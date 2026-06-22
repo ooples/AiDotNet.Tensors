@@ -34,7 +34,7 @@ public class FusedAttentionTiledBackwardTests
         var v  = RandomTensor(new[] { B, H, S, Dh }, 3);
         var dO = RandomTensor(new[] { B, H, S, Dh }, 4);
 
-        var (refQ, refK, refV) = ReferenceBackward(B, H, S, Dh, dO, q, k, v, causal: false, queryOffset: 0);
+        var (refQ, refK, refV) = ReferenceBackward(B, H, S, Dh, dO, q, k, v, causal: false, queryOffset: 0, bias: null);
         var (gQ, gK, gV) = FusedAttention<float>.Backward(dO, q, k, v, engine: engine);
 
         AssertClose(refQ, gQ.AsSpan().ToArray(), 1e-3f, "dQ");
@@ -54,7 +54,7 @@ public class FusedAttentionTiledBackwardTests
         var v  = RandomTensor(new[] { B, H, S, Dh }, 13);
         var dO = RandomTensor(new[] { B, H, S, Dh }, 14);
 
-        var (refQ, refK, refV) = ReferenceBackward(B, H, S, Dh, dO, q, k, v, causal: true, queryOffset: 0);
+        var (refQ, refK, refV) = ReferenceBackward(B, H, S, Dh, dO, q, k, v, causal: true, queryOffset: 0, bias: null);
         var cfg = new FlashAttentionConfig { IsCausal = true };
         var (gQ, gK, gV) = FusedAttention<float>.Backward(dO, q, k, v, config: cfg, engine: engine);
 
@@ -63,16 +63,39 @@ public class FusedAttentionTiledBackwardTests
         AssertClose(refV, gV.AsSpan().ToArray(), 1e-3f, "dV");
     }
 
+    [Theory]
+    [InlineData(1, 2, 64, 16)]   // additive bias, full-matrix path (S <= 128)
+    [InlineData(1, 4, 256, 32)]  // additive bias, tiled path (2 key tiles)
+    [InlineData(2, 4, 200, 16)]  // additive bias, tiled, uneven last tile
+    public void Backward_Bias_MatchesNaiveReference_dQdKdV(int B, int H, int S, int Dh)
+    {
+        var engine = new CpuEngine();
+        var q  = RandomTensor(new[] { B, H, S, Dh }, 21);
+        var k  = RandomTensor(new[] { B, H, S, Dh }, 22);
+        var v  = RandomTensor(new[] { B, H, S, Dh }, 23);
+        var dO = RandomTensor(new[] { B, H, S, Dh }, 24);
+        var bias = RandomTensor(new[] { B, H, S, S }, 25); // full additive [B,H,Sq,Sk] bias
+
+        var (refQ, refK, refV) = ReferenceBackward(B, H, S, Dh, dO, q, k, v, causal: false, queryOffset: 0, bias: bias);
+        var (gQ, gK, gV) = FusedAttention<float>.Backward(dO, q, k, v, attentionBias: bias, engine: engine);
+
+        AssertClose(refQ, gQ.AsSpan().ToArray(), 1e-3f, "dQ");
+        AssertClose(refK, gK.AsSpan().ToArray(), 1e-3f, "dK");
+        AssertClose(refV, gV.AsSpan().ToArray(), 1e-3f, "dV");
+    }
+
     // Naive analytic attention backward over [B,H,S,Dh] row-major tensors. No engine ops.
     // Causal: key j is visible to query i iff j <= queryOffset + i (matches ApplyCausalMask).
+    // bias (optional, full [B,H,Sq,Sk]): added to the scaled scores before softmax.
     private static (float[] dQ, float[] dK, float[] dV) ReferenceBackward(
         int B, int H, int S, int Dh, Tensor<float> dOT, Tensor<float> qT, Tensor<float> kT, Tensor<float> vT,
-        bool causal, int queryOffset)
+        bool causal, int queryOffset, Tensor<float>? bias)
     {
         float[] dO = dOT.AsSpan().ToArray();
         float[] q = qT.AsSpan().ToArray();
         float[] k = kT.AsSpan().ToArray();
         float[] v = vT.AsSpan().ToArray();
+        float[]? biasData = bias?.AsSpan().ToArray(); // full [B,H,S,S]
         float scale = (float)(1.0 / Math.Sqrt(Dh));
 
         var dQ = new float[B * H * S * Dh];
@@ -101,6 +124,7 @@ public class FusedAttentionTiledBackwardTests
                     float s = 0f;
                     for (int d = 0; d < Dh; d++) s += q[o + i * Dh + d] * k[o + j * Dh + d];
                     s *= scale;
+                    if (biasData != null) s += biasData[(((i + S * ((b * H) + h))) * S) + j]; // bias[b,h,i,j]
                     P[i * S + j] = s;
                     if (s > max) max = s;
                 }

@@ -469,11 +469,12 @@ public static class FusedAttention<T>
     /// </code>
     /// </para>
     ///
-    /// <para>Memory: for small/medium key lengths (<c>Sk &lt;= 128</c>) and for the bias / causal
-    /// cases, the straightforward path materialises the full <c>[B, H, Sq, Sk]</c> attention-weight
-    /// matrix. For longer unmasked sequences (<c>Sk &gt; 128</c>) the backward is tiled over key
-    /// blocks (<see cref="BackwardTiled"/>) in the FlashAttention-2 style, so the full <c>Sq×Sk</c>
-    /// matrices are never resident — peak extra memory is O(Sq·tile) instead of O(Sq·Sk).</para>
+    /// <para>Memory: for small/medium key lengths (<c>Sk &lt;= 128</c>) the straightforward path
+    /// materialises the full <c>[B, H, Sq, Sk]</c> attention-weight matrix. For longer sequences
+    /// (<c>Sk &gt; 128</c>) the backward is tiled over key blocks (<see cref="BackwardTiled"/>) in
+    /// the FlashAttention-2 style — including the causal and additive-bias cases — so the full
+    /// <c>Sq×Sk</c> intermediates are never resident: peak extra memory is O(Sq·tile), not
+    /// O(Sq·Sk).</para>
     /// </summary>
     /// <exception cref="NotSupportedException">
     /// <typeparamref name="T"/> is not a floating-point type
@@ -525,22 +526,22 @@ public static class FusedAttention<T>
 
         // #1662 lever #3: for long key sequences, tile the backward over key blocks so the full
         // [Sq, Sk] score/prob matrices are NEVER materialized — peak extra memory is O(Sq*tile)
-        // instead of O(Sq*Sk). Handles both plain and CAUSAL attention (causal fully-masked key
-        // tiles are skipped, which is also where the LLM long-context memory win lands). Additive
-        // attention bias keeps the full-matrix path. Small/medium Sk also keeps the full path,
-        // which is faster when the S^2 matrices fit comfortably. This is a permanent size-tiered
-        // fast path, mirroring the FP32/FP64 split already here.
+        // instead of O(Sq*Sk). Handles plain, CAUSAL (fully-masked key tiles skipped — the LLM
+        // long-context win), AND additive-bias attention (the bias is sliced per key tile and
+        // broadcast-added to each tile's scores). Matching the full path, bias takes precedence
+        // over the causal flag. Small/medium Sk keeps the full path (faster when S^2 fits).
         const int TileBk = 128;
-        if (attentionBias is null && Sk > TileBk && !ForceFullBackwardForBench)
+        if (Sk > TileBk && !ForceFullBackwardForBench)
         {
             (gradQ, gradK, gradV) = BackwardTiled(
                 engine, numOps, query, key, value, gradOutput,
                 B, H, Sq, Sk, headDim, Dv, scaleVal, TileBk,
-                config.IsCausal, config.QueryOffset);
+                isCausal: attentionBias is null && config.IsCausal, // bias precedence: no causal mask when bias present
+                config.QueryOffset, attentionBias);
         }
         else
         {
-            // ===== Full-matrix path (small/medium Sk, or bias/causal masking) =====
+            // ===== Full-matrix path (small/medium Sk only; Sk>128 — incl. causal/bias — tiles) =====
             // Recompute the forward softmax to get P — needed for every gradient below.
             var qFlat  = engine.Reshape(query, new[] { B * H, Sq, headDim });
             var kFlat  = engine.Reshape(key,   new[] { B * H, Sk, headDim });
@@ -604,14 +605,15 @@ public static class FusedAttention<T>
     ///   2. the softmax-backward correction D_i = Σ_j P_ij·(dO_i·v_j);
     ///   3. dQ / dK / dV from P_ij = exp(s_ij − m_i)/l_i and dS_ij = P_ij·(dP_ij − D_i).
     /// The heavy GEMMs (scores, dP, dQ, dK, dV) run through the engine's batched matmul; only the
-    /// O(Sq*tile) per-row softmax elementwise is done inline. Unmasked attention only (the bias /
-    /// causal cases use the full-matrix path in <see cref="Backward"/>).
+    /// O(Sq*tile) per-row softmax elementwise is done inline. Supports plain, causal (fully-masked
+    /// key tiles skipped), and additive-bias attention (bias sliced + broadcast-added per key tile
+    /// via <see cref="ScoresTileWithBias"/>); bias takes precedence over the causal flag.
     /// </summary>
     private static (Tensor<T> GradQuery, Tensor<T> GradKey, Tensor<T> GradValue) BackwardTiled(
         IEngine engine, INumericOperations<T> numOps,
         Tensor<T> query, Tensor<T> key, Tensor<T> value, Tensor<T> gradOutput,
         int B, int H, int Sq, int Sk, int headDim, int Dv, double scaleVal, int tileBk,
-        bool isCausal, int queryOffset)
+        bool isCausal, int queryOffset, Tensor<T>? attentionBias)
     {
         int BH = B * H;
         T scaleT = numOps.FromDouble(scaleVal);
@@ -635,8 +637,7 @@ public static class FusedAttention<T>
             if (TileFullyMasked(j0)) continue;
             int bk = Math.Min(tileBk, Sk - j0);
             var kt = SliceAxis1(numOps, kf, BH, Sk, headDim, j0, bk);                       // [BH, bk, Dh]
-            var sTile = engine.TensorMultiplyScalar(
-                engine.TensorBatchMatMul(qf, kt.TransposeLast2D()), scaleT);                // [BH, Sq, bk]
+            var sTile = ScoresTileWithBias(engine, qf, kt, scaleT, attentionBias, B, H, Sq, bk, j0); // [BH, Sq, bk]
             var s = sTile.GetDataArray();
             for (int row = 0; row < BH * Sq; row++)
             {
@@ -666,8 +667,7 @@ public static class FusedAttention<T>
             int bk = Math.Min(tileBk, Sk - j0);
             var kt = SliceAxis1(numOps, kf, BH, Sk, headDim, j0, bk);                       // [BH, bk, Dh]
             var vt = SliceAxis1(numOps, vf, BH, Sk, Dv, j0, bk);                            // [BH, bk, Dv]
-            var sTile = engine.TensorMultiplyScalar(
-                engine.TensorBatchMatMul(qf, kt.TransposeLast2D()), scaleT);                // [BH, Sq, bk]
+            var sTile = ScoresTileWithBias(engine, qf, kt, scaleT, attentionBias, B, H, Sq, bk, j0); // [BH, Sq, bk]
             var dpTile = engine.TensorBatchMatMul(dof, vt.TransposeLast2D());               // [BH, Sq, bk]
             var s = sTile.GetDataArray();
             var dp = dpTile.GetDataArray();
@@ -694,8 +694,7 @@ public static class FusedAttention<T>
             int bk = Math.Min(tileBk, Sk - j0);
             var kt = SliceAxis1(numOps, kf, BH, Sk, headDim, j0, bk);                       // [BH, bk, Dh]
             var vt = SliceAxis1(numOps, vf, BH, Sk, Dv, j0, bk);                            // [BH, bk, Dv]
-            var sTile = engine.TensorMultiplyScalar(
-                engine.TensorBatchMatMul(qf, kt.TransposeLast2D()), scaleT);                // [BH, Sq, bk]
+            var sTile = ScoresTileWithBias(engine, qf, kt, scaleT, attentionBias, B, H, Sq, bk, j0); // [BH, Sq, bk]
             var dpTile = engine.TensorBatchMatMul(dof, vt.TransposeLast2D());               // [BH, Sq, bk]
             var s = sTile.GetDataArray();
             var dp = dpTile.GetDataArray();
@@ -738,6 +737,29 @@ public static class FusedAttention<T>
         var gradK = engine.Reshape(new Tensor<T>(dKfull, new[] { BH, Sk, headDim }), new[] { B, H, Sk, headDim });
         var gradV = engine.Reshape(new Tensor<T>(dVfull, new[] { BH, Sk, Dv }), new[] { B, H, Sk, Dv });
         return (gradQ, gradK, gradV);
+    }
+
+    /// <summary>Scaled scores for one key tile: <c>scale · (Q @ Kt^T)</c> as [BH, Sq, bk], plus
+    /// the additive attention bias sliced to the tile's key columns when present. The bias slice
+    /// preserves the bias's broadcast shape (last axis Sk → [j0, j0+bk)); TensorBroadcastAdd then
+    /// applies the same broadcast rules as the full-matrix path's AddBroadcastBias.</summary>
+    private static Tensor<T> ScoresTileWithBias(
+        IEngine engine, Tensor<T> qf, Tensor<T> kt, T scaleT, Tensor<T>? bias,
+        int B, int H, int Sq, int bk, int j0)
+    {
+        var s = engine.TensorMultiplyScalar(engine.TensorBatchMatMul(qf, kt.TransposeLast2D()), scaleT); // [BH, Sq, bk]
+        if (bias is null) return s;
+
+        int br = bias.Rank;
+        var start = new int[br];
+        var len = new int[br];
+        for (int d = 0; d < br; d++) { start[d] = 0; len[d] = bias._shape[d]; }
+        start[br - 1] = j0;   // slice the key axis to this tile
+        len[br - 1] = bk;
+        var biasTile = engine.TensorSlice(bias, start, len);                 // [.., Sq, bk] (broadcastable)
+        var s4 = engine.Reshape(s, new[] { B, H, Sq, bk });
+        s4 = engine.TensorBroadcastAdd(s4, biasTile);
+        return engine.Reshape(s4, new[] { B * H, Sq, bk });
     }
 
     /// <summary>Copies the key/value slice [:, j0:j0+bk, :] out of a contiguous [BH, S, D]
