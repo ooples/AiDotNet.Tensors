@@ -25,7 +25,7 @@ public class BackwardArenaTests
     private readonly CpuEngine _engine = new();
 
     [Fact]
-    public void Conv2DBackward_PerStepAllocation_StaysBounded_WithArena()
+    public void Conv2DBackward_PerStepAllocation_Recycled_ByArena()
     {
         var rng = new Random(0);
         // Same shape class as the trainbench conv probe that surfaced the leak.
@@ -55,21 +55,33 @@ public class BackwardArenaTests
             });
         }
 
-        using var arena = TensorArena.Create();
-        for (int i = 0; i < 5; i++) { arena.Reset(); OneStep(); } // warmup: fill the arena
+        const int warmup = 12, reps = 10;
 
-        const int reps = 10;
-        long start = GC.GetAllocatedBytesForCurrentThread();
-        for (int i = 0; i < reps; i++) { arena.Reset(); OneStep(); }
-        long perStep = (GC.GetAllocatedBytesForCurrentThread() - start) / reps;
+        // Measure WITHOUT an arena: conv backward output grads are fresh allocations each step.
+        // (Relative on-vs-off comparison is robust to the process-global AutoTensorCache state
+        // left by other tests in the suite, which an absolute byte threshold is not.)
+        for (int i = 0; i < warmup; i++) OneStep();
+        long offStart = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < reps; i++) OneStep();
+        long perStepOff = (GC.GetAllocatedBytesForCurrentThread() - offStart) / reps;
 
-        // Pre-fix this path allocated ~1.07 MB/step on the main thread; post-fix ~0.1 MB/step.
-        // 0.5 MB threshold sits firmly between the two so a regression of the conv arena
-        // routing trips it, while leaving headroom for tape bookkeeping / machine variance.
-        const long thresholdBytes = 512L * 1024;
-        Assert.True(perStep < thresholdBytes,
-            $"per-step conv backward allocation {perStep} bytes >= threshold {thresholdBytes} " +
-            $"(arena routing for Conv2D backward output grads may have regressed)");
+        // Measure WITH the per-step arena: the conv backward output grads (and other scratch)
+        // are recycled via Reset(), so per-step allocation drops sharply.
+        long perStepOn;
+        using (var arena = TensorArena.Create())
+        {
+            for (int i = 0; i < warmup; i++) { arena.Reset(); OneStep(); }
+            long onStart = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < reps; i++) { arena.Reset(); OneStep(); }
+            perStepOn = (GC.GetAllocatedBytesForCurrentThread() - onStart) / reps;
+        }
+
+        // The arena must recycle the bulk of the per-step allocation. Pre-fix, conv backward
+        // output grads bypassed the arena (raw new float[]) so the arena barely helped here;
+        // after routing them through the arena, on-allocation is a small fraction of off.
+        Assert.True(perStepOn * 3 < perStepOff,
+            $"arena did not recycle conv backward allocation: on={perStepOn} B/step, off={perStepOff} B/step " +
+            $"(expected on < off/3; conv backward output-grad arena routing may have regressed)");
     }
 
     private static Tensor<float> Rand(int[] s, Random r)
