@@ -44,6 +44,13 @@ public static partial class BlasManaged
     /// </summary>
     internal const long MachineKernelMinWork = 4_000_000;
 
+    // #653 machine-code GEBP investigation: force the machine-code kernel ON even for shapes the
+    // PrefersStrategyOverMachineKernel gate would route to the managed strategy, so the two paths
+    // can be A/B-benchmarked on the SAME shape without trusting stale routing comments. Diagnostic
+    // only (default off); does NOT change production routing.
+    private static readonly bool s_forceMachineKernel =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_FORCE_MK") == "1";
+
     // #653: extend the PackBoth parallelism-floor + wide-N blocking optimizations to the
     // DisableAutotune shim path the forward GEMM uses (CpuEngine.BatchMatMul -> 6-arg
     // SimdGemm.Sgemm -> Gemm{DisableAutotune}). Those optimizations were gated on
@@ -466,7 +473,7 @@ public static partial class BlasManaged
             var epi409 = options.Epilogue;
             if (mkAvail && m >= mkMr && n >= mkNr
                 && (long)m * n * k >= MachineKernelMinWork
-                && !PrefersStrategyOverMachineKernel(m, n, k, typeof(T) == typeof(float))
+                && (s_forceMachineKernel || !PrefersStrategyOverMachineKernel(m, n, k, typeof(T) == typeof(float)))
                 && EpilogueFlagsCompute.Compute(in epi409) == EpilogueFlags.None)
             {
                 int mAl = m - (m % mkMr); // interior rows (× Mr)
