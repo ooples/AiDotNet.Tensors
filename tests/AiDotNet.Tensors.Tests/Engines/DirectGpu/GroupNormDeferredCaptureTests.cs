@@ -39,7 +39,7 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
     // only the long-lived-skip-into-concat case fails. NOTE: MemoryPlanningPass.BufferReuseMap is
     // dead code (computed, never consumed), so the bad reuse is in the recording/release-deferral
     // path, not that pass.
-    private const bool DeferredLongLivedSkipFixed = false;
+    private const bool DeferredLongLivedSkipFixed = true;
     private const int C = 64;       // channels != numGroups (the GroupNorm arg-order overflow case)
     private const int Groups = 32;
     private const int Sp = 16;
