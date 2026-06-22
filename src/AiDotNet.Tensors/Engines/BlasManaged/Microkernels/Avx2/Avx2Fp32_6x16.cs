@@ -242,5 +242,9 @@ internal static class Avx2Fp32_6x16
     /// <summary>Throws on net471 — AVX2 intrinsics unavailable. Dispatcher gates this.</summary>
     public static void RunStridedB(ReadOnlySpan<float> packedA, ReadOnlySpan<float> b, int ldb, Span<float> c, int ldc, int kc) =>
         throw new PlatformNotSupportedException("Avx2Fp32_6x16 requires net5.0+ for Vector256<T>.");
+
+    /// <summary>Throws on net471 — AVX2 intrinsics unavailable. Dispatcher gates this (IsSupported=false).</summary>
+    public static void RunPrefetch(ReadOnlySpan<float> packedA, ReadOnlySpan<float> packedB, Span<float> c, int ldc, int kc) =>
+        throw new PlatformNotSupportedException("Avx2Fp32_6x16 requires net5.0+ for Vector256<T>.");
 #endif
 }
