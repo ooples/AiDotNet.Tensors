@@ -3540,6 +3540,48 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         });
     }
 
+    /// <summary>
+    /// #638/#1650 resident channel-axis concatenation: concat NCHW tensors <paramref name="a"/> ([N,cA,H,W]) and
+    /// <paramref name="b"/> ([N,cB,H,W]) into <paramref name="output"/> ([N,cA+cB,H,W]) entirely on-device, via
+    /// stream-ordered device-to-device copies of each input's per-batch channel slab into the output's resident
+    /// buffer, then binds the output resident (no host span-copy → stays GPU-resident and CUDA-graph-capturable).
+    /// Returns false (caller does its host concat) when not on the resident step, non-float, non-contiguous, or
+    /// shapes don't match the channel-concat contract. The diffusion U-Net decoder skip-concat is the caller.
+    /// </summary>
+    public bool TryConcatenateChannelsResidentInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b)
+    {
+        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (a is null || b is null || output is null) return false;
+        if (a.Rank != 4 || b.Rank != 4 || output.Rank != 4) return false;
+        if (!a.IsContiguous || !b.IsContiguous || !output.IsContiguous) return false;
+        int n = a.Shape._dims[0], cA = a.Shape._dims[1], h = a.Shape._dims[2], w = a.Shape._dims[3];
+        int cB = b.Shape._dims[1];
+        if (b.Shape._dims[0] != n || b.Shape._dims[2] != h || b.Shape._dims[3] != w) return false;
+        if (output.Shape._dims[0] != n || output.Shape._dims[1] != cA + cB
+            || output.Shape._dims[2] != h || output.Shape._dims[3] != w) return false;
+        if (!TryGetBackend(out var be) || be is not Engines.DirectGpu.CUDA.CudaBackend cb) return false;
+        try
+        {
+            int spatial = h * w;
+            int aBatch = cA * spatial, bBatch = cB * spatial, oBatch = (cA + cB) * spatial;
+            using var abuf = GetOrAllocateContiguousInputBuffer(cb, a);
+            using var bbuf = GetOrAllocateContiguousInputBuffer(cb, b);
+            var outBuf = GetOrCreateResidentBuffer(cb, output, output.Length);
+            if (abuf.Buffer.Handle == System.IntPtr.Zero || bbuf.Buffer.Handle == System.IntPtr.Zero
+                || outBuf.Handle == System.IntPtr.Zero || outBuf.Size < output.Length)
+                return false;
+            for (int bi = 0; bi < n; bi++)
+            {
+                cb.Copy(abuf.Buffer, bi * aBatch, outBuf, bi * oBatch, aBatch);
+                cb.Copy(bbuf.Buffer, bi * bBatch, outBuf, bi * oBatch + aBatch, bBatch);
+            }
+            ResidentSyncCheck("ConcatenateChannels");
+            BindResidentBuffer(output, outBuf, cb);
+            return true;
+        }
+        catch (Exception cex) { AliasDiag($"ConcatChannels-resident FELLBACK n={n} cA={cA} cB={cB}: {cex.GetType().Name}: {cex.Message}"); return false; }
+    }
+
     /// <summary>PR #638 A1: ensure tensor `t` has a STABLE resident GPU buffer (allocate + bind once if it has none),
     /// so the compiled backward's pre-allocated gradient accumulators are device-resident before capture. Idempotent:
     /// returns the existing resident buffer when already bound. MUST be called OUTSIDE stream capture (it may allocate);
@@ -4764,6 +4806,34 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.Conv2DInto<T>(Tensor<T> output, Tensor<T> input, Tensor<T> kernel, int stride, int padding, int dilation)
     {
+        // #1650/#638: resident path for the capture step — read resident input + prefer-resident
+        // kernel, conv into the output's STABLE resident buffer, BindResidentBuffer, NO host
+        // round-trip. The legacy GPU path below uploads input/kernel + DownloadIntoTensor (non-
+        // capturable: 901/900). This is the ResBlock's inference fast-path conv (pre-allocated
+        // output), so making it resident is what lets the residual add downstream stay on-device.
+        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
+            && input.Rank == 4 && kernel.Rank == 4
+            && output.DataVector.GetBackingArrayUnsafe() is not null
+            && TryGetBackend(out var rbk) && rbk is Engines.DirectGpu.CUDA.CudaBackend)
+        {
+            try
+            {
+                int b = input.Shape._dims[0], ic = input.Shape._dims[1];
+                int ih = input.Shape._dims[2], iw = input.Shape._dims[3];
+                int oc = kernel.Shape._dims[0], kh = kernel.Shape._dims[2], kw = kernel.Shape._dims[3];
+                int oh = output.Shape._dims[2], ow = output.Shape._dims[3];
+                using var bufIn = GetOrAllocateContiguousInputBuffer(rbk, input);
+                using var bufK = GetWeightBufferPreferResident(rbk, kernel, PersistentTensorRole.Weights);
+                var outBuf = GetOrCreateResidentBuffer(rbk, output, output.Length);
+                rbk.Conv2D(bufIn.Buffer, bufK.Buffer, outBuf,
+                    b, ic, ih, iw, oc, oh, ow, kh, kw, stride, stride, padding, padding, dilation, dilation);
+                ResidentSyncCheck("Conv2DInto");
+                BindResidentBuffer(output, outBuf, rbk);
+                return;
+            }
+            catch (Exception cex) { AliasDiag($"Conv2DInto-resident FELLBACK in=[{string.Join(",", input._shape)}]: {cex.GetType().Name}: {cex.Message}"); }
+        }
+
         if (TryGetBackend(out var gpuBackend))
         {
             try
@@ -5491,9 +5561,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         result = null;
         if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
         if (activationParams is not null || bias is null || weights.Rank != 2 || !input.IsContiguous) return false;
-        if (activation != FusedActivationType.None && activation != FusedActivationType.ReLU
-            && activation != FusedActivationType.GELU && activation != FusedActivationType.Swish)
-            return false;
+        // All FusedActivationType values are applied below by ApplyGpuActivation as in-place GPU kernels
+        // (no host round-trip), so the resident path covers Swish/SiLU (the diffusion ResBlock time-MLP —
+        // the first in-capture blocker), Sigmoid, Tanh, ELU, Mish, etc. — not just ReLU/GELU. An activation
+        // ApplyGpuActivation doesn't support throws inside the try and cleanly falls back to the eager path.
         if (!TryGetBackend(out var backend) || backend is not Engines.DirectGpu.CUDA.CudaBackend cb) return false;
         int K = weights.Shape._dims[0];   // input features
         int N = weights.Shape._dims[1];   // output features
@@ -5514,9 +5585,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return false;
             cb.Gemm(inBuf.Buffer, wBuf.Buffer, outBuf, M, N, K, 1.0f, 0.0f);   // outBuf = input @ weights
             cb.BiasAdd(outBuf, bBuf.Buffer, outBuf, M, N);                     // += bias[N] (in place)
-            if (activation == FusedActivationType.ReLU) cb.Relu(outBuf, outBuf, M * N);
-            else if (activation == FusedActivationType.GELU) cb.Gelu(outBuf, outBuf, M * N);
-            else if (activation == FusedActivationType.Swish) cb.Swish(outBuf, outBuf, M * N);
+            if (activation != FusedActivationType.None)
+                ApplyGpuActivation(backend, outBuf, M * N, activation);        // in-place GPU activation (covers Swish/SiLU, Sigmoid, Tanh, …)
             ResidentSyncCheck("FusedLinear");
             BindResidentBuffer(outTensor, outBuf, backend);
             result = outTensor;
@@ -8988,6 +9058,41 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         // Compute scale if not provided
         float scaleFloat = (float)(scale ?? (1.0 / Math.Sqrt(headDim)));
+
+        // #638/#1650 GPU-RESIDENT capture path: run FlashAttentionV2 into resident output + softmax-stats
+        // buffers and BIND them (no DownloadBuffer), so the diffusion attention block stays fully on-device
+        // for CUDA-graph capture. Inputs Q/K/V are read through their resident buffers with no re-upload.
+        // Scope: float, no attention bias (diffusion self-attention), CUDA backend; anything else falls
+        // through to the eager download path below. Numerically identical — same FlashAttentionV2 kernel.
+        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
+            && attentionBias is null && query.IsContiguous && key.IsContiguous && value.IsContiguous
+            && backend is Engines.DirectGpu.CUDA.CudaBackend)
+        {
+            try
+            {
+                using var qBufR = GetOrAllocateContiguousInputBuffer(backend, query);
+                using var kBufR = GetOrAllocateContiguousInputBuffer(backend, key);
+                using var vBufR = GetOrAllocateContiguousInputBuffer(backend, value);
+                var outT = new Tensor<T>(new T[(long)batch * heads * seqQ * headDim], new[] { batch, heads, seqQ, headDim });
+                var statsT = new Tensor<T>(new T[(long)batch * heads * seqQ], new[] { batch, heads, seqQ });
+                var outBufR = GetOrCreateResidentBuffer(backend, outT, batch * heads * seqQ * headDim);
+                var statsBufR = GetOrCreateResidentBuffer(backend, statsT, batch * heads * seqQ);
+                using var biasNoneR = default(OwnedBuffer);
+                if (qBufR.Buffer.Handle != System.IntPtr.Zero && kBufR.Buffer.Handle != System.IntPtr.Zero
+                    && vBufR.Buffer.Handle != System.IntPtr.Zero
+                    && outBufR.Handle != System.IntPtr.Zero && statsBufR.Handle != System.IntPtr.Zero)
+                {
+                    backend.FlashAttentionV2(qBufR.Buffer, kBufR.Buffer, vBufR.Buffer, outBufR, statsBufR,
+                        batch, heads, seqQ, seqK, headDim, scaleFloat, isCausal, biasNoneR.Buffer, 0);
+                    ResidentSyncCheck("FlashAttention");
+                    BindResidentBuffer(outT, outBufR, backend);
+                    BindResidentBuffer(statsT, statsBufR, backend);
+                    softmaxStats = statsT;
+                    return outT;
+                }
+            }
+            catch (Exception fex) { AliasDiag($"FlashAttention-resident FELLBACK q=[{string.Join(",", query._shape)}]: {fex.GetType().Name}: {fex.Message}"); }
+        }
 
         // Use cache-aware buffer allocation (especially important for KV cache)
         using var queryBuffer = GetOrAllocateBuffer(backend, query);
@@ -17422,6 +17527,41 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend) || input.Rank < 4)
             return base.ConvTranspose2D(input, kernel, stride, padding, outputPadding);
 
+        // #638/#1650 GPU-RESIDENT capture path: run ConvTranspose2D into a resident output buffer and BIND it
+        // (no FinishGpuOp deferred download), so the diffusion decoder upsample stays on-device for CUDA-graph
+        // capture. The eager path below uses FinishGpuOp, whose deferred materializer races activation-cache
+        // eviction under capture (issue #226). Float, rank-4, no active tape (inference) — same kernel, so
+        // numerically identical; tape training still records via the eager path below.
+        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
+            && input.Rank == 4 && kernel.Rank == 4 && !IsTapeActive<T>()
+            && input.IsContiguous && backend is Engines.DirectGpu.CUDA.CudaBackend rbkT)
+        {
+            try
+            {
+                int batchR = input.Shape._dims[0], inChR = input.Shape._dims[1];
+                int inHR = input.Shape._dims[2], inWR = input.Shape._dims[3];
+                int outChR = kernel.Shape._dims[1], kHR = kernel.Shape._dims[2], kWR = kernel.Shape._dims[3];
+                int outHR = (inHR - 1) * stride[0] - 2 * padding[0] + kHR + outputPadding[0];
+                int outWR = (inWR - 1) * stride[1] - 2 * padding[1] + kWR + outputPadding[1];
+                long outLenR = (long)batchR * outChR * outHR * outWR;
+                using var bufInR = GetOrAllocateContiguousInputBuffer(rbkT, input);
+                using var bufKR = GetWeightBufferPreferResident(rbkT, kernel, PersistentTensorRole.Weights);
+                var outTR = new Tensor<T>(new T[outLenR], new[] { batchR, outChR, outHR, outWR });
+                var outBufR = GetOrCreateResidentBuffer(rbkT, outTR, (int)outLenR);
+                if (bufInR.Buffer.Handle != System.IntPtr.Zero && bufKR.Buffer.Handle != System.IntPtr.Zero
+                    && outBufR.Handle != System.IntPtr.Zero && outBufR.Size >= outLenR)
+                {
+                    rbkT.ConvTranspose2D(bufInR.Buffer, bufKR.Buffer, outBufR,
+                        batchR, inChR, inHR, inWR, outChR, outHR, outWR,
+                        kHR, kWR, stride[0], stride[1], padding[0], padding[1], outputPadding[0], outputPadding[1]);
+                    ResidentSyncCheck("ConvTranspose2D");
+                    BindResidentBuffer(outTR, outBufR, rbkT);
+                    return outTR;
+                }
+            }
+            catch (Exception tex) { AliasDiag($"ConvTranspose2D-resident FELLBACK in=[{string.Join(",", input._shape)}]: {tex.GetType().Name}: {tex.Message}"); }
+        }
+
         try
         {
             int batch = input.Shape._dims[0];
@@ -18434,11 +18574,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 int n = a.Shape._dims[0], c = a.Shape._dims[1], hw = a.Shape._dims[2] * a.Shape._dims[3];
                 using var abuf = GetResidentOrPersistentInputBuffer(beCh, a);
                 using var bbuf = GetResidentOrPersistentInputBuffer(beCh, b);
-                var outBuf = AllocateOutputBuffer(beCh, a.Length);
-                cbCh.Copy(abuf.Buffer, outBuf.Buffer, a.Length);          // out = a
-                cbCh.Conv2DBiasAdd(outBuf.Buffer, bbuf.Buffer, n, c, hw); // out += bias (per channel)
-                var resData = FinishGpuOp<T>(beCh, outBuf, a.Length);
-                return new Tensor<T>(resData, a.Shape._dims);
+                // BIND the result resident (no FinishGpuOp deferred download): the diffusion decoder's Deconv
+                // bias-add runs inside the captured forward, where a deferred materializer races activation-
+                // cache eviction (issue #226) and aborts replay. Fresh output → its resident buffer becomes a
+                // graph alloc node under capture; downstream reads it on-device with no re-upload.
+                var outT = new Tensor<T>(new T[a.Length], a.Shape._dims);
+                var outBuf = GetOrCreateResidentBuffer(beCh, outT, a.Length);
+                if (abuf.Buffer.Handle != System.IntPtr.Zero && bbuf.Buffer.Handle != System.IntPtr.Zero
+                    && outBuf.Handle != System.IntPtr.Zero && outBuf.Size >= a.Length)
+                {
+                    cbCh.Copy(abuf.Buffer, outBuf, a.Length);          // out = a (DtoD async, capturable)
+                    cbCh.Conv2DBiasAdd(outBuf, bbuf.Buffer, n, c, hw); // out += bias (per channel)
+                    ResidentSyncCheck("BroadcastAddConvBias");
+                    BindResidentBuffer(outT, outBuf, beCh);
+                    return outT;
+                }
             }
             catch { /* fall through to the paths below */ }
         }

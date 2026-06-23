@@ -1083,6 +1083,15 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     // capture-aborting on the first. The dedup'd op frames are the residency-grind work-list.
     private static readonly bool s_residentAudit =
         System.Environment.GetEnvironmentVariable("AIDOTNET_RESIDENT_AUDIT") == "1";
+
+    // #638/#1650 capture-blocker diagnostic: when AIDOTNET_GRAPH_CAPTURE_DEBUG=1, log the call stack of the
+    // FIRST sync HtoD/DtoH that runs WHILE the stream is actually capturing (cuStreamBeginCapture active).
+    // Unlike AIDOTNET_RESIDENT_AUDIT (which also logs the eager passes that run AFTER capture is disabled,
+    // polluting the work-list), this fires ONLY inside CaptureGraph's recorded forward, so it pinpoints the
+    // exact op that aborts capture with no pollution. One-shot per process (capture is attempted once).
+    private static readonly bool s_captureDebug =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1";
+    private static int s_captureBlockerLogged;
     internal static void AuditSyncIO(string kind, long bytes)
     {
         if (!s_residentAudit) return;
@@ -1108,11 +1117,43 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         catch { }
     }
 
+    internal void LogCaptureBlockerIfCapturing(string kind, long bytes)
+    {
+        if (!s_captureDebug) return;
+        if (System.Threading.Volatile.Read(ref s_captureBlockerLogged) != 0) return;
+        bool capturing;
+        try { capturing = IsStreamCapturing(); } catch { return; }
+        if (!capturing) return;
+        if (System.Threading.Interlocked.Exchange(ref s_captureBlockerLogged, 1) != 0) return;
+        try
+        {
+            var st = new System.Diagnostics.StackTrace(1, false);
+            var sb = new System.Text.StringBuilder();
+            sb.Append("CAPTURE BLOCKER — first sync ").Append(kind).Append(" (").Append(bytes).Append(" bytes) during capture: ");
+            for (int i = 0; i < st.FrameCount; i++)
+            {
+                var m = st.GetFrame(i)?.GetMethod();
+                var tn = m?.DeclaringType?.Name;
+                if (tn is null) continue;
+                if (tn.Contains("Layer") || tn.Contains("NoisePredictor") || tn.Contains("ResBlock")
+                    || tn.Contains("Attention") || tn.Contains("DirectGpuTensorEngine") || tn.Contains("CpuEngine")
+                    || tn.Contains("UNet") || tn.Contains("Diffusion"))
+                {
+                    sb.Append(tn).Append('.').Append(m!.Name).Append(" <- ");
+                    if (sb.Length > 600) break;
+                }
+            }
+            System.IO.File.WriteAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_capture_blocker.txt"), sb.ToString() + "\n");
+        }
+        catch { }
+    }
+
     public IGpuBuffer AllocateBuffer(float[] data)
     {
         if (!IsAvailable)
             throw new InvalidOperationException("CUDA backend is not available.");
         AuditSyncIO("HtoD-alloc", (long)data.Length * sizeof(float));
+        LogCaptureBlockerIfCapturing("HtoD-alloc", (long)data.Length * sizeof(float));
 
         int size = data.Length;
         if (size <= 0)
@@ -1519,6 +1560,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // sync on the host-read path (already a synchronization point) closes
         // the race with no effect on the GPU-resident training hot path.
         AuditSyncIO("DtoH-download", (long)buffer.Size * sizeof(float));
+        LogCaptureBlockerIfCapturing("DtoH-download", (long)buffer.Size * sizeof(float));
         CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamSynchronize(_stream), "cuStreamSynchronize(download)");
 
         ulong byteSize = (ulong)(buffer.Size * sizeof(float));
@@ -12616,15 +12658,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IntPtr srcPtr = source.Handle + sourceOffset * sizeof(float);
         IntPtr dstPtr = destination.Handle + destinationOffset * sizeof(float);
         ulong byteSize = (ulong)length * sizeof(float);
-        // Async during capture (sync cuMemcpyDtoD aborts capture with 906); sync otherwise. See Copy(src,dst,size).
-        if (IsStreamCapturing())
-            CuBlasNative.CheckCudaResult(
-                CudaNativeBindings.cuMemcpyDtoDAsync(dstPtr, srcPtr, byteSize, _stream),
-                "cuMemcpyDtoDAsync(strided)");
-        else
-            CuBlasNative.CheckCudaResult(
-                CuBlasNative.cuMemcpyDtoD(dstPtr, srcPtr, byteSize),
-                "cuMemcpyDtoD(strided)");
+        // Stream-ordered async DtoD (same fix as the 3-arg Copy): the synchronous cuMemcpyDtoD is NOT
+        // capturable — it aborts CUDA-graph stream capture (CUDA 906). The async copy on _stream records
+        // as a graph node and stays correctly ordered with the surrounding kernels (e.g. the resident
+        // channel-concat that copies each input's slab into the pooled output).
+        CuBlasNative.CheckCudaResult(
+            CudaNativeBindings.cuMemcpyDtoDAsync(dstPtr, srcPtr, byteSize, _stream),
+            "cuMemcpyDtoDAsync(strided)");
     }
 
     /// <inheritdoc/>
