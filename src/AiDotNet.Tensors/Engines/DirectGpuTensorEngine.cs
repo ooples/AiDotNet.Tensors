@@ -425,6 +425,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             cb.LaunchCapturedGraph(graphExec);
     }
 
+    /// <summary>Blocks until all work on the backend's compute stream completes. Used to separate GPU-compute
+    /// time from the DtoH copy when profiling the captured-graph replay. No-op off CUDA.</summary>
+    public void SynchronizeStream()
+    {
+        if (GetBackend() is Engines.DirectGpu.CUDA.CudaBackend cbSync) cbSync.Synchronize();
+    }
+
     /// <summary>Frees a captured graph handle.</summary>
     public void DestroyGpuGraph(System.IntPtr graphExec)
     {

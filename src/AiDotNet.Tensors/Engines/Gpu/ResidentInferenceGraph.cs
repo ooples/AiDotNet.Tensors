@@ -103,14 +103,22 @@ public sealed class ResidentInferenceGraph : System.IDisposable
         if (_exec != System.IntPtr.Zero)
         {
             bool timing = System.Environment.GetEnvironmentVariable("AIDOTNET_INFGRAPH_TIMING") == "1";
+            bool breakdown = timing && System.Environment.GetEnvironmentVariable("AIDOTNET_INFGRAPH_TIMING_BREAKDOWN") == "1";
+            double freq = System.Diagnostics.Stopwatch.Frequency / 1_000_000.0;
             long t0 = timing ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             for (int i = 0; i < s.Length; i++) _engine.RefreshResidentInputInPlace(s[i]);
+            long tRefresh = breakdown ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             _engine.LaunchGpuGraph(_exec);
+            if (breakdown) _engine.SynchronizeStream(); // block so the next stamp isolates GPU-compute time
+            long tCompute = breakdown ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             var outR = DownloadOutput<T>();
             if (timing)
             {
-                double us = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1_000_000.0 / System.Diagnostics.Stopwatch.Frequency;
-                try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_infgraph_timing.txt"), $"REPLAY {us:F1} us\n"); } catch { }
+                double us = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) / freq;
+                string line = breakdown
+                    ? $"REPLAY {us:F1} us  [refresh(HtoD)={(tRefresh - t0) / freq:F1} compute={(tCompute - tRefresh) / freq:F1} download(DtoH)={(System.Diagnostics.Stopwatch.GetTimestamp() - tCompute) / freq:F1}]\n"
+                    : $"REPLAY {us:F1} us\n";
+                try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_infgraph_timing.txt"), line); } catch { }
             }
             if (System.Environment.GetEnvironmentVariable("AIDOTNET_REPLAY_VERIFY") == "1")
             {
