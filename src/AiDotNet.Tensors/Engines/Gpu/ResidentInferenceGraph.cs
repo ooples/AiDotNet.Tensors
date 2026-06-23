@@ -112,6 +112,17 @@ public sealed class ResidentInferenceGraph : System.IDisposable
         // pre-residency pass so every op binds its stable resident buffer, then record the forward.
         try
         {
+            // RESIDENT-VS-CPU VERIFY (AIDOTNET_RESIDENT_VERIFY=1): run the SAME input eagerly first (outside
+            // the scope → ResidentStepActive off → CPU/host reference), then compare the resident pre-residency
+            // forward to it. Localizes a wrong resident op immediately, per build, with NO capture needed.
+            float[]? verifyRef = null;
+            bool verify = System.Environment.GetEnvironmentVariable("AIDOTNET_RESIDENT_VERIFY") == "1";
+            if (verify)
+            {
+                var refOut = forward(s);
+                verifyRef = refOut.AsSpan().ToArray() as float[];
+            }
+
             _scope = _engine.EnterResidentCaptureScope();
             if (_scope is null) { _disabled = true; return forward(s); }
 
@@ -119,7 +130,15 @@ public sealed class ResidentInferenceGraph : System.IDisposable
             // stable device address (no re-upload mid-capture). The forward's own intermediates become
             // resident under the capture path.
             for (int i = 0; i < s.Length; i++) _engine.EnsureResidentInput(s[i]);
-            _ = forward(s); // pre-residency: bind resident buffers (sync uploads here are fine — not capturing)
+            var preResOut = forward(s); // pre-residency: bind resident buffers (sync uploads here are fine — not capturing)
+            if (verify && verifyRef is not null)
+            {
+                var got = preResOut.AsSpan();
+                double maxd = 0; int n = System.Math.Min(got.Length, verifyRef.Length);
+                for (int i = 0; i < n; i++) maxd = System.Math.Max(maxd, System.Math.Abs(System.Convert.ToDouble(got[i]) - verifyRef[i]));
+                try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_resident_verify.txt"),
+                    $"resident-vs-cpu maxAbsDiff={maxd:E4} n={got.Length}\n"); } catch { }
+            }
             for (int i = 0; i < s.Length; i++) _engine.RefreshResidentInputInPlace(s[i]);
 
             // RESIDENCY AUDIT (AIDOTNET_RESIDENT_AUDIT=1): run one more resident pass with the audit log
