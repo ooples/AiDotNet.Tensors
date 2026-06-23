@@ -3689,6 +3689,48 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch (Exception lex) { AliasDiag($"LN-resident FELLBACK in=[{string.Join(",", input._shape)}] inContig={input.IsContiguous}: {lex.GetType().Name}: {lex.Message}"); return false; }
     }
 
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<object, (IGpuBuffer norm, IGpuBuffer mean, IGpuBuffer var)> _gnSwishScratch = new();
+
+    /// <summary>
+    /// #1650/#638 GPU-RESIDENT GroupNorm+Swish (the diffusion ResBlock's <c>GroupNormSwishInto</c>):
+    /// reads the resident input + prefer-resident gamma/beta, runs GroupNorm then Swish into the
+    /// output's STABLE resident buffer, and BindResidentBuffer's the result — NO AllocateBuffer(data)
+    /// upload and NO DownloadIntoTensor (the legacy GPU path did both, which are non-capturable inside
+    /// CUDA-graph capture: CUDA 901 on the alloc, 900 on the sync download). Stats/norm scratch are
+    /// allocated ONCE (cached) so capture-time passes are pool-hits, not pool-growth. Returns false to
+    /// fall back to the legacy GPU/CPU path (non-resident / non-float / autocast).
+    /// </summary>
+    internal bool TryGroupNormSwishResidentInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon)
+    {
+        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!TryGetBackend(out var backend) || input.Rank < 2) return false;
+        var arr = output.DataVector.GetBackingArrayUnsafe();
+        if (arr is null) return false;
+        try
+        {
+            int batch = input.Shape._dims[0], channels = input.Shape._dims[1];
+            int spatial = input.Length / (batch * channels);
+            using var bufIn = GetOrAllocateContiguousInputBuffer(backend, input);
+            using var bufGamma = GetWeightBufferPreferResident(backend, gamma, PersistentTensorRole.Weights);
+            using var bufBeta = GetWeightBufferPreferResident(backend, beta, PersistentTensorRole.Biases);
+            var outBuf = GetOrCreateResidentBuffer(backend, output, input.Length);
+            if (!_gnSwishScratch.TryGetValue(arr, out var sc))
+            {
+                sc = (backend.AllocateBuffer(input.Length), backend.AllocateBuffer(batch * numGroups), backend.AllocateBuffer(batch * numGroups));
+                _gnSwishScratch[arr] = sc;
+            }
+            // GroupNorm into the norm scratch, then Swish (x*sigmoid(x)) into the resident output.
+            // Arg order (batch, numGroups, channels, spatial) matches the corrected GroupNorm signature.
+            backend.GroupNorm(bufIn.Buffer, sc.norm, bufGamma.Buffer, bufBeta.Buffer, sc.mean, sc.var,
+                batch, numGroups, channels, spatial, (float)epsilon);
+            backend.Swish(sc.norm, outBuf, input.Length);
+            ResidentSyncCheck("GroupNormSwish");
+            BindResidentBuffer(output, outBuf, backend);
+            return true;
+        }
+        catch (Exception gex) { AliasDiag($"GNSwish-resident FELLBACK in=[{string.Join(",", input._shape)}]: {gex.GetType().Name}: {gex.Message}"); return false; }
+    }
+
     /// <summary>GPU-RESIDENT 2-D / ND×2-D matmul for the compiled step (e.g. attention out-proj / LM-head /
     /// any TensorMatMul against a 2-D weight): collapse A's leading dims into M and run backend.Gemm (C=A@B)
     /// into the destination's stable buffer — no host TensorMatMulFloatInto (which materializes inputs → a DtoH
@@ -4621,6 +4663,30 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (ShapesMatch(a.Shape._dims, b.Shape._dims) && TryRunBinaryInPlace(a, b,
             static (backend, bufA, bufB, size) => backend.Add(bufA, bufB, bufA, size)))
             return;
+
+        // #1650/#638 resident per-channel in-place add (diffusion time-embed residual: h[N,C,H,W] += t[.,C,1,1]).
+        // The shapes-differ broadcast otherwise falls to CpuEngine, which materializes `a` (DtoH download) —
+        // non-capturable inside CUDA-graph capture. Do it on-device via Conv2DBiasAdd (per-channel a += b) on
+        // a's resident buffer (mutated in place; a stays bound). Gated on ResidentStepActive so non-capture
+        // inference is unchanged. Mirrors the resident conv-bias TensorBroadcastAdd path.
+        if (ResidentStepActive && typeof(T) == typeof(float) && !Gpu.AutocastScope.IsEnabled
+            && a.Rank == 4 && b.Rank == 4 && a.IsContiguous
+            && b.Shape._dims[2] == 1 && b.Shape._dims[3] == 1
+            && a.Shape._dims[1] == b.Shape._dims[1]
+            && (b.Shape._dims[0] == 1 || b.Shape._dims[0] == a.Shape._dims[0])
+            && TryGetBackend(out var beCh) && beCh is Engines.DirectGpu.CUDA.CudaBackend cbCh)
+        {
+            try
+            {
+                int n = a.Shape._dims[0], c = a.Shape._dims[1], hw = a.Shape._dims[2] * a.Shape._dims[3];
+                using var abuf = GetResidentOrPersistentInputBuffer(beCh, a);
+                using var bbuf = GetResidentOrPersistentInputBuffer(beCh, b);
+                cbCh.Conv2DBiasAdd(abuf.Buffer, bbuf.Buffer, n, c, hw); // a += b (per channel), in place
+                ResidentSyncCheck("BroadcastAddInPlace");
+                return;
+            }
+            catch (Exception rex) { AliasDiag($"BCastAddInPlace-resident FELLBACK: {rex.GetType().Name}: {rex.Message}"); }
+        }
         // Shapes differ — CPU handles broadcasting logic
         base.TensorBroadcastAddInPlace(a, b);
     }
@@ -5092,6 +5158,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.GroupNormSwishInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon)
     {
+        // #1650/#638: resident GPU path for the capture step (no host round-trip). Falls through to the
+        // legacy upload/compute/download GPU path (then CPU) when not in a resident step.
+        if (TryGroupNormSwishResidentInto(output, input, numGroups, gamma, beta, epsilon)) return;
         if (TryGetBackend(out var gpuBackend))
         {
             try
