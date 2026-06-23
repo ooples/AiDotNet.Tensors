@@ -121,5 +121,39 @@ public class MhaLeanSdpaAllocTests
             $"Double MHA forward allocated {kbPerCall:F0} KB/call; expected < 16384 KB (pooled fast " +
             "path). Regressed to MultiHeadAttentionForwardGeneric's full-scores path (#478/#1675)?");
     }
+
+    // #478 regression guard for the generic (double) LSTM forward: it must reuse ping-pong state
+    // buffers + a pooled hidden-GEMM buffer across timesteps, NOT allocate a fresh hCurr/cCurr +
+    // hidden GEMM output EVERY step (which measured ~25-28x the float fast path's allocation on a
+    // 64-step LSTM and is the same GC-churn class as the MHA #478 fix).
+    [Trait("Category", "Performance")]
+    [Fact]
+    public void LstmForward_Double_ReusesBuffers_NotPerStepAlloc()
+    {
+        var eng = new CpuEngine();
+        const int batch = 4, seq = 128, inF = 256, hidden = 256;
+        var r = new Random(2026);
+        var input = RandD(r, batch, seq, inF);
+        var wIh = RandD(r, 4 * hidden, inF);
+        var wHh = RandD(r, 4 * hidden, hidden);
+        var bIh = RandD(r, 4 * hidden);
+        var bHh = RandD(r, 4 * hidden);
+
+        for (int w = 0; w < 5; w++) _ = eng.LstmSequenceForward(input, null, null, wIh, wHh, bIh, bHh, returnSequences: true);
+
+        const int n = 10;
+        long a0 = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < n; i++) _ = eng.LstmSequenceForward(input, null, null, wIh, wHh, bIh, bHh, returnSequences: true);
+        long a1 = GC.GetAllocatedBytesForCurrentThread();
+        double kbPerCall = (a1 - a0) / 1024.0 / n;
+
+        // After the ping-pong + pooled-GEMM fix this is a small constant per call (state buffers +
+        // one-time input projection + output). The pre-fix per-step path allocated 2*seqLen state
+        // tensors + seqLen GEMM outputs => many MB/call that scales with seq. 8 MB threshold catches
+        // a revert to per-step allocation with a wide margin.
+        Assert.True(kbPerCall < 8192,
+            $"Double LSTM forward allocated {kbPerCall:F0} KB/call; expected < 8192 KB (buffer-reusing " +
+            "path). Regressed to the per-timestep CreateZeros + per-step hidden-GEMM allocation (#478)?");
+    }
 #endif
 }
