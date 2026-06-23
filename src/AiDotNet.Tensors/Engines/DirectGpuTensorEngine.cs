@@ -5271,8 +5271,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // it safe (no owned upload to async-free under the kernel, the CUDA-700 the s_residentInPlace gate guarded).
         if (((s_residentInPlace && InGradAccumulation) || InferenceCaptureActive) && ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
             && a.IsContiguous && b.IsContiguous && a.Length == b.Length
-            && a.TryGetGpuBuffer() is { } aResident
-            && b.TryGetGpuBuffer() is { } bResident
+            && ResolveResidentBufferNoUpload(backend, a, a.Length) is { } aResident
+            && ResolveResidentBufferNoUpload(backend, b, b.Length) is { } bResident
             && !ReferenceEquals(aResident, bResident)
             && aResident.Handle != System.IntPtr.Zero && bResident.Handle != System.IntPtr.Zero
             && aResident.Size >= a.Length && bResident.Size >= b.Length)
