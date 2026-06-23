@@ -35,6 +35,10 @@ public sealed class ResidentInferenceGraph : System.IDisposable
     public ResidentInferenceGraph(DirectGpuTensorEngine engine, int warmupRuns = 2)
     {
         _engine = engine ?? throw new System.ArgumentNullException(nameof(engine));
+        // Benchmarking knob: AIDOTNET_INFGRAPH_WARMUP overrides the eager-warmup count so a timing run can
+        // collect many eager-forward samples before capture (see AIDOTNET_INFGRAPH_TIMING).
+        var wenv = System.Environment.GetEnvironmentVariable("AIDOTNET_INFGRAPH_WARMUP");
+        if (wenv is not null && int.TryParse(wenv, out var w) && w >= 1) warmupRuns = w;
         _warmupRuns = warmupRuns < 1 ? 1 : warmupRuns;
     }
 
@@ -98,15 +102,44 @@ public sealed class ResidentInferenceGraph : System.IDisposable
         // REPLAY: refresh stable input buffers in place, one cuGraphLaunch, fresh download of the output.
         if (_exec != System.IntPtr.Zero)
         {
+            bool timing = System.Environment.GetEnvironmentVariable("AIDOTNET_INFGRAPH_TIMING") == "1";
+            long t0 = timing ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             for (int i = 0; i < s.Length; i++) _engine.RefreshResidentInputInPlace(s[i]);
             _engine.LaunchGpuGraph(_exec);
-            return DownloadOutput<T>();
+            var outR = DownloadOutput<T>();
+            if (timing)
+            {
+                double us = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1_000_000.0 / System.Diagnostics.Stopwatch.Frequency;
+                try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_infgraph_timing.txt"), $"REPLAY {us:F1} us\n"); } catch { }
+            }
+            if (System.Environment.GetEnvironmentVariable("AIDOTNET_REPLAY_VERIFY") == "1")
+            {
+                double inSum = 0; var isp = s[0].AsSpan();
+                for (int i = 0; i < isp.Length; i++) inSum += System.Convert.ToDouble(isp[i]);
+                double tSum = 0; if (s.Length > 1) { var tsp = s[1].AsSpan(); for (int i = 0; i < tsp.Length; i++) tSum += System.Convert.ToDouble(tsp[i]); }
+                double outSum = 0; var osp = outR.AsSpan();
+                for (int i = 0; i < osp.Length; i++) outSum += System.Convert.ToDouble(osp[i]);
+                try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_replay_verify.txt"),
+                    $"REPLAY inSum(s0)={inSum:F4} timeSum(s1)={tSum:F4} -> outSum={outSum:F4}\n"); } catch { }
+            }
+            return outR;
         }
 
         // WARMUP: a few eager forwards on the stable inputs so lazy allocs / autotune settle.
         _warmup++;
         if (_warmup < _warmupRuns)
+        {
+            if (System.Environment.GetEnvironmentVariable("AIDOTNET_INFGRAPH_TIMING") == "1")
+            {
+                long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                var w = forward(s);
+                _ = w.AsSpan(); // force materialization so timing includes the eager download
+                double us = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1_000_000.0 / System.Diagnostics.Stopwatch.Frequency;
+                try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_infgraph_timing.txt"), $"EAGER {us:F1} us\n"); } catch { }
+                return w;
+            }
             return forward(s);
+        }
 
         // CAPTURE: enter the resident capture path (kept alive for the graph's lifetime), do a
         // pre-residency pass so every op binds its stable resident buffer, then record the forward.
@@ -131,6 +164,9 @@ public sealed class ResidentInferenceGraph : System.IDisposable
             // resident under the capture path.
             for (int i = 0; i < s.Length; i++) _engine.EnsureResidentInput(s[i]);
             var preResOut = forward(s); // pre-residency: bind resident buffers (sync uploads here are fine — not capturing)
+            // Allocate the STABLE output buffer (sync, pre-capture) the captured graph's final op will copy into,
+            // so the externally-read output address survives AUTO_FREE relaunch (else replays read stale output).
+            _engine.PrepareStableCaptureOutput(preResOut);
             if (verify && verifyRef is not null)
             {
                 var got = preResOut.AsSpan();
@@ -153,14 +189,59 @@ public sealed class ResidentInferenceGraph : System.IDisposable
             }
 
             Tensor<T>? captured = null;
-            var exec = _engine.CaptureGpuGraph(() => { captured = forward(s); });
+            // Capture the forward AND a final copy of its output into the stable buffer — both become graph nodes,
+            // so replay recomputes into the stable address and DownloadOutput reads fresh data every launch.
+            var exec = _engine.CaptureGpuGraph(() => { var o = forward(s); captured = _engine.WriteOutputToStableCapture(o); });
             if (exec != System.IntPtr.Zero && captured is not null)
             {
                 _exec = exec;
                 _output = captured;
                 _outShape = captured.Shape._dims;
                 _engine.LaunchGpuGraph(exec); // capture records but does not execute — run once for this call
-                return DownloadOutput<T>();
+                var out1 = DownloadOutput<T>();
+
+                // REPLAY DETERMINISM (AIDOTNET_REPLAY_VERIFY=1): relaunch the SAME graph on the SAME (unrefreshed)
+                // input buffers and compare. Identical ⇒ replay is bit-stable (any later run-vs-run divergence is
+                // from input refresh, not the graph). Nonzero ⇒ the graph replay itself corrupts (AUTO_FREE
+                // realloc moving a buffer's VA, or a captured pointer into a non-graph-managed buffer).
+                if (System.Environment.GetEnvironmentVariable("AIDOTNET_REPLAY_VERIFY") == "1")
+                {
+                    _engine.LaunchGpuGraph(exec);
+                    var out2 = DownloadOutput<T>();
+                    var a = out1.AsSpan(); var b = out2.AsSpan();
+                    double maxd = 0, a0 = 0, b0 = 0; int n = System.Math.Min(a.Length, b.Length);
+                    for (int i = 0; i < n; i++)
+                    {
+                        double ai = System.Convert.ToDouble(a[i]), bi = System.Convert.ToDouble(b[i]);
+                        if (i == 0) { a0 = ai; b0 = bi; }
+                        maxd = System.Math.Max(maxd, System.Math.Abs(ai - bi));
+                    }
+                    // Does the graph actually CONSUME a refreshed input? Mutate s[0], refresh, relaunch.
+                    // If the output is unchanged, RefreshResidentInputInPlace isn't reaching the buffer the
+                    // graph's first op reads (the run-vs-run divergence then comes entirely from this).
+                    var orig = s[0].AsSpan().ToArray();
+                    var w = s[0].AsWritableSpan();
+                    var zeroT = (T)(object)0f; // typeof(T)==float guaranteed above
+                    for (int i = 0; i < w.Length; i++) w[i] = zeroT;
+                    _engine.RefreshResidentInputInPlace(s[0]);
+                    _engine.LaunchGpuGraph(exec);
+                    var out3 = DownloadOutput<T>();
+                    var c = out3.AsSpan();
+                    double mutd = 0, c0 = 0; int n3 = System.Math.Min(a.Length, c.Length);
+                    for (int i = 0; i < n3; i++)
+                    {
+                        double ci = System.Convert.ToDouble(c[i]);
+                        if (i == 0) c0 = ci;
+                        mutd = System.Math.Max(mutd, System.Math.Abs(System.Convert.ToDouble(a[i]) - ci));
+                    }
+                    orig.AsSpan().CopyTo(s[0].AsWritableSpan()); // restore
+                    _engine.RefreshResidentInputInPlace(s[0]);
+                    _engine.LaunchGpuGraph(exec);
+                    out1 = DownloadOutput<T>();
+                    try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_replay_verify.txt"),
+                        $"relaunch-same-input maxAbsDiff={maxd:E4} n={a.Length} launch1[0]={a0:F4} launch2[0]={b0:F4} | zeroed-input maxAbsDiffVsOrig={mutd:E4} zeroOut[0]={c0:F4} (≈0 ⇒ refresh INEFFECTIVE)\n"); } catch { }
+                }
+                return out1;
             }
 
             // A non-capturable op remains → abandon capture, resume eviction, run eager from here.
@@ -183,6 +264,7 @@ public sealed class ResidentInferenceGraph : System.IDisposable
             return forward(inputs);
         }
     }
+
 
     private Tensor<T> DownloadOutput<T>()
     {

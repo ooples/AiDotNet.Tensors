@@ -463,6 +463,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <summary>Uploads <paramref name="t"/>'s current host data into its EXISTING resident GPU buffer in place
     /// (stable pointer) so a replayed graph — which reads the address captured at record time — sees fresh data.
     /// No-op if the tensor has no resident buffer on this engine. float only.</summary>
+
     public void RefreshResidentInputInPlace<T>(Tensor<T> t)
     {
         if (typeof(T) != typeof(float) || t is null) return;
@@ -508,6 +509,50 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var buf = t._gpuBuffer;
         if (buf is null || !ReferenceEquals(t._gpuBackend, cb) || buf.Handle == System.IntPtr.Zero) return null;
         return cb.DownloadBuffer(buf);
+    }
+
+    // #1650 — STABLE captured-graph output. The forward's own output buffer is a graph-internal cuMemAllocAsync
+    // node; under CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH the graph frees+reallocs its pool every launch,
+    // so reading the capture-time output pointer after a later replay returns STALE data (the captured-step
+    // output) — the graph computes fresh values into the realloc'd internal buffer but the externally-held
+    // pointer no longer aliases them. Fix (the cortex resident-into pattern): pre-allocate ONE persistent buffer
+    // OUTSIDE the graph and make the final captured op copy the forward output into it, so the externally-read
+    // address is fixed and holds fresh data every replay.
+    private IGpuBuffer? _stableCaptureOutput;
+    private int _stableCaptureOutputSize;
+
+    /// <summary>Pre-capture (sync alloc — call OUTSIDE stream capture): allocate/reuse a persistent output buffer
+    /// sized to the forward's output. float only / no-op off CUDA.</summary>
+    public void PrepareStableCaptureOutput<T>(Tensor<T> sampleOutput)
+    {
+        if (typeof(T) != typeof(float) || sampleOutput is null) return;
+        if (GetBackend() is not Engines.DirectGpu.CUDA.CudaBackend cb) return;
+        int need = sampleOutput.Length;
+        if (_stableCaptureOutput is null || _stableCaptureOutput.Handle == System.IntPtr.Zero || _stableCaptureOutput.Size < need)
+        {
+            _stableCaptureOutput?.Dispose();
+            _stableCaptureOutput = cb.AllocateBuffer(need); // sync alloc — safe pre-capture
+            _stableCaptureOutputSize = need;
+        }
+    }
+
+    /// <summary>During capture: copy <paramref name="output"/> into the persistent buffer prepared by
+    /// <see cref="PrepareStableCaptureOutput"/> (async DtoD → a captured graph node) and return a tensor bound to
+    /// that fixed address. Returns the input unchanged off the capture path / on any miss. float only.</summary>
+    public Tensor<T> WriteOutputToStableCapture<T>(Tensor<T> output)
+    {
+        if (output is null) throw new System.ArgumentNullException(nameof(output));
+        if (typeof(T) != typeof(float)) return output;
+        if (GetBackend() is not Engines.DirectGpu.CUDA.CudaBackend cb) return output;
+        if (_stableCaptureOutput is null || _stableCaptureOutput.Handle == System.IntPtr.Zero) return output;
+        int need = output.Length;
+        if (_stableCaptureOutputSize < need) return output;
+        var src = ResolveResidentBufferNoUpload(cb, output, need);
+        if (src is null) return output;
+        cb.Copy(src, _stableCaptureOutput, need); // async on the compute stream — captured into the graph
+        var stableT = new Tensor<T>(output.Shape._dims);
+        BindResidentBuffer(stableT, _stableCaptureOutput, cb);
+        return stableT;
     }
 
     /// <summary>

@@ -75,6 +75,11 @@ public sealed partial class CudaBackend
         rc = CudaNativeBindings.cuStreamEndCapture(_stream, out var graph);
         if (rc != CudaResult.Success || graph == IntPtr.Zero) { GcDiag($"endCapture FAILED rc={rc} graph={(graph != IntPtr.Zero)} (a non-capturable op — sync HtoD/DtoH or cuMemAlloc — was issued during launch)"); return IntPtr.Zero; }
 
+        // Diagnostic: how many kernel/memory nodes did the capture actually record? A near-empty graph means
+        // the forward's ops were short-circuited (e.g. served from the activation cache) during capture, so
+        // replay reproduces a frozen output that ignores refreshed inputs.
+        { ulong nodeCount = 0; var gn = CudaNativeBindings.cuGraphGetNodes(graph, IntPtr.Zero, ref nodeCount); GcDiag($"captured graph node count = {nodeCount} (rc={gn})"); }
+
         // PR #638 Phase B: the captured whole-step graph contains cuMemAllocAsync MEMORY NODES (the resident-into
         // backward ops allocate per-call scratch from the async pool during capture). A graph with allocation nodes
         // can only be relaunched if its allocations are freed between launches — otherwise the SECOND cuGraphLaunch
