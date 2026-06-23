@@ -121,6 +121,22 @@ public partial class CpuEngine
                 mask,
                 batch, seqLen, dModel, numHeads, dHead);
 
+        // Double fast path (#478 / #1675): the generic-T path below materializes the FULL
+        // [B*heads, seq, seq] attention scores + weights + four strided-transpose tensors per call,
+        // none pooled (scores exceed ArrayPool.Shared's 2^20-element bucket). At paper scale that is
+        // ~50x the float path's allocation per MHA layer (measured 54x), and the resulting GC/heap
+        // churn — not the math — is what makes a <double> transformer forward ~65x slower than
+        // <float> on a memory-bounded host. Route double through the same per-head, single-reused-
+        // scratch structure the float fast path uses (no full-scores matrix, no transpose buffers).
+        if (typeof(T) == typeof(double))
+            return (Tensor<T>)(object)MultiHeadAttentionForwardDouble(
+                (Tensor<double>)(object)input,
+                (Tensor<double>)(object)qWeight,
+                (Tensor<double>)(object)kWeight,
+                (Tensor<double>)(object)vWeight,
+                (Tensor<double>)(object)outWeight,
+                mask, batch, seqLen, dModel, numHeads, dHead);
+
         return MultiHeadAttentionForwardGeneric(
             input, qWeight, kWeight, vWeight, outWeight, mask,
             batch, seqLen, dModel, numHeads, dHead);
@@ -405,6 +421,188 @@ public partial class CpuEngine
         return m;
     }
 #endif
+
+    /// <summary>
+    /// Double fast path (#478 / #1675). Same allocation discipline as the float fast path — fused
+    /// Q/K/V projections into pooled scratch, a per-head fused SDPA that reuses ONE pooled scratch
+    /// buffer across all heads (never materializing the full [B*H, seq, seq] scores or the four
+    /// strided transposes the generic path allocates), and the output projection — but in managed
+    /// (no-intrinsic) code so it runs on both TFMs. The per-head math is identical to
+    /// <see cref="ScaledDotProductAttention{T}"/>'s double path; only the buffering changes.
+    /// </summary>
+    private Tensor<double> MultiHeadAttentionForwardDouble(
+        Tensor<double> input,
+        Tensor<double> qWeight, Tensor<double> kWeight, Tensor<double> vWeight, Tensor<double> outWeight,
+        Tensor<bool>? mask,
+        int batch, int seqLen, int dModel, int numHeads, int dHead)
+    {
+        int totalRows = batch * seqLen;
+        int proj = totalRows * dModel;
+        var ops = MathHelper.GetNumericOperations<double>();
+        var pool = ArrayPool<double>.Shared;
+
+        // Pooled projection scratch (returned at end of call) instead of fresh Tensor intermediates.
+        var qBuf = pool.Rent(proj);
+        var kBuf = pool.Rent(proj);
+        var vBuf = pool.Rent(proj);
+        var concatBuf = pool.Rent(proj);
+        var output = AutoTensorCache.RentOrAllocate<double>(new[] { batch, seqLen, dModel });
+        try
+        {
+            var inArr = input.GetFlattenedData();
+            var qW = qWeight.GetFlattenedData();
+            var kW = kWeight.GetFlattenedData();
+            var vW = vWeight.GetFlattenedData();
+            var oW = outWeight.GetFlattenedData();
+            var inMem = new ReadOnlyMemory<double>(inArr, 0, proj);
+
+            // Q/K/V = input[totalRows, dModel] @ W[dModel, dModel]. MultiplyBlocked accumulates into C,
+            // so the (un-zeroed) pooled destination must be cleared first.
+            void Project(double[] w, double[] dst)
+            {
+                Array.Clear(dst, 0, proj);
+                MatrixMultiplyHelper.MultiplyBlocked(ops, inMem,
+                    new ReadOnlyMemory<double>(w, 0, dModel * dModel),
+                    new Memory<double>(dst, 0, proj),
+                    totalRows, dModel, dModel, dModel, dModel, dModel, allowParallel: true);
+            }
+            Project(qW, qBuf);
+            Project(kW, kBuf);
+            Project(vW, vBuf);
+
+            MultiHeadAttentionFusedSdpaDouble(qBuf, kBuf, vBuf, dModel, mask,
+                1.0 / Math.Sqrt(dHead), batch, numHeads, seqLen, dHead, concatBuf, dModel);
+
+            // Output projection: concat[totalRows, dModel] @ outWeight[dModel, dModel] -> output.
+            var outArr = output.GetDataArray();
+            Array.Clear(outArr, 0, proj);
+            MatrixMultiplyHelper.MultiplyBlocked(ops,
+                new ReadOnlyMemory<double>(concatBuf, 0, proj),
+                new ReadOnlyMemory<double>(oW, 0, dModel * dModel),
+                new Memory<double>(outArr, 0, proj),
+                totalRows, dModel, dModel, dModel, dModel, dModel, allowParallel: true);
+
+            return output;
+        }
+        finally
+        {
+            pool.Return(qBuf);
+            pool.Return(kBuf);
+            pool.Return(vBuf);
+            pool.Return(concatBuf);
+        }
+    }
+
+    /// <summary>
+    /// Per-head fused SDPA for the double MHA fast path. Mirrors the float
+    /// <see cref="MultiHeadAttentionFusedSdpa"/>: each (batch, head) slice gathers Q/V contiguous
+    /// and K already-transposed into ONE pooled scratch (reused across the chunk's slices), runs
+    /// Q·Kᵀ → scaled+masked stable softmax → P·V, and scatters into <paramref name="concat"/> in
+    /// [B, seq, H, dHead] = [B*seq, dModel] layout. No full-scores matrix, no transpose buffers.
+    /// </summary>
+    private void MultiHeadAttentionFusedSdpaDouble(
+        double[] qd, double[] kd, double[] vd, int rowStride,
+        Tensor<bool>? mask, double scaleValue,
+        int batch, int heads, int seq, int dHead,
+        double[] concat, int dModel)
+    {
+        int bhCount = batch * heads;
+        var ops = MathHelper.GetNumericOperations<double>();
+        int qSoff = 0;
+        int vSoff = seq * dHead;
+        int ktoff = 2 * seq * dHead;
+        int scoff = 3 * seq * dHead;
+        int scratchLen = 3 * seq * dHead + seq * seq;
+        var pool = ArrayPool<double>.Shared;
+        int chunks = Math.Max(1, Math.Min(bhCount, CpuParallelSettings.MaxDegreeOfParallelism));
+
+        PersistentParallelExecutor.Instance.Execute(chunks, chunk =>
+        {
+            var scratch = pool.Rent(scratchLen);
+            try
+            {
+                for (int bh = chunk; bh < bhCount; bh += chunks)
+                {
+                    int b = bh / heads;
+                    int h = bh % heads;
+                    int headOff = h * dHead;
+
+                    // Gather: Q [seq×dHead], V [seq×dHead] contiguous; K transposed into [dHead×seq].
+                    for (int s = 0; s < seq; s++)
+                    {
+                        int row = (b * seq + s) * rowStride + headOff;
+                        int qdst = qSoff + s * dHead;
+                        int vdst = vSoff + s * dHead;
+                        for (int d = 0; d < dHead; d++)
+                        {
+                            scratch[qdst + d] = qd[row + d];
+                            scratch[vdst + d] = vd[row + d];
+                            scratch[ktoff + d * seq + s] = kd[row + d];   // Kᵀ
+                        }
+                    }
+
+                    // scores[seq×seq] = Q[seq×dHead] · Kᵀ[dHead×seq]. MultiplyBlocked accumulates → clear.
+                    var scoresMem = new Memory<double>(scratch, scoff, seq * seq);
+                    scoresMem.Span.Clear();
+                    MatrixMultiplyHelper.MultiplyBlocked(ops,
+                        new ReadOnlyMemory<double>(scratch, qSoff, seq * dHead),
+                        new ReadOnlyMemory<double>(scratch, ktoff, dHead * seq),
+                        scoresMem,
+                        seq, dHead, seq, dHead, seq, seq, allowParallel: false);
+
+                    // In-place scale + numerically-stable softmax, row by row.
+                    for (int i = 0; i < seq; i++)
+                    {
+                        int rowOff = scoff + i * seq;
+                        double maxVal = double.NegativeInfinity;
+                        for (int j = 0; j < seq; j++)
+                        {
+                            double v = scratch[rowOff + j] * scaleValue;
+                            if (mask != null && !mask[b, h, i, j]) v = double.NegativeInfinity;
+                            if (v > maxVal) maxVal = v;
+                            scratch[rowOff + j] = v;
+                        }
+                        if (double.IsNegativeInfinity(maxVal))
+                        {
+                            for (int j = 0; j < seq; j++) scratch[rowOff + j] = 0d;
+                            continue;
+                        }
+                        double sumExp = 0d;
+                        for (int j = 0; j < seq; j++)
+                        {
+                            double e = Math.Exp(scratch[rowOff + j] - maxVal);
+                            scratch[rowOff + j] = e;
+                            sumExp += e;
+                        }
+                        double inv = sumExp != 0d ? 1d / sumExp : 0d;
+                        for (int j = 0; j < seq; j++) scratch[rowOff + j] *= inv;
+                    }
+
+                    // out[seq×dHead] = P[seq×seq] · V[seq×dHead], reusing the Q region as output.
+                    var outMem = new Memory<double>(scratch, qSoff, seq * dHead);
+                    outMem.Span.Clear();
+                    MatrixMultiplyHelper.MultiplyBlocked(ops,
+                        new ReadOnlyMemory<double>(scratch, scoff, seq * seq),
+                        new ReadOnlyMemory<double>(scratch, vSoff, seq * dHead),
+                        outMem,
+                        seq, seq, dHead, seq, dHead, dHead, allowParallel: false);
+
+                    // Scatter into concat[B, seq, H, dHead] = [B*seq, dModel].
+                    for (int s = 0; s < seq; s++)
+                    {
+                        int dst = (b * seq + s) * dModel + headOff;
+                        int src = qSoff + s * dHead;
+                        for (int d = 0; d < dHead; d++)
+                            concat[dst + d] = scratch[src + d];
+                    }
+                }
+            }
+            finally
+            {
+                pool.Return(scratch);
+            }
+        });
+    }
 
     /// <summary>
     /// Generic-T path. Composes existing tensor-level primitives. Used for

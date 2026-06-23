@@ -78,5 +78,48 @@ public class MhaLeanSdpaAllocTests
             $"MHA forward allocated {kbPerCall:F0} KB/call; expected < 3072 KB (lean ~1024, " +
             "old weight-materializing path ~7200). Regressed to the non-lean SDPA?");
     }
+
+    private static Tensor<double> RandD(Random r, params int[] s)
+    {
+        var t = new Tensor<double>(s);
+        var sp = t.AsWritableSpan();
+        for (int i = 0; i < sp.Length; i++) sp[i] = r.NextDouble() * 2 - 1;
+        return t;
+    }
+
+    // #478 / #1675 regression guard: <double> MHA forward must use the pooled per-head fast path
+    // (MultiHeadAttentionForwardDouble), NOT fall to MultiHeadAttentionForwardGeneric — which
+    // materializes the full [B*H, seq, seq] attention scores + weights + four transpose tensors per
+    // call (unpooled, > 2^20 elems), measured at 54x the float path's allocation per MHA layer and
+    // the direct cause of a <double> transformer forward being ~65x slower than <float> on a
+    // memory-bounded host (GC/heap churn, not math). Measured here at a seq where the generic path's
+    // full-scores allocation is large enough to be unambiguous.
+    [Trait("Category", "Performance")]
+    [Fact]
+    public void MhaForward_Double_UsesPooledFastPath_NotGenericFullScores()
+    {
+        var eng = new CpuEngine();
+        const int batch = 1, seq = 256, dModel = 1280, numHeads = 20;
+        var r = new Random(2026);
+        var input = RandD(r, batch, seq, dModel);
+        var qW = RandD(r, dModel, dModel); var kW = RandD(r, dModel, dModel);
+        var vW = RandD(r, dModel, dModel); var oW = RandD(r, dModel, dModel);
+
+        for (int w = 0; w < 5; w++) _ = eng.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads);
+
+        const int n = 10;
+        long a0 = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < n; i++) _ = eng.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads);
+        long a1 = GC.GetAllocatedBytesForCurrentThread();
+        double kbPerCall = (a1 - a0) / 1024.0 / n;
+
+        // Fast path: pooled Q/K/V/concat scratch + one output tensor — a few MB/call. The generic
+        // full-scores path it replaced allocated ~tens of MB/call at this shape (the [1,20,256,256]
+        // scores + weights alone are ~10 MB each in double). 16 MB threshold catches a revert with
+        // a wide margin against measurement noise.
+        Assert.True(kbPerCall < 16384,
+            $"Double MHA forward allocated {kbPerCall:F0} KB/call; expected < 16384 KB (pooled fast " +
+            "path). Regressed to MultiHeadAttentionForwardGeneric's full-scores path (#478/#1675)?");
+    }
 #endif
 }
