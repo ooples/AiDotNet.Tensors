@@ -697,16 +697,18 @@ public static partial class BlasManaged
             return;
         }
 
-        // Shapes too small for the SIMD tile entirely: fall back to scalar 4×4.
-        if (m < mr || n < nr || m % mr != 0)
-        {
-            mr = 4; nr = 4;
-        }
-
-        // If still misaligned after the scalar fallback (m < 4 or n < 4 or m%4 != 0):
-        // route to Streaming. This is the D.1 correctness fix for genuinely tiny
-        // misaligned shapes; the Sub-D4 split above handles m >= mr cases.
-        if (m % mr != 0 || n % nr != 0)
+        // Shapes too small for, or unaligned to, the CHOSEN SIMD tile (mr, nr) route to Streaming,
+        // which correctly handles arbitrary tiny / unaligned shapes. The previous "reset to mr=nr=4
+        // then run PackBoth" fallback was UNSAFE for fp32: PackBoth's fp32 pack + 6×16 microkernel
+        // assume the mr=6/nr=16 tile, so an mr=4 fallback (e.g. m=4 — the 1×1 stride-2 conv whose
+        // im2col SGEMM is m=4, k=512, n=1024, which every ResNet/diffusion CNN forward hits) packed
+        // and indexed with a mismatched tile and overran ArrayPool<float>.Shared, corrupting the pool
+        // and crashing the test host with an AccessViolation on a later Rent. The Sub-D4 tail-split
+        // above already covers m >= mr && n >= nr unaligned shapes (aligned interior recurses to
+        // PackBoth; the m/n tails use Streaming); this catches the genuinely-small (m < mr or n < nr)
+        // and any residual unaligned shape. Note: m % mr / n % nr here use the ORIGINAL chosen tile,
+        // not a reset 4×4 — the reset was exactly what let m=4 slip past into the broken PackBoth path.
+        if (m < mr || n < nr || m % mr != 0 || n % nr != 0)
         {
             StreamingStrategy.Run<T>(
                 a, lda, transA,
