@@ -12616,9 +12616,15 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IntPtr srcPtr = source.Handle + sourceOffset * sizeof(float);
         IntPtr dstPtr = destination.Handle + destinationOffset * sizeof(float);
         ulong byteSize = (ulong)length * sizeof(float);
-        CuBlasNative.CheckCudaResult(
-            CuBlasNative.cuMemcpyDtoD(dstPtr, srcPtr, byteSize),
-            "cuMemcpyDtoD(strided)");
+        // Async during capture (sync cuMemcpyDtoD aborts capture with 906); sync otherwise. See Copy(src,dst,size).
+        if (IsStreamCapturing())
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuMemcpyDtoDAsync(dstPtr, srcPtr, byteSize, _stream),
+                "cuMemcpyDtoDAsync(strided)");
+        else
+            CuBlasNative.CheckCudaResult(
+                CuBlasNative.cuMemcpyDtoD(dstPtr, srcPtr, byteSize),
+                "cuMemcpyDtoD(strided)");
     }
 
     /// <inheritdoc/>
