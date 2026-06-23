@@ -51,6 +51,18 @@ internal static class StrategyDefaultTable
     {
         var bucket = Bucket(m, n, k);
 
+        // #653: the MediumMWide bucket (m∈[128,256], wide-N, k≥256) is mis-routed to PackAOnly
+        // for NON-transposed shapes (they reach this transposed-calibrated table via
+        // PrefersStrategyOverMachineKernel's k>2m decline). Re-derived by INTERLEAVED min-of-N on
+        // the post-#663 kernels (the merged machine-code GEMM compressed the strategy gaps): only
+        // SHALLOW-K (k≤256) still favors Streaming — packing overhead unamortized (e.g.
+        // 128×256×1536: Streaming 1.6 vs PackBoth 2.3ms). At k≥512 the improved PackBoth wins
+        // (192×512×1536), and deep-K wide-N now ALSO wins with PackBoth — NOT PackAOnly (that was
+        // an old-kernel artifact; on the new kernels PackAOnly is ~2× slower there). Everything
+        // past this falls through to the PackBoth arms below.
+        if (bucket == ShapeBucket.MediumMWide && k <= 256)
+            return PackingMode.ForceStreaming;
+
         // amd-avx2 mid-core (≤16T, this box). Calibrated for the TRANSPOSED shapes that
         // actually reach this table (--prewarm-autotune measurements): small/cube → Streaming
         // wins even transposed; ThinK (e.g. 512×512×64 transB) → PackBoth (Streaming is 2.5×
@@ -65,7 +77,13 @@ internal static class StrategyDefaultTable
                 ShapeBucket.TallThin => PackingMode.ForceStreaming,
                 ShapeBucket.MediumSquare => PackingMode.ForceStreaming,  // 128³ transB: Streaming
                 ShapeBucket.ThinK => PackingMode.ForcePackBoth,          // 512×512×64 transB: PackBoth ≫ Streaming
-                ShapeBucket.MediumMWide => PackingMode.ForcePackAOnly,   // 197×768×768 transB → PackBoth via PackAOnly
+                // #653: was ForcePackAOnly, calibrated for TRANSPOSED shapes (which redirect
+                // PackAOnly→PackBoth under transB and win). But PrefersStrategyOverMachineKernel
+                // declines the machine kernel for deep-K small-M (k>2m), so NON-transposed
+                // FFN-shaped GEMMs (m∈[132,256], wide-N, deep-K) also reach here — and for them
+                // PackAOnly is pathologically 4-6× slower than PackBoth (132×384×1536: 26ms vs
+                // ~6ms). PackBoth is also where the transB redirect lands, so route there directly.
+                ShapeBucket.MediumMWide => PackingMode.ForcePackBoth,
                 _ => PackingMode.ForcePackBoth,
             };
         }
@@ -80,7 +98,7 @@ internal static class StrategyDefaultTable
                 ShapeBucket.TallThin => PackingMode.ForceStreaming,
                 ShapeBucket.MediumSquare => PackingMode.ForcePackBoth,
                 ShapeBucket.ThinK => PackingMode.ForcePackAOnly,
-                ShapeBucket.MediumMWide => PackingMode.ForcePackAOnly,
+                ShapeBucket.MediumMWide => PackingMode.ForcePackBoth, // #653: see cpu≤1 note — PackAOnly is pathological for non-transposed MediumMWide
                 _ => PackingMode.ForcePackBoth,
             };
         }
@@ -95,7 +113,7 @@ internal static class StrategyDefaultTable
             ShapeBucket.TallThin => PackingMode.ForceStreaming,
             ShapeBucket.ThinK => PackingMode.ForcePackAOnly,
             ShapeBucket.MediumSquare => PackingMode.ForcePackAOnly,
-            ShapeBucket.MediumMWide => PackingMode.ForcePackAOnly,
+            ShapeBucket.MediumMWide => PackingMode.ForcePackBoth, // #653: see cpu≤1 note — PackAOnly is pathological for non-transposed MediumMWide
             _ => PackingMode.ForcePackBoth,
         };
     }

@@ -173,10 +173,30 @@ internal static class BackgroundAutotuner
         for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
         var opts = new BlasOptions<float> { PackingMode = mode };
         for (int w = 0; w < 3; w++) BlasManaged.Gemm<float>(a, aCols, id.TransA, b, bCols, id.TransB, c, id.N, id.M, id.N, id.K, opts);
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        for (int w = 0; w < 10; w++) BlasManaged.Gemm<float>(a, aCols, id.TransA, b, bCols, id.TransB, c, id.N, id.M, id.N, id.K, opts);
-        sw.Stop();
-        return sw.Elapsed.TotalMilliseconds;
+        return MinOfN<float>(a, aCols, id.TransA, b, bCols, id.TransB, c, id.M, id.N, id.K, in opts);
+    }
+
+    /// <summary>
+    /// #653: per-run MIN over N timings, NOT the sum/mean of a run-batch. The background sweep
+    /// runs concurrently with foreground work (BelowNormal, but not exclusive), so any single
+    /// run can be preempted/contended; summing 10 runs lets one spike inflate a strategy and
+    /// pick the wrong winner. The MIN captures the contention-free slice — the strategy's true
+    /// cost — and is what makes the learned choice match a clean micro-benchmark.
+    /// </summary>
+    private static double MinOfN<T>(
+        T[] a, int aCols, bool transA, T[] b, int bCols, bool transB,
+        T[] c, int m, int n, int k, in BlasOptions<T> opts, int reps = 12) where T : unmanaged
+    {
+        double best = double.MaxValue;
+        for (int i = 0; i < reps; i++)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            BlasManaged.Gemm<T>(a, aCols, transA, b, bCols, transB, c, n, m, n, k, opts);
+            sw.Stop();
+            double ms = sw.Elapsed.TotalMilliseconds;
+            if (ms < best) best = ms;
+        }
+        return best;
     }
 
     private static double TimeFp64(SightingTracker.ShapeId id, PackingMode mode)
@@ -191,9 +211,6 @@ internal static class BackgroundAutotuner
         for (int i = 0; i < b.Length; i++) b[i] = rng.NextDouble() * 2 - 1;
         var opts = new BlasOptions<double> { PackingMode = mode };
         for (int w = 0; w < 3; w++) BlasManaged.Gemm<double>(a, aCols, id.TransA, b, bCols, id.TransB, c, id.N, id.M, id.N, id.K, opts);
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        for (int w = 0; w < 10; w++) BlasManaged.Gemm<double>(a, aCols, id.TransA, b, bCols, id.TransB, c, id.N, id.M, id.N, id.K, opts);
-        sw.Stop();
-        return sw.Elapsed.TotalMilliseconds;
+        return MinOfN<double>(a, aCols, id.TransA, b, bCols, id.TransB, c, id.M, id.N, id.K, in opts);
     }
 }
