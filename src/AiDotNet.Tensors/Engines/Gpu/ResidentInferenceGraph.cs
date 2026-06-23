@@ -122,6 +122,17 @@ public sealed class ResidentInferenceGraph : System.IDisposable
             _ = forward(s); // pre-residency: bind resident buffers (sync uploads here are fine — not capturing)
             for (int i = 0; i < s.Length; i++) _engine.RefreshResidentInputInPlace(s[i]);
 
+            // RESIDENCY AUDIT (AIDOTNET_RESIDENT_AUDIT=1): run one more resident pass with the audit log
+            // cleared first, so only GENUINELY non-resident ops (sync HtoD/DtoH every pass — not one-time
+            // cache fills) are recorded. Lists the whole residency work-list in ONE run; then bail (no capture).
+            if (System.Environment.GetEnvironmentVariable("AIDOTNET_RESIDENT_AUDIT") == "1")
+            {
+                try { System.IO.File.Delete(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_resident_audit.txt")); } catch { }
+                var auditOut = forward(s);
+                _scope.Dispose(); _scope = null; _disabled = true;
+                return auditOut;
+            }
+
             Tensor<T>? captured = null;
             var exec = _engine.CaptureGpuGraph(() => { captured = forward(s); });
             if (exec != System.IntPtr.Zero && captured is not null)

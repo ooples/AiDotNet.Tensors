@@ -1077,10 +1077,42 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         return log;
     }
 
+    // #1650 residency AUDIT: when AIDOTNET_RESIDENT_AUDIT=1, log a compact call-stack at each sync HtoD/DtoH
+    // (the exact ops that would abort CUDA-graph capture). Run the forward once under ResidentStepActive AFTER a
+    // warmup (so one-time cache-fills don't show) → the full set of NOT-YET-RESIDENT ops in ONE pass, instead of
+    // capture-aborting on the first. The dedup'd op frames are the residency-grind work-list.
+    private static readonly bool s_residentAudit =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_RESIDENT_AUDIT") == "1";
+    internal static void AuditSyncIO(string kind, long bytes)
+    {
+        if (!s_residentAudit) return;
+        try
+        {
+            var st = new System.Diagnostics.StackTrace(2, false);
+            var sb = new System.Text.StringBuilder();
+            for (int i = 0; i < st.FrameCount; i++)
+            {
+                var m = st.GetFrame(i)?.GetMethod();
+                var tn = m?.DeclaringType?.Name;
+                if (tn is null) continue;
+                if (tn.Contains("Layer") || tn.Contains("NoisePredictor") || tn.Contains("ResBlock")
+                    || tn.Contains("Attention") || tn.Contains("DirectGpuTensorEngine") || tn.Contains("CpuEngine"))
+                {
+                    sb.Append(tn).Append('.').Append(m!.Name).Append(" <- ");
+                    if (sb.Length > 300) break;
+                }
+            }
+            System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_resident_audit.txt"),
+                $"{kind}\t{bytes}\t{sb}\n");
+        }
+        catch { }
+    }
+
     public IGpuBuffer AllocateBuffer(float[] data)
     {
         if (!IsAvailable)
             throw new InvalidOperationException("CUDA backend is not available.");
+        AuditSyncIO("HtoD-alloc", (long)data.Length * sizeof(float));
 
         int size = data.Length;
         if (size <= 0)
@@ -1472,6 +1504,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // value oscillated run-to-run between updated and pre-step). One stream
         // sync on the host-read path (already a synchronization point) closes
         // the race with no effect on the GPU-resident training hot path.
+        AuditSyncIO("DtoH-download", (long)buffer.Size * sizeof(float));
         CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamSynchronize(_stream), "cuStreamSynchronize(download)");
 
         ulong byteSize = (ulong)(buffer.Size * sizeof(float));
