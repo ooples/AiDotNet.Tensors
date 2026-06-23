@@ -32,8 +32,24 @@ public sealed class Conv2DIm2colArrayPoolReproTests
         var kernel = Rand(new[] { outC, inC, k, k }, seed + 1);
         var output = new Tensor<float>(new[] { 1, outC, oHW, oHW });
         eng.Conv2DInto(output, input, kernel, stride, 0, 1);
-        float v = output[0, 0, 0, 0];
-        Assert.False(float.IsNaN(v) || float.IsInfinity(v));
+
+        // Validate the WHOLE output buffer, not just element 0: every value must be
+        // finite (pool corruption / a mismatched-tile overrun shows up as NaN/Inf
+        // partway through the buffer), and the conv of random non-zero input*kernel
+        // must produce a non-zero result (an all-zero buffer means the GEMM was
+        // silently skipped / wrote nothing — a no-op regression the single-element
+        // check would miss).
+        var span = output.AsWritableSpan();
+        bool anyNonZero = false;
+        for (int i = 0; i < span.Length; i++)
+        {
+            float v = span[i];
+            Assert.False(float.IsNaN(v) || float.IsInfinity(v),
+                $"non-finite output at index {i} (inC={inC} hw={hw} outC={outC} k={k} s={stride})");
+            if (v != 0f) anyNonZero = true;
+        }
+        Assert.True(anyNonZero,
+            $"conv produced an all-zero output buffer (inC={inC} hw={hw} outC={outC} k={k} s={stride})");
     }
 
     [Fact]
@@ -46,11 +62,34 @@ public sealed class Conv2DIm2colArrayPoolReproTests
         var b = new float[K * N];
         for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() - 0.5);
         for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() - 0.5);
+
+        // Naive row-major reference (a,b are fixed across iterations). Asserting against
+        // this validates not just "no NaN/crash" but that the shape that used to slip into
+        // the broken mr=4 PackBoth fallback now produces the CORRECT product through the
+        // Streaming reroute — over the ENTIRE C buffer, not element 0 alone.
+        var expected = new float[M * N];
+        for (int i = 0; i < M; i++)
+            for (int j = 0; j < N; j++)
+            {
+                double acc = 0;
+                for (int p = 0; p < K; p++) acc += (double)a[i * K + p] * b[p * N + j];
+                expected[i * N + j] = (float)acc;
+            }
+
         for (int it = 0; it < 300; it++)
         {
             var c = new float[M * N];
             AiDotNet.Tensors.Engines.Simd.SimdGemm.Sgemm(a, b, c, M, K, N); // 6-arg overload (the one Conv2DIm2colGemm uses)
-            Assert.False(float.IsNaN(c[0]) || float.IsInfinity(c[0]));
+            for (int idx = 0; idx < c.Length; idx++)
+            {
+                float v = c[idx];
+                Assert.False(float.IsNaN(v) || float.IsInfinity(v), $"non-finite C[{idx}] on iteration {it}");
+                // K=512 fp32 accumulation differs from the naive order by a few ULPs scaled
+                // by the magnitude (~5-6 here); 1e-2 absolute is comfortably above that and
+                // well below any corruption-sized error.
+                Assert.True(Math.Abs(v - expected[idx]) < 1e-2f,
+                    $"C[{idx}]={v} != expected {expected[idx]} on iteration {it}");
+            }
             // Force ArrayPool traffic between GEMMs so corruption surfaces as an AV on Rent.
             var scratch = System.Buffers.ArrayPool<float>.Shared.Rent(4096);
             System.Buffers.ArrayPool<float>.Shared.Return(scratch);
