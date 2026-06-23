@@ -5491,7 +5491,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         result = null;
         if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
         if (activationParams is not null || bias is null || weights.Rank != 2 || !input.IsContiguous) return false;
-        if (activation != FusedActivationType.None && activation != FusedActivationType.ReLU && activation != FusedActivationType.GELU)
+        if (activation != FusedActivationType.None && activation != FusedActivationType.ReLU
+            && activation != FusedActivationType.GELU && activation != FusedActivationType.Swish)
             return false;
         if (!TryGetBackend(out var backend) || backend is not Engines.DirectGpu.CUDA.CudaBackend cb) return false;
         int K = weights.Shape._dims[0];   // input features
@@ -5515,6 +5516,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             cb.BiasAdd(outBuf, bBuf.Buffer, outBuf, M, N);                     // += bias[N] (in place)
             if (activation == FusedActivationType.ReLU) cb.Relu(outBuf, outBuf, M * N);
             else if (activation == FusedActivationType.GELU) cb.Gelu(outBuf, outBuf, M * N);
+            else if (activation == FusedActivationType.Swish) cb.Swish(outBuf, outBuf, M * N);
             ResidentSyncCheck("FusedLinear");
             BindResidentBuffer(outTensor, outBuf, backend);
             result = outTensor;
