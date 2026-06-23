@@ -1444,6 +1444,20 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private IntPtr AllocDeviceMemoryAsync(ulong byteSize)
     {
         var r = CuBlasNative.cuMemAllocAsync(out IntPtr p, byteSize, _stream);
+        if (r != CudaResult.Success && IsStreamCapturing())
+        {
+            // #1650/#638 capture: during stream capture cuCtxSynchronize / cuMemPoolTrimTo are ILLEGAL
+            // (they throw CUDA 900 and abort the capture — blocker #2 of the diffusion UNet capture, a
+            // scratch alloc inside GroupNormSwish's SwishInPlace). The pre-residency warmup pass already
+            // grew the async pool for these exact allocations, so the capture-time alloc is a pool-hit
+            // memory-node; if it still failed, the synchronizing reclamation cannot help mid-capture
+            // anyway. Surface the real alloc error (capture aborts → graceful eager fallback) instead of
+            // masking it behind an illegal-sync CUDA 900.
+            if (r != CudaResult.Success) GpuMemoryTracker.Dump($"cuMemAllocAsync OOM (capturing) requesting {byteSize} bytes");
+            CuBlasNative.CheckCudaResult(r, "cuMemAllocAsync (during capture)");
+            GpuMemoryTracker.OnAlloc(p, (long)byteSize);
+            return p;
+        }
         if (r != CudaResult.Success)
         {
             // Sync so pending cuMemFreeAsync reclamations land back in the pool, then TRIM the pool's
@@ -7514,9 +7528,15 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         using var _ = PushContext();
         ulong byteSize = (ulong)size * sizeof(float);
+        // #1650/#638 capture: async device->device on the backend's own stream so this op is
+        // CAPTURABLE inside a CUDA graph. The synchronous cuMemcpyDtoD throws CUDA 906
+        // ("operation not permitted while stream is capturing") and aborts graph capture — it was
+        // the first blocker in the diffusion UNet capture (resident conv-bias add's a->out copy).
+        // Device-side ordering is preserved (later ops on the same stream serialize after it);
+        // host reads go through the download path which synchronizes the stream.
         CuBlasNative.CheckCudaResult(
-            CuBlasNative.cuMemcpyDtoD(destination.Handle, source.Handle, byteSize),
-            "cuMemcpyDtoD");
+            CudaNativeBindings.cuMemcpyDtoDAsync(destination.Handle, source.Handle, byteSize, _stream),
+            "cuMemcpyDtoDAsync (Copy)");
     }
 
     public void Fill(IGpuBuffer buffer, float value, int size)
