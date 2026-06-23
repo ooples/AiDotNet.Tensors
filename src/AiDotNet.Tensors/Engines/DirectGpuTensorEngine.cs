@@ -6518,7 +6518,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
                 var biasedData = FinishGpuOp<T>(backend, outputBuffer, outputSize);
                 outputHandedOff = true;
-                return new Tensor<T>(biasedData, new[] { batch, outChannels, outHeight, outWidth });
+                var biasedT = new Tensor<T>(biasedData, new[] { batch, outChannels, outHeight, outWidth });
+                // #1650/#638: during the capture step, ALSO bind the output buffer as resident so a
+                // downstream in-place/resident op (e.g. the ResBlock residual add reading this conv's
+                // output as operand b) sees TryGetGpuBuffer() != null and stays on-device instead of
+                // downloading (CUDA-900 in capture). FinishGpuOp already keeps the buffer alive; this
+                // additionally exposes it for resident reuse. Gated → non-capture inference unchanged.
+                if (ResidentStepActive && typeof(T) == typeof(float))
+                    BindResidentBuffer(biasedT, outputBuffer.Buffer, backend);
+                return biasedT;
             }
             else
             {
@@ -6539,7 +6547,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // lifetime from here, so it must NOT be disposed in the finally.
                 var resultData = FinishGpuOp<T>(backend, outputBuffer, outputSize);
                 outputHandedOff = true;
-                return new Tensor<T>(resultData, new[] { batch, outChannels, outHeight, outWidth });
+                var resultT = new Tensor<T>(resultData, new[] { batch, outChannels, outHeight, outWidth });
+                // #1650/#638: bind resident during capture (see bias path above) so downstream resident
+                // ops reuse the conv output on-device. Gated on ResidentStepActive → non-capture unchanged.
+                if (ResidentStepActive && typeof(T) == typeof(float))
+                    BindResidentBuffer(resultT, outputBuffer.Buffer, backend);
+                return resultT;
             }
         }
         catch
