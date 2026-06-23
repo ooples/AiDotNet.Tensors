@@ -8993,8 +8993,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var queryBuffer = GetOrAllocateBuffer(backend, query);
         using var keyBuffer = GetOrAllocateBuffer(backend, key);
         using var valueBuffer = GetOrAllocateBuffer(backend, value);
-        using var outputBuffer = AllocateOutputBuffer(backend, batch * heads * seqQ * headDim);
-        using var statsBuffer = AllocateOutputBuffer(backend, batch * heads * seqQ);
+        var outputBuffer = AllocateOutputBuffer(backend, batch * heads * seqQ * headDim);
+        var statsBuffer = AllocateOutputBuffer(backend, batch * heads * seqQ);
+        bool faHanded = false;
 
         // Upload attention bias to GPU if provided, with shape validation
         int biasBatchStride = 0;
@@ -9008,6 +9009,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.FlashAttentionV2(queryBuffer.Buffer, keyBuffer.Buffer, valueBuffer.Buffer, outputBuffer.Buffer, statsBuffer.Buffer,
                 batch, heads, seqQ, seqK, headDim, scaleFloat, isCausal,
                 biasBufferHandle.Buffer, biasBatchStride);
+
+            // #1650 capture path: DEFER the output/stats downloads (a sync DtoH aborts capture with 900).
+            // FinishGpuOp keeps the buffers resident + lazily materialized; downstream resident ops read them
+            // on-device and a host read downloads after scope.Execute(). softmaxStats is backward-only (unused
+            // in the inference forward) but deferred the same way for shape/contract parity.
+            if (ResidentStepActive && typeof(T) == typeof(float))
+            {
+                T[] outResident = FinishGpuOp<T>(backend, outputBuffer, batch * heads * seqQ * headDim);
+                T[] statsResident = FinishGpuOp<T>(backend, statsBuffer, batch * heads * seqQ);
+                faHanded = true; // FinishGpuOp owns the buffers' lifetime now (activation cache)
+                softmaxStats = new Tensor<T>(statsResident, new[] { batch, heads, seqQ });
+                return new Tensor<T>(outResident, new[] { batch, heads, seqQ, headDim });
+            }
 
             // DownloadBuffer uses blocking read, Synchronize() removed for performance
             float[] outputFloat = new float[batch * heads * seqQ * headDim];
@@ -9026,6 +9040,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             // Fall back to CPU on any GPU error
             return base.FlashAttention(query, key, value, scale, isCausal, out softmaxStats, attentionBias);
+        }
+        finally
+        {
+            // Free the GPU buffers unless they were handed to FinishGpuOp (resident path owns them).
+            if (!faHanded) { outputBuffer.Dispose(); statsBuffer.Dispose(); }
         }
     }
 
