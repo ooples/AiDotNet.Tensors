@@ -537,6 +537,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private IGpuBuffer? _stableCaptureOutput;
     private int _stableCaptureOutputSize;
 
+    // #1650/#638 hardware-FP16 conv lever (AIDOTNET_FP16_CONV=1): route the resident conv through the in-kernel
+    // __half2 conv (conv2d_direct_fp16hw, FP32 in/out, FP16 compute) on a CUDA-TOOLKIT box. No-op on a driver-
+    // only box (the kernel isn't compiled → Fp16HwConvAvailable false → FP32 fallback). Default OFF.
+    private static readonly bool s_fp16Conv =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_FP16_CONV") == "1";
+
     /// <summary>Pre-capture (sync alloc — call OUTSIDE stream capture): allocate/reuse a persistent output buffer
     /// sized to the forward's output. float only / no-op off CUDA.</summary>
     public void PrepareStableCaptureOutput<T>(Tensor<T> sampleOutput)
@@ -4920,8 +4926,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var bufIn = GetOrAllocateContiguousInputBuffer(rbk, input);
                 using var bufK = GetWeightBufferPreferResident(rbk, kernel, PersistentTensorRole.Weights);
                 var outBuf = GetOrCreateResidentBuffer(rbk, output, output.Length);
-                rbk.Conv2D(bufIn.Buffer, bufK.Buffer, outBuf,
-                    b, ic, ih, iw, oc, oh, ow, kh, kw, stride, stride, padding, padding, dilation, dilation);
+
+                // #1650/#638 hardware-FP16 conv lever: on a CUDA-TOOLKIT box (Fp16HwConvAvailable) route through
+                // the in-kernel __half2 conv — FP32 in/out (same memory, capture-safe), FP16 compute (~2x on the
+                // FMA-bound deep convs). Driver-only box: Fp16HwConvAvailable is false → skip → FP32 below. The
+                // hw kernel reads FP32 and converts in-register, so NO cast buffers / activation chain needed.
+                bool fp16Ran = false;
+                if (s_fp16Conv && rbk is Engines.DirectGpu.CUDA.CudaBackend cudaRbk && cudaRbk.Fp16HwConvAvailable)
+                {
+                    try
+                    {
+                        cudaRbk.Conv2DDirectFp16Hw(bufIn.Buffer, bufK.Buffer, outBuf,
+                            b, ic, ih, iw, oc, oh, ow, kh, kw, stride, stride, padding, padding, dilation, dilation);
+                        fp16Ran = true;
+                    }
+                    catch (Exception) { fp16Ran = false; } // any issue → FP32 fallback below
+                }
+                if (!fp16Ran)
+                    rbk.Conv2D(bufIn.Buffer, bufK.Buffer, outBuf,
+                        b, ic, ih, iw, oc, oh, ow, kh, kw, stride, stride, padding, padding, dilation, dilation);
                 ResidentSyncCheck("Conv2DInto");
                 BindResidentBuffer(output, outBuf, rbk);
                 return;
