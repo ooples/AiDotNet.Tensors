@@ -5058,6 +5058,34 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel(k, grid, DefaultBlockSize, a);
     }
 
+    /// <summary>True when the FP16-in im2col kernel compiled (needs cuda_fp16.h). #1650/#638 #3.</summary>
+    public bool Fp16Im2colFromFp16Available => _kernelCache.ContainsKey("im2col_kn_fp16_from_fp16");
+
+    /// <summary>FUSED im2col with an FP16 input + FP16 output, TRANSPOSED [K,N] layout (outputHalf = half/ushort
+    /// buffer of K*N). Same as <see cref="UnfoldKNFp16Hw"/> but the input is already half-resident (each tap loaded
+    /// via __half2float, oob → 0) — avoids the FP32→FP16 cast pass when the activation feeding the conv is FP16.
+    /// Pair with GemmFp16(weightsHalf[outC,K], colHalf[K,N]) → out[outC,N]. Capture-safe (one kernel). #1650/#638 #3.</summary>
+    public unsafe void UnfoldKNFp16FromFp16(IGpuBuffer inputHalf, IGpuBuffer outputHalf,
+        int batch, int channels, int height, int width,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
+    {
+        using var _ = PushContext();
+        if (!_kernelCache.TryGetValue("im2col_kn_fp16_from_fp16", out var k))
+            throw new InvalidOperationException("CUDA kernel not found: im2col_kn_fp16_from_fp16");
+        IntPtr inputPtr = inputHalf.Handle, outputPtr = outputHalf.Handle;
+        int outH = (height + 2 * padH - ((kernelH - 1) * dilationH + 1)) / strideH + 1;
+        int outW = (width + 2 * padW - ((kernelW - 1) * dilationW + 1)) / strideW + 1;
+        int totalPatches = batch * outH * outW;
+        void** a = stackalloc void*[16];
+        a[0] = &inputPtr; a[1] = &outputPtr;
+        a[2] = &batch; a[3] = &channels; a[4] = &height; a[5] = &width;
+        a[6] = &kernelH; a[7] = &kernelW; a[8] = &strideH; a[9] = &strideW;
+        a[10] = &padH; a[11] = &padW; a[12] = &dilationH; a[13] = &dilationW; a[14] = &outH; a[15] = &outW;
+        long elems = (long)totalPatches * (channels * kernelH * kernelW); // N*K threads (one per col element)
+        uint grid = (uint)((elems + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(k, grid, DefaultBlockSize, a);
+    }
+
     /// <summary>Lazily spin up the cuDNN context + convolution helper on
     /// the first call that routes Conv2D through the vendor path. Both
     /// live for the lifetime of this backend and are released in
@@ -12099,6 +12127,64 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[0] = &inPtr; args[1] = &gPtr; args[2] = &bPtr; args[3] = &outPtr;
         args[4] = &meanPtr; args[5] = &varPtr; args[6] = &rows; args[7] = &cols; args[8] = &eps;
         LaunchKernelWithSharedMem(kernel, (uint)rows, block, block * sizeof(float), args);
+    }
+
+    /// <summary>True when the fused FP16 GroupNorm+Swish kernel compiled (driver-only, no cuda_fp16.h). #1650/#638 #3.</summary>
+    public bool Fp16GroupNormSwishAvailable => _kernelCache.ContainsKey("fp16_groupnorm_swish");
+
+    /// <summary>FP16-native fused GroupNorm + Swish: ONE BLOCK PER (batch, group). input/output are FP16 buffers
+    /// [batch, channels, spatial]; gamma/beta are FP32 (per-channel). Population variance (÷groupSize), eps inside
+    /// the rsqrt, then affine + Swish (x/(1+exp(-x))) — matches the FP32 groupnorm_forward + Swish. #1650/#638 #3.</summary>
+    public unsafe void Fp16GroupNormSwish(IGpuBuffer inHalf, IGpuBuffer gammaFp32, IGpuBuffer betaFp32, IGpuBuffer outHalf,
+        int batch, int numGroups, int channels, int spatial, float eps)
+    {
+        if (inHalf is null) throw new ArgumentNullException(nameof(inHalf));
+        if (gammaFp32 is null) throw new ArgumentNullException(nameof(gammaFp32));
+        if (betaFp32 is null) throw new ArgumentNullException(nameof(betaFp32));
+        if (outHalf is null) throw new ArgumentNullException(nameof(outHalf));
+        if (batch <= 0 || channels <= 0 || spatial <= 0) throw new ArgumentException($"batch/channels/spatial must be positive (batch={batch}, channels={channels}, spatial={spatial}).");
+        if (numGroups <= 0 || channels % numGroups != 0) throw new ArgumentException($"numGroups must be positive and divide channels (numGroups={numGroups}, channels={channels}).");
+        long matHalfBytes = (long)batch * channels * spatial * Fp16ByteWidth;
+        long chanFp32Bytes = (long)channels * sizeof(float);
+        if (inHalf.SizeInBytes < matHalfBytes) throw new ArgumentException($"input half buffer too small: {inHalf.SizeInBytes} < {matHalfBytes}.");
+        if (outHalf.SizeInBytes < matHalfBytes) throw new ArgumentException($"output half buffer too small: {outHalf.SizeInBytes} < {matHalfBytes}.");
+        if (gammaFp32.SizeInBytes < chanFp32Bytes) throw new ArgumentException($"gamma FP32 buffer too small: {gammaFp32.SizeInBytes} < {chanFp32Bytes}.");
+        if (betaFp32.SizeInBytes < chanFp32Bytes) throw new ArgumentException($"beta FP32 buffer too small: {betaFp32.SizeInBytes} < {chanFp32Bytes}.");
+        if (eps <= 0f || float.IsNaN(eps) || float.IsInfinity(eps)) throw new ArgumentOutOfRangeException(nameof(eps), eps, "eps must be finite and positive.");
+        if (!_kernelCache.TryGetValue("fp16_groupnorm_swish", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: fp16_groupnorm_swish");
+        using var _ = PushContext();
+        const uint block = 256u;
+        IntPtr inPtr = inHalf.Handle, gPtr = gammaFp32.Handle, bPtr = betaFp32.Handle, outPtr = outHalf.Handle;
+        void** args = stackalloc void*[9];
+        args[0] = &inPtr; args[1] = &gPtr; args[2] = &bPtr; args[3] = &outPtr;
+        args[4] = &batch; args[5] = &numGroups; args[6] = &channels; args[7] = &spatial; args[8] = &eps;
+        LaunchKernelWithSharedMem(kernel, (uint)(batch * numGroups), block, block * sizeof(float), args);
+    }
+
+    /// <summary>True when the FP16 per-channel broadcast-add kernel compiled (driver-only, no cuda_fp16.h). #1650/#638 #3.</summary>
+    public bool Fp16BroadcastAddChannelAvailable => _kernelCache.ContainsKey("fp16_broadcast_add_channel");
+
+    /// <summary>FP16-native per-channel broadcast add (conv bias): ioHalf[b,c,sp] += biasHalf[b,c], in place.
+    /// Both are FP16 buffers (io = [batch, channels, spatial], bias = [batch, channels]); FP32 add. #1650/#638 #3.</summary>
+    public unsafe void Fp16BroadcastAddChannel(IGpuBuffer ioHalf, IGpuBuffer biasHalf, int batch, int channels, int spatial)
+    {
+        if (ioHalf is null) throw new ArgumentNullException(nameof(ioHalf));
+        if (biasHalf is null) throw new ArgumentNullException(nameof(biasHalf));
+        if (batch <= 0 || channels <= 0 || spatial <= 0) throw new ArgumentException($"batch/channels/spatial must be positive (batch={batch}, channels={channels}, spatial={spatial}).");
+        long ioHalfBytes = (long)batch * channels * spatial * Fp16ByteWidth;
+        long biasHalfBytes = (long)batch * channels * Fp16ByteWidth;
+        if (ioHalf.SizeInBytes < ioHalfBytes) throw new ArgumentException($"io half buffer too small: {ioHalf.SizeInBytes} < {ioHalfBytes}.");
+        if (biasHalf.SizeInBytes < biasHalfBytes) throw new ArgumentException($"bias half buffer too small: {biasHalf.SizeInBytes} < {biasHalfBytes}.");
+        if (!_kernelCache.TryGetValue("fp16_broadcast_add_channel", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: fp16_broadcast_add_channel");
+        using var _ = PushContext();
+        long elems = (long)batch * channels * spatial;
+        uint grid = (uint)((elems + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr ioPtr = ioHalf.Handle, biasPtr = biasHalf.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &ioPtr; args[1] = &biasPtr; args[2] = &batch; args[3] = &channels; args[4] = &spatial;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
     /// <summary>FP16-native GELU backward: gradIn = gradOut * gelu'(x). All FP16 buffers; FP32 math in-register.

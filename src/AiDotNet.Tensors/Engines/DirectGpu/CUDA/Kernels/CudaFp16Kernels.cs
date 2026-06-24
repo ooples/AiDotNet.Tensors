@@ -503,6 +503,42 @@ extern ""C"" __global__ void conv2d_direct_fp16hw(
     }
     output[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = acc;
 }
+
+// FP16-IN variant of im2col_kn_fp16hw: input is already FP16 (unsigned short), output FP16 col[K,N] in the SAME
+// TRANSPOSED [K,N] layout (N=batch*outH*outW, K=channels*kH*kW). Each tap is loaded via __half2float (oob → 0);
+// avoids a separate FP16→FP32 cast pass when the activation feeding the conv is already half-resident
+// (#1650/#638 #3 — FP16-activation diffusion inference). ONE THREAD PER col element (N*K threads), fully coalesced.
+extern ""C"" __global__ __launch_bounds__(256) void im2col_kn_fp16_from_fp16(
+    const unsigned short* __restrict__ input, unsigned short* __restrict__ output,
+    int batch, int channels, int height, int width,
+    int kernelH, int kernelW, int strideH, int strideW,
+    int padH, int padW, int dilationH, int dilationW, int outH, int outW)
+{
+    int N = batch * outH * outW;
+    int K = channels * kernelH * kernelW;
+    long t = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= (long)N * K) return;
+    int n = (int)(t % N);     // output position (fastest — coalesced)
+    int k = (int)(t / N);     // unrolled (c,kh,kw) row
+    int b = n / (outH * outW);
+    int rem = n % (outH * outW);
+    int oh = rem / outW;
+    int ow = rem % outW;
+    int kw = k % kernelW;
+    int kh = (k / kernelW) % kernelH;
+    int c  = k / (kernelW * kernelH);
+    int ih = oh * strideH - padH + kh * dilationH;
+    int iw = ow * strideW - padW + kw * dilationW;
+    float val;
+    if (ih >= 0 && ih < height && iw >= 0 && iw < width) {
+        int idx = ((b * channels + c) * height + ih) * width + iw;
+        val = __half2float(*reinterpret_cast<const __half*>(&input[idx]));
+    } else {
+        val = 0.0f;
+    }
+    __half h = __float2half(val);
+    output[t] = *reinterpret_cast<unsigned short*>(&h); // store the half BITS (NOT a value-convert __half→ushort)
+}
 ";
     }
 
@@ -515,6 +551,7 @@ extern ""C"" __global__ void conv2d_direct_fp16hw(
         {
             "im2col_kn_fp16hw",
             "conv2d_direct_fp16hw",
+            "im2col_kn_fp16_from_fp16",
             "convert_fp32_to_fp16",
             "convert_fp16_to_fp32",
             "convert_fp32_to_fp16_rounding",

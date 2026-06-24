@@ -172,6 +172,71 @@ extern ""C"" __global__ void fp16_layernorm_native(
     }
 }
 
+// FP16-NATIVE fused GroupNorm + Swish: ONE BLOCK PER (batch, group). Reads FP16 directly, mean/population-variance
+// reductions in FP32 (mirrors fp16_layernorm_native's full-block tree reduction — no warp-size assumption), then
+// applies affine gamma/beta (FP32) followed by Swish (x/(1+exp(-x))) in-register and writes FP16. gamma/beta are
+// FP32 (per-channel). Population variance (÷groupSize), eps inside the rsqrt — matches the FP32 groupnorm_forward
+// + swish semantics. Shared mem = blockDim.x floats. #1650/#638 #3 (FP16-activation diffusion inference).
+extern ""C"" __global__ void fp16_groupnorm_swish(
+    const unsigned short* __restrict__ input, const float* __restrict__ gamma, const float* __restrict__ beta,
+    unsigned short* __restrict__ output, int batch, int numGroups, int channels, int spatial, float eps)
+{
+    int blockId = blockIdx.x;
+    int g = blockId % numGroups;
+    int b = blockId / numGroups;
+    if (b >= batch) return;
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x; int bs = blockDim.x;
+    int channelsPerGroup = channels / numGroups;
+    int groupSize = channelsPerGroup * spatial;
+    // mean (FP32)
+    float s = 0.0f;
+    for (int i = tid; i < groupSize; i += bs) {
+        int c = g * channelsPerGroup + i / spatial;
+        int sp = i % spatial;
+        s += h2f(input[(b * channels + c) * spatial + sp]);
+    }
+    sdata[tid] = s; __syncthreads();
+    for (int st = bs >> 1; st > 0; st >>= 1) { if (tid < st) sdata[tid] += sdata[tid + st]; __syncthreads(); }
+    float mean = sdata[0] / (float)groupSize; __syncthreads();
+    // population variance (FP32)
+    float v = 0.0f;
+    for (int i = tid; i < groupSize; i += bs) {
+        int c = g * channelsPerGroup + i / spatial;
+        int sp = i % spatial;
+        float d = h2f(input[(b * channels + c) * spatial + sp]) - mean;
+        v += d * d;
+    }
+    sdata[tid] = v; __syncthreads();
+    for (int st = bs >> 1; st > 0; st >>= 1) { if (tid < st) sdata[tid] += sdata[tid + st]; __syncthreads(); }
+    float var = sdata[0] / (float)groupSize; __syncthreads();
+    float invstd = rsqrtf(var + eps);
+    // normalize + affine + Swish
+    for (int i = tid; i < groupSize; i += bs) {
+        int c = g * channelsPerGroup + i / spatial;
+        int sp = i % spatial;
+        int idx = (b * channels + c) * spatial + sp;
+        float norm = (h2f(input[idx]) - mean) * invstd;
+        float aff = norm * gamma[c] + beta[c];
+        float swish = aff / (1.0f + expf(-aff));
+        output[idx] = f2h(swish);
+    }
+}
+
+// FP16-NATIVE per-channel broadcast add (conv bias): io[b,c,sp] += bias[b,c], in place. ONE THREAD PER io element.
+// bias is laid out [batch, channels]; reads FP16 directly, FP32 add, writes FP16. #1650/#638 #3.
+extern ""C"" __global__ __launch_bounds__(256) void fp16_broadcast_add_channel(
+    unsigned short* __restrict__ io, const unsigned short* __restrict__ bias,
+    int batch, int channels, int spatial)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long)batch * channels * spatial) return;
+    int b = (int)(i / ((long)channels * spatial));
+    int rem = (int)(i % ((long)channels * spatial));
+    int c = rem / spatial;
+    io[i] = f2h(h2f(io[i]) + h2f(bias[b * channels + c]));
+}
+
 // ── FP16-NATIVE BACKWARD kernels (read FP16 grad + FP16 saved activation, FP32 math, write FP16 grad) ──
 // Each mirrors the EXACT formula of its FP32 counterpart so the Half backward is parity-equivalent to the
 // FP32 backward — only the storage dtype differs (the converts that scaled with data size are eliminated).
@@ -288,6 +353,8 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_layernorm_grad_params_n
         "fp16_add_native",
         "fp16_softmax_native",
         "fp16_layernorm_native",
+        "fp16_groupnorm_swish",
+        "fp16_broadcast_add_channel",
         "fp16_gelu_backward_native",
         "fp16_relu_backward_native",
         "fp16_softmax_backward_native",
