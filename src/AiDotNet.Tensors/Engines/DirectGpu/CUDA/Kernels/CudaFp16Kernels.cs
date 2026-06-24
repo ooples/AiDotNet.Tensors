@@ -12,6 +12,11 @@ public static class CudaFp16Kernels
         return @"
 #include <cuda_fp16.h>
 
+// nvrtc has no <sys/types.h>, so `uint` (used by the vec2 conversion kernels below) is undefined under nvrtc
+// even with the toolkit headers present — this is why the whole module historically failed to compile. Provide
+// the typedef (identical re-typedef is legal C++ if a CUDA header also defines it).
+typedef unsigned int uint;
+
 // ============================================================================
 // FP16 CONVERSION KERNELS
 // ============================================================================
@@ -461,14 +466,15 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_direct_fp16hw(
             if (ih < 0 || ih >= inHeight || iw < 0 || iw >= inWidth) continue;
             const float* inP = input + ((b * inChannels) * inHeight + ih) * inWidth + iw;
             const float* kP  = kernel + ((oc * inChannels) * kernelH + kh) * kernelW + kw;
-            __half2 acc = __floats2half2_rn(0.0f, 0.0f);
             int ic = 0;
             for (; ic + 1 < inChannels; ic += 2) {
+                // HW FP16 multiply (__hmul2, packed 2-channels), FP32 ACCUMULATE (mixed precision — accumulating
+                // in __half2 over up to hundreds of channels drifts badly; the sum must stay FP32).
                 __half2 iv = __floats2half2_rn(inP[ic * inStride], inP[(ic + 1) * inStride]);
                 __half2 kv = __floats2half2_rn(kP[ic * kStride], kP[(ic + 1) * kStride]);
-                acc = __hfma2(iv, kv, acc);
+                float2 p = __half22float2(__hmul2(iv, kv));
+                sum += p.x + p.y;
             }
-            sum += __half2float(__low2half(acc)) + __half2float(__high2half(acc));
             for (; ic < inChannels; ic++)   // odd-channel remainder
                 sum += __half2float(__hmul(__float2half(inP[ic * inStride]), __float2half(kP[ic * kStride])));
         }

@@ -461,6 +461,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     private static string? GetCudaIncludePath()
     {
+        // AIDOTNET_CUDA_INCLUDE points DIRECTLY at a dir holding the CUDA headers (cuda_fp16.h etc.) for nvrtc.
+        // Lets a driver-only box enable the FP16/hardware-half kernels via just the pip CUDA-runtime headers
+        // (nvidia-cuda-runtime-cuXX) WITHOUT a full toolkit install or hijacking the global CUDA_PATH (which
+        // other tools expect to be a complete toolkit with bin/nvcc). Checked first; falls through if unset.
+        var directInclude = Environment.GetEnvironmentVariable("AIDOTNET_CUDA_INCLUDE");
+        if (!string.IsNullOrEmpty(directInclude) && Directory.Exists(directInclude))
+            return directInclude;
+
         // Check CUDA_PATH environment variable first
         var cudaPath = Environment.GetEnvironmentVariable("CUDA_PATH");
         if (string.IsNullOrEmpty(cudaPath) && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
@@ -910,6 +918,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             // here disables the ENTIRE FP16 GPU path (convert + half activations + Tensor-Core throughput),
             // which is invisible otherwise (#558). Surfaced via Fp16ModuleCompileError for diagnostics.
             Fp16ModuleCompileError = fp16Ex.Message;
+        }
+        if (System.Environment.GetEnvironmentVariable("AIDOTNET_FP16_SETUP_DIAG") == "1")
+        {
+            try { System.IO.File.WriteAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_fp16_setup.txt"),
+                $"cudaInclude={GetCudaIncludePath() ?? "(null)"}\n" +
+                $"fp16ModuleCompiled={_fp16Module != IntPtr.Zero}\n" +
+                $"conv2d_direct_fp16hw in cache={_kernelCache.ContainsKey("conv2d_direct_fp16hw")}\n" +
+                $"Fp16ModuleCompileError={Fp16ModuleCompileError ?? "(none)"}\n"); } catch { }
         }
 
         // Compile LSTM sequence kernels (forward/backward for BPTT training)
