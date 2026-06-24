@@ -103,7 +103,7 @@ internal static class RebindablePlanCache<T>
     /// (from its <c>Backward</c> delegate's <see cref="System.Delegate.Method"/>).
     /// Returns null when ANY entry's backward delegate is non-static —
     /// the IL specialisation path requires static methods, and a null
-    /// return tells <see cref="CompiledBackwardWalk{T}.Compile(int[], System.Reflection.MethodInfo[]?)"/>
+    /// return tells <see cref="CompiledBackwardWalk{T}.Compile(int[], System.Reflection.MethodInfo[])"/>
     /// to take the non-specialised helper-dispatch path.
     /// </summary>
     private static System.Reflection.MethodInfo[]? ExtractBackwardMethods(
