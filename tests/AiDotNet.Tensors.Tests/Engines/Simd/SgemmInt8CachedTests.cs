@@ -13,6 +13,10 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd;
 /// <para>Guarded with NET5_0_OR_GREATER because the kernel only compiles
 /// on NET5+ (requires <c>System.Runtime.Intrinsics</c>).</para>
 /// </summary>
+// Serialize with the process-global GEMM-state mutators (DeterministicReductions / IsDeterministicMode):
+// the int8-vs-float SNR margin drifts if a concurrent determinism-flag flip changes this run's reduction
+// order. The collection name is assembly-global, so joining it from this namespace is fine. (#675 CI flake)
+[Collection("BlasManaged-Stats-Serial")]
 public class SgemmInt8CachedTests
 {
     [Theory]
