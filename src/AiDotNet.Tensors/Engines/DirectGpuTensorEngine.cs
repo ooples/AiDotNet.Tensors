@@ -4929,20 +4929,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
                 // #1650/#638 hardware-FP16 conv lever: on a CUDA-TOOLKIT box (Fp16HwConvAvailable) route through
                 // the in-kernel __half2 conv — FP32 in/out (same memory, capture-safe), FP16 compute (~2x on the
-                // FMA-bound deep convs). Driver-only box: Fp16HwConvAvailable is false → skip → FP32 below. The
-                // hw kernel reads FP32 and converts in-register, so NO cast buffers / activation chain needed.
-                bool fp16Ran = false;
+                // FMA-bound deep convs). Driver-only box: Fp16HwConvAvailable is false → FP32 path. The hw kernel
+                // reads FP32 and converts in-register, so NO cast buffers / activation chain needed.
+                // Fp16HwConvAvailable already gates the kernel-unsupported case, so DON'T swallow exceptions here:
+                // a failed launch / capture-invalidating error must propagate to the outer resident catch (which
+                // abandons the resident path + re-runs eager cleanly) rather than continuing a corrupted capture
+                // by appending an FP32 conv on top of it. (#671 review)
                 if (s_fp16Conv && rbk is Engines.DirectGpu.CUDA.CudaBackend cudaRbk && cudaRbk.Fp16HwConvAvailable)
-                {
-                    try
-                    {
-                        cudaRbk.Conv2DDirectFp16Hw(bufIn.Buffer, bufK.Buffer, outBuf,
-                            b, ic, ih, iw, oc, oh, ow, kh, kw, stride, stride, padding, padding, dilation, dilation);
-                        fp16Ran = true;
-                    }
-                    catch (Exception) { fp16Ran = false; } // any issue → FP32 fallback below
-                }
-                if (!fp16Ran)
+                    cudaRbk.Conv2DDirectFp16Hw(bufIn.Buffer, bufK.Buffer, outBuf,
+                        b, ic, ih, iw, oc, oh, ow, kh, kw, stride, stride, padding, padding, dilation, dilation);
+                else
                     rbk.Conv2D(bufIn.Buffer, bufK.Buffer, outBuf,
                         b, ic, ih, iw, oc, oh, ow, kh, kw, stride, stride, padding, padding, dilation, dilation);
                 ResidentSyncCheck("Conv2DInto");

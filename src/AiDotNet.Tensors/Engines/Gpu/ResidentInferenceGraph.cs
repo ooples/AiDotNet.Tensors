@@ -151,6 +151,11 @@ public sealed class ResidentInferenceGraph : System.IDisposable
             // caller never receives a stale (frozen-buffer) result.
             if (_exec != System.IntPtr.Zero) { _engine.DestroyGpuGraph(_exec); _exec = System.IntPtr.Zero; }
             _output = null;
+            // Dispose the capture scope BEFORE the eager fallback: it resumes activation eviction and clears
+            // ResidentStepActive, so forward(s) runs as a normal eager pass — not under resident-capture state
+            // (which would keep binding/pinning resident buffers for a graph that no longer exists). (#671 review)
+            _scope?.Dispose();
+            _scope = null;
             _disabled = true;
             return forward(s);
           }
