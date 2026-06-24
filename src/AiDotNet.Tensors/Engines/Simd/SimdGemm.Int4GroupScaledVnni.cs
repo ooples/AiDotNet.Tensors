@@ -26,9 +26,14 @@ namespace AiDotNet.Tensors.Engines.Simd;
 
 internal static partial class SimdGemm
 {
-    /// <summary>True when the int4-native VNNI path can run (AVX-VNNI present).</summary>
+    /// <summary>
+    /// True when the int4-native VNNI path can run (AVX-VNNI present).
+    /// Gated NET9_0_OR_GREATER (not NET8): <see cref="AvxVnni"/> is
+    /// <c>[RequiresPreviewFeatures]</c> on net8.0 (CA2252) and only stable from
+    /// .NET 9. Below that the dispatcher uses the fp32 weight-only fallback.
+    /// </summary>
     internal static bool Int4VnniAvailable =>
-#if NET8_0_OR_GREATER
+#if NET9_0_OR_GREATER
         AvxVnni.IsSupported;
 #else
         false;
@@ -115,7 +120,7 @@ internal static partial class SimdGemm
                 int dot = 0, wsum = 0;
                 int aOff = (int)(aBase + p);
                 int wOff = (int)(wBase + p);
-#if NET8_0_OR_GREATER
+#if NET9_0_OR_GREATER
                 int t = 0;
                 if (vnni && len >= 32)
                 {
