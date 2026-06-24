@@ -4972,9 +4972,29 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         using var _ = PushContext();
         if (!_kernelCache.TryGetValue("im2col_kn_fp16hw", out var k))
             throw new InvalidOperationException("CUDA kernel not found: im2col_kn_fp16hw");
+        // #671 review: validate launch dimensions before computing the grid — strideH/strideW == 0 divides by
+        // zero, a non-positive output extent makes `elems` negative, and an overflowing `elems` casts to a huge
+        // uint launch size. Guard the public backend boundary before LaunchKernel.
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (outputHalf is null) throw new ArgumentNullException(nameof(outputHalf));
+        if (batch <= 0) throw new ArgumentOutOfRangeException(nameof(batch), "Dimensions must be positive.");
+        if (channels <= 0) throw new ArgumentOutOfRangeException(nameof(channels), "Dimensions must be positive.");
+        if (height <= 0) throw new ArgumentOutOfRangeException(nameof(height), "Dimensions must be positive.");
+        if (width <= 0) throw new ArgumentOutOfRangeException(nameof(width), "Dimensions must be positive.");
+        if (kernelH <= 0) throw new ArgumentOutOfRangeException(nameof(kernelH), "Dimensions must be positive.");
+        if (kernelW <= 0) throw new ArgumentOutOfRangeException(nameof(kernelW), "Dimensions must be positive.");
+        if (strideH <= 0) throw new ArgumentOutOfRangeException(nameof(strideH), "Stride must be positive.");
+        if (strideW <= 0) throw new ArgumentOutOfRangeException(nameof(strideW), "Stride must be positive.");
+        if (dilationH <= 0) throw new ArgumentOutOfRangeException(nameof(dilationH), "Dilation must be positive.");
+        if (dilationW <= 0) throw new ArgumentOutOfRangeException(nameof(dilationW), "Dilation must be positive.");
+        if (padH < 0) throw new ArgumentOutOfRangeException(nameof(padH), "Padding must be non-negative.");
+        if (padW < 0) throw new ArgumentOutOfRangeException(nameof(padW), "Padding must be non-negative.");
         IntPtr inputPtr = input.Handle, outputPtr = outputHalf.Handle;
         int outH = (height + 2 * padH - ((kernelH - 1) * dilationH + 1)) / strideH + 1;
         int outW = (width + 2 * padW - ((kernelW - 1) * dilationW + 1)) / strideW + 1;
+        if (outH <= 0 || outW <= 0)
+            throw new ArgumentException(
+                $"Convolution output size is non-positive (outH={outH}, outW={outW}); check kernel/stride/pad/dilation vs input size.");
         int totalPatches = batch * outH * outW;
         void** a = stackalloc void*[16];
         a[0] = &inputPtr; a[1] = &outputPtr;
@@ -4982,6 +5002,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         a[6] = &kernelH; a[7] = &kernelW; a[8] = &strideH; a[9] = &strideW;
         a[10] = &padH; a[11] = &padW; a[12] = &dilationH; a[13] = &dilationW; a[14] = &outH; a[15] = &outW;
         long elems = (long)totalPatches * (channels * kernelH * kernelW); // N*K threads (one per col element)
+        if (elems > int.MaxValue)
+            throw new NotSupportedException($"FP16 im2col work size {elems} exceeds the launch limit.");
         uint grid = (uint)((elems + DefaultBlockSize - 1) / DefaultBlockSize);
         LaunchKernel(k, grid, DefaultBlockSize, a);
     }

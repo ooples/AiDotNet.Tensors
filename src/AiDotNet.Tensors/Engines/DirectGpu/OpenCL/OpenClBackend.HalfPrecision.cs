@@ -201,8 +201,26 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         if (!_kernelCache.TryGetValue("im2col_kn_fp16hw", out var kernel))
             throw new NotSupportedException("FP16 im2col kernel is not available on this OpenCL device.");
 
+        // #671 review: validate convolution parameters before deriving the work size — a zero stride/dilation
+        // divides by zero, and non-positive dims/output extents would flow into Execute1D as invalid global sizes.
+        if (batch <= 0) throw new ArgumentOutOfRangeException(nameof(batch), "Dimensions must be positive.");
+        if (channels <= 0) throw new ArgumentOutOfRangeException(nameof(channels), "Dimensions must be positive.");
+        if (height <= 0) throw new ArgumentOutOfRangeException(nameof(height), "Dimensions must be positive.");
+        if (width <= 0) throw new ArgumentOutOfRangeException(nameof(width), "Dimensions must be positive.");
+        if (kernelH <= 0) throw new ArgumentOutOfRangeException(nameof(kernelH), "Dimensions must be positive.");
+        if (kernelW <= 0) throw new ArgumentOutOfRangeException(nameof(kernelW), "Dimensions must be positive.");
+        if (strideH <= 0) throw new ArgumentOutOfRangeException(nameof(strideH), "Stride must be positive.");
+        if (strideW <= 0) throw new ArgumentOutOfRangeException(nameof(strideW), "Stride must be positive.");
+        if (dilationH <= 0) throw new ArgumentOutOfRangeException(nameof(dilationH), "Dilation must be positive.");
+        if (dilationW <= 0) throw new ArgumentOutOfRangeException(nameof(dilationW), "Dilation must be positive.");
+        if (padH < 0) throw new ArgumentOutOfRangeException(nameof(padH), "Padding must be non-negative.");
+        if (padW < 0) throw new ArgumentOutOfRangeException(nameof(padW), "Padding must be non-negative.");
+
         int outH = (height + 2 * padH - ((kernelH - 1) * dilationH + 1)) / strideH + 1;
         int outW = (width + 2 * padW - ((kernelW - 1) * dilationW + 1)) / strideW + 1;
+        if (outH <= 0 || outW <= 0)
+            throw new ArgumentException(
+                $"Convolution output size is non-positive (outH={outH}, outW={outW}); check kernel/stride/pad/dilation vs input size.");
         long elems = (long)batch * outH * outW * channels * kernelH * kernelW; // N*K work-items
         if (elems > int.MaxValue)
             throw new NotSupportedException($"FP16 im2col work size {elems} exceeds the 1-D dispatch limit.");

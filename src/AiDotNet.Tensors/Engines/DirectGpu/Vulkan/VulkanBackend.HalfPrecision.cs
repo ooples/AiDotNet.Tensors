@@ -206,6 +206,9 @@ public sealed partial class VulkanBackend : IGpuHalfPrecisionBackend
         if (strideW <= 0) throw new ArgumentOutOfRangeException(nameof(strideW), "Stride must be positive.");
         if (dilationH <= 0) throw new ArgumentOutOfRangeException(nameof(dilationH), "Dilation must be positive.");
         if (dilationW <= 0) throw new ArgumentOutOfRangeException(nameof(dilationW), "Dilation must be positive.");
+        // #671 review: reject negative padding to match the peer (WebGPU) contract and keep output geometry consistent.
+        if (padH < 0) throw new ArgumentOutOfRangeException(nameof(padH), "Padding must be non-negative.");
+        if (padW < 0) throw new ArgumentOutOfRangeException(nameof(padW), "Padding must be non-negative.");
 
         // HOST computes outH/outW (mirrors the CUDA launcher: the kernel receives them as args).
         int outH = (height + 2 * padH - ((kernelH - 1) * dilationH + 1)) / strideH + 1;
