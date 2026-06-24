@@ -368,6 +368,27 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         });
     }
 
+    /// <summary>
+    /// Like <see cref="GetPipeline"/> but returns <c>null</c> instead of throwing when the kernel is missing or
+    /// fails to compile into a pipeline. Used by capability gates (e.g. <see cref="Fp16Im2colAvailable"/>) that
+    /// must report honestly whether a specific kernel is actually available before dispatching it. On success the
+    /// pipeline is cached so a following <see cref="GetPipeline"/> for the same kernel reuses it. (GetOrAdd does
+    /// not cache a throwing factory, so a failed probe leaves the cache clean for a later retry.)
+    /// </summary>
+    private MetalPipelineState? TryGetPipeline(string libraryName, IntPtr library, string kernelName)
+    {
+        if (library == IntPtr.Zero) return null;
+        try
+        {
+            return GetPipeline(libraryName, library, kernelName);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Metal pipeline '{kernelName}' unavailable: {ex.Message}");
+            return null;
+        }
+    }
+
     #endregion
 
     #region Memory Management

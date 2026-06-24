@@ -175,14 +175,31 @@ public sealed partial class HipBackend : IGpuHalfPrecisionBackend
         if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n), "Dimensions must be positive.");
         if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k), "Dimensions must be positive.");
     }
-    // #1650/#638 FP16 conv im2col — STUB pending the HIP kernel port (dispatch gates on Fp16Im2colAvailable
-    // so Im2colKNFp16 is never invoked while this returns false; the engine keeps the FP32 conv on HIP).
+    // #1650/#638 FP16 conv im2col (the industry conv-as-GEMM path): fused im2col + FP32->FP16 into a [K,N] half
+    // buffer (im2col_kn_fp16hw in HipFp16Kernels), paired with GemmFp16In32fOut (hipBLAS) on the MFMA units.
+    // Available only when the FP16 kernel module compiled (hiprtc + hip_fp16.h); else the engine keeps FP32 conv.
     /// <inheritdoc/>
-    public bool Fp16Im2colAvailable => false;
+    public bool Fp16Im2colAvailable => _fp16Module != IntPtr.Zero && _kernelCache.ContainsKey("im2col_kn_fp16hw");
+
     /// <inheritdoc/>
-    public void Im2colKNFp16(IGpuBuffer input, IGpuBuffer outputHalf,
+    public unsafe void Im2colKNFp16(IGpuBuffer input, IGpuBuffer outputHalf,
         int batch, int channels, int height, int width,
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
-        => throw new System.NotSupportedException("FP16 im2col (Im2colKNFp16) is not yet ported to the HIP backend.");
+    {
+        if (!_kernelCache.TryGetValue("im2col_kn_fp16hw", out var k))
+            throw new System.InvalidOperationException("HIP kernel not found: im2col_kn_fp16hw");
+        IntPtr inputPtr = input.Handle, outputPtr = outputHalf.Handle;
+        int outH = (height + 2 * padH - ((kernelH - 1) * dilationH + 1)) / strideH + 1;
+        int outW = (width + 2 * padW - ((kernelW - 1) * dilationW + 1)) / strideW + 1;
+        int totalPatches = batch * outH * outW;
+        void** a = stackalloc void*[16];
+        a[0] = &inputPtr; a[1] = &outputPtr;
+        a[2] = &batch; a[3] = &channels; a[4] = &height; a[5] = &width;
+        a[6] = &kernelH; a[7] = &kernelW; a[8] = &strideH; a[9] = &strideW;
+        a[10] = &padH; a[11] = &padW; a[12] = &dilationH; a[13] = &dilationW; a[14] = &outH; a[15] = &outW;
+        long elems = (long)totalPatches * (channels * kernelH * kernelW); // N*K threads (one per col element)
+        uint grid = (uint)((elems + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(k, grid, DefaultBlockSize, a);
+    }
 
 }

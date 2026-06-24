@@ -163,14 +163,79 @@ public sealed partial class VulkanBackend : IGpuHalfPrecisionBackend
         if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n), "Dimensions must be positive.");
         if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k), "Dimensions must be positive.");
     }
-    // #1650/#638 FP16 conv im2col — STUB pending the Vulkan kernel port (dispatch gates on Fp16Im2colAvailable
-    // so Im2colKNFp16 is never invoked while this returns false; the engine keeps the FP32 conv on Vulkan).
+    // #1650/#638 FP16 conv im2col — ported to Vulkan (1-D-flattened port of the VALIDATED CUDA im2col_kn_fp16hw).
+    // The col matrix is written in the packed-half layout (two halves per 32-bit word) that ConvertToFp16 produces
+    // and GemmFp16In32fOut consumes, so the conv becomes a plain NN GEMM out[outC,N] = weights[outC,K] · col[K,N].
+    // Dispatch gates on Fp16Im2colAvailable: false (no libshaderc, or the shader/pipeline failed to build) keeps
+    // the FP32 conv; Im2colKNFp16 is only invoked when this is true.
+    private const uint Im2colKnFp16PushInts = 14u * sizeof(uint);
+
     /// <inheritdoc/>
-    public bool Fp16Im2colAvailable => false;
+    /// <remarks>
+    /// True only when the <c>im2col_kn_fp16hw</c> GLSL compute shader actually compiled to SPIR-V AND its pipeline
+    /// built — <see cref="GetOrCreateGlslPipeline"/> returns non-null only in that case (and caches it, so the
+    /// pipeline is reused by the subsequent <see cref="Im2colKNFp16"/> dispatch). Stronger than the bare
+    /// libshaderc gate the GEMM uses (<see cref="SupportsHgemm"/> = <c>IsGlslCompilerAvailable</c>): it confirms
+    /// this specific shader is usable on the device. Returns false (no throw) when libshaderc is unavailable.
+    /// </remarks>
+    public bool Fp16Im2colAvailable
+    {
+        get
+        {
+            if (!IsGlslCompilerAvailable)
+                return false;
+            return GetOrCreateGlslPipeline(VulkanConvPoolKernels.Im2colKnFp16Hw, 2, Im2colKnFp16PushInts) is not null;
+        }
+    }
+
     /// <inheritdoc/>
     public void Im2colKNFp16(IGpuBuffer input, IGpuBuffer outputHalf,
         int batch, int channels, int height, int width,
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
-        => throw new System.NotSupportedException("FP16 im2col (Im2colKNFp16) is not yet ported to the Vulkan backend.");
+    {
+        EnsureInitialized();
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (outputHalf is null) throw new ArgumentNullException(nameof(outputHalf));
+        if (batch <= 0) throw new ArgumentOutOfRangeException(nameof(batch), "Dimensions must be positive.");
+        if (channels <= 0) throw new ArgumentOutOfRangeException(nameof(channels), "Dimensions must be positive.");
+        if (height <= 0) throw new ArgumentOutOfRangeException(nameof(height), "Dimensions must be positive.");
+        if (width <= 0) throw new ArgumentOutOfRangeException(nameof(width), "Dimensions must be positive.");
+        if (kernelH <= 0) throw new ArgumentOutOfRangeException(nameof(kernelH), "Dimensions must be positive.");
+        if (kernelW <= 0) throw new ArgumentOutOfRangeException(nameof(kernelW), "Dimensions must be positive.");
+        if (strideH <= 0) throw new ArgumentOutOfRangeException(nameof(strideH), "Stride must be positive.");
+        if (strideW <= 0) throw new ArgumentOutOfRangeException(nameof(strideW), "Stride must be positive.");
+        if (dilationH <= 0) throw new ArgumentOutOfRangeException(nameof(dilationH), "Dilation must be positive.");
+        if (dilationW <= 0) throw new ArgumentOutOfRangeException(nameof(dilationW), "Dilation must be positive.");
+
+        // HOST computes outH/outW (mirrors the CUDA launcher: the kernel receives them as args).
+        int outH = (height + 2 * padH - ((kernelH - 1) * dilationH + 1)) / strideH + 1;
+        int outW = (width + 2 * padW - ((kernelW - 1) * dilationW + 1)) / strideW + 1;
+        if (outH <= 0 || outW <= 0)
+            throw new ArgumentException(
+                $"Convolution output size is non-positive (outH={outH}, outW={outW}); check kernel/stride/pad/dilation vs input size.");
+
+        // N*K col elements packed two halves per 32-bit word ⇒ ceil(N*K/2) threads (one per word), exactly the
+        // per-word dispatch the FP16-native kernels use. Each thread writes one race-free packHalf2x16.
+        int n = batch * outH * outW;
+        int k = channels * kernelH * kernelW;
+        long total = (long)n * k;
+        int numWords = (int)((total + 1L) / 2L);
+
+        var pc = new uint[]
+        {
+            (uint)batch, (uint)channels, (uint)height, (uint)width,
+            (uint)kernelH, (uint)kernelW, (uint)strideH, (uint)strideW,
+            (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW, (uint)outH, (uint)outW,
+        };
+
+        // Reuses the validated conv-family dispatch helper (compile-or-cache the pipeline gated on libshaderc, bind
+        // the two SSBOs, push the 14 ints, launch ceil(N*K/2) threads). Capture-safe: no device alloc/free inside.
+        if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Im2colKnFp16Hw, pc, numWords, input, outputHalf))
+            return;
+
+        // Reached only if libshaderc/pipeline became unavailable between the Fp16Im2colAvailable gate and here.
+        throw new NotSupportedException(
+            "Vulkan FP16 im2col requires libshaderc for runtime GLSL compilation, which is unavailable.");
+    }
 
 }
