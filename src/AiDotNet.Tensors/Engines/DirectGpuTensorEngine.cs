@@ -240,7 +240,7 @@ public sealed class GpuScope : IDisposable
 /// <para>For concurrent weight updates during inference, consider using separate engine instances
 /// or implementing external synchronization around weight update + invalidation sequences.</para>
 /// </remarks>
-public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDisposable
+public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDisposable, Engines.Gpu.IInferenceGraphCaptureEngine
 {
     private readonly DirectGpuEngine? _directGpu;
     private readonly bool _ownsDirectGpu;
@@ -381,11 +381,434 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (e is not null) System.Threading.Interlocked.Decrement(ref e._gradAccumDepth);
         }
     }
+    // #1650 inference CUDA-graph capture: while set, GPU-resident in-place ops (TryRunBinaryInPlace) engage
+    // on ResidentStepActive WITHOUT the training-only InGradAccumulation gate, so the inference forward runs
+    // host-round-trip-free and is capturable. Depth counter (not bool) so it's visible on the BLAS pool
+    // threads the op execution fans out to, mirroring _capturePathDepth / _evictionSuspendDepth.
+    private int _inferenceCaptureDepth;
+    internal bool InferenceCaptureActive => System.Threading.Volatile.Read(ref _inferenceCaptureDepth) > 0;
+    internal void BeginInferenceCapture() => System.Threading.Interlocked.Increment(ref _inferenceCaptureDepth);
+    internal void EndInferenceCapture() => System.Threading.Interlocked.Decrement(ref _inferenceCaptureDepth);
+
     internal void SuspendActivationEviction() => System.Threading.Interlocked.Increment(ref _evictionSuspendDepth);
     internal void ResumeActivationEviction()
     {
         if (System.Threading.Interlocked.Decrement(ref _evictionSuspendDepth) < 0)
             System.Threading.Interlocked.Increment(ref _evictionSuspendDepth); // clamp at 0
+    }
+
+    // ───────────────────────────────────────────────────────────────────────────────────────────
+    // #1650 PUBLIC inference CUDA-graph capture API. ForwardUNet (the diffusion eager GPU forward to
+    // capture) lives in AiDotNet, a separate assembly that cannot reach the internal capture-path
+    // machinery — so expose a minimal, safe public surface. A consumer:
+    //   1. warms up its forward eagerly a few times (lazy allocs / autotune settle),
+    //   2. enters a resident capture scope (eviction suspended for the graph's lifetime, ResidentStepActive
+    //      on so GPU ops use stable resident buffers, inference-capture on so resident in-place ops engage),
+    //   3. refreshes its stable input buffers in place, captures the forward, then replays it per step,
+    //   4. disposes the scope when done (resumes eviction, frees the graph).
+    // ───────────────────────────────────────────────────────────────────────────────────────────
+
+    /// <summary>True when this engine is backed by a CUDA backend that can capture/replay CUDA graphs.</summary>
+    public bool SupportsInferenceGraphCapture => GetBackend() is Engines.DirectGpu.CUDA.CudaBackend cb && cb.IsAvailable;
+
+    /// <summary>Records the GPU kernel launches issued by <paramref name="forward"/> into a CUDA graph and
+    /// returns a replayable handle (IntPtr.Zero on failure / a non-capturable op — caller falls back to eager).
+    /// Must be called inside a <see cref="EnterResidentCaptureScope"/> so the forward runs resident (capturable).</summary>
+    public IntPtr CaptureGpuGraph(Action forward)
+    {
+        // Reject API misuse here rather than letting a null delegate surface as a backend-side failure.
+        if (forward is null) throw new System.ArgumentNullException(nameof(forward));
+        return GetBackend() is Engines.DirectGpu.CUDA.CudaBackend cb ? cb.CaptureGraph(forward) : System.IntPtr.Zero;
+    }
+
+    /// <summary>Replays a graph captured by <see cref="CaptureGpuGraph"/> as a single cuGraphLaunch. Refresh
+    /// input-buffer CONTENTS (via <see cref="RefreshResidentInputInPlace"/>) before calling to feed new data.</summary>
+    public void LaunchGpuGraph(System.IntPtr graphExec)
+    {
+        if (graphExec != System.IntPtr.Zero && GetBackend() is Engines.DirectGpu.CUDA.CudaBackend cb)
+            cb.LaunchCapturedGraph(graphExec);
+    }
+
+    /// <summary>Blocks until all work on the backend's compute stream completes. Used to separate GPU-compute
+    /// time from the DtoH copy when profiling the captured-graph replay. No-op off CUDA.</summary>
+    public void SynchronizeStream()
+    {
+        if (GetBackend() is Engines.DirectGpu.CUDA.CudaBackend cbSync) cbSync.Synchronize();
+    }
+
+    /// <summary>Frees a captured graph handle.</summary>
+    public void DestroyGpuGraph(System.IntPtr graphExec)
+    {
+        if (graphExec != System.IntPtr.Zero && GetBackend() is Engines.DirectGpu.CUDA.CudaBackend cb)
+            cb.DestroyCapturedGraph(graphExec);
+    }
+
+    /// <summary>Enters the resident capture path: suspends activation eviction (so resident intermediates a
+    /// captured graph references survive replay), marks ResidentStepActive (GPU ops bind stable resident
+    /// buffers) and inference-capture (resident in-place ops engage). The returned scope reverses all three on
+    /// Dispose — keep it alive for the captured graph's whole lifetime (dispose when the graph is no longer
+    /// replayed). Returns null on a non-CUDA engine.</summary>
+    public IDisposable? EnterResidentCaptureScope()
+    {
+        if (GetBackend() is not Engines.DirectGpu.CUDA.CudaBackend) return null;
+        SuspendActivationEviction();
+        BeginInferenceCapture();
+        System.Threading.Interlocked.Increment(ref _capturePathDepth);
+        return new ResidentCaptureScope(this);
+    }
+
+    private sealed class ResidentCaptureScope : IDisposable
+    {
+        private DirectGpuTensorEngine? _e;
+        public ResidentCaptureScope(DirectGpuTensorEngine e) => _e = e;
+        public void Dispose()
+        {
+            var e = System.Threading.Interlocked.Exchange(ref _e, null);
+            if (e is null) return;
+            System.Threading.Interlocked.Decrement(ref e._capturePathDepth);
+            e.EndInferenceCapture();
+            e.ResumeActivationEviction();
+        }
+    }
+
+    /// <summary>Uploads <paramref name="t"/>'s current host data into its EXISTING resident GPU buffer in place
+    /// (stable pointer) so a replayed graph — which reads the address captured at record time — sees fresh data.
+    /// No-op if the tensor has no resident buffer on this engine. float only.</summary>
+
+    public void RefreshResidentInputInPlace<T>(Tensor<T> t)
+    {
+        if (typeof(T) != typeof(float) || t is null) return;
+        if (GetBackend() is not Engines.DirectGpu.CUDA.CudaBackend cb) return;
+        if (t._gpuBuffer is not { } buf || !ReferenceEquals(t._gpuBackend, cb) || buf.Handle == System.IntPtr.Zero) return;
+        var data = t.GetDataArray();
+        if (buf.Size < data.Length) return;
+        cb.UploadBufferInPlace((float[])(object)data, buf);
+        t._gpuBufferVersion = t.Version;
+    }
+
+    /// <summary>Binds <paramref name="t"/> to a STABLE resident GPU buffer (uploading its current host data),
+    /// so the captured graph reads a fixed device address and GetOrAllocateBuffer finds it (no re-upload mid-
+    /// capture). Call during the non-capturing pre-residency pass for each EXTERNAL stable input (the graph's
+    /// own intermediates become resident via FinishGpuOp under ResidentStepActive). Idempotent: re-binds the
+    /// current data into the existing buffer if already bound + big enough. float only / no-op off CUDA.</summary>
+    public void EnsureResidentInput<T>(Tensor<T> t)
+    {
+        if (typeof(T) != typeof(float) || t is null) return;
+        if (GetBackend() is not Engines.DirectGpu.CUDA.CudaBackend cb) return;
+        var data = t.GetDataArray();
+        if (t._gpuBuffer is { } existing && ReferenceEquals(t._gpuBackend, cb)
+            && existing.Handle != System.IntPtr.Zero && existing.Size >= data.Length)
+        {
+            cb.UploadBufferInPlace((float[])(object)data, existing);
+            t._gpuBufferVersion = t.Version;
+            return;
+        }
+        // Release the previous allocation before overwriting it. The reuse branch above already returned for a
+        // same-backend buffer big enough; reaching here means the old buffer is too small or on another backend,
+        // so dropping the reference without freeing would leak VRAM across recaptures / shape changes.
+        if (t._gpuBuffer is { } stale && stale.Handle != System.IntPtr.Zero)
+            stale.Dispose();
+        var buf = cb.AllocateBuffer((float[])(object)data); // sync upload — OK in the non-capturing pre-pass
+        t._gpuBuffer = buf;
+        t._gpuBackend = cb;
+        t._gpuBufferVersion = t.Version;
+    }
+
+    /// <summary>Downloads <paramref name="t"/>'s resident GPU buffer (which a replayed graph just wrote) into a
+    /// fresh host array. Needed for a graph OUTPUT: its deferred materializer caches after the first read, so a
+    /// plain re-read returns the capture-step's stale values; this forces a fresh DtoH each replay. Returns null
+    /// if the tensor has no resident buffer on this engine. float only.</summary>
+    public float[]? DownloadResidentBuffer<T>(Tensor<T> t)
+    {
+        if (typeof(T) != typeof(float) || t is null) return null;
+        if (GetBackend() is not Engines.DirectGpu.CUDA.CudaBackend cb) return null;
+        var buf = t._gpuBuffer;
+        if (buf is null || !ReferenceEquals(t._gpuBackend, cb) || buf.Handle == System.IntPtr.Zero) return null;
+        return cb.DownloadBuffer(buf);
+    }
+
+    // #1650 — STABLE captured-graph output. The forward's own output buffer is a graph-internal cuMemAllocAsync
+    // node; under CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH the graph frees+reallocs its pool every launch,
+    // so reading the capture-time output pointer after a later replay returns STALE data (the captured-step
+    // output) — the graph computes fresh values into the realloc'd internal buffer but the externally-held
+    // pointer no longer aliases them. Fix (the cortex resident-into pattern): pre-allocate ONE persistent buffer
+    // OUTSIDE the graph and make the final captured op copy the forward output into it, so the externally-read
+    // address is fixed and holds fresh data every replay.
+    private IGpuBuffer? _stableCaptureOutput;
+    private int _stableCaptureOutputSize;
+
+    // #1650/#638 hardware-FP16 conv lever: route the resident inference conv through the INDUSTRY path (oneDNN/
+    // cuDNN/PyTorch) — im2col → FP16 col[K,N] → GemmFp16In32fOut (FP16 multiply / FP32 accumulate on the matrix
+    // units), backend-agnostic via IGpuHalfPrecisionBackend. DEFAULT ON (set AIDOTNET_FP16_CONV=0 to disable),
+    // VALIDATED before flipping on (PR #671 #2): primitive conv vs FP32 Conv2D relL2=0.028%; one full UNet forward
+    // end-to-end relL2=0.67% — at the cuBLAS run-to-run FP32-vs-FP32 noise floor (0.666%), PSNR 60.9 dB — and
+    // 1.40x faster end-to-end. Self-gates to FP32 where it can't or shouldn't run: no FP16 im2col kernel on the
+    // device (Fp16Im2colAvailable false) or a too-small GEMM (size gate below). The FP16 im2col kernel now ships
+    // for ALL backends (CUDA/HIP/Metal/OpenCL/Vulkan/WebGpu), so default-on engages wherever it compiles — it is
+    // NOT CUDA-only anymore. Validation status differs per backend (#671 review): CUDA is validated end-to-end
+    // (RTX 3080, primitive relL2 0.028%, UNet relL2 0.67% at the cuBLAS FP32 noise floor, PSNR 60.9 dB);
+    // OpenCL/Vulkan have CPU-parity coverage; HIP/Metal/WebGpu compile-and-dispatch but are not yet hardware-
+    // validated end-to-end (tracked follow-up). Set AIDOTNET_FP16_CONV=0 to disable globally.
+    private static readonly bool s_fp16ConvEnv =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_FP16_CONV") != "0";
+
+    /// <summary>#1650/#638: runtime override for the FP16-conv gate. Used by the precision-validation tests
+    /// (<c>Fp16Conv_PrimitiveMatchesFp32Conv_OnCuda</c> / <c>Fp16Conv_TrajectoryMatchesFp32_OnCuda</c>) to force
+    /// FP32 (false) or FP16 (true) within one process, and by the graph-correctness test to isolate the graph path
+    /// from FP16 precision noise. Null ⇒ use the <c>AIDOTNET_FP16_CONV</c> env default (now ON unless ="0").</summary>
+    internal static bool? Fp16ConvOverride;
+
+    private static bool s_fp16Conv => Fp16ConvOverride ?? s_fp16ConvEnv;
+
+    // #1650/#638 (#671 review): the matrix-unit FP16 conv only pays off on a big-enough GEMM. The documented
+    // tiny boundary is 8x8 spatial -> N=64 (and 4x4 -> N=16), where im2col + launch overhead exceeds the win,
+    // so N must be STRICTLY greater than this to take the FP16 path. The next real conv spatial (16x16) gives
+    // N=256, so this excludes only the tiny convs the benchmark flagged.
+    private const int Fp16ConvTinyGemmN = 64;
+
+    // Cache the FP16 copy of each conv weight (constant across denoising steps), keyed by its resident FP32
+    // buffer handle. Converted ONCE (sync, on the pre-residency pass — not while stream-capturing); reused on
+    // every captured replay. The Tensor-Core GemmFp16 conv path needs the weights as FP16.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<System.IntPtr, IGpuBuffer> _fp16WeightCache = new();
+    private IGpuBuffer GetOrCacheFp16Weights(IDirectGpuBackend backend, IGpuBuffer wFp32, int count)
+    {
+        if (_fp16WeightCache.TryGetValue(wFp32.Handle, out var cached)
+            && cached.Handle != System.IntPtr.Zero && cached.SizeInBytes >= (long)count * 2)
+            return cached;
+        // #671 review: a miss while the stream is capturing means the pre-residency prewarm was skipped.
+        // Allocating/converting inside cuStreamBeginCapture aborts the graph (CUDA 906) — fail loudly instead.
+        if (backend is Engines.DirectGpu.CUDA.CudaBackend capCb && capCb.IsStreamCapturing())
+            throw new InvalidOperationException(
+                "FP16 conv weight cache miss during CUDA stream capture — convert the weights on the pre-residency pass before cuStreamBeginCapture.");
+        var half = backend.AllocateBuffer(count); // count floats ≥ count halfs; sync alloc — only on the pre-residency miss
+        backend.ConvertToFp16(wFp32, half, count);
+        _fp16WeightCache[wFp32.Handle] = half;
+        return half;
+    }
+
+    // #1650/#638: the FP16 im2col col[K,N] SCRATCH must be a STABLE, REUSED device buffer — NOT a fresh
+    // AllocateOutputBuffer each call. The captured graph (CaptureGpuGraph at ResidentInferenceGraph) replays the
+    // im2col + GEMM nodes; a per-call `using` scratch is freed after the pre-residency pass, so on replay the
+    // GEMM reads a freed / pool-reused VA → garbage output (the symptom: primitive conv correct, but the
+    // captured-forward path diverges 100%). Cache it (keyed by the conv's resident FP32 weight handle — K·N is
+    // fixed per conv layer) so the pre-residency pass (sync, capture-safe) allocates it ONCE and every captured
+    // replay reuses the same address. Mirrors _fp16WeightCache + the LayerNorm stable-scratch pattern.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<System.IntPtr, IGpuBuffer> _fp16ColScratchCache = new();
+    private IGpuBuffer GetOrCacheFp16ColScratch(IDirectGpuBackend backend, IGpuBuffer wFp32Key, int count)
+    {
+        if (_fp16ColScratchCache.TryGetValue(wFp32Key.Handle, out var cached)
+            && cached.Handle != System.IntPtr.Zero && cached.SizeInBytes >= (long)count * 2)
+            return cached;
+        // #671 review: a miss while the stream is capturing means the pre-residency prewarm was skipped.
+        // Allocating inside cuStreamBeginCapture aborts the graph (CUDA 906) — fail loudly instead.
+        if (backend is Engines.DirectGpu.CUDA.CudaBackend capCb && capCb.IsStreamCapturing())
+            throw new InvalidOperationException(
+                "FP16 conv col-scratch cache miss during CUDA stream capture — allocate the scratch on the pre-residency pass before cuStreamBeginCapture.");
+        var scratch = backend.AllocateBuffer(count); // count floats ≥ count halfs; sync alloc — only on the pre-residency miss
+        _fp16ColScratchCache[wFp32Key.Handle] = scratch;
+        return scratch;
+    }
+
+    // ============================================================================================================
+    // #1650/#638 #3 FP16 ACTIVATIONS END-TO-END (opt-in AIDOTNET_FP16_ACT, default OFF until validated): keep the
+    // resident UNet activations in FP16 BETWEEN ops so no FP32↔FP16 convert happens at op boundaries (the
+    // conversions are what cap the im2col path). Strictly ADDITIVE: when OFF, every path below is inert and the
+    // validated FP32 resident path is bit-identical. A resident buffer can be TAGGED as holding FP16 data (count
+    // halfs, packed in the low 2·count bytes of an over-allocated float buffer). FP16-aware ops (conv/groupnorm/
+    // add) read the raw FP16 via TryFp16ResidentInput; every OTHER op up-converts at the gap through the input-
+    // fetch helpers. Capture-safe: all FP16 / convert buffers are CACHED stable scratch (pre-allocated in the
+    // pre-residency pass, reused on replay).
+    private static readonly bool s_fp16ActEnv =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_FP16_ACT") == "1";
+    /// <summary>#3: runtime override for the FP16-activations gate (used by the validation test). Null ⇒ env default.</summary>
+    internal static bool? Fp16ActOverride;
+    private static bool Fp16ActEnabled => Fp16ActOverride ?? s_fp16ActEnv;
+
+    // backing-array → element count: presence marks the tensor's resident buffer as holding FP16 (count halfs).
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<object, int> _fp16ResidentArrays = new();
+
+    /// <summary>Mark a tensor GPU-resident on an FP16 buffer (count halfs): tags the backing array FP16 and
+    /// registers a downconvert (FP16→FP32) host materializer so CPU reads stay correct.</summary>
+    internal void BindResidentBufferFp16<T>(Tensor<T> t, IGpuBuffer buf, IDirectGpuBackend backend, int elementCount)
+    {
+        t._gpuBuffer = buf; t._gpuBackend = backend; t._gpuBufferVersion = t.Version;
+        var arr = t.DataVector.GetBackingArrayUnsafe();
+        if (arr is null) return;
+        _fp16ResidentArrays[arr] = elementCount;
+        var capBuf = buf; var capBackend = backend; var capCount = elementCount;
+        Helpers.DeferredArrayMaterializer.Register(arr, a =>
+        {
+            using var f32 = AllocateOutputBuffer(capBackend, capCount); // post-capture host read: alloc is fine
+            capBackend.ConvertToFp32(capBuf, f32.Buffer, capCount);
+            float[] f = capBackend.DownloadBuffer(f32.Buffer);
+            var conv = DirectGpuEngine.FromFloatArray<T>(f);
+            System.Array.Copy(conv, (T[])a, System.Math.Min(conv.Length, ((T[])a).Length));
+        });
+    }
+
+    /// <summary>True when <paramref name="t"/>'s resident buffer currently holds FP16 data (and FP16-act is on).</summary>
+    internal bool IsFp16Resident<T>(Tensor<T> t)
+    {
+        if (!Fp16ActEnabled) return false;
+        var arr = t.DataVector.GetBackingArrayUnsafe();
+        return arr is not null && _fp16ResidentArrays.ContainsKey(arr);
+    }
+
+    /// <summary>The FP16 resident buffer (+ element count) for an FP16-tagged input, or null. Callers narrow with
+    /// <c>is not null</c>. Read directly (no re-upload from the stale host array).</summary>
+    internal IGpuBuffer? TryFp16ResidentInput<T>(Tensor<T> t, out int count)
+    {
+        count = 0;
+        if (!Fp16ActEnabled) return null;
+        var arr = t.DataVector.GetBackingArrayUnsafe();
+        if (arr is null || !_fp16ResidentArrays.TryGetValue(arr, out count)) return null;
+        if (t._gpuBuffer is null || t._gpuBuffer.Handle == System.IntPtr.Zero) return null;
+        return t._gpuBuffer;
+    }
+
+    // Stable per-consumer FP32 up-convert scratch (keyed by the consuming tensor's backing array), for convert-at-gap
+    // ops with no FP16 path. Capture-safe (allocated pre-residency, reused on replay).
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<object, IGpuBuffer> _fp16UpconvertScratch = new();
+    private IGpuBuffer Fp16InputToFp32Stable(IDirectGpuBackend backend, IGpuBuffer fp16Buf, int count, object scratchKey)
+    {
+        if (!_fp16UpconvertScratch.TryGetValue(scratchKey, out var f32)
+            || f32.Handle == System.IntPtr.Zero || f32.Size < count)
+        {
+            f32 = backend.AllocateBuffer(count);
+            _fp16UpconvertScratch[scratchKey] = f32;
+        }
+        backend.ConvertToFp32(fp16Buf, f32, count);
+        return f32;
+    }
+
+    // Stable per-consumer FP16 down-convert scratch: for an FP16-native op fed an FP32 input (convert-at-gap entry).
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<object, IGpuBuffer> _fp16DownconvertScratch = new();
+    private IGpuBuffer Fp32InputToFp16Stable(IDirectGpuBackend backend, IGpuBuffer fp32Buf, int count, object scratchKey)
+    {
+        if (!_fp16DownconvertScratch.TryGetValue(scratchKey, out var half)
+            || half.Handle == System.IntPtr.Zero || half.Size < count)
+        {
+            half = backend.AllocateBuffer(count);
+            _fp16DownconvertScratch[scratchKey] = half;
+        }
+        backend.ConvertToFp16(fp32Buf, half, count);
+        return half;
+    }
+
+    /// <summary>#3 FP16-act residual add (a += b) keeping a FP16-resident (Fp16Add). Returns false to fall back.</summary>
+    private bool TryFp16AddInPlace<T>(Tensor<T> a, Tensor<T> b)
+    {
+        if (!Fp16ActEnabled || typeof(T) != typeof(float)) return false;
+        if (!ShapesMatch(a.Shape._dims, b.Shape._dims)) return false;
+        if (!TryGetBackend(out var be) || be is not Engines.DirectGpu.CUDA.CudaBackend cb || !cb.SupportsFp16NativeOps) return false;
+        var aHalf = TryFp16ResidentInput(a, out _);
+        if (aHalf is null) return false; // only when the in-place target is FP16
+        var aArr = a.DataVector.GetBackingArrayUnsafe();
+        if (aArr is null) return false;
+        int len = a.Length;
+        try
+        {
+            IGpuBuffer bHalf;
+            var bh = TryFp16ResidentInput(b, out _);
+            if (bh is not null) bHalf = bh;
+            else { using var bbuf = GetResidentOrPersistentInputBuffer(cb, b); bHalf = Fp32InputToFp16Stable(cb, bbuf.Buffer, len, aArr); }
+            cb.Fp16Add(aHalf, bHalf, aHalf, len);
+            ResidentSyncCheck("AddInPlace");
+            a._gpuBufferVersion = a.Version; // a stays FP16-resident + tagged
+            return true;
+        }
+        catch (Exception ex) { AliasDiag($"Fp16AddInPlace FELLBACK: {ex.GetType().Name}: {ex.Message}"); return false; }
+    }
+
+    /// <summary>#3 FP16-act per-channel broadcast add (a[N,C,H,W] += b[.,C,1,1]) keeping a FP16-resident.</summary>
+    private bool TryFp16BroadcastAddInPlace<T>(Tensor<T> a, Tensor<T> b)
+    {
+        if (!Fp16ActEnabled || typeof(T) != typeof(float)) return false;
+        if (a.Rank != 4 || b.Rank != 4 || !a.IsContiguous) return false;
+        if (b.Shape._dims[2] != 1 || b.Shape._dims[3] != 1 || a.Shape._dims[1] != b.Shape._dims[1]) return false;
+        int n = a.Shape._dims[0];
+        if (!(n == 1 || b.Shape._dims[0] == n)) return false; // bias[b·C+c] addressing valid (capture is n=1)
+        if (!TryGetBackend(out var be) || be is not Engines.DirectGpu.CUDA.CudaBackend cb || !cb.Fp16BroadcastAddChannelAvailable) return false;
+        var aHalf = TryFp16ResidentInput(a, out _);
+        if (aHalf is null) return false;
+        var aArr = a.DataVector.GetBackingArrayUnsafe();
+        if (aArr is null) return false;
+        int c = a.Shape._dims[1], hw = a.Shape._dims[2] * a.Shape._dims[3];
+        try
+        {
+            IGpuBuffer biasHalf;
+            var bh = TryFp16ResidentInput(b, out _);
+            if (bh is not null) biasHalf = bh;
+            else { using var bbuf = GetResidentOrPersistentInputBuffer(cb, b); biasHalf = Fp32InputToFp16Stable(cb, bbuf.Buffer, b.Length, aArr); }
+            cb.Fp16BroadcastAddChannel(aHalf, biasHalf, n, c, hw);
+            ResidentSyncCheck("BroadcastAddInPlace");
+            a._gpuBufferVersion = a.Version;
+            return true;
+        }
+        catch (Exception ex) { AliasDiag($"Fp16BroadcastAddInPlace FELLBACK: {ex.GetType().Name}: {ex.Message}"); return false; }
+    }
+
+    /// <summary>Pre-capture (sync alloc — call OUTSIDE stream capture): allocate/reuse a persistent output buffer
+    /// sized to the forward's output. float only / no-op off CUDA.</summary>
+    public void PrepareStableCaptureOutput<T>(Tensor<T> sampleOutput)
+    {
+        if (typeof(T) != typeof(float) || sampleOutput is null) return;
+        if (GetBackend() is not Engines.DirectGpu.CUDA.CudaBackend cb) return;
+        int need = sampleOutput.Length;
+        if (_stableCaptureOutput is null || _stableCaptureOutput.Handle == System.IntPtr.Zero || _stableCaptureOutput.Size < need)
+        {
+            _stableCaptureOutput?.Dispose();
+            _stableCaptureOutput = cb.AllocateBuffer(need); // sync alloc — safe pre-capture
+            _stableCaptureOutputSize = need;
+        }
+    }
+
+    /// <summary>During capture: copy <paramref name="output"/> into the persistent buffer prepared by
+    /// <see cref="PrepareStableCaptureOutput"/> (async DtoD → a captured graph node) and return a tensor bound to
+    /// that fixed address. Returns the input unchanged off the capture path / on any miss. float only.</summary>
+    public Tensor<T> WriteOutputToStableCapture<T>(Tensor<T> output)
+    {
+        if (output is null) throw new System.ArgumentNullException(nameof(output));
+        // Genuinely off the capture path (a non-float / non-CUDA forward never captures): no-op pass-through.
+        if (typeof(T) != typeof(float)) return output;
+        if (GetBackend() is not Engines.DirectGpu.CUDA.CudaBackend cb) return output;
+        // On the ACTIVE capture path the misses below are unrecoverable invalid-capture states, NOT benign
+        // no-ops: returning `output` records no DtoD copy node, so the graph computes into its internal pool
+        // and a later DownloadOutput reads the now-stale externally-held pointer — the exact frozen-output
+        // regression this path exists to prevent. Throw so the caller abandons capture (falls back to eager)
+        // loudly and deterministically instead of silently producing a constant-output graph.
+        bool capturing = ResidentStepActive;
+        int need = output.Length;
+        if (_stableCaptureOutput is null || _stableCaptureOutput.Handle == System.IntPtr.Zero)
+        {
+            if (capturing) throw new System.InvalidOperationException(
+                "WriteOutputToStableCapture: stable capture-output buffer was not prepared (call PrepareStableCaptureOutput before capture).");
+            return output;
+        }
+        if (_stableCaptureOutputSize < need)
+        {
+            if (capturing) throw new System.InvalidOperationException(
+                $"WriteOutputToStableCapture: stable capture-output buffer (size {_stableCaptureOutputSize}) is smaller than the forward output ({need}).");
+            return output;
+        }
+        var src = ResolveResidentBufferNoUpload(cb, output, need);
+        if (src is null)
+        {
+            if (capturing) throw new System.InvalidOperationException(
+                "WriteOutputToStableCapture: the forward output is not resident; cannot record the stable-output copy node.");
+            return output;
+        }
+        // #3 FP16-act: if the forward's final output is an FP16 activation, DOWN-CONVERT it to FP32 into the stable
+        // (FP32-sized) output buffer — the FP16-region EXIT. A raw Copy would memcpy need*4 bytes from a need*2-byte
+        // FP16 buffer (garbage). The convert is captured into the graph, so replay re-runs it; the stable output is
+        // then plain FP32 for DownloadOutput + the host read.
+        if (IsFp16Resident(output))
+            cb.ConvertToFp32(src, _stableCaptureOutput, need); // FP16 → FP32, captured
+        else
+            cb.Copy(src, _stableCaptureOutput, need); // async on the compute stream — captured into the graph
+        var stableT = new Tensor<T>(output.Shape._dims);
+        BindResidentBuffer(stableT, _stableCaptureOutput, cb); // FP32 (down-converted if the output was FP16)
+        return stableT;
     }
 
     /// <summary>
@@ -395,7 +818,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     internal void ReclaimGpuMemoryUnderPressure()
     {
-        if (TryGetBackend(out var backend) && backend is DirectGpu.CUDA.CudaBackend cudaBackend)
+        if (TryGetBackend(out var backend) && backend is Engines.DirectGpu.CUDA.CudaBackend cudaBackend)
             cudaBackend.ReclaimUnderPressure();
     }
 
@@ -900,6 +1323,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private OwnedBuffer GetOrAllocateBuffer<T>(IDirectGpuBackend backend, Tensor<T> tensor)
     {
+        // #3 FP16-act CONVERT-AT-GAP: an FP16-tagged input → stable up-converted FP32, so EVERY non-FP16-aware op
+        // that fetches its activation through this helper (softmax, scale, in-place unary/binary, etc.) reads
+        // correct FP32. FP16-aware ops (conv/groupnorm/add) bypass via TryFp16ResidentInput. Capture-safe scratch.
+        var tHalfG = TryFp16ResidentInput(tensor, out var tCountG);
+        if (tHalfG is not null)
+        {
+            var kG = tensor.DataVector.GetBackingArrayUnsafe();
+            if (kG is not null) return new OwnedBuffer(Fp16InputToFp32Stable(backend, tHalfG, tCountG, kG), ownsBuffer: false);
+        }
         // A non-contiguous tensor (or one with a nonzero storage offset) is a STRIDED VIEW: it shares
         // its source's backing array, and any GPU buffer cached against that array holds the SOURCE's
         // contiguous layout — NOT the view's permuted/sliced layout. The fast paths below all key off
@@ -1417,7 +1849,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // the pipeline (the earlier full-stream-sync fix was correct but impractically slow).
         if (evicted.Count > 0)
         {
-            if (backend is DirectGpu.CUDA.CudaBackend cudaBackend)
+            if (backend is Engines.DirectGpu.CUDA.CudaBackend cudaBackend)
             {
                 foreach (var entry in evicted)
                     cudaBackend.FreeBufferDeferred(entry.Buffer);
@@ -1470,7 +1902,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             if (!_activationCache.TryGetValue(key, out var e)) return false;
             if (e.IsFp16) return true;
-            if (e.Backend is not DirectGpu.CUDA.CudaBackend cuda) return false;
+            if (e.Backend is not Engines.DirectGpu.CUDA.CudaBackend cuda) return false;
             // Only compress genuine FP32 buffers (elementCount*4 bytes); skip anything unexpected.
             if (e.Buffer.SizeInBytes != (long)elementCount * sizeof(float)) return false;
             IGpuBuffer fp16;
@@ -1488,7 +1920,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, fp16.SizeInBytes - e.Buffer.SizeInBytes);
             old = e;
         }
-        if (old is not null && old.Backend is DirectGpu.CUDA.CudaBackend c) c.FreeBufferDeferred(old.Buffer);
+        if (old is not null && old.Backend is Engines.DirectGpu.CUDA.CudaBackend c) c.FreeBufferDeferred(old.Buffer);
         else old?.Dispose();
         return true;
     }
@@ -1504,7 +1936,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private bool TryTransientUpcastFp16(object key, IDirectGpuBackend backend, out OwnedBuffer transient)
     {
         transient = default;
-        if (backend is not DirectGpu.CUDA.CudaBackend cuda) return false;
+        if (backend is not Engines.DirectGpu.CUDA.CudaBackend cuda) return false;
         IGpuBuffer halfBuf; int elems;
         lock (_activationCacheLock)
         {
@@ -1530,7 +1962,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             if (!_activationCache.TryGetValue(key, out var e)) return false;
             if (!e.IsFp16) return true;
-            if (e.Backend is not DirectGpu.CUDA.CudaBackend cuda) return false;
+            if (e.Backend is not Engines.DirectGpu.CUDA.CudaBackend cuda) return false;
             IGpuBuffer fp32;
             try
             {
@@ -1543,7 +1975,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, fp32.SizeInBytes - e.Buffer.SizeInBytes);
             old = e;
         }
-        if (old is not null && old.Backend is DirectGpu.CUDA.CudaBackend c) c.FreeBufferDeferred(old.Buffer);
+        if (old is not null && old.Backend is Engines.DirectGpu.CUDA.CudaBackend c) c.FreeBufferDeferred(old.Buffer);
         else old?.Dispose();
         return true;
     }
@@ -1593,7 +2025,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // equivalent. Every other backend takes the immediate, equally-correct e.Dispose() (no leak, no
         // cross-backend semantic difference — just a synchronous free). This asymmetry is intentional, not a
         // missing feature; a deferred-free abstraction across all backends is tracked as a follow-up.
-        if (e.Backend is DirectGpu.CUDA.CudaBackend c) c.FreeBufferDeferred(e.Buffer);
+        if (e.Backend is Engines.DirectGpu.CUDA.CudaBackend c) c.FreeBufferDeferred(e.Buffer);
         else e.Dispose();
         return true;
     }
@@ -2163,7 +2595,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal bool TryLandResidentHalf(Tensor<Half> r, Tensor<Half> o)
     {
         if (r is null || o is null || o.Length == 0 || r.Length != o.Length) return false;
-        if (!TryGetBackend(out var backend) || backend is not DirectGpu.CUDA.CudaBackend cb) return false;
+        if (!TryGetBackend(out var backend) || backend is not Engines.DirectGpu.CUDA.CudaBackend cb) return false;
         if (!TryGetResidentFp16Buffer(r, backend, out var rBuf) || rBuf is null) return false;
         var oKey = o.DataVector.GetBackingArrayUnsafe();
         if (oKey is null) return false;
@@ -3360,6 +3792,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     private OwnedBuffer GetOrAllocateContiguousInputBuffer<T>(IDirectGpuBackend backend, Tensor<T> tensor)
     {
+        // #3 FP16-act CONVERT-AT-GAP: an FP16-tagged input → stable up-converted FP32 (see GetResidentOrPersistentInputBuffer).
+        var tHalfC = TryFp16ResidentInput(tensor, out var tCountC);
+        if (tHalfC is not null)
+        {
+            var kC = tensor.DataVector.GetBackingArrayUnsafe();
+            if (kC is not null) return new OwnedBuffer(Fp16InputToFp32Stable(backend, tHalfC, tCountC, kC), ownsBuffer: false);
+        }
         if (tensor._gpuBuffer is not null && ReferenceEquals(tensor._gpuBackend, backend))
             return new OwnedBuffer(tensor._gpuBuffer, ownsBuffer: false);
 
@@ -3408,6 +3847,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         t._gpuBuffer = buf; t._gpuBackend = backend; t._gpuBufferVersion = t.Version;
         var arr = t.DataVector.GetBackingArrayUnsafe();
         if (arr is null) return;
+        // #3 FP16-act: this array now holds FP32 — drop any stale FP16 tag (a pooled array reused FP16→FP32).
+        if (Fp16ActEnabled) _fp16ResidentArrays.TryRemove(arr, out _);
         if (s_currentForwardOp is not null) if (s_producerDiagEnabled && s_producerOf.Count < ProducerDiagCap) s_producerOf[arr] = s_currentForwardOp;
         var capBuf = buf; var capBackend = backend;
         Helpers.DeferredArrayMaterializer.Register(arr, a =>
@@ -3416,6 +3857,48 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var conv = DirectGpuEngine.FromFloatArray<T>(f);
             System.Array.Copy(conv, (T[])a, System.Math.Min(conv.Length, ((T[])a).Length));
         });
+    }
+
+    /// <summary>
+    /// #638/#1650 resident channel-axis concatenation: concat NCHW tensors <paramref name="a"/> ([N,cA,H,W]) and
+    /// <paramref name="b"/> ([N,cB,H,W]) into <paramref name="output"/> ([N,cA+cB,H,W]) entirely on-device, via
+    /// stream-ordered device-to-device copies of each input's per-batch channel slab into the output's resident
+    /// buffer, then binds the output resident (no host span-copy → stays GPU-resident and CUDA-graph-capturable).
+    /// Returns false (caller does its host concat) when not on the resident step, non-float, non-contiguous, or
+    /// shapes don't match the channel-concat contract. The diffusion U-Net decoder skip-concat is the caller.
+    /// </summary>
+    public bool TryConcatenateChannelsResidentInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b)
+    {
+        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (a is null || b is null || output is null) return false;
+        if (a.Rank != 4 || b.Rank != 4 || output.Rank != 4) return false;
+        if (!a.IsContiguous || !b.IsContiguous || !output.IsContiguous) return false;
+        int n = a.Shape._dims[0], cA = a.Shape._dims[1], h = a.Shape._dims[2], w = a.Shape._dims[3];
+        int cB = b.Shape._dims[1];
+        if (b.Shape._dims[0] != n || b.Shape._dims[2] != h || b.Shape._dims[3] != w) return false;
+        if (output.Shape._dims[0] != n || output.Shape._dims[1] != cA + cB
+            || output.Shape._dims[2] != h || output.Shape._dims[3] != w) return false;
+        if (!TryGetBackend(out var be) || be is not Engines.DirectGpu.CUDA.CudaBackend cb) return false;
+        try
+        {
+            int spatial = h * w;
+            int aBatch = cA * spatial, bBatch = cB * spatial, oBatch = (cA + cB) * spatial;
+            using var abuf = GetOrAllocateContiguousInputBuffer(cb, a);
+            using var bbuf = GetOrAllocateContiguousInputBuffer(cb, b);
+            var outBuf = GetOrCreateResidentBuffer(cb, output, output.Length);
+            if (abuf.Buffer.Handle == System.IntPtr.Zero || bbuf.Buffer.Handle == System.IntPtr.Zero
+                || outBuf.Handle == System.IntPtr.Zero || outBuf.Size < output.Length)
+                return false;
+            for (int bi = 0; bi < n; bi++)
+            {
+                cb.Copy(abuf.Buffer, bi * aBatch, outBuf, bi * oBatch, aBatch);
+                cb.Copy(bbuf.Buffer, bi * bBatch, outBuf, bi * oBatch + aBatch, bBatch);
+            }
+            ResidentSyncCheck("ConcatenateChannels");
+            BindResidentBuffer(output, outBuf, cb);
+            return true;
+        }
+        catch (Exception cex) { AliasDiag($"ConcatChannels-resident FELLBACK n={n} cA={cA} cB={cB}: {cex.GetType().Name}: {cex.Message}"); return false; }
     }
 
     /// <summary>PR #638 A1: ensure tensor `t` has a STABLE resident GPU buffer (allocate + bind once if it has none),
@@ -3482,7 +3965,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (_onesBufferCache.TryGetValue(size, out var existing) && existing.Handle != System.IntPtr.Zero) return existing;
         // Allocate+fill only when NOT capturing (cuMemsetD32 aborts capture). The pre-pass populates the cache.
-        if (backend is DirectGpu.CUDA.CudaBackend cb && cb.IsStreamCapturing()) return null;
+        if (backend is Engines.DirectGpu.CUDA.CudaBackend cb && cb.IsStreamCapturing()) return null;
         try
         {
             var buf = backend.AllocateBuffer(size);
@@ -3567,6 +4050,77 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch (Exception lex) { AliasDiag($"LN-resident FELLBACK in=[{string.Join(",", input._shape)}] inContig={input.IsContiguous}: {lex.GetType().Name}: {lex.Message}"); return false; }
     }
 
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<object, (IGpuBuffer norm, IGpuBuffer mean, IGpuBuffer var)> _gnSwishScratch = new();
+
+    /// <summary>
+    /// #1650/#638 GPU-RESIDENT GroupNorm+Swish (the diffusion ResBlock's <c>GroupNormSwishInto</c>):
+    /// reads the resident input + prefer-resident gamma/beta, runs GroupNorm then Swish into the
+    /// output's STABLE resident buffer, and BindResidentBuffer's the result — NO AllocateBuffer(data)
+    /// upload and NO DownloadIntoTensor (the legacy GPU path did both, which are non-capturable inside
+    /// CUDA-graph capture: CUDA 901 on the alloc, 900 on the sync download). Stats/norm scratch are
+    /// allocated ONCE (cached) so capture-time passes are pool-hits, not pool-growth. Returns false to
+    /// fall back to the legacy GPU/CPU path (non-resident / non-float / autocast).
+    /// </summary>
+    internal bool TryGroupNormSwishResidentInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon)
+    {
+        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!TryGetBackend(out var backend) || input.Rank < 2) return false;
+        var arr = output.DataVector.GetBackingArrayUnsafe();
+        if (arr is null) return false;
+        try
+        {
+            int batch = input.Shape._dims[0], channels = input.Shape._dims[1];
+            int spatial = input.Length / (batch * channels);
+            int statSize = batch * numGroups;
+            // #3 FP16-act: read an FP16-resident input RAW. Skip bufIn only when the FP16 GroupNorm+Swish path runs
+            // on a RAW FP16 input; else bufIn is needed (FP32 input down-convert, or the FP32 fallback when the
+            // kernel didn't compile — where the central guard up-converts an FP16 input).
+            var ihGn = TryFp16ResidentInput(input, out _);
+            bool gnFp16Path = ihGn is not null && backend is Engines.DirectGpu.CUDA.CudaBackend cbAvail && cbAvail.Fp16GroupNormSwishAvailable;
+            using var bufIn = gnFp16Path ? default : GetOrAllocateContiguousInputBuffer(backend, input);
+            using var bufGamma = GetWeightBufferPreferResident(backend, gamma, PersistentTensorRole.Weights);
+            using var bufBeta = GetWeightBufferPreferResident(backend, beta, PersistentTensorRole.Biases);
+            var outBuf = GetOrCreateResidentBuffer(backend, output, input.Length);
+            // #3 FP16-ACTIVATIONS: fused FP16 GroupNorm+Swish (FP16 in/out, FP32-internal mean/var) — keeps the
+            // activation FP16 for the next conv (no convert). Input is the FP16-resident buffer, or an FP32 input
+            // down-converted once (convert-at-gap, e.g. after attention/resample). gamma/beta stay FP32.
+            if (Fp16ActEnabled && backend is Engines.DirectGpu.CUDA.CudaBackend cbGn && cbGn.Fp16GroupNormSwishAvailable)
+            {
+                var inHalfGn = ihGn is not null ? ihGn : Fp32InputToFp16Stable(backend, bufIn.Buffer, input.Length, arr);
+                cbGn.Fp16GroupNormSwish(inHalfGn, bufGamma.Buffer, bufBeta.Buffer, outBuf,
+                    batch, numGroups, channels, spatial, (float)epsilon);
+                ResidentSyncCheck("GroupNormSwish");
+                BindResidentBufferFp16(output, outBuf, backend, input.Length);
+                return true;
+            }
+            // Key AND validate by required capacity: the cache is keyed on the output backing array, but the
+            // same array can recur with different group metadata (batch*numGroups) or a larger input, and a
+            // reused undersized norm/mean/var buffer would feed GroupNorm out-of-bounds scratch. (Re)allocate
+            // when the cached buffers are too small — and do it HERE, during the pre-residency warmup pass, so
+            // the capture-time pass is a pure pool-hit (a miss/realloc inside stream capture is a graph-purity
+            // violation: CUDA 901).
+            if (!_gnSwishScratch.TryGetValue(arr, out var sc)
+                || sc.norm.Size < input.Length || sc.mean.Size < statSize || sc.var.Size < statSize)
+            {
+                if (_gnSwishScratch.TryRemove(arr, out var oldSc))
+                {
+                    oldSc.norm.Dispose(); oldSc.mean.Dispose(); oldSc.var.Dispose();
+                }
+                sc = (backend.AllocateBuffer(input.Length), backend.AllocateBuffer(statSize), backend.AllocateBuffer(statSize));
+                _gnSwishScratch[arr] = sc;
+            }
+            // GroupNorm into the norm scratch, then Swish (x*sigmoid(x)) into the resident output.
+            // Arg order (batch, numGroups, channels, spatial) matches the corrected GroupNorm signature.
+            backend.GroupNorm(bufIn.Buffer, sc.norm, bufGamma.Buffer, bufBeta.Buffer, sc.mean, sc.var,
+                batch, numGroups, channels, spatial, (float)epsilon);
+            backend.Swish(sc.norm, outBuf, input.Length);
+            ResidentSyncCheck("GroupNormSwish");
+            BindResidentBuffer(output, outBuf, backend);
+            return true;
+        }
+        catch (Exception gex) { AliasDiag($"GNSwish-resident FELLBACK in=[{string.Join(",", input._shape)}]: {gex.GetType().Name}: {gex.Message}"); return false; }
+    }
+
     /// <summary>GPU-RESIDENT 2-D / ND×2-D matmul for the compiled step (e.g. attention out-proj / LM-head /
     /// any TensorMatMul against a 2-D weight): collapse A's leading dims into M and run backend.Gemm (C=A@B)
     /// into the destination's stable buffer — no host TensorMatMulFloatInto (which materializes inputs → a DtoH
@@ -3606,7 +4160,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal bool TryBatchedMatMulResidentInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b)
     {
         if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
-        if (!TryGetBackend(out var backend) || backend is not DirectGpu.CUDA.CudaBackend cb) return false;
+        if (!TryGetBackend(out var backend) || backend is not Engines.DirectGpu.CUDA.CudaBackend cb) return false;
         int rank = a.Rank;
         // ND batched: equal rank ≥ 3, contiguous, matching leading (batch) dims, inner dims compatible (K).
         if (rank < 3 || b.Rank != rank || !a.IsContiguous || !b.IsContiguous) return false;
@@ -3729,7 +4283,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var gradBuf = GetOrCreateResidentBuffer(backend, gradTable, vocabSize * embeddingDim);
             if (gradBuf.Handle == System.IntPtr.Zero || gradBuf.Size < (long)vocabSize * embeddingDim) return null;
             // Capturable zero (cuMemsetD8Async); backend.Fill (cuMemsetD32) aborts capture (906). Scatter-ADD needs 0-init.
-            if (backend is DirectGpu.CUDA.CudaBackend cudaEmbBe)
+            if (backend is Engines.DirectGpu.CUDA.CudaBackend cudaEmbBe)
                 cudaEmbBe.MemsetBuffer(gradBuf, 0, (long)vocabSize * embeddingDim * sizeof(float));
             else backend.Fill(gradBuf, 0f, vocabSize * embeddingDim);
             backend.EmbeddingBackward(gR, _cachedEmbIndexBuffer, gradBuf, numIndices, embeddingDim, vocabSize);
@@ -3819,6 +4373,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // whole graph). Falls back to the transient path if it has no backing array.
     private OwnedBuffer GetResidentOrPersistentInputBuffer<T>(IDirectGpuBackend backend, Tensor<T> t)
     {
+        // #3 FP16-act CONVERT-AT-GAP: if t holds FP16 activation data, transparently up-convert to a STABLE FP32
+        // buffer so any non-FP16-aware resident op (attention matmul/softmax, resample, concat) reads correct FP32.
+        // FP16-aware ops (conv/groupnorm/add) BYPASS this by reading the raw FP16 via TryFp16ResidentInput.
+        var tHalfR = TryFp16ResidentInput(t, out var tCountR);
+        if (tHalfR is not null)
+        {
+            var kR = t.DataVector.GetBackingArrayUnsafe();
+            if (kR is not null) return new OwnedBuffer(Fp16InputToFp32Stable(backend, tHalfR, tCountR, kR), ownsBuffer: false);
+        }
         // PR #638 (CUDA-700 fix): a REUSED input buffer must hold at least the tensor's logical length, else the
         // consuming kernel reads PAST the allocation (out-of-bounds → sticky CUDA-700). A pooled backing array
         // reused at a larger shape leaves an UNDERSIZED cached/resident buffer; skip it and re-resolve a correctly
@@ -4426,6 +4989,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TensorAddInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
+        // #3 FP16-act: FP16-native residual add when a is FP16-resident (keeps the activation FP16, no convert).
+        if (TryFp16AddInPlace(a, b)) return;
         // Version-counter contract is enforced inside TryRunBinaryInPlace
         // (and CpuEngine's base implementation on the fallback path).
         if (ShapesMatch(a.Shape._dims, b.Shape._dims) && TryRunBinaryInPlace(a, b,
@@ -4495,10 +5060,38 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TensorBroadcastAddInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
+        // #3 FP16-act: keep the activation FP16 across the add. Same-shape → FP16 residual add; per-channel
+        // broadcast ([N,C,H,W] += [.,C,1,1]) → FP16 broadcast-add. Both no-op back to FP32 if not tagged.
+        if (ShapesMatch(a.Shape._dims, b.Shape._dims)) { if (TryFp16AddInPlace(a, b)) return; }
+        else if (TryFp16BroadcastAddInPlace(a, b)) return;
         // If shapes match, use GPU element-wise add in-place
         if (ShapesMatch(a.Shape._dims, b.Shape._dims) && TryRunBinaryInPlace(a, b,
             static (backend, bufA, bufB, size) => backend.Add(bufA, bufB, bufA, size)))
             return;
+
+        // #1650/#638 resident per-channel in-place add (diffusion time-embed residual: h[N,C,H,W] += t[.,C,1,1]).
+        // The shapes-differ broadcast otherwise falls to CpuEngine, which materializes `a` (DtoH download) —
+        // non-capturable inside CUDA-graph capture. Do it on-device via Conv2DBiasAdd (per-channel a += b) on
+        // a's resident buffer (mutated in place; a stays bound). Gated on ResidentStepActive so non-capture
+        // inference is unchanged. Mirrors the resident conv-bias TensorBroadcastAdd path.
+        if (ResidentStepActive && typeof(T) == typeof(float) && !Gpu.AutocastScope.IsEnabled
+            && a.Rank == 4 && b.Rank == 4 && a.IsContiguous
+            && b.Shape._dims[2] == 1 && b.Shape._dims[3] == 1
+            && a.Shape._dims[1] == b.Shape._dims[1]
+            && (b.Shape._dims[0] == 1 || b.Shape._dims[0] == a.Shape._dims[0])
+            && TryGetBackend(out var beCh) && beCh is Engines.DirectGpu.CUDA.CudaBackend cbCh)
+        {
+            try
+            {
+                int n = a.Shape._dims[0], c = a.Shape._dims[1], hw = a.Shape._dims[2] * a.Shape._dims[3];
+                using var abuf = GetResidentOrPersistentInputBuffer(beCh, a);
+                using var bbuf = GetResidentOrPersistentInputBuffer(beCh, b);
+                cbCh.Conv2DBiasAdd(abuf.Buffer, bbuf.Buffer, n, c, hw); // a += b (per channel), in place
+                ResidentSyncCheck("BroadcastAddInPlace");
+                return;
+            }
+            catch (Exception rex) { AliasDiag($"BCastAddInPlace-resident FELLBACK: {rex.GetType().Name}: {rex.Message}"); }
+        }
         // Shapes differ — CPU handles broadcasting logic
         base.TensorBroadcastAddInPlace(a, b);
     }
@@ -4576,6 +5169,95 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.Conv2DInto<T>(Tensor<T> output, Tensor<T> input, Tensor<T> kernel, int stride, int padding, int dilation)
     {
+        // #1650/#638: resident path for the capture step — read resident input + prefer-resident
+        // kernel, conv into the output's STABLE resident buffer, BindResidentBuffer, NO host
+        // round-trip. The legacy GPU path below uploads input/kernel + DownloadIntoTensor (non-
+        // capturable: 901/900). This is the ResBlock's inference fast-path conv (pre-allocated
+        // output), so making it resident is what lets the residual add downstream stay on-device.
+        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
+            && input.Rank == 4 && kernel.Rank == 4
+            && output.DataVector.GetBackingArrayUnsafe() is not null
+            && TryGetBackend(out var rbk) && rbk is Engines.DirectGpu.CUDA.CudaBackend)
+        {
+            try
+            {
+                int b = input.Shape._dims[0], ic = input.Shape._dims[1];
+                int ih = input.Shape._dims[2], iw = input.Shape._dims[3];
+                int oc = kernel.Shape._dims[0], kh = kernel.Shape._dims[2], kw = kernel.Shape._dims[3];
+                int oh = output.Shape._dims[2], ow = output.Shape._dims[3];
+                // #3 FP16-act: detect an FP16-resident input up-front so we read it RAW. bufIn (FP32 path's input)
+                // is skipped when FP16 (else the central up-convert guard wastes a convert we don't use).
+                var inHalf = TryFp16ResidentInput(input, out _);
+                bool inFp16 = inHalf is not null;
+                using var bufIn = inFp16 ? default : GetOrAllocateContiguousInputBuffer(rbk, input);
+                using var bufK = GetWeightBufferPreferResident(rbk, kernel, PersistentTensorRole.Weights);
+                var outBuf = GetOrCreateResidentBuffer(rbk, output, output.Length);
+
+                // #1650/#638 FP16-conv replay-floor lever (AIDOTNET_FP16_CONV=1): the INDUSTRY path (oneDNN/cuDNN/
+                // PyTorch) — conv as a GEMM on the matrix units. Fused FP16 im2col → col[K,N] (FP16), cached FP16
+                // weights[outC,K], GemmFp16In32fOut/HalfOut → out[outC,N]. #3 FP16-ACT: read FP16 input directly
+                // (UnfoldKNFp16FromFp16, no convert) + write FP16 output (GemmFp16HalfOut) so the next op stays FP16.
+                int gemmK = ic * kh * kw, gemmN = b * oh * ow, gemmM = oc;
+                var outArr = output.DataVector.GetBackingArrayUnsafe(); // stable scratch key (gate above ensured non-null)
+                // The matrix-unit GEMM only PAYS OFF on a big-enough GEMM. Deep convs at small spatial (8x8→N=64,
+                // 4x4→N=16) are tiny GEMMs where the im2col + launch overhead exceeds the win. Gate on N/K/M so
+                // only the large convs take the FP16 path; the small ones stay on the FP32 conv kernel.
+                bool fp16ConvWorth = gemmN > Fp16ConvTinyGemmN && gemmK >= 64 && gemmM >= 16;
+                if (s_fp16Conv && fp16ConvWorth
+                    && rbk is Engines.Gpu.IGpuHalfPrecisionBackend hbConvR
+                    && hbConvR.SupportsHgemm && hbConvR.Fp16Im2colAvailable)
+                {
+                    int K = gemmK, N = gemmN, M = gemmM;
+                    // STABLE cached col scratch (NOT a per-call `using` alloc) — capture-replay-safe (see method doc).
+                    var colHalf = GetOrCacheFp16ColScratch(rbk, bufK.Buffer, K * N);
+                    if (inHalf is not null && rbk is Engines.DirectGpu.CUDA.CudaBackend cbIn && cbIn.Fp16Im2colFromFp16Available)
+                        cbIn.UnfoldKNFp16FromFp16(inHalf, colHalf, b, ic, ih, iw, kh, kw, stride, stride, padding, padding, dilation, dilation);
+                    else
+                        hbConvR.Im2colKNFp16(bufIn.Buffer, colHalf, b, ic, ih, iw, kh, kw, stride, stride, padding, padding, dilation, dilation);
+                    var wHalf = GetOrCacheFp16Weights(rbk, bufK.Buffer, M * K); // FP16 weights, converted once + cached
+                    // FP16-act: keep the conv OUTPUT FP16 (GemmFp16HalfOut) + tag, so the next op reads FP16 (no convert).
+                    if (Fp16ActEnabled && rbk is Engines.DirectGpu.CUDA.CudaBackend cbOut)
+                    {
+                        cbOut.GemmFp16HalfOut(wHalf, colHalf, outBuf, M, N, K);
+                        ResidentSyncCheck("Conv2DInto");
+                        BindResidentBufferFp16(output, outBuf, rbk, M * N);
+                        return;
+                    }
+                    hbConvR.GemmFp16In32fOut(wHalf, colHalf, outBuf, M, N, K);
+                }
+                else if (s_fp16Conv && gemmN <= Fp16ConvTinyGemmN && gemmK >= 64 && gemmM >= 16
+                    && rbk is Engines.DirectGpu.CUDA.CudaBackend cudaDirectConv && cudaDirectConv.Fp16DirectConvAvailable)
+                {
+                    // #671: the tiny-spatial deep convs (N <= Fp16ConvTinyGemmN) that the im2col+GEMM path skips run
+                    // through the DIRECT FP16 conv (no im2col materialization) for FP16-consistent numerics on the
+                    // small convs. CUDA-first; parity for the other backends is a tracked follow-up. Weights reuse the
+                    // same cached FP16 copy ([outC,inC,kh,kw] layout); input stays FP32 (rounded to FP16 in-kernel).
+                    var wHalfDirect = GetOrCacheFp16Weights(rbk, bufK.Buffer, gemmM * gemmK);
+                    // #3 FP16-act: the direct conv takes an FP32 input (rounds to FP16 in-kernel). When the activation
+                    // is FP16-resident, bufIn is null (skipped) — up-convert it to a stable FP32 scratch (convert-at-gap).
+                    var directIn = inHalf is not null && outArr is not null
+                        ? Fp16InputToFp32Stable(rbk, inHalf, input.Length, outArr)
+                        : bufIn.Buffer;
+                    cudaDirectConv.Conv2dDirectFp16Hw(directIn, wHalfDirect, outBuf,
+                        b, ic, ih, iw, oc, oh, ow, kh, kw, stride, stride, padding, padding, dilation, dilation);
+                }
+                else
+                {
+                    // FP32 conv (small conv, or FP16-conv off). If the input is FP16-resident, up-convert it to a
+                    // stable FP32 scratch first (convert-at-gap) so this FP32 kernel reads correct data.
+                    var convIn = inHalf is not null && outArr is not null
+                        ? Fp16InputToFp32Stable(rbk, inHalf, input.Length, outArr)
+                        : bufIn.Buffer;
+                    rbk.Conv2D(convIn, bufK.Buffer, outBuf,
+                        b, ic, ih, iw, oc, oh, ow, kh, kw, stride, stride, padding, padding, dilation, dilation);
+                }
+                ResidentSyncCheck("Conv2DInto");
+                BindResidentBuffer(output, outBuf, rbk);
+                return;
+            }
+            catch (Exception cex) { AliasDiag($"Conv2DInto-resident FELLBACK in=[{string.Join(",", input._shape)}]: {cex.GetType().Name}: {cex.Message}"); }
+        }
+
         if (TryGetBackend(out var gpuBackend))
         {
             try
@@ -4970,6 +5652,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.GroupNormSwishInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon)
     {
+        // #1650/#638: resident GPU path for the capture step (no host round-trip). Falls through to the
+        // legacy upload/compute/download GPU path (then CPU) when not in a resident step.
+        if (TryGroupNormSwishResidentInto(output, input, numGroups, gamma, beta, epsilon)) return;
         if (TryGetBackend(out var gpuBackend))
         {
             try
@@ -5075,10 +5760,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var aCached = aArr is not null ? TryGetCachedBuffer(aArr) : null;
             AliasDiag($"gradacc-inplace probe: aField={(aB is null ? "null" : "H=" + ((long)aB.Handle).ToString("X") + "/sz" + aB.Size)} aCache={(aCached is null ? "null" : "H=" + ((long)aCached.Handle).ToString("X") + "/sz" + aCached.Size)} bField={(bB2 is null ? "null" : "H=" + ((long)bB2.Handle).ToString("X") + "/sz" + bB2.Size)} need={a.Length} aContig={a.IsContiguous}");
         }
-        if (s_residentInPlace && InGradAccumulation && ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
+        // Training grad-accum (opt-in s_residentInPlace) OR inference CUDA-graph capture engage the resident
+        // in-place path. Both still require BOTH operands already resident (checked below) — that is what makes
+        // it safe (no owned upload to async-free under the kernel, the CUDA-700 the s_residentInPlace gate guarded).
+        if (((s_residentInPlace && InGradAccumulation) || InferenceCaptureActive) && ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
             && a.IsContiguous && b.IsContiguous && a.Length == b.Length
-            && a.TryGetGpuBuffer() is { } aResident
-            && b.TryGetGpuBuffer() is { } bResident
+            && ResolveResidentBufferNoUpload(backend, a, a.Length) is { } aResident
+            && ResolveResidentBufferNoUpload(backend, b, b.Length) is { } bResident
             && !ReferenceEquals(aResident, bResident)
             && aResident.Handle != System.IntPtr.Zero && bResident.Handle != System.IntPtr.Zero
             && aResident.Size >= a.Length && bResident.Size >= b.Length)
@@ -5297,9 +5985,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         result = null;
         if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
         if (activationParams is not null || bias is null || weights.Rank != 2 || !input.IsContiguous) return false;
-        if (activation != FusedActivationType.None && activation != FusedActivationType.ReLU && activation != FusedActivationType.GELU)
-            return false;
-        if (!TryGetBackend(out var backend) || backend is not DirectGpu.CUDA.CudaBackend cb) return false;
+        // All FusedActivationType values are applied below by ApplyGpuActivation as in-place GPU kernels
+        // (no host round-trip), so the resident path covers Swish/SiLU (the diffusion ResBlock time-MLP —
+        // the first in-capture blocker), Sigmoid, Tanh, ELU, Mish, etc. — not just ReLU/GELU. An activation
+        // ApplyGpuActivation doesn't support throws inside the try and cleanly falls back to the eager path.
+        if (!TryGetBackend(out var backend) || backend is not Engines.DirectGpu.CUDA.CudaBackend cb) return false;
         int K = weights.Shape._dims[0];   // input features
         int N = weights.Shape._dims[1];   // output features
         if (K <= 0 || N <= 0 || input.Length % K != 0) return false;
@@ -5319,8 +6009,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return false;
             cb.Gemm(inBuf.Buffer, wBuf.Buffer, outBuf, M, N, K, 1.0f, 0.0f);   // outBuf = input @ weights
             cb.BiasAdd(outBuf, bBuf.Buffer, outBuf, M, N);                     // += bias[N] (in place)
-            if (activation == FusedActivationType.ReLU) cb.Relu(outBuf, outBuf, M * N);
-            else if (activation == FusedActivationType.GELU) cb.Gelu(outBuf, outBuf, M * N);
+            if (activation != FusedActivationType.None)
+                ApplyGpuActivation(backend, outBuf, M * N, activation);        // in-place GPU activation (covers Swish/SiLU, Sigmoid, Tanh, …)
             ResidentSyncCheck("FusedLinear");
             BindResidentBuffer(outTensor, outBuf, backend);
             result = outTensor;
@@ -6324,7 +7014,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
                 var biasedData = FinishGpuOp<T>(backend, outputBuffer, outputSize);
                 outputHandedOff = true;
-                return new Tensor<T>(biasedData, new[] { batch, outChannels, outHeight, outWidth });
+                var biasedT = new Tensor<T>(biasedData, new[] { batch, outChannels, outHeight, outWidth });
+                // #1650/#638: during the capture step, ALSO bind the output buffer as resident so a
+                // downstream in-place/resident op (e.g. the ResBlock residual add reading this conv's
+                // output as operand b) sees TryGetGpuBuffer() != null and stays on-device instead of
+                // downloading (CUDA-900 in capture). FinishGpuOp already keeps the buffer alive; this
+                // additionally exposes it for resident reuse. Gated → non-capture inference unchanged.
+                if (ResidentStepActive && typeof(T) == typeof(float))
+                    BindResidentBuffer(biasedT, outputBuffer.Buffer, backend);
+                return biasedT;
             }
             else
             {
@@ -6345,7 +7043,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // lifetime from here, so it must NOT be disposed in the finally.
                 var resultData = FinishGpuOp<T>(backend, outputBuffer, outputSize);
                 outputHandedOff = true;
-                return new Tensor<T>(resultData, new[] { batch, outChannels, outHeight, outWidth });
+                var resultT = new Tensor<T>(resultData, new[] { batch, outChannels, outHeight, outWidth });
+                // #1650/#638: bind resident during capture (see bias path above) so downstream resident
+                // ops reuse the conv output on-device. Gated on ResidentStepActive → non-capture unchanged.
+                if (ResidentStepActive && typeof(T) == typeof(float))
+                    BindResidentBuffer(resultT, outputBuffer.Buffer, backend);
+                return resultT;
             }
         }
         catch
@@ -8808,12 +9511,48 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Compute scale if not provided
         float scaleFloat = (float)(scale ?? (1.0 / Math.Sqrt(headDim)));
 
+        // #638/#1650 GPU-RESIDENT capture path: run FlashAttentionV2 into resident output + softmax-stats
+        // buffers and BIND them (no DownloadBuffer), so the diffusion attention block stays fully on-device
+        // for CUDA-graph capture. Inputs Q/K/V are read through their resident buffers with no re-upload.
+        // Scope: float, no attention bias (diffusion self-attention), CUDA backend; anything else falls
+        // through to the eager download path below. Numerically identical — same FlashAttentionV2 kernel.
+        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
+            && attentionBias is null && query.IsContiguous && key.IsContiguous && value.IsContiguous
+            && backend is Engines.DirectGpu.CUDA.CudaBackend)
+        {
+            try
+            {
+                using var qBufR = GetOrAllocateContiguousInputBuffer(backend, query);
+                using var kBufR = GetOrAllocateContiguousInputBuffer(backend, key);
+                using var vBufR = GetOrAllocateContiguousInputBuffer(backend, value);
+                var outT = new Tensor<T>(new T[(long)batch * heads * seqQ * headDim], new[] { batch, heads, seqQ, headDim });
+                var statsT = new Tensor<T>(new T[(long)batch * heads * seqQ], new[] { batch, heads, seqQ });
+                var outBufR = GetOrCreateResidentBuffer(backend, outT, batch * heads * seqQ * headDim);
+                var statsBufR = GetOrCreateResidentBuffer(backend, statsT, batch * heads * seqQ);
+                using var biasNoneR = default(OwnedBuffer);
+                if (qBufR.Buffer.Handle != System.IntPtr.Zero && kBufR.Buffer.Handle != System.IntPtr.Zero
+                    && vBufR.Buffer.Handle != System.IntPtr.Zero
+                    && outBufR.Handle != System.IntPtr.Zero && statsBufR.Handle != System.IntPtr.Zero)
+                {
+                    backend.FlashAttentionV2(qBufR.Buffer, kBufR.Buffer, vBufR.Buffer, outBufR, statsBufR,
+                        batch, heads, seqQ, seqK, headDim, scaleFloat, isCausal, biasNoneR.Buffer, 0);
+                    ResidentSyncCheck("FlashAttention");
+                    BindResidentBuffer(outT, outBufR, backend);
+                    BindResidentBuffer(statsT, statsBufR, backend);
+                    softmaxStats = statsT;
+                    return outT;
+                }
+            }
+            catch (Exception fex) { AliasDiag($"FlashAttention-resident FELLBACK q=[{string.Join(",", query._shape)}]: {fex.GetType().Name}: {fex.Message}"); }
+        }
+
         // Use cache-aware buffer allocation (especially important for KV cache)
         using var queryBuffer = GetOrAllocateBuffer(backend, query);
         using var keyBuffer = GetOrAllocateBuffer(backend, key);
         using var valueBuffer = GetOrAllocateBuffer(backend, value);
-        using var outputBuffer = AllocateOutputBuffer(backend, batch * heads * seqQ * headDim);
-        using var statsBuffer = AllocateOutputBuffer(backend, batch * heads * seqQ);
+        var outputBuffer = AllocateOutputBuffer(backend, batch * heads * seqQ * headDim);
+        var statsBuffer = AllocateOutputBuffer(backend, batch * heads * seqQ);
+        bool faHanded = false;
 
         // Upload attention bias to GPU if provided, with shape validation
         int biasBatchStride = 0;
@@ -8827,6 +9566,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.FlashAttentionV2(queryBuffer.Buffer, keyBuffer.Buffer, valueBuffer.Buffer, outputBuffer.Buffer, statsBuffer.Buffer,
                 batch, heads, seqQ, seqK, headDim, scaleFloat, isCausal,
                 biasBufferHandle.Buffer, biasBatchStride);
+
+            // #1650 capture path: DEFER the output/stats downloads (a sync DtoH aborts capture with 900).
+            // FinishGpuOp keeps the buffers resident + lazily materialized; downstream resident ops read them
+            // on-device and a host read downloads after scope.Execute(). softmaxStats is backward-only (unused
+            // in the inference forward) but deferred the same way for shape/contract parity.
+            if (ResidentStepActive && typeof(T) == typeof(float))
+            {
+                T[] outResident = FinishGpuOp<T>(backend, outputBuffer, batch * heads * seqQ * headDim);
+                T[] statsResident = FinishGpuOp<T>(backend, statsBuffer, batch * heads * seqQ);
+                faHanded = true; // FinishGpuOp owns the buffers' lifetime now (activation cache)
+                var outResT = new Tensor<T>(outResident, new[] { batch, heads, seqQ, headDim });
+                var statsResT = new Tensor<T>(statsResident, new[] { batch, heads, seqQ });
+                // Bind the resident buffers (matching the resident branch above): FinishGpuOp registers them in
+                // the activation cache keyed on the backing array, but downstream resident ops probe the
+                // tensor's _gpuBuffer — without this bind they see none and fall back to host materialization,
+                // breaking the on-device chain during capture.
+                BindResidentBuffer(outResT, outputBuffer.Buffer, backend);
+                BindResidentBuffer(statsResT, statsBuffer.Buffer, backend);
+                softmaxStats = statsResT;
+                return outResT;
+            }
 
             // DownloadBuffer uses blocking read, Synchronize() removed for performance
             float[] outputFloat = new float[batch * heads * seqQ * headDim];
@@ -8845,6 +9605,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             // Fall back to CPU on any GPU error
             return base.FlashAttention(query, key, value, scale, isCausal, out softmaxStats, attentionBias);
+        }
+        finally
+        {
+            // Free the GPU buffers unless they were handed to FinishGpuOp (resident path owns them).
+            if (!faHanded) { outputBuffer.Dispose(); statsBuffer.Dispose(); }
         }
     }
 
@@ -10298,7 +11063,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // FP16 Half-native backward: read IsFp16 grad + softmax output directly, FP16-native softmax
                 // backward (Half grad out), store Half. Parity-equivalent to softmax_backward (same math).
                 if (typeof(T) == typeof(Half) && s_fp16FwdStore
-                    && backend is DirectGpu.CUDA.CudaBackend cbS && cbS.SupportsFp16NativeOps)
+                    && backend is Engines.DirectGpu.CUDA.CudaBackend cbS && cbS.SupportsFp16NativeOps)
                 {
                     IGpuBuffer? hgOwned = null, hoOwned = null, hOut = null;
                     bool ok = false;
@@ -11006,7 +11771,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // backward (gradInput) + grad-params (gradGamma/gradBeta), store Half. mean/invVar stay FP32 (tiny,
             // one per row) exactly like the float path. Parity-equivalent to layernorm_backward + grad_params.
             if (typeof(T) == typeof(Half) && s_fp16FwdStore
-                && backend is DirectGpu.CUDA.CudaBackend cbL && cbL.SupportsFp16NativeOps)
+                && backend is Engines.DirectGpu.CUDA.CudaBackend cbL && cbL.SupportsFp16NativeOps)
             {
                 IGpuBuffer? hgOwned = null, hiOwned = null, hgamOwned = null;
                 IGpuBuffer? meanBuf = null, invVarBuf = null, giOut = null, ggOut = null, gbOut = null;
@@ -15308,7 +16073,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // FP16 Half-resident store (keystone-enabled): the transformer residual add. Read both IsFp16 inputs
         // directly, FP16-native add (FP32 accumulate, Half out), store Half — keeps the residual stream Half.
         if (typeof(T) == typeof(Half) && s_fp16FwdStore && TryGetBackend(out var bkA)
-            && bkA is DirectGpu.CUDA.CudaBackend cbA && cbA.SupportsFp16NativeOps)
+            && bkA is Engines.DirectGpu.CUDA.CudaBackend cbA && cbA.SupportsFp16NativeOps)
         {
             IGpuBuffer? hAOwned = null, hBOwned = null, hOut = null;
             bool ok = false;
@@ -15494,7 +16259,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (typeof(T) == typeof(float))
         {
             if (System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1"
-                && TryGetBackend(out var dbgB) && dbgB is DirectGpu.CUDA.CudaBackend dbgCb && dbgCb.IsStreamCapturing())
+                && TryGetBackend(out var dbgB) && dbgB is Engines.DirectGpu.CUDA.CudaBackend dbgCb && dbgCb.IsStreamCapturing())
                 AliasDiag($"Negate DURING-CAPTURE residentStep={ResidentStepActive} evictSusp={EvictionSuspended} capDepth>0");
             var resOut = new Tensor<T>(new T[tensor.Length], tensor.Shape._dims);
             if (TryUnaryResidentInto(resOut, tensor, static (be, i, o, n) => be.Negate(i, o, n), "Negate"))
@@ -15638,7 +16403,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // FP16 Half-native backward: read IsFp16 grad + input directly, FP16-native ReLU backward
                 // (Half grad out), store Half. Parity-equivalent to relu_backward.
                 if (typeof(T) == typeof(Half) && s_fp16FwdStore
-                    && backend is DirectGpu.CUDA.CudaBackend cbR && cbR.SupportsFp16NativeOps)
+                    && backend is Engines.DirectGpu.CUDA.CudaBackend cbR && cbR.SupportsFp16NativeOps)
                 {
                     IGpuBuffer? hgOwned = null, hiOwned = null, hOut = null;
                     bool ok = false;
@@ -15764,7 +16529,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // (Half grad out), store Half — keeps the backward signal Half (no up-cast). Parity-equivalent
                 // to the FP32 gelu_backward kernel (same formula).
                 if (typeof(T) == typeof(Half) && s_fp16FwdStore
-                    && backend is DirectGpu.CUDA.CudaBackend cbG && cbG.SupportsFp16NativeOps)
+                    && backend is Engines.DirectGpu.CUDA.CudaBackend cbG && cbG.SupportsFp16NativeOps)
                 {
                     IGpuBuffer? hgOwned = null, hiOwned = null, hOut = null;
                     bool ok = false;
@@ -17229,6 +17994,41 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend) || input.Rank < 4)
             return base.ConvTranspose2D(input, kernel, stride, padding, outputPadding);
 
+        // #638/#1650 GPU-RESIDENT capture path: run ConvTranspose2D into a resident output buffer and BIND it
+        // (no FinishGpuOp deferred download), so the diffusion decoder upsample stays on-device for CUDA-graph
+        // capture. The eager path below uses FinishGpuOp, whose deferred materializer races activation-cache
+        // eviction under capture (issue #226). Float, rank-4, no active tape (inference) — same kernel, so
+        // numerically identical; tape training still records via the eager path below.
+        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
+            && input.Rank == 4 && kernel.Rank == 4 && !IsTapeActive<T>()
+            && input.IsContiguous && backend is Engines.DirectGpu.CUDA.CudaBackend rbkT)
+        {
+            try
+            {
+                int batchR = input.Shape._dims[0], inChR = input.Shape._dims[1];
+                int inHR = input.Shape._dims[2], inWR = input.Shape._dims[3];
+                int outChR = kernel.Shape._dims[1], kHR = kernel.Shape._dims[2], kWR = kernel.Shape._dims[3];
+                int outHR = (inHR - 1) * stride[0] - 2 * padding[0] + kHR + outputPadding[0];
+                int outWR = (inWR - 1) * stride[1] - 2 * padding[1] + kWR + outputPadding[1];
+                long outLenR = (long)batchR * outChR * outHR * outWR;
+                using var bufInR = GetOrAllocateContiguousInputBuffer(rbkT, input);
+                using var bufKR = GetWeightBufferPreferResident(rbkT, kernel, PersistentTensorRole.Weights);
+                var outTR = new Tensor<T>(new T[outLenR], new[] { batchR, outChR, outHR, outWR });
+                var outBufR = GetOrCreateResidentBuffer(rbkT, outTR, (int)outLenR);
+                if (bufInR.Buffer.Handle != System.IntPtr.Zero && bufKR.Buffer.Handle != System.IntPtr.Zero
+                    && outBufR.Handle != System.IntPtr.Zero && outBufR.Size >= outLenR)
+                {
+                    rbkT.ConvTranspose2D(bufInR.Buffer, bufKR.Buffer, outBufR,
+                        batchR, inChR, inHR, inWR, outChR, outHR, outWR,
+                        kHR, kWR, stride[0], stride[1], padding[0], padding[1], outputPadding[0], outputPadding[1]);
+                    ResidentSyncCheck("ConvTranspose2D");
+                    BindResidentBuffer(outTR, outBufR, rbkT);
+                    return outTR;
+                }
+            }
+            catch (Exception tex) { AliasDiag($"ConvTranspose2D-resident FELLBACK in=[{string.Join(",", input._shape)}]: {tex.GetType().Name}: {tex.Message}"); }
+        }
+
         try
         {
             int batch = input.Shape._dims[0];
@@ -18064,7 +18864,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // FP16 Half-resident store (keystone-enabled): read IsFp16 input directly, FP16-native ReLU (Half out),
         // store Half — keeps the activation Half end-to-end. Gated like the other forward stores.
         if (typeof(T) == typeof(Half) && s_fp16FwdStore && TryGetBackend(out var bkR)
-            && bkR is DirectGpu.CUDA.CudaBackend cbR && cbR.SupportsFp16NativeOps)
+            && bkR is Engines.DirectGpu.CUDA.CudaBackend cbR && cbR.SupportsFp16NativeOps)
         {
             IGpuBuffer? hInOwned = null, hOut = null;
             bool ok = false;
@@ -18111,7 +18911,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // (Half output, FP32-in-register math), store the Half output as an IsFp16 entry — keeps the activation
         // Half end-to-end so the next op reads Half (no up-cast/re-inflate). Gated like the other forward stores.
         if (typeof(T) == typeof(Half) && s_fp16FwdStore && TryGetBackend(out var bkG)
-            && bkG is DirectGpu.CUDA.CudaBackend cbG && cbG.SupportsFp16NativeOps)
+            && bkG is Engines.DirectGpu.CUDA.CudaBackend cbG && cbG.SupportsFp16NativeOps)
         {
             IGpuBuffer? hInOwned = null, hOut = null;
             bool ok = false;
@@ -18224,6 +19024,41 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return base.TensorBroadcastAdd(a, b);
+
+        // #1650 inference capture: per-channel [N,C,H,W] + [1,C,1,1] (conv bias) is NOT a last-axis
+        // broadcast, so the path below correctly declines it and the CPU base path would download a
+        // resident operand mid-capture. On the capture path, do it resident on-device via Conv2DBiasAdd
+        // (copy a → out, then add bias per channel). Gated on ResidentStepActive so non-capture inference
+        // is unchanged.
+        if (ResidentStepActive && typeof(T) == typeof(float) && !Gpu.AutocastScope.IsEnabled
+            && a.Rank == 4 && b.Rank == 4 && a.IsContiguous && b.IsContiguous
+            && b.Shape._dims[0] == 1 && b.Shape._dims[2] == 1 && b.Shape._dims[3] == 1
+            && a.Shape._dims[1] == b.Shape._dims[1]
+            && TryGetBackend(out var beCh) && beCh is Engines.DirectGpu.CUDA.CudaBackend cbCh)
+        {
+            try
+            {
+                int n = a.Shape._dims[0], c = a.Shape._dims[1], hw = a.Shape._dims[2] * a.Shape._dims[3];
+                using var abuf = GetResidentOrPersistentInputBuffer(beCh, a);
+                using var bbuf = GetResidentOrPersistentInputBuffer(beCh, b);
+                // BIND the result resident (no FinishGpuOp deferred download): the diffusion decoder's Deconv
+                // bias-add runs inside the captured forward, where a deferred materializer races activation-
+                // cache eviction (issue #226) and aborts replay. Fresh output → its resident buffer becomes a
+                // graph alloc node under capture; downstream reads it on-device with no re-upload.
+                var outT = new Tensor<T>(new T[a.Length], a.Shape._dims);
+                var outBuf = GetOrCreateResidentBuffer(beCh, outT, a.Length);
+                if (abuf.Buffer.Handle != System.IntPtr.Zero && bbuf.Buffer.Handle != System.IntPtr.Zero
+                    && outBuf.Handle != System.IntPtr.Zero && outBuf.Size >= a.Length)
+                {
+                    cbCh.Copy(abuf.Buffer, outBuf, a.Length);          // out = a (DtoD async, capturable)
+                    cbCh.Conv2DBiasAdd(outBuf, bbuf.Buffer, n, c, hw); // out += bias (per channel)
+                    ResidentSyncCheck("BroadcastAddConvBias");
+                    BindResidentBuffer(outT, outBuf, beCh);
+                    return outT;
+                }
+            }
+            catch { /* fall through to the paths below */ }
+        }
         // BroadcastAddLast(outer, inner=b.Length) computes out[o*inner+i] = a[o*inner+i] + b[i] — i.e. b
         // MUST map to a's contiguous LAST axis (or be a scalar). For a channel-broadcast like
         // [N,C,H,W] + [1,C,1,1] the b vector spans the OUTER (channel) axis with stride H*W, so
@@ -18629,7 +19464,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     for (int d = 0; d < axis; d++) outerCount *= destination.Shape._dims[d];
                     int axisSize = destination.Shape._dims[axis];
                     var dstBuf = GetOrCreateResidentBuffer(backend, destination, destination.Length);
-                    if (backend is DirectGpu.CUDA.CudaBackend cudaBe
+                    if (backend is Engines.DirectGpu.CUDA.CudaBackend cudaBe
                         && dstBuf.Handle != System.IntPtr.Zero && dstBuf.Size >= destination.Length)
                     {
                         // Capturable zero (cuMemsetD8Async) — backend.Fill is cuMemsetD32 which aborts capture (906).

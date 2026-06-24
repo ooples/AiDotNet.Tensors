@@ -75,6 +75,25 @@ public sealed partial class CudaBackend
         rc = CudaNativeBindings.cuStreamEndCapture(_stream, out var graph);
         if (rc != CudaResult.Success || graph == IntPtr.Zero) { GcDiag($"endCapture FAILED rc={rc} graph={(graph != IntPtr.Zero)} (a non-capturable op — sync HtoD/DtoH or cuMemAlloc — was issued during launch)"); return IntPtr.Zero; }
 
+        // Diagnostic: how many kernel/memory nodes did the capture actually record? A near-empty graph means
+        // the forward's ops were short-circuited (e.g. served from the activation cache) during capture, so
+        // replay reproduces a frozen output that ignores refreshed inputs.
+        { ulong nodeCount = 0; var gn = CudaNativeBindings.cuGraphGetNodes(graph, IntPtr.Zero, ref nodeCount); GcDiag($"captured graph node count = {nodeCount} (rc={gn})");
+          // Node-type breakdown (KERNEL/MEMCPY/MEMSET/MEM_ALLOC/MEM_FREE/…) — tells us how much of the chain is
+          // fusable kernels vs memcpy/alloc overhead. Only when capture-debug is on.
+          if (System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1" && nodeCount > 0 && gn == CudaResult.Success)
+          {
+              var nodes = new IntPtr[nodeCount]; ulong n2 = nodeCount;
+              if (CudaNativeBindings.cuGraphGetNodesArray(graph, nodes, ref n2) == CudaResult.Success)
+              {
+                  var counts = new int[16];
+                  for (ulong i = 0; i < nodeCount; i++)
+                      if (CudaNativeBindings.cuGraphNodeGetType(nodes[i], out int t) == CudaResult.Success && t >= 0 && t < 16) counts[t]++;
+                  GcDiag($"node types: KERNEL={counts[0]} MEMCPY={counts[1]} MEMSET={counts[2]} MEM_ALLOC={counts[10]} MEM_FREE={counts[11]} (other={nodeCount - (ulong)(counts[0] + counts[1] + counts[2] + counts[10] + counts[11])})");
+              }
+          }
+        }
+
         // PR #638 Phase B: the captured whole-step graph contains cuMemAllocAsync MEMORY NODES (the resident-into
         // backward ops allocate per-call scratch from the async pool during capture). A graph with allocation nodes
         // can only be relaunched if its allocations are freed between launches — otherwise the SECOND cuGraphLaunch

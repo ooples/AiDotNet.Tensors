@@ -115,6 +115,23 @@ public sealed class GpuExecutionOptions
     public bool CacheCompiledGraphs { get; set; } = true;
 
     /// <summary>
+    /// When true, the <see cref="RecordingGpuBackend"/> EXECUTES each operation eagerly at
+    /// record time (in addition to recording it into the graph), and <see cref="DeferredScope.Execute"/>
+    /// does NOT replay the graph (it would re-run already-executed ops, double-computing and corrupting
+    /// any in-place/accumulate op). Default: false (pure deferral — ops execute only at graph-execute time).
+    /// <para>
+    /// Pure deferral is only correct when EVERY op in the recorded region routes through a deferrable
+    /// primitive (the ~28 overridden in <see cref="RecordingGpuBackend"/>). A forward that also uses
+    /// non-overridden ops (GroupNorm, reductions, upsample, concat, …) or an already-compiled plan
+    /// (the diffusion UNet's <c>PredictCompiledForward</c>) has those ops fall through to the inner
+    /// backend and execute EAGERLY mid-record — reading buffers whose deferred producers have not run
+    /// yet (garbage). Setting this true makes recording a faithful trace-by-execution (the same contract
+    /// as CUDA-graph stream capture): the forward runs correctly on the GPU and a graph is still recorded.
+    /// </para>
+    /// </summary>
+    public bool ExecuteEagerlyWhileRecording { get; set; } = false;
+
+    /// <summary>
     /// Creates options with default values.
     /// </summary>
     public GpuExecutionOptions()
@@ -238,7 +255,8 @@ public sealed class GpuExecutionOptions
             TransferStreams = TransferStreams,
             EnableProfiling = EnableProfiling,
             GraphBatchSize = GraphBatchSize,
-            CacheCompiledGraphs = CacheCompiledGraphs
+            CacheCompiledGraphs = CacheCompiledGraphs,
+            ExecuteEagerlyWhileRecording = ExecuteEagerlyWhileRecording
         };
     }
 

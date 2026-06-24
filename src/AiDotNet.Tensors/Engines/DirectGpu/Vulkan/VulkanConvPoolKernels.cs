@@ -330,6 +330,58 @@ void main() {
     atomicAdd(gradInput[((b * channels + c) * inDepth + id) * inHeight * inWidth + ih * inWidth + iw], grad);
 }";
 
+    // ---- FUSED im2col + FP32->FP16, TRANSPOSED [K,N] layout (#1650/#638). 1-D-flattened port of the VALIDATED
+    // CUDA im2col_kn_fp16hw (primitive relL2 0.028%). K = channels*kernelH*kernelW, N = batch*outH*outW; the col
+    // matrix is written so the conv becomes a plain NN GEMM out[outC,N] = weights[outC,K] · col[K,N] fed to
+    // GemmFp16In32fOut. The Vulkan backend stores FP16 packed TWO halves per 32-bit word (the layout
+    // VulkanBackend.ConvertToFp16 produces and GemmFp16In32fOut consumes via unpackHalf2x16), so — unlike the CUDA
+    // kernel which writes one ushort per thread — this kernel dispatches ONE THREAD PER OUTPUT WORD (ceil(N*K/2)
+    // threads, exactly the per-word pattern of the FP16-native kernels) and writes one packHalf2x16 per word. That
+    // makes the two-halves-share-a-word writes race-free (each word is written by exactly one thread). The two
+    // col elements a word holds are the consecutive linear indices t0=2*w (low/even half) and t1=2*w+1 (high/odd
+    // half); each is decoded + gathered with the SAME math as the CUDA reference (t = k*N + n). The high half of
+    // the final word when N*K is odd is padding (val=0) the GEMM never reads (it indexes strictly < K*N).
+    // packHalf2x16 is a core GLSL built-in (no float16/extension needed), matching GemmFp16In32fOut. outH/outW are
+    // host-computed and passed in (declaration-order push constants, as int — same convention as the conv family).
+    public const string Im2colKnFp16Hw = Header + @"
+layout(set=0, binding=0) readonly buffer B0 { float inp[]; };
+layout(set=0, binding=1) writeonly buffer B1 { uint outp[]; };
+layout(push_constant) uniform PC {
+    int batch; int channels; int height; int width;
+    int kernelH; int kernelW; int strideH; int strideW;
+    int padH; int padW; int dilationH; int dilationW; int outH; int outW;
+};
+float gather(int t, int N, int K) {
+    // EXACT math of the CUDA im2col_kn_fp16hw, per col element t in [0, N*K).
+    int n = t % N;     // output position (fastest — coalesced)
+    int k = t / N;     // unrolled (c,kh,kw) row
+    int b = n / (outH * outW);
+    int rem = n % (outH * outW);
+    int oh = rem / outW;
+    int ow = rem % outW;
+    int kw = k % kernelW;
+    int kh = (k / kernelW) % kernelH;
+    int c  = k / (kernelW * kernelH);
+    int ih = oh * strideH - padH + kh * dilationH;
+    int iw = ow * strideW - padW + kw * dilationW;
+    if (ih >= 0 && ih < height && iw >= 0 && iw < width)
+        return inp[((b * channels + c) * height + ih) * width + iw];
+    return 0.0;
+}
+void main() {
+    int N = batch * outH * outW;
+    int K = channels * kernelH * kernelW;
+    int total = N * K;
+    int w = int(gl_GlobalInvocationID.x);
+    int numWords = (total + 1) / 2;     // ceil — packed two halves per 32-bit word
+    if (w >= numWords) return;
+    int t0 = 2 * w;
+    int t1 = t0 + 1;
+    float v0 = gather(t0, N, K);
+    float v1 = (t1 < total) ? gather(t1, N, K) : 0.0;   // odd tail: high half is unread padding
+    outp[w] = packHalf2x16(vec2(v0, v1));
+}";
+
     // ---- Conv2D (forward, gather): one thread per output element ----
     public const string Conv2D = Header + @"
 layout(set=0, binding=0) buffer B0 { float inp[]; };

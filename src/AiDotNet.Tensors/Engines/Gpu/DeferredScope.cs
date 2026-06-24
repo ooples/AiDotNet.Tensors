@@ -74,14 +74,23 @@ public sealed class DeferredScope : IDeferredScope
         _totalTimer = Stopwatch.StartNew();
 
         // Create the recording backend wrapper and start recording
-        _recordingBackend = new RecordingGpuBackend(backend);
+        _recordingBackend = new RecordingGpuBackend(backend)
+        {
+            ExecuteWhileRecording = options.ExecuteEagerlyWhileRecording
+        };
         _recordingBackend.BeginRecording(GraphBuilder);
 
         // #642: defer buffer releases for the lifetime of this scope. Ops allocate buffers
         // eagerly during recording but their compute is replayed at Execute(); without this the
         // engine's normal tensor lifetime frees those buffers mid-record, leaving the recorded
         // graph pointing at freed device memory. Flushed in Execute()/Dispose().
-        GpuBufferReleaseDeferral.Begin();
+        // Trace-by-execution runs ops eagerly during recording, so buffers are consumed immediately
+        // and there is nothing to keep alive for a later replay — deferring releases there only
+        // perturbs the engine's buffer reuse vs. the eager path. Skip it in that mode.
+        if (!_recordingBackend.ExecuteWhileRecording)
+        {
+            GpuBufferReleaseDeferral.Begin();
+        }
 
         // Set this scope as current (save parent for restore on dispose)
         _parentScope = _current;
@@ -136,7 +145,13 @@ public sealed class DeferredScope : IDeferredScope
 
             var executionTimer = Stopwatch.StartNew();
 
-            if (_streamPool != null)
+            if (_recordingBackend.ExecuteWhileRecording)
+            {
+                // Trace-by-execution: every op already ran eagerly at record time. Replaying the graph
+                // would execute each op a second time — harmless for pure functional kernels but wrong
+                // for in-place / accumulate ops. The recorded graph remains available via Compile().
+            }
+            else if (_streamPool != null)
             {
                 graph.Execute(_backend, _streamPool);
             }
@@ -187,7 +202,11 @@ public sealed class DeferredScope : IDeferredScope
 
             var executionTimer = Stopwatch.StartNew();
 
-            if (_streamPool != null)
+            if (_recordingBackend.ExecuteWhileRecording)
+            {
+                // Trace-by-execution: ops already ran eagerly at record time (see Execute()).
+            }
+            else if (_streamPool != null)
             {
                 await graph.ExecuteAsync(_backend, _streamPool, cancellationToken);
             }
@@ -231,6 +250,7 @@ public sealed class DeferredScope : IDeferredScope
     {
         if (_deferralEnded) return;
         _deferralEnded = true;
+        if (_recordingBackend.ExecuteWhileRecording) return; // no Begin() was issued in trace-by-execution mode
         GpuBufferReleaseDeferral.EndAndRelease();
     }
 

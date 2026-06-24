@@ -123,6 +123,132 @@ public sealed partial class WebGpuBackend : IGpuHalfPrecisionBackend
         if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n), "Dimensions must be positive.");
         if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k), "Dimensions must be positive.");
     }
+    // #1650/#638 FP16 conv im2col port (WebGpu): fused im2col + FP32→FP16 in the TRANSPOSED [K,N] layout
+    // so conv becomes out[outC,N] = weights[outC,K] · col[K,N] via GemmFp16In32fOut (the industry path).
+    // WebGPU models FP16 as f32 with a truncated 10-bit mantissa (no native 16-bit storage / shader-f16
+    // feature; see class remarks), so outputHalf is an ordinary f32 buffer of K*N elements whose values are
+    // the same truncated-f32 that ConvertToFp16 produces — exactly what GemmFp16In32fOut consumes. The WGSL
+    // kernel's fused f16_trunc helper is a byte-for-byte copy of fp16_convert's rounding, so the result is
+    // identical to a separate gather + ConvertToFp16.
+
+    private readonly object _im2colFp16Lock = new();
+    private bool _im2colFp16Tried;
+    private bool _im2colFp16Available;
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Gated on the <c>im2col_kn_fp16hw</c> WGSL shader actually compiling and the compute pipeline being
+    /// created (lazily, on first query, cached). Unlike <see cref="SupportsHgemm"/> (which only needs device
+    /// availability because the FP16 GEMM reuses the always-present f32 GEMM), this kernel is its own shader:
+    /// gating on a successful pipeline build means a device/driver that rejects it degrades gracefully to the
+    /// FP32 conv instead of throwing. The FP16 model is truncated-f32 (no <c>shader-f16</c> feature), so this
+    /// is expected to compile on every WebGPU device.
+    /// </remarks>
+    public bool Fp16Im2colAvailable => EnsureIm2colFp16Pipeline();
+
+    /// <summary>Lazily builds and caches the <c>im2col_kn_fp16hw</c> pipeline. Non-fatal on failure
+    /// (returns false ⇒ the engine keeps the FP32 conv on WebGpu); a broken/unsupported shader never
+    /// crashes the conv path.</summary>
+    private bool EnsureIm2colFp16Pipeline()
+    {
+        if (_im2colFp16Tried)
+            return _im2colFp16Available;
+
+        lock (_im2colFp16Lock)
+        {
+            if (_im2colFp16Tried)
+                return _im2colFp16Available;
+
+            if (!IsAvailable)
+            {
+                // #671 review: the backend isn't initialized yet — do NOT latch this miss (_im2colFp16Tried
+                // stays false) so a later query retries the pipeline build once IsAvailable becomes true.
+                return false;
+            }
+
+            _im2colFp16Tried = true;
+
+            try
+            {
+                // Build (and cache in _pipelineCache) the compute pipeline. Throws if the WGSL shader
+                // fails to compile or the pipeline cannot be created on this device.
+                GetOrCreatePipelineAsync("Im2colKnFp16", WebGpuKernels.Im2colKnFp16Source, "im2col_kn_fp16hw")
+                    .GetAwaiter().GetResult();
+                _im2colFp16Available = true;
+            }
+            catch (Exception)
+            {
+                // Non-fatal: without the kernel the FP16 conv stays on the FP32 path.
+                _im2colFp16Available = false;
+            }
+
+            return _im2colFp16Available;
+        }
+    }
+
+    /// <inheritdoc/>
+    public void Im2colKNFp16(IGpuBuffer input, IGpuBuffer outputHalf,
+        int batch, int channels, int height, int width,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (outputHalf is null) throw new ArgumentNullException(nameof(outputHalf));
+        if (batch <= 0) throw new ArgumentOutOfRangeException(nameof(batch), "Dimensions must be positive.");
+        if (channels <= 0) throw new ArgumentOutOfRangeException(nameof(channels), "Dimensions must be positive.");
+        if (height <= 0) throw new ArgumentOutOfRangeException(nameof(height), "Dimensions must be positive.");
+        if (width <= 0) throw new ArgumentOutOfRangeException(nameof(width), "Dimensions must be positive.");
+        if (kernelH <= 0) throw new ArgumentOutOfRangeException(nameof(kernelH), "Kernel size must be positive.");
+        if (kernelW <= 0) throw new ArgumentOutOfRangeException(nameof(kernelW), "Kernel size must be positive.");
+        if (strideH <= 0) throw new ArgumentOutOfRangeException(nameof(strideH), "Stride must be positive.");
+        if (strideW <= 0) throw new ArgumentOutOfRangeException(nameof(strideW), "Stride must be positive.");
+        if (padH < 0) throw new ArgumentOutOfRangeException(nameof(padH), "Padding must be non-negative.");
+        if (padW < 0) throw new ArgumentOutOfRangeException(nameof(padW), "Padding must be non-negative.");
+        if (dilationH <= 0) throw new ArgumentOutOfRangeException(nameof(dilationH), "Dilation must be positive.");
+        if (dilationW <= 0) throw new ArgumentOutOfRangeException(nameof(dilationW), "Dilation must be positive.");
+
+        // HOST computes the output spatial dims (same formula on every backend) and passes them in.
+        int outH = (height + 2 * padH - ((kernelH - 1) * dilationH + 1)) / strideH + 1;
+        int outW = (width + 2 * padW - ((kernelW - 1) * dilationW + 1)) / strideW + 1;
+        if (outH <= 0 || outW <= 0)
+            throw new ArgumentException(
+                $"Computed output dims are non-positive (outH={outH}, outW={outW}); kernel/stride/pad/dilation " +
+                "exceed the input size.");
+
+        long n = (long)batch * outH * outW;      // N = batch*outH*outW
+        long k = (long)channels * kernelH * kernelW; // K = channels*kernelH*kernelW
+        long total = n * k;                       // one invocation per col element
+        if (total > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(batch),
+                $"im2col element count N*K = {total} exceeds Int32.MaxValue.");
+        if (total <= 0) return;
+
+        // Im2colParams uniform: 14 u32 fields packed as a flat float[] (same convention as ConvParams /
+        // MakeConvUniforms — all-scalar u32 members are tightly 4-byte packed in a WGSL uniform struct).
+        // Padded to 16 floats (64 bytes) so the allocated uniform buffer is at least the 16-byte-rounded
+        // struct size (mirrors MakeDeformConvUniforms padding).
+        var uniforms = new float[16];
+        uniforms[0] = BitConverter.Int32BitsToSingle(batch);
+        uniforms[1] = BitConverter.Int32BitsToSingle(channels);
+        uniforms[2] = BitConverter.Int32BitsToSingle(height);
+        uniforms[3] = BitConverter.Int32BitsToSingle(width);
+        uniforms[4] = BitConverter.Int32BitsToSingle(kernelH);
+        uniforms[5] = BitConverter.Int32BitsToSingle(kernelW);
+        uniforms[6] = BitConverter.Int32BitsToSingle(strideH);
+        uniforms[7] = BitConverter.Int32BitsToSingle(strideW);
+        uniforms[8] = BitConverter.Int32BitsToSingle(padH);
+        uniforms[9] = BitConverter.Int32BitsToSingle(padW);
+        uniforms[10] = BitConverter.Int32BitsToSingle(dilationH);
+        uniforms[11] = BitConverter.Int32BitsToSingle(dilationW);
+        uniforms[12] = BitConverter.Int32BitsToSingle(outH);
+        uniforms[13] = BitConverter.Int32BitsToSingle(outW);
+        // uniforms[14], [15] = 0 (padding to 16 floats / 64 bytes)
+
+        // One thread per col element (t in [0, N*K)); workgroup_size(256), dispatch = ceil(N*K/256).
+        // outputHalf is the truncated-f32 half buffer GemmFp16In32fOut consumes.
+        Dispatch2BufferAsync("Im2colKnFp16", WebGpuKernels.Im2colKnFp16Source, "im2col_kn_fp16hw",
+            input, outputHalf, uniforms, (int)total).GetAwaiter().GetResult();
+    }
+
 }
 
 #endif

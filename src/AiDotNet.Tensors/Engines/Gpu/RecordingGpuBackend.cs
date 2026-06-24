@@ -44,6 +44,14 @@ public class RecordingGpuBackend : DelegatingGpuBackend
     private bool _isRecording;
 
     /// <summary>
+    /// When true, each recorded operation is ALSO executed eagerly at record time (trace-by-execution),
+    /// so intermediates are valid for any non-deferred op that reads them mid-record and the forward
+    /// produces correct output. The owning <see cref="DeferredScope"/> must then NOT replay the graph
+    /// (it would double-execute). See <see cref="GpuExecutionOptions.ExecuteEagerlyWhileRecording"/>.
+    /// </summary>
+    public bool ExecuteWhileRecording { get; set; }
+
+    /// <summary>
     /// Gets whether the backend is currently recording operations.
     /// </summary>
     public bool IsRecording => _isRecording;
@@ -114,6 +122,9 @@ public class RecordingGpuBackend : DelegatingGpuBackend
             Action<IDirectGpuBackend, IGpuStream?> deferredAction = (backend, stream) => executeAction();
 
             _graphBuilder.AddKernel(kernelType, inputTensors, outputTensors, deferredAction, parameters);
+
+            // Trace-by-execution: also run now so any non-deferred reader downstream sees real data.
+            if (ExecuteWhileRecording) executeAction();
         }
         else
         {
@@ -158,6 +169,7 @@ public class RecordingGpuBackend : DelegatingGpuBackend
                 () => Inner.Gemm(A, B, output, M, N, K, 1.0f, 0.0f),
                 new Dictionary<string, object> { ["M"] = M, ["N"] = N, ["K"] = K });
 
+            // Note: RecordOrExecute already eager-executes the Gemm-into-output when ExecuteWhileRecording.
             return output;
         }
 
@@ -209,6 +221,7 @@ public class RecordingGpuBackend : DelegatingGpuBackend
                 M, N, K, FusedActivationType.ReLU, action);
 
             _graphBuilder.AddNode(node);
+            if (ExecuteWhileRecording) action(Inner, null);
             return output;
         }
 
@@ -237,6 +250,7 @@ public class RecordingGpuBackend : DelegatingGpuBackend
                 M, N, K, FusedActivationType.GELU, action);
 
             _graphBuilder.AddNode(node);
+            if (ExecuteWhileRecording) action(Inner, null);
             return output;
         }
 
@@ -265,6 +279,7 @@ public class RecordingGpuBackend : DelegatingGpuBackend
                 M, N, K, FusedActivationType.Sigmoid, action);
 
             _graphBuilder.AddNode(node);
+            if (ExecuteWhileRecording) action(Inner, null);
             return output;
         }
 
@@ -293,6 +308,7 @@ public class RecordingGpuBackend : DelegatingGpuBackend
                 M, N, K, FusedActivationType.Tanh, action);
 
             _graphBuilder.AddNode(node);
+            if (ExecuteWhileRecording) action(Inner, null);
             return output;
         }
 
@@ -321,6 +337,7 @@ public class RecordingGpuBackend : DelegatingGpuBackend
                 M, N, K, FusedActivationType.None, action);
 
             _graphBuilder.AddNode(node);
+            if (ExecuteWhileRecording) action(Inner, null);
             return output;
         }
 
@@ -400,6 +417,7 @@ public class RecordingGpuBackend : DelegatingGpuBackend
 
             _graphBuilder.AddActivation(inputTensor, outputTensor, FusedActivationType.ReLU,
                 (backend, stream) => backend.Relu(A, B, size));
+            if (ExecuteWhileRecording) Inner.Relu(A, B, size);
         }
         else
         {
@@ -417,6 +435,7 @@ public class RecordingGpuBackend : DelegatingGpuBackend
 
             _graphBuilder.AddActivation(inputTensor, outputTensor, FusedActivationType.Sigmoid,
                 (backend, stream) => backend.Sigmoid(A, B, size));
+            if (ExecuteWhileRecording) Inner.Sigmoid(A, B, size);
         }
         else
         {
@@ -434,6 +453,7 @@ public class RecordingGpuBackend : DelegatingGpuBackend
 
             _graphBuilder.AddActivation(inputTensor, outputTensor, FusedActivationType.Tanh,
                 (backend, stream) => backend.Tanh(A, B, size));
+            if (ExecuteWhileRecording) Inner.Tanh(A, B, size);
         }
         else
         {
@@ -451,6 +471,7 @@ public class RecordingGpuBackend : DelegatingGpuBackend
 
             _graphBuilder.AddActivation(inputTensor, outputTensor, FusedActivationType.GELU,
                 (backend, stream) => backend.Gelu(A, B, size));
+            if (ExecuteWhileRecording) Inner.Gelu(A, B, size);
         }
         else
         {
@@ -468,6 +489,7 @@ public class RecordingGpuBackend : DelegatingGpuBackend
 
             _graphBuilder.AddActivation(inputTensor, outputTensor, FusedActivationType.Softmax,
                 (backend, stream) => backend.Softmax(A, B, batchSize, features));
+            if (ExecuteWhileRecording) Inner.Softmax(A, B, batchSize, features);
         }
         else
         {
@@ -485,6 +507,7 @@ public class RecordingGpuBackend : DelegatingGpuBackend
 
             _graphBuilder.AddActivation(inputTensor, outputTensor, FusedActivationType.LeakyReLU,
                 (backend, stream) => backend.LeakyRelu(A, B, alpha, size));
+            if (ExecuteWhileRecording) Inner.LeakyRelu(A, B, alpha, size);
         }
         else
         {
@@ -502,6 +525,7 @@ public class RecordingGpuBackend : DelegatingGpuBackend
 
             _graphBuilder.AddActivation(inputTensor, outputTensor, FusedActivationType.Swish,
                 (backend, stream) => backend.Swish(A, B, size));
+            if (ExecuteWhileRecording) Inner.Swish(A, B, size);
         }
         else
         {
@@ -749,6 +773,7 @@ public class RecordingGpuBackend : DelegatingGpuBackend
         if (_isRecording && _graphBuilder != null)
         {
             _graphBuilder.AddCopy(source, destination, size);
+            if (ExecuteWhileRecording) Inner.Copy(source, destination, size);
         }
         else
         {

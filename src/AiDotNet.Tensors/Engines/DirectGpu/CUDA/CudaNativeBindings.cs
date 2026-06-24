@@ -241,6 +241,18 @@ internal static class CudaNativeBindings
     [DllImport(CudaLibrary, EntryPoint = "cuGraphLaunch")]
     public static extern CudaResult cuGraphLaunch(IntPtr graphExec, IntPtr stream);
 
+    // Pass nodes=IntPtr.Zero to query just the node count (numNodes is in/out).
+    [DllImport(CudaLibrary, EntryPoint = "cuGraphGetNodes")]
+    public static extern CudaResult cuGraphGetNodes(IntPtr graph, IntPtr nodes, ref ulong numNodes);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuGraphGetNodes")]
+    public static extern CudaResult cuGraphGetNodesArray(IntPtr graph, [Out] IntPtr[] nodes, ref ulong numNodes);
+
+    // CUgraphNodeType: 0=KERNEL 1=MEMCPY 2=MEMSET 3=HOST 4=GRAPH 5=EMPTY 6=WAIT_EVENT 7=EVENT_RECORD
+    // 8=EXT_SEMAS_SIGNAL 9=EXT_SEMAS_WAIT 10=MEM_ALLOC 11=MEM_FREE 12=BATCH_MEMOP
+    [DllImport(CudaLibrary, EntryPoint = "cuGraphNodeGetType")]
+    public static extern CudaResult cuGraphNodeGetType(IntPtr node, out int type);
+
     [DllImport(CudaLibrary, EntryPoint = "cuGraphDestroy")]
     public static extern CudaResult cuGraphDestroy(IntPtr graph);
 

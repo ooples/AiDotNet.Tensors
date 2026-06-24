@@ -277,4 +277,77 @@ public sealed partial class MetalBackend : IGpuHalfPrecisionBackend
         if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n), "Dimensions must be positive.");
         if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k), "Dimensions must be positive.");
     }
+    // #1650/#638 FP16 conv im2col (the industry conv-as-GEMM path): fused im2col + FP32->FP16 into a [K,N] half
+    // buffer (the im2col_kn_fp16hw MSL kernel in the matrix library), paired with GemmFp16In32fOut on the GPU
+    // matrix units. The kernel lives in the same matrix MSL library as the FP16 GEMM, so it compiles whenever the
+    // backend does; the availability gate verifies its pipeline actually builds before the conv path uses it.
+    // Bit-identical index math to the CUDA/HIP im2col_kn_fp16hw kernels. Per the #671 policy decision the FP16 conv
+    // path is enabled by default on every backend whose pipeline compiles; end-to-end correctness is validated on
+    // CUDA (RTX 3080) and CPU-parity-tested on OpenCL/Vulkan, while Metal/WebGpu/HIP end-to-end hardware validation
+    // is a tracked follow-up (this dev box has no Apple GPU). Opt out globally with AIDOTNET_FP16_CONV=0.
+    /// <inheritdoc/>
+    public bool Fp16Im2colAvailable
+        => IsAvailable && _matrixLibrary != IntPtr.Zero
+           && TryGetPipeline("Matrix", _matrixLibrary, "im2col_kn_fp16hw") is not null;
+
+    /// <inheritdoc/>
+    public void Im2colKNFp16(IGpuBuffer input, IGpuBuffer outputHalf,
+        int batch, int channels, int height, int width,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
+    {
+        ThrowIfDisposed();
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (outputHalf is null) throw new ArgumentNullException(nameof(outputHalf));
+        if (batch <= 0 || channels <= 0 || height <= 0 || width <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "batch/channels/height/width must be positive.");
+        if (kernelH <= 0 || kernelW <= 0)
+            throw new ArgumentOutOfRangeException(nameof(kernelH), "kernel dimensions must be positive.");
+        if (strideH <= 0 || strideW <= 0)
+            throw new ArgumentOutOfRangeException(nameof(strideH), "stride must be positive.");
+        if (dilationH <= 0 || dilationW <= 0)
+            throw new ArgumentOutOfRangeException(nameof(dilationH), "dilation must be positive.");
+        if (input is not MetalGpuBuffer inBuf || outputHalf is not MetalGpuBuffer outBuf)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+
+        // Host computes outH/outW (mirrors the CUDA/HIP launchers) and passes them to the kernel.
+        int outH = (height + 2 * padH - ((kernelH - 1) * dilationH + 1)) / strideH + 1;
+        int outW = (width + 2 * padW - ((kernelW - 1) * dilationW + 1)) / strideW + 1;
+        if (outH <= 0 || outW <= 0)
+            throw new ArgumentOutOfRangeException(nameof(outH), "Computed output spatial size is non-positive; check kernel/stride/pad/dilation.");
+
+        // One thread per col element: total = N*K = (batch*outH*outW) * (channels*kernelH*kernelW).
+        // Calculate1DDispatch is int-bounded; guard against int overflow rather than silently truncating
+        // (a Metal limitation vs. the long grid the CUDA/HIP kernels use — see report).
+        long n = (long)batch * outH * outW;
+        long k = (long)channels * kernelH * kernelW;
+        long totalLong = n * k;
+        if (totalLong > int.MaxValue)
+            throw new NotSupportedException(
+                $"FP16 im2col col-matrix element count ({totalLong}) exceeds the Metal 1-D dispatch limit (int.MaxValue).");
+        int total = (int)totalLong;
+
+        var pipeline = GetPipeline("Matrix", _matrixLibrary, "im2col_kn_fp16hw");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(total);
+
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(inBuf, 0);
+        encoder.SetBuffer(outBuf, 1);
+        encoder.SetBytes((uint)batch, 2);
+        encoder.SetBytes((uint)channels, 3);
+        encoder.SetBytes((uint)height, 4);
+        encoder.SetBytes((uint)width, 5);
+        encoder.SetBytes((uint)kernelH, 6);
+        encoder.SetBytes((uint)kernelW, 7);
+        encoder.SetBytes((uint)strideH, 8);
+        encoder.SetBytes((uint)strideW, 9);
+        encoder.SetBytes((uint)padH, 10);
+        encoder.SetBytes((uint)padW, 11);
+        encoder.SetBytes((uint)dilationH, 12);
+        encoder.SetBytes((uint)dilationW, 13);
+        encoder.SetBytes((uint)outH, 14);
+        encoder.SetBytes((uint)outW, 15);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
 }

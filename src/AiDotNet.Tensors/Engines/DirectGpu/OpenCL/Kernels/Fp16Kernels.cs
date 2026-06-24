@@ -112,6 +112,41 @@ __kernel void convert_fp16_to_fp32_vec2(
     float2 f2 = vload_half2(idx, (__global const half*)input);
     output[idx] = f2;
 }
+
+// ============================================================================
+// FP16 CONV im2col (#1650/#638): fused im2col + FP32->FP16 in TRANSPOSED [K,N] layout (K=channels*kernelH*kernelW,
+// N=batch*outH*outW) so the conv becomes a plain NN GEMM out[outC,N] = weights[outC,K] . col[K,N] via
+// GemmFp16In32fOut (the OpenCL HalfPrecisionGemmKernels, FP16 multiply / FP32 accumulate) — the industry conv path.
+// ONE WORK-ITEM PER col ELEMENT (N*K items) → coalesced col[t]=col[k*N+n] writes via the CORE vstore_half built-in
+// (round-to-nearest-even, matches convert_fp32_to_fp16 / ConvertToFp16 so the col + weights agree bit-for-bit).
+// ============================================================================
+__kernel void im2col_kn_fp16hw(
+    __global const float* input,
+    __global ushort* output,
+    const int batch, const int channels, const int height, const int width,
+    const int kernelH, const int kernelW, const int strideH, const int strideW,
+    const int padH, const int padW, const int dilationH, const int dilationW,
+    const int outH, const int outW)
+{
+    size_t t = get_global_id(0);
+    long N = (long)batch * outH * outW;
+    long K = (long)channels * kernelH * kernelW;
+    if ((long)t >= N * K) return;
+    int n = (int)((long)t % N);     // output position (fastest — coalesced)
+    int k = (int)((long)t / N);     // unrolled (c,kh,kw) row
+    int b = n / (outH * outW);
+    int rem = n % (outH * outW);
+    int oh = rem / outW;
+    int ow = rem % outW;
+    int kw = k % kernelW;
+    int kh = (k / kernelW) % kernelH;
+    int c  = k / (kernelW * kernelH);
+    int ih = oh * strideH - padH + kh * dilationH;
+    int iw = ow * strideW - padW + kw * dilationW;
+    float val = (ih >= 0 && ih < height && iw >= 0 && iw < width)
+        ? input[((b * channels + c) * height + ih) * width + iw] : 0.0f;
+    vstore_half(val, t, (__global half*)output);
+}
 ";
     }
 
@@ -122,6 +157,7 @@ __kernel void convert_fp16_to_fp32_vec2(
     {
         return new[]
         {
+            "im2col_kn_fp16hw",
             "convert_fp32_to_fp16",
             "convert_fp16_to_fp32",
             "convert_fp32_to_fp16_rounding",
