@@ -6285,7 +6285,13 @@ KERNEL VARIANTS (A/B testing):
             k.Execute1D(globalSize, localSize);
         }
 
-        public void LocallyConnectedConv2DBackwardWeights(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer gradWeights,
+        // Parameter order MUST match IDirectGpuBackend (gradOutput, input, gradWeights): the engine
+        // calls this via the interface positionally, so a swapped (input, gradOutput) signature here
+        // silently fed gradOutput into the kernel's `input` slot and vice versa (C# binds interface
+        // impls by parameter type, not name — both are IGpuBuffer). The kernel reads gradOutput by
+        // [b,oc,oh,ow] and input by [b,ic,ih,iw]; swapping the buffers reads each at the other's
+        // index/shape, so the weight gradient was wrong (GpuConvKernelCoverageTests).
+        public void LocallyConnectedConv2DBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradWeights,
             int batch, int inChannels, int inHeight, int inWidth,
             int outChannels, int outHeight, int outWidth,
             int kernelH, int kernelW, int strideH, int strideW)
