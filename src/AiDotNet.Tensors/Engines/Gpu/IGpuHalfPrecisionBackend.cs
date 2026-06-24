@@ -94,4 +94,21 @@ public interface IGpuHalfPrecisionBackend
     /// real buffer; backends supply a temporary internally if a backend-specific null is allowed).</summary>
     void Fp16LayerNorm(IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer beta, IGpuBuffer output,
         IGpuBuffer meanFp32, IGpuBuffer varFp32, int rows, int cols, float eps);
+
+    /// <summary>True when this backend ships the fused FP16 im2col kernel (<see cref="Im2colKNFp16"/>) that the
+    /// Tensor-Core FP16 conv path needs (#1650/#638). False ⇒ the engine keeps the FP32 conv. Distinct from
+    /// <see cref="SupportsHgemm"/> because the half GEMM can exist before the conv im2col kernel is ported.</summary>
+    bool Fp16Im2colAvailable { get; }
+
+    /// <summary>
+    /// FUSED im2col + FP32→FP16, writing the col matrix in the TRANSPOSED [K, N] layout
+    /// (K = channels·kernelH·kernelW, N = batch·outH·outW) so the conv becomes a plain NN GEMM:
+    /// <c>out[outC, N] = weights[outC, K] · col[K, N]</c> via <see cref="GemmFp16In32fOut"/> (FP16 multiply /
+    /// FP32 accumulate on the Tensor-Core / matrix units) — the industry FP16-conv path (oneDNN/cuDNN/PyTorch).
+    /// <paramref name="outputHalf"/> is an FP16 (half / 16-bit) buffer of at least K·N elements. The kernel
+    /// MUST launch one thread per col element (N·K threads) for coalesced writes + full occupancy. Capture-safe.
+    /// </summary>
+    void Im2colKNFp16(IGpuBuffer input, IGpuBuffer outputHalf,
+        int batch, int channels, int height, int width,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW);
 }

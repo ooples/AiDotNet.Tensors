@@ -4942,26 +4942,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var bufK = GetWeightBufferPreferResident(rbk, kernel, PersistentTensorRole.Weights);
                 var outBuf = GetOrCreateResidentBuffer(rbk, output, output.Length);
 
-                // #1650/#638 FP16-conv replay-floor lever (AIDOTNET_FP16_CONV=1, CUDA-toolkit box): the INDUSTRY
-                // path (oneDNN/cuDNN/PyTorch) — conv as a Tensor-Core GEMM. Fused FP16 im2col → col[K,N] (FP16),
-                // cached FP16 weights[outC,K], GemmFp16 (cublasGemmEx: FP16 multiply / FP32 accumulate on Tensor
-                // Cores) → out[outC,N]. Measured ~11x faster than the hand-rolled FP32 Winograd at 256ch (the
-                // Winograd kernel itself is ~5.7x slower than even an FP32 cuBLAS GEMM). Driver-only box: kernel
-                // absent → FP32 path. Fp16HwIm2colAvailable gates the unsupported case, so DON'T swallow here —
-                // a launch/capture failure must propagate to the outer resident catch (clean eager fallback). (#671)
+                // #1650/#638 FP16-conv replay-floor lever (AIDOTNET_FP16_CONV=1): the INDUSTRY path (oneDNN/cuDNN/
+                // PyTorch) — conv as a GEMM on the matrix units. Fused FP16 im2col → col[K,N] (FP16), cached FP16
+                // weights[outC,K], GemmFp16In32fOut (FP16 multiply / FP32 accumulate on Tensor Cores / MFMA /
+                // simdgroup / coopmat) → out[outC,N]. Measured ~11x my FP32-Winograd on a big conv; end-to-end
+                // diffusion replay 25ms→17.7ms (1.41x). BACKEND-AGNOSTIC: dispatched via IGpuHalfPrecisionBackend
+                // (CUDA/HIP/Metal/OpenCL/Vulkan/WebGpu) — any backend whose Fp16Im2colAvailable is true. Don't
+                // swallow failures (the availability flag already gates support) — let them hit the outer catch.
                 int gemmK = ic * kh * kw, gemmN = b * oh * ow, gemmM = oc;
-                // Tensor-Core FP16 GEMM only PAYS OFF on a big-enough GEMM. The diffusion UNet's deep convs are
-                // at small spatial (8x8→N=64, 4x4→N=16) — tiny GEMMs where the im2col + GEMM-launch overhead
-                // exceeds the FP16 win and the MMA units sit idle. Gate on N (= outH*outW) and K so only the
-                // large convs (32x32 N=1024, 16x16 N=256) take the FP16 path; the small ones stay FP32 Winograd.
+                // The matrix-unit GEMM only PAYS OFF on a big-enough GEMM. Deep convs at small spatial (8x8→N=64,
+                // 4x4→N=16) are tiny GEMMs where the im2col + launch overhead exceeds the win. Gate on N/K/M so
+                // only the large convs take the FP16 path; the small ones stay on the FP32 conv kernel.
                 bool fp16ConvWorth = gemmN >= 64 && gemmK >= 64 && gemmM >= 16;
                 if (s_fp16Conv && fp16ConvWorth
-                    && rbk is Engines.DirectGpu.CUDA.CudaBackend cudaRbk && cudaRbk.Fp16HwIm2colAvailable
-                    && rbk is Engines.Gpu.IGpuHalfPrecisionBackend hbConvR && hbConvR.SupportsHgemm)
+                    && rbk is Engines.Gpu.IGpuHalfPrecisionBackend hbConvR
+                    && hbConvR.SupportsHgemm && hbConvR.Fp16Im2colAvailable)
                 {
                     int K = gemmK, N = gemmN, M = gemmM;
                     using var colHalf = AllocateOutputBuffer(rbk, K * N); // float-sized buffer holds K*N FP16 col
-                    cudaRbk.UnfoldKNFp16Hw(bufIn.Buffer, colHalf.Buffer, b, ic, ih, iw, kh, kw, stride, stride, padding, padding, dilation, dilation);
+                    hbConvR.Im2colKNFp16(bufIn.Buffer, colHalf.Buffer, b, ic, ih, iw, kh, kw, stride, stride, padding, padding, dilation, dilation);
                     var wHalf = GetOrCacheFp16Weights(rbk, bufK.Buffer, M * K); // FP16 weights, converted once + cached
                     hbConvR.GemmFp16In32fOut(wHalf, colHalf.Buffer, outBuf, M, N, K);
                 }

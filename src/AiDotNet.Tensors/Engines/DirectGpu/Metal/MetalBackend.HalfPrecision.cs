@@ -277,4 +277,14 @@ public sealed partial class MetalBackend : IGpuHalfPrecisionBackend
         if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n), "Dimensions must be positive.");
         if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k), "Dimensions must be positive.");
     }
+    // #1650/#638 FP16 conv im2col — STUB pending the Metal kernel port (dispatch gates on Fp16Im2colAvailable
+    // so Im2colKNFp16 is never invoked while this returns false; the engine keeps the FP32 conv on Metal).
+    /// <inheritdoc/>
+    public bool Fp16Im2colAvailable => false;
+    /// <inheritdoc/>
+    public void Im2colKNFp16(IGpuBuffer input, IGpuBuffer outputHalf,
+        int batch, int channels, int height, int width,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
+        => throw new System.NotSupportedException("FP16 im2col (Im2colKNFp16) is not yet ported to the Metal backend.");
+
 }

@@ -4952,6 +4952,16 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     /// <summary>True when the fused FP16 im2col kernel compiled (needs cuda_fp16.h). #1650/#638.</summary>
     public bool Fp16HwIm2colAvailable => _kernelCache.ContainsKey("im2col_kn_fp16hw");
 
+    // IGpuHalfPrecisionBackend FP16-conv im2col (backend-agnostic dispatch); delegates to the CUDA impl.
+    /// <inheritdoc/>
+    public bool Fp16Im2colAvailable => Fp16HwIm2colAvailable;
+    /// <inheritdoc/>
+    public void Im2colKNFp16(IGpuBuffer input, IGpuBuffer outputHalf,
+        int batch, int channels, int height, int width,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
+        => UnfoldKNFp16Hw(input, outputHalf, batch, channels, height, width,
+            kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+
     /// <summary>FUSED im2col + hw FP32→FP16, TRANSPOSED [K,N] layout (outputHalf = half/ushort buffer of K*N).
     /// Pair with GemmFp16(weightsHalf[outC,K], colHalf[K,N]) → out[outC,N] for a Tensor-Core FP16 conv.
     /// Capture-safe (one kernel on the compute stream). #1650/#638.</summary>
