@@ -210,9 +210,26 @@ public partial class CpuEngine
                 return (Tensor<T>)(object)trainOut;
             }
 
+            if (typeof(T) == typeof(double))
+            {
+                var trainOut = LstmSequenceForwardDoubleTrain(
+                    (Tensor<double>)(object)input,
+                    (Tensor<double>?)(object?)h0,
+                    (Tensor<double>?)(object?)c0,
+                    (Tensor<double>)(object)wIh,
+                    (Tensor<double>)(object)wHh,
+                    (Tensor<double>?)(object?)bIh,
+                    (Tensor<double>?)(object?)bHh,
+                    batch, seqLen, inFeatures, hidden, gateRows, returnSequences, wantState,
+                    out var hnD, out var cnD);
+                finalHidden = (Tensor<T>)(object)hnD;
+                finalCell = (Tensor<T>)(object)cnD;
+                return (Tensor<T>)(object)trainOut;
+            }
+
             throw new InvalidOperationException(
-                "LstmSequenceForward supports GradientTape for float only in this revision. " +
-                "Route non-float training through the decomposed LSTMLayer.Forward path.");
+                "LstmSequenceForward supports GradientTape for float and double in this revision. " +
+                "Route other element types through the decomposed LSTMLayer.Forward path.");
         }
 
         // Graph-compilation mode (distinct from the eager tape) is not yet supported.
