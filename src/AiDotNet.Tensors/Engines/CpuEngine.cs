@@ -2033,7 +2033,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var originalShape = tensor.Shape.ToArray();
         var result = tensor.Reshape(newShape);
         DifferentiableOps.RecordUnary("Reshape", result, tensor, BackwardFunctions<T>.ReshapeBackward, new object[] { originalShape });
-        AutoTracer.RecordOp("Reshape", result, eng => result);
+        AutoTracer.RecordOp("Reshape", result, eng => eng.Reshape(tensor, newShape));
         return result;
     }
 
@@ -5906,7 +5906,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (scalar is not null)
             DifferentiableOps.RecordUnary("TensorMultiplyScalar", result, tensor, BackwardFunctions<T>.MultiplyScalarBackward, new object[] { scalar });
-        AutoTracer.RecordOp("TensorMultiplyScalar", result, eng => result);
+        AutoTracer.RecordOp("TensorMultiplyScalar", result, eng => eng.TensorMultiplyScalar(tensor, scalar));
         return result;
     }
 
@@ -7131,7 +7131,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         object boxedExponent = exponent is not null ? (object)exponent : throw new InvalidOperationException("Exponent cannot be null");
         DifferentiableOps.RecordUnary("TensorPow", result, tensorOrig, BackwardFunctions<T>.TensorPowBackward, new object[] { boxedExponent });
-        AutoTracer.RecordOp("TensorPow", result, eng => result);
+        AutoTracer.RecordOp("TensorPow", result, eng => eng.TensorPow(tensorOrig, exponent));
         return result;
     }
 
@@ -7294,7 +7294,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         DifferentiableOps.RecordBinary("TensorMin", result, aOrig, bOrig, BackwardFunctions<T>.MinBackward);
-        AutoTracer.RecordOp("TensorMin", result, eng => result);
+        AutoTracer.RecordOp("TensorMin", result, eng => eng.TensorMin(aOrig, bOrig));
         return result;
     }
 
@@ -7376,7 +7376,7 @@ public partial class CpuEngine : ITensorLevelEngine
         DifferentiableOps.RecordUnary("Clamp", result, tensorOrig,
             BackwardFunctions<T>.ClampBackward,
             savedState: new object[] { numOps.ToDouble(min), numOps.ToDouble(max) });
-        AutoTracer.RecordOp("Clamp", result, eng => result);
+        AutoTracer.RecordOp("Clamp", result, eng => eng.TensorClamp(tensorOrig, min, max));
         return result;
     }
 
@@ -8789,7 +8789,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int idx = 0; idx < bc; idx++) poolKernel(idx);
             DifferentiableOps.RecordUnary("AvgPool2D", result, inputOrig, BackwardFunctions<T>.AvgPool2DBackward,
                 new object[] { new[] { poolSize, poolSize }, new[] { stride, stride } });
-            AutoTracer.RecordOp("AvgPool2D", result, eng => result);
+            AutoTracer.RecordOp("AvgPool2D", result, eng => eng.AvgPool2D(inputOrig, poolSize, stride, padding));
             return result;
         }
 
@@ -8831,7 +8831,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         DifferentiableOps.RecordUnary("AvgPool2D", result, inputOrig, BackwardFunctions<T>.AvgPool2DBackward,
             new object[] { new[] { poolSize, poolSize }, new[] { stride, stride } });
-        AutoTracer.RecordOp("AvgPool2D", result, eng => result);
+        AutoTracer.RecordOp("AvgPool2D", result, eng => eng.AvgPool2D(inputOrig, poolSize, stride, padding));
         return result;
     }
 
@@ -8877,7 +8877,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         DifferentiableOps.RecordBinary("Conv1D", result, input, kernel, BackwardFunctions<T>.Conv1DBackward,
             new object[] { stride, padding, dilation });
-        AutoTracer.RecordOp("Conv1D", result, eng => result);
+        AutoTracer.RecordOp("Conv1D", result, eng => eng.Conv1D(input, kernel, stride, padding, dilation));
         return result;
     }
 
@@ -8990,7 +8990,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 outputHeight, outputWidth);
             DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel,
                 BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
-            if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => result);
+            if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => eng.Conv2D(inputOrig, kernel, stride, padding, dilation));
             return result;
         }
 
@@ -9089,7 +9089,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
                 DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel,
                     BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
-                if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => result);
+                if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => eng.Conv2D(inputOrig, kernel, stride, padding, dilation));
                 return result;
             }
 #endif
@@ -9104,7 +9104,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 outputHeight, outputWidth);
             DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel,
                 BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
-            if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => result);
+            if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => eng.Conv2D(inputOrig, kernel, stride, padding, dilation));
             return result;
         }
 
@@ -9117,7 +9117,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel,
             BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
-        if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => result);
+        if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => eng.Conv2D(inputOrig, kernel, stride, padding, dilation));
         return result;
     }
 
@@ -11244,7 +11244,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var result = TensorAllocator.Rent<T>(outputShape, outputData);
         DifferentiableOps.RecordUnary("GLU", result, input, BackwardFunctions<T>.GLUBackward, new object[] { actualDim });
-        AutoTracer.RecordOp("GLU", result, eng => result);
+        AutoTracer.RecordOp("GLU", result, eng => eng.GLU(input, dim));
         return result;
     }
 
@@ -13005,7 +13005,7 @@ public partial class CpuEngine : ITensorLevelEngine
             result.Layout = LinearAlgebra.TensorLayout.Nchwc16;
             DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel, BackwardFunctions<T>.Conv2DBackward,
                 new object[] { stride, padding, dilation });
-            if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => result);
+            if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => eng.Conv2D(inputOrig, kernel, stride, padding, dilation));
             return result;
         }
 
@@ -13036,7 +13036,7 @@ public partial class CpuEngine : ITensorLevelEngine
             result.Layout = LinearAlgebra.TensorLayout.Nchwc8;
             DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel, BackwardFunctions<T>.Conv2DBackward,
                 new object[] { stride, padding, dilation });
-            if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => result);
+            if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => eng.Conv2D(inputOrig, kernel, stride, padding, dilation));
             return result;
         }
 
@@ -13139,7 +13139,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel, BackwardFunctions<T>.Conv2DBackward,
             new object[] { stride, padding, dilation });
-        if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => result);
+        if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => eng.Conv2D(inputOrig, kernel, stride, padding, dilation));
         return result;
     }
 
@@ -18112,7 +18112,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         DifferentiableOps.RecordBinary("Conv3D", result, input, kernel, BackwardFunctions<T>.Conv3DBackward,
             new object[] { stride, padding, dilation });
-        AutoTracer.RecordOp("Conv3D", result, eng => result);
+        AutoTracer.RecordOp("Conv3D", result, eng => eng.Conv3D(input, kernel, stride, padding, dilation));
         return result;
     }
 
@@ -18933,7 +18933,7 @@ public partial class CpuEngine : ITensorLevelEngine
         });
 
         DifferentiableOps.RecordUnary("AvgPool3D", result, inputOrig, BackwardFunctions<T>.AvgPool3DBackward, new object[] { poolSize, stride, padding });
-        AutoTracer.RecordOp("AvgPool3D", result, eng => result);
+        AutoTracer.RecordOp("AvgPool3D", result, eng => eng.AvgPool3D(inputOrig, poolSize, stride, padding));
         return result;
     }
 
@@ -22522,7 +22522,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var lnResult = (Tensor<T>)(object)lnResultF;
             DifferentiableOps.RecordIfActive("LayerNorm", lnResult, new[] { input, gamma, beta },
                 BackwardFunctions<T>.LayerNormBackward, new object[] { mean, variance, epsilon });
-            if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("LayerNorm", lnResult, eng => lnResult);
+            if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("LayerNorm", lnResult, eng => eng.LayerNorm(input, gamma, beta, epsilon, out _, out _));
             return lnResult;
         }
 
@@ -23880,7 +23880,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             DifferentiableOps.RecordIfActive("GroupNorm", result, new[] { inputOrig, gamma, beta },
                 BackwardFunctions<T>.GroupNormBackward, new object[] { numGroups, mean, variance, epsilon });
-            if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("GroupNorm", result, eng => result);
+            if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("GroupNorm", result, eng => eng.GroupNorm(inputOrig, numGroups, gamma, beta, epsilon, out _, out _));
             return result;
         }
 
@@ -28925,7 +28925,7 @@ public partial class CpuEngine : ITensorLevelEngine
         DifferentiableOps.RecordUnary("ReduceMean", result, input,
             BackwardFunctions<T>.ReduceMeanBackward,
             savedState: new object[] { normalizedAxes.ToArray() });
-        AutoTracer.RecordOp("ReduceMean", result, eng => result);
+        AutoTracer.RecordOp("ReduceMean", result, eng => eng.ReduceMean(input, normalizedAxes.ToArray(), keepDims));
         return result;
     }
 
@@ -30083,7 +30083,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         DifferentiableOps.RecordBinary("GridSample", output, input, grid, BackwardFunctions<T>.GridSampleBackward);
-        AutoTracer.RecordOp("GridSample", output, eng => output);
+        AutoTracer.RecordOp("GridSample", output, eng => eng.GridSample(input, grid));
         return output;
     }
 
@@ -30179,7 +30179,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (GradientTape<T>.Current is not null)
             DifferentiableOps.RecordUnary("Unfold", result, originalUnfoldInput, BackwardFunctions<T>.UnfoldBackward,
                 new object[] { (int[])kernelSize.Clone(), (int[])stride.Clone(), (int[])padding.Clone() });
-        AutoTracer.RecordOp("Unfold", result, eng => result);
+        AutoTracer.RecordOp("Unfold", result, eng => eng.Unfold(originalUnfoldInput, kernelSize, stride, padding));
         return result;
     }
 
@@ -30280,7 +30280,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (GradientTape<T>.Current is not null)
             DifferentiableOps.RecordUnary("Fold", result, originalFoldInput, BackwardFunctions<T>.FoldBackward,
                 new object[] { (int[])kernelSize.Clone(), (int[])stride.Clone(), (int[])padding.Clone() });
-        AutoTracer.RecordOp("Fold", result, eng => result);
+        AutoTracer.RecordOp("Fold", result, eng => eng.Fold(originalFoldInput, outputSize, kernelSize, stride, padding));
         return result;
     }
 
@@ -31618,7 +31618,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         DifferentiableOps.RecordUnary("Tile", result, tensorOrig,
             BackwardFunctions<T>.TileBackward);
-        AutoTracer.RecordOp("Tile", result, eng => result);
+        AutoTracer.RecordOp("Tile", result, eng => eng.TensorTile(tensorOrig, multiples));
         return result;
     }
 
@@ -31682,7 +31682,7 @@ public partial class CpuEngine : ITensorLevelEngine
         });
 
         DifferentiableOps.RecordUnary("TensorSlice", result, tensor, BackwardFunctions<T>.SliceBackward, new object[] { start });
-        AutoTracer.RecordOp("TensorSlice", result, eng => result);
+        AutoTracer.RecordOp("TensorSlice", result, eng => eng.TensorSlice(tensor, start, length));
         return result;
     }
 
@@ -32123,7 +32123,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Use tensor's built-in Transpose method
         var result = tensor.Transpose(axes);
         DifferentiableOps.RecordUnary("TensorPermute", result, tensor, BackwardFunctions<T>.PermuteBackward, new object[] { axes });
-        AutoTracer.RecordOp("TensorPermute", result, eng => result);
+        AutoTracer.RecordOp("TensorPermute", result, eng => eng.TensorPermute(tensor, axes));
         return result;
     }
 
@@ -32168,7 +32168,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var result = tensor.Reshape(newShape);
         DifferentiableOps.RecordUnary("TensorExpandDims", result, tensor, BackwardFunctions<T>.ExpandDimsBackward, new object[] { axis });
-        AutoTracer.RecordOp("TensorExpandDims", result, eng => result);
+        AutoTracer.RecordOp("TensorExpandDims", result, eng => eng.TensorExpandDims(tensor, axis));
         return result;
     }
 
@@ -33219,7 +33219,7 @@ public partial class CpuEngine : ITensorLevelEngine
         else { var src = tensor._storage.GetDataArray(); var dst = result.GetDataArray(); for (int i = 0; i < tensor.Length; i++) dst[i] = numOps.Add(src[tensor.LogicalToStorageIndex(i)], scalar); }
 
         DifferentiableOps.RecordUnary("TensorAddScalar", result, tensor, BackwardFunctions<T>.AddScalarBackward);
-        AutoTracer.RecordOp("TensorAddScalar", result, eng => result);
+        AutoTracer.RecordOp("TensorAddScalar", result, eng => eng.TensorAddScalar(tensor, scalar));
         return result;
     }
 
@@ -33249,7 +33249,7 @@ public partial class CpuEngine : ITensorLevelEngine
         else { var src = tensor._storage.GetDataArray(); var dst = result.GetDataArray(); for (int i = 0; i < tensor.Length; i++) dst[i] = numOps.Subtract(src[tensor.LogicalToStorageIndex(i)], scalar); }
 
         DifferentiableOps.RecordUnary("TensorSubtractScalar", result, tensor, BackwardFunctions<T>.SubtractScalarBackward);
-        AutoTracer.RecordOp("TensorSubtractScalar", result, eng => result);
+        AutoTracer.RecordOp("TensorSubtractScalar", result, eng => eng.TensorSubtractScalar(tensor, scalar));
         return result;
     }
 
@@ -33280,7 +33280,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (scalar is not null)
             DifferentiableOps.RecordUnary("TensorDivideScalar", result, tensor, BackwardFunctions<T>.DivideScalarBackward, new object[] { scalar });
-        AutoTracer.RecordOp("TensorDivideScalar", result, eng => result);
+        AutoTracer.RecordOp("TensorDivideScalar", result, eng => eng.TensorDivideScalar(tensor, scalar));
         return result;
     }
 
@@ -34212,7 +34212,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         DifferentiableOps.RecordUnary("TensorSliceAxis", result, originalTensor, BackwardFunctions<T>.SliceAxisBackward, new object[] { axis, index });
-        AutoTracer.RecordOp("TensorSliceAxis", result, eng => result);
+        AutoTracer.RecordOp("TensorSliceAxis", result, eng => eng.TensorSliceAxis(originalTensor, axis, index));
         return result;
     }
 
@@ -34675,7 +34675,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
             DifferentiableOps.RecordUnary("TensorIndexSelect", result, tensor,
                 BackwardFunctions<T>.IndexSelectBackward, new object[] { indices, axis });
-            AutoTracer.RecordOp("TensorIndexSelect", result, eng => result);
+            AutoTracer.RecordOp("TensorIndexSelect", result, eng => eng.TensorIndexSelect(tensor, indices, axis));
             return result;
         }
         else if (tensor.Rank == 2 && axis == 1)
@@ -34699,7 +34699,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
             DifferentiableOps.RecordUnary("TensorIndexSelect", result, tensor,
                 BackwardFunctions<T>.IndexSelectBackward, new object[] { indices, axis });
-            AutoTracer.RecordOp("TensorIndexSelect", result, eng => result);
+            AutoTracer.RecordOp("TensorIndexSelect", result, eng => eng.TensorIndexSelect(tensor, indices, axis));
             return result;
         }
         else
@@ -34876,7 +34876,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         DifferentiableOps.RecordUnary("TensorMaskedFill", result, tensorOrig,
             BackwardFunctions<T>.MaskedFillBackward, new object[] { mask });
-        AutoTracer.RecordOp("TensorMaskedFill", result, eng => result);
+        AutoTracer.RecordOp("TensorMaskedFill", result, eng => eng.TensorMaskedFill(tensorOrig, mask, value));
         return result;
     }
 
@@ -35583,7 +35583,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         DifferentiableOps.RecordUnary("Gather", result, inputOrig, BackwardFunctions<T>.GatherBackward, new object[] { indices, axis });
-        AutoTracer.RecordOp("Gather", result, eng => result);
+        AutoTracer.RecordOp("Gather", result, eng => eng.Gather(inputOrig, indices, axis));
         return result;
     }
 
@@ -39538,7 +39538,7 @@ public partial class CpuEngine : ITensorLevelEngine
         DifferentiableOps.RecordUnary("AdaptiveAvgPool2D", result, inputOrig,
             BackwardFunctions<T>.AdaptiveAvgPool2DBackward,
             savedState: new object[] { outputHeight, outputWidth });
-        AutoTracer.RecordOp("AdaptiveAvgPool2D", result, eng => result);
+        AutoTracer.RecordOp("AdaptiveAvgPool2D", result, eng => eng.AdaptiveAvgPool2D(inputOrig, outputHeight, outputWidth));
         return result;
     }
 
@@ -39820,7 +39820,7 @@ public partial class CpuEngine : ITensorLevelEngine
         object boxedScaleA = scaleA is not null ? (object)scaleA : throw new InvalidOperationException("scaleA cannot be null");
         object boxedScaleB = scaleB is not null ? (object)scaleB : throw new InvalidOperationException("scaleB cannot be null");
         DifferentiableOps.RecordBinary("TensorAddScaled", result, a, b, BackwardFunctions<T>.AddScaledBackward, new object[] { boxedScaleA, boxedScaleB });
-        AutoTracer.RecordOp("TensorAddScaled", result, eng => result);
+        AutoTracer.RecordOp("TensorAddScaled", result, eng => eng.TensorAddScaled(a, b, scaleA, scaleB));
         return result;
     }
 
@@ -40338,7 +40338,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = new Tensor<T>(new[] { mean }, [1]);
         DifferentiableOps.RecordBinary("CrossEntropyLoss", result, logitsOrig, targetsOrig,
             BackwardFunctions<T>.CrossEntropyLossBackward);
-        AutoTracer.RecordOp("CrossEntropyLoss", result, eng => result);
+        AutoTracer.RecordOp("CrossEntropyLoss", result, eng => eng.TensorCrossEntropyLoss(logitsOrig, targetsOrig));
         return result;
     }
 
@@ -40377,7 +40377,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = new Tensor<T>(new[] { mean }, [1]);
         DifferentiableOps.RecordBinary("NLLLoss", result, logProbs, targets,
             BackwardFunctions<T>.NLLLossBackward);
-        AutoTracer.RecordOp("NLLLoss", result, eng => result);
+        AutoTracer.RecordOp("NLLLoss", result, eng => eng.TensorNLLLoss(logProbs, targets));
         return result;
     }
 
@@ -40414,7 +40414,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = new Tensor<T>(new[] { mean }, [1]);
         DifferentiableOps.RecordBinary("KLDivLoss", result, input, target,
             BackwardFunctions<T>.KLDivLossBackward);
-        AutoTracer.RecordOp("KLDivLoss", result, eng => result);
+        AutoTracer.RecordOp("KLDivLoss", result, eng => eng.TensorKLDivLoss(input, target));
         return result;
     }
 
@@ -40609,7 +40609,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
         DifferentiableOps.RecordUnary("ReLU6", result, tensorOrig, BackwardFunctions<T>.ReLU6Backward);
-        AutoTracer.RecordOp("ReLU6", result, eng => result);
+        AutoTracer.RecordOp("ReLU6", result, eng => eng.TensorReLU6(tensorOrig));
         return result;
     }
 
@@ -40697,7 +40697,7 @@ public partial class CpuEngine : ITensorLevelEngine
         DifferentiableOps.RecordBinary("PReLU", result, tensorOrig, alphaOrig,
             BackwardFunctions<T>.PReLUBackward,
             savedState: new object[] { channels, spatialSize });
-        AutoTracer.RecordOp("PReLU", result, eng => result);
+        AutoTracer.RecordOp("PReLU", result, eng => eng.TensorPReLU(tensorOrig, alphaOrig));
         return result;
     }
 
@@ -40732,7 +40732,7 @@ public partial class CpuEngine : ITensorLevelEngine
             result[i] = numOps.FromDouble(x >= 0 ? x : a * x);
         }
         DifferentiableOps.RecordUnary("RReLU", result, tensor, BackwardFunctions<T>.RReLUBackward, savedState: new object[] { noise });
-        AutoTracer.RecordOp("RReLU", result, eng => result);
+        AutoTracer.RecordOp("RReLU", result, eng => eng.TensorRReLU(tensor, lower, upper, training));
         return result;
     }
 
@@ -40764,7 +40764,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         DifferentiableOps.RecordUnary("Threshold", result, tensor, BackwardFunctions<T>.ThresholdBackward,
             savedState: new object[] { numOps.ToDouble(threshold) });
-        AutoTracer.RecordOp("Threshold", result, eng => result);
+        AutoTracer.RecordOp("Threshold", result, eng => eng.TensorThreshold(tensor, threshold, value));
         return result;
     }
 
@@ -40880,7 +40880,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var result = tensor.Reshape([tensor.Length]);
         DifferentiableOps.RecordUnary("Flatten", result, tensor, BackwardFunctions<T>.FlattenBackward);
-        AutoTracer.RecordOp("Flatten", result, eng => result);
+        AutoTracer.RecordOp("Flatten", result, eng => eng.TensorFlatten(tensor));
         return result;
     }
 
@@ -40907,7 +40907,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = tensor.Slice(dim, start, start + length);
         DifferentiableOps.RecordUnary("Narrow", result, tensor, BackwardFunctions<T>.NarrowBackward,
             savedState: new object[] { dim, start, length });
-        AutoTracer.RecordOp("Narrow", result, eng => result);
+        AutoTracer.RecordOp("Narrow", result, eng => eng.TensorNarrow(tensor, dim, start, length));
         return result;
     }
 
@@ -41000,7 +41000,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         DifferentiableOps.RecordUnary("ConstantPad", result, tensor, BackwardFunctions<T>.ConstantPadBackward,
             savedState: new object[] { padding });
-        AutoTracer.RecordOp("ConstantPad", result, eng => result);
+        AutoTracer.RecordOp("ConstantPad", result, eng => eng.TensorConstantPad(tensor, padding, value));
         return result;
     }
 
@@ -41185,7 +41185,7 @@ public partial class CpuEngine : ITensorLevelEngine
         TensorUpsampleBilinearInto(result, input, outputSize);
         DifferentiableOps.RecordUnary("UpsampleBilinear", result, input, BackwardFunctions<T>.UpsampleBilinearBackward,
             savedState: new object[] { new[] { h, w } });
-        AutoTracer.RecordOp("UpsampleBilinear", result, eng => result);
+        AutoTracer.RecordOp("UpsampleBilinear", result, eng => eng.TensorUpsampleBilinear(input, outputSize));
         return result;
     }
 
@@ -41232,7 +41232,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
         DifferentiableOps.RecordUnary("AvgPool1D", result, input, BackwardFunctions<T>.AvgPool1DBackward,
             savedState: new object[] { kernelSize, stride });
-        AutoTracer.RecordOp("AvgPool1D", result, eng => result);
+        AutoTracer.RecordOp("AvgPool1D", result, eng => eng.TensorAvgPool1D(input, kernelSize, stride));
         return result;
     }
 
@@ -41283,7 +41283,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
         DifferentiableOps.RecordUnary("MaxPool1D", result, input, BackwardFunctions<T>.MaxPool1DBackward,
             savedState: new object[] { indices, kernelSize, stride });
-        AutoTracer.RecordOp("MaxPool1D", result, eng => result);
+        AutoTracer.RecordOp("MaxPool1D", result, eng => eng.TensorMaxPool1D(input, kernelSize, stride));
         return result;
     }
 
@@ -41313,7 +41313,7 @@ public partial class CpuEngine : ITensorLevelEngine
         T mean = numOps.Divide(sum, numOps.FromDouble(tensor.Length));
         var result = new Tensor<T>(new[] { mean }, [1]);
         DifferentiableOps.RecordUnary("Mean", result, tensor, BackwardFunctions<T>.MeanBackward);
-        AutoTracer.RecordOp("Mean", result, eng => result);
+        AutoTracer.RecordOp("Mean", result, eng => eng.TensorMeanDiff(tensor));
         return result;
     }
 
@@ -41358,7 +41358,7 @@ public partial class CpuEngine : ITensorLevelEngine
         variance /= tensor.Length;
         var result = new Tensor<T>(new[] { numOps.FromDouble(variance) }, [1]);
         DifferentiableOps.RecordUnary("Var", result, tensor, BackwardFunctions<T>.VarBackward);
-        AutoTracer.RecordOp("Var", result, eng => result);
+        AutoTracer.RecordOp("Var", result, eng => eng.TensorVar(tensor));
         return result;
     }
 
@@ -41392,7 +41392,7 @@ public partial class CpuEngine : ITensorLevelEngine
         variance /= tensor.Length;
         var result = new Tensor<T>(new[] { numOps.FromDouble(Math.Sqrt(variance)) }, [1]);
         DifferentiableOps.RecordUnary("Std", result, tensor, BackwardFunctions<T>.StdBackward);
-        AutoTracer.RecordOp("Std", result, eng => result);
+        AutoTracer.RecordOp("Std", result, eng => eng.TensorStd(tensor));
         return result;
     }
 
@@ -41433,7 +41433,7 @@ public partial class CpuEngine : ITensorLevelEngine
         double lse = maxVal + Math.Log(sumExp);
         var result = new Tensor<T>(new[] { numOps.FromDouble(lse) }, [1]);
         DifferentiableOps.RecordUnary("LogSumExp", result, tensor, BackwardFunctions<T>.LogSumExpBackward);
-        AutoTracer.RecordOp("LogSumExp", result, eng => result);
+        AutoTracer.RecordOp("LogSumExp", result, eng => eng.TensorLogSumExp(tensor));
         return result;
     }
 
@@ -41463,7 +41463,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         var result = new Tensor<T>(new[] { numOps.FromDouble(Math.Sqrt(sumSq)) }, [1]);
         DifferentiableOps.RecordUnary("Norm", result, tensor, BackwardFunctions<T>.NormBackward);
-        AutoTracer.RecordOp("Norm", result, eng => result);
+        AutoTracer.RecordOp("Norm", result, eng => eng.TensorNorm(tensor));
         return result;
     }
 
@@ -41517,7 +41517,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     }
         DifferentiableOps.RecordUnary("AdaptiveMaxPool2D", result, input,
             BackwardFunctions<T>.AdaptiveMaxPool2DBackward, savedState: new object[] { argmax });
-        AutoTracer.RecordOp("AdaptiveMaxPool2D", result, eng => result);
+        AutoTracer.RecordOp("AdaptiveMaxPool2D", result, eng => eng.TensorAdaptiveMaxPool2D(input, outputSize));
         return result;
     }
 
@@ -41546,7 +41546,7 @@ public partial class CpuEngine : ITensorLevelEngine
             result[i] = condition[i] ? x[i] : y[i];
         DifferentiableOps.RecordBinary("Where", result, x, y,
             BackwardFunctions<T>.WhereBackward, savedState: new object[] { condition });
-        AutoTracer.RecordOp("Where", result, eng => result);
+        AutoTracer.RecordOp("Where", result, eng => eng.TensorWhere(condition, x, y));
         return result;
     }
 
