@@ -175,10 +175,67 @@ public class MathInvariantExtendedTests
     [Fact] public void Diagonal_Shape() { var mat = R([4, 4], 1); Assert.Equal(new[] { 4 }, E.TensorDiagonal(mat).Shape.ToArray()); }
 
     // ================================================================
-    // TensorDropoutMask (2)
+    // TensorDropoutMask (7)
     // ================================================================
     [Fact] public void DropoutMask_ShapeCorrect() => Assert.Equal(new[] { 4, 8 }, E.TensorDropoutMask<float>(new[] { 4, 8 }, 0.3f, 1.0f / 0.7f, 42).Shape.ToArray());
     [Fact] public void DropoutMask_ValuesInRange() { var t = E.TensorDropoutMask<float>(new[] { 256 }, 0.5f, 2f, 99); var m = t.GetDataArray(); for (int i = 0; i < t.Length; i++) Assert.True(m[i] == 0f || Math.Abs(m[i] - 2f) < Tol, $"mask[{i}]={m[i]}"); }
+
+    // Reproducibility regression tests for the seeded path. The previous implementation keyed
+    // per-thread RNGs on Thread.CurrentThread.ManagedThreadId and drew from them in
+    // nondeterministic chunk order, so a seeded mask was NOT reproducible above the
+    // 10000-element parallel threshold (the root of intermittent "two trainings at the same
+    // seed diverge" model-family failures). A seeded mask must depend only on (seed, index).
+    [Fact]
+    public void DropoutMask_Seeded_ReproducibleAcrossCalls_LargeParallel()
+    {
+        var a = E.TensorDropoutMask<float>(new[] { 20000 }, 0.3f, 2f, 12345).GetDataArray();
+        for (int rep = 0; rep < 4; rep++)
+        {
+            var b = E.TensorDropoutMask<float>(new[] { 20000 }, 0.3f, 2f, 12345).GetDataArray();
+            for (int i = 0; i < a.Length; i++)
+                Assert.True(a[i] == b[i], $"seeded mask not reproducible at [{i}] (rep {rep}): {a[i]} vs {b[i]}");
+        }
+    }
+
+    [Fact]
+    public void DropoutMask_Seeded_ReproducibleAcrossCalls_Small()
+    {
+        var a = E.TensorDropoutMask<float>(new[] { 256 }, 0.5f, 2f, 777).GetDataArray();
+        var b = E.TensorDropoutMask<float>(new[] { 256 }, 0.5f, 2f, 777).GetDataArray();
+        for (int i = 0; i < a.Length; i++) Assert.True(a[i] == b[i], $"[{i}]: {a[i]} vs {b[i]}");
+    }
+
+    [Fact]
+    public void DropoutMask_Seeded_PathIndependent_SmallMatchesLargePrefix()
+    {
+        // The small (<=10000, serial) and large (>10000, parallel) seeded paths share the same
+        // per-element hash, so the small mask equals the prefix of the large mask at the same seed.
+        var large = E.TensorDropoutMask<float>(new[] { 20000 }, 0.4f, 2f, 2024).GetDataArray();
+        var small = E.TensorDropoutMask<float>(new[] { 9000 }, 0.4f, 2f, 2024).GetDataArray();
+        for (int i = 0; i < small.Length; i++)
+            Assert.True(small[i] == large[i], $"path mismatch at [{i}]: small {small[i]} vs large {large[i]}");
+    }
+
+    [Fact]
+    public void DropoutMask_Seeded_DifferentSeeds_DifferMasks()
+    {
+        var a = E.TensorDropoutMask<float>(new[] { 20000 }, 0.5f, 2f, 1).GetDataArray();
+        var b = E.TensorDropoutMask<float>(new[] { 20000 }, 0.5f, 2f, 2).GetDataArray();
+        int diff = 0;
+        for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) diff++;
+        // At rate 0.5, two independent seeds agree at a position with p=0.5, so ~half should flip.
+        Assert.True(diff > a.Length / 4, $"masks for distinct seeds barely differ: {diff}/{a.Length}");
+    }
+
+    [Fact]
+    public void DropoutMask_Seeded_DropRateApproximatelyCorrect_LargeParallel()
+    {
+        var m = E.TensorDropoutMask<float>(new[] { 50000 }, 0.3f, 1f / 0.7f, 99).GetDataArray();
+        int dropped = 0;
+        for (int i = 0; i < m.Length; i++) if (m[i] == 0f) dropped++;
+        double observed = (double)dropped / m.Length;
+        Assert.True(Math.Abs(observed - 0.3) < 0.02, $"drop rate {observed:F4} deviates from 0.3");
+    }
 
     // ================================================================
     // TensorExpandDims / TensorSqueeze (3)
