@@ -461,6 +461,16 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     private static string? GetCudaIncludePath()
     {
+        // AIDOTNET_CUDA_INCLUDE points DIRECTLY at a dir holding the CUDA headers (cuda_fp16.h etc.) for nvrtc.
+        // Lets a driver-only box enable the FP16/hardware-half kernels via just the pip CUDA-runtime headers
+        // (nvidia-cuda-runtime-cuXX) WITHOUT a full toolkit install or hijacking the global CUDA_PATH (which
+        // other tools expect to be a complete toolkit with bin/nvcc). Checked first; falls through if unset.
+        var directInclude = Environment.GetEnvironmentVariable("AIDOTNET_CUDA_INCLUDE");
+        if (!string.IsNullOrWhiteSpace(directInclude)
+            && Directory.Exists(directInclude)
+            && File.Exists(Path.Combine(directInclude, "cuda_fp16.h"))) // validate it actually holds the headers
+            return directInclude;                                       // before short-circuiting CUDA_PATH (#671 review)
+
         // Check CUDA_PATH environment variable first
         var cudaPath = Environment.GetEnvironmentVariable("CUDA_PATH");
         if (string.IsNullOrEmpty(cudaPath) && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
@@ -911,6 +921,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             // which is invisible otherwise (#558). Surfaced via Fp16ModuleCompileError for diagnostics.
             Fp16ModuleCompileError = fp16Ex.Message;
         }
+        if (System.Environment.GetEnvironmentVariable("AIDOTNET_FP16_SETUP_DIAG") == "1")
+        {
+            try { System.IO.File.WriteAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_fp16_setup.txt"),
+                $"cudaInclude={GetCudaIncludePath() ?? "(null)"}\n" +
+                $"fp16ModuleCompiled={_fp16Module != IntPtr.Zero}\n" +
+                $"conv2d_direct_fp16hw in cache={_kernelCache.ContainsKey("conv2d_direct_fp16hw")}\n" +
+                $"Fp16ModuleCompileError={Fp16ModuleCompileError ?? "(none)"}\n"); } catch { }
+        }
 
         // Compile LSTM sequence kernels (forward/backward for BPTT training)
         try
@@ -1077,10 +1095,111 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         return log;
     }
 
+    // #1650 residency AUDIT: when AIDOTNET_RESIDENT_AUDIT=1, log a compact call-stack at each sync HtoD/DtoH
+    // (the exact ops that would abort CUDA-graph capture). Run the forward once under ResidentStepActive AFTER a
+    // warmup (so one-time cache-fills don't show) → the full set of NOT-YET-RESIDENT ops in ONE pass, instead of
+    // capture-aborting on the first. The dedup'd op frames are the residency-grind work-list.
+    private static readonly bool s_residentAudit =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_RESIDENT_AUDIT") == "1";
+
+    // Bounded sink for the opt-in resident-audit diagnostics. The path is process-unique (no cross-process
+    // append collision) and overridable via AIDOTNET_RESIDENT_AUDIT_PATH; the cumulative size is capped so a
+    // long capture session can't grow it without bound; write/cap failures surface via Trace instead of being
+    // silently swallowed. Only ever exercised when AIDOTNET_RESIDENT_AUDIT=1 (developer diagnostics).
+    private const long ResidentAuditMaxBytes = 16L * 1024 * 1024; // 16 MB
+    private static readonly string s_residentAuditPath =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_RESIDENT_AUDIT_PATH")
+        ?? System.IO.Path.Combine(System.IO.Path.GetTempPath(),
+            $"aidotnet_resident_audit_{System.Diagnostics.Process.GetCurrentProcess().Id}.txt");
+    private static long s_residentAuditBytes;
+    private static int s_residentAuditFull;
+
+    private static void AppendResidentAudit(string line)
+    {
+        if (System.Threading.Volatile.Read(ref s_residentAuditFull) != 0) return;
+        if (System.Threading.Interlocked.Add(ref s_residentAuditBytes, line.Length) > ResidentAuditMaxBytes)
+        {
+            if (System.Threading.Interlocked.Exchange(ref s_residentAuditFull, 1) == 0)
+                System.Diagnostics.Trace.WriteLine(
+                    $"[AiDotNet] resident-audit log reached {ResidentAuditMaxBytes} bytes; further entries dropped ({s_residentAuditPath}).");
+            return;
+        }
+        try { System.IO.File.AppendAllText(s_residentAuditPath, line); }
+        catch (System.Exception ex)
+        {
+            System.Diagnostics.Trace.WriteLine($"[AiDotNet] resident-audit write failed ({s_residentAuditPath}): {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    // #638/#1650 capture-blocker diagnostic: when AIDOTNET_GRAPH_CAPTURE_DEBUG=1, log the call stack of the
+    // FIRST sync HtoD/DtoH that runs WHILE the stream is actually capturing (cuStreamBeginCapture active).
+    // Unlike AIDOTNET_RESIDENT_AUDIT (which also logs the eager passes that run AFTER capture is disabled,
+    // polluting the work-list), this fires ONLY inside CaptureGraph's recorded forward, so it pinpoints the
+    // exact op that aborts capture with no pollution. One-shot per process (capture is attempted once).
+    private static readonly bool s_captureDebug =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1";
+    private static int s_captureBlockerLogged;
+    internal static void AuditSyncIO(string kind, long bytes)
+    {
+        if (!s_residentAudit) return;
+        try
+        {
+            var st = new System.Diagnostics.StackTrace(2, false);
+            var sb = new System.Text.StringBuilder();
+            for (int i = 0; i < st.FrameCount; i++)
+            {
+                var m = st.GetFrame(i)?.GetMethod();
+                var tn = m?.DeclaringType?.Name;
+                if (tn is null) continue;
+                if (tn.Contains("Layer") || tn.Contains("NoisePredictor") || tn.Contains("ResBlock")
+                    || tn.Contains("Attention") || tn.Contains("DirectGpuTensorEngine") || tn.Contains("CpuEngine"))
+                {
+                    sb.Append(tn).Append('.').Append(m!.Name).Append(" <- ");
+                    if (sb.Length > 300) break;
+                }
+            }
+            AppendResidentAudit($"{kind}\t{bytes}\t{sb}\n");
+        }
+        catch { }
+    }
+
+    internal void LogCaptureBlockerIfCapturing(string kind, long bytes)
+    {
+        if (!s_captureDebug) return;
+        if (System.Threading.Volatile.Read(ref s_captureBlockerLogged) != 0) return;
+        bool capturing;
+        try { capturing = IsStreamCapturing(); } catch { return; }
+        if (!capturing) return;
+        if (System.Threading.Interlocked.Exchange(ref s_captureBlockerLogged, 1) != 0) return;
+        try
+        {
+            var st = new System.Diagnostics.StackTrace(1, false);
+            var sb = new System.Text.StringBuilder();
+            sb.Append("CAPTURE BLOCKER — first sync ").Append(kind).Append(" (").Append(bytes).Append(" bytes) during capture: ");
+            for (int i = 0; i < st.FrameCount; i++)
+            {
+                var m = st.GetFrame(i)?.GetMethod();
+                var tn = m?.DeclaringType?.Name;
+                if (tn is null) continue;
+                if (tn.Contains("Layer") || tn.Contains("NoisePredictor") || tn.Contains("ResBlock")
+                    || tn.Contains("Attention") || tn.Contains("DirectGpuTensorEngine") || tn.Contains("CpuEngine")
+                    || tn.Contains("UNet") || tn.Contains("Diffusion"))
+                {
+                    sb.Append(tn).Append('.').Append(m!.Name).Append(" <- ");
+                    if (sb.Length > 600) break;
+                }
+            }
+            System.IO.File.WriteAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_capture_blocker.txt"), sb.ToString() + "\n");
+        }
+        catch { }
+    }
+
     public IGpuBuffer AllocateBuffer(float[] data)
     {
         if (!IsAvailable)
             throw new InvalidOperationException("CUDA backend is not available.");
+        AuditSyncIO("HtoD-alloc", (long)data.Length * sizeof(float));
+        LogCaptureBlockerIfCapturing("HtoD-alloc", (long)data.Length * sizeof(float));
 
         int size = data.Length;
         if (size <= 0)
@@ -1412,6 +1531,20 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private IntPtr AllocDeviceMemoryAsync(ulong byteSize)
     {
         var r = CuBlasNative.cuMemAllocAsync(out IntPtr p, byteSize, _stream);
+        if (r != CudaResult.Success && IsStreamCapturing())
+        {
+            // #1650/#638 capture: during stream capture cuCtxSynchronize / cuMemPoolTrimTo are ILLEGAL
+            // (they throw CUDA 900 and abort the capture — blocker #2 of the diffusion UNet capture, a
+            // scratch alloc inside GroupNormSwish's SwishInPlace). The pre-residency warmup pass already
+            // grew the async pool for these exact allocations, so the capture-time alloc is a pool-hit
+            // memory-node; if it still failed, the synchronizing reclamation cannot help mid-capture
+            // anyway. Surface the real alloc error (capture aborts → graceful eager fallback) instead of
+            // masking it behind an illegal-sync CUDA 900.
+            if (r != CudaResult.Success) GpuMemoryTracker.Dump($"cuMemAllocAsync OOM (capturing) requesting {byteSize} bytes");
+            CuBlasNative.CheckCudaResult(r, "cuMemAllocAsync (during capture)");
+            GpuMemoryTracker.OnAlloc(p, (long)byteSize);
+            return p;
+        }
         if (r != CudaResult.Success)
         {
             // Sync so pending cuMemFreeAsync reclamations land back in the pool, then TRIM the pool's
@@ -1472,6 +1605,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // value oscillated run-to-run between updated and pre-step). One stream
         // sync on the host-read path (already a synchronization point) closes
         // the race with no effect on the GPU-resident training hot path.
+        AuditSyncIO("DtoH-download", (long)buffer.Size * sizeof(float));
+        LogCaptureBlockerIfCapturing("DtoH-download", (long)buffer.Size * sizeof(float));
         CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamSynchronize(_stream), "cuStreamSynchronize(download)");
 
         ulong byteSize = (ulong)(buffer.Size * sizeof(float));
@@ -4814,6 +4949,143 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         }
     }
 
+    /// <summary>True when the fused FP16 im2col kernel compiled (needs cuda_fp16.h). #1650/#638.</summary>
+    public bool Fp16HwIm2colAvailable => _kernelCache.ContainsKey("im2col_kn_fp16hw");
+
+    /// <summary>True when the direct FP16 conv kernel compiled (needs cuda_fp16.h). #1650/#638 / #671.</summary>
+    public bool Fp16DirectConvAvailable => _kernelCache.ContainsKey("conv2d_direct_fp16hw");
+
+    /// <summary>
+    /// #1650/#638 (#671): DIRECT FP16 convolution for the tiny-spatial deep convs the im2col + Tensor-Core GEMM
+    /// path skips (small N, where im2col + launch overhead exceeds the GEMM win). FP32 <paramref name="input"/>
+    /// rounded to FP16 per access, FP16 <paramref name="weightsHalf"/> (the cached half copy of the conv weights,
+    /// [outChannels, inChannels, kernelH, kernelW] layout), FP32 multiply-accumulate, FP32 <paramref name="output"/>.
+    /// Capture-safe: a single kernel launch, no device allocation. CUDA-first — parity for the other backends is a
+    /// tracked follow-up; validate end-to-end on CUDA hardware before relying on it.
+    /// </summary>
+    public unsafe void Conv2dDirectFp16Hw(IGpuBuffer input, IGpuBuffer weightsHalf, IGpuBuffer output,
+        int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
+    {
+        using var _ = PushContext();
+        if (!_kernelCache.TryGetValue("conv2d_direct_fp16hw", out var k))
+            throw new InvalidOperationException("CUDA kernel not found: conv2d_direct_fp16hw");
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (weightsHalf is null) throw new ArgumentNullException(nameof(weightsHalf));
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (batch <= 0) throw new ArgumentOutOfRangeException(nameof(batch), "Dimensions must be positive.");
+        if (inChannels <= 0) throw new ArgumentOutOfRangeException(nameof(inChannels), "Dimensions must be positive.");
+        if (inHeight <= 0) throw new ArgumentOutOfRangeException(nameof(inHeight), "Dimensions must be positive.");
+        if (inWidth <= 0) throw new ArgumentOutOfRangeException(nameof(inWidth), "Dimensions must be positive.");
+        if (outChannels <= 0) throw new ArgumentOutOfRangeException(nameof(outChannels), "Dimensions must be positive.");
+        if (outHeight <= 0) throw new ArgumentOutOfRangeException(nameof(outHeight), "Dimensions must be positive.");
+        if (outWidth <= 0) throw new ArgumentOutOfRangeException(nameof(outWidth), "Dimensions must be positive.");
+        if (kernelH <= 0) throw new ArgumentOutOfRangeException(nameof(kernelH), "Dimensions must be positive.");
+        if (kernelW <= 0) throw new ArgumentOutOfRangeException(nameof(kernelW), "Dimensions must be positive.");
+        if (strideH <= 0) throw new ArgumentOutOfRangeException(nameof(strideH), "Stride must be positive.");
+        if (strideW <= 0) throw new ArgumentOutOfRangeException(nameof(strideW), "Stride must be positive.");
+        if (dilationH <= 0) throw new ArgumentOutOfRangeException(nameof(dilationH), "Dilation must be positive.");
+        if (dilationW <= 0) throw new ArgumentOutOfRangeException(nameof(dilationW), "Dilation must be positive.");
+        if (padH < 0) throw new ArgumentOutOfRangeException(nameof(padH), "Padding must be non-negative.");
+        if (padW < 0) throw new ArgumentOutOfRangeException(nameof(padW), "Padding must be non-negative.");
+        IntPtr inputPtr = input.Handle, wPtr = weightsHalf.Handle, outputPtr = output.Handle;
+        const int BLOCK = 16;
+        uint gx = (uint)((outWidth + BLOCK - 1) / BLOCK);
+        uint gy = (uint)((outHeight + BLOCK - 1) / BLOCK);
+        uint gz = (uint)(batch * outChannels);
+        void** a = stackalloc void*[18];
+        a[0] = &inputPtr; a[1] = &wPtr; a[2] = &outputPtr;
+        a[3] = &batch; a[4] = &inChannels; a[5] = &inHeight; a[6] = &inWidth;
+        a[7] = &outChannels; a[8] = &outHeight; a[9] = &outWidth;
+        a[10] = &kernelH; a[11] = &kernelW; a[12] = &strideH; a[13] = &strideW;
+        a[14] = &padH; a[15] = &padW; a[16] = &dilationH; a[17] = &dilationW;
+        LaunchKernel3D(k, gx, gy, gz, (uint)BLOCK, (uint)BLOCK, 1, a, 0);
+    }
+
+    // IGpuHalfPrecisionBackend FP16-conv im2col (backend-agnostic dispatch); delegates to the CUDA impl.
+    /// <inheritdoc/>
+    public bool Fp16Im2colAvailable => Fp16HwIm2colAvailable;
+    /// <inheritdoc/>
+    public void Im2colKNFp16(IGpuBuffer input, IGpuBuffer outputHalf,
+        int batch, int channels, int height, int width,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
+        => UnfoldKNFp16Hw(input, outputHalf, batch, channels, height, width,
+            kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+
+    /// <summary>FUSED im2col + hw FP32→FP16, TRANSPOSED [K,N] layout (outputHalf = half/ushort buffer of K*N).
+    /// Pair with GemmFp16(weightsHalf[outC,K], colHalf[K,N]) → out[outC,N] for a Tensor-Core FP16 conv.
+    /// Capture-safe (one kernel on the compute stream). #1650/#638.</summary>
+    public unsafe void UnfoldKNFp16Hw(IGpuBuffer input, IGpuBuffer outputHalf,
+        int batch, int channels, int height, int width,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
+    {
+        using var _ = PushContext();
+        if (!_kernelCache.TryGetValue("im2col_kn_fp16hw", out var k))
+            throw new InvalidOperationException("CUDA kernel not found: im2col_kn_fp16hw");
+        // #671 review: validate launch dimensions before computing the grid — strideH/strideW == 0 divides by
+        // zero, a non-positive output extent makes `elems` negative, and an overflowing `elems` casts to a huge
+        // uint launch size. Guard the public backend boundary before LaunchKernel.
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (outputHalf is null) throw new ArgumentNullException(nameof(outputHalf));
+        if (batch <= 0) throw new ArgumentOutOfRangeException(nameof(batch), "Dimensions must be positive.");
+        if (channels <= 0) throw new ArgumentOutOfRangeException(nameof(channels), "Dimensions must be positive.");
+        if (height <= 0) throw new ArgumentOutOfRangeException(nameof(height), "Dimensions must be positive.");
+        if (width <= 0) throw new ArgumentOutOfRangeException(nameof(width), "Dimensions must be positive.");
+        if (kernelH <= 0) throw new ArgumentOutOfRangeException(nameof(kernelH), "Dimensions must be positive.");
+        if (kernelW <= 0) throw new ArgumentOutOfRangeException(nameof(kernelW), "Dimensions must be positive.");
+        if (strideH <= 0) throw new ArgumentOutOfRangeException(nameof(strideH), "Stride must be positive.");
+        if (strideW <= 0) throw new ArgumentOutOfRangeException(nameof(strideW), "Stride must be positive.");
+        if (dilationH <= 0) throw new ArgumentOutOfRangeException(nameof(dilationH), "Dilation must be positive.");
+        if (dilationW <= 0) throw new ArgumentOutOfRangeException(nameof(dilationW), "Dilation must be positive.");
+        if (padH < 0) throw new ArgumentOutOfRangeException(nameof(padH), "Padding must be non-negative.");
+        if (padW < 0) throw new ArgumentOutOfRangeException(nameof(padW), "Padding must be non-negative.");
+        IntPtr inputPtr = input.Handle, outputPtr = outputHalf.Handle;
+        int outH = (height + 2 * padH - ((kernelH - 1) * dilationH + 1)) / strideH + 1;
+        int outW = (width + 2 * padW - ((kernelW - 1) * dilationW + 1)) / strideW + 1;
+        if (outH <= 0 || outW <= 0)
+            throw new ArgumentException(
+                $"Convolution output size is non-positive (outH={outH}, outW={outW}); check kernel/stride/pad/dilation vs input size.");
+        int totalPatches = batch * outH * outW;
+        void** a = stackalloc void*[16];
+        a[0] = &inputPtr; a[1] = &outputPtr;
+        a[2] = &batch; a[3] = &channels; a[4] = &height; a[5] = &width;
+        a[6] = &kernelH; a[7] = &kernelW; a[8] = &strideH; a[9] = &strideW;
+        a[10] = &padH; a[11] = &padW; a[12] = &dilationH; a[13] = &dilationW; a[14] = &outH; a[15] = &outW;
+        long elems = (long)totalPatches * (channels * kernelH * kernelW); // N*K threads (one per col element)
+        if (elems > int.MaxValue)
+            throw new NotSupportedException($"FP16 im2col work size {elems} exceeds the launch limit.");
+        uint grid = (uint)((elems + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(k, grid, DefaultBlockSize, a);
+    }
+
+    /// <summary>True when the FP16-in im2col kernel compiled (needs cuda_fp16.h). #1650/#638 #3.</summary>
+    public bool Fp16Im2colFromFp16Available => _kernelCache.ContainsKey("im2col_kn_fp16_from_fp16");
+
+    /// <summary>FUSED im2col with an FP16 input + FP16 output, TRANSPOSED [K,N] layout (outputHalf = half/ushort
+    /// buffer of K*N). Same as <see cref="UnfoldKNFp16Hw"/> but the input is already half-resident (each tap loaded
+    /// via __half2float, oob → 0) — avoids the FP32→FP16 cast pass when the activation feeding the conv is FP16.
+    /// Pair with GemmFp16(weightsHalf[outC,K], colHalf[K,N]) → out[outC,N]. Capture-safe (one kernel). #1650/#638 #3.</summary>
+    public unsafe void UnfoldKNFp16FromFp16(IGpuBuffer inputHalf, IGpuBuffer outputHalf,
+        int batch, int channels, int height, int width,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
+    {
+        using var _ = PushContext();
+        if (!_kernelCache.TryGetValue("im2col_kn_fp16_from_fp16", out var k))
+            throw new InvalidOperationException("CUDA kernel not found: im2col_kn_fp16_from_fp16");
+        IntPtr inputPtr = inputHalf.Handle, outputPtr = outputHalf.Handle;
+        int outH = (height + 2 * padH - ((kernelH - 1) * dilationH + 1)) / strideH + 1;
+        int outW = (width + 2 * padW - ((kernelW - 1) * dilationW + 1)) / strideW + 1;
+        int totalPatches = batch * outH * outW;
+        void** a = stackalloc void*[16];
+        a[0] = &inputPtr; a[1] = &outputPtr;
+        a[2] = &batch; a[3] = &channels; a[4] = &height; a[5] = &width;
+        a[6] = &kernelH; a[7] = &kernelW; a[8] = &strideH; a[9] = &strideW;
+        a[10] = &padH; a[11] = &padW; a[12] = &dilationH; a[13] = &dilationW; a[14] = &outH; a[15] = &outW;
+        long elems = (long)totalPatches * (channels * kernelH * kernelW); // N*K threads (one per col element)
+        uint grid = (uint)((elems + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(k, grid, DefaultBlockSize, a);
+    }
+
     /// <summary>Lazily spin up the cuDNN context + convolution helper on
     /// the first call that routes Conv2D through the vendor path. Both
     /// live for the lifetime of this backend and are released in
@@ -7499,9 +7771,15 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         using var _ = PushContext();
         ulong byteSize = (ulong)size * sizeof(float);
+        // #1650/#638 capture: async device->device on the backend's own stream so this op is
+        // CAPTURABLE inside a CUDA graph. The synchronous cuMemcpyDtoD throws CUDA 906
+        // ("operation not permitted while stream is capturing") and aborts graph capture — it was
+        // the first blocker in the diffusion UNet capture (resident conv-bias add's a->out copy).
+        // Device-side ordering is preserved (later ops on the same stream serialize after it);
+        // host reads go through the download path which synchronizes the stream.
         CuBlasNative.CheckCudaResult(
-            CuBlasNative.cuMemcpyDtoD(destination.Handle, source.Handle, byteSize),
-            "cuMemcpyDtoD");
+            CudaNativeBindings.cuMemcpyDtoDAsync(destination.Handle, source.Handle, byteSize, _stream),
+            "cuMemcpyDtoDAsync (Copy)");
     }
 
     public void Fill(IGpuBuffer buffer, float value, int size)
@@ -11869,6 +12147,64 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernelWithSharedMem(kernel, (uint)rows, block, block * sizeof(float), args);
     }
 
+    /// <summary>True when the fused FP16 GroupNorm+Swish kernel compiled (driver-only, no cuda_fp16.h). #1650/#638 #3.</summary>
+    public bool Fp16GroupNormSwishAvailable => _kernelCache.ContainsKey("fp16_groupnorm_swish");
+
+    /// <summary>FP16-native fused GroupNorm + Swish: ONE BLOCK PER (batch, group). input/output are FP16 buffers
+    /// [batch, channels, spatial]; gamma/beta are FP32 (per-channel). Population variance (÷groupSize), eps inside
+    /// the rsqrt, then affine + Swish (x/(1+exp(-x))) — matches the FP32 groupnorm_forward + Swish. #1650/#638 #3.</summary>
+    public unsafe void Fp16GroupNormSwish(IGpuBuffer inHalf, IGpuBuffer gammaFp32, IGpuBuffer betaFp32, IGpuBuffer outHalf,
+        int batch, int numGroups, int channels, int spatial, float eps)
+    {
+        if (inHalf is null) throw new ArgumentNullException(nameof(inHalf));
+        if (gammaFp32 is null) throw new ArgumentNullException(nameof(gammaFp32));
+        if (betaFp32 is null) throw new ArgumentNullException(nameof(betaFp32));
+        if (outHalf is null) throw new ArgumentNullException(nameof(outHalf));
+        if (batch <= 0 || channels <= 0 || spatial <= 0) throw new ArgumentException($"batch/channels/spatial must be positive (batch={batch}, channels={channels}, spatial={spatial}).");
+        if (numGroups <= 0 || channels % numGroups != 0) throw new ArgumentException($"numGroups must be positive and divide channels (numGroups={numGroups}, channels={channels}).");
+        long matHalfBytes = (long)batch * channels * spatial * Fp16ByteWidth;
+        long chanFp32Bytes = (long)channels * sizeof(float);
+        if (inHalf.SizeInBytes < matHalfBytes) throw new ArgumentException($"input half buffer too small: {inHalf.SizeInBytes} < {matHalfBytes}.");
+        if (outHalf.SizeInBytes < matHalfBytes) throw new ArgumentException($"output half buffer too small: {outHalf.SizeInBytes} < {matHalfBytes}.");
+        if (gammaFp32.SizeInBytes < chanFp32Bytes) throw new ArgumentException($"gamma FP32 buffer too small: {gammaFp32.SizeInBytes} < {chanFp32Bytes}.");
+        if (betaFp32.SizeInBytes < chanFp32Bytes) throw new ArgumentException($"beta FP32 buffer too small: {betaFp32.SizeInBytes} < {chanFp32Bytes}.");
+        if (eps <= 0f || float.IsNaN(eps) || float.IsInfinity(eps)) throw new ArgumentOutOfRangeException(nameof(eps), eps, "eps must be finite and positive.");
+        if (!_kernelCache.TryGetValue("fp16_groupnorm_swish", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: fp16_groupnorm_swish");
+        using var _ = PushContext();
+        const uint block = 256u;
+        IntPtr inPtr = inHalf.Handle, gPtr = gammaFp32.Handle, bPtr = betaFp32.Handle, outPtr = outHalf.Handle;
+        void** args = stackalloc void*[9];
+        args[0] = &inPtr; args[1] = &gPtr; args[2] = &bPtr; args[3] = &outPtr;
+        args[4] = &batch; args[5] = &numGroups; args[6] = &channels; args[7] = &spatial; args[8] = &eps;
+        LaunchKernelWithSharedMem(kernel, (uint)(batch * numGroups), block, block * sizeof(float), args);
+    }
+
+    /// <summary>True when the FP16 per-channel broadcast-add kernel compiled (driver-only, no cuda_fp16.h). #1650/#638 #3.</summary>
+    public bool Fp16BroadcastAddChannelAvailable => _kernelCache.ContainsKey("fp16_broadcast_add_channel");
+
+    /// <summary>FP16-native per-channel broadcast add (conv bias): ioHalf[b,c,sp] += biasHalf[b,c], in place.
+    /// Both are FP16 buffers (io = [batch, channels, spatial], bias = [batch, channels]); FP32 add. #1650/#638 #3.</summary>
+    public unsafe void Fp16BroadcastAddChannel(IGpuBuffer ioHalf, IGpuBuffer biasHalf, int batch, int channels, int spatial)
+    {
+        if (ioHalf is null) throw new ArgumentNullException(nameof(ioHalf));
+        if (biasHalf is null) throw new ArgumentNullException(nameof(biasHalf));
+        if (batch <= 0 || channels <= 0 || spatial <= 0) throw new ArgumentException($"batch/channels/spatial must be positive (batch={batch}, channels={channels}, spatial={spatial}).");
+        long ioHalfBytes = (long)batch * channels * spatial * Fp16ByteWidth;
+        long biasHalfBytes = (long)batch * channels * Fp16ByteWidth;
+        if (ioHalf.SizeInBytes < ioHalfBytes) throw new ArgumentException($"io half buffer too small: {ioHalf.SizeInBytes} < {ioHalfBytes}.");
+        if (biasHalf.SizeInBytes < biasHalfBytes) throw new ArgumentException($"bias half buffer too small: {biasHalf.SizeInBytes} < {biasHalfBytes}.");
+        if (!_kernelCache.TryGetValue("fp16_broadcast_add_channel", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: fp16_broadcast_add_channel");
+        using var _ = PushContext();
+        long elems = (long)batch * channels * spatial;
+        uint grid = (uint)((elems + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr ioPtr = ioHalf.Handle, biasPtr = biasHalf.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &ioPtr; args[1] = &biasPtr; args[2] = &batch; args[3] = &channels; args[4] = &spatial;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
     /// <summary>FP16-native GELU backward: gradIn = gradOut * gelu'(x). All FP16 buffers; FP32 math in-register.
     /// Mirrors the FP32 gelu_backward formula so the Half backward is parity-equivalent.</summary>
     public unsafe void Fp16GeluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
@@ -12591,9 +12927,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IntPtr srcPtr = source.Handle + sourceOffset * sizeof(float);
         IntPtr dstPtr = destination.Handle + destinationOffset * sizeof(float);
         ulong byteSize = (ulong)length * sizeof(float);
+        // Stream-ordered async DtoD (same fix as the 3-arg Copy): the synchronous cuMemcpyDtoD is NOT
+        // capturable — it aborts CUDA-graph stream capture (CUDA 906). The async copy on _stream records
+        // as a graph node and stays correctly ordered with the surrounding kernels (e.g. the resident
+        // channel-concat that copies each input's slab into the pooled output).
         CuBlasNative.CheckCudaResult(
-            CuBlasNative.cuMemcpyDtoD(dstPtr, srcPtr, byteSize),
-            "cuMemcpyDtoD(strided)");
+            CudaNativeBindings.cuMemcpyDtoDAsync(dstPtr, srcPtr, byteSize, _stream),
+            "cuMemcpyDtoDAsync(strided)");
     }
 
     /// <inheritdoc/>

@@ -8065,6 +8065,104 @@ fn fp16_convert(@builtin(global_invocation_id) gid: vec3<u32>) {
 ";
 
     /// <summary>
+    /// FUSED im2col + FP32→FP16, writing the column matrix in the TRANSPOSED [K, N] layout
+    /// (K = channels·kernelH·kernelW, N = batch·outH·outW) so a conv becomes a plain NN GEMM
+    /// <c>out[outC, N] = weights[outC, K] · col[K, N]</c> via <see cref="GemmFp16In32fOut"/> — the
+    /// industry FP16-conv path (#1650/#638). WebGPU counterpart of the validated CUDA
+    /// <c>im2col_kn_fp16hw</c> kernel: one invocation per col element (t in [0, N·K)), identical index
+    /// math. WebGPU has no native 16-bit storage by default (the optional <c>shader-f16</c> feature is
+    /// not used here), so this backend models FP16 as f32 with a truncated 10-bit mantissa — exactly the
+    /// layout <see cref="Fp16ConvertSource"/>/<c>ConvertToFp16</c> produces and the FP16 GEMM consumes.
+    /// The fused <c>f16_trunc</c> helper below is a byte-for-byte copy of the <c>fp16_convert</c> (dir 0)
+    /// rounding so the output is identical to gather-then-ConvertToFp16. Out-of-bounds taps store +0.0.
+    /// Index math is done in u32/i32; the bounds check is in i32; the stored value is truncated f32.
+    /// </summary>
+    public const string Im2colKnFp16Source = @"
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+
+struct Im2colParams {
+    batch: u32,
+    channels: u32,
+    height: u32,
+    width: u32,
+    kernel_h: u32,
+    kernel_w: u32,
+    stride_h: u32,
+    stride_w: u32,
+    pad_h: u32,
+    pad_w: u32,
+    dilation_h: u32,
+    dilation_w: u32,
+    out_h: u32,
+    out_w: u32,
+}
+@group(0) @binding(2) var<uniform> params: Im2colParams;
+
+// FP32 -> FP16-precision (truncated-f32) emulation: byte-identical to fp16_convert (direction 0).
+fn f16_trunc(val: f32) -> f32 {
+    let bits = bitcast<u32>(val);
+    let sign = (bits >> 31u) & 1u;
+    let exp_bits = (bits >> 23u) & 0xFFu;
+    let mantissa = bits & 0x7FFFFFu;
+    if (exp_bits == 0xFFu) {
+        // Inf/NaN: preserve
+        return val;
+    }
+    let exp_val: i32 = i32(exp_bits) - 127;
+    if (exp_val < -14) {
+        // Underflow to zero (FP16 subnormal range)
+        return select(-0.0, 0.0, sign == 0u);
+    }
+    if (exp_val > 15) {
+        // Overflow to infinity
+        let inf_bits = (sign << 31u) | 0x7F800000u;
+        return bitcast<f32>(inf_bits);
+    }
+    let truncated_mantissa = mantissa & 0x7FE000u; // mask off bottom 13 bits
+    let result_bits = (sign << 31u) | (exp_bits << 23u) | truncated_mantissa;
+    return bitcast<f32>(result_bits);
+}
+
+@compute @workgroup_size(256)
+fn im2col_kn_fp16hw(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let t = gid.x;
+    let out_h = params.out_h;
+    let out_w = params.out_w;
+    let n_total = params.batch * out_h * out_w;       // N
+    let k_total = params.channels * params.kernel_h * params.kernel_w; // K
+    if (t >= n_total * k_total) { return; }
+
+    // t = k*N + n  (TRANSPOSED [K, N] layout)
+    let n = t % n_total;
+    let k = t / n_total;
+
+    // Decode n -> (b, oh, ow)
+    let hw = out_h * out_w;
+    let b = n / hw;
+    let rem = n % hw;
+    let oh = rem / out_w;
+    let ow = rem % out_w;
+
+    // Decode k -> (c, kh, kw)
+    let kw = k % params.kernel_w;
+    let kh = (k / params.kernel_w) % params.kernel_h;
+    let c = k / (params.kernel_w * params.kernel_h);
+
+    // Source pixel (signed: padding can push it out of bounds)
+    let ih = i32(oh * params.stride_h) - i32(params.pad_h) + i32(kh * params.dilation_h);
+    let iw = i32(ow * params.stride_w) - i32(params.pad_w) + i32(kw * params.dilation_w);
+
+    var val: f32 = 0.0;
+    if (ih >= 0 && ih < i32(params.height) && iw >= 0 && iw < i32(params.width)) {
+        let in_idx = ((b * params.channels + c) * params.height + u32(ih)) * params.width + u32(iw);
+        val = input[in_idx];
+    }
+    output[t] = f16_trunc(val);
+}
+";
+
+    /// <summary>
     /// LSTM backward sequence kernel: computes gate gradients for one timestep.
     /// Buffers: gates_cache, grad_h_next, grad_c_next, grad_gates (output).
     /// </summary>
@@ -8326,7 +8424,8 @@ fn reduce_partial_sums(@builtin(local_invocation_id) lid: vec3<u32>) {
                GatedActivationSource + SoftmaxVariantsSource +
                ShapeOpsSource + ReductionExtSource +
                StridedOpsSource +
-               Pool1DSource + BilinearUpsample2DSource;
+               Pool1DSource + BilinearUpsample2DSource +
+               Im2colKnFp16Source; // #671: include the FP16 im2col shader in the combined-module pipeline source
     }
 
     // ============================================================================

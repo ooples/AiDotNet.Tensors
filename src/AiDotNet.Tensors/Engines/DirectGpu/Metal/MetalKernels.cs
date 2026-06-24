@@ -1749,6 +1749,54 @@ kernel void matmul_fp16_backward(
     }
 }
 
+// FP16 CONV im2col (#1650/#638): fused im2col + FP32->FP16 in the TRANSPOSED [K,N] layout
+// (K = channels*kernelH*kernelW, N = batch*outH*outW) so the conv becomes a plain NN GEMM
+// out[outC,N] = weights[outC,K] . col[K,N] via matmul_fp16_fp32out (GemmFp16In32fOut) on the GPU
+// matrix units — the industry conv-as-GEMM path (oneDNN/cuDNN/PyTorch). ONE THREAD PER col ELEMENT
+// (N*K threads): n = t % N is the fastest-varying index so adjacent threads write adjacent col[t]
+// addresses (coalesced) and the launch is fully occupied. The half output is written directly
+// (MSL native half), matching the other FP16-native kernels. Index math is bit-identical to the
+// CUDA/HIP im2col_kn_fp16hw kernels. The grid is 1-D over N*K (the host passes outH/outW).
+kernel void im2col_kn_fp16hw(
+    device const float* input [[buffer(0)]],
+    device half* output [[buffer(1)]],
+    constant uint& batch [[buffer(2)]],
+    constant uint& channels [[buffer(3)]],
+    constant uint& height [[buffer(4)]],
+    constant uint& width [[buffer(5)]],
+    constant uint& kernelH [[buffer(6)]],
+    constant uint& kernelW [[buffer(7)]],
+    constant uint& strideH [[buffer(8)]],
+    constant uint& strideW [[buffer(9)]],
+    constant uint& padH [[buffer(10)]],
+    constant uint& padW [[buffer(11)]],
+    constant uint& dilationH [[buffer(12)]],
+    constant uint& dilationW [[buffer(13)]],
+    constant uint& outH [[buffer(14)]],
+    constant uint& outW [[buffer(15)]],
+    uint t [[thread_position_in_grid]])
+{
+    uint N = batch * outH * outW;
+    uint K = channels * kernelH * kernelW;
+    if (t >= N * K) return;
+    uint n = t % N;     // output position (fastest — coalesced)
+    uint k = t / N;     // unrolled (c,kh,kw) row
+    uint b = n / (outH * outW);
+    uint rem = n % (outH * outW);
+    uint oh = rem / outW;
+    uint ow = rem % outW;
+    uint kw = k % kernelW;
+    uint kh = (k / kernelW) % kernelH;
+    uint c  = k / (kernelW * kernelH);
+    int ih = int(oh * strideH) - int(padH) + int(kh * dilationH);
+    int iw = int(ow * strideW) - int(padW) + int(kw * dilationW);
+    float val = 0.0f;
+    if (ih >= 0 && ih < int(height) && iw >= 0 && iw < int(width)) {
+        val = input[((b * channels + c) * height + uint(ih)) * width + uint(iw)];
+    }
+    output[t] = half(val);
+}
+
 // FP16-NATIVE elementwise / activation kernels (#558): read the activation DIRECTLY from a half buffer
 // (MSL has a native half type), compute in FP32 in-register, write half — no FP32 buffer materialized,
 // no convert transient. GPU counterpart of the CPU FP16-native emit.

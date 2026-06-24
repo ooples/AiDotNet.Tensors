@@ -92,6 +92,40 @@ extern ""C"" __global__ __launch_bounds__(256) void convert_fp16_to_fp32_vec2(
 }
 
 // ============================================================================
+// FP16 CONV im2col (#1650/#638): fused im2col + FP32->FP16 in TRANSPOSED [K,N] layout (K=channels*kernelH*kernelW,
+// N=batch*outH*outW) so the conv becomes a plain NN GEMM out[outC,N] = weights[outC,K] . col[K,N] via
+// GemmFp16In32fOut (hipBLAS, FP16 multiply / FP32 accumulate on the MFMA matrix units) — the industry conv path.
+// ONE THREAD PER col ELEMENT (N*K threads) → coalesced col[t]=col[k*N+n] writes (adjacent threads → adjacent n →
+// adjacent addresses) + full occupancy (a thread-per-patch version launched only N threads → starved).
+// ============================================================================
+extern ""C"" __global__ __launch_bounds__(256) void im2col_kn_fp16hw(
+    const float* __restrict__ input, unsigned short* __restrict__ output,
+    int batch, int channels, int height, int width,
+    int kernelH, int kernelW, int strideH, int strideW,
+    int padH, int padW, int dilationH, int dilationW, int outH, int outW)
+{
+    int N = batch * outH * outW;
+    int K = channels * kernelH * kernelW;
+    long t = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= (long)N * K) return;
+    int n = (int)(t % N);     // output position (fastest — coalesced)
+    int k = (int)(t / N);     // unrolled (c,kh,kw) row
+    int b = n / (outH * outW);
+    int rem = n % (outH * outW);
+    int oh = rem / outW;
+    int ow = rem % outW;
+    int kw = k % kernelW;
+    int kh = (k / kernelW) % kernelH;
+    int c  = k / (kernelW * kernelH);
+    int ih = oh * strideH - padH + kh * dilationH;
+    int iw = ow * strideW - padW + kw * dilationW;
+    float val = (ih >= 0 && ih < height && iw >= 0 && iw < width)
+        ? input[((b * channels + c) * height + ih) * width + iw] : 0.0f;
+    __half h = __float2half(val);
+    output[t] = *reinterpret_cast<unsigned short*>(&h);
+}
+
+// ============================================================================
 // FP16 ELEMENT-WISE ARITHMETIC (packed __half2 for 2x throughput)
 // ============================================================================
 
@@ -453,6 +487,7 @@ extern ""C"" __global__ void fp16_layernorm(
     {
         return new[]
         {
+            "im2col_kn_fp16hw",
             "convert_fp32_to_fp16",
             "convert_fp16_to_fp32",
             "convert_fp32_to_fp16_rounding",

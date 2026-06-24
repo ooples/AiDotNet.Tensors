@@ -12,6 +12,11 @@ public static class CudaFp16Kernels
         return @"
 #include <cuda_fp16.h>
 
+// nvrtc has no <sys/types.h>, so `uint` (used by the vec2 conversion kernels below) is undefined under nvrtc
+// even with the toolkit headers present — this is why the whole module historically failed to compile. Provide
+// the typedef (identical re-typedef is legal C++ if a CUDA header also defines it).
+typedef unsigned int uint;
+
 // ============================================================================
 // FP16 CONVERSION KERNELS
 // ============================================================================
@@ -428,6 +433,112 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_softmax(
         *reinterpret_cast<__half*>(&rowOut[c]) = __float2half(result);
     }
 }
+
+// FUSED im2col + hardware FP32->FP16, TRANSPOSED [K,N] layout (K=channels*kH*kW, N=batch*outH*outW). This is
+// the industry FP16-conv path: feed col[K,N] (FP16) + weights[outC,K] (FP16) to a Tensor-Core GEMM
+// (GemmFp16: out[outC,N] = weights @ col, FP16 multiply / FP32 accumulate). Writing FP16 directly here (hw
+// __float2half) avoids a separate cast pass + halves col bandwidth. #1650/#638 replay-floor lever.
+extern ""C"" __global__ __launch_bounds__(256) void im2col_kn_fp16hw(
+    const float* __restrict__ input, unsigned short* __restrict__ output,
+    int batch, int channels, int height, int width,
+    int kernelH, int kernelW, int strideH, int strideW,
+    int padH, int padW, int dilationH, int dilationW, int outH, int outW)
+{
+    // ONE THREAD PER col ELEMENT (N*K threads) — fills the GPU and writes col[t]=col[k*N+n] fully coalesced
+    // (adjacent threads → adjacent n → adjacent addresses). The previous thread-per-patch version launched only
+    // N threads (~4 blocks → ~6% occupancy → ~107us for a ~6us-of-bandwidth job); this is the fix.
+    int N = batch * outH * outW;
+    int K = channels * kernelH * kernelW;
+    long t = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= (long)N * K) return;
+    int n = (int)(t % N);     // output position (fastest — coalesced)
+    int k = (int)(t / N);     // unrolled (c,kh,kw) row
+    int b = n / (outH * outW);
+    int rem = n % (outH * outW);
+    int oh = rem / outW;
+    int ow = rem % outW;
+    int kw = k % kernelW;
+    int kh = (k / kernelW) % kernelH;
+    int c  = k / (kernelW * kernelH);
+    int ih = oh * strideH - padH + kh * dilationH;
+    int iw = ow * strideW - padW + kw * dilationW;
+    float val = (ih >= 0 && ih < height && iw >= 0 && iw < width)
+        ? input[((b * channels + c) * height + ih) * width + iw] : 0.0f;
+    __half h = __float2half(val);
+    output[t] = *reinterpret_cast<unsigned short*>(&h);
+}
+
+// #1650/#638 (#671): DIRECT FP16 conv for the tiny-spatial deep convs the im2col+GEMM path skips (small N where
+// im2col + launch overhead exceeds the Tensor-Core GEMM win). FP32 input rounded to FP16 per access (mirrors
+// im2col_kn_fp16hw), FP16 weights, FP32 multiply-accumulate (matches GemmFp16In32fOut numerics), FP32 output.
+// One thread per output (ow, oh) with a 3D grid z = b*outChannels. Capture-safe (single kernel, no device alloc).
+extern ""C"" __global__ void conv2d_direct_fp16hw(
+    const float* __restrict__ input, const unsigned short* __restrict__ weightsHalf, float* __restrict__ output,
+    int batch, int inChannels, int inHeight, int inWidth,
+    int outChannels, int outHeight, int outWidth,
+    int kernelH, int kernelW, int strideH, int strideW,
+    int padH, int padW, int dilationH, int dilationW)
+{
+    int ow = blockIdx.x * blockDim.x + threadIdx.x;
+    int oh = blockIdx.y * blockDim.y + threadIdx.y;
+    int bz = blockIdx.z;                 // b * outChannels + oc
+    if (ow >= outWidth || oh >= outHeight) return;
+    int oc = bz % outChannels;
+    int b  = bz / outChannels;
+    float acc = 0.0f;
+    for (int ic = 0; ic < inChannels; ic++) {
+        for (int kh = 0; kh < kernelH; kh++) {
+            int ih = oh * strideH - padH + kh * dilationH;
+            if (ih < 0 || ih >= inHeight) continue;
+            for (int kw = 0; kw < kernelW; kw++) {
+                int iw = ow * strideW - padW + kw * dilationW;
+                if (iw < 0 || iw >= inWidth) continue;
+                float inV = input[((b * inChannels + ic) * inHeight + ih) * inWidth + iw];
+                int wIdx = ((oc * inChannels + ic) * kernelH + kh) * kernelW + kw;
+                __half wH = *reinterpret_cast<const __half*>(&weightsHalf[wIdx]);
+                // FP16 operands, FP32 multiply-accumulate (Tensor-Core semantics): round input to FP16, mul in FP32.
+                acc += __half2float(__float2half(inV)) * __half2float(wH);
+            }
+        }
+    }
+    output[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = acc;
+}
+
+// FP16-IN variant of im2col_kn_fp16hw: input is already FP16 (unsigned short), output FP16 col[K,N] in the SAME
+// TRANSPOSED [K,N] layout (N=batch*outH*outW, K=channels*kH*kW). Each tap is loaded via __half2float (oob → 0);
+// avoids a separate FP16→FP32 cast pass when the activation feeding the conv is already half-resident
+// (#1650/#638 #3 — FP16-activation diffusion inference). ONE THREAD PER col element (N*K threads), fully coalesced.
+extern ""C"" __global__ __launch_bounds__(256) void im2col_kn_fp16_from_fp16(
+    const unsigned short* __restrict__ input, unsigned short* __restrict__ output,
+    int batch, int channels, int height, int width,
+    int kernelH, int kernelW, int strideH, int strideW,
+    int padH, int padW, int dilationH, int dilationW, int outH, int outW)
+{
+    int N = batch * outH * outW;
+    int K = channels * kernelH * kernelW;
+    long t = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= (long)N * K) return;
+    int n = (int)(t % N);     // output position (fastest — coalesced)
+    int k = (int)(t / N);     // unrolled (c,kh,kw) row
+    int b = n / (outH * outW);
+    int rem = n % (outH * outW);
+    int oh = rem / outW;
+    int ow = rem % outW;
+    int kw = k % kernelW;
+    int kh = (k / kernelW) % kernelH;
+    int c  = k / (kernelW * kernelH);
+    int ih = oh * strideH - padH + kh * dilationH;
+    int iw = ow * strideW - padW + kw * dilationW;
+    float val;
+    if (ih >= 0 && ih < height && iw >= 0 && iw < width) {
+        int idx = ((b * channels + c) * height + ih) * width + iw;
+        val = __half2float(*reinterpret_cast<const __half*>(&input[idx]));
+    } else {
+        val = 0.0f;
+    }
+    __half h = __float2half(val);
+    output[t] = *reinterpret_cast<unsigned short*>(&h); // store the half BITS (NOT a value-convert __half→ushort)
+}
 ";
     }
 
@@ -438,6 +549,9 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_softmax(
     {
         return new[]
         {
+            "im2col_kn_fp16hw",
+            "conv2d_direct_fp16hw",
+            "im2col_kn_fp16_from_fp16",
             "convert_fp32_to_fp16",
             "convert_fp16_to_fp32",
             "convert_fp32_to_fp16_rounding",
