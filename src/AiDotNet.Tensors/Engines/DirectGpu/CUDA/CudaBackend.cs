@@ -466,8 +466,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // (nvidia-cuda-runtime-cuXX) WITHOUT a full toolkit install or hijacking the global CUDA_PATH (which
         // other tools expect to be a complete toolkit with bin/nvcc). Checked first; falls through if unset.
         var directInclude = Environment.GetEnvironmentVariable("AIDOTNET_CUDA_INCLUDE");
-        if (!string.IsNullOrEmpty(directInclude) && Directory.Exists(directInclude))
-            return directInclude;
+        if (!string.IsNullOrWhiteSpace(directInclude)
+            && Directory.Exists(directInclude)
+            && File.Exists(Path.Combine(directInclude, "cuda_fp16.h"))) // validate it actually holds the headers
+            return directInclude;                                       // before short-circuiting CUDA_PATH (#671 review)
 
         // Check CUDA_PATH environment variable first
         var cudaPath = Environment.GetEnvironmentVariable("CUDA_PATH");
