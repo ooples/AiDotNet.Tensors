@@ -32969,7 +32969,6 @@ public partial class CpuEngine : ITensorLevelEngine
         if (shape == null) throw new ArgumentNullException(nameof(shape));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var random = seed.HasValue ? RandomHelper.CreateSeededRandom(seed.Value) : RandomHelper.ThreadSafeRandom;
         var result = AutoTensorCache.RentOrAllocate<T>(shape);
         int totalElements = shape.Aggregate(1, (a, b) => a * b);
 
@@ -32978,43 +32977,95 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var resultData = result.GetDataArray();
 
-        if (totalElements > 10000)
+        if (seed.HasValue)
         {
-            // For seeded random with parallelism, we need thread-local randoms
-            if (seed.HasValue)
-            {
-                var baseRandom = RandomHelper.CreateSeededRandom(seed.Value);
-                var seeds = new int[CpuParallelSettings.MaxDegreeOfParallelism];
-                for (int i = 0; i < seeds.Length; i++)
-                    seeds[i] = baseRandom.Next();
+            // Deterministic per-element mask. Element i's keep/drop decision is a stateless
+            // SplitMix64 hash of (seed, i), so it depends ONLY on (seed, i) — never on which
+            // thread happens to process i, on how the parallel partitioner splits the index
+            // range, or on the chunk size. A seeded mask is therefore bit-reproducible across
+            // runs, across thread-pool states, AND across machines with different core counts.
+            //
+            // This is a strictly stronger guarantee than the chunk-id-seeded scheme used by
+            // TensorRandomUniformRangeInto (reproducible only at a fixed worker count), and it
+            // completes AiDotNet #1383: DropoutLayer already derives a per-call seed for
+            // reproducible masks, but the previous seeded path here created per-thread Randoms
+            // keyed on Thread.CurrentThread.ManagedThreadId and drew from them in
+            // nondeterministic chunk order, so any mask above the 10000-element parallel
+            // threshold was still nonreproducible — the root of intermittent "two trainings at
+            // the same seed diverge" model-family test failures.
+            ulong seedState = SplitMix64Seed(seed.Value);
 
-                CpuParallelSettings.ParallelForOrSerial(0, totalElements,
-                    totalElements,
-                    () => RandomHelper.CreateSeededRandom(seeds[Thread.CurrentThread.ManagedThreadId % seeds.Length]),
-                    (i, state, localRandom) =>
-                    {
-                        resultData[i] = localRandom.NextDouble() < dropoutRateD ? zero : scale;
-                        return localRandom;
-                    },
-                    _ => { });
+            if (totalElements > 10000)
+            {
+                CpuParallelSettings.ParallelForOrSerial(0, totalElements, totalElements, i =>
+                {
+                    resultData[i] = SplitMix64Uniform(seedState, i) < dropoutRateD ? zero : scale;
+                });
             }
             else
+            {
+                for (int i = 0; i < totalElements; i++)
+                {
+                    resultData[i] = SplitMix64Uniform(seedState, i) < dropoutRateD ? zero : scale;
+                }
+            }
+        }
+        else
+        {
+            // Unseeded: intentionally nondeterministic (shared thread-safe global RNG).
+            if (totalElements > 10000)
             {
                 CpuParallelSettings.ParallelForOrSerial(0, totalElements, totalElements, i =>
                 {
                     resultData[i] = RandomHelper.ThreadSafeRandom.NextDouble() < dropoutRateD ? zero : scale;
                 });
             }
-        }
-        else
-        {
-            for (int i = 0; i < totalElements; i++)
+            else
             {
-                resultData[i] = random.NextDouble() < dropoutRateD ? zero : scale;
+                for (int i = 0; i < totalElements; i++)
+                {
+                    resultData[i] = RandomHelper.ThreadSafeRandom.NextDouble() < dropoutRateD ? zero : scale;
+                }
             }
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Mixes a 32-bit seed into a well-distributed 64-bit SplitMix64 base state. Running the seed
+    /// through the SplitMix64 finalizer first ensures adjacent seeds (e.g. consecutive per-call
+    /// dropout seeds) produce uncorrelated streams — without it, the counter-based offset in
+    /// <see cref="SplitMix64Uniform"/> would make element i of seed s collide with element i+1 of
+    /// seed s-1.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static ulong SplitMix64Seed(int seed)
+    {
+        ulong z = unchecked((ulong)(uint)seed);
+        z = unchecked((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9UL);
+        z = unchecked((z ^ (z >> 27)) * 0x94D049BB133111EBUL);
+        return z ^ (z >> 31);
+    }
+
+    /// <summary>
+    /// Stateless SplitMix64 uniform in [0, 1) for a (seedState, index) pair. Returns the same value
+    /// as the (index+1)-th draw of a SplitMix64 stream seeded by <paramref name="seedState"/>, but
+    /// in O(1) and independent of evaluation order — so a parallel fill produces identical results
+    /// regardless of how the index range is partitioned across threads. SplitMix64 (the JDK
+    /// SplittableRandom finalizer; Steele, Lea &amp; Flood, OOPSLA 2014) has excellent
+    /// equidistribution, more than sufficient for dropout masks, which need only a well-distributed
+    /// uniform per element. The top 53 bits map to [0, 1) at the same resolution as
+    /// <see cref="System.Random.NextDouble"/>.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static double SplitMix64Uniform(ulong seedState, long index)
+    {
+        ulong z = unchecked(seedState + (ulong)(index + 1) * 0x9E3779B97F4A7C15UL);
+        z = unchecked((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9UL);
+        z = unchecked((z ^ (z >> 27)) * 0x94D049BB133111EBUL);
+        z ^= z >> 31;
+        return (z >> 11) * (1.0 / 9007199254740992.0); // top 53 bits / 2^53 -> [0, 1)
     }
 
     /// <inheritdoc/>
