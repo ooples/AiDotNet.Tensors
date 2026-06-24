@@ -22,6 +22,10 @@ public sealed class ResidentInferenceGraph : System.IDisposable
 {
     private readonly DirectGpuTensorEngine _engine;
     private readonly int _warmupRuns;
+    // Serializes Forward on a single graph instance: _stableInputs/_exec/_output and the stable device
+    // buffers are shared mutable state, so two concurrent calls could interleave input copy/refresh/launch
+    // and replay one request with another's inputs.
+    private readonly object _gate = new object();
     private System.IntPtr _exec;
     private object? _stableInputs;   // Tensor<T>[]
     private object? _output;         // Tensor<T> captured output (its resident buffer is what the graph writes)
@@ -57,7 +61,14 @@ public sealed class ResidentInferenceGraph : System.IDisposable
     {
         if (inputs is null) throw new System.ArgumentNullException(nameof(inputs));
         if (forward is null) throw new System.ArgumentNullException(nameof(forward));
+        // Validate every element up front — the diagnostic loop and shape handling below dereference
+        // inputs[i], so a null slot must surface as a clear contract error, not an NRE deep inside.
+        for (int i = 0; i < inputs.Length; i++)
+            if (inputs[i] is null) throw new System.ArgumentException($"inputs[{i}] is null.", nameof(inputs));
 
+        // Serialize the whole forward/capture/replay on this instance (shared mutable graph state — see _gate).
+        lock (_gate)
+        {
         if (System.Environment.GetEnvironmentVariable("AIDOTNET_INFGRAPH_DIAG") == "1")
         {
             var sh = new System.Text.StringBuilder();
@@ -102,6 +113,8 @@ public sealed class ResidentInferenceGraph : System.IDisposable
         // REPLAY: refresh stable input buffers in place, one cuGraphLaunch, fresh download of the output.
         if (_exec != System.IntPtr.Zero)
         {
+          try
+          {
             bool timing = System.Environment.GetEnvironmentVariable("AIDOTNET_INFGRAPH_TIMING") == "1";
             bool breakdown = timing && System.Environment.GetEnvironmentVariable("AIDOTNET_INFGRAPH_TIMING_BREAKDOWN") == "1";
             double freq = System.Diagnostics.Stopwatch.Frequency / 1_000_000.0;
@@ -131,11 +144,23 @@ public sealed class ResidentInferenceGraph : System.IDisposable
                     $"REPLAY inSum(s0)={inSum:F4} timeSum(s1)={tSum:F4} -> outSum={outSum:F4}\n"); } catch { }
             }
             return outR;
+          }
+          catch (System.InvalidOperationException)
+          {
+            // Resident replay/download failed — fail closed: discard the graph and run eager so the
+            // caller never receives a stale (frozen-buffer) result.
+            if (_exec != System.IntPtr.Zero) { _engine.DestroyGpuGraph(_exec); _exec = System.IntPtr.Zero; }
+            _output = null;
+            _disabled = true;
+            return forward(s);
+          }
         }
 
         // WARMUP: a few eager forwards on the stable inputs so lazy allocs / autotune settle.
+        // <= so warmupRuns eager forwards run before capture (the count is incremented first, so a
+        // strict < would run only warmupRuns-1 — and zero at the clamped minimum of 1).
         _warmup++;
-        if (_warmup < _warmupRuns)
+        if (_warmup <= _warmupRuns)
         {
             if (System.Environment.GetEnvironmentVariable("AIDOTNET_INFGRAPH_TIMING") == "1")
             {
@@ -266,21 +291,30 @@ public sealed class ResidentInferenceGraph : System.IDisposable
                     System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
                     $"[RESIDENT-INF-GRAPH] capture threw: {ex.GetType().Name}: {ex.Message} | {ex.StackTrace?.Replace("\r", "").Replace("\n", " >> ")}\n"); } catch { }
             }
+            // A launch/download can throw after _exec was assigned (Lines above). Destroy the partially
+            // captured graph so HasGraph reports false and the handle is not leaked until Dispose.
+            if (_exec != System.IntPtr.Zero) { _engine.DestroyGpuGraph(_exec); _exec = System.IntPtr.Zero; }
+            _output = null;
             _scope?.Dispose();
             _scope = null;
             _disabled = true;
             return forward(inputs);
         }
+        } // lock (_gate)
     }
 
 
     private Tensor<T> DownloadOutput<T>()
     {
-        var outT = (Tensor<T>)_output!;
+        if (_output is not Tensor<T> outT)
+            throw new System.InvalidOperationException("Resident graph output is not available for download.");
         var data = _engine.DownloadResidentBuffer(outT);
-        if (data is not null && _outShape is not null)
-            return new Tensor<T>(_outShape, new Vector<T>((T[])(object)data));
-        return outT; // fallback: the tensor's own (possibly stale) data
+        if (data is null || _outShape is null)
+            // Fail closed: the graph wrote the resident buffer, not necessarily outT's host data, so
+            // returning outT would surface a stale (frozen-buffer) result. Throwing lets the caller
+            // disable capture and fall back to eager — never a stale inference result.
+            throw new System.InvalidOperationException("Resident output download failed; refusing to return stale inference result.");
+        return new Tensor<T>(_outShape, new Vector<T>((T[])(object)data));
     }
 
     private static bool ShapeMatches<T>(Tensor<T> a, Tensor<T> b)

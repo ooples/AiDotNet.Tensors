@@ -240,7 +240,7 @@ public sealed class GpuScope : IDisposable
 /// <para>For concurrent weight updates during inference, consider using separate engine instances
 /// or implementing external synchronization around weight update + invalidation sequences.</para>
 /// </remarks>
-public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDisposable
+public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDisposable, Engines.Gpu.IInferenceGraphCaptureEngine
 {
     private readonly DirectGpuEngine? _directGpu;
     private readonly bool _ownsDirectGpu;
@@ -415,7 +415,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// returns a replayable handle (IntPtr.Zero on failure / a non-capturable op — caller falls back to eager).
     /// Must be called inside a <see cref="EnterResidentCaptureScope"/> so the forward runs resident (capturable).</summary>
     public IntPtr CaptureGpuGraph(Action forward)
-        => GetBackend() is Engines.DirectGpu.CUDA.CudaBackend cb ? cb.CaptureGraph(forward) : System.IntPtr.Zero;
+    {
+        // Reject API misuse here rather than letting a null delegate surface as a backend-side failure.
+        if (forward is null) throw new System.ArgumentNullException(nameof(forward));
+        return GetBackend() is Engines.DirectGpu.CUDA.CudaBackend cb ? cb.CaptureGraph(forward) : System.IntPtr.Zero;
+    }
 
     /// <summary>Replays a graph captured by <see cref="CaptureGpuGraph"/> as a single cuGraphLaunch. Refresh
     /// input-buffer CONTENTS (via <see cref="RefreshResidentInputInPlace"/>) before calling to feed new data.</summary>
@@ -499,6 +503,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             t._gpuBufferVersion = t.Version;
             return;
         }
+        // Release the previous allocation before overwriting it. The reuse branch above already returned for a
+        // same-backend buffer big enough; reaching here means the old buffer is too small or on another backend,
+        // so dropping the reference without freeing would leak VRAM across recaptures / shape changes.
+        if (t._gpuBuffer is { } stale && stale.Handle != System.IntPtr.Zero)
+            stale.Dispose();
         var buf = cb.AllocateBuffer((float[])(object)data); // sync upload — OK in the non-capturing pre-pass
         t._gpuBuffer = buf;
         t._gpuBackend = cb;
@@ -549,13 +558,35 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public Tensor<T> WriteOutputToStableCapture<T>(Tensor<T> output)
     {
         if (output is null) throw new System.ArgumentNullException(nameof(output));
+        // Genuinely off the capture path (a non-float / non-CUDA forward never captures): no-op pass-through.
         if (typeof(T) != typeof(float)) return output;
         if (GetBackend() is not Engines.DirectGpu.CUDA.CudaBackend cb) return output;
-        if (_stableCaptureOutput is null || _stableCaptureOutput.Handle == System.IntPtr.Zero) return output;
+        // On the ACTIVE capture path the misses below are unrecoverable invalid-capture states, NOT benign
+        // no-ops: returning `output` records no DtoD copy node, so the graph computes into its internal pool
+        // and a later DownloadOutput reads the now-stale externally-held pointer — the exact frozen-output
+        // regression this path exists to prevent. Throw so the caller abandons capture (falls back to eager)
+        // loudly and deterministically instead of silently producing a constant-output graph.
+        bool capturing = ResidentStepActive;
         int need = output.Length;
-        if (_stableCaptureOutputSize < need) return output;
+        if (_stableCaptureOutput is null || _stableCaptureOutput.Handle == System.IntPtr.Zero)
+        {
+            if (capturing) throw new System.InvalidOperationException(
+                "WriteOutputToStableCapture: stable capture-output buffer was not prepared (call PrepareStableCaptureOutput before capture).");
+            return output;
+        }
+        if (_stableCaptureOutputSize < need)
+        {
+            if (capturing) throw new System.InvalidOperationException(
+                $"WriteOutputToStableCapture: stable capture-output buffer (size {_stableCaptureOutputSize}) is smaller than the forward output ({need}).");
+            return output;
+        }
         var src = ResolveResidentBufferNoUpload(cb, output, need);
-        if (src is null) return output;
+        if (src is null)
+        {
+            if (capturing) throw new System.InvalidOperationException(
+                "WriteOutputToStableCapture: the forward output is not resident; cannot record the stable-output copy node.");
+            return output;
+        }
         cb.Copy(src, _stableCaptureOutput, need); // async on the compute stream — captured into the graph
         var stableT = new Tensor<T>(output.Shape._dims);
         BindResidentBuffer(stableT, _stableCaptureOutput, cb);
@@ -3804,13 +3835,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             int batch = input.Shape._dims[0], channels = input.Shape._dims[1];
             int spatial = input.Length / (batch * channels);
+            int statSize = batch * numGroups;
             using var bufIn = GetOrAllocateContiguousInputBuffer(backend, input);
             using var bufGamma = GetWeightBufferPreferResident(backend, gamma, PersistentTensorRole.Weights);
             using var bufBeta = GetWeightBufferPreferResident(backend, beta, PersistentTensorRole.Biases);
             var outBuf = GetOrCreateResidentBuffer(backend, output, input.Length);
-            if (!_gnSwishScratch.TryGetValue(arr, out var sc))
+            // Key AND validate by required capacity: the cache is keyed on the output backing array, but the
+            // same array can recur with different group metadata (batch*numGroups) or a larger input, and a
+            // reused undersized norm/mean/var buffer would feed GroupNorm out-of-bounds scratch. (Re)allocate
+            // when the cached buffers are too small — and do it HERE, during the pre-residency warmup pass, so
+            // the capture-time pass is a pure pool-hit (a miss/realloc inside stream capture is a graph-purity
+            // violation: CUDA 901).
+            if (!_gnSwishScratch.TryGetValue(arr, out var sc)
+                || sc.norm.Size < input.Length || sc.mean.Size < statSize || sc.var.Size < statSize)
             {
-                sc = (backend.AllocateBuffer(input.Length), backend.AllocateBuffer(batch * numGroups), backend.AllocateBuffer(batch * numGroups));
+                if (_gnSwishScratch.TryRemove(arr, out var oldSc))
+                {
+                    oldSc.norm.Dispose(); oldSc.mean.Dispose(); oldSc.var.Dispose();
+                }
+                sc = (backend.AllocateBuffer(input.Length), backend.AllocateBuffer(statSize), backend.AllocateBuffer(statSize));
                 _gnSwishScratch[arr] = sc;
             }
             // GroupNorm into the norm scratch, then Swish (x*sigmoid(x)) into the resident output.
@@ -9176,8 +9219,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 T[] outResident = FinishGpuOp<T>(backend, outputBuffer, batch * heads * seqQ * headDim);
                 T[] statsResident = FinishGpuOp<T>(backend, statsBuffer, batch * heads * seqQ);
                 faHanded = true; // FinishGpuOp owns the buffers' lifetime now (activation cache)
-                softmaxStats = new Tensor<T>(statsResident, new[] { batch, heads, seqQ });
-                return new Tensor<T>(outResident, new[] { batch, heads, seqQ, headDim });
+                var outResT = new Tensor<T>(outResident, new[] { batch, heads, seqQ, headDim });
+                var statsResT = new Tensor<T>(statsResident, new[] { batch, heads, seqQ });
+                // Bind the resident buffers (matching the resident branch above): FinishGpuOp registers them in
+                // the activation cache keyed on the backing array, but downstream resident ops probe the
+                // tensor's _gpuBuffer — without this bind they see none and fall back to host materialization,
+                // breaking the on-device chain during capture.
+                BindResidentBuffer(outResT, outputBuffer.Buffer, backend);
+                BindResidentBuffer(statsResT, statsBuffer.Buffer, backend);
+                softmaxStats = statsResT;
+                return outResT;
             }
 
             // DownloadBuffer uses blocking read, Synchronize() removed for performance

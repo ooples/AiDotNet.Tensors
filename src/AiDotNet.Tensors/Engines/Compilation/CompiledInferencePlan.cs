@@ -70,6 +70,11 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     // Eviction is suspended for the captured graph's LIFETIME (resumed in Dispose): the captured kernels
     // reference resident intermediate buffers in the activation cache that must not be freed before replay.
     private bool _graphEvictionSuspended;
+    // Structural flag: this plan contains steps that run on a DIFFERENT engine than _engine (a cross-engine
+    // stitch — see ThenAsync). Capturing only _engine's backend would record the CUDA work but run the
+    // CPU/other-backend steps once at capture and skip them on replay, leaving stale downstream outputs.
+    // So graph capture is refused for such plans (TryGetGraphBackend returns false).
+    private readonly bool _containsCrossEngineSteps;
     private static readonly bool s_inferenceCudaGraph =
         System.Environment.GetEnvironmentVariable("AIDOTNET_INFERENCE_CUDA_GRAPH") == "1";
     // Eager calls before capture, so lazy uploads / kernel autotune settle into the steady-state
@@ -141,12 +146,14 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         Tensor<T>? compiledInputTensor,
         List<GCHandle>? handles = null,
         CompiledInferencePlan<T>[]? sourcePlans = null,
-        Tensor<T>[]? compiledInputTensors = null)
+        Tensor<T>[]? compiledInputTensors = null,
+        bool containsCrossEngineSteps = false)
     {
         _steps = steps;
         _finalOutput = finalOutput;
         _engine = engine;
         _compiledInputShape = inputShape;
+        _containsCrossEngineSteps = containsCrossEngineSteps;
         // Compile() / CreateFromDeserialized currently capture one input,
         // so the array has length 0 or 1 in practice. Storing it as an array
         // lets SetInputs generalize cleanly when multi-input Compile lands.
@@ -718,7 +725,10 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             inputShape: (int[])_compiledInputShape.Clone(),
             compiledInputTensor: _compiledInputTensors.Length > 0 ? _compiledInputTensors[0] : null,
             handles: null,
-            sourcePlans: stitchedSources);
+            sourcePlans: stitchedSources,
+            // A stitched plan contains cross-engine steps if THIS stitch crosses engines or either operand
+            // already did — so graph capture stays disabled for the whole chain, not just the first hop.
+            containsCrossEngineSteps: crossEngine || _containsCrossEngineSteps || nextPlan._containsCrossEngineSteps);
     }
 
     private static bool ShapesEqual(int[] a, int[] b)
@@ -774,8 +784,30 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             // then run the whole forward as one cuGraphLaunch.
             if (_graphExec != IntPtr.Zero)
             {
-                RefreshInferenceInputsInPlace(cb);
-                cb.LaunchCapturedGraph(_graphExec);
+                bool replayed = false;
+                try
+                {
+                    RefreshInferenceInputsInPlace(cb);            // throws if an input can't be refreshed in place
+                    cb.LaunchCapturedGraph(_graphExec);
+                    replayed = RefreshFinalOutputFromResident(); // fresh DtoH into _finalOutput's host storage
+                }
+                catch (InvalidOperationException) { replayed = false; }
+                if (replayed) return _finalOutput;
+
+                // Fail closed: an input could not be refreshed in place, or the output could not be downloaded
+                // — discard the captured graph and run this call eagerly so we never serve a result computed
+                // from stale device inputs or read from a stale host buffer. Capture stays disabled afterward.
+                if (_graphExec != IntPtr.Zero) { try { cb.DestroyCapturedGraph(_graphExec); } catch { } _graphExec = IntPtr.Zero; }
+                _graphBackend = null;
+                _graphCaptureDisabled = true;
+                if (_graphEvictionSuspended && _graphEngine is not null)
+                {
+                    try { _graphEngine.ResumeActivationEviction(); } catch { }
+                    _graphEvictionSuspended = false;
+                }
+                _graphEngine = null;
+                for (int i = 0; i < steps.Length; i++)
+                    steps[i].Execute(engine, steps[i].OutputBuffer);
                 return _finalOutput;
             }
 
@@ -816,6 +848,12 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                                 _graphBackend = cb;
                                 _graphEngine = gte;
                                 cb.LaunchCapturedGraph(exec);
+                                // Force a fresh DtoH into _finalOutput's host storage (else the returned tensor
+                                // exposes capture-time host data). If the output is not resident-downloadable,
+                                // treat capture as failed — the outer catch disables it and falls back to eager.
+                                if (!RefreshFinalOutputFromResident())
+                                    throw new InvalidOperationException(
+                                        "Captured-graph output is not resident-downloadable; abandoning capture.");
                                 return _finalOutput;
                             }
                         }
@@ -831,6 +869,16 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                 catch
                 {
                     _graphCaptureDisabled = true;
+                    // A throw after _graphExec was assigned (the first LaunchCapturedGraph or the output
+                    // download above) leaves the graph executable allocated — destroy it so it isn't leaked
+                    // until Dispose, and HasGraph-style state reflects that capture was abandoned.
+                    if (_graphExec != IntPtr.Zero)
+                    {
+                        try { cb.DestroyCapturedGraph(_graphExec); } catch { }
+                        _graphExec = IntPtr.Zero;
+                        _graphBackend = null;
+                        _graphEngine = null;
+                    }
                     if (_graphEvictionSuspended) { gte.ResumeActivationEviction(); _graphEvictionSuspended = false; }
                 }
             }
@@ -852,6 +900,9 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     private bool TryGetGraphBackend(out Engines.DirectGpu.CUDA.CudaBackend cb)
     {
         cb = null!;
+        // A cross-engine stitched plan runs some steps on a non-_engine backend; capturing only _engine's
+        // CUDA work would skip those steps on replay and serve stale downstream outputs. Refuse capture.
+        if (_containsCrossEngineSteps) return false;
         if (typeof(T) != typeof(float)) return false;
         if (_engine is not DirectGpuTensorEngine gte) return false;
         if (gte.GetBackend() is not Engines.DirectGpu.CUDA.CudaBackend backend) return false;
@@ -871,12 +922,41 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         {
             var inT = inputs[i];
             if (inT is null) continue;
-            if (inT._gpuBuffer is not { } buf || !ReferenceEquals(inT._gpuBackend, cb)) continue;
+            // Fail closed (the captured graph reads fixed resident input addresses): if a buffer is missing,
+            // belongs to another backend, or is too small, refreshing in place is impossible, so the replay
+            // would consume this call's inputs from STALE device memory. Throw so the caller abandons the
+            // graph and falls back to eager rather than silently producing a wrong result.
+            if (inT._gpuBuffer is not { } buf || !ReferenceEquals(inT._gpuBackend, cb))
+                throw new InvalidOperationException(
+                    $"Captured-graph input {i} has no resident buffer on the capture backend; cannot refresh in place.");
             var data = inT.GetDataArray();
-            if (buf.Size < data.Length) continue;
+            if (buf.Size < data.Length)
+                throw new InvalidOperationException(
+                    $"Captured-graph input {i} resident buffer (size {buf.Size}) is smaller than its host data " +
+                    $"({data.Length}); cannot refresh in place.");
             cb.UploadBufferInPlace((float[])(object)data, buf);
             inT._gpuBufferVersion = inT.Version;
         }
+    }
+
+    /// <summary>
+    /// After a captured-graph launch the result lives in <c>_finalOutput</c>'s resident GPU buffer; force a
+    /// fresh device→host download into its host storage so a CPU read of the returned tensor observes THIS
+    /// call's output, not the capture-time host data. Mirrors <see cref="ResidentInferenceGraph"/>'s explicit
+    /// output-download contract. Returns false when no resident buffer is available to download (the caller
+    /// then fails closed and falls back to eager). float only.
+    /// </summary>
+    private bool RefreshFinalOutputFromResident()
+    {
+        var eng = _graphEngine ?? _engine as DirectGpuTensorEngine;
+        if (eng is null) return false;
+        var data = eng.DownloadResidentBuffer(_finalOutput);
+        if (data is null) return false;
+        var src = (T[])(object)data;
+        var dst = _finalOutput.AsWritableSpan();
+        if (src.Length < dst.Length) return false;
+        src.AsSpan(0, dst.Length).CopyTo(dst);
+        return true;
     }
 
     /// <inheritdoc/>

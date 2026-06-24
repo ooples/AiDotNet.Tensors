@@ -1084,6 +1084,35 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private static readonly bool s_residentAudit =
         System.Environment.GetEnvironmentVariable("AIDOTNET_RESIDENT_AUDIT") == "1";
 
+    // Bounded sink for the opt-in resident-audit diagnostics. The path is process-unique (no cross-process
+    // append collision) and overridable via AIDOTNET_RESIDENT_AUDIT_PATH; the cumulative size is capped so a
+    // long capture session can't grow it without bound; write/cap failures surface via Trace instead of being
+    // silently swallowed. Only ever exercised when AIDOTNET_RESIDENT_AUDIT=1 (developer diagnostics).
+    private const long ResidentAuditMaxBytes = 16L * 1024 * 1024; // 16 MB
+    private static readonly string s_residentAuditPath =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_RESIDENT_AUDIT_PATH")
+        ?? System.IO.Path.Combine(System.IO.Path.GetTempPath(),
+            $"aidotnet_resident_audit_{System.Diagnostics.Process.GetCurrentProcess().Id}.txt");
+    private static long s_residentAuditBytes;
+    private static int s_residentAuditFull;
+
+    private static void AppendResidentAudit(string line)
+    {
+        if (System.Threading.Volatile.Read(ref s_residentAuditFull) != 0) return;
+        if (System.Threading.Interlocked.Add(ref s_residentAuditBytes, line.Length) > ResidentAuditMaxBytes)
+        {
+            if (System.Threading.Interlocked.Exchange(ref s_residentAuditFull, 1) == 0)
+                System.Diagnostics.Trace.WriteLine(
+                    $"[AiDotNet] resident-audit log reached {ResidentAuditMaxBytes} bytes; further entries dropped ({s_residentAuditPath}).");
+            return;
+        }
+        try { System.IO.File.AppendAllText(s_residentAuditPath, line); }
+        catch (System.Exception ex)
+        {
+            System.Diagnostics.Trace.WriteLine($"[AiDotNet] resident-audit write failed ({s_residentAuditPath}): {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
     // #638/#1650 capture-blocker diagnostic: when AIDOTNET_GRAPH_CAPTURE_DEBUG=1, log the call stack of the
     // FIRST sync HtoD/DtoH that runs WHILE the stream is actually capturing (cuStreamBeginCapture active).
     // Unlike AIDOTNET_RESIDENT_AUDIT (which also logs the eager passes that run AFTER capture is disabled,
@@ -1111,8 +1140,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                     if (sb.Length > 300) break;
                 }
             }
-            System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_resident_audit.txt"),
-                $"{kind}\t{bytes}\t{sb}\n");
+            AppendResidentAudit($"{kind}\t{bytes}\t{sb}\n");
         }
         catch { }
     }
