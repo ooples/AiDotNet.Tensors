@@ -539,9 +539,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     // #1650/#638 hardware-FP16 conv lever (AIDOTNET_FP16_CONV=1): route the resident conv through the in-kernel
     // __half2 conv (conv2d_direct_fp16hw, FP32 in/out, FP16 compute) on a CUDA-TOOLKIT box. No-op on a driver-
-    // only box (the kernel isn't compiled → Fp16HwConvAvailable false → FP32 fallback). Default OFF.
+    // only box (the im2col kernel isn't compiled → Fp16HwIm2colAvailable false → FP32 fallback). Default OFF.
     private static readonly bool s_fp16Conv =
         System.Environment.GetEnvironmentVariable("AIDOTNET_FP16_CONV") == "1";
+
+    // Cache the FP16 copy of each conv weight (constant across denoising steps), keyed by its resident FP32
+    // buffer handle. Converted ONCE (sync, on the pre-residency pass — not while stream-capturing); reused on
+    // every captured replay. The Tensor-Core GemmFp16 conv path needs the weights as FP16.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<System.IntPtr, IGpuBuffer> _fp16WeightCache = new();
+    private IGpuBuffer GetOrCacheFp16Weights(IDirectGpuBackend backend, IGpuBuffer wFp32, int count)
+    {
+        if (_fp16WeightCache.TryGetValue(wFp32.Handle, out var cached)
+            && cached.Handle != System.IntPtr.Zero && cached.SizeInBytes >= (long)count * 2)
+            return cached;
+        var half = backend.AllocateBuffer(count); // count floats ≥ count halfs; sync alloc — only on the pre-residency miss
+        backend.ConvertToFp16(wFp32, half, count);
+        _fp16WeightCache[wFp32.Handle] = half;
+        return half;
+    }
 
     /// <summary>Pre-capture (sync alloc — call OUTSIDE stream capture): allocate/reuse a persistent output buffer
     /// sized to the forward's output. float only / no-op off CUDA.</summary>
@@ -4927,17 +4942,29 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var bufK = GetWeightBufferPreferResident(rbk, kernel, PersistentTensorRole.Weights);
                 var outBuf = GetOrCreateResidentBuffer(rbk, output, output.Length);
 
-                // #1650/#638 hardware-FP16 conv lever: on a CUDA-TOOLKIT box (Fp16HwConvAvailable) route through
-                // the in-kernel __half2 conv — FP32 in/out (same memory, capture-safe), FP16 compute (~2x on the
-                // FMA-bound deep convs). Driver-only box: Fp16HwConvAvailable is false → FP32 path. The hw kernel
-                // reads FP32 and converts in-register, so NO cast buffers / activation chain needed.
-                // Fp16HwConvAvailable already gates the kernel-unsupported case, so DON'T swallow exceptions here:
-                // a failed launch / capture-invalidating error must propagate to the outer resident catch (which
-                // abandons the resident path + re-runs eager cleanly) rather than continuing a corrupted capture
-                // by appending an FP32 conv on top of it. (#671 review)
-                if (s_fp16Conv && rbk is Engines.DirectGpu.CUDA.CudaBackend cudaRbk && cudaRbk.Fp16HwConvAvailable)
-                    cudaRbk.Conv2DDirectFp16Hw(bufIn.Buffer, bufK.Buffer, outBuf,
-                        b, ic, ih, iw, oc, oh, ow, kh, kw, stride, stride, padding, padding, dilation, dilation);
+                // #1650/#638 FP16-conv replay-floor lever (AIDOTNET_FP16_CONV=1, CUDA-toolkit box): the INDUSTRY
+                // path (oneDNN/cuDNN/PyTorch) — conv as a Tensor-Core GEMM. Fused FP16 im2col → col[K,N] (FP16),
+                // cached FP16 weights[outC,K], GemmFp16 (cublasGemmEx: FP16 multiply / FP32 accumulate on Tensor
+                // Cores) → out[outC,N]. Measured ~11x faster than the hand-rolled FP32 Winograd at 256ch (the
+                // Winograd kernel itself is ~5.7x slower than even an FP32 cuBLAS GEMM). Driver-only box: kernel
+                // absent → FP32 path. Fp16HwIm2colAvailable gates the unsupported case, so DON'T swallow here —
+                // a launch/capture failure must propagate to the outer resident catch (clean eager fallback). (#671)
+                int gemmK = ic * kh * kw, gemmN = b * oh * ow, gemmM = oc;
+                // Tensor-Core FP16 GEMM only PAYS OFF on a big-enough GEMM. The diffusion UNet's deep convs are
+                // at small spatial (8x8→N=64, 4x4→N=16) — tiny GEMMs where the im2col + GEMM-launch overhead
+                // exceeds the FP16 win and the MMA units sit idle. Gate on N (= outH*outW) and K so only the
+                // large convs (32x32 N=1024, 16x16 N=256) take the FP16 path; the small ones stay FP32 Winograd.
+                bool fp16ConvWorth = gemmN >= 64 && gemmK >= 64 && gemmM >= 16;
+                if (s_fp16Conv && fp16ConvWorth
+                    && rbk is Engines.DirectGpu.CUDA.CudaBackend cudaRbk && cudaRbk.Fp16HwIm2colAvailable
+                    && rbk is Engines.Gpu.IGpuHalfPrecisionBackend hbConvR && hbConvR.SupportsHgemm)
+                {
+                    int K = gemmK, N = gemmN, M = gemmM;
+                    using var colHalf = AllocateOutputBuffer(rbk, K * N); // float-sized buffer holds K*N FP16 col
+                    cudaRbk.UnfoldKNFp16Hw(bufIn.Buffer, colHalf.Buffer, b, ic, ih, iw, kh, kw, stride, stride, padding, padding, dilation, dilation);
+                    var wHalf = GetOrCacheFp16Weights(rbk, bufK.Buffer, M * K); // FP16 weights, converted once + cached
+                    hbConvR.GemmFp16In32fOut(wHalf, colHalf.Buffer, outBuf, M, N, K);
+                }
                 else
                     rbk.Conv2D(bufIn.Buffer, bufK.Buffer, outBuf,
                         b, ic, ih, iw, oc, oh, ow, kh, kw, stride, stride, padding, padding, dilation, dilation);

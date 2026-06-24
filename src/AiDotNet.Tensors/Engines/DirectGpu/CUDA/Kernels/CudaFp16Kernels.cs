@@ -434,52 +434,38 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_softmax(
     }
 }
 
-// HARDWARE-FP16 direct conv2d (#1650/#638 toolkit-box replay-floor lever). Reads FP32 input/weights, converts
-// to half IN-REGISTER via the HARDWARE __floats2half2_rn (a single instruction on a CUDA-toolkit GPU — ~free,
-// unlike the 10x-slower software h2f on a driver-only box), multiply-accumulates two input channels per
-// __hfma2 (packed __half2), accumulates in FP32, writes FP32. SAME memory traffic as the FP32 path (no FP16
-// buffers, no cast-in/out, no activation chain) — a pure ~2x FMA-throughput win on the FMA-bound deep convs.
-// This module #includes <cuda_fp16.h>, so on a driver-only box (no header) the WHOLE module fails to compile
-// and is skipped (try/catch in InitializeKernels) → this kernel is absent from _kernelCache → the engine's
-// Fp16HwConvAvailable is false → it falls back to the FP32 Winograd path. On a toolkit box it compiles and the
-// engine routes the resident conv here when AIDOTNET_FP16_CONV=1.
-extern ""C"" __global__ __launch_bounds__(256) void conv2d_direct_fp16hw(
-    const float* __restrict__ input, const float* __restrict__ kernel, float* __restrict__ output,
-    int batch, int inChannels, int inHeight, int inWidth,
-    int outChannels, int outHeight, int outWidth,
+// FUSED im2col + hardware FP32->FP16, TRANSPOSED [K,N] layout (K=channels*kH*kW, N=batch*outH*outW). This is
+// the industry FP16-conv path: feed col[K,N] (FP16) + weights[outC,K] (FP16) to a Tensor-Core GEMM
+// (GemmFp16: out[outC,N] = weights @ col, FP16 multiply / FP32 accumulate). Writing FP16 directly here (hw
+// __float2half) avoids a separate cast pass + halves col bandwidth. #1650/#638 replay-floor lever.
+extern ""C"" __global__ __launch_bounds__(256) void im2col_kn_fp16hw(
+    const float* __restrict__ input, unsigned short* __restrict__ output,
+    int batch, int channels, int height, int width,
     int kernelH, int kernelW, int strideH, int strideW,
-    int padH, int padW, int dilationH, int dilationW)
+    int padH, int padW, int dilationH, int dilationW, int outH, int outW)
 {
-    int ow = blockIdx.x * blockDim.x + threadIdx.x;
-    int oh = blockIdx.y * blockDim.y + threadIdx.y;
-    int oc = blockIdx.z % outChannels;
-    int b = blockIdx.z / outChannels;
-    if (ow >= outWidth || oh >= outHeight || b >= batch) return;
-
-    int inStride = inHeight * inWidth;
-    int kStride = kernelH * kernelW;
-    float sum = 0.0f;
-    for (int kh = 0; kh < kernelH; kh++) {
-        for (int kw = 0; kw < kernelW; kw++) {
-            int ih = oh * strideH - padH + kh * dilationH;
-            int iw = ow * strideW - padW + kw * dilationW;
-            if (ih < 0 || ih >= inHeight || iw < 0 || iw >= inWidth) continue;
-            const float* inP = input + ((b * inChannels) * inHeight + ih) * inWidth + iw;
-            const float* kP  = kernel + ((oc * inChannels) * kernelH + kh) * kernelW + kw;
-            int ic = 0;
-            for (; ic + 1 < inChannels; ic += 2) {
-                // HW FP16 multiply (__hmul2, packed 2-channels), FP32 ACCUMULATE (mixed precision — accumulating
-                // in __half2 over up to hundreds of channels drifts badly; the sum must stay FP32).
-                __half2 iv = __floats2half2_rn(inP[ic * inStride], inP[(ic + 1) * inStride]);
-                __half2 kv = __floats2half2_rn(kP[ic * kStride], kP[(ic + 1) * kStride]);
-                float2 p = __half22float2(__hmul2(iv, kv));
-                sum += p.x + p.y;
-            }
-            for (; ic < inChannels; ic++)   // odd-channel remainder
-                sum += __half2float(__hmul(__float2half(inP[ic * inStride]), __float2half(kP[ic * kStride])));
-        }
-    }
-    output[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = sum;
+    // ONE THREAD PER col ELEMENT (N*K threads) — fills the GPU and writes col[t]=col[k*N+n] fully coalesced
+    // (adjacent threads → adjacent n → adjacent addresses). The previous thread-per-patch version launched only
+    // N threads (~4 blocks → ~6% occupancy → ~107us for a ~6us-of-bandwidth job); this is the fix.
+    int N = batch * outH * outW;
+    int K = channels * kernelH * kernelW;
+    long t = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= (long)N * K) return;
+    int n = (int)(t % N);     // output position (fastest — coalesced)
+    int k = (int)(t / N);     // unrolled (c,kh,kw) row
+    int b = n / (outH * outW);
+    int rem = n % (outH * outW);
+    int oh = rem / outW;
+    int ow = rem % outW;
+    int kw = k % kernelW;
+    int kh = (k / kernelW) % kernelH;
+    int c  = k / (kernelW * kernelH);
+    int ih = oh * strideH - padH + kh * dilationH;
+    int iw = ow * strideW - padW + kw * dilationW;
+    float val = (ih >= 0 && ih < height && iw >= 0 && iw < width)
+        ? input[((b * channels + c) * height + ih) * width + iw] : 0.0f;
+    __half h = __float2half(val);
+    output[t] = *reinterpret_cast<unsigned short*>(&h);
 }
 ";
     }
@@ -491,7 +477,7 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_direct_fp16hw(
     {
         return new[]
         {
-            "conv2d_direct_fp16hw",
+            "im2col_kn_fp16hw",
             "convert_fp32_to_fp16",
             "convert_fp16_to_fp32",
             "convert_fp32_to_fp16_rounding",

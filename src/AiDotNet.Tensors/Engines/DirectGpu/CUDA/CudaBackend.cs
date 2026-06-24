@@ -4949,35 +4949,31 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         }
     }
 
-    /// <summary>True when the HARDWARE-FP16 conv kernel (conv2d_direct_fp16hw, needs cuda_fp16.h) compiled into
-    /// the cache. False on a driver-only box (no cuda_fp16.h → CudaFp16Kernels module skipped) → callers fall
-    /// back to FP32. #1650/#638 toolkit-box FP16-conv lever.</summary>
-    public bool Fp16HwConvAvailable => _kernelCache.ContainsKey("conv2d_direct_fp16hw");
+    /// <summary>True when the fused FP16 im2col kernel compiled (needs cuda_fp16.h). #1650/#638.</summary>
+    public bool Fp16HwIm2colAvailable => _kernelCache.ContainsKey("im2col_kn_fp16hw");
 
-    /// <summary>HARDWARE-FP16 direct conv2d: FP32 input/weights/output buffers (same memory as the FP32 path),
-    /// FP16 multiply-accumulate IN-KERNEL via __half2 (hardware __floats2half2_rn/__hfma2). ~2x FMA throughput
-    /// on a CUDA-toolkit GPU; absent on driver-only boxes (use <see cref="Fp16HwConvAvailable"/> to gate).
-    /// Capture-safe (one kernel on the compute stream).</summary>
-    public unsafe void Conv2DDirectFp16Hw(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
-        int batch, int inChannels, int inHeight, int inWidth,
-        int outChannels, int outHeight, int outWidth,
+    /// <summary>FUSED im2col + hw FP32→FP16, TRANSPOSED [K,N] layout (outputHalf = half/ushort buffer of K*N).
+    /// Pair with GemmFp16(weightsHalf[outC,K], colHalf[K,N]) → out[outC,N] for a Tensor-Core FP16 conv.
+    /// Capture-safe (one kernel on the compute stream). #1650/#638.</summary>
+    public unsafe void UnfoldKNFp16Hw(IGpuBuffer input, IGpuBuffer outputHalf,
+        int batch, int channels, int height, int width,
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
     {
         using var _ = PushContext();
-        if (!_kernelCache.TryGetValue("conv2d_direct_fp16hw", out var k))
-            throw new InvalidOperationException("CUDA kernel not found: conv2d_direct_fp16hw");
-        IntPtr inputPtr = input.Handle, kernelPtr = kernel.Handle, outputPtr = output.Handle;
-        const int BLOCK = 16;
-        uint dgx = (uint)((outWidth + BLOCK - 1) / BLOCK);
-        uint dgy = (uint)((outHeight + BLOCK - 1) / BLOCK);
-        uint dgz = (uint)(batch * outChannels);
-        void** a = stackalloc void*[18];
-        a[0] = &inputPtr; a[1] = &kernelPtr; a[2] = &outputPtr;
-        a[3] = &batch; a[4] = &inChannels; a[5] = &inHeight; a[6] = &inWidth;
-        a[7] = &outChannels; a[8] = &outHeight; a[9] = &outWidth;
-        a[10] = &kernelH; a[11] = &kernelW; a[12] = &strideH; a[13] = &strideW;
-        a[14] = &padH; a[15] = &padW; a[16] = &dilationH; a[17] = &dilationW;
-        LaunchKernel3D(k, dgx, dgy, dgz, (uint)BLOCK, (uint)BLOCK, 1, a, 0);
+        if (!_kernelCache.TryGetValue("im2col_kn_fp16hw", out var k))
+            throw new InvalidOperationException("CUDA kernel not found: im2col_kn_fp16hw");
+        IntPtr inputPtr = input.Handle, outputPtr = outputHalf.Handle;
+        int outH = (height + 2 * padH - ((kernelH - 1) * dilationH + 1)) / strideH + 1;
+        int outW = (width + 2 * padW - ((kernelW - 1) * dilationW + 1)) / strideW + 1;
+        int totalPatches = batch * outH * outW;
+        void** a = stackalloc void*[16];
+        a[0] = &inputPtr; a[1] = &outputPtr;
+        a[2] = &batch; a[3] = &channels; a[4] = &height; a[5] = &width;
+        a[6] = &kernelH; a[7] = &kernelW; a[8] = &strideH; a[9] = &strideW;
+        a[10] = &padH; a[11] = &padW; a[12] = &dilationH; a[13] = &dilationW; a[14] = &outH; a[15] = &outW;
+        long elems = (long)totalPatches * (channels * kernelH * kernelW); // N*K threads (one per col element)
+        uint grid = (uint)((elems + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(k, grid, DefaultBlockSize, a);
     }
 
     /// <summary>Lazily spin up the cuDNN context + convolution helper on
