@@ -9,8 +9,10 @@
   <PropertyGroup>
     <TargetFramework>netstandard2.0</TargetFramework>
     <PackageId>AiDotNet.Tensors.Gpu</PackageId>
-    <!-- Tracks the AiDotNet.Tensors version it bundles. -->
-    <Version>0.91.46</Version>
+    <!-- Tracks the AiDotNet.Tensors version it bundles. Static fallback only;
+         the release pipeline injects the real version via -p:PackageVersion at
+         pack time. Kept in sync with the latest published version. -->
+    <Version>0.102.13</Version>
     <Authors>AiDotNet Contributors</Authors>
     <Company>AiDotNet</Company>
     <Description>GPU meta-package: AiDotNet.Tensors + the full NVIDIA CUDA runtime (cuBLAS + nvRTC) for out-of-the-box NVIDIA GPU acceleration — no CUDA Toolkit install required. Install this instead of AiDotNet.Tensors to get GPU support by default.</Description>
@@ -30,8 +32,11 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="AiDotNet.Tensors" Version="0.91.46" />
-    <PackageReference Include="AiDotNet.Native.CUDA" Version="12.5.0" />
+    <PackageReference Include="AiDotNet.Tensors" Version="0.102.13" />
+    <!-- 0.102.x is this package's version scheme (NOT the NVIDIA CUDA toolkit
+         version). The previous 12.5.0 pin never existed on nuget.org, which
+         broke restore for this meta-package and every consumer of it. -->
+    <PackageReference Include="AiDotNet.Native.CUDA" Version="0.102.13" />
   </ItemGroup>
 
   <ItemGroup>
