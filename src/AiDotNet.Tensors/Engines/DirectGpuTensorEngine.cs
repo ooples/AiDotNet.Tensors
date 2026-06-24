@@ -537,11 +537,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private IGpuBuffer? _stableCaptureOutput;
     private int _stableCaptureOutputSize;
 
-    // #1650/#638 hardware-FP16 conv lever (AIDOTNET_FP16_CONV=1): route the resident conv through the in-kernel
-    // __half2 conv (conv2d_direct_fp16hw, FP32 in/out, FP16 compute) on a CUDA-TOOLKIT box. No-op on a driver-
-    // only box (the im2col kernel isn't compiled → Fp16HwIm2colAvailable false → FP32 fallback). Default OFF.
-    private static readonly bool s_fp16Conv =
-        System.Environment.GetEnvironmentVariable("AIDOTNET_FP16_CONV") == "1";
+    // #1650/#638 hardware-FP16 conv lever: route the resident inference conv through the INDUSTRY path (oneDNN/
+    // cuDNN/PyTorch) — im2col → FP16 col[K,N] → GemmFp16In32fOut (FP16 multiply / FP32 accumulate on the matrix
+    // units), backend-agnostic via IGpuHalfPrecisionBackend. DEFAULT ON (set AIDOTNET_FP16_CONV=0 to disable),
+    // VALIDATED before flipping on (PR #671 #2): primitive conv vs FP32 Conv2D relL2=0.028%; one full UNet forward
+    // end-to-end relL2=0.67% — at the cuBLAS run-to-run FP32-vs-FP32 noise floor (0.666%), PSNR 60.9 dB — and
+    // 1.40x faster end-to-end. Self-gates to FP32 where it can't or shouldn't run: no toolkit (the FP16 im2col
+    // kernel isn't compiled → Fp16Im2colAvailable false), backend without the kernel (HIP/Metal/OpenCL/Vulkan/
+    // WebGpu pending → false), or a too-small GEMM (size gate below). So default-on changes behavior ONLY on the
+    // validated CUDA-with-toolkit inference path; everywhere else it is inert.
+    private static readonly bool s_fp16ConvEnv =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_FP16_CONV") != "0";
+
+    /// <summary>#1650/#638: runtime override for the FP16-conv gate. Used by the precision-validation tests
+    /// (<c>Fp16Conv_PrimitiveMatchesFp32Conv_OnCuda</c> / <c>Fp16Conv_TrajectoryMatchesFp32_OnCuda</c>) to force
+    /// FP32 (false) or FP16 (true) within one process, and by the graph-correctness test to isolate the graph path
+    /// from FP16 precision noise. Null ⇒ use the <c>AIDOTNET_FP16_CONV</c> env default (now ON unless ="0").</summary>
+    internal static bool? Fp16ConvOverride;
+
+    private static bool s_fp16Conv => Fp16ConvOverride ?? s_fp16ConvEnv;
 
     // Cache the FP16 copy of each conv weight (constant across denoising steps), keyed by its resident FP32
     // buffer handle. Converted ONCE (sync, on the pre-residency pass — not while stream-capturing); reused on
@@ -556,6 +570,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         backend.ConvertToFp16(wFp32, half, count);
         _fp16WeightCache[wFp32.Handle] = half;
         return half;
+    }
+
+    // #1650/#638: the FP16 im2col col[K,N] SCRATCH must be a STABLE, REUSED device buffer — NOT a fresh
+    // AllocateOutputBuffer each call. The captured graph (CaptureGpuGraph at ResidentInferenceGraph) replays the
+    // im2col + GEMM nodes; a per-call `using` scratch is freed after the pre-residency pass, so on replay the
+    // GEMM reads a freed / pool-reused VA → garbage output (the symptom: primitive conv correct, but the
+    // captured-forward path diverges 100%). Cache it (keyed by the conv's resident FP32 weight handle — K·N is
+    // fixed per conv layer) so the pre-residency pass (sync, capture-safe) allocates it ONCE and every captured
+    // replay reuses the same address. Mirrors _fp16WeightCache + the LayerNorm stable-scratch pattern.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<System.IntPtr, IGpuBuffer> _fp16ColScratchCache = new();
+    private IGpuBuffer GetOrCacheFp16ColScratch(IDirectGpuBackend backend, IGpuBuffer wFp32Key, int count)
+    {
+        if (_fp16ColScratchCache.TryGetValue(wFp32Key.Handle, out var cached)
+            && cached.Handle != System.IntPtr.Zero && cached.SizeInBytes >= (long)count * 2)
+            return cached;
+        var scratch = backend.AllocateBuffer(count); // count floats ≥ count halfs; sync alloc — only on the pre-residency miss
+        _fp16ColScratchCache[wFp32Key.Handle] = scratch;
+        return scratch;
     }
 
     /// <summary>Pre-capture (sync alloc — call OUTSIDE stream capture): allocate/reuse a persistent output buffer
@@ -4959,10 +4991,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     && hbConvR.SupportsHgemm && hbConvR.Fp16Im2colAvailable)
                 {
                     int K = gemmK, N = gemmN, M = gemmM;
-                    using var colHalf = AllocateOutputBuffer(rbk, K * N); // float-sized buffer holds K*N FP16 col
-                    hbConvR.Im2colKNFp16(bufIn.Buffer, colHalf.Buffer, b, ic, ih, iw, kh, kw, stride, stride, padding, padding, dilation, dilation);
+                    // STABLE cached col scratch (NOT a per-call `using` alloc) — capture-replay-safe (see method doc).
+                    var colHalf = GetOrCacheFp16ColScratch(rbk, bufK.Buffer, K * N);
+                    hbConvR.Im2colKNFp16(bufIn.Buffer, colHalf, b, ic, ih, iw, kh, kw, stride, stride, padding, padding, dilation, dilation);
                     var wHalf = GetOrCacheFp16Weights(rbk, bufK.Buffer, M * K); // FP16 weights, converted once + cached
-                    hbConvR.GemmFp16In32fOut(wHalf, colHalf.Buffer, outBuf, M, N, K);
+                    hbConvR.GemmFp16In32fOut(wHalf, colHalf, outBuf, M, N, K);
                 }
                 else
                     rbk.Conv2D(bufIn.Buffer, bufK.Buffer, outBuf,
