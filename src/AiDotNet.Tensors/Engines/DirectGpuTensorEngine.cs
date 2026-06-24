@@ -5016,6 +5016,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     var wHalf = GetOrCacheFp16Weights(rbk, bufK.Buffer, M * K); // FP16 weights, converted once + cached
                     hbConvR.GemmFp16In32fOut(wHalf, colHalf, outBuf, M, N, K);
                 }
+                else if (s_fp16Conv && gemmN <= Fp16ConvTinyGemmN && gemmK >= 64 && gemmM >= 16
+                    && rbk is Engines.DirectGpu.CUDA.CudaBackend cudaDirectConv && cudaDirectConv.Fp16DirectConvAvailable)
+                {
+                    // #671: the tiny-spatial deep convs (N <= Fp16ConvTinyGemmN) that the im2col+GEMM path skips run
+                    // through the DIRECT FP16 conv (no im2col materialization) for FP16-consistent numerics on the
+                    // small convs. CUDA-first; parity for the other backends is a tracked follow-up. Weights reuse the
+                    // same cached FP16 copy ([outC,inC,kh,kw] layout); input stays FP32 (rounded to FP16 in-kernel).
+                    var wHalfDirect = GetOrCacheFp16Weights(rbk, bufK.Buffer, gemmM * gemmK);
+                    cudaDirectConv.Conv2dDirectFp16Hw(bufIn.Buffer, wHalfDirect, outBuf,
+                        b, ic, ih, iw, oc, oh, ow, kh, kw, stride, stride, padding, padding, dilation, dilation);
+                }
                 else
                     rbk.Conv2D(bufIn.Buffer, bufK.Buffer, outBuf,
                         b, ic, ih, iw, oc, oh, ow, kh, kw, stride, stride, padding, padding, dilation, dilation);

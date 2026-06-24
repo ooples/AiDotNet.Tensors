@@ -4952,6 +4952,56 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     /// <summary>True when the fused FP16 im2col kernel compiled (needs cuda_fp16.h). #1650/#638.</summary>
     public bool Fp16HwIm2colAvailable => _kernelCache.ContainsKey("im2col_kn_fp16hw");
 
+    /// <summary>True when the direct FP16 conv kernel compiled (needs cuda_fp16.h). #1650/#638 / #671.</summary>
+    public bool Fp16DirectConvAvailable => _kernelCache.ContainsKey("conv2d_direct_fp16hw");
+
+    /// <summary>
+    /// #1650/#638 (#671): DIRECT FP16 convolution for the tiny-spatial deep convs the im2col + Tensor-Core GEMM
+    /// path skips (small N, where im2col + launch overhead exceeds the GEMM win). FP32 <paramref name="input"/>
+    /// rounded to FP16 per access, FP16 <paramref name="weightsHalf"/> (the cached half copy of the conv weights,
+    /// [outChannels, inChannels, kernelH, kernelW] layout), FP32 multiply-accumulate, FP32 <paramref name="output"/>.
+    /// Capture-safe: a single kernel launch, no device allocation. CUDA-first — parity for the other backends is a
+    /// tracked follow-up; validate end-to-end on CUDA hardware before relying on it.
+    /// </summary>
+    public unsafe void Conv2dDirectFp16Hw(IGpuBuffer input, IGpuBuffer weightsHalf, IGpuBuffer output,
+        int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
+    {
+        using var _ = PushContext();
+        if (!_kernelCache.TryGetValue("conv2d_direct_fp16hw", out var k))
+            throw new InvalidOperationException("CUDA kernel not found: conv2d_direct_fp16hw");
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (weightsHalf is null) throw new ArgumentNullException(nameof(weightsHalf));
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (batch <= 0) throw new ArgumentOutOfRangeException(nameof(batch), "Dimensions must be positive.");
+        if (inChannels <= 0) throw new ArgumentOutOfRangeException(nameof(inChannels), "Dimensions must be positive.");
+        if (inHeight <= 0) throw new ArgumentOutOfRangeException(nameof(inHeight), "Dimensions must be positive.");
+        if (inWidth <= 0) throw new ArgumentOutOfRangeException(nameof(inWidth), "Dimensions must be positive.");
+        if (outChannels <= 0) throw new ArgumentOutOfRangeException(nameof(outChannels), "Dimensions must be positive.");
+        if (outHeight <= 0) throw new ArgumentOutOfRangeException(nameof(outHeight), "Dimensions must be positive.");
+        if (outWidth <= 0) throw new ArgumentOutOfRangeException(nameof(outWidth), "Dimensions must be positive.");
+        if (kernelH <= 0) throw new ArgumentOutOfRangeException(nameof(kernelH), "Dimensions must be positive.");
+        if (kernelW <= 0) throw new ArgumentOutOfRangeException(nameof(kernelW), "Dimensions must be positive.");
+        if (strideH <= 0) throw new ArgumentOutOfRangeException(nameof(strideH), "Stride must be positive.");
+        if (strideW <= 0) throw new ArgumentOutOfRangeException(nameof(strideW), "Stride must be positive.");
+        if (dilationH <= 0) throw new ArgumentOutOfRangeException(nameof(dilationH), "Dilation must be positive.");
+        if (dilationW <= 0) throw new ArgumentOutOfRangeException(nameof(dilationW), "Dilation must be positive.");
+        if (padH < 0) throw new ArgumentOutOfRangeException(nameof(padH), "Padding must be non-negative.");
+        if (padW < 0) throw new ArgumentOutOfRangeException(nameof(padW), "Padding must be non-negative.");
+        IntPtr inputPtr = input.Handle, wPtr = weightsHalf.Handle, outputPtr = output.Handle;
+        const int BLOCK = 16;
+        uint gx = (uint)((outWidth + BLOCK - 1) / BLOCK);
+        uint gy = (uint)((outHeight + BLOCK - 1) / BLOCK);
+        uint gz = (uint)(batch * outChannels);
+        void** a = stackalloc void*[18];
+        a[0] = &inputPtr; a[1] = &wPtr; a[2] = &outputPtr;
+        a[3] = &batch; a[4] = &inChannels; a[5] = &inHeight; a[6] = &inWidth;
+        a[7] = &outChannels; a[8] = &outHeight; a[9] = &outWidth;
+        a[10] = &kernelH; a[11] = &kernelW; a[12] = &strideH; a[13] = &strideW;
+        a[14] = &padH; a[15] = &padW; a[16] = &dilationH; a[17] = &dilationW;
+        LaunchKernel3D(k, gx, gy, gz, (uint)BLOCK, (uint)BLOCK, 1, a, 0);
+    }
+
     // IGpuHalfPrecisionBackend FP16-conv im2col (backend-agnostic dispatch); delegates to the CUDA impl.
     /// <inheritdoc/>
     public bool Fp16Im2colAvailable => Fp16HwIm2colAvailable;

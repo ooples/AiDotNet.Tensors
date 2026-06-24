@@ -467,6 +467,42 @@ extern ""C"" __global__ __launch_bounds__(256) void im2col_kn_fp16hw(
     __half h = __float2half(val);
     output[t] = *reinterpret_cast<unsigned short*>(&h);
 }
+
+// #1650/#638 (#671): DIRECT FP16 conv for the tiny-spatial deep convs the im2col+GEMM path skips (small N where
+// im2col + launch overhead exceeds the Tensor-Core GEMM win). FP32 input rounded to FP16 per access (mirrors
+// im2col_kn_fp16hw), FP16 weights, FP32 multiply-accumulate (matches GemmFp16In32fOut numerics), FP32 output.
+// One thread per output (ow, oh) with a 3D grid z = b*outChannels. Capture-safe (single kernel, no device alloc).
+extern ""C"" __global__ void conv2d_direct_fp16hw(
+    const float* __restrict__ input, const unsigned short* __restrict__ weightsHalf, float* __restrict__ output,
+    int batch, int inChannels, int inHeight, int inWidth,
+    int outChannels, int outHeight, int outWidth,
+    int kernelH, int kernelW, int strideH, int strideW,
+    int padH, int padW, int dilationH, int dilationW)
+{
+    int ow = blockIdx.x * blockDim.x + threadIdx.x;
+    int oh = blockIdx.y * blockDim.y + threadIdx.y;
+    int bz = blockIdx.z;                 // b * outChannels + oc
+    if (ow >= outWidth || oh >= outHeight) return;
+    int oc = bz % outChannels;
+    int b  = bz / outChannels;
+    float acc = 0.0f;
+    for (int ic = 0; ic < inChannels; ic++) {
+        for (int kh = 0; kh < kernelH; kh++) {
+            int ih = oh * strideH - padH + kh * dilationH;
+            if (ih < 0 || ih >= inHeight) continue;
+            for (int kw = 0; kw < kernelW; kw++) {
+                int iw = ow * strideW - padW + kw * dilationW;
+                if (iw < 0 || iw >= inWidth) continue;
+                float inV = input[((b * inChannels + ic) * inHeight + ih) * inWidth + iw];
+                int wIdx = ((oc * inChannels + ic) * kernelH + kh) * kernelW + kw;
+                __half wH = *reinterpret_cast<const __half*>(&weightsHalf[wIdx]);
+                // FP16 operands, FP32 multiply-accumulate (Tensor-Core semantics): round input to FP16, mul in FP32.
+                acc += __half2float(__float2half(inV)) * __half2float(wH);
+            }
+        }
+    }
+    output[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = acc;
+}
 ";
     }
 
@@ -478,6 +514,7 @@ extern ""C"" __global__ __launch_bounds__(256) void im2col_kn_fp16hw(
         return new[]
         {
             "im2col_kn_fp16hw",
+            "conv2d_direct_fp16hw",
             "convert_fp32_to_fp16",
             "convert_fp16_to_fp32",
             "convert_fp32_to_fp16_rounding",
