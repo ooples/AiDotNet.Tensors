@@ -238,6 +238,14 @@ public partial class CpuEngine
     }
 
     /// <summary>
+    /// Broadcasts one attention-mask axis index per the IEngine contract (the mask is broadcastable
+    /// to [batch, heads, seq_q, seq_k]): a size-1 axis maps EVERY index to 0 (NumPy-style), so a
+    /// shared mask such as [1, 1, seq, seq] or [batch, 1, seq, seq] is read correctly instead of
+    /// indexing past its bounds. Returns <paramref name="idx"/> unchanged when the axis is full-sized.
+    /// </summary>
+    private static int BroadcastMaskIndex(int idx, int dimSize) => dimSize == 1 ? 0 : idx;
+
+    /// <summary>
     /// Transpose-fused scaled-dot-product attention for the MHA float path
     /// (#476 root-cause-2). Reads Q/K/V for each (batch, head) slice DIRECTLY
     /// from the fused QKV projection buffer — no separate [B,H,seq,dHead]
@@ -267,6 +275,15 @@ public partial class CpuEngine
         int scoff = 3 * seq * dHead;      // dHead*seq == seq*dHead
         int scratchLen = 3 * seq * dHead + seq * seq;
 
+        // Mask broadcasting (IEngine contract: the attention mask is broadcastable to
+        // [batch, heads, seq_q, seq_k] — e.g. [1,1,seq,seq] shared-causal or [batch,1,seq,seq]
+        // per-batch padding). A size-1 dimension maps every index to 0 (NumPy-style); without this
+        // a broadcast mask would index past its bounds (IndexOutOfRangeException / wrong data).
+        int mB = mask is null ? 1 : mask.Shape[0];
+        int mH = mask is null ? 1 : mask.Shape[1];
+        int mSq = mask is null ? 1 : mask.Shape[2];
+        int mSk = mask is null ? 1 : mask.Shape[3];
+
         // Parallelize over batch·heads using the SAME PersistentParallelExecutor as
         // the GEMMs/LayerNorm (NOT Parallel.For/ThreadPool) — a second pool in the
         // forward pass oversubscribed the cores and forced park/wakeup between ops.
@@ -282,6 +299,8 @@ public partial class CpuEngine
                 {
                 int b = bh / heads;
                 int h = bh % heads;
+                int mb = BroadcastMaskIndex(b, mB);   // broadcast batch/head indices into the mask
+                int mh = BroadcastMaskIndex(h, mH);
                 int hQ = qCol + h * dHead;
                 int hK = kCol + h * dHead;
                 int hV = vCol + h * dHead;
@@ -358,7 +377,7 @@ public partial class CpuEngine
                         for (int j = 0; j < seq; j++)
                         {
                             float v = scratch[rowOff + j] * scaleF;
-                            if (mask != null && !mask[b, h, i, j]) v = negInfF;
+                            if (mask != null && !mask[mb, mh, BroadcastMaskIndex(i, mSq), BroadcastMaskIndex(j, mSk)]) v = negInfF;
                             if (v > maxVal) maxVal = v;
                             scratch[rowOff + j] = v;
                         }
@@ -514,6 +533,15 @@ public partial class CpuEngine
         int scoff = 3 * seq * dHead;
         int scratchLen = 3 * seq * dHead + seq * seq;
         var pool = ArrayPool<double>.Shared;
+
+        // Mask broadcasting (IEngine contract: broadcastable to [batch, heads, seq_q, seq_k]). A
+        // size-1 dimension maps every index to 0; without this a broadcast mask (e.g. [1,1,seq,seq])
+        // indexes past its bounds. See BroadcastMaskIndex.
+        int mB = mask is null ? 1 : mask.Shape[0];
+        int mH = mask is null ? 1 : mask.Shape[1];
+        int mSq = mask is null ? 1 : mask.Shape[2];
+        int mSk = mask is null ? 1 : mask.Shape[3];
+
         int chunks = Math.Max(1, Math.Min(bhCount, CpuParallelSettings.MaxDegreeOfParallelism));
 
         PersistentParallelExecutor.Instance.Execute(chunks, chunk =>
@@ -525,6 +553,8 @@ public partial class CpuEngine
                 {
                     int b = bh / heads;
                     int h = bh % heads;
+                    int mb = BroadcastMaskIndex(b, mB);   // broadcast batch/head indices into the mask
+                    int mh = BroadcastMaskIndex(h, mH);
                     int headOff = h * dHead;
 
                     // Gather: Q [seq×dHead], V [seq×dHead] contiguous; K transposed into [dHead×seq].
@@ -558,7 +588,7 @@ public partial class CpuEngine
                         for (int j = 0; j < seq; j++)
                         {
                             double v = scratch[rowOff + j] * scaleValue;
-                            if (mask != null && !mask[b, h, i, j]) v = double.NegativeInfinity;
+                            if (mask != null && !mask[mb, mh, BroadcastMaskIndex(i, mSq), BroadcastMaskIndex(j, mSk)]) v = double.NegativeInfinity;
                             if (v > maxVal) maxVal = v;
                             scratch[rowOff + j] = v;
                         }
