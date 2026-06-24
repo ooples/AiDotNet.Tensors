@@ -18,12 +18,24 @@ namespace AiDotNet.Tensors.Helpers;
 /// Issue319TransformerBlockPerfTests probe surfaces.
 /// </para>
 /// <para>
-/// Opt-OUT: set <c>AIDOTNET_USE_BLAS=0</c> (or <c>false</c> / <c>no</c> /
-/// <c>off</c>) at process start to disable the native path and route every
-/// dispatch through <see cref="Engines.Simd.SimdGemm"/>'s AVX2 blocked
-/// kernel. Use this for deterministic-bit-exact builds where BLAS's
-/// non-associative reduction order is unacceptable, or for environments
-/// where libopenblas refuses to load.
+/// Opt-IN: the native path is OFF by default — every dispatch routes through
+/// the in-house managed BLAS (<see cref="Engines.BlasManaged.BlasManaged"/>,
+/// AVX2/AVX-512 kernels gated by <c>IsSupported</c>). Set
+/// <c>AIDOTNET_USE_BLAS=1</c> (or <c>true</c> / <c>yes</c> / <c>on</c>) at
+/// process start to opt the native libopenblas / MKL path back in.
+/// </para>
+/// <para>
+/// <b>Why default-off (issue #131 supply-chain + crash-safety):</b> native
+/// BLAS binaries dispatch to SIMD code that is NOT gated by .NET's
+/// hardware-feature checks, so on an unsupported / virtualized CPU — or with a
+/// missing transitive runtime — they can raise an illegal-instruction or
+/// access-violation that .NET cannot catch (it hard-crashes the process with
+/// no managed stack trace). The probe that "validates" the library
+/// (<see cref="ProbeNativeLibrary"/>) executes a real native GEMM, so the
+/// crash can happen during the probe itself. The managed BLAS is
+/// feature-gated (safe scalar fallback) and benchmarks at ~parity with MKL on
+/// tracked shapes, so it is the safe, supply-chain-clean default; native stays
+/// available as an explicit per-deployment opt-in.
 /// </para>
 /// <para>
 /// Missing native library at runtime falls back to the SimdGemm path
@@ -636,30 +648,25 @@ internal static class BlasProvider
 
     private static bool ReadOptIn()
     {
-        // Industry-standard default: BLAS on when the native lib is available.
-        // PyTorch / NumPy / TensorFlow all default to BLAS-mandatory; AiDotNet
-        // ships AiDotNet.Native.OpenBLAS as a transitive NuGet dependency, so
-        // libopenblas is loadable on every consumer install. The previous
-        // opt-in default (`AIDOTNET_USE_BLAS=1` to enable) left double-precision
-        // matmul running on the in-house SimdGemm.Dgemm AVX2 path at ~12 GFLOPS
-        // when OpenBLAS Dgemm runs the same kernel at ~75 GFLOPS — a 6× perf
-        // gap on every TensorMatMul call (which is ~80 % of ViT-Base CPU
-        // train wall-clock per the Issue319TransformerBlockPerfTests probe).
+        // Native CPU BLAS is OFF by default — the in-house managed BlasManaged
+        // is the default GEMM path (issue #131 supply-chain independence + crash
+        // safety; see the type-level remarks). Native binaries can hard-crash
+        // (uncatchable illegal-instruction / access-violation) on unsupported or
+        // virtualized CPUs, and the ProbeNativeLibrary validation executes a real
+        // native GEMM, so even probing is unsafe on those machines. The managed
+        // path is hardware-feature-gated and benchmarks at ~parity with MKL on
+        // tracked shapes, so defaulting to it costs ~nothing and never crashes.
         //
-        // Opt-OUT is now `AIDOTNET_USE_BLAS=0|false|no` — for deterministic-
-        // bit-exact builds where BLAS's non-associative reduction order is
-        // unacceptable, or for environments where libopenblas refuses to load
-        // and we want the SimdGemm fallback to engage without paying for the
-        // ProbeNativeLibrary cost on every cold start.
+        // Opt-IN to native: set `AIDOTNET_USE_BLAS=1|true|yes|on` at process
+        // start (for deployments on known-good hardware that want native BLAS).
         var raw = Environment.GetEnvironmentVariable("AIDOTNET_USE_BLAS");
-        if (string.IsNullOrWhiteSpace(raw)) return true;
-        // Explicit opt-out values disable BLAS; everything else (including
-        // empty string after trim, unrecognized strings, and the legacy
-        // 1/true/yes affirmations) leaves BLAS enabled.
-        return !(string.Equals(raw, "0", StringComparison.OrdinalIgnoreCase)
-              || string.Equals(raw, "false", StringComparison.OrdinalIgnoreCase)
-              || string.Equals(raw, "no", StringComparison.OrdinalIgnoreCase)
-              || string.Equals(raw, "off", StringComparison.OrdinalIgnoreCase));
+        if (string.IsNullOrWhiteSpace(raw)) return false;
+        // Only explicit affirmative values enable the native path; everything
+        // else (including the legacy 0/false/no/off opt-outs) leaves it off.
+        return string.Equals(raw, "1", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(raw, "true", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(raw, "yes", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(raw, "on", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool ProbeNativeLibrary()
