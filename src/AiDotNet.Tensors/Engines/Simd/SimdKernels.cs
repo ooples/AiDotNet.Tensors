@@ -6686,18 +6686,29 @@ namespace AiDotNet.Tensors.Engines.Simd
     /// </remarks>
     public static unsafe void ConvertToSingle(ReadOnlySpan<Half> source, Span<float> destination)
     {
+        // Public + writes through raw pointers below, so validate lengths before pinning: a shorter
+        // destination would overrun. Matches the FromHalfSpan wrapper's equal-length contract.
+        if (source.Length != destination.Length)
+            throw new ArgumentException(
+                $"Source length ({source.Length}) must equal destination length ({destination.Length}).",
+                nameof(destination));
         int length = source.Length;
         if (length == 0) return;
 
+        // Parallel-conversion tuning knobs (named so threshold tuning stays reviewable):
+        const int ParallelThresholdElements = 1 << 15; // below this, run inline — dispatch would dominate
+        const int TargetElementsPerChunk = 1 << 13;    // work granularity: ~one L1-sized chunk per task
+        const int ChunksPerCore = 4;                   // oversubscribe cores for load balance
+
         int cores = CpuParallelSettings.MaxDegreeOfParallelism;
-        if (cores > 1 && length >= (1 << 15))
+        if (cores > 1 && length >= ParallelThresholdElements)
         {
             fixed (Half* pSrcRoot = source)
             fixed (float* pDstRoot = destination)
             {
                 IntPtr ipS = (IntPtr)pSrcRoot, ipD = (IntPtr)pDstRoot;
                 int lengthCap = length;
-                int numChunks = Math.Min(cores * 4, Math.Max(1, length / (1 << 13)));
+                int numChunks = Math.Min(cores * ChunksPerCore, Math.Max(1, length / TargetElementsPerChunk));
                 int per = (length + numChunks - 1) / numChunks;
                 PersistentParallelExecutor.Instance.Execute(numChunks, (long)length, chunk =>
                 {
