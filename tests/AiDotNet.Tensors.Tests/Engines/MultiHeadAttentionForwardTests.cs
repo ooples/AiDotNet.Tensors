@@ -162,6 +162,47 @@ public class MultiHeadAttentionForwardTests
     }
 
     [Fact]
+    public void MultiHeadAttentionForward_BroadcastMask_MatchesFullyMaterializedMask()
+    {
+        // #674 (CodeRabbit): the IEngine contract allows masks BROADCASTABLE to [batch, heads, seq, seq]
+        // — e.g. a shared causal mask [1, 1, seq, seq]. Direct mask[b, h, i, j] indexing threw
+        // IndexOutOfRangeException (or read wrong data) for b>0/h>0. A [1, 1, seq, seq] mask must be
+        // applied to EVERY (batch, head) and produce the same result as the fully-materialized mask.
+        // seq=5 (not a multiple of 8) forces the scalar softmax path that consults the mask.
+        const int batch = 3, seq = 5, dModel = 8, numHeads = 2;
+        var rng = new Random(11);
+
+        var input = MakeRandom(rng, batch, seq, dModel);
+        var qW = MakeRandom(rng, dModel, dModel);
+        var kW = MakeRandom(rng, dModel, dModel);
+        var vW = MakeRandom(rng, dModel, dModel);
+        var oW = MakeRandom(rng, dModel, dModel);
+
+        // Shared causal mask broadcast over batch + heads: [1, 1, seq, seq].
+        var shared = new Tensor<bool>(new[] { 1, 1, seq, seq });
+        var sharedSpan = shared.AsWritableSpan();
+        for (int i = 0; i < seq; i++)
+            for (int j = 0; j < seq; j++)
+                sharedSpan[i * seq + j] = j <= i;
+
+        // The same pattern, fully materialized to [batch, heads, seq, seq] — the known-good reference.
+        var full = new Tensor<bool>(new[] { batch, numHeads, seq, seq });
+        var fullSpan = full.AsWritableSpan();
+        for (int b = 0; b < batch; b++)
+            for (int h = 0; h < numHeads; h++)
+                for (int i = 0; i < seq; i++)
+                    for (int j = 0; j < seq; j++)
+                        fullSpan[((b * numHeads + h) * seq + i) * seq + j] = j <= i;
+
+        // (a) must not throw on b>0/h>0, and (b) must equal the fully-materialized mask's result.
+        var broadcastResult = _engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads, shared);
+        var fullResult = _engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads, full);
+
+        Assert.Equal(new[] { batch, seq, dModel }, broadcastResult.Shape.ToArray());
+        AssertClose(broadcastResult, fullResult, atol: 1e-4f);
+    }
+
+    [Fact]
     public void MultiHeadAttentionForward_RejectsBadShapes()
     {
         var input = Tensor<float>.CreateZeros(2, 4, 8);

@@ -210,9 +210,26 @@ public partial class CpuEngine
                 return (Tensor<T>)(object)trainOut;
             }
 
+            if (typeof(T) == typeof(double))
+            {
+                var trainOut = LstmSequenceForwardDoubleTrain(
+                    (Tensor<double>)(object)input,
+                    (Tensor<double>?)(object?)h0,
+                    (Tensor<double>?)(object?)c0,
+                    (Tensor<double>)(object)wIh,
+                    (Tensor<double>)(object)wHh,
+                    (Tensor<double>?)(object?)bIh,
+                    (Tensor<double>?)(object?)bHh,
+                    batch, seqLen, inFeatures, hidden, gateRows, returnSequences, wantState,
+                    out var hnD, out var cnD);
+                finalHidden = (Tensor<T>)(object)hnD;
+                finalCell = (Tensor<T>)(object)cnD;
+                return (Tensor<T>)(object)trainOut;
+            }
+
             throw new InvalidOperationException(
-                "LstmSequenceForward supports GradientTape for float only in this revision. " +
-                "Route non-float training through the decomposed LSTMLayer.Forward path.");
+                "LstmSequenceForward supports GradientTape for float and double in this revision. " +
+                "Route other element types through the decomposed LSTMLayer.Forward path.");
         }
 
         // Graph-compilation mode (distinct from the eager tape) is not yet supported.
@@ -612,44 +629,94 @@ public partial class CpuEngine
         out Tensor<T> finalHidden,
         out Tensor<T> finalCell)
     {
-        // Pre-compute Wx = input @ wIh^T + bIh for ALL timesteps as one big GEMM.
-        var inputFlat = input.Reshape(new[] { batch * seqLen, inFeatures });
-        var wxFlat = TensorMatMulTransposed(inputFlat, wIh); // [B*seq, 4H]
+        // #478: pool the one-time input projection Wx = input @ wIh^T + bIh too (the dominant residual
+        // after the per-step buffers below). The old TensorMatMulTransposed(inputFlat, wIh) allocated a
+        // fresh [B*seq, 4*hidden] output; pre-transpose wIh once and MultiplyBlocked into a rented wxBuf
+        // (returned in the finally with the per-step buffers). Mirrors the float fast path's wxBuf.
+        var lstmPool = ArrayPool<T>.Shared;
+        int wxRows = batch * seqLen;
+        var wIhT = lstmPool.Rent(inFeatures * gateRows);
+        var wxBuf = lstmPool.Rent(wxRows * gateRows);
+        {
+            var wIhSrc = wIh.AsSpan();
+            for (int g = 0; g < gateRows; g++)
+                for (int fcol = 0; fcol < inFeatures; fcol++)
+                    wIhT[fcol * gateRows + g] = wIhSrc[g * inFeatures + fcol];
+        }
+        var wxMem = new Memory<T>(wxBuf, 0, wxRows * gateRows);
+        wxMem.Span.Clear();
+        MatrixMultiplyHelper.MultiplyBlocked(MathHelper.GetNumericOperations<T>(),
+            new ReadOnlyMemory<T>(input.GetFlattenedData(), 0, wxRows * inFeatures),
+            new ReadOnlyMemory<T>(wIhT, 0, inFeatures * gateRows),
+            wxMem, wxRows, inFeatures, gateRows, inFeatures, gateRows, gateRows, allowParallel: true);
+        lstmPool.Return(wIhT);
 
         if (bIh is not null)
         {
             var ops = MathHelper.GetNumericOperations<T>();
-            var wxSpan = wxFlat.AsWritableSpan();
             var bIhSpan = bIh.AsSpan();
-            int rows = batch * seqLen;
-            for (int r = 0; r < rows; r++)
+            for (int r = 0; r < wxRows; r++)
             {
                 int off = r * gateRows;
                 for (int g = 0; g < gateRows; g++)
-                    wxSpan[off + g] = ops.Add(wxSpan[off + g], bIhSpan[g]);
+                    wxBuf[off + g] = ops.Add(wxBuf[off + g], bIhSpan[g]);
             }
         }
 
         var hShape = new[] { batch, hidden };
-        var hPrev = h0 is null ? Tensor<T>.CreateZeros(hShape) : h0.Clone();
-        var cPrev = c0 is null ? Tensor<T>.CreateZeros(hShape) : c0.Clone();
+        // #478: ping-pong TWO pooled hidden + TWO pooled cell buffers across timesteps instead of a
+        // fresh Tensor<T>.CreateZeros for hCurr AND cCurr EVERY step (2*seqLen allocations that bypass
+        // the arena). That fresh-per-step allocation measured ~25-28x the float fast path's per-call
+        // allocation on a 64-step LSTM; reusing two buffers brings the generic (double/decimal/...)
+        // path's per-call allocation down to a small constant. The inner loop fully overwrites every
+        // element of the destination buffers each step, so no clear is needed between reuses.
+        int stateLen = batch * hidden;
+        var hbufs = new[] { AutoTensorCache.RentOrAllocate<T>(hShape), AutoTensorCache.RentOrAllocate<T>(hShape) };
+        var cbufs = new[] { AutoTensorCache.RentOrAllocate<T>(hShape), AutoTensorCache.RentOrAllocate<T>(hShape) };
+        SeedLstmState(hbufs[0], h0, stateLen);
+        SeedLstmState(cbufs[0], c0, stateLen);
+        int cur = 0;
 
         Tensor<T> output = returnSequences
             ? AutoTensorCache.RentOrAllocate<T>(new[] { batch, seqLen, hidden })
             : AutoTensorCache.RentOrAllocate<T>(hShape);
 
         var opsT = MathHelper.GetNumericOperations<T>();
-        var wxSpanRO = wxFlat.AsSpan();
+        var wxSpanRO = new ReadOnlySpan<T>(wxBuf, 0, wxRows * gateRows);
 
+        // #478: pool the per-timestep hidden GEMM. The old TensorMatMulTransposed(hPrev, wHh) allocated
+        // a fresh [batch, 4*hidden] output (plus the GEMM's packing scratch) EVERY step. Pre-transpose
+        // wHh once into a rented buffer and MultiplyBlocked into ONE reused hh buffer, mirroring the
+        // float fast path's wHhT + hhBuf — so the recurrence loop allocates nothing per step. This is
+        // the dominant remaining allocation after the ping-pong state buffers above.
+        var wHhT = lstmPool.Rent(hidden * gateRows);
+        var hhBuf = lstmPool.Rent(batch * gateRows);
+        {
+            var wHhSrc = wHh.AsSpan();
+            for (int g = 0; g < gateRows; g++)
+                for (int hcol = 0; hcol < hidden; hcol++)
+                    wHhT[hcol * gateRows + g] = wHhSrc[g * hidden + hcol];
+        }
+        try
+        {
         for (int t = 0; t < seqLen; t++)
         {
-            var hh = TensorMatMulTransposed(hPrev, wHh);
-            var hhSpan = hh.AsSpan();
-            var hCurr = Tensor<T>.CreateZeros(hShape);
-            var cCurr = Tensor<T>.CreateZeros(hShape);
+            int nxt = 1 - cur;
+            // hh[batch, gateRows] = hbufs[cur][batch, hidden] @ wHhT[hidden, gateRows].
+            // MultiplyBlocked accumulates into C, so clear the reused buffer first.
+            var hhMem = new Memory<T>(hhBuf, 0, batch * gateRows);
+            hhMem.Span.Clear();
+            MatrixMultiplyHelper.MultiplyBlocked(opsT,
+                new ReadOnlyMemory<T>(hbufs[cur].GetDataArray(), 0, stateLen),
+                new ReadOnlyMemory<T>(wHhT, 0, hidden * gateRows),
+                hhMem,
+                batch, hidden, gateRows, hidden, gateRows, gateRows, allowParallel: true);
+            var hhSpan = hhBuf.AsSpan();
+            var hCurr = hbufs[nxt];
+            var cCurr = cbufs[nxt];
             var hCurrSpan = hCurr.AsWritableSpan();
             var cCurrSpan = cCurr.AsWritableSpan();
-            var cPrevSpan = cPrev.AsSpan();
+            var cPrevSpan = cbufs[cur].AsSpan();
             bool hasBhh = bHh is not null;
             ReadOnlySpan<T> bHhSpan = hasBhh ? bHh!.AsSpan() : default;
 
@@ -696,8 +763,7 @@ public partial class CpuEngine
                 }
             }
 
-            hPrev = hCurr;
-            cPrev = cCurr;
+            cur = nxt;
 
             if (returnSequences)
             {
@@ -711,11 +777,18 @@ public partial class CpuEngine
                 }
             }
         }
+        }
+        finally
+        {
+            lstmPool.Return(wHhT);
+            lstmPool.Return(hhBuf);
+            lstmPool.Return(wxBuf);
+        }
 
         if (!returnSequences)
         {
             var outSpan = output.AsWritableSpan();
-            var hLastSpan = hPrev.AsSpan();
+            var hLastSpan = hbufs[cur].AsSpan();
             for (int i = 0; i < batch * hidden; i++)
                 outSpan[i] = hLastSpan[i];
         }
@@ -725,8 +798,8 @@ public partial class CpuEngine
             // Final states (h_n, c_n) for streaming/chunked inference. hPrev / cPrev
             // hold the last timestep's hidden / cell state; Clone so they are owned
             // tensors independent of the loop's intermediate buffers.
-            finalHidden = hPrev.Clone();
-            finalCell = cPrev.Clone();
+            finalHidden = hbufs[cur].Clone();
+            finalCell = cbufs[cur].Clone();
         }
         else
         {
@@ -736,6 +809,17 @@ public partial class CpuEngine
         }
 
         return output;
+    }
+
+    // Seed a ping-pong state buffer (#478): copy the initial state in, or zero it when none is given.
+    // default(T) is the additive identity for the numeric structs this path serves, so Clear() zeroes.
+    private static void SeedLstmState<T>(Tensor<T> buffer, Tensor<T>? source, int n)
+    {
+        var dst = buffer.AsWritableSpan();
+        if (source is null)
+            dst.Slice(0, n).Clear();
+        else
+            source.AsSpan().Slice(0, n).CopyTo(dst.Slice(0, n));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

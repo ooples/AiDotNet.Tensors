@@ -521,4 +521,384 @@ public partial class CpuEngine
         pool.Return(dhPrev);
         pool.Return(hPrevAll);
     }
+
+    // ── Double fused BPTT (#478 follow-up): same one-tape-node + pooled-scratch structure as the
+    //    float fast path above, so a <double> LSTM under a gradient tape trains FUSED (one backward
+    //    node, not ~5·seqLen decomposed tape ops) instead of throwing. Native double arithmetic +
+    //    scalar Math.Exp activations; the big GEMMs (Wx / dInput / dWih / dWhh) go through the generic
+    //    parallel BlasManaged.Gemm<double>, the tiny per-step recurrent GEMMs stay sequential. ──────
+
+    private static void GemmBigD(System.ReadOnlySpan<double> a, int lda, bool transA,
+                                 System.ReadOnlySpan<double> b, int ldb, bool transB,
+                                 System.Span<double> c, int m, int k, int n)
+    {
+        BlasManaged.BlasManaged.Gemm<double>(a, lda, transA, b, ldb, transB, c, n, m, n, k,
+            new BlasManaged.BlasOptions<double> { PackingMode = BlasManaged.PackingMode.DisableAutotune });
+    }
+
+    private static void SigmoidExactInPlaceD(double[] buf, int off, int len)
+    {
+        for (int i = off; i < off + len; i++) buf[i] = 1.0 / (1.0 + Math.Exp(-buf[i]));
+    }
+
+    private static void TanhExactInPlaceD(double[] buf, int off, int len)
+    {
+        // tanh(x) = 2/(1+exp(-2x)) - 1 (overflow-safe; large |x| → ±1, never NaN).
+        for (int i = off; i < off + len; i++) buf[i] = 2.0 / (1.0 + Math.Exp(-2.0 * buf[i])) - 1.0;
+    }
+
+    private Tensor<double> LstmSequenceForwardDoubleTrain(
+        Tensor<double> input, Tensor<double>? h0, Tensor<double>? c0,
+        Tensor<double> wIh, Tensor<double> wHh, Tensor<double>? bIh, Tensor<double>? bHh,
+        int batch, int seqLen, int inFeatures, int hidden, int gateRows,
+        bool returnSequences, bool wantState,
+        out Tensor<double> finalHidden, out Tensor<double> finalCell)
+    {
+        if (wantState && DifferentiableOps.ThreadTapeActive())
+        {
+            throw new ArgumentException(
+                "LstmSequenceForwardDoubleTrain: wantState=true is not supported under an active gradient tape. " +
+                "The fused BPTT node records gradients only for the sequence output; the returned finalHidden / " +
+                "finalCell carry no backward edge. Set wantState=false, or slice the final state out of the output.",
+                nameof(wantState));
+        }
+
+        int G = gateRows;
+        int totalRows = batch * seqLen;
+
+        var inSpan = input.AsSpan();
+        var wIhSpan = wIh.AsSpan();
+        var wHhSpan = wHh.AsSpan();
+        double[]? bIhArr = bIh?.ToArray();
+        double[]? bHhArr = bHh?.ToArray();
+        double[]? h0Arr = h0?.ToArray();
+        double[]? c0Arr = c0?.ToArray();
+
+        // Saved state (captured by the backward closure). Layout matches the float path.
+        var gates = new double[totalRows * G];
+        var cells = new double[batch * (seqLen + 1) * hidden];
+        var hiddens = new double[batch * (seqLen + 1) * hidden];
+
+        for (int b = 0; b < batch; b++)
+        {
+            int baseTc = b * (seqLen + 1) * hidden;
+            for (int h = 0; h < hidden; h++)
+            {
+                cells[baseTc + h] = c0Arr is null ? 0.0 : c0Arr[b * hidden + h];
+                hiddens[baseTc + h] = h0Arr is null ? 0.0 : h0Arr[b * hidden + h];
+            }
+        }
+
+        // Wx[b,t,:] = wIh @ x[b,t] (+ bIh): one big GEMM x[totalRows, inF] @ wIh^T[inF, G].
+        var wx = new double[totalRows * G];
+        GemmBigD(inSpan, inFeatures, false, wIhSpan, inFeatures, true,
+                 wx.AsSpan(0, totalRows * G), totalRows, inFeatures, G);
+        if (bIhArr is not null)
+            for (int r = 0; r < totalRows; r++)
+            {
+                int off = r * G;
+                for (int g = 0; g < G; g++) wx[off + g] += bIhArr[g];
+            }
+
+        // Pre-transpose wHh [G, hidden] → wHhT [hidden, G] for the per-step recurrent GEMM.
+        var wHhT = new double[hidden * G];
+        for (int g = 0; g < G; g++)
+            for (int h = 0; h < hidden; h++)
+                wHhT[h * G + g] = wHhSpan[g * hidden + h];
+
+        var output = returnSequences
+            ? new Tensor<double>(new[] { batch, seqLen, hidden })
+            : new Tensor<double>(new[] { batch, hidden });
+        var outSpan = output.AsWritableSpan();
+
+        if (seqLen == 0)
+        {
+            if (!returnSequences)
+                for (int b = 0; b < batch; b++)
+                    for (int h = 0; h < hidden; h++)
+                        outSpan[b * hidden + h] = h0Arr is null ? 0.0 : h0Arr[b * hidden + h];
+            if (wantState)
+            {
+                finalHidden = new Tensor<double>(new[] { batch, hidden });
+                finalCell = new Tensor<double>(new[] { batch, hidden });
+                var fh0 = finalHidden.AsWritableSpan(); var fc0 = finalCell.AsWritableSpan();
+                for (int b = 0; b < batch; b++)
+                    for (int h = 0; h < hidden; h++)
+                    {
+                        fh0[b * hidden + h] = h0Arr is null ? 0.0 : h0Arr[b * hidden + h];
+                        fc0[b * hidden + h] = c0Arr is null ? 0.0 : c0Arr[b * hidden + h];
+                    }
+            }
+            else { finalHidden = new Tensor<double>(new[] { 0 }); finalCell = new Tensor<double>(new[] { 0 }); }
+            return output;
+        }
+
+        var hPrev = new double[batch * hidden];
+        var hh = new double[batch * G];
+        for (int b = 0; b < batch; b++)
+            Array.Copy(hiddens, b * (seqLen + 1) * hidden, hPrev, b * hidden, hidden);
+
+        int bh = batch * hidden;
+        var act = new double[4 * bh];
+        var cbuf = new double[bh];
+
+        for (int t = 0; t < seqLen; t++)
+        {
+            // hh = h_prev @ wHhT → [batch, G]. BlasManaged double microkernel — the generic
+            // MatrixMultiplyHelper.MultiplyBlocked is ~128x slower at this tiny per-step shape
+            // (measured 320ms vs 2.5ms for the 32-step loop), which was the whole double-vs-float gap.
+            GemmBigD(hPrev.AsSpan(0, batch * hidden), hidden, false,
+                     wHhT.AsSpan(0, hidden * G), G, false,
+                     hh.AsSpan(0, batch * G), batch, hidden, G);
+
+            for (int b = 0; b < batch; b++)
+            {
+                int wxBase = (b * seqLen + t) * G;
+                int hhBase = b * G;
+                for (int g = 0; g < 4; g++)
+                {
+                    int wxg = wxBase + g * hidden, hhg = hhBase + g * hidden, dst = g * bh + b * hidden;
+                    if (bHhArr is not null)
+                    {
+                        int bOff = g * hidden;
+                        for (int h = 0; h < hidden; h++) act[dst + h] = wx[wxg + h] + hh[hhg + h] + bHhArr[bOff + h];
+                    }
+                    else
+                        for (int h = 0; h < hidden; h++) act[dst + h] = wx[wxg + h] + hh[hhg + h];
+                }
+            }
+
+            SigmoidExactInPlaceD(act, 0 * bh, bh);
+            SigmoidExactInPlaceD(act, 1 * bh, bh);
+            TanhExactInPlaceD(act, 2 * bh, bh);
+            SigmoidExactInPlaceD(act, 3 * bh, bh);
+
+            for (int b = 0; b < batch; b++)
+            {
+                int cPrevRow = (b * (seqLen + 1) + t) * hidden;
+                int cCurRow = (b * (seqLen + 1) + t + 1) * hidden;
+                int gb = b * hidden;
+                for (int h = 0; h < hidden; h++)
+                {
+                    double c = act[1 * bh + gb + h] * cells[cPrevRow + h] + act[0 * bh + gb + h] * act[2 * bh + gb + h];
+                    cells[cCurRow + h] = c;
+                    cbuf[gb + h] = c;
+                }
+            }
+            TanhExactInPlaceD(cbuf, 0, bh);
+
+            for (int b = 0; b < batch; b++)
+            {
+                int gateRow = (b * seqLen + t) * G;
+                int cCurRow = (b * (seqLen + 1) + t + 1) * hidden;
+                int outRow = returnSequences ? (b * seqLen + t) * hidden : b * hidden;
+                int gb = b * hidden;
+                bool writeOut = returnSequences || t == seqLen - 1;
+                for (int h = 0; h < hidden; h++)
+                {
+                    double hOut = act[3 * bh + gb + h] * cbuf[gb + h];
+                    gates[gateRow + 0 * hidden + h] = act[0 * bh + gb + h];
+                    gates[gateRow + 1 * hidden + h] = act[1 * bh + gb + h];
+                    gates[gateRow + 2 * hidden + h] = act[2 * bh + gb + h];
+                    gates[gateRow + 3 * hidden + h] = act[3 * bh + gb + h];
+                    hiddens[cCurRow + h] = hOut;
+                    if (writeOut) outSpan[outRow + h] = hOut;
+                }
+            }
+
+            for (int b = 0; b < batch; b++)
+                Array.Copy(hiddens, (b * (seqLen + 1) + t + 1) * hidden, hPrev, b * hidden, hidden);
+        }
+
+        if (wantState)
+        {
+            finalHidden = new Tensor<double>(new[] { batch, hidden });
+            finalCell = new Tensor<double>(new[] { batch, hidden });
+            var fh = finalHidden.AsWritableSpan(); var fc = finalCell.AsWritableSpan();
+            for (int b = 0; b < batch; b++)
+                for (int h = 0; h < hidden; h++)
+                {
+                    fh[b * hidden + h] = hiddens[(b * (seqLen + 1) + seqLen) * hidden + h];
+                    fc[b * hidden + h] = cells[(b * (seqLen + 1) + seqLen) * hidden + h];
+                }
+        }
+        else { finalHidden = new Tensor<double>(new[] { 0 }); finalCell = new Tensor<double>(new[] { 0 }); }
+
+        int nInputs = 3 + (bIh is not null ? 1 : 0) + (bHh is not null ? 1 : 0)
+                        + (h0 is not null ? 1 : 0) + (c0 is not null ? 1 : 0);
+        var inputsArr = new Tensor<double>[nInputs];
+        int idx = 0;
+        inputsArr[idx++] = input;
+        inputsArr[idx++] = wIh;
+        inputsArr[idx++] = wHh;
+        int idxBIh = bIh is not null ? idx : -1; if (bIh is not null) inputsArr[idx++] = bIh;
+        int idxBHh = bHh is not null ? idx : -1; if (bHh is not null) inputsArr[idx++] = bHh;
+        int idxH0 = h0 is not null ? idx : -1; if (h0 is not null) inputsArr[idx++] = h0;
+        int idxC0 = c0 is not null ? idx : -1; if (c0 is not null) inputsArr[idx++] = c0;
+
+        var meta = new int[] { batch, seqLen, inFeatures, hidden, returnSequences ? 1 : 0,
+                               idxBIh, idxBHh, idxH0, idxC0 };
+        var savedState = new object[] { gates, cells, hiddens, meta };
+
+        DifferentiableOps.RecordIfActive<double>(
+            "LstmSequenceForward", output, inputsArr, LstmSequenceBackwardDouble, savedState);
+
+        return output;
+    }
+
+    /// <summary>
+    /// BPTT backward for the fused double LSTM (mirror of <see cref="LstmSequenceBackwardFloat"/>).
+    /// Native double arithmetic; pooled backward scratch; big GEMMs via the generic parallel
+    /// BlasManaged.Gemm&lt;double&gt;, the per-step recurrent GEMM sequential.
+    /// </summary>
+    private static void LstmSequenceBackwardDouble(
+        Tensor<double> gradOutput, Tensor<double>[] inp, Tensor<double> output,
+        object[] savedState, IEngine engine, System.Collections.Generic.Dictionary<Tensor<double>, Tensor<double>> grads)
+    {
+        var gates = (double[])savedState[0];
+        var cells = (double[])savedState[1];
+        var hiddens = (double[])savedState[2];
+        var meta = (int[])savedState[3];
+        int batch = meta[0], seqLen = meta[1], inFeatures = meta[2], hidden = meta[3];
+        bool returnSequences = meta[4] != 0;
+        int idxBIh = meta[5], idxBHh = meta[6], idxH0 = meta[7], idxC0 = meta[8];
+        int G = 4 * hidden;
+        int totalRows = batch * seqLen;
+
+        var input = inp[0];
+        var wIh = inp[1];
+        var wHh = inp[2];
+        var gradOutSpan = gradOutput.AsSpan();
+
+        var pool = System.Buffers.ArrayPool<double>.Shared;
+        var dgatesAll = pool.Rent(totalRows * G);
+        var dhNext = pool.Rent(batch * hidden);
+        var dcNext = pool.Rent(batch * hidden);
+        System.Array.Clear(dhNext, 0, batch * hidden);
+        System.Array.Clear(dcNext, 0, batch * hidden);
+        var dgatesT = pool.Rent(batch * G);
+        var dhPrev = pool.Rent(batch * hidden);
+
+        for (int t = seqLen - 1; t >= 0; t--)
+        {
+            for (int b = 0; b < batch; b++)
+            {
+                int gateRow = (b * seqLen + t) * G;
+                int cPrevRow = (b * (seqLen + 1) + t) * hidden;
+                int cCurRow = (b * (seqLen + 1) + t + 1) * hidden;
+                int dgtRow = b * G;
+                int carryRow = b * hidden;
+
+                int goRow = returnSequences ? (b * seqLen + t) * hidden : b * hidden;
+                bool feedThisStep = returnSequences || t == seqLen - 1;
+
+                for (int h = 0; h < hidden; h++)
+                {
+                    double ig = gates[gateRow + 0 * hidden + h];
+                    double fg = gates[gateRow + 1 * hidden + h];
+                    double gg = gates[gateRow + 2 * hidden + h];
+                    double og = gates[gateRow + 3 * hidden + h];
+                    double cCur = cells[cCurRow + h];
+                    double cPrev = cells[cPrevRow + h];
+
+                    double dhTotal = dhNext[carryRow + h] + (feedThisStep ? gradOutSpan[goRow + h] : 0.0);
+                    double tc = Math.Tanh(cCur);
+
+                    double doPre = dhTotal * tc * og * (1.0 - og);                  // sigmoid'
+                    double dcTotal = dcNext[carryRow + h] + dhTotal * og * (1.0 - tc * tc); // tanh'
+
+                    double diPre = dcTotal * gg * ig * (1.0 - ig);
+                    double dgPre = dcTotal * ig * (1.0 - gg * gg);
+                    double dfPre = dcTotal * cPrev * fg * (1.0 - fg);
+                    dcNext[carryRow + h] = dcTotal * fg;
+
+                    dgatesT[dgtRow + 0 * hidden + h] = diPre;
+                    dgatesT[dgtRow + 1 * hidden + h] = dfPre;
+                    dgatesT[dgtRow + 2 * hidden + h] = dgPre;
+                    dgatesT[dgtRow + 3 * hidden + h] = doPre;
+
+                    dgatesAll[gateRow + 0 * hidden + h] = diPre;
+                    dgatesAll[gateRow + 1 * hidden + h] = dfPre;
+                    dgatesAll[gateRow + 2 * hidden + h] = dgPre;
+                    dgatesAll[gateRow + 3 * hidden + h] = doPre;
+                }
+            }
+
+            // dh_prev = dgates_t @ wHh → [batch, hidden]; carried to t-1. BlasManaged double
+            // microkernel (NOT the generic MultiplyBlocked — ~128x slower at this per-step shape).
+            GemmBigD(dgatesT.AsSpan(0, batch * G), G, false,
+                     wHh.AsSpan().Slice(0, G * hidden), hidden, false,
+                     dhPrev.AsSpan(0, batch * hidden), batch, G, hidden);
+            Array.Copy(dhPrev, dhNext, batch * hidden);
+        }
+
+        // gradInput = dgatesAll @ wIh → [totalRows, inFeatures]
+        var gradInput = new Tensor<double>(new[] { batch, seqLen, inFeatures });
+        GemmBigD(dgatesAll.AsSpan(0, totalRows * G), G, false,
+                 wIh.AsSpan().Slice(0, G * inFeatures), inFeatures, false,
+                 gradInput.AsWritableSpan(), totalRows, G, inFeatures);
+        DifferentiableOps.AccumulateGrad(grads, input, gradInput, engine);
+
+        // gradWIh = dgatesAll^T @ input2d → [G, inFeatures]
+        var gradWIh = new Tensor<double>(new[] { G, inFeatures });
+        GemmBigD(dgatesAll.AsSpan(0, totalRows * G), G, true,
+                 input.AsSpan(), inFeatures, false,
+                 gradWIh.AsWritableSpan(), G, totalRows, inFeatures);
+        DifferentiableOps.AccumulateGrad(grads, wIh, gradWIh, engine);
+
+        // gradWHh = dgatesAll^T @ hPrevAll → [G, hidden]; hPrevAll[b,t] = h_{t-1}.
+        var hPrevAll = pool.Rent(totalRows * hidden);
+        for (int b = 0; b < batch; b++)
+            for (int t = 0; t < seqLen; t++)
+                Array.Copy(hiddens, (b * (seqLen + 1) + t) * hidden,
+                           hPrevAll, (b * seqLen + t) * hidden, hidden);
+        var gradWHh = new Tensor<double>(new[] { G, hidden });
+        GemmBigD(dgatesAll.AsSpan(0, totalRows * G), G, true,
+                 hPrevAll.AsSpan(0, totalRows * hidden), hidden, false,
+                 gradWHh.AsWritableSpan(), G, totalRows, hidden);
+        DifferentiableOps.AccumulateGrad(grads, wHh, gradWHh, engine);
+
+        // gradBIh = gradBHh = column-sum of dgatesAll over (b,t) → [G].
+        if (idxBIh >= 0 || idxBHh >= 0)
+        {
+            var gradB = new double[G];
+            for (int r = 0; r < totalRows; r++)
+            {
+                int off = r * G;
+                for (int g = 0; g < G; g++) gradB[g] += dgatesAll[off + g];
+            }
+            if (idxBIh >= 0)
+            {
+                var gb = new Tensor<double>(new[] { G });
+                gradB.AsSpan().CopyTo(gb.AsWritableSpan());
+                DifferentiableOps.AccumulateGrad(grads, inp[idxBIh], gb, engine);
+            }
+            if (idxBHh >= 0)
+            {
+                var gb = new Tensor<double>(new[] { G });
+                gradB.AsSpan().CopyTo(gb.AsWritableSpan());
+                DifferentiableOps.AccumulateGrad(grads, inp[idxBHh], gb, engine);
+            }
+        }
+
+        if (idxH0 >= 0)
+        {
+            var gh0 = new Tensor<double>(new[] { batch, hidden });
+            dhNext.AsSpan(0, batch * hidden).CopyTo(gh0.AsWritableSpan());
+            DifferentiableOps.AccumulateGrad(grads, inp[idxH0], gh0, engine);
+        }
+        if (idxC0 >= 0)
+        {
+            var gc0 = new Tensor<double>(new[] { batch, hidden });
+            dcNext.AsSpan(0, batch * hidden).CopyTo(gc0.AsWritableSpan());
+            DifferentiableOps.AccumulateGrad(grads, inp[idxC0], gc0, engine);
+        }
+
+        pool.Return(dgatesAll);
+        pool.Return(dhNext);
+        pool.Return(dcNext);
+        pool.Return(dgatesT);
+        pool.Return(dhPrev);
+        pool.Return(hPrevAll);
+    }
 }
