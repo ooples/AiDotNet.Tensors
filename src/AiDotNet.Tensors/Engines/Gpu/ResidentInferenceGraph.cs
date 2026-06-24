@@ -34,6 +34,11 @@ public sealed class ResidentInferenceGraph : System.IDisposable
     private bool _disabled;
     private System.IDisposable? _scope;
 
+    /// <summary>#1650/#638 engagement diagnostic: total CUDA-graph launches (capture-run + replays) across all
+    /// instances. A test can reset it to 0, run a stream-capture generation, and assert it increased — proving the
+    /// resident-graph capture/replay actually engaged rather than silently falling back to eager (CodeRabbit #1650).</summary>
+    public static long GraphLaunchesExecuted;
+
     /// <param name="engine">The CUDA-backed engine to capture on.</param>
     /// <param name="warmupRuns">Eager forwards before capture (lazy allocs / autotune settle). Default 2.</param>
     public ResidentInferenceGraph(DirectGpuTensorEngine engine, int warmupRuns = 2)
@@ -122,6 +127,7 @@ public sealed class ResidentInferenceGraph : System.IDisposable
             for (int i = 0; i < s.Length; i++) _engine.RefreshResidentInputInPlace(s[i]);
             long tRefresh = breakdown ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             _engine.LaunchGpuGraph(_exec);
+            System.Threading.Interlocked.Increment(ref GraphLaunchesExecuted); // engagement diag (CodeRabbit #1650)
             if (breakdown) _engine.SynchronizeStream(); // block so the next stamp isolates GPU-compute time
             long tCompute = breakdown ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             var outR = DownloadOutput<T>();
@@ -236,6 +242,7 @@ public sealed class ResidentInferenceGraph : System.IDisposable
                 _output = captured;
                 _outShape = captured.Shape._dims;
                 _engine.LaunchGpuGraph(exec); // capture records but does not execute — run once for this call
+                System.Threading.Interlocked.Increment(ref GraphLaunchesExecuted); // engagement diag (CodeRabbit #1650)
                 var out1 = DownloadOutput<T>();
 
                 // REPLAY DETERMINISM (AIDOTNET_REPLAY_VERIFY=1): relaunch the SAME graph on the SAME (unrefreshed)
