@@ -1,6 +1,15 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFrameworks>net10.0;net471</TargetFrameworks>
+    <!--
+      net10.0 — latest; full AVX2/AVX-512 + AVX-VNNI int8/int4 kernels (serves net10/net11)
+      net8.0  — LTS; AVX2/AVX-512 intrinsics. (AVX-VNNI is [RequiresPreviewFeatures] on
+                net8 — compiled out via #if NET9_0_OR_GREATER — so it routes to AVX2/scalar.)
+                Without this target, net8/net9 consumers had no compatible modern asset and
+                NuGet's AssetTargetFallback silently selected the net471 .NET Framework build
+                (NU1701). See issue #679 for extending to net462 + netstandard2.0.
+      net471  — .NET Framework 4.7.1–4.8.1 (scalar fallback, no System.Runtime.Intrinsics)
+    -->
+    <TargetFrameworks>net10.0;net8.0;net471</TargetFrameworks>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>

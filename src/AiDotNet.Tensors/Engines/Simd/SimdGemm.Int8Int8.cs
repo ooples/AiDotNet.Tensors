@@ -43,13 +43,20 @@ internal static partial class SimdGemm
     internal static bool Int8Int8Avx2Available => false;
 #endif
 
-#if NET8_0_OR_GREATER
+#if NET9_0_OR_GREATER
     /// <summary>
     /// True when the AVX-VNNI <c>VPDPBUSD</c> fast path can run (256-bit AVX-VNNI).
     /// VNNI accumulates the int8 dot product directly into int32 in a single
     /// instruction — no int16 intermediate, so (unlike the AVX2 emulation) it does
     /// not saturate and is both faster and more accurate.
     /// </summary>
+    /// <remarks>
+    /// Gated NET9_0_OR_GREATER (not NET8): <see cref="AvxVnni"/> is marked
+    /// <c>[RequiresPreviewFeatures]</c> on net8.0 (CA2252) and only became a stable,
+    /// non-preview intrinsic in .NET 9. On net8.0 / net6.0 / netstandard2.0 / net462
+    /// this path is compiled out and the dispatcher falls back to the AVX2 emulation
+    /// (net6.0+) or the scalar kernel.
+    /// </remarks>
     internal static bool Int8Int8VnniAvailable => AvxVnni.IsSupported;
 #else
     internal static bool Int8Int8VnniAvailable => false;
@@ -133,7 +140,7 @@ internal static partial class SimdGemm
 #endif
     }
 
-#if NET8_0_OR_GREATER
+#if NET9_0_OR_GREATER
     /// <summary>
     /// Phase 2 VNNI fast path: same contract as <see cref="MatMulInt8Int8Avx2"/> but
     /// uses <c>VPDPBUSD</c> (<see cref="AvxVnni.MultiplyWideningAndAdd"/>) to accumulate
@@ -247,7 +254,7 @@ internal static partial class SimdGemm
         ReadOnlySpan<float> actScale, ReadOnlySpan<float> wScale,
         Span<float> c, int m, int k, int n)
     {
-#if NET8_0_OR_GREATER
+#if NET9_0_OR_GREATER
         if (Int8Int8VnniAvailable)
         {
             MatMulInt8Int8Vnni(aU8, bI8, bRowSum, actScale, wScale, c, m, k, n);
