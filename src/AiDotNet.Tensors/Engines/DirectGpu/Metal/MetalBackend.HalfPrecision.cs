@@ -281,8 +281,10 @@ public sealed partial class MetalBackend : IGpuHalfPrecisionBackend
     // buffer (the im2col_kn_fp16hw MSL kernel in the matrix library), paired with GemmFp16In32fOut on the GPU
     // matrix units. The kernel lives in the same matrix MSL library as the FP16 GEMM, so it compiles whenever the
     // backend does; the availability gate verifies its pipeline actually builds before the conv path uses it.
-    // Bit-identical index math to the CUDA/HIP im2col_kn_fp16hw kernels. NOTE: written against the Metal launch
-    // conventions but NOT validated on Apple hardware (the dev box has no Apple GPU).
+    // Bit-identical index math to the CUDA/HIP im2col_kn_fp16hw kernels. Per the #671 policy decision the FP16 conv
+    // path is enabled by default on every backend whose pipeline compiles; end-to-end correctness is validated on
+    // CUDA (RTX 3080) and CPU-parity-tested on OpenCL/Vulkan, while Metal/WebGpu/HIP end-to-end hardware validation
+    // is a tracked follow-up (this dev box has no Apple GPU). Opt out globally with AIDOTNET_FP16_CONV=0.
     /// <inheritdoc/>
     public bool Fp16Im2colAvailable
         => IsAvailable && _matrixLibrary != IntPtr.Zero

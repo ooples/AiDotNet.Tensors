@@ -8424,7 +8424,8 @@ fn reduce_partial_sums(@builtin(local_invocation_id) lid: vec3<u32>) {
                GatedActivationSource + SoftmaxVariantsSource +
                ShapeOpsSource + ReductionExtSource +
                StridedOpsSource +
-               Pool1DSource + BilinearUpsample2DSource;
+               Pool1DSource + BilinearUpsample2DSource +
+               Im2colKnFp16Source; // #671: include the FP16 im2col shader in the combined-module pipeline source
     }
 
     // ============================================================================

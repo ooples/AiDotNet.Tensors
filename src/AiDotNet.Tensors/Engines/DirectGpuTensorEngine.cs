@@ -542,10 +542,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // units), backend-agnostic via IGpuHalfPrecisionBackend. DEFAULT ON (set AIDOTNET_FP16_CONV=0 to disable),
     // VALIDATED before flipping on (PR #671 #2): primitive conv vs FP32 Conv2D relL2=0.028%; one full UNet forward
     // end-to-end relL2=0.67% — at the cuBLAS run-to-run FP32-vs-FP32 noise floor (0.666%), PSNR 60.9 dB — and
-    // 1.40x faster end-to-end. Self-gates to FP32 where it can't or shouldn't run: no toolkit (the FP16 im2col
-    // kernel isn't compiled → Fp16Im2colAvailable false), backend without the kernel (HIP/Metal/OpenCL/Vulkan/
-    // WebGpu pending → false), or a too-small GEMM (size gate below). So default-on changes behavior ONLY on the
-    // validated CUDA-with-toolkit inference path; everywhere else it is inert.
+    // 1.40x faster end-to-end. Self-gates to FP32 where it can't or shouldn't run: no FP16 im2col kernel on the
+    // device (Fp16Im2colAvailable false) or a too-small GEMM (size gate below). The FP16 im2col kernel now ships
+    // for ALL backends (CUDA/HIP/Metal/OpenCL/Vulkan/WebGpu), so default-on engages wherever it compiles — it is
+    // NOT CUDA-only anymore. Validation status differs per backend (#671 review): CUDA is validated end-to-end
+    // (RTX 3080, primitive relL2 0.028%, UNet relL2 0.67% at the cuBLAS FP32 noise floor, PSNR 60.9 dB);
+    // OpenCL/Vulkan have CPU-parity coverage; HIP/Metal/WebGpu compile-and-dispatch but are not yet hardware-
+    // validated end-to-end (tracked follow-up). Set AIDOTNET_FP16_CONV=0 to disable globally.
     private static readonly bool s_fp16ConvEnv =
         System.Environment.GetEnvironmentVariable("AIDOTNET_FP16_CONV") != "0";
 
@@ -557,6 +560,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     private static bool s_fp16Conv => Fp16ConvOverride ?? s_fp16ConvEnv;
 
+    // #1650/#638 (#671 review): the matrix-unit FP16 conv only pays off on a big-enough GEMM. The documented
+    // tiny boundary is 8x8 spatial -> N=64 (and 4x4 -> N=16), where im2col + launch overhead exceeds the win,
+    // so N must be STRICTLY greater than this to take the FP16 path. The next real conv spatial (16x16) gives
+    // N=256, so this excludes only the tiny convs the benchmark flagged.
+    private const int Fp16ConvTinyGemmN = 64;
+
     // Cache the FP16 copy of each conv weight (constant across denoising steps), keyed by its resident FP32
     // buffer handle. Converted ONCE (sync, on the pre-residency pass — not while stream-capturing); reused on
     // every captured replay. The Tensor-Core GemmFp16 conv path needs the weights as FP16.
@@ -566,6 +575,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (_fp16WeightCache.TryGetValue(wFp32.Handle, out var cached)
             && cached.Handle != System.IntPtr.Zero && cached.SizeInBytes >= (long)count * 2)
             return cached;
+        // #671 review: a miss while the stream is capturing means the pre-residency prewarm was skipped.
+        // Allocating/converting inside cuStreamBeginCapture aborts the graph (CUDA 906) — fail loudly instead.
+        if (backend is Engines.DirectGpu.CUDA.CudaBackend capCb && capCb.IsStreamCapturing())
+            throw new InvalidOperationException(
+                "FP16 conv weight cache miss during CUDA stream capture — convert the weights on the pre-residency pass before cuStreamBeginCapture.");
         var half = backend.AllocateBuffer(count); // count floats ≥ count halfs; sync alloc — only on the pre-residency miss
         backend.ConvertToFp16(wFp32, half, count);
         _fp16WeightCache[wFp32.Handle] = half;
@@ -585,6 +599,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (_fp16ColScratchCache.TryGetValue(wFp32Key.Handle, out var cached)
             && cached.Handle != System.IntPtr.Zero && cached.SizeInBytes >= (long)count * 2)
             return cached;
+        // #671 review: a miss while the stream is capturing means the pre-residency prewarm was skipped.
+        // Allocating inside cuStreamBeginCapture aborts the graph (CUDA 906) — fail loudly instead.
+        if (backend is Engines.DirectGpu.CUDA.CudaBackend capCb && capCb.IsStreamCapturing())
+            throw new InvalidOperationException(
+                "FP16 conv col-scratch cache miss during CUDA stream capture — allocate the scratch on the pre-residency pass before cuStreamBeginCapture.");
         var scratch = backend.AllocateBuffer(count); // count floats ≥ count halfs; sync alloc — only on the pre-residency miss
         _fp16ColScratchCache[wFp32Key.Handle] = scratch;
         return scratch;
@@ -4985,7 +5004,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // The matrix-unit GEMM only PAYS OFF on a big-enough GEMM. Deep convs at small spatial (8x8→N=64,
                 // 4x4→N=16) are tiny GEMMs where the im2col + launch overhead exceeds the win. Gate on N/K/M so
                 // only the large convs take the FP16 path; the small ones stay on the FP32 conv kernel.
-                bool fp16ConvWorth = gemmN >= 64 && gemmK >= 64 && gemmM >= 16;
+                bool fp16ConvWorth = gemmN > Fp16ConvTinyGemmN && gemmK >= 64 && gemmM >= 16;
                 if (s_fp16Conv && fp16ConvWorth
                     && rbk is Engines.Gpu.IGpuHalfPrecisionBackend hbConvR
                     && hbConvR.SupportsHgemm && hbConvR.Fp16Im2colAvailable)

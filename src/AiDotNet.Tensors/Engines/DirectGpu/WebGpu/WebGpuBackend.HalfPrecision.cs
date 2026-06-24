@@ -159,13 +159,14 @@ public sealed partial class WebGpuBackend : IGpuHalfPrecisionBackend
             if (_im2colFp16Tried)
                 return _im2colFp16Available;
 
-            _im2colFp16Tried = true;
-
             if (!IsAvailable)
             {
-                _im2colFp16Available = false;
+                // #671 review: the backend isn't initialized yet — do NOT latch this miss (_im2colFp16Tried
+                // stays false) so a later query retries the pipeline build once IsAvailable becomes true.
                 return false;
             }
+
+            _im2colFp16Tried = true;
 
             try
             {

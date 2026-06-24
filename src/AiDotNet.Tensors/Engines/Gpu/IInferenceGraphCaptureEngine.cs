@@ -42,6 +42,9 @@ public interface IInferenceGraphCaptureEngine
     void RefreshResidentInputInPlace<T>(Tensor<T> t);
 
     /// <summary>Downloads <paramref name="t"/>'s resident GPU buffer (which a replayed graph just wrote) into
-    /// a fresh host array, forcing a fresh DtoH each replay. Null if the tensor has no resident buffer.</summary>
+    /// a fresh host array, forcing a fresh DtoH each replay. Returns <see langword="null"/> if the tensor has no
+    /// resident buffer. Resident inference buffers are float-only, so the result is <c>float[]</c> regardless of
+    /// <typeparamref name="T"/> (the generic parameter is for call-site convenience; a non-float
+    /// <typeparamref name="T"/> has no resident buffer and yields null).</summary>
     float[]? DownloadResidentBuffer<T>(Tensor<T> t);
 }
