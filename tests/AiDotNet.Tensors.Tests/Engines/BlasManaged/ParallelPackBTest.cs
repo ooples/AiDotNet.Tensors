@@ -12,6 +12,12 @@ namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 /// shapes where serial pack-B previously dominated total time should now
 /// pack faster, and produce bit-identical output to the serial path.
 /// </summary>
+// Join the single serial collection for tests that touch the process-global GEMM state
+// (CpuParallelSettings.DeterministicReductions / BlasProvider.IsDeterministicMode). xUnit only
+// serializes WITHIN a collection, so an uncollected bit-exact test runs in parallel with the
+// determinism-flag mutators (DeterministicParallelGemmContractTests, PrePackConcurrencyStress, …)
+// and intermittently observes a flipped flag mid-GEMM, drifting parallel-vs-serial output. (#675 CI flake)
+[Collection("BlasManaged-Stats-Serial")]
 public class ParallelPackBTest
 {
     private readonly ITestOutputHelper _output;
