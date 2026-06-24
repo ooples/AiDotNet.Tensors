@@ -155,5 +155,35 @@ public class MhaLeanSdpaAllocTests
             $"Double LSTM forward allocated {kbPerCall:F0} KB/call; expected < 8192 KB (buffer-reusing " +
             "path). Regressed to the per-timestep CreateZeros + per-step hidden-GEMM allocation (#478)?");
     }
+
+    // #478 regression guard for the systemic zero-copy result hand-off: BatchNorm (and the conv /
+    // SDPA / norm backward paths) must wrap their freshly-allocated result arrays with
+    // Vector<T>.FromMemory, NOT `new Vector<T>(arr)`, which routes through the IEnumerable<T> ctor and
+    // COPIES the whole array — doubling the result allocation (BatchNorm forward measured 4x the float
+    // path; FromMemory brings it to ~2x = just the bytes).
+    [Trait("Category", "Performance")]
+    [Fact]
+    public void BatchNormForward_Double_ZeroCopyHandoff_NotVectorCopy()
+    {
+        var eng = new CpuEngine();
+        const int n = 8, c = 256, h = 16, w = 16;
+        var r = new Random(2026);
+        var input = RandD(r, n, c, h, w);
+        var gamma = RandD(r, c); var beta = RandD(r, c);
+
+        for (int wi = 0; wi < 5; wi++) _ = eng.BatchNorm(input, gamma, beta, 1e-5, out _, out _);
+
+        const int reps = 10;
+        long a0 = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < reps; i++) _ = eng.BatchNorm(input, gamma, beta, 1e-5, out _, out _);
+        long a1 = GC.GetAllocatedBytesForCurrentThread();
+        double kbPerCall = (a1 - a0) / 1024.0 / reps;
+
+        // Output [8,256,16,16] double ≈ 4 MB; the fixed path hands it off zero-copy. The reverted
+        // `new Vector<double>(outDArr)` path COPIED it (~8 MB/call). 6 MB threshold catches a revert.
+        Assert.True(kbPerCall < 6144,
+            $"Double BatchNorm allocated {kbPerCall:F0} KB/call; expected < 6144 KB (zero-copy " +
+            "FromMemory hand-off). Regressed to new Vector<double>(arr) which copies the result (#478)?");
+    }
 #endif
 }

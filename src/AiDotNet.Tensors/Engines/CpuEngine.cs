@@ -13842,7 +13842,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         finally { poolKt.Return(kT); }
                     }
                 });
-                return TensorAllocator.Rent<T>(inputShape, (Vector<T>)(object)new Vector<double>(gradInputD1x1));
+                return TensorAllocator.Rent<T>(inputShape, (Vector<T>)(object)Vector<double>.FromMemory(gradInputD1x1));
             }
 #if !NET471
             // #415 Phase B: direct-kernel fast path for 3×3 stride=1 padding=1
@@ -13962,7 +13962,7 @@ public partial class CpuEngine : ITensorLevelEngine
                                 padH: 1, padW: 1, dilationH: 1, dilationW: 1);
                         }
                     }
-                    return TensorAllocator.Rent<T>(inputShape, (Vector<T>)(object)new Vector<double>(gradInputDDirect));
+                    return TensorAllocator.Rent<T>(inputShape, (Vector<T>)(object)Vector<double>.FromMemory(gradInputDDirect));
                     }
                     finally { poolFlip.Return(kernelFlippedBuf); }
                 }
@@ -14053,7 +14053,7 @@ public partial class CpuEngine : ITensorLevelEngine
                             outputHeight, outputWidth);
                     });
 
-                    return TensorAllocator.Rent<T>(inputShape, (Vector<T>)(object)new Vector<double>(gradInputD));
+                    return TensorAllocator.Rent<T>(inputShape, (Vector<T>)(object)Vector<double>.FromMemory(gradInputD));
                 }
                 finally
                 {
@@ -14107,7 +14107,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 finally { poolD.Return(colBuf); }
             });
 
-            return TensorAllocator.Rent<T>(inputShape, (Vector<T>)(object)new Vector<double>(gradInputD));
+            return TensorAllocator.Rent<T>(inputShape, (Vector<T>)(object)Vector<double>.FromMemory(gradInputD));
         }
 
         // Generic fallback for non-float, non-double types
@@ -14908,7 +14908,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         }
                     }
                 }
-                return TensorAllocator.Rent<T>(kernelShape, (Vector<T>)(object)new Vector<double>(gradKernelD));
+                return TensorAllocator.Rent<T>(kernelShape, (Vector<T>)(object)Vector<double>.FromMemory(gradKernelD));
             }
 
 #if !NET471
@@ -14948,7 +14948,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         batch, inChannels, outChannels,
                         height, width, outputHeight, outputWidth,
                         padH: 1, padW: 1);
-                    return TensorAllocator.Rent<T>(kernelShape, (Vector<T>)(object)new Vector<double>(gradKernelD));
+                    return TensorAllocator.Rent<T>(kernelShape, (Vector<T>)(object)Vector<double>.FromMemory(gradKernelD));
                 }
             }
 #endif
@@ -14995,7 +14995,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         im2colAll, 0, batchColW, true,
                         gradKernelD, 0, colH))
                     {
-                        return TensorAllocator.Rent<T>(kernelShape, (Vector<T>)(object)new Vector<double>(gradKernelD));
+                        return TensorAllocator.Rent<T>(kernelShape, (Vector<T>)(object)Vector<double>.FromMemory(gradKernelD));
                     }
                     // BLAS declined (non-deterministic + no native BLAS): clear
                     // the partial destination and fall through to the per-batch
@@ -15092,7 +15092,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 kPoolD.Return(lg);
             }
 
-            return TensorAllocator.Rent<T>(kernelShape, (Vector<T>)(object)new Vector<double>(gradKernelD));
+            return TensorAllocator.Rent<T>(kernelShape, (Vector<T>)(object)Vector<double>.FromMemory(gradKernelD));
         }
 
         // Generic fallback for non-float, non-double types
@@ -21192,9 +21192,12 @@ public partial class CpuEngine : ITensorLevelEngine
             var outDArr = new double[logicalLength];
 #endif
             BatchNorm4DDouble(inD, gamD, betD, epsD, batch, channels, spatialSize, meanDArr, varDArr, outDArr);
-            mean = (Tensor<T>)(object)TensorAllocator.Rent<T>(new[] { channels }, (Vector<T>)(object)new Vector<double>(meanDArr));
-            variance = (Tensor<T>)(object)TensorAllocator.Rent<T>(new[] { channels }, (Vector<T>)(object)new Vector<double>(varDArr));
-            return (Tensor<T>)(object)TensorAllocator.Rent<T>(input._shape, (Vector<T>)(object)new Vector<double>(outDArr));
+            // #478: wrap the freshly-allocated result arrays with FromMemory (zero-copy hand-off, like
+            // the float path above) instead of `new Vector<double>(arr)`, which COPIED every array —
+            // doubling the output allocation (measured 4x the float path; now ~2x = just the bytes).
+            mean = (Tensor<T>)(object)TensorAllocator.Rent<T>(new[] { channels }, (Vector<T>)(object)Vector<double>.FromMemory(meanDArr));
+            variance = (Tensor<T>)(object)TensorAllocator.Rent<T>(new[] { channels }, (Vector<T>)(object)Vector<double>.FromMemory(varDArr));
+            return (Tensor<T>)(object)TensorAllocator.Rent<T>(input._shape, (Vector<T>)(object)Vector<double>.FromMemory(outDArr));
         }
 
         var meanData = new T[channels];
@@ -21985,9 +21988,9 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             });
 
-            gradGamma = TensorAllocator.Rent<T>([channels], (Vector<T>)(object)new Vector<float>(ggF));
-            gradBeta = TensorAllocator.Rent<T>([channels], (Vector<T>)(object)new Vector<float>(gbF));
-            return TensorAllocator.Rent<T>(input._shape, (Vector<T>)(object)new Vector<float>(giF));
+            gradGamma = TensorAllocator.Rent<T>([channels], (Vector<T>)(object)Vector<float>.FromMemory(ggF));
+            gradBeta = TensorAllocator.Rent<T>([channels], (Vector<T>)(object)Vector<float>.FromMemory(gbF));
+            return TensorAllocator.Rent<T>(input._shape, (Vector<T>)(object)Vector<float>.FromMemory(giF));
         }
 
         // Double fast path — replaces the per-channel scalar inner loops with
@@ -22009,9 +22012,9 @@ public partial class CpuEngine : ITensorLevelEngine
             BatchNormBackward4DDouble(goD, inD, gaD, meD, vaD, epsD,
                 batch, channels, spatialSize, elemD,
                 ggD, gbD, giD);
-            gradGamma = TensorAllocator.Rent<T>([channels], (Vector<T>)(object)new Vector<double>(ggD));
-            gradBeta = TensorAllocator.Rent<T>([channels], (Vector<T>)(object)new Vector<double>(gbD));
-            return TensorAllocator.Rent<T>(input._shape, (Vector<T>)(object)new Vector<double>(giD));
+            gradGamma = TensorAllocator.Rent<T>([channels], (Vector<T>)(object)Vector<double>.FromMemory(ggD));
+            gradBeta = TensorAllocator.Rent<T>([channels], (Vector<T>)(object)Vector<double>.FromMemory(gbD));
+            return TensorAllocator.Rent<T>(input._shape, (Vector<T>)(object)Vector<double>.FromMemory(giD));
         }
 
         var gradGammaData = new T[channels];
@@ -25681,9 +25684,9 @@ public partial class CpuEngine : ITensorLevelEngine
             finally { System.Buffers.ArrayPool<float>.Shared.Return(gradWeights, clearArray: false); }
         });
 
-        gradValue = TensorAllocator.Rent<float>(value._shape, new Vector<float>(gradVData));
-        gradKey = TensorAllocator.Rent<float>(key._shape, new Vector<float>(gradKData));
-        return TensorAllocator.Rent<float>(query._shape, new Vector<float>(gradQData));
+        gradValue = TensorAllocator.Rent<float>(value._shape, Vector<float>.FromMemory(gradVData));
+        gradKey = TensorAllocator.Rent<float>(key._shape, Vector<float>.FromMemory(gradKData));
+        return TensorAllocator.Rent<float>(query._shape, Vector<float>.FromMemory(gradQData));
     }
 
     /// <summary>
@@ -25820,9 +25823,9 @@ public partial class CpuEngine : ITensorLevelEngine
             finally { System.Buffers.ArrayPool<double>.Shared.Return(gradWeights, clearArray: false); }
         });
 
-        gradValue = TensorAllocator.Rent<double>(value._shape, new Vector<double>(gradVData));
-        gradKey = TensorAllocator.Rent<double>(key._shape, new Vector<double>(gradKData));
-        return TensorAllocator.Rent<double>(query._shape, new Vector<double>(gradQData));
+        gradValue = TensorAllocator.Rent<double>(value._shape, Vector<double>.FromMemory(gradVData));
+        gradKey = TensorAllocator.Rent<double>(key._shape, Vector<double>.FromMemory(gradKData));
+        return TensorAllocator.Rent<double>(query._shape, Vector<double>.FromMemory(gradQData));
     }
 
     /// <summary>
