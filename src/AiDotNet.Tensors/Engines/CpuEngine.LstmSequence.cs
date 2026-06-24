@@ -612,21 +612,37 @@ public partial class CpuEngine
         out Tensor<T> finalHidden,
         out Tensor<T> finalCell)
     {
-        // Pre-compute Wx = input @ wIh^T + bIh for ALL timesteps as one big GEMM.
-        var inputFlat = input.Reshape(new[] { batch * seqLen, inFeatures });
-        var wxFlat = TensorMatMulTransposed(inputFlat, wIh); // [B*seq, 4H]
+        // #478: pool the one-time input projection Wx = input @ wIh^T + bIh too (the dominant residual
+        // after the per-step buffers below). The old TensorMatMulTransposed(inputFlat, wIh) allocated a
+        // fresh [B*seq, 4*hidden] output; pre-transpose wIh once and MultiplyBlocked into a rented wxBuf
+        // (returned in the finally with the per-step buffers). Mirrors the float fast path's wxBuf.
+        var lstmPool = ArrayPool<T>.Shared;
+        int wxRows = batch * seqLen;
+        var wIhT = lstmPool.Rent(inFeatures * gateRows);
+        var wxBuf = lstmPool.Rent(wxRows * gateRows);
+        {
+            var wIhSrc = wIh.AsSpan();
+            for (int g = 0; g < gateRows; g++)
+                for (int fcol = 0; fcol < inFeatures; fcol++)
+                    wIhT[fcol * gateRows + g] = wIhSrc[g * inFeatures + fcol];
+        }
+        var wxMem = new Memory<T>(wxBuf, 0, wxRows * gateRows);
+        wxMem.Span.Clear();
+        MatrixMultiplyHelper.MultiplyBlocked(MathHelper.GetNumericOperations<T>(),
+            new ReadOnlyMemory<T>(input.GetFlattenedData(), 0, wxRows * inFeatures),
+            new ReadOnlyMemory<T>(wIhT, 0, inFeatures * gateRows),
+            wxMem, wxRows, inFeatures, gateRows, inFeatures, gateRows, gateRows, allowParallel: true);
+        lstmPool.Return(wIhT);
 
         if (bIh is not null)
         {
             var ops = MathHelper.GetNumericOperations<T>();
-            var wxSpan = wxFlat.AsWritableSpan();
             var bIhSpan = bIh.AsSpan();
-            int rows = batch * seqLen;
-            for (int r = 0; r < rows; r++)
+            for (int r = 0; r < wxRows; r++)
             {
                 int off = r * gateRows;
                 for (int g = 0; g < gateRows; g++)
-                    wxSpan[off + g] = ops.Add(wxSpan[off + g], bIhSpan[g]);
+                    wxBuf[off + g] = ops.Add(wxBuf[off + g], bIhSpan[g]);
             }
         }
 
@@ -649,14 +665,13 @@ public partial class CpuEngine
             : AutoTensorCache.RentOrAllocate<T>(hShape);
 
         var opsT = MathHelper.GetNumericOperations<T>();
-        var wxSpanRO = wxFlat.AsSpan();
+        var wxSpanRO = new ReadOnlySpan<T>(wxBuf, 0, wxRows * gateRows);
 
         // #478: pool the per-timestep hidden GEMM. The old TensorMatMulTransposed(hPrev, wHh) allocated
         // a fresh [batch, 4*hidden] output (plus the GEMM's packing scratch) EVERY step. Pre-transpose
         // wHh once into a rented buffer and MultiplyBlocked into ONE reused hh buffer, mirroring the
         // float fast path's wHhT + hhBuf — so the recurrence loop allocates nothing per step. This is
         // the dominant remaining allocation after the ping-pong state buffers above.
-        var lstmPool = ArrayPool<T>.Shared;
         var wHhT = lstmPool.Rent(hidden * gateRows);
         var hhBuf = lstmPool.Rent(batch * gateRows);
         {
@@ -750,6 +765,7 @@ public partial class CpuEngine
         {
             lstmPool.Return(wHhT);
             lstmPool.Return(hhBuf);
+            lstmPool.Return(wxBuf);
         }
 
         if (!returnSequences)
