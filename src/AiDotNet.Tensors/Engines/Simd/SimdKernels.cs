@@ -6674,24 +6674,114 @@ namespace AiDotNet.Tensors.Engines.Simd
     }
 
     /// <summary>
-    /// Converts Half span to float span. Uses unrolled loop for better throughput.
+    /// Converts a Half span to a float span. Each range is decoded with a bit-exact AVX2 IEEE-754
+    /// half→float kernel (<see cref="HalfToSingleRange"/>) and large spans are split across cores.
     /// </summary>
-    public static void ConvertToSingle(ReadOnlySpan<Half> source, Span<float> destination)
+    /// <remarks>
+    /// fp16-resident inference (storing large weight matrices as <see cref="Half"/> and upcasting to fp32
+    /// per forward) drives GBs of conversions through this kernel; the previous single-threaded scalar
+    /// <c>(float)Half</c> pass was the dominant cost of a foundation-scale forward. This path is
+    /// embarrassingly parallel and element-wise, so it is split across cores (grain-gated — small spans
+    /// stay inline) and each chunk uses the vectorized decode. Bit-identical to the scalar conversion.
+    /// </remarks>
+    public static unsafe void ConvertToSingle(ReadOnlySpan<Half> source, Span<float> destination)
     {
-        int i = 0;
+        // Public + writes through raw pointers below, so validate lengths before pinning: a shorter
+        // destination would overrun. Matches the FromHalfSpan wrapper's equal-length contract.
+        if (source.Length != destination.Length)
+            throw new ArgumentException(
+                $"Source length ({source.Length}) must equal destination length ({destination.Length}).",
+                nameof(destination));
         int length = source.Length;
+        if (length == 0) return;
 
-        // 4x unrolled scalar conversion
-        for (; i + 4 <= length; i += 4)
+        // Parallel-conversion tuning knobs (named so threshold tuning stays reviewable):
+        const int ParallelThresholdElements = 1 << 15; // below this, run inline — dispatch would dominate
+        const int TargetElementsPerChunk = 1 << 13;    // work granularity: ~one L1-sized chunk per task
+        const int ChunksPerCore = 4;                   // oversubscribe cores for load balance
+
+        int cores = CpuParallelSettings.MaxDegreeOfParallelism;
+        if (cores > 1 && length >= ParallelThresholdElements)
         {
-            destination[i] = (float)source[i];
-            destination[i + 1] = (float)source[i + 1];
-            destination[i + 2] = (float)source[i + 2];
-            destination[i + 3] = (float)source[i + 3];
+            fixed (Half* pSrcRoot = source)
+            fixed (float* pDstRoot = destination)
+            {
+                IntPtr ipS = (IntPtr)pSrcRoot, ipD = (IntPtr)pDstRoot;
+                int lengthCap = length;
+                int numChunks = Math.Min(cores * ChunksPerCore, Math.Max(1, length / TargetElementsPerChunk));
+                int per = (length + numChunks - 1) / numChunks;
+                PersistentParallelExecutor.Instance.Execute(numChunks, (long)length, chunk =>
+                {
+                    int s = chunk * per;
+                    if (s >= lengthCap) return;
+                    int e = Math.Min(s + per, lengthCap);
+                    HalfToSingleRange((Half*)ipS, (float*)ipD, s, e);
+                });
+            }
+            return;
         }
 
-        for (; i < length; i++)
-            destination[i] = (float)source[i];
+        fixed (Half* pSrc = source)
+        fixed (float* pDst = destination)
+            HalfToSingleRange(pSrc, pDst, 0, length);
+    }
+
+    /// <summary>
+    /// Bit-exact Half→float conversion for <paramref name="dst"/>[start..end). Uses an AVX2 IEEE-754 half
+    /// decode (8 lanes/iteration) when supported, else the 4× scalar fallback. The vectorized path is
+    /// validated to produce results identical to <c>(float)Half</c> for all 65536 half bit patterns
+    /// (normal, subnormal, ±zero, ±Inf, and NaN payloads — note <c>(float)Half</c> quiets NaNs by forcing
+    /// the float quiet bit, which this path reproduces).
+    /// </summary>
+    private static unsafe void HalfToSingleRange(Half* src, float* dst, int start, int end)
+    {
+        int j = start;
+#if NET8_0_OR_GREATER
+        if (Avx2.IsSupported && end - start >= 8)
+        {
+            ushort* us = (ushort*)src;
+            var expMask = Vector256.Create(0x1Fu);
+            var mantMask = Vector256.Create(0x3FFu);
+            var signIn = Vector256.Create(0x8000u);
+            var normalExpAdj = Vector256.Create(112u);    // 127 - 15
+            var infNanExp = Vector256.Create(0x7F800000u);
+            var quietBitV = Vector256.Create(0x400000u);
+            var denormScale = Vector256.Create(5.9604644775390625e-08f); // 2^-24, exact
+            for (; j + 8 <= end; j += 8)
+            {
+                var h = Avx2.ConvertToVector256Int32(Sse2.LoadVector128(us + j)).AsUInt32();
+                var sign = Avx2.ShiftLeftLogical(Avx2.And(h, signIn), 16);
+                var exp5 = Avx2.And(Avx2.ShiftRightLogical(h, 10), expMask);
+                var mant = Avx2.And(h, mantMask);
+                var mantShift = Avx2.ShiftLeftLogical(mant, 13);
+
+                // Normal: ((exp5 + 112) << 23) | (mant << 13)
+                var normal = Avx2.Or(Avx2.ShiftLeftLogical(Avx2.Add(exp5, normalExpAdj), 23), mantShift);
+                // Inf/NaN (exp5 == 0x1F): 0x7F800000 | (mant << 13), with the float quiet bit forced on for
+                // NaN (mant != 0) to match (float)Half; Inf (mant == 0) left alone.
+                var isInfNan = Avx2.CompareEqual(exp5, expMask);
+                var mantIsZero = Avx2.CompareEqual(mant, Vector256<uint>.Zero);
+                var isNan = Avx2.AndNot(mantIsZero, isInfNan);
+                var infnan = Avx2.Or(Avx2.Or(infNanExp, mantShift), Avx2.And(isNan, quietBitV));
+                // Zero/subnormal (exp5 == 0): value = mant * 2^-24, exact in float (mant < 1024).
+                var denorm = Avx.Multiply(Avx.ConvertToVector256Single(mant.AsInt32()), denormScale).AsUInt32();
+
+                var isZeroDen = Avx2.CompareEqual(exp5, Vector256<uint>.Zero);
+                var notSpecial = Avx2.Xor(Avx2.Or(isInfNan, isZeroDen), Vector256<uint>.AllBitsSet);
+                var body = Avx2.Or(Avx2.Or(Avx2.And(normal, notSpecial), Avx2.And(infnan, isInfNan)),
+                                   Avx2.And(denorm, isZeroDen));
+                Avx.Store(dst + j, Avx2.Or(sign, body).AsSingle());
+            }
+        }
+#endif
+        for (; j + 4 <= end; j += 4)
+        {
+            dst[j] = (float)src[j];
+            dst[j + 1] = (float)src[j + 1];
+            dst[j + 2] = (float)src[j + 2];
+            dst[j + 3] = (float)src[j + 3];
+        }
+        for (; j < end; j++) dst[j] = (float)src[j];
     }
 
     /// <summary>
