@@ -73,7 +73,12 @@ internal static class MachineCodeFmaKernel
     /// 4 vbroadcastss + 3 vmovups = 7 load-port ops / 12 FMAs vs 6x16's 8 — fewer broadcasts (the Zen2
     /// load-port bottleneck). First-party, RyuJIT-free (12 accumulators exceed RyuJIT's ~8 ceiling).
     /// </summary>
-    internal static byte[] EmitFp32TileWindows(int mr, int nrYmm)
+    internal static byte[] EmitFp32TileWindows(int mr, int nrYmm) => EmitFp32TileWindows(mr, nrYmm, false);
+
+    /// <summary>When <paramref name="overwrite"/> the SAVE writes C = acc (store only, no load+add) — used
+    /// for the FIRST K-panel so the caller can skip the ZeroCBlock zero-pass + the panel-0 C read-back.
+    /// (True non-temporal stores don't fit: C is L2-resident and RMW'd across K-panels.)</summary>
+    internal static byte[] EmitFp32TileWindows(int mr, int nrYmm, bool overwrite)
     {
         const int RCX = 1, RDX = 2, R8 = 8, R9 = 9, R10 = 10, R11 = 11, RSP = 4;
         int accN = mr * nrYmm;          // must be <= 12
@@ -102,15 +107,19 @@ internal static class MachineCodeFmaKernel
         asm.DecReg(R10);
         asm.JnzLabel32(loop);
 
-        // SAVE C += acc (row-major). r11 walks c by r9 (ldc bytes). ymm12 free after the K-loop.
+        // SAVE C (row-major). r11 walks c by r9 (ldc bytes). ymm12 free after the K-loop.
+        // overwrite: C = acc (first K-panel, no read). else: C += acc (accumulate across panels).
         asm.MovRegReg(R11, R8);
         int cTmp = bBase;
         for (int r = 0; r < mr; r++)
         {
             for (int j = 0; j < nrYmm; j++)
             {
-                asm.VmovupsLoad(cTmp, R11, (sbyte)(j * 32));
-                asm.Vaddps(r * nrYmm + j, r * nrYmm + j, cTmp);
+                if (!overwrite)
+                {
+                    asm.VmovupsLoad(cTmp, R11, (sbyte)(j * 32));
+                    asm.Vaddps(r * nrYmm + j, r * nrYmm + j, cTmp);
+                }
                 asm.VmovupsStore(R11, (sbyte)(j * 32), r * nrYmm + j);
             }
             if (r < mr - 1) asm.AddRegReg(R11, R9);

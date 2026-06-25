@@ -102,6 +102,38 @@ internal static class GotoGemmFp32
         return (delegate* unmanaged<float*, float*, float*, long, long, void>)(void*)s_kernel;
     }
 
+    // Overwrite variant: C = acc (no read+add). Used for the FIRST K-panel so callers skip the ZeroCBlock
+    // zero-pass + the panel-0 C read-back.
+    private static IntPtr s_kernelOw;
+    private static ExecutableMemory? s_kernelOwMem;
+    private static int s_kernelOwInit;
+
+    private static unsafe delegate* unmanaged<float*, float*, float*, long, long, void> KernelOw()
+    {
+        if (Volatile.Read(ref s_kernelOwInit) == 0)
+        {
+            lock (typeof(GotoGemmFp32))
+            {
+                if (s_kernelOwInit == 0)
+                {
+                    var code = MachineCodeFmaKernel.EmitFp32TileWindows(Mr, NrYmm, true);
+                    s_kernelOwMem = ExecutableMemory.TryAllocate(code);
+                    s_kernelOw = s_kernelOwMem?.Pointer ?? IntPtr.Zero;
+                    Volatile.Write(ref s_kernelOwInit, 1);
+                }
+            }
+        }
+        return (delegate* unmanaged<float*, float*, float*, long, long, void>)(void*)s_kernelOw;
+    }
+
+    /// <summary>Zero only the M-tail rows + N-tail cols of a C block (the kernel overwrites the aligned
+    /// Mr×Nr interior on the first K-panel; only the scalar-tail regions still need pre-zeroing).</summary>
+    private static unsafe void ZeroTailStrips(float* c, int ldc, int ic, int jc, int effMc, int effNc, int mFull, int nFull)
+    {
+        for (int r = mFull; r < effMc; r++) { float* cr = c + (long)(ic + r) * ldc + jc; for (int col = 0; col < effNc; col++) cr[col] = 0f; }
+        for (int r = 0; r < mFull; r++) { float* cr = c + (long)(ic + r) * ldc + jc + nFull; for (int col = nFull; col < effNc; col++) cr[col] = 0f; }
+    }
+
     /// <summary>True when the machine-code microkernel is available on this CPU/OS (AVX2+FMA, Windows x64).</summary>
     internal static unsafe bool IsAvailable => MachineKernelGemm.IsFp32Available && Kernel() != null;
 
@@ -243,7 +275,7 @@ internal static class GotoGemmFp32
         {
             fixed (float* pa = paArr, pb = pbArr)
             {
-                var kern = Kernel();
+                var kAcc = Kernel(); var kOw = KernelOw();
                 bool timing = s_timing;
                 for (int pc = 0; pc < k; pc += kc)
                 {
@@ -262,7 +294,10 @@ internal static class GotoGemmFp32
                     }
                     long tB = timing ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                     PackA6(a, lda, pa, ic, pc, effKc, mTiles); // SIMD A-pack (8x8 AVX2 transpose; scalar fallback)
-                    if (pc == 0) ZeroCBlock(c, ldc, ic, jc, effMc, effNc);
+                    // First K-panel: overwrite kernel (C = acc) + zero only the scalar-tail strips → skip the
+                    // full ZeroCBlock zero-pass + the panel-0 C read-back. Later panels accumulate.
+                    var kern = pc == 0 ? kOw : kAcc;
+                    if (pc == 0) ZeroTailStrips(c, ldc, ic, jc, effMc, effNc, mFull, nFull);
                     long t1 = timing ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                     for (int nt = 0; nt < nTiles; nt++)
                     {
@@ -366,8 +401,8 @@ internal static class GotoGemmFp32
             fixed (float* pa = paArr)
             {
                 PackA6(a, lda, pa, ic, pc, effKc, mTiles);
-                if (firstPc) ZeroCBlock(c, ldc, ic, jc, effMc, effNc);
-                var kern = Kernel();
+                var kern = firstPc ? KernelOw() : Kernel();    // first panel overwrites C; later accumulate
+                if (firstPc) ZeroTailStrips(c, ldc, ic, jc, effMc, effNc, mFull, nFull);
                 for (int nt = 0; nt < nTiles; nt++)
                 {
                     float* bp = pkB + (long)nt * kc * Nr; int col0 = jc + nt * Nr;
@@ -469,12 +504,13 @@ internal static class GotoGemmFp32
         {
             fixed (float* pa = paArr)
             {
-                var kern = Kernel();
+                var kAcc = Kernel(); var kOw = KernelOw();
                 for (int p = 0, pc = 0; pc < k; p++, pc += kc)
                 {
                     int effKc = Math.Min(kc, k - pc);
                     PackA6(a, lda, pa, ic, pc, effKc, mTiles); // SIMD A-pack (8x8 AVX2 transpose; scalar fallback)
-                    if (pc == 0) ZeroCBlock(c, ldc, ic, jc, effMc, effNc);
+                    var kern = pc == 0 ? kOw : kAcc;           // first panel overwrites C; later panels accumulate
+                    if (pc == 0) ZeroTailStrips(c, ldc, ic, jc, effMc, effNc, mFull, nFull);
                     for (int nt = 0; nt < nTiles; nt++)
                     {
                         float* bp = packedB + (long)p * nTiles * kc * Nr + (long)nt * kc * Nr; int col0 = jc + nt * Nr;
