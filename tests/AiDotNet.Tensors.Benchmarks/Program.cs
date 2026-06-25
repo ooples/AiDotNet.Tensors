@@ -140,6 +140,12 @@ class Program
             return;
         }
 
+        if (args[0] == "--ab-shortm")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.ShortMBench();
+            return;
+        }
+
         if (args[0] == "--profile-gemm")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.ProfileGemm();

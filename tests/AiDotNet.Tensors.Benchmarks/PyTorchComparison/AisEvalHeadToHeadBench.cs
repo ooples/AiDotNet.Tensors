@@ -1258,6 +1258,81 @@ internal static class AisEvalHeadToHeadBench
         }
     }
 
+    /// <summary>
+    /// #24 short-M diagnosis: sweep M at fixed wide-N (the DiT MLP shape N=4608, K=1152) measuring our raw
+    /// per-tile GEMM (GotoGemmFp32.RunParallel) vs MKL — to see WHERE throughput falls off vs M (a cliff at
+    /// short M = the short-M problem) and quantify the gap. Plus the pack-vs-kernel split at M=256 (is short-M
+    /// pack-bound or kernel-bound?). Run: --ab-shortm.
+    /// </summary>
+    public static unsafe void ShortMBench()
+    {
+        torch.set_grad_enabled(false);
+        int P = Environment.ProcessorCount; torch.set_num_threads(P);
+        int N = 4608, K = 1152;
+        var Ms = new[] { 64, 128, 256, 512, 1024, 2048 };
+        var rng = new Random(7);
+        static float[] R(long n, Random r) { var a = new float[n]; for (long i = 0; i < n; i++) a[i] = (float)(r.NextDouble() - 0.5); return a; }
+        float[] Bw = R((long)K * N, rng);
+        using var tB = torch.tensor(Bw).reshape(K, N);
+        { using var wa = torch.randn(1024, K); var ww = Stopwatch.StartNew(); while (ww.ElapsedMilliseconds < 1200) { using var _ = torch.matmul(wa, tB); } }
+        Console.WriteLine($"=== short-M sweep N={N} K={K}: ours per-tile (RunParallel) vs MKL, cores={P} ===");
+        double Min(Action a, int reps) { double best = double.MaxValue; for (int r = 0; r < reps; r++) { var sw = Stopwatch.StartNew(); int q = 0; do { a(); q++; } while (sw.Elapsed.TotalMilliseconds < 40); sw.Stop(); best = Math.Min(best, sw.Elapsed.TotalMilliseconds / q); } return best; }
+        foreach (int M in Ms)
+        {
+            float[] A = R((long)M * K, rng); float[] C = new float[(long)M * N];
+            using var tA = torch.tensor(A).reshape(M, K);
+            var (mc, nc, kc) = AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.ChooseParallelBlocks(M, N);
+            double gf = 2.0 * M * N * K / 1e9;
+            double pt, mkl;
+            fixed (float* pa = A, pb = Bw, pc = C)
+            {
+                var paL = (nint)pa; var pbL = (nint)pb; var pcL = (nint)pc;
+                pt = Min(() => AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.RunParallel((float*)paL, K, (float*)pbL, N, (float*)pcL, N, M, N, K, mc, nc, kc), 6);
+            }
+            mkl = Min(() => { using var _ = torch.matmul(tA, tB); }, 6);
+            double ptGf = gf / (pt / 1000), mklGf = gf / (mkl / 1000);
+            Console.WriteLine($"M={M,4}: pertile={ptGf,6:F0}GF  MKL={mklGf,6:F0}GF  pt/MKL={ptGf / mklGf * 100,4:F0}%   (mc={mc} nc={nc} kc={kc}, B-panel kc*nc={(long)kc * nc * 4 / 1024}KB)");
+        }
+        {
+            int M = 256; float[] A = R((long)M * K, rng); float[] C = new float[(long)M * N];
+            double gf = 2.0 * M * N * K / 1e9;
+            // WRAPPER ISOLATION (same run): dit-mlp2 (M=256,K=4608,N=1152) routes to GotoGemm in BOTH the
+            // engine and direct paths (BeatsPackBoth: k>=2n) → direct-vs-engine is the pure engine wrapper
+            // (output alloc + dispatch + GC), no routing confound. torch is wrapped too (fair).
+            {
+                int m2 = 256, k2 = 4608, n2 = 1152; double gf2 = 2.0 * m2 * n2 * k2 / 1e9;
+                float[] A2 = R((long)m2 * k2, rng), B2 = R((long)k2 * n2, rng), C2 = new float[(long)m2 * n2];
+                var (mc2, nc2, kc2) = AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.ChooseParallelBlocks(m2, n2);
+                var engine = new CpuEngine();
+                var ea = Tensor<float>.CreateRandom(m2, k2); var eb = Tensor<float>.CreateRandom(k2, n2);
+                using var t2a = torch.tensor(A2).reshape(m2, k2); using var t2b = torch.tensor(B2).reshape(k2, n2);
+                for (int w = 0; w < 5; w++) { var _ = engine.TensorMatMul(ea, eb); using var __ = torch.matmul(t2a, t2b); }
+                double dir2; fixed (float* pa = A2, pb = B2, pc = C2) { var paL = (nint)pa; var pbL = (nint)pb; var pcL = (nint)pc; dir2 = Min(() => AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.RunParallel((float*)paL, k2, (float*)pbL, n2, (float*)pcL, n2, m2, n2, k2, mc2, nc2, kc2), 6); }
+                double eng2 = Min(() => { var _ = engine.TensorMatMul(ea, eb); }, 6);
+                double mkl2 = Min(() => { using var _ = torch.matmul(t2a, t2b); }, 6);
+                Console.WriteLine($"--- WRAPPER (dit-mlp2 256x1152x4608, both GotoGemm): direct={gf2 / (dir2 / 1000):F0}GF  engine={gf2 / (eng2 / 1000):F0}GF  MKL={gf2 / (mkl2 / 1000):F0}GF  direct/engine={(dir2 > 0 ? eng2 / dir2 : 0):F2}x ---");
+            }
+            Console.WriteLine($"--- M=256 blocking sweep (mc x nc, kc=256): tiles=ceil(256/mc)*ceil(4608/nc) vs 128 cores ---");
+            foreach (int mcv in new[] { 32, 48, 64, 96, 128 })
+                foreach (int ncv in new[] { 64, 128, 256, 512 })
+                {
+                    long panel = (long)256 * ncv * 4;
+                    if (panel > 700 * 1024) continue;
+                    int tiles = ((256 + mcv - 1) / mcv) * ((N + ncv - 1) / ncv);
+                    double t; fixed (float* pa = A, pb = Bw, pc = C) { var paL = (nint)pa; var pbL = (nint)pb; var pcL = (nint)pc; t = Min(() => AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.RunParallel((float*)paL, K, (float*)pbL, N, (float*)pcL, N, M, N, K, mcv, ncv, 256), 5); }
+                    Console.WriteLine($"   mc={mcv,3} nc={ncv,3}: {gf / (t / 1000),6:F0}GF  tiles={tiles,4}  Bpanel={(long)256 * ncv * 4 / 1024}KB");
+                }
+            var (mc, nc, kc) = AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.ChooseParallelBlocks(M, N);
+            AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.s_timing = true;
+            AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.ResetTiming();
+            fixed (float* pa = A, pb = Bw, pc = C)
+                for (int it = 0; it < 50; it++) AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.RunParallel(pa, K, pb, N, pc, N, M, N, K, mc, nc, kc);
+            AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.s_timing = false;
+            Console.WriteLine($"--- M=256 pack-vs-kernel at default mc={mc} nc={nc} kc={kc} (summed across workers) ---");
+            AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.ReportTiming();
+        }
+    }
+
     private static (double median, double p95) TimeAi(Func<Tensor<float>> forward)
         => MeasureRobust(() => forward());
 

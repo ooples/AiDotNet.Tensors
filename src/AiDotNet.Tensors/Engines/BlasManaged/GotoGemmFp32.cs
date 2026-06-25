@@ -61,6 +61,21 @@ internal static class GotoGemmFp32
         int kc = s_kcOverride > 0 ? s_kcOverride : ParallelKc;
         if (m >= 1536 && n >= 1536) return (192, 256, kc); // large square
         if (m >= 640 && n >= 640) return (96, 128, kc);    // medium square
+        if (m <= 512)
+        {
+            // Short-M (the DiT/transformer batch regime). The old (120,128) split m=256 into 120+120+16
+            // (load imbalance) and, for wide-N, made too few balanced tiles. Use a NARROW nc=64 (small
+            // L2-resident B-panel + more N-tiles) and pick mc to fill the cores with BALANCED tiles while
+            // keeping mc in [64,128] for microkernel efficiency (the sweep craters below 48 and peaks ~96-128).
+            // Measured 1.2x at m=256,n=4608 (374→455 GF) vs the old (120,128).
+            int cores = CpuParallelSettings.MaxDegreeOfParallelism;
+            if (cores <= 0) cores = System.Environment.ProcessorCount;
+            int nc = 64;
+            int jc = (n + nc - 1) / nc;
+            int ic = System.Math.Max(1, (cores + jc - 1) / jc); // ceil(cores/jc) row-blocks to fill the cores
+            int mc = System.Math.Min(128, System.Math.Max(64, (m + ic - 1) / ic));
+            return (mc, nc, kc);
+        }
         return (120, 128, kc);                              // skewed / smaller
     }
 
