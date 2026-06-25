@@ -121,6 +121,44 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
                     "DeformableConv2D");
     }
 
+    // ---- DeformableConv2DGrouped (DCNv3): single-launch fused grouped GPU kernel vs CPU oracle (#1691) ----
+    [SkippableTheory]
+    [InlineData(2, 2)]   // grouped, one deform group per output group
+    [InlineData(4, 4)]   // depthwise-ish
+    [InlineData(2, 1)]   // shared deform group across output groups
+    public void DeformableConv2DGrouped_Gpu_MatchesCpu(int groups, int deformGroups)
+    {
+        SkipIfUnavailable();
+        const int B = 1, inC = 8, outC = 8, H = 6, W = 6, k = 3, kk = 9;
+        int inCpg = inC / groups;
+        var input = R(20, B, inC, H, W);
+        var kernel = R(21, outC, inCpg, k, k);                 // [outC, inC/groups, kH, kW]
+        var offset = R(22, B, 2 * kk * deformGroups, H, W);    // [B, 2*kH*kW*deformGroups, H, W]
+        int[] stride = { 1, 1 }, pad = { 1, 1 }, dil = { 1, 1 };
+        AssertClose(
+            _cpu.DeformableConv2DGrouped(input, kernel, offset, null, stride, pad, dil, groups, deformGroups),
+            _gpu.DeformableConv2DGrouped(input, kernel, offset, null, stride, pad, dil, groups, deformGroups),
+            $"DeformableConv2DGrouped(g={groups},dg={deformGroups})");
+    }
+
+    // DCNv3 with modulation mask — exercises the masked single-launch grouped GPU path.
+    [SkippableFact]
+    public void DeformableConv2DGroupedWithMask_Gpu_MatchesCpu()
+    {
+        SkipIfUnavailable();
+        const int B = 1, inC = 8, outC = 8, H = 6, W = 6, k = 3, kk = 9, groups = 2, deformGroups = 2;
+        int inCpg = inC / groups;
+        var input = R(23, B, inC, H, W);
+        var kernel = R(24, outC, inCpg, k, k);
+        var offset = R(25, B, 2 * kk * deformGroups, H, W);
+        var mask = R(26, B, kk * deformGroups, H, W);
+        int[] stride = { 1, 1 }, pad = { 1, 1 }, dil = { 1, 1 };
+        AssertClose(
+            _cpu.DeformableConv2DGrouped(input, kernel, offset, mask, stride, pad, dil, groups, deformGroups),
+            _gpu.DeformableConv2DGrouped(input, kernel, offset, mask, stride, pad, dil, groups, deformGroups),
+            "DeformableConv2DGroupedWithMask");
+    }
+
     [SkippableFact]
     public void DeformableConv2DBackwardInput_Gpu_MatchesCpu()
     {

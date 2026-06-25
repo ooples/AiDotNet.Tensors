@@ -8562,11 +8562,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
-    /// Grouped/depthwise deformable convolution (DCNv3). Interim GPU path: per-group composition over the
-    /// validated groups=1 GPU <see cref="DeformableConv2D{T}"/> kernel plus a GPU concat — every group runs a
-    /// real GPU kernel (no CPU fallback). A fused single-launch grouped GPU kernel (passing groups/deformGroups
-    /// straight to the backend with on-hardware parity) is tracked in AiDotNet #1691. The grouped backward is
-    /// inherited from <see cref="CpuEngine"/> and composes over the virtual groups=1 GPU backward kernels.
+    /// Grouped/depthwise deformable convolution (DCNv3). Single-launch GPU path: passes groups/deformGroups
+    /// straight to the backend's grouped <c>deformable_conv2d</c> kernel (one launch), which all six backends
+    /// implement with the same blocked offset layout as the CPU reference. Falls back to the CPU fused kernel
+    /// only when GPU is unavailable / inputs are non-4D / a launch throws. The grouped backward is inherited
+    /// from <see cref="CpuEngine"/> and composes over the virtual groups=1 GPU backward kernels.
     /// </summary>
     public override Tensor<T> DeformableConv2DGrouped<T>(
         Tensor<T> input,
@@ -8581,26 +8581,61 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (groups == 1 && deformGroups == 1)
             return DeformableConv2D(input, kernel, offset, mask, stride, padding, dilation);
-        if (!TryGetBackend(out _) || input.Rank != 4 || kernel.Rank != 4)
+        if (!TryGetBackend(out var backend) || input.Rank != 4 || kernel.Rank != 4 || offset.Rank != 4)
             return base.DeformableConv2DGrouped(input, kernel, offset, mask, stride, padding, dilation, groups, deformGroups);
 
-        int inC = input.Shape._dims[1];
-        int outC = kernel.Shape._dims[0];
-        int kk = kernel.Shape._dims[2] * kernel.Shape._dims[3];
-        int inCpg = inC / groups;
-        int outCpg = outC / groups;
-        var parts = new Tensor<T>[groups];
-        for (int g = 0; g < groups; g++)
+        if (stride == null || stride.Length != 2) throw new ArgumentException("Stride must be an array of 2 elements", nameof(stride));
+        if (padding == null || padding.Length != 2) throw new ArgumentException("Padding must be an array of 2 elements", nameof(padding));
+        if (dilation == null || dilation.Length != 2) throw new ArgumentException("Dilation must be an array of 2 elements", nameof(dilation));
+
+        int batch = input.Shape._dims[0];
+        int inChannels = input.Shape._dims[1];
+        int inHeight = input.Shape._dims[2];
+        int inWidth = input.Shape._dims[3];
+        int outChannels = kernel.Shape._dims[0];   // kernel: [outC, inC/groups, kH, kW]
+        int kernelH = kernel.Shape._dims[2];
+        int kernelW = kernel.Shape._dims[3];
+
+        int outHeight = (inHeight + 2 * padding[0] - dilation[0] * (kernelH - 1) - 1) / stride[0] + 1;
+        int outWidth = (inWidth + 2 * padding[1] - dilation[1] * (kernelW - 1) - 1) / stride[1] + 1;
+        if (outHeight <= 0 || outWidth <= 0)
+            return base.DeformableConv2DGrouped(input, kernel, offset, mask, stride, padding, dilation, groups, deformGroups);
+
+        int outputSize = batch * outChannels * outHeight * outWidth;
+
+        using var inputBuffer = GetOrAllocateBuffer(backend, input);
+        using var weightsBuffer = GetOrCacheWeightBuffer(backend, kernel.GetDataArray(), PersistentTensorRole.Weights);
+        using var offsetsBuffer = GetOrAllocateBuffer(backend, offset);
+        using var outputBuffer = AllocateOutputBuffer(backend, outputSize);
+
+        try
         {
-            int dg = deformGroups == 1 ? 0 : g * deformGroups / groups;
-            var inG = input.Slice(1, g * inCpg, (g + 1) * inCpg);
-            var kG = kernel.Slice(0, g * outCpg, (g + 1) * outCpg);
-            var offG = offset.Slice(1, dg * 2 * kk, (dg + 1) * 2 * kk);
-            var mkG = mask?.Slice(1, dg * kk, (dg + 1) * kk);
-            // virtual dispatch -> the groups=1 GPU DeformableConv2D kernel above
-            parts[g] = DeformableConv2D(inG, kG, offG, mkG, stride, padding, dilation);
+            OwnedBuffer? maskBuffer = mask != null ? GetOrAllocateBuffer(backend, mask) : null;
+            try
+            {
+                backend.DeformableConv2D(
+                    inputBuffer.Buffer, weightsBuffer.Buffer, offsetsBuffer.Buffer, maskBuffer?.Buffer, outputBuffer.Buffer,
+                    batch, inChannels, inHeight, inWidth,
+                    outChannels, outHeight, outWidth,
+                    kernelH, kernelW, stride[0], stride[1], padding[0], padding[1],
+                    dilation[0], dilation[1], groups, deformGroups);
+
+                float[] resultFloat = new float[outputSize];
+                backend.DownloadBuffer(outputBuffer.Buffer, resultFloat);
+
+                T[] resultData = DirectGpuEngine.FromFloatArray<T>(resultFloat);
+                return new Tensor<T>(resultData, new[] { batch, outChannels, outHeight, outWidth });
+            }
+            finally
+            {
+                maskBuffer?.Dispose();
+            }
         }
-        return Tensor<T>.Concatenate(parts, axis: 1);
+        catch
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            return base.DeformableConv2DGrouped(input, kernel, offset, mask, stride, padding, dilation, groups, deformGroups);
+        }
     }
 
     /// <summary>
