@@ -132,6 +132,64 @@ internal static class MachineCodeFmaKernel
         return asm.ToArray();
     }
 
+    /// <summary>bf16-B microkernel: C[mr,nr] += packedA(fp32)·packedB(bf16), fp32 accumulate. B is stored
+    /// bf16 (half the bytes → 2× the L2/L3/DRAM bandwidth headroom for the re-read operand); each K-iter
+    /// loads 8 bf16 per nr-YMM (vpmovzxwd m128→8×u32) and widens to fp32 in-register (vpslld 16 — bf16 is
+    /// the high 16 bits of fp32). A stays fp32 (broadcast). Same signature/SAVE as the fp32 kernel; the only
+    /// change is the B load+widen and B advancing nrYmm*16 bytes/iter (half of fp32's nrYmm*32).</summary>
+    internal static byte[] EmitBf16BTileWindows(int mr, int nrYmm, bool overwrite)
+    {
+        const int RCX = 1, RDX = 2, R8 = 8, R9 = 9, R10 = 10, R11 = 11, RSP = 4;
+        int accN = mr * nrYmm;
+        int bBase = 12;
+        int aReg = 12 + nrYmm;
+        var asm = new X64Assembler();
+
+        asm.MovRegFromRsp(R10, 0x28);
+        asm.SubRsp(0xA0);
+        for (int i = 0; i < 10; i++) asm.VmovupsXmmStore(RSP, (sbyte)(i * 0x10), 6 + i);
+        for (int i = 0; i < accN; i++) asm.Vxorps(i);
+
+        int loop = asm.NewLabel();
+        asm.MarkLabel(loop);
+        for (int j = 0; j < nrYmm; j++)
+        {
+            asm.VpmovzxwdLoad(bBase + j, RDX, (sbyte)(j * 16)); // 8 bf16 → 8×u32 (bf16 in low 16)
+            asm.Vpslld(bBase + j, bBase + j, 16);               // → fp32 (bf16 in high 16)
+        }
+        for (int r = 0; r < mr; r++)
+        {
+            asm.VbroadcastSs(aReg, RCX, (sbyte)(r * 4));
+            for (int j = 0; j < nrYmm; j++) asm.Vfmadd231ps(r * nrYmm + j, aReg, bBase + j);
+        }
+        asm.AddRegImm8(RCX, (sbyte)(mr * 4));
+        asm.AddRegImm8(RDX, (sbyte)(nrYmm * 16)); // bf16 B: half the bytes/iter vs fp32's nrYmm*32
+        asm.DecReg(R10);
+        asm.JnzLabel32(loop);
+
+        asm.MovRegReg(R11, R8);
+        int cTmp = bBase;
+        for (int r = 0; r < mr; r++)
+        {
+            for (int j = 0; j < nrYmm; j++)
+            {
+                if (!overwrite)
+                {
+                    asm.VmovupsLoad(cTmp, R11, (sbyte)(j * 32));
+                    asm.Vaddps(r * nrYmm + j, r * nrYmm + j, cTmp);
+                }
+                asm.VmovupsStore(R11, (sbyte)(j * 32), r * nrYmm + j);
+            }
+            if (r < mr - 1) asm.AddRegReg(R11, R9);
+        }
+
+        for (int i = 0; i < 10; i++) asm.VmovupsXmmLoad(6 + i, RSP, (sbyte)(i * 0x10));
+        asm.AddRsp(0xA0);
+        asm.Vzeroupper();
+        asm.Ret();
+        return asm.ToArray();
+    }
+
     internal static byte[] EmitFp64_6x8_PackedWindows()
     {
         const int RCX = 1, RDX = 2, R8 = 8, R9 = 9, R10 = 10, R11 = 11, RAX = 0, RSP = 4;

@@ -126,6 +126,29 @@ internal static class GotoGemmFp32
         return (delegate* unmanaged<float*, float*, float*, long, long, void>)(void*)s_kernelOw;
     }
 
+    // bf16-B kernels (B stored bf16 → half the bytes; A fp32; fp32 accumulate). #19 bandwidth lever.
+    private static IntPtr s_kBf16, s_kBf16Ow;
+    private static ExecutableMemory? s_kBf16Mem, s_kBf16OwMem;
+    private static int s_kBf16Init, s_kBf16OwInit;
+    private static unsafe delegate* unmanaged<float*, float*, float*, long, long, void> KernelBf16(bool ow)
+    {
+        ref int init = ref (ow ? ref s_kBf16OwInit : ref s_kBf16Init);
+        if (Volatile.Read(ref init) == 0)
+            lock (typeof(GotoGemmFp32))
+                if (init == 0)
+                {
+                    var code = MachineCodeFmaKernel.EmitBf16BTileWindows(Mr, NrYmm, ow);
+                    var mem = ExecutableMemory.TryAllocate(code);
+                    if (ow) { s_kBf16OwMem = mem; s_kBf16Ow = mem?.Pointer ?? IntPtr.Zero; }
+                    else { s_kBf16Mem = mem; s_kBf16 = mem?.Pointer ?? IntPtr.Zero; }
+                    Volatile.Write(ref init, 1);
+                }
+        return (delegate* unmanaged<float*, float*, float*, long, long, void>)(void*)(ow ? s_kBf16Ow : s_kBf16);
+    }
+
+    /// <summary>Truncate fp32→bf16 (take the high 16 bits). Used to pack B as bf16 for the bf16-B GEMM.</summary>
+    private static ushort ToBf16(float f) => (ushort)(System.BitConverter.SingleToUInt32Bits(f) >> 16);
+
     /// <summary>Zero only the M-tail rows + N-tail cols of a C block (the kernel overwrites the aligned
     /// Mr×Nr interior on the first K-panel; only the scalar-tail regions still need pre-zeroing).</summary>
     private static unsafe void ZeroTailStrips(float* c, int ldc, int ic, int jc, int effMc, int effNc, int mFull, int nFull)
@@ -583,6 +606,86 @@ internal static class GotoGemmFp32
                 }
             }
         }
+    }
+
+    /// <summary>bf16-B tile: like RunTile but B is packed as bf16 (half the bytes → 2× bandwidth headroom),
+    /// A stays fp32, fp32 accumulate. Precision opt-in (bf16 ~3 sig digits). Tails are exact fp32 (small).</summary>
+    internal static unsafe void RunTileBf16(float* a, int lda, float* b, int ldb, float* c, int ldc,
+        int ic, int jc, int effMc, int effNc, int k, int mc, int nc, int kc)
+    {
+        int nFull = effNc - (effNc % Nr); int nTiles = nFull / Nr;
+        int mFull = effMc - (effMc % Mr); int mTiles = mFull / Mr;
+        float[] paArr = ArrayPool<float>.Shared.Rent(mc * kc + 8);
+        ushort[] pbArr = ArrayPool<ushort>.Shared.Rent(kc * nc);
+        try
+        {
+            fixed (float* pa = paArr) fixed (ushort* pbb = pbArr)
+            {
+                var kAcc = KernelBf16(false); var kOw = KernelBf16(true);
+                for (int pc = 0; pc < k; pc += kc)
+                {
+                    int effKc = Math.Min(kc, k - pc);
+                    for (int nt = 0; nt < nTiles; nt++)
+                    {
+                        ushort* dst = pbb + (long)nt * effKc * Nr; int col0 = jc + nt * Nr;
+                        if (Avx2.IsSupported && Nr == 16)
+                        {
+                            // SIMD fp32→bf16 truncation: shift each fp32 right 16 (bf16 = high 16 bits), pack
+                            // 8+8 u32→16 u16 (vpackusdw — exact since hi16=0 after the shift), then fix the
+                            // AVX2 in-lane pack order with vpermq [0,2,1,3]=0xD8 → 16 bf16 in column order.
+                            for (int kk = 0; kk < effKc; kk++)
+                            {
+                                float* brow = b + (long)(pc + kk) * ldb + col0; ushort* d = dst + (long)kk * Nr;
+                                var s0 = Avx2.ShiftRightLogical(Avx.LoadVector256(brow).AsUInt32(), 16);
+                                var s1 = Avx2.ShiftRightLogical(Avx.LoadVector256(brow + 8).AsUInt32(), 16);
+                                var packed = Avx2.PackUnsignedSaturate(s0.AsInt32(), s1.AsInt32());
+                                Avx.Store(d, Avx2.Permute4x64(packed.AsUInt64(), 0xD8).AsUInt16());
+                            }
+                        }
+                        else
+                        {
+                            for (int kk = 0; kk < effKc; kk++)
+                            {
+                                float* brow = b + (long)(pc + kk) * ldb + col0; ushort* d = dst + (long)kk * Nr;
+                                for (int col = 0; col < Nr; col++) d[col] = ToBf16(brow[col]);
+                            }
+                        }
+                    }
+                    PackA6(a, lda, pa, ic, pc, effKc, mTiles);
+                    var kern = pc == 0 ? kOw : kAcc;
+                    if (pc == 0) ZeroTailStrips(c, ldc, ic, jc, effMc, effNc, mFull, nFull);
+                    for (int nt = 0; nt < nTiles; nt++)
+                    {
+                        float* bp = (float*)(pbb + (long)nt * effKc * Nr); int col0 = jc + nt * Nr;
+                        for (int mt = 0; mt < mTiles; mt++)
+                        {
+                            float* ap = pa + (long)mt * effKc * Mr;
+                            float* cp = c + (long)(ic + mt * Mr) * ldc + col0;
+                            kern(ap, bp, cp, (long)ldc * 4, effKc);
+                        }
+                    }
+                    ScalarTails(a, lda, b, ldb, c, ldc, ic, jc, effMc, effNc, mFull, nFull, pc, effKc);
+                }
+            }
+        }
+        finally { ArrayPool<float>.Shared.Return(paArr); ArrayPool<ushort>.Shared.Return(pbArr); }
+    }
+
+    /// <summary>Parallel bf16-B GEMM (per-tile, B bf16) — the #19 bandwidth-doubler measurement path.</summary>
+    internal static unsafe void RunParallelBf16(float* a, int lda, float* b, int ldb, float* c, int ldc,
+        int m, int n, int k, int mc, int nc, int kc)
+    {
+        int numIc = (m + mc - 1) / mc, numJc = (n + nc - 1) / nc, totalTiles = numIc * numJc;
+        if (totalTiles <= 1) { RunTileBf16(a, lda, b, ldb, c, ldc, 0, 0, m, n, k, mc, nc, kc); return; }
+        nint ai = (nint)a, bi = (nint)b, ci = (nint)c;
+        int numIcL = numIc, mcL = mc, ncL = nc, kcL = kc, mL = m, nL = n, kL = k, ldaL = lda, ldbL = ldb, ldcL = ldc;
+        CpuParallelSettings.ParallelForOrSerial(0, totalTiles, (long)m * n * k, tileIdx =>
+        {
+            int ic = (int)(tileIdx % numIcL) * mcL; int jc = (int)(tileIdx / numIcL) * ncL;
+            int effMc = Math.Min(mcL, mL - ic); int effNc = Math.Min(ncL, nL - jc);
+            if (effMc <= 0 || effNc <= 0) return;
+            RunTileBf16((float*)ai, ldaL, (float*)bi, ldbL, (float*)ci, ldcL, ic, jc, effMc, effNc, kL, mcL, ncL, kcL);
+        }, deterministicSafe: true);
     }
 
     private static unsafe void ZeroCBlock(float* c, int ldc, int ic, int jc, int effMc, int effNc)

@@ -306,6 +306,14 @@ internal sealed class X64Assembler
     /// <summary>vxorps dst, dst, dst (zero a ymm). VEX.256.0F.WIG 57 /r — cheaper/cleaner than vxorpd for FP32 accumulators.</summary>
     internal void Vxorps(int dst) => VexRR(Map0F, PpNone, 0, 1, 0x57, dst, dst, dst);
 
+    /// <summary>vpmovzxwd ymm_dst, [base+disp8] — load 8×u16 (m128) and zero-extend to 8×u32 (ymm).
+    /// VEX.256.66.0F38.WIG 33 /r. Used to widen bf16 inputs (then vpslld 16 → fp32) in the bf16 microkernel.</summary>
+    internal void VpmovzxwdLoad(int dst, int baseReg, sbyte disp8) => VexMemDisp8(Map0F38, Pp66, 0, 1, 0x33, dst, baseReg, disp8);
+
+    /// <summary>vpslld ymm_dst, ymm_src, imm8 — shift 8×u32 left by imm. VEX.NDD.256.66.0F.WIG 72 /6 ib
+    /// (dst in VEX.vvvv, src in rm, /6 in modrm.reg). bf16→fp32: vpmovzxwd then vpslld(.,16).</summary>
+    internal void Vpslld(int dst, int src, byte imm) { VexRR(Map0F, Pp66, 0, 1, 0x72, 6, dst, src); B(imm); }
+
     // ── EVEX register-register form (#378: AVX-512-BF16) ───────────────────────
     // 4-byte EVEX: 62 P0 P1 P2  opcode  ModRM(mod=11). Limited to ymm/zmm 0..15
     // (no mask / broadcast / zeroing), which is all the BF16 microkernel needs —

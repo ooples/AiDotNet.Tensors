@@ -648,6 +648,56 @@ internal static class AisEvalHeadToHeadBench
     }
 
     /// <summary>
+    /// #19 bf16-B vs fp32 GEMM (the bandwidth doubler): B stored bf16 (half the bytes), A fp32, fp32
+    /// accumulate. Measures whether halving the re-read operand's bytes beats fp32 — and MKL's fp32 — on
+    /// the memory-bound squares. Reports bf16/fp32, bf16/MKL, and the bf16 rounding error. Run: --ab-bf16.
+    /// </summary>
+    public static unsafe void GotoBf16Bench()
+    {
+        torch.set_grad_enabled(false);
+        int P = Environment.ProcessorCount;
+        if (!AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.IsAvailable) { Console.WriteLine("not available"); return; }
+        int saved = CpuParallelSettings.MaxDegreeOfParallelism;
+        CpuParallelSettings.MaxDegreeOfParallelism = P;
+        var rng = new Random(13);
+        var shapes = new (int M, int N, int K, string tag)[] { (1024, 1024, 1024, "sq1024"), (2048, 2048, 2048, "sq2048"), (4096, 4096, 4096, "sq4096") };
+        Console.WriteLine($"=== bf16-B vs fp32 GEMM (bandwidth doubler), cores={P} ===");
+        try
+        {
+            torch.set_num_threads(P);
+            { var wa = torch.rand(2048, 2048); var wb = torch.rand(2048, 2048); var ww = Stopwatch.StartNew(); while (ww.ElapsedMilliseconds < 1500) { using var _ = torch.matmul(wa, wb); } }
+            foreach (var (M, N, K, tag) in shapes)
+            {
+                var A = new float[(long)M * K]; var B = new float[(long)K * N]; var Cf = new float[(long)M * N]; var Cb = new float[(long)M * N];
+                for (int i = 0; i < A.Length; i++) A[i] = (float)(rng.NextDouble() - 0.5);
+                for (int i = 0; i < B.Length; i++) B[i] = (float)(rng.NextDouble() - 0.5);
+                var (mc, nc, kc) = AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.ChooseParallelBlocks(M, N);
+                double gf = 2.0 * M * N * K / 1e9, maxRel = 0, f32 = double.PositiveInfinity, bf16 = double.PositiveInfinity, mkl = double.PositiveInfinity;
+                var ta = torch.rand(M, K); var tb = torch.rand(K, N);
+                fixed (float* pa = A, pb = B, pcf = Cf, pcb = Cb)
+                {
+                    AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.RunParallel(pa, K, pb, N, pcf, N, M, N, K, mc, nc, kc);
+                    AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.RunParallelBf16(pa, K, pb, N, pcb, N, M, N, K, mc, nc, kc);
+                    // Frobenius-relative error ||Cb-Cf||/||Cf|| — per-element relative blows up on near-zero dot
+                    // products (random A,B cancel to ~0), so it's a bogus accuracy metric for GEMM.
+                    double sumE2 = 0, sumC2 = 0;
+                    for (long i = 0; i < (long)M * N; i += 7) { double e = (double)Cb[i] - Cf[i]; sumE2 += e * e; sumC2 += (double)Cf[i] * Cf[i]; }
+                    maxRel = sumC2 > 0 ? Math.Sqrt(sumE2 / sumC2) : 0;
+                    for (int r = 0; r < 8; r++)
+                    {
+                        { var sw = Stopwatch.StartNew(); int n = 0; do { AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.RunParallel(pa, K, pb, N, pcf, N, M, N, K, mc, nc, kc); n++; } while (sw.Elapsed.TotalMilliseconds < 30); sw.Stop(); f32 = Math.Min(f32, sw.Elapsed.TotalMilliseconds / n); }
+                        { var sw = Stopwatch.StartNew(); int n = 0; do { AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.RunParallelBf16(pa, K, pb, N, pcb, N, M, N, K, mc, nc, kc); n++; } while (sw.Elapsed.TotalMilliseconds < 30); sw.Stop(); bf16 = Math.Min(bf16, sw.Elapsed.TotalMilliseconds / n); }
+                        { var sw = Stopwatch.StartNew(); int n = 0; do { using var _ = torch.matmul(ta, tb); n++; } while (sw.Elapsed.TotalMilliseconds < 30); sw.Stop(); mkl = Math.Min(mkl, sw.Elapsed.TotalMilliseconds / n); }
+                    }
+                }
+                double f32Gf = gf / (f32 / 1000), bf16Gf = gf / (bf16 / 1000), mklGf = gf / (mkl / 1000);
+                Console.WriteLine($"{tag,-8} fp32={f32Gf,7:F0}  bf16={bf16Gf,7:F0}  MKL={mklGf,7:F0}   bf16/fp32={(f32Gf > 0 ? bf16Gf / f32Gf : 0),4:F2}x  bf16/MKL={(mklGf > 0 ? bf16Gf / mklGf * 100 : 0),4:F0}%   bf16-relErr={maxRel:E2}");
+            }
+        }
+        finally { CpuParallelSettings.MaxDegreeOfParallelism = saved; }
+    }
+
+    /// <summary>
     /// Tight engine.TensorMatMul loop for an external profiler (PerfView / dotnet-trace) to find where the
     /// per-call time ACTUALLY goes (GEMM kernel vs output alloc vs dispatch vs GC) — no guessing. Shape via
     /// env PROFILE_SHAPE (sq1024 default; dit-attnout / dit-mlp2 / sq2048). Runs PROFILE_SECONDS (default 20).

@@ -122,6 +122,12 @@ class Program
             return;
         }
 
+        if (args[0] == "--ab-bf16")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.GotoBf16Bench();
+            return;
+        }
+
         if (args[0] == "--profile-gemm")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.ProfileGemm();
