@@ -724,25 +724,27 @@ internal static class AisEvalHeadToHeadBench
                     maxRel = Math.Max(maxRel, Math.Abs(s) > 1e-3 ? err / Math.Abs(s) : err);
                 }
 
-                // All through engine.TensorMatMul (same wrapper), interleaved min-of-10: PackBoth (old) /
-                // GotoGemm per-tile (CCX off) / GotoGemm CCX (on) / MKL — the clean A/B for the CCX lever.
-                var B2 = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.s_disableGotoGemm;
+                // All through engine.TensorMatMul (same wrapper), interleaved min-of-10: per-tile / CCX-1D /
+                // CCX-2D / MKL — the clean A/B that decides the production heuristic (1D vs 2D per shape).
+                var prevForce1D = AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_force1D;
                 var ta = torch.rand(M, K); var tb = torch.rand(K, N);
-                double ptMs = double.PositiveInfinity, oldMs = double.PositiveInfinity, mklMs = double.PositiveInfinity, ccxMs = double.PositiveInfinity;
+                double ptMs = double.PositiveInfinity, d1Ms = double.PositiveInfinity, d2Ms = double.PositiveInfinity, mklMs = double.PositiveInfinity;
                 for (int r = 0; r < 10; r++)
                 {
-                    AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.s_disableGotoGemm = true;
-                    { var sw = Stopwatch.StartNew(); int reps = 0; do { var _ = engine.TensorMatMul(ea, eb); reps++; } while (sw.Elapsed.TotalMilliseconds < 30); sw.Stop(); oldMs = Math.Min(oldMs, sw.Elapsed.TotalMilliseconds / reps); }
-                    AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.s_disableGotoGemm = false;
                     AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_disable = true;
                     { var sw = Stopwatch.StartNew(); int reps = 0; do { var _ = engine.TensorMatMul(ea, eb); reps++; } while (sw.Elapsed.TotalMilliseconds < 30); sw.Stop(); ptMs = Math.Min(ptMs, sw.Elapsed.TotalMilliseconds / reps); }
                     AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_disable = false;
-                    { var sw = Stopwatch.StartNew(); int reps = 0; do { var _ = engine.TensorMatMul(ea, eb); reps++; } while (sw.Elapsed.TotalMilliseconds < 30); sw.Stop(); ccxMs = Math.Min(ccxMs, sw.Elapsed.TotalMilliseconds / reps); }
+                    AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_force1D = true;
+                    { var sw = Stopwatch.StartNew(); int reps = 0; do { var _ = engine.TensorMatMul(ea, eb); reps++; } while (sw.Elapsed.TotalMilliseconds < 30); sw.Stop(); d1Ms = Math.Min(d1Ms, sw.Elapsed.TotalMilliseconds / reps); }
+                    AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_force1D = false;
+                    { var sw = Stopwatch.StartNew(); int reps = 0; do { var _ = engine.TensorMatMul(ea, eb); reps++; } while (sw.Elapsed.TotalMilliseconds < 30); sw.Stop(); d2Ms = Math.Min(d2Ms, sw.Elapsed.TotalMilliseconds / reps); }
                     { var sw = Stopwatch.StartNew(); int reps = 0; do { using var _ = torch.matmul(ta, tb); reps++; } while (sw.Elapsed.TotalMilliseconds < 30); sw.Stop(); mklMs = Math.Min(mklMs, sw.Elapsed.TotalMilliseconds / reps); }
                 }
-                AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.s_disableGotoGemm = B2;
-                double ptGf = gf / (ptMs / 1000), oldGf = gf / (oldMs / 1000), mklGf = gf / (mklMs / 1000), ccxGf = gf / (ccxMs / 1000);
-                Console.WriteLine($"{tag,-9} old={oldGf,6:F0}  pertile={ptGf,6:F0}  CCX={ccxGf,6:F0}  MKL={mklGf,6:F0}   CCX/pertile={(ptGf > 0 ? ccxGf / ptGf : 0),4:F2}x  best/MKL={(mklGf > 0 ? Math.Max(ptGf, ccxGf) / mklGf * 100 : 0),3:F0}%  {(maxRel < 1e-3 ? "OK" : "WRONG")}");
+                AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_force1D = prevForce1D;
+                AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_disable = false;
+                double ptGf = gf / (ptMs / 1000), d1Gf = gf / (d1Ms / 1000), d2Gf = gf / (d2Ms / 1000), mklGf = gf / (mklMs / 1000);
+                double best = Math.Max(ptGf, Math.Max(d1Gf, d2Gf));
+                Console.WriteLine($"{tag,-9} pertile={ptGf,6:F0}  CCX1D={d1Gf,6:F0}  CCX2D={d2Gf,6:F0}  MKL={mklGf,6:F0}   1D/pt={(ptGf>0?d1Gf/ptGf:0),4:F2}x  2D/pt={(ptGf>0?d2Gf/ptGf:0),4:F2}x  best/MKL={(mklGf>0?best/mklGf*100:0),3:F0}%  {(maxRel < 1e-3 ? "OK" : "WRONG")}");
             }
         }
         finally { CpuParallelSettings.MaxDegreeOfParallelism = saved; }

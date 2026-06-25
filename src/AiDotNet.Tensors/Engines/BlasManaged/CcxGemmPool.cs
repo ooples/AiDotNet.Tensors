@@ -175,7 +175,7 @@ internal static unsafe class CcxGemmPool
         // Win regime (measured): large + BALANCED squares (CCX 1.12-1.19x on sq2048 = ~46% MKL). Below
         // ~1536 the win is noise-level (±5%) so gate it out to GUARANTEE no regression; skewed/wide-N
         // (DiT) regress and are excluded by the balance check below.
-        if (m < 1536 || n < 1536 || k < 256) return false;
+        if (m < 512 || n < 512 || k < 256) return false;
         if ((long)m * n * k < CcxMinWork) return false;
         if (n > 2 * m || m > 2 * n) return false;            // not balanced → per-tile/PackBoth
         if ((n / _numCcx) < Nr32) return false;              // strips too thin to tile
@@ -184,9 +184,10 @@ internal static unsafe class CcxGemmPool
         const int kc = 256;
         int nc1d = ChooseNc(n);
         bool oneDFits = (long)k * nc1d <= 512L * 1024; // 1D full-K strip <= 2MB
-        // 2D-NUMA when the 1D strip would spill (huge squares) OR forced for A/B. 2D cuts A DRAM re-reads
-        // to gc× (vs numCcx× for 1D) using kc×nBlk B-panels that stay cache-friendly regardless of K.
-        bool use2D = s_force2D || !oneDFits;
+        // 2D-NUMA is the production default: the clean A/B measured 2D 1.66x over per-tile on sq2048 (=92%
+        // MKL) vs 1D's 1.0x — 2D's gc×-A / gr×-B DRAM split + kc×nBlk L2-panels crush the 1D full-M strip.
+        // s_force1D (A/B knob) routes to 1D only where its strip fits; huge shapes always take 2D.
+        bool use2D = !(s_force1D && oneDFits);
         int mc, nc; long need;
         if (use2D)
         {
@@ -228,10 +229,10 @@ internal static unsafe class CcxGemmPool
 
     private static int RoundMr(int x) { int r = (x / 6) * 6; return r < 6 ? 6 : r; }
 
-    /// <summary>A/B knob (env AIDOTNET_CCX_2D=1): force the 2D-NUMA path for all CCX-eligible shapes, to
-    /// compare 1D-N vs 2D directly. Production uses 2D only when the 1D strip would spill.</summary>
-    internal static bool s_force2D =
-        System.Environment.GetEnvironmentVariable("AIDOTNET_CCX_2D") == "1";
+    /// <summary>A/B knob (env AIDOTNET_CCX_1D=1): force the 1D-N path where its strip fits (huge shapes
+    /// still take 2D), to compare against the production 2D default.</summary>
+    internal static bool s_force1D =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_CCX_1D") == "1";
 
     private const int Nr32 = 16;
     // mc: enough ic-blocks for the CCX's lanes (≈2·tpc) while keeping the A-panel cache-friendly.
