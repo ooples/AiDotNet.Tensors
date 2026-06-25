@@ -3,6 +3,7 @@ using System.Buffers;
 using System.Runtime.InteropServices;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 #endif
 using System.Threading;
 using AiDotNet.Tensors.Helpers;
@@ -61,13 +62,13 @@ internal static class GotoGemmFp32
     // per-K-panel Stopwatch deltas summed across worker threads — answers "is the cost packing or
     // the microkernel?" without profiler pseudo-frame ambiguity.
     internal static bool s_timing;
-    internal static long s_packTicks, s_kernTicks;
-    internal static void ResetTiming() { s_packTicks = 0; s_kernTicks = 0; }
+    internal static long s_packTicks, s_kernTicks, s_packBTicks, s_packATicks;
+    internal static void ResetTiming() { s_packTicks = 0; s_kernTicks = 0; s_packBTicks = 0; s_packATicks = 0; }
     internal static void ReportTiming()
     {
         double f = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
         long tot = s_packTicks + s_kernTicks; if (tot == 0) { System.Console.WriteLine("(no timing)"); return; }
-        System.Console.WriteLine($"  pack   = {s_packTicks * f,9:F0} ms  ({100.0 * s_packTicks / tot:F1}%)");
+        System.Console.WriteLine($"  pack   = {s_packTicks * f,9:F0} ms  ({100.0 * s_packTicks / tot:F1}%)  [B={100.0 * s_packBTicks / tot:F1}% A={100.0 * s_packATicks / tot:F1}%]");
         System.Console.WriteLine($"  kernel = {s_kernTicks * f,9:F0} ms  ({100.0 * s_kernTicks / tot:F1}%)");
     }
 
@@ -226,7 +227,7 @@ internal static class GotoGemmFp32
     {
         int nFull = effNc - (effNc % Nr); int nTiles = nFull / Nr;
         int mFull = effMc - (effMc % Mr); int mTiles = mFull / Mr;
-        float[] paArr = ArrayPool<float>.Shared.Rent(mc * kc);
+        float[] paArr = ArrayPool<float>.Shared.Rent(mc * kc + 8); // +8: SIMD A-pack transpose may store 2 past the last tile
         float[] pbArr = ArrayPool<float>.Shared.Rent(kc * nc);
         try
         {
@@ -249,17 +250,59 @@ internal static class GotoGemmFp32
                             Vector256.Store(Vector256.Load(brow + 8), d + 8);
                         }
                     }
-                    // Pack A cache-friendly: read each A-row CONTIGUOUSLY along K (the cache-cold operand)
-                    // and write the small packed buffer strided. The old order read A column-major (stride
-                    // lda = a cache miss per element) — the profiler showed packing was 60% of GEMM time.
+                    long tB = timing ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+                    // Pack A into [kk][row] (Mr=6 per kk). The microkernel reads A kk-major, but A is
+                    // row-major (K contiguous per row) — so packing is a transpose. SIMD it via an 8x8 AVX2
+                    // transpose: load 8 K-elements of each of the 6 rows, transpose, write 8 kk-columns
+                    // contiguously. Each store writes 8 floats (low 6 valid); the +2 overlap is overwritten
+                    // by the next column / chunk (and the +8 buffer pad covers the final tile). Scalar tail
+                    // for the K-remainder past the last multiple of 8.
                     for (int mt = 0; mt < mTiles; mt++)
                     {
                         float* dst = pa + (long)mt * effKc * Mr; int row0 = ic + mt * Mr;
-                        for (int row = 0; row < Mr; row++)
+                        if (Avx.IsSupported)
                         {
-                            float* asrc = a + (long)(row0 + row) * lda + pc;
-                            float* d = dst + row;
-                            for (int kk = 0; kk < effKc; kk++) d[(long)kk * Mr] = asrc[kk];
+                            float* a0 = a + (long)(row0 + 0) * lda + pc, a1 = a + (long)(row0 + 1) * lda + pc;
+                            float* a2 = a + (long)(row0 + 2) * lda + pc, a3 = a + (long)(row0 + 3) * lda + pc;
+                            float* a4 = a + (long)(row0 + 4) * lda + pc, a5 = a + (long)(row0 + 5) * lda + pc;
+                            int kc8 = effKc & ~7;
+                            for (int kk = 0; kk < kc8; kk += 8)
+                            {
+                                var r0 = Avx.LoadVector256(a0 + kk); var r1 = Avx.LoadVector256(a1 + kk);
+                                var r2 = Avx.LoadVector256(a2 + kk); var r3 = Avx.LoadVector256(a3 + kk);
+                                var r4 = Avx.LoadVector256(a4 + kk); var r5 = Avx.LoadVector256(a5 + kk);
+                                var z = Vector256<float>.Zero;
+                                var u0 = Avx.UnpackLow(r0, r1); var u1 = Avx.UnpackHigh(r0, r1);
+                                var u2 = Avx.UnpackLow(r2, r3); var u3 = Avx.UnpackHigh(r2, r3);
+                                var u4 = Avx.UnpackLow(r4, r5); var u5 = Avx.UnpackHigh(r4, r5);
+                                var u6 = Avx.UnpackLow(z, z); var u7 = Avx.UnpackHigh(z, z);
+                                var s0 = Avx.Shuffle(u0, u2, 0x44); var s1 = Avx.Shuffle(u0, u2, 0xEE);
+                                var s2 = Avx.Shuffle(u1, u3, 0x44); var s3 = Avx.Shuffle(u1, u3, 0xEE);
+                                var s4 = Avx.Shuffle(u4, u6, 0x44); var s5 = Avx.Shuffle(u4, u6, 0xEE);
+                                var s6 = Avx.Shuffle(u5, u7, 0x44); var s7 = Avx.Shuffle(u5, u7, 0xEE);
+                                float* dd = dst + (long)kk * Mr;
+                                Avx.Store(dd + 0 * Mr, Avx.Permute2x128(s0, s4, 0x20));
+                                Avx.Store(dd + 1 * Mr, Avx.Permute2x128(s1, s5, 0x20));
+                                Avx.Store(dd + 2 * Mr, Avx.Permute2x128(s2, s6, 0x20));
+                                Avx.Store(dd + 3 * Mr, Avx.Permute2x128(s3, s7, 0x20));
+                                Avx.Store(dd + 4 * Mr, Avx.Permute2x128(s0, s4, 0x31));
+                                Avx.Store(dd + 5 * Mr, Avx.Permute2x128(s1, s5, 0x31));
+                                Avx.Store(dd + 6 * Mr, Avx.Permute2x128(s2, s6, 0x31));
+                                Avx.Store(dd + 7 * Mr, Avx.Permute2x128(s3, s7, 0x31));
+                            }
+                            for (int kk = kc8; kk < effKc; kk++)
+                            {
+                                float* d = dst + (long)kk * Mr;
+                                d[0] = a0[kk]; d[1] = a1[kk]; d[2] = a2[kk]; d[3] = a3[kk]; d[4] = a4[kk]; d[5] = a5[kk];
+                            }
+                        }
+                        else
+                        {
+                            for (int row = 0; row < Mr; row++)
+                            {
+                                float* asrc = a + (long)(row0 + row) * lda + pc; float* d = dst + row;
+                                for (int kk = 0; kk < effKc; kk++) d[(long)kk * Mr] = asrc[kk];
+                            }
                         }
                     }
                     if (pc == 0) ZeroCBlock(c, ldc, ic, jc, effMc, effNc);
@@ -278,6 +321,8 @@ internal static class GotoGemmFp32
                     {
                         long t2 = System.Diagnostics.Stopwatch.GetTimestamp();
                         Interlocked.Add(ref s_packTicks, t1 - t0);
+                        Interlocked.Add(ref s_packBTicks, tB - t0);
+                        Interlocked.Add(ref s_packATicks, t1 - tB);
                         Interlocked.Add(ref s_kernTicks, t2 - t1);
                     }
                     ScalarTails(a, lda, b, ldb, c, ldc, ic, jc, effMc, effNc, mFull, nFull, pc, effKc);
