@@ -4730,6 +4730,199 @@ public partial class CpuEngine : ITensorLevelEngine
         }
     }
 
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Inference fast path (#1672): writes SDPA output into a caller-owned resident buffer,
+    /// reusing the internal ArrayPool scores scratch — no scores/weights/output tensor
+    /// allocations. The float path delegates to <see cref="ScaledDotProductAttentionFloatInto"/>
+    /// (the exact per-head GEMM + numerically-stable softmax kernel the allocating overload
+    /// uses), so its result is bit-identical. Other numeric types fall back to the allocating
+    /// <see cref="ScaledDotProductAttention{T}"/> and copy into the destination — still correct,
+    /// just without the alloc saving. This overload does not record on the autodiff tape; it is
+    /// only invoked on the no-tape inference forward.
+    /// </remarks>
+    public void ScaledDotProductAttentionInto<T>(
+        Tensor<T> destination,
+        Tensor<T> query,
+        Tensor<T> key,
+        Tensor<T> value,
+        double? scale)
+    {
+        if (destination == null) throw new ArgumentNullException(nameof(destination));
+        if (query == null) throw new ArgumentNullException(nameof(query));
+        if (key == null) throw new ArgumentNullException(nameof(key));
+        if (value == null) throw new ArgumentNullException(nameof(value));
+        if (!destination.IsContiguous) throw new InvalidOperationException("Destination tensor must be contiguous.");
+
+        // Stride-aware: QKV usually arrive as reshape+permute views — materialize
+        // contiguous copies exactly as the allocating overload does so the flat
+        // GEMM offsets line up.
+        if (!query.IsContiguous) query = query.Contiguous();
+        if (!key.IsContiguous) key = key.Contiguous();
+        if (!value.IsContiguous) value = value.Contiguous();
+
+        if (query.Rank != 4 || key.Rank != 4 || value.Rank != 4)
+            throw new ArgumentException("Query, Key, and Value must be 4D tensors [batch, heads, seq, d_k/d_v]");
+
+        int batch = query._shape[0];
+        int heads = query._shape[1];
+        int seqQ = query._shape[2];
+        int d_k = query._shape[3];
+        int seqK = key._shape[2];
+        int d_v = value._shape[3];
+
+        if (key._shape[0] != batch || key._shape[1] != heads || key._shape[3] != d_k)
+            throw new ArgumentException("Key shape mismatch with Query");
+        if (value._shape[0] != batch || value._shape[1] != heads || value._shape[2] != seqK)
+            throw new ArgumentException("Value shape mismatch with Key");
+
+        long outLen = (long)batch * heads * seqQ * d_v;
+        if (destination.Length != outLen)
+            throw new ArgumentException(
+                $"Destination length ({destination.Length}) must equal [batch,heads,seqQ,d_v] = {outLen}.");
+
+        double scaleVal = scale ?? (1.0 / Math.Sqrt(d_k));
+
+        if (typeof(T) == typeof(float))
+        {
+            var qf = (Tensor<float>)(object)query;
+            var kf = (Tensor<float>)(object)key;
+            var vf = (Tensor<float>)(object)value;
+            var df = (Tensor<float>)(object)destination;
+            // GetDataArray() on a contiguous tensor returns the backing array; the
+            // *Into kernel writes outBuf[oOff..] per head. df must be a freshly-owned
+            // contiguous buffer (it is — caller passes a dedicated per-op scratch).
+            ScaledDotProductAttentionFloatInto(
+                qf.GetFlattenedData(), kf.GetFlattenedData(), vf.GetDataArray(),
+                df.GetDataArray(),
+                mask: null, scaleValue: scaleVal,
+                batch, heads, seqQ, d_k, seqK, d_v);
+            return;
+        }
+
+        // Generic / double fallback: allocate via the existing overload, copy out, release.
+        var result = ScaledDotProductAttention(query, key, value, mask: null, scale: scaleVal, out var weights);
+        try
+        {
+            result.Data.Span.CopyTo(destination.Data.Span);
+        }
+        finally
+        {
+            TensorAllocator.Return(result);
+            if (weights != null) TensorAllocator.Return(weights);
+        }
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Inference fast path (#1672): the trailing-repeat broadcast multiply of
+    /// <see cref="TensorBroadcastMultiply{T}"/> written into a caller-owned destination
+    /// (shape == <paramref name="a"/>'s shape). Identical SIMD tile kernel, so bit-identical.
+    /// Falls back to the allocating overload + copy when the inputs are not the trailing-repeat
+    /// pattern. No tape recording (no-tape inference forward only).
+    /// </remarks>
+    public void TensorBroadcastMultiplyInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
+    {
+        if (destination == null) throw new ArgumentNullException(nameof(destination));
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (b == null) throw new ArgumentNullException(nameof(b));
+        if (!destination.IsContiguous) throw new InvalidOperationException("Destination tensor must be contiguous.");
+        if (destination.Length != a.Length)
+            throw new ArgumentException(
+                $"Destination length ({destination.Length}) must equal a.Length ({a.Length}).");
+
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
+
+        if (TryBroadcastTrailingRepeat(a, b, out int bTileSize))
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            var aSpan = a.AsSpan();
+            var bSpan = b.AsSpan();
+            var rSpan = destination.AsWritableSpan();
+            int numTiles = a.Length / bTileSize;
+            for (int t = 0; t < numTiles; t++)
+            {
+                int off = t * bTileSize;
+                numOps.Multiply(aSpan.Slice(off, bTileSize), bSpan, rSpan.Slice(off, bTileSize));
+            }
+            return;
+        }
+
+        var result = TensorBroadcastMultiply(a, b);
+        try { result.Data.Span.CopyTo(destination.Data.Span); }
+        finally { TensorAllocator.Return(result); }
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Inference fast path (#1672): the trailing-repeat broadcast add of
+    /// <see cref="TensorBroadcastAdd{T}"/> written into a caller-owned destination
+    /// (shape == <paramref name="a"/>'s shape). Identical SIMD tile kernel, so bit-identical.
+    /// Falls back to the allocating overload + copy when the inputs are not the trailing-repeat
+    /// pattern. No tape recording (no-tape inference forward only).
+    /// </remarks>
+    public void TensorBroadcastAddInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
+    {
+        if (destination == null) throw new ArgumentNullException(nameof(destination));
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (b == null) throw new ArgumentNullException(nameof(b));
+        if (!destination.IsContiguous) throw new InvalidOperationException("Destination tensor must be contiguous.");
+        if (destination.Length != a.Length)
+            throw new ArgumentException(
+                $"Destination length ({destination.Length}) must equal a.Length ({a.Length}).");
+
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
+
+        if (TryBroadcastTrailingRepeat(a, b, out int bTileSize))
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            var aSpan = a.AsSpan();
+            var bSpan = b.AsSpan();
+            var rSpan = destination.AsWritableSpan();
+            int numTiles = a.Length / bTileSize;
+            for (int t = 0; t < numTiles; t++)
+            {
+                int off = t * bTileSize;
+                numOps.Add(aSpan.Slice(off, bTileSize), bSpan, rSpan.Slice(off, bTileSize));
+            }
+            return;
+        }
+
+        var result = TensorBroadcastAdd(a, b);
+        try { result.Data.Span.CopyTo(destination.Data.Span); }
+        finally { TensorAllocator.Return(result); }
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Inference fast path (#1672): <see cref="TensorAddScalar{T}"/> written into a caller-owned
+    /// destination. Identical <c>numOps.AddScalar</c> SIMD kernel, so bit-identical. No tape
+    /// recording (no-tape inference forward only).
+    /// </remarks>
+    public void TensorAddScalarInto<T>(Tensor<T> destination, Tensor<T> a, T scalar)
+    {
+        if (destination == null) throw new ArgumentNullException(nameof(destination));
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (!destination.IsContiguous) throw new InvalidOperationException("Destination tensor must be contiguous.");
+        if (destination.Length != a.Length)
+            throw new ArgumentException(
+                $"Destination length ({destination.Length}) must equal a.Length ({a.Length}).");
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        if (a.IsContiguous)
+        {
+            numOps.AddScalar(a.AsSpan(), scalar, destination.AsWritableSpan());
+        }
+        else
+        {
+            var src = a._storage.GetDataArray();
+            var dst = destination.GetDataArray();
+            for (int i = 0; i < a.Length; i++) dst[i] = numOps.Add(src[a.LogicalToStorageIndex(i)], scalar);
+        }
+    }
+
     /// <summary>Subtract into pre-allocated destination. Zero allocation.</summary>
     #if !NETFRAMEWORK
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
