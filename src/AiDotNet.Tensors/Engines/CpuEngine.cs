@@ -17045,6 +17045,115 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>
+    /// Fused grouped / depthwise deformable convolution (DCNv3, Wang et al. 2023). Single-pass kernel:
+    /// the channels are split into <paramref name="groups"/>; output channel <c>oc</c> (group
+    /// <c>g = oc / (outChannels/groups)</c>) convolves only its group's <c>inChannels/groups</c> input
+    /// channels against kernel rows shaped <c>[outChannels, inChannels/groups, kH, kW]</c>, sampling with
+    /// its deformable-group (<paramref name="deformGroups"/>) offset/mask slice. With
+    /// <c>groups == deformGroups == 1</c> this reduces exactly to <see cref="DeformableConv2D{T}"/>.
+    /// <para>Reference CPU implementation for the fused DCNv3 kernel (#1691). The offset/mask channel
+    /// layout matches the per-group composition path: contiguous per-deformable-group blocks of
+    /// <c>2·kH·kW</c> (Y then X) for offsets and <c>kH·kW</c> for the modulation mask.</para>
+    /// </summary>
+    public virtual Tensor<T> DeformableConv2DGrouped<T>(
+        Tensor<T> input, Tensor<T> kernel, Tensor<T> offset, Tensor<T>? mask,
+        int[] stride, int[] padding, int[] dilation, int groups, int deformGroups)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (kernel == null) throw new ArgumentNullException(nameof(kernel));
+        if (offset == null) throw new ArgumentNullException(nameof(offset));
+        if (groups < 1) throw new ArgumentOutOfRangeException(nameof(groups), "Groups must be at least 1.");
+        if (deformGroups < 1) throw new ArgumentOutOfRangeException(nameof(deformGroups), "Deformable groups must be at least 1.");
+        if (groups == 1 && deformGroups == 1)
+            return DeformableConv2D(input, kernel, offset, mask, stride, padding, dilation);
+        if (input.Rank != 4) throw new ArgumentException($"DeformableConv2DGrouped requires 4D input. Got rank {input.Rank}.", nameof(input));
+        if (kernel.Rank != 4) throw new ArgumentException($"DeformableConv2DGrouped requires 4D kernel. Got rank {kernel.Rank}.", nameof(kernel));
+
+        int batch = input._shape[0];
+        int inChannels = input._shape[1];
+        int height = input._shape[2];
+        int width = input._shape[3];
+        int outChannels = kernel._shape[0];
+        int kernelInChannels = kernel._shape[1];
+        int kernelHeight = kernel._shape[2];
+        int kernelWidth = kernel._shape[3];
+
+        if (inChannels % groups != 0) throw new ArgumentException($"Input channels ({inChannels}) must be divisible by groups ({groups}).");
+        if (outChannels % groups != 0) throw new ArgumentException($"Output channels ({outChannels}) must be divisible by groups ({groups}).");
+        int inCpg = inChannels / groups;
+        int outCpg = outChannels / groups;
+        if (kernelInChannels != inCpg) throw new ArgumentException($"Kernel in_channels ({kernelInChannels}) must equal inChannels/groups ({inCpg}).");
+        if (groups % deformGroups != 0 && deformGroups % groups != 0)
+            throw new ArgumentException($"deformGroups ({deformGroups}) and groups ({groups}) must divide one another.");
+
+        int strideH = stride[0], strideW = stride[1];
+        int padH = padding[0], padW = padding[1];
+        int dilationH = dilation[0], dilationW = dilation[1];
+        int effectiveKernelH = dilationH * (kernelHeight - 1) + 1;
+        int effectiveKernelW = dilationW * (kernelWidth - 1) + 1;
+        int outputHeight = (height + 2 * padH - effectiveKernelH) / strideH + 1;
+        int outputWidth = (width + 2 * padW - effectiveKernelW) / strideW + 1;
+        int numKernelPositions = kernelHeight * kernelWidth;
+        int offChans = 2 * numKernelPositions * deformGroups;
+        int maskChans = numKernelPositions * deformGroups;
+        var numOps = MathHelper.GetNumericOperations<T>();
+
+        var inputData = input.GetDataArray();
+        var kernelData = kernel.GetDataArray();
+        var offsetData = offset.GetDataArray();
+        var maskData = mask?.GetDataArray();
+        var result = TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth]);
+        var outputData = result.GetDataArray();
+
+        CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, outputData.Length, idx =>
+        {
+            int b = idx / outChannels;
+            int oc = idx % outChannels;
+            int g = oc / outCpg;                                   // output group
+            int dg = deformGroups == 1 ? 0 : g * deformGroups / groups; // deformable group
+            int icBase = g * inCpg;                                // first input channel of this group
+            int offBlock = dg * 2 * numKernelPositions;            // offset channel base for this deform group
+            int maskBlock = dg * numKernelPositions;
+
+            for (int oh = 0; oh < outputHeight; oh++)
+            {
+                for (int ow = 0; ow < outputWidth; ow++)
+                {
+                    T sum = numOps.Zero;
+                    for (int ic = 0; ic < inCpg; ic++)
+                    {
+                        int icGlobal = icBase + ic;
+                        for (int kh = 0; kh < kernelHeight; kh++)
+                        {
+                            for (int kw = 0; kw < kernelWidth; kw++)
+                            {
+                                int kp = kh * kernelWidth + kw;
+                                int offYIdx = ((b * offChans + offBlock + kp) * outputHeight + oh) * outputWidth + ow;
+                                int offXIdx = ((b * offChans + offBlock + numKernelPositions + kp) * outputHeight + oh) * outputWidth + ow;
+                                double offsetY = numOps.ToDouble(offsetData[offYIdx]);
+                                double offsetX = numOps.ToDouble(offsetData[offXIdx]);
+                                double sampledH = oh * strideH - padH + kh * dilationH + offsetY;
+                                double sampledW = ow * strideW - padW + kw * dilationW + offsetX;
+                                T sampledValue = BilinearSample(inputData, b, icGlobal, inChannels, height, width, sampledH, sampledW, numOps);
+                                if (maskData != null)
+                                {
+                                    int maskIdx = ((b * maskChans + maskBlock + kp) * outputHeight + oh) * outputWidth + ow;
+                                    sampledValue = numOps.Multiply(sampledValue, maskData[maskIdx]);
+                                }
+                                int kernelIdx = ((oc * inCpg + ic) * kernelHeight + kh) * kernelWidth + kw;
+                                sum = numOps.Add(sum, numOps.Multiply(sampledValue, kernelData[kernelIdx]));
+                            }
+                        }
+                    }
+                    int outputIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
+                    outputData[outputIdx] = sum;
+                }
+            }
+        });
+        return result;
+    }
+
+    /// <summary>
     /// Performs bilinear sampling at a fractional position.
     /// </summary>
     private static T BilinearSample<T>(
