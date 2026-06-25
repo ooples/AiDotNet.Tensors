@@ -184,62 +184,69 @@ internal static class GotoGemmFp32
         int numIcL = numIc, mcL = mc, ncL = nc, kcL = kc, mL = m, nL = n, kL = k, ldaL = lda, ldbL = ldb, ldcL = ldc;
         CpuParallelSettings.ParallelForOrSerial(0, totalTiles, (long)m * n * k, tileIdx =>
         {
-            int icIdx = tileIdx % numIcL;
-            int jcIdx = tileIdx / numIcL;
-            int ic = icIdx * mcL;
-            int jc = jcIdx * ncL;
+            int ic = (int)(tileIdx % numIcL) * mcL;
+            int jc = (int)(tileIdx / numIcL) * ncL;
             int effMc = Math.Min(mcL, mL - ic);
             int effNc = Math.Min(ncL, nL - jc);
             if (effMc <= 0 || effNc <= 0) return;
-            int nFull = effNc - (effNc % Nr); int nTiles = nFull / Nr;
-            int mFull = effMc - (effMc % Mr); int mTiles = mFull / Mr;
-            float* aa = (float*)ai, bb = (float*)bi, cc = (float*)ci;
+            RunTile((float*)ai, ldaL, (float*)bi, ldbL, (float*)ci, ldcL, ic, jc, effMc, effNc, kL, mcL, ncL, kcL);
+        }, deterministicSafe: true);
+    }
 
-            float[] paArr = ArrayPool<float>.Shared.Rent(mcL * kcL);
-            float[] pbArr = ArrayPool<float>.Shared.Rent(kcL * ncL);
-            try
+    /// <summary>Compute one disjoint (effMc×effNc) C-tile at (ic,jc): C[tile] = A[ic:, :]·B[:, jc:] over
+    /// the full K, packing this tile's A and B panels into per-call L2 buffers. C is zeroed on the first
+    /// K-panel then accumulated, so the tile is self-contained and deterministic (fixed K order). Shared
+    /// by RunParallel (TPL tile grid) and the CCX-aware driver (pinned per-CCX dispatch).</summary>
+    internal static unsafe void RunTile(
+        float* a, int lda, float* b, int ldb, float* c, int ldc,
+        int ic, int jc, int effMc, int effNc, int k, int mc, int nc, int kc)
+    {
+        int nFull = effNc - (effNc % Nr); int nTiles = nFull / Nr;
+        int mFull = effMc - (effMc % Mr); int mTiles = mFull / Mr;
+        float[] paArr = ArrayPool<float>.Shared.Rent(mc * kc);
+        float[] pbArr = ArrayPool<float>.Shared.Rent(kc * nc);
+        try
+        {
+            fixed (float* pa = paArr, pb = pbArr)
             {
-                fixed (float* pa = paArr, pb = pbArr)
+                var kern = Kernel();
+                for (int pc = 0; pc < k; pc += kc)
                 {
-                    var kern = Kernel();
-                    for (int pc = 0; pc < kL; pc += kcL)
+                    int effKc = Math.Min(kc, k - pc);
+                    for (int nt = 0; nt < nTiles; nt++)
                     {
-                        int effKc = Math.Min(kcL, kL - pc);
-                        for (int nt = 0; nt < nTiles; nt++)
+                        float* dst = pb + (long)nt * effKc * Nr; int col0 = jc + nt * Nr;
+                        for (int kk = 0; kk < effKc; kk++)
                         {
-                            float* dst = pb + (long)nt * effKc * Nr; int col0 = jc + nt * Nr;
-                            for (int kk = 0; kk < effKc; kk++)
-                            {
-                                float* brow = bb + (long)(pc + kk) * ldbL + col0; float* d = dst + (long)kk * Nr;
-                                for (int col = 0; col < Nr; col++) d[col] = brow[col];
-                            }
+                            float* brow = b + (long)(pc + kk) * ldb + col0; float* d = dst + (long)kk * Nr;
+                            for (int col = 0; col < Nr; col++) d[col] = brow[col];
                         }
+                    }
+                    for (int mt = 0; mt < mTiles; mt++)
+                    {
+                        float* dst = pa + (long)mt * effKc * Mr; int row0 = ic + mt * Mr;
+                        for (int kk = 0; kk < effKc; kk++)
+                        {
+                            float* d = dst + (long)kk * Mr;
+                            for (int row = 0; row < Mr; row++) d[row] = a[(long)(row0 + row) * lda + (pc + kk)];
+                        }
+                    }
+                    if (pc == 0) ZeroCBlock(c, ldc, ic, jc, effMc, effNc);
+                    for (int nt = 0; nt < nTiles; nt++)
+                    {
+                        float* bp = pb + (long)nt * effKc * Nr; int col0 = jc + nt * Nr;
                         for (int mt = 0; mt < mTiles; mt++)
                         {
-                            float* dst = pa + (long)mt * effKc * Mr; int row0 = ic + mt * Mr;
-                            for (int kk = 0; kk < effKc; kk++)
-                            {
-                                float* d = dst + (long)kk * Mr;
-                                for (int row = 0; row < Mr; row++) d[row] = aa[(long)(row0 + row) * ldaL + (pc + kk)];
-                            }
+                            float* ap = pa + (long)mt * effKc * Mr;
+                            float* cp = c + (long)(ic + mt * Mr) * ldc + col0;
+                            kern(ap, bp, cp, (long)ldc * 4, effKc);
                         }
-                        if (pc == 0) ZeroCBlock(cc, ldcL, ic, jc, effMc, effNc);
-                        for (int nt = 0; nt < nTiles; nt++)
-                        {
-                            float* bp = pb + (long)nt * effKc * Nr; int col0 = jc + nt * Nr;
-                            for (int mt = 0; mt < mTiles; mt++)
-                            {
-                                float* ap = pa + (long)mt * effKc * Mr;
-                                float* cp = cc + (long)(ic + mt * Mr) * ldcL + col0;
-                                kern(ap, bp, cp, (long)ldcL * 4, effKc);
-                            }
-                        }
-                        ScalarTails(aa, ldaL, bb, ldbL, cc, ldcL, ic, jc, effMc, effNc, mFull, nFull, pc, effKc);
                     }
+                    ScalarTails(a, lda, b, ldb, c, ldc, ic, jc, effMc, effNc, mFull, nFull, pc, effKc);
                 }
             }
-            finally { ArrayPool<float>.Shared.Return(paArr); ArrayPool<float>.Shared.Return(pbArr); }
-        }, deterministicSafe: true);
+        }
+        finally { ArrayPool<float>.Shared.Return(paArr); ArrayPool<float>.Shared.Return(pbArr); }
     }
 
     private static unsafe void ZeroCBlock(float* c, int ldc, int ic, int jc, int effMc, int effNc)

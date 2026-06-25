@@ -110,6 +110,12 @@ class Program
             return;
         }
 
+        if (args[0] == "--ab-ccx")
+        {
+            AiDotNet.Tensors.Benchmarks.CcxGemmBench.Bench();
+            return;
+        }
+
         if (args[0] == "--ab-aiseval-poolstats")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.PoolStats();
