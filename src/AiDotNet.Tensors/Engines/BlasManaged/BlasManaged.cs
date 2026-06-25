@@ -487,7 +487,6 @@ public static partial class BlasManaged
             var gepi = options.Epilogue;
             if (EpilogueFlagsCompute.Compute(in gepi) == EpilogueFlags.None)
             {
-                var (gmc, gnc, gkc) = GotoGemmFp32.ChooseParallelBlocks(m, n);
                 var gfa = MemoryMarshal.Cast<T, float>(a);
                 var gfb = MemoryMarshal.Cast<T, float>(b);
                 var gfc = MemoryMarshal.Cast<T, float>(c);
@@ -496,7 +495,16 @@ public static partial class BlasManaged
                     fixed (float* pa = gfa)
                     fixed (float* pb = gfb)
                     fixed (float* pc = gfc)
-                        GotoGemmFp32.RunParallel(pa, lda, pb, ldb, pc, ldc, m, n, k, gmc, gnc, gkc);
+                    {
+                        // CCX-aware pinned pool for large BALANCED shapes (per-CCX L3-resident B-strips →
+                        // less cross-CCX/DRAM traffic; ~49% MKL on squares vs ~37-47% per-tile). Returns
+                        // false (→ per-tile) when busy/nested/restricted or out of the win regime.
+                        if (!CcxGemmPool.TryRun(pa, lda, pb, ldb, pc, ldc, m, n, k))
+                        {
+                            var (gmc, gnc, gkc) = GotoGemmFp32.ChooseParallelBlocks(m, n);
+                            GotoGemmFp32.RunParallel(pa, lda, pb, ldb, pc, ldc, m, n, k, gmc, gnc, gkc);
+                        }
+                    }
                 }
                 return;
             }

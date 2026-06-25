@@ -723,24 +723,25 @@ internal static class AisEvalHeadToHeadBench
                     maxRel = Math.Max(maxRel, Math.Abs(s) > 1e-3 ? err / Math.Abs(s) : err);
                 }
 
-                // Direct BlasManaged.Gemm on raw arrays with a REUSED output → isolates the GEMM kernel from
-                // the engine wrapper (output alloc + dispatch). engine vs direct = the per-call wrapper cost.
-                var rawA = new float[(long)M * K]; var rawB = new float[(long)K * N]; var rawC = new float[(long)M * N];
-                var dop = new AiDotNet.Tensors.Engines.BlasManaged.BlasOptions<float> { PackingMode = AiDotNet.Tensors.Engines.BlasManaged.PackingMode.DisableAutotune };
+                // All through engine.TensorMatMul (same wrapper), interleaved min-of-10: PackBoth (old) /
+                // GotoGemm per-tile (CCX off) / GotoGemm CCX (on) / MKL — the clean A/B for the CCX lever.
+                var B2 = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.s_disableGotoGemm;
                 var ta = torch.rand(M, K); var tb = torch.rand(K, N);
-                double ptMs = double.PositiveInfinity, oldMs = double.PositiveInfinity, mklMs = double.PositiveInfinity, directMs = double.PositiveInfinity;
+                double ptMs = double.PositiveInfinity, oldMs = double.PositiveInfinity, mklMs = double.PositiveInfinity, ccxMs = double.PositiveInfinity;
                 for (int r = 0; r < 10; r++)
                 {
-                    // OLD path (PackBoth, GotoGemm disabled), through the engine — apples-to-apples.
                     AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.s_disableGotoGemm = true;
                     { var sw = Stopwatch.StartNew(); int reps = 0; do { var _ = engine.TensorMatMul(ea, eb); reps++; } while (sw.Elapsed.TotalMilliseconds < 30); sw.Stop(); oldMs = Math.Min(oldMs, sw.Elapsed.TotalMilliseconds / reps); }
                     AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.s_disableGotoGemm = false;
+                    AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_disable = true;
                     { var sw = Stopwatch.StartNew(); int reps = 0; do { var _ = engine.TensorMatMul(ea, eb); reps++; } while (sw.Elapsed.TotalMilliseconds < 30); sw.Stop(); ptMs = Math.Min(ptMs, sw.Elapsed.TotalMilliseconds / reps); }
-                    { var sw = Stopwatch.StartNew(); int reps = 0; do { AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(rawA, K, false, rawB, N, false, rawC, N, M, N, K, dop); reps++; } while (sw.Elapsed.TotalMilliseconds < 30); sw.Stop(); directMs = Math.Min(directMs, sw.Elapsed.TotalMilliseconds / reps); }
+                    AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_disable = false;
+                    { var sw = Stopwatch.StartNew(); int reps = 0; do { var _ = engine.TensorMatMul(ea, eb); reps++; } while (sw.Elapsed.TotalMilliseconds < 30); sw.Stop(); ccxMs = Math.Min(ccxMs, sw.Elapsed.TotalMilliseconds / reps); }
                     { var sw = Stopwatch.StartNew(); int reps = 0; do { using var _ = torch.matmul(ta, tb); reps++; } while (sw.Elapsed.TotalMilliseconds < 30); sw.Stop(); mklMs = Math.Min(mklMs, sw.Elapsed.TotalMilliseconds / reps); }
                 }
-                double ptGf = gf / (ptMs / 1000), oldGf = gf / (oldMs / 1000), mklGf = gf / (mklMs / 1000), directGf = gf / (directMs / 1000);
-                Console.WriteLine($"{tag,-9} old={oldGf,6:F0}  engine={ptGf,6:F0}  direct={directGf,6:F0}  MKL={mklGf,6:F0}   eng/old={(oldGf > 0 ? ptGf / oldGf : 0),4:F2}x  direct/eng={(ptGf > 0 ? directGf / ptGf : 0),4:F2}x  eng/MKL={(mklGf > 0 ? ptGf / mklGf * 100 : 0),3:F0}%  dir/MKL={(mklGf > 0 ? directGf / mklGf * 100 : 0),3:F0}%  {(maxRel < 1e-3 ? "OK" : "WRONG")}");
+                AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.s_disableGotoGemm = B2;
+                double ptGf = gf / (ptMs / 1000), oldGf = gf / (oldMs / 1000), mklGf = gf / (mklMs / 1000), ccxGf = gf / (ccxMs / 1000);
+                Console.WriteLine($"{tag,-9} old={oldGf,6:F0}  pertile={ptGf,6:F0}  CCX={ccxGf,6:F0}  MKL={mklGf,6:F0}   CCX/pertile={(ptGf > 0 ? ccxGf / ptGf : 0),4:F2}x  best/MKL={(mklGf > 0 ? Math.Max(ptGf, ccxGf) / mklGf * 100 : 0),3:F0}%  {(maxRel < 1e-3 ? "OK" : "WRONG")}");
             }
         }
         finally { CpuParallelSettings.MaxDegreeOfParallelism = saved; }
