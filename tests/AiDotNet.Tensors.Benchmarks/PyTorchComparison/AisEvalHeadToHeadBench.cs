@@ -648,6 +648,39 @@ internal static class AisEvalHeadToHeadBench
     }
 
     /// <summary>
+    /// Tight engine.TensorMatMul loop for an external profiler (PerfView / dotnet-trace) to find where the
+    /// per-call time ACTUALLY goes (GEMM kernel vs output alloc vs dispatch vs GC) — no guessing. Shape via
+    /// env PROFILE_SHAPE (sq1024 default; dit-attnout / dit-mlp2 / sq2048). Runs PROFILE_SECONDS (default 20).
+    /// Run: --profile-gemm.
+    /// </summary>
+    public static void ProfileGemm()
+    {
+        var engine = new CpuEngine();
+        CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
+        int M = 1024, N = 1024, K = 1024;
+        switch (Environment.GetEnvironmentVariable("PROFILE_SHAPE"))
+        {
+            case "dit-attnout": M = 256; N = 1152; K = 1152; break;
+            case "dit-mlp2": M = 256; N = 1152; K = 4608; break;
+            case "dit-qkv": M = 256; N = 3456; K = 1152; break;
+            case "sq2048": M = 2048; N = 2048; K = 2048; break;
+            case "sq768": M = 768; N = 768; K = 768; break;
+        }
+        double secs = double.TryParse(Environment.GetEnvironmentVariable("PROFILE_SECONDS"), out var s) ? s : 20;
+        var ea = Tensor<float>.CreateRandom(M, K); var eb = Tensor<float>.CreateRandom(K, N);
+        for (int i = 0; i < 20; i++) { var _ = engine.TensorMatMul(ea, eb); } // warm
+        Console.WriteLine($"PROFILING engine.TensorMatMul [{M}x{N}x{K}] for {secs}s — attach profiler now");
+        AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.ResetTiming();
+        AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.s_timing = true;
+        var sw = Stopwatch.StartNew(); long n = 0;
+        while (sw.Elapsed.TotalSeconds < secs) { var _ = engine.TensorMatMul(ea, eb); n++; }
+        AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.s_timing = false;
+        Console.WriteLine($"done: {n} matmuls in {sw.Elapsed.TotalSeconds:F1}s = {n / sw.Elapsed.TotalSeconds:F0}/s, {2.0 * M * N * K / 1e9 * n / sw.Elapsed.TotalSeconds:F0} GFLOP/s");
+        Console.WriteLine("RunTile pack-vs-kernel (summed across worker threads):");
+        AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.ReportTiming();
+    }
+
+    /// <summary>
     /// Validate + benchmark the PRODUCTION engine GEMM path (engine.TensorMatMul → BlasManaged.Gemm →
     /// CcxGemmPool for large balanced shapes). Proves the CCX wiring is BIT-IDENTICAL to the per-tile
     /// fallback (toggling CcxGemmPool.s_disable) — so it's correct + Deterministic-mode safe — then

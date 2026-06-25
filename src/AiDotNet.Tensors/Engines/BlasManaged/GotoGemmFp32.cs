@@ -1,6 +1,9 @@
 using System;
 using System.Buffers;
 using System.Runtime.InteropServices;
+#if NET5_0_OR_GREATER
+using System.Runtime.Intrinsics;
+#endif
 using System.Threading;
 using AiDotNet.Tensors.Helpers;
 
@@ -54,6 +57,20 @@ internal static class GotoGemmFp32
     }
 
 #if NET5_0_OR_GREATER
+    // Direct pack-vs-kernel timing (diagnostic; set s_timing during a profiling run only). Coarse
+    // per-K-panel Stopwatch deltas summed across worker threads — answers "is the cost packing or
+    // the microkernel?" without profiler pseudo-frame ambiguity.
+    internal static bool s_timing;
+    internal static long s_packTicks, s_kernTicks;
+    internal static void ResetTiming() { s_packTicks = 0; s_kernTicks = 0; }
+    internal static void ReportTiming()
+    {
+        double f = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        long tot = s_packTicks + s_kernTicks; if (tot == 0) { System.Console.WriteLine("(no timing)"); return; }
+        System.Console.WriteLine($"  pack   = {s_packTicks * f,9:F0} ms  ({100.0 * s_packTicks / tot:F1}%)");
+        System.Console.WriteLine($"  kernel = {s_kernTicks * f,9:F0} ms  ({100.0 * s_kernTicks / tot:F1}%)");
+    }
+
     // Emitted-once kernel: void(float* packedA, float* packedB, float* c, long ldcBytes, long kc).
     private static IntPtr s_kernel;
     private static ExecutableMemory? s_kernelMem;
@@ -216,28 +233,37 @@ internal static class GotoGemmFp32
             fixed (float* pa = paArr, pb = pbArr)
             {
                 var kern = Kernel();
+                bool timing = s_timing;
                 for (int pc = 0; pc < k; pc += kc)
                 {
                     int effKc = Math.Min(kc, k - pc);
+                    long t0 = timing ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                     for (int nt = 0; nt < nTiles; nt++)
                     {
                         float* dst = pb + (long)nt * effKc * Nr; int col0 = jc + nt * Nr;
                         for (int kk = 0; kk < effKc; kk++)
                         {
+                            // SIMD copy of the Nr=16 contiguous B-cols (was scalar — packing was ~50% of GEMM).
                             float* brow = b + (long)(pc + kk) * ldb + col0; float* d = dst + (long)kk * Nr;
-                            for (int col = 0; col < Nr; col++) d[col] = brow[col];
+                            Vector256.Store(Vector256.Load(brow), d);
+                            Vector256.Store(Vector256.Load(brow + 8), d + 8);
                         }
                     }
+                    // Pack A cache-friendly: read each A-row CONTIGUOUSLY along K (the cache-cold operand)
+                    // and write the small packed buffer strided. The old order read A column-major (stride
+                    // lda = a cache miss per element) — the profiler showed packing was 60% of GEMM time.
                     for (int mt = 0; mt < mTiles; mt++)
                     {
                         float* dst = pa + (long)mt * effKc * Mr; int row0 = ic + mt * Mr;
-                        for (int kk = 0; kk < effKc; kk++)
+                        for (int row = 0; row < Mr; row++)
                         {
-                            float* d = dst + (long)kk * Mr;
-                            for (int row = 0; row < Mr; row++) d[row] = a[(long)(row0 + row) * lda + (pc + kk)];
+                            float* asrc = a + (long)(row0 + row) * lda + pc;
+                            float* d = dst + row;
+                            for (int kk = 0; kk < effKc; kk++) d[(long)kk * Mr] = asrc[kk];
                         }
                     }
                     if (pc == 0) ZeroCBlock(c, ldc, ic, jc, effMc, effNc);
+                    long t1 = timing ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                     for (int nt = 0; nt < nTiles; nt++)
                     {
                         float* bp = pb + (long)nt * effKc * Nr; int col0 = jc + nt * Nr;
@@ -247,6 +273,12 @@ internal static class GotoGemmFp32
                             float* cp = c + (long)(ic + mt * Mr) * ldc + col0;
                             kern(ap, bp, cp, (long)ldc * 4, effKc);
                         }
+                    }
+                    if (timing)
+                    {
+                        long t2 = System.Diagnostics.Stopwatch.GetTimestamp();
+                        Interlocked.Add(ref s_packTicks, t1 - t0);
+                        Interlocked.Add(ref s_kernTicks, t2 - t1);
                     }
                     ScalarTails(a, lda, b, ldb, c, ldc, ic, jc, effMc, effNc, mFull, nFull, pc, effKc);
                 }
@@ -377,13 +409,17 @@ internal static class GotoGemmFp32
                 for (int p = 0, pc = 0; pc < k; p++, pc += kc)
                 {
                     int effKc = Math.Min(kc, k - pc);
+                    // Pack A cache-friendly: read each A-row CONTIGUOUSLY along K (the cache-cold operand)
+                    // and write the small packed buffer strided. The old order read A column-major (stride
+                    // lda = a cache miss per element) — the profiler showed packing was 60% of GEMM time.
                     for (int mt = 0; mt < mTiles; mt++)
                     {
                         float* dst = pa + (long)mt * effKc * Mr; int row0 = ic + mt * Mr;
-                        for (int kk = 0; kk < effKc; kk++)
+                        for (int row = 0; row < Mr; row++)
                         {
-                            float* d = dst + (long)kk * Mr;
-                            for (int row = 0; row < Mr; row++) d[row] = a[(long)(row0 + row) * lda + (pc + kk)];
+                            float* asrc = a + (long)(row0 + row) * lda + pc;
+                            float* d = dst + row;
+                            for (int kk = 0; kk < effKc; kk++) d[(long)kk * Mr] = asrc[kk];
                         }
                     }
                     if (pc == 0) ZeroCBlock(c, ldc, ic, jc, effMc, effNc);
