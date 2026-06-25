@@ -282,6 +282,77 @@ internal static class GotoGemmFp32
         }
     }
 
+    /// <summary>Floats needed to hold ONE ic-block's whole-K packed A (numKc · mTiles · kc · Mr).</summary>
+    internal static long PackedALen(int effMc, int k, int kc)
+    {
+        int mTiles = (effMc - (effMc % Mr)) / Mr;
+        int numKc = (k + kc - 1) / kc;
+        return (long)numKc * mTiles * kc * Mr;
+    }
+
+    /// <summary>Pack a whole-K A row-block A[ic:ic+effMc, 0:k] ONCE into <paramref name="dst"/>: K-panel p
+    /// at p·mTiles·kc·Mr, Mr-tile mt at +mt·kc·Mr, rows kk·Mr (effKc used). mtStart/mtStride let the CCX's
+    /// lanes pack in parallel. Used by the 2D CCX grid so each CCX's A-block lives in its own L3.</summary>
+    internal static unsafe void PackAPanel(float* a, int lda, int ic, int effMc, int k, int kc, float* dst,
+        int mtStart = 0, int mtStride = 1)
+    {
+        int mFull = effMc - (effMc % Mr); int mTiles = mFull / Mr;
+        for (int p = 0, pc = 0; pc < k; p++, pc += kc)
+        {
+            int effKc = Math.Min(kc, k - pc);
+            for (int mt = mtStart; mt < mTiles; mt += mtStride)
+            {
+                float* d = dst + (long)p * mTiles * kc * Mr + (long)mt * kc * Mr; int row0 = ic + mt * Mr;
+                for (int kk = 0; kk < effKc; kk++)
+                {
+                    float* dd = d + (long)kk * Mr;
+                    for (int row = 0; row < Mr; row++) dd[row] = a[(long)(row0 + row) * lda + (pc + kk)];
+                }
+            }
+        }
+    }
+
+    /// <summary>2D CCX-grid block: compute C[ic0:ic0+effMc, jc0:jc0+effNc] from a whole-K pre-packed
+    /// A-block (<paramref name="packedA"/>, PackAPanel) and B-block (<paramref name="packedB"/>, PackBPanel)
+    /// — BOTH resident in this CCX's L3, so the microkernel streams neither from DRAM. The CCX's lanes
+    /// split the Mr×Nr micro-tiles (laneStart/laneStride); each micro-tile is zeroed then accumulated over
+    /// the full K (fixed order ⇒ deterministic, disjoint C ⇒ no races). lane 0 does the block's M/N tails
+    /// (reads original a,b). mTilesAll/nTilesAll are the block's full Mr/Nr tile counts (pack strides).</summary>
+    internal static unsafe void RunBlockPackedAB(
+        float* a, int lda, float* b, int ldb, float* c, int ldc,
+        int ic0, int jc0, int effMc, int effNc, int k, int kc,
+        float* packedA, float* packedB, int laneStart, int laneStride)
+    {
+        int nFull = effNc - (effNc % Nr); int nTiles = nFull / Nr;
+        int mFull = effMc - (effMc % Mr); int mTiles = mFull / Mr;
+        var kern = Kernel();
+        int totalMt = mTiles * nTiles;
+        for (int idx = laneStart; idx < totalMt; idx += laneStride)
+        {
+            int mt = idx % mTiles; int nt = idx / mTiles;
+            float* cp = c + (long)(ic0 + mt * Mr) * ldc + (jc0 + nt * Nr);
+            for (int r = 0; r < Mr; r++) { float* cr = cp + (long)r * ldc; for (int col = 0; col < Nr; col++) cr[col] = 0f; }
+            for (int p = 0, pc = 0; pc < k; p++, pc += kc)
+            {
+                int effKc = Math.Min(kc, k - pc);
+                float* ap = packedA + (long)p * mTiles * kc * Mr + (long)mt * kc * Mr;
+                float* bp = packedB + (long)p * nTiles * kc * Nr + (long)nt * kc * Nr;
+                kern(ap, bp, cp, (long)ldc * 4, effKc);
+            }
+        }
+        // Block M/N tails (single lane): zero the tail strips then scalar-accumulate over full K.
+        if (laneStart == 0 && (mFull < effMc || nFull < effNc))
+        {
+            for (int r = mFull; r < effMc; r++) { float* cr = c + (long)(ic0 + r) * ldc + jc0; for (int col = 0; col < effNc; col++) cr[col] = 0f; }
+            for (int r = 0; r < mFull; r++) { float* cr = c + (long)(ic0 + r) * ldc + jc0 + nFull; for (int col = nFull; col < effNc; col++) cr[col - nFull] = 0f; }
+            for (int p = 0, pc = 0; pc < k; p++, pc += kc)
+            {
+                int effKc = Math.Min(kc, k - pc);
+                ScalarTails(a, lda, b, ldb, c, ldc, ic0, jc0, effMc, effNc, mFull, nFull, pc, effKc);
+            }
+        }
+    }
+
     /// <summary>Like <see cref="RunTile"/> but B is already packed (by <see cref="PackBPanel"/>) in
     /// <paramref name="packedB"/> — this tile only packs its own A-panel and runs the kernel + tails
     /// (tails read the original b). Deterministic (fixed K order, disjoint C). Used by the CCX driver.</summary>
