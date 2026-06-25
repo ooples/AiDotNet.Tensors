@@ -14212,6 +14212,52 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
+            // FUSED FAST PATH (transposed-convolution identity). For stride=1,
+            // dilation=1 and a non-negative symmetric transposed padding, the
+            // input-gradient equals a FORWARD convolution of gradOutput with the
+            // spatially-flipped, channel-transposed kernel:
+            //   dX = conv(gradOut, flip(W)^T, stride=1, pad=(k-1)-p)
+            // Routing through the fast implicit-GEMM forward path (~90 GFLOP/s)
+            // instead of the GEMM + memory-bound Col2ImAccumulate scatter (~27
+            // GFLOP/s, scalar) is ~3x on the large-spatial stem convs every CNN
+            // backbone starts with (VGG/ResNet at 224x224 / 112x112). Output is
+            // numerically equivalent (different summation order, within float
+            // tolerance). Anything outside this regime falls through to the col2im
+            // path below unchanged.
+            {
+                int padHt = (kernelHeight - 1) - padH;
+                int padWt = (kernelWidth - 1) - padW;
+                if (strideH == 1 && strideW == 1 && dilationH == 1 && dilationW == 1
+                    && padHt >= 0 && padWt >= 0 && padHt == padWt)
+                {
+                    int kHWf = kernelHeight * kernelWidth;
+                    var gradOutFloat = (Tensor<float>)(object)gradOutput;
+                    var flippedKernel = new Tensor<float>(new[] { inChannels, outChannels, kernelHeight, kernelWidth });
+                    var flippedF = (float[])(object)flippedKernel._storage.GetDataArray();
+                    var kernelFlip = (float[])(object)kernel.GetFlattenedData();
+                    for (int oc = 0; oc < outChannels; oc++)
+                        for (int ic = 0; ic < inChannels; ic++)
+                        {
+                            int kBase = oc * inChannels * kHWf + ic * kHWf;
+                            int fBase = ic * outChannels * kHWf + oc * kHWf;
+                            for (int kh = 0; kh < kernelHeight; kh++)
+                                for (int kw = 0; kw < kernelWidth; kw++)
+                                    flippedF[fBase + kh * kernelWidth + kw] =
+                                        kernelFlip[kBase + (kernelHeight - 1 - kh) * kernelWidth + (kernelWidth - 1 - kw)];
+                        }
+                    var fusedResult = Conv2D<float>(gradOutFloat, flippedKernel, 1, padHt, 1);
+                    var fusedF = (float[])(object)fusedResult.GetFlattenedData();
+                    var destFused = (float[])(object)dest._storage.GetDataArray();
+                    int destOffFused = dest._storageOffset;
+                    int totalFused = batch * inChannels * height * width;
+                    if (accumulate)
+                        for (int i = 0; i < totalFused; i++) destFused[destOffFused + i] += fusedF[i];
+                    else
+                        Array.Copy(fusedF, 0, destFused, destOffFused, totalFused);
+                    return;
+                }
+            }
+
             int colH = inChannels * kernelHeight * kernelWidth;
             int colW = outputHeight * outputWidth;
             // Write directly into dest's live backing — skip the temp gradInputF
