@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -644,6 +645,61 @@ internal static class AisEvalHeadToHeadBench
             }
         }
         finally { CpuParallelSettings.MaxDegreeOfParallelism = saved; }
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetLogicalProcessorInformationEx(
+        int relationshipType, IntPtr buffer, ref uint returnedLength);
+
+    /// <summary>
+    /// CPU topology probe (foundation for the CCX-aware GEMM scheme): enumerate the L3 cache domains
+    /// (= CCXs on Zen). Each L3 domain is a set of logical cores that share one last-level cache; the
+    /// hierarchical GEMM will pin a thread-group per domain and replicate the packed-B panel into each
+    /// domain's L3 so it is reused WITHOUT cross-CCX Infinity-Fabric traffic (the measured 2x-to-MKL gap).
+    /// Run: --cpu-topology. On the 3990X expect 16 L3 domains × 8 logical cores (4 phys + SMT), 16 MB each.
+    /// </summary>
+    public static void CpuTopologyProbe()
+    {
+        const int RelationCache = 2;
+        Console.WriteLine($"=== CPU topology (logical procs={Environment.ProcessorCount}) ===");
+        uint len = 0;
+        GetLogicalProcessorInformationEx(RelationCache, IntPtr.Zero, ref len); // size query (returns false)
+        if (len == 0) { Console.WriteLine("GetLogicalProcessorInformationEx size query returned 0 — unsupported."); return; }
+        IntPtr buf = Marshal.AllocHGlobal((int)len);
+        try
+        {
+            if (!GetLogicalProcessorInformationEx(RelationCache, buf, ref len))
+            { Console.WriteLine($"GetLogicalProcessorInformationEx failed: {Marshal.GetLastWin32Error()}"); return; }
+
+            // Walk variable-length SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX records.
+            // Record: +0 DWORD Relationship, +4 DWORD Size, then CACHE_RELATIONSHIP at +8:
+            //   cache+0 Level, cache+4 CacheSize(DWORD), cache+32 GROUP_AFFINITY{ +0 KAFFINITY Mask(8), +8 WORD Group }
+            //   → record offsets: Level@8, CacheSize@12, Mask@40, Group@48.
+            long ptr = (long)buf, end = ptr + len;
+            int l3 = 0, totalCores = 0;
+            while (ptr < end)
+            {
+                int rel = Marshal.ReadInt32((IntPtr)ptr);
+                int size = Marshal.ReadInt32((IntPtr)(ptr + 4));
+                if (size <= 0) break;
+                if (rel == RelationCache)
+                {
+                    byte level = Marshal.ReadByte((IntPtr)(ptr + 8));
+                    if (level == 3)
+                    {
+                        int cacheBytes = Marshal.ReadInt32((IntPtr)(ptr + 12));
+                        long mask = Marshal.ReadInt64((IntPtr)(ptr + 40));
+                        short group = Marshal.ReadInt16((IntPtr)(ptr + 48));
+                        int cores = System.Numerics.BitOperations.PopCount((ulong)mask);
+                        totalCores += cores;
+                        Console.WriteLine($"  L3 #{++l3,2}: group={group} cores={cores,2} L3={cacheBytes / (1024 * 1024)}MB mask=0x{(ulong)mask:X16}");
+                    }
+                }
+                ptr += size;
+            }
+            Console.WriteLine($"Total L3 (CCX) domains: {l3}, summed logical cores: {totalCores}");
+        }
+        finally { Marshal.FreeHGlobal(buf); }
     }
 
     public static void GemmDopFine()
