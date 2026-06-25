@@ -1509,6 +1509,34 @@ internal static class BackwardFunctions<T>
     }
 
     /// <summary>
+    /// DeformableConv2D backward WITH modulation mask (DCN v2): routes gradient to input, kernel, offset
+    /// AND mask. inputs[0]=input, inputs[1]=kernel, inputs[2]=offset, inputs[3]=mask.
+    /// savedState layout: [stride, padding, dilation].
+    /// </summary>
+    internal static void DeformableConv2DBackwardWithMask(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var stride = (int[])savedState[0];
+        var padding = (int[])savedState[1];
+        var dilation = (int[])savedState[2];
+        var mask = inputs[3];
+
+        var gradInput = engine.DeformableConv2DBackwardInput(
+            gradOutput, inputs[0], inputs[1], inputs[2], mask, inputs[0]._shape, stride, padding, dilation);
+        var gradKernel = engine.DeformableConv2DBackwardKernel(
+            gradOutput, inputs[0], inputs[2], mask, inputs[1]._shape, stride, padding, dilation);
+        var gradOffset = engine.DeformableConv2DBackwardOffset(
+            gradOutput, inputs[0], inputs[1], inputs[2], mask, stride, padding, dilation);
+        var gradMask = engine.DeformableConv2DBackwardMask(
+            gradOutput, inputs[0], inputs[1], inputs[2], mask, stride, padding, dilation);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradKernel, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[2], gradOffset, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[3], gradMask, engine);
+    }
+
+    /// <summary>
     /// Grouped/depthwise DeformableConv2D backward (DCNv3, DCN v1 / mask=null): routes gradient to
     /// input, kernel, offset via the engine's grouped backward kernels. savedState layout:
     /// [stride, padding, dilation, groups (boxed int), deformGroups (boxed int)].
@@ -1534,6 +1562,36 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradKernel, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[2], gradOffset, engine);
+    }
+
+    /// <summary>
+    /// Grouped DeformableConv2D backward WITH modulation mask (DCN v2 / v3): routes gradient to
+    /// input, kernel, offset AND mask. inputs[0]=input, inputs[1]=kernel, inputs[2]=offset, inputs[3]=mask.
+    /// savedState layout: [stride, padding, dilation, groups (boxed int), deformGroups (boxed int)].
+    /// </summary>
+    internal static void DeformableConv2DGroupedBackwardWithMask(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var stride = (int[])savedState[0];
+        var padding = (int[])savedState[1];
+        var dilation = (int[])savedState[2];
+        int groups = (int)savedState[3];
+        int deformGroups = (int)savedState[4];
+        var mask = inputs[3];
+
+        var gradInput = engine.DeformableConv2DGroupedBackwardInput(
+            gradOutput, inputs[0], inputs[1], inputs[2], mask, inputs[0]._shape, stride, padding, dilation, groups, deformGroups);
+        var gradKernel = engine.DeformableConv2DGroupedBackwardKernel(
+            gradOutput, inputs[0], inputs[2], mask, inputs[1]._shape, stride, padding, dilation, groups, deformGroups);
+        var gradOffset = engine.DeformableConv2DGroupedBackwardOffset(
+            gradOutput, inputs[0], inputs[1], inputs[2], mask, stride, padding, dilation, groups, deformGroups);
+        var gradMask = engine.DeformableConv2DGroupedBackwardMask(
+            gradOutput, inputs[0], inputs[1], inputs[2], mask, stride, padding, dilation, groups, deformGroups);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradKernel, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[2], gradOffset, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[3], gradMask, engine);
     }
 
     /// <summary>

@@ -17034,12 +17034,48 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
         }
-        else if (DifferentiableOps.IsTapeActiveForThread<T>() || GraphMode.IsActive)
+        else
         {
-            throw new NotSupportedException(
-                "DeformableConv2D autograd with a modulation mask (DCN v2) is not yet wired. " +
-                "Either pass mask=null (DCN v1) or wrap the call in a NoGradScope<T>() to opt out " +
-                "of autograd for this op.");
+            // DCN v2 (modulation mask): record input/kernel/offset AND mask so dL flows to all four.
+            var savedState = new object[]
+            {
+                (int[])stride.Clone(), (int[])padding.Clone(), (int[])dilation.Clone(),
+            };
+            DifferentiableOps.RecordIfActive("DeformableConv2D", result,
+                new[] { input, kernel, offset, mask },
+                BackwardFunctions<T>.DeformableConv2DBackwardWithMask,
+                savedState);
+
+            if (GraphMode.IsActive)
+            {
+                var scope = GraphMode.Current;
+                if (scope != null)
+                {
+                    var capturedInput = input;
+                    var capturedKernel = kernel;
+                    var capturedOffset = offset;
+                    var capturedMask = mask;
+                    var capturedStride = (int[])stride.Clone();
+                    var capturedPadding = (int[])padding.Clone();
+                    var capturedDilation = (int[])dilation.Clone();
+                    var outShape = (int[])result._shape.Clone();
+                    return scope.RecordVariadic(
+                        LazyNodeType.Custom,
+                        "DeformableConv2D",
+                        new[] { input, kernel, offset, mask },
+                        outShape,
+                        (eng, output) =>
+                        {
+                            var replayed = eng.DeformableConv2D(
+                                capturedInput, capturedKernel, capturedOffset,
+                                capturedMask,
+                                capturedStride, capturedPadding, capturedDilation);
+                            DirectGpuTensorEngine.CopyResultInto(eng, replayed, output);
+                        },
+                        BackwardFunctions<T>.DeformableConv2DBackwardWithMask,
+                        savedState);
+                }
+            }
         }
         return result;
     }
@@ -17083,8 +17119,14 @@ public partial class CpuEngine : ITensorLevelEngine
         int inCpg = inChannels / groups;
         int outCpg = outChannels / groups;
         if (kernelInChannels != inCpg) throw new ArgumentException($"Kernel in_channels ({kernelInChannels}) must equal inChannels/groups ({inCpg}).");
-        if (groups % deformGroups != 0 && deformGroups % groups != 0)
-            throw new ArgumentException($"deformGroups ({deformGroups}) and groups ({groups}) must divide one another.");
+        // deformGroups must DIVIDE groups: there each output group maps to exactly one deformable group
+        // (dg = g·deformGroups/groups), and that mapping coincides with the GPU kernel's per-input-channel
+        // mapping (ic/(inChannels/deformGroups)). The groups<deformGroups case (deformGroups not dividing
+        // groups) would put multiple deformable groups inside one group's channel span — the CPU
+        // composition path can't express that and would silently diverge from the GPU kernel — so reject it.
+        if (groups % deformGroups != 0)
+            throw new ArgumentException($"deformGroups ({deformGroups}) must divide groups ({groups}). " +
+                "The groups<deformGroups configuration is not supported (it would diverge between the CPU and GPU paths).");
 
         int strideH = stride[0], strideW = stride[1];
         int padH = padding[0], padW = padding[1];
@@ -17198,12 +17240,51 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
         }
-        else if (DifferentiableOps.IsTapeActiveForThread<T>() || GraphMode.IsActive)
+        else
         {
-            throw new NotSupportedException(
-                "DeformableConv2DGrouped autograd with a modulation mask (DCN v2) is not yet wired. " +
-                "Either pass mask=null (DCN v1) or wrap the call in a NoGradScope<T>() to opt out " +
-                "of autograd for this op.");
+            // DCN v2 / v3 (modulation mask): record input/kernel/offset AND mask so dL flows to all four.
+            var savedState = new object[]
+            {
+                (int[])stride.Clone(), (int[])padding.Clone(), (int[])dilation.Clone(), groups, deformGroups,
+            };
+            DifferentiableOps.RecordIfActive("DeformableConv2DGrouped", result,
+                new[] { input, kernel, offset, mask },
+                BackwardFunctions<T>.DeformableConv2DGroupedBackwardWithMask,
+                savedState);
+
+            if (GraphMode.IsActive)
+            {
+                var scope = GraphMode.Current;
+                if (scope != null)
+                {
+                    var capturedInput = input;
+                    var capturedKernel = kernel;
+                    var capturedOffset = offset;
+                    var capturedMask = mask;
+                    var capturedStride = (int[])stride.Clone();
+                    var capturedPadding = (int[])padding.Clone();
+                    var capturedDilation = (int[])dilation.Clone();
+                    int capturedGroups = groups;
+                    int capturedDeformGroups = deformGroups;
+                    var outShape = (int[])result._shape.Clone();
+                    return scope.RecordVariadic(
+                        LazyNodeType.Custom,
+                        "DeformableConv2DGrouped",
+                        new[] { input, kernel, offset, mask },
+                        outShape,
+                        (eng, output) =>
+                        {
+                            var replayed = eng.DeformableConv2DGrouped(
+                                capturedInput, capturedKernel, capturedOffset,
+                                capturedMask,
+                                capturedStride, capturedPadding, capturedDilation,
+                                capturedGroups, capturedDeformGroups);
+                            DirectGpuTensorEngine.CopyResultInto(eng, replayed, output);
+                        },
+                        BackwardFunctions<T>.DeformableConv2DGroupedBackwardWithMask,
+                        savedState);
+                }
+            }
         }
         return result;
     }
