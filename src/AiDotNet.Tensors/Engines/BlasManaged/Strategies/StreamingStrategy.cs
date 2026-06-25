@@ -129,7 +129,7 @@ internal static class StreamingStrategy
                 int ldaLocal = lda, ldbLocal = ldb, ldcLocal = ldc;
                 bool taLocal = transA, tbLocal = transB;
 
-                StreamingWorkerPool.Dispatch(procsLocal, p =>
+                PersistentParallelExecutor.Instance.Execute(procsLocal, p =>
                 {
                     int mStart = (int)(((long)p * mLocal) / procsLocal);
                     int mEnd = (int)(((long)(p + 1) * mLocal) / procsLocal);
@@ -191,7 +191,7 @@ internal static class StreamingStrategy
                     bool taLocal = transA, tbLocal = transB;
                     int procsLocal = procs;
 
-                    StreamingWorkerPool.Dispatch(procsLocal, p =>
+                    PersistentParallelExecutor.Instance.Execute(procsLocal, p =>
                     {
                         var (kStart, kLen) = KAxisDriver.GetThreadRange(k, procsLocal, p);
                         if (kLen <= 0) return;
@@ -237,7 +237,7 @@ internal static class StreamingStrategy
                     bool taLocal = transA, tbLocal = transB;
                     int procsLocal = procs;
 
-                    StreamingWorkerPool.Dispatch(procsLocal, p =>
+                    PersistentParallelExecutor.Instance.Execute(procsLocal, p =>
                     {
                         var (kStart, kLen) = KAxisDriver.GetThreadRange(k, procsLocal, p);
                         if (kLen <= 0) return;
@@ -304,7 +304,7 @@ internal static class StreamingStrategy
                 int ldaLocal = lda, ldbLocal = ldb, ldcLocal = ldc;
                 bool taLocal = transA, tbLocal = transB;
 
-                StreamingWorkerPool.Dispatch(procsLocal, p =>
+                PersistentParallelExecutor.Instance.Execute(procsLocal, p =>
                 {
                     int nStart = (int)(((long)p * nLocal) / procsLocal);
                     int nEnd = (int)(((long)(p + 1) * nLocal) / procsLocal);
