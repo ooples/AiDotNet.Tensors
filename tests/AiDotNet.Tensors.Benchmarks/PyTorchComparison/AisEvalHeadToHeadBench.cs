@@ -700,6 +700,7 @@ internal static class AisEvalHeadToHeadBench
         var shapes = new (int M, int N, int K, string tag)[]
         {
             (768, 768, 768, "sq768"), (1024, 1024, 1024, "sq1024"), (2048, 2048, 2048, "sq2048"),
+            (4096, 4096, 4096, "sq4096"),
             (256, 3456, 1152, "dit-qkv"), (256, 1152, 1152, "dit-attnout"),
             (256, 4608, 1152, "dit-mlp1"), (256, 1152, 4608, "dit-mlp2"),
         };

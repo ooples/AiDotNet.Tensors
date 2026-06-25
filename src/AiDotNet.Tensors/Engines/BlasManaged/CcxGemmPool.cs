@@ -123,16 +123,22 @@ internal static unsafe class CcxGemmPool
     internal static bool TryRun(float* a, int lda, float* b, int ldb, float* c, int ldc, int m, int n, int k)
     {
         if (s_disable || !IsAvailable) return false;
-        // Win regime (measured): large + BALANCED (CCX beats per-tile on squares; skewed/wide-N regress).
-        if (m < 768 || n < 768 || k < 256) return false;
+        // Win regime (measured): large + BALANCED squares (CCX 1.12-1.19x on sq2048 = ~46% MKL). Below
+        // ~1536 the win is noise-level (±5%) so gate it out to GUARANTEE no regression; skewed/wide-N
+        // (DiT) regress and are excluded by the balance check below.
+        if (m < 1536 || n < 1536 || k < 256) return false;
         if ((long)m * n * k < CcxMinWork) return false;
         if (n > 2 * m || m > 2 * n) return false;            // not balanced → per-tile/PackBoth
         if ((n / _numCcx) < Nr32) return false;              // strips too thin to tile
+        int mc = ChooseMc(m), nc = ChooseNc(n), kc = 256;
+        // The CCX win requires the per-CCX B-strip (K·nc) to stay cache-friendly. Above ~2MB the microkernel
+        // reads it from L3 and per-tile's L2-resident per-panel B wins (MEASURED: sq2048 K·nc=1MB CCX 1.14x;
+        // sq4096 K·nc=4MB CCX 0.86x). So cap the strip → huge squares fall back to per-tile.
+        if ((long)k * nc > 512L * 1024) return false;
         if (CpuParallelSettings.MaxDegreeOfParallelism < _total) return false; // restricted budget → per-tile
         if (!Monitor.TryEnter(_runGate)) return false;       // concurrent GEMM owns the pool → per-tile
         try
         {
-            int mc = ChooseMc(m), nc = ChooseNc(n), kc = 256;
             long need = GotoGemmFp32.PackedBLen(nc, k, kc);
             if (need > _bbufLen)
             {
