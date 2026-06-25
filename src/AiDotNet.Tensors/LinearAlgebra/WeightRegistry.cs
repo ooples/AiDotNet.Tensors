@@ -1104,7 +1104,24 @@ public static class WeightRegistry
         if (weight.Lifetime != WeightLifetime.Streaming) return;
         if (weight.StreamingPoolHandle < 0) return;
         if (weight.DataVector.Length == 0) return; // already released
-        weight.DropStorageForStreaming();
+        // Soft-defer drop — mirrors the RegisterWeight #430 fix. A streaming
+        // weight's storage can be SHARED (refcount > 1) at release time when a
+        // peer holds a second reference for the duration of the layer's Forward:
+        //   - a copy-on-write clone (#624) taken inside the op (O(1) until write),
+        //   - a RebindStorageFrom peer (CompiledInferencePlan / MemoryPlanning),
+        //   - an int8/int4 quant-resident alias (#629),
+        //   - an autodiff tape input capture (training).
+        // The strict DropStorageForStreaming() throws "requires sole storage
+        // ownership; refcount is 2" in that window, which the foundation-scale
+        // streaming-inference path surfaces as the MaterializeScope.Dispose
+        // AggregateException that breaks every paper-scale VLM forward (Phi3Vision,
+        // SmolVLM, Whisper, …). DEFER instead: leave the bytes resident for the
+        // peer and mark StreamingDropDeferred so TryFinalizeDeferredDrop retries
+        // once the peer ref releases. A deferred (still-resident) weight is never
+        // corrupt — only un-evicted — so this can only cost a little extra
+        // residency, never correctness.
+        bool dropped = weight.TryDropStorageForStreaming(throwOnSharedRefcount: false);
+        weight.StreamingDropDeferred = !dropped;
     }
 
     /// <summary>
