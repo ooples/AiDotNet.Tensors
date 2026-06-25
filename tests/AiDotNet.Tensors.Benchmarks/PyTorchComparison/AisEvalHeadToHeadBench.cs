@@ -346,6 +346,160 @@ internal static class AisEvalHeadToHeadBench
     /// for MLP? If a low cap wins, it's a cheap production lever. Run:
     /// --ab-aiseval-dopsweep.
     /// </summary>
+    /// <summary>
+    /// Raw GEMM (TensorMatMul) multi-thread SCALING sweep at DiT/transformer sizes, with a native
+    /// TorchSharp (libtorch/MKL) reference. Roots the diffusion model-family CPU test timeouts: the
+    /// managed BLAS scales poorly + trails native. Run: --ab-gemm-dop.
+    /// </summary>
+    // Time-budgeted MIN-of-N timer: warms up, then takes the BEST (min) of 8 rounds — the round
+    // that caught the highest boost / least OS-jitter. On a 64-core Threadripper the all-core clock
+    // throttles vs the 1-thread boost, and the box has run-to-run variance; min-of-N makes the GEMM
+    // A/B reproducible (a single 10-rep timing swung ~2x run-to-run). Adaptive reps per round so a
+    // 100ms square-2048 op and a 1ms attn-proj op both get fair coverage.
+    private static double MinMs(Action op)
+    {
+        var w = Stopwatch.StartNew();
+        while (w.ElapsedMilliseconds < 100) op();           // warm caches + boost
+        double best = double.PositiveInfinity;
+        for (int r = 0; r < 8; r++)
+        {
+            var sw = Stopwatch.StartNew();
+            int reps = 0;
+            do { op(); reps++; } while (sw.Elapsed.TotalMilliseconds < 40);
+            sw.Stop();
+            best = Math.Min(best, sw.Elapsed.TotalMilliseconds / reps);
+        }
+        return best;
+    }
+
+    public static void GemmDopSweep()
+    {
+        torch.set_grad_enabled(false);
+        int P = Environment.ProcessorCount;
+        Console.WriteLine($"=== GEMM gap decomposition: managed BLAS vs native MKL (cores={P}) ===");
+        Console.WriteLine("GFLOP/s, min-of-8 time-budgeted. scal = Nthread/1thread. gap = MKL/managed.");
+        var engine = new CpuEngine();
+        var sizes = new (int M, int K, int N, string tag)[]
+        {
+            (256, 1152, 1152, "attn-proj"),
+            (256, 1152, 4608, "mlp-fc"),
+            (1024, 1024, 1024, "square1024"),
+            (2048, 2048, 2048, "square2048"),
+        };
+        int saved = CpuParallelSettings.MaxDegreeOfParallelism;
+        try
+        {
+            Console.WriteLine($"{"shape",-11}{"mgd1t",8}{"mgdNt",8}{"mgdScal",9}{"mkl1t",8}{"mklNt",8}{"mklScal",9}{"gap1t",7}{"gapNt",7}");
+            foreach (var (M, K, N, tag) in sizes)
+            {
+                var a = Tensor<float>.CreateRandom(M, K);
+                var b = Tensor<float>.CreateRandom(K, N);
+                double gf = 2.0 * M * K * N / 1e9;
+                double Mgd(int dop) { CpuParallelSettings.MaxDegreeOfParallelism = dop; return gf / (MinMs(() => { var _ = engine.TensorMatMul(a, b); }) / 1000); }
+                double m1 = Mgd(1), mN = Mgd(P);
+                double k1 = 0, kN = 0;
+                try
+                {
+                    var ta = torch.rand(M, K); var tb = torch.rand(K, N);
+                    double Mkl(int t) { torch.set_num_threads(t); return gf / (MinMs(() => { using var _ = torch.matmul(ta, tb); }) / 1000); }
+                    k1 = Mkl(1); kN = Mkl(P);
+                }
+                catch (Exception e) { Console.WriteLine($"  torch ref failed: {e.Message}"); }
+                Console.WriteLine($"{tag,-11}{m1,8:F1}{mN,8:F1}{mN / m1,8:F1}x{k1,8:F1}{kN,8:F1}{kN / k1,8:F1}x{(m1 > 0 ? k1 / m1 : 0),6:F1}x{(mN > 0 ? kN / mN : 0),6:F1}x");
+            }
+        }
+        finally { CpuParallelSettings.MaxDegreeOfParallelism = saved; }
+    }
+
+    /// <summary>
+    /// Blocking sweep: for each shape, override (Mc,Nc,Kc) via AutotuneDispatcher.BlockOverride
+    /// (set on the main thread where Decide runs) and measure all-core GFLOP/s, to find the
+    /// blocking that maximizes scaling — the dominant gap vs MKL. Run: --ab-gemm-block.
+    /// </summary>
+    /// <summary>
+    /// Thread-count sweep (in-process, min-of-8): find the DOP that maximizes all-core GEMM on this
+    /// 64-core/128-thread chip. If best DOP &lt; 128, the parallel framework is over-subscribing
+    /// (SMT/memory contention) — capping threads would be a free scaling win. Run: --ab-gemm-dopfine.
+    /// </summary>
+    public static void GemmDopFine()
+    {
+        int P = Environment.ProcessorCount;
+        Console.WriteLine($"=== GEMM thread-count sweep (optimal DOP) cores={P} ===");
+        var engine = new CpuEngine();
+        var sizes = new (int M, int K, int N, string tag)[]
+        {
+            (256, 1152, 1152, "attn-proj"),
+            (256, 1152, 4608, "mlp-fc"),
+            (1024, 1024, 1024, "square1024"),
+            (2048, 2048, 2048, "square2048"),
+        };
+        int saved = CpuParallelSettings.MaxDegreeOfParallelism;
+        int[] dops = { 8, 16, 32, 48, 64, 96, 128 };
+        try
+        {
+            foreach (var (M, K, N, tag) in sizes)
+            {
+                var a = Tensor<float>.CreateRandom(M, K);
+                var b = Tensor<float>.CreateRandom(K, N);
+                double gf = 2.0 * M * K * N / 1e9;
+                var sb = new System.Text.StringBuilder($"{tag,-11}");
+                double best = 0; int bestDop = 0;
+                foreach (int d in dops)
+                {
+                    CpuParallelSettings.MaxDegreeOfParallelism = d;
+                    double g = gf / (MinMs(() => { var _ = engine.TensorMatMul(a, b); }) / 1000);
+                    sb.Append($" {d}t={g,5:F0}");
+                    if (g > best) { best = g; bestDop = d; }
+                }
+                Console.WriteLine(sb + $"  BEST={best:F0}@{bestDop}t");
+            }
+        }
+        finally { CpuParallelSettings.MaxDegreeOfParallelism = saved; }
+    }
+
+    public static void GemmBlockingSweep()
+    {
+        torch.set_grad_enabled(false);
+        int P = Environment.ProcessorCount;
+        Console.WriteLine($"=== GEMM blocking sweep (Mc/Nc/Kc via BlockOverride) @ DOP={P} cores ===");
+        var engine = new CpuEngine();
+        int saved = CpuParallelSettings.MaxDegreeOfParallelism;
+        CpuParallelSettings.MaxDegreeOfParallelism = P;
+        var sizes = new (int M, int K, int N, string tag, double mkl)[]
+        {
+            (256, 1152, 1152, "attn-proj", 1305),
+            (256, 1152, 4608, "mlp-fc", 1245),
+            (1024, 1024, 1024, "square1024", 1107),
+            (2048, 2048, 2048, "square2048", 1602),
+        };
+        int[] mcs = { 18, 60, 120, 192, 256, 384, 512 };
+        int[] ncs = { 256, 512, 1024, 2048 };
+        int[] kcs = { 128, 256, 512 };
+        try
+        {
+            foreach (var (M, K, N, tag, mkl) in sizes)
+            {
+                var a = Tensor<float>.CreateRandom(M, K);
+                var b = Tensor<float>.CreateRandom(K, N);
+                double gf = 2.0 * M * K * N / 1e9;
+                double best = 0; (int mc, int nc, int kc) bestcfg = (0, 0, 0);
+                foreach (int mc in mcs)
+                    foreach (int nc in ncs)
+                        foreach (int kc in kcs)
+                        {
+                            if (mc > M + 64 || nc > N + 64 || kc > K + 64) continue;
+                            AiDotNet.Tensors.Engines.BlasManaged.AutotuneDispatcher.BlockOverride = (mc, nc, kc);
+                            double g;
+                            try { g = gf / (MinMs(() => { var _ = engine.TensorMatMul(a, b); }) / 1000); }
+                            finally { AiDotNet.Tensors.Engines.BlasManaged.AutotuneDispatcher.BlockOverride = null; }
+                            if (g > best) { best = g; bestcfg = (mc, nc, kc); }
+                        }
+                Console.WriteLine($"{tag,-11} BEST {best,7:F0} GFLOP/s @ mc={bestcfg.mc} nc={bestcfg.nc} kc={bestcfg.kc}   (MKL {mkl,5:F0}, {best / mkl * 100,3:F0}% of MKL)");
+            }
+        }
+        finally { CpuParallelSettings.MaxDegreeOfParallelism = saved; }
+    }
+
     public static void DopSweep()
     {
         Console.WriteLine("=== Issue #436 — CpuParallelSettings MaxDOP sweep (MHA, LSTM) ===");

@@ -62,6 +62,24 @@ class Program
             return;
         }
 
+        if (args[0] == "--ab-gemm-dop")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.GemmDopSweep();
+            return;
+        }
+
+        if (args[0] == "--ab-gemm-block")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.GemmBlockingSweep();
+            return;
+        }
+
+        if (args[0] == "--ab-gemm-dopfine")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.GemmDopFine();
+            return;
+        }
+
         if (args[0] == "--ab-aiseval-poolstats")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.PoolStats();
