@@ -510,6 +510,56 @@ internal static class AisEvalHeadToHeadBench
         }
     }
 
+    /// <summary>
+    /// GotoGemmFp32 rewrite: single-thread correctness (vs naive ref, incl. an unaligned shape that
+    /// exercises the M/N tails) + single-thread GFLOP/s. Run: --ab-goto-gemm.
+    /// </summary>
+    public static unsafe void GotoGemmBench()
+    {
+        Console.WriteLine("=== GotoGemmFp32 (rewrite) single-thread correctness + perf ===");
+        if (!AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.IsAvailable) { Console.WriteLine("GotoGemmFp32 not available on this CPU/OS"); return; }
+        int mc = AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.DefaultMc;
+        int nc = AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.DefaultNc;
+        int kc = AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.DefaultKc;
+        var rng = new Random(11);
+        var shapes = new (int M, int N, int K, string tag)[]
+        {
+            (252, 1152, 1152, "attn-proj"),
+            (250, 1150, 1150, "unaligned"),
+            (1020, 1024, 1024, "square1024"),
+            (2046, 2048, 2048, "square2048"),
+        };
+        foreach (var (M, N, K, tag) in shapes)
+        {
+            var A = new float[(long)M * K]; var B = new float[(long)K * N]; var C = new float[(long)M * N];
+            for (int i = 0; i < A.Length; i++) A[i] = (float)(rng.NextDouble() - 0.5);
+            for (int i = 0; i < B.Length; i++) B[i] = (float)(rng.NextDouble() - 0.5);
+            fixed (float* pa = A, pb = B, pc = C)
+                AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.RunSingle(pa, K, pb, N, pc, N, M, N, K, mc, nc, kc);
+            var rv = new Random(5); double maxRel = 0;
+            for (int t = 0; t < 200; t++)
+            {
+                int r = rv.Next(M), col = rv.Next(N);
+                double s = 0; for (int k = 0; k < K; k++) s += (double)A[(long)r * K + k] * B[(long)k * N + col];
+                double err = Math.Abs(C[(long)r * N + col] - s);
+                maxRel = Math.Max(maxRel, Math.Abs(s) > 1e-3 ? err / Math.Abs(s) : err);
+            }
+            bool ok = maxRel < 1e-3;
+            double gf = 2.0 * M * N * K / 1e9, best = double.PositiveInfinity;
+            fixed (float* pa = A, pb = B, pc = C)
+            {
+                var w = Stopwatch.StartNew(); while (w.ElapsedMilliseconds < 100) AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.RunSingle(pa, K, pb, N, pc, N, M, N, K, mc, nc, kc);
+                for (int rr = 0; rr < 6; rr++)
+                {
+                    var sw = Stopwatch.StartNew(); int reps = 0;
+                    do { AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.RunSingle(pa, K, pb, N, pc, N, M, N, K, mc, nc, kc); reps++; } while (sw.Elapsed.TotalMilliseconds < 40);
+                    sw.Stop(); best = Math.Min(best, sw.Elapsed.TotalMilliseconds / reps);
+                }
+            }
+            Console.WriteLine($"{tag,-11} correct={ok} (maxRel {maxRel:E2})  single-thread {gf / (best / 1000),6:F1} GFLOP/s");
+        }
+    }
+
     public static void GemmDopFine()
     {
         int P = Environment.ProcessorCount;

@@ -92,6 +92,12 @@ class Program
             return;
         }
 
+        if (args[0] == "--ab-goto-gemm")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.GotoGemmBench();
+            return;
+        }
+
         if (args[0] == "--ab-aiseval-poolstats")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.PoolStats();
