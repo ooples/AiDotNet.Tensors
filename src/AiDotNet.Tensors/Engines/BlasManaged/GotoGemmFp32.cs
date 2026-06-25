@@ -50,11 +50,18 @@ internal static class GotoGemmFp32
     /// <summary>Shape-adaptive (Mc, Nc, Kc) for RunParallel, tuned on the 3990X (measured --ab-goto-par).
     /// Memory-bound regime: larger square shapes want larger tiles (fewer redundant DRAM re-reads);
     /// skewed / smaller shapes want smaller Mc for enough IC-blocks. Kc=512 is universally best.</summary>
+    internal static int s_kcOverride; // 0 = use ParallelKc; A/B knob for the kc sweep
+    // kc=256 (not 512): once the pack is SIMD (B 2xVector256, A 8x8 transpose), the smaller K-block that
+    // keeps the microkernel's per-C-tile working set (A 6×kc + B kc×16 ≈ 22·kc floats) in L1 (32KB) wins —
+    // sq1024 +25%, sq2048 +9% vs kc=512 (measured --profile-gemm). With the old scalar pack, kc=512 won
+    // because it amortized the (then-expensive) packing; SIMD packing flipped the tradeoff toward L1 fit.
+    private const int ParallelKc = 256;
     internal static (int mc, int nc, int kc) ChooseParallelBlocks(int m, int n)
     {
-        if (m >= 1536 && n >= 1536) return (192, 256, DefaultKc); // large square
-        if (m >= 640 && n >= 640) return (96, 128, DefaultKc);    // medium square
-        return (120, 128, DefaultKc);                              // skewed / smaller
+        int kc = s_kcOverride > 0 ? s_kcOverride : ParallelKc;
+        if (m >= 1536 && n >= 1536) return (192, 256, kc); // large square
+        if (m >= 640 && n >= 640) return (96, 128, kc);    // medium square
+        return (120, 128, kc);                              // skewed / smaller
     }
 
 #if NET5_0_OR_GREATER

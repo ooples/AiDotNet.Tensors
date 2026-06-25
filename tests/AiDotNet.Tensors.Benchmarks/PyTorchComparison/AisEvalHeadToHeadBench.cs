@@ -667,6 +667,7 @@ internal static class AisEvalHeadToHeadBench
             case "sq768": M = 768; N = 768; K = 768; break;
         }
         double secs = double.TryParse(Environment.GetEnvironmentVariable("PROFILE_SECONDS"), out var s) ? s : 20;
+        if (int.TryParse(Environment.GetEnvironmentVariable("KC"), out var kcv)) AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.s_kcOverride = kcv;
         var ea = Tensor<float>.CreateRandom(M, K); var eb = Tensor<float>.CreateRandom(K, N);
         for (int i = 0; i < 20; i++) { var _ = engine.TensorMatMul(ea, eb); } // warm
         Console.WriteLine($"PROFILING engine.TensorMatMul [{M}x{N}x{K}] for {secs}s — attach profiler now");
