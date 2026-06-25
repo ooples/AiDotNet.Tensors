@@ -128,6 +128,12 @@ class Program
             return;
         }
 
+        if (args[0] == "--ab-strassen")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.GotoStrassenBench();
+            return;
+        }
+
         if (args[0] == "--profile-gemm")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.ProfileGemm();

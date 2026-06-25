@@ -698,6 +698,54 @@ internal static class AisEvalHeadToHeadBench
     }
 
     /// <summary>
+    /// #23 one-level Strassen vs standard fp32 GEMM vs MKL on large squares. 7 sub-multiplies instead of 8
+    /// (~12.5% fewer multiply-FLOPs) to attack the all-core AVX2 FMA-throttle ceiling (the binding
+    /// constraint per #19). Reports str/fp32, str/MKL, and the Frobenius accuracy hit. Run: --ab-strassen.
+    /// </summary>
+    public static unsafe void GotoStrassenBench()
+    {
+        torch.set_grad_enabled(false);
+        int P = Environment.ProcessorCount;
+        if (!AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.IsAvailable) { Console.WriteLine("not available"); return; }
+        int saved = CpuParallelSettings.MaxDegreeOfParallelism;
+        CpuParallelSettings.MaxDegreeOfParallelism = P;
+        var rng = new Random(13);
+        var shapes = new (int n, string tag)[] { (2048, "sq2048"), (4096, "sq4096") };
+        Console.WriteLine($"=== one-level Strassen vs fp32 vs MKL, cores={P} ===");
+        try
+        {
+            torch.set_num_threads(P);
+            { var wa = torch.rand(2048, 2048); var wb = torch.rand(2048, 2048); var ww = Stopwatch.StartNew(); while (ww.ElapsedMilliseconds < 1500) { using var _ = torch.matmul(wa, wb); } }
+            foreach (var (n, tag) in shapes)
+            {
+                var A = new float[(long)n * n]; var B = new float[(long)n * n]; var Cf = new float[(long)n * n]; var Cs = new float[(long)n * n];
+                for (int i = 0; i < A.Length; i++) A[i] = (float)(rng.NextDouble() - 0.5);
+                for (int i = 0; i < B.Length; i++) B[i] = (float)(rng.NextDouble() - 0.5);
+                var (mc, nc, kc) = AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.ChooseParallelBlocks(n, n);
+                double gf = 2.0 * n * n * n / 1e9, relErr, f32 = double.PositiveInfinity, str = double.PositiveInfinity, mkl = double.PositiveInfinity;
+                var ta = torch.rand(n, n); var tb = torch.rand(n, n);
+                fixed (float* pa = A, pb = B, pcf = Cf, pcs = Cs)
+                {
+                    AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.RunParallel(pa, n, pb, n, pcf, n, n, n, n, mc, nc, kc);
+                    AiDotNet.Tensors.Engines.BlasManaged.StrassenGemm.RunSquare(pa, n, pb, n, pcs, n, n);
+                    double sumE2 = 0, sumC2 = 0;
+                    for (long i = 0; i < (long)n * n; i += 7) { double e = (double)Cs[i] - Cf[i]; sumE2 += e * e; sumC2 += (double)Cf[i] * Cf[i]; }
+                    relErr = sumC2 > 0 ? Math.Sqrt(sumE2 / sumC2) : 0;
+                    for (int r = 0; r < 8; r++)
+                    {
+                        { var sw = Stopwatch.StartNew(); int q = 0; do { AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.RunParallel(pa, n, pb, n, pcf, n, n, n, n, mc, nc, kc); q++; } while (sw.Elapsed.TotalMilliseconds < 30); sw.Stop(); f32 = Math.Min(f32, sw.Elapsed.TotalMilliseconds / q); }
+                        { var sw = Stopwatch.StartNew(); int q = 0; do { AiDotNet.Tensors.Engines.BlasManaged.StrassenGemm.RunSquare(pa, n, pb, n, pcs, n, n); q++; } while (sw.Elapsed.TotalMilliseconds < 30); sw.Stop(); str = Math.Min(str, sw.Elapsed.TotalMilliseconds / q); }
+                        { var sw = Stopwatch.StartNew(); int q = 0; do { using var _ = torch.matmul(ta, tb); q++; } while (sw.Elapsed.TotalMilliseconds < 30); sw.Stop(); mkl = Math.Min(mkl, sw.Elapsed.TotalMilliseconds / q); }
+                    }
+                }
+                double f32Gf = gf / (f32 / 1000), strGf = gf / (str / 1000), mklGf = gf / (mkl / 1000);
+                Console.WriteLine($"{tag,-8} fp32={f32Gf,7:F0}  strassen={strGf,7:F0}  MKL={mklGf,7:F0}   str/fp32={(f32Gf > 0 ? strGf / f32Gf : 0),4:F2}x  str/MKL={(mklGf > 0 ? strGf / mklGf * 100 : 0),4:F0}%   str-relErr={relErr:E2}");
+            }
+        }
+        finally { CpuParallelSettings.MaxDegreeOfParallelism = saved; }
+    }
+
+    /// <summary>
     /// Tight engine.TensorMatMul loop for an external profiler (PerfView / dotnet-trace) to find where the
     /// per-call time ACTUALLY goes (GEMM kernel vs output alloc vs dispatch vs GC) — no guessing. Shape via
     /// env PROFILE_SHAPE (sq1024 default; dit-attnout / dit-mlp2 / sq2048). Runs PROFILE_SECONDS (default 20).
