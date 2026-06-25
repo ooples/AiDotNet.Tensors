@@ -3464,6 +3464,150 @@ public interface IEngine
         int[] dilation);
 
     /// <summary>
+    /// Computes a grouped/depthwise deformable convolution (DCNv3, Wang et al. 2023).
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="input">Input tensor [batch, inChannels, height, width].</param>
+    /// <param name="kernel">Convolution kernel [outChannels, inChannels/groups, kH, kW].</param>
+    /// <param name="offset">Offset tensor [batch, 2·kH·kW·deformGroups, outH, outW] (per-deformable-group blocks).</param>
+    /// <param name="mask">Optional modulation mask [batch, kH·kW·deformGroups, outH, outW] (null for DCNv1).</param>
+    /// <param name="stride">The stride [strideH, strideW].</param>
+    /// <param name="padding">The padding [padH, padW].</param>
+    /// <param name="dilation">The dilation [dilationH, dilationW].</param>
+    /// <param name="groups">Number of convolution groups (channels partitioned independently).</param>
+    /// <param name="deformGroups">Number of deformable groups sharing offset/mask fields.</param>
+    /// <returns>Output tensor [batch, outChannels, outH, outW].</returns>
+    /// <remarks>
+    /// <para>
+    /// DCNv3's parameter efficiency comes from grouping: each output group convolves only its slice of
+    /// input channels, and offsets/masks are predicted per deformable group. With
+    /// <paramref name="groups"/> = <paramref name="deformGroups"/> = 1 this reduces exactly to
+    /// <see cref="DeformableConv2D{T}"/>. <paramref name="groups"/> and <paramref name="deformGroups"/>
+    /// must divide one another (covers depthwise deformGroups==groups and shared deformGroups==1).
+    /// </para>
+    /// </remarks>
+    Tensor<T> DeformableConv2DGrouped<T>(
+        Tensor<T> input,
+        Tensor<T> kernel,
+        Tensor<T> offset,
+        Tensor<T>? mask,
+        int[] stride,
+        int[] padding,
+        int[] dilation,
+        int groups,
+        int deformGroups);
+
+    /// <summary>
+    /// Computes the gradient of <see cref="DeformableConv2DGrouped{T}"/> with respect to the input.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="gradOutput">The gradient flowing back from the output.</param>
+    /// <param name="input">The original input tensor from forward pass.</param>
+    /// <param name="kernel">The convolution kernel from forward pass.</param>
+    /// <param name="offset">The offset tensor from forward pass.</param>
+    /// <param name="mask">The modulation mask from forward pass (null for DCNv1).</param>
+    /// <param name="inputShape">The shape of the original input tensor.</param>
+    /// <param name="stride">The stride used in forward pass.</param>
+    /// <param name="padding">The padding used in forward pass.</param>
+    /// <param name="dilation">The dilation used in forward pass.</param>
+    /// <param name="groups">Number of convolution groups.</param>
+    /// <param name="deformGroups">Number of deformable groups.</param>
+    /// <returns>The gradient with respect to the input tensor.</returns>
+    Tensor<T> DeformableConv2DGroupedBackwardInput<T>(
+        Tensor<T> gradOutput,
+        Tensor<T> input,
+        Tensor<T> kernel,
+        Tensor<T> offset,
+        Tensor<T>? mask,
+        int[] inputShape,
+        int[] stride,
+        int[] padding,
+        int[] dilation,
+        int groups,
+        int deformGroups);
+
+    /// <summary>
+    /// Computes the gradient of <see cref="DeformableConv2DGrouped{T}"/> with respect to the kernel.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="gradOutput">The gradient flowing back from the output.</param>
+    /// <param name="input">The original input tensor from forward pass.</param>
+    /// <param name="offset">The offset tensor from forward pass.</param>
+    /// <param name="mask">The modulation mask from forward pass (null for DCNv1).</param>
+    /// <param name="kernelShape">The shape of the kernel tensor [outChannels, inChannels/groups, kH, kW].</param>
+    /// <param name="stride">The stride used in forward pass.</param>
+    /// <param name="padding">The padding used in forward pass.</param>
+    /// <param name="dilation">The dilation used in forward pass.</param>
+    /// <param name="groups">Number of convolution groups.</param>
+    /// <param name="deformGroups">Number of deformable groups.</param>
+    /// <returns>The gradient with respect to the kernel tensor.</returns>
+    Tensor<T> DeformableConv2DGroupedBackwardKernel<T>(
+        Tensor<T> gradOutput,
+        Tensor<T> input,
+        Tensor<T> offset,
+        Tensor<T>? mask,
+        int[] kernelShape,
+        int[] stride,
+        int[] padding,
+        int[] dilation,
+        int groups,
+        int deformGroups);
+
+    /// <summary>
+    /// Computes the gradient of <see cref="DeformableConv2DGrouped{T}"/> with respect to the offset.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="gradOutput">The gradient flowing back from the output.</param>
+    /// <param name="input">The original input tensor from forward pass.</param>
+    /// <param name="kernel">The convolution kernel from forward pass.</param>
+    /// <param name="offset">The offset tensor from forward pass.</param>
+    /// <param name="mask">The modulation mask from forward pass (null for DCNv1).</param>
+    /// <param name="stride">The stride used in forward pass.</param>
+    /// <param name="padding">The padding used in forward pass.</param>
+    /// <param name="dilation">The dilation used in forward pass.</param>
+    /// <param name="groups">Number of convolution groups.</param>
+    /// <param name="deformGroups">Number of deformable groups.</param>
+    /// <returns>The gradient with respect to the offset tensor.</returns>
+    Tensor<T> DeformableConv2DGroupedBackwardOffset<T>(
+        Tensor<T> gradOutput,
+        Tensor<T> input,
+        Tensor<T> kernel,
+        Tensor<T> offset,
+        Tensor<T>? mask,
+        int[] stride,
+        int[] padding,
+        int[] dilation,
+        int groups,
+        int deformGroups);
+
+    /// <summary>
+    /// Computes the gradient of <see cref="DeformableConv2DGrouped{T}"/> with respect to the modulation mask.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="gradOutput">The gradient flowing back from the output.</param>
+    /// <param name="input">The original input tensor from forward pass.</param>
+    /// <param name="kernel">The convolution kernel from forward pass.</param>
+    /// <param name="offset">The offset tensor from forward pass.</param>
+    /// <param name="mask">The modulation mask from forward pass.</param>
+    /// <param name="stride">The stride used in forward pass.</param>
+    /// <param name="padding">The padding used in forward pass.</param>
+    /// <param name="dilation">The dilation used in forward pass.</param>
+    /// <param name="groups">Number of convolution groups.</param>
+    /// <param name="deformGroups">Number of deformable groups.</param>
+    /// <returns>The gradient with respect to the modulation mask tensor.</returns>
+    Tensor<T> DeformableConv2DGroupedBackwardMask<T>(
+        Tensor<T> gradOutput,
+        Tensor<T> input,
+        Tensor<T> kernel,
+        Tensor<T> offset,
+        Tensor<T> mask,
+        int[] stride,
+        int[] padding,
+        int[] dilation,
+        int groups,
+        int deformGroups);
+
+    /// <summary>
     /// Computes the gradient of GridSample with respect to the input (NHWC format).
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>

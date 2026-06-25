@@ -8562,6 +8562,48 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
+    /// Grouped/depthwise deformable convolution (DCNv3). Interim GPU path: per-group composition over the
+    /// validated groups=1 GPU <see cref="DeformableConv2D{T}"/> kernel plus a GPU concat — every group runs a
+    /// real GPU kernel (no CPU fallback). A fused single-launch grouped GPU kernel (passing groups/deformGroups
+    /// straight to the backend with on-hardware parity) is tracked in AiDotNet #1691. The grouped backward is
+    /// inherited from <see cref="CpuEngine"/> and composes over the virtual groups=1 GPU backward kernels.
+    /// </summary>
+    public override Tensor<T> DeformableConv2DGrouped<T>(
+        Tensor<T> input,
+        Tensor<T> kernel,
+        Tensor<T> offset,
+        Tensor<T>? mask,
+        int[] stride,
+        int[] padding,
+        int[] dilation,
+        int groups,
+        int deformGroups)
+    {
+        if (groups == 1 && deformGroups == 1)
+            return DeformableConv2D(input, kernel, offset, mask, stride, padding, dilation);
+        if (!TryGetBackend(out _) || input.Rank != 4 || kernel.Rank != 4)
+            return base.DeformableConv2DGrouped(input, kernel, offset, mask, stride, padding, dilation, groups, deformGroups);
+
+        int inC = input.Shape._dims[1];
+        int outC = kernel.Shape._dims[0];
+        int kk = kernel.Shape._dims[2] * kernel.Shape._dims[3];
+        int inCpg = inC / groups;
+        int outCpg = outC / groups;
+        var parts = new Tensor<T>[groups];
+        for (int g = 0; g < groups; g++)
+        {
+            int dg = deformGroups == 1 ? 0 : g * deformGroups / groups;
+            var inG = input.Slice(1, g * inCpg, (g + 1) * inCpg);
+            var kG = kernel.Slice(0, g * outCpg, (g + 1) * outCpg);
+            var offG = offset.Slice(1, dg * 2 * kk, (dg + 1) * 2 * kk);
+            var mkG = mask?.Slice(1, dg * kk, (dg + 1) * kk);
+            // virtual dispatch -> the groups=1 GPU DeformableConv2D kernel above
+            parts[g] = DeformableConv2D(inG, kG, offG, mkG, stride, padding, dilation);
+        }
+        return Tensor<T>.Concatenate(parts, axis: 1);
+    }
+
+    /// <summary>
     /// GPU-accelerated deformable conv2D backward pass for input gradients.
     /// Falls back to CPU implementation if GPU is unavailable.
     /// </summary>
