@@ -249,6 +249,84 @@ internal static class GotoGemmFp32
         finally { ArrayPool<float>.Shared.Return(paArr); ArrayPool<float>.Shared.Return(pbArr); }
     }
 
+    /// <summary>Floats needed by <see cref="PackBPanel"/> / <see cref="RunTilePackedB"/> to hold ONE
+    /// jc-block's whole-K packed B (numKc panels × nTiles × kc × Nr; last K-panel padded to kc).</summary>
+    internal static long PackedBLen(int effNc, int k, int kc)
+    {
+        int nTiles = (effNc - (effNc % Nr)) / Nr;
+        int numKc = (k + kc - 1) / kc;
+        return (long)numKc * nTiles * kc * Nr;
+    }
+
+    /// <summary>Pack a whole-K B column-block B[0:k, jc:jc+effNc] ONCE into <paramref name="dst"/> (the
+    /// CCX-shared layout): K-panel p at p·nTiles·kc·Nr, Nr-tile nt at +nt·kc·Nr, rows kk·Nr (effKc used).
+    /// Packed once per CCX so the CCX's threads reuse it from their shared L3 with no redundant packing.
+    /// <paramref name="ntStart"/>/<paramref name="ntStride"/> let the CCX's lanes split the pack work
+    /// (lane, threadsPerCcx) so the pack itself is parallel — no serial-pack stall on skewed shapes.</summary>
+    internal static unsafe void PackBPanel(float* b, int ldb, int jc, int effNc, int k, int kc, float* dst,
+        int ntStart = 0, int ntStride = 1)
+    {
+        int nFull = effNc - (effNc % Nr); int nTiles = nFull / Nr;
+        for (int p = 0, pc = 0; pc < k; p++, pc += kc)
+        {
+            int effKc = Math.Min(kc, k - pc);
+            for (int nt = ntStart; nt < nTiles; nt += ntStride)
+            {
+                float* d = dst + (long)p * nTiles * kc * Nr + (long)nt * kc * Nr; int col0 = jc + nt * Nr;
+                for (int kk = 0; kk < effKc; kk++)
+                {
+                    float* brow = b + (long)(pc + kk) * ldb + col0; float* dd = d + (long)kk * Nr;
+                    for (int col = 0; col < Nr; col++) dd[col] = brow[col];
+                }
+            }
+        }
+    }
+
+    /// <summary>Like <see cref="RunTile"/> but B is already packed (by <see cref="PackBPanel"/>) in
+    /// <paramref name="packedB"/> — this tile only packs its own A-panel and runs the kernel + tails
+    /// (tails read the original b). Deterministic (fixed K order, disjoint C). Used by the CCX driver.</summary>
+    internal static unsafe void RunTilePackedB(
+        float* a, int lda, float* b, int ldb, float* c, int ldc,
+        int ic, int jc, int effMc, int effNc, int k, int mc, int nc, int kc, float* packedB)
+    {
+        int nFull = effNc - (effNc % Nr); int nTiles = nFull / Nr;
+        int mFull = effMc - (effMc % Mr); int mTiles = mFull / Mr;
+        float[] paArr = ArrayPool<float>.Shared.Rent(mc * kc);
+        try
+        {
+            fixed (float* pa = paArr)
+            {
+                var kern = Kernel();
+                for (int p = 0, pc = 0; pc < k; p++, pc += kc)
+                {
+                    int effKc = Math.Min(kc, k - pc);
+                    for (int mt = 0; mt < mTiles; mt++)
+                    {
+                        float* dst = pa + (long)mt * effKc * Mr; int row0 = ic + mt * Mr;
+                        for (int kk = 0; kk < effKc; kk++)
+                        {
+                            float* d = dst + (long)kk * Mr;
+                            for (int row = 0; row < Mr; row++) d[row] = a[(long)(row0 + row) * lda + (pc + kk)];
+                        }
+                    }
+                    if (pc == 0) ZeroCBlock(c, ldc, ic, jc, effMc, effNc);
+                    for (int nt = 0; nt < nTiles; nt++)
+                    {
+                        float* bp = packedB + (long)p * nTiles * kc * Nr + (long)nt * kc * Nr; int col0 = jc + nt * Nr;
+                        for (int mt = 0; mt < mTiles; mt++)
+                        {
+                            float* ap = pa + (long)mt * effKc * Mr;
+                            float* cp = c + (long)(ic + mt * Mr) * ldc + col0;
+                            kern(ap, bp, cp, (long)ldc * 4, effKc);
+                        }
+                    }
+                    ScalarTails(a, lda, b, ldb, c, ldc, ic, jc, effMc, effNc, mFull, nFull, pc, effKc);
+                }
+            }
+        }
+        finally { ArrayPool<float>.Shared.Return(paArr); }
+    }
+
     private static unsafe void ZeroCBlock(float* c, int ldc, int ic, int jc, int effMc, int effNc)
     {
         for (int r = 0; r < effMc; r++)

@@ -34,6 +34,9 @@ internal static unsafe class CcxGemmBench
     private static int _numCcx, _threadsPerCcx;
     private static ManualResetEventSlim[] _go = Array.Empty<ManualResetEventSlim>();
     private static CountdownEvent? _done;
+    private static Barrier[] _ccxBarrier = Array.Empty<Barrier>();
+    private static IntPtr[] _ccxB = Array.Empty<IntPtr>();   // per-CCX whole-K packed-B buffer (pack-once)
+    private static long _ccxBLen;                            // current capacity (floats) of each _ccxB
     private static volatile bool _shutdown;
 
     // GEMM params set per Run.
@@ -78,6 +81,9 @@ internal static unsafe class CcxGemmBench
         int total = _numCcx * threadsPerCcx;
         _go = new ManualResetEventSlim[total];
         _done = new CountdownEvent(total);
+        _ccxBarrier = new Barrier[_numCcx];
+        for (int c = 0; c < _numCcx; c++) _ccxBarrier[c] = new Barrier(threadsPerCcx);
+        _ccxB = new IntPtr[_numCcx];
         for (int i = 0; i < total; i++)
         {
             _go[i] = new ManualResetEventSlim(false);
@@ -104,30 +110,49 @@ internal static unsafe class CcxGemmBench
         }
     }
 
-    // CCX owns a contiguous jc-block range → its B-columns live in its own L3. The CCX's lanes split the
-    // (jc-range × all ic-blocks) tiles round-robin; each tile = GotoGemmFp32.RunTile (per-thread A/B pack).
+    // CCX owns a contiguous jc-block range → its B lives in its own L3. PACK-ONCE: lane 0 packs the
+    // jc-block's whole-K B into the CCX-shared buffer, a per-CCX barrier releases the lanes, then the
+    // lanes split the ic-blocks (each only packs its own A) via RunTilePackedB — no redundant B-pack and
+    // B is DRAM-read once per CCX. A second barrier guards the shared buffer before the next jc-block.
     private static void DoWork(int ccx, int lane)
     {
         int numJc = (_n + _nc - 1) / _nc;
         int numIc = (_m + _mc - 1) / _mc;
         int jcStart = (int)((long)ccx * numJc / _numCcx);
         int jcEnd = (int)((long)(ccx + 1) * numJc / _numCcx);
-        int tileIdx = 0;
+        var bar = _ccxBarrier[ccx];
+        float* pkb = (float*)_ccxB[ccx];
         for (int jb = jcStart; jb < jcEnd; jb++)
         {
-            int jc = jb * _nc; int effNc = Math.Min(_nc, _n - jc); if (effNc <= 0) continue;
-            for (int ib = 0; ib < numIc; ib++)
+            int jc = jb * _nc; int effNc = Math.Min(_nc, _n - jc);
+            if (effNc <= 0) { bar.SignalAndWait(); bar.SignalAndWait(); continue; }
+            // Parallel pack: each lane packs its stride of the Nr-tiles → no serial-pack stall.
+            GotoGemmFp32.PackBPanel(_b, _ldb, jc, effNc, _k, _kc, pkb, lane, _threadsPerCcx);
+            bar.SignalAndWait();
+            for (int ib = lane; ib < numIc; ib += _threadsPerCcx)
             {
-                if ((tileIdx++ % _threadsPerCcx) != lane) continue;
                 int ic = ib * _mc; int effMc = Math.Min(_mc, _m - ic); if (effMc <= 0) continue;
-                GotoGemmFp32.RunTile(_a, _lda, _b, _ldb, _c, _ldc, ic, jc, effMc, effNc, _k, _mc, _nc, _kc);
+                GotoGemmFp32.RunTilePackedB(_a, _lda, _b, _ldb, _c, _ldc, ic, jc, effMc, effNc, _k, _mc, _nc, _kc, pkb);
             }
+            bar.SignalAndWait();
         }
     }
 
     public static void Run(float* a, int lda, float* b, int ldb, float* c, int ldc,
         int m, int n, int k, int mc, int nc, int kc)
     {
+        // Ensure each CCX's whole-K packed-B buffer is large enough for this shape's jc-block (amortized:
+        // reallocs only on a size increase, so it's outside the steady-state timing loop).
+        long need = GotoGemmFp32.PackedBLen(nc, k, kc);
+        if (need > _ccxBLen)
+        {
+            for (int c2 = 0; c2 < _numCcx; c2++)
+            {
+                if (_ccxB[c2] != IntPtr.Zero) Marshal.FreeHGlobal(_ccxB[c2]);
+                _ccxB[c2] = Marshal.AllocHGlobal(checked((int)(need * sizeof(float))));
+            }
+            _ccxBLen = need;
+        }
         _a = a; _b = b; _c = c; _lda = lda; _ldb = ldb; _ldc = ldc;
         _m = m; _n = n; _k = k; _mc = mc; _nc = nc; _kc = kc;
         _done!.Reset();
