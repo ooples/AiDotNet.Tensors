@@ -51,6 +51,13 @@ public static partial class BlasManaged
     private static readonly bool s_forceMachineKernel =
         System.Environment.GetEnvironmentVariable("AIDOTNET_FORCE_MK") == "1";
 
+    // GotoBLAS FP32 parallel path (the rewrite) is the default for large float GEMM (see the hook in
+    // Gemm{T}). Tests that must exercise the UNDERLYING strategy paths (N-axis vs M-axis parity, the
+    // machine-kernel dispatch, etc.) set this to true to disable the GotoGemm interception, mirroring
+    // PackBothStrategy.s_disableNAxis. Production leaves it false. Opt-out env: AIDOTNET_DISABLE_GOTO=1.
+    internal static bool s_disableGotoGemm =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_DISABLE_GOTO") == "1";
+
     // #653: extend the PackBoth parallelism-floor + wide-N blocking optimizations to the
     // DisableAutotune shim path the forward GEMM uses (CpuEngine.BatchMatMul -> 6-arg
     // SimdGemm.Sgemm -> Gemm{DisableAutotune}). Those optimizations were gated on
@@ -471,6 +478,35 @@ public static partial class BlasManaged
         if (options.PackingMode == PackingMode.Auto && !transA && !transB
             && options.PackedA is null && options.PackedB is null)
         {
+#if NET5_0_OR_GREATER
+            // GotoBLAS FP32 parallel path (the rewrite): a clean GotoBLAS macro-kernel over per-thread
+            // L2-resident packed A/B tiles. Beats the existing machine-kernel dispatch 1.6-3.9x on the
+            // 3990X (measured --ab-goto-par) by owning disjoint C-tiles (no shared-B streaming) + kc=512
+            // blocking. Deterministic by construction: each C element is computed by exactly one thread
+            // in fixed K-order, so the result is thread-count-independent (Deterministic-mode safe). C is
+            // pre-zeroed above, so RunParallel's zero-then-accumulate yields C := A·B; it handles its own
+            // M/N tails (no Streaming follow-up). Gated to float + the proven large-shape regime.
+            if (typeof(T) == typeof(float) && !s_disableGotoGemm && GotoGemmFp32.IsAvailable
+                && (long)m * n * k >= GotoGemmFp32.ParallelMinWork)
+            {
+                var gepi = options.Epilogue;
+                if (EpilogueFlagsCompute.Compute(in gepi) == EpilogueFlags.None)
+                {
+                    var (gmc, gnc, gkc) = GotoGemmFp32.ChooseParallelBlocks(m, n);
+                    var gfa = MemoryMarshal.Cast<T, float>(a);
+                    var gfb = MemoryMarshal.Cast<T, float>(b);
+                    var gfc = MemoryMarshal.Cast<T, float>(c);
+                    unsafe
+                    {
+                        fixed (float* pa = gfa)
+                        fixed (float* pb = gfb)
+                        fixed (float* pc = gfc)
+                            GotoGemmFp32.RunParallel(pa, lda, pb, ldb, pc, ldc, m, n, k, gmc, gnc, gkc);
+                    }
+                    return;
+                }
+            }
+#endif
             int mkMr = 0, mkNr = 0;
             bool mkAvail = false;
             if (typeof(T) == typeof(double) && MachineKernelGemm.IsFp64Available)

@@ -2933,10 +2933,12 @@ public class ScalarKernelTests
         // procs*mr*2 = 256, m=3137 > 256 → M-axis.
         // Sub-Q (#407): BLIS-style defaults (mc=128, nc=512, kc=256) replaced
         // the previous (64, 64, 64).
+        // kc=512 (was 256): the Zen2/3990X blocking sweep measured Kc=512 as the universal
+        // best K-stripe (+20-54% all-core GFLOP/s); AutotuneDispatcher's heuristic now emits it.
         Assert.Equal(ParallelismAxis.M, axis);
         Assert.Equal(128, mc);
         Assert.Equal(512, nc);
-        Assert.Equal(256, kc);
+        Assert.Equal(512, kc);
     }
 
     [Fact]

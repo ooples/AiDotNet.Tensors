@@ -33,6 +33,20 @@ internal static class GotoGemmFp32
     internal const int DefaultNc = 256;
     internal const int DefaultKc = 512;
 
+    /// <summary>Minimum M·N·K work for the parallel GotoBLAS path to beat the existing machine-kernel
+    /// dispatch (below this the per-tile pack/launch overhead dominates — stay on the existing path).</summary>
+    internal const long ParallelMinWork = 8L * 1024 * 1024; // ~8.4e6
+
+    /// <summary>Shape-adaptive (Mc, Nc, Kc) for RunParallel, tuned on the 3990X (measured --ab-goto-par).
+    /// Memory-bound regime: larger square shapes want larger tiles (fewer redundant DRAM re-reads);
+    /// skewed / smaller shapes want smaller Mc for enough IC-blocks. Kc=512 is universally best.</summary>
+    internal static (int mc, int nc, int kc) ChooseParallelBlocks(int m, int n)
+    {
+        if (m >= 1536 && n >= 1536) return (192, 256, DefaultKc); // large square
+        if (m >= 640 && n >= 640) return (96, 128, DefaultKc);    // medium square
+        return (120, 128, DefaultKc);                              // skewed / smaller
+    }
+
 #if NET5_0_OR_GREATER
     // Emitted-once kernel: void(float* packedA, float* packedB, float* c, long ldcBytes, long kc).
     private static IntPtr s_kernel;

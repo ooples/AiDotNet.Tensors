@@ -574,35 +574,37 @@ internal static class AisEvalHeadToHeadBench
         int kc = AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.DefaultKc;
         int saved = CpuParallelSettings.MaxDegreeOfParallelism;
         CpuParallelSettings.MaxDegreeOfParallelism = P;
+        var engine = new CpuEngine();
         var rng = new Random(13);
         var shapes = new (int M, int N, int K, string tag)[]
         {
             (256, 1152, 1152, "attn-proj"), (256, 1152, 4608, "mlp-fc"),
             (1024, 1024, 1024, "square1024"), (2048, 2048, 2048, "square2048"),
         };
-        // Cache-resident-tile hypothesis: small mc (A→L1) + small nc (B→L2) lets the microkernel run
-        // at peak with NO shared-L3 streaming, so it should scale past the existing M-axis L3 cap.
-        var mcs = new[] { 16, 24, 32, 48, 64, 96, 120 };
-        var ncs = new[] { 64, 96, 128, 192, 256, 512 };
+        // Fixed candidate defaults (not a full sweep): find the best all-rounder to wire as the default.
+        var cands = new (int mc, int nc)[] { (120, 128), (96, 128), (120, 256), (192, 256), (96, 96), (240, 256) };
         try
         {
+            // Warm the chip to steady all-core thermal state so MKL and ours are measured under the
+            // SAME boost/throttle conditions (this box swings ~4x cold-vs-warm — measure fairly).
+            torch.set_num_threads(P);
+            { var wa = torch.rand(2048, 2048); var wb = torch.rand(2048, 2048);
+              var ww = Stopwatch.StartNew(); while (ww.ElapsedMilliseconds < 1500) { using var _ = torch.matmul(wa, wb); } }
+
             foreach (var (M, N, K, tag) in shapes)
             {
                 var A = new float[(long)M * K]; var B = new float[(long)K * N]; var C = new float[(long)M * N];
                 for (int i = 0; i < A.Length; i++) A[i] = (float)(rng.NextDouble() - 0.5);
                 for (int i = 0; i < B.Length; i++) B[i] = (float)(rng.NextDouble() - 0.5);
-                double gf = 2.0 * M * N * K / 1e9, mkl = 0;
-                try { var ta = torch.rand(M, K); var tb = torch.rand(K, N); torch.set_num_threads(P); mkl = gf / (MinMs(() => { using var _ = torch.matmul(ta, tb); }) / 1000); }
-                catch (Exception e) { Console.WriteLine($"  torch ref failed: {e.Message}"); }
+                double gf = 2.0 * M * N * K / 1e9;
                 double bestGf = 0; int bMc = 0, bNc = 0; string bCorrect = "?";
                 fixed (float* pa = A, pb = B, pc = C)
                 {
-                    foreach (int mc in mcs)
-                    foreach (int nc in ncs)
+                    foreach (var (mc, nc) in cands)
                     {
                         AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.RunParallel(pa, K, pb, N, pc, N, M, N, K, mc, nc, kc);
                         double maxRel = 0; var rv = new Random(5);
-                        for (int t = 0; t < 80; t++)
+                        for (int t = 0; t < 60; t++)
                         {
                             int r = rv.Next(M), col = rv.Next(N);
                             double s = 0; for (int kk = 0; kk < K; kk++) s += (double)A[(long)r * K + kk] * B[(long)kk * N + col];
@@ -610,18 +612,35 @@ internal static class AisEvalHeadToHeadBench
                             maxRel = Math.Max(maxRel, Math.Abs(s) > 1e-3 ? err / Math.Abs(s) : err);
                         }
                         double gbest = double.PositiveInfinity;
-                        var w = Stopwatch.StartNew(); while (w.ElapsedMilliseconds < 60) AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.RunParallel(pa, K, pb, N, pc, N, M, N, K, mc, nc, kc);
-                        for (int r = 0; r < 6; r++)
+                        var w = Stopwatch.StartNew(); while (w.ElapsedMilliseconds < 30) AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.RunParallel(pa, K, pb, N, pc, N, M, N, K, mc, nc, kc);
+                        for (int r = 0; r < 4; r++)
                         {
                             var sw = Stopwatch.StartNew(); int reps = 0;
-                            do { AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.RunParallel(pa, K, pb, N, pc, N, M, N, K, mc, nc, kc); reps++; } while (sw.Elapsed.TotalMilliseconds < 40);
+                            do { AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.RunParallel(pa, K, pb, N, pc, N, M, N, K, mc, nc, kc); reps++; } while (sw.Elapsed.TotalMilliseconds < 30);
                             sw.Stop(); gbest = Math.Min(gbest, sw.Elapsed.TotalMilliseconds / reps);
                         }
                         double g = gf / (gbest / 1000);
+                        Console.WriteLine($"    cand mc={mc,4} nc={nc,4}: {g,7:F0} GF  {(maxRel < 1e-3 ? "OK" : "WRONG " + maxRel.ToString("E1"))}");
                         if (g > bestGf) { bestGf = g; bMc = mc; bNc = nc; bCorrect = maxRel < 1e-3 ? "OK" : "WRONG " + maxRel.ToString("E1"); }
                     }
                 }
-                Console.WriteLine($"{tag,-11} best={bestGf,7:F0} GF  mc={bMc,4} nc={bNc,4}  MKL={mkl,7:F0}  {(mkl > 0 ? bestGf / mkl * 100 : 0),5:F0}%  {bCorrect}");
+                // Thermally-fair three-way: alternate existing(engine) / ours(best) / MKL back-to-back, min-of-10 each.
+                var ta = torch.rand(M, K); var tb = torch.rand(K, N);
+                var ea = Tensor<float>.CreateRandom(M, K); var eb = Tensor<float>.CreateRandom(K, N);
+                CpuParallelSettings.MaxDegreeOfParallelism = P;
+                double oursMs = double.PositiveInfinity, mklMs = double.PositiveInfinity, exMs = double.PositiveInfinity;
+                fixed (float* pa = A, pb = B, pc = C)
+                {
+                    for (int r = 0; r < 10; r++)
+                    {
+                        { var sw = Stopwatch.StartNew(); int reps = 0; do { var _ = engine.TensorMatMul(ea, eb); reps++; } while (sw.Elapsed.TotalMilliseconds < 30); sw.Stop(); exMs = Math.Min(exMs, sw.Elapsed.TotalMilliseconds / reps); }
+                        { var sw = Stopwatch.StartNew(); int reps = 0; do { AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.RunParallel(pa, K, pb, N, pc, N, M, N, K, bMc, bNc, kc); reps++; } while (sw.Elapsed.TotalMilliseconds < 30); sw.Stop(); oursMs = Math.Min(oursMs, sw.Elapsed.TotalMilliseconds / reps); }
+                        { var sw = Stopwatch.StartNew(); int reps = 0; do { using var _ = torch.matmul(ta, tb); reps++; } while (sw.Elapsed.TotalMilliseconds < 30); sw.Stop(); mklMs = Math.Min(mklMs, sw.Elapsed.TotalMilliseconds / reps); }
+                    }
+                }
+                double oursGf = gf / (oursMs / 1000), mklGf = gf / (mklMs / 1000), exGf = gf / (exMs / 1000);
+                int tiles = bMc > 0 ? ((M + bMc - 1) / bMc) * ((N + bNc - 1) / bNc) : 0;
+                Console.WriteLine($"{tag,-11} exist={exGf,7:F0}  ours={oursGf,7:F0} (mc={bMc,4} nc={bNc,4} {(P>0?(double)tiles/P:0),3:F1}xP)  MKL={mklGf,7:F0}   ours/exist={(exGf>0?oursGf/exGf:0),4:F2}x  ours/MKL={(mklGf > 0 ? oursGf / mklGf * 100 : 0),4:F0}%  {bCorrect}");
             }
         }
         finally { CpuParallelSettings.MaxDegreeOfParallelism = saved; }
