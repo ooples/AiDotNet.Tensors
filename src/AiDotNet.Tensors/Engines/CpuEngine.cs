@@ -17153,6 +17153,139 @@ public partial class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    // ---- Grouped DCNv3 backward (#1691). Composition over the tested groups=1 backward kernels:
+    // groups are channel-independent for input/kernel grads (concatenate); the offset/mask grad of a
+    // deformable group is the SUM over the output groups that share it. (Single-pass fusion of the
+    // backward is a later optimization; the forward is the perf-critical path.) ----
+
+    private static (int b, int inC, int H, int W, int outC, int kk, int inCpg, int outCpg) GroupDims<T>(
+        int[] inputShape, Tensor<T> kernel, int groups)
+    {
+        int outC = kernel._shape[0];
+        int kk = kernel._shape[2] * kernel._shape[3];
+        return (inputShape[0], inputShape[1], inputShape[2], inputShape[3], outC, kk,
+                inputShape[1] / groups, outC / groups);
+    }
+
+    /// <summary>Grouped <see cref="DeformableConv2D{T}"/> gradient w.r.t. input (#1691).</summary>
+    public virtual Tensor<T> DeformableConv2DGroupedBackwardInput<T>(
+        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> kernel, Tensor<T> offset, Tensor<T>? mask,
+        int[] inputShape, int[] stride, int[] padding, int[] dilation, int groups, int deformGroups)
+    {
+        if (groups == 1 && deformGroups == 1)
+            return DeformableConv2DBackwardInput(gradOutput, input, kernel, offset, mask, inputShape, stride, padding, dilation);
+        var d = GroupDims(inputShape, kernel, groups);
+        var parts = new Tensor<T>[groups];
+        for (int g = 0; g < groups; g++)
+        {
+            int dg = deformGroups == 1 ? 0 : g * deformGroups / groups;
+            var goG = gradOutput.Slice(1, g * d.outCpg, (g + 1) * d.outCpg);
+            var kG = kernel.Slice(0, g * d.outCpg, (g + 1) * d.outCpg);
+            var inG = input.Slice(1, g * d.inCpg, (g + 1) * d.inCpg);
+            var offG = offset.Slice(1, dg * 2 * d.kk, (dg + 1) * 2 * d.kk);
+            var mkG = mask?.Slice(1, dg * d.kk, (dg + 1) * d.kk);
+            parts[g] = DeformableConv2DBackwardInput(goG, inG, kG, offG, mkG, new[] { d.b, d.inCpg, d.H, d.W }, stride, padding, dilation);
+        }
+        return Tensor<T>.Concatenate(parts, axis: 1);
+    }
+
+    /// <summary>Grouped <see cref="DeformableConv2D{T}"/> gradient w.r.t. kernel (#1691).</summary>
+    public virtual Tensor<T> DeformableConv2DGroupedBackwardKernel<T>(
+        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> offset, Tensor<T>? mask,
+        int[] kernelShape, int[] stride, int[] padding, int[] dilation, int groups, int deformGroups)
+    {
+        if (groups == 1 && deformGroups == 1)
+            return DeformableConv2DBackwardKernel(gradOutput, input, offset, mask, kernelShape, stride, padding, dilation);
+        int outC = kernelShape[0], inCpg = kernelShape[1], kH = kernelShape[2], kW = kernelShape[3], kk = kH * kW;
+        int inC = input._shape[1], outCpg = outC / groups; int kkChans = 2 * kk;
+        var parts = new Tensor<T>[groups];
+        for (int g = 0; g < groups; g++)
+        {
+            int dg = deformGroups == 1 ? 0 : g * deformGroups / groups;
+            var goG = gradOutput.Slice(1, g * outCpg, (g + 1) * outCpg);
+            var inG = input.Slice(1, g * inCpg, (g + 1) * inCpg);
+            var offG = offset.Slice(1, dg * kkChans, (dg + 1) * kkChans);
+            var mkG = mask?.Slice(1, dg * kk, (dg + 1) * kk);
+            parts[g] = DeformableConv2DBackwardKernel(goG, inG, offG, mkG, new[] { outCpg, inCpg, kH, kW }, stride, padding, dilation);
+        }
+        return Tensor<T>.Concatenate(parts, axis: 0); // concat over output-channel axis -> [outC, inCpg, kH, kW]
+    }
+
+    /// <summary>Grouped <see cref="DeformableConv2D{T}"/> gradient w.r.t. offset (#1691). The grad of a
+    /// deformable group is the sum over the output groups sharing it.</summary>
+    public virtual Tensor<T> DeformableConv2DGroupedBackwardOffset<T>(
+        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> kernel, Tensor<T> offset, Tensor<T>? mask,
+        int[] stride, int[] padding, int[] dilation, int groups, int deformGroups)
+    {
+        if (groups == 1 && deformGroups == 1)
+            return DeformableConv2DBackwardOffset(gradOutput, input, kernel, offset, mask, stride, padding, dilation);
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int inC = input._shape[1], outC = kernel._shape[0], kk = kernel._shape[2] * kernel._shape[3];
+        int inCpg = inC / groups, outCpg = outC / groups, blk = 2 * kk;
+        var gradOffset = AutoTensorCache.RentOrAllocate<T>(offset._shape);
+        var goData = gradOffset.GetDataArray();
+        Array.Clear(goData, 0, (int)gradOffset.Length);
+        int fullC = offset._shape[1];
+        for (int g = 0; g < groups; g++)
+        {
+            int dg = deformGroups == 1 ? 0 : g * deformGroups / groups;
+            var goG = gradOutput.Slice(1, g * outCpg, (g + 1) * outCpg);
+            var kG = kernel.Slice(0, g * outCpg, (g + 1) * outCpg);
+            var inG = input.Slice(1, g * inCpg, (g + 1) * inCpg);
+            var offG = offset.Slice(1, dg * blk, (dg + 1) * blk);
+            var mkG = mask?.Slice(1, dg * kk, (dg + 1) * kk);
+            var part = DeformableConv2DBackwardOffset(goG, inG, kG, offG, mkG, stride, padding, dilation);
+            var pData = part.GetDataArray();
+            int B = part._shape[0], pc = part._shape[1], oHW = part._shape[2] * part._shape[3];
+            for (int bb = 0; bb < B; bb++)
+                for (int c = 0; c < pc; c++)
+                    for (int s = 0; s < oHW; s++)
+                    {
+                        int dst = ((bb * fullC + dg * blk + c) * oHW) + s;
+                        int src = ((bb * pc + c) * oHW) + s;
+                        goData[dst] = numOps.Add(goData[dst], pData[src]);
+                    }
+        }
+        return gradOffset;
+    }
+
+    /// <summary>Grouped <see cref="DeformableConv2D{T}"/> gradient w.r.t. modulation mask (#1691).</summary>
+    public virtual Tensor<T> DeformableConv2DGroupedBackwardMask<T>(
+        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> kernel, Tensor<T> offset, Tensor<T> mask,
+        int[] stride, int[] padding, int[] dilation, int groups, int deformGroups)
+    {
+        if (groups == 1 && deformGroups == 1)
+            return DeformableConv2DBackwardMask(gradOutput, input, kernel, offset, mask, stride, padding, dilation);
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int inC = input._shape[1], outC = kernel._shape[0], kk = kernel._shape[2] * kernel._shape[3];
+        int inCpg = inC / groups, outCpg = outC / groups, blk = 2 * kk;
+        var gradMask = AutoTensorCache.RentOrAllocate<T>(mask._shape);
+        var gmData = gradMask.GetDataArray();
+        Array.Clear(gmData, 0, (int)gradMask.Length);
+        int fullC = mask._shape[1];
+        for (int g = 0; g < groups; g++)
+        {
+            int dg = deformGroups == 1 ? 0 : g * deformGroups / groups;
+            var goG = gradOutput.Slice(1, g * outCpg, (g + 1) * outCpg);
+            var kG = kernel.Slice(0, g * outCpg, (g + 1) * outCpg);
+            var inG = input.Slice(1, g * inCpg, (g + 1) * inCpg);
+            var offG = offset.Slice(1, dg * blk, (dg + 1) * blk);
+            var mkG = mask.Slice(1, dg * kk, (dg + 1) * kk);
+            var part = DeformableConv2DBackwardMask(goG, inG, kG, offG, mkG, stride, padding, dilation);
+            var pData = part.GetDataArray();
+            int B = part._shape[0], pc = part._shape[1], oHW = part._shape[2] * part._shape[3];
+            for (int bb = 0; bb < B; bb++)
+                for (int c = 0; c < pc; c++)
+                    for (int s = 0; s < oHW; s++)
+                    {
+                        int dst = ((bb * fullC + dg * kk + c) * oHW) + s;
+                        int src = ((bb * pc + c) * oHW) + s;
+                        gmData[dst] = numOps.Add(gmData[dst], pData[src]);
+                    }
+        }
+        return gradMask;
+    }
+
     /// <summary>
     /// Performs bilinear sampling at a fractional position.
     /// </summary>

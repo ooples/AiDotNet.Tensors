@@ -71,3 +71,58 @@ public class GroupedDeformableConv2DTests
         for (int i = 0; i < baseOut.Length; i++) Assert.Equal(baseOut[i], grouped[i]);
     }
 }
+
+// Finite-difference verification of the grouped backward (double precision for numerical accuracy).
+public class GroupedDeformableConv2DBackwardTests
+{
+    private static Tensor<double> Rand(int seed, double scale, params int[] shape)
+    {
+        int n = 1; foreach (var s in shape) n *= s;
+        var d = new double[n];
+        var rng = new System.Random(seed);
+        for (int i = 0; i < n; i++) d[i] = (rng.NextDouble() - 0.5) * scale;
+        return new Tensor<double>(shape, new Vector<double>(d));
+    }
+
+    private static double Loss(CpuEngine e, Tensor<double> input, Tensor<double> kernel, Tensor<double> offset,
+        int[] s, int[] p, int[] dl, int groups, int dg)
+    {
+        var o = e.DeformableConv2DGrouped(input, kernel, offset, null, s, p, dl, groups, dg);
+        double sum = 0; for (int i = 0; i < o.Length; i++) sum += o[i];
+        return sum;
+    }
+
+    [Fact]
+    public void GroupedBackward_MatchesFiniteDifference()
+    {
+        var e = new CpuEngine();
+        const int groups = 2, dg = 2, inC = 4, outC = 4, H = 5, W = 5, k = 3, kk = 9, inCpg = 2;
+        int[] s = [1, 1], p = [1, 1], dl = [1, 1];
+        var input = Rand(1, 1.0, 1, inC, H, W);
+        var kernel = Rand(2, 1.0, outC, inCpg, k, k);
+        var offset = Rand(3, 0.6, 1, 2 * kk * dg, H, W);
+        var gradOut = new Tensor<double>([1, outC, H, W], new Vector<double>(System.Linq.Enumerable.Repeat(1.0, outC * H * W).ToArray()));
+
+        var gI = e.DeformableConv2DGroupedBackwardInput(gradOut, input, kernel, offset, null, [1, inC, H, W], s, p, dl, groups, dg);
+        var gK = e.DeformableConv2DGroupedBackwardKernel(gradOut, input, offset, null, [outC, inCpg, k, k], s, p, dl, groups, dg);
+        var gO = e.DeformableConv2DGroupedBackwardOffset(gradOut, input, kernel, offset, null, s, p, dl, groups, dg);
+
+        const double eps = 1e-5;
+        void Check(Tensor<double> t, Tensor<double> analytic, string name, double tol)
+        {
+            for (int i = 0; i < t.Length; i++)
+            {
+                double orig = t[i];
+                t[i] = orig + eps; double lp = Loss(e, input, kernel, offset, s, p, dl, groups, dg);
+                t[i] = orig - eps; double lm = Loss(e, input, kernel, offset, s, p, dl, groups, dg);
+                t[i] = orig;
+                double num = (lp - lm) / (2 * eps);
+                Assert.True(System.Math.Abs(num - analytic[i]) <= tol + 1e-2 * System.Math.Abs(num),
+                    $"{name}[{i}]: analytic={analytic[i]:F5} numeric={num:F5}");
+            }
+        }
+        Check(input, gI, "gradInput", 1e-3);
+        Check(kernel, gK, "gradKernel", 1e-3);
+        Check(offset, gO, "gradOffset", 5e-3);
+    }
+}
