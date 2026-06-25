@@ -54,6 +54,11 @@ public static class WeightRegistry
             throw new PlatformNotSupportedException(
                 "WeightRegistry / StreamingTensorPool requires a little-endian host. " +
                 "Big-endian platforms (legacy IBM Power, certain ARM modes) are not supported in v1.");
+        // Quiesce background prefetch workers before (possibly) disposing/swapping
+        // the pool below — same fire-and-forget-outlives-the-pool hazard Reset()
+        // guards against. Must run outside _lock (workers take _lock in their
+        // finally). See DrainInFlightPrefetches.
+        DrainInFlightPrefetches();
         lock (_lock)
         {
             // Mid-flight guard: refuse to dispose a pool that holds live
@@ -1585,6 +1590,58 @@ public static class WeightRegistry
         new(initialCount: PrefetchMaxConcurrency, maxCount: PrefetchMaxConcurrency);
 
     /// <summary>
+    /// Blocks until every in-flight background prefetch worker (queued by
+    /// <see cref="PrefetchAsync{T}"/> / <see cref="PrefetchAsyncMany{T}"/>) has
+    /// finished, or <paramref name="timeoutMs"/> elapses; returns true iff the
+    /// subsystem fully quiesced.
+    /// <para>
+    /// Each worker holds exactly one <see cref="_prefetchSemaphore"/> permit for
+    /// its lifetime — acquired (<c>Wait(0)</c>) before it is queued, released in
+    /// its <c>finally</c>. Acquiring ALL <see cref="PrefetchMaxConcurrency"/>
+    /// permits therefore can only succeed once NO worker still holds one, i.e.
+    /// the prefetch subsystem is idle; we then release them so the pool is usable
+    /// again.
+    /// </para>
+    /// <para>
+    /// MUST be called WITHOUT holding <see cref="_lock"/>: a worker's <c>finally</c>
+    /// takes <c>_lock</c> (to remove its handle from <see cref="_inFlightPrefetches"/>)
+    /// BEFORE releasing its permit, so holding the lock here would deadlock the
+    /// drain against the very workers it is waiting for.
+    /// </para>
+    /// <para>
+    /// <see cref="Reset"/> / <see cref="Configure"/> call this before tearing the
+    /// pool down: a fire-and-forget worker that outlived its issuing forward must
+    /// not be left paging bytes against a pool we are about to dispose — or, worse,
+    /// against a SUCCESSOR pool that has reused the same handle id (the handle
+    /// counter restarts when the pool is recreated). Under ThreadPool starvation a
+    /// worker may not get a thread to release its permit in time; the timeout is the
+    /// safety valve, and the worker's own ObjectDisposedException / InvalidOperationException
+    /// guards keep the timed-out case from corrupting anything.
+    /// </para>
+    /// </summary>
+    internal static bool DrainInFlightPrefetches(int timeoutMs = 5000)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        int acquired = 0;
+        try
+        {
+            for (int i = 0; i < PrefetchMaxConcurrency; i++)
+            {
+                int remaining = timeoutMs - (int)sw.ElapsedMilliseconds;
+                if (remaining < 0) remaining = 0;
+                if (!_prefetchSemaphore.Wait(remaining))
+                    return false; // timed out with at least one worker still outstanding
+                acquired++;
+            }
+            return true;
+        }
+        finally
+        {
+            if (acquired > 0) _prefetchSemaphore.Release(acquired);
+        }
+    }
+
+    /// <summary>
     /// Returns a snapshot of streaming-pool telemetry counters. Caller
     /// typically reads this at end of inference / training pass and
     /// surfaces it in <c>PredictionModelResult.StreamingReport</c>.
@@ -1639,6 +1696,16 @@ public static class WeightRegistry
     /// </remarks>
     public static void Reset()
     {
+        // Quiesce background prefetch workers BEFORE taking _lock + disposing the
+        // pool. A fire-and-forget worker still paging bytes would otherwise touch
+        // the pool we are about to dispose AND race the NEXT pool's reused handle
+        // ids (the handle counter restarts on pool re-creation), corrupting the
+        // successor's resident set. Draining OUTSIDE the lock is mandatory — a
+        // worker's finally takes _lock before releasing its permit, so draining
+        // under _lock would deadlock. Best-effort: on ThreadPool starvation the
+        // drain times out and we proceed; the worker's own disposed-pool guards
+        // keep that safe.
+        DrainInFlightPrefetches();
         lock (_lock)
         {
             _streamingPool?.Dispose();
@@ -1646,6 +1713,10 @@ public static class WeightRegistry
             _offloadAllocator?.Dispose();
             _offloadAllocator = null;
             _ownerByHandle.Clear();
+            // Drop any straggler in-flight markers (a worker that timed out the
+            // drain above). Leaving them would suppress the NEXT pool's prefetch
+            // of a reused handle id (dedup sees it as "already in-flight").
+            _inFlightPrefetches.Clear();
             _options = new GpuOffloadOptions();
             // CodeRabbit #604: clear the training-mode hint too. Otherwise a
             // prior `false` (set by the last model's SetTrainingMode) persists
