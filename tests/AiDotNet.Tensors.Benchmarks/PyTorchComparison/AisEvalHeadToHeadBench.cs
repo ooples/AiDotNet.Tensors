@@ -803,6 +803,31 @@ internal static class AisEvalHeadToHeadBench
             Console.WriteLine($"Total L3 (CCX) domains: {l3}, summed logical cores: {totalCores}");
         }
         finally { Marshal.FreeHGlobal(buf); }
+
+        // NUMA nodes + processor groups (RelationAll=0xffff): NumaNode=1, Group=4. Decides #18 — if 1 NUMA
+        // node (NPS1), NUMA-local allocation is a no-op (uniform DRAM; CCX-L3 pinning is the real locality).
+        uint len2 = 0; GetLogicalProcessorInformationEx(0xffff, IntPtr.Zero, ref len2);
+        if (len2 == 0) { Console.WriteLine("NUMA/group query unsupported"); return; }
+        IntPtr buf2 = Marshal.AllocHGlobal((int)len2);
+        try
+        {
+            if (!GetLogicalProcessorInformationEx(0xffff, buf2, ref len2)) { Console.WriteLine("NUMA/group query failed"); return; }
+            long ptr = (long)buf2, end = ptr + len2; int numa = 0, groups = 0, maxGroupCount = 0;
+            while (ptr < end)
+            {
+                int rel = Marshal.ReadInt32((IntPtr)ptr);
+                int size = Marshal.ReadInt32((IntPtr)(ptr + 4));
+                if (size <= 0) break;
+                if (rel == 1) numa++;                 // RelationNumaNode
+                else if (rel == 4) { groups++; maxGroupCount = Marshal.ReadInt16((IntPtr)(ptr + 8)); } // RelationGroup → ActiveGroupCount@+8
+                ptr += size;
+            }
+            Console.WriteLine($"NUMA nodes: {numa}   processor-group records: {groups} (ActiveGroupCount={maxGroupCount})");
+            Console.WriteLine(numa <= 1
+                ? "→ NPS1 / single NUMA node: NUMA-local alloc is a NO-OP; CCX-L3 pinning is the locality lever."
+                : $"→ {numa} NUMA nodes: NUMA-local allocation (#18) is worth implementing.");
+        }
+        finally { Marshal.FreeHGlobal(buf2); }
     }
 
     public static void GemmDopFine()
