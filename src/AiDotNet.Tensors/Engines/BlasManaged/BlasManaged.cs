@@ -481,7 +481,8 @@ public static partial class BlasManaged
         if (typeof(T) == typeof(float) && !s_disableGotoGemm && !transA && !transB
             && options.PackedA is null && options.PackedB is null
             && (options.PackingMode == PackingMode.Auto || options.PackingMode == PackingMode.DisableAutotune)
-            && (long)m * n * k >= GotoGemmFp32.ParallelMinWork && GotoGemmFp32.IsAvailable)
+            && (long)m * n * k >= GotoGemmFp32.ParallelMinWork && GotoGemmFp32.BeatsPackBoth(m, n, k)
+            && GotoGemmFp32.IsAvailable)
         {
             var gepi = options.Epilogue;
             if (EpilogueFlagsCompute.Compute(in gepi) == EpilogueFlags.None)

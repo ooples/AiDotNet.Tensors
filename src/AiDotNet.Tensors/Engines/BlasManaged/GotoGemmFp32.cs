@@ -37,6 +37,12 @@ internal static class GotoGemmFp32
     /// dispatch (below this the per-tile pack/launch overhead dominates — stay on the existing path).</summary>
     internal const long ParallelMinWork = 8L * 1024 * 1024; // ~8.4e6
 
+    /// <summary>Shape regime where the per-tile GotoBLAS path beats the PackBoth strategy (measured on the
+    /// 3990X via --ab-prod): large/balanced (M≥512) OR wide-K (K≥2N, e.g. MLP-fc2). PackBoth's wide-N
+    /// N-axis path wins the small-M wide-N shapes (DiT QKV M256×N3456, MLP-fc1 M256×N4608 — GotoGemm was
+    /// 0.86-0.88× there), so those are excluded to avoid a production regression on the diffusion forward.</summary>
+    internal static bool BeatsPackBoth(int m, int n, int k) => m >= 512 || (long)k >= 2L * n;
+
     /// <summary>Shape-adaptive (Mc, Nc, Kc) for RunParallel, tuned on the 3990X (measured --ab-goto-par).
     /// Memory-bound regime: larger square shapes want larger tiles (fewer redundant DRAM re-reads);
     /// skewed / smaller shapes want smaller Mc for enough IC-blocks. Kc=512 is universally best.</summary>
