@@ -1,6 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 using System;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -124,5 +125,44 @@ public class GroupedDeformableConv2DBackwardTests
         Check(input, gI, "gradInput", 1e-3);
         Check(kernel, gK, "gradKernel", 1e-3);
         Check(offset, gO, "gradOffset", 5e-3);
+    }
+
+    /// <summary>
+    /// The autodiff wiring (#1691): the grouped forward records on the tape and back-props through the
+    /// grouped backward kernels. With loss = sum(output), the upstream gradient is all-ones, so the tape
+    /// gradients must equal the manual grouped backward called with gradOut = ones (already finite-diff
+    /// verified above). This proves DeformableConv2DGrouped is differentiable via GradientTape.
+    /// </summary>
+    [Fact]
+    public void GroupedForward_OnTape_BackpropsThroughGroupedBackward()
+    {
+        var e = new CpuEngine();
+        const int groups = 2, dg = 2, inC = 4, outC = 4, H = 5, W = 5, k = 3, kk = 9, inCpg = 2;
+        int[] s = [1, 1], p = [1, 1], dl = [1, 1];
+        var input = Rand(11, 1.0, 1, inC, H, W);
+        var kernel = Rand(12, 1.0, outC, inCpg, k, k);
+        var offset = Rand(13, 0.6, 1, 2 * kk * dg, H, W);
+
+        using var tape = new GradientTape<double>();
+        var output = e.DeformableConv2DGrouped(input, kernel, offset, null, s, p, dl, groups, dg);
+        var loss = e.ReduceSum(output, null);
+        var grads = tape.ComputeGradients(loss, new[] { input, kernel, offset });
+
+        var gradOut = new Tensor<double>([1, outC, H, W], new Vector<double>(System.Linq.Enumerable.Repeat(1.0, outC * H * W).ToArray()));
+        var gI = e.DeformableConv2DGroupedBackwardInput(gradOut, input, kernel, offset, null, [1, inC, H, W], s, p, dl, groups, dg);
+        var gK = e.DeformableConv2DGroupedBackwardKernel(gradOut, input, offset, null, [outC, inCpg, k, k], s, p, dl, groups, dg);
+        var gO = e.DeformableConv2DGroupedBackwardOffset(gradOut, input, kernel, offset, null, s, p, dl, groups, dg);
+
+        void Same(Tensor<double> tape_, Tensor<double> manual, string name)
+        {
+            Assert.NotNull(tape_);
+            Assert.Equal(manual.Length, tape_.Length);
+            for (int i = 0; i < manual.Length; i++)
+                Assert.True(System.Math.Abs(tape_[i] - manual[i]) < 1e-9,
+                    $"{name}[{i}]: tape={tape_[i]:F9} manual={manual[i]:F9}");
+        }
+        Same(grads[input], gI, "gradInput");
+        Same(grads[kernel], gK, "gradKernel");
+        Same(grads[offset], gO, "gradOffset");
     }
 }

@@ -1509,6 +1509,34 @@ internal static class BackwardFunctions<T>
     }
 
     /// <summary>
+    /// Grouped/depthwise DeformableConv2D backward (DCNv3, DCN v1 / mask=null): routes gradient to
+    /// input, kernel, offset via the engine's grouped backward kernels. savedState layout:
+    /// [stride, padding, dilation, groups (boxed int), deformGroups (boxed int)].
+    /// inputs[0]=input, inputs[1]=kernel, inputs[2]=offset. The modulation-mask (DCN v2) variant is not
+    /// yet wired; tape recording only runs when mask is null in the forward call.
+    /// </summary>
+    internal static void DeformableConv2DGroupedBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var stride = (int[])savedState[0];
+        var padding = (int[])savedState[1];
+        var dilation = (int[])savedState[2];
+        int groups = (int)savedState[3];
+        int deformGroups = (int)savedState[4];
+
+        var gradInput = engine.DeformableConv2DGroupedBackwardInput(
+            gradOutput, inputs[0], inputs[1], inputs[2], null, inputs[0]._shape, stride, padding, dilation, groups, deformGroups);
+        var gradKernel = engine.DeformableConv2DGroupedBackwardKernel(
+            gradOutput, inputs[0], inputs[2], null, inputs[1]._shape, stride, padding, dilation, groups, deformGroups);
+        var gradOffset = engine.DeformableConv2DGroupedBackwardOffset(
+            gradOutput, inputs[0], inputs[1], inputs[2], null, stride, padding, dilation, groups, deformGroups);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradKernel, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[2], gradOffset, engine);
+    }
+
+    /// <summary>
     /// GraphAttention backward: dL flows to nodeFeatures + the two attention
     /// weight vectors. Edge index tensors are non-trainable and live in
     /// savedState as portable int[] data + int[] shape pairs (so the tape

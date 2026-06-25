@@ -17150,6 +17150,61 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
         });
+
+        // Tape + lazy-graph registration — only DCN v1 (mask null) for now, mirroring DeformableConv2D.
+        // The grouped backward (input/kernel/offset) is wired; the modulation-mask (DCN v2) grad isn't,
+        // so fail fast under an active tape/graph rather than silently dropping dL when a mask is passed.
+        if (mask is null)
+        {
+            var savedState = new object[]
+            {
+                (int[])stride.Clone(), (int[])padding.Clone(), (int[])dilation.Clone(), groups, deformGroups,
+            };
+            DifferentiableOps.RecordIfActive("DeformableConv2DGrouped", result,
+                new[] { input, kernel, offset },
+                BackwardFunctions<T>.DeformableConv2DGroupedBackward,
+                savedState);
+
+            if (GraphMode.IsActive)
+            {
+                var scope = GraphMode.Current;
+                if (scope != null)
+                {
+                    var capturedInput = input;
+                    var capturedKernel = kernel;
+                    var capturedOffset = offset;
+                    var capturedStride = (int[])stride.Clone();
+                    var capturedPadding = (int[])padding.Clone();
+                    var capturedDilation = (int[])dilation.Clone();
+                    int capturedGroups = groups;
+                    int capturedDeformGroups = deformGroups;
+                    var outShape = (int[])result._shape.Clone();
+                    return scope.RecordVariadic(
+                        LazyNodeType.Custom,
+                        "DeformableConv2DGrouped",
+                        new[] { input, kernel, offset },
+                        outShape,
+                        (eng, output) =>
+                        {
+                            var replayed = eng.DeformableConv2DGrouped(
+                                capturedInput, capturedKernel, capturedOffset,
+                                mask: null,
+                                capturedStride, capturedPadding, capturedDilation,
+                                capturedGroups, capturedDeformGroups);
+                            DirectGpuTensorEngine.CopyResultInto(eng, replayed, output);
+                        },
+                        BackwardFunctions<T>.DeformableConv2DGroupedBackward,
+                        savedState);
+                }
+            }
+        }
+        else if (DifferentiableOps.IsTapeActiveForThread<T>() || GraphMode.IsActive)
+        {
+            throw new NotSupportedException(
+                "DeformableConv2DGrouped autograd with a modulation mask (DCN v2) is not yet wired. " +
+                "Either pass mask=null (DCN v1) or wrap the call in a NoGradScope<T>() to opt out " +
+                "of autograd for this op.");
+        }
         return result;
     }
 
