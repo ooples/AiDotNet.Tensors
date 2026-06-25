@@ -175,23 +175,25 @@ internal static unsafe class CcxGemmPool
         // Win regime (measured): large + BALANCED squares (CCX 1.12-1.19x on sq2048 = ~46% MKL). Below
         // ~1536 the win is noise-level (±5%) so gate it out to GUARANTEE no regression; skewed/wide-N
         // (DiT) regress and are excluded by the balance check below.
+        // Gate to the PROVEN balanced-square regime: m,n>=512 (DiT m=256 excluded — its deep-K MLP shapes
+        // are barrier-heavy in 2D and the diffusion hot path must not regress; they stay on per-tile/PackBoth).
         if (m < 512 || n < 512 || k < 256) return false;
         if ((long)m * n * k < CcxMinWork) return false;
-        if (n > 2 * m || m > 2 * n) return false;            // not balanced → per-tile/PackBoth
-        if ((n / _numCcx) < Nr32) return false;              // strips too thin to tile
         if (CpuParallelSettings.MaxDegreeOfParallelism < _total) return false; // restricted budget → per-tile
 
         const int kc = 256;
+        (_gr, _gc) = ChooseGrid(m, n);
+        // Require a GENUINE 2D grid (both dims partitioned): gr==1 (very wide-N) or gc==1 (very tall-M) is
+        // a degenerate 1D split that re-reads the big operand numCcx× and regresses — those stay on
+        // per-tile/PackBoth. A genuine grid gives the gc×-A / gr×-B DRAM split that wins on balanced squares.
+        // The 1D-N path is reachable only via s_force1D (A/B).
         int nc1d = ChooseNc(n);
-        bool oneDFits = (long)k * nc1d <= 512L * 1024; // 1D full-K strip <= 2MB
-        // 2D-NUMA is the production default: the clean A/B measured 2D 1.66x over per-tile on sq2048 (=92%
-        // MKL) vs 1D's 1.0x — 2D's gc×-A / gr×-B DRAM split + kc×nBlk L2-panels crush the 1D full-M strip.
-        // s_force1D (A/B knob) routes to 1D only where its strip fits; huge shapes always take 2D.
+        bool oneDFits = (long)k * nc1d <= 512L * 1024;
         bool use2D = !(s_force1D && oneDFits);
         int mc, nc; long need;
         if (use2D)
         {
-            (_gr, _gc) = ChooseGrid(m, n);
+            if (_gr < 2 || _gc < 2) return false;            // degenerate grid → per-tile/PackBoth
             int nBlk = RoundUp((n + _gc - 1) / _gc, Nr32);
             int mBlk = RoundUp((m + _gr - 1) / _gr, 6);
             if ((long)kc * nBlk > 1024L * 1024) return false; // 2D B-panel (kc×nBlk) > 4MB → per-tile
@@ -201,6 +203,7 @@ internal static unsafe class CcxGemmPool
         }
         else
         {
+            if ((n / _numCcx) < Nr32) return false;          // 1D strips too thin
             mc = ChooseMc(m); nc = nc1d;
             need = GotoGemmFp32.PackedBLen(nc, k, kc);
         }
