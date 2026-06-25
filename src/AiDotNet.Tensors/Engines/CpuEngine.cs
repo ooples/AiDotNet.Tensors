@@ -15365,9 +15365,71 @@ public partial class CpuEngine : ITensorLevelEngine
                 return;
             }
 
-            var gradKernelD = new double[totalLen];
             var kPoolD = System.Buffers.ArrayPool<double>.Shared;
             long im2colWorkKD = (long)inChannels * kernelHeight * kernelWidth * colW;
+
+            // #1688: batch==1 fast path — GEMM the kernel gradient straight into
+            // `dest` with the accumulate β, so NEITHER the per-image localGrad NOR
+            // the gradKernelD accumulator is allocated. Each of those is
+            // outC·inC·kH·kW doubles — e.g. 302 MB for a single 2048→2048 3×3 conv —
+            // and is too large for ArrayPool.Shared to pool (it exceeds the shared
+            // bucket cap, so Rent/`new` allocates fresh and Return discards). Across
+            // a deep many-channel backbone the general path below churns GBs of such
+            // transient per backward pass, which OOMs the 16 GB CI runner even though
+            // the model fits. A single-image backward needs no cross-batch
+            // accumulation, so the GEMM result IS the kernel gradient — write it to
+            // dest directly and the only large buffer left is dest itself (the
+            // gradient that must exist). The im2col buffer is colH·colW, which is
+            // small here (tiny spatial). Bit-identical to the general path: same
+            // gradOut · im2col^T GEMM, just targeting dest with β=accumulate.
+            if (batch == 1)
+            {
+                var im2colBuf = kPoolD.Rent(colH * colW);
+                try
+                {
+                    CpuParallelSettings.ParallelForOrSerial(0, inChannels, im2colWorkKD, c =>
+                    {
+                        Helpers.Im2ColHelper.Im2ColStridedSingleChannelRange(
+                            new ReadOnlySpan<double>(inputD, 0, inputSliceSize),
+                            new Span<double>(im2colBuf, 0, colH * colW), colW, 0,
+                            c, c + 1, height, width, kernelHeight, kernelWidth,
+                            strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
+                    }, deterministicSafe: true);
+                    if (Helpers.BlasProvider.TryGemmExBeta(
+                        outChannels, colH, colW,
+                        gradOutputD, 0, colW, false,
+                        im2colBuf, 0, colW, true,
+                        destD, destOff, colH,
+                        alpha: 1.0, beta: accumulate ? 1.0 : 0.0))
+                    {
+                        return;
+                    }
+                    // No-BLAS cold fallback (BLAS is normally present): transpose +
+                    // blocked multiply into a bounded temp, then merge per accumulate.
+                    var localGradCold = kPoolD.Rent(totalLen);
+                    var im2colT = kPoolD.Rent(colW * colH);
+                    try
+                    {
+                        for (int r = 0; r < colH; r++)
+                            for (int cc = 0; cc < colW; cc++)
+                                im2colT[cc * colH + r] = im2colBuf[r * colW + cc];
+                        Helpers.Im2ColHelper.MultiplyMatrixBlockedDouble(
+                            new ReadOnlySpan<double>(gradOutputD, 0, outChannels * colW),
+                            new ReadOnlySpan<double>(im2colT, 0, colW * colH),
+                            new Span<double>(localGradCold, 0, totalLen),
+                            outChannels, colW, colH);
+                        if (accumulate)
+                            for (int i = 0; i < totalLen; i++) destD[destOff + i] += localGradCold[i];
+                        else
+                            Array.Copy(localGradCold, 0, destD, destOff, totalLen);
+                    }
+                    finally { kPoolD.Return(localGradCold); kPoolD.Return(im2colT); }
+                }
+                finally { kPoolD.Return(im2colBuf); }
+                return;
+            }
+
+            var gradKernelD = new double[totalLen];
 
             // Per-image im2col + GEMM into localGrad (overwrite). See the float
             // counterpart ComputeBatchGradF for the channel-parallel rationale.
