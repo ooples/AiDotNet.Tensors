@@ -134,6 +134,12 @@ class Program
             return;
         }
 
+        if (args[0] == "--ab-mlp-block")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.MlpBlockBench();
+            return;
+        }
+
         if (args[0] == "--profile-gemm")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.ProfileGemm();

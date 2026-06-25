@@ -177,7 +177,7 @@ internal static unsafe class CcxGemmPool
         // (DiT) regress and are excluded by the balance check below.
         // Gate to the PROVEN balanced-square regime: m,n>=512 (DiT m=256 excluded — its deep-K MLP shapes
         // are barrier-heavy in 2D and the diffusion hot path must not regress; they stay on per-tile/PackBoth).
-        if (m < 512 || n < 512 || k < 256) return false;
+        if (m < s_minM || n < 512 || k < 256) return false;
         if ((long)m * n * k < CcxMinWork) return false;
         if (CpuParallelSettings.MaxDegreeOfParallelism < _total) return false; // restricted budget → per-tile
 
@@ -243,6 +243,11 @@ internal static unsafe class CcxGemmPool
     /// <summary>A/B knob (env AIDOTNET_CCX_KC): override the 2D-path kc to sweep the barrier-vs-L1-fit tradeoff.</summary>
     internal static int s_kc2dOverride =
         int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_CCX_KC"), out var v) ? v : 0;
+
+    /// <summary>A/B knob (env AIDOTNET_CCX_MINM): override the min-M gate (default 512) to test CCX on the
+    /// wide-N small-M DiT shapes (m=256). Lets the 1D-N path (pack B once per CCX) be measured there.</summary>
+    internal static int s_minM =
+        int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_CCX_MINM"), out var mm) && mm > 0 ? mm : 512;
 
     private const int Nr32 = 16;
     // mc: enough ic-blocks for the CCX's lanes (≈2·tpc) while keeping the A-panel cache-friendly.

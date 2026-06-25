@@ -1196,6 +1196,68 @@ internal static class AisEvalHeadToHeadBench
         AiDotNet.Tensors.Helpers.CpuParallelSettings.UseCooperativePool = false;
     }
 
+    /// <summary>
+    /// The DiT/transformer MLP BLOCK (fc1 K→H, GELU, fc2 H→N) — ours-fused (cached pre-packed weights +
+    /// fused activation, the framework advantage MKL can't match: frozen weights pack ONCE) vs the torch
+    /// (MKL) sequence (matmul + gelu + matmul, re-packs weights every call). The GEMMs are at MKL's HW
+    /// ceiling; the win must come from the weight-pack amortization + the fused activation. Run: --ab-mlp-block.
+    /// </summary>
+    public static void MlpBlockBench()
+    {
+        torch.set_grad_enabled(false);
+        int P = Environment.ProcessorCount; torch.set_num_threads(P);
+        var engine = new CpuEngine();
+        var shapes = new (int M, int K, int H, int N, string tag)[]
+        {
+            (256, 1152, 4608, 1152, "DiT-XL/2 MLP m=256"),
+            (1024, 1152, 4608, 1152, "DiT MLP m=1024"),
+            (256, 1024, 4096, 1024, "MLP m=256 d=1024"),
+        };
+        Console.WriteLine($"=== MLP block fc1+GELU+fc2 (SAME data, tanh-gelu, correctness-checked): ours-fused(cached W) vs torch(MKL), cores={P} ===");
+        static float[] R(long n, Random r) { var a = new float[n]; for (long i = 0; i < n; i++) a[i] = (float)(r.NextDouble() - 0.5); return a; }
+        foreach (var (M, K, H, N, tag) in shapes)
+        {
+            var rng = new Random(7);
+            float[] X = R((long)M * K, rng), W1 = R((long)K * H, rng), b1 = R(H, rng), W2 = R((long)H * N, rng), b2 = R(N, rng);
+            float[] Hb = new float[(long)M * H], Y = new float[(long)M * N];
+            // torch tensors from the SAME data (so outputs are comparable).
+            using var tX = torch.tensor(X).reshape(M, K); using var tW1 = torch.tensor(W1).reshape(K, H); using var tb1 = torch.tensor(b1);
+            using var tW2 = torch.tensor(W2).reshape(H, N); using var tb2 = torch.tensor(b2);
+
+            // ours-fused (cached-B + fused tanh-GELU)
+            CpuFusedOperations.FusedGemmBiasActivation(X, W1, b1, Hb, M, H, K, FusedActivationType.GELU);
+            CpuFusedOperations.FusedGemmBiasActivation(Hb, W2, b2, Y, M, N, H, FusedActivationType.None);
+            // reference output for correctness (torch, tanh-gelu to match our approx)
+            float relErr;
+            using (var h = torch.matmul(tX, tW1).add_(tb1))
+            using (var g = torch.nn.functional.gelu(h))
+            using (var y = torch.matmul(g, tW2).add_(tb2))
+            {
+                var yref = y.data<float>().ToArray();
+                double se = 0, sr = 0; for (long i = 0; i < (long)M * N; i++) { double e = (double)Y[i] - yref[i]; se += e * e; sr += (double)yref[i] * yref[i]; }
+                relErr = (float)(sr > 0 ? Math.Sqrt(se / sr) : 0);
+            }
+
+            var (ofMed, _) = MeasureRobust(() =>
+            {
+                CpuFusedOperations.FusedGemmBiasActivation(X, W1, b1, Hb, M, H, K, FusedActivationType.GELU);
+                CpuFusedOperations.FusedGemmBiasActivation(Hb, W2, b2, Y, M, N, H, FusedActivationType.None);
+            });
+            // torch FULL block + torch MATMUL-ONLY (decompose: is torch slow on matmul or on the glue?),
+            // each at its BEST thread count (give MKL its best shot — rule out oversubscription artifacts).
+            double tBlock = double.MaxValue, tMM = double.MaxValue;
+            foreach (int th in new[] { 32, 64, 128 })
+            {
+                torch.set_num_threads(th);
+                var (b, _) = MeasureRobust(() => { using var h = torch.matmul(tX, tW1).add_(tb1); using var g = torch.nn.functional.gelu(h); using var y = torch.matmul(g, tW2).add_(tb2); });
+                var (mm, _) = MeasureRobust(() => { using var h = torch.matmul(tX, tW1); using var y = torch.matmul(h, tW2); });
+                tBlock = Math.Min(tBlock, b); tMM = Math.Min(tMM, mm);
+            }
+            torch.set_num_threads(P);
+            Console.WriteLine($"{tag,-20} torch-block={tBlock,7:F3}ms (mm-only={tMM,6:F3})  ours-fused={ofMed,7:F3}ms  ours/torch={ofMed / tBlock,4:F2}x  {(ofMed < tBlock ? "WIN" : "LOSS")}  relErr={relErr:E2}");
+        }
+    }
+
     private static (double median, double p95) TimeAi(Func<Tensor<float>> forward)
         => MeasureRobust(() => forward());
 
