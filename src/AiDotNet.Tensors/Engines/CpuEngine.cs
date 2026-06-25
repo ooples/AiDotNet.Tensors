@@ -9337,22 +9337,34 @@ public partial class CpuEngine : ITensorLevelEngine
             return;
         }
 
-        // Strategy 1.5: high-channel convs -> explicit im2col + BLAS GEMM.
+        // Strategy 1.5: route to explicit im2col + BLAS GEMM (implicit-GEMM panels).
         // MEASURED (diffusion decoder + ResNet shapes, 32-thread CPU, 2026-06): a single
         // im2col + BlasManaged.Gemm runs at ~350-440 GFLOP/s (the GEMM K dimension =
         // inChannels*kH*kW is large enough that one packed machine-code GEMM reaches
         // near hardware peak), whereas at high channel counts BOTH the on-the-fly fused
         // kernel (~1 GFLOP/s) AND the SIMD-direct 3x3 kernel (~35-87 GFLOP/s) collapse.
         // Routing these straight to im2col+BLAS is what makes a 1.2B-param diffusion
-        // UNet forward ~10x faster (per-block profile: 99% of the forward was ResBlock
-        // convs at >=384 input channels, mis-routed to the slow direct/fused paths and
-        // timing out the foundation-scale CI shards). The >=256 gate is conservative:
-        // every measured high-channel conv wins decisively (>300 GFLOP/s) while lower-
-        // channel / stem / depthwise convs stay on the direct cascade below where the
-        // transient im2col buffer is not worth it. Winograd keeps its large-spatial niche
-        // (output >= 224) since it cuts FLOPs 2.25x there.
-        if (inChannels >= 256 &&
-            !WinogradHelper.ShouldUseWinograd(kernelHeight, kernelWidth, stride, stride, dilation, dilation, outputHeight, outputWidth))
+        // UNet forward ~10x faster.
+        //
+        // The gate covers TWO regimes:
+        //  (a) high channel count (inChannels >= 256) — the original case.
+        //  (b) large-spatial 3x3 stride-1 convs (the stems EVERY CNN backbone starts
+        //      with — VGG/ResNet at 224x224 / 112x112, low channel). MEASURED (VGG16
+        //      conv shapes, 16-core CPU, 2026-06): for these the Winograd path is
+        //      catastrophic (64ch@224 fwd = 2209 ms; 128ch@112 = 1558 ms) and the
+        //      SIMD-direct fallback is barely better, while implicit-GEMM does the same
+        //      conv in 41 ms / 33 ms — a 25-54x forward speedup, bit-identical. The old
+        //      `!ShouldUseWinograd` exclusion sent exactly these shapes to the slow
+        //      Winograd path; routing them here is the fix. Winograd's theoretical 2.25x
+        //      FLOP cut is never realized by its current implementation at any measured
+        //      shape, so implicit-GEMM is preferred for 3x3 stride-1 outright. End-to-end
+        //      this cuts a VGG16 conv fwd+bwd step ~6800 ms -> ~820 ms (8.3x).
+        bool largeSpatial3x3 = kernelHeight == 3 && kernelWidth == 3
+            && stride == 1 && dilation == 1
+            && (long)outputHeight * outputWidth >= 64L * 64; // >= 4096 output positions
+        bool highChannelNonWinograd = inChannels >= 256 &&
+            !WinogradHelper.ShouldUseWinograd(kernelHeight, kernelWidth, stride, stride, dilation, dilation, outputHeight, outputWidth);
+        if (highChannelNonWinograd || largeSpatial3x3)
         {
             // Fused (implicit-GEMM) path: block on output rows, im2col each block into a
             // cache-resident panel, GEMM straight into the output — never materialises the
