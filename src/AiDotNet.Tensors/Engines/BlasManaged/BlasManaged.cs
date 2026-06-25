@@ -467,46 +467,46 @@ public static partial class BlasManaged
             return;
 #endif
 
-        // Sub-S (#409): machine-code microkernel fast path. The tile-aligned interior
-        // runs on the hand-emitted kernel (FP64 6×8 ~57 GFLOPS/core ~95% of OpenBLAS;
-        // FP32 6×16 — multithreaded, first-party machine code, no dependency); the
-        // m%Mr / n%Nr tails go to Streaming. Honours PackingMode.Auto only (explicit
-        // pack-mode overrides take the managed path so callers can force-test a
-        // strategy), no transpose, no epilogue, no pre-pack. C is already zeroed
-        // above (the kernel accumulates), and the tails read-modify-write their own
-        // disjoint sub-tiles — so this can only add speed, never change results.
+#if NET5_0_OR_GREATER
+        // GotoBLAS FP32 parallel path (the rewrite) — the production large-float GEMM. Fires for BOTH
+        // PackingMode.Auto AND DisableAutotune: the engine's hot float path (CpuEngine.TensorMatMul2D)
+        // dispatches with DisableAutotune, so gating to Auto alone left this DEAD for real models (they ran
+        // on PackBoth). With the fix, measured 1.3-2.5x over PackBoth through the engine. A clean GotoBLAS
+        // macro-kernel over per-thread L2-resident A/B tiles. Deterministic by construction (each C element
+        // computed by one thread in fixed K order ⇒ thread-count-independent, Deterministic/DisableAutotune-
+        // contract safe). C is pre-zeroed above ⇒ zero-then-accumulate yields C := A·B; handles its own M/N
+        // tails. Gated to float, no trans, no pre-pack, no epilogue, large-shape regime. (The CCX-aware
+        // pinned-pool variant beats this ~2x at the kernel level but its win is masked by per-call engine
+        // overhead — deferred until that overhead is cut; prototype in tests/CcxGemmBench.)
+        if (typeof(T) == typeof(float) && !s_disableGotoGemm && !transA && !transB
+            && options.PackedA is null && options.PackedB is null
+            && (options.PackingMode == PackingMode.Auto || options.PackingMode == PackingMode.DisableAutotune)
+            && (long)m * n * k >= GotoGemmFp32.ParallelMinWork && GotoGemmFp32.IsAvailable)
+        {
+            var gepi = options.Epilogue;
+            if (EpilogueFlagsCompute.Compute(in gepi) == EpilogueFlags.None)
+            {
+                var (gmc, gnc, gkc) = GotoGemmFp32.ChooseParallelBlocks(m, n);
+                var gfa = MemoryMarshal.Cast<T, float>(a);
+                var gfb = MemoryMarshal.Cast<T, float>(b);
+                var gfc = MemoryMarshal.Cast<T, float>(c);
+                unsafe
+                {
+                    fixed (float* pa = gfa)
+                    fixed (float* pb = gfb)
+                    fixed (float* pc = gfc)
+                        GotoGemmFp32.RunParallel(pa, lda, pb, ldb, pc, ldc, m, n, k, gmc, gnc, gkc);
+                }
+                return;
+            }
+        }
+#endif
+
+        // Sub-S (#409): machine-code microkernel fast path for the remaining Auto shapes (small float +
+        // all double), no transpose, no epilogue, no pre-pack. C is pre-zeroed above (kernel accumulates).
         if (options.PackingMode == PackingMode.Auto && !transA && !transB
             && options.PackedA is null && options.PackedB is null)
         {
-#if NET5_0_OR_GREATER
-            // GotoBLAS FP32 parallel path (the rewrite): a clean GotoBLAS macro-kernel over per-thread
-            // L2-resident packed A/B tiles. Beats the existing machine-kernel dispatch 1.6-3.9x on the
-            // 3990X (measured --ab-goto-par) by owning disjoint C-tiles (no shared-B streaming) + kc=512
-            // blocking. Deterministic by construction: each C element is computed by exactly one thread
-            // in fixed K-order, so the result is thread-count-independent (Deterministic-mode safe). C is
-            // pre-zeroed above, so RunParallel's zero-then-accumulate yields C := A·B; it handles its own
-            // M/N tails (no Streaming follow-up). Gated to float + the proven large-shape regime.
-            if (typeof(T) == typeof(float) && !s_disableGotoGemm && GotoGemmFp32.IsAvailable
-                && (long)m * n * k >= GotoGemmFp32.ParallelMinWork)
-            {
-                var gepi = options.Epilogue;
-                if (EpilogueFlagsCompute.Compute(in gepi) == EpilogueFlags.None)
-                {
-                    var (gmc, gnc, gkc) = GotoGemmFp32.ChooseParallelBlocks(m, n);
-                    var gfa = MemoryMarshal.Cast<T, float>(a);
-                    var gfb = MemoryMarshal.Cast<T, float>(b);
-                    var gfc = MemoryMarshal.Cast<T, float>(c);
-                    unsafe
-                    {
-                        fixed (float* pa = gfa)
-                        fixed (float* pb = gfb)
-                        fixed (float* pc = gfc)
-                            GotoGemmFp32.RunParallel(pa, lda, pb, ldb, pc, ldc, m, n, k, gmc, gnc, gkc);
-                    }
-                    return;
-                }
-            }
-#endif
             int mkMr = 0, mkNr = 0;
             bool mkAvail = false;
             if (typeof(T) == typeof(double) && MachineKernelGemm.IsFp64Available)

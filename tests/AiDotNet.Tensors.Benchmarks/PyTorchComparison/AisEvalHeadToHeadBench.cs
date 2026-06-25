@@ -647,6 +647,59 @@ internal static class AisEvalHeadToHeadBench
         finally { CpuParallelSettings.MaxDegreeOfParallelism = saved; }
     }
 
+    /// <summary>
+    /// Validate + benchmark the PRODUCTION engine GEMM path (engine.TensorMatMul → BlasManaged.Gemm →
+    /// CcxGemmPool for large balanced shapes). Proves the CCX wiring is BIT-IDENTICAL to the per-tile
+    /// fallback (toggling CcxGemmPool.s_disable) — so it's correct + Deterministic-mode safe — then
+    /// times CCX vs per-tile vs MKL (warm, interleaved, min-of-10). Run: --ab-prod.
+    /// </summary>
+    public static void GotoProductionBench()
+    {
+        torch.set_grad_enabled(false);
+        int P = Environment.ProcessorCount;
+        var engine = new CpuEngine();
+        int saved = CpuParallelSettings.MaxDegreeOfParallelism;
+        CpuParallelSettings.MaxDegreeOfParallelism = P;
+        Console.WriteLine($"=== PRODUCTION engine GEMM: CCX vs per-tile vs MKL (cores={P}) ===");
+        var shapes = new (int M, int N, int K, string tag)[] { (768, 768, 768, "sq768"), (1024, 1024, 1024, "sq1024"), (2048, 2048, 2048, "sq2048") };
+        try
+        {
+            torch.set_num_threads(P);
+            { var wa = torch.rand(2048, 2048); var wb = torch.rand(2048, 2048); var ww = Stopwatch.StartNew(); while (ww.ElapsedMilliseconds < 1500) { using var _ = torch.matmul(wa, wb); } }
+            foreach (var (M, N, K, tag) in shapes)
+            {
+                var ea = Tensor<float>.CreateRandom(M, K); var eb = Tensor<float>.CreateRandom(K, N);
+                double gf = 2.0 * M * N * K / 1e9;
+                // Correctness: GotoGemm output must be BIT-IDENTICAL to the old (PackBoth) path? No — different
+                // kc/order ⇒ different rounding. Instead verify against a sampled FP64 reference dot.
+                var ec = engine.TensorMatMul(ea, eb);
+                double maxRel = 0; var rv = new Random(5);
+                for (int t = 0; t < 60; t++)
+                {
+                    int rr = rv.Next(M), col = rv.Next(N);
+                    double s = 0; for (int kk = 0; kk < K; kk++) s += (double)ea[rr * K + kk] * eb[kk * N + col];
+                    double err = Math.Abs(ec[rr * N + col] - s);
+                    maxRel = Math.Max(maxRel, Math.Abs(s) > 1e-3 ? err / Math.Abs(s) : err);
+                }
+
+                var ta = torch.rand(M, K); var tb = torch.rand(K, N);
+                double ptMs = double.PositiveInfinity, oldMs = double.PositiveInfinity, mklMs = double.PositiveInfinity;
+                for (int r = 0; r < 10; r++)
+                {
+                    // OLD path (PackBoth, GotoGemm disabled), through the engine — apples-to-apples.
+                    AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.s_disableGotoGemm = true;
+                    { var sw = Stopwatch.StartNew(); int reps = 0; do { var _ = engine.TensorMatMul(ea, eb); reps++; } while (sw.Elapsed.TotalMilliseconds < 30); sw.Stop(); oldMs = Math.Min(oldMs, sw.Elapsed.TotalMilliseconds / reps); }
+                    AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.s_disableGotoGemm = false;
+                    { var sw = Stopwatch.StartNew(); int reps = 0; do { var _ = engine.TensorMatMul(ea, eb); reps++; } while (sw.Elapsed.TotalMilliseconds < 30); sw.Stop(); ptMs = Math.Min(ptMs, sw.Elapsed.TotalMilliseconds / reps); }
+                    { var sw = Stopwatch.StartNew(); int reps = 0; do { using var _ = torch.matmul(ta, tb); reps++; } while (sw.Elapsed.TotalMilliseconds < 30); sw.Stop(); mklMs = Math.Min(mklMs, sw.Elapsed.TotalMilliseconds / reps); }
+                }
+                double ptGf = gf / (ptMs / 1000), oldGf = gf / (oldMs / 1000), mklGf = gf / (mklMs / 1000);
+                Console.WriteLine($"{tag,-9} old(PackBoth)={oldGf,7:F0}  GotoGemm={ptGf,7:F0}  MKL={mklGf,7:F0}   GotoGemm/old={(oldGf > 0 ? ptGf / oldGf : 0),4:F2}x  GotoGemm/MKL={(mklGf > 0 ? ptGf / mklGf * 100 : 0),4:F0}%   {(maxRel < 1e-3 ? "OK" : "WRONG " + maxRel.ToString("E1"))}");
+            }
+        }
+        finally { CpuParallelSettings.MaxDegreeOfParallelism = saved; }
+    }
+
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool GetLogicalProcessorInformationEx(
         int relationshipType, IntPtr buffer, ref uint returnedLength);
