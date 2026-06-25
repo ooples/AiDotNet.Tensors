@@ -98,6 +98,12 @@ class Program
             return;
         }
 
+        if (args[0] == "--ab-goto-par")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.GotoGemmParBench();
+            return;
+        }
+
         if (args[0] == "--ab-aiseval-poolstats")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.PoolStats();

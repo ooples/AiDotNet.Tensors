@@ -560,6 +560,65 @@ internal static class AisEvalHeadToHeadBench
         }
     }
 
+    /// <summary>
+    /// GotoGemmFp32 PARALLEL (the rewrite) vs native MKL, all cores. Correctness-checked + min-of-8.
+    /// The decisive measurement: does the L2-resident tile-grid decomposition beat the existing
+    /// 10-27%-of-MKL ceiling? Run: --ab-goto-par.
+    /// </summary>
+    public static unsafe void GotoGemmParBench()
+    {
+        torch.set_grad_enabled(false);
+        int P = Environment.ProcessorCount;
+        Console.WriteLine($"=== GotoGemmFp32 PARALLEL vs MKL (cores={P}) ===");
+        if (!AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.IsAvailable) { Console.WriteLine("not available"); return; }
+        int mc = AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.DefaultMc;
+        int nc = AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.DefaultNc;
+        int kc = AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.DefaultKc;
+        int saved = CpuParallelSettings.MaxDegreeOfParallelism;
+        CpuParallelSettings.MaxDegreeOfParallelism = P;
+        var rng = new Random(13);
+        var shapes = new (int M, int N, int K, string tag)[]
+        {
+            (256, 1152, 1152, "attn-proj"), (256, 1152, 4608, "mlp-fc"),
+            (1024, 1024, 1024, "square1024"), (2048, 2048, 2048, "square2048"),
+        };
+        try
+        {
+            Console.WriteLine($"{"shape",-11}{"goto",9}{"mkl",9}{"%MKL",7}  correct");
+            foreach (var (M, N, K, tag) in shapes)
+            {
+                var A = new float[(long)M * K]; var B = new float[(long)K * N]; var C = new float[(long)M * N];
+                for (int i = 0; i < A.Length; i++) A[i] = (float)(rng.NextDouble() - 0.5);
+                for (int i = 0; i < B.Length; i++) B[i] = (float)(rng.NextDouble() - 0.5);
+                double gf = 2.0 * M * N * K / 1e9, gbest = double.PositiveInfinity, maxRel = 0;
+                fixed (float* pa = A, pb = B, pc = C)
+                {
+                    AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.RunParallel(pa, K, pb, N, pc, N, M, N, K, mc, nc, kc);
+                    var rv = new Random(5);
+                    for (int t = 0; t < 200; t++)
+                    {
+                        int r = rv.Next(M), col = rv.Next(N);
+                        double s = 0; for (int kk = 0; kk < K; kk++) s += (double)A[(long)r * K + kk] * B[(long)kk * N + col];
+                        double err = Math.Abs(C[(long)r * N + col] - s);
+                        maxRel = Math.Max(maxRel, Math.Abs(s) > 1e-3 ? err / Math.Abs(s) : err);
+                    }
+                    var w = Stopwatch.StartNew(); while (w.ElapsedMilliseconds < 100) AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.RunParallel(pa, K, pb, N, pc, N, M, N, K, mc, nc, kc);
+                    for (int r = 0; r < 8; r++)
+                    {
+                        var sw = Stopwatch.StartNew(); int reps = 0;
+                        do { AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.RunParallel(pa, K, pb, N, pc, N, M, N, K, mc, nc, kc); reps++; } while (sw.Elapsed.TotalMilliseconds < 40);
+                        sw.Stop(); gbest = Math.Min(gbest, sw.Elapsed.TotalMilliseconds / reps);
+                    }
+                }
+                double goGf = gf / (gbest / 1000), mkl = 0;
+                try { var ta = torch.rand(M, K); var tb = torch.rand(K, N); torch.set_num_threads(P); mkl = gf / (MinMs(() => { using var _ = torch.matmul(ta, tb); }) / 1000); }
+                catch (Exception e) { Console.WriteLine($"  torch ref failed: {e.Message}"); }
+                Console.WriteLine($"{tag,-11}{goGf,8:F0}{mkl,9:F0}{(mkl > 0 ? goGf / mkl * 100 : 0),6:F0}%  {(maxRel < 1e-3 ? "OK" : "WRONG maxRel " + maxRel.ToString("E2"))}");
+            }
+        }
+        finally { CpuParallelSettings.MaxDegreeOfParallelism = saved; }
+    }
+
     public static void GemmDopFine()
     {
         int P = Environment.ProcessorCount;

@@ -1,6 +1,8 @@
 using System;
+using System.Buffers;
 using System.Runtime.InteropServices;
 using System.Threading;
+using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -141,6 +143,109 @@ internal static class GotoGemmFp32
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Parallel C = A·B over the IC×JC tile grid. Each worker owns a disjoint (mc×nc) C-tile and packs
+    /// its OWN A-panel + B-panel into L2 — so during the microkernel NO thread streams a shared B-panel
+    /// from L3 (the existing M-axis bottleneck that caps scaling at ~9x). Redundant B-pack across the
+    /// ic dimension is the trade for L2-resident, contention-free compute. Each tile runs its full
+    /// K-loop independently (disjoint C writes ⇒ no races, no reduction).
+    /// </summary>
+    internal static unsafe void RunParallel(
+        float* a, int lda, float* b, int ldb, float* c, int ldc,
+        int m, int n, int k, int mc, int nc, int kc)
+    {
+        int numIc = (m + mc - 1) / mc;
+        int numJc = (n + nc - 1) / nc;
+        int totalTiles = numIc * numJc;
+        if (totalTiles <= 1) { RunSingle(a, lda, b, ldb, c, ldc, m, n, k, mc, nc, kc); return; }
+
+        // Shared B-pack: numJc column-slices of up to (kc*nc) floats. Packed ONCE per K-panel and
+        // reused by every ic-tile — so B is not re-packed per tile (that was the regression) and the
+        // microkernel reads its B from the shared packed buffer.
+        long sharedBLen = (long)numJc * kc * nc;
+        float[] sharedBArr = ArrayPool<float>.Shared.Rent(checked((int)sharedBLen));
+        nint ai = (nint)a, bi = (nint)b, ci = (nint)c;
+        int numIcL = numIc, mcL = mc, ncL = nc, kcL = kc, mL = m, nL = n, ldaL = lda, ldbL = ldb, ldcL = ldc;
+        try
+        {
+            fixed (float* sharedB = sharedBArr)
+            {
+                nint sbi = (nint)sharedB;
+                for (int pc = 0; pc < k; pc += kc)
+                {
+                    int effKc = Math.Min(kc, k - pc);
+                    bool firstK = pc == 0;
+
+                    // Pre-pack every B column-slice for this K-panel (once, on the caller thread).
+                    for (int jcIdx = 0; jcIdx < numJc; jcIdx++)
+                    {
+                        int jcb = jcIdx * nc;
+                        int effNcb = Math.Min(nc, n - jcb);
+                        int nFullb = effNcb - (effNcb % Nr); int nTilesb = nFullb / Nr;
+                        float* slice = sharedB + (long)jcIdx * kc * nc;
+                        for (int nt = 0; nt < nTilesb; nt++)
+                        {
+                            float* dst = slice + (long)nt * effKc * Nr; int col0 = jcb + nt * Nr;
+                            for (int kk = 0; kk < effKc; kk++)
+                            {
+                                float* brow = b + (long)(pc + kk) * ldb + col0; float* d = dst + (long)kk * Nr;
+                                for (int col = 0; col < Nr; col++) d[col] = brow[col];
+                            }
+                        }
+                    }
+
+                    int pcL = pc, effKcL = effKc; bool firstKL = firstK;
+                    CpuParallelSettings.ParallelForOrSerial(0, totalTiles, (long)m * n * effKc, tileIdx =>
+                    {
+                        int jcIdx = tileIdx / numIcL;
+                        int icIdx = tileIdx % numIcL;
+                        int jc = jcIdx * ncL;
+                        int ic = icIdx * mcL;
+                        int effMc = Math.Min(mcL, mL - ic);
+                        int effNc = Math.Min(ncL, nL - jc);
+                        if (effMc <= 0 || effNc <= 0) return;
+                        int nFull = effNc - (effNc % Nr); int nTiles = nFull / Nr;
+                        int mFull = effMc - (effMc % Mr); int mTiles = mFull / Mr;
+                        float* slice = (float*)sbi + (long)jcIdx * kcL * ncL;
+                        float* aa = (float*)ai, bb = (float*)bi, cc = (float*)ci;
+
+                        float[] paArr = ArrayPool<float>.Shared.Rent(mcL * kcL);
+                        try
+                        {
+                            fixed (float* pa = paArr)
+                            {
+                                var kern = Kernel();
+                                for (int mt = 0; mt < mTiles; mt++)
+                                {
+                                    float* dst = pa + (long)mt * effKcL * Mr; int row0 = ic + mt * Mr;
+                                    for (int kk = 0; kk < effKcL; kk++)
+                                    {
+                                        float* d = dst + (long)kk * Mr;
+                                        for (int row = 0; row < Mr; row++) d[row] = aa[(long)(row0 + row) * ldaL + (pcL + kk)];
+                                    }
+                                }
+                                if (firstKL) ZeroCBlock(cc, ldcL, ic, jc, effMc, effNc);
+                                for (int nt = 0; nt < nTiles; nt++)
+                                {
+                                    float* bp = slice + (long)nt * effKcL * Nr; int col0 = jc + nt * Nr;
+                                    for (int mt = 0; mt < mTiles; mt++)
+                                    {
+                                        float* ap = pa + (long)mt * effKcL * Mr;
+                                        float* cp = cc + (long)(ic + mt * Mr) * ldcL + col0;
+                                        kern(ap, bp, cp, (long)ldcL * 4, effKcL);
+                                    }
+                                }
+                                ScalarTails(aa, ldaL, bb, ldbL, cc, ldcL, ic, jc, effMc, effNc, mFull, nFull, pcL, effKcL);
+                            }
+                        }
+                        finally { ArrayPool<float>.Shared.Return(paArr); }
+                    }, deterministicSafe: true);
+                }
+            }
+        }
+        finally { ArrayPool<float>.Shared.Return(sharedBArr); }
     }
 
     private static unsafe void ZeroCBlock(float* c, int ldc, int ic, int jc, int effMc, int effNc)
