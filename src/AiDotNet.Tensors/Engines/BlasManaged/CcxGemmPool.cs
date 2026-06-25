@@ -181,7 +181,10 @@ internal static unsafe class CcxGemmPool
         if ((long)m * n * k < CcxMinWork) return false;
         if (CpuParallelSettings.MaxDegreeOfParallelism < _total) return false; // restricted budget → per-tile
 
-        const int kc = 256;
+        // Deep-K-aware kc for the 2D path: more K per panel ⇒ fewer (pc-panels × 2) per-CCX barriers, which
+        // dominate when K is large. Capped so the per-C-tile working set still ~fits L1. s_kc2dOverride (env
+        // AIDOTNET_CCX_KC) for the sweep.
+        int kc = s_kc2dOverride > 0 ? s_kc2dOverride : (k >= 4096 ? 384 : 256);
         (_gr, _gc) = ChooseGrid(m, n);
         // Require a GENUINE 2D grid (both dims partitioned): gr==1 (very wide-N) or gc==1 (very tall-M) is
         // a degenerate 1D split that re-reads the big operand numCcx× and regresses — those stay on
@@ -236,6 +239,10 @@ internal static unsafe class CcxGemmPool
     /// still take 2D), to compare against the production 2D default.</summary>
     internal static bool s_force1D =
         System.Environment.GetEnvironmentVariable("AIDOTNET_CCX_1D") == "1";
+
+    /// <summary>A/B knob (env AIDOTNET_CCX_KC): override the 2D-path kc to sweep the barrier-vs-L1-fit tradeoff.</summary>
+    internal static int s_kc2dOverride =
+        int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_CCX_KC"), out var v) ? v : 0;
 
     private const int Nr32 = 16;
     // mc: enough ic-blocks for the CCX's lanes (≈2·tpc) while keeping the A-panel cache-friendly.
