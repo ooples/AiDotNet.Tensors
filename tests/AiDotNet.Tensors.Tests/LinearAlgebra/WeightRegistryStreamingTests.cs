@@ -216,6 +216,72 @@ public class WeightRegistryStreamingTests : IDisposable
     }
 
     [Fact]
+    public void ReleaseToPool_RefcountTwo_DefersDrop_DoesNotThrow()
+    {
+        // Regression for the foundation-scale streaming-inference break: during
+        // a layer's Forward a peer takes a SECOND ref on a materialized streaming
+        // weight's storage — a copy-on-write clone (#624), a RebindStorageFrom
+        // peer (CompiledInferencePlan / MemoryPlanning), or an int8/int4
+        // quant-resident alias (#629). ReleaseToPool used the STRICT
+        // DropStorageForStreaming(), which threw "requires sole storage
+        // ownership; refcount is 2" — surfaced to the consumer as the
+        // MaterializeScope.Dispose AggregateException that broke every paper-scale
+        // VLM forward (Phi3Vision / SmolVLM / Whisper / …). Post-fix it DEFERS,
+        // mirroring the RegisterWeight #430 fix.
+        var w = new Tensor<float>(new float[] { 1.5f, 2.5f, 3.5f, 4.5f }, new[] { 4 });
+        w.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(w);   // drops the resident copy to the pool
+        WeightRegistry.Materialize(w);      // page back in — resident, refcount 1
+        Assert.Equal(4, w.DataVector.Length);
+
+        // A peer shares the materialized storage for the duration of the forward.
+        var peer = new Tensor<float>(new[] { 4 });
+        peer.RebindStorageFrom(w);
+        Assert.Equal(2, w._storage.RefCount);
+
+        // Pre-fix this threw InvalidOperationException. Post-fix it defers.
+        WeightRegistry.ReleaseToPool(w);
+        Assert.True(w.StreamingDropDeferred, "Release must defer when storage is shared.");
+        Assert.Equal(4, w.DataVector.Length);            // still resident for the peer
+        Assert.Equal(1.5f, peer[0]);
+        Assert.Equal(4.5f, peer[3]);
+
+        // Once the peer releases, the deferred drop finalizes.
+        var fresh = new Tensor<float>(new[] { 4 });
+        peer.RebindStorageFrom(fresh);
+        Assert.Equal(1, w._storage.RefCount);
+        Assert.True(WeightRegistry.TryFinalizeDeferredDrop(w),
+            "Deferred drop should finalize once the peer ref releases.");
+        Assert.False(w.StreamingDropDeferred);
+        Assert.Equal(0, w.DataVector.Length);
+    }
+
+    [Fact]
+    public void MaterializeScope_Dispose_WithSharedWeight_DoesNotThrow()
+    {
+        // The exact CI failure mode: MaterializeScope.Dispose -> ReleaseToPool on
+        // a weight whose storage a forward-op peer still shares used to throw
+        // "One or more ReleaseToPool calls failed during MaterializeScope.Dispose".
+        var w = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, new[] { 4 });
+        w.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(w);
+
+        var peer = new Tensor<float>(new[] { 4 });
+        using (WeightRegistry.MaterializeMany(new[] { w }))
+        {
+            // Inside the scope w is resident; a forward op shares its storage
+            // (e.g. a COW clone of the weight that outlives the op).
+            peer.RebindStorageFrom(w);
+            Assert.Equal(2, w._storage.RefCount);
+        } // Dispose -> ReleaseToPool(w): must NOT throw now (drop deferred).
+
+        Assert.True(w.StreamingDropDeferred, "Shared weight's drop is deferred, not forced.");
+        Assert.Equal(4, w.DataVector.Length);            // still resident, uncorrupted
+        Assert.Equal(1f, peer[0]);
+        Assert.Equal(4f, peer[3]);
+    }
+
+    [Fact]
     public void MaterializeMany_Scope_MaterializesOnEnter_ReleasesOnDispose()
     {
         var t1 = new Tensor<float>(new float[] { 1f, 2f }, new[] { 2 });
