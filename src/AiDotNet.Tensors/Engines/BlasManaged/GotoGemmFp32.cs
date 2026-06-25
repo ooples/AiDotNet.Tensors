@@ -207,10 +207,13 @@ internal static class GotoGemmFp32
         int totalTiles = numIc * numJc;
         if (totalTiles <= 1) { RunSingle(a, lda, b, ldb, c, ldc, m, n, k, mc, nc, kc); return; }
 
-        // Per-tile parallelism: each worker owns a disjoint (mc×nc) C-tile and packs ITS OWN A-panel
-        // + B-panel into per-thread buffers, so the microkernel's operands are cache-resident (A→L1,
-        // B→L2 when mc/nc are sized small) with NO shared-L3 streaming during compute. Sized small,
-        // this is the cache-resident-tile scheme MKL uses to scale past the existing M-axis's L3 cap.
+        // Per-tile parallelism: each worker owns a disjoint (mc×nc) C-tile and packs ITS OWN A-panel +
+        // B-panel (per kc-panel) into per-thread L2 buffers, so the microkernel's operands stay L2-resident
+        // with no shared-L3 streaming. This redundantly re-packs A across jc and B across ic, but that
+        // redundancy is the PRICE of L2-residency: both the A-cache (ic-major) and B-cache (full-K B[jc] =
+        // K·nc > L2 → L3 reads) variants were MEASURED to regress (the cached panel spills L2 / source
+        // locality breaks). The genuine fix is the CCX/NUMA hierarchy (per-CCX shared panel), not a flat
+        // cache. Each tile runs its full K-loop independently (disjoint C ⇒ no races, deterministic).
         nint ai = (nint)a, bi = (nint)b, ci = (nint)c;
         int numIcL = numIc, mcL = mc, ncL = nc, kcL = kc, mL = m, nL = n, kL = k, ldaL = lda, ldbL = ldb, ldcL = ldc;
         CpuParallelSettings.ParallelForOrSerial(0, totalTiles, (long)m * n * k, tileIdx =>
@@ -258,60 +261,7 @@ internal static class GotoGemmFp32
                         }
                     }
                     long tB = timing ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-                    // Pack A into [kk][row] (Mr=6 per kk). The microkernel reads A kk-major, but A is
-                    // row-major (K contiguous per row) — so packing is a transpose. SIMD it via an 8x8 AVX2
-                    // transpose: load 8 K-elements of each of the 6 rows, transpose, write 8 kk-columns
-                    // contiguously. Each store writes 8 floats (low 6 valid); the +2 overlap is overwritten
-                    // by the next column / chunk (and the +8 buffer pad covers the final tile). Scalar tail
-                    // for the K-remainder past the last multiple of 8.
-                    for (int mt = 0; mt < mTiles; mt++)
-                    {
-                        float* dst = pa + (long)mt * effKc * Mr; int row0 = ic + mt * Mr;
-                        if (Avx.IsSupported)
-                        {
-                            float* a0 = a + (long)(row0 + 0) * lda + pc, a1 = a + (long)(row0 + 1) * lda + pc;
-                            float* a2 = a + (long)(row0 + 2) * lda + pc, a3 = a + (long)(row0 + 3) * lda + pc;
-                            float* a4 = a + (long)(row0 + 4) * lda + pc, a5 = a + (long)(row0 + 5) * lda + pc;
-                            int kc8 = effKc & ~7;
-                            for (int kk = 0; kk < kc8; kk += 8)
-                            {
-                                var r0 = Avx.LoadVector256(a0 + kk); var r1 = Avx.LoadVector256(a1 + kk);
-                                var r2 = Avx.LoadVector256(a2 + kk); var r3 = Avx.LoadVector256(a3 + kk);
-                                var r4 = Avx.LoadVector256(a4 + kk); var r5 = Avx.LoadVector256(a5 + kk);
-                                var z = Vector256<float>.Zero;
-                                var u0 = Avx.UnpackLow(r0, r1); var u1 = Avx.UnpackHigh(r0, r1);
-                                var u2 = Avx.UnpackLow(r2, r3); var u3 = Avx.UnpackHigh(r2, r3);
-                                var u4 = Avx.UnpackLow(r4, r5); var u5 = Avx.UnpackHigh(r4, r5);
-                                var u6 = Avx.UnpackLow(z, z); var u7 = Avx.UnpackHigh(z, z);
-                                var s0 = Avx.Shuffle(u0, u2, 0x44); var s1 = Avx.Shuffle(u0, u2, 0xEE);
-                                var s2 = Avx.Shuffle(u1, u3, 0x44); var s3 = Avx.Shuffle(u1, u3, 0xEE);
-                                var s4 = Avx.Shuffle(u4, u6, 0x44); var s5 = Avx.Shuffle(u4, u6, 0xEE);
-                                var s6 = Avx.Shuffle(u5, u7, 0x44); var s7 = Avx.Shuffle(u5, u7, 0xEE);
-                                float* dd = dst + (long)kk * Mr;
-                                Avx.Store(dd + 0 * Mr, Avx.Permute2x128(s0, s4, 0x20));
-                                Avx.Store(dd + 1 * Mr, Avx.Permute2x128(s1, s5, 0x20));
-                                Avx.Store(dd + 2 * Mr, Avx.Permute2x128(s2, s6, 0x20));
-                                Avx.Store(dd + 3 * Mr, Avx.Permute2x128(s3, s7, 0x20));
-                                Avx.Store(dd + 4 * Mr, Avx.Permute2x128(s0, s4, 0x31));
-                                Avx.Store(dd + 5 * Mr, Avx.Permute2x128(s1, s5, 0x31));
-                                Avx.Store(dd + 6 * Mr, Avx.Permute2x128(s2, s6, 0x31));
-                                Avx.Store(dd + 7 * Mr, Avx.Permute2x128(s3, s7, 0x31));
-                            }
-                            for (int kk = kc8; kk < effKc; kk++)
-                            {
-                                float* d = dst + (long)kk * Mr;
-                                d[0] = a0[kk]; d[1] = a1[kk]; d[2] = a2[kk]; d[3] = a3[kk]; d[4] = a4[kk]; d[5] = a5[kk];
-                            }
-                        }
-                        else
-                        {
-                            for (int row = 0; row < Mr; row++)
-                            {
-                                float* asrc = a + (long)(row0 + row) * lda + pc; float* d = dst + row;
-                                for (int kk = 0; kk < effKc; kk++) d[(long)kk * Mr] = asrc[kk];
-                            }
-                        }
-                    }
+                    PackA6(a, lda, pa, ic, pc, effKc, mTiles); // SIMD A-pack (8x8 AVX2 transpose; scalar fallback)
                     if (pc == 0) ZeroCBlock(c, ldc, ic, jc, effMc, effNc);
                     long t1 = timing ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                     for (int nt = 0; nt < nTiles; nt++)
@@ -366,7 +316,8 @@ internal static class GotoGemmFp32
                 for (int kk = 0; kk < effKc; kk++)
                 {
                     float* brow = b + (long)(pc + kk) * ldb + col0; float* dd = d + (long)kk * Nr;
-                    for (int col = 0; col < Nr; col++) dd[col] = brow[col];
+                    Vector256.Store(Vector256.Load(brow), dd);          // SIMD copy of the Nr=16 contiguous B-cols
+                    Vector256.Store(Vector256.Load(brow + 8), dd + 8);
                 }
             }
         }
@@ -452,7 +403,7 @@ internal static class GotoGemmFp32
     {
         int nFull = effNc - (effNc % Nr); int nTiles = nFull / Nr;
         int mFull = effMc - (effMc % Mr); int mTiles = mFull / Mr;
-        float[] paArr = ArrayPool<float>.Shared.Rent(mc * kc);
+        float[] paArr = ArrayPool<float>.Shared.Rent(mc * kc + 8); // +8: SIMD A-pack transpose may store 2 past the last tile
         try
         {
             fixed (float* pa = paArr)
@@ -461,19 +412,7 @@ internal static class GotoGemmFp32
                 for (int p = 0, pc = 0; pc < k; p++, pc += kc)
                 {
                     int effKc = Math.Min(kc, k - pc);
-                    // Pack A cache-friendly: read each A-row CONTIGUOUSLY along K (the cache-cold operand)
-                    // and write the small packed buffer strided. The old order read A column-major (stride
-                    // lda = a cache miss per element) — the profiler showed packing was 60% of GEMM time.
-                    for (int mt = 0; mt < mTiles; mt++)
-                    {
-                        float* dst = pa + (long)mt * effKc * Mr; int row0 = ic + mt * Mr;
-                        for (int row = 0; row < Mr; row++)
-                        {
-                            float* asrc = a + (long)(row0 + row) * lda + pc;
-                            float* d = dst + row;
-                            for (int kk = 0; kk < effKc; kk++) d[(long)kk * Mr] = asrc[kk];
-                        }
-                    }
+                    PackA6(a, lda, pa, ic, pc, effKc, mTiles); // SIMD A-pack (8x8 AVX2 transpose; scalar fallback)
                     if (pc == 0) ZeroCBlock(c, ldc, ic, jc, effMc, effNc);
                     for (int nt = 0; nt < nTiles; nt++)
                     {
@@ -490,6 +429,63 @@ internal static class GotoGemmFp32
             }
         }
         finally { ArrayPool<float>.Shared.Return(paArr); }
+    }
+
+    /// <summary>Pack the A-panel A[ic:ic+mTiles*Mr, pc:pc+effKc] into <paramref name="pa"/> as [mt][kk][row]
+    /// (effKc*Mr stride per mt) via an 8x8 AVX2 transpose (A is row-major K-contiguous → microkernel's
+    /// kk-major layout). Each store writes 8 floats (low Mr=6 valid); the +2 overlap is overwritten by the
+    /// next column/chunk — the caller MUST pad the pa buffer by 8. Scalar K-tail + scalar fallback (non-AVX).
+    /// Shared by RunTile and RunTilePackedB.</summary>
+    private static unsafe void PackA6(float* a, int lda, float* pa, int ic, int pc, int effKc, int mTiles)
+    {
+        for (int mt = 0; mt < mTiles; mt++)
+        {
+            float* dst = pa + (long)mt * effKc * Mr; int row0 = ic + mt * Mr;
+            if (Avx.IsSupported)
+            {
+                float* a0 = a + (long)(row0 + 0) * lda + pc, a1 = a + (long)(row0 + 1) * lda + pc;
+                float* a2 = a + (long)(row0 + 2) * lda + pc, a3 = a + (long)(row0 + 3) * lda + pc;
+                float* a4 = a + (long)(row0 + 4) * lda + pc, a5 = a + (long)(row0 + 5) * lda + pc;
+                int kc8 = effKc & ~7;
+                for (int kk = 0; kk < kc8; kk += 8)
+                {
+                    var r0 = Avx.LoadVector256(a0 + kk); var r1 = Avx.LoadVector256(a1 + kk);
+                    var r2 = Avx.LoadVector256(a2 + kk); var r3 = Avx.LoadVector256(a3 + kk);
+                    var r4 = Avx.LoadVector256(a4 + kk); var r5 = Avx.LoadVector256(a5 + kk);
+                    var zz = Vector256<float>.Zero;
+                    var u0 = Avx.UnpackLow(r0, r1); var u1 = Avx.UnpackHigh(r0, r1);
+                    var u2 = Avx.UnpackLow(r2, r3); var u3 = Avx.UnpackHigh(r2, r3);
+                    var u4 = Avx.UnpackLow(r4, r5); var u5 = Avx.UnpackHigh(r4, r5);
+                    var u6 = Avx.UnpackLow(zz, zz); var u7 = Avx.UnpackHigh(zz, zz);
+                    var s0 = Avx.Shuffle(u0, u2, 0x44); var s1 = Avx.Shuffle(u0, u2, 0xEE);
+                    var s2 = Avx.Shuffle(u1, u3, 0x44); var s3 = Avx.Shuffle(u1, u3, 0xEE);
+                    var s4 = Avx.Shuffle(u4, u6, 0x44); var s5 = Avx.Shuffle(u4, u6, 0xEE);
+                    var s6 = Avx.Shuffle(u5, u7, 0x44); var s7 = Avx.Shuffle(u5, u7, 0xEE);
+                    float* dd = dst + (long)kk * Mr;
+                    Avx.Store(dd + 0 * Mr, Avx.Permute2x128(s0, s4, 0x20));
+                    Avx.Store(dd + 1 * Mr, Avx.Permute2x128(s1, s5, 0x20));
+                    Avx.Store(dd + 2 * Mr, Avx.Permute2x128(s2, s6, 0x20));
+                    Avx.Store(dd + 3 * Mr, Avx.Permute2x128(s3, s7, 0x20));
+                    Avx.Store(dd + 4 * Mr, Avx.Permute2x128(s0, s4, 0x31));
+                    Avx.Store(dd + 5 * Mr, Avx.Permute2x128(s1, s5, 0x31));
+                    Avx.Store(dd + 6 * Mr, Avx.Permute2x128(s2, s6, 0x31));
+                    Avx.Store(dd + 7 * Mr, Avx.Permute2x128(s3, s7, 0x31));
+                }
+                for (int kk = kc8; kk < effKc; kk++)
+                {
+                    float* d = dst + (long)kk * Mr;
+                    d[0] = a0[kk]; d[1] = a1[kk]; d[2] = a2[kk]; d[3] = a3[kk]; d[4] = a4[kk]; d[5] = a5[kk];
+                }
+            }
+            else
+            {
+                for (int row = 0; row < Mr; row++)
+                {
+                    float* asrc = a + (long)(row0 + row) * lda + pc; float* d = dst + row;
+                    for (int kk = 0; kk < effKc; kk++) d[(long)kk * Mr] = asrc[kk];
+                }
+            }
+        }
     }
 
     private static unsafe void ZeroCBlock(float* c, int ldc, int ic, int jc, int effMc, int effNc)
