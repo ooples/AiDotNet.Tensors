@@ -34,6 +34,8 @@ internal static unsafe class CcxGemmPool
 
     private static float* _a, _b, _c;
     private static int _m, _n, _k, _mc, _nc, _kc, _lda, _ldb, _ldc;
+    private static bool _use2D;       // 2D-NUMA grid (huge squares) vs 1D-N thin strips
+    private static int _gr, _gc;      // 2D CCX grid (gr·gc = numCcx)
 
     /// <summary>Min M·N·K for the CCX path (below this the pinned-pool + barrier overhead isn't worth it).</summary>
     private const long CcxMinWork = 200L * 1024 * 1024;
@@ -83,7 +85,7 @@ internal static unsafe class CcxGemmPool
         {
             _go[id].Wait();
             _go[id].Reset();
-            try { DoWork(ccx, lane); }
+            try { if (_use2D) DoWork2D(ccx, lane); else DoWork(ccx, lane); }
             catch { /* a lane fault must not deadlock the join; correctness is gated by tests */ }
             finally { _done!.Signal(); }
         }
@@ -115,6 +117,53 @@ internal static unsafe class CcxGemmPool
         }
     }
 
+    // 2D-NUMA GotoBLAS: CCX (r,c) owns M-block r × N-block c. For each K-panel, lane-parallel pack that
+    // pc-panel of the N-block's B into the CCX's L3 (kc×nBlk ⇒ stays cache-friendly), barrier, then the
+    // CCX's lanes split the M-block's ic-blocks (each packs its A-panel into L2) and accumulate C across pc
+    // via RunMacroPanelStep; barrier guards the shared B-panel before the next pc. Cuts A DRAM re-reads to
+    // gc× (vs numCcx× for 1D) — the lever for huge squares whose 1D full-K strip would spill L3.
+    private static void DoWork2D(int ccx, int lane)
+    {
+        int r = ccx / _gc, cc = ccx % _gc;
+        int mBlk = RoundUp((_m + _gr - 1) / _gr, 6);
+        int nBlk = RoundUp((_n + _gc - 1) / _gc, Nr32);
+        int m0 = r * mBlk, n0 = cc * nBlk;
+        int effMblk = Math.Min(mBlk, _m - m0), effNblk = Math.Min(nBlk, _n - n0);
+        if (effMblk <= 0 || effNblk <= 0) return; // empty CCX (grid > matrix): all its lanes skip; no barrier use
+        var bar = _bar[ccx];
+        float* pkB = (float*)_bbuf[ccx];
+        for (int pc = 0; pc < _k; pc += _kc)
+        {
+            int effKc = Math.Min(_kc, _k - pc);
+            GotoGemmFp32.PackBPanelPc(_b, _ldb, n0, effNblk, pc, effKc, _kc, pkB, lane, _tpc);
+            bar.SignalAndWait();
+            int ii = 0;
+            for (int ic = m0; ic < m0 + effMblk; ic += _mc)
+            {
+                if (ii++ % _tpc != lane) continue;
+                int effMc = Math.Min(_mc, m0 + effMblk - ic);
+                GotoGemmFp32.RunMacroPanelStep(_a, _lda, _b, _ldb, _c, _ldc, ic, n0, effMc, effNblk, pc, effKc, _mc, _kc, pkB, pc == 0);
+            }
+            bar.SignalAndWait();
+        }
+    }
+
+    private static int RoundUp(int x, int mult) { int r = ((x + mult - 1) / mult) * mult; return r < mult ? mult : r; }
+
+    // Pick grid gr·gc = numCcx minimizing block aspect mismatch (balance M/gr vs N/gc).
+    private static (int gr, int gc) ChooseGrid(int m, int n)
+    {
+        int best = 1; double bestScore = double.MaxValue;
+        for (int gr = 1; gr <= _numCcx; gr++)
+        {
+            if (_numCcx % gr != 0) continue;
+            int gc = _numCcx / gr;
+            double score = Math.Abs((double)m / gr - (double)n / gc);
+            if (score < bestScore) { bestScore = score; best = gr; }
+        }
+        return (best, _numCcx / best);
+    }
+
     /// <summary>True when the CCX pool exists (≥2 L3 domains, FP32 machine kernel available).</summary>
     internal static bool IsAvailable { get { EnsureInit(); return _initState == 1; } }
 
@@ -130,16 +179,34 @@ internal static unsafe class CcxGemmPool
         if ((long)m * n * k < CcxMinWork) return false;
         if (n > 2 * m || m > 2 * n) return false;            // not balanced → per-tile/PackBoth
         if ((n / _numCcx) < Nr32) return false;              // strips too thin to tile
-        int mc = ChooseMc(m), nc = ChooseNc(n), kc = 256;
-        // The CCX win requires the per-CCX B-strip (K·nc) to stay cache-friendly. Above ~2MB the microkernel
-        // reads it from L3 and per-tile's L2-resident per-panel B wins (MEASURED: sq2048 K·nc=1MB CCX 1.14x;
-        // sq4096 K·nc=4MB CCX 0.86x). So cap the strip → huge squares fall back to per-tile.
-        if ((long)k * nc > 512L * 1024) return false;
         if (CpuParallelSettings.MaxDegreeOfParallelism < _total) return false; // restricted budget → per-tile
+
+        const int kc = 256;
+        int nc1d = ChooseNc(n);
+        bool oneDFits = (long)k * nc1d <= 512L * 1024; // 1D full-K strip <= 2MB
+        // 2D-NUMA when the 1D strip would spill (huge squares) OR forced for A/B. 2D cuts A DRAM re-reads
+        // to gc× (vs numCcx× for 1D) using kc×nBlk B-panels that stay cache-friendly regardless of K.
+        bool use2D = s_force2D || !oneDFits;
+        int mc, nc; long need;
+        if (use2D)
+        {
+            (_gr, _gc) = ChooseGrid(m, n);
+            int nBlk = RoundUp((n + _gc - 1) / _gc, Nr32);
+            int mBlk = RoundUp((m + _gr - 1) / _gr, 6);
+            if ((long)kc * nBlk > 1024L * 1024) return false; // 2D B-panel (kc×nBlk) > 4MB → per-tile
+            mc = RoundMr(mBlk / _tpc); if (mc < 48) mc = 48; if (mc > 240) mc = 240;
+            nc = nBlk;
+            need = GotoGemmFp32.PackedBPanelLen(nBlk, kc);
+        }
+        else
+        {
+            mc = ChooseMc(m); nc = nc1d;
+            need = GotoGemmFp32.PackedBLen(nc, k, kc);
+        }
         if (!Monitor.TryEnter(_runGate)) return false;       // concurrent GEMM owns the pool → per-tile
         try
         {
-            long need = GotoGemmFp32.PackedBLen(nc, k, kc);
+            _use2D = use2D;
             if (need > _bbufLen)
             {
                 for (int cc = 0; cc < _numCcx; cc++)
@@ -158,6 +225,13 @@ internal static unsafe class CcxGemmPool
         }
         finally { Monitor.Exit(_runGate); }
     }
+
+    private static int RoundMr(int x) { int r = (x / 6) * 6; return r < 6 ? 6 : r; }
+
+    /// <summary>A/B knob (env AIDOTNET_CCX_2D=1): force the 2D-NUMA path for all CCX-eligible shapes, to
+    /// compare 1D-N vs 2D directly. Production uses 2D only when the 1D strip would spill.</summary>
+    internal static bool s_force2D =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_CCX_2D") == "1";
 
     private const int Nr32 = 16;
     // mc: enough ic-blocks for the CCX's lanes (≈2·tpc) while keeping the A-panel cache-friendly.

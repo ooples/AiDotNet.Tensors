@@ -323,6 +323,67 @@ internal static class GotoGemmFp32
         }
     }
 
+    /// <summary>Floats for ONE kc×nc B-panel (nTiles·kc·Nr) — the 2D-NUMA GotoBLAS step packs B per (pc,jc),
+    /// not whole-K, so the active panel stays ~L2-sized and the microkernel never reads B from a big L3 block.</summary>
+    internal static long PackedBPanelLen(int effNc, int kc)
+    {
+        int nTiles = (effNc - (effNc % Nr)) / Nr;
+        return (long)nTiles * kc * Nr;
+    }
+
+    /// <summary>Pack ONE kc-panel of B[pc:pc+effKc, jc:jc+effNc] into <paramref name="pkB"/> as [nt][kk][col]
+    /// (nt-stride = kc·Nr). Lane-strided (ntStart/ntStride) for parallel packing within a CCX. Used by the
+    /// 2D-NUMA driver: the panel lives in the CCX's L3 and is reused across that block's ic-blocks.</summary>
+    internal static unsafe void PackBPanelPc(float* b, int ldb, int jc, int effNc, int pc, int effKc, int kc,
+        float* pkB, int ntStart, int ntStride)
+    {
+        int nFull = effNc - (effNc % Nr); int nTiles = nFull / Nr;
+        for (int nt = ntStart; nt < nTiles; nt += ntStride)
+        {
+            float* dst = pkB + (long)nt * kc * Nr; int col0 = jc + nt * Nr;
+            for (int kk = 0; kk < effKc; kk++)
+            {
+                float* brow = b + (long)(pc + kk) * ldb + col0; float* d = dst + (long)kk * Nr;
+                Vector256.Store(Vector256.Load(brow), d);
+                Vector256.Store(Vector256.Load(brow + 8), d + 8);
+            }
+        }
+    }
+
+    /// <summary>One GotoBLAS macro step for the 2D-NUMA driver: C[ic:ic+effMc, jc:jc+effNc] += A[ic,pc]·B[pc],
+    /// where B's pc-panel is already packed in <paramref name="pkB"/> (PackBPanelPc, in the CCX's L3) and A's
+    /// pc-panel is packed here into a per-lane L2 buffer (PackA6). C is zeroed when <paramref name="firstPc"/>
+    /// then accumulated across pc (RMW in L2). Tails read original a,b. Deterministic (fixed K order, disjoint C).</summary>
+    internal static unsafe void RunMacroPanelStep(
+        float* a, int lda, float* b, int ldb, float* c, int ldc,
+        int ic, int jc, int effMc, int effNc, int pc, int effKc, int mc, int kc, float* pkB, bool firstPc)
+    {
+        int nFull = effNc - (effNc % Nr); int nTiles = nFull / Nr;
+        int mFull = effMc - (effMc % Mr); int mTiles = mFull / Mr;
+        float[] paArr = ArrayPool<float>.Shared.Rent(mc * kc + 8); // +8: PackA6 transpose may store 2 past the last tile
+        try
+        {
+            fixed (float* pa = paArr)
+            {
+                PackA6(a, lda, pa, ic, pc, effKc, mTiles);
+                if (firstPc) ZeroCBlock(c, ldc, ic, jc, effMc, effNc);
+                var kern = Kernel();
+                for (int nt = 0; nt < nTiles; nt++)
+                {
+                    float* bp = pkB + (long)nt * kc * Nr; int col0 = jc + nt * Nr;
+                    for (int mt = 0; mt < mTiles; mt++)
+                    {
+                        float* ap = pa + (long)mt * effKc * Mr;
+                        float* cp = c + (long)(ic + mt * Mr) * ldc + col0;
+                        kern(ap, bp, cp, (long)ldc * 4, effKc);
+                    }
+                }
+                ScalarTails(a, lda, b, ldb, c, ldc, ic, jc, effMc, effNc, mFull, nFull, pc, effKc);
+            }
+        }
+        finally { ArrayPool<float>.Shared.Return(paArr); }
+    }
+
     /// <summary>Floats needed to hold ONE ic-block's whole-K packed A (numKc · mTiles · kc · Mr).</summary>
     internal static long PackedALen(int effMc, int k, int kc)
     {
