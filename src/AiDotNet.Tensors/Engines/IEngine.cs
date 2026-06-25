@@ -5026,6 +5026,24 @@ public interface IEngine
         FusedActivationParams? activationParams = null);
 
     /// <summary>
+    /// <see cref="FusedLinear{T}"/> written into a caller-provided destination tensor
+    /// instead of allocating the <c>[M, N]</c> output — the dominant per-forward allocator
+    /// on the DiT/SiT inference path (#1672). Computes <c>activation(input @ weights + bias)</c>
+    /// straight into <paramref name="destination"/> (contiguous <c>[M, N]</c>, fully overwritten).
+    /// Numerics are bit-identical to <see cref="FusedLinear{T}"/> (same GEMM tiers + bias/activation
+    /// epilogue). Inference-only: no tape/graph recording — the caller must ensure no gradient tape
+    /// is active. ND/generic shapes fall back to the allocating overload + a copy (correct, just no
+    /// allocation saving).
+    /// </summary>
+    void FusedLinearInto<T>(
+        Tensor<T> destination,
+        Tensor<T> input,
+        Tensor<T> weights,
+        Tensor<T>? bias,
+        FusedActivationType activation,
+        FusedActivationParams? activationParams = null);
+
+    /// <summary>
     /// Fused linear + Maxout (Goodfellow et al. 2013): computes x·W + bias of shape
     /// [.., M, N] then reduces along the feature dim by max over consecutive groups
     /// of <paramref name="numPieces"/>, producing [.., M, N/numPieces]. A

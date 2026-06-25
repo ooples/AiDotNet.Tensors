@@ -37201,6 +37201,246 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>
+    /// <see cref="FusedLinear{T}"/> written into a caller-provided destination tensor
+    /// instead of allocating the <c>[M, N]</c> output — the dominant per-forward
+    /// allocator on the DiT/SiT inference path (issue #1672). Computes
+    /// <c>activation(input @ weights + bias)</c> straight into <paramref name="destination"/>'s
+    /// backing array. Numerics are bit-identical to <see cref="FusedLinear{T}"/>: the 2D
+    /// float/double/int8/int4 fast paths reuse the exact same GEMM tiers + bias/activation
+    /// epilogue, only the output array differs. Inference-only — there is no tape/graph
+    /// recording here; the caller must guarantee no gradient tape is active (it mirrors how
+    /// <c>SelfAttentionLayer</c> guards the SDPA <c>*Into</c> path). Any case the fast paths
+    /// don't cover (ND input, generic <typeparamref name="T"/>) falls back to the allocating
+    /// <see cref="FusedLinear{T}"/> + a copy into the destination, so correctness is preserved
+    /// (it just doesn't save the allocation for those shapes).
+    /// </summary>
+    /// <param name="destination">Pre-allocated, contiguous <c>[M, N]</c> output. Fully overwritten.</param>
+    public virtual void FusedLinearInto<T>(Tensor<T> destination, Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, FusedActivationType activation, FusedActivationParams? activationParams = null)
+    {
+        using var _opScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("FusedLinearInto");
+        if (destination == null) throw new ArgumentNullException(nameof(destination));
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (weights == null) throw new ArgumentNullException(nameof(weights));
+        if (!destination.IsContiguous) throw new InvalidOperationException("Destination tensor must be contiguous.");
+
+        if (!input.IsContiguous) input = input.Contiguous();
+        if (!weights.IsContiguous) weights = weights.Contiguous();
+
+        // 2D fast path (batch x features) for float/double — the DiT/SiT forward shapes.
+        if (input.Rank == 2 && weights.Rank == 2 && (typeof(T) == typeof(float) || typeof(T) == typeof(double)))
+        {
+            int M = input._shape[0];  // Batch size
+            int K = input._shape[1];  // Input features
+            int N = weights._shape[1]; // Output features
+
+            if (weights._shape[0] != K)
+                throw new ArgumentException($"Weight matrix shape mismatch: expected [{K}, N], got [{weights._shape[0]}, {weights._shape[1]}]");
+            if (destination.Length != (long)M * N)
+                throw new ArgumentException(
+                    $"Destination length ({destination.Length}) must equal [M, N] = {(long)M * N}.");
+
+#if NET5_0_OR_GREATER
+            // No-upcast int8 weight-only fast path (mirrors FusedLinear exactly, into dest).
+            if (typeof(T) == typeof(float))
+            {
+                var q8 = weights.GetMaterializedStreamingInt8();
+                if (q8 is not null && q8.Rows == N && q8.K == K)
+                {
+                    var inA = (float[])(object)input.GetReadOnlyDataArray();
+                    var outA = (float[])(object)destination.GetDataArray();
+                    Simd.SimdGemm.SgemmWithInt8RowScaledCachedB(
+                        inA.AsSpan(0, M * K), q8.Data, q8.Scales, outA.AsSpan(0, M * N), M, K, N);
+                    if (bias != null || activation != FusedActivationType.None)
+                    {
+                        var bA = bias != null ? (float[])(object)bias.GetReadOnlyDataArray() : null;
+                        CpuFusedOperations.ApplyBiasActivationInPlace(outA, bA, M, N, activation, activationParams);
+                    }
+                    return;
+                }
+            }
+            // No-upcast int4 weight-only fast path (mirrors FusedLinear exactly, into dest).
+            if (typeof(T) == typeof(float))
+            {
+                var q4 = weights.GetMaterializedStreamingInt4();
+                if (q4 is not null && q4.Rows == N && q4.K == K)
+                {
+                    var inA = (float[])(object)input.GetDataArray();
+                    var outA = (float[])(object)destination.GetDataArray();
+                    Simd.SimdGemm.SgemmWithInt4GroupScaledDispatch(
+                        inA, q4.Data, q4.GroupScales, q4.GroupSize, outA, M, K, N);
+                    if (bias != null || activation != FusedActivationType.None)
+                    {
+                        var bA = bias != null ? (float[])(object)bias.GetDataArray() : null;
+                        CpuFusedOperations.ApplyBiasActivationInPlace(outA, bA, M, N, activation, activationParams);
+                    }
+                    return;
+                }
+            }
+#endif
+
+            if (typeof(T) == typeof(float))
+            {
+                var inArr = (float[])(object)input.GetReadOnlyDataArray();
+                var wArr = (float[])(object)weights.GetReadOnlyDataArray();
+                var outArr = (float[])(object)destination.GetDataArray();
+
+                bool blasDone = false;
+                var _ffnGemmScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("FFN.GEMM");
+
+#if !NET471
+                if (!blasDone && _jitGemm
+                    && Simd.JitGemmAvx2.TryMultiply(inArr.AsSpan(0, M * K), wArr.AsSpan(0, K * N), outArr.AsSpan(0, M * N), M, N, K))
+                    blasDone = true;
+
+                if (!blasDone && _oneDnnGemm && (long)M * K * N >= 262_144)
+                {
+                    unsafe
+                    {
+                        fixed (float* pIn = inArr, pW = wArr, pOut = outArr)
+                        {
+                            if (OneDnnProvider.TrySgemm(pIn, pW, pOut, M, K, N))
+                                blasDone = true;
+                        }
+                    }
+                }
+#endif
+
+                if (PreferManagedInferenceGemm(M, K, N))
+                {
+                    Simd.SimdGemm.SgemmWithCachedB(
+                        inArr.AsSpan(0, M * K), wArr, outArr.AsSpan(0, M * N), M, K, N);
+                    blasDone = true;
+                }
+#if NET5_0_OR_GREATER
+                var inferPool = NativeInferencePool.Current;
+                if (!blasDone && inferPool is not null && (BlasProvider.HasRawSgemm || BlasProvider.HasNativeSgemm))
+                {
+                    unsafe
+                    {
+                        float* pW = inferPool.GetOrPin(wArr);
+                        float* pOut = inferPool.GetActivationBuffer(M * N);
+                        fixed (float* pIn = inArr)
+                        {
+                            if (BlasProvider.HasRawSgemm)
+                                BlasProvider.SgemmRaw(M, N, K, pIn, K, pW, N, pOut, N);
+                            else
+                                BlasProvider.SgemmDirect(M, N, K, pIn, K, pW, N, pOut, N);
+                        }
+                        new System.Span<float>(pOut, M * N).CopyTo(outArr.AsSpan());
+                    }
+                    blasDone = true;
+                }
+
+                if (!blasDone && BlasProvider.HasRawSgemm)
+                {
+                    unsafe
+                    {
+                        fixed (float* pIn = inArr, pW = wArr, pOut = outArr)
+                            BlasProvider.SgemmRaw(M, N, K, pIn, K, pW, N, pOut, N);
+                    }
+                    blasDone = true;
+                }
+#endif
+                if (!blasDone)
+                {
+                    if (BlasProvider.HasNativeSgemm)
+                    {
+                        unsafe
+                        {
+                            fixed (float* pIn = inArr, pW = wArr, pOut = outArr)
+                                BlasProvider.SgemmDirect(M, N, K, pIn, K, pW, N, pOut, N);
+                        }
+                    }
+                    else if (BlasProvider.IsMklVerified)
+                    {
+                        BlasProvider.MklSgemmZeroOffset(M, N, K, inArr, K, wArr, N, outArr, N);
+                    }
+                    else if (!BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
+                    {
+                        Simd.SimdGemm.SgemmWithCachedB(
+                            inArr.AsSpan(0, M * K), wArr, outArr.AsSpan(0, M * N), M, K, N);
+                    }
+                }
+
+                _ffnGemmScope.Dispose();
+
+                if (bias != null || activation != FusedActivationType.None)
+                {
+                    using var _ffnEpi = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("FFN.Epilogue");
+                    var bArr = bias != null ? (float[])(object)bias.GetReadOnlyDataArray() : null;
+                    CpuFusedOperations.ApplyBiasActivationInPlace(outArr, bArr, M, N, activation, activationParams);
+                }
+
+                return;
+            }
+
+            // double
+            {
+                var inArr = (double[])(object)input.GetReadOnlyDataArray();
+                var wArr = (double[])(object)weights.GetReadOnlyDataArray();
+                var outArr = (double[])(object)destination.GetDataArray();
+
+                bool dBlasDone = false;
+#if NET5_0_OR_GREATER
+                if (BlasProvider.HasRawDgemm)
+                {
+                    unsafe
+                    {
+                        fixed (double* pIn = inArr, pW = wArr, pOut = outArr)
+                            BlasProvider.DgemmRaw(M, N, K, pIn, K, pW, N, pOut, N);
+                    }
+                    dBlasDone = true;
+                }
+#endif
+                if (!dBlasDone && BlasProvider.HasNativeDgemm)
+                {
+                    unsafe
+                    {
+                        fixed (double* pIn = inArr, pW = wArr, pOut = outArr)
+                            BlasProvider.DgemmDirect(M, N, K, pIn, K, pW, N, pOut, N);
+                    }
+                    dBlasDone = true;
+                }
+                if (!dBlasDone && BlasProvider.IsMklVerified)
+                {
+                    BlasProvider.MklDgemmZeroOffset(M, N, K, inArr, K, wArr, N, outArr, N);
+                    dBlasDone = true;
+                }
+                if (!dBlasDone && !BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
+                {
+                    CpuFusedOperations.FusedGemmBiasActivation(inArr, wArr,
+                        bias != null ? (double[])(object)bias.GetReadOnlyDataArray() : null,
+                        outArr, M, N, K, activation);
+                    return;
+                }
+
+                if (bias != null || activation != FusedActivationType.None)
+                {
+                    var bArr = bias != null ? (double[])(object)bias.GetDataArray() : null;
+                    CpuFusedOperations.ApplyBiasActivationInPlaceDouble(outArr, bArr, M, N, activation, activationParams);
+                }
+
+                return;
+            }
+        }
+
+        // Generic / ND fallback: allocate via the existing overload, copy into the
+        // destination, release. Bit-identical (same kernel); just no allocation saving.
+        var result = FusedLinear(input, weights, bias, activation, activationParams);
+        try
+        {
+            if (destination.Length != result.Length)
+                throw new ArgumentException(
+                    $"Destination length ({destination.Length}) must equal FusedLinear result length ({result.Length}).");
+            result.Data.Span.CopyTo(destination.Data.Span);
+        }
+        finally
+        {
+            TensorAllocator.Return(result);
+        }
+    }
+
+    /// <summary>
     /// Fused linear + Maxout: computes the linear pre-activation (x·W + bias) of
     /// shape [.., M, N] and reduces it by taking the max over consecutive groups of
     /// <paramref name="numPieces"/> along the feature dimension, producing
