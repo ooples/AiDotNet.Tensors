@@ -26,6 +26,14 @@ internal static class GotoGemmFp32
     private const int NrYmm = 2;
     private const int Nr = NrYmm * 8; // 16
 
+    // Default L2-resident blocking for Zen2 (512 KB L2/core): Kc=512 (the measured-best K-block),
+    // Mc/Nc chosen so packA(Mc*Kc) + packB(Kc*Nc) + Ctile(Mc*Nc) fit ~half L2. Small skewed shapes
+    // (M small) win with smaller Mc/Nc (more tiles); large square shapes want larger tiles.
+    internal const int DefaultMc = 120;
+    internal const int DefaultNc = 256;
+    internal const int DefaultKc = 512;
+
+#if NET5_0_OR_GREATER
     // Emitted-once kernel: void(float* packedA, float* packedB, float* c, long ldcBytes, long kc).
     private static IntPtr s_kernel;
     private static ExecutableMemory? s_kernelMem;
@@ -51,13 +59,6 @@ internal static class GotoGemmFp32
 
     /// <summary>True when the machine-code microkernel is available on this CPU/OS (AVX2+FMA, Windows x64).</summary>
     internal static unsafe bool IsAvailable => MachineKernelGemm.IsFp32Available && Kernel() != null;
-
-    // Default L2-resident blocking for Zen2 (512 KB L2/core): Kc=512 (the measured-best K-block),
-    // Mc/Nc chosen so packA(Mc*Kc) + packB(Kc*Nc) + Ctile(Mc*Nc) fit ~half L2. With Kc=512:
-    // 120*512 + 512*128 + 120*128 ≈ 0.5 MB → tune per measurement.
-    internal const int DefaultMc = 120;
-    internal const int DefaultNc = 256;
-    internal const int DefaultKc = 512;
 
     /// <summary>
     /// Single-thread C = A·B (row-major). A[M,K] lda, B[K,N] ldb, C[M,N] ldc (element strides).
@@ -161,91 +162,70 @@ internal static class GotoGemmFp32
         int totalTiles = numIc * numJc;
         if (totalTiles <= 1) { RunSingle(a, lda, b, ldb, c, ldc, m, n, k, mc, nc, kc); return; }
 
-        // Shared B-pack: numJc column-slices of up to (kc*nc) floats. Packed ONCE per K-panel and
-        // reused by every ic-tile — so B is not re-packed per tile (that was the regression) and the
-        // microkernel reads its B from the shared packed buffer.
-        long sharedBLen = (long)numJc * kc * nc;
-        float[] sharedBArr = ArrayPool<float>.Shared.Rent(checked((int)sharedBLen));
+        // Per-tile parallelism: each worker owns a disjoint (mc×nc) C-tile and packs ITS OWN A-panel
+        // + B-panel into per-thread buffers, so the microkernel's operands are cache-resident (A→L1,
+        // B→L2 when mc/nc are sized small) with NO shared-L3 streaming during compute. Sized small,
+        // this is the cache-resident-tile scheme MKL uses to scale past the existing M-axis's L3 cap.
         nint ai = (nint)a, bi = (nint)b, ci = (nint)c;
-        int numIcL = numIc, mcL = mc, ncL = nc, kcL = kc, mL = m, nL = n, ldaL = lda, ldbL = ldb, ldcL = ldc;
-        try
+        int numIcL = numIc, mcL = mc, ncL = nc, kcL = kc, mL = m, nL = n, kL = k, ldaL = lda, ldbL = ldb, ldcL = ldc;
+        CpuParallelSettings.ParallelForOrSerial(0, totalTiles, (long)m * n * k, tileIdx =>
         {
-            fixed (float* sharedB = sharedBArr)
-            {
-                nint sbi = (nint)sharedB;
-                for (int pc = 0; pc < k; pc += kc)
-                {
-                    int effKc = Math.Min(kc, k - pc);
-                    bool firstK = pc == 0;
+            int icIdx = tileIdx % numIcL;
+            int jcIdx = tileIdx / numIcL;
+            int ic = icIdx * mcL;
+            int jc = jcIdx * ncL;
+            int effMc = Math.Min(mcL, mL - ic);
+            int effNc = Math.Min(ncL, nL - jc);
+            if (effMc <= 0 || effNc <= 0) return;
+            int nFull = effNc - (effNc % Nr); int nTiles = nFull / Nr;
+            int mFull = effMc - (effMc % Mr); int mTiles = mFull / Mr;
+            float* aa = (float*)ai, bb = (float*)bi, cc = (float*)ci;
 
-                    // Pre-pack every B column-slice for this K-panel (once, on the caller thread).
-                    for (int jcIdx = 0; jcIdx < numJc; jcIdx++)
+            float[] paArr = ArrayPool<float>.Shared.Rent(mcL * kcL);
+            float[] pbArr = ArrayPool<float>.Shared.Rent(kcL * ncL);
+            try
+            {
+                fixed (float* pa = paArr, pb = pbArr)
+                {
+                    var kern = Kernel();
+                    for (int pc = 0; pc < kL; pc += kcL)
                     {
-                        int jcb = jcIdx * nc;
-                        int effNcb = Math.Min(nc, n - jcb);
-                        int nFullb = effNcb - (effNcb % Nr); int nTilesb = nFullb / Nr;
-                        float* slice = sharedB + (long)jcIdx * kc * nc;
-                        for (int nt = 0; nt < nTilesb; nt++)
+                        int effKc = Math.Min(kcL, kL - pc);
+                        for (int nt = 0; nt < nTiles; nt++)
                         {
-                            float* dst = slice + (long)nt * effKc * Nr; int col0 = jcb + nt * Nr;
+                            float* dst = pb + (long)nt * effKc * Nr; int col0 = jc + nt * Nr;
                             for (int kk = 0; kk < effKc; kk++)
                             {
-                                float* brow = b + (long)(pc + kk) * ldb + col0; float* d = dst + (long)kk * Nr;
+                                float* brow = bb + (long)(pc + kk) * ldbL + col0; float* d = dst + (long)kk * Nr;
                                 for (int col = 0; col < Nr; col++) d[col] = brow[col];
                             }
                         }
-                    }
-
-                    int pcL = pc, effKcL = effKc; bool firstKL = firstK;
-                    CpuParallelSettings.ParallelForOrSerial(0, totalTiles, (long)m * n * effKc, tileIdx =>
-                    {
-                        int jcIdx = tileIdx / numIcL;
-                        int icIdx = tileIdx % numIcL;
-                        int jc = jcIdx * ncL;
-                        int ic = icIdx * mcL;
-                        int effMc = Math.Min(mcL, mL - ic);
-                        int effNc = Math.Min(ncL, nL - jc);
-                        if (effMc <= 0 || effNc <= 0) return;
-                        int nFull = effNc - (effNc % Nr); int nTiles = nFull / Nr;
-                        int mFull = effMc - (effMc % Mr); int mTiles = mFull / Mr;
-                        float* slice = (float*)sbi + (long)jcIdx * kcL * ncL;
-                        float* aa = (float*)ai, bb = (float*)bi, cc = (float*)ci;
-
-                        float[] paArr = ArrayPool<float>.Shared.Rent(mcL * kcL);
-                        try
+                        for (int mt = 0; mt < mTiles; mt++)
                         {
-                            fixed (float* pa = paArr)
+                            float* dst = pa + (long)mt * effKc * Mr; int row0 = ic + mt * Mr;
+                            for (int kk = 0; kk < effKc; kk++)
                             {
-                                var kern = Kernel();
-                                for (int mt = 0; mt < mTiles; mt++)
-                                {
-                                    float* dst = pa + (long)mt * effKcL * Mr; int row0 = ic + mt * Mr;
-                                    for (int kk = 0; kk < effKcL; kk++)
-                                    {
-                                        float* d = dst + (long)kk * Mr;
-                                        for (int row = 0; row < Mr; row++) d[row] = aa[(long)(row0 + row) * ldaL + (pcL + kk)];
-                                    }
-                                }
-                                if (firstKL) ZeroCBlock(cc, ldcL, ic, jc, effMc, effNc);
-                                for (int nt = 0; nt < nTiles; nt++)
-                                {
-                                    float* bp = slice + (long)nt * effKcL * Nr; int col0 = jc + nt * Nr;
-                                    for (int mt = 0; mt < mTiles; mt++)
-                                    {
-                                        float* ap = pa + (long)mt * effKcL * Mr;
-                                        float* cp = cc + (long)(ic + mt * Mr) * ldcL + col0;
-                                        kern(ap, bp, cp, (long)ldcL * 4, effKcL);
-                                    }
-                                }
-                                ScalarTails(aa, ldaL, bb, ldbL, cc, ldcL, ic, jc, effMc, effNc, mFull, nFull, pcL, effKcL);
+                                float* d = dst + (long)kk * Mr;
+                                for (int row = 0; row < Mr; row++) d[row] = aa[(long)(row0 + row) * ldaL + (pc + kk)];
                             }
                         }
-                        finally { ArrayPool<float>.Shared.Return(paArr); }
-                    }, deterministicSafe: true);
+                        if (pc == 0) ZeroCBlock(cc, ldcL, ic, jc, effMc, effNc);
+                        for (int nt = 0; nt < nTiles; nt++)
+                        {
+                            float* bp = pb + (long)nt * effKc * Nr; int col0 = jc + nt * Nr;
+                            for (int mt = 0; mt < mTiles; mt++)
+                            {
+                                float* ap = pa + (long)mt * effKc * Mr;
+                                float* cp = cc + (long)(ic + mt * Mr) * ldcL + col0;
+                                kern(ap, bp, cp, (long)ldcL * 4, effKc);
+                            }
+                        }
+                        ScalarTails(aa, ldaL, bb, ldbL, cc, ldcL, ic, jc, effMc, effNc, mFull, nFull, pc, effKc);
+                    }
                 }
             }
-        }
-        finally { ArrayPool<float>.Shared.Return(sharedBArr); }
+            finally { ArrayPool<float>.Shared.Return(paArr); ArrayPool<float>.Shared.Return(pbArr); }
+        }, deterministicSafe: true);
     }
 
     private static unsafe void ZeroCBlock(float* c, int ldc, int ic, int jc, int effMc, int effNc)
@@ -288,4 +268,17 @@ internal static class GotoGemmFp32
             }
         }
     }
+#else
+    // net471 / pre-net5: the machine-code microkernel uses `delegate* unmanaged`, which requires the
+    // net5.0+ runtime calling-convention support. Unavailable here; callers gate on IsAvailable.
+    internal static bool IsAvailable => false;
+
+    internal static unsafe void RunSingle(
+        float* a, int lda, float* b, int ldb, float* c, int ldc, int m, int n, int k, int mc, int nc, int kc)
+        => throw new NotSupportedException("GotoGemmFp32 requires the net5.0+ machine-code JIT path; gate on IsAvailable.");
+
+    internal static unsafe void RunParallel(
+        float* a, int lda, float* b, int ldb, float* c, int ldc, int m, int n, int k, int mc, int nc, int kc)
+        => throw new NotSupportedException("GotoGemmFp32 requires the net5.0+ machine-code JIT path; gate on IsAvailable.");
+#endif
 }
