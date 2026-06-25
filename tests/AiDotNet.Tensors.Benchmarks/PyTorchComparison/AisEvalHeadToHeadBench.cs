@@ -421,6 +421,95 @@ internal static class AisEvalHeadToHeadBench
     /// 64-core/128-thread chip. If best DOP &lt; 128, the parallel framework is over-subscribing
     /// (SMT/memory contention) — capping threads would be a free scaling win. Run: --ab-gemm-dopfine.
     /// </summary>
+    /// <summary>
+    /// Pack-vs-kernel CPU-time split (PackBothProfiler) at DOP=all, to quantify the framework
+    /// overhead. KernelTicks/PackTicks are summed over worker threads. High pack% = the lever.
+    /// Run: --ab-gemm-pack.
+    /// </summary>
+    public static void GemmPackProfile()
+    {
+        int P = Environment.ProcessorCount;
+        CpuParallelSettings.MaxDegreeOfParallelism = P;
+        Console.WriteLine($"=== GEMM pack-vs-kernel CPU-time split @ {P} cores (sum over threads) ===");
+        var engine = new CpuEngine();
+        var sizes = new (int M, int K, int N, string tag)[]
+        {
+            (256, 1152, 1152, "attn-proj"),
+            (256, 1152, 4608, "mlp-fc"),
+            (2048, 2048, 2048, "square2048"),
+        };
+        foreach (var (M, K, N, tag) in sizes)
+        {
+            var a = Tensor<float>.CreateRandom(M, K);
+            var b = Tensor<float>.CreateRandom(K, N);
+            for (int i = 0; i < 5; i++) { var _ = engine.TensorMatMul(a, b); }
+            AiDotNet.Tensors.Engines.BlasManaged.PackBothProfiler.Reset();
+            AiDotNet.Tensors.Engines.BlasManaged.PackBothProfiler.Enabled = true;
+            int reps = 50;
+            for (int i = 0; i < reps; i++) { var _ = engine.TensorMatMul(a, b); }
+            AiDotNet.Tensors.Engines.BlasManaged.PackBothProfiler.Enabled = false;
+            double pa = AiDotNet.Tensors.Engines.BlasManaged.PackBothProfiler.PackAMs;
+            double pb = AiDotNet.Tensors.Engines.BlasManaged.PackBothProfiler.PackBMs;
+            double kr = AiDotNet.Tensors.Engines.BlasManaged.PackBothProfiler.KernelMs;
+            double tot = pa + pb + kr; if (tot <= 0) tot = 1;
+            Console.WriteLine($"{tag,-11} packA={pa / tot * 100,5:F1}%  packB={pb / tot * 100,5:F1}%  kernel={kr / tot * 100,5:F1}%   (kernel={kr:F0}ms packB={pb:F0}ms packA={pa:F0}ms, {reps} reps)");
+        }
+    }
+
+    /// <summary>
+    /// Single-tile FP32 microkernel bakeoff: 6x16 vs 4x24 register blocking, emitted machine code,
+    /// verified correct vs a naive reference, then timed in isolation (hot-L1, no pack/parallel).
+    /// Tests the Zen2 load-port hypothesis (4x24 = 4 broadcasts vs 6x16 = 6). Run: --ab-gemm-tile.
+    /// </summary>
+    public static unsafe void GemmTileBakeoff()
+    {
+        Console.WriteLine("=== FP32 single-tile microkernel bakeoff (6x16 vs 4x24) ===");
+        var blockings = new (int mr, int nrYmm, string tag)[] { (6, 2, "6x16"), (4, 3, "4x24") };
+        const int K = 512;
+        var rng = new Random(7);
+        foreach (var (mr, nrYmm, tag) in blockings)
+        {
+            int nr = nrYmm * 8;
+            var A = new float[mr * K]; var B = new float[K * nr];
+            for (int i = 0; i < A.Length; i++) A[i] = (float)(rng.NextDouble() - 0.5);
+            for (int i = 0; i < B.Length; i++) B[i] = (float)(rng.NextDouble() - 0.5);
+            var Apk = new float[K * mr]; var Bpk = new float[K * nr];
+            for (int row = 0; row < mr; row++) for (int k = 0; k < K; k++) Apk[k * mr + row] = A[row * K + k];
+            for (int k = 0; k < K; k++) for (int col = 0; col < nr; col++) Bpk[k * nr + col] = B[k * nr + col];
+            var Cref = new float[mr * nr];
+            for (int row = 0; row < mr; row++)
+                for (int col = 0; col < nr; col++)
+                {
+                    double s = 0; for (int k = 0; k < K; k++) s += (double)A[row * K + k] * B[k * nr + col];
+                    Cref[row * nr + col] = (float)s;
+                }
+            var C = new float[mr * nr];
+            var code = AiDotNet.Tensors.Engines.BlasManaged.MachineCodeFmaKernel.EmitFp32TileWindows(mr, nrYmm);
+            using var mem = AiDotNet.Tensors.Engines.BlasManaged.ExecutableMemory.TryAllocate(code);
+            if (mem is null || mem.Pointer == IntPtr.Zero) { Console.WriteLine($"{tag}: exec alloc failed"); continue; }
+            var kern = (delegate* unmanaged<float*, float*, float*, long, long, void>)(void*)mem.Pointer;
+            Array.Clear(C, 0, C.Length);
+            fixed (float* pa = Apk, pb = Bpk, pc = C) kern(pa, pb, pc, nr * 4L, K);
+            double maxErr = 0, maxRef = 0;
+            for (int i = 0; i < C.Length; i++) { maxErr = Math.Max(maxErr, Math.Abs(C[i] - Cref[i])); maxRef = Math.Max(maxRef, Math.Abs(Cref[i])); }
+            double relErr = maxRef > 0 ? maxErr / maxRef : maxErr;
+            bool ok = relErr < 1e-4;
+            double gf = 2.0 * mr * nr * K / 1e9;
+            double best = double.PositiveInfinity;
+            fixed (float* pa = Apk, pb = Bpk, pc = C)
+            {
+                for (int w = 0; w < 3000; w++) kern(pa, pb, pc, nr * 4L, K);
+                for (int r = 0; r < 8; r++)
+                {
+                    var swr = Stopwatch.StartNew(); int reps = 0;
+                    do { kern(pa, pb, pc, nr * 4L, K); reps++; } while (swr.Elapsed.TotalMilliseconds < 30);
+                    swr.Stop(); best = Math.Min(best, swr.Elapsed.TotalMilliseconds / reps);
+                }
+            }
+            Console.WriteLine($"{tag,-6} correct={ok} (relErr {relErr:E2})  single-tile {gf / (best / 1000),6:F1} GFLOP/s  ({mr} bcast+{nrYmm} load /12 FMA)");
+        }
+    }
+
     public static void GemmDopFine()
     {
         int P = Environment.ProcessorCount;

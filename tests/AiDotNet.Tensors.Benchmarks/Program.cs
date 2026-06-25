@@ -80,6 +80,18 @@ class Program
             return;
         }
 
+        if (args[0] == "--ab-gemm-pack")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.GemmPackProfile();
+            return;
+        }
+
+        if (args[0] == "--ab-gemm-tile")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.GemmTileBakeoff();
+            return;
+        }
+
         if (args[0] == "--ab-aiseval-poolstats")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.PoolStats();

@@ -63,6 +63,64 @@ internal static class MachineCodeFmaKernel
     /// 12 accumulators (ymm0–11) + bLo/bHi (ymm12/13) + 2 A-broadcasts (ymm14/15) —
     /// all 16 YMM, our allocation, which RyuJIT can't sustain. Row r: lo=ymm(2r), hi=ymm(2r+1).
     /// </summary>
+    /// <summary>
+    /// Generic single-tile FP32 GEMM microkernel (Windows x64) for A/B-ing register blockings on Zen2.
+    /// Computes C[mr, nr] += packedA[kc, mr]·packedB[kc, nr] (nr = nrYmm*8), C ROW-MAJOR (row stride =
+    /// ldc bytes). Pack layout: A[k*mr+row] = A_rowmajor[row,k]; B[k*nr+col] = B_rowmajor[k,col].
+    /// Signature: void(float* packedA, float* packedB, float* c, long ldcBytes, long kc).
+    /// Win-x64: rcx=packedA, rdx=packedB, r8=c, r9=ldcBytes, [rsp+0x28]=kc.
+    /// Uses mr*nrYmm YMM accumulators (≤12) + nrYmm B regs + 1 A-broadcast. The 4x24 blocking issues
+    /// 4 vbroadcastss + 3 vmovups = 7 load-port ops / 12 FMAs vs 6x16's 8 — fewer broadcasts (the Zen2
+    /// load-port bottleneck). First-party, RyuJIT-free (12 accumulators exceed RyuJIT's ~8 ceiling).
+    /// </summary>
+    internal static byte[] EmitFp32TileWindows(int mr, int nrYmm)
+    {
+        const int RCX = 1, RDX = 2, R8 = 8, R9 = 9, R10 = 10, R11 = 11, RSP = 4;
+        int accN = mr * nrYmm;          // must be <= 12
+        int bBase = 12;                 // B vectors: ymm12 .. ymm(12+nrYmm-1)
+        int aReg = 12 + nrYmm;          // A-broadcast reg (ymm14 for 6x16, ymm15 for 4x24)
+        var asm = new X64Assembler();
+
+        asm.MovRegFromRsp(R10, 0x28);   // r10 = kc (5th arg) — read before rsp moves
+        asm.SubRsp(0xA0);
+        for (int i = 0; i < 10; i++) asm.VmovupsXmmStore(RSP, (sbyte)(i * 0x10), 6 + i); // save xmm6-15
+
+        for (int i = 0; i < accN; i++) asm.Vxorps(i);   // zero accumulators
+
+        int loop = asm.NewLabel();
+        asm.MarkLabel(loop);
+        for (int j = 0; j < nrYmm; j++) asm.VmovupsLoad(bBase + j, RDX, (sbyte)(j * 32));
+        for (int r = 0; r < mr; r++)
+        {
+            asm.VbroadcastSs(aReg, RCX, (sbyte)(r * 4));
+            for (int j = 0; j < nrYmm; j++) asm.Vfmadd231ps(r * nrYmm + j, aReg, bBase + j);
+        }
+        asm.AddRegImm8(RCX, (sbyte)(mr * 4));
+        asm.AddRegImm8(RDX, (sbyte)(nrYmm * 32));
+        asm.DecReg(R10);
+        asm.JnzLabel32(loop);
+
+        // SAVE C += acc (row-major). r11 walks c by r9 (ldc bytes). ymm12 free after the K-loop.
+        asm.MovRegReg(R11, R8);
+        int cTmp = bBase;
+        for (int r = 0; r < mr; r++)
+        {
+            for (int j = 0; j < nrYmm; j++)
+            {
+                asm.VmovupsLoad(cTmp, R11, (sbyte)(j * 32));
+                asm.Vaddps(r * nrYmm + j, r * nrYmm + j, cTmp);
+                asm.VmovupsStore(R11, (sbyte)(j * 32), r * nrYmm + j);
+            }
+            if (r < mr - 1) asm.AddRegReg(R11, R9);
+        }
+
+        for (int i = 0; i < 10; i++) asm.VmovupsXmmLoad(6 + i, RSP, (sbyte)(i * 0x10));
+        asm.AddRsp(0xA0);
+        asm.Vzeroupper();
+        asm.Ret();
+        return asm.ToArray();
+    }
+
     internal static byte[] EmitFp64_6x8_PackedWindows()
     {
         const int RCX = 1, RDX = 2, R8 = 8, R9 = 9, R10 = 10, R11 = 11, RAX = 0, RSP = 4;

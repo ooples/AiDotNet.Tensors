@@ -296,6 +296,16 @@ internal sealed class X64Assembler
         Imm32(disp32);
     }
 
+    /// <summary>vaddps dst, s1, s2 (dst = s1 + s2, FP32 256-bit). VEX.NDS.256.0F.WIG 58 /r.
+    /// Used to fold the de-interleaved / tile result into C at SAVE (C += A·B).</summary>
+    internal void Vaddps(int dst, int s1, int s2) => VexRR(Map0F, PpNone, 0, 1, 0x58, dst, s1, s2);
+
+    /// <summary>vmovsldup ymm_dst, [base] (disp0). F3.0F 12 /r.</summary>
+    internal void VmovsldupLoad0(int dst, int baseReg) => VexMemDisp8(Map0F, PpF3, 0, 1, 0x12, dst, baseReg, 0);
+
+    /// <summary>vxorps dst, dst, dst (zero a ymm). VEX.256.0F.WIG 57 /r — cheaper/cleaner than vxorpd for FP32 accumulators.</summary>
+    internal void Vxorps(int dst) => VexRR(Map0F, PpNone, 0, 1, 0x57, dst, dst, dst);
+
     // ── EVEX register-register form (#378: AVX-512-BF16) ───────────────────────
     // 4-byte EVEX: 62 P0 P1 P2  opcode  ModRM(mod=11). Limited to ymm/zmm 0..15
     // (no mask / broadcast / zeroing), which is all the BF16 microkernel needs —
