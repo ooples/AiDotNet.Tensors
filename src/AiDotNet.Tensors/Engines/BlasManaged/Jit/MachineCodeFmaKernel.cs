@@ -90,6 +90,8 @@ internal static class MachineCodeFmaKernel
         int loop = asm.NewLabel();
         asm.MarkLabel(loop);
         for (int j = 0; j < nrYmm; j++) asm.VmovupsLoad(bBase + j, RDX, (sbyte)(j * 32));
+        // (SW prefetch of the packed panels was measured NO-OP: the HW prefetcher already covers the
+        // sequential access; the wall is aggregate L2/L3/DRAM bandwidth across cores, not L1 latency.)
         for (int r = 0; r < mr; r++)
         {
             asm.VbroadcastSs(aReg, RCX, (sbyte)(r * 4));

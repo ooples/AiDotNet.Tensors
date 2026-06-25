@@ -656,7 +656,7 @@ internal static class AisEvalHeadToHeadBench
     public static void ProfileGemm()
     {
         var engine = new CpuEngine();
-        CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
+        CpuParallelSettings.MaxDegreeOfParallelism = int.TryParse(Environment.GetEnvironmentVariable("DOP"), out var dop) ? dop : Environment.ProcessorCount;
         int M = 1024, N = 1024, K = 1024;
         switch (Environment.GetEnvironmentVariable("PROFILE_SHAPE"))
         {
