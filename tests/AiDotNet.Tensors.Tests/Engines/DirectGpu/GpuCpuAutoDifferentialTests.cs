@@ -442,6 +442,9 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
         // MaxPool2DBackwardGpuCorrectnessTests). These were hidden from this gate by a `public new`
         // hide on DirectGpuTensorEngine until it was converted to `override`.
         "DeformableConv2D(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32[],Int32[],Int32[])",
+        // DCNv3 grouped/depthwise single-launch GPU kernel — GPU-vs-CPU parity in
+        // GpuConvKernelCoverageTests.DeformableConv2DGrouped_Gpu_MatchesCpu (+ …WithMask) (#1691).
+        "DeformableConv2DGrouped(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32[],Int32[],Int32[],Int32,Int32)",
         "DeformableConv2DBackwardInput(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32[],Int32[],Int32[],Int32[])",
         "DeformableConv2DBackwardKernel(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32[],Int32[],Int32[],Int32[])",
         "DeformableConv2DBackwardMask(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32[],Int32[],Int32[])",

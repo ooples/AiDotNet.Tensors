@@ -17154,14 +17154,392 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
         }
-        else if (DifferentiableOps.IsTapeActiveForThread<T>() || GraphMode.IsActive)
+        else
         {
-            throw new NotSupportedException(
-                "DeformableConv2D autograd with a modulation mask (DCN v2) is not yet wired. " +
-                "Either pass mask=null (DCN v1) or wrap the call in a NoGradScope<T>() to opt out " +
-                "of autograd for this op.");
+            // DCN v2 (modulation mask): record input/kernel/offset AND mask so dL flows to all four.
+            var savedState = new object[]
+            {
+                (int[])stride.Clone(), (int[])padding.Clone(), (int[])dilation.Clone(),
+            };
+            DifferentiableOps.RecordIfActive("DeformableConv2D", result,
+                new[] { input, kernel, offset, mask },
+                BackwardFunctions<T>.DeformableConv2DBackwardWithMask,
+                savedState);
+
+            if (GraphMode.IsActive)
+            {
+                var scope = GraphMode.Current;
+                if (scope != null)
+                {
+                    var capturedInput = input;
+                    var capturedKernel = kernel;
+                    var capturedOffset = offset;
+                    var capturedMask = mask;
+                    var capturedStride = (int[])stride.Clone();
+                    var capturedPadding = (int[])padding.Clone();
+                    var capturedDilation = (int[])dilation.Clone();
+                    var outShape = (int[])result._shape.Clone();
+                    return scope.RecordVariadic(
+                        LazyNodeType.Custom,
+                        "DeformableConv2D",
+                        new[] { input, kernel, offset, mask },
+                        outShape,
+                        (eng, output) =>
+                        {
+                            var replayed = eng.DeformableConv2D(
+                                capturedInput, capturedKernel, capturedOffset,
+                                capturedMask,
+                                capturedStride, capturedPadding, capturedDilation);
+                            DirectGpuTensorEngine.CopyResultInto(eng, replayed, output);
+                        },
+                        BackwardFunctions<T>.DeformableConv2DBackwardWithMask,
+                        savedState);
+                }
+            }
         }
         return result;
+    }
+
+    /// <summary>
+    /// Fused grouped / depthwise deformable convolution (DCNv3, Wang et al. 2023). Single-pass kernel:
+    /// the channels are split into <paramref name="groups"/>; output channel <c>oc</c> (group
+    /// <c>g = oc / (outChannels/groups)</c>) convolves only its group's <c>inChannels/groups</c> input
+    /// channels against kernel rows shaped <c>[outChannels, inChannels/groups, kH, kW]</c>, sampling with
+    /// its deformable-group (<paramref name="deformGroups"/>) offset/mask slice. With
+    /// <c>groups == deformGroups == 1</c> this reduces exactly to <see cref="DeformableConv2D{T}"/>.
+    /// <para>Reference CPU implementation for the fused DCNv3 kernel (#1691). The offset/mask channel
+    /// layout matches the per-group composition path: contiguous per-deformable-group blocks of
+    /// <c>2·kH·kW</c> (Y then X) for offsets and <c>kH·kW</c> for the modulation mask.</para>
+    /// </summary>
+    public virtual Tensor<T> DeformableConv2DGrouped<T>(
+        Tensor<T> input, Tensor<T> kernel, Tensor<T> offset, Tensor<T>? mask,
+        int[] stride, int[] padding, int[] dilation, int groups, int deformGroups)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (kernel == null) throw new ArgumentNullException(nameof(kernel));
+        if (offset == null) throw new ArgumentNullException(nameof(offset));
+        if (groups < 1) throw new ArgumentOutOfRangeException(nameof(groups), "Groups must be at least 1.");
+        if (deformGroups < 1) throw new ArgumentOutOfRangeException(nameof(deformGroups), "Deformable groups must be at least 1.");
+        if (groups == 1 && deformGroups == 1)
+            return DeformableConv2D(input, kernel, offset, mask, stride, padding, dilation);
+        if (input.Rank != 4) throw new ArgumentException($"DeformableConv2DGrouped requires 4D input. Got rank {input.Rank}.", nameof(input));
+        if (kernel.Rank != 4) throw new ArgumentException($"DeformableConv2DGrouped requires 4D kernel. Got rank {kernel.Rank}.", nameof(kernel));
+
+        int batch = input._shape[0];
+        int inChannels = input._shape[1];
+        int height = input._shape[2];
+        int width = input._shape[3];
+        int outChannels = kernel._shape[0];
+        int kernelInChannels = kernel._shape[1];
+        int kernelHeight = kernel._shape[2];
+        int kernelWidth = kernel._shape[3];
+
+        if (inChannels % groups != 0) throw new ArgumentException($"Input channels ({inChannels}) must be divisible by groups ({groups}).");
+        if (outChannels % groups != 0) throw new ArgumentException($"Output channels ({outChannels}) must be divisible by groups ({groups}).");
+        int inCpg = inChannels / groups;
+        int outCpg = outChannels / groups;
+        if (kernelInChannels != inCpg) throw new ArgumentException($"Kernel in_channels ({kernelInChannels}) must equal inChannels/groups ({inCpg}).");
+        // deformGroups must DIVIDE groups: there each output group maps to exactly one deformable group
+        // (dg = g·deformGroups/groups), and that mapping coincides with the GPU kernel's per-input-channel
+        // mapping (ic/(inChannels/deformGroups)). The groups<deformGroups case (deformGroups not dividing
+        // groups) would put multiple deformable groups inside one group's channel span — the CPU
+        // composition path can't express that and would silently diverge from the GPU kernel — so reject it.
+        if (groups % deformGroups != 0)
+            throw new ArgumentException($"deformGroups ({deformGroups}) must divide groups ({groups}). " +
+                "The groups<deformGroups configuration is not supported (it would diverge between the CPU and GPU paths).");
+
+        int strideH = stride[0], strideW = stride[1];
+        int padH = padding[0], padW = padding[1];
+        int dilationH = dilation[0], dilationW = dilation[1];
+        int effectiveKernelH = dilationH * (kernelHeight - 1) + 1;
+        int effectiveKernelW = dilationW * (kernelWidth - 1) + 1;
+        int outputHeight = (height + 2 * padH - effectiveKernelH) / strideH + 1;
+        int outputWidth = (width + 2 * padW - effectiveKernelW) / strideW + 1;
+        int numKernelPositions = kernelHeight * kernelWidth;
+        int offChans = 2 * numKernelPositions * deformGroups;
+        int maskChans = numKernelPositions * deformGroups;
+        var numOps = MathHelper.GetNumericOperations<T>();
+
+        var inputData = input.GetDataArray();
+        var kernelData = kernel.GetDataArray();
+        var offsetData = offset.GetDataArray();
+        var maskData = mask?.GetDataArray();
+        var result = TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth]);
+        var outputData = result.GetDataArray();
+
+        CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, outputData.Length, idx =>
+        {
+            int b = idx / outChannels;
+            int oc = idx % outChannels;
+            int g = oc / outCpg;                                   // output group
+            int dg = deformGroups == 1 ? 0 : g * deformGroups / groups; // deformable group
+            int icBase = g * inCpg;                                // first input channel of this group
+            int offBlock = dg * 2 * numKernelPositions;            // offset channel base for this deform group
+            int maskBlock = dg * numKernelPositions;
+
+            for (int oh = 0; oh < outputHeight; oh++)
+            {
+                for (int ow = 0; ow < outputWidth; ow++)
+                {
+                    T sum = numOps.Zero;
+                    for (int ic = 0; ic < inCpg; ic++)
+                    {
+                        int icGlobal = icBase + ic;
+                        for (int kh = 0; kh < kernelHeight; kh++)
+                        {
+                            for (int kw = 0; kw < kernelWidth; kw++)
+                            {
+                                int kp = kh * kernelWidth + kw;
+                                int offYIdx = ((b * offChans + offBlock + kp) * outputHeight + oh) * outputWidth + ow;
+                                int offXIdx = ((b * offChans + offBlock + numKernelPositions + kp) * outputHeight + oh) * outputWidth + ow;
+                                double offsetY = numOps.ToDouble(offsetData[offYIdx]);
+                                double offsetX = numOps.ToDouble(offsetData[offXIdx]);
+                                double sampledH = oh * strideH - padH + kh * dilationH + offsetY;
+                                double sampledW = ow * strideW - padW + kw * dilationW + offsetX;
+                                T sampledValue = BilinearSample(inputData, b, icGlobal, inChannels, height, width, sampledH, sampledW, numOps);
+                                if (maskData != null)
+                                {
+                                    int maskIdx = ((b * maskChans + maskBlock + kp) * outputHeight + oh) * outputWidth + ow;
+                                    sampledValue = numOps.Multiply(sampledValue, maskData[maskIdx]);
+                                }
+                                int kernelIdx = ((oc * inCpg + ic) * kernelHeight + kh) * kernelWidth + kw;
+                                sum = numOps.Add(sum, numOps.Multiply(sampledValue, kernelData[kernelIdx]));
+                            }
+                        }
+                    }
+                    int outputIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
+                    outputData[outputIdx] = sum;
+                }
+            }
+        });
+
+        // Tape + lazy-graph registration — only DCN v1 (mask null) for now, mirroring DeformableConv2D.
+        // The grouped backward (input/kernel/offset) is wired; the modulation-mask (DCN v2) grad isn't,
+        // so fail fast under an active tape/graph rather than silently dropping dL when a mask is passed.
+        if (mask is null)
+        {
+            var savedState = new object[]
+            {
+                (int[])stride.Clone(), (int[])padding.Clone(), (int[])dilation.Clone(), groups, deformGroups,
+            };
+            DifferentiableOps.RecordIfActive("DeformableConv2DGrouped", result,
+                new[] { input, kernel, offset },
+                BackwardFunctions<T>.DeformableConv2DGroupedBackward,
+                savedState);
+
+            if (GraphMode.IsActive)
+            {
+                var scope = GraphMode.Current;
+                if (scope != null)
+                {
+                    var capturedInput = input;
+                    var capturedKernel = kernel;
+                    var capturedOffset = offset;
+                    var capturedStride = (int[])stride.Clone();
+                    var capturedPadding = (int[])padding.Clone();
+                    var capturedDilation = (int[])dilation.Clone();
+                    int capturedGroups = groups;
+                    int capturedDeformGroups = deformGroups;
+                    var outShape = (int[])result._shape.Clone();
+                    return scope.RecordVariadic(
+                        LazyNodeType.Custom,
+                        "DeformableConv2DGrouped",
+                        new[] { input, kernel, offset },
+                        outShape,
+                        (eng, output) =>
+                        {
+                            var replayed = eng.DeformableConv2DGrouped(
+                                capturedInput, capturedKernel, capturedOffset,
+                                mask: null,
+                                capturedStride, capturedPadding, capturedDilation,
+                                capturedGroups, capturedDeformGroups);
+                            DirectGpuTensorEngine.CopyResultInto(eng, replayed, output);
+                        },
+                        BackwardFunctions<T>.DeformableConv2DGroupedBackward,
+                        savedState);
+                }
+            }
+        }
+        else
+        {
+            // DCN v2 / v3 (modulation mask): record input/kernel/offset AND mask so dL flows to all four.
+            var savedState = new object[]
+            {
+                (int[])stride.Clone(), (int[])padding.Clone(), (int[])dilation.Clone(), groups, deformGroups,
+            };
+            DifferentiableOps.RecordIfActive("DeformableConv2DGrouped", result,
+                new[] { input, kernel, offset, mask },
+                BackwardFunctions<T>.DeformableConv2DGroupedBackwardWithMask,
+                savedState);
+
+            if (GraphMode.IsActive)
+            {
+                var scope = GraphMode.Current;
+                if (scope != null)
+                {
+                    var capturedInput = input;
+                    var capturedKernel = kernel;
+                    var capturedOffset = offset;
+                    var capturedMask = mask;
+                    var capturedStride = (int[])stride.Clone();
+                    var capturedPadding = (int[])padding.Clone();
+                    var capturedDilation = (int[])dilation.Clone();
+                    int capturedGroups = groups;
+                    int capturedDeformGroups = deformGroups;
+                    var outShape = (int[])result._shape.Clone();
+                    return scope.RecordVariadic(
+                        LazyNodeType.Custom,
+                        "DeformableConv2DGrouped",
+                        new[] { input, kernel, offset, mask },
+                        outShape,
+                        (eng, output) =>
+                        {
+                            var replayed = eng.DeformableConv2DGrouped(
+                                capturedInput, capturedKernel, capturedOffset,
+                                capturedMask,
+                                capturedStride, capturedPadding, capturedDilation,
+                                capturedGroups, capturedDeformGroups);
+                            DirectGpuTensorEngine.CopyResultInto(eng, replayed, output);
+                        },
+                        BackwardFunctions<T>.DeformableConv2DGroupedBackwardWithMask,
+                        savedState);
+                }
+            }
+        }
+        return result;
+    }
+
+    // ---- Grouped DCNv3 backward (#1691). Composition over the tested groups=1 backward kernels:
+    // groups are channel-independent for input/kernel grads (concatenate); the offset/mask grad of a
+    // deformable group is the SUM over the output groups that share it. (Single-pass fusion of the
+    // backward is a later optimization; the forward is the perf-critical path.) ----
+
+    private static (int b, int inC, int H, int W, int outC, int kk, int inCpg, int outCpg) GroupDims<T>(
+        int[] inputShape, Tensor<T> kernel, int groups)
+    {
+        int outC = kernel._shape[0];
+        int kk = kernel._shape[2] * kernel._shape[3];
+        return (inputShape[0], inputShape[1], inputShape[2], inputShape[3], outC, kk,
+                inputShape[1] / groups, outC / groups);
+    }
+
+    /// <summary>Grouped <see cref="DeformableConv2D{T}"/> gradient w.r.t. input (#1691).</summary>
+    public virtual Tensor<T> DeformableConv2DGroupedBackwardInput<T>(
+        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> kernel, Tensor<T> offset, Tensor<T>? mask,
+        int[] inputShape, int[] stride, int[] padding, int[] dilation, int groups, int deformGroups)
+    {
+        if (groups == 1 && deformGroups == 1)
+            return DeformableConv2DBackwardInput(gradOutput, input, kernel, offset, mask, inputShape, stride, padding, dilation);
+        var d = GroupDims(inputShape, kernel, groups);
+        var parts = new Tensor<T>[groups];
+        for (int g = 0; g < groups; g++)
+        {
+            int dg = deformGroups == 1 ? 0 : g * deformGroups / groups;
+            var goG = gradOutput.Slice(1, g * d.outCpg, (g + 1) * d.outCpg);
+            var kG = kernel.Slice(0, g * d.outCpg, (g + 1) * d.outCpg);
+            var inG = input.Slice(1, g * d.inCpg, (g + 1) * d.inCpg);
+            var offG = offset.Slice(1, dg * 2 * d.kk, (dg + 1) * 2 * d.kk);
+            var mkG = mask?.Slice(1, dg * d.kk, (dg + 1) * d.kk);
+            parts[g] = DeformableConv2DBackwardInput(goG, inG, kG, offG, mkG, new[] { d.b, d.inCpg, d.H, d.W }, stride, padding, dilation);
+        }
+        return Tensor<T>.Concatenate(parts, axis: 1);
+    }
+
+    /// <summary>Grouped <see cref="DeformableConv2D{T}"/> gradient w.r.t. kernel (#1691).</summary>
+    public virtual Tensor<T> DeformableConv2DGroupedBackwardKernel<T>(
+        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> offset, Tensor<T>? mask,
+        int[] kernelShape, int[] stride, int[] padding, int[] dilation, int groups, int deformGroups)
+    {
+        if (groups == 1 && deformGroups == 1)
+            return DeformableConv2DBackwardKernel(gradOutput, input, offset, mask, kernelShape, stride, padding, dilation);
+        int outC = kernelShape[0], inCpg = kernelShape[1], kH = kernelShape[2], kW = kernelShape[3], kk = kH * kW;
+        int inC = input._shape[1], outCpg = outC / groups; int kkChans = 2 * kk;
+        var parts = new Tensor<T>[groups];
+        for (int g = 0; g < groups; g++)
+        {
+            int dg = deformGroups == 1 ? 0 : g * deformGroups / groups;
+            var goG = gradOutput.Slice(1, g * outCpg, (g + 1) * outCpg);
+            var inG = input.Slice(1, g * inCpg, (g + 1) * inCpg);
+            var offG = offset.Slice(1, dg * kkChans, (dg + 1) * kkChans);
+            var mkG = mask?.Slice(1, dg * kk, (dg + 1) * kk);
+            parts[g] = DeformableConv2DBackwardKernel(goG, inG, offG, mkG, new[] { outCpg, inCpg, kH, kW }, stride, padding, dilation);
+        }
+        return Tensor<T>.Concatenate(parts, axis: 0); // concat over output-channel axis -> [outC, inCpg, kH, kW]
+    }
+
+    /// <summary>Grouped <see cref="DeformableConv2D{T}"/> gradient w.r.t. offset (#1691). The grad of a
+    /// deformable group is the sum over the output groups sharing it.</summary>
+    public virtual Tensor<T> DeformableConv2DGroupedBackwardOffset<T>(
+        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> kernel, Tensor<T> offset, Tensor<T>? mask,
+        int[] stride, int[] padding, int[] dilation, int groups, int deformGroups)
+    {
+        if (groups == 1 && deformGroups == 1)
+            return DeformableConv2DBackwardOffset(gradOutput, input, kernel, offset, mask, stride, padding, dilation);
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int inC = input._shape[1], outC = kernel._shape[0], kk = kernel._shape[2] * kernel._shape[3];
+        int inCpg = inC / groups, outCpg = outC / groups, blk = 2 * kk;
+        var gradOffset = AutoTensorCache.RentOrAllocate<T>(offset._shape);
+        var goData = gradOffset.GetDataArray();
+        Array.Clear(goData, 0, (int)gradOffset.Length);
+        int fullC = offset._shape[1];
+        for (int g = 0; g < groups; g++)
+        {
+            int dg = deformGroups == 1 ? 0 : g * deformGroups / groups;
+            var goG = gradOutput.Slice(1, g * outCpg, (g + 1) * outCpg);
+            var kG = kernel.Slice(0, g * outCpg, (g + 1) * outCpg);
+            var inG = input.Slice(1, g * inCpg, (g + 1) * inCpg);
+            var offG = offset.Slice(1, dg * blk, (dg + 1) * blk);
+            var mkG = mask?.Slice(1, dg * kk, (dg + 1) * kk);
+            var part = DeformableConv2DBackwardOffset(goG, inG, kG, offG, mkG, stride, padding, dilation);
+            var pData = part.GetDataArray();
+            int B = part._shape[0], pc = part._shape[1], oHW = part._shape[2] * part._shape[3];
+            for (int bb = 0; bb < B; bb++)
+                for (int c = 0; c < pc; c++)
+                    for (int s = 0; s < oHW; s++)
+                    {
+                        int dst = ((bb * fullC + dg * blk + c) * oHW) + s;
+                        int src = ((bb * pc + c) * oHW) + s;
+                        goData[dst] = numOps.Add(goData[dst], pData[src]);
+                    }
+        }
+        return gradOffset;
+    }
+
+    /// <summary>Grouped <see cref="DeformableConv2D{T}"/> gradient w.r.t. modulation mask (#1691).</summary>
+    public virtual Tensor<T> DeformableConv2DGroupedBackwardMask<T>(
+        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> kernel, Tensor<T> offset, Tensor<T> mask,
+        int[] stride, int[] padding, int[] dilation, int groups, int deformGroups)
+    {
+        if (groups == 1 && deformGroups == 1)
+            return DeformableConv2DBackwardMask(gradOutput, input, kernel, offset, mask, stride, padding, dilation);
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int inC = input._shape[1], outC = kernel._shape[0], kk = kernel._shape[2] * kernel._shape[3];
+        int inCpg = inC / groups, outCpg = outC / groups, blk = 2 * kk;
+        var gradMask = AutoTensorCache.RentOrAllocate<T>(mask._shape);
+        var gmData = gradMask.GetDataArray();
+        Array.Clear(gmData, 0, (int)gradMask.Length);
+        int fullC = mask._shape[1];
+        for (int g = 0; g < groups; g++)
+        {
+            int dg = deformGroups == 1 ? 0 : g * deformGroups / groups;
+            var goG = gradOutput.Slice(1, g * outCpg, (g + 1) * outCpg);
+            var kG = kernel.Slice(0, g * outCpg, (g + 1) * outCpg);
+            var inG = input.Slice(1, g * inCpg, (g + 1) * inCpg);
+            var offG = offset.Slice(1, dg * blk, (dg + 1) * blk);
+            var mkG = mask.Slice(1, dg * kk, (dg + 1) * kk);
+            var part = DeformableConv2DBackwardMask(goG, inG, kG, offG, mkG, stride, padding, dilation);
+            var pData = part.GetDataArray();
+            int B = part._shape[0], pc = part._shape[1], oHW = part._shape[2] * part._shape[3];
+            for (int bb = 0; bb < B; bb++)
+                for (int c = 0; c < pc; c++)
+                    for (int s = 0; s < oHW; s++)
+                    {
+                        int dst = ((bb * fullC + dg * kk + c) * oHW) + s;
+                        int src = ((bb * pc + c) * oHW) + s;
+                        gmData[dst] = numOps.Add(gmData[dst], pData[src]);
+                    }
+        }
+        return gradMask;
     }
 
     /// <summary>
