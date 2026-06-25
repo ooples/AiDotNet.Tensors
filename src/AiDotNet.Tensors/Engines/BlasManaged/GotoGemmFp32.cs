@@ -47,9 +47,9 @@ internal static class GotoGemmFp32
     /// 0.86-0.88× there), so those are excluded to avoid a production regression on the diffusion forward.</summary>
     internal static bool BeatsPackBoth(int m, int n, int k) => m >= 512 || (long)k >= 2L * n;
 
-    /// <summary>Shape-adaptive (Mc, Nc, Kc) for RunParallel, tuned on the 3990X (measured --ab-goto-par).
-    /// Memory-bound regime: larger square shapes want larger tiles (fewer redundant DRAM re-reads);
-    /// skewed / smaller shapes want smaller Mc for enough IC-blocks. Kc=512 is universally best.</summary>
+    /// <summary>Shape-adaptive (Mc, Nc, Kc) for RunParallel, tuned on the 3990X (measured --ab-goto-par /
+    /// --profile-gemm). Memory-bound regime: larger square shapes want larger tiles (fewer redundant DRAM
+    /// re-reads); skewed / smaller shapes want smaller Mc for enough IC-blocks. Kc=256 (see ParallelKc).</summary>
     internal static int s_kcOverride; // 0 = use ParallelKc; A/B knob for the kc sweep
     // kc=256 (not 512): once the pack is SIMD (B 2xVector256, A 8x8 transpose), the smaller K-block that
     // keeps the microkernel's per-C-tile working set (A 6×kc + B kc×16 ≈ 22·kc floats) in L1 (32KB) wins —
