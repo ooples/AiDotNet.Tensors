@@ -74,6 +74,13 @@ class Program
             return;
         }
 
+        // #475 machine-code macro-kernel A/B (RyuJIT off the hot path). (--ab-macro)
+        if (args[0] == "--ab-macro")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.MacroAb();
+            return;
+        }
+
         if (args[0] == "--ab-aiseval-dopsweep")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.DopSweep();

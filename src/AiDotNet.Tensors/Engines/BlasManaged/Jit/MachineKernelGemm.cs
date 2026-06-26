@@ -75,9 +75,9 @@ internal static class MachineKernelGemm
     private static bool UseAvx512Fp32 => EnableAvx512 && Avx512F.IsSupported && TryInitAvx512Fp32();
 
     private static readonly object _lock = new();
-    private static bool _tried64, _tried32, _triedZ64, _triedZ32, _triedPanel32;
-    private static ExecutableMemory? _mem64, _mem32, _memZ64, _memZ32, _memPanel32; // kept alive for the process
-    private static nint _kern64, _kern32, _kernZ64, _kernZ32, _kernPanel32;
+    private static bool _tried64, _tried32, _triedZ64, _triedZ32, _triedPanel32, _triedMacro32;
+    private static ExecutableMemory? _mem64, _mem32, _memZ64, _memZ32, _memPanel32, _memMacro32; // kept alive for the process
+    private static nint _kern64, _kern32, _kernZ64, _kernZ32, _kernPanel32, _kernMacro32;
 
     // #663: expose the #653 panel kernel to the N-axis path (PackBothStrategy.RunNAxisParallelUnsafe).
     // Shares _kernPanel32 + TryInitPanelFp32 with the internal RunPacked panel use (both branches
@@ -100,6 +100,44 @@ internal static class MachineKernelGemm
         fixed (float* pb = packedB)
         fixed (float* pc = c)
             kern(pa, pb, pc, ldc, kc, njr);
+    }
+
+    /// <summary>True when the FP32 6×16 MACRO kernel (whole Mr-sweep in asm) is usable.</summary>
+    internal static bool IsFp32MacroAvailable => Enabled && EnablePanelKernel && TryInitMacroFp32();
+
+    /// <summary>
+    /// Run the FP32 6×16 macro kernel: for a single K-panel, does numMr Mr-blocks × njr Nr=16
+    /// tiles × kc K-steps entirely in machine code, reusing packedB across Mr-blocks. C is
+    /// read-modify-write. aBase points at the panel's first Mr-stripe; consecutive stripes are
+    /// aStrideBytes apart; C advances Mr·ldc rows per Mr-block. Caller guarantees availability.
+    /// </summary>
+    internal static unsafe void RunMacroPanelFp32(
+        float* aBase, float* bBase, float* cBase,
+        int ldc, int kc, int njr, int numMr, int aStrideBytes)
+    {
+        var kern = (delegate* unmanaged<float*, float*, float*, long, long, long, long, long, void>)_kernMacro32;
+        kern(aBase, bBase, cBase, ldc, kc, njr, numMr, aStrideBytes);
+    }
+
+    private static bool TryInitMacroFp32()
+    {
+        if (_triedMacro32) return _kernMacro32 != 0;
+        lock (_lock)
+        {
+            if (_triedMacro32) return _kernMacro32 != 0;
+            _triedMacro32 = true;
+            if (!PlatformOk()) return false;
+            try
+            {
+                byte[] code = IsWindows
+                    ? MachineCodeFmaKernel.EmitFp32_6x16_MacroWindows()
+                    : MachineCodeFmaKernel.EmitFp32_6x16_MacroSysV();
+                _memMacro32 = ExecutableMemory.TryAllocate(code);
+                if (_memMacro32 is not null) _kernMacro32 = _memMacro32.Pointer;
+            }
+            catch { _memMacro32 = null; _kernMacro32 = 0; }
+            return _kernMacro32 != 0;
+        }
     }
 
     private static bool IsWindows => RuntimeInformation.IsOSPlatform(OSPlatform.Windows);

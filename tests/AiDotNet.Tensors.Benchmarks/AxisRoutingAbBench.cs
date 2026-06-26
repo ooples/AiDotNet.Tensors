@@ -113,6 +113,58 @@ public static class AxisRoutingAbBench
         BlasManaged.Gemm<float>(a, k, false, b, n, false, c, n, m, n, k, in opts);
     }
 
+    private static double TimeMinGemm(float[] a, float[] b, float[] c, int m, int n, int k)
+    {
+        double work = (double)m * n * k;
+        int iters = work > 2e9 ? 2 : work > 5e8 ? 4 : 10;
+        for (int i = 0; i < 3 * iters; i++) GemmOnce(a, b, c, m, n, k);
+        var sw = new Stopwatch();
+        double best = double.MaxValue;
+        for (int r = 0; r < 12; r++) { sw.Restart(); for (int i = 0; i < iters; i++) GemmOnce(a, b, c, m, n, k); sw.Stop(); best = Math.Min(best, sw.Elapsed.TotalSeconds / iters); }
+        return best;
+    }
+
+    /// <summary>
+    /// #475 machine-code MACRO kernel A/B: the whole Mr-sweep in asm (RyuJIT off the hot path) vs
+    /// the current managed-loop path, single- and multi-thread, with a bit-exactness check.
+    /// Run: <c>--ab-macro</c>.
+    /// </summary>
+    public static void MacroAb()
+    {
+        Console.WriteLine("=== #475 MACRO kernel A/B (FP32) — whole Mr-sweep in machine code ===");
+        Console.WriteLine($"MacroAvailable={MachineKernelGemm.IsFp32MacroAvailable}  cores={Environment.ProcessorCount}");
+        var shapes = new (string label, int m, int n, int k)[]
+        {
+            ("medium  384x1024x1024", 384, 1024, 1024),
+            ("attn    256x1536x1536", 256, 1536, 1536),
+            ("ffn-up  384x6144x1536", 384, 6144, 1536),
+            ("ffn-big 384x4096x3456", 384, 4096, 3456),
+        };
+        foreach (var (label, m, n, k) in shapes)
+        {
+            var a = MakeRandom(m * k);
+            var b = MakeRandom(k * n);
+            double flops = 2.0 * m * n * k;
+            var cref = new float[m * n];
+            var c = new float[m * n];
+            foreach (int dop in new[] { 1, 32 })
+            {
+                CpuParallelSettings.MaxDegreeOfParallelism = dop;
+                PackBothStrategy.s_macroKernel = false;
+                Array.Clear(cref, 0, cref.Length); GemmOnce(a, b, cref, m, n, k);
+                double baseSec = TimeMinGemm(a, b, c, m, n, k);
+                PackBothStrategy.s_macroKernel = true;
+                Array.Clear(c, 0, c.Length); GemmOnce(a, b, c, m, n, k);
+                double maxErr = 0;
+                for (int i = 0; i < c.Length; i++) { double e = Math.Abs(c[i] - cref[i]); if (e > maxErr) maxErr = e; }
+                double macroSec = TimeMinGemm(a, b, c, m, n, k);
+                PackBothStrategy.s_macroKernel = false;
+                Console.WriteLine($"  {label} DOP={dop,2}: base {flops / baseSec / 1e9,6:F0}  macro {flops / macroSec / 1e9,6:F0} GF/s  ({baseSec / macroSec:F2}x)  maxErr={maxErr:E1}");
+            }
+        }
+        CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
+    }
+
     private static double Gf(double flops, double sec) => flops / sec / 1e9;
 
     private static unsafe double TimeMinNative(float[] a, float[] b, float[] c, int m, int n, int k)

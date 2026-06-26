@@ -201,6 +201,15 @@ internal sealed class X64Assembler
         B(rex, 0x8B, (byte)(0x40 | ((dst & 7) << 3) | 4), 0x24, (byte)disp);
     }
 
+    /// <summary>mov dst64, [rsp+disp32]. REX.W[.R] 8B /r, mod=10, rm=100 (SIB rsp), disp32.
+    /// For reading a stack argument after the frame has grown past the disp8 (±127) range.</summary>
+    internal void MovRegFromRspD32(int dst, int disp32)
+    {
+        byte rex = (byte)(0x48 | (dst >= 8 ? 4 : 0));
+        B(rex, 0x8B, (byte)(0x80 | ((dst & 7) << 3) | 4), 0x24);
+        Imm32(disp32);
+    }
+
     /// <summary>lea rax, [idx*8]. REX.W[.X] 8D, mod=00 reg=rax rm=100, SIB(scale8,idx,base=disp32), disp32=0.</summary>
     internal void LeaRaxIndexScale8(int idx)
     {

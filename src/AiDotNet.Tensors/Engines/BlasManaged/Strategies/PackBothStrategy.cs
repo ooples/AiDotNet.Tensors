@@ -47,6 +47,12 @@ internal static class PackBothStrategy
     // chunks of ~256, while chunking still amortizes per-tile dispatch. Settable for sweeps.
     internal static int MaxPanelTiles = 256;
 
+    // #475: route the FP32 N-axis compute loop's Mr-sweep through the machine-code MACRO kernel
+    // (RunMacroPanelFp32) — the whole numMr × njr × kc sweep in one asm call, taking RyuJIT off the
+    // hot path (PerfView showed ~36% of single-thread time in the managed RunNAxisParallelUnsafe
+    // loop body). A/B toggle; default off until bit-exactness is validated, then flipped on.
+    internal static bool s_macroKernel;
+
     // #653 software-prefetch microkernel (env AIDOTNET_GEMM_PREFETCH=1, default off). Routes the
     // FP32 6×16 tile through Avx2Fp32_6x16.RunPrefetch (PREFETCHT0 of packed-B ahead) — same inlined
     // intrinsic kernel, so NO per-tile call/fixed overhead (unlike the machine-code-per-tile path
@@ -949,36 +955,63 @@ internal static class PackBothStrategy
 
                     // Compute: for each K-panel (ascending → correct C accumulation), each
                     // Mr-block does one chunked panel call over the N-block's full tiles + tail.
-                    for (int pIdx = 0; pIdx < numKPanelsL; pIdx++)
+                    // #475: when enabled, the whole Mr-sweep runs in the machine-code MACRO kernel
+                    // (one asm call per K-panel/N-chunk), taking RyuJIT off the hot path.
+                    bool useMacro = s_macroKernel && njrFull > 0 && MachineKernelGemm.IsFp32MacroAvailable;
+                    fixed (float* pbPacked = packBSpan)
                     {
-                        int pc = pIdx * kcL;
-                        int effKc = Math.Min(kcL, kL - pc);
-                        var bPanel = packBSpan.Slice(pIdx * bPanelStride, effKc * packedNc);
-                        for (int ir = 0; ir < numMrL; ir++)
+                        for (int pIdx = 0; pIdx < numKPanelsL; pIdx++)
                         {
-                            var aPanel = new ReadOnlySpan<float>(pa + pIdx * aPanelStrideL + ir * effKc * mrL, effKc * mrL);
-                            int cOff = (ir * mrL) * ldcL + jc;
-                            if (njrFull > 0)
+                            int pc = pIdx * kcL;
+                            int effKc = Math.Min(kcL, kL - pc);
+                            var bPanel = packBSpan.Slice(pIdx * bPanelStride, effKc * packedNc);
+                            int maxPanelTiles = Math.Max(1, MaxPanelTiles); // guard sweep-set 0/negative
+
+                            if (useMacro)
                             {
-                                int maxPanelTiles = Math.Max(1, MaxPanelTiles); // guard sweep-set 0/negative
+                                float* aBase0 = pa + pIdx * aPanelStrideL;
+                                float* bBase0 = pbPacked + pIdx * bPanelStride;
+                                int aStrideBytes = effKc * mrL * sizeof(float);
                                 for (int jb = 0; jb < njrFull; jb += maxPanelTiles)
                                 {
                                     int chunk = Math.Min(maxPanelTiles, njrFull - jb);
-                                    MachineKernelGemm.RunPanelFp32(
-                                        aPanel,
-                                        bPanel.Slice(jb * effKc * nrL, chunk * effKc * nrL),
-                                        new Span<float>(cc + cOff + jb * nrL, cLenL - (cOff + jb * nrL)),
-                                        ldcL, effKc, chunk);
+                                    MachineKernelGemm.RunMacroPanelFp32(
+                                        aBase0, bBase0 + jb * effKc * nrL, cc + jc + jb * nrL,
+                                        ldcL, effKc, chunk, numMrL, aStrideBytes);
                                 }
                             }
+                            else if (njrFull > 0)
+                            {
+                                for (int ir = 0; ir < numMrL; ir++)
+                                {
+                                    var aPanel = new ReadOnlySpan<float>(pa + pIdx * aPanelStrideL + ir * effKc * mrL, effKc * mrL);
+                                    int cOff = (ir * mrL) * ldcL + jc;
+                                    for (int jb = 0; jb < njrFull; jb += maxPanelTiles)
+                                    {
+                                        int chunk = Math.Min(maxPanelTiles, njrFull - jb);
+                                        MachineKernelGemm.RunPanelFp32(
+                                            aPanel,
+                                            bPanel.Slice(jb * effKc * nrL, chunk * effKc * nrL),
+                                            new Span<float>(cc + cOff + jb * nrL, cLenL - (cOff + jb * nrL)),
+                                            ldcL, effKc, chunk);
+                                    }
+                                }
+                            }
+
+                            // Nr tail (effNc % nr != 0): per-Mr-block managed dispatch (small).
                             if (nrTail > 0)
                             {
                                 int jrTail = njrFull * nrL;
-                                DispatchMicrokernelWithTail<float>(
-                                    aPanel,
-                                    bPanel.Slice(njrFull * effKc * nrL, effKc * nrL),
-                                    new Span<float>(cc + cOff + jrTail, cLenL - (cOff + jrTail)),
-                                    ldcL, effKc, mrL, nrL, nrTail);
+                                var bTail = bPanel.Slice(njrFull * effKc * nrL, effKc * nrL);
+                                for (int ir = 0; ir < numMrL; ir++)
+                                {
+                                    var aPanel = new ReadOnlySpan<float>(pa + pIdx * aPanelStrideL + ir * effKc * mrL, effKc * mrL);
+                                    int cOff = (ir * mrL) * ldcL + jc + jrTail;
+                                    DispatchMicrokernelWithTail<float>(
+                                        aPanel, bTail,
+                                        new Span<float>(cc + cOff, cLenL - cOff),
+                                        ldcL, effKc, mrL, nrL, nrTail);
+                                }
                             }
                         }
                     }
