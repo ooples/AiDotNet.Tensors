@@ -253,9 +253,14 @@ internal static class PackBothStrategy
                 && options.Epilogue.BiasN.IsEmpty && options.Epilogue.SkipMxN.IsEmpty;
             // Auto-gate = the measured win envelope k ≤ n ≤ 2k (the N-axis regime, n≥k, where the
             // crossover ladder showed 1.06-1.41x). Below k is narrow-N (other paths, not A/B'd here);
-            // above 2k N-axis wins. s_forceGotoBlas (test-only) ignores the gate for the full A/B.
-            if (gotoEnvelope && (s_forceGotoBlas
-                    || (s_gotoBlasAuto && (long)n >= (long)k && (long)n <= 2L * k)))
+            // above 2k N-axis wins. The m≥128 / k≥512 floor keeps routing inside the validated regime
+            // (measured at m∈{384,768}, k∈{1024,1536}) — small/skinny shapes, where GotoBLAS's ic
+            // fan-out is unvalidated, keep their existing routing. s_forceGotoBlas (test-only) ignores
+            // the gate for the full A/B.
+            bool gotoAutoGate = s_gotoBlasAuto
+                && m >= 128 && k >= 512
+                && (long)n >= (long)k && (long)n <= 2L * k;
+            if (gotoEnvelope && (s_forceGotoBlas || gotoAutoGate))
             {
                 fixed (T* aPtrG = a)
                 fixed (T* bPtrG = b)
