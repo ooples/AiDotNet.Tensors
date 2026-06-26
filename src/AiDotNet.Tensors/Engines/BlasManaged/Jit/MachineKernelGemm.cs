@@ -119,16 +119,29 @@ internal static class MachineKernelGemm
         kern(aBase, bBase, cBase, ldc, kc, njr, numMr, aStrideBytes);
     }
 
+    // #475 Phase-0 A/B support: superseded panel/macro kernels are RETIRED here (never disposed)
+    // so their RX code pages stay mapped for the process lifetime. ResetFp32Kernels re-emits with a
+    // changed PanelKUnroll; a previously-handed-out kernel pointer may still be mid-call on another
+    // thread, so the old ExecutableMemory must NOT be freed (that would munmap/VirtualFree code a
+    // thread is executing → use-after-free). Retaining the handful of A/B generations is bounded.
+    private static readonly System.Collections.Generic.List<ExecutableMemory> _retiredKernels = new();
+
     /// <summary>
     /// #475 Phase-0 A/B support: drop the cached FP32 panel + macro kernels so the next
     /// IsFp32PanelAvailable/IsFp32MacroAvailable re-emits them with the current
-    /// MachineCodeFmaKernel.PanelKUnroll (and other emit-time knobs). Test/bench use only —
-    /// the old ExecutableMemory is left to the GC. Not thread-safe vs in-flight kernel calls.
+    /// MachineCodeFmaKernel.PanelKUnroll (and other emit-time knobs). Test/bench use only.
+    /// <para>
+    /// The superseded <see cref="ExecutableMemory"/> is moved to <c>_retiredKernels</c> rather than
+    /// freed, so any kernel pointer still in flight on another thread keeps executing valid mapped
+    /// code (dropping it to the GC could unmap pages a thread is mid-call into — a use-after-free).
+    /// </para>
     /// </summary>
     internal static void ResetFp32Kernels()
     {
         lock (_lock)
         {
+            if (_memPanel32 is not null) _retiredKernels.Add(_memPanel32);
+            if (_memMacro32 is not null) _retiredKernels.Add(_memMacro32);
             _triedPanel32 = false; _kernPanel32 = 0; _memPanel32 = null;
             _triedMacro32 = false; _kernMacro32 = 0; _memMacro32 = null;
         }

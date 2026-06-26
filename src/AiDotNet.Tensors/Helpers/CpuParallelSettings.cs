@@ -65,11 +65,18 @@ public static class CpuParallelSettings
         return Environment.ProcessorCount;
     }
 
+    /// <summary>
+    /// Value of <see cref="SystemLogicalProcessorInformation.Relationship"/> that denotes a physical
+    /// processor core (Win32 <c>LOGICAL_PROCESSOR_RELATIONSHIP.RelationProcessorCore</c>). Encodes the
+    /// native interop contract instead of testing the raw <c>0</c> in the scan loop.
+    /// </summary>
+    private const int RelationProcessorCore = 0;
+
     [StructLayout(LayoutKind.Sequential)]
     private struct SystemLogicalProcessorInformation
     {
         public UIntPtr ProcessorMask;
-        public int Relationship;   // RelationProcessorCore == 0
+        public int Relationship;   // RelationProcessorCore
         private readonly int _pad;
         private readonly ulong _u0, _u1; // union (16 bytes)
     }
@@ -89,17 +96,20 @@ public static class CpuParallelSettings
             if (!GetLogicalProcessorInformation(buf, ref len)) return Environment.ProcessorCount;
             int n = (int)(len / structSize), cores = 0;
             var p = (SystemLogicalProcessorInformation*)buf;
-            for (int i = 0; i < n; i++) if (p[i].Relationship == 0) cores++;
+            for (int i = 0; i < n; i++) if (p[i].Relationship == RelationProcessorCore) cores++;
             return cores > 0 ? cores : Environment.ProcessorCount;
         }
         finally { Marshal.FreeHGlobal(buf); }
     }
 
+    /// <summary>Linux file that lists per-logical-processor topology used for physical-core counting.</summary>
+    private const string LinuxCpuInfoPath = "/proc/cpuinfo";
+
     private static int DetectPhysicalCoresLinux()
     {
         var seen = new HashSet<string>();
         string phys = "";
-        foreach (var line in File.ReadLines("/proc/cpuinfo"))
+        foreach (var line in File.ReadLines(LinuxCpuInfoPath))
         {
             if (line.StartsWith("physical id", StringComparison.Ordinal)) phys = line;
             else if (line.StartsWith("core id", StringComparison.Ordinal)) seen.Add(phys + "|" + line);

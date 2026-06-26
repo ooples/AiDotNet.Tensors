@@ -58,7 +58,7 @@ internal static class GotoGemmFp32
     internal static bool BeatsPackBoth(int m, int n, int k)
         => m >= 512
         || (long)k >= 2L * n
-        || (m >= 128 && n >= 512 && ((long)n < 2L * k || (m % 6) != 0));
+        || (m >= 128 && n >= 512 && ((long)n < 2L * k || (m % Mr) != 0));
 
     /// <summary>Shape-adaptive (Mc, Nc, Kc) for RunParallel, tuned on the 3990X (measured --ab-goto-par /
     /// --profile-gemm). Memory-bound regime: larger square shapes want larger tiles (fewer redundant DRAM

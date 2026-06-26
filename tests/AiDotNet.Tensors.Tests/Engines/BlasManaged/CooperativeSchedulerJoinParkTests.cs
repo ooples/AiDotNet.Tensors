@@ -16,6 +16,13 @@ namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 /// out-live the caller's spin budget — and verify correctness with no lost wakeup or
 /// hang.
 /// </summary>
+// Serialized: this is a concurrency stress test (up to 200 dispatches that each
+// spin up a Task and park/wake on the cooperative scheduler). Under the parallel
+// test suite the thread-pool starvation made the park/wake handshake intermittently
+// miss its done.Wait deadline on CI (a 23s hang/timeout) while passing in isolation.
+// Membership in the serial perf collection gives it exclusive CPU time so the
+// bounded-spin-then-park timing assumptions hold.
+[Collection("BlasManaged-Perf-Serial")]
 public class CooperativeSchedulerJoinParkTests
 {
     [Fact]

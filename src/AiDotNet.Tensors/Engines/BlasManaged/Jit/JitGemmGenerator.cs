@@ -23,10 +23,24 @@ internal static class JitGemmGenerator
     internal static bool Enabled { get; set; } = true;
 
     // Specialized-kernel cache: (Mr, nVec, lda, ldb, ldc, f64, bias, relu) -> native entry point.
-    // ExecutableMemory is retained for process lifetime so the emitted pages stay mapped.
+    // ExecutableMemory is retained so the emitted pages stay mapped while a kernel pointer is live.
     private static readonly ConcurrentDictionary<(int Mr, int NVec, int Lda, int Ldb, int Ldc, bool F64, bool Bias, bool Relu), nint> s_cache = new();
-    private static readonly ConcurrentBag<ExecutableMemory> s_keepAlive = new();
+    // Guarded by s_emitLock (all mutation happens inside GetOrEmit's lock or ClearCache). A List —
+    // not a ConcurrentBag — so ClearCache can dispose every region and reset it. Total emitted bytes
+    // are tracked so the cache is bounded: callers vary lda/ldb/ldc, so without a cap a long-running
+    // process inside the small-shape gate could emit unboundedly many distinct executable kernels.
+    private static readonly System.Collections.Generic.List<ExecutableMemory> s_keepAlive = new();
+    private static long s_keepAliveBytes;
     private static readonly object s_emitLock = new();
+
+    /// <summary>
+    /// Upper bound on total emitted executable kernel bytes. Once exceeded, <see cref="GetOrEmit"/>
+    /// stops emitting NEW kernels (the caller falls back to the managed path) instead of evicting
+    /// retained code while another thread may be mid-call into it. The whole cache is reclaimed only
+    /// by <see cref="ClearCache"/> (the quiescent reset wired into <see cref="BlasManaged.ClearCaches"/>).
+    /// Mirrors <see cref="JittedKernelCache.DefaultMaxJitCacheBytes"/>.
+    /// </summary>
+    internal static long MaxJitCacheBytes { get; set; } = JittedKernelCache.DefaultMaxJitCacheBytes;
 
     private static bool IsWindows => RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
 
@@ -108,6 +122,11 @@ internal static class JitGemmGenerator
         lock (s_emitLock)
         {
             if (s_cache.TryGetValue(key, out p)) return p;
+            // Cache bound: once the retained executable code exceeds the cap, stop emitting new
+            // kernels (return 0 → caller takes the managed path). We do NOT evict here: another
+            // thread may be executing a retained kernel, and freeing its pages would be a
+            // use-after-free. Reclaim happens only in ClearCache() at a quiescent point.
+            if (s_keepAliveBytes >= MaxJitCacheBytes) return 0;
             nint entry = 0;
             try
             {
@@ -115,11 +134,28 @@ internal static class JitGemmGenerator
                     ? EmitDirectTileWindows(mr, nVec, lda, ldb, ldc, f64, hasBias, relu)
                     : EmitDirectTileSysV(mr, nVec, lda, ldb, ldc, f64, hasBias, relu);
                 var mem = ExecutableMemory.TryAllocate(code);
-                if (mem is not null) { s_keepAlive.Add(mem); entry = mem.Pointer; }
+                if (mem is not null) { s_keepAlive.Add(mem); s_keepAliveBytes += mem.Size; entry = mem.Pointer; }
             }
             catch { entry = 0; }
             s_cache[key] = entry;
             return entry;
+        }
+    }
+
+    /// <summary>
+    /// Release every retained executable kernel and reset the cache. Wired into
+    /// <see cref="BlasManaged.ClearCaches"/>. NOTE: this disposes the executable pages, so it is
+    /// only safe when no GEMM is in flight on any thread (the same contract the rest of
+    /// <see cref="BlasManaged.ClearCaches"/> assumes).
+    /// </summary>
+    internal static void ClearCache()
+    {
+        lock (s_emitLock)
+        {
+            foreach (var mem in s_keepAlive) mem.Dispose();
+            s_keepAlive.Clear();
+            s_keepAliveBytes = 0;
+            s_cache.Clear();
         }
     }
 
@@ -209,8 +245,11 @@ internal static class JitGemmGenerator
         if (relu)
         {
             asm.Vxorps(Ascr, Ascr, Ascr); // 0.0
+            // ReLU = max(acc, 0). VMAXPS returns its SECOND source on a NaN/unordered compare, so the
+            // accumulator must be src2 (not the zero vector) to keep NaN accumulators as NaN — matching
+            // the managed reference ReLU (value<0 is false for NaN, so NaN passes through unchanged).
             for (int i = 0; i < mr; i++)
-                for (int v = 0; v < nVec; v++) asm.Vmaxps(i * nVec + v, i * nVec + v, Ascr);
+                for (int v = 0; v < nVec; v++) asm.Vmaxps(i * nVec + v, Ascr, i * nVec + v);
         }
 
         for (int i = 0; i < mr; i++)
@@ -231,9 +270,6 @@ internal static class JitGemmGenerator
     /// Avx512Bf16 capability, and vdpbf16ps faults without it). Enable only on verified BF16 HW / SDE.</summary>
     internal static bool EnableBf16 { get; set; }
 
-    /// <summary>Opt-in for the native AMX int8 GEMM path (default off; faults without AMX).</summary>
-    internal static bool EnableAmxInt8 { get; set; }
-
     /// <summary>BF16 GEMM C[m,n] += Σ_k A[m,k]·B[k,n] (raw BF16 bits, FP32 accumulate) via the
     /// SDE-verified vdpbf16ps microkernel. No-op (returns false) unless <see cref="EnableBf16"/>.</summary>
     internal static unsafe bool TryRunBf16(ReadOnlySpan<ushort> a, ReadOnlySpan<ushort> b, Span<float> c, int m, int k, int n)
@@ -246,9 +282,9 @@ internal static class JitGemmGenerator
     internal static bool Enabled { get; set; }
     internal static bool IsSupported => false;
     internal static bool EnableBf16 { get; set; }
-    internal static bool EnableAmxInt8 { get; set; }
     internal static unsafe bool TryRunFp32(float* a, int lda, float* b, int ldb, float* c, int ldc, int m, int n, int k, float* bias = null, bool relu = false) => false;
     internal static unsafe bool TryRunFp64(double* a, int lda, double* b, int ldb, double* c, int ldc, int m, int n, int k) => false;
     internal static bool TryRunBf16(System.ReadOnlySpan<ushort> a, System.ReadOnlySpan<ushort> b, System.Span<float> c, int m, int k, int n) => false;
+    internal static void ClearCache() { /* no JIT cache on net471 — IsSupported is always false */ }
 }
 #endif

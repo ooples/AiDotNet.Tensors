@@ -77,6 +77,9 @@ public static class AxisRoutingAbBench
     /// </summary>
     public static void ProfileSingleThread(int seconds, string shape)
     {
+        if (seconds <= 0)
+            throw new ArgumentOutOfRangeException(nameof(seconds), "Profile duration must be positive.");
+
         CpuParallelSettings.MaxDegreeOfParallelism = 1; // profile the single-core path
         (int m, int n, int k) = shape switch
         {
@@ -84,7 +87,10 @@ public static class AxisRoutingAbBench
             "square"  => (1024, 1024, 1024),
             "attn"    => (256, 1536, 1536),
             "medium"  => (384, 1024, 1024),
-            _         => (384, 6144, 1536), // ffn-up
+            "ffn-up"  => (384, 6144, 1536),
+            _         => throw new ArgumentException(
+                "Expected one of: ffn-up, ffn-big, square, attn, medium.",
+                nameof(shape)),
         };
         var a = MakeRandom(m * k);
         var b = MakeRandom(k * n);
@@ -374,134 +380,6 @@ public static class AxisRoutingAbBench
     }
 
     /// <summary>
-    /// #85 GotoBLAS A/B: the low-barrier jc-blocked path (B packed per Nc-block into shared L3,
-    /// A packed once with disjoint-row reads, one parallel region per Nc-block) vs the current
-    /// N-axis path (whole shared A re-read by every thread per N-block) and OpenBLAS, on the wide-N
-    /// diffusion shapes at the default DOP. Also asserts bit-exactness vs the default path. Run
-    /// <c>--ab-gotoblas</c> (add AIDOTNET_USE_BLAS=1 for the OpenBLAS bar).
-    /// </summary>
-    public static unsafe void GotoBlasSweep()
-    {
-        Console.WriteLine("=== #85 GotoBLAS jc-blocked path A/B (vs N-axis + OpenBLAS) ===");
-        PackBothStrategy.s_gotoBlasAuto = false; // bench drives the path explicitly via s_forceGotoBlas
-        Console.WriteLine($"HasRawSgemm={BlasProvider.HasRawSgemm}  PhysicalCores={CpuParallelSettings.PhysicalCoreCount}  Logical={Environment.ProcessorCount}");
-        var shapes = new (string label, int m, int n, int k)[]
-        {
-            ("ffn-up   384x6144x1536", 384, 6144, 1536),
-            ("medium   384x1024x1024", 384, 1024, 1024),
-            ("tall-ffn 768x4096x1024", 768, 4096, 1024),
-        };
-        PackBothStrategy.s_macroKernel = true;
-        foreach (var (label, m, n, k) in shapes)
-        {
-            var a = MakeRandom(m * k); var b = MakeRandom(k * n);
-            var cRef = new float[m * n]; var cGoto = new float[m * n];
-            double flops = 2.0 * m * n * k;
-            // Correctness: GotoBLAS path must be bit-identical to the default (same K-panel order).
-            PackBothStrategy.s_forceGotoBlas = false; GemmOnce(a, b, cRef, m, n, k);
-            PackBothStrategy.s_forceGotoBlas = true; GemmOnce(a, b, cGoto, m, n, k);
-            PackBothStrategy.s_forceGotoBlas = false;
-            double maxErr = 0;
-            for (int i = 0; i < cRef.Length; i++) maxErr = Math.Max(maxErr, Math.Abs(cRef[i] - cGoto[i]));
-            Console.WriteLine($"  {label}: maxErr(goto vs default)={maxErr:E2}");
-            var c = new float[m * n];
-            foreach (int dop in new[] { 16, 32 })
-            {
-                CpuParallelSettings.MaxDegreeOfParallelism = dop;
-                PackBothStrategy.s_forceGotoBlas = false;
-                double dN = flops / TimeMinGemm(a, b, c, m, n, k) / 1e9;
-                PackBothStrategy.s_forceGotoBlas = true;
-                double dG = flops / TimeMinGemm(a, b, c, m, n, k) / 1e9;
-                PackBothStrategy.s_forceGotoBlas = false;
-                Console.WriteLine($"    DOP={dop,2}: N-axis {dN,5:F0}   GotoBLAS {dG,5:F0} GF/s   ({dG / dN:F2}x)");
-            }
-            if (BlasProvider.HasRawSgemm)
-            {
-                CpuParallelSettings.MaxDegreeOfParallelism = 32;
-                Console.WriteLine($"    OpenBLAS (auto-threaded): {flops / TimeMinPtr(a, b, c, m, n, k, jit: false) / 1e9,5:F0} GF/s");
-            }
-        }
-        PackBothStrategy.s_macroKernel = false;
-        PackBothStrategy.s_forceGotoBlas = false;
-        CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
-    }
-
-    /// <summary>
-    /// #85 GotoBLAS nc tuning: the wide-N losses come from many small Nc-blocks (12 for ffn at
-    /// nc=512) = many barriers + a small shared B re-read by all ic-blocks. Sweep nc upward to cut
-    /// the barrier count (bigger shared B per block, still L3-resident up to ~9 MB) vs the N-axis
-    /// baseline, at the default DOP. Run <c>--ab-gotoblas-nc</c>.
-    /// </summary>
-    public static unsafe void GotoBlasNcSweep()
-    {
-        Console.WriteLine("=== #85 GotoBLAS nc tuning (cut wide-N barrier count) ===");
-        Console.WriteLine($"PhysicalCores={CpuParallelSettings.PhysicalCoreCount}  Logical={Environment.ProcessorCount}");
-        PackBothStrategy.s_gotoBlasAuto = false; // bench drives the path explicitly via s_forceGotoBlas
-        var shapes = new (string label, int m, int n, int k)[]
-        {
-            ("ffn-up   384x6144x1536", 384, 6144, 1536),
-            ("tall-ffn 768x4096x1024", 768, 4096, 1024),
-            ("medium   384x1024x1024", 384, 1024, 1024),
-        };
-        int[] ncs = { 512, 1024, 1536, 2048, 3072, 6144 };
-        PackBothStrategy.s_macroKernel = true;
-        CpuParallelSettings.MaxDegreeOfParallelism = 32;
-        foreach (var (label, m, n, k) in shapes)
-        {
-            var a = MakeRandom(m * k); var b = MakeRandom(k * n); var c = new float[m * n];
-            double flops = 2.0 * m * n * k;
-            PackBothStrategy.s_forceGotoBlas = false;
-            AutotuneDispatcher.s_overrideNc = null;
-            double dN = flops / TimeMinGemm(a, b, c, m, n, k) / 1e9;
-            Console.WriteLine($"  {label}: N-axis baseline {dN,5:F0} GF/s");
-            PackBothStrategy.s_forceGotoBlas = true;
-            foreach (int nc in ncs)
-            {
-                if (nc > n) continue;
-                AutotuneDispatcher.s_overrideNc = nc;
-                double dG = flops / TimeMinGemm(a, b, c, m, n, k) / 1e9;
-                Console.WriteLine($"    GotoBLAS nc={nc,4}: {dG,5:F0} GF/s   ({dG / dN:F2}x)");
-            }
-            AutotuneDispatcher.s_overrideNc = null;
-            PackBothStrategy.s_forceGotoBlas = false;
-        }
-        PackBothStrategy.s_macroKernel = false;
-        CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
-    }
-
-    /// <summary>
-    /// #85 GotoBLAS crossover: at fixed m, k the GotoBLAS path wins for moderate N and loses for very
-    /// wide N. Ladder n/k from 1x to 4x to locate the routing threshold. Interleaved A/B (N-axis vs
-    /// GotoBLAS) per n, min-of-N, default DOP. Run <c>--ab-gotoblas-x</c>.
-    /// </summary>
-    public static unsafe void GotoBlasCrossover()
-    {
-        Console.WriteLine("=== #85 GotoBLAS crossover (n/k ladder, m=384 k=1024, nc=512) ===");
-        PackBothStrategy.s_gotoBlasAuto = false; // bench drives the path explicitly via s_forceGotoBlas
-        CpuParallelSettings.MaxDegreeOfParallelism = 32;
-        PackBothStrategy.s_macroKernel = true;
-        int m = 384, k = 1024;
-        foreach (int n in new[] { 1024, 1280, 1536, 2048, 2560, 3072, 4096 })
-        {
-            var a = MakeRandom(m * k); var b = MakeRandom(k * n); var c = new float[m * n];
-            double flops = 2.0 * m * n * k;
-            // 3 interleaved A/B reps to beat the box noise.
-            double bestN = 0, bestG = 0;
-            for (int rep = 0; rep < 3; rep++)
-            {
-                PackBothStrategy.s_forceGotoBlas = false; AutotuneDispatcher.s_overrideNc = null;
-                bestN = Math.Max(bestN, flops / TimeMinGemm(a, b, c, m, n, k) / 1e9);
-                PackBothStrategy.s_forceGotoBlas = true; AutotuneDispatcher.s_overrideNc = 512;
-                bestG = Math.Max(bestG, flops / TimeMinGemm(a, b, c, m, n, k) / 1e9);
-            }
-            PackBothStrategy.s_forceGotoBlas = false; AutotuneDispatcher.s_overrideNc = null;
-            Console.WriteLine($"  n={n,4} (n/k={n / 1024.0:F1}x): N-axis {bestN,5:F0}  GotoBLAS {bestG,5:F0}  ({bestG / bestN:F2}x)");
-        }
-        PackBothStrategy.s_macroKernel = false;
-        CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
-    }
-
-    /// <summary>
     /// #85 multi-thread diagnosis: GF/s + BUSY-CORE utilization (process CPU-time / wall / core) for the
     /// production large-float path at full DOP. Busy-cores is the scientific discriminator vs OpenBLAS's
     /// scaling: LOW busy-cores ⇒ we stall on barriers/sync (OB uses lock-free per-slice flags, not
@@ -510,6 +388,9 @@ public static class AxisRoutingAbBench
     /// </summary>
     public static void ProfileMultiThread(int seconds, string shape)
     {
+        if (seconds <= 0)
+            throw new ArgumentOutOfRangeException(nameof(seconds), "Profile duration must be positive.");
+
         CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
         (int m, int n, int k) = shape switch
         {
@@ -517,7 +398,10 @@ public static class AxisRoutingAbBench
             "square"  => (1024, 1024, 1024),
             "attn"    => (256, 1536, 1536),
             "medium"  => (384, 1024, 1024),
-            _         => (384, 6144, 1536), // ffn-up
+            "ffn-up"  => (384, 6144, 1536),
+            _         => throw new ArgumentException(
+                "Expected one of: ffn-up, ffn-big, square, attn, medium.",
+                nameof(shape)),
         };
         var a = MakeRandom(m * k); var b = MakeRandom(k * n); var c = new float[m * n];
         double flops = 2.0 * m * n * k;
@@ -572,11 +456,17 @@ public static class AxisRoutingAbBench
             for (int rep = 0; rep < 3; rep++)
             {
                 BlasManaged.s_disableGotoGemm = false; // GotoGemmFp32 path
+                AxisSelector.ForceAxisForTest = null;
                 bestG = Math.Max(bestG, flops / TimeMinGemm(a, b, c, m, n, k) / 1e9);
+                // Baseline must be the N-axis route, not just "PackBoth": disabling GotoGemm only sends
+                // the shape to PackBoth — AxisSelector may still pick M/2D on some host/DOP. Pin N so the
+                // printed "N-axis" number is guaranteed to measure the N-axis path.
                 BlasManaged.s_disableGotoGemm = true;  // PackBoth (N-axis for thin-M wide-N)
+                AxisSelector.ForceAxisForTest = ParallelismAxis.N;
                 bestN = Math.Max(bestN, flops / TimeMinGemm(a, b, c, m, n, k) / 1e9);
             }
             BlasManaged.s_disableGotoGemm = false;
+            AxisSelector.ForceAxisForTest = null;
             string winner = bestN > bestG ? "N-axis" : "GotoGemm";
             Console.WriteLine($"  {label}: GotoGemm {bestG,5:F0}  N-axis {bestN,5:F0} GF/s  ({bestN / bestG:F2}x)  -> {winner}");
         }

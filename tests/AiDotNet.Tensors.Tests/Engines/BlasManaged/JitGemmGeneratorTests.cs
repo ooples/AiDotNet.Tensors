@@ -3,6 +3,8 @@
 // the src guard on JitGemmGenerator (#if NET5_0_OR_GREATER); otherwise net471 fails CS0234.
 #if NET5_0_OR_GREATER
 using System;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics.X86;
 using AiDotNet.Tensors.Engines.BlasManaged;
 using AiDotNet.Tensors.Engines.BlasManaged.Jit;
 using Xunit;
@@ -16,6 +18,15 @@ namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 /// </summary>
 public class JitGemmGeneratorTests
 {
+    // The ISA/OS contract JitGemmGenerator.IsSupported must honor (everything EXCEPT the Enabled
+    // master switch). On a runner that meets this, IsSupported MUST be true — otherwise a silent
+    // support-gate regression has disabled the JIT path; the tests assert that rather than skipping.
+    // On a runner that does NOT meet it (no AVX2/FMA, non-x64), the JIT path must report unsupported
+    // and the TryRun* entrypoints must return false so callers fall back to the managed kernels.
+    private static bool HardwareSupportsJit =>
+        Fma.IsSupported && Avx2.IsSupported &&
+        RuntimeInformation.ProcessArchitecture == Architecture.X64 &&
+        (RuntimeInformation.IsOSPlatform(OSPlatform.Windows) || RuntimeInformation.IsOSPlatform(OSPlatform.Linux));
     private static float[] Rand(int n, int seed)
     {
         var r = new Random(seed);
@@ -58,11 +69,19 @@ public class JitGemmGeneratorTests
     [MemberData(nameof(Shapes))]
     public unsafe void Fp32_MatchesScalarReference(int m, int n, int k)
     {
-        if (!JitGemmGenerator.IsSupported) return; // net471 / non-x64 — managed path covers it
         var a = Rand(m * k, 1); var b = Rand(k * n, 2); var c = new float[m * n];
         bool ok;
         fixed (float* pa = a, pb = b, pc = c)
             ok = JitGemmGenerator.TryRunFp32(pa, k, pb, n, pc, n, m, n, k);
+        if (!HardwareSupportsJit)
+        {
+            // No AVX2/FMA or non-x64: the JIT path must report unsupported and decline so the caller
+            // takes the managed kernel. (Asserts the fallback contract instead of silently passing.)
+            Assert.False(JitGemmGenerator.IsSupported);
+            Assert.False(ok);
+            return;
+        }
+        Assert.True(JitGemmGenerator.IsSupported, "JIT must report supported on this AVX2/FMA x64 host");
         Assert.True(ok, $"JIT FP32 must fire for {m}x{n}x{k} (n%8==0)");
         Assert.True(MaxAbsErr(c, ScalarRef(a, b, m, n, k, null, false)) < 1e-3, "FP32 result must match scalar ref");
     }
@@ -71,11 +90,17 @@ public class JitGemmGeneratorTests
     [MemberData(nameof(Shapes))]
     public unsafe void Fp32_FusedBiasRelu_MatchesScalarReference(int m, int n, int k)
     {
-        if (!JitGemmGenerator.IsSupported) return;
         var a = Rand(m * k, 3); var b = Rand(k * n, 4); var bias = Rand(n, 5); var c = new float[m * n];
         bool ok;
         fixed (float* pa = a, pb = b, pc = c, pbias = bias)
             ok = JitGemmGenerator.TryRunFp32(pa, k, pb, n, pc, n, m, n, k, pbias, relu: true);
+        if (!HardwareSupportsJit)
+        {
+            Assert.False(JitGemmGenerator.IsSupported);
+            Assert.False(ok);
+            return;
+        }
+        Assert.True(JitGemmGenerator.IsSupported, "JIT must report supported on this AVX2/FMA x64 host");
         Assert.True(ok, $"fused JIT must fire for {m}x{n}x{k}");
         Assert.True(MaxAbsErr(c, ScalarRef(a, b, m, n, k, bias, relu: true)) < 1e-3, "fused relu(A·B+bias) must match scalar ref");
     }
@@ -84,8 +109,6 @@ public class JitGemmGeneratorTests
     [MemberData(nameof(Shapes))]
     public unsafe void Fp64_MatchesScalarReference(int m, int n, int k)
     {
-        if (!JitGemmGenerator.IsSupported) return;
-        if ((n & 3) != 0) return; // FP64 lane is 4
         var af = Rand(m * k, 6); var bf = Rand(k * n, 7);
         var a = Array.ConvertAll(af, x => (double)x);
         var b = Array.ConvertAll(bf, x => (double)x);
@@ -93,6 +116,20 @@ public class JitGemmGeneratorTests
         bool ok;
         fixed (double* pa = a, pb = b, pc = c)
             ok = JitGemmGenerator.TryRunFp64(pa, k, pb, n, pc, n, m, n, k);
+        if (!HardwareSupportsJit)
+        {
+            Assert.False(JitGemmGenerator.IsSupported);
+            Assert.False(ok);
+            return;
+        }
+        Assert.True(JitGemmGenerator.IsSupported, "JIT must report supported on this AVX2/FMA x64 host");
+        if ((n & 3) != 0)
+        {
+            // FP64 lane is 4: partial-4 columns are out of the JIT envelope, so it must DECLINE
+            // (return false) and let the managed path handle it — verify the decline, don't skip.
+            Assert.False(ok, $"JIT FP64 must decline n%4!=0 ({m}x{n}x{k})");
+            return;
+        }
         Assert.True(ok, $"JIT FP64 must fire for {m}x{n}x{k} (n%4==0)");
         double e = 0;
         for (int i = 0; i < m; i++)
@@ -111,7 +148,12 @@ public class JitGemmGeneratorTests
     [Fact]
     public void Bf16Microkernel_EmitsValidEncoding()
     {
-        if (!JitGemmGenerator.IsSupported) return;
+        if (!HardwareSupportsJit)
+        {
+            // Non-x64 / no AVX2: the JIT path is unsupported; the x64 EVEX emitter is not exercised.
+            Assert.False(JitGemmGenerator.IsSupported);
+            return;
+        }
         byte[] code = MachineCodeBf16Kernel.EmitGemmMicrokernelWindows();
         Assert.True(code.Length > 16, "BF16 microkernel must emit a non-trivial body");
         Assert.Equal(0xC3, code[^1]);          // ret

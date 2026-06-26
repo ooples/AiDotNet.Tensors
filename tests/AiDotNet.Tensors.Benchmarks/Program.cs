@@ -119,27 +119,6 @@ class Program
             return;
         }
 
-        // #85 GotoBLAS jc-blocked path A/B vs N-axis + OpenBLAS. (--ab-gotoblas)
-        if (args[0] == "--ab-gotoblas")
-        {
-            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.GotoBlasSweep();
-            return;
-        }
-
-        // #85 GotoBLAS nc tuning sweep. (--ab-gotoblas-nc)
-        if (args[0] == "--ab-gotoblas-nc")
-        {
-            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.GotoBlasNcSweep();
-            return;
-        }
-
-        // #85 GotoBLAS crossover ladder (n/k). (--ab-gotoblas-x)
-        if (args[0] == "--ab-gotoblas-x")
-        {
-            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.GotoBlasCrossover();
-            return;
-        }
-
         // #85 GotoGemm RunParallel vs N-axis (thin-M shared-A) routing A/B. (--ab-goto-vs-naxis)
         if (args[0] == "--ab-goto-vs-naxis")
         {
@@ -1021,6 +1000,21 @@ class Program
         Console.WriteLine("  --ab-ccx               : CCX-pinned-pool GEMM prototype (1D/2D)");
         Console.WriteLine("  --profile-gemm         : tight engine.TensorMatMul loop for an external profiler");
         Console.WriteLine("  --cpu-topology         : L3/CCX + NUMA topology (Windows-only)");
+        Console.WriteLine();
+        Console.WriteLine("#475 medium-axis routing + GEMM-profile A/B (managed BLAS):");
+        Console.WriteLine("  --ab-axis-routing      : forced M/N/2D vs the live heuristic vs OpenBLAS (diffusion shapes)");
+        Console.WriteLine("  --profile-gemm-st      : single-thread GEMM profile repro (--profile-gemm-st [seconds] [shape])");
+        Console.WriteLine("  --profile-gemm-mt      : multi-thread GEMM profile, GF/s + busy-core util (--profile-gemm-mt [seconds] [shape])");
+        Console.WriteLine("                           shape = ffn-up|ffn-big|square|attn|medium");
+        Console.WriteLine("  --ab-macro             : machine-code macro-kernel A/B (RyuJIT off the hot path)");
+        Console.WriteLine("  --ab-kunroll           : FP32 panel K-unroll sweep (4/8/2/6)");
+        Console.WriteLine("  --ab-jit               : JIT-specialized FP32 GEMM A/B vs OpenBLAS (small/medium)");
+        Console.WriteLine("  --ab-blocking          : medium/large blocking sweep vs OpenBLAS P/Q/R");
+        Console.WriteLine("  --ab-scaling           : thread-scaling curve (DOP 1..32) vs OpenBLAS");
+        Console.WriteLine("  --ab-goto-vs-naxis     : GotoGemm RunParallel vs N-axis (thin-M shared-A) routing A/B");
+        Console.WriteLine("  --ab-ccx-vs-rp         : CCX pool (barriers) vs RunParallel (barrier-free) on balanced shapes");
+        Console.WriteLine("  --ab-spinbar           : CCX spin-barrier vs .NET Barrier (forced CCX, bit-exact + perf)");
+        Console.WriteLine("  --ab-ccx-block         : CCX 2D kc blocking sweep (forced CCX)");
         Console.WriteLine();
         Console.WriteLine("PyTorch-comparison diagnostics:");
         Console.WriteLine("  --per-call-threads       : Per-call NumThreads sweep vs PyTorch");

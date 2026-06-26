@@ -65,26 +65,24 @@ internal static class AxisSelector
     /// <param name="nr">Microkernel column-tile width.</param>
     /// <param name="procs">Available processor count (≥ 1).</param>
     /// <param name="isDeterministic">True if BlasProvider.IsDeterministicMode is set.</param>
-    /// <summary>
-    /// A/B test hook (#475 medium-axis routing). When non-null on the calling thread,
-    /// <see cref="Select"/> returns this axis directly, bypassing the heuristic — used by
-    /// the in-process axis-routing bench to measure each axis on the same shape. Null in
-    /// production (the default); thread-static so a bench thread can pin an axis without
-    /// perturbing the dispatcher on other threads.
-    /// </summary>
-    [ThreadStatic] internal static ParallelismAxis? ForceAxisForTest;
-
     public static ParallelismAxis Select(
         int m, int n, int k,
         int mr, int nr,
         int procs,
         bool isDeterministic)
     {
-        var forced = ForceAxisForTest;
-        if (forced.HasValue) return forced.Value;
-
+        // Universal guards run FIRST, before any forced-axis override, so a test/bench hook can
+        // never route a shape that production would refuse to parallelize (procs<=1 or below the
+        // work threshold) or pick an axis that violates the active mode (K-axis under determinism).
         if (procs <= 1) return ParallelismAxis.None;
         if ((long)m * n * k < ParallelWorkThreshold) return ParallelismAxis.None;
+
+        // A/B test hook (#475 medium-axis routing): honor a pinned axis only AFTER the universal
+        // guards above, and reject a forced K-axis in deterministic mode (the same gate the
+        // heuristic enforces below). Null in production, so this is a no-op on the hot path.
+        var forced = ForceAxisForTest;
+        if (forced.HasValue && !(forced.Value == ParallelismAxis.K && isDeterministic))
+            return forced.Value;
 
         // M-axis: enough M-blocks to spread across cores. Also gated on K size:
         // when K is large, pack overhead amortizes better with finer-grained
@@ -107,4 +105,14 @@ internal static class AxisSelector
         // Fallback.
         return ParallelismAxis.M;
     }
+
+    /// <summary>
+    /// A/B test hook (#475 medium-axis routing). When non-null on the calling thread,
+    /// <see cref="Select"/> returns this axis — but only AFTER the universal procs/work-threshold
+    /// guards and only when the axis is legal for the active mode (a forced K-axis is ignored in
+    /// deterministic mode). Used by the in-process axis-routing bench to measure each axis on the
+    /// same shape. Null in production (the default); thread-static so a bench thread can pin an axis
+    /// without perturbing the dispatcher on other threads.
+    /// </summary>
+    [ThreadStatic] internal static ParallelismAxis? ForceAxisForTest;
 }

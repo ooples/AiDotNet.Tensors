@@ -53,22 +53,6 @@ internal static class PackBothStrategy
     // loop body). A/B toggle; default off until bit-exactness is validated, then flipped on.
     internal static bool s_macroKernel;
 
-    // #85 low-barrier jc-blocked GotoBLAS path (RunGotoBlasParallelUnsafe) — pack-B-per-Nc-block once
-    // into shared L3, ONE parallel region per Nc-block, shared packed-A read by DISJOINT rows.
-    // DEAD END — kept only as a measurement record (s_forceGotoBlas + the --ab-gotoblas* benches).
-    //
-    // WHY DEAD: the early "1.1-1.4x medium win" was a MEASUREMENT ARTIFACT. The production large-float
-    // path is GotoGemmFp32 at BlasManaged.cs:542 (its own GotoBLAS macro-kernel + CCX pool), gated by
-    // BeatsPackBoth = m≥512 || k≥2n || (m≥128 && n≥512). Every shape in this path's intended envelope
-    // (k≤n≤2k with m≥128, k≥512 ⇒ n≥512) satisfies (m≥128 && n≥512) ⇒ routes to GotoGemmFp32 and NEVER
-    // reaches PackBoth. So toggling s_forceGotoBlas changed nothing for those shapes — the "win" was
-    // ±25% box noise. Forcing the path for real (AIDOTNET_DISABLE_GOTO=1 ⇒ falls to PackBoth) measured
-    // it SLOWER than the N-axis path: ffn 0.40x, medium ~1.0x — the jc-outer-serial barrier-per-Nc-block
-    // structure throttles wide-N (the single-region path exists precisely to avoid that barrier).
-    // Conclusion: GotoGemmFp32 already owns this regime; this PackBoth variant adds nothing. Default OFF.
-    internal static bool s_forceGotoBlas;
-    internal static bool s_gotoBlasAuto; // default OFF — dead end (see above); GotoGemmFp32 owns this regime
-
     // #653 software-prefetch microkernel (env AIDOTNET_GEMM_PREFETCH=1, default off). Routes the
     // FP32 6×16 tile through Avx2Fp32_6x16.RunPrefetch (PREFETCHT0 of packed-B ahead) — same inlined
     // intrinsic kernel, so NO per-tile call/fixed overhead (unlike the machine-code-per-tile path
@@ -246,37 +230,6 @@ internal static class PackBothStrategy
                 && numNBlocksN >= 2 && numNBlocksN >= Math.Min(4, effProcs)
                 && options.Epilogue.Activation == AiDotNet.Tensors.Engines.FusedActivationType.None
                 && options.Epilogue.BiasN.IsEmpty && options.Epilogue.SkipMxN.IsEmpty;
-            // #85 low-barrier jc-blocked GotoBLAS path. Same FP32 / no-transpose / no-prepack /
-            // no-epilogue / m%mr==0 envelope as the N-axis path. s_gotoBlasAuto is DEAD (default off):
-            // every shape in the k≤n≤2k gate satisfies BeatsPackBoth's (m≥128 && n≥512) clause and is
-            // claimed by GotoGemmFp32 at BlasManaged.cs:542 before PackBoth is ever reached; when forced
-            // onto PackBoth (AIDOTNET_DISABLE_GOTO=1) this path measured SLOWER than N-axis (ffn 0.40x).
-            // The gate stays only so s_forceGotoBlas can still drive the --ab-gotoblas* measurement record.
-            bool gotoEnvelope =
-                MachineKernelGemm.IsFp32PanelAvailable
-                && typeof(T) == typeof(float)
-                && !transA && !transB
-                && options.PackedA is null && options.PackedB is null
-                && (m % mr) == 0 && m >= mr
-                && options.Epilogue.Activation == AiDotNet.Tensors.Engines.FusedActivationType.None
-                && options.Epilogue.BiasN.IsEmpty && options.Epilogue.SkipMxN.IsEmpty;
-            bool gotoAutoGate = s_gotoBlasAuto
-                && m >= 128 && k >= 512
-                && (long)n >= (long)k && (long)n <= 2L * k;
-            if (gotoEnvelope && (s_forceGotoBlas || gotoAutoGate))
-            {
-                fixed (T* aPtrG = a)
-                fixed (T* bPtrG = b)
-                fixed (T* cPtrG = c)
-                {
-                    RunGotoBlasParallelUnsafe<T>(
-                        aPtrG, a.Length, lda,
-                        bPtrG, b.Length, ldb,
-                        cPtrG, c.Length, ldc,
-                        m, n, k, mc, nc, kc, mr, nr, elemSize);
-                }
-                return;
-            }
 
             if (useNAxis)
             {
@@ -1196,143 +1149,6 @@ internal static class PackBothStrategy
         {
             System.Buffers.ArrayPool<byte>.Shared.Return(packBArr);
         }
-    }
-
-    /// <summary>
-    /// #85 low-barrier jc-blocked GotoBLAS path (FP32). Packs ALL of A once into a shared Mr-stripe
-    /// buffer — each ic-block reads its DISJOINT rows, so there is no cross-thread A contention
-    /// (unlike the N-axis path, where every thread re-reads the whole shared A for its N-block). Then
-    /// for each Nc-block of N (serial outer, disjoint C columns) it packs that block's B once into a
-    /// shared, L3-resident buffer and runs ONE parallel region over ic-blocks, each thread walking the
-    /// full K-loop for its rows. This is the BLIS persistent-team structure that no existing path has:
-    /// low barrier count (one region per Nc-block, not per (jc,pc) macro-tile like RunParallelUnsafe),
-    /// B blocked to stay L3-resident (vs single-region's all-B), shared packed-B (vs 2D's redundant
-    /// per-thread B-pack), and disjoint-row shared-A (vs N-axis's whole-A-per-thread re-read).
-    /// Bit-identical to the other paths: each C[i,j] reduces over k in ascending panel order and
-    /// ic-blocks own disjoint C rows.
-    /// </summary>
-    private static unsafe void RunGotoBlasParallelUnsafe<T>(
-        T* aPtr, int aLen, int lda,
-        T* bPtr, int bLen, int ldb,
-        T* cPtr, int cLen, int ldc,
-        int m, int n, int k,
-        int mc, int nc, int kc, int mr, int nr, int elemSize) where T : unmanaged
-    {
-        int numKPanels = (k + kc - 1) / kc;
-        int numStripesM = (m + mr - 1) / mr;
-        int packedM = numStripesM * mr;
-        long packAElems = (long)numKPanels * kc * packedM;
-
-        const int Align = 32;
-        byte[] packAArr = System.Buffers.ArrayPool<byte>.Shared.Rent((int)(packAElems * elemSize) + Align - 1);
-        int packAOff;
-        fixed (byte* pa0 = packAArr)
-        {
-            nuint addr = (nuint)pa0; nuint mask = Align - 1;
-            packAOff = (int)((Align - (uint)(addr & mask)) & mask);
-        }
-
-        nint aI = (nint)aPtr, bI = (nint)bPtr, cI = (nint)cPtr;
-        int ldaC = lda, ldbC = ldb, ldcC = ldc, kC = k, mC = m, nC = n, aLenC = aLen, bLenC = bLen, cLenC = cLen;
-        int kcC = kc, mrC = mr, nrC = nr, numKPanelsC = numKPanels, packedMC = packedM, numStripesMC = numStripesM;
-        byte[] packAArrC = packAArr; int packAOffC = packAOff;
-
-        try
-        {
-            // ── Pack ALL of A once: (panel × m-stripe) shared, Mr-stripe layout ──
-            int numPackAItems = numKPanelsC * numStripesMC;
-            CpuParallelSettings.ParallelForOrSerial(0, numPackAItems, packAElems, item =>
-            {
-                int panel = item / numStripesMC;
-                int mstripe = item % numStripesMC;
-                int pc = panel * kcC;
-                int effKc = Math.Min(kcC, kC - pc);
-                int row = mstripe * mrC;
-                int effMr = Math.Min(mrC, mC - row);
-                long panelBase = (long)panel * packedMC * kcC;
-                long stripeOff = (long)mstripe * effKc * mrC;
-                int aOff = row * ldaC + pc;
-                ReadOnlySpan<T> aSlice = new ReadOnlySpan<T>((T*)aI + aOff, aLenC - aOff);
-                Span<T> dst = MemoryMarshal.Cast<byte, T>(
-                    packAArrC.AsSpan(packAOffC + (int)((panelBase + stripeOff) * elemSize), effKc * mrC * elemSize));
-                Avx2Pack.PackA<T>(aSlice, ldaC, false, dst, effMr, effKc, mrC);
-            }, deterministicSafe: true);
-
-            // ── Per Nc-block: pack that block's B once (shared, L3) + ONE ic parallel region ──
-            int numIcBlocks = (mC + mc - 1) / mc;
-            int mcC = mc;
-            for (int jc = 0; jc < nC; jc += nc)
-            {
-                int effNc = Math.Min(nc, nC - jc);
-                int numStripesN = (effNc + nrC - 1) / nrC;
-                int packedNc = numStripesN * nrC;
-                long packBElems = (long)numKPanelsC * kcC * packedNc;
-                byte[] packBArr = System.Buffers.ArrayPool<byte>.Shared.Rent((int)(packBElems * elemSize) + Align - 1);
-                int packBOff;
-                fixed (byte* pb0 = packBArr)
-                {
-                    nuint addr = (nuint)pb0; nuint mask = Align - 1;
-                    packBOff = (int)((Align - (uint)(addr & mask)) & mask);
-                }
-                byte[] packBArrC = packBArr; int packBOffC = packBOff;
-                int jcC = jc, effNcC = effNc, numStripesNC = numStripesN, packedNcC = packedNc;
-                try
-                {
-                    // Pack B[*, jc:jc+effNc] once: (panel × n-stripe) shared.
-                    int numPackBItems = numKPanelsC * numStripesNC;
-                    CpuParallelSettings.ParallelForOrSerial(0, numPackBItems, packBElems, item =>
-                    {
-                        int panel = item / numStripesNC;
-                        int nstripe = item % numStripesNC;
-                        int pc = panel * kcC;
-                        int effKc = Math.Min(kcC, kC - pc);
-                        long panelBase = (long)panel * packedNcC * kcC;
-                        long stripeOff = (long)nstripe * effKc * nrC;
-                        int bOff = pc * ldbC + jcC;
-                        ReadOnlySpan<T> bSlice = new ReadOnlySpan<T>((T*)bI + bOff, bLenC - bOff);
-                        Span<T> dst = MemoryMarshal.Cast<byte, T>(
-                            packBArrC.AsSpan(packBOffC + (int)((panelBase + stripeOff) * elemSize), effKc * nrC * elemSize));
-                        Avx2Pack.PackBStripeRange<T>(bSlice, ldbC, false, dst, nstripe, 1, effNcC, effKc, nrC);
-                    }, deterministicSafe: true);
-
-                    // ONE parallel region over ic-blocks; each thread walks the full K-loop for its rows.
-                    long compWork = (long)mC * effNc * kC;
-                    CpuParallelSettings.ParallelForOrSerial(0, numIcBlocks, compWork, icIdx =>
-                    {
-                        int ic = icIdx * mcC;
-                        int effMc = Math.Min(mcC, mC - ic);
-                        for (int panel = 0; panel < numKPanelsC; panel++)
-                        {
-                            int pc = panel * kcC;
-                            int effKc = Math.Min(kcC, kC - pc);
-                            long panelBaseA = (long)panel * packedMC * kcC;
-                            long panelBaseB = (long)panel * packedNcC * kcC;
-                            for (int jr = 0; jr < effNcC; jr += nrC)
-                            {
-                                int effNr = Math.Min(nrC, effNcC - jr);
-                                long bStripeOff = panelBaseB + (long)(jr / nrC) * effKc * nrC;
-                                Span<T> packBStripe = MemoryMarshal.Cast<byte, T>(
-                                    packBArrC.AsSpan(packBOffC + (int)(bStripeOff * elemSize), effKc * nrC * elemSize));
-                                for (int ir = 0; ir < effMc; ir += mrC)
-                                {
-                                    if (ir + mrC > effMc) break;
-                                    int globalStripe = (ic + ir) / mrC;
-                                    long aStripeOff = panelBaseA + (long)globalStripe * effKc * mrC;
-                                    Span<T> packAStripe = MemoryMarshal.Cast<byte, T>(
-                                        packAArrC.AsSpan(packAOffC + (int)(aStripeOff * elemSize), effKc * mrC * elemSize));
-                                    int cOff = (ic + ir) * ldcC + jcC + jr;
-                                    Span<T> cTile = new Span<T>((T*)cI + cOff, cLenC - cOff);
-                                    DispatchMicrokernelWithTail<T>(
-                                        packAStripe, packBStripe, cTile, ldcC, effKc, mrC, nrC, effNr);
-                                }
-                            }
-                        }
-                    }, deterministicSafe: true);
-                }
-                finally { System.Buffers.ArrayPool<byte>.Shared.Return(packBArr); }
-            }
-        }
-        finally { System.Buffers.ArrayPool<byte>.Shared.Return(packAArr); }
     }
 
     /// <summary>

@@ -333,6 +333,19 @@ public static partial class BlasManaged
         return false;
     }
 
+    // Validate that <paramref name="span"/> backs a [rows × cols] row-major tile with the given
+    // leading dimension (ld) — i.e. the last element the JIT kernel touches,
+    // (rows-1)*ld + cols, is in bounds. Used to gate the unsafe JIT GEMM path: if any operand fails
+    // this check we fall back to the bounds-checked managed path instead of issuing raw native
+    // loads/stores past the end of a span (invalid lda/ldb/ldc or a caller-truncated buffer).
+    private static bool HasRowMajorTile<T>(ReadOnlySpan<T> span, int rows, int cols, int ld)
+    {
+        if (rows <= 0 || cols <= 0) return true;
+        if (ld < cols) return false;
+        long required = (long)(rows - 1) * ld + cols;
+        return required <= span.Length;
+    }
+
     // Diagnostic timing wrapper (#475 shape audit). When GemmShapeHistogram.Enabled it times
     // only the TOP-LEVEL Gemm call (a ThreadStatic guard skips internal re-dispatches so a
     // shape is attributed once, to the outer call). Disabled → a single bool read + straight
@@ -412,6 +425,12 @@ public static partial class BlasManaged
             && options.PackingMode == PackingMode.Auto
             && options.PackedA is null && options.PackedB is null
             && n <= JitMaxN && m <= JitMaxM && k <= JitMaxK
+            // Validate the row-major tiles BEFORE the unsafe JIT path pins the spans and issues raw
+            // native loads/stores: an invalid lda/ldb/ldc or a short span would otherwise become an
+            // out-of-bounds native access instead of falling back to the bounds-checked managed path.
+            && HasRowMajorTile(a, m, k, lda)
+            && HasRowMajorTile(b, k, n, ldb)
+            && HasRowMajorTile(c, m, n, ldc)
             && JitGemmGenerator.IsSupported)
         {
             var jitEpi = options.Epilogue;
@@ -421,9 +440,14 @@ public static partial class BlasManaged
             {
                 // Phase 4: fuse bias + ReLU into the kernel store when the epilogue is ONLY those
                 // (no skip/dropout/scale, activation None or ReLU). Anything else → plain JIT + Apply.
-                bool fuseable = (eflags & ~(EpilogueFlags.HasBias | EpilogueFlags.HasActivation)) == 0
-                    && (jitEpi.Activation == FusedActivationType.None || jitEpi.Activation == FusedActivationType.ReLU);
                 bool wantBias = (eflags & EpilogueFlags.HasBias) != 0;
+                // A fused bias reads bias[col] per output column inside the kernel, so a short BiasN
+                // would be an out-of-bounds native read. If bias is requested but BiasN is shorter
+                // than n, drop OUT of the fused path so the bounds-checked managed epilogue
+                // (EpilogueChain.Apply) applies/validates the bias instead of the raw kernel store.
+                bool fuseable = (eflags & ~(EpilogueFlags.HasBias | EpilogueFlags.HasActivation)) == 0
+                    && (jitEpi.Activation == FusedActivationType.None || jitEpi.Activation == FusedActivationType.ReLU)
+                    && (!wantBias || jitEpi.BiasN.Length >= n);
                 bool wantRelu = jitEpi.Activation == FusedActivationType.ReLU;
                 System.ReadOnlySpan<float> biasSpan = (fuseable && wantBias) ? MemoryMarshal.Cast<T, float>(jitEpi.BiasN) : default;
                 unsafe
@@ -1351,6 +1375,7 @@ public static partial class BlasManaged
     {
         BlasManagedStatsTracker.Reset();
         JittedKernelCache.Clear();
+        JitGemmGenerator.ClearCache(); // release retained executable JIT-GEMM kernels (#475)
         BlasManagedAutotune.ClearStrategyMemo(); // in-memory strategy memo (#375 G13)
         // Future: clear weight pre-pack cache entries that are still in memory.
     }
