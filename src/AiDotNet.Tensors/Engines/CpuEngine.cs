@@ -28504,97 +28504,104 @@ public partial class CpuEngine : ITensorLevelEngine
         var gradKData = new T[batch * numKVHeads * seqK * headDim];
         var gradVData = new T[batch * numKVHeads * seqK * headDim];
 
-        // Lock objects for thread-safe accumulation of gradK and gradV
-        var gradKLocks = new object[batch * numKVHeads * seqK];
-        var gradVLocks = new object[batch * numKVHeads * seqK];
-        for (int i = 0; i < gradKLocks.Length; i++)
+        // Parallelize over (batch, KV head): each work item EXCLUSIVELY owns gradK/gradV for its
+        // KV head AND gradQ for the query heads in that head's GQA group, so the accumulation needs
+        // NO locks and NO per-call lock allocation. (The previous (batch, queryHead) split had all
+        // query heads sharing a KV head write the same gradK/gradV planes, forcing a per-element lock
+        // array — `new object[batch*numKVHeads*seqK]` × 2, one `new object()` each — allocated on every
+        // backward call: heavy GC churn on the attention training hot path. Same total work; the
+        // gradV/gradK accumulation across the group's query heads is now serial within one work item.)
+        // Granularity: this exposes batch*numKVHeads work items. Very low KV-head counts (e.g. batch=1 MQA,
+        // numKVHeads=1) therefore under-parallelize — an accepted tradeoff for the lock-free + low-GC design
+        // (finer per-query-head parallelism needs either the removed per-element lock array or per-thread
+        // gradK/gradV partials, both of which reintroduce the GC/memory churn this path eliminates; training
+        // batches are typically >1 so batch*numKVHeads stays multi-item for GQA). The work estimate counts
+        // seqK because the body is seqQ*seqK*headDim per query group, so ParallelForOrSerial reads the true
+        // per-task cost and parallelizes the (common) multi-item shapes instead of mis-sizing them as serial.
+        CpuParallelSettings.ParallelForOrSerial(0, batch * numKVHeads,
+            (long)batch * numQHeads * seqQ * seqK * headDim, bkv =>
         {
-            gradKLocks[i] = new object();
-            gradVLocks[i] = new object();
-        }
+            int b = bkv / numKVHeads;
+            int kvh = bkv % numKVHeads;
 
-        CpuParallelSettings.ParallelForOrSerial(0, batch * numQHeads,
-            (long)batch * numQHeads * seqQ * headDim, bqh =>
-        {
-            int b = bqh / numQHeads;
-            int qh = bqh % numQHeads;
-            int kvh = qh / numQueriesPerKV;
-
-            int qOffset = (b * numQHeads + qh) * seqQ * headDim;
             int kOffset = (b * numKVHeads + kvh) * seqK * headDim;
-            int vOffset = (b * numKVHeads + kvh) * seqK * headDim;
-            int gOffset = (b * numQHeads + qh) * seqQ * headDim;
-            int wOffset = (b * numQHeads + qh) * seqQ * seqK;
+            int vOffset = kOffset;
 
-            for (int qi = 0; qi < seqQ; qi++)
+            // Per-work-item scratch, reused across all query positions (each is fully overwritten
+            // before use, so no clear is needed). Hoisted out of the qi loop: the old per-(head,position)
+            // `new T[seqK]` pair allocated ~39 MB/call at [B2,QH16,SQ256,SK256] scale — the dominant GC
+            // cost of this kernel, far larger than the (now-removed) lock arrays.
+            var gradWeights = new T[seqK];
+            var gradScores = new T[seqK];
+
+            for (int qLocal = 0; qLocal < numQueriesPerKV; qLocal++)
             {
-                // Gradient w.r.t. V: weights^T @ gradOutput
-                for (int ki = 0; ki < seqK; ki++)
-                {
-                    T weight = weightsData[wOffset + qi * seqK + ki];
-                    int lockIdx = (b * numKVHeads + kvh) * seqK + ki;
+                int qh = kvh * numQueriesPerKV + qLocal;
+                if (qh >= numQHeads) break; // defensive: never index gradQ past the query-head count
+                int qOffset = (b * numQHeads + qh) * seqQ * headDim;
+                int gOffset = qOffset;
+                int wOffset = (b * numQHeads + qh) * seqQ * seqK;
 
-                    for (int d = 0; d < headDim; d++)
+                for (int qi = 0; qi < seqQ; qi++)
+                {
+                    // Gradient w.r.t. V: weights^T @ gradOutput (owned plane -> no lock)
+                    for (int ki = 0; ki < seqK; ki++)
                     {
-                        T gradV = numOps.Multiply(weight, gradOutData[gOffset + qi * headDim + d]);
-                        lock (gradVLocks[lockIdx])
+                        T weight = weightsData[wOffset + qi * seqK + ki];
+                        for (int d = 0; d < headDim; d++)
                         {
+                            T gradV = numOps.Multiply(weight, gradOutData[gOffset + qi * headDim + d]);
                             gradVData[vOffset + ki * headDim + d] = numOps.Add(
                                 gradVData[vOffset + ki * headDim + d], gradV);
                         }
                     }
-                }
 
-                // Gradient w.r.t. attention weights: gradOutput @ V^T
-                var gradWeights = new T[seqK];
-                for (int ki = 0; ki < seqK; ki++)
-                {
-                    T sum = numOps.Zero;
-                    for (int d = 0; d < headDim; d++)
-                    {
-                        sum = numOps.Add(sum, numOps.Multiply(
-                            gradOutData[gOffset + qi * headDim + d],
-                            valueData[vOffset + ki * headDim + d]));
-                    }
-                    gradWeights[ki] = sum;
-                }
-
-                // Softmax backward: gradScores = weights * (gradWeights - sum(weights * gradWeights))
-                T dotProduct = numOps.Zero;
-                for (int ki = 0; ki < seqK; ki++)
-                {
-                    dotProduct = numOps.Add(dotProduct, numOps.Multiply(
-                        weightsData[wOffset + qi * seqK + ki], gradWeights[ki]));
-                }
-
-                var gradScores = new T[seqK];
-                for (int ki = 0; ki < seqK; ki++)
-                {
-                    T w = weightsData[wOffset + qi * seqK + ki];
-                    gradScores[ki] = numOps.Multiply(w, numOps.Subtract(gradWeights[ki], dotProduct));
-                    gradScores[ki] = numOps.Multiply(gradScores[ki], scaleFactor);
-                }
-
-                // Gradient w.r.t. Q: gradScores @ K
-                for (int d = 0; d < headDim; d++)
-                {
-                    T sum = numOps.Zero;
+                    // Gradient w.r.t. attention weights: gradOutput @ V^T (reuses hoisted gradWeights)
                     for (int ki = 0; ki < seqK; ki++)
                     {
-                        sum = numOps.Add(sum, numOps.Multiply(gradScores[ki], keyData[kOffset + ki * headDim + d]));
+                        T sum = numOps.Zero;
+                        for (int d = 0; d < headDim; d++)
+                        {
+                            sum = numOps.Add(sum, numOps.Multiply(
+                                gradOutData[gOffset + qi * headDim + d],
+                                valueData[vOffset + ki * headDim + d]));
+                        }
+                        gradWeights[ki] = sum;
                     }
-                    gradQData[qOffset + qi * headDim + d] = sum;
-                }
 
-                // Gradient w.r.t. K: gradScores^T @ Q (accumulated across query heads sharing this KV)
-                for (int ki = 0; ki < seqK; ki++)
-                {
-                    int lockIdx = (b * numKVHeads + kvh) * seqK + ki;
+                    // Softmax backward: gradScores = weights * (gradWeights - sum(weights * gradWeights))
+                    T dotProduct = numOps.Zero;
+                    for (int ki = 0; ki < seqK; ki++)
+                    {
+                        dotProduct = numOps.Add(dotProduct, numOps.Multiply(
+                            weightsData[wOffset + qi * seqK + ki], gradWeights[ki]));
+                    }
+
+                    for (int ki = 0; ki < seqK; ki++)
+                    {
+                        T w = weightsData[wOffset + qi * seqK + ki];
+                        gradScores[ki] = numOps.Multiply(w, numOps.Subtract(gradWeights[ki], dotProduct));
+                        gradScores[ki] = numOps.Multiply(gradScores[ki], scaleFactor);
+                    }
+
+                    // Gradient w.r.t. Q: gradScores @ K (owned plane -> no lock)
                     for (int d = 0; d < headDim; d++)
                     {
-                        T gradK = numOps.Multiply(gradScores[ki], queryData[qOffset + qi * headDim + d]);
-                        lock (gradKLocks[lockIdx])
+                        T sum = numOps.Zero;
+                        for (int ki = 0; ki < seqK; ki++)
                         {
+                            sum = numOps.Add(sum, numOps.Multiply(gradScores[ki], keyData[kOffset + ki * headDim + d]));
+                        }
+                        gradQData[qOffset + qi * headDim + d] = sum;
+                    }
+
+                    // Gradient w.r.t. K: gradScores^T @ Q (accumulated across the group's query heads;
+                    // this work item owns the KV head's gradK plane, so no lock is needed)
+                    for (int ki = 0; ki < seqK; ki++)
+                    {
+                        for (int d = 0; d < headDim; d++)
+                        {
+                            T gradK = numOps.Multiply(gradScores[ki], queryData[qOffset + qi * headDim + d]);
                             gradKData[kOffset + ki * headDim + d] = numOps.Add(
                                 gradKData[kOffset + ki * headDim + d], gradK);
                         }
