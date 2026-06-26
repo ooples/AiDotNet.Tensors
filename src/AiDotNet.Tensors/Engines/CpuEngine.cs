@@ -7155,6 +7155,11 @@ public partial class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    // Named kernel constants (no magic numbers in src/** — CodeRabbit #702).
+    private const long TrilinearCornerCount = 8;          // corners summed per output channel (parallel work estimate)
+    private const double SampleUpperIndexEpsilon = 1e-3;  // clamp sample positions just below the top index: dim - 1 - eps
+    private const double ScatterWeightEpsilon = 1e-10;    // skip scatter contributions whose weight is negligibly small
+
     /// <inheritdoc/>
     public Tensor<T> TensorTrilinearInterpolate<T>(Tensor<T> grid, Tensor<T> positions)
     {
@@ -7194,7 +7199,7 @@ public partial class CpuEngine : ITensorLevelEngine
             double[] g = Unsafe.As<T[], double[]>(ref gridData);
             double[] p = Unsafe.As<T[], double[]>(ref posData);
             double[] r = Unsafe.As<T[], double[]>(ref resData);
-            CpuParallelSettings.ParallelForOrSerial(0, numPositions, (long)numPositions * lC * 8, n =>
+            CpuParallelSettings.ParallelForOrSerial(0, numPositions, (long)numPositions * lC * TrilinearCornerCount, n =>
                 TrilinearRow(g, p, r, n, lD, lH, lW, lC));
         }
         else if (typeof(T) == typeof(float))
@@ -7202,16 +7207,16 @@ public partial class CpuEngine : ITensorLevelEngine
             float[] g = Unsafe.As<T[], float[]>(ref gridData);
             float[] p = Unsafe.As<T[], float[]>(ref posData);
             float[] r = Unsafe.As<T[], float[]>(ref resData);
-            CpuParallelSettings.ParallelForOrSerial(0, numPositions, (long)numPositions * lC * 8, n =>
+            CpuParallelSettings.ParallelForOrSerial(0, numPositions, (long)numPositions * lC * TrilinearCornerCount, n =>
                 TrilinearRowF(g, p, r, n, lD, lH, lW, lC));
         }
         else
         {
-            CpuParallelSettings.ParallelForOrSerial(0, numPositions, (long)numPositions * lC * 8, n =>
+            CpuParallelSettings.ParallelForOrSerial(0, numPositions, (long)numPositions * lC * TrilinearCornerCount, n =>
             {
-                double z = Math.Max(0, Math.Min(lD - 1.001, numOps.ToDouble(posData[n * 3 + 0])));
-                double y = Math.Max(0, Math.Min(lH - 1.001, numOps.ToDouble(posData[n * 3 + 1])));
-                double x = Math.Max(0, Math.Min(lW - 1.001, numOps.ToDouble(posData[n * 3 + 2])));
+                double z = Math.Max(0, Math.Min(lD - 1 - SampleUpperIndexEpsilon, numOps.ToDouble(posData[n * 3 + 0])));
+                double y = Math.Max(0, Math.Min(lH - 1 - SampleUpperIndexEpsilon, numOps.ToDouble(posData[n * 3 + 1])));
+                double x = Math.Max(0, Math.Min(lW - 1 - SampleUpperIndexEpsilon, numOps.ToDouble(posData[n * 3 + 2])));
                 int z0 = (int)Math.Floor(z), y0 = (int)Math.Floor(y), x0 = (int)Math.Floor(x);
                 int z1 = Math.Min(z0 + 1, lD - 1), y1 = Math.Min(y0 + 1, lH - 1), x1 = Math.Min(x0 + 1, lW - 1);
                 double fz = z - z0, fy = y - y0, fx = x - x0;
@@ -7242,9 +7247,9 @@ public partial class CpuEngine : ITensorLevelEngine
     // Same clamp, weights, and left-associative 8-corner sum as the generic path => bit-exact.
     private static void TrilinearRow(double[] g, double[] p, double[] r, int n, int D, int H, int W, int C)
     {
-        double z = Math.Max(0, Math.Min(D - 1.001, p[n * 3 + 0]));
-        double y = Math.Max(0, Math.Min(H - 1.001, p[n * 3 + 1]));
-        double x = Math.Max(0, Math.Min(W - 1.001, p[n * 3 + 2]));
+        double z = Math.Max(0, Math.Min(D - 1 - SampleUpperIndexEpsilon, p[n * 3 + 0]));
+        double y = Math.Max(0, Math.Min(H - 1 - SampleUpperIndexEpsilon, p[n * 3 + 1]));
+        double x = Math.Max(0, Math.Min(W - 1 - SampleUpperIndexEpsilon, p[n * 3 + 2]));
         int z0 = (int)Math.Floor(z), y0 = (int)Math.Floor(y), x0 = (int)Math.Floor(x);
         int z1 = Math.Min(z0 + 1, D - 1), y1 = Math.Min(y0 + 1, H - 1), x1 = Math.Min(x0 + 1, W - 1);
         double fz = z - z0, fy = y - y0, fx = x - x0;
@@ -7264,9 +7269,9 @@ public partial class CpuEngine : ITensorLevelEngine
 
     private static void TrilinearRowF(float[] g, float[] p, float[] r, int n, int D, int H, int W, int C)
     {
-        double z = Math.Max(0, Math.Min(D - 1.001, p[n * 3 + 0]));
-        double y = Math.Max(0, Math.Min(H - 1.001, p[n * 3 + 1]));
-        double x = Math.Max(0, Math.Min(W - 1.001, p[n * 3 + 2]));
+        double z = Math.Max(0, Math.Min(D - 1 - SampleUpperIndexEpsilon, p[n * 3 + 0]));
+        double y = Math.Max(0, Math.Min(H - 1 - SampleUpperIndexEpsilon, p[n * 3 + 1]));
+        double x = Math.Max(0, Math.Min(W - 1 - SampleUpperIndexEpsilon, p[n * 3 + 2]));
         int z0 = (int)Math.Floor(z), y0 = (int)Math.Floor(y), x0 = (int)Math.Floor(x);
         int z1 = Math.Min(z0 + 1, D - 1), y1 = Math.Min(y0 + 1, H - 1), x1 = Math.Min(x0 + 1, W - 1);
         double fz = z - z0, fy = y - y0, fx = x - x0;
@@ -7327,9 +7332,9 @@ public partial class CpuEngine : ITensorLevelEngine
             T px = positions[n, 2];
 
             // Clamp to valid range and get integer and fractional parts
-            double z = Math.Max(0, Math.Min(depth - 1.001, numOps.ToDouble(pz)));
-            double y = Math.Max(0, Math.Min(height - 1.001, numOps.ToDouble(py)));
-            double x = Math.Max(0, Math.Min(width - 1.001, numOps.ToDouble(px)));
+            double z = Math.Max(0, Math.Min(depth - 1 - SampleUpperIndexEpsilon, numOps.ToDouble(pz)));
+            double y = Math.Max(0, Math.Min(height - 1 - SampleUpperIndexEpsilon, numOps.ToDouble(py)));
+            double x = Math.Max(0, Math.Min(width - 1 - SampleUpperIndexEpsilon, numOps.ToDouble(px)));
 
             int z0 = (int)Math.Floor(z);
             int y0 = (int)Math.Floor(y);
@@ -18402,7 +18407,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
     private static void ScatterPixelDouble(double[] gradData, double gradVal, int batch, int channel, int totalChannels, int height, int width, int h, int w, double weight, object[] locks)
     {
-        if (h < 0 || h >= height || w < 0 || w >= width || Math.Abs(weight) < 1e-10) return;
+        if (h < 0 || h >= height || w < 0 || w >= width || Math.Abs(weight) < ScatterWeightEpsilon) return;
         int idx = ((batch * totalChannels + channel) * height + h) * width + w;
         double contrib = gradVal * weight;
         lock (locks[idx & (DeformScatterLockCount - 1)]) { gradData[idx] += contrib; }
@@ -18420,7 +18425,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
     private static void ScatterPixelFloat(float[] gradData, float gradVal, int batch, int channel, int totalChannels, int height, int width, int h, int w, double weight, object[] locks)
     {
-        if (h < 0 || h >= height || w < 0 || w >= width || Math.Abs(weight) < 1e-10) return;
+        if (h < 0 || h >= height || w < 0 || w >= width || Math.Abs(weight) < ScatterWeightEpsilon) return;
         int idx = ((batch * totalChannels + channel) * height + h) * width + w;
         float contrib = gradVal * (float)weight;
         lock (locks[idx & (DeformScatterLockCount - 1)]) { gradData[idx] += contrib; }
@@ -18471,19 +18476,19 @@ public partial class CpuEngine : ITensorLevelEngine
 
     private static void ScatterPixelDoubleNoLock(double[] gradData, double gradVal, int batch, int channel, int totalChannels, int height, int width, int h, int w, double weight)
     {
-        if (h < 0 || h >= height || w < 0 || w >= width || Math.Abs(weight) < 1e-10) return;
+        if (h < 0 || h >= height || w < 0 || w >= width || Math.Abs(weight) < ScatterWeightEpsilon) return;
         gradData[((batch * totalChannels + channel) * height + h) * width + w] += gradVal * weight;
     }
 
     private static void ScatterPixelFloatNoLock(float[] gradData, float gradVal, int batch, int channel, int totalChannels, int height, int width, int h, int w, double weight)
     {
-        if (h < 0 || h >= height || w < 0 || w >= width || Math.Abs(weight) < 1e-10) return;
+        if (h < 0 || h >= height || w < 0 || w >= width || Math.Abs(weight) < ScatterWeightEpsilon) return;
         gradData[((batch * totalChannels + channel) * height + h) * width + w] += gradVal * (float)weight;
     }
 
     private static void AddGradientToPixelNoLock<T>(T[] gradData, T gradVal, int batch, int channel, int totalChannels, int height, int width, int h, int w, double weight, INumericOperations<T> numOps)
     {
-        if (h < 0 || h >= height || w < 0 || w >= width || Math.Abs(weight) < 1e-10) return;
+        if (h < 0 || h >= height || w < 0 || w >= width || Math.Abs(weight) < ScatterWeightEpsilon) return;
         int idx = ((batch * totalChannels + channel) * height + h) * width + w;
         gradData[idx] = numOps.Add(gradData[idx], numOps.Multiply(gradVal, numOps.FromDouble(weight)));
     }
@@ -18505,7 +18510,7 @@ public partial class CpuEngine : ITensorLevelEngine
         INumericOperations<T> numOps,
         object[] locks)
     {
-        if (h < 0 || h >= height || w < 0 || w >= width || Math.Abs(weight) < 1e-10)
+        if (h < 0 || h >= height || w < 0 || w >= width || Math.Abs(weight) < ScatterWeightEpsilon)
             return;
 
         int idx = ((batch * totalChannels + channel) * height + h) * width + w;
@@ -18901,7 +18906,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
     private static void ScatterPixelDoubleNHWC(double[] gradData, double gradVal, int batch, int channel, int height, int width, int channels, int h, int w, double weight, object[] locks)
     {
-        if (h < 0 || h >= height || w < 0 || w >= width || Math.Abs(weight) < 1e-10) return;
+        if (h < 0 || h >= height || w < 0 || w >= width || Math.Abs(weight) < ScatterWeightEpsilon) return;
         int idx = ((batch * height + h) * width + w) * channels + channel;
         double contrib = gradVal * weight;
         lock (locks[idx & (DeformScatterLockCount - 1)]) { gradData[idx] += contrib; }
@@ -18909,7 +18914,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
     private static void ScatterPixelFloatNHWC(float[] gradData, float gradVal, int batch, int channel, int height, int width, int channels, int h, int w, double weight, object[] locks)
     {
-        if (h < 0 || h >= height || w < 0 || w >= width || Math.Abs(weight) < 1e-10) return;
+        if (h < 0 || h >= height || w < 0 || w >= width || Math.Abs(weight) < ScatterWeightEpsilon) return;
         int idx = ((batch * height + h) * width + w) * channels + channel;
         float contrib = gradVal * (float)weight;
         lock (locks[idx & (DeformScatterLockCount - 1)]) { gradData[idx] += contrib; }
@@ -18932,7 +18937,7 @@ public partial class CpuEngine : ITensorLevelEngine
         INumericOperations<T> numOps,
         object[] locks)
     {
-        if (h < 0 || h >= height || w < 0 || w >= width || Math.Abs(weight) < 1e-10)
+        if (h < 0 || h >= height || w < 0 || w >= width || Math.Abs(weight) < ScatterWeightEpsilon)
             return;
 
         // NHWC index: [batch, h, w, channel]
