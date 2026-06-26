@@ -687,6 +687,42 @@ public static class AxisRoutingAbBench
         AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_ignoreWorkGate = false;
     }
 
+    /// <summary>
+    /// #85 macro-kernel multi-thread A/B: PerfView on the production N-axis ffn path shows 42% of CPU in
+    /// the MANAGED RunNAxisParallelUnsafe loop (per-tile dispatch + Mr-sweep) — OpenBLAS does the whole
+    /// sweep in asm. We have the asm macro-kernel (s_macroKernel → RunMacroPanelFp32) but it's default OFF.
+    /// A/B it at full DOP with a bit-exact check on the diffusion shapes. Run <c>--ab-macro-mt</c>.
+    /// </summary>
+    public static void MacroMtSweep()
+    {
+        Console.WriteLine("=== #85 N-axis macro-kernel (asm Mr-sweep) vs managed loop, DOP32 ===");
+        CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
+        var shapes = new (string label, int m, int n, int k)[]
+        {
+            ("ffn-up   384x6144x1536", 384, 6144, 1536),
+            ("ffn      384x4096x1536", 384, 4096, 1536),
+            ("medium2k 384x2048x1024", 384, 2048, 1024),
+        };
+        foreach (var (label, m, n, k) in shapes)
+        {
+            var a = MakeRandom(m * k); var b = MakeRandom(k * n);
+            var cOff = new float[m * n]; var cOn = new float[m * n];
+            double flops = 2.0 * m * n * k;
+            PackBothStrategy.s_macroKernel = false; GemmOnce(a, b, cOff, m, n, k);
+            PackBothStrategy.s_macroKernel = true; GemmOnce(a, b, cOn, m, n, k);
+            double maxErr = 0; for (int i = 0; i < cOff.Length; i++) maxErr = Math.Max(maxErr, Math.Abs(cOff[i] - cOn[i]));
+            var c = new float[m * n];
+            double bOff = 0, bOn = 0;
+            for (int rep = 0; rep < 3; rep++)
+            {
+                PackBothStrategy.s_macroKernel = false; bOff = Math.Max(bOff, flops / TimeMinGemm(a, b, c, m, n, k) / 1e9);
+                PackBothStrategy.s_macroKernel = true; bOn = Math.Max(bOn, flops / TimeMinGemm(a, b, c, m, n, k) / 1e9);
+            }
+            PackBothStrategy.s_macroKernel = false;
+            Console.WriteLine($"  {label}: managed {bOff,5:F0}  macro {bOn,5:F0} GF/s  ({bOn / bOff:F2}x)  maxErr={maxErr:E1}");
+        }
+    }
+
     private static double Gf(double flops, double sec) => flops / sec / 1e9;
 
     private static unsafe double TimeMinNative(float[] a, float[] b, float[] c, int m, int n, int k)

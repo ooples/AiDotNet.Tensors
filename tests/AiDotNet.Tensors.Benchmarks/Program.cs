@@ -168,6 +168,13 @@ class Program
             return;
         }
 
+        // #85 N-axis macro-kernel (asm Mr-sweep) vs managed loop, multi-thread. (--ab-macro-mt)
+        if (args[0] == "--ab-macro-mt")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.MacroMtSweep();
+            return;
+        }
+
         if (args[0] == "--ab-aiseval-dopsweep")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.DopSweep();
