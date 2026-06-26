@@ -28284,8 +28284,15 @@ public partial class CpuEngine : ITensorLevelEngine
         // array — `new object[batch*numKVHeads*seqK]` × 2, one `new object()` each — allocated on every
         // backward call: heavy GC churn on the attention training hot path. Same total work; the
         // gradV/gradK accumulation across the group's query heads is now serial within one work item.)
+        // Granularity: this exposes batch*numKVHeads work items. Very low KV-head counts (e.g. batch=1 MQA,
+        // numKVHeads=1) therefore under-parallelize — an accepted tradeoff for the lock-free + low-GC design
+        // (finer per-query-head parallelism needs either the removed per-element lock array or per-thread
+        // gradK/gradV partials, both of which reintroduce the GC/memory churn this path eliminates; training
+        // batches are typically >1 so batch*numKVHeads stays multi-item for GQA). The work estimate counts
+        // seqK because the body is seqQ*seqK*headDim per query group, so ParallelForOrSerial reads the true
+        // per-task cost and parallelizes the (common) multi-item shapes instead of mis-sizing them as serial.
         CpuParallelSettings.ParallelForOrSerial(0, batch * numKVHeads,
-            (long)batch * numQHeads * seqQ * headDim, bkv =>
+            (long)batch * numQHeads * seqQ * seqK * headDim, bkv =>
         {
             int b = bkv / numKVHeads;
             int kvh = bkv % numKVHeads;
