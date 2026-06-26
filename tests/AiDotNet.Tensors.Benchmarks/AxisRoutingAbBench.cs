@@ -501,6 +501,48 @@ public static class AxisRoutingAbBench
         CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
     }
 
+    /// <summary>
+    /// #85 multi-thread diagnosis: GF/s + BUSY-CORE utilization (process CPU-time / wall / core) for the
+    /// production large-float path at full DOP. Busy-cores is the scientific discriminator vs OpenBLAS's
+    /// scaling: LOW busy-cores ⇒ we stall on barriers/sync (OB uses lock-free per-slice flags, not
+    /// barriers); HIGH busy-cores but low GF/s ⇒ memory-bandwidth bound (private per-thread buffers vs
+    /// OB's one shared sa/sb). Run <c>--profile-gemm-mt [seconds] [shape]</c>.
+    /// </summary>
+    public static void ProfileMultiThread(int seconds, string shape)
+    {
+        CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
+        (int m, int n, int k) = shape switch
+        {
+            "ffn-big" => (384, 4096, 3456),
+            "square"  => (1024, 1024, 1024),
+            "attn"    => (256, 1536, 1536),
+            "medium"  => (384, 1024, 1024),
+            _         => (384, 6144, 1536), // ffn-up
+        };
+        var a = MakeRandom(m * k); var b = MakeRandom(k * n); var c = new float[m * n];
+        double flops = 2.0 * m * n * k;
+        int cores = Environment.ProcessorCount;
+        Console.WriteLine($"=== multi-thread GEMM profile: {shape} {m}x{n}x{k}  DOP={cores}  {seconds}s ===");
+        for (int i = 0; i < 10; i++) GemmOnce(a, b, c, m, n, k); // warm
+        var proc = System.Diagnostics.Process.GetCurrentProcess();
+        var cpu0 = proc.TotalProcessorTime;
+        var total = Stopwatch.StartNew();
+        var one = new Stopwatch();
+        long iters = 0; double bestSec = double.MaxValue;
+        while (total.Elapsed.TotalSeconds < seconds)
+        {
+            one.Restart(); GemmOnce(a, b, c, m, n, k); one.Stop();
+            bestSec = Math.Min(bestSec, one.Elapsed.TotalSeconds);
+            iters++;
+        }
+        double wall = total.Elapsed.TotalSeconds;
+        double cpuSec = (proc.TotalProcessorTime - cpu0).TotalSeconds;
+        double busyCores = cpuSec / wall;
+        Console.WriteLine($"  best {flops / bestSec / 1e9:F0} GF/s   avg {flops / (wall / iters) / 1e9:F0} GF/s");
+        Console.WriteLine($"  busy-cores {busyCores:F1} / {cores}  ({busyCores / cores * 100:F0}% util)   iters={iters}  (sink {c[0]:E2})");
+        Console.WriteLine($"  per-busy-core {flops / (wall / iters) / 1e9 / busyCores:F1} GF/s/core   (OB on this box ~59/core)");
+    }
+
     private static double Gf(double flops, double sec) => flops / sec / 1e9;
 
     private static unsafe double TimeMinNative(float[] a, float[] b, float[] c, int m, int n, int k)

@@ -74,6 +74,16 @@ class Program
             return;
         }
 
+        // Multi-thread GEMM profile (GF/s + busy-core utilization) + PerfView PMU repro.
+        // --profile-gemm-mt [seconds=20] [shape=ffn-up|ffn-big|square|attn|medium]
+        if (args[0] == "--profile-gemm-mt")
+        {
+            int secs = args.Length > 1 && int.TryParse(args[1], out var s) ? s : 20;
+            string shape = args.Length > 2 ? args[2] : "ffn-up";
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.ProfileMultiThread(secs, shape);
+            return;
+        }
+
         // #475 machine-code macro-kernel A/B (RyuJIT off the hot path). (--ab-macro)
         if (args[0] == "--ab-macro")
         {
