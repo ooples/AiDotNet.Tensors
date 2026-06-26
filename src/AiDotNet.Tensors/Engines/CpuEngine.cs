@@ -17488,6 +17488,26 @@ public partial class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    // Striped lock pool for deformable-conv gradient scatter (input/kernel/mask backward).
+    // Replaces the former per-element `new object[N]` + N `new object()` allocation that ran on
+    // EVERY backward call (one lock object per gradient element). At early deformable stages
+    // (e.g. [1, 64, 128, 128]) that allocated ~1M objects PER backward call, dominating GC —
+    // profiled at ~29.5% coreclr (GC) on the InternImage train step. A fixed power-of-two pool maps
+    // each gradient index to a stable lock via `idx & (count-1)`, so the same element always
+    // serializes on the same lock (correctness preserved); distinct elements only rarely collide
+    // (brief, harmless extra contention — each critical section is a single add). Allocated once at
+    // type init; zero per-call allocation. Shared across all deformable backward methods (a generic
+    // method's locks are type-agnostic objects, so one non-generic pool is safe for every T).
+    private const int DeformScatterLockCount = 16384; // power of two
+    private static readonly object[] _deformScatterLocks = CreateDeformScatterLocks();
+
+    private static object[] CreateDeformScatterLocks()
+    {
+        var locks = new object[DeformScatterLockCount];
+        for (int i = 0; i < locks.Length; i++) locks[i] = new object();
+        return locks;
+    }
+
     // ---- Grouped DCNv3 backward (#1691). Single-pass FUSED kernels: one parallel region over the full
     // output/deform-group space with inline group indexing — no per-group slicing or G separate launches.
     // (Replaces the earlier per-group composition; finite-difference + GPU-parity verified. The constraint
@@ -17518,8 +17538,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var offsetData = offset.GetDataArray();
         var maskData = mask?.GetDataArray();
 
-        var locks = new object[batch * inChannels * height * width];
-        for (int i = 0; i < locks.Length; i++) locks[i] = new object();
+        // Striped lock pool (no per-call allocation) — see _deformScatterLocks.
+        var locks = _deformScatterLocks;
 
         // Parallelize over the full (batch, outChannel) space (all groups) -> good core utilization.
         CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels,
@@ -17896,9 +17916,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var offsetData = offset.GetDataArray();
         var maskData = mask?.GetDataArray();
 
-        // Use a lock array to avoid race conditions during atomic adds
-        var locks = new object[batch * inChannels * height * width];
-        for (int i = 0; i < locks.Length; i++) locks[i] = new object();
+        // Striped lock pool (no per-call allocation) — see _deformScatterLocks.
+        var locks = _deformScatterLocks;
 
         CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels,
             (long)batch * outChannels * outputHeight * outputWidth, idx =>
@@ -18017,7 +18036,7 @@ public partial class CpuEngine : ITensorLevelEngine
         int idx = ((batch * totalChannels + channel) * height + h) * width + w;
         T contrib = numOps.Multiply(gradVal, numOps.FromDouble(weight));
 
-        lock (locks[idx])
+        lock (locks[idx & (DeformScatterLockCount - 1)])
         {
             gradData[idx] = numOps.Add(gradData[idx], contrib);
         }
@@ -18064,9 +18083,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var offsetData = offset.GetDataArray();
         var maskData = mask?.GetDataArray();
 
-        // Use locks for atomic operations on kernel gradients
-        var locks = new object[outChannels * inChannels * kernelHeight * kernelWidth];
-        for (int i = 0; i < locks.Length; i++) locks[i] = new object();
+        // Striped lock pool (no per-call allocation) — see _deformScatterLocks.
+        var locks = _deformScatterLocks;
 
         CpuParallelSettings.ParallelForOrSerial(0, batch,
             (long)batch * outChannels * outputHeight * outputWidth, b =>
@@ -18112,7 +18130,7 @@ public partial class CpuEngine : ITensorLevelEngine
                                     // gradKernel[oc, ic, kh, kw] += gradOutput * sampledValue
                                     T contrib = numOps.Multiply(gradOutVal, sampledValue);
 
-                                    lock (locks[kernelIdx])
+                                    lock (locks[kernelIdx & (DeformScatterLockCount - 1)])
                                     {
                                         gradKernelData[kernelIdx] = numOps.Add(gradKernelData[kernelIdx], contrib);
                                     }
@@ -18368,7 +18386,7 @@ public partial class CpuEngine : ITensorLevelEngine
         int idx = ((batch * height + h) * width + w) * channels + channel;
         T contrib = numOps.Multiply(gradVal, numOps.FromDouble(weight));
 
-        lock (locks[idx])
+        lock (locks[idx & (DeformScatterLockCount - 1)])
         {
             gradData[idx] = numOps.Add(gradData[idx], contrib);
         }
@@ -18597,9 +18615,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var gradOutputData = gradOutput.GetDataArray();
         var gridData = grid.GetDataArray();
 
-        // Use locks for atomic addition - NHWC layout
-        var locks = new object[batch * height * width * channels];
-        for (int i = 0; i < locks.Length; i++) locks[i] = new object();
+        // Striped lock pool (no per-call allocation) - NHWC layout — see _deformScatterLocks.
+        var locks = _deformScatterLocks;
 
         CpuParallelSettings.ParallelForOrSerial(0, batch,
             (long)batch * channels * outHeight * outWidth, b =>
