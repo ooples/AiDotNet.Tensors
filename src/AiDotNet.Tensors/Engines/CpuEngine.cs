@@ -17742,6 +17742,26 @@ public partial class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    // Striped lock pool for deformable-conv gradient scatter (input/kernel/mask backward).
+    // Replaces the former per-element `new object[N]` + N `new object()` allocation that ran on
+    // EVERY backward call (one lock object per gradient element). At early deformable stages
+    // (e.g. [1, 64, 128, 128]) that allocated ~1M objects PER backward call, dominating GC —
+    // profiled at ~29.5% coreclr (GC) on the InternImage train step. A fixed power-of-two pool maps
+    // each gradient index to a stable lock via `idx & (count-1)`, so the same element always
+    // serializes on the same lock (correctness preserved); distinct elements only rarely collide
+    // (brief, harmless extra contention — each critical section is a single add). Allocated once at
+    // type init; zero per-call allocation. Shared across all deformable backward methods (a generic
+    // method's locks are type-agnostic objects, so one non-generic pool is safe for every T).
+    private const int DeformScatterLockCount = 16384; // power of two
+    private static readonly object[] _deformScatterLocks = CreateDeformScatterLocks();
+
+    private static object[] CreateDeformScatterLocks()
+    {
+        var locks = new object[DeformScatterLockCount];
+        for (int i = 0; i < locks.Length; i++) locks[i] = new object();
+        return locks;
+    }
+
     // ---- Grouped DCNv3 backward (#1691). Single-pass FUSED kernels: one parallel region over the full
     // output/deform-group space with inline group indexing — no per-group slicing or G separate launches.
     // (Replaces the earlier per-group composition; finite-difference + GPU-parity verified. The constraint
@@ -17772,29 +17792,33 @@ public partial class CpuEngine : ITensorLevelEngine
         var offsetData = offset.GetDataArray();
         var maskData = mask?.GetDataArray();
 
-        var locks = new object[batch * inChannels * height * width];
-        for (int i = 0; i < locks.Length; i++) locks[i] = new object();
-
-        // Parallelize over the full (batch, outChannel) space (all groups) -> good core utilization.
-        CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels,
-            (long)batch * outChannels * outputHeight * outputWidth, idx =>
+        // Parallelize over (batch, inChannel): each work item owns gradInput[b, icGlobal, :, :]
+        // EXCLUSIVELY (every bilinear scatter for a given input channel lands in that channel's
+        // own H×W plane), so the gradient accumulation needs NO locks and NO per-thread buffers.
+        // This restructures the original (batch, outChannel) loop — which had every output channel
+        // in a group scatter into the same input planes and thus required a lock per corner — into
+        // a disjoint-output partition. Same total work (batch·inChannels·outCpg = batch·outChannels·inCpg),
+        // similar parallelism, but the scatter-lock contention that bounded BackwardInput is gone.
+        CpuParallelSettings.ParallelForOrSerial(0, batch * inChannels,
+            (long)batch * inChannels * outCpg * outputHeight * outputWidth * numKernelPositions, idx =>
         {
-            int b = idx / outChannels;
-            int oc = idx % outChannels;
-            int g = oc / outCpg;
+            int b = idx / inChannels;
+            int icGlobal = idx % inChannels;
+            int g = icGlobal / inCpg;
+            int icl = icGlobal - g * inCpg;
             int dg = deformGroups == 1 ? 0 : g * deformGroups / groups;
-            int icBase = g * inCpg;
+            int ocBase = g * outCpg;
             int offBlock = dg * 2 * numKernelPositions;
             int maskBlock = dg * numKernelPositions;
 
-            for (int oh = 0; oh < outputHeight; oh++)
-            for (int ow = 0; ow < outputWidth; ow++)
+            for (int ocl = 0; ocl < outCpg; ocl++)
             {
-                int gradOutIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
-                T gradOutVal = gradOutputData[gradOutIdx];
-                for (int icl = 0; icl < inCpg; icl++)
+                int oc = ocBase + ocl;
+                for (int oh = 0; oh < outputHeight; oh++)
+                for (int ow = 0; ow < outputWidth; ow++)
                 {
-                    int icGlobal = icBase + icl;
+                    int gradOutIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
+                    T gradOutVal = gradOutputData[gradOutIdx];
                     for (int kh = 0; kh < kernelHeight; kh++)
                     for (int kw = 0; kw < kernelWidth; kw++)
                     {
@@ -17813,7 +17837,7 @@ public partial class CpuEngine : ITensorLevelEngine
                             modulation = maskData[maskIdx];
                         }
                         T gradVal = numOps.Multiply(numOps.Multiply(gradOutVal, kernelData[kernelIdx]), modulation);
-                        BilinearBackwardInput(gradInputData, gradVal, b, icGlobal, inChannels, height, width, sampledH, sampledW, numOps, locks);
+                        BilinearBackwardInputUnlocked(gradInputData, gradVal, b, icGlobal, inChannels, height, width, sampledH, sampledW, numOps);
                     }
                 }
             }
@@ -18059,6 +18083,21 @@ public partial class CpuEngine : ITensorLevelEngine
         if (h < -1 || h > height || w < -1 || w > width)
             return numOps.Zero;
 
+        // Fast paths: native double/float arithmetic, no INumericOperations<T> virtual dispatch
+        // (the deformable bilinear sample is the per-element hot path; profiled ~12-13% of the
+        // InternImage train step). The typeof(T) branch is a JIT-time constant per instantiation,
+        // so it folds away and only the matching native body remains. Bit-exact vs the generic path.
+        if (typeof(T) == typeof(double))
+        {
+            double r = BilinearSampleDouble(Unsafe.As<T[], double[]>(ref data), batch, channel, totalChannels, height, width, h, w);
+            return Unsafe.As<double, T>(ref r);
+        }
+        if (typeof(T) == typeof(float))
+        {
+            float r = BilinearSampleFloat(Unsafe.As<T[], float[]>(ref data), batch, channel, totalChannels, height, width, h, w);
+            return Unsafe.As<float, T>(ref r);
+        }
+
         int h0 = (int)Math.Floor(h);
         int h1 = h0 + 1;
         int w0 = (int)Math.Floor(w);
@@ -18084,6 +18123,43 @@ public partial class CpuEngine : ITensorLevelEngine
         result = numOps.Add(result, numOps.Multiply(v11, numOps.FromDouble(w11)));
 
         return result;
+    }
+
+    // Native double/float specializations of the deformable bilinear sample. Same boundary rules,
+    // same left-associative accumulation order as the generic path above => bit-exact results.
+    private static double BilinearSampleDouble(double[] data, int batch, int channel, int totalChannels, int height, int width, double h, double w)
+    {
+        int h0 = (int)Math.Floor(h), h1 = h0 + 1, w0 = (int)Math.Floor(w), w1 = w0 + 1;
+        double lh = h - h0, lw = w - w0;
+        double v00 = GetPixelDouble(data, batch, channel, totalChannels, height, width, h0, w0);
+        double v01 = GetPixelDouble(data, batch, channel, totalChannels, height, width, h0, w1);
+        double v10 = GetPixelDouble(data, batch, channel, totalChannels, height, width, h1, w0);
+        double v11 = GetPixelDouble(data, batch, channel, totalChannels, height, width, h1, w1);
+        return v00 * ((1 - lh) * (1 - lw)) + v01 * ((1 - lh) * lw) + v10 * (lh * (1 - lw)) + v11 * (lh * lw);
+    }
+
+    private static float BilinearSampleFloat(float[] data, int batch, int channel, int totalChannels, int height, int width, double h, double w)
+    {
+        int h0 = (int)Math.Floor(h), h1 = h0 + 1, w0 = (int)Math.Floor(w), w1 = w0 + 1;
+        double lh = h - h0, lw = w - w0;
+        float v00 = GetPixelFloat(data, batch, channel, totalChannels, height, width, h0, w0);
+        float v01 = GetPixelFloat(data, batch, channel, totalChannels, height, width, h0, w1);
+        float v10 = GetPixelFloat(data, batch, channel, totalChannels, height, width, h1, w0);
+        float v11 = GetPixelFloat(data, batch, channel, totalChannels, height, width, h1, w1);
+        // Cast weights to float so each product/accumulate is in float, matching FromDouble + float ops.
+        return v00 * (float)((1 - lh) * (1 - lw)) + v01 * (float)((1 - lh) * lw) + v10 * (float)(lh * (1 - lw)) + v11 * (float)(lh * lw);
+    }
+
+    private static double GetPixelDouble(double[] data, int batch, int channel, int totalChannels, int height, int width, int h, int w)
+    {
+        if (h < 0 || h >= height || w < 0 || w >= width) return 0.0;
+        return data[((batch * totalChannels + channel) * height + h) * width + w];
+    }
+
+    private static float GetPixelFloat(float[] data, int batch, int channel, int totalChannels, int height, int width, int h, int w)
+    {
+        if (h < 0 || h >= height || w < 0 || w >= width) return 0f;
+        return data[((batch * totalChannels + channel) * height + h) * width + w];
     }
 
     /// <summary>
@@ -18150,9 +18226,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var offsetData = offset.GetDataArray();
         var maskData = mask?.GetDataArray();
 
-        // Use a lock array to avoid race conditions during atomic adds
-        var locks = new object[batch * inChannels * height * width];
-        for (int i = 0; i < locks.Length; i++) locks[i] = new object();
+        // Striped lock pool (no per-call allocation) — see _deformScatterLocks.
+        var locks = _deformScatterLocks;
 
         CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels,
             (long)batch * outChannels * outputHeight * outputWidth, idx =>
@@ -18228,6 +18303,20 @@ public partial class CpuEngine : ITensorLevelEngine
         if (h <= -1 || h >= height || w <= -1 || w >= width)
             return;
 
+        // Fast paths: native double/float scatter (no virtual dispatch). Bit-exact vs generic.
+        if (typeof(T) == typeof(double))
+        {
+            double gv = Unsafe.As<T, double>(ref gradVal);
+            BilinearBackwardInputDouble(Unsafe.As<T[], double[]>(ref gradData), gv, batch, channel, totalChannels, height, width, h, w, locks);
+            return;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            float gv = Unsafe.As<T, float>(ref gradVal);
+            BilinearBackwardInputFloat(Unsafe.As<T[], float[]>(ref gradData), gv, batch, channel, totalChannels, height, width, h, w, locks);
+            return;
+        }
+
         int h0 = (int)Math.Floor(h);
         int h1 = h0 + 1;
         int w0 = (int)Math.Floor(w);
@@ -18246,6 +18335,106 @@ public partial class CpuEngine : ITensorLevelEngine
         AddGradientToPixel(gradData, gradVal, batch, channel, totalChannels, height, width, h0, w1, w01, numOps, locks);
         AddGradientToPixel(gradData, gradVal, batch, channel, totalChannels, height, width, h1, w0, w10, numOps, locks);
         AddGradientToPixel(gradData, gradVal, batch, channel, totalChannels, height, width, h1, w1, w11, numOps, locks);
+    }
+
+    // Native double/float specializations of the deformable input-gradient scatter. Same boundary
+    // rules, same weights, same lock striping as the generic AddGradientToPixel path => bit-exact.
+    private static void BilinearBackwardInputDouble(double[] gradData, double gradVal, int batch, int channel, int totalChannels, int height, int width, double h, double w, object[] locks)
+    {
+        int h0 = (int)Math.Floor(h), h1 = h0 + 1, w0 = (int)Math.Floor(w), w1 = w0 + 1;
+        double lh = h - h0, lw = w - w0;
+        ScatterPixelDouble(gradData, gradVal, batch, channel, totalChannels, height, width, h0, w0, (1 - lh) * (1 - lw), locks);
+        ScatterPixelDouble(gradData, gradVal, batch, channel, totalChannels, height, width, h0, w1, (1 - lh) * lw, locks);
+        ScatterPixelDouble(gradData, gradVal, batch, channel, totalChannels, height, width, h1, w0, lh * (1 - lw), locks);
+        ScatterPixelDouble(gradData, gradVal, batch, channel, totalChannels, height, width, h1, w1, lh * lw, locks);
+    }
+
+    private static void ScatterPixelDouble(double[] gradData, double gradVal, int batch, int channel, int totalChannels, int height, int width, int h, int w, double weight, object[] locks)
+    {
+        if (h < 0 || h >= height || w < 0 || w >= width || Math.Abs(weight) < 1e-10) return;
+        int idx = ((batch * totalChannels + channel) * height + h) * width + w;
+        double contrib = gradVal * weight;
+        lock (locks[idx & (DeformScatterLockCount - 1)]) { gradData[idx] += contrib; }
+    }
+
+    private static void BilinearBackwardInputFloat(float[] gradData, float gradVal, int batch, int channel, int totalChannels, int height, int width, double h, double w, object[] locks)
+    {
+        int h0 = (int)Math.Floor(h), h1 = h0 + 1, w0 = (int)Math.Floor(w), w1 = w0 + 1;
+        double lh = h - h0, lw = w - w0;
+        ScatterPixelFloat(gradData, gradVal, batch, channel, totalChannels, height, width, h0, w0, (1 - lh) * (1 - lw), locks);
+        ScatterPixelFloat(gradData, gradVal, batch, channel, totalChannels, height, width, h0, w1, (1 - lh) * lw, locks);
+        ScatterPixelFloat(gradData, gradVal, batch, channel, totalChannels, height, width, h1, w0, lh * (1 - lw), locks);
+        ScatterPixelFloat(gradData, gradVal, batch, channel, totalChannels, height, width, h1, w1, lh * lw, locks);
+    }
+
+    private static void ScatterPixelFloat(float[] gradData, float gradVal, int batch, int channel, int totalChannels, int height, int width, int h, int w, double weight, object[] locks)
+    {
+        if (h < 0 || h >= height || w < 0 || w >= width || Math.Abs(weight) < 1e-10) return;
+        int idx = ((batch * totalChannels + channel) * height + h) * width + w;
+        float contrib = gradVal * (float)weight;
+        lock (locks[idx & (DeformScatterLockCount - 1)]) { gradData[idx] += contrib; }
+    }
+
+    // Lock-FREE bilinear input-gradient scatter, for callers that own the target channel plane
+    // exclusively (grouped BackwardInput parallelized over input channels). Same math as the locked
+    // BilinearBackwardInput; differs only by dropping the lock since no other thread writes this plane.
+    private static void BilinearBackwardInputUnlocked<T>(T[] gradData, T gradVal, int batch, int channel, int totalChannels, int height, int width, double h, double w, INumericOperations<T> numOps)
+    {
+        if (h <= -1 || h >= height || w <= -1 || w >= width)
+            return;
+
+        if (typeof(T) == typeof(double))
+        {
+            double gv = Unsafe.As<T, double>(ref gradVal);
+            double[] gd = Unsafe.As<T[], double[]>(ref gradData);
+            int h0 = (int)Math.Floor(h), h1 = h0 + 1, w0 = (int)Math.Floor(w), w1 = w0 + 1;
+            double lh = h - h0, lw = w - w0;
+            ScatterPixelDoubleNoLock(gd, gv, batch, channel, totalChannels, height, width, h0, w0, (1 - lh) * (1 - lw));
+            ScatterPixelDoubleNoLock(gd, gv, batch, channel, totalChannels, height, width, h0, w1, (1 - lh) * lw);
+            ScatterPixelDoubleNoLock(gd, gv, batch, channel, totalChannels, height, width, h1, w0, lh * (1 - lw));
+            ScatterPixelDoubleNoLock(gd, gv, batch, channel, totalChannels, height, width, h1, w1, lh * lw);
+            return;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            float gv = Unsafe.As<T, float>(ref gradVal);
+            float[] gd = Unsafe.As<T[], float[]>(ref gradData);
+            int h0 = (int)Math.Floor(h), h1 = h0 + 1, w0 = (int)Math.Floor(w), w1 = w0 + 1;
+            double lh = h - h0, lw = w - w0;
+            ScatterPixelFloatNoLock(gd, gv, batch, channel, totalChannels, height, width, h0, w0, (1 - lh) * (1 - lw));
+            ScatterPixelFloatNoLock(gd, gv, batch, channel, totalChannels, height, width, h0, w1, (1 - lh) * lw);
+            ScatterPixelFloatNoLock(gd, gv, batch, channel, totalChannels, height, width, h1, w0, lh * (1 - lw));
+            ScatterPixelFloatNoLock(gd, gv, batch, channel, totalChannels, height, width, h1, w1, lh * lw);
+            return;
+        }
+
+        {
+            int h0 = (int)Math.Floor(h), h1 = h0 + 1, w0 = (int)Math.Floor(w), w1 = w0 + 1;
+            double lh = h - h0, lw = w - w0;
+            AddGradientToPixelNoLock(gradData, gradVal, batch, channel, totalChannels, height, width, h0, w0, (1 - lh) * (1 - lw), numOps);
+            AddGradientToPixelNoLock(gradData, gradVal, batch, channel, totalChannels, height, width, h0, w1, (1 - lh) * lw, numOps);
+            AddGradientToPixelNoLock(gradData, gradVal, batch, channel, totalChannels, height, width, h1, w0, lh * (1 - lw), numOps);
+            AddGradientToPixelNoLock(gradData, gradVal, batch, channel, totalChannels, height, width, h1, w1, lh * lw, numOps);
+        }
+    }
+
+    private static void ScatterPixelDoubleNoLock(double[] gradData, double gradVal, int batch, int channel, int totalChannels, int height, int width, int h, int w, double weight)
+    {
+        if (h < 0 || h >= height || w < 0 || w >= width || Math.Abs(weight) < 1e-10) return;
+        gradData[((batch * totalChannels + channel) * height + h) * width + w] += gradVal * weight;
+    }
+
+    private static void ScatterPixelFloatNoLock(float[] gradData, float gradVal, int batch, int channel, int totalChannels, int height, int width, int h, int w, double weight)
+    {
+        if (h < 0 || h >= height || w < 0 || w >= width || Math.Abs(weight) < 1e-10) return;
+        gradData[((batch * totalChannels + channel) * height + h) * width + w] += gradVal * (float)weight;
+    }
+
+    private static void AddGradientToPixelNoLock<T>(T[] gradData, T gradVal, int batch, int channel, int totalChannels, int height, int width, int h, int w, double weight, INumericOperations<T> numOps)
+    {
+        if (h < 0 || h >= height || w < 0 || w >= width || Math.Abs(weight) < 1e-10) return;
+        int idx = ((batch * totalChannels + channel) * height + h) * width + w;
+        gradData[idx] = numOps.Add(gradData[idx], numOps.Multiply(gradVal, numOps.FromDouble(weight)));
     }
 
     /// <summary>
@@ -18271,7 +18460,7 @@ public partial class CpuEngine : ITensorLevelEngine
         int idx = ((batch * totalChannels + channel) * height + h) * width + w;
         T contrib = numOps.Multiply(gradVal, numOps.FromDouble(weight));
 
-        lock (locks[idx])
+        lock (locks[idx & (DeformScatterLockCount - 1)])
         {
             gradData[idx] = numOps.Add(gradData[idx], contrib);
         }
@@ -18318,9 +18507,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var offsetData = offset.GetDataArray();
         var maskData = mask?.GetDataArray();
 
-        // Use locks for atomic operations on kernel gradients
-        var locks = new object[outChannels * inChannels * kernelHeight * kernelWidth];
-        for (int i = 0; i < locks.Length; i++) locks[i] = new object();
+        // Striped lock pool (no per-call allocation) — see _deformScatterLocks.
+        var locks = _deformScatterLocks;
 
         CpuParallelSettings.ParallelForOrSerial(0, batch,
             (long)batch * outChannels * outputHeight * outputWidth, b =>
@@ -18366,7 +18554,7 @@ public partial class CpuEngine : ITensorLevelEngine
                                     // gradKernel[oc, ic, kh, kw] += gradOutput * sampledValue
                                     T contrib = numOps.Multiply(gradOutVal, sampledValue);
 
-                                    lock (locks[kernelIdx])
+                                    lock (locks[kernelIdx & (DeformScatterLockCount - 1)])
                                     {
                                         gradKernelData[kernelIdx] = numOps.Add(gradKernelData[kernelIdx], contrib);
                                     }
@@ -18528,6 +18716,18 @@ public partial class CpuEngine : ITensorLevelEngine
         if (h <= -1 || h >= height || w <= -1 || w >= width)
             return (numOps.Zero, numOps.Zero);
 
+        // Fast paths: native double/float arithmetic (no virtual dispatch). Bit-exact vs generic.
+        if (typeof(T) == typeof(double))
+        {
+            var (dHd, dWd) = BilinearGradientDouble(Unsafe.As<T[], double[]>(ref data), batch, channel, totalChannels, height, width, h, w);
+            return (Unsafe.As<double, T>(ref dHd), Unsafe.As<double, T>(ref dWd));
+        }
+        if (typeof(T) == typeof(float))
+        {
+            var (dHf, dWf) = BilinearGradientFloat(Unsafe.As<T[], float[]>(ref data), batch, channel, totalChannels, height, width, h, w);
+            return (Unsafe.As<float, T>(ref dHf), Unsafe.As<float, T>(ref dWf));
+        }
+
         int h0 = (int)Math.Floor(h);
         int h1 = h0 + 1;
         int w0 = (int)Math.Floor(w);
@@ -18556,6 +18756,34 @@ public partial class CpuEngine : ITensorLevelEngine
             numOps.Multiply(numOps.FromDouble(1 - lh), numOps.Subtract(v01, v00)),
             numOps.Multiply(numOps.FromDouble(lh), numOps.Subtract(v11, v10)));
 
+        return (dH, dW);
+    }
+
+    // Native double/float specializations of BilinearGradient. Same operand/association order
+    // as the generic path => bit-exact.
+    private static (double dH, double dW) BilinearGradientDouble(double[] data, int batch, int channel, int totalChannels, int height, int width, double h, double w)
+    {
+        int h0 = (int)Math.Floor(h), h1 = h0 + 1, w0 = (int)Math.Floor(w), w1 = w0 + 1;
+        double lh = h - h0, lw = w - w0;
+        double v00 = GetPixelDouble(data, batch, channel, totalChannels, height, width, h0, w0);
+        double v01 = GetPixelDouble(data, batch, channel, totalChannels, height, width, h0, w1);
+        double v10 = GetPixelDouble(data, batch, channel, totalChannels, height, width, h1, w0);
+        double v11 = GetPixelDouble(data, batch, channel, totalChannels, height, width, h1, w1);
+        double dH = (1 - lw) * (v10 - v00) + lw * (v11 - v01);
+        double dW = (1 - lh) * (v01 - v00) + lh * (v11 - v10);
+        return (dH, dW);
+    }
+
+    private static (float dH, float dW) BilinearGradientFloat(float[] data, int batch, int channel, int totalChannels, int height, int width, double h, double w)
+    {
+        int h0 = (int)Math.Floor(h), h1 = h0 + 1, w0 = (int)Math.Floor(w), w1 = w0 + 1;
+        double lh = h - h0, lw = w - w0;
+        float v00 = GetPixelFloat(data, batch, channel, totalChannels, height, width, h0, w0);
+        float v01 = GetPixelFloat(data, batch, channel, totalChannels, height, width, h0, w1);
+        float v10 = GetPixelFloat(data, batch, channel, totalChannels, height, width, h1, w0);
+        float v11 = GetPixelFloat(data, batch, channel, totalChannels, height, width, h1, w1);
+        float dH = (float)(1 - lw) * (v10 - v00) + (float)lw * (v11 - v01);
+        float dW = (float)(1 - lh) * (v01 - v00) + (float)lh * (v11 - v10);
         return (dH, dW);
     }
 
@@ -18622,7 +18850,7 @@ public partial class CpuEngine : ITensorLevelEngine
         int idx = ((batch * height + h) * width + w) * channels + channel;
         T contrib = numOps.Multiply(gradVal, numOps.FromDouble(weight));
 
-        lock (locks[idx])
+        lock (locks[idx & (DeformScatterLockCount - 1)])
         {
             gradData[idx] = numOps.Add(gradData[idx], contrib);
         }
@@ -18851,9 +19079,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var gradOutputData = gradOutput.GetDataArray();
         var gridData = grid.GetDataArray();
 
-        // Use locks for atomic addition - NHWC layout
-        var locks = new object[batch * height * width * channels];
-        for (int i = 0; i < locks.Length; i++) locks[i] = new object();
+        // Striped lock pool (no per-call allocation) - NHWC layout — see _deformScatterLocks.
+        var locks = _deformScatterLocks;
 
         CpuParallelSettings.ParallelForOrSerial(0, batch,
             (long)batch * channels * outHeight * outWidth, b =>
