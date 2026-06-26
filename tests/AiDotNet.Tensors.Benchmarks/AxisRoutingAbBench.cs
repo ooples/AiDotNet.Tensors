@@ -214,6 +214,58 @@ public static class AxisRoutingAbBench
         CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
     }
 
+    /// <summary>
+    /// #475 Phase 1: JIT specialized FP32 GEMM A/B vs native OpenBLAS on small/medium shapes (the
+    /// libxsmm regime). Correctness vs a double-precision scalar reference (small float-rounding
+    /// maxErr expected, not 0). Run: <c>--ab-jit</c>.
+    /// </summary>
+    public static unsafe void JitAb()
+    {
+        Console.WriteLine("=== #475 Phase 1: JIT specialized FP32 GEMM A/B (single-thread) ===");
+        Console.WriteLine($"JIT supported={JitGemmGenerator.IsSupported}  HasRawSgemm={BlasProvider.HasRawSgemm}");
+        var shapes = new (int m, int n, int k)[]
+        {
+            (6,16,64),(12,32,128),(24,48,128),(48,64,256),(64,64,128),
+            (96,96,256),(128,128,256),(64,512,512),(128,256,512),(256,256,256),
+        };
+        foreach (var (m, n, k) in shapes)
+        {
+            var a = MakeRandom(m * k);
+            var b = MakeRandom(k * n);
+            var cref = new float[m * n];
+            ScalarGemm(a, b, cref, m, n, k);
+            var c = new float[m * n];
+            bool ok;
+            fixed (float* pa = a, pb = b, pc = c) ok = JitGemmGenerator.TryRunFp32(pa, k, pb, n, pc, n, m, n, k);
+            double maxErr = 0;
+            for (int i = 0; i < c.Length; i++) { double e = Math.Abs((double)c[i] - cref[i]); if (e > maxErr) maxErr = e; }
+            double flops = 2.0 * m * n * k;
+            double jitSec = ok ? TimeMinPtr(a, b, c, m, n, k, jit: true) : double.NaN;
+            double obSec = BlasProvider.HasRawSgemm ? TimeMinPtr(a, b, c, m, n, k, jit: false) : double.NaN;
+            string cmp = (BlasProvider.HasRawSgemm && ok) ? $"  {obSec / jitSec:F2}x vs OpenBLAS" : "";
+            Console.WriteLine($"  {m,4}x{n,4}x{k,4}  ok={ok} maxErr={maxErr:E1}  JIT {flops / jitSec / 1e9,5:F0}  OB {flops / obSec / 1e9,5:F0} GF/s{cmp}");
+        }
+    }
+
+    private static void ScalarGemm(float[] a, float[] b, float[] c, int m, int n, int k)
+    {
+        for (int i = 0; i < m; i++)
+            for (int j = 0; j < n; j++)
+            {
+                double s = 0;
+                for (int p = 0; p < k; p++) s += (double)a[i * k + p] * b[p * n + j];
+                c[i * n + j] = (float)s;
+            }
+    }
+
+    private static unsafe double TimeMinPtr(float[] a, float[] b, float[] c, int m, int n, int k, bool jit)
+    {
+        Action op = jit
+            ? () => { fixed (float* pa = a, pb = b, pc = c) JitGemmGenerator.TryRunFp32(pa, k, pb, n, pc, n, m, n, k); }
+            : () => { fixed (float* pa = a, pb = b, pc = c) BlasProvider.SgemmRaw(m, n, k, pa, k, pb, n, pc, n); };
+        return TimeMin(op, m, n, k);
+    }
+
     private static double Gf(double flops, double sec) => flops / sec / 1e9;
 
     private static unsafe double TimeMinNative(float[] a, float[] b, float[] c, int m, int n, int k)

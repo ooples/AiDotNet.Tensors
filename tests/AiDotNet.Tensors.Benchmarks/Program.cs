@@ -88,6 +88,13 @@ class Program
             return;
         }
 
+        // #475 Phase 1: JIT specialized FP32 GEMM A/B vs OpenBLAS (small/medium). (--ab-jit)
+        if (args[0] == "--ab-jit")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.JitAb();
+            return;
+        }
+
         if (args[0] == "--ab-aiseval-dopsweep")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.DopSweep();

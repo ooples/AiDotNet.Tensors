@@ -146,6 +146,9 @@ internal sealed class X64Assembler
     /// <summary>vmovups ymm_dst, [base+disp32] (FP32 256-bit load).</summary>
     internal void VmovupsLoadD32(int dst, int baseReg, int disp32) => VexMemDisp32(Map0F, PpNone, 0, 1, 0x10, dst, baseReg, disp32);
 
+    /// <summary>vmovups [base+disp32], ymm_src (FP32 256-bit store). Op 0x11; src in ModRM.reg.</summary>
+    internal void VmovupsStoreD32(int baseReg, int disp32, int src) => VexMemDisp32(Map0F, PpNone, 0, 1, 0x11, src, baseReg, disp32);
+
     /// <summary>vbroadcastss ymm_dst, [base+disp32].</summary>
     internal void VbroadcastSsD32(int dst, int baseReg, int disp32) => VexMemDisp32(Map0F38, Pp66, 0, 1, 0x18, dst, baseReg, disp32);
 
@@ -404,6 +407,9 @@ internal sealed class X64Assembler
 
     /// <summary>vfmadd231ps dst, s1, s2 (dst += s1*s2). VEX.DDS.256.66.0F38.W0 B8.</summary>
     internal void Vfmadd231ps(int dst, int s1, int s2) => VexRR(Map0F38, Pp66, 0, 1, 0xB8, dst, s1, s2);
+
+    /// <summary>vxorps ymm_dst, s1, s2. VEX.256.0F.WIG 57 /r. Zeroes a register via dst,dst,dst.</summary>
+    internal void Vxorps(int dst, int s1, int s2) => VexRR(Map0F, PpNone, 0, 1, 0x57, dst, s1, s2);
 
     /// <summary>vbroadcastss ymm_dst, [base+disp8]. VEX.256.66.0F38.W0 18.</summary>
     internal void VbroadcastSs(int dst, int baseReg, sbyte disp8) => VexMemDisp8(Map0F38, Pp66, 0, 1, 0x18, dst, baseReg, disp8);
