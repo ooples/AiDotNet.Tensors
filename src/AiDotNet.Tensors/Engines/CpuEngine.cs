@@ -18870,11 +18870,49 @@ public partial class CpuEngine : ITensorLevelEngine
         double w10 = lh * (1 - lw);
         double w11 = lh * lw;
 
+        // Native double/float scatter (no numOps dispatch); generic falls through. Bit-exact.
+        if (typeof(T) == typeof(double))
+        {
+            double gv = Unsafe.As<T, double>(ref gradVal);
+            double[] gd = Unsafe.As<T[], double[]>(ref gradData);
+            ScatterPixelDoubleNHWC(gd, gv, batch, channel, height, width, channels, h0, w0, w00, locks);
+            ScatterPixelDoubleNHWC(gd, gv, batch, channel, height, width, channels, h0, w1, w01, locks);
+            ScatterPixelDoubleNHWC(gd, gv, batch, channel, height, width, channels, h1, w0, w10, locks);
+            ScatterPixelDoubleNHWC(gd, gv, batch, channel, height, width, channels, h1, w1, w11, locks);
+            return;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            float gv = Unsafe.As<T, float>(ref gradVal);
+            float[] gd = Unsafe.As<T[], float[]>(ref gradData);
+            ScatterPixelFloatNHWC(gd, gv, batch, channel, height, width, channels, h0, w0, w00, locks);
+            ScatterPixelFloatNHWC(gd, gv, batch, channel, height, width, channels, h0, w1, w01, locks);
+            ScatterPixelFloatNHWC(gd, gv, batch, channel, height, width, channels, h1, w0, w10, locks);
+            ScatterPixelFloatNHWC(gd, gv, batch, channel, height, width, channels, h1, w1, w11, locks);
+            return;
+        }
+
         // Add gradient contributions to each of the 4 corners (NHWC layout)
         AddGradientToPixelNHWC(gradData, gradVal, batch, channel, height, width, channels, h0, w0, w00, numOps, locks);
         AddGradientToPixelNHWC(gradData, gradVal, batch, channel, height, width, channels, h0, w1, w01, numOps, locks);
         AddGradientToPixelNHWC(gradData, gradVal, batch, channel, height, width, channels, h1, w0, w10, numOps, locks);
         AddGradientToPixelNHWC(gradData, gradVal, batch, channel, height, width, channels, h1, w1, w11, numOps, locks);
+    }
+
+    private static void ScatterPixelDoubleNHWC(double[] gradData, double gradVal, int batch, int channel, int height, int width, int channels, int h, int w, double weight, object[] locks)
+    {
+        if (h < 0 || h >= height || w < 0 || w >= width || Math.Abs(weight) < 1e-10) return;
+        int idx = ((batch * height + h) * width + w) * channels + channel;
+        double contrib = gradVal * weight;
+        lock (locks[idx & (DeformScatterLockCount - 1)]) { gradData[idx] += contrib; }
+    }
+
+    private static void ScatterPixelFloatNHWC(float[] gradData, float gradVal, int batch, int channel, int height, int width, int channels, int h, int w, double weight, object[] locks)
+    {
+        if (h < 0 || h >= height || w < 0 || w >= width || Math.Abs(weight) < 1e-10) return;
+        int idx = ((batch * height + h) * width + w) * channels + channel;
+        float contrib = gradVal * (float)weight;
+        lock (locks[idx & (DeformScatterLockCount - 1)]) { gradData[idx] += contrib; }
     }
 
     /// <summary>
