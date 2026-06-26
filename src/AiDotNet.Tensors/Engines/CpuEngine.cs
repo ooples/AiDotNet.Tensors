@@ -36834,52 +36834,90 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = TensorAllocator.Rent<T>([n, m]);
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        // Use the identity: ||x - y||^2 = ||x||^2 + ||y||^2 - 2 * x.y
-        // Compute ||x||^2 for each row of x
-        var xNormSq = new T[n];
-        for (int i = 0; i < n; i++)
-        {
-            T sum = numOps.Zero;
-            for (int k = 0; k < d; k++)
-            {
-                T val = x[i, k];
-                sum = numOps.Add(sum, numOps.Multiply(val, val));
-            }
-            xNormSq[i] = sum;
-        }
+        // Rewritten from a serial triple loop with per-element Tensor indexer (x[i,k]/y[j,k]) +
+        // numOps dispatch to a parallel raw-array kernel with native double/float fast paths.
+        // Same ||x-y||^2 = ||x||^2 + ||y||^2 - 2 x·y identity and same accumulation order (bit-exact).
+        var xc = x.IsContiguous ? x : x.Contiguous();
+        var yc = y.IsContiguous ? y : y.Contiguous();
+        var xData = xc.GetDataArray();
+        var yData = yc.GetDataArray();
+        var resData = result.GetDataArray();
 
-        // Compute ||y||^2 for each row of y
-        var yNormSq = new T[m];
-        for (int j = 0; j < m; j++)
+        if (typeof(T) == typeof(double))
         {
-            T sum = numOps.Zero;
-            for (int k = 0; k < d; k++)
-            {
-                T val = y[j, k];
-                sum = numOps.Add(sum, numOps.Multiply(val, val));
-            }
-            yNormSq[j] = sum;
+            PairwiseDistanceSquaredDouble(Unsafe.As<T[], double[]>(ref xData), Unsafe.As<T[], double[]>(ref yData), Unsafe.As<T[], double[]>(ref resData), n, m, d);
         }
-
-        // Compute result[i,j] = ||x[i]||^2 + ||y[j]||^2 - 2 * x[i].y[j]
-        T two = numOps.FromDouble(2.0);
-        for (int i = 0; i < n; i++)
+        else if (typeof(T) == typeof(float))
         {
+            PairwiseDistanceSquaredFloat(Unsafe.As<T[], float[]>(ref xData), Unsafe.As<T[], float[]>(ref yData), Unsafe.As<T[], float[]>(ref resData), n, m, d);
+        }
+        else
+        {
+            var xNormSq = new T[n];
+            for (int i = 0; i < n; i++)
+            {
+                T sum = numOps.Zero;
+                for (int k = 0; k < d; k++) { T val = xData[i * d + k]; sum = numOps.Add(sum, numOps.Multiply(val, val)); }
+                xNormSq[i] = sum;
+            }
+            var yNormSq = new T[m];
             for (int j = 0; j < m; j++)
             {
-                // Compute dot product x[i].y[j]
-                T dot = numOps.Zero;
-                for (int k = 0; k < d; k++)
-                {
-                    dot = numOps.Add(dot, numOps.Multiply(x[i, k], y[j, k]));
-                }
-                // ||x - y||^2 = ||x||^2 + ||y||^2 - 2 * x.y
-                T dist = numOps.Subtract(numOps.Add(xNormSq[i], yNormSq[j]), numOps.Multiply(two, dot));
-                result[i, j] = dist;
+                T sum = numOps.Zero;
+                for (int k = 0; k < d; k++) { T val = yData[j * d + k]; sum = numOps.Add(sum, numOps.Multiply(val, val)); }
+                yNormSq[j] = sum;
             }
+            T two = numOps.FromDouble(2.0);
+            CpuParallelSettings.ParallelForOrSerial(0, n, (long)n * m * d, i =>
+            {
+                int xb = i * d;
+                for (int j = 0; j < m; j++)
+                {
+                    int yb = j * d;
+                    T dot = numOps.Zero;
+                    for (int k = 0; k < d; k++) dot = numOps.Add(dot, numOps.Multiply(xData[xb + k], yData[yb + k]));
+                    resData[i * m + j] = numOps.Subtract(numOps.Add(xNormSq[i], yNormSq[j]), numOps.Multiply(two, dot));
+                }
+            });
         }
 
         return result;
+    }
+
+    private static void PairwiseDistanceSquaredDouble(double[] x, double[] y, double[] r, int n, int m, int d)
+    {
+        var xn = new double[n];
+        for (int i = 0; i < n; i++) { double s = 0; int b = i * d; for (int k = 0; k < d; k++) s += x[b + k] * x[b + k]; xn[i] = s; }
+        var yn = new double[m];
+        for (int j = 0; j < m; j++) { double s = 0; int b = j * d; for (int k = 0; k < d; k++) s += y[b + k] * y[b + k]; yn[j] = s; }
+        CpuParallelSettings.ParallelForOrSerial(0, n, (long)n * m * d, i =>
+        {
+            int xb = i * d; double xni = xn[i];
+            for (int j = 0; j < m; j++)
+            {
+                int yb = j * d; double dot = 0;
+                for (int k = 0; k < d; k++) dot += x[xb + k] * y[yb + k];
+                r[i * m + j] = (xni + yn[j]) - 2.0 * dot;
+            }
+        });
+    }
+
+    private static void PairwiseDistanceSquaredFloat(float[] x, float[] y, float[] r, int n, int m, int d)
+    {
+        var xn = new float[n];
+        for (int i = 0; i < n; i++) { float s = 0; int b = i * d; for (int k = 0; k < d; k++) s += x[b + k] * x[b + k]; xn[i] = s; }
+        var yn = new float[m];
+        for (int j = 0; j < m; j++) { float s = 0; int b = j * d; for (int k = 0; k < d; k++) s += y[b + k] * y[b + k]; yn[j] = s; }
+        CpuParallelSettings.ParallelForOrSerial(0, n, (long)n * m * d, i =>
+        {
+            int xb = i * d; float xni = xn[i];
+            for (int j = 0; j < m; j++)
+            {
+                int yb = j * d; float dot = 0;
+                for (int k = 0; k < d; k++) dot += x[xb + k] * y[yb + k];
+                r[i * m + j] = (xni + yn[j]) - 2f * dot;
+            }
+        });
     }
 
     /// <inheritdoc/>
