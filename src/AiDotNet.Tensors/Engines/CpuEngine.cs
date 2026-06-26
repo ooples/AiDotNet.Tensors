@@ -7176,62 +7176,113 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var result = TensorAllocator.Rent<T>(new[] { numPositions, channels });
 
-        CpuParallelSettings.ParallelForOrSerial(0, numPositions, (long)numPositions * channels * 8, n =>
+        // Rewritten from per-element Tensor-indexer access (grid[z,y,x,c] × 8 corners/channel +
+        // positions[n,i] + numOps.ToDouble/FromDouble dispatch) to raw-array access with native
+        // double/float fast paths. Interp already runs in double; the wins are killing the indexer
+        // (flat index instead of stride-resolve + bounds check) and the per-corner numOps boxing.
+        // Contiguity-guarded; tape records the original tensors.
+        var gridSrc = grid; var posSrc = positions;
+        if (!grid.IsContiguous) grid = grid.Contiguous();
+        if (!positions.IsContiguous) positions = positions.Contiguous();
+        var gridData = grid.GetDataArray();
+        var posData = positions.GetDataArray();
+        var resData = result.GetDataArray();
+        int lD = depth, lH = height, lW = width, lC = channels;
+
+        if (typeof(T) == typeof(double))
         {
-            // Get position (z, y, x)
-            T pz = positions[n, 0];
-            T py = positions[n, 1];
-            T px = positions[n, 2];
-
-            // Clamp to valid range and get integer and fractional parts
-            double z = Math.Max(0, Math.Min(depth - 1.001, numOps.ToDouble(pz)));
-            double y = Math.Max(0, Math.Min(height - 1.001, numOps.ToDouble(py)));
-            double x = Math.Max(0, Math.Min(width - 1.001, numOps.ToDouble(px)));
-
-            int z0 = (int)Math.Floor(z);
-            int y0 = (int)Math.Floor(y);
-            int x0 = (int)Math.Floor(x);
-            int z1 = Math.Min(z0 + 1, depth - 1);
-            int y1 = Math.Min(y0 + 1, height - 1);
-            int x1 = Math.Min(x0 + 1, width - 1);
-
-            double fz = z - z0;
-            double fy = y - y0;
-            double fx = x - x0;
-
-            // Trilinear interpolation weights for 8 corners
-            double w000 = (1 - fz) * (1 - fy) * (1 - fx);
-            double w001 = (1 - fz) * (1 - fy) * fx;
-            double w010 = (1 - fz) * fy * (1 - fx);
-            double w011 = (1 - fz) * fy * fx;
-            double w100 = fz * (1 - fy) * (1 - fx);
-            double w101 = fz * (1 - fy) * fx;
-            double w110 = fz * fy * (1 - fx);
-            double w111 = fz * fy * fx;
-
-            for (int c = 0; c < channels; c++)
+            double[] g = Unsafe.As<T[], double[]>(ref gridData);
+            double[] p = Unsafe.As<T[], double[]>(ref posData);
+            double[] r = Unsafe.As<T[], double[]>(ref resData);
+            CpuParallelSettings.ParallelForOrSerial(0, numPositions, (long)numPositions * lC * 8, n =>
+                TrilinearRow(g, p, r, n, lD, lH, lW, lC));
+        }
+        else if (typeof(T) == typeof(float))
+        {
+            float[] g = Unsafe.As<T[], float[]>(ref gridData);
+            float[] p = Unsafe.As<T[], float[]>(ref posData);
+            float[] r = Unsafe.As<T[], float[]>(ref resData);
+            CpuParallelSettings.ParallelForOrSerial(0, numPositions, (long)numPositions * lC * 8, n =>
+                TrilinearRowF(g, p, r, n, lD, lH, lW, lC));
+        }
+        else
+        {
+            CpuParallelSettings.ParallelForOrSerial(0, numPositions, (long)numPositions * lC * 8, n =>
             {
-                // Get values at 8 corners
-                double v000 = numOps.ToDouble(grid[z0, y0, x0, c]);
-                double v001 = numOps.ToDouble(grid[z0, y0, x1, c]);
-                double v010 = numOps.ToDouble(grid[z0, y1, x0, c]);
-                double v011 = numOps.ToDouble(grid[z0, y1, x1, c]);
-                double v100 = numOps.ToDouble(grid[z1, y0, x0, c]);
-                double v101 = numOps.ToDouble(grid[z1, y0, x1, c]);
-                double v110 = numOps.ToDouble(grid[z1, y1, x0, c]);
-                double v111 = numOps.ToDouble(grid[z1, y1, x1, c]);
+                double z = Math.Max(0, Math.Min(lD - 1.001, numOps.ToDouble(posData[n * 3 + 0])));
+                double y = Math.Max(0, Math.Min(lH - 1.001, numOps.ToDouble(posData[n * 3 + 1])));
+                double x = Math.Max(0, Math.Min(lW - 1.001, numOps.ToDouble(posData[n * 3 + 2])));
+                int z0 = (int)Math.Floor(z), y0 = (int)Math.Floor(y), x0 = (int)Math.Floor(x);
+                int z1 = Math.Min(z0 + 1, lD - 1), y1 = Math.Min(y0 + 1, lH - 1), x1 = Math.Min(x0 + 1, lW - 1);
+                double fz = z - z0, fy = y - y0, fx = x - x0;
+                double w000 = (1 - fz) * (1 - fy) * (1 - fx), w001 = (1 - fz) * (1 - fy) * fx,
+                       w010 = (1 - fz) * fy * (1 - fx), w011 = (1 - fz) * fy * fx,
+                       w100 = fz * (1 - fy) * (1 - fx), w101 = fz * (1 - fy) * fx,
+                       w110 = fz * fy * (1 - fx), w111 = fz * fy * fx;
+                for (int c = 0; c < lC; c++)
+                {
+                    double interpolated =
+                        w000 * numOps.ToDouble(gridData[(((z0 * lH + y0) * lW + x0) * lC) + c]) + w001 * numOps.ToDouble(gridData[(((z0 * lH + y0) * lW + x1) * lC) + c]) +
+                        w010 * numOps.ToDouble(gridData[(((z0 * lH + y1) * lW + x0) * lC) + c]) + w011 * numOps.ToDouble(gridData[(((z0 * lH + y1) * lW + x1) * lC) + c]) +
+                        w100 * numOps.ToDouble(gridData[(((z1 * lH + y0) * lW + x0) * lC) + c]) + w101 * numOps.ToDouble(gridData[(((z1 * lH + y0) * lW + x1) * lC) + c]) +
+                        w110 * numOps.ToDouble(gridData[(((z1 * lH + y1) * lW + x0) * lC) + c]) + w111 * numOps.ToDouble(gridData[(((z1 * lH + y1) * lW + x1) * lC) + c]);
+                    resData[n * lC + c] = numOps.FromDouble(interpolated);
+                }
+            });
+        }
 
-                // Weighted sum
-                double interpolated = w000 * v000 + w001 * v001 + w010 * v010 + w011 * v011 +
-                                     w100 * v100 + w101 * v101 + w110 * v110 + w111 * v111;
-
-                result[n, c] = numOps.FromDouble(interpolated);
-            }
-        });
+        grid = gridSrc; positions = posSrc;
 
         DifferentiableOps.RecordUnary("TensorTrilinearInterpolate", result, grid, BackwardFunctions<T>.TrilinearInterpolateBackward, new object[] { positions });
         { var cg = grid; var cp = positions; AutoTracer.RecordOp("TensorTrilinearInterpolate", result, eng => eng.TensorTrilinearInterpolate(cg, cp)); }
         return result;
+    }
+
+    // Native double/float row kernels for TensorTrilinearInterpolate (raw-array, no indexer/dispatch).
+    // Same clamp, weights, and left-associative 8-corner sum as the generic path => bit-exact.
+    private static void TrilinearRow(double[] g, double[] p, double[] r, int n, int D, int H, int W, int C)
+    {
+        double z = Math.Max(0, Math.Min(D - 1.001, p[n * 3 + 0]));
+        double y = Math.Max(0, Math.Min(H - 1.001, p[n * 3 + 1]));
+        double x = Math.Max(0, Math.Min(W - 1.001, p[n * 3 + 2]));
+        int z0 = (int)Math.Floor(z), y0 = (int)Math.Floor(y), x0 = (int)Math.Floor(x);
+        int z1 = Math.Min(z0 + 1, D - 1), y1 = Math.Min(y0 + 1, H - 1), x1 = Math.Min(x0 + 1, W - 1);
+        double fz = z - z0, fy = y - y0, fx = x - x0;
+        double w000 = (1 - fz) * (1 - fy) * (1 - fx), w001 = (1 - fz) * (1 - fy) * fx,
+               w010 = (1 - fz) * fy * (1 - fx), w011 = (1 - fz) * fy * fx,
+               w100 = fz * (1 - fy) * (1 - fx), w101 = fz * (1 - fy) * fx,
+               w110 = fz * fy * (1 - fx), w111 = fz * fy * fx;
+        int b000 = ((z0 * H + y0) * W + x0) * C, b001 = ((z0 * H + y0) * W + x1) * C,
+            b010 = ((z0 * H + y1) * W + x0) * C, b011 = ((z0 * H + y1) * W + x1) * C,
+            b100 = ((z1 * H + y0) * W + x0) * C, b101 = ((z1 * H + y0) * W + x1) * C,
+            b110 = ((z1 * H + y1) * W + x0) * C, b111 = ((z1 * H + y1) * W + x1) * C;
+        int rb = n * C;
+        for (int c = 0; c < C; c++)
+            r[rb + c] = w000 * g[b000 + c] + w001 * g[b001 + c] + w010 * g[b010 + c] + w011 * g[b011 + c] +
+                        w100 * g[b100 + c] + w101 * g[b101 + c] + w110 * g[b110 + c] + w111 * g[b111 + c];
+    }
+
+    private static void TrilinearRowF(float[] g, float[] p, float[] r, int n, int D, int H, int W, int C)
+    {
+        double z = Math.Max(0, Math.Min(D - 1.001, p[n * 3 + 0]));
+        double y = Math.Max(0, Math.Min(H - 1.001, p[n * 3 + 1]));
+        double x = Math.Max(0, Math.Min(W - 1.001, p[n * 3 + 2]));
+        int z0 = (int)Math.Floor(z), y0 = (int)Math.Floor(y), x0 = (int)Math.Floor(x);
+        int z1 = Math.Min(z0 + 1, D - 1), y1 = Math.Min(y0 + 1, H - 1), x1 = Math.Min(x0 + 1, W - 1);
+        double fz = z - z0, fy = y - y0, fx = x - x0;
+        double w000 = (1 - fz) * (1 - fy) * (1 - fx), w001 = (1 - fz) * (1 - fy) * fx,
+               w010 = (1 - fz) * fy * (1 - fx), w011 = (1 - fz) * fy * fx,
+               w100 = fz * (1 - fy) * (1 - fx), w101 = fz * (1 - fy) * fx,
+               w110 = fz * fy * (1 - fx), w111 = fz * fy * fx;
+        int b000 = ((z0 * H + y0) * W + x0) * C, b001 = ((z0 * H + y0) * W + x1) * C,
+            b010 = ((z0 * H + y1) * W + x0) * C, b011 = ((z0 * H + y1) * W + x1) * C,
+            b100 = ((z1 * H + y0) * W + x0) * C, b101 = ((z1 * H + y0) * W + x1) * C,
+            b110 = ((z1 * H + y1) * W + x0) * C, b111 = ((z1 * H + y1) * W + x1) * C;
+        int rb = n * C;
+        // Interp accumulated in double (matching numOps.ToDouble path), result cast to float.
+        for (int c = 0; c < C; c++)
+            r[rb + c] = (float)(w000 * g[b000 + c] + w001 * g[b001 + c] + w010 * g[b010 + c] + w011 * g[b011 + c] +
+                                w100 * g[b100 + c] + w101 * g[b101 + c] + w110 * g[b110 + c] + w111 * g[b111 + c]);
     }
 
     /// <inheritdoc/>
