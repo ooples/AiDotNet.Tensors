@@ -184,8 +184,15 @@ internal static class GotoGemmFp32
         for (int r = 0; r < mFull; r++) { float* cr = c + (long)(ic + r) * ldc + jc; for (int col = nFull; col < effNc; col++) cr[col] = 0f; }
     }
 
-    /// <summary>True when the machine-code microkernel is available on this CPU/OS (AVX2+FMA, Windows x64).</summary>
-    internal static unsafe bool IsAvailable => MachineKernelGemm.IsFp32Available && Kernel() != null;
+    /// <summary>True when the machine-code microkernel is available on this CPU/OS (AVX2+FMA, Windows x64).
+    /// The tile kernels (EmitFp32TileWindows/EmitBf16BTileWindows) use the Microsoft x64 ABI — RCX/RDX/R8/R9
+    /// args + the 5th arg (kc) read from the [rsp+0x28] shadow space — so they are ONLY valid when invoked
+    /// via the platform-default unmanaged convention on Windows. On Linux/macOS that convention is SysV
+    /// (no shadow space, different arg registers), so calling these kernels there reads garbage → SIGSEGV.
+    /// Gate to Windows until a SysV tile kernel exists; non-Windows falls back to MachineKernelGemm/PackBoth.</summary>
+    internal static unsafe bool IsAvailable =>
+        System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows)
+        && MachineKernelGemm.IsFp32Available && Kernel() != null;
 
     /// <summary>
     /// Single-thread C = A·B (row-major). A[M,K] lda, B[K,N] ldb, C[M,N] ldc (element strides).
