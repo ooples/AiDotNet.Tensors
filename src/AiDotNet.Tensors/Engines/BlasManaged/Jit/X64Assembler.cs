@@ -414,6 +414,12 @@ internal sealed class X64Assembler
     /// <summary>vxorps ymm_dst, s1, s2. VEX.256.0F.WIG 57 /r. Zeroes a register via dst,dst,dst.</summary>
     internal void Vxorps(int dst, int s1, int s2) => VexRR(Map0F, PpNone, 0, 1, 0x57, dst, s1, s2);
 
+    /// <summary>vaddps ymm_dst, s1, s2 (dst = s1 + s2). VEX.256.0F.WIG 58 /r. For fused bias.</summary>
+    internal void Vaddps(int dst, int s1, int s2) => VexRR(Map0F, PpNone, 0, 1, 0x58, dst, s1, s2);
+
+    /// <summary>vmaxps ymm_dst, s1, s2 (dst = max(s1, s2)). VEX.256.0F.WIG 5F /r. For fused ReLU.</summary>
+    internal void Vmaxps(int dst, int s1, int s2) => VexRR(Map0F, PpNone, 0, 1, 0x5F, dst, s1, s2);
+
     /// <summary>vbroadcastss ymm_dst, [base+disp8]. VEX.256.66.0F38.W0 18.</summary>
     internal void VbroadcastSs(int dst, int baseReg, sbyte disp8) => VexMemDisp8(Map0F38, Pp66, 0, 1, 0x18, dst, baseReg, disp8);
 

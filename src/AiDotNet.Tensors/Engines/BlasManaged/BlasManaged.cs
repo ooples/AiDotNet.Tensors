@@ -407,15 +407,37 @@ public static partial class BlasManaged
             && n <= JitMaxN && m <= JitMaxM && k <= JitMaxK
             && JitGemmGenerator.IsSupported)
         {
-            bool jitOk = false;
+            var jitEpi = options.Epilogue;
+            var eflags = EpilogueFlagsCompute.Compute<T>(in jitEpi);
+            bool jitOk = false, fused = false;
             if (typeof(T) == typeof(float) && (n & 7) == 0)
+            {
+                // Phase 4: fuse bias + ReLU into the kernel store when the epilogue is ONLY those
+                // (no skip/dropout/scale, activation None or ReLU). Anything else → plain JIT + Apply.
+                bool fuseable = (eflags & ~(EpilogueFlags.HasBias | EpilogueFlags.HasActivation)) == 0
+                    && (jitEpi.Activation == FusedActivationType.None || jitEpi.Activation == FusedActivationType.ReLU);
+                bool wantBias = (eflags & EpilogueFlags.HasBias) != 0;
+                bool wantRelu = jitEpi.Activation == FusedActivationType.ReLU;
+                System.ReadOnlySpan<float> biasSpan = (fuseable && wantBias) ? MemoryMarshal.Cast<T, float>(jitEpi.BiasN) : default;
                 unsafe
                 {
                     fixed (float* pa = MemoryMarshal.Cast<T, float>(a))
                     fixed (float* pb = MemoryMarshal.Cast<T, float>(b))
                     fixed (float* pc = MemoryMarshal.Cast<T, float>(c))
-                        jitOk = JitGemmGenerator.TryRunFp32(pa, lda, pb, ldb, pc, ldc, m, n, k);
+                    fixed (float* pbias = biasSpan)
+                    {
+                        if (fuseable)
+                        {
+                            jitOk = JitGemmGenerator.TryRunFp32(pa, lda, pb, ldb, pc, ldc, m, n, k, wantBias ? pbias : null, wantRelu);
+                            fused = jitOk;
+                        }
+                        else
+                        {
+                            jitOk = JitGemmGenerator.TryRunFp32(pa, lda, pb, ldb, pc, ldc, m, n, k);
+                        }
+                    }
                 }
+            }
             else if (typeof(T) == typeof(double) && (n & 3) == 0)
                 unsafe
                 {
@@ -426,8 +448,7 @@ public static partial class BlasManaged
                 }
             if (jitOk)
             {
-                var jitEpi = options.Epilogue;
-                EpilogueChain.Apply<T>(c, ldc, m, n, in jitEpi);
+                if (!fused) EpilogueChain.Apply<T>(c, ldc, m, n, in jitEpi);
                 return;
             }
         }
