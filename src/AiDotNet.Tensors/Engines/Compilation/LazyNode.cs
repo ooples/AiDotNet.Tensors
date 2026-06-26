@@ -174,7 +174,13 @@ internal sealed class LazyNode<T> : ILazyNode
         // RecordInPlace overwrites target.LazySource (self-loop).
         if (_externalPrerequisite is { IsRealized: false } pre && !ReferenceEquals(pre, this))
             pre.Realize(engine);
-        if (Input0.LazySource is ILazyNode n0 && !n0.IsRealized && !ReferenceEquals(n0, this)) n0.Realize(engine);
+        // In-place op (Input0 IS the mutated target/output): the prior producer
+        // of the target is _externalPrerequisite (realized above). Input0.LazySource
+        // instead resolves to the LATEST in-place writer of the target — for an
+        // EARLIER op in an in-place chain that is a LATER node, so following it
+        // would recurse into a not-yet-realized successor. Skip it.
+        bool input0IsInPlaceTarget = ReferenceEquals(Input0, Output);
+        if (!input0IsInPlaceTarget && Input0.LazySource is ILazyNode n0 && !n0.IsRealized && !ReferenceEquals(n0, this)) n0.Realize(engine);
         if (Input1?.LazySource is ILazyNode n1 && !n1.IsRealized && !ReferenceEquals(n1, this)) n1.Realize(engine);
         if (Input2?.LazySource is ILazyNode n2 && !n2.IsRealized && !ReferenceEquals(n2, this)) n2.Realize(engine);
         if (InputsOverflow != null)
@@ -191,7 +197,16 @@ internal sealed class LazyNode<T> : ILazyNode
         // not see a phantom self-edge for in-place ops where Input0 == Output.
         if (_externalPrerequisite is ILazyNode pre && !ReferenceEquals(pre, this))
             nodes.Add(pre);
-        if (Input0.LazySource is ILazyNode n0 && !ReferenceEquals(n0, this)) nodes.Add(n0);
+        // In-place op (Input0 IS the mutated target/output): its prior producer is
+        // _externalPrerequisite (added above). Input0.LazySource resolves to the
+        // LATEST in-place writer of the target tensor; for the FIRST op in an
+        // in-place chain that is a LATER node — a false back-edge that turns the
+        // chain into a topo-sort cycle (e.g. M1↔A1 for runningVar *= m; += v), so
+        // Kahn's reordering pass schedules NEITHER and silently DROPS the whole
+        // in-place chain from the compiled plan. The dropped EMA never executes,
+        // leaving the persistent running-stat tensor stale (BatchNorm clone bug).
+        bool input0IsInPlaceTarget = ReferenceEquals(Input0, Output);
+        if (!input0IsInPlaceTarget && Input0.LazySource is ILazyNode n0 && !ReferenceEquals(n0, this)) nodes.Add(n0);
         if (Input1?.LazySource is ILazyNode n1 && !ReferenceEquals(n1, this)) nodes.Add(n1);
         if (Input2?.LazySource is ILazyNode n2 && !ReferenceEquals(n2, this)) nodes.Add(n2);
         if (InputsOverflow != null)
