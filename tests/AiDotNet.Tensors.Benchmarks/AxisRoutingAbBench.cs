@@ -543,6 +543,45 @@ public static class AxisRoutingAbBench
         Console.WriteLine($"  per-busy-core {flops / (wall / iters) / 1e9 / busyCores:F1} GF/s/core   (OB on this box ~59/core)");
     }
 
+    /// <summary>
+    /// #85 routing fix A/B: GotoGemmFp32.RunParallel (per-tile private pack) vs the N-axis path
+    /// (shared-A) for thin-M m%6==0 shapes. PerfView pinned RunParallel's redundant per-tile A-repack
+    /// (~50x for wide-N) as the per-core killer; N-axis shares A. Toggled in-process via
+    /// BlasManaged.s_disableGotoGemm. Confirms the win + the M boundary before retuning BeatsPackBoth.
+    /// Run <c>--ab-goto-vs-naxis</c>.
+    /// </summary>
+    public static void GotoVsNaxisSweep()
+    {
+        Console.WriteLine("=== #85 GotoGemm RunParallel vs N-axis (thin-M, shared-A) ===");
+        CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
+        var shapes = new (string label, int m, int n, int k)[]
+        {
+            ("384x1024x1024 n=k  ", 384, 1024, 1024),
+            ("384x2048x1024 n=2k ", 384, 2048, 1024),
+            ("384x4096x1536 ffn  ", 384, 4096, 1536),
+            ("384x6144x1536 ffn-up", 384, 6144, 1536),
+            ("768x2048x2048 m=768", 768, 2048, 2048),
+            ("768x4096x1024 tall ", 768, 4096, 1024),
+            ("1536x1536x1536 sq  ", 1536, 1536, 1536),
+        };
+        foreach (var (label, m, n, k) in shapes)
+        {
+            var a = MakeRandom(m * k); var b = MakeRandom(k * n); var c = new float[m * n];
+            double flops = 2.0 * m * n * k;
+            double bestG = 0, bestN = 0;
+            for (int rep = 0; rep < 3; rep++)
+            {
+                BlasManaged.s_disableGotoGemm = false; // GotoGemmFp32 path
+                bestG = Math.Max(bestG, flops / TimeMinGemm(a, b, c, m, n, k) / 1e9);
+                BlasManaged.s_disableGotoGemm = true;  // PackBoth (N-axis for thin-M wide-N)
+                bestN = Math.Max(bestN, flops / TimeMinGemm(a, b, c, m, n, k) / 1e9);
+            }
+            BlasManaged.s_disableGotoGemm = false;
+            string winner = bestN > bestG ? "N-axis" : "GotoGemm";
+            Console.WriteLine($"  {label}: GotoGemm {bestG,5:F0}  N-axis {bestN,5:F0} GF/s  ({bestN / bestG:F2}x)  -> {winner}");
+        }
+    }
+
     private static double Gf(double flops, double sec) => flops / sec / 1e9;
 
     private static unsafe double TimeMinNative(float[] a, float[] b, float[] c, int m, int n, int k)

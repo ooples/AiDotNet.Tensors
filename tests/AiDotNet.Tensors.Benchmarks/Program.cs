@@ -140,6 +140,13 @@ class Program
             return;
         }
 
+        // #85 GotoGemm RunParallel vs N-axis (thin-M shared-A) routing A/B. (--ab-goto-vs-naxis)
+        if (args[0] == "--ab-goto-vs-naxis")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.GotoVsNaxisSweep();
+            return;
+        }
+
         if (args[0] == "--ab-aiseval-dopsweep")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.DopSweep();
