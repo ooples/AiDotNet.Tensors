@@ -1366,6 +1366,32 @@ internal static class AisEvalHeadToHeadBench
             double g = gf3 / (goto3 / 1000), p = gf3 / (pb3 / 1000), mk = gf3 / (mkl3 / 1000);
             Console.WriteLine($"   {dtag,-8} GotoGemm={g,6:F0}GF  PackBoth={p,6:F0}GF  MKL={mk,6:F0}GF  goto/pb={g / p,4:F2}x  → route to {(g > p * 1.05 ? "GotoGemm" : "PackBoth")}");
         }
+        // SPLIT-K A/B (same run): deep-K short-M is under-parallelized; does split-K (shape-based G) beat
+        // per-tile RunParallel + stay correct? Shapes: mlp2 + a deeper synthetic.
+        Console.WriteLine("--- SPLIT-K: RunParallel (per-tile) vs RunParallelSplitK vs MKL (deep-K short-M) ---");
+        var skShapes = new (int m, int n, int k, string tag)[] { (256, 1152, 4608, "mlp2 k=4608"), (256, 1152, 9216, "deep k=9216"), (512, 1152, 8192, "m512 k=8192") };
+        foreach (var (dm, dn, dk, dtag) in skShapes)
+        {
+            if (!AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.ShouldSplitK(dm, dn, dk)) { Console.WriteLine($"   {dtag,-12} (ShouldSplitK=false, skipped)"); continue; }
+            float[] A4 = R((long)dm * dk, rng), B4 = R((long)dk * dn, rng), Cp = new float[(long)dm * dn], Cs = new float[(long)dm * dn];
+            using var t4a = torch.tensor(A4).reshape(dm, dk); using var t4b = torch.tensor(B4).reshape(dk, dn);
+            var (mc4, nc4, kc4) = AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.ChooseParallelBlocks(dm, dn);
+            int G = AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.SplitKGroups(dm, dn, dk);
+            double gf4 = 2.0 * dm * dn * dk / 1e9, relErr;
+            double pt, sk; fixed (float* pa = A4, pb = B4, pcp = Cp, pcs = Cs)
+            {
+                var paL = (nint)pa; var pbL = (nint)pb; var pcpL = (nint)pcp; var pcsL = (nint)pcs;
+                AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.RunParallel((float*)paL, dk, (float*)pbL, dn, (float*)pcpL, dn, dm, dn, dk, mc4, nc4, kc4);
+                AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.RunParallelSplitK((float*)paL, dk, (float*)pbL, dn, (float*)pcsL, dn, dm, dn, dk, mc4, nc4, kc4);
+                double se = 0, sr = 0; for (long i = 0; i < (long)dm * dn; i += 7) { double e = (double)Cs[i] - Cp[i]; se += e * e; sr += (double)Cp[i] * Cp[i]; }
+                relErr = sr > 0 ? Math.Sqrt(se / sr) : 0;
+                pt = Min(() => AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.RunParallel((float*)paL, dk, (float*)pbL, dn, (float*)pcpL, dn, dm, dn, dk, mc4, nc4, kc4), 6);
+                sk = Min(() => AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.RunParallelSplitK((float*)paL, dk, (float*)pbL, dn, (float*)pcsL, dn, dm, dn, dk, mc4, nc4, kc4), 6);
+            }
+            double mkl4 = Min(() => { using var _ = torch.matmul(t4a, t4b); }, 6);
+            double ptG = gf4 / (pt / 1000), skG = gf4 / (sk / 1000), mkG = gf4 / (mkl4 / 1000);
+            Console.WriteLine($"   {dtag,-12} G={G} per-tile={ptG,6:F0}GF  split-K={skG,6:F0}GF  MKL={mkG,6:F0}GF  sk/pt={skG / ptG,4:F2}x  sk/MKL={skG / mkG * 100,3:F0}%  relErr={relErr:E1}");
+        }
     }
 
     private static (double median, double p95) TimeAi(Func<Tensor<float>> forward)

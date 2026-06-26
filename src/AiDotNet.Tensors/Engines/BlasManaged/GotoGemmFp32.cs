@@ -305,6 +305,74 @@ internal static class GotoGemmFp32
         }, deterministicSafe: true);
     }
 
+    /// <summary>Deep-K + short-M is UNDER-PARALLELIZED (few (m/mc)·(n/nc) tiles for many cores). Split-K
+    /// helps there. The split count G is derived from the SHAPE ONLY (never the thread/core count) so the
+    /// reduction order is fixed ⇒ the result is thread-count-INDEPENDENT (Deterministic-mode safe).</summary>
+    internal static bool ShouldSplitK(int m, int n, int k)
+        => m <= 512 && k >= 4 * Math.Max(m, n) && (long)m * n * k >= ParallelMinWork;
+
+    internal static int SplitKGroups(int m, int n, int k)
+        => Math.Min(4, Math.Max(2, (int)Math.Round((double)k / (2 * Math.Max(m, n)))));
+
+    /// <summary>Split-K GEMM: G shape-based K-groups computed as G partial products in parallel
+    /// ((tile×G) work units instead of tiles), then summed in fixed g-order. For the deep-K short-M shapes
+    /// (e.g. the DiT MLP down-projection) this fills the cores the per-tile scheme leaves idle. Deterministic
+    /// (G is shape-only; each partial is a fixed-K-order tile; the reduction order is fixed).</summary>
+    internal static unsafe void RunParallelSplitK(
+        float* a, int lda, float* b, int ldb, float* c, int ldc, int m, int n, int k, int mc, int nc, int kc)
+    {
+        int G = SplitKGroups(m, n, k);
+        int kg = (k + G - 1) / G;
+        int numIc = (m + mc - 1) / mc, numJc = (n + nc - 1) / nc, totalTiles = numIc * numJc;
+        long mn = (long)m * n;
+        float[] tmp = ArrayPool<float>.Shared.Rent(checked((int)(mn * G)));
+        try
+        {
+            fixed (float* pt = tmp)
+            {
+                nint ai = (nint)a, bi = (nint)b, ti = (nint)pt;
+                int numIcL = numIc, mcL = mc, ncL = nc, kcL = kc, mL = m, nL = n, kL = k, ldaL = lda, ldbL = ldb, GL = G, kgL = kg;
+                // (tile, g) → partial C-tile for K-range [g*kg, …) into tmp[g] (disjoint per g, per tile).
+                CpuParallelSettings.ParallelForOrSerial(0, totalTiles * G, (long)m * n * k, taskIdx =>
+                {
+                    int g = taskIdx % GL;
+                    int tile = taskIdx / GL;
+                    int ic = (tile % numIcL) * mcL;
+                    int jc = (tile / numIcL) * ncL;
+                    int effMc = Math.Min(mcL, mL - ic);
+                    int effNc = Math.Min(ncL, nL - jc);
+                    if (effMc <= 0 || effNc <= 0) return;
+                    int k0 = g * kgL; int kThis = Math.Min(kgL, kL - k0); if (kThis <= 0) return;
+                    float* gbuf = (float*)ti + (long)g * mL * nL;
+                    RunTile((float*)ai + k0, ldaL, (float*)bi + (long)k0 * ldbL, ldbL, gbuf, nL, ic, jc, effMc, effNc, kThis, mcL, ncL, kcL);
+                }, deterministicSafe: true);
+                // C = Σ_g tmp[g] in fixed g order (deterministic), parallel over rows.
+                nint ci = (nint)c; int mL2 = m, nL2 = n, GL2 = G, ldcL = ldc;
+                CpuParallelSettings.ParallelForOrSerial(0, m, (long)m * n * G, i =>
+                {
+                    float* cp = (float*)ci + (long)i * ldcL;
+                    float* t0 = (float*)ti + (long)i * nL2;
+                    long stride = (long)mL2 * nL2;
+                    int j = 0;
+                    if (Avx.IsSupported)
+                        for (; j + 8 <= nL2; j += 8)
+                        {
+                            var acc = Avx.LoadVector256(t0 + j);
+                            for (int g = 1; g < GL2; g++) acc = Avx.Add(acc, Avx.LoadVector256(t0 + g * stride + j));
+                            Avx.Store(cp + j, acc);
+                        }
+                    for (; j < nL2; j++)
+                    {
+                        float s = t0[j];
+                        for (int g = 1; g < GL2; g++) s += t0[g * stride + j];
+                        cp[j] = s;
+                    }
+                }, deterministicSafe: true);
+            }
+        }
+        finally { ArrayPool<float>.Shared.Return(tmp); }
+    }
+
     /// <summary>Compute one disjoint (effMc×effNc) C-tile at (ic,jc): C[tile] = A[ic:, :]·B[:, jc:] over
     /// the full K, packing this tile's A and B panels into per-call L2 buffers. C is zeroed on the first
     /// K-panel then accumulated, so the tile is self-contained and deterministic (fixed K order). Shared
