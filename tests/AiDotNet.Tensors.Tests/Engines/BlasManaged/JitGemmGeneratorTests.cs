@@ -1,3 +1,7 @@
+// The JIT machine-code GEMM generator is net5+ only (it needs System.Runtime.Intrinsics),
+// so the BlasManaged.Jit namespace does not exist on net471. Guard the whole file to match
+// the src guard on JitGemmGenerator (#if NET5_0_OR_GREATER); otherwise net471 fails CS0234.
+#if NET5_0_OR_GREATER
 using System;
 using AiDotNet.Tensors.Engines.BlasManaged;
 using AiDotNet.Tensors.Engines.BlasManaged.Jit;
@@ -123,3 +127,4 @@ public class JitGemmGeneratorTests
         Assert.False(JitGemmGenerator.TryRunBf16(a, b, c, 2, 8, 2));
     }
 }
+#endif
