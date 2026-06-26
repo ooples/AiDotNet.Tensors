@@ -64,6 +64,16 @@ class Program
             return;
         }
 
+        // Single-thread GEMM profile repro for PerfView CPU-counter sampling.
+        // --profile-gemm-st [seconds=25] [shape=ffn-up|ffn-big|square|attn|medium]
+        if (args[0] == "--profile-gemm-st")
+        {
+            int secs = args.Length > 1 && int.TryParse(args[1], out var s) ? s : 25;
+            string shape = args.Length > 2 ? args[2] : "ffn-up";
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.ProfileSingleThread(secs, shape);
+            return;
+        }
+
         if (args[0] == "--ab-aiseval-dopsweep")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.DopSweep();

@@ -69,6 +69,50 @@ public static class AxisRoutingAbBench
         }
     }
 
+    /// <summary>
+    /// Single-thread GEMM profiling repro — pins MaxDOP=1 and hammers one shape through the
+    /// managed PackBoth path for a fixed wall-time, so a PMU profiler (PerfView CPU-counter
+    /// sampling) can attribute the single-core stall (the ~72 vs OpenBLAS ~103 GF/s gap).
+    /// Run: <c>--profile-gemm-st [seconds=25] [shape=ffn-up|ffn-big|square|attn|medium]</c>.
+    /// </summary>
+    public static void ProfileSingleThread(int seconds, string shape)
+    {
+        CpuParallelSettings.MaxDegreeOfParallelism = 1; // profile the single-core path
+        (int m, int n, int k) = shape switch
+        {
+            "ffn-big" => (384, 4096, 3456),
+            "square"  => (1024, 1024, 1024),
+            "attn"    => (256, 1536, 1536),
+            "medium"  => (384, 1024, 1024),
+            _         => (384, 6144, 1536), // ffn-up
+        };
+        var a = MakeRandom(m * k);
+        var b = MakeRandom(k * n);
+        var c = new float[m * n];
+        double flops = 2.0 * m * n * k;
+        Console.WriteLine($"=== single-thread GEMM profile repro: {shape} {m}x{n}x{k}  MaxDOP={CpuParallelSettings.MaxDegreeOfParallelism}  {seconds}s ===");
+        for (int i = 0; i < 5; i++) GemmOnce(a, b, c, m, n, k); // warm
+        var total = Stopwatch.StartNew();
+        var one = new Stopwatch();
+        long iters = 0;
+        double bestSec = double.MaxValue;
+        while (total.Elapsed.TotalSeconds < seconds)
+        {
+            one.Restart();
+            GemmOnce(a, b, c, m, n, k);
+            one.Stop();
+            bestSec = Math.Min(bestSec, one.Elapsed.TotalSeconds);
+            iters++;
+        }
+        Console.WriteLine($"iters={iters}  best {flops / bestSec / 1e9:F1} GF/s  avg {flops / (total.Elapsed.TotalSeconds / iters) / 1e9:F1} GF/s  (sink {c[0]:E2})");
+    }
+
+    private static void GemmOnce(float[] a, float[] b, float[] c, int m, int n, int k)
+    {
+        var opts = new BlasOptions<float> { PackingMode = PackingMode.DisableAutotune };
+        BlasManaged.Gemm<float>(a, k, false, b, n, false, c, n, m, n, k, in opts);
+    }
+
     private static double Gf(double flops, double sec) => flops / sec / 1e9;
 
     private static unsafe double TimeMinNative(float[] a, float[] b, float[] c, int m, int n, int k)
