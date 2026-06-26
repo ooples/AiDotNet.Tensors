@@ -4730,6 +4730,254 @@ public partial class CpuEngine : ITensorLevelEngine
         }
     }
 
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Inference fast path (#1672): writes SDPA output into a caller-owned resident buffer,
+    /// reusing the internal ArrayPool scores scratch — no scores/weights/output tensor
+    /// allocations. The float path delegates to <see cref="ScaledDotProductAttentionFloatInto"/>
+    /// (the exact per-head GEMM + numerically-stable softmax kernel the allocating overload
+    /// uses), so its result is bit-identical. Other numeric types fall back to the allocating
+    /// <see cref="ScaledDotProductAttention{T}"/> and copy into the destination — still correct,
+    /// just without the alloc saving. This overload does not record on the autodiff tape; it is
+    /// only invoked on the no-tape inference forward.
+    /// </remarks>
+    public void ScaledDotProductAttentionInto<T>(
+        Tensor<T> destination,
+        Tensor<T> query,
+        Tensor<T> key,
+        Tensor<T> value,
+        double? scale)
+    {
+        if (destination == null) throw new ArgumentNullException(nameof(destination));
+        if (query == null) throw new ArgumentNullException(nameof(query));
+        if (key == null) throw new ArgumentNullException(nameof(key));
+        if (value == null) throw new ArgumentNullException(nameof(value));
+        if (!destination.IsContiguous) throw new InvalidOperationException("Destination tensor must be contiguous.");
+
+        if (query.Rank != 4 || key.Rank != 4 || value.Rank != 4)
+            throw new ArgumentException("Query, Key, and Value must be 4D tensors [batch, heads, seq, d_k/d_v]");
+
+        int batch = query._shape[0];
+        int heads = query._shape[1];
+        int seqQ = query._shape[2];
+        int d_k = query._shape[3];
+        int seqK = key._shape[2];
+        int d_v = value._shape[3];
+
+        if (key._shape[0] != batch || key._shape[1] != heads || key._shape[3] != d_k)
+            throw new ArgumentException("Key shape mismatch with Query");
+        if (value._shape[0] != batch || value._shape[1] != heads || value._shape[2] != seqK)
+            throw new ArgumentException("Value shape mismatch with Key");
+
+        long outLen = (long)batch * heads * seqQ * d_v;
+        if (destination.Length != outLen)
+            throw new ArgumentException(
+                $"Destination length ({destination.Length}) must equal [batch,heads,seqQ,d_v] = {outLen}.");
+
+        double scaleVal = scale ?? (1.0 / Math.Sqrt(d_k));
+
+        if (typeof(T) == typeof(float))
+        {
+            var qf = (Tensor<float>)(object)query;
+            var kf = (Tensor<float>)(object)key;
+            var vf = (Tensor<float>)(object)value;
+            var df = (Tensor<float>)(object)destination;
+
+            // Stride-aware QKV access (#1672): the inputs almost always arrive as a
+            // reshape+permute view [B,T,H,D]→[B,H,T,D] whose innermost dim D is still
+            // contiguous (stride 1) while the head/seq permute makes the WHOLE tensor
+            // non-contiguous. Materializing a contiguous copy of each (the old
+            // Contiguous() calls) cost ~9% of the DiT critical path. Instead we index
+            // each per-head [seq,d] slice directly through the backing array using the
+            // view's row stride (Strides[2]) as the GEMM leading dimension — no copy.
+            // We only require the d-dimension to be contiguous (Strides[3] == 1, which
+            // BLAS lda addressing assumes); if any operand violates that we fall back
+            // to a contiguous copy of THAT operand so the result stays bit-identical.
+            var qa = ResolveStridedAttnOperand(qf, seqQ, d_k, out int qBase, out int qBatchStride, out int qHeadStride, out int qRowStride);
+            var ka = ResolveStridedAttnOperand(kf, seqK, d_k, out int kBase, out int kBatchStride, out int kHeadStride, out int kRowStride);
+            var va = ResolveStridedAttnOperand(vf, seqK, d_v, out int vBase, out int vBatchStride, out int vHeadStride, out int vRowStride);
+            // GetDataArray() on the (contiguous, freshly-owned) destination returns the
+            // backing array; the *Into kernel writes outBuf[oOff..] per head.
+            ScaledDotProductAttentionFloatInto(
+                qa, qBase, qBatchStride, qHeadStride, qRowStride,
+                ka, kBase, kBatchStride, kHeadStride, kRowStride,
+                va, vBase, vBatchStride, vHeadStride, vRowStride,
+                df.GetDataArray(),
+                mask: null, scaleValue: scaleVal,
+                batch, heads, seqQ, d_k, seqK, d_v);
+            return;
+        }
+
+        // Generic / double fallback: allocate via the existing overload, copy out, release.
+        var result = ScaledDotProductAttention(query, key, value, mask: null, scale: scaleVal, out var weights);
+        try
+        {
+            result.Data.Span.CopyTo(destination.Data.Span);
+        }
+        finally
+        {
+            TensorAllocator.Return(result);
+            if (weights != null) TensorAllocator.Return(weights);
+        }
+    }
+
+    /// <summary>
+    /// Resolves a 4-D attention operand [batch, heads, seq, depth] to the raw float
+    /// backing array plus the addressing parameters the float SDPA kernel uses to
+    /// index it WITHOUT a contiguous copy. <paramref name="baseOffset"/> is the
+    /// storage offset of element [0,0,0,0]; <paramref name="batchStride"/> /
+    /// <paramref name="headStride"/> / <paramref name="rowStride"/> are the
+    /// per-batch / per-head / per-seq-row storage strides. The per-head base for
+    /// (b,h) is <c>baseOffset + b*batchStride + h*headStride</c>, and the depth
+    /// dimension is required to be contiguous (stride 1) so each per-head slice is a
+    /// standard row-major [seq, depth] matrix with leading dimension
+    /// <paramref name="rowStride"/> — exactly what BLAS lda/ldb expect. When the
+    /// operand is not a CPU tensor or its depth dim is not unit-stride, we
+    /// materialize a contiguous copy of THIS operand and return its standard packed
+    /// strides, keeping the result bit-identical.
+    /// </summary>
+    private static float[] ResolveStridedAttnOperand(
+        Tensor<float> t, int seq, int depth,
+        out int baseOffset, out int batchStride, out int headStride, out int rowStride)
+    {
+        // Strides are logical [B, H, S, D]. BLAS lda addressing needs the innermost
+        // (depth) dimension contiguous. The reshape+permute view satisfies this
+        // (D keeps stride 1); a slice/transpose that breaks it is rare but handled.
+        var strides = t.Strides;
+        if (strides[3] == 1)
+        {
+            var backing = t.GetCpuBackingForStridedRead(out int off);
+            if (backing != null)
+            {
+                baseOffset = off;
+                batchStride = strides[0];
+                headStride = strides[1];
+                rowStride = strides[2];
+                return backing;
+            }
+        }
+
+        // Fallback: materialize a contiguous copy of just this operand. Its strides
+        // are then packed row-major: batchStride = heads*seq*depth, headStride =
+        // seq*depth, rowStride = depth, baseOffset = 0.
+        var contig = t.Contiguous();
+        baseOffset = 0;
+        batchStride = t._shape[1] * seq * depth;
+        headStride = seq * depth;
+        rowStride = depth;
+        return contig.GetFlattenedData();
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Inference fast path (#1672): the trailing-repeat broadcast multiply of
+    /// <see cref="TensorBroadcastMultiply{T}"/> written into a caller-owned destination
+    /// (shape == <paramref name="a"/>'s shape). Identical SIMD tile kernel, so bit-identical.
+    /// Falls back to the allocating overload + copy when the inputs are not the trailing-repeat
+    /// pattern. No tape recording (no-tape inference forward only).
+    /// </remarks>
+    public void TensorBroadcastMultiplyInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
+    {
+        if (destination == null) throw new ArgumentNullException(nameof(destination));
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (b == null) throw new ArgumentNullException(nameof(b));
+        if (!destination.IsContiguous) throw new InvalidOperationException("Destination tensor must be contiguous.");
+        if (destination.Length != a.Length)
+            throw new ArgumentException(
+                $"Destination length ({destination.Length}) must equal a.Length ({a.Length}).");
+
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
+
+        if (TryBroadcastTrailingRepeat(a, b, out int bTileSize))
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            var aSpan = a.AsSpan();
+            var bSpan = b.AsSpan();
+            var rSpan = destination.AsWritableSpan();
+            int numTiles = a.Length / bTileSize;
+            for (int t = 0; t < numTiles; t++)
+            {
+                int off = t * bTileSize;
+                numOps.Multiply(aSpan.Slice(off, bTileSize), bSpan, rSpan.Slice(off, bTileSize));
+            }
+            return;
+        }
+
+        var result = TensorBroadcastMultiply(a, b);
+        try { result.Data.Span.CopyTo(destination.Data.Span); }
+        finally { TensorAllocator.Return(result); }
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Inference fast path (#1672): the trailing-repeat broadcast add of
+    /// <see cref="TensorBroadcastAdd{T}"/> written into a caller-owned destination
+    /// (shape == <paramref name="a"/>'s shape). Identical SIMD tile kernel, so bit-identical.
+    /// Falls back to the allocating overload + copy when the inputs are not the trailing-repeat
+    /// pattern. No tape recording (no-tape inference forward only).
+    /// </remarks>
+    public void TensorBroadcastAddInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
+    {
+        if (destination == null) throw new ArgumentNullException(nameof(destination));
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (b == null) throw new ArgumentNullException(nameof(b));
+        if (!destination.IsContiguous) throw new InvalidOperationException("Destination tensor must be contiguous.");
+        if (destination.Length != a.Length)
+            throw new ArgumentException(
+                $"Destination length ({destination.Length}) must equal a.Length ({a.Length}).");
+
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
+
+        if (TryBroadcastTrailingRepeat(a, b, out int bTileSize))
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            var aSpan = a.AsSpan();
+            var bSpan = b.AsSpan();
+            var rSpan = destination.AsWritableSpan();
+            int numTiles = a.Length / bTileSize;
+            for (int t = 0; t < numTiles; t++)
+            {
+                int off = t * bTileSize;
+                numOps.Add(aSpan.Slice(off, bTileSize), bSpan, rSpan.Slice(off, bTileSize));
+            }
+            return;
+        }
+
+        var result = TensorBroadcastAdd(a, b);
+        try { result.Data.Span.CopyTo(destination.Data.Span); }
+        finally { TensorAllocator.Return(result); }
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Inference fast path (#1672): <see cref="TensorAddScalar{T}"/> written into a caller-owned
+    /// destination. Identical <c>numOps.AddScalar</c> SIMD kernel, so bit-identical. No tape
+    /// recording (no-tape inference forward only).
+    /// </remarks>
+    public void TensorAddScalarInto<T>(Tensor<T> destination, Tensor<T> a, T scalar)
+    {
+        if (destination == null) throw new ArgumentNullException(nameof(destination));
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (!destination.IsContiguous) throw new InvalidOperationException("Destination tensor must be contiguous.");
+        if (destination.Length != a.Length)
+            throw new ArgumentException(
+                $"Destination length ({destination.Length}) must equal a.Length ({a.Length}).");
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        if (a.IsContiguous)
+        {
+            numOps.AddScalar(a.AsSpan(), scalar, destination.AsWritableSpan());
+        }
+        else
+        {
+            var src = a._storage.GetDataArray();
+            var dst = destination.GetDataArray();
+            for (int i = 0; i < a.Length; i++) dst[i] = numOps.Add(src[a.LogicalToStorageIndex(i)], scalar);
+        }
+    }
+
     /// <summary>Subtract into pre-allocated destination. Zero allocation.</summary>
     #if !NETFRAMEWORK
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
@@ -25825,15 +26073,31 @@ public partial class CpuEngine : ITensorLevelEngine
     /// caller's copy-out — the MHA path only ever wanted the output buffer. Same per-head kernel
     /// (incl. the nested-parallel sequential-GEMM guard), so numerics are identical.
     /// </summary>
+    // Resident per-thread scores scratch for the float *Into SDPA (#1672). Replaces the
+    // per-call ArrayPool.Shared.Rent, whose first-touch on freshly-committed pages cost
+    // ~12.6% of the DiT critical path (Buffer.ZeroMemoryInternal). [ThreadStatic] so the
+    // committed pages stay warm across calls on the SAME thread and there is no cross-call
+    // aliasing between concurrent SDPA calls on different threads. The buffer is captured
+    // into the parallel closure before dispatch; the inner Parallel.For workers each write
+    // a DISJOINT [sOff, seqQ*seqK) slice, so a single shared buffer is race-free (identical
+    // ownership model to the old per-call rented buffer). Each scores element is fully
+    // written (GEMM beta=0 SET, or the negInf-row 0f fill) before it is read, so no pre-zero
+    // is needed — the resident buffer's stale contents are always overwritten in-place.
+    [ThreadStatic]
+    private static float[]? t_sdpaScoresScratch;
+
     internal void ScaledDotProductAttentionFloatInto(
-        float[] qf, float[] kf, float[] vf, float[] outBuf,
+        float[] qf, int qBase, int qBatchStride, int qHeadStride, int qRowStride,
+        float[] kf, int kBase, int kBatchStride, int kHeadStride, int kRowStride,
+        float[] vf, int vBase, int vBatchStride, int vHeadStride, int vRowStride,
+        float[] outBuf,
         Tensor<bool>? mask, double scaleValue,
         int batch, int heads, int seqQ, int d_k, int seqK, int d_v)
     {
         int bhCount = batch * heads;
         // Use long arithmetic for the score-buffer size: for large attention contexts
         // (e.g. batch=8, heads=16, seq=4096 → 2.1B floats) the 32-bit product would
-        // silently overflow and ArrayPool.Rent would see a negative size.
+        // silently overflow.
         long scoresLenL = (long)bhCount * seqQ * seqK;
         if (scoresLenL > int.MaxValue)
             throw new ArgumentOutOfRangeException(
@@ -25841,96 +26105,146 @@ public partial class CpuEngine : ITensorLevelEngine
                 $"Attention scores buffer size ({scoresLenL:N0} floats) exceeds int.MaxValue; " +
                 "reduce batch, heads, or sequence length.");
         int scoresLen = (int)scoresLenL;
-        var scratch = System.Buffers.ArrayPool<float>.Shared.Rent(scoresLen);
-        try
+        // Lazily allocate / grow the resident scratch. Growth keeps the previous capacity's
+        // committed pages warm by handing the larger buffer to subsequent calls; we never
+        // shrink (the steady-state DiT forward reaches a fixed max and reuses it).
+        var scratch = t_sdpaScoresScratch;
+        if (scratch == null || scratch.Length < scoresLen)
         {
-            float scaleF = (float)scaleValue;
-            float negInfF = float.NegativeInfinity;
-            CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqQ * d_k, bh =>
+            scratch = new float[scoresLen];
+            t_sdpaScoresScratch = scratch;
+        }
+
+        float scaleF = (float)scaleValue;
+        float negInfF = float.NegativeInfinity;
+        CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqQ * d_k, bh =>
+        {
+            int b = bh / heads;
+            int h = bh % heads;
+            // Per-head storage offsets via the operands' (possibly permuted) strides.
+            int qOff = qBase + b * qBatchStride + h * qHeadStride;
+            int kOff = kBase + b * kBatchStride + h * kHeadStride;
+            int vOff = vBase + b * vBatchStride + h * vHeadStride;
+            int sOff = bh * seqQ * seqK;
+            int oOff = bh * seqQ * d_v;
+
+            // Nested-parallel guard: identical reasoning to ScaledDotProductAttentionFloat —
+            // force the single-threaded inner GEMM when this body is itself a parallel worker.
+            bool useSequentialGemm = CpuParallelSettings.IsInParallelRegion;
+
+            // Step 1: scores = Q @ K^T → scratch. Q is [seqQ,d_k] with leading dim qRowStride,
+            // K is [seqK,d_k] (used transposed) with leading dim kRowStride; the resolver
+            // guarantees the d_k dimension is unit-stride, which is all BLAS lda/ldb require.
+            bool gemmed = !useSequentialGemm && BlasProvider.TryGemmEx(
+                m: seqQ, n: seqK, k: d_k,
+                a: qf, aOffset: qOff, lda: qRowStride, transA: false,
+                b: kf, bOffset: kOff, ldb: kRowStride, transB: true,
+                c: scratch, cOffset: sOff, ldc: seqK);
+            if (!gemmed)
             {
-                int b = bh / heads;
-                int h = bh % heads;
-                int qOff = bh * seqQ * d_k;
-                int kOff = bh * seqK * d_k;
-                int sOff = bh * seqQ * seqK;
-                int vOff = bh * seqK * d_v;
-                int oOff = bh * seqQ * d_v;
-
-                // Nested-parallel guard: identical reasoning to ScaledDotProductAttentionFloat —
-                // force the single-threaded inner GEMM when this body is itself a parallel worker.
-                bool useSequentialGemm = CpuParallelSettings.IsInParallelRegion;
-
-                // Step 1: scores = Q @ K^T → scratch (transB=true, or transpose + SgemmSequential).
-                bool gemmed = !useSequentialGemm && BlasProvider.TryGemmEx(
-                    m: seqQ, n: seqK, k: d_k,
-                    a: qf, aOffset: qOff, lda: d_k, transA: false,
-                    b: kf, bOffset: kOff, ldb: d_k, transB: true,
-                    c: scratch, cOffset: sOff, ldc: seqK);
-                if (!gemmed)
+                // SgemmSequential needs packed (row-major, leading dim == cols) inputs, so
+                // gather strided Q/K per-head slices into small reused buffers. kt holds K^T.
+                var kt = System.Buffers.ArrayPool<float>.Shared.Rent(d_k * seqK);
+                float[]? qPackRented = qRowStride != d_k
+                    ? System.Buffers.ArrayPool<float>.Shared.Rent(seqQ * d_k) : null;
+                try
                 {
-                    var kt = System.Buffers.ArrayPool<float>.Shared.Rent(d_k * seqK);
-                    try
+                    for (int i = 0; i < seqK; i++)
+                        for (int j = 0; j < d_k; j++)
+                            kt[j * seqK + i] = kf[kOff + i * kRowStride + j];
+
+                    ReadOnlySpan<float> qSpan;
+                    if (qPackRented != null)
                     {
-                        for (int i = 0; i < seqK; i++)
+                        for (int i = 0; i < seqQ; i++)
                             for (int j = 0; j < d_k; j++)
-                                kt[j * seqK + i] = kf[kOff + i * d_k + j];
-                        Engines.Simd.SimdGemm.SgemmSequential(
-                            qf.AsSpan(qOff, seqQ * d_k),
-                            kt.AsSpan(0, d_k * seqK),
-                            scratch.AsSpan(sOff, seqQ * seqK),
-                            seqQ, d_k, seqK);
+                                qPackRented[i * d_k + j] = qf[qOff + i * qRowStride + j];
+                        qSpan = qPackRented.AsSpan(0, seqQ * d_k);
                     }
-                    finally { System.Buffers.ArrayPool<float>.Shared.Return(kt); }
-                }
+                    else
+                    {
+                        qSpan = qf.AsSpan(qOff, seqQ * d_k);
+                    }
 
-                // Step 2: scale + mask + numerically-stable softmax, IN PLACE in scratch.
-                for (int i = 0; i < seqQ; i++)
+                    Engines.Simd.SimdGemm.SgemmSequential(
+                        qSpan,
+                        kt.AsSpan(0, d_k * seqK),
+                        scratch.AsSpan(sOff, seqQ * seqK),
+                        seqQ, d_k, seqK);
+                }
+                finally
                 {
-                    int rowOff = sOff + i * seqK;
-                    float maxVal = negInfF;
-                    for (int j = 0; j < seqK; j++)
-                    {
-                        float val = scratch[rowOff + j] * scaleF;
-                        if (mask != null && !mask[b, h, i, j]) val = negInfF;
-                        if (val > maxVal) maxVal = val;
-                        scratch[rowOff + j] = val;
-                    }
-                    if (float.IsNegativeInfinity(maxVal))
-                    {
-                        for (int j = 0; j < seqK; j++) scratch[rowOff + j] = 0f;
-                        continue;
-                    }
-                    float sumExp = 0f;
-                    for (int j = 0; j < seqK; j++)
-                    {
-                        float ev = MathF.Exp(scratch[rowOff + j] - maxVal);
-                        scratch[rowOff + j] = ev;
-                        sumExp += ev;
-                    }
-                    float inv = sumExp != 0f ? 1f / sumExp : 0f;
-                    for (int j = 0; j < seqK; j++) scratch[rowOff + j] *= inv;
+                    System.Buffers.ArrayPool<float>.Shared.Return(kt);
+                    if (qPackRented != null) System.Buffers.ArrayPool<float>.Shared.Return(qPackRented);
                 }
+            }
 
-                // Step 3: output = probs @ V → outBuf (TryGemmEx beta=0 / SgemmSequential self-clears).
-                bool gemmed2 = !useSequentialGemm && BlasProvider.TryGemmEx(
-                    m: seqQ, n: d_v, k: seqK,
-                    a: scratch, aOffset: sOff, lda: seqK, transA: false,
-                    b: vf, bOffset: vOff, ldb: d_v, transB: false,
-                    c: outBuf, cOffset: oOff, ldc: d_v);
-                if (!gemmed2)
+            // Step 2: scale + mask + numerically-stable softmax, IN PLACE in scratch.
+            for (int i = 0; i < seqQ; i++)
+            {
+                int rowOff = sOff + i * seqK;
+                float maxVal = negInfF;
+                for (int j = 0; j < seqK; j++)
+                {
+                    float val = scratch[rowOff + j] * scaleF;
+                    if (mask != null && !mask[b, h, i, j]) val = negInfF;
+                    if (val > maxVal) maxVal = val;
+                    scratch[rowOff + j] = val;
+                }
+                if (float.IsNegativeInfinity(maxVal))
+                {
+                    for (int j = 0; j < seqK; j++) scratch[rowOff + j] = 0f;
+                    continue;
+                }
+                float sumExp = 0f;
+                for (int j = 0; j < seqK; j++)
+                {
+                    float ev = MathF.Exp(scratch[rowOff + j] - maxVal);
+                    scratch[rowOff + j] = ev;
+                    sumExp += ev;
+                }
+                float inv = sumExp != 0f ? 1f / sumExp : 0f;
+                for (int j = 0; j < seqK; j++) scratch[rowOff + j] *= inv;
+            }
+
+            // Step 3: output = probs @ V → outBuf. V is [seqK,d_v] with leading dim vRowStride
+            // (resolver guarantees d_v unit-stride). TryGemmEx beta=0 SET / SgemmSequential
+            // self-clears, so outBuf needs no pre-zero.
+            bool gemmed2 = !useSequentialGemm && BlasProvider.TryGemmEx(
+                m: seqQ, n: d_v, k: seqK,
+                a: scratch, aOffset: sOff, lda: seqK, transA: false,
+                b: vf, bOffset: vOff, ldb: vRowStride, transB: false,
+                c: outBuf, cOffset: oOff, ldc: d_v);
+            if (!gemmed2)
+            {
+                ReadOnlySpan<float> vSpan;
+                float[]? vPackRented = null;
+                if (vRowStride != d_v)
+                {
+                    vPackRented = System.Buffers.ArrayPool<float>.Shared.Rent(seqK * d_v);
+                    for (int i = 0; i < seqK; i++)
+                        for (int j = 0; j < d_v; j++)
+                            vPackRented[i * d_v + j] = vf[vOff + i * vRowStride + j];
+                    vSpan = vPackRented.AsSpan(0, seqK * d_v);
+                }
+                else
+                {
+                    vSpan = vf.AsSpan(vOff, seqK * d_v);
+                }
+                try
                 {
                     Engines.Simd.SimdGemm.SgemmSequential(
                         scratch.AsSpan(sOff, seqQ * seqK),
-                        vf.AsSpan(vOff, seqK * d_v),
+                        vSpan,
                         outBuf.AsSpan(oOff, seqQ * d_v),
                         seqQ, seqK, d_v);
                 }
-            });
-        }
-        finally
-        {
-            System.Buffers.ArrayPool<float>.Shared.Return(scratch, clearArray: false);
-        }
+                finally
+                {
+                    if (vPackRented != null) System.Buffers.ArrayPool<float>.Shared.Return(vPackRented);
+                }
+            }
+        });
     }
 
     /// <summary>
@@ -37011,6 +37325,246 @@ public partial class CpuEngine : ITensorLevelEngine
         ApplyFusedActivationInPlace(fallbackResult, activation);
 
         return fallbackResult;
+    }
+
+    /// <summary>
+    /// <see cref="FusedLinear{T}"/> written into a caller-provided destination tensor
+    /// instead of allocating the <c>[M, N]</c> output — the dominant per-forward
+    /// allocator on the DiT/SiT inference path (issue #1672). Computes
+    /// <c>activation(input @ weights + bias)</c> straight into <paramref name="destination"/>'s
+    /// backing array. Numerics are bit-identical to <see cref="FusedLinear{T}"/>: the 2D
+    /// float/double/int8/int4 fast paths reuse the exact same GEMM tiers + bias/activation
+    /// epilogue, only the output array differs. Inference-only — there is no tape/graph
+    /// recording here; the caller must guarantee no gradient tape is active (it mirrors how
+    /// <c>SelfAttentionLayer</c> guards the SDPA <c>*Into</c> path). Any case the fast paths
+    /// don't cover (ND input, generic <typeparamref name="T"/>) falls back to the allocating
+    /// <see cref="FusedLinear{T}"/> + a copy into the destination, so correctness is preserved
+    /// (it just doesn't save the allocation for those shapes).
+    /// </summary>
+    /// <param name="destination">Pre-allocated, contiguous <c>[M, N]</c> output. Fully overwritten.</param>
+    public virtual void FusedLinearInto<T>(Tensor<T> destination, Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, FusedActivationType activation, FusedActivationParams? activationParams = null)
+    {
+        using var _opScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("FusedLinearInto");
+        if (destination == null) throw new ArgumentNullException(nameof(destination));
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (weights == null) throw new ArgumentNullException(nameof(weights));
+        if (!destination.IsContiguous) throw new InvalidOperationException("Destination tensor must be contiguous.");
+
+        if (!input.IsContiguous) input = input.Contiguous();
+        if (!weights.IsContiguous) weights = weights.Contiguous();
+
+        // 2D fast path (batch x features) for float/double — the DiT/SiT forward shapes.
+        if (input.Rank == 2 && weights.Rank == 2 && (typeof(T) == typeof(float) || typeof(T) == typeof(double)))
+        {
+            int M = input._shape[0];  // Batch size
+            int K = input._shape[1];  // Input features
+            int N = weights._shape[1]; // Output features
+
+            if (weights._shape[0] != K)
+                throw new ArgumentException($"Weight matrix shape mismatch: expected [{K}, N], got [{weights._shape[0]}, {weights._shape[1]}]");
+            if (destination.Length != (long)M * N)
+                throw new ArgumentException(
+                    $"Destination length ({destination.Length}) must equal [M, N] = {(long)M * N}.");
+
+#if NET5_0_OR_GREATER
+            // No-upcast int8 weight-only fast path (mirrors FusedLinear exactly, into dest).
+            if (typeof(T) == typeof(float))
+            {
+                var q8 = weights.GetMaterializedStreamingInt8();
+                if (q8 is not null && q8.Rows == N && q8.K == K)
+                {
+                    var inA = (float[])(object)input.GetReadOnlyDataArray();
+                    var outA = (float[])(object)destination.GetDataArray();
+                    Simd.SimdGemm.SgemmWithInt8RowScaledCachedB(
+                        inA.AsSpan(0, M * K), q8.Data, q8.Scales, outA.AsSpan(0, M * N), M, K, N);
+                    if (bias != null || activation != FusedActivationType.None)
+                    {
+                        var bA = bias != null ? (float[])(object)bias.GetReadOnlyDataArray() : null;
+                        CpuFusedOperations.ApplyBiasActivationInPlace(outA, bA, M, N, activation, activationParams);
+                    }
+                    return;
+                }
+            }
+            // No-upcast int4 weight-only fast path (mirrors FusedLinear exactly, into dest).
+            if (typeof(T) == typeof(float))
+            {
+                var q4 = weights.GetMaterializedStreamingInt4();
+                if (q4 is not null && q4.Rows == N && q4.K == K)
+                {
+                    var inA = (float[])(object)input.GetDataArray();
+                    var outA = (float[])(object)destination.GetDataArray();
+                    Simd.SimdGemm.SgemmWithInt4GroupScaledDispatch(
+                        inA, q4.Data, q4.GroupScales, q4.GroupSize, outA, M, K, N);
+                    if (bias != null || activation != FusedActivationType.None)
+                    {
+                        var bA = bias != null ? (float[])(object)bias.GetDataArray() : null;
+                        CpuFusedOperations.ApplyBiasActivationInPlace(outA, bA, M, N, activation, activationParams);
+                    }
+                    return;
+                }
+            }
+#endif
+
+            if (typeof(T) == typeof(float))
+            {
+                var inArr = (float[])(object)input.GetReadOnlyDataArray();
+                var wArr = (float[])(object)weights.GetReadOnlyDataArray();
+                var outArr = (float[])(object)destination.GetDataArray();
+
+                bool blasDone = false;
+                var _ffnGemmScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("FFN.GEMM");
+
+#if !NET471
+                if (!blasDone && _jitGemm
+                    && Simd.JitGemmAvx2.TryMultiply(inArr.AsSpan(0, M * K), wArr.AsSpan(0, K * N), outArr.AsSpan(0, M * N), M, N, K))
+                    blasDone = true;
+
+                if (!blasDone && _oneDnnGemm && (long)M * K * N >= 262_144)
+                {
+                    unsafe
+                    {
+                        fixed (float* pIn = inArr, pW = wArr, pOut = outArr)
+                        {
+                            if (OneDnnProvider.TrySgemm(pIn, pW, pOut, M, K, N))
+                                blasDone = true;
+                        }
+                    }
+                }
+#endif
+
+                if (PreferManagedInferenceGemm(M, K, N))
+                {
+                    Simd.SimdGemm.SgemmWithCachedB(
+                        inArr.AsSpan(0, M * K), wArr, outArr.AsSpan(0, M * N), M, K, N);
+                    blasDone = true;
+                }
+#if NET5_0_OR_GREATER
+                var inferPool = NativeInferencePool.Current;
+                if (!blasDone && inferPool is not null && (BlasProvider.HasRawSgemm || BlasProvider.HasNativeSgemm))
+                {
+                    unsafe
+                    {
+                        float* pW = inferPool.GetOrPin(wArr);
+                        float* pOut = inferPool.GetActivationBuffer(M * N);
+                        fixed (float* pIn = inArr)
+                        {
+                            if (BlasProvider.HasRawSgemm)
+                                BlasProvider.SgemmRaw(M, N, K, pIn, K, pW, N, pOut, N);
+                            else
+                                BlasProvider.SgemmDirect(M, N, K, pIn, K, pW, N, pOut, N);
+                        }
+                        new System.Span<float>(pOut, M * N).CopyTo(outArr.AsSpan());
+                    }
+                    blasDone = true;
+                }
+
+                if (!blasDone && BlasProvider.HasRawSgemm)
+                {
+                    unsafe
+                    {
+                        fixed (float* pIn = inArr, pW = wArr, pOut = outArr)
+                            BlasProvider.SgemmRaw(M, N, K, pIn, K, pW, N, pOut, N);
+                    }
+                    blasDone = true;
+                }
+#endif
+                if (!blasDone)
+                {
+                    if (BlasProvider.HasNativeSgemm)
+                    {
+                        unsafe
+                        {
+                            fixed (float* pIn = inArr, pW = wArr, pOut = outArr)
+                                BlasProvider.SgemmDirect(M, N, K, pIn, K, pW, N, pOut, N);
+                        }
+                    }
+                    else if (BlasProvider.IsMklVerified)
+                    {
+                        BlasProvider.MklSgemmZeroOffset(M, N, K, inArr, K, wArr, N, outArr, N);
+                    }
+                    else if (!BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
+                    {
+                        Simd.SimdGemm.SgemmWithCachedB(
+                            inArr.AsSpan(0, M * K), wArr, outArr.AsSpan(0, M * N), M, K, N);
+                    }
+                }
+
+                _ffnGemmScope.Dispose();
+
+                if (bias != null || activation != FusedActivationType.None)
+                {
+                    using var _ffnEpi = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("FFN.Epilogue");
+                    var bArr = bias != null ? (float[])(object)bias.GetReadOnlyDataArray() : null;
+                    CpuFusedOperations.ApplyBiasActivationInPlace(outArr, bArr, M, N, activation, activationParams);
+                }
+
+                return;
+            }
+
+            // double
+            {
+                var inArr = (double[])(object)input.GetReadOnlyDataArray();
+                var wArr = (double[])(object)weights.GetReadOnlyDataArray();
+                var outArr = (double[])(object)destination.GetDataArray();
+
+                bool dBlasDone = false;
+#if NET5_0_OR_GREATER
+                if (BlasProvider.HasRawDgemm)
+                {
+                    unsafe
+                    {
+                        fixed (double* pIn = inArr, pW = wArr, pOut = outArr)
+                            BlasProvider.DgemmRaw(M, N, K, pIn, K, pW, N, pOut, N);
+                    }
+                    dBlasDone = true;
+                }
+#endif
+                if (!dBlasDone && BlasProvider.HasNativeDgemm)
+                {
+                    unsafe
+                    {
+                        fixed (double* pIn = inArr, pW = wArr, pOut = outArr)
+                            BlasProvider.DgemmDirect(M, N, K, pIn, K, pW, N, pOut, N);
+                    }
+                    dBlasDone = true;
+                }
+                if (!dBlasDone && BlasProvider.IsMklVerified)
+                {
+                    BlasProvider.MklDgemmZeroOffset(M, N, K, inArr, K, wArr, N, outArr, N);
+                    dBlasDone = true;
+                }
+                if (!dBlasDone && !BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
+                {
+                    CpuFusedOperations.FusedGemmBiasActivation(inArr, wArr,
+                        bias != null ? (double[])(object)bias.GetReadOnlyDataArray() : null,
+                        outArr, M, N, K, activation);
+                    return;
+                }
+
+                if (bias != null || activation != FusedActivationType.None)
+                {
+                    var bArr = bias != null ? (double[])(object)bias.GetDataArray() : null;
+                    CpuFusedOperations.ApplyBiasActivationInPlaceDouble(outArr, bArr, M, N, activation, activationParams);
+                }
+
+                return;
+            }
+        }
+
+        // Generic / ND fallback: allocate via the existing overload, copy into the
+        // destination, release. Bit-identical (same kernel); just no allocation saving.
+        var result = FusedLinear(input, weights, bias, activation, activationParams);
+        try
+        {
+            if (destination.Length != result.Length)
+                throw new ArgumentException(
+                    $"Destination length ({destination.Length}) must equal FusedLinear result length ({result.Length}).");
+            result.Data.Span.CopyTo(destination.Data.Span);
+        }
+        finally
+        {
+            TensorAllocator.Return(result);
+        }
     }
 
     /// <summary>
