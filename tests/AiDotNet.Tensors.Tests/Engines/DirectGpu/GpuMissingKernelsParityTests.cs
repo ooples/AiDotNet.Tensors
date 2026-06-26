@@ -10,6 +10,7 @@ using System;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.BlasManaged;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 using BM = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged;
@@ -26,6 +27,12 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
 
     public GpuMissingKernelsParityTests()
     {
+        // GPU/CPU parity validates kernel LOGIC, so it must compare at MATCHED precision: force strict
+        // fp32 on the GPU (TF32 off) before the backend initializes. TF32 stays the production default
+        // (industry standard, ~5× fp32 throughput) and is unaffected here — but a TF32 GPU result vs a
+        // true-fp32 CPU result legitimately differs by ~1e-3 relative (TF32's ~10-bit mantissa), which
+        // would mask real logic bugs. PyTorch's own CUDA-vs-CPU correctness tests disable TF32 the same way.
+        CudaDispatchPolicy.AllowTF32 = false;
         try
         {
             _gpu = new DirectGpuTensorEngine();
