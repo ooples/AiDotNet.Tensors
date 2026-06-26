@@ -13692,12 +13692,18 @@ public partial class CpuEngine : ITensorLevelEngine
             // batch-parallel Col2ImAccumulateStrided scatters each batch's
             // slice in place). Gated on a memory bound.
             long niConcatElemsF = (long)colH * batch * colW;
-            const long MaxNiConcatElemsF = 16L * 1024 * 1024; // 64 MB of floats
+            // Aligned with ConvScratchPool's 32M-float (128 MB) pooling cap: shapes up to this use the fast
+            // single-GEMM K-concat path AND get their stacks recycled by the pool (instead of the slower
+            // per-batch fallback that churned ~8x-output GC). Larger shapes stay on the per-batch path.
+            const long MaxNiConcatElemsF = 32L * 1024 * 1024; // 128 MB of floats (was 16M)
             if (batch >= 2 && niConcatElemsF <= MaxNiConcatElemsF)
             {
                 int batchColW = batch * colW;
-                var gradOutAll = pool.Rent(outChannels * batchColW);
-                var colAll = pool.Rent(colH * batchColW);
+                // Big K-concat stacks → size-bounded ConvScratchPool (recycle across training iters
+                // instead of the ArrayPool.Shared fresh-alloc-and-discard for >cap arrays). Fully
+                // overwritten below, so dirty reuse is safe.
+                var gradOutAll = ConvScratchPool.Rent(outChannels * batchColW);
+                var colAll = ConvScratchPool.Rent(colH * batchColW);
                 try
                 {
                     for (int b = 0; b < batch; b++)
@@ -13736,14 +13742,16 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
                 finally
                 {
-                    pool.Return(gradOutAll);
-                    pool.Return(colAll);
+                    ConvScratchPool.Return(gradOutAll);
+                    ConvScratchPool.Return(colAll);
                 }
             }
 
             CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>
             {
-                var colBuf = pool.Rent(colW * colH);
+                // Per-batch col buffer (colW·colH, ~tens of MB → exceeds ArrayPool.Shared's pooling cap).
+                // ConvScratchPool recycles it across iters; thread-safe for the batch-parallel rents.
+                var colBuf = ConvScratchPool.Rent(colW * colH);
                 try
                 {
                     int gradOutOff = b * outChannels * colW;
@@ -13779,7 +13787,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW,
                         outputHeight, outputWidth);
                 }
-                finally { pool.Return(colBuf); }
+                finally { ConvScratchPool.Return(colBuf); }
             });
 
             return RentFloatResult<T>(inputShape, gradInputF);
@@ -14532,6 +14540,73 @@ public partial class CpuEngine : ITensorLevelEngine
     private const int ConvSmallGemmMr = 6;
 
     /// <summary>
+    /// Size-bounded large-array pool for the conv-backward K-concat scratch stacks (im2colAll / gradOutAll,
+    /// up to ~100s of MB). These exceed <see cref="System.Buffers.ArrayPool{T}"/>.Shared's ~1M-element
+    /// pooling cap, so Shared.Rent allocates a FRESH array every call and Return discards it — measured at
+    /// 8-15x the output in GC traffic per conv-backward, the dominant churn behind conv-model TRAINING
+    /// timeouts + GC-driven timing variance. This pool RECYCLES those buffers across calls (same training
+    /// shape every iteration → ~0 alloc after warmup). Hard-capped so it can never threaten the fixed 16 GB
+    /// CI runner: buffers larger than <see cref="MaxPooledLen"/> (128 MB) are NOT retained (fresh alloc,
+    /// discarded on return — foundation-scale shapes stay un-pooled, no OOM added), and at most
+    /// <see cref="MaxSlots"/> buffers are held (≤512 MB total). Returned buffers may be dirty — every
+    /// consumer (BuildKConcatStack*, the im2col helpers) fully overwrites its buffer, same as Shared.
+    /// </summary>
+    internal static class ConvScratchPool
+    {
+        private const int SharedCap = 1024 * 1024;         // ArrayPool<T>.Shared stops pooling above ~1M elements
+        private const int MaxPooledLen = 32 * 1024 * 1024; // 128 MB of floats; larger → not retained (OOM-safe)
+        private const int MaxSlots = 4;                    // ≤ 512 MB held total
+        private static readonly float[]?[] _slots = new float[]?[MaxSlots];
+        private static readonly object _lock = new object();
+
+        public static float[] Rent(int minLen)
+        {
+            if (minLen <= 0) return Array.Empty<float>();
+            // Small buffers: Shared already pools them on a lock-free per-thread stack — going through our
+            // locked pool would only add contention (regressed a small-shape perf test). Only the large
+            // buffers Shared refuses to pool are worth the bounded large pool.
+            if (minLen <= SharedCap) return System.Buffers.ArrayPool<float>.Shared.Rent(minLen);
+            if (minLen > MaxPooledLen) return new float[minLen]; // too big to retain → fresh, dropped on Return
+            lock (_lock)
+            {
+                int best = -1, bestLen = int.MaxValue;
+                for (int i = 0; i < MaxSlots; i++)
+                {
+                    var s = _slots[i];
+                    if (s is not null && s.Length >= minLen && s.Length < bestLen) { best = i; bestLen = s.Length; }
+                }
+                if (best >= 0)
+                {
+                    var r = _slots[best];
+                    _slots[best] = null;
+                    if (r is not null) return r;
+                }
+            }
+            return new float[minLen];
+        }
+
+        public static void Return(float[]? arr)
+        {
+            if (arr is null || arr.Length == 0) return;
+            // Mirror Rent: small arrays came from Shared (its max bucket is ~1M, so it never hands back a
+            // larger one), oversized ones aren't retained.
+            if (arr.Length <= SharedCap) { System.Buffers.ArrayPool<float>.Shared.Return(arr); return; }
+            if (arr.Length > MaxPooledLen) return;
+            lock (_lock)
+            {
+                int smallest = -1, smallestLen = int.MaxValue;
+                for (int i = 0; i < MaxSlots; i++)
+                {
+                    var s = _slots[i];
+                    if (s is null) { _slots[i] = arr; return; } // free slot → keep
+                    if (s.Length < smallestLen) { smallest = i; smallestLen = s.Length; }
+                }
+                if (smallest >= 0 && arr.Length > smallestLen) _slots[smallest] = arr; // evict smaller, keep larger
+            }
+        }
+    }
+
+    /// <summary>
     /// Packed SGEMM for the K-concat conv weight gradient:
     /// C[M=colH, N=oc] = A[M, K=batchColW] · B[K, N] (all row-major), C := A·B.
     /// Packs each Mr-row panel of A so the inner loop reads contiguously, holds the C tile in
@@ -14790,13 +14865,17 @@ public partial class CpuEngine : ITensorLevelEngine
             // stacking, so the buffers are the same size the fallback already rents — the
             // 64 MB element bound only needs to gate genuine multi-batch stacking.
             long kConcatElemsF = (long)colH * batch * colW;
-            const long MaxKConcatElemsF = 16L * 1024 * 1024; // 64 MB of floats
+            // Aligned with ConvScratchPool's 32M-float (128 MB) pooling cap (see Conv2DBackwardInput).
+            const long MaxKConcatElemsF = 32L * 1024 * 1024; // 128 MB of floats (was 16M)
             if (batch == 1 || (batch >= 2 && kConcatElemsF <= MaxKConcatElemsF))
             {
                 int batchColW = batch * colW;
                 var kcPool = System.Buffers.ArrayPool<float>.Shared;
-                var im2colAll = kcPool.Rent(colH * batchColW);
-                var gradOutAllT = kcPool.Rent(batchColW * outChannels);
+                // The two big K-concat stacks (im2colAll/gradOutAllT, often >> ArrayPool.Shared's pooling
+                // cap → fresh alloc + discard each call) go through the size-bounded ConvScratchPool so a
+                // training loop recycles them instead of churning GC. gradKernelT is small → Shared is fine.
+                var im2colAll = ConvScratchPool.Rent(colH * batchColW);
+                var gradOutAllT = ConvScratchPool.Rent(batchColW * outChannels);
                 var gradKernelT = kcPool.Rent(colH * outChannels);
                 try
                 {
@@ -14845,8 +14924,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
                 finally
                 {
-                    kcPool.Return(im2colAll);
-                    kcPool.Return(gradOutAllT);
+                    ConvScratchPool.Return(im2colAll);
+                    ConvScratchPool.Return(gradOutAllT);
                     kcPool.Return(gradKernelT);
                 }
             }
