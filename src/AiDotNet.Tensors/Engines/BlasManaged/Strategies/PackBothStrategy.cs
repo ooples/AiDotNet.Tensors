@@ -978,7 +978,7 @@ internal static class PackBothStrategy
             int kL = k, nL = n, bLenL = bLen, cLenL = cLen;
             long totalWork = (long)m * n * k * 2;
 
-            CpuParallelSettings.ParallelForOrSerial(0, numNBlocks, totalWork, jcIdx =>
+            Action<int> nAxisBody = jcIdx =>
             {
                 int jc = jcIdx * ncL;
                 int effNc = Math.Min(ncL, nL - jc);
@@ -1071,7 +1071,12 @@ internal static class PackBothStrategy
                     }
                 }
                 finally { System.Buffers.ArrayPool<byte>.Shared.Return(packBArr); }
-            }, deterministicSafe: true); // N-axis split: disjoint C columns, fixed-order K reduction
+            }; // N-axis body: disjoint C columns, fixed-order K reduction (bit-exact regardless of dispatch)
+            // #85 EXPERIMENT (gated): route the N-block parallel-for through the L3-domain-PINNED pool to
+            // test whether pinning closes the per-core gap to OpenBLAS (59 vs our ~42). Same body ⇒
+            // bit-exact. Returns false (→ threadpool) when unavailable/busy; throws only on a real fault.
+            if (!(PinnedParallel.s_enabled && PinnedParallel.For(0, numNBlocks, nAxisBody)))
+                CpuParallelSettings.ParallelForOrSerial(0, numNBlocks, totalWork, nAxisBody, deterministicSafe: true);
             }
         }
         finally { System.Buffers.ArrayPool<float>.Shared.Return(packAArr); }

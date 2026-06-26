@@ -723,6 +723,46 @@ public static class AxisRoutingAbBench
         }
     }
 
+    /// <summary>
+    /// #85 pinned N-axis A/B: route the N-block parallel-for through the L3-domain-PINNED pool vs the
+    /// .NET threadpool. Tests the source-grounded hypothesis that pinning closes the per-core gap to
+    /// OpenBLAS (59 vs ~42). Same body ⇒ bit-exact (checked). Run <c>--ab-pinned</c>.
+    /// </summary>
+    public static void PinnedNAxisSweep()
+    {
+        Console.WriteLine("=== #85 N-axis: L3-domain-PINNED pool vs threadpool, DOP32 ===");
+        Console.WriteLine($"PinnedParallel.IsAvailable={AiDotNet.Tensors.Engines.BlasManaged.PinnedParallel.IsAvailable}");
+        CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
+        var shapes = new (string label, int m, int n, int k)[]
+        {
+            ("ffn-up   384x6144x1536", 384, 6144, 1536),
+            ("ffn      384x4096x1536", 384, 4096, 1536),
+            ("medium2k 384x2048x1024", 384, 2048, 1024),
+            ("tall     768x4096x1024", 768, 4096, 1024),
+        };
+        foreach (var (label, m, n, k) in shapes)
+        {
+            var a = MakeRandom(m * k); var b = MakeRandom(k * n);
+            var cTp = new float[m * n]; var cPin = new float[m * n];
+            double flops = 2.0 * m * n * k;
+            AiDotNet.Tensors.Engines.BlasManaged.PinnedParallel.s_enabled = false; GemmOnce(a, b, cTp, m, n, k);
+            AiDotNet.Tensors.Engines.BlasManaged.PinnedParallel.s_enabled = true; GemmOnce(a, b, cPin, m, n, k);
+            AiDotNet.Tensors.Engines.BlasManaged.PinnedParallel.s_enabled = false;
+            double maxErr = 0; for (int i = 0; i < cTp.Length; i++) maxErr = Math.Max(maxErr, Math.Abs(cTp[i] - cPin[i]));
+            var c = new float[m * n];
+            double bTp = 0, bPin = 0;
+            for (int rep = 0; rep < 3; rep++)
+            {
+                AiDotNet.Tensors.Engines.BlasManaged.PinnedParallel.s_enabled = false;
+                bTp = Math.Max(bTp, flops / TimeMinGemm(a, b, c, m, n, k) / 1e9);
+                AiDotNet.Tensors.Engines.BlasManaged.PinnedParallel.s_enabled = true;
+                bPin = Math.Max(bPin, flops / TimeMinGemm(a, b, c, m, n, k) / 1e9);
+            }
+            AiDotNet.Tensors.Engines.BlasManaged.PinnedParallel.s_enabled = false;
+            Console.WriteLine($"  {label}: threadpool {bTp,5:F0}  pinned {bPin,5:F0} GF/s  ({bPin / bTp:F2}x)  maxErr={maxErr:E1}");
+        }
+    }
+
     private static double Gf(double flops, double sec) => flops / sec / 1e9;
 
     private static unsafe double TimeMinNative(float[] a, float[] b, float[] c, int m, int n, int k)

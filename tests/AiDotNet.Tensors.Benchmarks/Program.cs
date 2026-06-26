@@ -175,6 +175,13 @@ class Program
             return;
         }
 
+        // #85 N-axis pinned pool vs threadpool. (--ab-pinned)
+        if (args[0] == "--ab-pinned")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.PinnedNAxisSweep();
+            return;
+        }
+
         if (args[0] == "--ab-aiseval-dopsweep")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.DopSweep();
