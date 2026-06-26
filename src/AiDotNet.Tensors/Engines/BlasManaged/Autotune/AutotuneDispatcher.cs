@@ -201,7 +201,11 @@ internal static class AutotuneDispatcher
         // For tiny shapes (m < 128, etc.) the Math.Min clamp falls back to dim-fits.
         int mc = Math.Min(128, m);
         int nc = Math.Min(512, n);
-        int kc = Math.Min(256, k);
+        // Kc=512 (was 256): a blocking sweep on Zen2 (Threadripper 3990X) measured Kc=512 as the
+        // best K-block for EVERY tested shape (attn-proj/mlp-fc/square-1024/square-2048), +20–54%
+        // all-core GFLOP/s vs Kc=256 — the larger K-stripe amortizes the pack + microkernel
+        // ramp over more FMAs before the C-tile is re-touched. Matches OpenBLAS's Zen Kc≈248–512 band.
+        int kc = Math.Min(512, k);
 
         // Sub-G (#375): M-axis occupancy floor. PackBoth parallelises over
         // numIcBlocks = ceil(m / mc). With mc=128 a shape like 512×512×512 has

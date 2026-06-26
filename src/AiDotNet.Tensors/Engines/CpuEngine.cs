@@ -12367,8 +12367,14 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float) && a.IsContiguous && b.IsContiguous
             && m <= _cachedBMaxM)
         {
-            var aArrF = (float[])(object)a.GetReadOnlyDataArray();
-            var bArrF = (float[])(object)b.GetReadOnlyDataArray();
+            // #475: read inputs via AsSpan (no-copy; materializes on CPU once) — GetReadOnlyDataArray hands
+            // back a COPY for any GPU-DEVICE-TAGGED tensor, and the GPU auto-detect ModuleInitializer tags
+            // even CPU-resident tensors as GPU. That copied A+B every call (~26 MB at the DiT MLP shape),
+            // costing 1.61x through this wrapper vs the direct kernel (measured --ab-shortm: engine 184 vs
+            // direct 296 GF with a GPU present; 377 vs 329 = no penalty with the copy gone). AsSpan is a no-op
+            // on genuinely CPU-resident data and skips the per-call snapshot on CPU-resident-but-GPU-tagged.
+            var aArrF = ((Tensor<float>)(object)a).AsSpan();
+            var bArrF = ((Tensor<float>)(object)b).AsSpan();
             var rArrF = (float[])(object)result.GetDataArray();
             // #573 follow-up: above a row-count floor, route through BlasManaged.Gemm (the same
             // dispatcher the pre-packed path above uses) instead of the legacy full-trans
@@ -12385,13 +12391,13 @@ public partial class CpuEngine : ITensorLevelEngine
             if (m >= BlasManagedParallelMinM)
             {
                 Engines.BlasManaged.BlasManaged.Gemm<float>(
-                    aArrF.AsSpan(0, m * n), n, false, bArrF.AsSpan(0, n * p), p, false,
+                    aArrF.Slice(0, m * n), n, false, bArrF.Slice(0, n * p), p, false,
                     rArrF.AsSpan(0, m * p), p, m, p, n,
                     new Engines.BlasManaged.BlasOptions<float> { PackingMode = Engines.BlasManaged.PackingMode.DisableAutotune });
             }
             else
             {
-                Simd.SimdGemm.Sgemm(aArrF.AsSpan(0, m * n), n, false, bArrF.AsSpan(0, n * p), p, false,
+                Simd.SimdGemm.Sgemm(aArrF.Slice(0, m * n), n, false, bArrF.Slice(0, n * p), p, false,
                                     rArrF.AsSpan(0, m * p), m, n, p);
             }
             return result;

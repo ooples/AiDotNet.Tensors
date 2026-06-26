@@ -51,6 +51,13 @@ public static partial class BlasManaged
     private static readonly bool s_forceMachineKernel =
         System.Environment.GetEnvironmentVariable("AIDOTNET_FORCE_MK") == "1";
 
+    // GotoBLAS FP32 parallel path (the rewrite) is the default for large float GEMM (see the hook in
+    // Gemm{T}). Tests that must exercise the UNDERLYING strategy paths (N-axis vs M-axis parity, the
+    // machine-kernel dispatch, etc.) set this to true to disable the GotoGemm interception, mirroring
+    // PackBothStrategy.s_disableNAxis. Production leaves it false. Opt-out env: AIDOTNET_DISABLE_GOTO=1.
+    internal static bool s_disableGotoGemm =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_DISABLE_GOTO") == "1";
+
     // #653: extend the PackBoth parallelism-floor + wide-N blocking optimizations to the
     // DisableAutotune shim path the forward GEMM uses (CpuEngine.BatchMatMul -> 6-arg
     // SimdGemm.Sgemm -> Gemm{DisableAutotune}). Those optimizations were gated on
@@ -460,14 +467,53 @@ public static partial class BlasManaged
             return;
 #endif
 
-        // Sub-S (#409): machine-code microkernel fast path. The tile-aligned interior
-        // runs on the hand-emitted kernel (FP64 6×8 ~57 GFLOPS/core ~95% of OpenBLAS;
-        // FP32 6×16 — multithreaded, first-party machine code, no dependency); the
-        // m%Mr / n%Nr tails go to Streaming. Honours PackingMode.Auto only (explicit
-        // pack-mode overrides take the managed path so callers can force-test a
-        // strategy), no transpose, no epilogue, no pre-pack. C is already zeroed
-        // above (the kernel accumulates), and the tails read-modify-write their own
-        // disjoint sub-tiles — so this can only add speed, never change results.
+#if NET5_0_OR_GREATER
+        // GotoBLAS FP32 parallel path (the rewrite) — the production large-float GEMM. Fires for BOTH
+        // PackingMode.Auto AND DisableAutotune: the engine's hot float path (CpuEngine.TensorMatMul2D)
+        // dispatches with DisableAutotune, so gating to Auto alone left this DEAD for real models (they ran
+        // on PackBoth). With the fix, measured 1.3-2.5x over PackBoth through the engine. A clean GotoBLAS
+        // macro-kernel over per-thread L2-resident A/B tiles. Deterministic by construction (each C element
+        // computed by one thread in fixed K order ⇒ thread-count-independent, Deterministic/DisableAutotune-
+        // contract safe). C is pre-zeroed above ⇒ zero-then-accumulate yields C := A·B; handles its own M/N
+        // tails. Gated to float, no trans, no pre-pack, no epilogue, large-shape regime. (The CCX-aware
+        // pinned-pool variant beats this ~2x at the kernel level but its win is masked by per-call engine
+        // overhead — deferred until that overhead is cut; prototype in tests/CcxGemmBench.)
+        if (typeof(T) == typeof(float) && !s_disableGotoGemm && !transA && !transB
+            && options.PackedA is null && options.PackedB is null
+            && options.NumThreads == 0 // only the default (all-core) budget; explicit -1/>0 requests honored below
+            && (options.PackingMode == PackingMode.Auto || options.PackingMode == PackingMode.DisableAutotune)
+            && (long)m * n * k >= GotoGemmFp32.ParallelMinWork && GotoGemmFp32.BeatsPackBoth(m, n, k)
+            && GotoGemmFp32.IsAvailable)
+        {
+            var gepi = options.Epilogue;
+            if (EpilogueFlagsCompute.Compute(in gepi) == EpilogueFlags.None)
+            {
+                var gfa = MemoryMarshal.Cast<T, float>(a);
+                var gfb = MemoryMarshal.Cast<T, float>(b);
+                var gfc = MemoryMarshal.Cast<T, float>(c);
+                unsafe
+                {
+                    fixed (float* pa = gfa)
+                    fixed (float* pb = gfb)
+                    fixed (float* pc = gfc)
+                    {
+                        // CCX-aware pinned pool for large BALANCED shapes (per-CCX L3-resident B-strips →
+                        // less cross-CCX/DRAM traffic; ~49% MKL on squares vs ~37-47% per-tile). Returns
+                        // false (→ per-tile) when busy/nested/restricted or out of the win regime.
+                        if (!CcxGemmPool.TryRun(pa, lda, pb, ldb, pc, ldc, m, n, k))
+                        {
+                            var (gmc, gnc, gkc) = GotoGemmFp32.ChooseParallelBlocks(m, n);
+                            GotoGemmFp32.RunParallel(pa, lda, pb, ldb, pc, ldc, m, n, k, gmc, gnc, gkc);
+                        }
+                    }
+                }
+                return;
+            }
+        }
+#endif
+
+        // Sub-S (#409): machine-code microkernel fast path for the remaining Auto shapes (small float +
+        // all double), no transpose, no epilogue, no pre-pack. C is pre-zeroed above (kernel accumulates).
         if (options.PackingMode == PackingMode.Auto && !transA && !transB
             && options.PackedA is null && options.PackedB is null)
         {
@@ -1014,7 +1060,7 @@ public static partial class BlasManaged
         // PrePackA's contract is "give the consume path identical tiling to
         // what live-pack would have produced" so we mirror those defaults.
         int mc = Math.Min(128, m);
-        int kc = Math.Min(256, k);
+        int kc = Math.Min(512, k); // sync with FallbackToHeuristic Kc=512 (b373b9d) — else pre-pack tiles at a smaller K-panel than live-pack and the consume path slows down
         // Round mc UP to a multiple of mr (microkernel row tile height) so the
         // packed-byte layout matches what ScalarPack.PackA / Avx2Pack.PackA
         // expects. CodeRabbit #402: the previous gated form (`if (mc < m ...`)
@@ -1138,7 +1184,7 @@ public static partial class BlasManaged
         // = 6× more inner-loop iterations + far worse cache reuse than the
         // 512×256 live-pack baseline).
         int nc = Math.Min(512, n);
-        int kc = Math.Min(256, k);
+        int kc = Math.Min(512, k); // sync with FallbackToHeuristic Kc=512 (b373b9d) — else pre-pack tiles at a smaller K-panel than live-pack and the consume path slows down
         // Round nc UP to a multiple of nr (microkernel column tile width) — the
         // packed-buffer layout in ScalarPack.PackB / Avx2Pack.PackB always
         // writes ceil(nc / nr) * nr columns per Kc row, zero-padding the tail
