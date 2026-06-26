@@ -147,6 +147,13 @@ class Program
             return;
         }
 
+        // #85 CCX pool (barriers) vs RunParallel (barrier-free) on balanced shapes. (--ab-ccx-vs-rp)
+        if (args[0] == "--ab-ccx-vs-rp")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.CcxVsRunParallelSweep();
+            return;
+        }
+
         if (args[0] == "--ab-aiseval-dopsweep")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.DopSweep();

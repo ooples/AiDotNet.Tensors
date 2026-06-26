@@ -582,6 +582,40 @@ public static class AxisRoutingAbBench
         }
     }
 
+    /// <summary>
+    /// #85 CCX pool vs RunParallel A/B: PerfView/busy-core showed the CCX pinned-pool barriers strand
+    /// cores (square 1024: 6/32 busy, 237 GF/s) while barrier-free RunParallel gets 13.3 cores / 598.
+    /// Toggle CcxGemmPool.s_disable in-process across balanced shapes to see if the barrier loss holds
+    /// at scale (it should — per-core is equal, so the lost cores are pure barrier stall). Run
+    /// <c>--ab-ccx-vs-rp</c>.
+    /// </summary>
+    public static void CcxVsRunParallelSweep()
+    {
+        Console.WriteLine("=== #85 CCX pool (barriers) vs RunParallel (barrier-free) ===");
+        CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
+        var shapes = new (int m, int n, int k)[]
+        {
+            (1024, 1024, 1024), (1536, 1536, 1536), (2048, 2048, 2048),
+            (1024, 2048, 2048), (2048, 1024, 1024),
+        };
+        foreach (var (m, n, k) in shapes)
+        {
+            var a = MakeRandom(m * k); var b = MakeRandom(k * n); var c = new float[m * n];
+            double flops = 2.0 * m * n * k;
+            double bestCcx = 0, bestRp = 0;
+            for (int rep = 0; rep < 3; rep++)
+            {
+                AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_disable = false;
+                bestCcx = Math.Max(bestCcx, flops / TimeMinGemm(a, b, c, m, n, k) / 1e9);
+                AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_disable = true;
+                bestRp = Math.Max(bestRp, flops / TimeMinGemm(a, b, c, m, n, k) / 1e9);
+            }
+            AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_disable = false;
+            string w = bestRp > bestCcx ? "RunParallel" : "CCX";
+            Console.WriteLine($"  {m}x{n}x{k}: CCX {bestCcx,5:F0}  RunParallel {bestRp,5:F0} GF/s  ({bestRp / bestCcx:F2}x)  -> {w}");
+        }
+    }
+
     private static double Gf(double flops, double sec) => flops / sec / 1e9;
 
     private static unsafe double TimeMinNative(float[] a, float[] b, float[] c, int m, int n, int k)

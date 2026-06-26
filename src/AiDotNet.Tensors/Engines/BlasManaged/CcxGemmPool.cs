@@ -38,8 +38,13 @@ internal static unsafe class CcxGemmPool
     private static volatile bool _faulted; // a lane's compute threw → TryRun returns false (caller falls back)
     private static int _gr, _gc;      // 2D CCX grid (gr·gc = numCcx)
 
-    /// <summary>Min M·N·K for the CCX path (below this the pinned-pool + barrier overhead isn't worth it).</summary>
-    private const long CcxMinWork = 200L * 1024 * 1024;
+    /// <summary>Min M·N·K for the CCX path. Below ~2G FLOP the per-K-panel BARRIERS dominate: PerfView
+    /// busy-core (2026-06-26) showed CCX on 1024³ stalls at 6/32 busy cores (237 GF/s) while barrier-free
+    /// RunParallel gets 13.3 cores (598). Clean A/B (--ab-ccx-vs-rp, DOP32): RunParallel beats CCX 1024³
+    /// 1.96×; CCX only amortizes its barriers and wins at 1536³ (1.23×). So gate CCX to ≥2G work where the
+    /// compute-per-barrier is large enough to hide the barrier latency; smaller balanced shapes (1024³-class)
+    /// fall through to RunParallel.</summary>
+    private const long CcxMinWork = 2L * 1024 * 1024 * 1024;
 
     /// <summary>Test/diagnostic toggle (env AIDOTNET_DISABLE_CCX=1): force per-tile, for in-process A/B.</summary>
     internal static bool s_disable =
