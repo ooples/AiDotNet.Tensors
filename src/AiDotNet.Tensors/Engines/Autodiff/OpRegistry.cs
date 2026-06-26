@@ -283,6 +283,8 @@ internal static class OpRegistry
         "LocallyConnectedConv2DBackwardInput", "LocallyConnectedConv2DBackwardWeights", "LocallyConnectedConv2DBackwardBias",
         "DeformableConv2DBackwardInput", "DeformableConv2DBackwardKernel",
         "DeformableConv2DBackwardOffset", "DeformableConv2DBackwardMask",
+        "DeformableConv2DGroupedBackwardInput", "DeformableConv2DGroupedBackwardKernel",
+        "DeformableConv2DGroupedBackwardOffset", "DeformableConv2DGroupedBackwardMask",
         "GridSampleBackwardInput", "GridSampleBackwardGrid",
         "BatchNormBackward", "LayerNormBackward", "GroupNormBackward", "RMSNormBackward", "InstanceNormBackward",
         "DropoutBackward", "EmbeddingBackward",
@@ -457,6 +459,7 @@ internal static class OpRegistry
 
         // Deformable conv (complex, delegates to sub-ops)
         "DeformableConv2D",
+        "DeformableConv2DGrouped", // DCNv3 grouped/depthwise (#1691)
 
         // Additional delegators for IEngine wrappers
         "TensorSELU",          // -> SELU (records)

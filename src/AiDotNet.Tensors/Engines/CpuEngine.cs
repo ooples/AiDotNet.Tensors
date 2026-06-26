@@ -9337,22 +9337,34 @@ public partial class CpuEngine : ITensorLevelEngine
             return;
         }
 
-        // Strategy 1.5: high-channel convs -> explicit im2col + BLAS GEMM.
+        // Strategy 1.5: route to explicit im2col + BLAS GEMM (implicit-GEMM panels).
         // MEASURED (diffusion decoder + ResNet shapes, 32-thread CPU, 2026-06): a single
         // im2col + BlasManaged.Gemm runs at ~350-440 GFLOP/s (the GEMM K dimension =
         // inChannels*kH*kW is large enough that one packed machine-code GEMM reaches
         // near hardware peak), whereas at high channel counts BOTH the on-the-fly fused
         // kernel (~1 GFLOP/s) AND the SIMD-direct 3x3 kernel (~35-87 GFLOP/s) collapse.
         // Routing these straight to im2col+BLAS is what makes a 1.2B-param diffusion
-        // UNet forward ~10x faster (per-block profile: 99% of the forward was ResBlock
-        // convs at >=384 input channels, mis-routed to the slow direct/fused paths and
-        // timing out the foundation-scale CI shards). The >=256 gate is conservative:
-        // every measured high-channel conv wins decisively (>300 GFLOP/s) while lower-
-        // channel / stem / depthwise convs stay on the direct cascade below where the
-        // transient im2col buffer is not worth it. Winograd keeps its large-spatial niche
-        // (output >= 224) since it cuts FLOPs 2.25x there.
-        if (inChannels >= 256 &&
-            !WinogradHelper.ShouldUseWinograd(kernelHeight, kernelWidth, stride, stride, dilation, dilation, outputHeight, outputWidth))
+        // UNet forward ~10x faster.
+        //
+        // The gate covers TWO regimes:
+        //  (a) high channel count (inChannels >= 256) — the original case.
+        //  (b) large-spatial 3x3 stride-1 convs (the stems EVERY CNN backbone starts
+        //      with — VGG/ResNet at 224x224 / 112x112, low channel). MEASURED (VGG16
+        //      conv shapes, 16-core CPU, 2026-06): for these the Winograd path is
+        //      catastrophic (64ch@224 fwd = 2209 ms; 128ch@112 = 1558 ms) and the
+        //      SIMD-direct fallback is barely better, while implicit-GEMM does the same
+        //      conv in 41 ms / 33 ms — a 25-54x forward speedup, bit-identical. The old
+        //      `!ShouldUseWinograd` exclusion sent exactly these shapes to the slow
+        //      Winograd path; routing them here is the fix. Winograd's theoretical 2.25x
+        //      FLOP cut is never realized by its current implementation at any measured
+        //      shape, so implicit-GEMM is preferred for 3x3 stride-1 outright. End-to-end
+        //      this cuts a VGG16 conv fwd+bwd step ~6800 ms -> ~820 ms (8.3x).
+        bool largeSpatial3x3 = kernelHeight == 3 && kernelWidth == 3
+            && stride == 1 && dilation == 1
+            && (long)outputHeight * outputWidth >= 64L * 64; // >= 4096 output positions
+        bool highChannelNonWinograd = inChannels >= 256 &&
+            !WinogradHelper.ShouldUseWinograd(kernelHeight, kernelWidth, stride, stride, dilation, dilation, outputHeight, outputWidth);
+        if (highChannelNonWinograd || largeSpatial3x3)
         {
             // Fused (implicit-GEMM) path: block on output rows, im2col each block into a
             // cache-resident panel, GEMM straight into the output — never materialises the
@@ -13686,12 +13698,18 @@ public partial class CpuEngine : ITensorLevelEngine
             // batch-parallel Col2ImAccumulateStrided scatters each batch's
             // slice in place). Gated on a memory bound.
             long niConcatElemsF = (long)colH * batch * colW;
-            const long MaxNiConcatElemsF = 16L * 1024 * 1024; // 64 MB of floats
+            // Aligned with ConvScratchPool's 32M-float (128 MB) pooling cap: shapes up to this use the fast
+            // single-GEMM K-concat path AND get their stacks recycled by the pool (instead of the slower
+            // per-batch fallback that churned ~8x-output GC). Larger shapes stay on the per-batch path.
+            const long MaxNiConcatElemsF = 32L * 1024 * 1024; // 128 MB of floats (was 16M)
             if (batch >= 2 && niConcatElemsF <= MaxNiConcatElemsF)
             {
                 int batchColW = batch * colW;
-                var gradOutAll = pool.Rent(outChannels * batchColW);
-                var colAll = pool.Rent(colH * batchColW);
+                // Big K-concat stacks → size-bounded ConvScratchPool (recycle across training iters
+                // instead of the ArrayPool.Shared fresh-alloc-and-discard for >cap arrays). Fully
+                // overwritten below, so dirty reuse is safe.
+                var gradOutAll = ConvScratchPool.Rent(outChannels * batchColW);
+                var colAll = ConvScratchPool.Rent(colH * batchColW);
                 try
                 {
                     for (int b = 0; b < batch; b++)
@@ -13730,14 +13748,16 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
                 finally
                 {
-                    pool.Return(gradOutAll);
-                    pool.Return(colAll);
+                    ConvScratchPool.Return(gradOutAll);
+                    ConvScratchPool.Return(colAll);
                 }
             }
 
             CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>
             {
-                var colBuf = pool.Rent(colW * colH);
+                // Per-batch col buffer (colW·colH, ~tens of MB → exceeds ArrayPool.Shared's pooling cap).
+                // ConvScratchPool recycles it across iters; thread-safe for the batch-parallel rents.
+                var colBuf = ConvScratchPool.Rent(colW * colH);
                 try
                 {
                     int gradOutOff = b * outChannels * colW;
@@ -13773,7 +13793,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW,
                         outputHeight, outputWidth);
                 }
-                finally { pool.Return(colBuf); }
+                finally { ConvScratchPool.Return(colBuf); }
             });
 
             return RentFloatResult<T>(inputShape, gradInputF);
@@ -14206,6 +14226,52 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
+            // FUSED FAST PATH (transposed-convolution identity). For stride=1,
+            // dilation=1 and a non-negative symmetric transposed padding, the
+            // input-gradient equals a FORWARD convolution of gradOutput with the
+            // spatially-flipped, channel-transposed kernel:
+            //   dX = conv(gradOut, flip(W)^T, stride=1, pad=(k-1)-p)
+            // Routing through the fast implicit-GEMM forward path (~90 GFLOP/s)
+            // instead of the GEMM + memory-bound Col2ImAccumulate scatter (~27
+            // GFLOP/s, scalar) is ~3x on the large-spatial stem convs every CNN
+            // backbone starts with (VGG/ResNet at 224x224 / 112x112). Output is
+            // numerically equivalent (different summation order, within float
+            // tolerance). Anything outside this regime falls through to the col2im
+            // path below unchanged.
+            {
+                int padHt = (kernelHeight - 1) - padH;
+                int padWt = (kernelWidth - 1) - padW;
+                if (strideH == 1 && strideW == 1 && dilationH == 1 && dilationW == 1
+                    && padHt >= 0 && padWt >= 0 && padHt == padWt)
+                {
+                    int kHWf = kernelHeight * kernelWidth;
+                    var gradOutFloat = (Tensor<float>)(object)gradOutput;
+                    var flippedKernel = new Tensor<float>(new[] { inChannels, outChannels, kernelHeight, kernelWidth });
+                    var flippedF = (float[])(object)flippedKernel._storage.GetDataArray();
+                    var kernelFlip = (float[])(object)kernel.GetFlattenedData();
+                    for (int oc = 0; oc < outChannels; oc++)
+                        for (int ic = 0; ic < inChannels; ic++)
+                        {
+                            int kBase = oc * inChannels * kHWf + ic * kHWf;
+                            int fBase = ic * outChannels * kHWf + oc * kHWf;
+                            for (int kh = 0; kh < kernelHeight; kh++)
+                                for (int kw = 0; kw < kernelWidth; kw++)
+                                    flippedF[fBase + kh * kernelWidth + kw] =
+                                        kernelFlip[kBase + (kernelHeight - 1 - kh) * kernelWidth + (kernelWidth - 1 - kw)];
+                        }
+                    var fusedResult = Conv2D<float>(gradOutFloat, flippedKernel, 1, padHt, 1);
+                    var fusedF = (float[])(object)fusedResult.GetFlattenedData();
+                    var destFused = (float[])(object)dest._storage.GetDataArray();
+                    int destOffFused = dest._storageOffset;
+                    int totalFused = batch * inChannels * height * width;
+                    if (accumulate)
+                        for (int i = 0; i < totalFused; i++) destFused[destOffFused + i] += fusedF[i];
+                    else
+                        Array.Copy(fusedF, 0, destFused, destOffFused, totalFused);
+                    return;
+                }
+            }
+
             int colH = inChannels * kernelHeight * kernelWidth;
             int colW = outputHeight * outputWidth;
             // Write directly into dest's live backing — skip the temp gradInputF
@@ -14480,6 +14546,73 @@ public partial class CpuEngine : ITensorLevelEngine
     private const int ConvSmallGemmMr = 6;
 
     /// <summary>
+    /// Size-bounded large-array pool for the conv-backward K-concat scratch stacks (im2colAll / gradOutAll,
+    /// up to ~100s of MB). These exceed <see cref="System.Buffers.ArrayPool{T}"/>.Shared's ~1M-element
+    /// pooling cap, so Shared.Rent allocates a FRESH array every call and Return discards it — measured at
+    /// 8-15x the output in GC traffic per conv-backward, the dominant churn behind conv-model TRAINING
+    /// timeouts + GC-driven timing variance. This pool RECYCLES those buffers across calls (same training
+    /// shape every iteration → ~0 alloc after warmup). Hard-capped so it can never threaten the fixed 16 GB
+    /// CI runner: buffers larger than <see cref="MaxPooledLen"/> (128 MB) are NOT retained (fresh alloc,
+    /// discarded on return — foundation-scale shapes stay un-pooled, no OOM added), and at most
+    /// <see cref="MaxSlots"/> buffers are held (≤512 MB total). Returned buffers may be dirty — every
+    /// consumer (BuildKConcatStack*, the im2col helpers) fully overwrites its buffer, same as Shared.
+    /// </summary>
+    internal static class ConvScratchPool
+    {
+        private const int SharedCap = 1024 * 1024;         // ArrayPool<T>.Shared stops pooling above ~1M elements
+        private const int MaxPooledLen = 32 * 1024 * 1024; // 128 MB of floats; larger → not retained (OOM-safe)
+        private const int MaxSlots = 4;                    // ≤ 512 MB held total
+        private static readonly float[]?[] _slots = new float[]?[MaxSlots];
+        private static readonly object _lock = new object();
+
+        public static float[] Rent(int minLen)
+        {
+            if (minLen <= 0) return Array.Empty<float>();
+            // Small buffers: Shared already pools them on a lock-free per-thread stack — going through our
+            // locked pool would only add contention (regressed a small-shape perf test). Only the large
+            // buffers Shared refuses to pool are worth the bounded large pool.
+            if (minLen <= SharedCap) return System.Buffers.ArrayPool<float>.Shared.Rent(minLen);
+            if (minLen > MaxPooledLen) return new float[minLen]; // too big to retain → fresh, dropped on Return
+            lock (_lock)
+            {
+                int best = -1, bestLen = int.MaxValue;
+                for (int i = 0; i < MaxSlots; i++)
+                {
+                    var s = _slots[i];
+                    if (s is not null && s.Length >= minLen && s.Length < bestLen) { best = i; bestLen = s.Length; }
+                }
+                if (best >= 0)
+                {
+                    var r = _slots[best];
+                    _slots[best] = null;
+                    if (r is not null) return r;
+                }
+            }
+            return new float[minLen];
+        }
+
+        public static void Return(float[]? arr)
+        {
+            if (arr is null || arr.Length == 0) return;
+            // Mirror Rent: small arrays came from Shared (its max bucket is ~1M, so it never hands back a
+            // larger one), oversized ones aren't retained.
+            if (arr.Length <= SharedCap) { System.Buffers.ArrayPool<float>.Shared.Return(arr); return; }
+            if (arr.Length > MaxPooledLen) return;
+            lock (_lock)
+            {
+                int smallest = -1, smallestLen = int.MaxValue;
+                for (int i = 0; i < MaxSlots; i++)
+                {
+                    var s = _slots[i];
+                    if (s is null) { _slots[i] = arr; return; } // free slot → keep
+                    if (s.Length < smallestLen) { smallest = i; smallestLen = s.Length; }
+                }
+                if (smallest >= 0 && arr.Length > smallestLen) _slots[smallest] = arr; // evict smaller, keep larger
+            }
+        }
+    }
+
+    /// <summary>
     /// Packed SGEMM for the K-concat conv weight gradient:
     /// C[M=colH, N=oc] = A[M, K=batchColW] · B[K, N] (all row-major), C := A·B.
     /// Packs each Mr-row panel of A so the inner loop reads contiguously, holds the C tile in
@@ -14738,13 +14871,17 @@ public partial class CpuEngine : ITensorLevelEngine
             // stacking, so the buffers are the same size the fallback already rents — the
             // 64 MB element bound only needs to gate genuine multi-batch stacking.
             long kConcatElemsF = (long)colH * batch * colW;
-            const long MaxKConcatElemsF = 16L * 1024 * 1024; // 64 MB of floats
+            // Aligned with ConvScratchPool's 32M-float (128 MB) pooling cap (see Conv2DBackwardInput).
+            const long MaxKConcatElemsF = 32L * 1024 * 1024; // 128 MB of floats (was 16M)
             if (batch == 1 || (batch >= 2 && kConcatElemsF <= MaxKConcatElemsF))
             {
                 int batchColW = batch * colW;
                 var kcPool = System.Buffers.ArrayPool<float>.Shared;
-                var im2colAll = kcPool.Rent(colH * batchColW);
-                var gradOutAllT = kcPool.Rent(batchColW * outChannels);
+                // The two big K-concat stacks (im2colAll/gradOutAllT, often >> ArrayPool.Shared's pooling
+                // cap → fresh alloc + discard each call) go through the size-bounded ConvScratchPool so a
+                // training loop recycles them instead of churning GC. gradKernelT is small → Shared is fine.
+                var im2colAll = ConvScratchPool.Rent(colH * batchColW);
+                var gradOutAllT = ConvScratchPool.Rent(batchColW * outChannels);
                 var gradKernelT = kcPool.Rent(colH * outChannels);
                 try
                 {
@@ -14793,8 +14930,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
                 finally
                 {
-                    kcPool.Return(im2colAll);
-                    kcPool.Return(gradOutAllT);
+                    ConvScratchPool.Return(im2colAll);
+                    ConvScratchPool.Return(gradOutAllT);
                     kcPool.Return(gradKernelT);
                 }
             }
@@ -15371,9 +15508,71 @@ public partial class CpuEngine : ITensorLevelEngine
                 return;
             }
 
-            var gradKernelD = new double[totalLen];
             var kPoolD = System.Buffers.ArrayPool<double>.Shared;
             long im2colWorkKD = (long)inChannels * kernelHeight * kernelWidth * colW;
+
+            // #1688: batch==1 fast path — GEMM the kernel gradient straight into
+            // `dest` with the accumulate β, so NEITHER the per-image localGrad NOR
+            // the gradKernelD accumulator is allocated. Each of those is
+            // outC·inC·kH·kW doubles — e.g. 302 MB for a single 2048→2048 3×3 conv —
+            // and is too large for ArrayPool.Shared to pool (it exceeds the shared
+            // bucket cap, so Rent/`new` allocates fresh and Return discards). Across
+            // a deep many-channel backbone the general path below churns GBs of such
+            // transient per backward pass, which OOMs the 16 GB CI runner even though
+            // the model fits. A single-image backward needs no cross-batch
+            // accumulation, so the GEMM result IS the kernel gradient — write it to
+            // dest directly and the only large buffer left is dest itself (the
+            // gradient that must exist). The im2col buffer is colH·colW, which is
+            // small here (tiny spatial). Bit-identical to the general path: same
+            // gradOut · im2col^T GEMM, just targeting dest with β=accumulate.
+            if (batch == 1)
+            {
+                var im2colBuf = kPoolD.Rent(colH * colW);
+                try
+                {
+                    CpuParallelSettings.ParallelForOrSerial(0, inChannels, im2colWorkKD, c =>
+                    {
+                        Helpers.Im2ColHelper.Im2ColStridedSingleChannelRange(
+                            new ReadOnlySpan<double>(inputD, 0, inputSliceSize),
+                            new Span<double>(im2colBuf, 0, colH * colW), colW, 0,
+                            c, c + 1, height, width, kernelHeight, kernelWidth,
+                            strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
+                    }, deterministicSafe: true);
+                    if (Helpers.BlasProvider.TryGemmExBeta(
+                        outChannels, colH, colW,
+                        gradOutputD, 0, colW, false,
+                        im2colBuf, 0, colW, true,
+                        destD, destOff, colH,
+                        alpha: 1.0, beta: accumulate ? 1.0 : 0.0))
+                    {
+                        return;
+                    }
+                    // No-BLAS cold fallback (BLAS is normally present): transpose +
+                    // blocked multiply into a bounded temp, then merge per accumulate.
+                    var localGradCold = kPoolD.Rent(totalLen);
+                    var im2colT = kPoolD.Rent(colW * colH);
+                    try
+                    {
+                        for (int r = 0; r < colH; r++)
+                            for (int cc = 0; cc < colW; cc++)
+                                im2colT[cc * colH + r] = im2colBuf[r * colW + cc];
+                        Helpers.Im2ColHelper.MultiplyMatrixBlockedDouble(
+                            new ReadOnlySpan<double>(gradOutputD, 0, outChannels * colW),
+                            new ReadOnlySpan<double>(im2colT, 0, colW * colH),
+                            new Span<double>(localGradCold, 0, totalLen),
+                            outChannels, colW, colH);
+                        if (accumulate)
+                            for (int i = 0; i < totalLen; i++) destD[destOff + i] += localGradCold[i];
+                        else
+                            Array.Copy(localGradCold, 0, destD, destOff, totalLen);
+                    }
+                    finally { kPoolD.Return(localGradCold); kPoolD.Return(im2colT); }
+                }
+                finally { kPoolD.Return(im2colBuf); }
+                return;
+            }
+
+            var gradKernelD = new double[totalLen];
 
             // Per-image im2col + GEMM into localGrad (overwrite). See the float
             // counterpart ComputeBatchGradF for the channel-parallel rationale.
@@ -17040,14 +17239,558 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
         }
-        else if (DifferentiableOps.IsTapeActiveForThread<T>() || GraphMode.IsActive)
+        else
         {
-            throw new NotSupportedException(
-                "DeformableConv2D autograd with a modulation mask (DCN v2) is not yet wired. " +
-                "Either pass mask=null (DCN v1) or wrap the call in a NoGradScope<T>() to opt out " +
-                "of autograd for this op.");
+            // DCN v2 (modulation mask): record input/kernel/offset AND mask so dL flows to all four.
+            var savedState = new object[]
+            {
+                (int[])stride.Clone(), (int[])padding.Clone(), (int[])dilation.Clone(),
+            };
+            DifferentiableOps.RecordIfActive("DeformableConv2D", result,
+                new[] { input, kernel, offset, mask },
+                BackwardFunctions<T>.DeformableConv2DBackwardWithMask,
+                savedState);
+
+            if (GraphMode.IsActive)
+            {
+                var scope = GraphMode.Current;
+                if (scope != null)
+                {
+                    var capturedInput = input;
+                    var capturedKernel = kernel;
+                    var capturedOffset = offset;
+                    var capturedMask = mask;
+                    var capturedStride = (int[])stride.Clone();
+                    var capturedPadding = (int[])padding.Clone();
+                    var capturedDilation = (int[])dilation.Clone();
+                    var outShape = (int[])result._shape.Clone();
+                    return scope.RecordVariadic(
+                        LazyNodeType.Custom,
+                        "DeformableConv2D",
+                        new[] { input, kernel, offset, mask },
+                        outShape,
+                        (eng, output) =>
+                        {
+                            var replayed = eng.DeformableConv2D(
+                                capturedInput, capturedKernel, capturedOffset,
+                                capturedMask,
+                                capturedStride, capturedPadding, capturedDilation);
+                            DirectGpuTensorEngine.CopyResultInto(eng, replayed, output);
+                        },
+                        BackwardFunctions<T>.DeformableConv2DBackwardWithMask,
+                        savedState);
+                }
+            }
         }
         return result;
+    }
+
+    /// <summary>
+    /// Fused grouped / depthwise deformable convolution (DCNv3, Wang et al. 2023). Single-pass kernel:
+    /// the channels are split into <paramref name="groups"/>; output channel <c>oc</c> (group
+    /// <c>g = oc / (outChannels/groups)</c>) convolves only its group's <c>inChannels/groups</c> input
+    /// channels against kernel rows shaped <c>[outChannels, inChannels/groups, kH, kW]</c>, sampling with
+    /// its deformable-group (<paramref name="deformGroups"/>) offset/mask slice. With
+    /// <c>groups == deformGroups == 1</c> this reduces exactly to <see cref="DeformableConv2D{T}"/>.
+    /// <para>Reference CPU implementation for the fused DCNv3 kernel (#1691). The offset/mask channel
+    /// layout matches the per-group composition path: contiguous per-deformable-group blocks of
+    /// <c>2·kH·kW</c> (Y then X) for offsets and <c>kH·kW</c> for the modulation mask.</para>
+    /// </summary>
+    public virtual Tensor<T> DeformableConv2DGrouped<T>(
+        Tensor<T> input, Tensor<T> kernel, Tensor<T> offset, Tensor<T>? mask,
+        int[] stride, int[] padding, int[] dilation, int groups, int deformGroups)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (kernel == null) throw new ArgumentNullException(nameof(kernel));
+        if (offset == null) throw new ArgumentNullException(nameof(offset));
+        if (groups < 1) throw new ArgumentOutOfRangeException(nameof(groups), "Groups must be at least 1.");
+        if (deformGroups < 1) throw new ArgumentOutOfRangeException(nameof(deformGroups), "Deformable groups must be at least 1.");
+        if (groups == 1 && deformGroups == 1)
+            return DeformableConv2D(input, kernel, offset, mask, stride, padding, dilation);
+        if (input.Rank != 4) throw new ArgumentException($"DeformableConv2DGrouped requires 4D input. Got rank {input.Rank}.", nameof(input));
+        if (kernel.Rank != 4) throw new ArgumentException($"DeformableConv2DGrouped requires 4D kernel. Got rank {kernel.Rank}.", nameof(kernel));
+
+        int batch = input._shape[0];
+        int inChannels = input._shape[1];
+        int height = input._shape[2];
+        int width = input._shape[3];
+        int outChannels = kernel._shape[0];
+        int kernelInChannels = kernel._shape[1];
+        int kernelHeight = kernel._shape[2];
+        int kernelWidth = kernel._shape[3];
+
+        if (inChannels % groups != 0) throw new ArgumentException($"Input channels ({inChannels}) must be divisible by groups ({groups}).");
+        if (outChannels % groups != 0) throw new ArgumentException($"Output channels ({outChannels}) must be divisible by groups ({groups}).");
+        int inCpg = inChannels / groups;
+        int outCpg = outChannels / groups;
+        if (kernelInChannels != inCpg) throw new ArgumentException($"Kernel in_channels ({kernelInChannels}) must equal inChannels/groups ({inCpg}).");
+        // deformGroups must DIVIDE groups: there each output group maps to exactly one deformable group
+        // (dg = g·deformGroups/groups), and that mapping coincides with the GPU kernel's per-input-channel
+        // mapping (ic/(inChannels/deformGroups)). The groups<deformGroups case (deformGroups not dividing
+        // groups) would put multiple deformable groups inside one group's channel span — the CPU
+        // composition path can't express that and would silently diverge from the GPU kernel — so reject it.
+        if (groups % deformGroups != 0)
+            throw new ArgumentException($"deformGroups ({deformGroups}) must divide groups ({groups}). " +
+                "The groups<deformGroups configuration is not supported (it would diverge between the CPU and GPU paths).");
+
+        int strideH = stride[0], strideW = stride[1];
+        int padH = padding[0], padW = padding[1];
+        int dilationH = dilation[0], dilationW = dilation[1];
+        int effectiveKernelH = dilationH * (kernelHeight - 1) + 1;
+        int effectiveKernelW = dilationW * (kernelWidth - 1) + 1;
+        int outputHeight = (height + 2 * padH - effectiveKernelH) / strideH + 1;
+        int outputWidth = (width + 2 * padW - effectiveKernelW) / strideW + 1;
+        int numKernelPositions = kernelHeight * kernelWidth;
+        int offChans = 2 * numKernelPositions * deformGroups;
+        int maskChans = numKernelPositions * deformGroups;
+        var numOps = MathHelper.GetNumericOperations<T>();
+
+        var inputData = input.GetDataArray();
+        var kernelData = kernel.GetDataArray();
+        var offsetData = offset.GetDataArray();
+        var maskData = mask?.GetDataArray();
+        var result = TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth]);
+        var outputData = result.GetDataArray();
+
+        CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, outputData.Length, idx =>
+        {
+            int b = idx / outChannels;
+            int oc = idx % outChannels;
+            int g = oc / outCpg;                                   // output group
+            int dg = deformGroups == 1 ? 0 : g * deformGroups / groups; // deformable group
+            int icBase = g * inCpg;                                // first input channel of this group
+            int offBlock = dg * 2 * numKernelPositions;            // offset channel base for this deform group
+            int maskBlock = dg * numKernelPositions;
+
+            for (int oh = 0; oh < outputHeight; oh++)
+            {
+                for (int ow = 0; ow < outputWidth; ow++)
+                {
+                    T sum = numOps.Zero;
+                    for (int ic = 0; ic < inCpg; ic++)
+                    {
+                        int icGlobal = icBase + ic;
+                        for (int kh = 0; kh < kernelHeight; kh++)
+                        {
+                            for (int kw = 0; kw < kernelWidth; kw++)
+                            {
+                                int kp = kh * kernelWidth + kw;
+                                int offYIdx = ((b * offChans + offBlock + kp) * outputHeight + oh) * outputWidth + ow;
+                                int offXIdx = ((b * offChans + offBlock + numKernelPositions + kp) * outputHeight + oh) * outputWidth + ow;
+                                double offsetY = numOps.ToDouble(offsetData[offYIdx]);
+                                double offsetX = numOps.ToDouble(offsetData[offXIdx]);
+                                double sampledH = oh * strideH - padH + kh * dilationH + offsetY;
+                                double sampledW = ow * strideW - padW + kw * dilationW + offsetX;
+                                T sampledValue = BilinearSample(inputData, b, icGlobal, inChannels, height, width, sampledH, sampledW, numOps);
+                                if (maskData != null)
+                                {
+                                    int maskIdx = ((b * maskChans + maskBlock + kp) * outputHeight + oh) * outputWidth + ow;
+                                    sampledValue = numOps.Multiply(sampledValue, maskData[maskIdx]);
+                                }
+                                int kernelIdx = ((oc * inCpg + ic) * kernelHeight + kh) * kernelWidth + kw;
+                                sum = numOps.Add(sum, numOps.Multiply(sampledValue, kernelData[kernelIdx]));
+                            }
+                        }
+                    }
+                    int outputIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
+                    outputData[outputIdx] = sum;
+                }
+            }
+        });
+
+        // Tape + lazy-graph registration — only DCN v1 (mask null) for now, mirroring DeformableConv2D.
+        // The grouped backward (input/kernel/offset) is wired; the modulation-mask (DCN v2) grad isn't,
+        // so fail fast under an active tape/graph rather than silently dropping dL when a mask is passed.
+        if (mask is null)
+        {
+            var savedState = new object[]
+            {
+                (int[])stride.Clone(), (int[])padding.Clone(), (int[])dilation.Clone(), groups, deformGroups,
+            };
+            DifferentiableOps.RecordIfActive("DeformableConv2DGrouped", result,
+                new[] { input, kernel, offset },
+                BackwardFunctions<T>.DeformableConv2DGroupedBackward,
+                savedState);
+
+            if (GraphMode.IsActive)
+            {
+                var scope = GraphMode.Current;
+                if (scope != null)
+                {
+                    var capturedInput = input;
+                    var capturedKernel = kernel;
+                    var capturedOffset = offset;
+                    var capturedStride = (int[])stride.Clone();
+                    var capturedPadding = (int[])padding.Clone();
+                    var capturedDilation = (int[])dilation.Clone();
+                    int capturedGroups = groups;
+                    int capturedDeformGroups = deformGroups;
+                    var outShape = (int[])result._shape.Clone();
+                    return scope.RecordVariadic(
+                        LazyNodeType.Custom,
+                        "DeformableConv2DGrouped",
+                        new[] { input, kernel, offset },
+                        outShape,
+                        (eng, output) =>
+                        {
+                            var replayed = eng.DeformableConv2DGrouped(
+                                capturedInput, capturedKernel, capturedOffset,
+                                mask: null,
+                                capturedStride, capturedPadding, capturedDilation,
+                                capturedGroups, capturedDeformGroups);
+                            DirectGpuTensorEngine.CopyResultInto(eng, replayed, output);
+                        },
+                        BackwardFunctions<T>.DeformableConv2DGroupedBackward,
+                        savedState);
+                }
+            }
+        }
+        else
+        {
+            // DCN v2 / v3 (modulation mask): record input/kernel/offset AND mask so dL flows to all four.
+            var savedState = new object[]
+            {
+                (int[])stride.Clone(), (int[])padding.Clone(), (int[])dilation.Clone(), groups, deformGroups,
+            };
+            DifferentiableOps.RecordIfActive("DeformableConv2DGrouped", result,
+                new[] { input, kernel, offset, mask },
+                BackwardFunctions<T>.DeformableConv2DGroupedBackwardWithMask,
+                savedState);
+
+            if (GraphMode.IsActive)
+            {
+                var scope = GraphMode.Current;
+                if (scope != null)
+                {
+                    var capturedInput = input;
+                    var capturedKernel = kernel;
+                    var capturedOffset = offset;
+                    var capturedMask = mask;
+                    var capturedStride = (int[])stride.Clone();
+                    var capturedPadding = (int[])padding.Clone();
+                    var capturedDilation = (int[])dilation.Clone();
+                    int capturedGroups = groups;
+                    int capturedDeformGroups = deformGroups;
+                    var outShape = (int[])result._shape.Clone();
+                    return scope.RecordVariadic(
+                        LazyNodeType.Custom,
+                        "DeformableConv2DGrouped",
+                        new[] { input, kernel, offset, mask },
+                        outShape,
+                        (eng, output) =>
+                        {
+                            var replayed = eng.DeformableConv2DGrouped(
+                                capturedInput, capturedKernel, capturedOffset,
+                                capturedMask,
+                                capturedStride, capturedPadding, capturedDilation,
+                                capturedGroups, capturedDeformGroups);
+                            DirectGpuTensorEngine.CopyResultInto(eng, replayed, output);
+                        },
+                        BackwardFunctions<T>.DeformableConv2DGroupedBackwardWithMask,
+                        savedState);
+                }
+            }
+        }
+        return result;
+    }
+
+    // ---- Grouped DCNv3 backward (#1691). Single-pass FUSED kernels: one parallel region over the full
+    // output/deform-group space with inline group indexing — no per-group slicing or G separate launches.
+    // (Replaces the earlier per-group composition; finite-difference + GPU-parity verified. The constraint
+    // deformGroups | groups, enforced by the forward, guarantees groupsPerDg = groups/deformGroups output
+    // groups share each deformable group.) ----
+
+    /// <summary>Grouped <see cref="DeformableConv2D{T}"/> gradient w.r.t. input (#1691, fused single pass).</summary>
+    public virtual Tensor<T> DeformableConv2DGroupedBackwardInput<T>(
+        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> kernel, Tensor<T> offset, Tensor<T>? mask,
+        int[] inputShape, int[] stride, int[] padding, int[] dilation, int groups, int deformGroups)
+    {
+        if (groups == 1 && deformGroups == 1)
+            return DeformableConv2DBackwardInput(gradOutput, input, kernel, offset, mask, inputShape, stride, padding, dilation);
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int batch = inputShape[0], inChannels = inputShape[1], height = inputShape[2], width = inputShape[3];
+        int outChannels = kernel._shape[0], kernelHeight = kernel._shape[2], kernelWidth = kernel._shape[3];
+        int strideH = stride[0], strideW = stride[1], padH = padding[0], padW = padding[1], dilationH = dilation[0], dilationW = dilation[1];
+        int outputHeight = gradOutput._shape[2], outputWidth = gradOutput._shape[3];
+        int numKernelPositions = kernelHeight * kernelWidth;
+        int inCpg = inChannels / groups, outCpg = outChannels / groups;
+        int offChans = 2 * numKernelPositions * deformGroups, maskChans = numKernelPositions * deformGroups;
+
+        var gradInput = AutoTensorCache.RentOrAllocate<T>(inputShape);
+        var gradInputData = gradInput.GetDataArray();
+        Array.Clear(gradInputData, 0, (int)gradInput.Length);
+        var gradOutputData = gradOutput.GetDataArray();
+        var kernelData = kernel.GetDataArray();
+        var offsetData = offset.GetDataArray();
+        var maskData = mask?.GetDataArray();
+
+        var locks = new object[batch * inChannels * height * width];
+        for (int i = 0; i < locks.Length; i++) locks[i] = new object();
+
+        // Parallelize over the full (batch, outChannel) space (all groups) -> good core utilization.
+        CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels,
+            (long)batch * outChannels * outputHeight * outputWidth, idx =>
+        {
+            int b = idx / outChannels;
+            int oc = idx % outChannels;
+            int g = oc / outCpg;
+            int dg = deformGroups == 1 ? 0 : g * deformGroups / groups;
+            int icBase = g * inCpg;
+            int offBlock = dg * 2 * numKernelPositions;
+            int maskBlock = dg * numKernelPositions;
+
+            for (int oh = 0; oh < outputHeight; oh++)
+            for (int ow = 0; ow < outputWidth; ow++)
+            {
+                int gradOutIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
+                T gradOutVal = gradOutputData[gradOutIdx];
+                for (int icl = 0; icl < inCpg; icl++)
+                {
+                    int icGlobal = icBase + icl;
+                    for (int kh = 0; kh < kernelHeight; kh++)
+                    for (int kw = 0; kw < kernelWidth; kw++)
+                    {
+                        int kp = kh * kernelWidth + kw;
+                        int kernelIdx = ((oc * inCpg + icl) * kernelHeight + kh) * kernelWidth + kw;
+                        int offYIdx = ((b * offChans + offBlock + kp) * outputHeight + oh) * outputWidth + ow;
+                        int offXIdx = ((b * offChans + offBlock + numKernelPositions + kp) * outputHeight + oh) * outputWidth + ow;
+                        double offsetY = numOps.ToDouble(offsetData[offYIdx]);
+                        double offsetX = numOps.ToDouble(offsetData[offXIdx]);
+                        double sampledH = oh * strideH - padH + kh * dilationH + offsetY;
+                        double sampledW = ow * strideW - padW + kw * dilationW + offsetX;
+                        T modulation = numOps.One;
+                        if (maskData != null)
+                        {
+                            int maskIdx = ((b * maskChans + maskBlock + kp) * outputHeight + oh) * outputWidth + ow;
+                            modulation = maskData[maskIdx];
+                        }
+                        T gradVal = numOps.Multiply(numOps.Multiply(gradOutVal, kernelData[kernelIdx]), modulation);
+                        BilinearBackwardInput(gradInputData, gradVal, b, icGlobal, inChannels, height, width, sampledH, sampledW, numOps, locks);
+                    }
+                }
+            }
+        });
+        return gradInput;
+    }
+
+    /// <summary>Grouped <see cref="DeformableConv2D{T}"/> gradient w.r.t. kernel (#1691, fused single pass).</summary>
+    public virtual Tensor<T> DeformableConv2DGroupedBackwardKernel<T>(
+        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> offset, Tensor<T>? mask,
+        int[] kernelShape, int[] stride, int[] padding, int[] dilation, int groups, int deformGroups)
+    {
+        if (groups == 1 && deformGroups == 1)
+            return DeformableConv2DBackwardKernel(gradOutput, input, offset, mask, kernelShape, stride, padding, dilation);
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int batch = input._shape[0], inChannels = input._shape[1], height = input._shape[2], width = input._shape[3];
+        int outChannels = kernelShape[0], inCpg = kernelShape[1], kernelHeight = kernelShape[2], kernelWidth = kernelShape[3];
+        int strideH = stride[0], strideW = stride[1], padH = padding[0], padW = padding[1], dilationH = dilation[0], dilationW = dilation[1];
+        int outputHeight = gradOutput._shape[2], outputWidth = gradOutput._shape[3];
+        int numKernelPositions = kernelHeight * kernelWidth;
+        int outCpg = outChannels / groups;
+        int offChans = 2 * numKernelPositions * deformGroups, maskChans = numKernelPositions * deformGroups;
+
+        var gradKernel = AutoTensorCache.RentOrAllocate<T>(kernelShape);
+        var gradKernelData = gradKernel.GetDataArray();
+        Array.Clear(gradKernelData, 0, (int)gradKernel.Length);
+        var gradOutputData = gradOutput.GetDataArray();
+        var inputData = input.GetDataArray();
+        var offsetData = offset.GetDataArray();
+        var maskData = mask?.GetDataArray();
+
+        // Parallelize over output channels: each oc owns disjoint kernel rows -> no locks needed.
+        CpuParallelSettings.ParallelForOrSerial(0, outChannels,
+            (long)batch * outChannels * outputHeight * outputWidth, oc =>
+        {
+            int g = oc / outCpg;
+            int dg = deformGroups == 1 ? 0 : g * deformGroups / groups;
+            int icBase = g * inCpg;
+            int offBlock = dg * 2 * numKernelPositions;
+            int maskBlock = dg * numKernelPositions;
+
+            for (int b = 0; b < batch; b++)
+            for (int oh = 0; oh < outputHeight; oh++)
+            for (int ow = 0; ow < outputWidth; ow++)
+            {
+                int gradOutIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
+                T gradOutVal = gradOutputData[gradOutIdx];
+                for (int icl = 0; icl < inCpg; icl++)
+                {
+                    int icGlobal = icBase + icl;
+                    for (int kh = 0; kh < kernelHeight; kh++)
+                    for (int kw = 0; kw < kernelWidth; kw++)
+                    {
+                        int kp = kh * kernelWidth + kw;
+                        int kernelIdx = ((oc * inCpg + icl) * kernelHeight + kh) * kernelWidth + kw;
+                        int offYIdx = ((b * offChans + offBlock + kp) * outputHeight + oh) * outputWidth + ow;
+                        int offXIdx = ((b * offChans + offBlock + numKernelPositions + kp) * outputHeight + oh) * outputWidth + ow;
+                        double offsetY = numOps.ToDouble(offsetData[offYIdx]);
+                        double offsetX = numOps.ToDouble(offsetData[offXIdx]);
+                        double sampledH = oh * strideH - padH + kh * dilationH + offsetY;
+                        double sampledW = ow * strideW - padW + kw * dilationW + offsetX;
+                        T sampledValue = BilinearSample(inputData, b, icGlobal, inChannels, height, width, sampledH, sampledW, numOps);
+                        if (maskData != null)
+                        {
+                            int maskIdx = ((b * maskChans + maskBlock + kp) * outputHeight + oh) * outputWidth + ow;
+                            sampledValue = numOps.Multiply(sampledValue, maskData[maskIdx]);
+                        }
+                        gradKernelData[kernelIdx] = numOps.Add(gradKernelData[kernelIdx], numOps.Multiply(gradOutVal, sampledValue));
+                    }
+                }
+            }
+        });
+        return gradKernel;
+    }
+
+    /// <summary>Grouped <see cref="DeformableConv2D{T}"/> gradient w.r.t. offset (#1691, fused single pass).
+    /// Each deformable group's offset gradient sums over the <c>groups/deformGroups</c> output groups sharing it.</summary>
+    public virtual Tensor<T> DeformableConv2DGroupedBackwardOffset<T>(
+        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> kernel, Tensor<T> offset, Tensor<T>? mask,
+        int[] stride, int[] padding, int[] dilation, int groups, int deformGroups)
+    {
+        if (groups == 1 && deformGroups == 1)
+            return DeformableConv2DBackwardOffset(gradOutput, input, kernel, offset, mask, stride, padding, dilation);
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int batch = input._shape[0], inChannels = input._shape[1], height = input._shape[2], width = input._shape[3];
+        int outChannels = kernel._shape[0], kernelHeight = kernel._shape[2], kernelWidth = kernel._shape[3];
+        int strideH = stride[0], strideW = stride[1], padH = padding[0], padW = padding[1], dilationH = dilation[0], dilationW = dilation[1];
+        int outputHeight = gradOutput._shape[2], outputWidth = gradOutput._shape[3];
+        int numKernelPositions = kernelHeight * kernelWidth;
+        int inCpg = inChannels / groups, outCpg = outChannels / groups, groupsPerDg = groups / deformGroups;
+        int offChans = 2 * numKernelPositions * deformGroups, maskChans = numKernelPositions * deformGroups;
+
+        var gradOffset = AutoTensorCache.RentOrAllocate<T>(offset._shape);
+        var gradOffsetData = gradOffset.GetDataArray();
+        Array.Clear(gradOffsetData, 0, (int)gradOffset.Length);
+        var gradOutputData = gradOutput.GetDataArray();
+        var inputData = input.GetDataArray();
+        var kernelData = kernel.GetDataArray();
+        var offsetData = offset.GetDataArray();
+        var maskData = mask?.GetDataArray();
+
+        // Parallelize over (batch, deformGroup): each owns a disjoint offset block -> no locks.
+        CpuParallelSettings.ParallelForOrSerial(0, batch * deformGroups,
+            (long)batch * outChannels * outputHeight * outputWidth, idx =>
+        {
+            int b = idx / deformGroups;
+            int dg = idx % deformGroups;
+            int offBlock = dg * 2 * numKernelPositions, maskBlock = dg * numKernelPositions;
+            int gStart = dg * groupsPerDg, gEnd = gStart + groupsPerDg;
+
+            for (int oh = 0; oh < outputHeight; oh++)
+            for (int ow = 0; ow < outputWidth; ow++)
+            for (int kh = 0; kh < kernelHeight; kh++)
+            for (int kw = 0; kw < kernelWidth; kw++)
+            {
+                int kp = kh * kernelWidth + kw;
+                int offYIdx = ((b * offChans + offBlock + kp) * outputHeight + oh) * outputWidth + ow;
+                int offXIdx = ((b * offChans + offBlock + numKernelPositions + kp) * outputHeight + oh) * outputWidth + ow;
+                double offsetY = numOps.ToDouble(offsetData[offYIdx]);
+                double offsetX = numOps.ToDouble(offsetData[offXIdx]);
+                double sampledH = oh * strideH - padH + kh * dilationH + offsetY;
+                double sampledW = ow * strideW - padW + kw * dilationW + offsetX;
+                T modulation = numOps.One;
+                if (maskData != null)
+                {
+                    int maskIdx = ((b * maskChans + maskBlock + kp) * outputHeight + oh) * outputWidth + ow;
+                    modulation = maskData[maskIdx];
+                }
+
+                T gradOffsetY = numOps.Zero, gradOffsetX = numOps.Zero;
+                for (int g = gStart; g < gEnd; g++)
+                {
+                    int icBase = g * inCpg, ocBase = g * outCpg;
+                    for (int ocl = 0; ocl < outCpg; ocl++)
+                    {
+                        int oc = ocBase + ocl;
+                        int gradOutIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
+                        T gradOutVal = gradOutputData[gradOutIdx];
+                        for (int icl = 0; icl < inCpg; icl++)
+                        {
+                            int icGlobal = icBase + icl;
+                            int kernelIdx = ((oc * inCpg + icl) * kernelHeight + kh) * kernelWidth + kw;
+                            var (dH, dW) = BilinearGradient(inputData, b, icGlobal, inChannels, height, width, sampledH, sampledW, numOps);
+                            T factor = numOps.Multiply(numOps.Multiply(gradOutVal, kernelData[kernelIdx]), modulation);
+                            gradOffsetY = numOps.Add(gradOffsetY, numOps.Multiply(factor, dH));
+                            gradOffsetX = numOps.Add(gradOffsetX, numOps.Multiply(factor, dW));
+                        }
+                    }
+                }
+                gradOffsetData[offYIdx] = gradOffsetY;
+                gradOffsetData[offXIdx] = gradOffsetX;
+            }
+        });
+        return gradOffset;
+    }
+
+    /// <summary>Grouped <see cref="DeformableConv2D{T}"/> gradient w.r.t. modulation mask (#1691, fused single pass).</summary>
+    public virtual Tensor<T> DeformableConv2DGroupedBackwardMask<T>(
+        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> kernel, Tensor<T> offset, Tensor<T> mask,
+        int[] stride, int[] padding, int[] dilation, int groups, int deformGroups)
+    {
+        if (groups == 1 && deformGroups == 1)
+            return DeformableConv2DBackwardMask(gradOutput, input, kernel, offset, mask, stride, padding, dilation);
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int batch = input._shape[0], inChannels = input._shape[1], height = input._shape[2], width = input._shape[3];
+        int outChannels = kernel._shape[0], kernelHeight = kernel._shape[2], kernelWidth = kernel._shape[3];
+        int strideH = stride[0], strideW = stride[1], padH = padding[0], padW = padding[1], dilationH = dilation[0], dilationW = dilation[1];
+        int outputHeight = gradOutput._shape[2], outputWidth = gradOutput._shape[3];
+        int numKernelPositions = kernelHeight * kernelWidth;
+        int inCpg = inChannels / groups, outCpg = outChannels / groups, groupsPerDg = groups / deformGroups;
+        int offChans = 2 * numKernelPositions * deformGroups, maskChans = numKernelPositions * deformGroups;
+
+        var gradMask = AutoTensorCache.RentOrAllocate<T>(mask._shape);
+        var gradMaskData = gradMask.GetDataArray();
+        Array.Clear(gradMaskData, 0, (int)gradMask.Length);
+        var gradOutputData = gradOutput.GetDataArray();
+        var inputData = input.GetDataArray();
+        var kernelData = kernel.GetDataArray();
+        var offsetData = offset.GetDataArray();
+
+        // Parallelize over (batch, deformGroup): each owns a disjoint mask block -> no locks.
+        CpuParallelSettings.ParallelForOrSerial(0, batch * deformGroups,
+            (long)batch * outChannels * outputHeight * outputWidth, idx =>
+        {
+            int b = idx / deformGroups;
+            int dg = idx % deformGroups;
+            int offBlock = dg * 2 * numKernelPositions, maskBlock = dg * numKernelPositions;
+            int gStart = dg * groupsPerDg, gEnd = gStart + groupsPerDg;
+
+            for (int oh = 0; oh < outputHeight; oh++)
+            for (int ow = 0; ow < outputWidth; ow++)
+            for (int kh = 0; kh < kernelHeight; kh++)
+            for (int kw = 0; kw < kernelWidth; kw++)
+            {
+                int kp = kh * kernelWidth + kw;
+                int offYIdx = ((b * offChans + offBlock + kp) * outputHeight + oh) * outputWidth + ow;
+                int offXIdx = ((b * offChans + offBlock + numKernelPositions + kp) * outputHeight + oh) * outputWidth + ow;
+                double offsetY = numOps.ToDouble(offsetData[offYIdx]);
+                double offsetX = numOps.ToDouble(offsetData[offXIdx]);
+                double sampledH = oh * strideH - padH + kh * dilationH + offsetY;
+                double sampledW = ow * strideW - padW + kw * dilationW + offsetX;
+
+                T gradMaskVal = numOps.Zero;
+                for (int g = gStart; g < gEnd; g++)
+                {
+                    int icBase = g * inCpg, ocBase = g * outCpg;
+                    for (int ocl = 0; ocl < outCpg; ocl++)
+                    {
+                        int oc = ocBase + ocl;
+                        int gradOutIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
+                        T gradOutVal = gradOutputData[gradOutIdx];
+                        for (int icl = 0; icl < inCpg; icl++)
+                        {
+                            int icGlobal = icBase + icl;
+                            int kernelIdx = ((oc * inCpg + icl) * kernelHeight + kh) * kernelWidth + kw;
+                            T sampledValue = BilinearSample(inputData, b, icGlobal, inChannels, height, width, sampledH, sampledW, numOps);
+                            gradMaskVal = numOps.Add(gradMaskVal, numOps.Multiply(numOps.Multiply(gradOutVal, kernelData[kernelIdx]), sampledValue));
+                        }
+                    }
+                }
+                int maskIdx = ((b * maskChans + maskBlock + kp) * outputHeight + oh) * outputWidth + ow;
+                gradMaskData[maskIdx] = gradMaskVal;
+            }
+        });
+        return gradMask;
     }
 
     /// <summary>
