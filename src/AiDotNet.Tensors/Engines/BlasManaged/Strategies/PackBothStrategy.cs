@@ -908,8 +908,13 @@ internal static class PackBothStrategy
         // Panel pc occupies numMr * effKc * mr floats; pc panels are laid end to end with a
         // fixed per-panel stride of numMr * kc * mr so a worker can index (pc, ir) directly.
         int aPanelStride = numMr * kc * mr;
-        long packAElems = (long)numKPanels * aPanelStride;
-        var packAArr = System.Buffers.ArrayPool<float>.Shared.Rent((int)packAElems);
+        long packAElemsPerCopy = (long)numKPanels * aPanelStride;
+        // Per-CCX A-replication: pack ONE packed-A copy per L3 domain so each pinned worker reads its
+        // CCX-local copy (no cross-CCX shared-A reads). Copies are identical ⇒ bit-exact; a non-pinned
+        // thread (CurrentDomain==0) reads copy 0. Only when the pinned pool + replication are both on.
+        int nCopies = (PinnedParallel.s_enabled && PinnedParallel.s_replicate && PinnedParallel.DomainCount > 1)
+            ? PinnedParallel.DomainCount : 1;
+        var packAArr = System.Buffers.ArrayPool<float>.Shared.Rent((int)(packAElemsPerCopy * nCopies));
         try
         {
             for (int pIdx = 0; pIdx < numKPanels; pIdx++)
@@ -922,9 +927,14 @@ internal static class PackBothStrategy
                     packAArr.AsSpan(pIdx * aPanelStride, numMr * effKc * mr),
                     mc: m, kc: effKc, mr);
             }
+            // Replicate copy 0 into the remaining per-CCX copies.
+            for (int cp = 1; cp < nCopies; cp++)
+                Array.Copy(packAArr, 0L, packAArr, cp * packAElemsPerCopy, packAElemsPerCopy);
 
-            nint aPackAddr = 0, bAddr = (nint)bPtr, cAddr = (nint)cPtr;
-            fixed (float* paBase = packAArr) { aPackAddr = (nint)paBase;
+            nint bAddr = (nint)bPtr, cAddr = (nint)cPtr;
+            int aCopyStrideBytes = (int)(packAElemsPerCopy * sizeof(float));
+            int nCopiesL = nCopies;
+            fixed (float* paBase = packAArr) { nint aPackAddr = (nint)paBase;
 
             int kcL = kc, ncL = nc, nrL = nr, mrL = mr, ldbL = ldb, ldcL = ldc;
             int numKPanelsL = numKPanels, numMrL = numMr, aPanelStrideL = aPanelStride;
@@ -944,7 +954,10 @@ internal static class PackBothStrategy
                 byte[] packBArr = System.Buffers.ArrayPool<byte>.Shared.Rent(numKPanelsL * bPanelStride * sizeof(float));
                 try
                 {
-                    float* pa = (float*)aPackAddr;
+                    // Per-CCX A-replication: read this worker's CCX-local packed-A copy (copy 0 otherwise).
+                    int cp = nCopiesL > 1 ? PinnedParallel.CurrentDomain : 0;
+                    if (cp < 0 || cp >= nCopiesL) cp = 0;
+                    float* pa = (float*)(aPackAddr + (nint)cp * aCopyStrideBytes);
                     float* bb = (float*)bAddr;
                     float* cc = (float*)cAddr;
                     var packBSpan = MemoryMarshal.Cast<byte, float>(packBArr.AsSpan());

@@ -15,13 +15,14 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// </summary>
 internal static class PinnedParallel
 {
-    private static int _n, _initState; // _initState: 0 unstarted, 1 ready, 2 unavailable
+    private static int _n, _initState, _domainCount; // _initState: 0 unstarted, 1 ready, 2 unavailable
     private static readonly object _initGate = new(), _runGate = new();
     private static ManualResetEventSlim[] _go = Array.Empty<ManualResetEventSlim>();
     private static CountdownEvent? _done;
     private static Action<int>? _body;
     private static int _from, _to, _next;
     private static volatile bool _faulted;
+    [ThreadStatic] private static int _curDomain; // this worker's L3-domain (CCX) index, 0..DomainCount-1
 
     /// <summary>Route the FP32 N-axis parallel-for through the L3-domain-pinned pool. Default ON — measured
     /// 1.08-1.16x bit-exact on the diffusion thin-M wide-N shapes (--ab-pinned). Opt out with
@@ -30,7 +31,21 @@ internal static class PinnedParallel
     internal static bool s_enabled =
         System.Environment.GetEnvironmentVariable("AIDOTNET_PIN_NAXIS") != "0";
 
+    /// <summary>Per-CCX A-replication (env AIDOTNET_PIN_REPLICATE=1): the N-axis packs one packed-A copy
+    /// per L3 domain and each pinned worker reads its CCX-local copy via <see cref="CurrentDomain"/>,
+    /// killing cross-CCX shared-A reads. Correctness is independent (copies are identical; copy 0 is the
+    /// fallback on any non-pinned thread).</summary>
+    internal static bool s_replicate =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_PIN_REPLICATE") == "1";
+
     internal static bool IsAvailable { get { EnsureInit(); return _initState == 1; } }
+
+    /// <summary>Distinct L3 domains (CCX) the pool spans (≥1).</summary>
+    internal static int DomainCount { get { EnsureInit(); return _domainCount < 1 ? 1 : _domainCount; } }
+
+    /// <summary>The running worker's L3-domain index; 0 on threadpool/non-pool threads (so reading copy 0
+    /// is always valid).</summary>
+    internal static int CurrentDomain => _curDomain;
 
     private static void EnsureInit()
     {
@@ -40,19 +55,31 @@ internal static class PinnedParallel
             if (_initState != 0) return;
             try
             {
-                // Build the per-thread pin target list. Per-core mode (AIDOTNET_PIN_PERCORE=1, OB-exact):
-                // ONE thread per physical core, pinned to that core's mask — no SMT contention. Default:
-                // L3-domain mode — Domain.Cores threads per CCX, each pinned to the CCX mask.
+                // Build (pin target, L3-domain index) per thread. The domain index groups threads by CCX
+                // so per-CCX A-replication can hand each worker its local copy. Per-core mode
+                // (AIDOTNET_PIN_PERCORE=1): one thread per physical core (no SMT), mapped back to its L3
+                // domain. Default: Domain.Cores threads per CCX, each pinned to the CCX mask.
+                var l3 = CpuTopology.DetectL3Domains();
+                _domainCount = l3.Length;
                 var pins = new System.Collections.Generic.List<CpuTopology.Domain>();
+                var domIdx = new System.Collections.Generic.List<int>();
                 if (System.Environment.GetEnvironmentVariable("AIDOTNET_PIN_PERCORE") == "1")
-                    foreach (var core in CpuTopology.DetectPhysicalCores()) pins.Add(core);
+                {
+                    foreach (var core in CpuTopology.DetectPhysicalCores())
+                    {
+                        int di = 0;
+                        for (int j = 0; j < l3.Length; j++) if ((l3[j].Mask & core.Mask) == core.Mask) { di = j; break; }
+                        pins.Add(core); domIdx.Add(di);
+                    }
+                }
                 if (pins.Count < 2)
                 {
-                    pins.Clear();
-                    foreach (var dom in CpuTopology.DetectL3Domains())
-                        for (int c = 0; c < dom.Cores; c++) pins.Add(dom);
+                    pins.Clear(); domIdx.Clear();
+                    for (int di = 0; di < l3.Length; di++)
+                        for (int c = 0; c < l3[di].Cores; c++) { pins.Add(l3[di]); domIdx.Add(di); }
                 }
                 if (pins.Count < 2) { Volatile.Write(ref _initState, 2); return; }
+                if (_domainCount < 1) _domainCount = 1;
                 _n = pins.Count;
                 _go = new ManualResetEventSlim[_n];
                 _done = new CountdownEvent(_n);
@@ -60,8 +87,9 @@ internal static class PinnedParallel
                 {
                     int myId = id;
                     var pin = pins[id];
+                    int myDom = domIdx[id];
                     _go[myId] = new ManualResetEventSlim(false);
-                    new Thread(() => Worker(myId, pin)) { IsBackground = true, Name = $"aidotnet-pin-{myId}" }.Start();
+                    new Thread(() => Worker(myId, pin, myDom)) { IsBackground = true, Name = $"aidotnet-pin-{myId}" }.Start();
                 }
                 Volatile.Write(ref _initState, 1);
             }
@@ -69,9 +97,10 @@ internal static class PinnedParallel
         }
     }
 
-    private static void Worker(int id, CpuTopology.Domain dom)
+    private static void Worker(int id, CpuTopology.Domain dom, int domainIndex)
     {
         CpuTopology.TryPinCurrentThread(dom); // pin to L3 domain (best-effort; correctness is pin-independent)
+        _curDomain = domainIndex;             // expose the worker's CCX index for per-CCX A-replication
         while (true)
         {
             _go[id].Wait();
@@ -123,7 +152,10 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 internal static class PinnedParallel
 {
     internal static bool s_enabled;
+    internal static bool s_replicate;
     internal static bool IsAvailable => false;
+    internal static int DomainCount => 1;
+    internal static int CurrentDomain => 0;
     internal static bool For(int from, int to, System.Action<int> body) => false;
 }
 #endif
