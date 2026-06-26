@@ -102,6 +102,13 @@ class Program
             return;
         }
 
+        // #475 thread-scaling curve (DOP 1..32) vs OpenBLAS. (--ab-scaling)
+        if (args[0] == "--ab-scaling")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.ScalingSweep();
+            return;
+        }
+
         if (args[0] == "--ab-aiseval-dopsweep")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.DopSweep();

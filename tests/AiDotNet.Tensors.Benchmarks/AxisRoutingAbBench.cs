@@ -317,6 +317,45 @@ public static class AxisRoutingAbBench
         CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
     }
 
+    /// <summary>
+    /// #475 thread-scaling curve: GF/s + scaling + efficiency at DOP 1..32 on the diffusion shapes,
+    /// vs OpenBLAS. Locates WHERE multi-thread scaling breaks (SMT/CCX/contention) before changing
+    /// anything. Run: <c>--ab-scaling</c> (with AIDOTNET_USE_BLAS=1 for the OB bar).
+    /// </summary>
+    public static unsafe void ScalingSweep()
+    {
+        Console.WriteLine("=== #475 thread-scaling curve (16C/32T Zen2) ===");
+        var shapes = new (string label, int m, int n, int k)[]
+        {
+            ("ffn    384x6144x1536", 384, 6144, 1536),
+            ("medium 384x1024x1024", 384, 1024, 1024),
+            ("square 1024x1024x1024", 1024, 1024, 1024),
+        };
+        int[] dops = { 1, 2, 4, 8, 16, 24, 32 };
+        PackBothStrategy.s_macroKernel = true;
+        foreach (var (label, m, n, k) in shapes)
+        {
+            var a = MakeRandom(m * k); var b = MakeRandom(k * n); var c = new float[m * n];
+            double flops = 2.0 * m * n * k;
+            Console.WriteLine($"  {label}:");
+            double s1 = 0;
+            foreach (int dop in dops)
+            {
+                CpuParallelSettings.MaxDegreeOfParallelism = dop;
+                double gf = flops / TimeMinGemm(a, b, c, m, n, k) / 1e9;
+                if (dop == 1) s1 = gf;
+                Console.WriteLine($"    DOP={dop,2}: {gf,6:F0} GF/s   {gf / s1,4:F1}x   eff={gf / s1 / dop * 100,3:F0}%");
+            }
+            if (BlasProvider.HasRawSgemm)
+            {
+                CpuParallelSettings.MaxDegreeOfParallelism = 32;
+                Console.WriteLine($"    OpenBLAS (auto-threaded): {flops / TimeMinPtr(a, b, c, m, n, k, jit: false) / 1e9,6:F0} GF/s");
+            }
+        }
+        PackBothStrategy.s_macroKernel = false;
+        CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
+    }
+
     private static double Gf(double flops, double sec) => flops / sec / 1e9;
 
     private static unsafe double TimeMinNative(float[] a, float[] b, float[] c, int m, int n, int k)
