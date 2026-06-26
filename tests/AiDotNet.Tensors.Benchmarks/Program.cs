@@ -56,6 +56,14 @@ class Program
             return;
         }
 
+        // #475 medium-axis routing A/B — forced M/N/2D vs the live heuristic vs OpenBLAS
+        // on the diffusion FP32 shapes, full DOP, deterministic. (--ab-axis-routing)
+        if (args[0] == "--ab-axis-routing")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.Run();
+            return;
+        }
+
         if (args[0] == "--ab-aiseval-dopsweep")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.DopSweep();

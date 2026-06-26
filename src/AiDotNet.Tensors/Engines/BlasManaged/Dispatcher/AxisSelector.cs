@@ -65,12 +65,24 @@ internal static class AxisSelector
     /// <param name="nr">Microkernel column-tile width.</param>
     /// <param name="procs">Available processor count (≥ 1).</param>
     /// <param name="isDeterministic">True if BlasProvider.IsDeterministicMode is set.</param>
+    /// <summary>
+    /// A/B test hook (#475 medium-axis routing). When non-null on the calling thread,
+    /// <see cref="Select"/> returns this axis directly, bypassing the heuristic — used by
+    /// the in-process axis-routing bench to measure each axis on the same shape. Null in
+    /// production (the default); thread-static so a bench thread can pin an axis without
+    /// perturbing the dispatcher on other threads.
+    /// </summary>
+    [ThreadStatic] internal static ParallelismAxis? ForceAxisForTest;
+
     public static ParallelismAxis Select(
         int m, int n, int k,
         int mr, int nr,
         int procs,
         bool isDeterministic)
     {
+        var forced = ForceAxisForTest;
+        if (forced.HasValue) return forced.Value;
+
         if (procs <= 1) return ParallelismAxis.None;
         if ((long)m * n * k < ParallelWorkThreshold) return ParallelismAxis.None;
 
