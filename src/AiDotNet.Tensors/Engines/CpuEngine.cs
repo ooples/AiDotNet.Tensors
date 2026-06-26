@@ -17825,6 +17825,21 @@ public partial class CpuEngine : ITensorLevelEngine
         if (h < -1 || h > height || w < -1 || w > width)
             return numOps.Zero;
 
+        // Fast paths: native double/float arithmetic, no INumericOperations<T> virtual dispatch
+        // (the deformable bilinear sample is the per-element hot path; profiled ~12-13% of the
+        // InternImage train step). The typeof(T) branch is a JIT-time constant per instantiation,
+        // so it folds away and only the matching native body remains. Bit-exact vs the generic path.
+        if (typeof(T) == typeof(double))
+        {
+            double r = BilinearSampleDouble(Unsafe.As<T[], double[]>(ref data), batch, channel, totalChannels, height, width, h, w);
+            return Unsafe.As<double, T>(ref r);
+        }
+        if (typeof(T) == typeof(float))
+        {
+            float r = BilinearSampleFloat(Unsafe.As<T[], float[]>(ref data), batch, channel, totalChannels, height, width, h, w);
+            return Unsafe.As<float, T>(ref r);
+        }
+
         int h0 = (int)Math.Floor(h);
         int h1 = h0 + 1;
         int w0 = (int)Math.Floor(w);
@@ -17850,6 +17865,43 @@ public partial class CpuEngine : ITensorLevelEngine
         result = numOps.Add(result, numOps.Multiply(v11, numOps.FromDouble(w11)));
 
         return result;
+    }
+
+    // Native double/float specializations of the deformable bilinear sample. Same boundary rules,
+    // same left-associative accumulation order as the generic path above => bit-exact results.
+    private static double BilinearSampleDouble(double[] data, int batch, int channel, int totalChannels, int height, int width, double h, double w)
+    {
+        int h0 = (int)Math.Floor(h), h1 = h0 + 1, w0 = (int)Math.Floor(w), w1 = w0 + 1;
+        double lh = h - h0, lw = w - w0;
+        double v00 = GetPixelDouble(data, batch, channel, totalChannels, height, width, h0, w0);
+        double v01 = GetPixelDouble(data, batch, channel, totalChannels, height, width, h0, w1);
+        double v10 = GetPixelDouble(data, batch, channel, totalChannels, height, width, h1, w0);
+        double v11 = GetPixelDouble(data, batch, channel, totalChannels, height, width, h1, w1);
+        return v00 * ((1 - lh) * (1 - lw)) + v01 * ((1 - lh) * lw) + v10 * (lh * (1 - lw)) + v11 * (lh * lw);
+    }
+
+    private static float BilinearSampleFloat(float[] data, int batch, int channel, int totalChannels, int height, int width, double h, double w)
+    {
+        int h0 = (int)Math.Floor(h), h1 = h0 + 1, w0 = (int)Math.Floor(w), w1 = w0 + 1;
+        double lh = h - h0, lw = w - w0;
+        float v00 = GetPixelFloat(data, batch, channel, totalChannels, height, width, h0, w0);
+        float v01 = GetPixelFloat(data, batch, channel, totalChannels, height, width, h0, w1);
+        float v10 = GetPixelFloat(data, batch, channel, totalChannels, height, width, h1, w0);
+        float v11 = GetPixelFloat(data, batch, channel, totalChannels, height, width, h1, w1);
+        // Cast weights to float so each product/accumulate is in float, matching FromDouble + float ops.
+        return v00 * (float)((1 - lh) * (1 - lw)) + v01 * (float)((1 - lh) * lw) + v10 * (float)(lh * (1 - lw)) + v11 * (float)(lh * lw);
+    }
+
+    private static double GetPixelDouble(double[] data, int batch, int channel, int totalChannels, int height, int width, int h, int w)
+    {
+        if (h < 0 || h >= height || w < 0 || w >= width) return 0.0;
+        return data[((batch * totalChannels + channel) * height + h) * width + w];
+    }
+
+    private static float GetPixelFloat(float[] data, int batch, int channel, int totalChannels, int height, int width, int h, int w)
+    {
+        if (h < 0 || h >= height || w < 0 || w >= width) return 0f;
+        return data[((batch * totalChannels + channel) * height + h) * width + w];
     }
 
     /// <summary>
@@ -17993,6 +18045,20 @@ public partial class CpuEngine : ITensorLevelEngine
         if (h <= -1 || h >= height || w <= -1 || w >= width)
             return;
 
+        // Fast paths: native double/float scatter (no virtual dispatch). Bit-exact vs generic.
+        if (typeof(T) == typeof(double))
+        {
+            double gv = Unsafe.As<T, double>(ref gradVal);
+            BilinearBackwardInputDouble(Unsafe.As<T[], double[]>(ref gradData), gv, batch, channel, totalChannels, height, width, h, w, locks);
+            return;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            float gv = Unsafe.As<T, float>(ref gradVal);
+            BilinearBackwardInputFloat(Unsafe.As<T[], float[]>(ref gradData), gv, batch, channel, totalChannels, height, width, h, w, locks);
+            return;
+        }
+
         int h0 = (int)Math.Floor(h);
         int h1 = h0 + 1;
         int w0 = (int)Math.Floor(w);
@@ -18011,6 +18077,44 @@ public partial class CpuEngine : ITensorLevelEngine
         AddGradientToPixel(gradData, gradVal, batch, channel, totalChannels, height, width, h0, w1, w01, numOps, locks);
         AddGradientToPixel(gradData, gradVal, batch, channel, totalChannels, height, width, h1, w0, w10, numOps, locks);
         AddGradientToPixel(gradData, gradVal, batch, channel, totalChannels, height, width, h1, w1, w11, numOps, locks);
+    }
+
+    // Native double/float specializations of the deformable input-gradient scatter. Same boundary
+    // rules, same weights, same lock striping as the generic AddGradientToPixel path => bit-exact.
+    private static void BilinearBackwardInputDouble(double[] gradData, double gradVal, int batch, int channel, int totalChannels, int height, int width, double h, double w, object[] locks)
+    {
+        int h0 = (int)Math.Floor(h), h1 = h0 + 1, w0 = (int)Math.Floor(w), w1 = w0 + 1;
+        double lh = h - h0, lw = w - w0;
+        ScatterPixelDouble(gradData, gradVal, batch, channel, totalChannels, height, width, h0, w0, (1 - lh) * (1 - lw), locks);
+        ScatterPixelDouble(gradData, gradVal, batch, channel, totalChannels, height, width, h0, w1, (1 - lh) * lw, locks);
+        ScatterPixelDouble(gradData, gradVal, batch, channel, totalChannels, height, width, h1, w0, lh * (1 - lw), locks);
+        ScatterPixelDouble(gradData, gradVal, batch, channel, totalChannels, height, width, h1, w1, lh * lw, locks);
+    }
+
+    private static void ScatterPixelDouble(double[] gradData, double gradVal, int batch, int channel, int totalChannels, int height, int width, int h, int w, double weight, object[] locks)
+    {
+        if (h < 0 || h >= height || w < 0 || w >= width || Math.Abs(weight) < 1e-10) return;
+        int idx = ((batch * totalChannels + channel) * height + h) * width + w;
+        double contrib = gradVal * weight;
+        lock (locks[idx & (DeformScatterLockCount - 1)]) { gradData[idx] += contrib; }
+    }
+
+    private static void BilinearBackwardInputFloat(float[] gradData, float gradVal, int batch, int channel, int totalChannels, int height, int width, double h, double w, object[] locks)
+    {
+        int h0 = (int)Math.Floor(h), h1 = h0 + 1, w0 = (int)Math.Floor(w), w1 = w0 + 1;
+        double lh = h - h0, lw = w - w0;
+        ScatterPixelFloat(gradData, gradVal, batch, channel, totalChannels, height, width, h0, w0, (1 - lh) * (1 - lw), locks);
+        ScatterPixelFloat(gradData, gradVal, batch, channel, totalChannels, height, width, h0, w1, (1 - lh) * lw, locks);
+        ScatterPixelFloat(gradData, gradVal, batch, channel, totalChannels, height, width, h1, w0, lh * (1 - lw), locks);
+        ScatterPixelFloat(gradData, gradVal, batch, channel, totalChannels, height, width, h1, w1, lh * lw, locks);
+    }
+
+    private static void ScatterPixelFloat(float[] gradData, float gradVal, int batch, int channel, int totalChannels, int height, int width, int h, int w, double weight, object[] locks)
+    {
+        if (h < 0 || h >= height || w < 0 || w >= width || Math.Abs(weight) < 1e-10) return;
+        int idx = ((batch * totalChannels + channel) * height + h) * width + w;
+        float contrib = gradVal * (float)weight;
+        lock (locks[idx & (DeformScatterLockCount - 1)]) { gradData[idx] += contrib; }
     }
 
     /// <summary>
@@ -18292,6 +18396,18 @@ public partial class CpuEngine : ITensorLevelEngine
         if (h <= -1 || h >= height || w <= -1 || w >= width)
             return (numOps.Zero, numOps.Zero);
 
+        // Fast paths: native double/float arithmetic (no virtual dispatch). Bit-exact vs generic.
+        if (typeof(T) == typeof(double))
+        {
+            var (dHd, dWd) = BilinearGradientDouble(Unsafe.As<T[], double[]>(ref data), batch, channel, totalChannels, height, width, h, w);
+            return (Unsafe.As<double, T>(ref dHd), Unsafe.As<double, T>(ref dWd));
+        }
+        if (typeof(T) == typeof(float))
+        {
+            var (dHf, dWf) = BilinearGradientFloat(Unsafe.As<T[], float[]>(ref data), batch, channel, totalChannels, height, width, h, w);
+            return (Unsafe.As<float, T>(ref dHf), Unsafe.As<float, T>(ref dWf));
+        }
+
         int h0 = (int)Math.Floor(h);
         int h1 = h0 + 1;
         int w0 = (int)Math.Floor(w);
@@ -18320,6 +18436,34 @@ public partial class CpuEngine : ITensorLevelEngine
             numOps.Multiply(numOps.FromDouble(1 - lh), numOps.Subtract(v01, v00)),
             numOps.Multiply(numOps.FromDouble(lh), numOps.Subtract(v11, v10)));
 
+        return (dH, dW);
+    }
+
+    // Native double/float specializations of BilinearGradient. Same operand/association order
+    // as the generic path => bit-exact.
+    private static (double dH, double dW) BilinearGradientDouble(double[] data, int batch, int channel, int totalChannels, int height, int width, double h, double w)
+    {
+        int h0 = (int)Math.Floor(h), h1 = h0 + 1, w0 = (int)Math.Floor(w), w1 = w0 + 1;
+        double lh = h - h0, lw = w - w0;
+        double v00 = GetPixelDouble(data, batch, channel, totalChannels, height, width, h0, w0);
+        double v01 = GetPixelDouble(data, batch, channel, totalChannels, height, width, h0, w1);
+        double v10 = GetPixelDouble(data, batch, channel, totalChannels, height, width, h1, w0);
+        double v11 = GetPixelDouble(data, batch, channel, totalChannels, height, width, h1, w1);
+        double dH = (1 - lw) * (v10 - v00) + lw * (v11 - v01);
+        double dW = (1 - lh) * (v01 - v00) + lh * (v11 - v10);
+        return (dH, dW);
+    }
+
+    private static (float dH, float dW) BilinearGradientFloat(float[] data, int batch, int channel, int totalChannels, int height, int width, double h, double w)
+    {
+        int h0 = (int)Math.Floor(h), h1 = h0 + 1, w0 = (int)Math.Floor(w), w1 = w0 + 1;
+        double lh = h - h0, lw = w - w0;
+        float v00 = GetPixelFloat(data, batch, channel, totalChannels, height, width, h0, w0);
+        float v01 = GetPixelFloat(data, batch, channel, totalChannels, height, width, h0, w1);
+        float v10 = GetPixelFloat(data, batch, channel, totalChannels, height, width, h1, w0);
+        float v11 = GetPixelFloat(data, batch, channel, totalChannels, height, width, h1, w1);
+        float dH = (float)(1 - lw) * (v10 - v00) + (float)lw * (v11 - v01);
+        float dW = (float)(1 - lh) * (v01 - v00) + (float)lh * (v11 - v10);
         return (dH, dW);
     }
 
