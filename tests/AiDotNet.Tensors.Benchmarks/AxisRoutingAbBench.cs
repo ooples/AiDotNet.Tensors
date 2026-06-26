@@ -383,6 +383,7 @@ public static class AxisRoutingAbBench
     public static unsafe void GotoBlasSweep()
     {
         Console.WriteLine("=== #85 GotoBLAS jc-blocked path A/B (vs N-axis + OpenBLAS) ===");
+        PackBothStrategy.s_gotoBlasAuto = false; // bench drives the path explicitly via s_forceGotoBlas
         Console.WriteLine($"HasRawSgemm={BlasProvider.HasRawSgemm}  PhysicalCores={CpuParallelSettings.PhysicalCoreCount}  Logical={Environment.ProcessorCount}");
         var shapes = new (string label, int m, int n, int k)[]
         {
@@ -422,6 +423,81 @@ public static class AxisRoutingAbBench
         }
         PackBothStrategy.s_macroKernel = false;
         PackBothStrategy.s_forceGotoBlas = false;
+        CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
+    }
+
+    /// <summary>
+    /// #85 GotoBLAS nc tuning: the wide-N losses come from many small Nc-blocks (12 for ffn at
+    /// nc=512) = many barriers + a small shared B re-read by all ic-blocks. Sweep nc upward to cut
+    /// the barrier count (bigger shared B per block, still L3-resident up to ~9 MB) vs the N-axis
+    /// baseline, at the default DOP. Run <c>--ab-gotoblas-nc</c>.
+    /// </summary>
+    public static unsafe void GotoBlasNcSweep()
+    {
+        Console.WriteLine("=== #85 GotoBLAS nc tuning (cut wide-N barrier count) ===");
+        Console.WriteLine($"PhysicalCores={CpuParallelSettings.PhysicalCoreCount}  Logical={Environment.ProcessorCount}");
+        PackBothStrategy.s_gotoBlasAuto = false; // bench drives the path explicitly via s_forceGotoBlas
+        var shapes = new (string label, int m, int n, int k)[]
+        {
+            ("ffn-up   384x6144x1536", 384, 6144, 1536),
+            ("tall-ffn 768x4096x1024", 768, 4096, 1024),
+            ("medium   384x1024x1024", 384, 1024, 1024),
+        };
+        int[] ncs = { 512, 1024, 1536, 2048, 3072, 6144 };
+        PackBothStrategy.s_macroKernel = true;
+        CpuParallelSettings.MaxDegreeOfParallelism = 32;
+        foreach (var (label, m, n, k) in shapes)
+        {
+            var a = MakeRandom(m * k); var b = MakeRandom(k * n); var c = new float[m * n];
+            double flops = 2.0 * m * n * k;
+            PackBothStrategy.s_forceGotoBlas = false;
+            AutotuneDispatcher.s_overrideNc = null;
+            double dN = flops / TimeMinGemm(a, b, c, m, n, k) / 1e9;
+            Console.WriteLine($"  {label}: N-axis baseline {dN,5:F0} GF/s");
+            PackBothStrategy.s_forceGotoBlas = true;
+            foreach (int nc in ncs)
+            {
+                if (nc > n) continue;
+                AutotuneDispatcher.s_overrideNc = nc;
+                double dG = flops / TimeMinGemm(a, b, c, m, n, k) / 1e9;
+                Console.WriteLine($"    GotoBLAS nc={nc,4}: {dG,5:F0} GF/s   ({dG / dN:F2}x)");
+            }
+            AutotuneDispatcher.s_overrideNc = null;
+            PackBothStrategy.s_forceGotoBlas = false;
+        }
+        PackBothStrategy.s_macroKernel = false;
+        CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
+    }
+
+    /// <summary>
+    /// #85 GotoBLAS crossover: at fixed m, k the GotoBLAS path wins for moderate N and loses for very
+    /// wide N. Ladder n/k from 1x to 4x to locate the routing threshold. Interleaved A/B (N-axis vs
+    /// GotoBLAS) per n, min-of-N, default DOP. Run <c>--ab-gotoblas-x</c>.
+    /// </summary>
+    public static unsafe void GotoBlasCrossover()
+    {
+        Console.WriteLine("=== #85 GotoBLAS crossover (n/k ladder, m=384 k=1024, nc=512) ===");
+        PackBothStrategy.s_gotoBlasAuto = false; // bench drives the path explicitly via s_forceGotoBlas
+        CpuParallelSettings.MaxDegreeOfParallelism = 32;
+        PackBothStrategy.s_macroKernel = true;
+        int m = 384, k = 1024;
+        foreach (int n in new[] { 1024, 1280, 1536, 2048, 2560, 3072, 4096 })
+        {
+            var a = MakeRandom(m * k); var b = MakeRandom(k * n); var c = new float[m * n];
+            double flops = 2.0 * m * n * k;
+            // 3 interleaved A/B reps to beat the box noise.
+            double bestN = 0, bestG = 0;
+            for (int rep = 0; rep < 3; rep++)
+            {
+                PackBothStrategy.s_forceGotoBlas = false; AutotuneDispatcher.s_overrideNc = null;
+                bestN = Math.Max(bestN, flops / TimeMinGemm(a, b, c, m, n, k) / 1e9);
+                PackBothStrategy.s_forceGotoBlas = true; AutotuneDispatcher.s_overrideNc = 512;
+                bestG = Math.Max(bestG, flops / TimeMinGemm(a, b, c, m, n, k) / 1e9);
+            }
+            PackBothStrategy.s_forceGotoBlas = false; AutotuneDispatcher.s_overrideNc = null;
+            Console.WriteLine($"  n={n,4} (n/k={n / 1024.0:F1}x): N-axis {bestN,5:F0}  GotoBLAS {bestG,5:F0}  ({bestG / bestN:F2}x)");
+        }
+        PackBothStrategy.s_macroKernel = false;
         CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
     }
 

@@ -116,6 +116,20 @@ class Program
             return;
         }
 
+        // #85 GotoBLAS nc tuning sweep. (--ab-gotoblas-nc)
+        if (args[0] == "--ab-gotoblas-nc")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.GotoBlasNcSweep();
+            return;
+        }
+
+        // #85 GotoBLAS crossover ladder (n/k). (--ab-gotoblas-x)
+        if (args[0] == "--ab-gotoblas-x")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.GotoBlasCrossover();
+            return;
+        }
+
         if (args[0] == "--ab-aiseval-dopsweep")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.DopSweep();

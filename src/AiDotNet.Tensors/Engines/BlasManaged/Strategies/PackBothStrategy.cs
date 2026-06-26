@@ -53,13 +53,19 @@ internal static class PackBothStrategy
     // loop body). A/B toggle; default off until bit-exactness is validated, then flipped on.
     internal static bool s_macroKernel;
 
-    // #85 thread-scaling A/B: force the low-barrier jc-blocked GotoBLAS path
-    // (RunGotoBlasParallelUnsafe) — pack-B-per-Nc-block once into shared L3, ONE parallel region
-    // per Nc-block over an (ic × jr) work-grid with private per-thread packed-A. This is the BLIS
-    // standard structure that no existing path has: N-axis shares A (cross-CCX contention),
-    // M-axis is high-barrier (per-(jc,pc) region), single-region packs ALL B (busts L3), 2D
-    // re-packs B per thread. Default off; flipped on per-shape only if the A/B proves a win.
+    // #85 low-barrier jc-blocked GotoBLAS path (RunGotoBlasParallelUnsafe) — pack-B-per-Nc-block
+    // once into shared L3, ONE parallel region per Nc-block, with shared packed-A read by DISJOINT
+    // rows (no cross-thread A contention). The BLIS standard structure no existing path had: N-axis
+    // shares the WHOLE A re-read per thread, M-axis is high-barrier (per-(jc,pc) region),
+    // single-region packs ALL B (busts L3), 2D re-packs B per thread.
+    //
+    // AUTO-ROUTING (s_gotoBlasAuto, default ON): the clean A/B (--ab-gotoblas-x) measured a robust
+    // win for the moderate-N envelope n/k ≤ 2 (1.06-1.41x vs N-axis at n/k 1.0-2.0, crossing at
+    // ~2.5x). N-axis wins for very wide N (its private-L2-B amortizes; GotoBLAS plateaus ~390 GF/s
+    // as the shared B is re-read by every ic-block). So route n ≤ 2k here, keep wide-N on N-axis.
+    // Bit-exact (maxErr=0 vs N-axis). s_forceGotoBlas (test-only) overrides the n≤2k gate for A/B.
     internal static bool s_forceGotoBlas;
+    internal static bool s_gotoBlasAuto = true;
 
     // #653 software-prefetch microkernel (env AIDOTNET_GEMM_PREFETCH=1, default off). Routes the
     // FP32 6×16 tile through Avx2Fp32_6x16.RunPrefetch (PREFETCHT0 of packed-B ahead) — same inlined
@@ -234,16 +240,22 @@ internal static class PackBothStrategy
                 && numNBlocksN >= 2 && numNBlocksN >= Math.Min(4, effProcs)
                 && options.Epilogue.Activation == AiDotNet.Tensors.Engines.FusedActivationType.None
                 && options.Epilogue.BiasN.IsEmpty && options.Epilogue.SkipMxN.IsEmpty;
-            // #85 thread-scaling A/B: low-barrier jc-blocked GotoBLAS path. Same FP32 / no-transpose /
-            // no-prepack / no-epilogue / m%mr==0 envelope as the N-axis path so the A/B is apples-to-apples.
-            if (s_forceGotoBlas
-                && MachineKernelGemm.IsFp32PanelAvailable
+            // #85 low-barrier jc-blocked GotoBLAS path. Same FP32 / no-transpose / no-prepack /
+            // no-epilogue / m%mr==0 envelope as the N-axis path. Auto-routed within the measured win
+            // envelope (n ≤ 2k); s_forceGotoBlas overrides the n-gate for the A/B bench.
+            bool gotoEnvelope =
+                MachineKernelGemm.IsFp32PanelAvailable
                 && typeof(T) == typeof(float)
                 && !transA && !transB
                 && options.PackedA is null && options.PackedB is null
                 && (m % mr) == 0 && m >= mr
                 && options.Epilogue.Activation == AiDotNet.Tensors.Engines.FusedActivationType.None
-                && options.Epilogue.BiasN.IsEmpty && options.Epilogue.SkipMxN.IsEmpty)
+                && options.Epilogue.BiasN.IsEmpty && options.Epilogue.SkipMxN.IsEmpty;
+            // Auto-gate = the measured win envelope k ≤ n ≤ 2k (the N-axis regime, n≥k, where the
+            // crossover ladder showed 1.06-1.41x). Below k is narrow-N (other paths, not A/B'd here);
+            // above 2k N-axis wins. s_forceGotoBlas (test-only) ignores the gate for the full A/B.
+            if (gotoEnvelope && (s_forceGotoBlas
+                    || (s_gotoBlasAuto && (long)n >= (long)k && (long)n <= 2L * k)))
             {
                 fixed (T* aPtrG = a)
                 fixed (T* bPtrG = b)
