@@ -138,6 +138,65 @@ internal static class MachineCodeFmaKernel
         return asm.ToArray();
     }
 
+    /// <summary>System V AMD64 (Linux/macOS) ABI variant of <see cref="EmitFp32TileWindows(int,int,bool)"/>.
+    /// `delegate* unmanaged` uses the platform-default convention, which is SysV off Windows, so the
+    /// Win-x64 kernel (shadow-space kc read + RCX/RDX/R8/R9 args) segfaults there. SysV args:
+    /// rdi=packedA, rsi=packedB, rdx=c, rcx=ldcBytes, r8=kc — and ALL xmm are caller-saved, so there is no
+    /// save/restore frame (no SubRsp/xmm6-15 spill). Body (FMA loop + SAVE) is otherwise identical to the
+    /// Win-x64 kernel, so it produces bit-identical results.</summary>
+    internal static byte[] EmitFp32TileSysV(int mr, int nrYmm, bool overwrite)
+    {
+        const int RCX = 1, RDX = 2, RSI = 6, RDI = 7, R8 = 8, R10 = 10, R11 = 11;
+        int regA = RDI, regB = RSI, regC = RDX, regLdc = RCX; // SysV arg registers
+        int accN = mr * nrYmm;
+        int bBase = 12;
+        int aReg = 12 + nrYmm;
+        var asm = new X64Assembler();
+
+        asm.MovRegReg(R10, R8);                         // r10 = kc (5th arg in r8; no shadow space on SysV)
+        for (int i = 0; i < accN; i++) asm.Vxorps(i);   // zero accumulators
+
+        int store = asm.NewLabel();
+        asm.TestRegSelf(R10);                           // kc==0 guard (mirror the Win kernel)
+        asm.JzLabel32(store);
+        int loop = asm.NewLabel();
+        asm.MarkLabel(loop);
+        for (int j = 0; j < nrYmm; j++) asm.VmovupsLoad(bBase + j, regB, (sbyte)(j * 32));
+        for (int r = 0; r < mr; r++)
+        {
+            asm.VbroadcastSs(aReg, regA, (sbyte)(r * 4));
+            for (int j = 0; j < nrYmm; j++) asm.Vfmadd231ps(r * nrYmm + j, aReg, bBase + j);
+        }
+        asm.AddRegImm8(regA, (sbyte)(mr * 4));
+        asm.AddRegImm8(regB, (sbyte)(nrYmm * 32));
+        asm.DecReg(R10);
+        asm.JnzLabel32(loop);
+
+        asm.MarkLabel(store);
+        asm.MovRegReg(R11, regC);                       // r11 walks c (rdx) by ldcBytes (rcx)
+        int cTmp = bBase;
+        for (int r = 0; r < mr; r++)
+        {
+            for (int j = 0; j < nrYmm; j++)
+            {
+                if (!overwrite) { asm.VmovupsLoad(cTmp, R11, (sbyte)(j * 32)); asm.Vaddps(r * nrYmm + j, r * nrYmm + j, cTmp); }
+                asm.VmovupsStore(R11, (sbyte)(j * 32), r * nrYmm + j);
+            }
+            if (r < mr - 1) asm.AddRegReg(R11, regLdc);
+        }
+
+        asm.Vzeroupper();                               // no xmm restore / AddRsp on SysV (caller-saved, no frame)
+        asm.Ret();
+        return asm.ToArray();
+    }
+
+    /// <summary>Emit the FP32 tile kernel for the CURRENT OS's ABI (Win-x64 vs SysV) — the GEMM driver uses
+    /// this so the kernel matches the platform-default <c>delegate* unmanaged</c> convention.</summary>
+    internal static byte[] EmitFp32TileAbi(int mr, int nrYmm, bool overwrite)
+        => System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows)
+            ? EmitFp32TileWindows(mr, nrYmm, overwrite)
+            : EmitFp32TileSysV(mr, nrYmm, overwrite);
+
     /// <summary>bf16-B microkernel: C[mr,nr] += packedA(fp32)·packedB(bf16), fp32 accumulate. B is stored
     /// bf16 (half the bytes → 2× the L2/L3/DRAM bandwidth headroom for the re-read operand); each K-iter
     /// loads 8 bf16 per nr-YMM (vpmovzxwd m128→8×u32) and widens to fp32 in-register (vpslld 16 — bf16 is
