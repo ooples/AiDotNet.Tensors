@@ -373,6 +373,58 @@ public static class AxisRoutingAbBench
         CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
     }
 
+    /// <summary>
+    /// #85 GotoBLAS A/B: the low-barrier jc-blocked path (B packed per Nc-block into shared L3,
+    /// A packed once with disjoint-row reads, one parallel region per Nc-block) vs the current
+    /// N-axis path (whole shared A re-read by every thread per N-block) and OpenBLAS, on the wide-N
+    /// diffusion shapes at the default DOP. Also asserts bit-exactness vs the default path. Run
+    /// <c>--ab-gotoblas</c> (add AIDOTNET_USE_BLAS=1 for the OpenBLAS bar).
+    /// </summary>
+    public static unsafe void GotoBlasSweep()
+    {
+        Console.WriteLine("=== #85 GotoBLAS jc-blocked path A/B (vs N-axis + OpenBLAS) ===");
+        Console.WriteLine($"HasRawSgemm={BlasProvider.HasRawSgemm}  PhysicalCores={CpuParallelSettings.PhysicalCoreCount}  Logical={Environment.ProcessorCount}");
+        var shapes = new (string label, int m, int n, int k)[]
+        {
+            ("ffn-up   384x6144x1536", 384, 6144, 1536),
+            ("medium   384x1024x1024", 384, 1024, 1024),
+            ("tall-ffn 768x4096x1024", 768, 4096, 1024),
+        };
+        PackBothStrategy.s_macroKernel = true;
+        foreach (var (label, m, n, k) in shapes)
+        {
+            var a = MakeRandom(m * k); var b = MakeRandom(k * n);
+            var cRef = new float[m * n]; var cGoto = new float[m * n];
+            double flops = 2.0 * m * n * k;
+            // Correctness: GotoBLAS path must be bit-identical to the default (same K-panel order).
+            PackBothStrategy.s_forceGotoBlas = false; GemmOnce(a, b, cRef, m, n, k);
+            PackBothStrategy.s_forceGotoBlas = true; GemmOnce(a, b, cGoto, m, n, k);
+            PackBothStrategy.s_forceGotoBlas = false;
+            double maxErr = 0;
+            for (int i = 0; i < cRef.Length; i++) maxErr = Math.Max(maxErr, Math.Abs(cRef[i] - cGoto[i]));
+            Console.WriteLine($"  {label}: maxErr(goto vs default)={maxErr:E2}");
+            var c = new float[m * n];
+            foreach (int dop in new[] { 16, 32 })
+            {
+                CpuParallelSettings.MaxDegreeOfParallelism = dop;
+                PackBothStrategy.s_forceGotoBlas = false;
+                double dN = flops / TimeMinGemm(a, b, c, m, n, k) / 1e9;
+                PackBothStrategy.s_forceGotoBlas = true;
+                double dG = flops / TimeMinGemm(a, b, c, m, n, k) / 1e9;
+                PackBothStrategy.s_forceGotoBlas = false;
+                Console.WriteLine($"    DOP={dop,2}: N-axis {dN,5:F0}   GotoBLAS {dG,5:F0} GF/s   ({dG / dN:F2}x)");
+            }
+            if (BlasProvider.HasRawSgemm)
+            {
+                CpuParallelSettings.MaxDegreeOfParallelism = 32;
+                Console.WriteLine($"    OpenBLAS (auto-threaded): {flops / TimeMinPtr(a, b, c, m, n, k, jit: false) / 1e9,5:F0} GF/s");
+            }
+        }
+        PackBothStrategy.s_macroKernel = false;
+        PackBothStrategy.s_forceGotoBlas = false;
+        CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
+    }
+
     private static double Gf(double flops, double sec) => flops / sec / 1e9;
 
     private static unsafe double TimeMinNative(float[] a, float[] b, float[] c, int m, int n, int k)

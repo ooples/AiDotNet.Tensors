@@ -109,6 +109,13 @@ class Program
             return;
         }
 
+        // #85 GotoBLAS jc-blocked path A/B vs N-axis + OpenBLAS. (--ab-gotoblas)
+        if (args[0] == "--ab-gotoblas")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.GotoBlasSweep();
+            return;
+        }
+
         if (args[0] == "--ab-aiseval-dopsweep")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.DopSweep();
