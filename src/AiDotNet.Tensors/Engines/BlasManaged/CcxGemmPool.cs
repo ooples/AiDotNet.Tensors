@@ -254,6 +254,7 @@ internal static unsafe class CcxGemmPool
             int mBlk = RoundUp((m + _gr - 1) / _gr, 6);
             if ((long)kc * nBlk > 1024L * 1024) return false; // 2D B-panel (kc×nBlk) > 4MB → per-tile
             mc = RoundMr(mBlk / _tpc); if (mc < 48) mc = 48; if (mc > 240) mc = 240;
+            if (s_mc2dOverride > 0) mc = s_mc2dOverride; // A/B knob for the mc blocking sweep
             nc = nBlk;
             need = GotoGemmFp32.PackedBPanelLen(nBlk, kc);
         }
@@ -311,6 +312,9 @@ internal static unsafe class CcxGemmPool
     /// <summary>A/B knob (env AIDOTNET_CCX_KC): override the 2D-path kc to sweep the barrier-vs-L1-fit tradeoff.</summary>
     internal static int s_kc2dOverride =
         int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_CCX_KC"), out var v) ? v : 0;
+
+    /// <summary>A/B knob: override the 2D-path mc to sweep ic-block count (load balance) vs A-panel reuse.</summary>
+    internal static int s_mc2dOverride;
 
     /// <summary>A/B knob (env AIDOTNET_CCX_MINM): override the min-M gate (default 512) to test CCX on the
     /// wide-N small-M DiT shapes (m=256). Lets the 1D-N path (pack B once per CCX) be measured there.</summary>

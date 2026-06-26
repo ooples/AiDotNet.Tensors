@@ -161,6 +161,13 @@ class Program
             return;
         }
 
+        // #85 CCX 2D kc blocking sweep (forced CCX). (--ab-ccx-block)
+        if (args[0] == "--ab-ccx-block")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.CcxBlockingSweep();
+            return;
+        }
+
         if (args[0] == "--ab-aiseval-dopsweep")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.DopSweep();

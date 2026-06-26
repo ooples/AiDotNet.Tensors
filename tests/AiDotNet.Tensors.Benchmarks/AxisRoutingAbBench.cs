@@ -656,6 +656,37 @@ public static class AxisRoutingAbBench
         AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_spinBarrier = true;
     }
 
+    /// <summary>
+    /// #85 CCX blocking sweep: CCX hits OB-level (66 GF/s/core) only at 1536³; sweep the 2D kc
+    /// (AIDOTNET_CCX_KC / s_kc2dOverride) on the forced-CCX path to see if a different K-block extends
+    /// that to 1024³/2048³ (fewer K-panels = fewer barriers + better L1 fit). Run <c>--ab-ccx-block</c>.
+    /// </summary>
+    public static void CcxBlockingSweep()
+    {
+        Console.WriteLine("=== #85 CCX 2D kc blocking sweep (forced CCX) ===");
+        CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
+        AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_ignoreWorkGate = true;
+        AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_disable = false;
+        AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_spinBarrier = false;
+        int[] mcs = { 0, 48, 96, 144, 192, 240 }; // 0 = default heuristic
+        var shapes = new (int m, int n, int k)[] { (1024, 1024, 1024), (1536, 1536, 1536), (2048, 2048, 2048) };
+        foreach (var (m, n, k) in shapes)
+        {
+            var a = MakeRandom(m * k); var b = MakeRandom(k * n); var c = new float[m * n];
+            double flops = 2.0 * m * n * k;
+            Console.WriteLine($"  {m}x{n}x{k}:");
+            foreach (int mc in mcs)
+            {
+                AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_mc2dOverride = mc;
+                double best = 0;
+                for (int rep = 0; rep < 3; rep++) best = Math.Max(best, flops / TimeMinGemm(a, b, c, m, n, k) / 1e9);
+                Console.WriteLine($"    mc={(mc == 0 ? "dflt" : mc.ToString()),4}: {best,5:F0} GF/s   ({best / 16:F0}/core)");
+            }
+        }
+        AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_mc2dOverride = 0;
+        AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_ignoreWorkGate = false;
+    }
+
     private static double Gf(double flops, double sec) => flops / sec / 1e9;
 
     private static unsafe double TimeMinNative(float[] a, float[] b, float[] c, int m, int n, int k)
