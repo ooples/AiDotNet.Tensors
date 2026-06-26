@@ -117,7 +117,7 @@ internal static class GotoGemmFp32
             {
                 if (s_kernelInit == 0)
                 {
-                    var code = MachineCodeFmaKernel.EmitFp32TileWindows(Mr, NrYmm);
+                    var code = MachineCodeFmaKernel.EmitFp32TileAbi(Mr, NrYmm, false);
                     s_kernelMem = ExecutableMemory.TryAllocate(code);
                     s_kernel = s_kernelMem?.Pointer ?? IntPtr.Zero;
                     Volatile.Write(ref s_kernelInit, 1);
@@ -141,7 +141,7 @@ internal static class GotoGemmFp32
             {
                 if (s_kernelOwInit == 0)
                 {
-                    var code = MachineCodeFmaKernel.EmitFp32TileWindows(Mr, NrYmm, true);
+                    var code = MachineCodeFmaKernel.EmitFp32TileAbi(Mr, NrYmm, true);
                     s_kernelOwMem = ExecutableMemory.TryAllocate(code);
                     s_kernelOw = s_kernelOwMem?.Pointer ?? IntPtr.Zero;
                     Volatile.Write(ref s_kernelOwInit, 1);
@@ -184,15 +184,12 @@ internal static class GotoGemmFp32
         for (int r = 0; r < mFull; r++) { float* cr = c + (long)(ic + r) * ldc + jc; for (int col = nFull; col < effNc; col++) cr[col] = 0f; }
     }
 
-    /// <summary>True when the machine-code microkernel is available on this CPU/OS (AVX2+FMA, Windows x64).
-    /// The tile kernels (EmitFp32TileWindows/EmitBf16BTileWindows) use the Microsoft x64 ABI — RCX/RDX/R8/R9
-    /// args + the 5th arg (kc) read from the [rsp+0x28] shadow space — so they are ONLY valid when invoked
-    /// via the platform-default unmanaged convention on Windows. On Linux/macOS that convention is SysV
-    /// (no shadow space, different arg registers), so calling these kernels there reads garbage → SIGSEGV.
-    /// Gate to Windows until a SysV tile kernel exists; non-Windows falls back to MachineKernelGemm/PackBoth.</summary>
-    internal static unsafe bool IsAvailable =>
-        System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows)
-        && MachineKernelGemm.IsFp32Available && Kernel() != null;
+    /// <summary>True when the machine-code microkernel is available on this CPU/OS (AVX2+FMA, x64). The tile
+    /// kernel is emitted for the CURRENT OS's ABI via MachineCodeFmaKernel.EmitFp32TileAbi — Microsoft x64 on
+    /// Windows, System V AMD64 on Linux/macOS — so it matches the platform-default `delegate* unmanaged`
+    /// convention on both. (A Windows-ABI kernel on Linux read the kc arg from the [rsp+0x28] shadow space
+    /// that SysV doesn't have → SIGSEGV; the SysV kernel reads it from r8.)</summary>
+    internal static unsafe bool IsAvailable => MachineKernelGemm.IsFp32Available && Kernel() != null;
 
     /// <summary>
     /// Single-thread C = A·B (row-major). A[M,K] lda, B[K,N] ldb, C[M,N] ldc (element strides).

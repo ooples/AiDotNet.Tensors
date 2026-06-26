@@ -56,6 +56,7 @@ internal static class Program
         if (args.Length > 0 && args[0] == "--attnblock") return RunAttnBlock(eng, args);
         if (args.Length > 0 && args[0] == "--act") return RunAct(eng, args);
         if (args.Length > 0 && args[0] == "--gemm") return RunGemm(eng, args);
+        if (args.Length > 0 && args[0] == "--gemmverify") return RunGemmVerify(eng, args);
         if (args.Length > 0 && args[0] == "--gemmaudit") return RunGemmAudit(eng, args);
         if (args.Length > 0 && args[0] == "--gemmprofile") return RunGemmProfile(eng, args);
         if (args.Length > 0 && args[0] == "--gpu") return RunGpu(args);
@@ -675,6 +676,39 @@ internal static class Program
             $"GEMM M={M} K={K} N={N} fma={(double)M * K * N:E1} maxdop={maxdop} procs={Environment.ProcessorCount} " +
             $"median_ms={times[reps / 2]:F3} min_ms={times[0]:F3} max_ms={times[times.Length - 1]:F3} (sink={sink:E1}){u}");
         return 0;
+    }
+
+    // Correctness check: GotoGemm (the machine-code kernel — SysV on Linux) vs PackBoth (the cross-platform
+    // managed reference), same inputs. They must agree to fp-reassociation noise (~1e-6). A wrong-ABI kernel
+    // would produce garbage / NaN here, not a ~1e-6 match.
+    private static int RunGemmVerify(CpuEngine eng, string[] a)
+    {
+        int M = ArgI(a, "--m", 256), K = ArgI(a, "--k", 512), N = ArgI(a, "--n", 1024);
+        var rng = new Random(1);
+        var lhs = Rand(new[] { M, K }, rng);
+        var rhs = Rand(new[] { K, N }, rng);
+        var bm = typeof(CpuEngine).Assembly.GetType("AiDotNet.Tensors.Engines.BlasManaged.BlasManaged");
+        var fld = bm?.GetField("s_disableGotoGemm", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+        if (fld is null) { Console.Error.WriteLine("[verify] s_disableGotoGemm not found"); return 2; }
+        fld.SetValue(null, false);                       // GotoGemm (SysV kernel on Linux)
+        var cGoto = eng.BatchMatMul(lhs, rhs);
+        fld.SetValue(null, true);                        // PackBoth reference
+        var cRef = eng.BatchMatMul(lhs, rhs);
+        fld.SetValue(null, false);
+        // Frobenius-relative ||cGoto - cRef|| / ||cRef|| — robust to the near-zero cancellation that makes
+        // per-element relative error meaningless (random A,B → many ~0 dot products). True fp32 reassociation
+        // noise between two reduction orders is ~1e-6..1e-5; a wrong-ABI kernel would be O(1) or NaN.
+        int total = M * N;
+        double sumD2 = 0, sumR2 = 0;
+        for (int i = 0; i < total; i++)
+        {
+            double g = cGoto[i], r = cRef[i];
+            double d = g - r; sumD2 += d * d; sumR2 += r * r;
+        }
+        double frob = sumR2 > 0 ? Math.Sqrt(sumD2 / sumR2) : 0;
+        bool ok = frob < 1e-4 && !double.IsNaN(frob);
+        Console.WriteLine($"GEMM-VERIFY {M}x{K}x{N} Frobenius||GotoGemm-PackBoth||/||PackBoth|| = {frob:E2} -> {(ok ? "OK" : "MISMATCH")}");
+        return ok ? 0 : 1;
     }
 
     // P4 (#653): single-thread pack-vs-kernel attribution via PackBothProfiler (reflection,
