@@ -17,6 +17,11 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// </summary>
 internal static class MachineCodeFmaKernel
 {
+    // #475 Phase-0 A/B knob: K-unroll factor for the FP32 6×16 panel loop. OpenBLAS's Zen sgemm
+    // kernel unrolls 8; ours shipped 4. Baked at emit time — change requires re-emitting the
+    // panel/macro kernels (MachineKernelGemm.ResetFp32Kernels). Default 4 until A/B confirms 8.
+    internal static int PanelKUnroll = 4;
+
     /// <summary>Emit the Windows-x64 12-accumulator FP64 FMA loop. Returns the machine-code bytes.</summary>
     internal static byte[] EmitFp64x12Windows()
     {
@@ -357,7 +362,7 @@ internal static class MachineCodeFmaKernel
 
         int store = asm.NewLabel();
         int ktail = asm.NewLabel();
-        const int U = 4; // K-unroll factor
+        int U = Math.Max(1, PanelKUnroll); // K-unroll factor (#475 A/B knob; OpenBLAS uses 8)
 
         // Tuned prefetch distance for the next packed-B stripe (bytes ahead of rdx). 512 B = 8
         // cache lines ≈ one Nr=16 tile's worth of K-steps ahead — far enough to hide the L2→L1
@@ -378,7 +383,7 @@ internal static class MachineCodeFmaKernel
         // prefetching A is pure redundant load-port traffic (PR #656: A+B −14%, B-only −2% in
         // the single-tile kernel). Here B is cold for the NEXT tile in the panel macro-loop, so
         // it's a real win. Pure hint, bit-exact.
-        asm.CmpRegImm8(R10, U);
+        asm.CmpRegImm8(R10, (sbyte)U);
         asm.JlLabel32(ktail);          // kc < U → straight to the 1-step tail
         int kmain = asm.NewLabel();
         asm.MarkLabel(kmain);
@@ -393,15 +398,17 @@ internal static class MachineCodeFmaKernel
             for (int r = 0; r < Mr; r++)
             {
                 int areg = (r % 2 == 0) ? A0 : A1;
-                asm.VbroadcastSs(areg, RCX, (sbyte)(ku * Mr * 4 + r * 4)); // max 3*24+20=92 → disp8
+                int aOff = ku * Mr * 4 + r * 4;   // U=4 max 92 → disp8; U=8 max 188 → disp32
+                if (aOff <= 127) asm.VbroadcastSs(areg, RCX, (sbyte)aOff);
+                else asm.VbroadcastSsD32(areg, RCX, aOff);
                 asm.Vfmadd231ps(2 * r, areg, BLO);
                 asm.Vfmadd231ps(2 * r + 1, areg, BHI);
             }
         }
-        asm.AddRegImm32(RCX, U * Mr * 4);  // A += 24 floats
-        asm.AddRegImm32(RDX, U * Nr * 4);  // B += 64 floats
+        asm.AddRegImm32(RCX, U * Mr * 4);  // A += U*6 floats
+        asm.AddRegImm32(RDX, U * Nr * 4);  // B += U*16 floats
         asm.SubRegImm8(R10, (sbyte)U);
-        asm.CmpRegImm8(R10, U);
+        asm.CmpRegImm8(R10, (sbyte)U);
         asm.JlLabel32(ktail);          // remaining < U → tail
         asm.JmpLabel32(kmain);         // else another unrolled round
 
@@ -592,7 +599,7 @@ internal static class MachineCodeFmaKernel
         int rem = asm.NewLabel();
         int store = asm.NewLabel();
         asm.MarkLabel(cond);
-        asm.CmpRegImm8(R10, U);
+        asm.CmpRegImm8(R10, (sbyte)U);
         asm.JlLabel32(rem);
         for (int s = 0; s < U; s++)
         {

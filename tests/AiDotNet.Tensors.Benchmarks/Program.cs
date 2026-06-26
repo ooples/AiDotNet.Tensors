@@ -81,6 +81,13 @@ class Program
             return;
         }
 
+        // #475 Phase 0a: FP32 panel K-unroll sweep (4/8/2/6). (--ab-kunroll)
+        if (args[0] == "--ab-kunroll")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.KUnrollSweep();
+            return;
+        }
+
         if (args[0] == "--ab-aiseval-dopsweep")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.DopSweep();

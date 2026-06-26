@@ -119,6 +119,21 @@ internal static class MachineKernelGemm
         kern(aBase, bBase, cBase, ldc, kc, njr, numMr, aStrideBytes);
     }
 
+    /// <summary>
+    /// #475 Phase-0 A/B support: drop the cached FP32 panel + macro kernels so the next
+    /// IsFp32PanelAvailable/IsFp32MacroAvailable re-emits them with the current
+    /// MachineCodeFmaKernel.PanelKUnroll (and other emit-time knobs). Test/bench use only —
+    /// the old ExecutableMemory is left to the GC. Not thread-safe vs in-flight kernel calls.
+    /// </summary>
+    internal static void ResetFp32Kernels()
+    {
+        lock (_lock)
+        {
+            _triedPanel32 = false; _kernPanel32 = 0; _memPanel32 = null;
+            _triedMacro32 = false; _kernMacro32 = 0; _memMacro32 = null;
+        }
+    }
+
     private static bool TryInitMacroFp32()
     {
         if (_triedMacro32) return _kernMacro32 != 0;

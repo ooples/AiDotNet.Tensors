@@ -165,6 +165,55 @@ public static class AxisRoutingAbBench
         CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
     }
 
+    /// <summary>
+    /// #475 Phase 0a: sweep the FP32 panel K-unroll (4/8/2/6) through the macro kernel, single- and
+    /// multi-thread, vs the U=4 reference, with a bit-exactness check. OpenBLAS's Zen sgemm uses 8.
+    /// Run: <c>--ab-kunroll</c>.
+    /// </summary>
+    public static void KUnrollSweep()
+    {
+        Console.WriteLine("=== #475 Phase 0a: FP32 panel K-unroll sweep (macro kernel) ===");
+        var shapes = new (string label, int m, int n, int k)[]
+        {
+            ("ffn-up  384x6144x1536", 384, 6144, 1536),
+            ("ffn-big 384x4096x3456", 384, 4096, 3456),
+            ("medium  384x1024x1024", 384, 1024, 1024),
+        };
+        int[] unrolls = { 4, 8, 2, 6 };
+        foreach (var (label, m, n, k) in shapes)
+        {
+            var a = MakeRandom(m * k);
+            var b = MakeRandom(k * n);
+            double flops = 2.0 * m * n * k;
+            // Reference: default kernel (U=4), managed base path, single thread.
+            MachineCodeFmaKernel.PanelKUnroll = 4; MachineKernelGemm.ResetFp32Kernels();
+            PackBothStrategy.s_macroKernel = false;
+            CpuParallelSettings.MaxDegreeOfParallelism = 1;
+            var cref = new float[m * n];
+            GemmOnce(a, b, cref, m, n, k);
+
+            var c = new float[m * n];
+            PackBothStrategy.s_macroKernel = true;
+            foreach (int u in unrolls)
+            {
+                MachineCodeFmaKernel.PanelKUnroll = u; MachineKernelGemm.ResetFp32Kernels();
+                _ = MachineKernelGemm.IsFp32MacroAvailable; // force re-emit
+                foreach (int dop in new[] { 1, 32 })
+                {
+                    CpuParallelSettings.MaxDegreeOfParallelism = dop;
+                    Array.Clear(c, 0, c.Length); GemmOnce(a, b, c, m, n, k);
+                    double maxErr = 0;
+                    for (int i = 0; i < c.Length; i++) { double e = Math.Abs(c[i] - cref[i]); if (e > maxErr) maxErr = e; }
+                    double sec = TimeMinGemm(a, b, c, m, n, k);
+                    Console.WriteLine($"  {label} U={u} DOP={dop,2}: {flops / sec / 1e9,6:F0} GF/s  maxErr={maxErr:E1}");
+                }
+            }
+        }
+        MachineCodeFmaKernel.PanelKUnroll = 4; MachineKernelGemm.ResetFp32Kernels();
+        PackBothStrategy.s_macroKernel = false;
+        CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
+    }
+
     private static double Gf(double flops, double sec) => flops / sec / 1e9;
 
     private static unsafe double TimeMinNative(float[] a, float[] b, float[] c, int m, int n, int k)
