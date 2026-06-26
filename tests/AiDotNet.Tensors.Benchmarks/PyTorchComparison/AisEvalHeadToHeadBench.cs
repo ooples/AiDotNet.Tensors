@@ -1331,6 +1331,22 @@ internal static class AisEvalHeadToHeadBench
             Console.WriteLine($"--- M=256 pack-vs-kernel at default mc={mc} nc={nc} kc={kc} (summed across workers) ---");
             AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.ReportTiming();
         }
+        // dit-mlp2 (deep-K narrow-N: 256x1152x4608) — does smaller nc (more tiles) recover the
+        // under-parallelization (72 tiles@nc=64), or is split-K needed? Sweep mc/nc; compare to MKL.
+        {
+            int m2 = 256, n2 = 1152, k2 = 4608; double gf2 = 2.0 * m2 * n2 * k2 / 1e9;
+            float[] A2 = R((long)m2 * k2, rng), B2 = R((long)k2 * n2, rng), C2 = new float[(long)m2 * n2];
+            using var t2a = torch.tensor(A2).reshape(m2, k2); using var t2b = torch.tensor(B2).reshape(k2, n2);
+            double mkl2 = Min(() => { using var _ = torch.matmul(t2a, t2b); }, 6);
+            Console.WriteLine($"--- dit-mlp2 (256x1152x4608) blocking sweep, MKL={gf2 / (mkl2 / 1000):F0}GF ---");
+            foreach (int mcv in new[] { 32, 48, 64, 128 })
+                foreach (int ncv in new[] { 16, 32, 64, 128 })
+                {
+                    int tiles = ((m2 + mcv - 1) / mcv) * ((n2 + ncv - 1) / ncv);
+                    double t; fixed (float* pa = A2, pb = B2, pc = C2) { var paL = (nint)pa; var pbL = (nint)pb; var pcL = (nint)pc; t = Min(() => AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.RunParallel((float*)paL, k2, (float*)pbL, n2, (float*)pcL, n2, m2, n2, k2, mcv, ncv, 256), 5); }
+                    Console.WriteLine($"   mc={mcv,3} nc={ncv,3}: {gf2 / (t / 1000),6:F0}GF  tiles={tiles,4}  ({gf2 / (t / 1000) / (gf2 / (mkl2 / 1000)) * 100:F0}% MKL)");
+                }
+        }
     }
 
     private static (double median, double p95) TimeAi(Func<Tensor<float>> forward)
