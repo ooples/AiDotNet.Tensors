@@ -4754,13 +4754,6 @@ public partial class CpuEngine : ITensorLevelEngine
         if (value == null) throw new ArgumentNullException(nameof(value));
         if (!destination.IsContiguous) throw new InvalidOperationException("Destination tensor must be contiguous.");
 
-        // Stride-aware: QKV usually arrive as reshape+permute views — materialize
-        // contiguous copies exactly as the allocating overload does so the flat
-        // GEMM offsets line up.
-        if (!query.IsContiguous) query = query.Contiguous();
-        if (!key.IsContiguous) key = key.Contiguous();
-        if (!value.IsContiguous) value = value.Contiguous();
-
         if (query.Rank != 4 || key.Rank != 4 || value.Rank != 4)
             throw new ArgumentException("Query, Key, and Value must be 4D tensors [batch, heads, seq, d_k/d_v]");
 
@@ -4789,11 +4782,26 @@ public partial class CpuEngine : ITensorLevelEngine
             var kf = (Tensor<float>)(object)key;
             var vf = (Tensor<float>)(object)value;
             var df = (Tensor<float>)(object)destination;
-            // GetDataArray() on a contiguous tensor returns the backing array; the
-            // *Into kernel writes outBuf[oOff..] per head. df must be a freshly-owned
-            // contiguous buffer (it is — caller passes a dedicated per-op scratch).
+
+            // Stride-aware QKV access (#1672): the inputs almost always arrive as a
+            // reshape+permute view [B,T,H,D]→[B,H,T,D] whose innermost dim D is still
+            // contiguous (stride 1) while the head/seq permute makes the WHOLE tensor
+            // non-contiguous. Materializing a contiguous copy of each (the old
+            // Contiguous() calls) cost ~9% of the DiT critical path. Instead we index
+            // each per-head [seq,d] slice directly through the backing array using the
+            // view's row stride (Strides[2]) as the GEMM leading dimension — no copy.
+            // We only require the d-dimension to be contiguous (Strides[3] == 1, which
+            // BLAS lda addressing assumes); if any operand violates that we fall back
+            // to a contiguous copy of THAT operand so the result stays bit-identical.
+            var qa = ResolveStridedAttnOperand(qf, seqQ, d_k, out int qBase, out int qBatchStride, out int qHeadStride, out int qRowStride);
+            var ka = ResolveStridedAttnOperand(kf, seqK, d_k, out int kBase, out int kBatchStride, out int kHeadStride, out int kRowStride);
+            var va = ResolveStridedAttnOperand(vf, seqK, d_v, out int vBase, out int vBatchStride, out int vHeadStride, out int vRowStride);
+            // GetDataArray() on the (contiguous, freshly-owned) destination returns the
+            // backing array; the *Into kernel writes outBuf[oOff..] per head.
             ScaledDotProductAttentionFloatInto(
-                qf.GetFlattenedData(), kf.GetFlattenedData(), vf.GetDataArray(),
+                qa, qBase, qBatchStride, qHeadStride, qRowStride,
+                ka, kBase, kBatchStride, kHeadStride, kRowStride,
+                va, vBase, vBatchStride, vHeadStride, vRowStride,
                 df.GetDataArray(),
                 mask: null, scaleValue: scaleVal,
                 batch, heads, seqQ, d_k, seqK, d_v);
@@ -4811,6 +4819,53 @@ public partial class CpuEngine : ITensorLevelEngine
             TensorAllocator.Return(result);
             if (weights != null) TensorAllocator.Return(weights);
         }
+    }
+
+    /// <summary>
+    /// Resolves a 4-D attention operand [batch, heads, seq, depth] to the raw float
+    /// backing array plus the addressing parameters the float SDPA kernel uses to
+    /// index it WITHOUT a contiguous copy. <paramref name="baseOffset"/> is the
+    /// storage offset of element [0,0,0,0]; <paramref name="batchStride"/> /
+    /// <paramref name="headStride"/> / <paramref name="rowStride"/> are the
+    /// per-batch / per-head / per-seq-row storage strides. The per-head base for
+    /// (b,h) is <c>baseOffset + b*batchStride + h*headStride</c>, and the depth
+    /// dimension is required to be contiguous (stride 1) so each per-head slice is a
+    /// standard row-major [seq, depth] matrix with leading dimension
+    /// <paramref name="rowStride"/> — exactly what BLAS lda/ldb expect. When the
+    /// operand is not a CPU tensor or its depth dim is not unit-stride, we
+    /// materialize a contiguous copy of THIS operand and return its standard packed
+    /// strides, keeping the result bit-identical.
+    /// </summary>
+    private static float[] ResolveStridedAttnOperand(
+        Tensor<float> t, int seq, int depth,
+        out int baseOffset, out int batchStride, out int headStride, out int rowStride)
+    {
+        // Strides are logical [B, H, S, D]. BLAS lda addressing needs the innermost
+        // (depth) dimension contiguous. The reshape+permute view satisfies this
+        // (D keeps stride 1); a slice/transpose that breaks it is rare but handled.
+        var strides = t.Strides;
+        if (strides[3] == 1)
+        {
+            var backing = t.GetCpuBackingForStridedRead(out int off);
+            if (backing != null)
+            {
+                baseOffset = off;
+                batchStride = strides[0];
+                headStride = strides[1];
+                rowStride = strides[2];
+                return backing;
+            }
+        }
+
+        // Fallback: materialize a contiguous copy of just this operand. Its strides
+        // are then packed row-major: batchStride = heads*seq*depth, headStride =
+        // seq*depth, rowStride = depth, baseOffset = 0.
+        var contig = t.Contiguous();
+        baseOffset = 0;
+        batchStride = t._shape[1] * seq * depth;
+        headStride = seq * depth;
+        rowStride = depth;
+        return contig.GetFlattenedData();
     }
 
     /// <inheritdoc/>
@@ -26012,15 +26067,31 @@ public partial class CpuEngine : ITensorLevelEngine
     /// caller's copy-out — the MHA path only ever wanted the output buffer. Same per-head kernel
     /// (incl. the nested-parallel sequential-GEMM guard), so numerics are identical.
     /// </summary>
+    // Resident per-thread scores scratch for the float *Into SDPA (#1672). Replaces the
+    // per-call ArrayPool.Shared.Rent, whose first-touch on freshly-committed pages cost
+    // ~12.6% of the DiT critical path (Buffer.ZeroMemoryInternal). [ThreadStatic] so the
+    // committed pages stay warm across calls on the SAME thread and there is no cross-call
+    // aliasing between concurrent SDPA calls on different threads. The buffer is captured
+    // into the parallel closure before dispatch; the inner Parallel.For workers each write
+    // a DISJOINT [sOff, seqQ*seqK) slice, so a single shared buffer is race-free (identical
+    // ownership model to the old per-call rented buffer). Each scores element is fully
+    // written (GEMM beta=0 SET, or the negInf-row 0f fill) before it is read, so no pre-zero
+    // is needed — the resident buffer's stale contents are always overwritten in-place.
+    [ThreadStatic]
+    private static float[]? t_sdpaScoresScratch;
+
     internal void ScaledDotProductAttentionFloatInto(
-        float[] qf, float[] kf, float[] vf, float[] outBuf,
+        float[] qf, int qBase, int qBatchStride, int qHeadStride, int qRowStride,
+        float[] kf, int kBase, int kBatchStride, int kHeadStride, int kRowStride,
+        float[] vf, int vBase, int vBatchStride, int vHeadStride, int vRowStride,
+        float[] outBuf,
         Tensor<bool>? mask, double scaleValue,
         int batch, int heads, int seqQ, int d_k, int seqK, int d_v)
     {
         int bhCount = batch * heads;
         // Use long arithmetic for the score-buffer size: for large attention contexts
         // (e.g. batch=8, heads=16, seq=4096 → 2.1B floats) the 32-bit product would
-        // silently overflow and ArrayPool.Rent would see a negative size.
+        // silently overflow.
         long scoresLenL = (long)bhCount * seqQ * seqK;
         if (scoresLenL > int.MaxValue)
             throw new ArgumentOutOfRangeException(
@@ -26028,96 +26099,146 @@ public partial class CpuEngine : ITensorLevelEngine
                 $"Attention scores buffer size ({scoresLenL:N0} floats) exceeds int.MaxValue; " +
                 "reduce batch, heads, or sequence length.");
         int scoresLen = (int)scoresLenL;
-        var scratch = System.Buffers.ArrayPool<float>.Shared.Rent(scoresLen);
-        try
+        // Lazily allocate / grow the resident scratch. Growth keeps the previous capacity's
+        // committed pages warm by handing the larger buffer to subsequent calls; we never
+        // shrink (the steady-state DiT forward reaches a fixed max and reuses it).
+        var scratch = t_sdpaScoresScratch;
+        if (scratch == null || scratch.Length < scoresLen)
         {
-            float scaleF = (float)scaleValue;
-            float negInfF = float.NegativeInfinity;
-            CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqQ * d_k, bh =>
+            scratch = new float[scoresLen];
+            t_sdpaScoresScratch = scratch;
+        }
+
+        float scaleF = (float)scaleValue;
+        float negInfF = float.NegativeInfinity;
+        CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqQ * d_k, bh =>
+        {
+            int b = bh / heads;
+            int h = bh % heads;
+            // Per-head storage offsets via the operands' (possibly permuted) strides.
+            int qOff = qBase + b * qBatchStride + h * qHeadStride;
+            int kOff = kBase + b * kBatchStride + h * kHeadStride;
+            int vOff = vBase + b * vBatchStride + h * vHeadStride;
+            int sOff = bh * seqQ * seqK;
+            int oOff = bh * seqQ * d_v;
+
+            // Nested-parallel guard: identical reasoning to ScaledDotProductAttentionFloat —
+            // force the single-threaded inner GEMM when this body is itself a parallel worker.
+            bool useSequentialGemm = CpuParallelSettings.IsInParallelRegion;
+
+            // Step 1: scores = Q @ K^T → scratch. Q is [seqQ,d_k] with leading dim qRowStride,
+            // K is [seqK,d_k] (used transposed) with leading dim kRowStride; the resolver
+            // guarantees the d_k dimension is unit-stride, which is all BLAS lda/ldb require.
+            bool gemmed = !useSequentialGemm && BlasProvider.TryGemmEx(
+                m: seqQ, n: seqK, k: d_k,
+                a: qf, aOffset: qOff, lda: qRowStride, transA: false,
+                b: kf, bOffset: kOff, ldb: kRowStride, transB: true,
+                c: scratch, cOffset: sOff, ldc: seqK);
+            if (!gemmed)
             {
-                int b = bh / heads;
-                int h = bh % heads;
-                int qOff = bh * seqQ * d_k;
-                int kOff = bh * seqK * d_k;
-                int sOff = bh * seqQ * seqK;
-                int vOff = bh * seqK * d_v;
-                int oOff = bh * seqQ * d_v;
-
-                // Nested-parallel guard: identical reasoning to ScaledDotProductAttentionFloat —
-                // force the single-threaded inner GEMM when this body is itself a parallel worker.
-                bool useSequentialGemm = CpuParallelSettings.IsInParallelRegion;
-
-                // Step 1: scores = Q @ K^T → scratch (transB=true, or transpose + SgemmSequential).
-                bool gemmed = !useSequentialGemm && BlasProvider.TryGemmEx(
-                    m: seqQ, n: seqK, k: d_k,
-                    a: qf, aOffset: qOff, lda: d_k, transA: false,
-                    b: kf, bOffset: kOff, ldb: d_k, transB: true,
-                    c: scratch, cOffset: sOff, ldc: seqK);
-                if (!gemmed)
+                // SgemmSequential needs packed (row-major, leading dim == cols) inputs, so
+                // gather strided Q/K per-head slices into small reused buffers. kt holds K^T.
+                var kt = System.Buffers.ArrayPool<float>.Shared.Rent(d_k * seqK);
+                float[]? qPackRented = qRowStride != d_k
+                    ? System.Buffers.ArrayPool<float>.Shared.Rent(seqQ * d_k) : null;
+                try
                 {
-                    var kt = System.Buffers.ArrayPool<float>.Shared.Rent(d_k * seqK);
-                    try
+                    for (int i = 0; i < seqK; i++)
+                        for (int j = 0; j < d_k; j++)
+                            kt[j * seqK + i] = kf[kOff + i * kRowStride + j];
+
+                    ReadOnlySpan<float> qSpan;
+                    if (qPackRented != null)
                     {
-                        for (int i = 0; i < seqK; i++)
+                        for (int i = 0; i < seqQ; i++)
                             for (int j = 0; j < d_k; j++)
-                                kt[j * seqK + i] = kf[kOff + i * d_k + j];
-                        Engines.Simd.SimdGemm.SgemmSequential(
-                            qf.AsSpan(qOff, seqQ * d_k),
-                            kt.AsSpan(0, d_k * seqK),
-                            scratch.AsSpan(sOff, seqQ * seqK),
-                            seqQ, d_k, seqK);
+                                qPackRented[i * d_k + j] = qf[qOff + i * qRowStride + j];
+                        qSpan = qPackRented.AsSpan(0, seqQ * d_k);
                     }
-                    finally { System.Buffers.ArrayPool<float>.Shared.Return(kt); }
-                }
+                    else
+                    {
+                        qSpan = qf.AsSpan(qOff, seqQ * d_k);
+                    }
 
-                // Step 2: scale + mask + numerically-stable softmax, IN PLACE in scratch.
-                for (int i = 0; i < seqQ; i++)
+                    Engines.Simd.SimdGemm.SgemmSequential(
+                        qSpan,
+                        kt.AsSpan(0, d_k * seqK),
+                        scratch.AsSpan(sOff, seqQ * seqK),
+                        seqQ, d_k, seqK);
+                }
+                finally
                 {
-                    int rowOff = sOff + i * seqK;
-                    float maxVal = negInfF;
-                    for (int j = 0; j < seqK; j++)
-                    {
-                        float val = scratch[rowOff + j] * scaleF;
-                        if (mask != null && !mask[b, h, i, j]) val = negInfF;
-                        if (val > maxVal) maxVal = val;
-                        scratch[rowOff + j] = val;
-                    }
-                    if (float.IsNegativeInfinity(maxVal))
-                    {
-                        for (int j = 0; j < seqK; j++) scratch[rowOff + j] = 0f;
-                        continue;
-                    }
-                    float sumExp = 0f;
-                    for (int j = 0; j < seqK; j++)
-                    {
-                        float ev = MathF.Exp(scratch[rowOff + j] - maxVal);
-                        scratch[rowOff + j] = ev;
-                        sumExp += ev;
-                    }
-                    float inv = sumExp != 0f ? 1f / sumExp : 0f;
-                    for (int j = 0; j < seqK; j++) scratch[rowOff + j] *= inv;
+                    System.Buffers.ArrayPool<float>.Shared.Return(kt);
+                    if (qPackRented != null) System.Buffers.ArrayPool<float>.Shared.Return(qPackRented);
                 }
+            }
 
-                // Step 3: output = probs @ V → outBuf (TryGemmEx beta=0 / SgemmSequential self-clears).
-                bool gemmed2 = !useSequentialGemm && BlasProvider.TryGemmEx(
-                    m: seqQ, n: d_v, k: seqK,
-                    a: scratch, aOffset: sOff, lda: seqK, transA: false,
-                    b: vf, bOffset: vOff, ldb: d_v, transB: false,
-                    c: outBuf, cOffset: oOff, ldc: d_v);
-                if (!gemmed2)
+            // Step 2: scale + mask + numerically-stable softmax, IN PLACE in scratch.
+            for (int i = 0; i < seqQ; i++)
+            {
+                int rowOff = sOff + i * seqK;
+                float maxVal = negInfF;
+                for (int j = 0; j < seqK; j++)
+                {
+                    float val = scratch[rowOff + j] * scaleF;
+                    if (mask != null && !mask[b, h, i, j]) val = negInfF;
+                    if (val > maxVal) maxVal = val;
+                    scratch[rowOff + j] = val;
+                }
+                if (float.IsNegativeInfinity(maxVal))
+                {
+                    for (int j = 0; j < seqK; j++) scratch[rowOff + j] = 0f;
+                    continue;
+                }
+                float sumExp = 0f;
+                for (int j = 0; j < seqK; j++)
+                {
+                    float ev = MathF.Exp(scratch[rowOff + j] - maxVal);
+                    scratch[rowOff + j] = ev;
+                    sumExp += ev;
+                }
+                float inv = sumExp != 0f ? 1f / sumExp : 0f;
+                for (int j = 0; j < seqK; j++) scratch[rowOff + j] *= inv;
+            }
+
+            // Step 3: output = probs @ V → outBuf. V is [seqK,d_v] with leading dim vRowStride
+            // (resolver guarantees d_v unit-stride). TryGemmEx beta=0 SET / SgemmSequential
+            // self-clears, so outBuf needs no pre-zero.
+            bool gemmed2 = !useSequentialGemm && BlasProvider.TryGemmEx(
+                m: seqQ, n: d_v, k: seqK,
+                a: scratch, aOffset: sOff, lda: seqK, transA: false,
+                b: vf, bOffset: vOff, ldb: vRowStride, transB: false,
+                c: outBuf, cOffset: oOff, ldc: d_v);
+            if (!gemmed2)
+            {
+                ReadOnlySpan<float> vSpan;
+                float[]? vPackRented = null;
+                if (vRowStride != d_v)
+                {
+                    vPackRented = System.Buffers.ArrayPool<float>.Shared.Rent(seqK * d_v);
+                    for (int i = 0; i < seqK; i++)
+                        for (int j = 0; j < d_v; j++)
+                            vPackRented[i * d_v + j] = vf[vOff + i * vRowStride + j];
+                    vSpan = vPackRented.AsSpan(0, seqK * d_v);
+                }
+                else
+                {
+                    vSpan = vf.AsSpan(vOff, seqK * d_v);
+                }
+                try
                 {
                     Engines.Simd.SimdGemm.SgemmSequential(
                         scratch.AsSpan(sOff, seqQ * seqK),
-                        vf.AsSpan(vOff, seqK * d_v),
+                        vSpan,
                         outBuf.AsSpan(oOff, seqQ * d_v),
                         seqQ, seqK, d_v);
                 }
-            });
-        }
-        finally
-        {
-            System.Buffers.ArrayPool<float>.Shared.Return(scratch, clearArray: false);
-        }
+                finally
+                {
+                    if (vPackRented != null) System.Buffers.ArrayPool<float>.Shared.Return(vPackRented);
+                }
+            }
+        });
     }
 
     /// <summary>
