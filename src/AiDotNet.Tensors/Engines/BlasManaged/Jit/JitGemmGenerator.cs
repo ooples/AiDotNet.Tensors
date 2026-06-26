@@ -218,6 +218,26 @@ internal static class JitGemmGenerator
                 if (f64) asm.VmovupdStoreD32(R8, i * ldcB + v * 32, i * nVec + v);
                 else asm.VmovupsStoreD32(R8, i * ldcB + v * 32, i * nVec + v);
     }
+
+    // ── #475 Phase 2: native low-precision GEMM folded into the JIT framework ───
+    // These reuse the existing SDE-verified machine-code microkernels (vdpbf16ps for BF16,
+    // AMX tdpb* for int8), which use instructions this AVX2 host lacks. They are perf-validatable
+    // ONLY on real AVX-512-BF16 / AMX hardware (or for correctness under Intel SDE) — hence the
+    // explicit opt-in flags (default OFF): auto-using them here would #UD. Ship opt-in; the
+    // structural encoding is gated by MachineKernel*Tests + the `--verify-bf16gemm`/`--verify-amx-gemm`
+    // SDE entrypoints, exactly like the existing AVX-512 kernels.
+
+    /// <summary>Opt-in for the native AVX-512-BF16 GEMM path (default off; .NET exposes no
+    /// Avx512Bf16 capability, and vdpbf16ps faults without it). Enable only on verified BF16 HW / SDE.</summary>
+    internal static bool EnableBf16 { get; set; }
+
+    /// <summary>Opt-in for the native AMX int8 GEMM path (default off; faults without AMX).</summary>
+    internal static bool EnableAmxInt8 { get; set; }
+
+    /// <summary>BF16 GEMM C[m,n] += Σ_k A[m,k]·B[k,n] (raw BF16 bits, FP32 accumulate) via the
+    /// SDE-verified vdpbf16ps microkernel. No-op (returns false) unless <see cref="EnableBf16"/>.</summary>
+    internal static unsafe bool TryRunBf16(ReadOnlySpan<ushort> a, ReadOnlySpan<ushort> b, Span<float> c, int m, int k, int n)
+        => Enabled && EnableBf16 && Jit.MachineCodeBf16Kernel.TryGemm(a, b, c, m, k, n);
 }
 #else
 /// <summary>net471 stub — no intrinsics / function pointers; callers fall back to the managed path.</summary>
@@ -225,7 +245,10 @@ internal static class JitGemmGenerator
 {
     internal static bool Enabled { get; set; }
     internal static bool IsSupported => false;
+    internal static bool EnableBf16 { get; set; }
+    internal static bool EnableAmxInt8 { get; set; }
     internal static unsafe bool TryRunFp32(float* a, int lda, float* b, int ldb, float* c, int ldc, int m, int n, int k, float* bias = null, bool relu = false) => false;
     internal static unsafe bool TryRunFp64(double* a, int lda, double* b, int ldb, double* c, int ldc, int m, int n, int k) => false;
+    internal static bool TryRunBf16(System.ReadOnlySpan<ushort> a, System.ReadOnlySpan<ushort> b, System.Span<float> c, int m, int k, int n) => false;
 }
 #endif

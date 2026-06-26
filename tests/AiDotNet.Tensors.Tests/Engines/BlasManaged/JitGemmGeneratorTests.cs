@@ -1,5 +1,6 @@
 using System;
 using AiDotNet.Tensors.Engines.BlasManaged;
+using AiDotNet.Tensors.Engines.BlasManaged.Jit;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
@@ -98,5 +99,27 @@ public class JitGemmGeneratorTests
                 e = Math.Max(e, Math.Abs(c[i * n + j] - s));
             }
         Assert.True(e < 1e-9, "FP64 result must match scalar ref");
+    }
+
+    // ── #475 Phase 2: native BF16 path (vdpbf16ps) — encoding-verified here; correctness/perf on
+    //    AVX-512-BF16 hardware or under Intel SDE (--verify-bf16gemm). ──────────────────────────
+
+    [Fact]
+    public void Bf16Microkernel_EmitsValidEncoding()
+    {
+        if (!JitGemmGenerator.IsSupported) return;
+        byte[] code = MachineCodeBf16Kernel.EmitGemmMicrokernelWindows();
+        Assert.True(code.Length > 16, "BF16 microkernel must emit a non-trivial body");
+        Assert.Equal(0xC3, code[^1]);          // ret
+        Assert.Contains((byte)0x62, code);     // EVEX prefix — vdpbf16ps is raw EVEX (no .NET intrinsic)
+    }
+
+    [Fact]
+    public void Bf16_StaysOffUntilExplicitlyEnabled()
+    {
+        // vdpbf16ps faults (#UD) without AVX-512-BF16, so the JIT BF16 path must never auto-run.
+        Assert.False(JitGemmGenerator.EnableBf16);
+        var a = new ushort[16]; var b = new ushort[16]; var c = new float[4];
+        Assert.False(JitGemmGenerator.TryRunBf16(a, b, c, 2, 8, 2));
     }
 }
