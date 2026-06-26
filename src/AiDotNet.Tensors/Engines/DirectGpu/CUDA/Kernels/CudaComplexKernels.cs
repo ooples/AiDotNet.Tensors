@@ -160,9 +160,15 @@ extern ""C"" __global__ void softmax_rows(
         maxVal = fmaxf(maxVal, rowIn[c]);
     sdata[tid] = maxVal;
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+    // Non-power-of-2-safe reduction: blockDim.x = min(256, cols), so cols=3/6 give a
+    // non-pow2 block. A plain s=blockDim.x/2; s>>=1 tree drops the top odd element
+    // (e.g. blockDim=6 never folds sdata[2]), corrupting the max/sum -> unnormalized
+    // softmax. Halve the ACTIVE count with ceil and bound-check tid+half.
+    for (int n = blockDim.x; n > 1; ) {
+        int half = (n + 1) >> 1;
+        if (tid < half && tid + half < n) sdata[tid] = fmaxf(sdata[tid], sdata[tid + half]);
         __syncthreads();
+        n = half;
     }
     maxVal = sdata[0];
 
@@ -175,9 +181,12 @@ extern ""C"" __global__ void softmax_rows(
     }
     sdata[tid] = sumExp;
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
+    // Same non-power-of-2-safe reduction as the max pass above.
+    for (int n = blockDim.x; n > 1; ) {
+        int half = (n + 1) >> 1;
+        if (tid < half && tid + half < n) sdata[tid] += sdata[tid + half];
         __syncthreads();
+        n = half;
     }
     sumExp = sdata[0];
 

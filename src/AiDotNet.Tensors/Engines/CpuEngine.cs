@@ -43145,8 +43145,25 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>Scaled dot-product attention: softmax(Q@K^T/sqrt(dk)) @ V</summary>
     public Tensor<T> TensorScaledDotProductAttention<T>(Tensor<T> query, Tensor<T> key, Tensor<T> value)
     {
-        var numOps = MathHelper.GetNumericOperations<T>();
         int dk = query._shape[^1];
+
+        // Inference fast path (float, 4D [B,H,S,D], not recording a tape): route through the
+        // resident-scratch *Into kernel, which computes scale+softmax+P·V WITHOUT materializing the
+        // O(S^2) scores / scaled-scores / softmax-weights tensors the decomposition below allocates
+        // (~3-4x [B,H,S,S]). Allocates only the [B,H,S,D] output. Bit-identical to the allocating
+        // path (verified for ScaledDotProductAttentionInto in #696). GraphMode falls through so the
+        // primitive ops still record for autodiff.
+        if (typeof(T) == typeof(float) && query.Rank == 4 && key.Rank == 4 && value.Rank == 4
+            && !GraphMode.IsActive
+            && System.Environment.GetEnvironmentVariable("AIDOTNET_SDPA_DECOMPOSE") != "1") // =1 forces old path for A/B
+        {
+            int b = query._shape[0], h = query._shape[1], sq = query._shape[2], dv = value._shape[3];
+            var outT = new Tensor<T>(new[] { b, h, sq, dv });
+            ScaledDotProductAttentionInto(outT, query, key, value, 1.0 / Math.Sqrt(dk));
+            return outT;
+        }
+
+        var numOps = MathHelper.GetNumericOperations<T>();
         T scale = numOps.FromDouble(1.0 / Math.Sqrt(dk));
 
         // Q @ K^T
