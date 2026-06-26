@@ -1,9 +1,13 @@
 using System;
 using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
+#if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics.X86;
+#endif
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
+
+#if NET5_0_OR_GREATER
 
 /// <summary>
 /// #475 Phase 1 — libxsmm-style JIT GEMM generator. Emits per-shape-SPECIALIZED FP32 microkernels
@@ -157,3 +161,12 @@ internal static class JitGemmGenerator
                 asm.VmovupsStoreD32(R8, i * ldcB + v * 32, i * nVec + v);
     }
 }
+#else
+/// <summary>net471 stub — no intrinsics / function pointers; callers fall back to the managed path.</summary>
+internal static class JitGemmGenerator
+{
+    internal static bool Enabled { get; set; }
+    internal static bool IsSupported => false;
+    internal static unsafe bool TryRunFp32(float* a, int lda, float* b, int ldb, float* c, int ldc, int m, int n, int k) => false;
+}
+#endif

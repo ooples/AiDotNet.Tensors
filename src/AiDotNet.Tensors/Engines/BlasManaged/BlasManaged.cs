@@ -197,6 +197,12 @@ public static partial class BlasManaged
     /// </summary>
     public static bool PreferManaged { get; set; } = false;
 
+    // #475 Phase 1: route small FP32 GEMMs to the libxsmm-style JIT generator, which exceeds OpenBLAS
+    // 1.5-6x for n<=128 (measured --ab-jit). Gate to the win region (large-N unpacked streaming loses
+    // to OpenBLAS's blocking — Phase 1 extension adds K-blocking). A/B toggle; default on.
+    internal static bool s_useJitGemm = true;
+    private const int JitMaxN = 128, JitMaxM = 256, JitMaxK = 1024;
+
     /// <summary>
     /// Sub-F3 (#374 follow-up): when true, the <see cref="Helpers.BlasProvider"/>
     /// <c>TryGemm</c> / <c>TryGemmEx</c> entry points consult
@@ -390,6 +396,31 @@ public static partial class BlasManaged
                     Mode = options.Mode,
                 });
             return;
+        }
+
+        // #475 Phase 1: small FP32 GEMMs go to the JIT generator (exceeds OpenBLAS 1.5-6x for n<=128).
+        // It writes C := A·B directly (no pre-zero needed), then the managed epilogue is applied.
+        // Gated to the win region + Auto packing + no transpose + n a multiple of 8.
+        if (s_useJitGemm && typeof(T) == typeof(float) && !transA && !transB
+            && options.PackingMode == PackingMode.Auto
+            && options.PackedA is null && options.PackedB is null
+            && n <= JitMaxN && m <= JitMaxM && k <= JitMaxK && (n & 7) == 0
+            && JitGemmGenerator.IsSupported)
+        {
+            bool jitOk;
+            unsafe
+            {
+                fixed (float* pa = MemoryMarshal.Cast<T, float>(a))
+                fixed (float* pb = MemoryMarshal.Cast<T, float>(b))
+                fixed (float* pc = MemoryMarshal.Cast<T, float>(c))
+                    jitOk = JitGemmGenerator.TryRunFp32(pa, lda, pb, ldb, pc, ldc, m, n, k);
+            }
+            if (jitOk)
+            {
+                var jitEpi = options.Epilogue;
+                EpilogueChain.Apply<T>(c, ldc, m, n, in jitEpi);
+                return;
+            }
         }
 
         // Strategies do read-modify-write on C; zero it here so the first call

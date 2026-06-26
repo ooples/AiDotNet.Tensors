@@ -440,6 +440,13 @@ internal static class MachineKernelGemm
         Span<float> c, int ldc, int kc, int njr) =>
         throw new PlatformNotSupportedException(
             "RunPanelFp32 requires the net5.0+ machine-code JIT path; gate on IsFp32PanelAvailable before calling.");
+    internal static bool IsFp32MacroAvailable => false;
+    internal static unsafe void RunMacroPanelFp32(
+        float* aBase, float* bBase, float* cBase,
+        int ldc, int kc, int njr, int numMr, int aStrideBytes) =>
+        throw new PlatformNotSupportedException(
+            "RunMacroPanelFp32 requires the net5.0+ machine-code JIT path; gate on IsFp32MacroAvailable before calling.");
+    internal static void ResetFp32Kernels() { }
     internal static int ActiveFp64Nr => Fp64Nr;
     internal static int ActiveFp32Nr => Fp32Nr;
 
