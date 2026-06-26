@@ -40,24 +40,28 @@ internal static class PinnedParallel
             if (_initState != 0) return;
             try
             {
-                var domains = CpuTopology.DetectL3Domains();
-                int total = 0;
-                foreach (var d in domains) total += d.Cores;
-                if (domains.Length < 1 || total < 2) { Volatile.Write(ref _initState, 2); return; }
-                _n = total;
+                // Build the per-thread pin target list. Per-core mode (AIDOTNET_PIN_PERCORE=1, OB-exact):
+                // ONE thread per physical core, pinned to that core's mask — no SMT contention. Default:
+                // L3-domain mode — Domain.Cores threads per CCX, each pinned to the CCX mask.
+                var pins = new System.Collections.Generic.List<CpuTopology.Domain>();
+                if (System.Environment.GetEnvironmentVariable("AIDOTNET_PIN_PERCORE") == "1")
+                    foreach (var core in CpuTopology.DetectPhysicalCores()) pins.Add(core);
+                if (pins.Count < 2)
+                {
+                    pins.Clear();
+                    foreach (var dom in CpuTopology.DetectL3Domains())
+                        for (int c = 0; c < dom.Cores; c++) pins.Add(dom);
+                }
+                if (pins.Count < 2) { Volatile.Write(ref _initState, 2); return; }
+                _n = pins.Count;
                 _go = new ManualResetEventSlim[_n];
                 _done = new CountdownEvent(_n);
-                int id = 0;
-                for (int di = 0; di < domains.Length; di++)
+                for (int id = 0; id < _n; id++)
                 {
-                    for (int c = 0; c < domains[di].Cores; c++)
-                    {
-                        int myId = id;
-                        var dom = domains[di];
-                        _go[myId] = new ManualResetEventSlim(false);
-                        new Thread(() => Worker(myId, dom)) { IsBackground = true, Name = $"aidotnet-pin-{myId}" }.Start();
-                        id++;
-                    }
+                    int myId = id;
+                    var pin = pins[id];
+                    _go[myId] = new ManualResetEventSlim(false);
+                    new Thread(() => Worker(myId, pin)) { IsBackground = true, Name = $"aidotnet-pin-{myId}" }.Start();
                 }
                 Volatile.Write(ref _initState, 1);
             }
