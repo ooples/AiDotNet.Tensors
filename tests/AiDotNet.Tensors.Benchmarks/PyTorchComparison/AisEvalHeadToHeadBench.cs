@@ -656,6 +656,10 @@ internal static class AisEvalHeadToHeadBench
     {
         torch.set_grad_enabled(false);
         int P = Environment.ProcessorCount;
+        // The bf16-B kernel (EmitBf16BTileWindows) is Win-x64 ABI only — no SysV variant (it's a negative
+        // experiment, not production). Skip on non-Windows so it never invokes the Win kernel via SysV → SIGSEGV.
+        if (!System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows))
+        { Console.WriteLine("bf16-B kernel is Win-x64 ABI only; skipped on non-Windows"); return; }
         if (!AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.IsAvailable) { Console.WriteLine("not available"); return; }
         int saved = CpuParallelSettings.MaxDegreeOfParallelism;
         CpuParallelSettings.MaxDegreeOfParallelism = P;
