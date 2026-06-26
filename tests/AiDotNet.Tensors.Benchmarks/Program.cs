@@ -154,6 +154,13 @@ class Program
             return;
         }
 
+        // #85 CCX spin-barrier vs .NET Barrier (forced CCX, bit-exact + perf). (--ab-spinbar)
+        if (args[0] == "--ab-spinbar")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.SpinBarrierSweep();
+            return;
+        }
+
         if (args[0] == "--ab-aiseval-dopsweep")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.DopSweep();

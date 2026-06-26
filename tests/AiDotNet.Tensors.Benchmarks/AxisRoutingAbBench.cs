@@ -616,6 +616,46 @@ public static class AxisRoutingAbBench
         }
     }
 
+    /// <summary>
+    /// #85 spin-barrier A/B: OpenBLAS spins (YIELDING) at its sync points; our CcxGemmPool used a .NET
+    /// Barrier that PARKS lanes (the 6/32-busy stall). Compare CCX with the lock-free spin barrier vs the
+    /// .NET Barrier — forced at all sizes (s_ignoreWorkGate) — for GF/s AND bit-exact output. If spin lifts
+    /// the small/large balanced shapes to the 1536³ per-core level, widen the CCX window. Run <c>--ab-spinbar</c>.
+    /// </summary>
+    public static void SpinBarrierSweep()
+    {
+        Console.WriteLine("=== #85 CCX spin barrier vs .NET Barrier (forced CCX, all sizes) ===");
+        CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
+        AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_ignoreWorkGate = true;
+        AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_disable = false;
+        var shapes = new (int m, int n, int k)[]
+        {
+            (1024, 1024, 1024), (1536, 1536, 1536), (2048, 2048, 2048), (1280, 1280, 1280),
+        };
+        foreach (var (m, n, k) in shapes)
+        {
+            var a = MakeRandom(m * k); var b = MakeRandom(k * n);
+            var cBar = new float[m * n]; var cSpin = new float[m * n];
+            double flops = 2.0 * m * n * k;
+            // Correctness: spin must be bit-identical to the barrier (same compute order).
+            AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_spinBarrier = false; GemmOnce(a, b, cBar, m, n, k);
+            AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_spinBarrier = true; GemmOnce(a, b, cSpin, m, n, k);
+            double maxErr = 0; for (int i = 0; i < cBar.Length; i++) maxErr = Math.Max(maxErr, Math.Abs(cBar[i] - cSpin[i]));
+            var c = new float[m * n];
+            double bestBar = 0, bestSpin = 0;
+            for (int rep = 0; rep < 3; rep++)
+            {
+                AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_spinBarrier = false;
+                bestBar = Math.Max(bestBar, flops / TimeMinGemm(a, b, c, m, n, k) / 1e9);
+                AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_spinBarrier = true;
+                bestSpin = Math.Max(bestSpin, flops / TimeMinGemm(a, b, c, m, n, k) / 1e9);
+            }
+            Console.WriteLine($"  {m}x{n}x{k}: barrier {bestBar,5:F0}  spin {bestSpin,5:F0} GF/s  ({bestSpin / bestBar:F2}x)  maxErr={maxErr:E1}");
+        }
+        AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_ignoreWorkGate = false;
+        AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_spinBarrier = true;
+    }
+
     private static double Gf(double flops, double sec) => flops / sec / 1e9;
 
     private static unsafe double TimeMinNative(float[] a, float[] b, float[] c, int m, int n, int k)
