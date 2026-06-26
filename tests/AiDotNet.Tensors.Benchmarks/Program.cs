@@ -62,6 +62,96 @@ class Program
             return;
         }
 
+        if (args[0] == "--ab-gemm-dop")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.GemmDopSweep();
+            return;
+        }
+
+        if (args[0] == "--ab-gemm-block")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.GemmBlockingSweep();
+            return;
+        }
+
+        if (args[0] == "--ab-gemm-dopfine")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.GemmDopFine();
+            return;
+        }
+
+        if (args[0] == "--ab-gemm-pack")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.GemmPackProfile();
+            return;
+        }
+
+        if (args[0] == "--ab-gemm-tile")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.GemmTileBakeoff();
+            return;
+        }
+
+        if (args[0] == "--ab-goto-gemm")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.GotoGemmBench();
+            return;
+        }
+
+        if (args[0] == "--ab-goto-par")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.GotoGemmParBench();
+            return;
+        }
+
+        if (args[0] == "--cpu-topology")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.CpuTopologyProbe();
+            return;
+        }
+
+        if (args[0] == "--ab-ccx")
+        {
+            AiDotNet.Tensors.Benchmarks.CcxGemmBench.Bench();
+            return;
+        }
+
+        if (args[0] == "--ab-prod")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.GotoProductionBench();
+            return;
+        }
+
+        if (args[0] == "--ab-bf16")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.GotoBf16Bench();
+            return;
+        }
+
+        if (args[0] == "--ab-strassen")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.GotoStrassenBench();
+            return;
+        }
+
+        if (args[0] == "--ab-mlp-block")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.MlpBlockBench();
+            return;
+        }
+
+        if (args[0] == "--ab-shortm")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.ShortMBench();
+            return;
+        }
+
+        if (args[0] == "--profile-gemm")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.ProfileGemm();
+            return;
+        }
+
         if (args[0] == "--ab-aiseval-poolstats")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.PoolStats();
@@ -794,6 +884,17 @@ class Program
         Console.WriteLine("  --ab-softmax-double    : A/B softmax (FP64)");
         Console.WriteLine("  --ab-layernorm         : A/B LayerNorm");
         Console.WriteLine("  --ab-binary-ops        : A/B elementwise binary ops");
+        Console.WriteLine();
+        Console.WriteLine("Managed FP32 GEMM (GotoGemm / CCX) A/B + diagnostics:");
+        Console.WriteLine("  --ab-prod              : production engine GEMM — per-tile/CCX-1D/CCX-2D vs MKL (warm, interleaved)");
+        Console.WriteLine("  --ab-shortm            : short-M GEMM diagnosis (M-sweep, blocking/wrapper/routing/split-K A/B)");
+        Console.WriteLine("  --ab-mlp-block         : DiT MLP block (fused+cached) vs torch MKL sequence");
+        Console.WriteLine("  --ab-bf16              : bf16-B vs fp32 GEMM (bandwidth experiment)");
+        Console.WriteLine("  --ab-strassen          : one-level Strassen vs fp32 vs MKL (large squares)");
+        Console.WriteLine("  --ab-gemm-dop          : managed GEMM scaling vs MKL (gap decomposition)");
+        Console.WriteLine("  --ab-ccx               : CCX-pinned-pool GEMM prototype (1D/2D)");
+        Console.WriteLine("  --profile-gemm         : tight engine.TensorMatMul loop for an external profiler");
+        Console.WriteLine("  --cpu-topology         : L3/CCX + NUMA topology (Windows-only)");
         Console.WriteLine();
         Console.WriteLine("PyTorch-comparison diagnostics:");
         Console.WriteLine("  --per-call-threads       : Per-call NumThreads sweep vs PyTorch");
