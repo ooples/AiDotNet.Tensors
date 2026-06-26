@@ -38,13 +38,14 @@ internal static unsafe class CcxGemmPool
     private static volatile bool _faulted; // a lane's compute threw → TryRun returns false (caller falls back)
     private static int _gr, _gc;      // 2D CCX grid (gr·gc = numCcx)
 
-    /// <summary>Min M·N·K for the CCX path. Below ~2G FLOP the per-K-panel BARRIERS dominate: PerfView
-    /// busy-core (2026-06-26) showed CCX on 1024³ stalls at 6/32 busy cores (237 GF/s) while barrier-free
-    /// RunParallel gets 13.3 cores (598). Clean A/B (--ab-ccx-vs-rp, DOP32): RunParallel beats CCX 1024³
-    /// 1.96×; CCX only amortizes its barriers and wins at 1536³ (1.23×). So gate CCX to ≥2G work where the
-    /// compute-per-barrier is large enough to hide the barrier latency; smaller balanced shapes (1024³-class)
-    /// fall through to RunParallel.</summary>
+    /// <summary>M·N·K WINDOW for the CCX path — its per-CCX L3-resident B-strip only beats barrier-free
+    /// RunParallel in a narrow sweet spot. Clean A/B (--ab-ccx-vs-rp, DOP32, 2026-06-26 square ladder):
+    /// 1024³ tie, 1280³ tie, **1536³ CCX 1135 vs 882 (1.29×, near-OB)**, 1792³ RunParallel 1.18×, 2048³
+    /// RunParallel 1.38×. Below ~2G the per-K-panel barriers dominate (PerfView: 1024³ stalled 6/32 busy
+    /// cores under sustained load); above ~4.5G the B-strip spills the CCX L3 and RunParallel's per-tile
+    /// L2 residency wins. So fire CCX only in [2G, 4.5G]; everything else → RunParallel.</summary>
     private const long CcxMinWork = 2L * 1024 * 1024 * 1024;
+    private const long CcxMaxWork = 4_500_000_000L;
 
     /// <summary>Test/diagnostic toggle (env AIDOTNET_DISABLE_CCX=1): force per-tile, for in-process A/B.</summary>
     internal static bool s_disable =
@@ -189,7 +190,8 @@ internal static unsafe class CcxGemmPool
         // Gate to the PROVEN balanced-square regime: m,n>=512 (DiT m=256 excluded — its deep-K MLP shapes
         // are barrier-heavy in 2D and the diffusion hot path must not regress; they stay on per-tile/PackBoth).
         if (m < s_minM || n < 512 || k < 256) return false;
-        if ((long)m * n * k < CcxMinWork) return false;
+        long work = (long)m * n * k;
+        if (work < CcxMinWork || work > CcxMaxWork) return false; // CCX win window only; else RunParallel
         if (CpuParallelSettings.MaxDegreeOfParallelism < _total) return false; // restricted budget → per-tile
 
         // Deep-K-aware kc for the 2D path: more K per panel ⇒ fewer (pc-panels × 2) per-CCX barriers, which

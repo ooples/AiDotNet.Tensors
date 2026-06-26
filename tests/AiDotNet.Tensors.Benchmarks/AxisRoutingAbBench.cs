@@ -595,8 +595,8 @@ public static class AxisRoutingAbBench
         CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
         var shapes = new (int m, int n, int k)[]
         {
-            (1024, 1024, 1024), (1536, 1536, 1536), (2048, 2048, 2048),
-            (1024, 2048, 2048), (2048, 1024, 1024),
+            (1024, 1024, 1024), (1280, 1280, 1280), (1536, 1536, 1536),
+            (1792, 1792, 1792), (2048, 2048, 2048),
         };
         foreach (var (m, n, k) in shapes)
         {
