@@ -398,23 +398,32 @@ public static partial class BlasManaged
             return;
         }
 
-        // #475 Phase 1: small FP32 GEMMs go to the JIT generator (exceeds OpenBLAS 1.5-6x for n<=128).
-        // It writes C := A·B directly (no pre-zero needed), then the managed epilogue is applied.
-        // Gated to the win region + Auto packing + no transpose + n a multiple of 8.
-        if (s_useJitGemm && typeof(T) == typeof(float) && !transA && !transB
+        // #475 Phase 1: small FP32/FP64 GEMMs go to the JIT generator (exceeds OpenBLAS 1.5-6x for
+        // n<=128). It writes C := A·B directly (no pre-zero needed), then the managed epilogue is
+        // applied. Gated to the win region + Auto packing + no transpose + n a multiple of the lane.
+        if (s_useJitGemm && !transA && !transB
             && options.PackingMode == PackingMode.Auto
             && options.PackedA is null && options.PackedB is null
-            && n <= JitMaxN && m <= JitMaxM && k <= JitMaxK && (n & 7) == 0
+            && n <= JitMaxN && m <= JitMaxM && k <= JitMaxK
             && JitGemmGenerator.IsSupported)
         {
-            bool jitOk;
-            unsafe
-            {
-                fixed (float* pa = MemoryMarshal.Cast<T, float>(a))
-                fixed (float* pb = MemoryMarshal.Cast<T, float>(b))
-                fixed (float* pc = MemoryMarshal.Cast<T, float>(c))
-                    jitOk = JitGemmGenerator.TryRunFp32(pa, lda, pb, ldb, pc, ldc, m, n, k);
-            }
+            bool jitOk = false;
+            if (typeof(T) == typeof(float) && (n & 7) == 0)
+                unsafe
+                {
+                    fixed (float* pa = MemoryMarshal.Cast<T, float>(a))
+                    fixed (float* pb = MemoryMarshal.Cast<T, float>(b))
+                    fixed (float* pc = MemoryMarshal.Cast<T, float>(c))
+                        jitOk = JitGemmGenerator.TryRunFp32(pa, lda, pb, ldb, pc, ldc, m, n, k);
+                }
+            else if (typeof(T) == typeof(double) && (n & 3) == 0)
+                unsafe
+                {
+                    fixed (double* pa = MemoryMarshal.Cast<T, double>(a))
+                    fixed (double* pb = MemoryMarshal.Cast<T, double>(b))
+                    fixed (double* pc = MemoryMarshal.Cast<T, double>(c))
+                        jitOk = JitGemmGenerator.TryRunFp64(pa, lda, pb, ldb, pc, ldc, m, n, k);
+                }
             if (jitOk)
             {
                 var jitEpi = options.Epilogue;

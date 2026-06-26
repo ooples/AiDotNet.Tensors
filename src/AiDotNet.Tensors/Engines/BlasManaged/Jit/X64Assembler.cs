@@ -149,6 +149,9 @@ internal sealed class X64Assembler
     /// <summary>vmovups [base+disp32], ymm_src (FP32 256-bit store). Op 0x11; src in ModRM.reg.</summary>
     internal void VmovupsStoreD32(int baseReg, int disp32, int src) => VexMemDisp32(Map0F, PpNone, 0, 1, 0x11, src, baseReg, disp32);
 
+    /// <summary>vmovupd [base+disp32], ymm_src (FP64 256-bit store). 66 prefix; op 0x11.</summary>
+    internal void VmovupdStoreD32(int baseReg, int disp32, int src) => VexMemDisp32(Map0F, Pp66, 0, 1, 0x11, src, baseReg, disp32);
+
     /// <summary>vbroadcastss ymm_dst, [base+disp32].</summary>
     internal void VbroadcastSsD32(int dst, int baseReg, int disp32) => VexMemDisp32(Map0F38, Pp66, 0, 1, 0x18, dst, baseReg, disp32);
 

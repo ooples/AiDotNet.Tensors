@@ -22,9 +22,9 @@ internal static class JitGemmGenerator
     /// <summary>Master switch (default on when supported). A/B + safety override.</summary>
     internal static bool Enabled { get; set; } = true;
 
-    // Specialized-kernel cache: (Mr, nVec, lda, ldb, ldc) -> native entry point. ExecutableMemory
-    // is retained for process lifetime so the emitted pages stay mapped.
-    private static readonly ConcurrentDictionary<(int Mr, int NVec, int Lda, int Ldb, int Ldc), nint> s_cache = new();
+    // Specialized-kernel cache: (Mr, nVec, lda, ldb, ldc, f64) -> native entry point.
+    // ExecutableMemory is retained for process lifetime so the emitted pages stay mapped.
+    private static readonly ConcurrentDictionary<(int Mr, int NVec, int Lda, int Ldb, int Ldc, bool F64), nint> s_cache = new();
     private static readonly ConcurrentBag<ExecutableMemory> s_keepAlive = new();
     private static readonly object s_emitLock = new();
 
@@ -52,14 +52,14 @@ internal static class JitGemmGenerator
             int nj = 0;
             for (; nj + 16 <= n; nj += 16)
             {
-                nint kern = GetOrEmit(mr, 2, lda, ldb, ldc);
+                nint kern = GetOrEmit(mr, 2, lda, ldb, ldc, f64: false);
                 if (kern == 0) return false;
                 ((delegate* unmanaged<float*, float*, float*, long, void>)kern)(
                     a + (long)mi * lda, b + nj, c + (long)mi * ldc + nj, k);
             }
             for (; nj + 8 <= n; nj += 8)
             {
-                nint kern = GetOrEmit(mr, 1, lda, ldb, ldc);
+                nint kern = GetOrEmit(mr, 1, lda, ldb, ldc, f64: false);
                 if (kern == 0) return false;
                 ((delegate* unmanaged<float*, float*, float*, long, void>)kern)(
                     a + (long)mi * lda, b + nj, c + (long)mi * ldc + nj, k);
@@ -68,9 +68,39 @@ internal static class JitGemmGenerator
         return true;
     }
 
-    private static nint GetOrEmit(int mr, int nVec, int lda, int ldb, int ldc)
+    /// <summary>C[m×n] := A[m×k]·B[k×n] (row-major, overwrite) via specialized JIT tiles, FP64.
+    /// Returns false when N is not a multiple of 4 (no AVX2 mask), unsupported, or on emit failure.</summary>
+    internal static unsafe bool TryRunFp64(
+        double* a, int lda, double* b, int ldb, double* c, int ldc, int m, int n, int k)
     {
-        var key = (mr, nVec, lda, ldb, ldc);
+        if (!IsSupported || m <= 0 || n <= 0 || k <= 0) return false;
+        if ((n & 3) != 0) return false; // YMM holds 4 doubles; partial-4 columns fall back
+
+        for (int mi = 0; mi < m; mi += 6)
+        {
+            int mr = Math.Min(6, m - mi);
+            int nj = 0;
+            for (; nj + 8 <= n; nj += 8)
+            {
+                nint kern = GetOrEmit(mr, 2, lda, ldb, ldc, f64: true);
+                if (kern == 0) return false;
+                ((delegate* unmanaged<double*, double*, double*, long, void>)kern)(
+                    a + (long)mi * lda, b + nj, c + (long)mi * ldc + nj, k);
+            }
+            for (; nj + 4 <= n; nj += 4)
+            {
+                nint kern = GetOrEmit(mr, 1, lda, ldb, ldc, f64: true);
+                if (kern == 0) return false;
+                ((delegate* unmanaged<double*, double*, double*, long, void>)kern)(
+                    a + (long)mi * lda, b + nj, c + (long)mi * ldc + nj, k);
+            }
+        }
+        return true;
+    }
+
+    private static nint GetOrEmit(int mr, int nVec, int lda, int ldb, int ldc, bool f64)
+    {
+        var key = (mr, nVec, lda, ldb, ldc, f64);
         if (s_cache.TryGetValue(key, out var p)) return p;
         lock (s_emitLock)
         {
@@ -79,8 +109,8 @@ internal static class JitGemmGenerator
             try
             {
                 byte[] code = IsWindows
-                    ? EmitDirectTileWindows(mr, nVec, lda, ldb, ldc)
-                    : EmitDirectTileSysV(mr, nVec, lda, ldb, ldc);
+                    ? EmitDirectTileWindows(mr, nVec, lda, ldb, ldc, f64)
+                    : EmitDirectTileSysV(mr, nVec, lda, ldb, ldc, f64);
                 var mem = ExecutableMemory.TryAllocate(code);
                 if (mem is not null) { s_keepAlive.Add(mem); entry = mem.Pointer; }
             }
@@ -94,7 +124,7 @@ internal static class JitGemmGenerator
     // Canonical body register layout: rcx=A, rdx=B, r8=C, r9=K. Accumulators ymm0..(Mr*nVec-1)
     // (≤12), B-load scratch ymm12..(12+nVec-1), A-broadcast scratch ymm14. Mr≤6, nVec≤2.
 
-    private static byte[] EmitDirectTileWindows(int mr, int nVec, int lda, int ldb, int ldc)
+    private static byte[] EmitDirectTileWindows(int mr, int nVec, int lda, int ldb, int ldc, bool f64)
     {
         const int RSP = 4;
         var asm = new X64Assembler();
@@ -102,7 +132,7 @@ internal static class JitGemmGenerator
         // body uses ymm6–14, whose low 128 bits are nonvolatile).
         asm.SubRsp(0xA0);
         for (int i = 0; i < 10; i++) asm.VmovupsXmmStoreD32(RSP, i * 0x10, 6 + i);
-        EmitDirectBody(asm, mr, nVec, lda, ldb, ldc);
+        EmitDirectBody(asm, mr, nVec, lda, ldb, ldc, f64);
         for (int i = 0; i < 10; i++) asm.VmovupsXmmLoadD32(6 + i, RSP, i * 0x10);
         asm.AddRsp(0xA0);
         asm.Vzeroupper();
@@ -110,7 +140,7 @@ internal static class JitGemmGenerator
         return asm.ToArray();
     }
 
-    private static byte[] EmitDirectTileSysV(int mr, int nVec, int lda, int ldb, int ldc)
+    private static byte[] EmitDirectTileSysV(int mr, int nVec, int lda, int ldb, int ldc, bool f64)
     {
         const int RCX = 1, RDX = 2, R8 = 8, R9 = 9, RSI = 6, RDI = 7;
         var asm = new X64Assembler();
@@ -120,20 +150,24 @@ internal static class JitGemmGenerator
         asm.MovRegReg(RDX, RSI);  // rdx = B
         asm.MovRegReg(RCX, RDI);  // rcx = A
         // All ymm are volatile on SysV — no save needed.
-        EmitDirectBody(asm, mr, nVec, lda, ldb, ldc);
+        EmitDirectBody(asm, mr, nVec, lda, ldb, ldc, f64);
         asm.Vzeroupper();
         asm.Ret();
         return asm.ToArray();
     }
 
-    /// <summary>Mr×(8·nVec) FP32 tile, lda/ldb/ldc baked. rcx=A, rdx=B, r8=C, r9=K. C is RMW.</summary>
-    private static void EmitDirectBody(X64Assembler asm, int mr, int nVec, int lda, int ldb, int ldc)
+    /// <summary>Mr×(laneW·nVec) tile (laneW = 8 floats / 4 doubles), lda/ldb/ldc baked. rcx=A,
+    /// rdx=B, r8=C, r9=K. Each ymm spans 32 B regardless of dtype, so the v·32 displacements and
+    /// the +32 store strides are shared; only the element size, FMA, broadcast, and load/store
+    /// opcodes differ between FP32 and FP64.</summary>
+    private static void EmitDirectBody(X64Assembler asm, int mr, int nVec, int lda, int ldb, int ldc, bool f64)
     {
         const int RCX = 1, RDX = 2, R8 = 8, R9 = 9;
         const int Bscr = 12, Ascr = 14; // ymm12..13 = B rows, ymm14 = A broadcast
-        int ldaB = lda * sizeof(float), ldbB = ldb * sizeof(float), ldcB = ldc * sizeof(float);
+        int esz = f64 ? 8 : 4;
+        int ldaB = lda * esz, ldbB = ldb * esz, ldcB = ldc * esz;
 
-        // Zero the accumulators (C := A·B overwrite — no dependence on C's prior content).
+        // Zero the accumulators (C := A·B overwrite). vxorps clears all bits → 0.0 for both dtypes.
         for (int i = 0; i < mr; i++)
             for (int v = 0; v < nVec; v++)
                 asm.Vxorps(i * nVec + v, i * nVec + v, i * nVec + v);
@@ -144,21 +178,24 @@ internal static class JitGemmGenerator
         int loop = asm.NewLabel();
         asm.MarkLabel(loop);
         // One K-step: load the B row (nVec ymm), broadcast each A column element, FMA.
-        for (int v = 0; v < nVec; v++) asm.VmovupsLoad(Bscr + v, RDX, (sbyte)(v * 32));
+        for (int v = 0; v < nVec; v++)
+            if (f64) asm.VmovupdLoad(Bscr + v, RDX, (sbyte)(v * 32)); else asm.VmovupsLoad(Bscr + v, RDX, (sbyte)(v * 32));
         for (int i = 0; i < mr; i++)
         {
-            asm.VbroadcastSsD32(Ascr, RCX, i * ldaB);          // A[i][k] = [rcx + i*lda*4]
-            for (int v = 0; v < nVec; v++) asm.Vfmadd231ps(i * nVec + v, Ascr, Bscr + v);
+            if (f64) asm.VbroadcastSdD32(Ascr, RCX, i * ldaB); else asm.VbroadcastSsD32(Ascr, RCX, i * ldaB);
+            for (int v = 0; v < nVec; v++)
+                if (f64) asm.Vfmadd231pd(i * nVec + v, Ascr, Bscr + v); else asm.Vfmadd231ps(i * nVec + v, Ascr, Bscr + v);
         }
-        asm.AddRegImm8(RCX, sizeof(float));                    // A col ptr += 1 float (k++)
-        asm.AddRegImm32(RDX, ldbB);                            // B row ptr += ldb floats (k++)
+        asm.AddRegImm8(RCX, (sbyte)esz);    // A col ptr += 1 element (k++)
+        asm.AddRegImm32(RDX, ldbB);  // B row ptr += ldb elements (k++)
         asm.DecReg(R9);
         asm.JnzLabel32(loop);
         asm.MarkLabel(done);
 
         for (int i = 0; i < mr; i++)
             for (int v = 0; v < nVec; v++)
-                asm.VmovupsStoreD32(R8, i * ldcB + v * 32, i * nVec + v);
+                if (f64) asm.VmovupdStoreD32(R8, i * ldcB + v * 32, i * nVec + v);
+                else asm.VmovupsStoreD32(R8, i * ldcB + v * 32, i * nVec + v);
     }
 }
 #else
@@ -168,5 +205,6 @@ internal static class JitGemmGenerator
     internal static bool Enabled { get; set; }
     internal static bool IsSupported => false;
     internal static unsafe bool TryRunFp32(float* a, int lda, float* b, int ldb, float* c, int ldc, int m, int n, int k) => false;
+    internal static unsafe bool TryRunFp64(double* a, int lda, double* b, int ldb, double* c, int ldc, int m, int n, int k) => false;
 }
 #endif
