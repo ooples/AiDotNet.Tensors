@@ -17538,29 +17538,33 @@ public partial class CpuEngine : ITensorLevelEngine
         var offsetData = offset.GetDataArray();
         var maskData = mask?.GetDataArray();
 
-        // Striped lock pool (no per-call allocation) — see _deformScatterLocks.
-        var locks = _deformScatterLocks;
-
-        // Parallelize over the full (batch, outChannel) space (all groups) -> good core utilization.
-        CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels,
-            (long)batch * outChannels * outputHeight * outputWidth, idx =>
+        // Parallelize over (batch, inChannel): each work item owns gradInput[b, icGlobal, :, :]
+        // EXCLUSIVELY (every bilinear scatter for a given input channel lands in that channel's
+        // own H×W plane), so the gradient accumulation needs NO locks and NO per-thread buffers.
+        // This restructures the original (batch, outChannel) loop — which had every output channel
+        // in a group scatter into the same input planes and thus required a lock per corner — into
+        // a disjoint-output partition. Same total work (batch·inChannels·outCpg = batch·outChannels·inCpg),
+        // similar parallelism, but the scatter-lock contention that bounded BackwardInput is gone.
+        CpuParallelSettings.ParallelForOrSerial(0, batch * inChannels,
+            (long)batch * inChannels * outCpg * outputHeight * outputWidth * numKernelPositions, idx =>
         {
-            int b = idx / outChannels;
-            int oc = idx % outChannels;
-            int g = oc / outCpg;
+            int b = idx / inChannels;
+            int icGlobal = idx % inChannels;
+            int g = icGlobal / inCpg;
+            int icl = icGlobal - g * inCpg;
             int dg = deformGroups == 1 ? 0 : g * deformGroups / groups;
-            int icBase = g * inCpg;
+            int ocBase = g * outCpg;
             int offBlock = dg * 2 * numKernelPositions;
             int maskBlock = dg * numKernelPositions;
 
-            for (int oh = 0; oh < outputHeight; oh++)
-            for (int ow = 0; ow < outputWidth; ow++)
+            for (int ocl = 0; ocl < outCpg; ocl++)
             {
-                int gradOutIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
-                T gradOutVal = gradOutputData[gradOutIdx];
-                for (int icl = 0; icl < inCpg; icl++)
+                int oc = ocBase + ocl;
+                for (int oh = 0; oh < outputHeight; oh++)
+                for (int ow = 0; ow < outputWidth; ow++)
                 {
-                    int icGlobal = icBase + icl;
+                    int gradOutIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
+                    T gradOutVal = gradOutputData[gradOutIdx];
                     for (int kh = 0; kh < kernelHeight; kh++)
                     for (int kw = 0; kw < kernelWidth; kw++)
                     {
@@ -17579,7 +17583,7 @@ public partial class CpuEngine : ITensorLevelEngine
                             modulation = maskData[maskIdx];
                         }
                         T gradVal = numOps.Multiply(numOps.Multiply(gradOutVal, kernelData[kernelIdx]), modulation);
-                        BilinearBackwardInput(gradInputData, gradVal, b, icGlobal, inChannels, height, width, sampledH, sampledW, numOps, locks);
+                        BilinearBackwardInputUnlocked(gradInputData, gradVal, b, icGlobal, inChannels, height, width, sampledH, sampledW, numOps);
                     }
                 }
             }
@@ -18115,6 +18119,68 @@ public partial class CpuEngine : ITensorLevelEngine
         int idx = ((batch * totalChannels + channel) * height + h) * width + w;
         float contrib = gradVal * (float)weight;
         lock (locks[idx & (DeformScatterLockCount - 1)]) { gradData[idx] += contrib; }
+    }
+
+    // Lock-FREE bilinear input-gradient scatter, for callers that own the target channel plane
+    // exclusively (grouped BackwardInput parallelized over input channels). Same math as the locked
+    // BilinearBackwardInput; differs only by dropping the lock since no other thread writes this plane.
+    private static void BilinearBackwardInputUnlocked<T>(T[] gradData, T gradVal, int batch, int channel, int totalChannels, int height, int width, double h, double w, INumericOperations<T> numOps)
+    {
+        if (h <= -1 || h >= height || w <= -1 || w >= width)
+            return;
+
+        if (typeof(T) == typeof(double))
+        {
+            double gv = Unsafe.As<T, double>(ref gradVal);
+            double[] gd = Unsafe.As<T[], double[]>(ref gradData);
+            int h0 = (int)Math.Floor(h), h1 = h0 + 1, w0 = (int)Math.Floor(w), w1 = w0 + 1;
+            double lh = h - h0, lw = w - w0;
+            ScatterPixelDoubleNoLock(gd, gv, batch, channel, totalChannels, height, width, h0, w0, (1 - lh) * (1 - lw));
+            ScatterPixelDoubleNoLock(gd, gv, batch, channel, totalChannels, height, width, h0, w1, (1 - lh) * lw);
+            ScatterPixelDoubleNoLock(gd, gv, batch, channel, totalChannels, height, width, h1, w0, lh * (1 - lw));
+            ScatterPixelDoubleNoLock(gd, gv, batch, channel, totalChannels, height, width, h1, w1, lh * lw);
+            return;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            float gv = Unsafe.As<T, float>(ref gradVal);
+            float[] gd = Unsafe.As<T[], float[]>(ref gradData);
+            int h0 = (int)Math.Floor(h), h1 = h0 + 1, w0 = (int)Math.Floor(w), w1 = w0 + 1;
+            double lh = h - h0, lw = w - w0;
+            ScatterPixelFloatNoLock(gd, gv, batch, channel, totalChannels, height, width, h0, w0, (1 - lh) * (1 - lw));
+            ScatterPixelFloatNoLock(gd, gv, batch, channel, totalChannels, height, width, h0, w1, (1 - lh) * lw);
+            ScatterPixelFloatNoLock(gd, gv, batch, channel, totalChannels, height, width, h1, w0, lh * (1 - lw));
+            ScatterPixelFloatNoLock(gd, gv, batch, channel, totalChannels, height, width, h1, w1, lh * lw);
+            return;
+        }
+
+        {
+            int h0 = (int)Math.Floor(h), h1 = h0 + 1, w0 = (int)Math.Floor(w), w1 = w0 + 1;
+            double lh = h - h0, lw = w - w0;
+            AddGradientToPixelNoLock(gradData, gradVal, batch, channel, totalChannels, height, width, h0, w0, (1 - lh) * (1 - lw), numOps);
+            AddGradientToPixelNoLock(gradData, gradVal, batch, channel, totalChannels, height, width, h0, w1, (1 - lh) * lw, numOps);
+            AddGradientToPixelNoLock(gradData, gradVal, batch, channel, totalChannels, height, width, h1, w0, lh * (1 - lw), numOps);
+            AddGradientToPixelNoLock(gradData, gradVal, batch, channel, totalChannels, height, width, h1, w1, lh * lw, numOps);
+        }
+    }
+
+    private static void ScatterPixelDoubleNoLock(double[] gradData, double gradVal, int batch, int channel, int totalChannels, int height, int width, int h, int w, double weight)
+    {
+        if (h < 0 || h >= height || w < 0 || w >= width || Math.Abs(weight) < 1e-10) return;
+        gradData[((batch * totalChannels + channel) * height + h) * width + w] += gradVal * weight;
+    }
+
+    private static void ScatterPixelFloatNoLock(float[] gradData, float gradVal, int batch, int channel, int totalChannels, int height, int width, int h, int w, double weight)
+    {
+        if (h < 0 || h >= height || w < 0 || w >= width || Math.Abs(weight) < 1e-10) return;
+        gradData[((batch * totalChannels + channel) * height + h) * width + w] += gradVal * (float)weight;
+    }
+
+    private static void AddGradientToPixelNoLock<T>(T[] gradData, T gradVal, int batch, int channel, int totalChannels, int height, int width, int h, int w, double weight, INumericOperations<T> numOps)
+    {
+        if (h < 0 || h >= height || w < 0 || w >= width || Math.Abs(weight) < 1e-10) return;
+        int idx = ((batch * totalChannels + channel) * height + h) * width + w;
+        gradData[idx] = numOps.Add(gradData[idx], numOps.Multiply(gradVal, numOps.FromDouble(weight)));
     }
 
     /// <summary>
