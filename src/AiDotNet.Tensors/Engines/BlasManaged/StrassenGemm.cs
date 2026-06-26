@@ -114,7 +114,7 @@ internal static class StrassenGemm
                 WriteQuad(C22, ldc, h, m1, 1, m2, -1, m3, 1, m6, 1);
             }
         }
-        finally { ArrayPool<float>.Shared.Return(pool); }
+        finally { ArrayPool<float>.Shared.Return(pool, clearArray: true); } // clear: holds operand sums/sub-products (tensor data)
     }
 }
 #endif

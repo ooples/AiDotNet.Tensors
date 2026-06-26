@@ -885,6 +885,17 @@ class Program
         Console.WriteLine("  --ab-layernorm         : A/B LayerNorm");
         Console.WriteLine("  --ab-binary-ops        : A/B elementwise binary ops");
         Console.WriteLine();
+        Console.WriteLine("Managed FP32 GEMM (GotoGemm / CCX) A/B + diagnostics:");
+        Console.WriteLine("  --ab-prod              : production engine GEMM — per-tile/CCX-1D/CCX-2D vs MKL (warm, interleaved)");
+        Console.WriteLine("  --ab-shortm            : short-M GEMM diagnosis (M-sweep, blocking/wrapper/routing/split-K A/B)");
+        Console.WriteLine("  --ab-mlp-block         : DiT MLP block (fused+cached) vs torch MKL sequence");
+        Console.WriteLine("  --ab-bf16              : bf16-B vs fp32 GEMM (bandwidth experiment)");
+        Console.WriteLine("  --ab-strassen          : one-level Strassen vs fp32 vs MKL (large squares)");
+        Console.WriteLine("  --ab-gemm-dop          : managed GEMM scaling vs MKL (gap decomposition)");
+        Console.WriteLine("  --ab-ccx               : CCX-pinned-pool GEMM prototype (1D/2D)");
+        Console.WriteLine("  --profile-gemm         : tight engine.TensorMatMul loop for an external profiler");
+        Console.WriteLine("  --cpu-topology         : L3/CCX + NUMA topology (Windows-only)");
+        Console.WriteLine();
         Console.WriteLine("PyTorch-comparison diagnostics:");
         Console.WriteLine("  --per-call-threads       : Per-call NumThreads sweep vs PyTorch");
         Console.WriteLine("  --frozen-weight-inference: Frozen-weight (pre-packed) inference vs PyTorch");

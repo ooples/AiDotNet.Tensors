@@ -776,7 +776,7 @@ internal static class AisEvalHeadToHeadBench
         AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.s_timing = false;
         Console.WriteLine($"done: {n} matmuls in {sw.Elapsed.TotalSeconds:F1}s = {n / sw.Elapsed.TotalSeconds:F0}/s, {2.0 * M * N * K / 1e9 * n / sw.Elapsed.TotalSeconds:F0} GFLOP/s");
         Console.WriteLine("RunTile pack-vs-kernel (summed across worker threads):");
-        AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.ReportTiming();
+        Console.WriteLine(AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.ReportTiming());
     }
 
     /// <summary>
@@ -825,21 +825,28 @@ internal static class AisEvalHeadToHeadBench
                 // All through engine.TensorMatMul (same wrapper), interleaved min-of-10: per-tile / CCX-1D /
                 // CCX-2D / MKL — the clean A/B that decides the production heuristic (1D vs 2D per shape).
                 var prevForce1D = AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_force1D;
+                var prevDisable = AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_disable;
                 var ta = torch.rand(M, K); var tb = torch.rand(K, N);
                 double ptMs = double.PositiveInfinity, d1Ms = double.PositiveInfinity, d2Ms = double.PositiveInfinity, mklMs = double.PositiveInfinity;
-                for (int r = 0; r < 10; r++)
+                try
                 {
-                    AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_disable = true;
-                    { var sw = Stopwatch.StartNew(); int reps = 0; do { var _ = engine.TensorMatMul(ea, eb); reps++; } while (sw.Elapsed.TotalMilliseconds < 30); sw.Stop(); ptMs = Math.Min(ptMs, sw.Elapsed.TotalMilliseconds / reps); }
-                    AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_disable = false;
-                    AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_force1D = true;
-                    { var sw = Stopwatch.StartNew(); int reps = 0; do { var _ = engine.TensorMatMul(ea, eb); reps++; } while (sw.Elapsed.TotalMilliseconds < 30); sw.Stop(); d1Ms = Math.Min(d1Ms, sw.Elapsed.TotalMilliseconds / reps); }
-                    AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_force1D = false;
-                    { var sw = Stopwatch.StartNew(); int reps = 0; do { var _ = engine.TensorMatMul(ea, eb); reps++; } while (sw.Elapsed.TotalMilliseconds < 30); sw.Stop(); d2Ms = Math.Min(d2Ms, sw.Elapsed.TotalMilliseconds / reps); }
-                    { var sw = Stopwatch.StartNew(); int reps = 0; do { using var _ = torch.matmul(ta, tb); reps++; } while (sw.Elapsed.TotalMilliseconds < 30); sw.Stop(); mklMs = Math.Min(mklMs, sw.Elapsed.TotalMilliseconds / reps); }
+                    for (int r = 0; r < 10; r++)
+                    {
+                        AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_disable = true;
+                        { var sw = Stopwatch.StartNew(); int reps = 0; do { var _ = engine.TensorMatMul(ea, eb); reps++; } while (sw.Elapsed.TotalMilliseconds < 30); sw.Stop(); ptMs = Math.Min(ptMs, sw.Elapsed.TotalMilliseconds / reps); }
+                        AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_disable = false;
+                        AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_force1D = true;
+                        { var sw = Stopwatch.StartNew(); int reps = 0; do { var _ = engine.TensorMatMul(ea, eb); reps++; } while (sw.Elapsed.TotalMilliseconds < 30); sw.Stop(); d1Ms = Math.Min(d1Ms, sw.Elapsed.TotalMilliseconds / reps); }
+                        AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_force1D = false;
+                        { var sw = Stopwatch.StartNew(); int reps = 0; do { var _ = engine.TensorMatMul(ea, eb); reps++; } while (sw.Elapsed.TotalMilliseconds < 30); sw.Stop(); d2Ms = Math.Min(d2Ms, sw.Elapsed.TotalMilliseconds / reps); }
+                        { var sw = Stopwatch.StartNew(); int reps = 0; do { using var _ = torch.matmul(ta, tb); reps++; } while (sw.Elapsed.TotalMilliseconds < 30); sw.Stop(); mklMs = Math.Min(mklMs, sw.Elapsed.TotalMilliseconds / reps); }
+                    }
                 }
-                AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_force1D = prevForce1D;
-                AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_disable = false;
+                finally
+                {
+                    AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_force1D = prevForce1D;
+                    AiDotNet.Tensors.Engines.BlasManaged.CcxGemmPool.s_disable = prevDisable;
+                }
                 double ptGf = gf / (ptMs / 1000), d1Gf = gf / (d1Ms / 1000), d2Gf = gf / (d2Ms / 1000), mklGf = gf / (mklMs / 1000);
                 double best = Math.Max(ptGf, Math.Max(d1Gf, d2Gf));
                 Console.WriteLine($"{tag,-9} pertile={ptGf,6:F0}  CCX1D={d1Gf,6:F0}  CCX2D={d2Gf,6:F0}  MKL={mklGf,6:F0}   1D/pt={(ptGf>0?d1Gf/ptGf:0),4:F2}x  2D/pt={(ptGf>0?d2Gf/ptGf:0),4:F2}x  best/MKL={(mklGf>0?best/mklGf*100:0),3:F0}%  {(maxRel < 1e-3 ? "OK" : "WRONG")}");
@@ -863,6 +870,8 @@ internal static class AisEvalHeadToHeadBench
     {
         const int RelationCache = 2;
         Console.WriteLine($"=== CPU topology (logical procs={Environment.ProcessorCount}) ===");
+        if (!System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows))
+        { Console.WriteLine("--cpu-topology is Windows-only (uses GetLogicalProcessorInformationEx); skipping on this OS."); return; }
         uint len = 0;
         GetLogicalProcessorInformationEx(RelationCache, IntPtr.Zero, ref len); // size query (returns false)
         if (len == 0) { Console.WriteLine("GetLogicalProcessorInformationEx size query returned 0 — unsupported."); return; }
@@ -1329,7 +1338,7 @@ internal static class AisEvalHeadToHeadBench
                 for (int it = 0; it < 50; it++) AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.RunParallel(pa, K, pb, N, pc, N, M, N, K, mc, nc, kc);
             AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.s_timing = false;
             Console.WriteLine($"--- M=256 pack-vs-kernel at default mc={mc} nc={nc} kc={kc} (summed across workers) ---");
-            AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.ReportTiming();
+            Console.WriteLine(AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.ReportTiming());
         }
         // dit-mlp2 (deep-K narrow-N: 256x1152x4608) — does smaller nc (more tiles) recover the
         // under-parallelization (72 tiles@nc=64), or is split-K needed? Sweep mc/nc; compare to MKL.

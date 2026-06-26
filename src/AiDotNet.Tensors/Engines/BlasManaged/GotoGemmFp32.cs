@@ -94,12 +94,14 @@ internal static class GotoGemmFp32
     internal static bool s_timing;
     internal static long s_packTicks, s_kernTicks, s_packBTicks, s_packATicks;
     internal static void ResetTiming() { s_packTicks = 0; s_kernTicks = 0; s_packBTicks = 0; s_packATicks = 0; }
-    internal static void ReportTiming()
+    /// <summary>Format the pack-vs-kernel timing as a string for the caller (bench) to log — src must not
+    /// write to Console directly.</summary>
+    internal static string ReportTiming()
     {
         double f = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-        long tot = s_packTicks + s_kernTicks; if (tot == 0) { System.Console.WriteLine("(no timing)"); return; }
-        System.Console.WriteLine($"  pack   = {s_packTicks * f,9:F0} ms  ({100.0 * s_packTicks / tot:F1}%)  [B={100.0 * s_packBTicks / tot:F1}% A={100.0 * s_packATicks / tot:F1}%]");
-        System.Console.WriteLine($"  kernel = {s_kernTicks * f,9:F0} ms  ({100.0 * s_kernTicks / tot:F1}%)");
+        long tot = s_packTicks + s_kernTicks; if (tot == 0) return "(no timing)";
+        return $"  pack   = {s_packTicks * f,9:F0} ms  ({100.0 * s_packTicks / tot:F1}%)  [B={100.0 * s_packBTicks / tot:F1}% A={100.0 * s_packATicks / tot:F1}%]\n"
+             + $"  kernel = {s_kernTicks * f,9:F0} ms  ({100.0 * s_kernTicks / tot:F1}%)";
     }
 
     // Emitted-once kernel: void(float* packedA, float* packedB, float* c, long ldcBytes, long kc).
@@ -177,7 +179,9 @@ internal static class GotoGemmFp32
     private static unsafe void ZeroTailStrips(float* c, int ldc, int ic, int jc, int effMc, int effNc, int mFull, int nFull)
     {
         for (int r = mFull; r < effMc; r++) { float* cr = c + (long)(ic + r) * ldc + jc; for (int col = 0; col < effNc; col++) cr[col] = 0f; }
-        for (int r = 0; r < mFull; r++) { float* cr = c + (long)(ic + r) * ldc + jc + nFull; for (int col = nFull; col < effNc; col++) cr[col] = 0f; }
+        // N-tail cols [nFull, effNc) of the full rows. cr is based at jc (NOT jc+nFull) so cr[col] hits the
+        // actual tail columns and never writes past the tile (the +nFull offset double-counted before).
+        for (int r = 0; r < mFull; r++) { float* cr = c + (long)(ic + r) * ldc + jc; for (int col = nFull; col < effNc; col++) cr[col] = 0f; }
     }
 
     /// <summary>True when the machine-code microkernel is available on this CPU/OS (AVX2+FMA, Windows x64).</summary>
@@ -191,6 +195,7 @@ internal static class GotoGemmFp32
         float* a, int lda, float* b, int ldb, float* c, int ldc,
         int m, int n, int k, int mc, int nc, int kc)
     {
+        if (k <= 0) { ZeroCBlock(c, ldc, 0, 0, m, n); return; } // C = A·B with K=0 is the zero matrix
         var kern = Kernel();
         // Per-call scratch (Stage 1: plain alloc; Stage 2 will pool these per worker).
         // packA holds one Mc×Kc A-panel as consecutive mr-row sub-panels: [mt][k][mr].
@@ -280,6 +285,7 @@ internal static class GotoGemmFp32
         float* a, int lda, float* b, int ldb, float* c, int ldc,
         int m, int n, int k, int mc, int nc, int kc)
     {
+        if (k <= 0) { ZeroCBlock(c, ldc, 0, 0, m, n); return; } // C = A·B with K=0 is the zero matrix
         int numIc = (m + mc - 1) / mc;
         int numJc = (n + nc - 1) / nc;
         int totalTiles = numIc * numJc;

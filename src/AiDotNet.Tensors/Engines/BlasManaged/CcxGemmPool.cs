@@ -35,6 +35,7 @@ internal static unsafe class CcxGemmPool
     private static float* _a, _b, _c;
     private static int _m, _n, _k, _mc, _nc, _kc, _lda, _ldb, _ldc;
     private static bool _use2D;       // 2D-NUMA grid (huge squares) vs 1D-N thin strips
+    private static volatile bool _faulted; // a lane's compute threw → TryRun returns false (caller falls back)
     private static int _gr, _gc;      // 2D CCX grid (gr·gc = numCcx)
 
     /// <summary>Min M·N·K for the CCX path (below this the pinned-pool + barrier overhead isn't worth it).</summary>
@@ -85,8 +86,11 @@ internal static unsafe class CcxGemmPool
         {
             _go[id].Wait();
             _go[id].Reset();
+            // Backstop: compute faults are caught INSIDE DoWork/DoWork2D (around the compute, not the
+            // barriers) so a faulting lane still completes its barrier sequence and never deadlocks siblings.
+            // This catches any non-compute fault. Either way _faulted ⇒ TryRun returns false ⇒ caller re-runs.
             try { if (_use2D) DoWork2D(ccx, lane); else DoWork(ccx, lane); }
-            catch { /* a lane fault must not deadlock the join; correctness is gated by tests */ }
+            catch { _faulted = true; }
             finally { _done!.Signal(); }
         }
     }
@@ -106,12 +110,13 @@ internal static unsafe class CcxGemmPool
         {
             int jc = jb * _nc; int effNc = Math.Min(_nc, _n - jc);
             if (effNc <= 0) { bar.SignalAndWait(); bar.SignalAndWait(); continue; }
-            GotoGemmFp32.PackBPanel(_b, _ldb, jc, effNc, _k, _kc, pkb, lane, _tpc);
+            // Compute wrapped (NOT the barriers): a fault sets _faulted but the lane still hits every barrier.
+            try { GotoGemmFp32.PackBPanel(_b, _ldb, jc, effNc, _k, _kc, pkb, lane, _tpc); } catch { _faulted = true; }
             bar.SignalAndWait();
             for (int ib = lane; ib < numIc; ib += _tpc)
             {
                 int ic = ib * _mc; int effMc = Math.Min(_mc, _m - ic); if (effMc <= 0) continue;
-                GotoGemmFp32.RunTilePackedB(_a, _lda, _b, _ldb, _c, _ldc, ic, jc, effMc, effNc, _k, _mc, _nc, _kc, pkb);
+                try { GotoGemmFp32.RunTilePackedB(_a, _lda, _b, _ldb, _c, _ldc, ic, jc, effMc, effNc, _k, _mc, _nc, _kc, pkb); } catch { _faulted = true; }
             }
             bar.SignalAndWait();
         }
@@ -135,14 +140,15 @@ internal static unsafe class CcxGemmPool
         for (int pc = 0; pc < _k; pc += _kc)
         {
             int effKc = Math.Min(_kc, _k - pc);
-            GotoGemmFp32.PackBPanelPc(_b, _ldb, n0, effNblk, pc, effKc, _kc, pkB, lane, _tpc);
+            // Compute wrapped (NOT the barriers): a fault sets _faulted but the lane still hits every barrier.
+            try { GotoGemmFp32.PackBPanelPc(_b, _ldb, n0, effNblk, pc, effKc, _kc, pkB, lane, _tpc); } catch { _faulted = true; }
             bar.SignalAndWait();
             int ii = 0;
             for (int ic = m0; ic < m0 + effMblk; ic += _mc)
             {
                 if (ii++ % _tpc != lane) continue;
                 int effMc = Math.Min(_mc, m0 + effMblk - ic);
-                GotoGemmFp32.RunMacroPanelStep(_a, _lda, _b, _ldb, _c, _ldc, ic, n0, effMc, effNblk, pc, effKc, _mc, _kc, pkB, pc == 0);
+                try { GotoGemmFp32.RunMacroPanelStep(_a, _lda, _b, _ldb, _c, _ldc, ic, n0, effMc, effNblk, pc, effKc, _mc, _kc, pkB, pc == 0); } catch { _faulted = true; }
             }
             bar.SignalAndWait();
         }
@@ -216,19 +222,32 @@ internal static unsafe class CcxGemmPool
             _use2D = use2D;
             if (need > _bbufLen)
             {
+                // Allocate ALL replacements first; only free the old buffers once every new alloc succeeded.
+                // If AllocHGlobal throws (OOM), free any partial new allocs, keep the (still-valid) old
+                // buffers + _bbufLen, and fall back to per-tile — never leave a dangling _bbuf[cc].
+                var fresh = new IntPtr[_numCcx];
+                try { for (int cc = 0; cc < _numCcx; cc++) fresh[cc] = Marshal.AllocHGlobal(checked((int)(need * sizeof(float)))); }
+                catch
+                {
+                    for (int cc = 0; cc < _numCcx; cc++) if (fresh[cc] != IntPtr.Zero) Marshal.FreeHGlobal(fresh[cc]);
+                    return false;
+                }
                 for (int cc = 0; cc < _numCcx; cc++)
                 {
                     if (_bbuf[cc] != IntPtr.Zero) Marshal.FreeHGlobal(_bbuf[cc]);
-                    _bbuf[cc] = Marshal.AllocHGlobal(checked((int)(need * sizeof(float))));
+                    _bbuf[cc] = fresh[cc];
                 }
                 _bbufLen = need;
             }
             _a = a; _b = b; _c = c; _lda = lda; _ldb = ldb; _ldc = ldc;
             _m = m; _n = n; _k = k; _mc = mc; _nc = nc; _kc = kc;
+            _faulted = false;
             _done!.Reset();
             for (int i = 0; i < _total; i++) _go[i].Set();
             _done.Wait();
-            return true;
+            // A lane's compute threw → C may be partially written; report failure so the caller recomputes
+            // on the correct per-tile/PackBoth path (which fully overwrites C).
+            return !_faulted;
         }
         finally { Monitor.Exit(_runGate); }
     }

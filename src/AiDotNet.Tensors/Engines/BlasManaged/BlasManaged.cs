@@ -480,6 +480,7 @@ public static partial class BlasManaged
         // overhead — deferred until that overhead is cut; prototype in tests/CcxGemmBench.)
         if (typeof(T) == typeof(float) && !s_disableGotoGemm && !transA && !transB
             && options.PackedA is null && options.PackedB is null
+            && options.NumThreads == 0 // only the default (all-core) budget; explicit -1/>0 requests honored below
             && (options.PackingMode == PackingMode.Auto || options.PackingMode == PackingMode.DisableAutotune)
             && (long)m * n * k >= GotoGemmFp32.ParallelMinWork && GotoGemmFp32.BeatsPackBoth(m, n, k)
             && GotoGemmFp32.IsAvailable)
@@ -1059,7 +1060,7 @@ public static partial class BlasManaged
         // PrePackA's contract is "give the consume path identical tiling to
         // what live-pack would have produced" so we mirror those defaults.
         int mc = Math.Min(128, m);
-        int kc = Math.Min(256, k);
+        int kc = Math.Min(512, k); // sync with FallbackToHeuristic Kc=512 (b373b9d) — else pre-pack tiles at a smaller K-panel than live-pack and the consume path slows down
         // Round mc UP to a multiple of mr (microkernel row tile height) so the
         // packed-byte layout matches what ScalarPack.PackA / Avx2Pack.PackA
         // expects. CodeRabbit #402: the previous gated form (`if (mc < m ...`)
@@ -1183,7 +1184,7 @@ public static partial class BlasManaged
         // = 6× more inner-loop iterations + far worse cache reuse than the
         // 512×256 live-pack baseline).
         int nc = Math.Min(512, n);
-        int kc = Math.Min(256, k);
+        int kc = Math.Min(512, k); // sync with FallbackToHeuristic Kc=512 (b373b9d) — else pre-pack tiles at a smaller K-panel than live-pack and the consume path slows down
         // Round nc UP to a multiple of nr (microkernel column tile width) — the
         // packed-buffer layout in ScalarPack.PackB / Avx2Pack.PackB always
         // writes ceil(nc / nr) * nr columns per Kc row, zero-padding the tail

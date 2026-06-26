@@ -230,6 +230,7 @@ internal static unsafe class CcxGemmBench
         int tpc = int.TryParse(Environment.GetEnvironmentVariable("CCX_TPC"), out var v) ? v : 4;
         _use2D = Environment.GetEnvironmentVariable("CCX_2D") == "1";
         Init(tpc);
+        if (_numCcx <= 0) { Console.WriteLine("no L3/CCX domains detected (non-Windows or unsupported) — skipping CCX bench"); return; }
         Console.WriteLine($"=== CCX-aware GEMM ({(_use2D ? "2D grid" : "1D-N")}) vs MKL vs per-tile (cores={P}, CCX={_numCcx}, threads/CCX={_threadsPerCcx}) ===");
         int kc = GotoGemmFp32.DefaultKc;
         int saved = CpuParallelSettings.MaxDegreeOfParallelism;

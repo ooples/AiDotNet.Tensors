@@ -88,10 +88,15 @@ internal static class MachineCodeFmaKernel
 
         asm.MovRegFromRsp(R10, 0x28);   // r10 = kc (5th arg) — read before rsp moves
         asm.SubRsp(0xA0);
-        for (int i = 0; i < 10; i++) asm.VmovupsXmmStore(RSP, (sbyte)(i * 0x10), 6 + i); // save xmm6-15
+        for (int i = 0; i < 10; i++) asm.VmovupsXmmStoreD32(RSP, i * 0x10, 6 + i); // save xmm6-15 (D32: offsets 0x80/0x90 don't fit sbyte)
 
         for (int i = 0; i < accN; i++) asm.Vxorps(i);   // zero accumulators
 
+        // kc==0 guard (mirror the FP64 emitter): without it the loop runs once, DecReg underflows R10 to
+        // ulong.MaxValue, and it spins reading past the panels. Skip straight to SAVE (acc is 0).
+        int store = asm.NewLabel();
+        asm.TestRegSelf(R10);
+        asm.JzLabel32(store);
         int loop = asm.NewLabel();
         asm.MarkLabel(loop);
         for (int j = 0; j < nrYmm; j++) asm.VmovupsLoad(bBase + j, RDX, (sbyte)(j * 32));
@@ -109,6 +114,7 @@ internal static class MachineCodeFmaKernel
 
         // SAVE C (row-major). r11 walks c by r9 (ldc bytes). ymm12 free after the K-loop.
         // overwrite: C = acc (first K-panel, no read). else: C += acc (accumulate across panels).
+        asm.MarkLabel(store);
         asm.MovRegReg(R11, R8);
         int cTmp = bBase;
         for (int r = 0; r < mr; r++)
@@ -125,7 +131,7 @@ internal static class MachineCodeFmaKernel
             if (r < mr - 1) asm.AddRegReg(R11, R9);
         }
 
-        for (int i = 0; i < 10; i++) asm.VmovupsXmmLoad(6 + i, RSP, (sbyte)(i * 0x10));
+        for (int i = 0; i < 10; i++) asm.VmovupsXmmLoadD32(6 + i, RSP, i * 0x10); // D32: offsets 0x80/0x90 don't fit sbyte
         asm.AddRsp(0xA0);
         asm.Vzeroupper();
         asm.Ret();
@@ -147,9 +153,13 @@ internal static class MachineCodeFmaKernel
 
         asm.MovRegFromRsp(R10, 0x28);
         asm.SubRsp(0xA0);
-        for (int i = 0; i < 10; i++) asm.VmovupsXmmStore(RSP, (sbyte)(i * 0x10), 6 + i);
+        for (int i = 0; i < 10; i++) asm.VmovupsXmmStoreD32(RSP, i * 0x10, 6 + i); // D32: offsets 0x80/0x90 don't fit sbyte
         for (int i = 0; i < accN; i++) asm.Vxorps(i);
 
+        // kc==0 guard (mirror the FP64 emitter): else DecReg underflows R10 and the loop spins.
+        int store = asm.NewLabel();
+        asm.TestRegSelf(R10);
+        asm.JzLabel32(store);
         int loop = asm.NewLabel();
         asm.MarkLabel(loop);
         for (int j = 0; j < nrYmm; j++)
@@ -167,6 +177,7 @@ internal static class MachineCodeFmaKernel
         asm.DecReg(R10);
         asm.JnzLabel32(loop);
 
+        asm.MarkLabel(store);
         asm.MovRegReg(R11, R8);
         int cTmp = bBase;
         for (int r = 0; r < mr; r++)
@@ -183,7 +194,7 @@ internal static class MachineCodeFmaKernel
             if (r < mr - 1) asm.AddRegReg(R11, R9);
         }
 
-        for (int i = 0; i < 10; i++) asm.VmovupsXmmLoad(6 + i, RSP, (sbyte)(i * 0x10));
+        for (int i = 0; i < 10; i++) asm.VmovupsXmmLoadD32(6 + i, RSP, i * 0x10); // D32: offsets 0x80/0x90 don't fit sbyte
         asm.AddRsp(0xA0);
         asm.Vzeroupper();
         asm.Ret();
