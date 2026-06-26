@@ -1347,6 +1347,25 @@ internal static class AisEvalHeadToHeadBench
                     Console.WriteLine($"   mc={mcv,3} nc={ncv,3}: {gf2 / (t / 1000),6:F0}GF  tiles={tiles,4}  ({gf2 / (t / 1000) / (gf2 / (mkl2 / 1000)) * 100:F0}% MKL)");
                 }
         }
+        // ROUTING A/B (same run): does improved GotoGemm now BEAT PackBoth at the DiT shapes? The
+        // BeatsPackBoth gate routed small-M-wide-N to PackBoth BEFORE the short-M blocking fix; re-decide.
+        Console.WriteLine("--- ROUTING: GotoGemm (RunParallel) vs PackBoth (BlasManaged, goto disabled) vs MKL ---");
+        var ditShapes = new (int m, int n, int k, string tag)[] { (256, 3456, 1152, "qkv"), (256, 1152, 1152, "attnout"), (256, 4608, 1152, "mlp1"), (256, 1152, 4608, "mlp2") };
+        foreach (var (dm, dn, dk, dtag) in ditShapes)
+        {
+            float[] A3 = R((long)dm * dk, rng), B3 = R((long)dk * dn, rng), C3 = new float[(long)dm * dn];
+            using var t3a = torch.tensor(A3).reshape(dm, dk); using var t3b = torch.tensor(B3).reshape(dk, dn);
+            var (mc3, nc3, kc3) = AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.ChooseParallelBlocks(dm, dn);
+            double gf3 = 2.0 * dm * dn * dk / 1e9;
+            double goto3; fixed (float* pa = A3, pb = B3, pc = C3) { var paL = (nint)pa; var pbL = (nint)pb; var pcL = (nint)pc; goto3 = Min(() => AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32.RunParallel((float*)paL, dk, (float*)pbL, dn, (float*)pcL, dn, dm, dn, dk, mc3, nc3, kc3), 6); }
+            bool savedDis = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.s_disableGotoGemm;
+            AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.s_disableGotoGemm = true;
+            double pb3 = Min(() => AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(A3.AsSpan(0, dm * dk), dk, false, B3.AsSpan(0, dk * dn), dn, false, C3.AsSpan(0, dm * dn), dn, dm, dn, dk, new AiDotNet.Tensors.Engines.BlasManaged.BlasOptions<float> { PackingMode = AiDotNet.Tensors.Engines.BlasManaged.PackingMode.DisableAutotune }), 6);
+            AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.s_disableGotoGemm = savedDis;
+            double mkl3 = Min(() => { using var _ = torch.matmul(t3a, t3b); }, 6);
+            double g = gf3 / (goto3 / 1000), p = gf3 / (pb3 / 1000), mk = gf3 / (mkl3 / 1000);
+            Console.WriteLine($"   {dtag,-8} GotoGemm={g,6:F0}GF  PackBoth={p,6:F0}GF  MKL={mk,6:F0}GF  goto/pb={g / p,4:F2}x  → route to {(g > p * 1.05 ? "GotoGemm" : "PackBoth")}");
+        }
     }
 
     private static (double median, double p95) TimeAi(Func<Tensor<float>> forward)
