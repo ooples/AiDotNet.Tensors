@@ -148,7 +148,9 @@ internal static class PackBothStrategy
             // to fill all cores via M-axis parallel alone. ShouldUse2DGrid returns
             // true when (numMBlocks * 2 < procs && numNBlocks > 1) — i.e., the
             // existing M-axis split would leave half or more cores idle.
-            int procs = options.NumThreads > 0 ? options.NumThreads : Environment.ProcessorCount;
+            // #475: default fan-out caps at PHYSICAL cores (FMA-bound GEMM regresses on SMT threads —
+            // measured ffn peak at 16, regress at 24/32). An explicit NumThreads request is honoured.
+            int procs = options.NumThreads > 0 ? options.NumThreads : CpuParallelSettings.GemmThreadCount(Environment.ProcessorCount);
             if (options.NumThreads < 0) procs = 1;
             int numMBlocks = (m + mc - 1) / mc;
             int numNBlocks = (n + nc - 1) / nc;

@@ -325,6 +325,23 @@ public static class AxisRoutingAbBench
     public static unsafe void ScalingSweep()
     {
         Console.WriteLine("=== #475 thread-scaling curve (16C/32T Zen2) ===");
+        Console.WriteLine($"PhysicalCoreCount={CpuParallelSettings.PhysicalCoreCount}  Logical={Environment.ProcessorCount}");
+        // Same-process A/B: the SMT cap ON vs OFF at the default DOP (noise-robust, min-of-N).
+        Console.WriteLine("--- SMT-cap A/B at default DOP (cap=physical vs cap=off) ---");
+        CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
+        PackBothStrategy.s_macroKernel = true;
+        foreach (var (m, n, k) in new[] { (384, 6144, 1536), (384, 1024, 1024), (1024, 1024, 1024) })
+        {
+            var a = MakeRandom(m * k); var b = MakeRandom(k * n); var c = new float[m * n];
+            double flops = 2.0 * m * n * k;
+            CpuParallelSettings.CapGemmAtPhysicalCores = true;
+            double on = flops / TimeMinGemm(a, b, c, m, n, k) / 1e9;
+            CpuParallelSettings.CapGemmAtPhysicalCores = false;
+            double off = flops / TimeMinGemm(a, b, c, m, n, k) / 1e9;
+            CpuParallelSettings.CapGemmAtPhysicalCores = true;
+            Console.WriteLine($"    {m}x{n}x{k}: cap-on {on,5:F0}  cap-off {off,5:F0} GF/s  ({on / off:F2}x)");
+        }
+        PackBothStrategy.s_macroKernel = false;
         var shapes = new (string label, int m, int n, int k)[]
         {
             ("ffn    384x6144x1536", 384, 6144, 1536),
