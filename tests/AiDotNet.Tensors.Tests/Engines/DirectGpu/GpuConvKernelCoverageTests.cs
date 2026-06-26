@@ -159,6 +159,80 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
             "DeformableConv2DGroupedWithMask");
     }
 
+    // ---- Grouped (DCNv3) BACKWARD: single-launch GPU kernels vs CPU composition oracle (#1691) ----
+    private (Tensor<float> input, Tensor<float> kernel, Tensor<float> offset, int[] stride, int[] pad,
+             int[] dil, int groups, int dg, Tensor<float> grad) GroupedBwdSetup(int groups, int dg)
+    {
+        const int B = 1, inC = 8, outC = 8, H = 6, W = 6, k = 3, kk = 9;
+        int inCpg = inC / groups;
+        var input = R(30, B, inC, H, W);
+        var kernel = R(31, outC, inCpg, k, k);
+        var offset = R(32, B, 2 * kk * dg, H, W);
+        int[] stride = { 1, 1 }, pad = { 1, 1 }, dil = { 1, 1 };
+        var fwd = _cpu.DeformableConv2DGrouped(input, kernel, offset, null, stride, pad, dil, groups, dg);
+        return (input, kernel, offset, stride, pad, dil, groups, dg, Like(33, fwd));
+    }
+
+    [SkippableTheory]
+    [InlineData(2, 2)]
+    [InlineData(4, 4)]
+    public void DeformableConv2DGroupedBackwardInput_Gpu_MatchesCpu(int groups, int dg)
+    {
+        SkipIfUnavailable();
+        var s = GroupedBwdSetup(groups, dg);
+        int[] inShape = s.input.Shape.ToArray();
+        AssertClose(
+            _cpu.DeformableConv2DGroupedBackwardInput(s.grad, s.input, s.kernel, s.offset, null, inShape, s.stride, s.pad, s.dil, s.groups, s.dg),
+            _gpu.DeformableConv2DGroupedBackwardInput(s.grad, s.input, s.kernel, s.offset, null, inShape, s.stride, s.pad, s.dil, s.groups, s.dg),
+            $"GroupedBackwardInput(g={groups},dg={dg})");
+    }
+
+    [SkippableTheory]
+    [InlineData(2, 2)]
+    [InlineData(4, 4)]
+    public void DeformableConv2DGroupedBackwardKernel_Gpu_MatchesCpu(int groups, int dg)
+    {
+        SkipIfUnavailable();
+        var s = GroupedBwdSetup(groups, dg);
+        int[] kShape = s.kernel.Shape.ToArray();
+        AssertClose(
+            _cpu.DeformableConv2DGroupedBackwardKernel(s.grad, s.input, s.offset, null, kShape, s.stride, s.pad, s.dil, s.groups, s.dg),
+            _gpu.DeformableConv2DGroupedBackwardKernel(s.grad, s.input, s.offset, null, kShape, s.stride, s.pad, s.dil, s.groups, s.dg),
+            $"GroupedBackwardKernel(g={groups},dg={dg})");
+    }
+
+    [SkippableTheory]
+    [InlineData(2, 2)]
+    [InlineData(4, 4)]
+    public void DeformableConv2DGroupedBackwardOffset_Gpu_MatchesCpu(int groups, int dg)
+    {
+        SkipIfUnavailable();
+        var s = GroupedBwdSetup(groups, dg);
+        AssertClose(
+            _cpu.DeformableConv2DGroupedBackwardOffset(s.grad, s.input, s.kernel, s.offset, null, s.stride, s.pad, s.dil, s.groups, s.dg),
+            _gpu.DeformableConv2DGroupedBackwardOffset(s.grad, s.input, s.kernel, s.offset, null, s.stride, s.pad, s.dil, s.groups, s.dg),
+            $"GroupedBackwardOffset(g={groups},dg={dg})");
+    }
+
+    [SkippableFact]
+    public void DeformableConv2DGroupedBackwardMask_Gpu_MatchesCpu()
+    {
+        SkipIfUnavailable();
+        const int B = 1, inC = 8, outC = 8, H = 6, W = 6, k = 3, kk = 9, groups = 2, dg = 2;
+        int inCpg = inC / groups;
+        var input = R(40, B, inC, H, W);
+        var kernel = R(41, outC, inCpg, k, k);
+        var offset = R(42, B, 2 * kk * dg, H, W);
+        var mask = R(43, B, kk * dg, H, W);
+        int[] stride = { 1, 1 }, pad = { 1, 1 }, dil = { 1, 1 };
+        var fwd = _cpu.DeformableConv2DGrouped(input, kernel, offset, mask, stride, pad, dil, groups, dg);
+        var grad = Like(44, fwd);
+        AssertClose(
+            _cpu.DeformableConv2DGroupedBackwardMask(grad, input, kernel, offset, mask, stride, pad, dil, groups, dg),
+            _gpu.DeformableConv2DGroupedBackwardMask(grad, input, kernel, offset, mask, stride, pad, dil, groups, dg),
+            "GroupedBackwardMask");
+    }
+
     [SkippableFact]
     public void DeformableConv2DBackwardInput_Gpu_MatchesCpu()
     {

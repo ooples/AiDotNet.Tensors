@@ -8638,6 +8638,175 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    // ---- Grouped/depthwise (DCNv3) backward: single-launch GPU kernels (#1691 backward fusion). Each passes
+    // groups/deformGroups straight to the backend's grouped deformable_conv2d_backward_* kernel (one launch)
+    // instead of the inherited per-group CPU composition. Falls back to base (CPU composition oracle) when GPU
+    // is unavailable / inputs non-4D / a launch throws. groups=deformGroups=1 routes to the groups=1 override. ----
+
+    /// <summary>Grouped DeformableConv2D backward w.r.t. input — single GPU launch (#1691).</summary>
+    public override Tensor<T> DeformableConv2DGroupedBackwardInput<T>(
+        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> kernel, Tensor<T> offset, Tensor<T>? mask,
+        int[] inputShape, int[] stride, int[] padding, int[] dilation, int groups, int deformGroups)
+    {
+        if (groups == 1 && deformGroups == 1)
+            return DeformableConv2DBackwardInput(gradOutput, input, kernel, offset, mask, inputShape, stride, padding, dilation);
+        if (!TryGetBackend(out var backend) || gradOutput.Rank != 4 || input.Rank != 4 || kernel.Rank != 4)
+            return base.DeformableConv2DGroupedBackwardInput(gradOutput, input, kernel, offset, mask, inputShape, stride, padding, dilation, groups, deformGroups);
+
+        int batch = inputShape[0], inChannels = inputShape[1], inHeight = inputShape[2], inWidth = inputShape[3];
+        int outChannels = kernel.Shape._dims[0], kernelH = kernel.Shape._dims[2], kernelW = kernel.Shape._dims[3];
+        int outHeight = gradOutput.Shape._dims[2], outWidth = gradOutput.Shape._dims[3];
+        int inputSize = batch * inChannels * inHeight * inWidth;
+
+        using var gradOutputBuffer = GetOrAllocateBuffer(backend, gradOutput);
+        using var weightsBuffer = GetOrCacheWeightBuffer(backend, kernel.GetDataArray(), PersistentTensorRole.Weights);
+        using var offsetsBuffer = GetOrAllocateBuffer(backend, offset);
+        using var gradInputBuffer = AllocateOutputBuffer(backend, inputSize);
+        try
+        {
+            OwnedBuffer? maskBuffer = mask != null ? GetOrAllocateBuffer(backend, mask) : null;
+            try
+            {
+                backend.DeformableConv2DBackwardInput(
+                    gradOutputBuffer.Buffer, weightsBuffer.Buffer, offsetsBuffer.Buffer, maskBuffer?.Buffer, gradInputBuffer.Buffer,
+                    batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
+                    kernelH, kernelW, stride[0], stride[1], padding[0], padding[1], dilation[0], dilation[1], groups, deformGroups);
+                float[] resultFloat = new float[inputSize];
+                backend.DownloadBuffer(gradInputBuffer.Buffer, resultFloat);
+                return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat), inputShape);
+            }
+            finally { maskBuffer?.Dispose(); }
+        }
+        catch
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            return base.DeformableConv2DGroupedBackwardInput(gradOutput, input, kernel, offset, mask, inputShape, stride, padding, dilation, groups, deformGroups);
+        }
+    }
+
+    /// <summary>Grouped DeformableConv2D backward w.r.t. kernel — single GPU launch (#1691).</summary>
+    public override Tensor<T> DeformableConv2DGroupedBackwardKernel<T>(
+        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> offset, Tensor<T>? mask,
+        int[] kernelShape, int[] stride, int[] padding, int[] dilation, int groups, int deformGroups)
+    {
+        if (groups == 1 && deformGroups == 1)
+            return DeformableConv2DBackwardKernel(gradOutput, input, offset, mask, kernelShape, stride, padding, dilation);
+        if (!TryGetBackend(out var backend) || gradOutput.Rank != 4 || input.Rank != 4)
+            return base.DeformableConv2DGroupedBackwardKernel(gradOutput, input, offset, mask, kernelShape, stride, padding, dilation, groups, deformGroups);
+
+        int batch = input.Shape._dims[0], inChannels = input.Shape._dims[1], inHeight = input.Shape._dims[2], inWidth = input.Shape._dims[3];
+        int outChannels = kernelShape[0], kernelH = kernelShape[2], kernelW = kernelShape[3];
+        int outHeight = gradOutput.Shape._dims[2], outWidth = gradOutput.Shape._dims[3];
+        int kernelSize = kernelShape[0] * kernelShape[1] * kernelShape[2] * kernelShape[3];
+
+        using var gradOutputBuffer = GetOrAllocateBuffer(backend, gradOutput);
+        using var inputBuffer = GetOrAllocateBuffer(backend, input);
+        using var offsetsBuffer = GetOrAllocateBuffer(backend, offset);
+        using var gradWeightsBuffer = AllocateOutputBuffer(backend, kernelSize);
+        try
+        {
+            OwnedBuffer? maskBuffer = mask != null ? GetOrAllocateBuffer(backend, mask) : null;
+            try
+            {
+                backend.DeformableConv2DBackwardWeights(
+                    inputBuffer.Buffer, gradOutputBuffer.Buffer, offsetsBuffer.Buffer, maskBuffer?.Buffer, gradWeightsBuffer.Buffer,
+                    batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
+                    kernelH, kernelW, stride[0], stride[1], padding[0], padding[1], dilation[0], dilation[1], groups, deformGroups);
+                float[] resultFloat = new float[kernelSize];
+                backend.DownloadBuffer(gradWeightsBuffer.Buffer, resultFloat);
+                return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat), kernelShape);
+            }
+            finally { maskBuffer?.Dispose(); }
+        }
+        catch
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            return base.DeformableConv2DGroupedBackwardKernel(gradOutput, input, offset, mask, kernelShape, stride, padding, dilation, groups, deformGroups);
+        }
+    }
+
+    /// <summary>Grouped DeformableConv2D backward w.r.t. offset — single GPU launch (#1691).</summary>
+    public override Tensor<T> DeformableConv2DGroupedBackwardOffset<T>(
+        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> kernel, Tensor<T> offset, Tensor<T>? mask,
+        int[] stride, int[] padding, int[] dilation, int groups, int deformGroups)
+    {
+        if (groups == 1 && deformGroups == 1)
+            return DeformableConv2DBackwardOffset(gradOutput, input, kernel, offset, mask, stride, padding, dilation);
+        if (!TryGetBackend(out var backend) || gradOutput.Rank != 4 || input.Rank != 4 || kernel.Rank != 4)
+            return base.DeformableConv2DGroupedBackwardOffset(gradOutput, input, kernel, offset, mask, stride, padding, dilation, groups, deformGroups);
+
+        int batch = input.Shape._dims[0], inChannels = input.Shape._dims[1], inHeight = input.Shape._dims[2], inWidth = input.Shape._dims[3];
+        int outChannels = kernel.Shape._dims[0], kernelH = kernel.Shape._dims[2], kernelW = kernel.Shape._dims[3];
+        int outHeight = gradOutput.Shape._dims[2], outWidth = gradOutput.Shape._dims[3];
+        int offsetChannels = offset.Shape._dims[1];
+        int offsetSize = batch * offsetChannels * outHeight * outWidth;
+
+        using var gradOutputBuffer = GetOrAllocateBuffer(backend, gradOutput);
+        using var inputBuffer = GetOrAllocateBuffer(backend, input);
+        using var weightsBuffer = GetOrCacheWeightBuffer(backend, kernel.GetDataArray(), PersistentTensorRole.Weights);
+        using var offsetsBuffer = GetOrAllocateBuffer(backend, offset);
+        using var gradOffsetBuffer = AllocateOutputBuffer(backend, offsetSize);
+        try
+        {
+            OwnedBuffer? maskBuffer = mask != null ? GetOrAllocateBuffer(backend, mask) : null;
+            try
+            {
+                backend.DeformableConv2DBackwardOffset(
+                    inputBuffer.Buffer, weightsBuffer.Buffer, gradOutputBuffer.Buffer, offsetsBuffer.Buffer, maskBuffer?.Buffer, gradOffsetBuffer.Buffer,
+                    batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
+                    kernelH, kernelW, stride[0], stride[1], padding[0], padding[1], dilation[0], dilation[1], groups, deformGroups);
+                float[] resultFloat = new float[offsetSize];
+                backend.DownloadBuffer(gradOffsetBuffer.Buffer, resultFloat);
+                return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat), offset.Shape._dims);
+            }
+            finally { maskBuffer?.Dispose(); }
+        }
+        catch
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            return base.DeformableConv2DGroupedBackwardOffset(gradOutput, input, kernel, offset, mask, stride, padding, dilation, groups, deformGroups);
+        }
+    }
+
+    /// <summary>Grouped DeformableConv2D backward w.r.t. modulation mask — single GPU launch (#1691).</summary>
+    public override Tensor<T> DeformableConv2DGroupedBackwardMask<T>(
+        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> kernel, Tensor<T> offset, Tensor<T> mask,
+        int[] stride, int[] padding, int[] dilation, int groups, int deformGroups)
+    {
+        if (groups == 1 && deformGroups == 1)
+            return DeformableConv2DBackwardMask(gradOutput, input, kernel, offset, mask, stride, padding, dilation);
+        if (mask == null)
+            throw new ArgumentNullException(nameof(mask), "Mask cannot be null when computing mask gradients");
+        if (!TryGetBackend(out var backend) || gradOutput.Rank != 4 || input.Rank != 4 || kernel.Rank != 4 || mask.Rank != 4)
+            return base.DeformableConv2DGroupedBackwardMask(gradOutput, input, kernel, offset, mask, stride, padding, dilation, groups, deformGroups);
+
+        int batch = input.Shape._dims[0], inChannels = input.Shape._dims[1], inHeight = input.Shape._dims[2], inWidth = input.Shape._dims[3];
+        int outChannels = kernel.Shape._dims[0], kernelH = kernel.Shape._dims[2], kernelW = kernel.Shape._dims[3];
+        int outHeight = gradOutput.Shape._dims[2], outWidth = gradOutput.Shape._dims[3];
+        int maskSize = batch * mask.Shape._dims[1] * outHeight * outWidth;
+
+        using var gradOutputBuffer = GetOrAllocateBuffer(backend, gradOutput);
+        using var inputBuffer = GetOrAllocateBuffer(backend, input);
+        using var weightsBuffer = GetOrCacheWeightBuffer(backend, kernel.GetDataArray(), PersistentTensorRole.Weights);
+        using var offsetsBuffer = GetOrAllocateBuffer(backend, offset);
+        using var gradMaskBuffer = AllocateOutputBuffer(backend, maskSize);
+        try
+        {
+            backend.DeformableConv2DBackwardMask(
+                inputBuffer.Buffer, weightsBuffer.Buffer, gradOutputBuffer.Buffer, offsetsBuffer.Buffer, gradMaskBuffer.Buffer,
+                batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
+                kernelH, kernelW, stride[0], stride[1], padding[0], padding[1], dilation[0], dilation[1], groups, deformGroups);
+            float[] resultFloat = new float[maskSize];
+            backend.DownloadBuffer(gradMaskBuffer.Buffer, resultFloat);
+            return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat), mask.Shape._dims);
+        }
+        catch
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            return base.DeformableConv2DGroupedBackwardMask(gradOutput, input, kernel, offset, mask, stride, padding, dilation, groups, deformGroups);
+        }
+    }
+
     /// <summary>
     /// GPU-accelerated deformable conv2D backward pass for input gradients.
     /// Falls back to CPU implementation if GPU is unavailable.

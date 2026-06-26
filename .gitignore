@@ -80,3 +80,6 @@ TR/
 # Generated at release time by tools/pack-cuda-split.ps1 (CUDA fragment manifest)
 src/AiDotNet.Native.CUDA/build/cuda-fragments.manifest
 src/AiDotNet.Native.CUDA/obj/cuda-split/
+
+# local CLI/device state (gh)
+.local/

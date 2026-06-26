@@ -263,6 +263,20 @@ public static class CpuParallelSettings
 
         int chunkSize = (length + numChunks - 1) / numChunks;
 
+        // Cooperative-pool dispatch (PR #531/#688): cheaper than raw Parallel.For's ThreadPool
+        // task/range alloc + park/wakeup. Disjoint [start,count) chunks ⇒ bit-identical.
+        if (UseCooperativePool)
+        {
+            Engines.BlasManaged.Pool.CooperativeGemmScheduler.Dispatch(numChunks, i =>
+            {
+                using var _region = EnterParallelRegion();
+                int start = i * chunkSize;
+                int count = Math.Min(chunkSize, length - start);
+                if (count > 0) action(start, count);
+            });
+            return;
+        }
+
         Parallel.For(0, numChunks, new ParallelOptions { MaxDegreeOfParallelism = maxDegree }, i =>
         {
             using var _region = EnterParallelRegion();
@@ -299,6 +313,20 @@ public static class CpuParallelSettings
         if (count == 1 || MaxDegreeOfParallelism <= 1 || _inParallelRegion)
         {
             for (int p = 0; p < count; p++) body(p);
+            return;
+        }
+        // Route off raw Parallel.For (the .NET ThreadPool — per-call task/range allocation +
+        // LowLevelLifoSemaphore park/wakeup, the per-op dispatch overhead that shows as
+        // Parallel.ForWorker in the leaf profile) onto the low-latency cooperative pool, exactly
+        // as ParallelForOrSerial does (PR #531/#688). The caller already chose `count` partitions
+        // (disjoint-write GEMM tiles), so cooperative chunking is bit-identical to Parallel.For.
+        if (UseCooperativePool)
+        {
+            Engines.BlasManaged.Pool.CooperativeGemmScheduler.Dispatch(count, p =>
+            {
+                using var _region = EnterParallelRegion();
+                body(p);
+            });
             return;
         }
         Parallel.For(0, count,
@@ -488,7 +516,8 @@ public static class CpuParallelSettings
     /// strategies. Set <c>false</c> to fall back to <c>Parallel.For</c> (e.g. to avoid the
     /// cooperative pool's dedicated worker threads in a thread-count-sensitive host).</para>
     /// </summary>
-    public static bool UseCooperativePool { get; set; } = true;
+    public static bool UseCooperativePool { get; set; } =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_COOP_POOL") != "0"; // =0 forces raw Parallel.For for A/B
 
     // PR #531 diagnostic: how often the general op path actually dispatches through
     // System.Threading.Tasks.Parallel.For (the .NET ThreadPool — the LowLevelLifoSemaphore

@@ -145,6 +145,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private IntPtr _wmmaModule;
     private int _ccMajor;
     private int _ccMinor;
+    // cublasGemmEx fp32 compute type: COMPUTE_32F (TF32 allowed) or COMPUTE_32F_PEDANTIC (strict fp32),
+    // set at init to mirror the handle math mode / AIDOTNET_DISABLE_TF32. Default = TF32-allowed.
+    private int _fp32GemmComputeType = CuBlasNative.CUBLAS_COMPUTE_32F;
 
     /// <summary>
     /// True when this device supports the bfloat16 GEMM / MHA fanout
@@ -385,9 +388,16 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             _ccMinor = cc.Minor;
 
             bool useTF32 = _ccMajor >= 8 && CudaDispatchPolicy.AllowTF32;
+            // !useTF32 must use PEDANTIC_MATH, not TENSOR_OP_MATH: the latter STILL permits TF32
+            // tensor-core rounding for fp32 on Ampere+, so AIDOTNET_DISABLE_TF32 was a no-op (the
+            // GPU-vs-CPU parity error was byte-identical with it set). PEDANTIC_MATH forces true fp32.
             int mathMode = useTF32
                 ? CuBlasNative.CUBLAS_TF32_TENSOR_OP_MATH
-                : CuBlasNative.CUBLAS_TENSOR_OP_MATH;
+                : CuBlasNative.CUBLAS_PEDANTIC_MATH;
+            // cublasGemmEx takes a per-call compute type that ALSO permits TF32 under plain COMPUTE_32F
+            // on Ampere+ regardless of the handle math mode; mirror the TF32 decision so the GemmEx fp32
+            // paths honor AIDOTNET_DISABLE_TF32 too.
+            _fp32GemmComputeType = useTF32 ? CuBlasNative.CUBLAS_COMPUTE_32F : CuBlasNative.CUBLAS_COMPUTE_32F_PEDANTIC;
             // Wrap in CheckCublasStatus so a math-mode set failure surfaces
             // immediately rather than leaving the handle in an unknown state.
             // Same pattern as cublasCreate / cublasSetStream above; a silent
@@ -2052,7 +2062,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                             qPtr, inDtype, headDim,
                             betaPtr,
                             sPtr, CuBlasNative.CUDA_R_32F, seqLen,
-                            CuBlasNative.CUBLAS_COMPUTE_32F,
+                            _fp32GemmComputeType,
                             0 /* CUBLAS_GEMM_DEFAULT */),
                         $"cublasGemmEx MHA score batch={batchIdx} head={headIdx}");
                 });
@@ -2236,7 +2246,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                         aPtr, inDtype, K,
                         betaPtr,
                         cPtr, CuBlasNative.CUDA_R_32F, N,
-                        CuBlasNative.CUBLAS_COMPUTE_32F,
+                        _fp32GemmComputeType,
                         0 /* CUBLAS_GEMM_DEFAULT */),
                     $"cublasGemmEx slice {slice}");
             });
