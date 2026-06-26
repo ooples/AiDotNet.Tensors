@@ -229,6 +229,10 @@ internal static class PackBothStrategy
             int numNBlocksN = (n + ncN - 1) / ncN;
             bool useNAxis = !s_disableNAxis
                 && MachineKernelGemm.IsFp32PanelAvailable
+                // The N-axis path computes with RunPanelFp32 = the 6×16 panel kernel (mr=6), but packs A
+                // with `mr`. Under AVX-512 the strategy selects the 16×16 microkernel (mr=16), so the A-pack
+                // (16-row stripes) would mismatch the 6-row panel kernel → garbage. Gate to the panel's mr.
+                && mr == MachineKernelGemm.Fp32Mr
                 && typeof(T) == typeof(float)
                 && !transA && !transB
                 && options.PackedA is null && options.PackedB is null
