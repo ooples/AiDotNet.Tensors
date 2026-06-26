@@ -266,6 +266,57 @@ public static class AxisRoutingAbBench
         return TimeMin(op, m, n, k);
     }
 
+    /// <summary>
+    /// #475 medium/large gap: sweep the PackBoth blocking (Mc/Nc/Kc) against OpenBLAS's Zen sgemm
+    /// P/Q/R (320/320/large) on the diffusion shapes, single- and multi-thread, vs the OpenBLAS bar.
+    /// Tests whether precise blocking closes the 1.3-1.7x single-core gap. Run: <c>--ab-blocking</c>.
+    /// </summary>
+    public static unsafe void BlockingSweep()
+    {
+        Console.WriteLine("=== #475 medium/large blocking A/B (vs OpenBLAS P/Q/R = 320/320) ===");
+        Console.WriteLine($"HasRawSgemm={BlasProvider.HasRawSgemm}  cores={Environment.ProcessorCount}");
+        var shapes = new (string label, int m, int n, int k)[]
+        {
+            ("ffn-up 384x6144x1536", 384, 6144, 1536),
+            ("medium 384x1024x1024", 384, 1024, 1024),
+            ("square 1024x1024x1024", 1024, 1024, 1024),
+        };
+        var configs = new (string name, int? mc, int? nc, int? kc)[]
+        {
+            ("default", null, null, null), ("Kc512", null, null, 512),
+            ("Nc256", null, 256, null), ("Nc128", null, 128, null),
+            ("Nc256Kc512", null, 256, 512), ("Nc128Kc512", null, 128, 512),
+        };
+        PackBothStrategy.s_macroKernel = true;
+        foreach (var (label, m, n, k) in shapes)
+        {
+            var a = MakeRandom(m * k); var b = MakeRandom(k * n); var c = new float[m * n];
+            double flops = 2.0 * m * n * k;
+            Console.WriteLine($"  {label}:");
+            foreach (var (name, mc, nc, kc) in configs)
+            {
+                AutotuneDispatcher.s_overrideMc = mc; AutotuneDispatcher.s_overrideNc = nc; AutotuneDispatcher.s_overrideKc = kc;
+                foreach (int dop in new[] { 1, 32 })
+                {
+                    CpuParallelSettings.MaxDegreeOfParallelism = dop;
+                    double sec = TimeMinGemm(a, b, c, m, n, k);
+                    Console.WriteLine($"    {name,-11} DOP={dop,2}: {flops / sec / 1e9,6:F0} GF/s");
+                }
+            }
+            AutotuneDispatcher.s_overrideMc = AutotuneDispatcher.s_overrideNc = AutotuneDispatcher.s_overrideKc = null;
+            if (BlasProvider.HasRawSgemm)
+                foreach (int dop in new[] { 1, 32 })
+                {
+                    CpuParallelSettings.MaxDegreeOfParallelism = dop;
+                    double sec = TimeMinPtr(a, b, c, m, n, k, jit: false);
+                    Console.WriteLine($"    OpenBLAS    DOP={dop,2}: {flops / sec / 1e9,6:F0} GF/s");
+                }
+        }
+        AutotuneDispatcher.s_overrideMc = AutotuneDispatcher.s_overrideNc = AutotuneDispatcher.s_overrideKc = null;
+        PackBothStrategy.s_macroKernel = false;
+        CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
+    }
+
     private static double Gf(double flops, double sec) => flops / sec / 1e9;
 
     private static unsafe double TimeMinNative(float[] a, float[] b, float[] c, int m, int n, int k)

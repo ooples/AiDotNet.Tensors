@@ -174,6 +174,11 @@ internal static class AutotuneDispatcher
     /// </summary>
     [ThreadStatic] internal static bool ForceMeasureOnMiss;
 
+    // #475 medium/large blocking A/B: when set, override the heuristic's Mc/Nc/Kc to test
+    // OpenBLAS-style Zen blocking (sgemm P/Q = 320/320, R large) against the single-core gap.
+    // Null = the heuristic. Test/bench only.
+    internal static int? s_overrideMc, s_overrideNc, s_overrideKc;
+
     /// <summary>
     /// Use the AxisSelector heuristic to choose an axis, with default blocking
     /// parameters. The heuristic itself is shape-aware (m, n, k, mr, nr, procs).
@@ -223,6 +228,11 @@ internal static class AutotuneDispatcher
                 if (targetMc < mc) mc = targetMc;
             }
         }
+
+        // #475 medium/large blocking A/B — force OpenBLAS-style P/Q/R to probe the single-core gap.
+        if (s_overrideMc is int omc) mc = omc;
+        if (s_overrideNc is int onc) nc = onc;
+        if (s_overrideKc is int okc) kc = okc;
 
         // Round mc down to mr alignment, nc down to nr alignment.
         if (mr > 0) mc = (mc / mr) * mr;

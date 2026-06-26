@@ -95,6 +95,13 @@ class Program
             return;
         }
 
+        // #475 medium/large blocking sweep vs OpenBLAS P/Q/R. (--ab-blocking)
+        if (args[0] == "--ab-blocking")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.BlockingSweep();
+            return;
+        }
+
         if (args[0] == "--ab-aiseval-dopsweep")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.DopSweep();
