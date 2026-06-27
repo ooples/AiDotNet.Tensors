@@ -146,6 +146,12 @@ internal sealed class X64Assembler
     /// <summary>vmovups ymm_dst, [base+disp32] (FP32 256-bit load).</summary>
     internal void VmovupsLoadD32(int dst, int baseReg, int disp32) => VexMemDisp32(Map0F, PpNone, 0, 1, 0x10, dst, baseReg, disp32);
 
+    /// <summary>vmovups [base+disp32], ymm_src (FP32 256-bit store). Op 0x11; src in ModRM.reg.</summary>
+    internal void VmovupsStoreD32(int baseReg, int disp32, int src) => VexMemDisp32(Map0F, PpNone, 0, 1, 0x11, src, baseReg, disp32);
+
+    /// <summary>vmovupd [base+disp32], ymm_src (FP64 256-bit store). 66 prefix; op 0x11.</summary>
+    internal void VmovupdStoreD32(int baseReg, int disp32, int src) => VexMemDisp32(Map0F, Pp66, 0, 1, 0x11, src, baseReg, disp32);
+
     /// <summary>vbroadcastss ymm_dst, [base+disp32].</summary>
     internal void VbroadcastSsD32(int dst, int baseReg, int disp32) => VexMemDisp32(Map0F38, Pp66, 0, 1, 0x18, dst, baseReg, disp32);
 
@@ -199,6 +205,15 @@ internal sealed class X64Assembler
     {
         byte rex = (byte)(0x48 | (dst >= 8 ? 4 : 0));
         B(rex, 0x8B, (byte)(0x40 | ((dst & 7) << 3) | 4), 0x24, (byte)disp);
+    }
+
+    /// <summary>mov dst64, [rsp+disp32]. REX.W[.R] 8B /r, mod=10, rm=100 (SIB rsp), disp32.
+    /// For reading a stack argument after the frame has grown past the disp8 (±127) range.</summary>
+    internal void MovRegFromRspD32(int dst, int disp32)
+    {
+        byte rex = (byte)(0x48 | (dst >= 8 ? 4 : 0));
+        B(rex, 0x8B, (byte)(0x80 | ((dst & 7) << 3) | 4), 0x24);
+        Imm32(disp32);
     }
 
     /// <summary>lea rax, [idx*8]. REX.W[.X] 8D, mod=00 reg=rax rm=100, SIB(scale8,idx,base=disp32), disp32=0.</summary>
@@ -459,6 +474,15 @@ internal sealed class X64Assembler
 
     /// <summary>vfmadd231ps dst, s1, s2 (dst += s1*s2). VEX.DDS.256.66.0F38.W0 B8.</summary>
     internal void Vfmadd231ps(int dst, int s1, int s2) => VexRR(Map0F38, Pp66, 0, 1, 0xB8, dst, s1, s2);
+
+    /// <summary>vxorps ymm_dst, s1, s2. VEX.256.0F.WIG 57 /r. Zeroes a register via dst,dst,dst.</summary>
+    internal void Vxorps(int dst, int s1, int s2) => VexRR(Map0F, PpNone, 0, 1, 0x57, dst, s1, s2);
+
+    // vaddps (dst = s1 + s2) — used here for the fused-bias epilogue — shares the single
+    // definition declared with the tile-SAVE helpers above; do not redeclare it here.
+
+    /// <summary>vmaxps ymm_dst, s1, s2 (dst = max(s1, s2)). VEX.256.0F.WIG 5F /r. For fused ReLU.</summary>
+    internal void Vmaxps(int dst, int s1, int s2) => VexRR(Map0F, PpNone, 0, 1, 0x5F, dst, s1, s2);
 
     /// <summary>vbroadcastss ymm_dst, [base+disp8]. VEX.256.66.0F38.W0 18.</summary>
     internal void VbroadcastSs(int dst, int baseReg, sbyte disp8) => VexMemDisp8(Map0F38, Pp66, 0, 1, 0x18, dst, baseReg, disp8);

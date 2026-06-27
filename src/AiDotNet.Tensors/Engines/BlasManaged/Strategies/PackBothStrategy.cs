@@ -47,6 +47,12 @@ internal static class PackBothStrategy
     // chunks of ~256, while chunking still amortizes per-tile dispatch. Settable for sweeps.
     internal static int MaxPanelTiles = 256;
 
+    // #475: route the FP32 N-axis compute loop's Mr-sweep through the machine-code MACRO kernel
+    // (RunMacroPanelFp32) — the whole numMr × njr × kc sweep in one asm call, taking RyuJIT off the
+    // hot path (PerfView showed ~36% of single-thread time in the managed RunNAxisParallelUnsafe
+    // loop body). A/B toggle; default off until bit-exactness is validated, then flipped on.
+    internal static bool s_macroKernel;
+
     // #653 software-prefetch microkernel (env AIDOTNET_GEMM_PREFETCH=1, default off). Routes the
     // FP32 6×16 tile through Avx2Fp32_6x16.RunPrefetch (PREFETCHT0 of packed-B ahead) — same inlined
     // intrinsic kernel, so NO per-tile call/fixed overhead (unlike the machine-code-per-tile path
@@ -142,7 +148,9 @@ internal static class PackBothStrategy
             // to fill all cores via M-axis parallel alone. ShouldUse2DGrid returns
             // true when (numMBlocks * 2 < procs && numNBlocks > 1) — i.e., the
             // existing M-axis split would leave half or more cores idle.
-            int procs = options.NumThreads > 0 ? options.NumThreads : Environment.ProcessorCount;
+            // #475: default fan-out caps at PHYSICAL cores (FMA-bound GEMM regresses on SMT threads —
+            // measured ffn peak at 16, regress at 24/32). An explicit NumThreads request is honoured.
+            int procs = options.NumThreads > 0 ? options.NumThreads : CpuParallelSettings.GemmThreadCount(Environment.ProcessorCount);
             if (options.NumThreads < 0) procs = 1;
             int numMBlocks = (m + mc - 1) / mc;
             int numNBlocks = (n + nc - 1) / nc;
@@ -222,6 +230,7 @@ internal static class PackBothStrategy
                 && numNBlocksN >= 2 && numNBlocksN >= Math.Min(4, effProcs)
                 && options.Epilogue.Activation == AiDotNet.Tensors.Engines.FusedActivationType.None
                 && options.Epilogue.BiasN.IsEmpty && options.Epilogue.SkipMxN.IsEmpty;
+
             if (useNAxis)
             {
                 System.Threading.Interlocked.Increment(ref s_nAxisRunCount); // test observable (see s_nAxisRunCount)
@@ -899,8 +908,13 @@ internal static class PackBothStrategy
         // Panel pc occupies numMr * effKc * mr floats; pc panels are laid end to end with a
         // fixed per-panel stride of numMr * kc * mr so a worker can index (pc, ir) directly.
         int aPanelStride = numMr * kc * mr;
-        long packAElems = (long)numKPanels * aPanelStride;
-        var packAArr = System.Buffers.ArrayPool<float>.Shared.Rent((int)packAElems);
+        long packAElemsPerCopy = (long)numKPanels * aPanelStride;
+        // Per-CCX A-replication: pack ONE packed-A copy per L3 domain so each pinned worker reads its
+        // CCX-local copy (no cross-CCX shared-A reads). Copies are identical ⇒ bit-exact; a non-pinned
+        // thread (CurrentDomain==0) reads copy 0. Only when the pinned pool + replication are both on.
+        int nCopies = (PinnedParallel.s_enabled && PinnedParallel.s_replicate && PinnedParallel.DomainCount > 1)
+            ? PinnedParallel.DomainCount : 1;
+        var packAArr = System.Buffers.ArrayPool<float>.Shared.Rent((int)(packAElemsPerCopy * nCopies));
         try
         {
             for (int pIdx = 0; pIdx < numKPanels; pIdx++)
@@ -913,16 +927,21 @@ internal static class PackBothStrategy
                     packAArr.AsSpan(pIdx * aPanelStride, numMr * effKc * mr),
                     mc: m, kc: effKc, mr);
             }
+            // Replicate copy 0 into the remaining per-CCX copies.
+            for (int cp = 1; cp < nCopies; cp++)
+                Array.Copy(packAArr, 0L, packAArr, cp * packAElemsPerCopy, packAElemsPerCopy);
 
-            nint aPackAddr = 0, bAddr = (nint)bPtr, cAddr = (nint)cPtr;
-            fixed (float* paBase = packAArr) { aPackAddr = (nint)paBase;
+            nint bAddr = (nint)bPtr, cAddr = (nint)cPtr;
+            int aCopyStrideBytes = (int)(packAElemsPerCopy * sizeof(float));
+            int nCopiesL = nCopies;
+            fixed (float* paBase = packAArr) { nint aPackAddr = (nint)paBase;
 
             int kcL = kc, ncL = nc, nrL = nr, mrL = mr, ldbL = ldb, ldcL = ldc;
             int numKPanelsL = numKPanels, numMrL = numMr, aPanelStrideL = aPanelStride;
             int kL = k, nL = n, bLenL = bLen, cLenL = cLen;
             long totalWork = (long)m * n * k * 2;
 
-            CpuParallelSettings.ParallelForOrSerial(0, numNBlocks, totalWork, jcIdx =>
+            Action<int> nAxisBody = jcIdx =>
             {
                 int jc = jcIdx * ncL;
                 int effNc = Math.Min(ncL, nL - jc);
@@ -935,7 +954,10 @@ internal static class PackBothStrategy
                 byte[] packBArr = System.Buffers.ArrayPool<byte>.Shared.Rent(numKPanelsL * bPanelStride * sizeof(float));
                 try
                 {
-                    float* pa = (float*)aPackAddr;
+                    // Per-CCX A-replication: read this worker's CCX-local packed-A copy (copy 0 otherwise).
+                    int cp = nCopiesL > 1 ? PinnedParallel.CurrentDomain : 0;
+                    if (cp < 0 || cp >= nCopiesL) cp = 0;
+                    float* pa = (float*)(aPackAddr + (nint)cp * aCopyStrideBytes);
                     float* bb = (float*)bAddr;
                     float* cc = (float*)cAddr;
                     var packBSpan = MemoryMarshal.Cast<byte, float>(packBArr.AsSpan());
@@ -953,42 +975,74 @@ internal static class PackBothStrategy
 
                     // Compute: for each K-panel (ascending → correct C accumulation), each
                     // Mr-block does one chunked panel call over the N-block's full tiles + tail.
-                    for (int pIdx = 0; pIdx < numKPanelsL; pIdx++)
+                    // #475: when enabled, the whole Mr-sweep runs in the machine-code MACRO kernel
+                    // (one asm call per K-panel/N-chunk), taking RyuJIT off the hot path.
+                    bool useMacro = s_macroKernel && njrFull > 0 && MachineKernelGemm.IsFp32MacroAvailable;
+                    fixed (float* pbPacked = packBSpan)
                     {
-                        int pc = pIdx * kcL;
-                        int effKc = Math.Min(kcL, kL - pc);
-                        var bPanel = packBSpan.Slice(pIdx * bPanelStride, effKc * packedNc);
-                        for (int ir = 0; ir < numMrL; ir++)
+                        for (int pIdx = 0; pIdx < numKPanelsL; pIdx++)
                         {
-                            var aPanel = new ReadOnlySpan<float>(pa + pIdx * aPanelStrideL + ir * effKc * mrL, effKc * mrL);
-                            int cOff = (ir * mrL) * ldcL + jc;
-                            if (njrFull > 0)
+                            int pc = pIdx * kcL;
+                            int effKc = Math.Min(kcL, kL - pc);
+                            var bPanel = packBSpan.Slice(pIdx * bPanelStride, effKc * packedNc);
+                            int maxPanelTiles = Math.Max(1, MaxPanelTiles); // guard sweep-set 0/negative
+
+                            if (useMacro)
                             {
-                                int maxPanelTiles = Math.Max(1, MaxPanelTiles); // guard sweep-set 0/negative
+                                float* aBase0 = pa + pIdx * aPanelStrideL;
+                                float* bBase0 = pbPacked + pIdx * bPanelStride;
+                                int aStrideBytes = effKc * mrL * sizeof(float);
                                 for (int jb = 0; jb < njrFull; jb += maxPanelTiles)
                                 {
                                     int chunk = Math.Min(maxPanelTiles, njrFull - jb);
-                                    MachineKernelGemm.RunPanelFp32(
-                                        aPanel,
-                                        bPanel.Slice(jb * effKc * nrL, chunk * effKc * nrL),
-                                        new Span<float>(cc + cOff + jb * nrL, cLenL - (cOff + jb * nrL)),
-                                        ldcL, effKc, chunk);
+                                    MachineKernelGemm.RunMacroPanelFp32(
+                                        aBase0, bBase0 + jb * effKc * nrL, cc + jc + jb * nrL,
+                                        ldcL, effKc, chunk, numMrL, aStrideBytes);
                                 }
                             }
+                            else if (njrFull > 0)
+                            {
+                                for (int ir = 0; ir < numMrL; ir++)
+                                {
+                                    var aPanel = new ReadOnlySpan<float>(pa + pIdx * aPanelStrideL + ir * effKc * mrL, effKc * mrL);
+                                    int cOff = (ir * mrL) * ldcL + jc;
+                                    for (int jb = 0; jb < njrFull; jb += maxPanelTiles)
+                                    {
+                                        int chunk = Math.Min(maxPanelTiles, njrFull - jb);
+                                        MachineKernelGemm.RunPanelFp32(
+                                            aPanel,
+                                            bPanel.Slice(jb * effKc * nrL, chunk * effKc * nrL),
+                                            new Span<float>(cc + cOff + jb * nrL, cLenL - (cOff + jb * nrL)),
+                                            ldcL, effKc, chunk);
+                                    }
+                                }
+                            }
+
+                            // Nr tail (effNc % nr != 0): per-Mr-block managed dispatch (small).
                             if (nrTail > 0)
                             {
                                 int jrTail = njrFull * nrL;
-                                DispatchMicrokernelWithTail<float>(
-                                    aPanel,
-                                    bPanel.Slice(njrFull * effKc * nrL, effKc * nrL),
-                                    new Span<float>(cc + cOff + jrTail, cLenL - (cOff + jrTail)),
-                                    ldcL, effKc, mrL, nrL, nrTail);
+                                var bTail = bPanel.Slice(njrFull * effKc * nrL, effKc * nrL);
+                                for (int ir = 0; ir < numMrL; ir++)
+                                {
+                                    var aPanel = new ReadOnlySpan<float>(pa + pIdx * aPanelStrideL + ir * effKc * mrL, effKc * mrL);
+                                    int cOff = (ir * mrL) * ldcL + jc + jrTail;
+                                    DispatchMicrokernelWithTail<float>(
+                                        aPanel, bTail,
+                                        new Span<float>(cc + cOff, cLenL - cOff),
+                                        ldcL, effKc, mrL, nrL, nrTail);
+                                }
                             }
                         }
                     }
                 }
                 finally { System.Buffers.ArrayPool<byte>.Shared.Return(packBArr); }
-            }, deterministicSafe: true); // N-axis split: disjoint C columns, fixed-order K reduction
+            }; // N-axis body: disjoint C columns, fixed-order K reduction (bit-exact regardless of dispatch)
+            // #85 EXPERIMENT (gated): route the N-block parallel-for through the L3-domain-PINNED pool to
+            // test whether pinning closes the per-core gap to OpenBLAS (59 vs our ~42). Same body ⇒
+            // bit-exact. Returns false (→ threadpool) when unavailable/busy; throws only on a real fault.
+            if (!(PinnedParallel.s_enabled && PinnedParallel.For(0, numNBlocks, nAxisBody)))
+                CpuParallelSettings.ParallelForOrSerial(0, numNBlocks, totalWork, nAxisBody, deterministicSafe: true);
             }
         }
         finally { System.Buffers.ArrayPool<float>.Shared.Return(packAArr); }

@@ -75,9 +75,9 @@ internal static class MachineKernelGemm
     private static bool UseAvx512Fp32 => EnableAvx512 && Avx512F.IsSupported && TryInitAvx512Fp32();
 
     private static readonly object _lock = new();
-    private static bool _tried64, _tried32, _triedZ64, _triedZ32, _triedPanel32;
-    private static ExecutableMemory? _mem64, _mem32, _memZ64, _memZ32, _memPanel32; // kept alive for the process
-    private static nint _kern64, _kern32, _kernZ64, _kernZ32, _kernPanel32;
+    private static bool _tried64, _tried32, _triedZ64, _triedZ32, _triedPanel32, _triedMacro32;
+    private static ExecutableMemory? _mem64, _mem32, _memZ64, _memZ32, _memPanel32, _memMacro32; // kept alive for the process
+    private static nint _kern64, _kern32, _kernZ64, _kernZ32, _kernPanel32, _kernMacro32;
 
     // #663: expose the #653 panel kernel to the N-axis path (PackBothStrategy.RunNAxisParallelUnsafe).
     // Shares _kernPanel32 + TryInitPanelFp32 with the internal RunPacked panel use (both branches
@@ -100,6 +100,72 @@ internal static class MachineKernelGemm
         fixed (float* pb = packedB)
         fixed (float* pc = c)
             kern(pa, pb, pc, ldc, kc, njr);
+    }
+
+    /// <summary>True when the FP32 6×16 MACRO kernel (whole Mr-sweep in asm) is usable.</summary>
+    internal static bool IsFp32MacroAvailable => Enabled && EnablePanelKernel && TryInitMacroFp32();
+
+    /// <summary>
+    /// Run the FP32 6×16 macro kernel: for a single K-panel, does numMr Mr-blocks × njr Nr=16
+    /// tiles × kc K-steps entirely in machine code, reusing packedB across Mr-blocks. C is
+    /// read-modify-write. aBase points at the panel's first Mr-stripe; consecutive stripes are
+    /// aStrideBytes apart; C advances Mr·ldc rows per Mr-block. Caller guarantees availability.
+    /// </summary>
+    internal static unsafe void RunMacroPanelFp32(
+        float* aBase, float* bBase, float* cBase,
+        int ldc, int kc, int njr, int numMr, int aStrideBytes)
+    {
+        var kern = (delegate* unmanaged<float*, float*, float*, long, long, long, long, long, void>)_kernMacro32;
+        kern(aBase, bBase, cBase, ldc, kc, njr, numMr, aStrideBytes);
+    }
+
+    // #475 Phase-0 A/B support: superseded panel/macro kernels are RETIRED here (never disposed)
+    // so their RX code pages stay mapped for the process lifetime. ResetFp32Kernels re-emits with a
+    // changed PanelKUnroll; a previously-handed-out kernel pointer may still be mid-call on another
+    // thread, so the old ExecutableMemory must NOT be freed (that would munmap/VirtualFree code a
+    // thread is executing → use-after-free). Retaining the handful of A/B generations is bounded.
+    private static readonly System.Collections.Generic.List<ExecutableMemory> _retiredKernels = new();
+
+    /// <summary>
+    /// #475 Phase-0 A/B support: drop the cached FP32 panel + macro kernels so the next
+    /// IsFp32PanelAvailable/IsFp32MacroAvailable re-emits them with the current
+    /// MachineCodeFmaKernel.PanelKUnroll (and other emit-time knobs). Test/bench use only.
+    /// <para>
+    /// The superseded <see cref="ExecutableMemory"/> is moved to <c>_retiredKernels</c> rather than
+    /// freed, so any kernel pointer still in flight on another thread keeps executing valid mapped
+    /// code (dropping it to the GC could unmap pages a thread is mid-call into — a use-after-free).
+    /// </para>
+    /// </summary>
+    internal static void ResetFp32Kernels()
+    {
+        lock (_lock)
+        {
+            if (_memPanel32 is not null) _retiredKernels.Add(_memPanel32);
+            if (_memMacro32 is not null) _retiredKernels.Add(_memMacro32);
+            _triedPanel32 = false; _kernPanel32 = 0; _memPanel32 = null;
+            _triedMacro32 = false; _kernMacro32 = 0; _memMacro32 = null;
+        }
+    }
+
+    private static bool TryInitMacroFp32()
+    {
+        if (_triedMacro32) return _kernMacro32 != 0;
+        lock (_lock)
+        {
+            if (_triedMacro32) return _kernMacro32 != 0;
+            _triedMacro32 = true;
+            if (!PlatformOk()) return false;
+            try
+            {
+                byte[] code = IsWindows
+                    ? MachineCodeFmaKernel.EmitFp32_6x16_MacroWindows()
+                    : MachineCodeFmaKernel.EmitFp32_6x16_MacroSysV();
+                _memMacro32 = ExecutableMemory.TryAllocate(code);
+                if (_memMacro32 is not null) _kernMacro32 = _memMacro32.Pointer;
+            }
+            catch { _memMacro32 = null; _kernMacro32 = 0; }
+            return _kernMacro32 != 0;
+        }
     }
 
     private static bool IsWindows => RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
@@ -387,6 +453,13 @@ internal static class MachineKernelGemm
         Span<float> c, int ldc, int kc, int njr) =>
         throw new PlatformNotSupportedException(
             "RunPanelFp32 requires the net5.0+ machine-code JIT path; gate on IsFp32PanelAvailable before calling.");
+    internal static bool IsFp32MacroAvailable => false;
+    internal static unsafe void RunMacroPanelFp32(
+        float* aBase, float* bBase, float* cBase,
+        int ldc, int kc, int njr, int numMr, int aStrideBytes) =>
+        throw new PlatformNotSupportedException(
+            "RunMacroPanelFp32 requires the net5.0+ machine-code JIT path; gate on IsFp32MacroAvailable before calling.");
+    internal static void ResetFp32Kernels() { }
     internal static int ActiveFp64Nr => Fp64Nr;
     internal static int ActiveFp32Nr => Fp32Nr;
 

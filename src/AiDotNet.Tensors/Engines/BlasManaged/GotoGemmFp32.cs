@@ -45,11 +45,20 @@ internal static class GotoGemmFp32
     /// 3990X via --ab-prod): large/balanced (M≥512) OR wide-K (K≥2N, e.g. MLP-fc2). PackBoth's wide-N
     /// N-axis path wins the small-M wide-N shapes (DiT QKV M256×N3456, MLP-fc1 M256×N4608 — GotoGemm was
     /// 0.86-0.88× there), so those are excluded to avoid a production regression on the diffusion forward.</summary>
-    // GotoGemm beats PackBoth for: large-M, deep-K (k>=2n), AND — since the short-M blocking fix (balanced
-    // mc, core-filling nc) — short-M with decent N. Measured routing A/B (--ab-shortm, same-run direct
-    // kernels) on the DiT shapes: GotoGemm/PackBoth = qkv 2.06x, attnout 2.65x, mlp1 1.24x, mlp2 7.92x. The
-    // old gate (m>=512 || k>=2n) was set BEFORE that fix and wrongly kept m=256 wide/square-N on PackBoth.
-    internal static bool BeatsPackBoth(int m, int n, int k) => m >= 512 || (long)k >= 2L * n || (m >= 128 && n >= 512);
+    // GotoGemm beats PackBoth for: large-M (m>=512), deep-K (k>=2n), AND moderate-M decent-N — EXCEPT
+    // thin-M VERY-wide-N (m<512 && n>=2k), where PackBoth's N-axis path wins by sharing A. PerfView PMC +
+    // OpenBLAS-source analysis (2026-06-26): RunParallel packs A/B into PRIVATE per-thread tile panels, so
+    // for thin-M wide-N it re-packs A ~n/nc times (the per-tile work shows 86% of LLC misses; per-core
+    // 19.6 GF/s vs N-axis's shared-A 32). Clean A/B (--ab-goto-vs-naxis, DOP32): N-axis beats RunParallel
+    // 384x2048x1024 1.17x, 384x4096x1536 1.32x, 384x6144x1536 1.31x; while GotoGemm still wins balanced
+    // 768x2048x2048 1.33x and 1536^3 1.49x. So claim large/deep/moderate, cede thin-M-very-wide-N.
+    // Cede thin-M very-wide-N ONLY when PackBoth's N-axis can actually take it (m % Mr == 0, Mr=6 for the
+    // FP32 6x16 kernel): for m%6!=0 (e.g. the m=256 DiT QKV/MLP shapes) N-axis is disabled and PackBoth
+    // falls to M-axis/2D which LOSES to GotoGemm (the old --ab-shortm 2.06x), so GotoGemm must keep those.
+    internal static bool BeatsPackBoth(int m, int n, int k)
+        => m >= 512
+        || (long)k >= 2L * n
+        || (m >= 128 && n >= 512 && ((long)n < 2L * k || (m % Mr) != 0));
 
     /// <summary>Shape-adaptive (Mc, Nc, Kc) for RunParallel, tuned on the 3990X (measured --ab-goto-par /
     /// --profile-gemm). Memory-bound regime: larger square shapes want larger tiles (fewer redundant DRAM
