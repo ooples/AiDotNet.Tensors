@@ -113,6 +113,18 @@ public class RunningStatInPlaceMaterializationTests
             $"  indexer[0]   after Dispose   = {afterDispose:F12}\n" +
             $"  expected (post-EMA)          = {expected:F12}\n" +
             $"  (raw==1.0 && idx==0.95 => in-place side-effect left DEFERRED/stale)");
+        Assert.True(
+            System.Math.Abs(idxAfterStep - expected) < 1e-9,
+            $"Indexer probe after Step diverged from expected:\n" +
+            $"  indexer[0]   after Step      = {idxAfterStep:F12}\n" +
+            $"  expected (post-EMA)          = {expected:F12}\n" +
+            $"  (divergence => clone-divergence path: indexer triggers materialization but raw backing is stale)");
+        Assert.True(
+            System.Math.Abs(afterDispose - expected) < 1e-9,
+            $"Indexer probe after Dispose diverged from expected:\n" +
+            $"  indexer[0]   after Dispose   = {afterDispose:F12}\n" +
+            $"  expected (post-EMA)          = {expected:F12}\n" +
+            $"  (divergence => post-disposal value changed unexpectedly)");
     }
 
     /// <summary>
