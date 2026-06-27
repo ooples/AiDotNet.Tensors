@@ -113,11 +113,16 @@ public partial class CpuEngine
         int batch, int seqLen, int modelDim, int numHeads, int headDim)
     {
         int hh = headDim * headDim;
-        var S = new double[hh];
-        for (int b = 0; b < batch; b++)
+        // Each (batch, head) pair is fully independent (private state, disjoint output); parallelize
+        // lock-free over the combined (b*numHeads) axis. See GlaForwardDouble for the pattern.
+        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, (bhStart, bhCount) =>
         {
-            for (int h = 0; h < numHeads; h++)
+            var S = new double[hh];
+            int bhEnd = bhStart + bhCount;
+            for (int bh = bhStart; bh < bhEnd; bh++)
             {
+                int b = bh / numHeads;
+                int h = bh % numHeads;
                 Array.Clear(S, 0, hh);
                 int hOff = h * headDim;
                 for (int t = 0; t < seqLen; t++)
@@ -143,7 +148,7 @@ public partial class CpuEngine
                     }
                 }
             }
-        }
+        });
     }
 
     private static void Rwkv7BackwardDouble(
@@ -152,14 +157,17 @@ public partial class CpuEngine
         int batch, int seqLen, int modelDim, int numHeads, int headDim)
     {
         int hh = headDim * headDim;
-        var Straj = new double[seqLen * hh]; // S_t (post-update) for every t, reused per (b,h)
-        var S = new double[hh];
-        var dS = new double[hh];
-
-        for (int b = 0; b < batch; b++)
+        // Lock-free over the independent (b*numHeads) axis with per-chunk scratch; see GlaBackwardDouble.
+        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, (bhStart, bhCount) =>
         {
-            for (int h = 0; h < numHeads; h++)
+            var Straj = new double[seqLen * hh]; // S_t (post-update) for every t, reused per (b,h)
+            var S = new double[hh];
+            var dS = new double[hh];
+            int bhEnd = bhStart + bhCount;
+            for (int bh = bhStart; bh < bhEnd; bh++)
             {
+                int b = bh / numHeads;
+                int h = bh % numHeads;
                 int hOff = h * headDim;
 
                 // Forward recompute, saving the full state trajectory.
@@ -237,7 +245,7 @@ public partial class CpuEngine
                     }
                 }
             }
-        }
+        });
     }
 
     // ── Generic-T path (correct for any numeric T; used for non-double) ──────────────────
@@ -247,11 +255,14 @@ public partial class CpuEngine
     {
         var ops = MathHelper.GetNumericOperations<T>();
         int hh = headDim * headDim;
-        var S = new T[hh];
-        for (int b = 0; b < batch; b++)
+        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, (bhStart, bhCount) =>
         {
-            for (int h = 0; h < numHeads; h++)
+            var S = new T[hh];
+            int bhEnd = bhStart + bhCount;
+            for (int bh = bhStart; bh < bhEnd; bh++)
             {
+                int b = bh / numHeads;
+                int h = bh % numHeads;
                 for (int i = 0; i < hh; i++) S[i] = ops.Zero;
                 int hOff = h * headDim;
                 for (int t = 0; t < seqLen; t++)
@@ -275,7 +286,7 @@ public partial class CpuEngine
                     }
                 }
             }
-        }
+        });
     }
 
     private static void Rwkv7BackwardGeneric<T>(
@@ -285,15 +296,17 @@ public partial class CpuEngine
     {
         var ops = MathHelper.GetNumericOperations<T>();
         int hh = headDim * headDim;
-        var Straj = new T[seqLen * hh];
-        var S = new T[hh];
-        var dS = new T[hh];
         T one = ops.One;
-
-        for (int b = 0; b < batch; b++)
+        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, (bhStart, bhCount) =>
         {
-            for (int h = 0; h < numHeads; h++)
+            var Straj = new T[seqLen * hh];
+            var S = new T[hh];
+            var dS = new T[hh];
+            int bhEnd = bhStart + bhCount;
+            for (int bh = bhStart; bh < bhEnd; bh++)
             {
+                int b = bh / numHeads;
+                int h = bh % numHeads;
                 int hOff = h * headDim;
                 for (int i = 0; i < hh; i++) S[i] = ops.Zero;
                 for (int t = 0; t < seqLen; t++)
@@ -365,7 +378,7 @@ public partial class CpuEngine
                     }
                 }
             }
-        }
+        });
     }
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
