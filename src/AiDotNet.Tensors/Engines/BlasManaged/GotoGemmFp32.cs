@@ -180,7 +180,10 @@ internal static class GotoGemmFp32
             lock (typeof(GotoGemmFp32))
                 if (init == 0)
                 {
-                    var code = MachineCodeFmaKernel.EmitBf16BTileWindows(Mr, NrYmm, ow);
+                    // ABI-aware (Win-x64 vs SysV): the Win-only emit segfaults on Linux/macOS — it reads kc
+                    // from the [rsp+0x28] shadow space SysV lacks (the #706 CI SIGSEGV). Mirrors the fp32
+                    // kernel's EmitFp32TileAbi selection.
+                    var code = MachineCodeFmaKernel.EmitBf16BTileAbi(Mr, NrYmm, ow);
                     var mem = ExecutableMemory.TryAllocate(code);
                     if (ow) { s_kBf16OwMem = mem; s_kBf16Ow = mem?.Pointer ?? IntPtr.Zero; }
                     else { s_kBf16Mem = mem; s_kBf16 = mem?.Pointer ?? IntPtr.Zero; }
