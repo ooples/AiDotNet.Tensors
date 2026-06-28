@@ -31,7 +31,12 @@ internal sealed class TensorStorage<T>
     // write paths (AsWritableSpan / AsWritableMemory / GetDataArray) can
     // throw a clear error instead of faulting in the mapped pages.
     private IDisposable? _mmapOwner;
-    internal bool IsReadOnlyMapped => Volatile.Read(ref _mmapOwner) != null;
+    // Writable mmap aliases (#1715 param-IO round-trip) back a tensor whose mutations must persist
+    // to the mapped file (MAP_SHARED). Only READ-ONLY aliases gate the write paths — a writable
+    // alias's whole purpose is to be written. Set before _mmapOwner is published (the CAS below is
+    // the release barrier), so a reader that sees a non-null owner also sees the correct writability.
+    private bool _mmapWritable;
+    internal bool IsReadOnlyMapped => Volatile.Read(ref _mmapOwner) != null && !_mmapWritable;
 
     /// <summary>
     /// Attaches an IDisposable that will be disposed when this storage's
@@ -39,11 +44,15 @@ internal sealed class TensorStorage<T>
     /// alias to tie the lifetime of the underlying memory-mapped file to
     /// the lifetime of the shared storage (not the lifetime of any single
     /// tensor that holds a ref). Must be called BEFORE the alias is exposed
-    /// to other tensors.
+    /// to other tensors. <paramref name="writable"/> (#1715) marks a
+    /// read-WRITE mapping whose mutations persist — such aliases do NOT gate
+    /// the write paths (read-only aliases do, so writes fail loud rather than
+    /// faulting the mapped pages).
     /// </summary>
-    internal void AttachMmapOwner(IDisposable owner)
+    internal void AttachMmapOwner(IDisposable owner, bool writable = false)
     {
         if (owner is null) throw new ArgumentNullException(nameof(owner));
+        _mmapWritable = writable;
         if (Interlocked.CompareExchange(ref _mmapOwner, owner, null) != null)
             throw new InvalidOperationException(
                 "TensorStorage already has an attached mmap owner; replacing it would leak the prior mapping.");

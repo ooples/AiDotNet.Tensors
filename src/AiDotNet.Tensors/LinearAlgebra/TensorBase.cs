@@ -303,7 +303,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     /// <para>READ-ONLY: the mapping is read-only; the caller guarantees nothing writes to
     /// this tensor while aliased (inference / forward-read only). A write would fault.</para>
     /// </summary>
-    internal void AliasStorageFromMmap(Vector<T> aliased, IDisposable owner)
+    internal void AliasStorageFromMmap(Vector<T> aliased, IDisposable owner, bool writable = false)
     {
         if (aliased is null) throw new ArgumentNullException(nameof(aliased));
         if (owner is null) throw new ArgumentNullException(nameof(owner));
@@ -323,7 +323,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         var oldStorage = _storage;
         _data = aliased;
         var newStorage = new TensorStorage<T>(_data);
-        newStorage.AttachMmapOwner(owner); // attach BEFORE making the storage visible to anyone else
+        newStorage.AttachMmapOwner(owner, writable); // attach BEFORE making the storage visible to anyone else
         _storage = newStorage;
         oldStorage.Release();
     }
