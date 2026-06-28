@@ -50,10 +50,10 @@ public class GotoGemmBf16FusionTests
         return c;
     }
 
-    [Fact]
+    [SkippableFact]
     public void Bf16Kernel_LargeBandwidthShape_WithinBf16Tolerance()
     {
-        if (!GotoGemmFp32.IsAvailable) return; // AVX2+FMA x64 net5+ only
+        Skip.IfNot(GotoGemmFp32.IsAvailable, "GotoGemmFp32 requires AVX2+FMA x64 (net5+)"); // visible skip, not a false pass
         const int m = 1024, n = 1024, k = 4096; // work 4.29e9, the regime ShouldUseBf16 selects
         Assert.True(GotoGemmFp32.ShouldUseBf16(m, n, k));
         var a = Random(m * k, 1);
@@ -77,11 +77,16 @@ public class GotoGemmBf16FusionTests
         Assert.True(maxDiff > 1e-5, $"bf16-B did not change the result: maxDiff={maxDiff:E3}");
     }
 
-    [Fact]
+    [SkippableFact]
     public void FusedEpilogue_OnLargeGotoGemmShape_MatchesUnfusedThenBiasActivation()
     {
-        if (!GotoGemmFp32.IsAvailable) return;
+        Skip.IfNot(GotoGemmFp32.IsAvailable, "GotoGemmFp32 requires AVX2+FMA x64 (net5+)");
         const int m = 768, n = 512, k = 768; // m≥512 ⇒ BeatsPackBoth ⇒ GotoGemm fast path
+        // Pin the route: this shape selects the fast GotoGemm path (the fusion target this test covers),
+        // not the PackBoth fallback. Asserting the routing predicate is parallel-safe (pure functions) and
+        // guards against a silent regression to the fallback that would still pass the numeric parity check.
+        Assert.True(GotoGemmFp32.BeatsPackBoth(m, n, k), "shape must route to GotoGemm");
+        Assert.True((long)m * n * k >= GotoGemmFp32.ParallelMinWork, "shape must meet GotoGemm's parallel work floor");
         var a = Random(m * k, 7);
         var b = Random(k * n, 9);
         var bias = Random(n, 11);
