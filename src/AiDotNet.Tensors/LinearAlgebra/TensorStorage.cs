@@ -38,6 +38,11 @@ internal sealed class TensorStorage<T>
     private bool _mmapWritable;
     internal bool IsReadOnlyMapped => Volatile.Read(ref _mmapOwner) != null && !_mmapWritable;
 
+    /// <summary>True when this storage aliases a WRITABLE memory-mapped slice (#1715 param-IO): the
+    /// mapped file is the weight's canonical storage (mutations persist via MAP_SHARED), so the registry
+    /// must not re-materialize it from the pool (stale bytes) nor drop it on ReleaseToPool.</summary>
+    internal bool IsWritableMmapped => Volatile.Read(ref _mmapOwner) != null && _mmapWritable;
+
     /// <summary>
     /// Attaches an IDisposable that will be disposed when this storage's
     /// refcount finally reaches 0. Used by the streaming-pool zero-copy

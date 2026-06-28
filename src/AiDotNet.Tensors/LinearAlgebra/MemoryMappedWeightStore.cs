@@ -44,12 +44,20 @@ internal sealed class MemoryMappedWeightStore : IDisposable
     /// <summary>Current mapped file capacity in bytes (grows by doubling).</summary>
     public long Capacity { get { lock (_lock) { return _capacity; } } }
 
+    /// <summary>Backing file path — callers that writably-alias a slice (the #1715 param-IO path) open
+    /// their own independent MAP_SHARED view of this file at the slice's offset; an alias's mapping
+    /// stays valid across a store grow (the file only ever grows, never moves existing bytes).</summary>
+    public string Path => _path;
+
     public MemoryMappedWeightStore(string path, long initialCapacity = 64L * 1024 * 1024)
     {
         _path = path ?? throw new ArgumentNullException(nameof(path));
         if (initialCapacity <= 0) throw new ArgumentOutOfRangeException(nameof(initialCapacity));
         _capacity = AlignUp(Math.Max(initialCapacity, 4096), 4096);
-        _file = new FileStream(_path, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None);
+        // FileShare.ReadWrite so a slice can be writably aliased through an independent MAP_SHARED view
+        // (the #1715 param-IO round-trip) concurrently with the store's own mapping. The two mappings
+        // touch the same page-cache pages, so writes to disjoint byte ranges stay coherent.
+        _file = new FileStream(_path, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.ReadWrite);
         _file.SetLength(_capacity);
         TryMarkSparse(_file);     // unwritten capacity costs no disk where supported (Linux: always; Windows: NTFS)
         Map();

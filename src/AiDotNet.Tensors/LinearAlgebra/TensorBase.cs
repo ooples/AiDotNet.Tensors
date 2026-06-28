@@ -328,6 +328,11 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         oldStorage.Release();
     }
 
+    /// <summary>True when this tensor's storage aliases a WRITABLE memory-mapped slice (#1715 param-IO):
+    /// the mapped file is the canonical storage (mutations persist), so WeightRegistry must not
+    /// re-materialize it from the pool nor drop it on ReleaseToPool.</summary>
+    internal bool IsWritableMmapAliased => _storage.IsWritableMmapped;
+
     /// <summary>
     /// Physical memory layout of this tensor's data. Default
     /// <see cref="TensorLayout.Nchw"/> (standard row-major). The

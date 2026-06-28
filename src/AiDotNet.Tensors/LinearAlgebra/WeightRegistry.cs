@@ -667,6 +667,54 @@ public static class WeightRegistry
         }
     }
 
+    // #1715 param-IO writable mmap store: one growable memory-mapped file holding the writable slices
+    // that training/param-IO weights alias instead of materializing resident copies. Lazily created;
+    // disposed (file deleted) on Reset. Process-global like the streaming pool.
+    private static MemoryMappedWeightStore? _paramIoStore;
+
+    private static MemoryMappedWeightStore ParamIoStore()
+        => _paramIoStore ??= new MemoryMappedWeightStore(System.IO.Path.Combine(
+            System.IO.Path.GetTempPath(), "aidotnet-paramio-" + System.Guid.NewGuid().ToString("N") + ".bin"));
+
+    /// <summary>
+    /// #1715 writable zero-copy: copy <paramref name="weight"/>'s current bytes once into the param-IO
+    /// mmap store and alias its storage to that writable slice (MAP_SHARED) so mutations persist with no
+    /// resident copy and the OS pages the slice. Returns false (caller falls back to the copy path) when
+    /// the bytes aren't the tensor's native element layout or the mapping can't be opened. The store slice
+    /// becomes the weight's canonical storage — <see cref="Materialize{T}"/> / <see cref="ReleaseToPool{T}"/>
+    /// then no-op on it via <c>IsWritableMmapAliased</c>.
+    /// </summary>
+    private static bool TryAliasZeroCopyWritable<T>(Tensor<T> weight, StreamingTensorPool pool)
+    {
+        int elemSize = NativeStreamingElementSize<T>();
+        if (elemSize <= 0) return false;
+        long byteLen = (long)weight.Length * elemSize;
+        if (byteLen <= 0 || byteLen > int.MaxValue) return false;
+
+        MmapTensorMemoryManager<T>? manager = null;
+        try
+        {
+            // Current bytes from the pool (native, uncompressed). A scale prefix / compression makes the
+            // length mismatch — not aliasable, fall back to the copy path.
+            byte[] bytes = pool.RehydrateInto(weight.StreamingPoolHandle);
+            if (bytes.Length != (int)byteLen) return false;
+
+            var store = ParamIoStore();
+            long offset = store.Allocate(bytes); // Allocate is internally locked (+ grows the single file)
+            manager = new MmapTensorMemoryManager<T>(store.Path, offset, (int)byteLen, weight.Length, writable: true);
+            var aliased = Vector<T>.WrapMemory(manager.Memory);
+            weight.AliasStorageFromMmap(aliased, manager, writable: true); // tensor's storage owns the mapping
+            return true;
+        }
+        catch
+        {
+            // Any failure (length mismatch handled above; mapping open / address-space failure here) →
+            // dispose the half-built mapping and fall back to the proven copy path.
+            ((IDisposable?)manager)?.Dispose();
+            return false;
+        }
+    }
+
     /// <summary>Byte size of one native element of <typeparamref name="T"/> for the
     /// zero-copy path, or 0 for unsupported types. Matches the native (encoding 0)
     /// branch of <c>SerializeToBytes</c>/<c>RestoreStorageFromBytes</c>.</summary>
@@ -1006,6 +1054,10 @@ public static class WeightRegistry
         if (weight is null) throw new ArgumentNullException(nameof(weight));
         if (weight.Lifetime != WeightLifetime.Streaming) return;
         if (weight.StreamingPoolHandle < 0) return;
+        // #1715: a writable mmap alias is the weight's canonical storage (mutations persist through the
+        // mapping). Re-materializing from the pool would read stale bytes, and the shed path would drop
+        // the alias and lose the mutation — so the weight is already materialized. Nothing to do.
+        if (weight.IsWritableMmapAliased) return;
         // A no-upcast int8/int4 weight is already materialized (as quantized + scales), even though
         // its fp _data is empty — treat it as resident so we don't re-fetch + re-attach each call.
         if (weight.DataVector.Length == weight.Length || weight.StreamingInt8 is not null || weight.StreamingInt4 is not null)
@@ -1081,6 +1133,21 @@ public static class WeightRegistry
         {
             // The pool entry stays "paged out" (the OS page cache holds the bytes now), so
             // there are no new owner-drops to drain from this path.
+            return;
+        }
+
+        // #1715 WRITABLE zero-copy fast path: in TRAINING / param-IO mode the read-only alias above can't
+        // be used (a weight update would fault), so foundation models fall to the copy path below and
+        // materialize the whole weight set as resident arrays → the GetParameters round-trip OOMs. Instead,
+        // copy the weight's bytes once into the param-IO mmap store and alias its storage to that slice
+        // WRITABLY: mutations persist (MAP_SHARED) and the OS pages the slice, so no resident copy is held.
+        // Gated to native encoding (bf16/int8/lossless need a decode = copy). The store slice becomes the
+        // weight's canonical storage, so the early IsWritableMmapAliased guard makes re-materialize a no-op
+        // and ReleaseToPool leaves it intact.
+        if (zeroCopyEnabled && !inferenceMode && weight.StreamingStoreEncoding == StreamingEncoding.Native
+            && NativeStreamingElementSize<T>() > 0
+            && TryAliasZeroCopyWritable(weight, pool))
+        {
             return;
         }
 
@@ -1225,6 +1292,10 @@ public static class WeightRegistry
         if (weight is null) throw new ArgumentNullException(nameof(weight));
         if (weight.Lifetime != WeightLifetime.Streaming) return;
         if (weight.StreamingPoolHandle < 0) return;
+        // #1715: a writable mmap alias IS the offloaded form — its bytes live in the param-IO store
+        // (OS-paged), not on the GC heap. Dropping the storage would discard the mapping (and the
+        // mutated bytes) and a re-materialize would read stale pool bytes. Nothing to release.
+        if (weight.IsWritableMmapAliased) return;
         if (weight.DataVector.Length == 0) return; // already released
         // Soft-defer drop — mirrors the RegisterWeight #430 fix. A streaming
         // weight's storage can be SHARED (refcount > 1) at release time when a
@@ -1847,6 +1918,11 @@ public static class WeightRegistry
         {
             _streamingPool?.Dispose();
             _streamingPool = null;
+            // #1715: dispose the param-IO mmap store (deletes its backing file). Weights still aliasing
+            // its slices keep their own MAP_SHARED view alive (the alias owns an independent mapping), so
+            // disposing the store here only releases the registry's handle, not the live aliases' mappings.
+            _paramIoStore?.Dispose();
+            _paramIoStore = null;
             _offloadAllocator?.Dispose();
             _offloadAllocator = null;
             _ownerByHandle.Clear();
