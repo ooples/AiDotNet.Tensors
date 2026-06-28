@@ -3892,6 +3892,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return nb;
     }
 
+    /// <summary>Dispose + clear the per-action capture scratch pool. Call at the training→eval transition:
+    /// these pooled transient buffers are training-only (the captured graph does NOT replay during forward-only
+    /// eval), and on a big model (d256/L4+) they hold GBs that the async pool reserved at the training peak.
+    /// Freeing them returns that memory to the pool (then trimmable to the OS on the next alloc-OOM retry), so
+    /// the eval forward's weight uploads no longer hit cuMemAllocAsync free=0. Safe ONLY when no further training
+    /// step will run on this plan (eval is terminal); a replay after this would read freed device memory.</summary>
+    public void ClearActionScratchPool()
+    {
+        foreach (var kv in _actionScratchPool)
+            { try { kv.Value?.Dispose(); } catch { } }
+        _actionScratchPool.Clear();
+        _currentScratchAction = -1;
+        _currentScratchLocal = 0;
+    }
+
     // Set during the resident step so the STATIC AllocateOutputBuffer can route transient allocs into this
     // engine's per-action pool. Plain static (one plan captures at a time on the single GPU; resident step is
     // single-threaded in practice). Set on EnterCompiledCapturePath, cleared when its depth returns to 0.
@@ -12163,9 +12178,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (gR is not null && iR is not null && gamR is not null && meanR is not null && varR is not null)
                 {
                     IGpuBuffer? invVarBuf = null;
+                    bool invVarPooled = false;
                     try
                     {
-                        invVarBuf = backend.AllocateBuffer(batchSize);
+                        // CAPTURE-DETERMINISM (#638): pool the invVar scratch by (action,local) during the resident step
+                        // so it is NOT a cuMemAllocAsync graph node (the 8 small ~32KB in-capture allocs). Pooled ⇒ do
+                        // NOT dispose (the pool owns + reuses it across steps/replays); unpooled (eager/eval) ⇒ dispose.
+                        invVarPooled = ScratchPoolingActive;
+                        invVarBuf = invVarPooled ? RentActionScratch(backend, batchSize) : backend.AllocateBuffer(batchSize);
                         if (invVarBuf is not null && invVarBuf.Handle != System.IntPtr.Zero)
                         {
                             backend.AddScalar(varR, invVarBuf, (float)epsilon, batchSize); // var + eps
@@ -12191,7 +12211,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         }
                     }
                     catch (Exception ex) { AliasDiag($"LayerNormBackward-resident FELLBACK: {ex.GetType().Name}: {ex.Message}"); }
-                    finally { invVarBuf?.Dispose(); }
+                    finally { if (!invVarPooled) invVarBuf?.Dispose(); }
                 }
             }
 
@@ -17947,8 +17967,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                             outBuf = e.Buffer;
                 if (outBuf is null)
                 {
-                    outBuf = backend.AllocateBuffer(output.Length);
-                    if (arr is not null) CacheActivation(arr, outBuf, output._shape, backend);
+                    // CAPTURE-DETERMINISM (#638): inside a compiled action during the resident step, draw the permute
+                    // output from the per-action scratch pool — a stable address by (action,local) → NO cuMemAllocAsync
+                    // graph node → no AUTO_FREE_ON_LAUNCH realloc nondeterminism. This was the DOMINANT residual: ~50 of
+                    // 58 in-capture allocs funneled here (TensorPermute←PermuteBackward/MatMulBackward, and
+                    // ReduceAxisGpu←ReduceSum←SumToShape/ReduceGradToShape), each a fresh AllocateBuffer because the
+                    // backward intermediate's backing array is null (CacheActivation skipped) → cache miss every pass.
+                    // Pooled buffers are first-rented in the pre-residency pass (outside capture); the capture pass hits
+                    // the pool (no alloc). Do NOT CacheActivation when pooled (its per-step bookkeeping perturbs the
+                    // captured graph — matches GetOrCreateResidentBuffer's resident-miss path).
+                    if (ScratchPoolingActive)
+                        outBuf = RentActionScratch(backend, output.Length);
+                    else
+                    {
+                        outBuf = backend.AllocateBuffer(output.Length);
+                        if (arr is not null) CacheActivation(arr, outBuf, output._shape, backend);
+                    }
                 }
                 backend.Permute(bufIn.Buffer, outBuf, tensor.Shape._dims, axes);
                 ResidentSyncCheck("Permute");

@@ -2024,6 +2024,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         if (gradTransient) gradBuf.Dispose();
                     }
                     if (diagAU) { try { gpuBe.Synchronize(); var w = gpuBe.DownloadBuffer(gpuP); double s = 0; for (int i = 0; i < w.Length; i++) s += System.Math.Abs((double)w[i]); System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_opt_diag.txt"), $"[AU] p=0 step6 lr={lr:E3} gradBufL1={auGrad:E4} mvAlloc={(gpuM[p] != null && gpuV[p] != null)} paramL1 before={auBefore:E6} after={s:E6} delta={(s - auBefore):E6}" + System.Environment.NewLine); } catch { } }
+                    // EVAL-LEAK ROOT FIX (#638): on-device Adam just updated _parameters[p]'s RESIDENT device
+                    // buffer IN PLACE — it now holds the authoritative current weights. Sync _gpuBufferVersion to
+                    // Version so the version-gate in GetWeightBufferPreferResident TRUSTS it during forward-only
+                    // eval. Without this, on-device Adam bumps Version but not _gpuBufferVersion, so the gate
+                    // falsely judges the (fresh) device buffer stale → re-uploads the weights via GetDataArray()
+                    // (a FRESH host array each call → persistent-cache MISS) on EVERY Predict → a per-call
+                    // ~weight-size GPU leak that OOMs the eval at d256/L4+. A later CPU SetParameters legitimately
+                    // re-bumps Version (without this device write) → mismatch returns → correct re-upload. Harmless
+                    // to capture (the gate's ResidentStepActive branch already covers it).
+                    _parameters[p]._gpuBufferVersion = _parameters[p].Version;
                     continue;
                 }
 
