@@ -220,7 +220,7 @@ internal static class PackBothStrategy
                 && typeof(T) == typeof(float)
                 && !transA && !transB
                 && options.PackedA is null && options.PackedB is null
-                && (m % mr) == 0 && m >= mr
+                && (s_allowNAxisMTail || (m % mr) == 0) && m >= mr
                 // Wide-N gate (n >= k): the N-axis re-reads the shared A (m×k) once per N-block,
                 // so it pays off only when N is wide enough to amortize that — measured across 6
                 // interleaved reps: ffn-big n=4096≥k=3456 wins +27% (DOP32, 6/6) and is neutral
@@ -878,6 +878,12 @@ internal static class PackBothStrategy
     // Route wide-N moderate-M float GEMMs to the N-axis private-B path. Test-only toggle.
     internal static bool s_disableNAxis;
 
+    // #90: allow the shared-A N-axis path for m % mr != 0 (a scalar M-tail handles the <mr leftover
+    // rows). Unlocks the m=256 DiT shapes (m%6=4) currently stuck on the slower per-tile GotoGemm path.
+    // Default OFF until A/B'd (--ab-naxis-mtail); the M-tail code itself is always correct (no-op when
+    // m % mr == 0). Flipping this on changes routing, so it stays a gate, not unconditional.
+    internal static bool s_allowNAxisMTail;
+
     // Test-only observable: incremented each time the N-axis private-B path actually runs, so the
     // parity test can assert the N-axis path was exercised (not silently falling back to M-axis,
     // which would make the bit-identity comparison vacuous M-vs-M).
@@ -902,7 +908,8 @@ internal static class PackBothStrategy
     {
         int numKPanels = (k + kc - 1) / kc;
         int numNBlocks = (n + nc - 1) / nc;
-        int numMr = m / mr; // m % mr == 0 guaranteed by caller
+        int numMr = m / mr;       // full Mr-stripes
+        int mFull = numMr * mr;    // rows [mFull, m) are the M-tail (0 unless s_allowNAxisMTail)
 
         // ── Pack ALL of A once (shared, read-only). Layout: [K-panel][Mr-stripe][Kc × Mr]. ──
         // Panel pc occupies numMr * effKc * mr floats; pc panels are laid end to end with a
@@ -921,19 +928,21 @@ internal static class PackBothStrategy
             {
                 int pc = pIdx * kc;
                 int effKc = Math.Min(kc, k - pc);
-                // PackA writes [Mr-stripe][effKc × mr] (mc=m → all stripes).
+                // PackA writes [Mr-stripe][effKc × mr] — only the mFull full stripes (mc=mFull). Any
+                // M-tail rows [mFull, m) are NOT packed; they go through the scalar tail below.
                 Avx2Pack.PackA<float>(
                     new ReadOnlySpan<float>(aPtr + pc, aLen - pc), lda, false,
                     packAArr.AsSpan(pIdx * aPanelStride, numMr * effKc * mr),
-                    mc: m, kc: effKc, mr);
+                    mc: mFull, kc: effKc, mr);
             }
             // Replicate copy 0 into the remaining per-CCX copies.
             for (int cp = 1; cp < nCopies; cp++)
                 Array.Copy(packAArr, 0L, packAArr, cp * packAElemsPerCopy, packAElemsPerCopy);
 
-            nint bAddr = (nint)bPtr, cAddr = (nint)cPtr;
+            nint bAddr = (nint)bPtr, cAddr = (nint)cPtr, aOrigAddr = (nint)aPtr;
             int aCopyStrideBytes = (int)(packAElemsPerCopy * sizeof(float));
             int nCopiesL = nCopies;
+            int ldaL = lda, mFullL = mFull, mTailL = m;
             fixed (float* paBase = packAArr) { nint aPackAddr = (nint)paBase;
 
             int kcL = kc, ncL = nc, nrL = nr, mrL = mr, ldbL = ldb, ldcL = ldc;
@@ -1032,6 +1041,30 @@ internal static class PackBothStrategy
                                         new Span<float>(cc + cOff, cLenL - cOff),
                                         ldcL, effKc, mrL, nrL, nrTail);
                                 }
+                            }
+                        }
+                    }
+
+                    // #90 M-tail: rows [mFull, m) aren't in packed-A (only full Mr-stripes). This N-block
+                    // owns disjoint C columns [jc, jc+effNc), so accumulate those tail rows here with a
+                    // scalar K-loop reading the ORIGINAL A and B (the <mr leftover rows are a small fraction;
+                    // e.g. 4/256 for the DiT m=256 shapes). C := A·B (overwrite). Ascending k ⇒ deterministic
+                    // and disjoint-column ⇒ no cross-thread write race. No-op when mFull == m (m % mr == 0).
+                    if (mFullL < mTailL)
+                    {
+                        float* aOrig = (float*)aOrigAddr;
+                        float* bOrig = (float*)bAddr;
+                        float* cOut = (float*)cAddr;
+                        for (int r = mFullL; r < mTailL; r++)
+                        {
+                            float* aRow = aOrig + (long)r * ldaL;
+                            float* cRow = cOut + (long)r * ldcL + jc;
+                            for (int col = 0; col < effNc; col++)
+                            {
+                                float s = 0f;
+                                float* bCol = bOrig + jc + col;
+                                for (int kk = 0; kk < kL; kk++) s += aRow[kk] * bCol[(long)kk * ldbL];
+                                cRow[col] = s;
                             }
                         }
                     }

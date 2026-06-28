@@ -509,6 +509,46 @@ public static class AxisRoutingAbBench
         }
     }
 
+    /// <summary>#90 A/B: the m=256 DiT shapes (m%6=4) are currently STUCK on the per-tile GotoGemm path
+    /// because the shared-A N-axis path is gated m%6==0. This compares production (GotoGemm) vs the N-axis
+    /// path with the new scalar M-tail (PackBothStrategy.s_allowNAxisMTail). N-axis = OpenBLAS's contiguous-
+    /// N-partition shared-A structure (already beats GotoGemm 1.17-1.32× on m%6==0 wide-N). Confirms N-axis
+    /// actually ran (s_nAxisRunCount) + bit-close vs scalar ref. Run <c>--ab-naxis-mtail</c>.</summary>
+    public static void NaxisMTailSweep()
+    {
+        Console.WriteLine($"=== #90 N-axis shared-A + M-tail vs per-tile GotoGemm, m%6!=0 (cores={Environment.ProcessorCount}) ===");
+        CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
+        var shapes = new (string label, int m, int n, int k)[]
+        {
+            ("dit-qkv     256x3456x1152", 256, 3456, 1152),
+            ("dit-attnout 256x1152x1152", 256, 1152, 1152),
+            ("dit-mlp1    256x4608x1152", 256, 4608, 1152),
+            ("dit-qkv-L   256x4608x1536", 256, 4608, 1536),
+        };
+        foreach (var (label, m, n, k) in shapes)
+        {
+            var a = MakeRandom(m * k); var b = MakeRandom(k * n); var c = new float[m * n];
+            double flops = 2.0 * m * n * k, work = (double)m * n * k;
+            // Production GotoGemm path.
+            BlasManaged.s_disableGotoGemm = false; AxisSelector.ForceAxisForTest = null;
+            PackBothStrategy.s_allowNAxisMTail = false;
+            double gGoto = 0; for (int r = 0; r < 3; r++) gGoto = Math.Max(gGoto, flops / TimeMinGemm(a, b, c, m, n, k) / 1e9);
+            double relGoto = SpotCheck(a, b, c, m, n, k);
+            // N-axis + M-tail path (forced).
+            BlasManaged.s_disableGotoGemm = true; AxisSelector.ForceAxisForTest = ParallelismAxis.N;
+            PackBothStrategy.s_allowNAxisMTail = true;
+            PackBothStrategy.s_nAxisRunCount = 0;
+            double gNax = 0; for (int r = 0; r < 3; r++) gNax = Math.Max(gNax, flops / TimeMinGemm(a, b, c, m, n, k) / 1e9);
+            double relNax = SpotCheck(a, b, c, m, n, k);
+            long ran = PackBothStrategy.s_nAxisRunCount;
+            BlasManaged.s_disableGotoGemm = false; AxisSelector.ForceAxisForTest = null;
+            PackBothStrategy.s_allowNAxisMTail = false;
+            string ok = (relGoto < 1e-3 && relNax < 1e-3) ? "OK" : $"WRONG goto={relGoto:E1} nax={relNax:E1}";
+            string nax = ran > 0 ? "N-ran" : "N-FELLBACK";
+            Console.WriteLine($"  {label}: GotoGemm {gGoto,5:F0}  N-axis+tail {gNax,5:F0} GF/s  ({(gGoto > 0 ? gNax / gGoto : 0):F2}x)  {nax}  {ok}");
+        }
+    }
+
     /// <summary>Pin A/B/C and dispatch one GotoGemmFp32 GEMM — per-tile RunParallel or the shared-A path.
     /// The <c>fixed</c> lives inside this method so the timing lambda can capture only the managed arrays.</summary>
     private static unsafe void RunGoto(float[] a, float[] b, float[] c, int m, int n, int k, int mc, int nc, int kc, bool shared)
@@ -540,7 +580,10 @@ public static class AxisRoutingAbBench
             int r = rng.Next(m), col = rng.Next(n);
             double s = 0; for (int kk = 0; kk < k; kk++) s += (double)a[(long)r * k + kk] * b[(long)kk * n + col];
             double err = Math.Abs(c[(long)r * n + col] - s);
-            maxRel = Math.Max(maxRel, Math.Abs(s) > 1e-3 ? err / Math.Abs(s) : err);
+            // Floor the denominator at 1.0: for random [-0.5,0.5] inputs a K-deep dot is ~O(1-10),
+            // but cancellation can make |s|≈0 and inflate *relative* error on a result whose ABSOLUTE
+            // error is fp32-tiny. A real GEMM bug yields O(1)+ absolute error and still trips the gate.
+            maxRel = Math.Max(maxRel, err / Math.Max(Math.Abs(s), 1.0));
         }
         return maxRel;
     }
