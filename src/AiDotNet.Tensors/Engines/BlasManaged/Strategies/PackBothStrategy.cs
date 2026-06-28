@@ -895,10 +895,12 @@ internal static class PackBothStrategy
     /// PRIVATE per-thread buffer (its L2) and computes all M for that N-block with the panel
     /// kernel. This is the OpenBLAS macro-loop: no shared-L3 B contention (each thread's B is
     /// private) AND no redundant B-packing (each N-block's B packed exactly once) — the two
-    /// failure modes of the M-axis shared-B path and the 2D grid respectively. Gated to
-    /// m%mr==0 float (the M-tail-free case, e.g. FFN m=384); other shapes use the M-axis path.
+    /// failure modes of the M-axis shared-B path and the 2D grid respectively. The full Mr-stripes use
+    /// the packed panel kernel; when m % mr != 0 and <see cref="s_allowNAxisMTail"/> is enabled (#90), the
+    /// &lt;mr leftover tail rows are computed separately with a scalar ascending-k A/B readback. By default
+    /// (flag off) only m % mr == 0 reaches this path (e.g. FFN m=384) and there is no tail.
     /// Bit-identical: each C[ir,jc] tile reduces over k in ascending K-panel order; jc blocks
-    /// own disjoint C columns so no cross-thread write sync.
+    /// own disjoint C columns so no cross-thread write sync (the tail rows likewise — disjoint columns).
     /// </summary>
     private static unsafe void RunNAxisParallelUnsafe(
         float* aPtr, int aLen, int lda,

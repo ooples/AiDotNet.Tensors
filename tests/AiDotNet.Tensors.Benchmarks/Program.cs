@@ -126,13 +126,6 @@ class Program
             return;
         }
 
-        // #88 short-M cooperative shared-A (pack A once) vs per-tile RunParallel. (--ab-shared-a)
-        if (args[0] == "--ab-shared-a")
-        {
-            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.SharedASweep();
-            return;
-        }
-
         // #90 N-axis shared-A + M-tail (m%6!=0 DiT shapes) vs per-tile GotoGemm. (--ab-naxis-mtail)
         if (args[0] == "--ab-naxis-mtail")
         {

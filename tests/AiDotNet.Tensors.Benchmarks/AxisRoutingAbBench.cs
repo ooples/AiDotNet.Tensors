@@ -472,43 +472,6 @@ public static class AxisRoutingAbBench
         }
     }
 
-    /// <summary>#88 short-M cooperative shared-A A/B: GotoGemmFp32.RunParallel (per-tile PRIVATE A-pack,
-    /// re-packs each ic-block's A ~n/nc× for wide-N) vs RunParallelSharedA (pack A once, share it, parallelize
-    /// over N). PerfView blamed the redundant per-thread A-pack for 86% of LLC misses on the diffusion short-M
-    /// shapes. Direct calls + scalar spot-check (bit-exact expected). Run <c>--ab-shared-a</c>.</summary>
-    public static unsafe void SharedASweep()
-    {
-        Console.WriteLine($"=== #88 short-M shared-A vs per-tile RunParallel (cores={Environment.ProcessorCount}) ===");
-        CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
-        if (!GotoGemmFp32.IsAvailable) { Console.WriteLine("GotoGemmFp32 not available"); return; }
-        var shapes = new (string label, int m, int n, int k)[]
-        {
-            ("dit-qkv     256x3456x1152", 256, 3456, 1152),
-            ("dit-attnout 256x1152x1152", 256, 1152, 1152),
-            ("dit-mlp1    256x4608x1152", 256, 4608, 1152),
-            ("dit-mlp2    256x1152x4608", 256, 1152, 4608),
-            ("384x1024x1024 balanced   ", 384, 1024, 1024),
-            ("512x2048x2048 mid        ", 512, 2048, 2048),
-        };
-        foreach (var (label, m, n, k) in shapes)
-        {
-            var A = MakeRandom(m * k); var B = MakeRandom(k * n); var C = new float[m * n];
-            var (mc, nc, kcc) = GotoGemmFp32.ChooseParallelBlocks(m, n);
-            double flops = 2.0 * m * n * k, work = (double)m * n * k;
-            double gPar = 0, gShared = 0;
-            RunGoto(A, B, C, m, n, k, mc, nc, kcc, shared: false);
-            double relPar = SpotCheck(A, B, C, m, n, k);
-            for (int rep = 0; rep < 4; rep++)
-                gPar = Math.Max(gPar, flops / TimeMinAction(() => RunGoto(A, B, C, m, n, k, mc, nc, kcc, shared: false), work) / 1e9);
-            RunGoto(A, B, C, m, n, k, mc, nc, kcc, shared: true);
-            double relShared = SpotCheck(A, B, C, m, n, k);
-            for (int rep = 0; rep < 4; rep++)
-                gShared = Math.Max(gShared, flops / TimeMinAction(() => RunGoto(A, B, C, m, n, k, mc, nc, kcc, shared: true), work) / 1e9);
-            string ok = (relPar < 1e-3 && relShared < 1e-3) ? "OK" : $"WRONG par={relPar:E1} sh={relShared:E1}";
-            Console.WriteLine($"  {label}: per-tile {gPar,5:F0}  shared-A {gShared,5:F0} GF/s  ({(gPar > 0 ? gShared / gPar : 0):F2}x)  (mc={mc} nc={nc} kc={kcc})  {ok}");
-        }
-    }
-
     /// <summary>#90 A/B: the m=256 DiT shapes (m%6=4) are currently STUCK on the per-tile GotoGemm path
     /// because the shared-A N-axis path is gated m%6==0. This compares production (GotoGemm) vs the N-axis
     /// path with the new scalar M-tail (PackBothStrategy.s_allowNAxisMTail). N-axis = OpenBLAS's contiguous-
@@ -517,6 +480,7 @@ public static class AxisRoutingAbBench
     public static void NaxisMTailSweep()
     {
         Console.WriteLine($"=== #90 N-axis shared-A + M-tail vs per-tile GotoGemm, m%6!=0 (cores={Environment.ProcessorCount}) ===");
+        if (!GotoGemmFp32.IsAvailable) { Console.WriteLine("GotoGemmFp32 not available — the GotoGemm baseline would be a fallback path"); return; }
         CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
         var shapes = new (string label, int m, int n, int k)[]
         {
@@ -547,28 +511,6 @@ public static class AxisRoutingAbBench
             string nax = ran > 0 ? "N-ran" : "N-FELLBACK";
             Console.WriteLine($"  {label}: GotoGemm {gGoto,5:F0}  N-axis+tail {gNax,5:F0} GF/s  ({(gGoto > 0 ? gNax / gGoto : 0):F2}x)  {nax}  {ok}");
         }
-    }
-
-    /// <summary>Pin A/B/C and dispatch one GotoGemmFp32 GEMM — per-tile RunParallel or the shared-A path.
-    /// The <c>fixed</c> lives inside this method so the timing lambda can capture only the managed arrays.</summary>
-    private static unsafe void RunGoto(float[] a, float[] b, float[] c, int m, int n, int k, int mc, int nc, int kc, bool shared)
-    {
-        fixed (float* pa = a, pb = b, pc = c)
-        {
-            if (shared) GotoGemmFp32.RunParallelSharedA(pa, k, pb, n, pc, n, m, n, k, mc, nc, kc);
-            else GotoGemmFp32.RunParallel(pa, k, pb, n, pc, n, m, n, k, mc, nc, kc);
-        }
-    }
-
-    /// <summary>Min wall-time (seconds) of one <paramref name="work"/> call: warm then min-of-12 over
-    /// work-scaled iteration counts. Shared by the direct-call A/Bs.</summary>
-    private static double TimeMinAction(Action work, double flopWork)
-    {
-        int iters = flopWork > 2e9 ? 2 : flopWork > 5e8 ? 4 : 10;
-        for (int i = 0; i < 3 * iters; i++) work();
-        var sw = new Stopwatch(); double best = double.MaxValue;
-        for (int r = 0; r < 12; r++) { sw.Restart(); for (int i = 0; i < iters; i++) work(); sw.Stop(); best = Math.Min(best, sw.Elapsed.TotalSeconds / iters); }
-        return best;
     }
 
     /// <summary>Max relative error of C vs a double scalar reference over 60 random (row,col) samples.</summary>
