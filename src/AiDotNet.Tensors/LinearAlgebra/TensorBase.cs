@@ -28,6 +28,13 @@ internal interface IStreamingDroppable
     /// when the storage is still shared (refcount &gt; 1) — e.g. an autodiff
     /// tape capture during training — leaving the data resident for the peer.</summary>
     bool TryDropStorageForStreaming(bool throwOnSharedRefcount);
+
+    /// <summary>Re-serializes this tensor's CURRENT resident data into its streaming-pool entry
+    /// under the same handle, so a later drop + rehydrate returns the current (possibly mutated)
+    /// values rather than the stale snapshot taken at register time (#1715). Returns <c>false</c>
+    /// (no-op) when the weight isn't a resident, full-precision streaming weight. Call BEFORE
+    /// dropping a mutated streaming weight so the mutation is not lost.</summary>
+    bool TryWriteBackResidentForStreaming();
 }
 
 /// <summary>
@@ -535,6 +542,26 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         => TryDropStorageForStreaming(throwOnSharedRefcount);
 
     long IStreamingDroppable.StreamingPoolHandle => StreamingPoolHandle;
+
+    bool IStreamingDroppable.TryWriteBackResidentForStreaming() => TryWriteBackResidentForStreaming();
+
+    /// <summary>
+    /// Re-serializes this tensor's current resident data into its streaming-pool entry (#1715).
+    /// Native (full-precision) streaming weights only: a lossy store (bf16/int8/int4) is taken by
+    /// read-only inference and its owner is never mutated, so skip it; a non-resident / view / quant
+    /// tensor has nothing to write back. The new bytes overwrite the pool entry under the same handle
+    /// (marked dirty), so the next eviction persists them to disk and a later <c>Materialize</c>
+    /// rehydrates the mutation instead of the stale register-time snapshot.
+    /// </summary>
+    internal bool TryWriteBackResidentForStreaming()
+    {
+        if (StreamingPoolHandle < 0) return false;
+        if (StreamingStoreEncoding != StreamingEncoding.Native) return false;
+        if (DataVector.Length != Length) return false;            // already dropped / no-upcast quant
+        if (!IsContiguous || _storageOffset != 0 || IsView) return false;
+        // Streaming weights are concrete Tensor<T>; serialization needs the concrete type.
+        return this is Tensor<T> concrete && WeightRegistry.WriteBackResidentNative(concrete);
+    }
 
     /// <summary>
     /// Restores this tensor's data from a serialized byte buffer (produced

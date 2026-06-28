@@ -36,6 +36,18 @@ public static class WeightRegistry
     // drain. Written/read under _lock.
     private static readonly Dictionary<long, WeakReference<IStreamingDroppable>> _ownerByHandle = new();
 
+    // #1715: bound the set of streaming weights whose OWNER tensors hold resident _data at once.
+    // Materialize hands each weight a private resident copy; the pool only accounts ITS OWN byte[]
+    // snapshots, so without this a caller that materializes many weights and holds them (a
+    // GetParameters round-trip / Clone over a foundation-scale model) accumulates unbounded owner
+    // copies → OOM before the pool's snapshot-budget eviction ever fires. We track materialized
+    // owners in an LRU and, once their bytes exceed the budget, shed the coldest: write its current
+    // (possibly mutated) data back to the pool, then drop its resident copy. All under _lock.
+    private static readonly LinkedList<long> _materializedLru = new();           // MRU at front
+    private static readonly Dictionary<long, LinkedListNode<long>> _materializedNode = new();
+    private static readonly Dictionary<long, long> _materializedBytes = new();   // handle → owner-resident bytes
+    private static long _materializedResidentBytes;
+
     /// <summary>Replaces the active options; must be called before any
     /// <see cref="WeightLifetime.Streaming"/> / GpuOffload registration.
     /// Throws <see cref="InvalidOperationException"/> when the existing pool
@@ -552,6 +564,7 @@ public static class WeightRegistry
             {
                 _streamingPool?.Unregister(weight.StreamingPoolHandle);
                 _ownerByHandle.Remove(weight.StreamingPoolHandle);
+                UntrackMaterializedOwner(weight.StreamingPoolHandle); // #1715
                 weight.StreamingPoolHandle = -1;
             }
             if (weight.OffloadDevicePointer != IntPtr.Zero || weight.OffloadHostPointer != IntPtr.Zero)
@@ -1017,6 +1030,11 @@ public static class WeightRegistry
             // (a late RegisterWeight, or a background prefetch) since the last
             // drain, so their owners' resident _data doesn't linger.
             DrainOwnerDropsAfterEviction();
+            // #1715: a still-resident owner re-accessed here is hot — refresh its position in the
+            // materialized-owner LRU (and register it if a non-Materialize path made it resident) so
+            // it isn't shed while in use. Skip no-upcast quant (its fp _data is empty, not a copy).
+            if (weight.DataVector.Length == weight.Length)
+                NoteMaterializedAndShed(weight.StreamingPoolHandle, CheckedStreamingByteCount<T>(weight.Length));
             return;
         }
 
@@ -1094,6 +1112,105 @@ public static class WeightRegistry
         // resident set stays bounded (the just-materialized weight is protected
         // from eviction by RehydrateInto, so it's never in the drained set).
         DrainOwnerDropsAfterEviction();
+
+        // #1715: this weight now holds a resident owner copy. Track it and shed the coldest
+        // materialized owners if the concurrently-held owner set exceeds the budget — bounding the
+        // resident set for a caller (parameter round-trip / Clone) that materializes many weights and
+        // holds them all, which would otherwise OOM (the pool only accounts its own snapshots).
+        NoteMaterializedAndShed(weight.StreamingPoolHandle, CheckedStreamingByteCount<T>(weight.Length));
+    }
+
+    /// <summary>
+    /// Re-serializes a resident, native-encoded streaming weight's CURRENT data into its pool entry
+    /// under the same handle (#1715). Called by <see cref="Tensor{T}.TryWriteBackResidentForStreaming"/>
+    /// before a mutated weight is dropped, so the mutation reaches disk and a later
+    /// <see cref="Materialize{T}"/> rehydrates it rather than the stale register-time snapshot.
+    /// </summary>
+    internal static bool WriteBackResidentNative<T>(Tensor<T> weight)
+    {
+        if (weight is null) throw new ArgumentNullException(nameof(weight));
+        if (weight.StreamingPoolHandle < 0) return false;
+        if (weight.DataVector.Length != weight.Length) return false;
+        int byteCount = CheckedStreamingByteCount<T>(weight.Length);
+        var bytes = new byte[byteCount];
+        SerializeToBytes(weight, bytes, StreamingEncoding.Native, stochastic: false);
+        StreamingTensorPool pool;
+        lock (_lock) { pool = StreamingPoolUnlocked(); }
+        pool.ReplaceEntryData(weight.StreamingPoolHandle, bytes);
+        return true;
+    }
+
+    // #1715: budget for concurrently-materialized owner copies. Half the pool's resident cap so the
+    // owner copies + the pool's own snapshot working set stay comfortably under the total budget the
+    // streaming model was sized against. Zero/absent cap → no bounding (degrades to prior behavior).
+    private static long MaterializedOwnerBudget()
+    {
+        long cap;
+        lock (_lock) { cap = StreamingPoolUnlocked().MaxResidentBytes; }
+        return cap > 0 ? cap / 2 : long.MaxValue;
+    }
+
+    private static void NoteMaterializedAndShed(long handle, long ownerBytes)
+    {
+        if (handle < 0 || ownerBytes <= 0) return;
+        long budget = MaterializedOwnerBudget();
+
+        lock (_lock)
+        {
+            // Add or move-to-front (MRU).
+            if (_materializedNode.TryGetValue(handle, out var existing))
+            {
+                _materializedLru.Remove(existing);
+                _materializedLru.AddFirst(existing);
+            }
+            else
+            {
+                var node = _materializedLru.AddFirst(handle);
+                _materializedNode[handle] = node;
+                _materializedBytes[handle] = ownerBytes;
+                _materializedResidentBytes += ownerBytes;
+            }
+
+            // Shed the coldest materialized owners until back under budget. Keep at least the
+            // just-added MRU entry resident (the caller is using it right now).
+            while (_materializedResidentBytes > budget && _materializedLru.Count > 1)
+            {
+                var tail = _materializedLru.Last;
+                if (tail is null) break;
+                long victim = tail.Value;
+                _materializedLru.RemoveLast();
+                _materializedNode.Remove(victim);
+                _materializedBytes.TryGetValue(victim, out long victimBytes);
+                _materializedBytes.Remove(victim);
+                _materializedResidentBytes -= victimBytes;
+
+                // Resolve the owner OUTSIDE the eventual drop's heavy work but still under _lock —
+                // the owner-drop + write-back only touch the tensor + pool, not the registry maps.
+                if (_ownerByHandle.TryGetValue(victim, out var weak) && weak.TryGetTarget(out var owner))
+                {
+                    // Persist the (possibly mutated) data, then drop the resident copy. Order matters:
+                    // write-back FIRST so the dropped bytes are recoverable from the pool/disk.
+                    try { owner.TryWriteBackResidentForStreaming(); }
+                    catch { /* best-effort: a non-native/aliased owner just stays resident */ }
+                    try { owner.TryDropStorageForStreaming(throwOnSharedRefcount: false); }
+                    catch { /* shared refcount → leave resident; bounding is best-effort, never corrupting */ }
+                }
+            }
+        }
+    }
+
+    // #1715: stop tracking a handle as a materialized owner (it was released / unregistered).
+    private static void UntrackMaterializedOwner(long handle)
+    {
+        if (handle < 0) return;
+        if (_materializedNode.TryGetValue(handle, out var node))
+        {
+            _materializedLru.Remove(node);
+            _materializedNode.Remove(handle);
+            _materializedBytes.TryGetValue(handle, out long bytes);
+            _materializedBytes.Remove(handle);
+            _materializedResidentBytes -= bytes;
+        }
     }
 
     /// <summary>
@@ -1127,6 +1244,9 @@ public static class WeightRegistry
         // residency, never correctness.
         bool dropped = weight.TryDropStorageForStreaming(throwOnSharedRefcount: false);
         weight.StreamingDropDeferred = !dropped;
+        // #1715: the owner copy is gone — stop counting it against the materialized-owner budget.
+        if (dropped)
+            lock (_lock) { UntrackMaterializedOwner(weight.StreamingPoolHandle); }
     }
 
     /// <summary>
@@ -1730,6 +1850,11 @@ public static class WeightRegistry
             _offloadAllocator?.Dispose();
             _offloadAllocator = null;
             _ownerByHandle.Clear();
+            // #1715: reset the materialized-owner tracker with the pool.
+            _materializedLru.Clear();
+            _materializedNode.Clear();
+            _materializedBytes.Clear();
+            _materializedResidentBytes = 0;
             // Drop any straggler in-flight markers (a worker that timed out the
             // drain above). Leaving them would suppress the NEXT pool's prefetch
             // of a reused handle id (dedup sees it as "already in-flight").
@@ -1795,6 +1920,13 @@ public static class WeightRegistry
             // storage, which a registered weight never is — guarded anyway.
             if (owner is not null && owner.StreamingPoolHandle == handle)
             {
+                // #1715: the pool just paged out this handle's snapshot taken at register time. If the
+                // owner MUTATED its resident copy since (a GetParameters round-trip / optimizer step),
+                // that snapshot is stale — write the owner's CURRENT bytes back BEFORE dropping so a
+                // later Materialize rehydrates the mutation, not the stale value. Native-gated inside
+                // TryWriteBackResidentForStreaming, so read-only inference (bf16/quant store) is a no-op.
+                try { owner.TryWriteBackResidentForStreaming(); }
+                catch { /* best-effort write-back; never block the drop */ }
                 try { owner.TryDropStorageForStreaming(throwOnSharedRefcount: false); }
                 catch (InvalidOperationException) { /* not droppable (view/non-contiguous) — leave resident */ }
             }

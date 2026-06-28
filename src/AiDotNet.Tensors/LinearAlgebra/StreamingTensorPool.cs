@@ -144,6 +144,12 @@ public sealed class StreamingTensorPool : IDisposable
     /// triggering eviction.</summary>
     public long ResidentBytes => Interlocked.Read(ref _residentBytes);
 
+    /// <summary>The configured resident-byte budget (<see cref="GpuOffloadOptions.StreamingPoolMaxResidentBytes"/>).
+    /// Exposed so callers that hold their OWN resident copies of pool-registered weights (e.g. a
+    /// parameter round-trip that materializes many weights at once, #1715) can bound their concurrent
+    /// resident set against the same budget the pool uses for its byte[] snapshots.</summary>
+    public long MaxResidentBytes => _maxResidentBytes;
+
     /// <summary>Number of entries currently resident in the working set.
     /// Excludes entries that have been paged out to the backing store.</summary>
     public int ResidentEntryCount
