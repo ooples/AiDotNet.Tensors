@@ -126,6 +126,13 @@ class Program
             return;
         }
 
+        // #88 short-M cooperative shared-A (pack A once) vs per-tile RunParallel. (--ab-shared-a)
+        if (args[0] == "--ab-shared-a")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.SharedASweep();
+            return;
+        }
+
         // #85 CCX pool (barriers) vs RunParallel (barrier-free) on balanced shapes. (--ab-ccx-vs-rp)
         if (args[0] == "--ab-ccx-vs-rp")
         {
