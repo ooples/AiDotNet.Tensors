@@ -282,6 +282,67 @@ public sealed class StreamingTensorPool : IDisposable
     }
 
     /// <summary>
+    /// Replaces an existing entry's bytes IN PLACE under the same handle and marks it
+    /// dirty so the next eviction re-writes the new bytes to the backing file. Used by
+    /// the write-back-on-owner-drop path (#1715): when a streaming weight's resident
+    /// owner copy was MUTATED (e.g. a GetParameters round-trip or an optimizer step
+    /// writes into the rehydrated tensor), the pool's snapshot + disk slice are stale.
+    /// Calling this with the owner's current bytes makes the entry resident again with
+    /// the fresh content, so dropping the owner's copy can't lose the mutation — a later
+    /// <see cref="Rehydrate(long)"/> reads the written value back. Re-accounts resident
+    /// bytes (the new buffer may differ in size from the old, e.g. variable-size lossless)
+    /// and re-runs the budget check so the freshly-resident bytes get paged back to disk
+    /// under pressure. No-op for an unknown handle.
+    /// </summary>
+    public void ReplaceEntryData(long handleId, byte[] newData)
+    {
+        if (newData is null) throw new ArgumentNullException(nameof(newData));
+        lock (_lock)
+        {
+            ThrowIfDisposed();
+            if (!_entries.TryGetValue(handleId, out var entry)) return;
+
+            long oldResident = entry.Data?.Length ?? 0;
+            entry.Data = newData;
+            entry.ResidentBytes = newData.Length;
+            // The new bytes have NOT been written to the backing file, so force the
+            // next eviction to (re-)write them rather than dropping the resident copy
+            // as if the file already held it. Also reset the compressed/uncompressed
+            // metadata: the caller supplies the canonical (native-encoded) bytes, so a
+            // prior compressed page-out's sizes no longer describe this content.
+            entry.BackingFileCurrent = false;
+            entry.IsCompressed = false;
+            entry.UncompressedBytes = newData.Length;
+
+            // Net resident delta: the new buffer replaces whatever was resident before
+            // (which is 0 when the entry was paged out). Keep _residentBytes exact so
+            // the budget check below — and every future one — stays correct.
+            long delta = newData.Length - oldResident;
+            if (delta != 0)
+            {
+                Interlocked.Add(ref _residentBytes, delta);
+                long peak = Interlocked.Read(ref _residentBytesPeak);
+                long current = Interlocked.Read(ref _residentBytes);
+                if (current > peak) Interlocked.Exchange(ref _residentBytesPeak, current);
+            }
+
+            // The entry is resident again — make sure it's in the LRU so eviction can
+            // page it back to disk (carrying the new bytes) under budget pressure.
+            if (!_lruIndex.TryGetValue(handleId, out var node))
+            {
+                node = _lruOrder.AddFirst(handleId);
+                _lruIndex[handleId] = node;
+            }
+            else
+            {
+                _lruOrder.Remove(node);
+                _lruOrder.AddFirst(node);
+            }
+            EvictIfOverBudget();
+        }
+    }
+
+    /// <summary>
     /// Supplies the repeating per-step handle access order so eviction can use
     /// Belady-optimal selection (evict the entry whose next use is furthest) instead
     /// of LRU. For a transformer this is forward layers 0..N then backward N..0 — a
