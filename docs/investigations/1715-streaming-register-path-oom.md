@@ -73,3 +73,50 @@ fix to fully land:
    Oracle = no OOM AND the ramp value-check passes (write-back correctness).
 4. Also re-run the `Step-Sync` (StepVideo) + `03b` (ControlNetFlux Clone) OOMs — same foundation-scale
    full-materialization family; this fix likely helps them too.
+
+---
+
+## MEASURED CORRECTION (supersedes the deferred-drop hypothesis above)
+
+Instrumented `WeightRegistry.GetStreamingReport()` during enumeration (AiDotNet side, no Tensors
+rebuild — the engage+register wiring was enough to engage streaming on 0.104.6). Two probes:
+
+**Read pass** (enumerate + read `chunk.Length` only): resident pinned at the **8 GB cap**,
+evictions climb 0→519, 23.6 GB written to disk, reaches ~chunk 900 / ~31 GB. **No OOM** — it *times
+out* (~10 min for one pass; disk-bound). So the pool's snapshot eviction works; the deferred-drop
+hypothesis is **disproven**.
+
+**Write pass** (`chunk.Data.Span[i] = …`, exactly as `AssertParameterChunksRoundTrip`):
+| chunk | residentMB | evictions | diskWriteMB |
+|------|-----------|-----------|-------------|
+| 50  | 1489 | 0 | 0 |
+| 100 | 3361 | 0 | 0 |
+| 150 | 5090 | 0 | 0 |
+| 200 | 6746 | **0** | **0** |
+→ **OOM ~chunk 230**, before the 8 GB snapshot-eviction trigger ever fires.
+
+### The real mechanism
+`chunk.Data.Span` triggers `WeightRegistry.Materialize` → `RehydrateInto` returns a **caller-owned
+copy** that `RestoreStorageFromBytes` installs as the tensor's `_data`. That owner `_data` copy is
+**not counted in the pool's `_residentBytes`** (only the pool's own `entry.Data` snapshot is). The
+eviction trigger (`EvictIfOverBudget`, gated on `_residentBytes` ≥ cap) therefore never sees the
+owner copies — they accumulate one-per-written-chunk (held live by each layer's `_weights`) until the
+process OOMs, well before the snapshot budget is reached (evictions=0 at 6.7 GB resident).
+
+### The fix (real, load-bearing — streaming core)
+1. **Account owner-resident bytes.** When `Materialize` restores an owner's `_data`, the pool must
+   include that in the resident budget (or page out its own redundant `entry.Data` AND track the
+   owner copy) so `EvictIfOverBudget` fires and `_pendingOwnerDrops` / `DrainOwnerDropsAfterEviction`
+   sheds cold owners' `_data` under pressure — exactly the bounding the read path already gets.
+2. **Dirty write-back on owner-drop.** A test-written (mutated) owner copy is dirty vs the pool
+   snapshot; owner-drop must re-snapshot (write-back) before freeing `_data`, or the round-trip's
+   verify pass reads stale (pre-write) values. (`Span` writes likely bypass the `MarkDirty` hooks on
+   `Matrix`/`MatrixBase`, so dirty-tracking on the rehydrated-then-mutated path needs wiring.)
+
+### Plus: inherent speed
+Even fully memory-bounded, a 31 GB model round-trip streams ~70 GB across 3 passes ≈ 30 min →
+exceeds the per-test timeout. Once memory-safe, these foundation-scale contract tests warrant a
+longer timeout / `HeavyTimeout` (matches #1709) — the #1715 footprint concern is then satisfied.
+
+This is the streaming path used by every >500M-param model's inference+training, so the accounting +
+write-back change must be made carefully and validated with the two-repo loop before merge.
