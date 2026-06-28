@@ -38520,7 +38520,29 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual void InvalidatePersistentTensor<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
-        // No-op on CPU
+
+        // CPU derived-weight cache invalidation (#1711). The CPU fast paths cache
+        // forms DERIVED from a weight array — the small-N conv path's transposed
+        // kernel (GetOrBuildTransposedKernel) and the GEMM pre-packed-B panels —
+        // keyed by the weight array's identity + a per-array mutation version
+        // (SimdGemm.WeightArrayVersionOf). Those caches are only correct as long as
+        // every IN-PLACE mutation of the weight array bumps that version. Callers
+        // signal an in-place weight change by calling THIS method (e.g.
+        // ConvolutionalLayer.SetParameters copies new kernel values into the existing
+        // _kernels buffer and then calls InvalidatePersistentTensor), so a CPU no-op
+        // here left the derived caches stale: after SetParameters the conv small-N
+        // path kept transposing the PRE-mutation kernel, so a model loaded/cloned via
+        // SetParameters produced different output than the source even though its
+        // GetParameters() was byte-identical (a diffusion Clone-determinism bug class).
+        // Mark the backing array dirty so the next consume rebuilds from live bytes.
+        // GetLiveBackingArrayOrNull returns the backing array only for a simple
+        // contiguous-at-offset-0 layout — exactly the array the conv/GEMM fast paths
+        // key their caches on (they consume kernel.Contiguous().GetDataArray()); it
+        // returns null for view/lazy/GPU layouts, which never own a persistent
+        // per-array cache entry, so skipping them is correct.
+        var backing = tensor.GetLiveBackingArrayOrNull();
+        if (backing is not null)
+            AiDotNet.Tensors.Engines.Simd.SimdGemm.MarkWeightDirty(backing);
     }
 
     #endregion
