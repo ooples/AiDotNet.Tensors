@@ -120,3 +120,31 @@ longer timeout / `HeavyTimeout` (matches #1709) — the #1715 footprint concern 
 
 This is the streaming path used by every >500M-param model's inference+training, so the accounting +
 write-back change must be made carefully and validated with the two-repo loop before merge.
+
+---
+
+## DEFINITIVE CONCLUSION — streaming round-trip is the wrong tool for these tests
+
+Pursuing the memory fix to the end surfaced three independent blockers that together mean
+`{Flux2,SiT,FluxDoubleStream}_GetSetParameters_RoundTrips` **cannot be made green by streaming** at
+their default foundation scale (Flux2 = 6.5 B params / ~31 GB):
+
+1. **Precision vs exact-equality.** The round-trip asserts `span[i] == expected` exactly. The
+   streaming store often uses **bf16** (`ResolveStoreEncoding` / `StreamingStoreDtype` policy), which
+   is lossy — a bf16 page-out → rehydrate returns a rounded value, so the exact assert fails *even
+   with perfect memory bounding + write-back*. Lossless-only streaming would avoid this but is not the
+   default and doesn't help the runtime blocker.
+2. **Runtime.** Even fully memory-bounded, the round-trip streams ~70 GB across 3 passes to/from disk
+   ≈ 30 min — far over the per-test timeout.
+3. **Invariant friction.** Write-back of a mutated entry re-writes a backing-file slice, which the
+   pool's append-only + zero-copy-mmap design assumes never happens — so a correct write-back needs to
+   coordinate with (or disable) those for the mutated-resident case.
+
+**Recommended resolution (matches the #1709 precedent):** treat these as foundation-scale contract
+tests that don't fit the 16 GB default gate — keep the AiDotNet read-path memory wiring (so
+construction/read don't OOM-crash) and exclude them from the default gate via `HeavyTimeout` (or have
+the test exercise the get/set *framing* without a full 31 GB exact-value round-trip). The general
+streaming improvement (owner-resident accounting + owner-side write-back, built on the
+`ReplaceEntryData` primitive added here) remains worthwhile for real training/inference on
+foundation-scale models, but it is a separate, multi-day, design-reviewed feature — NOT a fix that
+makes these exact-equality round-trip tests pass.
