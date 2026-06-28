@@ -31,6 +31,9 @@ public class GotoGemmBf16FusionTests
         return a;
     }
 
+#if NET5_0_OR_GREATER
+    // GotoGemmFp32.RunParallelBf16/RunParallel are net5+-only (the machine-code path); on net471 the
+    // direct-call bf16 test is excluded (GotoGemmFp32.IsAvailable is false there anyway).
     private static unsafe float[] GemmDirect(float[] a, float[] b, int m, int n, int k, bool bf16)
     {
         var c = new float[(long)m * n];
@@ -42,6 +45,7 @@ public class GotoGemmBf16FusionTests
         }
         return c;
     }
+#endif
 
     private static unsafe float[] GemmManaged(float[] a, float[] b, int m, int n, int k, in BlasOptions<float> opts)
     {
@@ -50,6 +54,7 @@ public class GotoGemmBf16FusionTests
         return c;
     }
 
+#if NET5_0_OR_GREATER
     [SkippableFact]
     public void Bf16Kernel_LargeBandwidthShape_WithinBf16Tolerance()
     {
@@ -76,6 +81,7 @@ public class GotoGemmBf16FusionTests
         // And it MUST differ from exact fp32 — proves the bf16 kernel actually ran (not silently fp32).
         Assert.True(maxDiff > 1e-5, $"bf16-B did not change the result: maxDiff={maxDiff:E3}");
     }
+#endif
 
     [SkippableFact]
     public void FusedEpilogue_OnLargeGotoGemmShape_MatchesUnfusedThenBiasActivation()
