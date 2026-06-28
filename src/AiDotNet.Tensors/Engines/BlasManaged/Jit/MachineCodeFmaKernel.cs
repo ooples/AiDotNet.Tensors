@@ -17,6 +17,11 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// </summary>
 internal static class MachineCodeFmaKernel
 {
+    // #475 Phase-0 A/B knob: K-unroll factor for the FP32 6×16 panel loop. OpenBLAS's Zen sgemm
+    // kernel unrolls 8; ours shipped 4. Baked at emit time — change requires re-emitting the
+    // panel/macro kernels (MachineKernelGemm.ResetFp32Kernels). Default 4 until A/B confirms 8.
+    internal static int PanelKUnroll = 4;
+
     /// <summary>Emit the Windows-x64 12-accumulator FP64 FMA loop. Returns the machine-code bytes.</summary>
     internal static byte[] EmitFp64x12Windows()
     {
@@ -427,6 +432,99 @@ internal static class MachineCodeFmaKernel
         return asm.ToArray();
     }
 
+    // ── #475 macro-kernel: the whole Mr-sweep in machine code ──────────────────
+    // Takes RyuJIT off the hot path. One call does numMr Mr-blocks × njr N-tiles × kc K-steps
+    // for one K-panel, reusing the same packed-B across Mr-blocks (B stays hot, no managed
+    // per-Mr-block call / span construction). Signature (both ABIs, via delegate* unmanaged):
+    //   (float* aBase, float* bBase, float* cBase, long ldc, long kc, long njr,
+    //    long numMr, long aStrideBytes)
+    // where aStrideBytes = effKc*Mr*4 (the byte gap between packed-A Mr-stripes), and cBase
+    // advances by Mr*ldc*4 (6 rows) per Mr-block. Bit-identical to the per-Mr-block panel path
+    // (same per-tile FMA order; C tiles disjoint; K accumulates ascending).
+    internal static byte[] EmitFp32_6x16_MacroWindows()
+    {
+        const int RCX = 1, RDX = 2, R8 = 8, R9 = 9, R10 = 10, R11 = 11, RAX = 0,
+                  RSI = 6, RDI = 7, RBX = 3, RBP = 5, R12 = 12, R13 = 13, R14 = 14, R15 = 15, RSP = 4;
+        var asm = new X64Assembler();
+        // Read stack args BEFORE growing rsp (Windows: arg5 @ +0x28 .. arg8 @ +0x40).
+        asm.MovRegFromRsp(R10, 0x28);  // r10 = kc
+        asm.MovRegFromRsp(RAX, 0x30);  // rax = njr
+        asm.MovRegFromRsp(R11, 0x38);  // r11 = numMr
+        // Preserve nonvolatiles used by the macro wrapper + panel body.
+        asm.PushReg(RSI); asm.PushReg(RDI); asm.PushReg(RBX); asm.PushReg(RBP);
+        asm.PushReg(R12); asm.PushReg(R13); asm.PushReg(R14); asm.PushReg(R15);
+        asm.SubRsp(0xA0); // frame to save xmm6–15 (panel body uses ymm6–15)
+        for (int i = 0; i < 10; i++) asm.VmovupsXmmStoreD32(RSP, i * 0x10, 6 + i);
+        // arg8 aStrideBytes: entry [rsp+0x40] shifted by 8 pushes (0x40) + 0xA0 frame → [rsp+0x120].
+        asm.MovRegFromRspD32(RDI, 0x40 + 0x40 + 0xA0); // rdi = aStrideBytes
+        // Masters.
+        asm.MovRegReg(RSI, RCX);   // rsi = A-base master
+        asm.MovRegReg(R14, RDX);   // r14 = B-base master
+        asm.MovRegReg(R15, R8);    // r15 = C-base master
+        asm.MovRegReg(RBX, R11);   // rbx = numMr counter
+        asm.MovRegReg(RBP, RAX);   // rbp = njr master
+        asm.MovRegReg(R12, R10);   // r12 = kc
+        asm.LeaRaxIndexScale4(R9); // rax = ldc*4 (row stride); r9 = ldc preserved
+
+        EmitMacroPanelLoop_Fp32_6x16(asm);
+
+        for (int i = 0; i < 10; i++) asm.VmovupsXmmLoadD32(6 + i, RSP, i * 0x10);
+        asm.AddRsp(0xA0);
+        asm.PopReg(R15); asm.PopReg(R14); asm.PopReg(R13); asm.PopReg(R12);
+        asm.PopReg(RBP); asm.PopReg(RBX); asm.PopReg(RDI); asm.PopReg(RSI);
+        asm.Vzeroupper(); asm.Ret();
+        return asm.ToArray();
+    }
+
+    internal static byte[] EmitFp32_6x16_MacroSysV()
+    {
+        const int RCX = 1, RDX = 2, R8 = 8, R9 = 9, R10 = 10, R11 = 11,
+                  RSI = 6, RDI = 7, RBX = 3, RBP = 5, R12 = 12, R13 = 13, R14 = 14, R15 = 15;
+        var asm = new X64Assembler();
+        // SysV args: rdi=A, rsi=B, rdx=C, rcx=ldc, r8=kc, r9=njr, [rsp+8]=numMr, [rsp+0x10]=aStrideBytes.
+        asm.MovRegFromRsp(R10, 0x08);  // r10 = numMr
+        asm.MovRegFromRsp(R11, 0x10);  // r11 = aStrideBytes
+        asm.PushReg(RBX); asm.PushReg(RBP); asm.PushReg(R12); asm.PushReg(R13); asm.PushReg(R14); asm.PushReg(R15);
+        // Shuffle into the canonical layout (rsi/rdi/rax are volatile on SysV).
+        asm.MovRegReg(R14, RSI);   // r14 = B   (rsi held B)
+        asm.MovRegReg(RSI, RDI);   // rsi = A   (rdi held A)
+        asm.MovRegReg(R15, RDX);   // r15 = C
+        asm.MovRegReg(RDI, R11);   // rdi = aStrideBytes
+        asm.MovRegReg(RBX, R10);   // rbx = numMr
+        asm.MovRegReg(RBP, R9);    // rbp = njr
+        asm.MovRegReg(R12, R8);    // r12 = kc
+        asm.MovRegReg(R9, RCX);    // r9 = ldc
+        asm.LeaRaxIndexScale4(R9); // rax = ldc*4
+
+        EmitMacroPanelLoop_Fp32_6x16(asm);
+
+        asm.PopReg(R15); asm.PopReg(R14); asm.PopReg(R13); asm.PopReg(R12); asm.PopReg(RBP); asm.PopReg(RBX);
+        asm.Vzeroupper(); asm.Ret();
+        return asm.ToArray();
+    }
+
+    /// <summary>Outer Mr-loop wrapping the panel tile-loop. Assumes rsi=A-base, r14=B-base,
+    /// r15=C-base, rbx=numMr, rbp=njr, r12=kc, rdi=aStrideBytes, rax=ldc*4, r9=ldc. EmitPanelLoop
+    /// touches none of rsi/r14/r15/rbx/rbp/rdi/r9, so the masters survive each tile sweep.</summary>
+    private static void EmitMacroPanelLoop_Fp32_6x16(X64Assembler asm)
+    {
+        const int RDX = 2, R8 = 8, R13 = 13, RSI = 6, RDI = 7, RBX = 3, RBP = 5, R14 = 14, R15 = 15, RAX = 0;
+        int macroDone = asm.NewLabel();
+        asm.TestRegSelf(RBX);          // numMr == 0 → nothing to do
+        asm.JzLabel32(macroDone);
+        int mrLoop = asm.NewLabel();
+        asm.MarkLabel(mrLoop);
+        asm.MovRegReg(RDX, R14);       // B = base (panel advances rdx through the tiles)
+        asm.MovRegReg(R8, R15);        // C = this Mr-block's base (panel advances r8)
+        asm.MovRegReg(R13, RBP);       // njr counter = master (panel decrements r13)
+        EmitPanelLoop_Fp32_6x16(asm);  // numMr-th Mr-block: njr tiles × kc K-steps
+        asm.AddRegReg(RSI, RDI);       // A-base += aStrideBytes (next packed-A Mr-stripe)
+        for (int r = 0; r < 6; r++) asm.AddRegReg(R15, RAX); // C-base += Mr(6) × ldc*4 rows
+        asm.DecReg(RBX);
+        asm.JnzLabel32(mrLoop);
+        asm.MarkLabel(macroDone);
+    }
+
     /// <summary>Register-level FP32 6×16 panel loop. Assumes rsi=A-base, r12=kc, r13=njr,
     /// rax=ldc*4 (row stride bytes), r8=C, r9=ldc; clobbers ymm0–15, rcx, rdx, r10, r11,
     /// advances r8/r13/rdx; rsi/r12/rax preserved across iterations. ABI-agnostic.</summary>
@@ -461,7 +559,7 @@ internal static class MachineCodeFmaKernel
 
         int store = asm.NewLabel();
         int ktail = asm.NewLabel();
-        const int U = 4; // K-unroll factor
+        int U = Math.Max(1, PanelKUnroll); // K-unroll factor (#475 A/B knob; OpenBLAS uses 8)
 
         // Tuned prefetch distance for the next packed-B stripe (bytes ahead of rdx). 512 B = 8
         // cache lines ≈ one Nr=16 tile's worth of K-steps ahead — far enough to hide the L2→L1
@@ -482,7 +580,7 @@ internal static class MachineCodeFmaKernel
         // prefetching A is pure redundant load-port traffic (PR #656: A+B −14%, B-only −2% in
         // the single-tile kernel). Here B is cold for the NEXT tile in the panel macro-loop, so
         // it's a real win. Pure hint, bit-exact.
-        asm.CmpRegImm8(R10, U);
+        asm.CmpRegImm8(R10, (sbyte)U);
         asm.JlLabel32(ktail);          // kc < U → straight to the 1-step tail
         int kmain = asm.NewLabel();
         asm.MarkLabel(kmain);
@@ -497,15 +595,17 @@ internal static class MachineCodeFmaKernel
             for (int r = 0; r < Mr; r++)
             {
                 int areg = (r % 2 == 0) ? A0 : A1;
-                asm.VbroadcastSs(areg, RCX, (sbyte)(ku * Mr * 4 + r * 4)); // max 3*24+20=92 → disp8
+                int aOff = ku * Mr * 4 + r * 4;   // U=4 max 92 → disp8; U=8 max 188 → disp32
+                if (aOff <= 127) asm.VbroadcastSs(areg, RCX, (sbyte)aOff);
+                else asm.VbroadcastSsD32(areg, RCX, aOff);
                 asm.Vfmadd231ps(2 * r, areg, BLO);
                 asm.Vfmadd231ps(2 * r + 1, areg, BHI);
             }
         }
-        asm.AddRegImm32(RCX, U * Mr * 4);  // A += 24 floats
-        asm.AddRegImm32(RDX, U * Nr * 4);  // B += 64 floats
+        asm.AddRegImm32(RCX, U * Mr * 4);  // A += U*6 floats
+        asm.AddRegImm32(RDX, U * Nr * 4);  // B += U*16 floats
         asm.SubRegImm8(R10, (sbyte)U);
-        asm.CmpRegImm8(R10, U);
+        asm.CmpRegImm8(R10, (sbyte)U);
         asm.JlLabel32(ktail);          // remaining < U → tail
         asm.JmpLabel32(kmain);         // else another unrolled round
 
@@ -696,7 +796,7 @@ internal static class MachineCodeFmaKernel
         int rem = asm.NewLabel();
         int store = asm.NewLabel();
         asm.MarkLabel(cond);
-        asm.CmpRegImm8(R10, U);
+        asm.CmpRegImm8(R10, (sbyte)U);
         asm.JlLabel32(rem);
         for (int s = 0; s < U; s++)
         {

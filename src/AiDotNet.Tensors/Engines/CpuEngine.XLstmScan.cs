@@ -98,12 +98,17 @@ public partial class CpuEngine
     {
         int hh = headDim * headDim;
         double kappa = 1.0 / Math.Sqrt(headDim);
-        var C = new double[hh];
-        var n = new double[headDim];
-        for (int b = 0; b < batch; b++)
+        // Each (batch, head) pair is independent (private state/scratch, disjoint outputs); parallelize
+        // lock-free over the combined (b*numHeads) axis. See GlaForwardDouble.
+        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, (bhStart, bhCount) =>
         {
-            for (int h = 0; h < numHeads; h++)
+            var C = new double[hh];
+            var n = new double[headDim];
+            int bhEnd = bhStart + bhCount;
+            for (int bh = bhStart; bh < bhEnd; bh++)
             {
+                int b = bh / numHeads;
+                int h = bh % numHeads;
                 Array.Clear(C, 0, hh);
                 Array.Clear(n, 0, headDim);
                 int hOff = h * headDim;
@@ -134,7 +139,7 @@ public partial class CpuEngine
                     }
                 }
             }
-        }
+        });
     }
 
     private static void XLstmBackwardDouble(
@@ -144,23 +149,24 @@ public partial class CpuEngine
     {
         int hh = headDim * headDim;
         double kappa = 1.0 / Math.Sqrt(headDim);
-        var Ctraj = new double[seqLen * hh];        // pre-update C entering step t
-        var ntraj = new double[seqLen * headDim];   // pre-update n entering step t
-        var C = new double[hh];
-        var n = new double[headDim];
-        var dC = new double[hh];
-        var dN = new double[headDim];
-        var dKS = new double[headDim];
-        // Hoisted out of the reverse-time loop below: a fresh new[] per timestep
-        // would create O(batch·heads·seqLen) allocations in this hot backward
-        // kernel. Both are fully overwritten each step before being read.
-        var dCp = new double[hh];
-        var dNp = new double[headDim];
-
-        for (int b = 0; b < batch; b++)
+        // Lock-free over the independent (b*numHeads) axis with per-chunk scratch; see GlaBackwardDouble.
+        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, (bhStart, bhCount) =>
         {
-            for (int h = 0; h < numHeads; h++)
+            var Ctraj = new double[seqLen * hh];        // pre-update C entering step t
+            var ntraj = new double[seqLen * headDim];   // pre-update n entering step t
+            var C = new double[hh];
+            var n = new double[headDim];
+            var dC = new double[hh];
+            var dN = new double[headDim];
+            var dKS = new double[headDim];
+            // Both dCp/dNp are fully overwritten each step before being read (per-step scratch).
+            var dCp = new double[hh];
+            var dNp = new double[headDim];
+            int bhEnd = bhStart + bhCount;
+            for (int bh = bhStart; bh < bhEnd; bh++)
             {
+                int b = bh / numHeads;
+                int h = bh % numHeads;
                 int hOff = h * headDim;
 
                 // Forward recompute, saving the pre-update C/n entering each step.
@@ -284,7 +290,7 @@ public partial class CpuEngine
                     Array.Copy(dNp, 0, dN, 0, headDim);
                 }
             }
-        }
+        });
     }
 
     // ── Generic-T path ───────────────────────────────────────────────────────────────────
@@ -297,12 +303,15 @@ public partial class CpuEngine
         T kappa = ops.FromDouble(1.0 / Math.Sqrt(headDim));
         T clamp = ops.FromDouble(XLstmIGateClamp);
         T one = ops.One;
-        var C = new T[hh];
-        var n = new T[headDim];
-        for (int b = 0; b < batch; b++)
+        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, (bhStart, bhCount) =>
         {
-            for (int h = 0; h < numHeads; h++)
+            var C = new T[hh];
+            var n = new T[headDim];
+            int bhEnd = bhStart + bhCount;
+            for (int bh = bhStart; bh < bhEnd; bh++)
             {
+                int b = bh / numHeads;
+                int h = bh % numHeads;
                 for (int i = 0; i < hh; i++) C[i] = ops.Zero;
                 for (int di = 0; di < headDim; di++) n[di] = ops.Zero;
                 int hOff = h * headDim;
@@ -335,7 +344,7 @@ public partial class CpuEngine
                     }
                 }
             }
-        }
+        });
     }
 
     private static void XLstmBackwardGeneric<T>(
@@ -348,20 +357,22 @@ public partial class CpuEngine
         T kappa = ops.FromDouble(1.0 / Math.Sqrt(headDim));
         T clamp = ops.FromDouble(XLstmIGateClamp);
         T one = ops.One, zero = ops.Zero;
-        var Ctraj = new T[seqLen * hh];
-        var ntraj = new T[seqLen * headDim];
-        var C = new T[hh];
-        var n = new T[headDim];
-        var dC = new T[hh];
-        var dN = new T[headDim];
-        var dKS = new T[headDim];
-        var dCp = new T[hh];
-        var dNp = new T[headDim];
-
-        for (int b = 0; b < batch; b++)
+        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, (bhStart, bhCount) =>
         {
-            for (int h = 0; h < numHeads; h++)
+            var Ctraj = new T[seqLen * hh];
+            var ntraj = new T[seqLen * headDim];
+            var C = new T[hh];
+            var n = new T[headDim];
+            var dC = new T[hh];
+            var dN = new T[headDim];
+            var dKS = new T[headDim];
+            var dCp = new T[hh];
+            var dNp = new T[headDim];
+            int bhEnd = bhStart + bhCount;
+            for (int bh = bhStart; bh < bhEnd; bh++)
             {
+                int b = bh / numHeads;
+                int h = bh % numHeads;
                 int hOff = h * headDim;
                 for (int i = 0; i < hh; i++) C[i] = zero;
                 for (int di = 0; di < headDim; di++) n[di] = zero;
@@ -479,7 +490,7 @@ public partial class CpuEngine
                     Array.Copy(dNp, 0, dN, 0, headDim);
                 }
             }
-        }
+        });
     }
 
     private static void XLstmScanBackward<T>(

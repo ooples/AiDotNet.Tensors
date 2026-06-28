@@ -26,6 +26,18 @@ internal static unsafe class CcxGemmPool
     private static ManualResetEventSlim[] _go = Array.Empty<ManualResetEventSlim>();
     private static CountdownEvent? _done;
     private static Barrier[] _bar = Array.Empty<Barrier>();
+    // #85 DEAD END (default OFF): a lock-free sense-reversing SPIN barrier (OpenBLAS spins with YIELDING).
+    // Hypothesis was that the .NET Barrier PARKS lanes → the 6/32-busy stall. DISPROVEN by --ab-spinbar
+    // (bit-exact, maxErr=0): spin is 10-20× SLOWER (1536³ barrier 1061 vs spin 49 GF/s). On this 32-thread
+    // box the 16 CCX lanes that spin-wait CONTEND for cores with the lanes doing useful pack/compute, so
+    // spinning craters throughput; the .NET Barrier (which parks, freeing the core) is correct here. The
+    // "6-core 1024³" reading that motivated this was measurement NOISE — the barrier was never the
+    // bottleneck (CCX's real limit is the L3 B-strip residency, hence the [2G,4.5G] window). Kept gated
+    // off as the measurement record. Sense-reversing: last arriver resets count, flips CCX sense.
+    private static int[] _sbCount = Array.Empty<int>();   // arrival count per CCX (reset to _tpc each round)
+    private static int[] _sbSense = Array.Empty<int>();   // released sense per CCX
+    private static int[] _localSense = Array.Empty<int>();// per-worker local sense (reset per dispatch)
+    internal static bool s_spinBarrier;                   // DEAD END (see above) — default OFF, .NET Barrier wins
     private static IntPtr[] _bbuf = Array.Empty<IntPtr>();
     private static long _bbufLen;
     private static int _initState; // 0 unstarted, 1 ready, 2 unavailable
@@ -38,12 +50,21 @@ internal static unsafe class CcxGemmPool
     private static volatile bool _faulted; // a lane's compute threw → TryRun returns false (caller falls back)
     private static int _gr, _gc;      // 2D CCX grid (gr·gc = numCcx)
 
-    /// <summary>Min M·N·K for the CCX path (below this the pinned-pool + barrier overhead isn't worth it).</summary>
-    private const long CcxMinWork = 200L * 1024 * 1024;
+    /// <summary>M·N·K WINDOW for the CCX path — its per-CCX L3-resident B-strip only beats barrier-free
+    /// RunParallel in a narrow sweet spot. Clean A/B (--ab-ccx-vs-rp, DOP32, 2026-06-26 square ladder):
+    /// 1024³ tie, 1280³ tie, **1536³ CCX 1135 vs 882 (1.29×, near-OB)**, 1792³ RunParallel 1.18×, 2048³
+    /// RunParallel 1.38×. Below ~2G the per-K-panel barriers dominate (PerfView: 1024³ stalled 6/32 busy
+    /// cores under sustained load); above ~4.5G the B-strip spills the CCX L3 and RunParallel's per-tile
+    /// L2 residency wins. So fire CCX only in [2G, 4.5G]; everything else → RunParallel.</summary>
+    private const long CcxMinWork = 2L * 1024 * 1024 * 1024;
+    private const long CcxMaxWork = 4_500_000_000L;
 
     /// <summary>Test/diagnostic toggle (env AIDOTNET_DISABLE_CCX=1): force per-tile, for in-process A/B.</summary>
     internal static bool s_disable =
         System.Environment.GetEnvironmentVariable("AIDOTNET_DISABLE_CCX") == "1";
+
+    /// <summary>Bench-only: bypass the [2G,4.5G] work window so CCX fires at any size (for spin-barrier A/B).</summary>
+    internal static bool s_ignoreWorkGate;
 
     private static void EnsureInit()
     {
@@ -64,6 +85,10 @@ internal static unsafe class CcxGemmPool
                 _done = new CountdownEvent(_total);
                 _bar = new Barrier[_numCcx];
                 for (int c = 0; c < _numCcx; c++) _bar[c] = new Barrier(_tpc);
+                _sbCount = new int[_numCcx];
+                _sbSense = new int[_numCcx];
+                for (int c = 0; c < _numCcx; c++) _sbCount[c] = _tpc;
+                _localSense = new int[_total];
                 _bbuf = new IntPtr[_numCcx];
                 for (int i = 0; i < _total; i++)
                 {
@@ -86,12 +111,35 @@ internal static unsafe class CcxGemmPool
         {
             _go[id].Wait();
             _go[id].Reset();
+            _localSense[id] = 0; // fresh sense each dispatch (TryRun reset _sbSense/_sbCount to match)
             // Backstop: compute faults are caught INSIDE DoWork/DoWork2D (around the compute, not the
             // barriers) so a faulting lane still completes its barrier sequence and never deadlocks siblings.
             // This catches any non-compute fault. Either way _faulted ⇒ TryRun returns false ⇒ caller re-runs.
             try { if (_use2D) DoWork2D(ccx, lane); else DoWork(ccx, lane); }
             catch { _faulted = true; }
             finally { _done!.Signal(); }
+        }
+    }
+
+    /// <summary>Per-CCX synchronization point. Spin (lock-free sense-reversing) when s_spinBarrier, else
+    /// the .NET Barrier. The spin path keeps lanes HOT across the short K-panel intervals instead of
+    /// parking them on a kernel event (the cause of the 6/32-busy stall). Bit-exact: pure ordering, no
+    /// effect on the reduction.</summary>
+    private static void Sync(int ccx, int lane)
+    {
+        if (!s_spinBarrier) { _bar[ccx].SignalAndWait(); return; }
+        int id = ccx * _tpc + lane;
+        int ls = _localSense[id] ^ 1;
+        _localSense[id] = ls;
+        if (System.Threading.Interlocked.Decrement(ref _sbCount[ccx]) == 0)
+        {
+            Volatile.Write(ref _sbCount[ccx], _tpc); // reset count BEFORE releasing sense (next round ready)
+            Volatile.Write(ref _sbSense[ccx], ls);   // release: spinners observe sense == their ls
+        }
+        else
+        {
+            var sw = new SpinWait();
+            while (Volatile.Read(ref _sbSense[ccx]) != ls) sw.SpinOnce();
         }
     }
 
@@ -104,21 +152,20 @@ internal static unsafe class CcxGemmPool
         int numIc = (_m + _mc - 1) / _mc;
         int jcStart = (int)((long)ccx * numJc / _numCcx);
         int jcEnd = (int)((long)(ccx + 1) * numJc / _numCcx);
-        var bar = _bar[ccx];
         float* pkb = (float*)_bbuf[ccx];
         for (int jb = jcStart; jb < jcEnd; jb++)
         {
             int jc = jb * _nc; int effNc = Math.Min(_nc, _n - jc);
-            if (effNc <= 0) { bar.SignalAndWait(); bar.SignalAndWait(); continue; }
+            if (effNc <= 0) { Sync(ccx, lane); Sync(ccx, lane); continue; }
             // Compute wrapped (NOT the barriers): a fault sets _faulted but the lane still hits every barrier.
             try { GotoGemmFp32.PackBPanel(_b, _ldb, jc, effNc, _k, _kc, pkb, lane, _tpc); } catch { _faulted = true; }
-            bar.SignalAndWait();
+            Sync(ccx, lane);
             for (int ib = lane; ib < numIc; ib += _tpc)
             {
                 int ic = ib * _mc; int effMc = Math.Min(_mc, _m - ic); if (effMc <= 0) continue;
                 try { GotoGemmFp32.RunTilePackedB(_a, _lda, _b, _ldb, _c, _ldc, ic, jc, effMc, effNc, _k, _mc, _nc, _kc, pkb); } catch { _faulted = true; }
             }
-            bar.SignalAndWait();
+            Sync(ccx, lane);
         }
     }
 
@@ -135,14 +182,13 @@ internal static unsafe class CcxGemmPool
         int m0 = r * mBlk, n0 = cc * nBlk;
         int effMblk = Math.Min(mBlk, _m - m0), effNblk = Math.Min(nBlk, _n - n0);
         if (effMblk <= 0 || effNblk <= 0) return; // empty CCX (grid > matrix): all its lanes skip; no barrier use
-        var bar = _bar[ccx];
         float* pkB = (float*)_bbuf[ccx];
         for (int pc = 0; pc < _k; pc += _kc)
         {
             int effKc = Math.Min(_kc, _k - pc);
             // Compute wrapped (NOT the barriers): a fault sets _faulted but the lane still hits every barrier.
             try { GotoGemmFp32.PackBPanelPc(_b, _ldb, n0, effNblk, pc, effKc, _kc, pkB, lane, _tpc); } catch { _faulted = true; }
-            bar.SignalAndWait();
+            Sync(ccx, lane);
             int ii = 0;
             for (int ic = m0; ic < m0 + effMblk; ic += _mc)
             {
@@ -150,7 +196,7 @@ internal static unsafe class CcxGemmPool
                 int effMc = Math.Min(_mc, m0 + effMblk - ic);
                 try { GotoGemmFp32.RunMacroPanelStep(_a, _lda, _b, _ldb, _c, _ldc, ic, n0, effMc, effNblk, pc, effKc, _mc, _kc, pkB, pc == 0); } catch { _faulted = true; }
             }
-            bar.SignalAndWait();
+            Sync(ccx, lane);
         }
     }
 
@@ -184,7 +230,8 @@ internal static unsafe class CcxGemmPool
         // Gate to the PROVEN balanced-square regime: m,n>=512 (DiT m=256 excluded — its deep-K MLP shapes
         // are barrier-heavy in 2D and the diffusion hot path must not regress; they stay on per-tile/PackBoth).
         if (m < s_minM || n < 512 || k < 256) return false;
-        if ((long)m * n * k < CcxMinWork) return false;
+        long work = (long)m * n * k;
+        if (!s_ignoreWorkGate && (work < CcxMinWork || work > CcxMaxWork)) return false; // CCX win window only; else RunParallel
         if (CpuParallelSettings.MaxDegreeOfParallelism < _total) return false; // restricted budget → per-tile
 
         // Deep-K-aware kc for the 2D path: more K per panel ⇒ fewer (pc-panels × 2) per-CCX barriers, which
@@ -207,6 +254,7 @@ internal static unsafe class CcxGemmPool
             int mBlk = RoundUp((m + _gr - 1) / _gr, 6);
             if ((long)kc * nBlk > 1024L * 1024) return false; // 2D B-panel (kc×nBlk) > 4MB → per-tile
             mc = RoundMr(mBlk / _tpc); if (mc < 48) mc = 48; if (mc > 240) mc = 240;
+            if (s_mc2dOverride > 0) mc = s_mc2dOverride; // A/B knob for the mc blocking sweep
             nc = nBlk;
             need = GotoGemmFp32.PackedBPanelLen(nBlk, kc);
         }
@@ -242,6 +290,8 @@ internal static unsafe class CcxGemmPool
             _a = a; _b = b; _c = c; _lda = lda; _ldb = ldb; _ldc = ldc;
             _m = m; _n = n; _k = k; _mc = mc; _nc = nc; _kc = kc;
             _faulted = false;
+            // Fresh spin-barrier state for this dispatch (workers reset their own _localSense to 0).
+            for (int cc = 0; cc < _numCcx; cc++) { _sbCount[cc] = _tpc; _sbSense[cc] = 0; }
             _done!.Reset();
             for (int i = 0; i < _total; i++) _go[i].Set();
             _done.Wait();
@@ -262,6 +312,9 @@ internal static unsafe class CcxGemmPool
     /// <summary>A/B knob (env AIDOTNET_CCX_KC): override the 2D-path kc to sweep the barrier-vs-L1-fit tradeoff.</summary>
     internal static int s_kc2dOverride =
         int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_CCX_KC"), out var v) ? v : 0;
+
+    /// <summary>A/B knob: override the 2D-path mc to sweep ic-block count (load balance) vs A-panel reuse.</summary>
+    internal static int s_mc2dOverride;
 
     /// <summary>A/B knob (env AIDOTNET_CCX_MINM): override the min-M gate (default 512) to test CCX on the
     /// wide-N small-M DiT shapes (m=256). Lets the 1D-N path (pack B once per CCX) be measured there.</summary>

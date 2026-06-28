@@ -71,6 +71,51 @@ internal static class CpuTopology
         catch { return Array.Empty<Domain>(); }
     }
 
+    /// <summary>Enumerate PHYSICAL cores — one <see cref="Domain"/> per core, Mask = that core's logical
+    /// procs (its SMT siblings). Lets a pool pin exactly one thread per physical core (no SMT contention),
+    /// matching OpenBLAS's 1-thread-per-core decomposition. Empty on non-Windows / failure.</summary>
+    internal static Domain[] DetectPhysicalCores()
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return Array.Empty<Domain>();
+        try
+        {
+            const int RelationProcessorCore = 0;
+            uint len = 0;
+            GetLogicalProcessorInformationEx(RelationProcessorCore, IntPtr.Zero, ref len);
+            if (len == 0) return Array.Empty<Domain>();
+            IntPtr buf = Marshal.AllocHGlobal((int)len);
+            try
+            {
+                if (!GetLogicalProcessorInformationEx(RelationProcessorCore, buf, ref len)) return Array.Empty<Domain>();
+                var list = new List<Domain>();
+                long ptr = (long)buf, end = ptr + len;
+                while (ptr < end)
+                {
+                    int rel = Marshal.ReadInt32((IntPtr)ptr);
+                    int size = Marshal.ReadInt32((IntPtr)(ptr + 4));
+                    if (size <= 0) break;
+                    // PROCESSOR_RELATIONSHIP at +8: Flags@8, EfficiencyClass@9, Reserved[20]@10,
+                    // GroupCount@30 (WORD), GroupMask[0] (GROUP_AFFINITY) @32 { Mask@32 (8B), Group@40 (2B) }.
+                    if (rel == RelationProcessorCore)
+                    {
+                        ushort groupCount = (ushort)Marshal.ReadInt16((IntPtr)(ptr + 30));
+                        if (groupCount >= 1)
+                        {
+                            ulong mask = (ulong)Marshal.ReadInt64((IntPtr)(ptr + 32));
+                            ushort group = (ushort)Marshal.ReadInt16((IntPtr)(ptr + 40));
+                            int cores = System.Numerics.BitOperations.PopCount(mask);
+                            if (cores > 0) list.Add(new Domain(mask, group, cores));
+                        }
+                    }
+                    ptr += size;
+                }
+                return list.ToArray();
+            }
+            finally { Marshal.FreeHGlobal(buf); }
+        }
+        catch { return Array.Empty<Domain>(); }
+    }
+
     /// <summary>Pin the calling thread to a domain's cores (best-effort; correctness is independent of it).</summary>
     internal static bool TryPinCurrentThread(in Domain d)
     {

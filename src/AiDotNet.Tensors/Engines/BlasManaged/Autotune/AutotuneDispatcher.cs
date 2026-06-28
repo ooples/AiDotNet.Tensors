@@ -63,6 +63,14 @@ internal static class AutotuneDispatcher
             return FallbackToHeuristic(m, n, k, mr, nr, procs, isDeterministic);
         }
 
+        // #475 blocking override active (test/bench only): skip cache lookup AND store so the
+        // forced block choice never leaks into the persisted heuristic cache, and use the
+        // (clamped) heuristic path directly. FallbackToHeuristic applies + clamps the overrides.
+        if (BlockingOverrideActive)
+        {
+            return FallbackToHeuristic(m, n, k, mr, nr, procs, isDeterministic);
+        }
+
         var shape = BlasManagedAutotune.EncodeShape<T>(m, n, k, transA, transB, mr, nr, hasEpilogue, isDeterministic);
 
         // Cache hit?
@@ -174,6 +182,20 @@ internal static class AutotuneDispatcher
     /// </summary>
     [ThreadStatic] internal static bool ForceMeasureOnMiss;
 
+    // #475 medium/large blocking A/B: when set, override the heuristic's Mc/Nc/Kc to test
+    // OpenBLAS-style Zen blocking (sgemm P/Q = 320/320, R large) against the single-core gap.
+    // Null = the heuristic. Test/bench only.
+    internal static int? s_overrideMc, s_overrideNc, s_overrideKc;
+
+    /// <summary>
+    /// True while any of the #475 blocking overrides (<see cref="s_overrideMc"/>,
+    /// <see cref="s_overrideNc"/>, <see cref="s_overrideKc"/>) is set. When active,
+    /// <see cref="Decide{T}"/> bypasses the autotune cache lookup AND store so a
+    /// test/bench-only block choice never poisons the persisted heuristic cache.
+    /// </summary>
+    private static bool BlockingOverrideActive
+        => s_overrideMc.HasValue || s_overrideNc.HasValue || s_overrideKc.HasValue;
+
     /// <summary>
     /// Use the AxisSelector heuristic to choose an axis, with default blocking
     /// parameters. The heuristic itself is shape-aware (m, n, k, mr, nr, procs).
@@ -226,6 +248,20 @@ internal static class AutotuneDispatcher
                 targetMc = Math.Max(floorMc, targetMc);
                 if (targetMc < mc) mc = targetMc;
             }
+        }
+
+        // #475 medium/large blocking A/B — force OpenBLAS-style P/Q/R to probe the single-core gap.
+        // These are test/bench-only knobs; route them through ClampBlocking so an unvalidated
+        // override (e.g. kc=0 or a negative value) can never reach the strategy pipeline and hang a
+        // downstream `pc += kc` loop. Decide<T> additionally bypasses the cache while any override is
+        // active so the bench value never persists in the heuristic cache.
+        if (BlockingOverrideActive)
+        {
+            if (s_overrideMc is int omc) mc = omc;
+            if (s_overrideNc is int onc) nc = onc;
+            if (s_overrideKc is int okc) kc = okc;
+            (mc, nc, kc) = ClampBlocking(mc, nc, kc, m, n, k, mr, nr);
+            return (axis, mc, nc, kc, procs);
         }
 
         // Round mc down to mr alignment, nc down to nr alignment.

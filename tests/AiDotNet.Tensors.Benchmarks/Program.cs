@@ -56,6 +56,111 @@ class Program
             return;
         }
 
+        // #475 medium-axis routing A/B — forced M/N/2D vs the live heuristic vs OpenBLAS
+        // on the diffusion FP32 shapes, full DOP, deterministic. (--ab-axis-routing)
+        if (args[0] == "--ab-axis-routing")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.Run();
+            return;
+        }
+
+        // Single-thread GEMM profile repro for PerfView CPU-counter sampling.
+        // --profile-gemm-st [seconds=25] [shape=ffn-up|ffn-big|square|attn|medium]
+        if (args[0] == "--profile-gemm-st")
+        {
+            int secs = args.Length > 1 && int.TryParse(args[1], out var s) ? s : 25;
+            string shape = args.Length > 2 ? args[2] : "ffn-up";
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.ProfileSingleThread(secs, shape);
+            return;
+        }
+
+        // Multi-thread GEMM profile (GF/s + busy-core utilization) + PerfView PMU repro.
+        // --profile-gemm-mt [seconds=20] [shape=ffn-up|ffn-big|square|attn|medium]
+        if (args[0] == "--profile-gemm-mt")
+        {
+            int secs = args.Length > 1 && int.TryParse(args[1], out var s) ? s : 20;
+            string shape = args.Length > 2 ? args[2] : "ffn-up";
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.ProfileMultiThread(secs, shape);
+            return;
+        }
+
+        // #475 machine-code macro-kernel A/B (RyuJIT off the hot path). (--ab-macro)
+        if (args[0] == "--ab-macro")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.MacroAb();
+            return;
+        }
+
+        // #475 Phase 0a: FP32 panel K-unroll sweep (4/8/2/6). (--ab-kunroll)
+        if (args[0] == "--ab-kunroll")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.KUnrollSweep();
+            return;
+        }
+
+        // #475 Phase 1: JIT specialized FP32 GEMM A/B vs OpenBLAS (small/medium). (--ab-jit)
+        if (args[0] == "--ab-jit")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.JitAb();
+            return;
+        }
+
+        // #475 medium/large blocking sweep vs OpenBLAS P/Q/R. (--ab-blocking)
+        if (args[0] == "--ab-blocking")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.BlockingSweep();
+            return;
+        }
+
+        // #475 thread-scaling curve (DOP 1..32) vs OpenBLAS. (--ab-scaling)
+        if (args[0] == "--ab-scaling")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.ScalingSweep();
+            return;
+        }
+
+        // #85 GotoGemm RunParallel vs N-axis (thin-M shared-A) routing A/B. (--ab-goto-vs-naxis)
+        if (args[0] == "--ab-goto-vs-naxis")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.GotoVsNaxisSweep();
+            return;
+        }
+
+        // #85 CCX pool (barriers) vs RunParallel (barrier-free) on balanced shapes. (--ab-ccx-vs-rp)
+        if (args[0] == "--ab-ccx-vs-rp")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.CcxVsRunParallelSweep();
+            return;
+        }
+
+        // #85 CCX spin-barrier vs .NET Barrier (forced CCX, bit-exact + perf). (--ab-spinbar)
+        if (args[0] == "--ab-spinbar")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.SpinBarrierSweep();
+            return;
+        }
+
+        // #85 CCX 2D kc blocking sweep (forced CCX). (--ab-ccx-block)
+        if (args[0] == "--ab-ccx-block")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.CcxBlockingSweep();
+            return;
+        }
+
+        // #85 N-axis macro-kernel (asm Mr-sweep) vs managed loop, multi-thread. (--ab-macro-mt)
+        if (args[0] == "--ab-macro-mt")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.MacroMtSweep();
+            return;
+        }
+
+        // #85 N-axis pinned pool vs threadpool. (--ab-pinned)
+        if (args[0] == "--ab-pinned")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.PinnedNAxisSweep();
+            return;
+        }
+
         if (args[0] == "--ab-aiseval-dopsweep")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.DopSweep();
@@ -895,6 +1000,21 @@ class Program
         Console.WriteLine("  --ab-ccx               : CCX-pinned-pool GEMM prototype (1D/2D)");
         Console.WriteLine("  --profile-gemm         : tight engine.TensorMatMul loop for an external profiler");
         Console.WriteLine("  --cpu-topology         : L3/CCX + NUMA topology (Windows-only)");
+        Console.WriteLine();
+        Console.WriteLine("#475 medium-axis routing + GEMM-profile A/B (managed BLAS):");
+        Console.WriteLine("  --ab-axis-routing      : forced M/N/2D vs the live heuristic vs OpenBLAS (diffusion shapes)");
+        Console.WriteLine("  --profile-gemm-st      : single-thread GEMM profile repro (--profile-gemm-st [seconds] [shape])");
+        Console.WriteLine("  --profile-gemm-mt      : multi-thread GEMM profile, GF/s + busy-core util (--profile-gemm-mt [seconds] [shape])");
+        Console.WriteLine("                           shape = ffn-up|ffn-big|square|attn|medium");
+        Console.WriteLine("  --ab-macro             : machine-code macro-kernel A/B (RyuJIT off the hot path)");
+        Console.WriteLine("  --ab-kunroll           : FP32 panel K-unroll sweep (4/8/2/6)");
+        Console.WriteLine("  --ab-jit               : JIT-specialized FP32 GEMM A/B vs OpenBLAS (small/medium)");
+        Console.WriteLine("  --ab-blocking          : medium/large blocking sweep vs OpenBLAS P/Q/R");
+        Console.WriteLine("  --ab-scaling           : thread-scaling curve (DOP 1..32) vs OpenBLAS");
+        Console.WriteLine("  --ab-goto-vs-naxis     : GotoGemm RunParallel vs N-axis (thin-M shared-A) routing A/B");
+        Console.WriteLine("  --ab-ccx-vs-rp         : CCX pool (barriers) vs RunParallel (barrier-free) on balanced shapes");
+        Console.WriteLine("  --ab-spinbar           : CCX spin-barrier vs .NET Barrier (forced CCX, bit-exact + perf)");
+        Console.WriteLine("  --ab-ccx-block         : CCX 2D kc blocking sweep (forced CCX)");
         Console.WriteLine();
         Console.WriteLine("PyTorch-comparison diagnostics:");
         Console.WriteLine("  --per-call-threads       : Per-call NumThreads sweep vs PyTorch");
