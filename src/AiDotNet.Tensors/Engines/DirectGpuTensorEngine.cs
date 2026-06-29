@@ -6380,8 +6380,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         switch (activation)
         {
             case FusedActivationType.Softmax:
-                // Per-row softmax over features; in-place is safe (read-then-write per index).
-                backend.Softmax(buffer, buffer, batchSize, features);
+                // Softmax normalizes across the feature dimension per row, so the kernel reads the whole
+                // row (max + sum) before writing. In-place (input buffer == output buffer) is NOT portable:
+                // WebGPU forbids binding one storage buffer as both `read` and `read_write`. Route through a
+                // scratch buffer and copy the normalized result back, so every backend behaves identically.
+                var softmaxScratch = backend.AllocateBuffer(batchSize * features);
+                try
+                {
+                    backend.Softmax(buffer, softmaxScratch, batchSize, features);
+                    backend.Copy(softmaxScratch, buffer, batchSize * features);
+                }
+                finally
+                {
+                    softmaxScratch.Dispose();
+                }
                 break;
             default:
                 ApplyGpuActivation(backend, buffer, batchSize * features, activation);

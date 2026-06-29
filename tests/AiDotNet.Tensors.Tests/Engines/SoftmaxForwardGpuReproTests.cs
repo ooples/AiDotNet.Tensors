@@ -153,4 +153,57 @@ public class SoftmaxForwardGpuReproTests
         }
         AssertValidDistribution(gpu, CpuReference(a, w, b, batch), batch);
     }
+
+    /// <summary>
+    /// Path 2b — async fused GEMM+bias+Softmax on a NON-DEFAULT stream, with the inputs uploaded
+    /// asynchronously on that same stream. A backend that ignores the caller-supplied <c>stream</c>
+    /// (running GemmBias/Softmax on its default stream while the uploads are still in flight on the
+    /// compute stream) can read the operands before they land. Regression guard for the stream-ordering
+    /// fix in <c>FusedGemmBiasActivationAsync</c> — the original code synchronized only AFTER the op and
+    /// on the wrong stream, so it neither fenced prior <c>stream</c> work nor was visible to
+    /// <c>SynchronizeStream(stream)</c>.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(2)]
+    public void FusedGemmBiasActivationAsyncSoftmax_HonorsNonDefaultStream(int batch)
+    {
+        using var engine = new DirectGpuTensorEngine();
+        Skip.IfNot(engine.SupportsGpu, "No GPU backend available (expected on WSL/CPU-only hosts).");
+        var backend = engine.GetBackend();
+        Skip.IfNot(backend is IAsyncGpuBackend, "Backend is not async-capable.");
+        var asyncBackend = (IAsyncGpuBackend)backend;
+        _out.WriteLine($"Engine: {engine.Name}   batch={batch}  (non-default stream)");
+
+        var (a, w, b) = MakeInputs(batch);
+        var stream = asyncBackend.CreateStream(GpuStreamType.Compute);
+        float[] gpu;
+        try
+        {
+            // Allocate device buffers, then upload the inputs ASYNCHRONOUSLY on the compute stream so the
+            // fused op MUST honor `stream` (drain it before reading) to see the correct operands.
+            var aBuf = backend.AllocateBuffer(a.Length);
+            var wBuf = backend.AllocateBuffer(w.Length);
+            var biasBuf = backend.AllocateBuffer(b.Length);
+            var outBuf = backend.AllocateBuffer(batch * OutF);
+            asyncBackend.UploadBufferAsync(a, aBuf, stream);
+            asyncBackend.UploadBufferAsync(w, wBuf, stream);
+            asyncBackend.UploadBufferAsync(b, biasBuf, stream);
+
+            asyncBackend.FusedGemmBiasActivationAsync(aBuf, wBuf, biasBuf, outBuf,
+                batch, OutF, InF, FusedActivationType.Softmax, stream);
+            asyncBackend.SynchronizeStream(stream);
+            gpu = new float[batch * OutF];
+            backend.DownloadBuffer(outBuf, gpu);
+        }
+        catch (Exception ex)
+        {
+            _out.WriteLine($"non-default-stream fused Softmax THREW: {ex.GetType().Name}: {ex.Message}");
+            throw new Xunit.Sdk.XunitException($"BUG: async fused Softmax on a non-default stream threw for batch={batch}: {ex.GetType().Name}: {ex.Message}");
+        }
+        finally
+        {
+            (stream as IDisposable)?.Dispose();
+        }
+        AssertValidDistribution(gpu, CpuReference(a, w, b, batch), batch);
+    }
 }

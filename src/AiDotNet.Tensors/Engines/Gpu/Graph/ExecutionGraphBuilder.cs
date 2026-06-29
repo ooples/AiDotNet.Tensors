@@ -556,8 +556,27 @@ public static class ExecutionGraphBuilderExtensions
                 break;
             case FusedActivationType.Softmax:
                 // Per-row softmax: pass real (batchSize, features); the old (1, size) collapsed
-                // the whole batch into one row for batchSize > 1.
-                backend.Softmax(input, output, batchSize, features);
+                // the whole batch into one row for batchSize > 1. Softmax reads the whole row before
+                // writing, and WebGPU forbids binding one storage buffer as both read and read_write —
+                // so when this is called in-place (input == output, as AddLinearLayer's separate-node
+                // path does) route through a scratch buffer and copy back instead of aliasing.
+                if (input == output)
+                {
+                    var softmaxScratch = backend.AllocateBuffer(size);
+                    try
+                    {
+                        backend.Softmax(input, softmaxScratch, batchSize, features);
+                        backend.Copy(softmaxScratch, output, size);
+                    }
+                    finally
+                    {
+                        softmaxScratch.Dispose();
+                    }
+                }
+                else
+                {
+                    backend.Softmax(input, output, batchSize, features);
+                }
                 break;
         }
     }

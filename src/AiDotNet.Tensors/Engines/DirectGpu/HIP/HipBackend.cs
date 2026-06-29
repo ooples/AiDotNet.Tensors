@@ -9799,9 +9799,20 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         // GEMM+bias then per-row softmax over [M, N]. Parity fix from OpenCL; unverified on ROCm hardware.
         if (activation == FusedActivationType.Softmax)
         {
+            // GemmBias and the softmax kernel both run on the backend's DEFAULT stream, not `stream`.
+            // To preserve ordering w.r.t. the caller's stream, drain it first (so prior writes to
+            // A/B/bias complete before GemmBias reads them), then fully synchronize after so the result
+            // in `output` is ready on return — a subsequent SynchronizeStream(stream) is then a no-op.
+            SynchronizeStream(stream);
             var gemmBias = GemmBias(A, B, bias, M, N, K);
-            Softmax(gemmBias, output, M, N);
-            gemmBias.Dispose();
+            try
+            {
+                Softmax(gemmBias, output, M, N);
+            }
+            finally
+            {
+                gemmBias.Dispose();   // release the temp even if Softmax throws
+            }
             Synchronize();
             return;
         }
