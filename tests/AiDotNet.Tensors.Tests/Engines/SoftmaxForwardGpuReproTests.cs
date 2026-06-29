@@ -4,6 +4,7 @@ using System.Linq;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.Gpu;
+using AiDotNet.Tensors.Engines.Gpu.Graph;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 using Xunit.Abstractions;
@@ -203,6 +204,95 @@ public class SoftmaxForwardGpuReproTests
         finally
         {
             (stream as IDisposable)?.Dispose();
+        }
+        AssertValidDistribution(gpu, CpuReference(a, w, b, batch), batch);
+    }
+
+    // GPU-resident operands for a [batch, InF] @ [InF, OutF] + bias linear layer, built via the graph.
+    private static (Tensor<float> input, Tensor<float> weights, Tensor<float> bias, Tensor<float> output)
+        MakeGpuOperands(int batch, float[] a, float[] w, float[] bv)
+    {
+        var input = new Tensor<float>(a, new[] { batch, InF }).Gpu();
+        var weights = new Tensor<float>(w, new[] { InF, OutF }).Gpu();
+        var bias = new Tensor<float>(bv, new[] { OutF }).Gpu();
+        var output = new Tensor<float>(new[] { batch, OutF }).Gpu();
+        return (input, weights, bias, output);
+    }
+
+    /// <summary>
+    /// Path 3 — the DEFERRED graph path, ASYNC (fused) route. Builds the layer through
+    /// <see cref="ExecutionGraphBuilderExtensions.AddLinearLayer"/> and runs it with a stream pool, so
+    /// the work actually flows through the graph machinery (KernelFusionPass folds GEMM→bias→Softmax into
+    /// a single <c>FusedKernelNode</c> whose action calls <c>FusedGemmBiasActivationAsync</c>) rather than
+    /// a direct backend call. Reachable on async backends (CUDA/HIP/OpenCL).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void DeferredGraph_FusedLinearSoftmax_AsyncFusedRoute_IsValidDistribution(int batch)
+    {
+        using var engine = new DirectGpuTensorEngine();
+        Skip.IfNot(engine.SupportsGpu, "No GPU backend available (expected on WSL/CPU-only hosts).");
+        var backend = engine.GetBackend();
+        Skip.IfNot(backend is IAsyncGpuBackend, "Async fused graph route requires an IAsyncGpuBackend (CUDA/HIP/OpenCL).");
+        var asyncBackend = (IAsyncGpuBackend)backend;
+        _out.WriteLine($"Engine: {engine.Name}   batch={batch}  (deferred graph, async fused route)");
+
+        var (a, w, b) = MakeInputs(batch);
+        var (input, weights, bias, output) = MakeGpuOperands(batch, a, w, b);
+        float[] gpu;
+        try
+        {
+            using var builder = new ExecutionGraphBuilder();
+            builder.AddLinearLayer(input, weights, bias, output, batch, InF, OutF, FusedActivationType.Softmax, backend);
+            using var graph = builder.Build();
+            using var streamPool = new GpuStreamPool(asyncBackend);
+            graph.Execute(backend, streamPool);   // streamed execution → fused node fires on a real stream
+            gpu = new float[batch * OutF];
+            backend.DownloadBuffer(output.Buffer, gpu);
+        }
+        finally
+        {
+            input.Dispose(); weights.Dispose(); bias.Dispose(); output.Dispose();
+        }
+        AssertValidDistribution(gpu, CpuReference(a, w, b, batch), batch);
+    }
+
+    /// <summary>
+    /// Path 4 — the DEFERRED graph path, SEPARATE-NODE route (GEMM → bias-add → <c>ApplyActivation</c>).
+    /// <see cref="ExecutionGraphBuilderExtensions.AddLinearLayer"/> only takes this route on NON-async
+    /// backends (Vulkan / WebGPU / Metal); async backends fold into the fused node instead. So this is
+    /// the test that exercises <c>ExecutionGraphBuilder.ApplyActivation</c> (the per-row, scratch-buffered
+    /// Softmax). It is gated to non-async backends and SKIPS on CUDA/HIP/OpenCL — run it on a machine where
+    /// the active DirectGpu backend is Vulkan/WebGPU/Metal (e.g. via AIDOTNET_DIRECTGPU_BACKENDS).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void DeferredGraph_FusedLinearSoftmax_SeparateNodeRoute_IsValidDistribution(int batch)
+    {
+        using var engine = new DirectGpuTensorEngine();
+        Skip.IfNot(engine.SupportsGpu, "No GPU backend available (expected on WSL/CPU-only hosts).");
+        var backend = engine.GetBackend();
+        Skip.If(backend is IAsyncGpuBackend,
+            "Separate-node graph route only runs on non-async backends (Vulkan/WebGPU/Metal); async backends use the fused node.");
+        _out.WriteLine($"Engine: {engine.Name}   batch={batch}  (deferred graph, separate-node route)");
+
+        var (a, w, b) = MakeInputs(batch);
+        var (input, weights, bias, output) = MakeGpuOperands(batch, a, w, b);
+        float[] gpu;
+        try
+        {
+            using var builder = new ExecutionGraphBuilder();
+            builder.AddLinearLayer(input, weights, bias, output, batch, InF, OutF, FusedActivationType.Softmax, backend);
+            using var graph = builder.Build();
+            graph.Execute(backend);   // sync execution → GEMM, bias-add, then ApplyActivation(Softmax)
+            gpu = new float[batch * OutF];
+            backend.DownloadBuffer(output.Buffer, gpu);
+        }
+        finally
+        {
+            input.Dispose(); weights.Dispose(); bias.Dispose(); output.Dispose();
         }
         AssertValidDistribution(gpu, CpuReference(a, w, b, batch), batch);
     }
