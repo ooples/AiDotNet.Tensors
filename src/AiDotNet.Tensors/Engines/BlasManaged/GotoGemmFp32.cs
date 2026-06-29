@@ -60,6 +60,15 @@ internal static class GotoGemmFp32
         || (long)k >= 2L * n
         || (m >= 128 && n >= 512 && ((long)n < 2L * k || (m % Mr) != 0));
 
+    /// <summary>bf16-B win regime (opt-in, gated by BlasManaged.s_gemmBf16). bf16-B halves the streamed
+    /// B bytes, so it only pays off once B no longer fits cache and the GEMM is bandwidth-bound — measured
+    /// crossover between sq1024 (compute-bound, bf16 0.80×) and sq2048 (bandwidth-bound, 1.13×). Gate on
+    /// total work ≥ 4e9 (≈ sq1585³) so opt-in users still get exact fp32 on the smaller shapes where bf16
+    /// would only add pack overhead and precision loss. Wide-N short-M (n≥2k) is excluded — it streams B
+    /// less and stays compute/pack-bound (matches the bf16 measurement showing the win is on the squares).</summary>
+    internal static bool ShouldUseBf16(int m, int n, int k)
+        => (long)m * n * k >= 4_000_000_000L && (long)n < 2L * k && (long)m >= 512;
+
     /// <summary>Shape-adaptive (Mc, Nc, Kc) for RunParallel, tuned on the 3990X (measured --ab-goto-par /
     /// --profile-gemm). Memory-bound regime: larger square shapes want larger tiles (fewer redundant DRAM
     /// re-reads); skewed / smaller shapes want smaller Mc for enough IC-blocks. Kc=256 (see ParallelKc).</summary>
@@ -171,7 +180,10 @@ internal static class GotoGemmFp32
             lock (typeof(GotoGemmFp32))
                 if (init == 0)
                 {
-                    var code = MachineCodeFmaKernel.EmitBf16BTileWindows(Mr, NrYmm, ow);
+                    // ABI-aware (Win-x64 vs SysV): the Win-only emit segfaults on Linux/macOS — it reads kc
+                    // from the [rsp+0x28] shadow space SysV lacks (the #706 CI SIGSEGV). Mirrors the fp32
+                    // kernel's EmitFp32TileAbi selection.
+                    var code = MachineCodeFmaKernel.EmitBf16BTileAbi(Mr, NrYmm, ow);
                     var mem = ExecutableMemory.TryAllocate(code);
                     if (ow) { s_kBf16OwMem = mem; s_kBf16Ow = mem?.Pointer ?? IntPtr.Zero; }
                     else { s_kBf16Mem = mem; s_kBf16 = mem?.Pointer ?? IntPtr.Zero; }

@@ -144,6 +144,12 @@ public sealed class StreamingTensorPool : IDisposable
     /// triggering eviction.</summary>
     public long ResidentBytes => Interlocked.Read(ref _residentBytes);
 
+    /// <summary>The configured resident-byte budget (<see cref="GpuOffloadOptions.StreamingPoolMaxResidentBytes"/>).
+    /// Exposed so callers that hold their OWN resident copies of pool-registered weights (e.g. a
+    /// parameter round-trip that materializes many weights at once, #1715) can bound their concurrent
+    /// resident set against the same budget the pool uses for its byte[] snapshots.</summary>
+    public long MaxResidentBytes => _maxResidentBytes;
+
     /// <summary>Number of entries currently resident in the working set.
     /// Excludes entries that have been paged out to the backing store.</summary>
     public int ResidentEntryCount
@@ -278,6 +284,67 @@ public sealed class StreamingTensorPool : IDisposable
             ThrowIfDisposed();
             if (_entries.TryGetValue(handleId, out var entry))
                 entry.BackingFileCurrent = false;
+        }
+    }
+
+    /// <summary>
+    /// Replaces an existing entry's bytes IN PLACE under the same handle and marks it
+    /// dirty so the next eviction re-writes the new bytes to the backing file. Used by
+    /// the write-back-on-owner-drop path (#1715): when a streaming weight's resident
+    /// owner copy was MUTATED (e.g. a GetParameters round-trip or an optimizer step
+    /// writes into the rehydrated tensor), the pool's snapshot + disk slice are stale.
+    /// Calling this with the owner's current bytes makes the entry resident again with
+    /// the fresh content, so dropping the owner's copy can't lose the mutation — a later
+    /// <see cref="Rehydrate(long)"/> reads the written value back. Re-accounts resident
+    /// bytes (the new buffer may differ in size from the old, e.g. variable-size lossless)
+    /// and re-runs the budget check so the freshly-resident bytes get paged back to disk
+    /// under pressure. No-op for an unknown handle.
+    /// </summary>
+    public void ReplaceEntryData(long handleId, byte[] newData)
+    {
+        if (newData is null) throw new ArgumentNullException(nameof(newData));
+        lock (_lock)
+        {
+            ThrowIfDisposed();
+            if (!_entries.TryGetValue(handleId, out var entry)) return;
+
+            long oldResident = entry.Data?.Length ?? 0;
+            entry.Data = newData;
+            entry.ResidentBytes = newData.Length;
+            // The new bytes have NOT been written to the backing file, so force the
+            // next eviction to (re-)write them rather than dropping the resident copy
+            // as if the file already held it. Also reset the compressed/uncompressed
+            // metadata: the caller supplies the canonical (native-encoded) bytes, so a
+            // prior compressed page-out's sizes no longer describe this content.
+            entry.BackingFileCurrent = false;
+            entry.IsCompressed = false;
+            entry.UncompressedBytes = newData.Length;
+
+            // Net resident delta: the new buffer replaces whatever was resident before
+            // (which is 0 when the entry was paged out). Keep _residentBytes exact so
+            // the budget check below — and every future one — stays correct.
+            long delta = newData.Length - oldResident;
+            if (delta != 0)
+            {
+                Interlocked.Add(ref _residentBytes, delta);
+                long peak = Interlocked.Read(ref _residentBytesPeak);
+                long current = Interlocked.Read(ref _residentBytes);
+                if (current > peak) Interlocked.Exchange(ref _residentBytesPeak, current);
+            }
+
+            // The entry is resident again — make sure it's in the LRU so eviction can
+            // page it back to disk (carrying the new bytes) under budget pressure.
+            if (!_lruIndex.TryGetValue(handleId, out var node))
+            {
+                node = _lruOrder.AddFirst(handleId);
+                _lruIndex[handleId] = node;
+            }
+            else
+            {
+                _lruOrder.Remove(node);
+                _lruOrder.AddFirst(node);
+            }
+            EvictIfOverBudget();
         }
     }
 

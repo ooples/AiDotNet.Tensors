@@ -126,6 +126,13 @@ class Program
             return;
         }
 
+        // #90 N-axis shared-A + M-tail (m%6!=0 DiT shapes) vs per-tile GotoGemm. (--ab-naxis-mtail)
+        if (args[0] == "--ab-naxis-mtail")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.NaxisMTailSweep();
+            return;
+        }
+
         // #85 CCX pool (barriers) vs RunParallel (barrier-free) on balanced shapes. (--ab-ccx-vs-rp)
         if (args[0] == "--ab-ccx-vs-rp")
         {
