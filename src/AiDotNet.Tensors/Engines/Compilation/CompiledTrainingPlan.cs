@@ -4993,9 +4993,24 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// backing-array length), then scales every element by
     /// <c>maxNorm / (totalNorm + 1e-6)</c> when totalNorm exceeds maxNorm.
     /// </summary>
-    private static void ClipGradientsGlobalL2(Tensor<T>[] gradients, double maxNorm)
+    private void ClipGradientsGlobalL2(Tensor<T>[] gradients, double maxNorm)
     {
         if (gradients.Length == 0) return;
+        // A gradient belongs to an unexercised (lazy, off-loss-path) parameter when that PARAMETER's
+        // weight backing is unmaterialized — even though the plan holds a full-length zero gradient
+        // buffer for it. Such gradients are zero: they contribute nothing to the global norm and
+        // scaling them is a no-op. Skipping them makes the clip cost scale with the EXERCISED params
+        // (what the optimizer already does) instead of the full param set — ClipGradientsGlobalL2 was
+        // ~44% of a UnifiedMultimodal training step, almost all of it scanning ~500M zero elements. #1738
+        var ps = _parameters;
+        bool SkipUnexercised(int p)
+        {
+            if (ps is null || ps.Length != gradients.Length) return false;
+            var pt = ps[p];
+            if (pt is null) return true;
+            var pa = pt.GetLiveBackingArrayAllowingPaddingOrNull();
+            return pa is null || pa.Length == 0;
+        }
 
         // CodeRabbit #425 review: detect GPU-resident gradients before the CPU
         // clip loop. Pre-fix the CPU pass would compute the L2 norm over a
@@ -5041,7 +5056,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         for (int p = 0; p < gradients.Length; p++)
         {
             var tensor = gradients[p];
-            if (tensor == null) continue;
+            if (tensor == null || SkipUnexercised(p)) continue;
             var arr = tensor.GetLiveBackingArrayAllowingPaddingOrNull() ?? tensor.GetDataArray();
             int len = tensor.Length;
             for (int i = 0; i < len; i++)
@@ -5059,7 +5074,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         for (int p = 0; p < gradients.Length; p++)
         {
             var tensor = gradients[p];
-            if (tensor == null) continue;
+            if (tensor == null || SkipUnexercised(p)) continue;
             var arr = tensor.GetLiveBackingArrayAllowingPaddingOrNull() ?? tensor.GetDataArray();
             int len = tensor.Length;
             for (int i = 0; i < len; i++)
