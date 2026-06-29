@@ -2212,6 +2212,38 @@ public interface IEngine
     /// <summary>LogSoftmax into pre-allocated destination. Zero allocation.</summary>
     void LogSoftmaxInto<T>(Tensor<T> destination, Tensor<T> input, int axis);
 
+    /// <summary>
+    /// Scaled dot-product attention written into a caller-provided destination tensor,
+    /// reusing an internal per-call scratch buffer for the [.,heads,S,S] scores/softmax.
+    /// Computes <c>softmax(Q·Kᵀ·scale)·V</c> into <paramref name="destination"/> (shape
+    /// <c>[batch, heads, seqQ, d_v]</c>) and does NOT materialize the attention-weight
+    /// matrix — an inference-only fast path that skips the scores tensor, the weights
+    /// tensor, and the output tensor allocations of
+    /// <see cref="ScaledDotProductAttention{T}"/>. Numerics are bit-identical to the
+    /// allocating overload (same per-head GEMM + numerically-stable softmax kernel).
+    /// </summary>
+    /// <typeparam name="T">Numeric element type (float / double fast paths; others fall back).</typeparam>
+    /// <param name="destination">Pre-allocated, contiguous <c>[batch, heads, seqQ, d_v]</c> output. Fully overwritten.</param>
+    /// <param name="query">Query <c>[batch, heads, seqQ, d_k]</c>.</param>
+    /// <param name="key">Key <c>[batch, heads, seqK, d_k]</c>.</param>
+    /// <param name="value">Value <c>[batch, heads, seqK, d_v]</c>.</param>
+    /// <param name="scale">Optional scale; null uses 1/sqrt(d_k).</param>
+    void ScaledDotProductAttentionInto<T>(
+        Tensor<T> destination,
+        Tensor<T> query,
+        Tensor<T> key,
+        Tensor<T> value,
+        double? scale);
+
+    /// <summary>Trailing-repeat broadcast multiply into a pre-allocated destination (shape == a's shape). Zero output allocation; bit-identical to <see cref="TensorBroadcastMultiply{T}"/>.</summary>
+    void TensorBroadcastMultiplyInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b);
+
+    /// <summary>Trailing-repeat broadcast add into a pre-allocated destination (shape == a's shape). Zero output allocation; bit-identical to <see cref="TensorBroadcastAdd{T}"/>.</summary>
+    void TensorBroadcastAddInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b);
+
+    /// <summary>Add a scalar to every element into a pre-allocated destination. Zero output allocation; bit-identical to <see cref="TensorAddScalar{T}"/>.</summary>
+    void TensorAddScalarInto<T>(Tensor<T> destination, Tensor<T> a, T scalar);
+
     #endregion
 
     /// <summary>
@@ -4987,6 +5019,24 @@ public interface IEngine
     /// <param name="activation">Activation function to apply.</param>
     /// <returns>Output tensor with shape [..., outputFeatures].</returns>
     Tensor<T> FusedLinear<T>(
+        Tensor<T> input,
+        Tensor<T> weights,
+        Tensor<T>? bias,
+        FusedActivationType activation,
+        FusedActivationParams? activationParams = null);
+
+    /// <summary>
+    /// <see cref="FusedLinear{T}"/> written into a caller-provided destination tensor
+    /// instead of allocating the <c>[M, N]</c> output — the dominant per-forward allocator
+    /// on the DiT/SiT inference path (#1672). Computes <c>activation(input @ weights + bias)</c>
+    /// straight into <paramref name="destination"/> (contiguous <c>[M, N]</c>, fully overwritten).
+    /// Numerics are bit-identical to <see cref="FusedLinear{T}"/> (same GEMM tiers + bias/activation
+    /// epilogue). Inference-only: no tape/graph recording — the caller must ensure no gradient tape
+    /// is active. ND/generic shapes fall back to the allocating overload + a copy (correct, just no
+    /// allocation saving).
+    /// </summary>
+    void FusedLinearInto<T>(
+        Tensor<T> destination,
         Tensor<T> input,
         Tensor<T> weights,
         Tensor<T>? bias,

@@ -47,6 +47,12 @@ internal static class PackBothStrategy
     // chunks of ~256, while chunking still amortizes per-tile dispatch. Settable for sweeps.
     internal static int MaxPanelTiles = 256;
 
+    // #475: route the FP32 N-axis compute loop's Mr-sweep through the machine-code MACRO kernel
+    // (RunMacroPanelFp32) — the whole numMr × njr × kc sweep in one asm call, taking RyuJIT off the
+    // hot path (PerfView showed ~36% of single-thread time in the managed RunNAxisParallelUnsafe
+    // loop body). A/B toggle; default off until bit-exactness is validated, then flipped on.
+    internal static bool s_macroKernel;
+
     // #653 software-prefetch microkernel (env AIDOTNET_GEMM_PREFETCH=1, default off). Routes the
     // FP32 6×16 tile through Avx2Fp32_6x16.RunPrefetch (PREFETCHT0 of packed-B ahead) — same inlined
     // intrinsic kernel, so NO per-tile call/fixed overhead (unlike the machine-code-per-tile path
@@ -142,7 +148,9 @@ internal static class PackBothStrategy
             // to fill all cores via M-axis parallel alone. ShouldUse2DGrid returns
             // true when (numMBlocks * 2 < procs && numNBlocks > 1) — i.e., the
             // existing M-axis split would leave half or more cores idle.
-            int procs = options.NumThreads > 0 ? options.NumThreads : Environment.ProcessorCount;
+            // #475: default fan-out caps at PHYSICAL cores (FMA-bound GEMM regresses on SMT threads —
+            // measured ffn peak at 16, regress at 24/32). An explicit NumThreads request is honoured.
+            int procs = options.NumThreads > 0 ? options.NumThreads : CpuParallelSettings.GemmThreadCount(Environment.ProcessorCount);
             if (options.NumThreads < 0) procs = 1;
             int numMBlocks = (m + mc - 1) / mc;
             int numNBlocks = (n + nc - 1) / nc;
@@ -205,10 +213,14 @@ internal static class PackBothStrategy
             int numNBlocksN = (n + ncN - 1) / ncN;
             bool useNAxis = !s_disableNAxis
                 && MachineKernelGemm.IsFp32PanelAvailable
+                // The N-axis path computes with RunPanelFp32 = the 6×16 panel kernel (mr=6), but packs A
+                // with `mr`. Under AVX-512 the strategy selects the 16×16 microkernel (mr=16), so the A-pack
+                // (16-row stripes) would mismatch the 6-row panel kernel → garbage. Gate to the panel's mr.
+                && mr == MachineKernelGemm.Fp32Mr
                 && typeof(T) == typeof(float)
                 && !transA && !transB
                 && options.PackedA is null && options.PackedB is null
-                && (m % mr) == 0 && m >= mr
+                && (s_allowNAxisMTail || (m % mr) == 0) && m >= mr
                 // Wide-N gate (n >= k): the N-axis re-reads the shared A (m×k) once per N-block,
                 // so it pays off only when N is wide enough to amortize that — measured across 6
                 // interleaved reps: ffn-big n=4096≥k=3456 wins +27% (DOP32, 6/6) and is neutral
@@ -218,6 +230,7 @@ internal static class PackBothStrategy
                 && numNBlocksN >= 2 && numNBlocksN >= Math.Min(4, effProcs)
                 && options.Epilogue.Activation == AiDotNet.Tensors.Engines.FusedActivationType.None
                 && options.Epilogue.BiasN.IsEmpty && options.Epilogue.SkipMxN.IsEmpty;
+
             if (useNAxis)
             {
                 System.Threading.Interlocked.Increment(ref s_nAxisRunCount); // test observable (see s_nAxisRunCount)
@@ -865,6 +878,12 @@ internal static class PackBothStrategy
     // Route wide-N moderate-M float GEMMs to the N-axis private-B path. Test-only toggle.
     internal static bool s_disableNAxis;
 
+    // #90: allow the shared-A N-axis path for m % mr != 0 (a scalar M-tail handles the <mr leftover
+    // rows). Unlocks the m=256 DiT shapes (m%6=4) currently stuck on the slower per-tile GotoGemm path.
+    // Default OFF until A/B'd (--ab-naxis-mtail); the M-tail code itself is always correct (no-op when
+    // m % mr == 0). Flipping this on changes routing, so it stays a gate, not unconditional.
+    internal static bool s_allowNAxisMTail;
+
     // Test-only observable: incremented each time the N-axis private-B path actually runs, so the
     // parity test can assert the N-axis path was exercised (not silently falling back to M-axis,
     // which would make the bit-identity comparison vacuous M-vs-M).
@@ -876,10 +895,12 @@ internal static class PackBothStrategy
     /// PRIVATE per-thread buffer (its L2) and computes all M for that N-block with the panel
     /// kernel. This is the OpenBLAS macro-loop: no shared-L3 B contention (each thread's B is
     /// private) AND no redundant B-packing (each N-block's B packed exactly once) — the two
-    /// failure modes of the M-axis shared-B path and the 2D grid respectively. Gated to
-    /// m%mr==0 float (the M-tail-free case, e.g. FFN m=384); other shapes use the M-axis path.
+    /// failure modes of the M-axis shared-B path and the 2D grid respectively. The full Mr-stripes use
+    /// the packed panel kernel; when m % mr != 0 and <see cref="s_allowNAxisMTail"/> is enabled (#90), the
+    /// &lt;mr leftover tail rows are computed separately with a scalar ascending-k A/B readback. By default
+    /// (flag off) only m % mr == 0 reaches this path (e.g. FFN m=384) and there is no tail.
     /// Bit-identical: each C[ir,jc] tile reduces over k in ascending K-panel order; jc blocks
-    /// own disjoint C columns so no cross-thread write sync.
+    /// own disjoint C columns so no cross-thread write sync (the tail rows likewise — disjoint columns).
     /// </summary>
     private static unsafe void RunNAxisParallelUnsafe(
         float* aPtr, int aLen, int lda,
@@ -889,36 +910,49 @@ internal static class PackBothStrategy
     {
         int numKPanels = (k + kc - 1) / kc;
         int numNBlocks = (n + nc - 1) / nc;
-        int numMr = m / mr; // m % mr == 0 guaranteed by caller
+        int numMr = m / mr;       // full Mr-stripes
+        int mFull = numMr * mr;    // rows [mFull, m) are the M-tail (0 unless s_allowNAxisMTail)
 
         // ── Pack ALL of A once (shared, read-only). Layout: [K-panel][Mr-stripe][Kc × Mr]. ──
         // Panel pc occupies numMr * effKc * mr floats; pc panels are laid end to end with a
         // fixed per-panel stride of numMr * kc * mr so a worker can index (pc, ir) directly.
         int aPanelStride = numMr * kc * mr;
-        long packAElems = (long)numKPanels * aPanelStride;
-        var packAArr = System.Buffers.ArrayPool<float>.Shared.Rent((int)packAElems);
+        long packAElemsPerCopy = (long)numKPanels * aPanelStride;
+        // Per-CCX A-replication: pack ONE packed-A copy per L3 domain so each pinned worker reads its
+        // CCX-local copy (no cross-CCX shared-A reads). Copies are identical ⇒ bit-exact; a non-pinned
+        // thread (CurrentDomain==0) reads copy 0. Only when the pinned pool + replication are both on.
+        int nCopies = (PinnedParallel.s_enabled && PinnedParallel.s_replicate && PinnedParallel.DomainCount > 1)
+            ? PinnedParallel.DomainCount : 1;
+        var packAArr = System.Buffers.ArrayPool<float>.Shared.Rent((int)(packAElemsPerCopy * nCopies));
         try
         {
             for (int pIdx = 0; pIdx < numKPanels; pIdx++)
             {
                 int pc = pIdx * kc;
                 int effKc = Math.Min(kc, k - pc);
-                // PackA writes [Mr-stripe][effKc × mr] (mc=m → all stripes).
+                // PackA writes [Mr-stripe][effKc × mr] — only the mFull full stripes (mc=mFull). Any
+                // M-tail rows [mFull, m) are NOT packed; they go through the scalar tail below.
                 Avx2Pack.PackA<float>(
                     new ReadOnlySpan<float>(aPtr + pc, aLen - pc), lda, false,
                     packAArr.AsSpan(pIdx * aPanelStride, numMr * effKc * mr),
-                    mc: m, kc: effKc, mr);
+                    mc: mFull, kc: effKc, mr);
             }
+            // Replicate copy 0 into the remaining per-CCX copies.
+            for (int cp = 1; cp < nCopies; cp++)
+                Array.Copy(packAArr, 0L, packAArr, cp * packAElemsPerCopy, packAElemsPerCopy);
 
-            nint aPackAddr = 0, bAddr = (nint)bPtr, cAddr = (nint)cPtr;
-            fixed (float* paBase = packAArr) { aPackAddr = (nint)paBase;
+            nint bAddr = (nint)bPtr, cAddr = (nint)cPtr, aOrigAddr = (nint)aPtr;
+            int aCopyStrideBytes = (int)(packAElemsPerCopy * sizeof(float));
+            int nCopiesL = nCopies;
+            int ldaL = lda, mFullL = mFull, mTailL = m;
+            fixed (float* paBase = packAArr) { nint aPackAddr = (nint)paBase;
 
             int kcL = kc, ncL = nc, nrL = nr, mrL = mr, ldbL = ldb, ldcL = ldc;
             int numKPanelsL = numKPanels, numMrL = numMr, aPanelStrideL = aPanelStride;
             int kL = k, nL = n, bLenL = bLen, cLenL = cLen;
             long totalWork = (long)m * n * k * 2;
 
-            CpuParallelSettings.ParallelForOrSerial(0, numNBlocks, totalWork, jcIdx =>
+            Action<int> nAxisBody = jcIdx =>
             {
                 int jc = jcIdx * ncL;
                 int effNc = Math.Min(ncL, nL - jc);
@@ -931,7 +965,10 @@ internal static class PackBothStrategy
                 byte[] packBArr = System.Buffers.ArrayPool<byte>.Shared.Rent(numKPanelsL * bPanelStride * sizeof(float));
                 try
                 {
-                    float* pa = (float*)aPackAddr;
+                    // Per-CCX A-replication: read this worker's CCX-local packed-A copy (copy 0 otherwise).
+                    int cp = nCopiesL > 1 ? PinnedParallel.CurrentDomain : 0;
+                    if (cp < 0 || cp >= nCopiesL) cp = 0;
+                    float* pa = (float*)(aPackAddr + (nint)cp * aCopyStrideBytes);
                     float* bb = (float*)bAddr;
                     float* cc = (float*)cAddr;
                     var packBSpan = MemoryMarshal.Cast<byte, float>(packBArr.AsSpan());
@@ -949,42 +986,98 @@ internal static class PackBothStrategy
 
                     // Compute: for each K-panel (ascending → correct C accumulation), each
                     // Mr-block does one chunked panel call over the N-block's full tiles + tail.
-                    for (int pIdx = 0; pIdx < numKPanelsL; pIdx++)
+                    // #475: when enabled, the whole Mr-sweep runs in the machine-code MACRO kernel
+                    // (one asm call per K-panel/N-chunk), taking RyuJIT off the hot path.
+                    bool useMacro = s_macroKernel && njrFull > 0 && MachineKernelGemm.IsFp32MacroAvailable;
+                    fixed (float* pbPacked = packBSpan)
                     {
-                        int pc = pIdx * kcL;
-                        int effKc = Math.Min(kcL, kL - pc);
-                        var bPanel = packBSpan.Slice(pIdx * bPanelStride, effKc * packedNc);
-                        for (int ir = 0; ir < numMrL; ir++)
+                        for (int pIdx = 0; pIdx < numKPanelsL; pIdx++)
                         {
-                            var aPanel = new ReadOnlySpan<float>(pa + pIdx * aPanelStrideL + ir * effKc * mrL, effKc * mrL);
-                            int cOff = (ir * mrL) * ldcL + jc;
-                            if (njrFull > 0)
+                            int pc = pIdx * kcL;
+                            int effKc = Math.Min(kcL, kL - pc);
+                            var bPanel = packBSpan.Slice(pIdx * bPanelStride, effKc * packedNc);
+                            int maxPanelTiles = Math.Max(1, MaxPanelTiles); // guard sweep-set 0/negative
+
+                            if (useMacro)
                             {
-                                int maxPanelTiles = Math.Max(1, MaxPanelTiles); // guard sweep-set 0/negative
+                                float* aBase0 = pa + pIdx * aPanelStrideL;
+                                float* bBase0 = pbPacked + pIdx * bPanelStride;
+                                int aStrideBytes = effKc * mrL * sizeof(float);
                                 for (int jb = 0; jb < njrFull; jb += maxPanelTiles)
                                 {
                                     int chunk = Math.Min(maxPanelTiles, njrFull - jb);
-                                    MachineKernelGemm.RunPanelFp32(
-                                        aPanel,
-                                        bPanel.Slice(jb * effKc * nrL, chunk * effKc * nrL),
-                                        new Span<float>(cc + cOff + jb * nrL, cLenL - (cOff + jb * nrL)),
-                                        ldcL, effKc, chunk);
+                                    MachineKernelGemm.RunMacroPanelFp32(
+                                        aBase0, bBase0 + jb * effKc * nrL, cc + jc + jb * nrL,
+                                        ldcL, effKc, chunk, numMrL, aStrideBytes);
                                 }
                             }
+                            else if (njrFull > 0)
+                            {
+                                for (int ir = 0; ir < numMrL; ir++)
+                                {
+                                    var aPanel = new ReadOnlySpan<float>(pa + pIdx * aPanelStrideL + ir * effKc * mrL, effKc * mrL);
+                                    int cOff = (ir * mrL) * ldcL + jc;
+                                    for (int jb = 0; jb < njrFull; jb += maxPanelTiles)
+                                    {
+                                        int chunk = Math.Min(maxPanelTiles, njrFull - jb);
+                                        MachineKernelGemm.RunPanelFp32(
+                                            aPanel,
+                                            bPanel.Slice(jb * effKc * nrL, chunk * effKc * nrL),
+                                            new Span<float>(cc + cOff + jb * nrL, cLenL - (cOff + jb * nrL)),
+                                            ldcL, effKc, chunk);
+                                    }
+                                }
+                            }
+
+                            // Nr tail (effNc % nr != 0): per-Mr-block managed dispatch (small).
                             if (nrTail > 0)
                             {
                                 int jrTail = njrFull * nrL;
-                                DispatchMicrokernelWithTail<float>(
-                                    aPanel,
-                                    bPanel.Slice(njrFull * effKc * nrL, effKc * nrL),
-                                    new Span<float>(cc + cOff + jrTail, cLenL - (cOff + jrTail)),
-                                    ldcL, effKc, mrL, nrL, nrTail);
+                                var bTail = bPanel.Slice(njrFull * effKc * nrL, effKc * nrL);
+                                for (int ir = 0; ir < numMrL; ir++)
+                                {
+                                    var aPanel = new ReadOnlySpan<float>(pa + pIdx * aPanelStrideL + ir * effKc * mrL, effKc * mrL);
+                                    int cOff = (ir * mrL) * ldcL + jc + jrTail;
+                                    DispatchMicrokernelWithTail<float>(
+                                        aPanel, bTail,
+                                        new Span<float>(cc + cOff, cLenL - cOff),
+                                        ldcL, effKc, mrL, nrL, nrTail);
+                                }
+                            }
+                        }
+                    }
+
+                    // #90 M-tail: rows [mFull, m) aren't in packed-A (only full Mr-stripes). This N-block
+                    // owns disjoint C columns [jc, jc+effNc), so accumulate those tail rows here with a
+                    // scalar K-loop reading the ORIGINAL A and B (the <mr leftover rows are a small fraction;
+                    // e.g. 4/256 for the DiT m=256 shapes). C := A·B (overwrite). Ascending k ⇒ deterministic
+                    // and disjoint-column ⇒ no cross-thread write race. No-op when mFull == m (m % mr == 0).
+                    if (mFullL < mTailL)
+                    {
+                        float* aOrig = (float*)aOrigAddr;
+                        float* bOrig = (float*)bAddr;
+                        float* cOut = (float*)cAddr;
+                        for (int r = mFullL; r < mTailL; r++)
+                        {
+                            float* aRow = aOrig + (long)r * ldaL;
+                            float* cRow = cOut + (long)r * ldcL + jc;
+                            for (int col = 0; col < effNc; col++)
+                            {
+                                float s = 0f;
+                                float* bCol = bOrig + jc + col;
+                                for (int kk = 0; kk < kL; kk++) s += aRow[kk] * bCol[(long)kk * ldbL];
+                                cRow[col] = s;
                             }
                         }
                     }
                 }
                 finally { System.Buffers.ArrayPool<byte>.Shared.Return(packBArr); }
-            }, deterministicSafe: true); // N-axis split: disjoint C columns, fixed-order K reduction
+            }; // N-axis body: disjoint C columns, fixed-order K reduction (bit-exact regardless of dispatch)
+            // #85 EXPERIMENT (gated): route the N-block parallel-for through the L3-domain-PINNED pool to
+            // test whether pinning closes the per-core gap to OpenBLAS (59 vs our ~42). Same body ⇒
+            // bit-exact. Returns false (→ threadpool) when unavailable/busy; throws only on a real fault.
+            if (!(PinnedParallel.s_enabled && PinnedParallel.For(0, numNBlocks, nAxisBody)))
+                CpuParallelSettings.ParallelForOrSerial(0, numNBlocks, totalWork, nAxisBody, deterministicSafe: true);
             }
         }
         finally { System.Buffers.ArrayPool<float>.Shared.Return(packAArr); }

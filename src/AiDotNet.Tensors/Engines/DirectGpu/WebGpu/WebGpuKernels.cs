@@ -9309,8 +9309,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let px1=pred[o]; let py1=pred[o+1u]; let px2=pred[o+2u]; let py2=pred[o+3u];
     let tx1=targ[o]; let ty1=targ[o+1u]; let tx2=targ[o+2u]; let ty2=targ[o+3u];
     let iw=max(0.0,min(px2,tx2)-max(px1,tx1)); let ih=max(0.0,min(py2,ty2)-max(py1,ty1));
-    let iA=iw*ih; let pw=px2-px1+1e-7; let ph=py2-py1+1e-7;
-    let uA=pw*ph+(tx2-tx1)*(ty2-ty1)-iA+1e-7;
+    let iA=iw*ih; let pw=max(px2-px1,1e-7); let ph=max(py2-py1,1e-7);
+    let uA=pw*ph+max(0.0,tx2-tx1)*max(0.0,ty2-ty1)-iA+1e-7;
     let hi=select(0.0,1.0,iw>0.0&&ih>0.0);
     let dI0=hi*select(0.0,-1.0,px1>tx1)*ih; let dI1=hi*select(0.0,-1.0,py1>ty1)*iw;
     let dI2=hi*select(0.0,1.0,px2<tx2)*ih; let dI3=hi*select(0.0,1.0,py2<ty2)*iw;
@@ -9324,7 +9324,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let cSq=encDx*encDx+encDy*encDy+1e-7; let cSqSq=cSq*cSq;
     let dCSq0=2.0*encDx*select(0.0,-1.0,px1<tx1); let dCSq1=2.0*encDy*select(0.0,-1.0,py1<ty1);
     let dCSq2=2.0*encDx*select(0.0,1.0,px2>tx2); let dCSq3=2.0*encDy*select(0.0,1.0,py2>ty2);
-    let tw=tx2-tx1+1e-7; let th=ty2-ty1+1e-7;
+    let tw=max(tx2-tx1,1e-7); let th=max(ty2-ty1,1e-7);
     let atanDiff=atan(tw/th)-atan(pw/ph); let fourOverPiSq=4.0/(3.14159265*3.14159265);
     let v=fourOverPiSq*atanDiff*atanDiff;
     let iou=iA/uA;
@@ -9353,7 +9353,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let px1=pred[o]; let py1=pred[o+1u]; let px2=pred[o+2u]; let py2=pred[o+3u];
     let tx1=targ[o]; let ty1=targ[o+1u]; let tx2=targ[o+2u]; let ty2=targ[o+3u];
     let iW=max(0.0,min(px2,tx2)-max(px1,tx1)); let iH=max(0.0,min(py2,ty2)-max(py1,ty1));
-    let iA=iW*iH; let pA=(px2-px1)*(py2-py1); let tA=(tx2-tx1)*(ty2-ty1);
+    let iA=iW*iH; let pA=max(0.0,px2-px1)*max(0.0,py2-py1); let tA=max(0.0,tx2-tx1)*max(0.0,ty2-ty1);
     let uA=pA+tA-iA+1e-7; let iou=iA/uA;
     let eA=(max(px2,tx2)-min(px1,tx1))*(max(py2,ty2)-min(py1,ty1))+1e-7;
     loss[i] = 1.0 - (iou - (eA - uA) / eA);
@@ -9373,7 +9373,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let px1=pred[o]; let py1=pred[o+1u]; let px2=pred[o+2u]; let py2=pred[o+3u];
     let tx1=targ[o]; let ty1=targ[o+1u]; let tx2=targ[o+2u]; let ty2=targ[o+3u];
     let iW=max(0.0,min(px2,tx2)-max(px1,tx1)); let iH=max(0.0,min(py2,ty2)-max(py1,ty1));
-    let iA=iW*iH; let pA=(px2-px1)*(py2-py1); let tA=(tx2-tx1)*(ty2-ty1);
+    let iA=iW*iH; let pA=max(0.0,px2-px1)*max(0.0,py2-py1); let tA=max(0.0,tx2-tx1)*max(0.0,ty2-ty1);
     let uA=pA+tA-iA+1e-7; let iou=iA/uA;
     let dx=0.5*(px1+px2)-0.5*(tx1+tx2); let dy=0.5*(py1+py2)-0.5*(ty1+ty2);
     let cds=dx*dx+dy*dy;
@@ -9396,13 +9396,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let px1=pred[o]; let py1=pred[o+1u]; let px2=pred[o+2u]; let py2=pred[o+3u];
     let tx1=targ[o]; let ty1=targ[o+1u]; let tx2=targ[o+2u]; let ty2=targ[o+3u];
     let iW=max(0.0,min(px2,tx2)-max(px1,tx1)); let iH=max(0.0,min(py2,ty2)-max(py1,ty1));
-    let iA=iW*iH; let pA=(px2-px1)*(py2-py1); let tA=(tx2-tx1)*(ty2-ty1);
+    let iA=iW*iH; let pA=max(0.0,px2-px1)*max(0.0,py2-py1); let tA=max(0.0,tx2-tx1)*max(0.0,ty2-ty1);
     let uA=pA+tA-iA+1e-7; let iou=iA/uA;
     let dx=0.5*(px1+px2)-0.5*(tx1+tx2); let dy=0.5*(py1+py2)-0.5*(ty1+ty2);
     let cds=dx*dx+dy*dy;
     let eDx=max(px2,tx2)-min(px1,tx1); let eDy=max(py2,ty2)-min(py1,ty1);
     let ds=eDx*eDx+eDy*eDy+1e-7;
-    let pw=px2-px1+1e-7; let ph=py2-py1+1e-7; let tw=tx2-tx1+1e-7; let th=ty2-ty1+1e-7;
+    let pw=max(px2-px1,1e-7); let ph=max(py2-py1,1e-7); let tw=max(tx2-tx1,1e-7); let th=max(ty2-ty1,1e-7);
     let rd=atan(tw/th)-atan(pw/ph);
     let v=(4.0/(3.14159265*3.14159265))*rd*rd;
     let alpha=v/(1.0-iou+v+1e-7);
@@ -9426,8 +9426,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let iW=max(0.0, min(px2,tx2)-max(px1,tx1));
     let iH=max(0.0, min(py2,ty2)-max(py1,ty1));
     let iA=iW*iH;
-    let pA=(px2-px1)*(py2-py1);
-    let tA=(tx2-tx1)*(ty2-ty1);
+    let pA=max(0.0,px2-px1)*max(0.0,py2-py1);
+    let tA=max(0.0,tx2-tx1)*max(0.0,ty2-ty1);
     let uA=pA+tA-iA+1e-7;
     loss[i] = 1.0 - iA/uA;
 }";

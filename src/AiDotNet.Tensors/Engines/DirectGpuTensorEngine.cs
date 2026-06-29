@@ -339,6 +339,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal IDisposable EnterCompiledCapturePath()
     {
         System.Threading.Interlocked.Increment(ref _capturePathDepth);
+        s_residentScratchEngine = this;   // route the static AllocateOutputBuffer's transient allocs here
         return new CapturePathScope(this);
     }
 
@@ -349,7 +350,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         public void Dispose()
         {
             var e = System.Threading.Interlocked.Exchange(ref _e, null);
-            if (e is not null) System.Threading.Interlocked.Decrement(ref e._capturePathDepth);
+            if (e is not null && System.Threading.Interlocked.Decrement(ref e._capturePathDepth) == 0)
+            {
+                e._currentScratchAction = -1;
+                if (ReferenceEquals(s_residentScratchEngine, e)) s_residentScratchEngine = null;
+            }
         }
     }
 
@@ -2070,6 +2075,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int removeCount = entries.Length / 2;
         if (removeCount == 0) return toDispose;
 
+        // #226 ROBUST FIX: drain THIS THREAD's pending deferred downloads before freeing ANY buffer. The
+        // per-entry `IsPending(entries[i].Key)` guard below only catches a materializer registered under the
+        // SAME object as the cache key — but BindResidentBuffer registers its download keyed by the tensor's
+        // BACKING ARRAY while the activation cache may key the same logical tensor by its DataVector (or vice
+        // versa). A buffer whose pending download is keyed differently than its cache entry then gets freed
+        // here, and the later materialize hits a released buffer → "GPU buffer released before its deferred
+        // download (#226)" (seen on eager d384/L4+). MaterializeAll is thread-scoped (only this thread's
+        // pending, so it never touches another tape-thread's in-flight buffer) and idempotent; after it runs
+        // no buffer we are about to free can have an outstanding download, regardless of its key. Eviction
+        // only fires under real VRAM pressure (the count cap is huge), so this broader drain is rare, not
+        // per-step. Not reached during capture (eviction is suspended while the stream is capturing).
+        Helpers.DeferredArrayMaterializer.MaterializeAll(swallowErrors: true);
+
         // Find threshold using Array.Sort on timestamps (avoids LINQ allocation)
         var timestamps = new long[entries.Length];
         for (int i = 0; i < entries.Length; i++)
@@ -2347,8 +2365,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // current weights and caches them. The offload-pointer path (GpuPinned / GpuOffload) has
             // _gpuBuffer == null and owns its own device-pointer lifetime, so it is NOT version-tracked —
             // keep trusting it unconditionally.
+            //
+            // EXCEPTION — the resident/captured training step (#638): during ResidentStepActive the DEVICE
+            // buffer is authoritative, not the host array. On-device Adam updates the resident weight buffer
+            // IN PLACE and bumps the host Version WITHOUT refreshing _gpuBufferVersion, so the version-gate
+            // would (a) falsely judge the fresh device buffer "stale" and re-upload the now-OLD host array
+            // over it (a correctness regression for on-device training) and (b) issue a cuStreamSynchronize
+            // re-upload that is illegal inside CUDA-graph capture (CUDA-900 → capture aborts → eager
+            // fallback, losing the 1.8× whole-step capture). So in the resident step trust the device buffer
+            // unconditionally; the #649 stale-weight gate still guards the eager/eval inference path.
             bool versionTracked = weights._gpuBuffer != null;
-            if (!versionTracked || weights._gpuBufferVersion == weights.Version)
+            if (ResidentStepActive || !versionTracked || weights._gpuBufferVersion == weights.Version)
                 return new OwnedBuffer(resident, ownsBuffer: false);
         }
         return GetOrCacheWeightBuffer(backend, weights.GetDataArray(), role);
@@ -2435,6 +2462,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private static OwnedBuffer AllocateOutputBuffer(IDirectGpuBackend backend, int size)
     {
+        // PR #638 capture-determinism: inside a compiled action during the resident step, draw from the engine's
+        // per-action static pool (stable address by (action,local) → no graph alloc node, no AUTO_FREE
+        // non-determinism). ownsBuffer:false so the caller's using/Dispose is a no-op on the pooled buffer.
+        var eng = s_residentScratchEngine;
+        if (eng is not null && eng.ScratchPoolingActive)
+            return new OwnedBuffer(eng.RentActionScratchOrAllocate(backend, size), ownsBuffer: false);
         return new OwnedBuffer(backend.AllocateBuffer(size), ownsBuffer: true);
     }
 
@@ -3813,6 +3846,72 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // Stable cached GPU buffer for a compiled-plan op OUTPUT: allocated ONCE and reused across steps (the
     // activation cache holds it alive while the step has eviction suspended), so capture/replay never cuMemAlloc
     // — a sync alloc inside a stream capture aborts it. Keyed by the destination's backing array.
+    // PR #638 capture-determinism: STATIC buffer assignment (the XLA/TensorRT/TVM industry approach — every op
+    // output gets a STABLE buffer keyed by its POSITION in the compiled graph, NOT by runtime call-order).
+    // The captured backward's intermediates are fresh tensors each step, so GetOrCreateResidentBuffer's caches
+    // MISS → it used to cuMemAllocAsync a new buffer each step → graph MEMORY NODES that AUTO_FREE_ON_LAUNCH
+    // reallocated non-deterministically each replay → grads came back zero/oscillating → frozen training. A
+    // global allocation-order index is too fragile (any variable-count alloc shifts every later buffer — it
+    // regressed when AllocateOutputBuffer was added). Key instead by (compiled-action index, local-alloc-index
+    // within that action): action i's allocs ALWAYS map to the same buffers regardless of what other actions
+    // do → robust + deterministic across the pre-residency pass, the capture pass, and every replay. The pool
+    // persists for the plan's life (the replayed graph bakes in these addresses). Pooling engages ONLY inside a
+    // compiled action (_currentScratchAction >= 0); the pre-pass (EnsureResidentBuffer) and the eager optimizer
+    // run with action = -1 → normal alloc, so the cached-once persistent buffers are never pooled.
+    private readonly System.Collections.Generic.Dictionary<long, IGpuBuffer> _actionScratchPool = new();
+    private int _currentScratchAction = -1;
+    private int _currentScratchLocal;
+
+    /// <summary>Mark the compiled action whose transient scratch allocs are pooled by (action, local) for
+    /// capture determinism. Call before each fwd/bwd action; pass -1 to disable (pre-pass / optimizer / eval).</summary>
+    internal void SetCurrentScratchAction(int action) { _currentScratchAction = action; _currentScratchLocal = 0; }
+
+    /// <summary>True while inside a compiled action whose transient scratch should draw from the static pool.</summary>
+    private bool ScratchPoolingActive => _currentScratchAction >= 0 && ResidentStepActive;
+
+    /// <summary>Pool a transient when inside a compiled action (stable buffer by (action,local)); else normal alloc.
+    /// Exposed for the static AllocateOutputBuffer routing.</summary>
+    internal IGpuBuffer RentActionScratchOrAllocate(IDirectGpuBackend backend, int length)
+        => ScratchPoolingActive ? RentActionScratch(backend, length) : backend.AllocateBuffer(length);
+
+    private IGpuBuffer RentActionScratch(IDirectGpuBackend backend, int length)
+    {
+        long key = ((long)_currentScratchAction << 32) | (uint)_currentScratchLocal++;
+        if (_actionScratchPool.TryGetValue(key, out var b) && b is not null
+            && b.Handle != System.IntPtr.Zero && b.Size >= length)
+        {
+            // Re-zero on reuse to preserve the alloc-zero invariant (accumulate / partial-write ops read it).
+            // Capturable cuMemsetD8Async on _stream (CudaBackend.MemsetBuffer); Fill/cuMemsetD32 aborts capture.
+            if (backend is DirectGpu.CUDA.CudaBackend cudaZ) cudaZ.MemsetBuffer(b, 0, (long)length * sizeof(float));
+            else backend.Fill(b, 0f, length);
+            return b;
+        }
+        if (b is not null) { try { b.Dispose(); } catch { } }
+        var nb = backend.AllocateBuffer(length);   // first pass at this (action,local): record the stable buffer
+        _actionScratchPool[key] = nb;
+        return nb;
+    }
+
+    /// <summary>Dispose + clear the per-action capture scratch pool. Call at the training→eval transition:
+    /// these pooled transient buffers are training-only (the captured graph does NOT replay during forward-only
+    /// eval), and on a big model (d256/L4+) they hold GBs that the async pool reserved at the training peak.
+    /// Freeing them returns that memory to the pool (then trimmable to the OS on the next alloc-OOM retry), so
+    /// the eval forward's weight uploads no longer hit cuMemAllocAsync free=0. Safe ONLY when no further training
+    /// step will run on this plan (eval is terminal); a replay after this would read freed device memory.</summary>
+    public void ClearActionScratchPool()
+    {
+        foreach (var kv in _actionScratchPool)
+            { try { kv.Value?.Dispose(); } catch { } }
+        _actionScratchPool.Clear();
+        _currentScratchAction = -1;
+        _currentScratchLocal = 0;
+    }
+
+    // Set during the resident step so the STATIC AllocateOutputBuffer can route transient allocs into this
+    // engine's per-action pool. Plain static (one plan captures at a time on the single GPU; resident step is
+    // single-threaded in practice). Set on EnterCompiledCapturePath, cleared when its depth returns to 0.
+    private static DirectGpuTensorEngine? s_residentScratchEngine;
+
     private IGpuBuffer GetOrCreateResidentBuffer<T>(IDirectGpuBackend backend, Tensor<T> t, int length)
     {
         // PR #638 (CUDA-700 fix): the reused buffer MUST hold at least `length` elements. A pooled backing array
@@ -3835,6 +3934,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // re-cache (CacheActivation's TryAdd fails on an existing key and would keep the wrong-sized one).
             RemoveActivationCacheEntry(arr);
         }
+        // Resident/capture step: rent a deterministic stable scratch buffer (see RentResidentScratch). This is
+        // ONLY reached on a cache MISS (a fresh-array transient — the per-step backward intermediates), so it
+        // fires in the same order every step → the same device address each step/replay → capture-deterministic.
+        // Do NOT CacheActivation here: the cache's per-step bookkeeping during the resident step perturbs the
+        // captured graph (cuGraphLaunch fails). The caller binds the pooled buffer to `t` (BindResidentBuffer),
+        // so SAME-tensor consumers resolve it via t._gpuBuffer; the (action,local) key gives determinism.
+        if (ScratchPoolingActive)
+            return RentActionScratch(backend, length);
         var buf = backend.AllocateBuffer(length);
         if (arr is not null) CacheActivation(arr, buf, t._shape, backend);
         return buf;
@@ -8660,6 +8767,175 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    // ---- Grouped/depthwise (DCNv3) backward: single-launch GPU kernels (#1691 backward fusion). Each passes
+    // groups/deformGroups straight to the backend's grouped deformable_conv2d_backward_* kernel (one launch)
+    // instead of the inherited per-group CPU composition. Falls back to base (CPU composition oracle) when GPU
+    // is unavailable / inputs non-4D / a launch throws. groups=deformGroups=1 routes to the groups=1 override. ----
+
+    /// <summary>Grouped DeformableConv2D backward w.r.t. input — single GPU launch (#1691).</summary>
+    public override Tensor<T> DeformableConv2DGroupedBackwardInput<T>(
+        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> kernel, Tensor<T> offset, Tensor<T>? mask,
+        int[] inputShape, int[] stride, int[] padding, int[] dilation, int groups, int deformGroups)
+    {
+        if (groups == 1 && deformGroups == 1)
+            return DeformableConv2DBackwardInput(gradOutput, input, kernel, offset, mask, inputShape, stride, padding, dilation);
+        if (!TryGetBackend(out var backend) || gradOutput.Rank != 4 || input.Rank != 4 || kernel.Rank != 4)
+            return base.DeformableConv2DGroupedBackwardInput(gradOutput, input, kernel, offset, mask, inputShape, stride, padding, dilation, groups, deformGroups);
+
+        int batch = inputShape[0], inChannels = inputShape[1], inHeight = inputShape[2], inWidth = inputShape[3];
+        int outChannels = kernel.Shape._dims[0], kernelH = kernel.Shape._dims[2], kernelW = kernel.Shape._dims[3];
+        int outHeight = gradOutput.Shape._dims[2], outWidth = gradOutput.Shape._dims[3];
+        int inputSize = batch * inChannels * inHeight * inWidth;
+
+        using var gradOutputBuffer = GetOrAllocateBuffer(backend, gradOutput);
+        using var weightsBuffer = GetOrCacheWeightBuffer(backend, kernel.GetDataArray(), PersistentTensorRole.Weights);
+        using var offsetsBuffer = GetOrAllocateBuffer(backend, offset);
+        using var gradInputBuffer = AllocateOutputBuffer(backend, inputSize);
+        try
+        {
+            OwnedBuffer? maskBuffer = mask != null ? GetOrAllocateBuffer(backend, mask) : null;
+            try
+            {
+                backend.DeformableConv2DBackwardInput(
+                    gradOutputBuffer.Buffer, weightsBuffer.Buffer, offsetsBuffer.Buffer, maskBuffer?.Buffer, gradInputBuffer.Buffer,
+                    batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
+                    kernelH, kernelW, stride[0], stride[1], padding[0], padding[1], dilation[0], dilation[1], groups, deformGroups);
+                float[] resultFloat = new float[inputSize];
+                backend.DownloadBuffer(gradInputBuffer.Buffer, resultFloat);
+                return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat), inputShape);
+            }
+            finally { maskBuffer?.Dispose(); }
+        }
+        catch
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            return base.DeformableConv2DGroupedBackwardInput(gradOutput, input, kernel, offset, mask, inputShape, stride, padding, dilation, groups, deformGroups);
+        }
+    }
+
+    /// <summary>Grouped DeformableConv2D backward w.r.t. kernel — single GPU launch (#1691).</summary>
+    public override Tensor<T> DeformableConv2DGroupedBackwardKernel<T>(
+        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> offset, Tensor<T>? mask,
+        int[] kernelShape, int[] stride, int[] padding, int[] dilation, int groups, int deformGroups)
+    {
+        if (groups == 1 && deformGroups == 1)
+            return DeformableConv2DBackwardKernel(gradOutput, input, offset, mask, kernelShape, stride, padding, dilation);
+        if (!TryGetBackend(out var backend) || gradOutput.Rank != 4 || input.Rank != 4)
+            return base.DeformableConv2DGroupedBackwardKernel(gradOutput, input, offset, mask, kernelShape, stride, padding, dilation, groups, deformGroups);
+
+        int batch = input.Shape._dims[0], inChannels = input.Shape._dims[1], inHeight = input.Shape._dims[2], inWidth = input.Shape._dims[3];
+        int outChannels = kernelShape[0], kernelH = kernelShape[2], kernelW = kernelShape[3];
+        int outHeight = gradOutput.Shape._dims[2], outWidth = gradOutput.Shape._dims[3];
+        int kernelSize = kernelShape[0] * kernelShape[1] * kernelShape[2] * kernelShape[3];
+
+        using var gradOutputBuffer = GetOrAllocateBuffer(backend, gradOutput);
+        using var inputBuffer = GetOrAllocateBuffer(backend, input);
+        using var offsetsBuffer = GetOrAllocateBuffer(backend, offset);
+        using var gradWeightsBuffer = AllocateOutputBuffer(backend, kernelSize);
+        try
+        {
+            OwnedBuffer? maskBuffer = mask != null ? GetOrAllocateBuffer(backend, mask) : null;
+            try
+            {
+                backend.DeformableConv2DBackwardWeights(
+                    inputBuffer.Buffer, gradOutputBuffer.Buffer, offsetsBuffer.Buffer, maskBuffer?.Buffer, gradWeightsBuffer.Buffer,
+                    batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
+                    kernelH, kernelW, stride[0], stride[1], padding[0], padding[1], dilation[0], dilation[1], groups, deformGroups);
+                float[] resultFloat = new float[kernelSize];
+                backend.DownloadBuffer(gradWeightsBuffer.Buffer, resultFloat);
+                return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat), kernelShape);
+            }
+            finally { maskBuffer?.Dispose(); }
+        }
+        catch
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            return base.DeformableConv2DGroupedBackwardKernel(gradOutput, input, offset, mask, kernelShape, stride, padding, dilation, groups, deformGroups);
+        }
+    }
+
+    /// <summary>Grouped DeformableConv2D backward w.r.t. offset — single GPU launch (#1691).</summary>
+    public override Tensor<T> DeformableConv2DGroupedBackwardOffset<T>(
+        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> kernel, Tensor<T> offset, Tensor<T>? mask,
+        int[] stride, int[] padding, int[] dilation, int groups, int deformGroups)
+    {
+        if (groups == 1 && deformGroups == 1)
+            return DeformableConv2DBackwardOffset(gradOutput, input, kernel, offset, mask, stride, padding, dilation);
+        if (!TryGetBackend(out var backend) || gradOutput.Rank != 4 || input.Rank != 4 || kernel.Rank != 4)
+            return base.DeformableConv2DGroupedBackwardOffset(gradOutput, input, kernel, offset, mask, stride, padding, dilation, groups, deformGroups);
+
+        int batch = input.Shape._dims[0], inChannels = input.Shape._dims[1], inHeight = input.Shape._dims[2], inWidth = input.Shape._dims[3];
+        int outChannels = kernel.Shape._dims[0], kernelH = kernel.Shape._dims[2], kernelW = kernel.Shape._dims[3];
+        int outHeight = gradOutput.Shape._dims[2], outWidth = gradOutput.Shape._dims[3];
+        int offsetChannels = offset.Shape._dims[1];
+        int offsetSize = batch * offsetChannels * outHeight * outWidth;
+
+        using var gradOutputBuffer = GetOrAllocateBuffer(backend, gradOutput);
+        using var inputBuffer = GetOrAllocateBuffer(backend, input);
+        using var weightsBuffer = GetOrCacheWeightBuffer(backend, kernel.GetDataArray(), PersistentTensorRole.Weights);
+        using var offsetsBuffer = GetOrAllocateBuffer(backend, offset);
+        using var gradOffsetBuffer = AllocateOutputBuffer(backend, offsetSize);
+        try
+        {
+            OwnedBuffer? maskBuffer = mask != null ? GetOrAllocateBuffer(backend, mask) : null;
+            try
+            {
+                backend.DeformableConv2DBackwardOffset(
+                    inputBuffer.Buffer, weightsBuffer.Buffer, gradOutputBuffer.Buffer, offsetsBuffer.Buffer, maskBuffer?.Buffer, gradOffsetBuffer.Buffer,
+                    batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
+                    kernelH, kernelW, stride[0], stride[1], padding[0], padding[1], dilation[0], dilation[1], groups, deformGroups);
+                float[] resultFloat = new float[offsetSize];
+                backend.DownloadBuffer(gradOffsetBuffer.Buffer, resultFloat);
+                return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat), offset.Shape._dims);
+            }
+            finally { maskBuffer?.Dispose(); }
+        }
+        catch
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            return base.DeformableConv2DGroupedBackwardOffset(gradOutput, input, kernel, offset, mask, stride, padding, dilation, groups, deformGroups);
+        }
+    }
+
+    /// <summary>Grouped DeformableConv2D backward w.r.t. modulation mask — single GPU launch (#1691).</summary>
+    public override Tensor<T> DeformableConv2DGroupedBackwardMask<T>(
+        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> kernel, Tensor<T> offset, Tensor<T> mask,
+        int[] stride, int[] padding, int[] dilation, int groups, int deformGroups)
+    {
+        if (groups == 1 && deformGroups == 1)
+            return DeformableConv2DBackwardMask(gradOutput, input, kernel, offset, mask, stride, padding, dilation);
+        if (mask == null)
+            throw new ArgumentNullException(nameof(mask), "Mask cannot be null when computing mask gradients");
+        if (!TryGetBackend(out var backend) || gradOutput.Rank != 4 || input.Rank != 4 || kernel.Rank != 4 || mask.Rank != 4)
+            return base.DeformableConv2DGroupedBackwardMask(gradOutput, input, kernel, offset, mask, stride, padding, dilation, groups, deformGroups);
+
+        int batch = input.Shape._dims[0], inChannels = input.Shape._dims[1], inHeight = input.Shape._dims[2], inWidth = input.Shape._dims[3];
+        int outChannels = kernel.Shape._dims[0], kernelH = kernel.Shape._dims[2], kernelW = kernel.Shape._dims[3];
+        int outHeight = gradOutput.Shape._dims[2], outWidth = gradOutput.Shape._dims[3];
+        int maskSize = batch * mask.Shape._dims[1] * outHeight * outWidth;
+
+        using var gradOutputBuffer = GetOrAllocateBuffer(backend, gradOutput);
+        using var inputBuffer = GetOrAllocateBuffer(backend, input);
+        using var weightsBuffer = GetOrCacheWeightBuffer(backend, kernel.GetDataArray(), PersistentTensorRole.Weights);
+        using var offsetsBuffer = GetOrAllocateBuffer(backend, offset);
+        using var gradMaskBuffer = AllocateOutputBuffer(backend, maskSize);
+        try
+        {
+            backend.DeformableConv2DBackwardMask(
+                inputBuffer.Buffer, weightsBuffer.Buffer, gradOutputBuffer.Buffer, offsetsBuffer.Buffer, gradMaskBuffer.Buffer,
+                batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
+                kernelH, kernelW, stride[0], stride[1], padding[0], padding[1], dilation[0], dilation[1], groups, deformGroups);
+            float[] resultFloat = new float[maskSize];
+            backend.DownloadBuffer(gradMaskBuffer.Buffer, resultFloat);
+            return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat), mask.Shape._dims);
+        }
+        catch
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            return base.DeformableConv2DGroupedBackwardMask(gradOutput, input, kernel, offset, mask, stride, padding, dilation, groups, deformGroups);
+        }
+    }
+
     /// <summary>
     /// GPU-accelerated deformable conv2D backward pass for input gradients.
     /// Falls back to CPU implementation if GPU is unavailable.
@@ -11924,9 +12200,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (gR is not null && iR is not null && gamR is not null && meanR is not null && varR is not null)
                 {
                     IGpuBuffer? invVarBuf = null;
+                    bool invVarPooled = false;
                     try
                     {
-                        invVarBuf = backend.AllocateBuffer(batchSize);
+                        // CAPTURE-DETERMINISM (#638): pool the invVar scratch by (action,local) during the resident step
+                        // so it is NOT a cuMemAllocAsync graph node (the 8 small ~32KB in-capture allocs). Pooled ⇒ do
+                        // NOT dispose (the pool owns + reuses it across steps/replays); unpooled (eager/eval) ⇒ dispose.
+                        invVarPooled = ScratchPoolingActive;
+                        invVarBuf = invVarPooled ? RentActionScratch(backend, batchSize) : backend.AllocateBuffer(batchSize);
                         if (invVarBuf is not null && invVarBuf.Handle != System.IntPtr.Zero)
                         {
                             backend.AddScalar(varR, invVarBuf, (float)epsilon, batchSize); // var + eps
@@ -11952,7 +12233,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         }
                     }
                     catch (Exception ex) { AliasDiag($"LayerNormBackward-resident FELLBACK: {ex.GetType().Name}: {ex.Message}"); }
-                    finally { invVarBuf?.Dispose(); }
+                    finally { if (!invVarPooled) invVarBuf?.Dispose(); }
                 }
             }
 
@@ -17708,8 +17989,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                             outBuf = e.Buffer;
                 if (outBuf is null)
                 {
-                    outBuf = backend.AllocateBuffer(output.Length);
-                    if (arr is not null) CacheActivation(arr, outBuf, output._shape, backend);
+                    // CAPTURE-DETERMINISM (#638): inside a compiled action during the resident step, draw the permute
+                    // output from the per-action scratch pool — a stable address by (action,local) → NO cuMemAllocAsync
+                    // graph node → no AUTO_FREE_ON_LAUNCH realloc nondeterminism. This was the DOMINANT residual: ~50 of
+                    // 58 in-capture allocs funneled here (TensorPermute←PermuteBackward/MatMulBackward, and
+                    // ReduceAxisGpu←ReduceSum←SumToShape/ReduceGradToShape), each a fresh AllocateBuffer because the
+                    // backward intermediate's backing array is null (CacheActivation skipped) → cache miss every pass.
+                    // Pooled buffers are first-rented in the pre-residency pass (outside capture); the capture pass hits
+                    // the pool (no alloc). Do NOT CacheActivation when pooled (its per-step bookkeeping perturbs the
+                    // captured graph — matches GetOrCreateResidentBuffer's resident-miss path).
+                    if (ScratchPoolingActive)
+                        outBuf = RentActionScratch(backend, output.Length);
+                    else
+                    {
+                        outBuf = backend.AllocateBuffer(output.Length);
+                        if (arr is not null) CacheActivation(arr, outBuf, output._shape, backend);
+                    }
                 }
                 backend.Permute(bufIn.Buffer, outBuf, tensor.Shape._dims, axes);
                 ResidentSyncCheck("Permute");
@@ -19844,7 +20139,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     for (int i = 0; i < axis; i++) outerSize *= tensor.Shape._dims[i];
                     int reduceSize = tensor.Shape._dims[axis];
                     var gi = UploadTensorRaw(b, tensor);
-                    var go = b.AllocateBuffer(outerSize);
+                    var go = RentActionScratchOrAllocate(b, outerSize);
                     b.SumAxis(gi, go, outerSize, reduceSize);
                     int[] outShape;
                     if (keepDims)
@@ -19889,7 +20184,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     for (int i = 0; i < axis; i++) outerSize *= input.Shape._dims[i];
                     int reduceSize = input.Shape._dims[axis];
                     var gi = UploadTensorRaw(b, input);
-                    var go = b.AllocateBuffer(outerSize);
+                    var go = RentActionScratchOrAllocate(b, outerSize);
                     b.MeanAxis(gi, go, outerSize, reduceSize);
                     int[] outShape;
                     if (keepDims)

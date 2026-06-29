@@ -86,11 +86,16 @@ public partial class CpuEngine
         int batch, int seqLen, int modelDim, int numHeads, int headDim)
     {
         int hh = headDim * headDim;
-        var S = new double[hh];
-        for (int b = 0; b < batch; b++)
+        // Every (batch, head) pair is fully independent (private state S, disjoint output region), so the
+        // combined (b*numHeads) axis is embarrassingly parallel with no cross-channel reduction.
+        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, (bhStart, bhCount) =>
         {
-            for (int h = 0; h < numHeads; h++)
+            var S = new double[hh];
+            int bhEnd = bhStart + bhCount;
+            for (int bh = bhStart; bh < bhEnd; bh++)
             {
+                int b = bh / numHeads;
+                int h = bh % numHeads;
                 Array.Clear(S, 0, hh);
                 int hOff = h * headDim;
                 for (int t = 0; t < seqLen; t++)
@@ -114,8 +119,14 @@ public partial class CpuEngine
                     }
                 }
             }
-        }
+        });
     }
+
+    /// <summary>
+    /// Minimum (batch*head) units per parallel chunk for the head-parallel scan kernels. Each unit owns a
+    /// private state and disjoint output/gradient regions, so parallelization is fully lock-free.
+    /// </summary>
+    private const int GlaBhGrain = 1;
 
     private static void GlaBackwardDouble(
         double[] dOut, double[] Q, double[] K, double[] V, double[] G,
@@ -123,14 +134,19 @@ public partial class CpuEngine
         int batch, int seqLen, int modelDim, int numHeads, int headDim)
     {
         int hh = headDim * headDim;
-        var Straj = new double[seqLen * hh];
-        var S = new double[hh];
-        var dS = new double[hh];
-
-        for (int b = 0; b < batch; b++)
+        // Each (batch, head) pair is fully independent: dQ/dK/dV are indexed by an offset that already
+        // includes the head, dG by (b,t,h), and S/Straj/dS are per-pair scratch. Parallelize lock-free
+        // over the combined (b*numHeads) axis with per-chunk private scratch buffers.
+        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, (bhStart, bhCount) =>
         {
-            for (int h = 0; h < numHeads; h++)
+            var Straj = new double[seqLen * hh];
+            var S = new double[hh];
+            var dS = new double[hh];
+            int bhEnd = bhStart + bhCount;
+            for (int bh = bhStart; bh < bhEnd; bh++)
             {
+                int b = bh / numHeads;
+                int h = bh % numHeads;
                 int hOff = h * headDim;
 
                 // Forward recompute, saving the post-update state trajectory.
@@ -193,7 +209,7 @@ public partial class CpuEngine
                     for (int i = 0; i < hh; i++) dS[i] *= g;
                 }
             }
-        }
+        });
     }
 
     // ── Generic-T path ───────────────────────────────────────────────────────────────────
@@ -203,11 +219,15 @@ public partial class CpuEngine
     {
         var ops = MathHelper.GetNumericOperations<T>();
         int hh = headDim * headDim;
-        var S = new T[hh];
-        for (int b = 0; b < batch; b++)
+        // Parallelize lock-free over the independent (b*numHeads) axis; see the double path.
+        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, (bhStart, bhCount) =>
         {
-            for (int h = 0; h < numHeads; h++)
+            var S = new T[hh];
+            int bhEnd = bhStart + bhCount;
+            for (int bh = bhStart; bh < bhEnd; bh++)
             {
+                int b = bh / numHeads;
+                int h = bh % numHeads;
                 for (int i = 0; i < hh; i++) S[i] = ops.Zero;
                 int hOff = h * headDim;
                 for (int t = 0; t < seqLen; t++)
@@ -231,7 +251,7 @@ public partial class CpuEngine
                     }
                 }
             }
-        }
+        });
     }
 
     private static void GlaBackwardGeneric<T>(
@@ -241,14 +261,17 @@ public partial class CpuEngine
     {
         var ops = MathHelper.GetNumericOperations<T>();
         int hh = headDim * headDim;
-        var Straj = new T[seqLen * hh];
-        var S = new T[hh];
-        var dS = new T[hh];
-
-        for (int b = 0; b < batch; b++)
+        // Parallelize lock-free over the independent (b*numHeads) axis with per-chunk scratch; see double path.
+        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, (bhStart, bhCount) =>
         {
-            for (int h = 0; h < numHeads; h++)
+            var Straj = new T[seqLen * hh];
+            var S = new T[hh];
+            var dS = new T[hh];
+            int bhEnd = bhStart + bhCount;
+            for (int bh = bhStart; bh < bhEnd; bh++)
             {
+                int b = bh / numHeads;
+                int h = bh % numHeads;
                 int hOff = h * headDim;
                 for (int i = 0; i < hh; i++) S[i] = ops.Zero;
                 for (int t = 0; t < seqLen; t++)
@@ -305,7 +328,7 @@ public partial class CpuEngine
                     for (int i = 0; i < hh; i++) dS[i] = ops.Multiply(dS[i], g);
                 }
             }
-        }
+        });
     }
 
     private static void GlaScanBackward<T>(

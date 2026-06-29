@@ -40,6 +40,7 @@ public class NAxisParityTests
 
         var prior = CpuParallelSettings.MaxDegreeOfParallelism;
         var priorDisable = PB.s_disableNAxis;
+        var priorDisableGoto = BlasMgd.s_disableGotoGemm;
         CpuParallelSettings.MaxDegreeOfParallelism = 4;
         var a = Rand(m * k, 1);
         var b = Rand(k * n, 2);
@@ -48,6 +49,9 @@ public class NAxisParityTests
         long nAxisRunsForThisCase;
         try
         {
+            // This test verifies the PackBoth N-axis vs M-axis paths; the GotoGemm fast path would
+            // intercept these large float shapes before either runs, so disable it for the duration.
+            BlasMgd.s_disableGotoGemm = true;
             PB.s_disableNAxis = true;
             BlasMgd.Gemm<float>(a, k, false, b, n, false, cM, n, m, n, k);
 
@@ -59,6 +63,7 @@ public class NAxisParityTests
         finally
         {
             PB.s_disableNAxis = priorDisable;
+            BlasMgd.s_disableGotoGemm = priorDisableGoto;
             CpuParallelSettings.MaxDegreeOfParallelism = prior;
         }
 

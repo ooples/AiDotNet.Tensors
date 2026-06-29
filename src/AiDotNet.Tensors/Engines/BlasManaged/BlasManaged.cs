@@ -51,6 +51,22 @@ public static partial class BlasManaged
     private static readonly bool s_forceMachineKernel =
         System.Environment.GetEnvironmentVariable("AIDOTNET_FORCE_MK") == "1";
 
+    // GotoBLAS FP32 parallel path (the rewrite) is the default for large float GEMM (see the hook in
+    // Gemm{T}). Tests that must exercise the UNDERLYING strategy paths (N-axis vs M-axis parity, the
+    // machine-kernel dispatch, etc.) set this to true to disable the GotoGemm interception, mirroring
+    // PackBothStrategy.s_disableNAxis. Production leaves it false. Opt-out env: AIDOTNET_DISABLE_GOTO=1.
+    internal static bool s_disableGotoGemm =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_DISABLE_GOTO") == "1";
+
+    // OPT-IN bf16-B GEMM (AIDOTNET_GEMM_BF16=1, default OFF). Stores the streamed B operand as bf16
+    // (half the bytes → ~2× bandwidth headroom), A stays fp32, fp32 accumulate. PRECISION-CHANGING
+    // (~3 significant digits; rel-err ~3e-3) so it is NEVER default — only large bandwidth-bound shapes
+    // benefit (measured: sq2048 1.13×, sq4096 1.19×, BEATS MKL 147% on sq4096; HURTS the compute-bound
+    // sq1024 0.80×). Gated to the GotoGemm regime + GotoGemmFp32.ShouldUseBf16 (large work). For users
+    // who accept bf16 precision (common in diffusion inference) and want the bandwidth win on big GEMMs.
+    internal static bool s_gemmBf16 =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_BF16") == "1";
+
     // #653: extend the PackBoth parallelism-floor + wide-N blocking optimizations to the
     // DisableAutotune shim path the forward GEMM uses (CpuEngine.BatchMatMul -> 6-arg
     // SimdGemm.Sgemm -> Gemm{DisableAutotune}). Those optimizations were gated on
@@ -197,6 +213,12 @@ public static partial class BlasManaged
     /// </summary>
     public static bool PreferManaged { get; set; } = false;
 
+    // #475 Phase 1: route small FP32 GEMMs to the libxsmm-style JIT generator, which exceeds OpenBLAS
+    // 1.5-6x for n<=128 (measured --ab-jit). Gate to the win region (large-N unpacked streaming loses
+    // to OpenBLAS's blocking — Phase 1 extension adds K-blocking). A/B toggle; default on.
+    internal static bool s_useJitGemm = true;
+    private const int JitMaxN = 128, JitMaxM = 256, JitMaxK = 1024;
+
     /// <summary>
     /// Sub-F3 (#374 follow-up): when true, the <see cref="Helpers.BlasProvider"/>
     /// <c>TryGemm</c> / <c>TryGemmEx</c> entry points consult
@@ -320,6 +342,19 @@ public static partial class BlasManaged
         return false;
     }
 
+    // Validate that <paramref name="span"/> backs a [rows × cols] row-major tile with the given
+    // leading dimension (ld) — i.e. the last element the JIT kernel touches,
+    // (rows-1)*ld + cols, is in bounds. Used to gate the unsafe JIT GEMM path: if any operand fails
+    // this check we fall back to the bounds-checked managed path instead of issuing raw native
+    // loads/stores past the end of a span (invalid lda/ldb/ldc or a caller-truncated buffer).
+    private static bool HasRowMajorTile<T>(ReadOnlySpan<T> span, int rows, int cols, int ld)
+    {
+        if (rows <= 0 || cols <= 0) return true;
+        if (ld < cols) return false;
+        long required = (long)(rows - 1) * ld + cols;
+        return required <= span.Length;
+    }
+
     // Diagnostic timing wrapper (#475 shape audit). When GemmShapeHistogram.Enabled it times
     // only the TOP-LEVEL Gemm call (a ThreadStatic guard skips internal re-dispatches so a
     // shape is attributed once, to the outer call). Disabled → a single bool read + straight
@@ -392,6 +427,72 @@ public static partial class BlasManaged
             return;
         }
 
+        // #475 Phase 1: small FP32/FP64 GEMMs go to the JIT generator (exceeds OpenBLAS 1.5-6x for
+        // n<=128). It writes C := A·B directly (no pre-zero needed), then the managed epilogue is
+        // applied. Gated to the win region + Auto packing + no transpose + n a multiple of the lane.
+        if (s_useJitGemm && !transA && !transB
+            && options.PackingMode == PackingMode.Auto
+            && options.PackedA is null && options.PackedB is null
+            && n <= JitMaxN && m <= JitMaxM && k <= JitMaxK
+            // Validate the row-major tiles BEFORE the unsafe JIT path pins the spans and issues raw
+            // native loads/stores: an invalid lda/ldb/ldc or a short span would otherwise become an
+            // out-of-bounds native access instead of falling back to the bounds-checked managed path.
+            && HasRowMajorTile(a, m, k, lda)
+            && HasRowMajorTile(b, k, n, ldb)
+            && HasRowMajorTile(c, m, n, ldc)
+            && JitGemmGenerator.IsSupported)
+        {
+            var jitEpi = options.Epilogue;
+            var eflags = EpilogueFlagsCompute.Compute<T>(in jitEpi);
+            bool jitOk = false, fused = false;
+            if (typeof(T) == typeof(float) && (n & 7) == 0)
+            {
+                // Phase 4: fuse bias + ReLU into the kernel store when the epilogue is ONLY those
+                // (no skip/dropout/scale, activation None or ReLU). Anything else → plain JIT + Apply.
+                bool wantBias = (eflags & EpilogueFlags.HasBias) != 0;
+                // A fused bias reads bias[col] per output column inside the kernel, so a short BiasN
+                // would be an out-of-bounds native read. If bias is requested but BiasN is shorter
+                // than n, drop OUT of the fused path so the bounds-checked managed epilogue
+                // (EpilogueChain.Apply) applies/validates the bias instead of the raw kernel store.
+                bool fuseable = (eflags & ~(EpilogueFlags.HasBias | EpilogueFlags.HasActivation)) == 0
+                    && (jitEpi.Activation == FusedActivationType.None || jitEpi.Activation == FusedActivationType.ReLU)
+                    && (!wantBias || jitEpi.BiasN.Length >= n);
+                bool wantRelu = jitEpi.Activation == FusedActivationType.ReLU;
+                System.ReadOnlySpan<float> biasSpan = (fuseable && wantBias) ? MemoryMarshal.Cast<T, float>(jitEpi.BiasN) : default;
+                unsafe
+                {
+                    fixed (float* pa = MemoryMarshal.Cast<T, float>(a))
+                    fixed (float* pb = MemoryMarshal.Cast<T, float>(b))
+                    fixed (float* pc = MemoryMarshal.Cast<T, float>(c))
+                    fixed (float* pbias = biasSpan)
+                    {
+                        if (fuseable)
+                        {
+                            jitOk = JitGemmGenerator.TryRunFp32(pa, lda, pb, ldb, pc, ldc, m, n, k, wantBias ? pbias : null, wantRelu);
+                            fused = jitOk;
+                        }
+                        else
+                        {
+                            jitOk = JitGemmGenerator.TryRunFp32(pa, lda, pb, ldb, pc, ldc, m, n, k);
+                        }
+                    }
+                }
+            }
+            else if (typeof(T) == typeof(double) && (n & 3) == 0)
+                unsafe
+                {
+                    fixed (double* pa = MemoryMarshal.Cast<T, double>(a))
+                    fixed (double* pb = MemoryMarshal.Cast<T, double>(b))
+                    fixed (double* pc = MemoryMarshal.Cast<T, double>(c))
+                        jitOk = JitGemmGenerator.TryRunFp64(pa, lda, pb, ldb, pc, ldc, m, n, k);
+                }
+            if (jitOk)
+            {
+                if (!fused) EpilogueChain.Apply<T>(c, ldc, m, n, in jitEpi);
+                return;
+            }
+        }
+
         // Strategies do read-modify-write on C; zero it here so the first call
         // produces C = A · B (not C += A · B). Future versions may expose a
         // beta=1 option that skips this zero, but Phase B's contract is C := A · B.
@@ -460,14 +561,66 @@ public static partial class BlasManaged
             return;
 #endif
 
-        // Sub-S (#409): machine-code microkernel fast path. The tile-aligned interior
-        // runs on the hand-emitted kernel (FP64 6×8 ~57 GFLOPS/core ~95% of OpenBLAS;
-        // FP32 6×16 — multithreaded, first-party machine code, no dependency); the
-        // m%Mr / n%Nr tails go to Streaming. Honours PackingMode.Auto only (explicit
-        // pack-mode overrides take the managed path so callers can force-test a
-        // strategy), no transpose, no epilogue, no pre-pack. C is already zeroed
-        // above (the kernel accumulates), and the tails read-modify-write their own
-        // disjoint sub-tiles — so this can only add speed, never change results.
+#if NET5_0_OR_GREATER
+        // GotoBLAS FP32 parallel path (the rewrite) — the production large-float GEMM. Fires for BOTH
+        // PackingMode.Auto AND DisableAutotune: the engine's hot float path (CpuEngine.TensorMatMul2D)
+        // dispatches with DisableAutotune, so gating to Auto alone left this DEAD for real models (they ran
+        // on PackBoth). With the fix, measured 1.3-2.5x over PackBoth through the engine. A clean GotoBLAS
+        // macro-kernel over per-thread L2-resident A/B tiles. Deterministic by construction (each C element
+        // computed by one thread in fixed K order ⇒ thread-count-independent, Deterministic/DisableAutotune-
+        // contract safe). C is pre-zeroed above ⇒ zero-then-accumulate yields C := A·B; handles its own M/N
+        // tails. Gated to float, no trans, no pre-pack, no epilogue, large-shape regime. (The CCX-aware
+        // pinned-pool variant beats this ~2x at the kernel level but its win is masked by per-call engine
+        // overhead — deferred until that overhead is cut; prototype in tests/CcxGemmBench.)
+        if (typeof(T) == typeof(float) && !s_disableGotoGemm && !transA && !transB
+            && options.PackedA is null && options.PackedB is null
+            && options.NumThreads == 0 // only the default (all-core) budget; explicit -1/>0 requests honored below
+            && (options.PackingMode == PackingMode.Auto || options.PackingMode == PackingMode.DisableAutotune)
+            && (long)m * n * k >= GotoGemmFp32.ParallelMinWork && GotoGemmFp32.BeatsPackBoth(m, n, k)
+            && GotoGemmFp32.IsAvailable)
+        {
+            var gepi = options.Epilogue;
+            {
+                var gfa = MemoryMarshal.Cast<T, float>(a);
+                var gfb = MemoryMarshal.Cast<T, float>(b);
+                var gfc = MemoryMarshal.Cast<T, float>(c);
+                unsafe
+                {
+                    fixed (float* pa = gfa)
+                    fixed (float* pb = gfb)
+                    fixed (float* pc = gfc)
+                    {
+                        var (gmc, gnc, gkc) = GotoGemmFp32.ChooseParallelBlocks(m, n);
+                        // OPT-IN bf16-B (AIDOTNET_GEMM_BF16=1): on large bandwidth-bound shapes store B as
+                        // bf16 to halve the streamed bytes (beats fp32 AND MKL on the big squares). Precision-
+                        // changing ⇒ never default; falls through to exact fp32 for smaller/wide-N shapes.
+                        if (s_gemmBf16 && GotoGemmFp32.ShouldUseBf16(m, n, k))
+                        {
+                            GotoGemmFp32.RunParallelBf16(pa, lda, pb, ldb, pc, ldc, m, n, k, gmc, gnc, gkc);
+                        }
+                        // CCX-aware pinned pool for large BALANCED shapes (per-CCX L3-resident B-strips →
+                        // less cross-CCX/DRAM traffic; ~49% MKL on squares vs ~37-47% per-tile). Returns
+                        // false (→ per-tile) when busy/nested/restricted or out of the win regime.
+                        else if (!CcxGemmPool.TryRun(pa, lda, pb, ldb, pc, ldc, m, n, k))
+                        {
+                            GotoGemmFp32.RunParallel(pa, lda, pb, ldb, pc, ldc, m, n, k, gmc, gnc, gkc);
+                        }
+                    }
+                }
+                // #93 FUSION: apply bias + activation + skip on the FAST path. This branch was gated to
+                // EpilogueFlags.None, so every diffusion GEMM with an activation fell through to the
+                // slower PackBoth path. GotoGemm overwrites C := A·B (pre-zeroed), then EpilogueChain
+                // applies the IDENTICAL post-ops PackBoth would (all FusedActivationType + bias + skip) —
+                // same result, faster GEMM (GotoGemm beats PackBoth 1.3-2.5× on these shapes). The
+                // Apply call is a cheap no-op when the epilogue is None (the prior fast path).
+                EpilogueChain.Apply<T>(c, ldc, m, n, in gepi);
+                return;
+            }
+        }
+#endif
+
+        // Sub-S (#409): machine-code microkernel fast path for the remaining Auto shapes (small float +
+        // all double), no transpose, no epilogue, no pre-pack. C is pre-zeroed above (kernel accumulates).
         if (options.PackingMode == PackingMode.Auto && !transA && !transB
             && options.PackedA is null && options.PackedB is null)
         {
@@ -1014,7 +1167,7 @@ public static partial class BlasManaged
         // PrePackA's contract is "give the consume path identical tiling to
         // what live-pack would have produced" so we mirror those defaults.
         int mc = Math.Min(128, m);
-        int kc = Math.Min(256, k);
+        int kc = Math.Min(512, k); // sync with FallbackToHeuristic Kc=512 (b373b9d) — else pre-pack tiles at a smaller K-panel than live-pack and the consume path slows down
         // Round mc UP to a multiple of mr (microkernel row tile height) so the
         // packed-byte layout matches what ScalarPack.PackA / Avx2Pack.PackA
         // expects. CodeRabbit #402: the previous gated form (`if (mc < m ...`)
@@ -1138,7 +1291,7 @@ public static partial class BlasManaged
         // = 6× more inner-loop iterations + far worse cache reuse than the
         // 512×256 live-pack baseline).
         int nc = Math.Min(512, n);
-        int kc = Math.Min(256, k);
+        int kc = Math.Min(512, k); // sync with FallbackToHeuristic Kc=512 (b373b9d) — else pre-pack tiles at a smaller K-panel than live-pack and the consume path slows down
         // Round nc UP to a multiple of nr (microkernel column tile width) — the
         // packed-buffer layout in ScalarPack.PackB / Avx2Pack.PackB always
         // writes ceil(nc / nr) * nr columns per Kc row, zero-padding the tail
@@ -1244,6 +1397,7 @@ public static partial class BlasManaged
     {
         BlasManagedStatsTracker.Reset();
         JittedKernelCache.Clear();
+        JitGemmGenerator.ClearCache(); // release retained executable JIT-GEMM kernels (#475)
         BlasManagedAutotune.ClearStrategyMemo(); // in-memory strategy memo (#375 G13)
         // Future: clear weight pre-pack cache entries that are still in memory.
     }

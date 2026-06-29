@@ -1,4 +1,7 @@
 using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -22,6 +25,97 @@ public static class CpuParallelSettings
     /// Set to 1 to disable parallelism.
     /// </remarks>
     public static int MaxDegreeOfParallelism { get; set; } = Environment.ProcessorCount;
+
+    // #475 thread-scaling: FMA-bound GEMM gets nothing from SMT and the 2nd-thread contention HURTS
+    // (measured: ffn scaling peaks at 16 physical cores, regresses at 24/32). GEMM fan-out should cap
+    // at PHYSICAL cores, not the logical Environment.ProcessorCount. Detected once; any failure falls
+    // back to the logical count (no cap — safe). Other (memory-bound) ops keep the logical count.
+    private static int _physicalCores;
+
+    /// <summary>Physical (non-SMT) core count; falls back to <see cref="Environment.ProcessorCount"/>
+    /// on any detection failure. Cached after first use.</summary>
+    public static int PhysicalCoreCount
+    {
+        get
+        {
+            if (_physicalCores == 0) _physicalCores = DetectPhysicalCores();
+            return _physicalCores;
+        }
+    }
+
+    /// <summary>GEMM fan-out cap at <see cref="PhysicalCoreCount"/>. DEFAULT OFF — a clean same-process
+    /// A/B measured it as a LOSS (medium 0.77×, ffn 0.91×): more threads beat fewer even on a 16-physical
+    /// box, so FMA-bound GEMM is NOT SMT-oversubscribed here (the noisy scaling curve that suggested it
+    /// was wrong). Kept as a knob; the detection is reused elsewhere.</summary>
+    public static bool CapGemmAtPhysicalCores { get; set; } = false;
+
+    /// <summary>The thread count the GEMM strategies should fan out to: the requested count capped at
+    /// physical cores when <see cref="CapGemmAtPhysicalCores"/> (FMA-bound work hates SMT).</summary>
+    public static int GemmThreadCount(int requested)
+        => CapGemmAtPhysicalCores ? Math.Min(requested, PhysicalCoreCount) : requested;
+
+    private static int DetectPhysicalCores()
+    {
+        try
+        {
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return DetectPhysicalCoresWindows();
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux)) return DetectPhysicalCoresLinux();
+        }
+        catch { /* any failure → no cap */ }
+        return Environment.ProcessorCount;
+    }
+
+    /// <summary>
+    /// Value of <see cref="SystemLogicalProcessorInformation.Relationship"/> that denotes a physical
+    /// processor core (Win32 <c>LOGICAL_PROCESSOR_RELATIONSHIP.RelationProcessorCore</c>). Encodes the
+    /// native interop contract instead of testing the raw <c>0</c> in the scan loop.
+    /// </summary>
+    private const int RelationProcessorCore = 0;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SystemLogicalProcessorInformation
+    {
+        public UIntPtr ProcessorMask;
+        public int Relationship;   // RelationProcessorCore
+        private readonly int _pad;
+        private readonly ulong _u0, _u1; // union (16 bytes)
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetLogicalProcessorInformation(IntPtr buffer, ref uint returnLength);
+
+    private static unsafe int DetectPhysicalCoresWindows()
+    {
+        uint len = 0;
+        GetLogicalProcessorInformation(IntPtr.Zero, ref len); // probe size (expected to "fail" with len set)
+        if (len == 0) return Environment.ProcessorCount;
+        int structSize = Marshal.SizeOf<SystemLogicalProcessorInformation>();
+        IntPtr buf = Marshal.AllocHGlobal((int)len);
+        try
+        {
+            if (!GetLogicalProcessorInformation(buf, ref len)) return Environment.ProcessorCount;
+            int n = (int)(len / structSize), cores = 0;
+            var p = (SystemLogicalProcessorInformation*)buf;
+            for (int i = 0; i < n; i++) if (p[i].Relationship == RelationProcessorCore) cores++;
+            return cores > 0 ? cores : Environment.ProcessorCount;
+        }
+        finally { Marshal.FreeHGlobal(buf); }
+    }
+
+    /// <summary>Linux file that lists per-logical-processor topology used for physical-core counting.</summary>
+    private const string LinuxCpuInfoPath = "/proc/cpuinfo";
+
+    private static int DetectPhysicalCoresLinux()
+    {
+        var seen = new HashSet<string>();
+        string phys = "";
+        foreach (var line in File.ReadLines(LinuxCpuInfoPath))
+        {
+            if (line.StartsWith("physical id", StringComparison.Ordinal)) phys = line;
+            else if (line.StartsWith("core id", StringComparison.Ordinal)) seen.Add(phys + "|" + line);
+        }
+        return seen.Count > 0 ? seen.Count : Environment.ProcessorCount;
+    }
 
     /// <summary>
     /// Worker-thread count for the library's persistent custom thread pools (PersistentParallelExecutor,
@@ -179,6 +273,20 @@ public static class CpuParallelSettings
 
         int chunkSize = (length + numChunks - 1) / numChunks;
 
+        // Cooperative-pool dispatch (PR #531/#688): cheaper than raw Parallel.For's ThreadPool
+        // task/range alloc + park/wakeup. Disjoint [start,count) chunks ⇒ bit-identical.
+        if (UseCooperativePool)
+        {
+            Engines.BlasManaged.Pool.CooperativeGemmScheduler.Dispatch(numChunks, i =>
+            {
+                using var _region = EnterParallelRegion();
+                int start = i * chunkSize;
+                int count = Math.Min(chunkSize, length - start);
+                if (count > 0) action(start, count);
+            });
+            return;
+        }
+
         Parallel.For(0, numChunks, new ParallelOptions { MaxDegreeOfParallelism = maxDegree }, i =>
         {
             using var _region = EnterParallelRegion();
@@ -215,6 +323,20 @@ public static class CpuParallelSettings
         if (count == 1 || MaxDegreeOfParallelism <= 1 || _inParallelRegion)
         {
             for (int p = 0; p < count; p++) body(p);
+            return;
+        }
+        // Route off raw Parallel.For (the .NET ThreadPool — per-call task/range allocation +
+        // LowLevelLifoSemaphore park/wakeup, the per-op dispatch overhead that shows as
+        // Parallel.ForWorker in the leaf profile) onto the low-latency cooperative pool, exactly
+        // as ParallelForOrSerial does (PR #531/#688). The caller already chose `count` partitions
+        // (disjoint-write GEMM tiles), so cooperative chunking is bit-identical to Parallel.For.
+        if (UseCooperativePool)
+        {
+            Engines.BlasManaged.Pool.CooperativeGemmScheduler.Dispatch(count, p =>
+            {
+                using var _region = EnterParallelRegion();
+                body(p);
+            });
             return;
         }
         Parallel.For(0, count,
@@ -404,7 +526,8 @@ public static class CpuParallelSettings
     /// strategies. Set <c>false</c> to fall back to <c>Parallel.For</c> (e.g. to avoid the
     /// cooperative pool's dedicated worker threads in a thread-count-sensitive host).</para>
     /// </summary>
-    public static bool UseCooperativePool { get; set; } = true;
+    public static bool UseCooperativePool { get; set; } =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_COOP_POOL") != "0"; // =0 forces raw Parallel.For for A/B
 
     // PR #531 diagnostic: how often the general op path actually dispatches through
     // System.Threading.Tasks.Parallel.For (the .NET ThreadPool — the LowLevelLifoSemaphore

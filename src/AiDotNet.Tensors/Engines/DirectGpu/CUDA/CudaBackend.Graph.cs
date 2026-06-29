@@ -120,6 +120,14 @@ public sealed partial class CudaBackend
         using var _ = PushContext();
         CuBlasNative.CheckCudaResult(
             CudaNativeBindings.cuGraphLaunch(graphExec, _stream), "cuGraphLaunch");
+        // DEVICE-WIDE barrier so the WHOLE captured step completes before the caller's EAGER grad-clip /
+        // optimizer read the gradients. The captured backward writes some grads on BLAS LEASE streams (not
+        // _stream), so a stream-only sync — or no sync — lets the eager optimizer race the still-in-flight
+        // grad writes and read partially-written (intermittently ZERO) gradients → non-deterministic grad
+        // oscillation and a training plateau (the embedding grad flickered 0.11↔0 step-to-step). The capture
+        // win is launch-overhead collapse, NOT cross-step async overlap, and a training step must finish
+        // before the next anyway, so this per-step barrier costs ~nothing while making grads deterministic.
+        CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxSynchronize(), "cuCtxSynchronize (post-capture-launch grad barrier)");
     }
 
     /// <summary>

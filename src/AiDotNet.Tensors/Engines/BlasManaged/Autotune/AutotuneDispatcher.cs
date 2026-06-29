@@ -63,6 +63,14 @@ internal static class AutotuneDispatcher
             return FallbackToHeuristic(m, n, k, mr, nr, procs, isDeterministic);
         }
 
+        // #475 blocking override active (test/bench only): skip cache lookup AND store so the
+        // forced block choice never leaks into the persisted heuristic cache, and use the
+        // (clamped) heuristic path directly. FallbackToHeuristic applies + clamps the overrides.
+        if (BlockingOverrideActive)
+        {
+            return FallbackToHeuristic(m, n, k, mr, nr, procs, isDeterministic);
+        }
+
         var shape = BlasManagedAutotune.EncodeShape<T>(m, n, k, transA, transB, mr, nr, hasEpilogue, isDeterministic);
 
         // Cache hit?
@@ -174,6 +182,20 @@ internal static class AutotuneDispatcher
     /// </summary>
     [ThreadStatic] internal static bool ForceMeasureOnMiss;
 
+    // #475 medium/large blocking A/B: when set, override the heuristic's Mc/Nc/Kc to test
+    // OpenBLAS-style Zen blocking (sgemm P/Q = 320/320, R large) against the single-core gap.
+    // Null = the heuristic. Test/bench only.
+    internal static int? s_overrideMc, s_overrideNc, s_overrideKc;
+
+    /// <summary>
+    /// True while any of the #475 blocking overrides (<see cref="s_overrideMc"/>,
+    /// <see cref="s_overrideNc"/>, <see cref="s_overrideKc"/>) is set. When active,
+    /// <see cref="Decide{T}"/> bypasses the autotune cache lookup AND store so a
+    /// test/bench-only block choice never poisons the persisted heuristic cache.
+    /// </summary>
+    private static bool BlockingOverrideActive
+        => s_overrideMc.HasValue || s_overrideNc.HasValue || s_overrideKc.HasValue;
+
     /// <summary>
     /// Use the AxisSelector heuristic to choose an axis, with default blocking
     /// parameters. The heuristic itself is shape-aware (m, n, k, mr, nr, procs).
@@ -201,7 +223,11 @@ internal static class AutotuneDispatcher
         // For tiny shapes (m < 128, etc.) the Math.Min clamp falls back to dim-fits.
         int mc = Math.Min(128, m);
         int nc = Math.Min(512, n);
-        int kc = Math.Min(256, k);
+        // Kc=512 (was 256): a blocking sweep on Zen2 (Threadripper 3990X) measured Kc=512 as the
+        // best K-block for EVERY tested shape (attn-proj/mlp-fc/square-1024/square-2048), +20–54%
+        // all-core GFLOP/s vs Kc=256 — the larger K-stripe amortizes the pack + microkernel
+        // ramp over more FMAs before the C-tile is re-touched. Matches OpenBLAS's Zen Kc≈248–512 band.
+        int kc = Math.Min(512, k);
 
         // Sub-G (#375): M-axis occupancy floor. PackBoth parallelises over
         // numIcBlocks = ceil(m / mc). With mc=128 a shape like 512×512×512 has
@@ -222,6 +248,20 @@ internal static class AutotuneDispatcher
                 targetMc = Math.Max(floorMc, targetMc);
                 if (targetMc < mc) mc = targetMc;
             }
+        }
+
+        // #475 medium/large blocking A/B — force OpenBLAS-style P/Q/R to probe the single-core gap.
+        // These are test/bench-only knobs; route them through ClampBlocking so an unvalidated
+        // override (e.g. kc=0 or a negative value) can never reach the strategy pipeline and hang a
+        // downstream `pc += kc` loop. Decide<T> additionally bypasses the cache while any override is
+        // active so the bench value never persists in the heuristic cache.
+        if (BlockingOverrideActive)
+        {
+            if (s_overrideMc is int omc) mc = omc;
+            if (s_overrideNc is int onc) nc = onc;
+            if (s_overrideKc is int okc) kc = okc;
+            (mc, nc, kc) = ClampBlocking(mc, nc, kc, m, n, k, mr, nr);
+            return (axis, mc, nc, kc, procs);
         }
 
         // Round mc down to mr alignment, nc down to nr alignment.

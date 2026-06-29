@@ -1060,6 +1060,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private void RunGpuStepBodyForCapture(Engines.DirectGpu.CUDA.CudaBackend cb)
     {
         var engine = _engine;
+        // PR #638 capture-determinism: tag each compiled action so its transient scratch draws from the engine's
+        // STATIC (action,local)-keyed pool → identical device addresses across the pre-residency pass, the capture
+        // pass, and every replay (XLA/TensorRT-style position-keyed buffer assignment). action=-1 disables pooling
+        // (the pre-pass's persistent EnsureResidentBuffer allocs must NOT be pooled).
+        var de = engine as Engines.DirectGpuTensorEngine;
+        de?.SetCurrentScratchAction(-1);
         _preForwardParamTransform?.Invoke();
         var fwd = _forwardActions;
         // The whole forward (INCLUDING the embedding, which gathers on-device from the externally-refreshed stable
@@ -1067,6 +1073,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         bool capDiag = System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1" && cb.IsStreamCapturing();
         for (int i = _graphEagerFwd; i < fwd.Length; i++)
         {
+            de?.SetCurrentScratchAction(i);   // pool this forward action's transient scratch by (i, local)
             fwd[i](engine);
             if (capDiag && cb.StreamCaptureStatusRaw() == 2)
             {
@@ -1076,6 +1083,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             }
         }
 
+        de?.SetCurrentScratchAction(-1);   // pre-pass (persistent EnsureResidentBuffer/seed/memset) runs UNpooled
         int esz = System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
         // PR #638 A1: bind a STABLE resident GPU buffer to every pre-allocated gradient accumulator (the generic
         // backward accumulates into gradMap[input] in place; without a resident buffer that accumulator lived on
@@ -1130,6 +1138,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var bwdNames = ProfBackwardStepNames;
         for (int i = 0; i < bwd.Length; i++)
         {
+            de?.SetCurrentScratchAction(fwd.Length + i);   // backward actions keyed in a namespace above forward
             bwd[i](engine);
             if (bwdDiag && cb.StreamCaptureStatusRaw() == 2)
             {
@@ -1139,6 +1148,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 bwdDiag = false;   // log only the FIRST invalidation
             }
         }
+        de?.SetCurrentScratchAction(-1);   // grad clip + optimizer (run after) must NOT pool
         // NOTE: _optimizerUpdate is intentionally NOT invoked here — it runs eagerly
         // in Step() after LaunchCapturedGraph so the LR schedule / Adam bias-correction
         // scalars are fresh per step rather than frozen at capture time.
@@ -1939,6 +1949,26 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 int len = lengths[p];
 
+                if (_optimizerStep <= 10 && System.Environment.GetEnvironmentVariable("AIDOTNET_OPT_DIAG") == "1")
+                {
+                    try
+                    {
+                        var gradResNow = _gradients[p]?.TryGetGpuBuffer();
+                        var paramResNow = _parameters[p].TryGetGpuBuffer();
+                        var be = gpuBackends[p];
+                        double gradL2 = -1, paramL1 = -1;
+                        if (be is not null)
+                        {
+                            if (gradResNow is not null) { var g = be.DownloadBuffer(gradResNow); double s = 0; for (int i = 0; i < g.Length; i++) s += (double)g[i] * g[i]; gradL2 = System.Math.Sqrt(s); }
+                            if (paramResNow is not null) { var w = be.DownloadBuffer(paramResNow); double s = 0; for (int i = 0; i < w.Length; i++) s += System.Math.Abs((double)w[i]); paramL1 = s; }
+                        }
+                        System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_opt_diag.txt"),
+                            $"step{_optimizerStep} p={p} len={len} paramBufMatch={ReferenceEquals(gpuParam[p], paramResNow)} " +
+                            $"gradResidentNow={(gradResNow != null)} gradL2={gradL2:E4} paramL1={paramL1:E6}" + System.Environment.NewLine);
+                    }
+                    catch (Exception dex) { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_opt_diag.txt"), $"step{_optimizerStep} p={p} DIAG-ERR {dex.Message}" + System.Environment.NewLine); }
+                }
+
                 // GPU path: dispatch to backend-native fused optimizer kernel.
                 // Backends own Sgd/Adam/AdamW kernel implementations
                 // (CUDA / HIP / OpenCL / Metal); we just translate the
@@ -1946,7 +1976,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // (uploaded transiently) or GPU (passed through directly).
                 if (gpuParam[p] is { } gpuP && gpuBackends[p] is { } gpuBe)
                 {
-                    Engines.DirectGpu.IGpuBuffer? gradBuf = gpuGrad[p];
+                    // CAPTURE-FREEZE FIX (#638): re-resolve the gradient's resident buffer EACH STEP. gpuGrad[p]
+                    // was bound ONCE at ConfigureOptimizer time — but under CUDA-graph capture the backward writes
+                    // grads into a buffer made GPU-resident by the capture pre-pass (EnsureResidentBuffer on
+                    // _preAllocatedGrads), which runs AFTER ConfigureOptimizer. So at config time the param-grad
+                    // tensor was NOT yet resident → gpuGrad[p] was null → the optimizer fell back to uploading the
+                    // stale host backing (gradArrays[p], all zeros after the captured resident backward bypassed
+                    // it) → AdamUpdate ran on ~zero grads → weights never changed → FLAT loss / frozen pL1 across
+                    // epochs (the capture-doesn't-learn bug; only visible at a learning scale, not the smoke run).
+                    // Reading the tensor's CURRENT resident buffer each step makes the optimizer consume the grads
+                    // the captured backward actually produced. Mirrors the param-side pin near the GPU fast path.
+                    // Eager paths are unaffected: a non-resident grad still yields null here → gpuGrad/host fallback.
+                    Engines.DirectGpu.IGpuBuffer? gradBuf = (_gradients[p]?.TryGetGpuBuffer()) ?? gpuGrad[p];
                     bool gradTransient = false;
                     if (gradBuf is null)
                     {
@@ -1954,6 +1995,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         gradBuf = gpuBe.AllocateBuffer(gradArrays[p]);
                         gradTransient = true;
                     }
+                    bool diagAU = p == 0 && _optimizerStep == 6 && System.Environment.GetEnvironmentVariable("AIDOTNET_OPT_DIAG") == "1";
+                    double auBefore = -1, auGrad = -1;
+                    if (diagAU) { try { gpuBe.Synchronize(); var w = gpuBe.DownloadBuffer(gpuP); double s = 0; for (int i = 0; i < w.Length; i++) s += System.Math.Abs((double)w[i]); auBefore = s; var gg = gpuBe.DownloadBuffer(gradBuf); double s2 = 0; for (int i = 0; i < gg.Length; i++) s2 += System.Math.Abs((double)gg[i]); auGrad = s2; } catch { } }
                     try
                     {
                         switch (optType)
@@ -1979,6 +2023,17 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     {
                         if (gradTransient) gradBuf.Dispose();
                     }
+                    if (diagAU) { try { gpuBe.Synchronize(); var w = gpuBe.DownloadBuffer(gpuP); double s = 0; for (int i = 0; i < w.Length; i++) s += System.Math.Abs((double)w[i]); System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_opt_diag.txt"), $"[AU] p=0 step6 lr={lr:E3} gradBufL1={auGrad:E4} mvAlloc={(gpuM[p] != null && gpuV[p] != null)} paramL1 before={auBefore:E6} after={s:E6} delta={(s - auBefore):E6}" + System.Environment.NewLine); } catch { } }
+                    // EVAL-LEAK ROOT FIX (#638): on-device Adam just updated _parameters[p]'s RESIDENT device
+                    // buffer IN PLACE — it now holds the authoritative current weights. Sync _gpuBufferVersion to
+                    // Version so the version-gate in GetWeightBufferPreferResident TRUSTS it during forward-only
+                    // eval. Without this, on-device Adam bumps Version but not _gpuBufferVersion, so the gate
+                    // falsely judges the (fresh) device buffer stale → re-uploads the weights via GetDataArray()
+                    // (a FRESH host array each call → persistent-cache MISS) on EVERY Predict → a per-call
+                    // ~weight-size GPU leak that OOMs the eval at d256/L4+. A later CPU SetParameters legitimately
+                    // re-bumps Version (without this device write) → mismatch returns → correct re-upload. Harmless
+                    // to capture (the gate's ResidentStepActive branch already covers it).
+                    _parameters[p]._gpuBufferVersion = _parameters[p].Version;
                     continue;
                 }
 
@@ -2272,7 +2327,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // GPU path (mirrors ConfigureOptimizerFloat).
                 if (gpuParam[p] is { } gpuP && gpuBackends[p] is { } gpuBe)
                 {
-                    Engines.DirectGpu.IGpuBuffer? gradBuf = gpuGrad[p];
+                    // CAPTURE-FREEZE FIX (#638): re-resolve the gradient's resident buffer EACH STEP. gpuGrad[p]
+                    // was bound ONCE at ConfigureOptimizer time — but under CUDA-graph capture the backward writes
+                    // grads into a buffer made GPU-resident by the capture pre-pass (EnsureResidentBuffer on
+                    // _preAllocatedGrads), which runs AFTER ConfigureOptimizer. So at config time the param-grad
+                    // tensor was NOT yet resident → gpuGrad[p] was null → the optimizer fell back to uploading the
+                    // stale host backing (gradArrays[p], all zeros after the captured resident backward bypassed
+                    // it) → AdamUpdate ran on ~zero grads → weights never changed → FLAT loss / frozen pL1 across
+                    // epochs (the capture-doesn't-learn bug; only visible at a learning scale, not the smoke run).
+                    // Reading the tensor's CURRENT resident buffer each step makes the optimizer consume the grads
+                    // the captured backward actually produced. Mirrors the param-side pin near the GPU fast path.
+                    // Eager paths are unaffected: a non-resident grad still yields null here → gpuGrad/host fallback.
+                    Engines.DirectGpu.IGpuBuffer? gradBuf = (_gradients[p]?.TryGetGpuBuffer()) ?? gpuGrad[p];
                     bool gradTransient = false;
                     if (gradBuf is null)
                     {

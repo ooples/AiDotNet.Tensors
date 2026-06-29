@@ -538,6 +538,7 @@ public static class CuBlasNative
     // Math modes
     public const int CUBLAS_DEFAULT_MATH = 0;
     public const int CUBLAS_TENSOR_OP_MATH = 1;  // Allow tensor core acceleration
+    public const int CUBLAS_PEDANTIC_MATH = 2;   // Strict IEEE fp32 — forbids TF32 tensor-core rounding
     public const int CUBLAS_TF32_TENSOR_OP_MATH = 3;  // TF32 for Ampere+
 
     /// <summary>
@@ -582,6 +583,7 @@ public static class CuBlasNative
     // Compute types
     public const int CUBLAS_COMPUTE_16F = 64;
     public const int CUBLAS_COMPUTE_32F = 68;
+    public const int CUBLAS_COMPUTE_32F_PEDANTIC = 69;  // Strict fp32 — forbids TF32 in cublasGemmEx
     public const int CUBLAS_COMPUTE_32F_FAST_16F = 74;
     public const int CUBLAS_COMPUTE_32F_FAST_TF32 = 77;
 

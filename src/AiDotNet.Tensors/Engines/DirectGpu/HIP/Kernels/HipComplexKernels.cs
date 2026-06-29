@@ -148,12 +148,14 @@ extern ""C"" __global__ void softmax_rows(
     float maxVal = -1e30f;
     for (int c = tid; c < cols; c += blockDim.x) maxVal = fmaxf(maxVal, rowIn[c]);
     sdata[tid] = maxVal; __syncthreads();
-    for (int s = blockDim.x/2; s > 0; s >>= 1) { if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid+s]); __syncthreads(); }
+    // Non-power-of-2-safe reduction (blockDim.x=min(256,cols) can be e.g. 3/6): ceil-halve the active
+    // count + bound-check, else the top odd element is dropped (corrupts max/sum -> unnormalized softmax).
+    for (int n = blockDim.x; n > 1; ) { int half = (n+1)>>1; if (tid < half && tid+half < n) sdata[tid] = fmaxf(sdata[tid], sdata[tid+half]); __syncthreads(); n = half; }
     maxVal = sdata[0];
     float sumExp = 0.0f;
     for (int c = tid; c < cols; c += blockDim.x) { float e = expf(rowIn[c]-maxVal); rowOut[c] = e; sumExp += e; }
     sdata[tid] = sumExp; __syncthreads();
-    for (int s = blockDim.x/2; s > 0; s >>= 1) { if (tid < s) sdata[tid] += sdata[tid+s]; __syncthreads(); }
+    for (int n = blockDim.x; n > 1; ) { int half = (n+1)>>1; if (tid < half && tid+half < n) sdata[tid] += sdata[tid+half]; __syncthreads(); n = half; }
     sumExp = sdata[0];
     for (int c = tid; c < cols; c += blockDim.x) rowOut[c] /= sumExp;
 }

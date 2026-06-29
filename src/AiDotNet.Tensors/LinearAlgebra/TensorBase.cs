@@ -1960,6 +1960,32 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         return _storage.GetDataArray();
     }
 
+    /// <summary>
+    /// Returns the raw CPU backing array together with this view's storage offset,
+    /// so a stride-aware reader can index logical elements directly through
+    /// <see cref="Strides"/> WITHOUT first materializing a contiguous copy. The
+    /// returned array is the shared backing store: the caller MUST only read, and
+    /// MUST honour <see cref="Strides"/> + <paramref name="storageOffset"/> when
+    /// addressing elements (the view may be permuted/sliced). Returns <c>null</c>
+    /// for GPU-resident tensors (no authoritative CPU array) — the caller should
+    /// then fall back to <see cref="Contiguous"/>. Triggers the same materialization
+    /// guard as the span accessors so a lazy node is realized and a paged-out
+    /// streaming weight rehydrated first. This is a READ-ONLY accessor (it does NOT
+    /// privatize a copy-on-write clone): routing a write through the returned array
+    /// would corrupt a COW peer.
+    /// </summary>
+    internal T[]? GetCpuBackingForStridedRead(out int storageOffset)
+    {
+        EnsureMaterialized();
+        if (_device != TensorDevice.CPU)
+        {
+            storageOffset = 0;
+            return null;
+        }
+        storageOffset = _storageOffset;
+        return _storage.GetDataArray();
+    }
+
     // ================================================================
     // Clone and Transform
     // ================================================================
