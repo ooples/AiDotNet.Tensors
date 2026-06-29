@@ -67,9 +67,13 @@ internal sealed class TensorStorage<T>
         if (owner is null) throw new ArgumentNullException(nameof(owner));
         // Publish owner + writability atomically: the new state object is fully constructed before the
         // CAS, so a failed CAS (owner already present) leaves the existing state untouched.
-        if (Interlocked.CompareExchange(ref _mmapOwner, new MmapOwnerState(owner, writable), null) != null)
+        var newState = new MmapOwnerState(owner, writable);
+        if (Interlocked.CompareExchange(ref _mmapOwner, newState, null) != null)
+        {
+            newState.Dispose();
             throw new InvalidOperationException(
                 "TensorStorage already has an attached mmap owner; replacing it would leak the prior mapping.");
+        }
     }
 
     /// <summary>

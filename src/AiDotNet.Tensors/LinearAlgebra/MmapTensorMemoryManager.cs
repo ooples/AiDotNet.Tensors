@@ -68,7 +68,7 @@ internal sealed unsafe class MmapTensorMemoryManager<T> : MemoryManager<T>
             // Hold the stream in a local: if CreateFromFile throws BEFORE it takes ownership (leaveOpen:
             // false transfers ownership only on success), the catch must dispose the stream itself —
             // otherwise the file handle leaks on a recoverable mapping failure.
-            stream = new System.IO.FileStream(path, System.IO.FileMode.Open, fileAccess, System.IO.FileShare.ReadWrite);
+            stream = new System.IO.FileStream(path, System.IO.FileMode.Open, fileAccess, System.IO.FileShare.ReadWrite | System.IO.FileShare.Delete);
             _mmf = MemoryMappedFile.CreateFromFile(
                 stream, mapName: null, capacity: 0,
                 mapAccess, HandleInheritability.None, leaveOpen: false);
