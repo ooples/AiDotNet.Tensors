@@ -17,6 +17,12 @@ namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 // native OpenBLAS. Writes results to a FILE (xUnit ITestOutputHelper isn't captured for
 // passing tests). Native gets ALL cores (deterministic mode otherwise pins OpenBLAS to 1).
 // Category=Performance so CI (Category!=Performance) skips it.
+// Joined to BlasManaged-Stats-Serial because Audit_ManagedVsNative_AcrossHotShapes calls
+// BlasProvider.TrySetOpenBlasThreads (mutating the PROCESS-GLOBAL OpenBLAS thread count). Left
+// uncollected it raced the bit-match/determinism tests in that collection under xUnit's parallel
+// collections, flipping their reduction order. Serializing it here is the same remedy applied to
+// the other global-BLAS-state mutators (see the collection definition in BlasManagedCollections).
+[Collection("BlasManaged-Stats-Serial")]
 public class ManagedVsNativeGemmAudit
 {
     private static readonly (int M, int K, int N, string Note)[] Shapes =
