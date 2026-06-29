@@ -58,6 +58,15 @@ public static partial class BlasManaged
     internal static bool s_disableGotoGemm =
         System.Environment.GetEnvironmentVariable("AIDOTNET_DISABLE_GOTO") == "1";
 
+    // OPT-IN bf16-B GEMM (AIDOTNET_GEMM_BF16=1, default OFF). Stores the streamed B operand as bf16
+    // (half the bytes → ~2× bandwidth headroom), A stays fp32, fp32 accumulate. PRECISION-CHANGING
+    // (~3 significant digits; rel-err ~3e-3) so it is NEVER default — only large bandwidth-bound shapes
+    // benefit (measured: sq2048 1.13×, sq4096 1.19×, BEATS MKL 147% on sq4096; HURTS the compute-bound
+    // sq1024 0.80×). Gated to the GotoGemm regime + GotoGemmFp32.ShouldUseBf16 (large work). For users
+    // who accept bf16 precision (common in diffusion inference) and want the bandwidth win on big GEMMs.
+    internal static bool s_gemmBf16 =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_BF16") == "1";
+
     // #653: extend the PackBoth parallelism-floor + wide-N blocking optimizations to the
     // DisableAutotune shim path the forward GEMM uses (CpuEngine.BatchMatMul -> 6-arg
     // SimdGemm.Sgemm -> Gemm{DisableAutotune}). Those optimizations were gated on
@@ -571,7 +580,6 @@ public static partial class BlasManaged
             && GotoGemmFp32.IsAvailable)
         {
             var gepi = options.Epilogue;
-            if (EpilogueFlagsCompute.Compute(in gepi) == EpilogueFlags.None)
             {
                 var gfa = MemoryMarshal.Cast<T, float>(a);
                 var gfb = MemoryMarshal.Cast<T, float>(b);
@@ -582,16 +590,30 @@ public static partial class BlasManaged
                     fixed (float* pb = gfb)
                     fixed (float* pc = gfc)
                     {
+                        var (gmc, gnc, gkc) = GotoGemmFp32.ChooseParallelBlocks(m, n);
+                        // OPT-IN bf16-B (AIDOTNET_GEMM_BF16=1): on large bandwidth-bound shapes store B as
+                        // bf16 to halve the streamed bytes (beats fp32 AND MKL on the big squares). Precision-
+                        // changing ⇒ never default; falls through to exact fp32 for smaller/wide-N shapes.
+                        if (s_gemmBf16 && GotoGemmFp32.ShouldUseBf16(m, n, k))
+                        {
+                            GotoGemmFp32.RunParallelBf16(pa, lda, pb, ldb, pc, ldc, m, n, k, gmc, gnc, gkc);
+                        }
                         // CCX-aware pinned pool for large BALANCED shapes (per-CCX L3-resident B-strips →
                         // less cross-CCX/DRAM traffic; ~49% MKL on squares vs ~37-47% per-tile). Returns
                         // false (→ per-tile) when busy/nested/restricted or out of the win regime.
-                        if (!CcxGemmPool.TryRun(pa, lda, pb, ldb, pc, ldc, m, n, k))
+                        else if (!CcxGemmPool.TryRun(pa, lda, pb, ldb, pc, ldc, m, n, k))
                         {
-                            var (gmc, gnc, gkc) = GotoGemmFp32.ChooseParallelBlocks(m, n);
                             GotoGemmFp32.RunParallel(pa, lda, pb, ldb, pc, ldc, m, n, k, gmc, gnc, gkc);
                         }
                     }
                 }
+                // #93 FUSION: apply bias + activation + skip on the FAST path. This branch was gated to
+                // EpilogueFlags.None, so every diffusion GEMM with an activation fell through to the
+                // slower PackBoth path. GotoGemm overwrites C := A·B (pre-zeroed), then EpilogueChain
+                // applies the IDENTICAL post-ops PackBoth would (all FusedActivationType + bias + skip) —
+                // same result, faster GEMM (GotoGemm beats PackBoth 1.3-2.5× on these shapes). The
+                // Apply call is a cheap no-op when the epilogue is None (the prior fast path).
+                EpilogueChain.Apply<T>(c, ldc, m, n, in gepi);
                 return;
             }
         }
