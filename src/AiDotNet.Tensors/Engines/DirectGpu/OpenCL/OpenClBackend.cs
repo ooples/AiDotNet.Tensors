@@ -4174,6 +4174,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
 
+            // Softmax is row-wise; it can't fuse into the pointwise GEMM epilogue (used to throw here).
+            // GEMM+bias then a per-row softmax over [M, N]; sync so the caller's stream event fences it.
+            if (activation == FusedActivationType.Softmax)
+            {
+                var gemmBias = GemmBias(A, B, bias, M, N, K);
+                Softmax(gemmBias, output, M, N);
+                gemmBias.Dispose();
+                _context?.Finish();
+                return;
+            }
+
             // Map activation to fused kernel name
             string kernelName = activation switch
             {

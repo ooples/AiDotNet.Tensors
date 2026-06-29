@@ -6234,8 +6234,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 default:
                     // For other activations, use GemmBias + separate activation kernel
                     resultBuffer = backend.GemmBias(inputBuffer, weightsBuffer, biasBuffer, batchSize, outputFeatures, inputFeatures);
-                    int size = batchSize * outputFeatures;
-                    ApplyGpuActivation(backend, resultBuffer, size, activation);
+                    ApplyFusedLinearEpilogue(backend, resultBuffer, batchSize, outputFeatures, activation);
                     break;
             }
         }
@@ -6253,11 +6252,34 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             // MatMul + activation (no bias)
             resultBuffer = backend.MatMul(inputBuffer, weightsBuffer, batchSize, outputFeatures, inputFeatures);
-            int size = batchSize * outputFeatures;
-            ApplyGpuActivation(backend, resultBuffer, size, activation);
+            ApplyFusedLinearEpilogue(backend, resultBuffer, batchSize, outputFeatures, activation);
         }
 
         return resultBuffer;
+    }
+
+    /// <summary>
+    /// Applies the fused-linear activation epilogue to a <c>[batchSize, features]</c> result buffer.
+    /// Most activations are pointwise and go through the size-only <see cref="ApplyGpuActivation(IDirectGpuBackend, IGpuBuffer, int, FusedActivationType)"/>.
+    /// Softmax is NOT pointwise — it normalizes across the feature dimension per row — so it must be
+    /// dispatched with the <c>(batchSize, features)</c> shape via <c>backend.Softmax</c>. Routing it
+    /// through the pointwise path made <c>FusedLinearGpu(..., Softmax)</c> throw
+    /// <c>ArgumentOutOfRangeException("Unsupported activation")</c> (the size-only switch has no Softmax
+    /// case), which broke GPU inference for any softmax-head dense layer.
+    /// </summary>
+    private static void ApplyFusedLinearEpilogue(
+        IDirectGpuBackend backend, IGpuBuffer buffer, int batchSize, int features, FusedActivationType activation)
+    {
+        switch (activation)
+        {
+            case FusedActivationType.Softmax:
+                // Per-row softmax over features; in-place is safe (read-then-write per index).
+                backend.Softmax(buffer, buffer, batchSize, features);
+                break;
+            default:
+                ApplyGpuActivation(backend, buffer, batchSize * features, activation);
+                break;
+        }
     }
 
     private static IGpuBuffer GemmBiasNoActivation(IDirectGpuBackend backend, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer bias, int M, int N, int K)

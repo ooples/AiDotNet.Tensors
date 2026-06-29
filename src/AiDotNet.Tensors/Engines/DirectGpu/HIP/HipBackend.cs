@@ -9795,6 +9795,17 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void FusedGemmBiasActivationAsync(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, IGpuBuffer output,
         int M, int N, int K, FusedActivationType activation, IGpuStream stream)
     {
+        // Softmax is row-wise; the old default SILENTLY applied ReLU instead (wrong distribution).
+        // GEMM+bias then per-row softmax over [M, N]. Parity fix from OpenCL; unverified on ROCm hardware.
+        if (activation == FusedActivationType.Softmax)
+        {
+            var gemmBias = GemmBias(A, B, bias, M, N, K);
+            Softmax(gemmBias, output, M, N);
+            gemmBias.Dispose();
+            Synchronize();
+            return;
+        }
+
         // Map activation type to appropriate kernel
         string kernelName = activation switch
         {

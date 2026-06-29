@@ -4067,6 +4067,17 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (!IsAvailable)
             throw new InvalidOperationException("CUDA backend is not available.");
 
+        // Softmax is row-wise; it can't fuse into the pointwise GEMM epilogue (used to throw here).
+        // GEMM+bias then per-row softmax over [M, N]. Verified on CUDA + OpenCL (RTX 2060).
+        if (activation == FusedActivationType.Softmax)
+        {
+            var gemmBias = GemmBias(A, B, bias, M, N, K);
+            Softmax(gemmBias, output, M, N);
+            gemmBias.Dispose();
+            Synchronize();
+            return;
+        }
+
         // Map activation to fused kernel name
         string kernelName = activation switch
         {
