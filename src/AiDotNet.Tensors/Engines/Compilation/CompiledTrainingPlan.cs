@@ -1983,7 +1983,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 }
 
                 // CPU path: pin live backing + SIMD kernel.
-                if (gradArrays[p].Length == 0) continue;
+                // Skip a parameter with no gradient (its grad buffer was never written this
+                // step) OR no materialized weight backing. The latter happens for lazy /
+                // unexercised layers — e.g. the unused-modality encoders of a multi-modal
+                // model whose forward only touched one modality: the plan pre-allocates their
+                // grad/m/v buffers at their declared length, but the parameter's live backing
+                // array stays empty (length 0) until first materialization, so there is nothing
+                // to update. The eager optimizer path skips such params the same way (#1738).
+                // Without the paramArrays guard, `fixed` over the empty backing yields a null
+                // pointer and the SIMD kernel NREs at the full declared length, which is caught
+                // upstream and silently kicks the ENTIRE model off the fused fast path onto the
+                // ~17× slower eager autograd tape — the exact UnifiedMultimodal regression.
+                if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
 
                 fixed (float* pParam = paramArrays[p], pGrad = gradArrays[p],
                        pM = m[p], pV = v[p], pVMax = vMax[p])
@@ -2308,7 +2319,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     continue;
                 }
 
-                if (gradArrays[p].Length == 0) continue;
+                // Skip params with no gradient OR no materialized weight backing (lazy /
+                // unexercised layers; see the same guard in ConfigureOptimizerFloat). #1738.
+                if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
 
                 fixed (float* pParam = paramArrays[p], pGrad = gradArrays[p],
                        pM = m[p], pV = v[p], pVMax = vMax[p])
