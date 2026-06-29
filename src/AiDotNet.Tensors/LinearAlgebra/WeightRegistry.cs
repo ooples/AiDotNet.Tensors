@@ -695,15 +695,22 @@ public static class WeightRegistry
         try
         {
             // Current bytes from the pool (native, uncompressed). A scale prefix / compression makes the
-            // length mismatch — not aliasable, fall back to the copy path.
+            // length mismatch — not aliasable, fall back to the copy path. RehydrateInto takes the pool's
+            // own lock; keep it OUTSIDE _lock to preserve the pool-lock-then-registry-lock-free ordering.
             byte[] bytes = pool.RehydrateInto(weight.StreamingPoolHandle);
             if (bytes.Length != (int)byteLen) return false;
 
-            var store = ParamIoStore();
-            long offset = store.Allocate(bytes); // Allocate is internally locked (+ grows the single file)
-            manager = new MmapTensorMemoryManager<T>(store.Path, offset, (int)byteLen, weight.Length, writable: true);
-            var aliased = Vector<T>.WrapMemory(manager.Memory);
-            weight.AliasStorageFromMmap(aliased, manager, writable: true); // tensor's storage owns the mapping
+            // Create/allocate the param-IO store and install the alias under the registry lock so a
+            // concurrent Reset (which disposes _paramIoStore under _lock) can't race store creation or
+            // open a writable view of a just-disposed mapping. store.Allocate is itself internally locked.
+            lock (_lock)
+            {
+                var store = ParamIoStore();
+                long offset = store.Allocate(bytes);
+                manager = new MmapTensorMemoryManager<T>(store.Path, offset, (int)byteLen, weight.Length, writable: true);
+                var aliased = Vector<T>.WrapMemory(manager.Memory);
+                weight.AliasStorageFromMmap(aliased, manager, writable: true); // tensor's storage owns the mapping
+            }
             return true;
         }
         catch
@@ -1245,23 +1252,38 @@ public static class WeightRegistry
                 var tail = _materializedLru.Last;
                 if (tail is null) break;
                 long victim = tail.Value;
-                _materializedLru.RemoveLast();
-                _materializedNode.Remove(victim);
                 _materializedBytes.TryGetValue(victim, out long victimBytes);
-                _materializedBytes.Remove(victim);
-                _materializedResidentBytes -= victimBytes;
 
-                // Resolve the owner OUTSIDE the eventual drop's heavy work but still under _lock —
-                // the owner-drop + write-back only touch the tensor + pool, not the registry maps.
+                // Persist + drop the coldest owner, but only UNTRACK it after both succeed. If write-back
+                // returns false (non-native/aliased — nothing to persist) or the drop returns false
+                // (shared refcount), the owner must stay resident AND accounted; untracking it first
+                // would leak its bytes from the budget (the resident copy still exists). Order: write-back
+                // FIRST so the dropped bytes are recoverable from the pool/disk.
+                bool shed;
                 if (_ownerByHandle.TryGetValue(victim, out var weak) && weak.TryGetTarget(out var owner))
                 {
-                    // Persist the (possibly mutated) data, then drop the resident copy. Order matters:
-                    // write-back FIRST so the dropped bytes are recoverable from the pool/disk.
-                    try { owner.TryWriteBackResidentForStreaming(); }
-                    catch { /* best-effort: a non-native/aliased owner just stays resident */ }
-                    try { owner.TryDropStorageForStreaming(throwOnSharedRefcount: false); }
-                    catch { /* shared refcount → leave resident; bounding is best-effort, never corrupting */ }
+                    bool wroteBack = false;
+                    try { wroteBack = owner.TryWriteBackResidentForStreaming(); }
+                    catch { /* best-effort */ }
+                    shed = false;
+                    if (wroteBack)
+                    {
+                        try { shed = owner.TryDropStorageForStreaming(throwOnSharedRefcount: false); }
+                        catch { /* shared refcount → leave resident + accounted */ }
+                    }
                 }
+                else
+                {
+                    shed = true; // dead owner: no resident copy remains to account
+                }
+
+                // Coldest owner can't be shed yet (non-native, or shared ref) — stop. Bounding is
+                // best-effort; never untrack/forget a still-resident owner.
+                if (!shed) break;
+                _materializedLru.RemoveLast();
+                _materializedNode.Remove(victim);
+                _materializedBytes.Remove(victim);
+                _materializedResidentBytes -= victimBytes;
             }
         }
     }
@@ -2001,6 +2023,12 @@ public static class WeightRegistry
                 // that snapshot is stale — write the owner's CURRENT bytes back BEFORE dropping so a
                 // later Materialize rehydrates the mutation, not the stale value. Native-gated inside
                 // TryWriteBackResidentForStreaming, so read-only inference (bf16/quant store) is a no-op.
+                // Unlike the materialized-owner SHED loop (NoteMaterializedAndShed), the drop here is safe
+                // regardless of the write-back RESULT: a native owner's write-back persists the mutation
+                // before the drop, and a non-native owner's resident copy is a re-derivable dequant of the
+                // pool's quantized snapshot (re-materialize re-derives it) — so the snapshot stays
+                // authoritative either way. (Training uses the FullPrecision/native store, so a mutated
+                // owner is always native and always writes back.)
                 try { owner.TryWriteBackResidentForStreaming(); }
                 catch { /* best-effort write-back; never block the drop */ }
                 try { owner.TryDropStorageForStreaming(throwOnSharedRefcount: false); }

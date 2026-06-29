@@ -39,7 +39,12 @@ so the spill mechanism exists — the gap is that the **owner tensors' resident 
 dropped** on this path, so paging the pool's byte[] snapshots to disk doesn't help (the unfreed
 `_data` is the accumulator).
 
-## Proposed fix (Tensors)
+## Rejected hypothesis — deferred-drop finalization (DISPROVEN; see "MEASURED CORRECTION" below)
+> ⚠️ Historical context only. The deferred-drop path below was the initial hypothesis; the MEASURED
+> CORRECTION section proved the pool's snapshot eviction already works and that this path does **not**
+> make the round-trip tests green. Do not implement it — the confirmed fix is the mmap redesign
+> (`MemoryMappedWeightStore` + writable zero-copy alias). Kept for the investigation trail.
+
 Bound the resident set on the register-heavy materialization path by finalizing deferred drops as we
 go, so each layer's `_data` is freed once its snapshot is in the pool:
 1. After `RegisterWeight` defers a drop, attempt finalization opportunistically when the pool crosses
@@ -87,12 +92,14 @@ out* (~10 min for one pass; disk-bound). So the pool's snapshot eviction works; 
 hypothesis is **disproven**.
 
 **Write pass** (`chunk.Data.Span[i] = …`, exactly as `AssertParameterChunksRoundTrip`):
+
 | chunk | residentMB | evictions | diskWriteMB |
-|------|-----------|-----------|-------------|
-| 50  | 1489 | 0 | 0 |
+| --- | ---: | ---: | ---: |
+| 50 | 1489 | 0 | 0 |
 | 100 | 3361 | 0 | 0 |
 | 150 | 5090 | 0 | 0 |
-| 200 | 6746 | **0** | **0** |
+| 200 | 6746 | 0 | 0 |
+
 → **OOM ~chunk 230**, before the 8 GB snapshot-eviction trigger ever fires.
 
 ### The real mechanism

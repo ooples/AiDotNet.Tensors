@@ -26,6 +26,13 @@ namespace AiDotNet.Tensors.LinearAlgebra;
 /// </remarks>
 internal sealed class MemoryMappedWeightStore : IDisposable
 {
+    // Slices are 64-byte aligned (cache-line) so adjacent writable aliases never share a cache line;
+    // the file capacity is page-aligned (4 KiB) so the OS maps whole pages; the default initial capacity
+    // is 64 MiB (sparse — costs no disk until written).
+    private const long SliceAlignmentBytes = 64;
+    private const long PageAlignmentBytes = 4096;
+    private const long DefaultInitialCapacityBytes = 64L * 1024 * 1024;
+
     private readonly object _lock = new();
     private readonly string _path;
     private FileStream _file;
@@ -49,32 +56,62 @@ internal sealed class MemoryMappedWeightStore : IDisposable
     /// stays valid across a store grow (the file only ever grows, never moves existing bytes).</summary>
     public string Path => _path;
 
-    public MemoryMappedWeightStore(string path, long initialCapacity = 64L * 1024 * 1024)
+    public MemoryMappedWeightStore(string path, long initialCapacity = DefaultInitialCapacityBytes)
     {
         _path = path ?? throw new ArgumentNullException(nameof(path));
         if (initialCapacity <= 0) throw new ArgumentOutOfRangeException(nameof(initialCapacity));
-        _capacity = AlignUp(Math.Max(initialCapacity, 4096), 4096);
+        _capacity = AlignUp(Math.Max(initialCapacity, PageAlignmentBytes), PageAlignmentBytes);
         // FileShare.ReadWrite so a slice can be writably aliased through an independent MAP_SHARED view
         // (the #1715 param-IO round-trip) concurrently with the store's own mapping. The two mappings
         // touch the same page-cache pages, so writes to disjoint byte ranges stay coherent.
-        _file = new FileStream(_path, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.ReadWrite);
-        _file.SetLength(_capacity);
-        TryMarkSparse(_file);     // unwritten capacity costs no disk where supported (Linux: always; Windows: NTFS)
-        Map();
+        // Clean up the file + handle if any step after CreateNew throws (CreateViewAccessor /
+        // AcquirePointer on a recoverable failure) — the ctor never reaches Dispose() on throw, so a
+        // partially-created mapping + the backing temp file would otherwise leak.
+        try
+        {
+            _file = new FileStream(_path, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.ReadWrite);
+            _file.SetLength(_capacity);
+            TryMarkSparse(_file); // unwritten capacity costs no disk where supported (Linux: always; Windows: NTFS)
+            Map();
+        }
+        catch
+        {
+            try { _file?.Dispose(); } catch { /* best-effort */ }
+            try { if (File.Exists(_path)) File.Delete(_path); } catch { /* best-effort */ }
+            throw;
+        }
     }
 
     private unsafe void Map()
     {
         // leaveOpen: true — we own _file and dispose it explicitly; the MMF must not close it
-        // so a later Grow can SetLength the same handle.
-        _mmf = MemoryMappedFile.CreateFromFile(
-            _file, mapName: null, _capacity, MemoryMappedFileAccess.ReadWrite,
-            HandleInheritability.None, leaveOpen: true);
-        _view = _mmf.CreateViewAccessor(0, _capacity, MemoryMappedFileAccess.ReadWrite);
+        // so a later Grow can SetLength the same handle. Build into locals and publish only after the
+        // pointer is acquired, so a throw from CreateViewAccessor / AcquirePointer disposes the partial
+        // MMF/view instead of leaking it (the ctor's catch deletes the file).
+        MemoryMappedFile? mmf = null;
+        MemoryMappedViewAccessor? view = null;
+        bool acquired = false;
         byte* p = null;
-        _view.SafeMemoryMappedViewHandle.AcquirePointer(ref p);
-        _base = p;
-        _pointerAcquired = true;
+        try
+        {
+            mmf = MemoryMappedFile.CreateFromFile(
+                _file, mapName: null, _capacity, MemoryMappedFileAccess.ReadWrite,
+                HandleInheritability.None, leaveOpen: true);
+            view = mmf.CreateViewAccessor(0, _capacity, MemoryMappedFileAccess.ReadWrite);
+            view.SafeMemoryMappedViewHandle.AcquirePointer(ref p);
+            acquired = true;
+            _mmf = mmf;
+            _view = view;
+            _base = p;
+            _pointerAcquired = true;
+        }
+        catch
+        {
+            if (acquired && view is not null) { try { view.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { /* best-effort */ } }
+            view?.Dispose();
+            mmf?.Dispose();
+            throw;
+        }
     }
 
     private unsafe void Unmap()
@@ -98,7 +135,7 @@ internal sealed class MemoryMappedWeightStore : IDisposable
         lock (_lock)
         {
             ThrowIfDisposed();
-            long offset = AlignUp(_used, 64);
+            long offset = AlignUp(_used, SliceAlignmentBytes);
             long need = offset + data.Length;
             if (need > _capacity) Grow(need);
             data.CopyTo(new Span<byte>(_base + offset, data.Length));
@@ -115,9 +152,16 @@ internal sealed class MemoryMappedWeightStore : IDisposable
         lock (_lock)
         {
             ThrowIfDisposed();
-            if (offset < 0 || length < 0 || offset + length > _used)
+            // Validate offset first, then length against the remaining span — `offset + length` could
+            // overflow before the comparison and then `_base + offset` would form a span from a bad address.
+            if (offset < 0 || length < 0 || offset > _used || length > _used - offset)
+            {
+                long end = offset >= 0 && length >= 0 && offset <= long.MaxValue - length
+                    ? offset + length
+                    : long.MaxValue;
                 throw new ArgumentOutOfRangeException(nameof(offset),
-                    $"slice [{offset},{offset + length}) is outside the allocated region [0,{_used}).");
+                    $"slice [{offset},{end}) is outside the allocated region [0,{_used}).");
+            }
             return new Span<byte>(_base + offset, length);
         }
     }
@@ -126,7 +170,7 @@ internal sealed class MemoryMappedWeightStore : IDisposable
     {
         long newCap = _capacity;
         while (newCap < minCapacity) newCap = checked(newCap * 2);
-        newCap = AlignUp(newCap, 4096);
+        newCap = AlignUp(newCap, PageAlignmentBytes);
 
         // Tear the mapping down (flushing dirty pages to the file), grow the file, re-map. The
         // file bytes already written persist across SetLength, so offsets stay valid.

@@ -31,7 +31,12 @@ public class MmapWritableAliasTests
         using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
         var bytes = new byte[count * sizeof(float)];
         int read = 0;
-        while (read < bytes.Length) read += fs.Read(bytes, read, bytes.Length - read);
+        while (read < bytes.Length)
+        {
+            int n = fs.Read(bytes, read, bytes.Length - read);
+            if (n == 0) throw new EndOfStreamException($"Expected {bytes.Length} bytes, read {read}.");
+            read += n;
+        }
         var values = new float[count];
         Buffer.BlockCopy(bytes, 0, values, 0, bytes.Length);
         return values;
@@ -108,9 +113,10 @@ public class MmapWritableAliasTests
         // resident array materialized (an mmap-backed Vector is not array-backed).
         for (int i = 0; i < n; i++) Assert.Equal(initial[i], tensor[i]);
 
-        // Mutate through the tensor's (writable) storage span; the change is the mmap, shared with
-        // the file. This is the GetParameters→mutate→SetParameters round-trip in miniature.
-        var span = aliased.AsWritableSpan();
+        // Mutate through the TENSOR API (not the raw alias) so this exercises the tensor-level write
+        // gate (TensorBase.AsWritableSpan → TensorStorage, which allows writable mmaps and would throw
+        // for a read-only one). The change lands in the mmap slice, shared with the file.
+        var span = tensor.AsWritableSpan();
         for (int i = 0; i < n; i++) span[i] = initial[i] * 2f + 1f;
         for (int i = 0; i < n; i++) Assert.Equal(initial[i] * 2f + 1f, tensor[i]); // tensor sees it (shared storage)
 

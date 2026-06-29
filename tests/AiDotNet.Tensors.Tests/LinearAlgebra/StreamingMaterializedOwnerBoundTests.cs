@@ -68,8 +68,11 @@ public class StreamingMaterializedOwnerBoundTests
             int residentNow = weights.Count(w => w.DataVector.Length == L);
             Assert.True(residentNow < N,
                 $"Expected the materialized-owner budget to shed cold owners, but all {N} are still resident.");
-            Assert.True(residentNow * (long)L * sizeof(float) <= Cap,
-                $"Resident owner set ({residentNow} weights) exceeds the pool cap ({Cap} bytes).");
+            // Assert against the OWNER budget (Cap/2), not the full pool cap — the implementation
+            // budgets materialized owners at Cap/2, so checking Cap would still pass if the owner set
+            // regressed to twice the intended limit.
+            Assert.True(residentNow * (long)L * sizeof(float) <= Cap / 2,
+                $"Resident owner set ({residentNow} weights) exceeds the owner budget ({Cap / 2} bytes).");
 
             // EXACT WRITE-BACK: re-materialize each weight and confirm the mutation survived the shed
             // (shed wrote the dirty bytes back to the pool/disk before dropping), and the untouched

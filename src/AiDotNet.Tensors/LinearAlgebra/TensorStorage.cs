@@ -30,18 +30,26 @@ internal sealed class TensorStorage<T>
     // TryClaimExclusive succeeds). Also exposes IsReadOnlyMapped so the
     // write paths (AsWritableSpan / AsWritableMemory / GetDataArray) can
     // throw a clear error instead of faulting in the mapped pages.
-    private IDisposable? _mmapOwner;
-    // Writable mmap aliases (#1715 param-IO round-trip) back a tensor whose mutations must persist
-    // to the mapped file (MAP_SHARED). Only READ-ONLY aliases gate the write paths — a writable
-    // alias's whole purpose is to be written. Set before _mmapOwner is published (the CAS below is
-    // the release barrier), so a reader that sees a non-null owner also sees the correct writability.
-    private bool _mmapWritable;
-    internal bool IsReadOnlyMapped => Volatile.Read(ref _mmapOwner) != null && !_mmapWritable;
+    // Owner + writability are published together as one immutable object so a reader that observes a
+    // non-null owner always sees the matching writability — and a failed AttachMmapOwner CAS can never
+    // leave the existing mapping reporting a new writability (#1715 param-IO writable aliases).
+    private sealed class MmapOwnerState : IDisposable
+    {
+        public MmapOwnerState(IDisposable owner, bool writable) { Owner = owner; Writable = writable; }
+        public IDisposable Owner { get; }
+        public bool Writable { get; }
+        public void Dispose() => Owner.Dispose();
+    }
+
+    private MmapOwnerState? _mmapOwner;
+    // Only READ-ONLY aliases gate the write paths (AsWritableSpan / AsWritableMemory / GetDataArray) —
+    // a writable alias (#1715) exists to be written, its mutations persist via MAP_SHARED.
+    internal bool IsReadOnlyMapped => Volatile.Read(ref _mmapOwner) is { Writable: false };
 
     /// <summary>True when this storage aliases a WRITABLE memory-mapped slice (#1715 param-IO): the
     /// mapped file is the weight's canonical storage (mutations persist via MAP_SHARED), so the registry
     /// must not re-materialize it from the pool (stale bytes) nor drop it on ReleaseToPool.</summary>
-    internal bool IsWritableMmapped => Volatile.Read(ref _mmapOwner) != null && _mmapWritable;
+    internal bool IsWritableMmapped => Volatile.Read(ref _mmapOwner) is { Writable: true };
 
     /// <summary>
     /// Attaches an IDisposable that will be disposed when this storage's
@@ -57,8 +65,9 @@ internal sealed class TensorStorage<T>
     internal void AttachMmapOwner(IDisposable owner, bool writable = false)
     {
         if (owner is null) throw new ArgumentNullException(nameof(owner));
-        _mmapWritable = writable;
-        if (Interlocked.CompareExchange(ref _mmapOwner, owner, null) != null)
+        // Publish owner + writability atomically: the new state object is fully constructed before the
+        // CAS, so a failed CAS (owner already present) leaves the existing state untouched.
+        if (Interlocked.CompareExchange(ref _mmapOwner, new MmapOwnerState(owner, writable), null) != null)
             throw new InvalidOperationException(
                 "TensorStorage already has an attached mmap owner; replacing it would leak the prior mapping.");
     }

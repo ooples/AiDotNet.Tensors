@@ -58,16 +58,21 @@ internal sealed unsafe class MmapTensorMemoryManager<T> : MemoryManager<T>
         // fallback a transient mapping failure would silently leak file
         // descriptors / view handles. Dispose what we've already opened
         // before rethrowing.
+        System.IO.FileStream? stream = null;
         try
         {
             // Read-only or read-write per `_writable`. The FileStream access must match the
             // mapping access (ReadWrite needs write permission on the file handle too).
             var fileAccess = _writable ? System.IO.FileAccess.ReadWrite : System.IO.FileAccess.Read;
             var mapAccess = _writable ? MemoryMappedFileAccess.ReadWrite : MemoryMappedFileAccess.Read;
+            // Hold the stream in a local: if CreateFromFile throws BEFORE it takes ownership (leaveOpen:
+            // false transfers ownership only on success), the catch must dispose the stream itself —
+            // otherwise the file handle leaks on a recoverable mapping failure.
+            stream = new System.IO.FileStream(path, System.IO.FileMode.Open, fileAccess, System.IO.FileShare.ReadWrite);
             _mmf = MemoryMappedFile.CreateFromFile(
-                new System.IO.FileStream(path, System.IO.FileMode.Open, fileAccess, System.IO.FileShare.ReadWrite),
-                mapName: null, capacity: 0,
+                stream, mapName: null, capacity: 0,
                 mapAccess, HandleInheritability.None, leaveOpen: false);
+            stream = null; // ownership transferred to _mmf (leaveOpen: false) — don't double-dispose
             _view = _mmf.CreateViewAccessor(byteOffset, byteLength, mapAccess);
             byte* p = null;
             _view.SafeMemoryMappedViewHandle.AcquirePointer(ref p);
@@ -78,6 +83,7 @@ internal sealed unsafe class MmapTensorMemoryManager<T> : MemoryManager<T>
         }
         catch
         {
+            try { stream?.Dispose(); } catch { /* best-effort: CreateFromFile didn't take ownership */ }
             _view?.Dispose();
             _view = null;
             _mmf?.Dispose();
