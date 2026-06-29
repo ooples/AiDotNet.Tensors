@@ -20,8 +20,12 @@ namespace AiDotNet.Tensors.LinearAlgebra;
 /// disposes it when it drops/replaces its storage, so the mapping lives exactly as long as
 /// the tensor aliases it.</para>
 ///
-/// <para>READ-ONLY: the view is mapped read-only, so this must only back weights that are
-/// not written while aliased (inference / forward-read). A write would fault.</para>
+/// <para>Read-only by default (inference / forward-read — a write would fault). Pass
+/// <c>writable: true</c> (#1715 param-IO round-trip) to map the slice <c>MemoryMappedFileAccess.ReadWrite</c>
+/// so writes through <see cref="GetSpan"/> hit the mapped pages and persist to the backing file
+/// (MAP_SHARED) — the OS flushes dirty pages under memory pressure and faults them back on the next
+/// read, with the mutation intact. A writable alias must back an all-mmap store (no concurrent
+/// FileStream writer on the same file) to stay page-cache-coherent.</para>
 /// </summary>
 internal sealed unsafe class MmapTensorMemoryManager<T> : MemoryManager<T>
 {
@@ -30,15 +34,21 @@ internal sealed unsafe class MmapTensorMemoryManager<T> : MemoryManager<T>
     private byte* _basePtr;            // start of the acquired view mapping (page-aligned)
     private readonly long _sliceByteOffset; // PointerOffset + the requested intra-view offset
     private readonly int _count;       // element count of T
+    private readonly bool _writable;
     private bool _disposed;
+
+    /// <summary>Whether this mapping is writable (writes persist) vs read-only (writes fault).</summary>
+    public bool IsWritable => _writable;
 
     /// <summary>
     /// Maps <paramref name="elementCount"/> elements of <typeparamref name="T"/> starting at
-    /// <paramref name="byteOffset"/> in the file at <paramref name="path"/>, read-only.
+    /// <paramref name="byteOffset"/> in the file at <paramref name="path"/>. Read-only unless
+    /// <paramref name="writable"/> is set, in which case writes persist to the file (MAP_SHARED).
     /// </summary>
-    public MmapTensorMemoryManager(string path, long byteOffset, int byteLength, int elementCount)
+    public MmapTensorMemoryManager(string path, long byteOffset, int byteLength, int elementCount, bool writable = false)
     {
         _count = elementCount;
+        _writable = writable;
         // Each step opens an additional handle on top of any prior one; if a
         // later step throws (e.g. CreateViewAccessor on a corrupt file,
         // AcquirePointer on an out-of-memory address space), the earlier
@@ -48,14 +58,22 @@ internal sealed unsafe class MmapTensorMemoryManager<T> : MemoryManager<T>
         // fallback a transient mapping failure would silently leak file
         // descriptors / view handles. Dispose what we've already opened
         // before rethrowing.
+        System.IO.FileStream? stream = null;
         try
         {
-            // Open a read-only mapping. The owning FileStream must share read access.
+            // Read-only or read-write per `_writable`. The FileStream access must match the
+            // mapping access (ReadWrite needs write permission on the file handle too).
+            var fileAccess = _writable ? System.IO.FileAccess.ReadWrite : System.IO.FileAccess.Read;
+            var mapAccess = _writable ? MemoryMappedFileAccess.ReadWrite : MemoryMappedFileAccess.Read;
+            // Hold the stream in a local: if CreateFromFile throws BEFORE it takes ownership (leaveOpen:
+            // false transfers ownership only on success), the catch must dispose the stream itself —
+            // otherwise the file handle leaks on a recoverable mapping failure.
+            stream = new System.IO.FileStream(path, System.IO.FileMode.Open, fileAccess, System.IO.FileShare.ReadWrite | System.IO.FileShare.Delete);
             _mmf = MemoryMappedFile.CreateFromFile(
-                new System.IO.FileStream(path, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite),
-                mapName: null, capacity: 0,
-                MemoryMappedFileAccess.Read, HandleInheritability.None, leaveOpen: false);
-            _view = _mmf.CreateViewAccessor(byteOffset, byteLength, MemoryMappedFileAccess.Read);
+                stream, mapName: null, capacity: 0,
+                mapAccess, HandleInheritability.None, leaveOpen: false);
+            stream = null; // ownership transferred to _mmf (leaveOpen: false) — don't double-dispose
+            _view = _mmf.CreateViewAccessor(byteOffset, byteLength, mapAccess);
             byte* p = null;
             _view.SafeMemoryMappedViewHandle.AcquirePointer(ref p);
             _basePtr = p;
@@ -65,6 +83,7 @@ internal sealed unsafe class MmapTensorMemoryManager<T> : MemoryManager<T>
         }
         catch
         {
+            try { stream?.Dispose(); } catch { /* best-effort: CreateFromFile didn't take ownership */ }
             _view?.Dispose();
             _view = null;
             _mmf?.Dispose();
@@ -99,6 +118,9 @@ internal sealed unsafe class MmapTensorMemoryManager<T> : MemoryManager<T>
         _disposed = true;
         if (_view is not null)
         {
+            // Push dirty pages to the file before tearing the mapping down so a writable
+            // alias's mutations are durable even if the OS hasn't flushed them yet.
+            if (_writable) { try { _view.Flush(); } catch { /* best-effort */ } }
             try { _view.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { /* best-effort */ }
             _view.Dispose();
             _view = null;
