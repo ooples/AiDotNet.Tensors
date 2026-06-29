@@ -36,6 +36,18 @@ public static class WeightRegistry
     // drain. Written/read under _lock.
     private static readonly Dictionary<long, WeakReference<IStreamingDroppable>> _ownerByHandle = new();
 
+    // #1715: bound the set of streaming weights whose OWNER tensors hold resident _data at once.
+    // Materialize hands each weight a private resident copy; the pool only accounts ITS OWN byte[]
+    // snapshots, so without this a caller that materializes many weights and holds them (a
+    // GetParameters round-trip / Clone over a foundation-scale model) accumulates unbounded owner
+    // copies → OOM before the pool's snapshot-budget eviction ever fires. We track materialized
+    // owners in an LRU and, once their bytes exceed the budget, shed the coldest: write its current
+    // (possibly mutated) data back to the pool, then drop its resident copy. All under _lock.
+    private static readonly LinkedList<long> _materializedLru = new();           // MRU at front
+    private static readonly Dictionary<long, LinkedListNode<long>> _materializedNode = new();
+    private static readonly Dictionary<long, long> _materializedBytes = new();   // handle → owner-resident bytes
+    private static long _materializedResidentBytes;
+
     /// <summary>Replaces the active options; must be called before any
     /// <see cref="WeightLifetime.Streaming"/> / GpuOffload registration.
     /// Throws <see cref="InvalidOperationException"/> when the existing pool
@@ -552,6 +564,7 @@ public static class WeightRegistry
             {
                 _streamingPool?.Unregister(weight.StreamingPoolHandle);
                 _ownerByHandle.Remove(weight.StreamingPoolHandle);
+                UntrackMaterializedOwner(weight.StreamingPoolHandle); // #1715
                 weight.StreamingPoolHandle = -1;
             }
             if (weight.OffloadDevicePointer != IntPtr.Zero || weight.OffloadHostPointer != IntPtr.Zero)
@@ -649,6 +662,61 @@ public static class WeightRegistry
             // Any failure (file locked, OOM mapping address space, etc.) → fall back to
             // the proven copy path. Dispose the half-built mapping so no handle leaks.
             // MemoryManager<T>.Dispose() is an explicit interface impl — cast to reach it.
+            ((IDisposable?)manager)?.Dispose();
+            return false;
+        }
+    }
+
+    // #1715 param-IO writable mmap store: one growable memory-mapped file holding the writable slices
+    // that training/param-IO weights alias instead of materializing resident copies. Lazily created;
+    // disposed (file deleted) on Reset. Process-global like the streaming pool.
+    private static MemoryMappedWeightStore? _paramIoStore;
+
+    private static MemoryMappedWeightStore ParamIoStore()
+        => _paramIoStore ??= new MemoryMappedWeightStore(System.IO.Path.Combine(
+            System.IO.Path.GetTempPath(), "aidotnet-paramio-" + System.Guid.NewGuid().ToString("N") + ".bin"));
+
+    /// <summary>
+    /// #1715 writable zero-copy: copy <paramref name="weight"/>'s current bytes once into the param-IO
+    /// mmap store and alias its storage to that writable slice (MAP_SHARED) so mutations persist with no
+    /// resident copy and the OS pages the slice. Returns false (caller falls back to the copy path) when
+    /// the bytes aren't the tensor's native element layout or the mapping can't be opened. The store slice
+    /// becomes the weight's canonical storage — <see cref="Materialize{T}"/> / <see cref="ReleaseToPool{T}"/>
+    /// then no-op on it via <c>IsWritableMmapAliased</c>.
+    /// </summary>
+    private static bool TryAliasZeroCopyWritable<T>(Tensor<T> weight, StreamingTensorPool pool)
+    {
+        int elemSize = NativeStreamingElementSize<T>();
+        if (elemSize <= 0) return false;
+        long byteLen = (long)weight.Length * elemSize;
+        if (byteLen <= 0 || byteLen > int.MaxValue) return false;
+
+        MmapTensorMemoryManager<T>? manager = null;
+        try
+        {
+            // Current bytes from the pool (native, uncompressed). A scale prefix / compression makes the
+            // length mismatch — not aliasable, fall back to the copy path. RehydrateInto takes the pool's
+            // own lock; keep it OUTSIDE _lock to preserve the pool-lock-then-registry-lock-free ordering.
+            byte[] bytes = pool.RehydrateInto(weight.StreamingPoolHandle);
+            if (bytes.Length != (int)byteLen) return false;
+
+            // Create/allocate the param-IO store and install the alias under the registry lock so a
+            // concurrent Reset (which disposes _paramIoStore under _lock) can't race store creation or
+            // open a writable view of a just-disposed mapping. store.Allocate is itself internally locked.
+            lock (_lock)
+            {
+                var store = ParamIoStore();
+                long offset = store.Allocate(bytes);
+                manager = new MmapTensorMemoryManager<T>(store.Path, offset, (int)byteLen, weight.Length, writable: true);
+                var aliased = Vector<T>.WrapMemory(manager.Memory);
+                weight.AliasStorageFromMmap(aliased, manager, writable: true); // tensor's storage owns the mapping
+            }
+            return true;
+        }
+        catch
+        {
+            // Any failure (length mismatch handled above; mapping open / address-space failure here) →
+            // dispose the half-built mapping and fall back to the proven copy path.
             ((IDisposable?)manager)?.Dispose();
             return false;
         }
@@ -993,6 +1061,10 @@ public static class WeightRegistry
         if (weight is null) throw new ArgumentNullException(nameof(weight));
         if (weight.Lifetime != WeightLifetime.Streaming) return;
         if (weight.StreamingPoolHandle < 0) return;
+        // #1715: a writable mmap alias is the weight's canonical storage (mutations persist through the
+        // mapping). Re-materializing from the pool would read stale bytes, and the shed path would drop
+        // the alias and lose the mutation — so the weight is already materialized. Nothing to do.
+        if (weight.IsWritableMmapAliased) return;
         // A no-upcast int8/int4 weight is already materialized (as quantized + scales), even though
         // its fp _data is empty — treat it as resident so we don't re-fetch + re-attach each call.
         if (weight.DataVector.Length == weight.Length || weight.StreamingInt8 is not null || weight.StreamingInt4 is not null)
@@ -1017,6 +1089,11 @@ public static class WeightRegistry
             // (a late RegisterWeight, or a background prefetch) since the last
             // drain, so their owners' resident _data doesn't linger.
             DrainOwnerDropsAfterEviction();
+            // #1715: a still-resident owner re-accessed here is hot — refresh its position in the
+            // materialized-owner LRU (and register it if a non-Materialize path made it resident) so
+            // it isn't shed while in use. Skip no-upcast quant (its fp _data is empty, not a copy).
+            if (weight.DataVector.Length == weight.Length)
+                NoteMaterializedAndShed(weight.StreamingPoolHandle, CheckedStreamingByteCount<T>(weight.Length));
             return;
         }
 
@@ -1066,6 +1143,21 @@ public static class WeightRegistry
             return;
         }
 
+        // #1715 WRITABLE zero-copy fast path: in TRAINING / param-IO mode the read-only alias above can't
+        // be used (a weight update would fault), so foundation models fall to the copy path below and
+        // materialize the whole weight set as resident arrays → the GetParameters round-trip OOMs. Instead,
+        // copy the weight's bytes once into the param-IO mmap store and alias its storage to that slice
+        // WRITABLY: mutations persist (MAP_SHARED) and the OS pages the slice, so no resident copy is held.
+        // Gated to native encoding (bf16/int8/lossless need a decode = copy). The store slice becomes the
+        // weight's canonical storage, so the early IsWritableMmapAliased guard makes re-materialize a no-op
+        // and ReleaseToPool leaves it intact.
+        if (zeroCopyEnabled && !inferenceMode && weight.StreamingStoreEncoding == StreamingEncoding.Native
+            && NativeStreamingElementSize<T>() > 0
+            && TryAliasZeroCopyWritable(weight, pool))
+        {
+            return;
+        }
+
         byte[] snapshot = pool.RehydrateInto(weight.StreamingPoolHandle);
         // No-upcast int8 fast path: keep an int8-stored weight as int8 + per-row scales in
         // inference so the matmul fast path feeds the int8 GEMM directly (no dequant to fp32).
@@ -1094,6 +1186,120 @@ public static class WeightRegistry
         // resident set stays bounded (the just-materialized weight is protected
         // from eviction by RehydrateInto, so it's never in the drained set).
         DrainOwnerDropsAfterEviction();
+
+        // #1715: this weight now holds a resident owner copy. Track it and shed the coldest
+        // materialized owners if the concurrently-held owner set exceeds the budget — bounding the
+        // resident set for a caller (parameter round-trip / Clone) that materializes many weights and
+        // holds them all, which would otherwise OOM (the pool only accounts its own snapshots).
+        NoteMaterializedAndShed(weight.StreamingPoolHandle, CheckedStreamingByteCount<T>(weight.Length));
+    }
+
+    /// <summary>
+    /// Re-serializes a resident, native-encoded streaming weight's CURRENT data into its pool entry
+    /// under the same handle (#1715). Called by <see cref="Tensor{T}.TryWriteBackResidentForStreaming"/>
+    /// before a mutated weight is dropped, so the mutation reaches disk and a later
+    /// <see cref="Materialize{T}"/> rehydrates it rather than the stale register-time snapshot.
+    /// </summary>
+    internal static bool WriteBackResidentNative<T>(Tensor<T> weight)
+    {
+        if (weight is null) throw new ArgumentNullException(nameof(weight));
+        if (weight.StreamingPoolHandle < 0) return false;
+        if (weight.DataVector.Length != weight.Length) return false;
+        int byteCount = CheckedStreamingByteCount<T>(weight.Length);
+        var bytes = new byte[byteCount];
+        SerializeToBytes(weight, bytes, StreamingEncoding.Native, stochastic: false);
+        StreamingTensorPool pool;
+        lock (_lock) { pool = StreamingPoolUnlocked(); }
+        pool.ReplaceEntryData(weight.StreamingPoolHandle, bytes);
+        return true;
+    }
+
+    // #1715: budget for concurrently-materialized owner copies. Half the pool's resident cap so the
+    // owner copies + the pool's own snapshot working set stay comfortably under the total budget the
+    // streaming model was sized against. Zero/absent cap → no bounding (degrades to prior behavior).
+    private static long MaterializedOwnerBudget()
+    {
+        long cap;
+        lock (_lock) { cap = StreamingPoolUnlocked().MaxResidentBytes; }
+        return cap > 0 ? cap / 2 : long.MaxValue;
+    }
+
+    private static void NoteMaterializedAndShed(long handle, long ownerBytes)
+    {
+        if (handle < 0 || ownerBytes <= 0) return;
+        long budget = MaterializedOwnerBudget();
+
+        lock (_lock)
+        {
+            // Add or move-to-front (MRU).
+            if (_materializedNode.TryGetValue(handle, out var existing))
+            {
+                _materializedLru.Remove(existing);
+                _materializedLru.AddFirst(existing);
+            }
+            else
+            {
+                var node = _materializedLru.AddFirst(handle);
+                _materializedNode[handle] = node;
+                _materializedBytes[handle] = ownerBytes;
+                _materializedResidentBytes += ownerBytes;
+            }
+
+            // Shed the coldest materialized owners until back under budget. Keep at least the
+            // just-added MRU entry resident (the caller is using it right now).
+            while (_materializedResidentBytes > budget && _materializedLru.Count > 1)
+            {
+                var tail = _materializedLru.Last;
+                if (tail is null) break;
+                long victim = tail.Value;
+                _materializedBytes.TryGetValue(victim, out long victimBytes);
+
+                // Persist + drop the coldest owner, but only UNTRACK it after both succeed. If write-back
+                // returns false (non-native/aliased — nothing to persist) or the drop returns false
+                // (shared refcount), the owner must stay resident AND accounted; untracking it first
+                // would leak its bytes from the budget (the resident copy still exists). Order: write-back
+                // FIRST so the dropped bytes are recoverable from the pool/disk.
+                bool shed;
+                if (_ownerByHandle.TryGetValue(victim, out var weak) && weak.TryGetTarget(out var owner))
+                {
+                    bool wroteBack = false;
+                    try { wroteBack = owner.TryWriteBackResidentForStreaming(); }
+                    catch { /* best-effort */ }
+                    shed = false;
+                    if (wroteBack)
+                    {
+                        try { shed = owner.TryDropStorageForStreaming(throwOnSharedRefcount: false); }
+                        catch { /* shared refcount → leave resident + accounted */ }
+                    }
+                }
+                else
+                {
+                    shed = true; // dead owner: no resident copy remains to account
+                }
+
+                // Coldest owner can't be shed yet (non-native, or shared ref) — stop. Bounding is
+                // best-effort; never untrack/forget a still-resident owner.
+                if (!shed) break;
+                _materializedLru.RemoveLast();
+                _materializedNode.Remove(victim);
+                _materializedBytes.Remove(victim);
+                _materializedResidentBytes -= victimBytes;
+            }
+        }
+    }
+
+    // #1715: stop tracking a handle as a materialized owner (it was released / unregistered).
+    private static void UntrackMaterializedOwner(long handle)
+    {
+        if (handle < 0) return;
+        if (_materializedNode.TryGetValue(handle, out var node))
+        {
+            _materializedLru.Remove(node);
+            _materializedNode.Remove(handle);
+            _materializedBytes.TryGetValue(handle, out long bytes);
+            _materializedBytes.Remove(handle);
+            _materializedResidentBytes -= bytes;
+        }
     }
 
     /// <summary>
@@ -1108,6 +1314,10 @@ public static class WeightRegistry
         if (weight is null) throw new ArgumentNullException(nameof(weight));
         if (weight.Lifetime != WeightLifetime.Streaming) return;
         if (weight.StreamingPoolHandle < 0) return;
+        // #1715: a writable mmap alias IS the offloaded form — its bytes live in the param-IO store
+        // (OS-paged), not on the GC heap. Dropping the storage would discard the mapping (and the
+        // mutated bytes) and a re-materialize would read stale pool bytes. Nothing to release.
+        if (weight.IsWritableMmapAliased) return;
         if (weight.DataVector.Length == 0) return; // already released
         // Soft-defer drop — mirrors the RegisterWeight #430 fix. A streaming
         // weight's storage can be SHARED (refcount > 1) at release time when a
@@ -1127,6 +1337,9 @@ public static class WeightRegistry
         // residency, never correctness.
         bool dropped = weight.TryDropStorageForStreaming(throwOnSharedRefcount: false);
         weight.StreamingDropDeferred = !dropped;
+        // #1715: the owner copy is gone — stop counting it against the materialized-owner budget.
+        if (dropped)
+            lock (_lock) { UntrackMaterializedOwner(weight.StreamingPoolHandle); }
     }
 
     /// <summary>
@@ -1727,9 +1940,19 @@ public static class WeightRegistry
         {
             _streamingPool?.Dispose();
             _streamingPool = null;
+            // #1715: dispose the param-IO mmap store (deletes its backing file). Weights still aliasing
+            // its slices keep their own MAP_SHARED view alive (the alias owns an independent mapping), so
+            // disposing the store here only releases the registry's handle, not the live aliases' mappings.
+            _paramIoStore?.Dispose();
+            _paramIoStore = null;
             _offloadAllocator?.Dispose();
             _offloadAllocator = null;
             _ownerByHandle.Clear();
+            // #1715: reset the materialized-owner tracker with the pool.
+            _materializedLru.Clear();
+            _materializedNode.Clear();
+            _materializedBytes.Clear();
+            _materializedResidentBytes = 0;
             // Drop any straggler in-flight markers (a worker that timed out the
             // drain above). Leaving them would suppress the NEXT pool's prefetch
             // of a reused handle id (dedup sees it as "already in-flight").
@@ -1795,6 +2018,19 @@ public static class WeightRegistry
             // storage, which a registered weight never is — guarded anyway.
             if (owner is not null && owner.StreamingPoolHandle == handle)
             {
+                // #1715: the pool just paged out this handle's snapshot taken at register time. If the
+                // owner MUTATED its resident copy since (a GetParameters round-trip / optimizer step),
+                // that snapshot is stale — write the owner's CURRENT bytes back BEFORE dropping so a
+                // later Materialize rehydrates the mutation, not the stale value. Native-gated inside
+                // TryWriteBackResidentForStreaming, so read-only inference (bf16/quant store) is a no-op.
+                // Unlike the materialized-owner SHED loop (NoteMaterializedAndShed), the drop here is safe
+                // regardless of the write-back RESULT: a native owner's write-back persists the mutation
+                // before the drop, and a non-native owner's resident copy is a re-derivable dequant of the
+                // pool's quantized snapshot (re-materialize re-derives it) — so the snapshot stays
+                // authoritative either way. (Training uses the FullPrecision/native store, so a mutated
+                // owner is always native and always writes back.)
+                try { owner.TryWriteBackResidentForStreaming(); }
+                catch { /* best-effort write-back; never block the drop */ }
                 try { owner.TryDropStorageForStreaming(throwOnSharedRefcount: false); }
                 catch (InvalidOperationException) { /* not droppable (view/non-contiguous) — leave resident */ }
             }

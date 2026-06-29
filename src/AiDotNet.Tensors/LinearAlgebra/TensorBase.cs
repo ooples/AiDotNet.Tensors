@@ -28,6 +28,13 @@ internal interface IStreamingDroppable
     /// when the storage is still shared (refcount &gt; 1) — e.g. an autodiff
     /// tape capture during training — leaving the data resident for the peer.</summary>
     bool TryDropStorageForStreaming(bool throwOnSharedRefcount);
+
+    /// <summary>Re-serializes this tensor's CURRENT resident data into its streaming-pool entry
+    /// under the same handle, so a later drop + rehydrate returns the current (possibly mutated)
+    /// values rather than the stale snapshot taken at register time (#1715). Returns <c>false</c>
+    /// (no-op) when the weight isn't a resident, full-precision streaming weight. Call BEFORE
+    /// dropping a mutated streaming weight so the mutation is not lost.</summary>
+    bool TryWriteBackResidentForStreaming();
 }
 
 /// <summary>
@@ -296,7 +303,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     /// <para>READ-ONLY: the mapping is read-only; the caller guarantees nothing writes to
     /// this tensor while aliased (inference / forward-read only). A write would fault.</para>
     /// </summary>
-    internal void AliasStorageFromMmap(Vector<T> aliased, IDisposable owner)
+    internal void AliasStorageFromMmap(Vector<T> aliased, IDisposable owner, bool writable = false)
     {
         if (aliased is null) throw new ArgumentNullException(nameof(aliased));
         if (owner is null) throw new ArgumentNullException(nameof(owner));
@@ -316,10 +323,15 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         var oldStorage = _storage;
         _data = aliased;
         var newStorage = new TensorStorage<T>(_data);
-        newStorage.AttachMmapOwner(owner); // attach BEFORE making the storage visible to anyone else
+        newStorage.AttachMmapOwner(owner, writable); // attach BEFORE making the storage visible to anyone else
         _storage = newStorage;
         oldStorage.Release();
     }
+
+    /// <summary>True when this tensor's storage aliases a WRITABLE memory-mapped slice (#1715 param-IO):
+    /// the mapped file is the canonical storage (mutations persist), so WeightRegistry must not
+    /// re-materialize it from the pool nor drop it on ReleaseToPool.</summary>
+    internal bool IsWritableMmapAliased => _storage.IsWritableMmapped;
 
     /// <summary>
     /// Physical memory layout of this tensor's data. Default
@@ -535,6 +547,26 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         => TryDropStorageForStreaming(throwOnSharedRefcount);
 
     long IStreamingDroppable.StreamingPoolHandle => StreamingPoolHandle;
+
+    bool IStreamingDroppable.TryWriteBackResidentForStreaming() => TryWriteBackResidentForStreaming();
+
+    /// <summary>
+    /// Re-serializes this tensor's current resident data into its streaming-pool entry (#1715).
+    /// Native (full-precision) streaming weights only: a lossy store (bf16/int8/int4) is taken by
+    /// read-only inference and its owner is never mutated, so skip it; a non-resident / view / quant
+    /// tensor has nothing to write back. The new bytes overwrite the pool entry under the same handle
+    /// (marked dirty), so the next eviction persists them to disk and a later <c>Materialize</c>
+    /// rehydrates the mutation instead of the stale register-time snapshot.
+    /// </summary>
+    internal bool TryWriteBackResidentForStreaming()
+    {
+        if (StreamingPoolHandle < 0) return false;
+        if (StreamingStoreEncoding != StreamingEncoding.Native) return false;
+        if (DataVector.Length != Length) return false;            // already dropped / no-upcast quant
+        if (!IsContiguous || _storageOffset != 0 || IsView) return false;
+        // Streaming weights are concrete Tensor<T>; serialization needs the concrete type.
+        return this is Tensor<T> concrete && WeightRegistry.WriteBackResidentNative(concrete);
+    }
 
     /// <summary>
     /// Restores this tensor's data from a serialized byte buffer (produced
@@ -1585,7 +1617,9 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
             ThrowIfSparse();
             ValidateIndices(indices);
             EnsureOwnedForWrite();
-            _data[GetFlatIndex(indices)] = value;
+            // Route through _storage so a read-only mmap alias throws rather than faulting on write
+            // (transparent for normal tensors — _storage wraps the same Vector as _data).
+            _storage.AsWritableSpan()[GetFlatIndex(indices)] = value;
             // Element-level CPU mutation: bump the version counter so cached
             // GPU buffers (DirectGpuTensorEngine activation cache,
             // _gpuBufferVersion) detect the change and re-upload. Public
@@ -1651,17 +1685,19 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
             throw new ArgumentException($"Source array length ({source.Length}) must match tensor length ({Length}).");
         if (Length == 0) return;
         EnsureOwnedForWrite();
+        // Route through _storage so a read-only mmap alias throws (ThrowIfReadOnlyMapped) rather than
+        // faulting the mapped pages; transparent for normal tensors (_storage wraps the same Vector).
         if (IsContiguous && _storageOffset == 0 && _storage.Length == Length)
         {
-            source.AsSpan().CopyTo(_data.AsWritableSpan());
+            source.AsSpan().CopyTo(_storage.AsWritableSpan());
         }
         else if (IsContiguous)
         {
-            source.AsSpan().CopyTo(_data.AsWritableSpan().Slice(_storageOffset, Length));
+            source.AsSpan().CopyTo(_storage.AsWritableSpan().Slice(_storageOffset, Length));
         }
         else
         {
-            var dstData = _data.AsWritableSpan();
+            var dstData = _storage.AsWritableSpan();
             for (int i = 0; i < Length; i++)
                 dstData[FlatIndexToStorageIndex(i)] = source[i];
         }
@@ -1697,10 +1733,13 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         if (flatIndex < 0 || flatIndex >= Length)
             throw new ArgumentOutOfRangeException(nameof(flatIndex), "Flat index is out of range.");
         EnsureOwnedForWrite();
+        // Route through _storage so a read-only mmap alias throws rather than faulting on write
+        // (transparent for normal tensors — _storage wraps the same Vector as _data).
+        var writable = _storage.AsWritableSpan();
         if (IsContiguous)
-            _data[flatIndex + _storageOffset] = value;
+            writable[flatIndex + _storageOffset] = value;
         else
-            _data[FlatIndexToStorageIndex(flatIndex)] = value;
+            writable[FlatIndexToStorageIndex(flatIndex)] = value;
         // Element-level CPU mutation: bump the version counter so cached GPU
         // buffers (DirectGpuTensorEngine activation cache, _gpuBufferVersion)
         // detect the change and re-upload. Without this, the GPU snapshot is
@@ -1831,9 +1870,12 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         if (!IsContiguous)
             throw new InvalidOperationException(
                 "Cannot get a contiguous writable span from a non-contiguous tensor view. Call Contiguous() first.");
+        // Route through _storage (not _data) so a read-only mmap alias fails loud via
+        // ThrowIfReadOnlyMapped instead of faulting the mapped pages on write. _storage wraps the same
+        // Vector as _data, so this is transparent for normal tensors; a writable mmap alias is allowed.
         if (_storageOffset == 0 && _storage.Length == Length)
-            return _data.AsWritableSpan();
-        return _data.AsWritableSpan().Slice(_storageOffset, Length);
+            return _storage.AsWritableSpan();
+        return _storage.AsWritableSpan().Slice(_storageOffset, Length);
     }
 
     /// <summary>
@@ -2502,7 +2544,9 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         get
         {
             EnsureOwnedForWrite();
-            return _data.AsWritableSpan();
+            // Route through _storage so a read-only mmap alias throws rather than faulting on write
+            // (transparent for normal tensors — _storage wraps the same Vector as _data).
+            return _storage.AsWritableSpan();
         }
     }
 
