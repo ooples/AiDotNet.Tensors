@@ -1873,7 +1873,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 float newLr = lr + hgAdj;
                 for (int p = 0; p < paramCount; p++)
                 {
-                    if (gradArrays[p].Length == 0) continue;
+                    // Skip params with no gradient OR no materialized weight backing (#1738).
+                    if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
                     int len2 = lengths[p];
                     fixed (float* pParam = paramArrays[p], pGrad = gradArrays[p], pPrev = m[p])
                         for (int i = 0; i < len2; i++) { pParam[i] -= newLr * pGrad[i]; pPrev[i] = pGrad[i]; }
@@ -1904,7 +1905,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 float gammaNew = dNew * lr;
                 for (int p = 0; p < paramCount; p++)
                 {
-                    if (gradArrays[p].Length == 0) continue;
+                    // Skip params with no gradient OR no materialized weight backing (#1738).
+                    if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
                     int len2 = lengths[p];
                     fixed (float* pParam = paramArrays[p], pGrad = gradArrays[p])
                         for (int i = 0; i < len2; i++) pParam[i] -= gammaNew * pGrad[i];
@@ -2520,7 +2522,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             double lr = lrSchedule.GetLr(_optimizerStep);
             for (int p = 0; p < paramCount; p++)
             {
-                if (gradArrays[p].Length == 0) continue;
+                // Skip params with no gradient OR no materialized weight backing (#1738).
+                if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
                 int len = lengths[p];
                 fixed (double* pParam = paramArrays[p], pGrad = gradArrays[p],
                        pM = m[p], pV = v[p], pVMax = vMax[p])
@@ -2641,7 +2644,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             for (int p = 0; p < paramCount; p++)
             {
-                if (gradArrays[p].Length == 0) continue;
+                // Skip params with no gradient OR no materialized weight backing (#1738).
+                if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
                 int len = lengths[p];
                 double lr = groupLrs[paramGroup[p]];
 
