@@ -1926,7 +1926,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 float wsNext = sfWeightSum;
                 for (int p = 0; p < paramCount; p++)
                 {
-                    if (gradArrays[p].Length == 0) continue;
+                    if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
                     int len2 = lengths[p];
                     fixed (float* pZ = m[p], pX = v[p], pGrad = gradArrays[p])
                         wsNext = FusedOptimizer.ScheduleFreeSgdUpdateSimd(
