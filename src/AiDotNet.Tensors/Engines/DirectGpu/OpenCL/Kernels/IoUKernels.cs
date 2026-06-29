@@ -199,7 +199,7 @@ __kernel void ciou_loss_backward(
     float encDx=max(px2,tx2)-min(px1,tx1),encDy=max(py2,ty2)-min(py1,ty1);
     float cSq=encDx*encDx+encDy*encDy+1e-7f,cSqSq=cSq*cSq;
     float dCSq[4]={2.0f*encDx*(-(px1<tx1?1.0f:0.0f)), 2.0f*encDy*(-(py1<ty1?1.0f:0.0f)), 2.0f*encDx*(px2>tx2?1.0f:0.0f), 2.0f*encDy*(py2>ty2?1.0f:0.0f)};
-    float pw=px2-px1+1e-7f,ph=py2-py1+1e-7f,tw=tx2-tx1+1e-7f,th=ty2-ty1+1e-7f;
+    float pw=max(px2-px1,1e-7f),ph=max(py2-py1,1e-7f),tw=max(tx2-tx1,1e-7f),th=max(ty2-ty1,1e-7f);
     float atanDiff=atan(tw/th)-atan(pw/ph);
     float fourOverPiSq=4.0f/(3.14159265f*3.14159265f);
     float v=fourOverPiSq*atanDiff*atanDiff;

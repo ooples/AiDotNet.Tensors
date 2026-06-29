@@ -5260,7 +5260,7 @@ kernel void ciou_loss(device const float* pred [[buffer(0)]], device const float
     float cds=dx*dx+dy*dy;
     float eDx=max(px2,tx2)-min(px1,tx1), eDy=max(py2,ty2)-min(py1,ty1);
     float ds=eDx*eDx+eDy*eDy+EPSILON;
-    float pw=px2-px1+EPSILON,ph=py2-py1+EPSILON,tw=tx2-tx1+EPSILON,th=ty2-ty1+EPSILON;
+    float pw=max(px2-px1,EPSILON),ph=max(py2-py1,EPSILON),tw=max(tx2-tx1,EPSILON),th=max(ty2-ty1,EPSILON);
     float rd=atan(tw/th)-atan(pw/ph);
     float v=(4.0f/(PI*PI))*rd*rd;
     float alpha=v/(1.0f-iou+v+EPSILON);
@@ -5345,7 +5345,7 @@ kernel void ciou_loss_backward(device const float* goB [[buffer(0)]], device con
     float encDx=max(px2,tx2)-min(px1,tx1),encDy=max(py2,ty2)-min(py1,ty1);
     float cSq=encDx*encDx+encDy*encDy+EPSILON,cSqSq=cSq*cSq;
     float dCSq[4]={2.0f*encDx*(-(px1<tx1?1.0f:0.0f)),2.0f*encDy*(-(py1<ty1?1.0f:0.0f)),2.0f*encDx*(px2>tx2?1.0f:0.0f),2.0f*encDy*(py2>ty2?1.0f:0.0f)};
-    float pw=px2-px1+EPSILON,ph=py2-py1+EPSILON,tw=tx2-tx1+EPSILON,th=ty2-ty1+EPSILON;
+    float pw=max(px2-px1,EPSILON),ph=max(py2-py1,EPSILON),tw=max(tx2-tx1,EPSILON),th=max(ty2-ty1,EPSILON);
     float atanDiff=atan(tw/th)-atan(pw/ph), fourOverPiSq=4.0f/(PI*PI);
     float v=fourOverPiSq*atanDiff*atanDiff;
     float ix1=max(px1,tx1),iy1=max(py1,ty1),ix2=min(px2,tx2),iy2=min(py2,ty2);
