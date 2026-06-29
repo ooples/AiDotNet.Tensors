@@ -9211,7 +9211,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let px1=pred[o]; let py1=pred[o+1u]; let px2=pred[o+2u]; let py2=pred[o+3u];
     let tx1=targ[o]; let ty1=targ[o+1u]; let tx2=targ[o+2u]; let ty2=targ[o+3u];
     let iw=max(0.0,min(px2,tx2)-max(px1,tx1)); let ih=max(0.0,min(py2,ty2)-max(py1,ty1));
-    let iA=iw*ih; let pw=px2-px1; let ph=py2-py1; let pA=pw*ph; let tA=max(0.0,tx2-tx1)*max(0.0,ty2-ty1);
+    let iA=iw*ih; let pw=px2-px1; let ph=py2-py1; let pA=pw*ph; let tA=(tx2-tx1)*(ty2-ty1);
     let uA=pA+tA-iA+1e-7;
     let hi=select(0.0, 1.0, iw>0.0 && ih>0.0);
     let dI0=hi*select(0.0,-1.0,px1>tx1)*ih; let dI1=hi*select(0.0,-1.0,py1>ty1)*iw;
@@ -9240,7 +9240,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let tx1=targ[o]; let ty1=targ[o+1u]; let tx2=targ[o+2u]; let ty2=targ[o+3u];
     let iw=max(0.0,min(px2,tx2)-max(px1,tx1)); let ih=max(0.0,min(py2,ty2)-max(py1,ty1));
     let iA=iw*ih; let pw=px2-px1; let ph=py2-py1;
-    let uA=pw*ph+max(0.0,tx2-tx1)*max(0.0,ty2-ty1)-iA+1e-7;
+    let uA=pw*ph+(tx2-tx1)*(ty2-ty1)-iA+1e-7;
     let hi=select(0.0,1.0,iw>0.0&&ih>0.0);
     let dI0=hi*select(0.0,-1.0,px1>tx1)*ih; let dI1=hi*select(0.0,-1.0,py1>ty1)*iw;
     let dI2=hi*select(0.0,1.0,px2<tx2)*ih; let dI3=hi*select(0.0,1.0,py2<ty2)*iw;
@@ -9274,7 +9274,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let tx1=targ[o]; let ty1=targ[o+1u]; let tx2=targ[o+2u]; let ty2=targ[o+3u];
     let iw=max(0.0,min(px2,tx2)-max(px1,tx1)); let ih=max(0.0,min(py2,ty2)-max(py1,ty1));
     let iA=iw*ih; let pw=px2-px1; let ph=py2-py1;
-    let uA=pw*ph+max(0.0,tx2-tx1)*max(0.0,ty2-ty1)-iA+1e-7;
+    let uA=pw*ph+(tx2-tx1)*(ty2-ty1)-iA+1e-7;
     let hi=select(0.0,1.0,iw>0.0&&ih>0.0);
     let dI0=hi*select(0.0,-1.0,px1>tx1)*ih; let dI1=hi*select(0.0,-1.0,py1>ty1)*iw;
     let dI2=hi*select(0.0,1.0,px2<tx2)*ih; let dI3=hi*select(0.0,1.0,py2<ty2)*iw;
