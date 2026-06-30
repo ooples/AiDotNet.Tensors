@@ -146,6 +146,78 @@ public class LrScheduleTests
         }
     }
 
+    [Fact]
+    public void LinearWarmup_Constant_MatchesAiDotNetBatchSequence()
+    {
+        var s = LrSchedule.LinearWarmup(
+            lrMax: 0.2,
+            warmupSteps: 4,
+            totalSteps: 4,
+            warmupInitLr: 0.01,
+            decayMode: WarmupDecayMode.Constant);
+
+        Assert.Equal(0.01, s.GetLr(1), 1e-12);
+        Assert.Equal(0.0575, s.GetLr(2), 1e-12);
+        Assert.Equal(0.105, s.GetLr(3), 1e-12);
+        Assert.Equal(0.1525, s.GetLr(4), 1e-12);
+        Assert.Equal(0.2, s.GetLr(5), 1e-12);
+        Assert.Equal(0.2, s.GetLr(50), 1e-12);
+    }
+
+    [Fact]
+    public void LinearWarmup_LinearDecay_MatchesAiDotNetBatchSequence()
+    {
+        var s = LrSchedule.LinearWarmup(
+            lrMax: 0.1,
+            warmupSteps: 2,
+            totalSteps: 6,
+            warmupInitLr: 0.02,
+            decayMode: WarmupDecayMode.Linear,
+            endLr: 0.001);
+
+        Assert.Equal(0.02, s.GetLr(1), 1e-12);
+        Assert.Equal(0.06, s.GetLr(2), 1e-12);
+        Assert.Equal(0.1, s.GetLr(3), 1e-12);
+        Assert.Equal(0.07525, s.GetLr(4), 1e-12);
+        Assert.Equal(0.0505, s.GetLr(5), 1e-12);
+        Assert.Equal(0.02575, s.GetLr(6), 1e-12);
+        Assert.Equal(0.001, s.GetLr(7), 1e-12);
+    }
+
+    [Fact]
+    public void LinearWarmup_CosineDecay_ReachesEndLrAndClamps()
+    {
+        var s = LrSchedule.LinearWarmup(
+            lrMax: 0.05,
+            warmupSteps: 3,
+            totalSteps: 9,
+            warmupInitLr: 0.005,
+            decayMode: WarmupDecayMode.Cosine,
+            endLr: 0.001);
+
+        Assert.Equal(0.005, s.GetLr(1), 1e-12);
+        Assert.Equal(0.02, s.GetLr(2), 1e-12);
+        Assert.Equal(0.035, s.GetLr(3), 1e-12);
+        Assert.Equal(0.05, s.GetLr(4), 1e-12);
+        Assert.Equal(0.001, s.GetLr(10), 1e-12);
+        Assert.Equal(0.001, s.GetLr(100), 1e-12);
+    }
+
+    [Fact]
+    public void LinearWarmup_DecayModesRejectTotalBeforeWarmup()
+    {
+        Assert.Throws<System.ArgumentOutOfRangeException>(() =>
+            LrSchedule.LinearWarmup(0.1, warmupSteps: 10, totalSteps: 9,
+                decayMode: WarmupDecayMode.Linear));
+        Assert.Throws<System.ArgumentOutOfRangeException>(() =>
+            LrSchedule.LinearWarmup(0.1, warmupSteps: 10, totalSteps: 9,
+                decayMode: WarmupDecayMode.Cosine));
+
+        var constant = LrSchedule.LinearWarmup(0.1, warmupSteps: 10, totalSteps: 9,
+            decayMode: WarmupDecayMode.Constant);
+        Assert.Equal(0.1, constant.GetLr(11), 1e-12);
+    }
+
     [Theory]
     [InlineData(0)]
     [InlineData(-1)]
