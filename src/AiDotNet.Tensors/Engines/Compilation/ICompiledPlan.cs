@@ -420,6 +420,16 @@ public interface ICompiledTrainingPlan<T> : IDisposable
     void SetMaxGradNorm(double maxNorm);
 
     /// <summary>
+    /// Requests bfloat16 storage for the Adam/AdamW moment state (m, v) on the
+    /// float CPU fused path (#1745). Halves resident optimizer-state memory while
+    /// keeping the fp32 update math, so large models can stay on the fused fast
+    /// path instead of dropping to the eager tape for memory. Call before
+    /// <see cref="ConfigureOptimizer(OptimizerType, float, float, float, float, float, FusedOptimizerExtras?)"/>;
+    /// honored only for CPU float Adam/AdamW and a safe no-op otherwise.
+    /// </summary>
+    void RequestBf16MomentStorage(bool enabled);
+
+    /// <summary>
     /// Configures fused optimizer updates with a per-step
     /// <see cref="LrSchedule"/>. Equivalent to
     /// <see cref="ConfigureOptimizer(OptimizerType, float, float, float, float, float)"/>

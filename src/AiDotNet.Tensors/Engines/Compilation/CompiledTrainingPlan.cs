@@ -719,6 +719,23 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private Action? _preForwardParamTransform;
     private int _optimizerStep;
 
+    // #1745: when set, the float Adam/AdamW fused path stores its m/v moment
+    // buffers as bfloat16 (half the fp32 footprint) instead of fp32. The
+    // consumer requests this before ConfigureOptimizer; it is honored only for
+    // CPU-resident float Adam/AdamW (the only kernels with a bf16 variant), and
+    // silently ignored otherwise so correctness never depends on it. Lets large
+    // models keep BOTH the fused fast path and a halved optimizer-state
+    // footprint instead of dropping to the eager tape for memory.
+    private bool _useBf16Moments;
+
+    /// <summary>
+    /// Requests bfloat16 storage for the Adam/AdamW moment state on the float CPU
+    /// fused path (#1745). Halves resident optimizer-state memory (m, v) while
+    /// keeping the fp32 update math; honored only for CPU float Adam/AdamW and a
+    /// no-op for every other configuration. Call before <see cref="ConfigureOptimizer(OptimizerType, float, float, float, float, float, FusedOptimizerExtras?)"/>.
+    /// </summary>
+    public void RequestBf16MomentStorage(bool enabled) => _useBf16Moments = enabled;
+
     /// <summary>
     /// Global gradient L2-norm clip threshold. When &gt; 0, applied inside
     /// <see cref="Step"/> between the backward pass and the fused optimizer
@@ -1668,6 +1685,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // the optimizer is AMSGrad, else left as an empty array.
         var vMax = new float[paramCount][];
 
+        // #1745: bfloat16 moment storage for CPU float Adam/AdamW. Honored only
+        // when requested AND the optimizer is Adam/AdamW AND no parameter is
+        // GPU-resident (the GPU Adam kernel keeps fp32 moments). Halves the m/v
+        // resident footprint while the update math stays fp32. When engaged, the
+        // fp32 m[p]/v[p] slots are left empty and these bf16 buffers carry state.
+        bool anyGpuParam = System.Array.Exists(_parameters, p => p.TryGetGpuBuffer() is not null);
+        bool useBf16 = _useBf16Moments
+            && (optimizerType is OptimizerType.Adam or OptimizerType.AdamW)
+            && !anyGpuParam;
+        var mB = new ushort[paramCount][];
+        var vB = new ushort[paramCount][];
+
         // GPU path state (parallel arrays to paramArrays etc.). For each
         // parameter that's GPU-resident, gpuParam[p] / gpuGrad[p] hold the
         // live IGpuBuffer and the per-step closure dispatches to the
@@ -1801,8 +1830,23 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 gradArrays[p] = Array.Empty<float>();
             }
 
-            m[p] = needsMomentum ? new float[lengths[p]] : Array.Empty<float>();
-            v[p] = needsSecondMoment ? new float[lengths[p]] : Array.Empty<float>();
+            if (useBf16)
+            {
+                // bf16 path: m/v carried as bfloat16 (half the fp32 bytes); the
+                // fp32 slots stay empty. ushort 0x0000 == bf16 +0.0 — the correct
+                // zero seed Adam expects for both moments on step 1.
+                m[p] = Array.Empty<float>();
+                v[p] = Array.Empty<float>();
+                mB[p] = new ushort[lengths[p]];
+                vB[p] = new ushort[lengths[p]];
+            }
+            else
+            {
+                m[p] = needsMomentum ? new float[lengths[p]] : Array.Empty<float>();
+                v[p] = needsSecondMoment ? new float[lengths[p]] : Array.Empty<float>();
+                mB[p] = Array.Empty<ushort>();
+                vB[p] = Array.Empty<ushort>();
+            }
             vMax[p] = optimizerType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL ? new float[lengths[p]] : Array.Empty<float>();
         }
 
@@ -2075,12 +2119,24 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             // by the dedicated AdamWUpdateSimd kernel.)
                             if (wd != 0f)
                                 for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
-                            FusedOptimizer.AdamUpdateSimd(pParam, pGrad, pM, pV, len,
-                                lr, b1, b2, epsVal, _optimizerStep);
+                            // #1745: bf16-moment variant when requested (mB/vB carry
+                            // the bfloat16 state; pM/pV are empty). Same fp32 math.
+                            if (useBf16)
+                                fixed (ushort* pMb = mB[p], pVb = vB[p])
+                                    FusedOptimizer.AdamUpdateBf16Simd(pParam, pGrad, pMb, pVb, len,
+                                        lr, b1, b2, epsVal, _optimizerStep);
+                            else
+                                FusedOptimizer.AdamUpdateSimd(pParam, pGrad, pM, pV, len,
+                                    lr, b1, b2, epsVal, _optimizerStep);
                             break;
                         case OptimizerType.AdamW:
-                            FusedOptimizer.AdamWUpdateSimd(pParam, pGrad, pM, pV, len,
-                                lr, b1, b2, epsVal, wd, _optimizerStep);
+                            if (useBf16)
+                                fixed (ushort* pMb = mB[p], pVb = vB[p])
+                                    FusedOptimizer.AdamWUpdateBf16Simd(pParam, pGrad, pMb, pVb, len,
+                                        lr, b1, b2, epsVal, wd, _optimizerStep);
+                            else
+                                FusedOptimizer.AdamWUpdateSimd(pParam, pGrad, pM, pV, len,
+                                    lr, b1, b2, epsVal, wd, _optimizerStep);
                             break;
                         case OptimizerType.AMSGrad:
                             // AMSGrad (#74): Adam with a running max of v̂ so the
