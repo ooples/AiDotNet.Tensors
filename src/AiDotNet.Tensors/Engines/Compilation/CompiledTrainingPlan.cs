@@ -1883,7 +1883,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 float newLr = lr + hgAdj;
                 for (int p = 0; p < paramCount; p++)
                 {
-                    if (gradArrays[p].Length == 0) continue;
+                    // Skip params with no gradient OR no materialized weight backing (#1738).
+                    if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
                     int len2 = lengths[p];
                     fixed (float* pParam = paramArrays[p], pGrad = gradArrays[p], pPrev = m[p])
                         for (int i = 0; i < len2; i++) { pParam[i] -= newLr * pGrad[i]; pPrev[i] = pGrad[i]; }
@@ -1914,7 +1915,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 float gammaNew = dNew * lr;
                 for (int p = 0; p < paramCount; p++)
                 {
-                    if (gradArrays[p].Length == 0) continue;
+                    // Skip params with no gradient OR no materialized weight backing (#1738).
+                    if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
                     int len2 = lengths[p];
                     fixed (float* pParam = paramArrays[p], pGrad = gradArrays[p])
                         for (int i = 0; i < len2; i++) pParam[i] -= gammaNew * pGrad[i];
@@ -1934,7 +1936,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 float wsNext = sfWeightSum;
                 for (int p = 0; p < paramCount; p++)
                 {
-                    if (gradArrays[p].Length == 0) continue;
+                    if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
                     int len2 = lengths[p];
                     fixed (float* pZ = m[p], pX = v[p], pGrad = gradArrays[p])
                         wsNext = FusedOptimizer.ScheduleFreeSgdUpdateSimd(
@@ -2038,7 +2040,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 }
 
                 // CPU path: pin live backing + SIMD kernel.
-                if (gradArrays[p].Length == 0) continue;
+                // Skip a parameter with no gradient (its grad buffer was never written this
+                // step) OR no materialized weight backing. The latter happens for lazy /
+                // unexercised layers — e.g. the unused-modality encoders of a multi-modal
+                // model whose forward only touched one modality: the plan pre-allocates their
+                // grad/m/v buffers at their declared length, but the parameter's live backing
+                // array stays empty (length 0) until first materialization, so there is nothing
+                // to update. The eager optimizer path skips such params the same way (#1738).
+                // Without the paramArrays guard, `fixed` over the empty backing yields a null
+                // pointer and the SIMD kernel NREs at the full declared length, which is caught
+                // upstream and silently kicks the ENTIRE model off the fused fast path onto the
+                // ~17× slower eager autograd tape — the exact UnifiedMultimodal regression.
+                if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
 
                 fixed (float* pParam = paramArrays[p], pGrad = gradArrays[p],
                        pM = m[p], pV = v[p], pVMax = vMax[p])
@@ -2374,7 +2387,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     continue;
                 }
 
-                if (gradArrays[p].Length == 0) continue;
+                // Skip params with no gradient OR no materialized weight backing (lazy /
+                // unexercised layers; see the same guard in ConfigureOptimizerFloat). #1738.
+                if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
 
                 fixed (float* pParam = paramArrays[p], pGrad = gradArrays[p],
                        pM = m[p], pV = v[p], pVMax = vMax[p])
@@ -2573,7 +2588,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             double lr = lrSchedule.GetLr(_optimizerStep);
             for (int p = 0; p < paramCount; p++)
             {
-                if (gradArrays[p].Length == 0) continue;
+                // Skip params with no gradient OR no materialized weight backing (#1738).
+                if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
                 int len = lengths[p];
                 fixed (double* pParam = paramArrays[p], pGrad = gradArrays[p],
                        pM = m[p], pV = v[p], pVMax = vMax[p])
@@ -2694,7 +2710,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             for (int p = 0; p < paramCount; p++)
             {
-                if (gradArrays[p].Length == 0) continue;
+                // Skip params with no gradient OR no materialized weight backing (#1738).
+                if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
                 int len = lengths[p];
                 double lr = groupLrs[paramGroup[p]];
 
@@ -4976,9 +4993,24 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// backing-array length), then scales every element by
     /// <c>maxNorm / (totalNorm + 1e-6)</c> when totalNorm exceeds maxNorm.
     /// </summary>
-    private static void ClipGradientsGlobalL2(Tensor<T>[] gradients, double maxNorm)
+    private void ClipGradientsGlobalL2(Tensor<T>[] gradients, double maxNorm)
     {
         if (gradients.Length == 0) return;
+        // A gradient belongs to an unexercised (lazy, off-loss-path) parameter when that PARAMETER's
+        // weight backing is unmaterialized — even though the plan holds a full-length zero gradient
+        // buffer for it. Such gradients are zero: they contribute nothing to the global norm and
+        // scaling them is a no-op. Skipping them makes the clip cost scale with the EXERCISED params
+        // (what the optimizer already does) instead of the full param set — ClipGradientsGlobalL2 was
+        // ~44% of a UnifiedMultimodal training step, almost all of it scanning ~500M zero elements. #1738
+        var ps = _parameters;
+        bool SkipUnexercised(int p)
+        {
+            if (ps is null || ps.Length != gradients.Length) return false;
+            var pt = ps[p];
+            if (pt is null) return true;
+            var pa = pt.GetLiveBackingArrayAllowingPaddingOrNull();
+            return pa is null || pa.Length == 0;
+        }
 
         // CodeRabbit #425 review: detect GPU-resident gradients before the CPU
         // clip loop. Pre-fix the CPU pass would compute the L2 norm over a
@@ -5024,7 +5056,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         for (int p = 0; p < gradients.Length; p++)
         {
             var tensor = gradients[p];
-            if (tensor == null) continue;
+            if (tensor == null || SkipUnexercised(p)) continue;
             var arr = tensor.GetLiveBackingArrayAllowingPaddingOrNull() ?? tensor.GetDataArray();
             int len = tensor.Length;
             for (int i = 0; i < len; i++)
@@ -5042,7 +5074,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         for (int p = 0; p < gradients.Length; p++)
         {
             var tensor = gradients[p];
-            if (tensor == null) continue;
+            if (tensor == null || SkipUnexercised(p)) continue;
             var arr = tensor.GetLiveBackingArrayAllowingPaddingOrNull() ?? tensor.GetDataArray();
             int len = tensor.Length;
             for (int i = 0; i < len; i++)
