@@ -127,6 +127,79 @@ internal static class FusedOptimizer
     }
 
     // ────────────────────────────────────────────────────────────────────
+    // BF16 moment-storage Adam/AdamW (#1745 follow-up). The Adam moment
+    // buffers m, v are the dominant training-step memory cost — 2x the model
+    // weights at fp32. Storing them as bfloat16 halves that to 1x while keeping
+    // the FULL float32 exponent (only the mantissa shortens 23→7 bits), so
+    // Adam's trajectory changes negligibly and — unlike int8 block-quant — no
+    // per-block scales are needed. These kernels widen each stored bf16 moment
+    // to fp32, run the EXACT same update math as the fp32 kernels, and narrow
+    // the result back to bf16 with round-to-nearest-even. Compute stays fp32;
+    // only the resident moment storage is halved. This lets large models keep
+    // the fused fast path AND the halved optimizer-state footprint, instead of
+    // falling off the fused path onto the eager tape when memory matters.
+    //
+    // Parameters and gradients remain fp32 (their precision is load-bearing for
+    // the weight update); bf16 applies only to the m/v accumulators, exactly as
+    // bitsandbytes / DeepSpeed store the optimizer state at reduced precision.
+    // Scalar-only: bf16 widen/narrow has no broad AVX2 intrinsic (AVX512-BF16
+    // is not assumed), and the win here is resident bytes, not peak throughput —
+    // this path is still far faster than the eager autograd tape it replaces.
+    // ────────────────────────────────────────────────────────────────────
+
+    /// <summary>Widen a bfloat16 (the top 16 bits of a float32) to float32.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe float Bf16ToFloat(ushort b)
+    {
+        uint u = (uint)b << 16;
+        return *(float*)&u;
+    }
+
+    /// <summary>
+    /// Narrow a float32 to bfloat16 with round-to-nearest-even. NaN is mapped to a
+    /// quiet bf16 NaN (never silently truncated into an infinity), matching the
+    /// IEEE/​PyTorch bf16 cast.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe ushort Bf16FromFloat(float f)
+    {
+        uint bits = *(uint*)&f;
+        if ((bits & 0x7FFFFFFFu) > 0x7F800000u)
+            return (ushort)((bits >> 16) | 0x0040u); // preserve sign, force quiet NaN
+        uint rounding = 0x7FFFu + ((bits >> 16) & 1u); // round-to-nearest-even bias
+        return (ushort)((bits + rounding) >> 16);
+    }
+
+    /// <summary>Adam update with bfloat16 moment storage (fp32 params/grads, fp32 math).</summary>
+    internal static unsafe void AdamUpdateBf16Simd(
+        float* param, float* grad, ushort* m, ushort* v, int length,
+        float lr, float beta1, float beta2, float eps, int step)
+    {
+        float bc1 = 1f - MathF.Pow(beta1, step);
+        float bc2 = 1f - MathF.Pow(beta2, step);
+        for (int i = 0; i < length; i++)
+        {
+            float mi = beta1 * Bf16ToFloat(m[i]) + (1f - beta1) * grad[i];
+            float vi = beta2 * Bf16ToFloat(v[i]) + (1f - beta2) * grad[i] * grad[i];
+            m[i] = Bf16FromFloat(mi);
+            v[i] = Bf16FromFloat(vi);
+            float mHat = mi / bc1;
+            float vHat = vi / bc2;
+            param[i] -= lr * mHat / (MathF.Sqrt(vHat) + eps);
+        }
+    }
+
+    /// <summary>AdamW (decoupled weight decay) with bfloat16 moment storage.</summary>
+    internal static unsafe void AdamWUpdateBf16Simd(
+        float* param, float* grad, ushort* m, ushort* v, int length,
+        float lr, float beta1, float beta2, float eps, float weightDecay, int step)
+    {
+        for (int i = 0; i < length; i++)
+            param[i] *= (1f - weightDecay * lr);
+        AdamUpdateBf16Simd(param, grad, m, v, length, lr, beta1, beta2, eps, step);
+    }
+
+    // ────────────────────────────────────────────────────────────────────
     // Double-precision overloads — engaged for `Tensor<double>` models on
     // the fused-compiled training path. PR #319 follow-up: the
     // CompiledTrainingPlan / CompiledTapeTrainingStep fast paths used to
