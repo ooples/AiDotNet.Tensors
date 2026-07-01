@@ -11,6 +11,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (sparseIndices is null) throw new ArgumentNullException(nameof(sparseIndices));
             if (sparseValues is null) throw new ArgumentNullException(nameof(sparseValues));
             if (nnz < 0) throw new ArgumentOutOfRangeException(nameof(nnz));
+            // The kernel reads sparseIndices[k]/sparseValues[k] for k in [0, nnz); reject undersized
+            // buffers before dispatch so a bad caller gets a clear error instead of a device OOB access.
+            if (sparseIndices.Size < nnz)
+                throw new ArgumentException($"sparseIndices buffer holds {sparseIndices.Size} elements but nnz={nnz}.", nameof(sparseIndices));
+            if (sparseValues.Size < nnz)
+                throw new ArgumentException($"sparseValues buffer holds {sparseValues.Size} elements but nnz={nnz}.", nameof(sparseValues));
         }
 
         public void SparseSgdUpdate(IGpuBuffer param, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float learningRate, float weightDecay)

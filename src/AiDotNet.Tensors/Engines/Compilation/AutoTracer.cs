@@ -30,6 +30,13 @@ internal static class AutoTracer
     // to the current call's mutable inputs. The legacy shape-only lookup can
     // reuse a plan whose delegates captured tensors from an earlier call with
     // the same op sequence and shape, producing stale numerical results.
+    //
+    // SCOPE NOTE: this master-switch is a standing CORRECTNESS guard, not part of
+    // the GPU sparse-optimizer feature. It gates the shape-only replay path off so
+    // it cannot return stale results; the full tensor-validation suite depends on it
+    // (removing it regresses those numerical checks). It stays a single compile-time
+    // const so re-enabling transparent replay — once plans rebind to live inputs —
+    // is a one-line change (flip to true) with no other call-site edits.
     private const bool TransparentReplayEnabled = false;
 
     /// <summary>

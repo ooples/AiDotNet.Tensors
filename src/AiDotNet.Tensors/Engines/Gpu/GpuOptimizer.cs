@@ -420,15 +420,40 @@ public static class GpuOptimizer
         valBuf = sparseValues.TryGetGpuBuffer();
         if (pBuf is null || idxBuf is null || valBuf is null) return false;
 
+        // Cheap, always-on device-buffer bounds guards: the kernels read indices[k] AND values[k] for
+        // k < nnz, so both buffers must hold at least nnz elements or the dispatch reads out of bounds.
+        if (idxBuf.Size < nnz)
+            throw new ArgumentException($"sparseIndices buffer holds {idxBuf.Size} elements but nnz={nnz}.", nameof(sparseIndices));
+        if (valBuf.Size < nnz)
+            throw new ArgumentException($"sparseValues buffer holds {valBuf.Size} elements but nnz={nnz}.", nameof(sparseValues));
+
         EnsureUniqueSparseDispatchIndices(backend, idxBuf, nnz, param.Length);
         return true;
     }
 
+    /// <summary>
+    /// Opt-in gate for the O(nnz) host-side duplicate-index verification in
+    /// <see cref="EnsureUniqueSparseDispatchIndices"/>. The native sparse kernels are non-atomic and
+    /// require unique, pre-aggregated indices per dispatch (see the <c>IDirectGpuBackend</c> sparse
+    /// optimizer contract), but downloading the index buffer and building a <see cref="HashSet{T}"/> on
+    /// every step forces a host round-trip that can serialize the GPU queue and defeats the O(nnz)
+    /// on-device benefit. Off by default (release/native fast path — callers own the uniqueness
+    /// invariant); enable via <c>AIDOTNET_VALIDATE_SPARSE_INDICES=1</c> for debugging or staged fallback.
+    /// </summary>
+    internal static bool ValidateSparseIndexUniqueness { get; set; } =
+        Environment.GetEnvironmentVariable("AIDOTNET_VALIDATE_SPARSE_INDICES") == "1";
+
     internal static void EnsureUniqueSparseDispatchIndices(IDirectGpuBackend backend, IGpuBuffer sparseIndices, int nnz, int paramLength)
     {
         if (nnz == 0) return;
+        // Always-on cheap bounds guard (no host transfer).
         if (sparseIndices.Size < nnz)
             throw new ArgumentException($"sparseIndices buffer holds {sparseIndices.Size} elements but nnz={nnz}.", nameof(sparseIndices));
+
+        // The duplicate/uniqueness scan below needs a DownloadBuffer round-trip + a HashSet — O(nnz)
+        // off-device work on every sparse step. Skip it on the fast path; the native kernels' unique-index
+        // requirement is part of the backend contract and callers pre-aggregate. Opt in for verification.
+        if (!ValidateSparseIndexUniqueness) return;
 
         var rawIndices = backend.DownloadBuffer(sparseIndices);
         var seen = new HashSet<int>();

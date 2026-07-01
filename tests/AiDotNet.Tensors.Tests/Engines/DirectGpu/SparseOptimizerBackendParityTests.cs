@@ -234,5 +234,7 @@ public sealed class SparseOptimizerBackendParityTests
         throw new DirectoryNotFoundException("Could not locate repository root from test output directory.");
     }
 
-    private static unsafe float Int32BitsToSingle(int value) => *(float*)&value;
+    // Non-unsafe bit reinterpretation (net471-compatible), mirroring the production
+    // Int32BitsToSingleCompat / BitConverter.ToSingle(GetBytes(...)) pattern.
+    private static float Int32BitsToSingle(int value) => BitConverter.ToSingle(BitConverter.GetBytes(value), 0);
 }
