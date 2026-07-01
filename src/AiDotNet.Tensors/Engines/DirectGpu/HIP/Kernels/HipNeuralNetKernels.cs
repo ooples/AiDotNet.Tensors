@@ -1426,7 +1426,7 @@ extern ""C"" __global__ __launch_bounds__(256) void dropout_backward(
 // IMPORTANT: Caller MUST ensure indices[i] >= 0 and < vocabSize to avoid undefined behavior.
 // Negative indices will wrap around; out-of-bounds access causes memory corruption.
 extern ""C"" __global__ __launch_bounds__(256) void embedding_forward(
-    const float* indices, const float* embeddingTable, float* output,
+    const int* indices, const float* embeddingTable, float* output,
     int numIndices, int embeddingDim)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1434,7 +1434,7 @@ extern ""C"" __global__ __launch_bounds__(256) void embedding_forward(
 
     // Note: idx must be validated by caller to be within [0, vocabSize)
     // We clamp negative values to 0 as a defensive measure
-    int idx = (int)indices[i];
+    int idx = indices[i];
     if (idx < 0) idx = 0;  // Defensive: prevent negative index wrapping
     for (int d = 0; d < embeddingDim; d++) {
         output[i * embeddingDim + d] = embeddingTable[idx * embeddingDim + d];

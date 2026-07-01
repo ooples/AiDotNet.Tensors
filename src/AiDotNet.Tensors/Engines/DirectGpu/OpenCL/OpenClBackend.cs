@@ -12480,6 +12480,12 @@ KERNEL VARIANTS (A/B testing):
 
         public void Release()
         {
+            if (GpuBufferReleaseDeferral.TryDefer(ReleaseCore)) return;
+            ReleaseCore();
+        }
+
+        private void ReleaseCore()
+        {
             if (Interlocked.Exchange(ref _poolState, 2) == 2)
                 return;
 

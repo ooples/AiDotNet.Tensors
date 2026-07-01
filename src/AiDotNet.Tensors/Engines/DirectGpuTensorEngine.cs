@@ -10047,6 +10047,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var gradQBuffer = AllocateOutputBuffer(backend, batch * heads * seqQ * headDim);
         using var gradKBuffer = AllocateOutputBuffer(backend, batch * heads * seqK * headDim);
         using var gradVBuffer = AllocateOutputBuffer(backend, batch * heads * seqK * headDim);
+        backend.Fill(gradQBuffer.Buffer, 0f, batch * heads * seqQ * headDim);
+        backend.Fill(gradKBuffer.Buffer, 0f, batch * heads * seqK * headDim);
+        backend.Fill(gradVBuffer.Buffer, 0f, batch * heads * seqK * headDim);
 
         // Upload attention bias to GPU if provided, with shape validation
         int biasBatchStride = 0;

@@ -1215,20 +1215,18 @@ __kernel void dropout_backward(
 
 // Embedding lookup
 __kernel void embedding_lookup(
-    __global const float* indices,
+    __global const int* indices,
     __global const float* embeddingTable,
     __global float* output,
     const int numIndices,
     const int embeddingDim)
 {
-    const int idx = get_global_id(0);
-    if (idx >= numIndices) return;
+    const int d = get_global_id(0);
+    const int idx = get_global_id(1);
+    if (idx >= numIndices || d >= embeddingDim) return;
 
-    int index = (int)indices[idx];
-
-    for (int d = 0; d < embeddingDim; d++) {
-        output[idx * embeddingDim + d] = embeddingTable[index * embeddingDim + d];
-    }
+    int index = indices[idx];
+    output[idx * embeddingDim + d] = embeddingTable[index * embeddingDim + d];
 }
 
 // Embedding backward (scatter add gradients)
