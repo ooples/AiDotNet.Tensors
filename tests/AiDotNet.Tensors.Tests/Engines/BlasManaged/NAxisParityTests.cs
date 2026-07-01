@@ -1,4 +1,5 @@
 using System;
+using AiDotNet.Tensors.Engines.BlasManaged;
 using AiDotNet.Tensors.Helpers;
 using Xunit;
 using BlasMgd = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged;
@@ -41,6 +42,10 @@ public class NAxisParityTests
         var prior = CpuParallelSettings.MaxDegreeOfParallelism;
         var priorDisable = PB.s_disableNAxis;
         var priorDisableGoto = BlasMgd.s_disableGotoGemm;
+        var priorMachineKernel = MachineKernelGemm.Enabled;
+        var priorPanelKernel = MachineKernelGemm.EnablePanelKernel;
+        var priorDeterministic = BlasProvider.IsDeterministicMode;
+        var priorThreadDeterministic = BlasProvider.GetThreadLocalDeterministicMode();
         CpuParallelSettings.MaxDegreeOfParallelism = 4;
         var a = Rand(m * k, 1);
         var b = Rand(k * n, 2);
@@ -49,21 +54,32 @@ public class NAxisParityTests
         long nAxisRunsForThisCase;
         try
         {
+            MachineKernelGemm.Enabled = true;
+            MachineKernelGemm.EnablePanelKernel = true;
+            BlasProvider.SetThreadLocalDeterministicMode(null);
+            BlasProvider.SetDeterministicMode(false);
+
+            var opts = new BlasOptions<float> { PackingMode = PackingMode.ForcePackBoth, NumThreads = 4 };
+
             // This test verifies the PackBoth N-axis vs M-axis paths; the GotoGemm fast path would
             // intercept these large float shapes before either runs, so disable it for the duration.
             BlasMgd.s_disableGotoGemm = true;
             PB.s_disableNAxis = true;
-            BlasMgd.Gemm<float>(a, k, false, b, n, false, cM, n, m, n, k);
+            BlasMgd.Gemm<float>(a, k, false, b, n, false, cM, n, m, n, k, opts);
 
             PB.s_disableNAxis = false;
             long before = System.Threading.Interlocked.Read(ref PB.s_nAxisRunCount);
-            BlasMgd.Gemm<float>(a, k, false, b, n, false, cN, n, m, n, k);
+            BlasMgd.Gemm<float>(a, k, false, b, n, false, cN, n, m, n, k, opts);
             nAxisRunsForThisCase = System.Threading.Interlocked.Read(ref PB.s_nAxisRunCount) - before;
         }
         finally
         {
             PB.s_disableNAxis = priorDisable;
             BlasMgd.s_disableGotoGemm = priorDisableGoto;
+            MachineKernelGemm.Enabled = priorMachineKernel;
+            MachineKernelGemm.EnablePanelKernel = priorPanelKernel;
+            BlasProvider.SetDeterministicMode(priorDeterministic);
+            BlasProvider.SetThreadLocalDeterministicMode(priorThreadDeterministic);
             CpuParallelSettings.MaxDegreeOfParallelism = prior;
         }
 
