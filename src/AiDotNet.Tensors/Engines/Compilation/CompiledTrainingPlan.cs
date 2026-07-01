@@ -1439,8 +1439,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             evictGuard?.ResumeActivationEviction();
             // Release this step's dead transient activations/grads/scratch. The optimizer has already read
-            // _gradients; protect the public parameter-gradient tensors and always materialize pending downloads
-            // before eviction so any externally-held step output still has a valid CPU view after Step().
+            // _gradients; protect public gradient/seed/dest tensors, materialize only the returned loss, and
+            // discard unprotected scratch materializers so cleanup does not introduce step-ending DtoH traffic.
             if (stepActivationEngine is not null && stepActivationSnapshot >= 0)
             {
                 try
@@ -1452,7 +1452,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     stepActivationEngine.EvictActivationsCreatedAfter(
                         stepActivationSnapshot,
                         BuildStepEvictionProtectSet(),
-                        materializePending: true);
+                        materializePending: false);
                 }
             }
             // Bound cross-step VRAM growth: per-step transient activation buffers are dereferenced
