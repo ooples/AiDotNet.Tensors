@@ -66,6 +66,7 @@ internal sealed class MockBackendState
     public int DownloadBufferCalls { get; set; }
     public int UnaryOpCalls { get; set; }
     public int BinaryOpCalls { get; set; }
+    public List<string> OptimizerCalls { get; } = new();
 }
 
 /// <summary>
@@ -137,6 +138,39 @@ public class MockDirectGpuBackend : DispatchProxy
                 Array.Copy(b.Data, dest, b.Size);
                 return null!;
             }
+
+            // Optimizer dispatch probes. These methods are void on IDirectGpuBackend; tests
+            // verify the wrapper reached the backend and marked only the mutated tensors current.
+            case "AdamUpdate":
+            case "SgdUpdate":
+            case "SgdMomentumUpdate":
+            case "RmspropUpdate":
+            case "AdagradUpdate":
+            case "NagUpdate":
+            case "LarsUpdate":
+            case "LambUpdate":
+            case "AdadeltaUpdate":
+            case "AmsgradUpdate":
+            case "AdamaxUpdate":
+            case "LionUpdate":
+            case "NadamUpdate":
+            case "FtrlUpdate":
+            case "SparseAdamUpdate":
+            case "SparseAdamWUpdate":
+            case "SparseSgdUpdate":
+            case "SparseSgdMomentumUpdate":
+            case "SparseRmspropUpdate":
+            case "SparseAdagradUpdate":
+            case "SparseNagUpdate":
+            case "SparseAdadeltaUpdate":
+            case "SparseAmsgradUpdate":
+            case "SparseAdamaxUpdate":
+            case "SparseLionUpdate":
+            case "SparseNadamUpdate":
+            case "SparseFtrlUpdate":
+            case "SparseProximalL1Update":
+                _state.OptimizerCalls.Add(targetMethod.Name);
+                return null!;
         }
         throw new NotImplementedException(
             $"MockDirectGpuBackend does not implement {targetMethod.Name}. " +
