@@ -17,21 +17,30 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// surfaced the bug (LagLlama / MOIRAI / UniTS / TimeGPT / TimeLLM /
 /// Timer FeedForwardLayer stacks).
 /// </summary>
+[Collection("EngineCurrentGlobalState")]
 public class FusedLinearBiasGradIntegrationTests : IDisposable
 {
-    private readonly IEngine _engine = AiDotNetEngine.Current;
+    private readonly IEngine _engine;
+    private readonly IEngine _previousEngine;
     private readonly bool _previousReplayMode;
 
     public FusedLinearBiasGradIntegrationTests()
     {
+        _previousEngine = AiDotNetEngine.Current;
         // AutoTrainingCompiler.ReplayMode is process-wide static state;
         // capture the prior value so Dispose can restore it and we don't
         // leak a false into tests that expect replay mode on.
         _previousReplayMode = AutoTrainingCompiler.ReplayMode;
+        AiDotNetEngine.Current = new CpuEngine();
+        _engine = AiDotNetEngine.Current;
         AutoTrainingCompiler.ReplayMode = false;
     }
 
-    public void Dispose() => AutoTrainingCompiler.ReplayMode = _previousReplayMode;
+    public void Dispose()
+    {
+        AutoTrainingCompiler.ReplayMode = _previousReplayMode;
+        AiDotNetEngine.Current = _previousEngine;
+    }
 
     /// <summary>
     /// Two-layer FFL (the shape that actually trips the consuming
