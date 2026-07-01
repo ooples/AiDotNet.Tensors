@@ -96,6 +96,72 @@ public class WeightRegistryStreamingTests : IDisposable
         Assert.Equal(0, w.DataVector.Length);
     }
 
+    // Register streaming weights in a NON-INLINED helper so the locals genuinely leave scope and
+    // become collectable — a JIT could otherwise keep a live root to a same-method local across the GC.
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static void RegisterAndAbandonStreamingWeights(int count)
+    {
+        for (int i = 0; i < count; i++)
+        {
+            var w = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, new[] { 4 });
+            w.Lifetime = WeightLifetime.Streaming;
+            WeightRegistry.RegisterWeight(w);
+            // No reference kept: w is unreachable at the next iteration / method return, so once GC
+            // runs its _ownerByHandle weak reference dies and its pool entry is an orphan (#714).
+        }
+    }
+
+    [Fact]
+    public void PruneDeadEntries_ReclaimsPoolEntriesForGarbageCollectedOwners()
+    {
+        // #714: a streaming weight whose owning tensor is GC'd WITHOUT UnregisterWeight leaves its
+        // serialized bytes pinned in the pool forever. Across sequentially-created-then-dropped models
+        // (the CV/diffusion foundation-scale test shards, long training loops) RegisteredEntryCount
+        // climbs until Configure throws "existing streaming pool has N registered entries" / the host
+        // OOMs. PruneDeadEntries must reclaim those orphaned entries; a fresh Configure must then work.
+        RegisterAndAbandonStreamingWeights(20);
+        Assert.True(WeightRegistry.GetStreamingReport().RegisteredEntryCount > 0,
+            "Sanity: the 20 streaming registrations should be resident in the pool before GC.");
+
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+
+        int reclaimed = WeightRegistry.PruneDeadEntries();
+
+        Assert.True(reclaimed > 0, "PruneDeadEntries should reclaim entries whose owners were GC'd.");
+        Assert.Equal(0, WeightRegistry.GetStreamingReport().RegisteredEntryCount);
+
+        // The leak used to make this throw "existing streaming pool has N registered entries";
+        // after the sweep (Configure also prunes internally) it must succeed.
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 1024L * 1024 * 1024,
+            StreamingBackingStorePath = _backingDir,
+        });
+    }
+
+    [Fact]
+    public void Configure_PrunesGarbageCollectedOwners_InsteadOfThrowing()
+    {
+        // #714 (the exact CV/diffusion shard symptom): a new streaming model's Configure must not be
+        // blocked by a PRIOR model's entries once that model has been GC'd. Configure prunes dead
+        // owners first, so only genuinely-live registrations still throw.
+        RegisterAndAbandonStreamingWeights(15);
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+
+        // Should NOT throw — the 15 orphaned entries are reclaimed by Configure's internal sweep.
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 1024L * 1024 * 1024,
+            StreamingBackingStorePath = _backingDir,
+        });
+
+        Assert.Equal(0, WeightRegistry.GetStreamingReport().RegisteredEntryCount);
+    }
+
     [Fact]
     public void TryFinalizeDeferredDrop_NoOpOnNonDeferredTensor()
     {

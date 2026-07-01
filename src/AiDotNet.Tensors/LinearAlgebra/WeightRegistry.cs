@@ -73,6 +73,14 @@ public static class WeightRegistry
         DrainInFlightPrefetches();
         lock (_lock)
         {
+            // #714: first reclaim entries whose owner was GC'd without UnregisterWeight. A
+            // sequentially-created-then-dropped model (test shards, long loops) leaves dead-owner
+            // entries pinned in the pool; without this sweep they would wrongly count as "live" and
+            // block the next Configure with "existing streaming pool has N registered entries" — the
+            // symptom that reddens the foundation-scale CV/diffusion model shards. Only genuinely-dead
+            // owners are reclaimed, so a real "live weights still registered" misuse still throws below.
+            PruneDeadOwnersUnlocked();
+
             // Mid-flight guard: refuse to dispose a pool that holds live
             // entries. Otherwise tensors registered against the old pool
             // would silently break on Materialize.
@@ -154,6 +162,16 @@ public static class WeightRegistry
         // reference and StreamingPool field stable for the duration.
         lock (_lock)
         {
+            // #714: amortized dead-owner sweep so a long run (many sequential streaming models)
+            // reclaims orphaned entries incrementally as new weights register, instead of letting the
+            // pool grow unbounded until an OOM or a later Configure throw. Throttled by
+            // DeadOwnerSweepInterval so the O(n) scan is paid at most once per N registrations.
+            if (++_registrationsSinceSweep >= DeadOwnerSweepInterval)
+            {
+                _registrationsSinceSweep = 0;
+                PruneDeadOwnersUnlocked();
+            }
+
             switch (weight.Lifetime)
             {
                 case WeightLifetime.Default:
@@ -1965,7 +1983,64 @@ public static class WeightRegistry
             // the policy is documented as "training or unknown → full
             // precision", so the safe-unknown state has to mean null here.
             _streamingTrainingMode = null;
+            _registrationsSinceSweep = 0;
         }
+    }
+
+    /// <summary>
+    /// #714: number of Streaming registrations between opportunistic dead-owner sweeps in
+    /// <see cref="RegisterWeight{T}"/>. Bounds orphaned-entry accumulation during a long run
+    /// (sequential model creation) without paying an O(n) sweep on every single registration.
+    /// </summary>
+    private const int DeadOwnerSweepInterval = 128;
+    private static int _registrationsSinceSweep;
+
+    /// <summary>
+    /// Reclaims streaming-pool entries whose owning tensor was garbage-collected WITHOUT an explicit
+    /// <see cref="UnregisterWeight{T}"/> (#714). A GC'd owner otherwise leaves its serialized bytes
+    /// pinned in the pool forever, so <see cref="StreamingTensorPool.RegisteredEntryCount"/> climbs
+    /// across sequentially-created-then-dropped models (test shards, long training/inference loops)
+    /// until a later <see cref="Configure"/> throws "existing streaming pool has N registered entries"
+    /// or the host OOMs. Long-lived hosts and test harnesses should call this periodically — typically
+    /// right after a <c>GC.Collect()</c> so disposed models' owners are actually collected first. Only
+    /// genuinely-dead owners (weak reference collected) are reclaimed; a live weight is never touched.
+    /// Returns the number of entries reclaimed.
+    /// </summary>
+    public static int PruneDeadEntries()
+    {
+        lock (_lock)
+        {
+            return PruneDeadOwnersUnlocked();
+        }
+    }
+
+    /// <summary>
+    /// Sweeps <see cref="_ownerByHandle"/> for owners whose weak reference has been collected and
+    /// releases each such handle's pool entry + materialized-tracking state — the exact cleanup
+    /// <see cref="UnregisterWeight{T}"/> performs, but for tensors that were GC'd without calling it.
+    /// MUST be called under <see cref="_lock"/>. Returns the number of entries reclaimed.
+    /// </summary>
+    private static int PruneDeadOwnersUnlocked()
+    {
+        if (_streamingPool is null || _ownerByHandle.Count == 0) return 0;
+
+        List<long>? dead = null;
+        foreach (var kvp in _ownerByHandle)
+        {
+            // A collected weak target means the owning tensor is gone and can never be Materialized or
+            // Unregistered again, so its pool bytes are unreachable and safe to release.
+            if (!kvp.Value.TryGetTarget(out _))
+                (dead ??= new List<long>()).Add(kvp.Key);
+        }
+        if (dead is null) return 0;
+
+        foreach (long handle in dead)
+        {
+            _streamingPool.Unregister(handle);
+            _ownerByHandle.Remove(handle);
+            UntrackMaterializedOwner(handle);
+        }
+        return dead.Count;
     }
 
     /// <summary>
