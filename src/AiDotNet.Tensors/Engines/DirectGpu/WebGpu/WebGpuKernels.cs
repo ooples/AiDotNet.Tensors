@@ -2598,14 +2598,22 @@ struct OptimizerParams {
 }
 @group(0) @binding(6) var<uniform> opt_params: OptimizerParams;
 
+// CONTRACT: the sparse index list is expected to be UNIQUE per dispatch - the caller pre-aggregates
+// (sums) gradients for repeated indices before applying them, as is standard for sparse/embedding
+// gradient updates. Under that contract no two invocations touch the same param/state slot, so the
+// non-atomic scatter below is race-free and matches the sequential CPU reference bit-for-bit.
+// (WGSL storage atomics are u32/i32 only, so an f32 accumulate would need a bitcast CAS loop; that is
+// deferred unless a duplicate-index workload is actually required.) The same contract holds for the
+// CUDA/HIP/OpenCL/Metal/Vulkan sparse kernels.
 fn decode_sparse_index(raw: f32) -> u32 {
     let bitcast = bitcast<i32>(raw);
     if (bitcast >= 0 && u32(bitcast) < opt_params.param_size) {
         return u32(bitcast);
     }
-    let numeric = i32(raw);
-    if (numeric >= 0 && u32(numeric) < opt_params.param_size && raw == f32(numeric)) {
-        return u32(numeric);
+    // Validate in the FLOAT domain before i32(raw) - the conversion is implementation-defined for NaN/
+    // Inf or out-of-range values. (raw == raw) rejects NaN; the range check rejects +/-Inf.
+    if (raw == raw && raw >= 0.0 && raw < f32(opt_params.param_size) && raw == trunc(raw)) {
+        return u32(raw);
     }
     return opt_params.param_size;
 }

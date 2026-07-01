@@ -2,6 +2,7 @@
 
 using System;
 using System.IO;
+using System.Text.RegularExpressions;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using Xunit;
 
@@ -84,11 +85,21 @@ public sealed class SparseOptimizerBackendParityTests
             SourcePath("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "WebGpu", "WebGpuBackend.SparseOptimizer.cs")
         };
 
+        // Source-based (not reflection) on purpose: the test project multi-targets net471, where
+        // WebGpuBackend's sparse partial is #if NET7_0_OR_GREATER-excluded, so typeof(...).GetMethod
+        // would false-fail there. Reading the source validates every backend SHIPS a real
+        // implementation regardless of build target. Match with a whitespace-tolerant regex (bounded
+        // by a ReDoS timeout) rather than a raw substring so formatting / line-wrapping don't break it.
         foreach (string file in backendFiles)
         {
             string source = File.ReadAllText(file);
             foreach (string method in SparseBackendMethods)
-                Assert.Contains("void " + method + "(", source);
+            {
+                var pattern = @"\bvoid\s+" + Regex.Escape(method) + @"\s*\(";
+                Assert.True(
+                    Regex.IsMatch(source, pattern, RegexOptions.None, TimeSpan.FromSeconds(1)),
+                    $"{Path.GetFileName(file)} does not implement {method}");
+            }
         }
     }
 

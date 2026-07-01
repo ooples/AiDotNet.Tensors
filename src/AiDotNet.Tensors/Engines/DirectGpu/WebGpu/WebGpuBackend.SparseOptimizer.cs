@@ -91,6 +91,11 @@ public sealed partial class WebGpuBackend
         if (state1 is null) throw new ArgumentNullException(nameof(state1));
         if (state2 is null) throw new ArgumentNullException(nameof(state2));
         if (state3 is null) throw new ArgumentNullException(nameof(state3));
+        // The kernel indexes state[i] for i in [0, param.Size); undersized state buffers would read/
+        // write out of bounds on the device (crash / device loss). Validate coverage up front.
+        if (state1.Size < param.Size) throw new ArgumentException($"state1 buffer holds {state1.Size} elements but param needs {param.Size}.", nameof(state1));
+        if (state2.Size < param.Size) throw new ArgumentException($"state2 buffer holds {state2.Size} elements but param needs {param.Size}.", nameof(state2));
+        if (state3.Size < param.Size) throw new ArgumentException($"state3 buffer holds {state3.Size} elements but param needs {param.Size}.", nameof(state3));
         if (nnz == 0) return;
         uniforms[8] = BitConverter.Int32BitsToSingle(param.Size);
         Dispatch6BufferAsync("SparseOptimizer", WebGpuKernels.SparseOptimizerSource, kernelName,
@@ -103,6 +108,12 @@ public sealed partial class WebGpuBackend
         if (sparseIndices is null) throw new ArgumentNullException(nameof(sparseIndices));
         if (sparseValues is null) throw new ArgumentNullException(nameof(sparseValues));
         if (nnz < 0) throw new ArgumentOutOfRangeException(nameof(nnz));
+        // The kernel reads sparseIndices[k]/sparseValues[k] for k in [0, nnz); reject undersized
+        // buffers before dispatch so a bad caller gets a clear error instead of a device OOB access.
+        if (sparseIndices.Size < nnz)
+            throw new ArgumentException($"sparseIndices buffer holds {sparseIndices.Size} elements but nnz={nnz}.", nameof(sparseIndices));
+        if (sparseValues.Size < nnz)
+            throw new ArgumentException($"sparseValues buffer holds {sparseValues.Size} elements but nnz={nnz}.", nameof(sparseValues));
     }
 
     private static void EnsureEpsilon(float epsilon)

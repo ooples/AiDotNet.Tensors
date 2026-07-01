@@ -326,5 +326,10 @@ internal static class SparseOptimizerReference
             throw new ArgumentException("Sparse optimizer state buffer is shorter than the parameter buffer.", name);
     }
 
+#if NETFRAMEWORK
+    // BitConverter.SingleToInt32Bits is unavailable on net471; reinterpret the bits via a pointer there.
     private static unsafe int SingleToInt32BitsCompat(float value) => *(int*)&value;
+#else
+    private static int SingleToInt32BitsCompat(float value) => BitConverter.SingleToInt32Bits(value);
+#endif
 }

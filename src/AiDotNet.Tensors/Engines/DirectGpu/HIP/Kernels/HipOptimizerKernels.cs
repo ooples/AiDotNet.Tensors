@@ -438,8 +438,10 @@ __device__ __forceinline__ int decode_sparse_index(float raw, int param_size)
 {
     int bitcast = __float_as_int(raw);
     if (bitcast >= 0 && bitcast < param_size) return bitcast;
-    int numeric = (int)raw;
-    if (numeric >= 0 && numeric < param_size && raw == (float)numeric) return numeric;
+    // Validate in the FLOAT domain before the (int) cast — (int)raw is undefined for NaN/Inf or
+    // out-of-int-range values on the device. Only convert once raw is finite, non-negative, in range
+    // and integral.
+    if (isfinite(raw) && raw >= 0.0f && raw < (float)param_size && raw == truncf(raw)) return (int)raw;
     return -1;
 }
 
