@@ -114,7 +114,8 @@ public sealed class CortexTransformerMemoryReproTests
                 double delta = Math.Abs(pL1After - pL1Before);
                 _output.WriteLine($"pL1 before={pL1Before:F6} after={pL1After:F6} delta={delta:G9}");
 
-                Assert.True(float.IsFinite(lastLoss), $"compiled step returned non-finite loss: {lastLoss}");
+                Assert.True(!float.IsNaN(lastLoss) && !float.IsInfinity(lastLoss),
+                    $"compiled step returned non-finite loss: {lastLoss}");
                 Assert.True(delta > 1e-6, $"parameters did not move; pL1 delta={delta:G9}");
             }
         }

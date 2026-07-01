@@ -220,6 +220,69 @@ public class GpuPinnedLifetimeTests
     }
 
     [Fact]
+    public void GpuOptimizer_TryAdamStep_MarksGpuUpdatedTensorsCurrent_OnGpuHost()
+    {
+        // Regression for post-training eval on GPU-resident model weights:
+        // a successful on-device optimizer step mutates param/m/v in place.
+        // Their resident GPU buffer version must be synced to the bumped
+        // tensor Version so later inference reuses the live device buffers
+        // instead of re-uploading fresh host arrays on every forward pass.
+        var priorEngine = AiDotNet.Tensors.Engines.AiDotNetEngine.Current;
+        var gpu = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine();
+        AiDotNet.Tensors.Engines.AiDotNetEngine.Current = gpu;
+        try
+        {
+            if (gpu.GetBackend() is null) return;
+
+            var p = AiDotNet.Tensors.Helpers.TensorAllocator.RentPinnedOnGpu<float>(new[] { 4 });
+            var g = AiDotNet.Tensors.Helpers.TensorAllocator.RentPinnedOnGpu<float>(new[] { 4 });
+            var m = AiDotNet.Tensors.Helpers.TensorAllocator.RentPinnedOnGpu<float>(new[] { 4 });
+            var v = AiDotNet.Tensors.Helpers.TensorAllocator.RentPinnedOnGpu<float>(new[] { 4 });
+            try
+            {
+                if (p.TryGetGpuBuffer() is null
+                    || g.TryGetGpuBuffer() is null
+                    || m.TryGetGpuBuffer() is null
+                    || v.TryGetGpuBuffer() is null)
+                    return;
+
+                int pVersion = p.Version;
+                int mVersion = m.Version;
+                int vVersion = v.Version;
+                int gVersion = g.Version;
+
+                bool ran = AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TryAdamStep(
+                    p, g, m, v,
+                    learningRate: 0.01f, beta1: 0.9f, beta2: 0.999f,
+                    epsilon: 1e-8f, weightDecay: 0f, step: 1);
+                Assert.True(ran,
+                    "GpuOptimizer.TryAdamStep returned false after GPU buffers were bound.");
+
+                Assert.True(p.Version > pVersion, "Parameter Version should advance after an in-place GPU Adam step.");
+                Assert.True(m.Version > mVersion, "Adam m-state Version should advance after an in-place GPU Adam step.");
+                Assert.True(v.Version > vVersion, "Adam v-state Version should advance after an in-place GPU Adam step.");
+                Assert.Equal(gVersion, g.Version);
+
+                Assert.Equal(p.Version, p._gpuBufferVersion);
+                Assert.Equal(m.Version, m._gpuBufferVersion);
+                Assert.Equal(v.Version, v._gpuBufferVersion);
+            }
+            finally
+            {
+                WeightRegistry.UnregisterWeight(p);
+                WeightRegistry.UnregisterWeight(g);
+                WeightRegistry.UnregisterWeight(m);
+                WeightRegistry.UnregisterWeight(v);
+            }
+        }
+        finally
+        {
+            AiDotNet.Tensors.Engines.AiDotNetEngine.Current = priorEngine;
+            gpu.Dispose();
+        }
+    }
+
+    [Fact]
     public void GpuOptimizer_TrySgdStep_MatchesHandComputedReference_OnGpuHost()
     {
         // Single-step SGD: p1 = p0 - lr * g
