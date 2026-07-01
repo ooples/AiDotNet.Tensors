@@ -411,10 +411,8 @@ extern ""C"" __global__ __launch_bounds__(256) void ftrl_update(
 }
 
 // ---------------------------------------------------------------------------
-// Proximal gradient (ISTA) with L1 soft-threshold prox. Matches the CPU
-// ProximalGradientDescentOptimizer + L1Regularization path exactly:
-//   tmp = param - lr*grad;  param = sign(tmp) * max(|tmp| - l1Strength, 0)
-// Note the threshold is the raw L1 strength (not lr*strength), per L1Regularization.
+// Proximal gradient (ISTA) with L1 soft-threshold prox:
+//   tmp = param - lr*grad;  param = sign(tmp) * max(|tmp| - lr*l1Strength, 0)
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void proximal_l1_update(
     float* __restrict__ param, const float* __restrict__ gradient,
@@ -424,7 +422,7 @@ extern ""C"" __global__ __launch_bounds__(256) void proximal_l1_update(
     if (idx >= size) return;
 
     float tmp = param[idx] - learningRate * gradient[idx];
-    float a = fabsf(tmp) - l1Strength;
+    float a = fabsf(tmp) - (learningRate * l1Strength);
     float sgn = (tmp > 0.0f) ? 1.0f : ((tmp < 0.0f) ? -1.0f : 0.0f);
     param[idx] = sgn * (a > 0.0f ? a : 0.0f);
 }

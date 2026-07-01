@@ -2023,6 +2023,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private bool TryFreeActivationByKey(object key)
     {
         if (!_activationCache.TryRemove(key, out var e)) return false;
+        // Dead tensor: discard the lazy GPU->CPU materializer before freeing
+        // the cache-owned buffer. Materializing here would be wasted work, and
+        // leaving the registration behind would point a later bulk drain at a
+        // freed buffer. Remove only after the cache entry is actually owned.
+        Helpers.DeferredArrayMaterializer.Remove(key);
         System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, -e.Buffer.SizeInBytes);
         System.Threading.Interlocked.Add(ref _currentActivationManagedBytes, -e.ManagedBytes);
         // CUDA uses STREAM-ORDERED deferred free (cuMemFreeAsync) to release the buffer at the stream's
@@ -2197,22 +2202,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (entries[i].Value.Timestamp <= snapshot) continue;   // pre-existing — keep
                 if (entries[i].Value.ThreadId != callerThreadId) continue; // another thread's live buffer
                 if (protect is not null && protect.Contains(entries[i].Key)) continue; // live gradient — keep
-                if (Helpers.DeferredArrayMaterializer.IsPending(entries[i].Key))
-                {
-                    if (materializePending)
-                    {
-                        // #226 safe path: flush the pending DtoH so a later CPU read still sees correct data.
-                        try { Helpers.DeferredArrayMaterializer.TryMaterialize(entries[i].Key); }
-                        catch { Helpers.DeferredArrayMaterializer.Remove(entries[i].Key); }
-                    }
-                    else
-                    {
-                        // Dead scratch: drop the pending download (no DtoH) — keeps the step fully GPU-resident.
-                        Helpers.DeferredArrayMaterializer.Remove(entries[i].Key);
-                    }
-                }
                 if (_activationCache.TryRemove(entries[i].Key, out var entry))
                 {
+                    if (Helpers.DeferredArrayMaterializer.IsPending(entries[i].Key))
+                    {
+                        if (materializePending)
+                        {
+                            // #226 safe path: flush the pending DtoH so a later CPU read still sees correct data.
+                            try { Helpers.DeferredArrayMaterializer.TryMaterialize(entries[i].Key); }
+                            catch { Helpers.DeferredArrayMaterializer.Remove(entries[i].Key); }
+                        }
+                        else
+                        {
+                            // Dead scratch: drop the pending download (no DtoH) after owning the cache entry.
+                            Helpers.DeferredArrayMaterializer.Remove(entries[i].Key);
+                        }
+                    }
                     System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, -entry.Buffer.SizeInBytes);
                     System.Threading.Interlocked.Add(ref _currentActivationManagedBytes, -entry.ManagedBytes);
                     toDispose.Add(entry);
@@ -10042,6 +10047,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var gradQBuffer = AllocateOutputBuffer(backend, batch * heads * seqQ * headDim);
         using var gradKBuffer = AllocateOutputBuffer(backend, batch * heads * seqK * headDim);
         using var gradVBuffer = AllocateOutputBuffer(backend, batch * heads * seqK * headDim);
+        backend.Fill(gradQBuffer.Buffer, 0f, batch * heads * seqQ * headDim);
+        backend.Fill(gradKBuffer.Buffer, 0f, batch * heads * seqK * headDim);
+        backend.Fill(gradVBuffer.Buffer, 0f, batch * heads * seqK * headDim);
 
         // Upload attention bias to GPU if provided, with shape validation
         int biasBatchStride = 0;

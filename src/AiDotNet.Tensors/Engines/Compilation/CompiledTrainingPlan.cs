@@ -1189,16 +1189,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             ? null
             : engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine;
         evictGuard?.SuspendActivationEviction();
-        // FP16 hetero path per-step LEAK fix (MEASURED): the Execute-replay caches fresh per-step transients
-        // (Half activations, grad contributions, scratch) keyed on NEW arrays every step, and — unlike the FP32
-        // compiled path's stable preallocated buffers — they accumulate across steps (the cortex GPU peak grew
-        // ~0.8MB/step faster than FP32). Snapshot the activation-cache timestamp before this step and
-        // deterministically release everything created during it in the finally (exactly what GradientTape does
-        // on dispose). Persistent state (params, optimizer m/v, gradMap) was allocated earlier → kept.
-        long fp16ActSnapshot = -1;
-        var fp16SnapEng = _fp16HeteroOrder is not null
-            ? engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine : null;
-        if (fp16SnapEng is not null) fp16ActSnapshot = fp16SnapEng.ActivationCacheTimestampSnapshot();
+        // Snapshot the activation-cache timestamp before this eager compiled step. Step() returns only the scalar
+        // loss and exposes parameter gradients; all other forward/backward intermediates created during the step
+        // are dead after the optimizer runs and must not accumulate across long training loops.
+        var stepActivationEngine = engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine;
+        long stepActivationSnapshot = stepActivationEngine?.ActivationCacheTimestampSnapshot() ?? -1;
         // FP16 mixed precision on the FUSED path (AiDotNet #1354 / #555). The fused plan
         // ignores AiDotNet's _mixedPrecisionContext, but the Tensors-level AutocastScope is
         // honored by the engine's matmul/conv/elementwise GPU ops (norms, softmax, loss and
@@ -1443,20 +1438,22 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         finally
         {
             evictGuard?.ResumeActivationEviction();
-            // FP16 hetero per-step leak fix: deterministically release THIS step's transient activations/grads/
-            // scratch (created after the snapshot). The optimizer has already read _gradients (separate stable
-            // buffers); the stable node-output tensors re-cache on the next step's Execute. This is what keeps
-            // the FP16 path's cross-step VRAM flat instead of climbing ~0.8MB/step.
-            if (fp16SnapEng is not null && fp16ActSnapshot >= 0)
+            // Release this step's dead transient activations/grads/scratch. The optimizer has already read
+            // _gradients; protect public gradient/seed/dest tensors, materialize only the returned loss, and
+            // discard unprotected scratch materializers so cleanup does not introduce step-ending DtoH traffic.
+            if (stepActivationEngine is not null && stepActivationSnapshot >= 0)
             {
-                // FULL-RESIDENCY: the ONLY value the caller reads from a step is the scalar loss (the returned
-                // tensor). Materialize just that (one tiny GPU→CPU copy) and DISCARD every other dead step
-                // intermediate without a download — so a training step's only host transfer is the loss readout
-                // (the activations / gradients / optimizer state never round-trip). The next step's Execute
-                // recomputes the node outputs; reading any non-loss output after Step() is not part of its contract.
-                var lossKey = _lossOutput.DataVector.GetBackingArrayUnsafe();
-                if (lossKey is not null) Helpers.DeferredArrayMaterializer.TryMaterialize(lossKey);
-                fp16SnapEng.EvictActivationsCreatedAfter(fp16ActSnapshot, protect: null, materializePending: false);
+                try
+                {
+                    MaterializeStepLoss();
+                }
+                finally
+                {
+                    stepActivationEngine.EvictActivationsCreatedAfter(
+                        stepActivationSnapshot,
+                        BuildStepEvictionProtectSet(),
+                        materializePending: false);
+                }
             }
             // Bound cross-step VRAM growth: per-step transient activation buffers are dereferenced
             // here but their device memory is only released by the GC finalizer, which cannot keep
@@ -1464,6 +1461,33 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // finalizer-backed reclaim under memory pressure (cheap no-op when not pressured).
             (engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine)?.ReclaimGpuMemoryUnderPressure();
         }
+    }
+
+    private void MaterializeStepLoss()
+    {
+        var lossKey = _lossOutput.DataVector.GetBackingArrayUnsafe();
+        if (lossKey is not null)
+            Helpers.DeferredArrayMaterializer.TryMaterialize(lossKey);
+        Helpers.DeferredArrayMaterializer.TryMaterialize(_lossOutput.DataVector);
+    }
+
+    private HashSet<object> BuildStepEvictionProtectSet()
+    {
+        var protect = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
+        for (int i = 0; i < _gradients.Length; i++)
+            AddActivationCacheKeys(protect, _gradients[i]);
+        AddActivationCacheKeys(protect, _lossGradDest);
+        AddActivationCacheKeys(protect, _lossGradSeed);
+        return protect;
+    }
+
+    private static void AddActivationCacheKeys(HashSet<object> keys, Tensor<T>? tensor)
+    {
+        if (tensor is null) return;
+        var backing = tensor.DataVector.GetBackingArrayUnsafe();
+        if (backing is not null)
+            keys.Add(backing);
+        keys.Add(tensor.DataVector);
     }
 
     public unsafe void ConfigureOptimizer(

@@ -10307,6 +10307,21 @@ KERNEL VARIANTS (A/B testing):
             k.Execute1D(size, Math.Min(256, size));
         }
 
+        /// <inheritdoc/>
+        public void ProximalL1Update(IGpuBuffer param, IGpuBuffer gradient,
+            float learningRate, float l1Strength, int size)
+        {
+            var k = _kernelCache["proximal_l1_update"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)param).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradient).Buffer.Handle);
+            k.SetArg(arg++, learningRate);
+            k.SetArg(arg++, l1Strength);
+            k.SetArg(arg++, size);
+
+            k.Execute1D(size, Math.Min(256, size));
+        }
+
         #endregion
 
         #region FFT and Signal Processing
@@ -12479,6 +12494,12 @@ KERNEL VARIANTS (A/B testing):
         }
 
         public void Release()
+        {
+            if (GpuBufferReleaseDeferral.TryDefer(ReleaseCore)) return;
+            ReleaseCore();
+        }
+
+        private void ReleaseCore()
         {
             if (Interlocked.Exchange(ref _poolState, 2) == 2)
                 return;

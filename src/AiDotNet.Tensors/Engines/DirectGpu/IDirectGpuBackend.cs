@@ -2314,6 +2314,17 @@ public interface IDirectGpuBackend : IDisposable
     void FtrlUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer z, IGpuBuffer n,
         float learningRate, float l1Reg, float l2Reg, float beta, int size);
 
+    /// <summary>
+    /// Proximal gradient (ISTA) step with L1 soft-thresholding.
+    /// </summary>
+    /// <param name="param">Parameters to update (in-place).</param>
+    /// <param name="gradient">Gradient values.</param>
+    /// <param name="learningRate">Learning rate.</param>
+    /// <param name="l1Strength">L1 regularization strength; shrinkage threshold is learningRate * l1Strength.</param>
+    /// <param name="size">Number of parameters.</param>
+    void ProximalL1Update(IGpuBuffer param, IGpuBuffer gradient,
+        float learningRate, float l1Strength, int size);
+
     // --------------------------------------------------------------
     // PR #567 — Sparse counterparts of the dense optimizer steps above.
     // Each method launches a native CUDA scatter-update kernel with one
