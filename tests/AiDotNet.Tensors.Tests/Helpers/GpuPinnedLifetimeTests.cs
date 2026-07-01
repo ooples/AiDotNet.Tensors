@@ -266,6 +266,16 @@ public class GpuPinnedLifetimeTests
                 Assert.Equal(p.Version, p._gpuBufferVersion);
                 Assert.Equal(m.Version, m._gpuBufferVersion);
                 Assert.Equal(v.Version, v._gpuBufferVersion);
+
+                Assert.NotNull(p.LastWriteSync);
+                Assert.NotNull(m.LastWriteSync);
+                Assert.NotNull(v.LastWriteSync);
+                p.Synchronize();
+                m.Synchronize();
+                v.Synchronize();
+                Assert.True(p.LastWriteSync!.IsComplete, "Parameter GPU write sync should complete after Synchronize().");
+                Assert.True(m.LastWriteSync!.IsComplete, "Adam m-state GPU write sync should complete after Synchronize().");
+                Assert.True(v.LastWriteSync!.IsComplete, "Adam v-state GPU write sync should complete after Synchronize().");
             }
             finally
             {

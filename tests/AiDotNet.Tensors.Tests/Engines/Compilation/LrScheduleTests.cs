@@ -219,6 +219,28 @@ public class LrScheduleTests
     }
 
     [Theory]
+    [InlineData(WarmupDecayMode.Linear, 0)]
+    [InlineData(WarmupDecayMode.Linear, -1)]
+    [InlineData(WarmupDecayMode.Cosine, 0)]
+    [InlineData(WarmupDecayMode.Cosine, -1)]
+    public void LinearWarmup_DecayModesDefaultNonPositiveTotalStepsToWarmup(
+        WarmupDecayMode decayMode, int totalSteps)
+    {
+        var s = LrSchedule.LinearWarmup(
+            lrMax: 0.1,
+            warmupSteps: 3,
+            totalSteps: totalSteps,
+            warmupInitLr: 0.01,
+            decayMode: decayMode,
+            endLr: 0.001);
+
+        Assert.Equal(0.01, s.GetLr(1), 1e-12);
+        Assert.Equal(0.04, s.GetLr(2), 1e-12);
+        Assert.Equal(0.07, s.GetLr(3), 1e-12);
+        Assert.Equal(0.001, s.GetLr(4), 1e-12);
+    }
+
+    [Theory]
     [InlineData(0)]
     [InlineData(-1)]
     public void Cosine_RejectsBadTotalSteps(int total)

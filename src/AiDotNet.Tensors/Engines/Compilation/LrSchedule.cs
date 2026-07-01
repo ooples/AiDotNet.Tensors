@@ -332,13 +332,13 @@ internal sealed class LinearWarmupLr : LrSchedule
         double warmupInitLr, WarmupDecayMode decayMode, double endLr)
     {
         if (warmupSteps < 0) throw new ArgumentOutOfRangeException(nameof(warmupSteps));
-        if (decayMode != WarmupDecayMode.Constant && totalSteps < warmupSteps)
+        int normalizedTotalSteps = totalSteps > 0 ? totalSteps : warmupSteps;
+        if (decayMode != WarmupDecayMode.Constant && normalizedTotalSteps < warmupSteps)
             throw new ArgumentOutOfRangeException(nameof(totalSteps),
                 "totalSteps must be >= warmupSteps for decay modes.");
         _lrMax = lrMax;
         _warmupSteps = warmupSteps;
-        // Eager ctor: _totalSteps = totalSteps > 0 ? totalSteps : warmupSteps.
-        _totalSteps = totalSteps > 0 ? totalSteps : warmupSteps;
+        _totalSteps = normalizedTotalSteps;
         _warmupInitLr = warmupInitLr;
         _decayMode = decayMode;
         _endLr = endLr;

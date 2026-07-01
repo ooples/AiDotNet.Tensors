@@ -33,32 +33,37 @@ namespace AiDotNet.Tensors.Engines.Gpu;
 /// </remarks>
 public static class GpuOptimizer
 {
-    private static void MarkGpuUpdated(Tensor<float>? tensor)
+    private static GpuSyncPoint CreateWriteSyncPoint(IDirectGpuBackend backend)
+        => backend is IAsyncGpuBackend asyncBackend
+            ? asyncBackend.CreateSyncPoint()
+            : GpuSyncPoint.CreateComplete();
+
+    private static void MarkGpuUpdated(IDirectGpuBackend backend, Tensor<float>? tensor)
     {
         if (tensor is null) return;
-        tensor.MarkModified(syncPoint: null);
+        tensor.MarkModified(CreateWriteSyncPoint(backend));
         tensor._gpuBufferVersion = tensor.Version;
     }
 
-    private static void MarkGpuUpdated(Tensor<float>? first, Tensor<float>? second)
+    private static void MarkGpuUpdated(IDirectGpuBackend backend, Tensor<float>? first, Tensor<float>? second)
     {
-        MarkGpuUpdated(first);
-        MarkGpuUpdated(second);
+        MarkGpuUpdated(backend, first);
+        MarkGpuUpdated(backend, second);
     }
 
-    private static void MarkGpuUpdated(Tensor<float>? first, Tensor<float>? second, Tensor<float>? third)
+    private static void MarkGpuUpdated(IDirectGpuBackend backend, Tensor<float>? first, Tensor<float>? second, Tensor<float>? third)
     {
-        MarkGpuUpdated(first);
-        MarkGpuUpdated(second);
-        MarkGpuUpdated(third);
+        MarkGpuUpdated(backend, first);
+        MarkGpuUpdated(backend, second);
+        MarkGpuUpdated(backend, third);
     }
 
-    private static void MarkGpuUpdated(Tensor<float>? first, Tensor<float>? second, Tensor<float>? third, Tensor<float>? fourth)
+    private static void MarkGpuUpdated(IDirectGpuBackend backend, Tensor<float>? first, Tensor<float>? second, Tensor<float>? third, Tensor<float>? fourth)
     {
-        MarkGpuUpdated(first);
-        MarkGpuUpdated(second);
-        MarkGpuUpdated(third);
-        MarkGpuUpdated(fourth);
+        MarkGpuUpdated(backend, first);
+        MarkGpuUpdated(backend, second);
+        MarkGpuUpdated(backend, third);
+        MarkGpuUpdated(backend, fourth);
     }
 
     /// <summary>
@@ -94,7 +99,7 @@ public static class GpuOptimizer
 
         backend.AdamUpdate(pBuf, gBuf, mBuf, vBuf,
             learningRate, beta1, beta2, epsilon, weightDecay, step, param.Length);
-        MarkGpuUpdated(param, m, v);
+        MarkGpuUpdated(backend, param, m, v);
         return true;
     }
 
@@ -140,7 +145,7 @@ public static class GpuOptimizer
         if (pBuf is null || gBuf is null) return false;
 
         backend.SgdUpdate(pBuf, gBuf, learningRate, weightDecay: 0f, param.Length);
-        MarkGpuUpdated(param);
+        MarkGpuUpdated(backend, param);
         return true;
     }
 
@@ -159,7 +164,7 @@ public static class GpuOptimizer
         var pb = p.TryGetGpuBuffer(); var gb = g.TryGetGpuBuffer();
         if (pb is null || gb is null) return false;
         cb.ProximalL1Update(pb, gb, lr, l1Strength, p.Length);
-        MarkGpuUpdated(p);
+        MarkGpuUpdated(cb, p);
         return true;
     }
 
@@ -235,7 +240,7 @@ public static class GpuOptimizer
         int nb = (p.Length + blockSize - 1) / blockSize;
         cb.Adam8BitUpdate(pb, gb, mQ, vQ, mScales, vScales,
             lr, beta1, beta2, epsilon, 1f - beta1, 1f - beta2, biasCorrection1, biasCorrection2, blockSize, p.Length, nb);
-        MarkGpuUpdated(p);
+        MarkGpuUpdated(cb, p);
         return true;
     }
 
@@ -249,7 +254,7 @@ public static class GpuOptimizer
         var pb = p?.TryGetGpuBuffer(); var gb = g?.TryGetGpuBuffer(); var vb = velocity?.TryGetGpuBuffer();
         if (pb is null || gb is null || vb is null) return false;
         b.SgdMomentumUpdate(pb, gb, vb, lr, momentum, weightDecay, p!.Length);
-        MarkGpuUpdated(p, velocity);
+        MarkGpuUpdated(b, p, velocity);
         return true;
     }
 
@@ -259,7 +264,7 @@ public static class GpuOptimizer
         var pb = p?.TryGetGpuBuffer(); var gb = g?.TryGetGpuBuffer(); var sb = squaredAvg?.TryGetGpuBuffer();
         if (pb is null || gb is null || sb is null) return false;
         b.RmspropUpdate(pb, gb, sb, lr, rho, epsilon, weightDecay, p!.Length);
-        MarkGpuUpdated(p, squaredAvg);
+        MarkGpuUpdated(b, p, squaredAvg);
         return true;
     }
 
@@ -269,7 +274,7 @@ public static class GpuOptimizer
         var pb = p?.TryGetGpuBuffer(); var gb = g?.TryGetGpuBuffer(); var ab = accum?.TryGetGpuBuffer();
         if (pb is null || gb is null || ab is null) return false;
         b.AdagradUpdate(pb, gb, ab, lr, epsilon, weightDecay, p!.Length);
-        MarkGpuUpdated(p, accum);
+        MarkGpuUpdated(b, p, accum);
         return true;
     }
 
@@ -279,7 +284,7 @@ public static class GpuOptimizer
         var pb = p?.TryGetGpuBuffer(); var gb = g?.TryGetGpuBuffer(); var vb = velocity?.TryGetGpuBuffer();
         if (pb is null || gb is null || vb is null) return false;
         b.NagUpdate(pb, gb, vb, lr, momentum, weightDecay, p!.Length);
-        MarkGpuUpdated(p, velocity);
+        MarkGpuUpdated(b, p, velocity);
         return true;
     }
 
@@ -289,7 +294,7 @@ public static class GpuOptimizer
         var pb = p?.TryGetGpuBuffer(); var gb = g?.TryGetGpuBuffer(); var vb = velocity?.TryGetGpuBuffer();
         if (pb is null || gb is null || vb is null) return false;
         b.LarsUpdate(pb, gb, vb, lr, momentum, weightDecay, trustCoeff, p!.Length);
-        MarkGpuUpdated(p, velocity);
+        MarkGpuUpdated(b, p, velocity);
         return true;
     }
 
@@ -299,7 +304,7 @@ public static class GpuOptimizer
         var pb = p?.TryGetGpuBuffer(); var gb = g?.TryGetGpuBuffer(); var mb = m?.TryGetGpuBuffer(); var vb = v?.TryGetGpuBuffer();
         if (pb is null || gb is null || mb is null || vb is null) return false;
         b.LambUpdate(pb, gb, mb, vb, lr, beta1, beta2, epsilon, weightDecay, step, p!.Length);
-        MarkGpuUpdated(p, m, v);
+        MarkGpuUpdated(b, p, m, v);
         return true;
     }
 
@@ -309,7 +314,7 @@ public static class GpuOptimizer
         var pb = p?.TryGetGpuBuffer(); var gb = g?.TryGetGpuBuffer(); var ag = accumGrad?.TryGetGpuBuffer(); var au = accumUpdate?.TryGetGpuBuffer();
         if (pb is null || gb is null || ag is null || au is null) return false;
         b.AdadeltaUpdate(pb, gb, ag, au, rho, epsilon, weightDecay, p!.Length);
-        MarkGpuUpdated(p, accumGrad, accumUpdate);
+        MarkGpuUpdated(b, p, accumGrad, accumUpdate);
         return true;
     }
 
@@ -319,7 +324,7 @@ public static class GpuOptimizer
         var pb = p?.TryGetGpuBuffer(); var gb = g?.TryGetGpuBuffer(); var mb = m?.TryGetGpuBuffer(); var vb = v?.TryGetGpuBuffer(); var xb = vMax?.TryGetGpuBuffer();
         if (pb is null || gb is null || mb is null || vb is null || xb is null) return false;
         b.AmsgradUpdate(pb, gb, mb, vb, xb, lr, beta1, beta2, epsilon, weightDecay, step, p!.Length);
-        MarkGpuUpdated(p, m, v, vMax);
+        MarkGpuUpdated(b, p, m, v, vMax);
         return true;
     }
 
@@ -329,7 +334,7 @@ public static class GpuOptimizer
         var pb = p?.TryGetGpuBuffer(); var gb = g?.TryGetGpuBuffer(); var mb = m?.TryGetGpuBuffer(); var ub = u?.TryGetGpuBuffer();
         if (pb is null || gb is null || mb is null || ub is null) return false;
         b.AdamaxUpdate(pb, gb, mb, ub, lr, beta1, beta2, epsilon, weightDecay, step, p!.Length);
-        MarkGpuUpdated(p, m, u);
+        MarkGpuUpdated(b, p, m, u);
         return true;
     }
 
@@ -339,7 +344,7 @@ public static class GpuOptimizer
         var pb = p?.TryGetGpuBuffer(); var gb = g?.TryGetGpuBuffer(); var mb = m?.TryGetGpuBuffer();
         if (pb is null || gb is null || mb is null) return false;
         b.LionUpdate(pb, gb, mb, lr, beta1, beta2, weightDecay, p!.Length);
-        MarkGpuUpdated(p, m);
+        MarkGpuUpdated(b, p, m);
         return true;
     }
 
@@ -349,7 +354,7 @@ public static class GpuOptimizer
         var pb = p?.TryGetGpuBuffer(); var gb = g?.TryGetGpuBuffer(); var mb = m?.TryGetGpuBuffer(); var vb = v?.TryGetGpuBuffer();
         if (pb is null || gb is null || mb is null || vb is null) return false;
         b.NadamUpdate(pb, gb, mb, vb, lr, beta1, beta2, epsilon, weightDecay, step, p!.Length);
-        MarkGpuUpdated(p, m, v);
+        MarkGpuUpdated(b, p, m, v);
         return true;
     }
 
@@ -359,7 +364,7 @@ public static class GpuOptimizer
         var pb = p?.TryGetGpuBuffer(); var gb = g?.TryGetGpuBuffer(); var zb = z?.TryGetGpuBuffer(); var nb = n?.TryGetGpuBuffer();
         if (pb is null || gb is null || zb is null || nb is null) return false;
         b.FtrlUpdate(pb, gb, zb, nb, lr, l1Reg, l2Reg, beta, p!.Length);
-        MarkGpuUpdated(p, z, n);
+        MarkGpuUpdated(b, p, z, n);
         return true;
     }
 
@@ -421,7 +426,7 @@ public static class GpuOptimizer
         if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
         var mb = m.TryGetGpuBuffer(); var vbState = v.TryGetGpuBuffer();
         if (mb is null || vbState is null) return false;
-        try { b!.SparseAdamUpdate(pb!, mb, vbState, iBuf!, vBuf!, nnz, learningRate, beta1, beta2, epsilon, weightDecay, step); MarkGpuUpdated(param, m, v); return true; }
+        try { b!.SparseAdamUpdate(pb!, mb, vbState, iBuf!, vBuf!, nnz, learningRate, beta1, beta2, epsilon, weightDecay, step); MarkGpuUpdated(b, param, m, v); return true; }
         catch (NotSupportedException) { return false; }
     }
 
@@ -437,7 +442,7 @@ public static class GpuOptimizer
         if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
         var mb = m.TryGetGpuBuffer(); var vbState = v.TryGetGpuBuffer();
         if (mb is null || vbState is null) return false;
-        try { b!.SparseAdamWUpdate(pb!, mb, vbState, iBuf!, vBuf!, nnz, learningRate, beta1, beta2, epsilon, weightDecay, step); MarkGpuUpdated(param, m, v); return true; }
+        try { b!.SparseAdamWUpdate(pb!, mb, vbState, iBuf!, vBuf!, nnz, learningRate, beta1, beta2, epsilon, weightDecay, step); MarkGpuUpdated(b, param, m, v); return true; }
         catch (NotSupportedException) { return false; }
     }
 
@@ -448,7 +453,7 @@ public static class GpuOptimizer
         float learningRate, float weightDecay = 0f)
     {
         if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
-        try { b!.SparseSgdUpdate(pb!, iBuf!, vBuf!, nnz, learningRate, weightDecay); MarkGpuUpdated(param); return true; }
+        try { b!.SparseSgdUpdate(pb!, iBuf!, vBuf!, nnz, learningRate, weightDecay); MarkGpuUpdated(b, param); return true; }
         catch (NotSupportedException) { return false; }
     }
 
@@ -462,7 +467,7 @@ public static class GpuOptimizer
         if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
         var velBuf = velocity.TryGetGpuBuffer();
         if (velBuf is null) return false;
-        try { b!.SparseSgdMomentumUpdate(pb!, velBuf, iBuf!, vBuf!, nnz, learningRate, momentum, weightDecay); MarkGpuUpdated(param, velocity); return true; }
+        try { b!.SparseSgdMomentumUpdate(pb!, velBuf, iBuf!, vBuf!, nnz, learningRate, momentum, weightDecay); MarkGpuUpdated(b, param, velocity); return true; }
         catch (NotSupportedException) { return false; }
     }
 
@@ -476,7 +481,7 @@ public static class GpuOptimizer
         if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
         var sb = squaredAvg.TryGetGpuBuffer();
         if (sb is null) return false;
-        try { b!.SparseRmspropUpdate(pb!, sb, iBuf!, vBuf!, nnz, lr, rho, epsilon, weightDecay); MarkGpuUpdated(param, squaredAvg); return true; }
+        try { b!.SparseRmspropUpdate(pb!, sb, iBuf!, vBuf!, nnz, lr, rho, epsilon, weightDecay); MarkGpuUpdated(b, param, squaredAvg); return true; }
         catch (NotSupportedException) { return false; }
     }
 
@@ -490,7 +495,7 @@ public static class GpuOptimizer
         if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
         var ab = accum.TryGetGpuBuffer();
         if (ab is null) return false;
-        try { b!.SparseAdagradUpdate(pb!, ab, iBuf!, vBuf!, nnz, lr, epsilon, weightDecay); MarkGpuUpdated(param, accum); return true; }
+        try { b!.SparseAdagradUpdate(pb!, ab, iBuf!, vBuf!, nnz, lr, epsilon, weightDecay); MarkGpuUpdated(b, param, accum); return true; }
         catch (NotSupportedException) { return false; }
     }
 
@@ -504,7 +509,7 @@ public static class GpuOptimizer
         if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
         var velBuf = velocity.TryGetGpuBuffer();
         if (velBuf is null) return false;
-        try { b!.SparseNagUpdate(pb!, velBuf, iBuf!, vBuf!, nnz, lr, momentum, weightDecay); MarkGpuUpdated(param, velocity); return true; }
+        try { b!.SparseNagUpdate(pb!, velBuf, iBuf!, vBuf!, nnz, lr, momentum, weightDecay); MarkGpuUpdated(b, param, velocity); return true; }
         catch (NotSupportedException) { return false; }
     }
 
@@ -520,7 +525,7 @@ public static class GpuOptimizer
         var agb = accumGrad.TryGetGpuBuffer();
         var aub = accumUpdate.TryGetGpuBuffer();
         if (agb is null || aub is null) return false;
-        try { b!.SparseAdadeltaUpdate(pb!, agb, aub, iBuf!, vBuf!, nnz, rho, epsilon, weightDecay); MarkGpuUpdated(param, accumGrad, accumUpdate); return true; }
+        try { b!.SparseAdadeltaUpdate(pb!, agb, aub, iBuf!, vBuf!, nnz, rho, epsilon, weightDecay); MarkGpuUpdated(b, param, accumGrad, accumUpdate); return true; }
         catch (NotSupportedException) { return false; }
     }
 
@@ -536,7 +541,7 @@ public static class GpuOptimizer
         if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
         var mb = m.TryGetGpuBuffer(); var vbState = v.TryGetGpuBuffer(); var vmb = vMax.TryGetGpuBuffer();
         if (mb is null || vbState is null || vmb is null) return false;
-        try { b!.SparseAmsgradUpdate(pb!, mb, vbState, vmb, iBuf!, vBuf!, nnz, lr, beta1, beta2, epsilon, weightDecay, step); MarkGpuUpdated(param, m, v, vMax); return true; }
+        try { b!.SparseAmsgradUpdate(pb!, mb, vbState, vmb, iBuf!, vBuf!, nnz, lr, beta1, beta2, epsilon, weightDecay, step); MarkGpuUpdated(b, param, m, v, vMax); return true; }
         catch (NotSupportedException) { return false; }
     }
 
@@ -551,7 +556,7 @@ public static class GpuOptimizer
         if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
         var mb = m.TryGetGpuBuffer(); var ub = u.TryGetGpuBuffer();
         if (mb is null || ub is null) return false;
-        try { b!.SparseAdamaxUpdate(pb!, mb, ub, iBuf!, vBuf!, nnz, lr, beta1, beta2, epsilon, weightDecay, step); MarkGpuUpdated(param, m, u); return true; }
+        try { b!.SparseAdamaxUpdate(pb!, mb, ub, iBuf!, vBuf!, nnz, lr, beta1, beta2, epsilon, weightDecay, step); MarkGpuUpdated(b, param, m, u); return true; }
         catch (NotSupportedException) { return false; }
     }
 
@@ -565,7 +570,7 @@ public static class GpuOptimizer
         if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
         var mb = m.TryGetGpuBuffer();
         if (mb is null) return false;
-        try { b!.SparseLionUpdate(pb!, mb, iBuf!, vBuf!, nnz, lr, beta1, beta2, weightDecay); MarkGpuUpdated(param, m); return true; }
+        try { b!.SparseLionUpdate(pb!, mb, iBuf!, vBuf!, nnz, lr, beta1, beta2, weightDecay); MarkGpuUpdated(b, param, m); return true; }
         catch (NotSupportedException) { return false; }
     }
 
@@ -580,7 +585,7 @@ public static class GpuOptimizer
         if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
         var mb = m.TryGetGpuBuffer(); var vbState = v.TryGetGpuBuffer();
         if (mb is null || vbState is null) return false;
-        try { b!.SparseNadamUpdate(pb!, mb, vbState, iBuf!, vBuf!, nnz, lr, beta1, beta2, epsilon, weightDecay, step); MarkGpuUpdated(param, m, v); return true; }
+        try { b!.SparseNadamUpdate(pb!, mb, vbState, iBuf!, vBuf!, nnz, lr, beta1, beta2, epsilon, weightDecay, step); MarkGpuUpdated(b, param, m, v); return true; }
         catch (NotSupportedException) { return false; }
     }
 
@@ -595,7 +600,7 @@ public static class GpuOptimizer
         if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
         var zb = z.TryGetGpuBuffer(); var nb = n.TryGetGpuBuffer();
         if (zb is null || nb is null) return false;
-        try { b!.SparseFtrlUpdate(pb!, zb, nb, iBuf!, vBuf!, nnz, lr, l1Reg, l2Reg, beta); MarkGpuUpdated(param, z, n); return true; }
+        try { b!.SparseFtrlUpdate(pb!, zb, nb, iBuf!, vBuf!, nnz, lr, l1Reg, l2Reg, beta); MarkGpuUpdated(b, param, z, n); return true; }
         catch (NotSupportedException) { return false; }
     }
 
@@ -606,7 +611,7 @@ public static class GpuOptimizer
         float lr, float l1Strength)
     {
         if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
-        try { b!.SparseProximalL1Update(pb!, iBuf!, vBuf!, nnz, lr, l1Strength); MarkGpuUpdated(param); return true; }
+        try { b!.SparseProximalL1Update(pb!, iBuf!, vBuf!, nnz, lr, l1Strength); MarkGpuUpdated(b, param); return true; }
         catch (NotSupportedException) { return false; }
     }
 }
