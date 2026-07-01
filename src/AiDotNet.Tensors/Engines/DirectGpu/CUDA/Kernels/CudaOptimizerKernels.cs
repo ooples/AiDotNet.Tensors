@@ -516,18 +516,27 @@ extern ""C"" __global__ __launch_bounds__(256) void adam8bit_update(
 // passes nnz as the size argument.
 // ===========================================================================
 
+__device__ __forceinline__ int decode_sparse_index(float raw, int param_size)
+{
+    int bitcast = __float_as_int(raw);
+    if (bitcast >= 0 && bitcast < param_size) return bitcast;
+    int numeric = (int)raw;
+    if (numeric >= 0 && numeric < param_size && raw == (float)numeric) return numeric;
+    return -1;
+}
+
 // ---------------------------------------------------------------------------
 // Sparse SGD (no momentum)
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void sparse_sgd_update(
     float* __restrict__ param,
-    const int* __restrict__ indices,
+    const float* __restrict__ indices,
     const float* __restrict__ values,
-    float learningRate, float weightDecay, int nnz)
+    float learningRate, float weightDecay, int nnz, int param_size)
 {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= nnz) return;
-    int i = indices[k];
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
     float grad = values[k];
     if (weightDecay > 0.0f) grad += weightDecay * param[i];
     param[i] -= learningRate * grad;
@@ -538,14 +547,14 @@ extern ""C"" __global__ __launch_bounds__(256) void sparse_sgd_update(
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void sparse_sgd_momentum_update(
     float* __restrict__ param,
-    const int* __restrict__ indices,
+    const float* __restrict__ indices,
     const float* __restrict__ values,
     float* __restrict__ velocity,
-    float learningRate, float momentum, float weightDecay, int nnz)
+    float learningRate, float momentum, float weightDecay, int nnz, int param_size)
 {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= nnz) return;
-    int i = indices[k];
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
     float grad = values[k];
     if (weightDecay > 0.0f) grad += weightDecay * param[i];
     float v = momentum * velocity[i] + grad;
@@ -558,15 +567,15 @@ extern ""C"" __global__ __launch_bounds__(256) void sparse_sgd_momentum_update(
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void sparse_adam_update(
     float* __restrict__ param,
-    const int* __restrict__ indices,
+    const float* __restrict__ indices,
     const float* __restrict__ values,
     float* __restrict__ m, float* __restrict__ v,
     float learningRate, float beta1, float beta2, float epsilon,
-    float weightDecay, int step, int nnz)
+    float weightDecay, int step, int nnz, int param_size)
 {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= nnz) return;
-    int i = indices[k];
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
     float grad = values[k];
     float mVal = beta1 * m[i] + (1.0f - beta1) * grad;
     float vVal = beta2 * v[i] + (1.0f - beta2) * grad * grad;
@@ -584,15 +593,15 @@ extern ""C"" __global__ __launch_bounds__(256) void sparse_adam_update(
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void sparse_adamw_update(
     float* __restrict__ param,
-    const int* __restrict__ indices,
+    const float* __restrict__ indices,
     const float* __restrict__ values,
     float* __restrict__ m, float* __restrict__ v,
     float learningRate, float beta1, float beta2, float epsilon,
-    float weightDecay, int step, int nnz)
+    float weightDecay, int step, int nnz, int param_size)
 {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= nnz) return;
-    int i = indices[k];
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
     float grad = values[k];
     float p = param[i];
     if (weightDecay > 0.0f) p -= learningRate * weightDecay * p;
@@ -610,14 +619,14 @@ extern ""C"" __global__ __launch_bounds__(256) void sparse_adamw_update(
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void sparse_rmsprop_update(
     float* __restrict__ param,
-    const int* __restrict__ indices,
+    const float* __restrict__ indices,
     const float* __restrict__ values,
     float* __restrict__ squaredAvg,
-    float learningRate, float rho, float epsilon, float weightDecay, int nnz)
+    float learningRate, float rho, float epsilon, float weightDecay, int nnz, int param_size)
 {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= nnz) return;
-    int i = indices[k];
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
     float grad = values[k];
     if (weightDecay > 0.0f) grad += weightDecay * param[i];
     float sq = rho * squaredAvg[i] + (1.0f - rho) * grad * grad;
@@ -630,14 +639,14 @@ extern ""C"" __global__ __launch_bounds__(256) void sparse_rmsprop_update(
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void sparse_adagrad_update(
     float* __restrict__ param,
-    const int* __restrict__ indices,
+    const float* __restrict__ indices,
     const float* __restrict__ values,
     float* __restrict__ accum,
-    float learningRate, float epsilon, float weightDecay, int nnz)
+    float learningRate, float epsilon, float weightDecay, int nnz, int param_size)
 {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= nnz) return;
-    int i = indices[k];
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
     float grad = values[k];
     if (weightDecay > 0.0f) grad += weightDecay * param[i];
     float a = accum[i] + grad * grad;
@@ -650,14 +659,14 @@ extern ""C"" __global__ __launch_bounds__(256) void sparse_adagrad_update(
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void sparse_nag_update(
     float* __restrict__ param,
-    const int* __restrict__ indices,
+    const float* __restrict__ indices,
     const float* __restrict__ values,
     float* __restrict__ velocity,
-    float learningRate, float momentum, float weightDecay, int nnz)
+    float learningRate, float momentum, float weightDecay, int nnz, int param_size)
 {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= nnz) return;
-    int i = indices[k];
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
     float grad = values[k];
     if (weightDecay > 0.0f) grad += weightDecay * param[i];
     float vOld = velocity[i];
@@ -672,14 +681,14 @@ extern ""C"" __global__ __launch_bounds__(256) void sparse_nag_update(
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void sparse_adadelta_update(
     float* __restrict__ param,
-    const int* __restrict__ indices,
+    const float* __restrict__ indices,
     const float* __restrict__ values,
     float* __restrict__ accumGrad, float* __restrict__ accumUpdate,
-    float rho, float epsilon, float weightDecay, int nnz)
+    float rho, float epsilon, float weightDecay, int nnz, int param_size)
 {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= nnz) return;
-    int i = indices[k];
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
     float grad = values[k];
     if (weightDecay > 0.0f) grad += weightDecay * param[i];
     float oneMinusRho = 1.0f - rho;
@@ -695,15 +704,15 @@ extern ""C"" __global__ __launch_bounds__(256) void sparse_adadelta_update(
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void sparse_amsgrad_update(
     float* __restrict__ param,
-    const int* __restrict__ indices,
+    const float* __restrict__ indices,
     const float* __restrict__ values,
     float* __restrict__ m, float* __restrict__ v, float* __restrict__ vMax,
     float learningRate, float beta1, float beta2, float epsilon,
-    float weightDecay, int step, int nnz)
+    float weightDecay, int step, int nnz, int param_size)
 {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= nnz) return;
-    int i = indices[k];
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
     float grad = values[k];
     if (weightDecay > 0.0f) grad += weightDecay * param[i];
     float mVal = beta1 * m[i] + (1.0f - beta1) * grad;
@@ -722,15 +731,15 @@ extern ""C"" __global__ __launch_bounds__(256) void sparse_amsgrad_update(
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void sparse_adamax_update(
     float* __restrict__ param,
-    const int* __restrict__ indices,
+    const float* __restrict__ indices,
     const float* __restrict__ values,
     float* __restrict__ m, float* __restrict__ u,
     float learningRate, float beta1, float beta2, float epsilon,
-    float weightDecay, int step, int nnz)
+    float weightDecay, int step, int nnz, int param_size)
 {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= nnz) return;
-    int i = indices[k];
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
     float grad = values[k];
     if (weightDecay > 0.0f) grad += weightDecay * param[i];
     float mVal = beta1 * m[i] + (1.0f - beta1) * grad;
@@ -746,14 +755,14 @@ extern ""C"" __global__ __launch_bounds__(256) void sparse_adamax_update(
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void sparse_lion_update(
     float* __restrict__ param,
-    const int* __restrict__ indices,
+    const float* __restrict__ indices,
     const float* __restrict__ values,
     float* __restrict__ m,
-    float learningRate, float beta1, float beta2, float weightDecay, int nnz)
+    float learningRate, float beta1, float beta2, float weightDecay, int nnz, int param_size)
 {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= nnz) return;
-    int i = indices[k];
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
     float grad = values[k];
     float c = beta1 * m[i] + (1.0f - beta1) * grad;
     float sign = (c > 0.0f) ? 1.0f : ((c < 0.0f) ? -1.0f : 0.0f);
@@ -768,15 +777,15 @@ extern ""C"" __global__ __launch_bounds__(256) void sparse_lion_update(
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void sparse_nadam_update(
     float* __restrict__ param,
-    const int* __restrict__ indices,
+    const float* __restrict__ indices,
     const float* __restrict__ values,
     float* __restrict__ m, float* __restrict__ v,
     float learningRate, float beta1, float beta2, float epsilon,
-    float weightDecay, int step, int nnz)
+    float weightDecay, int step, int nnz, int param_size)
 {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= nnz) return;
-    int i = indices[k];
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
     float grad = values[k];
     if (weightDecay > 0.0f) grad += weightDecay * param[i];
     float mVal = beta1 * m[i] + (1.0f - beta1) * grad;
@@ -795,14 +804,14 @@ extern ""C"" __global__ __launch_bounds__(256) void sparse_nadam_update(
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void sparse_ftrl_update(
     float* __restrict__ param,
-    const int* __restrict__ indices,
+    const float* __restrict__ indices,
     const float* __restrict__ values,
     float* __restrict__ z, float* __restrict__ n,
-    float learningRate, float l1Reg, float l2Reg, float beta, int nnz)
+    float learningRate, float l1Reg, float l2Reg, float beta, int nnz, int param_size)
 {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= nnz) return;
-    int i = indices[k];
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
     float grad = values[k];
     float nOld = n[i];
     float nNew = nOld + grad * grad;
@@ -823,13 +832,13 @@ extern ""C"" __global__ __launch_bounds__(256) void sparse_ftrl_update(
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void sparse_proximal_l1_update(
     float* __restrict__ param,
-    const int* __restrict__ indices,
+    const float* __restrict__ indices,
     const float* __restrict__ values,
-    float learningRate, float l1Strength, int nnz)
+    float learningRate, float l1Strength, int nnz, int param_size)
 {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= nnz) return;
-    int i = indices[k];
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
     float grad = values[k];
     float p = param[i] - learningRate * grad;
     float threshold = learningRate * l1Strength;
