@@ -1471,7 +1471,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     private HashSet<object> BuildStepEvictionProtectSet()
     {
-        var protect = new HashSet<object>();
+        var protect = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
         for (int i = 0; i < _gradients.Length; i++)
             AddActivationCacheKeys(protect, _gradients[i]);
         AddActivationCacheKeys(protect, _lossGradDest);

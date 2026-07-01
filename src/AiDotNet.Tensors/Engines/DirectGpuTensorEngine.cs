@@ -2022,12 +2022,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     private bool TryFreeActivationByKey(object key)
     {
+        if (!_activationCache.TryRemove(key, out var e)) return false;
         // Dead tensor: discard the lazy GPU->CPU materializer before freeing
         // the cache-owned buffer. Materializing here would be wasted work, and
         // leaving the registration behind would point a later bulk drain at a
-        // freed buffer.
+        // freed buffer. Remove only after the cache entry is actually owned.
         Helpers.DeferredArrayMaterializer.Remove(key);
-        if (!_activationCache.TryRemove(key, out var e)) return false;
         System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, -e.Buffer.SizeInBytes);
         System.Threading.Interlocked.Add(ref _currentActivationManagedBytes, -e.ManagedBytes);
         // CUDA uses STREAM-ORDERED deferred free (cuMemFreeAsync) to release the buffer at the stream's

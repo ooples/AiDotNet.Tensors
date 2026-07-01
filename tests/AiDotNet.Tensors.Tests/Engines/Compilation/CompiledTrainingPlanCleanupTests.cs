@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Reflection;
 using System.Runtime.Serialization;
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -23,6 +24,7 @@ public sealed class CompiledTrainingPlanCleanupTests
 
         var protect = (HashSet<object>)Invoke(plan, "BuildStepEvictionProtectSet")!;
 
+        Assert.Same(ReferenceEqualityComparer<object>.Instance, protect.Comparer);
         AssertContainsTensorKeys(protect, grad0);
         AssertContainsTensorKeys(protect, grad1);
         AssertContainsTensorKeys(protect, seed);
