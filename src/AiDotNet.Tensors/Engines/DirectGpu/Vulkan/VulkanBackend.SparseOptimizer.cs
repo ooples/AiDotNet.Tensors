@@ -5,6 +5,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
 public sealed unsafe partial class VulkanBackend
 {
+    // Staged correctness fallback: Vulkan sparse optimizer updates currently download and
+    // upload full param/state buffers, so host-device traffic is O(param.Size + state.Size + nnz)
+    // rather than native O(nnz). This preserves backend correctness until native SPIR-V scatter
+    // kernels land; throughput-sensitive sparse embedding workloads should use a native
+    // scatter backend.
+
     public void SparseSgdUpdate(IGpuBuffer param, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float learningRate, float weightDecay)
         => ApplySparse(param, sparseIndices, sparseValues, (p, i, v) =>
             SparseOptimizerReference.SparseSgdUpdate(p, i, v, nnz, learningRate, weightDecay));

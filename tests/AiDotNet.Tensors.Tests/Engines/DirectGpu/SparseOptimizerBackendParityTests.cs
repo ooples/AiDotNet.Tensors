@@ -136,6 +136,48 @@ public sealed class SparseOptimizerBackendParityTests
     }
 
     [Fact]
+    public void SparseOptimizerContract_DocumentsUniquePreAggregatedIndices()
+    {
+        string source = File.ReadAllText(SourcePath("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "IDirectGpuBackend.cs"));
+
+        Assert.Contains("sparseIndices[0..nnz) must be in range, unique, and", source);
+        Assert.Contains("pre-aggregated before dispatch", source);
+        Assert.Contains("duplicate-index order is intentionally undefined", source);
+    }
+
+    [Fact]
+    public void WebGpuSparseStateValidation_IsConditionalForDummyBuffers()
+    {
+        string source = File.ReadAllText(SourcePath("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "WebGpu", "WebGpuBackend.SparseOptimizer.cs"));
+
+        Assert.Contains("private enum SparseStateUsage", source);
+        Assert.Contains("SparseStateUsage.None", source);
+        Assert.Contains("EnsureSparseStateBuffer(state1", source);
+        Assert.Contains("validating dummy buffers would reject valid calls", source);
+        Assert.DoesNotContain("state1.Size < param.Size) throw", source);
+        Assert.DoesNotContain("state2.Size < param.Size) throw", source);
+        Assert.DoesNotContain("state3.Size < param.Size) throw", source);
+    }
+
+    [Fact]
+    public void StagedSparseBackends_DocumentFullBufferTransferFallback()
+    {
+        string[] stagedBackendFiles =
+        {
+            SourcePath("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "Metal", "MetalBackend.SparseOptimizer.cs"),
+            SourcePath("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "Vulkan", "VulkanBackend.SparseOptimizer.cs")
+        };
+
+        foreach (string file in stagedBackendFiles)
+        {
+            string source = File.ReadAllText(file);
+            Assert.Contains("Staged correctness fallback", source);
+            Assert.Contains("O(param.Size + state.Size + nnz)", source);
+            Assert.Contains("throughput-sensitive sparse embedding workloads", source);
+        }
+    }
+
+    [Fact]
     public void NativeSparseOptimizerKernelRegistrations_AreComplete()
     {
         string cuda = File.ReadAllText(SourcePath("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Kernels", "CudaOptimizerKernels.cs"));

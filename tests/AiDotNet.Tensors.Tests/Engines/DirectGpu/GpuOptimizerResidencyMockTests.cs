@@ -13,6 +13,7 @@ using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
+[Collection("EngineCurrentGlobalState")]
 public sealed class GpuOptimizerResidencyMockTests
 {
     [Fact]
@@ -117,6 +118,32 @@ public sealed class GpuOptimizerResidencyMockTests
         RunSparseCase(ctx, "SparseProximalL1Update",
             t => GpuOptimizer.TryProximalL1StepSparse(t.P, t.Indices, t.Values, 2, 0.01f, 0.1f),
             t => t.P);
+    }
+
+    [Fact]
+    public void SparseDispatchValidation_RejectsDuplicateIndicesBeforeDispatch()
+    {
+        var state = new MockBackendState();
+        var backend = MockDirectGpuBackend.Create(state);
+        var indices = new MockGpuBuffer(new[] { 1f, 1f });
+
+        var ex = Assert.Throws<ArgumentException>(() =>
+            GpuOptimizer.EnsureUniqueSparseDispatchIndices(backend, indices, 2, 4));
+
+        Assert.Contains("duplicate index 1", ex.Message);
+        Assert.Empty(state.OptimizerCalls);
+    }
+
+    [Fact]
+    public void SparseDispatchValidation_RejectsOutOfRangeIndicesBeforeDispatch()
+    {
+        var state = new MockBackendState();
+        var backend = MockDirectGpuBackend.Create(state);
+        var indices = new MockGpuBuffer(new[] { 0f, 4f });
+
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            GpuOptimizer.EnsureUniqueSparseDispatchIndices(backend, indices, 2, 4));
+        Assert.Empty(state.OptimizerCalls);
     }
 
     [Fact]
@@ -269,7 +296,12 @@ public sealed class GpuOptimizerResidencyMockTests
         => Tensor<float>.FromGpuBuffer(backend, new MockGpuBuffer(new float[length]), new[] { length });
 
     private static Tensor<int> GpuInt(IDirectGpuBackend backend, int length = 4)
-        => Tensor<int>.FromGpuBuffer(backend, new MockGpuBuffer(new float[length]), new[] { length });
+    {
+        var data = new float[length];
+        for (int i = 0; i < data.Length; i++)
+            data[i] = i;
+        return Tensor<int>.FromGpuBuffer(backend, new MockGpuBuffer(data), new[] { length });
+    }
 
     private sealed class DenseTensors
     {
