@@ -2001,10 +2001,15 @@ public static class WeightRegistry
     /// pinned in the pool forever, so <see cref="StreamingTensorPool.RegisteredEntryCount"/> climbs
     /// across sequentially-created-then-dropped models (test shards, long training/inference loops)
     /// until a later <see cref="Configure"/> throws "existing streaming pool has N registered entries"
-    /// or the host OOMs. Long-lived hosts and test harnesses should call this periodically — typically
-    /// right after a <c>GC.Collect()</c> so disposed models' owners are actually collected first. Only
-    /// genuinely-dead owners (weak reference collected) are reclaimed; a live weight is never touched.
-    /// Returns the number of entries reclaimed.
+    /// or the host OOMs. Call this when owners are expected to have been collected — e.g. on a
+    /// memory-pressure signal, between iterations of a long sequential-model loop, or between test
+    /// cases. Reclamation is driven off the owners' weak references, so an entry is only released once
+    /// the runtime has actually collected its owner; this method does NOT force a garbage collection,
+    /// and callers generally should NOT either — forcing a full <c>GC.Collect()</c> is harmful to
+    /// latency/throughput outside controlled scenarios such as tests. Note the common paths already
+    /// self-heal without any explicit call: <see cref="RegisterWeight{T}"/> sweeps amortized and
+    /// <see cref="Configure"/> sweeps before its guard. Only genuinely-dead owners (weak reference
+    /// collected) are reclaimed; a live weight is never touched. Returns the number of entries reclaimed.
     /// </summary>
     public static int PruneDeadEntries()
     {
@@ -2018,7 +2023,18 @@ public static class WeightRegistry
     /// Sweeps <see cref="_ownerByHandle"/> for owners whose weak reference has been collected and
     /// releases each such handle's pool entry + materialized-tracking state — the exact cleanup
     /// <see cref="UnregisterWeight{T}"/> performs, but for tensors that were GC'd without calling it.
-    /// MUST be called under <see cref="_lock"/>. Returns the number of entries reclaimed.
+    /// MUST be called under <see cref="_lock"/>.
+    /// <para>
+    /// This is an O(n) scan over the owner map (n = registered-weight count), so it is invoked only on
+    /// low-frequency / already-locked paths: <see cref="Configure"/> (per-model, rare) and an amortized
+    /// 1-in-<see cref="DeadOwnerSweepInterval"/> tick inside <see cref="RegisterWeight{T}"/> (which
+    /// already holds <see cref="_lock"/> for the whole registration). The scan body is a cheap weak
+    /// <c>TryGetTarget</c>; the dead list is allocated lazily and only when dead owners exist (the
+    /// steady-state case allocates nothing). The reclamation loop stays UNDER the lock deliberately —
+    /// <see cref="Configure"/>/<see cref="Reset"/> can dispose or swap <see cref="_streamingPool"/>
+    /// while holding <see cref="_lock"/>, so dropping the lock to call <c>Unregister</c> would race a
+    /// pool swap and free handles against the wrong (or disposed) pool. Returns entries reclaimed.
+    /// </para>
     /// </summary>
     private static int PruneDeadOwnersUnlocked()
     {

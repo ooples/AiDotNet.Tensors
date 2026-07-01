@@ -1,7 +1,11 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
+using System.Runtime.CompilerServices;
+using System.Threading;
 using AiDotNet.Tensors.LinearAlgebra;
 using AiDotNet.Tensors.NumericOperations;
 using Xunit;
@@ -96,19 +100,42 @@ public class WeightRegistryStreamingTests : IDisposable
         Assert.Equal(0, w.DataVector.Length);
     }
 
-    // Register streaming weights in a NON-INLINED helper so the locals genuinely leave scope and
-    // become collectable — a JIT could otherwise keep a live root to a same-method local across the GC.
-    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
-    private static void RegisterAndAbandonStreamingWeights(int count)
+    // Registers streaming weights in a NON-INLINED helper so the locals genuinely leave scope and
+    // become collectable, and returns WEAK references to them so the caller can deterministically WAIT
+    // for the GC to reclaim them (rather than assuming a single GC.Collect suffices — see
+    // WaitUntilCollected). The WeakReferences do not keep the tensors alive.
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static List<WeakReference> RegisterAndAbandonStreamingWeights(int count)
     {
+        var refs = new List<WeakReference>(count);
         for (int i = 0; i < count; i++)
         {
             var w = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, new[] { 4 });
             w.Lifetime = WeightLifetime.Streaming;
             WeightRegistry.RegisterWeight(w);
-            // No reference kept: w is unreachable at the next iteration / method return, so once GC
-            // runs its _ownerByHandle weak reference dies and its pool entry is an orphan (#714).
+            refs.Add(new WeakReference(w));
         }
+        return refs;
+    }
+
+    // Deterministically drives GC until every owner is OBSERVABLY collected (or a generous timeout),
+    // so a subsequent "reclaimed > 0" / "count == 0" assertion reflects a real registry regression
+    // rather than GC-timing nondeterminism (background/concurrent GC, delayed collection, JIT liveness).
+    private static void WaitUntilCollected(List<WeakReference> refs, int timeoutMs = 15000)
+    {
+        var sw = Stopwatch.StartNew();
+        do
+        {
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            if (refs.TrueForAll(static r => !r.IsAlive)) return;
+            Thread.Sleep(15);
+        }
+        while (sw.ElapsedMilliseconds < timeoutMs);
+
+        Assert.True(refs.TrueForAll(static r => !r.IsAlive),
+            "Owning tensors were not garbage-collected within the timeout — a test-environment issue, not a registry regression.");
     }
 
     [Fact]
@@ -119,13 +146,11 @@ public class WeightRegistryStreamingTests : IDisposable
         // (the CV/diffusion foundation-scale test shards, long training loops) RegisteredEntryCount
         // climbs until Configure throws "existing streaming pool has N registered entries" / the host
         // OOMs. PruneDeadEntries must reclaim those orphaned entries; a fresh Configure must then work.
-        RegisterAndAbandonStreamingWeights(20);
+        var refs = RegisterAndAbandonStreamingWeights(20);
         Assert.True(WeightRegistry.GetStreamingReport().RegisteredEntryCount > 0,
             "Sanity: the 20 streaming registrations should be resident in the pool before GC.");
 
-        GC.Collect();
-        GC.WaitForPendingFinalizers();
-        GC.Collect();
+        WaitUntilCollected(refs); // deterministic: all owners are provably collected past this point
 
         int reclaimed = WeightRegistry.PruneDeadEntries();
 
@@ -147,10 +172,8 @@ public class WeightRegistryStreamingTests : IDisposable
         // #714 (the exact CV/diffusion shard symptom): a new streaming model's Configure must not be
         // blocked by a PRIOR model's entries once that model has been GC'd. Configure prunes dead
         // owners first, so only genuinely-live registrations still throw.
-        RegisterAndAbandonStreamingWeights(15);
-        GC.Collect();
-        GC.WaitForPendingFinalizers();
-        GC.Collect();
+        var refs = RegisterAndAbandonStreamingWeights(15);
+        WaitUntilCollected(refs); // deterministic: all owners are provably collected past this point
 
         // Should NOT throw — the 15 orphaned entries are reclaimed by Configure's internal sweep.
         WeightRegistry.Configure(new GpuOffloadOptions
