@@ -119,6 +119,22 @@ public sealed class GpuOptimizerResidencyMockTests
             t => t.P);
     }
 
+    [Fact]
+    public void DenseProximalL1_RejectsInvalidInputsBeforeDispatch()
+    {
+        using var ctx = new MockGpuEngineScope();
+        var p = GpuFloat(ctx.Backend, 4);
+        var g = GpuFloat(ctx.Backend, 4);
+        var shortGrad = GpuFloat(ctx.Backend, 3);
+
+        Assert.Throws<ArgumentException>(() => GpuOptimizer.TryProximalL1Step(p, shortGrad, 0.01f, 0.1f));
+        Assert.Throws<ArgumentOutOfRangeException>(() => GpuOptimizer.TryProximalL1Step(p, g, -0.01f, 0.1f));
+        Assert.Throws<ArgumentOutOfRangeException>(() => GpuOptimizer.TryProximalL1Step(p, g, 0.01f, -0.1f));
+        Assert.Throws<ArgumentOutOfRangeException>(() => GpuOptimizer.TryProximalL1Step(p, g, float.NaN, 0.1f));
+        Assert.Throws<ArgumentOutOfRangeException>(() => GpuOptimizer.TryProximalL1Step(p, g, 0.01f, float.PositiveInfinity));
+        Assert.Empty(ctx.State.OptimizerCalls);
+    }
+
     private static void RunDenseCase(
         MockGpuEngineScope ctx,
         string expectedBackendCall,
@@ -143,34 +159,53 @@ public sealed class GpuOptimizerResidencyMockTests
         MockGpuEngineScope ctx,
         string expectedBackendCall,
         Func<bool> run,
-        IReadOnlyList<Tensor<float>> allTensors,
+        IReadOnlyList<TrackedTensor> allTensors,
         IReadOnlyList<Tensor<float>> expectedUpdated)
     {
         ctx.State.OptimizerCalls.Clear();
-        var beforeVersion = new Dictionary<Tensor<float>, int>();
-        var beforeGpuVersion = new Dictionary<Tensor<float>, int>();
-        var beforeSync = new Dictionary<Tensor<float>, object>();
-        foreach (var tensor in allTensors)
-        {
-            beforeVersion[tensor] = tensor.Version;
-            beforeGpuVersion[tensor] = tensor._gpuBufferVersion;
-            beforeSync[tensor] = tensor.LastWriteSync;
-        }
+        var before = new TensorSnapshot[allTensors.Count];
+        for (int i = 0; i < allTensors.Count; i++)
+            before[i] = allTensors[i].Snapshot();
 
         Assert.True(run(), $"GpuOptimizer wrapper for {expectedBackendCall} should run against the mock GPU backend.");
         Assert.Contains(expectedBackendCall, ctx.State.OptimizerCalls);
 
-        var updatedSet = new HashSet<Tensor<float>>(expectedUpdated);
         foreach (var tensor in expectedUpdated)
-            AssertGpuMarkedCurrent(tensor, beforeVersion[tensor], expectedBackendCall);
-
-        foreach (var tensor in allTensors)
         {
-            if (updatedSet.Contains(tensor)) continue;
-            Assert.Equal(beforeVersion[tensor], tensor.Version);
-            Assert.Equal(beforeGpuVersion[tensor], tensor._gpuBufferVersion);
-            Assert.Same(beforeSync[tensor], tensor.LastWriteSync);
+            int trackedIndex = IndexOfTracked(allTensors, tensor);
+            Assert.True(trackedIndex >= 0, $"{expectedBackendCall}: expected updated tensor was not tracked.");
+            AssertGpuMarkedCurrent(tensor, before[trackedIndex].Version, expectedBackendCall);
         }
+
+        for (int i = 0; i < allTensors.Count; i++)
+        {
+            if (ContainsReference(expectedUpdated, allTensors[i].Instance)) continue;
+            Assert.Equal(before[i].Version, allTensors[i].Version);
+            Assert.Equal(before[i].GpuBufferVersion, allTensors[i].GpuBufferVersion);
+            Assert.Same(before[i].LastWriteSync, allTensors[i].LastWriteSync);
+        }
+    }
+
+    private static int IndexOfTracked(IReadOnlyList<TrackedTensor> tensors, object expected)
+    {
+        for (int i = 0; i < tensors.Count; i++)
+        {
+            if (ReferenceEquals(tensors[i].Instance, expected))
+                return i;
+        }
+
+        return -1;
+    }
+
+    private static bool ContainsReference(IReadOnlyList<Tensor<float>> tensors, object expected)
+        => IndexOfTracked(Select(tensors), expected) >= 0;
+
+    private static TrackedTensor[] Select(IReadOnlyList<Tensor<float>> tensors)
+    {
+        var tracked = new TrackedTensor[tensors.Count];
+        for (int i = 0; i < tensors.Count; i++)
+            tracked[i] = Track(tensors[i]);
+        return tracked;
     }
 
     private static Tensor<float>[] Select<TState>(TState state, Func<TState, Tensor<float>>[] selectors)
@@ -187,6 +222,47 @@ public sealed class GpuOptimizerResidencyMockTests
         Assert.Equal(tensor.Version, tensor._gpuBufferVersion);
         Assert.NotNull(tensor.LastWriteSync);
         Assert.True(tensor.LastWriteSync!.IsComplete, $"{caseName}: mock backend write sync should be complete.");
+    }
+
+    private static TrackedTensor Track<T>(Tensor<T> tensor) => new TrackedTensor(
+        tensor,
+        () => tensor.Version,
+        () => tensor._gpuBufferVersion,
+        () => tensor.LastWriteSync);
+
+    private sealed class TrackedTensor
+    {
+        private readonly Func<int> _version;
+        private readonly Func<int> _gpuBufferVersion;
+        private readonly Func<object> _lastWriteSync;
+
+        public TrackedTensor(object instance, Func<int> version, Func<int> gpuBufferVersion, Func<object> lastWriteSync)
+        {
+            Instance = instance;
+            _version = version;
+            _gpuBufferVersion = gpuBufferVersion;
+            _lastWriteSync = lastWriteSync;
+        }
+
+        public object Instance { get; }
+        public int Version => _version();
+        public int GpuBufferVersion => _gpuBufferVersion();
+        public object LastWriteSync => _lastWriteSync();
+        public TensorSnapshot Snapshot() => new TensorSnapshot(Version, GpuBufferVersion, LastWriteSync);
+    }
+
+    private readonly struct TensorSnapshot
+    {
+        public TensorSnapshot(int version, int gpuBufferVersion, object lastWriteSync)
+        {
+            Version = version;
+            GpuBufferVersion = gpuBufferVersion;
+            LastWriteSync = lastWriteSync;
+        }
+
+        public int Version { get; }
+        public int GpuBufferVersion { get; }
+        public object LastWriteSync { get; }
     }
 
     private static Tensor<float> GpuFloat(IDirectGpuBackend backend, int length = 4)
@@ -210,7 +286,7 @@ public sealed class GpuOptimizerResidencyMockTests
         public Tensor<float> AccumGrad { get; }
         public Tensor<float> AccumUpdate { get; }
         public Tensor<float> VMax { get; }
-        public Tensor<float>[] All { get; }
+        public TrackedTensor[] All { get; }
 
         public DenseTensors(IDirectGpuBackend backend)
         {
@@ -227,7 +303,7 @@ public sealed class GpuOptimizerResidencyMockTests
             AccumGrad = GpuFloat(backend);
             AccumUpdate = GpuFloat(backend);
             VMax = GpuFloat(backend);
-            All = new[] { P, G, M, V, U, Z, N, Velocity, Accum, SquaredAvg, AccumGrad, AccumUpdate, VMax };
+            All = new[] { Track(P), Track(G), Track(M), Track(V), Track(U), Track(Z), Track(N), Track(Velocity), Track(Accum), Track(SquaredAvg), Track(AccumGrad), Track(AccumUpdate), Track(VMax) };
         }
     }
 
@@ -247,7 +323,7 @@ public sealed class GpuOptimizerResidencyMockTests
         public Tensor<float> VMax { get; }
         public Tensor<int> Indices { get; }
         public Tensor<float> Values { get; }
-        public Tensor<float>[] All { get; }
+        public TrackedTensor[] All { get; }
 
         public SparseTensors(IDirectGpuBackend backend)
         {
@@ -265,7 +341,7 @@ public sealed class GpuOptimizerResidencyMockTests
             VMax = GpuFloat(backend);
             Indices = GpuInt(backend);
             Values = GpuFloat(backend);
-            All = new[] { P, M, V, U, Z, N, Velocity, Accum, SquaredAvg, AccumGrad, AccumUpdate, VMax, Values };
+            All = new[] { Track(P), Track(M), Track(V), Track(U), Track(Z), Track(N), Track(Velocity), Track(Accum), Track(SquaredAvg), Track(AccumGrad), Track(AccumUpdate), Track(VMax), Track(Indices), Track(Values) };
         }
     }
 

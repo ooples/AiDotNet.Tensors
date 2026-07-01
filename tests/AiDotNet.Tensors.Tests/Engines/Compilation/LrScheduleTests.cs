@@ -220,6 +220,25 @@ public class LrScheduleTests
         Assert.Equal(0.1, s.GetLr(1), 1e-12);
     }
 
+    [Theory]
+    [InlineData(WarmupDecayMode.Linear, 0)]
+    [InlineData(WarmupDecayMode.Linear, -1)]
+    [InlineData(WarmupDecayMode.Cosine, 0)]
+    [InlineData(WarmupDecayMode.Cosine, -1)]
+    public void LinearWarmup_ZeroWarmupAndNormalizedTotal_StartsAtLrMax(
+        WarmupDecayMode decayMode, int totalSteps)
+    {
+        var s = LrSchedule.LinearWarmup(
+            lrMax: 0.1,
+            warmupSteps: 0,
+            totalSteps: totalSteps,
+            warmupInitLr: 0.001,
+            decayMode: decayMode,
+            endLr: 0.01);
+
+        Assert.Equal(0.1, s.GetLr(1), 1e-12);
+    }
+
     [Fact]
     public void LinearWarmup_RejectsUndefinedDecayMode()
     {

@@ -2320,7 +2320,7 @@ public interface IDirectGpuBackend : IDisposable
     /// <param name="param">Parameters to update (in-place).</param>
     /// <param name="gradient">Gradient values.</param>
     /// <param name="learningRate">Learning rate.</param>
-    /// <param name="l1Strength">L1 shrinkage threshold.</param>
+    /// <param name="l1Strength">L1 regularization strength; shrinkage threshold is learningRate * l1Strength.</param>
     /// <param name="size">Number of parameters.</param>
     void ProximalL1Update(IGpuBuffer param, IGpuBuffer gradient,
         float learningRate, float l1Strength, int size);

@@ -490,17 +490,20 @@ public sealed partial class MetalBackend
     {
         ThrowIfDisposed();
 
-        var paramData = DownloadBuffer(param);
-        var gradData = DownloadBuffer(gradient);
+        if (param is not MetalGpuBuffer paramBuffer || gradient is not MetalGpuBuffer gradientBuffer)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
 
-        for (int i = 0; i < size; i++)
-        {
-            float tmp = paramData[i] - learningRate * gradData[i];
-            float mag = MathF.Abs(tmp) - l1Strength;
-            paramData[i] = mag > 0 ? MathF.Sign(tmp) * mag : 0f;
-        }
+        var pipeline = GetPipeline("Optimizer", _optimizerLibrary, "proximal_l1_update");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(size);
 
-        UploadToBuffer(param, paramData);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(paramBuffer, 0);
+        encoder.SetBuffer(gradientBuffer, 1);
+        encoder.SetBytes(learningRate, 2);
+        encoder.SetBytes(l1Strength, 3);
+        encoder.SetBytes((uint)size, 4);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
 
     #endregion

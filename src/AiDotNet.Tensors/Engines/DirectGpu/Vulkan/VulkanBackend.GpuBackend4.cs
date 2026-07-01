@@ -264,7 +264,7 @@ public sealed unsafe partial class VulkanBackend
         for (int i = 0; i < size; i++)
         {
             float tmp = p[i] - learningRate * g[i];
-            float mag = MathF.Abs(tmp) - l1Strength;
+            float mag = MathF.Abs(tmp) - learningRate * l1Strength;
             p[i] = mag > 0 ? MathF.Sign(tmp) * mag : 0f;
         }
         UploadToBuffer(p, param);

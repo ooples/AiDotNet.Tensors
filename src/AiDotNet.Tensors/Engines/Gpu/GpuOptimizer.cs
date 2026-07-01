@@ -158,6 +158,12 @@ public static class GpuOptimizer
     {
         if (p is null) throw new ArgumentNullException(nameof(p));
         if (g is null) throw new ArgumentNullException(nameof(g));
+        if (p.Length != g.Length)
+            throw new ArgumentException("param and grad must have the same length.", nameof(g));
+        if (float.IsNaN(lr) || float.IsInfinity(lr) || lr < 0f)
+            throw new ArgumentOutOfRangeException(nameof(lr), lr, "Learning rate must be finite and non-negative.");
+        if (float.IsNaN(l1Strength) || float.IsInfinity(l1Strength) || l1Strength < 0f)
+            throw new ArgumentOutOfRangeException(nameof(l1Strength), l1Strength, "L1 strength must be finite and non-negative.");
         if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false;
         var backend = e.GetBackend();
         if (backend is null) return false;

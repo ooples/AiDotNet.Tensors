@@ -1443,11 +1443,17 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // before eviction so any externally-held step output still has a valid CPU view after Step().
             if (stepActivationEngine is not null && stepActivationSnapshot >= 0)
             {
-                MaterializeStepLoss();
-                stepActivationEngine.EvictActivationsCreatedAfter(
-                    stepActivationSnapshot,
-                    BuildStepEvictionProtectSet(),
-                    materializePending: true);
+                try
+                {
+                    MaterializeStepLoss();
+                }
+                finally
+                {
+                    stepActivationEngine.EvictActivationsCreatedAfter(
+                        stepActivationSnapshot,
+                        BuildStepEvictionProtectSet(),
+                        materializePending: true);
+                }
             }
             // Bound cross-step VRAM growth: per-step transient activation buffers are dereferenced
             // here but their device memory is only released by the GC finalizer, which cannot keep

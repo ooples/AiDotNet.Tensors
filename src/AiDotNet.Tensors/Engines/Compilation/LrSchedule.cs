@@ -354,7 +354,8 @@ internal sealed class LinearWarmupLr : LrSchedule
         // — _currentStep is (batch - 1) and Step() floors with _minLearningRate = endLr.
         // The 1-indexed fused step maps batch n → GetLr(n); reproduce both branches so the
         // per-step LR is bit-identical to the eager replay (FusedLrScheduleMappingTests).
-        if (_warmupSteps > 0 && step <= 1) return _warmupInitLr;
+        if (step <= 1)
+            return _warmupSteps > 0 ? _warmupInitLr : _lrMax;
         double raw = ComputeRaw(step - 1);
         return raw > _endLr ? raw : _endLr;
     }

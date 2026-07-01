@@ -11447,7 +11447,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     /// <summary>
     /// Proximal gradient (ISTA) step with L1 soft-threshold prox, in place on the GPU:
-    /// <c>tmp = param - lr*grad; param = sign(tmp)*max(|tmp| - l1Strength, 0)</c>.
+    /// <c>tmp = param - lr*grad; param = sign(tmp)*max(|tmp| - lr*l1Strength, 0)</c>.
     /// </summary>
     public unsafe void ProximalL1Update(IGpuBuffer param, IGpuBuffer gradient,
         float learningRate, float l1Strength, int size)

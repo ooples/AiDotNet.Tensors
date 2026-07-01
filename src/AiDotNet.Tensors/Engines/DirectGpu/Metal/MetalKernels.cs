@@ -3873,6 +3873,27 @@ kernel void lion_update(
     }
 }
 
+// Proximal gradient (ISTA) update with L1 soft-thresholding.
+kernel void proximal_l1_update(
+    device float* param [[buffer(0)]],
+    device const float* grad [[buffer(1)]],
+    constant float& lr [[buffer(2)]],
+    constant float& l1_strength [[buffer(3)]],
+    constant uint& size [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < size) {
+        float tmp = param[gid] - lr * grad[gid];
+        float mag = abs(tmp) - lr * l1_strength;
+        if (mag <= 0.0f) {
+            param[gid] = 0.0f;
+        } else {
+            float sign_tmp = (tmp > 0.0f) ? 1.0f : -1.0f;
+            param[gid] = sign_tmp * mag;
+        }
+    }
+}
+
 // Gradient clipping by norm
 kernel void clip_grad_norm(
     device float* grad [[buffer(0)]],

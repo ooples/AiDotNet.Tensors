@@ -425,7 +425,7 @@ extern ""C"" __global__ __launch_bounds__(256) void proximal_l1_update(
     if (idx >= size) return;
 
     float tmp = param[idx] - learningRate * gradient[idx];
-    float mag = fabsf(tmp) - l1Strength;
+    float mag = fabsf(tmp) - (learningRate * l1Strength);
     if (mag <= 0.0f) {
         param[idx] = 0.0f;
     } else {

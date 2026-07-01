@@ -1184,7 +1184,7 @@ fn proximal_l1(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < opt_params.size) {
         let tmp = params_arr[idx] - opt_params.lr * gradients[idx];
-        let mag = abs(tmp) - opt_params.beta1;
+        let mag = abs(tmp) - (opt_params.lr * opt_params.beta1);
         if (mag <= 0.0) {
             params_arr[idx] = 0.0;
         } else {
