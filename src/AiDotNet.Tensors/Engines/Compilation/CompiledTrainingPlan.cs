@@ -1439,19 +1439,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             evictGuard?.ResumeActivationEviction();
             // Release this step's dead transient activations/grads/scratch. The optimizer has already read
-            // _gradients; protect the public parameter-gradient tensors and materialize only the returned loss.
+            // _gradients; protect the public parameter-gradient tensors and always materialize pending downloads
+            // before eviction so any externally-held step output still has a valid CPU view after Step().
             if (stepActivationEngine is not null && stepActivationSnapshot >= 0)
             {
-                // FULL-RESIDENCY: the ONLY value the caller reads from a step is the scalar loss (the returned
-                // tensor). Materialize just that (one tiny GPU→CPU copy) and DISCARD every other dead step
-                // intermediate without a download — so a training step's only host transfer is the loss readout
-                // (the activations / gradients / optimizer state never round-trip). The next step's Execute
-                // recomputes the node outputs; reading any non-loss output after Step() is not part of its contract.
                 MaterializeStepLoss();
                 stepActivationEngine.EvictActivationsCreatedAfter(
                     stepActivationSnapshot,
                     BuildStepEvictionProtectSet(),
-                    materializePending: false);
+                    materializePending: true);
             }
             // Bound cross-step VRAM growth: per-step transient activation buffers are dereferenced
             // here but their device memory is only released by the GC finalizer, which cannot keep

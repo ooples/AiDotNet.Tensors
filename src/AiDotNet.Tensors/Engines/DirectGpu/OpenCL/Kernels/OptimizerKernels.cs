@@ -605,6 +605,31 @@ __kernel void sgd_update(
 
     param[idx] -= learningRate * grad;
 }
+
+// ---------------------------------------------------------------------------
+// Proximal gradient (ISTA) update with L1 soft-thresholding
+// Formula: tmp = param - lr * grad
+//          param = sign(tmp) * max(abs(tmp) - l1Strength, 0)
+// ---------------------------------------------------------------------------
+__kernel void proximal_l1_update(
+    __global float* param,
+    __global const float* gradient,
+    const float learningRate,
+    const float l1Strength,
+    const int size)
+{
+    const int idx = get_global_id(0);
+    if (idx >= size) return;
+
+    float tmp = param[idx] - learningRate * gradient[idx];
+    float mag = fabs(tmp) - l1Strength;
+    if (mag <= 0.0f) {
+        param[idx] = 0.0f;
+    } else {
+        float signTmp = (tmp > 0.0f) ? 1.0f : -1.0f;
+        param[idx] = signTmp * mag;
+    }
+}
 ";
     }
 
@@ -629,7 +654,8 @@ __kernel void sgd_update(
             "adamax_update",
             "lion_update",
             "nadam_update",
-            "ftrl_update"
+            "ftrl_update",
+            "proximal_l1_update"
         };
     }
 }

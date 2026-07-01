@@ -54,6 +54,7 @@
 
   <!-- ZipArchive needs an explicit reference on net471. -->
   <ItemGroup Condition="'$(TargetFramework)' == 'net471'">
+    <PackageReference Include="System.Reflection.DispatchProxy" Version="4.7.1" />
     <Reference Include="System.IO.Compression" />
     <Reference Include="System.IO.Compression.FileSystem" />
   </ItemGroup>

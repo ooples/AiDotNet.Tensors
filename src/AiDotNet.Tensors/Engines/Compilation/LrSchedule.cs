@@ -332,6 +332,8 @@ internal sealed class LinearWarmupLr : LrSchedule
         double warmupInitLr, WarmupDecayMode decayMode, double endLr)
     {
         if (warmupSteps < 0) throw new ArgumentOutOfRangeException(nameof(warmupSteps));
+        if (!Enum.IsDefined(typeof(WarmupDecayMode), decayMode))
+            throw new ArgumentOutOfRangeException(nameof(decayMode), decayMode, "Undefined warmup decay mode.");
         int normalizedTotalSteps = totalSteps > 0 ? totalSteps : warmupSteps;
         if (decayMode != WarmupDecayMode.Constant && normalizedTotalSteps < warmupSteps)
             throw new ArgumentOutOfRangeException(nameof(totalSteps),
@@ -352,7 +354,7 @@ internal sealed class LinearWarmupLr : LrSchedule
         // — _currentStep is (batch - 1) and Step() floors with _minLearningRate = endLr.
         // The 1-indexed fused step maps batch n → GetLr(n); reproduce both branches so the
         // per-step LR is bit-identical to the eager replay (FusedLrScheduleMappingTests).
-        if (step <= 1) return _warmupInitLr;
+        if (_warmupSteps > 0 && step <= 1) return _warmupInitLr;
         double raw = ComputeRaw(step - 1);
         return raw > _endLr ? raw : _endLr;
     }

@@ -1,6 +1,5 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
-#if !NETFRAMEWORK
 #nullable disable
 
 using System;
@@ -29,6 +28,9 @@ public sealed class GpuOptimizerResidencyMockTests
             t => t.P, t => t.M, t => t.V);
         RunDenseCase(ctx, "SgdUpdate",
             t => GpuOptimizer.TrySgdStep(t.P, t.G, 0.01f),
+            t => t.P);
+        RunDenseCase(ctx, "ProximalL1Update",
+            t => GpuOptimizer.TryProximalL1Step(t.P, t.G, 0.01f, 0.1f),
             t => t.P);
         RunDenseCase(ctx, "SgdMomentumUpdate",
             t => GpuOptimizer.TrySgdMomentumStep(t.P, t.G, t.Velocity, 0.01f, 0.9f, 0f),
@@ -124,7 +126,7 @@ public sealed class GpuOptimizerResidencyMockTests
         params Func<DenseTensors, Tensor<float>>[] updatedSelectors)
     {
         var tensors = new DenseTensors(ctx.Backend);
-        RunCase(ctx, expectedBackendCall, () => run(tensors), tensors.G, tensors.All, Select(tensors, updatedSelectors));
+        RunCase(ctx, expectedBackendCall, () => run(tensors), tensors.All, Select(tensors, updatedSelectors));
     }
 
     private static void RunSparseCase(
@@ -134,31 +136,41 @@ public sealed class GpuOptimizerResidencyMockTests
         params Func<SparseTensors, Tensor<float>>[] updatedSelectors)
     {
         var tensors = new SparseTensors(ctx.Backend);
-        RunCase(ctx, expectedBackendCall, () => run(tensors), tensors.Values, tensors.All, Select(tensors, updatedSelectors));
+        RunCase(ctx, expectedBackendCall, () => run(tensors), tensors.All, Select(tensors, updatedSelectors));
     }
 
     private static void RunCase(
         MockGpuEngineScope ctx,
         string expectedBackendCall,
         Func<bool> run,
-        Tensor<float> gradientTensor,
         IReadOnlyList<Tensor<float>> allTensors,
         IReadOnlyList<Tensor<float>> expectedUpdated)
     {
         ctx.State.OptimizerCalls.Clear();
-        var before = new Dictionary<Tensor<float>, int>();
+        var beforeVersion = new Dictionary<Tensor<float>, int>();
+        var beforeGpuVersion = new Dictionary<Tensor<float>, int>();
+        var beforeSync = new Dictionary<Tensor<float>, object>();
         foreach (var tensor in allTensors)
-            before[tensor] = tensor.Version;
+        {
+            beforeVersion[tensor] = tensor.Version;
+            beforeGpuVersion[tensor] = tensor._gpuBufferVersion;
+            beforeSync[tensor] = tensor.LastWriteSync;
+        }
 
         Assert.True(run(), $"GpuOptimizer wrapper for {expectedBackendCall} should run against the mock GPU backend.");
         Assert.Contains(expectedBackendCall, ctx.State.OptimizerCalls);
 
         var updatedSet = new HashSet<Tensor<float>>(expectedUpdated);
         foreach (var tensor in expectedUpdated)
-            AssertGpuMarkedCurrent(tensor, before[tensor], expectedBackendCall);
+            AssertGpuMarkedCurrent(tensor, beforeVersion[tensor], expectedBackendCall);
 
-        Assert.DoesNotContain(gradientTensor, updatedSet);
-        Assert.Equal(before[gradientTensor], gradientTensor.Version);
+        foreach (var tensor in allTensors)
+        {
+            if (updatedSet.Contains(tensor)) continue;
+            Assert.Equal(beforeVersion[tensor], tensor.Version);
+            Assert.Equal(beforeGpuVersion[tensor], tensor._gpuBufferVersion);
+            Assert.Same(beforeSync[tensor], tensor.LastWriteSync);
+        }
     }
 
     private static Tensor<float>[] Select<TState>(TState state, Func<TState, Tensor<float>>[] selectors)
@@ -269,7 +281,7 @@ public sealed class GpuOptimizerResidencyMockTests
         {
             _priorEngine = AiDotNetEngine.Current;
             _priorBackendEnv = Environment.GetEnvironmentVariable("AIDOTNET_DIRECTGPU_BACKENDS");
-            Environment.SetEnvironmentVariable("AIDOTNET_DIRECTGPU_BACKENDS", "mock-unavailable");
+            Environment.SetEnvironmentVariable("AIDOTNET_DIRECTGPU_BACKENDS", "none");
             var directGpu = new DirectGpuEngine();
             Environment.SetEnvironmentVariable("AIDOTNET_DIRECTGPU_BACKENDS", _priorBackendEnv);
 
@@ -296,4 +308,3 @@ public sealed class GpuOptimizerResidencyMockTests
         }
     }
 }
-#endif

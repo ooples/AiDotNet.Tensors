@@ -62,6 +62,10 @@ public sealed class CortexTransformerMemoryReproTests
             }
 
             double pL1Before = ParamL1(parameters);
+            float[][] parameterSnapshot = SnapshotParameters(parameters);
+            long memoryBaselineBytes = GpuMemoryTracker.LiveBytes;
+            GpuMemoryTracker.ResetPeak();
+
             ICompiledTrainingPlan<float> plan;
             using (var scope = GraphMode.Enable())
             {
@@ -107,16 +111,19 @@ public sealed class CortexTransformerMemoryReproTests
                     lastLoss = loss.AsSpan()[0];
                     _output.WriteLine($"step {step + 1}/{steps}: loss={lastLoss:G9}");
                     _output.WriteLine(GpuMemoryTracker.Report(topN: 12));
-                    AssertMemoryEnvelope(maxLiveMb, maxPeakMb);
+                    AssertMemoryEnvelope(maxLiveMb, maxPeakMb, memoryBaselineBytes);
                 }
 
                 double pL1After = ParamL1(parameters);
                 double delta = Math.Abs(pL1After - pL1Before);
-                _output.WriteLine($"pL1 before={pL1Before:F6} after={pL1After:F6} delta={delta:G9}");
+                double maxElementDelta = MaxParameterDelta(parameters, parameterSnapshot);
+                _output.WriteLine(
+                    $"pL1 before={pL1Before:F6} after={pL1After:F6} delta={delta:G9}; maxElementDelta={maxElementDelta:G9}");
 
                 Assert.True(!float.IsNaN(lastLoss) && !float.IsInfinity(lastLoss),
                     $"compiled step returned non-finite loss: {lastLoss}");
-                Assert.True(delta > 1e-6, $"parameters did not move; pL1 delta={delta:G9}");
+                Assert.True(maxElementDelta > 1e-7,
+                    $"parameters did not move; max element delta={maxElementDelta:G9}, pL1 delta={delta:G9}");
             }
         }
         finally
@@ -149,20 +156,42 @@ public sealed class CortexTransformerMemoryReproTests
 
     private static Tensor<float> Zeros(int[] shape) => new(shape);
 
-    private static void AssertMemoryEnvelope(int maxLiveMb, int maxPeakMb)
+    private static void AssertMemoryEnvelope(int maxLiveMb, int maxPeakMb, long baselineLiveBytes)
     {
         const long bytesPerMiB = 1024L * 1024L;
         if (maxLiveMb > 0)
         {
-            double liveMb = GpuMemoryTracker.LiveBytes / (double)bytesPerMiB;
+            double liveMb = Math.Max(0L, GpuMemoryTracker.LiveBytes - baselineLiveBytes) / (double)bytesPerMiB;
             Assert.True(liveMb <= maxLiveMb, $"GPU live memory {liveMb:F1} MiB exceeded {maxLiveMb} MiB.");
         }
 
         if (maxPeakMb > 0)
         {
-            double peakMb = GpuMemoryTracker.PeakBytes / (double)bytesPerMiB;
+            double peakMb = Math.Max(0L, GpuMemoryTracker.PeakBytes - baselineLiveBytes) / (double)bytesPerMiB;
             Assert.True(peakMb <= maxPeakMb, $"GPU peak memory {peakMb:F1} MiB exceeded {maxPeakMb} MiB.");
         }
+    }
+
+    private static float[][] SnapshotParameters(Tensor<float>[] parameters)
+    {
+        var snapshot = new float[parameters.Length][];
+        for (int i = 0; i < parameters.Length; i++)
+            snapshot[i] = parameters[i].AsSpan().ToArray();
+        return snapshot;
+    }
+
+    private static double MaxParameterDelta(Tensor<float>[] parameters, float[][] before)
+    {
+        double maxDelta = 0;
+        for (int p = 0; p < parameters.Length; p++)
+        {
+            var after = parameters[p].AsSpan();
+            Assert.Equal(before[p].Length, after.Length);
+            for (int i = 0; i < after.Length; i++)
+                maxDelta = Math.Max(maxDelta, Math.Abs(after[i] - before[p][i]));
+        }
+
+        return maxDelta;
     }
 
     private static double ParamL1(Tensor<float>[] parameters)

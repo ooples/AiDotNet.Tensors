@@ -4,12 +4,9 @@
 // and throws NotImplementedException for everything else. Sidesteps the
 // 470-member interface surface that would require a hand-written stub.
 //
-// DispatchProxy lives in System.Reflection from .NET Core 5+; it is NOT
-// available on .NET Framework, so the whole mock + its tests are gated
-// to non-Framework targets. Coverage on net10.0 is the meaningful one
-// for codecov.
-
-#if !NETFRAMEWORK
+// DispatchProxy is provided to net471 by the test project's
+// System.Reflection.DispatchProxy reference so this mock compiles on every
+// target framework the test project builds.
 #nullable disable
 
 using System;
@@ -147,6 +144,7 @@ public class MockDirectGpuBackend : DispatchProxy
             case "RmspropUpdate":
             case "AdagradUpdate":
             case "NagUpdate":
+            case "ProximalL1Update":
             case "LarsUpdate":
             case "LambUpdate":
             case "AdadeltaUpdate":
@@ -177,4 +175,3 @@ public class MockDirectGpuBackend : DispatchProxy
             "Add a case in MockDirectGpuBackend.Invoke if your test exercises this op.");
     }
 }
-#endif

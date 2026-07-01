@@ -482,5 +482,26 @@ public sealed partial class MetalBackend
         UploadToBuffer(n, nData);
     }
 
+    /// <summary>
+    /// Proximal gradient (ISTA) update with L1 soft-thresholding.
+    /// </summary>
+    public void ProximalL1Update(IGpuBuffer param, IGpuBuffer gradient,
+        float learningRate, float l1Strength, int size)
+    {
+        ThrowIfDisposed();
+
+        var paramData = DownloadBuffer(param);
+        var gradData = DownloadBuffer(gradient);
+
+        for (int i = 0; i < size; i++)
+        {
+            float tmp = paramData[i] - learningRate * gradData[i];
+            float mag = MathF.Abs(tmp) - l1Strength;
+            paramData[i] = mag > 0 ? MathF.Sign(tmp) * mag : 0f;
+        }
+
+        UploadToBuffer(param, paramData);
+    }
+
     #endregion
 }

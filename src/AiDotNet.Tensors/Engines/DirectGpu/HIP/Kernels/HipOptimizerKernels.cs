@@ -413,6 +413,26 @@ extern ""C"" __global__ __launch_bounds__(256) void ftrl_update(
         param[idx] = -zSign * (zAbs - l1Reg) / denom;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Proximal gradient (ISTA) update with L1 soft-thresholding
+// ---------------------------------------------------------------------------
+extern ""C"" __global__ __launch_bounds__(256) void proximal_l1_update(
+    float* param, const float* gradient,
+    float learningRate, float l1Strength, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+
+    float tmp = param[idx] - learningRate * gradient[idx];
+    float mag = fabsf(tmp) - l1Strength;
+    if (mag <= 0.0f) {
+        param[idx] = 0.0f;
+    } else {
+        float signTmp = (tmp > 0.0f) ? 1.0f : -1.0f;
+        param[idx] = signTmp * mag;
+    }
+}
 ";
     }
 
@@ -437,7 +457,8 @@ extern ""C"" __global__ __launch_bounds__(256) void ftrl_update(
             "adamax_update",
             "lion_update",
             "nadam_update",
-            "ftrl_update"
+            "ftrl_update",
+            "proximal_l1_update"
         };
     }
 }
