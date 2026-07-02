@@ -415,4 +415,13 @@ internal sealed class LinearWarmupLr : LrSchedule
         double cos = (1.0 + System.Math.Cos(System.Math.PI * progress)) / 2.0;
         return _endLr + (_lrMax - _endLr) * cos;
     }
+
+    // Was the ONE built-in schedule with no checkpoint capture, so a compiled plan using it lost its
+    // schedule on resume (base default returns null → serialization rejects/drops it). Capture the full
+    // parameter set (incl. warmupInitLr, endLr and the decay mode) so the restored LR sequence is
+    // bit-identical. _totalSteps is already the ctor-normalized value.
+    internal override FusedLrScheduleCheckpoint? TryCaptureCheckpoint()
+        => new(FusedLrScheduleKind.LinearWarmupDecay,
+            new[] { _lrMax, _warmupInitLr, _endLr },
+            new[] { _warmupSteps, _totalSteps, (int)_decayMode });
 }

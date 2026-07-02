@@ -371,4 +371,35 @@ public class LrScheduleTests
         Assert.Throws<System.ArgumentOutOfRangeException>(() => LrSchedule.Noam(modelDimension: 64, warmupSteps: 0));
         Assert.Throws<System.ArgumentOutOfRangeException>(() => LrSchedule.Noam(modelDimension: 64, warmupSteps: 10, factor: 0.0));
     }
+
+    // #719: the built-in LinearWarmup schedule was the ONE built-in with no checkpoint capture
+    // (inherited the base null), so a compiled plan using it lost its schedule on resume. Verify
+    // the captured checkpoint restores a bit-identical LR sequence across warmup + every decay mode.
+    [Theory]
+    [InlineData(WarmupDecayMode.Constant)]
+    [InlineData(WarmupDecayMode.Linear)]
+    [InlineData(WarmupDecayMode.Cosine)]
+    public void LinearWarmup_CheckpointRoundTrip_RestoresIdenticalLrSequence(WarmupDecayMode mode)
+    {
+        var original = LrSchedule.LinearWarmup(
+            lrMax: 0.01, warmupSteps: 5, totalSteps: 30,
+            warmupInitLr: 1e-4, decayMode: mode, endLr: 1e-5);
+
+        var checkpoint = original.TryCaptureCheckpoint();
+        Assert.NotNull(checkpoint);
+
+        var restored = checkpoint!.ToSchedule();
+        for (int step = 1; step <= 35; step++)
+            Assert.Equal(original.GetLr(step), restored.GetLr(step), 12);
+    }
+
+    // #719: a malformed schedule payload (too few doubles/ints for its kind) must fail loudly at
+    // load via Validate() instead of throwing IndexOutOfRange deep inside GetLr mid-training.
+    [Fact]
+    public void RestoredLrSchedule_RejectsMalformedArity()
+    {
+        var bad = new FusedLrScheduleCheckpoint(
+            FusedLrScheduleKind.LinearWarmupDecay, new[] { 0.01 }, new[] { 5 });
+        Assert.Throws<System.IO.InvalidDataException>(() => bad.ToSchedule());
+    }
 }

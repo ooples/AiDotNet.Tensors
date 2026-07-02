@@ -1250,7 +1250,7 @@ struct OptimizerParams {
     beta2: f32,
     epsilon: f32,
     weight_decay: f32,
-    t: f32,
+    t: u32,
 }
 @group(0) @binding(4) var<uniform> opt_params: OptimizerParams;
 
@@ -1318,7 +1318,7 @@ fn adam_bf16(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (opt_params.weight_decay > 0.0) {
         grad = grad + opt_params.weight_decay * params_arr[idx];
     }
-    let first_step = opt_params.t <= 1.0;
+    let first_step = opt_params.t <= 1u;
     let old_m = select(bf16_to_float(load_m(idx)), 0.0, first_step);
     let old_v = select(bf16_to_float(load_v(idx)), 0.0, first_step);
     let m_new = opt_params.beta1 * old_m + (1.0 - opt_params.beta1) * grad;
@@ -1326,8 +1326,8 @@ fn adam_bf16(@builtin(global_invocation_id) gid: vec3<u32>) {
     store_m(idx, float_to_bf16_rne(m_new));
     store_v(idx, float_to_bf16_rne(v_new));
 
-    let m_hat = m_new / (1.0 - pow(opt_params.beta1, opt_params.t));
-    let v_hat = v_new / (1.0 - pow(opt_params.beta2, opt_params.t));
+    let m_hat = m_new / (1.0 - pow(opt_params.beta1, f32(opt_params.t)));
+    let v_hat = v_new / (1.0 - pow(opt_params.beta2, f32(opt_params.t)));
     params_arr[idx] = params_arr[idx] - opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
 }
 
@@ -1343,7 +1343,7 @@ fn adamw_bf16(@builtin(global_invocation_id) gid: vec3<u32>) {
         params_arr[idx] = params_arr[idx] * (1.0 - opt_params.lr * opt_params.weight_decay);
     }
 
-    let first_step = opt_params.t <= 1.0;
+    let first_step = opt_params.t <= 1u;
     let old_m = select(bf16_to_float(load_m(idx)), 0.0, first_step);
     let old_v = select(bf16_to_float(load_v(idx)), 0.0, first_step);
     let m_new = opt_params.beta1 * old_m + (1.0 - opt_params.beta1) * grad;
@@ -1351,8 +1351,8 @@ fn adamw_bf16(@builtin(global_invocation_id) gid: vec3<u32>) {
     store_m(idx, float_to_bf16_rne(m_new));
     store_v(idx, float_to_bf16_rne(v_new));
 
-    let m_hat = m_new / (1.0 - pow(opt_params.beta1, opt_params.t));
-    let v_hat = v_new / (1.0 - pow(opt_params.beta2, opt_params.t));
+    let m_hat = m_new / (1.0 - pow(opt_params.beta1, f32(opt_params.t)));
+    let v_hat = v_new / (1.0 - pow(opt_params.beta2, f32(opt_params.t)));
     params_arr[idx] = params_arr[idx] - opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
 }
 ";

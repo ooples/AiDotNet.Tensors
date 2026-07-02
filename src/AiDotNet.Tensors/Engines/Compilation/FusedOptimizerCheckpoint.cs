@@ -9,7 +9,8 @@ internal enum FusedLrScheduleKind
     Exponential = 5,
     Step = 6,
     Cyclic = 7,
-    LinearWarmupCosine = 8
+    LinearWarmupCosine = 8,
+    LinearWarmupDecay = 9
 }
 
 internal sealed class FusedLrScheduleCheckpoint
@@ -29,7 +30,38 @@ internal sealed class FusedLrScheduleCheckpoint
         Ints = ints;
     }
 
-    public LrSchedule ToSchedule() => new RestoredLrSchedule(Kind, Doubles, Ints);
+    public LrSchedule ToSchedule()
+    {
+        Validate();
+        return new RestoredLrSchedule(Kind, Doubles, Ints);
+    }
+
+    /// <summary>
+    /// Rejects an unknown <see cref="Kind"/> or a payload with too few Doubles/Ints for that kind,
+    /// so a malformed checkpoint fails loudly at restore instead of throwing IndexOutOfRange deep
+    /// inside <c>GetLr</c> mid-training (or silently restoring an invalid schedule).
+    /// </summary>
+    public void Validate()
+    {
+        (int reqD, int reqI) = Kind switch
+        {
+            FusedLrScheduleKind.Constant => (1, 0),
+            FusedLrScheduleKind.NoamScaled => (2, 0),
+            FusedLrScheduleKind.Cosine => (2, 1),
+            FusedLrScheduleKind.OneCycleResolved => (3, 2),
+            FusedLrScheduleKind.Exponential => (2, 0),
+            FusedLrScheduleKind.Step => (2, 1),
+            FusedLrScheduleKind.Cyclic => (2, 1),
+            FusedLrScheduleKind.LinearWarmupCosine => (2, 2),
+            FusedLrScheduleKind.LinearWarmupDecay => (3, 3),
+            _ => throw new System.IO.InvalidDataException(
+                $"Unknown serialized LR schedule kind {(int)Kind}."),
+        };
+        if (Doubles.Length < reqD || Ints.Length < reqI)
+            throw new System.IO.InvalidDataException(
+                $"Serialized LR schedule kind {Kind} requires at least {reqD} double(s) and {reqI} int(s); " +
+                $"got {Doubles.Length} double(s) and {Ints.Length} int(s).");
+    }
 
     private sealed class RestoredLrSchedule : LrSchedule
     {
@@ -57,8 +89,40 @@ internal sealed class FusedLrScheduleCheckpoint
                 FusedLrScheduleKind.Step => _d[0] * System.Math.Pow(_d[1], System.Math.Max(0, s - 1) / _i[0]),
                 FusedLrScheduleKind.Cyclic => Cyclic(s),
                 FusedLrScheduleKind.LinearWarmupCosine => LinearWarmupCosine(s),
+                FusedLrScheduleKind.LinearWarmupDecay => LinearWarmupDecay(s),
                 _ => throw new NotSupportedException($"Unsupported serialized LR schedule kind '{_kind}'."),
             };
+        }
+
+        // Faithful restore of LinearWarmupLr.GetLr — must stay bit-identical to that eager formula
+        // (FusedLrScheduleMappingTests). _d = [lrMax, warmupInitLr, endLr]; _i = [warmupSteps,
+        // totalSteps(normalized), (int)WarmupDecayMode].
+        private double LinearWarmupDecay(int step)
+        {
+            double lrMax = _d[0], warmupInit = _d[1], endLr = _d[2];
+            int warmup = _i[0];
+            if (step <= 1) return warmup > 0 ? warmupInit : lrMax;
+            double raw = LinearWarmupRaw(step - 1, lrMax, warmupInit, endLr, warmup, _i[1], (WarmupDecayMode)_i[2]);
+            return raw > endLr ? raw : endLr;
+        }
+
+        private static double LinearWarmupRaw(
+            int t, double lrMax, double warmupInit, double endLr, int warmupSteps, int totalSteps, WarmupDecayMode mode)
+        {
+            if (t < warmupSteps)
+            {
+                if (warmupSteps == 0) return lrMax;
+                return warmupInit + (lrMax - warmupInit) * ((double)t / warmupSteps);
+            }
+            if (mode == WarmupDecayMode.Constant) return lrMax;
+            int decaySteps = totalSteps - warmupSteps;
+            int decayStep = t - warmupSteps;
+            if (decayStep >= decaySteps) return endLr;
+            double progress = (double)decayStep / decaySteps;
+            if (mode == WarmupDecayMode.Linear)
+                return lrMax - (lrMax - endLr) * progress;
+            double cos = (1.0 + System.Math.Cos(System.Math.PI * progress)) / 2.0;
+            return endLr + (lrMax - endLr) * cos;
         }
 
         internal override FusedLrScheduleCheckpoint? TryCaptureCheckpoint()

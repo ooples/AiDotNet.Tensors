@@ -54,6 +54,10 @@ internal static class FusedOptimizerCheckpointSerializer
         int paramCount = reader.ReadInt32();
         if (paramCount < 0)
             throw new InvalidDataException($"Fused optimizer parameter-state count {paramCount} cannot be negative.");
+        // Each parameter state writes at least 12 array-length prefixes (4 bytes each) even when every
+        // array is null, so bound the count against the remaining stream before allocating — a corrupt
+        // count (e.g. 0x7FFFFFFF) would otherwise allocate a multi-GB array up front.
+        EnsureFitsRemaining(reader, (long)paramCount * (12 * sizeof(int)), "parameter-state array");
         checkpoint.Parameters = new FusedOptimizerParameterCheckpoint[paramCount];
         for (int i = 0; i < paramCount; i++)
             checkpoint.Parameters[i] = ReadParameter(reader);
@@ -119,6 +123,8 @@ internal static class FusedOptimizerCheckpointSerializer
         int count = reader.ReadInt32();
         if (count < 0)
             throw new InvalidDataException($"Fused optimizer LR schedule count {count} cannot be negative.");
+        // Each schedule writes kind(4) + a double[] + an int[] (>= 4 bytes each) → >= 12 bytes.
+        EnsureFitsRemaining(reader, (long)count * (sizeof(int) + 2 * sizeof(int)), "LR schedule");
         var schedules = new FusedLrScheduleCheckpoint[count];
         for (int i = 0; i < count; i++)
         {
@@ -128,6 +134,9 @@ internal static class FusedOptimizerCheckpointSerializer
                 Doubles = ReadDoubleArray(reader) ?? System.Array.Empty<double>(),
                 Ints = ReadIntArray(reader) ?? System.Array.Empty<int>(),
             };
+            // Reject unknown kinds / wrong arity now, so a malformed schedule fails at load rather
+            // than throwing IndexOutOfRange deep inside GetLr mid-training.
+            schedules[i].Validate();
         }
         return schedules;
     }
@@ -191,7 +200,7 @@ internal static class FusedOptimizerCheckpointSerializer
 
     private static float[]? ReadFloatArray(BinaryReader reader)
     {
-        int length = ReadArrayLength(reader, "float[]");
+        int length = ReadArrayLength(reader, "float[]", sizeof(float));
         if (length < 0) return null;
         var values = new float[length];
         for (int i = 0; i < length; i++) values[i] = reader.ReadSingle();
@@ -207,7 +216,7 @@ internal static class FusedOptimizerCheckpointSerializer
 
     private static double[]? ReadDoubleArray(BinaryReader reader)
     {
-        int length = ReadArrayLength(reader, "double[]");
+        int length = ReadArrayLength(reader, "double[]", sizeof(double));
         if (length < 0) return null;
         var values = new double[length];
         for (int i = 0; i < length; i++) values[i] = reader.ReadDouble();
@@ -223,7 +232,7 @@ internal static class FusedOptimizerCheckpointSerializer
 
     private static int[]? ReadIntArray(BinaryReader reader)
     {
-        int length = ReadArrayLength(reader, "int[]");
+        int length = ReadArrayLength(reader, "int[]", sizeof(int));
         if (length < 0) return null;
         var values = new int[length];
         for (int i = 0; i < length; i++) values[i] = reader.ReadInt32();
@@ -239,7 +248,7 @@ internal static class FusedOptimizerCheckpointSerializer
 
     private static ushort[]? ReadUShortArray(BinaryReader reader)
     {
-        int length = ReadArrayLength(reader, "ushort[]");
+        int length = ReadArrayLength(reader, "ushort[]", sizeof(ushort));
         if (length < 0) return null;
         var values = new ushort[length];
         for (int i = 0; i < length; i++) values[i] = reader.ReadUInt16();
@@ -255,7 +264,7 @@ internal static class FusedOptimizerCheckpointSerializer
 
     private static byte[]? ReadByteArray(BinaryReader reader)
     {
-        int length = ReadArrayLength(reader, "byte[]");
+        int length = ReadArrayLength(reader, "byte[]", 1);
         if (length < 0) return null;
         var values = reader.ReadBytes(length);
         if (values.Length != length)
@@ -264,11 +273,30 @@ internal static class FusedOptimizerCheckpointSerializer
         return values;
     }
 
-    private static int ReadArrayLength(BinaryReader reader, string field)
+    private static int ReadArrayLength(BinaryReader reader, string field, int bytesPerElement)
     {
         int length = reader.ReadInt32();
         if (length < -1)
             throw new InvalidDataException($"Fused optimizer {field} length {length} is invalid.");
+        if (length > 0)
+            EnsureFitsRemaining(reader, (long)length * bytesPerElement, field);
         return length;
+    }
+
+    /// <summary>
+    /// Guards against a corrupt/truncated checkpoint claiming an element count whose payload can't
+    /// fit the remaining stream — allocating for it first would let a bad file OOM the process. Only
+    /// enforceable on a seekable stream; on a non-seekable stream the per-element reads still fail on
+    /// EOF, just without the up-front allocation guard.
+    /// </summary>
+    private static void EnsureFitsRemaining(BinaryReader reader, long requiredBytes, string field)
+    {
+        var stream = reader.BaseStream;
+        if (!stream.CanSeek) return;
+        long remaining = stream.Length - stream.Position;
+        if (requiredBytes > remaining)
+            throw new InvalidDataException(
+                $"Fused optimizer {field} claims {requiredBytes} byte(s) but only {remaining} remain " +
+                "in the stream — corrupt or truncated checkpoint.");
     }
 }

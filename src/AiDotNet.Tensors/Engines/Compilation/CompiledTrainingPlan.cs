@@ -832,6 +832,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var mInitial = new byte[length];
             for (int i = 0; i < mInitial.Length; i++) mInitial[i] = 128;
             backend.UploadByteBuffer(localMQuant, mInitial);
+            // V quant uses zero-point 0, so its zero state is all-zero bytes. AllocateByteBuffer leaves
+            // device memory uninitialized (e.g. cuMemAlloc), so upload zeros explicitly — M was seeded to
+            // its 128 zero-point above but V was left as garbage until this fix.
+            backend.UploadByteBuffer(localVQuant, new byte[length]);
 
             var initialScales = new float[blockCount];
             for (int i = 0; i < initialScales.Length; i++) initialScales[i] = 1e-10f;
@@ -1952,10 +1956,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     if (paramBackend is not Engines.DirectGpu.ICompressedMomentGpuOptimizerBackend)
                         throw new NotSupportedException(
                             $"BFloat16 fused optimizer moments are not implemented by GPU backend '{paramBackend.BackendName}'.");
-                    gpuM[p] = paramBackend.AllocateByteBuffer(lengths[p] * sizeof(ushort));
-                    gpuV[p] = paramBackend.AllocateByteBuffer(lengths[p] * sizeof(ushort));
-                    _gpuOptimizerBuffers.Add(gpuM[p]!);
-                    _gpuOptimizerBuffers.Add(gpuV[p]!);
+                    var mBufBf16 = paramBackend.AllocateByteBuffer(lengths[p] * sizeof(ushort));
+                    var vBufBf16 = paramBackend.AllocateByteBuffer(lengths[p] * sizeof(ushort));
+                    // bf16 zero == 0x0000; AllocateByteBuffer leaves device memory uninitialized, so zero
+                    // the moment buffers explicitly or the first optimizer step reads garbage moments.
+                    paramBackend.UploadByteBuffer(mBufBf16, new byte[lengths[p] * sizeof(ushort)]);
+                    paramBackend.UploadByteBuffer(vBufBf16, new byte[lengths[p] * sizeof(ushort)]);
+                    gpuM[p] = mBufBf16;
+                    gpuV[p] = vBufBf16;
+                    _gpuOptimizerBuffers.Add(mBufBf16);
+                    _gpuOptimizerBuffers.Add(vBufBf16);
                     gpuMomentStorage[p] = FusedMomentStorageMode.BFloat16;
                 }
                 else if (useInt8Moments)
@@ -2680,10 +2690,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     if (paramBackend is not Engines.DirectGpu.ICompressedMomentGpuOptimizerBackend)
                         throw new NotSupportedException(
                             $"BFloat16 fused optimizer moments are not implemented by GPU backend '{paramBackend.BackendName}'.");
-                    gpuM[p] = paramBackend.AllocateByteBuffer(lengths[p] * sizeof(ushort));
-                    gpuV[p] = paramBackend.AllocateByteBuffer(lengths[p] * sizeof(ushort));
-                    _gpuOptimizerBuffers.Add(gpuM[p]!);
-                    _gpuOptimizerBuffers.Add(gpuV[p]!);
+                    var mBufBf16 = paramBackend.AllocateByteBuffer(lengths[p] * sizeof(ushort));
+                    var vBufBf16 = paramBackend.AllocateByteBuffer(lengths[p] * sizeof(ushort));
+                    // bf16 zero == 0x0000; AllocateByteBuffer leaves device memory uninitialized, so zero
+                    // the moment buffers explicitly or the first optimizer step reads garbage moments.
+                    paramBackend.UploadByteBuffer(mBufBf16, new byte[lengths[p] * sizeof(ushort)]);
+                    paramBackend.UploadByteBuffer(vBufBf16, new byte[lengths[p] * sizeof(ushort)]);
+                    gpuM[p] = mBufBf16;
+                    gpuV[p] = vBufBf16;
+                    _gpuOptimizerBuffers.Add(mBufBf16);
+                    _gpuOptimizerBuffers.Add(vBufBf16);
                     gpuMomentStorage[p] = FusedMomentStorageMode.BFloat16;
                 }
                 else if (useInt8Moments)

@@ -219,6 +219,12 @@ internal static class FusedOptimizer
         float eps,
         int step)
     {
+        // blockSize == 0 makes `start += blockSize` spin forever; a negative value walks `start`
+        // backwards and grows `block` unbounded → out-of-bounds scale access. Reject up front.
+        if (blockSize <= 0)
+            throw new ArgumentOutOfRangeException(nameof(blockSize), blockSize,
+                "int8 block-quantized moment update requires blockSize > 0.");
+
         float bc1 = 1f - MathF.Pow(beta1, step);
         float bc2 = 1f - MathF.Pow(beta2, step);
         float oneMinusBeta1 = 1f - beta1;
@@ -227,15 +233,23 @@ internal static class FusedOptimizer
         for (int block = 0, start = 0; start < length; block++, start += blockSize)
         {
             int end = Math.Min(start + blockSize, length);
-            float oldMScale = (float)Math.Max(mScales[block], 1e-10);
-            float oldVScale = (float)Math.Max(vScales[block], 1e-10);
+            // A stored scale of 0 is the natural ALL-ZERO moment state (initial state / an untouched
+            // block). Decode those as exactly 0 rather than flooring the scale to 1e-10 — the floor
+            // would turn the default/zero quantized bytes into spurious non-zero moments (e.g. an M
+            // byte of 0 decodes to (0-128)*1e-10) and nudge parameters on the first step.
+            double mScaleRaw = mScales[block];
+            double vScaleRaw = vScales[block];
+            bool mHasHistory = mScaleRaw > 0.0;
+            bool vHasHistory = vScaleRaw > 0.0;
+            float oldMScale = (float)mScaleRaw;
+            float oldVScale = (float)vScaleRaw;
             float maxAbsM = 0f;
             float maxAbsV = 0f;
 
             for (int i = start; i < end; i++)
             {
-                float oldM = ((int)mQuant[i] - 128) * oldMScale;
-                float oldV = vQuant[i] * oldVScale;
+                float oldM = mHasHistory ? ((int)mQuant[i] - 128) * oldMScale : 0f;
+                float oldV = vHasHistory ? vQuant[i] * oldVScale : 0f;
                 float g = grad[i];
                 float newM = beta1 * oldM + oneMinusBeta1 * g;
                 float newV = beta2 * oldV + oneMinusBeta2 * g * g;
@@ -250,8 +264,8 @@ internal static class FusedOptimizer
 
             for (int i = start; i < end; i++)
             {
-                float oldM = ((int)mQuant[i] - 128) * oldMScale;
-                float oldV = vQuant[i] * oldVScale;
+                float oldM = mHasHistory ? ((int)mQuant[i] - 128) * oldMScale : 0f;
+                float oldV = vHasHistory ? vQuant[i] * oldVScale : 0f;
                 float g = grad[i];
                 float newM = beta1 * oldM + oneMinusBeta1 * g;
                 float newV = beta2 * oldV + oneMinusBeta2 * g * g;
