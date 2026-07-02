@@ -132,6 +132,10 @@ public static class GpuOptimizer
 
         backend.AdamWUpdate(pBuf, gBuf, mBuf, vBuf,
             learningRate, beta1, beta2, epsilon, weightDecay, step, param.Length);
+        // AdamW mutates param, m and v on the GPU — mark all three current so a later read
+        // doesn't serve stale host data. Every other dense/sparse wrapper does this; TryAdamWStep
+        // was the lone omission (caught by GpuOptimizerResidencyMockTests.MarkEveryMutatedTensorCurrent).
+        MarkGpuUpdated(backend, param, m, v);
         return true;
     }
 

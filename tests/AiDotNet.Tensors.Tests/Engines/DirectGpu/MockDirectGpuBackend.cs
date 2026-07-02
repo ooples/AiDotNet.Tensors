@@ -139,6 +139,7 @@ public class MockDirectGpuBackend : DispatchProxy
             // Optimizer dispatch probes. These methods are void on IDirectGpuBackend; tests
             // verify the wrapper reached the backend and marked only the mutated tensors current.
             case "AdamUpdate":
+            case "AdamWUpdate":
             case "SgdUpdate":
             case "SgdMomentumUpdate":
             case "RmspropUpdate":
