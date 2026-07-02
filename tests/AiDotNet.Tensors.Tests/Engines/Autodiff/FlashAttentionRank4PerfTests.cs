@@ -6,6 +6,7 @@ using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 using Xunit.Abstractions;
+using AiDotNet.Tensors.Tests.TestHelpers;
 
 namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 
@@ -53,9 +54,12 @@ public class FlashAttentionRank4PerfTests
             : 0.5 * (sorted[(n / 2) - 1] + sorted[n / 2]);
     }
 
-    [Fact]
+    [SkippableFact]
+    [Trait("Category", "Performance")]
     public void Forward_Rank4_Generic_WithinTolerance_Of_Rank4_Fixed()
     {
+        PerformanceGate.SkipUnlessEnabled();
+
         // Shape: BERT-base style attention block.
         const int B = 2, H = 4, Sq = 64, Sk = 64, D = 32, Dv = 32;
         const int IterationsWarmup = 10;

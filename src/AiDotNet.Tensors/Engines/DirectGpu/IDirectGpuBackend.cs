@@ -130,6 +130,21 @@ public interface IDirectGpuBackend : IDisposable
     void DownloadBuffer(IGpuBuffer buffer, float[] destination);
 
     /// <summary>
+    /// Downloads raw bytes from a GPU byte buffer to CPU.
+    /// </summary>
+    /// <param name="buffer">GPU byte buffer to download.</param>
+    /// <param name="byteCount">Number of bytes to download.</param>
+    /// <returns>CPU byte array with the requested buffer contents.</returns>
+    byte[] DownloadByteBuffer(IGpuBuffer buffer, int byteCount);
+
+    /// <summary>
+    /// Uploads raw bytes into an existing GPU byte buffer.
+    /// </summary>
+    /// <param name="buffer">GPU byte buffer to update.</param>
+    /// <param name="data">Raw bytes to upload.</param>
+    void UploadByteBuffer(IGpuBuffer buffer, byte[] data);
+
+    /// <summary>
     /// Copies data between GPU buffers.
     /// </summary>
     /// <param name="source">Source buffer.</param>

@@ -10,6 +10,7 @@ using System.Diagnostics;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
+using AiDotNet.Tensors.Tests.TestHelpers;
 using Xunit.Abstractions;
 
 namespace AiDotNet.Tensors.Tests.Engines;
@@ -20,9 +21,11 @@ public class LstmSequencePerfBench
     private readonly ITestOutputHelper _out;
     public LstmSequencePerfBench(ITestOutputHelper output) => _out = output;
 
-    [Fact]
+    [SkippableFact]
     public void LstmSequenceForward_AisEvalWorkload_Timing()
     {
+        PerformanceGate.SkipUnlessEnabled();
+
         const int batch = 128, seq = 32, inF = 32, hidden = 64;
         const int warmup = 50, measured = 200;
 
@@ -53,9 +56,11 @@ public class LstmSequencePerfBench
         Assert.True(median > 0);
     }
 
-    [Fact]
+    [SkippableFact]
     public void LstmSequenceForward_AllocationProfile()
     {
+        PerformanceGate.SkipUnlessEnabled();
+
         const int batch = 128, seq = 32, inF = 32, hidden = 64;
         const int warmup = 50, calls = 500;
 
@@ -78,7 +83,11 @@ public class LstmSequencePerfBench
         _out.WriteLine($"  bytes/call = {perCall:F0}");
         _out.WriteLine($"  gen0 collections = {GC.CollectionCount(0) - g0}, gen1 = {GC.CollectionCount(1) - g1}, gen2 = {GC.CollectionCount(2) - g2}");
 
+#if NET5_0_OR_GREATER
         Assert.True(perCall >= 0);
+#else
+        Assert.True(!double.IsNaN(perCall));
+#endif
     }
 
     // GC.GetAllocatedBytesForCurrentThread() is .NET Core 3.0+ only; on net471 the

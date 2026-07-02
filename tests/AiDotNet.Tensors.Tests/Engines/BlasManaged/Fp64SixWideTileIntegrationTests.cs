@@ -11,6 +11,7 @@ using System.Diagnostics;
 using AiDotNet.Tensors.Engines.BlasManaged;
 using AiDotNet.Tensors.Helpers;
 using Xunit;
+using AiDotNet.Tensors.Tests.TestHelpers;
 using Xunit.Abstractions;
 using BlasManagedLib = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged;
 
@@ -81,6 +82,7 @@ public class Fp64SixWideTileIntegrationTests
     [Trait("Category", "Performance")]
     public void FastMode6x8_NotSlowerThan_Deterministic4x8_WideN()
     {
+        PerformanceGate.SkipUnlessEnabled();
         Skip.IfNot(Avx2Fp64_6x8.IsSupported, "AVX2/FMA not supported.");
         const int M = 192, N = 512, K = 256;
         const int warmup = 100, measured = 1000;

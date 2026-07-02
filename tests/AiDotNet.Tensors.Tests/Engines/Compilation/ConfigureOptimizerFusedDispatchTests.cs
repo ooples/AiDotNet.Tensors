@@ -1,4 +1,6 @@
 using System;
+using System.Reflection;
+using System.Runtime.ExceptionServices;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -47,6 +49,46 @@ public class ConfigureOptimizerFusedDispatchTests
         OptimizerType.ASGD,
         OptimizerType.Rprop,
     };
+
+    public static TheoryData<OptimizerType> GpuPlanSupportedOptimizers => new()
+    {
+        OptimizerType.SGD,
+        OptimizerType.Adam,
+        OptimizerType.AdamW,
+        OptimizerType.AMSGrad,
+        OptimizerType.Nadam,
+        OptimizerType.RMSprop,
+        OptimizerType.Adagrad,
+        OptimizerType.Lion,
+        OptimizerType.SGDMomentum,
+        OptimizerType.AdaMax,
+    };
+
+    [Theory]
+    [MemberData(nameof(GpuPlanSupportedOptimizers))]
+    public void ConfigureOptimizer_GpuPlanSupportedOptimizer_PassesEarlyGate(OptimizerType opt)
+    {
+        InvokeValidatePlanOptimizerSupport(opt, isFloat: true, hasGpuParams: true);
+    }
+
+    [Theory]
+    [InlineData(OptimizerType.RAdam)]
+    [InlineData(OptimizerType.LAMB)]
+    [InlineData(OptimizerType.AdaDelta)]
+    [InlineData(OptimizerType.LARS)]
+    [InlineData(OptimizerType.FTRL)]
+    [InlineData(OptimizerType.ASGD)]
+    [InlineData(OptimizerType.Rprop)]
+    [InlineData(OptimizerType.HypergradientSGD)]
+    [InlineData(OptimizerType.DAdaptationSGD)]
+    [InlineData(OptimizerType.ScheduleFreeSGD)]
+    [InlineData(OptimizerType.SparseAdam)]
+    [InlineData(OptimizerType.LBFGS)]
+    public void ConfigureOptimizer_GpuPlanSemanticGap_ThrowsAtEarlyGate(OptimizerType opt)
+    {
+        Assert.Throws<NotSupportedException>(
+            () => InvokeValidatePlanOptimizerSupport(opt, isFloat: true, hasGpuParams: true));
+    }
 
     /// <summary>
     /// Every wired float optimizer must dispatch through the fused plan (no
@@ -334,6 +376,23 @@ public class ConfigureOptimizerFusedDispatchTests
             var schedules = new System.Collections.Generic.List<LrSchedule> { LrSchedule.Constant(0.01) };
             var map = new System.Collections.Generic.List<int> { 0 };
             Assert.Throws<NotSupportedException>(() => plan.ConfigureOptimizerGrouped(opt, schedules, map, B1, B2, Eps));
+        }
+    }
+
+    private static void InvokeValidatePlanOptimizerSupport(OptimizerType opt, bool isFloat, bool hasGpuParams)
+    {
+        var method = typeof(CompiledTrainingPlan<float>).GetMethod(
+            "ValidatePlanOptimizerSupport",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.NotNull(method);
+
+        try
+        {
+            method!.Invoke(null, [opt, isFloat, hasGpuParams]);
+        }
+        catch (TargetInvocationException ex) when (ex.InnerException is not null)
+        {
+            ExceptionDispatchInfo.Capture(ex.InnerException).Throw();
         }
     }
 }

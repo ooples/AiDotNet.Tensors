@@ -988,9 +988,12 @@ extern ""C"" __global__ __launch_bounds__(256) void amsgrad_update(
     float vMaxVal = fmaxf(vMax[idx], vVal);
     vMax[idx] = vMaxVal;
 
-    float mHat = mVal / (1.0f - powf(beta1, (float)safe_step));
+    float beta1Pow = powf(beta1, (float)safe_step);
+    float beta2Pow = powf(beta2, (float)safe_step);
+    float mHat = mVal / (1.0f - beta1Pow);
+    float vMaxHat = vMaxVal / (1.0f - beta2Pow);
 
-    param[idx] -= learningRate * mHat / (sqrtf(vMaxVal) + epsilon);
+    param[idx] -= learningRate * mHat / (sqrtf(vMaxHat) + epsilon);
 }
 
 // AdaMax optimizer update
@@ -1068,11 +1071,12 @@ extern ""C"" __global__ __launch_bounds__(256) void nadam_update(
     v[idx] = vVal;
 
     float beta1Pow = powf(beta1, (float)safe_step);
+    float beta1PowNext = powf(beta1, (float)(safe_step + 1));
     float beta2Pow = powf(beta2, (float)safe_step);
     float mHat = mVal / (1.0f - beta1Pow);
     float vHat = vVal / (1.0f - beta2Pow);
 
-    float mNesterov = beta1 * mHat + (1.0f - beta1) * grad / (1.0f - beta1Pow);
+    float mNesterov = beta1 * mHat + (1.0f - beta1) * grad / (1.0f - beta1PowNext);
 
     param[idx] -= learningRate * mNesterov / (sqrtf(vHat) + epsilon);
 }

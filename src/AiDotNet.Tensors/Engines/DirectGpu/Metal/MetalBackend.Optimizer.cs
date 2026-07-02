@@ -116,6 +116,144 @@ public sealed partial class MetalBackend
         UploadToBuffer(v, vData);
     }
 
+    // Lazily-compiled MSL library for the native compressed-moment kernels. IntPtr.Zero if the compile
+    // failed (older Metal / MSL feature gap) → the callers fall back to the host path.
+    private IntPtr _compressedOptLibrary = IntPtr.Zero;
+    private bool _compressedOptLibTried;
+    private readonly object _compressedOptLibLock = new();
+
+    private IntPtr GetCompressedOptLibrary()
+    {
+        if (_compressedOptLibTried) return _compressedOptLibrary;
+        lock (_compressedOptLibLock)
+        {
+            if (_compressedOptLibTried) return _compressedOptLibrary;
+            try { _compressedOptLibrary = _shaderLibrary.CompileLibrary("CompressedOptimizer", MetalCompressedOptimizerKernels.Source); }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Metal compressed-optimizer library compile failed: {ex.Message}");
+                _compressedOptLibrary = IntPtr.Zero;
+            }
+            _compressedOptLibTried = true;
+            return _compressedOptLibrary;
+        }
+    }
+
+    public void AdamUpdateBf16(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
+        => AdamBf16Impl(param, gradient, m, v, learningRate, beta1, beta2, epsilon, weightDecay, step, size, decoupled: 0u);
+
+    public void AdamWUpdateBf16(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
+        => AdamBf16Impl(param, gradient, m, v, learningRate, beta1, beta2, epsilon, weightDecay, step, size, decoupled: 1u);
+
+    private void AdamBf16Impl(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size, uint decoupled)
+    {
+        ThrowIfDisposed();
+        if (size <= 0) return;
+
+        var lib = GetCompressedOptLibrary();
+        var pipeline = lib != IntPtr.Zero ? TryGetPipeline("CompressedOptimizer", lib, "adam_bf16") : null;
+        if (pipeline is not null
+            && param is MetalGpuBuffer pb && gradient is MetalGpuBuffer gb
+            && m is MetalGpuBuffer mb && v is MetalGpuBuffer vb)
+        {
+            // Native GPU path: one thread per 32-bit word (= two bf16 moments).
+            var (tg, tpg) = pipeline.Calculate1DDispatch((size + 1) / 2);
+            using var encoder = _commandQueue.CreateScopedComputeEncoder();
+            encoder.SetPipelineState(pipeline.Handle);
+            encoder.SetBuffer(pb, 0);
+            encoder.SetBuffer(gb, 1);
+            encoder.SetBuffer(mb, 2);
+            encoder.SetBuffer(vb, 3);
+            encoder.SetBytes((uint)size, 4);
+            encoder.SetBytes((uint)step, 5);
+            encoder.SetBytes(decoupled, 6);
+            encoder.SetBytes(learningRate, 7);
+            encoder.SetBytes(beta1, 8);
+            encoder.SetBytes(beta2, 9);
+            encoder.SetBytes(epsilon, 10);
+            encoder.SetBytes(weightDecay, 11);
+            encoder.DispatchThreadgroups(tg, tpg);
+            return;
+        }
+
+        // Fallback only when the MSL library/pipeline is unavailable: host round-trip.
+        CompressedMomentHostFallback.WarnHostFallbackOnce("Metal");
+        var paramData = DownloadBuffer(param);
+        var gradData = DownloadBuffer(gradient);
+        var mBytes = CompressedMomentHostFallback.DownloadPackedBytes(DownloadBuffer(m), size * sizeof(ushort));
+        var vBytes = CompressedMomentHostFallback.DownloadPackedBytes(DownloadBuffer(v), size * sizeof(ushort));
+        CompressedMomentHostFallback.AdamBf16(
+            paramData, gradData, mBytes, vBytes, learningRate, beta1, beta2, epsilon, weightDecay, step, size,
+            decoupledWeightDecay: decoupled == 1u);
+        UploadToBuffer(param, paramData);
+        UploadToBuffer(m, CompressedMomentHostFallback.PackBytesAsFloats(mBytes));
+        UploadToBuffer(v, CompressedMomentHostFallback.PackBytesAsFloats(vBytes));
+    }
+
+    public void Adam8BitUpdate(IGpuBuffer param, IGpuBuffer gradient,
+        IGpuBuffer mQuant, IGpuBuffer vQuant, IGpuBuffer mScales, IGpuBuffer vScales,
+        float learningRate, float beta1, float beta2, float epsilon,
+        float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
+        int blockSize, int paramLength, int numBlocks)
+    {
+        ThrowIfDisposed();
+        if (paramLength <= 0 || numBlocks <= 0) return;
+
+        var lib = GetCompressedOptLibrary();
+        var pipeline = lib != IntPtr.Zero ? TryGetPipeline("CompressedOptimizer", lib, "adam8bit") : null;
+        if (pipeline is not null
+            && param is MetalGpuBuffer pb && gradient is MetalGpuBuffer gb
+            && mQuant is MetalGpuBuffer mqb && vQuant is MetalGpuBuffer vqb
+            && mScales is MetalGpuBuffer msb && vScales is MetalGpuBuffer vsb)
+        {
+            // Native GPU path: one threadgroup (256 threads) per block; shared reduction for the scales.
+            var (tg, tpg) = pipeline.Calculate1DDispatch(numBlocks * 256);
+            using var encoder = _commandQueue.CreateScopedComputeEncoder();
+            encoder.SetPipelineState(pipeline.Handle);
+            encoder.SetBuffer(pb, 0);
+            encoder.SetBuffer(gb, 1);
+            encoder.SetBuffer(mqb, 2);
+            encoder.SetBuffer(vqb, 3);
+            encoder.SetBuffer(msb, 4);
+            encoder.SetBuffer(vsb, 5);
+            encoder.SetBytes((uint)paramLength, 6);
+            encoder.SetBytes((uint)blockSize, 7);
+            encoder.SetBytes((uint)numBlocks, 8);
+            encoder.SetBytes(learningRate, 9);
+            encoder.SetBytes(beta1, 10);
+            encoder.SetBytes(beta2, 11);
+            encoder.SetBytes(epsilon, 12);
+            encoder.SetBytes(oneMinusBeta1, 13);
+            encoder.SetBytes(oneMinusBeta2, 14);
+            encoder.SetBytes(biasCorrection1, 15);
+            encoder.SetBytes(biasCorrection2, 16);
+            encoder.DispatchThreadgroups(tg, tpg);
+            return;
+        }
+
+        CompressedMomentHostFallback.WarnHostFallbackOnce("Metal");
+        var paramData = DownloadBuffer(param);
+        var gradData = DownloadBuffer(gradient);
+        var mQuantBytes = CompressedMomentHostFallback.DownloadPackedBytes(DownloadBuffer(mQuant), paramLength);
+        var vQuantBytes = CompressedMomentHostFallback.DownloadPackedBytes(DownloadBuffer(vQuant), paramLength);
+        var mScaleData = DownloadBuffer(mScales);
+        var vScaleData = DownloadBuffer(vScales);
+
+        CompressedMomentHostFallback.Adam8Bit(
+            paramData, gradData, mQuantBytes, vQuantBytes, mScaleData, vScaleData,
+            learningRate, beta1, beta2, epsilon, oneMinusBeta1, oneMinusBeta2,
+            biasCorrection1, biasCorrection2, blockSize, paramLength, numBlocks);
+
+        UploadToBuffer(param, paramData);
+        UploadToBuffer(mQuant, CompressedMomentHostFallback.PackBytesAsFloats(mQuantBytes));
+        UploadToBuffer(vQuant, CompressedMomentHostFallback.PackBytesAsFloats(vQuantBytes));
+        UploadToBuffer(mScales, mScaleData);
+        UploadToBuffer(vScales, vScaleData);
+    }
+
     /// <summary>
     /// RMSprop optimizer update.
     /// </summary>

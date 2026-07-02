@@ -26,7 +26,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 /// The MPS library provides hand-tuned implementations of common operations.
 /// </para>
 /// </remarks>
-public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKernels
+public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend
 {
     /// <summary>
     /// Metal MPSGraph has half/bfloat conv support but it's not wired
@@ -457,6 +457,48 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         }
 
         metalBuffer.CopyTo(destination);
+    }
+
+    /// <summary>
+    /// Downloads raw bytes from a GPU byte buffer.
+    /// </summary>
+    public byte[] DownloadByteBuffer(IGpuBuffer buffer, int byteCount)
+    {
+        ThrowIfDisposed();
+
+        if (buffer is not MetalGpuBuffer metalBuffer)
+        {
+            throw new ArgumentException("Buffer must be a MetalGpuBuffer", nameof(buffer));
+        }
+        if (byteCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(byteCount), "Byte count must be non-negative.");
+        if (byteCount > metalBuffer.SizeInBytes)
+            throw new ArgumentException($"Requested byte count ({byteCount}) exceeds buffer capacity ({metalBuffer.SizeInBytes}).", nameof(byteCount));
+
+        var result = new byte[byteCount];
+        if (byteCount > 0)
+            metalBuffer.CopyBytesTo(result, 0, byteCount);
+        return result;
+    }
+
+    /// <summary>
+    /// Uploads raw bytes into an existing GPU byte buffer.
+    /// </summary>
+    public void UploadByteBuffer(IGpuBuffer buffer, byte[] data)
+    {
+        ThrowIfDisposed();
+
+        if (data is null)
+            throw new ArgumentNullException(nameof(data));
+        if (buffer is not MetalGpuBuffer metalBuffer)
+        {
+            throw new ArgumentException("Buffer must be a MetalGpuBuffer", nameof(buffer));
+        }
+        if (data.LongLength > metalBuffer.SizeInBytes)
+            throw new ArgumentException($"Host data ({data.Length} bytes) exceeds buffer capacity ({metalBuffer.SizeInBytes} bytes).", nameof(data));
+
+        if (data.Length > 0)
+            metalBuffer.CopyBytesFrom(data, 0, data.Length);
     }
 
     /// <summary>

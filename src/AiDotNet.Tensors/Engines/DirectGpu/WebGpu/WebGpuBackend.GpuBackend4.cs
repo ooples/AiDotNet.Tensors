@@ -51,6 +51,47 @@ public sealed partial class WebGpuBackend
             param, gradient, m, v, uniforms, size).GetAwaiter().GetResult();
     }
 
+    public void AdamUpdateBf16(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
+    {
+        var uniforms = MakeOptimizerUniforms(size, learningRate, beta1, beta2, epsilon, weightDecay, step);
+        Dispatch4BufferAsync("CompressedOptimizerBf16", WebGpuKernels.CompressedOptimizerBf16Source, "adam_bf16",
+            param, gradient, m, v, uniforms, size).GetAwaiter().GetResult();
+    }
+
+    public void AdamWUpdateBf16(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
+    {
+        var uniforms = MakeOptimizerUniforms(size, learningRate, beta1, beta2, epsilon, weightDecay, step);
+        Dispatch4BufferAsync("CompressedOptimizerBf16", WebGpuKernels.CompressedOptimizerBf16Source, "adamw_bf16",
+            param, gradient, m, v, uniforms, size).GetAwaiter().GetResult();
+    }
+
+    public void Adam8BitUpdate(IGpuBuffer param, IGpuBuffer gradient,
+        IGpuBuffer mQuant, IGpuBuffer vQuant, IGpuBuffer mScales, IGpuBuffer vScales,
+        float learningRate, float beta1, float beta2, float epsilon,
+        float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
+        int blockSize, int paramLength, int numBlocks)
+    {
+        var uniforms = new[]
+        {
+            BitConverter.Int32BitsToSingle(paramLength),
+            BitConverter.Int32BitsToSingle(blockSize),
+            BitConverter.Int32BitsToSingle(numBlocks),
+            0f,
+            learningRate,
+            beta1,
+            beta2,
+            epsilon,
+            oneMinusBeta1,
+            oneMinusBeta2,
+            biasCorrection1,
+            biasCorrection2
+        };
+        Dispatch6BufferAsync("CompressedOptimizerInt8", WebGpuKernels.CompressedOptimizerInt8Source, "adam8bit",
+            param, gradient, mQuant, vQuant, mScales, vScales, uniforms, numBlocks * 256).GetAwaiter().GetResult();
+    }
+
     public void RmspropUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer squaredAvg,
         float learningRate, float rho, float epsilon, float weightDecay, int size)
     {

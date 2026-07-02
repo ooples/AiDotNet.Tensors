@@ -24,7 +24,7 @@ public sealed class GpuOptimizerResidencyMockTests
         RunDenseCase(ctx, "AdamUpdate",
             t => GpuOptimizer.TryAdamStep(t.P, t.G, t.M, t.V, 0.01f, 0.9f, 0.999f, 1e-8f, 0f, 1),
             t => t.P, t => t.M, t => t.V);
-        RunDenseCase(ctx, "AdamUpdate",
+        RunDenseCase(ctx, "AdamWUpdate",
             t => GpuOptimizer.TryAdamWStep(t.P, t.G, t.M, t.V, 0.01f, 0.9f, 0.999f, 1e-8f, 0.01f, 1),
             t => t.P, t => t.M, t => t.V);
         RunDenseCase(ctx, "SgdUpdate",

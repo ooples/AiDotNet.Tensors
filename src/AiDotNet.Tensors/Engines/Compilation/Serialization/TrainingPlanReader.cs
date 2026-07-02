@@ -161,6 +161,8 @@ internal static class TrainingPlanReader
             for (int d = 0; d < gradRank; d++) reader.ReadInt32();
         }
 
+        var optimizerCheckpoint = FusedOptimizerCheckpointSerializer.Read(reader);
+
         // ── Phase 2: Replay forward ops through engine under GraphMode ──
         // Each engine call under GraphMode returns a NEW lazy tensor. We must
         // wire these new outputs as inputs to subsequent ops — the tensor-table
@@ -234,7 +236,16 @@ internal static class TrainingPlanReader
                 liveTensors[op.OutputId] = output;
             }
 
-            return scope.CompileTraining<T>(callerParameters);
+            var plan = scope.CompileTraining<T>(callerParameters);
+            if (optimizerCheckpoint is not null)
+            {
+                if (plan is not CompiledTrainingPlan<T> concrete)
+                    throw new InvalidDataException(
+                        "Training plan loader produced an unknown ICompiledTrainingPlan implementation; " +
+                        "cannot restore fused optimizer checkpoint state.");
+                concrete.RestoreFusedOptimizerCheckpoint(optimizerCheckpoint);
+            }
+            return plan;
         }
     }
 

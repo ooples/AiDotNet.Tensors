@@ -256,6 +256,30 @@ export function writeBuffer(bufferId, data, offsetBytes) {
 }
 
 /**
+ * Writes raw byte data to a GPU buffer.
+ * @param {number} bufferId - Buffer ID.
+ * @param {Uint8Array|number[]} data - Byte data to write.
+ * @param {number} offsetBytes - Offset in bytes.
+ */
+export function writeByteBuffer(bufferId, data, offsetBytes) {
+    if (!device || !queue) return;
+
+    const buffer = buffers.get(bufferId);
+    if (!buffer) {
+        console.error(`Buffer ${bufferId} not found`);
+        return;
+    }
+
+    const source = data instanceof Uint8Array ? data : new Uint8Array(data);
+    const alignedLength = (source.byteLength + 3) & ~3;
+    const byteData = source.byteLength === alignedLength ? source : new Uint8Array(alignedLength);
+    if (byteData !== source) {
+        byteData.set(source);
+    }
+    queue.writeBuffer(buffer, offsetBytes, byteData);
+}
+
+/**
  * Reads data from a GPU buffer.
  * @param {number} bufferId - Buffer ID.
  * @param {number} sizeBytes - Size to read.
@@ -314,6 +338,47 @@ export async function readBufferAsJson(bufferId, sizeBytes, offsetBytes) {
         return '[]';
     }
     // Convert Float32Array to regular array for JSON serialization
+    return JSON.stringify(Array.from(result));
+}
+
+/**
+ * Reads raw byte data from a GPU buffer and returns as JSON string.
+ * @param {number} bufferId - Buffer ID.
+ * @param {number} sizeBytes - Size to read in bytes.
+ * @param {number} offsetBytes - Offset in bytes.
+ * @returns {Promise<string>} JSON string of byte values.
+ */
+export async function readByteBufferAsJson(bufferId, sizeBytes, offsetBytes) {
+    if (!device) return '[]';
+
+    const buffer = buffers.get(bufferId);
+    if (!buffer) {
+        console.error(`Buffer ${bufferId} not found`);
+        return '[]';
+    }
+
+    const alignedSize = (sizeBytes + 3) & ~3;
+    let stagingBuffer = getStagingBuffer(alignedSize);
+
+    if (!stagingBuffer) {
+        stagingBuffer = device.createBuffer({
+            size: alignedSize,
+            usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+            mappedAtCreation: false
+        });
+    }
+
+    const commandEncoder = device.createCommandEncoder();
+    commandEncoder.copyBufferToBuffer(buffer, offsetBytes, stagingBuffer, 0, alignedSize);
+    queue.submit([commandEncoder.finish()]);
+
+    await stagingBuffer.mapAsync(GPUMapMode.READ);
+    const arrayBuffer = stagingBuffer.getMappedRange();
+    const result = new Uint8Array(arrayBuffer.slice(0, sizeBytes));
+    stagingBuffer.unmap();
+
+    returnStagingBuffer(stagingBuffer, alignedSize);
+
     return JSON.stringify(Array.from(result));
 }
 

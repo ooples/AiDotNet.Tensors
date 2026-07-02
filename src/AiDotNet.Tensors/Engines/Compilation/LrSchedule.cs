@@ -38,6 +38,13 @@ public abstract class LrSchedule
     /// debiasing without an off-by-one trap.</param>
     public abstract double GetLr(int step);
 
+    /// <summary>
+    /// Captures built-in schedule parameters for compiled-training checkpoint
+    /// resume. Custom schedules return null and are rejected by plan
+    /// serialization rather than being restored with a different LR sequence.
+    /// </summary>
+    internal virtual FusedLrScheduleCheckpoint? TryCaptureCheckpoint() => null;
+
     /// <summary>Constant learning rate. Use this when you don't want a schedule.</summary>
     public static LrSchedule Constant(double lr) => new ConstantLr(lr);
 
@@ -136,6 +143,8 @@ internal sealed class ConstantLr : LrSchedule
     public ConstantLr(double lr) { _lr = lr; }
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public override double GetLr(int step) => _lr;
+    internal override FusedLrScheduleCheckpoint? TryCaptureCheckpoint()
+        => new(FusedLrScheduleKind.Constant, new[] { _lr }, System.Array.Empty<int>());
 }
 
 internal sealed class NoamLr : LrSchedule
@@ -174,6 +183,11 @@ internal sealed class NoamLr : LrSchedule
         double warmupBranch = _scaledWarmupTerm * t;
         return System.Math.Min(invSqrtBranch, warmupBranch);
     }
+
+    internal override FusedLrScheduleCheckpoint? TryCaptureCheckpoint()
+        => new(FusedLrScheduleKind.NoamScaled,
+            new[] { _scaledModelInvSqrt, _scaledWarmupTerm },
+            System.Array.Empty<int>());
 }
 
 internal sealed class CosineLr : LrSchedule
@@ -196,6 +210,9 @@ internal sealed class CosineLr : LrSchedule
         double cos = 0.5 * (1.0 + System.Math.Cos(System.Math.PI * progress));
         return _lrMin + (_lrMax - _lrMin) * cos;
     }
+
+    internal override FusedLrScheduleCheckpoint? TryCaptureCheckpoint()
+        => new(FusedLrScheduleKind.Cosine, new[] { _lrMax, _lrMin }, new[] { _total });
 }
 
 internal sealed class OneCycleLr : LrSchedule
@@ -234,6 +251,11 @@ internal sealed class OneCycleLr : LrSchedule
         double cos = 0.5 * (1.0 + System.Math.Cos(System.Math.PI * progress));
         return _lrFinal + (_lrMax - _lrFinal) * cos;
     }
+
+    internal override FusedLrScheduleCheckpoint? TryCaptureCheckpoint()
+        => new(FusedLrScheduleKind.OneCycleResolved,
+            new[] { _lrMax, _lrInitial, _lrFinal },
+            new[] { _total, _warmupEnd });
 }
 
 internal sealed class ExponentialLr : LrSchedule
@@ -247,6 +269,9 @@ internal sealed class ExponentialLr : LrSchedule
     }
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public override double GetLr(int step) => _lr0 * System.Math.Pow(_gamma, System.Math.Max(0, step - 1));
+
+    internal override FusedLrScheduleCheckpoint? TryCaptureCheckpoint()
+        => new(FusedLrScheduleKind.Exponential, new[] { _lr0, _gamma }, System.Array.Empty<int>());
 }
 
 internal sealed class StepLrImpl : LrSchedule
@@ -262,6 +287,9 @@ internal sealed class StepLrImpl : LrSchedule
     }
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public override double GetLr(int step) => _lr0 * System.Math.Pow(_gamma, System.Math.Max(0, step - 1) / _stepSize);
+
+    internal override FusedLrScheduleCheckpoint? TryCaptureCheckpoint()
+        => new(FusedLrScheduleKind.Step, new[] { _lr0, _gamma }, new[] { _stepSize });
 }
 
 internal sealed class CyclicLr : LrSchedule
@@ -286,6 +314,9 @@ internal sealed class CyclicLr : LrSchedule
             : 1.0 - (phase - _stepSize) / (double)_stepSize;
         return _base + (_max - _base) * t;
     }
+
+    internal override FusedLrScheduleCheckpoint? TryCaptureCheckpoint()
+        => new(FusedLrScheduleKind.Cyclic, new[] { _base, _max }, new[] { _stepSize });
 }
 
 internal sealed class LinearWarmupCosineLr : LrSchedule
@@ -317,6 +348,11 @@ internal sealed class LinearWarmupCosineLr : LrSchedule
         double cos = 0.5 * (1.0 + System.Math.Cos(System.Math.PI * progress));
         return _lrMin + (_lrMax - _lrMin) * cos;
     }
+
+    internal override FusedLrScheduleCheckpoint? TryCaptureCheckpoint()
+        => new(FusedLrScheduleKind.LinearWarmupCosine,
+            new[] { _lrMax, _lrMin },
+            new[] { _warmup, _total });
 }
 
 internal sealed class LinearWarmupLr : LrSchedule
@@ -379,4 +415,13 @@ internal sealed class LinearWarmupLr : LrSchedule
         double cos = (1.0 + System.Math.Cos(System.Math.PI * progress)) / 2.0;
         return _endLr + (_lrMax - _endLr) * cos;
     }
+
+    // Was the ONE built-in schedule with no checkpoint capture, so a compiled plan using it lost its
+    // schedule on resume (base default returns null → serialization rejects/drops it). Capture the full
+    // parameter set (incl. warmupInitLr, endLr and the decay mode) so the restored LR sequence is
+    // bit-identical. _totalSteps is already the ctor-normalized value.
+    internal override FusedLrScheduleCheckpoint? TryCaptureCheckpoint()
+        => new(FusedLrScheduleKind.LinearWarmupDecay,
+            new[] { _lrMax, _warmupInitLr, _endLr },
+            new[] { _warmupSteps, _totalSteps, (int)_decayMode });
 }

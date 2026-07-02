@@ -10047,9 +10047,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var gradQBuffer = AllocateOutputBuffer(backend, batch * heads * seqQ * headDim);
         using var gradKBuffer = AllocateOutputBuffer(backend, batch * heads * seqK * headDim);
         using var gradVBuffer = AllocateOutputBuffer(backend, batch * heads * seqK * headDim);
-        backend.Fill(gradQBuffer.Buffer, 0f, batch * heads * seqQ * headDim);
-        backend.Fill(gradKBuffer.Buffer, 0f, batch * heads * seqK * headDim);
-        backend.Fill(gradVBuffer.Buffer, 0f, batch * heads * seqK * headDim);
 
         // Upload attention bias to GPU if provided, with shape validation
         int biasBatchStride = 0;
@@ -10059,6 +10056,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
+            backend.Fill(gradQBuffer.Buffer, 0f, batch * heads * seqQ * headDim);
+            backend.Fill(gradKBuffer.Buffer, 0f, batch * heads * seqK * headDim);
+            backend.Fill(gradVBuffer.Buffer, 0f, batch * heads * seqK * headDim);
+
             // Execute GPU backward with optional bias
             backend.FlashAttentionBackward(gradOutBuffer.Buffer, queryBuffer.Buffer, keyBuffer.Buffer, valueBuffer.Buffer,
                 outputBuffer.Buffer, statsBuffer.Buffer, gradQBuffer.Buffer, gradKBuffer.Buffer, gradVBuffer.Buffer,
@@ -13565,23 +13566,53 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             int numIndices = indices.Length;
+            int vocabSize = embeddingTable.Shape._dims[0];
             int embeddingDim = embeddingTable.Shape._dims[^1];
-
-            using var indicesBuffer = backend.AllocateIntBuffer(indices.GetDataArray());
-            using var tableBuffer = GetOrCacheWeightBuffer(backend, embeddingTable.GetDataArray(), PersistentTensorRole.Embeddings);
-            using var outputBuffer = AllocateOutputBuffer(backend, numIndices * embeddingDim);
-
-            backend.Embedding(indicesBuffer, tableBuffer.Buffer, outputBuffer.Buffer, numIndices, embeddingDim);
-            // DownloadBuffer uses blocking read, Synchronize() removed for performance
-            float[] outputFloat = backend.DownloadBuffer(outputBuffer.Buffer);
-
-            // Output shape: indices.Shape + [embeddingDim]
+            int[] indicesData = indices.GetDataArray();
+            // Guard against out-of-range indices (mirrors the public override Embedding): an index < 0 or
+            // >= vocabSize would make the GPU kernel read outside the embedding table. Fall back to the
+            // base engine (which validates) rather than issuing an out-of-bounds device read.
+            for (int i = 0; i < indicesData.Length; i++)
+            {
+                int idx = indicesData[i];
+                if (idx < 0 || idx >= vocabSize)
+                    return base.Embedding(indices, embeddingTable);
+            }
             int[] outputShape = new int[indices.Shape._dims.Length + 1];
             for (int i = 0; i < indices.Shape._dims.Length; i++)
                 outputShape[i] = indices.Shape._dims[i];
             outputShape[^1] = embeddingDim;
+            bool isDeferredRecording = Gpu.DeferredScope.Current?.IsRecording == true;
 
-            return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(outputFloat), outputShape);
+            using var indicesBuffer = backend.AllocateIntBuffer(indicesData);
+            using var tableBuffer = GetOrCacheWeightBuffer(backend, embeddingTable.GetDataArray(), PersistentTensorRole.Embeddings);
+            var outputBuffer = AllocateOutputBuffer(backend, numIndices * embeddingDim);
+            bool outputHandedOff = false;
+
+            try
+            {
+                backend.Embedding(indicesBuffer, tableBuffer.Buffer, outputBuffer.Buffer, numIndices, embeddingDim);
+
+                if (isDeferredRecording)
+                {
+                    outputHandedOff = true;
+                    return Tensor<T>.FromGpuBuffer(
+                        backend,
+                        outputBuffer.Buffer,
+                        outputShape,
+                        GpuTensorRole.Activation,
+                        ownsBuffer: outputBuffer.OwnsBuffer);
+                }
+
+                // DownloadBuffer uses blocking read, Synchronize() removed for performance.
+                float[] outputFloat = backend.DownloadBuffer(outputBuffer.Buffer);
+                return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(outputFloat), outputShape);
+            }
+            finally
+            {
+                if (!outputHandedOff)
+                    outputBuffer.Dispose();
+            }
         }
         catch
         {
@@ -18612,16 +18643,51 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             int numIndices = indices.Length;
-            int embeddingDim = embeddingTable.Shape._dims[1];
+            int vocabSize = embeddingTable.Shape._dims[0];
+            int embeddingDim = embeddingTable.Shape._dims[^1];
+            int[] indicesData = indices.GetDataArray();
+            for (int i = 0; i < indicesData.Length; i++)
+            {
+                int idx = indicesData[i];
+                if (idx < 0 || idx >= vocabSize)
+                    return base.Embedding(indices, embeddingTable);
+            }
+
+            int[] outShape = new int[indices.Shape._dims.Length + 1];
+            for (int i = 0; i < indices.Shape._dims.Length; i++)
+                outShape[i] = indices.Shape._dims[i];
+            outShape[^1] = embeddingDim;
+            bool isDeferredRecording = Gpu.DeferredScope.Current?.IsRecording == true;
+
             using var bufTable = GetOrAllocateBuffer(backend, embeddingTable);
-            using var bufIdx = backend.AllocateIntBuffer(indices.GetDataArray());
+            using var bufIdx = backend.AllocateIntBuffer(indicesData);
             var bufOut = AllocateOutputBuffer(backend, numIndices * embeddingDim);
-            backend.Embedding(bufIdx, bufTable.Buffer, bufOut.Buffer, numIndices, embeddingDim);
-            var result = FinishGpuOp<T>(backend, bufOut, numIndices * embeddingDim);
-            int[] outShape = indices.Rank == 1
-                ? new[] { numIndices, embeddingDim }
-                : indices.Shape._dims.Concat(new[] { embeddingDim }).ToArray();
-            return new Tensor<T>(result, outShape);
+            bool outputHandedOff = false;
+
+            try
+            {
+                backend.Embedding(bufIdx, bufTable.Buffer, bufOut.Buffer, numIndices, embeddingDim);
+
+                if (isDeferredRecording)
+                {
+                    outputHandedOff = true;
+                    return Tensor<T>.FromGpuBuffer(
+                        backend,
+                        bufOut.Buffer,
+                        outShape,
+                        GpuTensorRole.Activation,
+                        ownsBuffer: bufOut.OwnsBuffer);
+                }
+
+                var result = FinishGpuOp<T>(backend, bufOut, numIndices * embeddingDim);
+                outputHandedOff = true;
+                return new Tensor<T>(result, outShape);
+            }
+            finally
+            {
+                if (!outputHandedOff)
+                    bufOut.Dispose();
+            }
         }
         catch (Exception)
         {

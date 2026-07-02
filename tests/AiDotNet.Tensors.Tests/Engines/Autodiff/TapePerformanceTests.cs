@@ -1,8 +1,10 @@
+using System;
 using System.Diagnostics;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
+using AiDotNet.Tensors.Tests.TestHelpers;
 using Xunit.Abstractions;
 
 namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
@@ -122,9 +124,11 @@ public class TapePerformanceTests
     // the default correctness suite. Keep the benchmark body for manual/dedicated
     // performance runs where the 100ms budget is meaningful.
     [Trait("Category", "Performance")]
-    [Fact(Skip = "Performance benchmark - timing sensitive, run manually or in a dedicated perf job.")]
+    [SkippableFact]
     public void FullForwardBackward_MLP_Performance()
     {
+        PerformanceGate.SkipUnlessEnabled();
+
         // Measure a realistic training step: 3-layer MLP forward + backward
         var input = Tensor<float>.CreateRandom([32, 128]); // batch=32, features=128
         var w1 = Tensor<float>.CreateRandom([128, 64]);

@@ -15,7 +15,7 @@ using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernels, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend
+public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend
 {
     // During teardown the CUDA driver/context may already be destroyed, so calling driver
     // APIs (cuCtxPushCurrent / cuMemFree / cuCtxPopCurrent / cuCtxDestroy / cuModuleUnload)
@@ -1632,6 +1632,26 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         }
         // PR #638 A0: attribute this DtoH to the op that issued it (no-op outside a download-trace window).
         AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.OnDownload((long)byteSize);
+    }
+
+    public byte[] DownloadByteBuffer(IGpuBuffer buffer, int byteCount)
+    {
+        if (byteCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(byteCount), "Byte count must be non-negative.");
+        if (byteCount > buffer.SizeInBytes)
+            throw new ArgumentException($"Requested byte count ({byteCount}) exceeds buffer capacity ({buffer.SizeInBytes}).", nameof(byteCount));
+
+        return DownloadBytes(buffer, byteCount);
+    }
+
+    public void UploadByteBuffer(IGpuBuffer buffer, byte[] data)
+    {
+        if (data is null)
+            throw new ArgumentNullException(nameof(data));
+        if (data.LongLength > buffer.SizeInBytes)
+            throw new ArgumentException($"Host data ({data.Length} bytes) exceeds buffer capacity ({buffer.SizeInBytes} bytes).", nameof(data));
+
+        UploadBytes(buffer, data);
     }
 
     public void Gemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
@@ -11249,6 +11269,100 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    public unsafe void AdamUpdateBf16(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
+    {
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (gradient is null) throw new ArgumentNullException(nameof(gradient));
+        if (m is null) throw new ArgumentNullException(nameof(m));
+        if (v is null) throw new ArgumentNullException(nameof(v));
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), "Size must be positive.");
+        if (step < 1)
+            throw new ArgumentOutOfRangeException(nameof(step), "Step must be at least 1.");
+        if (epsilon <= 0)
+            throw new ArgumentOutOfRangeException(nameof(epsilon), "Epsilon must be positive.");
+        if (param.Size < size)
+            throw new ArgumentException($"param buffer too small: capacity={param.Size}, required={size}.", nameof(param));
+        if (gradient.Size < size)
+            throw new ArgumentException($"gradient buffer too small: capacity={gradient.Size}, required={size}.", nameof(gradient));
+        long requiredMomentBytes = (long)size * sizeof(ushort);
+        if (m.SizeInBytes < requiredMomentBytes)
+            throw new ArgumentException($"m bf16 buffer too small: capacity={m.SizeInBytes} bytes, required={requiredMomentBytes}.", nameof(m));
+        if (v.SizeInBytes < requiredMomentBytes)
+            throw new ArgumentException($"v bf16 buffer too small: capacity={v.SizeInBytes} bytes, required={requiredMomentBytes}.", nameof(v));
+
+        if (!_kernelCache.TryGetValue("adam_bf16_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: adam_bf16_update");
+
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr paramPtr = param.Handle;
+        IntPtr gradPtr = gradient.Handle;
+        IntPtr mPtr = m.Handle;
+        IntPtr vPtr = v.Handle;
+        void** args = stackalloc void*[11];
+        args[0] = &paramPtr;
+        args[1] = &gradPtr;
+        args[2] = &mPtr;
+        args[3] = &vPtr;
+        args[4] = &learningRate;
+        args[5] = &beta1;
+        args[6] = &beta2;
+        args[7] = &epsilon;
+        args[8] = &weightDecay;
+        args[9] = &step;
+        args[10] = &size;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void AdamWUpdateBf16(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
+    {
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (gradient is null) throw new ArgumentNullException(nameof(gradient));
+        if (m is null) throw new ArgumentNullException(nameof(m));
+        if (v is null) throw new ArgumentNullException(nameof(v));
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), "Size must be positive.");
+        if (step < 1)
+            throw new ArgumentOutOfRangeException(nameof(step), "Step must be at least 1.");
+        if (epsilon <= 0)
+            throw new ArgumentOutOfRangeException(nameof(epsilon), "Epsilon must be positive.");
+        if (param.Size < size)
+            throw new ArgumentException($"param buffer too small: capacity={param.Size}, required={size}.", nameof(param));
+        if (gradient.Size < size)
+            throw new ArgumentException($"gradient buffer too small: capacity={gradient.Size}, required={size}.", nameof(gradient));
+        long requiredMomentBytes = (long)size * sizeof(ushort);
+        if (m.SizeInBytes < requiredMomentBytes)
+            throw new ArgumentException($"m bf16 buffer too small: capacity={m.SizeInBytes} bytes, required={requiredMomentBytes}.", nameof(m));
+        if (v.SizeInBytes < requiredMomentBytes)
+            throw new ArgumentException($"v bf16 buffer too small: capacity={v.SizeInBytes} bytes, required={requiredMomentBytes}.", nameof(v));
+
+        if (!_kernelCache.TryGetValue("adamw_bf16_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: adamw_bf16_update");
+
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr paramPtr = param.Handle;
+        IntPtr gradPtr = gradient.Handle;
+        IntPtr mPtr = m.Handle;
+        IntPtr vPtr = v.Handle;
+        void** args = stackalloc void*[11];
+        args[0] = &paramPtr;
+        args[1] = &gradPtr;
+        args[2] = &mPtr;
+        args[3] = &vPtr;
+        args[4] = &learningRate;
+        args[5] = &beta1;
+        args[6] = &beta2;
+        args[7] = &epsilon;
+        args[8] = &weightDecay;
+        args[9] = &step;
+        args[10] = &size;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
     /// <inheritdoc/>
     public unsafe void RmspropUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer squaredAvg,
         float learningRate, float rho, float epsilon, float weightDecay, int size)
@@ -11483,7 +11597,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     /// <summary>
     /// 8-bit Adam blockwise update in place on the GPU. mQ/vQ are int8 quantized
-    /// moments (one byte per element); mScales/vScales are one double per block.
+    /// moments (one byte per element); mScales/vScales are one float per block.
     /// One CUDA block per quant block, 256 threads, shared-memory maxAbs reduction.
     /// Matches the CPU Adam8BitOptimizer's CompressBothMoments / percentile>=100 /
     /// deterministic-rounding path.

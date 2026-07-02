@@ -32,7 +32,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 /// Always check IsAvailable before using GPU operations.
 /// </para>
 /// </remarks>
-public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFusedAdvancedKernels
+public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend
 {
     /// <summary>
     /// WebGpu has no cuDNN-equivalent half/bfloat16 conv path — returns

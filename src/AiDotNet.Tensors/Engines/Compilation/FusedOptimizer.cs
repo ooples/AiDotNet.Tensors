@@ -199,6 +199,92 @@ internal static class FusedOptimizer
         AdamUpdateBf16Simd(param, grad, m, v, length, lr, beta1, beta2, eps, step);
     }
 
+    /// <summary>
+    /// Adam update with true block-quantized int8 moment storage. The resident
+    /// state is one byte per m/v element plus one fp64 scale per block; update
+    /// math widens to fp32 and then requantizes the new moments.
+    /// </summary>
+    internal static unsafe void AdamUpdateInt8BlockQuantized(
+        float* param,
+        float* grad,
+        byte* mQuant,
+        byte* vQuant,
+        double* mScales,
+        double* vScales,
+        int length,
+        int blockSize,
+        float lr,
+        float beta1,
+        float beta2,
+        float eps,
+        int step)
+    {
+        // blockSize == 0 makes `start += blockSize` spin forever; a negative value walks `start`
+        // backwards and grows `block` unbounded → out-of-bounds scale access. Reject up front.
+        if (blockSize <= 0)
+            throw new ArgumentOutOfRangeException(nameof(blockSize), blockSize,
+                "int8 block-quantized moment update requires blockSize > 0.");
+
+        float bc1 = 1f - MathF.Pow(beta1, step);
+        float bc2 = 1f - MathF.Pow(beta2, step);
+        float oneMinusBeta1 = 1f - beta1;
+        float oneMinusBeta2 = 1f - beta2;
+
+        for (int block = 0, start = 0; start < length; block++, start += blockSize)
+        {
+            int end = Math.Min(start + blockSize, length);
+            // A stored scale of 0 is the natural ALL-ZERO moment state (initial state / an untouched
+            // block). Decode those as exactly 0 rather than flooring the scale to 1e-10 — the floor
+            // would turn the default/zero quantized bytes into spurious non-zero moments (e.g. an M
+            // byte of 0 decodes to (0-128)*1e-10) and nudge parameters on the first step.
+            double mScaleRaw = mScales[block];
+            double vScaleRaw = vScales[block];
+            bool mHasHistory = mScaleRaw > 0.0;
+            bool vHasHistory = vScaleRaw > 0.0;
+            float oldMScale = (float)mScaleRaw;
+            float oldVScale = (float)vScaleRaw;
+            float maxAbsM = 0f;
+            float maxAbsV = 0f;
+
+            for (int i = start; i < end; i++)
+            {
+                float oldM = mHasHistory ? ((int)mQuant[i] - 128) * oldMScale : 0f;
+                float oldV = vHasHistory ? vQuant[i] * oldVScale : 0f;
+                float g = grad[i];
+                float newM = beta1 * oldM + oneMinusBeta1 * g;
+                float newV = beta2 * oldV + oneMinusBeta2 * g * g;
+                maxAbsM = MathF.Max(maxAbsM, MathF.Abs(newM));
+                maxAbsV = MathF.Max(maxAbsV, MathF.Abs(newV));
+            }
+
+            float newMScale = MathF.Max(maxAbsM / 127f, 1e-10f);
+            float newVScale = MathF.Max(maxAbsV / 255f, 1e-10f);
+            mScales[block] = newMScale;
+            vScales[block] = newVScale;
+
+            for (int i = start; i < end; i++)
+            {
+                float oldM = mHasHistory ? ((int)mQuant[i] - 128) * oldMScale : 0f;
+                float oldV = vHasHistory ? vQuant[i] * oldVScale : 0f;
+                float g = grad[i];
+                float newM = beta1 * oldM + oneMinusBeta1 * g;
+                float newV = beta2 * oldV + oneMinusBeta2 * g * g;
+                float mHat = newM / bc1;
+                float vHat = newV / bc2;
+                param[i] -= lr * mHat / (MathF.Sqrt(vHat) + eps);
+
+                int qM = (int)Math.Round(newM / newMScale, MidpointRounding.ToEven);
+                if (qM < -127) qM = -127;
+                else if (qM > 127) qM = 127;
+                int qV = (int)Math.Round(newV / newVScale, MidpointRounding.ToEven);
+                if (qV < 0) qV = 0;
+                else if (qV > 255) qV = 255;
+                mQuant[i] = (byte)(qM + 128);
+                vQuant[i] = (byte)qV;
+            }
+        }
+    }
+
     // ────────────────────────────────────────────────────────────────────
     // Double-precision overloads — engaged for `Tensor<double>` models on
     // the fused-compiled training path. PR #319 follow-up: the
