@@ -13,6 +13,7 @@ using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
+[Collection("EngineCurrentGlobalState")]
 public sealed class GpuOptimizerResidencyMockTests
 {
     [Fact]
@@ -117,6 +118,121 @@ public sealed class GpuOptimizerResidencyMockTests
         RunSparseCase(ctx, "SparseProximalL1Update",
             t => GpuOptimizer.TryProximalL1StepSparse(t.P, t.Indices, t.Values, 2, 0.01f, 0.1f),
             t => t.P);
+    }
+
+    [Fact]
+    public void SparseDispatchValidation_RejectsDuplicateIndicesBeforeDispatch()
+    {
+        var state = new MockBackendState();
+        var backend = MockDirectGpuBackend.Create(state);
+        var indices = new MockGpuBuffer(new[] { 1f, 1f });
+
+        WithSparseIndexValidation(enabled: true, () =>
+        {
+            var ex = Assert.Throws<ArgumentException>(() =>
+                GpuOptimizer.EnsureUniqueSparseDispatchIndices(backend, indices, 2, 4));
+
+            Assert.Contains("duplicate index 1", ex.Message);
+            Assert.Empty(state.OptimizerCalls);
+        });
+    }
+
+    [Fact]
+    public void SparseDispatchValidation_RejectsOutOfRangeIndicesBeforeDispatch()
+    {
+        var state = new MockBackendState();
+        var backend = MockDirectGpuBackend.Create(state);
+        var indices = new MockGpuBuffer(new[] { 0f, 4f });
+
+        WithSparseIndexValidation(enabled: true, () =>
+        {
+            Assert.Throws<ArgumentOutOfRangeException>(() =>
+                GpuOptimizer.EnsureUniqueSparseDispatchIndices(backend, indices, 2, 4));
+            Assert.Empty(state.OptimizerCalls);
+        });
+    }
+
+    [Fact]
+    public void SparseDispatchValidation_SkipsHostDownloadWhenDisabled()
+    {
+        var state = new MockBackendState();
+        var backend = MockDirectGpuBackend.Create(state);
+        var duplicateIndices = new MockGpuBuffer(new[] { 1f, 1f });
+
+        WithSparseIndexValidation(enabled: false, () =>
+            GpuOptimizer.EnsureUniqueSparseDispatchIndices(backend, duplicateIndices, 2, 4));
+
+        Assert.Equal(0, state.DownloadBufferCalls);
+        Assert.Empty(state.OptimizerCalls);
+    }
+
+    [Fact]
+    public void SparseDispatchValidation_AllowsUniqueIndicesWhenEnabled()
+    {
+        var state = new MockBackendState();
+        var backend = MockDirectGpuBackend.Create(state);
+        var indices = new MockGpuBuffer(new[] { 0f, 2f });
+
+        WithSparseIndexValidation(enabled: true, () =>
+            GpuOptimizer.EnsureUniqueSparseDispatchIndices(backend, indices, 2, 4));
+
+        Assert.Equal(1, state.DownloadBufferCalls);
+        Assert.Empty(state.OptimizerCalls);
+    }
+
+    [Fact]
+    public void SparseDispatchValidation_AllowsZeroNnzWithoutHostDownload()
+    {
+        var state = new MockBackendState();
+        var backend = MockDirectGpuBackend.Create(state);
+        var indices = new MockGpuBuffer(Array.Empty<float>());
+
+        WithSparseIndexValidation(enabled: true, () =>
+            GpuOptimizer.EnsureUniqueSparseDispatchIndices(backend, indices, 0, 4));
+
+        Assert.Equal(0, state.DownloadBufferCalls);
+        Assert.Empty(state.OptimizerCalls);
+    }
+
+    [Fact]
+    public void SparseDispatchValidation_RejectsShortIndexBufferWithoutHostDownload()
+    {
+        var state = new MockBackendState();
+        var backend = MockDirectGpuBackend.Create(state);
+        var indices = new MockGpuBuffer(new[] { 0f });
+
+        WithSparseIndexValidation(enabled: false, () =>
+        {
+            var ex = Assert.Throws<ArgumentException>(() =>
+                GpuOptimizer.EnsureUniqueSparseDispatchIndices(backend, indices, 2, 4));
+
+            Assert.Contains("sparseIndices buffer holds 1 elements but nnz=2", ex.Message);
+        });
+
+        Assert.Equal(0, state.DownloadBufferCalls);
+        Assert.Empty(state.OptimizerCalls);
+    }
+
+    [Fact]
+    public void SparsePrepare_RejectsShortDeviceBuffersBeforeDispatch()
+    {
+        using var ctx = new MockGpuEngineScope();
+        var param = GpuFloat(ctx.Backend, 4);
+        var values = GpuFloat(ctx.Backend, 2);
+        var shortIndices = Tensor<int>.FromGpuBuffer(ctx.Backend, new MockGpuBuffer(new[] { 0f }), new[] { 2 });
+
+        var indexEx = Assert.Throws<ArgumentException>(() =>
+            GpuOptimizer.TrySgdStepSparse(param, shortIndices, values, 2, 0.01f));
+        Assert.Contains("sparseIndices buffer holds 1 elements but nnz=2", indexEx.Message);
+        Assert.Empty(ctx.State.OptimizerCalls);
+
+        var indices = GpuInt(ctx.Backend, 2);
+        var shortValues = Tensor<float>.FromGpuBuffer(ctx.Backend, new MockGpuBuffer(new[] { 1f }), new[] { 2 });
+
+        var valueEx = Assert.Throws<ArgumentException>(() =>
+            GpuOptimizer.TrySgdStepSparse(param, indices, shortValues, 2, 0.01f));
+        Assert.Contains("sparseValues buffer holds 1 elements but nnz=2", valueEx.Message);
+        Assert.Empty(ctx.State.OptimizerCalls);
     }
 
     [Fact]
@@ -269,7 +385,26 @@ public sealed class GpuOptimizerResidencyMockTests
         => Tensor<float>.FromGpuBuffer(backend, new MockGpuBuffer(new float[length]), new[] { length });
 
     private static Tensor<int> GpuInt(IDirectGpuBackend backend, int length = 4)
-        => Tensor<int>.FromGpuBuffer(backend, new MockGpuBuffer(new float[length]), new[] { length });
+    {
+        var data = new float[length];
+        for (int i = 0; i < data.Length; i++)
+            data[i] = i;
+        return Tensor<int>.FromGpuBuffer(backend, new MockGpuBuffer(data), new[] { length });
+    }
+
+    private static void WithSparseIndexValidation(bool enabled, Action action)
+    {
+        bool prior = GpuOptimizer.ValidateSparseIndexUniqueness;
+        try
+        {
+            GpuOptimizer.ValidateSparseIndexUniqueness = enabled;
+            action();
+        }
+        finally
+        {
+            GpuOptimizer.ValidateSparseIndexUniqueness = prior;
+        }
+    }
 
     private sealed class DenseTensors
     {

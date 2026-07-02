@@ -1156,7 +1156,7 @@ struct OptimizerParams {
     beta2: f32,
     epsilon: f32,
     weight_decay: f32,
-    t: f32,
+    t: u32,
 }
 @group(0) @binding(4) var<uniform> opt_params: OptimizerParams;
 
@@ -1206,8 +1206,9 @@ fn adam(@builtin(global_invocation_id) gid: vec3<u32>) {
         velocity[idx] = opt_params.beta2 * velocity[idx] + (1.0 - opt_params.beta2) * grad * grad;
 
         // Bias correction
-        let m_hat = momentum[idx] / (1.0 - pow(opt_params.beta1, opt_params.t));
-        let v_hat = velocity[idx] / (1.0 - pow(opt_params.beta2, opt_params.t));
+        let step = f32(opt_params.t);
+        let m_hat = momentum[idx] / (1.0 - pow(opt_params.beta1, step));
+        let v_hat = velocity[idx] / (1.0 - pow(opt_params.beta2, step));
 
         // Update parameters
         params_arr[idx] = params_arr[idx] - opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
@@ -1225,8 +1226,9 @@ fn adamw(@builtin(global_invocation_id) gid: vec3<u32>) {
         velocity[idx] = opt_params.beta2 * velocity[idx] + (1.0 - opt_params.beta2) * grad * grad;
 
         // Bias correction
-        let m_hat = momentum[idx] / (1.0 - pow(opt_params.beta1, opt_params.t));
-        let v_hat = velocity[idx] / (1.0 - pow(opt_params.beta2, opt_params.t));
+        let step = f32(opt_params.t);
+        let m_hat = momentum[idx] / (1.0 - pow(opt_params.beta1, step));
+        let v_hat = velocity[idx] / (1.0 - pow(opt_params.beta2, step));
 
         // AdamW: decoupled weight decay
         params_arr[idx] = params_arr[idx] * (1.0 - opt_params.lr * opt_params.weight_decay);
@@ -2400,7 +2402,7 @@ struct OptimizerParams {
     beta2: f32,
     epsilon: f32,
     weight_decay: f32,
-    t: f32,
+    t: u32,
     extra: f32,
 }
 @group(0) @binding(4) var<uniform> opt_params: OptimizerParams;
@@ -2455,7 +2457,7 @@ fn adamax(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < opt_params.size) {
         let grad = gradients[idx] + opt_params.weight_decay * params_arr[idx];
-        let bc1 = 1.0 - pow(opt_params.beta1, opt_params.t);
+        let bc1 = 1.0 - pow(opt_params.beta1, f32(opt_params.t));
         state1[idx] = opt_params.beta1 * state1[idx] + (1.0 - opt_params.beta1) * grad;
         state2[idx] = max(opt_params.beta2 * state2[idx], abs(grad));
         params_arr[idx] = params_arr[idx] - opt_params.lr / bc1 * state1[idx] / (state2[idx] + opt_params.epsilon);
@@ -2477,8 +2479,9 @@ fn nadam(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < opt_params.size) {
         let grad = gradients[idx] + opt_params.weight_decay * params_arr[idx];
-        let bc1 = 1.0 - pow(opt_params.beta1, opt_params.t);
-        let bc2 = 1.0 - pow(opt_params.beta2, opt_params.t);
+        let step = f32(opt_params.t);
+        let bc1 = 1.0 - pow(opt_params.beta1, step);
+        let bc2 = 1.0 - pow(opt_params.beta2, step);
         state1[idx] = opt_params.beta1 * state1[idx] + (1.0 - opt_params.beta1) * grad;
         state2[idx] = opt_params.beta2 * state2[idx] + (1.0 - opt_params.beta2) * grad * grad;
         let m_hat = state1[idx] / bc1;
@@ -2504,7 +2507,7 @@ struct OptimizerParams {
     beta2: f32,
     epsilon: f32,
     weight_decay: f32,
-    t: f32,
+    t: u32,
 }
 @group(0) @binding(4) var<uniform> opt_params: OptimizerParams;
 
@@ -2515,8 +2518,9 @@ fn amsgrad(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < opt_params.size) {
         let grad = gradients[idx] + opt_params.weight_decay * params_arr[idx];
-        let bc1 = 1.0 - pow(opt_params.beta1, opt_params.t);
-        let bc2 = 1.0 - pow(opt_params.beta2, opt_params.t);
+        let step = f32(opt_params.t);
+        let bc1 = 1.0 - pow(opt_params.beta1, step);
+        let bc2 = 1.0 - pow(opt_params.beta2, step);
         m[idx] = opt_params.beta1 * m[idx] + (1.0 - opt_params.beta1) * grad;
         v[idx] = opt_params.beta2 * v[idx] + (1.0 - opt_params.beta2) * grad * grad;
         // v_max stored at offset size
@@ -2531,7 +2535,7 @@ fn amsgrad(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// AMSGrad optimizer with 5 separate storage buffers (params, gradients, m, v, v_max).
     /// Uses Dispatch5BufferAsync so uniform is at binding(5).
     /// </summary>
-    public const string Amsgrad5BufferOptimizerSource = @"
+public const string Amsgrad5BufferOptimizerSource = @"
 @group(0) @binding(0) var<storage, read_write> params_arr: array<f32>;
 @group(0) @binding(1) var<storage, read> gradients: array<f32>;
 @group(0) @binding(2) var<storage, read_write> m: array<f32>;
@@ -2545,7 +2549,7 @@ struct OptimizerParams {
     beta2: f32,
     epsilon: f32,
     weight_decay: f32,
-    t: f32,
+    t: u32,
     _pad: f32,
 }
 @group(0) @binding(5) var<uniform> opt_params: OptimizerParams;
@@ -2555,12 +2559,262 @@ fn amsgrad5(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < opt_params.size) {
         let grad = gradients[idx] + opt_params.weight_decay * params_arr[idx];
-        let bc1 = 1.0 - pow(opt_params.beta1, opt_params.t);
-        let bc2 = 1.0 - pow(opt_params.beta2, opt_params.t);
+        let step = f32(opt_params.t);
+        let bc1 = 1.0 - pow(opt_params.beta1, step);
+        let bc2 = 1.0 - pow(opt_params.beta2, step);
         m[idx] = opt_params.beta1 * m[idx] + (1.0 - opt_params.beta1) * grad;
         v[idx] = opt_params.beta2 * v[idx] + (1.0 - opt_params.beta2) * grad * grad;
         v_max[idx] = max(v_max[idx], v[idx]);
         params_arr[idx] = params_arr[idx] - opt_params.lr * (m[idx] / bc1) / (sqrt(v_max[idx] / bc2) + opt_params.epsilon);
+    }
+}
+";
+
+    /// <summary>
+    /// Sparse optimizer scatter-update kernels. One invocation per non-zero gradient.
+    /// Bindings: params, indices, values, state1, state2, state3, uniforms.
+    /// </summary>
+    public const string SparseOptimizerSource = @"
+@group(0) @binding(0) var<storage, read_write> params_arr: array<f32>;
+@group(0) @binding(1) var<storage, read> indices: array<f32>;
+@group(0) @binding(2) var<storage, read> values: array<f32>;
+@group(0) @binding(3) var<storage, read_write> state1: array<f32>;
+@group(0) @binding(4) var<storage, read_write> state2: array<f32>;
+@group(0) @binding(5) var<storage, read_write> state3: array<f32>;
+
+struct OptimizerParams {
+    size: u32,
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    epsilon: f32,
+    weight_decay: f32,
+    t: u32,
+    extra: f32,
+    param_size: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+@group(0) @binding(6) var<uniform> opt_params: OptimizerParams;
+
+// CONTRACT: the sparse index list is expected to be UNIQUE per dispatch - the caller pre-aggregates
+// (sums) gradients for repeated indices before applying them, as is standard for sparse/embedding
+// gradient updates. Under that contract no two invocations touch the same param/state slot, so the
+// non-atomic scatter below is race-free and matches the sequential CPU reference bit-for-bit.
+// (WGSL storage atomics are u32/i32 only, so an f32 accumulate would need a bitcast CAS loop; that is
+// deferred unless a duplicate-index workload is actually required.) The same contract holds for the
+// CUDA/HIP/OpenCL/Metal/Vulkan sparse kernels.
+fn decode_sparse_index(raw: f32) -> u32 {
+    let bitcast = bitcast<i32>(raw);
+    if (bitcast >= 0 && u32(bitcast) < opt_params.param_size) {
+        return u32(bitcast);
+    }
+    // Validate in the FLOAT domain before i32(raw) - the conversion is implementation-defined for NaN/
+    // Inf or out-of-range values. (raw == raw) rejects NaN; the range check rejects +/-Inf.
+    if (raw == raw && raw >= 0.0 && raw < f32(opt_params.param_size) && raw == trunc(raw)) {
+        return u32(raw);
+    }
+    return opt_params.param_size;
+}
+
+fn sparse_slot(k: u32) -> u32 {
+    return decode_sparse_index(indices[k]);
+}
+
+@compute @workgroup_size(256)
+fn sparse_sgd_update(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= opt_params.size) { return; }
+    let i = sparse_slot(k); if (i >= opt_params.param_size) { return; }
+    var grad = values[k];
+    if (opt_params.weight_decay > 0.0) { grad = grad + opt_params.weight_decay * params_arr[i]; }
+    params_arr[i] = params_arr[i] - opt_params.lr * grad;
+}
+
+@compute @workgroup_size(256)
+fn sparse_sgd_momentum_update(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= opt_params.size) { return; }
+    let i = sparse_slot(k); if (i >= opt_params.param_size) { return; }
+    var grad = values[k];
+    if (opt_params.weight_decay > 0.0) { grad = grad + opt_params.weight_decay * params_arr[i]; }
+    state1[i] = opt_params.beta1 * state1[i] + grad;
+    params_arr[i] = params_arr[i] - opt_params.lr * state1[i];
+}
+
+@compute @workgroup_size(256)
+fn sparse_adam_update(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= opt_params.size) { return; }
+    let i = sparse_slot(k); if (i >= opt_params.param_size) { return; }
+    let grad = values[k];
+    state1[i] = opt_params.beta1 * state1[i] + (1.0 - opt_params.beta1) * grad;
+    state2[i] = opt_params.beta2 * state2[i] + (1.0 - opt_params.beta2) * grad * grad;
+    let step = f32(opt_params.t);
+    let m_hat = state1[i] / (1.0 - pow(opt_params.beta1, step));
+    let v_hat = state2[i] / (1.0 - pow(opt_params.beta2, step));
+    var update = opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
+    if (opt_params.weight_decay > 0.0) { update = update + opt_params.lr * opt_params.weight_decay * params_arr[i]; }
+    params_arr[i] = params_arr[i] - update;
+}
+
+@compute @workgroup_size(256)
+fn sparse_adamw_update(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= opt_params.size) { return; }
+    let i = sparse_slot(k); if (i >= opt_params.param_size) { return; }
+    let grad = values[k];
+    var p = params_arr[i];
+    if (opt_params.weight_decay > 0.0) { p = p - opt_params.lr * opt_params.weight_decay * p; }
+    state1[i] = opt_params.beta1 * state1[i] + (1.0 - opt_params.beta1) * grad;
+    state2[i] = opt_params.beta2 * state2[i] + (1.0 - opt_params.beta2) * grad * grad;
+    let step = f32(opt_params.t);
+    let m_hat = state1[i] / (1.0 - pow(opt_params.beta1, step));
+    let v_hat = state2[i] / (1.0 - pow(opt_params.beta2, step));
+    params_arr[i] = p - opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
+}
+
+@compute @workgroup_size(256)
+fn sparse_rmsprop_update(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= opt_params.size) { return; }
+    let i = sparse_slot(k); if (i >= opt_params.param_size) { return; }
+    var grad = values[k];
+    if (opt_params.weight_decay > 0.0) { grad = grad + opt_params.weight_decay * params_arr[i]; }
+    state1[i] = opt_params.beta1 * state1[i] + (1.0 - opt_params.beta1) * grad * grad;
+    params_arr[i] = params_arr[i] - opt_params.lr * grad / (sqrt(state1[i]) + opt_params.epsilon);
+}
+
+@compute @workgroup_size(256)
+fn sparse_adagrad_update(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= opt_params.size) { return; }
+    let i = sparse_slot(k); if (i >= opt_params.param_size) { return; }
+    var grad = values[k];
+    if (opt_params.weight_decay > 0.0) { grad = grad + opt_params.weight_decay * params_arr[i]; }
+    state1[i] = state1[i] + grad * grad;
+    params_arr[i] = params_arr[i] - opt_params.lr * grad / (sqrt(state1[i]) + opt_params.epsilon);
+}
+
+@compute @workgroup_size(256)
+fn sparse_nag_update(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= opt_params.size) { return; }
+    let i = sparse_slot(k); if (i >= opt_params.param_size) { return; }
+    var grad = values[k];
+    if (opt_params.weight_decay > 0.0) { grad = grad + opt_params.weight_decay * params_arr[i]; }
+    let v_old = state1[i];
+    let v_new = opt_params.beta1 * v_old + grad;
+    state1[i] = v_new;
+    params_arr[i] = params_arr[i] - opt_params.lr * ((1.0 + opt_params.beta1) * v_new - opt_params.beta1 * v_old);
+}
+
+@compute @workgroup_size(256)
+fn sparse_adadelta_update(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= opt_params.size) { return; }
+    let i = sparse_slot(k); if (i >= opt_params.param_size) { return; }
+    var grad = values[k];
+    if (opt_params.weight_decay > 0.0) { grad = grad + opt_params.weight_decay * params_arr[i]; }
+    let one_minus_rho = 1.0 - opt_params.beta1;
+    state1[i] = opt_params.beta1 * state1[i] + one_minus_rho * grad * grad;
+    let dx = sqrt(state2[i] + opt_params.epsilon) / sqrt(state1[i] + opt_params.epsilon) * grad;
+    state2[i] = opt_params.beta1 * state2[i] + one_minus_rho * dx * dx;
+    params_arr[i] = params_arr[i] - dx;
+}
+
+@compute @workgroup_size(256)
+fn sparse_amsgrad_update(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= opt_params.size) { return; }
+    let i = sparse_slot(k); if (i >= opt_params.param_size) { return; }
+    var grad = values[k];
+    if (opt_params.weight_decay > 0.0) { grad = grad + opt_params.weight_decay * params_arr[i]; }
+    state1[i] = opt_params.beta1 * state1[i] + (1.0 - opt_params.beta1) * grad;
+    state2[i] = opt_params.beta2 * state2[i] + (1.0 - opt_params.beta2) * grad * grad;
+    state3[i] = max(state3[i], state2[i]);
+    let step = f32(opt_params.t);
+    let m_hat = state1[i] / (1.0 - pow(opt_params.beta1, step));
+    let v_hat = state3[i] / (1.0 - pow(opt_params.beta2, step));
+    params_arr[i] = params_arr[i] - opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
+}
+
+@compute @workgroup_size(256)
+fn sparse_adamax_update(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= opt_params.size) { return; }
+    let i = sparse_slot(k); if (i >= opt_params.param_size) { return; }
+    var grad = values[k];
+    if (opt_params.weight_decay > 0.0) { grad = grad + opt_params.weight_decay * params_arr[i]; }
+    state1[i] = opt_params.beta1 * state1[i] + (1.0 - opt_params.beta1) * grad;
+    state2[i] = max(opt_params.beta2 * state2[i], abs(grad));
+    let lr_adj = opt_params.lr / (1.0 - pow(opt_params.beta1, f32(opt_params.t)));
+    params_arr[i] = params_arr[i] - lr_adj * state1[i] / (state2[i] + opt_params.epsilon);
+}
+
+@compute @workgroup_size(256)
+fn sparse_lion_update(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= opt_params.size) { return; }
+    let i = sparse_slot(k); if (i >= opt_params.param_size) { return; }
+    let grad = values[k];
+    var update = sign(opt_params.beta1 * state1[i] + (1.0 - opt_params.beta1) * grad);
+    if (opt_params.weight_decay > 0.0) { update = update + opt_params.weight_decay * params_arr[i]; }
+    params_arr[i] = params_arr[i] - opt_params.lr * update;
+    state1[i] = opt_params.beta2 * state1[i] + (1.0 - opt_params.beta2) * grad;
+}
+
+@compute @workgroup_size(256)
+fn sparse_nadam_update(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= opt_params.size) { return; }
+    let i = sparse_slot(k); if (i >= opt_params.param_size) { return; }
+    var grad = values[k];
+    if (opt_params.weight_decay > 0.0) { grad = grad + opt_params.weight_decay * params_arr[i]; }
+    state1[i] = opt_params.beta1 * state1[i] + (1.0 - opt_params.beta1) * grad;
+    state2[i] = opt_params.beta2 * state2[i] + (1.0 - opt_params.beta2) * grad * grad;
+    let step = f32(opt_params.t);
+    let bc1 = 1.0 - pow(opt_params.beta1, step);
+    let bc2 = 1.0 - pow(opt_params.beta2, step);
+    let m_hat = (opt_params.beta1 * state1[i] + (1.0 - opt_params.beta1) * grad) / bc1;
+    let v_hat = state2[i] / bc2;
+    params_arr[i] = params_arr[i] - opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
+}
+
+@compute @workgroup_size(256)
+fn sparse_ftrl_update(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= opt_params.size) { return; }
+    let i = sparse_slot(k); if (i >= opt_params.param_size) { return; }
+    let grad = values[k];
+    let n_old = state2[i];
+    let n_new = n_old + grad * grad;
+    state2[i] = n_new;
+    let sigma = (sqrt(n_new) - sqrt(n_old)) / opt_params.lr;
+    state1[i] = state1[i] + grad - sigma * params_arr[i];
+    if (abs(state1[i]) <= opt_params.beta1) {
+        params_arr[i] = 0.0;
+    } else {
+        let sign_z = select(-1.0, 1.0, state1[i] > 0.0);
+        params_arr[i] = (sign_z * opt_params.beta1 - state1[i]) /
+            ((opt_params.extra + sqrt(n_new)) / opt_params.lr + opt_params.beta2);
+    }
+}
+
+@compute @workgroup_size(256)
+fn sparse_proximal_l1_update(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= opt_params.size) { return; }
+    let i = sparse_slot(k); if (i >= opt_params.param_size) { return; }
+    let p = params_arr[i] - opt_params.lr * values[k];
+    let threshold = opt_params.lr * opt_params.beta1;
+    if (p > threshold) {
+        params_arr[i] = p - threshold;
+    } else if (p < -threshold) {
+        params_arr[i] = p + threshold;
+    } else {
+        params_arr[i] = 0.0;
     }
 }
 ";
@@ -3870,7 +4124,7 @@ struct OptimizerParams {
     beta2: f32,
     epsilon: f32,
     weight_decay: f32,
-    t: f32,
+    t: u32,
     extra: f32,
 }
 @group(0) @binding(4) var<uniform> opt_params: OptimizerParams;
@@ -3894,8 +4148,9 @@ fn lamb_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (idx < opt_params.size) {
         // extra = pre-computed ratio = param_norm / update_norm
         let ratio = opt_params.extra;
-        let bc1 = 1.0 - pow(opt_params.beta1, opt_params.t);
-        let bc2 = 1.0 - pow(opt_params.beta2, opt_params.t);
+        let step = f32(opt_params.t);
+        let bc1 = 1.0 - pow(opt_params.beta1, step);
+        let bc2 = 1.0 - pow(opt_params.beta2, step);
         let grad = gradients[idx];
         state1[idx] = opt_params.beta1 * state1[idx] + (1.0 - opt_params.beta1) * grad;
         state2[idx] = opt_params.beta2 * state2[idx] + (1.0 - opt_params.beta2) * grad * grad;
@@ -8399,7 +8654,7 @@ fn reduce_partial_sums(@builtin(local_invocation_id) lid: vec3<u32>) {
                AdditionalUnarySource + InverseHyperbolicSource + FillSource + ClampSource +
                FmaSource + BiasAddSource + Conv2DBiasAddSource + ActivationBackwardSource +
                LossBackwardSource + SoftmaxBackwardSource + AdditionalOptimizerSource +
-               AmsgradOptimizerSource + Amsgrad5BufferOptimizerSource +
+               AmsgradOptimizerSource + Amsgrad5BufferOptimizerSource + SparseOptimizerSource +
                DropoutSource + EmbeddingSource + InstanceNormSource +
                RMSNormSource + StatisticsSource + BroadcastSource + GradientClipSource +
                ScatterGatherSource + Conv2DBackwardSource + Conv2DBackwardKernelSource +

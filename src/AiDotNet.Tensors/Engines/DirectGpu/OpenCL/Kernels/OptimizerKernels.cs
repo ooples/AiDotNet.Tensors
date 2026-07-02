@@ -630,6 +630,266 @@ __kernel void proximal_l1_update(
         param[idx] = signTmp * mag;
     }
 }
+
+inline int decode_sparse_index(float raw, int param_size)
+{
+    int bitcast = as_int(raw);
+    if (bitcast >= 0 && bitcast < param_size) return bitcast;
+    // Validate in the FLOAT domain before the (int) cast — (int)raw is undefined for NaN/Inf or
+    // out-of-int-range values on the device. Only convert once raw is finite, non-negative, in range
+    // and integral.
+    if (isfinite(raw) && raw >= 0.0f && raw < (float)param_size && raw == trunc(raw)) return (int)raw;
+    return -1;
+}
+
+__kernel void sparse_sgd_update(
+    __global float* param, __global const float* indices, __global const float* values,
+    const float learningRate, const float weightDecay, const int nnz, const int param_size)
+{
+    const int k = get_global_id(0);
+    if (k >= nnz) return;
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
+    float grad = values[k];
+    if (weightDecay > 0.0f) grad += weightDecay * param[i];
+    param[i] -= learningRate * grad;
+}
+
+__kernel void sparse_sgd_momentum_update(
+    __global float* param, __global const float* indices, __global const float* values,
+    __global float* velocity,
+    const float learningRate, const float momentum, const float weightDecay, const int nnz, const int param_size)
+{
+    const int k = get_global_id(0);
+    if (k >= nnz) return;
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
+    float grad = values[k];
+    if (weightDecay > 0.0f) grad += weightDecay * param[i];
+    float v = momentum * velocity[i] + grad;
+    velocity[i] = v;
+    param[i] -= learningRate * v;
+}
+
+__kernel void sparse_adam_update(
+    __global float* param, __global const float* indices, __global const float* values,
+    __global float* m, __global float* v,
+    const float learningRate, const float beta1, const float beta2, const float epsilon,
+    const float weightDecay, const int step, const int nnz, const int param_size)
+{
+    const int k = get_global_id(0);
+    if (k >= nnz) return;
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
+    float grad = values[k];
+    float mVal = beta1 * m[i] + (1.0f - beta1) * grad;
+    float vVal = beta2 * v[i] + (1.0f - beta2) * grad * grad;
+    m[i] = mVal;
+    v[i] = vVal;
+    float mHat = mVal / (1.0f - pow(beta1, (float)step));
+    float vHat = vVal / (1.0f - pow(beta2, (float)step));
+    float update = learningRate * mHat / (sqrt(vHat) + epsilon);
+    if (weightDecay > 0.0f) update += learningRate * weightDecay * param[i];
+    param[i] -= update;
+}
+
+__kernel void sparse_adamw_update(
+    __global float* param, __global const float* indices, __global const float* values,
+    __global float* m, __global float* v,
+    const float learningRate, const float beta1, const float beta2, const float epsilon,
+    const float weightDecay, const int step, const int nnz, const int param_size)
+{
+    const int k = get_global_id(0);
+    if (k >= nnz) return;
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
+    float grad = values[k];
+    float p = param[i];
+    if (weightDecay > 0.0f) p -= learningRate * weightDecay * p;
+    float mVal = beta1 * m[i] + (1.0f - beta1) * grad;
+    float vVal = beta2 * v[i] + (1.0f - beta2) * grad * grad;
+    m[i] = mVal;
+    v[i] = vVal;
+    float mHat = mVal / (1.0f - pow(beta1, (float)step));
+    float vHat = vVal / (1.0f - pow(beta2, (float)step));
+    param[i] = p - learningRate * mHat / (sqrt(vHat) + epsilon);
+}
+
+__kernel void sparse_rmsprop_update(
+    __global float* param, __global const float* indices, __global const float* values,
+    __global float* squaredAvg,
+    const float learningRate, const float rho, const float epsilon, const float weightDecay, const int nnz, const int param_size)
+{
+    const int k = get_global_id(0);
+    if (k >= nnz) return;
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
+    float grad = values[k];
+    if (weightDecay > 0.0f) grad += weightDecay * param[i];
+    float sq = rho * squaredAvg[i] + (1.0f - rho) * grad * grad;
+    squaredAvg[i] = sq;
+    param[i] -= learningRate * grad / (sqrt(sq) + epsilon);
+}
+
+__kernel void sparse_adagrad_update(
+    __global float* param, __global const float* indices, __global const float* values,
+    __global float* accum,
+    const float learningRate, const float epsilon, const float weightDecay, const int nnz, const int param_size)
+{
+    const int k = get_global_id(0);
+    if (k >= nnz) return;
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
+    float grad = values[k];
+    if (weightDecay > 0.0f) grad += weightDecay * param[i];
+    float a = accum[i] + grad * grad;
+    accum[i] = a;
+    param[i] -= learningRate * grad / (sqrt(a) + epsilon);
+}
+
+__kernel void sparse_nag_update(
+    __global float* param, __global const float* indices, __global const float* values,
+    __global float* velocity,
+    const float learningRate, const float momentum, const float weightDecay, const int nnz, const int param_size)
+{
+    const int k = get_global_id(0);
+    if (k >= nnz) return;
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
+    float grad = values[k];
+    if (weightDecay > 0.0f) grad += weightDecay * param[i];
+    float vOld = velocity[i];
+    float vNew = momentum * vOld + grad;
+    velocity[i] = vNew;
+    param[i] -= learningRate * ((1.0f + momentum) * vNew - momentum * vOld);
+}
+
+__kernel void sparse_adadelta_update(
+    __global float* param, __global const float* indices, __global const float* values,
+    __global float* accumGrad, __global float* accumUpdate,
+    const float rho, const float epsilon, const float weightDecay, const int nnz, const int param_size)
+{
+    const int k = get_global_id(0);
+    if (k >= nnz) return;
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
+    float grad = values[k];
+    if (weightDecay > 0.0f) grad += weightDecay * param[i];
+    float oneMinusRho = 1.0f - rho;
+    float ag = rho * accumGrad[i] + oneMinusRho * grad * grad;
+    accumGrad[i] = ag;
+    float dx = sqrt(accumUpdate[i] + epsilon) / sqrt(ag + epsilon) * grad;
+    accumUpdate[i] = rho * accumUpdate[i] + oneMinusRho * dx * dx;
+    param[i] -= dx;
+}
+
+__kernel void sparse_amsgrad_update(
+    __global float* param, __global const float* indices, __global const float* values,
+    __global float* m, __global float* v, __global float* vMax,
+    const float learningRate, const float beta1, const float beta2, const float epsilon,
+    const float weightDecay, const int step, const int nnz, const int param_size)
+{
+    const int k = get_global_id(0);
+    if (k >= nnz) return;
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
+    float grad = values[k];
+    if (weightDecay > 0.0f) grad += weightDecay * param[i];
+    float mVal = beta1 * m[i] + (1.0f - beta1) * grad;
+    float vVal = beta2 * v[i] + (1.0f - beta2) * grad * grad;
+    m[i] = mVal;
+    v[i] = vVal;
+    float vMaxNew = fmax(vMax[i], vVal);
+    vMax[i] = vMaxNew;
+    float mHat = mVal / (1.0f - pow(beta1, (float)step));
+    float vHat = vMaxNew / (1.0f - pow(beta2, (float)step));
+    param[i] -= learningRate * mHat / (sqrt(vHat) + epsilon);
+}
+
+__kernel void sparse_adamax_update(
+    __global float* param, __global const float* indices, __global const float* values,
+    __global float* m, __global float* u,
+    const float learningRate, const float beta1, const float beta2, const float epsilon,
+    const float weightDecay, const int step, const int nnz, const int param_size)
+{
+    const int k = get_global_id(0);
+    if (k >= nnz) return;
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
+    float grad = values[k];
+    if (weightDecay > 0.0f) grad += weightDecay * param[i];
+    float mVal = beta1 * m[i] + (1.0f - beta1) * grad;
+    float uVal = fmax(beta2 * u[i], fabs(grad));
+    m[i] = mVal;
+    u[i] = uVal;
+    float lrAdj = learningRate / (1.0f - pow(beta1, (float)step));
+    param[i] -= lrAdj * mVal / (uVal + epsilon);
+}
+
+__kernel void sparse_lion_update(
+    __global float* param, __global const float* indices, __global const float* values,
+    __global float* m,
+    const float learningRate, const float beta1, const float beta2, const float weightDecay, const int nnz, const int param_size)
+{
+    const int k = get_global_id(0);
+    if (k >= nnz) return;
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
+    float grad = values[k];
+    float c = beta1 * m[i] + (1.0f - beta1) * grad;
+    float update = (c > 0.0f) ? 1.0f : ((c < 0.0f) ? -1.0f : 0.0f);
+    if (weightDecay > 0.0f) update += weightDecay * param[i];
+    param[i] -= learningRate * update;
+    m[i] = beta2 * m[i] + (1.0f - beta2) * grad;
+}
+
+__kernel void sparse_nadam_update(
+    __global float* param, __global const float* indices, __global const float* values,
+    __global float* m, __global float* v,
+    const float learningRate, const float beta1, const float beta2, const float epsilon,
+    const float weightDecay, const int step, const int nnz, const int param_size)
+{
+    const int k = get_global_id(0);
+    if (k >= nnz) return;
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
+    float grad = values[k];
+    if (weightDecay > 0.0f) grad += weightDecay * param[i];
+    float mVal = beta1 * m[i] + (1.0f - beta1) * grad;
+    float vVal = beta2 * v[i] + (1.0f - beta2) * grad * grad;
+    m[i] = mVal;
+    v[i] = vVal;
+    float bc1 = 1.0f - pow(beta1, (float)step);
+    float bc2 = 1.0f - pow(beta2, (float)step);
+    float mHat = (beta1 * mVal + (1.0f - beta1) * grad) / bc1;
+    float vHat = vVal / bc2;
+    param[i] -= learningRate * mHat / (sqrt(vHat) + epsilon);
+}
+
+__kernel void sparse_ftrl_update(
+    __global float* param, __global const float* indices, __global const float* values,
+    __global float* z, __global float* n,
+    const float learningRate, const float l1Reg, const float l2Reg, const float beta, const int nnz, const int param_size)
+{
+    const int k = get_global_id(0);
+    if (k >= nnz) return;
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
+    float grad = values[k];
+    float nOld = n[i];
+    float nNew = nOld + grad * grad;
+    n[i] = nNew;
+    float sigma = (sqrt(nNew) - sqrt(nOld)) / learningRate;
+    z[i] += grad - sigma * param[i];
+    float zVal = z[i];
+    if (fabs(zVal) <= l1Reg) {
+        param[i] = 0.0f;
+    } else {
+        float sign = (zVal > 0.0f) ? 1.0f : -1.0f;
+        param[i] = (sign * l1Reg - zVal) / ((beta + sqrt(nNew)) / learningRate + l2Reg);
+    }
+}
+
+__kernel void sparse_proximal_l1_update(
+    __global float* param, __global const float* indices, __global const float* values,
+    const float learningRate, const float l1Strength, const int nnz, const int param_size)
+{
+    const int k = get_global_id(0);
+    if (k >= nnz) return;
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
+    float p = param[i] - learningRate * values[k];
+    float threshold = learningRate * l1Strength;
+    if (p > threshold)       param[i] = p - threshold;
+    else if (p < -threshold) param[i] = p + threshold;
+    else                     param[i] = 0.0f;
+}
 ";
     }
 
@@ -655,7 +915,21 @@ __kernel void proximal_l1_update(
             "lion_update",
             "nadam_update",
             "ftrl_update",
-            "proximal_l1_update"
+            "proximal_l1_update",
+            "sparse_sgd_update",
+            "sparse_sgd_momentum_update",
+            "sparse_adam_update",
+            "sparse_adamw_update",
+            "sparse_rmsprop_update",
+            "sparse_adagrad_update",
+            "sparse_nag_update",
+            "sparse_adadelta_update",
+            "sparse_amsgrad_update",
+            "sparse_adamax_update",
+            "sparse_lion_update",
+            "sparse_nadam_update",
+            "sparse_ftrl_update",
+            "sparse_proximal_l1_update"
         };
     }
 }

@@ -22,9 +22,20 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// the reverse-mode gradient (as computed by
 /// <see cref="TensorFunc{T}.Grad"/>) to within numerical tolerance.
 /// </summary>
-public class TorchFuncPhase2Tests
+[Collection("EngineCurrentGlobalState")]
+public class TorchFuncPhase2Tests : IDisposable
 {
-    private readonly IEngine _engine = AiDotNetEngine.Current;
+    private readonly IEngine _engine;
+    private readonly IEngine _previousEngine;
+
+    public TorchFuncPhase2Tests()
+    {
+        _previousEngine = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = new CpuEngine();
+        _engine = AiDotNetEngine.Current;
+    }
+
+    public void Dispose() => AiDotNetEngine.Current = _previousEngine;
 
     [Fact]
     public void Dual_Constant_HasZeroTangent()

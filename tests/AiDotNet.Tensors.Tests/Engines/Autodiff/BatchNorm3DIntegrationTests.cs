@@ -14,21 +14,30 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// regimes, repeat-backward across tapes, and both floating-point
 /// precisions.
 /// </summary>
+[Collection("EngineCurrentGlobalState")]
 public class BatchNorm3DIntegrationTests : IDisposable
 {
-    private readonly IEngine _engine = AiDotNetEngine.Current;
+    private readonly IEngine _engine;
+    private readonly IEngine _previousEngine;
     private readonly bool _previousReplayMode;
 
     public BatchNorm3DIntegrationTests()
     {
+        _previousEngine = AiDotNetEngine.Current;
         // Capture AutoTrainingCompiler.ReplayMode so Dispose can restore
         // the process-wide value; leaving it pinned at false would
         // shadow replay-mode coverage in any subsequent test class.
         _previousReplayMode = AutoTrainingCompiler.ReplayMode;
+        AiDotNetEngine.Current = new CpuEngine();
+        _engine = AiDotNetEngine.Current;
         AutoTrainingCompiler.ReplayMode = false;
     }
 
-    public void Dispose() => AutoTrainingCompiler.ReplayMode = _previousReplayMode;
+    public void Dispose()
+    {
+        AutoTrainingCompiler.ReplayMode = _previousReplayMode;
+        AiDotNetEngine.Current = _previousEngine;
+    }
 
     /// <summary>
     /// Training loop: `[C, H, W] → BatchNorm → ReLU → MSE loss`. Verify

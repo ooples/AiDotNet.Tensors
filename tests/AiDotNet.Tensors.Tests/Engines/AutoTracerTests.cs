@@ -204,6 +204,21 @@ public class AutoTracerTests
         Assert.Equal(200, result2.Length);
     }
 
+    [Fact]
+    public void SameShapeNewOperands_DoNotReplayStaleCapturedInputs()
+    {
+        var warmA = new Tensor<float>(new[] { 3.5f }, new[] { 1 });
+        var warmB = new Tensor<float>(new[] { 3.5f }, new[] { 1 });
+        for (int i = 0; i < 8; i++)
+            Assert.Equal(12.25f, E.TensorMultiply(warmA, warmB)[0], precision: 4);
+
+        var currentA = new Tensor<float>(new[] { 0.5f }, new[] { 1 });
+        var currentB = new Tensor<float>(new[] { 0.5f }, new[] { 1 });
+        var result = E.TensorMultiply(currentA, currentB);
+
+        Assert.Equal(0.25f, result[0], precision: 4);
+    }
+
     #endregion
 
     #region Multi-op patterns

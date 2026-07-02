@@ -2327,18 +2327,19 @@ public interface IDirectGpuBackend : IDisposable
 
     // --------------------------------------------------------------
     // PR #567 — Sparse counterparts of the dense optimizer steps above.
-    // Each method launches a native CUDA scatter-update kernel with one
-    // thread per non-zero gradient (nnz). Only (param[idx], state[idx])
-    // entries are read/written; the other (N − nnz) entries are never
-    // touched. Memory traffic is O(nnz) vs. the dense path's O(N).
+    // Each method performs a GPU sparse scatter update with one thread or
+    // staged update per non-zero gradient (nnz). Only (param[idx], state[idx])
+    // entries are read/written; the other (N − nnz) entries are never touched.
+    // Native scatter backends provide O(nnz) device work and memory traffic
+    // vs. the dense path's O(N). Staged correctness fallback backends may
+    // transfer full param/state buffers and must document that behavior.
     //
     // sparseIndices and sparseValues are GPU-resident buffers of length
-    // >= nnz; the dense state buffers (m, v, accum, ...) keep their full
-    // shape and are mutated in place at the touched indices only.
-    //
-    // Backends that don't ship the sparse_* kernel should throw
-    // NotSupportedException; the GpuOptimizer wrapper will then return
-    // false so the caller falls back to the CPU sparse path.
+    // >= nnz. sparseIndices[0..nnz) must be in range, unique, and
+    // pre-aggregated before dispatch; native kernels use non-atomic scatter
+    // writes and duplicate-index order is intentionally undefined. The dense
+    // state buffers (m, v, accum, ...) keep their full shape and are mutated
+    // in place at the touched indices only.
     // --------------------------------------------------------------
 
     /// <summary>Sparse SGD scatter-update on GPU. See SgdUpdate for the dense counterpart.</summary>

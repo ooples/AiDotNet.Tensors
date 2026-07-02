@@ -1,6 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
 using System;
+using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -378,23 +379,25 @@ public static class GpuOptimizer
     // SPARSE-AWARE GPU OPTIMIZER WRAPPERS — PR #567
     // ==================================================================
     //
-    // Each wrapper below dispatches the matching NATIVE sparse_*_update
-    // CUDA kernel (defined in CudaOptimizerKernels.cs, launched by
-    // CudaBackend.SparseXUpdate). Grid dim = ceil(nnz / 256); each kernel
+    // Each wrapper below dispatches the matching native backend sparse optimizer
+    // kernel. Grid dim = ceil(nnz / 256); each kernel
     // thread reads exactly one (idx[k], val[k]) and scatter-updates only
     // (param[idx], state[idx]). Memory traffic is O(nnz) — the other
-    // (param.Length - nnz) entries are never read or written.
+    // (param.Length - nnz) entries are never read or written on native
+    // scatter backends. Staged fallback backends preserve correctness but
+    // may transfer full param/state buffers.
     //
     // sparseIndices and sparseValues must already be GPU-resident
-    // (TryGetGpuBuffer must succeed for them). The dense state buffers
-    // (m, v, accum, ...) keep their full shape and are mutated in place
-    // at the touched indices.
+    // (TryGetGpuBuffer must succeed for them). sparseIndices[0..nnz) must
+    // be in range, unique, and pre-aggregated; native kernels intentionally
+    // use non-atomic scatter writes and do not define duplicate-index order.
+    // The dense state buffers (m, v, accum, ...) keep their full shape and
+    // are mutated in place at the touched indices.
     //
     // Returns false on:
     //   * non-GPU engine (caller should run CPU sparse path)
     //   * any tensor missing its GPU buffer
-    //   * backend NotSupportedException (non-CUDA backends without the
-    //     native sparse kernel yet — HIP/Metal/Vulkan/WebGpu/OpenCL)
+    //   * backend NotSupportedException
     // ==================================================================
 
     private static bool TryPrepareSparse(
@@ -415,7 +418,65 @@ public static class GpuOptimizer
         pBuf = param.TryGetGpuBuffer();
         idxBuf = sparseIndices.TryGetGpuBuffer();
         valBuf = sparseValues.TryGetGpuBuffer();
-        return pBuf is not null && idxBuf is not null && valBuf is not null;
+        if (pBuf is null || idxBuf is null || valBuf is null) return false;
+
+        // Cheap, always-on device-buffer bounds guards: the kernels read indices[k] AND values[k] for
+        // k < nnz, so both buffers must hold at least nnz elements or the dispatch reads out of bounds.
+        if (idxBuf.Size < nnz)
+            throw new ArgumentException($"sparseIndices buffer holds {idxBuf.Size} elements but nnz={nnz}.", nameof(sparseIndices));
+        if (valBuf.Size < nnz)
+            throw new ArgumentException($"sparseValues buffer holds {valBuf.Size} elements but nnz={nnz}.", nameof(sparseValues));
+
+        EnsureUniqueSparseDispatchIndices(backend, idxBuf, nnz, param.Length);
+        return true;
+    }
+
+    /// <summary>
+    /// Opt-in gate for the O(nnz) host-side duplicate-index verification in
+    /// <see cref="EnsureUniqueSparseDispatchIndices"/>. The native sparse kernels are non-atomic and
+    /// require unique, pre-aggregated indices per dispatch (see the <c>IDirectGpuBackend</c> sparse
+    /// optimizer contract), but downloading the index buffer and building a <see cref="HashSet{T}"/> on
+    /// every step forces a host round-trip that can serialize the GPU queue and defeats the O(nnz)
+    /// on-device benefit. Off by default (release/native fast path — callers own the uniqueness
+    /// invariant); enable via <c>AIDOTNET_VALIDATE_SPARSE_INDICES=1</c> for debugging or staged fallback.
+    /// </summary>
+    internal static bool ValidateSparseIndexUniqueness { get; set; } =
+        Environment.GetEnvironmentVariable("AIDOTNET_VALIDATE_SPARSE_INDICES") == "1";
+
+    internal static void EnsureUniqueSparseDispatchIndices(IDirectGpuBackend backend, IGpuBuffer sparseIndices, int nnz, int paramLength)
+    {
+        if (nnz == 0) return;
+        // Always-on cheap bounds guard (no host transfer).
+        if (sparseIndices.Size < nnz)
+            throw new ArgumentException($"sparseIndices buffer holds {sparseIndices.Size} elements but nnz={nnz}.", nameof(sparseIndices));
+
+        // The duplicate/uniqueness scan below needs a DownloadBuffer round-trip + a HashSet — O(nnz)
+        // off-device work on every sparse step. Skip it on the fast path; the native kernels' unique-index
+        // requirement is part of the backend contract and callers pre-aggregate. Opt in for verification.
+        if (!ValidateSparseIndexUniqueness) return;
+
+        var rawIndices = backend.DownloadBuffer(sparseIndices);
+        var seen = new HashSet<int>();
+        for (int k = 0; k < nnz; k++)
+        {
+            int index;
+            try
+            {
+                index = SparseOptimizerReference.DecodeIndex(rawIndices[k], paramLength);
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(sparseIndices),
+                    rawIndices[k],
+                    $"sparseIndices[{k}] is outside [0, {paramLength}).");
+            }
+
+            if (!seen.Add(index))
+                throw new ArgumentException(
+                    $"sparseIndices contains duplicate index {index} at position {k}; GPU sparse optimizer indices must be unique and pre-aggregated before dispatch.",
+                    nameof(sparseIndices));
+        }
     }
 
     /// <summary>Adam GPU step driven by a sparse gradient — dispatches the native
