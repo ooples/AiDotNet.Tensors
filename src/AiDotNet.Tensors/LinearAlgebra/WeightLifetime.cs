@@ -61,10 +61,16 @@ public enum WeightLifetime
 public enum StreamingStoreDtype
 {
     /// <summary>Context-aware default — compresses whenever the execution mode is known:
-    /// bf16 in inference/eval (read-only weights → a one-time quantization, always safe, 2x),
-    /// and LOSSLESS (byte-shuffle + Deflate, ~1.18x, BIT-EXACT) during training so the
-    /// fp32/fp64 masters are preserved exactly. Unknown mode (no declared context) → full
-    /// precision (don't guess).</summary>
+    /// in inference/eval (read-only weights → a one-time quantization, always safe) it is
+    /// <b>RAM-aware</b> when <see cref="GpuOffloadOptions.ExpectedStreamingFootprintBytes"/>
+    /// is set: it stores the HIGHEST-fidelity precision whose resident footprint still fits
+    /// <see cref="GpuOffloadOptions.StreamingPoolMaxResidentBytes"/> — bf16 (2x) if the model
+    /// fits at bf16, else int8 (4x), else int4 (8x) so an otherwise-too-large model runs on a
+    /// constrained box; with no footprint hint it defaults to bf16. During TRAINING it stays
+    /// LOSSLESS (byte-shuffle + Deflate, ~1.18x, BIT-EXACT) so the fp32/fp64 masters are
+    /// preserved exactly (the quantized tiers can't write mutations back — write-back is
+    /// native-only — so they are never chosen while weights are mutable). Unknown mode (no
+    /// declared context) → full precision (don't guess).</summary>
     Auto = 0,
 
     /// <summary>Always store at the weight's native precision (fp32/fp64). No
@@ -81,10 +87,11 @@ public enum StreamingStoreDtype
     /// bf16 masters (large-batch pretraining). Opt-in for training.</summary>
     Bf16Stochastic = 3,
 
-    /// <summary>Always store int8 with a per-tensor symmetric scale. 4x I/O at
-    /// ~1.1% RMS error — much more lossy than bf16, so it's never the Auto default
-    /// and is intended for inference / aggressive memory-bound cases where the
-    /// accuracy tradeoff is accepted.</summary>
+    /// <summary>Always store int8 with a per-row symmetric scale. 4x I/O at ~1.1% RMS
+    /// error — more lossy than bf16, so <see cref="Auto"/> only steps down to it
+    /// automatically in INFERENCE when bf16 would overflow the resident cap (see
+    /// <see cref="GpuOffloadOptions.ExpectedStreamingFootprintBytes"/>); this explicit
+    /// value forces it unconditionally for aggressive memory-bound inference.</summary>
     Int8 = 4,
 
     /// <summary>EXACT (lossless) storage: SIMD byte-plane shuffle + Deflate. ~1.18x I/O on
@@ -97,8 +104,9 @@ public enum StreamingStoreDtype
     /// <summary>Always store int4 with AWQ/GPTQ-style GROUP-symmetric quantization (one fp32
     /// scale per 128-weight group). 8x I/O — the most aggressive rung, intended to make the
     /// very largest (&gt;~20B) models RESIDENT inside a 16 GiB budget so they skip streaming.
-    /// More lossy than int8, so it is never the Auto default and is explicit opt-in for
-    /// aggressive memory-bound inference where the accuracy tradeoff is accepted.</summary>
+    /// More lossy than int8, so <see cref="Auto"/> only steps down to it automatically in
+    /// INFERENCE as the last rung when even int8 would overflow the resident cap; this explicit
+    /// value forces it unconditionally for aggressive memory-bound inference.</summary>
     Int4 = 6,
 }
 
@@ -121,6 +129,24 @@ public sealed class GpuOffloadOptions
     /// never push the box into OS-level swap (which would page on top of the
     /// pool's own paging — double I/O). Set explicitly to override.</summary>
     public long StreamingPoolMaxResidentBytes { get; set; } = DefaultResidentBudgetBytes();
+
+    /// <summary>
+    /// The caller's estimate of the model's TOTAL streaming-weight footprint, in the
+    /// weights' native precision (fp32/fp64 bytes = ParameterCount × element size).
+    /// Zero (the default) means "unknown". When known, it makes
+    /// <see cref="StreamingStoreDtype.Auto"/> <b>RAM-aware in inference</b>: instead of
+    /// always storing bf16, Auto picks the HIGHEST-fidelity store precision whose
+    /// resident footprint still fits <see cref="StreamingPoolMaxResidentBytes"/> —
+    /// bf16 (÷2) when it fits, else int8 (÷4), else int4 (÷8). So a model that fits
+    /// resident at bf16 keeps bf16's fidelity, and only a model too large for bf16
+    /// steps down to the lossier-but-smaller quantized stores needed to run at all on
+    /// a constrained box. Training is unaffected — Auto stays lossless there (exact
+    /// masters), because the quantized stores' mutations can't be written back
+    /// (write-back is native-only); inference weights are read-only, so the quantized
+    /// tiers are safe there. Ignored unless <see cref="StreamingStoreDtype"/> is
+    /// <see cref="StreamingStoreDtype.Auto"/>.
+    /// </summary>
+    public long ExpectedStreamingFootprintBytes { get; set; }
 
     // Historical ceiling, kept as the cap for large-memory boxes so their
     // behaviour is unchanged.

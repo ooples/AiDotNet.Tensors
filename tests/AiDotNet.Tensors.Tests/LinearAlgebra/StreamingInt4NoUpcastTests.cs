@@ -98,6 +98,46 @@ public class StreamingInt4NoUpcastTests
         finally { Cleanup(dir); }
     }
 
+    [Fact]
+    public void Auto_RamAware_SelectsInt4_WhenEvenInt8Overflows_KeepsInt4NoUpcast()
+    {
+        // Extreme pressure: footprint 8 MiB, cap 1 MiB → bf16 (4 MiB) and int8 (2 MiB) both overflow,
+        // so RAM-aware Auto steps to int4 (1 MiB) — the last rung — for this large inference weight,
+        // and it materializes to the SAME no-upcast int4 form as the explicit Int4 path.
+        const int inDim = 128, outDim = 256, n = inDim * outDim; // 32,768 ≥ MinAutoQuantElements, rank 2
+        var dir = Path.Combine(Path.GetTempPath(), $"aidotnet-autoint4-{Guid.NewGuid():N}");
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingBackingStorePath = dir,
+            StreamingPoolMaxResidentBytes = 1L * 1024 * 1024,
+            ExpectedStreamingFootprintBytes = 8L * 1024 * 1024,
+            StreamingStoreDtype = StreamingStoreDtype.Auto,
+        });
+        WeightRegistry.SetStreamingExecutionTraining(false); // inference
+        try
+        {
+            var t = new Tensor<float>(new[] { inDim, outDim });
+            for (int i = 0; i < n; i++) t[i] = Val(i);
+            t.Lifetime = WeightLifetime.Streaming;
+            WeightRegistry.RegisterWeight(t);
+
+            Assert.Equal(StreamingEncoding.Int4, t.StreamingStoreEncoding); // Auto chose int4
+
+            WeightRegistry.Materialize(t);
+            Assert.NotNull(t.StreamingInt4);
+            Assert.Equal(0, t.DataVector.Length);
+            Assert.Equal(outDim, t.StreamingInt4!.Rows); // [out, in] kernel layout
+            Assert.Equal(inDim, t.StreamingInt4.K);
+
+            // Lazy fp fallback lands each value at its logical index within int4's group-quant RMS.
+            var span = t.AsSpan();
+            double sum2 = 0, ref2 = 0;
+            for (int i = 0; i < n; i++) { double e = span[i] - Val(i); sum2 += e * e; ref2 += (double)Val(i) * Val(i); }
+            Assert.True(Math.Sqrt(sum2 / ref2) < 0.20, "Auto-int4 lazy dequant should be within ~12-15% RMS");
+        }
+        finally { Cleanup(dir); }
+    }
+
     private static void Cleanup(string dir)
     {
         WeightRegistry.SetStreamingExecutionTraining(null);
