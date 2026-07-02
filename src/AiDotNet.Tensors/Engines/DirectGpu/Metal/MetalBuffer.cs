@@ -284,7 +284,9 @@ public sealed class MetalGpuBuffer : IGpuBuffer
             throw new ArgumentOutOfRangeException(nameof(offsetInBytes));
         }
 
-        if (count < 0 || offsetInBytes + count > SizeInBytes || count > destination.Length)
+        // (long) cast: offsetInBytes + count are both int, so a large offset+count would overflow to a
+        // negative int and slip past this bound before reaching Marshal.Copy. Evaluate in long.
+        if (count < 0 || (long)offsetInBytes + count > SizeInBytes || count > destination.Length)
         {
             throw new ArgumentOutOfRangeException(nameof(count));
         }
@@ -325,7 +327,8 @@ public sealed class MetalGpuBuffer : IGpuBuffer
             throw new ArgumentOutOfRangeException(nameof(offsetInBytes));
         }
 
-        if (count < 0 || offsetInBytes + count > SizeInBytes || count > source.Length)
+        // (long) cast: see CopyBytesTo — int offsetInBytes + count can overflow past this bound.
+        if (count < 0 || (long)offsetInBytes + count > SizeInBytes || count > source.Length)
         {
             throw new ArgumentOutOfRangeException(nameof(count));
         }

@@ -10185,6 +10185,15 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, paramLength);
             k.SetArg(arg++, numBlocks);
 
+            // The adam8bit kernel does a FIXED 256-wide per-block workgroup reduction (its __local
+            // arrays are sized [256]), so the local size must be exactly 256 — it cannot be clamped
+            // down (that would silently corrupt the reduction) nor exceed the device limit. On a device
+            // whose max workgroup size is < 256, fail with a clear, actionable error instead of an opaque
+            // CL_INVALID_WORK_GROUP_SIZE at enqueue.
+            if (_maxWorkGroupSize > 0 && _maxWorkGroupSize < 256)
+                throw new NotSupportedException(
+                    $"int8 block-quantized Adam requires a device max workgroup size >= 256; this device " +
+                    $"reports {_maxWorkGroupSize}. Use bf16 moments or the CPU optimizer path on this device.");
             k.Execute1D(numBlocks * 256, 256);
         }
 

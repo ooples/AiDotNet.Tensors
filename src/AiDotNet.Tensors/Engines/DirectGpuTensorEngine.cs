@@ -10047,9 +10047,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var gradQBuffer = AllocateOutputBuffer(backend, batch * heads * seqQ * headDim);
         using var gradKBuffer = AllocateOutputBuffer(backend, batch * heads * seqK * headDim);
         using var gradVBuffer = AllocateOutputBuffer(backend, batch * heads * seqK * headDim);
-        backend.Fill(gradQBuffer.Buffer, 0f, batch * heads * seqQ * headDim);
-        backend.Fill(gradKBuffer.Buffer, 0f, batch * heads * seqK * headDim);
-        backend.Fill(gradVBuffer.Buffer, 0f, batch * heads * seqK * headDim);
 
         // Upload attention bias to GPU if provided, with shape validation
         int biasBatchStride = 0;
@@ -13569,14 +13566,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             int numIndices = indices.Length;
+            int vocabSize = embeddingTable.Shape._dims[0];
             int embeddingDim = embeddingTable.Shape._dims[^1];
+            int[] indicesData = indices.GetDataArray();
+            // Guard against out-of-range indices (mirrors the public override Embedding): an index < 0 or
+            // >= vocabSize would make the GPU kernel read outside the embedding table. Fall back to the
+            // base engine (which validates) rather than issuing an out-of-bounds device read.
+            for (int i = 0; i < indicesData.Length; i++)
+            {
+                int idx = indicesData[i];
+                if (idx < 0 || idx >= vocabSize)
+                    return base.Embedding(indices, embeddingTable);
+            }
             int[] outputShape = new int[indices.Shape._dims.Length + 1];
             for (int i = 0; i < indices.Shape._dims.Length; i++)
                 outputShape[i] = indices.Shape._dims[i];
             outputShape[^1] = embeddingDim;
             bool isDeferredRecording = Gpu.DeferredScope.Current?.IsRecording == true;
 
-            using var indicesBuffer = backend.AllocateIntBuffer(indices.GetDataArray());
+            using var indicesBuffer = backend.AllocateIntBuffer(indicesData);
             using var tableBuffer = GetOrCacheWeightBuffer(backend, embeddingTable.GetDataArray(), PersistentTensorRole.Embeddings);
             var outputBuffer = AllocateOutputBuffer(backend, numIndices * embeddingDim);
             bool outputHandedOff = false;

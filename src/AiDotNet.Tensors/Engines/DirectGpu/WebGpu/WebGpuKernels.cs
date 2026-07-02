@@ -1450,7 +1450,7 @@ fn adam8bit(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id)
 
     let start = blk * opt_params.block_size;
     let end_idx = min(start + opt_params.block_size, opt_params.size);
-    let first_step = opt_params.bias_correction1 <= opt_params.one_minus_beta1 + 0.0000001;
+    let first_step = opt_params.bias_correction1 <= opt_params.one_minus_beta1 + 0.0000001 && opt_params.bias_correction2 <= opt_params.one_minus_beta2 + 0.0000001;
     let m_scale = select(m_scales[blk], 0.0, first_step);
     let v_scale = select(v_scales[blk], 0.0, first_step);
 

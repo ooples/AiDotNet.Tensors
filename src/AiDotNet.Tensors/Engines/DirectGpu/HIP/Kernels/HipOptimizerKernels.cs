@@ -204,7 +204,7 @@ extern ""C"" __global__ __launch_bounds__(256) void adam8bit_update(
     if (blk >= numBlocks) return;
     int start = blk * blockSize;
     int endIdx = start + blockSize; if (endIdx > paramLength) endIdx = paramLength;
-    int firstStep = biasCorrection1 <= oneMinusBeta1 + 1e-7f;
+    int firstStep = (biasCorrection1 <= oneMinusBeta1 + 1e-7f) && (biasCorrection2 <= oneMinusBeta2 + 1e-7f); /* both corrections must indicate step 1 — bc1 alone is always-true when beta1==0, wrongly discarding v history every step */
     float mScale = firstStep ? 0.0f : mScales[blk];
     float vScale = firstStep ? 0.0f : vScales[blk];
 

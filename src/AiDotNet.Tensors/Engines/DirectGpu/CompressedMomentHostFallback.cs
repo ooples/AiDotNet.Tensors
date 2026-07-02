@@ -79,7 +79,10 @@ internal static class CompressedMomentHostFallback
         int paramLength,
         int numBlocks)
     {
-        bool firstStep = biasCorrection1 <= oneMinusBeta1 + 1e-7f;
+        // Both corrections must indicate step 1: bc1 <= (1-beta1) alone is ALWAYS true when beta1==0
+        // (bc1 stays 1 for every step), which would wrongly discard v history each step for a
+        // beta1==0/beta2>0 config. Requiring bc2 to agree makes step detection robust.
+        bool firstStep = biasCorrection1 <= oneMinusBeta1 + 1e-7f && biasCorrection2 <= oneMinusBeta2 + 1e-7f;
         for (int block = 0; block < numBlocks; block++)
         {
             int start = block * blockSize;
