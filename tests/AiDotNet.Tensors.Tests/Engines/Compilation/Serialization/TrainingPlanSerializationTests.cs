@@ -183,6 +183,7 @@ public class TrainingPlanSerializationTests
         var savedCheckpoint = CaptureCheckpoint(original);
         Assert.Equal(optimizer, savedCheckpoint.OptimizerType);
         Assert.Equal(5, savedCheckpoint.OptimizerStep);
+        AssertDoubleOptimizerStatePresent(savedCheckpoint);
 
         using var ms = new MemoryStream();
         await original.SaveAsync(ms);
@@ -440,6 +441,26 @@ public class TrainingPlanSerializationTests
             Assert.NotNull(state.VFloat);
         if (NeedsThirdFloatState(checkpoint.OptimizerType))
             Assert.NotNull(state.VMaxFloat);
+
+        if (checkpoint.OptimizerType == OptimizerType.HypergradientSGD)
+            Assert.NotEqual(0f, checkpoint.Scalars.HypergradientAdjustment);
+        if (checkpoint.OptimizerType == OptimizerType.DAdaptationSGD)
+            Assert.True(checkpoint.Scalars.DAdaptationRAccum > 0f, "D-Adaptation scalar accumulator was not restored.");
+        if (checkpoint.OptimizerType == OptimizerType.ScheduleFreeSGD)
+            Assert.True(checkpoint.Scalars.ScheduleFreeWeightSum > 0f, "Schedule-Free scalar weight sum was not restored.");
+    }
+
+    // Double-path mirror of AssertFloatOptimizerStatePresent — asserts the fp64 moment state is
+    // actually captured before save (the double test previously only checked type + step).
+    private static void AssertDoubleOptimizerStatePresent(FusedOptimizerCheckpoint checkpoint)
+    {
+        var state = checkpoint.Parameters[0];
+        if (NeedsFirstFloatState(checkpoint.OptimizerType))
+            Assert.NotNull(state.MDouble);
+        if (NeedsSecondFloatState(checkpoint.OptimizerType))
+            Assert.NotNull(state.VDouble);
+        if (NeedsThirdFloatState(checkpoint.OptimizerType))
+            Assert.NotNull(state.VMaxDouble);
 
         if (checkpoint.OptimizerType == OptimizerType.HypergradientSGD)
             Assert.NotEqual(0f, checkpoint.Scalars.HypergradientAdjustment);
