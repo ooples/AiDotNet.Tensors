@@ -71,47 +71,51 @@ public sealed unsafe partial class VulkanBackend
         UploadToBuffer(p, param); UploadToBuffer(mArr, m); UploadToBuffer(vArr, v);
     }
 
+    // Reinterpret a float's bits as uint for a GLSL push-constant slot (the shader declares the field
+    // `float`, so the same 32 bits read back as the float value). net471-safe.
+    private static uint FBits(float f)
+#if NETFRAMEWORK
+        => unchecked((uint)BitConverter.ToInt32(BitConverter.GetBytes(f), 0));
+#else
+        => BitConverter.SingleToUInt32Bits(f);
+#endif
+
     public void AdamUpdateBf16(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
-    {
-        EnsureInitialized();
-        CompressedMomentHostFallback.WarnHostFallbackOnce("Vulkan");
-        if (step <= 0)
-            throw new ArgumentOutOfRangeException(nameof(step), step, "Step must be > 0 for bias-corrected optimizers to avoid division by zero.");
-
-        var p = DownloadBuffer(param);
-        var g = DownloadBuffer(gradient);
-        var mBytes = CompressedMomentHostFallback.DownloadPackedBytes(DownloadBuffer(m), size * sizeof(ushort));
-        var vBytes = CompressedMomentHostFallback.DownloadPackedBytes(DownloadBuffer(v), size * sizeof(ushort));
-
-        CompressedMomentHostFallback.AdamBf16(
-            p, g, mBytes, vBytes,
-            learningRate, beta1, beta2, epsilon, weightDecay, step, size,
-            decoupledWeightDecay: false);
-
-        UploadToBuffer(p, param);
-        UploadToBuffer(CompressedMomentHostFallback.PackBytesAsFloats(mBytes), m);
-        UploadToBuffer(CompressedMomentHostFallback.PackBytesAsFloats(vBytes), v);
-    }
+        => AdamBf16Impl(param, gradient, m, v, learningRate, beta1, beta2, epsilon, weightDecay, step, size, decoupled: false);
 
     public void AdamWUpdateBf16(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
+        => AdamBf16Impl(param, gradient, m, v, learningRate, beta1, beta2, epsilon, weightDecay, step, size, decoupled: true);
+
+    private void AdamBf16Impl(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size, bool decoupled)
     {
         EnsureInitialized();
-        CompressedMomentHostFallback.WarnHostFallbackOnce("Vulkan");
         if (step <= 0)
             throw new ArgumentOutOfRangeException(nameof(step), step, "Step must be > 0 for bias-corrected optimizers to avoid division by zero.");
+        if (size <= 0) return;
 
+        // Native GPU path: one GLSL thread per 32-bit word (= 2 bf16 moments), no host round-trip.
+        if (IsGlslCompilerAvailable)
+        {
+            int words = (size + 1) / 2;
+            GlslDispatchN(VulkanCompressedOptimizerKernels.AdamBf16, words,
+                new[] { param, gradient, m, v },
+                new uint[] { (uint)size, (uint)step, decoupled ? 1u : 0u,
+                    FBits(learningRate), FBits(beta1), FBits(beta2), FBits(epsilon), FBits(weightDecay) });
+            return;
+        }
+
+        // Fallback only when libshaderc is unavailable (no runtime GLSL→SPIR-V): host round-trip.
+        CompressedMomentHostFallback.WarnHostFallbackOnce("Vulkan");
         var p = DownloadBuffer(param);
         var g = DownloadBuffer(gradient);
         var mBytes = CompressedMomentHostFallback.DownloadPackedBytes(DownloadBuffer(m), size * sizeof(ushort));
         var vBytes = CompressedMomentHostFallback.DownloadPackedBytes(DownloadBuffer(v), size * sizeof(ushort));
-
         CompressedMomentHostFallback.AdamBf16(
-            p, g, mBytes, vBytes,
-            learningRate, beta1, beta2, epsilon, weightDecay, step, size,
-            decoupledWeightDecay: true);
-
+            p, g, mBytes, vBytes, learningRate, beta1, beta2, epsilon, weightDecay, step, size,
+            decoupledWeightDecay: decoupled);
         UploadToBuffer(p, param);
         UploadToBuffer(CompressedMomentHostFallback.PackBytesAsFloats(mBytes), m);
         UploadToBuffer(CompressedMomentHostFallback.PackBytesAsFloats(vBytes), v);
@@ -124,20 +128,30 @@ public sealed unsafe partial class VulkanBackend
         int blockSize, int paramLength, int numBlocks)
     {
         EnsureInitialized();
-        CompressedMomentHostFallback.WarnHostFallbackOnce("Vulkan");
+        if (paramLength <= 0 || numBlocks <= 0) return;
 
+        // Native GPU path: one workgroup per block (256-wide shared-memory reduction for the scales).
+        if (IsGlslCompilerAvailable)
+        {
+            GlslDispatchN(VulkanCompressedOptimizerKernels.Adam8Bit, numBlocks * 256,
+                new[] { param, gradient, mQuant, vQuant, mScales, vScales },
+                new uint[] { (uint)paramLength, (uint)blockSize, (uint)numBlocks,
+                    FBits(learningRate), FBits(beta1), FBits(beta2), FBits(epsilon),
+                    FBits(oneMinusBeta1), FBits(oneMinusBeta2), FBits(biasCorrection1), FBits(biasCorrection2) });
+            return;
+        }
+
+        CompressedMomentHostFallback.WarnHostFallbackOnce("Vulkan");
         var p = DownloadBuffer(param);
         var g = DownloadBuffer(gradient);
         var mQuantBytes = CompressedMomentHostFallback.DownloadPackedBytes(DownloadBuffer(mQuant), paramLength);
         var vQuantBytes = CompressedMomentHostFallback.DownloadPackedBytes(DownloadBuffer(vQuant), paramLength);
         var mScaleData = DownloadBuffer(mScales);
         var vScaleData = DownloadBuffer(vScales);
-
         CompressedMomentHostFallback.Adam8Bit(
             p, g, mQuantBytes, vQuantBytes, mScaleData, vScaleData,
             learningRate, beta1, beta2, epsilon, oneMinusBeta1, oneMinusBeta2,
             biasCorrection1, biasCorrection2, blockSize, paramLength, numBlocks);
-
         UploadToBuffer(p, param);
         UploadToBuffer(CompressedMomentHostFallback.PackBytesAsFloats(mQuantBytes), mQuant);
         UploadToBuffer(CompressedMomentHostFallback.PackBytesAsFloats(vQuantBytes), vQuant);
