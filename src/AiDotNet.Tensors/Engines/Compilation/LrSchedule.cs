@@ -3,6 +3,21 @@ using System.Runtime.CompilerServices;
 namespace AiDotNet.Tensors.Engines.Compilation;
 
 /// <summary>
+/// Decay shape applied AFTER the linear-warmup ramp in <see cref="LrSchedule.LinearWarmup"/>.
+/// Mirrors <c>AiDotNet.LearningRateSchedulers.LinearWarmupScheduler.DecayMode</c> so the
+/// fused mapping reproduces the eager scheduler exactly.
+/// </summary>
+public enum WarmupDecayMode
+{
+    /// <summary>Hold the peak learning rate after warmup.</summary>
+    Constant,
+    /// <summary>Linearly decay from peak to <c>endLr</c> over the post-warmup steps.</summary>
+    Linear,
+    /// <summary>Cosine-anneal from peak to <c>endLr</c> over the post-warmup steps.</summary>
+    Cosine
+}
+
+/// <summary>
 /// Per-step learning-rate schedule used by the fused-compiled training path.
 /// Implementations must be pure and allocation-free — they're called inside
 /// the tight <c>Step()</c> loop, once per optimizer step.
@@ -84,6 +99,24 @@ public abstract class LrSchedule
     public static LrSchedule LinearWarmupCosine(
         double lrMax, int warmupSteps, int totalSteps, double lrMin = 0.0)
         => new LinearWarmupCosineLr(lrMax, warmupSteps, totalSteps, lrMin);
+
+    /// <summary>
+    /// Linear warmup from <paramref name="warmupInitLr"/> to <paramref name="lrMax"/>
+    /// over <paramref name="warmupSteps"/> steps, then a Constant / Linear / Cosine
+    /// decay to <paramref name="endLr"/> per <paramref name="decayMode"/>. This is the
+    /// fused-path image of <c>AiDotNet.LearningRateSchedulers.LinearWarmupScheduler</c>:
+    /// its per-step sequence is bit-identical to that eager scheduler's per-batch LR
+    /// (batch 1 = ctor <c>warmupInitLr</c>; batch n = <c>max(endLr, ComputeLearningRate(n-1))</c>),
+    /// so the warmup recipe runs on the captured fast path instead of the eager tape.
+    /// Unlike <see cref="LinearWarmupCosine"/> (warmup→cosine only, floor 0), this honors
+    /// a non-zero warmup-init, all three decay modes, and a non-zero end LR.
+    /// </summary>
+    public static LrSchedule LinearWarmup(
+        double lrMax, int warmupSteps, int totalSteps,
+        double warmupInitLr = 0.0,
+        WarmupDecayMode decayMode = WarmupDecayMode.Constant,
+        double endLr = 0.0)
+        => new LinearWarmupLr(lrMax, warmupSteps, totalSteps, warmupInitLr, decayMode, endLr);
 
     /// <summary>
     /// Noam schedule from "Attention Is All You Need" (Vaswani et al. 2017,
@@ -320,4 +353,66 @@ internal sealed class LinearWarmupCosineLr : LrSchedule
         => new(FusedLrScheduleKind.LinearWarmupCosine,
             new[] { _lrMax, _lrMin },
             new[] { _warmup, _total });
+}
+
+internal sealed class LinearWarmupLr : LrSchedule
+{
+    private readonly double _lrMax;
+    private readonly int _warmupSteps;
+    private readonly int _totalSteps;
+    private readonly double _warmupInitLr;
+    private readonly WarmupDecayMode _decayMode;
+    private readonly double _endLr;
+
+    public LinearWarmupLr(double lrMax, int warmupSteps, int totalSteps,
+        double warmupInitLr, WarmupDecayMode decayMode, double endLr)
+    {
+        if (warmupSteps < 0) throw new ArgumentOutOfRangeException(nameof(warmupSteps));
+        if (!Enum.IsDefined(typeof(WarmupDecayMode), decayMode))
+            throw new ArgumentOutOfRangeException(nameof(decayMode), decayMode, "Undefined warmup decay mode.");
+        int normalizedTotalSteps = totalSteps > 0 ? totalSteps : warmupSteps;
+        if (decayMode != WarmupDecayMode.Constant && normalizedTotalSteps < warmupSteps)
+            throw new ArgumentOutOfRangeException(nameof(totalSteps),
+                "totalSteps must be >= warmupSteps for decay modes.");
+        _lrMax = lrMax;
+        _warmupSteps = warmupSteps;
+        _totalSteps = normalizedTotalSteps;
+        _warmupInitLr = warmupInitLr;
+        _decayMode = decayMode;
+        _endLr = endLr;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public override double GetLr(int step)
+    {
+        // The eager LinearWarmupScheduler reports its ctor value (warmupInitLr) on
+        // batch 1 (unfloored), then on batch n>=2 reports max(endLr, ComputeLearningRate(n-1))
+        // — _currentStep is (batch - 1) and Step() floors with _minLearningRate = endLr.
+        // The 1-indexed fused step maps batch n → GetLr(n); reproduce both branches so the
+        // per-step LR is bit-identical to the eager replay (FusedLrScheduleMappingTests).
+        if (step <= 1)
+            return _warmupSteps > 0 ? _warmupInitLr : _lrMax;
+        double raw = ComputeRaw(step - 1);
+        return raw > _endLr ? raw : _endLr;
+    }
+
+    // Mirror of LinearWarmupScheduler.ComputeLearningRate(step) with _baseLearningRate = lrMax.
+    private double ComputeRaw(int t)
+    {
+        if (t < _warmupSteps)
+        {
+            if (_warmupSteps == 0) return _lrMax;
+            return _warmupInitLr + (_lrMax - _warmupInitLr) * ((double)t / _warmupSteps);
+        }
+        if (_decayMode == WarmupDecayMode.Constant) return _lrMax;
+
+        int decaySteps = _totalSteps - _warmupSteps;
+        int decayStep = t - _warmupSteps;
+        if (decayStep >= decaySteps) return _endLr;
+        double progress = (double)decayStep / decaySteps;
+        if (_decayMode == WarmupDecayMode.Linear)
+            return _lrMax - (_lrMax - _endLr) * progress;
+        double cos = (1.0 + System.Math.Cos(System.Math.PI * progress)) / 2.0;
+        return _endLr + (_lrMax - _endLr) * cos;
+    }
 }

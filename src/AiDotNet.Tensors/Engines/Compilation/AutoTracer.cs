@@ -26,6 +26,19 @@ internal static class AutoTracer
     /// <summary>Whether auto-tracing is enabled (default: true).</summary>
     internal static bool Enabled { get; set; } = true;
 
+    // Transparent AutoTracer replay is disabled until replay plans are bound
+    // to the current call's mutable inputs. The legacy shape-only lookup can
+    // reuse a plan whose delegates captured tensors from an earlier call with
+    // the same op sequence and shape, producing stale numerical results.
+    //
+    // SCOPE NOTE: this master-switch is a standing CORRECTNESS guard, not part of
+    // the GPU sparse-optimizer feature. It gates the shape-only replay path off so
+    // it cannot return stale results; the full tensor-validation suite depends on it
+    // (removing it regresses those numerical checks). It stays a single compile-time
+    // const so re-enabling transparent replay — once plans rebind to live inputs —
+    // is a one-line change (flip to true) with no other call-site edits.
+    private const bool TransparentReplayEnabled = false;
+
     /// <summary>
     /// Fast inlinable check that callers should use BEFORE constructing
     /// the replay-delegate closure. The closure (e.g.
@@ -48,6 +61,7 @@ internal static class AutoTracer
     {
         [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
         get => Enabled
+            && TransparentReplayEnabled
             && !GraphMode.IsActive
             && TensorCodecOptions.Current.EnableCompilation
             && !Autodiff.DifferentiableOps.ThreadTapeActive();
@@ -69,7 +83,7 @@ internal static class AutoTracer
     /// are treated as different operations — prevents silent wrong-result bugs.</param>
     internal static CompiledInferencePlan<T>? TryGetCompiledPlan<T>(string opName, int[] outputShape, long paramHash = 0)
     {
-        if (!Enabled || GraphMode.IsActive || !TensorCodecOptions.Current.EnableCompilation) return null;
+        if (!Enabled || !TransparentReplayEnabled || GraphMode.IsActive || !TensorCodecOptions.Current.EnableCompilation) return null;
         // Don't return compiled plans during this thread's GradientTape lifecycle
         // (forward AND backward). The narrower IsRecording<T>() check returns
         // false during backward (Current is suspended for the backward walk),
@@ -94,7 +108,7 @@ internal static class AutoTracer
     /// <param name="paramHash">Extra hash for op-specific parameters (must match TryGetCompiledPlan).</param>
     internal static void RecordOp<T>(string opName, Tensor<T> result, Func<IEngine, Tensor<T>> replayDelegate, long paramHash = 0)
     {
-        if (!Enabled || GraphMode.IsActive || !TensorCodecOptions.Current.EnableCompilation) return;
+        if (!Enabled || !TransparentReplayEnabled || GraphMode.IsActive || !TensorCodecOptions.Current.EnableCompilation) return;
         // Skip recording for the ENTIRE GradientTape lifecycle on this thread,
         // not just while the tape is "currently recording" (Current != null).
         // During the backward walk the tape suspends Current to null so backward

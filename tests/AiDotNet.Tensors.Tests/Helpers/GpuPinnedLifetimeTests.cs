@@ -74,16 +74,16 @@ public class GpuPinnedLifetimeTests
         Assert.Equal(32, tensor.Length);
     }
 
-    [Fact]
+    [SkippableFact]
     public void RentPinnedOnGpu_GpuOffloadCapableHost_TagsTensorGpuPinned()
     {
         // When the offload allocator IS registered (GPU host), the tensor
         // comes back tagged GpuPinned (not GpuOffload — issue #336 uses
         // the new lifetime tag to distinguish "lives on GPU for the train
         // loop" from "may swap to host for large-model memory pressure").
-        if (WeightRegistry.OffloadAllocator is null
-            || !WeightRegistry.OffloadAllocator.IsAvailable)
-            return; // CPU-only host — skip; covered by the fallback test.
+        Skip.If(WeightRegistry.OffloadAllocator is null
+            || !WeightRegistry.OffloadAllocator.IsAvailable,
+            "CPU-only host; fallback path is covered by RentPinnedOnGpu_CpuOnlyHost_FallsBackToCpuPinned_NotThrowing.");
 
         // PR #345 review: tighten assertion to require GpuPinned exactly.
         // Permitting `Default` masked regressions in the new tagging
@@ -131,7 +131,7 @@ public class GpuPinnedLifetimeTests
         Assert.Null(t.TryGetGpuBuffer());
     }
 
-    [Fact]
+    [SkippableFact]
     public void GpuOptimizer_TryAdamStep_MatchesHandComputedReference_OnGpuHost()
     {
         // Issue #336 correctness gate. Runs a single Adam step on a tiny
@@ -149,7 +149,7 @@ public class GpuPinnedLifetimeTests
         AiDotNet.Tensors.Engines.AiDotNetEngine.Current = gpu;
         try
         {
-            if (gpu.GetBackend() is null) return;
+            Skip.If(gpu.GetBackend() is null, "DirectGpu backend is not available.");
 
             // RentPinnedOnGpu falls back to CPU-pinned on CPU-only hosts.
             // TryAdamStep then returns false (no GPU buffer), and the test
@@ -164,12 +164,17 @@ public class GpuPinnedLifetimeTests
                 // Need device-resident buffers to actually run the kernel; if
                 // the tensors didn't bind to GPU buffers, TryAdamStep returns
                 // false and we treat that as skip.
-                if (p.TryGetGpuBuffer() is null) return;
+                Skip.If(p.TryGetGpuBuffer() is null
+                    || g.TryGetGpuBuffer() is null
+                    || m.TryGetGpuBuffer() is null
+                    || v.TryGetGpuBuffer() is null,
+                    "Pinned tensors did not bind to GPU buffers on this host.");
                 // Some backends (current OpenCL allocator) return a GPU buffer but
                 // do NOT provide zero-copy host↔device mapping — the optimizer kernel
                 // runs against a separate buffer the host never sees written. Skip
                 // in that case; this gate is independent of the no-GPU skip above.
-                if (!HasZeroCopyPinnedMapping()) return;
+                Skip.If(!HasZeroCopyPinnedMapping(),
+                    "GPU pinned allocator does not expose a zero-copy host mapping on this backend.");
 
                 // Initialize values via flat-data span.
                 var pData = p.GetDataArray();
@@ -220,7 +225,80 @@ public class GpuPinnedLifetimeTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
+    public void GpuOptimizer_TryAdamStep_MarksGpuUpdatedTensorsCurrent_OnGpuHost()
+    {
+        // Regression for post-training eval on GPU-resident model weights:
+        // a successful on-device optimizer step mutates param/m/v in place.
+        // Their resident GPU buffer version must be synced to the bumped
+        // tensor Version so later inference reuses the live device buffers
+        // instead of re-uploading fresh host arrays on every forward pass.
+        var priorEngine = AiDotNet.Tensors.Engines.AiDotNetEngine.Current;
+        var gpu = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine();
+        AiDotNet.Tensors.Engines.AiDotNetEngine.Current = gpu;
+        try
+        {
+            Skip.If(gpu.GetBackend() is null, "DirectGpu backend is not available.");
+
+            var p = AiDotNet.Tensors.Helpers.TensorAllocator.RentPinnedOnGpu<float>(new[] { 4 });
+            var g = AiDotNet.Tensors.Helpers.TensorAllocator.RentPinnedOnGpu<float>(new[] { 4 });
+            var m = AiDotNet.Tensors.Helpers.TensorAllocator.RentPinnedOnGpu<float>(new[] { 4 });
+            var v = AiDotNet.Tensors.Helpers.TensorAllocator.RentPinnedOnGpu<float>(new[] { 4 });
+            try
+            {
+                if (p.TryGetGpuBuffer() is null
+                    || g.TryGetGpuBuffer() is null
+                    || m.TryGetGpuBuffer() is null
+                    || v.TryGetGpuBuffer() is null)
+                    Skip.If(true, "Pinned tensors did not bind to GPU buffers on this host.");
+
+                int pVersion = p.Version;
+                int mVersion = m.Version;
+                int vVersion = v.Version;
+                int gVersion = g.Version;
+
+                bool ran = AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TryAdamStep(
+                    p, g, m, v,
+                    learningRate: 0.01f, beta1: 0.9f, beta2: 0.999f,
+                    epsilon: 1e-8f, weightDecay: 0f, step: 1);
+                Assert.True(ran,
+                    "GpuOptimizer.TryAdamStep returned false after GPU buffers were bound.");
+
+                Assert.True(p.Version > pVersion, "Parameter Version should advance after an in-place GPU Adam step.");
+                Assert.True(m.Version > mVersion, "Adam m-state Version should advance after an in-place GPU Adam step.");
+                Assert.True(v.Version > vVersion, "Adam v-state Version should advance after an in-place GPU Adam step.");
+                Assert.Equal(gVersion, g.Version);
+
+                Assert.Equal(p.Version, p._gpuBufferVersion);
+                Assert.Equal(m.Version, m._gpuBufferVersion);
+                Assert.Equal(v.Version, v._gpuBufferVersion);
+
+                Assert.NotNull(p.LastWriteSync);
+                Assert.NotNull(m.LastWriteSync);
+                Assert.NotNull(v.LastWriteSync);
+                p.Synchronize();
+                m.Synchronize();
+                v.Synchronize();
+                Assert.True(p.LastWriteSync!.IsComplete, "Parameter GPU write sync should complete after Synchronize().");
+                Assert.True(m.LastWriteSync!.IsComplete, "Adam m-state GPU write sync should complete after Synchronize().");
+                Assert.True(v.LastWriteSync!.IsComplete, "Adam v-state GPU write sync should complete after Synchronize().");
+            }
+            finally
+            {
+                WeightRegistry.UnregisterWeight(p);
+                WeightRegistry.UnregisterWeight(g);
+                WeightRegistry.UnregisterWeight(m);
+                WeightRegistry.UnregisterWeight(v);
+            }
+        }
+        finally
+        {
+            AiDotNet.Tensors.Engines.AiDotNetEngine.Current = priorEngine;
+            gpu.Dispose();
+        }
+    }
+
+    [SkippableFact]
     public void GpuOptimizer_TrySgdStep_MatchesHandComputedReference_OnGpuHost()
     {
         // Single-step SGD: p1 = p0 - lr * g
@@ -229,17 +307,19 @@ public class GpuPinnedLifetimeTests
         AiDotNet.Tensors.Engines.AiDotNetEngine.Current = gpu;
         try
         {
-            if (gpu.GetBackend() is null) return;
+            Skip.If(gpu.GetBackend() is null, "DirectGpu backend is not available.");
             var p = AiDotNet.Tensors.Helpers.TensorAllocator.RentPinnedOnGpu<float>(new[] { 4 });
             var g = AiDotNet.Tensors.Helpers.TensorAllocator.RentPinnedOnGpu<float>(new[] { 4 });
             try
             {
-                if (p.TryGetGpuBuffer() is null) return;
+                Skip.If(p.TryGetGpuBuffer() is null || g.TryGetGpuBuffer() is null,
+                    "Pinned tensors did not bind to GPU buffers on this host.");
                 // Some backends (current OpenCL allocator) return a GPU buffer but
                 // do NOT provide zero-copy host↔device mapping — the optimizer kernel
                 // runs against a separate buffer the host never sees written. Skip
                 // in that case; this gate is independent of the no-GPU skip above.
-                if (!HasZeroCopyPinnedMapping()) return;
+                Skip.If(!HasZeroCopyPinnedMapping(),
+                    "GPU pinned allocator does not expose a zero-copy host mapping on this backend.");
 
                 var pData = p.GetDataArray();
                 var gData = g.GetDataArray();
@@ -270,7 +350,7 @@ public class GpuPinnedLifetimeTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void GpuOptimizer_TryAdamWStep_AppliesDecoupledWeightDecay_OnGpuHost()
     {
         // AdamW = Adam + decoupled weight decay. With weightDecay=0.01 and
@@ -281,19 +361,24 @@ public class GpuPinnedLifetimeTests
         AiDotNet.Tensors.Engines.AiDotNetEngine.Current = gpu;
         try
         {
-            if (gpu.GetBackend() is null) return;
+            Skip.If(gpu.GetBackend() is null, "DirectGpu backend is not available.");
             var p = AiDotNet.Tensors.Helpers.TensorAllocator.RentPinnedOnGpu<float>(new[] { 4 });
             var g = AiDotNet.Tensors.Helpers.TensorAllocator.RentPinnedOnGpu<float>(new[] { 4 });
             var m = AiDotNet.Tensors.Helpers.TensorAllocator.RentPinnedOnGpu<float>(new[] { 4 });
             var v = AiDotNet.Tensors.Helpers.TensorAllocator.RentPinnedOnGpu<float>(new[] { 4 });
             try
             {
-                if (p.TryGetGpuBuffer() is null) return;
+                Skip.If(p.TryGetGpuBuffer() is null
+                    || g.TryGetGpuBuffer() is null
+                    || m.TryGetGpuBuffer() is null
+                    || v.TryGetGpuBuffer() is null,
+                    "Pinned tensors did not bind to GPU buffers on this host.");
                 // Some backends (current OpenCL allocator) return a GPU buffer but
                 // do NOT provide zero-copy host↔device mapping — the optimizer kernel
                 // runs against a separate buffer the host never sees written. Skip
                 // in that case; this gate is independent of the no-GPU skip above.
-                if (!HasZeroCopyPinnedMapping()) return;
+                Skip.If(!HasZeroCopyPinnedMapping(),
+                    "GPU pinned allocator does not expose a zero-copy host mapping on this backend.");
 
                 var pData = p.GetDataArray();
                 var initial = new float[] { 1.0f, 2.0f, 3.0f, 4.0f };

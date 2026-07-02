@@ -11561,7 +11561,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     /// <summary>
     /// Proximal gradient (ISTA) step with L1 soft-threshold prox, in place on the GPU:
-    /// <c>tmp = param - lr*grad; param = sign(tmp)*max(|tmp| - l1Strength, 0)</c>.
+    /// <c>tmp = param - lr*grad; param = sign(tmp)*max(|tmp| - lr*l1Strength, 0)</c>.
     /// </summary>
     public unsafe void ProximalL1Update(IGpuBuffer param, IGpuBuffer gradient,
         float learningRate, float l1Strength, int size)
@@ -11884,9 +11884,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         using var _ = PushContext();
         uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
-        void** args = stackalloc void*[6];
+        int paramSize = param.Size;
+        void** args = stackalloc void*[7];
         args[0] = &pP; args[1] = &pI; args[2] = &pV;
-        args[3] = &learningRate; args[4] = &weightDecay; args[5] = &nnz;
+        args[3] = &learningRate; args[4] = &weightDecay; args[5] = &nnz; args[6] = &paramSize;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
@@ -11903,9 +11904,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         using var _ = PushContext();
         uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle, pVel = velocity.Handle;
-        void** args = stackalloc void*[8];
+        int paramSize = param.Size;
+        void** args = stackalloc void*[9];
         args[0] = &pP; args[1] = &pI; args[2] = &pV; args[3] = &pVel;
-        args[4] = &learningRate; args[5] = &momentum; args[6] = &weightDecay; args[7] = &nnz;
+        args[4] = &learningRate; args[5] = &momentum; args[6] = &weightDecay; args[7] = &nnz; args[8] = &paramSize;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
@@ -11926,11 +11928,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
         IntPtr pM = m.Handle, pVv = v.Handle;
-        void** args = stackalloc void*[12];
+        int paramSize = param.Size;
+        void** args = stackalloc void*[13];
         args[0] = &pP; args[1] = &pI; args[2] = &pV;
         args[3] = &pM; args[4] = &pVv;
         args[5] = &learningRate; args[6] = &beta1; args[7] = &beta2;
-        args[8] = &epsilon; args[9] = &weightDecay; args[10] = &step; args[11] = &nnz;
+        args[8] = &epsilon; args[9] = &weightDecay; args[10] = &step; args[11] = &nnz; args[12] = &paramSize;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
@@ -11950,11 +11953,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
         IntPtr pM = m.Handle, pVv = v.Handle;
-        void** args = stackalloc void*[12];
+        int paramSize = param.Size;
+        void** args = stackalloc void*[13];
         args[0] = &pP; args[1] = &pI; args[2] = &pV;
         args[3] = &pM; args[4] = &pVv;
         args[5] = &learningRate; args[6] = &beta1; args[7] = &beta2;
-        args[8] = &epsilon; args[9] = &weightDecay; args[10] = &step; args[11] = &nnz;
+        args[8] = &epsilon; args[9] = &weightDecay; args[10] = &step; args[11] = &nnz; args[12] = &paramSize;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
@@ -11971,9 +11975,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         using var _ = PushContext();
         uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle, pSq = squaredAvg.Handle;
-        void** args = stackalloc void*[9];
+        int paramSize = param.Size;
+        void** args = stackalloc void*[10];
         args[0] = &pP; args[1] = &pI; args[2] = &pV; args[3] = &pSq;
-        args[4] = &learningRate; args[5] = &rho; args[6] = &epsilon; args[7] = &weightDecay; args[8] = &nnz;
+        args[4] = &learningRate; args[5] = &rho; args[6] = &epsilon; args[7] = &weightDecay; args[8] = &nnz; args[9] = &paramSize;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
@@ -11990,9 +11995,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         using var _ = PushContext();
         uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle, pA = accumulatedGrad.Handle;
-        void** args = stackalloc void*[8];
+        int paramSize = param.Size;
+        void** args = stackalloc void*[9];
         args[0] = &pP; args[1] = &pI; args[2] = &pV; args[3] = &pA;
-        args[4] = &learningRate; args[5] = &epsilon; args[6] = &weightDecay; args[7] = &nnz;
+        args[4] = &learningRate; args[5] = &epsilon; args[6] = &weightDecay; args[7] = &nnz; args[8] = &paramSize;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
@@ -12009,9 +12015,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         using var _ = PushContext();
         uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle, pVel = velocity.Handle;
-        void** args = stackalloc void*[8];
+        int paramSize = param.Size;
+        void** args = stackalloc void*[9];
         args[0] = &pP; args[1] = &pI; args[2] = &pV; args[3] = &pVel;
-        args[4] = &learningRate; args[5] = &momentum; args[6] = &weightDecay; args[7] = &nnz;
+        args[4] = &learningRate; args[5] = &momentum; args[6] = &weightDecay; args[7] = &nnz; args[8] = &paramSize;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
@@ -12030,9 +12037,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
         IntPtr pAg = accumGrad.Handle, pAu = accumUpdate.Handle;
-        void** args = stackalloc void*[9];
+        int paramSize = param.Size;
+        void** args = stackalloc void*[10];
         args[0] = &pP; args[1] = &pI; args[2] = &pV; args[3] = &pAg; args[4] = &pAu;
-        args[5] = &rho; args[6] = &epsilon; args[7] = &weightDecay; args[8] = &nnz;
+        args[5] = &rho; args[6] = &epsilon; args[7] = &weightDecay; args[8] = &nnz; args[9] = &paramSize;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
@@ -12053,11 +12061,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
         IntPtr pM = m.Handle, pVv = v.Handle, pVm = vMax.Handle;
-        void** args = stackalloc void*[13];
+        int paramSize = param.Size;
+        void** args = stackalloc void*[14];
         args[0] = &pP; args[1] = &pI; args[2] = &pV;
         args[3] = &pM; args[4] = &pVv; args[5] = &pVm;
         args[6] = &learningRate; args[7] = &beta1; args[8] = &beta2;
-        args[9] = &epsilon; args[10] = &weightDecay; args[11] = &step; args[12] = &nnz;
+        args[9] = &epsilon; args[10] = &weightDecay; args[11] = &step; args[12] = &nnz; args[13] = &paramSize;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
@@ -12077,11 +12086,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
         IntPtr pM = m.Handle, pU = u.Handle;
-        void** args = stackalloc void*[12];
+        int paramSize = param.Size;
+        void** args = stackalloc void*[13];
         args[0] = &pP; args[1] = &pI; args[2] = &pV;
         args[3] = &pM; args[4] = &pU;
         args[5] = &learningRate; args[6] = &beta1; args[7] = &beta2;
-        args[8] = &epsilon; args[9] = &weightDecay; args[10] = &step; args[11] = &nnz;
+        args[8] = &epsilon; args[9] = &weightDecay; args[10] = &step; args[11] = &nnz; args[12] = &paramSize;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
@@ -12098,9 +12108,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         using var _ = PushContext();
         uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle, pM = m.Handle;
-        void** args = stackalloc void*[9];
+        int paramSize = param.Size;
+        void** args = stackalloc void*[10];
         args[0] = &pP; args[1] = &pI; args[2] = &pV; args[3] = &pM;
-        args[4] = &learningRate; args[5] = &beta1; args[6] = &beta2; args[7] = &weightDecay; args[8] = &nnz;
+        args[4] = &learningRate; args[5] = &beta1; args[6] = &beta2; args[7] = &weightDecay; args[8] = &nnz; args[9] = &paramSize;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
@@ -12120,11 +12131,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
         IntPtr pM = m.Handle, pVv = v.Handle;
-        void** args = stackalloc void*[12];
+        int paramSize = param.Size;
+        void** args = stackalloc void*[13];
         args[0] = &pP; args[1] = &pI; args[2] = &pV;
         args[3] = &pM; args[4] = &pVv;
         args[5] = &learningRate; args[6] = &beta1; args[7] = &beta2;
-        args[8] = &epsilon; args[9] = &weightDecay; args[10] = &step; args[11] = &nnz;
+        args[8] = &epsilon; args[9] = &weightDecay; args[10] = &step; args[11] = &nnz; args[12] = &paramSize;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
@@ -12143,10 +12155,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
         IntPtr pZ = z.Handle, pN = n.Handle;
-        void** args = stackalloc void*[10];
+        int paramSize = param.Size;
+        void** args = stackalloc void*[11];
         args[0] = &pP; args[1] = &pI; args[2] = &pV;
         args[3] = &pZ; args[4] = &pN;
-        args[5] = &learningRate; args[6] = &l1Reg; args[7] = &l2Reg; args[8] = &beta; args[9] = &nnz;
+        args[5] = &learningRate; args[6] = &l1Reg; args[7] = &l2Reg; args[8] = &beta; args[9] = &nnz; args[10] = &paramSize;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
@@ -12162,9 +12175,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         using var _ = PushContext();
         uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
-        void** args = stackalloc void*[6];
+        int paramSize = param.Size;
+        void** args = stackalloc void*[7];
         args[0] = &pP; args[1] = &pI; args[2] = &pV;
-        args[3] = &learningRate; args[4] = &l1Strength; args[5] = &nnz;
+        args[3] = &learningRate; args[4] = &l1Strength; args[5] = &nnz; args[6] = &paramSize;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 

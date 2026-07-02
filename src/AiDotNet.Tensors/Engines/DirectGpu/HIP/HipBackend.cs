@@ -11850,6 +11850,30 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     }
 
     /// <inheritdoc/>
+    public unsafe void ProximalL1Update(IGpuBuffer param, IGpuBuffer gradient,
+        float learningRate, float l1Strength, int size)
+    {
+        if (!_kernelCache.TryGetValue("proximal_l1_update", out var krnl))
+            throw new InvalidOperationException("HIP kernel not found: proximal_l1_update");
+
+            {
+            IntPtr _p0 = ((HipGpuBuffer)param).Handle;
+            IntPtr _p1 = ((HipGpuBuffer)gradient).Handle;
+            void** args = stackalloc void*[5];
+            args[0] = &_p0;
+            args[1] = &_p1;
+            args[2] = &learningRate;
+            args[3] = &l1Strength;
+            args[4] = &size;
+
+
+            uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+            LaunchKernel(krnl, grid, DefaultBlockSize, args);
+            Synchronize();
+            }
+    }
+
+    /// <inheritdoc/>
     public unsafe void ConvertToFp16(IGpuBuffer input, IGpuBuffer output, int size)
     {
         if (!_kernelCache.TryGetValue("convert_fp32_to_fp16", out var krnl))

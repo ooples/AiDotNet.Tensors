@@ -220,6 +220,11 @@ internal static class PackBothStrategy
                 && typeof(T) == typeof(float)
                 && !transA && !transB
                 && options.PackedA is null && options.PackedB is null
+                // RunNAxisParallelUnsafe dispatches the FP32 machine-code panel, whose packed-A
+                // layout is fixed at 6 rows by 16 columns. If the active PackBoth tile is wider
+                // (for example AVX-512 16x16), falling into this path would reinterpret the
+                // packed buffers with the wrong shape.
+                && nr == MachineKernelGemm.Fp32Nr
                 && (s_allowNAxisMTail || (m % mr) == 0) && m >= mr
                 // Wide-N gate (n >= k): the N-axis re-reads the shared A (m×k) once per N-block,
                 // so it pays off only when N is wide enough to amortize that — measured across 6

@@ -1216,7 +1216,7 @@ __kernel void dropout_backward(
 
 // Embedding lookup
 __kernel void embedding_lookup(
-    __global const float* indices,
+    __global const int* indices,
     __global const float* embeddingTable,
     __global float* output,
     const int numIndices,

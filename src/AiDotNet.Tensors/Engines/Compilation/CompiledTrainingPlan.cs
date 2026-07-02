@@ -1306,16 +1306,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             ? null
             : engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine;
         evictGuard?.SuspendActivationEviction();
-        // FP16 hetero path per-step LEAK fix (MEASURED): the Execute-replay caches fresh per-step transients
-        // (Half activations, grad contributions, scratch) keyed on NEW arrays every step, and — unlike the FP32
-        // compiled path's stable preallocated buffers — they accumulate across steps (the cortex GPU peak grew
-        // ~0.8MB/step faster than FP32). Snapshot the activation-cache timestamp before this step and
-        // deterministically release everything created during it in the finally (exactly what GradientTape does
-        // on dispose). Persistent state (params, optimizer m/v, gradMap) was allocated earlier → kept.
-        long fp16ActSnapshot = -1;
-        var fp16SnapEng = _fp16HeteroOrder is not null
-            ? engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine : null;
-        if (fp16SnapEng is not null) fp16ActSnapshot = fp16SnapEng.ActivationCacheTimestampSnapshot();
+        // Snapshot the activation-cache timestamp before this eager compiled step. Step() returns only the scalar
+        // loss and exposes parameter gradients; all other forward/backward intermediates created during the step
+        // are dead after the optimizer runs and must not accumulate across long training loops.
+        var stepActivationEngine = engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine;
+        long stepActivationSnapshot = stepActivationEngine?.ActivationCacheTimestampSnapshot() ?? -1;
         // FP16 mixed precision on the FUSED path (AiDotNet #1354 / #555). The fused plan
         // ignores AiDotNet's _mixedPrecisionContext, but the Tensors-level AutocastScope is
         // honored by the engine's matmul/conv/elementwise GPU ops (norms, softmax, loss and
@@ -1560,20 +1555,22 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         finally
         {
             evictGuard?.ResumeActivationEviction();
-            // FP16 hetero per-step leak fix: deterministically release THIS step's transient activations/grads/
-            // scratch (created after the snapshot). The optimizer has already read _gradients (separate stable
-            // buffers); the stable node-output tensors re-cache on the next step's Execute. This is what keeps
-            // the FP16 path's cross-step VRAM flat instead of climbing ~0.8MB/step.
-            if (fp16SnapEng is not null && fp16ActSnapshot >= 0)
+            // Release this step's dead transient activations/grads/scratch. The optimizer has already read
+            // _gradients; protect public gradient/seed/dest tensors, materialize only the returned loss, and
+            // discard unprotected scratch materializers so cleanup does not introduce step-ending DtoH traffic.
+            if (stepActivationEngine is not null && stepActivationSnapshot >= 0)
             {
-                // FULL-RESIDENCY: the ONLY value the caller reads from a step is the scalar loss (the returned
-                // tensor). Materialize just that (one tiny GPU→CPU copy) and DISCARD every other dead step
-                // intermediate without a download — so a training step's only host transfer is the loss readout
-                // (the activations / gradients / optimizer state never round-trip). The next step's Execute
-                // recomputes the node outputs; reading any non-loss output after Step() is not part of its contract.
-                var lossKey = _lossOutput.DataVector.GetBackingArrayUnsafe();
-                if (lossKey is not null) Helpers.DeferredArrayMaterializer.TryMaterialize(lossKey);
-                fp16SnapEng.EvictActivationsCreatedAfter(fp16ActSnapshot, protect: null, materializePending: false);
+                try
+                {
+                    MaterializeStepLoss();
+                }
+                finally
+                {
+                    stepActivationEngine.EvictActivationsCreatedAfter(
+                        stepActivationSnapshot,
+                        BuildStepEvictionProtectSet(),
+                        materializePending: false);
+                }
             }
             // Bound cross-step VRAM growth: per-step transient activation buffers are dereferenced
             // here but their device memory is only released by the GC finalizer, which cannot keep
@@ -1581,6 +1578,33 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // finalizer-backed reclaim under memory pressure (cheap no-op when not pressured).
             (engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine)?.ReclaimGpuMemoryUnderPressure();
         }
+    }
+
+    private void MaterializeStepLoss()
+    {
+        var lossKey = _lossOutput.DataVector.GetBackingArrayUnsafe();
+        if (lossKey is not null)
+            Helpers.DeferredArrayMaterializer.TryMaterialize(lossKey);
+        Helpers.DeferredArrayMaterializer.TryMaterialize(_lossOutput.DataVector);
+    }
+
+    private HashSet<object> BuildStepEvictionProtectSet()
+    {
+        var protect = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
+        for (int i = 0; i < _gradients.Length; i++)
+            AddActivationCacheKeys(protect, _gradients[i]);
+        AddActivationCacheKeys(protect, _lossGradDest);
+        AddActivationCacheKeys(protect, _lossGradSeed);
+        return protect;
+    }
+
+    private static void AddActivationCacheKeys(HashSet<object> keys, Tensor<T>? tensor)
+    {
+        if (tensor is null) return;
+        var backing = tensor.DataVector.GetBackingArrayUnsafe();
+        if (backing is not null)
+            keys.Add(backing);
+        keys.Add(tensor.DataVector);
     }
 
     public unsafe void ConfigureOptimizer(
@@ -2161,7 +2185,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 float newLr = lr + scalarState.HypergradientAdjustment;
                 for (int p = 0; p < paramCount; p++)
                 {
-                    if (gradArrays[p].Length == 0) continue;
+                    // Skip params with no gradient OR no materialized weight backing (#1738).
+                    if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
                     int len2 = lengths[p];
                     fixed (float* pParam = paramArrays[p], pGrad = gradArrays[p], pPrev = m[p])
                         for (int i = 0; i < len2; i++) { pParam[i] -= newLr * pGrad[i]; pPrev[i] = pGrad[i]; }
@@ -2192,7 +2217,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 float gammaNew = dNew * lr;
                 for (int p = 0; p < paramCount; p++)
                 {
-                    if (gradArrays[p].Length == 0) continue;
+                    // Skip params with no gradient OR no materialized weight backing (#1738).
+                    if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
                     int len2 = lengths[p];
                     fixed (float* pParam = paramArrays[p], pGrad = gradArrays[p])
                         for (int i = 0; i < len2; i++) pParam[i] -= gammaNew * pGrad[i];
@@ -2212,7 +2238,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 float wsNext = scalarState.ScheduleFreeWeightSum;
                 for (int p = 0; p < paramCount; p++)
                 {
-                    if (gradArrays[p].Length == 0) continue;
+                    if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
                     int len2 = lengths[p];
                     fixed (float* pZ = m[p], pX = v[p], pGrad = gradArrays[p])
                         wsNext = FusedOptimizer.ScheduleFreeSgdUpdateSimd(
@@ -2380,7 +2406,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 }
 
                 // CPU path: pin live backing + SIMD kernel.
-                if (gradArrays[p].Length == 0) continue;
+                // Skip a parameter with no gradient (its grad buffer was never written this
+                // step) OR no materialized weight backing. The latter happens for lazy /
+                // unexercised layers — e.g. the unused-modality encoders of a multi-modal
+                // model whose forward only touched one modality: the plan pre-allocates their
+                // grad/m/v buffers at their declared length, but the parameter's live backing
+                // array stays empty (length 0) until first materialization, so there is nothing
+                // to update. The eager optimizer path skips such params the same way (#1738).
+                // Without the paramArrays guard, `fixed` over the empty backing yields a null
+                // pointer and the SIMD kernel NREs at the full declared length, which is caught
+                // upstream and silently kicks the ENTIRE model off the fused fast path onto the
+                // ~17× slower eager autograd tape — the exact UnifiedMultimodal regression.
+                if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
 
                 fixed (float* pParam = paramArrays[p], pGrad = gradArrays[p],
                        pM = m[p], pV = v[p], pVMax = vMax[p])
@@ -2925,7 +2962,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     continue;
                 }
 
-                if (gradArrays[p].Length == 0) continue;
+                // Skip params with no gradient OR no materialized weight backing (lazy /
+                // unexercised layers; see the same guard in ConfigureOptimizerFloat). #1738.
+                if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
 
                 fixed (float* pParam = paramArrays[p], pGrad = gradArrays[p],
                        pM = m[p], pV = v[p], pVMax = vMax[p])
@@ -3164,7 +3203,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             double lr = lrSchedule.GetLr(_optimizerStep);
             for (int p = 0; p < paramCount; p++)
             {
-                if (gradArrays[p].Length == 0) continue;
+                // Skip params with no gradient OR no materialized weight backing (#1738).
+                if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
                 int len = lengths[p];
                 fixed (double* pParam = paramArrays[p], pGrad = gradArrays[p],
                        pM = m[p], pV = v[p], pVMax = vMax[p])
@@ -3310,7 +3350,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             for (int p = 0; p < paramCount; p++)
             {
-                if (gradArrays[p].Length == 0) continue;
+                // Skip params with no gradient OR no materialized weight backing (#1738).
+                if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
                 int len = lengths[p];
                 double lr = groupLrs[paramGroup[p]];
 
@@ -5952,9 +5993,24 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// backing-array length), then scales every element by
     /// <c>maxNorm / (totalNorm + 1e-6)</c> when totalNorm exceeds maxNorm.
     /// </summary>
-    private static void ClipGradientsGlobalL2(Tensor<T>[] gradients, double maxNorm)
+    private void ClipGradientsGlobalL2(Tensor<T>[] gradients, double maxNorm)
     {
         if (gradients.Length == 0) return;
+        // A gradient belongs to an unexercised (lazy, off-loss-path) parameter when that PARAMETER's
+        // weight backing is unmaterialized — even though the plan holds a full-length zero gradient
+        // buffer for it. Such gradients are zero: they contribute nothing to the global norm and
+        // scaling them is a no-op. Skipping them makes the clip cost scale with the EXERCISED params
+        // (what the optimizer already does) instead of the full param set — ClipGradientsGlobalL2 was
+        // ~44% of a UnifiedMultimodal training step, almost all of it scanning ~500M zero elements. #1738
+        var ps = _parameters;
+        bool SkipUnexercised(int p)
+        {
+            if (ps is null || ps.Length != gradients.Length) return false;
+            var pt = ps[p];
+            if (pt is null) return true;
+            var pa = pt.GetLiveBackingArrayAllowingPaddingOrNull();
+            return pa is null || pa.Length == 0;
+        }
 
         // CodeRabbit #425 review: detect GPU-resident gradients before the CPU
         // clip loop. Pre-fix the CPU pass would compute the L2 norm over a
@@ -6000,7 +6056,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         for (int p = 0; p < gradients.Length; p++)
         {
             var tensor = gradients[p];
-            if (tensor == null) continue;
+            if (tensor == null || SkipUnexercised(p)) continue;
             var arr = tensor.GetLiveBackingArrayAllowingPaddingOrNull() ?? tensor.GetDataArray();
             int len = tensor.Length;
             for (int i = 0; i < len; i++)
@@ -6018,7 +6074,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         for (int p = 0; p < gradients.Length; p++)
         {
             var tensor = gradients[p];
-            if (tensor == null) continue;
+            if (tensor == null || SkipUnexercised(p)) continue;
             var arr = tensor.GetLiveBackingArrayAllowingPaddingOrNull() ?? tensor.GetDataArray();
             int len = tensor.Length;
             for (int i = 0; i < len; i++)

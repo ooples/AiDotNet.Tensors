@@ -1640,6 +1640,11 @@ public class DelegatingGpuBackend : IDirectGpuBackend
         => Inner.FtrlUpdate(param, gradient, z, n, learningRate, l1Reg, l2Reg, beta, size);
 
     /// <inheritdoc/>
+    public virtual void ProximalL1Update(IGpuBuffer param, IGpuBuffer gradient,
+        float learningRate, float l1Strength, int size)
+        => Inner.ProximalL1Update(param, gradient, learningRate, l1Strength, size);
+
+    /// <inheritdoc/>
     public virtual void SparseSgdUpdate(IGpuBuffer param, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float learningRate, float weightDecay)
         => Inner.SparseSgdUpdate(param, sparseIndices, sparseValues, nnz, learningRate, weightDecay);
 

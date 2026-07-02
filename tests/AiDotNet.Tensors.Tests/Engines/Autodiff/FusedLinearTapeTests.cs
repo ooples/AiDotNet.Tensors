@@ -2,6 +2,7 @@ using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
+using System;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -11,12 +12,22 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// Integration tests proving FusedLinear is recorded by GradientTape
 /// and produces non-zero gradients for all paths (fixes issue #102).
 /// </summary>
-public class FusedLinearTapeTests
+[Collection("EngineCurrentGlobalState")]
+public class FusedLinearTapeTests : IDisposable
 {
     private readonly ITestOutputHelper _output;
-    private readonly IEngine _engine = AiDotNetEngine.Current;
+    private readonly IEngine _engine;
+    private readonly IEngine _previousEngine;
 
-    public FusedLinearTapeTests(ITestOutputHelper output) => _output = output;
+    public FusedLinearTapeTests(ITestOutputHelper output)
+    {
+        _output = output;
+        _previousEngine = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = new CpuEngine();
+        _engine = AiDotNetEngine.Current;
+    }
+
+    public void Dispose() => AiDotNetEngine.Current = _previousEngine;
 
     [Theory]
     [InlineData(FusedActivationType.None)]

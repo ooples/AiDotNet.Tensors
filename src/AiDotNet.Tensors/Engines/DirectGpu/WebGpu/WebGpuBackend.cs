@@ -866,7 +866,8 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         new float[]
         {
             BitConverter.Int32BitsToSingle(size), lr, beta1, beta2, epsilon, weightDecay,
-            t, extra
+            BitConverter.Int32BitsToSingle(t), extra,
+            0, 0, 0, 0
         };
 
     internal async Task Dispatch1BufferAsync(string moduleName, string source, string kernelName,

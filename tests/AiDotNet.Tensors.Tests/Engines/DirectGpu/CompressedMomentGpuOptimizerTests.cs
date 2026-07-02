@@ -74,7 +74,7 @@ public sealed class CompressedMomentGpuOptimizerTests
 
 #if NET7_0_OR_GREATER
     [Fact]
-    public void WebGpuOptimizerUniforms_PackStepAsFloatForBiasCorrection()
+    public void WebGpuOptimizerUniforms_PackIntegerFieldsAndPadding()
     {
         var uniforms = WebGpuBackend.MakeOptimizerUniforms(
             size: 17,
@@ -85,9 +85,10 @@ public sealed class CompressedMomentGpuOptimizerTests
             weightDecay: 0.0125f,
             t: 12);
 
-        Assert.Equal(8, uniforms.Length);
+        Assert.Equal(12, uniforms.Length);
         Assert.Equal(17, BitConverter.SingleToInt32Bits(uniforms[0]));
-        Assert.Equal(12f, uniforms[6]);
+        Assert.Equal(12, BitConverter.SingleToInt32Bits(uniforms[6]));
+        Assert.Equal(0f, uniforms[8]);
     }
 #endif
 

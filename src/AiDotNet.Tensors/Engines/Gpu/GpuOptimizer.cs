@@ -1,6 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
 using System;
+using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -33,6 +34,39 @@ namespace AiDotNet.Tensors.Engines.Gpu;
 /// </remarks>
 public static class GpuOptimizer
 {
+    private static GpuSyncPoint CreateWriteSyncPoint(IDirectGpuBackend backend)
+        => backend is IAsyncGpuBackend asyncBackend
+            ? asyncBackend.CreateSyncPoint()
+            : GpuSyncPoint.CreateComplete();
+
+    private static void MarkGpuUpdated(IDirectGpuBackend backend, Tensor<float>? tensor)
+    {
+        if (tensor is null) return;
+        tensor.MarkModified(CreateWriteSyncPoint(backend));
+        tensor._gpuBufferVersion = tensor.Version;
+    }
+
+    private static void MarkGpuUpdated(IDirectGpuBackend backend, Tensor<float>? first, Tensor<float>? second)
+    {
+        MarkGpuUpdated(backend, first);
+        MarkGpuUpdated(backend, second);
+    }
+
+    private static void MarkGpuUpdated(IDirectGpuBackend backend, Tensor<float>? first, Tensor<float>? second, Tensor<float>? third)
+    {
+        MarkGpuUpdated(backend, first);
+        MarkGpuUpdated(backend, second);
+        MarkGpuUpdated(backend, third);
+    }
+
+    private static void MarkGpuUpdated(IDirectGpuBackend backend, Tensor<float>? first, Tensor<float>? second, Tensor<float>? third, Tensor<float>? fourth)
+    {
+        MarkGpuUpdated(backend, first);
+        MarkGpuUpdated(backend, second);
+        MarkGpuUpdated(backend, third);
+        MarkGpuUpdated(backend, fourth);
+    }
+
     /// <summary>
     /// Adam optimizer step on GPU-resident tensors. All four tensors
     /// (<paramref name="param"/>, <paramref name="grad"/>,
@@ -66,6 +100,7 @@ public static class GpuOptimizer
 
         backend.AdamUpdate(pBuf, gBuf, mBuf, vBuf,
             learningRate, beta1, beta2, epsilon, weightDecay, step, param.Length);
+        MarkGpuUpdated(backend, param, m, v);
         return true;
     }
 
@@ -120,24 +155,32 @@ public static class GpuOptimizer
         if (pBuf is null || gBuf is null) return false;
 
         backend.SgdUpdate(pBuf, gBuf, learningRate, weightDecay: 0f, param.Length);
+        MarkGpuUpdated(backend, param);
         return true;
     }
 
     /// <summary>
     /// Proximal gradient (ISTA) step with L1 soft-threshold prox, in place on the GPU.
-    /// CUDA-only (proximal_l1_update lives on CudaBackend); returns false on any
-    /// other backend or when param/grad aren't GPU-resident, so the caller falls
+    /// Returns false when param/grad aren't GPU-resident so the caller falls
     /// back to the CPU path.
     /// </summary>
     public static bool TryProximalL1Step(Tensor<float> p, Tensor<float> g, float lr, float l1Strength)
     {
         if (p is null) throw new ArgumentNullException(nameof(p));
         if (g is null) throw new ArgumentNullException(nameof(g));
+        if (p.Length != g.Length)
+            throw new ArgumentException("param and grad must have the same length.", nameof(g));
+        if (float.IsNaN(lr) || float.IsInfinity(lr) || lr < 0f)
+            throw new ArgumentOutOfRangeException(nameof(lr), lr, "Learning rate must be finite and non-negative.");
+        if (float.IsNaN(l1Strength) || float.IsInfinity(l1Strength) || l1Strength < 0f)
+            throw new ArgumentOutOfRangeException(nameof(l1Strength), l1Strength, "L1 strength must be finite and non-negative.");
         if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false;
-        if (!(e.GetBackend() is DirectGpu.CUDA.CudaBackend cb)) return false;
+        var backend = e.GetBackend();
+        if (backend is null) return false;
         var pb = p.TryGetGpuBuffer(); var gb = g.TryGetGpuBuffer();
         if (pb is null || gb is null) return false;
-        cb.ProximalL1Update(pb, gb, lr, l1Strength, p.Length);
+        backend.ProximalL1Update(pb, gb, lr, l1Strength, p.Length);
+        MarkGpuUpdated(backend, p);
         return true;
     }
 
@@ -214,6 +257,7 @@ public static class GpuOptimizer
         int nb = (p.Length + blockSize - 1) / blockSize;
         cb.Adam8BitUpdate(pb, gb, mQ, vQ, mScales, vScales,
             lr, beta1, beta2, epsilon, 1f - beta1, 1f - beta2, biasCorrection1, biasCorrection2, blockSize, p.Length, nb);
+        MarkGpuUpdated(cb, p);
         return true;
     }
 
@@ -226,7 +270,9 @@ public static class GpuOptimizer
         if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; var b = e.GetBackend(); if (b is null) return false;
         var pb = p?.TryGetGpuBuffer(); var gb = g?.TryGetGpuBuffer(); var vb = velocity?.TryGetGpuBuffer();
         if (pb is null || gb is null || vb is null) return false;
-        b.SgdMomentumUpdate(pb, gb, vb, lr, momentum, weightDecay, p!.Length); return true;
+        b.SgdMomentumUpdate(pb, gb, vb, lr, momentum, weightDecay, p!.Length);
+        MarkGpuUpdated(b, p, velocity);
+        return true;
     }
 
     public static bool TryRmspropStep(Tensor<float> p, Tensor<float> g, Tensor<float> squaredAvg, float lr, float rho, float epsilon, float weightDecay)
@@ -234,7 +280,9 @@ public static class GpuOptimizer
         if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; var b = e.GetBackend(); if (b is null) return false;
         var pb = p?.TryGetGpuBuffer(); var gb = g?.TryGetGpuBuffer(); var sb = squaredAvg?.TryGetGpuBuffer();
         if (pb is null || gb is null || sb is null) return false;
-        b.RmspropUpdate(pb, gb, sb, lr, rho, epsilon, weightDecay, p!.Length); return true;
+        b.RmspropUpdate(pb, gb, sb, lr, rho, epsilon, weightDecay, p!.Length);
+        MarkGpuUpdated(b, p, squaredAvg);
+        return true;
     }
 
     public static bool TryAdagradStep(Tensor<float> p, Tensor<float> g, Tensor<float> accum, float lr, float epsilon, float weightDecay)
@@ -242,7 +290,9 @@ public static class GpuOptimizer
         if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; var b = e.GetBackend(); if (b is null) return false;
         var pb = p?.TryGetGpuBuffer(); var gb = g?.TryGetGpuBuffer(); var ab = accum?.TryGetGpuBuffer();
         if (pb is null || gb is null || ab is null) return false;
-        b.AdagradUpdate(pb, gb, ab, lr, epsilon, weightDecay, p!.Length); return true;
+        b.AdagradUpdate(pb, gb, ab, lr, epsilon, weightDecay, p!.Length);
+        MarkGpuUpdated(b, p, accum);
+        return true;
     }
 
     public static bool TryNagStep(Tensor<float> p, Tensor<float> g, Tensor<float> velocity, float lr, float momentum, float weightDecay)
@@ -250,7 +300,9 @@ public static class GpuOptimizer
         if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; var b = e.GetBackend(); if (b is null) return false;
         var pb = p?.TryGetGpuBuffer(); var gb = g?.TryGetGpuBuffer(); var vb = velocity?.TryGetGpuBuffer();
         if (pb is null || gb is null || vb is null) return false;
-        b.NagUpdate(pb, gb, vb, lr, momentum, weightDecay, p!.Length); return true;
+        b.NagUpdate(pb, gb, vb, lr, momentum, weightDecay, p!.Length);
+        MarkGpuUpdated(b, p, velocity);
+        return true;
     }
 
     public static bool TryLarsStep(Tensor<float> p, Tensor<float> g, Tensor<float> velocity, float lr, float momentum, float weightDecay, float trustCoeff)
@@ -258,7 +310,9 @@ public static class GpuOptimizer
         if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; var b = e.GetBackend(); if (b is null) return false;
         var pb = p?.TryGetGpuBuffer(); var gb = g?.TryGetGpuBuffer(); var vb = velocity?.TryGetGpuBuffer();
         if (pb is null || gb is null || vb is null) return false;
-        b.LarsUpdate(pb, gb, vb, lr, momentum, weightDecay, trustCoeff, p!.Length); return true;
+        b.LarsUpdate(pb, gb, vb, lr, momentum, weightDecay, trustCoeff, p!.Length);
+        MarkGpuUpdated(b, p, velocity);
+        return true;
     }
 
     public static bool TryLambStep(Tensor<float> p, Tensor<float> g, Tensor<float> m, Tensor<float> v, float lr, float beta1, float beta2, float epsilon, float weightDecay, int step)
@@ -266,7 +320,9 @@ public static class GpuOptimizer
         if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; var b = e.GetBackend(); if (b is null) return false;
         var pb = p?.TryGetGpuBuffer(); var gb = g?.TryGetGpuBuffer(); var mb = m?.TryGetGpuBuffer(); var vb = v?.TryGetGpuBuffer();
         if (pb is null || gb is null || mb is null || vb is null) return false;
-        b.LambUpdate(pb, gb, mb, vb, lr, beta1, beta2, epsilon, weightDecay, step, p!.Length); return true;
+        b.LambUpdate(pb, gb, mb, vb, lr, beta1, beta2, epsilon, weightDecay, step, p!.Length);
+        MarkGpuUpdated(b, p, m, v);
+        return true;
     }
 
     public static bool TryAdadeltaStep(Tensor<float> p, Tensor<float> g, Tensor<float> accumGrad, Tensor<float> accumUpdate, float rho, float epsilon, float weightDecay)
@@ -274,7 +330,9 @@ public static class GpuOptimizer
         if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; var b = e.GetBackend(); if (b is null) return false;
         var pb = p?.TryGetGpuBuffer(); var gb = g?.TryGetGpuBuffer(); var ag = accumGrad?.TryGetGpuBuffer(); var au = accumUpdate?.TryGetGpuBuffer();
         if (pb is null || gb is null || ag is null || au is null) return false;
-        b.AdadeltaUpdate(pb, gb, ag, au, rho, epsilon, weightDecay, p!.Length); return true;
+        b.AdadeltaUpdate(pb, gb, ag, au, rho, epsilon, weightDecay, p!.Length);
+        MarkGpuUpdated(b, p, accumGrad, accumUpdate);
+        return true;
     }
 
     public static bool TryAmsgradStep(Tensor<float> p, Tensor<float> g, Tensor<float> m, Tensor<float> v, Tensor<float> vMax, float lr, float beta1, float beta2, float epsilon, float weightDecay, int step)
@@ -282,7 +340,9 @@ public static class GpuOptimizer
         if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; var b = e.GetBackend(); if (b is null) return false;
         var pb = p?.TryGetGpuBuffer(); var gb = g?.TryGetGpuBuffer(); var mb = m?.TryGetGpuBuffer(); var vb = v?.TryGetGpuBuffer(); var xb = vMax?.TryGetGpuBuffer();
         if (pb is null || gb is null || mb is null || vb is null || xb is null) return false;
-        b.AmsgradUpdate(pb, gb, mb, vb, xb, lr, beta1, beta2, epsilon, weightDecay, step, p!.Length); return true;
+        b.AmsgradUpdate(pb, gb, mb, vb, xb, lr, beta1, beta2, epsilon, weightDecay, step, p!.Length);
+        MarkGpuUpdated(b, p, m, v, vMax);
+        return true;
     }
 
     public static bool TryAdamaxStep(Tensor<float> p, Tensor<float> g, Tensor<float> m, Tensor<float> u, float lr, float beta1, float beta2, float epsilon, float weightDecay, int step)
@@ -290,7 +350,9 @@ public static class GpuOptimizer
         if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; var b = e.GetBackend(); if (b is null) return false;
         var pb = p?.TryGetGpuBuffer(); var gb = g?.TryGetGpuBuffer(); var mb = m?.TryGetGpuBuffer(); var ub = u?.TryGetGpuBuffer();
         if (pb is null || gb is null || mb is null || ub is null) return false;
-        b.AdamaxUpdate(pb, gb, mb, ub, lr, beta1, beta2, epsilon, weightDecay, step, p!.Length); return true;
+        b.AdamaxUpdate(pb, gb, mb, ub, lr, beta1, beta2, epsilon, weightDecay, step, p!.Length);
+        MarkGpuUpdated(b, p, m, u);
+        return true;
     }
 
     public static bool TryLionStep(Tensor<float> p, Tensor<float> g, Tensor<float> m, float lr, float beta1, float beta2, float weightDecay)
@@ -298,7 +360,9 @@ public static class GpuOptimizer
         if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; var b = e.GetBackend(); if (b is null) return false;
         var pb = p?.TryGetGpuBuffer(); var gb = g?.TryGetGpuBuffer(); var mb = m?.TryGetGpuBuffer();
         if (pb is null || gb is null || mb is null) return false;
-        b.LionUpdate(pb, gb, mb, lr, beta1, beta2, weightDecay, p!.Length); return true;
+        b.LionUpdate(pb, gb, mb, lr, beta1, beta2, weightDecay, p!.Length);
+        MarkGpuUpdated(b, p, m);
+        return true;
     }
 
     public static bool TryNadamStep(Tensor<float> p, Tensor<float> g, Tensor<float> m, Tensor<float> v, float lr, float beta1, float beta2, float epsilon, float weightDecay, int step)
@@ -306,7 +370,9 @@ public static class GpuOptimizer
         if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; var b = e.GetBackend(); if (b is null) return false;
         var pb = p?.TryGetGpuBuffer(); var gb = g?.TryGetGpuBuffer(); var mb = m?.TryGetGpuBuffer(); var vb = v?.TryGetGpuBuffer();
         if (pb is null || gb is null || mb is null || vb is null) return false;
-        b.NadamUpdate(pb, gb, mb, vb, lr, beta1, beta2, epsilon, weightDecay, step, p!.Length); return true;
+        b.NadamUpdate(pb, gb, mb, vb, lr, beta1, beta2, epsilon, weightDecay, step, p!.Length);
+        MarkGpuUpdated(b, p, m, v);
+        return true;
     }
 
     public static bool TryFtrlStep(Tensor<float> p, Tensor<float> g, Tensor<float> z, Tensor<float> n, float lr, float l1Reg, float l2Reg, float beta)
@@ -314,30 +380,34 @@ public static class GpuOptimizer
         if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; var b = e.GetBackend(); if (b is null) return false;
         var pb = p?.TryGetGpuBuffer(); var gb = g?.TryGetGpuBuffer(); var zb = z?.TryGetGpuBuffer(); var nb = n?.TryGetGpuBuffer();
         if (pb is null || gb is null || zb is null || nb is null) return false;
-        b.FtrlUpdate(pb, gb, zb, nb, lr, l1Reg, l2Reg, beta, p!.Length); return true;
+        b.FtrlUpdate(pb, gb, zb, nb, lr, l1Reg, l2Reg, beta, p!.Length);
+        MarkGpuUpdated(b, p, z, n);
+        return true;
     }
 
     // ==================================================================
     // SPARSE-AWARE GPU OPTIMIZER WRAPPERS — PR #567
     // ==================================================================
     //
-    // Each wrapper below dispatches the matching NATIVE sparse_*_update
-    // CUDA kernel (defined in CudaOptimizerKernels.cs, launched by
-    // CudaBackend.SparseXUpdate). Grid dim = ceil(nnz / 256); each kernel
+    // Each wrapper below dispatches the matching native backend sparse optimizer
+    // kernel. Grid dim = ceil(nnz / 256); each kernel
     // thread reads exactly one (idx[k], val[k]) and scatter-updates only
     // (param[idx], state[idx]). Memory traffic is O(nnz) — the other
-    // (param.Length - nnz) entries are never read or written.
+    // (param.Length - nnz) entries are never read or written on native
+    // scatter backends. Staged fallback backends preserve correctness but
+    // may transfer full param/state buffers.
     //
     // sparseIndices and sparseValues must already be GPU-resident
-    // (TryGetGpuBuffer must succeed for them). The dense state buffers
-    // (m, v, accum, ...) keep their full shape and are mutated in place
-    // at the touched indices.
+    // (TryGetGpuBuffer must succeed for them). sparseIndices[0..nnz) must
+    // be in range, unique, and pre-aggregated; native kernels intentionally
+    // use non-atomic scatter writes and do not define duplicate-index order.
+    // The dense state buffers (m, v, accum, ...) keep their full shape and
+    // are mutated in place at the touched indices.
     //
     // Returns false on:
     //   * non-GPU engine (caller should run CPU sparse path)
     //   * any tensor missing its GPU buffer
-    //   * backend NotSupportedException (non-CUDA backends without the
-    //     native sparse kernel yet — HIP/Metal/Vulkan/WebGpu/OpenCL)
+    //   * backend NotSupportedException
     // ==================================================================
 
     private static bool TryPrepareSparse(
@@ -358,7 +428,65 @@ public static class GpuOptimizer
         pBuf = param.TryGetGpuBuffer();
         idxBuf = sparseIndices.TryGetGpuBuffer();
         valBuf = sparseValues.TryGetGpuBuffer();
-        return pBuf is not null && idxBuf is not null && valBuf is not null;
+        if (pBuf is null || idxBuf is null || valBuf is null) return false;
+
+        // Cheap, always-on device-buffer bounds guards: the kernels read indices[k] AND values[k] for
+        // k < nnz, so both buffers must hold at least nnz elements or the dispatch reads out of bounds.
+        if (idxBuf.Size < nnz)
+            throw new ArgumentException($"sparseIndices buffer holds {idxBuf.Size} elements but nnz={nnz}.", nameof(sparseIndices));
+        if (valBuf.Size < nnz)
+            throw new ArgumentException($"sparseValues buffer holds {valBuf.Size} elements but nnz={nnz}.", nameof(sparseValues));
+
+        EnsureUniqueSparseDispatchIndices(backend, idxBuf, nnz, param.Length);
+        return true;
+    }
+
+    /// <summary>
+    /// Opt-in gate for the O(nnz) host-side duplicate-index verification in
+    /// <see cref="EnsureUniqueSparseDispatchIndices"/>. The native sparse kernels are non-atomic and
+    /// require unique, pre-aggregated indices per dispatch (see the <c>IDirectGpuBackend</c> sparse
+    /// optimizer contract), but downloading the index buffer and building a <see cref="HashSet{T}"/> on
+    /// every step forces a host round-trip that can serialize the GPU queue and defeats the O(nnz)
+    /// on-device benefit. Off by default (release/native fast path — callers own the uniqueness
+    /// invariant); enable via <c>AIDOTNET_VALIDATE_SPARSE_INDICES=1</c> for debugging or staged fallback.
+    /// </summary>
+    internal static bool ValidateSparseIndexUniqueness { get; set; } =
+        Environment.GetEnvironmentVariable("AIDOTNET_VALIDATE_SPARSE_INDICES") == "1";
+
+    internal static void EnsureUniqueSparseDispatchIndices(IDirectGpuBackend backend, IGpuBuffer sparseIndices, int nnz, int paramLength)
+    {
+        if (nnz == 0) return;
+        // Always-on cheap bounds guard (no host transfer).
+        if (sparseIndices.Size < nnz)
+            throw new ArgumentException($"sparseIndices buffer holds {sparseIndices.Size} elements but nnz={nnz}.", nameof(sparseIndices));
+
+        // The duplicate/uniqueness scan below needs a DownloadBuffer round-trip + a HashSet — O(nnz)
+        // off-device work on every sparse step. Skip it on the fast path; the native kernels' unique-index
+        // requirement is part of the backend contract and callers pre-aggregate. Opt in for verification.
+        if (!ValidateSparseIndexUniqueness) return;
+
+        var rawIndices = backend.DownloadBuffer(sparseIndices);
+        var seen = new HashSet<int>();
+        for (int k = 0; k < nnz; k++)
+        {
+            int index;
+            try
+            {
+                index = SparseOptimizerReference.DecodeIndex(rawIndices[k], paramLength);
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(sparseIndices),
+                    rawIndices[k],
+                    $"sparseIndices[{k}] is outside [0, {paramLength}).");
+            }
+
+            if (!seen.Add(index))
+                throw new ArgumentException(
+                    $"sparseIndices contains duplicate index {index} at position {k}; GPU sparse optimizer indices must be unique and pre-aggregated before dispatch.",
+                    nameof(sparseIndices));
+        }
     }
 
     /// <summary>Adam GPU step driven by a sparse gradient — dispatches the native
@@ -375,7 +503,7 @@ public static class GpuOptimizer
         if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
         var mb = m.TryGetGpuBuffer(); var vbState = v.TryGetGpuBuffer();
         if (mb is null || vbState is null) return false;
-        try { b!.SparseAdamUpdate(pb!, mb, vbState, iBuf!, vBuf!, nnz, learningRate, beta1, beta2, epsilon, weightDecay, step); return true; }
+        try { b!.SparseAdamUpdate(pb!, mb, vbState, iBuf!, vBuf!, nnz, learningRate, beta1, beta2, epsilon, weightDecay, step); MarkGpuUpdated(b, param, m, v); return true; }
         catch (NotSupportedException) { return false; }
     }
 
@@ -391,7 +519,7 @@ public static class GpuOptimizer
         if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
         var mb = m.TryGetGpuBuffer(); var vbState = v.TryGetGpuBuffer();
         if (mb is null || vbState is null) return false;
-        try { b!.SparseAdamWUpdate(pb!, mb, vbState, iBuf!, vBuf!, nnz, learningRate, beta1, beta2, epsilon, weightDecay, step); return true; }
+        try { b!.SparseAdamWUpdate(pb!, mb, vbState, iBuf!, vBuf!, nnz, learningRate, beta1, beta2, epsilon, weightDecay, step); MarkGpuUpdated(b, param, m, v); return true; }
         catch (NotSupportedException) { return false; }
     }
 
@@ -402,7 +530,7 @@ public static class GpuOptimizer
         float learningRate, float weightDecay = 0f)
     {
         if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
-        try { b!.SparseSgdUpdate(pb!, iBuf!, vBuf!, nnz, learningRate, weightDecay); return true; }
+        try { b!.SparseSgdUpdate(pb!, iBuf!, vBuf!, nnz, learningRate, weightDecay); MarkGpuUpdated(b, param); return true; }
         catch (NotSupportedException) { return false; }
     }
 
@@ -416,7 +544,7 @@ public static class GpuOptimizer
         if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
         var velBuf = velocity.TryGetGpuBuffer();
         if (velBuf is null) return false;
-        try { b!.SparseSgdMomentumUpdate(pb!, velBuf, iBuf!, vBuf!, nnz, learningRate, momentum, weightDecay); return true; }
+        try { b!.SparseSgdMomentumUpdate(pb!, velBuf, iBuf!, vBuf!, nnz, learningRate, momentum, weightDecay); MarkGpuUpdated(b, param, velocity); return true; }
         catch (NotSupportedException) { return false; }
     }
 
@@ -430,7 +558,7 @@ public static class GpuOptimizer
         if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
         var sb = squaredAvg.TryGetGpuBuffer();
         if (sb is null) return false;
-        try { b!.SparseRmspropUpdate(pb!, sb, iBuf!, vBuf!, nnz, lr, rho, epsilon, weightDecay); return true; }
+        try { b!.SparseRmspropUpdate(pb!, sb, iBuf!, vBuf!, nnz, lr, rho, epsilon, weightDecay); MarkGpuUpdated(b, param, squaredAvg); return true; }
         catch (NotSupportedException) { return false; }
     }
 
@@ -444,7 +572,7 @@ public static class GpuOptimizer
         if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
         var ab = accum.TryGetGpuBuffer();
         if (ab is null) return false;
-        try { b!.SparseAdagradUpdate(pb!, ab, iBuf!, vBuf!, nnz, lr, epsilon, weightDecay); return true; }
+        try { b!.SparseAdagradUpdate(pb!, ab, iBuf!, vBuf!, nnz, lr, epsilon, weightDecay); MarkGpuUpdated(b, param, accum); return true; }
         catch (NotSupportedException) { return false; }
     }
 
@@ -458,7 +586,7 @@ public static class GpuOptimizer
         if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
         var velBuf = velocity.TryGetGpuBuffer();
         if (velBuf is null) return false;
-        try { b!.SparseNagUpdate(pb!, velBuf, iBuf!, vBuf!, nnz, lr, momentum, weightDecay); return true; }
+        try { b!.SparseNagUpdate(pb!, velBuf, iBuf!, vBuf!, nnz, lr, momentum, weightDecay); MarkGpuUpdated(b, param, velocity); return true; }
         catch (NotSupportedException) { return false; }
     }
 
@@ -474,7 +602,7 @@ public static class GpuOptimizer
         var agb = accumGrad.TryGetGpuBuffer();
         var aub = accumUpdate.TryGetGpuBuffer();
         if (agb is null || aub is null) return false;
-        try { b!.SparseAdadeltaUpdate(pb!, agb, aub, iBuf!, vBuf!, nnz, rho, epsilon, weightDecay); return true; }
+        try { b!.SparseAdadeltaUpdate(pb!, agb, aub, iBuf!, vBuf!, nnz, rho, epsilon, weightDecay); MarkGpuUpdated(b, param, accumGrad, accumUpdate); return true; }
         catch (NotSupportedException) { return false; }
     }
 
@@ -490,7 +618,7 @@ public static class GpuOptimizer
         if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
         var mb = m.TryGetGpuBuffer(); var vbState = v.TryGetGpuBuffer(); var vmb = vMax.TryGetGpuBuffer();
         if (mb is null || vbState is null || vmb is null) return false;
-        try { b!.SparseAmsgradUpdate(pb!, mb, vbState, vmb, iBuf!, vBuf!, nnz, lr, beta1, beta2, epsilon, weightDecay, step); return true; }
+        try { b!.SparseAmsgradUpdate(pb!, mb, vbState, vmb, iBuf!, vBuf!, nnz, lr, beta1, beta2, epsilon, weightDecay, step); MarkGpuUpdated(b, param, m, v, vMax); return true; }
         catch (NotSupportedException) { return false; }
     }
 
@@ -505,7 +633,7 @@ public static class GpuOptimizer
         if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
         var mb = m.TryGetGpuBuffer(); var ub = u.TryGetGpuBuffer();
         if (mb is null || ub is null) return false;
-        try { b!.SparseAdamaxUpdate(pb!, mb, ub, iBuf!, vBuf!, nnz, lr, beta1, beta2, epsilon, weightDecay, step); return true; }
+        try { b!.SparseAdamaxUpdate(pb!, mb, ub, iBuf!, vBuf!, nnz, lr, beta1, beta2, epsilon, weightDecay, step); MarkGpuUpdated(b, param, m, u); return true; }
         catch (NotSupportedException) { return false; }
     }
 
@@ -519,7 +647,7 @@ public static class GpuOptimizer
         if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
         var mb = m.TryGetGpuBuffer();
         if (mb is null) return false;
-        try { b!.SparseLionUpdate(pb!, mb, iBuf!, vBuf!, nnz, lr, beta1, beta2, weightDecay); return true; }
+        try { b!.SparseLionUpdate(pb!, mb, iBuf!, vBuf!, nnz, lr, beta1, beta2, weightDecay); MarkGpuUpdated(b, param, m); return true; }
         catch (NotSupportedException) { return false; }
     }
 
@@ -534,7 +662,7 @@ public static class GpuOptimizer
         if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
         var mb = m.TryGetGpuBuffer(); var vbState = v.TryGetGpuBuffer();
         if (mb is null || vbState is null) return false;
-        try { b!.SparseNadamUpdate(pb!, mb, vbState, iBuf!, vBuf!, nnz, lr, beta1, beta2, epsilon, weightDecay, step); return true; }
+        try { b!.SparseNadamUpdate(pb!, mb, vbState, iBuf!, vBuf!, nnz, lr, beta1, beta2, epsilon, weightDecay, step); MarkGpuUpdated(b, param, m, v); return true; }
         catch (NotSupportedException) { return false; }
     }
 
@@ -549,7 +677,7 @@ public static class GpuOptimizer
         if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
         var zb = z.TryGetGpuBuffer(); var nb = n.TryGetGpuBuffer();
         if (zb is null || nb is null) return false;
-        try { b!.SparseFtrlUpdate(pb!, zb, nb, iBuf!, vBuf!, nnz, lr, l1Reg, l2Reg, beta); return true; }
+        try { b!.SparseFtrlUpdate(pb!, zb, nb, iBuf!, vBuf!, nnz, lr, l1Reg, l2Reg, beta); MarkGpuUpdated(b, param, z, n); return true; }
         catch (NotSupportedException) { return false; }
     }
 
@@ -560,7 +688,7 @@ public static class GpuOptimizer
         float lr, float l1Strength)
     {
         if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
-        try { b!.SparseProximalL1Update(pb!, iBuf!, vBuf!, nnz, lr, l1Strength); return true; }
+        try { b!.SparseProximalL1Update(pb!, iBuf!, vBuf!, nnz, lr, l1Strength); MarkGpuUpdated(b, param); return true; }
         catch (NotSupportedException) { return false; }
     }
 }

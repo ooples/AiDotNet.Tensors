@@ -549,5 +549,29 @@ public sealed partial class MetalBackend
         UploadToBuffer(n, nData);
     }
 
+    /// <summary>
+    /// Proximal gradient (ISTA) update with L1 soft-thresholding.
+    /// </summary>
+    public void ProximalL1Update(IGpuBuffer param, IGpuBuffer gradient,
+        float learningRate, float l1Strength, int size)
+    {
+        ThrowIfDisposed();
+
+        if (param is not MetalGpuBuffer paramBuffer || gradient is not MetalGpuBuffer gradientBuffer)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+
+        var pipeline = GetPipeline("Optimizer", _optimizerLibrary, "proximal_l1_update");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(size);
+
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(paramBuffer, 0);
+        encoder.SetBuffer(gradientBuffer, 1);
+        encoder.SetBytes(learningRate, 2);
+        encoder.SetBytes(l1Strength, 3);
+        encoder.SetBytes((uint)size, 4);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
     #endregion
 }

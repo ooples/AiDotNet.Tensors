@@ -18,6 +18,15 @@ public sealed partial class WebGpuBackend
             param, gradient, dummy, dummy, uniforms, size).GetAwaiter().GetResult();
     }
 
+    public void ProximalL1Update(IGpuBuffer param, IGpuBuffer gradient,
+        float learningRate, float l1Strength, int size)
+    {
+        var dummy = SharedDummyBuffer;
+        var uniforms = MakeOptimizerUniforms(size, learningRate, l1Strength, 0, 0, 0, 0);
+        Dispatch4BufferAsync("Optimizer", WebGpuKernels.OptimizerSource, "proximal_l1",
+            param, gradient, dummy, dummy, uniforms, size).GetAwaiter().GetResult();
+    }
+
     public void SgdMomentumUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer velocity,
         float learningRate, float momentum, float weightDecay, int size)
     {
