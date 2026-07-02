@@ -42,10 +42,11 @@ public sealed unsafe partial class VulkanBackend
         float bc1 = 1f - MathF.Pow(beta1, step), bc2 = 1f - MathF.Pow(beta2, step);
         for (int i = 0; i < size; i++)
         {
-            mArr[i] = beta1 * mArr[i] + (1f - beta1) * g[i];
-            vArr[i] = beta2 * vArr[i] + (1f - beta2) * g[i] * g[i];
+            float grad = g[i] + weightDecay * p[i];
+            mArr[i] = beta1 * mArr[i] + (1f - beta1) * grad;
+            vArr[i] = beta2 * vArr[i] + (1f - beta2) * grad * grad;
             float mHat = mArr[i] / bc1, vHat = vArr[i] / bc2;
-            p[i] -= learningRate * (mHat / (MathF.Sqrt(vHat) + epsilon) + weightDecay * p[i]);
+            p[i] -= learningRate * mHat / (MathF.Sqrt(vHat) + epsilon);
         }
         UploadToBuffer(p, param); UploadToBuffer(mArr, m); UploadToBuffer(vArr, v);
     }
@@ -70,6 +71,77 @@ public sealed unsafe partial class VulkanBackend
         UploadToBuffer(p, param); UploadToBuffer(mArr, m); UploadToBuffer(vArr, v);
     }
 
+    public void AdamUpdateBf16(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
+    {
+        EnsureInitialized();
+        if (step <= 0)
+            throw new ArgumentOutOfRangeException(nameof(step), step, "Step must be > 0 for bias-corrected optimizers to avoid division by zero.");
+
+        var p = DownloadBuffer(param);
+        var g = DownloadBuffer(gradient);
+        var mBytes = CompressedMomentHostFallback.DownloadPackedBytes(DownloadBuffer(m), size * sizeof(ushort));
+        var vBytes = CompressedMomentHostFallback.DownloadPackedBytes(DownloadBuffer(v), size * sizeof(ushort));
+
+        CompressedMomentHostFallback.AdamBf16(
+            p, g, mBytes, vBytes,
+            learningRate, beta1, beta2, epsilon, weightDecay, step, size,
+            decoupledWeightDecay: false);
+
+        UploadToBuffer(p, param);
+        UploadToBuffer(CompressedMomentHostFallback.PackBytesAsFloats(mBytes), m);
+        UploadToBuffer(CompressedMomentHostFallback.PackBytesAsFloats(vBytes), v);
+    }
+
+    public void AdamWUpdateBf16(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
+    {
+        EnsureInitialized();
+        if (step <= 0)
+            throw new ArgumentOutOfRangeException(nameof(step), step, "Step must be > 0 for bias-corrected optimizers to avoid division by zero.");
+
+        var p = DownloadBuffer(param);
+        var g = DownloadBuffer(gradient);
+        var mBytes = CompressedMomentHostFallback.DownloadPackedBytes(DownloadBuffer(m), size * sizeof(ushort));
+        var vBytes = CompressedMomentHostFallback.DownloadPackedBytes(DownloadBuffer(v), size * sizeof(ushort));
+
+        CompressedMomentHostFallback.AdamBf16(
+            p, g, mBytes, vBytes,
+            learningRate, beta1, beta2, epsilon, weightDecay, step, size,
+            decoupledWeightDecay: true);
+
+        UploadToBuffer(p, param);
+        UploadToBuffer(CompressedMomentHostFallback.PackBytesAsFloats(mBytes), m);
+        UploadToBuffer(CompressedMomentHostFallback.PackBytesAsFloats(vBytes), v);
+    }
+
+    public void Adam8BitUpdate(IGpuBuffer param, IGpuBuffer gradient,
+        IGpuBuffer mQuant, IGpuBuffer vQuant, IGpuBuffer mScales, IGpuBuffer vScales,
+        float learningRate, float beta1, float beta2, float epsilon,
+        float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
+        int blockSize, int paramLength, int numBlocks)
+    {
+        EnsureInitialized();
+
+        var p = DownloadBuffer(param);
+        var g = DownloadBuffer(gradient);
+        var mQuantBytes = CompressedMomentHostFallback.DownloadPackedBytes(DownloadBuffer(mQuant), paramLength);
+        var vQuantBytes = CompressedMomentHostFallback.DownloadPackedBytes(DownloadBuffer(vQuant), paramLength);
+        var mScaleData = DownloadBuffer(mScales);
+        var vScaleData = DownloadBuffer(vScales);
+
+        CompressedMomentHostFallback.Adam8Bit(
+            p, g, mQuantBytes, vQuantBytes, mScaleData, vScaleData,
+            learningRate, beta1, beta2, epsilon, oneMinusBeta1, oneMinusBeta2,
+            biasCorrection1, biasCorrection2, blockSize, paramLength, numBlocks);
+
+        UploadToBuffer(p, param);
+        UploadToBuffer(CompressedMomentHostFallback.PackBytesAsFloats(mQuantBytes), mQuant);
+        UploadToBuffer(CompressedMomentHostFallback.PackBytesAsFloats(vQuantBytes), vQuant);
+        UploadToBuffer(mScaleData, mScales);
+        UploadToBuffer(vScaleData, vScales);
+    }
+
     public void RmspropUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer squaredAvg,
         float learningRate, float rho, float epsilon, float weightDecay, int size)
     {
@@ -77,8 +149,9 @@ public sealed unsafe partial class VulkanBackend
         var p = DownloadBuffer(param); var g = DownloadBuffer(gradient); var sa = DownloadBuffer(squaredAvg);
         for (int i = 0; i < size; i++)
         {
-            sa[i] = rho * sa[i] + (1f - rho) * g[i] * g[i];
-            p[i] -= learningRate * (g[i] / (MathF.Sqrt(sa[i]) + epsilon) + weightDecay * p[i]);
+            float grad = g[i] + weightDecay * p[i];
+            sa[i] = rho * sa[i] + (1f - rho) * grad * grad;
+            p[i] -= learningRate * grad / (MathF.Sqrt(sa[i]) + epsilon);
         }
         UploadToBuffer(p, param); UploadToBuffer(sa, squaredAvg);
     }
@@ -90,8 +163,9 @@ public sealed unsafe partial class VulkanBackend
         var p = DownloadBuffer(param); var g = DownloadBuffer(gradient); var ag = DownloadBuffer(accumulatedGrad);
         for (int i = 0; i < size; i++)
         {
-            ag[i] += g[i] * g[i];
-            p[i] -= learningRate * (g[i] / (MathF.Sqrt(ag[i]) + epsilon) + weightDecay * p[i]);
+            float grad = g[i] + weightDecay * p[i];
+            ag[i] += grad * grad;
+            p[i] -= learningRate * grad / (MathF.Sqrt(ag[i]) + epsilon);
         }
         UploadToBuffer(p, param); UploadToBuffer(ag, accumulatedGrad);
     }
@@ -177,11 +251,12 @@ public sealed unsafe partial class VulkanBackend
         float bc1 = 1f - MathF.Pow(beta1, step), bc2 = 1f - MathF.Pow(beta2, step);
         for (int i = 0; i < size; i++)
         {
-            mArr[i] = beta1 * mArr[i] + (1f - beta1) * g[i];
-            vArr[i] = beta2 * vArr[i] + (1f - beta2) * g[i] * g[i];
+            float grad = g[i] + weightDecay * p[i];
+            mArr[i] = beta1 * mArr[i] + (1f - beta1) * grad;
+            vArr[i] = beta2 * vArr[i] + (1f - beta2) * grad * grad;
             vmArr[i] = MathF.Max(vmArr[i], vArr[i]);
             float mHat = mArr[i] / bc1;
-            p[i] -= learningRate * (mHat / (MathF.Sqrt(vmArr[i] / bc2) + epsilon) + weightDecay * p[i]);
+            p[i] -= learningRate * mHat / (MathF.Sqrt(vmArr[i] / bc2) + epsilon);
         }
         UploadToBuffer(p, param); UploadToBuffer(mArr, m); UploadToBuffer(vArr, v); UploadToBuffer(vmArr, vMax);
     }
@@ -197,9 +272,10 @@ public sealed unsafe partial class VulkanBackend
         float bc1 = 1f - MathF.Pow(beta1, step);
         for (int i = 0; i < size; i++)
         {
-            mArr[i] = beta1 * mArr[i] + (1f - beta1) * g[i];
-            uArr[i] = MathF.Max(beta2 * uArr[i], MathF.Abs(g[i]));
-            p[i] -= learningRate / bc1 * mArr[i] / (uArr[i] + epsilon) + weightDecay * p[i];
+            float grad = g[i] + weightDecay * p[i];
+            mArr[i] = beta1 * mArr[i] + (1f - beta1) * grad;
+            uArr[i] = MathF.Max(beta2 * uArr[i], MathF.Abs(grad));
+            p[i] -= learningRate / bc1 * mArr[i] / (uArr[i] + epsilon);
         }
         UploadToBuffer(p, param); UploadToBuffer(mArr, m); UploadToBuffer(uArr, u);
     }
@@ -226,14 +302,17 @@ public sealed unsafe partial class VulkanBackend
             throw new ArgumentOutOfRangeException(nameof(step), step, "Step must be > 0 for bias-corrected optimizers to avoid division by zero.");
         var p = DownloadBuffer(param); var g = DownloadBuffer(gradient);
         var mArr = DownloadBuffer(m); var vArr = DownloadBuffer(v);
-        float bc1 = 1f - MathF.Pow(beta1, step), bc2 = 1f - MathF.Pow(beta2, step);
+        float bc1 = 1f - MathF.Pow(beta1, step);
+        float bc1Next = 1f - MathF.Pow(beta1, step + 1);
+        float bc2 = 1f - MathF.Pow(beta2, step);
         for (int i = 0; i < size; i++)
         {
-            mArr[i] = beta1 * mArr[i] + (1f - beta1) * g[i];
-            vArr[i] = beta2 * vArr[i] + (1f - beta2) * g[i] * g[i];
+            float grad = g[i] + weightDecay * p[i];
+            mArr[i] = beta1 * mArr[i] + (1f - beta1) * grad;
+            vArr[i] = beta2 * vArr[i] + (1f - beta2) * grad * grad;
             float mHat = mArr[i] / bc1, vHat = vArr[i] / bc2;
-            float nesterov = beta1 * mHat + (1f - beta1) / bc1 * g[i];
-            p[i] -= learningRate * (nesterov / (MathF.Sqrt(vHat) + epsilon) + weightDecay * p[i]);
+            float nesterov = beta1 * mHat + (1f - beta1) * grad / bc1Next;
+            p[i] -= learningRate * nesterov / (MathF.Sqrt(vHat) + epsilon);
         }
         UploadToBuffer(p, param); UploadToBuffer(mArr, m); UploadToBuffer(vArr, v);
     }

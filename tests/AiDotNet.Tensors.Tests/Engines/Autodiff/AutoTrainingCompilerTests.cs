@@ -13,6 +13,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// - TryGetCompiledBackward hash validation with loss identity
 /// - TryCompileBackward guard for non-persistent tapes
 /// </summary>
+[Collection("EngineCurrentGlobalState")]
 public class AutoTrainingCompilerTests : IDisposable
 {
     private readonly IEngine _engine = AiDotNetEngine.Current;

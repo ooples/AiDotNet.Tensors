@@ -11,6 +11,9 @@ using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.Distributed;
 
+[CollectionDefinition("DistributedSerial", DisableParallelization = true)]
+public sealed class DistributedSerialCollection { }
+
 /// <summary>
 /// Acceptance tests for issue #215 — ProcessGroup, DDP, FSDP, DTensor,
 /// Pipeline, RPC, ElasticLauncher.
@@ -23,6 +26,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Distributed;
 /// Behaviour is bit-identical to the network backend per the in-process
 /// backend's contract.</para>
 /// </summary>
+[Collection("DistributedSerial")]
 public class DistributedTrainingTests
 {
     // ── ProcessGroup core ───────────────────────────────────────────────

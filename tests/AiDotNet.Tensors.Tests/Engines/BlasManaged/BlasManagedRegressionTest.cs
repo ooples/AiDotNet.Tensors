@@ -49,9 +49,15 @@ public class BlasManagedRegressionTest
     /// </summary>
     private const double NoiseFloorMs = 5.0;
 
-    [Fact]
+    private static bool RunPerformanceTests =>
+        Environment.GetEnvironmentVariable("AIDOTNET_RUN_PERF_TESTS") == "1";
+
+    [SkippableFact]
+    [Trait("Category", "Performance")]
     public void BlasManaged_RepresentativeShapes_NoRegressionFromBaseline()
     {
+        Skip.IfNot(RunPerformanceTests, "Performance gate; set AIDOTNET_RUN_PERF_TESTS=1 to run.");
+
         // Locate the baseline JSON. It's deployed alongside the test assembly.
         // Use AppContext.BaseDirectory (not Assembly.Location) because the
         // net471 test runner shadow-copies assemblies but not their adjacent

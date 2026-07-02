@@ -1,3 +1,4 @@
+using System;
 using System.Diagnostics;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
@@ -15,6 +16,8 @@ public class TapePerformanceTests
 {
     private readonly ITestOutputHelper _output;
     private readonly IEngine _engine = AiDotNetEngine.Current;
+    private static bool RunPerformanceTests =>
+        string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_RUN_PERF_TESTS"), "1", StringComparison.Ordinal);
 
     public TapePerformanceTests(ITestOutputHelper output)
     {
@@ -124,9 +127,11 @@ public class TapePerformanceTests
     // budget — instrumentation + runner contention, not a real regression. Budget
     // unchanged; the gate just runs where wall-clock time is meaningful.
     [Trait("Category", "Performance")]
-    [Fact]
+    [SkippableFact]
     public void FullForwardBackward_MLP_Performance()
     {
+        Skip.IfNot(RunPerformanceTests, "Performance gate; set AIDOTNET_RUN_PERF_TESTS=1 to run.");
+
         // Measure a realistic training step: 3-layer MLP forward + backward
         var input = Tensor<float>.CreateRandom([32, 128]); // batch=32, features=128
         var w1 = Tensor<float>.CreateRandom([128, 64]);

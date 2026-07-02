@@ -8,13 +8,13 @@ namespace AiDotNet.Tensors.Engines.Gpu;
 
 /// <summary>
 /// Issue #336 — GPU-resident optimizer-step entry points. Consumers
-/// (AiDotNet's <c>AdamOptimizer</c> / <c>SgdOptimizer</c> /
-/// <c>AdamWOptimizer</c>) tag their <c>_tapeM</c> / <c>_tapeV</c> /
-/// parameter tensors with <see cref="WeightLifetime.GpuPinned"/> via
-/// <see cref="Helpers.TensorAllocator.RentPinnedOnGpu{T}"/> then call
-/// one of these methods. The GPU kernel reads + writes the pinned
-/// tensors directly via their device pointers — no per-step
-/// cuMemcpyHtoD / DtoH round-trip.
+/// (Adam, SGD, AdamW, RMSprop, Adagrad, LARS, LAMB, AdaDelta, AMSGrad,
+/// AdaMax, Lion, Nadam, FTRL, and sparse variants) tag their optimizer
+/// state and parameter tensors with <see cref="WeightLifetime.GpuPinned"/>
+/// via <see cref="Helpers.TensorAllocator.RentPinnedOnGpu{T}"/> then call
+/// one of these methods. The GPU kernel reads and writes the pinned tensors
+/// directly via their device pointers, avoiding a per-step host/device
+/// round-trip.
 /// </summary>
 /// <remarks>
 /// Path:
@@ -23,9 +23,9 @@ namespace AiDotNet.Tensors.Engines.Gpu;
 /// <item><see cref="WeightRegistry.RegisterWeight{T}"/> allocates pinned
 /// host memory + DMA-maps to GPU; populates <see cref="TensorBase{T}.OffloadDevicePointer"/>.</item>
 /// <item>This helper calls <see cref="TensorBase{T}.TryGetGpuBuffer"/>
-/// on each tensor; gets non-owning <see cref="IGpuBuffer"/> views.</item>
-/// <item>Dispatches to <see cref="IDirectGpuBackend.AdamUpdate"/> /
-/// <see cref="IDirectGpuBackend.SgdUpdate"/> on the active GPU backend.</item>
+/// on each tensor and gets non-owning <see cref="IGpuBuffer"/> views.</item>
+/// <item>Dispatches to the matching <see cref="IDirectGpuBackend"/> optimizer
+/// update method on the active GPU backend.</item>
 /// </list>
 /// Returns true when the GPU path ran. Returns false (no-op) when any
 /// argument fails the GPU-residency contract — caller should fall back
@@ -80,21 +80,30 @@ public static class GpuOptimizer
         float learningRate, float beta1, float beta2, float epsilon,
         float weightDecay, int step)
     {
-        // The CUDA AdamUpdate kernel already takes weightDecay; passing
-        // a non-zero value makes it AdamW. Some backends ship a separate
-        // adamw_update kernel; for now we route both through AdamUpdate
-        // and rely on the kernel implementation to apply the decay
-        // correctly (the existing adam_step kernel handles this).
-        return TryAdamStep(param, grad, m, v, learningRate, beta1, beta2,
-            epsilon, weightDecay, step);
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (grad is null) throw new ArgumentNullException(nameof(grad));
+        if (m is null) throw new ArgumentNullException(nameof(m));
+        if (v is null) throw new ArgumentNullException(nameof(v));
+
+        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine gpuEngine)) return false;
+        var backend = gpuEngine.GetBackend();
+        if (backend is null) return false;
+
+        var pBuf = param.TryGetGpuBuffer();
+        var gBuf = grad.TryGetGpuBuffer();
+        var mBuf = m.TryGetGpuBuffer();
+        var vBuf = v.TryGetGpuBuffer();
+        if (pBuf is null || gBuf is null || mBuf is null || vBuf is null) return false;
+
+        backend.AdamWUpdate(pBuf, gBuf, mBuf, vBuf,
+            learningRate, beta1, beta2, epsilon, weightDecay, step, param.Length);
+        return true;
     }
 
     /// <summary>
     /// SGD optimizer step on GPU-resident tensors. Simpler signature
-    /// than Adam — no momentum buffer needed for the plain SGD path.
-    /// (SGD with momentum should use <see cref="TryAdamStep"/> with
-    /// beta1=momentum, beta2=0, and a single moment buffer or use a
-    /// dedicated SgdMomentumUpdate when the backend ships one.)
+    /// than Adam: no momentum buffer is needed for the plain SGD path.
+    /// SGD with momentum should use <see cref="TrySgdMomentumStep"/>.
     /// </summary>
     public static bool TrySgdStep(
         Tensor<float> param, Tensor<float> grad, float learningRate)
@@ -133,12 +142,13 @@ public static class GpuOptimizer
     }
 
     /// <summary>
-    /// Allocates + initializes GPU-resident 8-bit Adam state (int8 m/v + per-block
-    /// double scales) for a parameter of <paramref name="length"/> elements. m starts
-    /// at the signed-zero byte (128), v at 0, scales at 1e-10 (matching the CPU
-    /// Adam8BitOptimizer's m_0=v_0=0 init). The caller keeps the four buffers
-    /// resident across steps and frees them with <see cref="FreeGpuBuffer"/>.
-    /// Returns false (buffers null) on any non-CUDA backend.
+    /// Allocates GPU-resident 8-bit Adam state (int8 m/v + per-block float
+    /// scales) for a parameter of <paramref name="length"/> elements. The first
+    /// Adam8Bit step treats m/v as zero state, matching the CPU Adam8BitOptimizer's
+    /// m_0=v_0=0 contract. The caller keeps the four buffers resident across
+    /// steps and frees them with <see cref="FreeGpuBuffer"/>. Returns false
+    /// when the active GPU backend does not implement compressed optimizer
+    /// moments.
     /// </summary>
     public static bool TryAllocAdam8BitState(int length, int blockSize,
         out DirectGpu.IGpuBuffer? mQ, out DirectGpu.IGpuBuffer? vQ,
@@ -146,10 +156,12 @@ public static class GpuOptimizer
     {
         mQ = vQ = mScales = vScales = null;
         if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false;
-        if (!(e.GetBackend() is DirectGpu.CUDA.CudaBackend cb)) return false;
+        if (e.GetBackend() is not ICompressedMomentGpuOptimizerBackend cb) return false;
+        if (length < 0) throw new ArgumentOutOfRangeException(nameof(length));
+        if (blockSize <= 0) throw new ArgumentOutOfRangeException(nameof(blockSize));
         int nb = (length + blockSize - 1) / blockSize;
 
-        // Allocate into locals first. If a later AllocateByteBuffer / UploadBytes
+        // Allocate into locals first. If a later AllocateByteBuffer / AllocateBuffer
         // throws (e.g. device OOM), free whatever was already allocated so the GPU
         // buffers don't leak, leave the out-params null (no dangling references),
         // and let the exception surface — masking an OOM as a `false` "fall back to
@@ -159,13 +171,8 @@ public static class GpuOptimizer
         {
             lmQ = cb.AllocateByteBuffer(length);
             lvQ = cb.AllocateByteBuffer(length);
-            lmScales = cb.AllocateByteBuffer(nb * 8);
-            lvScales = cb.AllocateByteBuffer(nb * 8);
-            var im = new byte[length]; for (int i = 0; i < length; i++) im[i] = 128; // signed-zero
-            var iv = new byte[length];                                              // unsigned-zero (already 0)
-            var isc = new byte[nb * 8]; for (int b = 0; b < nb; b++) BitConverter.GetBytes(1e-10).CopyTo(isc, b * 8);
-            cb.UploadBytes(lmQ, im); cb.UploadBytes(lvQ, iv);
-            cb.UploadBytes(lmScales, isc); cb.UploadBytes(lvScales, (byte[])isc.Clone());
+            lmScales = cb.AllocateBuffer(new float[nb]);
+            lvScales = cb.AllocateBuffer(new float[nb]);
         }
         catch
         {
@@ -176,7 +183,7 @@ public static class GpuOptimizer
         return true;
     }
 
-    /// <summary>Frees a GPU buffer allocated by <see cref="TryAllocAdam8BitState"/> (safe on null / non-CUDA).</summary>
+    /// <summary>Frees a GPU buffer allocated by <see cref="TryAllocAdam8BitState"/> (safe on null).</summary>
     public static void FreeGpuBuffer(DirectGpu.IGpuBuffer? buffer)
     {
         if (buffer is IDisposable d) d.Dispose();
@@ -184,8 +191,10 @@ public static class GpuOptimizer
 
     /// <summary>
     /// GPU-resident 8-bit Adam step: dequantize → Adam → param update → requantize,
-    /// in place on the GPU (no host download of moments). CUDA-only; returns false
-    /// (→ CPU fallback) when param/grad aren't GPU-resident or any state buffer is null.
+    /// in place on the GPU backend (no host download of moments where native kernels
+    /// are available). Returns false (→ CPU fallback) when param/grad aren't
+    /// GPU-resident, any state buffer is null, or the active backend does not
+    /// implement compressed optimizer moments.
     /// </summary>
     public static bool TryAdam8BitStep(Tensor<float> p, Tensor<float> g,
         DirectGpu.IGpuBuffer? mQ, DirectGpu.IGpuBuffer? vQ, DirectGpu.IGpuBuffer? mScales, DirectGpu.IGpuBuffer? vScales,
@@ -193,12 +202,13 @@ public static class GpuOptimizer
     {
         if (p is null) throw new ArgumentNullException(nameof(p));
         if (g is null) throw new ArgumentNullException(nameof(g));
+        if (blockSize <= 0) throw new ArgumentOutOfRangeException(nameof(blockSize));
         // The four state buffers are optional inputs: a null one means the caller
         // hasn't allocated GPU-resident 8-bit Adam state, so signal CPU fallback
         // (matching the documented contract) rather than throwing.
         if (mQ is null || vQ is null || mScales is null || vScales is null) return false;
         if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false;
-        if (!(e.GetBackend() is DirectGpu.CUDA.CudaBackend cb)) return false;
+        if (e.GetBackend() is not ICompressedMomentGpuOptimizerBackend cb) return false;
         var pb = p.TryGetGpuBuffer(); var gb = g.TryGetGpuBuffer();
         if (pb is null || gb is null) return false;
         int nb = (p.Length + blockSize - 1) / blockSize;

@@ -32,7 +32,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 /// Always check IsAvailable before using GPU operations.
 /// </para>
 /// </remarks>
-public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFusedAdvancedKernels
+public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend
 {
     /// <summary>
     /// WebGpu has no cuDNN-equivalent half/bfloat16 conv path — returns
@@ -866,7 +866,7 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         new float[]
         {
             BitConverter.Int32BitsToSingle(size), lr, beta1, beta2, epsilon, weightDecay,
-            BitConverter.Int32BitsToSingle(t), extra
+            t, extra
         };
 
     internal async Task Dispatch1BufferAsync(string moduleName, string source, string kernelName,

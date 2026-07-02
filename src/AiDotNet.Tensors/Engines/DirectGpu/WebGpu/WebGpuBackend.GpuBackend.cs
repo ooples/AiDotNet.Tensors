@@ -55,6 +55,34 @@ public sealed partial class WebGpuBackend
         Array.Copy(data, destination, Math.Min(data.Length, destination.Length));
     }
 
+    public byte[] DownloadByteBuffer(IGpuBuffer buffer, int byteCount)
+    {
+        EnsureInitialized();
+        if (byteCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(byteCount), "Byte count must be non-negative.");
+        var wb = AsWebGpu(buffer);
+        if (byteCount > wb.SizeInBytes)
+            throw new ArgumentException($"Requested byte count ({byteCount}) exceeds buffer capacity ({wb.SizeInBytes}).", nameof(byteCount));
+
+        var result = new byte[byteCount];
+        if (byteCount > 0)
+            wb.CopyBytesTo(result);
+        return result;
+    }
+
+    public void UploadByteBuffer(IGpuBuffer buffer, byte[] data)
+    {
+        EnsureInitialized();
+        if (data is null)
+            throw new ArgumentNullException(nameof(data));
+        var wb = AsWebGpu(buffer);
+        if (data.Length > wb.SizeInBytes)
+            throw new ArgumentException($"Host data ({data.Length} bytes) exceeds buffer capacity ({wb.SizeInBytes} bytes).", nameof(data));
+
+        if (data.Length > 0)
+            wb.CopyBytesFrom(data);
+    }
+
     public void Copy(IGpuBuffer source, IGpuBuffer destination, int size)
     {
         var uniforms = new float[]

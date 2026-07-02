@@ -76,6 +76,12 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     /// <inheritdoc/>
     public virtual void DownloadBuffer(IGpuBuffer buffer, float[] destination) => Inner.DownloadBuffer(buffer, destination);
 
+    /// <inheritdoc/>
+    public virtual byte[] DownloadByteBuffer(IGpuBuffer buffer, int byteCount) => Inner.DownloadByteBuffer(buffer, byteCount);
+
+    /// <inheritdoc/>
+    public virtual void UploadByteBuffer(IGpuBuffer buffer, byte[] data) => Inner.UploadByteBuffer(buffer, data);
+
     #endregion
 
     #region GEMM Operations

@@ -1221,6 +1221,290 @@ fn adamw(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 ";
 
+    public const string CompressedOptimizerBf16Source = @"
+@group(0) @binding(0) var<storage, read_write> params_arr: array<f32>;
+@group(0) @binding(1) var<storage, read> gradients: array<f32>;
+@group(0) @binding(2) var<storage, read_write> m_bits: array<atomic<u32>>;
+@group(0) @binding(3) var<storage, read_write> v_bits: array<atomic<u32>>;
+
+struct OptimizerParams {
+    size: u32,
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    epsilon: f32,
+    weight_decay: f32,
+    t: f32,
+}
+@group(0) @binding(4) var<uniform> opt_params: OptimizerParams;
+
+fn bf16_to_float(x: u32) -> f32 {
+    return bitcast<f32>(x << 16u);
+}
+
+fn float_to_bf16_rne(x: f32) -> u32 {
+    let bits = bitcast<u32>(x);
+    if ((bits & 0x7fffffffu) > 0x7f800000u) {
+        return ((bits >> 16u) | 0x40u) & 0xffffu;
+    }
+    let rounding = 0x7fffu + ((bits >> 16u) & 1u);
+    return ((bits + rounding) >> 16u) & 0xffffu;
+}
+
+fn load_m(idx: u32) -> u32 {
+    let word = atomicLoad(&m_bits[idx >> 1u]);
+    let shift = (idx & 1u) * 16u;
+    return (word >> shift) & 0xffffu;
+}
+
+fn load_v(idx: u32) -> u32 {
+    let word = atomicLoad(&v_bits[idx >> 1u]);
+    let shift = (idx & 1u) * 16u;
+    return (word >> shift) & 0xffffu;
+}
+
+fn store_m(idx: u32, value: u32) {
+    let word_idx = idx >> 1u;
+    let shift = (idx & 1u) * 16u;
+    let mask = 0xffffu << shift;
+    loop {
+        let old_word = atomicLoad(&m_bits[word_idx]);
+        let new_word = (old_word & ~mask) | ((value & 0xffffu) << shift);
+        let result = atomicCompareExchangeWeak(&m_bits[word_idx], old_word, new_word);
+        if (result.exchanged) {
+            break;
+        }
+    }
+}
+
+fn store_v(idx: u32, value: u32) {
+    let word_idx = idx >> 1u;
+    let shift = (idx & 1u) * 16u;
+    let mask = 0xffffu << shift;
+    loop {
+        let old_word = atomicLoad(&v_bits[word_idx]);
+        let new_word = (old_word & ~mask) | ((value & 0xffffu) << shift);
+        let result = atomicCompareExchangeWeak(&v_bits[word_idx], old_word, new_word);
+        if (result.exchanged) {
+            break;
+        }
+    }
+}
+
+@compute @workgroup_size(256)
+fn adam_bf16(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= opt_params.size) {
+        return;
+    }
+
+    var grad = gradients[idx];
+    if (opt_params.weight_decay > 0.0) {
+        grad = grad + opt_params.weight_decay * params_arr[idx];
+    }
+    let first_step = opt_params.t <= 1.0;
+    let old_m = select(bf16_to_float(load_m(idx)), 0.0, first_step);
+    let old_v = select(bf16_to_float(load_v(idx)), 0.0, first_step);
+    let m_new = opt_params.beta1 * old_m + (1.0 - opt_params.beta1) * grad;
+    let v_new = opt_params.beta2 * old_v + (1.0 - opt_params.beta2) * grad * grad;
+    store_m(idx, float_to_bf16_rne(m_new));
+    store_v(idx, float_to_bf16_rne(v_new));
+
+    let m_hat = m_new / (1.0 - pow(opt_params.beta1, opt_params.t));
+    let v_hat = v_new / (1.0 - pow(opt_params.beta2, opt_params.t));
+    params_arr[idx] = params_arr[idx] - opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
+}
+
+@compute @workgroup_size(256)
+fn adamw_bf16(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= opt_params.size) {
+        return;
+    }
+
+    let grad = gradients[idx];
+    if (opt_params.weight_decay > 0.0) {
+        params_arr[idx] = params_arr[idx] * (1.0 - opt_params.lr * opt_params.weight_decay);
+    }
+
+    let first_step = opt_params.t <= 1.0;
+    let old_m = select(bf16_to_float(load_m(idx)), 0.0, first_step);
+    let old_v = select(bf16_to_float(load_v(idx)), 0.0, first_step);
+    let m_new = opt_params.beta1 * old_m + (1.0 - opt_params.beta1) * grad;
+    let v_new = opt_params.beta2 * old_v + (1.0 - opt_params.beta2) * grad * grad;
+    store_m(idx, float_to_bf16_rne(m_new));
+    store_v(idx, float_to_bf16_rne(v_new));
+
+    let m_hat = m_new / (1.0 - pow(opt_params.beta1, opt_params.t));
+    let v_hat = v_new / (1.0 - pow(opt_params.beta2, opt_params.t));
+    params_arr[idx] = params_arr[idx] - opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
+}
+";
+
+    public const string CompressedOptimizerInt8Source = @"
+@group(0) @binding(0) var<storage, read_write> params_arr: array<f32>;
+@group(0) @binding(1) var<storage, read> gradients: array<f32>;
+@group(0) @binding(2) var<storage, read_write> m_quant: array<atomic<u32>>;
+@group(0) @binding(3) var<storage, read_write> v_quant: array<atomic<u32>>;
+@group(0) @binding(4) var<storage, read_write> m_scales: array<f32>;
+@group(0) @binding(5) var<storage, read_write> v_scales: array<f32>;
+
+struct Adam8Params {
+    size: u32,
+    block_size: u32,
+    num_blocks: u32,
+    reserved: u32,
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    epsilon: f32,
+    one_minus_beta1: f32,
+    one_minus_beta2: f32,
+    bias_correction1: f32,
+    bias_correction2: f32,
+}
+@group(0) @binding(6) var<uniform> opt_params: Adam8Params;
+
+var<workgroup> s_max_m: array<f32, 256>;
+var<workgroup> s_max_v: array<f32, 256>;
+
+fn load_m_byte(idx: u32) -> u32 {
+    let word = atomicLoad(&m_quant[idx >> 2u]);
+    let shift = (idx & 3u) * 8u;
+    return (word >> shift) & 0xffu;
+}
+
+fn load_v_byte(idx: u32) -> u32 {
+    let word = atomicLoad(&v_quant[idx >> 2u]);
+    let shift = (idx & 3u) * 8u;
+    return (word >> shift) & 0xffu;
+}
+
+fn store_m_byte(idx: u32, value: u32) {
+    let word_idx = idx >> 2u;
+    let shift = (idx & 3u) * 8u;
+    let mask = 0xffu << shift;
+    loop {
+        let old_word = atomicLoad(&m_quant[word_idx]);
+        let new_word = (old_word & ~mask) | ((value & 0xffu) << shift);
+        let result = atomicCompareExchangeWeak(&m_quant[word_idx], old_word, new_word);
+        if (result.exchanged) {
+            break;
+        }
+    }
+}
+
+fn store_v_byte(idx: u32, value: u32) {
+    let word_idx = idx >> 2u;
+    let shift = (idx & 3u) * 8u;
+    let mask = 0xffu << shift;
+    loop {
+        let old_word = atomicLoad(&v_quant[word_idx]);
+        let new_word = (old_word & ~mask) | ((value & 0xffu) << shift);
+        let result = atomicCompareExchangeWeak(&v_quant[word_idx], old_word, new_word);
+        if (result.exchanged) {
+            break;
+        }
+    }
+}
+
+fn round_ties_even(x: f32) -> f32 {
+    let lo = floor(x);
+    let frac = x - lo;
+    if (frac < 0.5) {
+        return lo;
+    }
+    if (frac > 0.5) {
+        return lo + 1.0;
+    }
+    let lo_i = i32(lo);
+    if ((lo_i % 2) == 0) {
+        return lo;
+    }
+    return lo + 1.0;
+}
+
+@compute @workgroup_size(256)
+fn adam8bit(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let blk = wid.x;
+    let tid = lid.x;
+    if (blk >= opt_params.num_blocks) {
+        return;
+    }
+
+    let start = blk * opt_params.block_size;
+    let end_idx = min(start + opt_params.block_size, opt_params.size);
+    let first_step = opt_params.bias_correction1 <= opt_params.one_minus_beta1 + 0.0000001;
+    let m_scale = select(m_scales[blk], 0.0, first_step);
+    let v_scale = select(v_scales[blk], 0.0, first_step);
+
+    var loc_m = 0.0;
+    var loc_v = 0.0;
+    var i = start + tid;
+    loop {
+        if (i >= end_idx) {
+            break;
+        }
+        let old_m = select((f32(i32(load_m_byte(i)) - 128) * m_scale), 0.0, first_step);
+        let old_v = select((f32(load_v_byte(i)) * v_scale), 0.0, first_step);
+        let g = gradients[i];
+        let new_m = opt_params.beta1 * old_m + opt_params.one_minus_beta1 * g;
+        let new_v = opt_params.beta2 * old_v + opt_params.one_minus_beta2 * (g * g);
+        loc_m = max(loc_m, abs(new_m));
+        loc_v = max(loc_v, abs(new_v));
+        i = i + 256u;
+    }
+
+    s_max_m[tid] = loc_m;
+    s_max_v[tid] = loc_v;
+    workgroupBarrier();
+
+    var stride = 128u;
+    loop {
+        if (stride == 0u) {
+            break;
+        }
+        if (tid < stride) {
+            s_max_m[tid] = max(s_max_m[tid], s_max_m[tid + stride]);
+            s_max_v[tid] = max(s_max_v[tid], s_max_v[tid + stride]);
+        }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+
+    let new_m_scale = max(s_max_m[0] / 127.0, 0.0000000001);
+    let new_v_scale = max(s_max_v[0] / 255.0, 0.0000000001);
+    if (tid == 0u) {
+        m_scales[blk] = new_m_scale;
+        v_scales[blk] = new_v_scale;
+    }
+    workgroupBarrier();
+
+    var j = start + tid;
+    loop {
+        if (j >= end_idx) {
+            break;
+        }
+        let old_m = select((f32(i32(load_m_byte(j)) - 128) * m_scale), 0.0, first_step);
+        let old_v = select((f32(load_v_byte(j)) * v_scale), 0.0, first_step);
+        let g = gradients[j];
+        let new_m = opt_params.beta1 * old_m + opt_params.one_minus_beta1 * g;
+        let new_v = opt_params.beta2 * old_v + opt_params.one_minus_beta2 * (g * g);
+
+        let m_hat = new_m / opt_params.bias_correction1;
+        let v_hat = new_v / opt_params.bias_correction2;
+        params_arr[j] = params_arr[j] - opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
+
+        let qm = clamp(i32(round_ties_even(new_m / new_m_scale)), -127, 127);
+        store_m_byte(j, u32(qm + 128));
+
+        let qv = clamp(i32(round_ties_even(new_v / new_v_scale)), 0, 255);
+        store_v_byte(j, u32(qv));
+        j = j + 256u;
+    }
+}
+";
+
     /// <summary>
     /// Transpose operations.
     /// </summary>
@@ -2464,12 +2748,13 @@ fn nadam(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (idx < opt_params.size) {
         let grad = gradients[idx] + opt_params.weight_decay * params_arr[idx];
         let bc1 = 1.0 - pow(opt_params.beta1, opt_params.t);
+        let bc1_next = 1.0 - pow(opt_params.beta1, opt_params.t + 1.0);
         let bc2 = 1.0 - pow(opt_params.beta2, opt_params.t);
         state1[idx] = opt_params.beta1 * state1[idx] + (1.0 - opt_params.beta1) * grad;
         state2[idx] = opt_params.beta2 * state2[idx] + (1.0 - opt_params.beta2) * grad * grad;
         let m_hat = state1[idx] / bc1;
         let v_hat = state2[idx] / bc2;
-        params_arr[idx] = params_arr[idx] - opt_params.lr * (opt_params.beta1 * m_hat + (1.0 - opt_params.beta1) * grad / bc1) / (sqrt(v_hat) + opt_params.epsilon);
+        params_arr[idx] = params_arr[idx] - opt_params.lr * (opt_params.beta1 * m_hat + (1.0 - opt_params.beta1) * grad / bc1_next) / (sqrt(v_hat) + opt_params.epsilon);
     }
 }
 ";

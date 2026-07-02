@@ -263,6 +263,95 @@ public sealed class MetalGpuBuffer : IGpuBuffer
     }
 
     /// <summary>
+    /// Copies raw bytes from the GPU buffer to a CPU array.
+    /// </summary>
+    public void CopyBytesTo(byte[] destination, int offsetInBytes = 0, int count = -1)
+    {
+        ThrowIfDisposed();
+
+        if (destination is null)
+        {
+            throw new ArgumentNullException(nameof(destination));
+        }
+
+        if (count < 0)
+        {
+            count = Math.Min(destination.Length, checked((int)(SizeInBytes - offsetInBytes)));
+        }
+
+        if (offsetInBytes < 0 || offsetInBytes >= SizeInBytes)
+        {
+            throw new ArgumentOutOfRangeException(nameof(offsetInBytes));
+        }
+
+        if (count < 0 || offsetInBytes + count > SizeInBytes || count > destination.Length)
+        {
+            throw new ArgumentOutOfRangeException(nameof(count));
+        }
+
+        if (count == 0)
+        {
+            return;
+        }
+
+        var contents = Contents;
+        if (contents == IntPtr.Zero)
+        {
+            throw new InvalidOperationException("Buffer contents are not accessible");
+        }
+
+        Marshal.Copy(IntPtr.Add(contents, offsetInBytes), destination, 0, count);
+    }
+
+    /// <summary>
+    /// Copies raw bytes from a CPU array to the GPU buffer.
+    /// </summary>
+    public void CopyBytesFrom(byte[] source, int offsetInBytes = 0, int count = -1)
+    {
+        ThrowIfDisposed();
+
+        if (source is null)
+        {
+            throw new ArgumentNullException(nameof(source));
+        }
+
+        if (count < 0)
+        {
+            count = Math.Min(source.Length, checked((int)(SizeInBytes - offsetInBytes)));
+        }
+
+        if (offsetInBytes < 0 || offsetInBytes >= SizeInBytes)
+        {
+            throw new ArgumentOutOfRangeException(nameof(offsetInBytes));
+        }
+
+        if (count < 0 || offsetInBytes + count > SizeInBytes || count > source.Length)
+        {
+            throw new ArgumentOutOfRangeException(nameof(count));
+        }
+
+        if (count == 0)
+        {
+            return;
+        }
+
+        var contents = Contents;
+        if (contents == IntPtr.Zero)
+        {
+            throw new InvalidOperationException("Buffer contents are not accessible");
+        }
+
+        Marshal.Copy(source, 0, IntPtr.Add(contents, offsetInBytes), count);
+
+        if ((StorageMode & MTLResourceOptions.StorageModeManaged) == MTLResourceOptions.StorageModeManaged)
+        {
+            int offsetElements = offsetInBytes / sizeof(float);
+            int countElements = (count + sizeof(float) - 1) / sizeof(float);
+            NotifyModified(offsetElements, countElements);
+        }
+    }
+
+    /// <summary>
     /// Copies data from a pointer to the GPU buffer.
     /// </summary>
     /// <param name="source">Source pointer.</param>

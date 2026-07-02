@@ -324,6 +324,43 @@ public sealed unsafe class VulkanBuffer : IDisposable
     }
 
     /// <summary>
+    /// Reads raw bytes from a host-visible buffer.
+    /// </summary>
+    public void ReadRawBytes(byte[] data)
+    {
+        if (!_isHostVisible || _disposed || data.Length == 0)
+        {
+            return;
+        }
+
+        ulong copySize = (ulong)data.Length;
+        if (copySize > _size)
+        {
+            copySize = _size;
+        }
+
+        var result = VulkanNativeBindings.vkMapMemory(
+            _device.Device, _memory, 0, copySize, 0, out IntPtr mappedPtr);
+
+        if (result != VulkanNativeBindings.VK_SUCCESS || mappedPtr == IntPtr.Zero)
+        {
+            return;
+        }
+
+        try
+        {
+            fixed (byte* dstPtr = data)
+            {
+                Buffer.MemoryCopy((void*)mappedPtr, dstPtr, data.Length, (long)copySize);
+            }
+        }
+        finally
+        {
+            VulkanNativeBindings.vkUnmapMemory(_device.Device, _memory);
+        }
+    }
+
+    /// <summary>
     /// Writes data directly to device-local memory via mapped pointer.
     /// For host-visible buffers only.
     /// </summary>

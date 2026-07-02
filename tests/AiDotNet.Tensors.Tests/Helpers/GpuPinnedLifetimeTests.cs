@@ -10,6 +10,7 @@ namespace AiDotNet.Tensors.Tests.Helpers;
 /// and weights with GpuPinned so they avoid the per-train-step
 /// cuMemcpyHtoD/DtoH round-trip.
 /// </summary>
+[Collection("DirectGpuSerial")]
 public class GpuPinnedLifetimeTests
 {
     /// <summary>

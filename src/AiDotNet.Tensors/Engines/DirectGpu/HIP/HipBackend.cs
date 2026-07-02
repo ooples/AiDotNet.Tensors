@@ -30,7 +30,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 /// <item>RX 6800 XT: 8,000+ GFLOPS (optimized scalar)</item>
 /// </list>
 /// </remarks>
-public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
+public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend
 {
     /// <summary>
     /// HIP has no cuDNN-equivalent half/bfloat16 conv path yet — returns
@@ -1081,6 +1081,54 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 size,
                 HipMemcpyKind.DeviceToHost);
             HipNativeBindings.CheckError(result, "hipMemcpy D2H");
+        }
+    }
+
+    public unsafe byte[] DownloadByteBuffer(IGpuBuffer buffer, int byteCount)
+    {
+        if (buffer is null)
+            throw new ArgumentNullException(nameof(buffer));
+        if (byteCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(byteCount), "Byte count must be non-negative.");
+        if (byteCount > buffer.SizeInBytes)
+            throw new ArgumentException($"Requested byte count ({byteCount}) exceeds buffer capacity ({buffer.SizeInBytes}).", nameof(byteCount));
+
+        var resultBytes = new byte[byteCount];
+        if (byteCount == 0)
+            return resultBytes;
+
+        fixed (byte* destPtr = resultBytes)
+        {
+            var result = HipNativeBindings.hipMemcpy(
+                (IntPtr)destPtr,
+                buffer.Handle,
+                (UIntPtr)byteCount,
+                HipMemcpyKind.DeviceToHost);
+            HipNativeBindings.CheckError(result, "hipMemcpy D2H (byte buffer)");
+        }
+
+        return resultBytes;
+    }
+
+    public unsafe void UploadByteBuffer(IGpuBuffer buffer, byte[] data)
+    {
+        if (buffer is null)
+            throw new ArgumentNullException(nameof(buffer));
+        if (data is null)
+            throw new ArgumentNullException(nameof(data));
+        if (data.LongLength > buffer.SizeInBytes)
+            throw new ArgumentException($"Host data ({data.Length} bytes) exceeds buffer capacity ({buffer.SizeInBytes} bytes).", nameof(data));
+        if (data.Length == 0)
+            return;
+
+        fixed (byte* srcPtr = data)
+        {
+            var result = HipNativeBindings.hipMemcpy(
+                buffer.Handle,
+                (IntPtr)srcPtr,
+                (UIntPtr)data.Length,
+                HipMemcpyKind.HostToDevice);
+            HipNativeBindings.CheckError(result, "hipMemcpy H2D (byte buffer)");
         }
     }
 
@@ -11368,6 +11416,106 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
             uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
             LaunchKernel(krnl, grid, DefaultBlockSize, args);
+            Synchronize();
+            }
+    }
+
+    public unsafe void AdamUpdateBf16(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
+    {
+        if (!_kernelCache.TryGetValue("adam_bf16_update", out var krnl))
+            throw new InvalidOperationException("HIP kernel not found: adam_bf16_update");
+
+            {
+            IntPtr _p0 = param.Handle;
+            IntPtr _p1 = gradient.Handle;
+            IntPtr _p2 = m.Handle;
+            IntPtr _p3 = v.Handle;
+            void** args = stackalloc void*[11];
+            args[0] = &_p0;
+            args[1] = &_p1;
+            args[2] = &_p2;
+            args[3] = &_p3;
+            args[4] = &learningRate;
+            args[5] = &beta1;
+            args[6] = &beta2;
+            args[7] = &epsilon;
+            args[8] = &weightDecay;
+            args[9] = &step;
+            args[10] = &size;
+
+            uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+            LaunchKernel(krnl, grid, DefaultBlockSize, args);
+            Synchronize();
+            }
+    }
+
+    public unsafe void AdamWUpdateBf16(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
+    {
+        if (!_kernelCache.TryGetValue("adamw_bf16_update", out var krnl))
+            throw new InvalidOperationException("HIP kernel not found: adamw_bf16_update");
+
+            {
+            IntPtr _p0 = param.Handle;
+            IntPtr _p1 = gradient.Handle;
+            IntPtr _p2 = m.Handle;
+            IntPtr _p3 = v.Handle;
+            void** args = stackalloc void*[11];
+            args[0] = &_p0;
+            args[1] = &_p1;
+            args[2] = &_p2;
+            args[3] = &_p3;
+            args[4] = &learningRate;
+            args[5] = &beta1;
+            args[6] = &beta2;
+            args[7] = &epsilon;
+            args[8] = &weightDecay;
+            args[9] = &step;
+            args[10] = &size;
+
+            uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+            LaunchKernel(krnl, grid, DefaultBlockSize, args);
+            Synchronize();
+            }
+    }
+
+    public unsafe void Adam8BitUpdate(IGpuBuffer param, IGpuBuffer gradient,
+        IGpuBuffer mQuant, IGpuBuffer vQuant, IGpuBuffer mScales, IGpuBuffer vScales,
+        float learningRate, float beta1, float beta2, float epsilon,
+        float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
+        int blockSize, int paramLength, int numBlocks)
+    {
+        if (!_kernelCache.TryGetValue("adam8bit_update", out var krnl))
+            throw new InvalidOperationException("HIP kernel not found: adam8bit_update");
+
+            {
+            IntPtr _p0 = param.Handle;
+            IntPtr _p1 = gradient.Handle;
+            IntPtr _p2 = mQuant.Handle;
+            IntPtr _p3 = vQuant.Handle;
+            IntPtr _p4 = mScales.Handle;
+            IntPtr _p5 = vScales.Handle;
+            void** args = stackalloc void*[17];
+            args[0] = &_p0;
+            args[1] = &_p1;
+            args[2] = &_p2;
+            args[3] = &_p3;
+            args[4] = &_p4;
+            args[5] = &_p5;
+            args[6] = &learningRate;
+            args[7] = &beta1;
+            args[8] = &beta2;
+            args[9] = &epsilon;
+            args[10] = &oneMinusBeta1;
+            args[11] = &oneMinusBeta2;
+            args[12] = &biasCorrection1;
+            args[13] = &biasCorrection2;
+            args[14] = &blockSize;
+            args[15] = &paramLength;
+            args[16] = &numBlocks;
+
+            LaunchKernel(krnl, (uint)numBlocks, 256u, args);
             Synchronize();
             }
     }

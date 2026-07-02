@@ -32,6 +32,9 @@ public class FlashAttentionRank4PerfTests
     private readonly ITestOutputHelper _output;
     public FlashAttentionRank4PerfTests(ITestOutputHelper output) { _output = output; }
 
+    private static bool RunPerformanceTests =>
+        Environment.GetEnvironmentVariable("AIDOTNET_RUN_PERF_TESTS") == "1";
+
     private static Tensor<float> RandomTensor(int[] shape, int seed)
     {
         var rng = new Random(seed);
@@ -53,9 +56,12 @@ public class FlashAttentionRank4PerfTests
             : 0.5 * (sorted[(n / 2) - 1] + sorted[n / 2]);
     }
 
-    [Fact]
+    [SkippableFact]
+    [Trait("Category", "Performance")]
     public void Forward_Rank4_Generic_WithinTolerance_Of_Rank4_Fixed()
     {
+        Skip.IfNot(RunPerformanceTests, "Performance gate; set AIDOTNET_RUN_PERF_TESTS=1 to run.");
+
         // Shape: BERT-base style attention block.
         const int B = 2, H = 4, Sq = 64, Sk = 64, D = 32, Dv = 32;
         const int IterationsWarmup = 10;

@@ -283,6 +283,39 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             }
         }
 
+        /// <summary>
+        /// Uploads byte contents from an existing array.
+        /// </summary>
+        public void CopyFromHost(byte[] source)
+        {
+            if (source.Length > _length)
+                throw new ArgumentException("Source array too large");
+            if (source.Length == 0)
+                return;
+
+            GCHandle handle = GCHandle.Alloc(source, GCHandleType.Pinned);
+            try
+            {
+                int err = OpenClNativeBindings.EnqueueWriteBuffer(
+                    _context.CommandQueue,
+                    _buffer,
+                    1, // blocking
+                    UIntPtr.Zero,
+                    (UIntPtr)source.Length,
+                    handle.AddrOfPinnedObject(),
+                    0,
+                    IntPtr.Zero,
+                    IntPtr.Zero);
+
+                if (err != OpenClNativeBindings.CL_SUCCESS)
+                    throw new InvalidOperationException($"Failed to write OpenCL byte buffer: {err}");
+            }
+            finally
+            {
+                handle.Free();
+            }
+        }
+
         public void Dispose()
         {
             if (_disposed) return;

@@ -21,6 +21,22 @@ internal static class HipOptimizerKernels
 // HIP OPTIMIZER KERNELS
 // ===========================================================================
 
+__device__ __forceinline__ float bf16_to_float(unsigned short x)
+{
+    unsigned int bits = ((unsigned int)x) << 16;
+    return __uint_as_float(bits);
+}
+
+__device__ __forceinline__ unsigned short float_to_bf16_rne(float x)
+{
+    unsigned int bits = __float_as_uint(x);
+    if ((bits & 0x7FFFFFFFu) > 0x7F800000u) {
+        return (unsigned short)((bits >> 16) | 0x0040u);
+    }
+    unsigned int rounding = 0x7FFFu + ((bits >> 16) & 1u);
+    return (unsigned short)((bits + rounding) >> 16);
+}
+
 // ---------------------------------------------------------------------------
 // SGD with momentum update
 // ---------------------------------------------------------------------------
@@ -71,6 +87,9 @@ extern ""C"" __global__ __launch_bounds__(256) void adam_update(
     if (idx >= size) return;
 
     float grad = gradient[idx];
+    if (weightDecay > 0.0f) {
+        grad += weightDecay * param[idx];
+    }
 
     float mVal = beta1 * m[idx] + (1.0f - beta1) * grad;
     float vVal = beta2 * v[idx] + (1.0f - beta2) * grad * grad;
@@ -80,11 +99,7 @@ extern ""C"" __global__ __launch_bounds__(256) void adam_update(
     float mHat = mVal / (1.0f - powf(beta1, (float)step));
     float vHat = vVal / (1.0f - powf(beta2, (float)step));
 
-    float update = learningRate * mHat / (sqrtf(vHat) + epsilon);
-    if (weightDecay > 0.0f) {
-        update += learningRate * weightDecay * param[idx];
-    }
-    param[idx] -= update;
+    param[idx] -= learningRate * mHat / (sqrtf(vHat) + epsilon);
 }
 
 // ---------------------------------------------------------------------------
@@ -114,6 +129,131 @@ extern ""C"" __global__ __launch_bounds__(256) void adamw_update(
     float vHat = vVal / (1.0f - powf(beta2, (float)step));
 
     param[idx] -= learningRate * mHat / (sqrtf(vHat) + epsilon);
+}
+
+// ---------------------------------------------------------------------------
+// Adam optimizer update with bfloat16 moment storage
+// ---------------------------------------------------------------------------
+extern ""C"" __global__ __launch_bounds__(256) void adam_bf16_update(
+    float* param, const float* gradient, unsigned short* m, unsigned short* v,
+    float learningRate, float beta1, float beta2, float epsilon,
+    float weightDecay, int step, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+
+    float grad = gradient[idx];
+    if (weightDecay > 0.0f) {
+        grad += weightDecay * param[idx];
+    }
+    float oldM = step <= 1 ? 0.0f : bf16_to_float(m[idx]);
+    float oldV = step <= 1 ? 0.0f : bf16_to_float(v[idx]);
+    float mVal = beta1 * oldM + (1.0f - beta1) * grad;
+    float vVal = beta2 * oldV + (1.0f - beta2) * grad * grad;
+    m[idx] = float_to_bf16_rne(mVal);
+    v[idx] = float_to_bf16_rne(vVal);
+
+    float mHat = mVal / (1.0f - powf(beta1, (float)step));
+    float vHat = vVal / (1.0f - powf(beta2, (float)step));
+
+    param[idx] -= learningRate * mHat / (sqrtf(vHat) + epsilon);
+}
+
+// ---------------------------------------------------------------------------
+// AdamW optimizer update with bfloat16 moment storage
+// ---------------------------------------------------------------------------
+extern ""C"" __global__ __launch_bounds__(256) void adamw_bf16_update(
+    float* param, const float* gradient, unsigned short* m, unsigned short* v,
+    float learningRate, float beta1, float beta2, float epsilon,
+    float weightDecay, int step, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+
+    float grad = gradient[idx];
+    if (weightDecay > 0.0f) {
+        param[idx] *= (1.0f - learningRate * weightDecay);
+    }
+
+    float oldM = step <= 1 ? 0.0f : bf16_to_float(m[idx]);
+    float oldV = step <= 1 ? 0.0f : bf16_to_float(v[idx]);
+    float mVal = beta1 * oldM + (1.0f - beta1) * grad;
+    float vVal = beta2 * oldV + (1.0f - beta2) * grad * grad;
+    m[idx] = float_to_bf16_rne(mVal);
+    v[idx] = float_to_bf16_rne(vVal);
+
+    float mHat = mVal / (1.0f - powf(beta1, (float)step));
+    float vHat = vVal / (1.0f - powf(beta2, (float)step));
+
+    param[idx] -= learningRate * mHat / (sqrtf(vHat) + epsilon);
+}
+
+// ---------------------------------------------------------------------------
+// 8-bit Adam blockwise dynamic quantization. One HIP block per quant block.
+// mQ is signed int8 stored as q+128; vQ is unsigned int8.
+// ---------------------------------------------------------------------------
+extern ""C"" __global__ __launch_bounds__(256) void adam8bit_update(
+    float* param, const float* gradient,
+    unsigned char* mQ, unsigned char* vQ,
+    float* mScales, float* vScales,
+    float learningRate, float beta1, float beta2, float epsilon,
+    float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
+    int blockSize, int paramLength, int numBlocks)
+{
+    int blk = blockIdx.x;
+    if (blk >= numBlocks) return;
+    int start = blk * blockSize;
+    int endIdx = start + blockSize; if (endIdx > paramLength) endIdx = paramLength;
+    int firstStep = biasCorrection1 <= oneMinusBeta1 + 1e-7f;
+    float mScale = firstStep ? 0.0f : mScales[blk];
+    float vScale = firstStep ? 0.0f : vScales[blk];
+
+    __shared__ float sMaxM[256];
+    __shared__ float sMaxV[256];
+
+    float locM = 0.0f, locV = 0.0f;
+    for (int i = start + threadIdx.x; i < endIdx; i += blockDim.x) {
+        float m_i = firstStep ? 0.0f : (float)((int)mQ[i] - 128) * mScale;
+        float v_i = firstStep ? 0.0f : (float)((int)vQ[i]) * vScale;
+        float g = gradient[i];
+        float newM = beta1 * m_i + oneMinusBeta1 * g;
+        float newV = beta2 * v_i + oneMinusBeta2 * (g * g);
+        locM = fmaxf(locM, fabsf(newM));
+        locV = fmaxf(locV, fabsf(newV));
+    }
+    sMaxM[threadIdx.x] = locM; sMaxV[threadIdx.x] = locV;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            sMaxM[threadIdx.x] = fmaxf(sMaxM[threadIdx.x], sMaxM[threadIdx.x + s]);
+            sMaxV[threadIdx.x] = fmaxf(sMaxV[threadIdx.x], sMaxV[threadIdx.x + s]);
+        }
+        __syncthreads();
+    }
+    float newMScale = sMaxM[0] / 127.0f; if (newMScale < 1e-10f) newMScale = 1e-10f;
+    float newVScale = sMaxV[0] / 255.0f; if (newVScale < 1e-10f) newVScale = 1e-10f;
+    if (threadIdx.x == 0) { mScales[blk] = newMScale; vScales[blk] = newVScale; }
+    __syncthreads();
+
+    for (int i = start + threadIdx.x; i < endIdx; i += blockDim.x) {
+        float m_i = firstStep ? 0.0f : (float)((int)mQ[i] - 128) * mScale;
+        float v_i = firstStep ? 0.0f : (float)((int)vQ[i]) * vScale;
+        float g = gradient[i];
+        float newM = beta1 * m_i + oneMinusBeta1 * g;
+        float newV = beta2 * v_i + oneMinusBeta2 * (g * g);
+
+        float mHat = newM / biasCorrection1;
+        float vHat = newV / biasCorrection2;
+        param[i] = param[i] - learningRate * mHat / (sqrtf(vHat) + epsilon);
+
+        int qm = (int)rintf(newM / newMScale);
+        if (qm < -127) qm = -127; if (qm > 127) qm = 127;
+        mQ[i] = (unsigned char)(qm + 128);
+
+        int qv = (int)rintf(newV / newVScale);
+        if (qv < 0) qv = 0; if (qv > 255) qv = 255;
+        vQ[i] = (unsigned char)qv;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -291,9 +431,11 @@ extern ""C"" __global__ __launch_bounds__(256) void amsgrad_update(
     float vMaxVal = fmaxf(vMax[idx], vVal);
     vMax[idx] = vMaxVal;
 
+    float beta2Pow = powf(beta2, (float)step);
     float mHat = mVal / (1.0f - powf(beta1, (float)step));
+    float vMaxHat = vMaxVal / (1.0f - beta2Pow);
 
-    param[idx] -= learningRate * mHat / (sqrtf(vMaxVal) + epsilon);
+    param[idx] -= learningRate * mHat / (sqrtf(vMaxHat) + epsilon);
 }
 
 // ---------------------------------------------------------------------------
@@ -371,11 +513,12 @@ extern ""C"" __global__ __launch_bounds__(256) void nadam_update(
     v[idx] = vVal;
 
     float beta1Pow = powf(beta1, (float)step);
+    float beta1PowNext = powf(beta1, (float)(step + 1));
     float beta2Pow = powf(beta2, (float)step);
     float mHat = mVal / (1.0f - beta1Pow);
     float vHat = vVal / (1.0f - beta2Pow);
 
-    float mNesterov = beta1 * mHat + (1.0f - beta1) * grad / (1.0f - beta1Pow);
+    float mNesterov = beta1 * mHat + (1.0f - beta1) * grad / (1.0f - beta1PowNext);
 
     param[idx] -= learningRate * mNesterov / (sqrtf(vHat) + epsilon);
 }
@@ -427,6 +570,9 @@ extern ""C"" __global__ __launch_bounds__(256) void ftrl_update(
             "sgd_update",
             "adam_update",
             "adamw_update",
+            "adam_bf16_update",
+            "adamw_bf16_update",
+            "adam8bit_update",
             "rmsprop_update",
             "adagrad_update",
             "nag_update",

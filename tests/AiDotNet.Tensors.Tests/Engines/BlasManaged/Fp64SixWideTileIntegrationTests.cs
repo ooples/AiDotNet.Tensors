@@ -21,6 +21,8 @@ public class Fp64SixWideTileIntegrationTests
 {
     private readonly ITestOutputHelper _out;
     public Fp64SixWideTileIntegrationTests(ITestOutputHelper output) => _out = output;
+    private static bool RunPerformanceTests =>
+        string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_RUN_PERF_TESTS"), "1", StringComparison.Ordinal);
 
     [SkippableTheory]
     [InlineData(192, 512, 256)]   // clean: M mult of 6 & 4, N mult of 8
@@ -81,6 +83,7 @@ public class Fp64SixWideTileIntegrationTests
     [Trait("Category", "Performance")]
     public void FastMode6x8_NotSlowerThan_Deterministic4x8_WideN()
     {
+        Skip.IfNot(RunPerformanceTests, "Performance gate; set AIDOTNET_RUN_PERF_TESTS=1 to run.");
         Skip.IfNot(Avx2Fp64_6x8.IsSupported, "AVX2/FMA not supported.");
         const int M = 192, N = 512, K = 256;
         const int warmup = 100, measured = 1000;

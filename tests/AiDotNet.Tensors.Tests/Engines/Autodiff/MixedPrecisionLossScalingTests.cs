@@ -36,9 +36,12 @@ public class MixedPrecisionLossScalingTests
         return (loss, x, W, t);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Fp16ResidentGradient_Underflows_WithoutLossScaling()
     {
+#if !NET5_0_OR_GREATER
+        Skip.If(true, "The net471 Half compatibility shim stores float values, so IEEE FP16 underflow is not observable.");
+#endif
         using var mp = new MixedPrecisionTape();
         var (loss, _, W, _) = Build(mp);
         var grads = mp.ComputeGradients(loss);

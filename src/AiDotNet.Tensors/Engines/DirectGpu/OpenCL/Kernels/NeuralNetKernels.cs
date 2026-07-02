@@ -487,6 +487,9 @@ __kernel void adam_update(
     if (idx >= size) return;
 
     float grad = gradient[idx];
+    if (weightDecay > 0.0f) {
+        grad += weightDecay * param[idx];
+    }
 
     // Update biased first moment estimate
     float m_new = beta1 * m[idx] + (1.0f - beta1) * grad;
@@ -503,11 +506,7 @@ __kernel void adam_update(
     float v_hat = v_new / (1.0f - pow(beta2, (float)safe_step));
 
     // Update parameters
-    float update = learningRate * m_hat / (sqrt(v_hat) + epsilon);
-    if (weightDecay > 0.0f) {
-        update += learningRate * weightDecay * param[idx];
-    }
-    param[idx] -= update;
+    param[idx] -= learningRate * m_hat / (sqrt(v_hat) + epsilon);
 }
 
 // AdamW optimizer update (decoupled weight decay)
@@ -796,8 +795,9 @@ __kernel void amsgrad_update(
     // Bias correction (ensure step >= 1 to avoid division by zero)
     int safeStep = max(step, 1);
     float mHat = mVal / (1.0f - pow(beta1, (float)safeStep));
+    float vMaxHat = vMaxVal / (1.0f - pow(beta2, (float)safeStep));
 
-    param[idx] -= learningRate * mHat / (sqrt(vMaxVal) + epsilon);
+    param[idx] -= learningRate * mHat / (sqrt(vMaxHat) + epsilon);
 }
 
 // AdaMax optimizer update
@@ -895,11 +895,12 @@ __kernel void nadam_update(
     // Bias correction (ensure step >= 1 to avoid division by zero)
     int safeStep = max(step, 1);
     float beta1Pow = pow(beta1, (float)safeStep);
+    float beta1PowNext = pow(beta1, (float)(safeStep + 1));
     float beta2Pow = pow(beta2, (float)safeStep);
     float mHat = mVal / (1.0f - beta1Pow);
     float vHat = vVal / (1.0f - beta2Pow);
 
-    float mNesterov = beta1 * mHat + (1.0f - beta1) * grad / (1.0f - beta1Pow);
+    float mNesterov = beta1 * mHat + (1.0f - beta1) * grad / (1.0f - beta1PowNext);
 
     param[idx] -= learningRate * mNesterov / (sqrt(vHat) + epsilon);
 }
@@ -1221,14 +1222,16 @@ __kernel void embedding_lookup(
     const int numIndices,
     const int embeddingDim)
 {
-    const int idx = get_global_id(0);
-    if (idx >= numIndices) return;
+    const int d = get_global_id(0);
+    const int idx = get_global_id(1);
+    if (idx >= numIndices || d >= embeddingDim) return;
 
-    int index = (int)indices[idx];
+    // OpenClBackend.AllocateIntBuffer(int[]) stores raw int bits in a float
+    // buffer. Reinterpret those bits here; a numeric cast truncates the
+    // denormal float representation of small positive indices to zero.
+    int index = as_int(indices[idx]);
 
-    for (int d = 0; d < embeddingDim; d++) {
-        output[idx * embeddingDim + d] = embeddingTable[index * embeddingDim + d];
-    }
+    output[idx * embeddingDim + d] = embeddingTable[index * embeddingDim + d];
 }
 
 // Embedding backward (scatter add gradients)
@@ -1242,10 +1245,12 @@ __kernel void embedding_backward(
     __global const float* indices,
     __global float* gradEmbedding,
     const int numIndices,
-    const int embeddingDim)
+    const int embeddingDim,
+    const int vocabSize)
 {
-    const int idx = get_global_id(0);
-    if (idx >= numIndices) return;
+    const int d = get_global_id(0);
+    const int idx = get_global_id(1);
+    if (idx >= numIndices || d >= embeddingDim) return;
 
     // OpenCL AllocateIntBuffer bit-packs int32 indices into the float buffer via
     // BitConverter (see OpenClBackend.AllocateIntBuffer(int[])). Use as_int() to
@@ -1253,11 +1258,10 @@ __kernel void embedding_backward(
     // float interpretation of the bit pattern (e.g. int 1 stored as denormal
     // ~1.4e-45 would truncate to 0).
     int index = as_int(indices[idx]);
+    if (index < 0 || index >= vocabSize) return;
 
-    for (int d = 0; d < embeddingDim; d++) {
-        // Use atomic add for thread safety when multiple indices point to same embedding
-        atomic_add_float(&gradEmbedding[index * embeddingDim + d], gradOutput[idx * embeddingDim + d]);
-    }
+    // Use atomic add for thread safety when multiple indices point to same embedding.
+    atomic_add_float(&gradEmbedding[index * embeddingDim + d], gradOutput[idx * embeddingDim + d]);
 }
 
 // Embedding backward — bit-deterministic variant (issue #382).

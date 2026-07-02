@@ -7,6 +7,23 @@ using AiDotNet.Tensors.LinearAlgebra;
 namespace AiDotNet.Tensors.Engines.Compilation;
 
 /// <summary>
+/// Reduced optimizer-state storage modes supported by fused compiled training.
+/// Parameters and gradients remain fp32; this controls only Adam-family moment
+/// buffers owned by the compiled optimizer closure.
+/// </summary>
+public enum FusedMomentStorageMode
+{
+    /// <summary>Store optimizer moments as fp32 arrays/buffers.</summary>
+    Float32 = 0,
+
+    /// <summary>Store Adam/AdamW moments as bfloat16 while computing updates in fp32.</summary>
+    BFloat16 = 1,
+
+    /// <summary>Store Adam moments as block-quantized int8 values with per-block scales.</summary>
+    Int8BlockQuantized = 2
+}
+
+/// <summary>
 /// A compiled inference plan that replays a pre-optimized computation graph.
 /// Compile once from a traced forward pass, replay forever with zero allocation.
 ///
@@ -421,13 +438,26 @@ public interface ICompiledTrainingPlan<T> : IDisposable
 
     /// <summary>
     /// Requests bfloat16 storage for the Adam/AdamW moment state (m, v) on the
-    /// float CPU fused path (#1745). Halves resident optimizer-state memory while
+    /// float fused path (#1745). Halves resident optimizer-state memory while
     /// keeping the fp32 update math, so large models can stay on the fused fast
     /// path instead of dropping to the eager tape for memory. Call before
     /// <see cref="ConfigureOptimizer(OptimizerType, float, float, float, float, float, FusedOptimizerExtras?)"/>;
-    /// honored only for CPU float Adam/AdamW and a safe no-op otherwise.
+    /// honored for float Adam/AdamW on CPU and direct GPU backends that implement
+    /// compressed optimizer moments.
     /// </summary>
     void RequestBf16MomentStorage(bool enabled);
+
+    /// <summary>
+    /// Requests true block-quantized int8 storage for Adam moment state (m, v) on
+    /// the float fused path. This mirrors the deterministic 8-bit Adam mode:
+    /// one byte per moment element plus a per-block scale, with fp32 math during
+    /// the update. Call before <see cref="ConfigureOptimizer(OptimizerType, float, float, float, float, float, FusedOptimizerExtras?)"/>.
+    /// This mode is supported only for Adam without weight decay; unsupported
+    /// combinations fail fast during optimizer configuration.
+    /// </summary>
+    /// <param name="enabled">True to request int8 moment storage; false to return to fp32 moments.</param>
+    /// <param name="blockSize">Number of elements per quantization block. Must be positive when enabled.</param>
+    void RequestInt8MomentStorage(bool enabled, int blockSize = 2048);
 
     /// <summary>
     /// Configures fused optimizer updates with a per-step

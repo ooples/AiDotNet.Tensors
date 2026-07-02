@@ -34,6 +34,8 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 public class MatrixMultiplyResidencyTests
 {
     private readonly ITestOutputHelper _output;
+    private static bool RunPerformanceTests =>
+        string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_RUN_PERF_TESTS"), "1", StringComparison.Ordinal);
 
     public MatrixMultiplyResidencyTests(ITestOutputHelper output) { _output = output; }
 
@@ -234,12 +236,16 @@ AssertCloseFloat(c.AsSpan().ToArray(), cRef.AsSpan().ToArray(), absTol: 5e-3f, r
     // claim isn't a trust-the-comments problem. They use [Fact] (not Theory)
     // so the output appears in the test runner. Tolerances on the assertion
     // bounds are generous (we just want "did the fix engage", not exact
-    // numbers from a specific GPU SKU).
+    // numbers from a specific GPU SKU). They are gated by
+    // AIDOTNET_RUN_PERF_TESTS so default correctness runs do not fail on
+    // wall-clock jitter.
 
     [SkippableFact]
     [Trait("Category", "CudaRequired")]
+    [Trait("Category", "Performance")]
     public void Benchmark_Fp16_VsFp32()
     {
+        Skip.IfNot(RunPerformanceTests, "Performance gate; set AIDOTNET_RUN_PERF_TESTS=1 to run.");
         // #560: pre-fix, FP16 MatMul hit a CPU scalar path because the GPU
         // dispatch declined (kernel-not-found / FP16-not-supported); on
         // an RTX 3080 with N=2048 that was 280s vs 195ms FP32 (1437× — the
@@ -300,8 +306,10 @@ AssertCloseFloat(c.AsSpan().ToArray(), cRef.AsSpan().ToArray(), absTol: 5e-3f, r
 
     [SkippableFact]
     [Trait("Category", "CudaRequired")]
+    [Trait("Category", "Performance")]
     public void Benchmark_ChainedGemm_InsideVsOutsideGpuScope()
     {
+        Skip.IfNot(RunPerformanceTests, "Performance gate; set AIDOTNET_RUN_PERF_TESTS=1 to run.");
         // #561 / #562: pre-fix, a 20-step chained N=2048 GEMM was SLOWER
         // inside BeginGpuScope() (5722 ms) than outside (4673 ms) — 0.82× —
         // because the scope's deferred-download path went unused and added

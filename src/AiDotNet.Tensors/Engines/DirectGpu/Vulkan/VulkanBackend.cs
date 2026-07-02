@@ -33,7 +33,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 /// Shader modules are compiled once and reused across operations.
 /// </para>
 /// </remarks>
-public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchExecution, IFusedAdvancedKernels
+public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchExecution, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend
 {
     /// <summary>
     /// Vulkan has no cuDNN-equivalent half/bfloat16 conv path — returns

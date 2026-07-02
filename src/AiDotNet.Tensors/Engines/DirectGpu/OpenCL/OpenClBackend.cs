@@ -30,7 +30,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     /// <item>Bank-conflict-free shared memory</item>
     /// </list>
     /// </remarks>
-    public sealed partial class OpenClBackend : IAsyncGpuBackend, IFusedAdvancedKernels
+    public sealed partial class OpenClBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend
     {
         /// <summary>
         /// OpenCL has no cuDNN-equivalent half/bfloat16 conv path —
@@ -110,6 +110,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private int _clblastMinIndirectSize;
 
         public bool IsAvailable { get; }
+        public string? InitializationError { get; private set; }
         public string BackendName => "OpenCL";
         public TensorDevice DeviceType => TensorDevice.OpenCL;
         public string DeviceName { get; }
@@ -253,6 +254,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             }
             catch (Exception ex)
             {
+                InitializationError = ex.ToString();
                 WriteDiag($"[OpenClBackend] Initialization FAILED: {ex.GetType().Name}: {ex.Message}");
                 if (ex.InnerException != null)
                     WriteDiag($"[OpenClBackend] Inner: {ex.InnerException.Message}");
@@ -413,6 +415,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 foreach (var name in NeuralNetKernels.GetKernelNames())
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, nnProgram, name);
+                }
+
+                var optimizerProgram = CompileOrLoadCached(Kernels.OptimizerKernels.GetSource(), optimizationFlags, "Optimizer kernels");
+                _programs.Add(optimizerProgram);
+                foreach (var name in Kernels.OptimizerKernels.GetKernelNames())
+                {
+                    _kernelCache[name] = new DirectOpenClKernel(_context, optimizerProgram, name);
                 }
 
                 // Compile mixed precision kernels only if device actually supports FP16
@@ -1177,6 +1186,36 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             var openClBuffer = (DirectOpenClGpuBuffer)buffer;
             openClBuffer.Download(destination);
+        }
+
+        public byte[] DownloadByteBuffer(IGpuBuffer buffer, int byteCount)
+        {
+            if (byteCount < 0)
+                throw new ArgumentOutOfRangeException(nameof(byteCount), "Byte count must be non-negative.");
+            if (buffer is not DirectOpenClGpuByteBuffer byteBuffer)
+                throw new ArgumentException("Buffer must be a DirectOpenClGpuByteBuffer.", nameof(buffer));
+            if (byteCount > byteBuffer.Size)
+                throw new ArgumentException($"Requested byte count ({byteCount}) exceeds buffer capacity ({byteBuffer.Size}).", nameof(byteCount));
+
+            var result = new byte[byteCount];
+            if (byteCount == 0)
+                return result;
+
+            var full = byteBuffer.Download();
+            Array.Copy(full, result, byteCount);
+            return result;
+        }
+
+        public void UploadByteBuffer(IGpuBuffer buffer, byte[] data)
+        {
+            if (data is null)
+                throw new ArgumentNullException(nameof(data));
+            if (buffer is not DirectOpenClGpuByteBuffer byteBuffer)
+                throw new ArgumentException("Buffer must be a DirectOpenClGpuByteBuffer.", nameof(buffer));
+            if (data.Length > byteBuffer.Size)
+                throw new ArgumentException($"Host data ({data.Length} bytes) exceeds buffer capacity ({byteBuffer.Size} bytes).", nameof(data));
+
+            byteBuffer.Upload(data);
         }
 
         public void Copy(IGpuBuffer source, int srcOffset, IGpuBuffer destination, int destOffset, int size)
@@ -10080,6 +10119,75 @@ KERNEL VARIANTS (A/B testing):
             k.Execute1D(size, Math.Min(256, size));
         }
 
+        public void AdamUpdateBf16(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
+            float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
+        {
+            var k = _kernelCache["adam_bf16_update"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)param).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradient).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuByteBuffer)m).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuByteBuffer)v).Buffer.Handle);
+            k.SetArg(arg++, learningRate);
+            k.SetArg(arg++, beta1);
+            k.SetArg(arg++, beta2);
+            k.SetArg(arg++, epsilon);
+            k.SetArg(arg++, weightDecay);
+            k.SetArg(arg++, step);
+            k.SetArg(arg++, size);
+
+            k.Execute1D(size, Math.Min(256, size));
+        }
+
+        public void AdamWUpdateBf16(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
+            float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
+        {
+            var k = _kernelCache["adamw_bf16_update"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)param).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradient).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuByteBuffer)m).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuByteBuffer)v).Buffer.Handle);
+            k.SetArg(arg++, learningRate);
+            k.SetArg(arg++, beta1);
+            k.SetArg(arg++, beta2);
+            k.SetArg(arg++, epsilon);
+            k.SetArg(arg++, weightDecay);
+            k.SetArg(arg++, step);
+            k.SetArg(arg++, size);
+
+            k.Execute1D(size, Math.Min(256, size));
+        }
+
+        public void Adam8BitUpdate(IGpuBuffer param, IGpuBuffer gradient,
+            IGpuBuffer mQuant, IGpuBuffer vQuant, IGpuBuffer mScales, IGpuBuffer vScales,
+            float learningRate, float beta1, float beta2, float epsilon,
+            float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
+            int blockSize, int paramLength, int numBlocks)
+        {
+            var k = _kernelCache["adam8bit_update"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)param).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradient).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuByteBuffer)mQuant).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuByteBuffer)vQuant).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)mScales).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)vScales).Buffer.Handle);
+            k.SetArg(arg++, learningRate);
+            k.SetArg(arg++, beta1);
+            k.SetArg(arg++, beta2);
+            k.SetArg(arg++, epsilon);
+            k.SetArg(arg++, oneMinusBeta1);
+            k.SetArg(arg++, oneMinusBeta2);
+            k.SetArg(arg++, biasCorrection1);
+            k.SetArg(arg++, biasCorrection2);
+            k.SetArg(arg++, blockSize);
+            k.SetArg(arg++, paramLength);
+            k.SetArg(arg++, numBlocks);
+
+            k.Execute1D(numBlocks * 256, 256);
+        }
+
         /// <inheritdoc/>
         public void RmspropUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer squaredAvg,
             float learningRate, float rho, float epsilon, float weightDecay, int size)
@@ -12483,6 +12591,9 @@ KERNEL VARIANTS (A/B testing):
             if (Interlocked.Exchange(ref _poolState, 2) == 2)
                 return;
 
+            if (GpuBufferReleaseDeferral.TryDefer(Buffer.Dispose))
+                return;
+
             Buffer.Dispose();
         }
 
@@ -12495,6 +12606,9 @@ KERNEL VARIANTS (A/B testing):
             }
 
             if (Interlocked.CompareExchange(ref _poolState, 1, 0) != 0)
+                return;
+
+            if (GpuBufferReleaseDeferral.TryDefer(() => _returnToPool(this)))
                 return;
 
             _returnToPool(this);
@@ -12611,6 +12725,7 @@ KERNEL VARIANTS (A/B testing):
     internal sealed class DirectOpenClGpuByteBuffer : IGpuBuffer
     {
         internal readonly DirectOpenClByteBuffer Buffer;
+        private int _disposed;
 
         public int Size => Buffer.Length;
         public long SizeInBytes => Buffer.Length;
@@ -12631,8 +12746,19 @@ KERNEL VARIANTS (A/B testing):
             Buffer.CopyToHost(destination);
         }
 
+        public void Upload(byte[] source)
+        {
+            Buffer.CopyFromHost(source);
+        }
+
         public void Dispose()
         {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+                return;
+
+            if (GpuBufferReleaseDeferral.TryDefer(Buffer.Dispose))
+                return;
+
             Buffer.Dispose();
         }
     }

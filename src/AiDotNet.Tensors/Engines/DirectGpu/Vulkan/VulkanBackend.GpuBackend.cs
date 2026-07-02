@@ -240,6 +240,43 @@ public sealed unsafe partial class VulkanBackend
         vb.Staging.ReadData(destination);
     }
 
+    public byte[] DownloadByteBuffer(IGpuBuffer buffer, int byteCount)
+    {
+        EnsureInitialized();
+        if (byteCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(byteCount), "Byte count must be non-negative.");
+        var vb = AsVulkan(buffer);
+        if (byteCount > vb.SizeInBytes)
+            throw new ArgumentException($"Requested byte count ({byteCount}) exceeds buffer capacity ({vb.SizeInBytes}).", nameof(byteCount));
+        if (_transfer is null)
+            throw new InvalidOperationException("Vulkan buffer transfer not initialized.");
+
+        var result = new byte[byteCount];
+        if (byteCount == 0)
+            return result;
+
+        _transfer.CopyFromDevice(vb.Storage, vb.Staging);
+        vb.Staging.ReadRawBytes(result);
+        return result;
+    }
+
+    public void UploadByteBuffer(IGpuBuffer buffer, byte[] data)
+    {
+        EnsureInitialized();
+        if (data is null)
+            throw new ArgumentNullException(nameof(data));
+        var vb = AsVulkan(buffer);
+        if (data.LongLength > vb.SizeInBytes)
+            throw new ArgumentException($"Host data ({data.Length} bytes) exceeds buffer capacity ({vb.SizeInBytes} bytes).", nameof(data));
+        if (_transfer is null)
+            throw new InvalidOperationException("Vulkan buffer transfer not initialized.");
+        if (data.Length == 0)
+            return;
+
+        vb.Staging.WriteRawData<byte>(data);
+        _transfer.CopyToDevice(vb.Staging, vb.Storage);
+    }
+
     public void Copy(IGpuBuffer source, int srcOffset, IGpuBuffer destination, int destOffset, int size)
     {
         EnsureInitialized();

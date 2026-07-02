@@ -16,7 +16,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// </summary>
 public class BatchNorm3DIntegrationTests : IDisposable
 {
-    private readonly IEngine _engine = AiDotNetEngine.Current;
+    private readonly IEngine _engine = new CpuEngine();
     private readonly bool _previousReplayMode;
 
     public BatchNorm3DIntegrationTests()

@@ -116,6 +116,73 @@ public sealed partial class MetalBackend
         UploadToBuffer(v, vData);
     }
 
+    public void AdamUpdateBf16(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
+    {
+        ThrowIfDisposed();
+
+        var paramData = DownloadBuffer(param);
+        var gradData = DownloadBuffer(gradient);
+        var mBytes = CompressedMomentHostFallback.DownloadPackedBytes(DownloadBuffer(m), size * sizeof(ushort));
+        var vBytes = CompressedMomentHostFallback.DownloadPackedBytes(DownloadBuffer(v), size * sizeof(ushort));
+
+        CompressedMomentHostFallback.AdamBf16(
+            paramData, gradData, mBytes, vBytes,
+            learningRate, beta1, beta2, epsilon, weightDecay, step, size,
+            decoupledWeightDecay: false);
+
+        UploadToBuffer(param, paramData);
+        UploadToBuffer(m, CompressedMomentHostFallback.PackBytesAsFloats(mBytes));
+        UploadToBuffer(v, CompressedMomentHostFallback.PackBytesAsFloats(vBytes));
+    }
+
+    public void AdamWUpdateBf16(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
+    {
+        ThrowIfDisposed();
+
+        var paramData = DownloadBuffer(param);
+        var gradData = DownloadBuffer(gradient);
+        var mBytes = CompressedMomentHostFallback.DownloadPackedBytes(DownloadBuffer(m), size * sizeof(ushort));
+        var vBytes = CompressedMomentHostFallback.DownloadPackedBytes(DownloadBuffer(v), size * sizeof(ushort));
+
+        CompressedMomentHostFallback.AdamBf16(
+            paramData, gradData, mBytes, vBytes,
+            learningRate, beta1, beta2, epsilon, weightDecay, step, size,
+            decoupledWeightDecay: true);
+
+        UploadToBuffer(param, paramData);
+        UploadToBuffer(m, CompressedMomentHostFallback.PackBytesAsFloats(mBytes));
+        UploadToBuffer(v, CompressedMomentHostFallback.PackBytesAsFloats(vBytes));
+    }
+
+    public void Adam8BitUpdate(IGpuBuffer param, IGpuBuffer gradient,
+        IGpuBuffer mQuant, IGpuBuffer vQuant, IGpuBuffer mScales, IGpuBuffer vScales,
+        float learningRate, float beta1, float beta2, float epsilon,
+        float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
+        int blockSize, int paramLength, int numBlocks)
+    {
+        ThrowIfDisposed();
+
+        var paramData = DownloadBuffer(param);
+        var gradData = DownloadBuffer(gradient);
+        var mQuantBytes = CompressedMomentHostFallback.DownloadPackedBytes(DownloadBuffer(mQuant), paramLength);
+        var vQuantBytes = CompressedMomentHostFallback.DownloadPackedBytes(DownloadBuffer(vQuant), paramLength);
+        var mScaleData = DownloadBuffer(mScales);
+        var vScaleData = DownloadBuffer(vScales);
+
+        CompressedMomentHostFallback.Adam8Bit(
+            paramData, gradData, mQuantBytes, vQuantBytes, mScaleData, vScaleData,
+            learningRate, beta1, beta2, epsilon, oneMinusBeta1, oneMinusBeta2,
+            biasCorrection1, biasCorrection2, blockSize, paramLength, numBlocks);
+
+        UploadToBuffer(param, paramData);
+        UploadToBuffer(mQuant, CompressedMomentHostFallback.PackBytesAsFloats(mQuantBytes));
+        UploadToBuffer(vQuant, CompressedMomentHostFallback.PackBytesAsFloats(vQuantBytes));
+        UploadToBuffer(mScales, mScaleData);
+        UploadToBuffer(vScales, vScaleData);
+    }
+
     /// <summary>
     /// RMSprop optimizer update.
     /// </summary>

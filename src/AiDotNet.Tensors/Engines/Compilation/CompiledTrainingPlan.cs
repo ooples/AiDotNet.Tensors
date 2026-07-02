@@ -218,6 +218,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
+        _optimizerRuntimeState = null;
 
         if (_residentGradBuffers is not null)
         {
@@ -718,23 +719,139 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // every other optimizer (they evaluate at the live weights directly).
     private Action? _preForwardParamTransform;
     private int _optimizerStep;
+    private FusedOptimizerRuntimeState? _optimizerRuntimeState;
 
-    // #1745: when set, the float Adam/AdamW fused path stores its m/v moment
-    // buffers as bfloat16 (half the fp32 footprint) instead of fp32. The
-    // consumer requests this before ConfigureOptimizer; it is honored only for
-    // CPU-resident float Adam/AdamW (the only kernels with a bf16 variant), and
-    // silently ignored otherwise so correctness never depends on it. Lets large
-    // models keep BOTH the fused fast path and a halved optimizer-state
-    // footprint instead of dropping to the eager tape for memory.
-    private bool _useBf16Moments;
+    private sealed class FusedOptimizerRuntimeScalars
+    {
+        public float HypergradientAdjustment;
+        public float DAdaptationEstimate;
+        public float DAdaptationRAccum;
+        public float ScheduleFreeWeightSum;
+    }
+
+    private sealed class FusedOptimizerRuntimeState
+    {
+        public OptimizerType OptimizerType;
+        public bool IsGrouped;
+        public LrSchedule[] Schedules = Array.Empty<LrSchedule>();
+        public int[]? ParamToGroup;
+        public float Beta1;
+        public float Beta2;
+        public float Epsilon;
+        public float WeightDecay;
+        public FusedOptimizerExtras Extras = new FusedOptimizerExtras();
+        public FusedMomentStorageMode MomentStorageMode;
+        public int Int8MomentBlockSize;
+        public FusedOptimizerRuntimeScalars Scalars = new FusedOptimizerRuntimeScalars();
+        public float[][]? MFloat;
+        public float[][]? VFloat;
+        public float[][]? VMaxFloat;
+        public double[][]? MDouble;
+        public double[][]? VDouble;
+        public double[][]? VMaxDouble;
+        public ushort[][]? MBFloat16;
+        public ushort[][]? VBFloat16;
+        public byte[][]? MQuantized;
+        public byte[][]? VQuantized;
+        public double[][]? MScales;
+        public double[][]? VScales;
+        public Engines.DirectGpu.IDirectGpuBackend?[]? GpuBackends;
+        public Engines.DirectGpu.IGpuBuffer?[]? GpuM;
+        public Engines.DirectGpu.IGpuBuffer?[]? GpuV;
+        public Engines.DirectGpu.IGpuBuffer?[]? GpuVMax;
+        public Engines.DirectGpu.IGpuBuffer?[]? GpuMScales;
+        public Engines.DirectGpu.IGpuBuffer?[]? GpuVScales;
+        public FusedMomentStorageMode[]? GpuMomentStorage;
+    }
+
+    // #1745: reduced moment storage requested by the consumer before
+    // ConfigureOptimizer. Parameters/gradients remain fp32; this controls only
+    // the Adam-family m/v state owned by the fused optimizer closure.
+    private FusedMomentStorageMode _momentStorageMode = FusedMomentStorageMode.Float32;
+    private int _int8MomentBlockSize = 2048;
 
     /// <summary>
-    /// Requests bfloat16 storage for the Adam/AdamW moment state on the float CPU
+    /// Requests bfloat16 storage for the Adam/AdamW moment state on the float
     /// fused path (#1745). Halves resident optimizer-state memory (m, v) while
-    /// keeping the fp32 update math; honored only for CPU float Adam/AdamW and a
-    /// no-op for every other configuration. Call before <see cref="ConfigureOptimizer(OptimizerType, float, float, float, float, float, FusedOptimizerExtras?)"/>.
+    /// keeping the fp32 update math. Applies to CPU and direct GPU backends that
+    /// implement compressed optimizer moments. Call before <see cref="ConfigureOptimizer(OptimizerType, float, float, float, float, float, FusedOptimizerExtras?)"/>.
     /// </summary>
-    public void RequestBf16MomentStorage(bool enabled) => _useBf16Moments = enabled;
+    public void RequestBf16MomentStorage(bool enabled)
+        => _momentStorageMode = enabled ? FusedMomentStorageMode.BFloat16 : FusedMomentStorageMode.Float32;
+
+    /// <summary>
+    /// Requests true block-quantized int8 Adam moment storage for the float fused
+    /// path. Supported only for Adam without weight decay. Last request wins
+    /// against <see cref="RequestBf16MomentStorage"/>.
+    /// </summary>
+    public void RequestInt8MomentStorage(bool enabled, int blockSize = 2048)
+    {
+        if (!enabled)
+        {
+            _momentStorageMode = FusedMomentStorageMode.Float32;
+            return;
+        }
+        if (blockSize <= 0)
+            throw new ArgumentOutOfRangeException(nameof(blockSize), "Block size must be positive.");
+        _int8MomentBlockSize = blockSize;
+        _momentStorageMode = FusedMomentStorageMode.Int8BlockQuantized;
+    }
+
+    private static int Adam8BitBlockCount(int length, int blockSize)
+        => (length + blockSize - 1) / blockSize;
+
+    private static void InitializeAdam8BitCpuState(
+        byte[] mQuant, byte[] vQuant, double[] mScales, double[] vScales)
+    {
+        for (int i = 0; i < mQuant.Length; i++) mQuant[i] = 128;
+        for (int i = 0; i < vQuant.Length; i++) vQuant[i] = 0;
+        for (int i = 0; i < mScales.Length; i++) mScales[i] = 1e-10;
+        for (int i = 0; i < vScales.Length; i++) vScales[i] = 1e-10;
+    }
+
+    private static void AllocateGpuAdam8BitState(
+        Engines.DirectGpu.IDirectGpuBackend backend,
+        int length,
+        int blockSize,
+        out Engines.DirectGpu.IGpuBuffer mQuant,
+        out Engines.DirectGpu.IGpuBuffer vQuant,
+        out Engines.DirectGpu.IGpuBuffer mScales,
+        out Engines.DirectGpu.IGpuBuffer vScales)
+    {
+        int blockCount = Adam8BitBlockCount(length, blockSize);
+        Engines.DirectGpu.IGpuBuffer? localMQuant = null;
+        Engines.DirectGpu.IGpuBuffer? localVQuant = null;
+        Engines.DirectGpu.IGpuBuffer? localMScales = null;
+        Engines.DirectGpu.IGpuBuffer? localVScales = null;
+
+        try
+        {
+            localMQuant = backend.AllocateByteBuffer(length);
+            localVQuant = backend.AllocateByteBuffer(length);
+
+            var mInitial = new byte[length];
+            for (int i = 0; i < mInitial.Length; i++) mInitial[i] = 128;
+            backend.UploadByteBuffer(localMQuant, mInitial);
+
+            var initialScales = new float[blockCount];
+            for (int i = 0; i < initialScales.Length; i++) initialScales[i] = 1e-10f;
+            localMScales = backend.AllocateBuffer(initialScales);
+            localVScales = backend.AllocateBuffer((float[])initialScales.Clone());
+
+            mQuant = localMQuant;
+            vQuant = localVQuant;
+            mScales = localMScales;
+            vScales = localVScales;
+        }
+        catch
+        {
+            localMQuant?.Dispose();
+            localVQuant?.Dispose();
+            localMScales?.Dispose();
+            localVScales?.Dispose();
+            throw;
+        }
+    }
 
     /// <summary>
     /// Global gradient L2-norm clip threshold. When &gt; 0, applied inside
@@ -1587,29 +1704,38 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         throw new NotSupportedException("Fused optimizer updates support float and double parameters.");
     }
 
-    /// <summary>Gate at the plan-level dispatch surface. The closures
-    /// built by ConfigureOptimizer*Float/Double only implement SGD,
-    /// Adam, and AdamW today — accepting anything else (Lion, LAMB,
-    /// HypergradientSGD, …) would configure successfully and then throw
-    /// on the first Step(). <c>OptimizerKernels.IsFusedPathEligible</c>
-    /// is the broader semantic predicate (which kernels exist at all);
-    /// this is the narrower "what the plan can replay today" check.</summary>
+    /// <summary>Gate at the plan-level dispatch surface. The fused kernels
+    /// support more optimizer math than every compiled-plan/device combination
+    /// can safely replay, so this keeps configure-time acceptance aligned with
+    /// the available closures and backend contracts.</summary>
     private static void ValidatePlanOptimizerSupport(OptimizerType optimizerType, bool isFloat, bool hasGpuParams)
     {
-        // Device-aware gate (CodeRabbit, PR #501): the GPU step path only ships
-        // SgdUpdate/AdamUpdate/AdamWUpdate backend kernels. AMSGrad and every
-        // float-only CPU kernel hit the GPU switch's default and throw — but on a
-        // MIXED CPU/GPU plan that throw lands AFTER earlier CPU parameters were
-        // already updated, leaving the optimizer step partially applied. Reject
-        // the unsupported-on-GPU combinations here, before _optimizerUpdate is
-        // published, so the failure is at configure time and atomic.
-        if (hasGpuParams &&
-            optimizerType is not (OptimizerType.SGD or OptimizerType.Adam or OptimizerType.AdamW))
+        // Device-aware gate (CodeRabbit, PR #501): reject unsupported GPU
+        // combinations before _optimizerUpdate is published so a mixed CPU/GPU
+        // plan cannot partially update CPU parameters and then throw on the
+        // first GPU param. Keep this list to GPU kernels whose current backend
+        // contracts preserve the compiled CPU path's semantics. LAMB/LARS/FTRL/
+        // AdaDelta have backend methods, but their current per-backend contracts
+        // differ from the plan-level CPU kernels (trust-ratio / lr-power / lr
+        // handling), so they remain CPU-only here until those contracts are fixed.
+        bool supportedGpu = optimizerType is OptimizerType.SGD
+            or OptimizerType.Adam
+            or OptimizerType.AdamW
+            or OptimizerType.AMSGrad
+            or OptimizerType.Nadam
+            or OptimizerType.RMSprop
+            or OptimizerType.Adagrad
+            or OptimizerType.Lion
+            or OptimizerType.SGDMomentum
+            or OptimizerType.AdaMax;
+        if (hasGpuParams && !supportedGpu)
         {
             throw new NotSupportedException(
                 $"Optimizer type {optimizerType} is not supported for GPU-resident parameters in " +
-                "CompiledTrainingPlan (the backend ships only SGD/Adam/AdamW GPU kernels). Use a " +
-                "CPU-resident plan for this optimizer, or SGD/Adam/AdamW on GPU.");
+                "CompiledTrainingPlan. GPU-resident plan dispatch currently supports " +
+                "SGD/Adam/AdamW/AMSGrad/Nadam/RMSprop/Adagrad/Lion/SGDMomentum/AdaMax. " +
+                "Use a CPU-resident compiled plan until the remaining GPU optimizer contracts " +
+                "match the compiled CPU semantics.");
         }
 
         // SGD/Adam/AdamW/AMSGrad have both float and double fused-update kernels
@@ -1650,7 +1776,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             throw new NotSupportedException(
                 $"Optimizer type {optimizerType} is not yet supported by CompiledTrainingPlan's " +
                 "fused-update closures. float: SGD/Adam/AdamW/AMSGrad/Nadam/RAdam/LAMB/RMSprop/" +
-                "Adagrad/Lion/SGDMomentum/AdaMax; double: SGD/Adam/AdamW/AMSGrad." + suffix);
+                "Adagrad/Lion/SGDMomentum/AdaMax/AdaDelta/LARS/FTRL/ASGD/Rprop/" +
+                "HypergradientSGD/DAdaptationSGD/ScheduleFreeSGD; double: SGD/Adam/AdamW/AMSGrad." + suffix);
         }
     }
 
@@ -1665,6 +1792,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
+        _optimizerRuntimeState = null;
         // A captured step graph holds kernel nodes wired to the OLD optimizer state
         // buffers + update; those are about to be freed/replaced, so drop it (replay
         // would otherwise launch against freed device memory or stale wiring).
@@ -1685,17 +1813,23 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // the optimizer is AMSGrad, else left as an empty array.
         var vMax = new float[paramCount][];
 
-        // #1745: bfloat16 moment storage for CPU float Adam/AdamW. Honored only
-        // when requested AND the optimizer is Adam/AdamW AND no parameter is
-        // GPU-resident (the GPU Adam kernel keeps fp32 moments). Halves the m/v
-        // resident footprint while the update math stays fp32. When engaged, the
-        // fp32 m[p]/v[p] slots are left empty and these bf16 buffers carry state.
-        bool anyGpuParam = System.Array.Exists(_parameters, p => p.TryGetGpuBuffer() is not null);
-        bool useBf16 = _useBf16Moments
-            && (optimizerType is OptimizerType.Adam or OptimizerType.AdamW)
-            && !anyGpuParam;
+        // Reduced Adam moment storage. BF16 supports Adam/AdamW; true int8 is
+        // Adam-only because the block-quant CUDA/CPU kernels intentionally match
+        // the deterministic 8-bit Adam path without decoupled weight decay.
+        bool useBf16Moments = _momentStorageMode == FusedMomentStorageMode.BFloat16
+            && (optimizerType is OptimizerType.Adam or OptimizerType.AdamW);
+        bool useInt8Moments = _momentStorageMode == FusedMomentStorageMode.Int8BlockQuantized;
+        if (useInt8Moments && optimizerType != OptimizerType.Adam)
+            throw new NotSupportedException("Int8 block-quantized fused moments are supported only for Adam.");
+        if (useInt8Moments && weightDecay != 0f)
+            throw new NotSupportedException("Int8 block-quantized fused Adam moments do not support weight decay.");
+
         var mB = new ushort[paramCount][];
         var vB = new ushort[paramCount][];
+        var mQuant = new byte[paramCount][];
+        var vQuant = new byte[paramCount][];
+        var mScales = new double[paramCount][];
+        var vScales = new double[paramCount][];
 
         // GPU path state (parallel arrays to paramArrays etc.). For each
         // parameter that's GPU-resident, gpuParam[p] / gpuGrad[p] hold the
@@ -1708,7 +1842,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var gpuGrad = new Engines.DirectGpu.IGpuBuffer?[paramCount];
         var gpuM = new Engines.DirectGpu.IGpuBuffer?[paramCount];
         var gpuV = new Engines.DirectGpu.IGpuBuffer?[paramCount];
+        var gpuVMax = new Engines.DirectGpu.IGpuBuffer?[paramCount];
+        var gpuMScales = new Engines.DirectGpu.IGpuBuffer?[paramCount];
+        var gpuVScales = new Engines.DirectGpu.IGpuBuffer?[paramCount];
         var gpuBackends = new Engines.DirectGpu.IDirectGpuBackend?[paramCount];
+        var gpuMomentStorage = new FusedMomentStorageMode[paramCount];
 
         // Issue #350: GetDataArray() returns a COPY when the parameter tensor's
         // backing storage is pool-padded (e.g. logical length 6 on a 16-slot
@@ -1735,6 +1873,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 or OptimizerType.RAdam or OptimizerType.LAMB or OptimizerType.AdaMax
                 or OptimizerType.AdaDelta or OptimizerType.FTRL or OptimizerType.Rprop
                 or OptimizerType.ScheduleFreeSGD;   // v[p] = x (eval/average copy)
+            bool needsThirdState = optimizerType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL;
 
             // GPU fast path: param is GPU-resident → allocate matching GPU
             // state buffers and dispatch to backend kernels. Backends ship
@@ -1784,19 +1923,61 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 {
                     gradArrays[p] = Array.Empty<float>();
                 }
-                if (needsMomentum)
+                if (useBf16Moments)
                 {
-                    gpuM[p] = paramBackend.AllocateBuffer(lengths[p]);
+                    if (paramBackend is not Engines.DirectGpu.ICompressedMomentGpuOptimizerBackend)
+                        throw new NotSupportedException(
+                            $"BFloat16 fused optimizer moments are not implemented by GPU backend '{paramBackend.BackendName}'.");
+                    gpuM[p] = paramBackend.AllocateByteBuffer(lengths[p] * sizeof(ushort));
+                    gpuV[p] = paramBackend.AllocateByteBuffer(lengths[p] * sizeof(ushort));
                     _gpuOptimizerBuffers.Add(gpuM[p]!);
-                }
-                if (needsSecondMoment)
-                {
-                    gpuV[p] = paramBackend.AllocateBuffer(lengths[p]);
                     _gpuOptimizerBuffers.Add(gpuV[p]!);
+                    gpuMomentStorage[p] = FusedMomentStorageMode.BFloat16;
+                }
+                else if (useInt8Moments)
+                {
+                    if (paramBackend is not Engines.DirectGpu.ICompressedMomentGpuOptimizerBackend)
+                        throw new NotSupportedException(
+                            $"Int8 block-quantized fused optimizer moments are not implemented by GPU backend '{paramBackend.BackendName}'.");
+                    AllocateGpuAdam8BitState(paramBackend, lengths[p], _int8MomentBlockSize,
+                        out var gpuMQuant, out var gpuVQuant, out var gpuMScaleBuf, out var gpuVScaleBuf);
+                    gpuM[p] = gpuMQuant;
+                    gpuV[p] = gpuVQuant;
+                    gpuMScales[p] = gpuMScaleBuf;
+                    gpuVScales[p] = gpuVScaleBuf;
+                    _gpuOptimizerBuffers.Add(gpuM[p]!);
+                    _gpuOptimizerBuffers.Add(gpuV[p]!);
+                    _gpuOptimizerBuffers.Add(gpuMScales[p]!);
+                    _gpuOptimizerBuffers.Add(gpuVScales[p]!);
+                    gpuMomentStorage[p] = FusedMomentStorageMode.Int8BlockQuantized;
+                }
+                else
+                {
+                    if (needsMomentum)
+                    {
+                        gpuM[p] = paramBackend.AllocateBuffer(new float[lengths[p]]);
+                        _gpuOptimizerBuffers.Add(gpuM[p]!);
+                    }
+                    if (needsSecondMoment)
+                    {
+                        gpuV[p] = paramBackend.AllocateBuffer(new float[lengths[p]]);
+                        _gpuOptimizerBuffers.Add(gpuV[p]!);
+                    }
+                    if (needsThirdState)
+                    {
+                        gpuVMax[p] = paramBackend.AllocateBuffer(new float[lengths[p]]);
+                        _gpuOptimizerBuffers.Add(gpuVMax[p]!);
+                    }
                 }
                 // Skip the CPU live-backing check entirely — we're on GPU.
                 m[p] = Array.Empty<float>();
                 v[p] = Array.Empty<float>();
+                mB[p] = Array.Empty<ushort>();
+                vB[p] = Array.Empty<ushort>();
+                mQuant[p] = Array.Empty<byte>();
+                vQuant[p] = Array.Empty<byte>();
+                mScales[p] = Array.Empty<double>();
+                vScales[p] = Array.Empty<double>();
                 paramArrays[p] = Array.Empty<float>();
                 continue;
             }
@@ -1830,7 +2011,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 gradArrays[p] = Array.Empty<float>();
             }
 
-            if (useBf16)
+            if (useBf16Moments)
             {
                 // bf16 path: m/v carried as bfloat16 (half the fp32 bytes); the
                 // fp32 slots stay empty. ushort 0x0000 == bf16 +0.0 — the correct
@@ -1839,6 +2020,23 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 v[p] = Array.Empty<float>();
                 mB[p] = new ushort[lengths[p]];
                 vB[p] = new ushort[lengths[p]];
+                mQuant[p] = Array.Empty<byte>();
+                vQuant[p] = Array.Empty<byte>();
+                mScales[p] = Array.Empty<double>();
+                vScales[p] = Array.Empty<double>();
+            }
+            else if (useInt8Moments)
+            {
+                m[p] = Array.Empty<float>();
+                v[p] = Array.Empty<float>();
+                mB[p] = Array.Empty<ushort>();
+                vB[p] = Array.Empty<ushort>();
+                mQuant[p] = new byte[lengths[p]];
+                vQuant[p] = new byte[lengths[p]];
+                int blockCount = Adam8BitBlockCount(lengths[p], _int8MomentBlockSize);
+                mScales[p] = new double[blockCount];
+                vScales[p] = new double[blockCount];
+                InitializeAdam8BitCpuState(mQuant[p], vQuant[p], mScales[p], vScales[p]);
             }
             else
             {
@@ -1846,6 +2044,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 v[p] = needsSecondMoment ? new float[lengths[p]] : Array.Empty<float>();
                 mB[p] = Array.Empty<ushort>();
                 vB[p] = Array.Empty<ushort>();
+                mQuant[p] = Array.Empty<byte>();
+                vQuant[p] = Array.Empty<byte>();
+                mScales[p] = Array.Empty<double>();
+                vScales[p] = Array.Empty<double>();
             }
             vMax[p] = optimizerType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL ? new float[lengths[p]] : Array.Empty<float>();
         }
@@ -1863,9 +2065,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // via these captured locals. CPU-only (the device gate rejects them for
         // GPU plans) and ungrouped (a per-group LR is meaningless for a globally
         // adapted step).
-        float hgAdj = 0f;                         // Hypergradient: accumulated lr adjustment (added to the per-step schedule base)
-        float dEst = extras.D0;                   // D-Adaptation: distance estimate
-        float dRAccum = 0f;                       // D-Adaptation: r accumulator
+        var scalarState = new FusedOptimizerRuntimeScalars
+        {
+            DAdaptationEstimate = extras.D0,
+        };
         float exHyperLr = extras.HyperLr;
         float exGrowth = extras.DGrowthRate;
 
@@ -1896,7 +2099,38 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 }
             };
         }
-        float sfWeightSum = 0f;
+        _optimizerRuntimeState = new FusedOptimizerRuntimeState
+        {
+            OptimizerType = optimizerType,
+            IsGrouped = false,
+            Schedules = new[] { schedule },
+            Beta1 = beta1,
+            Beta2 = beta2,
+            Epsilon = eps,
+            WeightDecay = weightDecay,
+            Extras = CloneFusedOptimizerExtras(extras),
+            MomentStorageMode = useBf16Moments ? FusedMomentStorageMode.BFloat16
+                : useInt8Moments ? FusedMomentStorageMode.Int8BlockQuantized
+                : FusedMomentStorageMode.Float32,
+            Int8MomentBlockSize = _int8MomentBlockSize,
+            Scalars = scalarState,
+            MFloat = m,
+            VFloat = v,
+            VMaxFloat = vMax,
+            MBFloat16 = mB,
+            VBFloat16 = vB,
+            MQuantized = mQuant,
+            VQuantized = vQuant,
+            MScales = mScales,
+            VScales = vScales,
+            GpuBackends = gpuBackends,
+            GpuM = gpuM,
+            GpuV = gpuV,
+            GpuVMax = gpuVMax,
+            GpuMScales = gpuMScales,
+            GpuVScales = gpuVScales,
+            GpuMomentStorage = gpuMomentStorage,
+        };
 
         _optimizerUpdate = () =>
         {
@@ -1923,8 +2157,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     fixed (float* pGrad = gradArrays[p], pPrev = m[p])
                         for (int i = 0; i < len2; i++) inner += (double)pGrad[i] * pPrev[i];
                 }
-                hgAdj += exHyperLr * (float)inner;
-                float newLr = lr + hgAdj;
+                scalarState.HypergradientAdjustment += exHyperLr * (float)inner;
+                float newLr = lr + scalarState.HypergradientAdjustment;
                 for (int p = 0; p < paramCount; p++)
                 {
                     if (gradArrays[p].Length == 0) continue;
@@ -1937,7 +2171,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (optType == OptimizerType.DAdaptationSGD)
             {
                 // Defazio & Mishchenko 2023 (growth-bounded, Prodigy). s, ‖s‖², r are GLOBAL.
-                float gamma = dEst * lr;
+                float gamma = scalarState.DAdaptationEstimate * lr;
                 double gNorm2 = 0, sNorm2 = 0;
                 for (int p = 0; p < paramCount; p++)
                 {
@@ -1951,10 +2185,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             sNorm2 += (double)pS[i] * pS[i];
                         }
                 }
-                dRAccum += gamma * gamma * (float)gNorm2;
-                float dHat = (float)(sNorm2 / (Math.Sqrt(dRAccum) + 1e-30));
-                float dCapped = float.IsPositiveInfinity(exGrowth) ? dHat : Math.Min(dHat, dEst * exGrowth);
-                float dNew = Math.Max(dEst, dCapped);
+                scalarState.DAdaptationRAccum += gamma * gamma * (float)gNorm2;
+                float dHat = (float)(sNorm2 / (Math.Sqrt(scalarState.DAdaptationRAccum) + 1e-30));
+                float dCapped = float.IsPositiveInfinity(exGrowth) ? dHat : Math.Min(dHat, scalarState.DAdaptationEstimate * exGrowth);
+                float dNew = Math.Max(scalarState.DAdaptationEstimate, dCapped);
                 float gammaNew = dNew * lr;
                 for (int p = 0; p < paramCount; p++)
                 {
@@ -1963,7 +2197,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     fixed (float* pParam = paramArrays[p], pGrad = gradArrays[p])
                         for (int i = 0; i < len2; i++) pParam[i] -= gammaNew * pGrad[i];
                 }
-                dEst = dNew;
+                scalarState.DAdaptationEstimate = dNew;
                 return;
             }
             if (optType == OptimizerType.ScheduleFreeSGD)
@@ -1975,17 +2209,17 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // weightSum is global (lr is shared across params each step), so
                 // every per-param call consumes the SAME weightSum and returns
                 // the SAME new value — capture it once.
-                float wsNext = sfWeightSum;
+                float wsNext = scalarState.ScheduleFreeWeightSum;
                 for (int p = 0; p < paramCount; p++)
                 {
                     if (gradArrays[p].Length == 0) continue;
                     int len2 = lengths[p];
                     fixed (float* pZ = m[p], pX = v[p], pGrad = gradArrays[p])
                         wsNext = FusedOptimizer.ScheduleFreeSgdUpdateSimd(
-                            pZ, pX, pGrad, len2, lr, sfWeightSum);
+                            pZ, pX, pGrad, len2, lr, scalarState.ScheduleFreeWeightSum);
                     Array.Copy(v[p], paramArrays[p], len2); // live backing ← x (eval copy)
                 }
-                sfWeightSum = wsNext;
+                scalarState.ScheduleFreeWeightSum = wsNext;
                 return;
             }
 
@@ -2050,17 +2284,81 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                 gpuBe.SgdUpdate(gpuP, gradBuf, lr, wd, len);
                                 break;
                             case OptimizerType.Adam:
-                                gpuBe.AdamUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
-                                    lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                if (gpuMomentStorage[p] == FusedMomentStorageMode.BFloat16)
+                                {
+                                    if (gpuBe is not Engines.DirectGpu.ICompressedMomentGpuOptimizerBackend compressedGpuBe)
+                                        throw new NotSupportedException(
+                                            $"BFloat16 fused optimizer moments are not implemented by GPU backend '{gpuBe.BackendName}'.");
+                                    compressedGpuBe.AdamUpdateBf16(
+                                        gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
+                                        lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                }
+                                else if (gpuMomentStorage[p] == FusedMomentStorageMode.Int8BlockQuantized)
+                                {
+                                    float bc1 = 1f - MathF.Pow(b1, _optimizerStep);
+                                    float bc2 = 1f - MathF.Pow(b2, _optimizerStep);
+                                    if (gpuBe is not Engines.DirectGpu.ICompressedMomentGpuOptimizerBackend compressedGpuBe)
+                                        throw new NotSupportedException(
+                                            $"Int8 block-quantized fused optimizer moments are not implemented by GPU backend '{gpuBe.BackendName}'.");
+                                    compressedGpuBe.Adam8BitUpdate(
+                                        gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuMScales[p]!, gpuVScales[p]!,
+                                        lr, b1, b2, epsVal, 1f - b1, 1f - b2, bc1, bc2,
+                                        _int8MomentBlockSize, len, Adam8BitBlockCount(len, _int8MomentBlockSize));
+                                }
+                                else
+                                {
+                                    gpuBe.AdamUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
+                                        lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                }
                                 break;
                             case OptimizerType.AdamW:
-                                gpuBe.AdamWUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
+                                if (gpuMomentStorage[p] == FusedMomentStorageMode.BFloat16)
+                                {
+                                    if (gpuBe is not Engines.DirectGpu.ICompressedMomentGpuOptimizerBackend compressedGpuBe)
+                                        throw new NotSupportedException(
+                                            $"BFloat16 fused optimizer moments are not implemented by GPU backend '{gpuBe.BackendName}'.");
+                                    compressedGpuBe.AdamWUpdateBf16(
+                                        gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
+                                        lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                }
+                                else
+                                {
+                                    gpuBe.AdamWUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
+                                        lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                }
+                                break;
+                            case OptimizerType.AMSGrad:
+                                gpuBe.AmsgradUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuVMax[p]!,
+                                    lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                break;
+                            case OptimizerType.Nadam:
+                                gpuBe.NadamUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
+                                    lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                break;
+                            case OptimizerType.RMSprop:
+                                gpuBe.RmspropUpdate(gpuP, gradBuf, gpuV[p]!,
+                                    lr, b2, epsVal, wd, len);
+                                break;
+                            case OptimizerType.Adagrad:
+                                gpuBe.AdagradUpdate(gpuP, gradBuf, gpuV[p]!,
+                                    lr, epsVal, wd, len);
+                                break;
+                            case OptimizerType.Lion:
+                                gpuBe.LionUpdate(gpuP, gradBuf, gpuM[p]!,
+                                    lr, b1, b2, wd, len);
+                                break;
+                            case OptimizerType.SGDMomentum:
+                                gpuBe.SgdMomentumUpdate(gpuP, gradBuf, gpuM[p]!,
+                                    lr, b1, wd, len);
+                                break;
+                            case OptimizerType.AdaMax:
+                                gpuBe.AdamaxUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
                                     lr, b1, b2, epsVal, wd, _optimizerStep, len);
                                 break;
                             default:
                                 throw new NotSupportedException(
                                     $"Optimizer type {optType} is not yet supported by ConfigureOptimizer on GPU. " +
-                                    $"Supported: SGD, Adam, AdamW.");
+                                    $"Supported: SGD, Adam, AdamW, AMSGrad, Nadam, RMSprop, Adagrad, Lion, SGDMomentum, AdaMax.");
                         }
                     }
                     finally
@@ -2106,18 +2404,24 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             // by the dedicated AdamWUpdateSimd kernel.)
                             if (wd != 0f)
                                 for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
-                            // #1745: bf16-moment variant when requested (mB/vB carry
-                            // the bfloat16 state; pM/pV are empty). Same fp32 math.
-                            if (useBf16)
+                            // Reduced moment variants keep params/grads fp32 while
+                            // storing m/v in the requested compact format.
+                            if (useBf16Moments)
                                 fixed (ushort* pMb = mB[p], pVb = vB[p])
                                     FusedOptimizer.AdamUpdateBf16Simd(pParam, pGrad, pMb, pVb, len,
+                                        lr, b1, b2, epsVal, _optimizerStep);
+                            else if (useInt8Moments)
+                                fixed (byte* pMq = mQuant[p], pVq = vQuant[p])
+                                fixed (double* pMs = mScales[p], pVs = vScales[p])
+                                    FusedOptimizer.AdamUpdateInt8BlockQuantized(
+                                        pParam, pGrad, pMq, pVq, pMs, pVs, len, _int8MomentBlockSize,
                                         lr, b1, b2, epsVal, _optimizerStep);
                             else
                                 FusedOptimizer.AdamUpdateSimd(pParam, pGrad, pM, pV, len,
                                     lr, b1, b2, epsVal, _optimizerStep);
                             break;
                         case OptimizerType.AdamW:
-                            if (useBf16)
+                            if (useBf16Moments)
                                 fixed (ushort* pMb = mB[p], pVb = vB[p])
                                     FusedOptimizer.AdamWUpdateBf16Simd(pParam, pGrad, pMb, pVb, len,
                                         lr, b1, b2, epsVal, wd, _optimizerStep);
@@ -2240,6 +2544,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
+        _optimizerRuntimeState = null;
         // Drop any captured step graph wired to the old optimizer state (see
         // ConfigureOptimizerFloat — replay would target freed/stale buffers).
         InvalidateCapturedStepGraph();
@@ -2255,6 +2560,19 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // and used only by the AMSGrad case; allocated per-param below only when
         // the optimizer is AMSGrad, else left as an empty array.
         var vMax = new float[paramCount][];
+        bool useBf16Moments = _momentStorageMode == FusedMomentStorageMode.BFloat16
+            && (optimizerType is OptimizerType.Adam or OptimizerType.AdamW);
+        bool useInt8Moments = _momentStorageMode == FusedMomentStorageMode.Int8BlockQuantized;
+        if (useInt8Moments && optimizerType != OptimizerType.Adam)
+            throw new NotSupportedException("Int8 block-quantized fused moments are supported only for Adam.");
+        if (useInt8Moments && weightDecay != 0f)
+            throw new NotSupportedException("Int8 block-quantized fused Adam moments do not support weight decay.");
+        var mB = new ushort[paramCount][];
+        var vB = new ushort[paramCount][];
+        var mQuant = new byte[paramCount][];
+        var vQuant = new byte[paramCount][];
+        var mScales = new double[paramCount][];
+        var vScales = new double[paramCount][];
         var paramGroup = new int[paramCount];
         // Snapshot schedule references — concrete types so closure can
         // see them without an extra interface dispatch per step.
@@ -2267,7 +2585,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var gpuGrad = new Engines.DirectGpu.IGpuBuffer?[paramCount];
         var gpuM = new Engines.DirectGpu.IGpuBuffer?[paramCount];
         var gpuV = new Engines.DirectGpu.IGpuBuffer?[paramCount];
+        var gpuVMax = new Engines.DirectGpu.IGpuBuffer?[paramCount];
+        var gpuMScales = new Engines.DirectGpu.IGpuBuffer?[paramCount];
+        var gpuVScales = new Engines.DirectGpu.IGpuBuffer?[paramCount];
         var gpuBackends = new Engines.DirectGpu.IDirectGpuBackend?[paramCount];
+        var gpuMomentStorage = new FusedMomentStorageMode[paramCount];
 
         // Issue #350: live-backing binding (see ConfigureOptimizerFloat).
         for (int p = 0; p < paramCount; p++)
@@ -2284,6 +2606,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 or OptimizerType.Adagrad
                 or OptimizerType.RAdam or OptimizerType.LAMB or OptimizerType.AdaMax
                 or OptimizerType.AdaDelta or OptimizerType.FTRL or OptimizerType.Rprop;
+            bool needsThirdState = optimizerType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL;
 
             // GPU fast path — same logic as ConfigureOptimizerFloat. See
             // there for the full rationale on per-param GPU/CPU dispatch.
@@ -2315,18 +2638,60 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 {
                     gradArrays[p] = Array.Empty<float>();
                 }
-                if (needsMomentum)
+                if (useBf16Moments)
                 {
-                    gpuM[p] = paramBackend.AllocateBuffer(lengths[p]);
+                    if (paramBackend is not Engines.DirectGpu.ICompressedMomentGpuOptimizerBackend)
+                        throw new NotSupportedException(
+                            $"BFloat16 fused optimizer moments are not implemented by GPU backend '{paramBackend.BackendName}'.");
+                    gpuM[p] = paramBackend.AllocateByteBuffer(lengths[p] * sizeof(ushort));
+                    gpuV[p] = paramBackend.AllocateByteBuffer(lengths[p] * sizeof(ushort));
                     _gpuOptimizerBuffers.Add(gpuM[p]!);
-                }
-                if (needsSecondMoment)
-                {
-                    gpuV[p] = paramBackend.AllocateBuffer(lengths[p]);
                     _gpuOptimizerBuffers.Add(gpuV[p]!);
+                    gpuMomentStorage[p] = FusedMomentStorageMode.BFloat16;
+                }
+                else if (useInt8Moments)
+                {
+                    if (paramBackend is not Engines.DirectGpu.ICompressedMomentGpuOptimizerBackend)
+                        throw new NotSupportedException(
+                            $"Int8 block-quantized fused optimizer moments are not implemented by GPU backend '{paramBackend.BackendName}'.");
+                    AllocateGpuAdam8BitState(paramBackend, lengths[p], _int8MomentBlockSize,
+                        out var gpuMQuant, out var gpuVQuant, out var gpuMScaleBuf, out var gpuVScaleBuf);
+                    gpuM[p] = gpuMQuant;
+                    gpuV[p] = gpuVQuant;
+                    gpuMScales[p] = gpuMScaleBuf;
+                    gpuVScales[p] = gpuVScaleBuf;
+                    _gpuOptimizerBuffers.Add(gpuM[p]!);
+                    _gpuOptimizerBuffers.Add(gpuV[p]!);
+                    _gpuOptimizerBuffers.Add(gpuMScales[p]!);
+                    _gpuOptimizerBuffers.Add(gpuVScales[p]!);
+                    gpuMomentStorage[p] = FusedMomentStorageMode.Int8BlockQuantized;
+                }
+                else
+                {
+                    if (needsMomentum)
+                    {
+                        gpuM[p] = paramBackend.AllocateBuffer(new float[lengths[p]]);
+                        _gpuOptimizerBuffers.Add(gpuM[p]!);
+                    }
+                    if (needsSecondMoment)
+                    {
+                        gpuV[p] = paramBackend.AllocateBuffer(new float[lengths[p]]);
+                        _gpuOptimizerBuffers.Add(gpuV[p]!);
+                    }
+                    if (needsThirdState)
+                    {
+                        gpuVMax[p] = paramBackend.AllocateBuffer(new float[lengths[p]]);
+                        _gpuOptimizerBuffers.Add(gpuVMax[p]!);
+                    }
                 }
                 m[p] = Array.Empty<float>();
                 v[p] = Array.Empty<float>();
+                mB[p] = Array.Empty<ushort>();
+                vB[p] = Array.Empty<ushort>();
+                mQuant[p] = Array.Empty<byte>();
+                vQuant[p] = Array.Empty<byte>();
+                mScales[p] = Array.Empty<double>();
+                vScales[p] = Array.Empty<double>();
                 paramArrays[p] = Array.Empty<float>();
                 continue;
             }
@@ -2353,8 +2718,41 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 gradArrays[p] = Array.Empty<float>();
             }
 
-            m[p] = needsMomentum ? new float[lengths[p]] : Array.Empty<float>();
-            v[p] = needsSecondMoment ? new float[lengths[p]] : Array.Empty<float>();
+            if (useBf16Moments)
+            {
+                m[p] = Array.Empty<float>();
+                v[p] = Array.Empty<float>();
+                mB[p] = new ushort[lengths[p]];
+                vB[p] = new ushort[lengths[p]];
+                mQuant[p] = Array.Empty<byte>();
+                vQuant[p] = Array.Empty<byte>();
+                mScales[p] = Array.Empty<double>();
+                vScales[p] = Array.Empty<double>();
+            }
+            else if (useInt8Moments)
+            {
+                m[p] = Array.Empty<float>();
+                v[p] = Array.Empty<float>();
+                mB[p] = Array.Empty<ushort>();
+                vB[p] = Array.Empty<ushort>();
+                mQuant[p] = new byte[lengths[p]];
+                vQuant[p] = new byte[lengths[p]];
+                int blockCount = Adam8BitBlockCount(lengths[p], _int8MomentBlockSize);
+                mScales[p] = new double[blockCount];
+                vScales[p] = new double[blockCount];
+                InitializeAdam8BitCpuState(mQuant[p], vQuant[p], mScales[p], vScales[p]);
+            }
+            else
+            {
+                m[p] = needsMomentum ? new float[lengths[p]] : Array.Empty<float>();
+                v[p] = needsSecondMoment ? new float[lengths[p]] : Array.Empty<float>();
+                mB[p] = Array.Empty<ushort>();
+                vB[p] = Array.Empty<ushort>();
+                mQuant[p] = Array.Empty<byte>();
+                vQuant[p] = Array.Empty<byte>();
+                mScales[p] = Array.Empty<double>();
+                vScales[p] = Array.Empty<double>();
+            }
             vMax[p] = optimizerType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL ? new float[lengths[p]] : Array.Empty<float>();
         }
 
@@ -2365,6 +2763,39 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var wd = weightDecay;
         var optType = optimizerType;
         var groupLrs = new float[groupCount];
+
+        _optimizerRuntimeState = new FusedOptimizerRuntimeState
+        {
+            OptimizerType = optimizerType,
+            IsGrouped = true,
+            Schedules = schedules,
+            ParamToGroup = paramGroup,
+            Beta1 = beta1,
+            Beta2 = beta2,
+            Epsilon = eps,
+            WeightDecay = weightDecay,
+            Extras = CloneFusedOptimizerExtras(extras),
+            MomentStorageMode = useBf16Moments ? FusedMomentStorageMode.BFloat16
+                : useInt8Moments ? FusedMomentStorageMode.Int8BlockQuantized
+                : FusedMomentStorageMode.Float32,
+            Int8MomentBlockSize = _int8MomentBlockSize,
+            MFloat = m,
+            VFloat = v,
+            VMaxFloat = vMax,
+            MBFloat16 = mB,
+            VBFloat16 = vB,
+            MQuantized = mQuant,
+            VQuantized = vQuant,
+            MScales = mScales,
+            VScales = vScales,
+            GpuBackends = gpuBackends,
+            GpuM = gpuM,
+            GpuV = gpuV,
+            GpuVMax = gpuVMax,
+            GpuMScales = gpuMScales,
+            GpuVScales = gpuVScales,
+            GpuMomentStorage = gpuMomentStorage,
+        };
 
         _optimizerUpdate = () =>
         {
@@ -2410,17 +2841,81 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                 gpuBe.SgdUpdate(gpuP, gradBuf, lr, wd, len);
                                 break;
                             case OptimizerType.Adam:
-                                gpuBe.AdamUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
-                                    lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                if (gpuMomentStorage[p] == FusedMomentStorageMode.BFloat16)
+                                {
+                                    if (gpuBe is not Engines.DirectGpu.ICompressedMomentGpuOptimizerBackend compressedGpuBe)
+                                        throw new NotSupportedException(
+                                            $"BFloat16 fused optimizer moments are not implemented by GPU backend '{gpuBe.BackendName}'.");
+                                    compressedGpuBe.AdamUpdateBf16(
+                                        gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
+                                        lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                }
+                                else if (gpuMomentStorage[p] == FusedMomentStorageMode.Int8BlockQuantized)
+                                {
+                                    float bc1 = 1f - MathF.Pow(b1, _optimizerStep);
+                                    float bc2 = 1f - MathF.Pow(b2, _optimizerStep);
+                                    if (gpuBe is not Engines.DirectGpu.ICompressedMomentGpuOptimizerBackend compressedGpuBe)
+                                        throw new NotSupportedException(
+                                            $"Int8 block-quantized fused optimizer moments are not implemented by GPU backend '{gpuBe.BackendName}'.");
+                                    compressedGpuBe.Adam8BitUpdate(
+                                        gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuMScales[p]!, gpuVScales[p]!,
+                                        lr, b1, b2, epsVal, 1f - b1, 1f - b2, bc1, bc2,
+                                        _int8MomentBlockSize, len, Adam8BitBlockCount(len, _int8MomentBlockSize));
+                                }
+                                else
+                                {
+                                    gpuBe.AdamUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
+                                        lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                }
                                 break;
                             case OptimizerType.AdamW:
-                                gpuBe.AdamWUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
+                                if (gpuMomentStorage[p] == FusedMomentStorageMode.BFloat16)
+                                {
+                                    if (gpuBe is not Engines.DirectGpu.ICompressedMomentGpuOptimizerBackend compressedGpuBe)
+                                        throw new NotSupportedException(
+                                            $"BFloat16 fused optimizer moments are not implemented by GPU backend '{gpuBe.BackendName}'.");
+                                    compressedGpuBe.AdamWUpdateBf16(
+                                        gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
+                                        lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                }
+                                else
+                                {
+                                    gpuBe.AdamWUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
+                                        lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                }
+                                break;
+                            case OptimizerType.AMSGrad:
+                                gpuBe.AmsgradUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuVMax[p]!,
+                                    lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                break;
+                            case OptimizerType.Nadam:
+                                gpuBe.NadamUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
+                                    lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                break;
+                            case OptimizerType.RMSprop:
+                                gpuBe.RmspropUpdate(gpuP, gradBuf, gpuV[p]!,
+                                    lr, b2, epsVal, wd, len);
+                                break;
+                            case OptimizerType.Adagrad:
+                                gpuBe.AdagradUpdate(gpuP, gradBuf, gpuV[p]!,
+                                    lr, epsVal, wd, len);
+                                break;
+                            case OptimizerType.Lion:
+                                gpuBe.LionUpdate(gpuP, gradBuf, gpuM[p]!,
+                                    lr, b1, b2, wd, len);
+                                break;
+                            case OptimizerType.SGDMomentum:
+                                gpuBe.SgdMomentumUpdate(gpuP, gradBuf, gpuM[p]!,
+                                    lr, b1, wd, len);
+                                break;
+                            case OptimizerType.AdaMax:
+                                gpuBe.AdamaxUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
                                     lr, b1, b2, epsVal, wd, _optimizerStep, len);
                                 break;
                             default:
                                 throw new NotSupportedException(
                                     $"Optimizer type {optType} is not yet supported by ConfigureOptimizerGrouped on GPU. " +
-                                    $"Supported: SGD, Adam, AdamW.");
+                                    $"Supported: SGD, Adam, AdamW, AMSGrad, Nadam, RMSprop, Adagrad, Lion, SGDMomentum, AdaMax.");
                         }
                     }
                     finally
@@ -2448,12 +2943,28 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         case OptimizerType.Adam:
                             if (wd != 0f)
                                 for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
-                            FusedOptimizer.AdamUpdateSimd(pParam, pGrad, pM, pV, len,
-                                lr, b1, b2, epsVal, _optimizerStep);
+                            if (useBf16Moments)
+                                fixed (ushort* pMb = mB[p], pVb = vB[p])
+                                    FusedOptimizer.AdamUpdateBf16Simd(pParam, pGrad, pMb, pVb, len,
+                                        lr, b1, b2, epsVal, _optimizerStep);
+                            else if (useInt8Moments)
+                                fixed (byte* pMq = mQuant[p], pVq = vQuant[p])
+                                fixed (double* pMs = mScales[p], pVs = vScales[p])
+                                    FusedOptimizer.AdamUpdateInt8BlockQuantized(
+                                        pParam, pGrad, pMq, pVq, pMs, pVs, len, _int8MomentBlockSize,
+                                        lr, b1, b2, epsVal, _optimizerStep);
+                            else
+                                FusedOptimizer.AdamUpdateSimd(pParam, pGrad, pM, pV, len,
+                                    lr, b1, b2, epsVal, _optimizerStep);
                             break;
                         case OptimizerType.AdamW:
-                            FusedOptimizer.AdamWUpdateSimd(pParam, pGrad, pM, pV, len,
-                                lr, b1, b2, epsVal, wd, _optimizerStep);
+                            if (useBf16Moments)
+                                fixed (ushort* pMb = mB[p], pVb = vB[p])
+                                    FusedOptimizer.AdamWUpdateBf16Simd(pParam, pGrad, pMb, pVb, len,
+                                        lr, b1, b2, epsVal, wd, _optimizerStep);
+                            else
+                                FusedOptimizer.AdamWUpdateSimd(pParam, pGrad, pM, pV, len,
+                                    lr, b1, b2, epsVal, wd, _optimizerStep);
                             break;
                         case OptimizerType.AMSGrad:
                             // AMSGrad (#74): Adam with a running max of v̂ so the
@@ -2551,6 +3062,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private unsafe void ConfigureOptimizerDouble(
         OptimizerType optimizerType, LrSchedule schedule, float beta1, float beta2, float eps, float weightDecay)
     {
+        foreach (var buf in _gpuOptimizerBuffers)
+            buf.Dispose();
+        _gpuOptimizerBuffers.Clear();
+        _optimizerRuntimeState = null;
+        _preForwardParamTransform = null;
+        InvalidateCapturedStepGraph();
+
         // Mirror of ConfigureOptimizerFloat for double parameters. PR #319
         // follow-up: tape-trained Tensor<double> models (e.g. ViT-Base in
         // the consumer integration test) can now hit the fused-compiled
@@ -2623,6 +3141,23 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var optType = optimizerType;
         var lrSchedule = schedule;
 
+        _optimizerRuntimeState = new FusedOptimizerRuntimeState
+        {
+            OptimizerType = optimizerType,
+            IsGrouped = false,
+            Schedules = new[] { schedule },
+            Beta1 = beta1,
+            Beta2 = beta2,
+            Epsilon = eps,
+            WeightDecay = weightDecay,
+            Extras = new FusedOptimizerExtras(),
+            MomentStorageMode = FusedMomentStorageMode.Float32,
+            Int8MomentBlockSize = _int8MomentBlockSize,
+            MDouble = m,
+            VDouble = v,
+            VMaxDouble = vMax,
+        };
+
         _optimizerUpdate = () =>
         {
             _optimizerStep++;
@@ -2676,6 +3211,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         System.Collections.Generic.IReadOnlyList<int> paramToGroup,
         float beta1, float beta2, float eps, float weightDecay)
     {
+        foreach (var buf in _gpuOptimizerBuffers)
+            buf.Dispose();
+        _gpuOptimizerBuffers.Clear();
+        _optimizerRuntimeState = null;
+        _preForwardParamTransform = null;
+        InvalidateCapturedStepGraph();
+
         int paramCount = _parameters.Length;
         int groupCount = groupSchedules.Count;
         var paramArrays = new double[paramCount][];
@@ -2742,6 +3284,24 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var optType = optimizerType;
         var groupLrs = new double[groupCount];
 
+        _optimizerRuntimeState = new FusedOptimizerRuntimeState
+        {
+            OptimizerType = optimizerType,
+            IsGrouped = true,
+            Schedules = schedules,
+            ParamToGroup = paramGroup,
+            Beta1 = beta1,
+            Beta2 = beta2,
+            Epsilon = eps,
+            WeightDecay = weightDecay,
+            Extras = new FusedOptimizerExtras(),
+            MomentStorageMode = FusedMomentStorageMode.Float32,
+            Int8MomentBlockSize = _int8MomentBlockSize,
+            MDouble = m,
+            VDouble = v,
+            VMaxDouble = vMax,
+        };
+
         _optimizerUpdate = () =>
         {
             _optimizerStep++;
@@ -2791,6 +3351,366 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 }
             }
         };
+    }
+
+    internal FusedOptimizerCheckpoint? CaptureFusedOptimizerCheckpoint()
+    {
+        if (_optimizerUpdate is null || _optimizerRuntimeState is null)
+            return null;
+
+        var rt = _optimizerRuntimeState;
+        var schedules = new FusedLrScheduleCheckpoint[rt.Schedules.Length];
+        for (int i = 0; i < rt.Schedules.Length; i++)
+        {
+            schedules[i] = rt.Schedules[i].TryCaptureCheckpoint()
+                ?? throw new NotSupportedException(
+                    $"Cannot serialize compiled optimizer state because LR schedule '{rt.Schedules[i].GetType().FullName}' " +
+                    "does not provide a checkpoint representation. Use one of the built-in LrSchedule factories.");
+        }
+
+        var checkpoint = new FusedOptimizerCheckpoint
+        {
+            OptimizerType = rt.OptimizerType,
+            IsGrouped = rt.IsGrouped,
+            OptimizerStep = _optimizerStep,
+            Beta1 = rt.Beta1,
+            Beta2 = rt.Beta2,
+            Epsilon = rt.Epsilon,
+            WeightDecay = rt.WeightDecay,
+            MomentStorageMode = rt.MomentStorageMode,
+            Int8MomentBlockSize = rt.Int8MomentBlockSize,
+            MaxGradNorm = _maxGradNorm,
+            Extras = CloneFusedOptimizerExtras(rt.Extras),
+            Schedules = schedules,
+            ParamToGroup = rt.ParamToGroup is null ? null : (int[])rt.ParamToGroup.Clone(),
+            Scalars = new FusedOptimizerScalarCheckpoint
+            {
+                HypergradientAdjustment = rt.Scalars.HypergradientAdjustment,
+                DAdaptationEstimate = rt.Scalars.DAdaptationEstimate,
+                DAdaptationRAccum = rt.Scalars.DAdaptationRAccum,
+                ScheduleFreeWeightSum = rt.Scalars.ScheduleFreeWeightSum,
+            },
+            Parameters = new FusedOptimizerParameterCheckpoint[_parameters.Length],
+        };
+
+        for (int p = 0; p < checkpoint.Parameters.Length; p++)
+            checkpoint.Parameters[p] = CaptureOptimizerParameterState(rt, p);
+        return checkpoint;
+    }
+
+    internal void RestoreFusedOptimizerCheckpoint(FusedOptimizerCheckpoint checkpoint)
+    {
+        if (checkpoint is null) throw new ArgumentNullException(nameof(checkpoint));
+        if (checkpoint.Parameters.Length != _parameters.Length)
+            throw new InvalidDataException(
+                $"Optimizer checkpoint has {checkpoint.Parameters.Length} parameter states but plan has {_parameters.Length} parameters.");
+
+        _momentStorageMode = checkpoint.MomentStorageMode;
+        _int8MomentBlockSize = checkpoint.Int8MomentBlockSize;
+        _maxGradNorm = checkpoint.MaxGradNorm;
+
+        var schedules = new LrSchedule[checkpoint.Schedules.Length];
+        for (int i = 0; i < schedules.Length; i++)
+            schedules[i] = checkpoint.Schedules[i].ToSchedule();
+
+        if (checkpoint.IsGrouped)
+        {
+            if (checkpoint.ParamToGroup is null)
+                throw new InvalidDataException("Grouped optimizer checkpoint is missing ParamToGroup.");
+            ConfigureOptimizerGrouped(
+                checkpoint.OptimizerType,
+                schedules,
+                checkpoint.ParamToGroup,
+                checkpoint.Beta1,
+                checkpoint.Beta2,
+                checkpoint.Epsilon,
+                checkpoint.WeightDecay,
+                checkpoint.Extras);
+        }
+        else
+        {
+            if (schedules.Length != 1)
+                throw new InvalidDataException(
+                    $"Ungrouped optimizer checkpoint must contain exactly one LR schedule, got {schedules.Length}.");
+            ConfigureOptimizer(
+                checkpoint.OptimizerType,
+                schedules[0],
+                checkpoint.Beta1,
+                checkpoint.Beta2,
+                checkpoint.Epsilon,
+                checkpoint.WeightDecay,
+                checkpoint.Extras);
+        }
+
+        if (_optimizerRuntimeState is null)
+            throw new InvalidDataException("Loaded optimizer checkpoint could not reconfigure the compiled optimizer.");
+
+        var rt = _optimizerRuntimeState;
+        _optimizerStep = checkpoint.OptimizerStep;
+        rt.Scalars.HypergradientAdjustment = checkpoint.Scalars.HypergradientAdjustment;
+        rt.Scalars.DAdaptationEstimate = checkpoint.Scalars.DAdaptationEstimate;
+        rt.Scalars.DAdaptationRAccum = checkpoint.Scalars.DAdaptationRAccum;
+        rt.Scalars.ScheduleFreeWeightSum = checkpoint.Scalars.ScheduleFreeWeightSum;
+
+        for (int p = 0; p < checkpoint.Parameters.Length; p++)
+            RestoreOptimizerParameterState(rt, p, checkpoint.Parameters[p]);
+    }
+
+    private FusedOptimizerParameterCheckpoint CaptureOptimizerParameterState(FusedOptimizerRuntimeState rt, int p)
+    {
+        var state = new FusedOptimizerParameterCheckpoint
+        {
+            MFloat = CopyNonEmpty(rt.MFloat, p),
+            VFloat = CopyNonEmpty(rt.VFloat, p),
+            VMaxFloat = CopyNonEmpty(rt.VMaxFloat, p),
+            MDouble = CopyNonEmpty(rt.MDouble, p),
+            VDouble = CopyNonEmpty(rt.VDouble, p),
+            VMaxDouble = CopyNonEmpty(rt.VMaxDouble, p),
+            MBFloat16 = CopyNonEmpty(rt.MBFloat16, p),
+            VBFloat16 = CopyNonEmpty(rt.VBFloat16, p),
+            MQuantized = CopyNonEmpty(rt.MQuantized, p),
+            VQuantized = CopyNonEmpty(rt.VQuantized, p),
+            MScales = CopyNonEmpty(rt.MScales, p),
+            VScales = CopyNonEmpty(rt.VScales, p),
+        };
+
+        if (rt.GpuBackends is not null && rt.GpuBackends[p] is { } backend)
+        {
+            var gpuMode = rt.GpuMomentStorage?[p] ?? FusedMomentStorageMode.Float32;
+            int parameterLength = _parameters[p].Length;
+            switch (gpuMode)
+            {
+                case FusedMomentStorageMode.BFloat16:
+                    if (rt.GpuM?[p] is { } gpuMBf16)
+                        state.MBFloat16 = BytesToUShortArray(
+                            backend.DownloadByteBuffer(gpuMBf16, checked(parameterLength * sizeof(ushort))),
+                            parameterLength);
+                    if (rt.GpuV?[p] is { } gpuVBf16)
+                        state.VBFloat16 = BytesToUShortArray(
+                            backend.DownloadByteBuffer(gpuVBf16, checked(parameterLength * sizeof(ushort))),
+                            parameterLength);
+                    break;
+
+                case FusedMomentStorageMode.Int8BlockQuantized:
+                    if (rt.GpuM?[p] is { } gpuMQuant)
+                        state.MQuantized = backend.DownloadByteBuffer(gpuMQuant, parameterLength);
+                    if (rt.GpuV?[p] is { } gpuVQuant)
+                        state.VQuantized = backend.DownloadByteBuffer(gpuVQuant, parameterLength);
+                    if (rt.GpuMScales?[p] is { } gpuMScale)
+                        state.MScales = ToDoubleArray(backend.DownloadBuffer(gpuMScale));
+                    if (rt.GpuVScales?[p] is { } gpuVScale)
+                        state.VScales = ToDoubleArray(backend.DownloadBuffer(gpuVScale));
+                    break;
+
+                default:
+                    if (rt.GpuM?[p] is { } gpuM)
+                        state.MFloat = backend.DownloadBuffer(gpuM);
+                    if (rt.GpuV?[p] is { } gpuV)
+                        state.VFloat = backend.DownloadBuffer(gpuV);
+                    if (rt.GpuVMax?[p] is { } gpuVMax)
+                        state.VMaxFloat = backend.DownloadBuffer(gpuVMax);
+                    break;
+            }
+        }
+
+        return state;
+    }
+
+    private void RestoreOptimizerParameterState(
+        FusedOptimizerRuntimeState rt,
+        int p,
+        FusedOptimizerParameterCheckpoint state)
+    {
+        if (rt.GpuBackends is not null && rt.GpuBackends[p] is { } backend)
+        {
+            var gpuMode = rt.GpuMomentStorage?[p] ?? FusedMomentStorageMode.Float32;
+            switch (gpuMode)
+            {
+                case FusedMomentStorageMode.BFloat16:
+                    if (state.MBFloat16 is not null)
+                        ReplaceGpuByteStateBuffer(rt.GpuM!, p, backend, UShortArrayToBytes(state.MBFloat16));
+                    if (state.VBFloat16 is not null)
+                        ReplaceGpuByteStateBuffer(rt.GpuV!, p, backend, UShortArrayToBytes(state.VBFloat16));
+                    break;
+
+                case FusedMomentStorageMode.Int8BlockQuantized:
+                    if (state.MQuantized is not null)
+                        ReplaceGpuByteStateBuffer(rt.GpuM!, p, backend, state.MQuantized);
+                    if (state.VQuantized is not null)
+                        ReplaceGpuByteStateBuffer(rt.GpuV!, p, backend, state.VQuantized);
+                    if (state.MScales is not null)
+                        ReplaceGpuFloatStateBuffer(rt.GpuMScales!, p, backend, ToFloatArray(state.MScales));
+                    if (state.VScales is not null)
+                        ReplaceGpuFloatStateBuffer(rt.GpuVScales!, p, backend, ToFloatArray(state.VScales));
+                    break;
+
+                default:
+                    if (state.MFloat is not null)
+                        ReplaceGpuFloatStateBuffer(rt.GpuM!, p, backend, state.MFloat);
+                    if (state.VFloat is not null)
+                        ReplaceGpuFloatStateBuffer(rt.GpuV!, p, backend, state.VFloat);
+                    if (state.VMaxFloat is not null)
+                        ReplaceGpuFloatStateBuffer(rt.GpuVMax!, p, backend, state.VMaxFloat);
+                    break;
+            }
+            return;
+        }
+
+        CopyInto(rt.MFloat, p, state.MFloat);
+        CopyInto(rt.VFloat, p, state.VFloat);
+        CopyInto(rt.VMaxFloat, p, state.VMaxFloat);
+        CopyInto(rt.MDouble, p, state.MDouble);
+        CopyInto(rt.VDouble, p, state.VDouble);
+        CopyInto(rt.VMaxDouble, p, state.VMaxDouble);
+        CopyInto(rt.MBFloat16, p, state.MBFloat16);
+        CopyInto(rt.VBFloat16, p, state.VBFloat16);
+        CopyInto(rt.MQuantized, p, state.MQuantized);
+        CopyInto(rt.VQuantized, p, state.VQuantized);
+        CopyInto(rt.MScales, p, state.MScales);
+        CopyInto(rt.VScales, p, state.VScales);
+    }
+
+    private void ReplaceGpuFloatStateBuffer(
+        Engines.DirectGpu.IGpuBuffer?[] buffers,
+        int index,
+        Engines.DirectGpu.IDirectGpuBackend backend,
+        float[] data)
+    {
+        var old = buffers[index];
+        if (old is not null)
+        {
+            _gpuOptimizerBuffers.Remove(old);
+            old.Dispose();
+        }
+        var replacement = backend.AllocateBuffer(data);
+        buffers[index] = replacement;
+        _gpuOptimizerBuffers.Add(replacement);
+    }
+
+    private void ReplaceGpuByteStateBuffer(
+        Engines.DirectGpu.IGpuBuffer?[] buffers,
+        int index,
+        Engines.DirectGpu.IDirectGpuBackend backend,
+        byte[] data)
+    {
+        var old = buffers[index];
+        if (old is not null)
+        {
+            _gpuOptimizerBuffers.Remove(old);
+            old.Dispose();
+        }
+        var replacement = backend.AllocateByteBuffer(data.Length);
+        backend.UploadByteBuffer(replacement, data);
+        buffers[index] = replacement;
+        _gpuOptimizerBuffers.Add(replacement);
+    }
+
+    private static byte[] UShortArrayToBytes(ushort[] values)
+    {
+        var bytes = new byte[checked(values.Length * sizeof(ushort))];
+        Buffer.BlockCopy(values, 0, bytes, 0, bytes.Length);
+        return bytes;
+    }
+
+    private static ushort[] BytesToUShortArray(byte[] bytes, int expectedElementCount)
+    {
+        int expectedByteCount = checked(expectedElementCount * sizeof(ushort));
+        if (bytes.Length != expectedByteCount)
+            throw new InvalidDataException(
+                $"Optimizer checkpoint bf16 byte length mismatch: checkpoint={bytes.Length}, expected={expectedByteCount}.");
+
+        var values = new ushort[expectedElementCount];
+        Buffer.BlockCopy(bytes, 0, values, 0, bytes.Length);
+        return values;
+    }
+
+    private static double[] ToDoubleArray(float[] values)
+    {
+        var result = new double[values.Length];
+        for (int i = 0; i < values.Length; i++) result[i] = values[i];
+        return result;
+    }
+
+    private static float[] ToFloatArray(double[] values)
+    {
+        var result = new float[values.Length];
+        for (int i = 0; i < values.Length; i++) result[i] = (float)values[i];
+        return result;
+    }
+
+    private static FusedOptimizerExtras CloneFusedOptimizerExtras(FusedOptimizerExtras extras)
+        => new FusedOptimizerExtras
+        {
+            Momentum = extras.Momentum,
+            TrustCoefficient = extras.TrustCoefficient,
+            L1 = extras.L1,
+            L2 = extras.L2,
+            LrPower = extras.LrPower,
+            Lambd = extras.Lambd,
+            Alpha = extras.Alpha,
+            T0 = extras.T0,
+            RpropEtaPlus = extras.RpropEtaPlus,
+            RpropEtaMinus = extras.RpropEtaMinus,
+            RpropStepMin = extras.RpropStepMin,
+            RpropStepMax = extras.RpropStepMax,
+            RpropInitialStep = extras.RpropInitialStep,
+            HyperLr = extras.HyperLr,
+            D0 = extras.D0,
+            DGrowthRate = extras.DGrowthRate,
+            SfBeta = extras.SfBeta,
+        };
+
+    private static float[]? CopyNonEmpty(float[][]? arrays, int index)
+        => arrays is not null && arrays[index].Length != 0 ? (float[])arrays[index].Clone() : null;
+
+    private static double[]? CopyNonEmpty(double[][]? arrays, int index)
+        => arrays is not null && arrays[index].Length != 0 ? (double[])arrays[index].Clone() : null;
+
+    private static ushort[]? CopyNonEmpty(ushort[][]? arrays, int index)
+        => arrays is not null && arrays[index].Length != 0 ? (ushort[])arrays[index].Clone() : null;
+
+    private static byte[]? CopyNonEmpty(byte[][]? arrays, int index)
+        => arrays is not null && arrays[index].Length != 0 ? (byte[])arrays[index].Clone() : null;
+
+    private static void CopyInto(float[][]? destination, int index, float[]? source)
+    {
+        if (source is null) return;
+        if (destination is null)
+            throw new InvalidDataException($"Optimizer checkpoint has unexpected float state for parameter {index}.");
+        CopyInto(destination[index], source, index, "float");
+    }
+
+    private static void CopyInto(double[][]? destination, int index, double[]? source)
+    {
+        if (source is null) return;
+        if (destination is null)
+            throw new InvalidDataException($"Optimizer checkpoint has unexpected double state for parameter {index}.");
+        CopyInto(destination[index], source, index, "double");
+    }
+
+    private static void CopyInto(ushort[][]? destination, int index, ushort[]? source)
+    {
+        if (source is null) return;
+        if (destination is null)
+            throw new InvalidDataException($"Optimizer checkpoint has unexpected bf16 state for parameter {index}.");
+        CopyInto(destination[index], source, index, "ushort");
+    }
+
+    private static void CopyInto(byte[][]? destination, int index, byte[]? source)
+    {
+        if (source is null) return;
+        if (destination is null)
+            throw new InvalidDataException($"Optimizer checkpoint has unexpected byte state for parameter {index}.");
+        CopyInto(destination[index], source, index, "byte");
+    }
+
+    private static void CopyInto<TValue>(TValue[] destination, TValue[] source, int index, string stateName)
+    {
+        if (destination.Length != source.Length)
+            throw new InvalidDataException(
+                $"Optimizer checkpoint {stateName} state length mismatch for parameter {index}: " +
+                $"checkpoint={source.Length}, plan={destination.Length}.");
+        Array.Copy(source, destination, source.Length);
     }
 
     /// <inheritdoc/>
