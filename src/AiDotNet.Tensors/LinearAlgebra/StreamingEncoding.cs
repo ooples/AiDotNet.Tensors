@@ -30,8 +30,10 @@ internal static class StreamingEncoding
     /// <summary>int8: PER-ROW symmetric quantisation — [int32 rows][rows × fp32
     /// scale][1 byte/element]. One scale per output channel preserves far more SNR
     /// than a single per-tensor scale on varied-magnitude rows, and the layout feeds
-    /// the int8 weight-only GEMM directly (no upcast). Lossier than bf16; explicit
-    /// opt-in only — <c>StreamingStoreDtype.Auto</c> never picks int8.</summary>
+    /// the int8 weight-only GEMM directly (no upcast). Lossier than bf16, so it is
+    /// only chosen automatically by RAM-aware <c>StreamingStoreDtype.Auto</c> in
+    /// INFERENCE when bf16 would overflow the resident cap (never in training —
+    /// quantized write-back is native-only); otherwise explicit opt-in.</summary>
     internal const byte Int8 = 2;
 
     /// <summary>Lossless: SIMD byte-plane shuffle + Deflate (variable size). Exact
@@ -42,7 +44,9 @@ internal static class StreamingEncoding
     /// <summary>int4: AWQ/GPTQ-style GROUP-symmetric quantization — [int32 count][int32
     /// groupSize][numGroups × fp32 scale][ceil(count/2) packed nibbles]. 8x compression at
     /// 4 bits/weight; one scale per contiguous group bounds the int4 RMSE. Feeds the no-upcast
-    /// int4 weight-only GEMM directly. Lossier than int8; explicit opt-in only —
-    /// <c>StreamingStoreDtype.Auto</c> never picks int4.</summary>
+    /// int4 weight-only GEMM directly. Lossier than int8, so it is only chosen
+    /// automatically by RAM-aware <c>StreamingStoreDtype.Auto</c> in INFERENCE as the
+    /// last rung when even int8 would overflow the resident cap (never in training);
+    /// otherwise explicit opt-in.</summary>
     internal const byte Int4 = 4;
 }

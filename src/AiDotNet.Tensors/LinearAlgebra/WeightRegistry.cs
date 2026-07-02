@@ -192,7 +192,7 @@ public static class WeightRegistry
                         // registered byte[] and everything downstream (resident set,
                         // eviction, disk) for free — the pool is byte-agnostic; only the
                         // restore boundary widens bf16 → T (RestoreStorageFromBytes).
-                        var (encoding, stochastic) = ResolveStoreEncoding<T>();
+                        var (encoding, stochastic) = ResolveStoreEncoding(weight);
                         byte[] bytes;
                         if (encoding == StreamingEncoding.Lossless)
                         {
@@ -753,12 +753,22 @@ public static class WeightRegistry
     }
 
     /// <summary>
-    /// Resolves the streaming-store encoding (1 = bf16, 0 = native) and rounding
-    /// (stochastic) for type T from <see cref="GpuOffloadOptions.StreamingStoreDtype"/>
-    /// and the execution-mode hint. Only float/double can be bf16-encoded; all other
-    /// types always store native. Caller holds <see cref="_lock"/>.
+    /// The minimum element count for <see cref="StreamingStoreDtype.Auto"/> to step a weight
+    /// BELOW bf16 (to int8/int4) in the RAM-aware inference path. Small weights — 1-D biases,
+    /// LayerNorm/RMSNorm gains, tiny projections — are both precision-sensitive AND a negligible
+    /// share of the footprint, so quantizing them costs accuracy for ~no memory. Mirrors
+    /// production weight-only quant (bitsandbytes/AWQ quantize the big Linear/conv weights and
+    /// keep norms + biases in higher precision). Weights below this always stay bf16 in inference.
     /// </summary>
-    private static (byte encoding, bool stochastic) ResolveStoreEncoding<T>()
+    private const int MinAutoQuantElements = 1 << 14; // 16,384 elements (64 KiB fp32)
+
+    /// <summary>
+    /// Resolves the streaming-store encoding (see <see cref="StreamingEncoding"/>) and rounding
+    /// (stochastic) for <paramref name="weight"/> from <see cref="GpuOffloadOptions.StreamingStoreDtype"/>
+    /// and the execution-mode hint. Only float/double can be narrowed; all other types always store
+    /// native. Caller holds <see cref="_lock"/>.
+    /// </summary>
+    private static (byte encoding, bool stochastic) ResolveStoreEncoding<T>(Tensor<T> weight)
     {
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return (StreamingEncoding.Native, false);
         switch (_options.StreamingStoreDtype)
@@ -766,28 +776,59 @@ public static class WeightRegistry
             case StreamingStoreDtype.FullPrecision: return (StreamingEncoding.Native, false);
             case StreamingStoreDtype.Bf16: return (StreamingEncoding.Bf16, false);
             case StreamingStoreDtype.Bf16Stochastic: return (StreamingEncoding.Bf16, true);
-            case StreamingStoreDtype.Int8: return (StreamingEncoding.Int8, false); // explicit opt-in (Auto never picks int8)
-            case StreamingStoreDtype.Int4: return (StreamingEncoding.Int4, false); // explicit opt-in (Auto never picks int4)
+            case StreamingStoreDtype.Int8: return (StreamingEncoding.Int8, false); // explicit opt-in
+            case StreamingStoreDtype.Int4: return (StreamingEncoding.Int4, false); // explicit opt-in
             case StreamingStoreDtype.Lossless: return (StreamingEncoding.Lossless, false); // exact, variable-size; explicit opt-in
             case StreamingStoreDtype.Auto:
             default:
                 // Compress by DEFAULT whenever the execution mode is known — every model that
-                // goes through SetTrainingMode is — always picking the max-safe option:
-                //   • inference → bf16: 2x (4x for fp64) at ~0.17% RMS, a safe one-time
-                //     quantization of read-only weights.
+                // goes through SetTrainingMode is:
                 //   • training → LOSSLESS (byte-shuffle + Deflate): bit-exact, so the fp32/fp64
                 //     masters are preserved EXACTLY (no convergence risk) while still reclaiming
-                //     ~1.18x of disk + resident bytes. Never silently lossy.
-                //   • unknown (no declared mode — raw registry use) → full precision: don't
-                //     guess; keep the bytes exact and the layout fixed-size.
-                // (int8 is too lossy to ever be an automatic choice — explicit opt-in only.)
+                //     ~1.18x. The quantized tiers are NEVER chosen here: their eviction write-back
+                //     is native-only (TryWriteBackResidentForStreaming), so a mutated quantized
+                //     weight would silently lose its update. Inference weights are read-only, so
+                //     the quantized tiers below are safe only in that mode.
+                //   • inference → RAM-aware (ResolveAutoInferenceEncoding): bf16 by default, but
+                //     stepping down to int8/int4 for the large weights when — and only when —
+                //     the model's footprint would otherwise exceed the resident cap.
+                //   • unknown (no declared mode — raw registry use) → full precision: don't guess.
                 return _streamingTrainingMode switch
                 {
-                    false => (StreamingEncoding.Bf16, false),     // inference → bf16
-                    true => (StreamingEncoding.Lossless, false),  // training → lossless
-                    _ => (StreamingEncoding.Native, false),       // unknown → full precision
+                    false => (ResolveAutoInferenceEncoding(weight), false), // inference → RAM-aware
+                    true => (StreamingEncoding.Lossless, false),            // training → lossless
+                    _ => (StreamingEncoding.Native, false),                 // unknown → full precision
                 };
         }
+    }
+
+    /// <summary>
+    /// RAM-aware <see cref="StreamingStoreDtype.Auto"/> encoding for a read-only inference weight:
+    /// the HIGHEST-fidelity store precision whose whole-model resident footprint still fits the
+    /// pool's resident cap. bf16 (÷2) unless the model is too large for bf16 to fit, in which case
+    /// the large weights step to int8 (÷4) or int4 (÷8) — enough to bring the resident set under
+    /// the cap so an otherwise-too-large model runs on a constrained box. Small / 1-D weights
+    /// (biases, norms) always stay bf16 (<see cref="MinAutoQuantElements"/>): they are
+    /// precision-sensitive and a negligible share of the footprint. With no footprint hint the
+    /// behaviour is unchanged (bf16).
+    /// </summary>
+    private static byte ResolveAutoInferenceEncoding<T>(Tensor<T> weight)
+    {
+        long footprint = _options.ExpectedStreamingFootprintBytes;
+        long cap = _options.StreamingPoolMaxResidentBytes;
+        // No footprint hint, or bf16 already fits, or a degenerate cap → keep bf16 (best fidelity,
+        // unchanged default). footprint/2 is the whole-model resident cost at bf16.
+        if (footprint <= 0 || cap <= 0 || footprint / 2 <= cap) return StreamingEncoding.Bf16;
+
+        // bf16 does NOT fit — the large weights must step down. Keep small / 1-D weights at bf16:
+        // they barely move the footprint and int8/int4 hurts their precision the most.
+        if (weight.Length < MinAutoQuantElements || weight.Rank < 2) return StreamingEncoding.Bf16;
+
+        // Pick the coarsest tier only as needed: int8 (÷4) if it fits, else int4 (÷8). int4 is the
+        // most aggressive rung — if even it doesn't fit, still use it (best effort; the resident cap
+        // then bounds the set by paging, which int4 minimizes the IO of).
+        if (footprint / 4 <= cap) return StreamingEncoding.Int8;
+        return StreamingEncoding.Int4;
     }
 
     /// <summary>bf16 byte count (2 per element) with the same int.MaxValue overflow
