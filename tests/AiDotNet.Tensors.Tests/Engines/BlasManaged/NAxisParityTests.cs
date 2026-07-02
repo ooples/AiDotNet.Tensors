@@ -34,17 +34,14 @@ public class NAxisParityTests
     [InlineData(768, 4096, 512)]   // larger mr-aligned M, wide N
     public void NAxis_BitIdentical_ToMAxis(int m, int n, int k)
     {
-        // The N-axis private-B path requires the FP32 6x16 machine-code panel kernel and the
-        // matching PackBoth tile. AVX-512 hosts intentionally pick the 16x16 FP32 tile instead;
-        // forcing N-axis there would reinterpret packed-A with the wrong row stride.
+        // The N-axis private-B path requires the FP32 6x16 machine-code panel kernel.
+        // Exercise PackBothStrategy directly with the matching tile so this route-coverage
+        // test is independent of the host's top-level BlasManaged tile heuristic.
         Skip.IfNot(MachineKernelGemm.IsFp32PanelAvailable,
             "FP32 machine-code panel kernel unavailable — N-axis path cannot run on this platform.");
-        Skip.If(Avx512Fp32_16x16.IsSupported,
-            "AVX-512 FP32 PackBoth tile is active; the 6x16 N-axis panel path must not run on this platform.");
 
         var prior = CpuParallelSettings.MaxDegreeOfParallelism;
         var priorDisable = PB.s_disableNAxis;
-        var priorDisableGoto = BlasMgd.s_disableGotoGemm;
         var priorMachineKernel = MachineKernelGemm.Enabled;
         var priorPanelKernel = MachineKernelGemm.EnablePanelKernel;
         var priorDeterministic = BlasProvider.IsDeterministicMode;
@@ -62,23 +59,22 @@ public class NAxisParityTests
             BlasProvider.SetThreadLocalDeterministicMode(null);
             BlasProvider.SetDeterministicMode(false);
 
-            var opts = new BlasOptions<float> { PackingMode = PackingMode.ForcePackBoth, NumThreads = 4 };
+            var opts = new BlasOptions<float> { NumThreads = 4 };
+            const int kc = 256;
+            int mr = MachineKernelGemm.Fp32Mr;
+            int nr = MachineKernelGemm.Fp32Nr;
 
-            // This test verifies the PackBoth N-axis vs M-axis paths; the GotoGemm fast path would
-            // intercept these large float shapes before either runs, so disable it for the duration.
-            BlasMgd.s_disableGotoGemm = true;
             PB.s_disableNAxis = true;
-            BlasMgd.Gemm<float>(a, k, false, b, n, false, cM, n, m, n, k, opts);
+            PB.Run<float>(a, k, false, b, n, false, cM, n, m, n, k, m, n, kc, mr, nr, opts);
 
             PB.s_disableNAxis = false;
             long before = System.Threading.Interlocked.Read(ref PB.s_nAxisRunCount);
-            BlasMgd.Gemm<float>(a, k, false, b, n, false, cN, n, m, n, k, opts);
+            PB.Run<float>(a, k, false, b, n, false, cN, n, m, n, k, m, n, kc, mr, nr, opts);
             nAxisRunsForThisCase = System.Threading.Interlocked.Read(ref PB.s_nAxisRunCount) - before;
         }
         finally
         {
             PB.s_disableNAxis = priorDisable;
-            BlasMgd.s_disableGotoGemm = priorDisableGoto;
             MachineKernelGemm.Enabled = priorMachineKernel;
             MachineKernelGemm.EnablePanelKernel = priorPanelKernel;
             BlasProvider.SetDeterministicMode(priorDeterministic);
