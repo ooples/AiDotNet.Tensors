@@ -120,6 +120,7 @@ public sealed partial class MetalBackend
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
         ThrowIfDisposed();
+        CompressedMomentHostFallback.WarnHostFallbackOnce("Metal");
 
         var paramData = DownloadBuffer(param);
         var gradData = DownloadBuffer(gradient);
@@ -140,6 +141,7 @@ public sealed partial class MetalBackend
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
         ThrowIfDisposed();
+        CompressedMomentHostFallback.WarnHostFallbackOnce("Metal");
 
         var paramData = DownloadBuffer(param);
         var gradData = DownloadBuffer(gradient);
@@ -163,6 +165,7 @@ public sealed partial class MetalBackend
         int blockSize, int paramLength, int numBlocks)
     {
         ThrowIfDisposed();
+        CompressedMomentHostFallback.WarnHostFallbackOnce("Metal");
 
         var paramData = DownloadBuffer(param);
         var gradData = DownloadBuffer(gradient);

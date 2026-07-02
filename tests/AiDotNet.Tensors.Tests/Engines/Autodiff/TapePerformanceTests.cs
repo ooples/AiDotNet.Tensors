@@ -4,6 +4,7 @@ using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
+using AiDotNet.Tensors.Tests.TestHelpers;
 using Xunit.Abstractions;
 
 namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
@@ -16,8 +17,6 @@ public class TapePerformanceTests
 {
     private readonly ITestOutputHelper _output;
     private readonly IEngine _engine = AiDotNetEngine.Current;
-    private static bool RunPerformanceTests =>
-        string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_RUN_PERF_TESTS"), "1", StringComparison.Ordinal);
 
     public TapePerformanceTests(ITestOutputHelper output)
     {
@@ -128,7 +127,7 @@ public class TapePerformanceTests
     [SkippableFact]
     public void FullForwardBackward_MLP_Performance()
     {
-        Skip.IfNot(RunPerformanceTests, "Performance gate; set AIDOTNET_RUN_PERF_TESTS=1 to run.");
+        PerformanceGate.SkipUnlessEnabled();
 
         // Measure a realistic training step: 3-layer MLP forward + backward
         var input = Tensor<float>.CreateRandom([32, 128]); // batch=32, features=128

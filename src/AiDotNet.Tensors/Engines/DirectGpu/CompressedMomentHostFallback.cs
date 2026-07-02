@@ -4,6 +4,27 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 
 internal static class CompressedMomentHostFallback
 {
+    private static readonly System.Collections.Generic.HashSet<string> _warnedBackends = new();
+
+    /// <summary>
+    /// Emits a one-time warning that this backend runs the compressed-moment (bf16/int8) optimizer
+    /// through a HOST fallback (per-step download → CPU compute → upload), NOT a native GPU kernel.
+    /// Backends whose compressed-moment methods delegate here (Metal, Vulkan) call this so the host
+    /// round-trip is transparent instead of silently masquerading as native GPU acceleration — the
+    /// concern raised on the #719 Metal/Vulkan review threads. Native kernels are tracked follow-up.
+    /// </summary>
+    public static void WarnHostFallbackOnce(string backendName)
+    {
+        lock (_warnedBackends)
+        {
+            if (!_warnedBackends.Add(backendName)) return;
+        }
+        System.Diagnostics.Trace.TraceWarning(
+            backendName + ": compressed-moment (bf16/int8) optimizer runs via a HOST fallback " +
+            "(per-step download → CPU compute → upload), NOT a native GPU kernel — expect reduced " +
+            "throughput vs full-precision GPU moments. Native kernels are tracked as follow-up.");
+    }
+
     public static byte[] DownloadPackedBytes(float[] words, int byteCount)
     {
         var allBytes = new byte[words.Length * sizeof(float)];

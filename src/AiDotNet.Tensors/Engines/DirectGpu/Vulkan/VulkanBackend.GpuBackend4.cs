@@ -75,6 +75,7 @@ public sealed unsafe partial class VulkanBackend
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
         EnsureInitialized();
+        CompressedMomentHostFallback.WarnHostFallbackOnce("Vulkan");
         if (step <= 0)
             throw new ArgumentOutOfRangeException(nameof(step), step, "Step must be > 0 for bias-corrected optimizers to avoid division by zero.");
 
@@ -97,6 +98,7 @@ public sealed unsafe partial class VulkanBackend
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
         EnsureInitialized();
+        CompressedMomentHostFallback.WarnHostFallbackOnce("Vulkan");
         if (step <= 0)
             throw new ArgumentOutOfRangeException(nameof(step), step, "Step must be > 0 for bias-corrected optimizers to avoid division by zero.");
 
@@ -122,6 +124,7 @@ public sealed unsafe partial class VulkanBackend
         int blockSize, int paramLength, int numBlocks)
     {
         EnsureInitialized();
+        CompressedMomentHostFallback.WarnHostFallbackOnce("Vulkan");
 
         var p = DownloadBuffer(param);
         var g = DownloadBuffer(gradient);

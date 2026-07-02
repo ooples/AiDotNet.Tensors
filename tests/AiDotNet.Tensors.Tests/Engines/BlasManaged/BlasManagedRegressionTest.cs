@@ -6,6 +6,7 @@ using System.Linq;
 using System.Text.Json;
 using AiDotNet.Tensors.Engines.BlasManaged;
 using Xunit;
+using AiDotNet.Tensors.Tests.TestHelpers;
 using Xunit.Abstractions;
 using BlasManagedLib = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged;
 
@@ -49,14 +50,12 @@ public class BlasManagedRegressionTest
     /// </summary>
     private const double NoiseFloorMs = 5.0;
 
-    private static bool RunPerformanceTests =>
-        Environment.GetEnvironmentVariable("AIDOTNET_RUN_PERF_TESTS") == "1";
 
     [SkippableFact]
     [Trait("Category", "Performance")]
     public void BlasManaged_RepresentativeShapes_NoRegressionFromBaseline()
     {
-        Skip.IfNot(RunPerformanceTests, "Performance gate; set AIDOTNET_RUN_PERF_TESTS=1 to run.");
+        PerformanceGate.SkipUnlessEnabled();
 
         // Locate the baseline JSON. It's deployed alongside the test assembly.
         // Use AppContext.BaseDirectory (not Assembly.Location) because the

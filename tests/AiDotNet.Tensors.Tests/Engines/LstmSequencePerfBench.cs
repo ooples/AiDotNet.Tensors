@@ -10,6 +10,7 @@ using System.Diagnostics;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
+using AiDotNet.Tensors.Tests.TestHelpers;
 using Xunit.Abstractions;
 
 namespace AiDotNet.Tensors.Tests.Engines;
@@ -19,13 +20,11 @@ public class LstmSequencePerfBench
 {
     private readonly ITestOutputHelper _out;
     public LstmSequencePerfBench(ITestOutputHelper output) => _out = output;
-    private static bool RunPerformanceTests =>
-        string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_RUN_PERF_TESTS"), "1", StringComparison.Ordinal);
 
     [SkippableFact]
     public void LstmSequenceForward_AisEvalWorkload_Timing()
     {
-        Skip.IfNot(RunPerformanceTests, "Performance gate; set AIDOTNET_RUN_PERF_TESTS=1 to run.");
+        PerformanceGate.SkipUnlessEnabled();
 
         const int batch = 128, seq = 32, inF = 32, hidden = 64;
         const int warmup = 50, measured = 200;
@@ -60,7 +59,7 @@ public class LstmSequencePerfBench
     [SkippableFact]
     public void LstmSequenceForward_AllocationProfile()
     {
-        Skip.IfNot(RunPerformanceTests, "Performance gate; set AIDOTNET_RUN_PERF_TESTS=1 to run.");
+        PerformanceGate.SkipUnlessEnabled();
 
         const int batch = 128, seq = 32, inF = 32, hidden = 64;
         const int warmup = 50, calls = 500;
