@@ -5436,48 +5436,25 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             (step.Inputs[0]._shape.Length == 3
              || (step.Inputs[0]._shape.Length == 4 && step.Inputs[0]._shape[0] == 1));
 
+        // BatchNorm forward: the specialized channels-first BatchNormInferenceUnsafe
+        // fast path normalized with — and never refreshed — the savedState
+        // mean/variance. In a TRAINING plan the batch statistics change every step as
+        // the input drifts (activations fed by upstream weights that move), so both the
+        // forward OUTPUT and the backward (which reads the same savedState, see the
+        // BatchNormBackwardInto step) ran on stale, trace-time statistics. Deep fused
+        // BatchNorm models — e.g. FireRedASR's Conformer conv modules — trained worse
+        // every step (LossStrictlyDecreases / DifferentInputs_AfterTraining / MoreData
+        // all failed). Returning null routes BatchNorm through the generic lazy execute
+        // delegate registered by CpuEngine.BatchNorm, which RECOMPUTES the batch
+        // statistics AND copies them into the savedState tensors on every plan.Step() —
+        // exactly the fix LayerNorm got in #1331 (and the GroupNorm equivalent). A future
+        // re-specialization MUST recompute + emit mean/variance alongside the output to
+        // stay correct under training. (Rank-2 [batch,features] BatchNorm never hit this
+        // block — layoutIsChannelsFirstContiguous is false — so it was already correct.)
         if (step.OpType == OpType.BatchNorm && typeof(T) == typeof(float)
-            && step.Inputs.Length >= 3 && step.Inputs[0].IsContiguous
-            && layoutIsChannelsFirstContiguous
-            && step.SavedState is { Length: >= 2 }
-            && step.SavedState[0] is Tensor<T> meanTensor
-            && step.SavedState[1] is Tensor<T> varTensor)
+            && layoutIsChannelsFirstContiguous)
         {
-            var input = step.Inputs[0];
-            var gamma = step.Inputs[1];
-            var beta = step.Inputs[2];
-            var mean = meanTensor;
-            var variance = varTensor;
-            var output = step.OutputBuffer;
-            int channels = gamma.Length;
-            float eps = 1e-5f;
-            if (step.SavedState.Length >= 3 && step.SavedState[2] is double epsD)
-                eps = (float)epsD;
-
-            var inH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)input), handleTracker);
-            var outH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)output), handleTracker);
-            var gammaH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)gamma), handleTracker);
-            var betaH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)beta), handleTracker);
-            var meanH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)mean), handleTracker);
-            var varH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)variance), handleTracker);
-            int length = input.Length;
-            float capturedEps = eps;
-
-            return eng =>
-            {
-                unsafe
-                {
-                    Simd.FusedKernels.BatchNormInferenceUnsafe(
-                        (float*)inH.AddrOfPinnedObject(),
-                        (float*)outH.AddrOfPinnedObject(),
-                        length, channels,
-                        (float*)gammaH.AddrOfPinnedObject(),
-                        (float*)betaH.AddrOfPinnedObject(),
-                        (float*)meanH.AddrOfPinnedObject(),
-                        (float*)varH.AddrOfPinnedObject(),
-                        capturedEps);
-                }
-            };
+            return null;
         }
 
         // LayerNorm: previously routed through FusedKernels.LayerNormUnsafe
