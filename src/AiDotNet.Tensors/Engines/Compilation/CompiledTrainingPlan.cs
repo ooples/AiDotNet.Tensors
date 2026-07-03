@@ -5680,13 +5680,27 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // × 10 sampling steps per Predict — a measurable share of the residual
         // compile-mode-slower-than-eager gap that #1305 surfaced.
         //
-        // SavedState layout for GroupNorm (set at CpuEngine.GroupNorm record-site,
-        // see line ~20597): [int numGroups, Tensor<T> mean, Tensor<T> variance,
-        // double epsilon]. Forward-only inference ignores mean/variance — they
-        // are required for backward only — so we discard them via `out _`.
+        // SavedState layout for GroupNorm (set at CpuEngine.GroupNorm record-site):
+        // [int numGroups, Tensor<T> mean, Tensor<T> variance, double epsilon]. The
+        // GroupNorm BACKWARD (BackwardFunctions<T>.GroupNormBackward) reads mean and
+        // variance from this savedState. In a compiled TRAINING plan the parameters
+        // change every step, so mean/variance MUST be recomputed from the CURRENT
+        // input on each forward replay and written back into the saved tensors —
+        // otherwise the backward runs on stale, trace-time statistics. That mis-directs
+        // the GroupNorm gradient, and (amplified by Adam's per-parameter normalization
+        // over many consecutive steps) makes deep GroupNorm models — e.g. ODISE's
+        // SD-UNet — DIVERGE instead of train: fused ODISE loss went 9231.58 -> 9244.10
+        // (worse) while eager reached 9188.04 (#1750). The eager record-site delegate
+        // already refreshes them the same way (#1331); this keeps the specialized
+        // replay consistent. GroupNormInto computes mean/variance internally regardless
+        // (they were previously discarded via `out _`), so capturing them adds no
+        // allocation — only a small write-back copy. Inference plans have no backward
+        // reader, so the refresh is harmless (and negligible) there.
         if (step.OpType == OpType.GroupNorm && step.Inputs.Length == 3 && step.Inputs[0].IsContiguous
             && step.SavedState is { Length: >= 4 }
             && step.SavedState[0] is int numGroupsGN
+            && step.SavedState[1] is Tensor<T> savedMeanGN
+            && step.SavedState[2] is Tensor<T> savedVarGN
             && step.SavedState[3] is double epsilonGN)
         {
             var inp = step.Inputs[0];
@@ -5695,13 +5709,19 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var o = step.OutputBuffer;
             return eng =>
             {
+                Tensor<T> freshMean, freshVar;
                 if (eng is CpuEngine cpuEng)
-                    cpuEng.GroupNormInto(o, inp, numGroupsGN, gamma, beta, epsilonGN, out _, out _);
+                    cpuEng.GroupNormInto(o, inp, numGroupsGN, gamma, beta, epsilonGN, out freshMean, out freshVar);
                 else
                 {
-                    var result = eng.GroupNorm(inp, numGroupsGN, gamma, beta, epsilonGN, out _, out _);
+                    var result = eng.GroupNorm(inp, numGroupsGN, gamma, beta, epsilonGN, out freshMean, out freshVar);
                     result.AsSpan().CopyTo(o.AsWritableSpan());
                 }
+                // Refresh the saved statistics the backward reads (see note above).
+                if (freshMean.Length == savedMeanGN.Length)
+                    freshMean.AsSpan().CopyTo(savedMeanGN.AsWritableSpan());
+                if (freshVar.Length == savedVarGN.Length)
+                    freshVar.AsSpan().CopyTo(savedVarGN.AsWritableSpan());
             };
         }
 
