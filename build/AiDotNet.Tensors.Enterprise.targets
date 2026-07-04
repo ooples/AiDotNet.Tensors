@@ -93,19 +93,7 @@
     <_AiDotNetLicenseValidatorDll>$(MSBuildThisFileDirectory)LicenseValidator\bin\AiDotNet.Tensors.LicenseValidator.dll</_AiDotNetLicenseValidatorDll>
   </PropertyGroup>
 
-  <!--
-    Bootstrap-build the validator if the DLL isn't on disk yet. This
-    runs ahead of every consuming target and is conditional so the
-    overhead only fires when somebody actually requested a DISABLE_*
-    flag (the only path that needs the validator). Source-builds where
-    the validator project hasn't been built yet hit this; NuGet
-    installs ship a pre-built copy and skip the bootstrap.
-  -->
-  <Target Name="EnsureAiDotNetLicenseValidatorBuilt"
-          BeforeTargets="ValidateEnterpriseDisableFlags"
-          Condition="'$(_AiDotNetAnyDisableFlagRequested)' == 'true' And !Exists('$(_AiDotNetLicenseValidatorDll)')">
-    <Message Importance="high"
-             Text="AiDotNet enterprise gate: building the license-validator task assembly because the precompiled DLL is missing at $(_AiDotNetLicenseValidatorDll)." />
+  <Target Name="BuildAiDotNetLicenseValidatorAssembly">
     <!--
       Restore and Build MUST be SEPARATE <MSBuild> invocations, not a single
       Targets="Restore;Build". A combined call evaluates the project only ONCE —
@@ -142,6 +130,22 @@
              Targets="Build"
              Properties="Configuration=Release;_LicenseValidatorPhase=Build"
              RemoveProperties="TargetFramework;NoBuild" />
+  </Target>
+
+  <!--
+    Bootstrap-build the validator if the DLL isn't on disk yet. This
+    runs ahead of every consuming target and is conditional so the
+    overhead only fires when somebody actually requested a DISABLE_*
+    flag (the only path that needs the validator). Source-builds where
+    the validator project hasn't been built yet hit this; NuGet
+    installs ship a pre-built copy and skip the bootstrap.
+  -->
+  <Target Name="EnsureAiDotNetLicenseValidatorBuilt"
+          BeforeTargets="ValidateEnterpriseDisableFlags"
+          Condition="'$(_AiDotNetAnyDisableFlagRequested)' == 'true' And !Exists('$(_AiDotNetLicenseValidatorDll)')">
+    <Message Importance="high"
+             Text="AiDotNet enterprise gate: building the license-validator task assembly because the precompiled DLL is missing at $(_AiDotNetLicenseValidatorDll)." />
+    <CallTarget Targets="BuildAiDotNetLicenseValidatorAssembly" />
   </Target>
 
   <!--
@@ -247,24 +251,7 @@
           Condition="('$(GeneratePackageOnBuild)' == 'true' Or '$(_IsPacking)' == 'true' Or '$(IsPackable)' != 'false')
                      And '$(MSBuildProjectName)' == 'AiDotNet.Tensors'
                      And Exists('$(MSBuildThisFileDirectory)LicenseValidator\AiDotNet.Tensors.LicenseValidator.csproj')">
-    <!--
-      Separate Restore + Build invocations (see EnsureAiDotNetLicenseValidatorBuilt
-      above): a combined Targets="Restore;Build" evaluates the project before the
-      assets file exists, so a cold pack build compiles the netstandard2.0 validator
-      without the NETStandard.Library facade (CS0012 "netstandard 2.0.0.0 not
-      referenced"). The distinct _LicenseValidatorPhase property on each call
-      forces Build to evaluate a fresh project instance after Restore rather
-      than reuse the pre-restore instance from the MSBuild config cache (see
-      EnsureAiDotNetLicenseValidatorBuilt above).
-    -->
-    <MSBuild Projects="$(MSBuildThisFileDirectory)LicenseValidator\AiDotNet.Tensors.LicenseValidator.csproj"
-             Targets="Restore"
-             Properties="Configuration=Release;_LicenseValidatorPhase=Restore"
-             RemoveProperties="TargetFramework;NoBuild" />
-    <MSBuild Projects="$(MSBuildThisFileDirectory)LicenseValidator\AiDotNet.Tensors.LicenseValidator.csproj"
-             Targets="Build"
-             Properties="Configuration=Release;_LicenseValidatorPhase=Build"
-             RemoveProperties="TargetFramework;NoBuild" />
+    <CallTarget Targets="BuildAiDotNetLicenseValidatorAssembly" />
     <ItemGroup>
       <!-- ONLY the validator DLL closure is added dynamically — those files
            don't exist until the validator is built above, and the
