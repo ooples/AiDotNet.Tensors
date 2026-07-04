@@ -5695,10 +5695,24 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     result.AsSpan().CopyTo(o.AsWritableSpan());
                 }
                 // Refresh the saved statistics the backward reads (see note above).
-                if (freshMean.Length == savedMeanGN.Length)
-                    freshMean.AsSpan().CopyTo(savedMeanGN.AsWritableSpan());
-                if (freshVar.Length == savedVarGN.Length)
-                    freshVar.AsSpan().CopyTo(savedVarGN.AsWritableSpan());
+                // In a compiled plan the trace-time and replay-time shapes are fixed, so
+                // mean/variance lengths must never legitimately diverge — a mismatch signals
+                // a real bug. Fail loud rather than silently skipping the refresh, which would
+                // resurrect the exact stale-statistics corruption this path exists to fix.
+                if (freshMean.Length != savedMeanGN.Length || freshVar.Length != savedVarGN.Length)
+                    throw new InvalidOperationException(
+                        $"GroupNorm forward produced mean/variance of length ({freshMean.Length}, {freshVar.Length}) " +
+                        $"but the compiled savedState buffers are ({savedMeanGN.Length}, {savedVarGN.Length}); " +
+                        "refusing to silently skip the statistics refresh (this is the same stale-statistics class of bug being fixed here).");
+                freshMean.AsSpan().CopyTo(savedMeanGN.AsWritableSpan());
+                freshVar.AsSpan().CopyTo(savedVarGN.AsWritableSpan());
+
+                // Return the freshly-rented stat temporaries to the pool. Both GroupNormInto
+                // and GroupNorm Rent freshMean/freshVar from TensorAllocator; this replay path
+                // only needs their values copied into savedMeanGN/savedVarGN above. Without the
+                // Return, every training Step() would leak two pooled tensors.
+                TensorAllocator.Return(freshMean);
+                TensorAllocator.Return(freshVar);
             };
         }
 
