@@ -68,7 +68,7 @@ public class Fp16WeightGemmTests
         var reference = engine.TensorMatMul(a, wUpcast);
         var fused = engine.TensorMatMulFp16WeightB(a, wHalf);
 
-        Assert.Equal(new[] { m, n }, fused.Shape);
+        Assert.Equal(new[] { m, n }, fused.Shape.ToArray());
         AssertClose(reference, fused);
     }
 
@@ -92,7 +92,7 @@ public class Fp16WeightGemmTests
 
         var fused = engine.FusedLinearFp16WeightB(a, wHalf, bias, FusedActivationType.None);
 
-        Assert.Equal(new[] { m, n }, fused.Shape);
+        Assert.Equal(new[] { m, n }, fused.Shape.ToArray());
         AssertClose(reference, fused);
     }
 
@@ -109,7 +109,7 @@ public class Fp16WeightGemmTests
         var reference2d = engine.TensorMatMul(a, wUpcast);   // [1, n]
         var fused1d = engine.FusedLinearFp16WeightB(a1d, wHalf, null, FusedActivationType.None);
 
-        Assert.Equal(new[] { n }, fused1d.Shape);
+        Assert.Equal(new[] { n }, fused1d.Shape.ToArray());
         var e = reference2d.GetCpuData();
         var g = fused1d.GetCpuData();
         for (int j = 0; j < n; j++)
