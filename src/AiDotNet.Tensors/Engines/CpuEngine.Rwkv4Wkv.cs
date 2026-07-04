@@ -101,41 +101,44 @@ public partial class CpuEngine
         for (int c = 0; c < modelDim; c++) w[c] = -Math.Exp(timeDecay[c]);
         // u = timeFirst (used directly).
 
-        var aa = new double[modelDim];
-        var bb = new double[modelDim];
-        var pp = new double[modelDim];
+        // Each channel c has an independent (aa, bb, pp) running state; parallelize over c with b kept
+        // outer (per-channel dTimeDecay/dTimeFirst accumulate across batch in the backward). Local scalar
+        // state + disjoint output writes — fully lock-free.
         for (int b = 0; b < batch; b++)
         {
-            Array.Clear(aa, 0, modelDim);
-            Array.Clear(bb, 0, modelDim);
-            for (int c = 0; c < modelDim; c++) pp[c] = double.NegativeInfinity;
-            for (int t = 0; t < seqLen; t++)
+            int bIdx = b;
+            CpuParallelSettings.ParallelForChunks(modelDim, RgLruChannelGrain, (cStart, cCount) =>
             {
-                int baseOff = (b * seqLen + t) * modelDim;
-                for (int c = 0; c < modelDim; c++)
+                int cEnd = cStart + cCount;
+                for (int c = cStart; c < cEnd; c++)
                 {
-                    double k = K[baseOff + c];
-                    double v = V[baseOff + c];
-                    double u = timeFirst[c];
+                    double aac = 0.0, bbc = 0.0, ppc = double.NegativeInfinity;
+                    double wc = w[c], u = timeFirst[c];
+                    for (int t = 0; t < seqLen; t++)
+                    {
+                        int baseOff = (bIdx * seqLen + t) * modelDim;
+                        double k = K[baseOff + c];
+                        double v = V[baseOff + c];
 
-                    // Output for token t (current key boosted by the time-first bonus u).
-                    double ww = u + k;
-                    double q = Math.Max(pp[c], ww);
-                    double e1 = Math.Exp(pp[c] - q);
-                    double e2 = Math.Exp(ww - q);
-                    double wkv = (e1 * aa[c] + e2 * v) / (e1 * bb[c] + e2);
-                    outp[baseOff + c] = Sig(R[baseOff + c]) * wkv;
+                        // Output for token t (current key boosted by the time-first bonus u).
+                        double ww = u + k;
+                        double q = Math.Max(ppc, ww);
+                        double e1 = Math.Exp(ppc - q);
+                        double e2 = Math.Exp(ww - q);
+                        double wkv = (e1 * aac + e2 * v) / (e1 * bbc + e2);
+                        outp[baseOff + c] = Sig(R[baseOff + c]) * wkv;
 
-                    // State update with the static decay w (no bonus on the carried state).
-                    double ww2 = pp[c] + w[c];
-                    double q2 = Math.Max(ww2, k);
-                    double e1b = Math.Exp(ww2 - q2);
-                    double e2b = Math.Exp(k - q2);
-                    aa[c] = e1b * aa[c] + e2b * v;
-                    bb[c] = e1b * bb[c] + e2b;
-                    pp[c] = q2;
+                        // State update with the static decay w (no bonus on the carried state).
+                        double ww2 = ppc + wc;
+                        double q2 = Math.Max(ww2, k);
+                        double e1b = Math.Exp(ww2 - q2);
+                        double e2b = Math.Exp(k - q2);
+                        aac = e1b * aac + e2b * v;
+                        bbc = e1b * bbc + e2b;
+                        ppc = q2;
+                    }
                 }
-            }
+            });
         }
     }
 
@@ -147,107 +150,102 @@ public partial class CpuEngine
         var w = new double[modelDim];
         for (int c = 0; c < modelDim; c++) w[c] = -Math.Exp(timeDecay[c]);
 
-        // Post-update state trajectories for every t (reused per batch).
-        var aaTraj = new double[seqLen * modelDim];
-        var bbTraj = new double[seqLen * modelDim];
-        var ppTraj = new double[seqLen * modelDim];
-        var aa = new double[modelDim];
-        var bb = new double[modelDim];
-        var pp = new double[modelDim];
-        var dAa = new double[modelDim];
-        var dBb = new double[modelDim];
         // dw accumulates the grad of w[c] = -exp(timeDecay[c]); converted to dTimeDecay at the end.
-        var dw = new double[modelDim];
+        var dw = new double[modelDim]; // one slot per channel — disjoint across c-threads
 
+        // Parallelize over channel c (independent (aa,bb,pp) recurrence); keep b outer so dw/dTimeFirst
+        // accumulate across batch serially. Each c owns private scalar state + private seqLen trajectories.
         for (int b = 0; b < batch; b++)
         {
-            // Forward recompute, saving the post-update state trajectory.
-            Array.Clear(aa, 0, modelDim);
-            Array.Clear(bb, 0, modelDim);
-            for (int c = 0; c < modelDim; c++) pp[c] = double.NegativeInfinity;
-            for (int t = 0; t < seqLen; t++)
+            int bIdx = b;
+            CpuParallelSettings.ParallelForChunks(modelDim, RgLruChannelGrain, (cStart, cCount) =>
             {
-                int baseOff = (b * seqLen + t) * modelDim;
-                int tOff = t * modelDim;
-                for (int c = 0; c < modelDim; c++)
+                var aaTrajC = new double[seqLen];
+                var bbTrajC = new double[seqLen];
+                var ppTrajC = new double[seqLen];
+                int cEnd = cStart + cCount;
+                for (int c = cStart; c < cEnd; c++)
                 {
-                    double k = K[baseOff + c];
-                    double v = V[baseOff + c];
-                    double ww2 = pp[c] + w[c];
-                    double q2 = Math.Max(ww2, k);
-                    double e1b = Math.Exp(ww2 - q2);
-                    double e2b = Math.Exp(k - q2);
-                    aa[c] = e1b * aa[c] + e2b * v;
-                    bb[c] = e1b * bb[c] + e2b;
-                    pp[c] = q2;
-                    aaTraj[tOff + c] = aa[c];
-                    bbTraj[tOff + c] = bb[c];
-                    ppTraj[tOff + c] = pp[c];
+                    double wc = w[c], u = timeFirst[c];
+
+                    // Forward recompute, saving this channel's post-update state trajectory.
+                    double aac = 0.0, bbc = 0.0, ppc = double.NegativeInfinity;
+                    for (int t = 0; t < seqLen; t++)
+                    {
+                        int baseOff = (bIdx * seqLen + t) * modelDim;
+                        double k = K[baseOff + c];
+                        double v = V[baseOff + c];
+                        double ww2 = ppc + wc;
+                        double q2 = Math.Max(ww2, k);
+                        double e1b = Math.Exp(ww2 - q2);
+                        double e2b = Math.Exp(k - q2);
+                        aac = e1b * aac + e2b * v;
+                        bbc = e1b * bbc + e2b;
+                        ppc = q2;
+                        aaTrajC[t] = aac;
+                        bbTrajC[t] = bbc;
+                        ppTrajC[t] = ppc;
+                    }
+
+                    // Reverse sweep. dAac/dBbc carry the adjoint of the post-update state from t+1.
+                    double dAac = 0.0, dBbc = 0.0;
+                    for (int t = seqLen - 1; t >= 0; t--)
+                    {
+                        int baseOff = (bIdx * seqLen + t) * modelDim;
+                        double k = K[baseOff + c];
+                        double v = V[baseOff + c];
+
+                        // Pre-update state entering step t (post-update state of t-1).
+                        double aaPrev = t > 0 ? aaTrajC[t - 1] : 0.0;
+                        double bbPrev = t > 0 ? bbTrajC[t - 1] : 0.0;
+                        double ppPrev = t > 0 ? ppTrajC[t - 1] : double.NegativeInfinity;
+                        double ppCur = ppTrajC[t];
+
+                        // Output recompute (q, pp treated as constants).
+                        double ww = u + k;
+                        double q = Math.Max(ppPrev, ww);
+                        double e1 = Math.Exp(ppPrev - q);
+                        double e2 = Math.Exp(ww - q);
+                        double den = e1 * bbPrev + e2;
+                        double num = e1 * aaPrev + e2 * v;
+                        double wkv = num / den;
+                        double sr = Sig(R[baseOff + c]);
+
+                        // Output backward: out = sr * wkv.
+                        double dO = dOut[baseOff + c];
+                        dR[baseOff + c] += dO * wkv * sr * (1.0 - sr);
+                        double gWkv = dO * sr;
+                        double dNum = gWkv / den;
+                        double dDen = -gWkv * wkv / den;
+                        // num = e1*aaPrev + e2*v ; den = e1*bbPrev + e2 (e1 constant in pp).
+                        double dAaFromOut = dNum * e1;
+                        double dBbFromOut = dDen * e1;
+                        dV[baseOff + c] += dNum * e2;
+                        double dE2 = dNum * v + dDen;          // e2 = exp(u + k - q)
+                        dK[baseOff + c] += dE2 * e2;            // de2/dk = e2
+                        dTimeFirst[c] += dE2 * e2;              // de2/du = e2
+
+                        // State-update recompute (ww2, q2=ppCur constants).
+                        double ww2 = ppPrev + wc;
+                        double e1b = Math.Exp(ww2 - ppCur);
+                        double e2b = Math.Exp(k - ppCur);
+
+                        // State-update backward: aa_t = e1b*aaPrev + e2b*v ; bb_t = e1b*bbPrev + e2b.
+                        double dAt = dAac;
+                        double dBt = dBbc;
+                        double dE1b = dAt * aaPrev + dBt * bbPrev;   // e1b = exp(ppPrev + w - ppCur)
+                        dw[c] += dE1b * e1b;                          // de1b/dw = e1b
+                        dV[baseOff + c] += dAt * e2b;
+                        double dE2b = dAt * v + dBt;                 // e2b = exp(k - ppCur)
+                        dK[baseOff + c] += dE2b * e2b;                // de2b/dk = e2b
+
+                        // Adjoint flowing to the pre-update state (for step t-1): from the update
+                        // (e1b factor) and from this step's output (e1 factor).
+                        dAac = dAt * e1b + dAaFromOut;
+                        dBbc = dBt * e1b + dBbFromOut;
+                    }
                 }
-            }
-
-            // Reverse sweep. dAa/dBb carry the adjoint of the post-update state from t+1.
-            Array.Clear(dAa, 0, modelDim);
-            Array.Clear(dBb, 0, modelDim);
-            for (int t = seqLen - 1; t >= 0; t--)
-            {
-                int baseOff = (b * seqLen + t) * modelDim;
-                for (int c = 0; c < modelDim; c++)
-                {
-                    double k = K[baseOff + c];
-                    double v = V[baseOff + c];
-                    double u = timeFirst[c];
-
-                    // Pre-update state entering step t (post-update state of t-1).
-                    double aaPrev = t > 0 ? aaTraj[(t - 1) * modelDim + c] : 0.0;
-                    double bbPrev = t > 0 ? bbTraj[(t - 1) * modelDim + c] : 0.0;
-                    double ppPrev = t > 0 ? ppTraj[(t - 1) * modelDim + c] : double.NegativeInfinity;
-                    double ppCur = ppTraj[t * modelDim + c];
-
-                    // Output recompute (q, pp treated as constants).
-                    double ww = u + k;
-                    double q = Math.Max(ppPrev, ww);
-                    double e1 = Math.Exp(ppPrev - q);
-                    double e2 = Math.Exp(ww - q);
-                    double den = e1 * bbPrev + e2;
-                    double num = e1 * aaPrev + e2 * v;
-                    double wkv = num / den;
-                    double sr = Sig(R[baseOff + c]);
-
-                    // Output backward: out = sr * wkv.
-                    double dO = dOut[baseOff + c];
-                    dR[baseOff + c] += dO * wkv * sr * (1.0 - sr);
-                    double gWkv = dO * sr;
-                    double dNum = gWkv / den;
-                    double dDen = -gWkv * wkv / den;
-                    // num = e1*aaPrev + e2*v ; den = e1*bbPrev + e2 (e1 constant in pp).
-                    double dAaFromOut = dNum * e1;
-                    double dBbFromOut = dDen * e1;
-                    dV[baseOff + c] += dNum * e2;
-                    double dE2 = dNum * v + dDen;          // e2 = exp(u + k - q)
-                    dK[baseOff + c] += dE2 * e2;            // de2/dk = e2
-                    dTimeFirst[c] += dE2 * e2;              // de2/du = e2
-
-                    // State-update recompute (ww2, q2=ppCur constants).
-                    double ww2 = ppPrev + w[c];
-                    double e1b = Math.Exp(ww2 - ppCur);
-                    double e2b = Math.Exp(k - ppCur);
-
-                    // State-update backward: aa_t = e1b*aaPrev + e2b*v ; bb_t = e1b*bbPrev + e2b.
-                    double dAt = dAa[c];
-                    double dBt = dBb[c];
-                    double dE1b = dAt * aaPrev + dBt * bbPrev;   // e1b = exp(ppPrev + w - ppCur)
-                    dw[c] += dE1b * e1b;                          // de1b/dw = e1b
-                    dV[baseOff + c] += dAt * e2b;
-                    double dE2b = dAt * v + dBt;                 // e2b = exp(k - ppCur)
-                    dK[baseOff + c] += dE2b * e2b;                // de2b/dk = e2b
-
-                    // Adjoint flowing to the pre-update state (for step t-1): from the update
-                    // (e1b factor) and from this step's output (e1 factor).
-                    dAa[c] = dAt * e1b + dAaFromOut;
-                    dBb[c] = dBt * e1b + dBbFromOut;
-                }
-            }
+            });
         }
 
         // Chain w = -exp(timeDecay) -> dTimeDecay = dw * dw/dTimeDecay = dw * (-exp(timeDecay)) = dw * w.
@@ -265,37 +263,41 @@ public partial class CpuEngine
         for (int c = 0; c < modelDim; c++) w[c] = ops.Negate(ops.Exp(timeDecay[c]));
         T negInf = ops.FromDouble(-1e38);
 
-        var aa = new T[modelDim];
-        var bb = new T[modelDim];
-        var pp = new T[modelDim];
+        // Channel-parallel with b outer; per-channel local scalar state. See Rwkv4ForwardDouble.
         for (int b = 0; b < batch; b++)
         {
-            for (int c = 0; c < modelDim; c++) { aa[c] = ops.Zero; bb[c] = ops.Zero; pp[c] = negInf; }
-            for (int t = 0; t < seqLen; t++)
+            int bIdx = b;
+            CpuParallelSettings.ParallelForChunks(modelDim, RgLruChannelGrain, (cStart, cCount) =>
             {
-                int baseOff = (b * seqLen + t) * modelDim;
-                for (int c = 0; c < modelDim; c++)
+                int cEnd = cStart + cCount;
+                for (int c = cStart; c < cEnd; c++)
                 {
-                    T k = K[baseOff + c];
-                    T v = V[baseOff + c];
-                    T ww = ops.Add(timeFirst[c], k);
-                    T q = MaxT(ops, pp[c], ww);
-                    T e1 = ops.Exp(ops.Subtract(pp[c], q));
-                    T e2 = ops.Exp(ops.Subtract(ww, q));
-                    T wkv = ops.Divide(
-                        ops.Add(ops.Multiply(e1, aa[c]), ops.Multiply(e2, v)),
-                        ops.Add(ops.Multiply(e1, bb[c]), e2));
-                    outp[baseOff + c] = ops.Multiply(SigGeneric(ops, R[baseOff + c]), wkv);
+                    T wc = w[c], u = timeFirst[c];
+                    T aac = ops.Zero, bbc = ops.Zero, ppc = negInf;
+                    for (int t = 0; t < seqLen; t++)
+                    {
+                        int baseOff = (bIdx * seqLen + t) * modelDim;
+                        T k = K[baseOff + c];
+                        T v = V[baseOff + c];
+                        T ww = ops.Add(u, k);
+                        T q = MaxT(ops, ppc, ww);
+                        T e1 = ops.Exp(ops.Subtract(ppc, q));
+                        T e2 = ops.Exp(ops.Subtract(ww, q));
+                        T wkv = ops.Divide(
+                            ops.Add(ops.Multiply(e1, aac), ops.Multiply(e2, v)),
+                            ops.Add(ops.Multiply(e1, bbc), e2));
+                        outp[baseOff + c] = ops.Multiply(SigGeneric(ops, R[baseOff + c]), wkv);
 
-                    T ww2 = ops.Add(pp[c], w[c]);
-                    T q2 = MaxT(ops, ww2, k);
-                    T e1b = ops.Exp(ops.Subtract(ww2, q2));
-                    T e2b = ops.Exp(ops.Subtract(k, q2));
-                    aa[c] = ops.Add(ops.Multiply(e1b, aa[c]), ops.Multiply(e2b, v));
-                    bb[c] = ops.Add(ops.Multiply(e1b, bb[c]), e2b);
-                    pp[c] = q2;
+                        T ww2 = ops.Add(ppc, wc);
+                        T q2 = MaxT(ops, ww2, k);
+                        T e1b = ops.Exp(ops.Subtract(ww2, q2));
+                        T e2b = ops.Exp(ops.Subtract(k, q2));
+                        aac = ops.Add(ops.Multiply(e1b, aac), ops.Multiply(e2b, v));
+                        bbc = ops.Add(ops.Multiply(e1b, bbc), e2b);
+                        ppc = q2;
+                    }
                 }
-            }
+            });
         }
     }
 
@@ -310,91 +312,90 @@ public partial class CpuEngine
         for (int c = 0; c < modelDim; c++) w[c] = ops.Negate(ops.Exp(timeDecay[c]));
         T negInf = ops.FromDouble(-1e38);
 
-        var aaTraj = new T[seqLen * modelDim];
-        var bbTraj = new T[seqLen * modelDim];
-        var ppTraj = new T[seqLen * modelDim];
-        var aa = new T[modelDim];
-        var bb = new T[modelDim];
-        var pp = new T[modelDim];
-        var dAa = new T[modelDim];
-        var dBb = new T[modelDim];
         var dw = new T[modelDim];
         for (int c = 0; c < modelDim; c++) dw[c] = ops.Zero;
 
+        // Channel-parallel with b outer; per-channel local state + private trajectories. See double path.
         for (int b = 0; b < batch; b++)
         {
-            for (int c = 0; c < modelDim; c++) { aa[c] = ops.Zero; bb[c] = ops.Zero; pp[c] = negInf; }
-            for (int t = 0; t < seqLen; t++)
+            int bIdx = b;
+            CpuParallelSettings.ParallelForChunks(modelDim, RgLruChannelGrain, (cStart, cCount) =>
             {
-                int baseOff = (b * seqLen + t) * modelDim;
-                int tOff = t * modelDim;
-                for (int c = 0; c < modelDim; c++)
+                var aaTrajC = new T[seqLen];
+                var bbTrajC = new T[seqLen];
+                var ppTrajC = new T[seqLen];
+                int cEnd = cStart + cCount;
+                for (int c = cStart; c < cEnd; c++)
                 {
-                    T k = K[baseOff + c];
-                    T v = V[baseOff + c];
-                    T ww2 = ops.Add(pp[c], w[c]);
-                    T q2 = MaxT(ops, ww2, k);
-                    T e1b = ops.Exp(ops.Subtract(ww2, q2));
-                    T e2b = ops.Exp(ops.Subtract(k, q2));
-                    aa[c] = ops.Add(ops.Multiply(e1b, aa[c]), ops.Multiply(e2b, v));
-                    bb[c] = ops.Add(ops.Multiply(e1b, bb[c]), e2b);
-                    pp[c] = q2;
-                    aaTraj[tOff + c] = aa[c];
-                    bbTraj[tOff + c] = bb[c];
-                    ppTraj[tOff + c] = pp[c];
+                    T wc = w[c], u = timeFirst[c];
+
+                    T aac = ops.Zero, bbc = ops.Zero, ppc = negInf;
+                    for (int t = 0; t < seqLen; t++)
+                    {
+                        int baseOff = (bIdx * seqLen + t) * modelDim;
+                        T k = K[baseOff + c];
+                        T v = V[baseOff + c];
+                        T ww2 = ops.Add(ppc, wc);
+                        T q2 = MaxT(ops, ww2, k);
+                        T e1b = ops.Exp(ops.Subtract(ww2, q2));
+                        T e2b = ops.Exp(ops.Subtract(k, q2));
+                        aac = ops.Add(ops.Multiply(e1b, aac), ops.Multiply(e2b, v));
+                        bbc = ops.Add(ops.Multiply(e1b, bbc), e2b);
+                        ppc = q2;
+                        aaTrajC[t] = aac;
+                        bbTrajC[t] = bbc;
+                        ppTrajC[t] = ppc;
+                    }
+
+                    T dAac = ops.Zero, dBbc = ops.Zero;
+                    for (int t = seqLen - 1; t >= 0; t--)
+                    {
+                        int baseOff = (bIdx * seqLen + t) * modelDim;
+                        T k = K[baseOff + c];
+                        T v = V[baseOff + c];
+                        T aaPrev = t > 0 ? aaTrajC[t - 1] : ops.Zero;
+                        T bbPrev = t > 0 ? bbTrajC[t - 1] : ops.Zero;
+                        T ppPrev = t > 0 ? ppTrajC[t - 1] : negInf;
+                        T ppCur = ppTrajC[t];
+
+                        T ww = ops.Add(u, k);
+                        T q = MaxT(ops, ppPrev, ww);
+                        T e1 = ops.Exp(ops.Subtract(ppPrev, q));
+                        T e2 = ops.Exp(ops.Subtract(ww, q));
+                        T den = ops.Add(ops.Multiply(e1, bbPrev), e2);
+                        T num = ops.Add(ops.Multiply(e1, aaPrev), ops.Multiply(e2, v));
+                        T wkv = ops.Divide(num, den);
+                        T sr = SigGeneric(ops, R[baseOff + c]);
+
+                        T dO = dOut[baseOff + c];
+                        dR[baseOff + c] = ops.Add(dR[baseOff + c],
+                            ops.Multiply(ops.Multiply(dO, wkv), ops.Multiply(sr, ops.Subtract(one, sr))));
+                        T gWkv = ops.Multiply(dO, sr);
+                        T dNum = ops.Divide(gWkv, den);
+                        T dDen = ops.Divide(ops.Negate(ops.Multiply(gWkv, wkv)), den);
+                        T dAaFromOut = ops.Multiply(dNum, e1);
+                        T dBbFromOut = ops.Multiply(dDen, e1);
+                        dV[baseOff + c] = ops.Add(dV[baseOff + c], ops.Multiply(dNum, e2));
+                        T dE2 = ops.Add(ops.Multiply(dNum, v), dDen);
+                        dK[baseOff + c] = ops.Add(dK[baseOff + c], ops.Multiply(dE2, e2));
+                        dTimeFirst[c] = ops.Add(dTimeFirst[c], ops.Multiply(dE2, e2));
+
+                        T ww2 = ops.Add(ppPrev, wc);
+                        T e1b = ops.Exp(ops.Subtract(ww2, ppCur));
+                        T e2b = ops.Exp(ops.Subtract(k, ppCur));
+                        T dAt = dAac;
+                        T dBt = dBbc;
+                        T dE1b = ops.Add(ops.Multiply(dAt, aaPrev), ops.Multiply(dBt, bbPrev));
+                        dw[c] = ops.Add(dw[c], ops.Multiply(dE1b, e1b));
+                        dV[baseOff + c] = ops.Add(dV[baseOff + c], ops.Multiply(dAt, e2b));
+                        T dE2b = ops.Add(ops.Multiply(dAt, v), dBt);
+                        dK[baseOff + c] = ops.Add(dK[baseOff + c], ops.Multiply(dE2b, e2b));
+
+                        dAac = ops.Add(ops.Multiply(dAt, e1b), dAaFromOut);
+                        dBbc = ops.Add(ops.Multiply(dBt, e1b), dBbFromOut);
+                    }
                 }
-            }
-
-            for (int c = 0; c < modelDim; c++) { dAa[c] = ops.Zero; dBb[c] = ops.Zero; }
-            for (int t = seqLen - 1; t >= 0; t--)
-            {
-                int baseOff = (b * seqLen + t) * modelDim;
-                for (int c = 0; c < modelDim; c++)
-                {
-                    T k = K[baseOff + c];
-                    T v = V[baseOff + c];
-                    T aaPrev = t > 0 ? aaTraj[(t - 1) * modelDim + c] : ops.Zero;
-                    T bbPrev = t > 0 ? bbTraj[(t - 1) * modelDim + c] : ops.Zero;
-                    T ppPrev = t > 0 ? ppTraj[(t - 1) * modelDim + c] : negInf;
-                    T ppCur = ppTraj[t * modelDim + c];
-
-                    T ww = ops.Add(timeFirst[c], k);
-                    T q = MaxT(ops, ppPrev, ww);
-                    T e1 = ops.Exp(ops.Subtract(ppPrev, q));
-                    T e2 = ops.Exp(ops.Subtract(ww, q));
-                    T den = ops.Add(ops.Multiply(e1, bbPrev), e2);
-                    T num = ops.Add(ops.Multiply(e1, aaPrev), ops.Multiply(e2, v));
-                    T wkv = ops.Divide(num, den);
-                    T sr = SigGeneric(ops, R[baseOff + c]);
-
-                    T dO = dOut[baseOff + c];
-                    dR[baseOff + c] = ops.Add(dR[baseOff + c],
-                        ops.Multiply(ops.Multiply(dO, wkv), ops.Multiply(sr, ops.Subtract(one, sr))));
-                    T gWkv = ops.Multiply(dO, sr);
-                    T dNum = ops.Divide(gWkv, den);
-                    T dDen = ops.Divide(ops.Negate(ops.Multiply(gWkv, wkv)), den);
-                    T dAaFromOut = ops.Multiply(dNum, e1);
-                    T dBbFromOut = ops.Multiply(dDen, e1);
-                    dV[baseOff + c] = ops.Add(dV[baseOff + c], ops.Multiply(dNum, e2));
-                    T dE2 = ops.Add(ops.Multiply(dNum, v), dDen);
-                    dK[baseOff + c] = ops.Add(dK[baseOff + c], ops.Multiply(dE2, e2));
-                    dTimeFirst[c] = ops.Add(dTimeFirst[c], ops.Multiply(dE2, e2));
-
-                    T ww2 = ops.Add(ppPrev, w[c]);
-                    T e1b = ops.Exp(ops.Subtract(ww2, ppCur));
-                    T e2b = ops.Exp(ops.Subtract(k, ppCur));
-                    T dAt = dAa[c];
-                    T dBt = dBb[c];
-                    T dE1b = ops.Add(ops.Multiply(dAt, aaPrev), ops.Multiply(dBt, bbPrev));
-                    dw[c] = ops.Add(dw[c], ops.Multiply(dE1b, e1b));
-                    dV[baseOff + c] = ops.Add(dV[baseOff + c], ops.Multiply(dAt, e2b));
-                    T dE2b = ops.Add(ops.Multiply(dAt, v), dBt);
-                    dK[baseOff + c] = ops.Add(dK[baseOff + c], ops.Multiply(dE2b, e2b));
-
-                    dAa[c] = ops.Add(ops.Multiply(dAt, e1b), dAaFromOut);
-                    dBb[c] = ops.Add(ops.Multiply(dBt, e1b), dBbFromOut);
-                }
-            }
+            });
         }
 
         for (int c = 0; c < modelDim; c++)

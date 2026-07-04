@@ -6784,6 +6784,41 @@ namespace AiDotNet.Tensors.Engines.Simd
         for (; j < end; j++) dst[j] = (float)src[j];
     }
 
+#if NET8_0_OR_GREATER
+    /// <summary>True when <see cref="Fp16To32Vec8"/>'s AVX2 path is available.</summary>
+    internal static bool Fp16Vec8Supported => Avx2.IsSupported;
+
+    /// <summary>
+    /// Bit-exact AVX2 IEEE-754 decode of 8 contiguous Half bit-patterns (<paramref name="us"/> as ushort*)
+    /// into 8 floats at <paramref name="dst"/>. Same algorithm as <see cref="HalfToSingleRange"/> (validated
+    /// identical to <c>(float)Half</c> for all 65536 patterns incl. NaN-quieting); factored out so the
+    /// fused fp16-weight GEMM packer (SgemmFp16WeightB) converts during packing without a scalar pass.
+    /// Caller must ensure AVX2 (<see cref="Fp16Vec8Supported"/>) and 8 readable/writable lanes.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe void Fp16To32Vec8(ushort* us, float* dst)
+    {
+        var h = Avx2.ConvertToVector256Int32(Sse2.LoadVector128(us)).AsUInt32();
+        var sign = Avx2.ShiftLeftLogical(Avx2.And(h, Vector256.Create(0x8000u)), 16);
+        var exp5 = Avx2.And(Avx2.ShiftRightLogical(h, 10), Vector256.Create(0x1Fu));
+        var mant = Avx2.And(h, Vector256.Create(0x3FFu));
+        var mantShift = Avx2.ShiftLeftLogical(mant, 13);
+        var normal = Avx2.Or(Avx2.ShiftLeftLogical(Avx2.Add(exp5, Vector256.Create(112u)), 23), mantShift);
+        var isInfNan = Avx2.CompareEqual(exp5, Vector256.Create(0x1Fu));
+        var mantIsZero = Avx2.CompareEqual(mant, Vector256<uint>.Zero);
+        var isNan = Avx2.AndNot(mantIsZero, isInfNan);
+        var quietBit = Avx2.And(isNan, Vector256.Create(0x400000u));
+        var infnan = Avx2.Or(Avx2.Or(Vector256.Create(0x7F800000u), mantShift), quietBit);
+        var denorm = Avx.Multiply(Avx.ConvertToVector256Single(mant.AsInt32()),
+                                  Vector256.Create(5.9604644775390625e-08f)).AsUInt32();
+        var isZeroDen = Avx2.CompareEqual(exp5, Vector256<uint>.Zero);
+        var notSpecial = Avx2.Xor(Avx2.Or(isInfNan, isZeroDen), Vector256<uint>.AllBitsSet);
+        var body = Avx2.Or(Avx2.Or(Avx2.And(normal, notSpecial), Avx2.And(infnan, isInfNan)),
+                           Avx2.And(denorm, isZeroDen));
+        Avx.Store(dst, Avx2.Or(sign, body).AsSingle());
+    }
+#endif
+
     /// <summary>
     /// Converts double span to float span using AVX narrowing conversion.
     /// </summary>
