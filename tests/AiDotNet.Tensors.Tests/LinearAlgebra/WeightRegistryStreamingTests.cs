@@ -842,8 +842,10 @@ public class WeightRegistryStreamingTests : IDisposable
             WeightRegistry.RegisterWeight(tensors[k]);
         }
 
-        // Concurrent Materialize from 4 threads, each owning a slice of
-        // tensors. All-or-nothing correctness.
+        // Concurrent scoped Materialize from 4 threads, each owning a
+        // slice of tensors. The scope must pin the owner copy while the
+        // caller reads it, even when sibling workers push the pool and
+        // materialized-owner LRU over budget.
         var tasks = new System.Threading.Tasks.Task[4];
         for (int worker = 0; worker < 4; worker++)
         {
@@ -852,13 +854,15 @@ public class WeightRegistryStreamingTests : IDisposable
             {
                 for (int k = wId; k < numTensors; k += 4)
                 {
-                    WeightRegistry.Materialize(tensors[k]);
-                    var got = tensors[k].DataVector.AsSpan();
-                    for (int i = 0; i < 1024; i++)
+                    using (WeightRegistry.MaterializeMany(new[] { tensors[k] }))
                     {
-                        if (got[i] != expected[k][i])
-                            throw new Xunit.Sdk.XunitException(
-                                $"Tensor {k} index {i}: expected {expected[k][i]}, got {got[i]}");
+                        var got = tensors[k].DataVector.AsSpan();
+                        for (int i = 0; i < 1024; i++)
+                        {
+                            if (got[i] != expected[k][i])
+                                throw new Xunit.Sdk.XunitException(
+                                    $"Tensor {k} index {i}: expected {expected[k][i]}, got {got[i]}");
+                        }
                     }
                 }
             });
