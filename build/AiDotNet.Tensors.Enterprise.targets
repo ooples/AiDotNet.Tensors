@@ -107,18 +107,40 @@
     <Message Importance="high"
              Text="AiDotNet enterprise gate: building the license-validator task assembly because the precompiled DLL is missing at $(_AiDotNetLicenseValidatorDll)." />
     <!--
+      Restore and Build MUST be SEPARATE <MSBuild> invocations, not a single
+      Targets="Restore;Build". A combined call evaluates the project only ONCE —
+      before Restore writes obj/project.assets.json — so on a cold tree the Build
+      target compiles with an incomplete reference set (the NETStandard.Library
+      facade is missing) and fails with CS0012 "netstandard 2.0.0.0 not
+      referenced" / CS0234 on System.Security.Cryptography. Two calls force Build
+      to re-evaluate with the freshly generated assets present. (The combined
+      form only appeared to work when a prior build had already produced assets,
+      e.g. a warm tree or a second consecutive build.)
+
       RemoveProperties="TargetFramework": the parent build sets TargetFramework
       as a global property while multi-targeting (net10.0 / net471). Without
       stripping it, that value propagates into this inner build and the
       netstandard2.0 validator project is asked to build for net471 — which
       fails with MSB3644 (no net471 ref assemblies for a netstandard2.0
       project) and was the reason the net471 build path silently skipped the
-      gate. Restore is included so the validator's BouncyCastle / System.Text.Json
-      references resolve on a fresh source tree (otherwise NETSDK1004).
+      gate. The dedicated Restore invocation also resolves the validator's
+      BouncyCastle / System.Text.Json references on a fresh source tree.
+
+      The two calls carry a DIFFERENT extra global property
+      (_LicenseValidatorPhase). MSBuild caches an evaluated project instance
+      keyed by (path + global properties), NOT by the requested target, so if
+      both calls used the same properties the Build call would reuse the
+      instance evaluated during Restore — i.e. evaluated before assets.json
+      existed, defeating the split. The distinct property forces Build to
+      evaluate a fresh instance that sees the freshly-restored assets.
     -->
     <MSBuild Projects="$(MSBuildThisFileDirectory)LicenseValidator\AiDotNet.Tensors.LicenseValidator.csproj"
-             Targets="Restore;Build"
-             Properties="Configuration=Release"
+             Targets="Restore"
+             Properties="Configuration=Release;_LicenseValidatorPhase=Restore"
+             RemoveProperties="TargetFramework;NoBuild" />
+    <MSBuild Projects="$(MSBuildThisFileDirectory)LicenseValidator\AiDotNet.Tensors.LicenseValidator.csproj"
+             Targets="Build"
+             Properties="Configuration=Release;_LicenseValidatorPhase=Build"
              RemoveProperties="TargetFramework;NoBuild" />
   </Target>
 
@@ -225,9 +247,23 @@
           Condition="('$(GeneratePackageOnBuild)' == 'true' Or '$(_IsPacking)' == 'true' Or '$(IsPackable)' != 'false')
                      And '$(MSBuildProjectName)' == 'AiDotNet.Tensors'
                      And Exists('$(MSBuildThisFileDirectory)LicenseValidator\AiDotNet.Tensors.LicenseValidator.csproj')">
+    <!--
+      Separate Restore + Build invocations (see EnsureAiDotNetLicenseValidatorBuilt
+      above): a combined Targets="Restore;Build" evaluates the project before the
+      assets file exists, so a cold pack build compiles the netstandard2.0 validator
+      without the NETStandard.Library facade (CS0012 "netstandard 2.0.0.0 not
+      referenced"). The distinct _LicenseValidatorPhase property on each call
+      forces Build to evaluate a fresh project instance after Restore rather
+      than reuse the pre-restore instance from the MSBuild config cache (see
+      EnsureAiDotNetLicenseValidatorBuilt above).
+    -->
     <MSBuild Projects="$(MSBuildThisFileDirectory)LicenseValidator\AiDotNet.Tensors.LicenseValidator.csproj"
-             Targets="Restore;Build"
-             Properties="Configuration=Release"
+             Targets="Restore"
+             Properties="Configuration=Release;_LicenseValidatorPhase=Restore"
+             RemoveProperties="TargetFramework;NoBuild" />
+    <MSBuild Projects="$(MSBuildThisFileDirectory)LicenseValidator\AiDotNet.Tensors.LicenseValidator.csproj"
+             Targets="Build"
+             Properties="Configuration=Release;_LicenseValidatorPhase=Build"
              RemoveProperties="TargetFramework;NoBuild" />
     <ItemGroup>
       <!-- ONLY the validator DLL closure is added dynamically — those files
