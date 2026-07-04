@@ -5436,48 +5436,25 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             (step.Inputs[0]._shape.Length == 3
              || (step.Inputs[0]._shape.Length == 4 && step.Inputs[0]._shape[0] == 1));
 
+        // BatchNorm forward: the specialized channels-first BatchNormInferenceUnsafe
+        // fast path normalized with — and never refreshed — the savedState
+        // mean/variance. In a TRAINING plan the batch statistics change every step as
+        // the input drifts (activations fed by upstream weights that move), so both the
+        // forward OUTPUT and the backward (which reads the same savedState, see the
+        // BatchNormBackwardInto step) ran on stale, trace-time statistics. Deep fused
+        // BatchNorm models — e.g. FireRedASR's Conformer conv modules — trained worse
+        // every step (LossStrictlyDecreases / DifferentInputs_AfterTraining / MoreData
+        // all failed). Returning null routes BatchNorm through the generic lazy execute
+        // delegate registered by CpuEngine.BatchNorm, which RECOMPUTES the batch
+        // statistics AND copies them into the savedState tensors on every plan.Step() —
+        // exactly the fix LayerNorm got in #1331 (and the GroupNorm equivalent). A future
+        // re-specialization MUST recompute + emit mean/variance alongside the output to
+        // stay correct under training. (Rank-2 [batch,features] BatchNorm never hit this
+        // block — layoutIsChannelsFirstContiguous is false — so it was already correct.)
         if (step.OpType == OpType.BatchNorm && typeof(T) == typeof(float)
-            && step.Inputs.Length >= 3 && step.Inputs[0].IsContiguous
-            && layoutIsChannelsFirstContiguous
-            && step.SavedState is { Length: >= 2 }
-            && step.SavedState[0] is Tensor<T> meanTensor
-            && step.SavedState[1] is Tensor<T> varTensor)
+            && layoutIsChannelsFirstContiguous)
         {
-            var input = step.Inputs[0];
-            var gamma = step.Inputs[1];
-            var beta = step.Inputs[2];
-            var mean = meanTensor;
-            var variance = varTensor;
-            var output = step.OutputBuffer;
-            int channels = gamma.Length;
-            float eps = 1e-5f;
-            if (step.SavedState.Length >= 3 && step.SavedState[2] is double epsD)
-                eps = (float)epsD;
-
-            var inH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)input), handleTracker);
-            var outH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)output), handleTracker);
-            var gammaH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)gamma), handleTracker);
-            var betaH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)beta), handleTracker);
-            var meanH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)mean), handleTracker);
-            var varH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)variance), handleTracker);
-            int length = input.Length;
-            float capturedEps = eps;
-
-            return eng =>
-            {
-                unsafe
-                {
-                    Simd.FusedKernels.BatchNormInferenceUnsafe(
-                        (float*)inH.AddrOfPinnedObject(),
-                        (float*)outH.AddrOfPinnedObject(),
-                        length, channels,
-                        (float*)gammaH.AddrOfPinnedObject(),
-                        (float*)betaH.AddrOfPinnedObject(),
-                        (float*)meanH.AddrOfPinnedObject(),
-                        (float*)varH.AddrOfPinnedObject(),
-                        capturedEps);
-                }
-            };
+            return null;
         }
 
         // LayerNorm: previously routed through FusedKernels.LayerNormUnsafe
@@ -5680,13 +5657,27 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // × 10 sampling steps per Predict — a measurable share of the residual
         // compile-mode-slower-than-eager gap that #1305 surfaced.
         //
-        // SavedState layout for GroupNorm (set at CpuEngine.GroupNorm record-site,
-        // see line ~20597): [int numGroups, Tensor<T> mean, Tensor<T> variance,
-        // double epsilon]. Forward-only inference ignores mean/variance — they
-        // are required for backward only — so we discard them via `out _`.
+        // SavedState layout for GroupNorm (set at CpuEngine.GroupNorm record-site):
+        // [int numGroups, Tensor<T> mean, Tensor<T> variance, double epsilon]. The
+        // GroupNorm BACKWARD (BackwardFunctions<T>.GroupNormBackward) reads mean and
+        // variance from this savedState. In a compiled TRAINING plan the parameters
+        // change every step, so mean/variance MUST be recomputed from the CURRENT
+        // input on each forward replay and written back into the saved tensors —
+        // otherwise the backward runs on stale, trace-time statistics. That mis-directs
+        // the GroupNorm gradient, and (amplified by Adam's per-parameter normalization
+        // over many consecutive steps) makes deep GroupNorm models — e.g. ODISE's
+        // SD-UNet — DIVERGE instead of train: fused ODISE loss went 9231.58 -> 9244.10
+        // (worse) while eager reached 9188.04 (#1750). The eager record-site delegate
+        // already refreshes them the same way (#1331); this keeps the specialized
+        // replay consistent. GroupNormInto computes mean/variance internally regardless
+        // (they were previously discarded via `out _`), so capturing them adds no
+        // allocation — only a small write-back copy. Inference plans have no backward
+        // reader, so the refresh is harmless (and negligible) there.
         if (step.OpType == OpType.GroupNorm && step.Inputs.Length == 3 && step.Inputs[0].IsContiguous
             && step.SavedState is { Length: >= 4 }
             && step.SavedState[0] is int numGroupsGN
+            && step.SavedState[1] is Tensor<T> savedMeanGN
+            && step.SavedState[2] is Tensor<T> savedVarGN
             && step.SavedState[3] is double epsilonGN)
         {
             var inp = step.Inputs[0];
@@ -5695,13 +5686,33 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var o = step.OutputBuffer;
             return eng =>
             {
+                Tensor<T> freshMean, freshVar;
                 if (eng is CpuEngine cpuEng)
-                    cpuEng.GroupNormInto(o, inp, numGroupsGN, gamma, beta, epsilonGN, out _, out _);
+                    cpuEng.GroupNormInto(o, inp, numGroupsGN, gamma, beta, epsilonGN, out freshMean, out freshVar);
                 else
                 {
-                    var result = eng.GroupNorm(inp, numGroupsGN, gamma, beta, epsilonGN, out _, out _);
+                    var result = eng.GroupNorm(inp, numGroupsGN, gamma, beta, epsilonGN, out freshMean, out freshVar);
                     result.AsSpan().CopyTo(o.AsWritableSpan());
                 }
+                // Refresh the saved statistics the backward reads (see note above).
+                // In a compiled plan the trace-time and replay-time shapes are fixed, so
+                // mean/variance lengths must never legitimately diverge — a mismatch signals
+                // a real bug. Fail loud rather than silently skipping the refresh, which would
+                // resurrect the exact stale-statistics corruption this path exists to fix.
+                if (freshMean.Length != savedMeanGN.Length || freshVar.Length != savedVarGN.Length)
+                    throw new InvalidOperationException(
+                        $"GroupNorm forward produced mean/variance of length ({freshMean.Length}, {freshVar.Length}) " +
+                        $"but the compiled savedState buffers are ({savedMeanGN.Length}, {savedVarGN.Length}); " +
+                        "refusing to silently skip the statistics refresh (this is the same stale-statistics class of bug being fixed here).");
+                freshMean.AsSpan().CopyTo(savedMeanGN.AsWritableSpan());
+                freshVar.AsSpan().CopyTo(savedVarGN.AsWritableSpan());
+
+                // Return the freshly-rented stat temporaries to the pool. Both GroupNormInto
+                // and GroupNorm Rent freshMean/freshVar from TensorAllocator; this replay path
+                // only needs their values copied into savedMeanGN/savedVarGN above. Without the
+                // Return, every training Step() would leak two pooled tensors.
+                TensorAllocator.Return(freshMean);
+                TensorAllocator.Return(freshVar);
             };
         }
 
