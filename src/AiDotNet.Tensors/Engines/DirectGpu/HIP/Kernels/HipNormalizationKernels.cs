@@ -50,7 +50,13 @@ extern ""C"" __global__ __launch_bounds__(256) void batchnorm_forward(
 
     if (training) {
         runningMean[c] = (1.0f - momentum) * runningMean[c] + momentum * mean;
-        runningVar[c] = (1.0f - momentum) * runningVar[c] + momentum * var;
+        // Unbiased (Bessel-corrected) running variance — paper-faithful
+        // (Ioffe & Szegedy 2015 §3.1), matches cuDNN. Normalization uses the
+        // biased var; guard batchSpatial==1 (unbiased is undefined).
+        float runVarUnbiased = batchSpatial > 1
+            ? var * (float)batchSpatial / (float)(batchSpatial - 1)
+            : var;
+        runningVar[c] = (1.0f - momentum) * runningVar[c] + momentum * runVarUnbiased;
     }
 
     float g = gamma[c];
