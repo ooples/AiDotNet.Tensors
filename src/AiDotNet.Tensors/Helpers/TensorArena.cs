@@ -177,53 +177,6 @@ public sealed class TensorArena : IDisposable
     /// </summary>
     internal static TensorArena? Current => _current;
 
-    /// <summary>
-    /// Returns a compact, never-throwing description of the calling thread's active arena and the
-    /// cross-arena persistent pool. Diagnostic-only: used to enrich a large-allocation failure so the
-    /// nightly HeavyTimeout run can capture the arena-state-dependent BF16 Adam rent failure (AiDotNet#1767).
-    /// Reports the tensor-ring sizes, dictionary-pool keys with their backing-array lengths (to expose a
-    /// size/length mismatch), and the pinned/backing/persistent counts.
-    /// </summary>
-    internal static string DescribeCurrentStateForDiagnostics()
-    {
-        try
-        {
-            var a = _current;
-            var sb = new System.Text.StringBuilder();
-            sb.Append("arenaActive=").Append(a != null);
-            if (a != null)
-            {
-                sb.Append(", tensorRingCount=").Append(a._tensorRingCount);
-                sb.Append(", tensorRingSizes=[");
-                if (a._tensorRingSizes != null)
-                    for (int i = 0; i < a._tensorRingCount && i < a._tensorRingSizes.Length; i++)
-                    { if (i > 0) sb.Append(','); sb.Append(a._tensorRingSizes[i]); }
-                sb.Append(']');
-                sb.Append(", pinnedArrays=").Append(a._pinnedArrays.Count);
-                sb.Append(", ringBackingArrays=").Append(a._ringBackingArrays.Count);
-                sb.Append(", pool={");
-                bool first = true;
-                foreach (var kv in a._pool)
-                {
-                    if (!first) sb.Append(';'); first = false;
-                    sb.Append(kv.Key.Item1?.Name).Append(':').Append(kv.Key.Item2).Append("=>");
-                    sb.Append(kv.Value?.Count ?? 0).Append('#');
-                    // backing-array lengths for this (type,size) bucket — a length != key size is the bug signature.
-                    if (kv.Value != null)
-                        for (int i = 0; i < kv.Value.Count; i++)
-                        { if (i > 0) sb.Append('/'); sb.Append(kv.Value[i]?.Length ?? -1); }
-                }
-                sb.Append('}');
-            }
-            sb.Append(", persistentPoolKeys=").Append(_persistent?.Count ?? 0);
-            return sb.ToString();
-        }
-        catch (Exception e)
-        {
-            return "arenaDiag-unavailable(" + e.GetType().Name + ")";
-        }
-    }
-
     private TensorArena(TensorArena? previous)
     {
         _previous = previous;
