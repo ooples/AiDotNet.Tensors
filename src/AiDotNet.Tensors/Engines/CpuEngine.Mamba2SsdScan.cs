@@ -100,37 +100,46 @@ public partial class CpuEngine
     {
         var negA = new double[numHeads];
         for (int hi = 0; hi < numHeads; hi++) negA[hi] = -Math.Exp(aLog[hi]);
-        var h = new double[innerDim * sd];
+        // Each head hi owns a disjoint state block and output region (B/C are shared but only read here),
+        // so the head axis is parallelizable with no reduction in the forward. Keep b outer; head-local
+        // state. (di within a head share the head's scalar dt/aBar but distinct state rows.)
         for (int b = 0; b < batch; b++)
         {
-            Array.Clear(h, 0, h.Length);
-            for (int t = 0; t < seqLen; t++)
+            int bIdx = b;
+            CpuParallelSettings.ParallelForChunks(numHeads, MambaDiGrain, (hStart, hCount) =>
             {
-                int btInner = (b * seqLen + t) * innerDim;
-                int btState = (b * seqLen + t) * sd;
-                int btHead = (b * seqLen + t) * numHeads;
-                for (int hi = 0; hi < numHeads; hi++)
+                var hHead = new double[headDim * sd];
+                int hEnd = hStart + hCount;
+                for (int hi = hStart; hi < hEnd; hi++)
                 {
-                    double dt = delta[btHead + hi];
-                    double aBar = Math.Exp(dt * negA[hi]);
+                    Array.Clear(hHead, 0, headDim * sd);
+                    double aHi = negA[hi];
                     double dv = D[hi];
                     int dimStart = hi * headDim;
-                    for (int di = 0; di < headDim; di++)
+                    for (int t = 0; t < seqLen; t++)
                     {
-                        int flatD = dimStart + di;
-                        double xv = X[btInner + flatD];
-                        int hsBase = flatD * sd;
-                        double y = 0.0;
-                        for (int n = 0; n < sd; n++)
+                        int btInner = (bIdx * seqLen + t) * innerDim;
+                        int btState = (bIdx * seqLen + t) * sd;
+                        int btHead = (bIdx * seqLen + t) * numHeads;
+                        double dt = delta[btHead + hi];
+                        double aBar = Math.Exp(dt * aHi);
+                        for (int di = 0; di < headDim; di++)
                         {
-                            double hNew = aBar * h[hsBase + n] + dt * B[btState + n] * xv;
-                            h[hsBase + n] = hNew;
-                            y += C[btState + n] * hNew;
+                            int flatD = dimStart + di;
+                            double xv = X[btInner + flatD];
+                            int hsBase = di * sd; // head-local state row
+                            double y = 0.0;
+                            for (int n = 0; n < sd; n++)
+                            {
+                                double hNew = aBar * hHead[hsBase + n] + dt * B[btState + n] * xv;
+                                hHead[hsBase + n] = hNew;
+                                y += C[btState + n] * hNew;
+                            }
+                            outp[btInner + flatD] = y + dv * xv;
                         }
-                        outp[btInner + flatD] = y + dv * xv;
                     }
                 }
-            }
+            });
         }
     }
 
@@ -139,91 +148,117 @@ public partial class CpuEngine
         double[] dX, double[] dDelta, double[] dALog, double[] dB, double[] dC, double[] dD,
         int batch, int seqLen, int innerDim, int numHeads, int headDim, int sd)
     {
-        int isd = innerDim * sd;
         var negA = new double[numHeads];
         for (int hi = 0; hi < numHeads; hi++) negA[hi] = -Math.Exp(aLog[hi]);
-        var hTraj = new double[seqLen * isd];
-        var h = new double[isd];
-        var dh = new double[isd];
+        int hd = headDim * sd; // head-local state size
 
+        // Parallelize over the head axis hi. dDelta/dALog/dD are per-head and dX per-flatD (all owned by
+        // hi), so they're written lock-free; B/C are shared across heads, so dB/dC (summed over heads) use
+        // per-chunk private partials reduced under a coarse lock. Keep b outer; head-local state/trajectory.
+        var reduceLock = new object();
         for (int b = 0; b < batch; b++)
         {
-            // Forward recompute, saving the post-update state trajectory.
-            Array.Clear(h, 0, isd);
-            for (int t = 0; t < seqLen; t++)
+            int bIdx = b;
+            CpuParallelSettings.ParallelForChunks(numHeads, MambaDiGrain, (hStart, hCount) =>
             {
-                int btInner = (b * seqLen + t) * innerDim;
-                int btState = (b * seqLen + t) * sd;
-                int btHead = (b * seqLen + t) * numHeads;
-                for (int hi = 0; hi < numHeads; hi++)
+                var hHead = new double[hd];
+                var hTrajHead = new double[seqLen * hd];
+                var dhHead = new double[hd];
+                var dBpart = new double[seqLen * sd];
+                var dCpart = new double[seqLen * sd];
+                int hEnd = hStart + hCount;
+                for (int hi = hStart; hi < hEnd; hi++)
                 {
-                    double dt = delta[btHead + hi];
-                    double aBar = Math.Exp(dt * negA[hi]);
+                    double aHi = negA[hi];
                     int dimStart = hi * headDim;
-                    for (int di = 0; di < headDim; di++)
+
+                    // Forward recompute for this head, saving its post-update state trajectory.
+                    Array.Clear(hHead, 0, hd);
+                    for (int t = 0; t < seqLen; t++)
                     {
-                        int flatD = dimStart + di;
-                        double xv = X[btInner + flatD];
-                        int hsBase = flatD * sd;
-                        for (int n = 0; n < sd; n++)
-                            h[hsBase + n] = aBar * h[hsBase + n] + dt * B[btState + n] * xv;
+                        int btInner = (bIdx * seqLen + t) * innerDim;
+                        int btState = (bIdx * seqLen + t) * sd;
+                        int btHead = (bIdx * seqLen + t) * numHeads;
+                        double dt = delta[btHead + hi];
+                        double aBar = Math.Exp(dt * aHi);
+                        for (int di = 0; di < headDim; di++)
+                        {
+                            int flatD = dimStart + di;
+                            double xv = X[btInner + flatD];
+                            int hsBase = di * sd;
+                            for (int n = 0; n < sd; n++)
+                                hHead[hsBase + n] = aBar * hHead[hsBase + n] + dt * B[btState + n] * xv;
+                        }
+                        Array.Copy(hHead, 0, hTrajHead, t * hd, hd);
+                    }
+
+                    // Reverse sweep.
+                    Array.Clear(dhHead, 0, hd);
+                    for (int t = seqLen - 1; t >= 0; t--)
+                    {
+                        int btInner = (bIdx * seqLen + t) * innerDim;
+                        int btState = (bIdx * seqLen + t) * sd;
+                        int btHead = (bIdx * seqLen + t) * numHeads;
+                        int stOff = t * hd, spOff = (t - 1) * hd, dbOff = t * sd;
+                        double dt = delta[btHead + hi];
+                        double a = aHi;
+                        double aBar = Math.Exp(dt * a);
+                        double dDeltaAcc = 0.0, dALogAcc = 0.0, dDAcc = 0.0;
+                        for (int di = 0; di < headDim; di++)
+                        {
+                            int flatD = dimStart + di;
+                            double xv = X[btInner + flatD];
+                            int hsBase = di * sd;
+                            double dOutVal = dOut[btInner + flatD];
+
+                            // D skip: y += D[h]*x.
+                            dX[btInner + flatD] += D[hi] * dOutVal;
+                            dDAcc += xv * dOutVal;
+
+                            for (int n = 0; n < sd; n++)
+                            {
+                                double hCur = hTrajHead[stOff + hsBase + n];
+                                double hPrev = t > 0 ? hTrajHead[spOff + hsBase + n] : 0.0;
+                                // Output: dh += C*dOut ; dC += h_t*dOut (private partial).
+                                dhHead[hsBase + n] += C[btState + n] * dOutVal;
+                                dCpart[dbOff + n] += hCur * dOutVal;
+                                double dhVal = dhHead[hsBase + n];
+
+                                // h_t = aBar*hPrev + dt*B*x.
+                                double dAbar = dhVal * hPrev;
+                                dDeltaAcc += dAbar * aBar * a;            // A-path: dAbar*Abar*A
+                                dALogAcc += dAbar * aBar * (dt * a);      // aLog: dAbar*Abar*(dt*A)
+                                dDeltaAcc += dhVal * B[btState + n] * xv; // B*x path
+                                dBpart[dbOff + n] += dhVal * dt * xv;
+                                dX[btInner + flatD] += dhVal * dt * B[btState + n];
+
+                                // Propagate to previous step.
+                                dhHead[hsBase + n] = dhVal * aBar;
+                            }
+                        }
+                        dDelta[btHead + hi] += dDeltaAcc;
+                        dALog[hi] += dALogAcc;
+                        dD[hi] += dDAcc;
                     }
                 }
-                Array.Copy(h, 0, hTraj, t * isd, isd);
-            }
 
-            // Reverse sweep.
-            Array.Clear(dh, 0, isd);
-            for (int t = seqLen - 1; t >= 0; t--)
-            {
-                int btInner = (b * seqLen + t) * innerDim;
-                int btState = (b * seqLen + t) * sd;
-                int btHead = (b * seqLen + t) * numHeads;
-                int stOff = t * isd, spOff = (t - 1) * isd;
-                for (int hi = 0; hi < numHeads; hi++)
+                // Reduce this chunk's dB/dC partials into the shared gradients (cross-head sum).
+                lock (reduceLock)
                 {
-                    double dt = delta[btHead + hi];
-                    double a = negA[hi];
-                    double aBar = Math.Exp(dt * a);
-                    int dimStart = hi * headDim;
-                    double dDeltaAcc = 0.0, dALogAcc = 0.0, dDAcc = 0.0;
-                    for (int di = 0; di < headDim; di++)
+                    for (int t = 0; t < seqLen; t++)
                     {
-                        int flatD = dimStart + di;
-                        double xv = X[btInner + flatD];
-                        int hsBase = flatD * sd;
-                        double dOutVal = dOut[btInner + flatD];
-
-                        // D skip: y += D[h]*x.
-                        dX[btInner + flatD] += D[hi] * dOutVal;
-                        dDAcc += xv * dOutVal;
-
+                        int btState = (bIdx * seqLen + t) * sd;
+                        int dbOff = t * sd;
                         for (int n = 0; n < sd; n++)
                         {
-                            double hCur = hTraj[stOff + hsBase + n];
-                            double hPrev = t > 0 ? hTraj[spOff + hsBase + n] : 0.0;
-                            // Output: dh += C*dOut ; dC += h_t*dOut.
-                            dh[hsBase + n] += C[btState + n] * dOutVal;
-                            dC[btState + n] += hCur * dOutVal;
-                            double dhVal = dh[hsBase + n];
-
-                            // h_t = aBar*hPrev + dt*B*x.
-                            double dAbar = dhVal * hPrev;
-                            dDeltaAcc += dAbar * aBar * a;            // A-path: dAbar*Abar*A
-                            dALogAcc += dAbar * aBar * (dt * a);      // aLog: dAbar*Abar*(dt*A)
-                            dDeltaAcc += dhVal * B[btState + n] * xv; // B*x path
-                            dB[btState + n] += dhVal * dt * xv;
-                            dX[btInner + flatD] += dhVal * dt * B[btState + n];
-
-                            // Propagate to previous step.
-                            dh[hsBase + n] = dhVal * aBar;
+                            dB[btState + n] += dBpart[dbOff + n];
+                            dC[btState + n] += dCpart[dbOff + n];
                         }
                     }
-                    dDelta[btHead + hi] += dDeltaAcc;
-                    dALog[hi] += dALogAcc;
-                    dD[hi] += dDAcc;
+                    Array.Clear(dBpart, 0, seqLen * sd);
+                    Array.Clear(dCpart, 0, seqLen * sd);
                 }
-            }
+            });
         }
     }
 
@@ -235,38 +270,46 @@ public partial class CpuEngine
         var ops = MathHelper.GetNumericOperations<T>();
         var negA = new T[numHeads];
         for (int hi = 0; hi < numHeads; hi++) negA[hi] = ops.Negate(ops.Exp(aLog[hi]));
-        var h = new T[innerDim * sd];
+        int hd = headDim * sd;
+        // Head-parallel with b outer; head-local state. See Mamba2ForwardDouble.
         for (int b = 0; b < batch; b++)
         {
-            for (int i = 0; i < h.Length; i++) h[i] = ops.Zero;
-            for (int t = 0; t < seqLen; t++)
+            int bIdx = b;
+            CpuParallelSettings.ParallelForChunks(numHeads, MambaDiGrain, (hStart, hCount) =>
             {
-                int btInner = (b * seqLen + t) * innerDim;
-                int btState = (b * seqLen + t) * sd;
-                int btHead = (b * seqLen + t) * numHeads;
-                for (int hi = 0; hi < numHeads; hi++)
+                var hHead = new T[hd];
+                int hEnd = hStart + hCount;
+                for (int hi = hStart; hi < hEnd; hi++)
                 {
-                    T dt = delta[btHead + hi];
-                    T aBar = ops.Exp(ops.Multiply(dt, negA[hi]));
+                    for (int i = 0; i < hd; i++) hHead[i] = ops.Zero;
+                    T aHi = negA[hi];
                     T dv = D[hi];
                     int dimStart = hi * headDim;
-                    for (int di = 0; di < headDim; di++)
+                    for (int t = 0; t < seqLen; t++)
                     {
-                        int flatD = dimStart + di;
-                        T xv = X[btInner + flatD];
-                        int hsBase = flatD * sd;
-                        T y = ops.Zero;
-                        for (int n = 0; n < sd; n++)
+                        int btInner = (bIdx * seqLen + t) * innerDim;
+                        int btState = (bIdx * seqLen + t) * sd;
+                        int btHead = (bIdx * seqLen + t) * numHeads;
+                        T dt = delta[btHead + hi];
+                        T aBar = ops.Exp(ops.Multiply(dt, aHi));
+                        for (int di = 0; di < headDim; di++)
                         {
-                            T hNew = ops.Add(ops.Multiply(aBar, h[hsBase + n]),
-                                ops.Multiply(dt, ops.Multiply(B[btState + n], xv)));
-                            h[hsBase + n] = hNew;
-                            y = ops.Add(y, ops.Multiply(C[btState + n], hNew));
+                            int flatD = dimStart + di;
+                            T xv = X[btInner + flatD];
+                            int hsBase = di * sd;
+                            T y = ops.Zero;
+                            for (int n = 0; n < sd; n++)
+                            {
+                                T hNew = ops.Add(ops.Multiply(aBar, hHead[hsBase + n]),
+                                    ops.Multiply(dt, ops.Multiply(B[btState + n], xv)));
+                                hHead[hsBase + n] = hNew;
+                                y = ops.Add(y, ops.Multiply(C[btState + n], hNew));
+                            }
+                            outp[btInner + flatD] = ops.Add(y, ops.Multiply(dv, xv));
                         }
-                        outp[btInner + flatD] = ops.Add(y, ops.Multiply(dv, xv));
                     }
                 }
-            }
+            });
         }
     }
 
@@ -276,82 +319,105 @@ public partial class CpuEngine
         int batch, int seqLen, int innerDim, int numHeads, int headDim, int sd)
     {
         var ops = MathHelper.GetNumericOperations<T>();
-        int isd = innerDim * sd;
         var negA = new T[numHeads];
         for (int hi = 0; hi < numHeads; hi++) negA[hi] = ops.Negate(ops.Exp(aLog[hi]));
-        var hTraj = new T[seqLen * isd];
-        var h = new T[isd];
-        var dh = new T[isd];
+        int hd = headDim * sd;
 
+        // Head-parallel with b outer; head-local state/trajectory; per-chunk dB/dC partials (cross-head
+        // reduction) under a coarse lock. See Mamba2BackwardDouble.
+        var reduceLock = new object();
         for (int b = 0; b < batch; b++)
         {
-            for (int i = 0; i < isd; i++) h[i] = ops.Zero;
-            for (int t = 0; t < seqLen; t++)
+            int bIdx = b;
+            CpuParallelSettings.ParallelForChunks(numHeads, MambaDiGrain, (hStart, hCount) =>
             {
-                int btInner = (b * seqLen + t) * innerDim;
-                int btState = (b * seqLen + t) * sd;
-                int btHead = (b * seqLen + t) * numHeads;
-                for (int hi = 0; hi < numHeads; hi++)
+                var hHead = new T[hd];
+                var hTrajHead = new T[seqLen * hd];
+                var dhHead = new T[hd];
+                var dBpart = new T[seqLen * sd];
+                var dCpart = new T[seqLen * sd];
+                for (int i = 0; i < seqLen * sd; i++) { dBpart[i] = ops.Zero; dCpart[i] = ops.Zero; }
+                int hEnd = hStart + hCount;
+                for (int hi = hStart; hi < hEnd; hi++)
                 {
-                    T dt = delta[btHead + hi];
-                    T aBar = ops.Exp(ops.Multiply(dt, negA[hi]));
+                    T aHi = negA[hi];
                     int dimStart = hi * headDim;
-                    for (int di = 0; di < headDim; di++)
+
+                    for (int i = 0; i < hd; i++) hHead[i] = ops.Zero;
+                    for (int t = 0; t < seqLen; t++)
                     {
-                        int flatD = dimStart + di;
-                        T xv = X[btInner + flatD];
-                        int hsBase = flatD * sd;
-                        for (int n = 0; n < sd; n++)
-                            h[hsBase + n] = ops.Add(ops.Multiply(aBar, h[hsBase + n]),
-                                ops.Multiply(dt, ops.Multiply(B[btState + n], xv)));
+                        int btInner = (bIdx * seqLen + t) * innerDim;
+                        int btState = (bIdx * seqLen + t) * sd;
+                        int btHead = (bIdx * seqLen + t) * numHeads;
+                        T dt = delta[btHead + hi];
+                        T aBar = ops.Exp(ops.Multiply(dt, aHi));
+                        for (int di = 0; di < headDim; di++)
+                        {
+                            int flatD = dimStart + di;
+                            T xv = X[btInner + flatD];
+                            int hsBase = di * sd;
+                            for (int n = 0; n < sd; n++)
+                                hHead[hsBase + n] = ops.Add(ops.Multiply(aBar, hHead[hsBase + n]),
+                                    ops.Multiply(dt, ops.Multiply(B[btState + n], xv)));
+                        }
+                        Array.Copy(hHead, 0, hTrajHead, t * hd, hd);
+                    }
+
+                    for (int i = 0; i < hd; i++) dhHead[i] = ops.Zero;
+                    for (int t = seqLen - 1; t >= 0; t--)
+                    {
+                        int btInner = (bIdx * seqLen + t) * innerDim;
+                        int btState = (bIdx * seqLen + t) * sd;
+                        int btHead = (bIdx * seqLen + t) * numHeads;
+                        int stOff = t * hd, spOff = (t - 1) * hd, dbOff = t * sd;
+                        T dt = delta[btHead + hi];
+                        T a = aHi;
+                        T aBar = ops.Exp(ops.Multiply(dt, a));
+                        T dDeltaAcc = ops.Zero, dALogAcc = ops.Zero, dDAcc = ops.Zero;
+                        for (int di = 0; di < headDim; di++)
+                        {
+                            int flatD = dimStart + di;
+                            T xv = X[btInner + flatD];
+                            int hsBase = di * sd;
+                            T dOutVal = dOut[btInner + flatD];
+                            dX[btInner + flatD] = ops.Add(dX[btInner + flatD], ops.Multiply(D[hi], dOutVal));
+                            dDAcc = ops.Add(dDAcc, ops.Multiply(xv, dOutVal));
+                            for (int n = 0; n < sd; n++)
+                            {
+                                T hCur = hTrajHead[stOff + hsBase + n];
+                                T hPrev = t > 0 ? hTrajHead[spOff + hsBase + n] : ops.Zero;
+                                dhHead[hsBase + n] = ops.Add(dhHead[hsBase + n], ops.Multiply(C[btState + n], dOutVal));
+                                dCpart[dbOff + n] = ops.Add(dCpart[dbOff + n], ops.Multiply(hCur, dOutVal));
+                                T dhVal = dhHead[hsBase + n];
+                                T dAbar = ops.Multiply(dhVal, hPrev);
+                                dDeltaAcc = ops.Add(dDeltaAcc, ops.Multiply(ops.Multiply(dAbar, aBar), a));
+                                dALogAcc = ops.Add(dALogAcc, ops.Multiply(ops.Multiply(dAbar, aBar), ops.Multiply(dt, a)));
+                                dDeltaAcc = ops.Add(dDeltaAcc, ops.Multiply(dhVal, ops.Multiply(B[btState + n], xv)));
+                                dBpart[dbOff + n] = ops.Add(dBpart[dbOff + n], ops.Multiply(dhVal, ops.Multiply(dt, xv)));
+                                dX[btInner + flatD] = ops.Add(dX[btInner + flatD], ops.Multiply(dhVal, ops.Multiply(dt, B[btState + n])));
+                                dhHead[hsBase + n] = ops.Multiply(dhVal, aBar);
+                            }
+                        }
+                        dDelta[btHead + hi] = ops.Add(dDelta[btHead + hi], dDeltaAcc);
+                        dALog[hi] = ops.Add(dALog[hi], dALogAcc);
+                        dD[hi] = ops.Add(dD[hi], dDAcc);
                     }
                 }
-                Array.Copy(h, 0, hTraj, t * isd, isd);
-            }
 
-            for (int i = 0; i < isd; i++) dh[i] = ops.Zero;
-            for (int t = seqLen - 1; t >= 0; t--)
-            {
-                int btInner = (b * seqLen + t) * innerDim;
-                int btState = (b * seqLen + t) * sd;
-                int btHead = (b * seqLen + t) * numHeads;
-                int stOff = t * isd, spOff = (t - 1) * isd;
-                for (int hi = 0; hi < numHeads; hi++)
+                lock (reduceLock)
                 {
-                    T dt = delta[btHead + hi];
-                    T a = negA[hi];
-                    T aBar = ops.Exp(ops.Multiply(dt, a));
-                    int dimStart = hi * headDim;
-                    T dDeltaAcc = ops.Zero, dALogAcc = ops.Zero, dDAcc = ops.Zero;
-                    for (int di = 0; di < headDim; di++)
+                    for (int t = 0; t < seqLen; t++)
                     {
-                        int flatD = dimStart + di;
-                        T xv = X[btInner + flatD];
-                        int hsBase = flatD * sd;
-                        T dOutVal = dOut[btInner + flatD];
-                        dX[btInner + flatD] = ops.Add(dX[btInner + flatD], ops.Multiply(D[hi], dOutVal));
-                        dDAcc = ops.Add(dDAcc, ops.Multiply(xv, dOutVal));
+                        int btState = (bIdx * seqLen + t) * sd;
+                        int dbOff = t * sd;
                         for (int n = 0; n < sd; n++)
                         {
-                            T hCur = hTraj[stOff + hsBase + n];
-                            T hPrev = t > 0 ? hTraj[spOff + hsBase + n] : ops.Zero;
-                            dh[hsBase + n] = ops.Add(dh[hsBase + n], ops.Multiply(C[btState + n], dOutVal));
-                            dC[btState + n] = ops.Add(dC[btState + n], ops.Multiply(hCur, dOutVal));
-                            T dhVal = dh[hsBase + n];
-                            T dAbar = ops.Multiply(dhVal, hPrev);
-                            dDeltaAcc = ops.Add(dDeltaAcc, ops.Multiply(ops.Multiply(dAbar, aBar), a));
-                            dALogAcc = ops.Add(dALogAcc, ops.Multiply(ops.Multiply(dAbar, aBar), ops.Multiply(dt, a)));
-                            dDeltaAcc = ops.Add(dDeltaAcc, ops.Multiply(dhVal, ops.Multiply(B[btState + n], xv)));
-                            dB[btState + n] = ops.Add(dB[btState + n], ops.Multiply(dhVal, ops.Multiply(dt, xv)));
-                            dX[btInner + flatD] = ops.Add(dX[btInner + flatD], ops.Multiply(dhVal, ops.Multiply(dt, B[btState + n])));
-                            dh[hsBase + n] = ops.Multiply(dhVal, aBar);
+                            dB[btState + n] = ops.Add(dB[btState + n], dBpart[dbOff + n]);
+                            dC[btState + n] = ops.Add(dC[btState + n], dCpart[dbOff + n]);
                         }
                     }
-                    dDelta[btHead + hi] = ops.Add(dDelta[btHead + hi], dDeltaAcc);
-                    dALog[hi] = ops.Add(dALog[hi], dALogAcc);
-                    dD[hi] = ops.Add(dD[hi], dDAcc);
                 }
-            }
+            });
         }
     }
 

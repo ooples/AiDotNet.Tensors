@@ -10144,6 +10144,76 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>
+    /// Inference-only fused linear with an fp16-resident weight: <c>Activation(input · Wfp16 + bias)</c>.
+    /// The weight stays <see cref="Half"/> and is converted fp16→fp32 inside the GEMM's pack step
+    /// (<see cref="Simd.SimdGemm.SgemmFp16WeightB"/>) — no whole-tensor upcast — then bias broadcast-add and
+    /// the fused activation run in the epilogue. Does NOT record on the autodiff tape; the caller uses it
+    /// only when <c>LowPrecisionResident</c> is active, T is float, and no tape/graph is recording.
+    /// </summary>
+    public Tensor<float> FusedLinearFp16WeightB(
+        Tensor<float> input, Tensor<Half> weightHalf, Tensor<float>? bias,
+        FusedActivationType activation, FusedActivationParams? activationParams = null)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (weightHalf is null) throw new ArgumentNullException(nameof(weightHalf));
+        if (input.Rank == 1)
+        {
+            var promoted = FusedLinearFp16WeightB(
+                Reshape(input, new[] { 1, input._shape[0] }), weightHalf, bias, activation, activationParams);
+            return Reshape(promoted, new[] { promoted._shape[promoted.Rank - 1] });
+        }
+
+        var result = TensorMatMulFp16WeightB(input, weightHalf); // [m, n], convert-in-pack matmul
+        if (bias is not null)
+        {
+            int n = result.Shape[result.Rank - 1];
+            if (bias.Length != n)
+                throw new ArgumentException($"bias length ({bias.Length}) must equal output features ({n}).");
+            var rData = result.GetCpuData();
+            var bData = bias.GetCpuData();
+            int rows = result.Length / n;
+            for (int i = 0; i < rows; i++)
+            {
+                int baseIdx = i * n;
+                for (int j = 0; j < n; j++) rData[baseIdx + j] += bData[j];
+            }
+        }
+        if (activation != FusedActivationType.None)
+            ApplyFusedActivationInPlace(result, activation, activationParams);
+        return result;
+    }
+
+    /// <summary>
+    /// Fused fp16-weight matmul for fp16-resident inference: <c>C[m,n] = A[m,k] · B[k,n]</c> where B is
+    /// a 2D <see cref="Half"/> weight in <c>[k, n]</c> row-major. Converts the weight one cache-resident
+    /// column panel at a time inside the GEMM (no full fp32 materialization), eliminating the cold-RAM
+    /// write+reread that a whole-tensor upcast pays. Inference-only (does not record on the autodiff tape);
+    /// callers use it when <c>LowPrecisionResident</c> is active and no tape is recording.
+    /// </summary>
+    public Tensor<float> TensorMatMulFp16WeightB(Tensor<float> a, Tensor<Half> b)
+    {
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b is null) throw new ArgumentNullException(nameof(b));
+        if (a.Rank != 2 || b.Rank != 2)
+            throw new ArgumentException("TensorMatMulFp16WeightB requires 2D tensors.");
+        int m = a.Shape[0], k = a.Shape[1];
+        if (b.Shape[0] != k)
+            throw new ArgumentException($"Inner dimensions must match: a[.,{k}] vs b[{b.Shape[0]},.].");
+        int n = b.Shape[1];
+
+        var aData = a.GetCpuData();
+        var bData = b.GetCpuData();
+        var result = new Tensor<float>(new[] { m, n });
+        var cData = result.GetCpuData();
+        Simd.SimdGemm.SgemmFp16WeightB(
+            new ReadOnlySpan<float>(aData, 0, m * k),
+            new ReadOnlySpan<Half>(bData, 0, k * n),
+            new Span<float>(cData, 0, m * n),
+            m, k, n);
+        return result;
+    }
+
+    /// <summary>
     /// Naive Conv2D implementation for non-float types.
     /// </summary>
     private static void Conv2DNaive<T>(
