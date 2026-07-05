@@ -1036,6 +1036,41 @@ public sealed class CuDnnContext : IDisposable
         }
     }
 
+    // Discriminator ctor for ForCurrentContext (see below). The bool is only
+    // there to distinguish this from the public parameterless ctor.
+    private CuDnnContext(bool bindToCurrentContext)
+    {
+        if (!IsAvailable)
+            throw new InvalidOperationException("cuDNN is not available on this system.");
+
+        // Bind the handle to the CUDA context ALREADY current on this thread
+        // instead of spinning up our own CudaBlasContext. cudnnCreate binds to
+        // whatever context is current; if we created a CudaBlasContext first it
+        // would switch the current context and the handle would bind to the
+        // wrong one — which then fails cudnnSetStream with
+        // CUDNN_STATUS_BAD_PARAM_STREAM_MISMATCH when the caller hands us its
+        // own stream, and would leave cuDNN unable to address the caller's
+        // device pointers (device memory is per-context). _blasContext stays
+        // null: only the GPU-pointer op variants (Conv2DForwardGpu /
+        // ForwardTrainingGpu / ForwardInferenceGpu / BackwardGpu) are valid on
+        // such an instance — the host-array helpers that need _blasContext are
+        // not.
+        _blasContext = null;
+        var status = CuDnnNative.cudnnCreate(out _cudnnHandle);
+        if (status != CuDnnNative.CudnnStatus.Success)
+            throw new InvalidOperationException($"Failed to create cuDNN handle: {status}");
+    }
+
+    /// <summary>
+    /// Creates a cuDNN context whose handle binds to the CUDA context already
+    /// current on the calling thread (e.g. a <c>CudaBackend</c> context pushed
+    /// via <c>cuCtxPushCurrent</c>). The handle, the caller's stream, and the
+    /// caller's device buffers then share one context — required for
+    /// <c>cudnnSetStream</c> and for cuDNN to operate on the caller's device
+    /// pointers. Only the GPU-pointer op variants are valid on the result.
+    /// </summary>
+    public static CuDnnContext ForCurrentContext() => new CuDnnContext(bindToCurrentContext: true);
+
     /// <summary>Allocates device memory.</summary>
     public CudaDeviceMemory<T> Allocate<T>(long count) where T : unmanaged
     {

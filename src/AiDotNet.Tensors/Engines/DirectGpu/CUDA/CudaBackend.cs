@@ -65,6 +65,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     // repeated kernel invocations (workspace reuse + descriptor cache).
     private CuDnnContext? _cudnnContext;
     private CuDnnConvolution? _cudnnConv;
+    // cuDNN batch-norm helper — lazily initialized on the first BatchNorm
+    // call that routes through the cuDNN dispatch path (UseCudnnForBatchNorm).
+    // Shares the same CuDnnContext as _cudnnConv (guarded by _cudnnInitLock).
+    private CuDnnBatchNorm? _cudnnBn;
     // Guards EnsureCudnnConv lazy-init against concurrent first callers.
     // Without this, two threads entering EnsureCudnnConv simultaneously
     // can both observe _cudnnConv == null and construct separate
@@ -5152,8 +5156,30 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             // Re-check inside the lock — another thread may have won the
             // race to construct and we'd otherwise leak its instance.
             if (_cudnnConv is not null) return;
-            _cudnnContext ??= new CuDnnContext();
+            // Bind the cuDNN handle to THIS backend's CUDA context (current on
+            // the calling thread via PushContext), not a fresh CudaBlasContext —
+            // otherwise cudnnSetStream(handle, _stream) fails with
+            // CUDNN_STATUS_BAD_PARAM_STREAM_MISMATCH and cuDNN can't address our
+            // device buffers. Callers MUST hold PushContext when they call this.
+            _cudnnContext ??= CuDnnContext.ForCurrentContext();
             _cudnnConv = new CuDnnConvolution(_cudnnContext);
+        }
+    }
+
+    // Lazily constructs the cuDNN batch-norm helper, sharing the backend's
+    // CuDnnContext (created here if Conv2D hasn't already). Mirrors
+    // EnsureCudnnConv's double-checked locking so concurrent first BatchNorm
+    // callers don't construct/leak duplicate helpers.
+    private void EnsureCudnnBatchNorm()
+    {
+        if (_cudnnBn is not null) return;
+        lock (_cudnnInitLock)
+        {
+            if (_cudnnBn is not null) return;
+            // Same context-binding requirement as EnsureCudnnConv — bind to the
+            // backend's current CUDA context (PushContext must be held).
+            _cudnnContext ??= CuDnnContext.ForCurrentContext();
+            _cudnnBn = new CuDnnBatchNorm(_cudnnContext);
         }
     }
 
@@ -6636,6 +6662,49 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer runningMean, IGpuBuffer runningVar, IGpuBuffer saveMean, IGpuBuffer saveInvVar,
         int batch, int channels, int spatialSize, float epsilon, float momentum, bool training)
     {
+        // cuDNN fast path (issue #1159). Gated on the UseCudnnForBatchNorm
+        // policy. Dispatches the GPU-pointer variant directly — caller-owned
+        // input / output / stat buffers, no host round-trip. The op's
+        // [batch, channels, spatialSize] layout maps to cuDNN's NCHW as
+        // n=batch, c=channels, h=spatialSize, w=1; Spatial mode then
+        // normalizes per-channel over (n, h·w), matching the hand-written
+        // kernel's reduction axis. Scope is opened here so PerformanceProfiler
+        // stats distinguish "BatchNorm.cuDNN" vs "BatchNorm.generic".
+        if (CudaDispatchPolicy.UseCudnnForBatchNorm)
+        {
+            using var _profileCudnn = CudaDispatchPolicy.Scope("BatchNorm", useVendor: true);
+            using var _ctxCudnn = PushContext();
+            EnsureCudnnBatchNorm();
+            // Stream affinity: bind cuDNN to this backend's stream so its
+            // kernels order correctly against surrounding Cuda ops. A silent
+            // bind failure would give nondeterministic results.
+            CuDnnContext.CheckStatus(
+                CuDnnNative.cudnnSetStream(_cudnnContext!.Handle, _stream),
+                "cudnnSetStream");
+            // cuDNN requires epsilon >= CUDNN_BN_MIN_EPSILON (1e-5).
+            double eps = epsilon < 1e-5 ? 1e-5 : epsilon;
+            if (training)
+            {
+                _cudnnBn!.ForwardTrainingGpu(
+                    inputDevPtr: input.Handle, outputDevPtr: output.Handle,
+                    scaleDevPtr: gamma.Handle, biasDevPtr: beta.Handle,
+                    runningMeanDevPtr: runningMean.Handle, runningVarDevPtr: runningVar.Handle,
+                    saveMeanDevPtr: saveMean.Handle, saveInvVarDevPtr: saveInvVar.Handle,
+                    n: batch, c: channels, h: spatialSize, w: 1,
+                    epsilon: eps, momentum: momentum);
+            }
+            else
+            {
+                _cudnnBn!.ForwardInferenceGpu(
+                    inputDevPtr: input.Handle, outputDevPtr: output.Handle,
+                    scaleDevPtr: gamma.Handle, biasDevPtr: beta.Handle,
+                    runningMeanDevPtr: runningMean.Handle, runningVarDevPtr: runningVar.Handle,
+                    n: batch, c: channels, h: spatialSize, w: 1,
+                    epsilon: eps);
+            }
+            return;
+        }
+
         if (!_kernelCache.TryGetValue("batchnorm_forward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: batchnorm_forward");
 
@@ -15025,6 +15094,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         {
             _cudnnConv.Dispose();
             _cudnnConv = null;
+        }
+        if (_cudnnBn is not null)
+        {
+            // Shares _cudnnContext (does not own it), so this only releases
+            // the helper's own descriptors — the context is disposed below.
+            _cudnnBn.Dispose();
+            _cudnnBn = null;
         }
         if (_cudnnContext is not null)
         {
