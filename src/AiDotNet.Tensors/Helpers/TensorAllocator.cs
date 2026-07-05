@@ -365,36 +365,6 @@ public static class TensorAllocator
         for (int i = 0; i < shape.Length; i++)
             totalSize = checked(totalSize * shape[i]);
 
-        // #1767 diagnostic: a foundation-scale (~661M-element), arena-state-dependent
-        // "Source array was not long enough" surfaces from this rent during BF16 Adam Step, but only
-        // on the fast CI runner — the local repro's 100-iter training times out before the failing
-        // step, so it can't be reproduced on a dev box. Scoped to >=100M-element rents (zero cost on
-        // ordinary allocations); on failure it rethrows with the requested shape/size and the live
-        // arena/pool state so the nightly HeavyTimeout run captures the true cause. See AiDotNet#1767.
-        if (totalSize >= LargeRentDiagnosticThreshold)
-        {
-            try
-            {
-                return RentUninitializedCore<T>(shape, totalSize);
-            }
-            catch (Exception ex)
-            {
-                throw new InvalidOperationException(
-                    $"TensorAllocator.RentUninitialized failed: T={typeof(T).Name}, " +
-                    $"shape=[{string.Join(",", shape)}], totalSize={totalSize}. " +
-                    TensorArena.DescribeCurrentStateForDiagnostics(), ex);
-            }
-        }
-
-        return RentUninitializedCore<T>(shape, totalSize);
-    }
-
-    /// <summary>Element-count floor above which <see cref="RentUninitialized{T}"/> captures arena/pool
-    /// diagnostics on failure (#1767). Well above any ordinary activation/weight tensor.</summary>
-    private const int LargeRentDiagnosticThreshold = 100_000_000;
-
-    private static Tensor<T> RentUninitializedCore<T>(int[] shape, int totalSize)
-    {
         // #318: when ForceFreshAllocations is enabled the caller wants
         // backing arrays exactly logical-Length sized. Skip both the
         // arena and pool tiers — go straight to new Tensor<T>(shape).
