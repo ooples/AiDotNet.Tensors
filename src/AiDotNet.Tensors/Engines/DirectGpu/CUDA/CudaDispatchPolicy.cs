@@ -15,12 +15,21 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 /// <c>PerformanceProfiler.Instance.GetStats("Conv2D.cuDNN")</c> that the
 /// vendor path actually ran.</para>
 ///
-/// <para>The actual vendor dispatch (calling cudnnConvolutionForward on
-/// GPU buffers) is tracked in a follow-up; today the CudaBackend Conv2D
-/// / BatchNorm methods still run their hand-written kernels. The
-/// dispatch-label scope + availability helpers are here so that path can
-/// be plugged in later with a single <c>if (UseCudnn) ... else ...</c>
-/// check without further wiring.</para>
+/// <para>Dispatch status (verified against CudaBackend, AiDotNet#1159):
+/// <list type="bullet">
+/// <item><b>Conv2D</b> — routes to cuDNN (<c>cudnnConvolutionForward</c> on GPU
+/// buffers via <c>CuDnnConvolution.Conv2DForwardGpu</c>) when
+/// <see cref="UseCudnnForConv"/>; otherwise the generic Winograd/tiled/im2col
+/// kernel.</item>
+/// <item><b>MatMul / GEMM</b> — always routes to cuBLAS (<c>cublasSgemm</c>);
+/// the scope is labelled <c>"MatMul.cuBLAS"</c> unconditionally.</item>
+/// <item><b>BatchNorm</b> — still runs the hand-written CUDA kernel on every
+/// path. The <see cref="UseCudnnForBatchNorm"/> helper and dispatch-label
+/// scope exist, but the cuDNN BatchNorm call is NOT yet wired; it can be
+/// plugged into <c>CudaBackend.BatchNorm</c> with a single
+/// <c>if (UseCudnnForBatchNorm) ... else ...</c> check mirroring Conv2D
+/// (remaining work tracked by AiDotNet#1159).</item>
+/// </list></para>
 /// </summary>
 internal static class CudaDispatchPolicy
 {
