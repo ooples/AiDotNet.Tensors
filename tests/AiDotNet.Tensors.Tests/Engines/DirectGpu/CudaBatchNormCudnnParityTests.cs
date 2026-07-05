@@ -204,16 +204,23 @@ public sealed class CudaBatchNormCudnnParityTests : IDisposable
         AssertClose(hand.RunningMean, expRunMean, 1e-4, "hand runningMean");
         AssertClose(cudnn.RunningMean, expRunMean, 1e-4, "cuDNN runningMean");
 
-        // Running variance: hand-written = biased; cuDNN = unbiased (Bessel). Each matches its own
-        // convention. The two differ measurably (N/(N-1) = 20/19), which we also assert to lock the
-        // documented behaviour in place.
-        AssertClose(hand.RunningVar, expRunVarBiased, 2e-3, "hand runningVar (biased)");
+        // Running variance: BOTH paths use the UNBIASED (Bessel-corrected) estimate — the
+        // paper-faithful choice (Ioffe & Szegedy 2015 §3.1). The hand-written kernel was updated to
+        // match cuDNN, so the two now agree (they no longer differ by the old N/(N-1) biased-vs-unbiased
+        // gap). expRunVarBiased is retained only as a guard that we are NOT accidentally storing biased.
+        AssertClose(hand.RunningVar, expRunVarUnbiased, 2e-3, "hand runningVar (unbiased/Bessel)");
         AssertClose(cudnn.RunningVar, expRunVarUnbiased, 2e-3, "cuDNN runningVar (unbiased/Bessel)");
         double maxDelta = 0;
         for (int c = 0; c < channels; c++)
             maxDelta = Math.Max(maxDelta, Math.Abs(cudnn.RunningVar[c] - hand.RunningVar[c]));
-        Assert.True(maxDelta > 1e-4,
-            $"expected a measurable biased-vs-unbiased runningVar difference, got {maxDelta:E3}");
+        Assert.True(maxDelta < 2e-3,
+            $"hand-written and cuDNN runningVar should now agree (both unbiased), got delta {maxDelta:E3}");
+        // Sanity: the unbiased estimate is measurably larger than the biased one for this N (20 vs 19),
+        // so confirm we did NOT regress to biased on either path.
+        double biasedGap = 0;
+        for (int c = 0; c < channels; c++)
+            biasedGap = Math.Max(biasedGap, Math.Abs(expRunVarUnbiased[c] - expRunVarBiased[c]));
+        Assert.True(biasedGap > 1e-4, $"test setup sanity: unbiased vs biased should differ, got {biasedGap:E3}");
     }
 
     [SkippableFact]
