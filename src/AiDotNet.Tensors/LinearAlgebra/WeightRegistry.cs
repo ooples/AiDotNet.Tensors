@@ -46,6 +46,7 @@ public static class WeightRegistry
     private static readonly LinkedList<long> _materializedLru = new();           // MRU at front
     private static readonly Dictionary<long, LinkedListNode<long>> _materializedNode = new();
     private static readonly Dictionary<long, long> _materializedBytes = new();   // handle → owner-resident bytes
+    private static readonly Dictionary<long, int> _materializedActiveUses = new(); // handle → active MaterializeMany scopes
     private static long _materializedResidentBytes;
 
     /// <summary>Replaces the active options; must be called before any
@@ -1278,9 +1279,74 @@ public static class WeightRegistry
     // streaming model was sized against. Zero/absent cap → no bounding (degrades to prior behavior).
     private static long MaterializedOwnerBudget()
     {
-        long cap;
-        lock (_lock) { cap = StreamingPoolUnlocked().MaxResidentBytes; }
+        lock (_lock) { return MaterializedOwnerBudgetUnlocked(); }
+    }
+
+    private static long MaterializedOwnerBudgetUnlocked()
+    {
+        long cap = _streamingPool?.MaxResidentBytes ?? _options.StreamingPoolMaxResidentBytes;
         return cap > 0 ? cap / 2 : long.MaxValue;
+    }
+
+    private static bool IsMaterializedOwnerActiveUnlocked(long handle)
+        => _materializedActiveUses.TryGetValue(handle, out int activeUses) && activeUses > 0;
+
+    private static LinkedListNode<long>? FindSheddableMaterializedOwnerUnlocked(long protectedHandle)
+    {
+        for (var node = _materializedLru.Last; node is not null; node = node.Previous)
+        {
+            long candidate = node.Value;
+            if (candidate == protectedHandle) continue;
+            if (IsMaterializedOwnerActiveUnlocked(candidate)) continue;
+            return node;
+        }
+
+        return null;
+    }
+
+    private static void ShedMaterializedOwnersUnlocked(long budget, long protectedHandle)
+    {
+        // Shed the coldest materialized owners until back under budget. Skip active
+        // MaterializeMany scopes; correctness beats the soft resident-byte cap while
+        // a caller is explicitly reading those tensors.
+        while (_materializedResidentBytes > budget && _materializedLru.Count > 1)
+        {
+            var victimNode = FindSheddableMaterializedOwnerUnlocked(protectedHandle);
+            if (victimNode is null) break;
+            long victim = victimNode.Value;
+            _materializedBytes.TryGetValue(victim, out long victimBytes);
+
+            // Persist + drop the coldest owner, but only UNTRACK it after both succeed. If write-back
+            // returns false (non-native/aliased — nothing to persist) or the drop returns false
+            // (shared refcount), the owner must stay resident AND accounted; untracking it first
+            // would leak its bytes from the budget (the resident copy still exists). Order: write-back
+            // FIRST so the dropped bytes are recoverable from the pool/disk.
+            bool shed;
+            if (_ownerByHandle.TryGetValue(victim, out var weak) && weak.TryGetTarget(out var owner))
+            {
+                bool wroteBack = false;
+                try { wroteBack = owner.TryWriteBackResidentForStreaming(); }
+                catch { /* best-effort */ }
+                shed = false;
+                if (wroteBack)
+                {
+                    try { shed = owner.TryDropStorageForStreaming(throwOnSharedRefcount: false); }
+                    catch { /* shared refcount → leave resident + accounted */ }
+                }
+            }
+            else
+            {
+                shed = true; // dead owner: no resident copy remains to account
+            }
+
+            // Coldest owner can't be shed yet (non-native, or shared ref) — stop. Bounding is
+            // best-effort; never untrack/forget a still-resident owner.
+            if (!shed) break;
+            _materializedLru.Remove(victimNode);
+            _materializedNode.Remove(victim);
+            _materializedBytes.Remove(victim);
+            _materializedResidentBytes -= victimBytes;
+        }
     }
 
     private static void NoteMaterializedAndShed(long handle, long ownerBytes)
@@ -1304,46 +1370,42 @@ public static class WeightRegistry
                 _materializedResidentBytes += ownerBytes;
             }
 
-            // Shed the coldest materialized owners until back under budget. Keep at least the
-            // just-added MRU entry resident (the caller is using it right now).
-            while (_materializedResidentBytes > budget && _materializedLru.Count > 1)
+            // Keep at least the just-added MRU entry resident (the caller is using it right now).
+            ShedMaterializedOwnersUnlocked(budget, protectedHandle: handle);
+        }
+    }
+
+    private static long EnterMaterializedOwnerUse<T>(Tensor<T> weight)
+    {
+        if (weight.Lifetime != WeightLifetime.Streaming) return -1;
+        long handle = weight.StreamingPoolHandle;
+        if (handle < 0) return -1;
+
+        lock (_lock)
+        {
+            // Re-read under the lock so a concurrent unregister/re-register cannot
+            // pin a stale handle captured before the registry state changed.
+            handle = weight.StreamingPoolHandle;
+            if (handle < 0) return -1;
+            _materializedActiveUses.TryGetValue(handle, out int activeUses);
+            _materializedActiveUses[handle] = activeUses + 1;
+            return handle;
+        }
+    }
+
+    private static void ExitMaterializedOwnerUse(long handle)
+    {
+        if (handle < 0) return;
+
+        lock (_lock)
+        {
+            if (_materializedActiveUses.TryGetValue(handle, out int activeUses))
             {
-                var tail = _materializedLru.Last;
-                if (tail is null) break;
-                long victim = tail.Value;
-                _materializedBytes.TryGetValue(victim, out long victimBytes);
-
-                // Persist + drop the coldest owner, but only UNTRACK it after both succeed. If write-back
-                // returns false (non-native/aliased — nothing to persist) or the drop returns false
-                // (shared refcount), the owner must stay resident AND accounted; untracking it first
-                // would leak its bytes from the budget (the resident copy still exists). Order: write-back
-                // FIRST so the dropped bytes are recoverable from the pool/disk.
-                bool shed;
-                if (_ownerByHandle.TryGetValue(victim, out var weak) && weak.TryGetTarget(out var owner))
-                {
-                    bool wroteBack = false;
-                    try { wroteBack = owner.TryWriteBackResidentForStreaming(); }
-                    catch { /* best-effort */ }
-                    shed = false;
-                    if (wroteBack)
-                    {
-                        try { shed = owner.TryDropStorageForStreaming(throwOnSharedRefcount: false); }
-                        catch { /* shared refcount → leave resident + accounted */ }
-                    }
-                }
-                else
-                {
-                    shed = true; // dead owner: no resident copy remains to account
-                }
-
-                // Coldest owner can't be shed yet (non-native, or shared ref) — stop. Bounding is
-                // best-effort; never untrack/forget a still-resident owner.
-                if (!shed) break;
-                _materializedLru.RemoveLast();
-                _materializedNode.Remove(victim);
-                _materializedBytes.Remove(victim);
-                _materializedResidentBytes -= victimBytes;
+                if (activeUses <= 1) _materializedActiveUses.Remove(handle);
+                else _materializedActiveUses[handle] = activeUses - 1;
             }
+
+            ShedMaterializedOwnersUnlocked(MaterializedOwnerBudgetUnlocked(), protectedHandle: -1);
         }
     }
 
@@ -1359,6 +1421,7 @@ public static class WeightRegistry
             _materializedBytes.Remove(handle);
             _materializedResidentBytes -= bytes;
         }
+        _materializedActiveUses.Remove(handle);
     }
 
     /// <summary>
@@ -1378,6 +1441,14 @@ public static class WeightRegistry
         // mutated bytes) and a re-materialize would read stale pool bytes. Nothing to release.
         if (weight.IsWritableMmapAliased) return;
         if (weight.DataVector.Length == 0) return; // already released
+        lock (_lock)
+        {
+            if (IsMaterializedOwnerActiveUnlocked(weight.StreamingPoolHandle))
+            {
+                weight.StreamingDropDeferred = true;
+                return;
+            }
+        }
         // Soft-defer drop — mirrors the RegisterWeight #430 fix. A streaming
         // weight's storage can be SHARED (refcount > 1) at release time when a
         // peer holds a second reference for the duration of the layer's Forward:
@@ -1449,7 +1520,9 @@ public static class WeightRegistry
         // rental. After construction, the field is effectively immutable
         // (only Dispose reads it).
         private Tensor<T>[] _weights;
+        private long[] _pinnedHandles;
         private readonly int _count;
+        private readonly int _pinCount;
         private int _disposed; // 0 = live, 1 = disposed (Interlocked-guarded)
 
         internal MaterializeScope(IEnumerable<Tensor<T>> weights)
@@ -1467,8 +1540,10 @@ public static class WeightRegistry
             if (weights is ICollection<Tensor<T>> c && c.Count > 0)
                 capacity = c.Count;
             _weights = System.Buffers.ArrayPool<Tensor<T>>.Shared.Rent(capacity);
+            _pinnedHandles = System.Buffers.ArrayPool<long>.Shared.Rent(capacity);
 
             int idx = 0;
+            int pinIdx = 0;
             try
             {
                 foreach (var w in weights)
@@ -1496,6 +1571,20 @@ public static class WeightRegistry
                         }
                     }
 
+                    long pinnedHandle = EnterMaterializedOwnerUse(w);
+                    if (pinnedHandle >= 0)
+                    {
+                        if (pinIdx >= _pinnedHandles.Length)
+                        {
+                            var grownPins = System.Buffers.ArrayPool<long>.Shared.Rent(_pinnedHandles.Length * 2);
+                            Array.Copy(_pinnedHandles, 0, grownPins, 0, pinIdx);
+                            Array.Clear(_pinnedHandles, 0, pinIdx);
+                            System.Buffers.ArrayPool<long>.Shared.Return(_pinnedHandles);
+                            _pinnedHandles = grownPins;
+                        }
+                        _pinnedHandles[pinIdx++] = pinnedHandle;
+                    }
+
                     Materialize(w);
 
                     if (needsRelease)
@@ -1521,9 +1610,15 @@ public static class WeightRegistry
                     }
                 }
                 _count = idx;
+                _pinCount = pinIdx;
             }
             catch
             {
+                for (int i = pinIdx - 1; i >= 0; i--)
+                {
+                    try { ExitMaterializedOwnerUse(_pinnedHandles[i]); }
+                    catch { /* best-effort; original exception is the real signal */ }
+                }
                 // Partial-failure cleanup: release the weights WE
                 // materialized before this exception propagates.
                 // Without this, the ctor exception path leaks every
@@ -1537,7 +1632,9 @@ public static class WeightRegistry
                     catch { /* best-effort; original exception is the real signal */ }
                 }
                 Array.Clear(_weights, 0, idx);
+                Array.Clear(_pinnedHandles, 0, pinIdx);
                 System.Buffers.ArrayPool<Tensor<T>>.Shared.Return(_weights);
+                System.Buffers.ArrayPool<long>.Shared.Return(_pinnedHandles);
                 throw;
             }
         }
@@ -1575,6 +1672,15 @@ public static class WeightRegistry
             List<Exception>? errors = null;
             try
             {
+                for (int i = _pinCount - 1; i >= 0; i--)
+                {
+                    try { ExitMaterializedOwnerUse(_pinnedHandles[i]); }
+                    catch (Exception ex)
+                    {
+                        (errors ??= new List<Exception>()).Add(ex);
+                    }
+                }
+
                 for (int i = 0; i < _count; i++)
                 {
                     try { ReleaseToPool(_weights[i]); }
@@ -1587,7 +1693,9 @@ public static class WeightRegistry
             finally
             {
                 Array.Clear(_weights, 0, _count);
+                Array.Clear(_pinnedHandles, 0, _pinCount);
                 System.Buffers.ArrayPool<Tensor<T>>.Shared.Return(_weights);
+                System.Buffers.ArrayPool<long>.Shared.Return(_pinnedHandles);
             }
             if (errors is not null)
                 throw new AggregateException(
@@ -2011,6 +2119,7 @@ public static class WeightRegistry
             _materializedLru.Clear();
             _materializedNode.Clear();
             _materializedBytes.Clear();
+            _materializedActiveUses.Clear();
             _materializedResidentBytes = 0;
             // Drop any straggler in-flight markers (a worker that timed out the
             // drain above). Leaving them would suppress the NEXT pool's prefetch
