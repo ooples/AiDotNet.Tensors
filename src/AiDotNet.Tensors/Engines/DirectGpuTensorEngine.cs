@@ -12588,6 +12588,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // path feeds Predict (TryForwardGpuOptimized), so held-out accuracy was measured on corrupted
         // activations even after training. Derive the sizes from gamma (matches CpuEngine.LayerNorm).
         int normalizedSize = gamma.Length > 0 ? gamma.Length : (shape.Length > 1 ? shape[shape.Length - 1] : shape[0]);
+        // Guard the launch geometry: batchSize below floor-divides, so a normalizedSize that does not evenly
+        // divide input.Length would silently drop the tail sample(s) and hand the backend a mismatched launch.
+        if (normalizedSize <= 0 || input.Length % normalizedSize != 0)
+        {
+            throw new ArgumentException(
+                $"LayerNormGpu: input length {input.Length} is not evenly divisible by the normalized size " +
+                $"{normalizedSize} (gamma.Length); the input's trailing dimension(s) must match gamma.",
+                nameof(input));
+        }
         int batchSize = input.Length / normalizedSize;
 
         // Upload gamma and beta to GPU

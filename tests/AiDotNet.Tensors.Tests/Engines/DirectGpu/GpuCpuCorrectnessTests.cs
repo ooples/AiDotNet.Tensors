@@ -144,8 +144,29 @@ public sealed class GpuCpuCorrectnessTests : IDisposable
         // The GPU-resident forward path (LayerNormGpu, used by Predict/TryForwardGpuOptimized)
         // must normalize identically for rank >= 3. It requires a GPU-resident input.
         var gpuInput = input.Gpu();
-        var (gpuResident, _, _) = _gpu.LayerNormGpu(gpuInput, gamma, beta, 1e-5);
+        var (gpuResident, gpuMean, gpuInvVar) = _gpu.LayerNormGpu(gpuInput, gamma, beta, 1e-5);
         AssertGpuMatchesCpu(gpuResident, cpu, $"LayerNormGpu[{string.Join(",", shape)}]");
+
+        // Close the loop on the full tuple: the saved per-sample mean / inverse-variance (consumed by the
+        // backward pass) must be correct too, not just the normalized output. Recompute them the way LayerNorm
+        // does over each gamma-spanning sample — population mean and inverse std 1 / sqrt(var + eps).
+        int normSize = d;
+        int samples = input.Length / normSize;
+        var flat = input.ToArray();
+        var expMean = new float[samples];
+        var expInvVar = new float[samples];
+        for (int s = 0; s < samples; s++)
+        {
+            double sum = 0;
+            for (int j = 0; j < normSize; j++) sum += flat[s * normSize + j];
+            double mean = sum / normSize;
+            double varAcc = 0;
+            for (int j = 0; j < normSize; j++) { double diff = flat[s * normSize + j] - mean; varAcc += diff * diff; }
+            expMean[s] = (float)mean;
+            expInvVar[s] = (float)(1.0 / Math.Sqrt(varAcc / normSize + 1e-5));
+        }
+        AssertGpuMatchesCpu(gpuMean, new Tensor<float>(expMean, new[] { samples }), $"LayerNormGpu.SaveMean[{string.Join(",", shape)}]");
+        AssertGpuMatchesCpu(gpuInvVar, new Tensor<float>(expInvVar, new[] { samples }), $"LayerNormGpu.SaveInvVar[{string.Join(",", shape)}]");
     }
 
     // Shapes span: <128 (the #364 hot zone), tile boundaries around WGD=32,
