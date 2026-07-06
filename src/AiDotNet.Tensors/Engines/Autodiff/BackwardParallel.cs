@@ -43,7 +43,7 @@ internal static class BackwardParallel
     /// dispatch beats serial execution. Below this, the
     /// <see cref="Parallel.For"/> setup cost dominates the body work.
     /// </summary>
-    internal const long MinWorkForParallel = 64L * 1024;
+    internal const long MinWorkForParallel = 8L * 1024;
 
     /// <summary>
     /// Max parallelism for backward operations. Capped lower than
@@ -95,8 +95,11 @@ internal static class BackwardParallel
         _inBackwardParallel = true;
         try
         {
-            var po = new ParallelOptions { MaxDegreeOfParallelism = MaxDegreeOfParallelism };
-            Parallel.For(0, rows, po, body);
+            // Route through the cooperative pool (StreamingWorkerPool-backed) instead of a raw Parallel.For:
+            // its per-dispatch cost is far lower, so small per-op backward work (the autodiff tape's bread and
+            // butter — e.g. N-BEATS FC-block gradients) actually fans out instead of the ForkJoin setup cost
+            // dominating and forcing single-threaded execution. The pool applies its own grain-size gate.
+            CpuParallelSettings.ParallelForOrSerial(0, rows, totalWork, body);
         }
         finally
         {
