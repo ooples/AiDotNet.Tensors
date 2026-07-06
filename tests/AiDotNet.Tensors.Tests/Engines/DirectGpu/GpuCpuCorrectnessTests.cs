@@ -112,6 +112,42 @@ public sealed class GpuCpuCorrectnessTests : IDisposable
         Assert.True(err < Tol, $"{op}: GPU vs CPU max_abs_err {err:E3} exceeded tolerance {Tol:E3}");
     }
 
+    // Regression: LayerNorm must normalize over the trailing (gamma-length) dims for EVERY rank,
+    // not just rank-2. The GPU path previously took outerSize = shape[0] / normSize = Length/shape[0],
+    // which for a transformer's rank-3 [B, S, D] input normalized over S*D and read gamma/beta
+    // (length D) out of bounds → garbage (measured CPU-vs-GPU max_abs_err ~70 on [2,8,48]). rank-2
+    // happened to work because shape[0] equals the row count. This drove a transformer trained through
+    // the AiDotNet facade to chance accuracy on the GPU engine (its [B,S,D] activations were corrupted).
+    public static IEnumerable<object[]> LayerNormShapes() => new List<object[]>
+    {
+        new object[] { new[] { 16, 48 } },       // rank-2 (always worked)
+        new object[] { new[] { 1, 8, 48 } },     // rank-3, batch 1 (the Predict shape)
+        new object[] { new[] { 2, 8, 48 } },     // rank-3 [B,S,D]
+        new object[] { new[] { 4, 3, 32 } },     // rank-3, non-square
+        new object[] { new[] { 2, 2, 4, 16 } },  // rank-4
+    };
+
+    [Theory]
+    [MemberData(nameof(LayerNormShapes))]
+    public void LayerNorm_RankGe2_GpuMatchesCpu(int[] shape)
+    {
+        if (!EnsureGpuReady()) return;
+        int d = shape[shape.Length - 1];
+        var input = Rand(101, shape);
+        var gamma = Rand(102, d);
+        var beta = Rand(103, d);
+
+        var cpu = _cpu.TensorLayerNorm(input, gamma, beta, 1e-5);
+        var gpu = _gpu.TensorLayerNorm(input, gamma, beta, 1e-5);
+        AssertGpuMatchesCpu(gpu, cpu, $"TensorLayerNorm[{string.Join(",", shape)}]");
+
+        // The GPU-resident forward path (LayerNormGpu, used by Predict/TryForwardGpuOptimized)
+        // must normalize identically for rank >= 3. It requires a GPU-resident input.
+        var gpuInput = input.Gpu();
+        var (gpuResident, _, _) = _gpu.LayerNormGpu(gpuInput, gamma, beta, 1e-5);
+        AssertGpuMatchesCpu(gpuResident, cpu, $"LayerNormGpu[{string.Join(",", shape)}]");
+    }
+
     // Shapes span: <128 (the #364 hot zone), tile boundaries around WGD=32,
     // exact/off-by-one multiples, non-square, degenerate 1-dims, and >=128.
     public static IEnumerable<object[]> GemmSizes() => new List<object[]>
