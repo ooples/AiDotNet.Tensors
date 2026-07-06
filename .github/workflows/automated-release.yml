@@ -1,21 +1,23 @@
 name: Automated Release Pipeline
 
 on:
-  push:
-    branches:
-      - main
-      - master
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - '.github/ISSUE_TEMPLATE/**'
-      - 'LICENSE'
-      - '.gitignore'
-      - '.editorconfig'
+  # Publishing is driven by release-please (see release-please.yml): merging the Release PR cuts the
+  # tag + GitHub release, which fires this. This replaces the old per-push trigger so a burst of merged
+  # PRs bundles into ONE version instead of one release per push.
+  release:
+    types: [published]
+  # Manual fallback: build & publish an already-created tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build & publish (e.g. v0.102.17)'
+        required: true
 
 concurrency:
+  # NEVER cancel an in-flight publish — building/packing 7 packages and pushing to NuGet must complete
+  # atomically. Releases are infrequent now (only on Release-PR merge), so serialization is cheap.
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true  # Cancel stale release when new push to master arrives
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -42,6 +44,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
@@ -62,6 +65,20 @@ jobs:
         shell: bash
         run: |
           set -e
+
+          # Release-please drives releases now: the version is simply the tag that fired this run
+          # (release event) or the manual workflow_dispatch input — NOT computed from conventional
+          # commits here (release-please already did that when it opened the Release PR). Publish that
+          # exact version and skip the legacy computation below.
+          RP_TAG="${{ github.event.release.tag_name || inputs.tag }}"
+          if [ -n "$RP_TAG" ]; then
+            VER="${RP_TAG#v}"
+            echo "Publishing release tag $RP_TAG (version $VER)"
+            echo "version=$VER" >> "$GITHUB_OUTPUT"
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "changelog=Release $RP_TAG (see the GitHub release notes)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           echo "=== Automated Semantic Versioning from Conventional Commits ==="
 
@@ -259,6 +276,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
@@ -541,29 +560,11 @@ jobs:
           echo -e "$PKGS" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ needs.version-and-build.outputs.package_version }}
-          name: Release v${{ needs.version-and-build.outputs.package_version }}
-          body: |
-            ${{ needs.version-and-build.outputs.changelog }}
-
-            ## Packages
-
-            ${{ steps.packages.outputs.list }}
-            > Note: AiDotNet.Native.CUDA bundles the NVIDIA CUDA 12 runtime (cudart / cuBLAS / cuBLASLt / nvRTC, ~770MB). Because that exceeds nuget.org's 250 MB per-package limit, it ships as a small meta package plus a set of `AiDotNet.Native.CUDA.Fragments.*` chunk packages that are reassembled into the full DLLs at your build (win-x64) — just `dotnet add package AiDotNet.Native.CUDA` alongside AiDotNet.Tensors on NVIDIA GPU machines; the fragments restore automatically.
-            > Note: AiDotNet.Native.ROCm requires ROCm installed on the target machine for the kernel library (~496MB).
-
-            ## Installation
-
-            ```bash
-            dotnet add package AiDotNet.Tensors
-            ```
-          files: out/*.nupkg
-          draft: false
-          prerelease: false
-          make_latest: true
-          generate_release_notes: false
+      - name: Attach packages to the release
+        # release-please already created the GitHub release (with its bundled changelog) — that is
+        # what fired this run. Just upload the built .nupkg assets to it; do NOT recreate the release
+        # or overwrite its release-please-generated notes. --clobber makes re-runs idempotent.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "v${{ needs.version-and-build.outputs.package_version }}" out/*.nupkg --clobber
