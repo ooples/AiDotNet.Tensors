@@ -7179,19 +7179,33 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (!_kernelCache.TryGetValue("dropout_forward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: dropout_forward");
 
+        // dropout_forward ONLY applies a pre-generated mask (output = input * mask * scale); it does
+        // NOT generate the random mask. The previous code (a) never populated `mask` — the freshly
+        // allocated buffer was all-zero, so every element was multiplied by 0 and 100% of activations
+        // were dropped (mask/output identically 0) — and (b) passed the launch args in the wrong slots
+        // (`size` landed in the kernel's `scale` param and `dropoutRate` in its `size` param, with a
+        // stray 6th `seed` arg the kernel doesn't take). During training this zeroed every dropout
+        // layer's output, so the transformer forward was garbage and GPU training diverged to chance.
+        //
+        // Correct flow: first fill `mask` with the inverted-dropout mask (keepProb = 1 - dropoutRate;
+        // each kept element = 1/keepProb, dropped = 0 — the invKeep scale is baked into the mask, exactly
+        // as CpuEngine.Dropout does), then apply it with scale = 1. When not training / rate <= 0 the
+        // mask kernel keeps everything at scale 1, so output == input (identity), matching the CPU path.
+        float keepProb = training ? (1.0f - dropoutRate) : 1.0f;
+        DropoutMask(mask, size, keepProb, seed);
+
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr inputPtr = input.Handle;
         IntPtr outputPtr = output.Handle;
         IntPtr maskPtr = mask.Handle;
-        int trainingInt = training ? 1 : 0;
-        void** args = stackalloc void*[6];
+        float scale = 1.0f; // invKeep is already baked into the mask by dropout_mask
+        void** args = stackalloc void*[5];
         args[0] = &inputPtr;
         args[1] = &outputPtr;
         args[2] = &maskPtr;
-        args[3] = &size;
-        args[4] = &dropoutRate;
-        args[5] = &seed;
+        args[3] = &scale;
+        args[4] = &size;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
@@ -7200,17 +7214,24 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (!_kernelCache.TryGetValue("dropout_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: dropout_backward");
 
+        // dropout_backward kernel signature is (gradOutput, mask, gradInput, float scale, int size).
+        // The previous launch passed `size` into the kernel's `scale` slot and `dropoutRate` into its
+        // `size` slot (mismatched arg order), so the backward gradient was scaled by a garbage factor
+        // and covered a garbage element count. The forward bakes invKeep into the mask and applies
+        // scale = 1, so the backward must also use scale = 1 to stay consistent (gradInput =
+        // gradOutput * mask, with mask = 1/keepProb on kept units, 0 on dropped units).
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr gradOutputPtr = gradOutput.Handle;
         IntPtr maskPtr = mask.Handle;
         IntPtr gradInputPtr = gradInput.Handle;
+        float scale = 1.0f; // invKeep already baked into the mask by dropout_mask
         void** args = stackalloc void*[5];
         args[0] = &gradOutputPtr;
         args[1] = &maskPtr;
         args[2] = &gradInputPtr;
-        args[3] = &size;
-        args[4] = &dropoutRate;
+        args[3] = &scale;
+        args[4] = &size;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
