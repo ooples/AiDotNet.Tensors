@@ -2225,6 +2225,24 @@ public sealed class GradientTape<T> : IDisposable
         // Return arena to thread-local cache for reuse by next GradientTape
         _entries.Reset();
         _cachedArena = _entries;
+
+        // Transparent per-step TensorArena recycling (AiDotNet #1804). When the
+        // OUTERMOST tape on this thread disposes, one training/compute step has
+        // completed — rewind the active TensorArena's scratch cursors so the
+        // next step reuses those backing arrays instead of GC-allocating fresh
+        // (this is the PyTorch caching-allocator parity that closes the ~25%
+        // per-op allocation gap on deep-model training). Any code that runs one
+        // GradientTape per step inside a TensorArena scope (e.g. the model
+        // training bases) gets zero-alloc training after warmup with NO
+        // per-model wiring. Guarded to the top-level tape (_parent is null) so
+        // nested / higher-order (Hvp/Hessian) tapes never reset mid-step.
+        // No-op when no arena is active (inference, non-arena callers).
+        // Contract: the optimizer step must run within the tape's scope so the
+        // gradient tensors (arena-backed) are consumed before this reset — the
+        // standard one-tape-per-step loop satisfies this; model weights and
+        // optimizer moments are plain-heap Tensors and are unaffected.
+        if (_parent is null)
+            Helpers.TensorArena.Current?.Reset();
     }
 
     // ──────────────────────────────────────────────────────────────

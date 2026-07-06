@@ -802,20 +802,20 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     /// Internal shape array. Direct access for same-assembly code (CpuEngine, etc.) — zero overhead.
     /// External consumers use the Shape property which returns an immutable TensorShape wrapper.
     /// </summary>
-    internal readonly int[] _shape;
+    internal int[] _shape;
 
     /// <summary>
     /// Pre-computed strides for each dimension, following PyTorch's stride convention.
     /// For row-major order: strides[i] = product of shape[i+1..end].
     /// For transposed views: strides are permuted without copying data.
     /// </summary>
-    internal readonly int[] _strides;
+    internal int[] _strides;
 
     /// <summary>
     /// Offset into the underlying storage where this tensor's data begins.
     /// Zero for non-view tensors. Non-zero for sliced views.
     /// </summary>
-    internal readonly int _storageOffset;
+    internal int _storageOffset;
 
     /// <summary>
     /// Tracks the device where this tensor's data currently resides.
@@ -1146,7 +1146,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     /// When true, raw span/array access is safe. When false, Contiguous() must be called
     /// before passing to BLAS/SIMD operations.
     /// </summary>
-    public bool IsContiguous { get; }
+    public bool IsContiguous { get; private set; }
 
     /// <summary>
     /// Lifetime / placement hint for the issue-#276 large-model memory paths.
@@ -1291,7 +1291,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     /// Gets the shape (dimensions) of the tensor as an immutable wrapper.
     /// Use Shape[i] for element access, Shape.Span for zero-copy iteration.
     /// </summary>
-    public TensorShape Shape { get; }
+    public TensorShape Shape { get; private set; }
 
     /// <summary>
     /// Gets the total number of logical elements in this tensor (product of all shape dimensions).
@@ -1403,6 +1403,29 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         Length = totalSize;
         _data = new Vector<T>(totalSize);
         _storage = new TensorStorage<T>(_data);
+    }
+
+    /// <summary>
+    /// Zero-copy, NON-tape-recording in-place reshape used ONLY by the
+    /// <see cref="AiDotNet.Tensors.Helpers.TensorArena"/> reuse path (AiDotNet #1804).
+    /// The arena's tensor ring buckets pooled buffers by element COUNT, so a buffer
+    /// first handed out as e.g. [B,L] can be re-issued for an [L,B] request of the same
+    /// count on the post-Reset reuse path; the caller fully overwrites the buffer, so only
+    /// the shape / stride metadata must be swapped to the requested shape. Requires a
+    /// contiguous, offset-0 buffer with a MATCHING element count (always true for arena
+    /// scratch). Unlike the public <c>Reshape</c>, this does NOT allocate a new wrapper and
+    /// does NOT record a Reshape node on the active gradient tape, so it is safe to call
+    /// mid-forward without corrupting autodiff. Element count is asserted by the caller
+    /// (same ring bucket) so no re-validation is done here.
+    /// </summary>
+    internal void ArenaReshapeInPlace(int[] newShape)
+    {
+        _shape = (int[])newShape.Clone();
+        Shape = TensorShape.WrapUnsafe(_shape);
+        _strides = ComputeRowMajorStrides(_shape);
+        _rowMajorStridesCache = null;
+        _storageOffset = 0;
+        IsContiguous = true;
     }
 
     /// <summary>
