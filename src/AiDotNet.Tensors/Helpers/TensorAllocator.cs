@@ -419,8 +419,19 @@ public static class TensorAllocator
             return Tensor<T>.FromPooledMemory(memory, shape, pooled);
         }
 
-        // Small allocation: new T[] is zeroed by CLR but that's unavoidable
-        T[] arr = new T[totalSize];
+        // Small allocation (below the ArrayPool threshold — the common case for
+        // deep-model training temporaries: every op output/grad/optimizer temp
+        // in an N-BEATS step lands here). RentUninitialized's contract is that
+        // the caller writes every logical element — the pooled paths above
+        // already skip clearing the logical region on that basis — so the CLR
+        // zero-fill a plain `new T[]` pays is wasted work for value types. It
+        // was ~25% of N-BEATS train wall-clock in the profile (#1804).
+        // GC.AllocateUninitializedArray skips the memset for value types;
+        // reference types MUST stay zeroed so the GC never walks uninitialized
+        // object references.
+        T[] arr = RuntimeHelpers.IsReferenceOrContainsReferences<T>()
+            ? new T[totalSize]
+            : GC.AllocateUninitializedArray<T>(totalSize);
         return Tensor<T>.FromMemory(new Memory<T>(arr), shape);
 #else
         return new Tensor<T>(shape);

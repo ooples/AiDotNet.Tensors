@@ -256,6 +256,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // Version tracking for invalidation
     private readonly ConcurrentDictionary<object, int> _tensorVersions = new();
 
+    // Monotonic per-call counter for stochastic-op seeds (dropout, etc.). The old code seeded the
+    // GPU dropout RNG from Environment.TickCount / DateTime.UtcNow.Ticks. TickCount has ~15 ms
+    // resolution, so the many dropout calls a training step fires in <1 ms all got the SAME seed →
+    // the Philox mask kernel (seed ^ index) produced an IDENTICAL mask for every dropout layer AND
+    // across consecutive steps, so a fixed subset of units was permanently dropped and the network
+    // could not learn. An advancing counter gives every call an independent, well-spread seed and is
+    // deterministic across runs (reproducible training) — the golden-ratio multiplier decorrelates
+    // sequential counter values for Philox.
+    private long _stochasticSeedCounter;
+    private ulong NextStochasticSeed() =>
+        unchecked((ulong)System.Threading.Interlocked.Increment(ref _stochasticSeedCounter) * 0x9E3779B97F4A7C15UL);
+
     // CSR buffer cache for sparse tensors — avoids re-uploading static sparse matrices every call.
     // Key: CsrCacheKey (SparseTensor + Backend reference pair) to avoid cross-backend buffer reuse.
     private readonly ConcurrentDictionary<CsrCacheKey, CsrGpuCache> _csrBufferCache = new();
@@ -13398,7 +13410,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             int size = input.Length;
-            ulong seed = (ulong)DateTime.UtcNow.Ticks;
+            ulong seed = NextStochasticSeed();
 
             using var inputBuffer = GetOrAllocateBuffer(backend, input);
             using var outputBuffer = AllocateOutputBuffer(backend, size);
@@ -18894,7 +18906,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
-            ulong seed = (ulong)Environment.TickCount;
+            ulong seed = NextStochasticSeed();
             using var bufIn = GetOrAllocateBuffer(backend, input);
             var bufOut = AllocateOutputBuffer(backend, input.Length);
             var bufMask = AllocateOutputBuffer(backend, input.Length);

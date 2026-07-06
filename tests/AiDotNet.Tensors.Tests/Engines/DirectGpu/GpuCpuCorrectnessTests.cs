@@ -169,6 +169,62 @@ public sealed class GpuCpuCorrectnessTests : IDisposable
         AssertGpuMatchesCpu(gpuInvVar, new Tensor<float>(expInvVar, new[] { samples }), $"LayerNormGpu.SaveInvVar[{string.Join(",", shape)}]");
     }
 
+    // Regression: the GPU training-mode Dropout must actually generate an inverted-dropout mask.
+    // The CUDA path launched dropout_forward (which only APPLIES a pre-generated mask) without ever
+    // filling the mask buffer and with mismatched launch args, so the mask was all-zero and 100% of
+    // activations were dropped (output identically 0). That zeroed every dropout layer during training,
+    // so any model with dropout > 0 could not learn on the GPU. Assert the mask actually keeps roughly
+    // (1 - rate) of the units, applies the 1/keepProb inverted-dropout scale, is finite, and that
+    // forward/backward are consistent (backward passes the same units through, at the same scale).
+    [Theory]
+    [InlineData(0.1)]
+    [InlineData(0.3)]
+    [InlineData(0.5)]
+    public void Dropout_Training_GpuGeneratesMaskLikeCpu(double rate)
+    {
+        if (!EnsureGpuReady()) return;
+        const int n = 8192;
+        var ones = new Tensor<float>(Enumerable.Repeat(1.0f, n).ToArray(), new[] { n });
+
+        var gpuOut = _gpu.Dropout(ones, rate, training: true, out var gpuMask);
+        var og = gpuOut.ToArray();
+        var mg = gpuMask.ToArray();
+
+        int zeros = 0; double keptSum = 0; int kept = 0;
+        for (int i = 0; i < n; i++)
+        {
+            Assert.False(float.IsNaN(og[i]) || float.IsInfinity(og[i]), $"GPU dropout produced non-finite {og[i]}");
+            Assert.Equal(og[i] == 0f, mg[i] == 0f); // mask and output agree on which units are dropped
+            if (og[i] == 0f) zeros++; else { keptSum += og[i]; kept++; }
+        }
+        double fracDropped = (double)zeros / n;
+        // The previous bug dropped 100%; a correct kernel drops ~rate. Wide band tolerates RNG variance
+        // but firmly excludes the all-dropped (1.0) and no-dropped (0.0) failure modes.
+        Assert.True(Math.Abs(fracDropped - rate) < 0.06,
+            $"GPU dropout fraction {fracDropped:F3} not ~{rate:F3} (100%-drop bug regression?)");
+        Assert.True(kept > 0, "GPU dropout dropped everything (mask never generated)");
+        double invKeep = 1.0 / (1.0 - rate);
+        double meanKept = keptSum / kept;
+        Assert.True(Math.Abs(meanKept - invKeep) < 1e-3,
+            $"GPU dropout kept-value {meanKept:F4} not the inverted-dropout scale {invKeep:F4}");
+
+        // Backward must pass gradients through the SAME kept units at the SAME scale (gradInput = gradOut * mask).
+        var gradOut = Rand(202, n);
+        var gradIn = ((AiDotNet.Tensors.Engines.IEngine)_gpu).DropoutBackward(gradOut, gpuMask, rate);
+        var gi = gradIn.ToArray(); var go = gradOut.ToArray();
+        for (int i = 0; i < n; i++)
+        {
+            float expected = go[i] * mg[i];
+            Assert.True(Math.Abs(gi[i] - expected) < 1e-3f,
+                $"GPU dropout backward {gi[i]} != gradOut*mask {expected} at {i}");
+        }
+
+        // Inference (training: false) must be identity.
+        var infer = _gpu.Dropout(ones, rate, training: false, out _);
+        foreach (var v in infer.ToArray())
+            Assert.True(Math.Abs(v - 1.0f) < 1e-4f, "GPU dropout in inference mode must be identity");
+    }
+
     // Shapes span: <128 (the #364 hot zone), tile boundaries around WGD=32,
     // exact/off-by-one multiples, non-square, degenerate 1-dims, and >=128.
     public static IEnumerable<object[]> GemmSizes() => new List<object[]>
