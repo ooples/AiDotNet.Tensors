@@ -112,6 +112,63 @@ public sealed class GpuCpuCorrectnessTests : IDisposable
         Assert.True(err < Tol, $"{op}: GPU vs CPU max_abs_err {err:E3} exceeded tolerance {Tol:E3}");
     }
 
+    // Regression: LayerNorm must normalize over the trailing (gamma-length) dims for EVERY rank,
+    // not just rank-2. The GPU path previously took outerSize = shape[0] / normSize = Length/shape[0],
+    // which for a transformer's rank-3 [B, S, D] input normalized over S*D and read gamma/beta
+    // (length D) out of bounds → garbage (measured CPU-vs-GPU max_abs_err ~70 on [2,8,48]). rank-2
+    // happened to work because shape[0] equals the row count. This drove a transformer trained through
+    // the AiDotNet facade to chance accuracy on the GPU engine (its [B,S,D] activations were corrupted).
+    public static IEnumerable<object[]> LayerNormShapes() => new List<object[]>
+    {
+        new object[] { new[] { 16, 48 } },       // rank-2 (always worked)
+        new object[] { new[] { 1, 8, 48 } },     // rank-3, batch 1 (the Predict shape)
+        new object[] { new[] { 2, 8, 48 } },     // rank-3 [B,S,D]
+        new object[] { new[] { 4, 3, 32 } },     // rank-3, non-square
+        new object[] { new[] { 2, 2, 4, 16 } },  // rank-4
+    };
+
+    [Theory]
+    [MemberData(nameof(LayerNormShapes))]
+    public void LayerNorm_RankGe2_GpuMatchesCpu(int[] shape)
+    {
+        if (!EnsureGpuReady()) return;
+        int d = shape[shape.Length - 1];
+        var input = Rand(101, shape);
+        var gamma = Rand(102, d);
+        var beta = Rand(103, d);
+
+        var cpu = _cpu.TensorLayerNorm(input, gamma, beta, 1e-5);
+        var gpu = _gpu.TensorLayerNorm(input, gamma, beta, 1e-5);
+        AssertGpuMatchesCpu(gpu, cpu, $"TensorLayerNorm[{string.Join(",", shape)}]");
+
+        // The GPU-resident forward path (LayerNormGpu, used by Predict/TryForwardGpuOptimized)
+        // must normalize identically for rank >= 3. It requires a GPU-resident input.
+        var gpuInput = input.Gpu();
+        var (gpuResident, gpuMean, gpuInvVar) = _gpu.LayerNormGpu(gpuInput, gamma, beta, 1e-5);
+        AssertGpuMatchesCpu(gpuResident, cpu, $"LayerNormGpu[{string.Join(",", shape)}]");
+
+        // Close the loop on the full tuple: the saved per-sample mean / inverse-variance (consumed by the
+        // backward pass) must be correct too, not just the normalized output. Recompute them the way LayerNorm
+        // does over each gamma-spanning sample — population mean and inverse std 1 / sqrt(var + eps).
+        int normSize = d;
+        int samples = input.Length / normSize;
+        var flat = input.ToArray();
+        var expMean = new float[samples];
+        var expInvVar = new float[samples];
+        for (int s = 0; s < samples; s++)
+        {
+            double sum = 0;
+            for (int j = 0; j < normSize; j++) sum += flat[s * normSize + j];
+            double mean = sum / normSize;
+            double varAcc = 0;
+            for (int j = 0; j < normSize; j++) { double diff = flat[s * normSize + j] - mean; varAcc += diff * diff; }
+            expMean[s] = (float)mean;
+            expInvVar[s] = (float)(1.0 / Math.Sqrt(varAcc / normSize + 1e-5));
+        }
+        AssertGpuMatchesCpu(gpuMean, new Tensor<float>(expMean, new[] { samples }), $"LayerNormGpu.SaveMean[{string.Join(",", shape)}]");
+        AssertGpuMatchesCpu(gpuInvVar, new Tensor<float>(expInvVar, new[] { samples }), $"LayerNormGpu.SaveInvVar[{string.Join(",", shape)}]");
+    }
+
     // Regression: the GPU training-mode Dropout must actually generate an inverted-dropout mask.
     // The CUDA path launched dropout_forward (which only APPLIES a pre-generated mask) without ever
     // filling the mask buffer and with mismatched launch args, so the mask was all-zero and 100% of

@@ -12592,14 +12592,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             throw new InvalidOperationException("No GPU backend available for LayerNormGpu");
 
         int[] shape = input.Shape._dims;
-        int batchSize = shape[0];
-        int normalizedSize = shape.Length > 1 ? shape[1] : shape[0];
-
-        // For higher-rank tensors, flatten the normalized dimensions
-        for (int i = 2; i < shape.Length; i++)
+        // LayerNorm normalizes over the trailing dims that gamma spans (gamma.Length), treating every
+        // leading position as an independent sample. The previous code took normalizedSize = shape[1]
+        // (times shape[2..]) with batchSize = shape[0], which is only correct for a rank-2 [B, D] input.
+        // For a transformer's rank-3 [B, S, D] activations that flattened S into the normalized size
+        // (normalizedSize = S*D) and read gamma/beta (length D) out of bounds → garbage output. This
+        // path feeds Predict (TryForwardGpuOptimized), so held-out accuracy was measured on corrupted
+        // activations even after training. Derive the sizes from gamma (matches CpuEngine.LayerNorm).
+        int normalizedSize = gamma.Length > 0 ? gamma.Length : (shape.Length > 1 ? shape[shape.Length - 1] : shape[0]);
+        // Guard the launch geometry: batchSize below floor-divides, so a normalizedSize that does not evenly
+        // divide input.Length would silently drop the tail sample(s) and hand the backend a mismatched launch.
+        if (normalizedSize <= 0 || input.Length % normalizedSize != 0)
         {
-            normalizedSize *= shape[i];
+            throw new ArgumentException(
+                $"LayerNormGpu: input length {input.Length} is not evenly divisible by the normalized size " +
+                $"{normalizedSize} (gamma.Length); the input's trailing dimension(s) must match gamma.",
+                nameof(input));
         }
+        int batchSize = input.Length / normalizedSize;
 
         // Upload gamma and beta to GPU
         using var gammaBuffer = GetOrCacheWeightBuffer(backend, gamma.GetDataArray(), PersistentTensorRole.Weights);
@@ -18183,8 +18193,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         bool ownershipTransferred = false;
         try
         {
-            int outerSize = input.Shape._dims[0];
-            int normSize = input.Length / outerSize;
+            // LayerNorm normalizes over the trailing dims that gamma spans (gamma.Length),
+            // treating every leading dim as a row. For a rank-2 [rows, D] input dims[0] equals
+            // the row count so `outerSize = dims[0]` was correct, but for rank > 2 (e.g. a
+            // transformer's [B, S, D] activations) `outerSize = dims[0]` = B set
+            // `normSize = Length/B = S*D`, so the kernel read gamma/beta (length D) out of
+            // bounds and normalized over S*D elements → garbage output (CPU-vs-GPU maxDiff ~70).
+            // Derive normSize from gamma (matches the CpuEngine reference + the kernel's
+            // per-row gamma/beta contract) and fold all leading dims into outerSize.
+            int normSize = gamma.Length;
+            int outerSize = input.Length / normSize;
 
             // FP16 Half-resident store (keystone-enabled): read IsFp16 input/gamma/beta directly, FP16-native
             // layernorm (Half output + FP32 mean/var), store Half output — keeps the per-layer norm Half.
@@ -18346,8 +18364,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         bool ownershipTransferred = false;
         try
         {
-            int outerSize = input.Shape._dims[0];
-            int normSize = input.Length / outerSize;
+            // Normalize over gamma's trailing dims (gamma.Length), folding every leading dim
+            // into outerSize. `outerSize = dims[0]` was only correct for rank-2 input; for a
+            // rank-3 [B, S, D] tensor it set normSize = S*D and read gamma (length D) out of
+            // bounds → garbage. See the LayerNorm fix above for the full rationale.
+            int normSize = gamma.Length;
+            int outerSize = input.Length / normSize;
             using var bufIn = GetOrAllocateBuffer(backend, input);
             using var bufGamma = GetOrAllocateBuffer(backend, gamma);
             bufOut = AllocateOutputBuffer(backend, input.Length);
