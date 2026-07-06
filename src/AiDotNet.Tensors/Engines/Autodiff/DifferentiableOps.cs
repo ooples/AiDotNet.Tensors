@@ -415,6 +415,14 @@ internal static class DifferentiableOps
         return false;
     }
 
+    // Cached once at type init. AccumulateGrad runs per-op on the backward
+    // pass, and the env read below executed BEFORE the cheap engine-type check
+    // short-circuited, so it fired on every CPU backward op too — part of the
+    // ~5.8% GetEnvironmentVariable hot-path cost in the N-BEATS profile
+    // (#728/#1804). Debug-only flag; env vars are process-stable.
+    private static readonly bool _graphCaptureDebug =
+        Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1";
+
     /// <summary>
     /// Accumulates a gradient for a tensor in the gradient dictionary.
     /// If the tensor already has a gradient, the new gradient is added to it.
@@ -462,7 +470,7 @@ internal static class DifferentiableOps
         // preserves graph connectivity through the original grad
         // reference. Keep the original `grad` for the out-of-place
         // path; only materialize for in-place add storage.
-        if (Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1"
+        if (_graphCaptureDebug
             && engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine gde && gde.ResidentStepActive)
         {
             Tensor<T>? exi = grads.TryGetValue(tensor, out var ed) ? ed : null;

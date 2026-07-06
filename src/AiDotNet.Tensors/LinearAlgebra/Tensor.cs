@@ -201,12 +201,21 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <para><b>Performance:</b> O(1) when already contiguous (just returns this).
     /// O(n) only when the tensor is a non-contiguous view (e.g., from Transpose).</para>
     /// </remarks>
+    // Cached once at type init. Contiguous() is a per-op hot path — every
+    // BLAS/permute/reshape operand that isn't already contiguous materializes
+    // through here — so reading the env var on every call cost ~5.8% of N-BEATS
+    // train wall-clock in a PerfView profile (#728/#1804). The flag is a
+    // debug-only diagnostic and env vars don't change mid-process, so reading
+    // it once at startup is both correct and free on the hot path.
+    private static readonly bool _debugContig =
+        Environment.GetEnvironmentVariable("AIDOTNET_DEBUG_CONTIG") == "1";
+
     public Tensor<T> Contiguous()
     {
         ThrowIfSparse();
         if (IsContiguous && _storageOffset == 0) return this;
 
-        if (Environment.GetEnvironmentVariable("AIDOTNET_DEBUG_CONTIG") == "1" && Length >= 256)
+        if (_debugContig && Length >= 256)
         {
             try
             {
