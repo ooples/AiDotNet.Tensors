@@ -80,6 +80,18 @@ public sealed class GradientTape<T> : IDisposable
     private readonly Engines.DirectGpuTensorEngine? _snapshotEngine;
     private readonly long _activationSnapshot;
 
+    // GLOBAL tape-owned arena (extends #734). A top-level GradientTape with no
+    // arena already active (i.e. not created through a model base or Optimize()
+    // call site that opens its own TensorArena) CREATES and OWNS one for the
+    // duration of the tape. This gives EVERY backprop path — including custom
+    // training loops that go through none of those wrappers — zero-alloc training
+    // after warmup with no per-path wiring. On Dispose the owned arena is
+    // Dispose()d (pooling its large buffers to the cross-arena persistent pool and
+    // restoring the previous arena); an externally-owned long-lived arena is left
+    // to its owner and only Reset() per step (the pre-existing #1804 behaviour).
+    private bool _ownsArena;
+    private Helpers.TensorArena? _ownedArena;
+
 
     /// <summary>
     /// Gets the number of operations recorded on this tape.
@@ -177,6 +189,20 @@ public sealed class GradientTape<T> : IDisposable
         _engine = AiDotNetEngine.Current;
         _engineExplicitlyBound = false;
         _parent = _current;
+
+        // GLOBAL tape-owned arena: a TOP-LEVEL tape (_parent is null) with NO arena
+        // already active on this thread opens one it owns. When an arena is already
+        // active (a model base / Optimize() call site opened it), we do NOT create
+        // our own — that arena stays externally owned and is only Reset() per step in
+        // Dispose (existing #1804 behaviour). Nested tapes (Hvp/Hessian) never own an
+        // arena. This is what extends zero-alloc training to backprop paths that go
+        // through none of the model bases or Optimize() call sites.
+        if (_parent is null && Helpers.TensorArena.Current is null)
+        {
+            _ownedArena = Helpers.TensorArena.Create();
+            _ownsArena = true;
+        }
+
         _savedReplayMode = Compilation.AutoTrainingCompiler.ReplayMode;
 
         // Capture the activation-cache baseline for the OUTERMOST tape on a GPU engine.
@@ -2241,8 +2267,21 @@ public sealed class GradientTape<T> : IDisposable
         // gradient tensors (arena-backed) are consumed before this reset — the
         // standard one-tape-per-step loop satisfies this; model weights and
         // optimizer moments are plain-heap Tensors and are unaffected.
-        if (_parent is null)
+        //
+        // GLOBAL tape-owned arena: if THIS tape created the arena (no arena was
+        // active at ctor and this is a top-level tape), Dispose it — that pools its
+        // large backing buffers to the cross-arena persistent pool and restores the
+        // previous arena, so the NEXT top-level tape reuses them (zero-alloc after
+        // warmup). Otherwise, if this is the top-level tape over an externally-owned
+        // long-lived arena, Reset() it per step (the pre-existing #1804 behaviour).
+        if (_ownsArena)
+        {
+            _ownedArena?.Dispose();
+        }
+        else if (_parent is null)
+        {
             Helpers.TensorArena.Current?.Reset();
+        }
     }
 
     // ──────────────────────────────────────────────────────────────
