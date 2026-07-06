@@ -43,7 +43,15 @@ internal static class BackwardParallel
     /// dispatch beats serial execution. Below this, the
     /// <see cref="Parallel.For"/> setup cost dominates the body work.
     /// </summary>
-    internal const long MinWorkForParallel = 64L * 1024;
+    // #729 set this to 64K (empirical 16-core crossover). On a many-core box that is far too
+    // low: a backward op with ~100K scalar work fanned out to the shared pool wakes workers for
+    // a few µs of work and pays the dispatch + resident-pool re-arm spin, which dominates. Raised
+    // to 256K so small (N-BEATS-scale) backward elementwise ops run serial; genuinely large
+    // backward ops (transformer/diffusion scale) still clear the bar and parallelize. Env
+    // override via AIDOTNET_BWD_MIN_WORK.
+    internal static readonly long MinWorkForParallel =
+        long.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_BWD_MIN_WORK"), out var bmw) && bmw > 0
+            ? bmw : 256L * 1024;
 
     /// <summary>
     /// Max parallelism for backward operations. Capped lower than
