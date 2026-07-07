@@ -31462,6 +31462,13 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // The output grid is linear in theta, so AffineGrid is differentiable w.r.t. theta
+        // (its 3D sibling AffineGrid3D already records). Without this, a Spatial Transformer's
+        // localization network receives no tape gradient and is silently untrainable.
+        AiDotNet.Tensors.Engines.Autodiff.DifferentiableOps.RecordUnary(
+            "AffineGrid", grid, theta,
+            AiDotNet.Tensors.Engines.Autodiff.BackwardFunctions<T>.AffineGridBackward,
+            new object[] { outputHeight, outputWidth });
         return grid;
     }
 

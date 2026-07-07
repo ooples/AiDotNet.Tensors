@@ -200,7 +200,7 @@ internal static class OpRegistry
         // BackwardFunctions<T>.{InterpolateBackward, PadNdBackward,
         // AffineGrid3DBackward}. InterpolateByScale is a delegator to
         // Interpolate.
-        "Interpolate", "PadNd", "AffineGrid3D",
+        "Interpolate", "PadNd", "AffineGrid3D", "AffineGrid",
 
         // Vision RoI family (Issue #217 tail) — backward wired
         // in BackwardFunctions<T>.{RoIAlign,RoIPool,PsRoIAlign,PsRoIPool}Backward.
@@ -255,9 +255,6 @@ internal static class OpRegistry
         // the multi-tensor return type is currently treated as
         // non-differentiable at the tape level.
         "TensorTensorSplit",
-
-        // Grid/geometry (non-learnable)
-        "AffineGrid",
 
         // NeRF/3D ops (typically not differentiated through in training)
         "VolumeRendering", "ImportanceSampling", "RasterizeGaussians",
