@@ -1467,6 +1467,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// so any subsequent CPU read sees correct data instead of
     /// uninitialized.</para>
     /// </summary>
+    /// <summary>
+    /// Fully invalidates a weight tensor's GPU residency after an in-place CPU-side update
+    /// (the fused compiled optimizer mutates weight host arrays via raw pointers). Clears BOTH
+    /// (a) the per-tensor <c>_gpuBuffer</c> fast-path field that <see cref="GetOrAllocateBuffer"/>
+    /// returns unconditionally under <c>ResidentStepActive</c> — the version-gate is BYPASSED in a
+    /// resident/capture scope, so a Version bump alone does NOT force a re-upload — and (b) the
+    /// array/vector-keyed activation-cache entries (#226-safe: materializes any pending deferred
+    /// download first). Without this, a resident-scope forward keeps reading the STALE pre-step
+    /// device weights → the GPU model trains against frozen weights (drift without descent →
+    /// accuracy pinned at chance). The next forward re-uploads the updated host weights.
+    /// </summary>
+    public void InvalidateResidentWeightBuffer<T>(LinearAlgebra.Tensor<T> tensor)
+    {
+        InvalidateGpuCacheForTensor(tensor);
+        // Drop the fast-path resident pointer so GetOrAllocateBuffer's `_gpuBuffer is not null`
+        // branch (which returns it verbatim under ResidentStepActive) can't serve stale weights.
+        tensor._gpuBuffer = null;
+        tensor._gpuBackend = null;
+        tensor._gpuBufferVersion = -1;
+    }
+
     internal void InvalidateGpuCacheForTensor<T>(LinearAlgebra.Tensor<T> tensor)
     {
         // Both the array-keyed and vector-keyed activation cache

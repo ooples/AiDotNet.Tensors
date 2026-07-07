@@ -2575,6 +2575,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                 $"Supported: SGD, Adam, AdamW. Apply gradients manually for other types.");
                     }
                 }
+                // GPU weight-cache coherence: the CPU fused-optimizer kernel above mutated
+                // paramArrays[p] (the parameter tensor's live backing) IN PLACE via a raw
+                // pointer, which does NOT bump Tensor.Version. Bump it (parity with the eager
+                // path's #1810 and the on-device path's version sync) AND fully invalidate the
+                // resident device buffer: in a GPU resident/capture scope the forward's
+                // version-gate is BYPASSED (returns the cached _gpuBuffer regardless of
+                // Version), so a bump alone does not force a re-upload — the forward keeps
+                // reading the STALE pre-step weights and the model trains against frozen
+                // weights (drift without descent → accuracy pinned at chance). Invalidating the
+                // resident buffer makes the next forward re-upload the updated host weights.
+                _parameters[p].IncrementVersion();
+                (_engine as Engines.DirectGpuTensorEngine)?.InvalidateResidentWeightBuffer(_parameters[p]);
             }
         };
     }
@@ -2975,6 +2987,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     {
                         if (gradTransient) gradBuf.Dispose();
                     }
+                    // GPU weight-cache coherence (parity with ConfigureOptimizerFloat's line ~2414,
+                    // EVAL-LEAK ROOT FIX #638): the grouped on-device optimizer just updated
+                    // _parameters[p]'s RESIDENT device buffer IN PLACE, so it now holds the
+                    // authoritative current weights. Sync _gpuBufferVersion to Version so the
+                    // version-gate in GetOrAllocateBuffer / GetWeightBufferPreferResident TRUSTS the
+                    // resident buffer on the next forward instead of re-uploading the STALE host
+                    // backing (which the on-device update never touched). Without this the grouped
+                    // (per-layer-LR) GPU path — the path the Transformer's Noam/warmup schedule
+                    // takes — trains against frozen weights: loss flat, weights drift, accuracy = chance.
+                    _parameters[p]._gpuBufferVersion = _parameters[p].Version;
                     continue;
                 }
 
@@ -3110,6 +3132,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                 $"Supported: SGD, Adam, AdamW.");
                     }
                 }
+                // GPU weight-cache coherence — see ConfigureOptimizerFloat. The CPU
+                // fused-optimizer kernel mutated the weight backing in place via a raw
+                // pointer (no Tensor.Version bump); bump it AND invalidate the resident
+                // device buffer so a DirectGpu forward re-uploads the updated weights
+                // instead of training against frozen pre-step weights (the version-gate is
+                // bypassed under a resident/capture scope, so the bump alone is insufficient).
+                _parameters[p].IncrementVersion();
+                (_engine as Engines.DirectGpuTensorEngine)?.InvalidateResidentWeightBuffer(_parameters[p]);
             }
         };
     }
