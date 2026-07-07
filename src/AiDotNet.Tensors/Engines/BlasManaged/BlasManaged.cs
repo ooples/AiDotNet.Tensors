@@ -140,7 +140,7 @@ public static partial class BlasManaged
         ReadOnlySpan<T> a, int lda, bool transA,
         ReadOnlySpan<T> b, int ldb, bool transB,
         Span<T> c, int ldc, int m, int n, int k,
-        in BlasOptions<T> options) where T : unmanaged
+        in BlasOptions<T> options, bool betaZero) where T : unmanaged
     {
         if (!(typeof(T) == typeof(float) || typeof(T) == typeof(double))) return false;
         if (!System.Runtime.Intrinsics.X86.Fma.IsSupported) return false;
@@ -183,9 +183,21 @@ public static partial class BlasManaged
                     MemoryMarshal.Cast<T, double>(c), m, k, n);
         }
         else if (isFloat)
-            Simd.SimdGemm.SgemmDirectParallelMInto(
-                MemoryMarshal.Cast<T, float>(a), MemoryMarshal.Cast<T, float>(b),
-                MemoryMarshal.Cast<T, float>(c), m, k, n);
+        {
+            // FP64 no-trans and both trans variants already OVERWRITE every C element
+            // (zero-init accumulators + store + scalar-tail writes), so they never needed a
+            // pre-clear. Only the FP32 no-trans path carries a redundant internal c.Clear();
+            // under beta=0 use the write-first sibling that skips it (bit-identical — the
+            // store-only kernels overwrite the whole tile).
+            if (betaZero)
+                Simd.SimdGemm.SgemmDirectParallelMOverwrite(
+                    MemoryMarshal.Cast<T, float>(a), MemoryMarshal.Cast<T, float>(b),
+                    MemoryMarshal.Cast<T, float>(c), m, k, n);
+            else
+                Simd.SimdGemm.SgemmDirectParallelMInto(
+                    MemoryMarshal.Cast<T, float>(a), MemoryMarshal.Cast<T, float>(b),
+                    MemoryMarshal.Cast<T, float>(c), m, k, n);
+        }
         else
             Simd.SimdGemm.DgemmDirectParallelMInto(
                 MemoryMarshal.Cast<T, double>(a), MemoryMarshal.Cast<T, double>(b),
@@ -355,6 +367,27 @@ public static partial class BlasManaged
         return required <= span.Length;
     }
 
+    /// <summary>
+    /// Zero the logical [m, n] output tile of C (respecting the leading dimension), NOT the
+    /// whole backing span. With an ldc-padded or offset-based caller the span extends past the
+    /// tile, and a blanket <c>c.Clear()</c> would clobber data the caller owns outside it.
+    /// Used both for the default (beta=1) pre-zero and as the localized beta=0 fallback for any
+    /// strategy path that read-modify-writes C rather than overwriting it.
+    /// </summary>
+    private static void ClearOutputTile<T>(Span<T> c, int ldc, int m, int n) where T : unmanaged
+    {
+        if (ldc == n)
+        {
+            // Contiguous rows — the tile is a single [0, m*n) run.
+            c.Slice(0, m * n).Clear();
+        }
+        else
+        {
+            for (int row = 0; row < m; row++)
+                c.Slice(row * ldc, n).Clear();
+        }
+    }
+
     // Diagnostic timing wrapper (#475 shape audit). When GemmShapeHistogram.Enabled it times
     // only the TOP-LEVEL Gemm call (a ThreadStatic guard skips internal re-dispatches so a
     // shape is attributed once, to the outer call). Disabled → a single bool read + straight
@@ -493,23 +526,41 @@ public static partial class BlasManaged
             }
         }
 
-        // Strategies do read-modify-write on C; zero it here so the first call
-        // produces C = A · B (not C += A · B). Future versions may expose a
-        // beta=1 option that skips this zero, but Phase B's contract is C := A · B.
+        // beta=0 (write-first) hint. When set, the caller wants a pure C := op(A)·op(B) and
+        // does NOT need C preserved/accumulated, so paths that provably overwrite the whole
+        // [m, n] tile may skip the redundant memset. Every path that does NOT overwrite falls
+        // back to a localized ClearOutputTile below, so correctness never depends on the flag.
+        bool betaZero = options.BetaZero;
+
+#if NET5_0_OR_GREATER
+        // #368 thin-M fast path — MOVED above the output clear. The thin-M direct kernels
+        // OVERWRITE every element of C: FP64 no-trans and both transposed variants zero-init
+        // their register accumulators and store (never reading C), and the FP32 no-trans path
+        // dispatches store-only kernels. So the [m, n] clear below is pure redundancy for this
+        // path; running it first lets thin-M (e.g. the N-BEATS m=256 forward shape) skip the
+        // memset entirely — bit-identical to clear-then-overwrite. Under beta=0 the FP32 path
+        // also drops its own internal c.Clear() (the store-only kernels overwrite the full
+        // tile). BlasManaged's general dispatch parallelises thin-M GEMM poorly (the packed /
+        // machine-code paths lose to the no-pack disjoint-row kernel here); this interception
+        // keeps it on the fast kernel and is bounded to the measured winning regime. Force*
+        // pack modes, pre-packed operands, both-transposed, out-of-box and non-FMA shapes fall
+        // through to the tuned strategy paths (see TryThinMDirect). Disjoint rows →
+        // bit-deterministic across thread counts. A fused bias/activation epilogue is applied
+        // after the GEMM so thin-M FusedLinear hits the fast kernel too.
+        if (TryThinMDirect<T>(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, in options, betaZero))
+            return;
+#endif
+
+        // Strategies do read-modify-write on C; zero it here so the first call produces
+        // C = A · B (not C += A · B). Under beta=0 (BetaZero) the caller wants a pure overwrite
+        // and every downstream path either WRITES every C element (thin-M above) or does its
+        // own localized clear before accumulating, so this global memset is skipped.
         //
         // Clear only the logical [m, n] output tile, NOT the whole span: with an
         // ldc-padded or offset-based caller the backing span extends past the
         // tile, and c.Clear() would clobber data the caller owns outside it.
-        if (ldc == n)
-        {
-            // Contiguous rows — the tile is a single [0, m*n) run.
-            c.Slice(0, m * n).Clear();
-        }
-        else
-        {
-            for (int row = 0; row < m; row++)
-                c.Slice(row * ldc, n).Clear();
-        }
+        if (!betaZero)
+            ClearOutputTile(c, ldc, m, n);
 
         // Sub-R (#408): GEMV fast path. M=1 (row × matrix), N=1 (matrix × col),
         // or K=1 (outer product) bypass the GEMM dispatcher entirely — per-call
@@ -519,6 +570,9 @@ public static partial class BlasManaged
         // path so callers can force-test the strategy if needed.
         if (GemvKernel.QualifiesFor(m, n, k) && options.PackingMode == PackingMode.Auto)
         {
+            // GEMV read-modify-writes C; under beta=0 the global clear was skipped, so zero the
+            // tile here before it accumulates (GEMV is not converted to write-first).
+            if (betaZero) ClearOutputTile(c, ldc, m, n);
             GemvKernel.Run<T>(a, lda, transA, b, ldb, transB, c, ldc, m, n, k);
             var gemvEpilogue = options.Epilogue;
             EpilogueChain.Apply<T>(c, ldc, m, n, in gemvEpilogue);
@@ -533,6 +587,8 @@ public static partial class BlasManaged
         // microkernel-tile picking and route directly to StreamingStrategy.
         if ((long)m * n * k <= TinyShapeWorkThreshold && options.PackingMode == PackingMode.Auto)
         {
+            // Streaming read-modify-writes C; zero the tile under beta=0 (not write-first).
+            if (betaZero) ClearOutputTile(c, ldc, m, n);
             StreamingStrategy.Run<T>(
                 a, lda, transA,
                 b, ldb, transB,
@@ -544,22 +600,6 @@ public static partial class BlasManaged
             EpilogueChain.Apply<T>(c, ldc, m, n, in fastEpilogue);
             return;
         }
-
-#if NET5_0_OR_GREATER
-        // #368 thin-M fast path: BlasManaged's general dispatch parallelises thin-M
-        // GEMM poorly — at the AIsEval MLP L0 128×784×512 float falls to the #409
-        // machine-code path (~55 GF/s) and double stays ~60, both LOSING to a no-pack
-        // direct parallel kernel that splits disjoint output-row blocks (float 6×16
-        // ~400-464 GF/s, beating OpenBLAS ~335; double 4×8 ~172). Disjoint rows →
-        // bit-deterministic across thread counts (no K-split → no Deterministic-mode
-        // concern). Also applies a fused bias/activation epilogue after the GEMM, so
-        // thin-M FusedLinear hits the fast kernel. Bounded to the measured winning
-        // regime; the Force* pack modes (caller pinned a strategy), pre-packed operands,
-        // transposed (its serial transpose regresses thin-M — see TryThinMDirect),
-        // out-of-box and non-FMA shapes fall through to the tuned strategy paths.
-        if (TryThinMDirect<T>(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, in options))
-            return;
-#endif
 
 #if NET5_0_OR_GREATER
         // GotoBLAS FP32 parallel path (the rewrite) — the production large-float GEMM. Fires for BOTH
@@ -579,6 +619,9 @@ public static partial class BlasManaged
             && (long)m * n * k >= GotoGemmFp32.ParallelMinWork && GotoGemmFp32.BeatsPackBoth(m, n, k)
             && GotoGemmFp32.IsAvailable)
         {
+            // GotoGemm accumulates into a pre-zeroed C; under beta=0 the global clear was
+            // skipped, so zero the tile here (this path is not converted to write-first).
+            if (betaZero) ClearOutputTile(c, ldc, m, n);
             var gepi = options.Epilogue;
             {
                 var gfa = MemoryMarshal.Cast<T, float>(a);
@@ -637,6 +680,9 @@ public static partial class BlasManaged
                 && (s_forceMachineKernel || !PrefersStrategyOverMachineKernel(m, n, k, typeof(T) == typeof(float)))
                 && EpilogueFlagsCompute.Compute(in epi409) == EpilogueFlags.None)
             {
+                // Machine-code kernel accumulates into a pre-zeroed C (and its Streaming M/N
+                // tails do too); under beta=0 the global clear was skipped, so zero here.
+                if (betaZero) ClearOutputTile(c, ldc, m, n);
                 int mAl = m - (m % mkMr); // interior rows (× Mr)
                 int nAl = n - (n % mkNr); // interior cols (× Nr)
                 bool ran = typeof(T) == typeof(double)
@@ -672,6 +718,16 @@ public static partial class BlasManaged
         // actual call (the shapes reaching strategy selection are typically transposed —
         // Sub-S already handled non-transposed aligned GEMM above).
         PackingMode strategy = Dispatcher.SelectStrategy(m, n, k, transA, transB, in options);
+
+        // beta=0 fallback for the tuned-strategy family (Streaming / PackAOnly / PackBoth and
+        // the partial-M/N tail decomposition): these all read-modify-write C (Streaming loads
+        // the C accumulator; PackBoth accumulates C across K-panels; the tail-split relies on a
+        // globally pre-zeroed C). None is converted to write-first, so under beta=0 — where the
+        // global clear was skipped — zero the [m, n] tile once here. Every path below is then
+        // identical to the historical clear-then-accumulate contract (bit-exact, no numeric
+        // risk); the memset-skip win is confined to the proven-overwrite thin-M path above.
+        if (betaZero)
+            ClearOutputTile(c, ldc, m, n);
 
         // PackAOnly does not support transB=true in Phase B — fall back to
         // PackBoth (which absorbs the transpose into its pack) or Streaming
