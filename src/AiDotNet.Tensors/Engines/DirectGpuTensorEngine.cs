@@ -1467,6 +1467,52 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// so any subsequent CPU read sees correct data instead of
     /// uninitialized.</para>
     /// </summary>
+    /// <summary>
+    /// Fully invalidates a weight tensor's GPU residency after an in-place CPU-side update
+    /// (the fused compiled optimizer mutates weight host arrays via raw pointers). Clears BOTH
+    /// (a) the per-tensor <c>_gpuBuffer</c> fast-path field that <see cref="GetOrAllocateBuffer"/>
+    /// returns unconditionally under <c>ResidentStepActive</c> — the version-gate is BYPASSED in a
+    /// resident/capture scope, so a Version bump alone does NOT force a re-upload — and (b) the
+    /// array/vector-keyed activation-cache entries (#226-safe: materializes any pending deferred
+    /// download first). Without this, a resident-scope forward keeps reading the STALE pre-step
+    /// device weights → the GPU model trains against frozen weights (drift without descent →
+    /// accuracy pinned at chance). The next forward re-uploads the updated host weights.
+    /// </summary>
+    public void InvalidateResidentWeightBuffer<T>(LinearAlgebra.Tensor<T> tensor)
+    {
+        // DROP (do not materialize) any pending deferred device->host download FIRST. The host
+        // weight array was just updated IN PLACE by the CPU-side optimizer, so a pending download
+        // holds STALE pre-step device data; letting InvalidateGpuCacheForTensor force-materialize it
+        // (its #226 "user might read after Dispose" behaviour) would overwrite the fresh weights on
+        // the fused-optimizer path (#739 review). Removing the registration keeps the just-written
+        // host weights authoritative — the next forward re-uploads them.
+        var pendingBacking = tensor.DataVector.GetBackingArrayUnsafe();
+        if (pendingBacking is not null)
+            Helpers.DeferredArrayMaterializer.Remove(pendingBacking);
+
+        InvalidateGpuCacheForTensor(tensor);
+        // Drop the fast-path resident pointer so GetOrAllocateBuffer's `_gpuBuffer is not null`
+        // branch (which returns it verbatim under ResidentStepActive) can't serve stale weights.
+        tensor._gpuBuffer = null;
+        tensor._gpuBackend = null;
+        tensor._gpuBufferVersion = -1;
+        // ALSO drop the PERSISTENT weight-buffer cache entry (keyed by the backing array). This is
+        // the cache the tape forward's weight read (GetWeightBufferPreferResident → GetOrCacheWeightBuffer)
+        // returns — and it does so WITHOUT a version re-check, so after an in-place optimizer update it
+        // serves the STALE pre-update device weights (the GPU model trains against frozen weights: host
+        // GetParameters is correct + Version bumped, but the forward prediction never reflects the update).
+        // Clearing it here forces GetOrCacheWeightBuffer to re-upload the current host weights next forward.
+        var backing = tensor.DataVector.GetBackingArrayUnsafe();
+        if (backing is not null)
+        {
+            lock (_persistentBufferLock)
+            {
+                if (_persistentBufferCache.TryRemove(backing, out var pe)) pe.Dispose();
+                _tensorVersions.TryRemove(backing, out _);
+            }
+        }
+    }
+
     internal void InvalidateGpuCacheForTensor<T>(LinearAlgebra.Tensor<T> tensor)
     {
         // Both the array-keyed and vector-keyed activation cache
