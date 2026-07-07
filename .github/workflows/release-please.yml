@@ -19,11 +19,6 @@ on:
       - main
       - master
 
-permissions:
-  contents: write
-  pull-requests: write
-  issues: write # release-please creates/applies the `autorelease:` labels via the Issues API
-
 concurrency:
   group: release-please-${{ github.ref }}
   cancel-in-progress: false
@@ -32,6 +27,12 @@ jobs:
   release-please:
     name: Maintain Release PR / cut release
     runs-on: ubuntu-latest
+    # Least-privilege: scope write permissions to this job (the only job in this workflow)
+    # instead of the workflow level, so issues:write is not granted more broadly than needed.
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write # release-please creates/applies the `autorelease:` labels via the Issues API
     steps:
       - name: Run release-please
         uses: googleapis/release-please-action@a02a34c4d625f9be7cb89156071d8567266a2445 # v4.1.3
