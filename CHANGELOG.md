@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.111.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.110.1...v0.111.0) (2026-07-07)
+
+
+### Features
+
+* **simd:** dual-path Adam kernel — bit-exact default + AIDOTNET_FAST_MATH FMA fast path ([#738](https://github.com/ooples/AiDotNet.Tensors/issues/738)) ([d670ce3](https://github.com/ooples/AiDotNet.Tensors/commit/d670ce31750d09311125761c9d3db8ed2dcc7bdf))
+
+
+### Bug Fixes
+
+* **autodiff:** make 2D AffineGrid differentiable w.r.t. theta ([#747](https://github.com/ooples/AiDotNet.Tensors/issues/747)) ([72e4116](https://github.com/ooples/AiDotNet.Tensors/commit/72e4116efcf33c11310f54fe0401f3597477db06))
+* **bench:** gate gemm-bench on the median per-round paired ON/OFF ratio ([#741](https://github.com/ooples/AiDotNet.Tensors/issues/741)) ([39194bb](https://github.com/ooples/AiDotNet.Tensors/commit/39194bbf96e44f40c5d13969b05a565f732405b1))
+* **gpu:** fused-optimizer weight-coherence — refresh resident device buffer after in-place update ([#739](https://github.com/ooples/AiDotNet.Tensors/issues/739)) ([8e61dc4](https://github.com/ooples/AiDotNet.Tensors/commit/8e61dc48df46d7981044fe98b22dc1b6a453218c))
+* **gpu:** hardware-independent determinism for scatter-add grad + cuBLAS under SetDeterministicMode (Closes [#742](https://github.com/ooples/AiDotNet.Tensors/issues/742)) ([#744](https://github.com/ooples/AiDotNet.Tensors/issues/744)) ([b815872](https://github.com/ooples/AiDotNet.Tensors/commit/b8158726d08bc72b85bef25fabffef811aef6938))
+
+
+### Performance
+
+* **gemm:** beta=0 write-first path — skip redundant C-zeroing on pure C:=A·B ([#743](https://github.com/ooples/AiDotNet.Tensors/issues/743)) ([2aac704](https://github.com/ooples/AiDotNet.Tensors/commit/2aac704a5d9a55ff2407903a95ad74bae164e18b))
+* kill training spin-storm — lower resident-pool MRES spin (2047 -&gt; 32) ([#736](https://github.com/ooples/AiDotNet.Tensors/issues/736)) ([8ede01f](https://github.com/ooples/AiDotNet.Tensors/commit/8ede01f1c9802bbafbc6eed2fd7c6db2e94a00da))
+* zero-alloc training via TensorArena reuse + shape-safe ring (DRAFT) ([#734](https://github.com/ooples/AiDotNet.Tensors/issues/734)) ([3f7178a](https://github.com/ooples/AiDotNet.Tensors/commit/3f7178af342e4ed33871501ae160fd51479e858d))
+
 ## [0.103.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.102.16...v0.103.0) (2026-07-07)
 
 
