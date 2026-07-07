@@ -17,31 +17,70 @@ namespace AiDotNet.Tensors.Engines.Simd;
 /// This is the single source of truth for the CPU eager-optimizer Adam inner loop: the consumer's
 /// <c>AdamOptimizer</c> tape-step calls it (InternalsVisibleTo "AiDotNet") instead of hand-rolling SIMD.
 ///
-/// <para><b>Numerics — SIMD is bit-identical to the scalar tail.</b> Both use a fused multiply-add for
-/// the two moment updates (<see cref="System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(Vector256{float},Vector256{float},Vector256{float})"/>
-/// in the vector path, <see cref="MathF.FusedMultiplyAdd"/> / <see cref="Math.FusedMultiplyAdd"/> in the
-/// scalar path), the SAME correctly-rounded hardware sqrt (<c>Avx.Sqrt</c> == <see cref="MathF.Sqrt"/> /
-/// <see cref="Math.Sqrt"/>), plain IEEE divide/multiply/subtract, and an ordered greater-than compare +
-/// blend for the AMSGrad running-max (matching the scalar <c>&gt;</c> ternary, incl. NaN → keep previous).
-/// Because the vector lanes and the sub-width tail run identical operations, the result does not depend
-/// on the vector width or the remainder split. (This uses FMA for speed, so it is intentionally NOT
-/// bit-identical to a non-FMA separate-multiply-add loop.)</para>
-///
-/// <para>On net471 (no <c>System.Runtime.Intrinsics</c>) or any host without AVX+FMA, the scalar path
-/// runs over the whole span. There, <see cref="MathF"/>/FMA intrinsics are unavailable, so it falls back
-/// to separate multiply-add and <c>(float)Math.Sqrt</c> — correct, just not bit-matched to the SIMD path
-/// that never runs on those hosts.</para>
+/// <para><b>Numerics — SIMD is bit-identical to the scalar tail AND to the consumer's scalar eager
+/// Adam.</b> The two moment updates use a SEPARATE multiply then add (NOT a fused multiply-add), the
+/// SAME correctly-rounded hardware sqrt (<c>Avx.Sqrt</c> == <see cref="MathF.Sqrt"/> / <see cref="Math.Sqrt"/>),
+/// plain IEEE divide/multiply/subtract, and an ordered greater-than compare + blend for the AMSGrad
+/// running-max (matching the scalar <c>&gt;</c> ternary, incl. NaN → keep previous). Because Adam is
+/// fully elementwise (no cross-lane reduction), the vector lanes and the sub-width tail run identical
+/// per-element operations, so the result does not depend on the vector width or the remainder split.
+/// Separate-multiply-add (rather than FMA) is deliberate: it keeps this kernel bit-exact with
+/// <c>AdamOptimizer&lt;T&gt;</c>'s eager fp32/fp64 loop (<c>beta*m + (1-beta)*g</c>), so wiring the eager
+/// optimizer onto this SIMD path does not perturb saved golden trajectories.</para>
 /// </summary>
 internal static class AdamMomentKernels
 {
+    // ── DUAL-PATH mode select (AiDotNet #1804) ────────────────────────────────
+    // Default (env UNSET): the bit-exact, separate-multiply-add, double-rounded-sqrt
+    // path below — reproduces saved golden N-BEATS trajectories to the last ULP
+    // (forecast[0]=47.395111, MAE=0.023372). This is production reproducibility.
+    //
+    // AIDOTNET_FAST_MATH=1: the FMA / single-precision-sqrt fast path — one fused
+    // multiply-add per moment (vs a separate multiply+add) and a hardware single-
+    // precision Avx.Sqrt / MathF.Sqrt (vs widen→double-sqrt→narrow). Faster, but the
+    // fused rounding drifts ~1 ULP/step which the chaotic N-BEATS training amplifies
+    // past 1e-4 — near-golden, not bit-exact. For research / PyTorch-parity benchmarks.
+    //
+    // Read ONCE into a static readonly bool so the JIT hoists the branch out of the
+    // hot loop (effectively a compile-time constant per process).
+    private static readonly bool FastMath =
+        Environment.GetEnvironmentVariable("AIDOTNET_FAST_MATH") == "1";
+
+    // Separate multiply-then-add (NOT fused). The consumer AdamOptimizer's eager
+    // fp32/fp64 fast path computes the two moment updates as `beta*m + (1-beta)*g`
+    // with a distinct multiply and add, so to stay bit-exact with that reference
+    // (and hence with saved golden trajectories) this kernel must NOT contract the
+    // pair into an FMA — an FMA keeps the intermediate at full width and rounds once,
+    // which drifts from the scalar path and, over a full training run, amplifies well
+    // past 1e-4. Because Adam is fully elementwise (no cross-lane reduction), the SIMD
+    // path below and this scalar tail produce identical results regardless of vector
+    // width or the remainder split.
+    // Default: double-rounded (widen to double, IEEE-sqrt, narrow) — matches the scalar
+    // eager path's `(float)Math.Sqrt((double)x)` exactly. Fast mode: single-precision
+    // sqrt (up to 1 ULP off, but ~2× cheaper — no widen/narrow round trip).
+    private static float SqrtF(float x) =>
 #if NET5_0_OR_GREATER
-    private static float FmaF(float a, float b, float c) => MathF.FusedMultiplyAdd(a, b, c);
-    private static double FmaD(double a, double b, double c) => Math.FusedMultiplyAdd(a, b, c);
-    private static float SqrtF(float x) => MathF.Sqrt(x);
+        FastMath ? MathF.Sqrt(x) : (float)Math.Sqrt(x);
 #else
-    private static float FmaF(float a, float b, float c) => a * b + c;
-    private static double FmaD(double a, double b, double c) => a * b + c;
-    private static float SqrtF(float x) => (float)Math.Sqrt(x);
+        (float)Math.Sqrt(x);
+#endif
+
+    // Fused multiply-add helpers for the fast-mode scalar tail (mirrors the SIMD FMA
+    // lanes for width-independence). Guarded: MathF.FusedMultiplyAdd / Math.FusedMultiplyAdd
+    // are .NET Core 3.0+ only; net471 (never a benchmark target) falls back to separate
+    // multiply-add — fast mode is a NET5+ research/benchmark path.
+    private static float FmaTail(float a, float b, float c) =>
+#if NET5_0_OR_GREATER
+        MathF.FusedMultiplyAdd(a, b, c);
+#else
+        a * b + c;
+#endif
+
+    private static double FmaTail(double a, double b, double c) =>
+#if NET5_0_OR_GREATER
+        Math.FusedMultiplyAdd(a, b, c);
+#else
+        a * b + c;
 #endif
 
     /// <summary>fp32 Adam/AMSGrad step, in place over <paramref name="param"/>/<paramref name="m"/>/<paramref name="v"/> (and <paramref name="vMax"/> when <paramref name="useAmsgrad"/>).</summary>
@@ -69,9 +108,23 @@ internal static class AdamMomentKernels
                 for (; i < simdLen; i += Vector256<float>.Count)
                 {
                     var g = Avx.LoadVector256(pGrad + i);
-                    var mNew = Fma.MultiplyAdd(vB1, Avx.LoadVector256(pM + i), Avx.Multiply(v1mB1, g));
+                    // Default (bit-exact) vs fast (FMA). Default matches AdamOptimizer's scalar
+                    // eager fp32 loop with a SEPARATE multiply-add:
+                    //   mNew = (β1·m) + ((1-β1)·g)      — separate multiply-add, not FMA
+                    //   vNew = (β2·v) + (((1-β2)·g)·g)  — LEFT-assoc `(1-β2)*g*g`, matching C# `f1mb2 * g * g`
+                    // Fast mode fuses the accumulate into one FMA (rounds once, ~1 ULP drift).
+                    Vector256<float> mNew, vNew;
+                    if (FastMath)
+                    {
+                        mNew = Fma.MultiplyAdd(v1mB1, g, Avx.Multiply(vB1, Avx.LoadVector256(pM + i)));
+                        vNew = Fma.MultiplyAdd(Avx.Multiply(v1mB2, g), g, Avx.Multiply(vB2, Avx.LoadVector256(pV + i)));
+                    }
+                    else
+                    {
+                        mNew = Avx.Add(Avx.Multiply(vB1, Avx.LoadVector256(pM + i)), Avx.Multiply(v1mB1, g));
+                        vNew = Avx.Add(Avx.Multiply(vB2, Avx.LoadVector256(pV + i)), Avx.Multiply(Avx.Multiply(v1mB2, g), g));
+                    }
                     Avx.Store(pM + i, mNew);
-                    var vNew = Fma.MultiplyAdd(vB2, Avx.LoadVector256(pV + i), Avx.Multiply(v1mB2, Avx.Multiply(g, g)));
                     Avx.Store(pV + i, vNew);
                     var mHat = Avx.Divide(mNew, vBc1);
                     Vector256<float> vHatEff;
@@ -88,7 +141,22 @@ internal static class AdamMomentKernels
                     {
                         vHatEff = Avx.Divide(vNew, vBc2);
                     }
-                    var denom = Avx.Add(Avx.Sqrt(vHatEff), vEps);
+                    // Default: DOUBLE-ROUNDED sqrt — (float)Math.Sqrt((double)vHat) — to bit-match
+                    // the scalar path (single-precision Avx.Sqrt differs by up to 1 ULP, which the
+                    // chaotic N-BEATS training amplifies past 1e-4). Widen each 4-float half to double,
+                    // IEEE-sqrt, narrow round-to-nearest. Fast mode: one hardware single-precision
+                    // Avx.Sqrt over all 8 lanes (no widen/narrow round trip).
+                    Vector256<float> denom;
+                    if (FastMath)
+                    {
+                        denom = Avx.Add(Avx.Sqrt(vHatEff), vEps);
+                    }
+                    else
+                    {
+                        var sqLo = Avx.ConvertToVector128Single(Avx.Sqrt(Avx.ConvertToVector256Double(vHatEff.GetLower())));
+                        var sqHi = Avx.ConvertToVector128Single(Avx.Sqrt(Avx.ConvertToVector256Double(vHatEff.GetUpper())));
+                        denom = Avx.Add(Vector256.Create(sqLo, sqHi), vEps);
+                    }
                     var update = Avx.Divide(Avx.Multiply(vLr, mHat), denom);
                     Avx.Store(pParam + i, Avx.Subtract(Avx.LoadVector256(pParam + i), update));
                 }
@@ -97,8 +165,20 @@ internal static class AdamMomentKernels
             for (; i < n; i++)
             {
                 float g = pGrad[i];
-                float mNew = FmaF(beta1, pM[i], oneMinusBeta1 * g);
-                float vNew = FmaF(beta2, pV[i], oneMinusBeta2 * (g * g));
+                // Default: separate multiply-add (not FMA), left-assoc `(1-β2)*g*g`, DOUBLE-ROUNDED
+                // sqrt (SqrtF) — bit-exact with the scalar eager fp32 loop. Fast mode: FMA-fused
+                // moments + single-precision sqrt, mirroring the SIMD lanes (width-independence).
+                float mNew, vNew;
+                if (FastMath)
+                {
+                    mNew = FmaTail(oneMinusBeta1, g, beta1 * pM[i]);
+                    vNew = FmaTail(oneMinusBeta2 * g, g, beta2 * pV[i]);
+                }
+                else
+                {
+                    mNew = beta1 * pM[i] + oneMinusBeta1 * g;
+                    vNew = beta2 * pV[i] + oneMinusBeta2 * g * g;
+                }
                 pM[i] = mNew;
                 pV[i] = vNew;
                 float mHat = mNew / bc1;
@@ -145,9 +225,20 @@ internal static class AdamMomentKernels
                 for (; i < simdLen; i += Vector256<double>.Count)
                 {
                     var g = Avx.LoadVector256(pGrad + i);
-                    var mNew = Fma.MultiplyAdd(vB1, Avx.LoadVector256(pM + i), Avx.Multiply(v1mB1, g));
+                    // Default: separate multiply-add (not FMA), left-assoc `(1-β2)*g*g` — bit-matches
+                    // the scalar eager fp64 loop. Fast mode: FMA-fused accumulate (rounds once).
+                    Vector256<double> mNew, vNew;
+                    if (FastMath)
+                    {
+                        mNew = Fma.MultiplyAdd(v1mB1, g, Avx.Multiply(vB1, Avx.LoadVector256(pM + i)));
+                        vNew = Fma.MultiplyAdd(Avx.Multiply(v1mB2, g), g, Avx.Multiply(vB2, Avx.LoadVector256(pV + i)));
+                    }
+                    else
+                    {
+                        mNew = Avx.Add(Avx.Multiply(vB1, Avx.LoadVector256(pM + i)), Avx.Multiply(v1mB1, g));
+                        vNew = Avx.Add(Avx.Multiply(vB2, Avx.LoadVector256(pV + i)), Avx.Multiply(Avx.Multiply(v1mB2, g), g));
+                    }
                     Avx.Store(pM + i, mNew);
-                    var vNew = Fma.MultiplyAdd(vB2, Avx.LoadVector256(pV + i), Avx.Multiply(v1mB2, Avx.Multiply(g, g)));
                     Avx.Store(pV + i, vNew);
                     var mHat = Avx.Divide(mNew, vBc1);
                     Vector256<double> vHatEff;
@@ -173,8 +264,17 @@ internal static class AdamMomentKernels
             for (; i < n; i++)
             {
                 double g = pGrad[i];
-                double mNew = FmaD(beta1, pM[i], oneMinusBeta1 * g);
-                double vNew = FmaD(beta2, pV[i], oneMinusBeta2 * (g * g));
+                double mNew, vNew;
+                if (FastMath)
+                {
+                    mNew = FmaTail(oneMinusBeta1, g, beta1 * pM[i]);
+                    vNew = FmaTail(oneMinusBeta2 * g, g, beta2 * pV[i]);
+                }
+                else
+                {
+                    mNew = beta1 * pM[i] + oneMinusBeta1 * g;
+                    vNew = beta2 * pV[i] + oneMinusBeta2 * g * g;
+                }
                 pM[i] = mNew;
                 pV[i] = vNew;
                 double mHat = mNew / bc1;

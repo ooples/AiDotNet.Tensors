@@ -7,24 +7,39 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.Simd;
 
 /// <summary>
-/// Bit-exact parity for <see cref="AdamMomentKernels"/> (#1757): the SIMD (AVX+FMA) lanes must produce
-/// results identical to the scalar tail, so a training step's output does not depend on the vector width
-/// or the remainder split. The kernel and this independent reference both use FMA for the moment updates
-/// and the same correctly-rounded hardware sqrt, so on a host with AVX+FMA (where sizes ≥ 8/4 exercise the
-/// vector path) exact equality proves SIMD == scalar. On net471 (scalar-only kernel) the reference mirrors
-/// the same fallback, so the comparison still holds.
+/// Bit-exact parity for <see cref="AdamMomentKernels"/> (#1757, dual-path #1804): the SIMD (AVX) lanes must
+/// produce results identical to the scalar tail, so a training step's output does not depend on the vector
+/// width or the remainder split. The kernel is DUAL-PATH: with <c>AIDOTNET_FAST_MATH</c> UNSET (production
+/// default) it uses separate-multiply-add moments and a double-rounded sqrt (bit-exact with the eager scalar
+/// optimizer and saved golden trajectories); with <c>AIDOTNET_FAST_MATH=1</c> it uses FMA moments and a
+/// single-precision sqrt. This reference mirrors the kernel's scalar tail for WHICHEVER mode the process is
+/// running in (same env read), so the SIMD == scalar invariant is proven in the active mode. On net471
+/// (scalar-only kernel) the reference mirrors the same fallback, so the comparison still holds.
 /// </summary>
 public class AdamMomentKernelsParityTests
 {
-    // Mirror the kernel's scalar helpers EXACTLY (same FMA / sqrt choice per TFM).
+    // Same env read as the kernel: default = bit-exact, "1" = FMA fast path.
+    private static readonly bool FastMath =
+        Environment.GetEnvironmentVariable("AIDOTNET_FAST_MATH") == "1";
+
+    // Mirror the kernel's scalar tail EXACTLY per mode / TFM.
+    private static float FmaF(float a, float b, float c) =>
 #if NET5_0_OR_GREATER
-    private static float FmaF(float a, float b, float c) => MathF.FusedMultiplyAdd(a, b, c);
-    private static double FmaD(double a, double b, double c) => Math.FusedMultiplyAdd(a, b, c);
-    private static float SqrtF(float x) => MathF.Sqrt(x);
+        MathF.FusedMultiplyAdd(a, b, c);
 #else
-    private static float FmaF(float a, float b, float c) => a * b + c;
-    private static double FmaD(double a, double b, double c) => a * b + c;
-    private static float SqrtF(float x) => (float)Math.Sqrt(x);
+        a * b + c;
+#endif
+    private static double FmaD(double a, double b, double c) =>
+#if NET5_0_OR_GREATER
+        Math.FusedMultiplyAdd(a, b, c);
+#else
+        a * b + c;
+#endif
+    private static float SqrtF(float x) =>
+#if NET5_0_OR_GREATER
+        FastMath ? MathF.Sqrt(x) : (float)Math.Sqrt(x);
+#else
+        (float)Math.Sqrt(x);
 #endif
 
     private static int FloatBits(float f) => BitConverter.ToInt32(BitConverter.GetBytes(f), 0);
@@ -36,8 +51,10 @@ public class AdamMomentKernelsParityTests
         for (int i = 0; i < param.Length; i++)
         {
             float g = grad[i];
-            float mNew = FmaF(b1, m[i], om1 * g);
-            float vNew = FmaF(b2, v[i], om2 * (g * g));
+            // Fast: FMA moments (matches kernel FmaTail(om1,g,b1*m) / FmaTail(om2*g,g,b2*v)).
+            // Default: separate multiply-add, left-assoc (om2*g)*g.
+            float mNew = FastMath ? FmaF(om1, g, b1 * m[i]) : b1 * m[i] + om1 * g;
+            float vNew = FastMath ? FmaF(om2 * g, g, b2 * v[i]) : b2 * v[i] + om2 * g * g;
             m[i] = mNew;
             v[i] = vNew;
             float mHat = mNew / bc1;
@@ -55,8 +72,8 @@ public class AdamMomentKernelsParityTests
         for (int i = 0; i < param.Length; i++)
         {
             double g = grad[i];
-            double mNew = FmaD(b1, m[i], om1 * g);
-            double vNew = FmaD(b2, v[i], om2 * (g * g));
+            double mNew = FastMath ? FmaD(om1, g, b1 * m[i]) : b1 * m[i] + om1 * g;
+            double vNew = FastMath ? FmaD(om2 * g, g, b2 * v[i]) : b2 * v[i] + om2 * g * g;
             m[i] = mNew;
             v[i] = vNew;
             double mHat = mNew / bc1;
