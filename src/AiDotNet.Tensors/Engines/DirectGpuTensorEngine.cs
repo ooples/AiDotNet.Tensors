@@ -1486,6 +1486,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         tensor._gpuBuffer = null;
         tensor._gpuBackend = null;
         tensor._gpuBufferVersion = -1;
+        // ALSO drop the PERSISTENT weight-buffer cache entry (keyed by the backing array). This is
+        // the cache the tape forward's weight read (GetWeightBufferPreferResident → GetOrCacheWeightBuffer)
+        // returns — and it does so WITHOUT a version re-check, so after an in-place optimizer update it
+        // serves the STALE pre-update device weights (the GPU model trains against frozen weights: host
+        // GetParameters is correct + Version bumped, but the forward prediction never reflects the update).
+        // Clearing it here forces GetOrCacheWeightBuffer to re-upload the current host weights next forward.
+        var backing = tensor.DataVector.GetBackingArrayUnsafe();
+        if (backing is not null)
+        {
+            lock (_persistentBufferLock)
+            {
+                if (_persistentBufferCache.TryRemove(backing, out var pe)) pe.Dispose();
+                _tensorVersions.TryRemove(backing, out _);
+            }
+        }
     }
 
     internal void InvalidateGpuCacheForTensor<T>(LinearAlgebra.Tensor<T> tensor)
