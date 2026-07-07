@@ -52,7 +52,15 @@ internal static class AxisSelector
     /// dispatch overhead. Same value used by
     /// <see cref="Helpers.CpuParallelSettings.ParallelForOrSerial"/>.
     /// </summary>
-    public const long ParallelWorkThreshold = 32_768;
+    // Raised from 32_768: on high-core boxes the pool DISPATCH BARRIER (waking + syncing
+    // 12-32 workers via ManualResetEventSlim) dwarfs the math for small GEMMs — a PerfView
+    // profile of N-BEATS training (GEMMs 0.6M-4.2M MACs, m=96-256) showed the driver blocked
+    // ~45% of wall on this barrier while worker compute was ~1%. Below this many MACs, run
+    // serial on the calling thread (no dispatch). M-axis partitioning is disjoint-row (no
+    // cross-thread reduction), so serial-vs-parallel is bit-exact. Tunable via
+    // AIDOTNET_GEMM_PARALLEL_MINWORK. 16M keeps N-BEATS-scale GEMMs serial while genuinely
+    // large GEMMs (transformers, d>=512) still fan out.
+    public const long ParallelWorkThreshold = 16_777_216;
 
     /// <summary>
     /// Pick the parallelism axis for the given shape, microkernel tile, and
