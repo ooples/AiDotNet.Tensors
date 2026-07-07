@@ -6529,6 +6529,50 @@ internal static class BackwardFunctions<T>
     }
 
     /// <summary>
+    /// AffineGrid (2D) backward — the output grid is linear in theta, so
+    /// ∂grid[n,h,w,r] / ∂theta[n,r,k] = coord_k(h,w) for k ∈ {x, y, 1}.
+    /// Matches the align-corners coordinate convention of the 2D forward
+    /// (xNorm = w/(W-1)*2-1, yNorm = h/(H-1)*2-1, or 0 when the axis is length 1).
+    /// Sum the product over all (h, w) to get gradTheta[n, r, k].
+    /// </summary>
+    internal static void AffineGridBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var theta = inputs[0];
+        int outH = (int)savedState[0];
+        int outW = (int)savedState[1];
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int N = theta._shape[0];
+        var gradTheta = new Tensor<T>(theta._shape);
+        var gOut = gradOutput.AsSpan();
+        var gTheta = gradTheta.AsWritableSpan();
+
+        for (int n = 0; n < N; n++)
+        {
+            int tBase = n * 6; // 2 × 3 affine matrix
+            for (int h = 0; h < outH; h++)
+            {
+                double y = outH <= 1 ? 0.0 : -1.0 + 2.0 * h / (outH - 1);
+                for (int w = 0; w < outW; w++)
+                {
+                    double x = outW <= 1 ? 0.0 : -1.0 + 2.0 * w / (outW - 1);
+                    int gBase = ((n * outH + h) * outW + w) * 2;
+                    for (int row = 0; row < 2; row++)
+                    {
+                        double g = numOps.ToDouble(gOut[gBase + row]);
+                        if (g == 0) continue;
+                        gTheta[tBase + row * 3]     = numOps.Add(gTheta[tBase + row * 3],     numOps.FromDouble(g * x));
+                        gTheta[tBase + row * 3 + 1] = numOps.Add(gTheta[tBase + row * 3 + 1], numOps.FromDouble(g * y));
+                        gTheta[tBase + row * 3 + 2] = numOps.Add(gTheta[tBase + row * 3 + 2], numOps.FromDouble(g));
+                    }
+                }
+            }
+        }
+        DifferentiableOps.AccumulateGrad(grads, theta, gradTheta, engine);
+    }
+
+    /// <summary>
     /// RoIAlign backward — scatter each output cell's gradient back across
     /// the 4 (or 2^samplingRatio²) bilinear-sampled source positions.
     /// </summary>
