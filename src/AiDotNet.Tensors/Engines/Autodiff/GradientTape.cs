@@ -80,6 +80,31 @@ public sealed class GradientTape<T> : IDisposable
     private readonly Engines.DirectGpuTensorEngine? _snapshotEngine;
     private readonly long _activationSnapshot;
 
+    // GLOBAL tape-owned arena (extends #734). A top-level GradientTape with no
+    // arena already active (i.e. not created through a model base or Optimize()
+    // call site that opens its own TensorArena) CREATES and OWNS one for the
+    // duration of the tape. This gives EVERY backprop path — including custom
+    // training loops that go through none of those wrappers — zero-alloc training
+    // after warmup with no per-path wiring. On Dispose the owned arena is
+    // Dispose()d (pooling its large buffers to the cross-arena persistent pool and
+    // restoring the previous arena); an externally-owned long-lived arena is left
+    // to its owner and only Reset() per step (the pre-existing #1804 behaviour).
+    private bool _ownsArena;
+    private Helpers.TensorArena? _ownedArena;
+
+    // Opt-in (default OFF; #734). When enabled, a TOP-LEVEL tape with no arena already
+    // active creates+owns one for its lifetime — extending per-step arena recycling to
+    // custom training loops that go through no model base / Optimize() call site (which
+    // already open their own arena). DEFAULT OFF because a tape-owned arena's tensor ring
+    // pins activation WRAPPERS for reuse, which is fundamentally incompatible with
+    // ComputeGradientsStreaming's activation release (the streaming test asserts the
+    // released activation wrapper becomes collectable). Standard training via the model
+    // bases / Optimize() is UNAFFECTED — those open an explicit arena and still get the
+    // per-step reuse. Enable (AIDOTNET_TAPE_OWNED_ARENA=1) only for hand-rolled loops that
+    // use neither streaming nor gradient checkpointing.
+    internal static bool EnableTapeOwnedArena { get; set; }
+        = System.Environment.GetEnvironmentVariable("AIDOTNET_TAPE_OWNED_ARENA") == "1";
+
 
     /// <summary>
     /// Gets the number of operations recorded on this tape.
@@ -177,6 +202,21 @@ public sealed class GradientTape<T> : IDisposable
         _engine = AiDotNetEngine.Current;
         _engineExplicitlyBound = false;
         _parent = _current;
+
+        // GLOBAL tape-owned arena: a TOP-LEVEL tape (_parent is null) with NO arena
+        // already active on this thread opens one it owns. When an arena is already
+        // active (a model base / Optimize() call site opened it), we do NOT create
+        // our own — that arena stays externally owned and is only Reset() per step in
+        // Dispose (existing #1804 behaviour). Nested tapes (Hvp/Hessian) never own an
+        // arena. This is what extends zero-alloc training to backprop paths that go
+        // through none of the model bases or Optimize() call sites.
+        if (EnableTapeOwnedArena && _parent is null && !_options.SuppressArenaScope
+            && Helpers.TensorArena.Current is null)
+        {
+            _ownedArena = Helpers.TensorArena.Create();
+            _ownsArena = true;
+        }
+
         _savedReplayMode = Compilation.AutoTrainingCompiler.ReplayMode;
 
         // Capture the activation-cache baseline for the OUTERMOST tape on a GPU engine.
@@ -2225,6 +2265,43 @@ public sealed class GradientTape<T> : IDisposable
         // Return arena to thread-local cache for reuse by next GradientTape
         _entries.Reset();
         _cachedArena = _entries;
+
+        // Transparent per-step TensorArena recycling (AiDotNet #1804). When the
+        // OUTERMOST tape on this thread disposes, one training/compute step has
+        // completed — rewind the active TensorArena's scratch cursors so the
+        // next step reuses those backing arrays instead of GC-allocating fresh
+        // (this is the PyTorch caching-allocator parity that closes the ~25%
+        // per-op allocation gap on deep-model training). Any code that runs one
+        // GradientTape per step inside a TensorArena scope (e.g. the model
+        // training bases) gets zero-alloc training after warmup with NO
+        // per-model wiring. Guarded to the top-level tape (_parent is null) so
+        // nested / higher-order (Hvp/Hessian) tapes never reset mid-step.
+        // No-op when no arena is active (inference, non-arena callers).
+        // Contract: the optimizer step must run within the tape's scope so the
+        // gradient tensors (arena-backed) are consumed before this reset — the
+        // standard one-tape-per-step loop satisfies this; model weights and
+        // optimizer moments are plain-heap Tensors and are unaffected.
+        //
+        // GLOBAL tape-owned arena: if THIS tape created the arena (no arena was
+        // active at ctor and this is a top-level tape), Dispose it — that pools its
+        // large backing buffers to the cross-arena persistent pool and restores the
+        // previous arena, so the NEXT top-level tape reuses them (zero-alloc after
+        // warmup). Otherwise, if this is the top-level tape over an externally-owned
+        // long-lived arena, Reset() it per step (the pre-existing #1804 behaviour).
+        if (_ownsArena)
+        {
+            _ownedArena?.Dispose();
+        }
+        else if (_parent is null && !_options.SuppressArenaScope)
+        {
+            // #734: a transient INNER tape (the GradientCheckpointing recompute tape) is
+            // created mid-backward when the outer tape has nulled the thread-current tape,
+            // so it also sees _parent == null. It must NOT Reset() the arena here — that
+            // rewinds the OUTER tape's arena ring cursors mid-backward and the outer walk
+            // then reuses buffers still holding live gradients, corrupting them. Inner tapes
+            // set SuppressArenaScope so only the genuine step-boundary tape resets per step.
+            Helpers.TensorArena.Current?.Reset();
+        }
     }
 
     // ──────────────────────────────────────────────────────────────
