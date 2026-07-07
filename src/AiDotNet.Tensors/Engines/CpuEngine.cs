@@ -2777,9 +2777,15 @@ public partial class CpuEngine : ITensorLevelEngine
                 // (BlasManaged's fast path declines transA&&transB; parallel dispatch loses on few rows).
                 if (m >= 64 && !(transA && transB))
                 {
+                    // BetaZero: this is a pure C := A·B (result is a freshly rented, write-only
+                    // buffer), so let the dispatcher skip the redundant C-zeroing memset on any
+                    // path that provably overwrites the whole output tile — notably the thin-M
+                    // direct kernel that intercepts the N-BEATS m=256 forward shape. Bit-exact
+                    // (write-first accumulators start at +0.0, identical to zero-then-accumulate);
+                    // non-overwrite paths fall back to a localized clear, so always correct.
                     Engines.BlasManaged.BlasManaged.Gemm<float>(
                         aFloat, lda, transA, bFloat, ldb, transB, cFloat, n, m, n, k,
-                        new Engines.BlasManaged.BlasOptions<float> { PackingMode = Engines.BlasManaged.PackingMode.DisableAutotune });
+                        new Engines.BlasManaged.BlasOptions<float> { PackingMode = Engines.BlasManaged.PackingMode.DisableAutotune, BetaZero = true });
                 }
                 else
                 {

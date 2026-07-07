@@ -308,7 +308,18 @@ public sealed class TensorArena : IDisposable
                 if (cursor < bucket.Count)
                 {
                     _tensorRingCursors[i] = cursor + 1;
-                    return (LinearAlgebra.Tensor<T>)bucket[cursor];
+                    var cached = (LinearAlgebra.Tensor<T>)bucket[cursor];
+                    // The ring buckets by element COUNT, not shape. The cached wrapper
+                    // carries the shape it was FIRST created with, so a same-count /
+                    // different-shape request (e.g. an [B,L] vs [L,B] permute in N-BEATS)
+                    // must be re-issued under the REQUESTED shape — otherwise a stale-shaped
+                    // tensor flows downstream and crashes shape checks on this post-Reset
+                    // reuse path (AiDotNet #1804). The buffer is contiguous with matching
+                    // element count, so this is a zero-copy metadata swap that does NOT
+                    // record a Reshape node on the active tape.
+                    if (!cached._shape.AsSpan().SequenceEqual(shape))
+                        cached.ArenaReshapeInPlace(shape);
+                    return cached;
                 }
 
                 // Need one more tensor of this size — reuse a persistent-pool

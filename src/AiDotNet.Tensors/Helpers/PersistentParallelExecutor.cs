@@ -16,6 +16,28 @@ internal sealed class PersistentParallelExecutor
 
     internal static PersistentParallelExecutor Instance => LazyInstance.Value;
 
+    // Per-worker MRES spin count before a parked worker truly blocks.
+    //
+    // History: #475 set this to 2047 (the MRES max) to keep the resident workers hot so
+    // back-to-back small GEMMs in INFERENCE find them already spinning (no per-dispatch wake
+    // latency). But under TRAINING on a many-core box the pool is woken by a near-continuous
+    // stream of tiny forward/backward GEMM dispatches, and each of the ~32 workers re-arming
+    // its MRES spins ~2047 iterations EVERY dispatch — profiled on an N-BEATS train (128
+    // logical cores) as ~15 avg-cores of PURE SPIN (TotalProcessorTime/wall), i.e. ~12 cores
+    // burned doing nothing while wall barely changed. Dropping the spin to a small bridge
+    // value parks idle workers almost immediately: the SAME train fell from ~15 to ~3.8
+    // avg-cores at unchanged wall (the beneficial ~4-way fan-out still happens; only the idle
+    // spin is removed), freeing the rest of the box for concurrent work. 32 still bridges the
+    // sub-µs gap between two GEMMs issued back-to-back in one op without holding a core for
+    // tens of µs of idle spin. Env override: AIDOTNET_PPE_SPINCOUNT (0 = park immediately).
+    // Clamped to ManualResetEventSlim's valid 0..2047 range — its ctor throws
+    // ArgumentOutOfRangeException for spinCount > 2047 (the count is stored in an 11-bit
+    // field, max (1 << 11) - 1). An unparseable OR out-of-range value falls back to the
+    // default 32 so a bad env value can never fail executor init and take the whole pool down.
+    private static readonly int _mresSpinCount =
+        int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_PPE_SPINCOUNT"), out var sc)
+            && sc >= 0 && sc <= 2047 ? sc : 32;
+
     private readonly int _numWorkers;
     private readonly Thread[] _workers;
 
@@ -67,7 +89,7 @@ internal sealed class PersistentParallelExecutor
             // worker, which dominates sub-millisecond tile work (1.1-1.7× scaling).
             // libtorch/OpenMP busy-wait for the same reason. Workers still PARK
             // after the spin window when the workload truly ends.
-            _workReady[i] = new ManualResetEventSlim(false, spinCount: 2047);
+            _workReady[i] = new ManualResetEventSlim(false, spinCount: _mresSpinCount);
             int workerSlot = i;
             _workers[i] = new Thread(() => WorkerLoop(workerSlot))
             {

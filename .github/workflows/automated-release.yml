@@ -567,4 +567,4 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload "v${{ needs.version-and-build.outputs.package_version }}" out/*.nupkg --clobber
+          gh release upload "v${{ needs.version-and-build.outputs.package_version }}" out/*.nupkg --clobber --repo "${{ github.repository }}"

@@ -6531,9 +6531,8 @@ internal static class BackwardFunctions<T>
     /// <summary>
     /// AffineGrid (2D) backward — the output grid is linear in theta, so
     /// ∂grid[n,h,w,r] / ∂theta[n,r,k] = coord_k(h,w) for k ∈ {x, y, 1}.
-    /// Matches the align-corners coordinate convention of the 2D forward
-    /// (xNorm = w/(W-1)*2-1, yNorm = h/(H-1)*2-1, or 0 when the axis is length 1).
-    /// Sum the product over all (h, w) to get gradTheta[n, r, k].
+    /// Sum the product over all (h, w) to get gradTheta[n, r, k]. Coordinate
+    /// normalization mirrors the forward (align-corners style: 2·i/(size-1) − 1).
     /// </summary>
     internal static void AffineGridBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
@@ -6553,10 +6552,10 @@ internal static class BackwardFunctions<T>
             int tBase = n * 6; // 2 × 3 affine matrix
             for (int h = 0; h < outH; h++)
             {
-                double y = outH <= 1 ? 0.0 : -1.0 + 2.0 * h / (outH - 1);
+                double y = outH <= 1 ? 0.0 : 2.0 * h / (outH - 1) - 1.0;
                 for (int w = 0; w < outW; w++)
                 {
-                    double x = outW <= 1 ? 0.0 : -1.0 + 2.0 * w / (outW - 1);
+                    double x = outW <= 1 ? 0.0 : 2.0 * w / (outW - 1) - 1.0;
                     int gBase = ((n * outH + h) * outW + w) * 2;
                     for (int row = 0; row < 2; row++)
                     {
