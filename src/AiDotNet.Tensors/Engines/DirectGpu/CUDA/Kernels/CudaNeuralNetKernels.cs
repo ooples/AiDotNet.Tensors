@@ -1967,6 +1967,32 @@ extern ""C"" __global__ __launch_bounds__(256) void scatter_add_deterministic(
     dst[dstIdx] = sum;
 }
 
+// scatter_add — bit-deterministic ACCUMULATING variant (issue #742).
+// Unlike scatter_add_deterministic (which OVERWRITES: dst = sum), this ADDS onto a
+// pre-SEEDED destination (dst += sum) — the semantics the CudaBackend.ScatterAdd
+// wrapper needs, since it copies the base tensor into `dst` first and expects the
+// indexed contributions accumulated on top. One thread per destination cell scans
+// numElements in fixed ascending order (no atomicAdd → bit-identical across runs on
+// ANY GPU/driver, unlike the default atomic path which is only incidentally stable).
+extern ""C"" __global__ __launch_bounds__(256) void scatter_add_accumulate_deterministic(
+    const float* src,
+    const int* indices,
+    float* dst,              // PRE-SEEDED destination; contributions are ADDED on top
+    int numElements,
+    int dstSize)
+{
+    int dstIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (dstIdx >= dstSize) return;
+
+    float sum = 0.0f;
+    for (int i = 0; i < numElements; i++) {
+        if (indices[i] == dstIdx) {
+            sum += src[i];
+        }
+    }
+    dst[dstIdx] += sum;   // accumulate onto seed; this thread solely owns dstIdx → race-free
+}
+
 // Batched scatter add for multi-dimensional tensors.
 // NON-DETERMINISTIC across runs (issue #382); see scatter_add_batched_deterministic.
 extern ""C"" __global__ __launch_bounds__(256) void scatter_add_batched(
@@ -2755,6 +2781,7 @@ extern ""C"" __global__ __launch_bounds__(256) void adaptive_avgpool_backward(
                 // bit-reproducible scatter accumulation)
                 "scatter_add",
                 "scatter_add_deterministic",
+                "scatter_add_accumulate_deterministic",
                 "scatter_add_batched",
                 "scatter_add_batched_deterministic",
                 "scatter_max",

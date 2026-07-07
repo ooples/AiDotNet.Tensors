@@ -133,4 +133,80 @@ public class GpuDeterminismRegressionTests
             BlasProvider.SetThreadLocalDeterministicMode(originalThreadLocalDet);
         }
     }
+
+    /// <summary>
+    /// Issue #742 (cross-hardware determinism hardening): the scatter-add gradient reduction
+    /// (CudaBackend.ScatterAdd, used by TensorScatterAdd / embedding scatter-add grad) accumulates
+    /// via atomicAdd by default — bit-stable on some GPUs but NOT guaranteed reproducible across all
+    /// GPUs/drivers because fp32 add is non-associative and atomic completion order is scheduler-
+    /// dependent. Under SetDeterministicMode(true) it must route to a fixed-order accumulating variant
+    /// (scatter_add_accumulate_deterministic) that is bit-identical across runs on ANY hardware.
+    /// This test asserts (a) byte-identical output across repeated deterministic-mode runs, and
+    /// (b) the deterministic result equals the fast atomicAdd result to fp32 tolerance (correctness
+    /// preserved — same math, just a fixed reduction order).
+    /// </summary>
+    [SkippableFact]
+    public void ScatterAdd_DeterministicMode_BitIdenticalAndMatchesAtomic()
+    {
+        Skip.IfNot(_isDirectGpuAvailable, "DirectGPU backend (CUDA/OpenCL/HIP) not available on this host");
+
+        bool? originalThreadLocalDet = BlasProvider.GetThreadLocalDeterministicMode();
+        bool originalProcessDet = AiDotNetEngine.DeterministicMode;
+        IEngine originalEngine = AiDotNetEngine.Current;
+        DirectGpuTensorEngine? installedEngine = null;
+        try
+        {
+            installedEngine = new DirectGpuTensorEngine();
+            AiDotNetEngine.Current = installedEngine;
+
+            // Heavy-collision scatter: 512 updates onto 32 cells → ~16 duplicate indices per cell,
+            // the pattern that maximizes atomicAdd ordering sensitivity. Destination is pre-seeded
+            // (the += target) so this exercises the accumulating deterministic variant, not overwrite.
+            const int dstSize = 32, n = 512;
+            var rng = new Random(123);
+            var dest = new Tensor<float>([dstSize]);
+            for (int i = 0; i < dstSize; i++) dest[i] = (float)(rng.NextDouble() * 2 - 1);
+            var updates = new Tensor<float>([n]);
+            for (int i = 0; i < n; i++) updates[i] = (float)(rng.NextDouble() * 2 - 1);
+            var indices = new Tensor<int>([n]);
+            for (int i = 0; i < n; i++) indices[i] = rng.Next(0, dstSize);
+
+            int Bits(float f) { var b = BitConverter.GetBytes(f); return BitConverter.ToInt32(b, 0); }
+
+            // Fast (atomicAdd) reference.
+            AiDotNetEngine.SetDeterministicMode(false);
+            var atomicResult = AiDotNetEngine.Current.TensorScatterAdd(dest, indices, updates, 0);
+
+            // Deterministic variant, 3 runs → must be byte-identical run-to-run.
+            AiDotNetEngine.SetDeterministicMode(true);
+            var snapshots = new float[3][];
+            for (int run = 0; run < 3; run++)
+            {
+                var r = AiDotNetEngine.Current.TensorScatterAdd(dest, indices, updates, 0);
+                snapshots[run] = new float[dstSize];
+                for (int i = 0; i < dstSize; i++) snapshots[run][i] = r[i];
+            }
+            for (int run = 1; run < 3; run++)
+                for (int i = 0; i < dstSize; i++)
+                    Assert.True(Bits(snapshots[run][i]) == Bits(snapshots[0][i]),
+                        $"deterministic ScatterAdd run {run} diverged from run 0 at [{i}]: {snapshots[run][i]} vs {snapshots[0][i]}");
+
+            // Correctness: deterministic result matches the atomicAdd result to fp32 tolerance.
+            double maxAbs = 0;
+            for (int i = 0; i < dstSize; i++)
+            {
+                double d = Math.Abs((double)snapshots[0][i] - atomicResult[i]);
+                if (d > maxAbs) maxAbs = d;
+            }
+            Assert.True(maxAbs < 1e-3,
+                $"deterministic ScatterAdd diverged from atomicAdd result (max_abs={maxAbs:E3}) — reduction changed the math, not just the order");
+        }
+        finally
+        {
+            AiDotNetEngine.Current = originalEngine;
+            installedEngine?.Dispose();
+            AiDotNetEngine.SetDeterministicMode(originalProcessDet);
+            BlasProvider.SetThreadLocalDeterministicMode(originalThreadLocalDet);
+        }
+    }
 }
