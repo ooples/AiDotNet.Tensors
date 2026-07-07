@@ -30,8 +30,13 @@ internal sealed class PersistentParallelExecutor
     // spin is removed), freeing the rest of the box for concurrent work. 32 still bridges the
     // sub-µs gap between two GEMMs issued back-to-back in one op without holding a core for
     // tens of µs of idle spin. Env override: AIDOTNET_PPE_SPINCOUNT (0 = park immediately).
+    // Clamped to ManualResetEventSlim's valid 0..2047 range — its ctor throws
+    // ArgumentOutOfRangeException for spinCount > 2047 (the count is stored in an 11-bit
+    // field, max (1 << 11) - 1). An unparseable OR out-of-range value falls back to the
+    // default 32 so a bad env value can never fail executor init and take the whole pool down.
     private static readonly int _mresSpinCount =
-        int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_PPE_SPINCOUNT"), out var sc) && sc >= 0 ? sc : 32;
+        int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_PPE_SPINCOUNT"), out var sc)
+            && sc >= 0 && sc <= 2047 ? sc : 32;
 
     private readonly int _numWorkers;
     private readonly Thread[] _workers;
