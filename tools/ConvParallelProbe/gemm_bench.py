@@ -27,6 +27,7 @@ Exit code 1 if any TUNED shape regresses past the tolerance.
 import argparse
 import os
 import re
+import statistics
 import subprocess
 import sys
 
@@ -92,6 +93,7 @@ def bench(probe, shapes, maxdop, reps, repeat):
     for label, m, k, n in shapes:
         off = None
         on = None
+        round_ratios = []
         # Interleave OFF/ON per repeat (not all-OFF-then-all-ON): slow machine-load drift on a
         # shared CI runner then biases both flags equally instead of skewing the ON/OFF ratio.
         for _ in range(repeat):
@@ -101,7 +103,19 @@ def bench(probe, shapes, maxdop, reps, repeat):
                 off = o0 if off is None else min(off, o0)
             if o1 is not None:
                 on = o1 if on is None else min(on, o1)
-        ratio = (on / off) if (off and on) else float("nan")
+            # Gate on the ratio of the OFF/ON measured back-to-back in the SAME round: their
+            # shared-runner load is ~equal, so drift cancels - which is the whole point of
+            # interleaving. Taking min(ON) / min(OFF) over ALL rounds independently (the previous
+            # behaviour) discarded that pairing: a lucky-fast OFF round could pair against an
+            # unlucky ON round, skewing the ratio. On a 32-core runner medium GEMMs (square-768/
+            # square-1152) have ~30% best-case dispatch variance, so that skew made this gate
+            # flaky - an identical commit read ratio 1.19 one run and 0.94 the next. Each o0/o1 is
+            # already the min over `reps` inner reps.
+            if o0 and o1:
+                round_ratios.append(o1 / o0)
+        # Median of the per-round paired ratios: robust to a single unlucky round while still
+        # catching a real, sustained regression (the median only moves if MOST rounds regress).
+        ratio = statistics.median(round_ratios) if round_ratios else float("nan")
         rows.append((label, m, k, n, off, on, ratio))
     return rows
 
@@ -122,7 +136,9 @@ def main():
     lines = [
         f"## #653 GEMM small-M tiling A/B  (maxdop={args.maxdop}, reps={args.reps}, repeat={args.repeat}, tol={args.tol:.0%})",
         "",
-        "min_ms = best case across repeats. ratio = ON / OFF (lower is better; <1 = faster with the lever).",
+        "OFF ms / ON ms = best case across repeats (informational). ratio = MEDIAN of the per-round "
+        "paired ON/OFF (each round's ON and OFF are measured back-to-back so runner-load drift cancels) "
+        "- this is the value the gate checks. lower is better; <1 = faster with the lever.",
         "",
         "### TUNED shapes - must not regress (gate)",
         "| shape | MxKxN | OFF ms | ON ms | ratio | verdict |",
