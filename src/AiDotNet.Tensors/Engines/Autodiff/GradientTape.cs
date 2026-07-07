@@ -92,6 +92,19 @@ public sealed class GradientTape<T> : IDisposable
     private bool _ownsArena;
     private Helpers.TensorArena? _ownedArena;
 
+    // Opt-in (default OFF; #734). When enabled, a TOP-LEVEL tape with no arena already
+    // active creates+owns one for its lifetime — extending per-step arena recycling to
+    // custom training loops that go through no model base / Optimize() call site (which
+    // already open their own arena). DEFAULT OFF because a tape-owned arena's tensor ring
+    // pins activation WRAPPERS for reuse, which is fundamentally incompatible with
+    // ComputeGradientsStreaming's activation release (the streaming test asserts the
+    // released activation wrapper becomes collectable). Standard training via the model
+    // bases / Optimize() is UNAFFECTED — those open an explicit arena and still get the
+    // per-step reuse. Enable (AIDOTNET_TAPE_OWNED_ARENA=1) only for hand-rolled loops that
+    // use neither streaming nor gradient checkpointing.
+    internal static bool EnableTapeOwnedArena { get; set; }
+        = System.Environment.GetEnvironmentVariable("AIDOTNET_TAPE_OWNED_ARENA") == "1";
+
 
     /// <summary>
     /// Gets the number of operations recorded on this tape.
@@ -197,7 +210,8 @@ public sealed class GradientTape<T> : IDisposable
         // Dispose (existing #1804 behaviour). Nested tapes (Hvp/Hessian) never own an
         // arena. This is what extends zero-alloc training to backprop paths that go
         // through none of the model bases or Optimize() call sites.
-        if (_parent is null && Helpers.TensorArena.Current is null)
+        if (EnableTapeOwnedArena && _parent is null && !_options.SuppressArenaScope
+            && Helpers.TensorArena.Current is null)
         {
             _ownedArena = Helpers.TensorArena.Create();
             _ownsArena = true;
@@ -2278,8 +2292,14 @@ public sealed class GradientTape<T> : IDisposable
         {
             _ownedArena?.Dispose();
         }
-        else if (_parent is null)
+        else if (_parent is null && !_options.SuppressArenaScope)
         {
+            // #734: a transient INNER tape (the GradientCheckpointing recompute tape) is
+            // created mid-backward when the outer tape has nulled the thread-current tape,
+            // so it also sees _parent == null. It must NOT Reset() the arena here — that
+            // rewinds the OUTER tape's arena ring cursors mid-backward and the outer walk
+            // then reuses buffers still holding live gradients, corrupting them. Inner tapes
+            // set SuppressArenaScope so only the genuine step-boundary tape resets per step.
             Helpers.TensorArena.Current?.Reset();
         }
     }
