@@ -158,6 +158,45 @@ public sealed class TensorArena : IDisposable
         // else: at cap — drop the reference, let GC reclaim (don't hoard).
     }
 
+    // ---------------------------------------------------------------------
+    // Boundary-CARRY pool (#1824). Separate from _persistent because carries
+    // pool at ANY size (the scratch pool skips < PersistThresholdElems, since
+    // small scratch GCs cheaply — but a carried layer boundary is copied EVERY
+    // forward, so even a small one must be reused or it re-introduces exactly
+    // the per-forward churn the arena exists to eliminate). Keyed by
+    // (type, size) and capped at MaxPersistPerSize; a model's set of boundary
+    // shapes is small and stable across calls, so this reuses perfectly while
+    // staying bounded. Thread-static, matching the [ThreadStatic] pool contract.
+    // ---------------------------------------------------------------------
+    [ThreadStatic]
+    private static Dictionary<(Type, int), Stack<Array>>? _carryPool;
+
+    private static Array? RentCarry(Type type, int elementCount)
+    {
+        var pool = _carryPool;
+        if (pool is null) return null;
+        if (pool.TryGetValue((type, elementCount), out var stack) && stack.Count > 0)
+        {
+            var arr = stack.Pop();
+            _persistentReuseHits++;
+            return arr; // caller overwrites every element from the boundary — no clear needed
+        }
+        return null;
+    }
+
+    private static void ReturnCarry(Type type, int elementCount, Array arr)
+    {
+        var pool = _carryPool ??= new Dictionary<(Type, int), Stack<Array>>();
+        var key = (type, elementCount);
+        if (!pool.TryGetValue(key, out var stack))
+        {
+            stack = new Stack<Array>(MaxPersistPerSize);
+            pool[key] = stack;
+        }
+        if (stack.Count < MaxPersistPerSize)
+            stack.Push(arr);
+    }
+
     /// <summary>
     /// Drops every buffer held in the calling thread's cross-arena persistent
     /// pool. For tests / explicit memory-pressure handling; production code
@@ -166,11 +205,57 @@ public sealed class TensorArena : IDisposable
     public static void ClearPersistentPool()
     {
         _persistent?.Clear();
+        _carryPool?.Clear();
         _persistentReuseHits = 0;
     }
 
     private bool _disposed;
     private readonly TensorArena? _previous;
+
+    // ---------------------------------------------------------------------
+    // Live working-set accounting (peak backing bytes).
+    //
+    // Every backing array this arena HOLDS (scratch buckets, the tensor ring,
+    // and the pinned tier) is counted here the moment it is first added to a
+    // bucket/ring. Reuse after Reset() does NOT add — the cursor rewinds and
+    // hands the SAME array back — so the counter reflects the arena's live
+    // resident working set, not per-call churn. Because arrays are only ever
+    // released on Dispose, the counter is monotonic within a lifetime, so the
+    // peak equals the final value. This is the deterministic signal a caller
+    // needs to prove a forward is memory-BOUNDED: with per-layer recycling
+    // (detach the boundary + Reset between layers) the arena reuses one
+    // block's buffers for every layer, so peak stays ~O(one block); without
+    // recycling every layer adds fresh buffers, so peak grows ~O(depth·block).
+    private long _liveBackingBytes;
+    private long _peakBackingBytes;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void TrackBackingBytes<T>(int elementCount)
+    {
+        _liveBackingBytes += (long)elementCount * Unsafe.SizeOf<T>();
+        if (_liveBackingBytes > _peakBackingBytes) _peakBackingBytes = _liveBackingBytes;
+    }
+
+    /// <summary>
+    /// Peak total bytes of backing arrays this arena has held over its lifetime
+    /// (scratch pool + tensor ring + pinned tier). Reuse after <see cref="Reset"/>
+    /// does not grow it, so it measures the live resident working set — the peak
+    /// memory a forward pass actually needs. Diagnostic / test signal for
+    /// memory-bounded inference.
+    /// </summary>
+    public long PeakBackingBytes => _peakBackingBytes;
+
+    [ThreadStatic]
+    private static long _lastDisposedPeakBackingBytes;
+
+    /// <summary>
+    /// <see cref="PeakBackingBytes"/> of the most recently disposed arena on this
+    /// thread. Lets a caller read a per-call arena's peak working set AFTER the
+    /// (internally created + disposed) arena is gone — e.g. a test that measures
+    /// <c>NeuralNetworkBase.Predict</c>'s bounded forward peak without holding the
+    /// arena reference. Reset to the disposing arena's peak on every Dispose.
+    /// </summary>
+    public static long LastDisposedPeakBackingBytes => _lastDisposedPeakBackingBytes;
 
     /// <summary>
     /// Gets the currently active arena for this thread, or null if none.
@@ -233,6 +318,7 @@ public sealed class TensorArena : IDisposable
         if (_disposed) return null;
         var arr = new T[elementCount];
         _pinnedArrays.Add(arr);
+        TrackBackingBytes<T>(elementCount);
         return arr;
     }
 
@@ -269,6 +355,7 @@ public sealed class TensorArena : IDisposable
         // THIS lifetime and may hold stale data the caller wrote.)
         var arr = RentPersistent(typeof(T), elementCount) as T[] ?? new T[elementCount];
         bucket.Add(arr);
+        TrackBackingBytes<T>(elementCount);
         _cursor[key] = cursor + 1;
         return arr;
     }
@@ -316,6 +403,7 @@ public sealed class TensorArena : IDisposable
                 // the caller overwrites every element, so no clear needed).
                 var newArr = RentPersistent(typeof(T), totalSize) as T[] ?? new T[totalSize];
                 _ringBackingArrays.Add((typeof(T), totalSize, newArr));
+                TrackBackingBytes<T>(totalSize);
                 var newTensor = LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(newArr, 0, totalSize), shape);
                 bucket.Add(newTensor);
                 _tensorRingCursors[i] = cursor + 1;
@@ -328,6 +416,7 @@ public sealed class TensorArena : IDisposable
         {
             var arr = RentPersistent(typeof(T), totalSize) as T[] ?? new T[totalSize];
             _ringBackingArrays.Add((typeof(T), totalSize, arr));
+            TrackBackingBytes<T>(totalSize);
             var tensor = LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(arr, 0, totalSize), shape);
             var newBucket = new List<object>(4) { tensor };
             int idx = _tensorRingCount++;
@@ -351,6 +440,60 @@ public sealed class TensorArena : IDisposable
         var overflowArr = TryAllocateUninitialized<T>(totalSize);
         if (overflowArr is null) return null; // disposed
         return LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(overflowArr, 0, totalSize), shape);
+    }
+
+    // Boundary-carry buffer produced by the PREVIOUS DetachBoundaryAndReset, pending return to
+    // the cross-arena persistent pool once the next layer has consumed it. See that method.
+    private (Type type, int size, Array arr)? _pendingCarryReturn;
+
+    /// <summary>
+    /// Copies a layer-boundary tensor OUT of the recyclable scratch region, then <see cref="Reset"/>s
+    /// the scratch pool so the NEXT layer reuses THIS layer's intermediate buffers instead of
+    /// allocating fresh — the core primitive of memory-bounded inference (AiDotNet #1824). Peak
+    /// backing memory stays ~O(one layer's scratch + one boundary) instead of O(depth · scratch).
+    /// </summary>
+    /// <remarks>
+    /// The copy destination is drawn from the cross-arena PERSISTENT pool (a top-level arena) so
+    /// the carried boundary both (a) survives the <see cref="Reset"/> that recycles the scratch
+    /// pool, and (b) is REUSED across calls — no per-forward GC churn for the boundary, preserving
+    /// the arena's cross-call allocation win. Double-buffered: the previous carry buffer is
+    /// returned to the pool here — by the time this new boundary exists, the layer that produced
+    /// it has already consumed the previous boundary, so the previous buffer is dead. A NESTED
+    /// arena (<c>_previous != null</c>) copies to a plain GC array instead: its op outputs can
+    /// escape to the still-live outer scope, and pooling an escaped buffer is the #1221 hazard the
+    /// Dispose path already guards against — the nested-inference case is rare, so the GC copy is
+    /// an acceptable, unconditionally-safe fallback.
+    /// </remarks>
+    public LinearAlgebra.Tensor<T> DetachBoundaryAndReset<T>(LinearAlgebra.Tensor<T> boundary)
+    {
+        int total = 1;
+        var shape = new int[boundary.Rank];
+        for (int i = 0; i < shape.Length; i++)
+        {
+            shape[i] = boundary.Shape[i];
+            total *= shape[i];
+        }
+
+        if (_previous is not null || _disposed)
+        {
+            // Nested (or already-disposed) — plain GC copy, never touch the shared pool.
+            var gc = boundary.ToArray();
+            Reset();
+            return LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(gc, 0, total), shape);
+        }
+
+        // Top-level: carry the boundary in a CARRY-pool buffer (survives Reset, reused across
+        // calls at any size). We overwrite every element from the boundary immediately, so the
+        // buffer's initial contents don't matter.
+        var buf = (RentCarry(typeof(T), total) as T[]) ?? new T[total];
+        boundary.AsSpan().CopyTo(new Span<T>(buf, 0, total));
+
+        if (_pendingCarryReturn is { } prev)
+            ReturnCarry(prev.type, prev.size, prev.arr);
+        _pendingCarryReturn = (typeof(T), total, buf);
+
+        Reset();
+        return LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(buf, 0, total), shape);
     }
 
     /// <summary>
@@ -404,6 +547,14 @@ public sealed class TensorArena : IDisposable
         if (_disposed) return;
         _disposed = true;
 
+        // Publish this arena's peak working set so a caller that let a
+        // per-call arena be created + disposed internally (e.g.
+        // NeuralNetworkBase.Predict) can still read the forward's bounded
+        // peak afterward. Set unconditionally (nested arenas overwrite;
+        // the outermost disposes last, so the last write is the top-level
+        // forward's peak — the number a memory-bound test cares about).
+        _lastDisposedPeakBackingBytes = _peakBackingBytes;
+
         if (_current == this)
             _current = _previous; // restore outer arena if nested
 
@@ -438,7 +589,12 @@ public sealed class TensorArena : IDisposable
                 var (type, size, arr) = _ringBackingArrays[i];
                 ReturnPersistent(type, size, arr);
             }
+            // Return the last boundary-carry buffer (#1824). By Dispose the final layer has
+            // consumed it and the model output is a fresh detached copy, so the carry is dead.
+            if (_pendingCarryReturn is { } carry)
+                ReturnCarry(carry.type, carry.size, carry.arr);
         }
+        _pendingCarryReturn = null;
 
         _pool.Clear();
         _cursor.Clear();
