@@ -220,4 +220,52 @@ public class GeometryOpsTests
         Assert.Equal(1f, g[tail + 1]);
         Assert.Equal(1f, g[tail + 2]);
     }
+
+    // ------------------------------------------------------------------
+    // AffineGrid (2D) autodiff — the grid is linear in theta, so a gradient
+    // seeded at the grid must flow back to theta. Without this a spatial-
+    // transformer localization head is silently untrainable (the whole point
+    // of making AffineGrid tape-aware).
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public void AffineGrid2D_PropagatesGradientToTheta()
+    {
+        var theta = new Tensor<double>(new double[]
+        {
+            1.0, 0.1, 0.05,
+            0.1, 1.0, -0.05,
+        }, new[] { 1, 2, 3 });
+
+        using var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<double>();
+        var grid = _cpu.AffineGrid(theta, 4, 4); // [1,4,4,2]
+
+        // Dense random-ish projection so dLoss/dGrid has no zero entries.
+        var proj = new Tensor<double>(grid.Shape.ToArray());
+        var pw = proj.AsWritableSpan();
+        for (int i = 0; i < pw.Length; i++) pw[i] = ((i * 37) % 13) * 0.1 - 0.6;
+
+        var elementwise = _cpu.TensorMultiply(grid, proj);
+        var axes = new int[elementwise.Shape.Length];
+        for (int i = 0; i < axes.Length; i++) axes[i] = i;
+        var loss = _cpu.ReduceSum(elementwise, axes, keepDims: false);
+
+        var grads = tape.ComputeGradients(loss, new[] { theta });
+
+        Assert.True(grads.ContainsKey(theta),
+            "AffineGrid did not record theta on the tape — gradient cannot reach the localization head.");
+        var gTheta = grads[theta];
+        double norm = 0;
+        for (int i = 0; i < gTheta.Length; i++) norm += gTheta[i] * gTheta[i];
+        Assert.True(Math.Sqrt(norm) > 1e-9,
+            $"AffineGrid produced a zero gradient w.r.t. theta (norm={Math.Sqrt(norm):E3}).");
+
+        // Spot-check one analytic entry: dLoss/dtheta[0,0,2] = Σ_hw proj[.,.,0] (coeff of the
+        // bias term on row 0 is 1 everywhere).
+        double expectedBias0 = 0;
+        var gr = grid.AsSpan(); var pr = proj.AsSpan();
+        for (int idx = 0; idx < gr.Length; idx += 2) expectedBias0 += pr[idx];
+        Assert.True(Math.Abs(gTheta[2] - expectedBias0) < 1e-6,
+            $"dLoss/dtheta[0,0,2] mismatch: got {gTheta[2]:F6}, expected {expectedBias0:F6}.");
+    }
 }

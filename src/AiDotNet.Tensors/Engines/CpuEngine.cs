@@ -31426,49 +31426,52 @@ public partial class CpuEngine : ITensorLevelEngine
         if (theta._shape.Length != 3 || theta._shape[1] != 2 || theta._shape[2] != 3)
             throw new ArgumentException("AffineGrid expects theta shape [batch, 2, 3]");
 
-        int batchSize = theta._shape[0];
-        var grid = TensorAllocator.Rent<T>([batchSize, outputHeight, outputWidth, 2]);
-        var numOps = MathHelper.GetNumericOperations<T>();
+        var grid = AffineGridImpl(theta, outputHeight, outputWidth);
 
-        for (int b = 0; b < batchSize; b++)
-        {
-            for (int h = 0; h < outputHeight; h++)
-            {
-                T yNorm = outputHeight == 1
-                    ? numOps.Zero
-                    : numOps.FromDouble((double)h / (outputHeight - 1) * 2.0 - 1.0);
-
-                for (int w = 0; w < outputWidth; w++)
-                {
-                    T xNorm = outputWidth == 1
-                        ? numOps.Zero
-                        : numOps.FromDouble((double)w / (outputWidth - 1) * 2.0 - 1.0);
-
-                    T xPrime = numOps.Add(
-                        numOps.Add(
-                            numOps.Multiply(theta[b, 0, 0], xNorm),
-                            numOps.Multiply(theta[b, 0, 1], yNorm)),
-                        theta[b, 0, 2]);
-
-                    T yPrime = numOps.Add(
-                        numOps.Add(
-                            numOps.Multiply(theta[b, 1, 0], xNorm),
-                            numOps.Multiply(theta[b, 1, 1], yNorm)),
-                        theta[b, 1, 2]);
-
-                    grid[b, h, w, 0] = xPrime;
-                    grid[b, h, w, 1] = yPrime;
-                }
-            }
-        }
-
-        // The output grid is linear in theta, so AffineGrid is differentiable w.r.t. theta
-        // (its 3D sibling AffineGrid3D already records). Without this, a Spatial Transformer's
-        // localization network receives no tape gradient and is silently untrainable.
+        // Record theta -> grid for reverse-mode autodiff. AffineGrid is LINEAR in theta, so a
+        // spatial-transformer localization head (and any other consumer that back-props through the
+        // sampling grid) can only learn if this edge is on the tape. Without it theta — and every
+        // upstream parameter feeding it — received a zero gradient (STN was silently untrainable).
         AiDotNet.Tensors.Engines.Autodiff.DifferentiableOps.RecordUnary(
             "AffineGrid", grid, theta,
             AiDotNet.Tensors.Engines.Autodiff.BackwardFunctions<T>.AffineGridBackward,
             new object[] { outputHeight, outputWidth });
+
+        return grid;
+    }
+
+    private Tensor<T> AffineGridImpl<T>(Tensor<T> theta, int outputHeight, int outputWidth)
+    {
+        int batchSize = theta._shape[0];
+        var grid = TensorAllocator.Rent<T>([batchSize, outputHeight, outputWidth, 2]);
+        if (grid.Length == 0) return grid;
+
+        // Rewritten from a per-element INumericOperations<T> loop (6 virtual Multiply/Add dispatches
+        // per grid point) to a native-double fast path: read theta once via ToDouble, run the affine
+        // map in plain double arithmetic, write via FromDouble — same numerics, no per-point virtual
+        // dispatch. Mirrors AffineGrid3DImpl and the GridSample raw-array kernel in this engine.
+        var ops = MathHelper.GetNumericOperations<T>();
+        var t = theta.AsSpan();
+        var g = grid.AsWritableSpan();
+
+        for (int b = 0; b < batchSize; b++)
+        {
+            int tBase = b * 6; // 2 × 3 affine matrix
+            double t00 = ops.ToDouble(t[tBase]),     t01 = ops.ToDouble(t[tBase + 1]), t02 = ops.ToDouble(t[tBase + 2]);
+            double t10 = ops.ToDouble(t[tBase + 3]), t11 = ops.ToDouble(t[tBase + 4]), t12 = ops.ToDouble(t[tBase + 5]);
+            for (int h = 0; h < outputHeight; h++)
+            {
+                double yNorm = outputHeight <= 1 ? 0.0 : (double)h / (outputHeight - 1) * 2.0 - 1.0;
+                for (int w = 0; w < outputWidth; w++)
+                {
+                    double xNorm = outputWidth <= 1 ? 0.0 : (double)w / (outputWidth - 1) * 2.0 - 1.0;
+                    int gBase = ((b * outputHeight + h) * outputWidth + w) * 2;
+                    g[gBase]     = ops.FromDouble(t00 * xNorm + t01 * yNorm + t02);
+                    g[gBase + 1] = ops.FromDouble(t10 * xNorm + t11 * yNorm + t12);
+                }
+            }
+        }
+
         return grid;
     }
 
