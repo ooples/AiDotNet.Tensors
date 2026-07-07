@@ -45,6 +45,29 @@ public readonly ref struct BlasOptions<T> where T : unmanaged
     /// throughput at the cost of ±1-2 ULP cross-thread variability.
     /// </summary>
     public BlasMode Mode { get; init; }
+
+    /// <summary>
+    /// beta = 0 hint (write-first, skip output-zeroing). When <see langword="true"/>, the
+    /// caller declares it wants a pure overwrite <c>C := op(A)·op(B)</c> and does NOT need
+    /// C's prior contents preserved or accumulated into — so the dispatcher may skip the
+    /// redundant <c>C.Clear()</c> memset for any path that provably WRITES every element of
+    /// the [m, n] output tile (rather than read-modify-writing it).
+    ///
+    /// <para>
+    /// Bit-exactness: for a write-first path the accumulator starts at <c>+0.0</c> and the
+    /// first fused-multiply-add is <c>fma(a, b, +0.0)</c> — identical to the
+    /// zero-then-accumulate path where the pre-cleared C supplies that same <c>+0.0</c>. So
+    /// the result is bit-for-bit identical, just without the memset.
+    /// </para>
+    ///
+    /// <para>
+    /// Default <see langword="false"/> preserves the historical contract (C is zeroed on
+    /// entry, then accumulated) so every existing caller is unchanged. Paths that cannot be
+    /// proven write-first fall back to a localized clear of the output tile even when this is
+    /// set, so the result is always correct regardless of which strategy the shape routes to.
+    /// </para>
+    /// </summary>
+    public bool BetaZero { get; init; }
 }
 
 public enum PackingMode

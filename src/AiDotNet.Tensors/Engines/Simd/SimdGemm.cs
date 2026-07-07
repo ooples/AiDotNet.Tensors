@@ -2057,6 +2057,24 @@ internal static partial class SimdGemm
     }
 
     /// <summary>
+    /// beta=0 write-first sibling of <see cref="SgemmDirectParallelMInto"/>: computes
+    /// C := A·B WITHOUT the leading <c>c.Clear()</c>. Safe because
+    /// <see cref="SgemmDirectParallelM"/> with <c>clearedOutput: true</c> dispatches only the
+    /// store-only kernels (<c>DirectKernel6x16Store</c> / <c>DirectKernelMxNMaskedStore</c>),
+    /// which OVERWRITE every element of the [m, n] tile (full Mr-row blocks over all N,
+    /// masked N-tail, and the M-edge rows) — nothing is read from C. The result is therefore
+    /// bit-identical to zero-then-store, just without the redundant memset. Callers that need
+    /// C accumulated (C += A·B) must NOT use this; use the SgemmAdd entry points instead.
+    /// </summary>
+    [MethodImpl(Hot)]
+    public static void SgemmDirectParallelMOverwrite(
+        ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c,
+        int m, int k, int n)
+    {
+        SgemmDirectParallelM(a, k, b, n, c, m, k, n, clearedOutput: true);
+    }
+
+    /// <summary>
     /// FP64 analog of <see cref="SgemmDirectParallelMInto"/> (#368): overwrite GEMM
     /// (C = A·B) via a no-pack register-blocked 4×8 <see cref="Vector256{T}"/> double
     /// microkernel, parallelised over disjoint M-row-blocks. For thin/moderate-M
