@@ -1,0 +1,40 @@
+name: Release Please
+
+# Batched, reviewable releases (replaces the per-push trigger of automated-release.yml).
+#
+# release-please accumulates conventional-commit changes since the last release into a rolling
+# "Release PR" (version bump + CHANGELOG). Merges to main just keep updating that one PR, so a burst
+# of merged PRs bundles into ONE version. When a maintainer merges the Release PR, release-please
+# creates the tag (v<version>) + GitHub release — which fires `release: published` and triggers the
+# existing automated-release.yml to build, pack ALL packages (Tensors + native runtimes), and publish
+# to NuGet. This workflow only decides WHEN/WHAT to release; automated-release.yml still owns HOW to
+# build/pack/publish (its 7-package native pack logic is unchanged).
+#
+# NOTE: the token MUST be a PAT (AUTOFIX_PAT). A GitHub release created via the default GITHUB_TOKEN
+# does not fire the `release: published` event (recursion guard), so the publish would never run.
+
+on:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: Maintain Release PR / cut release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run release-please
+        uses: googleapis/release-please-action@a02a34c4d625f9be7cb89156071d8567266a2445 # v4.1.3
+        with:
+          token: ${{ secrets.AUTOFIX_PAT || secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

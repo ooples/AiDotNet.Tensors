@@ -112,6 +112,119 @@ public sealed class GpuCpuCorrectnessTests : IDisposable
         Assert.True(err < Tol, $"{op}: GPU vs CPU max_abs_err {err:E3} exceeded tolerance {Tol:E3}");
     }
 
+    // Regression: LayerNorm must normalize over the trailing (gamma-length) dims for EVERY rank,
+    // not just rank-2. The GPU path previously took outerSize = shape[0] / normSize = Length/shape[0],
+    // which for a transformer's rank-3 [B, S, D] input normalized over S*D and read gamma/beta
+    // (length D) out of bounds → garbage (measured CPU-vs-GPU max_abs_err ~70 on [2,8,48]). rank-2
+    // happened to work because shape[0] equals the row count. This drove a transformer trained through
+    // the AiDotNet facade to chance accuracy on the GPU engine (its [B,S,D] activations were corrupted).
+    public static IEnumerable<object[]> LayerNormShapes() => new List<object[]>
+    {
+        new object[] { new[] { 16, 48 } },       // rank-2 (always worked)
+        new object[] { new[] { 1, 8, 48 } },     // rank-3, batch 1 (the Predict shape)
+        new object[] { new[] { 2, 8, 48 } },     // rank-3 [B,S,D]
+        new object[] { new[] { 4, 3, 32 } },     // rank-3, non-square
+        new object[] { new[] { 2, 2, 4, 16 } },  // rank-4
+    };
+
+    [Theory]
+    [MemberData(nameof(LayerNormShapes))]
+    public void LayerNorm_RankGe2_GpuMatchesCpu(int[] shape)
+    {
+        if (!EnsureGpuReady()) return;
+        int d = shape[shape.Length - 1];
+        var input = Rand(101, shape);
+        var gamma = Rand(102, d);
+        var beta = Rand(103, d);
+
+        var cpu = _cpu.TensorLayerNorm(input, gamma, beta, 1e-5);
+        var gpu = _gpu.TensorLayerNorm(input, gamma, beta, 1e-5);
+        AssertGpuMatchesCpu(gpu, cpu, $"TensorLayerNorm[{string.Join(",", shape)}]");
+
+        // The GPU-resident forward path (LayerNormGpu, used by Predict/TryForwardGpuOptimized)
+        // must normalize identically for rank >= 3. It requires a GPU-resident input.
+        var gpuInput = input.Gpu();
+        var (gpuResident, gpuMean, gpuInvVar) = _gpu.LayerNormGpu(gpuInput, gamma, beta, 1e-5);
+        AssertGpuMatchesCpu(gpuResident, cpu, $"LayerNormGpu[{string.Join(",", shape)}]");
+
+        // Close the loop on the full tuple: the saved per-sample mean / inverse-variance (consumed by the
+        // backward pass) must be correct too, not just the normalized output. Recompute them the way LayerNorm
+        // does over each gamma-spanning sample — population mean and inverse std 1 / sqrt(var + eps).
+        int normSize = d;
+        int samples = input.Length / normSize;
+        var flat = input.ToArray();
+        var expMean = new float[samples];
+        var expInvVar = new float[samples];
+        for (int s = 0; s < samples; s++)
+        {
+            double sum = 0;
+            for (int j = 0; j < normSize; j++) sum += flat[s * normSize + j];
+            double mean = sum / normSize;
+            double varAcc = 0;
+            for (int j = 0; j < normSize; j++) { double diff = flat[s * normSize + j] - mean; varAcc += diff * diff; }
+            expMean[s] = (float)mean;
+            expInvVar[s] = (float)(1.0 / Math.Sqrt(varAcc / normSize + 1e-5));
+        }
+        AssertGpuMatchesCpu(gpuMean, new Tensor<float>(expMean, new[] { samples }), $"LayerNormGpu.SaveMean[{string.Join(",", shape)}]");
+        AssertGpuMatchesCpu(gpuInvVar, new Tensor<float>(expInvVar, new[] { samples }), $"LayerNormGpu.SaveInvVar[{string.Join(",", shape)}]");
+    }
+
+    // Regression: the GPU training-mode Dropout must actually generate an inverted-dropout mask.
+    // The CUDA path launched dropout_forward (which only APPLIES a pre-generated mask) without ever
+    // filling the mask buffer and with mismatched launch args, so the mask was all-zero and 100% of
+    // activations were dropped (output identically 0). That zeroed every dropout layer during training,
+    // so any model with dropout > 0 could not learn on the GPU. Assert the mask actually keeps roughly
+    // (1 - rate) of the units, applies the 1/keepProb inverted-dropout scale, is finite, and that
+    // forward/backward are consistent (backward passes the same units through, at the same scale).
+    [Theory]
+    [InlineData(0.1)]
+    [InlineData(0.3)]
+    [InlineData(0.5)]
+    public void Dropout_Training_GpuGeneratesMaskLikeCpu(double rate)
+    {
+        if (!EnsureGpuReady()) return;
+        const int n = 8192;
+        var ones = new Tensor<float>(Enumerable.Repeat(1.0f, n).ToArray(), new[] { n });
+
+        var gpuOut = _gpu.Dropout(ones, rate, training: true, out var gpuMask);
+        var og = gpuOut.ToArray();
+        var mg = gpuMask.ToArray();
+
+        int zeros = 0; double keptSum = 0; int kept = 0;
+        for (int i = 0; i < n; i++)
+        {
+            Assert.False(float.IsNaN(og[i]) || float.IsInfinity(og[i]), $"GPU dropout produced non-finite {og[i]}");
+            Assert.Equal(og[i] == 0f, mg[i] == 0f); // mask and output agree on which units are dropped
+            if (og[i] == 0f) zeros++; else { keptSum += og[i]; kept++; }
+        }
+        double fracDropped = (double)zeros / n;
+        // The previous bug dropped 100%; a correct kernel drops ~rate. Wide band tolerates RNG variance
+        // but firmly excludes the all-dropped (1.0) and no-dropped (0.0) failure modes.
+        Assert.True(Math.Abs(fracDropped - rate) < 0.06,
+            $"GPU dropout fraction {fracDropped:F3} not ~{rate:F3} (100%-drop bug regression?)");
+        Assert.True(kept > 0, "GPU dropout dropped everything (mask never generated)");
+        double invKeep = 1.0 / (1.0 - rate);
+        double meanKept = keptSum / kept;
+        Assert.True(Math.Abs(meanKept - invKeep) < 1e-3,
+            $"GPU dropout kept-value {meanKept:F4} not the inverted-dropout scale {invKeep:F4}");
+
+        // Backward must pass gradients through the SAME kept units at the SAME scale (gradInput = gradOut * mask).
+        var gradOut = Rand(202, n);
+        var gradIn = ((AiDotNet.Tensors.Engines.IEngine)_gpu).DropoutBackward(gradOut, gpuMask, rate);
+        var gi = gradIn.ToArray(); var go = gradOut.ToArray();
+        for (int i = 0; i < n; i++)
+        {
+            float expected = go[i] * mg[i];
+            Assert.True(Math.Abs(gi[i] - expected) < 1e-3f,
+                $"GPU dropout backward {gi[i]} != gradOut*mask {expected} at {i}");
+        }
+
+        // Inference (training: false) must be identity.
+        var infer = _gpu.Dropout(ones, rate, training: false, out _);
+        foreach (var v in infer.ToArray())
+            Assert.True(Math.Abs(v - 1.0f) < 1e-4f, "GPU dropout in inference mode must be identity");
+    }
+
     // Shapes span: <128 (the #364 hot zone), tile boundaries around WGD=32,
     // exact/off-by-one multiples, non-square, degenerate 1-dims, and >=128.
     public static IEnumerable<object[]> GemmSizes() => new List<object[]>

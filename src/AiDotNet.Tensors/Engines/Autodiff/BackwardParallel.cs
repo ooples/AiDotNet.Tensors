@@ -43,12 +43,13 @@ internal static class BackwardParallel
     /// dispatch beats serial execution. Below this, the
     /// <see cref="Parallel.For"/> setup cost dominates the body work.
     /// </summary>
-    // #729 set this to 64K (empirical 16-core crossover). On a many-core box that is far too
-    // low: a backward op with ~100K scalar work fanned out to the shared pool wakes workers for
-    // a few µs of work and pays the dispatch + resident-pool re-arm spin, which dominates. Raised
-    // to 256K so small (N-BEATS-scale) backward elementwise ops run serial; genuinely large
-    // backward ops (transformer/diffusion scale) still clear the bar and parallelize. Env
-    // override via AIDOTNET_BWD_MIN_WORK.
+    // main (#729) routes backward row-parallelism through the cooperative pool and set this
+    // crossover low (8K). On a many-core box that is still far too low: a backward op with
+    // ~100K scalar work fanned out to the pool wakes workers for a few µs of work and pays the
+    // dispatch + resident-pool re-arm spin, which dominates. Raised to 256K so small
+    // (N-BEATS-scale) backward elementwise ops run serial; genuinely large backward ops
+    // (transformer/diffusion scale) still clear the bar and parallelize on top of #729's
+    // cooperative-pool routing. Env override via AIDOTNET_BWD_MIN_WORK.
     internal static readonly long MinWorkForParallel =
         long.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_BWD_MIN_WORK"), out var bmw) && bmw > 0
             ? bmw : 256L * 1024;
@@ -103,8 +104,11 @@ internal static class BackwardParallel
         _inBackwardParallel = true;
         try
         {
-            var po = new ParallelOptions { MaxDegreeOfParallelism = MaxDegreeOfParallelism };
-            Parallel.For(0, rows, po, body);
+            // Route through the cooperative pool (StreamingWorkerPool-backed) instead of a raw Parallel.For:
+            // its per-dispatch cost is far lower, so small per-op backward work (the autodiff tape's bread and
+            // butter — e.g. N-BEATS FC-block gradients) actually fans out instead of the ForkJoin setup cost
+            // dominating and forcing single-threaded execution. The pool applies its own grain-size gate.
+            CpuParallelSettings.ParallelForOrSerial(0, rows, totalWork, body);
         }
         finally
         {
