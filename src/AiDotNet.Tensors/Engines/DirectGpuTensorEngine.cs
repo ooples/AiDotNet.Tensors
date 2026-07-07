@@ -1480,6 +1480,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public void InvalidateResidentWeightBuffer<T>(LinearAlgebra.Tensor<T> tensor)
     {
+        // DROP (do not materialize) any pending deferred device->host download FIRST. The host
+        // weight array was just updated IN PLACE by the CPU-side optimizer, so a pending download
+        // holds STALE pre-step device data; letting InvalidateGpuCacheForTensor force-materialize it
+        // (its #226 "user might read after Dispose" behaviour) would overwrite the fresh weights on
+        // the fused-optimizer path (#739 review). Removing the registration keeps the just-written
+        // host weights authoritative — the next forward re-uploads them.
+        var pendingBacking = tensor.DataVector.GetBackingArrayUnsafe();
+        if (pendingBacking is not null)
+            Helpers.DeferredArrayMaterializer.Remove(pendingBacking);
+
         InvalidateGpuCacheForTensor(tensor);
         // Drop the fast-path resident pointer so GetOrAllocateBuffer's `_gpuBuffer is not null`
         // branch (which returns it verbatim under ResidentStepActive) can't serve stale weights.

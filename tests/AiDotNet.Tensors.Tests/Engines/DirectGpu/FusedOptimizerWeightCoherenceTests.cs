@@ -68,5 +68,38 @@ public sealed class FusedOptimizerWeightCoherenceTests : IDisposable
         // (If the platform happened not to cache, sStale already == 48 and this is trivially satisfied.)
         Assert.True(sFresh >= sStale - 1e-3f);
     }
+
+    [SkippableFact]
+    public void InvalidateResidentWeightBuffer_AlsoEvictsPersistentWeightCache_OnMatmulPath()
+    {
+        Skip.IfNot(_ready, "no GPU");
+
+        // ReduceSum (above) only exercises the per-tensor _gpuBuffer path. A matmul/linear reads its
+        // WEIGHT operand through GetWeightBufferPreferResident -> GetOrCacheWeightBuffer — the PERSISTENT
+        // weight-buffer cache, which the PR says the fix must also evict. Guard THAT path: without the
+        // persistent-cache eviction the post-invalidation FusedLinear would still serve the stale weights.
+        var wArr = new float[16];               // 4x4 weight, all ones
+        for (int i = 0; i < wArr.Length; i++) wArr[i] = 1.0f;
+        var w = new Tensor<float>(wArr, new[] { 4, 4 });
+
+        var xArr = new float[4] { 1f, 1f, 1f, 1f }; // 1x4 input of ones
+        var x = new Tensor<float>(xArr, new[] { 1, 4 });
+
+        // First FusedLinear uploads + caches w in the persistent weight cache.
+        float o0 = Sum(_gpu.FusedLinear(x, w, null, FusedActivationType.None));
+        Assert.True(o0 > 0f, "baseline linear output should be non-zero");
+
+        // Mutate w's backing IN PLACE (no Version bump), as the fused optimizer's raw-pointer update does.
+        for (int i = 0; i < wArr.Length; i++) wArr[i] = 3.0f; // uniform 3x scale
+        float oStale = Sum(_gpu.FusedLinear(x, w, null, FusedActivationType.None));
+
+        // Invalidate → must evict the PERSISTENT weight cache so the next matmul re-uploads w.
+        _gpu.InvalidateResidentWeightBuffer(w);
+        float oFresh = Sum(_gpu.FusedLinear(x, w, null, FusedActivationType.None));
+
+        // w scaled uniformly 1 -> 3, so the linear output must scale by 3 once the cache re-uploads.
+        Assert.Equal(3.0f * o0, oFresh, 2);
+        Assert.True(oFresh >= oStale - 1e-3f);
+    }
 }
 #endif

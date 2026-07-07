@@ -256,6 +256,22 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
     }
 
+    /// <summary>
+    /// GPU weight-cache coherence after a CPU-side in-place parameter mutation. The fused optimizer
+    /// mutates a parameter's host backing IN PLACE via raw pointers (no Version bump), so in a GPU
+    /// resident/capture scope the forward's version-gate is BYPASSED and it keeps reading the STALE
+    /// pre-step device weights (the model trains against frozen weights → accuracy pinned at chance).
+    /// Bump Version AND fully invalidate the resident device buffer so the next forward re-uploads the
+    /// updated host weights. Call after EVERY CPU-side weight write — including the early-return
+    /// HypergradientSGD/DAdaptationSGD/ScheduleFreeSGD branches and ScheduleFree's pre-forward
+    /// y-update, which previously left Version and the resident caches stale (#739 review).
+    /// </summary>
+    private void MarkHostWeightMutated(int p)
+    {
+        _parameters[p].IncrementVersion();
+        (_engine as Engines.DirectGpuTensorEngine)?.InvalidateResidentWeightBuffer(_parameters[p]);
+    }
+
     public Tensor<T>[] Gradients => _gradients;
     public int ForwardStepCount => _forwardActions.Length;
     public int BackwardStepCount => _backwardActions.Length;
@@ -2130,6 +2146,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     if (paramArrays[p].Length == 0) continue;
                     fixed (float* pY = paramArrays[p], pZ = m[p], pX = v[p])
                         FusedOptimizer.ScheduleFreeYUpdateSimd(pY, pZ, pX, lenY, sfBeta);
+                    // Pre-forward y-write also mutates the live backing → keep the resident GPU
+                    // buffer coherent so the forward reads y, not stale pre-step weights (#739 review).
+                    MarkHostWeightMutated(p);
                 }
             };
         }
@@ -2169,6 +2188,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _optimizerUpdate = () =>
         {
             _optimizerStep++;
+            // #739 review: retire any captured on-device step graph before the CPU fused optimizer
+            // mutates host weights and invalidates their resident device buffers (MarkHostWeightMutated
+            // below) — otherwise a later LaunchCapturedGraph would replay against freed/stale device
+            // pointers. No-op when no graph is captured (the CPU and on-device optimizer paths are
+            // normally mutually exclusive; this is the requested safety net).
+            if (_stepGraphExec != IntPtr.Zero) InvalidateCapturedStepGraph();
             // Issue #348: read lr from the schedule each step. PyTorch's
             // LRScheduler.step() pays managed-code dispatch overhead per
             // step; here it's an inlined Math.Cos / Math.Pow.
@@ -2200,6 +2225,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     int len2 = lengths[p];
                     fixed (float* pParam = paramArrays[p], pGrad = gradArrays[p], pPrev = m[p])
                         for (int i = 0; i < len2; i++) { pParam[i] -= newLr * pGrad[i]; pPrev[i] = pGrad[i]; }
+                    MarkHostWeightMutated(p);
                 }
                 return;
             }
@@ -2232,6 +2258,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     int len2 = lengths[p];
                     fixed (float* pParam = paramArrays[p], pGrad = gradArrays[p])
                         for (int i = 0; i < len2; i++) pParam[i] -= gammaNew * pGrad[i];
+                    MarkHostWeightMutated(p);
                 }
                 scalarState.DAdaptationEstimate = dNew;
                 return;
@@ -2254,6 +2281,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         wsNext = FusedOptimizer.ScheduleFreeSgdUpdateSimd(
                             pZ, pX, pGrad, len2, lr, scalarState.ScheduleFreeWeightSum);
                     Array.Copy(v[p], paramArrays[p], len2); // live backing ← x (eval copy)
+                    MarkHostWeightMutated(p);
                 }
                 scalarState.ScheduleFreeWeightSum = wsNext;
                 return;
@@ -2585,8 +2613,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // reading the STALE pre-step weights and the model trains against frozen
                 // weights (drift without descent → accuracy pinned at chance). Invalidating the
                 // resident buffer makes the next forward re-upload the updated host weights.
-                _parameters[p].IncrementVersion();
-                (_engine as Engines.DirectGpuTensorEngine)?.InvalidateResidentWeightBuffer(_parameters[p]);
+                MarkHostWeightMutated(p);
             }
         };
     }
@@ -2865,6 +2892,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _optimizerUpdate = () =>
         {
             _optimizerStep++;
+            // #739 review: retire any captured on-device step graph before this CPU fused optimizer
+            // invalidates resident weight buffers below — else a later LaunchCapturedGraph replays
+            // against freed/stale device pointers. No-op when no graph is captured.
+            if (_stepGraphExec != IntPtr.Zero) InvalidateCapturedStepGraph();
             // Resolve each group's lr ONCE per step. PyTorch does N kernel
             // launches for N groups; we do one schedule eval per group and
             // one fused-kernel call per parameter.
@@ -3138,8 +3169,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // device buffer so a DirectGpu forward re-uploads the updated weights
                 // instead of training against frozen pre-step weights (the version-gate is
                 // bypassed under a resident/capture scope, so the bump alone is insufficient).
-                _parameters[p].IncrementVersion();
-                (_engine as Engines.DirectGpuTensorEngine)?.InvalidateResidentWeightBuffer(_parameters[p]);
+                MarkHostWeightMutated(p);
             }
         };
     }
