@@ -50,6 +50,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private IntPtr _cudaContext;
     private IntPtr _stream;
     private IntPtr _cublasHandle;
+    // #742: the handle's default fp32 GEMM math mode chosen at init (TF32 tensor-op on Ampere+, else
+    // PEDANTIC). Under SetDeterministicMode(true) we switch the handle to PEDANTIC (true fp32, no
+    // tensor-core rounding) so backward GEMMs are reproducible on ANY GPU/driver; we restore the
+    // default when determinism is off. _gemmMathModeIsDeterministic tracks the current handle state
+    // so ApplyDeterministicGemmMathMode() only issues cublasSetMathMode on an actual transition.
+    private int _gemmDefaultMathMode;
+    private bool _gemmMathModeIsDeterministic;
     // Stream-ordered allocator (#558 layer 6): when enabled, device buffers are allocated/freed via
     // cuMemAllocAsync/cuMemFreeAsync on _stream, so freed memory is reused in stream order without a host
     // sync (race-free + bounds mid-step peak). DEFAULT ON; opt out with AIDOTNET_CUDA_ASYNC_ALLOC=0
@@ -411,6 +418,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             CuBlasNative.CheckCublasStatus(
                 CuBlasNative.cublasSetMathMode(_cublasHandle, mathMode),
                 "cublasSetMathMode");
+            _gemmDefaultMathMode = mathMode;          // #742: remember for determinism toggling
+            _gemmMathModeIsDeterministic = false;     // handle currently in the default (fast) mode
 
             // Query clock rate for theoretical GFLOPS calculation
             if (CuBlasNative.cuDeviceGetAttribute(out int clockKHz, (int)CudaDeviceAttribute.ClockRate, device) == CudaResult.Success)
@@ -1658,6 +1667,25 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         UploadBytes(buffer, data);
     }
 
+    /// <summary>
+    /// #742: aligns the cuBLAS handle's fp32 math mode with the current determinism setting.
+    /// Under <c>SetDeterministicMode(true)</c> forces <c>CUBLAS_PEDANTIC_MATH</c> (true fp32, no TF32
+    /// tensor-core rounding) so backward GEMMs are bit-reproducible across runs on ANY GPU/driver;
+    /// otherwise restores the init-time default (TF32 on Ampere+ for speed). Tracks the handle state
+    /// so a steady determinism setting costs at most ONE cublasSetMathMode (first GEMM after a toggle),
+    /// not one per call. Called at the top of every fp32 GEMM entry point.
+    /// </summary>
+    private void ApplyDeterministicGemmMathMode()
+    {
+        bool wantDeterministic = GpuDeterminism.IsActive;
+        if (wantDeterministic == _gemmMathModeIsDeterministic) return;
+        int mode = wantDeterministic ? CuBlasNative.CUBLAS_PEDANTIC_MATH : _gemmDefaultMathMode;
+        CuBlasNative.CheckCublasStatus(
+            CuBlasNative.cublasSetMathMode(_cublasHandle, mode),
+            "cublasSetMathMode(determinism)");
+        _gemmMathModeIsDeterministic = wantDeterministic;
+    }
+
     public void Gemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
     {
         if (!IsAvailable)
@@ -1666,6 +1694,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         ValidateGemmArgs(A, B, C, M, N, K);
 
         using var _ = PushContext();
+        ApplyDeterministicGemmMathMode();
         float alphaVal = alpha;
         float betaVal = beta;
 
@@ -1691,6 +1720,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         ValidateGemmArgs(A, B, C, M, N, K);
 
         using var _ = PushContext();
+        ApplyDeterministicGemmMathMode();
         float alphaVal = alpha;
         float betaVal = beta;
 
@@ -1745,6 +1775,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         ValidateBatchedGemmArgs(A, B, C, M, N, K, batchCount);
 
         using var _ = PushContext();
+        ApplyDeterministicGemmMathMode();
         float alphaVal = alpha;
         float betaVal = beta;
 
@@ -1819,6 +1850,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (!IsAvailable) throw new InvalidOperationException("CUDA backend is not available.");
         if (scheduler is null) throw new ArgumentNullException(nameof(scheduler));
         ValidateBatchedGemmArgs(A, B, C, M, N, K, batchCount);
+        ApplyDeterministicGemmMathMode();
 
         long strideA = (long)M * K;
         long strideB = (long)K * N;
@@ -10511,15 +10543,37 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // sum of the indexed contributions — diverging from CPU by exactly the
         // destination magnitude (~1.74 absolute error in the random-tensor
         // test, GpuCpuAutoDifferentialTests post-PR-#582).
-        // The atomic-add kernel is still correct under determinism for THIS
-        // use case (scatter-add's result is order-independent when reduced to
-        // a single sum per cell — duplicate indices commute up to fp32
-        // associativity, which is the same caveat the deterministic variant
-        // was meant to dodge for embedding-backward, not scatter-add).
+        // The atomic-add kernel is order-independent to a single sum per cell, but fp32 add is
+        // NON-ASSOCIATIVE and atomicAdd's completion order is scheduler-dependent — so the result
+        // is only *incidentally* bit-stable run-to-run (true on this RTX 3080/driver, NOT guaranteed
+        // on other GPUs/drivers). Issue #742: under SetDeterministicMode(true) route to a fixed-order
+        // ACCUMULATING variant (scatter_add_accumulate_deterministic) — one thread per destination
+        // cell, no atomics — so scatter-add is bit-identical across runs on ANY hardware. The fast
+        // atomicAdd path stays the DEFAULT (non-deterministic mode); the deterministic variant is
+        // opt-in only. (Defense-in-depth atop AiDotNet#1819, which fixed the actual observed
+        // repro — the minibatch-shuffle seed; #742 makes the guarantee hardware-independent.)
         using var _ = PushContext();
         IntPtr srcPtr = source.Handle;
         IntPtr idxPtr = indices.Handle;
         IntPtr dstPtr = destination.Handle;
+
+        if (GpuDeterminism.IsActive)
+        {
+            if (!_kernelCache.TryGetValue("scatter_add_accumulate_deterministic", out var kernelDet))
+                throw new InvalidOperationException("CUDA kernel not found: scatter_add_accumulate_deterministic");
+            // One thread PER DESTINATION CELL (not per source element): each thread solely owns its
+            // dst cell and adds the fixed-order sum of matching contributions onto the seed — race-free.
+            uint gridDet = (uint)((destSize + DefaultBlockSize - 1) / DefaultBlockSize);
+            void** argsDet = stackalloc void*[5];
+            argsDet[0] = &srcPtr;
+            argsDet[1] = &idxPtr;
+            argsDet[2] = &dstPtr;
+            argsDet[3] = &sourceSize;
+            argsDet[4] = &destSize;
+            LaunchKernel(kernelDet, gridDet, DefaultBlockSize, argsDet);
+            return;
+        }
+
         int embDim = 1;
 
         if (!_kernelCache.TryGetValue("embedding_backward", out var kernel))
