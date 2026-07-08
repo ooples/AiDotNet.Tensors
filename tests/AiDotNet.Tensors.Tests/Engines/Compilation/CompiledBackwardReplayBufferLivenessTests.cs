@@ -45,46 +45,54 @@ public class CompiledBackwardReplayBufferLivenessTests
     [InlineData(1024)]
     public void FusedReplayGradientsSurvivePerStepArenas(int V)
     {
-        AiDotNetEngine.Current = new CpuEngine();
-        var engine = new CpuEngine();
-        int B = 128, K = 128;
-        var x = Tensor<float>.CreateRandom(new[] { B, K });
-        var w = Tensor<float>.CreateRandom(new[] { K, V });
-        var rng = new Random(3);
-        var tgt = new Tensor<float>(new[] { B, V });
-        for (int r = 0; r < B; r++) tgt[r, rng.Next(V)] = 1f;
-
-        // The loss the LM/SequenceClassification path traces: softmax head -> clamp -> log -> CE.
-        Func<Tensor<float>> forwardAndLoss = () =>
+        var previousEngine = AiDotNetEngine.Current;
+        try
         {
-            var mm = engine.TensorMatMul(x, w);
-            var sm = engine.Softmax(mm, -1);                        // large [B,V] activation the Clamp backward reads
-            var clamped = engine.TensorClamp(sm, 1e-7f, 1f);
-            var lg = engine.TensorLog(clamped);
-            var prod = engine.TensorMultiply(tgt, lg);
-            var perRow = engine.ReduceSum(prod, new[] { 1 }, false); // ReduceSum backward tiles a fresh [B,V] temp
-            var mean = engine.ReduceMean(perRow, new[] { 0 }, false);
-            return engine.TensorNegate(mean);
-        };
-        var shapeKey = new[] { B, K };
+            AiDotNetEngine.Current = new CpuEngine();
+            var engine = new CpuEngine();
+            int B = 128, K = 128;
+            var x = Tensor<float>.CreateRandom(new[] { B, K });
+            var w = Tensor<float>.CreateRandom(new[] { K, V });
+            var rng = new Random(3);
+            var tgt = new Tensor<float>(new[] { B, V });
+            for (int r = 0; r < B; r++) tgt[r, rng.Next(V)] = 1f;
 
-        var cache = new CompiledModelCache<float>();
-        double[] grads = new double[6];
-        for (int step = 0; step < 6; step++)
-        {
-            // Each step in its OWN transient arena — exactly how the fused training path wraps a step.
-            using var stepArena = TensorArena.Create();
-            var plan = cache.GetOrCompileTraining(shapeKey, forwardAndLoss, new[] { w }); // compiles on step 0
-            var loss = plan.Step();
-            grads[step] = L2(plan.Gradients[0]);
-            Assert.False(float.IsNaN(loss[0]), $"loss NaN at V={V} step {step}");
+            // The loss the LM/SequenceClassification path traces: softmax head -> clamp -> log -> CE.
+            Func<Tensor<float>> forwardAndLoss = () =>
+            {
+                var mm = engine.TensorMatMul(x, w);
+                var sm = engine.Softmax(mm, -1);                        // large [B,V] activation the Clamp backward reads
+                var clamped = engine.TensorClamp(sm, 1e-7f, 1f);
+                var lg = engine.TensorLog(clamped);
+                var prod = engine.TensorMultiply(tgt, lg);
+                var perRow = engine.ReduceSum(prod, new[] { 1 }, false); // ReduceSum backward tiles a fresh [B,V] temp
+                var mean = engine.ReduceMean(perRow, new[] { 0 }, false);
+                return engine.TensorNegate(mean);
+            };
+            var shapeKey = new[] { B, K };
+
+            using var cache = new CompiledModelCache<float>();
+            double[] grads = new double[6];
+            for (int step = 0; step < 6; step++)
+            {
+                // Each step in its OWN transient arena — exactly how the fused training path wraps a step.
+                using var stepArena = TensorArena.Create();
+                var plan = cache.GetOrCompileTraining(shapeKey, forwardAndLoss, new[] { w }); // compiles on step 0
+                var loss = plan.Step();
+                grads[step] = L2(plan.Gradients[0]);
+                Assert.False(float.IsNaN(loss[0]), $"loss NaN at V={V} step {step}");
+            }
+
+            _o.WriteLine($"V={V} replay gradL2 per step: {string.Join(", ", Array.ConvertAll(grads, g => g.ToString("G4")))}");
+            // Pre-fix: step 0 grad is fine but every REPLAY step (1..5) collapses to 0 for V ≥ 512.
+            for (int step = 0; step < 6; step++)
+                Assert.True(grads[step] > 0,
+                    $"REPLAY grad ZERO at V={V} step {step} — a forward activation was recycled after its step arena disposed " +
+                    $"(per-step grads: {string.Join(", ", Array.ConvertAll(grads, g => g.ToString("G4")))})");
         }
-
-        _o.WriteLine($"V={V} replay gradL2 per step: {string.Join(", ", Array.ConvertAll(grads, g => g.ToString("G4")))}");
-        // Pre-fix: step 0 grad is fine but every REPLAY step (1..5) collapses to 0 for V ≥ 512.
-        for (int step = 0; step < 6; step++)
-            Assert.True(grads[step] > 0,
-                $"REPLAY grad ZERO at V={V} step {step} — a forward activation was recycled after its step arena disposed " +
-                $"(per-step grads: {string.Join(", ", Array.ConvertAll(grads, g => g.ToString("G4")))})");
+        finally
+        {
+            AiDotNetEngine.Current = previousEngine;
+        }
     }
 }

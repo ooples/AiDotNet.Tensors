@@ -228,7 +228,11 @@ public sealed class TensorArena : IDisposable
         {
             if (_disposed) return;
             _disposed = true;
-            _current = _saved;
+            // Only restore if _current is still null (the suspended state).
+            // If a different arena was activated inside the suspended window,
+            // don't clobber it — matches TensorArena.Dispose ownership check.
+            if (_current is null)
+                _current = _saved;
         }
     }
 
