@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.111.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.111.1...v0.111.2) (2026-07-09)
+
+
+### Bug Fixes
+
+* **cpu:** zero the unwritten tail in the axis-0 concat fast path ([#755](https://github.com/ooples/AiDotNet.Tensors/issues/755)) ([369b36a](https://github.com/ooples/AiDotNet.Tensors/commit/369b36a1a7f025fbb7cbfa094698d80906bd84a4))
+
 ## [0.111.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.111.0...v0.111.1) (2026-07-09)
 
 
