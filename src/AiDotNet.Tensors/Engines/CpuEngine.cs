@@ -35245,6 +35245,15 @@ public partial class CpuEngine : ITensorLevelEngine
                 Array.Copy(src, 0, data, offset, t.Length);
                 offset += t.Length;
             }
+            // The output buffer comes from RentOrAllocate UNINITIALIZED, and its element count
+            // (product of outShape, derived by summing _shape[0]) equals the copied total only when
+            // every input shares tensors[0]'s trailing dims. If a caller passes ragged inputs the copy
+            // under-fills the buffer and the rented tail would otherwise leak stale pooled data (a
+            // dirty buffer from an earlier op → intermittent NaN). Zero any unwritten remainder so the
+            // fast path honors RentOrAllocate's "caller fully overwrites" contract. This is free on the
+            // normal (fully-filled) path: offset == data.Length makes the clear a zero-length no-op.
+            if (offset < data.Length)
+                Array.Clear(data, offset, data.Length - offset);
         }
         else
         {
