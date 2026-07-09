@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.111.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.111.0...v0.111.1) (2026-07-09)
+
+
+### Bug Fixes
+
+* **autodiff:** make 2D AffineGrid tape-aware + vectorize (fixes STN untrainable) ([#751](https://github.com/ooples/AiDotNet.Tensors/issues/751)) ([890ed53](https://github.com/ooples/AiDotNet.Tensors/commit/890ed53656bc409da8930380085feeb59390adcf))
+* **compiled-training:** keep plan activation buffers alive across replay — unfreezes fused training at large vocab ([#754](https://github.com/ooples/AiDotNet.Tensors/issues/754)) ([687a4c6](https://github.com/ooples/AiDotNet.Tensors/commit/687a4c6ad2a031c9ad5f5caa91c0df009e0abdd9))
+
+
+### Performance
+
+* **arena:** recycle transformer-layer scratch between layers for memory-bounded inference (AiDotNet[#1824](https://github.com/ooples/AiDotNet.Tensors/issues/1824)) ([#753](https://github.com/ooples/AiDotNet.Tensors/issues/753)) ([2572bd8](https://github.com/ooples/AiDotNet.Tensors/commit/2572bd80e4b9014ffb9b3ee5ad2d9ad8f79fe44b))
+
 ## [0.111.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.110.1...v0.111.0) (2026-07-07)
 
 
