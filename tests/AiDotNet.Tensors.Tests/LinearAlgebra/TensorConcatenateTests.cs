@@ -4,6 +4,7 @@ using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -204,5 +205,216 @@ public class TensorConcatenateTests
             $"Expected 0 failures across {parallelism * iterationsPerThread} concat calls, got {failCount}. " +
             $"First failure: {firstFailure}");
         Assert.Equal(parallelism * iterationsPerThread, successCount);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    //  Regression: CpuEngine.TensorConcatenate axis-0 fast path must never leak an
+    //  uninitialized (pool-recycled) tail.
+    //
+    //  The axis-0 fast path rents an output buffer sized by SUMMING _shape[0] but
+    //  fills it by COPYING each input's Length. Those agree only when every input
+    //  shares tensors[0]'s trailing dims. For ragged inputs the output is larger
+    //  than the copied total, so the rented buffer keeps a tail the copy never
+    //  wrote. Because the buffer comes from AutoTensorCache UNINITIALIZED, a tail
+    //  left over from a prior op (e.g. NaN/Inf activations from a training step on
+    //  the same thread) leaked straight into the result — an intermittent, timing-
+    //  sensitive NaN that only reproduced when the pool happened to hand back a
+    //  dirty buffer. The fix zeroes any unwritten remainder.
+    //
+    //  These tests reproduce the leak deterministically by POISONING the thread-
+    //  local pool with a NaN buffer of the exact output shape, so RentOrAllocate is
+    //  guaranteed to hand it to the concat. Pre-fix they fail (NaN leaks); post-fix
+    //  they pass (tail zeroed). Compatible-shape concats are also covered to prove
+    //  the fast path still fully overwrites the poison (no behavior change there).
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    /// <summary>Rents a buffer of <paramref name="shape"/>, fills it with NaN, and
+    /// returns it to the thread-local pool so the next same-shape RentOrAllocate on
+    /// this thread hands the dirty buffer back.</summary>
+    private static void PoisonPoolWithNaN<T>(int[] shape) where T : struct
+    {
+        var poison = AutoTensorCache.RentOrAllocate<T>(shape);
+        var data = poison.GetDataArray();
+        var nan = (T)Convert.ChangeType(double.NaN, typeof(T));
+        for (int i = 0; i < data.Length; i++) data[i] = nan;
+        AutoTensorCache.Return(poison);
+    }
+
+    private static void AssertAllFinite(Tensor<double> t, string context)
+    {
+        var d = t.ToArray();
+        for (int i = 0; i < d.Length; i++)
+            Assert.False(double.IsNaN(d[i]) || double.IsInfinity(d[i]),
+                $"{context}: result[{i}] = {d[i]} leaked from an uninitialized pool tail.");
+    }
+
+    [Fact]
+    public void TensorConcatenate_Axis0_RaggedInputs_DoesNotLeakPoolTail()
+    {
+        var engine = new CpuEngine();
+        bool prev = AutoTensorCache.Enabled;
+        AutoTensorCache.Enabled = true;
+        try
+        {
+            AutoTensorCache.Clear();
+
+            // [1,49,64] ++ [1,64] on axis 0: the fast path sizes the output [2,49,64]
+            // (6272) but copies only 3136 + 64 = 3200 — a 3072-element tail.
+            PoisonPoolWithNaN<double>(new[] { 2, 49, 64 });
+
+            var a = Filled(new[] { 1, 49, 64 }, 1.0);
+            var b = Filled(new[] { 1, 64 }, 2.0);
+
+            var result = engine.TensorConcatenate(new[] { a, b }, axis: 0);
+
+            AssertAllFinite(result, "ragged axis-0 concat");
+            var rd = result.ToArray();
+            Assert.Equal(1.0, rd[0]);       // start of a
+            Assert.Equal(2.0, rd[3136]);    // start of b
+            Assert.Equal(0.0, rd[3200]);    // first tail element — must be zeroed, not NaN
+            Assert.Equal(0.0, rd[rd.Length - 1]);
+        }
+        finally
+        {
+            AutoTensorCache.Clear();
+            AutoTensorCache.Enabled = prev;
+        }
+    }
+
+    [Fact]
+    public void TensorConcatenate_Axis0_ThreeRaggedInputs_DoesNotLeakPoolTail()
+    {
+        var engine = new CpuEngine();
+        bool prev = AutoTensorCache.Enabled;
+        AutoTensorCache.Enabled = true;
+        try
+        {
+            AutoTensorCache.Clear();
+            // Output shape = [3,10,8] (240), copied = 80 + 8 + 40 = 128 → 112-element tail.
+            PoisonPoolWithNaN<double>(new[] { 3, 10, 8 });
+
+            var a = Filled(new[] { 1, 10, 8 }, 1.0);  // 80
+            var b = Filled(new[] { 1, 8 }, 2.0);      // 8
+            var c = Filled(new[] { 1, 5, 8 }, 3.0);   // 40
+
+            var result = engine.TensorConcatenate(new[] { a, b, c }, axis: 0);
+
+            AssertAllFinite(result, "three ragged axis-0 concat");
+        }
+        finally
+        {
+            AutoTensorCache.Clear();
+            AutoTensorCache.Enabled = prev;
+        }
+    }
+
+    [Fact]
+    public void TensorConcatenate_Axis0_CompatibleInputs_FullyOverwritesPoison()
+    {
+        // Edge case: when inputs share trailing dims the copy fills the whole buffer,
+        // so there is NO tail to zero. The poison must be fully overwritten and the
+        // result must exactly equal the concatenated inputs (no behavior change, no
+        // accidental zeroing of real data).
+        var engine = new CpuEngine();
+        bool prev = AutoTensorCache.Enabled;
+        AutoTensorCache.Enabled = true;
+        try
+        {
+            AutoTensorCache.Clear();
+            PoisonPoolWithNaN<double>(new[] { 2, 64 });
+
+            var a = Filled(new[] { 1, 64 }, 7.0);
+            var b = Filled(new[] { 1, 64 }, 9.0);
+
+            var result = engine.TensorConcatenate(new[] { a, b }, axis: 0);
+
+            AssertAllFinite(result, "compatible axis-0 concat");
+            var rd = result.ToArray();
+            for (int i = 0; i < 64; i++) Assert.Equal(7.0, rd[i]);
+            for (int i = 64; i < 128; i++) Assert.Equal(9.0, rd[i]);
+        }
+        finally
+        {
+            AutoTensorCache.Clear();
+            AutoTensorCache.Enabled = prev;
+        }
+    }
+
+    [Fact]
+    public void TensorConcatenate_Axis0_SingleRaggedTensor_NoLeak()
+    {
+        // Degenerate edge case: a one-element array. outShape[0] == tensors[0]._shape[0]
+        // and the copy fills the whole buffer, so nothing to zero — must still be finite.
+        var engine = new CpuEngine();
+        bool prev = AutoTensorCache.Enabled;
+        AutoTensorCache.Enabled = true;
+        try
+        {
+            AutoTensorCache.Clear();
+            PoisonPoolWithNaN<double>(new[] { 1, 49, 64 });
+            var a = Filled(new[] { 1, 49, 64 }, 5.0);
+
+            var result = engine.TensorConcatenate(new[] { a }, axis: 0);
+
+            AssertAllFinite(result, "single-tensor axis-0 concat");
+        }
+        finally
+        {
+            AutoTensorCache.Clear();
+            AutoTensorCache.Enabled = prev;
+        }
+    }
+
+    [Fact]
+    public void TensorConcatenate_Axis0_Float_RaggedInputs_DoesNotLeakPoolTail()
+    {
+        // Generic-type edge case: the fix lives in the shared generic method, so the
+        // float path must be protected too.
+        var engine = new CpuEngine();
+        bool prev = AutoTensorCache.Enabled;
+        AutoTensorCache.Enabled = true;
+        try
+        {
+            AutoTensorCache.Clear();
+            PoisonPoolWithNaN<float>(new[] { 2, 20, 4 });
+
+            var a = new Tensor<float>(new[] { 1, 20, 4 });
+            for (int i = 0; i < a.Length; i++) a[i] = 1f;
+            var b = new Tensor<float>(new[] { 1, 4 });
+            for (int i = 0; i < b.Length; i++) b[i] = 2f;
+
+            var result = engine.TensorConcatenate(new[] { a, b }, axis: 0);
+
+            var d = result.ToArray();
+            for (int i = 0; i < d.Length; i++)
+                Assert.False(float.IsNaN(d[i]) || float.IsInfinity(d[i]),
+                    $"float ragged concat: result[{i}] = {d[i]} leaked from the pool tail.");
+        }
+        finally
+        {
+            AutoTensorCache.Clear();
+            AutoTensorCache.Enabled = prev;
+        }
+    }
+
+    [Fact]
+    public void TensorConcatenate_SequenceAxis_RankMismatch_Throws()
+    {
+        // The validating (non-axis-0) path must reject genuinely incompatible inputs
+        // with a clear error rather than silently producing a wrong-sized result. This
+        // is the path the corrected LayoutXLM/LayoutLMv2 fusion relies on when it aligns
+        // both streams to [B, L, D] and concatenates on the sequence axis.
+        var engine = new CpuEngine();
+        var a = new Tensor<double>(new[] { 1, 49, 64 });
+        var b = new Tensor<double>(new[] { 1, 64 });
+
+        Assert.Throws<ArgumentException>(() => engine.TensorConcatenate(new[] { a, b }, axis: 1));
+    }
+
+    private static Tensor<double> Filled(int[] shape, double value)
+    {
+        var t = new Tensor<double>(shape);
+        for (int i = 0; i < t.Length; i++) t[i] = value;
+        return t;
     }
 }
