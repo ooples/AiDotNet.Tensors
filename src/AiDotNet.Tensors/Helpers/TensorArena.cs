@@ -281,6 +281,47 @@ public sealed class TensorArena : IDisposable
     }
 
     /// <summary>
+    /// Temporarily detaches the calling thread's active arena for the lifetime of the returned
+    /// scope, so allocations made inside it do NOT land in the (transient, per-iteration) arena
+    /// scratch pool. Restores the previous arena on dispose.
+    ///
+    /// <para><b>Why (compiled-plan buffer liveness):</b> a <see cref="Compilation.CompiledTrainingPlan{T}"/>
+    /// is traced+compiled ONCE and then replayed for the life of the model, so its forward-activation
+    /// and gradient buffers are LONG-LIVED plan state — not per-iteration scratch. But the trace runs
+    /// inside whatever transient arena the caller opened for the current training step. Without this
+    /// suspension those persistent buffers were allocated from that step's arena and RETURNED to the
+    /// shared pool when the step's arena disposed; a later step's backward temporary (e.g. the
+    /// <c>ReduceSum</c> gradient broadcast, which tiles a fresh <c>[B,V]</c> buffer) could then re-rent
+    /// a live forward activation's array and overwrite it BEFORE its backward consumer read it —
+    /// silently zeroing gradients on REPLAY for large activations (≥ the ArrayPool bucket boundary),
+    /// freezing training at large vocab. Compiling with the arena suspended makes the plan own its
+    /// buffers independently of any transient arena, so they can never be recycled underneath a replay.</para>
+    /// </summary>
+    internal static IDisposable Suspend()
+    {
+        var saved = _current;
+        _current = null;
+        return new SuspendScope(saved);
+    }
+
+    private sealed class SuspendScope : IDisposable
+    {
+        private readonly TensorArena? _saved;
+        private bool _disposed;
+        internal SuspendScope(TensorArena? saved) { _saved = saved; }
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            // Only restore if _current is still null (the suspended state).
+            // If a different arena was activated inside the suspended window,
+            // don't clobber it — matches TensorArena.Dispose ownership check.
+            if (_current is null)
+                _current = _saved;
+        }
+    }
+
+    /// <summary>
     /// Tries to rent an array of the given size from the arena.
     /// During warmup (first iteration): allocates a new array and tracks it.
     /// After Reset() (subsequent iterations): returns a previously-allocated array.

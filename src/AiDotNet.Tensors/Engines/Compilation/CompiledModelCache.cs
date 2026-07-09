@@ -187,7 +187,14 @@ public sealed class CompiledModelCache<T> : IDisposable
             if (_trainingPlans.TryGetValue(key, out cached))
                 return cached;
 
-            // Trace forward + loss under GraphMode and compile with backward
+            // Trace forward + loss under GraphMode and compile with backward.
+            // Suspend any transient per-step arena for the duration of the trace+compile so the
+            // plan's forward-activation and gradient buffers are allocated as LONG-LIVED plan state,
+            // not per-iteration scratch. Otherwise those buffers are returned to the shared pool when
+            // the caller's step arena disposes and a later step's backward temporary can re-rent a
+            // live forward activation and corrupt it on replay (silent zero-gradient / frozen training
+            // at large activation sizes). See TensorArena.Suspend.
+            using var arenaSuspend = Helpers.TensorArena.Suspend();
             using var scope = GraphMode.Enable();
             var explicitLoss = forwardAndLoss();
             ThrowIfForwardRecordedNothing(scope, explicitLoss);
