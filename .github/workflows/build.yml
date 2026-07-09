@@ -26,6 +26,7 @@ env:
 
 jobs:
   build:
+    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
     runs-on: ubuntu-latest
 
     steps:
@@ -239,6 +240,7 @@ jobs:
   # and assert bit-exactness, after which MachineKernelGemm.EnableAvx512 can be
   # flipped on by default.
   avx512-verify:
+    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
     runs-on: ${{ vars.AVX512_RUNNER || 'ubuntu-latest' }}
     steps:
     - uses: actions/checkout@v4
