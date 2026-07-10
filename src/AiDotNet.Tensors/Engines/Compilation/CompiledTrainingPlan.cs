@@ -3364,6 +3364,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     lr, b1, b2, epsVal, wd, stepBc1, stepBc2);
                 return;
             }
+            if (optType == OptimizerType.Adam)
+            {
+                FusedOptimizer.AdamUpdateSimdMulti(paramArrays, gradArrays, m, v, lengths, paramCount,
+                    lr, b1, b2, epsVal, stepBc1, stepBc2);
+                return;
+            }
             for (int p = 0; p < paramCount; p++)
             {
                 // Skip params with no gradient OR no materialized weight backing (#1738).

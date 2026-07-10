@@ -183,6 +183,79 @@ public class FusedAdamWSinglePassParityTests
         }
     }
 
+    // Adam (no weight decay) multi-tensor kernel — bit-identical to per-parameter.
+    [Fact]
+    public unsafe void AdamMultiTensor_BitIdenticalToPerParam_Double()
+    {
+        const double lr = 5e-4, b1 = 0.9, b2 = 0.999, eps = 1e-8;
+        int[] lens = { 1, 3, 4, 7, 8, 15, 16, 31, 100, 4096, 0, 5, 8193 };
+        int count = lens.Length;
+        for (int step = 1; step <= 3; step++)
+        {
+            double bc1 = 1.0 - Math.Pow(b1, step), bc2 = 1.0 - Math.Pow(b2, step);
+            var rng = new Random(71 + step);
+            double[][] P = new double[count][], G = new double[count][], M = new double[count][], V = new double[count][];
+            double[][] Pr = new double[count][], Mr = new double[count][], Vr = new double[count][];
+            for (int t = 0; t < count; t++)
+            {
+                int L = lens[t];
+                P[t] = new double[L]; G[t] = new double[L]; M[t] = new double[L]; V[t] = new double[L];
+                for (int i = 0; i < L; i++) { P[t][i] = rng.NextDouble() * 2 - 1; G[t][i] = (rng.NextDouble() * 2 - 1) * 0.1; M[t][i] = (rng.NextDouble() * 2 - 1) * 0.05; V[t][i] = rng.NextDouble() * 0.01; }
+                Pr[t] = (double[])P[t].Clone(); Mr[t] = (double[])M[t].Clone(); Vr[t] = (double[])V[t].Clone();
+            }
+            for (int t = 0; t < count; t++) { int L = lens[t]; if (L == 0) continue; fixed (double* p = Pr[t], g = G[t], m = Mr[t], v = Vr[t]) FusedOptimizer.AdamUpdateSimd(p, g, m, v, L, lr, b1, b2, eps, bc1, bc2); }
+            FusedOptimizer.AdamUpdateSimdMulti(P, G, M, V, lens, count, lr, b1, b2, eps, bc1, bc2);
+            for (int t = 0; t < count; t++) for (int i = 0; i < lens[t]; i++)
+            {
+                Assert.Equal(BitConverter.DoubleToInt64Bits(Pr[t][i]), BitConverter.DoubleToInt64Bits(P[t][i]));
+                Assert.Equal(BitConverter.DoubleToInt64Bits(Mr[t][i]), BitConverter.DoubleToInt64Bits(M[t][i]));
+                Assert.Equal(BitConverter.DoubleToInt64Bits(Vr[t][i]), BitConverter.DoubleToInt64Bits(V[t][i]));
+            }
+        }
+    }
+
+    // Float Adam + AdamW multi-tensor kernels — bit-identical to per-parameter (raw bits).
+    [Fact]
+    public unsafe void AdamAndAdamWMultiTensor_BitIdenticalToPerParam_Float()
+    {
+        const float lr = 5e-4f, b1 = 0.9f, b2 = 0.999f, eps = 1e-8f, wd = 1e-2f;
+        int[] lens = { 1, 7, 8, 9, 15, 16, 17, 100, 4096, 0, 8193 };
+        int count = lens.Length;
+        for (int step = 1; step <= 3; step++)
+        {
+            float bc1 = 1f - MathF.Pow(b1, step), bc2 = 1f - MathF.Pow(b2, step);
+            var rng = new Random(91 + step);
+            float[][] P = new float[count][], G = new float[count][], M = new float[count][], V = new float[count][];
+            for (int t = 0; t < count; t++)
+            {
+                int L = lens[t];
+                P[t] = new float[L]; G[t] = new float[L]; M[t] = new float[L]; V[t] = new float[L];
+                for (int i = 0; i < L; i++) { P[t][i] = (float)(rng.NextDouble() * 2 - 1); G[t][i] = (float)((rng.NextDouble() * 2 - 1) * 0.1); M[t][i] = (float)((rng.NextDouble() * 2 - 1) * 0.05); V[t][i] = (float)(rng.NextDouble() * 0.01); }
+            }
+            foreach (bool isAdamW in new[] { false, true })
+            {
+                float[][] Pr = new float[count][], Mr = new float[count][], Vr = new float[count][];
+                float[][] Pm = new float[count][], Mm = new float[count][], Vm = new float[count][];
+                for (int t = 0; t < count; t++) { Pr[t] = (float[])P[t].Clone(); Mr[t] = (float[])M[t].Clone(); Vr[t] = (float[])V[t].Clone(); Pm[t] = (float[])P[t].Clone(); Mm[t] = (float[])M[t].Clone(); Vm[t] = (float[])V[t].Clone(); }
+                for (int t = 0; t < count; t++)
+                {
+                    int L = lens[t]; if (L == 0) continue;
+                    fixed (float* p = Pr[t], g = G[t], m = Mr[t], v = Vr[t])
+                        if (isAdamW) FusedOptimizer.AdamWUpdateSimd(p, g, m, v, L, lr, b1, b2, eps, wd, bc1, bc2);
+                        else FusedOptimizer.AdamUpdateSimd(p, g, m, v, L, lr, b1, b2, eps, bc1, bc2);
+                }
+                if (isAdamW) FusedOptimizer.AdamWUpdateSimdMulti(Pm, G, Mm, Vm, lens, count, lr, b1, b2, eps, wd, bc1, bc2);
+                else FusedOptimizer.AdamUpdateSimdMulti(Pm, G, Mm, Vm, lens, count, lr, b1, b2, eps, bc1, bc2);
+                for (int t = 0; t < count; t++) for (int i = 0; i < lens[t]; i++)
+                {
+                    Assert.Equal(BitConverter.SingleToInt32Bits(Pr[t][i]), BitConverter.SingleToInt32Bits(Pm[t][i]));
+                    Assert.Equal(BitConverter.SingleToInt32Bits(Mr[t][i]), BitConverter.SingleToInt32Bits(Mm[t][i]));
+                    Assert.Equal(BitConverter.SingleToInt32Bits(Vr[t][i]), BitConverter.SingleToInt32Bits(Vm[t][i]));
+                }
+            }
+        }
+    }
+
     private static (double[] p, double[] g, double[] m, double[] v) MakeDouble(int len, int seed)
     {
         var rng = new Random(seed);

@@ -545,6 +545,64 @@ internal static class FusedOptimizer
         }
     }
 
+    /// <summary>Multi-tensor (foreach-style) Adam over a LIST of double parameter tensors.
+    /// Builds the SIMD constants once, reuses across every tensor; bit-identical to the
+    /// per-parameter bc1/bc2 Adam overload. (Adam == AdamW without the decoupled decay.)</summary>
+    internal static unsafe void AdamUpdateSimdMulti(
+        double[][] paramArrays, double[][] gradArrays, double[][] mArrays, double[][] vArrays,
+        int[] lengths, int count,
+        double lr, double beta1, double beta2, double eps, double bc1, double bc2)
+    {
+        double lrAdj = lr / bc1;
+#if NET5_0_OR_GREATER
+        bool useSimd = Fma.IsSupported;
+        var vB1 = Vector256.Create(beta1);
+        var v1mB1 = Vector256.Create(1.0 - beta1);
+        var vB2 = Vector256.Create(beta2);
+        var v1mB2 = Vector256.Create(1.0 - beta2);
+        var vLr = Vector256.Create(-lrAdj);
+        var vEps = Vector256.Create(eps);
+        var vBc2Inv = Vector256.Create(1.0 / bc2);
+#endif
+        for (int t = 0; t < count; t++)
+        {
+            int length = lengths[t];
+            if (length == 0) continue;
+            var pa = paramArrays[t]; var ga = gradArrays[t]; var ma = mArrays[t]; var va = vArrays[t];
+            if (pa.Length == 0 || ga.Length == 0) continue;
+            fixed (double* param = pa, grad = ga, m = ma, v = va)
+            {
+                int i = 0;
+#if NET5_0_OR_GREATER
+                if (useSimd && length >= 4)
+                {
+                    int simdLen = length & ~3;
+                    for (; i < simdLen; i += 4)
+                    {
+                        var g = Avx.LoadVector256(grad + i);
+                        var mNew = Fma.MultiplyAdd(vB1, Avx.LoadVector256(m + i), Avx.Multiply(v1mB1, g));
+                        Avx.Store(m + i, mNew);
+                        var vNew = Fma.MultiplyAdd(vB2, Avx.LoadVector256(v + i), Avx.Multiply(v1mB2, Avx.Multiply(g, g)));
+                        Avx.Store(v + i, vNew);
+                        var vHat = Avx.Multiply(vNew, vBc2Inv);
+                        var denom = Avx.Add(Avx.Sqrt(vHat), vEps);
+                        var update = Avx.Divide(mNew, denom);
+                        Avx.Store(param + i, Fma.MultiplyAdd(vLr, update, Avx.LoadVector256(param + i)));
+                    }
+                }
+#endif
+                for (; i < length; i++)
+                {
+                    m[i] = beta1 * m[i] + (1.0 - beta1) * grad[i];
+                    v[i] = beta2 * v[i] + (1.0 - beta2) * grad[i] * grad[i];
+                    double mHat = m[i] / bc1;
+                    double vHat = v[i] / bc2;
+                    param[i] -= lr * mHat / (System.Math.Sqrt(vHat) + eps);
+                }
+            }
+        }
+    }
+
     /// <summary>AVX2 AdamW: Adam with decoupled weight decay</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static unsafe void AdamWUpdateSimd(
@@ -667,6 +725,63 @@ internal static class FusedOptimizer
                     float vHat = v[i] / bc2;
                     float pScaled = param[i] * wdScale;
                     param[i] = pScaled - lr * mHat / (MathF.Sqrt(vHat) + eps);
+                }
+            }
+        }
+    }
+
+    /// <summary>Multi-tensor (foreach-style) Adam over a LIST of float parameter tensors —
+    /// constants built once, bit-identical to the per-parameter bc1/bc2 Adam overload.</summary>
+    internal static unsafe void AdamUpdateSimdMulti(
+        float[][] paramArrays, float[][] gradArrays, float[][] mArrays, float[][] vArrays,
+        int[] lengths, int count,
+        float lr, float beta1, float beta2, float eps, float bc1, float bc2)
+    {
+        float lrAdj = lr / bc1;
+#if NET5_0_OR_GREATER
+        bool useSimd = Fma.IsSupported;
+        var vB1 = Vector256.Create(beta1);
+        var v1mB1 = Vector256.Create(1f - beta1);
+        var vB2 = Vector256.Create(beta2);
+        var v1mB2 = Vector256.Create(1f - beta2);
+        var vLr = Vector256.Create(-lrAdj);
+        var vEps = Vector256.Create(eps);
+        var vBc2Inv = Vector256.Create(1f / bc2);
+#endif
+        for (int t = 0; t < count; t++)
+        {
+            int length = lengths[t];
+            if (length == 0) continue;
+            var pa = paramArrays[t]; var ga = gradArrays[t]; var ma = mArrays[t]; var va = vArrays[t];
+            if (pa.Length == 0 || ga.Length == 0) continue;
+            fixed (float* param = pa, grad = ga, m = ma, v = va)
+            {
+                int i = 0;
+#if NET5_0_OR_GREATER
+                if (useSimd && length >= 8)
+                {
+                    int simdLen = length & ~7;
+                    for (; i < simdLen; i += 8)
+                    {
+                        var g = Avx.LoadVector256(grad + i);
+                        var mNew = Fma.MultiplyAdd(vB1, Avx.LoadVector256(m + i), Avx.Multiply(v1mB1, g));
+                        Avx.Store(m + i, mNew);
+                        var vNew = Fma.MultiplyAdd(vB2, Avx.LoadVector256(v + i), Avx.Multiply(v1mB2, Avx.Multiply(g, g)));
+                        Avx.Store(v + i, vNew);
+                        var vHat = Avx.Multiply(vNew, vBc2Inv);
+                        var denom = Avx.Add(Avx.Sqrt(vHat), vEps);
+                        var update = Avx.Divide(mNew, denom);
+                        Avx.Store(param + i, Fma.MultiplyAdd(vLr, update, Avx.LoadVector256(param + i)));
+                    }
+                }
+#endif
+                for (; i < length; i++)
+                {
+                    m[i] = beta1 * m[i] + (1f - beta1) * grad[i];
+                    v[i] = beta2 * v[i] + (1f - beta2) * grad[i] * grad[i];
+                    float mHat = m[i] / bc1;
+                    float vHat = v[i] / bc2;
+                    param[i] -= lr * mHat / (MathF.Sqrt(vHat) + eps);
                 }
             }
         }
