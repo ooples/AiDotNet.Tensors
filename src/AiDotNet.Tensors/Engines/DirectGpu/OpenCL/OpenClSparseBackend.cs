@@ -24,6 +24,22 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// <summary>True when an OpenCL device/context is available on this host.</summary>
         public static bool IsAvailable => OpenClBackend.IsOpenClAvailable;
 
+        // The buffer pool may hand back a buffer physically LARGER than requested (e.g. a small
+        // odd-sized output renting an 8-element buffer left over from a prior op). DownloadBuffer
+        // copies the buffer's physical element count, which would overflow a snug destination, so
+        // download into a buffer-sized scratch and copy back exactly the logical elements.
+        private static void DownloadExact(OpenClBackend backend, IGpuBuffer buffer, float[] destination)
+        {
+            if (buffer.Size == destination.Length)
+            {
+                backend.DownloadBuffer(buffer, destination);
+                return;
+            }
+            var scratch = new float[buffer.Size];
+            backend.DownloadBuffer(buffer, scratch);
+            Array.Copy(scratch, destination, destination.Length);
+        }
+
         private static OpenClBackend GetOrCreate()
         {
             var existing = _cached;
@@ -75,7 +91,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 backend.CsrSpMM(valuesBuf, colIdxBuf, rowPtrBuf, bBuf, outBuf,
                     rows, cols, n, values.Length);
 
-                backend.DownloadBuffer(outBuf, output);
+                DownloadExact(backend, outBuf, output);
                 return output;
             }
             finally
@@ -85,6 +101,48 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 valuesBuf?.Dispose();
                 rowPtrBuf?.Dispose();
                 colIdxBuf?.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// SDDMM with host-side inputs: for each pattern entry p computes
+        /// <c>out[p] = Σ_k x[rowIndices[p], k] · y[colIndices[p], k]</c>. <paramref name="x"/> is
+        /// row-major [M, innerK], <paramref name="y"/> is row-major [Ny, innerK]. Returns the
+        /// <c>nnz</c>-length values array. Runs the OpenCL <c>sddmm</c> kernel on the GPU.
+        /// </summary>
+        public static float[] SDDMM(
+            int[] rowIndices, int[] colIndices,
+            float[] x, float[] y, int innerK)
+        {
+            if (!IsAvailable)
+                throw new InvalidOperationException("OpenCL SDDMM backend is not available.");
+
+            int nnz = rowIndices.Length;
+            var output = new float[nnz];
+            if (nnz == 0) return output;
+
+            var backend = GetOrCreate();
+            IGpuBuffer? rowBuf = null, colBuf = null, xBuf = null, yBuf = null, outBuf = null;
+            try
+            {
+                rowBuf = backend.AllocateIntBuffer(rowIndices);
+                colBuf = backend.AllocateIntBuffer(colIndices);
+                xBuf = backend.AllocateBuffer(x);
+                yBuf = backend.AllocateBuffer(y);
+                outBuf = backend.AllocateBuffer(output);
+
+                backend.CsrSddmm(rowBuf, colBuf, xBuf, yBuf, outBuf, nnz, innerK);
+
+                DownloadExact(backend, outBuf, output);
+                return output;
+            }
+            finally
+            {
+                outBuf?.Dispose();
+                yBuf?.Dispose();
+                xBuf?.Dispose();
+                colBuf?.Dispose();
+                rowBuf?.Dispose();
             }
         }
     }

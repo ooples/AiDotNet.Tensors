@@ -284,6 +284,31 @@ __kernel void symmetric_degree_normalize(
     float normFactor = rsqrt(srcDeg + epsilon) * rsqrt(tgtDeg + epsilon);
     output[edge] = edgeValues[edge] * normFactor;
 }
+
+// SDDMM (sampled dense-dense matmul): for each pattern entry p, compute the (i,j) element of
+// x . y^T restricted to the pattern -> output[p] = sum_k x[i,k] * y[j,k], where i=rowIndices[p]
+// and j=colIndices[p]. One work-item per pattern non-zero. This is the pattern-preserving
+// sparse-matmul backward's dA (x = grad, y = B).
+__kernel void sddmm(
+    __global const int* restrict rowIndices,
+    __global const int* restrict colIndices,
+    __global const float* restrict x,
+    __global const float* restrict y,
+    __global float* restrict output,
+    int nnz, int innerK)
+{
+    int p = get_global_id(0);
+    if (p >= nnz) return;
+
+    int xoff = rowIndices[p] * innerK;
+    int yoff = colIndices[p] * innerK;
+
+    float sum = 0.0f;
+    for (int k = 0; k < innerK; k++)
+        sum += x[xoff + k] * y[yoff + k];
+
+    output[p] = sum;
+}
 ";
     }
 
@@ -292,6 +317,7 @@ __kernel void symmetric_degree_normalize(
         return
         [
             "csr_spmm",
+            "sddmm",
             "csr_spmm_bias",
             "csr_spmm_bias_relu",
             "scatter_add_edges",

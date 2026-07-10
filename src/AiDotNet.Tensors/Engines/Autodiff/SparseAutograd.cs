@@ -195,54 +195,14 @@ public static class SparseAutograd
         int nnz = rowIndices.Length;
         int innerK = b.Shape[1];
 
-        // Compute dA over the pattern only — never materialises the
-        // dense O(rows × columns) gradient.
-        var gradValues = new T[nnz];
+        // Compute dA over the pattern only — never materialises the dense O(rows × columns)
+        // gradient. dA[i,j] = Σ_k grad[i,k]·B[j,k] at A's pattern is exactly SDDMM(pattern, grad, B):
+        // SparseOps.SDDMM dispatches the managed GPU sddmm kernel for large patterns (cuSPARSE-class
+        // hardware / OpenCL) and falls back to the cache-friendly CPU loop otherwise.
+        var gradValues = SparseOps.SDDMM(rowIndices, colIndices, gradOutput, b);
 
-        // Fast path: when both b and gradOutput are contiguous rank-2
-        // tensors we can slice each row once via the underlying flat
-        // span instead of paying for the per-element indexer's
-        // bounds-and-stride math on every (idx, k). This is a hot path
-        // in sampled-addmm backward — a sparsity-N x innerK loop over
-        // millions of pattern entries is the typical workload.
-        bool bFastPath = b.IsContiguous && b.Shape.Length == 2;
+        // gFastPath is reused by the dB accumulation below.
         bool gFastPath = gradOutput.IsContiguous && gradOutput.Shape.Length == 2;
-        if (bFastPath && gFastPath)
-        {
-            var bSpan = b.AsSpan();
-            var gSpan = gradOutput.AsSpan();
-            int bRowStride = b.Shape[1];
-            int gRowStride = gradOutput.Shape[1];
-            for (int idx = 0; idx < nnz; idx++)
-            {
-                int i = rowIndices[idx];
-                int j = colIndices[idx];
-                var bRow = bSpan.Slice(j * bRowStride, innerK);
-                var gRow = gSpan.Slice(i * gRowStride, innerK);
-                T sum = ops.Zero;
-                for (int k = 0; k < innerK; k++)
-                {
-                    sum = ops.Add(sum, ops.Multiply(bRow[k], gRow[k]));
-                }
-                gradValues[idx] = sum;
-            }
-        }
-        else
-        {
-            // Non-contiguous fallback uses the indexer; correctness is
-            // preserved at the cost of per-element stride math.
-            for (int idx = 0; idx < nnz; idx++)
-            {
-                int i = rowIndices[idx];
-                int j = colIndices[idx];
-                T sum = ops.Zero;
-                for (int k = 0; k < innerK; k++)
-                {
-                    sum = ops.Add(sum, ops.Multiply(b[j, k], gradOutput[i, k]));
-                }
-                gradValues[idx] = sum;
-            }
-        }
         var sparseGradA = new SparseTensor<T>(rows, columns, rowIndices, colIndices, gradValues);
         AccumulateGrad(aSparse, sparseGradA, gradAccumulator, engine);
 

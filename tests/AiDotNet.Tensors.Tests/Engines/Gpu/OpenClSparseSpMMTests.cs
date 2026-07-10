@@ -90,4 +90,34 @@ public class OpenClSparseSpMMTests
         for (int i = 0; i < expected.Length; i++)
             Assert.Equal(expected[i], gpu[i], 2);
     }
+
+    [Fact]
+    public void OpenClSddmm_MatchesCpuReference()
+    {
+        if (!GpuPresent) return;
+
+        // A sampling pattern of 6 entries; x is [4, innerK], y is [5, innerK].
+        const int innerK = 3;
+        int[] rowIdx = { 0, 0, 1, 2, 3, 3 };
+        int[] colIdx = { 1, 4, 0, 2, 1, 3 };
+        var x = new float[4 * innerK];
+        var y = new float[5 * innerK];
+        for (int i = 0; i < x.Length; i++) x[i] = (i % 7) - 3;
+        for (int i = 0; i < y.Length; i++) y[i] = ((i * 2) % 5) - 2;
+
+        var gpu = OpenClSparseBackend.SDDMM(rowIdx, colIdx, x, y, innerK);
+
+        var expected = new float[rowIdx.Length];
+        for (int p = 0; p < rowIdx.Length; p++)
+        {
+            float s = 0f;
+            for (int k = 0; k < innerK; k++)
+                s += x[rowIdx[p] * innerK + k] * y[colIdx[p] * innerK + k];
+            expected[p] = s;
+        }
+
+        Assert.Equal(expected.Length, gpu.Length);
+        for (int p = 0; p < expected.Length; p++)
+            Assert.Equal(expected[p], gpu[p], 3);
+    }
 }

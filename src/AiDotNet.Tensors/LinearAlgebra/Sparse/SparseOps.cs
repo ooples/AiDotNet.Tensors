@@ -432,6 +432,74 @@ public static class SparseOps
     }
 
     /// <summary>
+    /// SDDMM (sampled dense-dense matmul), COO-array form: for each pattern entry
+    /// <c>(rowIndices[p], colIndices[p])</c> computes
+    /// <c>out[p] = Σ_k x[rowIndices[p], k] · y[colIndices[p], k]</c> — i.e. the (i,j) entry of
+    /// <c>x · yᵀ</c> sampled only at the supplied pattern. This is the exact primitive the
+    /// pattern-preserving sparse·dense-matmul backward needs for dA (x = grad, y = B), and it is
+    /// where the previous CPU scalar loop lived. Returns the values aligned with the pattern order.
+    /// The GPU tier dispatches to the managed SDDMM kernels (float) when the work clears the
+    /// dispatch threshold and a backend is available; otherwise a cache-friendly CPU loop runs.
+    /// </summary>
+    public static T[] SDDMM<T>(int[] rowIndices, int[] colIndices, Tensor<T> x, Tensor<T> y)
+    {
+        if (rowIndices is null) throw new ArgumentNullException(nameof(rowIndices));
+        if (colIndices is null) throw new ArgumentNullException(nameof(colIndices));
+        if (x.Rank != 2 || y.Rank != 2) throw new ArgumentException("x and y must be 2-D.");
+        if (rowIndices.Length != colIndices.Length)
+            throw new ArgumentException("rowIndices and colIndices must have equal length.");
+        int innerK = x._shape[1];
+        if (y._shape[1] != innerK)
+            throw new ArgumentException($"x inner dim ({innerK}) must match y inner dim ({y._shape[1]}).");
+        int nnz = rowIndices.Length;
+        var outVals = new T[nnz];
+        if (nnz == 0) return outVals;
+
+        // GPU tier (float only — the managed SDDMM kernels are fp32), gated by the same
+        // upload/download-vs-compute threshold as SpMM.
+        if (typeof(T) == typeof(float) && (long)nnz * innerK >= GpuDispatchThreshold
+            && x.IsContiguous && y.IsContiguous)
+        {
+            var xf = (float[])(object)x.ToArray();
+            var yf = (float[])(object)y.ToArray();
+            float[]? gpu = null;
+            if (OpenClSparseBackend.IsAvailable)
+                gpu = OpenClSparseBackend.SDDMM(rowIndices, colIndices, xf, yf, innerK);
+            if (gpu is not null) return (T[])(object)gpu;
+        }
+
+        // CPU reference — cache-friendly row-slice loop (contiguous fast path).
+        var ops = MathHelper.GetNumericOperations<T>();
+        if (x.IsContiguous && y.IsContiguous)
+        {
+            var xSpan = x.AsSpan();
+            var ySpan = y.AsSpan();
+            for (int p = 0; p < nnz; p++)
+            {
+                int i = rowIndices[p], j = colIndices[p];
+                var xRow = xSpan.Slice(i * innerK, innerK);
+                var yRow = ySpan.Slice(j * innerK, innerK);
+                T sum = ops.Zero;
+                for (int k = 0; k < innerK; k++)
+                    sum = ops.Add(sum, ops.Multiply(xRow[k], yRow[k]));
+                outVals[p] = sum;
+            }
+        }
+        else
+        {
+            for (int p = 0; p < nnz; p++)
+            {
+                int i = rowIndices[p], j = colIndices[p];
+                T sum = ops.Zero;
+                for (int k = 0; k < innerK; k++)
+                    sum = ops.Add(sum, ops.Multiply(x[i, k], y[j, k]));
+                outVals[p] = sum;
+            }
+        }
+        return outVals;
+    }
+
+    /// <summary>
     /// Constructs a sparse tensor with the supplied diagonals.
     /// <paramref name="diagonals"/> is a 2-D dense tensor where row <c>i</c>
     /// is the values for offset <c>offsets[i]</c>; positive offsets are

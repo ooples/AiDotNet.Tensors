@@ -3797,6 +3797,35 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             kernel.Execute2D(N, M, localSizeX, localSizeY);
         }
 
+        /// <summary>
+        /// SDDMM: output[p] = sum_k x[rowIndices[p], k] * y[colIndices[p], k], one work-item per
+        /// pattern non-zero. Buffers are GPU-resident. Used by the pattern-preserving sparse-matmul
+        /// backward's dA.
+        /// </summary>
+        public void CsrSddmm(
+            IGpuBuffer rowIndices,
+            IGpuBuffer colIndices,
+            IGpuBuffer x,
+            IGpuBuffer y,
+            IGpuBuffer output,
+            int nnz, int innerK)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context not available");
+            if (nnz == 0) return;
+
+            var kernel = _kernelCache["sddmm"];
+            kernel.SetArg(0, ((DirectOpenClGpuBuffer)rowIndices).Buffer.Handle);
+            kernel.SetArg(1, ((DirectOpenClGpuBuffer)colIndices).Buffer.Handle);
+            kernel.SetArg(2, ((DirectOpenClGpuBuffer)x).Buffer.Handle);
+            kernel.SetArg(3, ((DirectOpenClGpuBuffer)y).Buffer.Handle);
+            kernel.SetArg(4, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            kernel.SetArg(5, nnz);
+            kernel.SetArg(6, innerK);
+
+            kernel.Execute1D(nnz, Math.Min(256, nnz));
+        }
+
         /// <inheritdoc/>
         public void CsrSpMMBias(
             IGpuBuffer csrValues,
