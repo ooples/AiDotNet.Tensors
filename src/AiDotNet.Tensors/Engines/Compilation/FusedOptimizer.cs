@@ -384,20 +384,58 @@ internal static class FusedOptimizer
         double* param, double* grad, double* m, double* v, int length,
         double lr, double beta1, double beta2, double eps, double weightDecay, int step)
     {
+        // SINGLE-PASS fused AdamW. The prior form did a separate full pass over
+        // `param` (read+write every element) to apply the decoupled weight decay,
+        // then called AdamUpdateSimd which read+wrote `param` AGAIN — two
+        // memory-bound passes over the parameter array where Adam does one. Fold
+        // the decay (param *= 1 - wd*lr) into the Adam update loop so `param` is
+        // touched once. Bit-identical to the two-pass form: the scaled parameter
+        // is a double, so keeping it in a register is exactly the value the old
+        // pre-scale pass stored to memory and the Adam pass reloaded. Mirrors the
+        // single-pass structure Adam already had (the optimization AdamW missed).
+        double bc1 = 1.0 - System.Math.Pow(beta1, step);
+        double bc2 = 1.0 - System.Math.Pow(beta2, step);
+        double lrAdj = lr / bc1;
+        double wdScale = 1.0 - weightDecay * lr;   // hoisted out of the loop
+
         int i = 0;
 #if NET5_0_OR_GREATER
-        if (Avx.IsSupported && length >= 4)
+        if (Fma.IsSupported && length >= 4)
         {
-            var vWdLr = Vector256.Create(1.0 - weightDecay * lr);
+            var vB1 = Vector256.Create(beta1);
+            var v1mB1 = Vector256.Create(1.0 - beta1);
+            var vB2 = Vector256.Create(beta2);
+            var v1mB2 = Vector256.Create(1.0 - beta2);
+            var vLr = Vector256.Create(-lrAdj);
+            var vEps = Vector256.Create(eps);
+            var vBc2Inv = Vector256.Create(1.0 / bc2);
+            var vWd = Vector256.Create(wdScale);
             int simdLen = length & ~3;
+
             for (; i < simdLen; i += 4)
-                Avx.Store(param + i, Avx.Multiply(Avx.LoadVector256(param + i), vWdLr));
+            {
+                var g = Avx.LoadVector256(grad + i);
+                var mNew = Fma.MultiplyAdd(vB1, Avx.LoadVector256(m + i), Avx.Multiply(v1mB1, g));
+                Avx.Store(m + i, mNew);
+                var vNew = Fma.MultiplyAdd(vB2, Avx.LoadVector256(v + i), Avx.Multiply(v1mB2, Avx.Multiply(g, g)));
+                Avx.Store(v + i, vNew);
+                var vHat = Avx.Multiply(vNew, vBc2Inv);
+                var denom = Avx.Add(Avx.Sqrt(vHat), vEps);
+                var update = Avx.Divide(mNew, denom);
+                var pScaled = Avx.Multiply(Avx.LoadVector256(param + i), vWd);   // decoupled wd, in-register
+                Avx.Store(param + i, Fma.MultiplyAdd(vLr, update, pScaled));
+            }
         }
 #endif
         for (; i < length; i++)
-            param[i] *= (1.0 - weightDecay * lr);
-
-        AdamUpdateSimd(param, grad, m, v, length, lr, beta1, beta2, eps, step);
+        {
+            m[i] = beta1 * m[i] + (1.0 - beta1) * grad[i];
+            v[i] = beta2 * v[i] + (1.0 - beta2) * grad[i] * grad[i];
+            double mHat = m[i] / bc1;
+            double vHat = v[i] / bc2;
+            double pScaled = param[i] * wdScale;
+            param[i] = pScaled - lr * mHat / (System.Math.Sqrt(vHat) + eps);
+        }
     }
 
     /// <summary>AVX2 AdamW: Adam with decoupled weight decay</summary>
@@ -406,20 +444,52 @@ internal static class FusedOptimizer
         float* param, float* grad, float* m, float* v, int length,
         float lr, float beta1, float beta2, float eps, float weightDecay, int step)
     {
+        // SINGLE-PASS fused AdamW — see the double overload above. Folds the
+        // decoupled weight decay into the Adam update loop so `param` is read+
+        // written once instead of twice. Bit-identical to the prior two-pass form.
+        float bc1 = 1f - MathF.Pow(beta1, step);
+        float bc2 = 1f - MathF.Pow(beta2, step);
+        float lrAdj = lr / bc1;
+        float wdScale = 1f - weightDecay * lr;
+
         int i = 0;
 #if NET5_0_OR_GREATER
-        if (Avx.IsSupported && length >= 8)
+        if (Fma.IsSupported && length >= 8)
         {
-            var vWdLr = Vector256.Create(1f - weightDecay * lr);
+            var vB1 = Vector256.Create(beta1);
+            var v1mB1 = Vector256.Create(1f - beta1);
+            var vB2 = Vector256.Create(beta2);
+            var v1mB2 = Vector256.Create(1f - beta2);
+            var vLr = Vector256.Create(-lrAdj);
+            var vEps = Vector256.Create(eps);
+            var vBc2Inv = Vector256.Create(1f / bc2);
+            var vWd = Vector256.Create(wdScale);
             int simdLen = length & ~7;
+
             for (; i < simdLen; i += 8)
-                Avx.Store(param + i, Avx.Multiply(Avx.LoadVector256(param + i), vWdLr));
+            {
+                var g = Avx.LoadVector256(grad + i);
+                var mNew = Fma.MultiplyAdd(vB1, Avx.LoadVector256(m + i), Avx.Multiply(v1mB1, g));
+                Avx.Store(m + i, mNew);
+                var vNew = Fma.MultiplyAdd(vB2, Avx.LoadVector256(v + i), Avx.Multiply(v1mB2, Avx.Multiply(g, g)));
+                Avx.Store(v + i, vNew);
+                var vHat = Avx.Multiply(vNew, vBc2Inv);
+                var denom = Avx.Add(Avx.Sqrt(vHat), vEps);
+                var update = Avx.Divide(mNew, denom);
+                var pScaled = Avx.Multiply(Avx.LoadVector256(param + i), vWd);
+                Avx.Store(param + i, Fma.MultiplyAdd(vLr, update, pScaled));
+            }
         }
 #endif
         for (; i < length; i++)
-            param[i] *= (1f - weightDecay * lr);
-
-        AdamUpdateSimd(param, grad, m, v, length, lr, beta1, beta2, eps, step);
+        {
+            m[i] = beta1 * m[i] + (1f - beta1) * grad[i];
+            v[i] = beta2 * v[i] + (1f - beta2) * grad[i] * grad[i];
+            float mHat = m[i] / bc1;
+            float vHat = v[i] / bc2;
+            float pScaled = param[i] * wdScale;
+            param[i] = pScaled - lr * mHat / (MathF.Sqrt(vHat) + eps);
+        }
     }
 
     /// <summary>AVX2 Adagrad: accum += g^2; param -= lr*g/(sqrt(accum)+eps)</summary>

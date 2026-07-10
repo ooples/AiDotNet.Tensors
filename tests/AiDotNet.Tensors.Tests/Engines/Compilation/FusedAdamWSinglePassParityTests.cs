@@ -1,0 +1,127 @@
+using System;
+using AiDotNet.Tensors.Engines.Compilation;
+using Xunit;
+
+namespace AiDotNet.Tensors.Tests.Engines.Compilation;
+
+/// <summary>
+/// The fused single-pass AdamW SIMD kernel must be BIT-IDENTICAL to the prior
+/// two-pass form (a full weight-decay pre-scale pass over <c>param</c>, then
+/// <see cref="FusedOptimizer"/>.AdamUpdateSimd). The fusion only removes the
+/// redundant second read+write of the parameter array; it changes no arithmetic,
+/// so training trajectories must be unchanged to the last bit. These tests
+/// reconstruct the exact two-pass reference and compare raw bit patterns across
+/// SIMD-tail lengths and a range of steps / learning rates / weight decays.
+/// </summary>
+public class FusedAdamWSinglePassParityTests
+{
+    public static TheoryData<int> Lengths => new() { 1, 3, 4, 7, 8, 9, 15, 16, 17, 31, 100, 257, 1024, 4099 };
+
+    [Theory]
+    [MemberData(nameof(Lengths))]
+    public void FusedAdamW_Double_BitIdenticalToTwoPass(int len)
+    {
+        const double lr = 3e-4, b1 = 0.9, b2 = 0.999, eps = 1e-8, wd = 1e-2;
+        for (int step = 1; step <= 3; step++)
+        {
+            var (param, grad, m, v) = MakeDouble(len, 100 + len + step);
+
+            // Reference: the OLD two-pass form. Weight-decay pre-scale (scalar
+            // multiply is bit-identical to the old SIMD Avx.Multiply for the same
+            // inputs), then the UNCHANGED AdamUpdateSimd kernel.
+            var pRef = (double[])param.Clone();
+            var mRef = (double[])m.Clone();
+            var vRef = (double[])v.Clone();
+            double wdScale = 1.0 - wd * lr;
+            for (int i = 0; i < len; i++) pRef[i] *= wdScale;
+            unsafe
+            {
+                fixed (double* pp = pRef, pg = grad, pm = mRef, pv = vRef)
+                    FusedOptimizer.AdamUpdateSimd(pp, pg, pm, pv, len, lr, b1, b2, eps, step);
+            }
+
+            // Fused single-pass AdamW.
+            var pFused = (double[])param.Clone();
+            var mFused = (double[])m.Clone();
+            var vFused = (double[])v.Clone();
+            unsafe
+            {
+                fixed (double* pp = pFused, pg = grad, pm = mFused, pv = vFused)
+                    FusedOptimizer.AdamWUpdateSimd(pp, pg, pm, pv, len, lr, b1, b2, eps, wd, step);
+            }
+
+            for (int i = 0; i < len; i++)
+            {
+                Assert.Equal(BitConverter.DoubleToInt64Bits(pRef[i]), BitConverter.DoubleToInt64Bits(pFused[i]));
+                Assert.Equal(BitConverter.DoubleToInt64Bits(mRef[i]), BitConverter.DoubleToInt64Bits(mFused[i]));
+                Assert.Equal(BitConverter.DoubleToInt64Bits(vRef[i]), BitConverter.DoubleToInt64Bits(vFused[i]));
+            }
+        }
+    }
+
+    [Theory]
+    [MemberData(nameof(Lengths))]
+    public void FusedAdamW_Float_BitIdenticalToTwoPass(int len)
+    {
+        const float lr = 3e-4f, b1 = 0.9f, b2 = 0.999f, eps = 1e-8f, wd = 1e-2f;
+        for (int step = 1; step <= 3; step++)
+        {
+            var (param, grad, m, v) = MakeFloat(len, 200 + len + step);
+
+            var pRef = (float[])param.Clone();
+            var mRef = (float[])m.Clone();
+            var vRef = (float[])v.Clone();
+            float wdScale = 1f - wd * lr;
+            for (int i = 0; i < len; i++) pRef[i] *= wdScale;
+            unsafe
+            {
+                fixed (float* pp = pRef, pg = grad, pm = mRef, pv = vRef)
+                    FusedOptimizer.AdamUpdateSimd(pp, pg, pm, pv, len, lr, b1, b2, eps, step);
+            }
+
+            var pFused = (float[])param.Clone();
+            var mFused = (float[])m.Clone();
+            var vFused = (float[])v.Clone();
+            unsafe
+            {
+                fixed (float* pp = pFused, pg = grad, pm = mFused, pv = vFused)
+                    FusedOptimizer.AdamWUpdateSimd(pp, pg, pm, pv, len, lr, b1, b2, eps, wd, step);
+            }
+
+            for (int i = 0; i < len; i++)
+            {
+                Assert.Equal(BitConverter.SingleToInt32Bits(pRef[i]), BitConverter.SingleToInt32Bits(pFused[i]));
+                Assert.Equal(BitConverter.SingleToInt32Bits(mRef[i]), BitConverter.SingleToInt32Bits(mFused[i]));
+                Assert.Equal(BitConverter.SingleToInt32Bits(vRef[i]), BitConverter.SingleToInt32Bits(vFused[i]));
+            }
+        }
+    }
+
+    private static (double[] p, double[] g, double[] m, double[] v) MakeDouble(int len, int seed)
+    {
+        var rng = new Random(seed);
+        double[] p = new double[len], g = new double[len], m = new double[len], v = new double[len];
+        for (int i = 0; i < len; i++)
+        {
+            p[i] = (rng.NextDouble() * 2 - 1);
+            g[i] = (rng.NextDouble() * 2 - 1) * 0.1;
+            m[i] = (rng.NextDouble() * 2 - 1) * 0.05;
+            v[i] = rng.NextDouble() * 0.01;   // second moment >= 0
+        }
+        return (p, g, m, v);
+    }
+
+    private static (float[] p, float[] g, float[] m, float[] v) MakeFloat(int len, int seed)
+    {
+        var rng = new Random(seed);
+        float[] p = new float[len], g = new float[len], m = new float[len], v = new float[len];
+        for (int i = 0; i < len; i++)
+        {
+            p[i] = (float)(rng.NextDouble() * 2 - 1);
+            g[i] = (float)((rng.NextDouble() * 2 - 1) * 0.1);
+            m[i] = (float)((rng.NextDouble() * 2 - 1) * 0.05);
+            v[i] = (float)(rng.NextDouble() * 0.01);
+        }
+        return (p, g, m, v);
+    }
+}
