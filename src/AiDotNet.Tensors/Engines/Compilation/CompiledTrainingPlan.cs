@@ -4478,11 +4478,23 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             }
         }
 
-        // If all backward steps are specialized (overwrite), we can skip gradient zeroing entirely.
-        // Under pooling, force the clear-all path (null) so every physical buffer is
-        // zeroed at step start (covering each shared buffer's FIRST tenant); the
-        // re-zero schedule clears it again before each subsequent tenant.
-        int[]? genericGradIndices = (!useGradPool && genericBackwardCount == 0) ? new int[0] : null;
+        // If all backward steps are specialized we CAN skip gradient zeroing — but ONLY
+        // when every specialized delegate truly OVERWRITES its gradient buffer. Some
+        // specialized delegates (e.g. the BroadcastAdd bias-grad path) instead
+        // ACCUMULATE in place (TensorAddInto / +=) whenever their input tensor has more
+        // than one consumer, because a multi-consumer tensor's gradient is the SUM of
+        // the contributions from each consumer. Skipping the zeroing for such a buffer
+        // makes it accumulate onto the PRIOR step's gradient every step, so the
+        // gradient — and the Adam update — grows without bound while the loss barely
+        // moves (observed on N-BEATS's doubly-residual graph, whose residual tensors
+        // are inherently multi-consumer: weights blew up to ~1e13). So the skip-zeroing
+        // optimization is only sound when no tensor has multiple consumers; otherwise
+        // fall back to the clear-all path (null) which zeroes every buffer each step.
+        bool anyMultiConsumer = false;
+        foreach (var cc in consumerCount.Values)
+            if (cc > 1) { anyMultiConsumer = true; break; }
+        int[]? genericGradIndices =
+            (!useGradPool && genericBackwardCount == 0 && !anyMultiConsumer) ? new int[0] : null;
 
         // #1624 drift guard: the re-zero schedule (indexed by backward ACTION index)
         // was planned in BuildPooledGradMap from the fusion/analytic DECISIONS made
