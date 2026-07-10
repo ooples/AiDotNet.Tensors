@@ -112,11 +112,19 @@ public sealed class TensorArena : IDisposable
     /// allocation/GC is cheap and pooling churns the dictionary for no gain.</summary>
     private const int PersistThresholdElems = 64 * 1024;
 
-    /// <summary>Max retained buffers per (type, size). A single-threaded training
-    /// step rents each distinct size O(1) times, so a small cap fully covers
-    /// steady-state reuse while bounding worst-case retained memory to a few ×
-    /// the model's transient working set.</summary>
-    private const int MaxPersistPerSize = 4;
+    /// <summary>Max retained buffers per (type, size). Retention is SELF-LIMITING:
+    /// a single arena's Dispose returns exactly as many same-size buffers as the
+    /// step actually used, so a shallow model that rents a size once retains one —
+    /// raising this cap costs nothing for it. The cap only bites DEEP models: an
+    /// N-layer transformer produces N same-shaped hidden-state / gradient tensors
+    /// per step (NOT "O(1) per size" as an earlier revision assumed), so with the
+    /// old cap of 4 a fresh-arena-per-step trainer dropped N-4 of them on Dispose
+    /// and re-allocated them next step — measured as ~2 GB/step of Double[] churn
+    /// for an 18-layer VALL-E-X-clone (PerfView, TensorArena.TryRentTensor). 64
+    /// covers realistic deep stacks (ViT/GPT-scale) while the returned-count self-
+    /// limit keeps the extra retention bounded by the model's own working set,
+    /// which already had to be resident during the step.</summary>
+    private const int MaxPersistPerSize = 64;
 
     private static Array? RentPersistent(Type type, int elementCount)
     {
