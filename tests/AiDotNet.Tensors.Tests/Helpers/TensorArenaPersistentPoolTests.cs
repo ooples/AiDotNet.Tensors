@@ -95,6 +95,33 @@ public class TensorArenaPersistentPoolTests
         Assert.Equal(n, TensorArena.PersistentReuseHits);
     }
 
+    /// <summary>
+    /// The retention cap is a bound, not just a floor: renting MORE than
+    /// MaxPersistPerSize (64) same-size buffers per cycle must retain AT MOST the
+    /// cap across lifetimes — the excess is dropped on Dispose, so a later cycle
+    /// sees exactly `cap` reuse hits (not all 65). Pins MaxPersistPerSize as the
+    /// sole guard against unbounded per-size pool growth (CodeRabbit #767).
+    /// </summary>
+    [Fact]
+    public void SameSizeBuffers_BeyondCap_RetentionIsCapped()
+    {
+        TensorArena.ClearPersistentPool();
+        const int cap = 64;                     // MaxPersistPerSize
+        const int n = cap + 1;                  // one past the cap
+        int[] shape = { 128 * 1024 };           // above PersistThresholdElems
+
+        using (var arena = TensorArena.Create())
+            for (int i = 0; i < n; i++) TensorAllocator.RentUninitialized<float>(shape).AsWritableSpan()[0] = i;
+        Assert.Equal(0, TensorArena.PersistentReuseHits);
+
+        using (var arena = TensorArena.Create())
+            for (int i = 0; i < n; i++) TensorAllocator.RentUninitialized<float>(shape).AsWritableSpan()[0] = i;
+
+        // Only `cap` of the n=65 buffers were retained; the 65th was dropped on
+        // Dispose and re-allocated fresh in cycle 2 — so exactly `cap` reuse hits.
+        Assert.Equal(cap, TensorArena.PersistentReuseHits);
+    }
+
 #if NET5_0_OR_GREATER
     /// <summary>
     /// Same guarantee, measured directly: steady-state per-step allocation must
