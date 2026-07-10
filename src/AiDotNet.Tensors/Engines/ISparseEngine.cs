@@ -227,4 +227,83 @@ public interface ISparseEngine
     SparseTensor<T> SparseTranspose<T>(SparseTensor<T> sparse);
 
     #endregion
+
+    #region Tape-Aware Differentiable Operations
+
+    // These return Tensor<T> (the autodiff tape's currency) and AUTOMATICALLY record
+    // themselves on the active autodiff tape — mirroring how every dense IEngine op
+    // (TensorMatMul, TensorAdd, …) records via DifferentiableOps. When no tape is active
+    // they are a plain forward with zero overhead. The forward dispatches through
+    // SparseOps, so it is GPU-accelerated (cuSPARSE / CSR GPU kernels) automatically when a
+    // GPU backend is present and the problem clears the dispatch threshold. Prefer these
+    // over the raw Matrix<T>/Vector<T> kernels above whenever the sparse operand may be a
+    // trainable parameter — the Matrix<T> SpMM etc. are non-differentiable low-level
+    // primitives and silently detach the tape.
+
+    /// <summary>
+    /// Tape-aware sparse·dense matrix multiply: <c>C = A · B</c> (A sparse, B dense).
+    /// Records on the active autodiff tape. A's gradient is DENSE and accumulates against the
+    /// <paramref name="a"/> instance, so it is retrievable via <c>ComputeGradients</c> like any
+    /// other operand — <paramref name="a"/> must be the exact registered parameter instance.
+    /// For a pattern-preserving (non-densifying) gradient into a sparse-aware parameter buffer,
+    /// use <see cref="SparseMatMulPatternPreserving{T}"/>.
+    /// </summary>
+    Tensor<T> SparseMatMul<T>(SparseTensor<T> a, Tensor<T> b);
+
+    /// <summary>
+    /// Tape-aware sparse·dense matrix multiply with a PATTERN-PRESERVING sparse gradient for A
+    /// (non-zeros align with A's stored pattern, avoiding the O(rows·cols) dense-gradient
+    /// allocation of <see cref="SparseMatMul{T}"/>). A's gradient is routed to a sparse-aware
+    /// <c>ParameterBuffer</c> slot, so use this only when <paramref name="a"/> is a registered
+    /// trainable parameter backed by such a buffer (e.g. <c>SparseLinearLayer&lt;T&gt;</c>).
+    /// </summary>
+    Tensor<T> SparseMatMulPatternPreserving<T>(SparseTensor<T> a, Tensor<T> b);
+
+    /// <summary>
+    /// Tape-aware fused <c>α · (A · B) + β · C</c> (A sparse; B, C dense). Records dA, dB and
+    /// dC on the active tape. Gradient for A is keyed on the <paramref name="a"/> instance.
+    /// </summary>
+    Tensor<T> SparseAddMM<T>(Tensor<T> c, SparseTensor<T> a, Tensor<T> b, T alpha, T beta);
+
+    /// <summary>
+    /// Tape-aware sampled fused multiply-add: computes <c>α · (A · B) + β · C</c> only at the
+    /// non-zeros of <paramref name="pattern"/>, returned densified for downstream tape
+    /// composition. The backward routes dA through the sampling mask so the gradient stays
+    /// pattern-consistent.
+    /// </summary>
+    Tensor<T> SparseSampledAddMM<T>(SparseTensor<T> pattern, Tensor<T> a, Tensor<T> b, Tensor<T> c, T alpha, T beta);
+
+    /// <summary>
+    /// Tape-aware sparse·sparse matrix multiply (SpGeMM): <c>C = A · B</c> with both operands
+    /// sparse, returned densified. The gradient flowing into A and B is pattern-preserving
+    /// sparse, so both may be trainable parameters.
+    /// </summary>
+    Tensor<T> SparseSpGeMM<T>(SparseTensor<T> a, SparseTensor<T> b);
+
+    /// <summary>
+    /// Tape-aware sparse sum. <paramref name="axis"/> null reduces to a scalar; otherwise
+    /// reduces along that axis. Records on the tape with the gradient keyed on
+    /// <paramref name="a"/>.
+    /// </summary>
+    Tensor<T> SparseSum<T>(SparseTensor<T> a, int? axis = null);
+
+    /// <summary>
+    /// Tape-aware sparse mean (divisor is the dense element count along the reduction axis,
+    /// matching <c>torch.sparse.mean</c>, i.e. structural zeros count). See
+    /// <see cref="SparseSum{T}"/>.
+    /// </summary>
+    Tensor<T> SparseMean<T>(SparseTensor<T> a, int? axis = null);
+
+    /// <summary>
+    /// Tape-aware sparse softmax over the stored non-zeros (per row). Output is dense; the
+    /// backward applies the standard softmax Jacobian restricted to the sparse pattern.
+    /// </summary>
+    Tensor<T> SparseSoftmax<T>(SparseTensor<T> a);
+
+    /// <summary>
+    /// Tape-aware sparse log-softmax companion of <see cref="SparseSoftmax{T}"/>.
+    /// </summary>
+    Tensor<T> SparseLogSoftmax<T>(SparseTensor<T> a);
+
+    #endregion
 }
