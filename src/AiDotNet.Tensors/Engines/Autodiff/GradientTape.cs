@@ -724,35 +724,42 @@ public sealed class GradientTape<T> : IDisposable
         bool hasHooksRegistered = (_hooks is not null && _hooks.Count > 0)
             || (_nodeHooks is not null && _nodeHooks.Count > 0)
             || (_nodePredicateHooks is not null && _nodePredicateHooks.Count > 0);
-        if (_options.Persistent && !createGraph && seedOverride is null)
+        if (_options.Persistent && seedOverride is null)
         {
             var compiledBwd = Compilation.AutoTrainingCompiler.TryGetCompiledBackward(this, loss, sources?.ToArray());
             if (compiledBwd is not null)
             {
-                // Issue #283: suspend the tape during compiled-backward
-                // replay. Without this, engine ops invoked from BackwardFunctions
-                // (TensorMatMul/TensorTranspose/etc.) see Current != null and
-                // record fresh tape entries whose GradNodes hold the FORWARD
-                // intermediates as inputs. The compiled plan's cleanup only
-                // visits the forward _reachableEntryIndices — backward-
-                // recorded entries' GradFn chains are NEVER cleared, pinning
-                // ~7 forward intermediates × ~40KB each per iter (the
-                // 133KB-1MB/call signature in the GradientTapeLeakTests
-                // transformer-scale probes). The non-compiled path
-                // (ComputeGradientsViaGraph) already suspends — this is the
-                // missing parity. Same gating: createGraph=true intentionally
-                // keeps recording so higher-order ops (Hvp/Hessian) land in
-                // the outer tape, but the compiled-replay path is gated on
-                // !createGraph (line 249 above) so we always suspend here.
+                // Issue #283 / higher-order AD: the compiled backward normally
+                // suspends the tape during replay so BackwardFunctions' engine
+                // ops don't record fresh entries that pin forward intermediates
+                // (the leak the non-compiled path already handles). When
+                // createGraph=true we DO want the backward ops recorded on the
+                // outer tape so higher-order AD (Hvp / WGAN-GP gradient penalty)
+                // can differentiate them — so we keep the tape active and set
+                // _isBackwardCreateGraph so AccumulateGrad uses out-of-place
+                // TensorAdd (keeps the double-backward graph intact).
                 var savedCompiledReplayCurrent = _current;
-                SetCurrentTape(null);
+                var savedCompiledCg = DifferentiableOps._isBackwardCreateGraph;
+                if (createGraph)
+                {
+                    DifferentiableOps._isBackwardCreateGraph = true;
+                    // Keep the tape active — backward ops MUST record so the
+                    // outer tape's next backward can traverse them.
+                }
+                else
+                {
+                    SetCurrentTape(null);
+                }
                 try
                 {
                     return compiledBwd.Execute(loss);
                 }
                 finally
                 {
-                    SetCurrentTape(savedCompiledReplayCurrent);
+                    if (createGraph)
+                        DifferentiableOps._isBackwardCreateGraph = savedCompiledCg;
+                    else
+                        SetCurrentTape(savedCompiledReplayCurrent);
                 }
             }
         }
