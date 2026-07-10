@@ -56,6 +56,45 @@ public class TensorArenaPersistentPoolTests
         Assert.Equal(5, TensorArena.PersistentReuseHits);
     }
 
+    /// <summary>
+    /// Deep-model churn guard: a training step for an N-layer network rents MANY
+    /// same-size large buffers (one hidden-state / gradient per layer), not "O(1)
+    /// per size". The cross-arena pool must retain and reuse ALL of them across a
+    /// fresh-arena-per-step trainer — with the old per-size cap of 4 an 18-layer
+    /// model dropped N-4 buffers on Dispose and re-allocated them every step
+    /// (~2 GB/step Double[] churn measured on VALL-E-X-clone via PerfView). Renting
+    /// 16 same-size large buffers per cycle must yield 16 reuse hits next cycle.
+    /// </summary>
+    [Fact]
+    public void ManySameSizeBuffers_PerStep_AllReusedAcrossLifetimes()
+    {
+        TensorArena.ClearPersistentPool();
+        const int n = 16;                       // > old cap (4); models a deep stack
+        int[] shape = { 128 * 1024 };           // 512 KB float — above PersistThresholdElems
+
+        // Cycle 1: cold — allocate n fresh, all returned to the pool on dispose.
+        using (var arena = TensorArena.Create())
+        {
+            for (int i = 0; i < n; i++)
+            {
+                var t = TensorAllocator.RentUninitialized<float>(shape);
+                t.AsWritableSpan()[0] = i;
+            }
+        }
+        Assert.Equal(0, TensorArena.PersistentReuseHits);
+
+        // Cycle 2: every one of the n same-size buffers must come from the pool.
+        using (var arena = TensorArena.Create())
+        {
+            for (int i = 0; i < n; i++)
+            {
+                var t = TensorAllocator.RentUninitialized<float>(shape);
+                t.AsWritableSpan()[0] = i;
+            }
+        }
+        Assert.Equal(n, TensorArena.PersistentReuseHits);
+    }
+
 #if NET5_0_OR_GREATER
     /// <summary>
     /// Same guarantee, measured directly: steady-state per-step allocation must
