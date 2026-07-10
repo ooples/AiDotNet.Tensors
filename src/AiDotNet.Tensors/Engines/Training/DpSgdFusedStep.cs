@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
+using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Training;
@@ -33,6 +34,17 @@ namespace AiDotNet.Tensors.Engines.Training;
 /// <typeparam name="T">Numeric type (float / double).</typeparam>
 public sealed class DpSgdFusedStep<T> : IDisposable
 {
+    /// <summary>Ambient engine — matches the codebase convention
+    /// (<c>protected IEngine Engine => AiDotNetEngine.Current;</c> on the
+    /// activation/optimizer/etc. bases). All tensor arithmetic in this class
+    /// goes through <c>Engine</c> so the dispatch is uniform.</summary>
+    private static IEngine Engine => AiDotNetEngine.Current;
+
+    /// <summary>Cached numeric ops for T. Class-level to match the codebase
+    /// pattern instead of threading <c>INumericOperations&lt;T&gt;</c> through
+    /// method signatures.</summary>
+    private static readonly INumericOperations<T> Ops = MathHelper.GetNumericOperations<T>();
+
     // Persistent per-example slots. Refreshed with each example's data before
     // running plan.Step(). The plan captured these references at trace time.
     private Tensor<T>[]? _persistentSlots;
@@ -63,9 +75,14 @@ public sealed class DpSgdFusedStep<T> : IDisposable
     /// <param name="batchSize">Number of per-example passes to run.</param>
     /// <param name="clipNorm">Per-example L2 norm clip (Abadi 2016's C).</param>
     /// <param name="noiseMultiplier">Gaussian noise multiplier (Abadi 2016's σ).</param>
-    /// <param name="learningRate">Learning rate of the FINAL aggregate update
-    /// applied to parameters after clip + noise + average.</param>
-    /// <param name="rng">RNG for Gaussian noise draws.</param>
+    /// <param name="rng">Retained for API compatibility. Noise is now sampled
+    /// on-device via <c>Engine.TensorRandomNormalInto</c> so it dispatches to
+    /// the engine's RNG (which supports vectorized / on-device random draws).
+    /// The caller's <c>rng</c> parameter is not used by the fused path.</param>
+    /// <param name="aggregatedGradients">On success, the per-example-clipped +
+    /// noised + averaged gradients keyed by parameter tensor reference. Feed
+    /// directly into the caller's configured optimizer so the caller's
+    /// optimizer choice (Adam / AdamW / SGD / ...) applies the update.</param>
     /// <returns>True when the fused compiled DP-SGD path ran; false to fall
     /// back to eager.</returns>
     public bool TryStep(
@@ -76,10 +93,11 @@ public sealed class DpSgdFusedStep<T> : IDisposable
         int batchSize,
         double clipNorm,
         double noiseMultiplier,
-        float learningRate,
-        Random rng)
+        Random rng,
+        out Dictionary<Tensor<T>, Tensor<T>> aggregatedGradients)
     {
         ThrowIfDisposed();
+        aggregatedGradients = new Dictionary<Tensor<T>, Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
 
         if (!IsAvailable) return false;
         if (parameters is null || parameters.Count == 0) return false;
@@ -89,8 +107,6 @@ public sealed class DpSgdFusedStep<T> : IDisposable
         if (batchSize <= 0) throw new ArgumentOutOfRangeException(nameof(batchSize));
         if (clipNorm <= 0) throw new ArgumentOutOfRangeException(nameof(clipNorm));
         if (rng is null) throw new ArgumentNullException(nameof(rng));
-
-        var ops = MathHelper.GetNumericOperations<T>();
 
         try
         {
@@ -136,14 +152,21 @@ public sealed class DpSgdFusedStep<T> : IDisposable
                 _plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f, beta1: 0.9f, beta2: 0.999f, eps: 1e-8f, weightDecay: 0f);
             }
 
-            // Per-example accumulators for clipped gradients.
+            // Per-example accumulators for clipped gradients — zero-init via
+            // vectorized TensorFill (avoids per-element scalar zero writes).
             var clippedSums = new Tensor<T>[_cachedParameters.Length];
             for (int p = 0; p < _cachedParameters.Length; p++)
+            {
                 clippedSums[p] = new Tensor<T>((int[])_cachedParameters[p]._shape.Clone());
+                Engine.TensorFill(clippedSums[p], Ops.Zero);
+            }
 
             // Per-example forward+backward via the compiled plan. Each example
-            // populates parameter .Grad; we snapshot into per-example arrays
-            // BEFORE clipping (the plan will overwrite .Grad on the next call).
+            // populates parameter .Grad; the L2 norm computation and clipped
+            // accumulation below use vectorized IEngine ops (TensorMultiply for
+            // element-wise square, ReduceSum for the norm reduction,
+            // TensorMultiplyScalar for the clip scale, TensorAdd for the
+            // accumulation) — no per-element scalar loops on the hot path.
             for (int example = 0; example < batchSize; example++)
             {
                 var exampleData = example == 0 ? firstExample : perExampleSlotData(example);
@@ -154,53 +177,61 @@ public sealed class DpSgdFusedStep<T> : IDisposable
                 // but .Grad on every parameter gets populated by the backward.
                 _plan.Step();
 
-                // Compute GLOBAL L2 norm across ALL parameter gradients
-                // concatenated. Required by Abadi 2016 L2-sensitivity bound —
-                // per-parameter norms would break the DP guarantee.
-                double normSquared = 0.0;
+                // GLOBAL L2 norm across ALL parameter gradients concatenated —
+                // Abadi 2016 L2-sensitivity contract. Per parameter: sum(g²) via
+                // TensorMultiply + ReduceSum (vectorized). Sum-of-scalars across
+                // parameters is a small O(paramCount) accumulation (unavoidable
+                // since each param has its own gradient tensor).
+                T normSquared = Ops.Zero;
                 for (int p = 0; p < _cachedParameters.Length; p++)
                 {
                     var grad = _cachedParameters[p].Grad;
                     if (grad is null) continue;
-                    var span = grad.AsSpan();
-                    for (int i = 0; i < span.Length; i++)
-                    {
-                        double v = ops.ToDouble(span[i]);
-                        normSquared += v * v;
-                    }
+                    var sq = Engine.TensorMultiply(grad, grad);
+                    // axes=null reduces all axes to a scalar.
+                    var perParamSum = Engine.ReduceSum(sq, axes: null, keepDims: false);
+                    normSquared = Ops.Add(normSquared, perParamSum.Length > 0 ? perParamSum[0] : Ops.Zero);
                 }
-                double clipFactor = Math.Min(1.0, clipNorm / Math.Sqrt(normSquared + 1e-12));
+                double clipFactor = Math.Min(1.0, clipNorm / Math.Sqrt(Ops.ToDouble(normSquared) + 1e-12));
+                var clipFactorT = Ops.FromDouble(clipFactor);
 
-                // Accumulate clipped per-example gradient into sums.
+                // Accumulate clipped per-example gradient into sums —
+                // vectorized: TensorMultiplyScalar + TensorAdd.
                 for (int p = 0; p < _cachedParameters.Length; p++)
                 {
                     var grad = _cachedParameters[p].Grad;
                     if (grad is null) continue;
-                    var sumSpan = clippedSums[p].AsWritableSpan();
-                    var gSpan = grad.AsSpan();
-                    for (int i = 0; i < gSpan.Length; i++)
-                    {
-                        double v = ops.ToDouble(sumSpan[i]) + ops.ToDouble(gSpan[i]) * clipFactor;
-                        sumSpan[i] = ops.FromDouble(v);
-                    }
+                    var scaled = Engine.TensorMultiplyScalar(grad, clipFactorT);
+                    clippedSums[p] = Engine.TensorAdd(clippedSums[p], scaled);
                 }
             }
 
-            // Final update: add Gaussian noise, average by batchSize, apply
-            // learningRate * aggregate to each parameter.
+            // Build the DP-SGD-clean aggregated gradient dictionary using
+            // vectorized IEngine ops: noise is sampled on-device via
+            // TensorRandomNormalInto, aggregate is TensorMultiplyScalar(sum, 1/B)
+            // + TensorAdd(scaled, noise). Preserves the caller's optimizer
+            // choice (Adam / AdamW / SGD) by returning gradients instead of
+            // applying an SGD update here.
             double invBatch = 1.0 / batchSize;
-            double noiseStd = clipNorm * noiseMultiplier * invBatch;
+            double noiseStdD = clipNorm * noiseMultiplier * invBatch;
+            var invBatchT = Ops.FromDouble(invBatch);
+            var noiseStdT = Ops.FromDouble(noiseStdD);
+            var zeroMean = Ops.Zero;
             for (int p = 0; p < _cachedParameters.Length; p++)
             {
-                var sumSpan = clippedSums[p].AsSpan();
-                var paramSpan = _cachedParameters[p].AsWritableSpan();
-                for (int i = 0; i < sumSpan.Length; i++)
+                var scaledSum = Engine.TensorMultiplyScalar(clippedSums[p], invBatchT);
+                Tensor<T> noisyAvg;
+                if (noiseStdD > 0)
                 {
-                    double noise = noiseStd > 0 ? SampleGaussian(rng) * noiseStd : 0.0;
-                    double aggregateGrad = ops.ToDouble(sumSpan[i]) * invBatch + noise;
-                    double newParam = ops.ToDouble(paramSpan[i]) - learningRate * aggregateGrad;
-                    paramSpan[i] = ops.FromDouble(newParam);
+                    var noise = new Tensor<T>(clippedSums[p]._shape);
+                    Engine.TensorRandomNormalInto(noise, zeroMean, noiseStdT);
+                    noisyAvg = Engine.TensorAdd(scaledSum, noise);
                 }
+                else
+                {
+                    noisyAvg = scaledSum;
+                }
+                aggregatedGradients[_cachedParameters[p]] = noisyAvg;
             }
 
             return true;
@@ -290,14 +321,6 @@ public sealed class DpSgdFusedStep<T> : IDisposable
     {
         _cachedParamIdentities = new object?[parameters.Count];
         for (int i = 0; i < parameters.Count; i++) _cachedParamIdentities[i] = parameters[i];
-    }
-
-    private static double SampleGaussian(Random rng)
-    {
-        double u1;
-        do { u1 = rng.NextDouble(); } while (u1 < 1e-300);
-        double u2 = rng.NextDouble();
-        return Math.Sqrt(-2.0 * Math.Log(u1)) * Math.Cos(2.0 * Math.PI * u2);
     }
 
     public void Dispose()

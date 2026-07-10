@@ -28,6 +28,16 @@ namespace AiDotNet.Tensors.Engines.Training;
 /// <typeparam name="T">Numeric type (float / double).</typeparam>
 public sealed class WganGpFusedStep<T> : IDisposable
 {
+    /// <summary>Ambient engine — matches the codebase convention
+    /// (<c>protected IEngine Engine => AiDotNetEngine.Current;</c> on the
+    /// activation/optimizer/etc. bases).</summary>
+    private static IEngine Engine => AiDotNetEngine.Current;
+
+    /// <summary>Cached numeric ops for T. Class-level to match the codebase
+    /// pattern instead of threading <c>INumericOperations&lt;T&gt;</c> through
+    /// method signatures.</summary>
+    private static readonly INumericOperations<T> Ops = MathHelper.GetNumericOperations<T>();
+
     // Persistent per-batch slots for (real, fake). Refreshed per step.
     private Tensor<T>[]? _persistentSlots;
     private ICompiledTrainingPlan<T>? _plan;
@@ -77,8 +87,7 @@ public sealed class WganGpFusedStep<T> : IDisposable
         out T lossValue)
     {
         ThrowIfDisposed();
-        var ops = MathHelper.GetNumericOperations<T>();
-        lossValue = ops.Zero;
+        lossValue = Ops.Zero;
 
         if (!IsAvailable) return false;
         if (discParameters is null || discParameters.Count == 0) return false;
@@ -128,10 +137,9 @@ public sealed class WganGpFusedStep<T> : IDisposable
             // Trace + compile on first call.
             if (_plan is null)
             {
-                var engine = AiDotNetEngine.Current;
                 using var arenaSuspend = TensorArena.Suspend();
                 using var scope = GraphMode.Enable();
-                var loss = BuildWganGpLoss(engine, discForward, gradientPenaltyWeight, ops);
+                var loss = BuildWganGpLoss(discForward, gradientPenaltyWeight);
                 _plan = scope.CompileTraining(_cachedParameters, loss);
             }
 
@@ -142,7 +150,7 @@ public sealed class WganGpFusedStep<T> : IDisposable
             }
 
             var lossTensor = _plan.Step();
-            lossValue = lossTensor.Length > 0 ? lossTensor[0] : ops.Zero;
+            lossValue = lossTensor.Length > 0 ? lossTensor[0] : Ops.Zero;
             return true;
         }
         catch (NotSupportedException)
@@ -164,10 +172,8 @@ public sealed class WganGpFusedStep<T> : IDisposable
     /// backward differentiate the penalty into disc weights.
     /// </summary>
     private Tensor<T> BuildWganGpLoss(
-        IEngine engine,
         Func<Tensor<T>, Tensor<T>> discForward,
-        double gradientPenaltyWeight,
-        INumericOperations<T> ops)
+        double gradientPenaltyWeight)
     {
         if (_persistentSlots is null || _persistentSlots.Length < 3)
             throw new InvalidOperationException("WganGpFusedStep: persistent slots not allocated.");
@@ -180,18 +186,16 @@ public sealed class WganGpFusedStep<T> : IDisposable
         var realScores = discForward(real);
         var fakeScores = discForward(fake);
         var scoreAxes = System.Linq.Enumerable.Range(0, realScores.Shape.Length).ToArray();
-        var wasserstein = engine.TensorSubtract(
-            engine.ReduceMean(fakeScores, scoreAxes, keepDims: false),
-            engine.ReduceMean(realScores, scoreAxes, keepDims: false));
+        var wasserstein = Engine.TensorSubtract(
+            Engine.ReduceMean(fakeScores, scoreAxes, keepDims: false),
+            Engine.ReduceMean(realScores, scoreAxes, keepDims: false));
 
         // Interpolated x̃ = ε · real + (1 − ε) · fake, broadcasting ε over the
         // sample. epsilon01 has shape [B, 1, ...] matching the sample.
-        var interpolated = engine.TensorAdd(
-            engine.TensorBroadcastMultiply(epsilon01, real),
-            engine.TensorBroadcastMultiply(
-                engine.TensorSubtract(
-                    OnesLike(engine, epsilon01, ops),
-                    epsilon01),
+        var interpolated = Engine.TensorAdd(
+            Engine.TensorBroadcastMultiply(epsilon01, real),
+            Engine.TensorBroadcastMultiply(
+                Engine.TensorSubtract(OnesLike(epsilon01), epsilon01),
                 fake));
 
         // Inner gradient penalty. Run the disc forward on the interpolated point
@@ -202,7 +206,7 @@ public sealed class WganGpFusedStep<T> : IDisposable
         using (var innerTape = new GradientTape<T>())
         {
             var interpScores = discForward(interpolated);
-            var summedScores = engine.ReduceSum(interpScores,
+            var summedScores = Engine.ReduceSum(interpScores,
                 System.Linq.Enumerable.Range(0, interpScores.Shape.Length).ToArray(),
                 keepDims: false);
             // createGraph=true records the inner backward's ops on the outer tape.
@@ -213,31 +217,30 @@ public sealed class WganGpFusedStep<T> : IDisposable
 
             int batchSize = interpolated.Shape[0];
             int elementsPer = interpolated.Length / batchSize;
-            var gradReshaped = engine.Reshape(inputGrad, new[] { batchSize, elementsPer });
-            var gradSquared = engine.TensorMultiply(gradReshaped, gradReshaped);
-            var normSquared = engine.ReduceSum(gradSquared, new[] { 1 }, keepDims: false);
-            var norm = engine.TensorSqrt(engine.TensorAddScalar(normSquared, ops.FromDouble(1e-12)));
-            var targetNorm = OnesLike(engine, norm, ops);
-            var deviation = engine.TensorSubtract(norm, targetNorm);
-            var perExPenalty = engine.TensorMultiply(deviation, deviation);
+            var gradReshaped = Engine.Reshape(inputGrad, new[] { batchSize, elementsPer });
+            var gradSquared = Engine.TensorMultiply(gradReshaped, gradReshaped);
+            var normSquared = Engine.ReduceSum(gradSquared, new[] { 1 }, keepDims: false);
+            var norm = Engine.TensorSqrt(Engine.TensorAddScalar(normSquared, Ops.FromDouble(1e-12)));
+            var deviation = Engine.TensorSubtract(norm, OnesLike(norm));
+            var perExPenalty = Engine.TensorMultiply(deviation, deviation);
             var penaltyAxes = System.Linq.Enumerable.Range(0, perExPenalty.Shape.Length).ToArray();
-            penalty = engine.ReduceMean(perExPenalty, penaltyAxes, keepDims: false);
+            penalty = Engine.ReduceMean(perExPenalty, penaltyAxes, keepDims: false);
         }
 
         // Total = wasserstein + λ · penalty.
-        var weightedPenalty = engine.TensorMultiplyScalar(penalty, ops.FromDouble(gradientPenaltyWeight));
+        var weightedPenalty = Engine.TensorMultiplyScalar(penalty, Ops.FromDouble(gradientPenaltyWeight));
         var alignedPenalty = weightedPenalty._shape.SequenceEqual(wasserstein._shape)
             ? weightedPenalty
-            : engine.Reshape(weightedPenalty, wasserstein._shape);
-        return engine.TensorAdd(wasserstein, alignedPenalty);
+            : Engine.Reshape(weightedPenalty, wasserstein._shape);
+        return Engine.TensorAdd(wasserstein, alignedPenalty);
     }
 
-    private static Tensor<T> OnesLike(IEngine engine, Tensor<T> reference, INumericOperations<T> ops)
+    private static Tensor<T> OnesLike(Tensor<T> reference)
     {
+        // Vectorized fill through the engine — dispatches to on-device
+        // fill (GPU/SIMD) instead of a per-element scalar write loop.
         var ones = new Tensor<T>(reference._shape);
-        var span = ones.AsWritableSpan();
-        var one = ops.One;
-        for (int i = 0; i < span.Length; i++) span[i] = one;
+        Engine.TensorFill(ones, Ops.One);
         return ones;
     }
 
