@@ -320,9 +320,20 @@ public class ConfigureOptimizerFusedDispatchTests
             Assert.True(!float.IsNaN(d[i]) && !float.IsInfinity(d[i]), "D-Adaptation produced a non-finite parameter");
             maxMove = Math.Max(maxMove, Math.Abs(d[i] - init[i]));
         }
-        // With d frozen at d0=1e-6 the total move over 20 steps would be ~O(1e-6·lr·20·|g|) ≈ 1e-6.
-        // A meaningfully larger move proves d grew well above d0 (the adaptation is active).
-        Assert.True(maxMove > 1e-3, $"D-Adaptation distance estimate did not grow (max move = {maxMove}).");
+        // With d frozen at d0=1e-6 the total move over 20 steps is ~O(1e-6·lr·20·|g|) ≈ 1e-6.
+        // A move an order of magnitude above that proves d grew well above d0 (adaptation
+        // is active). Here the observed move is ~4.9e-5 — ~48x the frozen baseline.
+        //
+        // This threshold was 1e-3 until the fused-plan gradient-buffer zeroing fix in this
+        // PR. RunGlobal's loss sum(w*w) makes `w` a MULTI-CONSUMER tensor, and the compiled
+        // plan used to skip zeroing its accumulating grad buffer — so w's gradient piled up
+        // across steps (~step*2w instead of 2w), inflating the D-Adaptation move ~1000x and
+        // masking the true dynamics. With the gradient now correct, the real move is ~4.9e-5,
+        // so the threshold is grounded in the actual d0-frozen baseline (~1e-6) instead.
+        const double d0FrozenBaseline = 1e-6; // ≈ D0 (the comment above)
+        Assert.True(maxMove > 10 * d0FrozenBaseline,
+            $"D-Adaptation distance estimate did not grow above d0 (max move = {maxMove}, " +
+            $"frozen-d0 baseline ≈ {d0FrozenBaseline}).");
     }
 
     /// <summary>
