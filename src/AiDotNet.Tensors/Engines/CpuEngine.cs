@@ -30029,24 +30029,49 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "ReduceMax", input, outShape,
                     (eng, output) =>
                     {
-                        // Call ReduceMax on captured 'this' after GraphMode check has already
-                        // been handled — the lazy node's execute runs outside scope.Current.
-                        // Use the eager path by materializing input first.
+                        // Axis-aware max that fills EVERY output element. The previous
+                        // implementation computed a single GLOBAL max over the whole
+                        // input and wrote it to output[0] only — correct solely when
+                        // the output is scalar. For a real axis reduction (e.g. softmax
+                        // over the class dim: [B,C,H,W] -> [B,1,H,W]) the output has many
+                        // elements, so writing just [0] left the rest of the rented,
+                        // UNINITIALIZED output buffer as whatever the pool last held. On a
+                        // fresh (zero-init) buffer that only produced wrong values; on a
+                        // pool buffer carrying a prior op's NaN/Inf tail it leaked straight
+                        // into softmax -> loss/grad NaN (net-core SIMD pools; net471's
+                        // zero-init masked it). Mirror the eager odometer below so the
+                        // recorded/compiled path matches the eager result exactly.
                         var materializedInput = capturedInput.IsContiguous ? capturedInput : capturedInput.Contiguous();
                         var numOps = MathHelper.GetNumericOperations<T>();
                         var inputData = materializedInput.GetFlattenedData();
-                        T maxVal = inputData[0];
-                        int maxIdx = 0;
-                        for (int k = 1; k < inputData.Length; k++)
+                        var inShape = materializedInput._shape;
+                        var normAxes = ValidateAndNormalizeAxes(capturedEffectiveAxes, inShape.Length);
+                        var outShapeLocal = output._shape;
+                        int outSize = output.Length;
+                        var outSpan = output.Data.Span;
+                        var idxArr = new int[outSize];
+                        T minVal = numOps.MinValue;
+                        for (int i = 0; i < outSize; i++) { outSpan[i] = minVal; idxArr[i] = -1; }
+                        int rank = inShape.Length;
+                        var outStrideForDim = BuildReducedOutStrideForDim(inShape, outShapeLocal, normAxes);
+                        var coord = new int[rank];
+                        int outFlat = 0;
+                        int lenIn = materializedInput.Length;
+                        for (int i = 0; i < lenIn; i++)
                         {
-                            if (numOps.ToDouble(inputData[k]) > numOps.ToDouble(maxVal))
+                            if (numOps.GreaterThan(inputData[i], outSpan[outFlat]))
                             {
-                                maxVal = inputData[k];
-                                maxIdx = k;
+                                outSpan[outFlat] = inputData[i];
+                                idxArr[outFlat] = i;
+                            }
+                            for (int d = rank - 1; d >= 0; d--)
+                            {
+                                coord[d]++; outFlat += outStrideForDim[d];
+                                if (coord[d] < inShape[d]) break;
+                                coord[d] = 0; outFlat -= outStrideForDim[d] * inShape[d];
                             }
                         }
-                        output.GetDataArray()[0] = maxVal;
-                        savedStateArr[0] = new[] { maxIdx };
+                        savedStateArr[0] = idxArr;
                     },
                     BackwardFunctions<T>.ReduceMaxBackward,
                     savedStateArr);
