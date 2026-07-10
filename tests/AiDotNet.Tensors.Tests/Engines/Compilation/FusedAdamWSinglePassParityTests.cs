@@ -256,6 +256,149 @@ public class FusedAdamWSinglePassParityTests
         }
     }
 
+    // ---- Phase 2 contiguous flat-buffer path -------------------------------------------
+
+    // The flat-moment MULTI kernel (fallback for the some-tensors-skipped case) must be
+    // BIT-IDENTICAL to the jagged multi kernel: same per-tensor loop, moments merely relocated
+    // from per-tensor arrays into one flat buffer at offsets[t]. Any drift here would corrupt
+    // training on steps where a lazy-init layer has no gradient yet.
+    [Fact]
+    public unsafe void FlatMomentMulti_BitIdenticalToJaggedMulti_Double()
+    {
+        const double lr = 5e-4, b1 = 0.9, b2 = 0.999, eps = 1e-8, wd = 1e-2;
+        int[] lens = { 1, 3, 4, 7, 8, 15, 16, 100, 4096, 0, 5 };
+        int count = lens.Length;
+        int total = 0; var offsets = new int[count];
+        for (int t = 0; t < count; t++) { offsets[t] = total; total += lens[t]; }
+
+        for (int step = 1; step <= 3; step++)
+        {
+            double bc1 = 1.0 - Math.Pow(b1, step), bc2 = 1.0 - Math.Pow(b2, step);
+            foreach (bool isAdamW in new[] { false, true })
+            {
+                var rng = new Random(123 + step + (isAdamW ? 7 : 0));
+                double[][] P = new double[count][], G = new double[count][], Mj = new double[count][], Vj = new double[count][];
+                double[][] Pf = new double[count][];
+                var mFlat = new double[total]; var vFlat = new double[total];
+                for (int t = 0; t < count; t++)
+                {
+                    int L = lens[t];
+                    P[t] = new double[L]; G[t] = new double[L]; Mj[t] = new double[L]; Vj[t] = new double[L]; Pf[t] = new double[L];
+                    for (int i = 0; i < L; i++)
+                    {
+                        double pv = rng.NextDouble() * 2 - 1, gv = (rng.NextDouble() * 2 - 1) * 0.1;
+                        double mv = (rng.NextDouble() * 2 - 1) * 0.05, vv = rng.NextDouble() * 0.01;
+                        P[t][i] = pv; Pf[t][i] = pv; G[t][i] = gv;
+                        Mj[t][i] = mv; Vj[t][i] = vv; mFlat[offsets[t] + i] = mv; vFlat[offsets[t] + i] = vv;
+                    }
+                }
+                // jagged reference
+                if (isAdamW) FusedOptimizer.AdamWUpdateSimdMulti(P, G, Mj, Vj, lens, count, lr, b1, b2, eps, wd, bc1, bc2);
+                else FusedOptimizer.AdamUpdateSimdMulti(P, G, Mj, Vj, lens, count, lr, b1, b2, eps, bc1, bc2);
+                // flat-moment
+                if (isAdamW) FusedOptimizer.AdamWUpdateSimdMultiFlatMoments(Pf, G, mFlat, vFlat, lens, offsets, count, lr, b1, b2, eps, wd, bc1, bc2);
+                else FusedOptimizer.AdamUpdateSimdMultiFlatMoments(Pf, G, mFlat, vFlat, lens, offsets, count, lr, b1, b2, eps, bc1, bc2);
+
+                for (int t = 0; t < count; t++) for (int i = 0; i < lens[t]; i++)
+                {
+                    Assert.Equal(BitConverter.DoubleToInt64Bits(P[t][i]), BitConverter.DoubleToInt64Bits(Pf[t][i]));
+                    Assert.Equal(BitConverter.DoubleToInt64Bits(Mj[t][i]), BitConverter.DoubleToInt64Bits(mFlat[offsets[t] + i]));
+                    Assert.Equal(BitConverter.DoubleToInt64Bits(Vj[t][i]), BitConverter.DoubleToInt64Bits(vFlat[offsets[t] + i]));
+                }
+            }
+        }
+    }
+
+    // The contiguous single-pass kernel matches the per-tensor kernels to within a tiny
+    // tolerance — it is NOT bit-identical by design: tensor-tail elements get an FMA (one
+    // rounding) instead of separate multiply+add (two roundings). Bound the drift tightly so a
+    // real bug (wrong offset, skipped element, stale staging) can't hide behind the tolerance.
+    [Fact]
+    public unsafe void Contiguous_MatchesPerTensor_WithinFmaTail_Double()
+    {
+        const double lr = 5e-4, b1 = 0.9, b2 = 0.999, eps = 1e-8, wd = 1e-2;
+        int[] lens = { 7, 16, 3, 100, 33, 8, 1, 4095 };   // deliberate non-multiple-of-4 tails
+        int count = lens.Length;
+        int total = 0; var offsets = new int[count];
+        for (int t = 0; t < count; t++) { offsets[t] = total; total += lens[t]; }
+
+        for (int step = 1; step <= 5; step++)   // let any drift compound across steps
+        {
+            double bc1 = 1.0 - Math.Pow(b1, step), bc2 = 1.0 - Math.Pow(b2, step);
+            foreach (bool isAdamW in new[] { false, true })
+            {
+                var rng = new Random(321 + step + (isAdamW ? 11 : 0));
+                double[][] Pref = new double[count][], Pcon = new double[count][], G = new double[count][];
+                var mRef = new double[total]; var vRef = new double[total];
+                var mCon = new double[total]; var vCon = new double[total];
+                var pFlat = new double[total]; var gFlat = new double[total];
+                for (int t = 0; t < count; t++)
+                {
+                    int L = lens[t];
+                    Pref[t] = new double[L]; Pcon[t] = new double[L]; G[t] = new double[L];
+                    for (int i = 0; i < L; i++)
+                    {
+                        double pv = rng.NextDouble() * 2 - 1, gv = (rng.NextDouble() * 2 - 1) * 0.1;
+                        double mv = (rng.NextDouble() * 2 - 1) * 0.05, vv = rng.NextDouble() * 0.01;
+                        Pref[t][i] = pv; Pcon[t][i] = pv; G[t][i] = gv;
+                        mRef[offsets[t] + i] = mv; vRef[offsets[t] + i] = vv;
+                        mCon[offsets[t] + i] = mv; vCon[offsets[t] + i] = vv;
+                    }
+                }
+                // reference: flat-moment multi (per-tensor tails = scalar)
+                if (isAdamW) FusedOptimizer.AdamWUpdateSimdMultiFlatMoments(Pref, G, mRef, vRef, lens, offsets, count, lr, b1, b2, eps, wd, bc1, bc2);
+                else FusedOptimizer.AdamUpdateSimdMultiFlatMoments(Pref, G, mRef, vRef, lens, offsets, count, lr, b1, b2, eps, bc1, bc2);
+                // contiguous single pass (uniform FMA)
+                if (isAdamW) FusedOptimizer.AdamWUpdateSimdContiguous(Pcon, G, lens, offsets, count, pFlat, gFlat, mCon, vCon, total, lr, b1, b2, eps, wd, bc1, bc2);
+                else FusedOptimizer.AdamUpdateSimdContiguous(Pcon, G, lens, offsets, count, pFlat, gFlat, mCon, vCon, total, lr, b1, b2, eps, bc1, bc2);
+
+                for (int t = 0; t < count; t++) for (int i = 0; i < lens[t]; i++)
+                {
+                    Assert.Equal(Pref[t][i], Pcon[t][i], 12);
+                    Assert.Equal(mRef[offsets[t] + i], mCon[offsets[t] + i], 12);
+                    Assert.Equal(vRef[offsets[t] + i], vCon[offsets[t] + i], 12);
+                }
+            }
+        }
+    }
+
+    // A tensor with an empty gradient (inactive / lazy-init layer) must have its flat moment
+    // slot left completely untouched by the flat-moment multi kernel — the guard the contiguous
+    // path relies on to fall back safely.
+    [Fact]
+    public unsafe void FlatMomentMulti_SkipsInactiveTensor_LeavesItsMomentsUntouched_Double()
+    {
+        const double lr = 1e-3, b1 = 0.9, b2 = 0.999, eps = 1e-8, wd = 1e-2;
+        int[] lens = { 8, 8, 8 };
+        int count = 3, total = 24;
+        var offsets = new[] { 0, 8, 16 };
+        var P = new double[count][]; var G = new double[count][];
+        var mFlat = new double[total]; var vFlat = new double[total];
+        var rng = new Random(99);
+        for (int t = 0; t < count; t++)
+        {
+            P[t] = new double[8];
+            // Middle tensor is INACTIVE: empty gradient array.
+            G[t] = t == 1 ? Array.Empty<double>() : new double[8];
+            for (int i = 0; i < 8; i++)
+            {
+                P[t][i] = rng.NextDouble();
+                if (G[t].Length == 8) G[t][i] = rng.NextDouble() * 0.1;
+                mFlat[offsets[t] + i] = 0.5; vFlat[offsets[t] + i] = 0.25;
+            }
+        }
+        FusedOptimizer.AdamWUpdateSimdMultiFlatMoments(P, G, mFlat, vFlat, lens, offsets, count, lr, b1, b2, eps, wd, 1.0 - b1, 1.0 - b2);
+        // Inactive tensor's moments are exactly their initial values (bit-exact).
+        for (int i = 0; i < 8; i++)
+        {
+            Assert.Equal(BitConverter.DoubleToInt64Bits(0.5), BitConverter.DoubleToInt64Bits(mFlat[8 + i]));
+            Assert.Equal(BitConverter.DoubleToInt64Bits(0.25), BitConverter.DoubleToInt64Bits(vFlat[8 + i]));
+        }
+        // Active tensors' moments DID move.
+        Assert.NotEqual(0.5, mFlat[0]);
+        Assert.NotEqual(0.5, mFlat[16]);
+    }
+
     private static (double[] p, double[] g, double[] m, double[] v) MakeDouble(int len, int seed)
     {
         var rng = new Random(seed);

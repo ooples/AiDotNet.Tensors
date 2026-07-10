@@ -603,6 +603,140 @@ internal static class FusedOptimizer
         }
     }
 
+    // ---- Contiguous single-buffer (PyTorch fused=True-style) path (double) --------------
+    // The multi-tensor foreach kernels above run the SIMD body once PER TENSOR, so a deep model
+    // with many small parameter tensors pays one scalar remainder tail (up to 3 elements for a
+    // 4-wide double vector) plus a loop preamble per tensor. The contiguous path packs every
+    // parameter's param+grad into ONE flat staging buffer, runs the SIMD update over the whole
+    // model in a SINGLE pass (ONE scalar tail total), then scatters the updated weights back.
+    // Moments (m,v) are flat and RESIDENT — only param+grad are re-gathered each step (the
+    // caller owns those jagged backings).
+    //
+    // MEASURED, NOT SHIPPED AS THE CPU DEFAULT: benchmarking (FusedOptimizerPathBenchmark)
+    // across few-large, many-small, and many-tiny-non-aligned shapes shows this is ~2x SLOWER
+    // than the jagged multi kernel on CPU — the 3xN gather/scatter memory traffic dwarfs the
+    // tail savings. PyTorch's fused=True win is GPU kernel-LAUNCH amortization, which a
+    // direct-call CPU foreach does not have. These kernels are retained as (a) the tested,
+    // bit-comparable CPU reference/oracle for the GPU multi_tensor_apply path, and (b) a ready
+    // implementation should a future ISA (e.g. wide AVX-512 with cheap gather) flip the tradeoff.
+    // Production CPU Adam/AdamW stays on AdamUpdateSimdMulti / AdamWUpdateSimdMulti.
+    //
+    // NOT bit-identical to the per-tensor kernels, by design: an element that sits in a
+    // tensor's scalar remainder tail in the per-tensor kernels (separate multiply + add = two
+    // roundings) instead lands inside a SIMD lane in the single contiguous pass and gets an
+    // FMA (fused multiply-add = one rounding). That is a ≤1-ULP difference and is, if anything,
+    // MORE accurate — the exact tradeoff PyTorch's fused=True optimizer makes by applying FMA
+    // uniformly. Everywhere else (the SIMD body, and Adam being elementwise across the packed
+    // boundaries) the result matches the per-tensor kernels exactly.
+
+    /// <summary>Multi-tensor AdamW (double) with FLAT resident moments: same per-tensor loop
+    /// as <see cref="AdamWUpdateSimdMulti"/> (so skipped/inactive tensors leave their moment
+    /// slots untouched — bit-identical), but m/v are read from the single flat buffers at
+    /// <paramref name="offsets"/>[t] instead of per-tensor arrays. This is the correctness
+    /// fallback for the contiguous path when NOT every tensor is active this step: a single
+    /// pass over the whole flat range would decay the moments of grad-absent tensors, which
+    /// the per-tensor loop must not do.</summary>
+    internal static unsafe void AdamWUpdateSimdMultiFlatMoments(
+        double[][] paramArrays, double[][] gradArrays, double[] mFlat, double[] vFlat,
+        int[] lengths, int[] offsets, int count,
+        double lr, double beta1, double beta2, double eps, double weightDecay, double bc1, double bc2)
+    {
+        fixed (double* mBase = mFlat, vBase = vFlat)
+        {
+            for (int t = 0; t < count; t++)
+            {
+                int length = lengths[t];
+                if (length == 0) continue;
+                var pa = paramArrays[t]; var ga = gradArrays[t];
+                if (pa.Length == 0 || ga.Length == 0) continue;
+                fixed (double* param = pa, grad = ga)
+                    AdamWUpdateSimd(param, grad, mBase + offsets[t], vBase + offsets[t], length,
+                        lr, beta1, beta2, eps, weightDecay, bc1, bc2);
+            }
+        }
+    }
+
+    /// <summary>Multi-tensor Adam (double, no weight decay) with FLAT resident moments.
+    /// Fallback for the contiguous Adam path when some tensors are inactive. Bit-identical
+    /// to <see cref="AdamUpdateSimdMulti"/>.</summary>
+    internal static unsafe void AdamUpdateSimdMultiFlatMoments(
+        double[][] paramArrays, double[][] gradArrays, double[] mFlat, double[] vFlat,
+        int[] lengths, int[] offsets, int count,
+        double lr, double beta1, double beta2, double eps, double bc1, double bc2)
+    {
+        fixed (double* mBase = mFlat, vBase = vFlat)
+        {
+            for (int t = 0; t < count; t++)
+            {
+                int length = lengths[t];
+                if (length == 0) continue;
+                var pa = paramArrays[t]; var ga = gradArrays[t];
+                if (pa.Length == 0 || ga.Length == 0) continue;
+                fixed (double* param = pa, grad = ga)
+                    AdamUpdateSimd(param, grad, mBase + offsets[t], vBase + offsets[t], length,
+                        lr, beta1, beta2, eps, bc1, bc2);
+            }
+        }
+    }
+
+    /// <summary>Contiguous fused AdamW (double): gather jagged param+grad into the flat
+    /// staging buffers, run ONE SIMD pass over <paramref name="totalLen"/>, scatter param back.
+    /// <paramref name="mFlat"/>/<paramref name="vFlat"/> are the resident flat moments (length
+    /// <paramref name="totalLen"/>); <paramref name="offsets"/>[t] is tensor t's start in the
+    /// flat layout. Matches <see cref="AdamWUpdateSimdMulti"/> to ≤1 ULP (uniform FMA on the
+    /// tails; see the section comment above).</summary>
+    internal static unsafe void AdamWUpdateSimdContiguous(
+        double[][] paramArrays, double[][] gradArrays, int[] lengths, int[] offsets, int count,
+        double[] paramFlat, double[] gradFlat, double[] mFlat, double[] vFlat, int totalLen,
+        double lr, double beta1, double beta2, double eps, double weightDecay, double bc1, double bc2)
+    {
+        GatherParamGrad(paramArrays, gradArrays, lengths, offsets, count, paramFlat, gradFlat);
+        fixed (double* p = paramFlat, g = gradFlat, m = mFlat, v = vFlat)
+            AdamWUpdateSimd(p, g, m, v, totalLen, lr, beta1, beta2, eps, weightDecay, bc1, bc2);
+        ScatterParam(paramArrays, lengths, offsets, count, paramFlat);
+    }
+
+    /// <summary>Contiguous fused Adam (double, no weight decay). Matches
+    /// <see cref="AdamUpdateSimdMulti"/> to ≤1 ULP (uniform FMA on the tails).</summary>
+    internal static unsafe void AdamUpdateSimdContiguous(
+        double[][] paramArrays, double[][] gradArrays, int[] lengths, int[] offsets, int count,
+        double[] paramFlat, double[] gradFlat, double[] mFlat, double[] vFlat, int totalLen,
+        double lr, double beta1, double beta2, double eps, double bc1, double bc2)
+    {
+        GatherParamGrad(paramArrays, gradArrays, lengths, offsets, count, paramFlat, gradFlat);
+        fixed (double* p = paramFlat, g = gradFlat, m = mFlat, v = vFlat)
+            AdamUpdateSimd(p, g, m, v, totalLen, lr, beta1, beta2, eps, bc1, bc2);
+        ScatterParam(paramArrays, lengths, offsets, count, paramFlat);
+    }
+
+    private static void GatherParamGrad(
+        double[][] paramArrays, double[][] gradArrays, int[] lengths, int[] offsets, int count,
+        double[] paramFlat, double[] gradFlat)
+    {
+        for (int t = 0; t < count; t++)
+        {
+            int len = lengths[t];
+            if (len == 0) continue;
+            var pa = paramArrays[t]; var ga = gradArrays[t];
+            if (pa.Length == 0 || ga.Length == 0) continue;
+            Array.Copy(pa, 0, paramFlat, offsets[t], len);
+            Array.Copy(ga, 0, gradFlat, offsets[t], len);
+        }
+    }
+
+    private static void ScatterParam(
+        double[][] paramArrays, int[] lengths, int[] offsets, int count, double[] paramFlat)
+    {
+        for (int t = 0; t < count; t++)
+        {
+            int len = lengths[t];
+            if (len == 0) continue;
+            var pa = paramArrays[t];
+            if (pa.Length == 0) continue;
+            Array.Copy(paramFlat, offsets[t], pa, 0, len);
+        }
+    }
+
     /// <summary>AVX2 AdamW: Adam with decoupled weight decay</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static unsafe void AdamWUpdateSimd(
