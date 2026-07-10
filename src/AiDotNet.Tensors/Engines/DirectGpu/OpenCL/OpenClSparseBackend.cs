@@ -131,7 +131,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 yBuf = backend.AllocateBuffer(y);
                 outBuf = backend.AllocateBuffer(output);
 
-                backend.CsrSddmm(rowBuf, colBuf, xBuf, yBuf, outBuf, nnz, innerK);
+                // Adaptive dispatch (beyond-industry-standard): for large innerK, use the
+                // workgroup-per-nnz collaborative kernel where 256 work-items share the reduction
+                // via local memory. Reduces per-nnz latency from O(innerK) to O(log₂ 256) +
+                // O(innerK/256). Threshold matches the Vulkan/Metal tiers.
+                const int CollabInnerKThreshold = 64;
+                if (innerK >= CollabInnerKThreshold)
+                    backend.CsrSddmmCollab(rowBuf, colBuf, xBuf, yBuf, outBuf, nnz, innerK);
+                else
+                    backend.CsrSddmm(rowBuf, colBuf, xBuf, yBuf, outBuf, nnz, innerK);
 
                 DownloadExact(backend, outBuf, output);
                 return output;

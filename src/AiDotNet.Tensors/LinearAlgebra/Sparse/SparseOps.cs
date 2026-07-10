@@ -5,6 +5,7 @@ using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.HIP;
 using AiDotNet.Tensors.Engines.DirectGpu.Metal;
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
+using AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 using AiDotNet.Tensors.Engines.Simd.Sparse;
 using AiDotNet.Tensors.Helpers;
 
@@ -89,10 +90,20 @@ public static class SparseOps
                     outArr = HipSparseBackend.SpMM(rowPtr, colIdx, valsArr, bArr, rows, k, n);
                 else if (MpsSparseBackend.IsAvailable)
                     outArr = MpsSparseBackend.SpMM(rowPtr, colIdx, valsArr, bArr, rows, k, n);
-                // OpenCL (AMD/Intel GPUs) via the managed csr_spmm kernel — the last GPU tier so
-                // vendor libraries win when present. float-only (the OpenCL csr_spmm kernel is fp32).
+                // Metal-native compute (MSL sparse_csr_spmm) — Apple hosts where MPS sparse
+                // isn't wired. Runs the AiDotNet-owned MSL kernel through the same pipeline
+                // path as every other Metal op, no vendor library needed.
+                else if (MetalSparseBackend.IsAvailable)
+                    outArr = MetalSparseBackend.SpMM(rowPtr, colIdx, valsArr, bArr, rows, k, n);
+                // OpenCL (AMD/Intel GPUs) via the managed csr_spmm kernel — vendor libraries
+                // win when present. float-only (the OpenCL csr_spmm kernel is fp32).
                 else if (OpenClSparseBackend.IsAvailable)
                     outArr = OpenClSparseBackend.SpMM(rowPtr, colIdx, valsArr, bArr, rows, k, n);
+                // Vulkan compute (mobile / cross-vendor / MoltenVK-on-Apple) — last GPU tier
+                // since it's the portable-everywhere fallback for devices without a vendor sparse
+                // library. Uses the managed csr_spmm GLSL kernel via VulkanSparseBackend.
+                else if (VulkanSparseBackend.IsAvailable)
+                    outArr = VulkanSparseBackend.SpMM(rowPtr, colIdx, valsArr, bArr, rows, k, n);
             }
 
             // Tier 1 — CPU SIMD on hardware-accelerated Vector<T>.
@@ -469,8 +480,14 @@ public static class SparseOps
                 gpu = HipCustomSparseBackend.SDDMM(rowIndices, colIndices, xf, yf, innerK);
             else if (MpsSparseBackend.IsAvailable)
                 gpu = MpsSparseBackend.SDDMM(rowIndices, colIndices, xf, yf, innerK);
+            // Metal-native compute (MSL sparse_sddmm) — Apple hosts where MPS isn't wired.
+            else if (MetalSparseBackend.IsAvailable)
+                gpu = MetalSparseBackend.SDDMM(rowIndices, colIndices, xf, yf, innerK);
             else if (OpenClSparseBackend.IsAvailable)
                 gpu = OpenClSparseBackend.SDDMM(rowIndices, colIndices, xf, yf, innerK);
+            // Vulkan compute (mobile / cross-vendor / MoltenVK) — portable fallback tier.
+            else if (VulkanSparseBackend.IsAvailable)
+                gpu = VulkanSparseBackend.SDDMM(rowIndices, colIndices, xf, yf, innerK);
             if (gpu is not null) return (T[])(object)gpu;
         }
 

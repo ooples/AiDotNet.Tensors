@@ -3826,6 +3826,48 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             kernel.Execute1D(nnz, Math.Min(256, nnz));
         }
 
+        /// <summary>
+        /// Collaborative SDDMM — one WORKGROUP (256 work-items) per pattern non-zero, threads share
+        /// the innerK reduction via local memory tree reduce. Beats the base <see cref="CsrSddmm"/>
+        /// when innerK is large enough that a single work-item's serial reduction becomes the
+        /// bottleneck (empirically innerK ≥ 64). Callers pick between this and the base variant
+        /// via the <c>SparseOps</c> adaptive-dispatch tier list; this method is the raw kernel launch.
+        /// </summary>
+        public void CsrSddmmCollab(
+            IGpuBuffer rowIndices,
+            IGpuBuffer colIndices,
+            IGpuBuffer x,
+            IGpuBuffer y,
+            IGpuBuffer output,
+            int nnz, int innerK)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context not available");
+            if (nnz == 0) return;
+
+            const int WorkgroupSize = 256;
+            var kernel = _kernelCache["sddmm_collab"];
+            kernel.SetArg(0, ((DirectOpenClGpuBuffer)rowIndices).Buffer.Handle);
+            kernel.SetArg(1, ((DirectOpenClGpuBuffer)colIndices).Buffer.Handle);
+            kernel.SetArg(2, ((DirectOpenClGpuBuffer)x).Buffer.Handle);
+            kernel.SetArg(3, ((DirectOpenClGpuBuffer)y).Buffer.Handle);
+            kernel.SetArg(4, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            kernel.SetArg(5, nnz);
+            kernel.SetArg(6, innerK);
+            // __local float partial[256] — 1024 bytes at arg index 7.
+            kernel.SetLocalArg(7, WorkgroupSize * sizeof(float));
+
+            // Global work size must be a multiple of local work size. nnz * 256 = one workgroup
+            // per non-zero. If nnz is very large the multiplication could exceed int.MaxValue,
+            // but the SparseOps GpuDispatchThreshold gates on nnz * innerK so we never see
+            // pathological nnz counts routing here.
+            long globalSize = (long)nnz * WorkgroupSize;
+            if (globalSize > int.MaxValue)
+                throw new InvalidOperationException(
+                    $"Collaborative SDDMM dispatch overflow (nnz*256 = {globalSize}); route to base kernel.");
+            kernel.Execute1D((int)globalSize, WorkgroupSize);
+        }
+
         /// <inheritdoc/>
         public void CsrSpMMBias(
             IGpuBuffer csrValues,

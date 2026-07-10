@@ -309,6 +309,51 @@ __kernel void sddmm(
 
     output[p] = sum;
 }
+
+// Collaborative SDDMM: one WORKGROUP per pattern non-zero, 256 work-items share the innerK
+// reduction via local memory tree reduce. Beats sddmm when innerK is large enough that a
+// single work-item's serial reduction becomes the bottleneck (empirically innerK >= 64).
+// One threadgroup per non-zero. Portable across OpenCL 1.2+ (uses barrier() + local memory,
+// no cl_khr_subgroups extension required). Matches the Vulkan/Metal collaborative variants.
+__kernel void sddmm_collab(
+    __global const int* restrict rowIndices,
+    __global const int* restrict colIndices,
+    __global const float* restrict x,
+    __global const float* restrict y,
+    __global float* restrict output,
+    int nnz, int innerK,
+    __local float* partial)
+{
+    int p = get_group_id(0);
+    int tid = get_local_id(0);
+
+    // All 256 work-items must reach the barriers below. Compute partial for real-work
+    // case, zero for the workgroup-count-rounding tail.
+    float sum = 0.0f;
+    if (p < nnz) {
+        int xoff = rowIndices[p] * innerK;
+        int yoff = colIndices[p] * innerK;
+        for (int k = tid; k < innerK; k += 256) {
+            sum += x[xoff + k] * y[yoff + k];
+        }
+    }
+    partial[tid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Local-memory tree reduction: 256 -> 128 -> 64 -> ... -> 1.
+    if (tid < 128) partial[tid] += partial[tid + 128]; barrier(CLK_LOCAL_MEM_FENCE);
+    if (tid <  64) partial[tid] += partial[tid +  64]; barrier(CLK_LOCAL_MEM_FENCE);
+    if (tid <  32) partial[tid] += partial[tid +  32]; barrier(CLK_LOCAL_MEM_FENCE);
+    if (tid <  16) partial[tid] += partial[tid +  16]; barrier(CLK_LOCAL_MEM_FENCE);
+    if (tid <   8) partial[tid] += partial[tid +   8]; barrier(CLK_LOCAL_MEM_FENCE);
+    if (tid <   4) partial[tid] += partial[tid +   4]; barrier(CLK_LOCAL_MEM_FENCE);
+    if (tid <   2) partial[tid] += partial[tid +   2]; barrier(CLK_LOCAL_MEM_FENCE);
+    if (tid <   1) partial[tid] += partial[tid +   1];
+
+    if (tid == 0 && p < nnz) {
+        output[p] = partial[0];
+    }
+}
 ";
     }
 
@@ -318,6 +363,7 @@ __kernel void sddmm(
         [
             "csr_spmm",
             "sddmm",
+            "sddmm_collab",
             "csr_spmm_bias",
             "csr_spmm_bias_relu",
             "scatter_add_edges",
