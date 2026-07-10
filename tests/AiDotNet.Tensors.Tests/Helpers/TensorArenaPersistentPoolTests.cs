@@ -162,6 +162,33 @@ public class TensorArenaPersistentPoolTests
     }
 
     /// <summary>
+    /// The RentPersistentZeroed / ReturnPersistentBuffer API (used for long-lived
+    /// fused-optimizer Adam m/v moment state that must outlive the transient
+    /// per-step arena) hands back a ZEROED buffer, pools it across return/rent, and
+    /// re-zeroes stale data on reuse. This is the transparent replacement for the
+    /// per-reconfigure `new double[len]` that PerfView flagged in
+    /// ConfigureOptimizerDouble (~2 GB churn on the VALL-E-X-clone warmup).
+    /// </summary>
+    [Fact]
+    public void RentPersistentZeroed_ZeroesPoolsAndRezeroesOnReuse()
+    {
+        TensorArena.ClearPersistentPool();
+        int len = 128 * 1024; // above PersistThresholdElems
+
+        var a = TensorArena.RentPersistentZeroed<double>(len);
+        Assert.Equal(len, a.Length);
+        for (int i = 0; i < len; i++) Assert.Equal(0.0, a[i]); // rented zeroed
+        a[0] = 42.0; a[len - 1] = 7.0;                          // dirty it
+        TensorArena.ReturnPersistentBuffer(a);
+        Assert.Equal(0, TensorArena.PersistentReuseHits);
+
+        var b = TensorArena.RentPersistentZeroed<double>(len);
+        Assert.Equal(1, TensorArena.PersistentReuseHits);       // reused, not re-allocated
+        Assert.Same(a, b);                                      // same backing array
+        for (int i = 0; i < len; i++) Assert.Equal(0.0, b[i]);  // stale 42/7 re-zeroed
+    }
+
+    /// <summary>
     /// Small buffers (below the persist threshold) are intentionally NOT pooled
     /// across lifetimes — they GC cheaply and pooling them would bloat the
     /// dictionary. This guards the threshold so the pool stays focused on the

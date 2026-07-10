@@ -218,6 +218,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
+        ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
 
         if (_residentGradBuffers is not null)
@@ -785,6 +786,29 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // the Adam-family m/v state owned by the fused optimizer closure.
     private FusedMomentStorageMode _momentStorageMode = FusedMomentStorageMode.Float32;
     private int _int8MomentBlockSize = 2048;
+
+    // Return a prior configuration's fp32 Adam m/v/vMax buffers to the cross-arena
+    // persistent pool so the NEXT ConfigureOptimizer* re-rents them instead of
+    // allocating fresh. ConfigureOptimizer runs every time the compiled plan is
+    // invalidated (lazy layer init during warmup), and each run previously did
+    // `new double[len]` for every moment — the ~2 GB/step Double[] churn PerfView
+    // attributed to ConfigureOptimizerDouble on the VALL-E-X-clone. The moments are
+    // long-lived (they must survive the transient per-step arena), so they use the
+    // PERSISTENT tier, not the transient ring. Reduced-precision (bf16/int8) and GPU
+    // moment buffers are left as-is — they have their own lifecycles.
+    private static void ReturnPooledMoments(FusedOptimizerRuntimeState? old)
+    {
+        if (old is null) return;
+        ReturnMomentJagged(old.MDouble); ReturnMomentJagged(old.VDouble); ReturnMomentJagged(old.VMaxDouble);
+        ReturnMomentJagged(old.MFloat); ReturnMomentJagged(old.VFloat); ReturnMomentJagged(old.VMaxFloat);
+    }
+
+    private static void ReturnMomentJagged<TElem>(TElem[][]? bufs)
+    {
+        if (bufs is null) return;
+        for (int i = 0; i < bufs.Length; i++)
+            if (bufs[i] is { Length: > 0 } b) TensorArena.ReturnPersistentBuffer(b);
+    }
 
     /// <summary>
     /// Requests bfloat16 storage for the Adam/AdamW moment state on the float
@@ -1836,6 +1860,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
+        ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
         // A captured step graph holds kernel nodes wired to the OLD optimizer state
         // buffers + update; those are about to be freed/replaced, so drop it (replay
@@ -2090,8 +2115,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             }
             else
             {
-                m[p] = needsMomentum ? new float[lengths[p]] : Array.Empty<float>();
-                v[p] = needsSecondMoment ? new float[lengths[p]] : Array.Empty<float>();
+                m[p] = needsMomentum ? TensorArena.RentPersistentZeroed<float>(lengths[p]) : Array.Empty<float>();
+                v[p] = needsSecondMoment ? TensorArena.RentPersistentZeroed<float>(lengths[p]) : Array.Empty<float>();
                 mB[p] = Array.Empty<ushort>();
                 vB[p] = Array.Empty<ushort>();
                 mQuant[p] = Array.Empty<byte>();
@@ -2099,7 +2124,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 mScales[p] = Array.Empty<double>();
                 vScales[p] = Array.Empty<double>();
             }
-            vMax[p] = optimizerType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL ? new float[lengths[p]] : Array.Empty<float>();
+            vMax[p] = optimizerType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL ? TensorArena.RentPersistentZeroed<float>(lengths[p]) : Array.Empty<float>();
         }
 
         _optimizerStep = 0;
@@ -2668,6 +2693,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
+        ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
         // Drop any captured step graph wired to the old optimizer state (see
         // ConfigureOptimizerFloat — replay would target freed/stale buffers).
@@ -2874,8 +2900,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             }
             else
             {
-                m[p] = needsMomentum ? new float[lengths[p]] : Array.Empty<float>();
-                v[p] = needsSecondMoment ? new float[lengths[p]] : Array.Empty<float>();
+                m[p] = needsMomentum ? TensorArena.RentPersistentZeroed<float>(lengths[p]) : Array.Empty<float>();
+                v[p] = needsSecondMoment ? TensorArena.RentPersistentZeroed<float>(lengths[p]) : Array.Empty<float>();
                 mB[p] = Array.Empty<ushort>();
                 vB[p] = Array.Empty<ushort>();
                 mQuant[p] = Array.Empty<byte>();
@@ -2883,7 +2909,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 mScales[p] = Array.Empty<double>();
                 vScales[p] = Array.Empty<double>();
             }
-            vMax[p] = optimizerType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL ? new float[lengths[p]] : Array.Empty<float>();
+            vMax[p] = optimizerType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL ? TensorArena.RentPersistentZeroed<float>(lengths[p]) : Array.Empty<float>();
         }
 
         _optimizerStep = 0;
@@ -3218,6 +3244,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
+        ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
         _preForwardParamTransform = null;
         InvalidateCapturedStepGraph();
@@ -3281,9 +3308,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 or OptimizerType.RAdam or OptimizerType.LAMB or OptimizerType.AdaMax
                 or OptimizerType.AdaDelta or OptimizerType.FTRL or OptimizerType.Rprop;
 
-            m[p] = needsMomentum ? new double[lengths[p]] : Array.Empty<double>();
-            v[p] = needsSecondMoment ? new double[lengths[p]] : Array.Empty<double>();
-            vMax[p] = optimizerType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL ? new double[lengths[p]] : Array.Empty<double>();
+            m[p] = needsMomentum ? TensorArena.RentPersistentZeroed<double>(lengths[p]) : Array.Empty<double>();
+            v[p] = needsSecondMoment ? TensorArena.RentPersistentZeroed<double>(lengths[p]) : Array.Empty<double>();
+            vMax[p] = optimizerType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL ? TensorArena.RentPersistentZeroed<double>(lengths[p]) : Array.Empty<double>();
         }
 
         _optimizerStep = 0;
@@ -3368,6 +3395,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
+        ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
         _preForwardParamTransform = null;
         InvalidateCapturedStepGraph();
@@ -3425,9 +3453,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 or OptimizerType.RAdam or OptimizerType.LAMB or OptimizerType.AdaMax
                 or OptimizerType.AdaDelta or OptimizerType.FTRL or OptimizerType.Rprop;
 
-            m[p] = needsMomentum ? new double[lengths[p]] : Array.Empty<double>();
-            v[p] = needsSecondMoment ? new double[lengths[p]] : Array.Empty<double>();
-            vMax[p] = optimizerType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL ? new double[lengths[p]] : Array.Empty<double>();
+            m[p] = needsMomentum ? TensorArena.RentPersistentZeroed<double>(lengths[p]) : Array.Empty<double>();
+            v[p] = needsSecondMoment ? TensorArena.RentPersistentZeroed<double>(lengths[p]) : Array.Empty<double>();
+            vMax[p] = optimizerType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL ? TensorArena.RentPersistentZeroed<double>(lengths[p]) : Array.Empty<double>();
         }
 
         _optimizerStep = 0;

@@ -166,6 +166,41 @@ public sealed class TensorArena : IDisposable
         // else: at cap — drop the reference, let GC reclaim (don't hoard).
     }
 
+    /// <summary>
+    /// Rents a ZEROED backing array from the cross-arena persistent pool, or
+    /// allocates a fresh zeroed one on a pool miss. For LONG-LIVED state that
+    /// must outlive the transient per-step arena and be reused across
+    /// re-allocations — e.g. a fused optimizer's Adam m/v moment buffers, which
+    /// the plan re-creates every time the compiled plan is invalidated (lazy
+    /// layer init during warmup). Using the transient arena for these would let
+    /// the ring recycle them mid-step (corruption); a plain <c>new T[]</c> per
+    /// re-create is the ~2 GB/step Double[] churn PerfView flagged in
+    /// <c>ConfigureOptimizerDouble</c>. The persistent pool sits ABOVE the
+    /// transient tier: entries survive arena Dispose and are handed back here,
+    /// so they pool across re-creations without ever being recycled as scratch.
+    /// Return with <see cref="ReturnPersistentBuffer{T}"/> when the state is
+    /// discarded (on the next re-configure). Buffers below
+    /// <see cref="PersistThresholdElems"/> aren't pooled (they GC cheaply) — a
+    /// fresh zeroed array is returned, matching the pooled path's zero-init.
+    /// </summary>
+    internal static T[] RentPersistentZeroed<T>(int elementCount)
+    {
+        if (elementCount == 0) return Array.Empty<T>();
+        return RentPersistent(typeof(T), elementCount) as T[] ?? new T[elementCount];
+    }
+
+    /// <summary>
+    /// Returns a buffer previously handed out by <see cref="RentPersistentZeroed{T}"/>
+    /// to the cross-arena persistent pool for reuse. No-op for arrays below the
+    /// pooling threshold or already at the per-size cap (they GC). The caller
+    /// must not touch the array after returning it.
+    /// </summary>
+    internal static void ReturnPersistentBuffer<T>(T[] arr)
+    {
+        if (arr is null || arr.Length == 0) return;
+        ReturnPersistent(typeof(T), arr.Length, arr);
+    }
+
     // ---------------------------------------------------------------------
     // Boundary-CARRY pool (#1824). Separate from _persistent because carries
     // pool at ANY size (the scratch pool skips < PersistThresholdElems, since
