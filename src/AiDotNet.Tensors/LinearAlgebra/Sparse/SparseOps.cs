@@ -463,7 +463,13 @@ public static class SparseOps
             var xf = (float[])(object)x.ToArray();
             var yf = (float[])(object)y.ToArray();
             float[]? gpu = null;
-            if (OpenClSparseBackend.IsAvailable)
+            if (CudaSparseBackend.IsAvailable)
+                gpu = CudaSparseBackend.SDDMM(rowIndices, colIndices, xf, yf, innerK);
+            else if (HipCustomSparseBackend.IsAvailable)
+                gpu = HipCustomSparseBackend.SDDMM(rowIndices, colIndices, xf, yf, innerK);
+            else if (MpsSparseBackend.IsAvailable)
+                gpu = MpsSparseBackend.SDDMM(rowIndices, colIndices, xf, yf, innerK);
+            else if (OpenClSparseBackend.IsAvailable)
                 gpu = OpenClSparseBackend.SDDMM(rowIndices, colIndices, xf, yf, innerK);
             if (gpu is not null) return (T[])(object)gpu;
         }

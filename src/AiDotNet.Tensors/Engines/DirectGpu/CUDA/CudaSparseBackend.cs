@@ -100,6 +100,50 @@ internal static class CudaSparseBackend
     }
 
     /// <summary>
+    /// SDDMM with host-side inputs: <c>out[p] = Σ_k x[rowIndices[p], k] · y[colIndices[p], k]</c>.
+    /// <paramref name="x"/> is [M, innerK] row-major, <paramref name="y"/> is [Ny, innerK] row-major.
+    /// Returns the <c>nnz</c>-length values array. Dispatches the managed <c>sddmm</c> kernel.
+    /// </summary>
+    public static float[] SDDMM(
+        int[] rowIndices, int[] colIndices,
+        float[] x, float[] y, int innerK)
+    {
+        if (!IsAvailable)
+            throw new InvalidOperationException("CUDA custom-kernel SDDMM backend is not available.");
+
+        int nnz = rowIndices.Length;
+        var output = new float[nnz];
+        if (nnz == 0) return output;
+
+        var backend = CudaBackend.CreateOrThrow();
+
+        IGpuBuffer? rowBuf = null, colBuf = null, xBuf = null, yBuf = null, outBuf = null;
+        try
+        {
+            xBuf = backend.AllocateBuffer(x);
+            yBuf = backend.AllocateBuffer(y);
+            outBuf = backend.AllocateBuffer(output);
+            rowBuf = backend.AllocateByteBuffer(rowIndices.Length * sizeof(int));
+            colBuf = backend.AllocateByteBuffer(colIndices.Length * sizeof(int));
+            UploadInts(rowBuf.Handle, rowIndices);
+            UploadInts(colBuf.Handle, colIndices);
+
+            backend.CsrSddmm(rowBuf, colBuf, xBuf, yBuf, outBuf, nnz, innerK);
+
+            backend.DownloadBuffer(outBuf, output);
+            return output;
+        }
+        finally
+        {
+            outBuf?.Dispose();
+            yBuf?.Dispose();
+            xBuf?.Dispose();
+            rowBuf?.Dispose();
+            colBuf?.Dispose();
+        }
+    }
+
+    /// <summary>
     /// FP64 CSR · dense → dense (issue #515). Same shape as the float
     /// <see cref="SpMM(int[], int[], float[], float[], int, int, int)"/> but the
     /// value / dense / output payloads are <c>double</c>, carried on byte buffers

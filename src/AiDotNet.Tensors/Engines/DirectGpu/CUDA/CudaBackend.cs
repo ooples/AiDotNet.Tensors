@@ -3243,6 +3243,47 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     }
 
     /// <summary>
+    /// SDDMM: output[p] = sum_k x[rowIndices[p], k] * y[colIndices[p], k], one thread per pattern
+    /// non-zero. Used by the pattern-preserving sparse-matmul backward's dA.
+    /// </summary>
+    public unsafe void CsrSddmm(
+        IGpuBuffer rowIndices,
+        IGpuBuffer colIndices,
+        IGpuBuffer x,
+        IGpuBuffer y,
+        IGpuBuffer output,
+        int nnz, int innerK)
+    {
+        if (!IsAvailable)
+            throw new InvalidOperationException("CUDA backend is not available.");
+        if (nnz == 0) return;
+
+        if (!_kernelCache.TryGetValue("sddmm", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: sddmm");
+
+        using var _ = PushContext();
+
+        uint gridX = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
+
+        IntPtr rowPtr = rowIndices.Handle;
+        IntPtr colPtr = colIndices.Handle;
+        IntPtr xPtr = x.Handle;
+        IntPtr yPtr = y.Handle;
+        IntPtr outputPtr = output.Handle;
+
+        void** args = stackalloc void*[7];
+        args[0] = &rowPtr;
+        args[1] = &colPtr;
+        args[2] = &xPtr;
+        args[3] = &yPtr;
+        args[4] = &outputPtr;
+        args[5] = &nnz;
+        args[6] = &innerK;
+
+        LaunchKernel(kernel, gridX, (uint)DefaultBlockSize, args);
+    }
+
+    /// <summary>
     /// Warp-per-row CSR SpMM (issue #515): launches <c>csr_spmm_warp</c>, where each
     /// warp (32 lanes) owns one output row and the lanes stride over columns. Best
     /// for small/moderate N (the lanes cover the columns with coalesced B reads);

@@ -593,6 +593,30 @@ extern ""C"" __global__ __launch_bounds__(256) void symmetric_degree_normalize(
     float normFactor = rsqrtf(srcDeg + epsilon) * rsqrtf(tgtDeg + epsilon);
     output[edge] = edgeValues[edge] * normFactor;
 }
+
+// SDDMM (sampled dense-dense matmul): output[p] = sum_k x[i,k] * y[j,k] where
+// i=rowIndices[p], j=colIndices[p]. One thread per pattern non-zero. This is the
+// pattern-preserving sparse-matmul backward's dA (x = grad, y = B).
+extern ""C"" __global__ __launch_bounds__(256) void sddmm(
+    const int* __restrict__ rowIndices,
+    const int* __restrict__ colIndices,
+    const float* __restrict__ x,
+    const float* __restrict__ y,
+    float* __restrict__ output,
+    int nnz, int innerK)
+{
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= nnz) return;
+
+    int xoff = rowIndices[p] * innerK;
+    int yoff = colIndices[p] * innerK;
+
+    float sum = 0.0f;
+    for (int k = 0; k < innerK; k++)
+        sum += x[xoff + k] * y[yoff + k];
+
+    output[p] = sum;
+}
 ";
     }
 
@@ -602,6 +626,7 @@ extern ""C"" __global__ __launch_bounds__(256) void symmetric_degree_normalize(
         [
             // CSR SpMM operations
             "csr_spmm",
+            "sddmm",
             "csr_spmm_warp",
             "csr_spmm_double",
             "csr_spmm_vec4",

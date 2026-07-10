@@ -3202,6 +3202,60 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             M, K, N, nnz);
     }
 
+    /// <summary>
+    /// SDDMM: output[p] = sum_k x[rowIndices[p], k] * y[colIndices[p], k], one thread per pattern
+    /// non-zero. CUDA mirror: <see cref="CUDA.CudaBackend.CsrSddmm"/>.
+    /// </summary>
+    public unsafe void CsrSddmm(
+        IGpuBuffer rowIndices,
+        IGpuBuffer colIndices,
+        IGpuBuffer x,
+        IGpuBuffer y,
+        IGpuBuffer output,
+        int nnz, int innerK)
+    {
+        if (!IsAvailable)
+            throw new InvalidOperationException("HIP backend is not available.");
+        if (nnz == 0) return;
+
+        if (!_kernelCache.TryGetValue("sddmm", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: sddmm");
+
+        int gridX = (nnz + DefaultBlockSize - 1) / DefaultBlockSize;
+
+        IntPtr rowHandle = ((HipGpuBuffer)rowIndices).Handle;
+        IntPtr colHandle = ((HipGpuBuffer)colIndices).Handle;
+        IntPtr xHandle = ((HipGpuBuffer)x).Handle;
+        IntPtr yHandle = ((HipGpuBuffer)y).Handle;
+        IntPtr outputHandle = ((HipGpuBuffer)output).Handle;
+
+        void*[] args = new void*[7];
+        fixed (void** argsPtr = args)
+        {
+            IntPtr[] handles = [rowHandle, colHandle, xHandle, yHandle, outputHandle];
+            int[] ints = [nnz, innerK];
+
+            fixed (IntPtr* h = handles)
+            fixed (int* i = ints)
+            {
+                argsPtr[0] = &h[0];
+                argsPtr[1] = &h[1];
+                argsPtr[2] = &h[2];
+                argsPtr[3] = &h[3];
+                argsPtr[4] = &h[4];
+                argsPtr[5] = &i[0];
+                argsPtr[6] = &i[1];
+
+                var result = HipNativeBindings.hipModuleLaunchKernel(
+                    kernel,
+                    (uint)gridX, 1, 1,
+                    (uint)DefaultBlockSize, 1, 1,
+                    0, _stream, (IntPtr)argsPtr, IntPtr.Zero);
+                HipNativeBindings.CheckError(result, "hipModuleLaunchKernel (sddmm)");
+            }
+        }
+    }
+
     /// <summary>Warp-per-row CSR SpMM (issue #515): launches <c>csr_spmm_warp</c>
     /// (one warp per output row). The kernel uses only blockIdx.x/threadIdx.x, so it
     /// runs on the shared 2-D launcher with gridY=1. Same numerics as
