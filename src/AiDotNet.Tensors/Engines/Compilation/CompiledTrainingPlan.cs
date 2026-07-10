@@ -2329,12 +2329,37 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // Reading the tensor's CURRENT resident buffer each step makes the optimizer consume the grads
                     // the captured backward actually produced. Mirrors the param-side pin near the GPU fast path.
                     // Eager paths are unaffected: a non-resident grad still yields null here → gpuGrad/host fallback.
-                    Engines.DirectGpu.IGpuBuffer? gradBuf = (_gradients[p]?.TryGetGpuBuffer()) ?? gpuGrad[p];
+                    // The #638 line trusts the grad tensor's resident GPU buffer as authoritative. That is correct
+                    // ONLY when that buffer actually holds the gradient the backward produced THIS step. Two backward
+                    // paths write it and keep its version in sync with the tensor Version: (a) CUDA-graph capture —
+                    // the captured backward writes it in place; (b) the FP16-hetero resident backward. But the plain
+                    // eager backward instead accumulates into the grad's HOST backing (gradArrays[p]) and leaves the
+                    // resident buffer at its memset-zero: Version bumps, _gpuBufferVersion does NOT. Consuming that
+                    // stale-zero buffer makes the fused optimizer apply ~ZERO grads, so the weights barely move and
+                    // the loss goes FLAT — the GPU-resident-param mistrain (7.70->7.70 resident vs 7.70->1.31
+                    // non-resident on the same graph; the TimeSeries family runs this path by default). So trust the
+                    // resident grad buffer only when it is version-FRESH (or we are mid stream-capture, where a host
+                    // download is impossible anyway); otherwise upload the authoritative HOST gradient the backward
+                    // produced. This keeps the #638 capture path AND the FP16 resident backward intact.
+                    bool gradStreamCapturing =
+                        gpuBe is Engines.DirectGpu.CUDA.CudaBackend _cbGrad && _cbGrad.IsStreamCapturing();
+                    var _gradT = _gradients[p];
+                    bool residentGradAuthoritative = _gradT is not null && _gradT.TryGetGpuBuffer() is not null
+                        && (gradStreamCapturing || _gradT._gpuBufferVersion == _gradT.Version);
+                    Engines.DirectGpu.IGpuBuffer? gradBuf = residentGradAuthoritative
+                        ? _gradT!.TryGetGpuBuffer()
+                        : null;
                     bool gradTransient = false;
                     if (gradBuf is null)
                     {
-                        if (gradArrays[p].Length == 0) continue; // no grad recorded
-                        gradBuf = gpuBe.AllocateBuffer(gradArrays[p]);
+                        float[] hostGrad = gradArrays[p];
+                        if (hostGrad.Length == 0)
+                        {
+                            var liveGrad = _gradients[p]?.GetLiveBackingArrayAllowingPaddingOrNull();
+                            hostGrad = liveGrad is not null ? (float[])(object)liveGrad : Array.Empty<float>();
+                        }
+                        if (hostGrad.Length == 0) continue; // no grad recorded
+                        gradBuf = gpuBe.AllocateBuffer(hostGrad);
                         gradTransient = true;
                     }
                     bool diagAU = p == 0 && _optimizerStep == 6 && System.Environment.GetEnvironmentVariable("AIDOTNET_OPT_DIAG") == "1";
@@ -2440,6 +2465,19 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // re-bumps Version (without this device write) → mismatch returns → correct re-upload. Harmless
                     // to capture (the gate's ResidentStepActive branch already covers it).
                     _parameters[p]._gpuBufferVersion = _parameters[p].Version;
+
+                    // RE-ARM the device→host deferred download so the NEXT host-side read of this parameter
+                    // re-downloads the freshly-updated weights. The eager forward reads its weight operand via
+                    // GetDataArray() (CpuEngine.TensorMatMulFloatInto), which is served by the ONE-SHOT deferred
+                    // materializer BindResidentBuffer registered: it fires + caches on the first read, so every
+                    // later read returns the STALE first-step download while the on-device optimizer keeps moving
+                    // the resident buffer. Net effect: the forward trains on FROZEN weights → the loss goes flat
+                    // (7.70→7.70 resident vs 7.70→1.31 non-resident on the same graph) — the GPU-resident-param
+                    // mistrain that hit the TimeSeries family (AIDOTNET_GPU_RESIDENT_PARAMS on by default).
+                    // Re-registering re-arms the download against the CURRENT device buffer (DeferredArrayMaterializer
+                    // .Register TryAdds, so it's a no-op if a read is still pending, and re-arms after one fired).
+                    if (_engine is Engines.DirectGpuTensorEngine _rebindEngine)
+                        _rebindEngine.BindResidentBuffer(_parameters[p], gpuP, gpuBe);
                     continue;
                 }
 

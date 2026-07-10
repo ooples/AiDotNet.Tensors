@@ -4350,6 +4350,16 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         var floatData = Engines.DirectGpu.DirectGpuEngine.ToFloatArray(logicalData);
         _gpuBuffer = backend.AllocateBuffer(floatData);
         _gpuBackend = backend;
+        // Tag the freshly-uploaded buffer with the CURRENT tensor version. The buffer was just filled from this
+        // tensor's host data, so it IS in sync — but every version-gated resident-buffer consumer
+        // (GetOrAllocateBuffer / GetWeightBufferPreferResident: `_gpuBufferVersion == Version`) leaves
+        // _gpuBufferVersion at its -1 sentinel and so immediately judges the buffer STALE, detaching it and
+        // re-uploading a frozen host snapshot on the very next read. For a GPU-resident PARAMETER that is
+        // catastrophic: the compiled forward then reads the frozen re-upload while the on-device fused optimizer
+        // updates the (now orphaned) resident buffer in place → the model trains against frozen weights → the loss
+        // goes completely flat (7.70→7.70 vs 7.70→1.31 non-resident on the same graph). This is the default GPU
+        // path for the TimeSeries family (AIDOTNET_GPU_RESIDENT_PARAMS != 0), so it silently mistrained on GPU.
+        _gpuBufferVersion = Version;
         _device = backend.BackendName?.ToUpperInvariant() switch
         {
             "CUDA" or "NVIDIA" => TensorDevice.CUDA,
