@@ -176,9 +176,9 @@ public class FusedAdamWSinglePassParityTests
 
             for (int i = 0; i < len; i++)
             {
-                Assert.Equal(BitConverter.SingleToInt32Bits(pRef[i]), BitConverter.SingleToInt32Bits(pFused[i]));
-                Assert.Equal(BitConverter.SingleToInt32Bits(mRef[i]), BitConverter.SingleToInt32Bits(mFused[i]));
-                Assert.Equal(BitConverter.SingleToInt32Bits(vRef[i]), BitConverter.SingleToInt32Bits(vFused[i]));
+                Assert.Equal(SingleBits(pRef[i]), SingleBits(pFused[i]));
+                Assert.Equal(SingleBits(mRef[i]), SingleBits(mFused[i]));
+                Assert.Equal(SingleBits(vRef[i]), SingleBits(vFused[i]));
             }
         }
     }
@@ -248,9 +248,9 @@ public class FusedAdamWSinglePassParityTests
                 else FusedOptimizer.AdamUpdateSimdMulti(Pm, G, Mm, Vm, lens, count, lr, b1, b2, eps, bc1, bc2);
                 for (int t = 0; t < count; t++) for (int i = 0; i < lens[t]; i++)
                 {
-                    Assert.Equal(BitConverter.SingleToInt32Bits(Pr[t][i]), BitConverter.SingleToInt32Bits(Pm[t][i]));
-                    Assert.Equal(BitConverter.SingleToInt32Bits(Mr[t][i]), BitConverter.SingleToInt32Bits(Mm[t][i]));
-                    Assert.Equal(BitConverter.SingleToInt32Bits(Vr[t][i]), BitConverter.SingleToInt32Bits(Vm[t][i]));
+                    Assert.Equal(SingleBits(Pr[t][i]), SingleBits(Pm[t][i]));
+                    Assert.Equal(SingleBits(Mr[t][i]), SingleBits(Mm[t][i]));
+                    Assert.Equal(SingleBits(Vr[t][i]), SingleBits(Vm[t][i]));
                 }
             }
         }
@@ -398,6 +398,10 @@ public class FusedAdamWSinglePassParityTests
         Assert.NotEqual(0.5, mFlat[0]);
         Assert.NotEqual(0.5, mFlat[16]);
     }
+
+    // BitConverter.SingleToInt32Bits is net5+; GetBytes->ToInt32 is the net471-safe equivalent
+    // for raw-bit float comparison (matches the codebase convention in the BLAS parity tests).
+    private static int SingleBits(float value) => BitConverter.ToInt32(BitConverter.GetBytes(value), 0);
 
     private static (double[] p, double[] g, double[] m, double[] v) MakeDouble(int len, int seed)
     {
