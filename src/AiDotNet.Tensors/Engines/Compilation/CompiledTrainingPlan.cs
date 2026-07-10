@@ -4478,11 +4478,48 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             }
         }
 
-        // If all backward steps are specialized (overwrite), we can skip gradient zeroing entirely.
-        // Under pooling, force the clear-all path (null) so every physical buffer is
-        // zeroed at step start (covering each shared buffer's FIRST tenant); the
-        // re-zero schedule clears it again before each subsequent tenant.
-        int[]? genericGradIndices = (!useGradPool && genericBackwardCount == 0) ? new int[0] : null;
+        // If all backward steps are specialized we CAN skip zeroing most gradient
+        // buffers — but NOT the ones a specialized delegate ACCUMULATES into. Most
+        // specialized delegates OVERWRITE their buffer (beta=0), but a delegate that
+        // writes a MULTI-CONSUMER tensor's gradient accumulates in place
+        // (TensorAddInto / +=), because a tensor consumed by N ops has gradient =
+        // Σ contributions (the BroadcastAdd bias-grad path is the clearest case).
+        // If such a buffer is never zeroed, each step's accumulation lands on top of
+        // the PRIOR step's gradient, so the gradient — and the Adam update — grows
+        // without bound while the loss barely moves (N-BEATS's doubly-residual stack,
+        // whose residual tensors are inherently multi-consumer, blew its weights up
+        // to ~1e13 this way).
+        //
+        // So instead of skip-all (which was silently wrong for these buffers) OR
+        // clear-all (correct but pays to zero every buffer), zero PRECISELY the
+        // accumulating buffers: the grad buffers of the multi-consumer tensors. Every
+        // other buffer is fully overwritten by its beta=0 delegate and stays skipped.
+        // When there are no multi-consumer tensors this yields an empty array — the
+        // exact skip-all fast path as before, so feed-forward graphs are unchanged.
+        int[]? genericGradIndices;
+        if (!useGradPool && genericBackwardCount == 0)
+        {
+            // allGrads holds the distinct physical grad buffers (id == index), so a
+            // reverse map gives each multi-consumer tensor's grad-buffer index.
+            var gradBufferIndex = new Dictionary<Tensor<T>, int>(allGrads.Count);
+            for (int gi = 0; gi < allGrads.Count; gi++) gradBufferIndex[allGrads[gi]] = gi;
+
+            var accumulatingGradIndices = new List<int>();
+            var seenGradIndices = new HashSet<int>();
+            foreach (var kv in consumerCount)
+            {
+                if (kv.Value <= 1) continue; // single-consumer buffers are overwritten, no zeroing needed
+                if (gradMap.TryGetValue(kv.Key, out var gradBuf)
+                    && gradBufferIndex.TryGetValue(gradBuf, out int bufIdx)
+                    && seenGradIndices.Add(bufIdx))
+                    accumulatingGradIndices.Add(bufIdx);
+            }
+            genericGradIndices = accumulatingGradIndices.ToArray();
+        }
+        else
+        {
+            genericGradIndices = null; // clear-all (unchanged: generic backward or grad pooling)
+        }
 
         // #1624 drift guard: the re-zero schedule (indexed by backward ACTION index)
         // was planned in BuildPooledGradMap from the fusion/analytic DECISIONS made
