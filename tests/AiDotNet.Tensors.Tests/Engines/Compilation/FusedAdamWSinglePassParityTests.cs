@@ -53,6 +53,56 @@ public class FusedAdamWSinglePassParityTests
             Assert.Equal(BitConverter.DoubleToInt64Bits(a[i]), BitConverter.DoubleToInt64Bits(b[i]));
     }
 
+    // The multi-tensor (foreach) AdamW kernel must be BIT-IDENTICAL to calling the
+    // single-tensor bc1/bc2 overload once per parameter — it only hoists the SIMD
+    // constant setup out of the per-tensor loop, changing no arithmetic. Exercises a
+    // list mixing SIMD-tail lengths and empty (len==0, unexercised) tensors.
+    [Fact]
+    public unsafe void AdamWMultiTensor_BitIdenticalToPerParam_Double()
+    {
+        const double lr = 5e-4, b1 = 0.9, b2 = 0.999, eps = 1e-8, wd = 1e-2;
+        int[] lens = { 1, 3, 4, 7, 8, 15, 16, 17, 31, 100, 4096, 0, 5, 8193 };
+        int count = lens.Length;
+        for (int step = 1; step <= 3; step++)
+        {
+            double bc1 = 1.0 - Math.Pow(b1, step), bc2 = 1.0 - Math.Pow(b2, step);
+            var rng = new Random(31 + step);
+            double[][] P = new double[count][], G = new double[count][], M = new double[count][], V = new double[count][];
+            double[][] Pr = new double[count][], Mr = new double[count][], Vr = new double[count][];
+            for (int t = 0; t < count; t++)
+            {
+                int L = lens[t];
+                P[t] = new double[L]; G[t] = new double[L]; M[t] = new double[L]; V[t] = new double[L];
+                for (int i = 0; i < L; i++)
+                {
+                    P[t][i] = rng.NextDouble() * 2 - 1;
+                    G[t][i] = (rng.NextDouble() * 2 - 1) * 0.1;
+                    M[t][i] = (rng.NextDouble() * 2 - 1) * 0.05;
+                    V[t][i] = rng.NextDouble() * 0.01;
+                }
+                Pr[t] = (double[])P[t].Clone(); Mr[t] = (double[])M[t].Clone(); Vr[t] = (double[])V[t].Clone();
+            }
+
+            // Reference: per-parameter bc1/bc2 overload (grads unchanged by AdamW, so shared).
+            for (int t = 0; t < count; t++)
+            {
+                int L = lens[t]; if (L == 0) continue;
+                fixed (double* p = Pr[t], g = G[t], m = Mr[t], v = Vr[t])
+                    FusedOptimizer.AdamWUpdateSimd(p, g, m, v, L, lr, b1, b2, eps, wd, bc1, bc2);
+            }
+            // Multi-tensor path.
+            FusedOptimizer.AdamWUpdateSimdMulti(P, G, M, V, lens, count, lr, b1, b2, eps, wd, bc1, bc2);
+
+            for (int t = 0; t < count; t++)
+                for (int i = 0; i < lens[t]; i++)
+                {
+                    Assert.Equal(BitConverter.DoubleToInt64Bits(Pr[t][i]), BitConverter.DoubleToInt64Bits(P[t][i]));
+                    Assert.Equal(BitConverter.DoubleToInt64Bits(Mr[t][i]), BitConverter.DoubleToInt64Bits(M[t][i]));
+                    Assert.Equal(BitConverter.DoubleToInt64Bits(Vr[t][i]), BitConverter.DoubleToInt64Bits(V[t][i]));
+                }
+        }
+    }
+
     [Theory]
     [MemberData(nameof(Lengths))]
     public void FusedAdamW_Double_BitIdenticalToTwoPass(int len)
