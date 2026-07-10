@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -545,6 +546,56 @@ public sealed class CpuSparseEngine : ISparseEngine
         // SparseTensor.Transpose() overrides Tensor<T>.Transpose() and returns a SparseTensor
         return (SparseTensor<T>)sparse.Transpose();
     }
+
+    #endregion
+
+    #region Tape-Aware Differentiable Operations
+
+    // Each delegates to the SparseAutograd Record helper, which performs the forward via
+    // SparseOps (GPU-dispatched when available) and records the tape edge + backward when a
+    // tape is active. The sparse operand is passed as its own gradient target so a registered
+    // trainable SparseTensor parameter receives its gradient directly.
+
+    /// <inheritdoc/>
+    // Uses the dense-gradient record so the gradient for A is accumulated against A on the
+    // standard autodiff tape (retrievable via ComputeGradients like any other operand). The
+    // pattern-preserving variant keeps A's gradient in a sparse-aware ParameterBuffer slot
+    // instead, which the plain tape API cannot read — see SparseMatMulPatternPreserving for
+    // that opt-in path when the sparse operand is backed by such a buffer.
+    public Tensor<T> SparseMatMul<T>(SparseTensor<T> a, Tensor<T> b)
+        => SparseAutograd.SparseMatMulRecord(a, a, b);
+
+    /// <inheritdoc/>
+    public Tensor<T> SparseMatMulPatternPreserving<T>(SparseTensor<T> a, Tensor<T> b)
+        => SparseAutograd.SparsePatternPreservingMatMulRecord(a, b);
+
+    /// <inheritdoc/>
+    public Tensor<T> SparseAddMM<T>(Tensor<T> c, SparseTensor<T> a, Tensor<T> b, T alpha, T beta)
+        => SparseAutograd.SparseAddMMRecord(c, a, a, b, alpha, beta);
+
+    /// <inheritdoc/>
+    public Tensor<T> SparseSampledAddMM<T>(SparseTensor<T> pattern, Tensor<T> a, Tensor<T> b, Tensor<T> c, T alpha, T beta)
+        => SparseAutograd.SparseSampledAddMMRecord(pattern, a, b, c, alpha, beta);
+
+    /// <inheritdoc/>
+    public Tensor<T> SparseSpGeMM<T>(SparseTensor<T> a, SparseTensor<T> b)
+        => SparseAutograd.SparsePatternPreservingSpGeMMRecord(a, b);
+
+    /// <inheritdoc/>
+    public Tensor<T> SparseSum<T>(SparseTensor<T> a, int? axis = null)
+        => SparseAutograd.SparseSumRecord(a, a, axis);
+
+    /// <inheritdoc/>
+    public Tensor<T> SparseMean<T>(SparseTensor<T> a, int? axis = null)
+        => SparseAutograd.SparseMeanRecord(a, a, axis);
+
+    /// <inheritdoc/>
+    public Tensor<T> SparseSoftmax<T>(SparseTensor<T> a)
+        => SparseAutograd.SparseSoftmaxRecord(a, a);
+
+    /// <inheritdoc/>
+    public Tensor<T> SparseLogSoftmax<T>(SparseTensor<T> a)
+        => SparseAutograd.SparseLogSoftmaxRecord(a, a);
 
     #endregion
 }

@@ -1,6 +1,8 @@
 // Copyright (c) AiDotNet. All rights reserved.
 // Metal GPU backend - Sparse, Comparison, and Statistics operations.
 
+using static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings;
+
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
 public sealed partial class MetalBackend
@@ -133,39 +135,113 @@ public sealed partial class MetalBackend
 
     #region CSR Sparse Operations
 
+    private const string SparseLibName = "Sparse";
+
+    private MetalPipelineState GetSparsePipeline(string kernelName)
+    {
+        if (_sparseLibrary == IntPtr.Zero)
+            throw new InvalidOperationException(
+                "Metal Sparse compute library was not compiled — install a Metal-capable runtime " +
+                "or route to a different GPU backend.");
+        return GetPipeline(SparseLibName, _sparseLibrary, kernelName);
+    }
+
     /// <summary>
-    /// CSR sparse matrix-dense matrix multiplication.
+    /// CSR · dense → dense: <c>C[M,N] = A[M,K] · B[K,N]</c> with A supplied as CSR
+    /// (values / colIndices / rowPointers). All five buffers are GPU-resident and
+    /// the compute stays on-device — replaces the previous CPU download-compute-upload
+    /// stub with a real MSL dispatch (<see cref="MetalSparseKernels.Source"/>).
+    /// One thread per output element (row, col); row = gid / N, col = gid % N.
     /// </summary>
     public void CsrSpMM(IGpuBuffer csrValues, IGpuBuffer csrColIndices, IGpuBuffer csrRowPointers,
         IGpuBuffer denseB, IGpuBuffer output, int M, int K, int N, int nnz)
     {
         ThrowIfDisposed();
+        if (M <= 0 || N <= 0) return;
 
-        var values = DownloadBuffer(csrValues);
-        var colIndices = DownloadIntBuffer(csrColIndices, nnz);
-        var rowPointers = DownloadIntBuffer(csrRowPointers, M + 1);
-        var denseData = DownloadBuffer(denseB);
+        long total = (long)M * N;
+        if (total > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(M),
+                $"CSR SpMM output too large for a single Metal dispatch (M*N = {total}).");
 
-        var outputData = new float[M * N];
+        var pipeline = GetSparsePipeline("sparse_csr_spmm");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch((int)total);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer((MetalGpuBuffer)csrValues, 0);
+        encoder.SetBuffer((MetalGpuBuffer)csrColIndices, 1);
+        encoder.SetBuffer((MetalGpuBuffer)csrRowPointers, 2);
+        encoder.SetBuffer((MetalGpuBuffer)denseB, 3);
+        encoder.SetBuffer((MetalGpuBuffer)output, 4);
+        encoder.SetBytes(M, 5);
+        encoder.SetBytes(K, 6);
+        encoder.SetBytes(N, 7);
+        encoder.SetBytes(nnz, 8);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
 
-        for (int row = 0; row < M; row++)
+    /// <summary>
+    /// Empirically-picked crossover: below this innerK, the thread-per-nnz base kernel
+    /// wins because each thread's serial dot-product fits in a few cycles and the
+    /// collaborative kernel's 256-thread tree reduction is pure overhead. Above this,
+    /// the reduction latency dominates and the collaborative kernel wins. 64 matches
+    /// the typical attention head_dim boundary. Mirror of the Vulkan tier's threshold.
+    /// </summary>
+    private const int SddmmCollabInnerKThreshold = 64;
+
+    /// <summary>
+    /// SDDMM: <c>output[p] = Σ_k x[rowIndices[p], k] · y[colIndices[p], k]</c> for each
+    /// pattern non-zero p ∈ [0, nnz). All five buffers are GPU-resident.
+    ///
+    /// <para><b>Adaptive dispatch (beyond-industry-standard):</b> for large <c>innerK</c>
+    /// (typical attention head_dim ≥ 64), routes to the collaborative kernel
+    /// <c>sparse_sddmm_collab</c> — one threadgroup per non-zero, 256 threads collaborate
+    /// on the innerK reduction via threadgroup memory + tree reduction. Reduces per-nnz
+    /// latency from O(innerK) to O(log₂ 256) + O(innerK/256). MPS's sparse SDDMM (when
+    /// available) uses fixed thread-per-nnz for all shapes.</para>
+    /// </summary>
+    public void CsrSddmm(IGpuBuffer rowIndices, IGpuBuffer colIndices,
+        IGpuBuffer x, IGpuBuffer y, IGpuBuffer output,
+        int nnz, int innerK)
+    {
+        ThrowIfDisposed();
+        if (nnz <= 0) return;
+
+        if (innerK >= SddmmCollabInnerKThreshold)
         {
-            int rowStart = rowPointers[row];
-            int rowEnd = rowPointers[row + 1];
-
-            for (int col = 0; col < N; col++)
-            {
-                float sum = 0;
-                for (int i = rowStart; i < rowEnd; i++)
-                {
-                    int k = colIndices[i];
-                    sum += values[i] * denseData[k * N + col];
-                }
-                outputData[row * N + col] = sum;
-            }
+            var pipeline = GetSparsePipeline("sparse_sddmm_collab");
+            var threadgroups = new MTLSize((ulong)nnz, 1, 1);
+            var threadsPerGroup = new MTLSize(
+                (ulong)MetalSparseKernels.SddmmCollabThreadgroupSize, 1, 1);
+            using var encoder = _commandQueue.CreateScopedComputeEncoder();
+            encoder.SetPipelineState(pipeline.Handle);
+            encoder.SetBuffer((MetalGpuBuffer)rowIndices, 0);
+            encoder.SetBuffer((MetalGpuBuffer)colIndices, 1);
+            encoder.SetBuffer((MetalGpuBuffer)x, 2);
+            encoder.SetBuffer((MetalGpuBuffer)y, 3);
+            encoder.SetBuffer((MetalGpuBuffer)output, 4);
+            encoder.SetBytes(nnz, 5);
+            encoder.SetBytes(innerK, 6);
+            // Threadgroup memory: 256 floats for the shared reduction buffer at binding 0.
+            encoder.SetThreadgroupMemoryLength(
+                (uint)(MetalSparseKernels.SddmmCollabThreadgroupSize * sizeof(float)), 0);
+            encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
         }
-
-        UploadToBuffer(output, outputData);
+        else
+        {
+            var pipeline = GetSparsePipeline("sparse_sddmm");
+            var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(nnz);
+            using var encoder = _commandQueue.CreateScopedComputeEncoder();
+            encoder.SetPipelineState(pipeline.Handle);
+            encoder.SetBuffer((MetalGpuBuffer)rowIndices, 0);
+            encoder.SetBuffer((MetalGpuBuffer)colIndices, 1);
+            encoder.SetBuffer((MetalGpuBuffer)x, 2);
+            encoder.SetBuffer((MetalGpuBuffer)y, 3);
+            encoder.SetBuffer((MetalGpuBuffer)output, 4);
+            encoder.SetBytes(nnz, 5);
+            encoder.SetBytes(innerK, 6);
+            encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+        }
     }
 
     /// <summary>
