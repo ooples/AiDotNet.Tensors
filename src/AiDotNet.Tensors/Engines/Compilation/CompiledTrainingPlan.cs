@@ -2188,6 +2188,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _optimizerUpdate = () =>
         {
             _optimizerStep++;
+            float stepBc1 = 1f - MathF.Pow(b1, _optimizerStep);
+            float stepBc2 = 1f - MathF.Pow(b2, _optimizerStep);
             // #739 review: retire any captured on-device step graph before the CPU fused optimizer
             // mutates host weights and invalidates their resident device buffers (MarkHostWeightMutated
             // below) — otherwise a later LaunchCapturedGraph would replay against freed/stale device
@@ -2531,7 +2533,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                         lr, b1, b2, epsVal, _optimizerStep);
                             else
                                 FusedOptimizer.AdamUpdateSimd(pParam, pGrad, pM, pV, len,
-                                    lr, b1, b2, epsVal, _optimizerStep);
+                                    lr, b1, b2, epsVal, stepBc1, stepBc2);
                             break;
                         case OptimizerType.AdamW:
                             if (useBf16Moments)
@@ -2540,7 +2542,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                         lr, b1, b2, epsVal, wd, _optimizerStep);
                             else
                                 FusedOptimizer.AdamWUpdateSimd(pParam, pGrad, pM, pV, len,
-                                    lr, b1, b2, epsVal, wd, _optimizerStep);
+                                    lr, b1, b2, epsVal, wd, stepBc1, stepBc2);
                             break;
                         case OptimizerType.AMSGrad:
                             // AMSGrad (#74): Adam with a running max of v̂ so the
@@ -2930,6 +2932,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _optimizerUpdate = () =>
         {
             _optimizerStep++;
+            float stepBc1 = 1f - MathF.Pow(b1, _optimizerStep);
+            float stepBc2 = 1f - MathF.Pow(b2, _optimizerStep);
             // #739 review: retire any captured on-device step graph before this CPU fused optimizer
             // invalidates resident weight buffers below — else a later LaunchCapturedGraph replays
             // against freed/stale device pointers. No-op when no graph is captured.
@@ -3101,7 +3105,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                         lr, b1, b2, epsVal, _optimizerStep);
                             else
                                 FusedOptimizer.AdamUpdateSimd(pParam, pGrad, pM, pV, len,
-                                    lr, b1, b2, epsVal, _optimizerStep);
+                                    lr, b1, b2, epsVal, stepBc1, stepBc2);
                             break;
                         case OptimizerType.AdamW:
                             if (useBf16Moments)
@@ -3110,7 +3114,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                         lr, b1, b2, epsVal, wd, _optimizerStep);
                             else
                                 FusedOptimizer.AdamWUpdateSimd(pParam, pGrad, pM, pV, len,
-                                    lr, b1, b2, epsVal, wd, _optimizerStep);
+                                    lr, b1, b2, epsVal, wd, stepBc1, stepBc2);
                             break;
                         case OptimizerType.AMSGrad:
                             // AMSGrad (#74): Adam with a running max of v̂ so the
@@ -3314,6 +3318,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _optimizerUpdate = () =>
         {
             _optimizerStep++;
+            // Bias corrections stepBc1=1-b1^step, stepBc2=1-b2^step are STEP-GLOBAL; compute the
+            // two Math.Pow ONCE here instead of once per parameter inside the Adam/AdamW kernels
+            // (bit-identical — a deep model with many small tensors paid ~2x(param count) Pow/step).
+            double stepBc1 = 1.0 - System.Math.Pow(b1, _optimizerStep);
+            double stepBc2 = 1.0 - System.Math.Pow(b2, _optimizerStep);
             double lr = lrSchedule.GetLr(_optimizerStep);
             for (int p = 0; p < paramCount; p++)
             {
@@ -3330,11 +3339,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             break;
                         case OptimizerType.Adam:
                             FusedOptimizer.AdamUpdateSimd(pParam, pGrad, pM, pV, len,
-                                lr, b1, b2, epsVal, _optimizerStep);
+                                lr, b1, b2, epsVal, stepBc1, stepBc2);
                             break;
                         case OptimizerType.AdamW:
                             FusedOptimizer.AdamWUpdateSimd(pParam, pGrad, pM, pV, len,
-                                lr, b1, b2, epsVal, wd, _optimizerStep);
+                                lr, b1, b2, epsVal, wd, stepBc1, stepBc2);
                             break;
                         case OptimizerType.AMSGrad:
                             // AMSGrad (#74): Adam with a running max of v̂ so the
@@ -3459,6 +3468,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _optimizerUpdate = () =>
         {
             _optimizerStep++;
+            // Bias corrections stepBc1=1-b1^step, stepBc2=1-b2^step are STEP-GLOBAL; compute the
+            // two Math.Pow ONCE here instead of once per parameter inside the Adam/AdamW kernels
+            // (bit-identical — a deep model with many small tensors paid ~2x(param count) Pow/step).
+            double stepBc1 = 1.0 - System.Math.Pow(b1, _optimizerStep);
+            double stepBc2 = 1.0 - System.Math.Pow(b2, _optimizerStep);
             for (int g = 0; g < groupCount; g++)
                 groupLrs[g] = schedules[g].GetLr(_optimizerStep);
 
@@ -3479,11 +3493,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             break;
                         case OptimizerType.Adam:
                             FusedOptimizer.AdamUpdateSimd(pParam, pGrad, pM, pV, len,
-                                lr, b1, b2, epsVal, _optimizerStep);
+                                lr, b1, b2, epsVal, stepBc1, stepBc2);
                             break;
                         case OptimizerType.AdamW:
                             FusedOptimizer.AdamWUpdateSimd(pParam, pGrad, pM, pV, len,
-                                lr, b1, b2, epsVal, wd, _optimizerStep);
+                                lr, b1, b2, epsVal, wd, stepBc1, stepBc2);
                             break;
                         case OptimizerType.AMSGrad:
                             // AMSGrad (#74): Adam with a running max of v̂ so the

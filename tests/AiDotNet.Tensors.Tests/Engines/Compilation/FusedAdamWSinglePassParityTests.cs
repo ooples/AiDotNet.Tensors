@@ -17,6 +17,42 @@ public class FusedAdamWSinglePassParityTests
 {
     public static TheoryData<int> Lengths => new() { 1, 3, 4, 7, 8, 9, 15, 16, 17, 31, 100, 257, 1024, 4099 };
 
+    // The step-taking Adam/AdamW kernels now delegate to a bc1/bc2-taking overload
+    // so a per-parameter loop can hoist the two step-global Math.Pow to once/step.
+    // These pin the wrapper's bias-correction formula: the step overload must be
+    // bit-identical to the bc overload fed bc1=1-β1^step, bc2=1-β2^step.
+    [Theory]
+    [MemberData(nameof(Lengths))]
+    public unsafe void AdamAndAdamW_BcOverload_BitIdenticalToStepOverload_Double(int len)
+    {
+        const double lr = 5e-4, b1 = 0.9, b2 = 0.999, eps = 1e-8, wd = 1e-2;
+        for (int step = 1; step <= 4; step++)
+        {
+            double bc1 = 1.0 - Math.Pow(b1, step), bc2 = 1.0 - Math.Pow(b2, step);
+            var (param, grad, m, v) = MakeDouble(len, 55 + len + step);
+
+            // Adam: step overload vs bc overload.
+            double[] pA = (double[])param.Clone(), mA = (double[])m.Clone(), vA = (double[])v.Clone();
+            double[] pB = (double[])param.Clone(), mB = (double[])m.Clone(), vB = (double[])v.Clone();
+            fixed (double* p = pA, g = grad, mm = mA, vv = vA) FusedOptimizer.AdamUpdateSimd(p, g, mm, vv, len, lr, b1, b2, eps, step);
+            fixed (double* p = pB, g = grad, mm = mB, vv = vB) FusedOptimizer.AdamUpdateSimd(p, g, mm, vv, len, lr, b1, b2, eps, bc1, bc2);
+            AssertBitEqual(pA, pB); AssertBitEqual(mA, mB); AssertBitEqual(vA, vB);
+
+            // AdamW: step overload vs bc overload.
+            double[] pC = (double[])param.Clone(), mC = (double[])m.Clone(), vC = (double[])v.Clone();
+            double[] pD = (double[])param.Clone(), mD = (double[])m.Clone(), vD = (double[])v.Clone();
+            fixed (double* p = pC, g = grad, mm = mC, vv = vC) FusedOptimizer.AdamWUpdateSimd(p, g, mm, vv, len, lr, b1, b2, eps, wd, step);
+            fixed (double* p = pD, g = grad, mm = mD, vv = vD) FusedOptimizer.AdamWUpdateSimd(p, g, mm, vv, len, lr, b1, b2, eps, wd, bc1, bc2);
+            AssertBitEqual(pC, pD); AssertBitEqual(mC, mD); AssertBitEqual(vC, vD);
+        }
+    }
+
+    private static void AssertBitEqual(double[] a, double[] b)
+    {
+        for (int i = 0; i < a.Length; i++)
+            Assert.Equal(BitConverter.DoubleToInt64Bits(a[i]), BitConverter.DoubleToInt64Bits(b[i]));
+    }
+
     [Theory]
     [MemberData(nameof(Lengths))]
     public void FusedAdamW_Double_BitIdenticalToTwoPass(int len)

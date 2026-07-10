@@ -85,8 +85,19 @@ internal static class FusedOptimizer
         float* param, float* grad, float* m, float* v, int length,
         float lr, float beta1, float beta2, float eps, int step)
     {
+        // Thin wrapper — hoist the step-global bias-correction MathF.Pow (see the
+        // double AdamUpdateSimd wrapper) so a per-parameter loop pays it once/step.
         float bc1 = 1f - MathF.Pow(beta1, step);
         float bc2 = 1f - MathF.Pow(beta2, step);
+        AdamUpdateSimd(param, grad, m, v, length, lr, beta1, beta2, eps, bc1, bc2);
+    }
+
+    /// <summary>Adam (float) with precomputed step-global bias corrections. Bit-identical
+    /// to the step overload; lets a per-parameter loop pay the two MathF.Pow once/step.</summary>
+    internal static unsafe void AdamUpdateSimd(
+        float* param, float* grad, float* m, float* v, int length,
+        float lr, float beta1, float beta2, float eps, float bc1, float bc2)
+    {
         float lrAdj = lr / bc1;
 
         int i = 0;
@@ -337,8 +348,24 @@ internal static class FusedOptimizer
         double* param, double* grad, double* m, double* v, int length,
         double lr, double beta1, double beta2, double eps, int step)
     {
+        // Thin wrapper: bc1 = 1-β1^step, bc2 = 1-β2^step are STEP-GLOBAL (identical
+        // for every parameter in a step), but this kernel runs once PER PARAMETER —
+        // so the two Math.Pow here cost ~2×(param count) transcendental calls per
+        // step, concentrated on a deep model's many small tensors. A per-parameter
+        // loop should compute bc1/bc2 ONCE and call the bc-taking overload below.
         double bc1 = 1.0 - System.Math.Pow(beta1, step);
         double bc2 = 1.0 - System.Math.Pow(beta2, step);
+        AdamUpdateSimd(param, grad, m, v, length, lr, beta1, beta2, eps, bc1, bc2);
+    }
+
+    /// <summary>Adam update with the STEP-GLOBAL bias corrections precomputed by the
+    /// caller (bc1 = 1-β1^step, bc2 = 1-β2^step). Bit-identical to the step overload;
+    /// exists so a per-parameter loop pays the two Math.Pow once per step, not per
+    /// parameter.</summary>
+    internal static unsafe void AdamUpdateSimd(
+        double* param, double* grad, double* m, double* v, int length,
+        double lr, double beta1, double beta2, double eps, double bc1, double bc2)
+    {
         double lrAdj = lr / bc1;
 
         int i = 0;
@@ -384,6 +411,19 @@ internal static class FusedOptimizer
         double* param, double* grad, double* m, double* v, int length,
         double lr, double beta1, double beta2, double eps, double weightDecay, int step)
     {
+        // Thin wrapper — hoist the step-global bias-correction Math.Pow (see the
+        // AdamUpdateSimd wrapper) so a per-parameter loop pays it once per step.
+        double bc1 = 1.0 - System.Math.Pow(beta1, step);
+        double bc2 = 1.0 - System.Math.Pow(beta2, step);
+        AdamWUpdateSimd(param, grad, m, v, length, lr, beta1, beta2, eps, weightDecay, bc1, bc2);
+    }
+
+    /// <summary>Single-pass fused AdamW with precomputed step-global bias corrections
+    /// (bc1 = 1-β1^step, bc2 = 1-β2^step). Bit-identical to the step overload.</summary>
+    internal static unsafe void AdamWUpdateSimd(
+        double* param, double* grad, double* m, double* v, int length,
+        double lr, double beta1, double beta2, double eps, double weightDecay, double bc1, double bc2)
+    {
         // SINGLE-PASS fused AdamW. The prior form did a separate full pass over
         // `param` (read+write every element) to apply the decoupled weight decay,
         // then called AdamUpdateSimd which read+wrote `param` AGAIN — two
@@ -393,8 +433,6 @@ internal static class FusedOptimizer
         // is a double, so keeping it in a register is exactly the value the old
         // pre-scale pass stored to memory and the Adam pass reloaded. Mirrors the
         // single-pass structure Adam already had (the optimization AdamW missed).
-        double bc1 = 1.0 - System.Math.Pow(beta1, step);
-        double bc2 = 1.0 - System.Math.Pow(beta2, step);
         double lrAdj = lr / bc1;
         double wdScale = 1.0 - weightDecay * lr;   // hoisted out of the loop
 
@@ -444,11 +482,22 @@ internal static class FusedOptimizer
         float* param, float* grad, float* m, float* v, int length,
         float lr, float beta1, float beta2, float eps, float weightDecay, int step)
     {
+        // Thin wrapper — hoist the step-global bias-correction MathF.Pow so a
+        // per-parameter loop pays it once/step (see the double overloads).
+        float bc1 = 1f - MathF.Pow(beta1, step);
+        float bc2 = 1f - MathF.Pow(beta2, step);
+        AdamWUpdateSimd(param, grad, m, v, length, lr, beta1, beta2, eps, weightDecay, bc1, bc2);
+    }
+
+    /// <summary>Single-pass fused AdamW (float) with precomputed step-global bias
+    /// corrections. Bit-identical to the step overload.</summary>
+    internal static unsafe void AdamWUpdateSimd(
+        float* param, float* grad, float* m, float* v, int length,
+        float lr, float beta1, float beta2, float eps, float weightDecay, float bc1, float bc2)
+    {
         // SINGLE-PASS fused AdamW — see the double overload above. Folds the
         // decoupled weight decay into the Adam update loop so `param` is read+
         // written once instead of twice. Bit-identical to the prior two-pass form.
-        float bc1 = 1f - MathF.Pow(beta1, step);
-        float bc2 = 1f - MathF.Pow(beta2, step);
         float lrAdj = lr / bc1;
         float wdScale = 1f - weightDecay * lr;
 
