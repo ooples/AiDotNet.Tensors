@@ -6221,11 +6221,19 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (tensor == null || SkipUnexercised(p)) continue;
             var arr = tensor.GetLiveBackingArrayAllowingPaddingOrNull() ?? tensor.GetDataArray();
             int len = tensor.Length;
-            for (int i = 0; i < len; i++)
-            {
-                double v = numOps.ToDouble(arr[i]);
-                totalNormSq += v * v;
-            }
+            // SIMD fast path for the two dominant element types (float/double): the
+            // norm is a per-step, full-gradient pass over the ENTIRE parameter set,
+            // and the previous scalar loop with a per-element numOps.ToDouble virtual
+            // call was ~19% of a large-model fused training step (PerfView). Only the
+            // logical [0,len) region is read, so the pool-padding tail never leaks.
+            if (arr is double[] dNorm) totalNormSq += SumSquaresVectorized(dNorm, len);
+            else if (arr is float[] fNorm) totalNormSq += SumSquaresVectorized(fNorm, len);
+            else
+                for (int i = 0; i < len; i++)
+                {
+                    double v = numOps.ToDouble(arr[i]);
+                    totalNormSq += v * v;
+                }
         }
         if (totalNormSq == 0.0) return;
         double totalNorm = Math.Sqrt(totalNormSq);
@@ -6239,9 +6247,79 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (tensor == null || SkipUnexercised(p)) continue;
             var arr = tensor.GetLiveBackingArrayAllowingPaddingOrNull() ?? tensor.GetDataArray();
             int len = tensor.Length;
-            for (int i = 0; i < len; i++)
-                arr[i] = numOps.Multiply(arr[i], scale);
+            if (arr is double[] dScale) ScaleInPlaceVectorized(dScale, len, maxNorm / (totalNorm + 1e-6));
+            else if (arr is float[] fScale) ScaleInPlaceVectorized(fScale, len, (float)(maxNorm / (totalNorm + 1e-6)));
+            else
+                for (int i = 0; i < len; i++)
+                    arr[i] = numOps.Multiply(arr[i], scale);
         }
+    }
+
+    // SIMD sum-of-squares over a[0..len). Uses System.Numerics.Vector&lt;T&gt; (net471-safe
+    // via System.Numerics.Vectors); Vector.Dot with the one-vector reduces the lanes
+    // without requiring the .NET7+ Vector.Sum. The scalar remainder handles len % width.
+    internal static double SumSquaresVectorized(double[] a, int len)
+    {
+        int w = System.Numerics.Vector<double>.Count;
+        var acc = System.Numerics.Vector<double>.Zero;
+        int i = 0;
+        for (; i <= len - w; i += w)
+        {
+            var v = new System.Numerics.Vector<double>(a, i);
+            acc += v * v;
+        }
+        double s = System.Numerics.Vector.Dot(acc, System.Numerics.Vector<double>.One);
+        for (; i < len; i++) s += a[i] * a[i];
+        return s;
+    }
+
+    internal static double SumSquaresVectorized(float[] a, int len)
+    {
+        // Widen each float lane to double BEFORE squaring so the accumulation matches
+        // the prior scalar path (double v = (double)arr[i]; sum += v*v) — squaring in
+        // float first would lose precision for large gradients and could shift the
+        // clip decision. Accumulate the sum of squares in double.
+        int w = System.Numerics.Vector<float>.Count;
+        var accLo = System.Numerics.Vector<double>.Zero;
+        var accHi = System.Numerics.Vector<double>.Zero;
+        int i = 0;
+        for (; i <= len - w; i += w)
+        {
+            var v = new System.Numerics.Vector<float>(a, i);
+            System.Numerics.Vector.Widen(v, out var lo, out var hi);
+            accLo += lo * lo;
+            accHi += hi * hi;
+        }
+        double s = System.Numerics.Vector.Dot(accLo, System.Numerics.Vector<double>.One)
+                 + System.Numerics.Vector.Dot(accHi, System.Numerics.Vector<double>.One);
+        for (; i < len; i++) { double v = a[i]; s += v * v; }
+        return s;
+    }
+
+    internal static void ScaleInPlaceVectorized(double[] a, int len, double scale)
+    {
+        int w = System.Numerics.Vector<double>.Count;
+        var vs = new System.Numerics.Vector<double>(scale);
+        int i = 0;
+        for (; i <= len - w; i += w)
+        {
+            var v = new System.Numerics.Vector<double>(a, i);
+            (v * vs).CopyTo(a, i);
+        }
+        for (; i < len; i++) a[i] *= scale;
+    }
+
+    internal static void ScaleInPlaceVectorized(float[] a, int len, float scale)
+    {
+        int w = System.Numerics.Vector<float>.Count;
+        var vs = new System.Numerics.Vector<float>(scale);
+        int i = 0;
+        for (; i <= len - w; i += w)
+        {
+            var v = new System.Numerics.Vector<float>(a, i);
+            (v * vs).CopyTo(a, i);
+        }
+        for (; i < len; i++) a[i] *= scale;
     }
 
     /// <summary>
