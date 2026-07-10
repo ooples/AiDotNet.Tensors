@@ -79,10 +79,75 @@ public class MultiConsumerGradZeroingTests
         }
     }
 
+    /// <summary>
+    /// Same invariant on the GPU (float): the fix's GPU-resident zeroing path is a
+    /// SEPARATE code path (MemsetBuffer over the precise buffer indices) from the CPU
+    /// one (Array.Clear), so this exercises it directly. Soft-skips when no usable GPU
+    /// is present — the CpuEngine test above still proves the fix on any runner.
+    /// </summary>
+    [Fact]
+    public void AllSpecialized_MultiConsumerBias_GradientStableAcrossSteps_OnGpu()
+    {
+        using var gpu = new DirectGpuTensorEngine();
+        if (!gpu.SupportsGpu)
+            return; // no usable GPU here; CPU test covers correctness
+
+        const int batch = 4, features = 3;
+        var rng = new System.Random(7);
+        var x1 = new Tensor<float>(new[] { batch, features });
+        var x2 = new Tensor<float>(new[] { batch, features });
+        for (int i = 0; i < x1.Length; i++) { x1[i] = (float)rng.NextDouble(); x2[i] = (float)rng.NextDouble(); }
+        var b = new Tensor<float>(new[] { features });
+
+        var prior = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = gpu;
+        try
+        {
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.Enable())
+            {
+                var h1 = gpu.TensorBroadcastAdd(x1, b);
+                var h2 = gpu.TensorBroadcastAdd(x2, b);
+                var s1 = gpu.ReduceSum(h1, null);
+                var s2 = gpu.ReduceSum(h2, null);
+                gpu.TensorAdd(s1, s2);
+                plan = scope.CompileTraining(new[] { b });
+            }
+
+            const float expected = 2.0f * batch; // 8
+            using (plan)
+            {
+                plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
+                plan.Step();
+                var g1 = SnapshotGradF(b, features);
+                plan.Step();
+                var g2 = SnapshotGradF(b, features);
+                for (int f = 0; f < features; f++)
+                {
+                    Assert.Equal(expected, g1[f], 3);
+                    Assert.Equal(expected, g2[f], 3); // pre-fix would be ~16 on step 2
+                    Assert.Equal(g1[f], g2[f], 4);
+                }
+            }
+        }
+        finally
+        {
+            AiDotNetEngine.Current = prior;
+        }
+    }
+
     private static double[] SnapshotGrad(Tensor<double> param, int n)
     {
         var grad = param.Grad ?? throw new System.InvalidOperationException("param.Grad was null after Step");
         var copy = new double[n];
+        for (int i = 0; i < n; i++) copy[i] = grad[i];
+        return copy;
+    }
+
+    private static float[] SnapshotGradF(Tensor<float> param, int n)
+    {
+        var grad = param.Grad ?? throw new System.InvalidOperationException("param.Grad was null after Step");
+        var copy = new float[n];
         for (int i = 0; i < n; i++) copy[i] = grad[i];
         return copy;
     }
