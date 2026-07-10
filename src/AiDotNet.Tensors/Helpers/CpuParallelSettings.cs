@@ -382,6 +382,67 @@ public static class CpuParallelSettings
     }
 
     /// <summary>
+    /// Per-call max-degree-of-parallelism variant. <paramref name="maxDop"/> &lt;= 0 uses the global
+    /// <see cref="MaxDegreeOfParallelism"/>; a positive value caps THIS dispatch (bounded by the
+    /// global). The lightweight-pool drop-in for a <c>Parallel.For</c> whose <c>ParallelOptions</c>
+    /// pin <c>MaxDegreeOfParallelism</c> per call — e.g. the SpMM row loop, which already pre-decides
+    /// serial vs parallel and passes a pinned thread count.
+    /// </summary>
+    /// <param name="numChunks">Number of work items (e.g. rows) to distribute across participants.</param>
+    /// <param name="maxDop">Per-call participant cap; &lt;= 0 uses the global setting.</param>
+    /// <param name="action">Action receiving each work-item index (0..numChunks-1).</param>
+    public static void LightweightParallel(int numChunks, int maxDop, Action<int> action)
+    {
+        PersistentParallelExecutor.Instance.Execute(numChunks, maxDop, action);
+    }
+
+    /// <summary>
+    /// Thread-local-state variant — the persistent-pool drop-in for
+    /// <c>Parallel.For&lt;TLocal&gt;(from, to, localInit, body, localFinally)</c>. Each participant
+    /// (main + each woken worker) gets ONE <typeparamref name="TLocal"/> from
+    /// <paramref name="localInit"/>, reuses it across the strided run of chunks it owns, then disposes
+    /// it once via <paramref name="localFinally"/> — so a per-worker rented buffer (e.g. an im2col
+    /// packing panel) is rented/returned once per participant, not per chunk. <paramref name="maxDop"/>
+    /// &lt;= 0 uses the global <see cref="MaxDegreeOfParallelism"/>.
+    /// </summary>
+    public static void LightweightParallel<TLocal>(int numChunks, int maxDop,
+        Func<TLocal> localInit, Action<int, TLocal> body, Action<TLocal> localFinally)
+    {
+        PersistentParallelExecutor.Instance.Execute(numChunks, maxDop, localInit, body, localFinally);
+    }
+
+    /// <summary>
+    /// Runs a small fixed set of INDEPENDENT actions in parallel on the persistent worker pool —
+    /// the lightweight drop-in for <see cref="System.Threading.Tasks.Parallel.Invoke(Action[])"/>.
+    /// For 0/1 actions (or when parallelism is pinned off / already inside a parallel region) it runs
+    /// them inline. Intended for a flat, fixed handful of tasks (e.g. two independent backward passes);
+    /// NOT for recursive/nested fork-join, which a fixed-worker pool serializes by design — keep those
+    /// on the TPL or restructure to iterative chunking.
+    /// </summary>
+    public static void LightweightInvoke(params Action[] actions)
+    {
+        if (actions is null) throw new ArgumentNullException(nameof(actions));
+        int n = actions.Length;
+        if (n == 0) return;
+        if (n == 1 || MaxDegreeOfParallelism <= 1 || _inParallelRegion)
+        {
+            Exception? first = null;
+            for (int i = 0; i < n; i++)
+            {
+                try { actions[i](); }
+                catch (Exception ex) { first ??= ex; }
+            }
+            if (first is not null) throw first;
+            return;
+        }
+        PersistentParallelExecutor.Instance.Execute(n, i =>
+        {
+            using var _region = EnterParallelRegion();
+            actions[i]();
+        });
+    }
+
+    /// <summary>
     /// Grain-size-aware drop-in for <see cref="System.Threading.Tasks.Parallel.For(int, int, Action{int})"/>.
     /// When <paramref name="totalWork"/> is below
     /// <see cref="PersistentParallelExecutor.DefaultSerialGrainSize"/>,

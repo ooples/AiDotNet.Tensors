@@ -48,6 +48,15 @@ internal sealed class PersistentParallelExecutor
     private volatile Action<int>? _action;
     private volatile int _numChunks;
 
+    // Thread-local-state mode (Execute<TLocal>): when _localBody is non-null the participants
+    // run this instead of _action, each creating ONE TLocal (via _localInit) for the whole strided
+    // run of its chunks and disposing it once (via _localFinally) — the persistent-pool equivalent
+    // of Parallel.For<TLocal>'s per-worker localInit/localFinally (e.g. a rented packing buffer
+    // reused across a worker's chunks). TLocal is boxed to object so the pool stays non-generic.
+    private volatile Func<object?>? _localInit;
+    private volatile Action<int, object?>? _localBody;
+    private volatile Action<object?>? _localFinally;
+
     // Per-dispatch participant stride (= active workers + 1). Workers walk chunks
     // slot+1, slot+1+stride, … so the stride MUST equal the number of participants
     // (main + woken workers) or chunks assigned to non-woken slots are dropped.
@@ -153,6 +162,55 @@ internal sealed class PersistentParallelExecutor
     // change. Written on every Execute.
     private int _lastWorkersNeeded;
 
+    /// <summary>
+    /// Runs one participant's strided chunk set: chunks <paramref name="firstChunk"/>,
+    /// firstChunk+stride, … &lt; <see cref="_numChunks"/>. In normal mode calls <see cref="_action"/>
+    /// per chunk; in thread-local mode (<see cref="_localBody"/> set) creates ONE TLocal via
+    /// <see cref="_localInit"/> for the whole run and disposes it once via <see cref="_localFinally"/>.
+    /// Returns the first exception thrown by any chunk (or localInit/localFinally), matching
+    /// Parallel.For's "finish the rest, re-throw first" semantics. Shared by the main thread and every
+    /// worker so both paths behave identically.
+    /// </summary>
+    private Exception? RunParticipantChunks(int firstChunk, int stride)
+    {
+        Exception? first = null;
+        var localBody = _localBody;
+        if (localBody is null)
+        {
+            var action = _action!;
+            for (int c = firstChunk; c < _numChunks; c += stride)
+            {
+                try { action(c); }
+                catch (Exception ex) { first ??= ex; }
+            }
+            return first;
+        }
+
+        // Thread-local mode: one TLocal for this participant's whole strided run.
+        object? tlocal = null;
+        bool inited = false;
+        try
+        {
+            tlocal = _localInit!();
+            inited = true;
+            for (int c = firstChunk; c < _numChunks; c += stride)
+            {
+                try { localBody(c, tlocal); }
+                catch (Exception ex) { first ??= ex; }
+            }
+        }
+        catch (Exception ex) { first ??= ex; }   // localInit threw
+        finally
+        {
+            if (inited)
+            {
+                try { _localFinally!(tlocal); }
+                catch (Exception ex) { first ??= ex; }
+            }
+        }
+        return first;
+    }
+
     private void WorkerLoop(int slot)
     {
         while (true)
@@ -202,20 +260,11 @@ internal sealed class PersistentParallelExecutor
             // callbacks falls back to sequential instead of deadlocking on _executeLock.
             _isExecuting = true;
             int stride = _stride;   // per-dispatch participant count (main + active workers)
-            int chunkId = slot + 1;
-            while (chunkId < _numChunks)
-            {
-                try
-                {
-                    _action!(chunkId);
-                }
-                catch (Exception ex)
-                {
-                    // Capture first exception — will be re-thrown on the caller thread
-                    Interlocked.CompareExchange(ref _workerException, ex, null);
-                }
-                chunkId += stride;
-            }
+            // Run this worker's strided chunk set (normal or thread-local mode). Capture the
+            // first exception — re-thrown on the caller thread.
+            var workerEx = RunParticipantChunks(slot + 1, stride);
+            if (workerEx is not null)
+                Interlocked.CompareExchange(ref _workerException, workerEx, null);
 
             // Signal completion
             if (Interlocked.Decrement(ref _remaining) == 0)
@@ -295,7 +344,16 @@ internal sealed class PersistentParallelExecutor
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void Execute(int numChunks, Action<int> action)
+    public void Execute(int numChunks, Action<int> action) => Execute(numChunks, 0, action);
+
+    /// <summary>
+    /// Per-dispatch max-degree-of-parallelism variant. <paramref name="maxDop"/> &lt;= 0 uses the
+    /// global <see cref="CpuParallelSettings.MaxDegreeOfParallelism"/>; a positive value caps THIS
+    /// dispatch's participant count (bounded by the global, so the process-wide "pin to 1" off-switch
+    /// still wins). The drop-in for a <c>Parallel.For</c> whose <c>ParallelOptions.MaxDegreeOfParallelism</c>
+    /// is set per call (e.g. the SpMM row loop's thread pin).
+    /// </summary>
+    public void Execute(int numChunks, int maxDop, Action<int> action)
     {
         if (numChunks <= 0)
             return;
@@ -322,8 +380,9 @@ internal sealed class PersistentParallelExecutor
                 // MaxDoP-1 workers (the caller participates as the MaxDoP-th). The parked pool
                 // is machine-width, but a low MaxDoP must not oversubscribe — and the stride
                 // below is set to the participant count so the un-woken slots' chunks aren't
-                // dropped.
-                int maxDeg = CpuParallelSettings.MaxDegreeOfParallelism;
+                // dropped. A positive per-call maxDop caps this further (bounded by the global).
+                int globalMaxDeg = CpuParallelSettings.MaxDegreeOfParallelism;
+                int maxDeg = maxDop > 0 ? Math.Min(maxDop, globalMaxDeg) : globalMaxDeg;
                 int effWorkers = Math.Min(_numWorkers, Math.Max(0, maxDeg - 1));
                 int workersNeeded = Math.Min(numChunks - 1, effWorkers);
                 int stride = workersNeeded + 1;   // participants = main + woken workers
@@ -348,22 +407,10 @@ internal sealed class PersistentParallelExecutor
                     _workReady[i].Set();
                 }
 
-                // Main thread does chunk 0 and any overflow chunks (round-robin by stride:
-                // main gets 0, stride, 2*stride, …; worker slot i gets i+1, i+1+stride, …).
-                Exception? mainException = null;
-                int mainChunk = 0;
-                while (mainChunk < numChunks)
-                {
-                    try
-                    {
-                        action(mainChunk);
-                    }
-                    catch (Exception ex)
-                    {
-                        mainException ??= ex;
-                    }
-                    mainChunk += stride;
-                }
+                // Main thread runs its strided chunk set (chunk 0, stride, 2*stride, …) — the
+                // same RunParticipantChunks path every worker takes, so normal and thread-local
+                // modes behave identically across all participants.
+                Exception? mainException = RunParticipantChunks(0, stride);
 
                 // Wait for the woken workers to finish (each decrements _remaining; the last
                 // sets _allDone). Skip when no workers were woken (workersNeeded == 0, e.g.
@@ -380,6 +427,100 @@ internal sealed class PersistentParallelExecutor
                     throw mainException;
                 if (workerEx is not null)
                     throw workerEx;
+            }
+            finally
+            {
+                _isExecuting = false;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Thread-local-state variant — the persistent-pool equivalent of
+    /// <see cref="System.Threading.Tasks.Parallel.For{TLocal}(int,int,Func{TLocal},Func{int,System.Threading.Tasks.ParallelLoopState,TLocal,TLocal},Action{TLocal})"/>.
+    /// Each participant (main + each woken worker) calls <paramref name="localInit"/> ONCE, reuses that
+    /// TLocal across the strided run of chunks it owns (<paramref name="body"/>(chunk, tlocal)), then
+    /// calls <paramref name="localFinally"/> ONCE — so a per-worker rented buffer is rented/returned
+    /// once per participant, not per chunk. <paramref name="maxDop"/> &lt;= 0 uses the global cap.
+    /// </summary>
+    public void Execute<TLocal>(int numChunks, int maxDop,
+        Func<TLocal> localInit, Action<int, TLocal> body, Action<TLocal> localFinally)
+    {
+        if (numChunks <= 0) return;
+        if (localInit is null) throw new ArgumentNullException(nameof(localInit));
+        if (body is null) throw new ArgumentNullException(nameof(body));
+        if (localFinally is null) throw new ArgumentNullException(nameof(localFinally));
+
+        // Single-chunk or reentrant/nested: run inline on the calling thread, still honoring the
+        // one-TLocal lifecycle. (Reentrancy would otherwise deadlock on _executeLock.)
+        if (numChunks == 1 || _isExecuting)
+        {
+            TLocal tl = localInit();
+            Exception? first = null;
+            try
+            {
+                for (int c = 0; c < numChunks; c++)
+                {
+                    try { body(c, tl); }
+                    catch (Exception ex) { first ??= ex; }
+                }
+            }
+            finally
+            {
+                try { localFinally(tl); }
+                catch (Exception ex) { first ??= ex; }
+            }
+            if (first is not null) throw first;
+            return;
+        }
+
+        lock (_executeLock)
+        {
+            _isExecuting = true;
+            try
+            {
+                // Publish the boxed TLocal lifecycle BEFORE waking workers (the _workReady Set()
+                // release barrier + volatile fields make it visible). RunParticipantChunks runs
+                // this path when _localBody is set.
+                _localInit = () => localInit();
+                _localBody = (c, o) => body(c, (TLocal)o!);
+                _localFinally = o => localFinally((TLocal)o!);
+                try
+                {
+                    int globalMaxDeg = CpuParallelSettings.MaxDegreeOfParallelism;
+                    int maxDeg = maxDop > 0 ? Math.Min(maxDop, globalMaxDeg) : globalMaxDeg;
+                    int effWorkers = Math.Min(_numWorkers, Math.Max(0, maxDeg - 1));
+                    int workersNeeded = Math.Min(numChunks - 1, effWorkers);
+                    int stride = workersNeeded + 1;
+
+                    System.Threading.Volatile.Write(ref _lastWorkersNeeded, workersNeeded);
+                    System.Threading.Volatile.Write(ref _lastDispatchTicks, System.Diagnostics.Stopwatch.GetTimestamp());
+
+                    _action = null;
+                    _numChunks = numChunks;
+                    _stride = stride;
+                    _remaining = workersNeeded;
+                    _workerException = null;
+                    _allDone.Reset();
+
+                    for (int i = 0; i < workersNeeded; i++)
+                        _workReady[i].Set();
+
+                    Exception? mainException = RunParticipantChunks(0, stride);
+
+                    if (workersNeeded > 0)
+                        _allDone.Wait();
+
+                    var workerEx = _workerException;
+                    if (mainException is not null) throw mainException;
+                    if (workerEx is not null) throw workerEx;
+                }
+                finally
+                {
+                    _localInit = null;
+                    _localBody = null;
+                    _localFinally = null;
+                }
             }
             finally
             {
