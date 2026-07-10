@@ -44,25 +44,41 @@ internal sealed class PersistentParallelExecutor
     // Per-worker signaling: workers wait on these to receive work
     private readonly ManualResetEventSlim[] _workReady;
 
-    // Shared work state — written by dispatcher, read by workers
-    private volatile Action<int>? _action;
-    private volatile int _numChunks;
+    // Per-dispatch work — ONE immutable Job published atomically via _job before any worker is woken.
+    // A worker reads _job once and takes everything (body, chunk count, stride) from that single
+    // reference, so it can never observe a partially-updated or cross-dispatch-contaminated field set
+    // — the class of race that made the earlier shared-mutable-field design fragile under load.
+    // Cleared to null after each dispatch so the body's captured references (e.g. the large im2col /
+    // GEMM arrays a thread-local body closes over) are released for GC between dispatches.
+    private volatile Job? _job;
 
-    // Thread-local-state mode (Execute<TLocal>): when _localBody is non-null the participants
-    // run this instead of _action, each creating ONE TLocal (via _localInit) for the whole strided
-    // run of its chunks and disposing it once (via _localFinally) — the persistent-pool equivalent
-    // of Parallel.For<TLocal>'s per-worker localInit/localFinally (e.g. a rented packing buffer
-    // reused across a worker's chunks). TLocal is boxed to object so the pool stays non-generic.
-    private volatile Func<object?>? _localInit;
-    private volatile Action<int, object?>? _localBody;
-    private volatile Action<object?>? _localFinally;
+    /// <summary>
+    /// Immutable snapshot of one dispatch. Either <see cref="Action"/> (plain mode) OR the
+    /// <see cref="LocalInit"/>/<see cref="LocalBody"/>/<see cref="LocalFinally"/> trio (thread-local
+    /// mode — each participant builds ONE TLocal, boxed to object, and reuses it across its strided
+    /// chunks) is set. Chunks are distributed round-robin across participants by <see cref="Stride"/>
+    /// (= active workers + 1): participant p runs p, p+Stride, … &lt; <see cref="NumChunks"/>.
+    /// </summary>
+    private sealed class Job
+    {
+        public readonly Action<int>? Action;
+        public readonly Func<object?>? LocalInit;
+        public readonly Action<int, object?>? LocalBody;
+        public readonly Action<object?>? LocalFinally;
+        public readonly int NumChunks;
+        public readonly int Stride;
 
-    // Per-dispatch participant stride (= active workers + 1). Workers walk chunks
-    // slot+1, slot+1+stride, … so the stride MUST equal the number of participants
-    // (main + woken workers) or chunks assigned to non-woken slots are dropped.
-    // Set per Execute so a low MaxDegreeOfParallelism wakes fewer workers without
-    // losing chunks. Volatile: published before _workReady[i].Set() wakes a worker.
-    private volatile int _stride = 1;
+        public Job(Action<int>? action, Func<object?>? localInit, Action<int, object?>? localBody,
+            Action<object?>? localFinally, int numChunks, int stride)
+        {
+            Action = action;
+            LocalInit = localInit;
+            LocalBody = localBody;
+            LocalFinally = localFinally;
+            NumChunks = numChunks;
+            Stride = stride;
+        }
+    }
 
     // Completion tracking — workers decrement, dispatcher waits for zero
     private int _remaining;
@@ -164,21 +180,22 @@ internal sealed class PersistentParallelExecutor
 
     /// <summary>
     /// Runs one participant's strided chunk set: chunks <paramref name="firstChunk"/>,
-    /// firstChunk+stride, … &lt; <see cref="_numChunks"/>. In normal mode calls <see cref="_action"/>
-    /// per chunk; in thread-local mode (<see cref="_localBody"/> set) creates ONE TLocal via
-    /// <see cref="_localInit"/> for the whole run and disposes it once via <see cref="_localFinally"/>.
-    /// Returns the first exception thrown by any chunk (or localInit/localFinally), matching
-    /// Parallel.For's "finish the rest, re-throw first" semantics. Shared by the main thread and every
-    /// worker so both paths behave identically.
+    /// firstChunk+Stride, … &lt; <c>job.NumChunks</c>. In normal mode calls <c>job.Action</c> per chunk;
+    /// in thread-local mode (<c>job.LocalBody</c> set) creates ONE TLocal via <c>job.LocalInit</c> for
+    /// the whole run and disposes it once via <c>job.LocalFinally</c>. Returns the first exception
+    /// thrown by any chunk (or localInit/localFinally), matching Parallel.For's "finish the rest,
+    /// re-throw first" semantics. Shared by the main thread and every worker (each passed the SAME
+    /// immutable <paramref name="job"/>) so both paths behave identically.
     /// </summary>
-    private Exception? RunParticipantChunks(int firstChunk, int stride)
+    private static Exception? RunParticipantChunks(Job job, int firstChunk)
     {
         Exception? first = null;
-        var localBody = _localBody;
+        int numChunks = job.NumChunks, stride = job.Stride;
+        var localBody = job.LocalBody;
         if (localBody is null)
         {
-            var action = _action!;
-            for (int c = firstChunk; c < _numChunks; c += stride)
+            var action = job.Action!;
+            for (int c = firstChunk; c < numChunks; c += stride)
             {
                 try { action(c); }
                 catch (Exception ex) { first ??= ex; }
@@ -191,9 +208,9 @@ internal sealed class PersistentParallelExecutor
         bool inited = false;
         try
         {
-            tlocal = _localInit!();
+            tlocal = job.LocalInit!();
             inited = true;
-            for (int c = firstChunk; c < _numChunks; c += stride)
+            for (int c = firstChunk; c < numChunks; c += stride)
             {
                 try { localBody(c, tlocal); }
                 catch (Exception ex) { first ??= ex; }
@@ -204,7 +221,7 @@ internal sealed class PersistentParallelExecutor
         {
             if (inited)
             {
-                try { _localFinally!(tlocal); }
+                try { job.LocalFinally!(tlocal); }
                 catch (Exception ex) { first ??= ex; }
             }
         }
@@ -259,10 +276,13 @@ internal sealed class PersistentParallelExecutor
             // Set reentrancy guard on worker thread so nested Execute() from
             // callbacks falls back to sequential instead of deadlocking on _executeLock.
             _isExecuting = true;
-            int stride = _stride;   // per-dispatch participant count (main + active workers)
+            // Read the whole dispatch atomically: _job was published (volatile) BEFORE this worker's
+            // _workReady was Set, so this single acquiring read gives a fully-consistent Job — no
+            // chance of a half-updated body/stride/chunk-count from a concurrent or prior dispatch.
+            var job = _job!;
             // Run this worker's strided chunk set (normal or thread-local mode). Capture the
             // first exception — re-thrown on the caller thread.
-            var workerEx = RunParticipantChunks(slot + 1, stride);
+            var workerEx = RunParticipantChunks(job, slot + 1);
             if (workerEx is not null)
                 Interlocked.CompareExchange(ref _workerException, workerEx, null);
 
@@ -393,13 +413,14 @@ internal sealed class PersistentParallelExecutor
                 System.Threading.Volatile.Write(ref _lastWorkersNeeded, workersNeeded);
                 System.Threading.Volatile.Write(ref _lastDispatchTicks, System.Diagnostics.Stopwatch.GetTimestamp());
 
-                // Setup shared state
-                _action = action;
-                _numChunks = numChunks;
-                _stride = stride;                 // publish BEFORE waking any worker
+                // Completion state, then publish the whole dispatch as ONE immutable Job. The
+                // _job volatile write (and the _workReady Set() release below) publishes _remaining
+                // too, so a woken worker reads a fully-consistent dispatch.
                 _remaining = workersNeeded;
                 _workerException = null;
                 _allDone.Reset();
+                _job = new Job(action, null, null, null, numChunks, stride); // publish BEFORE waking any worker
+                var job = _job;
 
                 // Wake workers (they're already spinning/blocked on ManualResetEventSlim)
                 for (int i = 0; i < workersNeeded; i++)
@@ -410,7 +431,7 @@ internal sealed class PersistentParallelExecutor
                 // Main thread runs its strided chunk set (chunk 0, stride, 2*stride, …) — the
                 // same RunParticipantChunks path every worker takes, so normal and thread-local
                 // modes behave identically across all participants.
-                Exception? mainException = RunParticipantChunks(0, stride);
+                Exception? mainException = RunParticipantChunks(job, 0);
 
                 // Wait for the woken workers to finish (each decrements _remaining; the last
                 // sets _allDone). Skip when no workers were woken (workersNeeded == 0, e.g.
@@ -419,7 +440,7 @@ internal sealed class PersistentParallelExecutor
                 if (workersNeeded > 0)
                     _allDone.Wait();
 
-                _action = null;
+                _job = null; // release the body's captured references for GC between dispatches
 
                 // Re-throw first captured exception (worker or main thread)
                 var workerEx = _workerException;
@@ -479,48 +500,42 @@ internal sealed class PersistentParallelExecutor
             _isExecuting = true;
             try
             {
-                // Publish the boxed TLocal lifecycle BEFORE waking workers (the _workReady Set()
-                // release barrier + volatile fields make it visible). RunParticipantChunks runs
-                // this path when _localBody is set.
-                _localInit = () => localInit();
-                _localBody = (c, o) => body(c, (TLocal)o!);
-                _localFinally = o => localFinally((TLocal)o!);
-                try
-                {
-                    int globalMaxDeg = CpuParallelSettings.MaxDegreeOfParallelism;
-                    int maxDeg = maxDop > 0 ? Math.Min(maxDop, globalMaxDeg) : globalMaxDeg;
-                    int effWorkers = Math.Min(_numWorkers, Math.Max(0, maxDeg - 1));
-                    int workersNeeded = Math.Min(numChunks - 1, effWorkers);
-                    int stride = workersNeeded + 1;
+                int globalMaxDeg = CpuParallelSettings.MaxDegreeOfParallelism;
+                int maxDeg = maxDop > 0 ? Math.Min(maxDop, globalMaxDeg) : globalMaxDeg;
+                int effWorkers = Math.Min(_numWorkers, Math.Max(0, maxDeg - 1));
+                int workersNeeded = Math.Min(numChunks - 1, effWorkers);
+                int stride = workersNeeded + 1;
 
-                    System.Threading.Volatile.Write(ref _lastWorkersNeeded, workersNeeded);
-                    System.Threading.Volatile.Write(ref _lastDispatchTicks, System.Diagnostics.Stopwatch.GetTimestamp());
+                System.Threading.Volatile.Write(ref _lastWorkersNeeded, workersNeeded);
+                System.Threading.Volatile.Write(ref _lastDispatchTicks, System.Diagnostics.Stopwatch.GetTimestamp());
 
-                    _action = null;
-                    _numChunks = numChunks;
-                    _stride = stride;
-                    _remaining = workersNeeded;
-                    _workerException = null;
-                    _allDone.Reset();
+                // Completion state, then publish the whole thread-local dispatch as ONE Job (the
+                // boxed TLocal lifecycle lives inside it), atomically, BEFORE waking any worker.
+                _remaining = workersNeeded;
+                _workerException = null;
+                _allDone.Reset();
+                _job = new Job(
+                    action: null,
+                    localInit: () => localInit(),
+                    localBody: (c, o) => body(c, (TLocal)o!),
+                    localFinally: o => localFinally((TLocal)o!),
+                    numChunks: numChunks,
+                    stride: stride);
+                var job = _job;
 
-                    for (int i = 0; i < workersNeeded; i++)
-                        _workReady[i].Set();
+                for (int i = 0; i < workersNeeded; i++)
+                    _workReady[i].Set();
 
-                    Exception? mainException = RunParticipantChunks(0, stride);
+                Exception? mainException = RunParticipantChunks(job, 0);
 
-                    if (workersNeeded > 0)
-                        _allDone.Wait();
+                if (workersNeeded > 0)
+                    _allDone.Wait();
 
-                    var workerEx = _workerException;
-                    if (mainException is not null) throw mainException;
-                    if (workerEx is not null) throw workerEx;
-                }
-                finally
-                {
-                    _localInit = null;
-                    _localBody = null;
-                    _localFinally = null;
-                }
+                _job = null; // release the body's captured references for GC between dispatches
+
+                var workerEx = _workerException;
+                if (mainException is not null) throw mainException;
+                if (workerEx is not null) throw workerEx;
             }
             finally
             {
