@@ -103,31 +103,95 @@ internal sealed class PersistentParallelExecutor
     // Captured worker exception (first one wins)
     private volatile Exception? _workerException;
 
-    // Warm-pool keep-alive: after finishing an op, busy-spin checking for the next
-    // dispatch for up to this many SpinWait rounds before falling back to the
-    // blocking Wait(). The MRES spinCount (2047, ~tens of µs) is too short to bridge
-    // the inter-op gaps in a forward pass (LayerNorm→MHA→FFN→…), so workers block and
-    // pay the full wakeup latency on EVERY op — profiled as the dominant small-op cost
-    // (a transformer LayerNorm measured 192 µs parked vs ~65 µs of actual work). A
-    // longer warm window keeps workers hot ACROSS the forward pass so back-to-back ops
-    // find them spinning (≈ free dispatch). Trade-off: CPU burned during genuinely-idle
-    // gaps; bounded by the spin count, then it parks. Env-tunable; 0 = original (park
-    // immediately via MRES spin only). Each SpinWait(32) ≈ ~1 µs, so 256 ≈ ~256 µs warm.
-    private static readonly int _warmSpins =
-        int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_PPE_WARMSPIN"), out var ws) && ws > 0 ? ws : 0;
+    // Adaptive keep-warm window (Stopwatch ticks). After finishing an op, a worker
+    // stays hot — cooperatively spinning for the next dispatch — for as long as the
+    // pool has been dispatched-to within this window, then parks (blocks) so a
+    // genuinely-idle pool burns no CPU.
+    //
+    // Why time-, not spin-count-based: the MRES spinCount and the old fixed SpinWait
+    // budget (#475 lowered it to 32 to stop ~12 idle cores burning during training)
+    // are far too short to bridge the inter-op gaps in a forward pass
+    // (LayerNorm→MHA→FFN→…), so a parked worker paid the full OS wakeup latency on
+    // EVERY op — profiled as the dominant small-op cost (a transformer LayerNorm
+    // measured 192 µs parked vs ~65 µs of actual work), and the head-to-head bench
+    // showed a ~70 µs wakeup floor on cold medium-work dispatches. A window keyed on
+    // *dispatch recency* keeps workers hot across a hot loop (training / a forward
+    // pass issue dispatches every few µs, so the window never lapses → near-free
+    // dispatch) yet lets them park the moment the loop ends.
+    //
+    // Why this no longer re-introduces the #475 idle burn / oversubscription: the
+    // spin is COOPERATIVE — it yields the core (Thread.Yield) on a fixed cadence, so
+    // a spinning worker releases its core to the dispatcher / other runnable work
+    // instead of monopolizing it. A fixed busy-SpinWait budget (the naive keep-warm)
+    // instead blew up 7× at high worker counts because ~31 workers all held cores and
+    // starved the dispatcher; the periodic yield removes that (verified: 64-chunk/32-
+    // worker dispatch stays ~equal to Parallel.For instead of the 1.8× regression the
+    // busy-spin showed). Env override AIDOTNET_PPE_WARMWINDOW_US sets the window in
+    // microseconds; 0 disables (park immediately). Default 200 µs.
+    private static readonly long _warmWindowTicks = ComputeWarmWindowTicks();
+
+    private static long ComputeWarmWindowTicks()
+    {
+        long micros = 200;
+        if (int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_PPE_WARMWINDOW_US"), out var us) && us >= 0)
+            micros = us;
+        // ticks = seconds * frequency = (micros / 1e6) * Stopwatch.Frequency
+        return (long)(micros * (System.Diagnostics.Stopwatch.Frequency / 1_000_000.0));
+    }
+
+    // Timestamp (Stopwatch ticks) of the most recent dispatch. Workers read this to
+    // decide whether to keep warm-spinning or park. Written on every Execute.
+    private long _lastDispatchTicks;
+
+    // Worker count of the most recent dispatch. Warm-spinning only pays off when the
+    // dispatch leaves SPARE cores: a worker that busy-spins on a core the dispatcher
+    // (or another about-to-run worker) needs just steals it, so a dispatch that
+    // already saturates the machine (workersNeeded ≈ _numWorkers) must PARK its
+    // workers instead — spinning there caused the 7× oversubscription blow-up in the
+    // 64-chunk/32-core bench. Workers read this (from the previous, same-shape dispatch
+    // in a hot loop) to gate the warm-spin; it self-corrects within one op on a shape
+    // change. Written on every Execute.
+    private int _lastWorkersNeeded;
 
     private void WorkerLoop(int slot)
     {
         while (true)
         {
-            // Warm-spin for the next dispatch before blocking (keeps the pool hot across
-            // a forward pass so small back-to-back ops skip the park/wakeup latency).
-            if (_warmSpins > 0)
+            // Adaptive cooperative warm-spin: stay hot while the pool is actively
+            // being dispatched to (recency window), but yield the core periodically so
+            // we never oversubscribe the dispatcher, and give up to a blocking park
+            // once the pool goes idle past the window.
+            long warm = _warmWindowTicks;
+            // Only warm-spin when the last dispatch left spare cores (workersNeeded <
+            // _numWorkers). When a dispatch saturates the machine, spinning steals the
+            // core the dispatcher needs → oversubscription; park instead so the wakeup
+            // overlaps the (already large, since saturating dispatches are big-work) op.
+            if (warm > 0 && System.Threading.Volatile.Read(ref _lastWorkersNeeded) < _numWorkers && !_workReady[slot].IsSet)
             {
-                for (int s = 0; s < _warmSpins && !_workReady[slot].IsSet; s++)
+                int spins = 0;
+                while (!_workReady[slot].IsSet)
+                {
+                    // Tight, responsive spin on EVERY iteration so an imminent dispatch is
+                    // caught in ~tens of ns (checking IsSet each pass). Yielding on every
+                    // pass — the naive "cooperative" version — deschedules a hot worker out
+                    // from under the very dispatch it is waiting for, which measured SLOWER
+                    // than parking on realistic inter-op-gap loops (118 µs vs 80 µs/op).
                     System.Threading.Thread.SpinWait(32);
+                    if ((++spins & 0x1FF) == 0)
+                    {
+                        // Only every ~512 passes (~tens of µs): a single cooperative yield as
+                        // a pressure-relief valve for the pathological all-workers-spinning-on-
+                        // a-saturated-machine case (this is what kept the busy-spin from the
+                        // 7× oversubscription blow-up), plus the idle-window check that parks
+                        // the worker once the pool goes quiet. Infrequent enough that it never
+                        // costs a hot worker its responsiveness.
+                        System.Threading.Thread.Yield();
+                        if (System.Diagnostics.Stopwatch.GetTimestamp() - System.Threading.Volatile.Read(ref _lastDispatchTicks) >= warm)
+                            break;
+                    }
+                }
             }
-            // Wait for work signal (returns immediately if a warm-spin already saw it).
+            // Wait for work signal (returns immediately if the warm-spin already saw it).
             _workReady[slot].Wait();
             _workReady[slot].Reset();
 
@@ -263,6 +327,12 @@ internal sealed class PersistentParallelExecutor
                 int effWorkers = Math.Min(_numWorkers, Math.Max(0, maxDeg - 1));
                 int workersNeeded = Math.Min(numChunks - 1, effWorkers);
                 int stride = workersNeeded + 1;   // participants = main + woken workers
+
+                // Publish dispatch time + worker count so warm-spinning workers know the
+                // pool is active and whether this dispatch left spare cores to spin on
+                // (adaptive keep-warm, gated on spare capacity).
+                System.Threading.Volatile.Write(ref _lastWorkersNeeded, workersNeeded);
+                System.Threading.Volatile.Write(ref _lastDispatchTicks, System.Diagnostics.Stopwatch.GetTimestamp());
 
                 // Setup shared state
                 _action = action;

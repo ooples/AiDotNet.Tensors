@@ -29,6 +29,21 @@ class Program
             return;
         }
 
+        // Head-to-head of the CPU parallel-dispatch primitives (Parallel.For vs
+        // LightweightParallel vs ParallelForOrSerial) to pick the superior one
+        // for replacing bare Parallel.For at layer call sites.
+        if (args[0] == "--ab-parallel")
+        {
+            ParallelPrimitiveBench.Run();
+            return;
+        }
+
+        if (args[0] == "--ab-parallel-cpu")
+        {
+            ParallelPrimitiveBench.CpuBurn();
+            return;
+        }
+
         // Issue #436: same-machine head-to-head of the fused inference
         // primitives (MLP / MHA / LSTM) vs TorchSharp at the AIsEval shapes.
         // Win = AiDotNet p95 < PyTorch median.
