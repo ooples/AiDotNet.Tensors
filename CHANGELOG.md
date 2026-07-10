@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.113.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.112.0...v0.113.0) (2026-07-10)
+
+
+### Features
+
+* **training:** compiled backward + createGraph, DP-SGD, multi-slot persistent inputs ([#763](https://github.com/ooples/AiDotNet.Tensors/issues/763)) ([b7cf72e](https://github.com/ooples/AiDotNet.Tensors/commit/b7cf72e1838455f9d57b46e2e0d2e4f0c953e3d1))
+
+
+### Performance
+
+* **compile:** SIMD-vectorize global-L2 gradient clip in fused training ([#766](https://github.com/ooples/AiDotNet.Tensors/issues/766)) ([ea98267](https://github.com/ooples/AiDotNet.Tensors/commit/ea98267f85d5f762f07313563064627c952f3b5e))
+* fused-training optimizer + arena suite (clip SIMD, moment pooling, AdamW fusion, bias-corr hoist, multi-tensor foreach) ([#770](https://github.com/ooples/AiDotNet.Tensors/issues/770)) ([7c8455d](https://github.com/ooples/AiDotNet.Tensors/commit/7c8455db631c4acc9abd9a6f4420b1e0251f400d))
+
 ## [0.112.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.111.2...v0.112.0) (2026-07-10)
 
 
