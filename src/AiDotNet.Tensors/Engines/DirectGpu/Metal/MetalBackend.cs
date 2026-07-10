@@ -72,6 +72,10 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     private IntPtr _roiLibrary;
     private IntPtr _audioLibrary;
     private IntPtr _fusedAdvancedLibrary;
+    // Sparse-op compute kernels (CSR SpMM + SDDMM). Compiled from
+    // MetalSparseKernels.Source; the sparse-autograd backward's dB and dA
+    // dispatch through here on Apple hardware without touching MPS.
+    private IntPtr _sparseLibrary;
 
     #region Properties
 
@@ -259,6 +263,21 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         catch (Exception ex)
         {
             System.Diagnostics.Debug.WriteLine($"Metal IoULoss pre-compilation warning: {ex.Message}");
+        }
+
+        // Sparse compute kernels (CSR SpMM + SDDMM) — Metal-native replacement
+        // for the previous CPU download-compute-upload stub in MetalBackend.Sparse.CsrSpMM,
+        // plus the SDDMM primitive the tape-aware sparse-autograd backward needs.
+        // Optional: if compilation fails, callers fall back to the CPU / MPS tiers.
+        try
+        {
+            _sparseLibrary = _shaderLibrary.CompileLibrary("Sparse",
+                MetalSparseKernels.Source);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Metal Sparse pre-compilation warning: {ex.Message}");
+            _sparseLibrary = IntPtr.Zero;
         }
 
         // Parity-210 hot-path kernels — same function surface as CUDA/HIP.
