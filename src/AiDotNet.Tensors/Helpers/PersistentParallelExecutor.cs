@@ -391,6 +391,22 @@ internal sealed class PersistentParallelExecutor
             return;
         }
 
+        // Single global A/B / kill-switch (AIDOTNET_COOP_POOL=0), in ONE place for every
+        // call site (PR #762 consolidation): route the whole dispatch to the .NET ThreadPool's
+        // Parallel.For instead of the persistent worker pool. Disjoint [0,numChunks) chunks ⇒
+        // bit-identical to the pool path. This is the ONLY remaining Parallel.For dispatch on the
+        // CPU compute path — kept as the benchmark baseline (ParallelPrimitiveBench --ab-parallel)
+        // and the operational rollback if the pool ever misbehaves on an unusual host.
+        if (!CpuParallelSettings.UseCooperativePool)
+        {
+            int gm = CpuParallelSettings.MaxDegreeOfParallelism;
+            int md = maxDop > 0 ? Math.Min(maxDop, gm) : gm;
+            System.Threading.Tasks.Parallel.For(0, numChunks,
+                new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, md) },
+                action);
+            return;
+        }
+
         lock (_executeLock)
         {
             _isExecuting = true;
@@ -495,6 +511,21 @@ internal sealed class PersistentParallelExecutor
             return;
         }
 
+        // Single global A/B / kill-switch (AIDOTNET_COOP_POOL=0) — one place for the thread-local
+        // path too. Parallel.For's TLocal overload preserves the one-local-per-task + merge-once
+        // semantics (localFinally runs per task, same as the pool's per-participant merge).
+        if (!CpuParallelSettings.UseCooperativePool)
+        {
+            int gm = CpuParallelSettings.MaxDegreeOfParallelism;
+            int md = maxDop > 0 ? Math.Min(maxDop, gm) : gm;
+            System.Threading.Tasks.Parallel.For(0, numChunks,
+                new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, md) },
+                localInit,
+                (c, state, tl) => { body(c, tl); return tl; },
+                localFinally);
+            return;
+        }
+
         lock (_executeLock)
         {
             _isExecuting = true;
@@ -542,5 +573,35 @@ internal sealed class PersistentParallelExecutor
                 _isExecuting = false;
             }
         }
+    }
+
+    /// <summary>
+    /// Reducing thread-local variant — the persistent-pool equivalent of
+    /// <see cref="System.Threading.Tasks.Parallel.For{TLocal}(int,int,Func{TLocal},Func{int,System.Threading.Tasks.ParallelLoopState,TLocal,TLocal},Action{TLocal})"/>
+    /// where the body <b>returns</b> the updated accumulator (functional reduction over a value- or
+    /// reference-type <typeparamref name="TLocal"/>) rather than mutating it in place. Each participant
+    /// seeds one accumulator via <paramref name="localInit"/>, threads it through its strided chunk set
+    /// (<c>local = reduceBody(chunk, local)</c>), then merges once via <paramref name="localFinally"/>.
+    ///
+    /// <para>Built on the in-place <see cref="Execute{TLocal}(int,int,Func{TLocal},Action{int,TLocal},Action{TLocal})"/>
+    /// overload by holding the accumulator in a single-element <c>TLocal[]</c>, so it reuses the exact
+    /// same (validated) Job dispatch/join machinery — the array is the per-participant reference the
+    /// Action overload mutates, and its element is the threaded accumulator. (A one-element array is
+    /// used rather than <see cref="StrongBox{T}"/> because array element access is typed
+    /// <c>TLocal</c>, not <c>TLocal?</c>, so it needs no null-suppression on the reduce/merge calls.)</para>
+    /// </summary>
+    public void Execute<TLocal>(int numChunks, int maxDop,
+        Func<TLocal> localInit, Func<int, TLocal, TLocal> reduceBody, Action<TLocal> localFinally)
+    {
+        if (localInit is null) throw new ArgumentNullException(nameof(localInit));
+        if (reduceBody is null) throw new ArgumentNullException(nameof(reduceBody));
+        if (localFinally is null) throw new ArgumentNullException(nameof(localFinally));
+
+        Execute<TLocal[]>(
+            numChunks,
+            maxDop,
+            localInit: () => new[] { localInit() },
+            body: (chunk, slot) => slot[0] = reduceBody(chunk, slot[0]),
+            localFinally: slot => localFinally(slot[0]));
     }
 }
