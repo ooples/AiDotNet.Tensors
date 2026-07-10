@@ -2329,12 +2329,37 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // Reading the tensor's CURRENT resident buffer each step makes the optimizer consume the grads
                     // the captured backward actually produced. Mirrors the param-side pin near the GPU fast path.
                     // Eager paths are unaffected: a non-resident grad still yields null here → gpuGrad/host fallback.
-                    Engines.DirectGpu.IGpuBuffer? gradBuf = (_gradients[p]?.TryGetGpuBuffer()) ?? gpuGrad[p];
+                    // The #638 line trusts the grad tensor's resident GPU buffer as authoritative. That is correct
+                    // ONLY when that buffer actually holds the gradient the backward produced THIS step. Two backward
+                    // paths write it and keep its version in sync with the tensor Version: (a) CUDA-graph capture —
+                    // the captured backward writes it in place; (b) the FP16-hetero resident backward. But the plain
+                    // eager backward instead accumulates into the grad's HOST backing (gradArrays[p]) and leaves the
+                    // resident buffer at its memset-zero: Version bumps, _gpuBufferVersion does NOT. Consuming that
+                    // stale-zero buffer makes the fused optimizer apply ~ZERO grads, so the weights barely move and
+                    // the loss goes FLAT — the GPU-resident-param mistrain (7.70->7.70 resident vs 7.70->1.31
+                    // non-resident on the same graph; the TimeSeries family runs this path by default). So trust the
+                    // resident grad buffer only when it is version-FRESH (or we are mid stream-capture, where a host
+                    // download is impossible anyway); otherwise upload the authoritative HOST gradient the backward
+                    // produced. This keeps the #638 capture path AND the FP16 resident backward intact.
+                    bool gradStreamCapturing =
+                        gpuBe is Engines.DirectGpu.CUDA.CudaBackend _cbGrad && _cbGrad.IsStreamCapturing();
+                    var _gradT = _gradients[p];
+                    bool residentGradAuthoritative = _gradT is not null && _gradT.TryGetGpuBuffer() is not null
+                        && (gradStreamCapturing || _gradT._gpuBufferVersion == _gradT.Version);
+                    Engines.DirectGpu.IGpuBuffer? gradBuf = residentGradAuthoritative
+                        ? _gradT!.TryGetGpuBuffer()
+                        : null;
                     bool gradTransient = false;
                     if (gradBuf is null)
                     {
-                        if (gradArrays[p].Length == 0) continue; // no grad recorded
-                        gradBuf = gpuBe.AllocateBuffer(gradArrays[p]);
+                        float[] hostGrad = gradArrays[p];
+                        if (hostGrad.Length == 0)
+                        {
+                            var liveGrad = _gradients[p]?.GetLiveBackingArrayAllowingPaddingOrNull();
+                            hostGrad = liveGrad is not null ? (float[])(object)liveGrad : Array.Empty<float>();
+                        }
+                        if (hostGrad.Length == 0) continue; // no grad recorded
+                        gradBuf = gpuBe.AllocateBuffer(hostGrad);
                         gradTransient = true;
                     }
                     bool diagAU = p == 0 && _optimizerStep == 6 && System.Environment.GetEnvironmentVariable("AIDOTNET_OPT_DIAG") == "1";
@@ -2440,6 +2465,19 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // re-bumps Version (without this device write) → mismatch returns → correct re-upload. Harmless
                     // to capture (the gate's ResidentStepActive branch already covers it).
                     _parameters[p]._gpuBufferVersion = _parameters[p].Version;
+
+                    // RE-ARM the device→host deferred download so the NEXT host-side read of this parameter
+                    // re-downloads the freshly-updated weights. The eager forward reads its weight operand via
+                    // GetDataArray() (CpuEngine.TensorMatMulFloatInto), which is served by the ONE-SHOT deferred
+                    // materializer BindResidentBuffer registered: it fires + caches on the first read, so every
+                    // later read returns the STALE first-step download while the on-device optimizer keeps moving
+                    // the resident buffer. Net effect: the forward trains on FROZEN weights → the loss goes flat
+                    // (7.70→7.70 resident vs 7.70→1.31 non-resident on the same graph) — the GPU-resident-param
+                    // mistrain that hit the TimeSeries family (AIDOTNET_GPU_RESIDENT_PARAMS on by default).
+                    // Re-registering re-arms the download against the CURRENT device buffer (DeferredArrayMaterializer
+                    // .Register TryAdds, so it's a no-op if a read is still pending, and re-arms after one fired).
+                    if (_engine is Engines.DirectGpuTensorEngine _rebindEngine)
+                        _rebindEngine.BindResidentBuffer(_parameters[p], gpuP, gpuBe);
                     continue;
                 }
 
@@ -4478,11 +4516,48 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             }
         }
 
-        // If all backward steps are specialized (overwrite), we can skip gradient zeroing entirely.
-        // Under pooling, force the clear-all path (null) so every physical buffer is
-        // zeroed at step start (covering each shared buffer's FIRST tenant); the
-        // re-zero schedule clears it again before each subsequent tenant.
-        int[]? genericGradIndices = (!useGradPool && genericBackwardCount == 0) ? new int[0] : null;
+        // If all backward steps are specialized we CAN skip zeroing most gradient
+        // buffers — but NOT the ones a specialized delegate ACCUMULATES into. Most
+        // specialized delegates OVERWRITE their buffer (beta=0), but a delegate that
+        // writes a MULTI-CONSUMER tensor's gradient accumulates in place
+        // (TensorAddInto / +=), because a tensor consumed by N ops has gradient =
+        // Σ contributions (the BroadcastAdd bias-grad path is the clearest case).
+        // If such a buffer is never zeroed, each step's accumulation lands on top of
+        // the PRIOR step's gradient, so the gradient — and the Adam update — grows
+        // without bound while the loss barely moves (N-BEATS's doubly-residual stack,
+        // whose residual tensors are inherently multi-consumer, blew its weights up
+        // to ~1e13 this way).
+        //
+        // So instead of skip-all (which was silently wrong for these buffers) OR
+        // clear-all (correct but pays to zero every buffer), zero PRECISELY the
+        // accumulating buffers: the grad buffers of the multi-consumer tensors. Every
+        // other buffer is fully overwritten by its beta=0 delegate and stays skipped.
+        // When there are no multi-consumer tensors this yields an empty array — the
+        // exact skip-all fast path as before, so feed-forward graphs are unchanged.
+        int[]? genericGradIndices;
+        if (!useGradPool && genericBackwardCount == 0)
+        {
+            // allGrads holds the distinct physical grad buffers (id == index), so a
+            // reverse map gives each multi-consumer tensor's grad-buffer index.
+            var gradBufferIndex = new Dictionary<Tensor<T>, int>(allGrads.Count);
+            for (int gi = 0; gi < allGrads.Count; gi++) gradBufferIndex[allGrads[gi]] = gi;
+
+            var accumulatingGradIndices = new List<int>();
+            var seenGradIndices = new HashSet<int>();
+            foreach (var kv in consumerCount)
+            {
+                if (kv.Value <= 1) continue; // single-consumer buffers are overwritten, no zeroing needed
+                if (gradMap.TryGetValue(kv.Key, out var gradBuf)
+                    && gradBufferIndex.TryGetValue(gradBuf, out int bufIdx)
+                    && seenGradIndices.Add(bufIdx))
+                    accumulatingGradIndices.Add(bufIdx);
+            }
+            genericGradIndices = accumulatingGradIndices.ToArray();
+        }
+        else
+        {
+            genericGradIndices = null; // clear-all (unchanged: generic backward or grad pooling)
+        }
 
         // #1624 drift guard: the re-zero schedule (indexed by backward ACTION index)
         // was planned in BuildPooledGradMap from the fusion/analytic DECISIONS made

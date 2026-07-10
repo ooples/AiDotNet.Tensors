@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.112.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.111.2...v0.112.0) (2026-07-10)
+
+
+### Features
+
+* **sparse:** tape-auto-tracking sparse engine ops + fully GPU-resident sparse autograd backward ([#758](https://github.com/ooples/AiDotNet.Tensors/issues/758)) ([4a865b7](https://github.com/ooples/AiDotNet.Tensors/commit/4a865b70a1426f2ccdcebfff22bbf6902669e8fb))
+
+
+### Bug Fixes
+
+* **compile:** fill entire output in compiled ReduceMax axis reduction ([#765](https://github.com/ooples/AiDotNet.Tensors/issues/765)) ([d04f8ca](https://github.com/ooples/AiDotNet.Tensors/commit/d04f8cafcd8bda78fa2c6d73ac1cfae87103ff41))
+* **compile:** zero only accumulating multi-consumer grad buffers (N-BEATS resident blow-up) ([#759](https://github.com/ooples/AiDotNet.Tensors/issues/759)) ([d94b919](https://github.com/ooples/AiDotNet.Tensors/commit/d94b91924e51d707dbdbfa29f98d4608df4ffdde))
+* **gpu:** resident params no longer flat-line FP32 fused-Adam training ([#764](https://github.com/ooples/AiDotNet.Tensors/issues/764)) ([c8da627](https://github.com/ooples/AiDotNet.Tensors/commit/c8da6270bb3241b7cbf1202a7760adf419132a7d))
+
 ## [0.111.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.111.1...v0.111.2) (2026-07-09)
 
 
