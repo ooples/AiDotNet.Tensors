@@ -4,6 +4,7 @@ using System;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.HIP;
 using AiDotNet.Tensors.Engines.DirectGpu.Metal;
+using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 using AiDotNet.Tensors.Engines.Simd.Sparse;
 using AiDotNet.Tensors.Helpers;
 
@@ -88,6 +89,10 @@ public static class SparseOps
                     outArr = HipSparseBackend.SpMM(rowPtr, colIdx, valsArr, bArr, rows, k, n);
                 else if (MpsSparseBackend.IsAvailable)
                     outArr = MpsSparseBackend.SpMM(rowPtr, colIdx, valsArr, bArr, rows, k, n);
+                // OpenCL (AMD/Intel GPUs) via the managed csr_spmm kernel — the last GPU tier so
+                // vendor libraries win when present. float-only (the OpenCL csr_spmm kernel is fp32).
+                else if (OpenClSparseBackend.IsAvailable)
+                    outArr = OpenClSparseBackend.SpMM(rowPtr, colIdx, valsArr, bArr, rows, k, n);
             }
 
             // Tier 1 — CPU SIMD on hardware-accelerated Vector<T>.
