@@ -2314,6 +2314,56 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 return;
             }
 
+            // Phase 3: multi-tensor (apex multi_tensor_apply / foreach) GPU fast path. When EVERY
+            // parameter is GPU-resident fp32 Adam/AdamW with a version-fresh resident gradient and
+            // the backend supports batched updates, replace the per-tensor AdamUpdate/AdamWUpdate
+            // loop (N kernel launches/step — the fixed per-launch cost dominates for small tensors)
+            // with ONE launch across all tensors. Requires the fully-clean case; ANY complication
+            // (stream capture, non-resident param/grad, bf16/int8 moments, missing moment buffers,
+            // zero length, mixed backends) falls through to the per-tensor loop below, which is
+            // unchanged and remains the fallback. Numerically identical to that loop — same kernel
+            // math per element, only the launch batching differs.
+            if ((optType == OptimizerType.Adam || optType == OptimizerType.AdamW)
+                && paramCount > 0
+                && gpuBackends[0] is Engines.DirectGpu.IMultiTensorGpuOptimizerBackend mtBackend)
+            {
+                bool eligible = !(gpuBackends[0] is Engines.DirectGpu.CUDA.CudaBackend cbMt && cbMt.IsStreamCapturing());
+                var mtParams = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
+                var mtGrads = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
+                var mtM = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
+                var mtV = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
+                var mtSizes = new List<int>(paramCount);
+                for (int p = 0; eligible && p < paramCount; p++)
+                {
+                    if (!ReferenceEquals(gpuBackends[p], mtBackend)) { eligible = false; break; }
+                    if (gpuParam[p] is not { } gp) { eligible = false; break; }
+                    if (gpuMomentStorage[p] != FusedMomentStorageMode.Float32) { eligible = false; break; }
+                    if (gpuM[p] is not { } gm || gpuV[p] is not { } gv) { eligible = false; break; }
+                    int lp = lengths[p];
+                    if (lp <= 0) { eligible = false; break; }
+                    var gt = _gradients[p];
+                    var gradResident = gt?.TryGetGpuBuffer();
+                    if (gt is null || gradResident is null || gt._gpuBufferVersion != gt.Version) { eligible = false; break; }
+                    mtParams.Add(gp); mtGrads.Add(gradResident); mtM.Add(gm); mtV.Add(gv); mtSizes.Add(lp);
+                }
+                if (eligible && mtParams.Count == paramCount)
+                {
+                    if (optType == OptimizerType.AdamW)
+                        mtBackend.AdamWMultiTensorUpdate(mtParams, mtGrads, mtM, mtV, mtSizes, lr, b1, b2, epsVal, wd, _optimizerStep);
+                    else
+                        mtBackend.AdamMultiTensorUpdate(mtParams, mtGrads, mtM, mtV, mtSizes, lr, b1, b2, epsVal, wd, _optimizerStep);
+                    // Per-param post-update bookkeeping (version sync + re-arm deferred download),
+                    // mirroring the per-tensor GPU path so eval/forward see the fresh resident weights.
+                    for (int p = 0; p < paramCount; p++)
+                    {
+                        _parameters[p]._gpuBufferVersion = _parameters[p].Version;
+                        if (_engine is Engines.DirectGpuTensorEngine rebindEngine && gpuParam[p] is { } gpBind && gpuBackends[p] is { } beBind)
+                            rebindEngine.BindResidentBuffer(_parameters[p], gpBind, beBind);
+                    }
+                    return;
+                }
+            }
+
             for (int p = 0; p < paramCount; p++)
             {
                 int len = lengths[p];

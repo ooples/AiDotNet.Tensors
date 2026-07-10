@@ -132,6 +132,89 @@ extern ""C"" __global__ __launch_bounds__(256) void adamw_update(
 }
 
 // ---------------------------------------------------------------------------
+// Multi-tensor (apex multi_tensor_apply-style) Adam / AdamW.
+// One kernel LAUNCH updates EVERY fp32 Adam/AdamW parameter tensor, instead of
+// one launch per tensor. A deep model with hundreds of parameter tensors pays
+// hundreds of kernel-launch + arg-marshal + scheduling round-trips per step on
+// the per-tensor path; those dominate when the tensors are small. Here the host
+// splits the tensor list into fixed CHUNK-element chunks and builds a chunk
+// table: each CUDA block handles ONE chunk of ONE tensor. Block b reads its
+// tensor index t = chunkTensor[b] and element base s = chunkStart[b], then the
+// param/grad/m/v base addresses for tensor t out of the device pointer arrays.
+// gridDim.x = total chunks; blockDim.x = CHUNK (256). Math is identical to the
+// single-tensor adam_update / adamw_update kernels — this only changes launch
+// batching, so results match the per-tensor kernels bit-for-bit.
+extern ""C"" __global__ __launch_bounds__(256) void adam_multi_tensor_update(
+    const unsigned long long* __restrict__ paramPtrs,
+    const unsigned long long* __restrict__ gradPtrs,
+    const unsigned long long* __restrict__ mPtrs,
+    const unsigned long long* __restrict__ vPtrs,
+    const int* __restrict__ sizes,
+    const int* __restrict__ chunkTensor,
+    const int* __restrict__ chunkStart,
+    float learningRate, float beta1, float beta2, float epsilon,
+    float weightDecay, int step, int chunkSize)
+{
+    int t = chunkTensor[blockIdx.x];
+    int base = chunkStart[blockIdx.x];
+    int i = base + threadIdx.x;
+    int size = sizes[t];
+    if (i >= size) return;
+
+    float* __restrict__ param = (float*)paramPtrs[t];
+    const float* __restrict__ gradient = (const float*)gradPtrs[t];
+    float* __restrict__ m = (float*)mPtrs[t];
+    float* __restrict__ v = (float*)vPtrs[t];
+
+    float grad = gradient[i];
+    if (weightDecay > 0.0f) {
+        grad += weightDecay * param[i];
+    }
+    float mVal = beta1 * m[i] + (1.0f - beta1) * grad;
+    float vVal = beta2 * v[i] + (1.0f - beta2) * grad * grad;
+    m[i] = mVal;
+    v[i] = vVal;
+    float mHat = mVal / (1.0f - powf(beta1, (float)step));
+    float vHat = vVal / (1.0f - powf(beta2, (float)step));
+    param[i] -= learningRate * mHat / (sqrtf(vHat) + epsilon);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void adamw_multi_tensor_update(
+    const unsigned long long* __restrict__ paramPtrs,
+    const unsigned long long* __restrict__ gradPtrs,
+    const unsigned long long* __restrict__ mPtrs,
+    const unsigned long long* __restrict__ vPtrs,
+    const int* __restrict__ sizes,
+    const int* __restrict__ chunkTensor,
+    const int* __restrict__ chunkStart,
+    float learningRate, float beta1, float beta2, float epsilon,
+    float weightDecay, int step, int chunkSize)
+{
+    int t = chunkTensor[blockIdx.x];
+    int base = chunkStart[blockIdx.x];
+    int i = base + threadIdx.x;
+    int size = sizes[t];
+    if (i >= size) return;
+
+    float* __restrict__ param = (float*)paramPtrs[t];
+    const float* __restrict__ gradient = (const float*)gradPtrs[t];
+    float* __restrict__ m = (float*)mPtrs[t];
+    float* __restrict__ v = (float*)vPtrs[t];
+
+    float grad = gradient[i];
+    if (weightDecay > 0.0f) {
+        param[i] *= (1.0f - learningRate * weightDecay);
+    }
+    float mVal = beta1 * m[i] + (1.0f - beta1) * grad;
+    float vVal = beta2 * v[i] + (1.0f - beta2) * grad * grad;
+    m[i] = mVal;
+    v[i] = vVal;
+    float mHat = mVal / (1.0f - powf(beta1, (float)step));
+    float vHat = vVal / (1.0f - powf(beta2, (float)step));
+    param[i] -= learningRate * mHat / (sqrtf(vHat) + epsilon);
+}
+
+// ---------------------------------------------------------------------------
 // Adam optimizer update with bfloat16 moment storage
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void adam_bf16_update(
@@ -939,6 +1022,8 @@ extern ""C"" __global__ __launch_bounds__(256) void sparse_proximal_l1_update(
             "sgd_update",
             "adam_update",
             "adamw_update",
+            "adam_multi_tensor_update",
+            "adamw_multi_tensor_update",
             "adam_bf16_update",
             "adamw_bf16_update",
             "rmsprop_update",
