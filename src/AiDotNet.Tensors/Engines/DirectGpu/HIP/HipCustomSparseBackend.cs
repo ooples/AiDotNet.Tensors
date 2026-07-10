@@ -81,6 +81,49 @@ internal static class HipCustomSparseBackend
         }
     }
 
+    /// <summary>SDDMM host wrapper: <c>out[p] = Σ_k x[rowIndices[p], k] · y[colIndices[p], k]</c>.
+    /// CUDA mirror: <see cref="CUDA.CudaSparseBackend.SDDMM"/>.</summary>
+    public static float[] SDDMM(
+        int[] rowIndices, int[] colIndices,
+        float[] x, float[] y, int innerK)
+    {
+        if (!IsAvailable)
+            throw new InvalidOperationException("HIP custom-kernel SDDMM backend is not available.");
+
+        var backend = new HipBackend();
+        if (!backend.IsAvailable)
+            throw new InvalidOperationException("HIP backend failed to initialise.");
+
+        int nnz = rowIndices.Length;
+        var output = new float[nnz];
+        if (nnz == 0) return output;
+
+        IGpuBuffer? rowBuf = null, colBuf = null, xBuf = null, yBuf = null, outBuf = null;
+        try
+        {
+            xBuf = backend.AllocateBuffer(x);
+            yBuf = backend.AllocateBuffer(y);
+            outBuf = backend.AllocateBuffer(output);
+            rowBuf = backend.AllocateByteBuffer(rowIndices.Length * sizeof(int));
+            colBuf = backend.AllocateByteBuffer(colIndices.Length * sizeof(int));
+            UploadInts(rowBuf.Handle, rowIndices);
+            UploadInts(colBuf.Handle, colIndices);
+
+            backend.CsrSddmm(rowBuf, colBuf, xBuf, yBuf, outBuf, nnz, innerK);
+
+            backend.DownloadBuffer(outBuf, output);
+            return output;
+        }
+        finally
+        {
+            outBuf?.Dispose();
+            yBuf?.Dispose();
+            xBuf?.Dispose();
+            rowBuf?.Dispose();
+            colBuf?.Dispose();
+        }
+    }
+
     /// <summary>FP64 CSR · dense → dense (issue #515). Double payloads ride byte
     /// buffers, dispatched through <c>csr_spmm_double</c>.</summary>
     public static double[] SpMM(
