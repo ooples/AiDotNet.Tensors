@@ -3324,6 +3324,19 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             double stepBc1 = 1.0 - System.Math.Pow(b1, _optimizerStep);
             double stepBc2 = 1.0 - System.Math.Pow(b2, _optimizerStep);
             double lr = lrSchedule.GetLr(_optimizerStep);
+            // Multi-tensor (PyTorch foreach) fast path: update EVERY parameter in one
+            // fused-AdamW call — the SIMD constant vectors are built once instead of
+            // rebuilt (plus a method call) per tensor, the redundancy a deep model with
+            // hundreds of small tensors pays every step. Bit-identical to the per-param
+            // loop below (same math, same per-tensor SIMD/scalar-tail split). This
+            // (non-grouped double) path is pure CPU fp32-moment AdamW — no GPU-resident
+            // or bf16/int8 branch to preserve — so the fast path is unconditional here.
+            if (optType == OptimizerType.AdamW)
+            {
+                FusedOptimizer.AdamWUpdateSimdMulti(paramArrays, gradArrays, m, v, lengths, paramCount,
+                    lr, b1, b2, epsVal, wd, stepBc1, stepBc2);
+                return;
+            }
             for (int p = 0; p < paramCount; p++)
             {
                 // Skip params with no gradient OR no materialized weight backing (#1738).
