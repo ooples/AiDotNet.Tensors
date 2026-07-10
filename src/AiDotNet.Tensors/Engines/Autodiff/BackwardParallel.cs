@@ -150,9 +150,10 @@ internal static class BackwardParallel
         _inBackwardParallel = true;
         try
         {
-            Parallel.Invoke(
-                new ParallelOptions { MaxDegreeOfParallelism = 2 },
-                a, b);
+            // Two independent backward passes on the lightweight persistent pool (was
+            // Parallel.Invoke). Flat, fixed 2-way — the _inBackwardParallel guard above keeps
+            // nested backward calls serial.
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.LightweightInvoke(a, b);
         }
         finally
         {
