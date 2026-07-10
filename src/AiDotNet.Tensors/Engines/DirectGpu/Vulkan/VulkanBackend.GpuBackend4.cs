@@ -567,33 +567,12 @@ public sealed unsafe partial class VulkanBackend
         return result;
     }
 
-    public void CsrSpMM(IGpuBuffer csrValues, IGpuBuffer csrColIndices, IGpuBuffer csrRowPointers, IGpuBuffer denseB, IGpuBuffer output, int M, int K, int N, int nnz)
-    {
-        EnsureInitialized();
-        var vals = DownloadBuffer(csrValues);
-        var cols = DownloadBuffer(csrColIndices);
-        var rows = DownloadBuffer(csrRowPointers);
-        var b = DownloadBuffer(denseB);
-        var o = new float[M * N];
-        for (int i = 0; i < M; i++)
-        {
-            int rowStart = SingleToInt32BitsCompat(rows[i]);
-            int rowEnd = SingleToInt32BitsCompat(rows[i + 1]);
-            if (rowStart < 0 || rowEnd < rowStart || rowEnd > nnz)
-                throw new ArgumentOutOfRangeException(nameof(csrRowPointers), $"CSR row pointer range [{rowStart}, {rowEnd}) for row {i} is invalid (nnz={nnz}).");
-            for (int idx = rowStart; idx < rowEnd; idx++)
-            {
-                if ((uint)idx >= (uint)vals.Length)
-                    throw new ArgumentOutOfRangeException(nameof(csrValues), $"CSR element index {idx} exceeds values buffer length ({vals.Length}).");
-                int col = SingleToInt32BitsCompat(cols[idx]);
-                if ((uint)col >= (uint)K)
-                    throw new ArgumentOutOfRangeException(nameof(csrColIndices), $"Decoded CSR column index {col} at position {idx} is out of range [0, {K}).");
-                float val = vals[idx];
-                for (int j = 0; j < N; j++) o[i * N + j] += val * b[col * N + j];
-            }
-        }
-        UploadToBuffer(o, output);
-    }
+    // NOTE: CsrSpMM moved to VulkanBackend.Sparse.cs and re-implemented as a real
+    // GPU compute dispatch (GLSL csr_spmm via GlslQuintOp) — the previous
+    // download-compute-upload stub here would defeat the point of routing SparseOps'
+    // GPU tier through Vulkan. CsrSpMMBias below still uses that CsrSpMM as its
+    // base then adds bias on host; that's a follow-up to fuse into an MSL bias
+    // variant, but the SpMM itself now stays on-device.
 
     public void CsrSpMMBias(IGpuBuffer csrValues, IGpuBuffer csrColIndices, IGpuBuffer csrRowPointers, IGpuBuffer denseB, IGpuBuffer bias, IGpuBuffer output, int M, int K, int N, int nnz)
     {
