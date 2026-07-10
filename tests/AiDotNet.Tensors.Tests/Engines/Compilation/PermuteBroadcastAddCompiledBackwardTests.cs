@@ -359,7 +359,7 @@ var x = engine.TensorPermute(input, new[] { 1, 0 });
         {
             Assert.True(!float.IsNaN(losses[s]) && !float.IsInfinity(losses[s]),
                 $"Step {s} loss non-finite ({losses[s]:R}) — doubly-residual stack triggered fused-Adam divergence. " +
-                $"Trajectory: [{string.Join(", ", losses[..(s+1)].Select(v => v.ToString("R")))}]");
+                $"Trajectory: [{string.Join(", ", losses.Take(s + 1).Select(v => v.ToString("R")))}]");
         }
         // Sanity: doubly-residual stack + Adam should converge on the constant target.
         Assert.True(losses[steps - 1] < losses[0],
