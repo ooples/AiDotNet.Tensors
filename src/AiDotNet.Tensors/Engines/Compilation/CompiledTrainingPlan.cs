@@ -218,6 +218,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
+        ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
 
         if (_residentGradBuffers is not null)
@@ -785,6 +786,29 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // the Adam-family m/v state owned by the fused optimizer closure.
     private FusedMomentStorageMode _momentStorageMode = FusedMomentStorageMode.Float32;
     private int _int8MomentBlockSize = 2048;
+
+    // Return a prior configuration's fp32 Adam m/v/vMax buffers to the cross-arena
+    // persistent pool so the NEXT ConfigureOptimizer* re-rents them instead of
+    // allocating fresh. ConfigureOptimizer runs every time the compiled plan is
+    // invalidated (lazy layer init during warmup), and each run previously did
+    // `new double[len]` for every moment — the ~2 GB/step Double[] churn PerfView
+    // attributed to ConfigureOptimizerDouble on the VALL-E-X-clone. The moments are
+    // long-lived (they must survive the transient per-step arena), so they use the
+    // PERSISTENT tier, not the transient ring. Reduced-precision (bf16/int8) and GPU
+    // moment buffers are left as-is — they have their own lifecycles.
+    private static void ReturnPooledMoments(FusedOptimizerRuntimeState? old)
+    {
+        if (old is null) return;
+        ReturnMomentJagged(old.MDouble); ReturnMomentJagged(old.VDouble); ReturnMomentJagged(old.VMaxDouble);
+        ReturnMomentJagged(old.MFloat); ReturnMomentJagged(old.VFloat); ReturnMomentJagged(old.VMaxFloat);
+    }
+
+    private static void ReturnMomentJagged<TElem>(TElem[][]? bufs)
+    {
+        if (bufs is null) return;
+        for (int i = 0; i < bufs.Length; i++)
+            if (bufs[i] is { Length: > 0 } b) TensorArena.ReturnPersistentBuffer(b);
+    }
 
     /// <summary>
     /// Requests bfloat16 storage for the Adam/AdamW moment state on the float
@@ -1836,6 +1860,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
+        ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
         // A captured step graph holds kernel nodes wired to the OLD optimizer state
         // buffers + update; those are about to be freed/replaced, so drop it (replay
@@ -2090,8 +2115,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             }
             else
             {
-                m[p] = needsMomentum ? new float[lengths[p]] : Array.Empty<float>();
-                v[p] = needsSecondMoment ? new float[lengths[p]] : Array.Empty<float>();
+                m[p] = needsMomentum ? TensorArena.RentPersistentZeroed<float>(lengths[p]) : Array.Empty<float>();
+                v[p] = needsSecondMoment ? TensorArena.RentPersistentZeroed<float>(lengths[p]) : Array.Empty<float>();
                 mB[p] = Array.Empty<ushort>();
                 vB[p] = Array.Empty<ushort>();
                 mQuant[p] = Array.Empty<byte>();
@@ -2099,7 +2124,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 mScales[p] = Array.Empty<double>();
                 vScales[p] = Array.Empty<double>();
             }
-            vMax[p] = optimizerType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL ? new float[lengths[p]] : Array.Empty<float>();
+            vMax[p] = optimizerType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL ? TensorArena.RentPersistentZeroed<float>(lengths[p]) : Array.Empty<float>();
         }
 
         _optimizerStep = 0;
@@ -2188,6 +2213,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _optimizerUpdate = () =>
         {
             _optimizerStep++;
+            float stepBc1 = 1f - MathF.Pow(b1, _optimizerStep);
+            float stepBc2 = 1f - MathF.Pow(b2, _optimizerStep);
             // #739 review: retire any captured on-device step graph before the CPU fused optimizer
             // mutates host weights and invalidates their resident device buffers (MarkHostWeightMutated
             // below) — otherwise a later LaunchCapturedGraph would replay against freed/stale device
@@ -2285,6 +2312,56 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 }
                 scalarState.ScheduleFreeWeightSum = wsNext;
                 return;
+            }
+
+            // Phase 3: multi-tensor (apex multi_tensor_apply / foreach) GPU fast path. When EVERY
+            // parameter is GPU-resident fp32 Adam/AdamW with a version-fresh resident gradient and
+            // the backend supports batched updates, replace the per-tensor AdamUpdate/AdamWUpdate
+            // loop (N kernel launches/step — the fixed per-launch cost dominates for small tensors)
+            // with ONE launch across all tensors. Requires the fully-clean case; ANY complication
+            // (stream capture, non-resident param/grad, bf16/int8 moments, missing moment buffers,
+            // zero length, mixed backends) falls through to the per-tensor loop below, which is
+            // unchanged and remains the fallback. Numerically identical to that loop — same kernel
+            // math per element, only the launch batching differs.
+            if ((optType == OptimizerType.Adam || optType == OptimizerType.AdamW)
+                && paramCount > 0
+                && gpuBackends[0] is Engines.DirectGpu.IMultiTensorGpuOptimizerBackend mtBackend)
+            {
+                bool eligible = !(gpuBackends[0] is Engines.DirectGpu.CUDA.CudaBackend cbMt && cbMt.IsStreamCapturing());
+                var mtParams = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
+                var mtGrads = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
+                var mtM = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
+                var mtV = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
+                var mtSizes = new List<int>(paramCount);
+                for (int p = 0; eligible && p < paramCount; p++)
+                {
+                    if (!ReferenceEquals(gpuBackends[p], mtBackend)) { eligible = false; break; }
+                    if (gpuParam[p] is not { } gp) { eligible = false; break; }
+                    if (gpuMomentStorage[p] != FusedMomentStorageMode.Float32) { eligible = false; break; }
+                    if (gpuM[p] is not { } gm || gpuV[p] is not { } gv) { eligible = false; break; }
+                    int lp = lengths[p];
+                    if (lp <= 0) { eligible = false; break; }
+                    var gt = _gradients[p];
+                    var gradResident = gt?.TryGetGpuBuffer();
+                    if (gt is null || gradResident is null || gt._gpuBufferVersion != gt.Version) { eligible = false; break; }
+                    mtParams.Add(gp); mtGrads.Add(gradResident); mtM.Add(gm); mtV.Add(gv); mtSizes.Add(lp);
+                }
+                if (eligible && mtParams.Count == paramCount)
+                {
+                    if (optType == OptimizerType.AdamW)
+                        mtBackend.AdamWMultiTensorUpdate(mtParams, mtGrads, mtM, mtV, mtSizes, lr, b1, b2, epsVal, wd, _optimizerStep);
+                    else
+                        mtBackend.AdamMultiTensorUpdate(mtParams, mtGrads, mtM, mtV, mtSizes, lr, b1, b2, epsVal, wd, _optimizerStep);
+                    // Per-param post-update bookkeeping (version sync + re-arm deferred download),
+                    // mirroring the per-tensor GPU path so eval/forward see the fresh resident weights.
+                    for (int p = 0; p < paramCount; p++)
+                    {
+                        _parameters[p]._gpuBufferVersion = _parameters[p].Version;
+                        if (_engine is Engines.DirectGpuTensorEngine rebindEngine && gpuParam[p] is { } gpBind && gpuBackends[p] is { } beBind)
+                            rebindEngine.BindResidentBuffer(_parameters[p], gpBind, beBind);
+                    }
+                    return;
+                }
             }
 
             for (int p = 0; p < paramCount; p++)
@@ -2531,7 +2608,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                         lr, b1, b2, epsVal, _optimizerStep);
                             else
                                 FusedOptimizer.AdamUpdateSimd(pParam, pGrad, pM, pV, len,
-                                    lr, b1, b2, epsVal, _optimizerStep);
+                                    lr, b1, b2, epsVal, stepBc1, stepBc2);
                             break;
                         case OptimizerType.AdamW:
                             if (useBf16Moments)
@@ -2540,7 +2617,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                         lr, b1, b2, epsVal, wd, _optimizerStep);
                             else
                                 FusedOptimizer.AdamWUpdateSimd(pParam, pGrad, pM, pV, len,
-                                    lr, b1, b2, epsVal, wd, _optimizerStep);
+                                    lr, b1, b2, epsVal, wd, stepBc1, stepBc2);
                             break;
                         case OptimizerType.AMSGrad:
                             // AMSGrad (#74): Adam with a running max of v̂ so the
@@ -2668,6 +2745,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
+        ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
         // Drop any captured step graph wired to the old optimizer state (see
         // ConfigureOptimizerFloat — replay would target freed/stale buffers).
@@ -2874,8 +2952,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             }
             else
             {
-                m[p] = needsMomentum ? new float[lengths[p]] : Array.Empty<float>();
-                v[p] = needsSecondMoment ? new float[lengths[p]] : Array.Empty<float>();
+                m[p] = needsMomentum ? TensorArena.RentPersistentZeroed<float>(lengths[p]) : Array.Empty<float>();
+                v[p] = needsSecondMoment ? TensorArena.RentPersistentZeroed<float>(lengths[p]) : Array.Empty<float>();
                 mB[p] = Array.Empty<ushort>();
                 vB[p] = Array.Empty<ushort>();
                 mQuant[p] = Array.Empty<byte>();
@@ -2883,7 +2961,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 mScales[p] = Array.Empty<double>();
                 vScales[p] = Array.Empty<double>();
             }
-            vMax[p] = optimizerType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL ? new float[lengths[p]] : Array.Empty<float>();
+            vMax[p] = optimizerType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL ? TensorArena.RentPersistentZeroed<float>(lengths[p]) : Array.Empty<float>();
         }
 
         _optimizerStep = 0;
@@ -2930,6 +3008,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _optimizerUpdate = () =>
         {
             _optimizerStep++;
+            float stepBc1 = 1f - MathF.Pow(b1, _optimizerStep);
+            float stepBc2 = 1f - MathF.Pow(b2, _optimizerStep);
             // #739 review: retire any captured on-device step graph before this CPU fused optimizer
             // invalidates resident weight buffers below — else a later LaunchCapturedGraph replays
             // against freed/stale device pointers. No-op when no graph is captured.
@@ -3101,7 +3181,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                         lr, b1, b2, epsVal, _optimizerStep);
                             else
                                 FusedOptimizer.AdamUpdateSimd(pParam, pGrad, pM, pV, len,
-                                    lr, b1, b2, epsVal, _optimizerStep);
+                                    lr, b1, b2, epsVal, stepBc1, stepBc2);
                             break;
                         case OptimizerType.AdamW:
                             if (useBf16Moments)
@@ -3110,7 +3190,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                         lr, b1, b2, epsVal, wd, _optimizerStep);
                             else
                                 FusedOptimizer.AdamWUpdateSimd(pParam, pGrad, pM, pV, len,
-                                    lr, b1, b2, epsVal, wd, _optimizerStep);
+                                    lr, b1, b2, epsVal, wd, stepBc1, stepBc2);
                             break;
                         case OptimizerType.AMSGrad:
                             // AMSGrad (#74): Adam with a running max of v̂ so the
@@ -3218,6 +3298,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
+        ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
         _preForwardParamTransform = null;
         InvalidateCapturedStepGraph();
@@ -3281,9 +3362,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 or OptimizerType.RAdam or OptimizerType.LAMB or OptimizerType.AdaMax
                 or OptimizerType.AdaDelta or OptimizerType.FTRL or OptimizerType.Rprop;
 
-            m[p] = needsMomentum ? new double[lengths[p]] : Array.Empty<double>();
-            v[p] = needsSecondMoment ? new double[lengths[p]] : Array.Empty<double>();
-            vMax[p] = optimizerType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL ? new double[lengths[p]] : Array.Empty<double>();
+            m[p] = needsMomentum ? TensorArena.RentPersistentZeroed<double>(lengths[p]) : Array.Empty<double>();
+            v[p] = needsSecondMoment ? TensorArena.RentPersistentZeroed<double>(lengths[p]) : Array.Empty<double>();
+            vMax[p] = optimizerType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL ? TensorArena.RentPersistentZeroed<double>(lengths[p]) : Array.Empty<double>();
         }
 
         _optimizerStep = 0;
@@ -3314,7 +3395,31 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _optimizerUpdate = () =>
         {
             _optimizerStep++;
+            // Bias corrections stepBc1=1-b1^step, stepBc2=1-b2^step are STEP-GLOBAL; compute the
+            // two Math.Pow ONCE here instead of once per parameter inside the Adam/AdamW kernels
+            // (bit-identical — a deep model with many small tensors paid ~2x(param count) Pow/step).
+            double stepBc1 = 1.0 - System.Math.Pow(b1, _optimizerStep);
+            double stepBc2 = 1.0 - System.Math.Pow(b2, _optimizerStep);
             double lr = lrSchedule.GetLr(_optimizerStep);
+            // Multi-tensor (PyTorch foreach) fast path: update EVERY parameter in one
+            // fused-AdamW call — the SIMD constant vectors are built once instead of
+            // rebuilt (plus a method call) per tensor, the redundancy a deep model with
+            // hundreds of small tensors pays every step. Bit-identical to the per-param
+            // loop below (same math, same per-tensor SIMD/scalar-tail split). This
+            // (non-grouped double) path is pure CPU fp32-moment AdamW — no GPU-resident
+            // or bf16/int8 branch to preserve — so the fast path is unconditional here.
+            if (optType == OptimizerType.AdamW)
+            {
+                FusedOptimizer.AdamWUpdateSimdMulti(paramArrays, gradArrays, m, v, lengths, paramCount,
+                    lr, b1, b2, epsVal, wd, stepBc1, stepBc2);
+                return;
+            }
+            if (optType == OptimizerType.Adam)
+            {
+                FusedOptimizer.AdamUpdateSimdMulti(paramArrays, gradArrays, m, v, lengths, paramCount,
+                    lr, b1, b2, epsVal, stepBc1, stepBc2);
+                return;
+            }
             for (int p = 0; p < paramCount; p++)
             {
                 // Skip params with no gradient OR no materialized weight backing (#1738).
@@ -3330,11 +3435,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             break;
                         case OptimizerType.Adam:
                             FusedOptimizer.AdamUpdateSimd(pParam, pGrad, pM, pV, len,
-                                lr, b1, b2, epsVal, _optimizerStep);
+                                lr, b1, b2, epsVal, stepBc1, stepBc2);
                             break;
                         case OptimizerType.AdamW:
                             FusedOptimizer.AdamWUpdateSimd(pParam, pGrad, pM, pV, len,
-                                lr, b1, b2, epsVal, wd, _optimizerStep);
+                                lr, b1, b2, epsVal, wd, stepBc1, stepBc2);
                             break;
                         case OptimizerType.AMSGrad:
                             // AMSGrad (#74): Adam with a running max of v̂ so the
@@ -3368,6 +3473,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
+        ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
         _preForwardParamTransform = null;
         InvalidateCapturedStepGraph();
@@ -3425,9 +3531,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 or OptimizerType.RAdam or OptimizerType.LAMB or OptimizerType.AdaMax
                 or OptimizerType.AdaDelta or OptimizerType.FTRL or OptimizerType.Rprop;
 
-            m[p] = needsMomentum ? new double[lengths[p]] : Array.Empty<double>();
-            v[p] = needsSecondMoment ? new double[lengths[p]] : Array.Empty<double>();
-            vMax[p] = optimizerType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL ? new double[lengths[p]] : Array.Empty<double>();
+            m[p] = needsMomentum ? TensorArena.RentPersistentZeroed<double>(lengths[p]) : Array.Empty<double>();
+            v[p] = needsSecondMoment ? TensorArena.RentPersistentZeroed<double>(lengths[p]) : Array.Empty<double>();
+            vMax[p] = optimizerType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL ? TensorArena.RentPersistentZeroed<double>(lengths[p]) : Array.Empty<double>();
         }
 
         _optimizerStep = 0;
@@ -3459,6 +3565,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _optimizerUpdate = () =>
         {
             _optimizerStep++;
+            // Bias corrections stepBc1=1-b1^step, stepBc2=1-b2^step are STEP-GLOBAL; compute the
+            // two Math.Pow ONCE here instead of once per parameter inside the Adam/AdamW kernels
+            // (bit-identical — a deep model with many small tensors paid ~2x(param count) Pow/step).
+            double stepBc1 = 1.0 - System.Math.Pow(b1, _optimizerStep);
+            double stepBc2 = 1.0 - System.Math.Pow(b2, _optimizerStep);
             for (int g = 0; g < groupCount; g++)
                 groupLrs[g] = schedules[g].GetLr(_optimizerStep);
 
@@ -3479,11 +3590,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             break;
                         case OptimizerType.Adam:
                             FusedOptimizer.AdamUpdateSimd(pParam, pGrad, pM, pV, len,
-                                lr, b1, b2, epsVal, _optimizerStep);
+                                lr, b1, b2, epsVal, stepBc1, stepBc2);
                             break;
                         case OptimizerType.AdamW:
                             FusedOptimizer.AdamWUpdateSimd(pParam, pGrad, pM, pV, len,
-                                lr, b1, b2, epsVal, wd, _optimizerStep);
+                                lr, b1, b2, epsVal, wd, stepBc1, stepBc2);
                             break;
                         case OptimizerType.AMSGrad:
                             // AMSGrad (#74): Adam with a running max of v̂ so the

@@ -15,7 +15,7 @@ using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend
+public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IMultiTensorGpuOptimizerBackend, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend
 {
     // During teardown the CUDA driver/context may already be destroyed, so calling driver
     // APIs (cuCtxPushCurrent / cuMemFree / cuCtxPopCurrent / cuCtxDestroy / cuModuleUnload)
@@ -11452,6 +11452,121 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[9] = &step;
         args[10] = &size;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    // Multi-tensor (apex multi_tensor_apply-style) fused Adam/AdamW: ONE launch updates every
+    // fp32 parameter tensor in the list, replacing the per-tensor AdamUpdate/AdamWUpdate loop
+    // (N launches/step). Chunk-per-block scheme: split the tensor list into DefaultBlockSize-
+    // element chunks and launch gridDim.x = totalChunks; block b handles chunk chunkTensor[b] /
+    // chunkStart[b] of one tensor. Device pointer arrays carry each tensor's buffer addresses.
+    private const int MultiTensorChunk = DefaultBlockSize;
+
+    public void AdamMultiTensorUpdate(
+        IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
+        IReadOnlyList<IGpuBuffer> firstMoments, IReadOnlyList<IGpuBuffer> secondMoments,
+        IReadOnlyList<int> sizes, float learningRate, float beta1, float beta2, float epsilon,
+        float weightDecay, int step)
+        => MultiTensorAdamImpl("adam_multi_tensor_update", parameters, gradients, firstMoments,
+            secondMoments, sizes, learningRate, beta1, beta2, epsilon, weightDecay, step);
+
+    public void AdamWMultiTensorUpdate(
+        IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
+        IReadOnlyList<IGpuBuffer> firstMoments, IReadOnlyList<IGpuBuffer> secondMoments,
+        IReadOnlyList<int> sizes, float learningRate, float beta1, float beta2, float epsilon,
+        float weightDecay, int step)
+        => MultiTensorAdamImpl("adamw_multi_tensor_update", parameters, gradients, firstMoments,
+            secondMoments, sizes, learningRate, beta1, beta2, epsilon, weightDecay, step);
+
+    private unsafe void MultiTensorAdamImpl(
+        string kernelName,
+        IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
+        IReadOnlyList<IGpuBuffer> firstMoments, IReadOnlyList<IGpuBuffer> secondMoments,
+        IReadOnlyList<int> sizes, float learningRate, float beta1, float beta2, float epsilon,
+        float weightDecay, int step)
+    {
+        if (parameters is null) throw new ArgumentNullException(nameof(parameters));
+        if (gradients is null) throw new ArgumentNullException(nameof(gradients));
+        if (firstMoments is null) throw new ArgumentNullException(nameof(firstMoments));
+        if (secondMoments is null) throw new ArgumentNullException(nameof(secondMoments));
+        if (sizes is null) throw new ArgumentNullException(nameof(sizes));
+        int n = parameters.Count;
+        if (gradients.Count != n || firstMoments.Count != n || secondMoments.Count != n || sizes.Count != n)
+            throw new ArgumentException("Multi-tensor optimizer buffer lists must all have the same length.");
+        if (step < 1) throw new ArgumentOutOfRangeException(nameof(step), "Step must be at least 1.");
+        if (epsilon <= 0) throw new ArgumentOutOfRangeException(nameof(epsilon), "Epsilon must be positive.");
+        if (n == 0) return;
+
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+
+        // Build the device pointer arrays (8-byte device addresses) and the chunk table.
+        var paramAddr = new byte[n * sizeof(ulong)];
+        var gradAddr = new byte[n * sizeof(ulong)];
+        var mAddr = new byte[n * sizeof(ulong)];
+        var vAddr = new byte[n * sizeof(ulong)];
+        var sizesArr = new int[n];
+        int totalChunks = 0;
+        for (int t = 0; t < n; t++)
+        {
+            int size = sizes[t];
+            if (size <= 0) throw new ArgumentOutOfRangeException(nameof(sizes), "Every tensor size must be positive.");
+            WriteAddress(paramAddr, t, parameters[t].Handle);
+            WriteAddress(gradAddr, t, gradients[t].Handle);
+            WriteAddress(mAddr, t, firstMoments[t].Handle);
+            WriteAddress(vAddr, t, secondMoments[t].Handle);
+            sizesArr[t] = size;
+            totalChunks += (size + MultiTensorChunk - 1) / MultiTensorChunk;
+        }
+        var chunkTensor = new int[totalChunks];
+        var chunkStart = new int[totalChunks];
+        int c = 0;
+        for (int t = 0; t < n; t++)
+        {
+            int chunks = (sizesArr[t] + MultiTensorChunk - 1) / MultiTensorChunk;
+            for (int k = 0; k < chunks; k++) { chunkTensor[c] = t; chunkStart[c] = k * MultiTensorChunk; c++; }
+        }
+
+        using var _ = PushContext();
+        IGpuBuffer? pPtrs = null, gPtrs = null, mPtrs = null, vPtrs = null, sizesBuf = null, ctBuf = null, csBuf = null;
+        try
+        {
+            pPtrs = AllocateByteBuffer(paramAddr.Length); UploadByteBuffer(pPtrs, paramAddr);
+            gPtrs = AllocateByteBuffer(gradAddr.Length); UploadByteBuffer(gPtrs, gradAddr);
+            mPtrs = AllocateByteBuffer(mAddr.Length); UploadByteBuffer(mPtrs, mAddr);
+            vPtrs = AllocateByteBuffer(vAddr.Length); UploadByteBuffer(vPtrs, vAddr);
+            sizesBuf = AllocateIntBuffer(sizesArr);
+            ctBuf = AllocateIntBuffer(chunkTensor);
+            csBuf = AllocateIntBuffer(chunkStart);
+
+            IntPtr pH = pPtrs.Handle, gH = gPtrs.Handle, mH = mPtrs.Handle, vH = vPtrs.Handle;
+            IntPtr szH = sizesBuf.Handle, ctH = ctBuf.Handle, csH = csBuf.Handle;
+            int chunkSize = MultiTensorChunk;
+            void** args = stackalloc void*[14];
+            args[0] = &pH; args[1] = &gH; args[2] = &mH; args[3] = &vH;
+            args[4] = &szH; args[5] = &ctH; args[6] = &csH;
+            args[7] = &learningRate; args[8] = &beta1; args[9] = &beta2; args[10] = &epsilon;
+            args[11] = &weightDecay; args[12] = &step; args[13] = &chunkSize;
+            LaunchKernel(kernel, (uint)totalChunks, DefaultBlockSize, args);
+        }
+        finally
+        {
+            pPtrs?.Dispose(); gPtrs?.Dispose(); mPtrs?.Dispose(); vPtrs?.Dispose();
+            sizesBuf?.Dispose(); ctBuf?.Dispose(); csBuf?.Dispose();
+        }
+    }
+
+    private static void WriteAddress(byte[] dst, int index, IntPtr address)
+    {
+        ulong a = unchecked((ulong)address.ToInt64());
+        int o = index * sizeof(ulong);
+        dst[o + 0] = (byte)(a & 0xFF);
+        dst[o + 1] = (byte)((a >> 8) & 0xFF);
+        dst[o + 2] = (byte)((a >> 16) & 0xFF);
+        dst[o + 3] = (byte)((a >> 24) & 0xFF);
+        dst[o + 4] = (byte)((a >> 32) & 0xFF);
+        dst[o + 5] = (byte)((a >> 40) & 0xFF);
+        dst[o + 6] = (byte)((a >> 48) & 0xFF);
+        dst[o + 7] = (byte)((a >> 56) & 0xFF);
     }
 
     public unsafe void AdamUpdateBf16(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,

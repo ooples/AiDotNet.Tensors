@@ -150,6 +150,76 @@ public sealed class CompressedMomentGpuOptimizerTests
             backend.DownloadBuffer(adamWParam), length, 2e-5f, $"{kind} fp32 AdamW");
     }
 
+    // Phase 3: the multi-tensor (apex multi_tensor_apply-style) batched Adam/AdamW kernel must
+    // produce the SAME result as calling the per-tensor AdamUpdate/AdamWUpdate once per tensor —
+    // it only changes how many kernel launches happen, not the per-element arithmetic. Runs a
+    // LIST of tensors with varied (non-block-aligned) lengths for several steps and compares each
+    // tensor against the per-tensor kernel on the same device.
+    [SkippableTheory]
+    [MemberData(nameof(Backends))]
+    public void MultiTensorAdamAndAdamW_MatchPerTensor(BackendKind kind)
+    {
+        var acquired = TryCreate(kind);
+        using var scope = acquired;
+        var backend = RequireReady(kind, acquired);
+        Skip.If(backend is not IMultiTensorGpuOptimizerBackend,
+            $"{kind} backend does not implement IMultiTensorGpuOptimizerBackend.");
+        var mt = (IMultiTensorGpuOptimizerBackend)backend;
+
+        const float lr = 0.01f, beta1 = 0.9f, beta2 = 0.997f, eps = 1e-7f, weightDecay = 0.0125f;
+        int[] lengths = { 1, 7, 256, 257, 300, 41, 1024 };   // mix of block-aligned and tailed
+        int n = lengths.Length;
+        const int steps = 4;
+
+        foreach (bool adamW in new[] { false, true })
+        {
+            var refParam = new IGpuBuffer[n]; var refGrad = new IGpuBuffer[n]; var refM = new IGpuBuffer[n]; var refV = new IGpuBuffer[n];
+            var mParam = new IGpuBuffer[n]; var mGrad = new IGpuBuffer[n]; var mM = new IGpuBuffer[n]; var mV = new IGpuBuffer[n];
+            var initials = new float[n][];
+            try
+            {
+                for (int t = 0; t < n; t++)
+                {
+                    int L = lengths[t];
+                    initials[t] = Vector(L, 0.2f + 0.01f * t, -0.0075f + 0.0001f * t);
+                    var grad = Gradient(L);
+                    refParam[t] = backend.AllocateBuffer((float[])initials[t].Clone());
+                    refGrad[t] = backend.AllocateBuffer((float[])grad.Clone());
+                    refM[t] = backend.AllocateBuffer(new float[L]);
+                    refV[t] = backend.AllocateBuffer(new float[L]);
+                    mParam[t] = backend.AllocateBuffer((float[])initials[t].Clone());
+                    mGrad[t] = backend.AllocateBuffer((float[])grad.Clone());
+                    mM[t] = backend.AllocateBuffer(new float[L]);
+                    mV[t] = backend.AllocateBuffer(new float[L]);
+                }
+
+                for (int step = 1; step <= steps; step++)
+                {
+                    // Reference: one launch per tensor.
+                    for (int t = 0; t < n; t++)
+                    {
+                        if (adamW) backend.AdamWUpdate(refParam[t], refGrad[t], refM[t], refV[t], lr, beta1, beta2, eps, weightDecay, step, lengths[t]);
+                        else backend.AdamUpdate(refParam[t], refGrad[t], refM[t], refV[t], lr, beta1, beta2, eps, weightDecay, step, lengths[t]);
+                    }
+                    // Batched: one launch for all tensors.
+                    if (adamW) mt.AdamWMultiTensorUpdate(mParam, mGrad, mM, mV, lengths, lr, beta1, beta2, eps, weightDecay, step);
+                    else mt.AdamMultiTensorUpdate(mParam, mGrad, mM, mV, lengths, lr, beta1, beta2, eps, weightDecay, step);
+                }
+
+                for (int t = 0; t < n; t++)
+                    AssertClose(backend.DownloadBuffer(refParam[t]), backend.DownloadBuffer(mParam[t]),
+                        lengths[t], 1e-6f, $"{kind} multi-tensor {(adamW ? "AdamW" : "Adam")} tensor {t}");
+            }
+            finally
+            {
+                foreach (var b in refParam) b?.Dispose(); foreach (var b in refGrad) b?.Dispose();
+                foreach (var b in refM) b?.Dispose(); foreach (var b in refV) b?.Dispose();
+                foreach (var b in mParam) b?.Dispose(); foreach (var b in mGrad) b?.Dispose();
+                foreach (var b in mM) b?.Dispose(); foreach (var b in mV) b?.Dispose();
+            }
+        }
+    }
+
     [SkippableTheory]
     [MemberData(nameof(DenseOptimizerBackends))]
     public void DensePlanSupportedOptimizer_MatchesCpuReference(BackendKind kind, OptimizerType optimizer)

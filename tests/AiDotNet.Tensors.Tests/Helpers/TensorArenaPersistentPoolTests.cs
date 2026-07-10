@@ -56,6 +56,72 @@ public class TensorArenaPersistentPoolTests
         Assert.Equal(5, TensorArena.PersistentReuseHits);
     }
 
+    /// <summary>
+    /// Deep-model churn guard: a training step for an N-layer network rents MANY
+    /// same-size large buffers (one hidden-state / gradient per layer), not "O(1)
+    /// per size". The cross-arena pool must retain and reuse ALL of them across a
+    /// fresh-arena-per-step trainer — with the old per-size cap of 4 an 18-layer
+    /// model dropped N-4 buffers on Dispose and re-allocated them every step
+    /// (~2 GB/step Double[] churn measured on VALL-E-X-clone via PerfView). Renting
+    /// 16 same-size large buffers per cycle must yield 16 reuse hits next cycle.
+    /// </summary>
+    [Fact]
+    public void ManySameSizeBuffers_PerStep_AllReusedAcrossLifetimes()
+    {
+        TensorArena.ClearPersistentPool();
+        const int n = 16;                       // > old cap (4); models a deep stack
+        int[] shape = { 128 * 1024 };           // 512 KB float — above PersistThresholdElems
+
+        // Cycle 1: cold — allocate n fresh, all returned to the pool on dispose.
+        using (var arena = TensorArena.Create())
+        {
+            for (int i = 0; i < n; i++)
+            {
+                var t = TensorAllocator.RentUninitialized<float>(shape);
+                t.AsWritableSpan()[0] = i;
+            }
+        }
+        Assert.Equal(0, TensorArena.PersistentReuseHits);
+
+        // Cycle 2: every one of the n same-size buffers must come from the pool.
+        using (var arena = TensorArena.Create())
+        {
+            for (int i = 0; i < n; i++)
+            {
+                var t = TensorAllocator.RentUninitialized<float>(shape);
+                t.AsWritableSpan()[0] = i;
+            }
+        }
+        Assert.Equal(n, TensorArena.PersistentReuseHits);
+    }
+
+    /// <summary>
+    /// The retention cap is a bound, not just a floor: renting MORE than
+    /// MaxPersistPerSize (64) same-size buffers per cycle must retain AT MOST the
+    /// cap across lifetimes — the excess is dropped on Dispose, so a later cycle
+    /// sees exactly `cap` reuse hits (not all 65). Pins MaxPersistPerSize as the
+    /// sole guard against unbounded per-size pool growth (CodeRabbit #767).
+    /// </summary>
+    [Fact]
+    public void SameSizeBuffers_BeyondCap_RetentionIsCapped()
+    {
+        TensorArena.ClearPersistentPool();
+        const int cap = 64;                     // MaxPersistPerSize
+        const int n = cap + 1;                  // one past the cap
+        int[] shape = { 128 * 1024 };           // above PersistThresholdElems
+
+        using (var arena = TensorArena.Create())
+            for (int i = 0; i < n; i++) TensorAllocator.RentUninitialized<float>(shape).AsWritableSpan()[0] = i;
+        Assert.Equal(0, TensorArena.PersistentReuseHits);
+
+        using (var arena = TensorArena.Create())
+            for (int i = 0; i < n; i++) TensorAllocator.RentUninitialized<float>(shape).AsWritableSpan()[0] = i;
+
+        // Only `cap` of the n=65 buffers were retained; the 65th was dropped on
+        // Dispose and re-allocated fresh in cycle 2 — so exactly `cap` reuse hits.
+        Assert.Equal(cap, TensorArena.PersistentReuseHits);
+    }
+
 #if NET5_0_OR_GREATER
     /// <summary>
     /// Same guarantee, measured directly: steady-state per-step allocation must
@@ -120,6 +186,33 @@ public class TensorArenaPersistentPoolTests
             for (int i = 0; i < 16; i++)
                 Assert.Equal(0f, span[i]);
         }
+    }
+
+    /// <summary>
+    /// The RentPersistentZeroed / ReturnPersistentBuffer API (used for long-lived
+    /// fused-optimizer Adam m/v moment state that must outlive the transient
+    /// per-step arena) hands back a ZEROED buffer, pools it across return/rent, and
+    /// re-zeroes stale data on reuse. This is the transparent replacement for the
+    /// per-reconfigure `new double[len]` that PerfView flagged in
+    /// ConfigureOptimizerDouble (~2 GB churn on the VALL-E-X-clone warmup).
+    /// </summary>
+    [Fact]
+    public void RentPersistentZeroed_ZeroesPoolsAndRezeroesOnReuse()
+    {
+        TensorArena.ClearPersistentPool();
+        int len = 128 * 1024; // above PersistThresholdElems
+
+        var a = TensorArena.RentPersistentZeroed<double>(len);
+        Assert.Equal(len, a.Length);
+        for (int i = 0; i < len; i++) Assert.Equal(0.0, a[i]); // rented zeroed
+        a[0] = 42.0; a[len - 1] = 7.0;                          // dirty it
+        TensorArena.ReturnPersistentBuffer(a);
+        Assert.Equal(0, TensorArena.PersistentReuseHits);
+
+        var b = TensorArena.RentPersistentZeroed<double>(len);
+        Assert.Equal(1, TensorArena.PersistentReuseHits);       // reused, not re-allocated
+        Assert.Same(a, b);                                      // same backing array
+        for (int i = 0; i < len; i++) Assert.Equal(0.0, b[i]);  // stale 42/7 re-zeroed
     }
 
     /// <summary>

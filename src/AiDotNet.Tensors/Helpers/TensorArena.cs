@@ -112,11 +112,19 @@ public sealed class TensorArena : IDisposable
     /// allocation/GC is cheap and pooling churns the dictionary for no gain.</summary>
     private const int PersistThresholdElems = 64 * 1024;
 
-    /// <summary>Max retained buffers per (type, size). A single-threaded training
-    /// step rents each distinct size O(1) times, so a small cap fully covers
-    /// steady-state reuse while bounding worst-case retained memory to a few ×
-    /// the model's transient working set.</summary>
-    private const int MaxPersistPerSize = 4;
+    /// <summary>Max retained buffers per (type, size). Retention is SELF-LIMITING:
+    /// a single arena's Dispose returns exactly as many same-size buffers as the
+    /// step actually used, so a shallow model that rents a size once retains one —
+    /// raising this cap costs nothing for it. The cap only bites DEEP models: an
+    /// N-layer transformer produces N same-shaped hidden-state / gradient tensors
+    /// per step (NOT "O(1) per size" as an earlier revision assumed), so with the
+    /// old cap of 4 a fresh-arena-per-step trainer dropped N-4 of them on Dispose
+    /// and re-allocated them next step — measured as ~2 GB/step of Double[] churn
+    /// for an 18-layer VALL-E-X-clone (PerfView, TensorArena.TryRentTensor). 64
+    /// covers realistic deep stacks (ViT/GPT-scale) while the returned-count self-
+    /// limit keeps the extra retention bounded by the model's own working set,
+    /// which already had to be resident during the step.</summary>
+    private const int MaxPersistPerSize = 64;
 
     private static Array? RentPersistent(Type type, int elementCount)
     {
@@ -156,6 +164,41 @@ public sealed class TensorArena : IDisposable
         if (stack.Count < MaxPersistPerSize)
             stack.Push(arr);
         // else: at cap — drop the reference, let GC reclaim (don't hoard).
+    }
+
+    /// <summary>
+    /// Rents a ZEROED backing array from the cross-arena persistent pool, or
+    /// allocates a fresh zeroed one on a pool miss. For LONG-LIVED state that
+    /// must outlive the transient per-step arena and be reused across
+    /// re-allocations — e.g. a fused optimizer's Adam m/v moment buffers, which
+    /// the plan re-creates every time the compiled plan is invalidated (lazy
+    /// layer init during warmup). Using the transient arena for these would let
+    /// the ring recycle them mid-step (corruption); a plain <c>new T[]</c> per
+    /// re-create is the ~2 GB/step Double[] churn PerfView flagged in
+    /// <c>ConfigureOptimizerDouble</c>. The persistent pool sits ABOVE the
+    /// transient tier: entries survive arena Dispose and are handed back here,
+    /// so they pool across re-creations without ever being recycled as scratch.
+    /// Return with <see cref="ReturnPersistentBuffer{T}"/> when the state is
+    /// discarded (on the next re-configure). Buffers below
+    /// <see cref="PersistThresholdElems"/> aren't pooled (they GC cheaply) — a
+    /// fresh zeroed array is returned, matching the pooled path's zero-init.
+    /// </summary>
+    internal static T[] RentPersistentZeroed<T>(int elementCount)
+    {
+        if (elementCount == 0) return Array.Empty<T>();
+        return RentPersistent(typeof(T), elementCount) as T[] ?? new T[elementCount];
+    }
+
+    /// <summary>
+    /// Returns a buffer previously handed out by <see cref="RentPersistentZeroed{T}"/>
+    /// to the cross-arena persistent pool for reuse. No-op for arrays below the
+    /// pooling threshold or already at the per-size cap (they GC). The caller
+    /// must not touch the array after returning it.
+    /// </summary>
+    internal static void ReturnPersistentBuffer<T>(T[] arr)
+    {
+        if (arr is null || arr.Length == 0) return;
+        ReturnPersistent(typeof(T), arr.Length, arr);
     }
 
     // ---------------------------------------------------------------------
