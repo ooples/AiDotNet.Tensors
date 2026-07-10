@@ -273,11 +273,14 @@ public static class CpuParallelSettings
 
         int chunkSize = (length + numChunks - 1) / numChunks;
 
-        // Cooperative-pool dispatch (PR #531/#688): cheaper than raw Parallel.For's ThreadPool
-        // task/range alloc + park/wakeup. Disjoint [start,count) chunks ⇒ bit-identical.
+        // Persistent-pool dispatch: the benchmark-proven winner (ParallelPrimitiveBench)
+        // over both raw Parallel.For and the CooperativeGemmScheduler path — parked
+        // workers wake with near-zero latency (adaptive keep-warm, PR #762). Disjoint
+        // [start,count) chunks ⇒ bit-identical to Parallel.For. AIDOTNET_COOP_POOL=0
+        // still falls back to raw Parallel.For for A/B.
         if (UseCooperativePool)
         {
-            Engines.BlasManaged.Pool.CooperativeGemmScheduler.Dispatch(numChunks, i =>
+            PersistentParallelExecutor.Instance.Execute(numChunks, i =>
             {
                 using var _region = EnterParallelRegion();
                 int start = i * chunkSize;
@@ -332,7 +335,7 @@ public static class CpuParallelSettings
         // (disjoint-write GEMM tiles), so cooperative chunking is bit-identical to Parallel.For.
         if (UseCooperativePool)
         {
-            Engines.BlasManaged.Pool.CooperativeGemmScheduler.Dispatch(count, p =>
+            PersistentParallelExecutor.Instance.Execute(count, p =>
             {
                 using var _region = EnterParallelRegion();
                 body(p);
@@ -488,7 +491,7 @@ public static class CpuParallelSettings
             int byWork = (int)Math.Min(count, Math.Max(1, totalWork / workPerChunk));
             int chunks = Math.Min(maxDegree, byWork);
             int from = fromInclusive;
-            Engines.BlasManaged.Pool.CooperativeGemmScheduler.Dispatch(chunks, chunk =>
+            PersistentParallelExecutor.Instance.Execute(chunks, chunk =>
             {
                 using var _region = EnterParallelRegion();
                 int cs = from + (int)((long)chunk * count / chunks);
