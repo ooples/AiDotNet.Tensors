@@ -44,17 +44,22 @@ public static class SparseAutograd
         var output = SparseOps.SparseMatMul(a, b);
         if (DifferentiableOps._anyTapeActive == 0) return output;
 
-        // Snapshot A's values at forward time. Storing on savedState
-        // ensures backward uses the values that produced this output
-        // even if A was mutated downstream.
-        var aDenseSnapshot = a.ToDense();
+        // Snapshot A TRANSPOSED and sparse. Transpose() copies the values array for the
+        // CSR/COO/CSC formats (index/pointer swap, O(nnz)), so the snapshot is frozen against
+        // in-place weight updates between forward and backward — the same guarantee the old
+        // a.ToDense() gave, but without the O(rows·cols) dense CPU allocation. Backward computes
+        // dB = A^T · grad directly from this snapshot via SparseOps.SparseMatMul, which
+        // GPU-dispatches (cuSPARSE / OpenCL csr_spmm / …) instead of round-tripping through a
+        // dense transpose. (Block formats fall back to a dense transpose inside Transpose(),
+        // which is acceptable — they are load-once weights, rare for trainable params.)
+        var aTransposedSnapshot = (SparseTensor<T>)a.Transpose();
         DifferentiableOps.RecordBinary(
             "SparseMatMul",
             output,
             aDense,
             b,
             SparseMatMulBackward,
-            savedState: new object[] { aDenseSnapshot });
+            savedState: new object[] { aTransposedSnapshot });
         return output;
     }
 
@@ -68,8 +73,10 @@ public static class SparseAutograd
         var output = SparseOps.SparseAddMM(c, a, b, alpha, beta);
         if (DifferentiableOps._anyTapeActive == 0) return output;
 
-        var aDenseSnapshot = a.ToDense();
-        var savedState = new object[] { alpha!, beta!, aDenseSnapshot };
+        // Snapshot A^T sparse (frozen, O(nnz)) — backward computes dB = A^T · (α·grad) via
+        // SparseOps.SparseMatMul (GPU-dispatched) instead of densifying A. See SparseMatMulRecord.
+        var aTransposedSnapshot = (SparseTensor<T>)a.Transpose();
+        var savedState = new object[] { alpha!, beta!, aTransposedSnapshot };
         DifferentiableOps.RecordIfActive(
             "SparseAddMM",
             output,
@@ -312,14 +319,16 @@ public static class SparseAutograd
         // dB = A^T · grad_Y  → uses the snapshot for the transpose
         var aDense = inputs[0];     // caller-visible target (gradient destination)
         var b = inputs[1];
-        var aSnapshot = (Tensor<T>)savedState[0];
+        var aTransposed = (SparseTensor<T>)savedState[0]; // A^T, sparse, frozen at forward time
 
+        // dA = grad_Y · B^T  (B dense -> dense matmul, GPU-capable via the bound engine)
         var bT = engine.TensorTranspose(b);
         var gradA = engine.TensorMatMul(gradOutput, bT);
         AccumulateGrad(aDense, gradA, gradAccumulator, engine);
 
-        var aT = engine.TensorTranspose(aSnapshot);
-        var gradB = engine.TensorMatMul(aT, gradOutput);
+        // dB = A^T · grad_Y  (kept sparse -> SparseOps.SparseMatMul GPU-dispatches; no dense
+        // materialisation of A). Numerically identical to the previous dense transpose+matmul.
+        var gradB = SparseOps.SparseMatMul(aTransposed, gradOutput);
         AccumulateGrad(b, gradB, gradAccumulator, engine);
         _ = output;
     }
@@ -337,7 +346,7 @@ public static class SparseAutograd
         // d(A·B) = α · grad_out  ⇒  dA = α · grad_out · B^T,  dB = α · A^T · grad_out
         T alpha = (T)savedState[0];
         T beta = (T)savedState[1];
-        var aSnapshot = (Tensor<T>)savedState[2];
+        var aTransposed = (SparseTensor<T>)savedState[2]; // A^T sparse, frozen at forward time
         var c = inputs[0];
         var aDense = inputs[1];     // caller-visible target
         var b = inputs[2];
@@ -350,8 +359,8 @@ public static class SparseAutograd
         var gradA = engine.TensorMatMul(alphaGradOut, bT);
         AccumulateGrad(aDense, gradA, gradAccumulator, engine);
 
-        var aT = engine.TensorTranspose(aSnapshot);
-        var gradB = engine.TensorMatMul(aT, alphaGradOut);
+        // dB = A^T · (α·grad), kept sparse -> GPU-dispatched, no dense A materialisation.
+        var gradB = SparseOps.SparseMatMul(aTransposed, alphaGradOut);
         AccumulateGrad(b, gradB, gradAccumulator, engine);
         _ = output;
     }
