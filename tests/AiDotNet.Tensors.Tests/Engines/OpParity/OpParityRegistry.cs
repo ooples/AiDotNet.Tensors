@@ -29,7 +29,50 @@ public static class OpParityRegistry
         .Concat(FusedConvMlp()).Concat(GatherScatterPool()).Concat(SdpaScatterUnique())
         .Concat(RecurrentScans()).Concat(MoreScansComplex()).Concat(AudioSpectral())
         .Concat(ReduceBackwardMisc()).Concat(DeformMesh()).Concat(DeformGridScatterBwd())
-        .Concat(LocalConvPool3D());
+        .Concat(LocalConvPool3D()).Concat(PsRoiOctonionReduceBwd());
+
+    // Position-sensitive RoI, octonion ops, std/var backwards.
+    public static IEnumerable<OpCase> PsRoiOctonionReduceBwd()
+    {
+        // PsRoIAlign/Pool: input channels = outputChannels*outH*outW = 2*2*2 = 8.
+        var psIn = OpInput.Rand(4300, new[] { 1, 8, 8, 8 });
+        var psBoxes = OpInput.From(new double[] { 0, 0, 0, 4, 4, 0, 1, 1, 6, 6 }, new[] { 2, 5 });
+        yield return new OpCase("PsRoIAlign[1,8,8,8;2roi]", "pool",
+            e => e.PsRoIAlign(psIn.F(), psBoxes.F(), 2, 2, 2, 1f, 2),
+            e => e.PsRoIAlign(psIn.D(), psBoxes.D(), 2, 2, 2, 1f, 2),
+            ParityTol.Accum(1e-3), opMethod: "PsRoIAlign");
+        yield return new OpCase("PsRoIPool[1,8,8,8;2roi]", "pool",
+            e => e.PsRoIPool(psIn.F(), psBoxes.F(), 2, 2, 2, 1f),
+            e => e.PsRoIPool(psIn.D(), psBoxes.D(), 2, 2, 2, 1f),
+            ParityTol.Accum(1e-3), opMethod: "PsRoIPool");
+
+        // Octonion (8-component) elementwise add + matmul.
+        var oa = OpInput.Rand(4310, new[] { 2, 8 });
+        var ob = OpInput.Rand(4311, new[] { 2, 8 });
+        yield return new OpCase("OctonionAddTensor[2,8]", "arithmetic",
+            e => e.OctonionAddTensor(oa.F(), ob.F()), e => e.OctonionAddTensor(oa.D(), ob.D()),
+            ParityTol.Ulp(2), opMethod: "OctonionAddTensor");
+        // Octonion matmul: input [B,F,8], weight [outF,F,8].
+        var oi = OpInput.Rand(4312, new[] { 1, 4, 8 });
+        var ow = OpInput.Rand(4313, new[] { 3, 4, 8 });
+        yield return new OpCase("OctonionMatMulTensor[1,4,8;3,4,8]", "matmul",
+            e => e.OctonionMatMulTensor(oi.F(), ow.F()), e => e.OctonionMatMulTensor(oi.D(), ow.D()),
+            ParityTol.Accum(1e-3), opMethod: "OctonionMatMulTensor");
+
+        // Std/Var backward — GLOBAL axes only: output scalar, gradOutput/mean/std [1].
+        var bgo = OpInput.Rand(4320, new[] { 1 });
+        var bin = OpInput.Rand(4321, new[] { 4, 6 });
+        var bmean = OpInput.Rand(4322, new[] { 1 });
+        var bstd = OpInput.RandPositive(4323, new[] { 1 }, 0.5, 2.0);
+        yield return new OpCase("StdBackward[4,6;global]", "reduction",
+            e => e.StdBackward(bgo.F(), bin.F(), bmean.F(), bstd.F(), System.Array.Empty<int>()),
+            e => e.StdBackward(bgo.D(), bin.D(), bmean.D(), bstd.D(), System.Array.Empty<int>()),
+            ParityTol.Accum(1e-3), opMethod: "StdBackward");
+        yield return new OpCase("VarBackward[4,6;global]", "reduction",
+            e => e.VarBackward(bgo.F(), bin.F(), bmean.F(), System.Array.Empty<int>()),
+            e => e.VarBackward(bgo.D(), bin.D(), bmean.D(), System.Array.Empty<int>()),
+            ParityTol.Accum(1e-3), opMethod: "VarBackward");
+    }
 
     // Locally-connected conv (+ backwards), grouped deformable conv, 3D max-pool-with-indices.
     public static IEnumerable<OpCase> LocalConvPool3D()
