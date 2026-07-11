@@ -983,12 +983,47 @@ public abstract class MatrixBase<T>
             return result;
         }
 
-        // Use cache-oblivious recursive algorithm — write directly into result's backing array
+        // Cache-oblivious recursion, parallelized across a flat grid of disjoint C-tiles through
+        // the persistent worker pool — write directly into result's backing array.
         MatrixMultiplyHelper.TraceMatmul("RECURSIVE", M, N, K);
         var resultData = result.GetDataArray();
-        MultiplyRecursive(_memory.ToArray(), other._memory.ToArray(), resultData, 0, 0, 0, 0, 0, 0, M, K, N, K, N, N);
+        MultiplyParallel(_memory.ToArray(), other._memory.ToArray(), resultData, M, K, N);
 
         return result;
+    }
+
+    /// <summary>
+    /// Parallel driver for the cache-oblivious recursive multiply: partitions C into a flat grid
+    /// of disjoint Tile×Tile blocks and dispatches them through the persistent worker pool as a
+    /// SINGLE fan-out (PR #762), each block computing its full-K product via the serial recursion.
+    /// One dispatch (not nested fork-join) means no reentrancy collapse; disjoint C blocks each walk
+    /// k = 0..K-1 in ascending order, so the result is bit-identical to a purely serial run.
+    /// </summary>
+    private void MultiplyParallel(T[] a, T[] b, T[] c, int M, int K, int N)
+    {
+        const int Tile = 128; // C-block edge — big enough to amortize dispatch, small enough to fan out.
+        int mTiles = (M + Tile - 1) / Tile;
+        int nTiles = (N + Tile - 1) / Tile;
+        int totalTiles = mTiles * nTiles;
+
+        // Grain gate: a single tile, or a product below the pool's serial threshold, runs inline
+        // (no dispatch) — matching the pool's own small-op fallback used elsewhere.
+        if (totalTiles <= 1 || (long)M * N * K < PersistentParallelExecutor.DefaultSerialGrainSize)
+        {
+            MultiplyRecursive(a, b, c, 0, 0, 0, 0, 0, 0, M, K, N, K, N, N);
+            return;
+        }
+
+        int nTilesLocal = nTiles;
+        PersistentParallelExecutor.Instance.Execute(totalTiles, tileIdx =>
+        {
+            int ti = tileIdx / nTilesLocal;
+            int tj = tileIdx - ti * nTilesLocal;
+            int mStart = ti * Tile; int mLen = Math.Min(Tile, M - mStart);
+            int nStart = tj * Tile; int nLen = Math.Min(Tile, N - nStart);
+            // C[mStart..+mLen, nStart..+nLen] = A[mStart.., 0..K] * B[0..K, nStart..], full K in order.
+            MultiplyRecursive(a, b, c, mStart, 0, 0, nStart, mStart, nStart, mLen, K, nLen, K, N, N);
+        });
     }
 
     /// <summary>
@@ -1006,7 +1041,6 @@ public abstract class MatrixBase<T>
         int aStride, int bStride, int cStride)
     {
         const int BaseThreshold = 64; // Threshold for base case
-        const int ParallelThreshold = 128; // Threshold for parallel execution
 
         // Base case: use optimized kernel
         if (m <= BaseThreshold && k <= BaseThreshold && n <= BaseThreshold)
@@ -1015,48 +1049,25 @@ public abstract class MatrixBase<T>
             return;
         }
 
-        // Find the largest dimension and split along it
+        // Serial cache-oblivious divide-and-conquer. Parallelism is applied ONCE at the top
+        // level by MultiplyParallel (a flat grid of disjoint C-tiles dispatched through the
+        // persistent worker pool, PR #762), so this routine recurses purely serially — it always
+        // runs inside a pool participant, where a nested dispatch would collapse to serial anyway.
         if (m >= k && m >= n)
         {
-            // Split A horizontally: [A1; A2] * B = [A1*B; A2*B]
-            // Subproblems write to different rows of C - can run in parallel
+            // Split A horizontally: [A1; A2] * B = [A1*B; A2*B] (disjoint C rows).
             int m1 = m / 2;
             int m2 = m - m1;
-
-            if (m >= ParallelThreshold)
-            {
-                // Execute independent subproblems in parallel
-                System.Threading.Tasks.Parallel.Invoke(
-                    () => MultiplyRecursive(a, b, c, aRowStart, aColStart, bRowStart, bColStart, cRowStart, cColStart, m1, k, n, aStride, bStride, cStride),
-                    () => MultiplyRecursive(a, b, c, aRowStart + m1, aColStart, bRowStart, bColStart, cRowStart + m1, cColStart, m2, k, n, aStride, bStride, cStride)
-                );
-            }
-            else
-            {
-                MultiplyRecursive(a, b, c, aRowStart, aColStart, bRowStart, bColStart, cRowStart, cColStart, m1, k, n, aStride, bStride, cStride);
-                MultiplyRecursive(a, b, c, aRowStart + m1, aColStart, bRowStart, bColStart, cRowStart + m1, cColStart, m2, k, n, aStride, bStride, cStride);
-            }
+            MultiplyRecursive(a, b, c, aRowStart, aColStart, bRowStart, bColStart, cRowStart, cColStart, m1, k, n, aStride, bStride, cStride);
+            MultiplyRecursive(a, b, c, aRowStart + m1, aColStart, bRowStart, bColStart, cRowStart + m1, cColStart, m2, k, n, aStride, bStride, cStride);
         }
         else if (n >= k)
         {
-            // Split B vertically: A * [B1 B2] = [A*B1 A*B2]
-            // Subproblems write to different columns of C - can run in parallel
+            // Split B vertically: A * [B1 B2] = [A*B1 A*B2] (disjoint C columns).
             int n1 = n / 2;
             int n2 = n - n1;
-
-            if (n >= ParallelThreshold)
-            {
-                // Execute independent subproblems in parallel
-                System.Threading.Tasks.Parallel.Invoke(
-                    () => MultiplyRecursive(a, b, c, aRowStart, aColStart, bRowStart, bColStart, cRowStart, cColStart, m, k, n1, aStride, bStride, cStride),
-                    () => MultiplyRecursive(a, b, c, aRowStart, aColStart, bRowStart, bColStart + n1, cRowStart, cColStart + n1, m, k, n2, aStride, bStride, cStride)
-                );
-            }
-            else
-            {
-                MultiplyRecursive(a, b, c, aRowStart, aColStart, bRowStart, bColStart, cRowStart, cColStart, m, k, n1, aStride, bStride, cStride);
-                MultiplyRecursive(a, b, c, aRowStart, aColStart, bRowStart, bColStart + n1, cRowStart, cColStart + n1, m, k, n2, aStride, bStride, cStride);
-            }
+            MultiplyRecursive(a, b, c, aRowStart, aColStart, bRowStart, bColStart, cRowStart, cColStart, m, k, n1, aStride, bStride, cStride);
+            MultiplyRecursive(a, b, c, aRowStart, aColStart, bRowStart, bColStart + n1, cRowStart, cColStart + n1, m, k, n2, aStride, bStride, cStride);
         }
         else
         {
