@@ -49,9 +49,21 @@ __kernel void pow_scalar(__global const float* input, __global float* output, fl
     int idx = get_global_id(0); if (idx >= size) return;
     output[idx] = pow(input[idx], exponent);
 }
+// #775: frac_kernel is dispatched via ExecuteActivation, which launches (size+3)/4 work items
+// because it assumes FLOAT4-VECTORIZED kernels (each work item handles 4 elements). The old scalar
+// form (one element per work item) therefore wrote only the first quarter of the output and left
+// the rest uninitialized — nondeterministic garbage (the CPU-vs-GPU op-parity scaffold caught it as
+// a run-to-run mismatch). Vectorize to float4 so one work item covers 4 elements, matching the
+// ExecuteActivation contract and the other activation kernels.
 __kernel void frac_kernel(__global const float* input, __global float* output, int size) {
-    int idx = get_global_id(0); if (idx >= size) return;
-    output[idx] = input[idx] - floor(input[idx]);
+    int idx = get_global_id(0);
+    int idx4 = idx * 4;
+    if (idx4 + 3 < size) {
+        float4 x = vload4(idx, input);
+        vstore4(x - floor(x), idx, output);
+    } else {
+        for (int i = idx4; i < size; i++) output[i] = input[i] - floor(input[i]);
+    }
 }
 __kernel void clip_kernel(__global const float* input, __global float* output, float minVal, float maxVal, int size) {
     int idx = get_global_id(0); if (idx >= size) return;

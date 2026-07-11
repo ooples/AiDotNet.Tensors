@@ -281,13 +281,10 @@ public static class OpParityRegistry
         yield return U("TensorCeiling", "arithmetic", (e, t) => e.TensorCeiling(t), (e, t) => e.TensorCeiling(t), ParityTol.Exact, x);
         yield return U("TensorRound", "arithmetic", (e, t) => e.TensorRound(t), (e, t) => e.TensorRound(t), ParityTol.Exact, x);
         yield return U("TensorSign", "arithmetic", (e, t) => e.TensorSign(t), (e, t) => e.TensorSign(t), ParityTol.Exact, x);
-        // FOUND BUG (quarantined): GPU TensorFrac returns 0 where CPU/oracle give the true frac
-        // (e.g. input ≈ −6.5e-4 → CPU 0.99935, GPU 0.0) — off by a whole unit for negatives near an
-        // integer. The GPU frac kernel diverges from the CPU floor-based convention; tracked for a
-        // separate GPU-side fix. The scaffold keeps testing it (fails to un-quarantine once fixed).
-        yield return new OpCase("TensorFrac[4,64]", "arithmetic",
-            e => e.TensorFrac(x.F()), e => e.TensorFrac(x.D()), ParityTol.Ulp(4, 1e-6), opMethod: "TensorFrac")
-        { KnownDivergence = "GPU TensorFrac returns 0 for negatives near an integer (CPU uses floor-based frac) AND is nondeterministic run-to-run — the GPU frac kernel likely reads an uninitialized/racy buffer." };
+        // #775: was quarantined — the GPU frac_kernel under-wrote its output (scalar kernel launched
+        // with size/4 work items by ExecuteActivation, which assumes float4) leaving 3/4 uninitialized
+        // → nondeterministic garbage. Fixed by vectorizing frac_kernel to float4; now bit-clean.
+        yield return U("TensorFrac", "arithmetic", (e, t) => e.TensorFrac(t), (e, t) => e.TensorFrac(t), ParityTol.Ulp(4, 1e-6), x);
         yield return U("TensorReciprocal", "arithmetic", (e, t) => e.TensorReciprocal(t), (e, t) => e.TensorReciprocal(t), ParityTol.Ulp(8, 1e-6), pos);
 
         // Transcendental unary math.
