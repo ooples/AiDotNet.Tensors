@@ -60,7 +60,7 @@ internal static class OpRegistry
 
         // Convolution
         "Conv2D", "Conv1D", "Conv3D",
-        "DepthwiseConv2D", "ConvTranspose2D", "ConvTranspose3D", "LocallyConnectedConv2D",
+        "DepthwiseConv2D", "DepthwiseConv1D", "ConvTranspose2D", "ConvTranspose3D", "LocallyConnectedConv2D",
 
         // Normalization
         "BatchNorm", "BatchNormAffine", "LayerNorm", "GroupNorm", "RMSNorm", "InstanceNorm",
@@ -277,6 +277,7 @@ internal static class OpRegistry
         "ConvTranspose2DBackwardInput", "ConvTranspose2DBackwardKernel",
         "ConvTranspose3DBackwardInput", "ConvTranspose3DBackwardKernel",
         "DepthwiseConv2DBackwardInput", "DepthwiseConv2DBackwardKernel",
+        "DepthwiseConv1DBackwardInput", "DepthwiseConv1DBackwardKernel",
         "LocallyConnectedConv2DBackwardInput", "LocallyConnectedConv2DBackwardWeights", "LocallyConnectedConv2DBackwardBias",
         "DeformableConv2DBackwardInput", "DeformableConv2DBackwardKernel",
         "DeformableConv2DBackwardOffset", "DeformableConv2DBackwardMask",
