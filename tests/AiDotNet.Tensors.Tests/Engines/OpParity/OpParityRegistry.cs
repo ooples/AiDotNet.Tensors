@@ -24,7 +24,53 @@ public static class OpParityRegistry
         .Concat(SpecialAttnNorm()).Concat(SlicePoolTake()).Concat(GridConvBwdLoss()).Concat(SliceScatterMisc())
         .Concat(NormConvBackward()).Concat(StackIndexEmbed()).Concat(FusedLinAffine()).Concat(GluCropSoftmaxBwd())
         .Concat(MoreBackward()).Concat(AudioFftSplat()).Concat(GeometryNerf()).Concat(FusedRoiLoss())
-        .Concat(Conv3DBoxIou());
+        .Concat(Conv3DBoxIou()).Concat(SortConvInterp());
+
+    // 1D/transpose conv backward kernels, interpolate, dropout(eval).
+    public static IEnumerable<OpCase> SortConvInterp()
+    {
+        // Conv1D backward kernel: input [1,2,8], kernel [3,2,3] -> out [1,3,6].
+        var go1d = OpInput.Rand(2810, new[] { 1, 3, 6 });
+        var in1d = OpInput.Rand(2811, new[] { 1, 2, 8 });
+        yield return new OpCase("Conv1DBackwardKernel[go1,3,6;in1,2,8]", "conv",
+            e => e.Conv1DBackwardKernel(go1d.F(), in1d.F(), new[] { 3, 2, 3 }, 1, 0, 1),
+            e => e.Conv1DBackwardKernel(go1d.D(), in1d.D(), new[] { 3, 2, 3 }, 1, 0, 1),
+            ParityTol.Accum(1e-3), opMethod: "Conv1DBackwardKernel");
+
+        // Depthwise conv1d backward kernel: input [1,4,8], kernelShape [4,1,3] -> out [1,4,6].
+        var dwGo1 = OpInput.Rand(2820, new[] { 1, 4, 6 });
+        var dwIn1 = OpInput.Rand(2821, new[] { 1, 4, 8 });
+        yield return new OpCase("DepthwiseConv1DBackwardKernel[go1,4,6;in1,4,8]", "conv",
+            e => e.DepthwiseConv1DBackwardKernel(dwGo1.F(), dwIn1.F(), new[] { 4, 1, 3 }, 1, 0),
+            e => e.DepthwiseConv1DBackwardKernel(dwGo1.D(), dwIn1.D(), new[] { 4, 1, 3 }, 1, 0),
+            ParityTol.Accum(1e-3), opMethod: "DepthwiseConv1DBackwardKernel");
+
+        // ConvTranspose2D backward kernel: convT input [1,2,4,4] kernel [2,3,2,2] stride2 -> [1,3,8,8].
+        var ct2Go = OpInput.Rand(2830, new[] { 1, 3, 8, 8 });
+        var ct2In = OpInput.Rand(2831, new[] { 1, 2, 4, 4 });
+        yield return new OpCase("ConvTranspose2DBackwardKernel[go1,3,8,8;in1,2,4,4]", "conv",
+            e => e.ConvTranspose2DBackwardKernel(ct2Go.F(), ct2In.F(), new[] { 2, 3, 2, 2 }, new[] { 2, 2 }, new[] { 0, 0 }),
+            e => e.ConvTranspose2DBackwardKernel(ct2Go.D(), ct2In.D(), new[] { 2, 3, 2, 2 }, new[] { 2, 2 }, new[] { 0, 0 }),
+            ParityTol.Accum(1e-3), opMethod: "ConvTranspose2DBackwardKernel");
+
+        // Interpolate [1,2,4,4] -> [8,8] bilinear.
+        var interpIn = OpInput.Rand(2840, new[] { 1, 2, 4, 4 });
+        yield return new OpCase("Interpolate[1,2,4,4->8,8;bilinear]", "resize",
+            e => e.Interpolate(interpIn.F(), new[] { 8, 8 }, InterpolateMode.Bilinear, false),
+            e => e.Interpolate(interpIn.D(), new[] { 8, 8 }, InterpolateMode.Bilinear, false),
+            ParityTol.Accum(1e-3), opMethod: "Interpolate");
+        yield return new OpCase("InterpolateByScale[1,2,4,4;x2;nearest]", "resize",
+            e => e.InterpolateByScale(interpIn.F(), new double[] { 2, 2 }, InterpolateMode.Nearest, false),
+            e => e.InterpolateByScale(interpIn.D(), new double[] { 2, 2 }, InterpolateMode.Nearest, false),
+            ParityTol.Exact, opMethod: "InterpolateByScale");
+
+        // Dropout in eval mode (training=false) is a deterministic identity.
+        var dropIn = OpInput.Rand(2850, new[] { 4, 6 });
+        yield return new OpCase("Dropout[4,6;eval]", "regularize",
+            e => e.Dropout(dropIn.F(), 0.5, false, out _),
+            e => e.Dropout(dropIn.D(), 0.5, false, out _),
+            ParityTol.Exact, opMethod: "Dropout");
+    }
 
     // 3D conv backward kernels/inputs, ConvTranspose3D, depthwise-conv backward, box-IoU + convert.
     public static IEnumerable<OpCase> Conv3DBoxIou()
