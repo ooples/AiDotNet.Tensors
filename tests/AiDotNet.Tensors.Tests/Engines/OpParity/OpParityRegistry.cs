@@ -19,12 +19,12 @@ public static class OpParityRegistry
             var a = OpInput.Rand(1, new[] { 2, 64 });
             var b = OpInput.Rand(2, new[] { 2, 64 });
             yield return new OpCase("Add[2,64]", "arithmetic",
-                e => e.TensorAdd(a.F(), b.F()), e => e.TensorAdd(a.D(), b.D()), ParityTol.Exact);
+                e => e.TensorAdd(a.F(), b.F()), e => e.TensorAdd(a.D(), b.D()), ParityTol.Exact, opMethod: "TensorAdd");
         }
         {
             var a = OpInput.Rand(3, new[] { 2, 64 });
             yield return new OpCase("Reshape[2,64->128]", "shape",
-                e => e.Reshape(a.F(), new[] { 128 }), e => e.Reshape(a.D(), new[] { 128 }), ParityTol.Exact);
+                e => e.Reshape(a.F(), new[] { 128 }), e => e.Reshape(a.D(), new[] { 128 }), ParityTol.Exact, opMethod: "Reshape");
         }
 
         // --- Accumulation ops (summation order differs across engines → relative bound) ---
@@ -32,7 +32,7 @@ public static class OpParityRegistry
             var a = OpInput.Rand(4, new[] { 8, 32 });
             var b = OpInput.Rand(5, new[] { 32, 16 });
             yield return new OpCase("MatMul[8x32x16]", "matmul",
-                e => e.TensorMatMul(a.F(), b.F()), e => e.TensorMatMul(a.D(), b.D()), ParityTol.Accum(1e-3));
+                e => e.TensorMatMul(a.F(), b.F()), e => e.TensorMatMul(a.D(), b.D()), ParityTol.Accum(1e-3), opMethod: "TensorMatMul");
         }
         {
             var a = OpInput.Rand(6, new[] { 4, 16 }, -4.0, 4.0);
@@ -53,7 +53,7 @@ public static class OpParityRegistry
             var x = OpInput.Rand(12, new[] { 1, 3, 16, 16 });
             var k = OpInput.Rand(13, new[] { 8, 3, 4, 4 });
             yield return new OpCase("Conv2D[1,3,16,16;k8x3x4x4;s4]", "conv",
-                e => e.Conv2D(x.F(), k.F(), 4, 0, 1), e => e.Conv2D(x.D(), k.D(), 4, 0, 1), ParityTol.Accum(1e-3));
+                e => e.Conv2D(x.F(), k.F(), 4, 0, 1), e => e.Conv2D(x.D(), k.D(), 4, 0, 1), ParityTol.Accum(1e-3), opMethod: "Conv2D");
         }
 
         // --- Elementwise transcendentals (a few ULP of per-element rounding) ---

@@ -61,6 +61,10 @@ public sealed class OpCase
     /// <summary>Display id, e.g. "Softmax[2,8]". Doubles as the emitted test name.</summary>
     public string Name { get; }
 
+    /// <summary>The IEngine method this case exercises, e.g. "GELU", "TensorMatMul", "Conv2D".
+    /// Used by the inventory/coverage report to mark that op covered across the full surface.</summary>
+    public string OpMethod { get; }
+
     /// <summary>Coarse bucket (arithmetic, matmul, activation, reduction, norm, conv, attention, loss, shape).</summary>
     public string Category { get; }
 
@@ -80,9 +84,13 @@ public sealed class OpCase
         ParityTol fwd,
         Func<IEngine, Tensor<float>>? runFloatGrad = null,
         Func<IEngine, Tensor<double>>? runDoubleGrad = null,
-        ParityTol bwdTol = default)
+        ParityTol bwdTol = default,
+        string? opMethod = null)
     {
         Name = name;
+        // Default the covered op method to the leading identifier of the display name
+        // (e.g. "Softmax[4,16]" -> "Softmax") when not given explicitly.
+        OpMethod = opMethod ?? LeadingIdentifier(name);
         Category = category;
         RunFloat = runFloat;
         RunDouble = runDouble;
@@ -90,6 +98,13 @@ public sealed class OpCase
         RunFloatGrad = runFloatGrad;
         RunDoubleGrad = runDoubleGrad;
         BwdTol = bwdTol;
+    }
+
+    private static string LeadingIdentifier(string name)
+    {
+        int i = 0;
+        while (i < name.Length && (char.IsLetterOrDigit(name[i]) || name[i] == '_')) i++;
+        return i > 0 ? name.Substring(0, i) : name;
     }
 }
 #endif
