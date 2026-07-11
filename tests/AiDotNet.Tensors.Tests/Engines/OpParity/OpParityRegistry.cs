@@ -32,7 +32,30 @@ public static class OpParityRegistry
         .Concat(LocalConvPool3D()).Concat(PsRoiOctonionReduceBwd()).Concat(ComplexIfftSpiral())
         .Concat(SpiralBwdPosEnc()).Concat(GroupedDeformBwdMisc()).Concat(MaskedGraphFusedBwd())
         .Concat(AttentionGraphBwd()).Concat(FlashBwdFusedTrilinear()).Concat(TrilinearBwdMhgaGrid())
-        .Concat(BceScatterMaskBwd());
+        .Concat(BceScatterMaskBwd()).Concat(MaxoutSpectral());
+
+    // Fused-linear maxout + spectral filter.
+    public static IEnumerable<OpCase> MaxoutSpectral()
+    {
+        // Maxout: input [4,8], weights [8, units*numPieces=12], numPieces 3 -> [4,4].
+        var mIn = OpInput.Rand(5200, new[] { 4, 8 });
+        var mW = OpInput.Rand(5201, new[] { 8, 12 });
+        yield return new OpCase("FusedLinearMaxout[4,8;w8,12;p3]", "matmul",
+            e => e.FusedLinearMaxout(mIn.F(), mW.F(), null, 3),
+            e => e.FusedLinearMaxout(mIn.D(), mW.D(), null, 3),
+            ParityTol.Accum(1e-3), opMethod: "FusedLinearMaxout");
+
+        // Spectral filter: real input [4,8], complex filter [4,8] (matching spatial dims).
+        var sfIn = OpInput.Rand(5210, new[] { 4, 8 });
+        var fRe = OpInput.Rand(5211, new[] { 4, 8 });
+        var fIm = OpInput.Rand(5212, new[] { 4, 8 });
+        // FOUND (quarantined): GPU spectral-filter (FFT-based) diverges ~0.93 abs while CPU matches
+        // oracle (49 ULP) — same GPU FFT-kernel family as the wideband/2D-IFFT divergences.
+        yield return new OpCase("NativeSpectralFilter[4,8]", "audio",
+            e => e.NativeSpectralFilter(sfIn.F(), fRe.CF(fIm)), e => e.NativeSpectralFilter(sfIn.D(), fRe.CD(fIm)),
+            ParityTol.Accum(2e-3), opMethod: "NativeSpectralFilter")
+        { KnownDivergence = "GPU FFT-based spectral filter diverges ~0.93 abs; CPU matches oracle." };
+    }
 
     // BCE backward, scatter-max/softmax backward, deform-mask backward, reduce-max backward.
     public static IEnumerable<OpCase> BceScatterMaskBwd()
