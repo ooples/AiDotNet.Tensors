@@ -30,7 +30,49 @@ public static class OpParityRegistry
         .Concat(RecurrentScans()).Concat(MoreScansComplex()).Concat(AudioSpectral())
         .Concat(ReduceBackwardMisc()).Concat(DeformMesh()).Concat(DeformGridScatterBwd())
         .Concat(LocalConvPool3D()).Concat(PsRoiOctonionReduceBwd()).Concat(ComplexIfftSpiral())
-        .Concat(SpiralBwdPosEnc()).Concat(GroupedDeformBwdMisc());
+        .Concat(SpiralBwdPosEnc()).Concat(GroupedDeformBwdMisc()).Concat(MaskedGraphFusedBwd());
+
+    // Masked-fill, index-put, fused-linear backward, graph attention.
+    public static IEnumerable<OpCase> MaskedGraphFusedBwd()
+    {
+        // Masked fill with a fixed checkerboard bool mask.
+        var mfT = OpInput.Rand(4700, new[] { 4, 6 });
+        var maskData = new bool[24];
+        for (int i = 0; i < 24; i++) maskData[i] = (i % 2) == 0;
+        yield return new OpCase("TensorMaskedFill[4,6;checker]", "index",
+            e => e.TensorMaskedFill(mfT.F(), new Tensor<bool>((bool[])maskData.Clone(), new[] { 4, 6 }), 0f),
+            e => e.TensorMaskedFill(mfT.D(), new Tensor<bool>((bool[])maskData.Clone(), new[] { 4, 6 }), 0.0),
+            ParityTol.Exact, opMethod: "TensorMaskedFill");
+
+        // Index-put: advanced (row,col) indexing, no accumulate.
+        var ipT = OpInput.Rand(4710, new[] { 4, 6 });
+        var ipSrc = OpInput.Rand(4711, new[] { 3 });
+        yield return new OpCase("TensorIndexPut[4,6;3pts]", "index",
+            e => e.TensorIndexPut(ipT.F(), new[] { new Tensor<int>(new[] { 0, 1, 2 }, new[] { 3 }), new Tensor<int>(new[] { 0, 2, 4 }, new[] { 3 }) }, ipSrc.F(), false),
+            e => e.TensorIndexPut(ipT.D(), new[] { new Tensor<int>(new[] { 0, 1, 2 }, new[] { 3 }), new Tensor<int>(new[] { 0, 2, 4 }, new[] { 3 }) }, ipSrc.D(), false),
+            ParityTol.Exact, opMethod: "TensorIndexPut");
+
+        // Fused-linear backward: input [4,8], weights [8,6], preActivation/gradOutput [4,6].
+        var flIn = OpInput.Rand(4720, new[] { 4, 8 });
+        var flW = OpInput.Rand(4721, new[] { 8, 6 });
+        var flPre = OpInput.Rand(4722, new[] { 4, 6 });
+        var flGo = OpInput.Rand(4723, new[] { 4, 6 });
+        yield return new OpCase("FusedLinearBackward[4,8;w8,6]", "matmul",
+            e => e.FusedLinearBackward(flGo.F(), flIn.F(), flW.F(), flPre.F(), FusedActivationType.None, out _, out _),
+            e => e.FusedLinearBackward(flGo.D(), flIn.D(), flW.D(), flPre.D(), FusedActivationType.None, out _, out _),
+            ParityTol.Accum(1e-3), opMethod: "FusedLinearBackward");
+
+        // Graph attention: nodeFeatures [1,4,6], edges [6], attnSrc/Tgt [6].
+        var nf = OpInput.Rand(4730, new[] { 1, 4, 6 });
+        var eSrc = new Tensor<int>(new[] { 0, 1, 2, 3, 0, 1 }, new[] { 6 });
+        var eTgt = new Tensor<int>(new[] { 1, 2, 3, 0, 2, 3 }, new[] { 6 });
+        var aSrc = OpInput.Rand(4731, new[] { 6 });
+        var aTgt = OpInput.Rand(4732, new[] { 6 });
+        yield return new OpCase("GraphAttention[1,4,6;6edges]", "attention",
+            e => e.GraphAttention(nf.F(), eSrc, eTgt, aSrc.F(), aTgt.F(), 0.2, out _),
+            e => e.GraphAttention(nf.D(), eSrc, eTgt, aSrc.D(), aTgt.D(), 0.2, out _),
+            ParityTol.Accum(1e-3), opMethod: "GraphAttention");
+    }
 
     // Grouped-deformable backwards, log-variance backward, scatter-reduce, equals.
     public static IEnumerable<OpCase> GroupedDeformBwdMisc()
