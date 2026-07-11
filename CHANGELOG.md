@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.114.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.113.0...v0.114.0) (2026-07-11)
+
+
+### Features
+
+* **engine:** DepthwiseConv1D primitive (CPU + GPU) for time-channel separable convs ([#772](https://github.com/ooples/AiDotNet.Tensors/issues/772)) ([f72b182](https://github.com/ooples/AiDotNet.Tensors/commit/f72b1827d3d145eb1c3fed12e737ff73eacb67ff))
+
+
+### Performance
+
+* **parallel:** adaptive spare-core-gated warm-spin for the persistent worker pool ([#762](https://github.com/ooples/AiDotNet.Tensors/issues/762)) ([e5b2a0a](https://github.com/ooples/AiDotNet.Tensors/commit/e5b2a0afece8bcbbefefcbcb23158d3dd87007e6))
+
 ## [0.113.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.112.0...v0.113.0) (2026-07-10)
 
 
