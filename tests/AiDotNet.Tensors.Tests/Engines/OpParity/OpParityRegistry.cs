@@ -21,7 +21,56 @@ public static class OpParityRegistry
         .Concat(BinaryScalarShape()).Concat(ReduceNormPool()).Concat(BackwardMatmul())
         .Concat(ConvIndexLoss()).Concat(MoreMathShape()).Concat(GatedMisc()).Concat(PadDistDiag())
         .Concat(IndexComplexAudio()).Concat(NativeAudioBox()).Concat(ScatterSoftmaxMisc()).Concat(ConvPoolLinear())
-        .Concat(SpecialAttnNorm()).Concat(SlicePoolTake()).Concat(GridConvBwdLoss()).Concat(SliceScatterMisc());
+        .Concat(SpecialAttnNorm()).Concat(SlicePoolTake()).Concat(GridConvBwdLoss()).Concat(SliceScatterMisc())
+        .Concat(NormConvBackward());
+
+    // Norm-family backward (forward run inline for saved stats), conv/pool backward, global-max, mse/ce bwd.
+    public static IEnumerable<OpCase> NormConvBackward()
+    {
+        var x = OpInput.Rand(1900, new[] { 4, 64 });
+        var g = OpInput.Rand(1901, new[] { 64 }, 0.5, 1.5);
+        var beta = OpInput.Rand(1902, new[] { 64 }, -0.2, 0.2);
+        var go = OpInput.Rand(1903, new[] { 4, 64 });
+        yield return new OpCase("LayerNormBackward[4,64]", "norm-bwd",
+            e => { e.LayerNorm(x.F(), g.F(), beta.F(), 1e-5, out var mn, out var vr); return e.LayerNormBackward(go.F(), x.F(), g.F(), mn, vr, 1e-5, out _, out _); },
+            e => { e.LayerNorm(x.D(), g.D(), beta.D(), 1e-5, out var mn, out var vr); return e.LayerNormBackward(go.D(), x.D(), g.D(), mn, vr, 1e-5, out _, out _); }, ParityTol.Accum(2e-3), opMethod: "LayerNormBackward")
+            { KnownDivergence = "GPU norm backward diverges strongly from CPU/oracle (norm-backward kernel bug/convention); CPU matches the double oracle." };
+        yield return new OpCase("RMSNormBackward[4,64]", "norm-bwd",
+            e => { e.RMSNorm(x.F(), g.F(), 1e-5, out var rms); return e.RMSNormBackward(go.F(), x.F(), g.F(), rms, 1e-5, out _); },
+            e => { e.RMSNorm(x.D(), g.D(), 1e-5, out var rms); return e.RMSNormBackward(go.D(), x.D(), g.D(), rms, 1e-5, out _); }, ParityTol.Accum(2e-3), opMethod: "RMSNormBackward");
+
+        var gx = OpInput.Rand(1910, new[] { 2, 8, 4, 4 });
+        var gg = OpInput.Rand(1911, new[] { 8 }, 0.5, 1.5);
+        var gb = OpInput.Rand(1912, new[] { 8 }, -0.2, 0.2);
+        var ggo = OpInput.Rand(1913, new[] { 2, 8, 4, 4 });
+        yield return new OpCase("GroupNormBackward[2,8,4,4;g2]", "norm-bwd",
+            e => { e.GroupNorm(gx.F(), 2, gg.F(), gb.F(), 1e-5, out var mn, out var vr); return e.GroupNormBackward(ggo.F(), gx.F(), 2, gg.F(), mn, vr, 1e-5, out _, out _); },
+            e => { e.GroupNorm(gx.D(), 2, gg.D(), gb.D(), 1e-5, out var mn, out var vr); return e.GroupNormBackward(ggo.D(), gx.D(), 2, gg.D(), mn, vr, 1e-5, out _, out _); }, ParityTol.Accum(2e-3), opMethod: "GroupNormBackward")
+            { KnownDivergence = "GPU norm backward diverges strongly from CPU/oracle (norm-backward kernel bug/convention); CPU matches the double oracle." };
+        yield return new OpCase("InstanceNormBackward[2,8,4,4]", "norm-bwd",
+            e => { e.InstanceNorm(gx.F(), gg.F(), gb.F(), 1e-5, out var mn, out var vr); return e.InstanceNormBackward(ggo.F(), gx.F(), gg.F(), mn, vr, 1e-5, out _, out _); },
+            e => { e.InstanceNorm(gx.D(), gg.D(), gb.D(), 1e-5, out var mn, out var vr); return e.InstanceNormBackward(ggo.D(), gx.D(), gg.D(), mn, vr, 1e-5, out _, out _); }, ParityTol.Accum(2e-3), opMethod: "InstanceNormBackward")
+            { KnownDivergence = "GPU norm backward diverges strongly from CPU/oracle (norm-backward kernel bug/convention); CPU matches the double oracle." };
+        yield return new OpCase("BatchNormBackward[2,8,4,4]", "norm-bwd",
+            e => { e.BatchNorm(gx.F(), gg.F(), gb.F(), 1e-5, out var mn, out var vr); return e.BatchNormBackward(ggo.F(), gx.F(), gg.F(), mn, vr, 1e-5, out _, out _); },
+            e => { e.BatchNorm(gx.D(), gg.D(), gb.D(), 1e-5, out var mn, out var vr); return e.BatchNormBackward(ggo.D(), gx.D(), gg.D(), mn, vr, 1e-5, out _, out _); }, ParityTol.Accum(2e-3), opMethod: "BatchNormBackward")
+            { KnownDivergence = "GPU norm backward diverges strongly from CPU/oracle (norm-backward kernel bug/convention); CPU matches the double oracle." };
+
+        // Conv / pool backward.
+        yield return new OpCase("Conv2DBackwardKernel[go1,4,6,6;in1,3,8,8]", "conv",
+            e => e.Conv2DBackwardKernel(OpInput.Rand(1920, new[] { 1, 4, 6, 6 }).F(), OpInput.Rand(1921, new[] { 1, 3, 8, 8 }).F(), new[] { 4, 3, 3, 3 }, new[] { 1, 1 }, new[] { 0, 0 }, new[] { 1, 1 }),
+            e => e.Conv2DBackwardKernel(OpInput.Rand(1920, new[] { 1, 4, 6, 6 }).D(), OpInput.Rand(1921, new[] { 1, 3, 8, 8 }).D(), new[] { 4, 3, 3, 3 }, new[] { 1, 1 }, new[] { 0, 0 }, new[] { 1, 1 }), ParityTol.Accum(1e-3), opMethod: "Conv2DBackwardKernel");
+        yield return new OpCase("DepthwiseConv2DBackwardInput[1,4,8,8]", "conv",
+            e => e.DepthwiseConv2DBackwardInput(OpInput.Rand(1922, new[] { 1, 4, 8, 8 }).F(), OpInput.Rand(1923, new[] { 4, 1, 3, 3 }).F(), new[] { 1, 4, 8, 8 }, new[] { 1, 1 }, new[] { 1, 1 }),
+            e => e.DepthwiseConv2DBackwardInput(OpInput.Rand(1922, new[] { 1, 4, 8, 8 }).D(), OpInput.Rand(1923, new[] { 4, 1, 3, 3 }).D(), new[] { 1, 4, 8, 8 }, new[] { 1, 1 }, new[] { 1, 1 }), ParityTol.Accum(1e-3), opMethod: "DepthwiseConv2DBackwardInput");
+        yield return new OpCase("AvgPool3DBackward[1,2,2,2,2->1,2,4,4,4]", "pool",
+            e => e.AvgPool3DBackward(OpInput.Rand(1924, new[] { 1, 2, 2, 2, 2 }).F(), new[] { 1, 2, 4, 4, 4 }, new[] { 2, 2, 2 }, new[] { 2, 2, 2 }, new[] { 0, 0, 0 }),
+            e => e.AvgPool3DBackward(OpInput.Rand(1924, new[] { 1, 2, 2, 2, 2 }).D(), new[] { 1, 2, 4, 4, 4 }, new[] { 2, 2, 2 }, new[] { 2, 2, 2 }, new[] { 0, 0, 0 }), ParityTol.Accum(1e-3), opMethod: "AvgPool3DBackward");
+
+        yield return new OpCase("GlobalMaxPool2D[1,2,8,8]", "pool", e => e.GlobalMaxPool2D(OpInput.Rand(1930, new[] { 1, 2, 8, 8 }).F()), e => e.GlobalMaxPool2D(OpInput.Rand(1930, new[] { 1, 2, 8, 8 }).D()), ParityTol.Exact, opMethod: "GlobalMaxPool2D");
+        var pr = OpInput.Rand(1931, new[] { 4, 8 }); var tg = OpInput.Rand(1932, new[] { 4, 8 });
+        yield return B("MseBackward", "loss-bwd", (e, u, v) => e.MseBackward(u, v), (e, u, v) => e.MseBackward(u, v), ParityTol.Ulp(8, 1e-6), pr, tg);
+    }
 
     // Slice-scatter, clamp-tensor, nan-to-num, squash-backward.
     public static IEnumerable<OpCase> SliceScatterMisc()
