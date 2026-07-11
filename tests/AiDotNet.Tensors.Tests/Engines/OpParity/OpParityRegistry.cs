@@ -27,7 +27,33 @@ public static class OpParityRegistry
         .Concat(Conv3DBoxIou()).Concat(SortConvInterp()).Concat(AttentionFused())
         .Concat(ScalarShapePad()).Concat(ComplexReal()).Concat(TensorMathBatch())
         .Concat(FusedConvMlp()).Concat(GatherScatterPool()).Concat(SdpaScatterUnique())
-        .Concat(RecurrentScans()).Concat(MoreScansComplex());
+        .Concat(RecurrentScans()).Concat(MoreScansComplex()).Concat(AudioSpectral());
+
+    // FFT-based audio features (MFCC / wideband / mel-spectrogram).
+    public static IEnumerable<OpCase> AudioSpectral()
+    {
+        var wave = OpInput.Rand(3800, new[] { 2, 512 }, -1, 1);
+        yield return new OpCase("NativeMfccFeatures[2,512;seg4;mfcc13]", "audio",
+            e => e.NativeMfccFeatures(wave.F(), 4, 13, 256), e => e.NativeMfccFeatures(wave.D(), 4, 13, 256),
+            ParityTol.Accum(2e-3), opMethod: "NativeMfccFeatures");
+        // FOUND (quarantined): GPU wideband-feature FFT kernel diverges massively (CPU 3 ULP vs
+        // oracle, GPU ~48M ULP / 2.24 abs).
+        yield return new OpCase("NativeWidebandFeatures[2,512;seg4;bins20]", "audio",
+            e => e.NativeWidebandFeatures(wave.F(), 4, 20), e => e.NativeWidebandFeatures(wave.D(), 4, 20),
+            ParityTol.Accum(2e-3), opMethod: "NativeWidebandFeatures")
+        { KnownDivergence = "GPU wideband-feature FFT kernel diverges ~2.24 abs; CPU matches oracle." };
+
+        // Mel-spectrogram of a [1,128] signal, nFft 16, hop 8, 8 mels.
+        // FOUND (quarantined): GPU emits a different frame count (120 vs CPU/oracle 136) -> STFT
+        // framing/centering mismatch on the GPU path.
+        var mwave = OpInput.Rand(3810, new[] { 1, 128 }, -1, 1);
+        var window = OpInput.RandPositive(3811, new[] { 16 }, 0.2, 1.0);
+        yield return new OpCase("MelSpectrogram[1,128;nfft16;mels8]", "audio",
+            e => e.MelSpectrogram(mwave.F(), 16000, 16, 8, 8, 0f, 8000f, window.F(), true),
+            e => e.MelSpectrogram(mwave.D(), 16000, 16, 8, 8, 0.0, 8000.0, window.D(), true),
+            ParityTol.Accum(2e-3), opMethod: "MelSpectrogram")
+        { KnownDivergence = "GPU mel-spectrogram emits a different frame count (STFT framing mismatch)." };
+    }
 
     // More linear-attention scans (RWKV-7, xLSTM, gated-delta-net) + scatter + interleaved complex.
     public static IEnumerable<OpCase> MoreScansComplex()
