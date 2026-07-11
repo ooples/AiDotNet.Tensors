@@ -118,11 +118,10 @@ public static class CpuParallelSettings
     }
 
     /// <summary>
-    /// Worker-thread count for the library's persistent custom thread pools (PersistentParallelExecutor,
-    /// StreamingWorkerPool, CooperativeGemmScheduler). Honors <see cref="MaxDegreeOfParallelism"/> and clamps to
-    /// a ceiling so a high-core box (e.g. 64 logical processors) does NOT spawn ~63 threads PER pool — three such
-    /// pools at 63 each = ~189 mostly-parked threads of pure oversubscription tax. Each pool reads this once at
-    /// construction. Override the ceiling with AIDOTNET_POOL_THREADS.
+    /// Worker-thread count for the library's persistent custom thread pool (PersistentParallelExecutor).
+    /// Honors <see cref="MaxDegreeOfParallelism"/> and clamps to a ceiling so a high-core box (e.g. 64
+    /// logical processors) does NOT spawn ~63 mostly-parked worker threads of pure oversubscription tax.
+    /// The pool reads this once at construction. Override the ceiling with AIDOTNET_POOL_THREADS.
     /// </summary>
     public static int WorkerPoolThreads
     {
@@ -274,7 +273,7 @@ public static class CpuParallelSettings
         int chunkSize = (length + numChunks - 1) / numChunks;
 
         // Persistent-pool dispatch: the benchmark-proven winner (ParallelPrimitiveBench)
-        // over both raw Parallel.For and the CooperativeGemmScheduler path — parked
+        // over both raw Parallel.For and the since-removed cooperative-scheduler path — parked
         // workers wake with near-zero latency (adaptive keep-warm, PR #762). Disjoint
         // [start,count) chunks ⇒ bit-identical to Parallel.For. The A/B / kill-switch
         // (AIDOTNET_COOP_POOL=0 → raw Parallel.For) now lives in ONE place inside
@@ -497,7 +496,6 @@ public static class CpuParallelSettings
             if (firstException is not null) throw firstException;
             return;
         }
-        System.Threading.Interlocked.Increment(ref s_parallelForInvocations);
 
         // PR #531: route the general parallel-op path off raw Parallel.For (the .NET
         // ThreadPool — high dispatch latency + per-call task/range allocation, and the
@@ -509,9 +507,8 @@ public static class CpuParallelSettings
         // Disjoint-iteration safety is the SAME contract Parallel.For already requires of
         // its callers (this is the Action overload — each iteration writes its own output,
         // no cross-iteration reduction — so chunking is bit-identical to Parallel.For).
-        // Decoupled from CooperativeGemmScheduler.Enabled (which still gates the GEMM
-        // strategies pending their concurrency benchmark). Default-on (validated across the
-        // full test suite); the A/B / kill-switch fallback to Parallel.For (AIDOTNET_COOP_POOL=0)
+        // Default-on (validated across the full test suite); the A/B / kill-switch fallback
+        // to Parallel.For (AIDOTNET_COOP_POOL=0)
         // now lives in ONE place inside PersistentParallelExecutor.Execute.
         int count = toExclusive - fromInclusive;
         // Scale the chunk count with the work, not blindly to maxDegree. Waking all
@@ -537,10 +534,10 @@ public static class CpuParallelSettings
     }
 
     /// <summary>
-    /// PR #531: route <see cref="ParallelForOrSerial(int,int,long,Action{int},bool)"/>'s parallel
-    /// path through the low-latency <c>CooperativeGemmScheduler</c> instead of
-    /// <see cref="System.Threading.Tasks.Parallel.For(int,int,Action{int})"/>. Cheaper dispatch
-    /// (≈15× less per-call allocation, lower median/p95 — the cooperative pool's fixed worker set
+    /// Route <see cref="ParallelForOrSerial(int,int,long,Action{int},bool)"/>'s parallel
+    /// path through the low-latency persistent worker pool (<see cref="PersistentParallelExecutor"/>)
+    /// instead of <see cref="System.Threading.Tasks.Parallel.For(int,int,Action{int})"/>. Cheaper
+    /// dispatch (≈15× less per-call allocation, lower median/p95 — the pool's fixed worker set
     /// + caller-participation avoids the .NET ThreadPool's per-call task/range state and
     /// park/wakeup) with no oversubscription under concurrent inference.
     ///
@@ -551,21 +548,12 @@ public static class CpuParallelSettings
     /// <c>Parallel.For&lt;TLocal&gt;</c> already used (bit-reproducibility is a separate concern
     /// handled by <see cref="DeterministicReductions"/>, which forces serial). The switch is now
     /// read in ONE place — inside <see cref="PersistentParallelExecutor"/>'s dispatch — so every
-    /// call site has a single code path. Decoupled from <c>CooperativeGemmScheduler.Enabled</c>,
-    /// which separately gates the GEMM strategies. Set <c>false</c> to fall back to <c>Parallel.For</c>
-    /// (e.g. to avoid the cooperative pool's dedicated worker threads in a thread-count-sensitive host,
+    /// call site has a single code path. Set <c>false</c> to fall back to <c>Parallel.For</c>
+    /// (e.g. to avoid the pool's dedicated worker threads in a thread-count-sensitive host,
     /// or to A/B benchmark the pool against the .NET ThreadPool).</para>
     /// </summary>
     public static bool UseCooperativePool { get; set; } =
         System.Environment.GetEnvironmentVariable("AIDOTNET_COOP_POOL") != "0"; // =0 forces raw Parallel.For for A/B
-
-    // PR #531 diagnostic: how often the general op path actually dispatches through
-    // System.Threading.Tasks.Parallel.For (the .NET ThreadPool — the LowLevelLifoSemaphore
-    // in the small-op trace) versus the low-latency StreamingWorkerPool (which is wired only
-    // into StreamingStrategy). Counts the Action overload's parallel/serial branches.
-    internal static long s_parallelForInvocations;
-    internal static long ParallelForStatsSnapshot() => System.Threading.Volatile.Read(ref s_parallelForInvocations);
-    internal static void ResetParallelForStats() { s_parallelForInvocations = 0; }
 
     /// <summary>
     /// Grain-size-aware drop-in for the localInit/localFinally overload of

@@ -38,9 +38,9 @@ public sealed class BlasManagedStatsSerialCollection { }
 public sealed class BlasManagedPerfSerialCollection { }
 
 /// <summary>
-/// StreamingWorkerPool tests measure dispatch latency and assert each chunk
-/// runs exactly once — both are sensitive to concurrent CPU contention from
-/// other collections. Serialize against all other collections.
+/// Pool-routing tests toggle the process-wide CpuParallelSettings.UseCooperativePool and
+/// assert each chunk runs exactly once — both are sensitive to concurrent CPU contention
+/// from other collections. Serialize against all other collections.
 /// </summary>
 [CollectionDefinition("BlasManaged-Pool-Serial", DisableParallelization = true)]
 public sealed class BlasManagedPoolSerialCollection { }

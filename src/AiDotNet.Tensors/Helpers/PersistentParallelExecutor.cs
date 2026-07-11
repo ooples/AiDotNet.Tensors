@@ -96,8 +96,8 @@ internal sealed class PersistentParallelExecutor
         // MaxDegreeOfParallelism, and this pool initializes exactly once — so a transient
         // low MaxDoP at the first dispatch (a DOP-pinned warmup/probe, or a consumer that
         // lowers MaxDoP before its first parallel op) would PERMANENTLY cap the pool and
-        // kill many-core scaling for the process's life (the same singleton-init bug fixed
-        // in CooperativeGemmScheduler). Per-dispatch concurrency is bounded per call below
+        // kill many-core scaling for the process's life (a singleton-init pitfall we avoid
+        // by sizing to machine width here). Per-dispatch concurrency is bounded per call below
         // (effWorkers honors the current MaxDegreeOfParallelism), so a machine-width parked
         // pool honors MaxDoP per op without the permanent cap; parked workers cost no CPU.
         const int ceiling = 32;

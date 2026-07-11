@@ -1073,60 +1073,6 @@ internal static class AisEvalHeadToHeadBench
     }
 
     /// <summary>
-    /// PR #531 validation: count StreamingWorkerPool dispatch/park events per primitive
-    /// to see whether the low-latency-pool keep-alive even targets these workloads'
-    /// critical path. Run: --ab-aiseval-poolstats.
-    /// </summary>
-    public static void PoolStats()
-    {
-        Console.WriteLine("=== PR #531 — StreamingWorkerPool usage per AIsEval primitive ===");
-        Console.WriteLine($"Host: cores={Environment.ProcessorCount}. Counters: parallel dispatch / serial<grain / serial-contended / park events.");
-        Console.WriteLine();
-        var engine = new CpuEngine();
-        const int reps = 200;
-
-        void Probe(string name, Action run)
-        {
-            for (int i = 0; i < 20; i++) run(); // warm
-            AiDotNet.Tensors.Engines.BlasManaged.Pool.StreamingWorkerPool.ResetPoolStats();
-            AiDotNet.Tensors.Helpers.CpuParallelSettings.ResetParallelForStats();
-            for (int i = 0; i < reps; i++) run();
-            var (par, serG, serC, park) = AiDotNet.Tensors.Engines.BlasManaged.Pool.StreamingWorkerPool.PoolStatsSnapshot();
-            long pfor = AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForStatsSnapshot();
-            Console.WriteLine($"  {name,-12} over {reps} calls: StreamingPool[parallel={par} parks={park}]  vs  Parallel.For dispatches={pfor}");
-            Console.WriteLine($"  {name,-12} per call         : StreamingPool parallel={par / (double)reps:F1}  Parallel.For={pfor / (double)reps:F1}");
-        }
-
-        bool managedPass = Environment.GetEnvironmentVariable("POOLSTATS_MANAGED") == "1";
-        if (managedPass)
-        {
-            AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.PreferManaged = true;
-            Console.WriteLine("  (BlasManaged.PreferManaged = true — forcing GEMMs onto the managed StreamingWorkerPool path)");
-        }
-
-        {
-            const int bs = 128;
-            var input = Tensor<float>.CreateRandom(bs, 784);
-            var weights = new List<Tensor<float>> { Tensor<float>.CreateRandom(784, 512), Tensor<float>.CreateRandom(512, 128), Tensor<float>.CreateRandom(128, 10) };
-            var biases = new List<Tensor<float>?> { Tensor<float>.CreateRandom(512), Tensor<float>.CreateRandom(128), Tensor<float>.CreateRandom(10) };
-            Probe("MLP", () => engine.MlpForward(input, weights, biases, FusedActivationType.ReLU, FusedActivationType.None));
-        }
-        {
-            const int batch = 128, seq = 32, dModel = 64, heads = 4;
-            var input = Tensor<float>.CreateRandom(batch, seq, dModel);
-            var qW = Tensor<float>.CreateRandom(dModel, dModel); var kW = Tensor<float>.CreateRandom(dModel, dModel);
-            var vW = Tensor<float>.CreateRandom(dModel, dModel); var oW = Tensor<float>.CreateRandom(dModel, dModel);
-            Probe("Transformer", () => engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, heads));
-        }
-        {
-            const int batch = 128, seq = 32, inF = 32, hidden = 64;
-            var input = Tensor<float>.CreateRandom(batch, seq, inF);
-            var wIh = Tensor<float>.CreateRandom(4 * hidden, inF); var wHh = Tensor<float>.CreateRandom(4 * hidden, hidden);
-            Probe("LSTM", () => engine.LstmSequenceForward(input, null, null, wIh, wHh, null, null));
-        }
-    }
-
-    /// <summary>
     /// PR #531 validation: per-dispatch latency + allocation of the general parallel-op
     /// path (CpuParallelSettings.ParallelForOrSerial) through raw Parallel.For (the .NET
     /// ThreadPool) vs the low-latency cooperative pool. This is the regime the prototype

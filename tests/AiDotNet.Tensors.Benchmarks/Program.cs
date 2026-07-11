@@ -176,13 +176,6 @@ class Program
             return;
         }
 
-        // #85 N-axis pinned pool vs threadpool. (--ab-pinned)
-        if (args[0] == "--ab-pinned")
-        {
-            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.PinnedNAxisSweep();
-            return;
-        }
-
         if (args[0] == "--ab-aiseval-dopsweep")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.DopSweep();
@@ -276,12 +269,6 @@ class Program
         if (args[0] == "--profile-gemm")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.ProfileGemm();
-            return;
-        }
-
-        if (args[0] == "--ab-aiseval-poolstats")
-        {
-            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.PoolStats();
             return;
         }
 
