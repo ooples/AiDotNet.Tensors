@@ -34,7 +34,17 @@ public static class OpParityRegistry
         .Concat(AttentionGraphBwd()).Concat(FlashBwdFusedTrilinear()).Concat(TrilinearBwdMhgaGrid())
         .Concat(BceScatterMaskBwd()).Concat(MaxoutSpectral()).Concat(NerfSplatSh())
         .Concat(ShBwdCtcSpectralBatch()).Concat(MaxPoolBwdAudio()).Concat(FoldReorderUnique())
-        .Concat(ConjReorderNdIfft()).Concat(MaskedSelectScatter());
+        .Concat(ConjReorderNdIfft()).Concat(MaskedSelectScatter()).Concat(IrfftBatch());
+
+    // Inverse real FFT (interleaved-complex input -> real signal).
+    public static IEnumerable<OpCase> IrfftBatch()
+    {
+        // outputLength 8 -> numFreqs 5 -> interleaved input last dim = 10.
+        var irIn = OpInput.Rand(5900, new[] { 10 });
+        yield return new OpCase("IRFFT[10->8]", "complex",
+            e => e.IRFFT(irIn.F(), 8), e => e.IRFFT(irIn.D(), 8),
+            ParityTol.Accum(1e-3), opMethod: "IRFFT");
+    }
 
     // Masked select / scatter with a fixed Bit mask.
     public static IEnumerable<OpCase> MaskedSelectScatter()
