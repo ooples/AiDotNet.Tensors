@@ -22,7 +22,49 @@ public static class OpParityRegistry
         .Concat(ConvIndexLoss()).Concat(MoreMathShape()).Concat(GatedMisc()).Concat(PadDistDiag())
         .Concat(IndexComplexAudio()).Concat(NativeAudioBox()).Concat(ScatterSoftmaxMisc()).Concat(ConvPoolLinear())
         .Concat(SpecialAttnNorm()).Concat(SlicePoolTake()).Concat(GridConvBwdLoss()).Concat(SliceScatterMisc())
-        .Concat(NormConvBackward());
+        .Concat(NormConvBackward()).Concat(StackIndexEmbed());
+
+    // Stack variants, index-copy/fill/put, embedding-from-float, cartesian-prod, softmax-backward.
+    public static IEnumerable<OpCase> StackIndexEmbed()
+    {
+        var c1 = OpInput.Rand(2000, new[] { 4, 8 });
+        var c2 = OpInput.Rand(2001, new[] { 4, 8 });
+        Tensor<float>[] Fs() => new[] { c1.F(), c2.F() };
+        Tensor<double>[] Ds() => new[] { c1.D(), c2.D() };
+        yield return new OpCase("TensorVStack[2x4,8]", "shape", e => e.TensorVStack(Fs()), e => e.TensorVStack(Ds()), ParityTol.Exact, opMethod: "TensorVStack");
+        yield return new OpCase("TensorHStack[2x4,8]", "shape", e => e.TensorHStack(Fs()), e => e.TensorHStack(Ds()), ParityTol.Exact, opMethod: "TensorHStack");
+        yield return new OpCase("TensorColumnStack[2x4,8]", "shape", e => e.TensorColumnStack(Fs()), e => e.TensorColumnStack(Ds()), ParityTol.Exact, opMethod: "TensorColumnStack");
+        yield return new OpCase("TensorRowStack[2x4,8]", "shape", e => e.TensorRowStack(Fs()), e => e.TensorRowStack(Ds()), ParityTol.Exact, opMethod: "TensorRowStack");
+        yield return new OpCase("TensorDStack[2x4,8]", "shape", e => e.TensorDStack(Fs()), e => e.TensorDStack(Ds()), ParityTol.Exact, opMethod: "TensorDStack");
+
+        var m = OpInput.Rand(2010, new[] { 4, 8 });
+        yield return new OpCase("TensorPut[4,8;idx3]", "index",
+            e => e.TensorPut(m.F(), new Tensor<int>(new[] { 0, 10, 25 }, new[] { 3 }), OpInput.Rand(2011, new[] { 3 }).F()),
+            e => e.TensorPut(m.D(), new Tensor<int>(new[] { 0, 10, 25 }, new[] { 3 }), OpInput.Rand(2011, new[] { 3 }).D()), ParityTol.Exact, opMethod: "TensorPut");
+        yield return new OpCase("TensorIndexCopy[4,8;ax0]", "index",
+            e => e.TensorIndexCopy(m.F(), 0, new Tensor<int>(new[] { 0, 2 }, new[] { 2 }), OpInput.Rand(2012, new[] { 2, 8 }).F()),
+            e => e.TensorIndexCopy(m.D(), 0, new Tensor<int>(new[] { 0, 2 }, new[] { 2 }), OpInput.Rand(2012, new[] { 2, 8 }).D()), ParityTol.Exact, opMethod: "TensorIndexCopy");
+        yield return new OpCase("TensorIndexFill[4,8;ax0]", "index",
+            e => e.TensorIndexFill(m.F(), 0, new Tensor<int>(new[] { 1, 3 }, new[] { 2 }), 0.5f),
+            e => e.TensorIndexFill(m.D(), 0, new Tensor<int>(new[] { 1, 3 }, new[] { 2 }), 0.5), ParityTol.Exact, opMethod: "TensorIndexFill");
+
+        yield return new OpCase("TensorEmbeddingLookupFromFloatIndices[10,8;idx4]", "index",
+            e => e.TensorEmbeddingLookupFromFloatIndices(OpInput.Rand(2020, new[] { 10, 8 }).F(), OpInput.From(new double[] { 1, 3, 0, 5 }, new[] { 4 }).F()),
+            e => e.TensorEmbeddingLookupFromFloatIndices(OpInput.Rand(2020, new[] { 10, 8 }).D(), OpInput.From(new double[] { 1, 3, 0, 5 }, new[] { 4 }).D()), ParityTol.Exact, opMethod: "TensorEmbeddingLookupFromFloatIndices");
+        yield return new OpCase("TensorCartesianProd[2.3]", "shape",
+            e => e.TensorCartesianProd(new[] { OpInput.Rand(2021, new[] { 2 }).F(), OpInput.Rand(2022, new[] { 3 }).F() }),
+            e => e.TensorCartesianProd(new[] { OpInput.Rand(2021, new[] { 2 }).D(), OpInput.Rand(2022, new[] { 3 }).D() }), ParityTol.Exact, opMethod: "TensorCartesianProd");
+
+        var logits = OpInput.Rand(2030, new[] { 4, 8 }, -4.0, 4.0);
+        var sgo = OpInput.Rand(2031, new[] { 4, 8 });
+        // FOUND (quarantined): GPU TensorSoftmaxBackward diverges strongly from CPU/oracle (maxRel
+        // ~1.3; CPU matches the oracle) — part of the GPU backward-kernel divergence cluster with the
+        // norm backwards. (The plain SoftmaxBackward op passes; this Tensor* variant does not.)
+        yield return new OpCase("TensorSoftmaxBackward[4,8]", "activation-bwd",
+            e => e.TensorSoftmaxBackward(e.TensorSoftmax(logits.F(), -1), sgo.F(), -1),
+            e => e.TensorSoftmaxBackward(e.TensorSoftmax(logits.D(), -1), sgo.D(), -1), ParityTol.Accum(1e-3), opMethod: "TensorSoftmaxBackward")
+        { KnownDivergence = "GPU TensorSoftmaxBackward diverges strongly from CPU/oracle (backward-kernel bug)." };
+    }
 
     // Norm-family backward (forward run inline for saved stats), conv/pool backward, global-max, mse/ce bwd.
     public static IEnumerable<OpCase> NormConvBackward()
