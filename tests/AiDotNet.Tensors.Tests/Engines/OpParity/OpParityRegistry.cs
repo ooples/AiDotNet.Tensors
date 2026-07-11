@@ -25,7 +25,62 @@ public static class OpParityRegistry
         .Concat(NormConvBackward()).Concat(StackIndexEmbed()).Concat(FusedLinAffine()).Concat(GluCropSoftmaxBwd())
         .Concat(MoreBackward()).Concat(AudioFftSplat()).Concat(GeometryNerf()).Concat(FusedRoiLoss())
         .Concat(Conv3DBoxIou()).Concat(SortConvInterp()).Concat(AttentionFused())
-        .Concat(ScalarShapePad()).Concat(ComplexReal());
+        .Concat(ScalarShapePad()).Concat(ComplexReal()).Concat(TensorMathBatch());
+
+    // Assorted Tensor* math: leaky-relu, power, inner/outer, expand, CIoU loss, upsample, tri-mask, zeta.
+    public static IEnumerable<OpCase> TensorMathBatch()
+    {
+        var a = OpInput.Rand(3200, new[] { 4, 6 });
+        var b = OpInput.Rand(3201, new[] { 4, 6 });
+        yield return new OpCase("TensorLeakyReLU[4,6;0.01]", "activation",
+            e => e.TensorLeakyReLU(a.F(), 0.01f), e => e.TensorLeakyReLU(a.D(), 0.01),
+            ParityTol.Ulp(2), opMethod: "TensorLeakyReLU");
+        yield return new OpCase("TensorPower[4,6;^2]", "elementwise",
+            e => e.TensorPower(a.F(), 2f), e => e.TensorPower(a.D(), 2.0),
+            ParityTol.Ulp(8), opMethod: "TensorPower");
+        yield return new OpCase("TensorInner[4,6;4,6]", "matmul",
+            e => e.TensorInner(a.F(), b.F()), e => e.TensorInner(a.D(), b.D()),
+            ParityTol.Accum(1e-3), opMethod: "TensorInner");
+
+        var u = OpInput.Rand(3210, new[] { 4 });
+        var v = OpInput.Rand(3211, new[] { 6 });
+        yield return new OpCase("TensorOuterProduct[4;6]", "matmul",
+            e => e.TensorOuterProduct(u.F(), v.F()), e => e.TensorOuterProduct(u.D(), v.D()),
+            ParityTol.Ulp(4), opMethod: "TensorOuterProduct");
+
+        var row = OpInput.Rand(3220, new[] { 1, 6 });
+        var like = OpInput.Rand(3221, new[] { 4, 6 });
+        yield return new OpCase("TensorExpandAs[1,6->4,6]", "shape",
+            e => e.TensorExpandAs(row.F(), like.F()), e => e.TensorExpandAs(row.D(), like.D()),
+            ParityTol.Exact, opMethod: "TensorExpandAs");
+
+        // CIoU loss between predicted/target boxes [3,4] in XYXY.
+        var pb = OpInput.From(new double[] { 0, 0, 2, 2, 1, 1, 3, 4, 0, 1, 4, 3 }, new[] { 3, 4 });
+        var tb = OpInput.From(new double[] { 0, 0, 2, 3, 1, 0, 3, 3, 0, 0, 3, 3 }, new[] { 3, 4 });
+        yield return new OpCase("TensorCIoULoss[3,4;3,4]", "loss",
+            e => e.TensorCIoULoss(pb.F(), tb.F()), e => e.TensorCIoULoss(pb.D(), tb.D()),
+            ParityTol.Accum(1e-3), opMethod: "TensorCIoULoss");
+
+        // FOUND (quarantined): GPU TensorUpsampleBilinear diverges badly (CPU 26 ULP vs oracle, GPU
+        // ~0.45 abs off) — GPU bilinear-upsample kernel bug (note plain Interpolate bilinear passes,
+        // so it's this specific kernel).
+        var upIn = OpInput.Rand(3230, new[] { 1, 2, 4, 4 });
+        yield return new OpCase("TensorUpsampleBilinear[1,2,4,4->8,8]", "resize",
+            e => e.TensorUpsampleBilinear(upIn.F(), new[] { 8, 8 }), e => e.TensorUpsampleBilinear(upIn.D(), new[] { 8, 8 }),
+            ParityTol.Accum(1e-3), opMethod: "TensorUpsampleBilinear")
+        { KnownDivergence = "GPU bilinear-upsample kernel diverges ~0.45 abs; CPU matches oracle." };
+
+        yield return new OpCase("TensorTriangularMask[4;lower]", "shape",
+            e => e.TensorTriangularMask<float>(4, false, 0), e => e.TensorTriangularMask<double>(4, false, 0),
+            ParityTol.Exact, opMethod: "TensorTriangularMask");
+
+        // Hurwitz zeta zeta(x,q), x>1, q>0.
+        var zx = OpInput.Rand(3240, new[] { 3, 4 }, 2.0, 4.0);
+        var zq = OpInput.Rand(3241, new[] { 3, 4 }, 0.5, 3.0);
+        yield return new OpCase("TensorZeta[3,4]", "special",
+            e => e.TensorZeta(zx.F(), zq.F()), e => e.TensorZeta(zx.D(), zq.D()),
+            ParityTol.Accum(1e-3), opMethod: "TensorZeta");
+    }
 
     // Complex-input ops that return a REAL tensor (magnitude/phase family).
     public static IEnumerable<OpCase> ComplexReal()
