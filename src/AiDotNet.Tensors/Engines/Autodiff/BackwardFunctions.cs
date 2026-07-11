@@ -988,6 +988,23 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradKernel, engine);
     }
 
+    /// <summary>DepthwiseConv1D backward: uses engine.DepthwiseConv1DBackwardInput and DepthwiseConv1DBackwardKernel</summary>
+    internal static void DepthwiseConv1DBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var stride = (int)savedState[0];
+        var padding = (int)savedState[1];
+
+        var gradInput = engine.DepthwiseConv1DBackwardInput(
+            gradOutput, inputs[1], inputs[0]._shape, stride, padding);
+        var gradKernel = engine.DepthwiseConv1DBackwardKernel(
+            gradOutput, inputs[0], inputs[1]._shape, stride, padding);
+
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradKernel, engine);
+    }
+
     /// <summary>Conv3D backward: uses engine.Conv3DBackwardInput and Conv3DBackwardKernel</summary>
     internal static void Conv3DBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,

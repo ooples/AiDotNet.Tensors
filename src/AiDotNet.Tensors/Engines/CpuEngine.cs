@@ -9215,6 +9215,72 @@ public partial class CpuEngine : ITensorLevelEngine
         return Reshape(result4D, kernelShape);
     }
 
+    /// <inheritdoc/>
+    public virtual Tensor<T> DepthwiseConv1D<T>(Tensor<T> input, Tensor<T> kernel, int stride = 1, int padding = 0)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (kernel == null) throw new ArgumentNullException(nameof(kernel));
+        if (input.Rank != 3) throw new ArgumentException($"DepthwiseConv1D requires 3D input [batch, channels, length]. Got rank {input.Rank}.", nameof(input));
+        if (kernel.Rank != 3) throw new ArgumentException($"DepthwiseConv1D requires 3D kernel [channels, multiplier, kernel_length]. Got rank {kernel.Rank}.", nameof(kernel));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                int outL = (input._shape[2] + 2 * padding - kernel._shape[2]) / stride + 1;
+                int outCh = input._shape[1] * kernel._shape[1];
+                var outShape = new[] { input._shape[0], outCh, outL };
+                var capturedInput = input;
+                var capturedKernel = kernel;
+                int s = stride, p = padding;
+                return scope.RecordBinary(LazyNodeType.Custom, "DepthwiseConv1D", input, kernel, outShape,
+                    (eng, output) => { var r = eng.DepthwiseConv1D(capturedInput, capturedKernel, s, p); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
+                    BackwardFunctions<T>.DepthwiseConv1DBackward, new object[] { stride, padding });
+            }
+        }
+
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("DepthwiseConv1D", input._shape); if (ac is not null) return ac.Execute(); }
+
+        // Reshape to 4D: [B, C, 1, L] and [C, multiplier, 1, K]
+        var input4D = Reshape(input, new[] { input._shape[0], input._shape[1], 1, input._shape[2] });
+        var kernel4D = Reshape(kernel, new[] { kernel._shape[0], kernel._shape[1], 1, kernel._shape[2] });
+
+        var result4D = DepthwiseConv2D(input4D, kernel4D, new[] { 1, stride }, new[] { 0, padding });
+
+        // Squeeze height dimension: [B, C*mult, 1, outL] -> [B, C*mult, outL]
+        var result = Reshape(result4D, new[] { result4D._shape[0], result4D._shape[1], result4D._shape[3] });
+
+        DifferentiableOps.RecordBinary("DepthwiseConv1D", result, input, kernel, BackwardFunctions<T>.DepthwiseConv1DBackward,
+            new object[] { stride, padding });
+        AutoTracer.RecordOp("DepthwiseConv1D", result, eng => eng.DepthwiseConv1D(input, kernel, stride, padding));
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public Tensor<T> DepthwiseConv1DBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> kernel, int[] inputShape, int stride, int padding)
+    {
+        // Reshape to 4D and use DepthwiseConv2DBackwardInput
+        var grad4D = Reshape(gradOutput, new[] { gradOutput._shape[0], gradOutput._shape[1], 1, gradOutput._shape[2] });
+        var kernel4D = Reshape(kernel, new[] { kernel._shape[0], kernel._shape[1], 1, kernel._shape[2] });
+        var inputShape4D = new[] { inputShape[0], inputShape[1], 1, inputShape[2] };
+
+        var result4D = DepthwiseConv2DBackwardInput(grad4D, kernel4D, inputShape4D, new[] { 1, stride }, new[] { 0, padding });
+        return Reshape(result4D, inputShape);
+    }
+
+    /// <inheritdoc/>
+    public Tensor<T> DepthwiseConv1DBackwardKernel<T>(Tensor<T> gradOutput, Tensor<T> input, int[] kernelShape, int stride, int padding)
+    {
+        // Reshape to 4D and use DepthwiseConv2DBackwardKernel
+        var grad4D = Reshape(gradOutput, new[] { gradOutput._shape[0], gradOutput._shape[1], 1, gradOutput._shape[2] });
+        var input4D = Reshape(input, new[] { input._shape[0], input._shape[1], 1, input._shape[2] });
+        var kernelShape4D = new[] { kernelShape[0], kernelShape[1], 1, kernelShape[2] };
+
+        var result4D = DepthwiseConv2DBackwardKernel(grad4D, input4D, kernelShape4D, new[] { 1, stride }, new[] { 0, padding });
+        return Reshape(result4D, kernelShape);
+    }
+
     public virtual Tensor<T> Conv2D<T>(Tensor<T> input, Tensor<T> kernel, int stride = 1, int padding = 0, int dilation = 1)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));

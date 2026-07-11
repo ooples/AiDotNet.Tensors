@@ -454,6 +454,10 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
         "DeformableConv2DBackwardMask(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32[],Int32[],Int32[])",
         "DeformableConv2DBackwardOffset(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32[],Int32[],Int32[])",
         "DepthwiseConv2D(Tensor<T>,Tensor<T>,Int32[],Int32[])",
+        // DepthwiseConv1D reshapes [B,C,L]->[B,C,1,L] onto the DepthwiseConv2D GPU kernel; input and
+        // kernel have distinct shapes (feature map vs [C,mult,K]) so the single-shape generic harness
+        // can't drive it. Dedicated GPU-vs-CPU parity in GpuConvKernelCoverageTests.DepthwiseConv1D_Gpu_MatchesCpu.
+        "DepthwiseConv1D(Tensor<T>,Tensor<T>,Int32,Int32)",
         "FlashAttentionBackward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Double,Boolean,out Tensor<T>,out Tensor<T>,out Tensor<T>,Tensor<T>)",
         "FusedConv3D(Tensor<T>,Tensor<T>,Tensor<T>,Int32,Int32,Int32,Int32,Int32,Int32,Int32,Int32,Int32,FusedActivationType)",
         "FusedConvTranspose2D(Tensor<T>,Tensor<T>,Tensor<T>,Int32,Int32,Int32,Int32,Int32,Int32,FusedActivationType)",

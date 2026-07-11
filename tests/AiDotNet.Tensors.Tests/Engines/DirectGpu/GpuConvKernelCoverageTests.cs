@@ -99,6 +99,17 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
                     _gpu.DepthwiseConv2D(input, kernel, stride, pad), "DepthwiseConv2D");
     }
 
+    // ---- DepthwiseConv1D (reshapes to the on-GPU DepthwiseConv2D kernel) ----
+    [SkippableFact]
+    public void DepthwiseConv1D_Gpu_MatchesCpu()
+    {
+        SkipIfUnavailable();
+        var input = R(1, 1, 3, 8);   // [batch, channels, length]
+        var kernel = R(2, 3, 1, 3);  // [channels, mult, K]
+        AssertClose(_cpu.DepthwiseConv1D(input, kernel, 1, 1),
+                    _gpu.DepthwiseConv1D(input, kernel, 1, 1), "DepthwiseConv1D");
+    }
+
     // ---- DeformableConv2D (forward + all four backward) ----
     private (Tensor<float> input, Tensor<float> kernel, Tensor<float> offset, Tensor<float> mask,
              int[] stride, int[] pad, int[] dil, Tensor<float> fwd, Tensor<float> grad) DeformSetup()
