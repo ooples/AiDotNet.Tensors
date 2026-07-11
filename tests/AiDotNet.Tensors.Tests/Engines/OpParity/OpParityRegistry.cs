@@ -23,7 +23,26 @@ public static class OpParityRegistry
         .Concat(IndexComplexAudio()).Concat(NativeAudioBox()).Concat(ScatterSoftmaxMisc()).Concat(ConvPoolLinear())
         .Concat(SpecialAttnNorm()).Concat(SlicePoolTake()).Concat(GridConvBwdLoss()).Concat(SliceScatterMisc())
         .Concat(NormConvBackward()).Concat(StackIndexEmbed()).Concat(FusedLinAffine()).Concat(GluCropSoftmaxBwd())
-        .Concat(MoreBackward());
+        .Concat(MoreBackward()).Concat(AudioFftSplat());
+
+    // Audio (mu-law), FFT, gaussian-splat covariance, gumbel-softmax backward.
+    public static IEnumerable<OpCase> AudioFftSplat()
+    {
+        var q = new int[8]; for (int i = 0; i < 8; i++) q[i] = i * 30 + 5;
+        yield return new OpCase("MuLawDecoding[idx8;q256]", "audio",
+            e => e.MuLawDecoding<float>(new Tensor<int>((int[])q.Clone(), new[] { 8 }), 256),
+            e => e.MuLawDecoding<double>(new Tensor<int>((int[])q.Clone(), new[] { 8 }), 256), ParityTol.Ulp(16, 1e-6), opMethod: "MuLawDecoding");
+        yield return new OpCase("RFFT[16]", "fft", e => e.RFFT(OpInput.Rand(2400, new[] { 16 }).F()), e => e.RFFT(OpInput.Rand(2400, new[] { 16 }).D()), ParityTol.Accum(1e-3), opMethod: "RFFT");
+        yield return new OpCase("Spectrogram[1,64;n16h8w16]", "audio", e => e.Spectrogram(OpInput.Rand(2401, new[] { 1, 64 }).F(), 16, 8, 16, null), e => e.Spectrogram(OpInput.Rand(2401, new[] { 1, 64 }).D(), 16, 8, 16, null), ParityTol.Accum(1e-3), opMethod: "Spectrogram");
+
+        var lg = OpInput.Rand(2410, new[] { 4, 8 }, -3.0, 3.0);
+        var gg = OpInput.Rand(2411, new[] { 4, 8 });
+        yield return new OpCase("GumbelSoftmaxBackward[4,8]", "activation-bwd", e => e.GumbelSoftmaxBackward(gg.F(), e.TensorSoftmax(lg.F(), -1), 1.0, -1), e => e.GumbelSoftmaxBackward(gg.D(), e.TensorSoftmax(lg.D(), -1), 1.0, -1), ParityTol.Accum(1e-3), opMethod: "GumbelSoftmaxBackward");
+
+        yield return new OpCase("ComputeGaussianCovariance[3,4;3,3]", "geometry",
+            e => e.ComputeGaussianCovariance(OpInput.Rand(2420, new[] { 3, 4 }, -1.0, 1.0).F(), OpInput.RandPositive(2421, new[] { 3, 3 }, 0.2, 1.5).F()),
+            e => e.ComputeGaussianCovariance(OpInput.Rand(2420, new[] { 3, 4 }, -1.0, 1.0).D(), OpInput.RandPositive(2421, new[] { 3, 3 }, 0.2, 1.5).D()), ParityTol.Accum(1e-3), opMethod: "ComputeGaussianCovariance");
+    }
 
     // More activation/conv/embedding backward ops.
     public static IEnumerable<OpCase> MoreBackward()
