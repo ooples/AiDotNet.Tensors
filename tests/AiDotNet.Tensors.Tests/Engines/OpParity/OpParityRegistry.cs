@@ -30,7 +30,55 @@ public static class OpParityRegistry
         .Concat(RecurrentScans()).Concat(MoreScansComplex()).Concat(AudioSpectral())
         .Concat(ReduceBackwardMisc()).Concat(DeformMesh()).Concat(DeformGridScatterBwd())
         .Concat(LocalConvPool3D()).Concat(PsRoiOctonionReduceBwd()).Concat(ComplexIfftSpiral())
-        .Concat(SpiralBwdPosEnc()).Concat(GroupedDeformBwdMisc()).Concat(MaskedGraphFusedBwd());
+        .Concat(SpiralBwdPosEnc()).Concat(GroupedDeformBwdMisc()).Concat(MaskedGraphFusedBwd())
+        .Concat(AttentionGraphBwd());
+
+    // Attention backwards (SDPA / GQA / graph) + scatter-mean backward.
+    public static IEnumerable<OpCase> AttentionGraphBwd()
+    {
+        const double scale = 0.35355339059; // 1/sqrt(8)
+        // SDPA backward: q/k/v/gradOutput [1,2,4,8], attnWeights [1,2,4,4].
+        var q = OpInput.Rand(4800, new[] { 1, 2, 4, 8 });
+        var k = OpInput.Rand(4801, new[] { 1, 2, 4, 8 });
+        var v = OpInput.Rand(4802, new[] { 1, 2, 4, 8 });
+        var sgo = OpInput.Rand(4803, new[] { 1, 2, 4, 8 });
+        var saw = OpInput.Rand(4804, new[] { 1, 2, 4, 4 }, 0.0, 1.0);
+        yield return new OpCase("ScaledDotProductAttentionBackward[1,2,4,8]", "attention",
+            e => e.ScaledDotProductAttentionBackward(sgo.F(), q.F(), k.F(), v.F(), saw.F(), scale, out _, out _, out _),
+            e => e.ScaledDotProductAttentionBackward(sgo.D(), q.D(), k.D(), v.D(), saw.D(), scale, out _, out _, out _),
+            ParityTol.Accum(1e-3), opMethod: "ScaledDotProductAttentionBackward");
+
+        // GQA backward: q/gradOutput [1,4,4,8], k/v [1,2,4,8], attnWeights [1,4,4,4].
+        var gq = OpInput.Rand(4810, new[] { 1, 4, 4, 8 });
+        var gk = OpInput.Rand(4811, new[] { 1, 2, 4, 8 });
+        var gv = OpInput.Rand(4812, new[] { 1, 2, 4, 8 });
+        var ggo = OpInput.Rand(4813, new[] { 1, 4, 4, 8 });
+        var gaw = OpInput.Rand(4814, new[] { 1, 4, 4, 4 }, 0.0, 1.0);
+        yield return new OpCase("GroupedQueryAttentionBackward[1,4,4,8]", "attention",
+            e => e.GroupedQueryAttentionBackward(ggo.F(), gq.F(), gk.F(), gv.F(), gaw.F(), 2, scale, out _, out _, out _),
+            e => e.GroupedQueryAttentionBackward(ggo.D(), gq.D(), gk.D(), gv.D(), gaw.D(), 2, scale, out _, out _, out _),
+            ParityTol.Accum(1e-3), opMethod: "GroupedQueryAttentionBackward");
+
+        // Graph attention backward: nodeFeatures/gradOutput [1,4,6], edges [6], coeffs [6].
+        var nf = OpInput.Rand(4820, new[] { 1, 4, 6 });
+        var ngo = OpInput.Rand(4821, new[] { 1, 4, 6 });
+        var eSrc = new Tensor<int>(new[] { 0, 1, 2, 3, 0, 1 }, new[] { 6 });
+        var eTgt = new Tensor<int>(new[] { 1, 2, 3, 0, 2, 3 }, new[] { 6 });
+        var aSrc = OpInput.Rand(4822, new[] { 6 });
+        var aTgt = OpInput.Rand(4823, new[] { 6 });
+        var coeffs = OpInput.Rand(4824, new[] { 6 }, 0.0, 1.0);
+        yield return new OpCase("GraphAttentionBackward[1,4,6;6edges]", "attention",
+            e => e.GraphAttentionBackward(ngo.F(), nf.F(), eSrc, eTgt, aSrc.F(), aTgt.F(), coeffs.F(), 0.2, out _, out _, out _),
+            e => e.GraphAttentionBackward(ngo.D(), nf.D(), eSrc, eTgt, aSrc.D(), aTgt.D(), coeffs.D(), 0.2, out _, out _, out _),
+            ParityTol.Accum(1e-3), opMethod: "GraphAttentionBackward");
+
+        // Scatter-mean backward: gradOutput [4,6], indices [3], counts [4], source [3,6].
+        var smgo = OpInput.Rand(4830, new[] { 4, 6 });
+        yield return new OpCase("ScatterMeanBackward[4,6;idx3]", "index",
+            e => e.ScatterMeanBackward(smgo.F(), new Tensor<int>(new[] { 0, 2, 3 }, new[] { 3 }), new Tensor<int>(new[] { 1, 1, 1, 1 }, new[] { 4 }), new[] { 3, 6 }, 0),
+            e => e.ScatterMeanBackward(smgo.D(), new Tensor<int>(new[] { 0, 2, 3 }, new[] { 3 }), new Tensor<int>(new[] { 1, 1, 1, 1 }, new[] { 4 }), new[] { 3, 6 }, 0),
+            ParityTol.Ulp(4), opMethod: "ScatterMeanBackward");
+    }
 
     // Masked-fill, index-put, fused-linear backward, graph attention.
     public static IEnumerable<OpCase> MaskedGraphFusedBwd()
