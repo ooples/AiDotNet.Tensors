@@ -19,7 +19,40 @@ public static class OpParityRegistry
     /// elementwise/reduction batch). Tests and the coverage audit run over this.</summary>
     public static IEnumerable<OpCase> All() => ViTPath().Concat(Elementwise()).Concat(Elementwise2())
         .Concat(BinaryScalarShape()).Concat(ReduceNormPool()).Concat(BackwardMatmul())
-        .Concat(ConvIndexLoss()).Concat(MoreMathShape()).Concat(GatedMisc()).Concat(PadDistDiag());
+        .Concat(ConvIndexLoss()).Concat(MoreMathShape()).Concat(GatedMisc()).Concat(PadDistDiag())
+        .Concat(IndexComplexAudio());
+
+    // Gather/scatter (int-index), complex-magnitude, histogram, and audio resample.
+    public static IEnumerable<OpCase> IndexComplexAudio()
+    {
+        // torch.gather: out[i][j] = source[indices[i][j]][j]; indices same shape as output.
+        var gidx = new int[32]; for (int k = 0; k < 32; k++) gidx[k] = k % 4;
+        yield return new OpCase("TensorGather[4,8;ax0]", "index",
+            e => e.TensorGather(OpInput.Rand(1100, new[] { 4, 8 }).F(), new Tensor<int>((int[])gidx.Clone(), new[] { 4, 8 }), 0),
+            e => e.TensorGather(OpInput.Rand(1100, new[] { 4, 8 }).D(), new Tensor<int>((int[])gidx.Clone(), new[] { 4, 8 }), 0), ParityTol.Exact, opMethod: "TensorGather");
+
+        // ScatterAdd: order-independent sum into a [6,8] output.
+        var sidx = new int[32]; for (int k = 0; k < 32; k++) sidx[k] = k % 6;
+        yield return new OpCase("ScatterAdd[4,8->6,8;d0]", "index",
+            e => e.ScatterAdd(OpInput.Rand(1101, new[] { 4, 8 }).F(), new Tensor<int>((int[])sidx.Clone(), new[] { 4, 8 }), 0, 6),
+            e => e.ScatterAdd(OpInput.Rand(1101, new[] { 4, 8 }).D(), new Tensor<int>((int[])sidx.Clone(), new[] { 4, 8 }), 0, 6), ParityTol.Ulp(8, 1e-6), opMethod: "ScatterAdd");
+
+        // Complex magnitude squared from separate real/imag tensors.
+        var re = OpInput.Rand(1110, new[] { 4, 8 });
+        var im = OpInput.Rand(1111, new[] { 4, 8 });
+        yield return new OpCase("ComplexMagnitudeSquared[4,8]", "complex",
+            e => e.ComplexMagnitudeSquared(re.F(), im.F()), e => e.ComplexMagnitudeSquared(re.D(), im.D()), ParityTol.Ulp(4, 1e-6), opMethod: "ComplexMagnitudeSquared");
+
+        // Histogram counts (integer-valued → exact).
+        yield return new OpCase("TensorHistc[4,8;b5]", "reduction",
+            e => e.TensorHistc(OpInput.Rand(1120, new[] { 4, 8 }).F(), 5, -1f, 1f),
+            e => e.TensorHistc(OpInput.Rand(1120, new[] { 4, 8 }).D(), 5, -1.0, 1.0), ParityTol.Exact, opMethod: "TensorHistc");
+
+        // Audio resample (accumulation).
+        yield return new OpCase("Resample[1,16;16->8]", "audio",
+            e => e.Resample(OpInput.Rand(1130, new[] { 1, 16 }).F(), 16, 8),
+            e => e.Resample(OpInput.Rand(1130, new[] { 1, 16 }).D(), 16, 8), ParityTol.Accum(1e-3), opMethod: "Resample");
+    }
 
     // Padding, unfold, distances, diagonal/linalg, and reduction-backward ops.
     public static IEnumerable<OpCase> PadDistDiag()
