@@ -7709,7 +7709,6 @@ namespace AiDotNet.Tensors.Engines.Simd
                 var vSqrtTwoPi = Vector256.Create(sqrtTwoPi);
                 var vCoeff = Vector256.Create(coeff);
                 var vThreeCoeff = Vector256.Create(3f * coeff);
-                var vHalf = Vector256.Create(0.5f);
                 var vOne = Vector256.Create(1f);
                 var vTwo = Vector256.Create(2f);
                 int simdLength = length & ~7;
@@ -7722,17 +7721,18 @@ namespace AiDotNet.Tensors.Engines.Simd
                     // k = sqrt(2/pi) * (x + 0.044715 * x^3)
                     var inner = Fma.MultiplyAdd(vCoeff, x3, x);
                     var k = Avx.Multiply(vSqrtTwoPi, inner);
-                    // tanh(k) using exp: tanh(k) = (exp(2k) - 1) / (exp(2k) + 1)
-                    var exp2k = ExpApprox256(Avx.Multiply(vTwo, k));
-                    var tanhK = Avx.Divide(Avx.Subtract(exp2k, vOne), Avx.Add(exp2k, vOne));
-                    // sech^2(k) = 1 - tanh^2(k)
-                    var sech2 = Avx.Subtract(vOne, Avx.Multiply(tanhK, tanhK));
+                    // #775: the derivative was evaluated with an APPROXIMATE exp (ExpApprox256) for
+                    // tanh(k) = (exp(2k)-1)/(exp(2k)+1), drifting ~0.5% from the accurate GPU builtin
+                    // tanh (op-parity scaffold flagged GeluBackward). Rewrite it via the accurate,
+                    // cancellation-free Padé sigmoid the FORWARD fix already adopted, using the exact
+                    // identities  0.5(1+tanh k) = sigmoid(2k) = σ  and  sech²(k) = 1 − tanh²(k) = 4σ(1−σ):
+                    //   dGELU/dx = σ + 0.5·x·(4σ(1−σ))·k' = σ + 2·x·σ(1−σ)·k'.
+                    var sigma = PadeSigmoid.Sigmoid8(Avx.Multiply(vTwo, k)); // σ = sigmoid(2k)
+                    var sigmaComp = Avx.Subtract(vOne, sigma);              // 1 − σ
                     // k' = sqrt(2/pi) * (1 + 3*0.044715*x^2)
                     var kPrime = Avx.Multiply(vSqrtTwoPi, Fma.MultiplyAdd(vThreeCoeff, x2, vOne));
-                    // derivative = 0.5 * (1 + tanh(k)) + 0.5 * x * sech^2(k) * k'
-                    var term1 = Avx.Multiply(vHalf, Avx.Add(vOne, tanhK));
-                    var term2 = Avx.Multiply(vHalf, Avx.Multiply(Avx.Multiply(x, sech2), kPrime));
-                    var derivative = Avx.Add(term1, term2);
+                    var term2 = Avx.Multiply(vTwo, Avx.Multiply(Avx.Multiply(x, Avx.Multiply(sigma, sigmaComp)), kPrime));
+                    var derivative = Avx.Add(sigma, term2);
                     Avx.Store(output + i, Avx.Multiply(g, derivative));
                 }
             }

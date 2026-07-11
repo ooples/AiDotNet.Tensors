@@ -74,11 +74,9 @@ public static class OpParityRegistry
         yield return new OpCase("SeluBackward[4,64]", "activation-bwd", e => e.SeluBackward(go.F(), inp.F()), e => e.SeluBackward(go.D(), inp.D()), ParityTol.Ulp(64, 1e-6), opMethod: "SeluBackward");
         yield return new OpCase("HardswishBackward[4,64]", "activation-bwd", e => e.HardswishBackward(go.F(), inp.F()), e => e.HardswishBackward(go.D(), inp.D()), ParityTol.Ulp(16, 1e-6), opMethod: "HardswishBackward");
         yield return new OpCase("HardsigmoidBackward[4,64]", "activation-bwd", e => e.HardsigmoidBackward(go.F(), inp.F()), e => e.HardsigmoidBackward(go.D(), inp.D()), ParityTol.Ulp(16, 1e-6), opMethod: "HardsigmoidBackward");
-        // NOTE (#775 follow-up): the CPU GeluBackward still evaluates the tanh-decomp derivative
-        // (the forward GELU was unified onto the stable x·sigmoid kernel; the backward wasn't yet),
-        // so it drifts ~0.5% from the oracle vs the GPU. Derivative-appropriate relative tolerance
-        // here; a follow-up should give the backward the same accurate treatment as the forward.
-        yield return new OpCase("GeluBackward[4,64]", "activation-bwd", e => e.GeluBackward(go.F(), inp.F()), e => e.GeluBackward(go.D(), inp.D()), ParityTol.Accum(1e-2), opMethod: "GeluBackward");
+        // #775: CPU GeluBackward now evaluates its derivative via the accurate Padé sigmoid (same
+        // fix family as the forward), so it matches the GPU builtin-tanh derivative tightly.
+        yield return new OpCase("GeluBackward[4,64]", "activation-bwd", e => e.GeluBackward(go.F(), inp.F()), e => e.GeluBackward(go.D(), inp.D()), ParityTol.Accum(1e-3), opMethod: "GeluBackward");
         yield return new OpCase("Relu6Backward[4,64]", "activation-bwd", e => e.Relu6Backward(go.F(), inp.F()), e => e.Relu6Backward(go.D(), inp.D()), ParityTol.Exact, opMethod: "Relu6Backward");
         yield return new OpCase("LeakyReluBackward[4,64]", "activation-bwd", e => e.LeakyReluBackward(go.F(), inp.F(), 0.1), e => e.LeakyReluBackward(go.D(), inp.D(), 0.1), ParityTol.Ulp(4, 1e-6), opMethod: "LeakyReluBackward");
         yield return new OpCase("EluBackward[4,64]", "activation-bwd",
