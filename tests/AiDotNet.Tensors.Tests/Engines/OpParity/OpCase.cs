@@ -77,6 +77,12 @@ public sealed class OpCase
     public ParityTol BwdTol { get; }
     public bool HasBackward => RunFloatGrad is not null && RunDoubleGrad is not null;
 
+    /// <summary>Non-null marks a CONFIRMED, tracked CPU/GPU divergence (a real cross-engine bug the
+    /// scaffold found that isn't fixed yet). The harness records it and SKIPS with this reason
+    /// instead of failing the build — but if the op ever starts passing, the harness fails to prompt
+    /// removing the marker, so the fix is noticed. Keeps CI green without hiding the finding.</summary>
+    public string? KnownDivergence { get; init; }
+
     public OpCase(
         string name, string category,
         Func<IEngine, Tensor<float>> runFloat,

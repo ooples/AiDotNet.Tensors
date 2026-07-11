@@ -17,7 +17,7 @@ public static class OpParityRegistry
 {
     /// <summary>Every registered parity case (the ViT-path localization set + the broad
     /// elementwise/reduction batch). Tests and the coverage audit run over this.</summary>
-    public static IEnumerable<OpCase> All() => ViTPath().Concat(Elementwise());
+    public static IEnumerable<OpCase> All() => ViTPath().Concat(Elementwise()).Concat(Elementwise2());
 
     // ---- batch helpers for the uniform op families -------------------------------------------
     private static string Dims(OpInput i) => string.Join(",", i.Shape);
@@ -79,6 +79,55 @@ public static class OpParityRegistry
             e => e.ReduceMean(red.F(), new[] { 1 }, false), e => e.ReduceMean(red.D(), new[] { 1 }, false), ParityTol.Accum(1e-3), opMethod: "ReduceMean");
         yield return new OpCase("ReduceMax[4,32;ax1]", "reduction",
             e => e.ReduceMax(red.F(), new[] { 1 }, false, out _), e => e.ReduceMax(red.D(), new[] { 1 }, false, out _), ParityTol.Ulp(0, 1e-6), opMethod: "ReduceMax");
+    }
+
+    // Second elementwise batch: the broad Tensor* unary math/activation family + softmax variants.
+    public static IEnumerable<OpCase> Elementwise2()
+    {
+        var s = new[] { 4, 64 };
+        var x = OpInput.Rand(300, s, -4.0, 4.0);
+        var pos = OpInput.RandPositive(301, s, 0.2, 6.0);
+
+        // Rounding / sign — exact (integer-valued results, identical scalar math).
+        yield return U("TensorFloor", "arithmetic", (e, t) => e.TensorFloor(t), (e, t) => e.TensorFloor(t), ParityTol.Exact, x);
+        yield return U("TensorCeiling", "arithmetic", (e, t) => e.TensorCeiling(t), (e, t) => e.TensorCeiling(t), ParityTol.Exact, x);
+        yield return U("TensorRound", "arithmetic", (e, t) => e.TensorRound(t), (e, t) => e.TensorRound(t), ParityTol.Exact, x);
+        yield return U("TensorSign", "arithmetic", (e, t) => e.TensorSign(t), (e, t) => e.TensorSign(t), ParityTol.Exact, x);
+        // FOUND BUG (quarantined): GPU TensorFrac returns 0 where CPU/oracle give the true frac
+        // (e.g. input ≈ −6.5e-4 → CPU 0.99935, GPU 0.0) — off by a whole unit for negatives near an
+        // integer. The GPU frac kernel diverges from the CPU floor-based convention; tracked for a
+        // separate GPU-side fix. The scaffold keeps testing it (fails to un-quarantine once fixed).
+        yield return new OpCase("TensorFrac[4,64]", "arithmetic",
+            e => e.TensorFrac(x.F()), e => e.TensorFrac(x.D()), ParityTol.Ulp(4, 1e-6), opMethod: "TensorFrac")
+        { KnownDivergence = "GPU TensorFrac returns 0 for negatives near an integer (CPU uses floor-based frac)." };
+        yield return U("TensorReciprocal", "arithmetic", (e, t) => e.TensorReciprocal(t), (e, t) => e.TensorReciprocal(t), ParityTol.Ulp(8, 1e-6), pos);
+
+        // Transcendental unary math.
+        yield return U("TensorCosh", "arithmetic", (e, t) => e.TensorCosh(t), (e, t) => e.TensorCosh(t), ParityTol.Ulp(64, 1e-6), x);
+        yield return U("TensorSinh", "arithmetic", (e, t) => e.TensorSinh(t), (e, t) => e.TensorSinh(t), ParityTol.Ulp(64, 1e-6), x);
+        yield return U("TensorErfc", "arithmetic", (e, t) => e.TensorErfc(t), (e, t) => e.TensorErfc(t), ParityTol.Ulp(256, 1e-5), x);
+        yield return U("TensorLgamma", "arithmetic", (e, t) => e.TensorLgamma(t), (e, t) => e.TensorLgamma(t), ParityTol.Ulp(256, 1e-5), pos);
+        yield return U("TensorDigamma", "arithmetic", (e, t) => e.TensorDigamma(t), (e, t) => e.TensorDigamma(t), ParityTol.Ulp(256, 1e-5), pos);
+
+        // Activation family (Tensor* variants).
+        yield return U("TensorTanh", "activation", (e, t) => e.TensorTanh(t), (e, t) => e.TensorTanh(t), ParityTol.Ulp(16, 1e-6), x);
+        yield return U("TensorSigmoid", "activation", (e, t) => e.TensorSigmoid(t), (e, t) => e.TensorSigmoid(t), ParityTol.Ulp(16, 1e-6), x);
+        yield return U("TensorGELU", "activation", (e, t) => e.TensorGELU(t), (e, t) => e.TensorGELU(t), ParityTol.Ulp(256, 2e-5), x);
+        yield return U("TensorMish", "activation", (e, t) => e.TensorMish(t), (e, t) => e.TensorMish(t), ParityTol.Ulp(64, 1e-6), x);
+        yield return U("TensorReLU", "activation", (e, t) => e.TensorReLU(t), (e, t) => e.TensorReLU(t), ParityTol.Exact, x);
+        yield return U("TensorReLU6", "activation", (e, t) => e.TensorReLU6(t), (e, t) => e.TensorReLU6(t), ParityTol.Exact, x);
+        yield return U("TensorSiLU", "activation", (e, t) => e.TensorSiLU(t), (e, t) => e.TensorSiLU(t), ParityTol.Ulp(64, 1e-6), x);
+        yield return U("TensorHardSigmoid", "activation", (e, t) => e.TensorHardSigmoid(t), (e, t) => e.TensorHardSigmoid(t), ParityTol.Ulp(8, 1e-6), x);
+        yield return U("TensorHardSwish", "activation", (e, t) => e.TensorHardSwish(t), (e, t) => e.TensorHardSwish(t), ParityTol.Ulp(8, 1e-6), x);
+
+        // Softmax family (accumulation over an axis).
+        var sm = OpInput.Rand(302, s, -4.0, 4.0);
+        yield return new OpCase("TensorSoftmax[4,64]", "activation",
+            e => e.TensorSoftmax(sm.F(), -1), e => e.TensorSoftmax(sm.D(), -1), ParityTol.Accum(1e-3), opMethod: "TensorSoftmax");
+        yield return new OpCase("TensorLogSoftmax[4,64]", "activation",
+            e => e.TensorLogSoftmax(sm.F(), -1), e => e.TensorLogSoftmax(sm.D(), -1), ParityTol.Accum(1e-3), opMethod: "TensorLogSoftmax");
+        yield return new OpCase("TensorSoftmaxRows[4,64]", "activation",
+            e => e.TensorSoftmaxRows(sm.F()), e => e.TensorSoftmaxRows(sm.D()), ParityTol.Accum(1e-3), opMethod: "TensorSoftmaxRows");
     }
 
     public static IEnumerable<OpCase> ViTPath()

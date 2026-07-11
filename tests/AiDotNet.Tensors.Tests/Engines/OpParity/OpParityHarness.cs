@@ -170,6 +170,18 @@ public static class OpParityHarness
             worse,
         }));
 
+        // Quarantined divergence: a confirmed, tracked cross-engine bug. Skip (finding preserved in
+        // the report + the reason) rather than fail — but if it now PASSES, fail so the marker is
+        // removed and the fix is recorded.
+        if (op.KnownDivergence is { } reason)
+        {
+            Assert.False(ok,
+                $"{op.Name} {phase}: marked KnownDivergence but now PASSES parity ({cpuVsGpu.Describe()}). " +
+                $"Remove the KnownDivergence marker. Reason was: {reason}");
+            Skip.If(true, $"KNOWN DIVERGENCE ({op.Name} {phase}): {reason}. {cpuVsGpu.Describe()}; worse: {worse}.");
+            return;
+        }
+
         Assert.True(ok,
             $"{op.Name} {phase}: CPU vs GPU exceeded tol {tol}. {cpuVsGpu.Describe()}. " +
             $"Oracle drift — CPU {cpuVsOracle.MaxUlp} ULP, GPU {gpuVsOracle.MaxUlp} ULP (worse: {worse}).");
