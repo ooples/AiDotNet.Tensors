@@ -27,7 +27,66 @@ public static class OpParityRegistry
         .Concat(Conv3DBoxIou()).Concat(SortConvInterp()).Concat(AttentionFused())
         .Concat(ScalarShapePad()).Concat(ComplexReal()).Concat(TensorMathBatch())
         .Concat(FusedConvMlp()).Concat(GatherScatterPool()).Concat(SdpaScatterUnique())
-        .Concat(RecurrentScans());
+        .Concat(RecurrentScans()).Concat(MoreScansComplex());
+
+    // More linear-attention scans (RWKV-7, xLSTM, gated-delta-net) + scatter + interleaved complex.
+    public static IEnumerable<OpCase> MoreScansComplex()
+    {
+        const int B = 2, S = 4, D = 6, H = 2;
+        var seqShape = new[] { B, S, D };
+        var gShape = new[] { B, S, H };
+
+        var r7 = OpInput.Rand(3700, seqShape);
+        var k7 = OpInput.Rand(3701, seqShape);
+        var v7 = OpInput.Rand(3702, seqShape);
+        var a7 = OpInput.Rand(3703, seqShape);
+        var b7 = OpInput.Rand(3704, seqShape);
+        yield return new OpCase("Rwkv7SequenceForward[2,4,6;h2]", "scan",
+            e => e.Rwkv7SequenceForward(r7.F(), k7.F(), v7.F(), a7.F(), b7.F(), H),
+            e => e.Rwkv7SequenceForward(r7.D(), k7.D(), v7.D(), a7.D(), b7.D(), H),
+            ParityTol.Accum(1e-3), opMethod: "Rwkv7SequenceForward");
+
+        var xq = OpInput.Rand(3710, seqShape);
+        var xk = OpInput.Rand(3711, seqShape);
+        var xv = OpInput.Rand(3712, seqShape);
+        var xi = OpInput.Rand(3713, gShape, 0.0, 2.0);
+        var xf = OpInput.Rand(3714, gShape, 0.0, 1.0);
+        var xo = OpInput.Rand(3715, gShape, 0.0, 1.0);
+        yield return new OpCase("XLstmScanForward[2,4,6;h2]", "scan",
+            e => e.XLstmScanForward(xq.F(), xk.F(), xv.F(), xi.F(), xf.F(), xo.F(), H),
+            e => e.XLstmScanForward(xq.D(), xk.D(), xv.D(), xi.D(), xf.D(), xo.D(), H),
+            ParityTol.Accum(1e-3), opMethod: "XLstmScanForward");
+
+        var dq = OpInput.Rand(3720, seqShape);
+        var dk = OpInput.Rand(3721, seqShape);
+        var dv = OpInput.Rand(3722, seqShape);
+        var dalpha = OpInput.Rand(3723, gShape, 0.0, 1.0);
+        var dbeta = OpInput.Rand(3724, gShape, 0.0, 1.0);
+        yield return new OpCase("GatedDeltaNetScanForward[2,4,6;h2]", "scan",
+            e => e.GatedDeltaNetScanForward(dq.F(), dk.F(), dv.F(), dalpha.F(), dbeta.F(), H),
+            e => e.GatedDeltaNetScanForward(dq.D(), dk.D(), dv.D(), dalpha.D(), dbeta.D(), H),
+            ParityTol.Accum(1e-3), opMethod: "GatedDeltaNetScanForward");
+
+        // Scatter: flat 1-D indices applied per outer slice; values shaped [outer, L, inner].
+        // Distinct permutation over axis-1 (length 6) -> deterministic, values [4,6].
+        var sd = OpInput.Rand(3730, new[] { 4, 6 });
+        var sv = OpInput.Rand(3731, new[] { 4, 6 });
+        var sIdx = new int[] { 0, 1, 2, 3, 4, 5 };
+        yield return new OpCase("Scatter[4,6;idx6;axis1]", "index",
+            e => e.Scatter(sd.F(), new Tensor<int>((int[])sIdx.Clone(), new[] { 6 }), sv.F(), 1),
+            e => e.Scatter(sd.D(), new Tensor<int>((int[])sIdx.Clone(), new[] { 6 }), sv.D(), 1),
+            ParityTol.Exact, opMethod: "Scatter");
+
+        // Interleaved-complex magnitude/multiply ([...,re,im] pairs in a real tensor).
+        var ca = OpInput.Rand(3740, new[] { 4, 6 });
+        var cb = OpInput.Rand(3741, new[] { 4, 6 });
+        yield return new OpCase("TensorComplexMagnitude[4,6]", "complex",
+            e => e.TensorComplexMagnitude(ca.F()), e => e.TensorComplexMagnitude(ca.D()),
+            ParityTol.Accum(1e-3), opMethod: "TensorComplexMagnitude");
+        yield return new OpCase("TensorComplexMultiply[4,6]", "complex",
+            e => e.TensorComplexMultiply(ca.F(), cb.F()), e => e.TensorComplexMultiply(ca.D(), cb.D()),
+            ParityTol.Ulp(8), opMethod: "TensorComplexMultiply");
+    }
 
     // Linear-attention / SSM / RNN sequence-scan forwards (batch=2, seq=4, dim=6).
     public static IEnumerable<OpCase> RecurrentScans()
