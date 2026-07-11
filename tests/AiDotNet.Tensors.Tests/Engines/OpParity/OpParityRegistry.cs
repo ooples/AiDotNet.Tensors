@@ -25,7 +25,67 @@ public static class OpParityRegistry
         .Concat(NormConvBackward()).Concat(StackIndexEmbed()).Concat(FusedLinAffine()).Concat(GluCropSoftmaxBwd())
         .Concat(MoreBackward()).Concat(AudioFftSplat()).Concat(GeometryNerf()).Concat(FusedRoiLoss())
         .Concat(Conv3DBoxIou()).Concat(SortConvInterp()).Concat(AttentionFused())
-        .Concat(ScalarShapePad()).Concat(ComplexReal()).Concat(TensorMathBatch());
+        .Concat(ScalarShapePad()).Concat(ComplexReal()).Concat(TensorMathBatch())
+        .Concat(FusedConvMlp());
+
+    // Fused conv2d/3d/transpose, convT3d backward, mel filterbank, MLP forward.
+    public static IEnumerable<OpCase> FusedConvMlp()
+    {
+        // FusedConv2D: input [1,2,8,8], kernel [3,2,3,3], bias [3], stride1 pad1 -> [1,3,8,8].
+        var c2In = OpInput.Rand(3300, new[] { 1, 2, 8, 8 });
+        var c2K = OpInput.Rand(3301, new[] { 3, 2, 3, 3 });
+        var c2B = OpInput.Rand(3302, new[] { 3 });
+        yield return new OpCase("FusedConv2D[1,2,8,8;k3,2,3,3]", "conv",
+            e => e.FusedConv2D(c2In.F(), c2K.F(), c2B.F(), 1, 1, 1, 1, 1, 1, FusedActivationType.None),
+            e => e.FusedConv2D(c2In.D(), c2K.D(), c2B.D(), 1, 1, 1, 1, 1, 1, FusedActivationType.None),
+            ParityTol.Accum(1e-3), opMethod: "FusedConv2D");
+
+        // FusedConv3D: input [1,2,4,4,4], kernel [3,2,2,2,2], bias [3], stride1 pad0 -> [1,3,3,3,3].
+        var c3In = OpInput.Rand(3310, new[] { 1, 2, 4, 4, 4 });
+        var c3K = OpInput.Rand(3311, new[] { 3, 2, 2, 2, 2 });
+        var c3B = OpInput.Rand(3312, new[] { 3 });
+        yield return new OpCase("FusedConv3D[1,2,4,4,4;k3,2,2,2,2]", "conv",
+            e => e.FusedConv3D(c3In.F(), c3K.F(), c3B.F(), 1, 1, 1, 0, 0, 0, 1, 1, 1, FusedActivationType.None),
+            e => e.FusedConv3D(c3In.D(), c3K.D(), c3B.D(), 1, 1, 1, 0, 0, 0, 1, 1, 1, FusedActivationType.None),
+            ParityTol.Accum(1e-3), opMethod: "FusedConv3D");
+
+        // FusedConvTranspose2D: input [1,2,4,4], kernel [2,3,2,2], stride2 -> [1,3,8,8].
+        var ctIn = OpInput.Rand(3320, new[] { 1, 2, 4, 4 });
+        var ctK = OpInput.Rand(3321, new[] { 2, 3, 2, 2 });
+        var ctB = OpInput.Rand(3322, new[] { 3 });
+        yield return new OpCase("FusedConvTranspose2D[1,2,4,4;k2,3,2,2]", "conv",
+            e => e.FusedConvTranspose2D(ctIn.F(), ctK.F(), ctB.F(), 2, 2, 0, 0, 0, 0, FusedActivationType.None),
+            e => e.FusedConvTranspose2D(ctIn.D(), ctK.D(), ctB.D(), 2, 2, 0, 0, 0, 0, FusedActivationType.None),
+            ParityTol.Accum(1e-3), opMethod: "FusedConvTranspose2D");
+
+        // ConvTranspose3D backward: convT3d input [1,2,2,2,2] kernel [2,3,2,2,2] stride2 -> [1,3,4,4,4].
+        var t3Go = OpInput.Rand(3330, new[] { 1, 3, 4, 4, 4 });
+        var t3In = OpInput.Rand(3331, new[] { 1, 2, 2, 2, 2 });
+        var t3K = OpInput.Rand(3332, new[] { 2, 3, 2, 2, 2 });
+        yield return new OpCase("ConvTranspose3DBackwardInput[go1,3,4,4,4;k2,3,2,2,2]", "conv",
+            e => e.ConvTranspose3DBackwardInput(t3Go.F(), t3K.F(), new[] { 1, 2, 2, 2, 2 }, new[] { 2, 2, 2 }, new[] { 0, 0, 0 }),
+            e => e.ConvTranspose3DBackwardInput(t3Go.D(), t3K.D(), new[] { 1, 2, 2, 2, 2 }, new[] { 2, 2, 2 }, new[] { 0, 0, 0 }),
+            ParityTol.Accum(1e-3), opMethod: "ConvTranspose3DBackwardInput");
+        yield return new OpCase("ConvTranspose3DBackwardKernel[go1,3,4,4,4;in1,2,2,2,2]", "conv",
+            e => e.ConvTranspose3DBackwardKernel(t3Go.F(), t3In.F(), new[] { 2, 3, 2, 2, 2 }, new[] { 2, 2, 2 }, new[] { 0, 0, 0 }),
+            e => e.ConvTranspose3DBackwardKernel(t3Go.D(), t3In.D(), new[] { 2, 3, 2, 2, 2 }, new[] { 2, 2, 2 }, new[] { 0, 0, 0 }),
+            ParityTol.Accum(1e-3), opMethod: "ConvTranspose3DBackwardKernel");
+
+        // Mel filterbank (no tensor input) — deterministic triangular filters.
+        yield return new OpCase("CreateMelFilterbank[8,16]", "audio",
+            e => e.CreateMelFilterbank<float>(8, 16, 16000, 0f, 8000f),
+            e => e.CreateMelFilterbank<double>(8, 16, 16000, 0.0, 8000.0),
+            ParityTol.Accum(1e-3), opMethod: "CreateMelFilterbank");
+
+        // MLP forward: input [4,8] -> [8,16] -> [16,6], no bias, None activations.
+        var mlpIn = OpInput.Rand(3340, new[] { 4, 8 });
+        var w1 = OpInput.Rand(3341, new[] { 8, 16 });
+        var w2 = OpInput.Rand(3342, new[] { 16, 6 });
+        yield return new OpCase("MlpForward[4,8;8,16;16,6]", "matmul",
+            e => e.MlpForward(mlpIn.F(), new[] { w1.F(), w2.F() }, new Tensor<float>?[] { null, null }, FusedActivationType.None, FusedActivationType.None),
+            e => e.MlpForward(mlpIn.D(), new[] { w1.D(), w2.D() }, new Tensor<double>?[] { null, null }, FusedActivationType.None, FusedActivationType.None),
+            ParityTol.Accum(1e-3), opMethod: "MlpForward");
+    }
 
     // Assorted Tensor* math: leaky-relu, power, inner/outer, expand, CIoU loss, upsample, tri-mask, zeta.
     public static IEnumerable<OpCase> TensorMathBatch()
