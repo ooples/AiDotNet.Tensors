@@ -32,7 +32,39 @@ public static class OpParityRegistry
         .Concat(LocalConvPool3D()).Concat(PsRoiOctonionReduceBwd()).Concat(ComplexIfftSpiral())
         .Concat(SpiralBwdPosEnc()).Concat(GroupedDeformBwdMisc()).Concat(MaskedGraphFusedBwd())
         .Concat(AttentionGraphBwd()).Concat(FlashBwdFusedTrilinear()).Concat(TrilinearBwdMhgaGrid())
-        .Concat(BceScatterMaskBwd()).Concat(MaxoutSpectral());
+        .Concat(BceScatterMaskBwd()).Concat(MaxoutSpectral()).Concat(NerfSplatSh());
+
+    // Spherical harmonics, multiresolution hash encoding, gaussian rasterization.
+    public static IEnumerable<OpCase> NerfSplatSh()
+    {
+        // SH: shCoefficients [numGaussians, basisCount=(deg+1)^2, channels], viewDirections [N,3].
+        var shC = OpInput.Rand(5300, new[] { 4, 9, 3 });
+        var viewDir = OpInput.Rand(5301, new[] { 4, 3 }, -1, 1);
+        yield return new OpCase("EvaluateSphericalHarmonics[4,9,3;deg2]", "geometry",
+            e => e.EvaluateSphericalHarmonics(shC.F(), viewDir.F(), 2),
+            e => e.EvaluateSphericalHarmonics(shC.D(), viewDir.D(), 2),
+            ParityTol.Accum(1e-3), opMethod: "EvaluateSphericalHarmonics");
+
+        // Multiresolution hash encoding: positions [5,3], 2 levels of [16,2] tables.
+        var pos = OpInput.Rand(5310, new[] { 5, 3 }, 0.0, 1.0);
+        var t0 = OpInput.Rand(5311, new[] { 16, 2 });
+        var t1 = OpInput.Rand(5312, new[] { 16, 2 });
+        yield return new OpCase("MultiresolutionHashEncoding[5,3;2lvl]", "encoding",
+            e => e.MultiresolutionHashEncoding(pos.F(), new[] { t0.F(), t1.F() }, new[] { 4, 8 }, 2),
+            e => e.MultiresolutionHashEncoding(pos.D(), new[] { t0.D(), t1.D() }, new[] { 4, 8 }, 2),
+            ParityTol.Accum(1e-3), opMethod: "MultiresolutionHashEncoding");
+
+        // Gaussian rasterization: 3 gaussians into an 8x8 RGB image.
+        var means = OpInput.Rand(5320, new[] { 3, 2 }, 1.0, 7.0);
+        var cov = OpInput.From(new double[] { 2, 0, 2, 3, 0.5, 2, 2, -0.5, 2.5 }, new[] { 3, 3 });
+        var colors = OpInput.Rand(5321, new[] { 3, 3 }, 0.0, 1.0);
+        var opac = OpInput.Rand(5322, new[] { 3 }, 0.3, 1.0);
+        var depths = OpInput.Rand(5323, new[] { 3 }, 0.5, 5.0);
+        yield return new OpCase("RasterizeGaussians[3g;8x8]", "geometry",
+            e => e.RasterizeGaussians(means.F(), cov.F(), colors.F(), opac.F(), depths.F(), 8, 8, 16),
+            e => e.RasterizeGaussians(means.D(), cov.D(), colors.D(), opac.D(), depths.D(), 8, 8, 16),
+            ParityTol.Accum(1e-3), opMethod: "RasterizeGaussians");
+    }
 
     // Fused-linear maxout + spectral filter.
     public static IEnumerable<OpCase> MaxoutSpectral()
