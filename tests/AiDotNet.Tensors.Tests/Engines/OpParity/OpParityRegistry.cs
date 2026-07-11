@@ -17,7 +17,53 @@ public static class OpParityRegistry
 {
     /// <summary>Every registered parity case (the ViT-path localization set + the broad
     /// elementwise/reduction batch). Tests and the coverage audit run over this.</summary>
-    public static IEnumerable<OpCase> All() => ViTPath().Concat(Elementwise()).Concat(Elementwise2());
+    public static IEnumerable<OpCase> All() => ViTPath().Concat(Elementwise()).Concat(Elementwise2()).Concat(BinaryScalarShape());
+
+    // Binary elementwise, scalar-arg, and shape ops (the last are pure movement → bit-exact).
+    public static IEnumerable<OpCase> BinaryScalarShape()
+    {
+        var s = new[] { 4, 64 };
+        var a = OpInput.Rand(400, s);
+        var b = OpInput.Rand(401, s);
+        var bpos = OpInput.Rand(402, s, 0.5, 3.0);
+        var brow = OpInput.Rand(403, new[] { 1, 64 });
+
+        // Binary (two same-shape tensors).
+        yield return B("TensorMax", "arithmetic", (e, u, v) => e.TensorMax(u, v), (e, u, v) => e.TensorMax(u, v), ParityTol.Exact, a, b);
+        yield return B("TensorMin", "arithmetic", (e, u, v) => e.TensorMin(u, v), (e, u, v) => e.TensorMin(u, v), ParityTol.Exact, a, b);
+        yield return B("TensorHypot", "arithmetic", (e, u, v) => e.TensorHypot(u, v), (e, u, v) => e.TensorHypot(u, v), ParityTol.Ulp(16, 1e-6), a, b);
+        yield return B("TensorCopysign", "arithmetic", (e, u, v) => e.TensorCopysign(u, v), (e, u, v) => e.TensorCopysign(u, v), ParityTol.Exact, a, b);
+        yield return B("TensorLogAddExp", "arithmetic", (e, u, v) => e.TensorLogAddExp(u, v), (e, u, v) => e.TensorLogAddExp(u, v), ParityTol.Ulp(64, 1e-6), a, b);
+
+        // Broadcast binary (row broadcast [1,64] over [4,64]).
+        yield return B("TensorBroadcastAdd", "arithmetic", (e, u, v) => e.TensorBroadcastAdd(u, v), (e, u, v) => e.TensorBroadcastAdd(u, v), ParityTol.Exact, a, brow);
+        yield return B("TensorBroadcastSubtract", "arithmetic", (e, u, v) => e.TensorBroadcastSubtract(u, v), (e, u, v) => e.TensorBroadcastSubtract(u, v), ParityTol.Exact, a, brow);
+        yield return B("TensorBroadcastMultiply", "arithmetic", (e, u, v) => e.TensorBroadcastMultiply(u, v), (e, u, v) => e.TensorBroadcastMultiply(u, v), ParityTol.Ulp(2, 1e-6), a, brow);
+        yield return B("TensorBroadcastDivide", "arithmetic", (e, u, v) => e.TensorBroadcastDivide(u, v), (e, u, v) => e.TensorBroadcastDivide(u, v), ParityTol.Ulp(4, 1e-6), a, OpInput.Rand(404, new[] { 1, 64 }, 0.5, 3.0));
+
+        // Scalar-arg ops.
+        yield return new OpCase("TensorAddScalar[4,64]", "arithmetic", e => e.TensorAddScalar(a.F(), 1.5f), e => e.TensorAddScalar(a.D(), 1.5), ParityTol.Exact, opMethod: "TensorAddScalar");
+        yield return new OpCase("TensorSubtractScalar[4,64]", "arithmetic", e => e.TensorSubtractScalar(a.F(), 1.5f), e => e.TensorSubtractScalar(a.D(), 1.5), ParityTol.Exact, opMethod: "TensorSubtractScalar");
+        yield return new OpCase("TensorMultiplyScalar[4,64]", "arithmetic", e => e.TensorMultiplyScalar(a.F(), 1.5f), e => e.TensorMultiplyScalar(a.D(), 1.5), ParityTol.Ulp(2, 1e-6), opMethod: "TensorMultiplyScalar");
+        yield return new OpCase("TensorDivideScalar[4,64]", "arithmetic", e => e.TensorDivideScalar(a.F(), 1.5f), e => e.TensorDivideScalar(a.D(), 1.5), ParityTol.Ulp(4, 1e-6), opMethod: "TensorDivideScalar");
+        yield return new OpCase("TensorClampMin[4,64]", "arithmetic", e => e.TensorClampMin(a.F(), -0.5f), e => e.TensorClampMin(a.D(), -0.5), ParityTol.Exact, opMethod: "TensorClampMin");
+        yield return new OpCase("TensorClampMax[4,64]", "arithmetic", e => e.TensorClampMax(a.F(), 0.5f), e => e.TensorClampMax(a.D(), 0.5), ParityTol.Exact, opMethod: "TensorClampMax");
+        yield return new OpCase("TensorClamp[4,64]", "arithmetic", e => e.TensorClamp(a.F(), -0.5f, 0.5f), e => e.TensorClamp(a.D(), -0.5, 0.5), ParityTol.Exact, opMethod: "TensorClamp");
+        yield return new OpCase("TensorPow[4,64]", "arithmetic", e => e.TensorPow(bpos.F(), 2.0f), e => e.TensorPow(bpos.D(), 2.0), ParityTol.Ulp(64, 1e-6), opMethod: "TensorPow");
+
+        // Shape / movement ops — bit-exact (no arithmetic).
+        var m = OpInput.Rand(410, new[] { 4, 8 });
+        yield return new OpCase("TensorFlatten[4,8]", "shape", e => e.TensorFlatten(m.F()), e => e.TensorFlatten(m.D()), ParityTol.Exact, opMethod: "TensorFlatten");
+        yield return new OpCase("TensorTranspose[4,8]", "shape", e => e.TensorTranspose(m.F()), e => e.TensorTranspose(m.D()), ParityTol.Exact, opMethod: "TensorTranspose");
+        yield return new OpCase("TensorFlip[4,8;ax0]", "shape", e => e.TensorFlip(m.F(), new[] { 0 }), e => e.TensorFlip(m.D(), new[] { 0 }), ParityTol.Exact, opMethod: "TensorFlip");
+        yield return new OpCase("TensorTril[4,8]", "shape", e => e.TensorTril(m.F(), 0), e => e.TensorTril(m.D(), 0), ParityTol.Exact, opMethod: "TensorTril");
+        yield return new OpCase("TensorTriu[4,8]", "shape", e => e.TensorTriu(m.F(), 0), e => e.TensorTriu(m.D(), 0), ParityTol.Exact, opMethod: "TensorTriu");
+        yield return new OpCase("TensorRoll[4,8]", "shape", e => e.TensorRoll(m.F(), new[] { 1 }, new[] { 0 }), e => e.TensorRoll(m.D(), new[] { 1 }, new[] { 0 }), ParityTol.Exact, opMethod: "TensorRoll");
+        yield return new OpCase("TensorMoveDim[4,8]", "shape", e => e.TensorMoveDim(m.F(), 0, 1), e => e.TensorMoveDim(m.D(), 0, 1), ParityTol.Exact, opMethod: "TensorMoveDim");
+        yield return new OpCase("TensorSwapAxes[4,8]", "shape", e => e.TensorSwapAxes(m.F(), 0, 1), e => e.TensorSwapAxes(m.D(), 0, 1), ParityTol.Exact, opMethod: "TensorSwapAxes");
+        yield return new OpCase("TensorExpandDims[4,8;ax0]", "shape", e => e.TensorExpandDims(m.F(), 0), e => e.TensorExpandDims(m.D(), 0), ParityTol.Exact, opMethod: "TensorExpandDims");
+        yield return new OpCase("TensorBroadcastTo[1,64->4,64]", "shape", e => e.TensorBroadcastTo(brow.F(), new[] { 4, 64 }), e => e.TensorBroadcastTo(brow.D(), new[] { 4, 64 }), ParityTol.Exact, opMethod: "TensorBroadcastTo");
+    }
 
     // ---- batch helpers for the uniform op families -------------------------------------------
     private static string Dims(OpInput i) => string.Join(",", i.Shape);
