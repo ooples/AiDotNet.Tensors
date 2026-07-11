@@ -98,11 +98,9 @@ public static partial class BlasManaged
 
                 if (threads == 1) { for (int i = 0; i < rows; i++) CsrRow(i); }
                 else
-                {
-                    var po = new ParallelOptions();
-                    if (threads > 1) po.MaxDegreeOfParallelism = threads;
-                    Parallel.For(0, rows, po, CsrRow);
-                }
+                    // Row-local disjoint writes (bit-exact regardless of thread count) dispatched
+                    // through the lightweight persistent pool, honoring SpMM's per-call thread pin.
+                    CpuParallelSettings.LightweightParallel(rows, threads, CsrRow);
             }
             else
             {
@@ -157,11 +155,9 @@ public static partial class BlasManaged
 
                 if (threads == 1) { for (int i = 0; i < rows; i++) CsrRow(i); }
                 else
-                {
-                    var po = new ParallelOptions();
-                    if (threads > 1) po.MaxDegreeOfParallelism = threads;
-                    Parallel.For(0, rows, po, CsrRow);
-                }
+                    // Row-local disjoint writes (bit-exact regardless of thread count) dispatched
+                    // through the lightweight persistent pool, honoring SpMM's per-call thread pin.
+                    CpuParallelSettings.LightweightParallel(rows, threads, CsrRow);
             }
             else
             {

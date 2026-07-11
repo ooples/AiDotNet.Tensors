@@ -1,17 +1,15 @@
 // Copyright (c) AiDotNet. All rights reserved.
-// PR #531: CpuParallelSettings.ParallelForOrSerial can route its parallel path through
-// the CooperativeGemmScheduler (low-latency, concurrency-safe) instead of raw Parallel.For
-// when the scheduler's master switch is enabled. These pin that the routing is a pure
-// scheduling change — bit-identical results to Parallel.For (the Action overload's
-// iterations write disjoint outputs, so order is irrelevant) — including under many
-// concurrent callers, which is the scheduler's reason to exist.
+// CpuParallelSettings.ParallelForOrSerial routes its parallel path through the persistent
+// worker pool (PersistentParallelExecutor) instead of raw Parallel.For when UseCooperativePool
+// is on (the default). These pin that the routing is a pure scheduling change — bit-identical
+// results to Parallel.For (the Action overload's iterations write disjoint outputs, so order is
+// irrelevant) — including under many concurrent callers.
 //
 // Serialized (it toggles the process-wide CpuParallelSettings.UseCooperativePool) and restores
 // the prior value in a finally so it can't leak into other tests.
 
 using System;
 using System.Threading;
-using AiDotNet.Tensors.Engines.BlasManaged.Pool;
 using AiDotNet.Tensors.Helpers;
 using Xunit;
 

@@ -104,7 +104,7 @@ internal static class BackwardParallel
         _inBackwardParallel = true;
         try
         {
-            // Route through the cooperative pool (StreamingWorkerPool-backed) instead of a raw Parallel.For:
+            // Route through the persistent worker pool (PersistentParallelExecutor) instead of a raw Parallel.For:
             // its per-dispatch cost is far lower, so small per-op backward work (the autodiff tape's bread and
             // butter — e.g. N-BEATS FC-block gradients) actually fans out instead of the ForkJoin setup cost
             // dominating and forcing single-threaded execution. The pool applies its own grain-size gate.
@@ -150,9 +150,10 @@ internal static class BackwardParallel
         _inBackwardParallel = true;
         try
         {
-            Parallel.Invoke(
-                new ParallelOptions { MaxDegreeOfParallelism = 2 },
-                a, b);
+            // Two independent backward passes on the lightweight persistent pool (was
+            // Parallel.Invoke). Flat, fixed 2-way — the _inBackwardParallel guard above keeps
+            // nested backward calls serial.
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.LightweightInvoke(a, b);
         }
         finally
         {

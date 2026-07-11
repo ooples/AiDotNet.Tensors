@@ -29,6 +29,21 @@ class Program
             return;
         }
 
+        // Head-to-head of the CPU parallel-dispatch primitives (Parallel.For vs
+        // LightweightParallel vs ParallelForOrSerial) to pick the superior one
+        // for replacing bare Parallel.For at layer call sites.
+        if (args[0] == "--ab-parallel")
+        {
+            ParallelPrimitiveBench.Run();
+            return;
+        }
+
+        if (args[0] == "--ab-parallel-cpu")
+        {
+            ParallelPrimitiveBench.CpuBurn();
+            return;
+        }
+
         // Issue #436: same-machine head-to-head of the fused inference
         // primitives (MLP / MHA / LSTM) vs TorchSharp at the AIsEval shapes.
         // Win = AiDotNet p95 < PyTorch median.
@@ -161,13 +176,6 @@ class Program
             return;
         }
 
-        // #85 N-axis pinned pool vs threadpool. (--ab-pinned)
-        if (args[0] == "--ab-pinned")
-        {
-            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.PinnedNAxisSweep();
-            return;
-        }
-
         if (args[0] == "--ab-aiseval-dopsweep")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.DopSweep();
@@ -261,12 +269,6 @@ class Program
         if (args[0] == "--profile-gemm")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.ProfileGemm();
-            return;
-        }
-
-        if (args[0] == "--ab-aiseval-poolstats")
-        {
-            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.PoolStats();
             return;
         }
 
@@ -988,6 +990,8 @@ class Program
         Console.WriteLine("  --transformer-ffn   : Small-M transformer FFN matmul (Sgemm+Dgemm+batched) — Issue #245 coverage");
         Console.WriteLine();
         Console.WriteLine("A/B microkernel + dispatch benchmarks:");
+        Console.WriteLine("  --ab-parallel          : head-to-head of CPU parallel-dispatch primitives (Parallel.For vs LightweightParallel)");
+        Console.WriteLine("  --ab-parallel-cpu      : idle-CPU / warm-window simulation for LightweightParallel (AIDOTNET_PPE_WARMWINDOW_US)");
         Console.WriteLine("  --ab-matmul            : A/B GEMM (FP32) across catalog shapes");
         Console.WriteLine("  --ab-conv2d            : A/B Conv2D (FP32)");
         Console.WriteLine("  --ab-conv2d-double     : A/B Conv2D (FP64)");
