@@ -7317,20 +7317,24 @@ public partial class CpuEngine : ITensorLevelEngine
         // Initialize gradient grid with zeros
         var gradGrid = AutoTensorCache.RentOrAllocate<T>(grid._shape);
 
-        // Use thread-local gradients to avoid contention, then combine
-        int numThreads = CpuParallelSettings.MaxDegreeOfParallelism;
-        var threadLocalGrads = new double[numThreads][];
-        for (int t = 0; t < numThreads; t++)
-        {
-            threadLocalGrads[t] = new double[depth * height * width * channels];
-        }
+        // Per-thread gradient accumulators so the trilinear scatter-add never
+        // contends. The prior code sized a fixed threadLocalGrads[MaxDegreeOf-
+        // Parallelism] array and indexed it by (ManagedThreadId % numThreads) —
+        // NOT collision-free: two worker threads whose managed ids are congruent
+        // mod numThreads select the SAME buffer and race on it, corrupting the
+        // gradient (observed as NaN under concurrent training). ThreadLocal with
+        // trackAllValues gives every participating thread its OWN buffer with no
+        // index arithmetic, so both the scatter below and the aggregation are
+        // race-free by construction.
+        int gradLen = depth * height * width * channels;
+        using var threadLocalGrads = new System.Threading.ThreadLocal<double[]>(
+            () => new double[gradLen], trackAllValues: true);
 
         CpuParallelSettings.ParallelForOrSerial(0, numPositions,
             (long)numPositions * 8, // 8 trilinear-corner accumulator updates per position
-            () => Thread.CurrentThread.ManagedThreadId % numThreads,
-            (n, _, threadIndex) =>
+            n =>
         {
-            var localGrad = threadLocalGrads[threadIndex];
+            var localGrad = threadLocalGrads.Value!;
 
             // Get position (z, y, x)
             T pz = positions[n, 0];
@@ -7388,19 +7392,19 @@ public partial class CpuEngine : ITensorLevelEngine
                 localGrad[idx111] += w111 * grad;
             }
 
-            return threadIndex;
-        }, _ => { });
+        });
 
-        // Combine thread-local gradients
-        int totalElements = depth * height * width * channels;
+        // Combine every participating thread's accumulator. Each buffer was
+        // written by exactly one thread, so this sum is race-free; snapshot
+        // Values into an array so the parallel combine indexes a stable set.
+        int totalElements = gradLen;
         var gradGridData = gradGrid.GetDataArray();
+        var allLocals = System.Linq.Enumerable.ToArray(threadLocalGrads.Values);
         CpuParallelSettings.ParallelForOrSerial(0, totalElements, totalElements, i =>
         {
             double sum = 0;
-            for (int t = 0; t < numThreads; t++)
-            {
-                sum += threadLocalGrads[t][i];
-            }
+            for (int t = 0; t < allLocals.Length; t++)
+                sum += allLocals[t][i];
             gradGridData[i] = numOps.FromDouble(sum);
         });
 
