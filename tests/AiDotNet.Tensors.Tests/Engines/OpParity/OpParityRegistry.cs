@@ -20,7 +20,31 @@ public static class OpParityRegistry
     public static IEnumerable<OpCase> All() => ViTPath().Concat(Elementwise()).Concat(Elementwise2())
         .Concat(BinaryScalarShape()).Concat(ReduceNormPool()).Concat(BackwardMatmul())
         .Concat(ConvIndexLoss()).Concat(MoreMathShape()).Concat(GatedMisc()).Concat(PadDistDiag())
-        .Concat(IndexComplexAudio()).Concat(NativeAudioBox()).Concat(ScatterSoftmaxMisc());
+        .Concat(IndexComplexAudio()).Concat(NativeAudioBox()).Concat(ScatterSoftmaxMisc()).Concat(ConvPoolLinear());
+
+    // Conv-transpose, fused-linear, adaptive/3D pooling, batch-outer, linspace.
+    public static IEnumerable<OpCase> ConvPoolLinear()
+    {
+        yield return new OpCase("ConvTranspose2D[1,4,4,4;k4,8,2,2;s2]", "conv",
+            e => e.ConvTranspose2D(OpInput.Rand(1400, new[] { 1, 4, 4, 4 }).F(), OpInput.Rand(1401, new[] { 4, 8, 2, 2 }).F(), new[] { 2, 2 }, new[] { 0, 0 }, new[] { 0, 0 }),
+            e => e.ConvTranspose2D(OpInput.Rand(1400, new[] { 1, 4, 4, 4 }).D(), OpInput.Rand(1401, new[] { 4, 8, 2, 2 }).D(), new[] { 2, 2 }, new[] { 0, 0 }, new[] { 0, 0 }), ParityTol.Accum(1e-3), opMethod: "ConvTranspose2D");
+
+        var lin = OpInput.Rand(1410, new[] { 4, 8 });
+        var w = OpInput.Rand(1411, new[] { 8, 6 }); // [in, out] — FusedLinear does input·weight
+        var bias = OpInput.Rand(1412, new[] { 6 });
+        yield return new OpCase("FusedLinearReLU[4,8;w8,6]", "matmul", e => e.FusedLinearReLU(lin.F(), w.F(), bias.F()), e => e.FusedLinearReLU(lin.D(), w.D(), bias.D()), ParityTol.Accum(1e-3), opMethod: "FusedLinearReLU");
+        yield return new OpCase("FusedLinearGELU[4,8;w8,6]", "matmul", e => e.FusedLinearGELU(lin.F(), w.F(), bias.F()), e => e.FusedLinearGELU(lin.D(), w.D(), bias.D()), ParityTol.Accum(1e-3), opMethod: "FusedLinearGELU");
+
+        var pool = OpInput.Rand(1420, new[] { 1, 2, 8, 8 });
+        yield return new OpCase("AdaptiveAvgPool2D[1,2,8,8->4,4]", "pool", e => e.AdaptiveAvgPool2D(pool.F(), 4, 4), e => e.AdaptiveAvgPool2D(pool.D(), 4, 4), ParityTol.Accum(1e-3), opMethod: "AdaptiveAvgPool2D");
+        yield return new OpCase("TensorAdaptiveMaxPool2D[1,2,8,8->4,4]", "pool", e => e.TensorAdaptiveMaxPool2D(pool.F(), new[] { 4, 4 }), e => e.TensorAdaptiveMaxPool2D(pool.D(), new[] { 4, 4 }), ParityTol.Exact, opMethod: "TensorAdaptiveMaxPool2D");
+        var pool3 = OpInput.Rand(1421, new[] { 1, 2, 4, 4, 4 });
+        yield return new OpCase("AvgPool3D[1,2,4,4,4;k2]", "pool", e => e.AvgPool3D(pool3.F(), 2), e => e.AvgPool3D(pool3.D(), 2), ParityTol.Accum(1e-3), opMethod: "AvgPool3D");
+        yield return new OpCase("MaxPool3D[1,2,4,4,4;k2]", "pool", e => e.MaxPool3D(pool3.F(), 2), e => e.MaxPool3D(pool3.D(), 2), ParityTol.Exact, opMethod: "MaxPool3D");
+
+        yield return B("TensorBatchOuterProduct", "matmul", (e, u, v) => e.TensorBatchOuterProduct(u, v), (e, u, v) => e.TensorBatchOuterProduct(u, v), ParityTol.Ulp(2, 1e-6), OpInput.Rand(1430, new[] { 4, 3 }), OpInput.Rand(1431, new[] { 4, 5 }));
+        yield return new OpCase("TensorLinspace[0,1,8]", "misc", e => e.TensorLinspace<float>(0f, 1f, 8), e => e.TensorLinspace<double>(0.0, 1.0, 8), ParityTol.Ulp(4, 1e-6), opMethod: "TensorLinspace");
+    }
 
     // Scatter-reduce, top-k, more activations/losses, positional encoding, einsum.
     public static IEnumerable<OpCase> ScatterSoftmaxMisc()
