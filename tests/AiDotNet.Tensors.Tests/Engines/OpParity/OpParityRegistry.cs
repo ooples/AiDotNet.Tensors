@@ -19,7 +19,43 @@ public static class OpParityRegistry
     /// elementwise/reduction batch). Tests and the coverage audit run over this.</summary>
     public static IEnumerable<OpCase> All() => ViTPath().Concat(Elementwise()).Concat(Elementwise2())
         .Concat(BinaryScalarShape()).Concat(ReduceNormPool()).Concat(BackwardMatmul())
-        .Concat(ConvIndexLoss()).Concat(MoreMathShape()).Concat(GatedMisc());
+        .Concat(ConvIndexLoss()).Concat(MoreMathShape()).Concat(GatedMisc()).Concat(PadDistDiag());
+
+    // Padding, unfold, distances, diagonal/linalg, and reduction-backward ops.
+    public static IEnumerable<OpCase> PadDistDiag()
+    {
+        var img = OpInput.Rand(1000, new[] { 1, 2, 4, 4 });
+        yield return new OpCase("Pad[1,2,4,4;1111]", "shape", e => e.Pad(img.F(), 1, 1, 1, 1, 0f), e => e.Pad(img.D(), 1, 1, 1, 1, 0.0), ParityTol.Exact, opMethod: "Pad");
+        var m = OpInput.Rand(1001, new[] { 4, 8 });
+        yield return new OpCase("TensorConstantPad[4,8;1111]", "shape", e => e.TensorConstantPad(m.F(), new[] { 1, 1, 1, 1 }, 0f), e => e.TensorConstantPad(m.D(), new[] { 1, 1, 1, 1 }, 0.0), ParityTol.Exact, opMethod: "TensorConstantPad");
+        yield return new OpCase("TensorUnfold[4,8;d1,4,2]", "shape", e => e.TensorUnfold(m.F(), 1, 4, 2), e => e.TensorUnfold(m.D(), 1, 4, 2), ParityTol.Exact, opMethod: "TensorUnfold");
+        // FOUND (quarantined): GPU Unfold (im2col) emits its columns in a DIFFERENT element order than
+        // CPU/oracle (values are a permutation — CPU matches oracle at 0 ULP, GPU is far off) — a
+        // layout/convention mismatch in the GPU im2col kernel. Tracked for a separate GPU-side fix.
+        yield return new OpCase("Unfold[1,3,8,8;k3,3]", "shape",
+            e => e.Unfold(OpInput.Rand(1002, new[] { 1, 3, 8, 8 }).F(), new[] { 3, 3 }, new[] { 1, 1 }, new[] { 0, 0 }),
+            e => e.Unfold(OpInput.Rand(1002, new[] { 1, 3, 8, 8 }).D(), new[] { 3, 3 }, new[] { 1, 1 }, new[] { 0, 0 }), ParityTol.Exact, opMethod: "Unfold")
+        { KnownDivergence = "GPU Unfold/im2col emits columns in a different element order than the CPU convention." };
+
+        var r = OpInput.Rand(1010, new[] { 4, 32 });
+        yield return new OpCase("ReduceLogVariance[4,32;ax1]", "reduction", e => e.ReduceLogVariance(r.F(), new[] { 1 }, false, 1e-8), e => e.ReduceLogVariance(r.D(), new[] { 1 }, false, 1e-8), ParityTol.Accum(1e-3), opMethod: "ReduceLogVariance");
+        yield return new OpCase("ReduceMeanBackward[4,1->4,8]", "reduction",
+            e => e.ReduceMeanBackward(OpInput.Rand(1011, new[] { 4, 1 }).F(), new[] { 4, 8 }, new[] { 1 }),
+            e => e.ReduceMeanBackward(OpInput.Rand(1011, new[] { 4, 1 }).D(), new[] { 4, 8 }, new[] { 1 }), ParityTol.Ulp(4, 1e-6), opMethod: "ReduceMeanBackward");
+        yield return new OpCase("TensorLogCumSumExp[4,32;ax1]", "reduction", e => e.TensorLogCumSumExp(r.F(), 1), e => e.TensorLogCumSumExp(r.D(), 1), ParityTol.Accum(1e-3), opMethod: "TensorLogCumSumExp");
+        yield return new OpCase("TensorCumMin[4,32;ax1]", "reduction", e => e.TensorCumMin(r.F(), 1), e => e.TensorCumMin(r.D(), 1), ParityTol.Exact, opMethod: "TensorCumMin");
+
+        yield return new OpCase("TensorPDist[4,8]", "reduction", e => e.TensorPDist(OpInput.Rand(1020, new[] { 4, 8 }).F(), 2.0), e => e.TensorPDist(OpInput.Rand(1020, new[] { 4, 8 }).D(), 2.0), ParityTol.Accum(1e-3), opMethod: "TensorPDist");
+        yield return new OpCase("TensorCDist[3,8x4,8]", "reduction", e => e.TensorCDist(OpInput.Rand(1021, new[] { 3, 8 }).F(), OpInput.Rand(1022, new[] { 4, 8 }).F(), 2.0), e => e.TensorCDist(OpInput.Rand(1021, new[] { 3, 8 }).D(), OpInput.Rand(1022, new[] { 4, 8 }).D(), 2.0), ParityTol.Accum(1e-3), opMethod: "TensorCDist");
+
+        var sq = OpInput.Rand(1030, new[] { 4, 4 });
+        yield return new OpCase("TensorDiagonal[4,4]", "linalg", e => e.TensorDiagonal(sq.F()), e => e.TensorDiagonal(sq.D()), ParityTol.Exact, opMethod: "TensorDiagonal");
+        yield return new OpCase("TensorDiagEmbed[4]", "linalg", e => e.TensorDiagEmbed(OpInput.Rand(1031, new[] { 4 }).F(), 0), e => e.TensorDiagEmbed(OpInput.Rand(1031, new[] { 4 }).D(), 0), ParityTol.Exact, opMethod: "TensorDiagEmbed");
+        yield return new OpCase("TensorBlockDiag[2x2,2]", "linalg", e => e.TensorBlockDiag(new[] { OpInput.Rand(1032, new[] { 2, 2 }).F(), OpInput.Rand(1033, new[] { 2, 2 }).F() }), e => e.TensorBlockDiag(new[] { OpInput.Rand(1032, new[] { 2, 2 }).D(), OpInput.Rand(1033, new[] { 2, 2 }).D() }), ParityTol.Exact, opMethod: "TensorBlockDiag");
+        yield return new OpCase("TensorCross[4,3]", "linalg", e => e.TensorCross(OpInput.Rand(1034, new[] { 4, 3 }).F(), OpInput.Rand(1035, new[] { 4, 3 }).F(), -1), e => e.TensorCross(OpInput.Rand(1034, new[] { 4, 3 }).D(), OpInput.Rand(1035, new[] { 4, 3 }).D(), -1), ParityTol.Ulp(8, 1e-6), opMethod: "TensorCross");
+        yield return new OpCase("TensorMultiDot[4,8.8,6.6,5]", "matmul", e => e.TensorMultiDot(new[] { OpInput.Rand(1036, new[] { 4, 8 }).F(), OpInput.Rand(1037, new[] { 8, 6 }).F(), OpInput.Rand(1038, new[] { 6, 5 }).F() }), e => e.TensorMultiDot(new[] { OpInput.Rand(1036, new[] { 4, 8 }).D(), OpInput.Rand(1037, new[] { 8, 6 }).D(), OpInput.Rand(1038, new[] { 6, 5 }).D() }), ParityTol.Accum(1e-3), opMethod: "TensorMultiDot");
+        yield return new OpCase("TensorNormalize[4,8;ax1]", "norm", e => e.TensorNormalize(m.F(), 1, 1e-8f), e => e.TensorNormalize(m.D(), 1, 1e-8), ParityTol.Accum(1e-3), opMethod: "TensorNormalize");
+    }
 
     // Gated activations, softmax variants, one-hot/eye, upsample/pixelshuffle, cosine-sim, stopgrad.
     public static IEnumerable<OpCase> GatedMisc()
