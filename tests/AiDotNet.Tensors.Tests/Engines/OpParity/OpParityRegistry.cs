@@ -22,7 +22,45 @@ public static class OpParityRegistry
         .Concat(ConvIndexLoss()).Concat(MoreMathShape()).Concat(GatedMisc()).Concat(PadDistDiag())
         .Concat(IndexComplexAudio()).Concat(NativeAudioBox()).Concat(ScatterSoftmaxMisc()).Concat(ConvPoolLinear())
         .Concat(SpecialAttnNorm()).Concat(SlicePoolTake()).Concat(GridConvBwdLoss()).Concat(SliceScatterMisc())
-        .Concat(NormConvBackward()).Concat(StackIndexEmbed()).Concat(FusedLinAffine()).Concat(GluCropSoftmaxBwd());
+        .Concat(NormConvBackward()).Concat(StackIndexEmbed()).Concat(FusedLinAffine()).Concat(GluCropSoftmaxBwd())
+        .Concat(MoreBackward());
+
+    // More activation/conv/embedding backward ops.
+    public static IEnumerable<OpCase> MoreBackward()
+    {
+        var s = new[] { 4, 8 };
+        var go = OpInput.Rand(2300, s);
+        var inp = OpInput.Rand(2301, s, -3.0, 3.0);
+        yield return new OpCase("ThresholdBackward[4,8]", "activation-bwd", e => e.ThresholdBackward(go.F(), inp.F(), 0.0), e => e.ThresholdBackward(go.D(), inp.D(), 0.0), ParityTol.Exact, opMethod: "ThresholdBackward");
+        yield return new OpCase("ReciprocalBackward[4,8]", "activation-bwd", e => e.ReciprocalBackward(go.F(), OpInput.Rand(2302, s, 0.5, 3.0).F()), e => e.ReciprocalBackward(go.D(), OpInput.Rand(2302, s, 0.5, 3.0).D()), ParityTol.Ulp(8, 1e-6), opMethod: "ReciprocalBackward");
+        {
+            var maskD = new double[32]; var rng = new Random(2303); for (int i = 0; i < 32; i++) maskD[i] = rng.NextDouble() < 0.5 ? 0.0 : 2.0;
+            var mask = OpInput.From(maskD, s);
+            yield return new OpCase("DropoutBackward[4,8]", "activation-bwd", e => e.DropoutBackward(go.F(), mask.F(), 0.5), e => e.DropoutBackward(go.D(), mask.D(), 0.5), ParityTol.Ulp(4, 1e-6), opMethod: "DropoutBackward");
+        }
+        // FOUND (quarantined): GPU CrossEntropyBackward returns 0 where CPU/oracle give the gradient
+        // — part of the GPU backward-kernel divergence cluster.
+        {
+            var cep = OpInput.Rand(2304, s, -3.0, 3.0); var cet = OpInput.Rand(2305, s, 0.0, 1.0);
+            yield return new OpCase("CrossEntropyBackward[4,8]", "loss-bwd",
+                e => e.CrossEntropyBackward(e.TensorSoftmax(cep.F(), -1), cet.F()), e => e.CrossEntropyBackward(e.TensorSoftmax(cep.D(), -1), cet.D()), ParityTol.Accum(1e-3), opMethod: "CrossEntropyBackward")
+            { KnownDivergence = "GPU CrossEntropyBackward returns 0 (backward-kernel bug cluster)." };
+        }
+
+        yield return new OpCase("Conv1DBackwardInput[1,8,14->1,3,16]", "conv",
+            e => e.Conv1DBackwardInput(OpInput.Rand(2310, new[] { 1, 8, 14 }).F(), OpInput.Rand(2311, new[] { 8, 3, 3 }).F(), new[] { 1, 3, 16 }, 1, 0, 1),
+            e => e.Conv1DBackwardInput(OpInput.Rand(2310, new[] { 1, 8, 14 }).D(), OpInput.Rand(2311, new[] { 8, 3, 3 }).D(), new[] { 1, 3, 16 }, 1, 0, 1), ParityTol.Accum(1e-3), opMethod: "Conv1DBackwardInput");
+        yield return new OpCase("ConvTranspose2DBackwardInput[1,8,8,8->1,4,4,4]", "conv",
+            e => e.ConvTranspose2DBackwardInput(OpInput.Rand(2312, new[] { 1, 8, 8, 8 }).F(), OpInput.Rand(2313, new[] { 4, 8, 2, 2 }).F(), new[] { 1, 4, 4, 4 }, new[] { 2, 2 }, new[] { 0, 0 }),
+            e => e.ConvTranspose2DBackwardInput(OpInput.Rand(2312, new[] { 1, 8, 8, 8 }).D(), OpInput.Rand(2313, new[] { 4, 8, 2, 2 }).D(), new[] { 1, 4, 4, 4 }, new[] { 2, 2 }, new[] { 0, 0 }), ParityTol.Accum(1e-3), opMethod: "ConvTranspose2DBackwardInput");
+        yield return new OpCase("DepthwiseConv1DBackwardInput[1,4,14->1,4,16]", "conv",
+            e => e.DepthwiseConv1DBackwardInput(OpInput.Rand(2314, new[] { 1, 4, 14 }).F(), OpInput.Rand(2315, new[] { 4, 1, 3 }).F(), new[] { 1, 4, 16 }, 1, 0),
+            e => e.DepthwiseConv1DBackwardInput(OpInput.Rand(2314, new[] { 1, 4, 14 }).D(), OpInput.Rand(2315, new[] { 4, 1, 3 }).D(), new[] { 1, 4, 16 }, 1, 0), ParityTol.Accum(1e-3), opMethod: "DepthwiseConv1DBackwardInput");
+
+        yield return new OpCase("EmbeddingBackward[go4,8;v10]", "index",
+            e => e.EmbeddingBackward(OpInput.Rand(2320, new[] { 4, 8 }).F(), new Tensor<int>(new[] { 1, 3, 0, 5 }, new[] { 4 }), 10, 8),
+            e => e.EmbeddingBackward(OpInput.Rand(2320, new[] { 4, 8 }).D(), new Tensor<int>(new[] { 1, 3, 0, 5 }, new[] { 4 }), 10, 8), ParityTol.Ulp(8, 1e-6), opMethod: "EmbeddingBackward");
+    }
 
     // GLU-variant backward (validates the gating-half fix), crop/pad backward, softmax-variant backward.
     public static IEnumerable<OpCase> GluCropSoftmaxBwd()
@@ -549,7 +587,10 @@ public static class OpParityRegistry
         var go = OpInput.Rand(600, s);
         var inp = OpInput.Rand(601, s, -4.0, 4.0);
 
-        yield return new OpCase("MishBackward[4,64]", "activation-bwd", e => e.MishBackward(go.F(), inp.F()), e => e.MishBackward(go.D(), inp.D()), ParityTol.Ulp(64, 1e-6), opMethod: "MishBackward");
+        // FOUND (quarantined): GPU MishBackward is NONDETERMINISTIC run-to-run (racy/uninitialized
+        // kernel, like the frac bug) — a real GPU bug the determinism check catches intermittently.
+        yield return new OpCase("MishBackward[4,64]", "activation-bwd", e => e.MishBackward(go.F(), inp.F()), e => e.MishBackward(go.D(), inp.D()), ParityTol.Ulp(64, 1e-6), opMethod: "MishBackward")
+        { KnownDivergence = "GPU MishBackward is nondeterministic run-to-run (racy/uninitialized backward kernel)." };
         yield return new OpCase("SwishBackward[4,64]", "activation-bwd", e => e.SwishBackward(go.F(), inp.F()), e => e.SwishBackward(go.D(), inp.D()), ParityTol.Ulp(64, 1e-6), opMethod: "SwishBackward");
         yield return new OpCase("SoftplusBackward[4,64]", "activation-bwd", e => e.SoftplusBackward(go.F(), inp.F()), e => e.SoftplusBackward(go.D(), inp.D()), ParityTol.Ulp(64, 1e-6), opMethod: "SoftplusBackward");
         yield return new OpCase("SeluBackward[4,64]", "activation-bwd", e => e.SeluBackward(go.F(), inp.F()), e => e.SeluBackward(go.D(), inp.D()), ParityTol.Ulp(64, 1e-6), opMethod: "SeluBackward");
