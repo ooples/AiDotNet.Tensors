@@ -987,7 +987,11 @@ public abstract class MatrixBase<T>
         // the persistent worker pool — write directly into result's backing array.
         MatrixMultiplyHelper.TraceMatmul("RECURSIVE", M, N, K);
         var resultData = result.GetDataArray();
-        MultiplyParallel(_memory.ToArray(), other._memory.ToArray(), resultData, M, K, N);
+        // GetDataArray() hands back the live backing array when the memory is a full array (offset 0) —
+        // no per-multiply full-matrix copy — and falls back to ToArray() only for sliced/non-array-backed
+        // memory. MultiplyParallel only READS a and b (it writes into resultData), so sharing the backing
+        // store is safe and avoids the two allocations the previous _memory.ToArray() calls made per call.
+        MultiplyParallel(GetDataArray(), other.GetDataArray(), resultData, M, K, N);
 
         return result;
     }

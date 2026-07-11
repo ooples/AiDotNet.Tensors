@@ -990,6 +990,8 @@ class Program
         Console.WriteLine("  --transformer-ffn   : Small-M transformer FFN matmul (Sgemm+Dgemm+batched) — Issue #245 coverage");
         Console.WriteLine();
         Console.WriteLine("A/B microkernel + dispatch benchmarks:");
+        Console.WriteLine("  --ab-parallel          : head-to-head of CPU parallel-dispatch primitives (Parallel.For vs LightweightParallel)");
+        Console.WriteLine("  --ab-parallel-cpu      : idle-CPU / warm-window simulation for LightweightParallel (AIDOTNET_PPE_WARMWINDOW_US)");
         Console.WriteLine("  --ab-matmul            : A/B GEMM (FP32) across catalog shapes");
         Console.WriteLine("  --ab-conv2d            : A/B Conv2D (FP32)");
         Console.WriteLine("  --ab-conv2d-double     : A/B Conv2D (FP64)");
