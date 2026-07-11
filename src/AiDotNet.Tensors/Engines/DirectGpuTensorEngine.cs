@@ -8255,6 +8255,32 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    public override Tensor<T> DepthwiseConv1D<T>(Tensor<T> input, Tensor<T> kernel, int stride, int padding)
+    {
+        // Tape-active: use the recording CPU base path so the depthwise conv (and its kernel
+        // gradient) participate in autodiff — the GPU path returns an untracked tensor, which
+        // would freeze training for the Citrinet time-channel separable stack. Mirrors Conv3D.
+        if (IsTapeActive<T>()) return base.DepthwiseConv1D(input, kernel, stride, padding);
+
+        if (!TryGetBackend(out _) || input.Rank != 3 || kernel.Rank != 3)
+            return base.DepthwiseConv1D(input, kernel, stride, padding);
+
+        try
+        {
+            // Reshape [B, C, L] -> [B, C, 1, L] and [C, mult, K] -> [C, mult, 1, K], then run the
+            // existing on-GPU DepthwiseConv2D kernel (real backend kernel on all six backends) and
+            // squeeze the height axis back out.
+            var input4D = Reshape(input, new[] { input.Shape._dims[0], input.Shape._dims[1], 1, input.Shape._dims[2] });
+            var kernel4D = Reshape(kernel, new[] { kernel.Shape._dims[0], kernel.Shape._dims[1], 1, kernel.Shape._dims[2] });
+            var result4D = DepthwiseConv2D(input4D, kernel4D, new[] { 1, stride }, new[] { 0, padding });
+            return Reshape(result4D, new[] { result4D.Shape._dims[0], result4D.Shape._dims[1], result4D.Shape._dims[3] });
+        }
+        catch (Exception)
+        {
+            return base.DepthwiseConv1D(input, kernel, stride, padding);
+        }
+    }
+
     /// <summary>
     /// GPU-resident depthwise 2D convolution with optional bias and activation.
     /// Keeps input and output on GPU for chained layer execution.

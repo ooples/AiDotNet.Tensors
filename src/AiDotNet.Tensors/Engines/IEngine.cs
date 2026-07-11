@@ -3129,6 +3129,32 @@ public interface IEngine
     Tensor<T> Conv1DBackwardKernel<T>(Tensor<T> gradOutput, Tensor<T> input, int[] kernelShape, int stride, int padding, int dilation);
 
     /// <summary>
+    /// Performs depthwise 1D convolution on a 3D tensor (batch, channels, length). Each input
+    /// channel is convolved with its own temporal filter (no cross-channel mixing), producing
+    /// <c>channels * multiplier</c> output channels. Implemented by reshaping to
+    /// <see cref="DepthwiseConv2D{T}"/> with height=1 so it reuses the existing depthwise kernel
+    /// on every backend. This is the "time-channel separable" temporal stage of NVIDIA Citrinet /
+    /// QuartzNet 1D time-channel separable convolutions (Majumdar et al., 2021).
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="input">The input tensor [batch, channels, length].</param>
+    /// <param name="kernel">The depthwise kernel [channels, multiplier, kernel_length].</param>
+    /// <param name="stride">The stride of the convolution.</param>
+    /// <param name="padding">The amount of zero-padding to add.</param>
+    /// <returns>The convolved tensor [batch, channels * multiplier, output_length].</returns>
+    Tensor<T> DepthwiseConv1D<T>(Tensor<T> input, Tensor<T> kernel, int stride = 1, int padding = 0);
+
+    /// <summary>
+    /// Computes gradient w.r.t. input for depthwise 1D convolution backward pass.
+    /// </summary>
+    Tensor<T> DepthwiseConv1DBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> kernel, int[] inputShape, int stride, int padding);
+
+    /// <summary>
+    /// Computes gradient w.r.t. kernel for depthwise 1D convolution backward pass.
+    /// </summary>
+    Tensor<T> DepthwiseConv1DBackwardKernel<T>(Tensor<T> gradOutput, Tensor<T> input, int[] kernelShape, int stride, int padding);
+
+    /// <summary>
     /// Performs 2D convolution with asymmetric stride, padding, and dilation.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
