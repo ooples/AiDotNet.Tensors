@@ -20,7 +20,37 @@ public static class OpParityRegistry
     public static IEnumerable<OpCase> All() => ViTPath().Concat(Elementwise()).Concat(Elementwise2())
         .Concat(BinaryScalarShape()).Concat(ReduceNormPool()).Concat(BackwardMatmul())
         .Concat(ConvIndexLoss()).Concat(MoreMathShape()).Concat(GatedMisc()).Concat(PadDistDiag())
-        .Concat(IndexComplexAudio()).Concat(NativeAudioBox());
+        .Concat(IndexComplexAudio()).Concat(NativeAudioBox()).Concat(ScatterSoftmaxMisc());
+
+    // Scatter-reduce, top-k, more activations/losses, positional encoding, einsum.
+    public static IEnumerable<OpCase> ScatterSoftmaxMisc()
+    {
+        var src = OpInput.Rand(1300, new[] { 4, 8 });
+        var sidx = new int[32]; for (int k = 0; k < 32; k++) sidx[k] = k % 6;
+        Tensor<int> Idx() => new Tensor<int>((int[])sidx.Clone(), new[] { 4, 8 });
+        yield return new OpCase("ScatterMean[4,8->6,8]", "index", e => { var y = e.ScatterMean(src.F(), Idx(), out _, 0, 6); return y; }, e => { var y = e.ScatterMean(src.D(), Idx(), out _, 0, 6); return y; }, ParityTol.Ulp(16, 1e-6), opMethod: "ScatterMean");
+        // ScatterMax left pending: it fills unmapped output positions with -inf (empty-group max
+        // sentinel), which the harness's finiteness check rejects; needs a spec that guarantees full
+        // output coverage under the exact scatter-dim semantics.
+        yield return new OpCase("ScatterSoftmax[4,8]", "index", e => e.ScatterSoftmax(src.F(), Idx(), 0, 6), e => e.ScatterSoftmax(src.D(), Idx(), 0, 6), ParityTol.Accum(1e-3), opMethod: "ScatterSoftmax");
+
+        yield return new OpCase("TensorTopK[4,8;k3,ax1]", "reduction", e => { var y = e.TensorTopK(src.F(), 3, 1, out _); return y; }, e => { var y = e.TensorTopK(src.D(), 3, 1, out _); return y; }, ParityTol.Exact, opMethod: "TensorTopK");
+
+        var a = OpInput.Rand(1310, new[] { 4, 8 }, -4.0, 4.0);
+        yield return U("TensorSELU", "activation", (e, t) => e.TensorSELU(t), (e, t) => e.TensorSELU(t), ParityTol.Ulp(64, 1e-6), a);
+        yield return new OpCase("TensorPReLU[4,8]", "activation", e => e.TensorPReLU(a.F(), OpInput.Rand(1311, new[] { 8 }, 0.1, 0.5).F()), e => e.TensorPReLU(a.D(), OpInput.Rand(1311, new[] { 8 }, 0.1, 0.5).D()), ParityTol.Ulp(4, 1e-6), opMethod: "TensorPReLU");
+        yield return new OpCase("TensorRReLU[4,8;eval]", "activation", e => e.TensorRReLU(a.F(), 0.125, 0.333, false), e => e.TensorRReLU(a.D(), 0.125, 0.333, false), ParityTol.Ulp(4, 1e-6), opMethod: "TensorRReLU");
+        yield return new OpCase("TensorSquash[4,8]", "activation", e => e.TensorSquash(OpInput.Rand(1312, new[] { 4, 8 }).F(), -1), e => e.TensorSquash(OpInput.Rand(1312, new[] { 4, 8 }).D(), -1), ParityTol.Accum(1e-3), opMethod: "TensorSquash");
+        yield return new OpCase("SphericalSoftmax[4,8]", "activation", e => e.SphericalSoftmax(OpInput.Rand(1313, new[] { 4, 8 }, -3.0, 3.0).F(), -1), e => e.SphericalSoftmax(OpInput.Rand(1313, new[] { 4, 8 }, -3.0, 3.0).D(), -1), ParityTol.Accum(1e-3), opMethod: "SphericalSoftmax");
+
+        var pred = OpInput.Rand(1320, new[] { 4, 8 }, 0.05, 0.95);
+        var tgt = OpInput.Rand(1321, new[] { 4, 8 }, 0.0, 1.0);
+        yield return new OpCase("TensorBinaryCrossEntropy[4,8]", "loss", e => e.TensorBinaryCrossEntropy(pred.F(), tgt.F(), 1e-7f), e => e.TensorBinaryCrossEntropy(pred.D(), tgt.D(), 1e-7), ParityTol.Accum(1e-3), opMethod: "TensorBinaryCrossEntropy");
+        yield return B("TensorCosineSimilarityLoss", "loss", (e, u, v) => e.TensorCosineSimilarityLoss(u, v), (e, u, v) => e.TensorCosineSimilarityLoss(u, v), ParityTol.Accum(1e-3), OpInput.Rand(1322, new[] { 4, 8 }), OpInput.Rand(1323, new[] { 4, 8 }));
+
+        yield return new OpCase("PositionalEncoding[4,3;f4]", "misc", e => e.PositionalEncoding(OpInput.Rand(1330, new[] { 4, 3 }).F(), 4), e => e.PositionalEncoding(OpInput.Rand(1330, new[] { 4, 3 }).D(), 4), ParityTol.Ulp(64, 1e-6), opMethod: "PositionalEncoding");
+        yield return new OpCase("TensorEinsum[ij,jk->ik]", "matmul", e => e.TensorEinsum("ij,jk->ik", OpInput.Rand(1340, new[] { 4, 8 }).F(), OpInput.Rand(1341, new[] { 8, 6 }).F()), e => e.TensorEinsum("ij,jk->ik", OpInput.Rand(1340, new[] { 4, 8 }).D(), OpInput.Rand(1341, new[] { 8, 6 }).D()), ParityTol.Accum(1e-3), opMethod: "TensorEinsum");
+    }
 
     // Native math, audio features, and bounding-box ops.
     public static IEnumerable<OpCase> NativeAudioBox()
