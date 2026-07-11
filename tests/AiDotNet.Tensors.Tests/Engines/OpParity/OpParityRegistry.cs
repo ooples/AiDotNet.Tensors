@@ -33,7 +33,27 @@ public static class OpParityRegistry
         .Concat(SpiralBwdPosEnc()).Concat(GroupedDeformBwdMisc()).Concat(MaskedGraphFusedBwd())
         .Concat(AttentionGraphBwd()).Concat(FlashBwdFusedTrilinear()).Concat(TrilinearBwdMhgaGrid())
         .Concat(BceScatterMaskBwd()).Concat(MaxoutSpectral()).Concat(NerfSplatSh())
-        .Concat(ShBwdCtcSpectralBatch()).Concat(MaxPoolBwdAudio()).Concat(FoldReorderUnique());
+        .Concat(ShBwdCtcSpectralBatch()).Concat(MaxPoolBwdAudio()).Concat(FoldReorderUnique())
+        .Concat(ConjReorderNdIfft());
+
+    // Complex conjugate (interleaved), reorder-to-NCHWc, N-D IFFT-real.
+    public static IEnumerable<OpCase> ConjReorderNdIfft()
+    {
+        var ca = OpInput.Rand(5700, new[] { 4, 6 });
+        yield return new OpCase("TensorComplexConjugate[4,6]", "complex",
+            e => e.TensorComplexConjugate(ca.F()), e => e.TensorComplexConjugate(ca.D()),
+            ParityTol.Exact, opMethod: "TensorComplexConjugate");
+
+        // FOUND (quarantined): GPU N-D IFFT-to-real diverges ~0.32 abs (CPU 20 ULP vs oracle) —
+        // same GPU FFT-kernel family as the 2D IFFT / spectral filters.
+        var re2 = OpInput.Rand(5720, new[] { 4, 4 });
+        var im2 = OpInput.Rand(5721, new[] { 4, 4 });
+        yield return new OpCase("NativeComplexIFFTNDReal[4,4]", "complex",
+            e => e.NativeComplexIFFTNDReal(re2.CF(im2), new[] { 0, 1 }),
+            e => e.NativeComplexIFFTNDReal(re2.CD(im2), new[] { 0, 1 }),
+            ParityTol.Accum(1e-3), opMethod: "NativeComplexIFFTNDReal")
+        { KnownDivergence = "GPU N-D IFFT-to-real diverges ~0.32 abs; CPU matches oracle." };
+    }
 
     // Grouped-deform mask backward, fold, reorder-to-NCHW, unique-consecutive.
     public static IEnumerable<OpCase> FoldReorderUnique()
