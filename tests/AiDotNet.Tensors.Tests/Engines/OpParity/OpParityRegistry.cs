@@ -21,7 +21,32 @@ public static class OpParityRegistry
         .Concat(BinaryScalarShape()).Concat(ReduceNormPool()).Concat(BackwardMatmul())
         .Concat(ConvIndexLoss()).Concat(MoreMathShape()).Concat(GatedMisc()).Concat(PadDistDiag())
         .Concat(IndexComplexAudio()).Concat(NativeAudioBox()).Concat(ScatterSoftmaxMisc()).Concat(ConvPoolLinear())
-        .Concat(SpecialAttnNorm()).Concat(SlicePoolTake()).Concat(GridConvBwdLoss());
+        .Concat(SpecialAttnNorm()).Concat(SlicePoolTake()).Concat(GridConvBwdLoss()).Concat(SliceScatterMisc());
+
+    // Slice-scatter, clamp-tensor, nan-to-num, squash-backward.
+    public static IEnumerable<OpCase> SliceScatterMisc()
+    {
+        var m = OpInput.Rand(1800, new[] { 4, 8 });
+        yield return new OpCase("TensorClampTensor[4,8]", "arithmetic",
+            e => e.TensorClampTensor(m.F(), OpInput.Rand(1801, new[] { 4, 8 }, -0.6, -0.4).F(), OpInput.Rand(1802, new[] { 4, 8 }, 0.4, 0.6).F()),
+            e => e.TensorClampTensor(m.D(), OpInput.Rand(1801, new[] { 4, 8 }, -0.6, -0.4).D(), OpInput.Rand(1802, new[] { 4, 8 }, 0.4, 0.6).D()), ParityTol.Exact, opMethod: "TensorClampTensor");
+        yield return U("TensorNanToNum", "arithmetic", (e, t) => e.TensorNanToNum(t, null, null, null), (e, t) => e.TensorNanToNum(t, null, null, null), ParityTol.Exact, OpInput.Rand(1803, new[] { 4, 8 }));
+
+        yield return new OpCase("TensorSetSlice[4,8;<-2,4@1,2]", "shape",
+            e => e.TensorSetSlice(m.F(), OpInput.Rand(1804, new[] { 2, 4 }).F(), new[] { 1, 2 }),
+            e => e.TensorSetSlice(m.D(), OpInput.Rand(1804, new[] { 2, 4 }).D(), new[] { 1, 2 }), ParityTol.Exact, opMethod: "TensorSetSlice");
+        yield return new OpCase("TensorSliceScatter[4,8;d1,2,4]", "shape",
+            e => e.TensorSliceScatter(m.F(), OpInput.Rand(1805, new[] { 4, 4 }).F(), 1, 2, 4),
+            e => e.TensorSliceScatter(m.D(), OpInput.Rand(1805, new[] { 4, 4 }).D(), 1, 2, 4), ParityTol.Exact, opMethod: "TensorSliceScatter");
+        yield return new OpCase("TensorSelectScatter[4,8;d0,i1]", "shape",
+            e => e.TensorSelectScatter(m.F(), OpInput.Rand(1806, new[] { 8 }).F(), 0, 1),
+            e => e.TensorSelectScatter(m.D(), OpInput.Rand(1806, new[] { 8 }).D(), 0, 1), ParityTol.Exact, opMethod: "TensorSelectScatter");
+
+        var sqi = OpInput.Rand(1807, new[] { 4, 8 });
+        yield return new OpCase("TensorSquashBackward[4,8]", "activation-bwd",
+            e => e.TensorSquashBackward(OpInput.Rand(1808, new[] { 4, 8 }).F(), sqi.F(), e.TensorSquash(sqi.F(), -1), -1),
+            e => e.TensorSquashBackward(OpInput.Rand(1808, new[] { 4, 8 }).D(), sqi.D(), e.TensorSquash(sqi.D(), -1), -1), ParityTol.Accum(1e-3), opMethod: "TensorSquashBackward");
+    }
 
     // Grid-sample, upsample3d/crop, depthwise-1d, conv/pool backward, IoU + CE losses.
     public static IEnumerable<OpCase> GridConvBwdLoss()
