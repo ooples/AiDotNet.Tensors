@@ -20,7 +20,42 @@ public static class OpParityRegistry
     public static IEnumerable<OpCase> All() => ViTPath().Concat(Elementwise()).Concat(Elementwise2())
         .Concat(BinaryScalarShape()).Concat(ReduceNormPool()).Concat(BackwardMatmul())
         .Concat(ConvIndexLoss()).Concat(MoreMathShape()).Concat(GatedMisc()).Concat(PadDistDiag())
-        .Concat(IndexComplexAudio()).Concat(NativeAudioBox()).Concat(ScatterSoftmaxMisc()).Concat(ConvPoolLinear());
+        .Concat(IndexComplexAudio()).Concat(NativeAudioBox()).Concat(ScatterSoftmaxMisc()).Concat(ConvPoolLinear())
+        .Concat(SpecialAttnNorm());
+
+    // Special functions, attention, batchnorm.
+    public static IEnumerable<OpCase> SpecialAttnNorm()
+    {
+        var s = new[] { 4, 8 };
+        yield return U("TensorI1", "arithmetic", (e, t) => e.TensorI1(t), (e, t) => e.TensorI1(t), ParityTol.Ulp(256, 1e-5), OpInput.Rand(1500, s, -2.0, 2.0));
+        yield return U("TensorI0e", "arithmetic", (e, t) => e.TensorI0e(t), (e, t) => e.TensorI0e(t), ParityTol.Ulp(256, 1e-5), OpInput.Rand(1501, s, -2.0, 2.0));
+        yield return U("TensorI1e", "arithmetic", (e, t) => e.TensorI1e(t), (e, t) => e.TensorI1e(t), ParityTol.Ulp(256, 1e-5), OpInput.Rand(1502, s, -2.0, 2.0));
+        yield return B("TensorLogAddExp2", "arithmetic", (e, u, v) => e.TensorLogAddExp2(u, v), (e, u, v) => e.TensorLogAddExp2(u, v), ParityTol.Ulp(64, 1e-6), OpInput.Rand(1503, s), OpInput.Rand(1504, s));
+        yield return B("TensorNextAfter", "arithmetic", (e, u, v) => e.TensorNextAfter(u, v), (e, u, v) => e.TensorNextAfter(u, v), ParityTol.Ulp(2, 1e-30), OpInput.Rand(1505, s), OpInput.Rand(1506, s));
+        yield return B("TensorXlog1py", "arithmetic", (e, u, v) => e.TensorXlog1py(u, v), (e, u, v) => e.TensorXlog1py(u, v), ParityTol.Ulp(64, 1e-6), OpInput.Rand(1507, s), OpInput.RandPositive(1508, s, 0.1, 4.0));
+        yield return new OpCase("TensorPolygamma[n1;4,8]", "arithmetic", e => e.TensorPolygamma(1, OpInput.RandPositive(1509, s, 0.5, 4.0).F()), e => e.TensorPolygamma(1, OpInput.RandPositive(1509, s, 0.5, 4.0).D()), ParityTol.Ulp(512, 1e-4), opMethod: "TensorPolygamma");
+        {
+            var xe = new int[32]; for (int k = 0; k < 32; k++) xe[k] = (k % 5) - 2;
+            yield return new OpCase("TensorLdexp[4,8]", "arithmetic",
+                e => e.TensorLdexp(OpInput.Rand(1510, s).F(), new Tensor<int>((int[])xe.Clone(), s)),
+                e => e.TensorLdexp(OpInput.Rand(1510, s).D(), new Tensor<int>((int[])xe.Clone(), s)), ParityTol.Ulp(2, 1e-6), opMethod: "TensorLdexp");
+        }
+
+        // Scaled dot-product attention (Q,K,V same shape).
+        var qq = OpInput.Rand(1520, new[] { 4, 8 });
+        var kk = OpInput.Rand(1521, new[] { 4, 8 });
+        var vv = OpInput.Rand(1522, new[] { 4, 8 });
+        yield return new OpCase("TensorScaledDotProductAttention[4,8]", "attention", e => e.TensorScaledDotProductAttention(qq.F(), kk.F(), vv.F()), e => e.TensorScaledDotProductAttention(qq.D(), kk.D(), vv.D()), ParityTol.Accum(1e-3), opMethod: "TensorScaledDotProductAttention");
+
+        // BatchNorm (train stats) + inference (given stats).
+        var bx = OpInput.Rand(1530, new[] { 2, 4, 4, 4 });
+        var bg = OpInput.Rand(1531, new[] { 4 }, 0.5, 1.5);
+        var bb = OpInput.Rand(1532, new[] { 4 }, -0.2, 0.2);
+        yield return new OpCase("BatchNorm[2,4,4,4]", "norm", e => { var y = e.BatchNorm(bx.F(), bg.F(), bb.F(), 1e-5, out _, out _); return y; }, e => { var y = e.BatchNorm(bx.D(), bg.D(), bb.D(), 1e-5, out _, out _); return y; }, ParityTol.Accum(1e-3), opMethod: "BatchNorm");
+        var bm = OpInput.Rand(1533, new[] { 4 }, -0.5, 0.5);
+        var bvv = OpInput.Rand(1534, new[] { 4 }, 0.5, 1.5);
+        yield return new OpCase("BatchNormInference[2,4,4,4]", "norm", e => e.BatchNormInference(bx.F(), bg.F(), bb.F(), bm.F(), bvv.F(), 1e-5), e => e.BatchNormInference(bx.D(), bg.D(), bb.D(), bm.D(), bvv.D(), 1e-5), ParityTol.Accum(1e-3), opMethod: "BatchNormInference");
+    }
 
     // Conv-transpose, fused-linear, adaptive/3D pooling, batch-outer, linspace.
     public static IEnumerable<OpCase> ConvPoolLinear()
