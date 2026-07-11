@@ -29,7 +29,43 @@ public static class OpParityRegistry
         .Concat(FusedConvMlp()).Concat(GatherScatterPool()).Concat(SdpaScatterUnique())
         .Concat(RecurrentScans()).Concat(MoreScansComplex()).Concat(AudioSpectral())
         .Concat(ReduceBackwardMisc()).Concat(DeformMesh()).Concat(DeformGridScatterBwd())
-        .Concat(LocalConvPool3D()).Concat(PsRoiOctonionReduceBwd());
+        .Concat(LocalConvPool3D()).Concat(PsRoiOctonionReduceBwd()).Concat(ComplexIfftSpiral());
+
+    // Complex IFFT-to-real, magnitude+phase, spiral conv.
+    public static IEnumerable<OpCase> ComplexIfftSpiral()
+    {
+        var re1 = OpInput.Rand(4400, new[] { 8 });
+        var im1 = OpInput.Rand(4401, new[] { 8 });
+        yield return new OpCase("NativeComplexIFFTReal[8]", "complex",
+            e => e.NativeComplexIFFTReal(re1.CF(im1)), e => e.NativeComplexIFFTReal(re1.CD(im1)),
+            ParityTol.Accum(1e-3), opMethod: "NativeComplexIFFTReal");
+
+        var re2 = OpInput.Rand(4410, new[] { 4, 4 });
+        var im2 = OpInput.Rand(4411, new[] { 4, 4 });
+        // FOUND (quarantined): GPU 2D IFFT-to-real diverges ~0.38 abs (CPU 8 ULP vs oracle);
+        // the 1D NativeComplexIFFTReal passes, so it's the 2D GPU FFT kernel.
+        yield return new OpCase("NativeComplexIFFT2DReal[4,4]", "complex",
+            e => e.NativeComplexIFFT2DReal(re2.CF(im2)), e => e.NativeComplexIFFT2DReal(re2.CD(im2)),
+            ParityTol.Accum(1e-3), opMethod: "NativeComplexIFFT2DReal")
+        { KnownDivergence = "GPU 2D IFFT-to-real kernel diverges ~0.38 abs; 1D passes." };
+
+        var reM = OpInput.Rand(4420, new[] { 4, 6 });
+        var imM = OpInput.Rand(4421, new[] { 4, 6 });
+        yield return new OpCase("NativeMagnitudeAndPhase[4,6]", "complex",
+            e => e.NativeMagnitudeAndPhase(reM.CF(imM), out _),
+            e => e.NativeMagnitudeAndPhase(reM.CD(imM), out _),
+            ParityTol.Accum(1e-3), opMethod: "NativeMagnitudeAndPhase");
+
+        // SpiralConv: vertexFeatures [6,4], spiralIndices [6,3] int, weights [Cout=5, Cin*L=12], biases [5].
+        var vf = OpInput.Rand(4430, new[] { 6, 4 });
+        var spiral = new Tensor<int>(new[] { 0, 1, 2, 1, 2, 3, 2, 3, 4, 3, 4, 5, 4, 5, 0, 5, 0, 1 }, new[] { 6, 3 });
+        var sw = OpInput.Rand(4431, new[] { 5, 12 });
+        var sb = OpInput.Rand(4432, new[] { 5 });
+        yield return new OpCase("SpiralConv[6,4;spiral6,3]", "conv",
+            e => e.SpiralConv(vf.F(), spiral, sw.F(), sb.F()),
+            e => e.SpiralConv(vf.D(), spiral, sw.D(), sb.D()),
+            ParityTol.Accum(1e-3), opMethod: "SpiralConv");
+    }
 
     // Position-sensitive RoI, octonion ops, std/var backwards.
     public static IEnumerable<OpCase> PsRoiOctonionReduceBwd()
