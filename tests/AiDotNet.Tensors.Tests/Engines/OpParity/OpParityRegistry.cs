@@ -31,7 +31,53 @@ public static class OpParityRegistry
         .Concat(ReduceBackwardMisc()).Concat(DeformMesh()).Concat(DeformGridScatterBwd())
         .Concat(LocalConvPool3D()).Concat(PsRoiOctonionReduceBwd()).Concat(ComplexIfftSpiral())
         .Concat(SpiralBwdPosEnc()).Concat(GroupedDeformBwdMisc()).Concat(MaskedGraphFusedBwd())
-        .Concat(AttentionGraphBwd()).Concat(FlashBwdFusedTrilinear()).Concat(TrilinearBwdMhgaGrid());
+        .Concat(AttentionGraphBwd()).Concat(FlashBwdFusedTrilinear()).Concat(TrilinearBwdMhgaGrid())
+        .Concat(BceScatterMaskBwd());
+
+    // BCE backward, scatter-max/softmax backward, deform-mask backward, reduce-max backward.
+    public static IEnumerable<OpCase> BceScatterMaskBwd()
+    {
+        var pred = OpInput.Rand(5100, new[] { 4, 6 }, 0.01, 0.99);
+        var tgt = OpInput.Rand(5101, new[] { 4, 6 }, 0.0, 1.0);
+        yield return new OpCase("TensorBinaryCrossEntropyBackward[4,6]", "loss",
+            e => e.TensorBinaryCrossEntropyBackward(pred.F(), tgt.F(), 1e-7f),
+            e => e.TensorBinaryCrossEntropyBackward(pred.D(), tgt.D(), 1e-7),
+            ParityTol.Accum(1e-3), opMethod: "TensorBinaryCrossEntropyBackward");
+
+        // ScatterMax backward: gradOutput [4], argmax [4] (positions into source [6]).
+        var smgo = OpInput.Rand(5110, new[] { 4 });
+        yield return new OpCase("ScatterMaxBackward[4->6]", "index",
+            e => e.ScatterMaxBackward(smgo.F(), new Tensor<int>(new[] { 0, 1, 2, 3 }, new[] { 4 }), new[] { 6 }, 0),
+            e => e.ScatterMaxBackward(smgo.D(), new Tensor<int>(new[] { 0, 1, 2, 3 }, new[] { 4 }), new[] { 6 }, 0),
+            ParityTol.Exact, opMethod: "ScatterMaxBackward");
+
+        // ScatterSoftmax backward: gradOutput/output [6], indices group ids [6].
+        var ssgo = OpInput.Rand(5120, new[] { 6 });
+        var ssout = OpInput.Rand(5121, new[] { 6 }, 0.0, 1.0);
+        yield return new OpCase("ScatterSoftmaxBackward[6]", "activation",
+            e => e.ScatterSoftmaxBackward(ssgo.F(), ssout.F(), new Tensor<int>(new[] { 0, 0, 1, 1, 2, 2 }, new[] { 6 }), 0),
+            e => e.ScatterSoftmaxBackward(ssgo.D(), ssout.D(), new Tensor<int>(new[] { 0, 0, 1, 1, 2, 2 }, new[] { 6 }), 0),
+            ParityTol.Accum(1e-3), opMethod: "ScatterSoftmaxBackward");
+
+        // Deformable-conv mask backward: mask channels = kh*kw*deformGroups = 9.
+        var dcIn = OpInput.Rand(5130, new[] { 1, 2, 8, 8 });
+        var dcK = OpInput.Rand(5131, new[] { 3, 2, 3, 3 });
+        var dcOff = OpInput.Rand(5132, new[] { 1, 18, 8, 8 }, -1, 1);
+        var dcMask = OpInput.Rand(5133, new[] { 1, 9, 8, 8 }, 0.0, 1.0);
+        var dcGo = OpInput.Rand(5134, new[] { 1, 3, 8, 8 });
+        var s1 = new[] { 1, 1 };
+        yield return new OpCase("DeformableConv2DBackwardMask[1,3,8,8]", "conv",
+            e => e.DeformableConv2DBackwardMask(dcGo.F(), dcIn.F(), dcK.F(), dcOff.F(), dcMask.F(), s1, s1, s1),
+            e => e.DeformableConv2DBackwardMask(dcGo.D(), dcIn.D(), dcK.D(), dcOff.D(), dcMask.D(), s1, s1, s1),
+            ParityTol.Accum(1e-3), opMethod: "DeformableConv2DBackwardMask");
+
+        // ReduceMax backward: global max, gradOutput [1], maxIndices flat position into [4,6].
+        var rmgo = OpInput.Rand(5140, new[] { 1 });
+        yield return new OpCase("ReduceMaxBackward[4,6;global]", "reduction",
+            e => e.ReduceMaxBackward(rmgo.F(), new[] { 5 }, new[] { 4, 6 }),
+            e => e.ReduceMaxBackward(rmgo.D(), new[] { 5 }, new[] { 4, 6 }),
+            ParityTol.Exact, opMethod: "ReduceMaxBackward");
+    }
 
     // Trilinear backward, multi-head graph attention, occupancy-grid update.
     public static IEnumerable<OpCase> TrilinearBwdMhgaGrid()
