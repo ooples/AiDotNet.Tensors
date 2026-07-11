@@ -34,7 +34,25 @@ public static class OpParityRegistry
         .Concat(AttentionGraphBwd()).Concat(FlashBwdFusedTrilinear()).Concat(TrilinearBwdMhgaGrid())
         .Concat(BceScatterMaskBwd()).Concat(MaxoutSpectral()).Concat(NerfSplatSh())
         .Concat(ShBwdCtcSpectralBatch()).Concat(MaxPoolBwdAudio()).Concat(FoldReorderUnique())
-        .Concat(ConjReorderNdIfft());
+        .Concat(ConjReorderNdIfft()).Concat(MaskedSelectScatter());
+
+    // Masked select / scatter with a fixed Bit mask.
+    public static IEnumerable<OpCase> MaskedSelectScatter()
+    {
+        var bits = new Bit[24];
+        for (int i = 0; i < 24; i++) bits[i] = (i % 2) == 0;
+        var t = OpInput.Rand(5800, new[] { 4, 6 });
+        yield return new OpCase("TensorMaskedSelect[4,6;checker]", "index",
+            e => e.TensorMaskedSelect(t.F(), new Tensor<Bit>((Bit[])bits.Clone(), new[] { 4, 6 })),
+            e => e.TensorMaskedSelect(t.D(), new Tensor<Bit>((Bit[])bits.Clone(), new[] { 4, 6 })),
+            ParityTol.Exact, opMethod: "TensorMaskedSelect");
+
+        var src = OpInput.Rand(5801, new[] { 12 });
+        yield return new OpCase("TensorMaskedScatter[4,6;checker]", "index",
+            e => e.TensorMaskedScatter(t.F(), new Tensor<Bit>((Bit[])bits.Clone(), new[] { 4, 6 }), src.F()),
+            e => e.TensorMaskedScatter(t.D(), new Tensor<Bit>((Bit[])bits.Clone(), new[] { 4, 6 }), src.D()),
+            ParityTol.Exact, opMethod: "TensorMaskedScatter");
+    }
 
     // Complex conjugate (interleaved), reorder-to-NCHWc, N-D IFFT-real.
     public static IEnumerable<OpCase> ConjReorderNdIfft()
