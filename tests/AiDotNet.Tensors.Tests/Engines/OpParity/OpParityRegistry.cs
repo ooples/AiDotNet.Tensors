@@ -31,7 +31,47 @@ public static class OpParityRegistry
         .Concat(ReduceBackwardMisc()).Concat(DeformMesh()).Concat(DeformGridScatterBwd())
         .Concat(LocalConvPool3D()).Concat(PsRoiOctonionReduceBwd()).Concat(ComplexIfftSpiral())
         .Concat(SpiralBwdPosEnc()).Concat(GroupedDeformBwdMisc()).Concat(MaskedGraphFusedBwd())
-        .Concat(AttentionGraphBwd());
+        .Concat(AttentionGraphBwd()).Concat(FlashBwdFusedTrilinear());
+
+    // Flash-attention backward (forward-then-backward), fused linear+CE, trilinear, hier-softmax.
+    public static IEnumerable<OpCase> FlashBwdFusedTrilinear()
+    {
+        const double scale = 0.35355339059;
+        var q = OpInput.Rand(4900, new[] { 1, 2, 4, 8 });
+        var k = OpInput.Rand(4901, new[] { 1, 2, 4, 8 });
+        var v = OpInput.Rand(4902, new[] { 1, 2, 4, 8 });
+        var fgo = OpInput.Rand(4903, new[] { 1, 2, 4, 8 });
+        yield return new OpCase("FlashAttentionBackward[1,2,4,8]", "attention",
+            e => { var o = e.FlashAttention(q.F(), k.F(), v.F(), scale, false, out var st, null); return e.FlashAttentionBackward(fgo.F(), q.F(), k.F(), v.F(), o, st, scale, false, out _, out _, out _); },
+            e => { var o = e.FlashAttention(q.D(), k.D(), v.D(), scale, false, out var st, null); return e.FlashAttentionBackward(fgo.D(), q.D(), k.D(), v.D(), o, st, scale, false, out _, out _, out _); },
+            ParityTol.Accum(1e-3), opMethod: "FlashAttentionBackward");
+
+        // Fused linear + cross-entropy with integer targets.
+        var hid = OpInput.Rand(4910, new[] { 4, 8 });
+        var wt = OpInput.Rand(4911, new[] { 8, 6 });
+        var bs = OpInput.Rand(4912, new[] { 6 });
+        var tgt = new Tensor<int>(new[] { 0, 3, 5, 1 }, new[] { 4 });
+        yield return new OpCase("FusedLinearCrossEntropyWithLogits[4,8;v6]", "loss",
+            e => e.FusedLinearCrossEntropyWithLogits(hid.F(), wt.F(), bs.F(), tgt),
+            e => e.FusedLinearCrossEntropyWithLogits(hid.D(), wt.D(), bs.D(), tgt),
+            ParityTol.Accum(1e-3), opMethod: "FusedLinearCrossEntropyWithLogits");
+
+        // Trilinear interpolation: grid [D,H,W,C]=[4,4,4,2], positions [5,3] in range.
+        var grid = OpInput.Rand(4920, new[] { 4, 4, 4, 2 });
+        var posns = OpInput.Rand(4921, new[] { 5, 3 }, 0.0, 3.0);
+        yield return new OpCase("TensorTrilinearInterpolate[4,4,4,2;5pts]", "resize",
+            e => e.TensorTrilinearInterpolate(grid.F(), posns.F()),
+            e => e.TensorTrilinearInterpolate(grid.D(), posns.D()),
+            ParityTol.Accum(1e-3), opMethod: "TensorTrilinearInterpolate");
+
+        // Hierarchical softmax: input [4,8], nodeWeights [numClasses-1=3, 8], numClasses 4.
+        var hsIn = OpInput.Rand(4930, new[] { 4, 8 });
+        var hsW = OpInput.Rand(4931, new[] { 3, 8 });
+        yield return new OpCase("FusedHierarchicalSoftmax[4,8;c4]", "activation",
+            e => e.FusedHierarchicalSoftmax(hsIn.F(), hsW.F(), 4),
+            e => e.FusedHierarchicalSoftmax(hsIn.D(), hsW.D(), 4),
+            ParityTol.Accum(1e-3), opMethod: "FusedHierarchicalSoftmax");
+    }
 
     // Attention backwards (SDPA / GQA / graph) + scatter-mean backward.
     public static IEnumerable<OpCase> AttentionGraphBwd()
