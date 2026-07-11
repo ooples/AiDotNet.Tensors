@@ -23,7 +23,33 @@ public static class OpParityRegistry
         .Concat(IndexComplexAudio()).Concat(NativeAudioBox()).Concat(ScatterSoftmaxMisc()).Concat(ConvPoolLinear())
         .Concat(SpecialAttnNorm()).Concat(SlicePoolTake()).Concat(GridConvBwdLoss()).Concat(SliceScatterMisc())
         .Concat(NormConvBackward()).Concat(StackIndexEmbed()).Concat(FusedLinAffine()).Concat(GluCropSoftmaxBwd())
-        .Concat(MoreBackward()).Concat(AudioFftSplat()).Concat(GeometryNerf());
+        .Concat(MoreBackward()).Concat(AudioFftSplat()).Concat(GeometryNerf()).Concat(FusedRoiLoss());
+
+    // Fused-linear (activation enum), RoI align/pool, NLL/KL losses.
+    public static IEnumerable<OpCase> FusedRoiLoss()
+    {
+        var lin = OpInput.Rand(2600, new[] { 4, 8 });
+        var w = OpInput.Rand(2601, new[] { 8, 6 });
+        var bias = OpInput.Rand(2602, new[] { 6 });
+        yield return new OpCase("FusedLinear[4,8;w8,6;None]", "matmul",
+            e => e.FusedLinear(lin.F(), w.F(), bias.F(), FusedActivationType.None, null),
+            e => e.FusedLinear(lin.D(), w.D(), bias.D(), FusedActivationType.None, null), ParityTol.Accum(1e-3), opMethod: "FusedLinear");
+
+        var img = OpInput.Rand(2610, new[] { 1, 2, 8, 8 });
+        var boxes = OpInput.From(new double[] { 0, 0, 0, 4, 4, 0, 1, 1, 6, 6, 0, 2, 0, 8, 5 }, new[] { 3, 5 });
+        yield return new OpCase("RoIAlign[1,2,8,8;b3;o2x2]", "pool",
+            e => e.RoIAlign(img.F(), boxes.F(), 2, 2, 1f, 2, false), e => e.RoIAlign(img.D(), boxes.D(), 2, 2, 1f, 2, false), ParityTol.Accum(1e-3), opMethod: "RoIAlign");
+        yield return new OpCase("RoIPool[1,2,8,8;b3;o2x2]", "pool",
+            e => e.RoIPool(img.F(), boxes.F(), 2, 2, 1f), e => e.RoIPool(img.D(), boxes.D(), 2, 2, 1f), ParityTol.Exact, opMethod: "RoIPool");
+
+        var lp = OpInput.Rand(2620, new[] { 4, 8 }, -3.0, 3.0);
+        var tg = OpInput.Rand(2621, new[] { 4, 8 }, 0.0, 1.0);
+        // FOUND (quarantined): GPU TensorNLLLoss returns 0 where CPU/oracle give the loss — GPU
+        // loss-kernel divergence.
+        yield return new OpCase("TensorNLLLoss[4,8]", "loss", e => e.TensorNLLLoss(e.TensorLogSoftmax(lp.F(), -1), tg.F()), e => e.TensorNLLLoss(e.TensorLogSoftmax(lp.D(), -1), tg.D()), ParityTol.Accum(1e-3), opMethod: "TensorNLLLoss")
+        { KnownDivergence = "GPU TensorNLLLoss returns 0 (loss-kernel divergence)." };
+        yield return new OpCase("TensorKLDivLoss[4,8]", "loss", e => e.TensorKLDivLoss(e.TensorLogSoftmax(lp.F(), -1), e.TensorSoftmax(tg.F(), -1)), e => e.TensorKLDivLoss(e.TensorLogSoftmax(lp.D(), -1), e.TensorSoftmax(tg.D(), -1)), ParityTol.Accum(1e-3), opMethod: "TensorKLDivLoss");
+    }
 
     // Geometry / NeRF: affine-grid, volume-render, spherical harmonics, upsample backward.
     public static IEnumerable<OpCase> GeometryNerf()
