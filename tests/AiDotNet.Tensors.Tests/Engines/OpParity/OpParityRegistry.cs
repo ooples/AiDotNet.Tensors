@@ -29,7 +29,37 @@ public static class OpParityRegistry
         .Concat(FusedConvMlp()).Concat(GatherScatterPool()).Concat(SdpaScatterUnique())
         .Concat(RecurrentScans()).Concat(MoreScansComplex()).Concat(AudioSpectral())
         .Concat(ReduceBackwardMisc()).Concat(DeformMesh()).Concat(DeformGridScatterBwd())
-        .Concat(LocalConvPool3D()).Concat(PsRoiOctonionReduceBwd()).Concat(ComplexIfftSpiral());
+        .Concat(LocalConvPool3D()).Concat(PsRoiOctonionReduceBwd()).Concat(ComplexIfftSpiral())
+        .Concat(SpiralBwdPosEnc());
+
+    // SpiralConv backwards + positional-encoding backward.
+    public static IEnumerable<OpCase> SpiralBwdPosEnc()
+    {
+        // outputGradient [V=6, Cout=5]; spiral [6,3]; weights [5, Cin*L=12]; Cin=4.
+        var go = OpInput.Rand(4500, new[] { 6, 5 });
+        var spiral = new Tensor<int>(new[] { 0, 1, 2, 1, 2, 3, 2, 3, 4, 3, 4, 5, 4, 5, 0, 5, 0, 1 }, new[] { 6, 3 });
+        var w = OpInput.Rand(4501, new[] { 5, 12 });
+        var vf = OpInput.Rand(4502, new[] { 6, 4 });
+        yield return new OpCase("SpiralConvBackwardInput[6,5]", "conv",
+            e => e.SpiralConvBackwardInput(go.F(), spiral, w.F(), 4),
+            e => e.SpiralConvBackwardInput(go.D(), spiral, w.D(), 4),
+            ParityTol.Accum(1e-3), opMethod: "SpiralConvBackwardInput");
+        yield return new OpCase("SpiralConvBackwardWeights[6,5]", "conv",
+            e => e.SpiralConvBackwardWeights(go.F(), vf.F(), spiral),
+            e => e.SpiralConvBackwardWeights(go.D(), vf.D(), spiral),
+            ParityTol.Accum(1e-3), opMethod: "SpiralConvBackwardWeights");
+        yield return new OpCase("SpiralConvBackwardBias[6,5]", "conv",
+            e => e.SpiralConvBackwardBias(go.F()), e => e.SpiralConvBackwardBias(go.D()),
+            ParityTol.Ulp(8), opMethod: "SpiralConvBackwardBias");
+
+        // Positional-encoding backward: positions [4,3], numFrequencies 4, encoded grad [4, 3*2*4=24].
+        var pos = OpInput.Rand(4510, new[] { 4, 3 });
+        var encGrad = OpInput.Rand(4511, new[] { 4, 24 });
+        yield return new OpCase("PositionalEncodingBackward[4,3;freq4]", "encoding",
+            e => e.PositionalEncodingBackward(pos.F(), encGrad.F(), 4),
+            e => e.PositionalEncodingBackward(pos.D(), encGrad.D(), 4),
+            ParityTol.Accum(1e-3), opMethod: "PositionalEncodingBackward");
+    }
 
     // Complex IFFT-to-real, magnitude+phase, spiral conv.
     public static IEnumerable<OpCase> ComplexIfftSpiral()
