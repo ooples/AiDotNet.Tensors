@@ -26,7 +26,34 @@ public static class OpParityRegistry
         .Concat(MoreBackward()).Concat(AudioFftSplat()).Concat(GeometryNerf()).Concat(FusedRoiLoss())
         .Concat(Conv3DBoxIou()).Concat(SortConvInterp()).Concat(AttentionFused())
         .Concat(ScalarShapePad()).Concat(ComplexReal()).Concat(TensorMathBatch())
-        .Concat(FusedConvMlp()).Concat(GatherScatterPool());
+        .Concat(FusedConvMlp()).Concat(GatherScatterPool()).Concat(SdpaScatterUnique());
+
+    // Scaled-dot-product attention, scatter-max (all outputs covered), unique.
+    public static IEnumerable<OpCase> SdpaScatterUnique()
+    {
+        // SDPA expects 4D q/k/v [batch, heads, seq, d_k].
+        var q = OpInput.Rand(3500, new[] { 1, 2, 4, 8 });
+        var k = OpInput.Rand(3501, new[] { 1, 2, 4, 8 });
+        var val = OpInput.Rand(3502, new[] { 1, 2, 4, 8 });
+        yield return new OpCase("ScaledDotProductAttention[4,8]", "attention",
+            e => e.ScaledDotProductAttention(q.F(), k.F(), val.F(), null, null, out _),
+            e => e.ScaledDotProductAttention(q.D(), k.D(), val.D(), null, null, out _),
+            ParityTol.Accum(1e-3), opMethod: "ScaledDotProductAttention");
+
+        // ScatterMax: every output index covered (0..3) so no empty-group -inf; max is deterministic.
+        var smSrc = OpInput.Rand(3510, new[] { 6 });
+        var smIdx = new int[] { 0, 1, 2, 3, 0, 1 };
+        yield return new OpCase("ScatterMax[6->4]", "index",
+            e => e.ScatterMax(smSrc.F(), new Tensor<int>((int[])smIdx.Clone(), new[] { 6 }), out _, 0, 4),
+            e => e.ScatterMax(smSrc.D(), new Tensor<int>((int[])smIdx.Clone(), new[] { 6 }), out _, 0, 4),
+            ParityTol.Exact, opMethod: "ScatterMax");
+
+        // Unique of a strictly-distinct input (sorted) -> output equals sorted input, same length.
+        var uniq = OpInput.Rand(3520, new[] { 12 });
+        yield return new OpCase("TensorUnique[12;sorted]", "index",
+            e => e.TensorUnique(uniq.F(), true), e => e.TensorUnique(uniq.D(), true),
+            ParityTol.Exact, opMethod: "TensorUnique");
+    }
 
     // Gather/scatter with explicit int indices + max-pool-with-indices.
     public static IEnumerable<OpCase> GatherScatterPool()
