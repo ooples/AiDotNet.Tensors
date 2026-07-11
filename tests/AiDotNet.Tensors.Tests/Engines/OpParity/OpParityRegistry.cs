@@ -28,7 +28,38 @@ public static class OpParityRegistry
         .Concat(ScalarShapePad()).Concat(ComplexReal()).Concat(TensorMathBatch())
         .Concat(FusedConvMlp()).Concat(GatherScatterPool()).Concat(SdpaScatterUnique())
         .Concat(RecurrentScans()).Concat(MoreScansComplex()).Concat(AudioSpectral())
-        .Concat(ReduceBackwardMisc());
+        .Concat(ReduceBackwardMisc()).Concat(DeformMesh());
+
+    // Deformable conv + mesh diffusion/Laplacian.
+    public static IEnumerable<OpCase> DeformMesh()
+    {
+        // DeformableConv2D: input [1,2,8,8], kernel [3,2,3,3], offset [1, 2*kh*kw=18, 8,8], no mask.
+        var dcIn = OpInput.Rand(4000, new[] { 1, 2, 8, 8 });
+        var dcK = OpInput.Rand(4001, new[] { 3, 2, 3, 3 });
+        var dcOff = OpInput.Rand(4002, new[] { 1, 18, 8, 8 }, -1, 1);
+        yield return new OpCase("DeformableConv2D[1,2,8,8;k3,2,3,3]", "conv",
+            e => e.DeformableConv2D(dcIn.F(), dcK.F(), dcOff.F(), null, new[] { 1, 1 }, new[] { 1, 1 }, new[] { 1, 1 }),
+            e => e.DeformableConv2D(dcIn.D(), dcK.D(), dcOff.D(), null, new[] { 1, 1 }, new[] { 1, 1 }, new[] { 1, 1 }),
+            ParityTol.Accum(1e-3), opMethod: "DeformableConv2D");
+
+        // Mesh diffusion conv: vertexFeatures [6,4], laplacian [6,6], weights [4,4], biases [4].
+        var vf = OpInput.Rand(4010, new[] { 6, 4 });
+        var lap = OpInput.Rand(4011, new[] { 6, 6 });
+        var mw = OpInput.Rand(4012, new[] { 4, 4 });
+        var mbias = OpInput.Rand(4013, new[] { 4 });
+        yield return new OpCase("DiffusionConv[6,4;lap6,6]", "conv",
+            e => e.DiffusionConv(vf.F(), lap.F(), mw.F(), mbias.F(), 0.5f),
+            e => e.DiffusionConv(vf.D(), lap.D(), mw.D(), mbias.D(), 0.5),
+            ParityTol.Accum(1e-3), opMethod: "DiffusionConv");
+
+        // Mesh Laplacian of a tetrahedron (uniform weights).
+        var verts = OpInput.From(new double[] { 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1 }, new[] { 4, 3 });
+        var faces = new Tensor<int>(new[] { 0, 1, 2, 0, 1, 3, 0, 2, 3, 1, 2, 3 }, new[] { 4, 3 });
+        yield return new OpCase("ComputeMeshLaplacian[tet4;uniform]", "geometry",
+            e => e.ComputeMeshLaplacian(verts.F(), faces, LaplacianType.Uniform),
+            e => e.ComputeMeshLaplacian(verts.D(), faces, LaplacianType.Uniform),
+            ParityTol.Accum(1e-3), opMethod: "ComputeMeshLaplacian");
+    }
 
     // Mean-diff, stack, variance/softmax backwards.
     public static IEnumerable<OpCase> ReduceBackwardMisc()
