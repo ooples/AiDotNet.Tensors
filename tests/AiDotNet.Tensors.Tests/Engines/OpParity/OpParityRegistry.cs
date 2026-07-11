@@ -23,7 +23,55 @@ public static class OpParityRegistry
         .Concat(IndexComplexAudio()).Concat(NativeAudioBox()).Concat(ScatterSoftmaxMisc()).Concat(ConvPoolLinear())
         .Concat(SpecialAttnNorm()).Concat(SlicePoolTake()).Concat(GridConvBwdLoss()).Concat(SliceScatterMisc())
         .Concat(NormConvBackward()).Concat(StackIndexEmbed()).Concat(FusedLinAffine()).Concat(GluCropSoftmaxBwd())
-        .Concat(MoreBackward()).Concat(AudioFftSplat()).Concat(GeometryNerf()).Concat(FusedRoiLoss());
+        .Concat(MoreBackward()).Concat(AudioFftSplat()).Concat(GeometryNerf()).Concat(FusedRoiLoss())
+        .Concat(Conv3DBoxIou());
+
+    // 3D conv backward kernels/inputs, ConvTranspose3D, depthwise-conv backward, box-IoU + convert.
+    public static IEnumerable<OpCase> Conv3DBoxIou()
+    {
+        // Conv3D shapes: input [1,2,4,4,4], kernel [3,2,2,2,2] -> output [1,3,3,3,3].
+        var go3d = OpInput.Rand(2700, new[] { 1, 3, 3, 3, 3 });
+        var in3d = OpInput.Rand(2701, new[] { 1, 2, 4, 4, 4 });
+        var k3d = OpInput.Rand(2702, new[] { 3, 2, 2, 2, 2 });
+        yield return new OpCase("Conv3DBackwardKernel[go1,3,3,3,3;in1,2,4,4,4]", "conv",
+            e => e.Conv3DBackwardKernel(go3d.F(), in3d.F(), new[] { 3, 2, 2, 2, 2 }, new[] { 1, 1, 1 }, new[] { 0, 0, 0 }, new[] { 1, 1, 1 }),
+            e => e.Conv3DBackwardKernel(go3d.D(), in3d.D(), new[] { 3, 2, 2, 2, 2 }, new[] { 1, 1, 1 }, new[] { 0, 0, 0 }, new[] { 1, 1, 1 }),
+            ParityTol.Accum(1e-3), opMethod: "Conv3DBackwardKernel");
+        yield return new OpCase("Conv3DBackwardInput[go1,3,3,3,3;k3,2,2,2,2]", "conv",
+            e => e.Conv3DBackwardInput(go3d.F(), k3d.F(), new[] { 1, 2, 4, 4, 4 }, new[] { 1, 1, 1 }, new[] { 0, 0, 0 }, new[] { 1, 1, 1 }),
+            e => e.Conv3DBackwardInput(go3d.D(), k3d.D(), new[] { 1, 2, 4, 4, 4 }, new[] { 1, 1, 1 }, new[] { 0, 0, 0 }, new[] { 1, 1, 1 }),
+            ParityTol.Accum(1e-3), opMethod: "Conv3DBackwardInput");
+
+        // ConvTranspose3D: input [1,2,2,2,2], kernel [2,3,2,2,2] (inC,outC,kD,kH,kW), stride 2.
+        var ctIn = OpInput.Rand(2710, new[] { 1, 2, 2, 2, 2 });
+        var ctK = OpInput.Rand(2711, new[] { 2, 3, 2, 2, 2 });
+        yield return new OpCase("ConvTranspose3D[1,2,2,2,2;k2,3,2,2,2]", "conv",
+            e => e.ConvTranspose3D(ctIn.F(), ctK.F(), new[] { 2, 2, 2 }, new[] { 0, 0, 0 }, new[] { 0, 0, 0 }),
+            e => e.ConvTranspose3D(ctIn.D(), ctK.D(), new[] { 2, 2, 2 }, new[] { 0, 0, 0 }, new[] { 0, 0, 0 }),
+            ParityTol.Accum(1e-3), opMethod: "ConvTranspose3D");
+
+        // Depthwise conv2d backward kernel: gradOutput/input [1,4,8,8], kernelShape [4,1,3,3].
+        var dwGo = OpInput.Rand(2720, new[] { 1, 4, 6, 6 });
+        var dwIn = OpInput.Rand(2721, new[] { 1, 4, 8, 8 });
+        yield return new OpCase("DepthwiseConv2DBackwardKernel[go1,4,6,6;in1,4,8,8]", "conv",
+            e => e.DepthwiseConv2DBackwardKernel(dwGo.F(), dwIn.F(), new[] { 4, 1, 3, 3 }, new[] { 1, 1 }, new[] { 0, 0 }),
+            e => e.DepthwiseConv2DBackwardKernel(dwGo.D(), dwIn.D(), new[] { 4, 1, 3, 3 }, new[] { 1, 1 }, new[] { 0, 0 }),
+            ParityTol.Accum(1e-3), opMethod: "DepthwiseConv2DBackwardKernel");
+
+        // Box-IoU variants: boxesA [3,4], boxesB [2,4] in XYXY.
+        var ba = OpInput.From(new double[] { 0, 0, 2, 2, 1, 1, 3, 4, 0, 1, 4, 3 }, new[] { 3, 4 });
+        var bb = OpInput.From(new double[] { 0, 0, 2, 3, 1, 0, 3, 3 }, new[] { 2, 4 });
+        yield return new OpCase("CompleteBoxIou[3,4;2,4]", "box",
+            e => e.CompleteBoxIou(ba.F(), bb.F()), e => e.CompleteBoxIou(ba.D(), bb.D()),
+            ParityTol.Accum(1e-3), opMethod: "CompleteBoxIou");
+        yield return new OpCase("DistanceBoxIou[3,4;2,4]", "box",
+            e => e.DistanceBoxIou(ba.F(), bb.F()), e => e.DistanceBoxIou(ba.D(), bb.D()),
+            ParityTol.Accum(1e-3), opMethod: "DistanceBoxIou");
+        yield return new OpCase("BoxConvert[3,4;XYXY->XYWH]", "box",
+            e => e.BoxConvert(ba.F(), BoxFormat.XYXY, BoxFormat.XYWH),
+            e => e.BoxConvert(ba.D(), BoxFormat.XYXY, BoxFormat.XYWH),
+            ParityTol.Accum(1e-4), opMethod: "BoxConvert");
+    }
 
     // Fused-linear (activation enum), RoI align/pool, NLL/KL losses.
     public static IEnumerable<OpCase> FusedRoiLoss()
