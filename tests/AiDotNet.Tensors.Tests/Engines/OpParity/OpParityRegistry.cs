@@ -32,7 +32,39 @@ public static class OpParityRegistry
         .Concat(LocalConvPool3D()).Concat(PsRoiOctonionReduceBwd()).Concat(ComplexIfftSpiral())
         .Concat(SpiralBwdPosEnc()).Concat(GroupedDeformBwdMisc()).Concat(MaskedGraphFusedBwd())
         .Concat(AttentionGraphBwd()).Concat(FlashBwdFusedTrilinear()).Concat(TrilinearBwdMhgaGrid())
-        .Concat(BceScatterMaskBwd()).Concat(MaxoutSpectral()).Concat(NerfSplatSh());
+        .Concat(BceScatterMaskBwd()).Concat(MaxoutSpectral()).Concat(NerfSplatSh())
+        .Concat(ShBwdCtcSpectralBatch());
+
+    // SH backward, CTC loss, batched spectral filter.
+    public static IEnumerable<OpCase> ShBwdCtcSpectralBatch()
+    {
+        var shC = OpInput.Rand(5400, new[] { 4, 9, 3 });
+        var viewDir = OpInput.Rand(5401, new[] { 4, 3 }, -1, 1);
+        var shGo = OpInput.Rand(5402, new[] { 4, 3 });
+        yield return new OpCase("EvaluateSphericalHarmonicsBackward[4,9,3;deg2]", "geometry",
+            e => e.EvaluateSphericalHarmonicsBackward(shC.F(), viewDir.F(), 2, shGo.F()),
+            e => e.EvaluateSphericalHarmonicsBackward(shC.D(), viewDir.D(), 2, shGo.D()),
+            ParityTol.Accum(1e-3), opMethod: "EvaluateSphericalHarmonicsBackward");
+
+        // CTC loss: logProbs [T=4, N=2, C=5] (log-softmaxed), targets flat, lengths per batch.
+        var lp = OpInput.Rand(5410, new[] { 4, 2, 5 });
+        var targets = new Tensor<int>(new[] { 1, 2, 3, 4 }, new[] { 4 });
+        yield return new OpCase("TensorCTCLoss[T4,N2,C5]", "loss",
+            e => e.TensorCTCLoss(e.TensorLogSoftmax(lp.F(), -1), targets, new[] { 4, 4 }, new[] { 2, 2 }, 0),
+            e => e.TensorCTCLoss(e.TensorLogSoftmax(lp.D(), -1), targets, new[] { 4, 4 }, new[] { 2, 2 }, 0),
+            ParityTol.Accum(1e-3), opMethod: "TensorCTCLoss");
+
+        // Batched spectral filter: 4D input [B,C,H,W], complex filter matching [H,W].
+        var sfIn = OpInput.Rand(5420, new[] { 1, 2, 4, 8 });
+        var fRe = OpInput.Rand(5421, new[] { 4, 8 });
+        var fIm = OpInput.Rand(5422, new[] { 4, 8 });
+        // FOUND (quarantined): GPU batched spectral filter diverges ~0.79 abs (CPU 50 ULP vs
+        // oracle) — same GPU FFT-kernel family as NativeSpectralFilter / wideband / 2D-IFFT.
+        yield return new OpCase("NativeSpectralFilterBatch[1,2,4,8]", "audio",
+            e => e.NativeSpectralFilterBatch(sfIn.F(), fRe.CF(fIm)), e => e.NativeSpectralFilterBatch(sfIn.D(), fRe.CD(fIm)),
+            ParityTol.Accum(2e-3), opMethod: "NativeSpectralFilterBatch")
+        { KnownDivergence = "GPU FFT-based batched spectral filter diverges ~0.79 abs; CPU matches oracle." };
+    }
 
     // Spherical harmonics, multiresolution hash encoding, gaussian rasterization.
     public static IEnumerable<OpCase> NerfSplatSh()
