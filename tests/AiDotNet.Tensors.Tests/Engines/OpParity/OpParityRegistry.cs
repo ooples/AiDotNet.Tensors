@@ -30,7 +30,54 @@ public static class OpParityRegistry
         .Concat(RecurrentScans()).Concat(MoreScansComplex()).Concat(AudioSpectral())
         .Concat(ReduceBackwardMisc()).Concat(DeformMesh()).Concat(DeformGridScatterBwd())
         .Concat(LocalConvPool3D()).Concat(PsRoiOctonionReduceBwd()).Concat(ComplexIfftSpiral())
-        .Concat(SpiralBwdPosEnc());
+        .Concat(SpiralBwdPosEnc()).Concat(GroupedDeformBwdMisc());
+
+    // Grouped-deformable backwards, log-variance backward, scatter-reduce, equals.
+    public static IEnumerable<OpCase> GroupedDeformBwdMisc()
+    {
+        var gin = OpInput.Rand(4600, new[] { 1, 4, 8, 8 });
+        var gk = OpInput.Rand(4601, new[] { 4, 2, 3, 3 });
+        var goff = OpInput.Rand(4602, new[] { 1, 18, 8, 8 }, -1, 1);
+        var ggo = OpInput.Rand(4603, new[] { 1, 4, 8, 8 });
+        var s = new[] { 1, 1 };
+        yield return new OpCase("DeformableConv2DGroupedBackwardInput[1,4,8,8;g2]", "conv",
+            e => e.DeformableConv2DGroupedBackwardInput(ggo.F(), gin.F(), gk.F(), goff.F(), null, new[] { 1, 4, 8, 8 }, s, s, s, 2, 1),
+            e => e.DeformableConv2DGroupedBackwardInput(ggo.D(), gin.D(), gk.D(), goff.D(), null, new[] { 1, 4, 8, 8 }, s, s, s, 2, 1),
+            ParityTol.Accum(1e-3), opMethod: "DeformableConv2DGroupedBackwardInput");
+        yield return new OpCase("DeformableConv2DGroupedBackwardKernel[1,4,8,8;g2]", "conv",
+            e => e.DeformableConv2DGroupedBackwardKernel(ggo.F(), gin.F(), goff.F(), null, new[] { 4, 2, 3, 3 }, s, s, s, 2, 1),
+            e => e.DeformableConv2DGroupedBackwardKernel(ggo.D(), gin.D(), goff.D(), null, new[] { 4, 2, 3, 3 }, s, s, s, 2, 1),
+            ParityTol.Accum(1e-3), opMethod: "DeformableConv2DGroupedBackwardKernel");
+        yield return new OpCase("DeformableConv2DGroupedBackwardOffset[1,4,8,8;g2]", "conv",
+            e => e.DeformableConv2DGroupedBackwardOffset(ggo.F(), gin.F(), gk.F(), goff.F(), null, s, s, s, 2, 1),
+            e => e.DeformableConv2DGroupedBackwardOffset(ggo.D(), gin.D(), gk.D(), goff.D(), null, s, s, s, 2, 1),
+            ParityTol.Accum(1e-3), opMethod: "DeformableConv2DGroupedBackwardOffset");
+
+        // Log-variance backward (global axes).
+        var lgo = OpInput.Rand(4610, new[] { 1 });
+        var lin = OpInput.Rand(4611, new[] { 4, 6 });
+        var lmean = OpInput.Rand(4612, new[] { 1 });
+        var lvar = OpInput.RandPositive(4613, new[] { 1 }, 0.5, 2.0);
+        yield return new OpCase("ReduceLogVarianceBackward[4,6;global]", "reduction",
+            e => e.ReduceLogVarianceBackward(lgo.F(), lin.F(), lmean.F(), lvar.F(), new[] { 0, 1 }),
+            e => e.ReduceLogVarianceBackward(lgo.D(), lin.D(), lmean.D(), lvar.D(), new[] { 0, 1 }),
+            ParityTol.Accum(1e-3), opMethod: "ReduceLogVarianceBackward");
+
+        // Scatter-reduce (Sum): indices and source share shape; distinct rows -> deterministic.
+        var srT = OpInput.Rand(4620, new[] { 4, 6 });
+        var srSrc = OpInput.Rand(4621, new[] { 3, 6 });
+        var srIdx = new int[] { 0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3 };
+        yield return new OpCase("TensorScatterReduce[4,6;idx3,6;sum]", "index",
+            e => e.TensorScatterReduce(srT.F(), 0, new Tensor<int>((int[])srIdx.Clone(), new[] { 3, 6 }), srSrc.F(), ScatterReduceMode.Sum, true),
+            e => e.TensorScatterReduce(srT.D(), 0, new Tensor<int>((int[])srIdx.Clone(), new[] { 3, 6 }), srSrc.D(), ScatterReduceMode.Sum, true),
+            ParityTol.Ulp(4), opMethod: "TensorScatterReduce");
+
+        // Elementwise equals-scalar (no exact matches -> all zeros; deterministic).
+        var eqT = OpInput.Rand(4630, new[] { 4, 6 });
+        yield return new OpCase("TensorEquals[4,6;==0.5]", "comparison",
+            e => e.TensorEquals(eqT.F(), 0.5f), e => e.TensorEquals(eqT.D(), 0.5),
+            ParityTol.Exact, opMethod: "TensorEquals");
+    }
 
     // SpiralConv backwards + positional-encoding backward.
     public static IEnumerable<OpCase> SpiralBwdPosEnc()
