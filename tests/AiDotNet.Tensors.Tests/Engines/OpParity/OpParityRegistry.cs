@@ -25,7 +25,23 @@ public static class OpParityRegistry
         .Concat(NormConvBackward()).Concat(StackIndexEmbed()).Concat(FusedLinAffine()).Concat(GluCropSoftmaxBwd())
         .Concat(MoreBackward()).Concat(AudioFftSplat()).Concat(GeometryNerf()).Concat(FusedRoiLoss())
         .Concat(Conv3DBoxIou()).Concat(SortConvInterp()).Concat(AttentionFused())
-        .Concat(ScalarShapePad());
+        .Concat(ScalarShapePad()).Concat(ComplexReal());
+
+    // Complex-input ops that return a REAL tensor (magnitude/phase family).
+    public static IEnumerable<OpCase> ComplexReal()
+    {
+        var re = OpInput.Rand(3100, new[] { 4, 6 });
+        var im = OpInput.Rand(3101, new[] { 4, 6 });
+        yield return new OpCase("NativeComplexMagnitude[4,6]", "complex",
+            e => e.NativeComplexMagnitude(re.CF(im)), e => e.NativeComplexMagnitude(re.CD(im)),
+            ParityTol.Accum(1e-3), opMethod: "NativeComplexMagnitude");
+        yield return new OpCase("NativeComplexMagnitudeSquared[4,6]", "complex",
+            e => e.NativeComplexMagnitudeSquared(re.CF(im)), e => e.NativeComplexMagnitudeSquared(re.CD(im)),
+            ParityTol.Ulp(8), opMethod: "NativeComplexMagnitudeSquared");
+        yield return new OpCase("NativeComplexPhase[4,6]", "complex",
+            e => e.NativeComplexPhase(re.CF(im)), e => e.NativeComplexPhase(re.CD(im)),
+            ParityTol.Accum(1e-3), opMethod: "NativeComplexPhase");
+    }
 
     // Scalar-minus-tensor, add-scaled, at-least-Nd shape promotion, N-d pad.
     public static IEnumerable<OpCase> ScalarShapePad()

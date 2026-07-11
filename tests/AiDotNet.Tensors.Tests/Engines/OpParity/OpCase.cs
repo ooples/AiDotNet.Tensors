@@ -48,6 +48,23 @@ public sealed class OpInput
     }
 
     public Tensor<double> D() => new Tensor<double>((double[])_data.Clone(), (int[])Shape.Clone());
+
+    /// <summary>Complex float tensor whose real parts are this input's samples and imaginary parts
+    /// are <paramref name="imag"/>'s samples (both must share this shape). For NativeComplex* ops.</summary>
+    public Tensor<Complex<float>> CF(OpInput imag)
+    {
+        var c = new Complex<float>[_data.Length];
+        for (int i = 0; i < _data.Length; i++) c[i] = new Complex<float>((float)_data[i], (float)imag._data[i]);
+        return new Tensor<Complex<float>>(c, (int[])Shape.Clone());
+    }
+
+    /// <summary>Complex double tensor (the oracle counterpart of <see cref="CF"/>).</summary>
+    public Tensor<Complex<double>> CD(OpInput imag)
+    {
+        var c = new Complex<double>[_data.Length];
+        for (int i = 0; i < _data.Length; i++) c[i] = new Complex<double>(_data[i], imag._data[i]);
+        return new Tensor<Complex<double>>(c, (int[])Shape.Clone());
+    }
 }
 
 /// <summary>

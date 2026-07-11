@@ -612,8 +612,8 @@ public static class SimdComplexKernels
     }
 
     /// <summary>
-    /// SIMD complex phase: out = atan2(im, re) using SVML-style polynomial approximation.
-    /// ~6 ulp max error, ~4x faster than scalar Math.Atan2.
+    /// SIMD complex phase: out = atan2(im, re) using an SVML-style polynomial approximation.
+    /// ~1e-7 max abs error (near float epsilon), ~4x faster than scalar Math.Atan2.
     /// </summary>
     [MethodImpl(HotInline)]
     public static void ComplexPhase(ReadOnlySpan<float> inR, ReadOnlySpan<float> inI, Span<float> output)
@@ -624,12 +624,17 @@ public static class SimdComplexKernels
 #if NET5_0_OR_GREATER
         if (Avx.IsSupported && n >= 8)
         {
-            // Minimax polynomial atan(x) ≈ x * (c0 + x² * (c1 + x² * (c2 + x² * c3)))
-            // Valid for |x| <= 1. For |x| > 1, use atan(x) = pi/2 - atan(1/x).
-            var c0 = Vector256.Create(0.9998660f);
-            var c1 = Vector256.Create(-0.3302995f);
-            var c2 = Vector256.Create(0.1801410f);
-            var c3 = Vector256.Create(-0.0851330f);
+            // Degree-15 odd minimax for atan(x) on |x| <= 1 (8 coefficients), accurate to ~1e-7 —
+            // the previous 4-term poly was ~0.02 off at x=1 (atan(1)=pi/4), which showed up as a
+            // ~1.8% CPU-vs-GPU phase divergence. For |x| > 1 the swap below maps into [0,1].
+            var c0 = Vector256.Create(0.9999993329f);
+            var c1 = Vector256.Create(-0.3332985605f);
+            var c2 = Vector256.Create(0.1994653599f);
+            var c3 = Vector256.Create(-0.1390853351f);
+            var c4 = Vector256.Create(0.0964200441f);
+            var c5 = Vector256.Create(-0.0559098861f);
+            var c6 = Vector256.Create(0.0218612288f);
+            var c7 = Vector256.Create(-0.0040540580f);
             var halfPi = Vector256.Create(MathF.PI / 2f);
             var pi = Vector256.Create(MathF.PI);
             var zero = Vector256<float>.Zero;
@@ -656,16 +661,16 @@ public static class SimdComplexKernels
                 var t = Avx.Divide(num, den); // t = min/max, so |t| <= 1
                 var t2 = Avx.Multiply(t, t);
 
-                // Horner: atan(t) = t * (c0 + t2*(c1 + t2*(c2 + t2*c3)))
+                // Horner: atan(t) = t * (c0 + t2*(c1 + ... + t2*c7))
                 var poly = Fma.IsSupported
-                    ? Fma.MultiplyAdd(t2, c3, c2)
-                    : Avx.Add(Avx.Multiply(t2, c3), c2);
-                poly = Fma.IsSupported
-                    ? Fma.MultiplyAdd(t2, poly, c1)
-                    : Avx.Add(Avx.Multiply(t2, poly), c1);
-                poly = Fma.IsSupported
-                    ? Fma.MultiplyAdd(t2, poly, c0)
-                    : Avx.Add(Avx.Multiply(t2, poly), c0);
+                    ? Fma.MultiplyAdd(t2, c7, c6)
+                    : Avx.Add(Avx.Multiply(t2, c7), c6);
+                poly = Fma.IsSupported ? Fma.MultiplyAdd(t2, poly, c5) : Avx.Add(Avx.Multiply(t2, poly), c5);
+                poly = Fma.IsSupported ? Fma.MultiplyAdd(t2, poly, c4) : Avx.Add(Avx.Multiply(t2, poly), c4);
+                poly = Fma.IsSupported ? Fma.MultiplyAdd(t2, poly, c3) : Avx.Add(Avx.Multiply(t2, poly), c3);
+                poly = Fma.IsSupported ? Fma.MultiplyAdd(t2, poly, c2) : Avx.Add(Avx.Multiply(t2, poly), c2);
+                poly = Fma.IsSupported ? Fma.MultiplyAdd(t2, poly, c1) : Avx.Add(Avx.Multiply(t2, poly), c1);
+                poly = Fma.IsSupported ? Fma.MultiplyAdd(t2, poly, c0) : Avx.Add(Avx.Multiply(t2, poly), c0);
                 var atanVal = Avx.Multiply(t, poly);
 
                 // If swapped: atan = pi/2 - atan
