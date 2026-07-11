@@ -18,7 +18,48 @@ public static class OpParityRegistry
     /// <summary>Every registered parity case (the ViT-path localization set + the broad
     /// elementwise/reduction batch). Tests and the coverage audit run over this.</summary>
     public static IEnumerable<OpCase> All() => ViTPath().Concat(Elementwise()).Concat(Elementwise2())
-        .Concat(BinaryScalarShape()).Concat(ReduceNormPool()).Concat(BackwardMatmul());
+        .Concat(BinaryScalarShape()).Concat(ReduceNormPool()).Concat(BackwardMatmul())
+        .Concat(ConvIndexLoss());
+
+    // Conv variants, index/embedding ops, losses (incl. the #775 BCE-with-logits), concat/stack.
+    public static IEnumerable<OpCase> ConvIndexLoss()
+    {
+        // Conv variants.
+        yield return new OpCase("Conv1D[1,3,16;k8,3,3]", "conv",
+            e => e.Conv1D(OpInput.Rand(700, new[] { 1, 3, 16 }).F(), OpInput.Rand(701, new[] { 8, 3, 3 }).F(), 1, 0, 1),
+            e => e.Conv1D(OpInput.Rand(700, new[] { 1, 3, 16 }).D(), OpInput.Rand(701, new[] { 8, 3, 3 }).D(), 1, 0, 1), ParityTol.Accum(1e-3), opMethod: "Conv1D");
+        yield return new OpCase("Conv3D[1,2,4,4,4;k3,2,2,2,2]", "conv",
+            e => e.Conv3D(OpInput.Rand(702, new[] { 1, 2, 4, 4, 4 }).F(), OpInput.Rand(703, new[] { 3, 2, 2, 2, 2 }).F(), 1, 0, 1),
+            e => e.Conv3D(OpInput.Rand(702, new[] { 1, 2, 4, 4, 4 }).D(), OpInput.Rand(703, new[] { 3, 2, 2, 2, 2 }).D(), 1, 0, 1), ParityTol.Accum(1e-3), opMethod: "Conv3D");
+        yield return new OpCase("DepthwiseConv2D[1,4,8,8;k4,1,3,3]", "conv",
+            e => e.DepthwiseConv2D(OpInput.Rand(704, new[] { 1, 4, 8, 8 }).F(), OpInput.Rand(705, new[] { 4, 1, 3, 3 }).F(), new[] { 1, 1 }, new[] { 1, 1 }),
+            e => e.DepthwiseConv2D(OpInput.Rand(704, new[] { 1, 4, 8, 8 }).D(), OpInput.Rand(705, new[] { 4, 1, 3, 3 }).D(), new[] { 1, 1 }, new[] { 1, 1 }), ParityTol.Accum(1e-3), opMethod: "DepthwiseConv2D");
+
+        // Index / embedding (Tensor<int> indices are identical across float/double runs).
+        yield return new OpCase("Embedding[idx4;table10,8]", "index",
+            e => e.Embedding(new Tensor<int>(new[] { 1, 3, 0, 5 }, new[] { 4 }), OpInput.Rand(710, new[] { 10, 8 }).F()),
+            e => e.Embedding(new Tensor<int>(new[] { 1, 3, 0, 5 }, new[] { 4 }), OpInput.Rand(710, new[] { 10, 8 }).D()), ParityTol.Exact, opMethod: "Embedding");
+        yield return new OpCase("TensorIndexSelect[6,8;ax0]", "index",
+            e => e.TensorIndexSelect(OpInput.Rand(711, new[] { 6, 8 }).F(), new Tensor<int>(new[] { 0, 2, 5, 1 }, new[] { 4 }), 0),
+            e => e.TensorIndexSelect(OpInput.Rand(711, new[] { 6, 8 }).D(), new Tensor<int>(new[] { 0, 2, 5, 1 }, new[] { 4 }), 0), ParityTol.Exact, opMethod: "TensorIndexSelect");
+
+        // Losses (reductions → relative tol). BCEWithLogits is the #775 loss itself.
+        var pred = OpInput.Rand(720, new[] { 4, 64 });
+        var tgt01 = OpInput.Rand(721, new[] { 4, 64 }, 0.0, 1.0);
+        yield return new OpCase("TensorMSELoss[4,64]", "loss", e => e.TensorMSELoss(pred.F(), tgt01.F()), e => e.TensorMSELoss(pred.D(), tgt01.D()), ParityTol.Accum(1e-3), opMethod: "TensorMSELoss");
+        yield return new OpCase("TensorL1Loss[4,64]", "loss", e => e.TensorL1Loss(pred.F(), tgt01.F()), e => e.TensorL1Loss(pred.D(), tgt01.D()), ParityTol.Accum(1e-3), opMethod: "TensorL1Loss");
+        yield return new OpCase("TensorHuberLoss[4,64]", "loss", e => e.TensorHuberLoss(pred.F(), tgt01.F(), 1.0), e => e.TensorHuberLoss(pred.D(), tgt01.D(), 1.0), ParityTol.Accum(1e-3), opMethod: "TensorHuberLoss");
+        yield return new OpCase("TensorBCEWithLogitsLoss[4,64]", "loss", e => e.TensorBCEWithLogitsLoss(pred.F(), tgt01.F()), e => e.TensorBCEWithLogitsLoss(pred.D(), tgt01.D()), ParityTol.Accum(1e-3), opMethod: "TensorBCEWithLogitsLoss");
+
+        // Concat / stack — pure movement, bit-exact.
+        var c1 = OpInput.Rand(730, new[] { 4, 8 }); var c2 = OpInput.Rand(731, new[] { 4, 8 });
+        yield return new OpCase("TensorConcatenate[2x4,8;ax0]", "shape",
+            e => e.TensorConcatenate(new[] { c1.F(), c2.F() }, 0), e => e.TensorConcatenate(new[] { c1.D(), c2.D() }, 0), ParityTol.Exact, opMethod: "TensorConcatenate");
+        yield return new OpCase("TensorStack[2x4,8;ax0]", "shape",
+            e => e.TensorStack(new[] { c1.F(), c2.F() }, 0), e => e.TensorStack(new[] { c1.D(), c2.D() }, 0), ParityTol.Exact, opMethod: "TensorStack");
+        yield return new OpCase("Concat[2x4,8;ax1]", "shape",
+            e => e.Concat(new[] { c1.F(), c2.F() }, 1), e => e.Concat(new[] { c1.D(), c2.D() }, 1), ParityTol.Exact, opMethod: "Concat");
+    }
 
     // Activation backward/derivative ops and the matmul/linear family.
     public static IEnumerable<OpCase> BackwardMatmul()
