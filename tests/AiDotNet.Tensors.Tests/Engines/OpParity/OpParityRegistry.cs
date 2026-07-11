@@ -28,7 +28,49 @@ public static class OpParityRegistry
         .Concat(ScalarShapePad()).Concat(ComplexReal()).Concat(TensorMathBatch())
         .Concat(FusedConvMlp()).Concat(GatherScatterPool()).Concat(SdpaScatterUnique())
         .Concat(RecurrentScans()).Concat(MoreScansComplex()).Concat(AudioSpectral())
-        .Concat(ReduceBackwardMisc()).Concat(DeformMesh()).Concat(DeformGridScatterBwd());
+        .Concat(ReduceBackwardMisc()).Concat(DeformMesh()).Concat(DeformGridScatterBwd())
+        .Concat(LocalConvPool3D());
+
+    // Locally-connected conv (+ backwards), grouped deformable conv, 3D max-pool-with-indices.
+    public static IEnumerable<OpCase> LocalConvPool3D()
+    {
+        // LocallyConnectedConv2D: input [1,1,3,3], weights [outH,outW,outCh,inCh,kH,kW]=[2,2,2,1,2,2].
+        var lcIn = OpInput.Rand(4200, new[] { 1, 1, 3, 3 });
+        var lcW = OpInput.Rand(4201, new[] { 2, 2, 2, 1, 2, 2 });
+        int[] lcStride = { 1, 1 };
+        var lcGo = OpInput.Rand(4202, new[] { 1, 2, 2, 2 });
+        yield return new OpCase("LocallyConnectedConv2D[1,1,3,3]", "conv",
+            e => e.LocallyConnectedConv2D(lcIn.F(), lcW.F(), null, lcStride),
+            e => e.LocallyConnectedConv2D(lcIn.D(), lcW.D(), null, lcStride),
+            ParityTol.Accum(1e-3), opMethod: "LocallyConnectedConv2D");
+        yield return new OpCase("LocallyConnectedConv2DBackwardInput[1,2,2,2]", "conv",
+            e => e.LocallyConnectedConv2DBackwardInput(lcGo.F(), lcW.F(), new[] { 1, 1, 3, 3 }, lcStride),
+            e => e.LocallyConnectedConv2DBackwardInput(lcGo.D(), lcW.D(), new[] { 1, 1, 3, 3 }, lcStride),
+            ParityTol.Accum(1e-3), opMethod: "LocallyConnectedConv2DBackwardInput");
+        yield return new OpCase("LocallyConnectedConv2DBackwardWeights[1,2,2,2]", "conv",
+            e => e.LocallyConnectedConv2DBackwardWeights(lcGo.F(), lcIn.F(), new[] { 2, 2, 2, 1, 2, 2 }, lcStride),
+            e => e.LocallyConnectedConv2DBackwardWeights(lcGo.D(), lcIn.D(), new[] { 2, 2, 2, 1, 2, 2 }, lcStride),
+            ParityTol.Accum(1e-3), opMethod: "LocallyConnectedConv2DBackwardWeights");
+        yield return new OpCase("LocallyConnectedConv2DBackwardBias[1,2,2,2]", "conv",
+            e => e.LocallyConnectedConv2DBackwardBias(lcGo.F()), e => e.LocallyConnectedConv2DBackwardBias(lcGo.D()),
+            ParityTol.Ulp(8), opMethod: "LocallyConnectedConv2DBackwardBias");
+
+        // Grouped deformable conv: input [1,4,8,8], kernel [4,2,3,3] (groups=2), offset [1,18,8,8].
+        var gdIn = OpInput.Rand(4210, new[] { 1, 4, 8, 8 });
+        var gdK = OpInput.Rand(4211, new[] { 4, 2, 3, 3 });
+        var gdOff = OpInput.Rand(4212, new[] { 1, 18, 8, 8 }, -1, 1);
+        yield return new OpCase("DeformableConv2DGrouped[1,4,8,8;g2]", "conv",
+            e => e.DeformableConv2DGrouped(gdIn.F(), gdK.F(), gdOff.F(), null, new[] { 1, 1 }, new[] { 1, 1 }, new[] { 1, 1 }, 2, 1),
+            e => e.DeformableConv2DGrouped(gdIn.D(), gdK.D(), gdOff.D(), null, new[] { 1, 1 }, new[] { 1, 1 }, new[] { 1, 1 }, 2, 1),
+            ParityTol.Accum(1e-3), opMethod: "DeformableConv2DGrouped");
+
+        // 3D max-pool with indices: input [1,2,4,4,4], pool/stride [2,2,2] -> [1,2,2,2,2].
+        var mp3 = OpInput.Rand(4220, new[] { 1, 2, 4, 4, 4 });
+        yield return new OpCase("MaxPool3DWithIndices[1,2,4,4,4;2x2x2]", "pool",
+            e => e.MaxPool3DWithIndices(mp3.F(), new[] { 2, 2, 2 }, new[] { 2, 2, 2 }, out _),
+            e => e.MaxPool3DWithIndices(mp3.D(), new[] { 2, 2, 2 }, new[] { 2, 2, 2 }, out _),
+            ParityTol.Exact, opMethod: "MaxPool3DWithIndices");
+    }
 
     // Deformable-conv backwards, grid-sample backwards, scatter-add backward.
     public static IEnumerable<OpCase> DeformGridScatterBwd()
