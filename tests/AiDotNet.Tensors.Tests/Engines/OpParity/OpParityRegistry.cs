@@ -24,7 +24,39 @@ public static class OpParityRegistry
         .Concat(SpecialAttnNorm()).Concat(SlicePoolTake()).Concat(GridConvBwdLoss()).Concat(SliceScatterMisc())
         .Concat(NormConvBackward()).Concat(StackIndexEmbed()).Concat(FusedLinAffine()).Concat(GluCropSoftmaxBwd())
         .Concat(MoreBackward()).Concat(AudioFftSplat()).Concat(GeometryNerf()).Concat(FusedRoiLoss())
-        .Concat(Conv3DBoxIou()).Concat(SortConvInterp()).Concat(AttentionFused());
+        .Concat(Conv3DBoxIou()).Concat(SortConvInterp()).Concat(AttentionFused())
+        .Concat(ScalarShapePad());
+
+    // Scalar-minus-tensor, add-scaled, at-least-Nd shape promotion, N-d pad.
+    public static IEnumerable<OpCase> ScalarShapePad()
+    {
+        var a = OpInput.Rand(3000, new[] { 4, 6 });
+        var b = OpInput.Rand(3001, new[] { 4, 6 });
+        yield return new OpCase("ScalarMinusTensor[2-;4,6]", "elementwise",
+            e => e.ScalarMinusTensor(2f, a.F()), e => e.ScalarMinusTensor(2.0, a.D()),
+            ParityTol.Exact, opMethod: "ScalarMinusTensor");
+        yield return new OpCase("TensorAddScaled[4,6;2,3]", "elementwise",
+            e => e.TensorAddScaled(a.F(), b.F(), 2f, 3f), e => e.TensorAddScaled(a.D(), b.D(), 2.0, 3.0),
+            ParityTol.Ulp(4), opMethod: "TensorAddScaled");
+
+        var v = OpInput.Rand(3010, new[] { 4 });
+        yield return new OpCase("TensorAtLeast1D[4]", "shape",
+            e => e.TensorAtLeast1D(v.F()), e => e.TensorAtLeast1D(v.D()), ParityTol.Exact, opMethod: "TensorAtLeast1D");
+        yield return new OpCase("TensorAtLeast2D[4]", "shape",
+            e => e.TensorAtLeast2D(v.F()), e => e.TensorAtLeast2D(v.D()), ParityTol.Exact, opMethod: "TensorAtLeast2D");
+        yield return new OpCase("TensorAtLeast3D[4]", "shape",
+            e => e.TensorAtLeast3D(v.F()), e => e.TensorAtLeast3D(v.D()), ParityTol.Exact, opMethod: "TensorAtLeast3D");
+
+        var padIn = OpInput.Rand(3020, new[] { 2, 4 });
+        yield return new OpCase("PadNd[2,4;1,1,1,1;constant]", "pad",
+            e => e.PadNd(padIn.F(), new[] { 1, 1, 1, 1 }, PadMode.Constant, 0f),
+            e => e.PadNd(padIn.D(), new[] { 1, 1, 1, 1 }, PadMode.Constant, 0.0),
+            ParityTol.Exact, opMethod: "PadNd");
+        yield return new OpCase("PadNd[2,4;1,1,1,1;reflect]", "pad",
+            e => e.PadNd(padIn.F(), new[] { 1, 1, 1, 1 }, PadMode.Reflect, 0f),
+            e => e.PadNd(padIn.D(), new[] { 1, 1, 1, 1 }, PadMode.Reflect, 0.0),
+            ParityTol.Exact, opMethod: "PadNd");
+    }
 
     // Attention forward paths + fused batchnorm (eval) + mu-law encoding.
     public static IEnumerable<OpCase> AttentionFused()
