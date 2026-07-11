@@ -22,7 +22,25 @@ public static class OpParityRegistry
         .Concat(ConvIndexLoss()).Concat(MoreMathShape()).Concat(GatedMisc()).Concat(PadDistDiag())
         .Concat(IndexComplexAudio()).Concat(NativeAudioBox()).Concat(ScatterSoftmaxMisc()).Concat(ConvPoolLinear())
         .Concat(SpecialAttnNorm()).Concat(SlicePoolTake()).Concat(GridConvBwdLoss()).Concat(SliceScatterMisc())
-        .Concat(NormConvBackward()).Concat(StackIndexEmbed());
+        .Concat(NormConvBackward()).Concat(StackIndexEmbed()).Concat(FusedLinAffine());
+
+    // Fused-linear activation variants + affine batchnorm.
+    public static IEnumerable<OpCase> FusedLinAffine()
+    {
+        var lin = OpInput.Rand(2100, new[] { 4, 8 });
+        var w = OpInput.Rand(2101, new[] { 8, 6 });
+        var bias = OpInput.Rand(2102, new[] { 6 });
+        yield return new OpCase("FusedLinearSigmoid[4,8;w8,6]", "matmul", e => e.FusedLinearSigmoid(lin.F(), w.F(), bias.F()), e => e.FusedLinearSigmoid(lin.D(), w.D(), bias.D()), ParityTol.Accum(1e-3), opMethod: "FusedLinearSigmoid");
+        yield return new OpCase("FusedLinearTanh[4,8;w8,6]", "matmul", e => e.FusedLinearTanh(lin.F(), w.F(), bias.F()), e => e.FusedLinearTanh(lin.D(), w.D(), bias.D()), ParityTol.Accum(1e-3), opMethod: "FusedLinearTanh");
+        yield return new OpCase("FusedLinearSwish[4,8;w8,6]", "matmul", e => e.FusedLinearSwish(lin.F(), w.F(), bias.F()), e => e.FusedLinearSwish(lin.D(), w.D(), bias.D()), ParityTol.Accum(1e-3), opMethod: "FusedLinearSwish");
+
+        var bx = OpInput.Rand(2110, new[] { 2, 4, 4, 4 });
+        var bg = OpInput.Rand(2111, new[] { 4 }, 0.5, 1.5);
+        var bb = OpInput.Rand(2112, new[] { 4 }, -0.2, 0.2);
+        var bm = OpInput.Rand(2113, new[] { 4 }, -0.5, 0.5);
+        var bv = OpInput.Rand(2114, new[] { 4 }, 0.5, 1.5);
+        yield return new OpCase("BatchNormAffine[2,4,4,4]", "norm", e => e.BatchNormAffine(bx.F(), bg.F(), bb.F(), bm.F(), bv.F(), 1e-5), e => e.BatchNormAffine(bx.D(), bg.D(), bb.D(), bm.D(), bv.D(), 1e-5), ParityTol.Accum(1e-3), opMethod: "BatchNormAffine");
+    }
 
     // Stack variants, index-copy/fill/put, embedding-from-float, cartesian-prod, softmax-backward.
     public static IEnumerable<OpCase> StackIndexEmbed()
