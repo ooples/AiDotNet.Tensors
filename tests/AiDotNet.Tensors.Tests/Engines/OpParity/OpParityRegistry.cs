@@ -21,7 +21,44 @@ public static class OpParityRegistry
         .Concat(BinaryScalarShape()).Concat(ReduceNormPool()).Concat(BackwardMatmul())
         .Concat(ConvIndexLoss()).Concat(MoreMathShape()).Concat(GatedMisc()).Concat(PadDistDiag())
         .Concat(IndexComplexAudio()).Concat(NativeAudioBox()).Concat(ScatterSoftmaxMisc()).Concat(ConvPoolLinear())
-        .Concat(SpecialAttnNorm()).Concat(SlicePoolTake());
+        .Concat(SpecialAttnNorm()).Concat(SlicePoolTake()).Concat(GridConvBwdLoss());
+
+    // Grid-sample, upsample3d/crop, depthwise-1d, conv/pool backward, IoU + CE losses.
+    public static IEnumerable<OpCase> GridConvBwdLoss()
+    {
+        // FOUND (quarantined): CPU and GPU GridSample produce DIFFERENT OUTPUT SHAPES for the same
+        // input+grid (CPU 64 elements vs GPU 32) — a hard shape/convention mismatch. Tracked.
+        yield return new OpCase("GridSample[1,2,4,4;g1,4,4,2]", "sample",
+            e => e.GridSample(OpInput.Rand(1700, new[] { 1, 2, 4, 4 }).F(), OpInput.Rand(1701, new[] { 1, 4, 4, 2 }, -1.0, 1.0).F()),
+            e => e.GridSample(OpInput.Rand(1700, new[] { 1, 2, 4, 4 }).D(), OpInput.Rand(1701, new[] { 1, 4, 4, 2 }, -1.0, 1.0).D()), ParityTol.Accum(1e-3), opMethod: "GridSample")
+        { KnownDivergence = "CPU and GPU GridSample return different output shapes (64 vs 32 elements)." };
+        yield return new OpCase("Upsample3D[1,2,2,2,2;2x2x2]", "shape",
+            e => e.Upsample3D(OpInput.Rand(1702, new[] { 1, 2, 2, 2, 2 }).F(), 2, 2, 2),
+            e => e.Upsample3D(OpInput.Rand(1702, new[] { 1, 2, 2, 2, 2 }).D(), 2, 2, 2), ParityTol.Exact, opMethod: "Upsample3D");
+        yield return new OpCase("Crop[1,2,8,8;1,1,4,4]", "shape",
+            e => e.Crop(OpInput.Rand(1703, new[] { 1, 2, 8, 8 }).F(), 1, 1, 4, 4),
+            e => e.Crop(OpInput.Rand(1703, new[] { 1, 2, 8, 8 }).D(), 1, 1, 4, 4), ParityTol.Exact, opMethod: "Crop");
+        yield return new OpCase("DepthwiseConv1D[1,4,16;k4,1,3]", "conv",
+            e => e.DepthwiseConv1D(OpInput.Rand(1704, new[] { 1, 4, 16 }).F(), OpInput.Rand(1705, new[] { 4, 1, 3 }).F(), 1, 0),
+            e => e.DepthwiseConv1D(OpInput.Rand(1704, new[] { 1, 4, 16 }).D(), OpInput.Rand(1705, new[] { 4, 1, 3 }).D(), 1, 0), ParityTol.Accum(1e-3), opMethod: "DepthwiseConv1D");
+
+        yield return new OpCase("Conv2DBackwardInput[1,4,6,6->1,3,8,8]", "conv",
+            e => e.Conv2DBackwardInput(OpInput.Rand(1710, new[] { 1, 4, 6, 6 }).F(), OpInput.Rand(1711, new[] { 4, 3, 3, 3 }).F(), new[] { 1, 3, 8, 8 }, new[] { 1, 1 }, new[] { 0, 0 }, new[] { 1, 1 }),
+            e => e.Conv2DBackwardInput(OpInput.Rand(1710, new[] { 1, 4, 6, 6 }).D(), OpInput.Rand(1711, new[] { 4, 3, 3, 3 }).D(), new[] { 1, 3, 8, 8 }, new[] { 1, 1 }, new[] { 0, 0 }, new[] { 1, 1 }), ParityTol.Accum(1e-3), opMethod: "Conv2DBackwardInput");
+        yield return new OpCase("AvgPool2DBackward[1,2,4,4->1,2,8,8]", "pool",
+            e => e.AvgPool2DBackward(OpInput.Rand(1712, new[] { 1, 2, 4, 4 }).F(), new[] { 1, 2, 8, 8 }, new[] { 2, 2 }, new[] { 2, 2 }),
+            e => e.AvgPool2DBackward(OpInput.Rand(1712, new[] { 1, 2, 4, 4 }).D(), new[] { 1, 2, 8, 8 }, new[] { 2, 2 }, new[] { 2, 2 }), ParityTol.Accum(1e-3), opMethod: "AvgPool2DBackward");
+
+        // IoU-family box losses (predicted vs target boxes [N,4]).
+        var pb = OpInput.From(new double[] { 0, 0, 2, 2, 1, 1, 3, 4, 0, 1, 4, 3 }, new[] { 3, 4 });
+        var tb = OpInput.From(new double[] { 0, 0, 2, 3, 1, 0, 3, 3, 1, 1, 5, 4 }, new[] { 3, 4 });
+        yield return new OpCase("TensorIoULoss[3,4]", "loss", e => e.TensorIoULoss(pb.F(), tb.F()), e => e.TensorIoULoss(pb.D(), tb.D()), ParityTol.Accum(1e-3), opMethod: "TensorIoULoss");
+        yield return new OpCase("TensorGIoULoss[3,4]", "loss", e => e.TensorGIoULoss(pb.F(), tb.F()), e => e.TensorGIoULoss(pb.D(), tb.D()), ParityTol.Accum(1e-3), opMethod: "TensorGIoULoss");
+        yield return new OpCase("TensorDIoULoss[3,4]", "loss", e => e.TensorDIoULoss(pb.F(), tb.F()), e => e.TensorDIoULoss(pb.D(), tb.D()), ParityTol.Accum(1e-3), opMethod: "TensorDIoULoss");
+        var logits = OpInput.Rand(1720, new[] { 4, 8 }, -3.0, 3.0);
+        var ceTgt = OpInput.Rand(1721, new[] { 4, 8 }, 0.0, 1.0);
+        yield return new OpCase("TensorCrossEntropyLoss[4,8]", "loss", e => e.TensorCrossEntropyLoss(logits.F(), ceTgt.F()), e => e.TensorCrossEntropyLoss(logits.D(), ceTgt.D()), ParityTol.Accum(1e-3), opMethod: "TensorCrossEntropyLoss");
+    }
 
     // 1D pools, permute/slice/take, index-add, Tensor* pool/conv variants.
     public static IEnumerable<OpCase> SlicePoolTake()

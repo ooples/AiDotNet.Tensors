@@ -52,7 +52,7 @@ public sealed class OpParityCoverageTests
         Assert.NotEmpty(covered);
         // Coverage floor: keep this at/above the current count so coverage can only grow. Raise it
         // as the registry expands; a drop means an op silently lost its spec.
-        const int coverageFloor = 150;
+        const int coverageFloor = 250;
         Assert.True(covered.Count >= coverageFloor,
             $"Parity op coverage dropped to {covered.Count} distinct IEngine ops (floor {coverageFloor}). " +
             $"An op likely lost its registry spec.");

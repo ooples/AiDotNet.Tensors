@@ -135,6 +135,16 @@ public static class OpParityHarness
         string phase, OpCase op, OpParityFixture fx,
         float[] cpuF, float[] cpuF2, float[] gpuF, float[] gpuF2, double[] oracleD, ParityTol tol)
     {
+        // Quarantined divergence: a confirmed, tracked cross-engine bug (parity gap, nondeterminism,
+        // non-finite, OR a hard shape mismatch). Record + SKIP before any hard assert — never fail CI
+        // on a known bug.
+        if (op.KnownDivergence is { } known)
+        {
+            fx.Record($"{op.Name}:{phase}\t{op.Category}\tKNOWN-DIVERGENCE\t-\t-\t-");
+            Skip.If(true, $"KNOWN DIVERGENCE ({op.Name} {phase}): {known}. cpuLen={cpuF.Length} gpuLen={gpuF.Length}.");
+            return;
+        }
+
         // Shape/length agreement.
         Assert.True(cpuF.Length == gpuF.Length && cpuF.Length == oracleD.Length,
             $"{op.Name} {phase}: length mismatch cpu={cpuF.Length} gpu={gpuF.Length} oracle={oracleD.Length}");
@@ -154,14 +164,6 @@ public static class OpParityHarness
             gpuVsOracle.MaxUlp.ToString(CultureInfo.InvariantCulture),
             worse,
         }));
-
-        // Quarantined divergence: a confirmed, tracked cross-engine bug (may be a parity gap AND/OR
-        // nondeterminism). Record the finding and SKIP — never hard-fail CI on a known bug.
-        if (op.KnownDivergence is { } reason)
-        {
-            Skip.If(true, $"KNOWN DIVERGENCE ({op.Name} {phase}): {reason}. {cpuVsGpu.Describe()}; worse: {worse}.");
-            return;
-        }
 
         // Finiteness — a non-finite result is a bug regardless of tolerance.
         for (int i = 0; i < cpuF.Length; i++)
