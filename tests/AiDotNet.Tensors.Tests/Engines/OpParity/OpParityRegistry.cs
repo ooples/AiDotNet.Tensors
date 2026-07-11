@@ -17,7 +17,60 @@ public static class OpParityRegistry
 {
     /// <summary>Every registered parity case (the ViT-path localization set + the broad
     /// elementwise/reduction batch). Tests and the coverage audit run over this.</summary>
-    public static IEnumerable<OpCase> All() => ViTPath().Concat(Elementwise()).Concat(Elementwise2()).Concat(BinaryScalarShape());
+    public static IEnumerable<OpCase> All() => ViTPath().Concat(Elementwise()).Concat(Elementwise2())
+        .Concat(BinaryScalarShape()).Concat(ReduceNormPool());
+
+    // Reductions / cumulative, comparison, norm family, and pooling.
+    public static IEnumerable<OpCase> ReduceNormPool()
+    {
+        // Reductions & cumulative.
+        var r = OpInput.Rand(500, new[] { 4, 32 });
+        yield return new OpCase("TensorCumSum[4,32;ax1]", "reduction", e => e.TensorCumSum(r.F(), 1), e => e.TensorCumSum(r.D(), 1), ParityTol.Accum(1e-3), opMethod: "TensorCumSum");
+        yield return new OpCase("TensorCumProd[4,32;ax1]", "reduction", e => e.TensorCumProd(OpInput.Rand(501, new[] { 4, 32 }, 0.8, 1.2).F(), 1), e => e.TensorCumProd(OpInput.Rand(501, new[] { 4, 32 }, 0.8, 1.2).D(), 1), ParityTol.Accum(1e-3), opMethod: "TensorCumProd");
+        yield return new OpCase("TensorNorm[4,32;ax1]", "reduction", e => e.TensorNorm(r.F(), 1, false), e => e.TensorNorm(r.D(), 1, false), ParityTol.Accum(1e-3), opMethod: "TensorNorm");
+        yield return new OpCase("TensorStd[4,32]", "reduction", e => e.TensorStd(r.F()), e => e.TensorStd(r.D()), ParityTol.Accum(1e-3), opMethod: "TensorStd");
+        yield return new OpCase("TensorVar[4,32]", "reduction", e => e.TensorVar(r.F()), e => e.TensorVar(r.D()), ParityTol.Accum(1e-3), opMethod: "TensorVar");
+        yield return new OpCase("ReduceStd[4,32;ax1]", "reduction", e => e.ReduceStd(r.F(), new[] { 1 }, false), e => e.ReduceStd(r.D(), new[] { 1 }, false), ParityTol.Accum(1e-3), opMethod: "ReduceStd");
+        yield return new OpCase("ReduceVariance[4,32;ax1]", "reduction", e => e.ReduceVariance(r.F(), new[] { 1 }, false), e => e.ReduceVariance(r.D(), new[] { 1 }, false), ParityTol.Accum(1e-3), opMethod: "ReduceVariance");
+        yield return new OpCase("TensorLogSumExp[4,32;ax1]", "reduction", e => e.TensorLogSumExp(r.F(), 1, false), e => e.TensorLogSumExp(r.D(), 1, false), ParityTol.Accum(1e-3), opMethod: "TensorLogSumExp");
+
+        // Comparison / selection — 0/1 or exact-select, bit-exact.
+        var a = OpInput.Rand(510, new[] { 4, 64 });
+        var b = OpInput.Rand(511, new[] { 4, 64 });
+        yield return B("TensorGreaterThan", "comparison", (e, u, v) => e.TensorGreaterThan(u, v), (e, u, v) => e.TensorGreaterThan(u, v), ParityTol.Exact, a, b);
+        yield return B("TensorLessThan", "comparison", (e, u, v) => e.TensorLessThan(u, v), (e, u, v) => e.TensorLessThan(u, v), ParityTol.Exact, a, b);
+        yield return new OpCase("TensorNotEquals[4,64]", "comparison", e => e.TensorNotEquals(a.F(), 0.5f), e => e.TensorNotEquals(a.D(), 0.5), ParityTol.Exact, opMethod: "TensorNotEquals");
+        {
+            // Where(cond, x, y): cond is a 0/1 tensor.
+            var condData = new double[256];
+            var rng = new Random(512);
+            for (int i = 0; i < condData.Length; i++) condData[i] = rng.NextDouble() < 0.5 ? 0.0 : 1.0;
+            var cond = OpInput.From(condData, new[] { 4, 64 });
+            yield return new OpCase("TensorWhere[4,64]", "comparison",
+                e => e.TensorWhere(cond.F(), a.F(), b.F()), e => e.TensorWhere(cond.D(), a.D(), b.D()), ParityTol.Exact, opMethod: "TensorWhere");
+        }
+
+        // Norm family.
+        var nx = OpInput.Rand(520, new[] { 4, 64 });
+        var g = OpInput.Rand(521, new[] { 64 }, 0.5, 1.5);
+        var be = OpInput.Rand(522, new[] { 64 }, -0.2, 0.2);
+        yield return new OpCase("TensorLayerNorm[4,64]", "norm", e => e.TensorLayerNorm(nx.F(), g.F(), be.F(), 1e-5), e => e.TensorLayerNorm(nx.D(), g.D(), be.D(), 1e-5), ParityTol.Accum(1e-3), opMethod: "TensorLayerNorm");
+        yield return new OpCase("RMSNorm[4,64]", "norm", e => { var y = e.RMSNorm(nx.F(), g.F(), 1e-5, out _); return y; }, e => { var y = e.RMSNorm(nx.D(), g.D(), 1e-5, out _); return y; }, ParityTol.Accum(1e-3), opMethod: "RMSNorm");
+        {
+            var gx = OpInput.Rand(523, new[] { 2, 8, 4, 4 });
+            var gg = OpInput.Rand(524, new[] { 8 }, 0.5, 1.5);
+            var gb = OpInput.Rand(525, new[] { 8 }, -0.2, 0.2);
+            yield return new OpCase("GroupNorm[2,8,4,4;g2]", "norm", e => { var y = e.GroupNorm(gx.F(), 2, gg.F(), gb.F(), 1e-5, out _, out _); return y; }, e => { var y = e.GroupNorm(gx.D(), 2, gg.D(), gb.D(), 1e-5, out _, out _); return y; }, ParityTol.Accum(1e-3), opMethod: "GroupNorm");
+            yield return new OpCase("InstanceNorm[2,8,4,4]", "norm", e => { var y = e.InstanceNorm(gx.F(), gg.F(), gb.F(), 1e-5, out _, out _); return y; }, e => { var y = e.InstanceNorm(gx.D(), gg.D(), gb.D(), 1e-5, out _, out _); return y; }, ParityTol.Accum(1e-3), opMethod: "InstanceNorm");
+        }
+
+        // Pooling (NCHW).
+        var p = OpInput.Rand(530, new[] { 1, 4, 8, 8 });
+        yield return new OpCase("MaxPool2D[1,4,8,8;k2]", "pool", e => e.MaxPool2D(p.F(), 2), e => e.MaxPool2D(p.D(), 2), ParityTol.Exact, opMethod: "MaxPool2D");
+        yield return new OpCase("AvgPool2D[1,4,8,8;k2]", "pool", e => e.AvgPool2D(p.F(), 2), e => e.AvgPool2D(p.D(), 2), ParityTol.Accum(1e-3), opMethod: "AvgPool2D");
+        yield return new OpCase("GlobalAvgPool2D[1,4,8,8]", "pool", e => e.GlobalAvgPool2D(p.F()), e => e.GlobalAvgPool2D(p.D()), ParityTol.Accum(1e-3), opMethod: "GlobalAvgPool2D");
+        yield return new OpCase("GlobalMaxPool2D[1,4,8,8]", "pool", e => e.GlobalMaxPool2D(p.F()), e => e.GlobalMaxPool2D(p.D()), ParityTol.Exact, opMethod: "GlobalMaxPool2D");
+    }
 
     // Binary elementwise, scalar-arg, and shape ops (the last are pure movement → bit-exact).
     public static IEnumerable<OpCase> BinaryScalarShape()
