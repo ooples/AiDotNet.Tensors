@@ -31,7 +31,40 @@ public static class OpParityRegistry
         .Concat(ReduceBackwardMisc()).Concat(DeformMesh()).Concat(DeformGridScatterBwd())
         .Concat(LocalConvPool3D()).Concat(PsRoiOctonionReduceBwd()).Concat(ComplexIfftSpiral())
         .Concat(SpiralBwdPosEnc()).Concat(GroupedDeformBwdMisc()).Concat(MaskedGraphFusedBwd())
-        .Concat(AttentionGraphBwd()).Concat(FlashBwdFusedTrilinear());
+        .Concat(AttentionGraphBwd()).Concat(FlashBwdFusedTrilinear()).Concat(TrilinearBwdMhgaGrid());
+
+    // Trilinear backward, multi-head graph attention, occupancy-grid update.
+    public static IEnumerable<OpCase> TrilinearBwdMhgaGrid()
+    {
+        var grid = OpInput.Rand(5000, new[] { 4, 4, 4, 2 });
+        var posns = OpInput.Rand(5001, new[] { 5, 3 }, 0.0, 3.0);
+        var tgo = OpInput.Rand(5002, new[] { 5, 2 });
+        yield return new OpCase("TensorTrilinearInterpolateBackward[4,4,4,2]", "resize",
+            e => e.TensorTrilinearInterpolateBackward(tgo.F(), grid.F(), posns.F()),
+            e => e.TensorTrilinearInterpolateBackward(tgo.D(), grid.D(), posns.D()),
+            ParityTol.Accum(1e-3), opMethod: "TensorTrilinearInterpolateBackward");
+
+        // Multi-head graph attention: nodeFeatures [1,4,6], headWeights [numHeads=2, inF=6, headDim=3].
+        var nf = OpInput.Rand(5010, new[] { 1, 4, 6 });
+        var eSrc = new Tensor<int>(new[] { 0, 1, 2, 3, 0, 1 }, new[] { 6 });
+        var eTgt = new Tensor<int>(new[] { 1, 2, 3, 0, 2, 3 }, new[] { 6 });
+        var hw = OpInput.Rand(5011, new[] { 2, 6, 3 });
+        var aS = OpInput.Rand(5012, new[] { 2, 3 });
+        var aT = OpInput.Rand(5013, new[] { 2, 3 });
+        yield return new OpCase("MultiHeadGraphAttention[1,4,6;h2]", "attention",
+            e => e.MultiHeadGraphAttention(nf.F(), eSrc, eTgt, hw.F(), aS.F(), aT.F(), 0.2, true, out _),
+            e => e.MultiHeadGraphAttention(nf.D(), eSrc, eTgt, hw.D(), aS.D(), aT.D(), 0.2, true, out _),
+            ParityTol.Accum(1e-3), opMethod: "MultiHeadGraphAttention");
+
+        // Occupancy-grid update: grid [64]=(gridSize 4)^3, densities [5], positions [5,3] in [0,4).
+        var occ = OpInput.Rand(5020, new[] { 64 }, 0.0, 1.0);
+        var dens = OpInput.Rand(5021, new[] { 5 }, 0.0, 1.0);
+        var opos = OpInput.Rand(5022, new[] { 5, 3 }, 0.0, 3.99);
+        yield return new OpCase("UpdateOccupancyGrid[64;5pts]", "geometry",
+            e => e.UpdateOccupancyGrid(occ.F(), dens.F(), opos.F(), 4, 0.5f, 0.9f),
+            e => e.UpdateOccupancyGrid(occ.D(), dens.D(), opos.D(), 4, 0.5, 0.9),
+            ParityTol.Accum(1e-3), opMethod: "UpdateOccupancyGrid");
+    }
 
     // Flash-attention backward (forward-then-backward), fused linear+CE, trilinear, hier-softmax.
     public static IEnumerable<OpCase> FlashBwdFusedTrilinear()
