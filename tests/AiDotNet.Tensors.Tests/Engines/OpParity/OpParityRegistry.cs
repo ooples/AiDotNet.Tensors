@@ -28,7 +28,49 @@ public static class OpParityRegistry
         .Concat(ScalarShapePad()).Concat(ComplexReal()).Concat(TensorMathBatch())
         .Concat(FusedConvMlp()).Concat(GatherScatterPool()).Concat(SdpaScatterUnique())
         .Concat(RecurrentScans()).Concat(MoreScansComplex()).Concat(AudioSpectral())
-        .Concat(ReduceBackwardMisc()).Concat(DeformMesh());
+        .Concat(ReduceBackwardMisc()).Concat(DeformMesh()).Concat(DeformGridScatterBwd());
+
+    // Deformable-conv backwards, grid-sample backwards, scatter-add backward.
+    public static IEnumerable<OpCase> DeformGridScatterBwd()
+    {
+        var dcIn = OpInput.Rand(4100, new[] { 1, 2, 8, 8 });
+        var dcK = OpInput.Rand(4101, new[] { 3, 2, 3, 3 });
+        var dcOff = OpInput.Rand(4102, new[] { 1, 18, 8, 8 }, -1, 1);
+        var dcGo = OpInput.Rand(4103, new[] { 1, 3, 8, 8 });
+        yield return new OpCase("DeformableConv2DBackwardInput[1,3,8,8]", "conv",
+            e => e.DeformableConv2DBackwardInput(dcGo.F(), dcIn.F(), dcK.F(), dcOff.F(), null, new[] { 1, 2, 8, 8 }, new[] { 1, 1 }, new[] { 1, 1 }, new[] { 1, 1 }),
+            e => e.DeformableConv2DBackwardInput(dcGo.D(), dcIn.D(), dcK.D(), dcOff.D(), null, new[] { 1, 2, 8, 8 }, new[] { 1, 1 }, new[] { 1, 1 }, new[] { 1, 1 }),
+            ParityTol.Accum(1e-3), opMethod: "DeformableConv2DBackwardInput");
+        yield return new OpCase("DeformableConv2DBackwardKernel[1,3,8,8]", "conv",
+            e => e.DeformableConv2DBackwardKernel(dcGo.F(), dcIn.F(), dcOff.F(), null, new[] { 3, 2, 3, 3 }, new[] { 1, 1 }, new[] { 1, 1 }, new[] { 1, 1 }),
+            e => e.DeformableConv2DBackwardKernel(dcGo.D(), dcIn.D(), dcOff.D(), null, new[] { 3, 2, 3, 3 }, new[] { 1, 1 }, new[] { 1, 1 }, new[] { 1, 1 }),
+            ParityTol.Accum(1e-3), opMethod: "DeformableConv2DBackwardKernel");
+        yield return new OpCase("DeformableConv2DBackwardOffset[1,3,8,8]", "conv",
+            e => e.DeformableConv2DBackwardOffset(dcGo.F(), dcIn.F(), dcK.F(), dcOff.F(), null, new[] { 1, 1 }, new[] { 1, 1 }, new[] { 1, 1 }),
+            e => e.DeformableConv2DBackwardOffset(dcGo.D(), dcIn.D(), dcK.D(), dcOff.D(), null, new[] { 1, 1 }, new[] { 1, 1 }, new[] { 1, 1 }),
+            ParityTol.Accum(1e-3), opMethod: "DeformableConv2DBackwardOffset");
+
+        // Grid-sample backwards (NHWC): input [1,4,4,2], grid [1,4,4,2], gradOutput [1,4,4,2].
+        var gsIn = OpInput.Rand(4110, new[] { 1, 4, 4, 2 });
+        var gsGrid = OpInput.Rand(4111, new[] { 1, 4, 4, 2 }, -1, 1);
+        var gsGo = OpInput.Rand(4112, new[] { 1, 4, 4, 2 });
+        yield return new OpCase("GridSampleBackwardInput[1,4,4,2]", "grid",
+            e => e.GridSampleBackwardInput(gsGo.F(), gsGrid.F(), new[] { 1, 4, 4, 2 }),
+            e => e.GridSampleBackwardInput(gsGo.D(), gsGrid.D(), new[] { 1, 4, 4, 2 }),
+            ParityTol.Accum(1e-3), opMethod: "GridSampleBackwardInput");
+        yield return new OpCase("GridSampleBackwardGrid[1,2,4,4]", "grid",
+            e => e.GridSampleBackwardGrid(gsGo.F(), gsIn.F(), gsGrid.F()),
+            e => e.GridSampleBackwardGrid(gsGo.D(), gsIn.D(), gsGrid.D()),
+            ParityTol.Accum(1e-3), opMethod: "GridSampleBackwardGrid");
+
+        // ScatterAdd backward: gradient wrt source = gather of gradOutput at indices.
+        var saGo = OpInput.Rand(4120, new[] { 4, 6 });
+        var saIdx = new int[] { 0, 2, 3 };
+        yield return new OpCase("ScatterAddBackward[4,6;idx3]", "index",
+            e => e.ScatterAddBackward(saGo.F(), new Tensor<int>((int[])saIdx.Clone(), new[] { 3 }), new[] { 3, 6 }, 0),
+            e => e.ScatterAddBackward(saGo.D(), new Tensor<int>((int[])saIdx.Clone(), new[] { 3 }), new[] { 3, 6 }, 0),
+            ParityTol.Exact, opMethod: "ScatterAddBackward");
+    }
 
     // Deformable conv + mesh diffusion/Laplacian.
     public static IEnumerable<OpCase> DeformMesh()
