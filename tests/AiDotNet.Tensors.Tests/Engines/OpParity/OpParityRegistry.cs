@@ -33,7 +33,44 @@ public static class OpParityRegistry
         .Concat(SpiralBwdPosEnc()).Concat(GroupedDeformBwdMisc()).Concat(MaskedGraphFusedBwd())
         .Concat(AttentionGraphBwd()).Concat(FlashBwdFusedTrilinear()).Concat(TrilinearBwdMhgaGrid())
         .Concat(BceScatterMaskBwd()).Concat(MaxoutSpectral()).Concat(NerfSplatSh())
-        .Concat(ShBwdCtcSpectralBatch()).Concat(MaxPoolBwdAudio());
+        .Concat(ShBwdCtcSpectralBatch()).Concat(MaxPoolBwdAudio()).Concat(FoldReorderUnique());
+
+    // Grouped-deform mask backward, fold, reorder-to-NCHW, unique-consecutive.
+    public static IEnumerable<OpCase> FoldReorderUnique()
+    {
+        var gin = OpInput.Rand(5600, new[] { 1, 4, 8, 8 });
+        var gk = OpInput.Rand(5601, new[] { 4, 2, 3, 3 });
+        var goff = OpInput.Rand(5602, new[] { 1, 18, 8, 8 }, -1, 1);
+        var gmask = OpInput.Rand(5603, new[] { 1, 9, 8, 8 }, 0.0, 1.0);
+        var ggo = OpInput.Rand(5604, new[] { 1, 4, 8, 8 });
+        var s = new[] { 1, 1 };
+        yield return new OpCase("DeformableConv2DGroupedBackwardMask[1,4,8,8;g2]", "conv",
+            e => e.DeformableConv2DGroupedBackwardMask(ggo.F(), gin.F(), gk.F(), goff.F(), gmask.F(), s, s, s, 2, 1),
+            e => e.DeformableConv2DGroupedBackwardMask(ggo.D(), gin.D(), gk.D(), goff.D(), gmask.D(), s, s, s, 2, 1),
+            ParityTol.Accum(1e-3), opMethod: "DeformableConv2DGroupedBackwardMask");
+
+        // Fold: unfolded columns [1, C*kh*kw=8, L=4] -> [1,2,4,4] (kernel 2x2 stride 2).
+        var foldIn = OpInput.Rand(5610, new[] { 1, 8, 4 });
+        // FOUND (quarantined): GPU Fold emits a different output size (64 vs CPU/oracle 32) —
+        // GPU fold/col2im shape or accumulation bug.
+        yield return new OpCase("Fold[1,8,4->4,4]", "shape",
+            e => e.Fold(foldIn.F(), new[] { 4, 4 }, new[] { 2, 2 }, new[] { 2, 2 }, new[] { 0, 0 }),
+            e => e.Fold(foldIn.D(), new[] { 4, 4 }, new[] { 2, 2 }, new[] { 2, 2 }, new[] { 0, 0 }),
+            ParityTol.Ulp(4), opMethod: "Fold")
+        { KnownDivergence = "GPU Fold emits a different output size (64 vs 32); CPU matches oracle." };
+
+        // Reorder to NCHW (standard [N,C,H,W] tensor).
+        var reIn = OpInput.Rand(5620, new[] { 1, 2, 4, 4 });
+        yield return new OpCase("ReorderToNchw[1,2,4,4]", "shape",
+            e => e.ReorderToNchw(reIn.F()), e => e.ReorderToNchw(reIn.D()),
+            ParityTol.Exact, opMethod: "ReorderToNchw");
+
+        // Unique-consecutive on a strictly-distinct input (no consecutive dupes -> identity).
+        var uc = OpInput.Rand(5630, new[] { 8 });
+        yield return new OpCase("TensorUniqueConsecutive[8]", "index",
+            e => e.TensorUniqueConsecutive(uc.F()), e => e.TensorUniqueConsecutive(uc.D()),
+            ParityTol.Exact, opMethod: "TensorUniqueConsecutive");
+    }
 
     // MaxPool 2D/3D backward (indices from WithIndices) + pitch shift.
     public static IEnumerable<OpCase> MaxPoolBwdAudio()
