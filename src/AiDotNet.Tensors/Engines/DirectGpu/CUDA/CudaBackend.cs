@@ -50,6 +50,20 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private IntPtr _cudaContext;
     private IntPtr _stream;
     private IntPtr _cublasHandle;
+    // Serializes host-side submission of GPU operations across threads. The
+    // backend is a singleton whose compute ops share ONE stream, ONE cuBLAS
+    // handle, and ONE stream-ordered mem pool; concurrent threads interleaving
+    // cuMemAllocAsync / cuLaunchKernel / cuMemcpy*Async + cuStreamSynchronize on
+    // that shared stream is a data race that faults the context with a sticky
+    // CUDA-700 (the exact symptom seen when the model-family test suite drives
+    // the backend from many xUnit worker threads at once). Held (reentrantly)
+    // for the duration of each op via PushContext, so GPU submission is
+    // one-at-a-time — the stream already executes serially, so the only cost is
+    // serializing the fast host-side enqueue. NOTE: the architecturally-better
+    // fix is per-thread streams + per-thread cuBLAS/cuDNN + cross-stream events;
+    // that is the tracked follow-up. This lock makes the shared-resource backend
+    // correct under concurrent access today.
+    private readonly object _gpuOpLock = new object();
     // #742: the handle's default fp32 GEMM math mode chosen at init (TF32 tensor-op on Ampere+, else
     // PEDANTIC). Under SetDeterministicMode(true) we switch the handle to PEDANTIC (true fp32, no
     // tensor-core rounding) so backward GEMMs are reproducible on ANY GPU/driver; we restore the
@@ -453,17 +467,39 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     private readonly struct CudaContextScope : IDisposable
     {
+        private readonly object _opLock;
+        private readonly bool _lockTaken;
         private readonly bool _pushed;
 
-        public CudaContextScope(IntPtr context)
+        public CudaContextScope(object opLock, IntPtr context)
         {
+            _opLock = opLock;
+            // Serialize GPU submission across threads. Monitor is REENTRANT on
+            // the same thread, so a nested PushContext (an op that calls a helper
+            // which also pushes) re-acquires and releases symmetrically without
+            // deadlock — the lock is simply held from the outermost scope to its
+            // dispose, spanning the whole op.
+            bool taken = false;
+            Monitor.Enter(opLock, ref taken);
+            _lockTaken = taken;
+
             _pushed = false;
-            // Push only if this thread doesn't already have the right context.
-            if (context != IntPtr.Zero && _threadCurrentContext != context)
+            try
             {
-                CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxPushCurrent(context), "cuCtxPushCurrent");
-                _threadCurrentContext = context;
-                _pushed = true;
+                // Push only if this thread doesn't already have the right context.
+                if (context != IntPtr.Zero && _threadCurrentContext != context)
+                {
+                    CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxPushCurrent(context), "cuCtxPushCurrent");
+                    _threadCurrentContext = context;
+                    _pushed = true;
+                }
+            }
+            catch
+            {
+                // Dispose won't run when the ctor throws, so release the lock here
+                // rather than leak it.
+                if (taken) Monitor.Exit(opLock);
+                throw;
             }
         }
 
@@ -474,12 +510,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxPopCurrent(out _), "cuCtxPopCurrent");
                 _threadCurrentContext = IntPtr.Zero;
             }
+            if (_lockTaken) Monitor.Exit(_opLock);
         }
     }
 
     private CudaContextScope PushContext()
     {
-        return new CudaContextScope(_cudaContext);
+        return new CudaContextScope(_gpuOpLock, _cudaContext);
     }
 
     private static string? GetCudaIncludePath()
