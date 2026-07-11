@@ -19,7 +19,47 @@ public static class OpParityRegistry
     /// elementwise/reduction batch). Tests and the coverage audit run over this.</summary>
     public static IEnumerable<OpCase> All() => ViTPath().Concat(Elementwise()).Concat(Elementwise2())
         .Concat(BinaryScalarShape()).Concat(ReduceNormPool()).Concat(BackwardMatmul())
-        .Concat(ConvIndexLoss());
+        .Concat(ConvIndexLoss()).Concat(MoreMathShape());
+
+    // More binary/scalar math, unary special functions, shape movement, and cumulative ops.
+    public static IEnumerable<OpCase> MoreMathShape()
+    {
+        var s = new[] { 4, 64 };
+        var a = OpInput.Rand(800, s);
+        var b = OpInput.Rand(801, s);
+        var ypos = OpInput.Rand(802, s, 0.3, 4.0);
+        var bnz = OpInput.Rand(803, s, 0.5, 2.0);
+
+        yield return B("TensorXlogy", "arithmetic", (e, u, v) => e.TensorXlogy(u, v), (e, u, v) => e.TensorXlogy(u, v), ParityTol.Ulp(64, 1e-6), a, ypos);
+        yield return B("TensorFloatPower", "arithmetic", (e, u, v) => e.TensorFloatPower(u, v), (e, u, v) => e.TensorFloatPower(u, v), ParityTol.Ulp(256, 1e-5), ypos, OpInput.Rand(804, s, 0.5, 2.5));
+        yield return B("TensorFmod", "arithmetic", (e, u, v) => e.TensorFmod(u, v), (e, u, v) => e.TensorFmod(u, v), ParityTol.Ulp(8, 1e-6), a, bnz);
+        yield return B("TensorRemainder", "arithmetic", (e, u, v) => e.TensorRemainder(u, v), (e, u, v) => e.TensorRemainder(u, v), ParityTol.Ulp(8, 1e-6), a, bnz);
+
+        yield return new OpCase("TensorLerp[4,64]", "arithmetic", e => e.TensorLerp(a.F(), b.F(), 0.3f), e => e.TensorLerp(a.D(), b.D(), 0.3), ParityTol.Ulp(4, 1e-6), opMethod: "TensorLerp");
+        yield return new OpCase("TensorClip[4,64]", "arithmetic", e => e.TensorClip(a.F(), -0.5f, 0.5f), e => e.TensorClip(a.D(), -0.5, 0.5), ParityTol.Exact, opMethod: "TensorClip");
+        yield return new OpCase("TensorThreshold[4,64]", "arithmetic", e => e.TensorThreshold(a.F(), 0.0f, 0.0f), e => e.TensorThreshold(a.D(), 0.0, 0.0), ParityTol.Exact, opMethod: "TensorThreshold");
+
+        yield return U("TensorErfinv", "arithmetic", (e, t) => e.TensorErfinv(t), (e, t) => e.TensorErfinv(t), ParityTol.Ulp(256, 1e-5), OpInput.Rand(805, s, -0.9, 0.9));
+        yield return U("TensorI0", "arithmetic", (e, t) => e.TensorI0(t), (e, t) => e.TensorI0(t), ParityTol.Ulp(256, 1e-5), OpInput.Rand(806, s, -2.0, 2.0));
+
+        // Shape / movement — bit-exact.
+        var m = OpInput.Rand(810, new[] { 4, 8 });
+        var sq = OpInput.Rand(811, new[] { 4, 1, 8 });
+        var diag = OpInput.Rand(812, new[] { 4 });
+        yield return new OpCase("TensorSqueeze[4,1,8;ax1]", "shape", e => e.TensorSqueeze(sq.F(), 1), e => e.TensorSqueeze(sq.D(), 1), ParityTol.Exact, opMethod: "TensorSqueeze");
+        yield return new OpCase("TensorNarrow[4,8;d1,1,4]", "shape", e => e.TensorNarrow(m.F(), 1, 1, 4), e => e.TensorNarrow(m.D(), 1, 1, 4), ParityTol.Exact, opMethod: "TensorNarrow");
+        yield return new OpCase("TensorRepeatInterleave[4,8;2,d0]", "shape", e => e.TensorRepeatInterleave(m.F(), 2, 0), e => e.TensorRepeatInterleave(m.D(), 2, 0), ParityTol.Exact, opMethod: "TensorRepeatInterleave");
+        yield return new OpCase("TensorTile[4,8;2,1]", "shape", e => e.TensorTile(m.F(), new[] { 2, 1 }), e => e.TensorTile(m.D(), new[] { 2, 1 }), ParityTol.Exact, opMethod: "TensorTile");
+        yield return new OpCase("TensorRot90[4,8]", "shape", e => e.TensorRot90(m.F(), 1, new[] { 0, 1 }), e => e.TensorRot90(m.D(), 1, new[] { 0, 1 }), ParityTol.Exact, opMethod: "TensorRot90");
+        yield return new OpCase("TensorDiag[4]", "shape", e => e.TensorDiag(diag.F()), e => e.TensorDiag(diag.D()), ParityTol.Exact, opMethod: "TensorDiag");
+        yield return new OpCase("TensorFliplr[4,8]", "shape", e => e.TensorFliplr(m.F()), e => e.TensorFliplr(m.D()), ParityTol.Exact, opMethod: "TensorFliplr");
+        yield return new OpCase("TensorFlipud[4,8]", "shape", e => e.TensorFlipud(m.F()), e => e.TensorFlipud(m.D()), ParityTol.Exact, opMethod: "TensorFlipud");
+        yield return new OpCase("TensorRepeatElements[4,8;2,ax0]", "shape", e => e.TensorRepeatElements(m.F(), 2, 0), e => e.TensorRepeatElements(m.D(), 2, 0), ParityTol.Exact, opMethod: "TensorRepeatElements");
+
+        // Cumulative selection.
+        var rr = OpInput.Rand(820, new[] { 4, 32 });
+        yield return new OpCase("TensorCumMax[4,32;ax1]", "reduction", e => e.TensorCumMax(rr.F(), 1), e => e.TensorCumMax(rr.D(), 1), ParityTol.Exact, opMethod: "TensorCumMax");
+    }
 
     // Conv variants, index/embedding ops, losses (incl. the #775 BCE-with-logits), concat/stack.
     public static IEnumerable<OpCase> ConvIndexLoss()
