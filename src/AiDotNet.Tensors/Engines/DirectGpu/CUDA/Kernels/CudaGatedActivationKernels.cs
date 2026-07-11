@@ -77,12 +77,13 @@ extern ""C"" __global__ __launch_bounds__(256) void geglu_forward(
     float value = input[outer * fullDim + d];
     float gate = input[outer * fullDim + halfDim + d];
 
-    // GELU(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    float x3 = value * value * value;
-    float inner = 0.7978845608f * (value + 0.044715f * x3);
-    float gelu_val = 0.5f * value * (1.0f + tanhf(inner));
+    // #775: activation applies to the GATE (second half), output = value * GELU(gate) — matches
+    // glu_forward, the CpuEngine reference, and the validated OpenCL fix (was GELU(value)*gate).
+    float g3 = gate * gate * gate;
+    float inner = 0.7978845608f * (gate + 0.044715f * g3);
+    float gelu_gate = 0.5f * gate * (1.0f + tanhf(inner));
 
-    output[idx] = gelu_val * gate;
+    output[idx] = value * gelu_gate;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void geglu_backward(
@@ -103,15 +104,16 @@ extern ""C"" __global__ __launch_bounds__(256) void geglu_backward(
     float gate = input[outer * fullDim + halfDim + d];
     float grad = grad_output[idx];
 
-    float x3 = value * value * value;
-    float inner = 0.7978845608f * (value + 0.044715f * x3);
+    // #775: out = value * GELU(gate) → d/value = grad*GELU(gate); d/gate = grad*value*GELU'(gate).
+    float g3 = gate * gate * gate;
+    float inner = 0.7978845608f * (gate + 0.044715f * g3);
     float tanh_inner = tanhf(inner);
-    float gelu_val = 0.5f * value * (1.0f + tanh_inner);
+    float gelu_gate = 0.5f * gate * (1.0f + tanh_inner);
     float gelu_deriv = 0.5f * (1.0f + tanh_inner) +
-        0.5f * value * (1.0f - tanh_inner * tanh_inner) * 0.7978845608f * (1.0f + 0.134145f * value * value);
+        0.5f * gate * (1.0f - tanh_inner * tanh_inner) * 0.7978845608f * (1.0f + 0.134145f * gate * gate);
 
-    grad_input[outer * fullDim + d] = grad * gate * gelu_deriv;
-    grad_input[outer * fullDim + halfDim + d] = grad * gelu_val;
+    grad_input[outer * fullDim + d] = grad * gelu_gate;
+    grad_input[outer * fullDim + halfDim + d] = grad * value * gelu_deriv;
 }
 
 // ReGLU: ReLU(value) * gate
@@ -130,7 +132,7 @@ extern ""C"" __global__ __launch_bounds__(256) void reglu_forward(
     float value = input[outer * fullDim + d];
     float gate = input[outer * fullDim + halfDim + d];
 
-    output[idx] = fmaxf(value, 0.0f) * gate;
+    output[idx] = value * fmaxf(gate, 0.0f); // #775: act on gate (see geglu_forward)
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void reglu_backward(
@@ -151,11 +153,12 @@ extern ""C"" __global__ __launch_bounds__(256) void reglu_backward(
     float gate = input[outer * fullDim + halfDim + d];
     float grad = grad_output[idx];
 
-    float relu_val = fmaxf(value, 0.0f);
-    float relu_deriv = (value > 0.0f) ? 1.0f : 0.0f;
+    // #775: out = value * ReLU(gate).
+    float relu_gate = fmaxf(gate, 0.0f);
+    float relu_deriv = (gate > 0.0f) ? 1.0f : 0.0f;
 
-    grad_input[outer * fullDim + d] = grad * gate * relu_deriv;
-    grad_input[outer * fullDim + halfDim + d] = grad * relu_val;
+    grad_input[outer * fullDim + d] = grad * relu_gate;
+    grad_input[outer * fullDim + halfDim + d] = grad * value * relu_deriv;
 }
 
 // SwiGLU: Swish(value) * gate = (value * sigmoid(value)) * gate
@@ -174,10 +177,11 @@ extern ""C"" __global__ __launch_bounds__(256) void swiglu_forward(
     float value = input[outer * fullDim + d];
     float gate = input[outer * fullDim + halfDim + d];
 
-    float sig_val = 1.0f / (1.0f + expf(-value));
-    float swish_val = value * sig_val;
+    // #775: out = value * Swish(gate).
+    float sig_gate = 1.0f / (1.0f + expf(-gate));
+    float swish_gate = gate * sig_gate;
 
-    output[idx] = swish_val * gate;
+    output[idx] = value * swish_gate;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void swiglu_backward(
@@ -198,12 +202,13 @@ extern ""C"" __global__ __launch_bounds__(256) void swiglu_backward(
     float gate = input[outer * fullDim + halfDim + d];
     float grad = grad_output[idx];
 
-    float sig_val = 1.0f / (1.0f + expf(-value));
-    float swish_val = value * sig_val;
-    float swish_deriv = sig_val + value * sig_val * (1.0f - sig_val);
+    // #775: out = value * Swish(gate) → d/value = grad*Swish(gate); d/gate = grad*value*Swish'(gate).
+    float sig_gate = 1.0f / (1.0f + expf(-gate));
+    float swish_gate = gate * sig_gate;
+    float swish_deriv = sig_gate + gate * sig_gate * (1.0f - sig_gate);
 
-    grad_input[outer * fullDim + d] = grad * gate * swish_deriv;
-    grad_input[outer * fullDim + halfDim + d] = grad * swish_val;
+    grad_input[outer * fullDim + d] = grad * swish_gate;
+    grad_input[outer * fullDim + halfDim + d] = grad * value * swish_deriv;
 }
 
 // ============================================================================

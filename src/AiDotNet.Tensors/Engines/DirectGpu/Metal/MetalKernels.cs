@@ -4417,9 +4417,10 @@ kernel void geglu_forward(device const float* input [[buffer(0)]],
     uint outer = gid / halfDim; uint d = gid % halfDim; uint fullDim = halfDim * 2;
     float value = input[outer * fullDim + d];
     float gate = input[outer * fullDim + halfDim + d];
-    float x3 = value * value * value;
-    float gelu = 0.5f * value * (1.0f + tanh(0.7978845608f * (value + 0.044715f * x3)));
-    output[gid] = gelu * gate;
+    // #775: activation on the GATE — out = value * GELU(gate) (was GELU(value)*gate).
+    float g3 = gate * gate * gate;
+    float gelu = 0.5f * gate * (1.0f + tanh(0.7978845608f * (gate + 0.044715f * g3)));
+    output[gid] = value * gelu;
 }
 
 kernel void reglu_forward(device const float* input [[buffer(0)]],
@@ -4432,7 +4433,7 @@ kernel void reglu_forward(device const float* input [[buffer(0)]],
     uint outer = gid / halfDim; uint d = gid % halfDim; uint fullDim = halfDim * 2;
     float value = input[outer * fullDim + d];
     float gate = input[outer * fullDim + halfDim + d];
-    output[gid] = max(value, 0.0f) * gate;
+    output[gid] = value * max(gate, 0.0f); // #775: act on gate
 }
 
 kernel void swiglu_forward(device const float* input [[buffer(0)]],
@@ -4445,8 +4446,8 @@ kernel void swiglu_forward(device const float* input [[buffer(0)]],
     uint outer = gid / halfDim; uint d = gid % halfDim; uint fullDim = halfDim * 2;
     float value = input[outer * fullDim + d];
     float gate = input[outer * fullDim + halfDim + d];
-    float sig = 1.0f / (1.0f + exp(-value));
-    output[gid] = value * sig * gate;
+    float sig = 1.0f / (1.0f + exp(-gate)); // #775: act on gate
+    output[gid] = value * (gate * sig);
 }
 
 kernel void relu_derivative(device const float* input [[buffer(0)]],
