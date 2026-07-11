@@ -23,7 +23,33 @@ public static class OpParityRegistry
         .Concat(IndexComplexAudio()).Concat(NativeAudioBox()).Concat(ScatterSoftmaxMisc()).Concat(ConvPoolLinear())
         .Concat(SpecialAttnNorm()).Concat(SlicePoolTake()).Concat(GridConvBwdLoss()).Concat(SliceScatterMisc())
         .Concat(NormConvBackward()).Concat(StackIndexEmbed()).Concat(FusedLinAffine()).Concat(GluCropSoftmaxBwd())
-        .Concat(MoreBackward()).Concat(AudioFftSplat());
+        .Concat(MoreBackward()).Concat(AudioFftSplat()).Concat(GeometryNerf());
+
+    // Geometry / NeRF: affine-grid, volume-render, spherical harmonics, upsample backward.
+    public static IEnumerable<OpCase> GeometryNerf()
+    {
+        yield return new OpCase("AffineGrid[2,2,3->4,4]", "geometry",
+            e => e.AffineGrid(OpInput.Rand(2500, new[] { 2, 2, 3 }, -1.0, 1.0).F(), 4, 4),
+            e => e.AffineGrid(OpInput.Rand(2500, new[] { 2, 2, 3 }, -1.0, 1.0).D(), 4, 4), ParityTol.Accum(1e-3), opMethod: "AffineGrid");
+        yield return new OpCase("AffineGrid3D[2,3,4->2,2,2]", "geometry",
+            e => e.AffineGrid3D(OpInput.Rand(2501, new[] { 2, 3, 4 }, -1.0, 1.0).F(), 2, 2, 2, false),
+            e => e.AffineGrid3D(OpInput.Rand(2501, new[] { 2, 3, 4 }, -1.0, 1.0).D(), 2, 2, 2, false), ParityTol.Accum(1e-3), opMethod: "AffineGrid3D");
+        yield return new OpCase("VolumeRendering[2,4,3]", "geometry",
+            e => e.VolumeRendering(OpInput.Rand(2502, new[] { 2, 4, 3 }, 0.0, 1.0).F(), OpInput.RandPositive(2503, new[] { 2, 4 }, 0.1, 2.0).F(), OpInput.RandPositive(2504, new[] { 2, 4 }, 0.1, 1.0).F()),
+            e => e.VolumeRendering(OpInput.Rand(2502, new[] { 2, 4, 3 }, 0.0, 1.0).D(), OpInput.RandPositive(2503, new[] { 2, 4 }, 0.1, 2.0).D(), OpInput.RandPositive(2504, new[] { 2, 4 }, 0.1, 1.0).D()), ParityTol.Accum(1e-3), opMethod: "VolumeRendering");
+        // EvaluateSphericalHarmonics left pending: its SH-coefficient tensor layout for a given degree
+        // needs the exact convention (a naive [N,(deg+1)^2*3] shape indexed out of bounds).
+
+        yield return new OpCase("PixelShuffleBackward[1,1,8,8->1,4,4,4]", "shape",
+            e => e.PixelShuffleBackward(OpInput.Rand(2510, new[] { 1, 1, 8, 8 }).F(), new[] { 1, 4, 4, 4 }, 2),
+            e => e.PixelShuffleBackward(OpInput.Rand(2510, new[] { 1, 1, 8, 8 }).D(), new[] { 1, 4, 4, 4 }, 2), ParityTol.Exact, opMethod: "PixelShuffleBackward");
+        yield return new OpCase("UpsampleBackward[1,2,8,8->1,2,4,4]", "shape",
+            e => e.UpsampleBackward(OpInput.Rand(2511, new[] { 1, 2, 8, 8 }).F(), new[] { 1, 2, 4, 4 }, 2, 2),
+            e => e.UpsampleBackward(OpInput.Rand(2511, new[] { 1, 2, 8, 8 }).D(), new[] { 1, 2, 4, 4 }, 2, 2), ParityTol.Accum(1e-3), opMethod: "UpsampleBackward");
+        yield return new OpCase("Upsample3DBackward[1,2,4,4,4->1,2,2,2,2]", "shape",
+            e => e.Upsample3DBackward(OpInput.Rand(2512, new[] { 1, 2, 4, 4, 4 }).F(), new[] { 1, 2, 2, 2, 2 }, 2, 2, 2),
+            e => e.Upsample3DBackward(OpInput.Rand(2512, new[] { 1, 2, 4, 4, 4 }).D(), new[] { 1, 2, 2, 2, 2 }, 2, 2, 2), ParityTol.Accum(1e-3), opMethod: "Upsample3DBackward");
+    }
 
     // Audio (mu-law), FFT, gaussian-splat covariance, gumbel-softmax backward.
     public static IEnumerable<OpCase> AudioFftSplat()
