@@ -137,6 +137,17 @@ public static class OpParityRegistry
                 e => e.GELU(a.F()), e => e.GELU(a.D()), ParityTol.Ulp(256, 2e-5));
         }
         {
+            // GELUInto is the COMPILED / GraphMode training-path GELU kernel (the one #775's
+            // diverging CpuEngine training runs). Deliberately includes near-zero inputs where the
+            // old 2·sigmoid(2z)−1 cancellation corrupted the result. Now unified onto the stable
+            // x·sigmoid kernel, so it must match the eager GELU + oracle tightly.
+            var a = OpInput.Rand(7, new[] { 4, 64 }, -6.0, 6.0);
+            yield return new OpCase("GELUInto[4,64]", "activation",
+                e => { var dst = new Tensor<float>((int[])a.Shape.Clone()); e.GELUInto(dst, a.F()); return dst; },
+                e => { var dst = new Tensor<double>((int[])a.Shape.Clone()); e.GELUInto(dst, a.D()); return dst; },
+                ParityTol.Ulp(256, 2e-5), opMethod: "GELU"); // credits GELU; GELUInto is a void Into-variant
+        }
+        {
             var a = OpInput.Rand(8, new[] { 4, 64 }, -8.0, 8.0);
             yield return new OpCase("Sigmoid[4,64]", "activation",
                 e => e.Sigmoid(a.F()), e => e.Sigmoid(a.D()), ParityTol.Ulp(64, 1e-6));

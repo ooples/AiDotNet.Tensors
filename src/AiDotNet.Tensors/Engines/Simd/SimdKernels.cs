@@ -1672,58 +1672,21 @@ namespace AiDotNet.Tensors.Engines.Simd
                 }
             }
 
-            // Polynomial fallback (no VML): fully fused single-pass, no buffer needed
-            if (Avx.IsSupported && Fma.IsSupported && length >= 32)
-            {
-                var vSqrt2OverPi = Vector256.Create(0.7978845608028654f);
-                var vCoeff = Vector256.Create(0.044715f);
-                var vHalf = Vector256.Create(0.5f);
-                var vOne = Vector256.Create(1.0f);
-                var vTwo = Vector256.Create(2.0f);
-
-                int simdLength = length & ~31;
-                for (; i < simdLength; i += 32)
-                {
-                    for (int k = 0; k < 32; k += 8)
-                    {
-                        var x = Avx.LoadVector256(input + i + k);
-                        var x_cubed = Avx.Multiply(Avx.Multiply(x, x), x);
-                        var inner = Fma.MultiplyAdd(vCoeff, x_cubed, x);
-                        var tanh_arg = Avx.Multiply(vSqrt2OverPi, inner);
-                        var tanh_val = Avx.Subtract(Avx.Multiply(vTwo, FastSigmoid256(Avx.Multiply(vTwo, tanh_arg))), vOne);
-                        Avx.Store(output + i + k, Avx.Multiply(vHalf, Avx.Multiply(x, Avx.Add(vOne, tanh_val))));
-                    }
-                }
-            }
-            if (Avx.IsSupported && Fma.IsSupported && length - i >= 8)
-            {
-                var vSqrt2OverPi = Vector256.Create(0.7978845608028654f);
-                var vCoeff = Vector256.Create(0.044715f);
-                var vHalf = Vector256.Create(0.5f);
-                var vOne = Vector256.Create(1.0f);
-                var vTwo = Vector256.Create(2.0f);
-
-                int simdLength = i + ((length - i) & ~7);
-                for (; i < simdLength; i += 8)
-                {
-                    var x = Avx.LoadVector256(input + i);
-                    var x_cubed = Avx.Multiply(Avx.Multiply(x, x), x);
-                    var inner = Fma.MultiplyAdd(vCoeff, x_cubed, x);
-                    var tanh_arg = Avx.Multiply(vSqrt2OverPi, inner);
-                    var tanh_val = Avx.Subtract(Avx.Multiply(vTwo, FastSigmoid256(Avx.Multiply(vTwo, tanh_arg))), vOne);
-                    Avx.Store(output + i, Avx.Multiply(vHalf, Avx.Multiply(x, Avx.Add(vOne, tanh_val))));
-                }
-            }
 #endif
-            for (; i < length; i++)
-            {
-                float x = input[i];
-                float x3 = x * x * x;
-                float inner = x + 0.044715f * x3;
-                float tanh_arg = 0.7978845608028654f * inner;
-                float tanh_val = MathF.Tanh(tanh_arg);
-                output[i] = 0.5f * x * (1f + tanh_val);
-            }
+            // #775: the previous SIMD path here computed tanh via the identity
+            //   tanh(z) = 2·sigmoid(2z) − 1.
+            // Near z = 0 that subtracts a value ≈1.0 from another ≈1.0 — CATASTROPHIC
+            // CANCELLATION — so small GELU outputs (the ViT flat region) lost most of their
+            // significant bits. This kernel feeds GELUInto, i.e. the COMPILED / GraphMode
+            // training path (what #775's diverging CpuEngine training actually runs), while the
+            // EAGER GELU already used the stable x·sigmoid form (FusedGELUUnsafe, #319) — so the
+            // two CPU GELU paths silently disagreed near zero and only the compiled one drifted.
+            // The CPU-vs-GPU op-parity scaffold flagged GELU as the one ViT-path op with a large
+            // cross-engine delta; a ViT + BCE-with-logits then AMPLIFIES that small forward error
+            // into CPU training divergence. Fix: delegate to the same cancellation-free, vectorized
+            // x·sigmoid kernel the eager path uses — one GELU implementation, no near-zero drift,
+            // no vectorization loss. (Arrays ≥ 500K still take the VML erf-exact path above.)
+            if (i < length) FusedGELUUnsafe(input + i, output + i, length - i);
         }
 
         /// <summary>
