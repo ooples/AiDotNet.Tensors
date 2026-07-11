@@ -24,7 +24,51 @@ public static class OpParityRegistry
         .Concat(SpecialAttnNorm()).Concat(SlicePoolTake()).Concat(GridConvBwdLoss()).Concat(SliceScatterMisc())
         .Concat(NormConvBackward()).Concat(StackIndexEmbed()).Concat(FusedLinAffine()).Concat(GluCropSoftmaxBwd())
         .Concat(MoreBackward()).Concat(AudioFftSplat()).Concat(GeometryNerf()).Concat(FusedRoiLoss())
-        .Concat(Conv3DBoxIou()).Concat(SortConvInterp());
+        .Concat(Conv3DBoxIou()).Concat(SortConvInterp()).Concat(AttentionFused());
+
+    // Attention forward paths + fused batchnorm (eval) + mu-law encoding.
+    public static IEnumerable<OpCase> AttentionFused()
+    {
+        // FlashAttention: q/k/v [batch, heads, seq, headDim] = [1,2,4,8].
+        var fq = OpInput.Rand(2900, new[] { 1, 2, 4, 8 });
+        var fk = OpInput.Rand(2901, new[] { 1, 2, 4, 8 });
+        var fv = OpInput.Rand(2902, new[] { 1, 2, 4, 8 });
+        yield return new OpCase("FlashAttention[1,2,4,8]", "attention",
+            e => e.FlashAttention(fq.F(), fk.F(), fv.F(), null, false, out _, null),
+            e => e.FlashAttention(fq.D(), fk.D(), fv.D(), null, false, out _, null),
+            ParityTol.Accum(1e-3), opMethod: "FlashAttention");
+
+        // GroupedQueryAttention: Q [1,4,4,8], K/V [1,2,4,8], 2 queries per KV head.
+        var gq = OpInput.Rand(2910, new[] { 1, 4, 4, 8 });
+        var gk = OpInput.Rand(2911, new[] { 1, 2, 4, 8 });
+        var gv = OpInput.Rand(2912, new[] { 1, 2, 4, 8 });
+        yield return new OpCase("GroupedQueryAttention[q1,4,4,8;kv1,2,4,8]", "attention",
+            e => e.GroupedQueryAttention(gq.F(), gk.F(), gv.F(), 2, null, false, out _),
+            e => e.GroupedQueryAttention(gq.D(), gk.D(), gv.D(), 2, null, false, out _),
+            ParityTol.Accum(1e-3), opMethod: "GroupedQueryAttention");
+
+        // MultiHeadAttentionForward: input [B,S,dModel] = [2,4,8], projections [8,8], 2 heads.
+        var mhaIn = OpInput.Rand(2920, new[] { 2, 4, 8 });
+        var qw = OpInput.Rand(2921, new[] { 8, 8 });
+        var kw = OpInput.Rand(2922, new[] { 8, 8 });
+        var vw = OpInput.Rand(2923, new[] { 8, 8 });
+        var ow = OpInput.Rand(2924, new[] { 8, 8 });
+        yield return new OpCase("MultiHeadAttentionForward[2,4,8;h2]", "attention",
+            e => e.MultiHeadAttentionForward(mhaIn.F(), qw.F(), kw.F(), vw.F(), ow.F(), 2, null),
+            e => e.MultiHeadAttentionForward(mhaIn.D(), qw.D(), kw.D(), vw.D(), ow.D(), 2, null),
+            ParityTol.Accum(1e-3), opMethod: "MultiHeadAttentionForward");
+
+        // FusedBatchNorm in eval mode (training=false) uses running stats -> deterministic identity-ish.
+        var bnIn = OpInput.Rand(2930, new[] { 2, 4, 4, 4 });
+        var gamma = OpInput.Rand(2931, new[] { 4 });
+        var beta = OpInput.Rand(2932, new[] { 4 });
+        var rMean = OpInput.Rand(2933, new[] { 4 });
+        var rVar = OpInput.RandPositive(2934, new[] { 4 });
+        yield return new OpCase("FusedBatchNorm[2,4,4,4;eval]", "norm",
+            e => e.FusedBatchNorm(bnIn.F(), gamma.F(), beta.F(), rMean.F(), rVar.F(), 1e-5, 0.1, false, FusedActivationType.None, out _, out _),
+            e => e.FusedBatchNorm(bnIn.D(), gamma.D(), beta.D(), rMean.D(), rVar.D(), 1e-5, 0.1, false, FusedActivationType.None, out _, out _),
+            ParityTol.Accum(1e-3), opMethod: "FusedBatchNorm");
+    }
 
     // 1D/transpose conv backward kernels, interpolate, dropout(eval).
     public static IEnumerable<OpCase> SortConvInterp()
