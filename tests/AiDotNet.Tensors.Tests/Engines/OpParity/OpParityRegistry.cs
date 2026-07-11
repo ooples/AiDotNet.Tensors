@@ -22,7 +22,29 @@ public static class OpParityRegistry
         .Concat(ConvIndexLoss()).Concat(MoreMathShape()).Concat(GatedMisc()).Concat(PadDistDiag())
         .Concat(IndexComplexAudio()).Concat(NativeAudioBox()).Concat(ScatterSoftmaxMisc()).Concat(ConvPoolLinear())
         .Concat(SpecialAttnNorm()).Concat(SlicePoolTake()).Concat(GridConvBwdLoss()).Concat(SliceScatterMisc())
-        .Concat(NormConvBackward()).Concat(StackIndexEmbed()).Concat(FusedLinAffine());
+        .Concat(NormConvBackward()).Concat(StackIndexEmbed()).Concat(FusedLinAffine()).Concat(GluCropSoftmaxBwd());
+
+    // GLU-variant backward (validates the gating-half fix), crop/pad backward, softmax-variant backward.
+    public static IEnumerable<OpCase> GluCropSoftmaxBwd()
+    {
+        var inp = OpInput.Rand(2200, new[] { 4, 16 }, -3.0, 3.0);
+        var go = OpInput.Rand(2201, new[] { 4, 8 });
+        yield return new OpCase("GLUBackward[4,16]", "activation-bwd", e => e.GLUBackward(go.F(), inp.F(), -1), e => e.GLUBackward(go.D(), inp.D(), -1), ParityTol.Accum(1e-3), opMethod: "GLUBackward");
+        yield return new OpCase("GeGLUBackward[4,16]", "activation-bwd", e => e.GeGLUBackward(go.F(), inp.F(), -1), e => e.GeGLUBackward(go.D(), inp.D(), -1), ParityTol.Accum(2e-3), opMethod: "GeGLUBackward");
+        yield return new OpCase("SwiGLUBackward[4,16]", "activation-bwd", e => e.SwiGLUBackward(go.F(), inp.F(), -1), e => e.SwiGLUBackward(go.D(), inp.D(), -1), ParityTol.Accum(1e-3), opMethod: "SwiGLUBackward");
+        yield return new OpCase("ReGLUBackward[4,16]", "activation-bwd", e => e.ReGLUBackward(go.F(), inp.F(), -1), e => e.ReGLUBackward(go.D(), inp.D(), -1), ParityTol.Ulp(4, 1e-6), opMethod: "ReGLUBackward");
+
+        yield return new OpCase("CropBackward[1,2,4,4->1,2,8,8]", "shape",
+            e => e.CropBackward(OpInput.Rand(2210, new[] { 1, 2, 4, 4 }).F(), new[] { 1, 2, 8, 8 }, 1, 1),
+            e => e.CropBackward(OpInput.Rand(2210, new[] { 1, 2, 4, 4 }).D(), new[] { 1, 2, 8, 8 }, 1, 1), ParityTol.Exact, opMethod: "CropBackward");
+        yield return new OpCase("PadBackward[1,2,10,10->1,2,8,8]", "shape",
+            e => e.PadBackward(OpInput.Rand(2211, new[] { 1, 2, 10, 10 }).F(), 1, 1, new[] { 1, 2, 8, 8 }),
+            e => e.PadBackward(OpInput.Rand(2211, new[] { 1, 2, 10, 10 }).D(), 1, 1, new[] { 1, 2, 8, 8 }), ParityTol.Exact, opMethod: "PadBackward");
+
+        var lg = OpInput.Rand(2220, new[] { 4, 8 }, -3.0, 3.0);
+        var sgo = OpInput.Rand(2221, new[] { 4, 8 });
+        yield return new OpCase("SparsemaxBackward[4,8]", "activation-bwd", e => e.SparsemaxBackward(sgo.F(), e.Sparsemax(lg.F(), -1), -1), e => e.SparsemaxBackward(sgo.D(), e.Sparsemax(lg.D(), -1), -1), ParityTol.Accum(1e-3), opMethod: "SparsemaxBackward");
+    }
 
     // Fused-linear activation variants + affine batchnorm.
     public static IEnumerable<OpCase> FusedLinAffine()
