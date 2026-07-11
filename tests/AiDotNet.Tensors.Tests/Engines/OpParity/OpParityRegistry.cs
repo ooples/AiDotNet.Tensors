@@ -33,7 +33,27 @@ public static class OpParityRegistry
         .Concat(SpiralBwdPosEnc()).Concat(GroupedDeformBwdMisc()).Concat(MaskedGraphFusedBwd())
         .Concat(AttentionGraphBwd()).Concat(FlashBwdFusedTrilinear()).Concat(TrilinearBwdMhgaGrid())
         .Concat(BceScatterMaskBwd()).Concat(MaxoutSpectral()).Concat(NerfSplatSh())
-        .Concat(ShBwdCtcSpectralBatch());
+        .Concat(ShBwdCtcSpectralBatch()).Concat(MaxPoolBwdAudio());
+
+    // MaxPool 2D/3D backward (indices from WithIndices) + pitch shift.
+    public static IEnumerable<OpCase> MaxPoolBwdAudio()
+    {
+        // 2D: input [1,2,8,8], pool/stride [2,2] -> pooled [1,2,4,4].
+        var in2 = OpInput.Rand(5500, new[] { 1, 2, 8, 8 });
+        var go2 = OpInput.Rand(5501, new[] { 1, 2, 4, 4 });
+        yield return new OpCase("MaxPool2DBackward[1,2,8,8]", "pool",
+            e => { e.MaxPool2DWithIndices(in2.F(), new[] { 2, 2 }, new[] { 2, 2 }, out var idx); return e.MaxPool2DBackward(go2.F(), idx, new[] { 1, 2, 8, 8 }, new[] { 2, 2 }, new[] { 2, 2 }); },
+            e => { e.MaxPool2DWithIndices(in2.D(), new[] { 2, 2 }, new[] { 2, 2 }, out var idx); return e.MaxPool2DBackward(go2.D(), idx, new[] { 1, 2, 8, 8 }, new[] { 2, 2 }, new[] { 2, 2 }); },
+            ParityTol.Exact, opMethod: "MaxPool2DBackward");
+
+        // 3D: input [1,2,4,4,4], pool/stride [2,2,2] -> pooled [1,2,2,2,2].
+        var in3 = OpInput.Rand(5510, new[] { 1, 2, 4, 4, 4 });
+        var go3 = OpInput.Rand(5511, new[] { 1, 2, 2, 2, 2 });
+        yield return new OpCase("MaxPool3DBackward[1,2,4,4,4]", "pool",
+            e => { e.MaxPool3DWithIndices(in3.F(), new[] { 2, 2, 2 }, new[] { 2, 2, 2 }, out var idx); return e.MaxPool3DBackward(go3.F(), idx, new[] { 1, 2, 4, 4, 4 }, new[] { 2, 2, 2 }, new[] { 2, 2, 2 }); },
+            e => { e.MaxPool3DWithIndices(in3.D(), new[] { 2, 2, 2 }, new[] { 2, 2, 2 }, out var idx); return e.MaxPool3DBackward(go3.D(), idx, new[] { 1, 2, 4, 4, 4 }, new[] { 2, 2, 2 }, new[] { 2, 2, 2 }); },
+            ParityTol.Exact, opMethod: "MaxPool3DBackward");
+    }
 
     // SH backward, CTC loss, batched spectral filter.
     public static IEnumerable<OpCase> ShBwdCtcSpectralBatch()
