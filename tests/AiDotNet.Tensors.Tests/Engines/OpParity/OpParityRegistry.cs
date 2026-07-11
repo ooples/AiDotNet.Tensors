@@ -27,7 +27,46 @@ public static class OpParityRegistry
         .Concat(Conv3DBoxIou()).Concat(SortConvInterp()).Concat(AttentionFused())
         .Concat(ScalarShapePad()).Concat(ComplexReal()).Concat(TensorMathBatch())
         .Concat(FusedConvMlp()).Concat(GatherScatterPool()).Concat(SdpaScatterUnique())
-        .Concat(RecurrentScans()).Concat(MoreScansComplex()).Concat(AudioSpectral());
+        .Concat(RecurrentScans()).Concat(MoreScansComplex()).Concat(AudioSpectral())
+        .Concat(ReduceBackwardMisc());
+
+    // Mean-diff, stack, variance/softmax backwards.
+    public static IEnumerable<OpCase> ReduceBackwardMisc()
+    {
+        var t = OpInput.Rand(3900, new[] { 4, 6 });
+        yield return new OpCase("TensorMeanDiff[4,6]", "reduction",
+            e => e.TensorMeanDiff(t.F()), e => e.TensorMeanDiff(t.D()),
+            ParityTol.Ulp(8), opMethod: "TensorMeanDiff");
+
+        var s1 = OpInput.Rand(3901, new[] { 4, 6 });
+        var s2 = OpInput.Rand(3902, new[] { 4, 6 });
+        yield return new OpCase("TensorStackDiff[2x4,6;ax0]", "shape",
+            e => e.TensorStackDiff(new[] { s1.F(), s2.F() }, 0),
+            e => e.TensorStackDiff(new[] { s1.D(), s2.D() }, 0),
+            ParityTol.Exact, opMethod: "TensorStackDiff");
+
+        // Variance backward over axis 1: gradOutput [4], mean [4].
+        var vgo = OpInput.Rand(3910, new[] { 4 });
+        var vin = OpInput.Rand(3911, new[] { 4, 6 });
+        var vmean = OpInput.Rand(3912, new[] { 4 });
+        yield return new OpCase("ReduceVarianceBackward[4,6;ax1]", "reduction",
+            e => e.ReduceVarianceBackward(vgo.F(), vin.F(), vmean.F(), new[] { 1 }),
+            e => e.ReduceVarianceBackward(vgo.D(), vin.D(), vmean.D(), new[] { 1 }),
+            ParityTol.Accum(1e-3), opMethod: "ReduceVarianceBackward");
+
+        // Taylor/spherical softmax backwards [4,8] over last axis.
+        var go = OpInput.Rand(3920, new[] { 4, 8 });
+        var sin = OpInput.Rand(3921, new[] { 4, 8 });
+        var sout = OpInput.Rand(3922, new[] { 4, 8 }, 0.0, 1.0);
+        yield return new OpCase("TaylorSoftmaxBackward[4,8]", "activation",
+            e => e.TaylorSoftmaxBackward(go.F(), sin.F(), sout.F(), 2, -1),
+            e => e.TaylorSoftmaxBackward(go.D(), sin.D(), sout.D(), 2, -1),
+            ParityTol.Accum(1e-3), opMethod: "TaylorSoftmaxBackward");
+        yield return new OpCase("SphericalSoftmaxBackward[4,8]", "activation",
+            e => e.SphericalSoftmaxBackward(go.F(), sin.F(), sout.F(), -1),
+            e => e.SphericalSoftmaxBackward(go.D(), sin.D(), sout.D(), -1),
+            ParityTol.Accum(1e-3), opMethod: "SphericalSoftmaxBackward");
+    }
 
     // FFT-based audio features (MFCC / wideband / mel-spectrogram).
     public static IEnumerable<OpCase> AudioSpectral()
