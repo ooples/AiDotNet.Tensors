@@ -26,7 +26,7 @@ public sealed class OpParityCoverageTests
     public void EveryRegistryCase_NamesARealIEngineOp()
     {
         var inventory = IEngineOpInventory.TensorReturningOps().ToHashSet(StringComparer.Ordinal);
-        foreach (var op in OpParityRegistry.ViTPath())
+        foreach (var op in OpParityRegistry.All())
         {
             Assert.True(inventory.Contains(op.OpMethod),
                 $"OpCase '{op.Name}' claims to cover IEngine op '{op.OpMethod}', which is not a " +
@@ -41,7 +41,7 @@ public sealed class OpParityCoverageTests
     public void FullSurface_CoverageReport()
     {
         var inventory = IEngineOpInventory.TensorReturningOps();
-        var covered = OpParityRegistry.ViTPath()
+        var covered = OpParityRegistry.All()
             .Select(o => o.OpMethod)
             .Distinct(StringComparer.Ordinal)
             .ToHashSet(StringComparer.Ordinal);
@@ -52,7 +52,7 @@ public sealed class OpParityCoverageTests
         Assert.NotEmpty(covered);
         // Coverage floor: keep this at/above the current count so coverage can only grow. Raise it
         // as the registry expands; a drop means an op silently lost its spec.
-        const int coverageFloor = 10;
+        const int coverageFloor = 30;
         Assert.True(covered.Count >= coverageFloor,
             $"Parity op coverage dropped to {covered.Count} distinct IEngine ops (floor {coverageFloor}). " +
             $"An op likely lost its registry spec.");

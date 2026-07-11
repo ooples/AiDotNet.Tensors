@@ -18,10 +18,10 @@ public sealed class OpParityTests
     public OpParityTests(OpParityFixture fx) => _fx = fx;
 
     private static readonly IReadOnlyDictionary<string, OpCase> Cases =
-        OpParityRegistry.ViTPath().ToDictionary(o => o.Name);
+        OpParityRegistry.All().ToDictionary(o => o.Name);
 
     public static IEnumerable<object[]> ForwardCases =>
-        OpParityRegistry.ViTPath().Select(o => new object[] { o.Name });
+        OpParityRegistry.All().Select(o => new object[] { o.Name });
 
     [SkippableTheory]
     [MemberData(nameof(ForwardCases))]

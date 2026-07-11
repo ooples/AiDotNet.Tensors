@@ -7,11 +7,80 @@
 #if !NETFRAMEWORK
 
 using System.Collections.Generic;
+using System.Linq;
+using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Tests.Engines.OpParity;
 
 public static class OpParityRegistry
 {
+    /// <summary>Every registered parity case (the ViT-path localization set + the broad
+    /// elementwise/reduction batch). Tests and the coverage audit run over this.</summary>
+    public static IEnumerable<OpCase> All() => ViTPath().Concat(Elementwise());
+
+    // ---- batch helpers for the uniform op families -------------------------------------------
+    private static string Dims(OpInput i) => string.Join(",", i.Shape);
+
+    /// <summary>Unary elementwise op: Op(tensor).</summary>
+    private static OpCase U(
+        string method, string cat, System.Func<IEngine, Tensor<float>, Tensor<float>> f,
+        System.Func<IEngine, Tensor<double>, Tensor<double>> d, ParityTol tol, OpInput x)
+        => new OpCase($"{method}[{Dims(x)}]", cat, e => f(e, x.F()), e => d(e, x.D()), tol, opMethod: method);
+
+    /// <summary>Binary elementwise op: Op(a, b).</summary>
+    private static OpCase B(
+        string method, string cat, System.Func<IEngine, Tensor<float>, Tensor<float>, Tensor<float>> f,
+        System.Func<IEngine, Tensor<double>, Tensor<double>, Tensor<double>> d, ParityTol tol, OpInput a, OpInput b)
+        => new OpCase($"{method}[{Dims(a)}]", cat, e => f(e, a.F(), b.F()), e => d(e, a.D(), b.D()), tol, opMethod: method);
+
+    public static IEnumerable<OpCase> Elementwise()
+    {
+        var s = new[] { 4, 64 };
+
+        // Bounded-range activations (transcendental → a handful of ULP).
+        var act = OpInput.Rand(200, s, -6.0, 6.0);
+        yield return U("Tanh", "activation", (e, t) => e.Tanh(t), (e, t) => e.Tanh(t), ParityTol.Ulp(16), act);
+        yield return U("ReLU", "activation", (e, t) => e.ReLU(t), (e, t) => e.ReLU(t), ParityTol.Exact, act);
+        yield return U("Mish", "activation", (e, t) => e.Mish(t), (e, t) => e.Mish(t), ParityTol.Ulp(64, 1e-6), act);
+        yield return U("Swish", "activation", (e, t) => e.Swish(t), (e, t) => e.Swish(t), ParityTol.Ulp(64, 1e-6), act);
+        yield return U("Softplus", "activation", (e, t) => e.Softplus(t), (e, t) => e.Softplus(t), ParityTol.Ulp(64, 1e-6), act);
+        yield return U("HardSwish", "activation", (e, t) => e.HardSwish(t), (e, t) => e.HardSwish(t), ParityTol.Ulp(16, 1e-6), act);
+        yield return U("ELU", "activation", (e, t) => e.ELU(t, 1.0), (e, t) => e.ELU(t, 1.0), ParityTol.Ulp(64, 1e-6), act);
+        yield return new OpCase($"LeakyReLU[{Dims(act)}]", "activation",
+            e => e.LeakyReLU(act.F(), 0.1f), e => e.LeakyReLU(act.D(), 0.1), ParityTol.Ulp(4, 1e-6), opMethod: "LeakyReLU");
+
+        // Elementwise math.
+        yield return U("TensorNegate", "arithmetic", (e, t) => e.TensorNegate(t), (e, t) => e.TensorNegate(t), ParityTol.Exact, act);
+        yield return U("TensorAbs", "arithmetic", (e, t) => e.TensorAbs(t), (e, t) => e.TensorAbs(t), ParityTol.Exact, act);
+        yield return U("TensorSquare", "arithmetic", (e, t) => e.TensorSquare(t), (e, t) => e.TensorSquare(t), ParityTol.Ulp(2, 1e-6), act);
+        yield return U("TensorSin", "arithmetic", (e, t) => e.TensorSin(t), (e, t) => e.TensorSin(t), ParityTol.Ulp(64, 1e-6), act);
+        yield return U("TensorCos", "arithmetic", (e, t) => e.TensorCos(t), (e, t) => e.TensorCos(t), ParityTol.Ulp(64, 1e-6), act);
+        yield return U("TensorExp", "arithmetic", (e, t) => e.TensorExp(t), (e, t) => e.TensorExp(t), ParityTol.Ulp(64, 1e-6),
+            OpInput.Rand(201, s, -4.0, 4.0));
+        yield return U("TensorLog", "arithmetic", (e, t) => e.TensorLog(t), (e, t) => e.TensorLog(t), ParityTol.Ulp(64, 1e-6),
+            OpInput.RandPositive(202, s, 0.1, 8.0));
+        yield return U("TensorSqrt", "arithmetic", (e, t) => e.TensorSqrt(t), (e, t) => e.TensorSqrt(t), ParityTol.Ulp(8, 1e-6),
+            OpInput.RandPositive(203, s, 0.01, 8.0));
+
+        // Binary elementwise.
+        var a = OpInput.Rand(210, s);
+        var b = OpInput.Rand(211, s);
+        var bnz = OpInput.Rand(212, s, 0.5, 2.0); // non-zero divisor
+        yield return B("TensorSubtract", "arithmetic", (e, x, y) => e.TensorSubtract(x, y), (e, x, y) => e.TensorSubtract(x, y), ParityTol.Exact, a, b);
+        yield return B("TensorMultiply", "arithmetic", (e, x, y) => e.TensorMultiply(x, y), (e, x, y) => e.TensorMultiply(x, y), ParityTol.Ulp(2, 1e-6), a, b);
+        yield return B("TensorDivide", "arithmetic", (e, x, y) => e.TensorDivide(x, y), (e, x, y) => e.TensorDivide(x, y), ParityTol.Ulp(4, 1e-6), a, bnz);
+
+        // Reductions (summation order differs → relative bound; Max is selection → tight).
+        var red = OpInput.Rand(220, new[] { 4, 32 });
+        yield return new OpCase("ReduceSum[4,32]", "reduction",
+            e => e.ReduceSum(red.F(), null, false), e => e.ReduceSum(red.D(), null, false), ParityTol.Accum(1e-3), opMethod: "ReduceSum");
+        yield return new OpCase("ReduceMean[4,32;ax1]", "reduction",
+            e => e.ReduceMean(red.F(), new[] { 1 }, false), e => e.ReduceMean(red.D(), new[] { 1 }, false), ParityTol.Accum(1e-3), opMethod: "ReduceMean");
+        yield return new OpCase("ReduceMax[4,32;ax1]", "reduction",
+            e => e.ReduceMax(red.F(), new[] { 1 }, false, out _), e => e.ReduceMax(red.D(), new[] { 1 }, false, out _), ParityTol.Ulp(0, 1e-6), opMethod: "ReduceMax");
+    }
+
     public static IEnumerable<OpCase> ViTPath()
     {
         // --- Elementwise, must be bit-identical (identical scalar math, no accumulation) ---
