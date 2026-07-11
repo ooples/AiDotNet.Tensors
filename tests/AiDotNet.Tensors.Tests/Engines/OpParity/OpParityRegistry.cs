@@ -20,7 +20,34 @@ public static class OpParityRegistry
     public static IEnumerable<OpCase> All() => ViTPath().Concat(Elementwise()).Concat(Elementwise2())
         .Concat(BinaryScalarShape()).Concat(ReduceNormPool()).Concat(BackwardMatmul())
         .Concat(ConvIndexLoss()).Concat(MoreMathShape()).Concat(GatedMisc()).Concat(PadDistDiag())
-        .Concat(IndexComplexAudio());
+        .Concat(IndexComplexAudio()).Concat(NativeAudioBox());
+
+    // Native math, audio features, and bounding-box ops.
+    public static IEnumerable<OpCase> NativeAudioBox()
+    {
+        var s = new[] { 4, 8 };
+        var x = OpInput.Rand(1200, s, -4.0, 4.0);
+        yield return U("NativeExp", "arithmetic", (e, t) => e.NativeExp(t), (e, t) => e.NativeExp(t), ParityTol.Ulp(64, 1e-6), x);
+        yield return U("NativeTanh", "arithmetic", (e, t) => e.NativeTanh(t), (e, t) => e.NativeTanh(t), ParityTol.Ulp(16, 1e-6), x);
+        yield return B("NativeAtan2", "arithmetic", (e, u, v) => e.NativeAtan2(u, v), (e, u, v) => e.NativeAtan2(u, v), ParityTol.Ulp(64, 1e-6), x, OpInput.Rand(1201, s));
+        yield return U("NativeNormalizeRows", "norm", (e, t) => e.NativeNormalizeRows(t, false), (e, t) => e.NativeNormalizeRows(t, false), ParityTol.Accum(1e-3), OpInput.Rand(1202, s));
+
+        yield return U("AmplitudeToDB", "audio", (e, t) => e.AmplitudeToDB(t, 1e-10f, null), (e, t) => e.AmplitudeToDB(t, 1e-10f, null), ParityTol.Ulp(256, 1e-4), OpInput.RandPositive(1210, s, 0.1, 4.0));
+        yield return U("ComputeDeltas", "audio", (e, t) => e.ComputeDeltas(t, 5), (e, t) => e.ComputeDeltas(t, 5), ParityTol.Accum(1e-3), OpInput.Rand(1211, new[] { 4, 16 }));
+        yield return new OpCase("CreateWindow[hann;16]", "audio", e => e.CreateWindow<float>("hann", 16), e => e.CreateWindow<double>("hann", 16), ParityTol.Ulp(64, 1e-6), opMethod: "CreateWindow");
+
+        // Bounding boxes [x1,y1,x2,y2] with positive extent.
+        var boxA = OpInput.From(new double[] { 0, 0, 2, 2, 1, 1, 3, 4, 0, 1, 5, 3 }, new[] { 3, 4 });
+        var boxB = OpInput.From(new double[] { 0, 0, 2, 3, 2, 2, 4, 5 }, new[] { 2, 4 });
+        yield return new OpCase("BoxArea[3,4]", "box", e => e.BoxArea(boxA.F()), e => e.BoxArea(boxA.D()), ParityTol.Ulp(4, 1e-6), opMethod: "BoxArea");
+        yield return new OpCase("BoxIou[3,4x2,4]", "box", e => e.BoxIou(boxA.F(), boxB.F()), e => e.BoxIou(boxA.D(), boxB.D()), ParityTol.Accum(1e-3), opMethod: "BoxIou");
+        yield return new OpCase("GeneralizedBoxIou[3,4x2,4]", "box", e => e.GeneralizedBoxIou(boxA.F(), boxB.F()), e => e.GeneralizedBoxIou(boxA.D(), boxB.D()), ParityTol.Accum(1e-3), opMethod: "GeneralizedBoxIou");
+
+        // Distances / kernels.
+        yield return B("PairwiseDistance", "reduction", (e, u, v) => e.PairwiseDistance(u, v), (e, u, v) => e.PairwiseDistance(u, v), ParityTol.Accum(1e-3), OpInput.Rand(1220, s), OpInput.Rand(1221, s));
+        yield return B("PairwiseDistanceSquared", "reduction", (e, u, v) => e.PairwiseDistanceSquared(u, v), (e, u, v) => e.PairwiseDistanceSquared(u, v), ParityTol.Accum(1e-3), OpInput.Rand(1222, s), OpInput.Rand(1223, s));
+        yield return new OpCase("RBFKernel[4,8;c3]", "kernel", e => e.RBFKernel(OpInput.Rand(1230, s).F(), OpInput.Rand(1231, new[] { 3, 8 }).F(), OpInput.Rand(1232, new[] { 3 }, 0.5, 1.5).F()), e => e.RBFKernel(OpInput.Rand(1230, s).D(), OpInput.Rand(1231, new[] { 3, 8 }).D(), OpInput.Rand(1232, new[] { 3 }, 0.5, 1.5).D()), ParityTol.Accum(1e-3), opMethod: "RBFKernel");
+    }
 
     // Gather/scatter (int-index), complex-magnitude, histogram, and audio resample.
     public static IEnumerable<OpCase> IndexComplexAudio()
