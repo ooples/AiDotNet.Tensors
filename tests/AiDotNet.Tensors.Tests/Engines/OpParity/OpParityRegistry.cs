@@ -21,7 +21,41 @@ public static class OpParityRegistry
         .Concat(BinaryScalarShape()).Concat(ReduceNormPool()).Concat(BackwardMatmul())
         .Concat(ConvIndexLoss()).Concat(MoreMathShape()).Concat(GatedMisc()).Concat(PadDistDiag())
         .Concat(IndexComplexAudio()).Concat(NativeAudioBox()).Concat(ScatterSoftmaxMisc()).Concat(ConvPoolLinear())
-        .Concat(SpecialAttnNorm());
+        .Concat(SpecialAttnNorm()).Concat(SlicePoolTake());
+
+    // 1D pools, permute/slice/take, index-add, Tensor* pool/conv variants.
+    public static IEnumerable<OpCase> SlicePoolTake()
+    {
+        var seq = OpInput.Rand(1600, new[] { 1, 4, 16 });
+        yield return new OpCase("TensorAvgPool1D[1,4,16;k2s2]", "pool", e => e.TensorAvgPool1D(seq.F(), 2, 2), e => e.TensorAvgPool1D(seq.D(), 2, 2), ParityTol.Accum(1e-3), opMethod: "TensorAvgPool1D");
+        yield return new OpCase("TensorMaxPool1D[1,4,16;k2s2]", "pool", e => e.TensorMaxPool1D(seq.F(), 2, 2), e => e.TensorMaxPool1D(seq.D(), 2, 2), ParityTol.Exact, opMethod: "TensorMaxPool1D");
+
+        var t3 = OpInput.Rand(1601, new[] { 2, 3, 4 });
+        yield return new OpCase("TensorPermute[2,3,4;201]", "shape", e => e.TensorPermute(t3.F(), new[] { 2, 0, 1 }), e => e.TensorPermute(t3.D(), new[] { 2, 0, 1 }), ParityTol.Exact, opMethod: "TensorPermute");
+        var m = OpInput.Rand(1602, new[] { 4, 8 });
+        yield return new OpCase("TensorSlice[4,8;s1,2;l2,4]", "shape", e => e.TensorSlice(m.F(), new[] { 1, 2 }, new[] { 2, 4 }), e => e.TensorSlice(m.D(), new[] { 1, 2 }, new[] { 2, 4 }), ParityTol.Exact, opMethod: "TensorSlice");
+        yield return new OpCase("TensorSliceAxis[4,8;ax0,i1]", "shape", e => e.TensorSliceAxis(m.F(), 0, 1), e => e.TensorSliceAxis(m.D(), 0, 1), ParityTol.Exact, opMethod: "TensorSliceAxis");
+
+        yield return new OpCase("TensorTake[4,8;idx5]", "index",
+            e => e.TensorTake(m.F(), new Tensor<int>(new[] { 0, 7, 15, 20, 31 }, new[] { 5 })),
+            e => e.TensorTake(m.D(), new Tensor<int>(new[] { 0, 7, 15, 20, 31 }, new[] { 5 })), ParityTol.Exact, opMethod: "TensorTake");
+        {
+            var tad = new int[32]; for (int i = 0; i < 32; i++) tad[i] = i % 8;
+            yield return new OpCase("TensorTakeAlongDim[4,8;d1]", "index",
+                e => e.TensorTakeAlongDim(m.F(), new Tensor<int>((int[])tad.Clone(), new[] { 4, 8 }), 1),
+                e => e.TensorTakeAlongDim(m.D(), new Tensor<int>((int[])tad.Clone(), new[] { 4, 8 }), 1), ParityTol.Exact, opMethod: "TensorTakeAlongDim");
+        }
+        yield return new OpCase("TensorIndexAdd[4,8;ax0]", "index",
+            e => e.TensorIndexAdd(m.F(), 0, new Tensor<int>(new[] { 0, 2 }, new[] { 2 }), OpInput.Rand(1603, new[] { 2, 8 }).F()),
+            e => e.TensorIndexAdd(m.D(), 0, new Tensor<int>(new[] { 0, 2 }, new[] { 2 }), OpInput.Rand(1603, new[] { 2, 8 }).D()), ParityTol.Ulp(4, 1e-6), opMethod: "TensorIndexAdd");
+
+        var pool = OpInput.Rand(1610, new[] { 1, 2, 8, 8 });
+        yield return new OpCase("TensorMaxPool2D[1,2,8,8;k2]", "pool", e => e.TensorMaxPool2D(pool.F(), 2), e => e.TensorMaxPool2D(pool.D(), 2), ParityTol.Exact, opMethod: "TensorMaxPool2D");
+        yield return new OpCase("TensorAvgPool2D[1,2,8,8;k2]", "pool", e => e.TensorAvgPool2D(pool.F(), 2), e => e.TensorAvgPool2D(pool.D(), 2), ParityTol.Accum(1e-3), opMethod: "TensorAvgPool2D");
+        yield return new OpCase("TensorConv2D[1,3,8,8;k4,3,3,3]", "conv",
+            e => e.TensorConv2D(OpInput.Rand(1611, new[] { 1, 3, 8, 8 }).F(), OpInput.Rand(1612, new[] { 4, 3, 3, 3 }).F(), 1, 0, 1),
+            e => e.TensorConv2D(OpInput.Rand(1611, new[] { 1, 3, 8, 8 }).D(), OpInput.Rand(1612, new[] { 4, 3, 3, 3 }).D(), 1, 0, 1), ParityTol.Accum(1e-3), opMethod: "TensorConv2D");
+    }
 
     // Special functions, attention, batchnorm.
     public static IEnumerable<OpCase> SpecialAttnNorm()
