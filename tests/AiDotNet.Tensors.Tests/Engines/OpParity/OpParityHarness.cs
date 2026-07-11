@@ -99,6 +99,13 @@ public static class OpParityHarness
             return;
         }
 
+        if (op.GpuUnsafe)
+        {
+            fx.Record($"{op.Name}:forward\t{op.Category}\tGPU-UNSAFE\t-\t-\t-");
+            Skip.If(true, $"GPU-UNSAFE ({op.Name} forward): {op.KnownDivergence ?? "GPU kernel crashes/poisons the host"}. GPU execution skipped so it can't crash the run.");
+            return;
+        }
+
         var gpu = fx.Gpu!;
 
         float[] cpuF = op.RunFloat(fx.Cpu).ToArray();
@@ -118,6 +125,13 @@ public static class OpParityHarness
             if (fx.RequireGpu)
                 throw new InvalidOperationException($"{op.Name}: GPU required but unavailable.", fx.GpuInitError);
             Skip.If(true, "No DirectGpu backend available.");
+            return;
+        }
+
+        if (op.GpuUnsafe)
+        {
+            fx.Record($"{op.Name}:backward\t{op.Category}\tGPU-UNSAFE\t-\t-\t-");
+            Skip.If(true, $"GPU-UNSAFE ({op.Name} backward): {op.KnownDivergence ?? "GPU kernel crashes/poisons the host"}. GPU execution skipped.");
             return;
         }
 

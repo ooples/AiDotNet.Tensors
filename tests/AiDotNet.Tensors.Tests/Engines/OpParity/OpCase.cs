@@ -100,6 +100,15 @@ public sealed class OpCase
     /// removing the marker, so the fix is noticed. Keeps CI green without hiding the finding.</summary>
     public string? KnownDivergence { get; init; }
 
+    /// <summary>Set when the op's GPU kernel is not just numerically divergent but actively UNSAFE —
+    /// it crashes / hangs the host process or corrupts GPU state for subsequent ops (e.g. an OpenCL
+    /// kernel that over-allocates private memory and errors the command queue). Unlike
+    /// <see cref="KnownDivergence"/>, which still executes both engines before skipping, a GpuUnsafe
+    /// op is SKIPPED before the GPU is ever touched, so it can't poison the run. Records the finding
+    /// (visible in the report) without executing the crashing kernel. Requires <see cref="KnownDivergence"/>
+    /// to carry the reason.</summary>
+    public bool GpuUnsafe { get; init; }
+
     public OpCase(
         string name, string category,
         Func<IEngine, Tensor<float>> runFloat,

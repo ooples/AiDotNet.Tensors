@@ -26,7 +26,81 @@ public static class OpParityRegistry
         .Concat(MoreBackward()).Concat(AudioFftSplat()).Concat(GeometryNerf()).Concat(FusedRoiLoss())
         .Concat(Conv3DBoxIou()).Concat(SortConvInterp()).Concat(AttentionFused())
         .Concat(ScalarShapePad()).Concat(ComplexReal()).Concat(TensorMathBatch())
-        .Concat(FusedConvMlp()).Concat(GatherScatterPool()).Concat(SdpaScatterUnique());
+        .Concat(FusedConvMlp()).Concat(GatherScatterPool()).Concat(SdpaScatterUnique())
+        .Concat(RecurrentScans());
+
+    // Linear-attention / SSM / RNN sequence-scan forwards (batch=2, seq=4, dim=6).
+    public static IEnumerable<OpCase> RecurrentScans()
+    {
+        const int B = 2, S = 4, D = 6, ST = 3, H = 2;
+        var seqShape = new[] { B, S, D };
+
+        // Mamba selective scan: x/delta [B,S,D], aLog [D,ST], b/c [B,S,ST], d [D].
+        var mx = OpInput.Rand(3600, seqShape);
+        var mdelta = OpInput.RandPositive(3601, seqShape, 0.1, 1.0);
+        var maLog = OpInput.Rand(3602, new[] { D, ST });
+        var mb = OpInput.Rand(3603, new[] { B, S, ST });
+        var mc = OpInput.Rand(3604, new[] { B, S, ST });
+        var md = OpInput.Rand(3605, new[] { D });
+        // FOUND (GPU-unsafe): the OpenCL mamba_selective_scan_forward kernel allocates two private
+        // float[256] arrays per work-item; on this device the launch errors and poisons the OpenCL
+        // command queue so a LATER unrelated GPU op crashes the host process. Passes in isolation,
+        // crashes the full run. Skipped before GPU execution until the kernel's private-memory use
+        // is bounded to the actual stateDim.
+        yield return new OpCase("MambaSelectiveScanForward[2,4,6]", "scan",
+            e => e.MambaSelectiveScanForward(mx.F(), mdelta.F(), maLog.F(), mb.F(), mc.F(), md.F()),
+            e => e.MambaSelectiveScanForward(mx.D(), mdelta.D(), maLog.D(), mb.D(), mc.D(), md.D()),
+            ParityTol.Accum(1e-3), opMethod: "MambaSelectiveScanForward")
+        { GpuUnsafe = true, KnownDivergence = "OpenCL mamba kernel over-allocates private memory -> command-queue error crashes a later GPU op." };
+        // Mamba2 SSD: delta [B,S,H], aLog/D per-head [H], shared B/C [B,S,ST].
+        var m2delta = OpInput.RandPositive(3606, new[] { B, S, H }, 0.1, 1.0);
+        var m2aLog = OpInput.Rand(3607, new[] { H });
+        var m2d = OpInput.Rand(3608, new[] { H });
+        yield return new OpCase("Mamba2SsdScanForward[2,4,6;h2]", "scan",
+            e => e.Mamba2SsdScanForward(mx.F(), m2delta.F(), m2aLog.F(), mb.F(), mc.F(), m2d.F(), H),
+            e => e.Mamba2SsdScanForward(mx.D(), m2delta.D(), m2aLog.D(), mb.D(), mc.D(), m2d.D(), H),
+            ParityTol.Accum(1e-3), opMethod: "Mamba2SsdScanForward");
+
+        // GLA: q/k/v [B,S,D], gate [B,S,H] in (0,1).
+        var gq = OpInput.Rand(3610, seqShape);
+        var gk = OpInput.Rand(3611, seqShape);
+        var gv = OpInput.Rand(3612, seqShape);
+        var gg = OpInput.Rand(3613, new[] { B, S, H }, 0.0, 1.0);
+        yield return new OpCase("GlaScanForward[2,4,6;h2]", "scan",
+            e => e.GlaScanForward(gq.F(), gk.F(), gv.F(), gg.F(), H),
+            e => e.GlaScanForward(gq.D(), gk.D(), gv.D(), gg.D(), H),
+            ParityTol.Accum(1e-3), opMethod: "GlaScanForward");
+
+        // RWKV-4 WKV: r/k/v [B,S,D], timeDecay/timeFirst [D].
+        var rr = OpInput.Rand(3620, seqShape);
+        var rk = OpInput.Rand(3621, seqShape);
+        var rv = OpInput.Rand(3622, seqShape);
+        var td = OpInput.Rand(3623, new[] { D }, 0.1, 0.9);
+        var tf = OpInput.Rand(3624, new[] { D }, 0.1, 0.9);
+        yield return new OpCase("Rwkv4WkvForward[2,4,6]", "scan",
+            e => e.Rwkv4WkvForward(rr.F(), rk.F(), rv.F(), td.F(), tf.F()),
+            e => e.Rwkv4WkvForward(rr.D(), rk.D(), rv.D(), td.D(), tf.D()),
+            ParityTol.Accum(1e-3), opMethod: "Rwkv4WkvForward");
+
+        // RG-LRU: value [B,S,D], recGate/inpGate [B,S,D] in (0,1), decay [D] in (0,1).
+        var lv = OpInput.Rand(3630, seqShape);
+        var lrg = OpInput.Rand(3631, seqShape, 0.0, 1.0);
+        var lig = OpInput.Rand(3632, seqShape, 0.0, 1.0);
+        var ldec = OpInput.Rand(3633, new[] { D }, 0.5, 0.95);
+        yield return new OpCase("RgLruScanForward[2,4,6]", "scan",
+            e => e.RgLruScanForward(lv.F(), lrg.F(), lig.F(), ldec.F()),
+            e => e.RgLruScanForward(lv.D(), lrg.D(), lig.D(), ldec.D()),
+            ParityTol.Accum(1e-3), opMethod: "RgLruScanForward");
+
+        // LSTM sequence: input [B,S,inF=8], wIh [4*hid,inF], wHh [4*hid,hid], hid=4.
+        var lstmIn = OpInput.Rand(3640, new[] { B, S, 8 });
+        var wIh = OpInput.Rand(3641, new[] { 16, 8 });
+        var wHh = OpInput.Rand(3642, new[] { 16, 4 });
+        yield return new OpCase("LstmSequenceForward[2,4,8;hid4]", "scan",
+            e => e.LstmSequenceForward(lstmIn.F(), null, null, wIh.F(), wHh.F(), null, null, false),
+            e => e.LstmSequenceForward(lstmIn.D(), null, null, wIh.D(), wHh.D(), null, null, false),
+            ParityTol.Accum(1e-3), opMethod: "LstmSequenceForward");
+    }
 
     // Scaled-dot-product attention, scatter-max (all outputs covered), unique.
     public static IEnumerable<OpCase> SdpaScatterUnique()
