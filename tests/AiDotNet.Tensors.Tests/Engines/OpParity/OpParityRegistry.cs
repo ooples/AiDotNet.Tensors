@@ -19,7 +19,36 @@ public static class OpParityRegistry
     /// elementwise/reduction batch). Tests and the coverage audit run over this.</summary>
     public static IEnumerable<OpCase> All() => ViTPath().Concat(Elementwise()).Concat(Elementwise2())
         .Concat(BinaryScalarShape()).Concat(ReduceNormPool()).Concat(BackwardMatmul())
-        .Concat(ConvIndexLoss()).Concat(MoreMathShape());
+        .Concat(ConvIndexLoss()).Concat(MoreMathShape()).Concat(GatedMisc());
+
+    // Gated activations, softmax variants, one-hot/eye, upsample/pixelshuffle, cosine-sim, stopgrad.
+    public static IEnumerable<OpCase> GatedMisc()
+    {
+        var glu = OpInput.Rand(900, new[] { 4, 16 });
+        yield return new OpCase("GLU[4,16]", "activation", e => e.GLU(glu.F(), -1), e => e.GLU(glu.D(), -1), ParityTol.Ulp(16, 1e-6), opMethod: "GLU");
+        yield return new OpCase("GeGLU[4,16]", "activation", e => e.GeGLU(glu.F(), -1), e => e.GeGLU(glu.D(), -1), ParityTol.Ulp(256, 2e-5), opMethod: "GeGLU");
+        yield return new OpCase("SwiGLU[4,16]", "activation", e => e.SwiGLU(glu.F(), -1), e => e.SwiGLU(glu.D(), -1), ParityTol.Ulp(64, 1e-6), opMethod: "SwiGLU");
+        yield return new OpCase("ReGLU[4,16]", "activation", e => e.ReGLU(glu.F(), -1), e => e.ReGLU(glu.D(), -1), ParityTol.Ulp(2, 1e-6), opMethod: "ReGLU");
+
+        var sm = OpInput.Rand(901, new[] { 4, 16 }, -4.0, 4.0);
+        yield return new OpCase("Sparsemax[4,16]", "activation", e => e.Sparsemax(sm.F(), -1), e => e.Sparsemax(sm.D(), -1), ParityTol.Accum(1e-3), opMethod: "Sparsemax");
+        yield return new OpCase("TaylorSoftmax[4,16]", "activation", e => e.TaylorSoftmax(sm.F(), 2, -1), e => e.TaylorSoftmax(sm.D(), 2, -1), ParityTol.Accum(1e-3), opMethod: "TaylorSoftmax");
+
+        yield return new OpCase("TensorOneHot[idx4;d5]", "index",
+            e => e.TensorOneHot<float>(new Tensor<int>(new[] { 0, 3, 1, 4 }, new[] { 4 }), 5),
+            e => e.TensorOneHot<double>(new Tensor<int>(new[] { 0, 3, 1, 4 }, new[] { 4 }), 5), ParityTol.Exact, opMethod: "TensorOneHot");
+        yield return new OpCase("TensorEye[5]", "shape", e => e.TensorEye<float>(5), e => e.TensorEye<double>(5), ParityTol.Exact, opMethod: "TensorEye");
+
+        var img = OpInput.Rand(902, new[] { 1, 2, 4, 4 });
+        yield return new OpCase("Upsample[1,2,4,4;2x2]", "shape", e => e.Upsample(img.F(), 2, 2), e => e.Upsample(img.D(), 2, 2), ParityTol.Exact, opMethod: "Upsample");
+        var ps = OpInput.Rand(903, new[] { 1, 4, 4, 4 });
+        yield return new OpCase("PixelShuffle[1,4,4,4;2]", "shape", e => e.PixelShuffle(ps.F(), 2), e => e.PixelShuffle(ps.D(), 2), ParityTol.Exact, opMethod: "PixelShuffle");
+
+        var cx = OpInput.Rand(904, new[] { 4, 8 });
+        var cy = OpInput.Rand(905, new[] { 4, 8 });
+        yield return new OpCase("TensorCosineSimilarity[4,8]", "reduction", e => e.TensorCosineSimilarity(cx.F(), cy.F(), -1, 1e-8), e => e.TensorCosineSimilarity(cx.D(), cy.D(), -1, 1e-8), ParityTol.Accum(1e-3), opMethod: "TensorCosineSimilarity");
+        yield return U("StopGradient", "shape", (e, t) => e.StopGradient(t), (e, t) => e.StopGradient(t), ParityTol.Exact, OpInput.Rand(906, new[] { 4, 64 }));
+    }
 
     // More binary/scalar math, unary special functions, shape movement, and cumulative ops.
     public static IEnumerable<OpCase> MoreMathShape()
