@@ -26,7 +26,45 @@ public static class OpParityRegistry
         .Concat(MoreBackward()).Concat(AudioFftSplat()).Concat(GeometryNerf()).Concat(FusedRoiLoss())
         .Concat(Conv3DBoxIou()).Concat(SortConvInterp()).Concat(AttentionFused())
         .Concat(ScalarShapePad()).Concat(ComplexReal()).Concat(TensorMathBatch())
-        .Concat(FusedConvMlp());
+        .Concat(FusedConvMlp()).Concat(GatherScatterPool());
+
+    // Gather/scatter with explicit int indices + max-pool-with-indices.
+    public static IEnumerable<OpCase> GatherScatterPool()
+    {
+        var src = OpInput.Rand(3400, new[] { 4, 6 });
+        // Per-row distinct column indices (axis 1) so scatter is order-independent/deterministic.
+        var gIdx = new int[] { 0, 2, 4, 1, 3, 5, 0, 2, 5, 1, 3, 4 };
+        yield return new OpCase("Gather[4,6;idx4,3;axis1]", "index",
+            e => e.Gather(src.F(), new Tensor<int>((int[])gIdx.Clone(), new[] { 4, 3 }), 1),
+            e => e.Gather(src.D(), new Tensor<int>((int[])gIdx.Clone(), new[] { 4, 3 }), 1),
+            ParityTol.Exact, opMethod: "Gather");
+
+        var dest = OpInput.Rand(3410, new[] { 4, 6 });
+        var upd = OpInput.Rand(3411, new[] { 4, 3 });
+        yield return new OpCase("TensorScatter[4,6;idx4,3;axis1]", "index",
+            e => e.TensorScatter(dest.F(), new Tensor<int>((int[])gIdx.Clone(), new[] { 4, 3 }), upd.F(), 1),
+            e => e.TensorScatter(dest.D(), new Tensor<int>((int[])gIdx.Clone(), new[] { 4, 3 }), upd.D(), 1),
+            ParityTol.Exact, opMethod: "TensorScatter");
+        // index_add semantics: 1-D indices select rows (axis 0); distinct rows -> deterministic.
+        var addUpd = OpInput.Rand(3412, new[] { 3, 6 });
+        var addIdx = new int[] { 0, 2, 3 };
+        yield return new OpCase("TensorScatterAdd[4,6;idx3;axis0]", "index",
+            e => e.TensorScatterAdd(dest.F(), new Tensor<int>((int[])addIdx.Clone(), new[] { 3 }), addUpd.F(), 0),
+            e => e.TensorScatterAdd(dest.D(), new Tensor<int>((int[])addIdx.Clone(), new[] { 3 }), addUpd.D(), 0),
+            ParityTol.Ulp(4), opMethod: "TensorScatterAdd");
+
+        var selIdx = new int[] { 0, 2, 3 };
+        yield return new OpCase("TensorIndexSelectDiff[4,6;idx3;axis0]", "index",
+            e => e.TensorIndexSelectDiff(src.F(), new Tensor<int>((int[])selIdx.Clone(), new[] { 3 }), 0),
+            e => e.TensorIndexSelectDiff(src.D(), new Tensor<int>((int[])selIdx.Clone(), new[] { 3 }), 0),
+            ParityTol.Exact, opMethod: "TensorIndexSelectDiff");
+
+        var poolIn = OpInput.Rand(3420, new[] { 1, 2, 8, 8 });
+        yield return new OpCase("MaxPool2DWithIndices[1,2,8,8;2x2]", "pool",
+            e => e.MaxPool2DWithIndices(poolIn.F(), new[] { 2, 2 }, new[] { 2, 2 }, out _),
+            e => e.MaxPool2DWithIndices(poolIn.D(), new[] { 2, 2 }, new[] { 2, 2 }, out _),
+            ParityTol.Exact, opMethod: "MaxPool2DWithIndices");
+    }
 
     // Fused conv2d/3d/transpose, convT3d backward, mel filterbank, MLP forward.
     public static IEnumerable<OpCase> FusedConvMlp()
