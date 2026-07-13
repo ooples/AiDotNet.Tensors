@@ -2779,4 +2779,37 @@ public partial class DirectGpuTensorEngine
         }
         catch { return base.MaxPool3D(input, poolSize, stride, padding); }
     }
+
+    /// <inheritdoc/>
+    Tensor<T> IEngine.ScaledDotProductAttention<T>(Tensor<T> query, Tensor<T> key, Tensor<T> value,
+        Tensor<bool>? mask, double? scale, out Tensor<T> attentionWeights)
+    {
+        // GPU SDPA kernel: self-attention [batch, numHeads, seqLen, headDim], no mask. Anything else
+        // (tape/graph, non-float, masked, cross-attention with differing seqLen) defers to the base.
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+            || query.Rank != 4 || key.Rank != 4 || value.Rank != 4 || mask is not null || !TryGetBackend(out var backend))
+            return base.ScaledDotProductAttention(query, key, value, mask, scale, out attentionWeights);
+        try
+        {
+            int batch = query.Shape._dims[0], numHeads = query.Shape._dims[1], seqLen = query.Shape._dims[2], headDim = query.Shape._dims[3];
+            if (key.Shape._dims[0] != batch || key.Shape._dims[1] != numHeads || key.Shape._dims[2] != seqLen || key.Shape._dims[3] != headDim
+                || value.Shape._dims[0] != batch || value.Shape._dims[1] != numHeads || value.Shape._dims[2] != seqLen || value.Shape._dims[3] != headDim)
+                return base.ScaledDotProductAttention(query, key, value, mask, scale, out attentionWeights);
+            float sc = (float)(scale ?? (1.0 / System.Math.Sqrt(headDim)));
+            int outLen = batch * numHeads * seqLen * headDim;
+            int awLen = batch * numHeads * seqLen * seqLen;
+            using var qB = GetOrAllocateBuffer(backend, query);
+            using var kB = GetOrAllocateBuffer(backend, key);
+            using var vB = GetOrAllocateBuffer(backend, value);
+            using var outB = AllocateOutputBuffer(backend, outLen);
+            using var awB = AllocateOutputBuffer(backend, awLen);
+            backend.ScaledDotProductAttention(qB.Buffer, kB.Buffer, vB.Buffer, outB.Buffer, awB.Buffer, null,
+                batch, numHeads, seqLen, headDim, sc, false);
+            float[] awArr = backend.DownloadBuffer(awB.Buffer);
+            float[] outArr = backend.DownloadBuffer(outB.Buffer);
+            attentionWeights = new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(awArr), new[] { batch, numHeads, seqLen, seqLen });
+            return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(outArr), new[] { batch, numHeads, seqLen, headDim });
+        }
+        catch { return base.ScaledDotProductAttention(query, key, value, mask, scale, out attentionWeights); }
+    }
 }
