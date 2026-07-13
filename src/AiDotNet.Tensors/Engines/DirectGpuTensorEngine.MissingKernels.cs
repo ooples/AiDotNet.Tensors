@@ -2946,4 +2946,39 @@ public partial class DirectGpuTensorEngine
         var variance = ((IEngine)this).ReduceVariance(input, axes, keepDims);
         return TensorLog(TensorAddScalar(variance, numOps.FromDouble(epsilon)));
     }
+
+    // #775: order-2 Taylor softmax = normalize(1 + s + s^2/2) along `axis`, s = x - max(x). Only order 2
+    // is accelerated: its polynomial 0.5*(s+1)^2 + 0.5 >= 0.5 > 0, so the axis-sum is strictly positive
+    // and CpuEngine's sumExp==0 fallback is provably dead — matching the CPU value under Accum(1e-3).
+    // Other orders (polynomial may vanish/negate) and tape/GraphMode defer to base. The per-row
+    // max/sum broadcast runs on the host (deterministic); the poly + reductions are GPU-resident.
+    Tensor<T> IEngine.TaylorSoftmax<T>(Tensor<T> input, int order, int axis)
+    {
+        int ax = axis < 0 ? input.Rank + axis : axis;
+        if (order != 2 || IsTapeActive<T>() || Compilation.GraphMode.IsActive || ax < 0 || ax >= input.Rank)
+            return base.TaylorSoftmax(input, order, axis);
+        var axes = new[] { ax };
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var max = ReduceMax(input, axes, keepDims: true, out _);
+        var shifted = TensorBroadcastSubtract(input, max);                 // s = x - max
+        var sq = TensorMultiply(shifted, shifted);                         // s^2
+        // 1 + s + s^2/2 (0.5 is exact, so *0.5 == CpuEngine's /2!).
+        var poly = TensorAddScalar(TensorAdd(shifted, TensorMultiplyScalar(sq, numOps.FromDouble(0.5))), numOps.One);
+        var sum = ReduceSum(poly, axes, keepDims: true);
+        return TensorBroadcastDivide(poly, sum);
+    }
+
+    // #775: spherical softmax = Softmax(x / ||x||_2) along `axis`. L2-normalize on-device (square ->
+    // axis-sum -> sqrt -> broadcast-divide) then the GPU-resident TensorSoftmax. For Rand inputs the
+    // norm is strictly positive so CpuEngine's norm==0 guard is dead; defer to base under tape/GraphMode.
+    Tensor<T> IEngine.SphericalSoftmax<T>(Tensor<T> input, int axis)
+    {
+        int ax = axis < 0 ? input.Rank + axis : axis;
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || ax < 0 || ax >= input.Rank)
+            return base.SphericalSoftmax(input, axis);
+        var axes = new[] { ax };
+        var sumSq = ReduceSum(TensorMultiply(input, input), axes, keepDims: true);
+        var normalized = TensorBroadcastDivide(input, TensorSqrt(sumSq));
+        return ((IEngine)this).TensorSoftmax(normalized, ax);
+    }
 }
