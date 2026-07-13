@@ -8446,7 +8446,7 @@ KERNEL VARIANTS (A/B testing):
 
         public void Hardsigmoid(IGpuBuffer A, IGpuBuffer B, int size)
         {
-            var k = _kernelCache["hardsigmoid_forward"];
+            var k = _kernelCache["hardsigmoid"]; // #775: kernel is registered as "hardsigmoid" (was silent CPU fallback)
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)B).Buffer.Handle);
@@ -9723,7 +9723,7 @@ KERNEL VARIANTS (A/B testing):
 
         public void Clamp(IGpuBuffer A, IGpuBuffer B, float min, float max, int size)
         {
-            var k = _kernelCache["clamp"];
+            var k = _kernelCache["clamp_values"]; // #775: kernel is registered as "clamp_values" (was silent CPU fallback)
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)B).Buffer.Handle);
@@ -10130,7 +10130,7 @@ KERNEL VARIANTS (A/B testing):
 
         public void BroadcastMultiplyLastAxis(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int outerSize, int innerSize)
         {
-            var k = _kernelCache["broadcast_multiply_last_axis"];
+            var k = _kernelCache["broadcast_mul_last"]; // #775: kernel is registered as "broadcast_mul_last" (was silent CPU fallback)
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)B).Buffer.Handle);
