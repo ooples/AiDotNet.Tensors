@@ -9931,7 +9931,13 @@ KERNEL VARIANTS (A/B testing):
 
         public void Gather(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, int numIndices, int featureSize)
         {
-            var k = _kernelCache["gather_kernel"];
+            // #775 KNOWN GAP: the registered kernel is "gather_kernel", so this "gather" lookup throws
+            // KeyNotFoundException and every caller's try/catch silently falls to the CPU (the residency
+            // probe surfaced it). Do NOT just rename it: the ~9 callers disagree on index encoding
+            // (float VALUE vs int bit-pattern) and semantics (row-gather vs torch.gather vs masked-select),
+            // so making this launch breaks TensorGather/TensorTake/TensorMaskedSelect. Each caller needs its
+            // own correct kernel/encoding; tracked on the gpu-cpu-fallback worklist until then.
+            var k = _kernelCache["gather"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)source).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
@@ -9939,10 +9945,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, numIndices);
             k.SetArg(arg++, featureSize);
 
-            // gather_kernel indexes get_global_id(0) as the OUTPUT ROW (0..numIndices) and loops
-            // featureSize internally — it is 1D over numIndices, NOT a 2D featureSize x numIndices grid
-            // (which would leave get_global_id(0) spanning featureSize and drop rows when featureSize<numIndices).
-            k.Execute1D(numIndices, Math.Min(256, numIndices));
+            k.Execute2D(featureSize, numIndices, Math.Min(16, featureSize), Math.Min(16, numIndices));
         }
 
         #endregion
