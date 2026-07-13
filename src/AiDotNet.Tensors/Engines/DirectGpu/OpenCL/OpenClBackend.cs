@@ -7583,7 +7583,17 @@ KERNEL VARIANTS (A/B testing):
 
         /// <inheritdoc/>
         public void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer)
-            => throw new NotSupportedException("UploadIntBufferInPlace is not supported by the OpenCL backend.");
+        {
+            if (data is null) throw new ArgumentNullException(nameof(data));
+            if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+            // Mirror AllocateIntBuffer: the OpenCL backend stores int buffers as the reinterpreted
+            // float bit pattern (net471-compatible), so convert and write the floats into the existing
+            // buffer in place (blocking) rather than allocating a new one.
+            var floatData = new float[data.Length];
+            for (int i = 0; i < data.Length; i++)
+                floatData[i] = BitConverter.ToSingle(BitConverter.GetBytes(data[i]), 0);
+            ((DirectOpenClGpuBuffer)buffer).Buffer.CopyFromHost(floatData);
+        }
 
         public IGpuBuffer AllocateIntBuffer(int[] data)
         {
