@@ -840,8 +840,7 @@ public static class OpParityRegistry
         yield return new OpCase("MambaSelectiveScanForward[2,4,6]", "scan",
             e => e.MambaSelectiveScanForward(mx.F(), mdelta.F(), maLog.F(), mb.F(), mc.F(), md.F()),
             e => e.MambaSelectiveScanForward(mx.D(), mdelta.D(), maLog.D(), mb.D(), mc.D(), md.D()),
-            ParityTol.Accum(1e-3), opMethod: "MambaSelectiveScanForward")
-        { GpuUnsafe = true, KnownDivergence = "OpenCL mamba kernel over-allocates private memory -> command-queue error crashes a later GPU op." };
+            ParityTol.Accum(1e-3), opMethod: "MambaSelectiveScanForward");
         // Mamba2 SSD: delta [B,S,H], aLog/D per-head [H], shared B/C [B,S,ST].
         var m2delta = OpInput.RandPositive(3606, new[] { B, S, H }, 0.1, 1.0);
         var m2aLog = OpInput.Rand(3607, new[] { H });
@@ -1516,11 +1515,14 @@ public static class OpParityRegistry
     // Grid-sample, upsample3d/crop, depthwise-1d, conv/pool backward, IoU + CE losses.
     public static IEnumerable<OpCase> GridConvBwdLoss()
     {
-        // FOUND (quarantined): LAYOUT-CONVENTION divergence, not a plain bug. CpuEngine.GridSample is
-        // documented NHWC (input [batch,height,width,channels] -> out [1,4,4,4]=64), the GPU kernel
-        // uses PyTorch NCHW (input [N,C,H,W] -> out [N,C,Hout,Wout]=[1,2,4,4]=32). Both are
-        // self-consistent; they disagree on layout. Resolving needs a library-wide convention decision
-        // (which layout wins) with consumer impact — flagged for the user, not silently changed.
+        // QUARANTINED — decision made (NCHW), scoped as a dedicated follow-up PR. Diagnosis: genuine
+        // layout split AND the GPU is internally inconsistent. CpuEngine.GridSample = NHWC
+        // (in [N,H,W,C] -> out [N,outH,outW,C]=64); the GPU 2-arg forward (DirectGpuTensorEngine.cs
+        // ~L19113) = NCHW (in [N,C,H,W] -> out [N,C,outH,outW]=32); the GPU BACKWARD kernels are named
+        // GridSampleBackward{Input,Grid}Nhwc (NHWC). User chose: standardize EVERYTHING on PyTorch NCHW.
+        // That migration spans CpuEngine forward+backward (2-arg AND multi-arg CpuEngine.Geometry),
+        // all 6 GPU backends' backward kernels, and ~22 test refs (only OpenCL is locally validatable),
+        // so it is a separate focused PR, not bundled into the op-parity scaffold branch.
         yield return new OpCase("GridSample[1,2,4,4;g1,4,4,2]", "sample",
             e => e.GridSample(OpInput.Rand(1700, new[] { 1, 2, 4, 4 }).F(), OpInput.Rand(1701, new[] { 1, 4, 4, 2 }, -1.0, 1.0).F()),
             e => e.GridSample(OpInput.Rand(1700, new[] { 1, 2, 4, 4 }).D(), OpInput.Rand(1701, new[] { 1, 4, 4, 2 }, -1.0, 1.0).D()), ParityTol.Accum(1e-3), opMethod: "GridSample")

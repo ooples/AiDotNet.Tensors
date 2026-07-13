@@ -12238,6 +12238,13 @@ KERNEL VARIANTS (A/B testing):
             if (!_kernelCache.TryGetValue("mamba_selective_scan_forward", out var kernel))
                 throw new InvalidOperationException("OpenCL kernel not found: mamba_selective_scan_forward");
 
+            int total = batch * innerDim;
+
+            // Global scratch for the scan state (one stateDim slice per work-item), replacing the old
+            // per-work-item private float[256] that faulted on register-constrained GPUs (#775). The
+            // kernel zero-inits its own slice, so no pre-fill is needed.
+            using var hState = AllocateBuffer(total * stateDim);
+
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)x).Buffer.Handle);
             kernel.SetArg(1u, ((DirectOpenClGpuBuffer)delta).Buffer.Handle);
             kernel.SetArg(2u, ((DirectOpenClGpuBuffer)aLog).Buffer.Handle);
@@ -12245,15 +12252,16 @@ KERNEL VARIANTS (A/B testing):
             kernel.SetArg(4u, ((DirectOpenClGpuBuffer)cParam).Buffer.Handle);
             kernel.SetArg(5u, ((DirectOpenClGpuBuffer)dParam).Buffer.Handle);
             kernel.SetArg(6u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
-            kernel.SetArg(7u, batch);
-            kernel.SetArg(8u, seqLen);
-            kernel.SetArg(9u, innerDim);
-            kernel.SetArg(10u, stateDim);
+            kernel.SetArg(7u, ((DirectOpenClGpuBuffer)hState).Buffer.Handle);
+            kernel.SetArg(8u, batch);
+            kernel.SetArg(9u, seqLen);
+            kernel.SetArg(10u, innerDim);
+            kernel.SetArg(11u, stateDim);
 
-            int total = batch * innerDim;
             int localSize = CalculateOptimalWorkGroupSize1D(total);
             int globalSize = ((total + localSize - 1) / localSize) * localSize;
             kernel.Execute1D(globalSize, localSize);
+            _context?.Finish();
         }
 
         // ── Fused Mamba-2 SSD scan forward (#1464) ──────────────────────────────────────────
