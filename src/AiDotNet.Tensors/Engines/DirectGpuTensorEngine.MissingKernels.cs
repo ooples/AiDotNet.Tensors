@@ -3091,4 +3091,16 @@ public partial class DirectGpuTensorEngine
         var gradB = GeluBackward(TensorMultiply(a, gradOutput), b);    // a*gelu'(b)*gradOut
         return TensorConcatenate(new[] { gradA, gradB }, actualDim);
     }
+
+    // #775: Gumbel-softmax backward = softmax backward scaled by 1/temperature (the gradient flows
+    // through the softmax, divided by the temperature). Reuse the GPU-resident SoftmaxBackward (via the
+    // interface so the override is hit) then TensorMultiplyScalar. Defer to base under tape/GraphMode.
+    Tensor<T> IEngine.GumbelSoftmaxBackward<T>(Tensor<T> gradOutput, Tensor<T> output, double temperature, int axis)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || temperature <= 0)
+            return base.GumbelSoftmaxBackward(gradOutput, output, temperature, axis);
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var softmaxGrad = ((IEngine)this).SoftmaxBackward(gradOutput, output, axis);
+        return TensorMultiplyScalar(softmaxGrad, numOps.FromDouble(1.0 / temperature));
+    }
 }
