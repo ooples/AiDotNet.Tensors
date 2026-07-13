@@ -861,6 +861,36 @@ __kernel void depthwise_conv2d_backward_weights(
     }
     gradKernel[idx] = sum;
 }
+
+// #775: Trilinear interpolation of a [D,H,W,C] grid at [P,3] (z,y,x) positions -> [P,C]. One work item
+// per (position, channel). Matches CpuEngine: clamp each coord to [0, dim-1-eps], 8-corner blend.
+__kernel void trilinear_interpolate(
+    __global const float* grid,
+    __global const float* positions,
+    __global float* output,
+    const int D, const int H, const int W, const int C,
+    const int P, const float upperEps)
+{
+    const int idx = get_global_id(0);
+    if (idx >= P * C) return;
+    const int c = idx % C;
+    const int n = idx / C;
+    float z = fmax(0.0f, fmin((float)(D - 1) - upperEps, positions[n * 3 + 0]));
+    float y = fmax(0.0f, fmin((float)(H - 1) - upperEps, positions[n * 3 + 1]));
+    float x = fmax(0.0f, fmin((float)(W - 1) - upperEps, positions[n * 3 + 2]));
+    int z0 = (int)floor(z), y0 = (int)floor(y), x0 = (int)floor(x);
+    int z1 = min(z0 + 1, D - 1), y1 = min(y0 + 1, H - 1), x1 = min(x0 + 1, W - 1);
+    float fz = z - z0, fy = y - y0, fx = x - x0;
+    float w000 = (1 - fz) * (1 - fy) * (1 - fx), w001 = (1 - fz) * (1 - fy) * fx;
+    float w010 = (1 - fz) * fy * (1 - fx),       w011 = (1 - fz) * fy * fx;
+    float w100 = fz * (1 - fy) * (1 - fx),       w101 = fz * (1 - fy) * fx;
+    float w110 = fz * fy * (1 - fx),             w111 = fz * fy * fx;
+    output[n * C + c] =
+        w000 * grid[(((z0 * H + y0) * W + x0) * C) + c] + w001 * grid[(((z0 * H + y0) * W + x1) * C) + c] +
+        w010 * grid[(((z0 * H + y1) * W + x0) * C) + c] + w011 * grid[(((z0 * H + y1) * W + x1) * C) + c] +
+        w100 * grid[(((z1 * H + y0) * W + x0) * C) + c] + w101 * grid[(((z1 * H + y0) * W + x1) * C) + c] +
+        w110 * grid[(((z1 * H + y1) * W + x0) * C) + c] + w111 * grid[(((z1 * H + y1) * W + x1) * C) + c];
+}
 ";
         }
 
@@ -884,7 +914,8 @@ __kernel void depthwise_conv2d_backward_weights(
                 "conv2d_winograd_f2x2_3x3",
                 "conv3d_direct",
                 "depthwise_conv2d_backward_input",
-                "depthwise_conv2d_backward_weights"
+                "depthwise_conv2d_backward_weights",
+                "trilinear_interpolate"
             };
         }
     }

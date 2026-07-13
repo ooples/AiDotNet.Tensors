@@ -7063,6 +7063,21 @@ KERNEL VARIANTS (A/B testing):
             k.Execute1D(total, Math.Min(256, total));
         }
 
+        // #775: Trilinear interpolation of a [D,H,W,C] grid at [P,3] positions -> [P,C]. 1D over P*C.
+        public void TrilinearInterpolate(IGpuBuffer grid, IGpuBuffer positions, IGpuBuffer output,
+            int d, int h, int w, int c, int p, float upperEps)
+        {
+            var k = _kernelCache["trilinear_interpolate"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)grid).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)positions).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, d); k.SetArg(arg++, h); k.SetArg(arg++, w); k.SetArg(arg++, c);
+            k.SetArg(arg++, p); k.SetArg(arg++, upperEps);
+            int total = p * c;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
         public void NearestNeighborUpsample3D(IGpuBuffer input, IGpuBuffer output,
             int batch, int channels,
             int inDepth, int inHeight, int inWidth,
