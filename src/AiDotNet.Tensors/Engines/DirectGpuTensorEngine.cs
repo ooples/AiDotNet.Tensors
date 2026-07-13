@@ -12221,6 +12221,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             float[] meanFloat = backend.DownloadBuffer(saveMeanBuffer.Buffer);
             float[] varFloat = backend.DownloadBuffer(saveVarBuffer.Buffer);
 
+            // The layernorm_forward kernel saves 1/sqrt(var+eps) (invVar), but the IEngine
+            // contract (matching CpuEngine.LayerNorm) is that the `variance` out-param is TRUE
+            // variance — LayerNormBackward re-derives invVar as 1/sqrt(variance+eps). Returning
+            // invVar here made the backward double-convert, so GPU norm-backward gradients diverged
+            // strongly from CPU/oracle (op-parity #775). Convert invVar -> var = 1/invVar^2 - eps.
+            for (int i = 0; i < varFloat.Length; i++)
+            {
+                float iv = varFloat[i];
+                varFloat[i] = 1f / (iv * iv) - (float)epsilon;
+            }
+
             mean = new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(meanFloat), batchShape);
             variance = new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(varFloat), batchShape);
             return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(outputFloat), input.Shape.ToArray());
@@ -12495,6 +12506,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             float[] meanFloat = backend.DownloadBuffer(saveMeanBuffer.Buffer);
             float[] varFloat = backend.DownloadBuffer(saveVarBuffer.Buffer);
 
+            // groupnorm_forward saves invVar = 1/sqrt(var+eps); the IEngine contract (CpuEngine)
+            // is TRUE variance, which GroupNormBackward re-derives invVar from. Returning invVar made
+            // the (base CPU) GroupNormBackward misread it, diverging the gradient (op-parity #775).
+            for (int i = 0; i < varFloat.Length; i++)
+            {
+                float iv = varFloat[i];
+                varFloat[i] = 1f / (iv * iv) - (float)epsilon;
+            }
+
             mean = new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(meanFloat), new[] { batch, numGroups });
             variance = new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(varFloat), new[] { batch, numGroups });
             return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(outputFloat), input.Shape.ToArray());
@@ -12540,6 +12560,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             float[] outputFloat = backend.DownloadBuffer(outputBuffer.Buffer);
             float[] meanFloat = backend.DownloadBuffer(saveMeanBuffer.Buffer);
             float[] varFloat = backend.DownloadBuffer(saveVarBuffer.Buffer);
+
+            // instancenorm_forward saves invVar = 1/sqrt(var+eps); the IEngine contract (CpuEngine)
+            // is TRUE variance, which InstanceNormBackward re-derives invVar from. Returning invVar
+            // made the (base CPU) InstanceNormBackward misread it, diverging the gradient (#775).
+            for (int i = 0; i < varFloat.Length; i++)
+            {
+                float iv = varFloat[i];
+                varFloat[i] = 1f / (iv * iv) - (float)epsilon;
+            }
 
             mean = new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(meanFloat), new[] { batch, channels });
             variance = new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(varFloat), new[] { batch, channels });

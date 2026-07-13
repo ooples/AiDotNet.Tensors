@@ -1459,8 +1459,7 @@ public static class OpParityRegistry
         var go = OpInput.Rand(1903, new[] { 4, 64 });
         yield return new OpCase("LayerNormBackward[4,64]", "norm-bwd",
             e => { e.LayerNorm(x.F(), g.F(), beta.F(), 1e-5, out var mn, out var vr); return e.LayerNormBackward(go.F(), x.F(), g.F(), mn, vr, 1e-5, out _, out _); },
-            e => { e.LayerNorm(x.D(), g.D(), beta.D(), 1e-5, out var mn, out var vr); return e.LayerNormBackward(go.D(), x.D(), g.D(), mn, vr, 1e-5, out _, out _); }, ParityTol.Accum(2e-3), opMethod: "LayerNormBackward")
-            { KnownDivergence = "GPU norm backward diverges strongly from CPU/oracle (norm-backward kernel bug/convention); CPU matches the double oracle." };
+            e => { e.LayerNorm(x.D(), g.D(), beta.D(), 1e-5, out var mn, out var vr); return e.LayerNormBackward(go.D(), x.D(), g.D(), mn, vr, 1e-5, out _, out _); }, ParityTol.Accum(2e-3), opMethod: "LayerNormBackward");
         yield return new OpCase("RMSNormBackward[4,64]", "norm-bwd",
             e => { e.RMSNorm(x.F(), g.F(), 1e-5, out var rms); return e.RMSNormBackward(go.F(), x.F(), g.F(), rms, 1e-5, out _); },
             e => { e.RMSNorm(x.D(), g.D(), 1e-5, out var rms); return e.RMSNormBackward(go.D(), x.D(), g.D(), rms, 1e-5, out _); }, ParityTol.Accum(2e-3), opMethod: "RMSNormBackward");
@@ -1471,12 +1470,10 @@ public static class OpParityRegistry
         var ggo = OpInput.Rand(1913, new[] { 2, 8, 4, 4 });
         yield return new OpCase("GroupNormBackward[2,8,4,4;g2]", "norm-bwd",
             e => { e.GroupNorm(gx.F(), 2, gg.F(), gb.F(), 1e-5, out var mn, out var vr); return e.GroupNormBackward(ggo.F(), gx.F(), 2, gg.F(), mn, vr, 1e-5, out _, out _); },
-            e => { e.GroupNorm(gx.D(), 2, gg.D(), gb.D(), 1e-5, out var mn, out var vr); return e.GroupNormBackward(ggo.D(), gx.D(), 2, gg.D(), mn, vr, 1e-5, out _, out _); }, ParityTol.Accum(2e-3), opMethod: "GroupNormBackward")
-            { KnownDivergence = "GPU norm backward diverges strongly from CPU/oracle (norm-backward kernel bug/convention); CPU matches the double oracle." };
+            e => { e.GroupNorm(gx.D(), 2, gg.D(), gb.D(), 1e-5, out var mn, out var vr); return e.GroupNormBackward(ggo.D(), gx.D(), 2, gg.D(), mn, vr, 1e-5, out _, out _); }, ParityTol.Accum(2e-3), opMethod: "GroupNormBackward");
         yield return new OpCase("InstanceNormBackward[2,8,4,4]", "norm-bwd",
             e => { e.InstanceNorm(gx.F(), gg.F(), gb.F(), 1e-5, out var mn, out var vr); return e.InstanceNormBackward(ggo.F(), gx.F(), gg.F(), mn, vr, 1e-5, out _, out _); },
-            e => { e.InstanceNorm(gx.D(), gg.D(), gb.D(), 1e-5, out var mn, out var vr); return e.InstanceNormBackward(ggo.D(), gx.D(), gg.D(), mn, vr, 1e-5, out _, out _); }, ParityTol.Accum(2e-3), opMethod: "InstanceNormBackward")
-            { KnownDivergence = "GPU norm backward diverges strongly from CPU/oracle (norm-backward kernel bug/convention); CPU matches the double oracle." };
+            e => { e.InstanceNorm(gx.D(), gg.D(), gb.D(), 1e-5, out var mn, out var vr); return e.InstanceNormBackward(ggo.D(), gx.D(), gg.D(), mn, vr, 1e-5, out _, out _); }, ParityTol.Accum(2e-3), opMethod: "InstanceNormBackward");
         yield return new OpCase("BatchNormBackward[2,8,4,4]", "norm-bwd",
             e => { e.BatchNorm(gx.F(), gg.F(), gb.F(), 1e-5, out var mn, out var vr); return e.BatchNormBackward(ggo.F(), gx.F(), gg.F(), mn, vr, 1e-5, out _, out _); },
             e => { e.BatchNorm(gx.D(), gg.D(), gb.D(), 1e-5, out var mn, out var vr); return e.BatchNormBackward(ggo.D(), gx.D(), gg.D(), mn, vr, 1e-5, out _, out _); }, ParityTol.Accum(2e-3), opMethod: "BatchNormBackward")
