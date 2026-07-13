@@ -3271,6 +3271,48 @@ public partial class DirectGpuTensorEngine
         catch { return base.MaxPool3DBackward(gradOutput, maxIndices, inputShape, poolSize, stride); }
     }
 
+    // #775: AvgPool3D (NCDHW, no-padding). Scalar overload routes to the int[] one through the interface
+    // (a direct this.AvgPool3D call would bypass the explicit impl). Padded / non-float / wrong-rank /
+    // tape / GraphMode defer to base.
+    Tensor<T> IEngine.AvgPool3D<T>(Tensor<T> input, int poolSize, int stride, int padding)
+    {
+        if (stride == 0) stride = poolSize;
+        return ((IEngine)this).AvgPool3D(input, new[] { poolSize, poolSize, poolSize },
+            new[] { stride, stride, stride }, new[] { padding, padding, padding });
+    }
+
+    Tensor<T> IEngine.AvgPool3D<T>(Tensor<T> input, int[] poolSize, int[] stride, int[] padding)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+            || input.Rank != 5 || poolSize is not { Length: 3 } || stride is not { Length: 3 }
+            || padding is not { Length: 3 } || padding[0] != 0 || padding[1] != 0 || padding[2] != 0
+            || !TryGetBackend(out var backend))
+            return base.AvgPool3D(input, poolSize, stride, padding);
+        try
+        {
+            int batch = input.Shape._dims[0], channels = input.Shape._dims[1];
+            int inD = input.Shape._dims[2], inH = input.Shape._dims[3], inW = input.Shape._dims[4];
+            int kD = poolSize[0], kH = poolSize[1], kW = poolSize[2];
+            int sD = stride[0], sH = stride[1], sW = stride[2];
+            if (sD <= 0 || sH <= 0 || sW <= 0) return base.AvgPool3D(input, poolSize, stride, padding);
+            int outD = (inD - kD) / sD + 1, outH = (inH - kH) / sH + 1, outW = (inW - kW) / sW + 1;
+            if (outD <= 0 || outH <= 0 || outW <= 0) return base.AvgPool3D(input, poolSize, stride, padding);
+            int outLen = batch * channels * outD * outH * outW;
+            using var inBuf = GetOrAllocateBuffer(backend, input);
+            var outBuf = AllocateOutputBuffer(backend, outLen);
+            try
+            {
+                // No padding, so every window is full -> countIncludePad is irrelevant; pass 1.
+                backend.AvgPool3D(inBuf.Buffer, outBuf.Buffer, batch, channels, inD, inH, inW,
+                    outD, outH, outW, kD, kH, kW, sD, sH, sW, countIncludePad: 1);
+                var arr = FinishGpuOp<T>(backend, outBuf, outLen);
+                return new Tensor<T>(arr, new[] { batch, channels, outD, outH, outW });
+            }
+            catch { outBuf.Dispose(); throw; }
+        }
+        catch { return base.AvgPool3D(input, poolSize, stride, padding); }
+    }
+
     // #775: whole-tensor mean (output [1]) via the GPU-resident ReduceMean over all axes.
     Tensor<T> IEngine.TensorMeanDiff<T>(Tensor<T> tensor)
     {
