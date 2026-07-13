@@ -925,6 +925,51 @@ __kernel void trilinear_interpolate_backward(
     }
     gradGrid[idx] = sum;
 }
+
+// #775: ConvTranspose3D forward (NCDHW), weights [inC,outC,kD,kH,kW]. GATHER over output elements:
+// od = id*stride - pad + kd  ->  id = (od + pad - kd)/stride (integer, in range). No output-padding here.
+__kernel void conv_transpose3d(
+    __global const float* input,
+    __global const float* weights,
+    __global float* output,
+    const int N, const int inC, const int iD, const int iH, const int iW,
+    const int outC, const int outD, const int outH, const int outW,
+    const int kD, const int kH, const int kW,
+    const int strideD, const int strideH, const int strideW,
+    const int padD, const int padH, const int padW)
+{
+    const int idx = get_global_id(0);
+    if (idx >= N * outC * outD * outH * outW) return;
+    const int ow = idx % outW;
+    const int oh = (idx / outW) % outH;
+    const int od = (idx / (outW * outH)) % outD;
+    const int oc = (idx / (outW * outH * outD)) % outC;
+    const int n = idx / (outW * outH * outD * outC);
+    float sum = 0.0f;
+    for (int kd = 0; kd < kD; kd++) {
+        int td = od + padD - kd;
+        if (td < 0 || (td % strideD) != 0) continue;
+        int id = td / strideD;
+        if (id < 0 || id >= iD) continue;
+        for (int kh = 0; kh < kH; kh++) {
+            int th = oh + padH - kh;
+            if (th < 0 || (th % strideH) != 0) continue;
+            int ih = th / strideH;
+            if (ih < 0 || ih >= iH) continue;
+            for (int kw = 0; kw < kW; kw++) {
+                int tw = ow + padW - kw;
+                if (tw < 0 || (tw % strideW) != 0) continue;
+                int iw = tw / strideW;
+                if (iw < 0 || iw >= iW) continue;
+                for (int ic = 0; ic < inC; ic++) {
+                    sum += input[(((n * inC + ic) * iD + id) * iH + ih) * iW + iw]
+                         * weights[((((ic * outC + oc) * kD + kd) * kH + kh) * kW + kw)];
+                }
+            }
+        }
+    }
+    output[idx] = sum;
+}
 ";
         }
 
@@ -950,7 +995,8 @@ __kernel void trilinear_interpolate_backward(
                 "depthwise_conv2d_backward_input",
                 "depthwise_conv2d_backward_weights",
                 "trilinear_interpolate",
-                "trilinear_interpolate_backward"
+                "trilinear_interpolate_backward",
+                "conv_transpose3d"
             };
         }
     }

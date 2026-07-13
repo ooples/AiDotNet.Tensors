@@ -1261,6 +1261,13 @@ public interface IDirectGpuBackend : IDisposable
         int d, int h, int w, int c, int p, float upperEps)
         => throw new System.NotSupportedException("TrilinearInterpolateBackward is not implemented for this GPU backend.");
 
+    /// <summary>ConvTranspose3D forward (NCDHW, weights [inC,outC,kD,kH,kW]). Default-throws (CPU
+    /// fallback); OpenCL overrides it (#775).</summary>
+    void ConvTranspose3D(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer output,
+        int n, int inC, int iD, int iH, int iW, int outC, int outD, int outH, int outW,
+        int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW)
+        => throw new System.NotSupportedException("ConvTranspose3D is not implemented for this GPU backend.");
+
     /// <summary>
     /// Backward pass for 3D max pooling (NCDHW format).
     /// Routes gradients back to the positions that had max values in the forward pass.

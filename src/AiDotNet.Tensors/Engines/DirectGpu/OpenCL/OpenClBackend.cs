@@ -7093,6 +7093,25 @@ KERNEL VARIANTS (A/B testing):
             k.Execute1D(total, Math.Min(256, total));
         }
 
+        // #775: ConvTranspose3D forward. 1D over output elements (gather), weights [inC,outC,kD,kH,kW].
+        public void ConvTranspose3D(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer output,
+            int n, int inC, int iD, int iH, int iW, int outC, int outD, int outH, int outW,
+            int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW)
+        {
+            var k = _kernelCache["conv_transpose3d"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)weights).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, n); k.SetArg(arg++, inC); k.SetArg(arg++, iD); k.SetArg(arg++, iH); k.SetArg(arg++, iW);
+            k.SetArg(arg++, outC); k.SetArg(arg++, outD); k.SetArg(arg++, outH); k.SetArg(arg++, outW);
+            k.SetArg(arg++, kD); k.SetArg(arg++, kH); k.SetArg(arg++, kW);
+            k.SetArg(arg++, strideD); k.SetArg(arg++, strideH); k.SetArg(arg++, strideW);
+            k.SetArg(arg++, padD); k.SetArg(arg++, padH); k.SetArg(arg++, padW);
+            int total = n * outC * outD * outH * outW;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
         public void NearestNeighborUpsample3D(IGpuBuffer input, IGpuBuffer output,
             int batch, int channels,
             int inDepth, int inHeight, int inWidth,
