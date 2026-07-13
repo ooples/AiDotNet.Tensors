@@ -2904,4 +2904,18 @@ public partial class DirectGpuTensorEngine
         var bf = b.IsContiguous ? b : b.Contiguous();
         return TensorMatMul(af.Reshape(new[] { n, 1 }), bf.Reshape(new[] { 1, m }));
     }
+
+    // #775: BatchNormAffine is inference-mode affine batch-norm — y = gamma*(x-mean)/sqrt(var+eps)+beta
+    // using the PROVIDED running mean/variance. That is exactly BatchNormInference, which has a dedicated
+    // on-device kernel. CpuEngine.BatchNormAffine instead routes through BatchNormInferenceInto, whose
+    // allocate-free Into variant has no GPU override, so it runs on the host even on a GPU engine. Route
+    // to the resident BatchNormInference override (identical computation → same result). Defer under
+    // tape/GraphMode/non-rank-4 to base, which BatchNormInference itself also does.
+    public override Tensor<T> BatchNormAffine<T>(Tensor<T> x, Tensor<T> gamma, Tensor<T> beta, Tensor<T> mean, Tensor<T> variance, double epsilon)
+    {
+        if (x is null) throw new ArgumentNullException(nameof(x));
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || x.Rank != 4)
+            return base.BatchNormAffine(x, gamma, beta, mean, variance, epsilon);
+        return BatchNormInference(x, gamma, beta, mean, variance, epsilon);
+    }
 }
