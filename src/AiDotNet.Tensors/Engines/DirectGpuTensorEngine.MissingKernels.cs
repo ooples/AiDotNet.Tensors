@@ -3103,4 +3103,45 @@ public partial class DirectGpuTensorEngine
         var softmaxGrad = ((IEngine)this).SoftmaxBackward(gradOutput, output, axis);
         return TensorMultiplyScalar(softmaxGrad, numOps.FromDouble(1.0 / temperature));
     }
+
+    // #775: complex conjugate of an interleaved [.., re, im, re, im, ...] tensor negates every imaginary
+    // (odd) element. When the last axis is even the pairs live within it, so split it into (pairs, 2),
+    // negate the imaginary column, and re-interleave — all exact, GPU-resident data moves + TensorNegate.
+    // Odd last-axis (pairs straddle rows) and tape/GraphMode defer to base.
+    Tensor<T> IEngine.TensorComplexConjugate<T>(Tensor<T> a)
+    {
+        int rank = a.Rank;
+        int lastDim = rank > 0 ? a.Shape._dims[rank - 1] : 0;
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || rank == 0 || lastDim % 2 != 0)
+            return base.TensorComplexConjugate(a);
+        var pairShape = new int[rank + 1];
+        for (int i = 0; i < rank - 1; i++) pairShape[i] = a.Shape._dims[i];
+        pairShape[rank - 1] = lastDim / 2;
+        pairShape[rank] = 2;
+        var reshaped = (a.IsContiguous ? a : a.Contiguous()).Reshape(pairShape);
+        var re = TensorNarrow(reshaped, rank, 0, 1);                 // real column
+        var im = TensorNarrow(reshaped, rank, 1, 1);                 // imaginary column
+        var conj = TensorConcatenate(new[] { re, TensorNegate(im) }, rank);
+        return conj.Reshape(a.Shape._dims);
+    }
+
+    // #775: complex magnitude sqrt(re^2 + im^2) per interleaved pair. Same even-last-axis de-interleave
+    // (split into (pairs, 2), square + add the two columns, sqrt), then flatten to the CpuEngine's 1-D
+    // [pairs] output. Fully GPU-resident (Narrow/Multiply/Add/Sqrt). Defers to base otherwise.
+    Tensor<T> IEngine.TensorComplexMagnitude<T>(Tensor<T> a)
+    {
+        int rank = a.Rank;
+        int lastDim = rank > 0 ? a.Shape._dims[rank - 1] : 0;
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || rank == 0 || lastDim % 2 != 0)
+            return base.TensorComplexMagnitude(a);
+        var pairShape = new int[rank + 1];
+        for (int i = 0; i < rank - 1; i++) pairShape[i] = a.Shape._dims[i];
+        pairShape[rank - 1] = lastDim / 2;
+        pairShape[rank] = 2;
+        var reshaped = (a.IsContiguous ? a : a.Contiguous()).Reshape(pairShape);
+        var re = TensorNarrow(reshaped, rank, 0, 1);
+        var im = TensorNarrow(reshaped, rank, 1, 1);
+        var mag = TensorSqrt(TensorAdd(TensorMultiply(re, re), TensorMultiply(im, im)));
+        return mag.Reshape(new[] { a.Length / 2 });   // CpuEngine returns a flat [pairs] vector
+    }
 }
