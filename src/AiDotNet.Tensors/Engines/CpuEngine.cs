@@ -38812,6 +38812,18 @@ public partial class CpuEngine : ITensorLevelEngine
         int numFreqs = input._shape[^1] / 2; // Interleaved real/imag
         int nFft = (numFreqs - 1) * 2;
 
+        // Degenerate tiny-transform guard (#778 / AiDotNet#1856): a length-1 forward RFFT
+        // pads to nFft = NextPowerOf2(1) = 1, which is ODD, so numFreqs = nFft/2 + 1 collapses
+        // to 1 and the even-only inverse formula (numFreqs-1)*2 yields nFft = 0 — a zero-point
+        // transform whose empty realOut[] makes the copy loop below throw IndexOutOfRange
+        // (surfaced during RFFT's autodiff backward at TFC's n=1 frequency axis). The caller
+        // always passes the true signal length as outputLength; for every non-degenerate case
+        // the padded (numFreqs-1)*2 already equals or exceeds it, so clamping up only affects
+        // the numFreqs==1 case, where the single DC bin IS the signal and a 1-point inverse is
+        // exact. Never below 1 so the Vector allocation and FFTCore stay well-formed.
+        if (nFft < outputLength) nFft = outputLength;
+        if (nFft < 1) nFft = 1;
+
         // Output shape
         var outputShape = input.Shape.ToArray();
         outputShape[^1] = outputLength;
