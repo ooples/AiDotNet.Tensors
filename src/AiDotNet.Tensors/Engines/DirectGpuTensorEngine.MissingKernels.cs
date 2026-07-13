@@ -3144,4 +3144,27 @@ public partial class DirectGpuTensorEngine
         var mag = TensorSqrt(TensorAdd(TensorMultiply(re, re), TensorMultiply(im, im)));
         return mag.Reshape(new[] { a.Length / 2 });   // CpuEngine returns a flat [pairs] vector
     }
+
+    // #775: complex multiply (aRe+aIm i)(bRe+bIm i) = (aRe*bRe - aIm*bIm) + (aRe*bIm + aIm*bRe) i, both
+    // operands interleaved. De-interleave the even last axis of each (metadata reshape + TensorNarrow),
+    // form the real/imag results with GPU-resident Multiply/Subtract/Add in CpuEngine's order, then
+    // re-interleave. Defers to base on odd last-axis / length-mismatch / tape / GraphMode.
+    Tensor<T> IEngine.TensorComplexMultiply<T>(Tensor<T> a, Tensor<T> b)
+    {
+        int rank = a.Rank;
+        int lastDim = rank > 0 ? a.Shape._dims[rank - 1] : 0;
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || rank == 0 || lastDim % 2 != 0 || a.Length != b.Length)
+            return base.TensorComplexMultiply(a, b);
+        var pairShape = new int[rank + 1];
+        for (int i = 0; i < rank - 1; i++) pairShape[i] = a.Shape._dims[i];
+        pairShape[rank - 1] = lastDim / 2;
+        pairShape[rank] = 2;
+        var ra = (a.IsContiguous ? a : a.Contiguous()).Reshape(pairShape);
+        var rb = (b.IsContiguous ? b : b.Contiguous()).Reshape(pairShape);
+        var aRe = TensorNarrow(ra, rank, 0, 1); var aIm = TensorNarrow(ra, rank, 1, 1);
+        var bRe = TensorNarrow(rb, rank, 0, 1); var bIm = TensorNarrow(rb, rank, 1, 1);
+        var outRe = TensorSubtract(TensorMultiply(aRe, bRe), TensorMultiply(aIm, bIm));
+        var outIm = TensorAdd(TensorMultiply(aRe, bIm), TensorMultiply(aIm, bRe));
+        return TensorConcatenate(new[] { outRe, outIm }, rank).Reshape(a.Shape._dims);
+    }
 }
