@@ -86,15 +86,24 @@ public sealed class BackendCompletenessTests
         // An op can appear covered via one overload and missing via another; coverage wins.
         missing.ExceptWith(covered);
 
+        // NOTE: "missing" here means "no DEDICATED GPU override". Many such ops still run on the GPU
+        // via composition — e.g. CpuEngine.TensorSquare is literally TensorMultiply(x,x), and
+        // TensorMultiply IS a GPU-resident override, so TensorSquare executes on-device even though it
+        // has no override of its own. This metric therefore tracks dedicated-override coverage (a perf/
+        // residency bar), NOT silent-CPU-fallback. The genuinely CPU-bound ops are the subset whose
+        // CpuEngine body does raw scalar/array loops without reaching a GPU-resident primitive (e.g.
+        // BatchNormBackward before it was wired) — those are the priority. Reflection can't tell the
+        // two apart statically, so treat the report as a superset worklist.
         WriteReport("gpu-engine-missing.md",
-            $"tensor-returning IEngine ops with a real GPU override : {covered.Count}",
-            $"tensor-returning IEngine ops still on CPU fallback     : {missing.Count} (goal 0)",
+            $"tensor-returning IEngine ops with a dedicated GPU override : {covered.Count}",
+            $"tensor-returning IEngine ops WITHOUT a dedicated override   : {missing.Count} " +
+            $"(goal 0; many still run on GPU via composed primitives)",
             covered, missing);
 
         Assert.True(missing.Count <= GpuOverrideMissingFloor,
-            $"{missing.Count} tensor IEngine ops still fall back to the CPU on the GPU engine " +
-            $"(floor {GpuOverrideMissingFloor}). A new op lost/never had its GPU override. See " +
-            $"gpu-engine-missing.md. Write the GPU kernel + wrapper; do not raise the floor.");
+            $"{missing.Count} tensor IEngine ops lack a dedicated GPU override (floor " +
+            $"{GpuOverrideMissingFloor}). A new op lost/never had one. See gpu-engine-missing.md. " +
+            $"Add a dedicated override (or verify it already composes onto GPU primitives); do not raise the floor.");
     }
 
     // ---- Tier 2: backend-level kernel stub detection ---------------------------------------
