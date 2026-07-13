@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.114.3](https://github.com/ooples/AiDotNet.Tensors/compare/v0.114.2...v0.114.3) (2026-07-13)
+
+
+### Performance
+
+* **autotune:** eliminate per-GEMM disk touches on the compiled-replay hot path ([#782](https://github.com/ooples/AiDotNet.Tensors/issues/782)) ([4fedc3b](https://github.com/ooples/AiDotNet.Tensors/commit/4fedc3b9e78accd596849459ff50dd272663fd37))
+
 ## [0.114.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.114.1...v0.114.2) (2026-07-13)
 
 
