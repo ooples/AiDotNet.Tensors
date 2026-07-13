@@ -73,9 +73,13 @@ __kernel void bce_with_logits_loss(__global const float* logits, __global const 
     float x = logits[idx]; float t = targets[idx]; float ax = fabs(x);
     loss[idx] = fmax(x, 0.0f) - x * t + log1p(exp(-ax));
 }
-__kernel void nll_loss(__global const float* logProbs, __global const int* targets, __global float* loss, int batchSize, int numClasses) {
+__kernel void nll_loss(__global const float* logProbs, __global const float* targets, __global float* loss, int batchSize, int numClasses) {
     int b = get_global_id(0); if (b >= batchSize) return;
-    int tc = targets[b];
+    // targets holds class indices as float VALUES (e.g. 3.0f == class 3), matching
+    // CpuEngine.TensorNLLLoss which does (int)targetValue. Reading the buffer as int*
+    // reinterpreted the float bit pattern (1.0f -> 1065353216), always out of range, so
+    // the GPU returned 0 (op-parity #775 quarantine: GPU TensorNLLLoss returns 0).
+    int tc = (int)targets[b];
     loss[b] = (tc >= 0 && tc < numClasses) ? -logProbs[b * numClasses + tc] : 0.0f;
 }
 __kernel void kl_div_loss(__global const float* input, __global const float* target, __global float* loss, int size) {

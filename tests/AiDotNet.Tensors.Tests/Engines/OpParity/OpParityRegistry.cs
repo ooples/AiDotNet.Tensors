@@ -1280,10 +1280,10 @@ public static class OpParityRegistry
 
         var lp = OpInput.Rand(2620, new[] { 4, 8 }, -3.0, 3.0);
         var tg = OpInput.Rand(2621, new[] { 4, 8 }, 0.0, 1.0);
-        // FOUND (quarantined): GPU TensorNLLLoss returns 0 where CPU/oracle give the loss — GPU
-        // loss-kernel divergence.
-        yield return new OpCase("TensorNLLLoss[4,8]", "loss", e => e.TensorNLLLoss(e.TensorLogSoftmax(lp.F(), -1), tg.F()), e => e.TensorNLLLoss(e.TensorLogSoftmax(lp.D(), -1), tg.D()), ParityTol.Accum(1e-3), opMethod: "TensorNLLLoss")
-        { KnownDivergence = "GPU TensorNLLLoss returns 0 (loss-kernel divergence)." };
+        // FIXED (#775): GPU nll_loss kernel read the float targets buffer as int* (bit-pattern
+        // reinterpret -> always out of range -> loss 0). Kernel now takes float* and truncates the
+        // value (int)targets[b], matching CpuEngine.TensorNLLLoss.
+        yield return new OpCase("TensorNLLLoss[4,8]", "loss", e => e.TensorNLLLoss(e.TensorLogSoftmax(lp.F(), -1), tg.F()), e => e.TensorNLLLoss(e.TensorLogSoftmax(lp.D(), -1), tg.D()), ParityTol.Accum(1e-3), opMethod: "TensorNLLLoss");
         yield return new OpCase("TensorKLDivLoss[4,8]", "loss", e => e.TensorKLDivLoss(e.TensorLogSoftmax(lp.F(), -1), e.TensorSoftmax(tg.F(), -1)), e => e.TensorKLDivLoss(e.TensorLogSoftmax(lp.D(), -1), e.TensorSoftmax(tg.D(), -1)), ParityTol.Accum(1e-3), opMethod: "TensorKLDivLoss");
     }
 
@@ -1345,13 +1345,12 @@ public static class OpParityRegistry
             var mask = OpInput.From(maskD, s);
             yield return new OpCase("DropoutBackward[4,8]", "activation-bwd", e => e.DropoutBackward(go.F(), mask.F(), 0.5), e => e.DropoutBackward(go.D(), mask.D(), 0.5), ParityTol.Ulp(4, 1e-6), opMethod: "DropoutBackward");
         }
-        // FOUND (quarantined): GPU CrossEntropyBackward returns 0 where CPU/oracle give the gradient
-        // — part of the GPU backward-kernel divergence cluster.
+        // FIXED (#775): GPU CrossEntropyBackward set all kernel args but never dispatched the kernel
+        // (missing Execute1D), so gradInput was never written and the GPU returned all-zero gradients.
         {
             var cep = OpInput.Rand(2304, s, -3.0, 3.0); var cet = OpInput.Rand(2305, s, 0.0, 1.0);
             yield return new OpCase("CrossEntropyBackward[4,8]", "loss-bwd",
-                e => e.CrossEntropyBackward(e.TensorSoftmax(cep.F(), -1), cet.F()), e => e.CrossEntropyBackward(e.TensorSoftmax(cep.D(), -1), cet.D()), ParityTol.Accum(1e-3), opMethod: "CrossEntropyBackward")
-            { KnownDivergence = "GPU CrossEntropyBackward returns 0 (backward-kernel bug cluster)." };
+                e => e.CrossEntropyBackward(e.TensorSoftmax(cep.F(), -1), cet.F()), e => e.CrossEntropyBackward(e.TensorSoftmax(cep.D(), -1), cet.D()), ParityTol.Accum(1e-3), opMethod: "CrossEntropyBackward");
         }
 
         yield return new OpCase("Conv1DBackwardInput[1,8,14->1,3,16]", "conv",

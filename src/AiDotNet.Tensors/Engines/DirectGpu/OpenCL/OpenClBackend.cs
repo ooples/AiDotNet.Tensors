@@ -9023,6 +9023,12 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
             k.SetArg(arg++, batchSize);
             k.SetArg(arg++, numClasses);
+
+            // The kernel is per-element over batchSize * numClasses (idx = b*numClasses + c).
+            // Without this dispatch gradInput was never written, so the GPU returned all-zero
+            // gradients (op-parity #775 quarantine "GPU CrossEntropyBackward returns 0").
+            int total = batchSize * numClasses;
+            k.Execute1D(total, Math.Min(256, total));
         }
 
         public float BinaryCrossEntropyLoss(IGpuBuffer predictions, IGpuBuffer targets, int size)
