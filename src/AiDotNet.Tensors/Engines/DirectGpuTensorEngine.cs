@@ -11130,7 +11130,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 inputData = paddedData;
             }
 
-            int numSamples = input.Length;
+            // Use the (possibly center-padded) inputData length, NOT the raw input length — otherwise
+            // the frame count ignores the center padding and the GPU emits fewer frames than CpuEngine
+            // (op-parity #775 mel-spectrogram/STFT frame-count mismatch, e.g. 15 vs 17).
+            int numSamples = inputData.Length;
             int numFrames = (numSamples - nFft) / hopLength + 1;
             int numFreqs = nFft / 2 + 1;
 

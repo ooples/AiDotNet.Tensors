@@ -757,7 +757,7 @@ public static class OpParityRegistry
             e => e.MelSpectrogram(mwave.F(), 16000, 16, 8, 8, 0f, 8000f, window.F(), true),
             e => e.MelSpectrogram(mwave.D(), 16000, 16, 8, 8, 0.0, 8000.0, window.D(), true),
             ParityTol.Accum(2e-3), opMethod: "MelSpectrogram")
-        { KnownDivergence = "GPU mel-spectrogram emits a different frame count (STFT framing mismatch)." };
+        { KnownDivergence = "GPU mel-spectrogram frame count now matches (STFT numSamples fix), but a mel bin still diverges (GPU hits the -80 dB floor where CPU has a positive value) — residual STFT edge/filterbank value bug." };
     }
 
     // More linear-attention scans (RWKV-7, xLSTM, gated-delta-net) + scatter + interleaved complex.
