@@ -3470,12 +3470,38 @@ public partial class DirectGpuTensorEngine
         catch { return base.Conv3DBackwardKernel(gradOutput, input, kernelShape, stride, padding, dilation); }
     }
 
-    // #775 NOTE: Conv1DBackwardInput/Kernel are NOT wired. backend.Conv1DBackwardInput looks up
-    // _kernelCache["im2col"] (the WRONG kernel — no conv1d_backward kernel exists) and there is no
-    // correct 1D backward kernel; launching it produces a wrong/out-of-bounds dispatch that corrupts GPU
-    // state (surfaced as a downstream determinism failure in NativeMagnitudeAndPhase). A REAL conv1d
-    // backward kernel is needed first — until then these stay CPU-only (probe cannot flag a WRONG-kernel
-    // launch, only a missing one, so this is verified by the full-suite regression, not the probe).
+    // #775: Conv1D backward == Conv2D backward with a singleton height (exactly how CpuEngine implements
+    // it), so route to the on-device Conv2DBackwardInput/Kernel (the correct, validated conv2d_backward_*
+    // kernels) instead of backend.Conv1DBackwardInput (which wrongly launches the im2col kernel and
+    // corrupts GPU state). Reshape the 1D tensors to [N,C,1,L], go through the interface to hit the GPU
+    // override, reshape the result back. Defer to base under tape/GraphMode/wrong-rank.
+    Tensor<T> IEngine.Conv1DBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> kernel, int[] inputShape, int stride, int padding, int dilation)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive
+            || inputShape is not { Length: 3 } || gradOutput.Rank != 3 || kernel.Rank != 3)
+            return base.Conv1DBackwardInput(gradOutput, kernel, inputShape, stride, padding, dilation);
+        var g = gradOutput.Shape._dims; var kd = kernel.Shape._dims;
+        var grad4D = gradOutput.Reshape(new[] { g[0], g[1], 1, g[2] });
+        var kernel4D = kernel.Reshape(new[] { kd[0], kd[1], 1, kd[2] });
+        var result4D = ((IEngine)this).Conv2DBackwardInput(grad4D, kernel4D,
+            new[] { inputShape[0], inputShape[1], 1, inputShape[2] },
+            new[] { 1, stride }, new[] { 0, padding }, new[] { 1, dilation });
+        return result4D.Reshape((int[])inputShape.Clone());
+    }
+
+    Tensor<T> IEngine.Conv1DBackwardKernel<T>(Tensor<T> gradOutput, Tensor<T> input, int[] kernelShape, int stride, int padding, int dilation)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive
+            || kernelShape is not { Length: 3 } || input.Rank != 3 || gradOutput.Rank != 3)
+            return base.Conv1DBackwardKernel(gradOutput, input, kernelShape, stride, padding, dilation);
+        var g = gradOutput.Shape._dims; var ind = input.Shape._dims;
+        var grad4D = gradOutput.Reshape(new[] { g[0], g[1], 1, g[2] });
+        var input4D = input.Reshape(new[] { ind[0], ind[1], 1, ind[2] });
+        var result4D = ((IEngine)this).Conv2DBackwardKernel(grad4D, input4D,
+            new[] { kernelShape[0], kernelShape[1], 1, kernelShape[2] },
+            new[] { 1, stride }, new[] { 0, padding }, new[] { 1, dilation });
+        return result4D.Reshape((int[])kernelShape.Clone());
+    }
 
     // #775: whole-tensor mean (output [1]) via the GPU-resident ReduceMean over all axes.
     Tensor<T> IEngine.TensorMeanDiff<T>(Tensor<T> tensor)
