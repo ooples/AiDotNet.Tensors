@@ -3271,6 +3271,55 @@ public partial class DirectGpuTensorEngine
         catch { return base.MaxPool3DBackward(gradOutput, maxIndices, inputShape, poolSize, stride); }
     }
 
+    // #775: MaxPool3D with indices. backend.MaxPool3D writes the SPATIAL flat argmax (id*inH*inW+ih*inW+iw)
+    // into the indices buffer; download it (int reinterpreted from the float buffer) and decode into the
+    // 6D maxIndices[b,c,od,oh,ow,{id,ih,iw}] the CpuEngine/MaxPool3DBackward contract expects. No padding.
+    Tensor<T> IEngine.MaxPool3DWithIndices<T>(Tensor<T> input, int[] poolSize, int[] stride, out int[,,,,,] maxIndices)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+            || input.Rank != 5 || poolSize is not { Length: 3 } || stride is not { Length: 3 } || !TryGetBackend(out var backend))
+            return base.MaxPool3DWithIndices(input, poolSize, stride, out maxIndices);
+        try
+        {
+            int batch = input.Shape._dims[0], channels = input.Shape._dims[1];
+            int inD = input.Shape._dims[2], inH = input.Shape._dims[3], inW = input.Shape._dims[4];
+            int kD = poolSize[0], kH = poolSize[1], kW = poolSize[2];
+            int sD = stride[0], sH = stride[1], sW = stride[2];
+            if (sD <= 0 || sH <= 0 || sW <= 0) return base.MaxPool3DWithIndices(input, poolSize, stride, out maxIndices);
+            int outD = (inD - kD) / sD + 1, outH = (inH - kH) / sH + 1, outW = (inW - kW) / sW + 1;
+            if (outD <= 0 || outH <= 0 || outW <= 0) return base.MaxPool3DWithIndices(input, poolSize, stride, out maxIndices);
+            int outLen = batch * channels * outD * outH * outW;
+            using var inBuf = GetOrAllocateBuffer(backend, input);
+            var outBuf = AllocateOutputBuffer(backend, outLen);
+            var idxBuf = AllocateOutputBuffer(backend, outLen);
+            try
+            {
+                backend.MaxPool3D(inBuf.Buffer, outBuf.Buffer, idxBuf.Buffer, batch, channels,
+                    inD, inH, inW, outD, outH, outW, kD, kH, kW, sD, sH, sW);
+                var outArr = FinishGpuOp<T>(backend, outBuf, outLen);
+                float[] idxRaw = backend.DownloadBuffer(idxBuf.Buffer);
+                int hw = inH * inW;
+                maxIndices = new int[batch, channels, outD, outH, outW, 3];
+                int p = 0;
+                for (int b = 0; b < batch; b++)
+                    for (int c = 0; c < channels; c++)
+                        for (int od = 0; od < outD; od++)
+                            for (int oh = 0; oh < outH; oh++)
+                                for (int ow = 0; ow < outW; ow++)
+                                {
+                                    int spatial = System.BitConverter.SingleToInt32Bits(idxRaw[p++]);
+                                    int id = spatial / hw, rem = spatial % hw;
+                                    maxIndices[b, c, od, oh, ow, 0] = id;
+                                    maxIndices[b, c, od, oh, ow, 1] = rem / inW;
+                                    maxIndices[b, c, od, oh, ow, 2] = rem % inW;
+                                }
+                return new Tensor<T>(outArr, new[] { batch, channels, outD, outH, outW });
+            }
+            finally { idxBuf.Dispose(); }
+        }
+        catch { return base.MaxPool3DWithIndices(input, poolSize, stride, out maxIndices); }
+    }
+
     // #775: AvgPool3D (NCDHW, no-padding). Scalar overload routes to the int[] one through the interface
     // (a direct this.AvgPool3D call would bypass the explicit impl). Padded / non-float / wrong-rank /
     // tape / GraphMode defer to base.
