@@ -1211,6 +1211,16 @@ public interface IDirectGpuBackend : IDisposable
         int strideD, int strideH, int strideW, int countIncludePad)
         => throw new System.NotSupportedException("AvgPool3D is not implemented for this GPU backend.");
 
+    /// <summary>Backward pass for 3D average pooling (NCDHW). Default-throws (CPU fallback via the
+    /// engine's try/catch); OpenCL overrides it (#775). Parallelizes over input elements.</summary>
+    void AvgPool3DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput,
+        int batch, int channels,
+        int inDepth, int inHeight, int inWidth,
+        int outDepth, int outHeight, int outWidth,
+        int kernelD, int kernelH, int kernelW,
+        int strideD, int strideH, int strideW, int countIncludePad)
+        => throw new System.NotSupportedException("AvgPool3DBackward is not implemented for this GPU backend.");
+
     /// <summary>
     /// Backward pass for 3D max pooling (NCDHW format).
     /// Routes gradients back to the positions that had max values in the forward pass.

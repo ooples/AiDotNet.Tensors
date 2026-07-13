@@ -6960,6 +6960,37 @@ KERNEL VARIANTS (A/B testing):
             k.Execute3D(outWidth, outHeight, batch * channels * outDepth, 8, 8, 1);
         }
 
+        // #775: 3D average-pool backward. The kernel parallelizes over INPUT elements (each gathers from
+        // the output windows covering it), so no scatter race and no pre-zeroing needed.
+        public void AvgPool3DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput,
+            int batch, int channels,
+            int inDepth, int inHeight, int inWidth,
+            int outDepth, int outHeight, int outWidth,
+            int kernelD, int kernelH, int kernelW,
+            int strideD, int strideH, int strideW, int countIncludePad)
+        {
+            var k = _kernelCache["avgpool3d_backward"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
+            k.SetArg(arg++, batch);
+            k.SetArg(arg++, channels);
+            k.SetArg(arg++, inDepth);
+            k.SetArg(arg++, inHeight);
+            k.SetArg(arg++, inWidth);
+            k.SetArg(arg++, outDepth);
+            k.SetArg(arg++, outHeight);
+            k.SetArg(arg++, outWidth);
+            k.SetArg(arg++, kernelD);
+            k.SetArg(arg++, kernelH);
+            k.SetArg(arg++, kernelW);
+            k.SetArg(arg++, strideD);
+            k.SetArg(arg++, strideH);
+            k.SetArg(arg++, strideW);
+            k.SetArg(arg++, countIncludePad);
+            k.Execute3D(inWidth, inHeight, batch * channels * inDepth, 8, 8, 1);
+        }
+
         public void NearestNeighborUpsample3D(IGpuBuffer input, IGpuBuffer output,
             int batch, int channels,
             int inDepth, int inHeight, int inWidth,

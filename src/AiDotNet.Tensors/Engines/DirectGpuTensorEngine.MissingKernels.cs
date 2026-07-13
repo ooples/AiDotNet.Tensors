@@ -3313,6 +3313,37 @@ public partial class DirectGpuTensorEngine
         catch { return base.AvgPool3D(input, poolSize, stride, padding); }
     }
 
+    // #775: AvgPool3D backward (NCDHW, no-padding). The avgpool3d_backward kernel parallelizes over input
+    // elements and WRITES each gradInput cell (gather, not scatter) so no pre-zeroing. Defer padded /
+    // non-float / wrong-rank / tape / GraphMode to base.
+    Tensor<T> IEngine.AvgPool3DBackward<T>(Tensor<T> gradOutput, int[] inputShape, int[] poolSize, int[] stride, int[] padding)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+            || inputShape is not { Length: 5 } || poolSize is not { Length: 3 } || stride is not { Length: 3 }
+            || padding is not { Length: 3 } || padding[0] != 0 || padding[1] != 0 || padding[2] != 0
+            || gradOutput.Rank != 5 || !TryGetBackend(out var backend))
+            return base.AvgPool3DBackward(gradOutput, inputShape, poolSize, stride, padding);
+        try
+        {
+            int batch = inputShape[0], channels = inputShape[1], inD = inputShape[2], inH = inputShape[3], inW = inputShape[4];
+            int outD = gradOutput.Shape._dims[2], outH = gradOutput.Shape._dims[3], outW = gradOutput.Shape._dims[4];
+            int kD = poolSize[0], kH = poolSize[1], kW = poolSize[2];
+            int sD = stride[0], sH = stride[1], sW = stride[2];
+            int inLen = batch * channels * inD * inH * inW;
+            using var gradOutBuf = GetOrAllocateBuffer(backend, gradOutput);
+            var gradInBuf = AllocateOutputBuffer(backend, inLen);
+            try
+            {
+                backend.AvgPool3DBackward(gradOutBuf.Buffer, gradInBuf.Buffer, batch, channels, inD, inH, inW,
+                    outD, outH, outW, kD, kH, kW, sD, sH, sW, countIncludePad: 1);
+                var arr = FinishGpuOp<T>(backend, gradInBuf, inLen);
+                return new Tensor<T>(arr, (int[])inputShape.Clone());
+            }
+            catch { gradInBuf.Dispose(); throw; }
+        }
+        catch { return base.AvgPool3DBackward(gradOutput, inputShape, poolSize, stride, padding); }
+    }
+
     // #775: whole-tensor mean (output [1]) via the GPU-resident ReduceMean over all axes.
     Tensor<T> IEngine.TensorMeanDiff<T>(Tensor<T> tensor)
     {
