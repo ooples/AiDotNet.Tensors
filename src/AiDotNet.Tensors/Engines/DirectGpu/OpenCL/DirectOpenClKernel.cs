@@ -139,6 +139,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// </summary>
         public void Execute1D(int globalSize, int localSize)
         {
+            GpuLaunchProbe.OnLaunch();
             // Round up global size to multiple of local size
             int alignedGlobal = ((globalSize + localSize - 1) / localSize) * localSize;
 
@@ -171,6 +172,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// </summary>
         public void Execute2D(int globalSizeX, int globalSizeY, int localSizeX, int localSizeY)
         {
+            GpuLaunchProbe.OnLaunch();
             // Round up global sizes to multiples of local sizes
             int alignedGlobalX = ((globalSizeX + localSizeX - 1) / localSizeX) * localSizeX;
             int alignedGlobalY = ((globalSizeY + localSizeY - 1) / localSizeY) * localSizeY;
@@ -204,6 +206,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// </summary>
         public void Execute3D(int globalSizeX, int globalSizeY, int globalSizeZ, int localSizeX, int localSizeY, int localSizeZ)
         {
+            GpuLaunchProbe.OnLaunch();
             // Round up global sizes to multiples of local sizes
             int alignedGlobalX = ((globalSizeX + localSizeX - 1) / localSizeX) * localSizeX;
             int alignedGlobalY = ((globalSizeY + localSizeY - 1) / localSizeY) * localSizeY;
@@ -245,6 +248,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// <param name="localSize">The local work size.</param>
         public void Execute1DOnQueue(IntPtr commandQueue, int globalSize, int localSize)
         {
+            GpuLaunchProbe.OnLaunch();
             // Round up global size to multiple of local size
             int alignedGlobal = ((globalSize + localSize - 1) / localSize) * localSize;
 
@@ -282,6 +286,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// <param name="localSizeY">The local work size in Y dimension.</param>
         public void Execute2DOnQueue(IntPtr commandQueue, int globalSizeX, int globalSizeY, int localSizeX, int localSizeY)
         {
+            GpuLaunchProbe.OnLaunch();
             // Round up global sizes to multiples of local sizes
             int alignedGlobalX = ((globalSizeX + localSizeX - 1) / localSizeX) * localSizeX;
             int alignedGlobalY = ((globalSizeY + localSizeY - 1) / localSizeY) * localSizeY;
@@ -323,6 +328,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void Execute3DOnQueue(IntPtr commandQueue, int globalSizeX, int globalSizeY, int globalSizeZ,
             int localSizeX, int localSizeY, int localSizeZ)
         {
+            GpuLaunchProbe.OnLaunch();
             // Round up global sizes to multiples of local sizes
             int alignedGlobalX = ((globalSizeX + localSizeX - 1) / localSizeX) * localSizeX;
             int alignedGlobalY = ((globalSizeY + localSizeY - 1) / localSizeY) * localSizeY;

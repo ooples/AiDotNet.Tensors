@@ -3183,13 +3183,9 @@ public partial class DirectGpuTensorEngine
         return TensorMatMul(gradOutput, TensorTranspose(weights));                 // gradOut @ Wᵀ
     }
 
-    // #775: repeat-elements (each element repeated `repeats` times along `axis`) is exactly
-    // repeat-interleave, which is a GPU-resident override — route to it. Defer to base under
-    // tape/GraphMode/out-of-range args.
-    Tensor<T> IEngine.TensorRepeatElements<T>(Tensor<T> tensor, int repeats, int axis)
-    {
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || repeats < 1 || axis < 0 || axis >= tensor.Rank)
-            return base.TensorRepeatElements(tensor, repeats, axis);
-        return TensorRepeatInterleave(tensor, repeats, axis);
-    }
+    // #775 NOTE: TensorRepeatElements is NOT wired here. Routing it to TensorRepeatInterleave (last-axis
+    // GPU only) or a reshape->TensorTile->reshape identity both leave it on the CPU for a non-last axis
+    // (the GpuLaunchProbe measured zero GPU work) — TensorTile/RepeatInterleave/Gather all fall back to
+    // the host for these shapes. It needs a real non-last-axis repeat kernel; until then it stays an
+    // honest entry on BOTH the reflection worklist and the gpu-cpu-fallback worklist.
 }

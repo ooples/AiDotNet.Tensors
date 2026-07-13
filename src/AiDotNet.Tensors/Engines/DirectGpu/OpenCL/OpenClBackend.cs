@@ -1230,6 +1230,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var destOffsetBytes = new UIntPtr((ulong)destOffset * sizeof(float));
             var sizeBytes = new UIntPtr((ulong)size * sizeof(float));
 
+            GpuLaunchProbe.OnLaunch(); // device-to-device copy = GPU-resident work (keeps data on device)
             int err = OpenClNativeBindings.EnqueueCopyBuffer(
                 _context.CommandQueue,
                 srcHandle,
@@ -4228,6 +4229,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var srcBuffer = (DirectOpenClGpuBuffer)source;
             var dstBuffer = (DirectOpenClGpuBuffer)destination;
 
+            GpuLaunchProbe.OnLaunch(); // device-to-device copy = GPU-resident work
             int err = OpenClNativeBindings.EnqueueCopyBuffer(
                 stream.Handle,
                 srcBuffer.Buffer.Handle,
@@ -10994,6 +10996,7 @@ KERNEL VARIANTS (A/B testing):
             var dstBuf = ((DirectOpenClGpuBuffer)dst).Buffer;
 
             // Use EnqueueCopyBuffer for device-to-device copy
+            GpuLaunchProbe.OnLaunch(); // device-to-device copy = GPU-resident work
             int err = OpenClNativeBindings.EnqueueCopyBuffer(
                 _context.CommandQueue,
                 srcBuf.Handle,
