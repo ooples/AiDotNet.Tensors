@@ -80,7 +80,7 @@ public static class OpParityRegistry
             e => e.NativeComplexIFFTNDReal(re2.CF(im2), new[] { 0, 1 }),
             e => e.NativeComplexIFFTNDReal(re2.CD(im2), new[] { 0, 1 }),
             ParityTol.Accum(1e-3), opMethod: "NativeComplexIFFTNDReal")
-        { KnownDivergence = "GPU N-D IFFT-to-real diverges ~0.32 abs; CPU matches oracle." };
+        { KnownDivergence = "GPU N-D IFFT-to-real uses a separate ND path (not the fixed FFT2D); still diverges ~0.32 abs." };
     }
 
     // Grouped-deform mask backward, fold, reorder-to-NCHW, unique-consecutive.
@@ -167,8 +167,7 @@ public static class OpParityRegistry
         // oracle) — same GPU FFT-kernel family as NativeSpectralFilter / wideband / 2D-IFFT.
         yield return new OpCase("NativeSpectralFilterBatch[1,2,4,8]", "audio",
             e => e.NativeSpectralFilterBatch(sfIn.F(), fRe.CF(fIm)), e => e.NativeSpectralFilterBatch(sfIn.D(), fRe.CD(fIm)),
-            ParityTol.Accum(2e-3), opMethod: "NativeSpectralFilterBatch")
-        { KnownDivergence = "GPU FFT-based batched spectral filter diverges ~0.79 abs; CPU matches oracle." };
+            ParityTol.Accum(2e-3), opMethod: "NativeSpectralFilterBatch");
     }
 
     // Spherical harmonics, multiresolution hash encoding, gaussian rasterization.
@@ -222,8 +221,7 @@ public static class OpParityRegistry
         // oracle (49 ULP) — same GPU FFT-kernel family as the wideband/2D-IFFT divergences.
         yield return new OpCase("NativeSpectralFilter[4,8]", "audio",
             e => e.NativeSpectralFilter(sfIn.F(), fRe.CF(fIm)), e => e.NativeSpectralFilter(sfIn.D(), fRe.CD(fIm)),
-            ParityTol.Accum(2e-3), opMethod: "NativeSpectralFilter")
-        { KnownDivergence = "GPU FFT-based spectral filter diverges ~0.93 abs; CPU matches oracle." };
+            ParityTol.Accum(2e-3), opMethod: "NativeSpectralFilter");
     }
 
     // BCE backward, scatter-max/softmax backward, deform-mask backward, reduce-max backward.
@@ -524,8 +522,7 @@ public static class OpParityRegistry
         // the 1D NativeComplexIFFTReal passes, so it's the 2D GPU FFT kernel.
         yield return new OpCase("NativeComplexIFFT2DReal[4,4]", "complex",
             e => e.NativeComplexIFFT2DReal(re2.CF(im2)), e => e.NativeComplexIFFT2DReal(re2.CD(im2)),
-            ParityTol.Accum(1e-3), opMethod: "NativeComplexIFFT2DReal")
-        { KnownDivergence = "GPU 2D IFFT-to-real kernel diverges ~0.38 abs; 1D passes." };
+            ParityTol.Accum(1e-3), opMethod: "NativeComplexIFFT2DReal");
 
         var reM = OpInput.Rand(4420, new[] { 4, 6 });
         var imM = OpInput.Rand(4421, new[] { 4, 6 });
@@ -752,7 +749,7 @@ public static class OpParityRegistry
         yield return new OpCase("NativeWidebandFeatures[2,512;seg4;bins20]", "audio",
             e => e.NativeWidebandFeatures(wave.F(), 4, 20), e => e.NativeWidebandFeatures(wave.D(), 4, 20),
             ParityTol.Accum(2e-3), opMethod: "NativeWidebandFeatures")
-        { KnownDivergence = "GPU wideband-feature FFT kernel diverges ~2.24 abs; CPU matches oracle." };
+        { KnownDivergence = "GPU wideband-feature FFT uses a separate 1D-FFT path (not the fixed FFT2D); still diverges ~2.24 abs." };
 
         // Mel-spectrogram of a [1,128] signal, nFft 16, hop 8, 8 mels.
         // FOUND (quarantined): GPU emits a different frame count (120 vs CPU/oracle 136) -> STFT

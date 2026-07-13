@@ -10695,16 +10695,22 @@ KERNEL VARIANTS (A/B testing):
             int log2Width = (int)MathHelper.Log2(width);
             int log2Height = (int)MathHelper.Log2(height);
 
-            // Row-wise bit reversal
+            // Row-wise bit reversal. NOTE: these 2D-FFT kernels index via a FLATTENED
+            // get_global_id(0) (row = tid/width etc.), so they MUST be dispatched 1D over the full
+            // element count. They were dispatched via Execute2D (a real 2D NDRange), so
+            // get_global_id(0) only spanned one row/col's worth and every row/col but the first was
+            // left untransformed — the root cause of the whole GPU 2D/ND-FFT divergence family (#775).
+            int rowsTotal = width * height;
             var bitRevRowsKernel = _kernelCache["bit_reverse_rows"];
             bitRevRowsKernel.SetArg(0, outReal.Handle);
             bitRevRowsKernel.SetArg(1, outImag.Handle);
             bitRevRowsKernel.SetArg(2, height);
             bitRevRowsKernel.SetArg(3, width);
             bitRevRowsKernel.SetArg(4, log2Width);
-            bitRevRowsKernel.Execute2D(width, height, Math.Min(16, width), Math.Min(16, height));
+            bitRevRowsKernel.Execute1D(rowsTotal, Math.Min(256, rowsTotal));
 
-            // Row-wise FFT
+            // Row-wise FFT (one butterfly pair per work item: (width/2) pairs per row × height rows)
+            int rowButterflyItems = (width / 2) * height;
             var rowButterfly = _kernelCache["fft_rows_butterfly"];
             for (int stride = 2; stride <= width; stride *= 2)
             {
@@ -10714,7 +10720,7 @@ KERNEL VARIANTS (A/B testing):
                 rowButterfly.SetArg(3, width);
                 rowButterfly.SetArg(4, stride);
                 rowButterfly.SetArg(5, inverse ? 1 : 0);
-                rowButterfly.Execute2D(width / 2, height, Math.Min(16, width / 2), Math.Min(16, height));
+                rowButterfly.Execute1D(rowButterflyItems, Math.Min(256, rowButterflyItems));
             }
 
             // Column-wise bit reversal
@@ -10724,9 +10730,10 @@ KERNEL VARIANTS (A/B testing):
             bitRevColsKernel.SetArg(2, height);
             bitRevColsKernel.SetArg(3, width);
             bitRevColsKernel.SetArg(4, log2Height);
-            bitRevColsKernel.Execute2D(width, height, Math.Min(16, width), Math.Min(16, height));
+            bitRevColsKernel.Execute1D(rowsTotal, Math.Min(256, rowsTotal));
 
-            // Column-wise FFT
+            // Column-wise FFT ((height/2) pairs per col × width cols)
+            int colButterflyItems = (height / 2) * width;
             var colButterfly = _kernelCache["fft_cols_butterfly"];
             for (int stride = 2; stride <= height; stride *= 2)
             {
@@ -10736,7 +10743,7 @@ KERNEL VARIANTS (A/B testing):
                 colButterfly.SetArg(3, width);
                 colButterfly.SetArg(4, stride);
                 colButterfly.SetArg(5, inverse ? 1 : 0);
-                colButterfly.Execute2D(height / 2, width, Math.Min(16, height / 2), Math.Min(16, width));
+                colButterfly.Execute1D(colButterflyItems, Math.Min(256, colButterflyItems));
             }
 
             // Scale for inverse FFT
