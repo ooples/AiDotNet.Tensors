@@ -3057,4 +3057,38 @@ public partial class DirectGpuTensorEngine
         var gradB = TensorMultiply(TensorMultiply(a, swishDeriv), gradOutput);
         return TensorConcatenate(new[] { gradA, gradB }, actualDim);
     }
+
+    // #775: ReGLU backward. ReGLU(input) = a * relu(b). d/da = relu(b)*gradOut = (b*gradOut) masked by
+    // (b>0); d/db = a*(b>0)*gradOut = (a*gradOut) masked by (b>0). Both maskings ARE ReluBackward(g,b) =
+    // g*(b>0), which is GPU-resident — so the whole op stays on-device. Defer to base under tape/GraphMode.
+    Tensor<T> IEngine.ReGLUBackward<T>(Tensor<T> gradOutput, Tensor<T> input, int dim)
+    {
+        int actualDim = dim < 0 ? input.Rank + dim : dim;
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || actualDim < 0 || actualDim >= input.Rank
+            || input.Shape._dims[actualDim] % 2 != 0)
+            return base.ReGLUBackward(gradOutput, input, dim);
+        int half = input.Shape._dims[actualDim] / 2;
+        var a = TensorNarrow(input, actualDim, 0, half);
+        var b = TensorNarrow(input, actualDim, half, half);
+        var gradA = ReluBackward(TensorMultiply(b, gradOutput), b);   // relu(b)*gradOut
+        var gradB = ReluBackward(TensorMultiply(a, gradOutput), b);   // a*(b>0)*gradOut
+        return TensorConcatenate(new[] { gradA, gradB }, actualDim);
+    }
+
+    // #775: GeGLU backward. GeGLU(input) = a * gelu(b). d/da = gelu(b)*gradOut; d/db = a*gelu'(b)*gradOut,
+    // and gelu'(b)*(a*gradOut) IS GeluBackward(a*gradOut, b), which is GPU-resident (same gelu the GPU
+    // GELU forward uses). Fully on-device. Defer to base under tape/GraphMode/odd split.
+    Tensor<T> IEngine.GeGLUBackward<T>(Tensor<T> gradOutput, Tensor<T> input, int dim)
+    {
+        int actualDim = dim < 0 ? input.Rank + dim : dim;
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || actualDim < 0 || actualDim >= input.Rank
+            || input.Shape._dims[actualDim] % 2 != 0)
+            return base.GeGLUBackward(gradOutput, input, dim);
+        int half = input.Shape._dims[actualDim] / 2;
+        var a = TensorNarrow(input, actualDim, 0, half);
+        var b = TensorNarrow(input, actualDim, half, half);
+        var gradA = TensorMultiply(GELU(b), gradOutput);               // gelu(b)*gradOut
+        var gradB = GeluBackward(TensorMultiply(a, gradOutput), b);    // a*gelu'(b)*gradOut
+        return TensorConcatenate(new[] { gradA, gradB }, actualDim);
+    }
 }
