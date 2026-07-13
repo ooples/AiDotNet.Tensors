@@ -11161,6 +11161,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var fftRealBuffer = AllocateOutputBuffer(backend, nFft);
             using var fftImagBuffer = AllocateOutputBuffer(backend, nFft);
             using var zeroBuffer = AllocateOutputBuffer(backend, nFft);
+            // zeroBuffer is the FFT's IMAGINARY input; AllocateOutputBuffer does NOT zero-initialize, so
+            // explicitly zero it — otherwise the per-frame FFT reads stale pool memory as the imaginary
+            // part (op-parity #775 mel-spectrogram residual).
+            backend.Fill(zeroBuffer.Buffer, 0f, nFft);
 
             float[] magnitudeData = new float[numFrames * numFreqs];
             float[] phaseData = new float[numFrames * numFreqs];

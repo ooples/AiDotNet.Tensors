@@ -763,8 +763,7 @@ public static class OpParityRegistry
         yield return new OpCase("MelSpectrogram[1,128;nfft16;mels8]", "audio",
             e => e.MelSpectrogram(mwave.F(), 16000, 16, 8, 8, 0f, 8000f, window.F(), true),
             e => e.MelSpectrogram(mwave.D(), 16000, 16, 8, 8, 0.0, 8000.0, window.D(), true),
-            ParityTol.Accum(2e-3), opMethod: "MelSpectrogram")
-        { KnownDivergence = "Two GPU mel bugs FIXED (STFT reflection padding + [frames,mels]->[mels,frames] transpose to match CpuEngine); one residual bin remains where the GPU STFT/ApplyMelFilterbank gives ~0 power vs CPU's real value (middle frame, not padding) — deep single-bin STFT/filterbank kernel detail." };
+            ParityTol.Accum(2e-3), opMethod: "MelSpectrogram");
     }
 
     // More linear-attention scans (RWKV-7, xLSTM, gated-delta-net) + scatter + interleaved complex.

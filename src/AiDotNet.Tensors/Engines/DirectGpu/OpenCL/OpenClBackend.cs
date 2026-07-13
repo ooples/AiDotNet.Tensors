@@ -10898,7 +10898,11 @@ KERNEL VARIANTS (A/B testing):
             kernel.SetArg(3, numFrames);
             kernel.SetArg(4, numFreqs);
             kernel.SetArg(5, nMels);
-            kernel.Execute2D(nMels, numFrames, Math.Min(32, nMels), 1);
+            // apply_mel_filterbank indexes a FLATTENED get_global_id(0) (frame = idx/nMels), so it MUST
+            // be dispatched 1D over numFrames*nMels. Dispatching Execute2D made get_global_id(0) span only
+            // [0,nMels), leaving all but the first frame's higher mel bins uncomputed (op-parity #775).
+            int melTotal = numFrames * nMels;
+            kernel.Execute1D(melTotal, Math.Min(256, melTotal));
         }
 
         /// <inheritdoc/>
