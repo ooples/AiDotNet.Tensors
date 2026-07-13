@@ -31,11 +31,21 @@ public static class IEngineOpInventory
     public static int TotalPublicMethodOverloads() =>
         typeof(IEngine).GetMethods(BindingFlags.Public | BindingFlags.Instance).Length;
 
-    private static bool IsTensorReturning(MethodInfo m)
+    private static bool IsTensorReturning(MethodInfo m) => ProducesTensor(m.ReturnType);
+
+    /// <summary>A return type "produces a tensor" if it is a bare <c>Tensor&lt;T&gt;</c>, an ARRAY of
+    /// them (<c>Tensor&lt;T&gt;[]</c>), or a tuple carrying at least one — so multi-output ops like
+    /// split / unstack / meshgrid enter the coverage denominator instead of silently hiding parity gaps.</summary>
+    private static bool ProducesTensor(System.Type rt)
     {
-        var rt = m.ReturnType;
         // Tensor<T> reflects as the open/closed generic named "Tensor`1".
-        return rt.IsGenericType && rt.Name == "Tensor`1";
+        if (rt.IsGenericType && rt.Name == "Tensor`1") return true;
+        // Tensor<T>[] (or jagged arrays of tensors).
+        if (rt.IsArray && rt.GetElementType() is { } el && ProducesTensor(el)) return true;
+        // (Value)Tuple<...> with a tensor in any slot — split/unstack/meshgrid-style multi-returns.
+        if (rt.IsGenericType && rt.FullName is { } fn && fn.StartsWith("System.ValueTuple`", System.StringComparison.Ordinal))
+            return rt.GetGenericArguments().Any(ProducesTensor);
+        return false;
     }
 }
 #endif
