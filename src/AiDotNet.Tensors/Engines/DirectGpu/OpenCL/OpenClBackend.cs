@@ -67,7 +67,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
 
         private DirectOpenClContext? _context;
-        private readonly Dictionary<string, DirectOpenClKernel> _kernelCache;
+        private readonly OpenClKernelCache _kernelCache;
         private readonly List<DirectOpenClProgram> _programs;
         private DynamicGemmKernel? _dynamicGemm;
         private bool _disposed;
@@ -173,7 +173,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public OpenClBackend(int deviceIndex, ILogger? logger = null)
         {
             _logger = logger;
-            _kernelCache = new Dictionary<string, DirectOpenClKernel>();
+            _kernelCache = new OpenClKernelCache();
             _programs = new List<DirectOpenClProgram>();
             _maxWorkItemSizes = Array.Empty<ulong>();
 

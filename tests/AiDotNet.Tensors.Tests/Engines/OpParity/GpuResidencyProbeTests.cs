@@ -34,6 +34,11 @@ public sealed class GpuResidencyProbeTests
     // <= assertion cannot false-fail.
     private const int CpuFallbackFloor = 160;
 
+    // Ops whose GPU override throws kernel-not-found and silently falls back to the CPU (a hollow
+    // override — reflection counts it covered, the probe proves it does zero GPU work). GOAL 0.
+    // Ratchets DOWN only: register/write the missing kernel or compose from a working primitive.
+    private const int HollowOverrideFloor = 10;
+
     [SkippableFact]
     public void EveryRegistryOp_ActuallyLaunchesAGpuKernel()
     {
@@ -50,6 +55,10 @@ public sealed class GpuResidencyProbeTests
         var fallback = new SortedSet<string>(StringComparer.Ordinal); // ran on CPU (0 launches)
         var covered = new SortedSet<string>(StringComparer.Ordinal);  // launched >= 1 kernel
         var errored = new SortedSet<string>(StringComparer.Ordinal);  // threw (can't classify)
+        // Of the fallbacks: HOLLOW = 0 launches AND a kernel-not-found miss (a GPU override asked for an
+        // unregistered kernel and silently fell to the CPU). These are BUGS. The rest (0 launches, no miss)
+        // are legitimately zero-compute views (reshape/permute/narrow) or CPU-guarded paths.
+        var hollow = new SortedSet<string>(StringComparer.Ordinal);
 
         foreach (var op in OpParityRegistry.All())
         {
@@ -60,28 +69,39 @@ public sealed class GpuResidencyProbeTests
             try { _ = op.RunFloat(gpu).ToArray(); }
             catch { errored.Add(op.Name); continue; }
 
-            if (GpuLaunchProbe.Count == 0) fallback.Add($"{op.Name}\t{op.Category}");
-            else covered.Add(op.Name);
+            if (GpuLaunchProbe.Count > 0) { covered.Add(op.Name); continue; }
+            fallback.Add($"{op.Name}\t{op.Category}");
+            if (GpuLaunchProbe.KernelMisses > 0)
+                hollow.Add($"{op.Name}\t{op.Category}\tmissing-kernel: {string.Join(",", GpuLaunchProbe.MissedKernelNames)}");
         }
 
-        WriteReport(covered, fallback, errored);
+        WriteReport(covered, fallback, errored, hollow);
 
         Assert.True(fallback.Count <= CpuFallbackFloor,
             $"{fallback.Count} registry ops execute ZERO GPU kernels on the GPU engine (floor " +
             $"{CpuFallbackFloor}) — they silently run on the CPU when the caller selected the GPU engine. " +
             $"See gpu-cpu-fallback.md for the list. Write a kernel or GPU-primitive composition to move " +
             $"them on-device; do not raise the floor.");
+
+        Assert.True(hollow.Count <= HollowOverrideFloor,
+            $"{hollow.Count} ops have a GPU override that threw kernel-not-found and SILENTLY fell back to " +
+            $"the CPU (floor {HollowOverrideFloor}) — reflection thinks they are GPU-covered but they do zero " +
+            $"GPU work. See gpu-hollow-overrides.md (lists the missing kernel per op). Register/write the " +
+            $"kernel or compose from a working primitive; do not raise the floor.");
     }
 
-    private static void WriteReport(IEnumerable<string> covered, IEnumerable<string> fallback, IEnumerable<string> errored)
+    private static void WriteReport(IEnumerable<string> covered, IEnumerable<string> fallback,
+        IEnumerable<string> errored, IEnumerable<string> hollow)
     {
         var cov = covered.ToList();
         var fb = fallback.ToList();
         var er = errored.ToList();
+        var hw = hollow.ToList();
         var sb = new StringBuilder();
         sb.AppendLine("# GPU residency probe — measured kernel launches per op (#775)");
         sb.AppendLine($"ran >= 1 GPU kernel (on-device) : {cov.Count}");
         sb.AppendLine($"ran ZERO GPU kernels (CPU fallback, the worklist) : {fb.Count} (goal 0)");
+        sb.AppendLine($"  of which HOLLOW (override threw kernel-not-found -> silent CPU) : {hw.Count}");
         sb.AppendLine($"threw before classifying : {er.Count}");
         sb.AppendLine();
         sb.AppendLine("## CPU fallback — ran entirely on the host (op\\tcategory)");
@@ -89,12 +109,25 @@ public sealed class GpuResidencyProbeTests
         sb.AppendLine();
         sb.AppendLine("## errored (excluded from the count)");
         foreach (var n in er) sb.AppendLine($"  [!] {n}");
+        WriteFile("gpu-cpu-fallback.md", sb.ToString());
+
+        var hb = new StringBuilder();
+        hb.AppendLine("# Hollow GPU overrides — threw kernel-not-found, silently fell back to CPU (#775)");
+        hb.AppendLine($"count : {hw.Count} (goal 0). Reflection counts these GPU-covered; they do ZERO GPU work.");
+        hb.AppendLine("Each: op<TAB>category<TAB>the kernel name(s) that were looked up but not registered.");
+        hb.AppendLine();
+        foreach (var n in hw) hb.AppendLine($"  [ ] {n}");
+        WriteFile("gpu-hollow-overrides.md", hb.ToString());
+    }
+
+    private static void WriteFile(string name, string content)
+    {
         try
         {
             var dir = Environment.GetEnvironmentVariable("AIDOTNET_OPPARITY_REPORT_DIR")
                       ?? Path.Combine(Path.GetTempPath(), "aidotnet-opparity");
             Directory.CreateDirectory(dir);
-            File.WriteAllText(Path.Combine(dir, "gpu-cpu-fallback.md"), sb.ToString());
+            File.WriteAllText(Path.Combine(dir, name), content);
         }
         catch { /* best-effort */ }
     }

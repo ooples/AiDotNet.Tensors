@@ -21,6 +21,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 internal static class GpuLaunchProbe
 {
     private static long _count;
+    private static long _kernelMisses;
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _missedNames = new();
 
     /// <summary>Total kernel launches observed since the last <see cref="Reset"/> (lock-free read).</summary>
     public static long Count => Interlocked.Read(ref _count);
@@ -28,6 +30,26 @@ internal static class GpuLaunchProbe
     /// <summary>Called once per GPU kernel dispatch. Cheap; safe to call from any thread.</summary>
     public static void OnLaunch() => Interlocked.Increment(ref _count);
 
-    /// <summary>Zeroes the counter before a measured region. Returns the pre-reset value.</summary>
-    public static long Reset() => Interlocked.Exchange(ref _count, 0);
+    /// <summary>Kernel-not-found lookups (throwing indexer) since the last <see cref="Reset"/>. A op that
+    /// does ZERO launches but has a miss recorded is a HOLLOW override: it asked for an unregistered kernel
+    /// and its caller silently fell back to the CPU. (Checked TryGetValue misses are NOT counted here.)</summary>
+    public static long KernelMisses => Interlocked.Read(ref _kernelMisses);
+
+    /// <summary>Distinct kernel names that were looked up and missing since the last <see cref="Reset"/>.</summary>
+    public static string[] MissedKernelNames => System.Linq.Enumerable.ToArray(_missedNames.Keys);
+
+    /// <summary>Records a throwing kernel-cache miss (called from the kernel cache indexer only).</summary>
+    public static void OnKernelMiss(string name)
+    {
+        Interlocked.Increment(ref _kernelMisses);
+        if (name is not null) _missedNames.TryAdd(name, 0);
+    }
+
+    /// <summary>Zeroes launches AND misses before a measured region. Returns the pre-reset launch count.</summary>
+    public static long Reset()
+    {
+        Interlocked.Exchange(ref _kernelMisses, 0);
+        _missedNames.Clear();
+        return Interlocked.Exchange(ref _count, 0);
+    }
 }
