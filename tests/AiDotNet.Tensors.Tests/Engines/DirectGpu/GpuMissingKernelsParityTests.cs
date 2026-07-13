@@ -734,14 +734,14 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
     public void GridSampleBackward_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;
-        int N = 2, H = 4, W = 5, C = 3, outH = 3, outW = 4;   // NHWC
-        var gradOut = Rand(340, N, outH, outW, C);
-        var input = Rand(342, N, H, W, C);
+        int N = 2, C = 3, H = 4, W = 5, outH = 3, outW = 4;   // NCHW (PyTorch)
+        var gradOut = Rand(340, N, C, outH, outW);
+        var input = Rand(342, N, C, H, W);
         var grid = Rand(341, N, outH, outW, 2);               // normalized coords ~[-1,1]
         var mode = AiDotNet.Tensors.Engines.GridSampleMode.Bilinear;
         var pad = AiDotNet.Tensors.Engines.GridSamplePadding.Zeros;
-        AssertMatch(_gpu.GridSampleBackwardInput(gradOut, grid, new[] { N, H, W, C }, mode, pad, false),
-                    _cpu.GridSampleBackwardInput(gradOut, grid, new[] { N, H, W, C }, mode, pad, false), "GSBackwardInput");
+        AssertMatch(_gpu.GridSampleBackwardInput(gradOut, grid, new[] { N, C, H, W }, mode, pad, false),
+                    _cpu.GridSampleBackwardInput(gradOut, grid, new[] { N, C, H, W }, mode, pad, false), "GSBackwardInput");
         AssertMatch(_gpu.GridSampleBackwardGrid(gradOut, input, grid, mode, pad, false),
                     _cpu.GridSampleBackwardGrid(gradOut, input, grid, mode, pad, false), "GSBackwardGrid");
     }

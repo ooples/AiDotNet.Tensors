@@ -19147,8 +19147,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bufIn = GetOrAllocateBuffer(backend, input);
             using var bufGrid = GetOrAllocateBuffer(backend, grid);
             var bufOut = AllocateOutputBuffer(backend, batch * channels * outH * outW);
+            // Match CpuEngine.GridSample (2-arg): align_corners=True + border/clamp padding.
             backend.GridSample(bufIn.Buffer, bufGrid.Buffer, bufOut.Buffer,
-                batch, channels, inH, inW, outH, outW);
+                batch, channels, inH, inW, outH, outW, paddingMode: 1, alignCorners: true);
             var result = FinishGpuOp<T>(backend, bufOut, batch * channels * outH * outW);
             return new Tensor<T>(result, new[] { batch, channels, outH, outW });
         }

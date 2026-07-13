@@ -485,10 +485,11 @@ __kernel void histogramdd(__global const float* samples, volatile __global float
 // (b,oh,ow,c) output: scatter gradOut into the 4 bilinear input corners (atomic). gradIn pre-zeroed.
 __kernel void gridsample_backward_input(__global const float* gradOut, __global const float* grid,
     volatile __global float* gradIn, int batch, int H, int W, int C, int outH, int outW) {
-    int idx = get_global_id(0); int total = batch*outH*outW*C; if (idx >= total) return;
-    int c = idx % C; int tmp = idx / C;
-    int ow = tmp % outW; tmp /= outW;
-    int oh = tmp % outH; int b = tmp / outH;
+    // NCHW: gradOut [b,c,oh,ow], gradIn [b,c,H,W], grid [b,oh,ow,2]. idx == the gradOut flat index.
+    int idx = get_global_id(0); int total = batch*C*outH*outW; if (idx >= total) return;
+    int ow = idx % outW; int tmp = idx / outW;
+    int oh = tmp % outH; tmp /= outH;
+    int c = tmp % C; int b = tmp / C;
     int gridBase = ((b*outH + oh)*outW + ow)*2;
     float gx = grid[gridBase]; float gy = grid[gridBase+1];
     float srcH = (gy + 1.0f) * 0.5f * (float)(H - 1);
@@ -497,12 +498,13 @@ __kernel void gridsample_backward_input(__global const float* gradOut, __global 
     int h0 = (int)floor(srcH); int h1 = h0 + 1; int w0 = (int)floor(srcW); int w1 = w0 + 1;
     float lh = srcH - (float)h0; float lw = srcW - (float)w0;
     float g = gradOut[idx];
-    if (h0>=0 && h0<H && w0>=0 && w0<W) atomicAddF(&gradIn[((b*H+h0)*W+w0)*C+c], g*(1.0f-lh)*(1.0f-lw));
-    if (h0>=0 && h0<H && w1>=0 && w1<W) atomicAddF(&gradIn[((b*H+h0)*W+w1)*C+c], g*(1.0f-lh)*lw);
-    if (h1>=0 && h1<H && w0>=0 && w0<W) atomicAddF(&gradIn[((b*H+h1)*W+w0)*C+c], g*lh*(1.0f-lw));
-    if (h1>=0 && h1<H && w1>=0 && w1<W) atomicAddF(&gradIn[((b*H+h1)*W+w1)*C+c], g*lh*lw);
+    int plane = (b*C+c)*H*W;
+    if (h0>=0 && h0<H && w0>=0 && w0<W) atomicAddF(&gradIn[plane+h0*W+w0], g*(1.0f-lh)*(1.0f-lw));
+    if (h0>=0 && h0<H && w1>=0 && w1<W) atomicAddF(&gradIn[plane+h0*W+w1], g*(1.0f-lh)*lw);
+    if (h1>=0 && h1<H && w0>=0 && w0<W) atomicAddF(&gradIn[plane+h1*W+w0], g*lh*(1.0f-lw));
+    if (h1>=0 && h1<H && w1>=0 && w1<W) atomicAddF(&gradIn[plane+h1*W+w1], g*lh*lw);
 }
-// GridSample bilinear backward-to-grid (NHWC). One thread per (b,oh,ow): gradGrid = d(out)/d(g) summed
+// GridSample bilinear backward-to-grid (NCHW). One thread per (b,oh,ow): gradGrid = d(out)/d(g) summed
 // over channels via the bilinear coordinate derivative, chain-ruled by (size-1)/2. No atomics.
 __kernel void gridsample_backward_grid(__global const float* gradOut, __global const float* input,
     __global const float* grid, __global float* gradGrid, int batch, int H, int W, int C, int outH, int outW) {
@@ -518,13 +520,14 @@ __kernel void gridsample_backward_grid(__global const float* gradOut, __global c
         int in00 = (h0>=0&&h0<H&&w0>=0&&w0<W); int in01 = (h0>=0&&h0<H&&w1>=0&&w1<W);
         int in10 = (h1>=0&&h1<H&&w0>=0&&w0<W); int in11 = (h1>=0&&h1<H&&w1>=0&&w1<W);
         for (int c = 0; c < C; c++) {
-            float v00 = in00 ? input[((b*H+h0)*W+w0)*C+c] : 0.0f;
-            float v01 = in01 ? input[((b*H+h0)*W+w1)*C+c] : 0.0f;
-            float v10 = in10 ? input[((b*H+h1)*W+w0)*C+c] : 0.0f;
-            float v11 = in11 ? input[((b*H+h1)*W+w1)*C+c] : 0.0f;
+            int plane = (b*C+c)*H*W;
+            float v00 = in00 ? input[plane+h0*W+w0] : 0.0f;
+            float v01 = in01 ? input[plane+h0*W+w1] : 0.0f;
+            float v10 = in10 ? input[plane+h1*W+w0] : 0.0f;
+            float v11 = in11 ? input[plane+h1*W+w1] : 0.0f;
             float dH = (1.0f-lw)*(v10-v00) + lw*(v11-v01);
             float dW = (1.0f-lh)*(v01-v00) + lh*(v11-v10);
-            float go = gradOut[((b*outH+oh)*outW+ow)*C+c];
+            float go = gradOut[((b*C+c)*outH+oh)*outW+ow];
             gradGx += go * dW * (float)(W-1)*0.5f;
             gradGy += go * dH * (float)(H-1)*0.5f;
         }

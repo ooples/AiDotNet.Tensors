@@ -213,7 +213,7 @@ fn sample_safe(n: i32, y_in: i32, x_in: i32, c: i32) -> f32 {
     } else {
         y = reflect_index(y, p.H); x = reflect_index(x, p.W);
     }
-    return input_[((n * p.H + y) * p.W + x) * p.C + c];
+    return input_[((n * p.C + c) * p.H + y) * p.W + x];
 }
 
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
@@ -237,7 +237,7 @@ fn sample_safe(n: i32, y_in: i32, x_in: i32, c: i32) -> f32 {
     if (p.mode == 1) {
         let nx = i32(round(sx)); let ny = i32(round(sy));
         for (var c : i32 = 0; c < p.C; c = c + 1) {
-            output_[((n * p.outH + oy) * p.outW + ox) * p.C + c] = sample_safe(n, ny, nx, c);
+            output_[((n * p.C + c) * p.outH + oy) * p.outW + ox] = sample_safe(n, ny, nx, c);
         }
     } else if (p.mode == 0) {
         let x0 = i32(floor(sx)); let y0 = i32(floor(sy));
@@ -248,7 +248,7 @@ fn sample_safe(n: i32, y_in: i32, x_in: i32, c: i32) -> f32 {
             let v01 = sample_safe(n, y0, x1, c);
             let v10 = sample_safe(n, y1, x0, c);
             let v11 = sample_safe(n, y1, x1, c);
-            output_[((n * p.outH + oy) * p.outW + ox) * p.C + c] =
+            output_[((n * p.C + c) * p.outH + oy) * p.outW + ox] =
                 v00 * (1.0 - fx) * (1.0 - fy) + v01 * fx * (1.0 - fy)
               + v10 * (1.0 - fx) * fy + v11 * fx * fy;
         }
@@ -272,7 +272,7 @@ fn sample_safe(n: i32, y_in: i32, x_in: i32, c: i32) -> f32 {
                 }
                 acc = acc + wy[yy] * rowAcc;
             }
-            output_[((n * p.outH + oy) * p.outW + ox) * p.C + c] = acc;
+            output_[((n * p.C + c) * p.outH + oy) * p.outW + ox] = acc;
         }
     }
 }

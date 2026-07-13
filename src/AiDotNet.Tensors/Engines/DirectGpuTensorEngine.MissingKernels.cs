@@ -1790,12 +1790,12 @@ public partial class DirectGpuTensorEngine
         if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
         if (grid is null) throw new ArgumentNullException(nameof(grid));
         if (inputShape is null) throw new ArgumentNullException(nameof(inputShape));
-        // The CPU/forward path is NHWC: inputShape [N,H,W,C], gradOutput [N,outH,outW,C], grid [N,outH,outW,2].
+        // NCHW (PyTorch): inputShape [N,C,H,W], gradOutput [N,C,outH,outW], grid [N,outH,outW,2].
         if (typeof(T) != typeof(float) || mode != GridSampleMode.Bilinear || padding != GridSamplePadding.Zeros
             || alignCorners || inputShape.Length != 4 || gradOutput.Rank != 4 || grid.Rank != 4 || !TryGetBackend(out var backend))
             return base.GridSampleBackwardInput(gradOutput, grid, inputShape, mode, padding, alignCorners);
-        int N = inputShape[0], H = inputShape[1], W = inputShape[2], C = inputShape[3];
-        int outH = gradOutput._shape[1], outW = gradOutput._shape[2];
+        int N = inputShape[0], C = inputShape[1], H = inputShape[2], W = inputShape[3];
+        int outH = gradOutput._shape[2], outW = gradOutput._shape[3];
         try
         {
             var cgo = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
@@ -1822,7 +1822,7 @@ public partial class DirectGpuTensorEngine
         if (typeof(T) != typeof(float) || mode != GridSampleMode.Bilinear || padding != GridSamplePadding.Zeros
             || alignCorners || input.Rank != 4 || gradOutput.Rank != 4 || grid.Rank != 4 || !TryGetBackend(out var backend))
             return base.GridSampleBackwardGrid(gradOutput, input, grid, mode, padding, alignCorners);
-        int N = input._shape[0], H = input._shape[1], W = input._shape[2], C = input._shape[3];
+        int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
         int outH = grid._shape[1], outW = grid._shape[2];
         try
         {

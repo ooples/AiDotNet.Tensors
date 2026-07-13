@@ -18988,6 +18988,15 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Distributes gradient to input using bilinear interpolation weights (NHWC layout).
     /// </summary>
+    /// <summary>Scatter-add a pre-weighted gradient into one NCHW pixel (plane = (b*C+c)*H*W),
+    /// bounds-checked. No lock: GridSampleBackwardInput parallelizes over batch (disjoint planes).</summary>
+    private static void AddGradientToPixelNCHW<T>(T[] gradData, int plane, int height, int width, int hy, int wx, double weight, INumericOperations<T> numOps)
+    {
+        if (hy < 0 || hy >= height || wx < 0 || wx >= width || weight == 0.0) return;
+        int idx = plane + hy * width + wx;
+        gradData[idx] = numOps.Add(gradData[idx], numOps.FromDouble(weight));
+    }
+
     private static void BilinearBackwardInputNHWC<T>(
         T[] gradData,
         T gradVal,
@@ -19112,6 +19121,31 @@ public partial class CpuEngine : ITensorLevelEngine
         // NHWC index: [batch, h, w, channel]
         int idx = ((batch * height + h) * width + w) * channels + channel;
         return data[idx];
+    }
+
+    /// <summary>Read one NCHW pixel (plane = (b*C+c)*H*W), zero-padded out of bounds.</summary>
+    private static T GetPixelValueNCHW<T>(T[] data, int plane, int height, int width, int h, int w, INumericOperations<T> numOps)
+    {
+        if (h < 0 || h >= height || w < 0 || w >= width) return numOps.Zero;
+        return data[plane + h * width + w];
+    }
+
+    /// <summary>Gradient of bilinear interpolation w.r.t. sampling position (NCHW). Mirrors
+    /// <see cref="BilinearGradientNHWC{T}"/> with NCHW plane indexing.</summary>
+    private static (T gradH, T gradW) BilinearGradientNCHW<T>(T[] data, int plane, int height, int width, double h, double w, INumericOperations<T> numOps)
+    {
+        if (h <= -1 || h >= height || w <= -1 || w >= width) return (numOps.Zero, numOps.Zero);
+        int h0 = (int)Math.Floor(h), h1 = h0 + 1, w0 = (int)Math.Floor(w), w1 = w0 + 1;
+        double lh = h - h0, lw = w - w0;
+        T v00 = GetPixelValueNCHW(data, plane, height, width, h0, w0, numOps);
+        T v01 = GetPixelValueNCHW(data, plane, height, width, h0, w1, numOps);
+        T v10 = GetPixelValueNCHW(data, plane, height, width, h1, w0, numOps);
+        T v11 = GetPixelValueNCHW(data, plane, height, width, h1, w1, numOps);
+        T dH = numOps.Add(numOps.Multiply(numOps.FromDouble(1 - lw), numOps.Subtract(v10, v00)),
+                          numOps.Multiply(numOps.FromDouble(lw), numOps.Subtract(v11, v01)));
+        T dW = numOps.Add(numOps.Multiply(numOps.FromDouble(1 - lh), numOps.Subtract(v01, v00)),
+                          numOps.Multiply(numOps.FromDouble(lh), numOps.Subtract(v11, v10)));
+        return (dH, dW);
     }
 
     /// <summary>
@@ -19285,19 +19319,19 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
         var gridOrig = grid;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!grid.IsContiguous) grid = grid.Contiguous();
-        if (inputShape == null || inputShape.Length != 4) throw new ArgumentException("inputShape must be array of 4 elements [batch, height, width, channels].", nameof(inputShape));
+        if (inputShape == null || inputShape.Length != 4) throw new ArgumentException("inputShape must be array of 4 elements [batch, channels, height, width].", nameof(inputShape));
 
-        // Validate tensor ranks for NHWC layout
-        if (gradOutput.Rank != 4) throw new ArgumentException($"GridSampleBackwardInput requires 4D gradOutput tensor (NHWC). Got rank {gradOutput.Rank}.", nameof(gradOutput));
+        // NCHW (PyTorch) layout validation.
+        if (gradOutput.Rank != 4) throw new ArgumentException($"GridSampleBackwardInput requires 4D gradOutput tensor (NCHW). Got rank {gradOutput.Rank}.", nameof(gradOutput));
         if (grid.Rank != 4) throw new ArgumentException($"GridSampleBackwardInput requires 4D grid tensor [batch, outH, outW, 2]. Got rank {grid.Rank}.", nameof(grid));
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        // NHWC layout: [batch, height, width, channels]
+        // NCHW layout: [batch, channels, height, width]
         int batch = inputShape[0];
-        int height = inputShape[1];
-        int width = inputShape[2];
-        int channels = inputShape[3];
+        int channels = inputShape[1];
+        int height = inputShape[2];
+        int width = inputShape[3];
 
         int outHeight = grid._shape[1];
         int outWidth = grid._shape[2];
@@ -19306,18 +19340,17 @@ public partial class CpuEngine : ITensorLevelEngine
         if (grid._shape[0] != batch) throw new ArgumentException($"Batch size mismatch: inputShape has {batch}, grid has {grid._shape[0]}.", nameof(grid));
         if (grid._shape[3] != 2) throw new ArgumentException($"Grid last dimension must be 2 (x,y coordinates). Got {grid._shape[3]}.", nameof(grid));
         if (gradOutput._shape[0] != batch) throw new ArgumentException($"Batch size mismatch: inputShape has {batch}, gradOutput has {gradOutput._shape[0]}.", nameof(gradOutput));
-        if (gradOutput._shape[1] != outHeight || gradOutput._shape[2] != outWidth)
-            throw new ArgumentException($"gradOutput spatial dims [{gradOutput._shape[1]},{gradOutput._shape[2]}] must match grid spatial dims [{outHeight},{outWidth}].", nameof(gradOutput));
-        if (gradOutput._shape[3] != channels) throw new ArgumentException($"Channel mismatch: inputShape has {channels}, gradOutput has {gradOutput._shape[3]}.", nameof(gradOutput));
+        if (gradOutput._shape[1] != channels) throw new ArgumentException($"Channel mismatch: inputShape has {channels}, gradOutput has {gradOutput._shape[1]}.", nameof(gradOutput));
+        if (gradOutput._shape[2] != outHeight || gradOutput._shape[3] != outWidth)
+            throw new ArgumentException($"gradOutput spatial dims [{gradOutput._shape[2]},{gradOutput._shape[3]}] must match grid spatial dims [{outHeight},{outWidth}].", nameof(gradOutput));
 
         var gradInput = AutoTensorCache.RentOrAllocate<T>(inputShape);
         var gradInputData = gradInput.GetDataArray();
         var gradOutputData = gradOutput.GetDataArray();
         var gridData = grid.GetDataArray();
+        for (int i = 0; i < gradInputData.Length; i++) gradInputData[i] = numOps.Zero;
 
-        // Striped lock pool (no per-call allocation) - NHWC layout — see _deformScatterLocks.
-        var locks = _deformScatterLocks;
-
+        // Parallel over batch — each task writes a DISJOINT gradInput[b] slice (NCHW), so no locks.
         CpuParallelSettings.ParallelForOrSerial(0, batch,
             (long)batch * channels * outHeight * outWidth, b =>
         {
@@ -19325,23 +19358,27 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 for (int ow = 0; ow < outWidth; ow++)
                 {
-                    // Get normalized grid coordinates
                     int gridBaseIdx = ((b * outHeight + oh) * outWidth + ow) * 2;
                     double gx = numOps.ToDouble(gridData[gridBaseIdx]);
                     double gy = numOps.ToDouble(gridData[gridBaseIdx + 1]);
-
-                    // Convert to pixel coordinates
                     double srcH = (gy + 1) / 2 * (height - 1);
                     double srcW = (gx + 1) / 2 * (width - 1);
+                    if (srcH <= -1 || srcH >= height || srcW <= -1 || srcW >= width) continue;
 
-                    // Distribute gradient for all channels using NHWC bilinear weights
+                    int h0 = (int)Math.Floor(srcH), h1 = h0 + 1;
+                    int w0 = (int)Math.Floor(srcW), w1 = w0 + 1;
+                    double lh = srcH - h0, lw = srcW - w0;
+                    double bw00 = (1 - lh) * (1 - lw), bw01 = (1 - lh) * lw, bw10 = lh * (1 - lw), bw11 = lh * lw;
+
                     for (int c = 0; c < channels; c++)
                     {
-                        // NHWC gradOutput index: [b, oh, ow, c]
-                        int gradOutIdx = ((b * outHeight + oh) * outWidth + ow) * channels + c;
-                        T gradVal = gradOutputData[gradOutIdx];
-
-                        BilinearBackwardInputNHWC(gradInputData, gradVal, b, c, height, width, channels, srcH, srcW, numOps, locks);
+                        int gradOutIdx = ((b * channels + c) * outHeight + oh) * outWidth + ow;
+                        double gradVal = numOps.ToDouble(gradOutputData[gradOutIdx]);
+                        int plane = (b * channels + c) * height * width;
+                        AddGradientToPixelNCHW(gradInputData, plane, height, width, h0, w0, gradVal * bw00, numOps);
+                        AddGradientToPixelNCHW(gradInputData, plane, height, width, h0, w1, gradVal * bw01, numOps);
+                        AddGradientToPixelNCHW(gradInputData, plane, height, width, h1, w0, gradVal * bw10, numOps);
+                        AddGradientToPixelNCHW(gradInputData, plane, height, width, h1, w1, gradVal * bw11, numOps);
                     }
                 }
             }
@@ -19363,18 +19400,18 @@ public partial class CpuEngine : ITensorLevelEngine
         var gradOutputOrig = gradOutput;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
 
-        // Validate tensor ranks for NHWC layout
-        if (gradOutput.Rank != 4) throw new ArgumentException($"GridSampleBackwardGrid requires 4D gradOutput tensor (NHWC). Got rank {gradOutput.Rank}.", nameof(gradOutput));
-        if (input.Rank != 4) throw new ArgumentException($"GridSampleBackwardGrid requires 4D input tensor (NHWC). Got rank {input.Rank}.", nameof(input));
+        // NCHW (PyTorch) layout validation.
+        if (gradOutput.Rank != 4) throw new ArgumentException($"GridSampleBackwardGrid requires 4D gradOutput tensor (NCHW). Got rank {gradOutput.Rank}.", nameof(gradOutput));
+        if (input.Rank != 4) throw new ArgumentException($"GridSampleBackwardGrid requires 4D input tensor (NCHW). Got rank {input.Rank}.", nameof(input));
         if (grid.Rank != 4) throw new ArgumentException($"GridSampleBackwardGrid requires 4D grid tensor [batch, outH, outW, 2]. Got rank {grid.Rank}.", nameof(grid));
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        // NHWC layout: [batch, height, width, channels]
+        // NCHW layout: [batch, channels, height, width]
         int batch = input._shape[0];
-        int height = input._shape[1];
-        int width = input._shape[2];
-        int channels = input._shape[3];
+        int channels = input._shape[1];
+        int height = input._shape[2];
+        int width = input._shape[3];
 
         int outHeight = grid._shape[1];
         int outWidth = grid._shape[2];
@@ -19383,9 +19420,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (grid._shape[0] != batch) throw new ArgumentException($"Batch size mismatch: input has {batch}, grid has {grid._shape[0]}.", nameof(grid));
         if (grid._shape[3] != 2) throw new ArgumentException($"Grid last dimension must be 2 (x,y coordinates). Got {grid._shape[3]}.", nameof(grid));
         if (gradOutput._shape[0] != batch) throw new ArgumentException($"Batch size mismatch: input has {batch}, gradOutput has {gradOutput._shape[0]}.", nameof(gradOutput));
-        if (gradOutput._shape[1] != outHeight || gradOutput._shape[2] != outWidth)
-            throw new ArgumentException($"gradOutput spatial dims [{gradOutput._shape[1]},{gradOutput._shape[2]}] must match grid spatial dims [{outHeight},{outWidth}].", nameof(gradOutput));
-        if (gradOutput._shape[3] != channels) throw new ArgumentException($"Channel mismatch: input has {channels}, gradOutput has {gradOutput._shape[3]}.", nameof(gradOutput));
+        if (gradOutput._shape[1] != channels) throw new ArgumentException($"Channel mismatch: input has {channels}, gradOutput has {gradOutput._shape[1]}.", nameof(gradOutput));
+        if (gradOutput._shape[2] != outHeight || gradOutput._shape[3] != outWidth)
+            throw new ArgumentException($"gradOutput spatial dims [{gradOutput._shape[2]},{gradOutput._shape[3]}] must match grid spatial dims [{outHeight},{outWidth}].", nameof(gradOutput));
 
         var gradGrid = AutoTensorCache.RentOrAllocate<T>(grid._shape);
         var gradGridData = gradGrid.GetDataArray();
@@ -19413,12 +19450,13 @@ public partial class CpuEngine : ITensorLevelEngine
 
                     for (int c = 0; c < channels; c++)
                     {
-                        // NHWC gradOutput index: [b, oh, ow, c]
-                        int gradOutIdx = ((b * outHeight + oh) * outWidth + ow) * channels + c;
+                        // NCHW gradOutput index: [b, c, oh, ow]
+                        int gradOutIdx = ((b * channels + c) * outHeight + oh) * outWidth + ow;
                         T gradOutVal = gradOutputData[gradOutIdx];
 
-                        // Get gradient of bilinear sampling w.r.t. h and w using NHWC layout
-                        var (dH, dW) = BilinearGradientNHWC(inputData, b, c, height, width, channels, srcH, srcW, numOps);
+                        // Gradient of bilinear sampling w.r.t. h and w (NCHW plane).
+                        int plane = (b * channels + c) * height * width;
+                        var (dH, dW) = BilinearGradientNCHW(inputData, plane, height, width, srcH, srcW, numOps);
 
                         // Chain rule: d/dgx = d/dw * dw/dgx where dw/dgx = (width-1)/2
                         // Chain rule: d/dgy = d/dh * dh/dgy where dh/dgy = (height-1)/2
@@ -31577,7 +31615,8 @@ public partial class CpuEngine : ITensorLevelEngine
             if (scope != null)
             {
                 var ci = input; var cg = grid;
-                var outShape = new[] { input._shape[0], grid._shape[1], grid._shape[2], input._shape[3] };
+                // NCHW (PyTorch): input [N,C,H,W], grid [N,outH,outW,2] -> output [N,C,outH,outW].
+                var outShape = new[] { input._shape[0], input._shape[1], grid._shape[1], grid._shape[2] };
                 return scope.RecordBinary(LazyNodeType.Custom, "GridSample", input, grid, outShape,
                     (eng, output) => { var r = eng.GridSample(ci, cg); DirectGpuTensorEngine.CopyResultInto(eng, r, output); });
             }
@@ -31586,21 +31625,22 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("GridSample", input._shape); if (ac is not null) return ac.Execute(); }
 
         if (input._shape.Length != 4)
-            throw new ArgumentException("GridSample expects input shape [batch, height, width, channels]");
+            throw new ArgumentException("GridSample expects input shape [batch, channels, height, width]");
         if (grid._shape.Length != 4 || grid._shape[3] != 2)
             throw new ArgumentException("GridSample expects grid shape [batch, outH, outW, 2]");
         if (input._shape[0] != grid._shape[0])
             throw new ArgumentException("GridSample batch size mismatch between input and grid");
 
+        // NCHW (PyTorch) layout: input [batch, channels, height, width].
         var numOps = MathHelper.GetNumericOperations<T>();
         int batch = input._shape[0];
-        int inH = input._shape[1];
-        int inW = input._shape[2];
-        int channels = input._shape[3];
+        int channels = input._shape[1];
+        int inH = input._shape[2];
+        int inW = input._shape[3];
         int outH = grid._shape[1];
         int outW = grid._shape[2];
 
-        var output = TensorAllocator.Rent<T>([batch, outH, outW, channels]);
+        var output = TensorAllocator.Rent<T>([batch, channels, outH, outW]);
 
         // Rewritten from a serial Tensor-indexer loop (per-element [] access + Convert.ToDouble +
         // INumericOperations<T> dispatch) to a parallel, raw-array kernel with native double/float
@@ -31637,12 +31677,15 @@ public partial class CpuEngine : ITensorLevelEngine
                     int x0 = Math.Max(0, Math.Min((int)Math.Floor(srcX), lInW - 1)), x1 = Math.Max(0, Math.Min(x0 + 1, lInW - 1));
                     int y0 = Math.Max(0, Math.Min((int)Math.Floor(srcY), lInH - 1)), y1 = Math.Max(0, Math.Min(y0 + 1, lInH - 1));
                     double wx1 = srcX - x0, wx0 = 1.0 - wx1, wy1 = srcY - y0, wy0 = 1.0 - wy1;
-                    int oBase = ((b * lOutH + h) * lOutW + w) * lCh;
-                    int i00 = ((b * lInH + y0) * lInW + x0) * lCh, i01 = ((b * lInH + y0) * lInW + x1) * lCh;
-                    int i10 = ((b * lInH + y1) * lInW + x0) * lCh, i11 = ((b * lInH + y1) * lInW + x1) * lCh;
+                    int outSpatial = h * lOutW + w;
+                    int s00 = y0 * lInW + x0, s01 = y0 * lInW + x1, s10 = y1 * lInW + x0, s11 = y1 * lInW + x1;
                     for (int c = 0; c < lCh; c++)
-                        outp[oBase + c] = (inp[i00 + c] * wx0 * wy0 + inp[i01 + c] * wx1 * wy0)
-                                        + (inp[i10 + c] * wx0 * wy1 + inp[i11 + c] * wx1 * wy1);
+                    {
+                        int inPlane = (b * lCh + c) * lInH * lInW;
+                        outp[(b * lCh + c) * lOutH * lOutW + outSpatial] =
+                            (inp[inPlane + s00] * wx0 * wy0 + inp[inPlane + s01] * wx1 * wy0)
+                          + (inp[inPlane + s10] * wx0 * wy1 + inp[inPlane + s11] * wx1 * wy1);
+                    }
                 }
             });
         }
@@ -31662,12 +31705,15 @@ public partial class CpuEngine : ITensorLevelEngine
                     int x0 = Math.Max(0, Math.Min((int)Math.Floor(srcX), lInW - 1)), x1 = Math.Max(0, Math.Min(x0 + 1, lInW - 1));
                     int y0 = Math.Max(0, Math.Min((int)Math.Floor(srcY), lInH - 1)), y1 = Math.Max(0, Math.Min(y0 + 1, lInH - 1));
                     float fwx1 = (float)(srcX - x0), fwx0 = 1f - fwx1, fwy1 = (float)(srcY - y0), fwy0 = 1f - fwy1;
-                    int oBase = ((b * lOutH + h) * lOutW + w) * lCh;
-                    int i00 = ((b * lInH + y0) * lInW + x0) * lCh, i01 = ((b * lInH + y0) * lInW + x1) * lCh;
-                    int i10 = ((b * lInH + y1) * lInW + x0) * lCh, i11 = ((b * lInH + y1) * lInW + x1) * lCh;
+                    int outSpatial = h * lOutW + w;
+                    int s00 = y0 * lInW + x0, s01 = y0 * lInW + x1, s10 = y1 * lInW + x0, s11 = y1 * lInW + x1;
                     for (int c = 0; c < lCh; c++)
-                        outp[oBase + c] = (inp[i00 + c] * fwx0 * fwy0 + inp[i01 + c] * fwx1 * fwy0)
-                                        + (inp[i10 + c] * fwx0 * fwy1 + inp[i11 + c] * fwx1 * fwy1);
+                    {
+                        int inPlane = (b * lCh + c) * lInH * lInW;
+                        outp[(b * lCh + c) * lOutH * lOutW + outSpatial] =
+                            (inp[inPlane + s00] * fwx0 * fwy0 + inp[inPlane + s01] * fwx1 * fwy0)
+                          + (inp[inPlane + s10] * fwx0 * fwy1 + inp[inPlane + s11] * fwx1 * fwy1);
+                    }
                 }
             });
         }
@@ -31685,15 +31731,17 @@ public partial class CpuEngine : ITensorLevelEngine
                     int y0 = Math.Max(0, Math.Min((int)Math.Floor(srcY), lInH - 1)), y1 = Math.Max(0, Math.Min(y0 + 1, lInH - 1));
                     T twx1 = numOps.FromDouble(srcX - x0), twx0 = numOps.Subtract(numOps.One, twx1);
                     T twy1 = numOps.FromDouble(srcY - y0), twy0 = numOps.Subtract(numOps.One, twy1);
-                    int oBase = ((b * lOutH + h) * lOutW + w) * lCh;
-                    int i00 = ((b * lInH + y0) * lInW + x0) * lCh, i01 = ((b * lInH + y0) * lInW + x1) * lCh;
-                    int i10 = ((b * lInH + y1) * lInW + x0) * lCh, i11 = ((b * lInH + y1) * lInW + x1) * lCh;
+                    int outSpatial = h * lOutW + w;
+                    int s00 = y0 * lInW + x0, s01 = y0 * lInW + x1, s10 = y1 * lInW + x0, s11 = y1 * lInW + x1;
                     for (int c = 0; c < lCh; c++)
-                        outData[oBase + c] = numOps.Add(
-                            numOps.Add(numOps.Multiply(numOps.Multiply(inData[i00 + c], twx0), twy0),
-                                       numOps.Multiply(numOps.Multiply(inData[i01 + c], twx1), twy0)),
-                            numOps.Add(numOps.Multiply(numOps.Multiply(inData[i10 + c], twx0), twy1),
-                                       numOps.Multiply(numOps.Multiply(inData[i11 + c], twx1), twy1)));
+                    {
+                        int inPlane = (b * lCh + c) * lInH * lInW;
+                        outData[(b * lCh + c) * lOutH * lOutW + outSpatial] = numOps.Add(
+                            numOps.Add(numOps.Multiply(numOps.Multiply(inData[inPlane + s00], twx0), twy0),
+                                       numOps.Multiply(numOps.Multiply(inData[inPlane + s01], twx1), twy0)),
+                            numOps.Add(numOps.Multiply(numOps.Multiply(inData[inPlane + s10], twx0), twy1),
+                                       numOps.Multiply(numOps.Multiply(inData[inPlane + s11], twx1), twy1)));
+                    }
                 }
             });
         }

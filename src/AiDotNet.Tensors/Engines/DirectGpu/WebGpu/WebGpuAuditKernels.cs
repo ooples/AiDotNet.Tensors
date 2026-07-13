@@ -411,10 +411,10 @@ struct P { batch: i32, H: i32, W: i32, C: i32, outH: i32, outW: i32 };
     let in00 = h0 >= 0 && h0 < pc.H && w0 >= 0 && w0 < pc.W; let in01 = h0 >= 0 && h0 < pc.H && w1 >= 0 && w1 < pc.W;
     let in10 = h1 >= 0 && h1 < pc.H && w0 >= 0 && w0 < pc.W; let in11 = h1 >= 0 && h1 < pc.H && w1 >= 0 && w1 < pc.W;
     for (var c = 0; c < pc.C; c = c + 1) {
-      let v00 = select(0.0, inp[((b*pc.H+h0)*pc.W+w0)*pc.C+c], in00); let v01 = select(0.0, inp[((b*pc.H+h0)*pc.W+w1)*pc.C+c], in01);
-      let v10 = select(0.0, inp[((b*pc.H+h1)*pc.W+w0)*pc.C+c], in10); let v11 = select(0.0, inp[((b*pc.H+h1)*pc.W+w1)*pc.C+c], in11);
+      let v00 = select(0.0, inp[((b*pc.C+c)*pc.H+h0)*pc.W+w0], in00); let v01 = select(0.0, inp[((b*pc.C+c)*pc.H+h0)*pc.W+w1], in01);
+      let v10 = select(0.0, inp[((b*pc.C+c)*pc.H+h1)*pc.W+w0], in10); let v11 = select(0.0, inp[((b*pc.C+c)*pc.H+h1)*pc.W+w1], in11);
       let dH = (1.0 - lw) * (v10 - v00) + lw * (v11 - v01); let dW = (1.0 - lh) * (v01 - v00) + lh * (v11 - v10);
-      let go = gradOut[((b*pc.outH+oh)*pc.outW+ow)*pc.C+c];
+      let go = gradOut[((b*pc.C+c)*pc.outH+oh)*pc.outW+ow];
       gradGx = gradGx + go * dW * f32(pc.W - 1) * 0.5; gradGy = gradGy + go * dH * f32(pc.H - 1) * 0.5;
     }
   }
@@ -470,15 +470,15 @@ struct P { batch: i32, H: i32, W: i32, C: i32, outH: i32, outW: i32 };
 @group(0) @binding(3) var<uniform> pc : P;
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let idx = i32(gid.x); let total = pc.batch * pc.outH * pc.outW * pc.C; if (idx >= total) { return; }
-  let c = idx % pc.C; var tmp = idx / pc.C; let ow = tmp % pc.outW; tmp = tmp / pc.outW; let oh = tmp % pc.outH; let b = tmp / pc.outH;
+  let ow = idx % pc.outW; var tmp = idx / pc.outW; let oh = tmp % pc.outH; tmp = tmp / pc.outH; let c = tmp % pc.C; let b = tmp / pc.C;
   let gridBase = ((b * pc.outH + oh) * pc.outW + ow) * 2; let gx = grid[gridBase]; let gy = grid[gridBase + 1];
   let srcH = (gy + 1.0) * 0.5 * f32(pc.H - 1); let srcW = (gx + 1.0) * 0.5 * f32(pc.W - 1);
   if (srcH <= -1.0 || srcH >= f32(pc.H) || srcW <= -1.0 || srcW >= f32(pc.W)) { return; }
   let h0 = i32(floor(srcH)); let h1 = h0 + 1; let w0 = i32(floor(srcW)); let w1 = w0 + 1; let lh = srcH - f32(h0); let lw = srcW - f32(w0); let g = gradOut[idx];
-  if (h0 >= 0 && h0 < pc.H && w0 >= 0 && w0 < pc.W) { p210_atomicAddF(&gradIn, ((b*pc.H+h0)*pc.W+w0)*pc.C+c, g*(1.0-lh)*(1.0-lw)); }
-  if (h0 >= 0 && h0 < pc.H && w1 >= 0 && w1 < pc.W) { p210_atomicAddF(&gradIn, ((b*pc.H+h0)*pc.W+w1)*pc.C+c, g*(1.0-lh)*lw); }
-  if (h1 >= 0 && h1 < pc.H && w0 >= 0 && w0 < pc.W) { p210_atomicAddF(&gradIn, ((b*pc.H+h1)*pc.W+w0)*pc.C+c, g*lh*(1.0-lw)); }
-  if (h1 >= 0 && h1 < pc.H && w1 >= 0 && w1 < pc.W) { p210_atomicAddF(&gradIn, ((b*pc.H+h1)*pc.W+w1)*pc.C+c, g*lh*lw); }
+  if (h0 >= 0 && h0 < pc.H && w0 >= 0 && w0 < pc.W) { p210_atomicAddF(&gradIn, ((b*pc.C+c)*pc.H+h0)*pc.W+w0, g*(1.0-lh)*(1.0-lw)); }
+  if (h0 >= 0 && h0 < pc.H && w1 >= 0 && w1 < pc.W) { p210_atomicAddF(&gradIn, ((b*pc.C+c)*pc.H+h0)*pc.W+w1, g*(1.0-lh)*lw); }
+  if (h1 >= 0 && h1 < pc.H && w0 >= 0 && w0 < pc.W) { p210_atomicAddF(&gradIn, ((b*pc.C+c)*pc.H+h1)*pc.W+w0, g*lh*(1.0-lw)); }
+  if (h1 >= 0 && h1 < pc.H && w1 >= 0 && w1 < pc.W) { p210_atomicAddF(&gradIn, ((b*pc.C+c)*pc.H+h1)*pc.W+w1, g*lh*lw); }
 }";
 
     public static string IstftFromSpectrum => AtomicAddF + @"

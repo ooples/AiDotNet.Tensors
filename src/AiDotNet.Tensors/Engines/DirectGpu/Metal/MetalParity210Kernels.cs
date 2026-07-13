@@ -1035,16 +1035,16 @@ kernel void parity210_gridsample_backward_input(
     constant int& outW [[buffer(8)]],
     uint gid [[thread_position_in_grid]]) {
     int idx = (int)gid; int total = batch*outH*outW*C; if (idx >= total) return;
-    int c = idx % C; int tmp = idx / C; int ow = tmp % outW; tmp /= outW; int oh = tmp % outH; int b = tmp / outH;
+    int ow = idx % outW; int tmp = idx / outW; int oh = tmp % outH; tmp /= outH; int c = tmp % C; int b = tmp / C;
     int gridBase = ((b*outH + oh)*outW + ow)*2; float gx = grid[gridBase]; float gy = grid[gridBase+1];
     float srcH = (gy + 1.0f) * 0.5f * (float)(H - 1); float srcW = (gx + 1.0f) * 0.5f * (float)(W - 1);
     if (srcH <= -1.0f || srcH >= (float)H || srcW <= -1.0f || srcW >= (float)W) return;
     int h0 = (int)floor(srcH); int h1 = h0 + 1; int w0 = (int)floor(srcW); int w1 = w0 + 1;
     float lh = srcH - (float)h0; float lw = srcW - (float)w0; float g = gradOut[idx];
-    if (h0>=0 && h0<H && w0>=0 && w0<W) atomic_fetch_add_explicit(&gradIn[((b*H+h0)*W+w0)*C+c], g*(1.0f-lh)*(1.0f-lw), memory_order_relaxed);
-    if (h0>=0 && h0<H && w1>=0 && w1<W) atomic_fetch_add_explicit(&gradIn[((b*H+h0)*W+w1)*C+c], g*(1.0f-lh)*lw, memory_order_relaxed);
-    if (h1>=0 && h1<H && w0>=0 && w0<W) atomic_fetch_add_explicit(&gradIn[((b*H+h1)*W+w0)*C+c], g*lh*(1.0f-lw), memory_order_relaxed);
-    if (h1>=0 && h1<H && w1>=0 && w1<W) atomic_fetch_add_explicit(&gradIn[((b*H+h1)*W+w1)*C+c], g*lh*lw, memory_order_relaxed);
+    if (h0>=0 && h0<H && w0>=0 && w0<W) atomic_fetch_add_explicit(&gradIn[((b*C+c)*H+h0)*W+w0], g*(1.0f-lh)*(1.0f-lw), memory_order_relaxed);
+    if (h0>=0 && h0<H && w1>=0 && w1<W) atomic_fetch_add_explicit(&gradIn[((b*C+c)*H+h0)*W+w1], g*(1.0f-lh)*lw, memory_order_relaxed);
+    if (h1>=0 && h1<H && w0>=0 && w0<W) atomic_fetch_add_explicit(&gradIn[((b*C+c)*H+h1)*W+w0], g*lh*(1.0f-lw), memory_order_relaxed);
+    if (h1>=0 && h1<H && w1>=0 && w1<W) atomic_fetch_add_explicit(&gradIn[((b*C+c)*H+h1)*W+w1], g*lh*lw, memory_order_relaxed);
 }
 
 kernel void parity210_gridsample_backward_grid(
@@ -1070,10 +1070,10 @@ kernel void parity210_gridsample_backward_grid(
         int in00 = (h0>=0&&h0<H&&w0>=0&&w0<W); int in01 = (h0>=0&&h0<H&&w1>=0&&w1<W);
         int in10 = (h1>=0&&h1<H&&w0>=0&&w0<W); int in11 = (h1>=0&&h1<H&&w1>=0&&w1<W);
         for (int c = 0; c < C; c++) {
-            float v00 = in00 ? input[((b*H+h0)*W+w0)*C+c] : 0.0f; float v01 = in01 ? input[((b*H+h0)*W+w1)*C+c] : 0.0f;
-            float v10 = in10 ? input[((b*H+h1)*W+w0)*C+c] : 0.0f; float v11 = in11 ? input[((b*H+h1)*W+w1)*C+c] : 0.0f;
+            float v00 = in00 ? input[((b*C+c)*H+h0)*W+w0] : 0.0f; float v01 = in01 ? input[((b*C+c)*H+h0)*W+w1] : 0.0f;
+            float v10 = in10 ? input[((b*C+c)*H+h1)*W+w0] : 0.0f; float v11 = in11 ? input[((b*C+c)*H+h1)*W+w1] : 0.0f;
             float dH = (1.0f-lw)*(v10-v00) + lw*(v11-v01); float dW = (1.0f-lh)*(v01-v00) + lh*(v11-v10);
-            float go = gradOut[((b*outH+oh)*outW+ow)*C+c];
+            float go = gradOut[((b*C+c)*outH+oh)*outW+ow];
             gradGx += go * dW * (float)(W-1)*0.5f; gradGy += go * dH * (float)(H-1)*0.5f;
         }
     }

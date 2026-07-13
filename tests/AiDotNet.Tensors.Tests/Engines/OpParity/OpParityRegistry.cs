@@ -645,12 +645,13 @@ public static class OpParityRegistry
             ParityTol.Accum(1e-3), opMethod: "DeformableConv2DBackwardOffset");
 
         // Grid-sample backwards (NHWC): input [1,4,4,2], grid [1,4,4,2], gradOutput [1,4,4,2].
-        var gsIn = OpInput.Rand(4110, new[] { 1, 4, 4, 2 });
+        // NCHW: input/gradOutput [N,C,H,W], grid [N,outH,outW,2] (outH=outW=4 -> gradOutput [1,2,4,4]).
+        var gsIn = OpInput.Rand(4110, new[] { 1, 2, 4, 4 });
         var gsGrid = OpInput.Rand(4111, new[] { 1, 4, 4, 2 }, -1, 1);
-        var gsGo = OpInput.Rand(4112, new[] { 1, 4, 4, 2 });
-        yield return new OpCase("GridSampleBackwardInput[1,4,4,2]", "grid",
-            e => e.GridSampleBackwardInput(gsGo.F(), gsGrid.F(), new[] { 1, 4, 4, 2 }),
-            e => e.GridSampleBackwardInput(gsGo.D(), gsGrid.D(), new[] { 1, 4, 4, 2 }),
+        var gsGo = OpInput.Rand(4112, new[] { 1, 2, 4, 4 });
+        yield return new OpCase("GridSampleBackwardInput[1,2,4,4]", "grid",
+            e => e.GridSampleBackwardInput(gsGo.F(), gsGrid.F(), new[] { 1, 2, 4, 4 }),
+            e => e.GridSampleBackwardInput(gsGo.D(), gsGrid.D(), new[] { 1, 2, 4, 4 }),
             ParityTol.Accum(1e-3), opMethod: "GridSampleBackwardInput");
         yield return new OpCase("GridSampleBackwardGrid[1,2,4,4]", "grid",
             e => e.GridSampleBackwardGrid(gsGo.F(), gsIn.F(), gsGrid.F()),
@@ -1525,18 +1526,12 @@ public static class OpParityRegistry
     // Grid-sample, upsample3d/crop, depthwise-1d, conv/pool backward, IoU + CE losses.
     public static IEnumerable<OpCase> GridConvBwdLoss()
     {
-        // QUARANTINED — decision made (NCHW), scoped as a dedicated follow-up PR. Diagnosis: genuine
-        // layout split AND the GPU is internally inconsistent. CpuEngine.GridSample = NHWC
-        // (in [N,H,W,C] -> out [N,outH,outW,C]=64); the GPU 2-arg forward (DirectGpuTensorEngine.cs
-        // ~L19113) = NCHW (in [N,C,H,W] -> out [N,C,outH,outW]=32); the GPU BACKWARD kernels are named
-        // GridSampleBackward{Input,Grid}Nhwc (NHWC). User chose: standardize EVERYTHING on PyTorch NCHW.
-        // That migration spans CpuEngine forward+backward (2-arg AND multi-arg CpuEngine.Geometry),
-        // all 6 GPU backends' backward kernels, and ~22 test refs (only OpenCL is locally validatable),
-        // so it is a separate focused PR, not bundled into the op-parity scaffold branch.
+        // FIXED (#775): standardized GridSample on PyTorch NCHW. CpuEngine.GridSample forward+backward
+        // (GridSampleBackwardInput/Grid) rewritten NHWC->NCHW to match the already-NCHW GPU 2-arg forward.
+        // input [N,C,H,W], grid [N,outH,outW,2] -> output [N,C,outH,outW]=32.
         yield return new OpCase("GridSample[1,2,4,4;g1,4,4,2]", "sample",
             e => e.GridSample(OpInput.Rand(1700, new[] { 1, 2, 4, 4 }).F(), OpInput.Rand(1701, new[] { 1, 4, 4, 2 }, -1.0, 1.0).F()),
-            e => e.GridSample(OpInput.Rand(1700, new[] { 1, 2, 4, 4 }).D(), OpInput.Rand(1701, new[] { 1, 4, 4, 2 }, -1.0, 1.0).D()), ParityTol.Accum(1e-3), opMethod: "GridSample")
-        { KnownDivergence = "GridSample CPU=NHWC vs GPU=NCHW layout convention mismatch (64 vs 32 elements); needs a library-wide layout decision." };
+            e => e.GridSample(OpInput.Rand(1700, new[] { 1, 2, 4, 4 }).D(), OpInput.Rand(1701, new[] { 1, 4, 4, 2 }, -1.0, 1.0).D()), ParityTol.Accum(1e-3), opMethod: "GridSample");
         yield return new OpCase("Upsample3D[1,2,2,2,2;2x2x2]", "shape",
             e => e.Upsample3D(OpInput.Rand(1702, new[] { 1, 2, 2, 2, 2 }).F(), 2, 2, 2),
             e => e.Upsample3D(OpInput.Rand(1702, new[] { 1, 2, 2, 2, 2 }).D(), 2, 2, 2), ParityTol.Exact, opMethod: "Upsample3D");

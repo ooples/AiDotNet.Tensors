@@ -112,10 +112,10 @@ public partial class DirectGpuTensorEngine
             {
                 if (TryGetBackend(out var backend) && backend is IGeometryBackend geom)
                 {
-                    int N = input._shape[0], H = input._shape[1], W = input._shape[2], C = input._shape[3];
+                    int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
                     int outH = grid._shape[1], outW = grid._shape[2];
                     int outLen = N * outH * outW * C;
-                    if (outLen == 0) return new Tensor<T>(new[] { N, outH, outW, C });
+                    if (outLen == 0) return new Tensor<T>(new[] { N, C, outH, outW });
                     using var inBuf = GetOrAllocateBuffer(backend, input);
                     using var grBuf = GetOrAllocateBuffer(backend, grid);
                     var outBuf = AllocateOutputBuffer(backend, outLen);
@@ -124,7 +124,7 @@ public partial class DirectGpuTensorEngine
                         geom.GridSample2D(inBuf.Buffer, grBuf.Buffer, outBuf.Buffer,
                             N, H, W, C, outH, outW, (int)mode, (int)padding, alignCorners);
                         var arr = FinishGpuOp<T>(backend, outBuf, outLen);
-                        return new Tensor<T>(arr, new[] { N, outH, outW, C });
+                        return new Tensor<T>(arr, new[] { N, C, outH, outW });
                     }
                     catch { outBuf.Dispose(); throw; }
                 }

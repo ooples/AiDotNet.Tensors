@@ -526,13 +526,13 @@ public partial class CpuEngine
     public virtual Tensor<T> GridSample<T>(Tensor<T> input, Tensor<T> grid,
         GridSampleMode mode, GridSamplePadding padding, bool alignCorners)
     {
-        if (input.Rank != 4) throw new ArgumentException("GridSample expects NHWC input [N, H, W, C].");
+        if (input.Rank != 4) throw new ArgumentException("GridSample expects NCHW input [N, C, H, W].");
         if (grid.Rank != 4 || grid._shape[3] != 2) throw new ArgumentException("grid must be [N, outH, outW, 2].");
         if (input._shape[0] != grid._shape[0]) throw new ArgumentException("batch dim of input and grid must match.");
 
-        int N = input._shape[0], H = input._shape[1], W = input._shape[2], C = input._shape[3];
+        int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
         int outH = grid._shape[1], outW = grid._shape[2];
-        var output = new Tensor<T>(new[] { N, outH, outW, C });
+        var output = new Tensor<T>(new[] { N, C, outH, outW });
         if (output.Length == 0) return output;
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -555,7 +555,7 @@ public partial class CpuEngine
             {
                 int nx = (int)Math.Round(sx), ny = (int)Math.Round(sy);
                 for (int c = 0; c < C; c++)
-                    dst[((n * outH + oy) * outW + ox) * C + c] =
+                    dst[((n * C + c) * outH + oy) * outW + ox] =
                         SampleSafe(src, n, ny, nx, c, H, W, C, padding, ops);
             }
             else if (mode == GridSampleMode.Bilinear)
@@ -574,7 +574,7 @@ public partial class CpuEngine
                         v01 * fx * (1 - fy) +
                         v10 * (1 - fx) * fy +
                         v11 * fx * fy;
-                    dst[((n * outH + oy) * outW + ox) * C + c] = ops.FromDouble(v);
+                    dst[((n * C + c) * outH + oy) * outW + ox] = ops.FromDouble(v);
                 }
             }
             else // Bicubic
@@ -596,7 +596,7 @@ public partial class CpuEngine
                         }
                         acc += wy[yy] * rowAcc;
                     }
-                    dst[((n * outH + oy) * outW + ox) * C + c] = ops.FromDouble(acc);
+                    dst[((n * C + c) * outH + oy) * outW + ox] = ops.FromDouble(acc);
                 }
             }
         }
@@ -631,7 +631,8 @@ public partial class CpuEngine
                 x = ReflectIndex(x, W);
                 break;
         }
-        return src[((n * H + y) * W + x) * C + c];
+        // NCHW: [n, c, y, x].
+        return src[((n * C + c) * H + y) * W + x];
     }
 
     /// <summary>Math.Clamp isn't on net471. Inline helper.</summary>
