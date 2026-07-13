@@ -3722,6 +3722,65 @@ public partial class DirectGpuTensorEngine
         catch { return base.ConvTranspose3D(input, kernel, stride, padding, outputPadding); }
     }
 
+    // #775: ConvTranspose3D backward w.r.t. input. weights=[inC,outC,kD,kH,kW]; inputShape=[N,inC,iD,iH,iW];
+    // gradOutput=[N,outC,outD,outH,outW]. Gather kernel. No-output-padding; padded defers to base.
+    Tensor<T> IEngine.ConvTranspose3DBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> kernel, int[] inputShape, int[] stride, int[] padding)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+            || inputShape is not { Length: 5 } || gradOutput.Rank != 5 || kernel.Rank != 5
+            || stride is not { Length: 3 } || padding is not { Length: 3 } || !TryGetBackend(out var backend))
+            return base.ConvTranspose3DBackwardInput(gradOutput, kernel, inputShape, stride, padding);
+        try
+        {
+            int n = inputShape[0], inC = inputShape[1], iD = inputShape[2], iH = inputShape[3], iW = inputShape[4];
+            int outC = gradOutput.Shape._dims[1], outD = gradOutput.Shape._dims[2], outH = gradOutput.Shape._dims[3], outW = gradOutput.Shape._dims[4];
+            int kD = kernel.Shape._dims[2], kH = kernel.Shape._dims[3], kW = kernel.Shape._dims[4];
+            int inLen = n * inC * iD * iH * iW;
+            using var gradOutBuf = GetOrAllocateBuffer(backend, gradOutput);
+            using var kBuf = GetOrAllocateBuffer(backend, kernel);
+            var gradInBuf = AllocateOutputBuffer(backend, inLen);
+            try
+            {
+                backend.ConvTranspose3DBackwardInput(gradOutBuf.Buffer, kBuf.Buffer, gradInBuf.Buffer,
+                    n, inC, iD, iH, iW, outC, outD, outH, outW, kD, kH, kW,
+                    stride[0], stride[1], stride[2], padding[0], padding[1], padding[2]);
+                var arr = FinishGpuOp<T>(backend, gradInBuf, inLen);
+                return new Tensor<T>(arr, (int[])inputShape.Clone());
+            }
+            catch { gradInBuf.Dispose(); throw; }
+        }
+        catch { return base.ConvTranspose3DBackwardInput(gradOutput, kernel, inputShape, stride, padding); }
+    }
+
+    // #775: ConvTranspose3D backward w.r.t. weights. kernelShape=[inC,outC,kD,kH,kW]; input=[N,inC,iD,iH,iW].
+    Tensor<T> IEngine.ConvTranspose3DBackwardKernel<T>(Tensor<T> gradOutput, Tensor<T> input, int[] kernelShape, int[] stride, int[] padding)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+            || kernelShape is not { Length: 5 } || input.Rank != 5 || gradOutput.Rank != 5
+            || stride is not { Length: 3 } || padding is not { Length: 3 } || !TryGetBackend(out var backend))
+            return base.ConvTranspose3DBackwardKernel(gradOutput, input, kernelShape, stride, padding);
+        try
+        {
+            int n = input.Shape._dims[0], inC = input.Shape._dims[1], iD = input.Shape._dims[2], iH = input.Shape._dims[3], iW = input.Shape._dims[4];
+            int outC = gradOutput.Shape._dims[1], outD = gradOutput.Shape._dims[2], outH = gradOutput.Shape._dims[3], outW = gradOutput.Shape._dims[4];
+            int kD = kernelShape[2], kH = kernelShape[3], kW = kernelShape[4];
+            int kLen = kernelShape[0] * kernelShape[1] * kD * kH * kW;
+            using var gradOutBuf = GetOrAllocateBuffer(backend, gradOutput);
+            using var inBuf = GetOrAllocateBuffer(backend, input);
+            var gradKBuf = AllocateOutputBuffer(backend, kLen);
+            try
+            {
+                backend.ConvTranspose3DBackwardKernel(gradOutBuf.Buffer, inBuf.Buffer, gradKBuf.Buffer,
+                    n, inC, iD, iH, iW, outC, outD, outH, outW, kD, kH, kW,
+                    stride[0], stride[1], stride[2], padding[0], padding[1], padding[2]);
+                var arr = FinishGpuOp<T>(backend, gradKBuf, kLen);
+                return new Tensor<T>(arr, (int[])kernelShape.Clone());
+            }
+            catch { gradKBuf.Dispose(); throw; }
+        }
+        catch { return base.ConvTranspose3DBackwardKernel(gradOutput, input, kernelShape, stride, padding); }
+    }
+
     // #775: whole-tensor mean (output [1]) via the GPU-resident ReduceMean over all axes.
     Tensor<T> IEngine.TensorMeanDiff<T>(Tensor<T> tensor)
     {

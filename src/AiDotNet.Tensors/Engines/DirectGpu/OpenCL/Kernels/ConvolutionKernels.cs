@@ -970,6 +970,82 @@ __kernel void conv_transpose3d(
     }
     output[idx] = sum;
 }
+
+// #775: ConvTranspose3D backward w.r.t. input. GATHER over gradInput; od = id*stride - pad + kd directly.
+__kernel void conv_transpose3d_backward_input(
+    __global const float* gradOutput,
+    __global const float* weights,
+    __global float* gradInput,
+    const int N, const int inC, const int iD, const int iH, const int iW,
+    const int outC, const int outD, const int outH, const int outW,
+    const int kD, const int kH, const int kW,
+    const int strideD, const int strideH, const int strideW,
+    const int padD, const int padH, const int padW)
+{
+    const int idx = get_global_id(0);
+    if (idx >= N * inC * iD * iH * iW) return;
+    const int iw = idx % iW;
+    const int ih = (idx / iW) % iH;
+    const int id = (idx / (iW * iH)) % iD;
+    const int ic = (idx / (iW * iH * iD)) % inC;
+    const int n = idx / (iW * iH * iD * inC);
+    float sum = 0.0f;
+    for (int kd = 0; kd < kD; kd++) {
+        int od = id * strideD - padD + kd;
+        if (od < 0 || od >= outD) continue;
+        for (int kh = 0; kh < kH; kh++) {
+            int oh = ih * strideH - padH + kh;
+            if (oh < 0 || oh >= outH) continue;
+            for (int kw = 0; kw < kW; kw++) {
+                int ow = iw * strideW - padW + kw;
+                if (ow < 0 || ow >= outW) continue;
+                for (int oc = 0; oc < outC; oc++) {
+                    sum += gradOutput[(((n * outC + oc) * outD + od) * outH + oh) * outW + ow]
+                         * weights[((((ic * outC + oc) * kD + kd) * kH + kh) * kW + kw)];
+                }
+            }
+        }
+    }
+    gradInput[idx] = sum;
+}
+
+// #775: ConvTranspose3D backward w.r.t. weights. GATHER over gradWeights [inC,outC,kD,kH,kW].
+__kernel void conv_transpose3d_backward_weights(
+    __global const float* gradOutput,
+    __global const float* input,
+    __global float* gradWeights,
+    const int N, const int inC, const int iD, const int iH, const int iW,
+    const int outC, const int outD, const int outH, const int outW,
+    const int kD, const int kH, const int kW,
+    const int strideD, const int strideH, const int strideW,
+    const int padD, const int padH, const int padW)
+{
+    const int idx = get_global_id(0);
+    if (idx >= inC * outC * kD * kH * kW) return;
+    const int kw = idx % kW;
+    const int kh = (idx / kW) % kH;
+    const int kd = (idx / (kW * kH)) % kD;
+    const int oc = (idx / (kW * kH * kD)) % outC;
+    const int ic = idx / (kW * kH * kD * outC);
+    float sum = 0.0f;
+    for (int n = 0; n < N; n++) {
+        for (int id = 0; id < iD; id++) {
+            int od = id * strideD - padD + kd;
+            if (od < 0 || od >= outD) continue;
+            for (int ih = 0; ih < iH; ih++) {
+                int oh = ih * strideH - padH + kh;
+                if (oh < 0 || oh >= outH) continue;
+                for (int iw = 0; iw < iW; iw++) {
+                    int ow = iw * strideW - padW + kw;
+                    if (ow < 0 || ow >= outW) continue;
+                    sum += input[(((n * inC + ic) * iD + id) * iH + ih) * iW + iw]
+                         * gradOutput[(((n * outC + oc) * outD + od) * outH + oh) * outW + ow];
+                }
+            }
+        }
+    }
+    gradWeights[idx] = sum;
+}
 ";
         }
 
@@ -996,7 +1072,9 @@ __kernel void conv_transpose3d(
                 "depthwise_conv2d_backward_weights",
                 "trilinear_interpolate",
                 "trilinear_interpolate_backward",
-                "conv_transpose3d"
+                "conv_transpose3d",
+                "conv_transpose3d_backward_input",
+                "conv_transpose3d_backward_weights"
             };
         }
     }

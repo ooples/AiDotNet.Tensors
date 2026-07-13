@@ -1268,6 +1268,18 @@ public interface IDirectGpuBackend : IDisposable
         int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW)
         => throw new System.NotSupportedException("ConvTranspose3D is not implemented for this GPU backend.");
 
+    /// <summary>ConvTranspose3D backward w.r.t. input. Default-throws (CPU fallback); OpenCL overrides (#775).</summary>
+    void ConvTranspose3DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer weights, IGpuBuffer gradInput,
+        int n, int inC, int iD, int iH, int iW, int outC, int outD, int outH, int outW,
+        int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW)
+        => throw new System.NotSupportedException("ConvTranspose3DBackwardInput is not implemented for this GPU backend.");
+
+    /// <summary>ConvTranspose3D backward w.r.t. weights. Default-throws (CPU fallback); OpenCL overrides (#775).</summary>
+    void ConvTranspose3DBackwardKernel(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradWeights,
+        int n, int inC, int iD, int iH, int iW, int outC, int outD, int outH, int outW,
+        int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW)
+        => throw new System.NotSupportedException("ConvTranspose3DBackwardKernel is not implemented for this GPU backend.");
+
     /// <summary>
     /// Backward pass for 3D max pooling (NCDHW format).
     /// Routes gradients back to the positions that had max values in the forward pass.
