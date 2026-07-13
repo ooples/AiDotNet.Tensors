@@ -14,42 +14,78 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// <c>(numFreqs-1)*2</c> produced nFft = 0 — an empty inverse whose output copy indexed
 /// out of range. IRFFT now clamps nFft up to the caller-supplied outputLength, so the
 /// single DC bin (which IS the signal for n = 1) round-trips exactly.
+///
+/// <para>For n = 1 every quantity is analytic, so these assert exact values rather than
+/// merely "does not throw": RFFT([x]) = [x, 0] (DC bin only), IRFFT([re, im], 1) = [re]
+/// (scale 1/nFft = 1), and d(Σ RFFT(x))/dx = 1 elementwise (the always-zero imaginary bin
+/// contributes no gradient).</para>
 /// </summary>
 [Collection("EngineCurrentGlobalState")]
 public class RfftBackwardTinyTransformTests
 {
     private readonly IEngine _engine = new CpuEngine();
 
-    // Forward RFFT of a length-1 axis is the identity DC bin; its adjoint (IRFFT with
-    // outputLength = 1) must reconstruct without throwing, for any leading batch shape.
+    // IRFFT of a length-1 spectrum returns exactly its real part (the DC bin), scaled by
+    // 1/nFft = 1. The imaginary bin is discarded — correct for a real inverse. Deterministic
+    // inputs so the reconstructed value is checked against a closed form, per batch row.
     [Theory]
     [InlineData(1)]
     [InlineData(8)]
     [InlineData(3)]
-    public void IRFft_LengthOneAxis_DoesNotThrow(int batch)
+    public void IRFft_LengthOneAxis_ReturnsRealPart(int batch)
     {
-        // RFFT([batch, 1]) -> [batch, 2] (interleaved DC re/im). Feed that straight back
-        // into IRFFT(outputLength: 1) — the exact shape RFFT's backward produces.
+        // spectrum[b] = [re_b, im_b]; re/im chosen distinct and non-trivial per row.
         var spectrum = new Tensor<double>(new[] { batch, 2 });
         var sd = spectrum.GetDataArray();
-        var rng = new Random(5);
-        for (int i = 0; i < sd.Length; i++) sd[i] = rng.NextDouble() * 2 - 1;
+        for (int b = 0; b < batch; b++)
+        {
+            sd[b * 2] = b + 1.5;          // re_b
+            sd[b * 2 + 1] = -(b + 0.25);  // im_b (must be ignored by the inverse)
+        }
 
-        var ex = Record.Exception(() => _engine.IRFFT(spectrum, outputLength: 1));
-        Assert.Null(ex);
+        var y = _engine.IRFFT(spectrum, outputLength: 1);
+
+        Assert.Equal(2, y.Rank);
+        Assert.Equal(batch, y.Shape[0]);
+        Assert.Equal(1, y.Shape[1]);
+        for (int b = 0; b < batch; b++)
+            Assert.Equal(b + 1.5, y[b], precision: 12); // == re_b, im_b dropped
     }
 
-    // The full tape path #1856 hit: backprop a scalar loss through Engine.RFFT over a
-    // length-1 axis. Must produce a finite gradient of the input's shape, not throw.
+    // Round-trip: IRFFT(RFFT(x), 1) == x for a length-1 axis (RFFT([x]) = [x, 0], inverse
+    // recovers x exactly with unit scale).
     [Theory]
     [InlineData(1)]
-    [InlineData(8)]
-    public void RfftBackward_LengthOneAxis_ProducesFiniteGradient(int batch)
+    [InlineData(5)]
+    public void Rfft_IRfft_LengthOneAxis_RoundTripsExactly(int batch)
     {
         var x = new Tensor<double>(new[] { batch, 1 });
         var xd = x.GetDataArray();
-        var rng = new Random(11);
-        for (int i = 0; i < xd.Length; i++) xd[i] = rng.NextDouble() * 2 - 1;
+        for (int b = 0; b < batch; b++) xd[b] = 0.75 - 0.5 * b;
+
+        var spectrum = _engine.RFFT(x);
+        Assert.Equal(2, spectrum.Shape[1]); // [re, im] DC only
+        for (int b = 0; b < batch; b++)
+        {
+            Assert.Equal(xd[b], spectrum[b * 2 + 0], precision: 12); // re == x
+            Assert.Equal(0.0, spectrum[b * 2 + 1], precision: 12);   // im == 0
+        }
+
+        var back = _engine.IRFFT(spectrum, outputLength: 1);
+        for (int b = 0; b < batch; b++)
+            Assert.Equal(xd[b], back[b], precision: 12);
+    }
+
+    // The full tape path #1856 hit: backprop Σ RFFT(x) over a length-1 axis. The gradient is
+    // exactly 1 for every element (dRe/dx = 1, dIm/dx = 0), and must carry the input's shape.
+    [Theory]
+    [InlineData(1)]
+    [InlineData(8)]
+    public void RfftBackward_LengthOneAxis_GradientIsAllOnes(int batch)
+    {
+        var x = new Tensor<double>(new[] { batch, 1 });
+        var xd = x.GetDataArray();
+        for (int b = 0; b < batch; b++) xd[b] = 0.3 * (b + 1);
 
         using var tape = new GradientTape<double>();
         var spectrum = _engine.RFFT(x);
@@ -57,9 +93,10 @@ public class RfftBackwardTinyTransformTests
         var grads = tape.ComputeGradients(loss, new[] { x });
 
         Assert.True(grads.TryGetValue(x, out var gx));
-        Assert.Equal(x.Length, gx.Length);
+        Assert.Equal(x.Rank, gx.Rank);
+        Assert.Equal(x.Shape[0], gx.Shape[0]);
+        Assert.Equal(x.Shape[1], gx.Shape[1]);
         for (int i = 0; i < gx.Length; i++)
-            Assert.False(double.IsNaN(gx[i]) || double.IsInfinity(gx[i]),
-                $"grad[{i}] not finite: {gx[i]}");
+            Assert.Equal(1.0, gx[i], precision: 12);
     }
 }
