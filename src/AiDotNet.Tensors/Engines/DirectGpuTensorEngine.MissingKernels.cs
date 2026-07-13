@@ -2998,4 +2998,19 @@ public partial class DirectGpuTensorEngine
         var loss = TensorAdd(TensorMultiply(targets, logP), TensorMultiply(oneMinusT, log1mP));
         return TensorNegate(loss);
     }
+
+    // #775: BCE gradient d/dp = (1-t)/(1-pc) - t/pc, pc = clamp(p, eps, 1-eps). Element-wise compose
+    // from GPU-resident TensorClamp/Divide/Subtract (1-x via Negate+AddScalar), same clamp + term order
+    // as CpuEngine. Defer to base under tape/GraphMode.
+    Tensor<T> IEngine.TensorBinaryCrossEntropyBackward<T>(Tensor<T> predictions, Tensor<T> targets, T epsilon)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+            return base.TensorBinaryCrossEntropyBackward(predictions, targets, epsilon);
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var upper = numOps.Subtract(numOps.One, epsilon);
+        var pc = TensorClamp(predictions, epsilon, upper);
+        var oneMinusPc = TensorAddScalar(TensorNegate(pc), numOps.One);                    // 1 - pc
+        var oneMinusT = TensorAddScalar(TensorNegate(targets), numOps.One);                // 1 - t
+        return TensorSubtract(TensorDivide(oneMinusT, oneMinusPc), TensorDivide(targets, pc));
+    }
 }
