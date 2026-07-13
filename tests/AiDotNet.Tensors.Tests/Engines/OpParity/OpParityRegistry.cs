@@ -1053,14 +1053,14 @@ public static class OpParityRegistry
             e => e.TensorCIoULoss(pb.F(), tb.F()), e => e.TensorCIoULoss(pb.D(), tb.D()),
             ParityTol.Accum(1e-3), opMethod: "TensorCIoULoss");
 
-        // FOUND (quarantined): GPU TensorUpsampleBilinear diverges badly (CPU 26 ULP vs oracle, GPU
-        // ~0.45 abs off) — GPU bilinear-upsample kernel bug (note plain Interpolate bilinear passes,
-        // so it's this specific kernel).
+        // FIXED (#775): the GPU was actually RIGHT — CpuEngine left the bilinear fractional weight
+        // unclamped at the top/left edge (srcH<0 for align_corners=False), extrapolating
+        // (1.25*in[0]-0.25*in[1]); PyTorch + the GPU clamp the source coord (weight 0). Clamped the
+        // CPU weights to >= 0 so both engines match PyTorch.
         var upIn = OpInput.Rand(3230, new[] { 1, 2, 4, 4 });
         yield return new OpCase("TensorUpsampleBilinear[1,2,4,4->8,8]", "resize",
             e => e.TensorUpsampleBilinear(upIn.F(), new[] { 8, 8 }), e => e.TensorUpsampleBilinear(upIn.D(), new[] { 8, 8 }),
-            ParityTol.Accum(1e-3), opMethod: "TensorUpsampleBilinear")
-        { KnownDivergence = "GPU bilinear-upsample kernel diverges ~0.45 abs; CPU matches oracle." };
+            ParityTol.Accum(1e-3), opMethod: "TensorUpsampleBilinear");
 
         yield return new OpCase("TensorTriangularMask[4;lower]", "shape",
             e => e.TensorTriangularMask<float>(4, false, 0), e => e.TensorTriangularMask<double>(4, false, 0),
@@ -1519,12 +1519,15 @@ public static class OpParityRegistry
     // Grid-sample, upsample3d/crop, depthwise-1d, conv/pool backward, IoU + CE losses.
     public static IEnumerable<OpCase> GridConvBwdLoss()
     {
-        // FOUND (quarantined): CPU and GPU GridSample produce DIFFERENT OUTPUT SHAPES for the same
-        // input+grid (CPU 64 elements vs GPU 32) — a hard shape/convention mismatch. Tracked.
+        // FOUND (quarantined): LAYOUT-CONVENTION divergence, not a plain bug. CpuEngine.GridSample is
+        // documented NHWC (input [batch,height,width,channels] -> out [1,4,4,4]=64), the GPU kernel
+        // uses PyTorch NCHW (input [N,C,H,W] -> out [N,C,Hout,Wout]=[1,2,4,4]=32). Both are
+        // self-consistent; they disagree on layout. Resolving needs a library-wide convention decision
+        // (which layout wins) with consumer impact — flagged for the user, not silently changed.
         yield return new OpCase("GridSample[1,2,4,4;g1,4,4,2]", "sample",
             e => e.GridSample(OpInput.Rand(1700, new[] { 1, 2, 4, 4 }).F(), OpInput.Rand(1701, new[] { 1, 4, 4, 2 }, -1.0, 1.0).F()),
             e => e.GridSample(OpInput.Rand(1700, new[] { 1, 2, 4, 4 }).D(), OpInput.Rand(1701, new[] { 1, 4, 4, 2 }, -1.0, 1.0).D()), ParityTol.Accum(1e-3), opMethod: "GridSample")
-        { KnownDivergence = "CPU and GPU GridSample return different output shapes (64 vs 32 elements)." };
+        { KnownDivergence = "GridSample CPU=NHWC vs GPU=NCHW layout convention mismatch (64 vs 32 elements); needs a library-wide layout decision." };
         yield return new OpCase("Upsample3D[1,2,2,2,2;2x2x2]", "shape",
             e => e.Upsample3D(OpInput.Rand(1702, new[] { 1, 2, 2, 2, 2 }).F(), 2, 2, 2),
             e => e.Upsample3D(OpInput.Rand(1702, new[] { 1, 2, 2, 2, 2 }).D(), 2, 2, 2), ParityTol.Exact, opMethod: "Upsample3D");

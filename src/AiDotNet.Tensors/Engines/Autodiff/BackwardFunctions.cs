@@ -2418,13 +2418,13 @@ internal static class BackwardFunctions<T>
             double srcY = (oy + 0.5) * h / outH - 0.5;
             int y0 = Math.Max(0, (int)Math.Floor(srcY));
             int y1 = Math.Min(y0 + 1, h - 1);
-            double fy = srcY - y0;
+            double fy = Math.Max(0.0, srcY - y0); // clamp to match the forward (#775 align_corners=False edge).
             for (int ox = 0; ox < outW; ox++)
             {
                 double srcX = (ox + 0.5) * w / outW - 0.5;
                 int x0 = Math.Max(0, (int)Math.Floor(srcX));
                 int x1 = Math.Min(x0 + 1, w - 1);
-                double fx = srcX - x0;
+                double fx = Math.Max(0.0, srcX - x0); // clamp to match the forward (#775).
                 double g = numOps.ToDouble(gradOutput[bc * outH * outW + oy * outW + ox]);
                 int baseIdx = bc * h * w;
                 inputGrad[baseIdx + y0 * w + x0] = numOps.Add(inputGrad[baseIdx + y0 * w + x0], numOps.FromDouble(g * (1 - fy) * (1 - fx)));

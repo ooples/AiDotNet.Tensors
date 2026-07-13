@@ -43008,7 +43008,12 @@ public partial class CpuEngine : ITensorLevelEngine
             int h0 = Math.Max(0, (int)Math.Floor(srcH));
             h0Arr[oh] = h0;
             h1Arr[oh] = Math.Min(h - 1, h0 + 1);
-            fhArr[oh] = srcH - h0;
+            // Clamp the fractional weight to >= 0. At the top edge srcH < 0 (e.g. outH>inH,
+            // align_corners=False), so srcH - h0 is negative; without the clamp the interpolation
+            // EXTRAPOLATES (1.25*in[0] - 0.25*in[1]). PyTorch align_corners=False clamps the source
+            // coordinate to >= 0 (=> weight 0), which the GPU kernel already did — this made the CPU
+            // the wrong engine in the op-parity edge case (#775).
+            fhArr[oh] = Math.Max(0.0, srcH - h0);
         }
         var w0Arr = new int[outW];
         var w1Arr = new int[outW];
@@ -43019,7 +43024,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int w0 = Math.Max(0, (int)Math.Floor(srcW));
             w0Arr[ow] = w0;
             w1Arr[ow] = Math.Min(w - 1, w0 + 1);
-            fwArr[ow] = srcW - w0;
+            fwArr[ow] = Math.Max(0.0, srcW - w0); // clamp to >= 0 (see fhArr above): PyTorch align_corners=False.
         }
 
         if (typeof(T) == typeof(float)
