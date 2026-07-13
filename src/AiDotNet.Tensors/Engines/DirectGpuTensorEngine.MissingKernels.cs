@@ -3224,6 +3224,16 @@ public partial class DirectGpuTensorEngine
         return TensorMatMul(gradOutput, TensorTranspose(weights));                 // gradOut @ Wᵀ
     }
 
+    // #775: whole-tensor mean (output [1]) via the GPU-resident ReduceMean over all axes.
+    Tensor<T> IEngine.TensorMeanDiff<T>(Tensor<T> tensor)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+            return base.TensorMeanDiff(tensor);
+        var allAxes = new int[tensor.Rank];
+        for (int i = 0; i < tensor.Rank; i++) allAxes[i] = i;
+        return ReduceMean(tensor, allAxes, keepDims: false).Reshape(new[] { 1 });
+    }
+
     // #775 NOTE: TensorRepeatElements is NOT wired here. Routing it to TensorRepeatInterleave (last-axis
     // GPU only) or a reshape->TensorTile->reshape identity both leave it on the CPU for a non-last axis
     // (the GpuLaunchProbe measured zero GPU work) — TensorTile/RepeatInterleave/Gather all fall back to
