@@ -2918,4 +2918,32 @@ public partial class DirectGpuTensorEngine
             return base.BatchNormAffine(x, gamma, beta, mean, variance, epsilon);
         return BatchNormInference(x, gamma, beta, mean, variance, epsilon);
     }
+
+    // #775: population variance over the given axes, composed to run on-device. Mirrors CpuEngine's
+    // TWO-PASS algorithm E[(x-mean)^2] (not the one-pass E[x^2]-E[x]^2, which cancels), so it tracks
+    // the CPU result tightly: reduce the mean keeping dims, broadcast-subtract, square, reduce again.
+    // ReduceMean and the elementwise ops are GPU-resident; the per-outer-group broadcast-subtract runs
+    // on the host but stays deterministic. Defer to base under a live tape/GraphMode (which also records
+    // the dedicated ReduceVariance backward node).
+    Tensor<T> IEngine.ReduceVariance<T>(Tensor<T> input, int[] axes, bool keepDims)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+            return base.ReduceVariance(input, axes, keepDims);
+        var mean = ReduceMean(input, axes, keepDims: true);
+        var centered = TensorBroadcastSubtract(input, mean);
+        var sq = TensorMultiply(centered, centered);
+        return ReduceMean(sq, axes, keepDims);
+    }
+
+    // #775: log-variance = log(variance + eps). Reuse the on-device ReduceVariance compose (via the
+    // interface so the explicit override is hit, not the inherited CpuEngine method), then AddScalar +
+    // TensorLog — same op order as CpuEngine.ReduceLogVariance. Defer to base under tape/GraphMode.
+    Tensor<T> IEngine.ReduceLogVariance<T>(Tensor<T> input, int[] axes, bool keepDims, double epsilon)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+            return base.ReduceLogVariance(input, axes, keepDims, epsilon);
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var variance = ((IEngine)this).ReduceVariance(input, axes, keepDims);
+        return TensorLog(TensorAddScalar(variance, numOps.FromDouble(epsilon)));
+    }
 }
