@@ -3470,6 +3470,13 @@ public partial class DirectGpuTensorEngine
         catch { return base.Conv3DBackwardKernel(gradOutput, input, kernelShape, stride, padding, dilation); }
     }
 
+    // #775 NOTE: Conv1DBackwardInput/Kernel are NOT wired. backend.Conv1DBackwardInput looks up
+    // _kernelCache["im2col"] (the WRONG kernel — no conv1d_backward kernel exists) and there is no
+    // correct 1D backward kernel; launching it produces a wrong/out-of-bounds dispatch that corrupts GPU
+    // state (surfaced as a downstream determinism failure in NativeMagnitudeAndPhase). A REAL conv1d
+    // backward kernel is needed first — until then these stay CPU-only (probe cannot flag a WRONG-kernel
+    // launch, only a missing one, so this is verified by the full-suite regression, not the probe).
+
     // #775: whole-tensor mean (output [1]) via the GPU-resident ReduceMean over all axes.
     Tensor<T> IEngine.TensorMeanDiff<T>(Tensor<T> tensor)
     {
