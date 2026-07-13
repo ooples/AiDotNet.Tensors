@@ -136,6 +136,52 @@ public class GroupedDeformableConv2DBackwardTests
     }
 
     /// <summary>
+    /// #1789 (BasicVSR++): groups=1 with deformGroups>1 — the standard torchvision DeformConv2d /
+    /// flow-guided deformable alignment (Chan et al. 2022) config. Previously the CPU path rejected it
+    /// (deformGroups must divide groups); now the deform group is keyed on the input channel span
+    /// (inChannels/deformGroups), matching the GPU. Verify forward runs and the grouped backward
+    /// (input/kernel/offset) agrees with finite differences.
+    /// </summary>
+    [Fact]
+    public void Groups1_DeformGroups2_BackwardMatchesFiniteDifference()
+    {
+        var e = new CpuEngine();
+        const int groups = 1, dg = 2, inC = 4, outC = 4, H = 5, W = 5, k = 3, kk = 9, inCpg = 4;
+        int[] s = [1, 1], p = [1, 1], dl = [1, 1];
+        var input = Rand(21, 1.0, 1, inC, H, W);
+        var kernel = Rand(22, 1.0, outC, inCpg, k, k);
+        var offset = Rand(23, 0.6, 1, 2 * kk * dg, H, W);
+        var gradOut = new Tensor<double>([1, outC, H, W], new Vector<double>(System.Linq.Enumerable.Repeat(1.0, outC * H * W).ToArray()));
+
+        // Forward must not throw and must be finite.
+        var fwd = e.DeformableConv2DGrouped(input, kernel, offset, null, s, p, dl, groups, dg);
+        for (int i = 0; i < fwd.Length; i++)
+            Assert.True(!double.IsNaN(fwd[i]) && !double.IsInfinity(fwd[i]), $"forward[{i}] not finite");
+
+        var gI = e.DeformableConv2DGroupedBackwardInput(gradOut, input, kernel, offset, null, [1, inC, H, W], s, p, dl, groups, dg);
+        var gK = e.DeformableConv2DGroupedBackwardKernel(gradOut, input, offset, null, [outC, inCpg, k, k], s, p, dl, groups, dg);
+        var gO = e.DeformableConv2DGroupedBackwardOffset(gradOut, input, kernel, offset, null, s, p, dl, groups, dg);
+
+        const double eps = 1e-5;
+        void Check(Tensor<double> t, Tensor<double> analytic, string name, double tol)
+        {
+            for (int i = 0; i < t.Length; i++)
+            {
+                double orig = t[i];
+                t[i] = orig + eps; double lp = Loss(e, input, kernel, offset, s, p, dl, groups, dg);
+                t[i] = orig - eps; double lm = Loss(e, input, kernel, offset, s, p, dl, groups, dg);
+                t[i] = orig;
+                double num = (lp - lm) / (2 * eps);
+                Assert.True(System.Math.Abs(num - analytic[i]) <= tol + 1e-2 * System.Math.Abs(num),
+                    $"{name}[{i}]: analytic={analytic[i]:F5} numeric={num:F5}");
+            }
+        }
+        Check(input, gI, "gradInput", 1e-3);
+        Check(kernel, gK, "gradKernel", 1e-3);
+        Check(offset, gO, "gradOffset", 5e-3);
+    }
+
+    /// <summary>
     /// The autodiff wiring (#1691): the grouped forward records on the tape and back-props through the
     /// grouped backward kernels. With loss = sum(output), the upstream gradient is all-ones, so the tape
     /// gradients must equal the manual grouped backward called with gradOut = ones (already finite-diff

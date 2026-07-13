@@ -17774,14 +17774,17 @@ public partial class CpuEngine : ITensorLevelEngine
         int inCpg = inChannels / groups;
         int outCpg = outChannels / groups;
         if (kernelInChannels != inCpg) throw new ArgumentException($"Kernel in_channels ({kernelInChannels}) must equal inChannels/groups ({inCpg}).");
-        // deformGroups must DIVIDE groups: there each output group maps to exactly one deformable group
-        // (dg = g·deformGroups/groups), and that mapping coincides with the GPU kernel's per-input-channel
-        // mapping (ic/(inChannels/deformGroups)). The groups<deformGroups case (deformGroups not dividing
-        // groups) would put multiple deformable groups inside one group's channel span — the CPU
-        // composition path can't express that and would silently diverge from the GPU kernel — so reject it.
-        if (groups % deformGroups != 0)
-            throw new ArgumentException($"deformGroups ({deformGroups}) must divide groups ({groups}). " +
-                "The groups<deformGroups configuration is not supported (it would diverge between the CPU and GPU paths).");
+        // A deformable group owns a contiguous span of INPUT channels — an input channel's deform group
+        // is ic/(inChannels/deformGroups), the same mapping the GPU kernel uses. So the only requirement
+        // is that deformGroups partitions the input channels evenly. The previous groups%deformGroups==0
+        // restriction (mapping the deform group per OUTPUT group as dg = g·deformGroups/groups) rejected
+        // the standard groups=1, deformGroups=N config (torchvision DeformConv2d / BasicVSR++'s flow-guided
+        // deformable alignment, Chan et al. 2022). Per-input-channel mapping (applied in the ic loop below)
+        // reduces to the same dg for every previously-allowed case (deformGroups | groups) and additionally
+        // handles groups < deformGroups, matching the GPU.
+        if (inChannels % deformGroups != 0)
+            throw new ArgumentException($"Input channels ({inChannels}) must be divisible by deformGroups ({deformGroups}).");
+        int inChannelsPerDeformGroup = inChannels / deformGroups;
 
         int strideH = stride[0], strideW = stride[1];
         int padH = padding[0], padW = padding[1];
@@ -17807,10 +17810,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int b = idx / outChannels;
             int oc = idx % outChannels;
             int g = oc / outCpg;                                   // output group
-            int dg = deformGroups == 1 ? 0 : g * deformGroups / groups; // deformable group
             int icBase = g * inCpg;                                // first input channel of this group
-            int offBlock = dg * 2 * numKernelPositions;            // offset channel base for this deform group
-            int maskBlock = dg * numKernelPositions;
 
             for (int oh = 0; oh < outputHeight; oh++)
             {
@@ -17820,6 +17820,12 @@ public partial class CpuEngine : ITensorLevelEngine
                     for (int ic = 0; ic < inCpg; ic++)
                     {
                         int icGlobal = icBase + ic;
+                        // Deformable group is keyed on the INPUT channel (same as the GPU kernel): each
+                        // deform group owns inChannels/deformGroups contiguous input channels. Reduces to
+                        // the old per-output-group dg whenever deformGroups | groups.
+                        int dg = deformGroups == 1 ? 0 : icGlobal / inChannelsPerDeformGroup;
+                        int offBlock = dg * 2 * numKernelPositions;
+                        int maskBlock = dg * numKernelPositions;
                         for (int kh = 0; kh < kernelHeight; kh++)
                         {
                             for (int kw = 0; kw < kernelWidth; kw++)
@@ -17966,9 +17972,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
     // ---- Grouped DCNv3 backward (#1691). Single-pass FUSED kernels: one parallel region over the full
     // output/deform-group space with inline group indexing — no per-group slicing or G separate launches.
-    // (Replaces the earlier per-group composition; finite-difference + GPU-parity verified. The constraint
-    // deformGroups | groups, enforced by the forward, guarantees groupsPerDg = groups/deformGroups output
-    // groups share each deformable group.) ----
+    // (Replaces the earlier per-group composition; finite-difference + GPU-parity verified. Each deformable
+    // group owns the input-channel span [dg·inChannels/deformGroups, (dg+1)·…), keyed on the input channel
+    // exactly as the GPU kernel — so any (groups, deformGroups) with deformGroups | inChannels works,
+    // including the standard groups=1, deformGroups>1 config, #1789.) ----
 
     /// <summary>Grouped <see cref="DeformableConv2D{T}"/> gradient w.r.t. input (#1691, fused single pass).</summary>
     public virtual Tensor<T> DeformableConv2DGroupedBackwardInput<T>(
@@ -18008,7 +18015,9 @@ public partial class CpuEngine : ITensorLevelEngine
             int icGlobal = idx % inChannels;
             int g = icGlobal / inCpg;
             int icl = icGlobal - g * inCpg;
-            int dg = deformGroups == 1 ? 0 : g * deformGroups / groups;
+            // Deform group keyed on the input channel (matches the forward + GPU); reduces to the old
+            // per-output-group dg when deformGroups | groups, and additionally supports groups < deformGroups.
+            int dg = deformGroups == 1 ? 0 : icGlobal / (inChannels / deformGroups);
             int ocBase = g * outCpg;
             int offBlock = dg * 2 * numKernelPositions;
             int maskBlock = dg * numKernelPositions;
@@ -18076,10 +18085,7 @@ public partial class CpuEngine : ITensorLevelEngine
             (long)batch * outChannels * outputHeight * outputWidth, oc =>
         {
             int g = oc / outCpg;
-            int dg = deformGroups == 1 ? 0 : g * deformGroups / groups;
             int icBase = g * inCpg;
-            int offBlock = dg * 2 * numKernelPositions;
-            int maskBlock = dg * numKernelPositions;
 
             for (int b = 0; b < batch; b++)
             for (int oh = 0; oh < outputHeight; oh++)
@@ -18090,6 +18096,10 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int icl = 0; icl < inCpg; icl++)
                 {
                     int icGlobal = icBase + icl;
+                    // Deform group keyed on the input channel (matches the forward + GPU).
+                    int dg = deformGroups == 1 ? 0 : icGlobal / (inChannels / deformGroups);
+                    int offBlock = dg * 2 * numKernelPositions;
+                    int maskBlock = dg * numKernelPositions;
                     for (int kh = 0; kh < kernelHeight; kh++)
                     for (int kw = 0; kw < kernelWidth; kw++)
                     {
@@ -18129,7 +18139,7 @@ public partial class CpuEngine : ITensorLevelEngine
         int strideH = stride[0], strideW = stride[1], padH = padding[0], padW = padding[1], dilationH = dilation[0], dilationW = dilation[1];
         int outputHeight = gradOutput._shape[2], outputWidth = gradOutput._shape[3];
         int numKernelPositions = kernelHeight * kernelWidth;
-        int inCpg = inChannels / groups, outCpg = outChannels / groups, groupsPerDg = groups / deformGroups;
+        int inCpg = inChannels / groups, outCpg = outChannels / groups, inChannelsPerDeformGroup = inChannels / deformGroups;
         int offChans = 2 * numKernelPositions * deformGroups, maskChans = numKernelPositions * deformGroups;
 
         var gradOffset = AutoTensorCache.RentOrAllocate<T>(offset._shape);
@@ -18148,7 +18158,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int b = idx / deformGroups;
             int dg = idx % deformGroups;
             int offBlock = dg * 2 * numKernelPositions, maskBlock = dg * numKernelPositions;
-            int gStart = dg * groupsPerDg, gEnd = gStart + groupsPerDg;
+            int icDgStart = dg * inChannelsPerDeformGroup, icDgEnd = icDgStart + inChannelsPerDeformGroup;
 
             for (int oh = 0; oh < outputHeight; oh++)
             for (int ow = 0; ow < outputWidth; ow++)
@@ -18170,23 +18180,22 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
 
                 T gradOffsetY = numOps.Zero, gradOffsetX = numOps.Zero;
-                for (int g = gStart; g < gEnd; g++)
+                for (int icGlobal = icDgStart; icGlobal < icDgEnd; icGlobal++)
                 {
-                    int icBase = g * inCpg, ocBase = g * outCpg;
+                    int g = icGlobal / inCpg;              // conv group owning this input channel
+                    int icl = icGlobal - g * inCpg;
+                    int ocBase = g * outCpg;
+                    int kernelIdx = ((ocBase * inCpg + icl) * kernelHeight + kh) * kernelWidth + kw;
+                    var (dH, dW) = BilinearGradient(inputData, b, icGlobal, inChannels, height, width, sampledH, sampledW, numOps);
                     for (int ocl = 0; ocl < outCpg; ocl++)
                     {
                         int oc = ocBase + ocl;
                         int gradOutIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
                         T gradOutVal = gradOutputData[gradOutIdx];
-                        for (int icl = 0; icl < inCpg; icl++)
-                        {
-                            int icGlobal = icBase + icl;
-                            int kernelIdx = ((oc * inCpg + icl) * kernelHeight + kh) * kernelWidth + kw;
-                            var (dH, dW) = BilinearGradient(inputData, b, icGlobal, inChannels, height, width, sampledH, sampledW, numOps);
-                            T factor = numOps.Multiply(numOps.Multiply(gradOutVal, kernelData[kernelIdx]), modulation);
-                            gradOffsetY = numOps.Add(gradOffsetY, numOps.Multiply(factor, dH));
-                            gradOffsetX = numOps.Add(gradOffsetX, numOps.Multiply(factor, dW));
-                        }
+                        int kIdx = kernelIdx + ocl * inCpg * kernelHeight * kernelWidth;
+                        T factor = numOps.Multiply(numOps.Multiply(gradOutVal, kernelData[kIdx]), modulation);
+                        gradOffsetY = numOps.Add(gradOffsetY, numOps.Multiply(factor, dH));
+                        gradOffsetX = numOps.Add(gradOffsetX, numOps.Multiply(factor, dW));
                     }
                 }
                 gradOffsetData[offYIdx] = gradOffsetY;
@@ -18209,7 +18218,7 @@ public partial class CpuEngine : ITensorLevelEngine
         int strideH = stride[0], strideW = stride[1], padH = padding[0], padW = padding[1], dilationH = dilation[0], dilationW = dilation[1];
         int outputHeight = gradOutput._shape[2], outputWidth = gradOutput._shape[3];
         int numKernelPositions = kernelHeight * kernelWidth;
-        int inCpg = inChannels / groups, outCpg = outChannels / groups, groupsPerDg = groups / deformGroups;
+        int inCpg = inChannels / groups, outCpg = outChannels / groups, inChannelsPerDeformGroup = inChannels / deformGroups;
         int offChans = 2 * numKernelPositions * deformGroups, maskChans = numKernelPositions * deformGroups;
 
         var gradMask = AutoTensorCache.RentOrAllocate<T>(mask._shape);
@@ -18227,7 +18236,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int b = idx / deformGroups;
             int dg = idx % deformGroups;
             int offBlock = dg * 2 * numKernelPositions, maskBlock = dg * numKernelPositions;
-            int gStart = dg * groupsPerDg, gEnd = gStart + groupsPerDg;
+            int icDgStart = dg * inChannelsPerDeformGroup, icDgEnd = icDgStart + inChannelsPerDeformGroup;
 
             for (int oh = 0; oh < outputHeight; oh++)
             for (int ow = 0; ow < outputWidth; ow++)
@@ -18243,21 +18252,19 @@ public partial class CpuEngine : ITensorLevelEngine
                 double sampledW = ow * strideW - padW + kw * dilationW + offsetX;
 
                 T gradMaskVal = numOps.Zero;
-                for (int g = gStart; g < gEnd; g++)
+                for (int icGlobal = icDgStart; icGlobal < icDgEnd; icGlobal++)
                 {
-                    int icBase = g * inCpg, ocBase = g * outCpg;
+                    int g = icGlobal / inCpg;              // conv group owning this input channel
+                    int icl = icGlobal - g * inCpg;
+                    int ocBase = g * outCpg;
+                    T sampledValue = BilinearSample(inputData, b, icGlobal, inChannels, height, width, sampledH, sampledW, numOps);
                     for (int ocl = 0; ocl < outCpg; ocl++)
                     {
                         int oc = ocBase + ocl;
                         int gradOutIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
                         T gradOutVal = gradOutputData[gradOutIdx];
-                        for (int icl = 0; icl < inCpg; icl++)
-                        {
-                            int icGlobal = icBase + icl;
-                            int kernelIdx = ((oc * inCpg + icl) * kernelHeight + kh) * kernelWidth + kw;
-                            T sampledValue = BilinearSample(inputData, b, icGlobal, inChannels, height, width, sampledH, sampledW, numOps);
-                            gradMaskVal = numOps.Add(gradMaskVal, numOps.Multiply(numOps.Multiply(gradOutVal, kernelData[kernelIdx]), sampledValue));
-                        }
+                        int kernelIdx = ((oc * inCpg + icl) * kernelHeight + kh) * kernelWidth + kw;
+                        gradMaskVal = numOps.Add(gradMaskVal, numOps.Multiply(numOps.Multiply(gradOutVal, kernelData[kernelIdx]), sampledValue));
                     }
                 }
                 int maskIdx = ((b * maskChans + maskBlock + kp) * outputHeight + oh) * outputWidth + ow;
