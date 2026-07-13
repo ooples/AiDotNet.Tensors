@@ -3013,4 +3013,48 @@ public partial class DirectGpuTensorEngine
         var oneMinusT = TensorAddScalar(TensorNegate(targets), numOps.One);                // 1 - t
         return TensorSubtract(TensorDivide(oneMinusT, oneMinusPc), TensorDivide(targets, pc));
     }
+
+    // #775: GLU backward. GLU(input) = a * sigmoid(b) where a,b are the halves of `input` split along
+    // `dim`. So d/da = sigmoid(b)*gradOut and d/db = a*sigmoid(b)*(1-sigmoid(b))*gradOut, concatenated
+    // back. Fully on-device: TensorNarrow (split) + TensorSigmoid + elementwise + TensorConcatenate are
+    // all GPU-resident. Same multiply order as CpuEngine. Defer to base under tape/GraphMode/odd split.
+    Tensor<T> IEngine.GLUBackward<T>(Tensor<T> gradOutput, Tensor<T> input, int dim)
+    {
+        int actualDim = dim < 0 ? input.Rank + dim : dim;
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || actualDim < 0 || actualDim >= input.Rank
+            || input.Shape._dims[actualDim] % 2 != 0)
+            return base.GLUBackward(gradOutput, input, dim);
+        int half = input.Shape._dims[actualDim] / 2;
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var a = TensorNarrow(input, actualDim, 0, half);           // value half
+        var b = TensorNarrow(input, actualDim, half, half);        // gate half
+        var sigB = TensorSigmoid(b);
+        var gradA = TensorMultiply(sigB, gradOutput);              // d/da = sigmoid(b)*gradOut
+        var oneMinusSig = TensorAddScalar(TensorNegate(sigB), numOps.One);
+        var gradB = TensorMultiply(TensorMultiply(TensorMultiply(a, sigB), oneMinusSig), gradOutput);
+        return TensorConcatenate(new[] { gradA, gradB }, actualDim);
+    }
+
+    // #775: SwiGLU backward. SwiGLU(input) = a * swish(b), swish(b) = b*sigmoid(b). d/da = swish(b)*gradOut;
+    // d/db = a * swish'(b) * gradOut, swish'(b) = sigmoid(b) + b*sigmoid(b)*(1-sigmoid(b)). Fully on-device,
+    // same op order as CpuEngine. Defer to base under tape/GraphMode/odd split.
+    Tensor<T> IEngine.SwiGLUBackward<T>(Tensor<T> gradOutput, Tensor<T> input, int dim)
+    {
+        int actualDim = dim < 0 ? input.Rank + dim : dim;
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || actualDim < 0 || actualDim >= input.Rank
+            || input.Shape._dims[actualDim] % 2 != 0)
+            return base.SwiGLUBackward(gradOutput, input, dim);
+        int half = input.Shape._dims[actualDim] / 2;
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var a = TensorNarrow(input, actualDim, 0, half);
+        var b = TensorNarrow(input, actualDim, half, half);
+        var sigB = TensorSigmoid(b);
+        var swishB = TensorMultiply(b, sigB);                                        // b*sigmoid(b)
+        var oneMinusSig = TensorAddScalar(TensorNegate(sigB), numOps.One);
+        // swish'(b) = sigmoid(b) + (b*sigmoid(b))*(1-sigmoid(b))
+        var swishDeriv = TensorAdd(sigB, TensorMultiply(swishB, oneMinusSig));
+        var gradA = TensorMultiply(swishB, gradOutput);
+        var gradB = TensorMultiply(TensorMultiply(a, swishDeriv), gradOutput);
+        return TensorConcatenate(new[] { gradA, gradB }, actualDim);
+    }
 }
