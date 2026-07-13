@@ -936,6 +936,12 @@ public static class OpParityRegistry
             e => e.Gather(src.F(), new Tensor<int>((int[])gIdx.Clone(), new[] { 4, 3 }), 1),
             e => e.Gather(src.D(), new Tensor<int>((int[])gIdx.Clone(), new[] { 4, 3 }), 1),
             ParityTol.Exact, opMethod: "Gather");
+        // Axis-0 row gather (1-D indices) — exercises the dedicated GPU gather_kernel path.
+        var g0Idx = new int[] { 3, 0, 2, 0, 1 };
+        yield return new OpCase("Gather[4,6;idx5;axis0]", "index",
+            e => e.Gather(src.F(), new Tensor<int>((int[])g0Idx.Clone(), new[] { 5 }), 0),
+            e => e.Gather(src.D(), new Tensor<int>((int[])g0Idx.Clone(), new[] { 5 }), 0),
+            ParityTol.Exact, opMethod: "Gather");
 
         var dest = OpInput.Rand(3410, new[] { 4, 6 });
         var upd = OpInput.Rand(3411, new[] { 4, 3 });

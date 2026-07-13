@@ -2812,4 +2812,39 @@ public partial class DirectGpuTensorEngine
         }
         catch { return base.ScaledDotProductAttention(query, key, value, mask, scale, out attentionWeights); }
     }
+
+    /// <inheritdoc/>
+    Tensor<T> IEngine.Gather<T>(Tensor<T> input, Tensor<int> indices, int axis)
+    {
+        // GPU gather_kernel is an axis-0 row-gather (output row i = source row indices[i]); other axes /
+        // n-D index tensors / tape / graph / non-float defer to the base.
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+            || axis != 0 || indices.Rank != 1 || input.Rank < 1 || input.Shape._dims[0] <= 0 || !TryGetBackend(out var backend))
+            return base.Gather(input, indices, axis);
+        try
+        {
+            int n = input.Shape._dims[0];
+            int featureSize = input.Length / n;
+            int numIndices = indices.Length;
+            var idxData = indices.GetDataArray();
+            // gather_kernel reads (int)indices[idx] from a FLOAT buffer, so upload the index VALUES
+            // (not the bit-reinterpreted ints AllocateIntBuffer would produce).
+            var idxF = new float[numIndices];
+            for (int i = 0; i < numIndices; i++) idxF[i] = idxData[i];
+            using var srcB = GetOrAllocateBuffer(backend, input);
+            using var idxB = new OwnedBuffer(backend.AllocateBuffer(idxF), ownsBuffer: true);
+            var outB = AllocateOutputBuffer(backend, numIndices * featureSize);
+            try
+            {
+                backend.Gather(srcB.Buffer, idxB.Buffer, outB.Buffer, numIndices, featureSize);
+                var outShape = new int[input.Rank];
+                outShape[0] = numIndices;
+                for (int i = 1; i < input.Rank; i++) outShape[i] = input.Shape._dims[i];
+                var arr = FinishGpuOp<T>(backend, outB, numIndices * featureSize);
+                return new Tensor<T>(arr, outShape);
+            }
+            catch { outB.Dispose(); throw; }
+        }
+        catch { return base.Gather(input, indices, axis); }
+    }
 }
