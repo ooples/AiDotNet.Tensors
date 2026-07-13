@@ -2975,6 +2975,19 @@ public partial class DirectGpuTensorEngine
         return TensorSqrt(((IEngine)this).TensorVar(tensor));
     }
 
+    // #775: MSE loss = mean((pred - target)^2), output [1]. Subtract -> square -> reduce-mean over all
+    // axes (all GPU-resident), reshape to [1]. Defer to base under tape/GraphMode.
+    Tensor<T> IEngine.TensorMSELoss<T>(Tensor<T> predictions, Tensor<T> targets)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+            return base.TensorMSELoss(predictions, targets);
+        var diff = TensorSubtract(predictions, targets);
+        var sq = TensorMultiply(diff, diff);
+        var allAxes = new int[sq.Rank];
+        for (int i = 0; i < sq.Rank; i++) allAxes[i] = i;
+        return ReduceMean(sq, allAxes, keepDims: false).Reshape(new[] { 1 });
+    }
+
     // #775: order-2 Taylor softmax = normalize(1 + s + s^2/2) along `axis`, s = x - max(x). Only order 2
     // is accelerated: its polynomial 0.5*(s+1)^2 + 0.5 >= 0.5 > 0, so the axis-sum is strictly positive
     // and CpuEngine's sumExp==0 fallback is provably dead — matching the CPU value under Accum(1e-3).
