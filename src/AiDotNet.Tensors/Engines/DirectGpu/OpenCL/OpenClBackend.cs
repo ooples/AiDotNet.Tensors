@@ -9931,7 +9931,7 @@ KERNEL VARIANTS (A/B testing):
 
         public void Gather(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, int numIndices, int featureSize)
         {
-            var k = _kernelCache["gather"];
+            var k = _kernelCache["gather_kernel"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)source).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
@@ -9939,7 +9939,10 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, numIndices);
             k.SetArg(arg++, featureSize);
 
-            k.Execute2D(featureSize, numIndices, Math.Min(16, featureSize), Math.Min(16, numIndices));
+            // gather_kernel indexes get_global_id(0) as the OUTPUT ROW (0..numIndices) and loops
+            // featureSize internally — it is 1D over numIndices, NOT a 2D featureSize x numIndices grid
+            // (which would leave get_global_id(0) spanning featureSize and drop rows when featureSize<numIndices).
+            k.Execute1D(numIndices, Math.Min(256, numIndices));
         }
 
         #endregion

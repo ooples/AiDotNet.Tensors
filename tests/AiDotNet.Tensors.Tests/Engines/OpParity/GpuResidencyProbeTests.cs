@@ -32,7 +32,7 @@ public sealed class GpuResidencyProbeTests
     // to hide a regression. Measured in isolation (see class remarks); parallel runs can only observe
     // an equal-or-lower count (a stray cross-collection launch never manufactures a fallback), so the
     // <= assertion cannot false-fail.
-    private const int CpuFallbackFloor = 160;
+    private const int CpuFallbackFloor = 156;
 
     [SkippableFact]
     public void EveryRegistryOp_ActuallyLaunchesAGpuKernel()
