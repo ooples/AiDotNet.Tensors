@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.114.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.114.1...v0.114.2) (2026-07-13)
+
+
+### Bug Fixes
+
+* **cpu:** support groups&lt;deformGroups in DeformableConv2DGrouped (key deform group on input channel) ([#780](https://github.com/ooples/AiDotNet.Tensors/issues/780)) ([2b5a080](https://github.com/ooples/AiDotNet.Tensors/commit/2b5a0809389eed4df45c105954dfb5a99abbde36))
+
 ## [0.114.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.114.0...v0.114.1) (2026-07-13)
 
 
