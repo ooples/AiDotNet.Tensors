@@ -16544,6 +16544,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    // #775: the plain Tanh(tensor) primitive (distinct IEngine op from TensorTanh) had no GPU
+    // override, so the eager path inherited CpuEngine's SIMD tanh and silently ran on the host.
+    // Route the eager, contiguous path to the GPU tanh kernel via TensorTanh (which runs the kernel
+    // and records autodiff); defer GraphMode capture and strided views to the base (whose GraphMode
+    // execution already dispatches to the GPU TanhInto kernel).
+    public override Tensor<T> Tanh<T>(Tensor<T> tensor)
+    {
+        if (tensor is null)
+            throw new System.ArgumentNullException(nameof(tensor));
+        if (Compilation.GraphMode.IsActive || !tensor.IsContiguous)
+            return base.Tanh(tensor);
+        return TensorTanh(tensor);
+    }
+
     public override Tensor<T> TensorTanh<T>(Tensor<T> tensor)
     {
         try
