@@ -2828,12 +2828,10 @@ public partial class DirectGpuTensorEngine
             int featureSize = input.Length / n;
             int numIndices = indices.Length;
             var idxData = indices.GetDataArray();
-            // gather_kernel reads (int)indices[idx] from a FLOAT buffer, so upload the index VALUES
-            // (not the bit-reinterpreted ints AllocateIntBuffer would produce).
-            var idxF = new float[numIndices];
-            for (int i = 0; i < numIndices; i++) idxF[i] = idxData[i];
+            // gather_kernel reads INT indices (aligned with the 8 other backend.Gather callers, which all
+            // upload via AllocateIntBuffer).
             using var srcB = GetOrAllocateBuffer(backend, input);
-            using var idxB = new OwnedBuffer(backend.AllocateBuffer(idxF), ownsBuffer: true);
+            using var idxB = new OwnedBuffer(backend.AllocateIntBuffer(idxData), ownsBuffer: true);
             var outB = AllocateOutputBuffer(backend, numIndices * featureSize);
             try
             {

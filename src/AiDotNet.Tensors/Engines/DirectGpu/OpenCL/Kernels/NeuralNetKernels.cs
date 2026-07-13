@@ -816,7 +816,7 @@ __kernel void fma_kernel(
 // Gather operation
 __kernel void gather_kernel(
     __global const float* source,
-    __global const float* indices,
+    __global const int* indices,
     __global float* output,
     const int numIndices,
     const int featureSize)
@@ -824,7 +824,7 @@ __kernel void gather_kernel(
     const int idx = get_global_id(0);
     if (idx >= numIndices) return;
 
-    int index = (int)indices[idx];
+    int index = indices[idx];
     for (int f = 0; f < featureSize; f++) {
         output[idx * featureSize + f] = source[index * featureSize + f];
     }

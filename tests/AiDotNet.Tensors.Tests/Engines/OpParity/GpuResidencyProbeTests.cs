@@ -32,12 +32,12 @@ public sealed class GpuResidencyProbeTests
     // to hide a regression. Measured in isolation (see class remarks); parallel runs can only observe
     // an equal-or-lower count (a stray cross-collection launch never manufactures a fallback), so the
     // <= assertion cannot false-fail.
-    private const int CpuFallbackFloor = 154;
+    private const int CpuFallbackFloor = 150;
 
     // Ops whose GPU override throws kernel-not-found and silently falls back to the CPU (a hollow
     // override — reflection counts it covered, the probe proves it does zero GPU work). GOAL 0.
     // Ratchets DOWN only: register/write the missing kernel or compose from a working primitive.
-    private const int HollowOverrideFloor = 4;
+    private const int HollowOverrideFloor = 0;
 
     [SkippableFact]
     public void EveryRegistryOp_ActuallyLaunchesAGpuKernel()

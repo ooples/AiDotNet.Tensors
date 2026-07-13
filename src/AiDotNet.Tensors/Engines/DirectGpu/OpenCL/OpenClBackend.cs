@@ -9934,13 +9934,11 @@ KERNEL VARIANTS (A/B testing):
 
         public void Gather(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, int numIndices, int featureSize)
         {
-            // #775 KNOWN GAP: the registered kernel is "gather_kernel", so this "gather" lookup throws
-            // KeyNotFoundException and every caller's try/catch silently falls to the CPU (the residency
-            // probe surfaced it). Do NOT just rename it: the ~9 callers disagree on index encoding
-            // (float VALUE vs int bit-pattern) and semantics (row-gather vs torch.gather vs masked-select),
-            // so making this launch breaks TensorGather/TensorTake/TensorMaskedSelect. Each caller needs its
-            // own correct kernel/encoding; tracked on the gpu-cpu-fallback worklist until then.
-            var k = _kernelCache["gather"];
+            // #775: registered as "gather_kernel". It is a 1D axis-0 ROW gather over `numIndices` output
+            // rows (get_global_id(0) = output row, loops featureSize), reading INT indices — which all 9
+            // callers upload via AllocateIntBuffer. (The prior "gather" lookup threw and every caller's
+            // catch silently fell to the CPU; the residency probe surfaced it.)
+            var k = _kernelCache["gather_kernel"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)source).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
@@ -9948,7 +9946,10 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, numIndices);
             k.SetArg(arg++, featureSize);
 
-            k.Execute2D(featureSize, numIndices, Math.Min(16, featureSize), Math.Min(16, numIndices));
+            // 1D over the OUTPUT ROWS (get_global_id(0) in [0,numIndices), loops featureSize internally).
+            // Execute2D(featureSize, numIndices) would leave get_global_id(0) spanning featureSize and drop
+            // rows whenever featureSize < numIndices.
+            k.Execute1D(numIndices, Math.Min(256, numIndices));
         }
 
         #endregion
