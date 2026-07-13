@@ -52,6 +52,18 @@ public static class AutotuneCache
 
     private static readonly object _lock = new();
 
+    // Process-wide in-memory memo of the (resolved-path -> parsed choice) lookup result, keyed by
+    // path and VALIDATED against the file's last-write time. Re-reading + JSON-parsing the autotune
+    // JSON from disk on every GEMM call was pure per-call overhead — File.ReadAllText +
+    // JsonSerializer.Deserialize dominated the compiled-replay hot path (measured ~33% of runtime).
+    // A cache hit now costs a single FileInfo stat (the same File.Exists stat the old code already
+    // did) instead of a full read+parse. Validating against LastWriteTimeUtc keeps the memo honest
+    // when the file changes out-of-band (Store rewrites it, ClearCurrentHardware deletes it, or a
+    // sibling process updates it), so correctness matches a fresh disk read while the hot path skips
+    // the read+parse. Concurrent-safe; a first-access race just repeats the idempotent disk read.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (DateTime WriteUtc, KernelChoice? Choice)> _memo
+        = new(System.StringComparer.Ordinal);
+
     /// <summary>
     /// Default cache root. Resolves to <c>~/.aidotnet/autotune/</c> unless the
     /// <c>AIDOTNET_AUTOTUNE_CACHE_PATH</c> environment variable is set (in which
@@ -86,9 +98,36 @@ public static class AutotuneCache
     /// </summary>
     public static KernelChoice? Lookup(KernelId kernelId, ShapeProfile shape)
     {
+        // Stat-validated memo (see _memo): one FileInfo stat replaces the per-call read+parse on a
+        // cache hit, while re-reading whenever the on-disk file changes (or disappears).
+        string path = ResolvePath(kernelId, shape);
         try
         {
-            string path = ResolvePath(kernelId, shape);
+            var fi = new FileInfo(path);
+            if (!fi.Exists)
+            {
+                _memo.TryRemove(path, out _);
+                return null;
+            }
+            DateTime writeUtc = fi.LastWriteTimeUtc;   // reuses the stat FileInfo.Exists already did
+            if (_memo.TryGetValue(path, out var e) && e.WriteUtc == writeUtc)
+                return e.Choice;                        // hit: skip the read + JSON parse
+
+            KernelChoice? result = LookupFromDisk(path);
+            _memo[path] = (writeUtc, result);
+            return result;
+        }
+        catch
+        {
+            // Stat failure (permissions, race) — fall back to a direct disk read, don't memoize.
+            return LookupFromDisk(path);
+        }
+    }
+
+    private static KernelChoice? LookupFromDisk(string path)
+    {
+        try
+        {
             if (!File.Exists(path)) return null;
 
             string json = File.ReadAllText(path);
@@ -254,6 +293,8 @@ public static class AutotuneCache
             try { if (File.Exists(tmpPath)) File.Delete(tmpPath); } catch { /* best effort */ }
             throw;
         }
+        // No explicit memo update needed: the write bumps the file's last-write time, and Lookup's
+        // stat-validation (see _memo) re-reads whenever the on-disk timestamp changes.
     }
 
     /// <summary>
