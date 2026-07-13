@@ -105,15 +105,17 @@ public static class OpParityRegistry
             e => e.Fold(foldIn.D(), new[] { 4, 4 }, new[] { 2, 2 }, new[] { 2, 2 }, new[] { 0, 0 }),
             ParityTol.Ulp(4), opMethod: "Fold");
 
-        // Reorder to NCHW (standard [N,C,H,W] tensor).
-        var reIn = OpInput.Rand(5620, new[] { 1, 2, 4, 4 });
-        yield return new OpCase("ReorderToNchw[1,2,4,4]", "shape",
+        // Reorder to NCHW. Distinct dims (2,3,4,5) so a wrong axis permutation is observable rather
+        // than hidden by a square/symmetric shape.
+        var reIn = OpInput.Rand(5620, new[] { 2, 3, 4, 5 });
+        yield return new OpCase("ReorderToNchw[2,3,4,5]", "shape",
             e => e.ReorderToNchw(reIn.F()), e => e.ReorderToNchw(reIn.D()),
             ParityTol.Exact, opMethod: "ReorderToNchw");
 
-        // Unique-consecutive on a strictly-distinct input (no consecutive dupes -> identity).
-        var uc = OpInput.Rand(5630, new[] { 8 });
-        yield return new OpCase("TensorUniqueConsecutive[8]", "index",
+        // Unique-consecutive: consecutive duplicates ARE collapsed while non-consecutive repeats are
+        // kept, so the deterministic input [1,1,2,2,2,3,3,1] must reduce to [1,2,3,1] (not an identity).
+        var uc = OpInput.From(new double[] { 1, 1, 2, 2, 2, 3, 3, 1 }, new[] { 8 });
+        yield return new OpCase("TensorUniqueConsecutive[8;dupes]", "index",
             e => e.TensorUniqueConsecutive(uc.F()), e => e.TensorUniqueConsecutive(uc.D()),
             ParityTol.Exact, opMethod: "TensorUniqueConsecutive");
     }
@@ -239,12 +241,14 @@ public static class OpParityRegistry
             e => e.ScatterMaxBackward(smgo.D(), new Tensor<int>(new[] { 0, 1, 2, 3 }, new[] { 4 }), new[] { 6 }, 0),
             ParityTol.Exact, opMethod: "ScatterMaxBackward");
 
-        // ScatterSoftmax backward: gradOutput/output [6], indices group ids [6].
+        // ScatterSoftmax backward: gradOutput [6], indices group ids [6]. The `output` operand MUST be
+        // a real scatter-softmax (derived from the forward on the same indices) — softmax backward's
+        // contract assumes a valid post-softmax distribution, so a random buffer wouldn't exercise it.
         var ssgo = OpInput.Rand(5120, new[] { 6 });
-        var ssout = OpInput.Rand(5121, new[] { 6 }, 0.0, 1.0);
+        var ssScore = OpInput.Rand(5121, new[] { 6 });
         yield return new OpCase("ScatterSoftmaxBackward[6]", "activation",
-            e => e.ScatterSoftmaxBackward(ssgo.F(), ssout.F(), new Tensor<int>(new[] { 0, 0, 1, 1, 2, 2 }, new[] { 6 }), 0),
-            e => e.ScatterSoftmaxBackward(ssgo.D(), ssout.D(), new Tensor<int>(new[] { 0, 0, 1, 1, 2, 2 }, new[] { 6 }), 0),
+            e => e.ScatterSoftmaxBackward(ssgo.F(), e.ScatterSoftmax(ssScore.F(), new Tensor<int>(new[] { 0, 0, 1, 1, 2, 2 }, new[] { 6 }), 0), new Tensor<int>(new[] { 0, 0, 1, 1, 2, 2 }, new[] { 6 }), 0),
+            e => e.ScatterSoftmaxBackward(ssgo.D(), e.ScatterSoftmax(ssScore.D(), new Tensor<int>(new[] { 0, 0, 1, 1, 2, 2 }, new[] { 6 }), 0), new Tensor<int>(new[] { 0, 0, 1, 1, 2, 2 }, new[] { 6 }), 0),
             ParityTol.Accum(1e-3), opMethod: "ScatterSoftmaxBackward");
 
         // Deformable-conv mask backward: mask channels = kh*kw*deformGroups = 9.
@@ -349,10 +353,11 @@ public static class OpParityRegistry
         var k = OpInput.Rand(4801, new[] { 1, 2, 4, 8 });
         var v = OpInput.Rand(4802, new[] { 1, 2, 4, 8 });
         var sgo = OpInput.Rand(4803, new[] { 1, 2, 4, 8 });
-        var saw = OpInput.Rand(4804, new[] { 1, 2, 4, 4 }, 0.0, 1.0);
+        // attentionWeights are FORWARD-derived (real post-softmax weights from the matching SDPA forward),
+        // not random — the backward's contract assumes valid softmax weights.
         yield return new OpCase("ScaledDotProductAttentionBackward[1,2,4,8]", "attention",
-            e => e.ScaledDotProductAttentionBackward(sgo.F(), q.F(), k.F(), v.F(), saw.F(), scale, out _, out _, out _),
-            e => e.ScaledDotProductAttentionBackward(sgo.D(), q.D(), k.D(), v.D(), saw.D(), scale, out _, out _, out _),
+            e => { e.ScaledDotProductAttention(q.F(), k.F(), v.F(), (Tensor<bool>?)null, scale, out var aw); return e.ScaledDotProductAttentionBackward(sgo.F(), q.F(), k.F(), v.F(), aw, scale, out _, out _, out _); },
+            e => { e.ScaledDotProductAttention(q.D(), k.D(), v.D(), (Tensor<bool>?)null, scale, out var aw); return e.ScaledDotProductAttentionBackward(sgo.D(), q.D(), k.D(), v.D(), aw, scale, out _, out _, out _); },
             ParityTol.Accum(1e-3), opMethod: "ScaledDotProductAttentionBackward");
 
         // GQA backward: q/gradOutput [1,4,4,8], k/v [1,2,4,8], attnWeights [1,4,4,4].
@@ -360,10 +365,10 @@ public static class OpParityRegistry
         var gk = OpInput.Rand(4811, new[] { 1, 2, 4, 8 });
         var gv = OpInput.Rand(4812, new[] { 1, 2, 4, 8 });
         var ggo = OpInput.Rand(4813, new[] { 1, 4, 4, 8 });
-        var gaw = OpInput.Rand(4814, new[] { 1, 4, 4, 4 }, 0.0, 1.0);
+        // attentionWeights FORWARD-derived from the matching GQA forward (numQueriesPerKV=2), not random.
         yield return new OpCase("GroupedQueryAttentionBackward[1,4,4,8]", "attention",
-            e => e.GroupedQueryAttentionBackward(ggo.F(), gq.F(), gk.F(), gv.F(), gaw.F(), 2, scale, out _, out _, out _),
-            e => e.GroupedQueryAttentionBackward(ggo.D(), gq.D(), gk.D(), gv.D(), gaw.D(), 2, scale, out _, out _, out _),
+            e => { e.GroupedQueryAttention(gq.F(), gk.F(), gv.F(), 2, scale, false, out var aw); return e.GroupedQueryAttentionBackward(ggo.F(), gq.F(), gk.F(), gv.F(), aw, 2, scale, out _, out _, out _); },
+            e => { e.GroupedQueryAttention(gq.D(), gk.D(), gv.D(), 2, scale, false, out var aw); return e.GroupedQueryAttentionBackward(ggo.D(), gq.D(), gk.D(), gv.D(), aw, 2, scale, out _, out _, out _); },
             ParityTol.Accum(1e-3), opMethod: "GroupedQueryAttentionBackward");
 
         // Graph attention backward: nodeFeatures/gradOutput [1,4,6], edges [6], coeffs [6].
@@ -568,18 +573,18 @@ public static class OpParityRegistry
             e => e.OctonionMatMulTensor(oi.F(), ow.F()), e => e.OctonionMatMulTensor(oi.D(), ow.D()),
             ParityTol.Accum(1e-3), opMethod: "OctonionMatMulTensor");
 
-        // Std/Var backward — GLOBAL axes only: output scalar, gradOutput/mean/std [1].
+        // Std/Var backward — GLOBAL axes only: output scalar, gradOutput [1]. The mean/std stats are
+        // FORWARD-derived (global ReduceMean / sqrt(ReduceVariance) of the same input), not random —
+        // they must be the input's real statistics for the backward contract to be exercised.
         var bgo = OpInput.Rand(4320, new[] { 1 });
         var bin = OpInput.Rand(4321, new[] { 4, 6 });
-        var bmean = OpInput.Rand(4322, new[] { 1 });
-        var bstd = OpInput.RandPositive(4323, new[] { 1 }, 0.5, 2.0);
         yield return new OpCase("StdBackward[4,6;global]", "reduction",
-            e => e.StdBackward(bgo.F(), bin.F(), bmean.F(), bstd.F(), System.Array.Empty<int>()),
-            e => e.StdBackward(bgo.D(), bin.D(), bmean.D(), bstd.D(), System.Array.Empty<int>()),
+            e => e.StdBackward(bgo.F(), bin.F(), e.ReduceMean(bin.F(), new[] { 0, 1 }, false), e.TensorSqrt(e.ReduceVariance(bin.F(), new[] { 0, 1 }, false)), System.Array.Empty<int>()),
+            e => e.StdBackward(bgo.D(), bin.D(), e.ReduceMean(bin.D(), new[] { 0, 1 }, false), e.TensorSqrt(e.ReduceVariance(bin.D(), new[] { 0, 1 }, false)), System.Array.Empty<int>()),
             ParityTol.Accum(1e-3), opMethod: "StdBackward");
         yield return new OpCase("VarBackward[4,6;global]", "reduction",
-            e => e.VarBackward(bgo.F(), bin.F(), bmean.F(), System.Array.Empty<int>()),
-            e => e.VarBackward(bgo.D(), bin.D(), bmean.D(), System.Array.Empty<int>()),
+            e => e.VarBackward(bgo.F(), bin.F(), e.ReduceMean(bin.F(), new[] { 0, 1 }, false), System.Array.Empty<int>()),
+            e => e.VarBackward(bgo.D(), bin.D(), e.ReduceMean(bin.D(), new[] { 0, 1 }, false), System.Array.Empty<int>()),
             ParityTol.Accum(1e-3), opMethod: "VarBackward");
     }
 
@@ -713,26 +718,27 @@ public static class OpParityRegistry
             e => e.TensorStackDiff(new[] { s1.D(), s2.D() }, 0),
             ParityTol.Exact, opMethod: "TensorStackDiff");
 
-        // Variance backward over axis 1: gradOutput [4], mean [4].
+        // Variance backward over axis 1: gradOutput [4]. `mean` is FORWARD-derived (ReduceMean of the
+        // same input over the same axis), not a random buffer, so it matches the input's real mean.
         var vgo = OpInput.Rand(3910, new[] { 4 });
         var vin = OpInput.Rand(3911, new[] { 4, 6 });
-        var vmean = OpInput.Rand(3912, new[] { 4 });
         yield return new OpCase("ReduceVarianceBackward[4,6;ax1]", "reduction",
-            e => e.ReduceVarianceBackward(vgo.F(), vin.F(), vmean.F(), new[] { 1 }),
-            e => e.ReduceVarianceBackward(vgo.D(), vin.D(), vmean.D(), new[] { 1 }),
+            e => e.ReduceVarianceBackward(vgo.F(), vin.F(), e.ReduceMean(vin.F(), new[] { 1 }, false), new[] { 1 }),
+            e => e.ReduceVarianceBackward(vgo.D(), vin.D(), e.ReduceMean(vin.D(), new[] { 1 }, false), new[] { 1 }),
             ParityTol.Accum(1e-3), opMethod: "ReduceVarianceBackward");
 
         // Taylor/spherical softmax backwards [4,8] over last axis.
         var go = OpInput.Rand(3920, new[] { 4, 8 });
+        // The softmax `output` operands are FORWARD-derived (TaylorSoftmax / SphericalSoftmax of the
+        // same input), not random — the backward contract assumes a valid post-softmax distribution.
         var sin = OpInput.Rand(3921, new[] { 4, 8 });
-        var sout = OpInput.Rand(3922, new[] { 4, 8 }, 0.0, 1.0);
         yield return new OpCase("TaylorSoftmaxBackward[4,8]", "activation",
-            e => e.TaylorSoftmaxBackward(go.F(), sin.F(), sout.F(), 2, -1),
-            e => e.TaylorSoftmaxBackward(go.D(), sin.D(), sout.D(), 2, -1),
+            e => e.TaylorSoftmaxBackward(go.F(), sin.F(), e.TaylorSoftmax(sin.F(), 2, -1), 2, -1),
+            e => e.TaylorSoftmaxBackward(go.D(), sin.D(), e.TaylorSoftmax(sin.D(), 2, -1), 2, -1),
             ParityTol.Accum(1e-3), opMethod: "TaylorSoftmaxBackward");
         yield return new OpCase("SphericalSoftmaxBackward[4,8]", "activation",
-            e => e.SphericalSoftmaxBackward(go.F(), sin.F(), sout.F(), -1),
-            e => e.SphericalSoftmaxBackward(go.D(), sin.D(), sout.D(), -1),
+            e => e.SphericalSoftmaxBackward(go.F(), sin.F(), e.SphericalSoftmax(sin.F(), -1), -1),
+            e => e.SphericalSoftmaxBackward(go.D(), sin.D(), e.SphericalSoftmax(sin.D(), -1), -1),
             ParityTol.Accum(1e-3), opMethod: "SphericalSoftmaxBackward");
     }
 
@@ -912,9 +918,10 @@ public static class OpParityRegistry
             e => e.ScatterMax(smSrc.D(), new Tensor<int>((int[])smIdx.Clone(), new[] { 6 }), out _, 0, 4),
             ParityTol.Exact, opMethod: "ScatterMax");
 
-        // Unique of a strictly-distinct input (sorted) -> output equals sorted input, same length.
-        var uniq = OpInput.Rand(3520, new[] { 12 });
-        yield return new OpCase("TensorUnique[12;sorted]", "index",
+        // Unique (sorted): NON-consecutive repeats must collapse. Deterministic input with dupes
+        // [3,1,2,1,3,2,4,1,5,2,3,4] -> sorted-unique [1,2,3,4,5] (length 5, not the input's 12).
+        var uniq = OpInput.From(new double[] { 3, 1, 2, 1, 3, 2, 4, 1, 5, 2, 3, 4 }, new[] { 12 });
+        yield return new OpCase("TensorUnique[12;dupes]", "index",
             e => e.TensorUnique(uniq.F(), true), e => e.TensorUnique(uniq.D(), true),
             ParityTol.Exact, opMethod: "TensorUnique");
     }

@@ -61,7 +61,7 @@ extern ""C"" __global__ __launch_bounds__(256) void glu_backward(
     grad_input[outer * fullDim + halfDim + d] = grad * value * sig_gate * (1.0f - sig_gate);
 }
 
-// GeGLU: GELU(value) * gate
+// GeGLU: value * GELU(gate)  (#775: activation applies to the GATE / 2nd half)
 extern ""C"" __global__ __launch_bounds__(256) void geglu_forward(
     const float* __restrict__ input, float* __restrict__ output,
     int outerSize, int halfDim)
@@ -116,7 +116,7 @@ extern ""C"" __global__ __launch_bounds__(256) void geglu_backward(
     grad_input[outer * fullDim + halfDim + d] = grad * value * gelu_deriv;
 }
 
-// ReGLU: ReLU(value) * gate
+// ReGLU: value * ReLU(gate)  (#775: activation applies to the GATE / 2nd half)
 extern ""C"" __global__ __launch_bounds__(256) void reglu_forward(
     const float* __restrict__ input, float* __restrict__ output,
     int outerSize, int halfDim)
@@ -161,7 +161,7 @@ extern ""C"" __global__ __launch_bounds__(256) void reglu_backward(
     grad_input[outer * fullDim + halfDim + d] = grad * value * relu_deriv;
 }
 
-// SwiGLU: Swish(value) * gate = (value * sigmoid(value)) * gate
+// SwiGLU: value * Swish(gate) = value * (gate * sigmoid(gate))  (#775: activation applies to the GATE)
 extern ""C"" __global__ __launch_bounds__(256) void swiglu_forward(
     const float* __restrict__ input, float* __restrict__ output,
     int outerSize, int halfDim)

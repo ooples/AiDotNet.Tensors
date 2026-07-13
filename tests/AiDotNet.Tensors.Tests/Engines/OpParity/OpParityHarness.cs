@@ -31,9 +31,13 @@ public sealed class OpParityFixture : IDisposable
 
     private readonly List<string> _report = new();
     private readonly object _lock = new();
+    private readonly bool _prevAllowTF32;
 
     public OpParityFixture()
     {
+        // Capture + restore (in Dispose) so this collection's strict-fp32 policy does not leak into
+        // other test collections that may run afterwards and rely on the process-wide default.
+        _prevAllowTF32 = CudaDispatchPolicy.AllowTF32;
         CudaDispatchPolicy.AllowTF32 = false;
         Cpu = new CpuEngine();
         try
@@ -60,6 +64,7 @@ public sealed class OpParityFixture : IDisposable
     public void Dispose()
     {
         Gpu?.Dispose();
+        CudaDispatchPolicy.AllowTF32 = _prevAllowTF32;
         lock (_lock)
         {
             if (_report.Count == 0) return;

@@ -53,6 +53,8 @@ public sealed class OpInput
     /// are <paramref name="imag"/>'s samples (both must share this shape). For NativeComplex* ops.</summary>
     public Tensor<Complex<float>> CF(OpInput imag)
     {
+        if (imag._data.Length != _data.Length)
+            throw new ArgumentException($"imag length {imag._data.Length} must match this input's length {_data.Length}.", nameof(imag));
         var c = new Complex<float>[_data.Length];
         for (int i = 0; i < _data.Length; i++) c[i] = new Complex<float>((float)_data[i], (float)imag._data[i]);
         return new Tensor<Complex<float>>(c, (int[])Shape.Clone());
@@ -61,6 +63,8 @@ public sealed class OpInput
     /// <summary>Complex double tensor (the oracle counterpart of <see cref="CF"/>).</summary>
     public Tensor<Complex<double>> CD(OpInput imag)
     {
+        if (imag._data.Length != _data.Length)
+            throw new ArgumentException($"imag length {imag._data.Length} must match this input's length {_data.Length}.", nameof(imag));
         var c = new Complex<double>[_data.Length];
         for (int i = 0; i < _data.Length; i++) c[i] = new Complex<double>(_data[i], imag._data[i]);
         return new Tensor<Complex<double>>(c, (int[])Shape.Clone());
