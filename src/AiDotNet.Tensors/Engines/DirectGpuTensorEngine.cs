@@ -11125,8 +11125,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (center)
             {
                 int padAmount = nFft / 2;
-                T[] paddedData = new T[input.Length + 2 * padAmount];
-                Array.Copy(inputData, 0, paddedData, padAmount, input.Length);
+                int sig = input.Length;
+                T[] paddedData = new T[sig + 2 * padAmount];
+                Array.Copy(inputData, 0, paddedData, padAmount, sig);
+                // REFLECTION padding (numpy 'reflect', no edge repeat) to match CpuEngine.STFT — the GPU
+                // previously zero-padded, so edge frames carried no signal energy and their mel bins
+                // collapsed to the -80 dB floor where the CPU had real values (op-parity #775).
+                for (int i = 0; i < padAmount && padAmount - i < sig; i++)
+                    paddedData[i] = inputData[padAmount - i];
+                for (int i = 0; i < padAmount && sig - 2 - i >= 0; i++)
+                    paddedData[padAmount + sig + i] = inputData[sig - 2 - i];
                 inputData = paddedData;
             }
 
@@ -11378,11 +11386,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 float[] dbResult = new float[numFrames * nMels];
                 backend.DownloadBuffer(dbBuffer.Buffer, dbResult);
 
+                // The GPU filterbank produces [frames, mels] (time-major) but CpuEngine.MelSpectrogram
+                // returns [mels, frames] (librosa freq/mel-major). Transpose to match (op-parity #775).
+                float[] dbT = TransposeMelFramesToMelMajor(dbResult, numFrames, nMels);
                 int[] outputShape = input.Rank == 1
-                    ? new[] { numFrames, nMels }
-                    : new[] { input.Shape._dims[0], numFrames, nMels };
+                    ? new[] { nMels, numFrames }
+                    : new[] { input.Shape._dims[0], nMels, numFrames };
 
-                return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(dbResult), outputShape);
+                return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(dbT), outputShape);
             }
             else
             {
@@ -11390,17 +11401,30 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 float[] melResult = new float[numFrames * nMels];
                 backend.DownloadBuffer(melBuffer.Buffer, melResult);
 
+                // Transpose [frames, mels] -> [mels, frames] to match CpuEngine (see powerToDb branch).
+                float[] melT = TransposeMelFramesToMelMajor(melResult, numFrames, nMels);
                 int[] outputShape = input.Rank == 1
-                    ? new[] { numFrames, nMels }
-                    : new[] { input.Shape._dims[0], numFrames, nMels };
+                    ? new[] { nMels, numFrames }
+                    : new[] { input.Shape._dims[0], nMels, numFrames };
 
-                return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(melResult), outputShape);
+                return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(melT), outputShape);
             }
         }
         catch
         {
             return base.MelSpectrogram(input, sampleRate, nFft, hopLength, nMels, fMin, fMax, window, powerToDb);
         }
+    }
+
+    /// <summary>Transpose a single-signal mel result from GPU time-major [numFrames, nMels]
+    /// (frame*nMels + mel) to the CpuEngine/librosa mel-major [nMels, numFrames] (mel*numFrames + frame).</summary>
+    private static float[] TransposeMelFramesToMelMajor(float[] framesMajor, int numFrames, int nMels)
+    {
+        var outArr = new float[framesMajor.Length];
+        for (int f = 0; f < numFrames; f++)
+            for (int m = 0; m < nMels; m++)
+                outArr[m * numFrames + f] = framesMajor[f * nMels + m];
+        return outArr;
     }
 
     /// <summary>
