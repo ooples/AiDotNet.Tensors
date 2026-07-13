@@ -3224,6 +3224,53 @@ public partial class DirectGpuTensorEngine
         return TensorMatMul(gradOutput, TensorTranspose(weights));                 // gradOut @ Wᵀ
     }
 
+    // #775: MaxPool3D backward on the existing maxpool3d_backward kernel. The kernel scatters each output
+    // gradient into gradInput at a precomputed FLAT input index; the engine gets a 6D maxIndices[b,c,od,oh,
+    // ow,{0,1,2}] = the (d,h,w) of the max, so flatten it to that per-output flat index (host, small) then
+    // scatter on-device. gradInput is zeroed first (scatter-add). Non-float / tape / GraphMode defer to base.
+    Tensor<T> IEngine.MaxPool3DBackward<T>(Tensor<T> gradOutput, int[,,,,,] maxIndices,
+        int[] inputShape, int[] poolSize, int[] stride)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+            || inputShape is not { Length: 5 } || !TryGetBackend(out var backend))
+            return base.MaxPool3DBackward(gradOutput, maxIndices, inputShape, poolSize, stride);
+        try
+        {
+            int batch = inputShape[0], channels = inputShape[1], depth = inputShape[2], height = inputShape[3], width = inputShape[4];
+            int outD = maxIndices.GetLength(2), outH = maxIndices.GetLength(3), outW = maxIndices.GetLength(4);
+            int outLen = batch * channels * outD * outH * outW;
+            int inLen = batch * channels * depth * height * width;
+            var flat = new int[outLen];
+            int p = 0;
+            for (int b = 0; b < batch; b++)
+                for (int c = 0; c < channels; c++)
+                    for (int od = 0; od < outD; od++)
+                        for (int oh = 0; oh < outH; oh++)
+                            for (int ow = 0; ow < outW; ow++)
+                            {
+                                int id = maxIndices[b, c, od, oh, ow, 0];
+                                int ih = maxIndices[b, c, od, oh, ow, 1];
+                                int iw = maxIndices[b, c, od, oh, ow, 2];
+                                // maxpool3d_backward decodes indices[] as a SPATIAL-only flat index
+                                // (id*inH*inW + ih*inW + iw) and adds the b,c offset itself.
+                                flat[p++] = (id * height + ih) * width + iw;
+                            }
+            using var gradOutBuf = GetOrAllocateBuffer(backend, gradOutput);
+            using var idxBuf = new OwnedBuffer(backend.AllocateIntBuffer(flat), ownsBuffer: true);
+            var gradInBuf = AllocateOutputBuffer(backend, inLen);
+            try
+            {
+                backend.Fill(gradInBuf.Buffer, 0f, inLen);
+                backend.MaxPool3DBackward(gradOutBuf.Buffer, idxBuf.Buffer, gradInBuf.Buffer,
+                    batch, channels, depth, height, width, outD, outH, outW);
+                var arr = FinishGpuOp<T>(backend, gradInBuf, inLen);
+                return new Tensor<T>(arr, (int[])inputShape.Clone());
+            }
+            catch { gradInBuf.Dispose(); throw; }
+        }
+        catch { return base.MaxPool3DBackward(gradOutput, maxIndices, inputShape, poolSize, stride); }
+    }
+
     // #775: whole-tensor mean (output [1]) via the GPU-resident ReduceMean over all axes.
     Tensor<T> IEngine.TensorMeanDiff<T>(Tensor<T> tensor)
     {
