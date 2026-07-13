@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.114.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.114.0...v0.114.1) (2026-07-13)
+
+
+### Bug Fixes
+
+* **cpu:** race-free GridSample-3D backward scatter (thread-local accumulators) ([#774](https://github.com/ooples/AiDotNet.Tensors/issues/774)) ([7773fc8](https://github.com/ooples/AiDotNet.Tensors/commit/7773fc8ac2048d0920589375d9e349a3e9dbfb54))
+* **fft:** guard IRFFT against degenerate length-1 transform (nFft=0 OOR) ([#779](https://github.com/ooples/AiDotNet.Tensors/issues/779)) ([f72615b](https://github.com/ooples/AiDotNet.Tensors/commit/f72615b7bf131f6124a6fccad36755f4b320268e))
+
 ## [0.114.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.113.0...v0.114.0) (2026-07-11)
 
 
