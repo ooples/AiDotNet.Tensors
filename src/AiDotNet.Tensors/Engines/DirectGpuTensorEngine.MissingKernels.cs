@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using AiDotNet.Tensors;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.DirectGpu;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines;
@@ -2846,5 +2847,48 @@ public partial class DirectGpuTensorEngine
             catch { outB.Dispose(); throw; }
         }
         catch { return base.Gather(input, indices, axis); }
+    }
+
+    // #775: GPU compositions for genuinely CPU-bound element-wise ops. Each CpuEngine body runs a raw
+    // NumOps span loop (it reaches no virtual primitive), so without these it executes on the CPU even
+    // on a GPU engine — a silent CPU fallback the parity harness would score as a false CPU-vs-CPU pass.
+    // Composing from the GPU-resident public overrides (TensorMultiply/Add/Negate/AddScalar) moves them
+    // on-device for EVERY backend at once (each backend supplies its own primitives), and mirrors the
+    // CpuEngine op ORDER so the fp32 result is bit-identical. Defer to base under a live tape / GraphMode
+    // so the recorded backward graph is unchanged.
+
+    Tensor<T> IEngine.ComplexMagnitudeSquared<T>(Tensor<T> real, Tensor<T> imag)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+            return base.ComplexMagnitudeSquared(real, imag);
+        // re*re + im*im — same two-multiply-then-add order as CpuEngine.
+        return TensorAdd(TensorMultiply(real, real), TensorMultiply(imag, imag));
+    }
+
+    Tensor<T> IEngine.SigmoidDerivative<T>(Tensor<T> sigmoidOutput)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+            return base.SigmoidDerivative(sigmoidOutput);
+        // y * (1 - y): negate, +1, multiply — mirrors CpuEngine's op sequence exactly.
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var oneMinusY = TensorAddScalar(TensorNegate(sigmoidOutput), numOps.One);
+        return TensorMultiply(sigmoidOutput, oneMinusY);
+    }
+
+    Tensor<T> IEngine.TanhDerivative<T>(Tensor<T> tanhOutput)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+            return base.TanhDerivative(tanhOutput);
+        // 1 - y*y: square, negate, +1 — mirrors CpuEngine's op sequence exactly.
+        var numOps = MathHelper.GetNumericOperations<T>();
+        return TensorAddScalar(TensorNegate(TensorMultiply(tanhOutput, tanhOutput)), numOps.One);
+    }
+
+    Tensor<T> IEngine.ScalarMinusTensor<T>(T scalar, Tensor<T> tensor)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+            return base.ScalarMinusTensor(scalar, tensor);
+        // scalar - x = (-x) + scalar — negate then AddScalar, mirroring CpuEngine exactly.
+        return TensorAddScalar(TensorNegate(tensor), scalar);
     }
 }
