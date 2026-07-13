@@ -7078,6 +7078,21 @@ KERNEL VARIANTS (A/B testing):
             k.Execute1D(total, Math.Min(256, total));
         }
 
+        // #775: Trilinear-interpolate backward w.r.t. the grid. 1D over grid cells (gather, deterministic).
+        public void TrilinearInterpolateBackward(IGpuBuffer gradOutput, IGpuBuffer positions, IGpuBuffer gradGrid,
+            int d, int h, int w, int c, int p, float upperEps)
+        {
+            var k = _kernelCache["trilinear_interpolate_backward"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)positions).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradGrid).Buffer.Handle);
+            k.SetArg(arg++, d); k.SetArg(arg++, h); k.SetArg(arg++, w); k.SetArg(arg++, c);
+            k.SetArg(arg++, p); k.SetArg(arg++, upperEps);
+            int total = d * h * w * c;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
         public void NearestNeighborUpsample3D(IGpuBuffer input, IGpuBuffer output,
             int batch, int channels,
             int inDepth, int inHeight, int inWidth,

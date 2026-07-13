@@ -3663,6 +3663,31 @@ public partial class DirectGpuTensorEngine
         catch { return base.TensorTrilinearInterpolate(grid, positions); }
     }
 
+    // #775: trilinear-interpolate backward w.r.t. the grid -> gradGrid [D,H,W,C], via the gather-form kernel.
+    Tensor<T> IEngine.TensorTrilinearInterpolateBackward<T>(Tensor<T> gradOutput, Tensor<T> grid, Tensor<T> positions)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+            || grid.Rank != 4 || positions.Rank != 2 || positions.Shape._dims[1] != 3 || !TryGetBackend(out var backend))
+            return base.TensorTrilinearInterpolateBackward(gradOutput, grid, positions);
+        try
+        {
+            int d = grid.Shape._dims[0], h = grid.Shape._dims[1], w = grid.Shape._dims[2], c = grid.Shape._dims[3];
+            int p = positions.Shape._dims[0];
+            int gridLen = d * h * w * c;
+            using var gradOutBuf = GetOrAllocateBuffer(backend, gradOutput);
+            using var posBuf = GetOrAllocateBuffer(backend, positions);
+            var gradGridBuf = AllocateOutputBuffer(backend, gridLen);
+            try
+            {
+                backend.TrilinearInterpolateBackward(gradOutBuf.Buffer, posBuf.Buffer, gradGridBuf.Buffer, d, h, w, c, p, 1e-3f);
+                var arr = FinishGpuOp<T>(backend, gradGridBuf, gridLen);
+                return new Tensor<T>(arr, new[] { d, h, w, c });
+            }
+            catch { gradGridBuf.Dispose(); throw; }
+        }
+        catch { return base.TensorTrilinearInterpolateBackward(gradOutput, grid, positions); }
+    }
+
     // #775: whole-tensor mean (output [1]) via the GPU-resident ReduceMean over all axes.
     Tensor<T> IEngine.TensorMeanDiff<T>(Tensor<T> tensor)
     {

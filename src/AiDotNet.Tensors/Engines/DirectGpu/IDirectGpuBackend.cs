@@ -1255,6 +1255,12 @@ public interface IDirectGpuBackend : IDisposable
         int d, int h, int w, int c, int p, float upperEps)
         => throw new System.NotSupportedException("TrilinearInterpolate is not implemented for this GPU backend.");
 
+    /// <summary>Trilinear-interpolate backward w.r.t. the grid -> [D,H,W,C]. Default-throws (CPU
+    /// fallback); OpenCL overrides it (#775).</summary>
+    void TrilinearInterpolateBackward(IGpuBuffer gradOutput, IGpuBuffer positions, IGpuBuffer gradGrid,
+        int d, int h, int w, int c, int p, float upperEps)
+        => throw new System.NotSupportedException("TrilinearInterpolateBackward is not implemented for this GPU backend.");
+
     /// <summary>
     /// Backward pass for 3D max pooling (NCDHW format).
     /// Routes gradients back to the positions that had max values in the forward pass.
