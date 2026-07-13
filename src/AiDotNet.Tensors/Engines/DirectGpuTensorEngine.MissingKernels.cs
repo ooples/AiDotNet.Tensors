@@ -3503,6 +3503,91 @@ public partial class DirectGpuTensorEngine
         return result4D.Reshape((int[])kernelShape.Clone());
     }
 
+    // #775: Depthwise Conv2D backward (new depthwise_conv2d_backward_* kernels, per-channel oc=ic*M+m).
+    // kernel=[inC,M,kH,kW]; inputShape=[N,inC,H,W]; gradOutput=[N,inC*M,outH,outW]. Both kernels gather.
+    Tensor<T> IEngine.DepthwiseConv2DBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> kernel, int[] inputShape, int[] stride, int[] padding)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+            || inputShape is not { Length: 4 } || gradOutput.Rank != 4 || kernel.Rank != 4
+            || stride is not { Length: 2 } || padding is not { Length: 2 } || !TryGetBackend(out var backend))
+            return base.DepthwiseConv2DBackwardInput(gradOutput, kernel, inputShape, stride, padding);
+        try
+        {
+            int n = inputShape[0], inC = inputShape[1], h = inputShape[2], w = inputShape[3];
+            int m = kernel.Shape._dims[1], kH = kernel.Shape._dims[2], kW = kernel.Shape._dims[3];
+            int outH = gradOutput.Shape._dims[2], outW = gradOutput.Shape._dims[3];
+            int inLen = n * inC * h * w;
+            using var gradOutBuf = GetOrAllocateBuffer(backend, gradOutput);
+            using var kBuf = GetOrAllocateBuffer(backend, kernel);
+            var gradInBuf = AllocateOutputBuffer(backend, inLen);
+            try
+            {
+                backend.DepthwiseConv2DBackwardInput(gradOutBuf.Buffer, kBuf.Buffer, gradInBuf.Buffer,
+                    n, inC, h, w, m, outH, outW, kH, kW, stride[0], stride[1], padding[0], padding[1]);
+                var arr = FinishGpuOp<T>(backend, gradInBuf, inLen);
+                return new Tensor<T>(arr, (int[])inputShape.Clone());
+            }
+            catch { gradInBuf.Dispose(); throw; }
+        }
+        catch { return base.DepthwiseConv2DBackwardInput(gradOutput, kernel, inputShape, stride, padding); }
+    }
+
+    Tensor<T> IEngine.DepthwiseConv2DBackwardKernel<T>(Tensor<T> gradOutput, Tensor<T> input, int[] kernelShape, int[] stride, int[] padding)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+            || kernelShape is not { Length: 4 } || input.Rank != 4 || gradOutput.Rank != 4
+            || stride is not { Length: 2 } || padding is not { Length: 2 } || !TryGetBackend(out var backend))
+            return base.DepthwiseConv2DBackwardKernel(gradOutput, input, kernelShape, stride, padding);
+        try
+        {
+            int n = input.Shape._dims[0], inC = input.Shape._dims[1], h = input.Shape._dims[2], w = input.Shape._dims[3];
+            int m = kernelShape[1], kH = kernelShape[2], kW = kernelShape[3];
+            int outH = gradOutput.Shape._dims[2], outW = gradOutput.Shape._dims[3];
+            int kLen = kernelShape[0] * kernelShape[1] * kernelShape[2] * kernelShape[3];
+            using var gradOutBuf = GetOrAllocateBuffer(backend, gradOutput);
+            using var inBuf = GetOrAllocateBuffer(backend, input);
+            var gradKBuf = AllocateOutputBuffer(backend, kLen);
+            try
+            {
+                backend.DepthwiseConv2DBackwardKernel(gradOutBuf.Buffer, inBuf.Buffer, gradKBuf.Buffer,
+                    n, inC, h, w, m, outH, outW, kH, kW, stride[0], stride[1], padding[0], padding[1]);
+                var arr = FinishGpuOp<T>(backend, gradKBuf, kLen);
+                return new Tensor<T>(arr, (int[])kernelShape.Clone());
+            }
+            catch { gradKBuf.Dispose(); throw; }
+        }
+        catch { return base.DepthwiseConv2DBackwardKernel(gradOutput, input, kernelShape, stride, padding); }
+    }
+
+    // #775: DepthwiseConv1D backward == 2D with a singleton height (mirrors CpuEngine). Route to the 2D path.
+    Tensor<T> IEngine.DepthwiseConv1DBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> kernel, int[] inputShape, int stride, int padding)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive
+            || inputShape is not { Length: 3 } || gradOutput.Rank != 3 || kernel.Rank != 3)
+            return base.DepthwiseConv1DBackwardInput(gradOutput, kernel, inputShape, stride, padding);
+        var g = gradOutput.Shape._dims; var kd = kernel.Shape._dims;
+        var result4D = ((IEngine)this).DepthwiseConv2DBackwardInput(
+            gradOutput.Reshape(new[] { g[0], g[1], 1, g[2] }),
+            kernel.Reshape(new[] { kd[0], kd[1], 1, kd[2] }),
+            new[] { inputShape[0], inputShape[1], 1, inputShape[2] },
+            new[] { 1, stride }, new[] { 0, padding });
+        return result4D.Reshape((int[])inputShape.Clone());
+    }
+
+    Tensor<T> IEngine.DepthwiseConv1DBackwardKernel<T>(Tensor<T> gradOutput, Tensor<T> input, int[] kernelShape, int stride, int padding)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive
+            || kernelShape is not { Length: 3 } || input.Rank != 3 || gradOutput.Rank != 3)
+            return base.DepthwiseConv1DBackwardKernel(gradOutput, input, kernelShape, stride, padding);
+        var g = gradOutput.Shape._dims; var ind = input.Shape._dims;
+        var result4D = ((IEngine)this).DepthwiseConv2DBackwardKernel(
+            gradOutput.Reshape(new[] { g[0], g[1], 1, g[2] }),
+            input.Reshape(new[] { ind[0], ind[1], 1, ind[2] }),
+            new[] { kernelShape[0], kernelShape[1], 1, kernelShape[2] },
+            new[] { 1, stride }, new[] { 0, padding });
+        return result4D.Reshape((int[])kernelShape.Clone());
+    }
+
     // #775: whole-tensor mean (output [1]) via the GPU-resident ReduceMean over all axes.
     Tensor<T> IEngine.TensorMeanDiff<T>(Tensor<T> tensor)
     {

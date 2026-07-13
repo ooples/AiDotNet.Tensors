@@ -7029,6 +7029,40 @@ KERNEL VARIANTS (A/B testing):
             k.Execute1D(total, Math.Min(256, total));
         }
 
+        // #775: Depthwise Conv2D backward w.r.t. input. 1D over gradInput elements (gather).
+        public void DepthwiseConv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
+            int n, int inC, int h, int w, int m, int outH, int outW, int kH, int kW,
+            int strideH, int strideW, int padH, int padW)
+        {
+            var k = _kernelCache["depthwise_conv2d_backward_input"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)kernel).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
+            k.SetArg(arg++, n); k.SetArg(arg++, inC); k.SetArg(arg++, h); k.SetArg(arg++, w);
+            k.SetArg(arg++, m); k.SetArg(arg++, outH); k.SetArg(arg++, outW); k.SetArg(arg++, kH); k.SetArg(arg++, kW);
+            k.SetArg(arg++, strideH); k.SetArg(arg++, strideW); k.SetArg(arg++, padH); k.SetArg(arg++, padW);
+            int total = n * inC * h * w;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
+        // #775: Depthwise Conv2D backward w.r.t. weights. 1D over gradKernel elements (gather).
+        public void DepthwiseConv2DBackwardKernel(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradKernel,
+            int n, int inC, int h, int w, int m, int outH, int outW, int kH, int kW,
+            int strideH, int strideW, int padH, int padW)
+        {
+            var k = _kernelCache["depthwise_conv2d_backward_weights"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradKernel).Buffer.Handle);
+            k.SetArg(arg++, n); k.SetArg(arg++, inC); k.SetArg(arg++, h); k.SetArg(arg++, w);
+            k.SetArg(arg++, m); k.SetArg(arg++, outH); k.SetArg(arg++, outW); k.SetArg(arg++, kH); k.SetArg(arg++, kW);
+            k.SetArg(arg++, strideH); k.SetArg(arg++, strideW); k.SetArg(arg++, padH); k.SetArg(arg++, padW);
+            int total = inC * m * kH * kW;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
         public void NearestNeighborUpsample3D(IGpuBuffer input, IGpuBuffer output,
             int batch, int channels,
             int inDepth, int inHeight, int inWidth,

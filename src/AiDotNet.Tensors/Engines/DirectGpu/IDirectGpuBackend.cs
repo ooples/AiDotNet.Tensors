@@ -1235,6 +1235,20 @@ public interface IDirectGpuBackend : IDisposable
         int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW)
         => throw new System.NotSupportedException("Conv3DBackwardKernel is not implemented for this GPU backend.");
 
+    /// <summary>Depthwise Conv2D backward w.r.t. input (NCHW, oc = ic*M + m). Default-throws (CPU
+    /// fallback); OpenCL overrides it (#775).</summary>
+    void DepthwiseConv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
+        int n, int inC, int h, int w, int m, int outH, int outW, int kH, int kW,
+        int strideH, int strideW, int padH, int padW)
+        => throw new System.NotSupportedException("DepthwiseConv2DBackwardInput is not implemented for this GPU backend.");
+
+    /// <summary>Depthwise Conv2D backward w.r.t. weights (NCHW). Default-throws (CPU fallback); OpenCL
+    /// overrides it (#775).</summary>
+    void DepthwiseConv2DBackwardKernel(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradKernel,
+        int n, int inC, int h, int w, int m, int outH, int outW, int kH, int kW,
+        int strideH, int strideW, int padH, int padW)
+        => throw new System.NotSupportedException("DepthwiseConv2DBackwardKernel is not implemented for this GPU backend.");
+
     /// <summary>
     /// Backward pass for 3D max pooling (NCDHW format).
     /// Routes gradients back to the positions that had max values in the forward pass.

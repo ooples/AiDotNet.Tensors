@@ -787,6 +787,80 @@ __kernel void conv3d_direct(
 
     output[(((b * outChannels + oc) * outDepth + od) * outHeight + oh) * outWidth + ow] = sum;
 }
+
+// #775: Depthwise Conv2D backward w.r.t. input (NCHW). Gathers per gradInput element (no race/zero).
+// kernel is [inC, M, kH, kW] flattened == [outC, kH, kW] with outC = inC*M, oc = ic*M + m.
+__kernel void depthwise_conv2d_backward_input(
+    __global const float* gradOutput,
+    __global const float* weights,
+    __global float* gradInput,
+    const int N, const int inC, const int H, const int W,
+    const int M, const int outH, const int outW,
+    const int kH, const int kW,
+    const int strideH, const int strideW, const int padH, const int padW)
+{
+    const int idx = get_global_id(0);
+    const int total = N * inC * H * W;
+    if (idx >= total) return;
+    const int iw = idx % W;
+    const int ih = (idx / W) % H;
+    const int ic = (idx / (W * H)) % inC;
+    const int b = idx / (W * H * inC);
+    const int outC = inC * M;
+    float sum = 0.0f;
+    for (int m = 0; m < M; m++) {
+        int oc = ic * M + m;
+        for (int kh = 0; kh < kH; kh++) {
+            int t = ih + padH - kh;
+            if (t < 0 || (t % strideH) != 0) continue;
+            int oh = t / strideH;
+            if (oh < 0 || oh >= outH) continue;
+            for (int kw = 0; kw < kW; kw++) {
+                int tw = iw + padW - kw;
+                if (tw < 0 || (tw % strideW) != 0) continue;
+                int ow = tw / strideW;
+                if (ow < 0 || ow >= outW) continue;
+                sum += weights[(oc * kH + kh) * kW + kw]
+                     * gradOutput[((b * outC + oc) * outH + oh) * outW + ow];
+            }
+        }
+    }
+    gradInput[idx] = sum;
+}
+
+// #775: Depthwise Conv2D backward w.r.t. weights (NCHW). Gathers per gradKernel element (no race/zero).
+__kernel void depthwise_conv2d_backward_weights(
+    __global const float* gradOutput,
+    __global const float* input,
+    __global float* gradKernel,
+    const int N, const int inC, const int H, const int W,
+    const int M, const int outH, const int outW,
+    const int kH, const int kW,
+    const int strideH, const int strideW, const int padH, const int padW)
+{
+    const int idx = get_global_id(0);
+    const int outC = inC * M;
+    const int total = outC * kH * kW;
+    if (idx >= total) return;
+    const int kw = idx % kW;
+    const int kh = (idx / kW) % kH;
+    const int oc = idx / (kW * kH);
+    const int ic = oc / M;
+    float sum = 0.0f;
+    for (int b = 0; b < N; b++) {
+        for (int oh = 0; oh < outH; oh++) {
+            int ih = oh * strideH - padH + kh;
+            if (ih < 0 || ih >= H) continue;
+            for (int ow = 0; ow < outW; ow++) {
+                int iw = ow * strideW - padW + kw;
+                if (iw < 0 || iw >= W) continue;
+                sum += input[((b * inC + ic) * H + ih) * W + iw]
+                     * gradOutput[((b * outC + oc) * outH + oh) * outW + ow];
+            }
+        }
+    }
+    gradKernel[idx] = sum;
+}
 ";
         }
 
@@ -808,7 +882,9 @@ __kernel void conv3d_direct(
                 "conv_transpose2d_backward_weights",
                 "conv2d_tiled",
                 "conv2d_winograd_f2x2_3x3",
-                "conv3d_direct"
+                "conv3d_direct",
+                "depthwise_conv2d_backward_input",
+                "depthwise_conv2d_backward_weights"
             };
         }
     }
