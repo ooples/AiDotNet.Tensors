@@ -10648,16 +10648,23 @@ KERNEL VARIANTS (A/B testing):
 
             int log2n = (int)MathHelper.Log2(n);
 
-            // Batched bit-reversal
+            // Batched bit-reversal. NOTE: batched_bit_reverse / batched_fft_butterfly index via a
+            // FLATTENED get_global_id(0) (b = idx/n, batchIdx = tid/(n/2)), so they MUST be dispatched
+            // 1D over batch*n (resp. batch*(n/2)). They were dispatched via Execute2D — a real 2D
+            // NDRange where get_global_id(0) only spanned one signal's worth — so only batch 0 was
+            // transformed and every other signal passed through untouched (op-parity #775: the batched
+            // FFT path that N-D IFFT / wideband / mel-spectrogram all route through).
+            int bitRevItems = batch * n;
             var bitRevKernel = _kernelCache["batched_bit_reverse"];
             bitRevKernel.SetArg(0, outReal.Handle);
             bitRevKernel.SetArg(1, outImag.Handle);
             bitRevKernel.SetArg(2, batch);
             bitRevKernel.SetArg(3, n);
             bitRevKernel.SetArg(4, log2n);
-            bitRevKernel.Execute2D(n, batch, Math.Min(256, n), 1);
+            bitRevKernel.Execute1D(bitRevItems, Math.Min(256, bitRevItems));
 
-            // Batched FFT butterfly stages
+            // Batched FFT butterfly stages (batch * (n/2) butterfly pairs per stage)
+            int butterflyItems = batch * (n / 2);
             var butterflyKernel = _kernelCache["batched_fft_butterfly"];
             for (int stride = 2; stride <= n; stride *= 2)
             {
@@ -10667,7 +10674,7 @@ KERNEL VARIANTS (A/B testing):
                 butterflyKernel.SetArg(3, n);
                 butterflyKernel.SetArg(4, stride);
                 butterflyKernel.SetArg(5, inverse ? 1 : 0);
-                butterflyKernel.Execute2D(n / 2, batch, Math.Min(256, n / 2), 1);
+                butterflyKernel.Execute1D(butterflyItems, Math.Min(256, butterflyItems));
             }
 
             // Scale for inverse FFT

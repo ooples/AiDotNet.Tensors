@@ -79,8 +79,7 @@ public static class OpParityRegistry
         yield return new OpCase("NativeComplexIFFTNDReal[4,4]", "complex",
             e => e.NativeComplexIFFTNDReal(re2.CF(im2), new[] { 0, 1 }),
             e => e.NativeComplexIFFTNDReal(re2.CD(im2), new[] { 0, 1 }),
-            ParityTol.Accum(1e-3), opMethod: "NativeComplexIFFTNDReal")
-        { KnownDivergence = "GPU N-D IFFT-to-real uses a separate ND path (not the fixed FFT2D); still diverges ~0.32 abs." };
+            ParityTol.Accum(1e-3), opMethod: "NativeComplexIFFTNDReal");
     }
 
     // Grouped-deform mask backward, fold, reorder-to-NCHW, unique-consecutive.
@@ -747,8 +746,7 @@ public static class OpParityRegistry
         // oracle, GPU ~48M ULP / 2.24 abs).
         yield return new OpCase("NativeWidebandFeatures[2,512;seg4;bins20]", "audio",
             e => e.NativeWidebandFeatures(wave.F(), 4, 20), e => e.NativeWidebandFeatures(wave.D(), 4, 20),
-            ParityTol.Accum(2e-3), opMethod: "NativeWidebandFeatures")
-        { KnownDivergence = "GPU wideband-feature FFT uses a separate 1D-FFT path (not the fixed FFT2D); still diverges ~2.24 abs." };
+            ParityTol.Accum(2e-3), opMethod: "NativeWidebandFeatures");
 
         // Mel-spectrogram of a [1,128] signal, nFft 16, hop 8, 8 mels.
         // FOUND (quarantined): GPU emits a different frame count (120 vs CPU/oracle 136) -> STFT
