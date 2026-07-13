@@ -1905,8 +1905,7 @@ public static class OpParityRegistry
 
         // FOUND (quarantined): GPU MishBackward is NONDETERMINISTIC run-to-run (racy/uninitialized
         // kernel, like the frac bug) — a real GPU bug the determinism check catches intermittently.
-        yield return new OpCase("MishBackward[4,64]", "activation-bwd", e => e.MishBackward(go.F(), inp.F()), e => e.MishBackward(go.D(), inp.D()), ParityTol.Ulp(64, 1e-6), opMethod: "MishBackward")
-        { KnownDivergence = "GPU MishBackward is nondeterministic run-to-run (racy/uninitialized backward kernel)." };
+        yield return new OpCase("MishBackward[4,64]", "activation-bwd", e => e.MishBackward(go.F(), inp.F()), e => e.MishBackward(go.D(), inp.D()), ParityTol.Ulp(64, 1e-6), opMethod: "MishBackward");
         yield return new OpCase("SwishBackward[4,64]", "activation-bwd", e => e.SwishBackward(go.F(), inp.F()), e => e.SwishBackward(go.D(), inp.D()), ParityTol.Ulp(64, 1e-6), opMethod: "SwishBackward");
         yield return new OpCase("SoftplusBackward[4,64]", "activation-bwd", e => e.SoftplusBackward(go.F(), inp.F()), e => e.SoftplusBackward(go.D(), inp.D()), ParityTol.Ulp(64, 1e-6), opMethod: "SoftplusBackward");
         yield return new OpCase("SeluBackward[4,64]", "activation-bwd", e => e.SeluBackward(go.F(), inp.F()), e => e.SeluBackward(go.D(), inp.D()), ParityTol.Ulp(64, 1e-6), opMethod: "SeluBackward");
