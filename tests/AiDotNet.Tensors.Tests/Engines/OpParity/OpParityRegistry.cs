@@ -1744,13 +1744,11 @@ public static class OpParityRegistry
         var m = OpInput.Rand(1001, new[] { 4, 8 });
         yield return new OpCase("TensorConstantPad[4,8;1111]", "shape", e => e.TensorConstantPad(m.F(), new[] { 1, 1, 1, 1 }, 0f), e => e.TensorConstantPad(m.D(), new[] { 1, 1, 1, 1 }, 0.0), ParityTol.Exact, opMethod: "TensorConstantPad");
         yield return new OpCase("TensorUnfold[4,8;d1,4,2]", "shape", e => e.TensorUnfold(m.F(), 1, 4, 2), e => e.TensorUnfold(m.D(), 1, 4, 2), ParityTol.Exact, opMethod: "TensorUnfold");
-        // FOUND (quarantined): GPU Unfold (im2col) emits its columns in a DIFFERENT element order than
-        // CPU/oracle (values are a permutation — CPU matches oracle at 0 ULP, GPU is far off) — a
-        // layout/convention mismatch in the GPU im2col kernel. Tracked for a separate GPU-side fix.
+        // FIXED (#775): GPU im2col wrote the transposed [batch, L, C*kH*kW] layout; CpuEngine.Unfold is
+        // [batch, C*kH*kW, L]. Kernel now writes [patchSize, L] so the columns match the CPU convention.
         yield return new OpCase("Unfold[1,3,8,8;k3,3]", "shape",
             e => e.Unfold(OpInput.Rand(1002, new[] { 1, 3, 8, 8 }).F(), new[] { 3, 3 }, new[] { 1, 1 }, new[] { 0, 0 }),
-            e => e.Unfold(OpInput.Rand(1002, new[] { 1, 3, 8, 8 }).D(), new[] { 3, 3 }, new[] { 1, 1 }, new[] { 0, 0 }), ParityTol.Exact, opMethod: "Unfold")
-        { KnownDivergence = "GPU Unfold/im2col emits columns in a different element order than the CPU convention." };
+            e => e.Unfold(OpInput.Rand(1002, new[] { 1, 3, 8, 8 }).D(), new[] { 3, 3 }, new[] { 1, 1 }, new[] { 0, 0 }), ParityTol.Exact, opMethod: "Unfold");
 
         var r = OpInput.Rand(1010, new[] { 4, 32 });
         yield return new OpCase("ReduceLogVariance[4,32;ax1]", "reduction", e => e.ReduceLogVariance(r.F(), new[] { 1 }, false, 1e-8), e => e.ReduceLogVariance(r.D(), new[] { 1 }, false, 1e-8), ParityTol.Accum(1e-3), opMethod: "ReduceLogVariance");

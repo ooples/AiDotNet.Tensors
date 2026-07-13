@@ -49,7 +49,11 @@ __kernel void im2col(
     const int ow = rem % outW;
 
     const int patchSize = channels * kernelH * kernelW;
-    __global float* outPtr = output + idx * patchSize;
+    // Output is [batch, C*kH*kW, L] (L = outH*outW), matching CpuEngine.Unfold. The old write
+    // (output[idx*patchSize + colRow]) produced the transposed [batch, L, C*kH*kW] layout, so the
+    // GPU columns came out permuted vs the CPU convention (#775). Write [patchSize, L] instead.
+    const int L = outH * outW;
+    const int s = oh * outW + ow;
 
     for (int c = 0; c < channels; c++) {
         for (int kh = 0; kh < kernelH; kh++) {
@@ -62,8 +66,8 @@ __kernel void im2col(
                     val = input[((b * channels + c) * height + ih) * width + iw];
                 }
 
-                int outIdx = (c * kernelH + kh) * kernelW + kw;
-                outPtr[outIdx] = val;
+                int colRow = (c * kernelH + kh) * kernelW + kw;
+                output[(b * patchSize + colRow) * L + s] = val;
             }
         }
     }
