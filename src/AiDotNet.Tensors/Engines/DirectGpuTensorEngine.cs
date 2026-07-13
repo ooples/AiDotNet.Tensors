@@ -19306,12 +19306,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             int batch = input.Shape._dims[0];
-            int outC = outputSize.Length >= 2 ? outputSize[0] : 1;
-            int outH = outputSize.Length >= 2 ? outputSize[outputSize.Length - 2] : outputSize[0];
+            int outH = outputSize[outputSize.Length - 2];
             int outW = outputSize[outputSize.Length - 1];
             int kH = kernelSize[0], kW = kernelSize[1];
             int sH = stride[0], sW = stride[1];
             int pH = padding[0], pW = padding[1];
+            // outputSize is the SPATIAL size [outH, outW]; the channel count comes from the unfolded
+            // input's dim-1 (C*kH*kW) divided by the kernel area, NOT outputSize[0]. Reading outC from
+            // outputSize[0] mistook outH for C and produced a [B, outH, outH, outW] output (#775).
+            int outC = input.Shape._dims[1] / (kH * kW);
             int totalOut = batch * outC * outH * outW;
             using var bufIn = GetOrAllocateBuffer(backend, input);
             var bufOut = AllocateOutputBuffer(backend, totalOut);

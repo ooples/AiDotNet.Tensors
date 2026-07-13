@@ -99,13 +99,12 @@ public static class OpParityRegistry
 
         // Fold: unfolded columns [1, C*kh*kw=8, L=4] -> [1,2,4,4] (kernel 2x2 stride 2).
         var foldIn = OpInput.Rand(5610, new[] { 1, 8, 4 });
-        // FOUND (quarantined): GPU Fold emits a different output size (64 vs CPU/oracle 32) —
-        // GPU fold/col2im shape or accumulation bug.
+        // FIXED (#775): GPU Fold read the channel count from outputSize[0] (the spatial height) instead
+        // of input-dim-1 / (kH*kW), producing a [B, outH, outH, outW] output. Channels now derived correctly.
         yield return new OpCase("Fold[1,8,4->4,4]", "shape",
             e => e.Fold(foldIn.F(), new[] { 4, 4 }, new[] { 2, 2 }, new[] { 2, 2 }, new[] { 0, 0 }),
             e => e.Fold(foldIn.D(), new[] { 4, 4 }, new[] { 2, 2 }, new[] { 2, 2 }, new[] { 0, 0 }),
-            ParityTol.Ulp(4), opMethod: "Fold")
-        { KnownDivergence = "GPU Fold emits a different output size (64 vs 32); CPU matches oracle." };
+            ParityTol.Ulp(4), opMethod: "Fold");
 
         // Reorder to NCHW (standard [N,C,H,W] tensor).
         var reIn = OpInput.Rand(5620, new[] { 1, 2, 4, 4 });

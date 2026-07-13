@@ -113,9 +113,13 @@ __kernel void col2im(
                 int ow = ow_base / strideW;
 
                 if (oh >= 0 && oh < outH && ow >= 0 && ow < outW) {
-                    int patchIdx = (b * outH + oh) * outW + ow;
+                    // Input is [batch, C*kH*kW, L] (L = outH*outW patches), matching CpuEngine.Fold:
+                    // flat = b*patchSize*L + colIdx*L + s. The old index (patchIdx*patchSize + colIdx)
+                    // assumed a transposed [batch, L, C*kH*kW] layout and produced wrong values (#775).
+                    int L = outH * outW;
+                    int s = oh * outW + ow;
                     int colIdx = (c * kernelH + kh) * kernelW + kw;
-                    sum += input[patchIdx * patchSize + colIdx];
+                    sum += input[(b * patchSize + colIdx) * L + s];
                 }
             }
         }
