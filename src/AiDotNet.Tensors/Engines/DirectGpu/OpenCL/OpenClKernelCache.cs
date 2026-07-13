@@ -28,8 +28,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             set => _map[name] = value;
         }
 
+#if NET471
+        // net471 ships MaybeNullWhenAttribute as internal (inaccessible here) and its BCL is
+        // nullable-oblivious, so a plain non-null out forwards to Dictionary.TryGetValue without any
+        // nullable warning; callers guard on the bool return before using the value either way.
+        public bool TryGetValue(string name, out DirectOpenClKernel value)
+            => _map.TryGetValue(name, out value);
+#else
         public bool TryGetValue(string name, [System.Diagnostics.CodeAnalysis.MaybeNullWhen(false)] out DirectOpenClKernel value)
             => _map.TryGetValue(name, out value);
+#endif
         public bool ContainsKey(string name) => _map.ContainsKey(name);
         public int Count => _map.Count;
         public Dictionary<string, DirectOpenClKernel>.ValueCollection Values => _map.Values;

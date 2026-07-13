@@ -3307,7 +3307,8 @@ public partial class DirectGpuTensorEngine
                             for (int oh = 0; oh < outH; oh++)
                                 for (int ow = 0; ow < outW; ow++)
                                 {
-                                    int spatial = System.BitConverter.SingleToInt32Bits(idxRaw[p++]);
+                                    // net471-safe bit reinterpret (no BitConverter.SingleToInt32Bits pre-net-core).
+                                    int spatial = System.BitConverter.ToInt32(System.BitConverter.GetBytes(idxRaw[p++]), 0);
                                     int id = spatial / hw, rem = spatial % hw;
                                     maxIndices[b, c, od, oh, ow, 0] = id;
                                     maxIndices[b, c, od, oh, ow, 1] = rem / inW;
@@ -3335,7 +3336,7 @@ public partial class DirectGpuTensorEngine
         if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || input.Rank != 5 || poolSize is not { Length: 3 } || stride is not { Length: 3 }
             || padding is not { Length: 3 } || padding[0] != 0 || padding[1] != 0 || padding[2] != 0
-            || !TryGetBackend(out var backend))
+            || !TryGetBackend(out var backend) || backend is not IExtendedConvKernels gpu)
             return base.AvgPool3D(input, poolSize, stride, padding);
         try
         {
@@ -3352,7 +3353,7 @@ public partial class DirectGpuTensorEngine
             try
             {
                 // No padding, so every window is full -> countIncludePad is irrelevant; pass 1.
-                backend.AvgPool3D(inBuf.Buffer, outBuf.Buffer, batch, channels, inD, inH, inW,
+                gpu.AvgPool3D(inBuf.Buffer, outBuf.Buffer, batch, channels, inD, inH, inW,
                     outD, outH, outW, kD, kH, kW, sD, sH, sW, countIncludePad: 1);
                 var arr = FinishGpuOp<T>(backend, outBuf, outLen);
                 return new Tensor<T>(arr, new[] { batch, channels, outD, outH, outW });
@@ -3370,7 +3371,7 @@ public partial class DirectGpuTensorEngine
         if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || inputShape is not { Length: 5 } || poolSize is not { Length: 3 } || stride is not { Length: 3 }
             || padding is not { Length: 3 } || padding[0] != 0 || padding[1] != 0 || padding[2] != 0
-            || gradOutput.Rank != 5 || !TryGetBackend(out var backend))
+            || gradOutput.Rank != 5 || !TryGetBackend(out var backend) || backend is not IExtendedConvKernels gpu)
             return base.AvgPool3DBackward(gradOutput, inputShape, poolSize, stride, padding);
         try
         {
@@ -3383,7 +3384,7 @@ public partial class DirectGpuTensorEngine
             var gradInBuf = AllocateOutputBuffer(backend, inLen);
             try
             {
-                backend.AvgPool3DBackward(gradOutBuf.Buffer, gradInBuf.Buffer, batch, channels, inD, inH, inW,
+                gpu.AvgPool3DBackward(gradOutBuf.Buffer, gradInBuf.Buffer, batch, channels, inD, inH, inW,
                     outD, outH, outW, kD, kH, kW, sD, sH, sW, countIncludePad: 1);
                 var arr = FinishGpuOp<T>(backend, gradInBuf, inLen);
                 return new Tensor<T>(arr, (int[])inputShape.Clone());
@@ -3463,7 +3464,7 @@ public partial class DirectGpuTensorEngine
             || inputShape is not { Length: 5 } || gradOutput.Rank != 5 || kernel.Rank != 5
             || stride is not { Length: 3 } || padding is not { Length: 3 }
             || dilation is not { Length: 3 } || dilation[0] != 1 || dilation[1] != 1 || dilation[2] != 1
-            || !TryGetBackend(out var backend))
+            || !TryGetBackend(out var backend) || backend is not IExtendedConvKernels gpu)
             return base.Conv3DBackwardInput(gradOutput, kernel, inputShape, stride, padding, dilation);
         try
         {
@@ -3476,7 +3477,7 @@ public partial class DirectGpuTensorEngine
             var gradInBuf = AllocateOutputBuffer(backend, inLen);
             try
             {
-                backend.Conv3DBackwardInput(gradOutBuf.Buffer, kBuf.Buffer, gradInBuf.Buffer,
+                gpu.Conv3DBackwardInput(gradOutBuf.Buffer, kBuf.Buffer, gradInBuf.Buffer,
                     n, inC, inD, inH, inW, outC, outD, outH, outW, kD, kH, kW,
                     stride[0], stride[1], stride[2], padding[0], padding[1], padding[2]);
                 var arr = FinishGpuOp<T>(backend, gradInBuf, inLen);
@@ -3495,7 +3496,7 @@ public partial class DirectGpuTensorEngine
             || kernelShape is not { Length: 5 } || input.Rank != 5 || gradOutput.Rank != 5
             || stride is not { Length: 3 } || padding is not { Length: 3 }
             || dilation is not { Length: 3 } || dilation[0] != 1 || dilation[1] != 1 || dilation[2] != 1
-            || !TryGetBackend(out var backend))
+            || !TryGetBackend(out var backend) || backend is not IExtendedConvKernels gpu)
             return base.Conv3DBackwardKernel(gradOutput, input, kernelShape, stride, padding, dilation);
         try
         {
@@ -3508,7 +3509,7 @@ public partial class DirectGpuTensorEngine
             var gradKBuf = AllocateOutputBuffer(backend, kLen);
             try
             {
-                backend.Conv3DBackwardKernel(gradOutBuf.Buffer, inBuf.Buffer, gradKBuf.Buffer,
+                gpu.Conv3DBackwardKernel(gradOutBuf.Buffer, inBuf.Buffer, gradKBuf.Buffer,
                     n, inC, inD, inH, inW, outC, outD, outH, outW, kD, kH, kW,
                     stride[0], stride[1], stride[2], padding[0], padding[1], padding[2]);
                 var arr = FinishGpuOp<T>(backend, gradKBuf, kLen);
@@ -3558,7 +3559,7 @@ public partial class DirectGpuTensorEngine
     {
         if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || inputShape is not { Length: 4 } || gradOutput.Rank != 4 || kernel.Rank != 4
-            || stride is not { Length: 2 } || padding is not { Length: 2 } || !TryGetBackend(out var backend))
+            || stride is not { Length: 2 } || padding is not { Length: 2 } || !TryGetBackend(out var backend) || backend is not IExtendedConvKernels gpu)
             return base.DepthwiseConv2DBackwardInput(gradOutput, kernel, inputShape, stride, padding);
         try
         {
@@ -3571,7 +3572,7 @@ public partial class DirectGpuTensorEngine
             var gradInBuf = AllocateOutputBuffer(backend, inLen);
             try
             {
-                backend.DepthwiseConv2DBackwardInput(gradOutBuf.Buffer, kBuf.Buffer, gradInBuf.Buffer,
+                gpu.DepthwiseConv2DBackwardInput(gradOutBuf.Buffer, kBuf.Buffer, gradInBuf.Buffer,
                     n, inC, h, w, m, outH, outW, kH, kW, stride[0], stride[1], padding[0], padding[1]);
                 var arr = FinishGpuOp<T>(backend, gradInBuf, inLen);
                 return new Tensor<T>(arr, (int[])inputShape.Clone());
@@ -3585,7 +3586,7 @@ public partial class DirectGpuTensorEngine
     {
         if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || kernelShape is not { Length: 4 } || input.Rank != 4 || gradOutput.Rank != 4
-            || stride is not { Length: 2 } || padding is not { Length: 2 } || !TryGetBackend(out var backend))
+            || stride is not { Length: 2 } || padding is not { Length: 2 } || !TryGetBackend(out var backend) || backend is not IExtendedConvKernels gpu)
             return base.DepthwiseConv2DBackwardKernel(gradOutput, input, kernelShape, stride, padding);
         try
         {
@@ -3598,7 +3599,7 @@ public partial class DirectGpuTensorEngine
             var gradKBuf = AllocateOutputBuffer(backend, kLen);
             try
             {
-                backend.DepthwiseConv2DBackwardKernel(gradOutBuf.Buffer, inBuf.Buffer, gradKBuf.Buffer,
+                gpu.DepthwiseConv2DBackwardKernel(gradOutBuf.Buffer, inBuf.Buffer, gradKBuf.Buffer,
                     n, inC, h, w, m, outH, outW, kH, kW, stride[0], stride[1], padding[0], padding[1]);
                 var arr = FinishGpuOp<T>(backend, gradKBuf, kLen);
                 return new Tensor<T>(arr, (int[])kernelShape.Clone());
@@ -3642,7 +3643,7 @@ public partial class DirectGpuTensorEngine
     Tensor<T> IEngine.TensorTrilinearInterpolate<T>(Tensor<T> grid, Tensor<T> positions)
     {
         if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
-            || grid.Rank != 4 || positions.Rank != 2 || positions.Shape._dims[1] != 3 || !TryGetBackend(out var backend))
+            || grid.Rank != 4 || positions.Rank != 2 || positions.Shape._dims[1] != 3 || !TryGetBackend(out var backend) || backend is not IExtendedConvKernels gpu)
             return base.TensorTrilinearInterpolate(grid, positions);
         try
         {
@@ -3654,7 +3655,7 @@ public partial class DirectGpuTensorEngine
             var outBuf = AllocateOutputBuffer(backend, outLen);
             try
             {
-                backend.TrilinearInterpolate(gridBuf.Buffer, posBuf.Buffer, outBuf.Buffer, d, h, w, c, p, 1e-3f);
+                gpu.TrilinearInterpolate(gridBuf.Buffer, posBuf.Buffer, outBuf.Buffer, d, h, w, c, p, 1e-3f);
                 var arr = FinishGpuOp<T>(backend, outBuf, outLen);
                 return new Tensor<T>(arr, new[] { p, c });
             }
@@ -3667,7 +3668,7 @@ public partial class DirectGpuTensorEngine
     Tensor<T> IEngine.TensorTrilinearInterpolateBackward<T>(Tensor<T> gradOutput, Tensor<T> grid, Tensor<T> positions)
     {
         if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
-            || grid.Rank != 4 || positions.Rank != 2 || positions.Shape._dims[1] != 3 || !TryGetBackend(out var backend))
+            || grid.Rank != 4 || positions.Rank != 2 || positions.Shape._dims[1] != 3 || !TryGetBackend(out var backend) || backend is not IExtendedConvKernels gpu)
             return base.TensorTrilinearInterpolateBackward(gradOutput, grid, positions);
         try
         {
@@ -3679,7 +3680,7 @@ public partial class DirectGpuTensorEngine
             var gradGridBuf = AllocateOutputBuffer(backend, gridLen);
             try
             {
-                backend.TrilinearInterpolateBackward(gradOutBuf.Buffer, posBuf.Buffer, gradGridBuf.Buffer, d, h, w, c, p, 1e-3f);
+                gpu.TrilinearInterpolateBackward(gradOutBuf.Buffer, posBuf.Buffer, gradGridBuf.Buffer, d, h, w, c, p, 1e-3f);
                 var arr = FinishGpuOp<T>(backend, gradGridBuf, gridLen);
                 return new Tensor<T>(arr, new[] { d, h, w, c });
             }
@@ -3697,7 +3698,7 @@ public partial class DirectGpuTensorEngine
             || input.Rank != 5 || kernel.Rank != 5 || stride is not { Length: 3 }
             || padding is not { Length: 3 } || padding[0] != 0 || padding[1] != 0 || padding[2] != 0
             || outputPadding is not { Length: 3 } || outputPadding[0] != 0 || outputPadding[1] != 0 || outputPadding[2] != 0
-            || !TryGetBackend(out var backend))
+            || !TryGetBackend(out var backend) || backend is not IExtendedConvKernels gpu)
             return base.ConvTranspose3D(input, kernel, stride, padding, outputPadding);
         try
         {
@@ -3712,7 +3713,7 @@ public partial class DirectGpuTensorEngine
             var outBuf = AllocateOutputBuffer(backend, outLen);
             try
             {
-                backend.ConvTranspose3D(inBuf.Buffer, kBuf.Buffer, outBuf.Buffer, n, inC, iD, iH, iW,
+                gpu.ConvTranspose3D(inBuf.Buffer, kBuf.Buffer, outBuf.Buffer, n, inC, iD, iH, iW,
                     outC, outD, outH, outW, kD, kH, kW, sD, sH, sW, 0, 0, 0);
                 var arr = FinishGpuOp<T>(backend, outBuf, outLen);
                 return new Tensor<T>(arr, new[] { n, outC, outD, outH, outW });
@@ -3728,7 +3729,7 @@ public partial class DirectGpuTensorEngine
     {
         if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || inputShape is not { Length: 5 } || gradOutput.Rank != 5 || kernel.Rank != 5
-            || stride is not { Length: 3 } || padding is not { Length: 3 } || !TryGetBackend(out var backend))
+            || stride is not { Length: 3 } || padding is not { Length: 3 } || !TryGetBackend(out var backend) || backend is not IExtendedConvKernels gpu)
             return base.ConvTranspose3DBackwardInput(gradOutput, kernel, inputShape, stride, padding);
         try
         {
@@ -3741,7 +3742,7 @@ public partial class DirectGpuTensorEngine
             var gradInBuf = AllocateOutputBuffer(backend, inLen);
             try
             {
-                backend.ConvTranspose3DBackwardInput(gradOutBuf.Buffer, kBuf.Buffer, gradInBuf.Buffer,
+                gpu.ConvTranspose3DBackwardInput(gradOutBuf.Buffer, kBuf.Buffer, gradInBuf.Buffer,
                     n, inC, iD, iH, iW, outC, outD, outH, outW, kD, kH, kW,
                     stride[0], stride[1], stride[2], padding[0], padding[1], padding[2]);
                 var arr = FinishGpuOp<T>(backend, gradInBuf, inLen);
@@ -3757,7 +3758,7 @@ public partial class DirectGpuTensorEngine
     {
         if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || kernelShape is not { Length: 5 } || input.Rank != 5 || gradOutput.Rank != 5
-            || stride is not { Length: 3 } || padding is not { Length: 3 } || !TryGetBackend(out var backend))
+            || stride is not { Length: 3 } || padding is not { Length: 3 } || !TryGetBackend(out var backend) || backend is not IExtendedConvKernels gpu)
             return base.ConvTranspose3DBackwardKernel(gradOutput, input, kernelShape, stride, padding);
         try
         {
@@ -3770,7 +3771,7 @@ public partial class DirectGpuTensorEngine
             var gradKBuf = AllocateOutputBuffer(backend, kLen);
             try
             {
-                backend.ConvTranspose3DBackwardKernel(gradOutBuf.Buffer, inBuf.Buffer, gradKBuf.Buffer,
+                gpu.ConvTranspose3DBackwardKernel(gradOutBuf.Buffer, inBuf.Buffer, gradKBuf.Buffer,
                     n, inC, iD, iH, iW, outC, outD, outH, outW, kD, kH, kW,
                     stride[0], stride[1], stride[2], padding[0], padding[1], padding[2]);
                 var arr = FinishGpuOp<T>(backend, gradKBuf, kLen);
@@ -3787,7 +3788,7 @@ public partial class DirectGpuTensorEngine
     {
         if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || vertexFeatures.Rank != 2 || spiralIndices.Rank != 2 || weights.Rank != 2 || biases.Rank != 1
-            || !TryGetBackend(out var backend))
+            || !TryGetBackend(out var backend) || backend is not IExtendedConvKernels gpu)
             return base.SpiralConv(vertexFeatures, spiralIndices, weights, biases);
         try
         {
@@ -3802,13 +3803,81 @@ public partial class DirectGpuTensorEngine
             var outBuf = AllocateOutputBuffer(backend, outLen);
             try
             {
-                backend.SpiralConv(vfBuf.Buffer, idxBuf.Buffer, wBuf.Buffer, bBuf.Buffer, outBuf.Buffer, v, inC, spiralLength, outC);
+                gpu.SpiralConv(vfBuf.Buffer, idxBuf.Buffer, wBuf.Buffer, bBuf.Buffer, outBuf.Buffer, v, inC, spiralLength, outC);
                 var arr = FinishGpuOp<T>(backend, outBuf, outLen);
                 return new Tensor<T>(arr, new[] { v, outC });
             }
             catch { outBuf.Dispose(); throw; }
         }
         catch { return base.SpiralConv(vertexFeatures, spiralIndices, weights, biases); }
+    }
+
+    // #775: SpiralConv backward w.r.t. vertex features on the spiral_conv_backward_input kernel.
+    // outputGradient=[V,outC], spiralIndices=[V,spiralLength] (int), weights=[outC, inC*spiralLength] -> [V,inC].
+    Tensor<T> IEngine.SpiralConvBackwardInput<T>(Tensor<T> outputGradient, Tensor<int> spiralIndices, Tensor<T> weights, int inputChannels)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+            || outputGradient.Rank != 2 || spiralIndices.Rank != 2 || weights.Rank != 2
+            || !TryGetBackend(out var backend) || backend is not IExtendedConvKernels gpu)
+            return base.SpiralConvBackwardInput(outputGradient, spiralIndices, weights, inputChannels);
+        try
+        {
+            int v = outputGradient.Shape._dims[0], outC = outputGradient.Shape._dims[1];
+            int spiralLength = spiralIndices.Shape._dims[1];
+            int inC = inputChannels;
+            int outLen = v * inC;
+            using var gradBuf = GetOrAllocateBuffer(backend, outputGradient);
+            using var idxBuf = new OwnedBuffer(backend.AllocateIntBuffer(spiralIndices.GetDataArray()), ownsBuffer: true);
+            using var wBuf = GetOrAllocateBuffer(backend, weights);
+            var outBuf = AllocateOutputBuffer(backend, outLen);
+            try
+            {
+                gpu.SpiralConvBackwardInput(gradBuf.Buffer, idxBuf.Buffer, wBuf.Buffer, outBuf.Buffer, v, inC, spiralLength, outC);
+                var arr = FinishGpuOp<T>(backend, outBuf, outLen);
+                return new Tensor<T>(arr, new[] { v, inC });
+            }
+            catch { outBuf.Dispose(); throw; }
+        }
+        catch { return base.SpiralConvBackwardInput(outputGradient, spiralIndices, weights, inputChannels); }
+    }
+
+    // #775: SpiralConv backward w.r.t. weights on the spiral_conv_backward_weights kernel.
+    // outputGradient=[V,outC], vertexFeatures=[V,inC], spiralIndices=[V,spiralLength] (int) -> [outC, inC*spiralLength].
+    Tensor<T> IEngine.SpiralConvBackwardWeights<T>(Tensor<T> outputGradient, Tensor<T> vertexFeatures, Tensor<int> spiralIndices)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+            || outputGradient.Rank != 2 || vertexFeatures.Rank != 2 || spiralIndices.Rank != 2
+            || !TryGetBackend(out var backend) || backend is not IExtendedConvKernels gpu)
+            return base.SpiralConvBackwardWeights(outputGradient, vertexFeatures, spiralIndices);
+        try
+        {
+            int v = vertexFeatures.Shape._dims[0], inC = vertexFeatures.Shape._dims[1];
+            int outC = outputGradient.Shape._dims[1];
+            int spiralLength = spiralIndices.Shape._dims[1];
+            int gatheredSize = inC * spiralLength;
+            int outLen = outC * gatheredSize;
+            using var gradBuf = GetOrAllocateBuffer(backend, outputGradient);
+            using var vfBuf = GetOrAllocateBuffer(backend, vertexFeatures);
+            using var idxBuf = new OwnedBuffer(backend.AllocateIntBuffer(spiralIndices.GetDataArray()), ownsBuffer: true);
+            var outBuf = AllocateOutputBuffer(backend, outLen);
+            try
+            {
+                gpu.SpiralConvBackwardWeights(gradBuf.Buffer, vfBuf.Buffer, idxBuf.Buffer, outBuf.Buffer, v, inC, spiralLength, outC);
+                var arr = FinishGpuOp<T>(backend, outBuf, outLen);
+                return new Tensor<T>(arr, new[] { outC, gatheredSize });
+            }
+            catch { outBuf.Dispose(); throw; }
+        }
+        catch { return base.SpiralConvBackwardWeights(outputGradient, vertexFeatures, spiralIndices); }
+    }
+
+    // #775: SpiralConv backward w.r.t. bias = sum of outputGradient[V,outC] over vertices -> [outC].
+    // Composed on-device via the existing GPU ReduceSum kernel (axis 0); no new kernel needed.
+    Tensor<T> IEngine.SpiralConvBackwardBias<T>(Tensor<T> outputGradient)
+    {
+        if (outputGradient.Rank != 2)
+            return base.SpiralConvBackwardBias(outputGradient);
+        return ((IEngine)this).ReduceSum(outputGradient, new[] { 0 }, false);
     }
 
     // #775: whole-tensor mean (output [1]) via the GPU-resident ReduceMean over all axes.

@@ -1073,6 +1073,56 @@ __kernel void spiral_conv(
     }
     output[idx] = sum;
 }
+
+// #775: SpiralConv backward w.r.t. vertex features. GATHER over gradVertexFeatures [V,inC]: for cell
+// (nbr,ic), sum over every (v,s) whose spiral index == nbr of sum_oc gradOut[v,oc]*weights[oc, s*inC+ic].
+__kernel void spiral_conv_backward_input(
+    __global const float* gradOutput,   // [V, outC]
+    __global const int* spiralIndices,  // [V, spiralLength]
+    __global const float* weights,      // [outC, inC*spiralLength]
+    __global float* gradVertexFeatures, // [V, inC]
+    const int V, const int inC, const int spiralLength, const int outC)
+{
+    const int idx = get_global_id(0);
+    if (idx >= V * inC) return;
+    const int ic = idx % inC;
+    const int nbr = idx / inC;
+    const int gatheredSize = inC * spiralLength;
+    float sum = 0.0f;
+    for (int v = 0; v < V; v++) {
+        for (int s = 0; s < spiralLength; s++) {
+            if (spiralIndices[v * spiralLength + s] != nbr) continue;
+            for (int oc = 0; oc < outC; oc++) {
+                sum += gradOutput[v * outC + oc] * weights[oc * gatheredSize + s * inC + ic];
+            }
+        }
+    }
+    gradVertexFeatures[idx] = sum;
+}
+
+// #775: SpiralConv backward w.r.t. weights. GATHER over gradWeights [outC, inC*spiralLength].
+__kernel void spiral_conv_backward_weights(
+    __global const float* gradOutput,      // [V, outC]
+    __global const float* vertexFeatures,  // [V, inC]
+    __global const int* spiralIndices,     // [V, spiralLength]
+    __global float* gradWeights,           // [outC, inC*spiralLength]
+    const int V, const int inC, const int spiralLength, const int outC)
+{
+    const int idx = get_global_id(0);
+    const int gatheredSize = inC * spiralLength;
+    if (idx >= outC * gatheredSize) return;
+    const int g = idx % gatheredSize;
+    const int oc = idx / gatheredSize;
+    const int s = g / inC;
+    const int ic = g % inC;
+    float sum = 0.0f;
+    for (int v = 0; v < V; v++) {
+        int neighborIdx = spiralIndices[v * spiralLength + s];
+        if (neighborIdx < 0 || neighborIdx >= V) continue;
+        sum += gradOutput[v * outC + oc] * vertexFeatures[neighborIdx * inC + ic];
+    }
+    gradWeights[idx] = sum;
+}
 ";
         }
 
@@ -1102,7 +1152,9 @@ __kernel void spiral_conv(
                 "conv_transpose3d",
                 "conv_transpose3d_backward_input",
                 "conv_transpose3d_backward_weights",
-                "spiral_conv"
+                "spiral_conv",
+                "spiral_conv_backward_input",
+                "spiral_conv_backward_weights"
             };
         }
     }

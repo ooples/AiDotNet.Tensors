@@ -30,7 +30,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     /// <item>Bank-conflict-free shared memory</item>
     /// </list>
     /// </remarks>
-    public sealed partial class OpenClBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend
+    public sealed partial class OpenClBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IExtendedConvKernels
     {
         /// <summary>
         /// OpenCL has no cuDNN-equivalent half/bfloat16 conv path —
@@ -7163,6 +7163,34 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
             k.SetArg(arg++, v); k.SetArg(arg++, inC); k.SetArg(arg++, spiralLength); k.SetArg(arg++, outC);
             int total = v * outC;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
+        public void SpiralConvBackwardInput(IGpuBuffer gradOutput, IGpuBuffer spiralIndices, IGpuBuffer weights,
+            IGpuBuffer gradVertexFeatures, int v, int inC, int spiralLength, int outC)
+        {
+            var k = _kernelCache["spiral_conv_backward_input"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)spiralIndices).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)weights).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradVertexFeatures).Buffer.Handle);
+            k.SetArg(arg++, v); k.SetArg(arg++, inC); k.SetArg(arg++, spiralLength); k.SetArg(arg++, outC);
+            int total = v * inC;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
+        public void SpiralConvBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer vertexFeatures, IGpuBuffer spiralIndices,
+            IGpuBuffer gradWeights, int v, int inC, int spiralLength, int outC)
+        {
+            var k = _kernelCache["spiral_conv_backward_weights"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)vertexFeatures).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)spiralIndices).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradWeights).Buffer.Handle);
+            k.SetArg(arg++, v); k.SetArg(arg++, inC); k.SetArg(arg++, spiralLength); k.SetArg(arg++, outC);
+            int total = outC * inC * spiralLength;
             k.Execute1D(total, Math.Min(256, total));
         }
 
