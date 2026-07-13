@@ -1046,6 +1046,33 @@ __kernel void conv_transpose3d_backward_weights(
     }
     gradWeights[idx] = sum;
 }
+
+// #775: SpiralConv (mesh conv). Per (vertex, out-channel): gather the spiralLength neighbour features and
+// matmul with weights [outC, inC*spiralLength] + bias. Invalid neighbour index contributes 0. 1D over V*outC.
+__kernel void spiral_conv(
+    __global const float* vertexFeatures,  // [V, inC]
+    __global const int* spiralIndices,     // [V, spiralLength]
+    __global const float* weights,         // [outC, inC*spiralLength]
+    __global const float* biases,          // [outC]
+    __global float* output,                // [V, outC]
+    const int V, const int inC, const int spiralLength, const int outC)
+{
+    const int idx = get_global_id(0);
+    if (idx >= V * outC) return;
+    const int oc = idx % outC;
+    const int v = idx / outC;
+    const int gatheredSize = inC * spiralLength;
+    float sum = biases[oc];
+    for (int s = 0; s < spiralLength; s++) {
+        int neighborIdx = spiralIndices[v * spiralLength + s];
+        if (neighborIdx < 0 || neighborIdx >= V) continue;
+        int gatherOffset = s * inC;
+        for (int c = 0; c < inC; c++) {
+            sum += vertexFeatures[neighborIdx * inC + c] * weights[oc * gatheredSize + gatherOffset + c];
+        }
+    }
+    output[idx] = sum;
+}
 ";
         }
 
@@ -1074,7 +1101,8 @@ __kernel void conv_transpose3d_backward_weights(
                 "trilinear_interpolate_backward",
                 "conv_transpose3d",
                 "conv_transpose3d_backward_input",
-                "conv_transpose3d_backward_weights"
+                "conv_transpose3d_backward_weights",
+                "spiral_conv"
             };
         }
     }

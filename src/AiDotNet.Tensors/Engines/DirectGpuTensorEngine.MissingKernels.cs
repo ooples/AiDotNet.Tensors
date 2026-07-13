@@ -3781,6 +3781,36 @@ public partial class DirectGpuTensorEngine
         catch { return base.ConvTranspose3DBackwardKernel(gradOutput, input, kernelShape, stride, padding); }
     }
 
+    // #775: SpiralConv (mesh conv) on the new spiral_conv kernel. vertexFeatures=[V,inC],
+    // spiralIndices=[V,spiralLength] (int), weights=[outC, inC*spiralLength], biases=[outC] -> [V,outC].
+    Tensor<T> IEngine.SpiralConv<T>(Tensor<T> vertexFeatures, Tensor<int> spiralIndices, Tensor<T> weights, Tensor<T> biases)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+            || vertexFeatures.Rank != 2 || spiralIndices.Rank != 2 || weights.Rank != 2 || biases.Rank != 1
+            || !TryGetBackend(out var backend))
+            return base.SpiralConv(vertexFeatures, spiralIndices, weights, biases);
+        try
+        {
+            int v = vertexFeatures.Shape._dims[0], inC = vertexFeatures.Shape._dims[1];
+            int spiralLength = spiralIndices.Shape._dims[1];
+            int outC = weights.Shape._dims[0];
+            int outLen = v * outC;
+            using var vfBuf = GetOrAllocateBuffer(backend, vertexFeatures);
+            using var idxBuf = new OwnedBuffer(backend.AllocateIntBuffer(spiralIndices.GetDataArray()), ownsBuffer: true);
+            using var wBuf = GetOrAllocateBuffer(backend, weights);
+            using var bBuf = GetOrAllocateBuffer(backend, biases);
+            var outBuf = AllocateOutputBuffer(backend, outLen);
+            try
+            {
+                backend.SpiralConv(vfBuf.Buffer, idxBuf.Buffer, wBuf.Buffer, bBuf.Buffer, outBuf.Buffer, v, inC, spiralLength, outC);
+                var arr = FinishGpuOp<T>(backend, outBuf, outLen);
+                return new Tensor<T>(arr, new[] { v, outC });
+            }
+            catch { outBuf.Dispose(); throw; }
+        }
+        catch { return base.SpiralConv(vertexFeatures, spiralIndices, weights, biases); }
+    }
+
     // #775: whole-tensor mean (output [1]) via the GPU-resident ReduceMean over all axes.
     Tensor<T> IEngine.TensorMeanDiff<T>(Tensor<T> tensor)
     {

@@ -7150,6 +7150,22 @@ KERNEL VARIANTS (A/B testing):
             k.Execute1D(total, Math.Min(256, total));
         }
 
+        // #775: SpiralConv (mesh conv). 1D over V*outC.
+        public void SpiralConv(IGpuBuffer vertexFeatures, IGpuBuffer spiralIndices, IGpuBuffer weights,
+            IGpuBuffer biases, IGpuBuffer output, int v, int inC, int spiralLength, int outC)
+        {
+            var k = _kernelCache["spiral_conv"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)vertexFeatures).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)spiralIndices).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)weights).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)biases).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, v); k.SetArg(arg++, inC); k.SetArg(arg++, spiralLength); k.SetArg(arg++, outC);
+            int total = v * outC;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
         public void NearestNeighborUpsample3D(IGpuBuffer input, IGpuBuffer output,
             int batch, int channels,
             int inDepth, int inHeight, int inWidth,

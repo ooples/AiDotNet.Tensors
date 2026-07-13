@@ -1280,6 +1280,12 @@ public interface IDirectGpuBackend : IDisposable
         int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW)
         => throw new System.NotSupportedException("ConvTranspose3DBackwardKernel is not implemented for this GPU backend.");
 
+    /// <summary>SpiralConv (mesh conv): weights [outC, inC*spiralLength]. Default-throws (CPU fallback);
+    /// OpenCL overrides it (#775).</summary>
+    void SpiralConv(IGpuBuffer vertexFeatures, IGpuBuffer spiralIndices, IGpuBuffer weights,
+        IGpuBuffer biases, IGpuBuffer output, int v, int inC, int spiralLength, int outC)
+        => throw new System.NotSupportedException("SpiralConv is not implemented for this GPU backend.");
+
     /// <summary>
     /// Backward pass for 3D max pooling (NCDHW format).
     /// Routes gradients back to the positions that had max values in the forward pass.
