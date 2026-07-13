@@ -2981,4 +2981,21 @@ public partial class DirectGpuTensorEngine
         var normalized = TensorBroadcastDivide(input, TensorSqrt(sumSq));
         return ((IEngine)this).TensorSoftmax(normalized, ax);
     }
+
+    // #775: element-wise binary cross-entropy -(t*log(pc) + (1-t)*log(1-pc)), pc = clamp(p, eps, 1-eps).
+    // Composes from GPU-resident TensorClamp/Log/Multiply/Add/Negate (1-x via Negate+AddScalar), matching
+    // CpuEngine's clamp bounds and term order under Accum(1e-3). Defer to base under tape/GraphMode.
+    Tensor<T> IEngine.TensorBinaryCrossEntropy<T>(Tensor<T> predictions, Tensor<T> targets, T epsilon)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+            return base.TensorBinaryCrossEntropy(predictions, targets, epsilon);
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var upper = numOps.Subtract(numOps.One, epsilon);
+        var pc = TensorClamp(predictions, epsilon, upper);                                 // clamp(p, eps, 1-eps)
+        var logP = TensorLog(pc);
+        var log1mP = TensorLog(TensorAddScalar(TensorNegate(pc), numOps.One));             // log(1 - pc)
+        var oneMinusT = TensorAddScalar(TensorNegate(targets), numOps.One);                // 1 - t
+        var loss = TensorAdd(TensorMultiply(targets, logP), TensorMultiply(oneMinusT, log1mP));
+        return TensorNegate(loss);
+    }
 }
