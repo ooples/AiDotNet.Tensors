@@ -2945,6 +2945,36 @@ public partial class DirectGpuTensorEngine
         return TensorLog(TensorAddScalar(variance, numOps.FromDouble(epsilon)));
     }
 
+    // #775: reduce-std = sqrt(reduce-variance), exactly as CpuEngine. On a GPU engine CpuEngine.ReduceStd's
+    // `this.ReduceVariance` binds to the CPU method (ReduceVariance is an explicit-interface override), so
+    // ReduceStd ran on the host; route ReduceVariance through the interface to hit the on-device compose,
+    // then TensorSqrt. Defer to base under tape/GraphMode.
+    Tensor<T> IEngine.ReduceStd<T>(Tensor<T> input, int[] axes, bool keepDims)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+            return base.ReduceStd(input, axes, keepDims);
+        return TensorSqrt(((IEngine)this).ReduceVariance(input, axes, keepDims));
+    }
+
+    // #775: whole-tensor population variance/std (output [1]). Reduce over ALL axes via the on-device
+    // ReduceVariance compose (through the interface), reshape to [1]; std = sqrt(var). Same two-pass
+    // population formula as CpuEngine. Defer to base under tape/GraphMode.
+    Tensor<T> IEngine.TensorVar<T>(Tensor<T> tensor)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+            return base.TensorVar(tensor);
+        var allAxes = new int[tensor.Rank];
+        for (int i = 0; i < tensor.Rank; i++) allAxes[i] = i;
+        return ((IEngine)this).ReduceVariance(tensor, allAxes, keepDims: false).Reshape(new[] { 1 });
+    }
+
+    Tensor<T> IEngine.TensorStd<T>(Tensor<T> tensor)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+            return base.TensorStd(tensor);
+        return TensorSqrt(((IEngine)this).TensorVar(tensor));
+    }
+
     // #775: order-2 Taylor softmax = normalize(1 + s + s^2/2) along `axis`, s = x - max(x). Only order 2
     // is accelerated: its polynomial 0.5*(s+1)^2 + 0.5 >= 0.5 > 0, so the axis-sum is strictly positive
     // and CpuEngine's sumExp==0 fallback is provably dead — matching the CPU value under Accum(1e-3).
