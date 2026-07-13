@@ -1441,13 +1441,13 @@ public static class OpParityRegistry
 
         var logits = OpInput.Rand(2030, new[] { 4, 8 }, -4.0, 4.0);
         var sgo = OpInput.Rand(2031, new[] { 4, 8 });
-        // FOUND (quarantined): GPU TensorSoftmaxBackward diverges strongly from CPU/oracle (maxRel
-        // ~1.3; CPU matches the oracle) — part of the GPU backward-kernel divergence cluster with the
-        // norm backwards. (The plain SoftmaxBackward op passes; this Tensor* variant does not.)
+        // FIXED (#775): the GPU TensorSoftmaxBackward override called the backend as
+        // SoftmaxBackward(softmaxOutput, gradOutput, ...) but the kernel signature is
+        // SoftmaxBackward(gradOutput, output, ...) — the two inputs were swapped, so it computed
+        // g*(s - dot(g,s)) instead of s*(g - dot(g,s)). Args corrected.
         yield return new OpCase("TensorSoftmaxBackward[4,8]", "activation-bwd",
             e => e.TensorSoftmaxBackward(e.TensorSoftmax(logits.F(), -1), sgo.F(), -1),
-            e => e.TensorSoftmaxBackward(e.TensorSoftmax(logits.D(), -1), sgo.D(), -1), ParityTol.Accum(1e-3), opMethod: "TensorSoftmaxBackward")
-        { KnownDivergence = "GPU TensorSoftmaxBackward diverges strongly from CPU/oracle (backward-kernel bug)." };
+            e => e.TensorSoftmaxBackward(e.TensorSoftmax(logits.D(), -1), sgo.D(), -1), ParityTol.Accum(1e-3), opMethod: "TensorSoftmaxBackward");
     }
 
     // Norm-family backward (forward run inline for saved stats), conv/pool backward, global-max, mse/ce bwd.
