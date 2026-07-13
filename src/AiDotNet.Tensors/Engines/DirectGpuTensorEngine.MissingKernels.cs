@@ -2891,4 +2891,17 @@ public partial class DirectGpuTensorEngine
         // scalar - x = (-x) + scalar — negate then AddScalar, mirroring CpuEngine exactly.
         return TensorAddScalar(TensorNegate(tensor), scalar);
     }
+
+    Tensor<T> IEngine.TensorOuterProduct<T>(Tensor<T> a, Tensor<T> b)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+            return base.TensorOuterProduct(a, b);
+        // outer(a,b)[i,j] = a_i * b_j == (a as [n,1]) @ (b as [1,m]). The contraction dim is 1, so it
+        // is a single multiply per element (no accumulation) — bit-identical to the CpuEngine loop and
+        // fully GPU-resident via TensorMatMul. Flatten to 1-D first (OuterProduct treats both as vectors).
+        int n = a.Length, m = b.Length;
+        var af = a.IsContiguous ? a : a.Contiguous();
+        var bf = b.IsContiguous ? b : b.Contiguous();
+        return TensorMatMul(af.Reshape(new[] { n, 1 }), bf.Reshape(new[] { 1, m }));
+    }
 }
