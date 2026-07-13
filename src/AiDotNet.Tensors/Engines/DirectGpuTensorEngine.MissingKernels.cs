@@ -3167,4 +3167,19 @@ public partial class DirectGpuTensorEngine
         var outIm = TensorAdd(TensorMultiply(aRe, bIm), TensorMultiply(aIm, bRe));
         return TensorConcatenate(new[] { outRe, outIm }, rank).Reshape(a.Shape._dims);
     }
+
+    // #775: fused linear backward for the no-activation case. With FusedActivationType.None the activation
+    // gradient is a passthrough (gradActivation = gradOutput), so gradInput = gradOut @ Wᵀ, gradWeights =
+    // inputᵀ @ gradOut, gradBias = sum over batch — all GPU-resident (TensorMatMul/TensorTranspose/ReduceSum),
+    // matching CpuEngine's steps. Fused activations and non-2D defer to base (which runs its activation-backward).
+    Tensor<T> IEngine.FusedLinearBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> weights,
+        Tensor<T> preActivation, FusedActivationType activation, out Tensor<T> gradWeights, out Tensor<T>? gradBias)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || activation != FusedActivationType.None
+            || gradOutput.Rank != 2)
+            return base.FusedLinearBackward(gradOutput, input, weights, preActivation, activation, out gradWeights, out gradBias);
+        gradBias = ReduceSum(gradOutput, new[] { 0 }, false);                       // sum over batch
+        gradWeights = TensorMatMul(TensorTranspose(input), gradOutput);            // inputᵀ @ gradOut
+        return TensorMatMul(gradOutput, TensorTranspose(weights));                 // gradOut @ Wᵀ
+    }
 }
