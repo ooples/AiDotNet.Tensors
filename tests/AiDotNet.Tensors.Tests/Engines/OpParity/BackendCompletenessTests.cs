@@ -56,7 +56,7 @@ public sealed class BackendCompletenessTests
 
     // Current count of tensor ops still lacking a GPU override. GOAL: 0. This floor only ratchets
     // DOWN — add a GPU kernel, lower the number. It must never be raised to hide a new gap.
-    private const int GpuOverrideMissingFloor = 135;
+    private const int GpuOverrideMissingFloor = 134;
 
     [Fact]
     public void EveryTensorOp_HasRealGpuEngineOverride()

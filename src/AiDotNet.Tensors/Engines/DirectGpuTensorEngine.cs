@@ -12664,6 +12664,56 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    // #775: GPU InstanceNormBackward. Same shape of contract as BatchNormBackward, but the
+    // reduction is PER-INSTANCE (each (batch,channel) normalized over its spatial extent), so
+    // saveMean/saveInvVar carry batch*channels values (idx = b*channels + c), while gamma and the
+    // gradGamma/gradBeta accumulators stay per-channel [channels]. Like BatchNormBackward, the
+    // instancenorm_backward kernel consumes saveInvVar = 1/sqrt(var+eps) directly, whereas the
+    // IEngine contract (CpuEngine) passes TRUE variance — convert on the way in.
+    Tensor<T> IEngine.InstanceNormBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> gamma, Tensor<T> mean, Tensor<T> variance, double epsilon, out Tensor<T> gradGamma, out Tensor<T> gradBeta)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend) || input.Rank < 2)
+            return base.InstanceNormBackward(gradOutput, input, gamma, mean, variance, epsilon, out gradGamma, out gradBeta);
+
+        try
+        {
+            int batch = input.Shape._dims[0];
+            int channels = input.Shape._dims[1];
+            if (channels <= 0 || batch <= 0 || gamma.Length != channels || input.Length % (batch * channels) != 0)
+                return base.InstanceNormBackward(gradOutput, input, gamma, mean, variance, epsilon, out gradGamma, out gradBeta);
+            int spatialSize = input.Length / (batch * channels);
+
+            var varF = DirectGpuEngine.ToFloatArray(variance.GetDataArray());
+            var invVarF = new float[varF.Length];
+            for (int i = 0; i < varF.Length; i++) invVarF[i] = 1f / MathF.Sqrt(varF[i] + (float)epsilon);
+
+            using var gradOutBuffer = GetOrAllocateBuffer(backend, gradOutput);
+            using var inputBuffer = GetOrAllocateBuffer(backend, input);
+            using var gammaBuffer = GetOrAllocateBuffer(backend, gamma);
+            using var saveMeanBuffer = GetOrAllocateBuffer(backend, mean);
+            using var saveInvVarBuffer = GetOrAllocateBuffer(backend, DirectGpuEngine.FromFloatArray<T>(invVarF));
+            using var gradInputBuffer = AllocateOutputBuffer(backend, input.Length);
+            using var gradGammaBuffer = AllocateOutputBuffer(backend, channels);
+            using var gradBetaBuffer = AllocateOutputBuffer(backend, channels);
+
+            backend.InstanceNormBackward(gradOutBuffer.Buffer, inputBuffer.Buffer, gammaBuffer.Buffer,
+                saveMeanBuffer.Buffer, saveInvVarBuffer.Buffer, gradInputBuffer.Buffer, gradGammaBuffer.Buffer, gradBetaBuffer.Buffer,
+                batch, channels, spatialSize, (float)epsilon);
+
+            float[] gradInputFloat = backend.DownloadBuffer(gradInputBuffer.Buffer);
+            float[] gradGammaFloat = backend.DownloadBuffer(gradGammaBuffer.Buffer);
+            float[] gradBetaFloat = backend.DownloadBuffer(gradBetaBuffer.Buffer);
+
+            gradGamma = new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(gradGammaFloat), gamma.Shape.ToArray());
+            gradBeta = new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(gradBetaFloat), gamma.Shape.ToArray());
+            return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(gradInputFloat), input.Shape.ToArray());
+        }
+        catch
+        {
+            return base.InstanceNormBackward(gradOutput, input, gamma, mean, variance, epsilon, out gradGamma, out gradBeta);
+        }
+    }
+
     /// <summary>
     /// GPU-resident batch normalization. Input and output remain on GPU, avoiding CPU round-trips.
     /// </summary>
