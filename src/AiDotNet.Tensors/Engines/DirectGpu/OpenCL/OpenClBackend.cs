@@ -8433,12 +8433,15 @@ KERNEL VARIANTS (A/B testing):
 
         public void Selu(IGpuBuffer A, IGpuBuffer B, float alpha, float scale, int size)
         {
-            var k = _kernelCache["selu_forward"];
+            // #775: the registered kernel is "selu" (was the unregistered "selu_forward" -> silent CPU
+            // fallback). SELU has FIXED constants by definition, and the "selu" kernel hardcodes exactly
+            // the standard scale/alpha every caller passes, so it takes (input, output, size) only — the
+            // alpha/scale params are redundant here and intentionally not forwarded.
+            _ = alpha; _ = scale;
+            var k = _kernelCache["selu"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)B).Buffer.Handle);
-            k.SetArg(arg++, alpha);
-            k.SetArg(arg++, scale);
             k.SetArg(arg++, size);
 
             k.Execute1D(size, Math.Min(256, size));
