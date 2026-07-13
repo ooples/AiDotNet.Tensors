@@ -3182,4 +3182,14 @@ public partial class DirectGpuTensorEngine
         gradWeights = TensorMatMul(TensorTranspose(input), gradOutput);            // inputᵀ @ gradOut
         return TensorMatMul(gradOutput, TensorTranspose(weights));                 // gradOut @ Wᵀ
     }
+
+    // #775: repeat-elements (each element repeated `repeats` times along `axis`) is exactly
+    // repeat-interleave, which is a GPU-resident override — route to it. Defer to base under
+    // tape/GraphMode/out-of-range args.
+    Tensor<T> IEngine.TensorRepeatElements<T>(Tensor<T> tensor, int repeats, int axis)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || repeats < 1 || axis < 0 || axis >= tensor.Rank)
+            return base.TensorRepeatElements(tensor, repeats, axis);
+        return TensorRepeatInterleave(tensor, repeats, axis);
+    }
 }
