@@ -4001,6 +4001,35 @@ public partial class DirectGpuTensorEngine
         catch { return base.TensorReciprocal(tensor); }
     }
 
+    // #775: 3D Gaussian-splat covariance on the new gaussian_covariance kernel. rotations [N,4]
+    // (quaternion w,x,y,z), scales [N,3] -> covariances [N,6] upper triangular of R*S^2*R^T. Gather
+    // over gaussians; mirrors GaussianSplattingOperations. Tape/GraphMode/non-float defer to the base.
+    Tensor<T> IEngine.ComputeGaussianCovariance<T>(Tensor<T> rotations, Tensor<T> scales)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+            || rotations.Rank != 2 || scales.Rank != 2
+            || rotations.Shape._dims[1] != 4 || scales.Shape._dims[1] != 3
+            || rotations.Shape._dims[0] != scales.Shape._dims[0]
+            || !TryGetBackend(out var backend) || backend is not IExtendedConvKernels gpu)
+            return base.ComputeGaussianCovariance(rotations, scales);
+        try
+        {
+            int n = rotations.Shape._dims[0];
+            int outLen = n * 6;
+            using var rotBuf = GetOrAllocateBuffer(backend, rotations);
+            using var scaleBuf = GetOrAllocateBuffer(backend, scales);
+            var outBuf = AllocateOutputBuffer(backend, outLen);
+            try
+            {
+                gpu.GaussianCovariance(rotBuf.Buffer, scaleBuf.Buffer, outBuf.Buffer, n);
+                var arr = FinishGpuOp<T>(backend, outBuf, outLen);
+                return new Tensor<T>(arr, new[] { n, 6 });
+            }
+            catch { outBuf.Dispose(); throw; }
+        }
+        catch { return base.ComputeGaussianCovariance(rotations, scales); }
+    }
+
     // #775: whole-tensor mean (output [1]) via the GPU-resident ReduceMean over all axes.
     Tensor<T> IEngine.TensorMeanDiff<T>(Tensor<T> tensor)
     {

@@ -490,6 +490,49 @@ __kernel void grid_sample_backward_grad_input_deterministic(
     }
     gradInput[((b * channels + c) * inHeight + h_in) * inWidth + w_in] += sum;
 }
+
+// #775: 3D Gaussian-splat covariance. rotations [N,4] quaternion (w,x,y,z), scales [N,3] ->
+// covariances [N,6] upper triangular (c00,c01,c02,c11,c12,c22) of Sigma = R * S^2 * R^T. Gather over
+// gaussians; mirrors GaussianSplattingOperations.ComputeGaussianCovariance exactly.
+__kernel void gaussian_covariance(
+    __global const float* rotations,
+    __global const float* scales,
+    __global float* covariances,
+    const int numGaussians)
+{
+    int i = get_global_id(0);
+    if (i >= numGaussians) return;
+
+    float qw = rotations[i * 4], qx = rotations[i * 4 + 1], qy = rotations[i * 4 + 2], qz = rotations[i * 4 + 3];
+    float qNorm = sqrt(qw * qw + qx * qx + qy * qy + qz * qz);
+    if (qNorm > 0.0f) { float inv = 1.0f / qNorm; qw *= inv; qx *= inv; qy *= inv; qz *= inv; }
+
+    float r00 = 1.0f - 2.0f * (qy * qy + qz * qz);
+    float r01 = 2.0f * (qx * qy - qw * qz);
+    float r02 = 2.0f * (qx * qz + qw * qy);
+    float r10 = 2.0f * (qx * qy + qw * qz);
+    float r11 = 1.0f - 2.0f * (qx * qx + qz * qz);
+    float r12 = 2.0f * (qy * qz - qw * qx);
+    float r20 = 2.0f * (qx * qz - qw * qy);
+    float r21 = 2.0f * (qy * qz + qw * qx);
+    float r22 = 1.0f - 2.0f * (qx * qx + qy * qy);
+
+    float sx = fmax(1e-6f, fabs(scales[i * 3])); float sx2 = sx * sx;
+    float sy = fmax(1e-6f, fabs(scales[i * 3 + 1])); float sy2 = sy * sy;
+    float sz = fmax(1e-6f, fabs(scales[i * 3 + 2])); float sz2 = sz * sz;
+
+    float m00 = r00 * sx2, m01 = r01 * sy2, m02 = r02 * sz2;
+    float m10 = r10 * sx2, m11 = r11 * sy2, m12 = r12 * sz2;
+    float m20 = r20 * sx2, m21 = r21 * sy2, m22 = r22 * sz2;
+
+    int o = i * 6;
+    covariances[o]     = m00 * r00 + m01 * r01 + m02 * r02;
+    covariances[o + 1] = m00 * r10 + m01 * r11 + m02 * r12;
+    covariances[o + 2] = m00 * r20 + m01 * r21 + m02 * r22;
+    covariances[o + 3] = m10 * r10 + m11 * r11 + m12 * r12;
+    covariances[o + 4] = m10 * r20 + m11 * r21 + m12 * r22;
+    covariances[o + 5] = m20 * r20 + m21 * r21 + m22 * r22;
+}
 ";
         }
     }

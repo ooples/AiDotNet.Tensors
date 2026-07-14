@@ -487,7 +487,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 // Compile spatial transformer kernels (TopK, AffineGrid, GridSample)
                 var stProgram = CompileOrLoadCached(SpatialTransformerKernels.GetSource(), optimizationFlags, "Spatial transformer kernels");
                 _programs.Add(stProgram);
-                foreach (var name in new[] { "topk", "affine_grid", "grid_sample", "grid_sample_backward", "grid_sample_backward_grad_grid_deterministic", "grid_sample_backward_grad_input_deterministic" })
+                foreach (var name in new[] { "topk", "affine_grid", "grid_sample", "grid_sample_backward", "grid_sample_backward_grad_grid_deterministic", "grid_sample_backward_grad_input_deterministic", "gaussian_covariance" })
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, stProgram, name);
                 }
@@ -7280,6 +7280,18 @@ KERNEL VARIANTS (A/B testing):
 
             int localX = 16, localY = 16, localZ = 1;
             k.Execute3D(outputWidth, outputHeight, batch, localX, localY, localZ);
+        }
+
+        // #775: 3D Gaussian-splat covariance. rotations [N,4], scales [N,3] -> covariances [N,6].
+        public void GaussianCovariance(IGpuBuffer rotations, IGpuBuffer scales, IGpuBuffer covariances, int numGaussians)
+        {
+            var k = _kernelCache["gaussian_covariance"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)rotations).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)scales).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)covariances).Buffer.Handle);
+            k.SetArg(arg++, numGaussians);
+            k.Execute1D(numGaussians, Math.Min(256, numGaussians));
         }
 
         public void GridSample(IGpuBuffer input, IGpuBuffer grid, IGpuBuffer output,

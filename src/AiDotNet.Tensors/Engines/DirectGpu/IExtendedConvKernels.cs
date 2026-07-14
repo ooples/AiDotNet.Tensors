@@ -85,4 +85,8 @@ internal interface IExtendedConvKernels
     /// <summary>Adaptive max pooling 2D (NCHW) -> [batch, channels, outHeight, outWidth] (#775).</summary>
     void AdaptiveMaxPool2D(IGpuBuffer input, IGpuBuffer output,
         int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth);
+
+    /// <summary>3D Gaussian-splat covariance: rotations [N,4] (quaternion), scales [N,3] -> [N,6] upper
+    /// triangular of R*S^2*R^T (#775).</summary>
+    void GaussianCovariance(IGpuBuffer rotations, IGpuBuffer scales, IGpuBuffer covariances, int numGaussians);
 }
