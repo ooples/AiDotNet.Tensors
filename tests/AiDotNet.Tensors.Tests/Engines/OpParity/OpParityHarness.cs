@@ -25,7 +25,7 @@ namespace AiDotNet.Tensors.Tests.Engines.OpParity;
 public sealed class OpParityFixture : IDisposable
 {
     public CpuEngine Cpu { get; }
-    public DirectGpuTensorEngine? Gpu { get; }
+    public DirectGpuTensorEngine? Gpu { get; private set; }
     public bool GpuReady { get; }
     public Exception? GpuInitError { get; }
 
@@ -50,6 +50,28 @@ public sealed class OpParityFixture : IDisposable
             GpuInitError = ex;
             GpuReady = false;
         }
+    }
+
+    /// <summary>
+    /// #775 driver-reset: disposes the current GPU engine and creates a fresh one, giving a brand-new
+    /// OpenCL context + command queues + compiled kernels. This clears the AMD RX 5500 (RDNA1) driver
+    /// state that accumulates across many kernel dispatches and, past a threshold, corrupts some later
+    /// kernels (FusedConv3D / NativeMagnitudeAndPhase: correct in isolation, wrong only deep into a long
+    /// full-suite run; neither a queue finish nor a queue recycle clears it — only a fresh context does,
+    /// which is why the EARLY OpParityTests copy of an op passes while the LATE generated copy fails).
+    /// The harness calls this every N ops so accumulated dispatches per context stay well under the
+    /// threshold. Safe between ops: each op materializes its result to a host array before returning, so
+    /// no live GPU buffer spans the swap. Program binaries are cached, so recreation is cheap.
+    /// </summary>
+    public void ResetGpuEngine()
+    {
+        if (!GpuReady) return;
+        var old = Gpu;
+        DirectGpuTensorEngine fresh;
+        try { fresh = new DirectGpuTensorEngine(); }
+        catch { return; } // keep the existing engine if a fresh context can't be made
+        Gpu = fresh;
+        old?.Dispose();
     }
 
     /// <summary>Whether GPU parity must run (CI can force it so a missing GPU fails instead of skips).</summary>
@@ -93,6 +115,25 @@ public sealed class OpParityCollection : ICollectionFixture<OpParityFixture> { }
 /// the oracle — recording which engine drifts more (the localization the #775 ViT bug needs).</summary>
 public static class OpParityHarness
 {
+    // #775: the AMD RX 5500 (RDNA1) OpenCL driver accumulates internal state across a large number of
+    // kernel dispatches and, past a threshold, returns subtly wrong results for some later kernels
+    // (FusedConv3D, NativeMagnitudeAndPhase: correct in isolation, wrong only deep into a long full-suite
+    // run). Neither a queue finish nor a queue recycle clears it — only a fresh OpenCL context does. So
+    // every N ops we recreate the GPU engine (fresh context), keeping accumulated dispatches per context
+    // well under the corruption threshold (~one full legacy suite). Program binaries are cached, so the
+    // recreation is cheap. See OpParityFixture.ResetGpuEngine.
+    private static int _opsSinceEngineReset;
+    private const int ResetEngineEveryNOps = 64;
+
+    private static void MaybeResetGpuEngine(OpParityFixture fx)
+    {
+        if (System.Threading.Interlocked.Increment(ref _opsSinceEngineReset) >= ResetEngineEveryNOps)
+        {
+            System.Threading.Interlocked.Exchange(ref _opsSinceEngineReset, 0);
+            fx.ResetGpuEngine();
+        }
+    }
+
     public static void CheckForward(OpCase op, OpParityFixture fx)
     {
         if (!fx.GpuReady)
@@ -111,6 +152,7 @@ public static class OpParityHarness
             return;
         }
 
+        MaybeResetGpuEngine(fx); // may swap fx.Gpu for a fresh engine — fetch AFTER
         var gpu = fx.Gpu!;
 
         float[] cpuF = op.RunFloat(fx.Cpu).ToArray();
@@ -140,6 +182,7 @@ public static class OpParityHarness
             return;
         }
 
+        MaybeResetGpuEngine(fx); // may swap fx.Gpu for a fresh engine — fetch AFTER
         var gpu = fx.Gpu!;
         float[] cpuF = op.RunFloatGrad!(fx.Cpu).ToArray();
         float[] cpuF2 = op.RunFloatGrad!(fx.Cpu).ToArray();
