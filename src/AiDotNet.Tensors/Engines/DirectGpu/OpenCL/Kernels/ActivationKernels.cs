@@ -1028,7 +1028,9 @@ __kernel void selu_backward(
     const float alpha = 1.6732632423543772848170429916717f;
 
     float x = input[idx];
-    float grad = x > 0.0f ? scale : scale * alpha * exp(x);
+    // #775: use >= to match CpuEngine (deriv = x >= 0 ? scale : scale*alpha*exp(x)); differs only at
+    // exactly x==0 but keeps CPU/GPU bit-identical. Constants are hardcoded (kernel takes 4 args, not 6).
+    float grad = x >= 0.0f ? scale : scale * alpha * exp(x);
     gradInput[idx] = gradOutput[idx] * grad;
 }
 
@@ -1119,10 +1121,13 @@ __kernel void threshold_backward(__global const float* gradOutput, __global cons
     gradInput[idx] = input[idx] > thresh ? gradOutput[idx] : 0.0f;
 }
 // Reciprocal backward: -1/x^2
+// #775: `input` here is the reciprocal OUTPUT y=1/x (what IEngine.ReciprocalBackward passes). The
+// derivative d(1/x)/dx = -1/x^2 = -y^2, so grad = -gradOutput * y^2. The old kernel DIVIDED by y^2
+// (-gradOutput / y^2) which is wrong; it was deliberately routed to CpuEngine. Multiply instead.
 __kernel void reciprocal_backward(__global const float* gradOutput, __global const float* input, __global float* gradInput, const int size)
 {
     const int idx = get_global_id(0); if (idx >= size) return;
-    float x = input[idx]; gradInput[idx] = -gradOutput[idx] / (x * x);
+    float y = input[idx]; gradInput[idx] = -gradOutput[idx] * (y * y);
 }
 
 __kernel void var_backward(__global const float* gradOutput, __global const float* input, __global const float* mean, __global float* gradInput, const int outerSize, const int reduceSize)

@@ -17380,13 +17380,29 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> SeluBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
-        // GPU SeluBackward kernel produces values that disagree with the
-        // mathematically-correct CpuEngine formula:
-        //   deriv = x >= 0 ? scale : scale * alpha * exp(x)
-        // Route to CpuEngine until the kernel arg order / formula is
-        // straightened out — gradient correctness wins over a small per-op
-        // speed-up here. Issue surfaced by SELU_Gradient_MatchesNumerical.
-        return base.SeluBackward(gradOutput, input);
+        // #775: the selu_backward kernel/backend arg mismatch is fixed (kernel takes 4 args with
+        // hardcoded SELU consts and uses >= to match CpuEngine deriv = x>=0 ? scale :
+        // scale*alpha*exp(x)). Tape/GraphMode/strided still defer to the base; the alpha/scale args
+        // are ignored by the backend (kernel hardcodes them).
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+            || !gradOutput.IsContiguous || !input.IsContiguous || gradOutput.Length != input.Length
+            || !TryGetBackend(out var backend))
+            return base.SeluBackward(gradOutput, input);
+        try
+        {
+            int size = gradOutput.Length;
+            using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
+            using var iBuf = GetOrAllocateBuffer(backend, input);
+            var outBuf = AllocateOutputBuffer(backend, size);
+            try
+            {
+                backend.SeluBackward(gBuf.Buffer, iBuf.Buffer, outBuf.Buffer, 1.6732632423543772f, 1.0507009873554805f, size);
+                var result = FinishGpuOp<T>(backend, outBuf, size);
+                return new Tensor<T>(result, gradOutput.Shape._dims);
+            }
+            catch { outBuf.Dispose(); throw; }
+        }
+        catch { return base.SeluBackward(gradOutput, input); }
     }
 
     public override Tensor<T> HardsigmoidBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
@@ -17457,14 +17473,28 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> ReciprocalBackward<T>(Tensor<T> gradOutput, Tensor<T> output)
     {
-        // GPU kernel `backend.ReciprocalBackward` was implemented as
-        // `grad * -1 / output^2` (which is `-grad * x^2`) — wrong sign of
-        // exponent. The correct derivative is d(1/x)/dx = -1/x^2 =
-        // -output^2 (since output = 1/x). The CpuEngine.ReciprocalBackward
-        // computes `-grad * output^2` correctly, so route through base
-        // until the GPU kernel is fixed. Hits the tape-active path which
-        // wants the correct gradient anyway.
-        return base.ReciprocalBackward(gradOutput, output);
+        // #775: the reciprocal_backward kernel now computes -gradOutput * output^2 (it previously
+        // DIVIDED by output^2, which was wrong, so this was routed to base). grad = -gradOutput *
+        // output^2 since d(1/x)/dx = -output^2. Tape/GraphMode/strided still defer to the base.
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+            || !gradOutput.IsContiguous || !output.IsContiguous || gradOutput.Length != output.Length
+            || !TryGetBackend(out var backend))
+            return base.ReciprocalBackward(gradOutput, output);
+        try
+        {
+            int size = gradOutput.Length;
+            using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
+            using var oBuf = GetOrAllocateBuffer(backend, output);
+            var outBuf = AllocateOutputBuffer(backend, size);
+            try
+            {
+                backend.ReciprocalBackward(gBuf.Buffer, oBuf.Buffer, outBuf.Buffer, size);
+                var result = FinishGpuOp<T>(backend, outBuf, size);
+                return new Tensor<T>(result, gradOutput.Shape._dims);
+            }
+            catch { outBuf.Dispose(); throw; }
+        }
+        catch { return base.ReciprocalBackward(gradOutput, output); }
     }
 
     public override (Tensor<T> inputGrad, Tensor<T> alphaGrad) PReLUBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> alpha)

@@ -8797,13 +8797,14 @@ KERNEL VARIANTS (A/B testing):
 
         public void SeluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float alpha, float scale, int size)
         {
+            // #775: the selu_backward kernel hardcodes the SELU constants and takes 4 args
+            // (gradOutput, input, gradInput, size) — NOT alpha/scale. Setting those extra args wrote
+            // alpha's bits into `size` and hit an invalid arg index (threw), so this was routed to base.
             var k = _kernelCache["selu_backward"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
-            k.SetArg(arg++, alpha);
-            k.SetArg(arg++, scale);
             k.SetArg(arg++, size);
 
             k.Execute1D(size, Math.Min(256, size));
