@@ -4063,6 +4063,41 @@ public partial class DirectGpuTensorEngine
         catch { return base.EvaluateSphericalHarmonics(shCoefficients, viewDirections, degree); }
     }
 
+    // #775: SH backward w.r.t. coefficients on the spherical_harmonics_backward kernel -> shGrad
+    // [N,basisCount,numChannels]. clamp01 derivative masks the gradient where the pre-clamp color left [0,1].
+    Tensor<T> IEngine.EvaluateSphericalHarmonicsBackward<T>(Tensor<T> shCoefficients, Tensor<T> viewDirections, int degree, Tensor<T> outputGradient)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+            || shCoefficients.Rank != 3 || viewDirections.Rank != 2 || outputGradient.Rank != 2
+            || degree < 0 || degree > 3 || viewDirections.Shape._dims[1] != 3
+            || !TryGetBackend(out var backend) || backend is not IExtendedConvKernels gpu)
+            return base.EvaluateSphericalHarmonicsBackward(shCoefficients, viewDirections, degree, outputGradient);
+        int n = shCoefficients.Shape._dims[0];
+        int basisCount = shCoefficients.Shape._dims[1];
+        int numChannels = shCoefficients.Shape._dims[2];
+        int dirRows = viewDirections.Shape._dims[0];
+        if (basisCount != (degree + 1) * (degree + 1) || (dirRows != n && dirRows != 1)
+            || outputGradient.Shape._dims[0] != n || outputGradient.Shape._dims[1] != numChannels)
+            return base.EvaluateSphericalHarmonicsBackward(shCoefficients, viewDirections, degree, outputGradient);
+        try
+        {
+            int broadcastDir = dirRows == 1 ? 1 : 0;
+            int outLen = n * basisCount * numChannels;
+            using var shBuf = GetOrAllocateBuffer(backend, shCoefficients);
+            using var dirBuf = GetOrAllocateBuffer(backend, viewDirections);
+            using var gradBuf = GetOrAllocateBuffer(backend, outputGradient);
+            var outBuf = AllocateOutputBuffer(backend, outLen);
+            try
+            {
+                gpu.SphericalHarmonicsBackward(shBuf.Buffer, dirBuf.Buffer, gradBuf.Buffer, outBuf.Buffer, n, basisCount, numChannels, degree, broadcastDir);
+                var arr = FinishGpuOp<T>(backend, outBuf, outLen);
+                return new Tensor<T>(arr, new[] { n, basisCount, numChannels });
+            }
+            catch { outBuf.Dispose(); throw; }
+        }
+        catch { return base.EvaluateSphericalHarmonicsBackward(shCoefficients, viewDirections, degree, outputGradient); }
+    }
+
     // #775: whole-tensor mean (output [1]) via the GPU-resident ReduceMean over all axes.
     Tensor<T> IEngine.TensorMeanDiff<T>(Tensor<T> tensor)
     {

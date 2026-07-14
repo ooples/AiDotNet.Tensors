@@ -94,4 +94,9 @@ internal interface IExtendedConvKernels
     /// [N or 1,3] -> colors [N,numChannels] (#775).</summary>
     void SphericalHarmonics(IGpuBuffer shCoefficients, IGpuBuffer viewDirections, IGpuBuffer output,
         int numPoints, int basisCount, int numChannels, int degree, int broadcastDir);
+
+    /// <summary>SH backward w.r.t. coefficients -> shGrad [N,basisCount,numChannels] (#775).</summary>
+    void SphericalHarmonicsBackward(IGpuBuffer shCoefficients, IGpuBuffer viewDirections,
+        IGpuBuffer outputGradient, IGpuBuffer shGrad,
+        int numPoints, int basisCount, int numChannels, int degree, int broadcastDir);
 }

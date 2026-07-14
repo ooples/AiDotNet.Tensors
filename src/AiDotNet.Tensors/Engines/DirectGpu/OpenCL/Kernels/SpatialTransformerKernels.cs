@@ -577,6 +577,53 @@ __kernel void spherical_harmonics(
 
     output[i * numChannels + ch] = fmin(fmax(color, 0.0f), 1.0f);
 }
+
+// #775: SH backward w.r.t. coefficients. shGrad[i,b,ch] = colorGrad*basis_b where colorGrad =
+// outputGradient[i,ch] masked to 0 when the pre-clamp color was outside [0,1] (clamp01 derivative).
+__kernel void spherical_harmonics_backward(
+    __global const float* shCoefficients,
+    __global const float* viewDirections,
+    __global const float* outputGradient,
+    __global float* shGrad,
+    const int numPoints, const int basisCount, const int numChannels, const int degree, const int broadcastDir)
+{
+    int idx = get_global_id(0);
+    if (idx >= numPoints * basisCount * numChannels) return;
+    int ch = idx % numChannels;
+    int b = (idx / numChannels) % basisCount;
+    int i = idx / (basisCount * numChannels);
+
+    int dirIdx = broadcastDir ? 0 : i;
+    float dx = viewDirections[dirIdx * 3], dy = viewDirections[dirIdx * 3 + 1], dz = viewDirections[dirIdx * 3 + 2];
+    float norm = sqrt(dx * dx + dy * dy + dz * dz);
+    if (norm > 0.0f) { float inv = 1.0f / norm; dx *= inv; dy *= inv; dz *= inv; }
+
+    float basis[16];
+    basis[0] = 0.282095f;
+    if (degree >= 1) { basis[1] = 0.488603f * dy; basis[2] = 0.488603f * dz; basis[3] = 0.488603f * dx; }
+    if (degree >= 2) {
+        basis[4] = 1.092548f * dx * dy; basis[5] = 1.092548f * dy * dz;
+        basis[6] = 0.315392f * (3.0f * dz * dz - 1.0f);
+        basis[7] = 1.092548f * dx * dz; basis[8] = 0.546274f * (dx * dx - dy * dy);
+    }
+    if (degree >= 3) {
+        basis[9]  = 0.590044f * dy * (3.0f * dx * dx - dy * dy);
+        basis[10] = 2.890611f * dx * dy * dz;
+        basis[11] = 0.457046f * dy * (5.0f * dz * dz - 1.0f);
+        basis[12] = 0.373176f * dz * (5.0f * dz * dz - 3.0f);
+        basis[13] = 0.457046f * dx * (5.0f * dz * dz - 1.0f);
+        basis[14] = 1.445306f * dz * (dx * dx - dy * dy);
+        basis[15] = 0.590044f * dx * (dx * dx - 3.0f * dy * dy);
+    }
+
+    float preclamp = 0.0f;
+    for (int bb = 0; bb < basisCount; bb++)
+        preclamp += shCoefficients[i * basisCount * numChannels + bb * numChannels + ch] * basis[bb];
+
+    float colorGrad = outputGradient[i * numChannels + ch];
+    if (preclamp < 0.0f || preclamp > 1.0f) colorGrad = 0.0f;
+    shGrad[idx] = colorGrad * basis[b];
+}
 ";
         }
     }

@@ -487,7 +487,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 // Compile spatial transformer kernels (TopK, AffineGrid, GridSample)
                 var stProgram = CompileOrLoadCached(SpatialTransformerKernels.GetSource(), optimizationFlags, "Spatial transformer kernels");
                 _programs.Add(stProgram);
-                foreach (var name in new[] { "topk", "affine_grid", "grid_sample", "grid_sample_backward", "grid_sample_backward_grad_grid_deterministic", "grid_sample_backward_grad_input_deterministic", "gaussian_covariance", "spherical_harmonics" })
+                foreach (var name in new[] { "topk", "affine_grid", "grid_sample", "grid_sample_backward", "grid_sample_backward_grad_grid_deterministic", "grid_sample_backward_grad_input_deterministic", "gaussian_covariance", "spherical_harmonics", "spherical_harmonics_backward" })
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, stProgram, name);
                 }
@@ -7307,6 +7307,23 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, numPoints); k.SetArg(arg++, basisCount); k.SetArg(arg++, numChannels);
             k.SetArg(arg++, degree); k.SetArg(arg++, broadcastDir);
             int total = numPoints * numChannels;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
+        // #775: SH backward w.r.t. coefficients -> shGrad [N, basisCount, numChannels].
+        public void SphericalHarmonicsBackward(IGpuBuffer shCoefficients, IGpuBuffer viewDirections,
+            IGpuBuffer outputGradient, IGpuBuffer shGrad,
+            int numPoints, int basisCount, int numChannels, int degree, int broadcastDir)
+        {
+            var k = _kernelCache["spherical_harmonics_backward"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)shCoefficients).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)viewDirections).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)outputGradient).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)shGrad).Buffer.Handle);
+            k.SetArg(arg++, numPoints); k.SetArg(arg++, basisCount); k.SetArg(arg++, numChannels);
+            k.SetArg(arg++, degree); k.SetArg(arg++, broadcastDir);
+            int total = numPoints * basisCount * numChannels;
             k.Execute1D(total, Math.Min(256, total));
         }
 
