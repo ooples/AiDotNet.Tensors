@@ -8,12 +8,21 @@ public static class LossForwardKernels
     public static string GetSource()
     {
         return @"
+// #775: TensorCrossEntropyLoss takes LOGITS (not probabilities). The old kernel did -sum(t*log(pred)),
+// treating pred as probabilities, which diverged from CpuEngine's softmax cross-entropy. Compute the
+// numerically-stable softmax CE from logits: logSumExp then -sum_c t[c]*(logit[c] - logSumExp), matching
+// CpuEngine.ComputeCrossEntropyBatch (dense targets) bit-for-bit modulo float vs double intermediates.
 __kernel void cross_entropy_loss(__global const float* predictions, __global const float* targets, __global float* loss, int batchSize, int numClasses) {
     int b = get_global_id(0); if (b >= batchSize) return;
+    float maxVal = -INFINITY;
+    for (int c = 0; c < numClasses; c++) { float v = predictions[b * numClasses + c]; if (v > maxVal) maxVal = v; }
+    float sumExp = 0.0f;
+    for (int c = 0; c < numClasses; c++) sumExp += exp(predictions[b * numClasses + c] - maxVal);
+    float logSumExp = maxVal + log(sumExp);
     float sample_loss = 0.0f;
     for (int c = 0; c < numClasses; c++) {
-        float target = targets[b * numClasses + c];
-        if (target > 0.0f) sample_loss -= target * log(fmax(predictions[b * numClasses + c], 1e-7f));
+        float t = targets[b * numClasses + c];
+        if (t > 0.0f) sample_loss -= t * (predictions[b * numClasses + c] - logSumExp);
     }
     loss[b] = sample_loss;
 }

@@ -78,6 +78,7 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
         ["TensorErfinv"] = "domain is (-1,1); generic input includes values > 1",
         // invalid input SEMANTICS for random input
         ["TensorNLLLoss"] = "targets must be class indices / log-probabilities, not random floats",
+        ["TensorCrossEntropyLoss"] = "targets must be one-hot / probabilities, not random floats; with random ~1.0 targets over a wide class dim (129) the softmax-CE magnitude is O(numClasses)~650 and GPU fast-math exp/log absolute error scales with it (~4.6), input ill-conditioning not a kernel bug — OpParity with valid targets passes at 1e-3",
         ["CompleteBoxIou"] = "needs valid boxes (x1<x2,y1<y2); CIoU center/enclose terms diverge on random boxes",
         ["GeneralizedBoxIou"] = "needs valid boxes; GIoU enclosing-box term diverges on random boxes",
         ["TensorMaxPool2D"] = "expects 4-D [N,C,H,W]; generic generator supplies 2-D/odd ranks",

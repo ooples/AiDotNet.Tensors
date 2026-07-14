@@ -19127,10 +19127,28 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorCrossEntropyLoss<T>(Tensor<T> logits, Tensor<T> targets)
     {
-        // GPU `backend.CrossEntropyLoss` and CpuEngine.TensorCrossEntropyLoss
-        // diverge on small batches — route through CpuEngine until the
-        // kernel matches the reference formula bit-for-bit.
-        return base.TensorCrossEntropyLoss(logits, targets);
+        // #775: the cross_entropy_loss kernel now computes numerically-stable softmax cross-entropy
+        // from LOGITS (was -sum(t*log(pred)) treating inputs as probabilities, hence disabled).
+        // backend.CrossEntropyLoss runs the per-batch kernel and returns the batch mean, matching the
+        // CpuEngine contract. Dense targets only (Rank 2); sparse/tape/GraphMode defer to the base.
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+            || logits.Rank != 2 || targets.Rank != 2 || logits.Length != targets.Length
+            || !logits.IsContiguous || !targets.IsContiguous
+            || !TryGetBackend(out var backend))
+            return base.TensorCrossEntropyLoss(logits, targets);
+        try
+        {
+            int batchSize = logits.Shape._dims[0], numClasses = logits.Shape._dims[1];
+            using var bufL = GetOrAllocateBuffer(backend, logits);
+            using var bufT = GetOrAllocateBuffer(backend, targets);
+            float meanLoss = backend.CrossEntropyLoss(bufL.Buffer, bufT.Buffer, batchSize, numClasses);
+            var numOps = MathHelper.GetNumericOperations<T>();
+            return new Tensor<T>(new[] { numOps.FromDouble((double)meanLoss) }, new[] { 1 });
+        }
+        catch (Exception)
+        {
+            return base.TensorCrossEntropyLoss(logits, targets);
+        }
     }
 
     public override Tensor<T> TensorNLLLoss<T>(Tensor<T> logProbs, Tensor<T> targets)
