@@ -3921,6 +3921,40 @@ public partial class DirectGpuTensorEngine
         catch { return base.DiffusionConv(vertexFeatures, laplacian, weights, biases, diffusionTime); }
     }
 
+    // #775: AffineGrid (spatial-transformer sampling grid). theta [batch,2,3] -> grid
+    // [batch,outH,outW,2], grid[b,h,w] = theta[b] @ [xNorm,yNorm,1] with align_corners normalization.
+    // The affine_grid OpenCL kernel + backend method already existed but no engine override wired them,
+    // so it ran on the host. Tape/GraphMode defer to the base so it records AffineGridBackward.
+    Tensor<T> IEngine.AffineGrid<T>(Tensor<T> theta, int outputHeight, int outputWidth)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+            || theta.Rank != 3 || theta.Shape._dims[1] != 2 || theta.Shape._dims[2] != 3
+            || outputHeight <= 0 || outputWidth <= 0
+            || !TryGetBackend(out var backend))
+            return base.AffineGrid(theta, outputHeight, outputWidth);
+        try
+        {
+            int batch = theta.Shape._dims[0];
+            int outLen = batch * outputHeight * outputWidth * 2;
+            using var thetaBuf = GetOrAllocateBuffer(backend, theta);
+            var gridBuf = AllocateOutputBuffer(backend, outLen);
+            try
+            {
+                backend.AffineGrid(thetaBuf.Buffer, gridBuf.Buffer, batch, outputHeight, outputWidth);
+                var arr = FinishGpuOp<T>(backend, gridBuf, outLen);
+                return new Tensor<T>(arr, new[] { batch, outputHeight, outputWidth, 2 });
+            }
+            catch { gridBuf.Dispose(); throw; }
+        }
+        catch { return base.AffineGrid(theta, outputHeight, outputWidth); }
+    }
+
+    // NOTE: PairwiseDistanceSquared was reverted to the CPU base. Its GPU compose (even a single
+    // TensorMultiply) deterministically tripped NativeMagnitudeAndPhase[4,6]'s parity in the full suite:
+    // NativeMagnitudeAndPhase runs EARLIER in the registry, so this is not direct corruption but a
+    // pre-existing GPU-pool/singleton-state fragility in NativeMagnitudeAndPhase's own kernel that the
+    // extra allocations expose. Needs a dedicated audit of that kernel before re-enabling this op.
+
     // #775: whole-tensor mean (output [1]) via the GPU-resident ReduceMean over all axes.
     Tensor<T> IEngine.TensorMeanDiff<T>(Tensor<T> tensor)
     {
