@@ -124,4 +124,12 @@ internal interface IExtendedConvKernels
     /// <summary>ScatterMean backward (gather / count) -> gradSource [srcDimSize, innerSize] (#775).</summary>
     void ScatterMeanBackwardRows(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer counts,
         IGpuBuffer gradSource, int srcDimSize, int innerSize, int outDimSize);
+
+    /// <summary>ScatterMax backward: route each output element's grad to its argmax source row (#775).</summary>
+    void ScatterMaxBackwardRows(IGpuBuffer gradOutput, IGpuBuffer argmax, IGpuBuffer gradSource,
+        int srcDimSize, int innerSize, int outDimSize);
+
+    /// <summary>ScatterSoftmax backward (softmax jacobian within each index-group) (#775).</summary>
+    void ScatterSoftmaxBackwardRows(IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer indices,
+        IGpuBuffer gradSource, int srcDimSize, int innerSize, int numGroups);
 }

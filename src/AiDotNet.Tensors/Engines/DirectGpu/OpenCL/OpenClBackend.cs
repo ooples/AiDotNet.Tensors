@@ -10331,6 +10331,35 @@ KERNEL VARIANTS (A/B testing):
             k.Execute1D(total, Math.Min(256, total));
         }
 
+        // #775: ScatterMax backward (route each output's grad to its argmax source row) -> gradSource.
+        public void ScatterMaxBackwardRows(IGpuBuffer gradOutput, IGpuBuffer argmax, IGpuBuffer gradSource,
+            int srcDimSize, int innerSize, int outDimSize)
+        {
+            var k = _kernelCache["scatter_max_backward_rows"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)argmax).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradSource).Buffer.Handle);
+            k.SetArg(arg++, srcDimSize); k.SetArg(arg++, innerSize); k.SetArg(arg++, outDimSize);
+            int total = srcDimSize * innerSize;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
+        // #775: ScatterSoftmax backward (softmax jacobian per index-group) -> gradSource [source shape].
+        public void ScatterSoftmaxBackwardRows(IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer indices,
+            IGpuBuffer gradSource, int srcDimSize, int innerSize, int numGroups)
+        {
+            var k = _kernelCache["scatter_softmax_backward_rows"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradSource).Buffer.Handle);
+            k.SetArg(arg++, srcDimSize); k.SetArg(arg++, innerSize); k.SetArg(arg++, numGroups);
+            int total = srcDimSize * innerSize;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
         public void ScatterAddBackward(IGpuBuffer gradDestination, IGpuBuffer indices, IGpuBuffer gradSource,
             int numIndices, int featureSize)
         {
