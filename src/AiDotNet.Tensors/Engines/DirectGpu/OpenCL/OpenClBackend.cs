@@ -10288,6 +10288,20 @@ KERNEL VARIANTS (A/B testing):
             k.Execute1D(total, Math.Min(256, total));
         }
 
+        // #775: GNN scatter-softmax (softmax within each index-group); output has the source shape.
+        public void ScatterSoftmaxRows(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output,
+            int srcDimSize, int innerSize, int numGroups)
+        {
+            var k = _kernelCache["scatter_softmax_rows"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)source).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, srcDimSize); k.SetArg(arg++, innerSize); k.SetArg(arg++, numGroups);
+            int total = srcDimSize * innerSize;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
         public void ScatterAddBackward(IGpuBuffer gradDestination, IGpuBuffer indices, IGpuBuffer gradSource,
             int numIndices, int featureSize)
         {

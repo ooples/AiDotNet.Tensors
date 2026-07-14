@@ -112,4 +112,8 @@ internal interface IExtendedConvKernels
     /// <summary>GNN scatter-max along dim 0; empty output rows -> -INFINITY (#775).</summary>
     void ScatterMaxRows(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output,
         int srcDimSize, int innerSize, int outDimSize);
+
+    /// <summary>GNN scatter-softmax (softmax within each index-group); output has the source shape (#775).</summary>
+    void ScatterSoftmaxRows(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output,
+        int srcDimSize, int innerSize, int numGroups);
 }

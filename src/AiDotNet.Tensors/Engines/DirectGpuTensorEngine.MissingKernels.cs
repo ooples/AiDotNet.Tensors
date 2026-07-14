@@ -4178,6 +4178,36 @@ public partial class DirectGpuTensorEngine
         catch { return base.ScatterMax(source, indices, out argmax, dim, outputSize); }
     }
 
+    // #775: GNN scatter-softmax on the scatter_softmax_rows kernel (softmax within each index-group;
+    // output keeps the source shape; invalid group -> 0). Non-dim-0 / tape / GraphMode defer to base.
+    Tensor<T> IEngine.ScatterSoftmax<T>(Tensor<T> source, Tensor<int> indices, int dim, int? outputSize)
+    {
+        int actualDim = dim < 0 ? source.Rank + dim : dim;
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+            || source.Rank < 1 || actualDim != 0 || !outputSize.HasValue || outputSize.Value <= 0
+            || indices.Length < source.Shape._dims[0]
+            || !TryGetBackend(out var backend) || backend is not IExtendedConvKernels gpu)
+            return base.ScatterSoftmax(source, indices, dim, outputSize);
+        try
+        {
+            int srcDimSize = source.Shape._dims[0];
+            int innerSize = source.Length / srcDimSize;
+            int numGroups = outputSize.Value;
+            int outLen = source.Length;
+            using var srcBuf = GetOrAllocateBuffer(backend, source);
+            using var idxBuf = new OwnedBuffer(backend.AllocateIntBuffer(indices.GetDataArray()), ownsBuffer: true);
+            var outBuf = AllocateOutputBuffer(backend, outLen);
+            try
+            {
+                gpu.ScatterSoftmaxRows(srcBuf.Buffer, idxBuf.Buffer, outBuf.Buffer, srcDimSize, innerSize, numGroups);
+                var arr = FinishGpuOp<T>(backend, outBuf, outLen);
+                return new Tensor<T>(arr, source.Shape.ToArray());
+            }
+            catch { outBuf.Dispose(); throw; }
+        }
+        catch { return base.ScatterSoftmax(source, indices, dim, outputSize); }
+    }
+
     // #775: whole-tensor mean (output [1]) via the GPU-resident ReduceMean over all axes.
     Tensor<T> IEngine.TensorMeanDiff<T>(Tensor<T> tensor)
     {

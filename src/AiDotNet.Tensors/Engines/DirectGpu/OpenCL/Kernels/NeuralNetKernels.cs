@@ -1761,6 +1761,31 @@ __kernel void scatter_max_rows(
     }
     output[idx] = mx;
 }
+
+// #775: GNN scatter-softmax = softmax within each index-group. output has the SAME shape as source;
+// for element (d,inner) with group g=indices[d]: exp(source[d,inner]-maxg)/sumg over the group (max
+// for stability). Invalid group (out of [0,numGroups)) -> 0, matching CpuEngine. Gather over source.
+__kernel void scatter_softmax_rows(
+    __global const float* source,
+    __global const int* indices,
+    __global float* output,
+    const int srcDimSize, const int innerSize, const int numGroups)
+{
+    int idx = get_global_id(0);
+    if (idx >= srcDimSize * innerSize) return;
+    int inner = idx % innerSize;
+    int d = idx / innerSize;
+    int g = indices[d];
+    if (g < 0 || g >= numGroups) { output[idx] = 0.0f; return; }
+    float maxg = -INFINITY;
+    for (int dd = 0; dd < srcDimSize; dd++)
+        if (indices[dd] == g) { float v = source[dd * innerSize + inner]; if (v > maxg) maxg = v; }
+    float sumg = 0.0f;
+    for (int dd = 0; dd < srcDimSize; dd++)
+        if (indices[dd] == g) sumg += exp(source[dd * innerSize + inner] - maxg);
+    float e = exp(source[d * innerSize + inner] - maxg);
+    output[idx] = (sumg != 0.0f) ? (e / sumg) : e;
+}
 ";
         }
 
@@ -1792,7 +1817,7 @@ __kernel void scatter_max_rows(
                 "mean_axis", "var_axis", "argmax_axis", "argmin_axis",
                 "dropout_forward", "dropout_backward",
                 "embedding_lookup", "embedding_backward", "embedding_backward_deterministic",
-                "fma_kernel", "gather_kernel", "scatter_add_kernel", "scatter_add_kernel_deterministic", "scatter_add_rows", "scatter_mean_rows", "scatter_max_rows",
+                "fma_kernel", "gather_kernel", "scatter_add_kernel", "scatter_add_kernel_deterministic", "scatter_add_rows", "scatter_mean_rows", "scatter_max_rows", "scatter_softmax_rows",
                 // LSTM kernels
                 "lstm_cell_forward", "lstm_cell_backward", "lstm_gates_precompute",
                 // GRU kernels
