@@ -3880,6 +3880,47 @@ public partial class DirectGpuTensorEngine
         return ((IEngine)this).ReduceSum(outputGradient, new[] { 0 }, false);
     }
 
+    // #775: DiffusionConv = exp(-t*L) @ x @ Wᵀ + b, order-4 Taylor of the matrix exponential
+    // (DiffusionNet, Sharp et al.). The CpuEngine path is a raw sparse-Laplacian + NumOps span loop
+    // reaching no virtual primitive, so it ran entirely on the host. Compose from GPU-resident
+    // primitives: dense MatMul(L, x) equals the CPU's sparse L@x, so
+    //   diffused = x - t*(Lx) + (t²/2)*(L²x) - (t³/6)*(L³x) + (t⁴/24)*(L⁴x);  out = diffused @ Wᵀ + b.
+    // Runs on all 6 backends; Taylor coefficients are formed in double to mirror the CpuEngine order.
+    Tensor<T> IEngine.DiffusionConv<T>(Tensor<T> vertexFeatures, Tensor<T> laplacian,
+        Tensor<T> weights, Tensor<T> biases, T diffusionTime)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+            || vertexFeatures.Rank != 2 || laplacian.Rank != 2 || weights.Rank != 2 || biases.Rank != 1
+            || !TryGetBackend(out _))
+            return base.DiffusionConv(vertexFeatures, laplacian, weights, biases, diffusionTime);
+        try
+        {
+            var e = (IEngine)this;
+            var ops = MathHelper.GetNumericOperations<T>();
+            double td = ops.ToDouble(diffusionTime);
+            T t = ops.FromDouble(td);
+            T t2 = ops.FromDouble(td * td / 2.0);
+            T t3 = ops.FromDouble(td * td * td / 6.0);
+            T t4 = ops.FromDouble(td * td * td * td / 24.0);
+
+            // Lⁿx via repeated dense Laplacian multiply ([V,V] @ [V,ic] = [V,ic]).
+            var lx = e.TensorMatMul(laplacian, vertexFeatures);
+            var l2x = e.TensorMatMul(laplacian, lx);
+            var l3x = e.TensorMatMul(laplacian, l2x);
+            var l4x = e.TensorMatMul(laplacian, l3x);
+
+            var diffused = e.TensorSubtract(vertexFeatures, e.TensorMultiplyScalar(lx, t));
+            diffused = e.TensorAdd(diffused, e.TensorMultiplyScalar(l2x, t2));
+            diffused = e.TensorSubtract(diffused, e.TensorMultiplyScalar(l3x, t3));
+            diffused = e.TensorAdd(diffused, e.TensorMultiplyScalar(l4x, t4));
+
+            // Linear transform: [V,ic] @ [ic,oc] = [V,oc], then broadcast-add bias[oc] over vertices.
+            var dw = e.TensorMatMul(diffused, e.TensorTranspose(weights));
+            return e.TensorBroadcastAdd(dw, biases);
+        }
+        catch { return base.DiffusionConv(vertexFeatures, laplacian, weights, biases, diffusionTime); }
+    }
+
     // #775: whole-tensor mean (output [1]) via the GPU-resident ReduceMean over all axes.
     Tensor<T> IEngine.TensorMeanDiff<T>(Tensor<T> tensor)
     {
