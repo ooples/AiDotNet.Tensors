@@ -1721,6 +1721,26 @@ __kernel void scatter_add_rows(
     }
     output[idx] = sum;
 }
+
+// #775: GNN scatter-mean along dim 0 = scatter-add / per-output-row count. Multiply by 1/count
+// (matching CpuEngine's invDivisor) rather than divide, and leave 0 where the count is 0.
+__kernel void scatter_mean_rows(
+    __global const float* source,
+    __global const int* indices,
+    __global float* output,
+    const int srcDimSize, const int innerSize, const int outDimSize)
+{
+    int idx = get_global_id(0);
+    if (idx >= outDimSize * innerSize) return;
+    int inner = idx % innerSize;
+    int m = idx / innerSize;
+    float sum = 0.0f;
+    int count = 0;
+    for (int d = 0; d < srcDimSize; d++) {
+        if (indices[d] == m) { sum += source[d * innerSize + inner]; count++; }
+    }
+    output[idx] = count > 0 ? sum * (1.0f / (float)count) : 0.0f;
+}
 ";
         }
 
@@ -1752,7 +1772,7 @@ __kernel void scatter_add_rows(
                 "mean_axis", "var_axis", "argmax_axis", "argmin_axis",
                 "dropout_forward", "dropout_backward",
                 "embedding_lookup", "embedding_backward", "embedding_backward_deterministic",
-                "fma_kernel", "gather_kernel", "scatter_add_kernel", "scatter_add_kernel_deterministic", "scatter_add_rows",
+                "fma_kernel", "gather_kernel", "scatter_add_kernel", "scatter_add_kernel_deterministic", "scatter_add_rows", "scatter_mean_rows",
                 // LSTM kernels
                 "lstm_cell_forward", "lstm_cell_backward", "lstm_gates_precompute",
                 // GRU kernels

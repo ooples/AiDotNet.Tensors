@@ -104,4 +104,8 @@ internal interface IExtendedConvKernels
     /// -> output [outDimSize,innerSize] (#775).</summary>
     void ScatterAddRows(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output,
         int srcDimSize, int innerSize, int outDimSize);
+
+    /// <summary>GNN scatter-mean along dim 0 (scatter-add / per-output-row count) (#775).</summary>
+    void ScatterMeanRows(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output,
+        int srcDimSize, int innerSize, int outDimSize);
 }

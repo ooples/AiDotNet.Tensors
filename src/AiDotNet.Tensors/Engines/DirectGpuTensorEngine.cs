@@ -19641,27 +19641,37 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> ScatterMean<T>(Tensor<T> source, Tensor<int> indices, out Tensor<int>? counts, int dim, int? outputSize)
     {
-        if (!TryGetBackend(out var backend) || dim != 0)
+        // #775: gather-form scatter-mean (deterministic, bit-exact with CpuEngine; the old atomic
+        // backend.ScatterMean path fell back). Dim-0 float case with an explicit outputSize and a
+        // long-enough index; else base. counts computed on the host from the first srcDimSize indices.
+        int actualDim = dim < 0 ? source.Rank + dim : dim;
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+            || source.Rank < 1 || actualDim != 0 || !outputSize.HasValue || outputSize.Value <= 0
+            || indices.Length < source.Shape._dims[0]
+            || !TryGetBackend(out var backend) || backend is not IExtendedConvKernels gpu)
             return base.ScatterMean(source, indices, out counts, dim, outputSize);
         try
         {
-            int outSize = outputSize ?? (indices.Length > 0 ? indices.GetDataArray().Max() + 1 : 0);
-            int featureSize = source.Rank >= 2 ? source.Length / source.Shape._dims[0] : 1;
-            int totalOut = outSize * featureSize;
-            using var bufSrc = GetOrAllocateBuffer(backend, source);
-            using var bufIdx = backend.AllocateIntBuffer(indices.GetDataArray());
-            var bufOut = AllocateOutputBuffer(backend, totalOut);
-            var bufCnt = backend.AllocateBuffer(outSize);
-            backend.Fill(bufOut.Buffer, 0f, totalOut);
-            backend.Fill(bufCnt, 0f, outSize);
-            backend.ScatterMean(bufSrc.Buffer, bufIdx, bufOut.Buffer, bufCnt, source.Length, totalOut, featureSize);
-            var result = FinishGpuOp<T>(backend, bufOut, totalOut);
-            var countData = backend.DownloadBuffer(bufCnt);
-            var countInts = new int[outSize];
-            for (int i = 0; i < outSize; i++) countInts[i] = (int)countData[i];
-            counts = new Tensor<int>(countInts, new[] { outSize });
-            int[] outShape = source.Rank >= 2 ? new[] { outSize }.Concat(source.Shape._dims.Skip(1)).ToArray() : new[] { outSize };
-            return new Tensor<T>(result, outShape);
+            int srcDimSize = source.Shape._dims[0];
+            int innerSize = source.Length / srcDimSize;
+            int outDimSize = outputSize.Value;
+            var idxData = indices.GetDataArray();
+            var countArr = new int[outDimSize];
+            for (int d = 0; d < srcDimSize; d++) { int t = idxData[d]; if (t >= 0 && t < outDimSize) countArr[t]++; }
+            int outLen = outDimSize * innerSize;
+            var outShape = source.Shape.ToArray();
+            outShape[0] = outDimSize;
+            using var srcBuf = GetOrAllocateBuffer(backend, source);
+            using var idxBuf = new OwnedBuffer(backend.AllocateIntBuffer(idxData), ownsBuffer: true);
+            var outBuf = AllocateOutputBuffer(backend, outLen);
+            try
+            {
+                gpu.ScatterMeanRows(srcBuf.Buffer, idxBuf.Buffer, outBuf.Buffer, srcDimSize, innerSize, outDimSize);
+                var arr = FinishGpuOp<T>(backend, outBuf, outLen);
+                counts = new Tensor<int>(countArr, new[] { outDimSize });
+                return new Tensor<T>(arr, outShape);
+            }
+            catch { outBuf.Dispose(); throw; }
         }
         catch { return base.ScatterMean(source, indices, out counts, dim, outputSize); }
     }
