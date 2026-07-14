@@ -1700,6 +1700,27 @@ __kernel void adaptive_avgpool_backward(
 
     gradInput[idx] = sum;
 }
+
+// #775: GNN scatter-add (index_add) along dim 0. output[m, inner] = sum over source rows d whose
+// index == m of source[d, inner]. GATHER over the output (no atomics); ascending d matches the
+// CpuEngine accumulation order bit-for-bit. Uses the first srcDimSize flattened index values
+// (indices[d]), mirroring CpuEngine.ScatterAdd's indicesData[d].
+__kernel void scatter_add_rows(
+    __global const float* source,   // [srcDimSize, innerSize]
+    __global const int* indices,    // first srcDimSize values are the per-row targets
+    __global float* output,         // [outDimSize, innerSize]
+    const int srcDimSize, const int innerSize, const int outDimSize)
+{
+    int idx = get_global_id(0);
+    if (idx >= outDimSize * innerSize) return;
+    int inner = idx % innerSize;
+    int m = idx / innerSize;
+    float sum = 0.0f;
+    for (int d = 0; d < srcDimSize; d++) {
+        if (indices[d] == m) sum += source[d * innerSize + inner];
+    }
+    output[idx] = sum;
+}
 ";
         }
 
@@ -1731,7 +1752,7 @@ __kernel void adaptive_avgpool_backward(
                 "mean_axis", "var_axis", "argmax_axis", "argmin_axis",
                 "dropout_forward", "dropout_backward",
                 "embedding_lookup", "embedding_backward", "embedding_backward_deterministic",
-                "fma_kernel", "gather_kernel", "scatter_add_kernel", "scatter_add_kernel_deterministic",
+                "fma_kernel", "gather_kernel", "scatter_add_kernel", "scatter_add_kernel_deterministic", "scatter_add_rows",
                 // LSTM kernels
                 "lstm_cell_forward", "lstm_cell_backward", "lstm_gates_precompute",
                 // GRU kernels

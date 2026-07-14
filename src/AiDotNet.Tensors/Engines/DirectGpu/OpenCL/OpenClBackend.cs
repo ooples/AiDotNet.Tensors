@@ -10246,6 +10246,20 @@ KERNEL VARIANTS (A/B testing):
             k.Execute1D(sourceSize, Math.Min(256, sourceSize));
         }
 
+        // #775: GNN scatter-add (index_add) along dim 0 -> [outDimSize, innerSize]. Gather over output.
+        public void ScatterAddRows(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output,
+            int srcDimSize, int innerSize, int outDimSize)
+        {
+            var k = _kernelCache["scatter_add_rows"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)source).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, srcDimSize); k.SetArg(arg++, innerSize); k.SetArg(arg++, outDimSize);
+            int total = outDimSize * innerSize;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
         public void ScatterAddBackward(IGpuBuffer gradDestination, IGpuBuffer indices, IGpuBuffer gradSource,
             int numIndices, int featureSize)
         {

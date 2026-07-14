@@ -99,4 +99,9 @@ internal interface IExtendedConvKernels
     void SphericalHarmonicsBackward(IGpuBuffer shCoefficients, IGpuBuffer viewDirections,
         IGpuBuffer outputGradient, IGpuBuffer shGrad,
         int numPoints, int basisCount, int numChannels, int degree, int broadcastDir);
+
+    /// <summary>GNN scatter-add (index_add) along dim 0: source [srcDimSize,innerSize] + per-row indices
+    /// -> output [outDimSize,innerSize] (#775).</summary>
+    void ScatterAddRows(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output,
+        int srcDimSize, int innerSize, int outDimSize);
 }
