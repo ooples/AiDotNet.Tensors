@@ -3955,6 +3955,37 @@ public partial class DirectGpuTensorEngine
     // pre-existing GPU-pool/singleton-state fragility in NativeMagnitudeAndPhase's own kernel that the
     // extra allocations expose. Needs a dedicated audit of that kernel before re-enabling this op.
 
+    // #775: TensorCosh on the existing backend.Cosh (cosh_vector) unary kernel — kernel existed but no
+    // engine override called it. Tape/GraphMode/strided defer to the base.
+    Tensor<T> IEngine.TensorCosh<T>(Tensor<T> tensor)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || !tensor.IsContiguous)
+            return base.TensorCosh(tensor);
+        try
+        {
+            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Cosh(input, output, size));
+            if (result != null)
+                return new Tensor<T>(result, tensor.Shape._dims);
+            return base.TensorCosh(tensor);
+        }
+        catch { return base.TensorCosh(tensor); }
+    }
+
+    // #775: TensorSinh on the existing backend.Sinh (sinh_vector) unary kernel — same as TensorCosh.
+    Tensor<T> IEngine.TensorSinh<T>(Tensor<T> tensor)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || !tensor.IsContiguous)
+            return base.TensorSinh(tensor);
+        try
+        {
+            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Sinh(input, output, size));
+            if (result != null)
+                return new Tensor<T>(result, tensor.Shape._dims);
+            return base.TensorSinh(tensor);
+        }
+        catch { return base.TensorSinh(tensor); }
+    }
+
     // #775: whole-tensor mean (output [1]) via the GPU-resident ReduceMean over all axes.
     Tensor<T> IEngine.TensorMeanDiff<T>(Tensor<T> tensor)
     {
