@@ -3986,6 +3986,21 @@ public partial class DirectGpuTensorEngine
         catch { return base.TensorSinh(tensor); }
     }
 
+    // #775: TensorReciprocal on the existing backend.Reciprocal (reciprocal_vector = 1/x) unary kernel.
+    Tensor<T> IEngine.TensorReciprocal<T>(Tensor<T> tensor)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || !tensor.IsContiguous)
+            return base.TensorReciprocal(tensor);
+        try
+        {
+            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Reciprocal(input, output, size));
+            if (result != null)
+                return new Tensor<T>(result, tensor.Shape._dims);
+            return base.TensorReciprocal(tensor);
+        }
+        catch { return base.TensorReciprocal(tensor); }
+    }
+
     // #775: whole-tensor mean (output [1]) via the GPU-resident ReduceMean over all axes.
     Tensor<T> IEngine.TensorMeanDiff<T>(Tensor<T> tensor)
     {
