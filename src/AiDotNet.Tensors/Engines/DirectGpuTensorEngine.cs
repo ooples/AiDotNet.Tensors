@@ -20292,6 +20292,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var result = FinishGpuOp<T>(backend, bufOut, batch * channels);
                 return new Tensor<T>(result, new[] { batch, channels, 1, 1 });
             }
+            // #775: general adaptive max pool via the adaptive_max_pool2d kernel (each output bin maxes
+            // over [oh*inH/outH..(oh+1)*inH/outH) x analogous W). Tape/GraphMode defer to the base so it
+            // records the argmax for the backward pass.
+            if (typeof(T) == typeof(float) && outH > 0 && outW > 0
+                && !IsTapeActive<T>() && !Compilation.GraphMode.IsActive
+                && backend is IExtendedConvKernels gpu)
+            {
+                int outLen = batch * channels * outH * outW;
+                using var bufIn2 = GetOrAllocateBuffer(backend, input);
+                var bufOut2 = AllocateOutputBuffer(backend, outLen);
+                try
+                {
+                    gpu.AdaptiveMaxPool2D(bufIn2.Buffer, bufOut2.Buffer, batch, channels, inH, inW, outH, outW);
+                    var result = FinishGpuOp<T>(backend, bufOut2, outLen);
+                    return new Tensor<T>(result, new[] { batch, channels, outH, outW });
+                }
+                catch { bufOut2.Dispose(); throw; }
+            }
             return base.TensorAdaptiveMaxPool2D(input, outputSize);
         }
         catch (Exception)

@@ -81,4 +81,8 @@ internal interface IExtendedConvKernels
     /// <summary>SpiralConv backward w.r.t. weights -> [outC, inC*spiralLength] (#775).</summary>
     void SpiralConvBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer vertexFeatures, IGpuBuffer spiralIndices,
         IGpuBuffer gradWeights, int v, int inC, int spiralLength, int outC);
+
+    /// <summary>Adaptive max pooling 2D (NCHW) -> [batch, channels, outHeight, outWidth] (#775).</summary>
+    void AdaptiveMaxPool2D(IGpuBuffer input, IGpuBuffer output,
+        int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth);
 }

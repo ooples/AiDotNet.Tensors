@@ -6875,6 +6875,24 @@ KERNEL VARIANTS (A/B testing):
             k.Execute3D(outWidth, outHeight, batch * channels, localX, localY, localZ);
         }
 
+        // #775: adaptive max pooling 2D on the adaptive_max_pool2d kernel (same 3D dispatch as avg).
+        public void AdaptiveMaxPool2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
+        {
+            var k = _kernelCache["adaptive_max_pool2d"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, batch);
+            k.SetArg(arg++, channels);
+            k.SetArg(arg++, inHeight);
+            k.SetArg(arg++, inWidth);
+            k.SetArg(arg++, outHeight);
+            k.SetArg(arg++, outWidth);
+
+            int localX = 8, localY = 8, localZ = 1;
+            k.Execute3D(outWidth, outHeight, batch * channels, localX, localY, localZ);
+        }
+
         public void MaxPool3D(IGpuBuffer input, IGpuBuffer output, IGpuBuffer? indices,
             int batch, int channels,
             int inDepth, int inHeight, int inWidth,
