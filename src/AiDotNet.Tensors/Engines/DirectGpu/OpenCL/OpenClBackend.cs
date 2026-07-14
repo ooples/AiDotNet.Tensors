@@ -487,7 +487,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 // Compile spatial transformer kernels (TopK, AffineGrid, GridSample)
                 var stProgram = CompileOrLoadCached(SpatialTransformerKernels.GetSource(), optimizationFlags, "Spatial transformer kernels");
                 _programs.Add(stProgram);
-                foreach (var name in new[] { "topk", "affine_grid", "grid_sample", "grid_sample_backward", "grid_sample_backward_grad_grid_deterministic", "grid_sample_backward_grad_input_deterministic", "gaussian_covariance" })
+                foreach (var name in new[] { "topk", "affine_grid", "grid_sample", "grid_sample_backward", "grid_sample_backward_grad_grid_deterministic", "grid_sample_backward_grad_input_deterministic", "gaussian_covariance", "spherical_harmonics" })
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, stProgram, name);
                 }
@@ -7292,6 +7292,22 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)covariances).Buffer.Handle);
             k.SetArg(arg++, numGaussians);
             k.Execute1D(numGaussians, Math.Min(256, numGaussians));
+        }
+
+        // #775: spherical-harmonics color eval. shCoefficients [N,basisCount,numChannels], viewDirections
+        // [N or 1,3] -> colors [N,numChannels].
+        public void SphericalHarmonics(IGpuBuffer shCoefficients, IGpuBuffer viewDirections, IGpuBuffer output,
+            int numPoints, int basisCount, int numChannels, int degree, int broadcastDir)
+        {
+            var k = _kernelCache["spherical_harmonics"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)shCoefficients).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)viewDirections).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, numPoints); k.SetArg(arg++, basisCount); k.SetArg(arg++, numChannels);
+            k.SetArg(arg++, degree); k.SetArg(arg++, broadcastDir);
+            int total = numPoints * numChannels;
+            k.Execute1D(total, Math.Min(256, total));
         }
 
         public void GridSample(IGpuBuffer input, IGpuBuffer grid, IGpuBuffer output,

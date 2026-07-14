@@ -4030,6 +4030,39 @@ public partial class DirectGpuTensorEngine
         catch { return base.ComputeGaussianCovariance(rotations, scales); }
     }
 
+    // #775: spherical-harmonics color eval on the new spherical_harmonics kernel. shCoefficients
+    // [N,basisCount,numChannels], viewDirections [N or 1,3] -> [N,numChannels]. Gather over N*channels.
+    Tensor<T> IEngine.EvaluateSphericalHarmonics<T>(Tensor<T> shCoefficients, Tensor<T> viewDirections, int degree)
+    {
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+            || shCoefficients.Rank != 3 || viewDirections.Rank != 2 || degree < 0 || degree > 3
+            || viewDirections.Shape._dims[1] != 3
+            || !TryGetBackend(out var backend) || backend is not IExtendedConvKernels gpu)
+            return base.EvaluateSphericalHarmonics(shCoefficients, viewDirections, degree);
+        int n = shCoefficients.Shape._dims[0];
+        int basisCount = shCoefficients.Shape._dims[1];
+        int numChannels = shCoefficients.Shape._dims[2];
+        int dirRows = viewDirections.Shape._dims[0];
+        if (basisCount != (degree + 1) * (degree + 1) || (dirRows != n && dirRows != 1))
+            return base.EvaluateSphericalHarmonics(shCoefficients, viewDirections, degree);
+        try
+        {
+            int broadcastDir = dirRows == 1 ? 1 : 0;
+            int outLen = n * numChannels;
+            using var shBuf = GetOrAllocateBuffer(backend, shCoefficients);
+            using var dirBuf = GetOrAllocateBuffer(backend, viewDirections);
+            var outBuf = AllocateOutputBuffer(backend, outLen);
+            try
+            {
+                gpu.SphericalHarmonics(shBuf.Buffer, dirBuf.Buffer, outBuf.Buffer, n, basisCount, numChannels, degree, broadcastDir);
+                var arr = FinishGpuOp<T>(backend, outBuf, outLen);
+                return new Tensor<T>(arr, new[] { n, numChannels });
+            }
+            catch { outBuf.Dispose(); throw; }
+        }
+        catch { return base.EvaluateSphericalHarmonics(shCoefficients, viewDirections, degree); }
+    }
+
     // #775: whole-tensor mean (output [1]) via the GPU-resident ReduceMean over all axes.
     Tensor<T> IEngine.TensorMeanDiff<T>(Tensor<T> tensor)
     {

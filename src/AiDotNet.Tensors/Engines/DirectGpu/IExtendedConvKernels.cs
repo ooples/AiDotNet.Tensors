@@ -89,4 +89,9 @@ internal interface IExtendedConvKernels
     /// <summary>3D Gaussian-splat covariance: rotations [N,4] (quaternion), scales [N,3] -> [N,6] upper
     /// triangular of R*S^2*R^T (#775).</summary>
     void GaussianCovariance(IGpuBuffer rotations, IGpuBuffer scales, IGpuBuffer covariances, int numGaussians);
+
+    /// <summary>Spherical-harmonics color eval: shCoefficients [N,basisCount,numChannels], viewDirections
+    /// [N or 1,3] -> colors [N,numChannels] (#775).</summary>
+    void SphericalHarmonics(IGpuBuffer shCoefficients, IGpuBuffer viewDirections, IGpuBuffer output,
+        int numPoints, int basisCount, int numChannels, int degree, int broadcastDir);
 }
