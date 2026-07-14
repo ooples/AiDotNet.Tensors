@@ -4131,6 +4131,53 @@ public partial class DirectGpuTensorEngine
         catch { return base.ScatterAdd(source, indices, dim, outputSize); }
     }
 
+    // #775: GNN scatter-max along dim 0 on the scatter_max_rows kernel (empty groups -> -INFINITY,
+    // matching CpuEngine). The GPU produces the max; argmax is recovered on the host as the first
+    // source row d (ascending) whose index == m and whose value equals the (exact, selection-only) max
+    // -- identical to CpuEngine's strict-> first-on-ties. Non-dim-0 / tape / GraphMode defer to base.
+    Tensor<T> IEngine.ScatterMax<T>(Tensor<T> source, Tensor<int> indices, out Tensor<int>? argmax, int dim, int? outputSize)
+    {
+        int actualDim = dim < 0 ? source.Rank + dim : dim;
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+            || source.Rank < 1 || actualDim != 0 || !outputSize.HasValue || outputSize.Value <= 0
+            || indices.Length < source.Shape._dims[0]
+            || !TryGetBackend(out var backend) || backend is not IExtendedConvKernels gpu)
+            return base.ScatterMax(source, indices, out argmax, dim, outputSize);
+        try
+        {
+            int srcDimSize = source.Shape._dims[0];
+            int innerSize = source.Length / srcDimSize;
+            int outDimSize = outputSize.Value;
+            int outLen = outDimSize * innerSize;
+            var idxData = indices.GetDataArray();
+            var srcData = source.GetDataArray();
+            var outShape = source.Shape.ToArray();
+            outShape[0] = outDimSize;
+            using var srcBuf = GetOrAllocateBuffer(backend, source);
+            using var idxBuf = new OwnedBuffer(backend.AllocateIntBuffer(idxData), ownsBuffer: true);
+            var outBuf = AllocateOutputBuffer(backend, outLen);
+            try
+            {
+                gpu.ScatterMaxRows(srcBuf.Buffer, idxBuf.Buffer, outBuf.Buffer, srcDimSize, innerSize, outDimSize);
+                var arr = FinishGpuOp<T>(backend, outBuf, outLen);
+                var maxF = (float[])(object)arr;
+                var srcF = (float[])(object)srcData;
+                var argmaxArr = new int[outLen];
+                for (int m = 0; m < outDimSize; m++)
+                    for (int inner = 0; inner < innerSize; inner++)
+                    {
+                        int oi = m * innerSize + inner;
+                        for (int d = 0; d < srcDimSize; d++)
+                            if (idxData[d] == m && srcF[d * innerSize + inner] == maxF[oi]) { argmaxArr[oi] = d; break; }
+                    }
+                argmax = new Tensor<int>(argmaxArr, outShape);
+                return new Tensor<T>(arr, outShape);
+            }
+            catch { outBuf.Dispose(); throw; }
+        }
+        catch { return base.ScatterMax(source, indices, out argmax, dim, outputSize); }
+    }
+
     // #775: whole-tensor mean (output [1]) via the GPU-resident ReduceMean over all axes.
     Tensor<T> IEngine.TensorMeanDiff<T>(Tensor<T> tensor)
     {

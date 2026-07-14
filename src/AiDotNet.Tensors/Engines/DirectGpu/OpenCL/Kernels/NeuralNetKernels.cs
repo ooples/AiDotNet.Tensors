@@ -1741,6 +1741,26 @@ __kernel void scatter_mean_rows(
     }
     output[idx] = count > 0 ? sum * (1.0f / (float)count) : 0.0f;
 }
+
+// #775: GNN scatter-max along dim 0. output[m,inner] = max over source rows d whose index == m of
+// source[d,inner]; empty groups stay -INFINITY (matching CpuEngine's negInf init). Strict > in
+// ascending d = first-row-on-ties, so the host argmax re-scan matches. Only the max is produced here.
+__kernel void scatter_max_rows(
+    __global const float* source,
+    __global const int* indices,
+    __global float* output,
+    const int srcDimSize, const int innerSize, const int outDimSize)
+{
+    int idx = get_global_id(0);
+    if (idx >= outDimSize * innerSize) return;
+    int inner = idx % innerSize;
+    int m = idx / innerSize;
+    float mx = -INFINITY;
+    for (int d = 0; d < srcDimSize; d++) {
+        if (indices[d] == m) { float v = source[d * innerSize + inner]; if (v > mx) mx = v; }
+    }
+    output[idx] = mx;
+}
 ";
         }
 
@@ -1772,7 +1792,7 @@ __kernel void scatter_mean_rows(
                 "mean_axis", "var_axis", "argmax_axis", "argmin_axis",
                 "dropout_forward", "dropout_backward",
                 "embedding_lookup", "embedding_backward", "embedding_backward_deterministic",
-                "fma_kernel", "gather_kernel", "scatter_add_kernel", "scatter_add_kernel_deterministic", "scatter_add_rows", "scatter_mean_rows",
+                "fma_kernel", "gather_kernel", "scatter_add_kernel", "scatter_add_kernel_deterministic", "scatter_add_rows", "scatter_mean_rows", "scatter_max_rows",
                 // LSTM kernels
                 "lstm_cell_forward", "lstm_cell_backward", "lstm_gates_precompute",
                 // GRU kernels
