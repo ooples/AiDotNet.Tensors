@@ -4208,6 +4208,67 @@ public partial class DirectGpuTensorEngine
         catch { return base.ScatterSoftmax(source, indices, dim, outputSize); }
     }
 
+    // #775: ScatterAdd backward = gather on the scatter_add_backward_rows kernel. Dim-0 float; else base.
+    Tensor<T> IEngine.ScatterAddBackward<T>(Tensor<T> gradOutput, Tensor<int> indices, int[] sourceShape, int dim)
+    {
+        int actualDim = dim < 0 ? sourceShape.Length + dim : dim;
+        int srcDimSize = sourceShape.Length > 0 ? sourceShape[0] : 0;
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+            || sourceShape.Length < 1 || actualDim != 0 || gradOutput.Rank < 1 || srcDimSize <= 0
+            || indices.Length < srcDimSize
+            || !TryGetBackend(out var backend) || backend is not IExtendedConvKernels gpu)
+            return base.ScatterAddBackward(gradOutput, indices, sourceShape, dim);
+        try
+        {
+            int srcLen = 1; for (int i = 0; i < sourceShape.Length; i++) srcLen *= sourceShape[i];
+            int innerSize = srcLen / srcDimSize;
+            int outDimSize = gradOutput.Shape._dims[0];
+            using var goBuf = GetOrAllocateBuffer(backend, gradOutput);
+            using var idxBuf = new OwnedBuffer(backend.AllocateIntBuffer(indices.GetDataArray()), ownsBuffer: true);
+            var outBuf = AllocateOutputBuffer(backend, srcLen);
+            try
+            {
+                gpu.ScatterAddBackwardRows(goBuf.Buffer, idxBuf.Buffer, outBuf.Buffer, srcDimSize, innerSize, outDimSize);
+                var arr = FinishGpuOp<T>(backend, outBuf, srcLen);
+                return new Tensor<T>(arr, (int[])sourceShape.Clone());
+            }
+            catch { outBuf.Dispose(); throw; }
+        }
+        catch { return base.ScatterAddBackward(gradOutput, indices, sourceShape, dim); }
+    }
+
+    // #775: ScatterMean backward = gather / count on the scatter_mean_backward_rows kernel.
+    Tensor<T> IEngine.ScatterMeanBackward<T>(Tensor<T> gradOutput, Tensor<int> indices, Tensor<int> counts, int[] sourceShape, int dim)
+    {
+        int actualDim = dim < 0 ? sourceShape.Length + dim : dim;
+        int srcDimSize = sourceShape.Length > 0 ? sourceShape[0] : 0;
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+            || sourceShape.Length < 1 || actualDim != 0 || gradOutput.Rank < 1 || srcDimSize <= 0
+            || indices.Length < srcDimSize
+            || !TryGetBackend(out var backend) || backend is not IExtendedConvKernels gpu)
+            return base.ScatterMeanBackward(gradOutput, indices, counts, sourceShape, dim);
+        try
+        {
+            int srcLen = 1; for (int i = 0; i < sourceShape.Length; i++) srcLen *= sourceShape[i];
+            int innerSize = srcLen / srcDimSize;
+            int outDimSize = gradOutput.Shape._dims[0];
+            if (counts.Length < outDimSize)
+                return base.ScatterMeanBackward(gradOutput, indices, counts, sourceShape, dim);
+            using var goBuf = GetOrAllocateBuffer(backend, gradOutput);
+            using var idxBuf = new OwnedBuffer(backend.AllocateIntBuffer(indices.GetDataArray()), ownsBuffer: true);
+            using var cntBuf = new OwnedBuffer(backend.AllocateIntBuffer(counts.GetDataArray()), ownsBuffer: true);
+            var outBuf = AllocateOutputBuffer(backend, srcLen);
+            try
+            {
+                gpu.ScatterMeanBackwardRows(goBuf.Buffer, idxBuf.Buffer, cntBuf.Buffer, outBuf.Buffer, srcDimSize, innerSize, outDimSize);
+                var arr = FinishGpuOp<T>(backend, outBuf, srcLen);
+                return new Tensor<T>(arr, (int[])sourceShape.Clone());
+            }
+            catch { outBuf.Dispose(); throw; }
+        }
+        catch { return base.ScatterMeanBackward(gradOutput, indices, counts, sourceShape, dim); }
+    }
+
     // #775: whole-tensor mean (output [1]) via the GPU-resident ReduceMean over all axes.
     Tensor<T> IEngine.TensorMeanDiff<T>(Tensor<T> tensor)
     {

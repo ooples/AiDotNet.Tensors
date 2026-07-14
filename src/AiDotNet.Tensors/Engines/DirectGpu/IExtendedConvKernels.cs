@@ -116,4 +116,12 @@ internal interface IExtendedConvKernels
     /// <summary>GNN scatter-softmax (softmax within each index-group); output has the source shape (#775).</summary>
     void ScatterSoftmaxRows(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output,
         int srcDimSize, int innerSize, int numGroups);
+
+    /// <summary>ScatterAdd backward (gather) -> gradSource [srcDimSize, innerSize] (#775).</summary>
+    void ScatterAddBackwardRows(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradSource,
+        int srcDimSize, int innerSize, int outDimSize);
+
+    /// <summary>ScatterMean backward (gather / count) -> gradSource [srcDimSize, innerSize] (#775).</summary>
+    void ScatterMeanBackwardRows(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer counts,
+        IGpuBuffer gradSource, int srcDimSize, int innerSize, int outDimSize);
 }

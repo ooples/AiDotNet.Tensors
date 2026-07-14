@@ -1786,6 +1786,42 @@ __kernel void scatter_softmax_rows(
     float e = exp(source[d * innerSize + inner] - maxg);
     output[idx] = (sumg != 0.0f) ? (e / sumg) : e;
 }
+
+// #775: ScatterAdd backward = gather. gradSource[d,inner] = gradOutput[index[d],inner], or 0 when the
+// index is out of range (matching CpuEngine).
+__kernel void scatter_add_backward_rows(
+    __global const float* gradOutput,
+    __global const int* indices,
+    __global float* gradSource,
+    const int srcDimSize, const int innerSize, const int outDimSize)
+{
+    int idx = get_global_id(0);
+    if (idx >= srcDimSize * innerSize) return;
+    int inner = idx % innerSize;
+    int d = idx / innerSize;
+    int g = indices[d];
+    gradSource[idx] = (g >= 0 && g < outDimSize) ? gradOutput[g * innerSize + inner] : 0.0f;
+}
+
+// #775: ScatterMean backward = gather / count. gradSource[d,inner] = gradOutput[index[d],inner] /
+// max(count[index[d]], 1) (CpuEngine divides by 1 when the count is 0). Out-of-range index -> 0.
+__kernel void scatter_mean_backward_rows(
+    __global const float* gradOutput,
+    __global const int* indices,
+    __global const int* counts,
+    __global float* gradSource,
+    const int srcDimSize, const int innerSize, const int outDimSize)
+{
+    int idx = get_global_id(0);
+    if (idx >= srcDimSize * innerSize) return;
+    int inner = idx % innerSize;
+    int d = idx / innerSize;
+    int g = indices[d];
+    if (g < 0 || g >= outDimSize) { gradSource[idx] = 0.0f; return; }
+    int cnt = counts[g];
+    float divisor = cnt > 0 ? (float)cnt : 1.0f;
+    gradSource[idx] = gradOutput[g * innerSize + inner] / divisor;
+}
 ";
         }
 
@@ -1817,7 +1853,7 @@ __kernel void scatter_softmax_rows(
                 "mean_axis", "var_axis", "argmax_axis", "argmin_axis",
                 "dropout_forward", "dropout_backward",
                 "embedding_lookup", "embedding_backward", "embedding_backward_deterministic",
-                "fma_kernel", "gather_kernel", "scatter_add_kernel", "scatter_add_kernel_deterministic", "scatter_add_rows", "scatter_mean_rows", "scatter_max_rows", "scatter_softmax_rows",
+                "fma_kernel", "gather_kernel", "scatter_add_kernel", "scatter_add_kernel_deterministic", "scatter_add_rows", "scatter_mean_rows", "scatter_max_rows", "scatter_softmax_rows", "scatter_add_backward_rows", "scatter_mean_backward_rows",
                 // LSTM kernels
                 "lstm_cell_forward", "lstm_cell_backward", "lstm_gates_precompute",
                 // GRU kernels

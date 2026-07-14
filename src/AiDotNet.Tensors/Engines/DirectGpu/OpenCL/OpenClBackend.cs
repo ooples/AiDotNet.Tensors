@@ -10302,6 +10302,35 @@ KERNEL VARIANTS (A/B testing):
             k.Execute1D(total, Math.Min(256, total));
         }
 
+        // #775: ScatterAdd backward (gather) -> gradSource [srcDimSize, innerSize].
+        public void ScatterAddBackwardRows(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradSource,
+            int srcDimSize, int innerSize, int outDimSize)
+        {
+            var k = _kernelCache["scatter_add_backward_rows"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradSource).Buffer.Handle);
+            k.SetArg(arg++, srcDimSize); k.SetArg(arg++, innerSize); k.SetArg(arg++, outDimSize);
+            int total = srcDimSize * innerSize;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
+        // #775: ScatterMean backward (gather / count) -> gradSource [srcDimSize, innerSize].
+        public void ScatterMeanBackwardRows(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer counts,
+            IGpuBuffer gradSource, int srcDimSize, int innerSize, int outDimSize)
+        {
+            var k = _kernelCache["scatter_mean_backward_rows"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)counts).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradSource).Buffer.Handle);
+            k.SetArg(arg++, srcDimSize); k.SetArg(arg++, innerSize); k.SetArg(arg++, outDimSize);
+            int total = srcDimSize * innerSize;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
         public void ScatterAddBackward(IGpuBuffer gradDestination, IGpuBuffer indices, IGpuBuffer gradSource,
             int numIndices, int featureSize)
         {
