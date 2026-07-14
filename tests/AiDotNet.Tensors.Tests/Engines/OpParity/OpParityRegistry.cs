@@ -998,7 +998,7 @@ public static class OpParityRegistry
             e => e.FusedConv3D(c3In.F(), c3K.F(), c3B.F(), 1, 1, 1, 0, 0, 0, 1, 1, 1, FusedActivationType.None),
             e => e.FusedConv3D(c3In.D(), c3K.D(), c3B.D(), 1, 1, 1, 0, 0, 0, 1, 1, 1, FusedActivationType.None),
             ParityTol.Accum(1e-3), opMethod: "FusedConv3D")
-        { KnownDivergence = "Full-suite-only cumulative artifact (correct in isolation + all subsets <=70 ops; survives sync + cache-clear; tiny tensors) — consistent with AMD OpenCL driver state after many dispatches, not a kernel bug." };
+        { KnownDivergence = "Full-suite-only cumulative artifact (correct in isolation + all subsets <=70 ops; survives sync + cache-clear; tiny tensors) — consistent with AMD OpenCL driver state after many dispatches, not a kernel bug. Degrades faster than NativeMagnitudeAndPhase: even the harness engine-reset every 64 ops (#775) does not clear it (fails both the early OpParityTests and late generated copies), so it stays quarantined while NativeMag is un-quarantined." };
 
         // FusedConvTranspose2D: input [1,2,4,4], kernel [2,3,2,2], stride2 -> [1,3,8,8].
         var ctIn = OpInput.Rand(3320, new[] { 1, 2, 4, 4 });
