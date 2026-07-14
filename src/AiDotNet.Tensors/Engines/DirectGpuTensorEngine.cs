@@ -21183,6 +21183,48 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return base.TensorNotEquals(a, b2);
     }
 
+    // #775: tensor-tensor INEQUALITIES on the exact elementwise greater_than / less_than kernels
+    // (the registry tests the two-tensor form). Bit-exact with CpuEngine's `a <cmp> b ? One : Zero`
+    // (ParityTol.Exact). float only (double -> CPU oracle); tape/GraphMode defer to base so autodiff and
+    // graph capture record on CPU. The EQUALITY ops (TensorEquals/TensorNotEquals) are deliberately left
+    // on CPU: exact float == on the GPU is fragile under this backend's fast-math + driver state (drifts
+    // by 1 ULP deep into the full suite); inequalities are robust to a sub-ULP nudge, so they wire cleanly.
+    Tensor<T> IEngine.TensorGreaterThan<T>(Tensor<T> a, Tensor<T> b2)
+    {
+        if (!IsTapeActive<T>() && !Compilation.GraphMode.IsActive && typeof(T) == typeof(float)
+            && TryGetBackend(out var b) && ShapesMatch(a.Shape._dims, b2.Shape._dims))
+        {
+            try
+            {
+                var ga = UploadTensorRaw(b, a);
+                var gb = UploadTensorRaw(b, b2);
+                var go = b.AllocateBuffer(a.Length);
+                b.GreaterThan(ga, gb, go, a.Length);
+                return DeferTensorResult<T>(b, go, a.Length, a.Shape.ToArray());
+            }
+            catch { }
+        }
+        return base.TensorGreaterThan(a, b2);
+    }
+
+    Tensor<T> IEngine.TensorLessThan<T>(Tensor<T> a, Tensor<T> b2)
+    {
+        if (!IsTapeActive<T>() && !Compilation.GraphMode.IsActive && typeof(T) == typeof(float)
+            && TryGetBackend(out var b) && ShapesMatch(a.Shape._dims, b2.Shape._dims))
+        {
+            try
+            {
+                var ga = UploadTensorRaw(b, a);
+                var gb = UploadTensorRaw(b, b2);
+                var go = b.AllocateBuffer(a.Length);
+                b.LessThan(ga, gb, go, a.Length);
+                return DeferTensorResult<T>(b, go, a.Length, a.Shape.ToArray());
+            }
+            catch { }
+        }
+        return base.TensorLessThan(a, b2);
+    }
+
     Tensor<T> IEngine.TensorOuter<T>(Tensor<T> a, Tensor<T> b2)
     {
         if (IsTapeActive<T>()) return base.TensorOuter(a, b2);
