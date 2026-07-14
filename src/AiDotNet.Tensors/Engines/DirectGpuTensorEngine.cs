@@ -19103,11 +19103,26 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorBCEWithLogitsLoss<T>(Tensor<T> logits, Tensor<T> targets)
     {
-        // GPU kernel returns per-element loss but the CpuEngine reference
-        // returns the mean — the shape and value mismatch corrupts
-        // numerical-gradient comparisons. Route through CpuEngine until
-        // the GPU output is normalized.
-        return base.TensorBCEWithLogitsLoss(logits, targets);
+        // #775: the per-element BCE-with-logits kernel matches CpuEngine element-wise (the #775 loss is
+        // clean cross-engine); the only mismatch was aggregation — CpuEngine returns the scalar mean.
+        // Run the per-element kernel then reduce to the mean over all elements (ScalarMeanResult), same
+        // as TensorHuberLoss. Tape/GraphMode/non-float defer to the base.
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+            || logits.Length != targets.Length || !TryGetBackend(out var backend))
+            return base.TensorBCEWithLogitsLoss(logits, targets);
+        try
+        {
+            int size = logits.Length;
+            using var bufL = GetOrAllocateBuffer(backend, logits);
+            using var bufT = GetOrAllocateBuffer(backend, targets);
+            using var bufOut = AllocateOutputBuffer(backend, size);
+            backend.BceWithLogitsLoss(bufL.Buffer, bufT.Buffer, bufOut.Buffer, size);
+            return ScalarMeanResult<T>(backend, bufOut, size);
+        }
+        catch (Exception)
+        {
+            return base.TensorBCEWithLogitsLoss(logits, targets);
+        }
     }
 
     public override Tensor<T> TensorCrossEntropyLoss<T>(Tensor<T> logits, Tensor<T> targets)
