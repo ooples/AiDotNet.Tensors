@@ -37,6 +37,7 @@ public partial class CpuEngine
         if (weight is null) throw new ArgumentNullException(nameof(weight));
         if (bias is null) throw new ArgumentNullException(nameof(bias));
         if (targetIds is null) throw new ArgumentNullException(nameof(targetIds));
+        GradientTape<T>.Current?.BindEngineIfUnset(this);
         if (hidden.Rank != 2)
             throw new ArgumentException($"hidden must be rank-2 [N, d]; got rank {hidden.Rank}.", nameof(hidden));
         if (weight.Rank != 2)
@@ -110,6 +111,7 @@ public partial class CpuEngine
         if (weight is null) throw new ArgumentNullException(nameof(weight));
         if (bias is null) throw new ArgumentNullException(nameof(bias));
         if (target is null) throw new ArgumentNullException(nameof(target));
+        GradientTape<T>.Current?.BindEngineIfUnset(this);
         if (hidden.Rank != 2)
             throw new ArgumentException($"hidden must be rank-2 [N, d]; got rank {hidden.Rank}.", nameof(hidden));
         if (weight.Rank != 2)

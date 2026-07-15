@@ -847,6 +847,22 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     internal Engines.DirectGpu.IGpuBuffer? _gpuBuffer;
 
     /// <summary>
+    /// True when <see cref="_gpuBuffer"/> stores a logical <c>Tensor&lt;Complex&lt;T&gt;&gt;</c>
+    /// as two contiguous float32 planes: all real values followed by all imaginary
+    /// values. The physical buffer therefore contains twice <see cref="Length"/>
+    /// elements. Direct GPU complex operations use this marker to split the planes
+    /// with device-to-device copies instead of materializing the tensor on the host.
+    /// </summary>
+    internal bool _gpuBufferIsSplitComplex;
+
+    /// <summary>
+    /// True when a logical <c>Tensor&lt;int&gt;</c> is backed by raw int32 device storage rather
+    /// than the numeric-float index representation used by general index-producing kernels.
+    /// Pooling kernels use raw int32 because their backward kernels consume the same buffer.
+    /// </summary>
+    internal bool _gpuBufferContainsRawInt32;
+
+    /// <summary>
     /// Backend that owns the GPU buffer. Required for downloading data to CPU.
     /// </summary>
     internal Engines.DirectGpu.IDirectGpuBackend? _gpuBackend;
@@ -2668,7 +2684,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         }
 
         // Remove pending deferred materializer to prevent callback on disposed tensor
-        if (_gpuMaterializerKey is not null)
+        if (_gpuMaterializerKey is not null && _storage.RefCount == 1)
         {
             Helpers.DeferredArrayMaterializer.Remove(_gpuMaterializerKey);
             _gpuMaterializerKey = null;

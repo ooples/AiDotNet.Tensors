@@ -7498,19 +7498,23 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var output = step.OutputBuffer;
             if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input)) return null;
             var savedState = step.SavedState;
-            // CpuEngine.MaxPool2D savedState: { maxIndices (int[,,,,]), poolSize (int[]), stride (int[]) }
+            // Saved indices may use the legacy CLR array or the resident tensor contract.
             if (savedState == null || savedState.Length < 3
-                || savedState[0] is not int[,,,,] maxIndices
                 || savedState[1] is not int[] poolSize
                 || savedState[2] is not int[] poolStride)
                 return null;
+            var maxIndices = savedState[0] as int[,,,,];
+            var tensorIndices = savedState[0] as Tensor<int>;
+            if (maxIndices is null && tensorIndices is null) return null;
             var gradOut = gradMap[output];
             var gradIn = gradMap[input];
             bool accum = consumerCount.ContainsKey(input) && consumerCount[input] > 1;
             var capInShape = (int[])input._shape.Clone();
             return eng =>
             {
-                var grad = eng.MaxPool2DBackward(gradOut, maxIndices, capInShape, poolSize, poolStride);
+                var grad = tensorIndices is not null
+                    ? eng.MaxPool2DBackwardWithTensorIndices(gradOut, tensorIndices, capInShape, poolSize, poolStride)
+                    : eng.MaxPool2DBackward(gradOut, maxIndices!, capInShape, poolSize, poolStride);
                 if (accum) eng.TensorAddInto(gradIn, gradIn, grad);
                 else grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
                 input.Grad = gradIn;

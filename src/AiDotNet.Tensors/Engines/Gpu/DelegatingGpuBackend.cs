@@ -853,16 +853,16 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     /// <inheritdoc/>
     public virtual void ScaledDotProductAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer? attentionWeights, IGpuBuffer? mask,
-        int batch, int numHeads, int seqLen, int headDim, float scale, bool isCausal)
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
         => Inner.ScaledDotProductAttention(query, key, value, output, attentionWeights, mask,
-            batch, numHeads, seqLen, headDim, scale, isCausal);
+            batch, numHeads, seqQ, seqK, headDim, scale, isCausal);
 
     /// <inheritdoc/>
     public virtual void ScaledDotProductAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer attentionWeights, IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
-        int batch, int numHeads, int seqLen, int headDim, float scale, bool isCausal)
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
         => Inner.ScaledDotProductAttentionBackward(gradOutput, query, key, value, attentionWeights,
-            gradQuery, gradKey, gradValue, batch, numHeads, seqLen, headDim, scale, isCausal);
+            gradQuery, gradKey, gradValue, batch, numHeads, seqQ, seqK, headDim, scale, isCausal);
 
     /// <inheritdoc/>
     public virtual void FlashAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
@@ -947,6 +947,10 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     /// <inheritdoc/>
     public virtual void GenerateRandomUniform(IGpuBuffer output, int size, float min, float max, ulong seed)
         => Inner.GenerateRandomUniform(output, size, min, max, seed);
+
+    /// <inheritdoc/>
+    public virtual void GenerateStatelessDropoutMask(IGpuBuffer output, int size, uint threshold, float scale, uint seed)
+        => Inner.GenerateStatelessDropoutMask(output, size, threshold, scale, seed);
 
     /// <inheritdoc/>
     public virtual void GenerateRandomNormal(IGpuBuffer output, int size, float mean, float stdDev, ulong seed)
@@ -1839,9 +1843,21 @@ public class DelegatingGpuBackend : IDirectGpuBackend
         => Inner.FusedLinearCrossEntropyIndex(hidden, weight, bias, targetIds, n, d, vocab);
 
     /// <inheritdoc/>
+    public virtual void FusedLinearCrossEntropyIndex(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer targetIds,
+        IGpuBuffer meanLoss, int n, int d, int vocab)
+        => Inner.FusedLinearCrossEntropyIndex(hidden, weight, bias, targetIds, meanLoss, n, d, vocab);
+
+    /// <inheritdoc/>
     public virtual float FusedLinearCrossEntropyDense(
         IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target, int n, int d, int vocab)
         => Inner.FusedLinearCrossEntropyDense(hidden, weight, bias, target, n, d, vocab);
+
+    /// <inheritdoc/>
+    public virtual void FusedLinearCrossEntropyDense(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target,
+        IGpuBuffer meanLoss, int n, int d, int vocab)
+        => Inner.FusedLinearCrossEntropyDense(hidden, weight, bias, target, meanLoss, n, d, vocab);
 
     /// <inheritdoc/>
     public virtual void LstmBackwardSequence(

@@ -149,6 +149,33 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     {
     }
 
+    /// <summary>
+    /// Creates a storage-sharing view and carries any authoritative GPU buffer
+    /// through as a non-owning alias. Owned buffer lifetime lives on TensorStorage,
+    /// whose refcount already spans every view.
+    /// </summary>
+    private Tensor<T> CreateStorageView(int[] shape, int[] strides, int storageOffset)
+    {
+        var view = new Tensor<T>(_data, shape, strides, storageOffset, _storage);
+        if (_device == TensorDevice.CPU || _gpuBuffer is null || _gpuBackend is null)
+            return view;
+
+        view._device = _device;
+        view._gpuDeviceIndex = _gpuDeviceIndex;
+        view._gpuBuffer = _gpuBuffer;
+        view._gpuBackend = _gpuBackend;
+        view._gpuBufferVersion = view.Version;
+        view._gpuBufferIsSplitComplex = _gpuBufferIsSplitComplex;
+        view._gpuBufferContainsRawInt32 = _gpuBufferContainsRawInt32;
+        view._gpuRole = _gpuRole;
+        view._ownsGpuBuffer = false;
+        view._gpuMaterializerCallback = _gpuMaterializerCallback;
+        view._gpuMaterializerKey = _gpuMaterializerKey;
+        view.IsDirty = IsDirty;
+        view.Layout = Layout;
+        return view;
+    }
+
     /// <inheritdoc/>
     public override TensorBase<T> CloneShared()
     {
@@ -392,7 +419,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             }
         }
 
-        return new Tensor<T>(_data, newShape, newStrides, _storageOffset, _storage);
+        return CreateStorageView(newShape, newStrides, _storageOffset);
     }
 
     /// <summary>
@@ -425,7 +452,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             }
         }
 
-        var result = new Tensor<T>(_data, newShape, newStrides, _storageOffset, _storage);
+        var result = CreateStorageView(newShape, newStrides, _storageOffset);
 
         // Record the view under GraphMode so the compiler sees the caller's
         // final tensor when a forward ends in Squeeze (issue #228).
@@ -468,7 +495,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             }
         }
 
-        var result = new Tensor<T>(_data, newShape, newStrides, _storageOffset, _storage);
+        var result = CreateStorageView(newShape, newStrides, _storageOffset);
 
         // Record the view under GraphMode — see Squeeze(int) for rationale.
         var graphScope = Engines.Compilation.GraphMode.Current;
@@ -1173,6 +1200,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         ThrowIfSparse();
         EnsureOwnedForWrite();
         _numOps.Fill(_data.AsWritableSpan(), value);
+        IncrementVersion();
         UniformFillValue = _numOps.ToDouble(value);
     }
 
@@ -1418,7 +1446,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             newStrides[i] = _strides[permutation[i]];
         }
 
-        return new Tensor<T>(_data, newShape, newStrides, _storageOffset, _storage);
+        return CreateStorageView(newShape, newStrides, _storageOffset);
     }
 
     /// <summary>
@@ -1697,7 +1725,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             // O(1) view: same storage, new shape, row-major strides, same offset.
             // Guaranteed zero-copy for contiguous tensors (PyTorch can't always guarantee this).
             var newStrides = ComputeRowMajorStrides(newShape);
-            result = new Tensor<T>(_data, newShape, newStrides, _storageOffset, _storage);
+            result = CreateStorageView(newShape, newStrides, _storageOffset);
         }
         else
         {
@@ -2975,27 +3003,60 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         Engines.DirectGpu.IGpuBuffer buffer,
         int[] shape,
         Engines.Gpu.GpuTensorRole role = Engines.Gpu.GpuTensorRole.General,
-        bool ownsBuffer = true)
+        bool ownsBuffer = true,
+        bool bufferContainsRawInt32 = false)
     {
+        if (bufferContainsRawInt32 && typeof(T) != typeof(int))
+            throw new ArgumentException("Raw int32 GPU storage is only valid for Tensor<int>.", nameof(bufferContainsRawInt32));
+
         var tensor = new Tensor<T>(shape, backend.DeviceType);
         tensor._gpuBuffer = buffer;
         tensor._gpuBackend = backend;
+        tensor._gpuBufferVersion = tensor.Version;
         tensor._gpuRole = role;
-        tensor._ownsGpuBuffer = ownsBuffer;
+        tensor._gpuBufferContainsRawInt32 = bufferContainsRawInt32;
+        if (ownsBuffer)
+            tensor._storage.AttachGpuBufferOwner(buffer);
+        tensor._ownsGpuBuffer = false;
 
         // Register deferred GPU-to-CPU download keyed by the Vector (not the backing array,
         // which doesn't exist yet for GPU-resident tensors). VectorBase.AsSpan() calls
         // TryMaterialize(this) on first CPU access, which triggers this callback.
         // The callback reads _gpuBackend/_gpuBuffer from the tensor at materialization time
         // (not captured at creation) so it stays correct if the buffer is swapped later.
-        var capturedTensor = tensor;
+        var capturedBackend = backend;
+        var capturedBuffer = buffer;
+        var capturedVector = tensor._data;
+        int capturedLength = tensor.Length;
         Action<object> materializeCallback = _ =>
         {
-            if (capturedTensor._gpuBackend is null || capturedTensor._gpuBuffer is null) return;
-            var floatData = capturedTensor._gpuBackend.DownloadBuffer(capturedTensor._gpuBuffer);
+            var downloaded = capturedBackend.DownloadBuffer(capturedBuffer);
+            var floatData = downloaded;
+            if (downloaded.Length != capturedLength)
+            {
+                if (downloaded.Length < capturedLength)
+                    throw new InvalidOperationException(
+                        $"GPU buffer returned {downloaded.Length} elements for a {capturedLength}-element tensor.");
+                floatData = new float[capturedLength];
+                Array.Copy(downloaded, floatData, capturedLength);
+            }
             if (typeof(T) == typeof(float))
             {
-                capturedTensor._data.MaterializeBacking((T[])(object)floatData);
+                capturedVector.MaterializeBacking((T[])(object)floatData);
+            }
+            else if (typeof(T) == typeof(int) && bufferContainsRawInt32)
+            {
+                var typedArr = new int[floatData.Length];
+                for (int i = 0; i < floatData.Length; i++)
+                {
+#if NET5_0_OR_GREATER
+                    typedArr[i] = BitConverter.SingleToInt32Bits(floatData[i]);
+#else
+                    float value = floatData[i];
+                    typedArr[i] = System.Runtime.CompilerServices.Unsafe.As<float, int>(ref value);
+#endif
+                }
+                capturedVector.MaterializeBacking((T[])(object)typedArr);
             }
             else
             {
@@ -3003,7 +3064,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
                 var typedArr = new T[floatData.Length];
                 for (int i = 0; i < floatData.Length; i++)
                     typedArr[i] = numOps.FromDouble(floatData[i]);
-                capturedTensor._data.MaterializeBacking(typedArr);
+                capturedVector.MaterializeBacking(typedArr);
             }
         };
         tensor._gpuMaterializerCallback = materializeCallback;
@@ -3026,7 +3087,9 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             // Trigger deferred materialization — this downloads from GPU
             _ = _data.AsSpan();
             IsDirty = false;
-            return _data.GetDataArray();
+            return IsContiguous && _storageOffset == 0 && _storage.Length == Length
+                ? _data.GetDataArray()
+                : GetFlattenedData();
         }
         // For CPU tensors, respect view logic (sliced/transposed/offset tensors)
         if (IsContiguous && _storageOffset == 0)
@@ -4396,6 +4459,17 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (backingArray is not null)
         {
             Helpers.DeferredArrayMaterializer.TryMaterialize(backingArray);
+        }
+
+        // Split-complex buffers have a physical [real plane][imaginary plane]
+        // layout rather than one float per logical element. Their dedicated
+        // materializer above has already reconstructed Complex<T> values, so the
+        // generic float-to-T download below must not run a second time.
+        if (_gpuBufferIsSplitComplex)
+        {
+            _gpuBufferIsSplitComplex = false;
+            _device = TensorDevice.CPU;
+            return this;
         }
 
         // If we have a GPU buffer but data was never materialized through the deferred

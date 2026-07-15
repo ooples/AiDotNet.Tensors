@@ -49,12 +49,12 @@ internal static class OpRegistry
         "TensorTile", "TensorDiagonal",
 
         // Reduction
-        "ReduceSum", "ReduceMean", "ReduceMax", "ReduceLogVariance",
+        "ReduceSum", "ReduceMean", "ReduceMax", "ReduceMaxWithTensorIndices", "ReduceLogVariance",
         "TensorMean", "Std", "Var",
 
         // Pooling
-        "MaxPool2D", "AvgPool2D", "MaxPool2DWithIndices",
-        "MaxPool3DWithIndices", "AvgPool3D",
+        "MaxPool2D", "AvgPool2D", "MaxPool2DWithIndices", "MaxPool2DWithTensorIndices",
+        "MaxPool3DWithIndices", "MaxPool3DWithTensorIndices", "AvgPool3D",
         "MaxPool1D", "AvgPool1D",
         "AdaptiveAvgPool2D", "AdaptiveMaxPool2D",
 
@@ -270,7 +270,8 @@ internal static class OpRegistry
         "GLUBackward", "GeGLUBackward", "SwiGLUBackward", "ReGLUBackward",
         "SparsemaxBackward", "TaylorSoftmaxBackward", "SphericalSoftmaxBackward",
         "GumbelSoftmaxBackward",
-        "MaxPool2DBackward", "AvgPool2DBackward", "MaxPool3DBackward", "AvgPool3DBackward",
+        "MaxPool2DBackward", "MaxPool2DBackwardWithTensorIndices", "AvgPool2DBackward",
+        "MaxPool3DBackward", "MaxPool3DBackwardWithTensorIndices", "AvgPool3DBackward",
         "Conv1DBackwardInput", "Conv1DBackwardKernel",
         "Conv2DBackwardInput", "Conv2DBackwardKernel",
         "Conv3DBackwardInput", "Conv3DBackwardKernel",
@@ -286,7 +287,8 @@ internal static class OpRegistry
         "GridSampleBackwardInput", "GridSampleBackwardGrid",
         "BatchNormBackward", "LayerNormBackward", "GroupNormBackward", "RMSNormBackward", "InstanceNormBackward",
         "DropoutBackward", "EmbeddingBackward",
-        "ReduceMaxBackward", "ReduceMeanBackward", "ReduceVarianceBackward", "ReduceLogVarianceBackward",
+        "ReduceMaxBackward", "ReduceMaxBackwardWithTensorIndices", "ReduceMeanBackward",
+        "ReduceVarianceBackward", "ReduceLogVarianceBackward",
         "UpsampleBackward", "Upsample3DBackward",
         "CropBackward", "PadBackward", "PixelShuffleBackward",
         "ScatterAddBackward", "ScatterMeanBackward", "ScatterMaxBackward", "ScatterSoftmaxBackward",

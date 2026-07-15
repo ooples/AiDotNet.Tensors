@@ -270,8 +270,9 @@ public partial class DirectGpuTensorEngine
                 try
                 {
                     p210.Parity210Triu(inBuf.Buffer, outBuf.Buffer, batch, rows, cols, diagonal);
-                    var arr = FinishGpuOp<T>(backend, outBuf, tensor.Length);
-                    var r = new Tensor<T>(arr, (int[])tensor._shape.Clone());
+                    var r = DeferTensorResult<T>(backend, outBuf.Buffer, tensor.Length,
+                        (int[])tensor._shape.Clone());
+                    outBuf.RelinquishOwnership();
                     Autodiff.DifferentiableOps.RecordUnary("TensorTriu", r, tensor,
                         Autodiff.BackwardFunctions<T>.TriuBackward,
                         savedState: new object[] { diagonal });
@@ -304,8 +305,9 @@ public partial class DirectGpuTensorEngine
                 try
                 {
                     p210.Parity210Tril(inBuf.Buffer, outBuf.Buffer, batch, rows, cols, diagonal);
-                    var arr = FinishGpuOp<T>(backend, outBuf, tensor.Length);
-                    var r = new Tensor<T>(arr, (int[])tensor._shape.Clone());
+                    var r = DeferTensorResult<T>(backend, outBuf.Buffer, tensor.Length,
+                        (int[])tensor._shape.Clone());
+                    outBuf.RelinquishOwnership();
                     Autodiff.DifferentiableOps.RecordUnary("TensorTril", r, tensor,
                         Autodiff.BackwardFunctions<T>.TrilBackward,
                         savedState: new object[] { diagonal });

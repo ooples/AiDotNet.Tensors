@@ -42,6 +42,7 @@ internal sealed class TensorStorage<T>
     }
 
     private MmapOwnerState? _mmapOwner;
+    private IDisposable? _gpuBufferOwner;
     // Only READ-ONLY aliases gate the write paths (AsWritableSpan / AsWritableMemory / GetDataArray) —
     // a writable alias (#1715) exists to be written, its mutations persist via MAP_SHARED.
     internal bool IsReadOnlyMapped => Volatile.Read(ref _mmapOwner) is { Writable: false };
@@ -73,6 +74,21 @@ internal sealed class TensorStorage<T>
             newState.Dispose();
             throw new InvalidOperationException(
                 "TensorStorage already has an attached mmap owner; replacing it would leak the prior mapping.");
+        }
+    }
+
+    /// <summary>
+    /// Attaches an owned GPU buffer to this shared storage. Tensor views AddRef the
+    /// storage, so the buffer remains valid until the last view is disposed.
+    /// </summary>
+    internal void AttachGpuBufferOwner(IDisposable owner)
+    {
+        if (owner is null) throw new ArgumentNullException(nameof(owner));
+        if (Interlocked.CompareExchange(ref _gpuBufferOwner, owner, null) != null)
+        {
+            owner.Dispose();
+            throw new InvalidOperationException(
+                "TensorStorage already has an attached GPU buffer owner; replacing it would leak the prior buffer.");
         }
     }
 
@@ -150,6 +166,8 @@ internal sealed class TensorStorage<T>
             // can't double-dispose.
             var owner = Interlocked.Exchange(ref _mmapOwner, null);
             owner?.Dispose();
+            var gpuOwner = Interlocked.Exchange(ref _gpuBufferOwner, null);
+            gpuOwner?.Dispose();
         }
     }
 
@@ -183,6 +201,8 @@ internal sealed class TensorStorage<T>
         // owner too. Caller is about to abandon this storage.
         var owner = Interlocked.Exchange(ref _mmapOwner, null);
         owner?.Dispose();
+        var gpuOwner = Interlocked.Exchange(ref _gpuBufferOwner, null);
+        gpuOwner?.Dispose();
         return true;
     }
 

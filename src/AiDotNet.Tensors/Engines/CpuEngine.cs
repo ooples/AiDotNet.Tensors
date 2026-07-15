@@ -16269,6 +16269,41 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<T> MaxPool2DWithTensorIndices<T>(
+        Tensor<T> input, int[] poolSize, int[] stride, out Tensor<int> maxIndices)
+    {
+        Tensor<T> result;
+        int[,,,,] coordinateIndices;
+        using (new NoGradScope<T>())
+        {
+            result = MaxPool2DWithIndices(input, poolSize, stride, out coordinateIndices);
+        }
+
+        int batch = result._shape[0];
+        int channels = result._shape[1];
+        int outputHeight = result._shape[2];
+        int outputWidth = result._shape[3];
+        int inputWidth = input._shape[3];
+        var flatIndices = new int[result.Length];
+        int flat = 0;
+        for (int b = 0; b < batch; b++)
+            for (int c = 0; c < channels; c++)
+                for (int oh = 0; oh < outputHeight; oh++)
+                    for (int ow = 0; ow < outputWidth; ow++)
+                    {
+                        int h = coordinateIndices[b, c, oh, ow, 0];
+                        int w = coordinateIndices[b, c, oh, ow, 1];
+                        flatIndices[flat++] = h * inputWidth + w;
+                    }
+
+        maxIndices = new Tensor<int>(flatIndices, (int[])result._shape.Clone());
+        DifferentiableOps.RecordUnary("MaxPool2D", result, input,
+            BackwardFunctions<T>.MaxPool2DTensorIndicesBackward,
+            new object[] { maxIndices, poolSize, stride });
+        return result;
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<T> MaxPool2DBackward<T>(Tensor<T> gradOutput, int[,,,,] maxIndices, int[] inputShape, int[] poolSize, int[] stride)
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
@@ -16358,6 +16393,37 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> MaxPool2DBackwardWithTensorIndices<T>(
+        Tensor<T> gradOutput, Tensor<int> maxIndices, int[] inputShape, int[] poolSize, int[] stride)
+    {
+        if (maxIndices == null) throw new ArgumentNullException(nameof(maxIndices));
+        if (inputShape == null || inputShape.Length != 4)
+            throw new ArgumentException("Input shape must have four elements [batch, channels, height, width].", nameof(inputShape));
+        if (maxIndices.Length != gradOutput.Length)
+            throw new ArgumentException("Max-index tensor must have one element per output gradient.", nameof(maxIndices));
+
+        int batch = inputShape[0];
+        int channels = inputShape[1];
+        int inputWidth = inputShape[3];
+        int outputHeight = gradOutput._shape[2];
+        int outputWidth = gradOutput._shape[3];
+        var flatIndices = maxIndices.GetDataArray();
+        var coordinateIndices = new int[batch, channels, outputHeight, outputWidth, 2];
+        int flat = 0;
+        for (int b = 0; b < batch; b++)
+            for (int c = 0; c < channels; c++)
+                for (int oh = 0; oh < outputHeight; oh++)
+                    for (int ow = 0; ow < outputWidth; ow++)
+                    {
+                        int spatial = flatIndices[flat++];
+                        coordinateIndices[b, c, oh, ow, 0] = spatial / inputWidth;
+                        coordinateIndices[b, c, oh, ow, 1] = spatial % inputWidth;
+                    }
+
+        return MaxPool2DBackward(gradOutput, coordinateIndices, inputShape, poolSize, stride);
     }
 
     /// <inheritdoc/>
@@ -20235,6 +20301,45 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<T> MaxPool3DWithTensorIndices<T>(
+        Tensor<T> input, int[] poolSize, int[] stride, out Tensor<int> maxIndices)
+    {
+        Tensor<T> result;
+        int[,,,,,] coordinateIndices;
+        using (new NoGradScope<T>())
+        {
+            result = MaxPool3DWithIndices(input, poolSize, stride, out coordinateIndices);
+        }
+
+        int batch = result._shape[0];
+        int channels = result._shape[1];
+        int outputDepth = result._shape[2];
+        int outputHeight = result._shape[3];
+        int outputWidth = result._shape[4];
+        int inputHeight = input._shape[3];
+        int inputWidth = input._shape[4];
+        var flatIndices = new int[result.Length];
+        int flat = 0;
+        for (int b = 0; b < batch; b++)
+            for (int c = 0; c < channels; c++)
+                for (int od = 0; od < outputDepth; od++)
+                    for (int oh = 0; oh < outputHeight; oh++)
+                        for (int ow = 0; ow < outputWidth; ow++)
+                        {
+                            int d = coordinateIndices[b, c, od, oh, ow, 0];
+                            int h = coordinateIndices[b, c, od, oh, ow, 1];
+                            int w = coordinateIndices[b, c, od, oh, ow, 2];
+                            flatIndices[flat++] = (d * inputHeight + h) * inputWidth + w;
+                        }
+
+        maxIndices = new Tensor<int>(flatIndices, (int[])result._shape.Clone());
+        DifferentiableOps.RecordUnary("MaxPool3DWithIndices", result, input,
+            BackwardFunctions<T>.MaxPool3DTensorIndicesBackward,
+            new object[] { maxIndices, poolSize, stride });
+        return result;
+    }
+
+    /// <inheritdoc/>
     public Tensor<T> MaxPool3DBackward<T>(Tensor<T> gradOutput, int[,,,,,] maxIndices, int[] inputShape, int[] poolSize, int[] stride)
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
@@ -20288,6 +20393,43 @@ public partial class CpuEngine : ITensorLevelEngine
         });
 
         return TensorAllocator.Rent<T>(inputShape, gradInputData);
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> MaxPool3DBackwardWithTensorIndices<T>(
+        Tensor<T> gradOutput, Tensor<int> maxIndices, int[] inputShape, int[] poolSize, int[] stride)
+    {
+        if (maxIndices == null) throw new ArgumentNullException(nameof(maxIndices));
+        if (inputShape == null || inputShape.Length != 5)
+            throw new ArgumentException("Input shape must have five elements [batch, channels, depth, height, width].", nameof(inputShape));
+        if (maxIndices.Length != gradOutput.Length)
+            throw new ArgumentException("Max-index tensor must have one element per output gradient.", nameof(maxIndices));
+
+        int batch = inputShape[0];
+        int channels = inputShape[1];
+        int inputHeight = inputShape[3];
+        int inputWidth = inputShape[4];
+        int inputPlane = inputHeight * inputWidth;
+        int outputDepth = gradOutput._shape[2];
+        int outputHeight = gradOutput._shape[3];
+        int outputWidth = gradOutput._shape[4];
+        var flatIndices = maxIndices.GetDataArray();
+        var coordinateIndices = new int[batch, channels, outputDepth, outputHeight, outputWidth, 3];
+        int flat = 0;
+        for (int b = 0; b < batch; b++)
+            for (int c = 0; c < channels; c++)
+                for (int od = 0; od < outputDepth; od++)
+                    for (int oh = 0; oh < outputHeight; oh++)
+                        for (int ow = 0; ow < outputWidth; ow++)
+                        {
+                            int spatial = flatIndices[flat++];
+                            coordinateIndices[b, c, od, oh, ow, 0] = spatial / inputPlane;
+                            int rem = spatial % inputPlane;
+                            coordinateIndices[b, c, od, oh, ow, 1] = rem / inputWidth;
+                            coordinateIndices[b, c, od, oh, ow, 2] = rem % inputWidth;
+                        }
+
+        return MaxPool3DBackward(gradOutput, coordinateIndices, inputShape, poolSize, stride);
     }
 
     /// <inheritdoc/>
@@ -23857,6 +23999,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (gamma == null) throw new ArgumentNullException(nameof(gamma));
         if (beta == null) throw new ArgumentNullException(nameof(beta));
+        GradientTape<T>.Current?.BindEngineIfUnset(this);
 
         if (GraphMode.IsActive)
         {
@@ -30102,6 +30245,10 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> ReduceMax<T>(Tensor<T> input, int[] axes, bool keepDims, out int[] maxIndices)
     {
+        axes = axes == null || axes.Length == 0
+            ? Enumerable.Range(0, input.Rank).ToArray()
+            : axes;
+
         // GraphMode: record lazy node for compiled plan
         if (GraphMode.IsActive)
         {
@@ -30286,6 +30433,55 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<T> ReduceMax<T>(Tensor<T> input, int[] axes, bool keepDims)
+        => ReduceMax(input, axes, keepDims, out _);
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> ReduceMaxWithTensorIndices<T>(
+        Tensor<T> input, int[] axes, bool keepDims, out Tensor<int> maxIndices)
+    {
+        Tensor<T> result;
+        int[] absoluteIndices;
+        using (new NoGradScope<T>())
+        {
+            result = ReduceMax(input, axes, keepDims, out absoluteIndices);
+        }
+
+        var effectiveAxes = axes == null || axes.Length == 0
+            ? Enumerable.Range(0, input.Rank).ToArray()
+            : axes;
+        var normalizedAxes = ValidateAndNormalizeAxes(effectiveAxes, input.Rank);
+        var inputShape = input._shape;
+        var inputStrides = new int[input.Rank];
+        int stride = 1;
+        for (int d = input.Rank - 1; d >= 0; d--)
+        {
+            inputStrides[d] = stride;
+            stride *= inputShape[d];
+        }
+
+        var relativeIndices = new int[absoluteIndices.Length];
+        for (int i = 0; i < absoluteIndices.Length; i++)
+        {
+            int absolute = absoluteIndices[i];
+            int relative = 0;
+            foreach (int axis in normalizedAxes)
+            {
+                int coordinate = (absolute / inputStrides[axis]) % inputShape[axis];
+                relative = relative * inputShape[axis] + coordinate;
+            }
+            relativeIndices[i] = relative;
+        }
+
+        maxIndices = new Tensor<int>(relativeIndices, (int[])result._shape.Clone());
+        GradientTape<T>.Current?.BindEngineIfUnset(this);
+        DifferentiableOps.RecordUnary("ReduceMax", result, input,
+            BackwardFunctions<T>.ReduceMaxTensorIndicesBackward,
+            new object[] { maxIndices, (int[])effectiveAxes.Clone() });
+        return result;
+    }
+
+    /// <inheritdoc/>
     public Tensor<T> ReduceMaxBackward<T>(Tensor<T> gradOutput, int[] maxIndices, int[] inputShape)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -30306,6 +30502,73 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         return TensorAllocator.Rent<T>(inputShape, gradInputData);
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> ReduceMaxBackwardWithTensorIndices<T>(
+        Tensor<T> gradOutput, Tensor<int> maxIndices, int[] inputShape, int[] axes)
+    {
+        if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
+        if (maxIndices == null) throw new ArgumentNullException(nameof(maxIndices));
+        if (inputShape == null || inputShape.Length == 0)
+            throw new ArgumentException("Input shape must not be empty.", nameof(inputShape));
+        if (maxIndices.Length != gradOutput.Length)
+            throw new ArgumentException("Max-index tensor must have one element per output gradient.", nameof(maxIndices));
+
+        var effectiveAxes = axes == null || axes.Length == 0
+            ? Enumerable.Range(0, inputShape.Length).ToArray()
+            : axes;
+        var normalizedAxes = ValidateAndNormalizeAxes(effectiveAxes, inputShape.Length);
+        var reduced = new HashSet<int>(normalizedAxes);
+        var outerAxes = Enumerable.Range(0, inputShape.Length)
+            .Where(d => !reduced.Contains(d)).ToArray();
+        var inputStrides = new int[inputShape.Length];
+        int inputSize = 1;
+        for (int d = inputShape.Length - 1; d >= 0; d--)
+        {
+            if (inputShape[d] <= 0)
+                throw new ArgumentException("Input dimensions must be positive.", nameof(inputShape));
+            inputStrides[d] = inputSize;
+            inputSize = checked(inputSize * inputShape[d]);
+        }
+        int reduceSize = 1;
+        foreach (int axis in normalizedAxes)
+            reduceSize = checked(reduceSize * inputShape[axis]);
+        int outerSize = inputSize / reduceSize;
+        if (gradOutput.Length != outerSize)
+            throw new ArgumentException(
+                "Gradient and max-index tensors must have one element per unreduced position.");
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var gradInput = new T[inputSize];
+        var gradOutputData = gradOutput.GetFlattenedData();
+        var relativeIndices = maxIndices.GetDataArray();
+        var coordinates = new int[inputShape.Length];
+        for (int output = 0; output < gradOutput.Length; output++)
+        {
+            int outer = output;
+            for (int i = outerAxes.Length - 1; i >= 0; i--)
+            {
+                int axis = outerAxes[i];
+                coordinates[axis] = outer % inputShape[axis];
+                outer /= inputShape[axis];
+            }
+
+            int relative = relativeIndices[output];
+            for (int i = normalizedAxes.Length - 1; i >= 0; i--)
+            {
+                int axis = normalizedAxes[i];
+                coordinates[axis] = relative % inputShape[axis];
+                relative /= inputShape[axis];
+            }
+
+            int absolute = 0;
+            for (int d = 0; d < inputShape.Length; d++)
+                absolute += coordinates[d] * inputStrides[d];
+            gradInput[absolute] = numOps.Add(gradInput[absolute], gradOutputData[output]);
+        }
+
+        return TensorAllocator.Rent<T>(inputShape, gradInput);
     }
 
     /// <inheritdoc/>
@@ -34332,12 +34595,42 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new InvalidOperationException("Random initialization into SparseTensor is not supported.");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var random = seed.HasValue ? RandomHelper.CreateSeededRandom(seed.Value) : RandomHelper.ThreadSafeRandom;
-
         double minD = numOps.ToDouble(min);
         double maxD = numOps.ToDouble(max);
         double range = maxD - minD;
         int totalElements = destination.Length;
+
+        if (seed.HasValue)
+        {
+            uint seedState = unchecked((uint)seed.Value);
+            if (destination.IsContiguous)
+            {
+                var output = destination.AsWritableSpan();
+                if (typeof(T) == typeof(float))
+                {
+                    float minF = (float)(object)min!;
+                    float maxF = (float)(object)max!;
+                    for (int i = 0; i < output.Length; i++)
+                        output[i] = (T)(object)StatelessRandom.UniformRange(seedState, (uint)i, minF, maxF);
+                }
+                else
+                {
+                    for (int i = 0; i < output.Length; i++)
+                        output[i] = numOps.FromDouble(StatelessRandom.UniformRange(seedState, (uint)i, minD, maxD));
+                }
+                return;
+            }
+
+            var seededStorage = destination.RawWritableStorageSpan;
+            for (int i = 0; i < totalElements; i++)
+            {
+                double value = StatelessRandom.UniformRange(seedState, (uint)i, minD, maxD);
+                seededStorage[destination.LogicalToStorageIndex(i)] = numOps.FromDouble(value);
+            }
+            return;
+        }
+
+        var random = RandomHelper.ThreadSafeRandom;
 
         var liveBacking = destination.GetLiveBackingArrayOrNull();
         if (liveBacking is not null && totalElements > 10000)
@@ -34351,9 +34644,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 CpuParallelSettings.MaxDegreeOfParallelism,
                 Math.Max(1, (totalElements + MinChunkSize - 1) / MinChunkSize));
             int chunkSize = (totalElements + workerCount - 1) / workerCount;
-            int baseSeed = seed.HasValue
-                ? seed.Value
-                : System.Threading.Interlocked.Add(ref _randomUniformSeedCounter, unchecked((int)0x9E3779B9));
+            int baseSeed = System.Threading.Interlocked.Add(
+                ref _randomUniformSeedCounter, unchecked((int)0x9E3779B9));
 
             LightweightParallel(workerCount, chunkIdx =>
             {
@@ -34643,34 +34935,24 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (seed.HasValue)
         {
-            // Deterministic per-element mask. Element i's keep/drop decision is a stateless
-            // SplitMix64 hash of (seed, i), so it depends ONLY on (seed, i) — never on which
-            // thread happens to process i, on how the parallel partitioner splits the index
-            // range, or on the chunk size. A seeded mask is therefore bit-reproducible across
-            // runs, across thread-pool states, AND across machines with different core counts.
-            //
-            // This is a strictly stronger guarantee than the chunk-id-seeded scheme used by
-            // TensorRandomUniformRangeInto (reproducible only at a fixed worker count), and it
-            // completes AiDotNet #1383: DropoutLayer already derives a per-call seed for
-            // reproducible masks, but the previous seeded path here created per-thread Randoms
-            // keyed on Thread.CurrentThread.ManagedThreadId and drew from them in
-            // nondeterministic chunk order, so any mask above the 10000-element parallel
-            // threshold was still nonreproducible — the root of intermittent "two trainings at
-            // the same seed diverge" model-family test failures.
-            ulong seedState = SplitMix64Seed(seed.Value);
+            // The integer-only PCG hash and threshold are shared with every direct GPU backend.
+            // Decisions depend only on (seed, index), so parallel partitioning and execution
+            // order cannot change the mask and CPU/GPU results are bit-identical.
+            uint seedState = unchecked((uint)seed.Value);
+            ulong threshold = StatelessRandom.ProbabilityThreshold(dropoutRateD);
 
             if (totalElements > 10000)
             {
                 CpuParallelSettings.ParallelForOrSerial(0, totalElements, totalElements, i =>
                 {
-                    resultData[i] = SplitMix64Uniform(seedState, i) < dropoutRateD ? zero : scale;
+                    resultData[i] = StatelessRandom.Sample(seedState, (uint)i) < threshold ? zero : scale;
                 });
             }
             else
             {
                 for (int i = 0; i < totalElements; i++)
                 {
-                    resultData[i] = SplitMix64Uniform(seedState, i) < dropoutRateD ? zero : scale;
+                    resultData[i] = StatelessRandom.Sample(seedState, (uint)i) < threshold ? zero : scale;
                 }
             }
         }
@@ -34694,42 +34976,6 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         return result;
-    }
-
-    /// <summary>
-    /// Mixes a 32-bit seed into a well-distributed 64-bit SplitMix64 base state. Running the seed
-    /// through the SplitMix64 finalizer first ensures adjacent seeds (e.g. consecutive per-call
-    /// dropout seeds) produce uncorrelated streams — without it, the counter-based offset in
-    /// <see cref="SplitMix64Uniform"/> would make element i of seed s collide with element i+1 of
-    /// seed s-1.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static ulong SplitMix64Seed(int seed)
-    {
-        ulong z = unchecked((ulong)(uint)seed);
-        z = unchecked((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9UL);
-        z = unchecked((z ^ (z >> 27)) * 0x94D049BB133111EBUL);
-        return z ^ (z >> 31);
-    }
-
-    /// <summary>
-    /// Stateless SplitMix64 uniform in [0, 1) for a (seedState, index) pair. Returns the same value
-    /// as the (index+1)-th draw of a SplitMix64 stream seeded by <paramref name="seedState"/>, but
-    /// in O(1) and independent of evaluation order — so a parallel fill produces identical results
-    /// regardless of how the index range is partitioned across threads. SplitMix64 (the JDK
-    /// SplittableRandom finalizer; Steele, Lea &amp; Flood, OOPSLA 2014) has excellent
-    /// equidistribution, more than sufficient for dropout masks, which need only a well-distributed
-    /// uniform per element. The top 53 bits map to [0, 1) at the same resolution as
-    /// <see cref="System.Random.NextDouble"/>.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static double SplitMix64Uniform(ulong seedState, long index)
-    {
-        ulong z = unchecked(seedState + (ulong)(index + 1) * 0x9E3779B97F4A7C15UL);
-        z = unchecked((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9UL);
-        z = unchecked((z ^ (z >> 27)) * 0x94D049BB133111EBUL);
-        z ^= z >> 31;
-        return (z >> 11) * (1.0 / 9007199254740992.0); // top 53 bits / 2^53 -> [0, 1)
     }
 
     /// <inheritdoc/>
@@ -36518,7 +36764,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T>[] TensorUnstack<T>(Tensor<T> tensor, int axis)
+    public virtual Tensor<T>[] TensorUnstack<T>(Tensor<T> tensor, int axis)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
@@ -36605,7 +36851,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorMaskedFill<T>(Tensor<T> tensor, Tensor<Bit> mask, T value)
+    public virtual Tensor<T> TensorMaskedFill<T>(Tensor<T> tensor, Tensor<Bit> mask, T value)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (mask == null) throw new ArgumentNullException(nameof(mask));
@@ -36719,7 +36965,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorWhere<T>(Tensor<Bit> condition, Tensor<T> x, Tensor<T> y)
+    public virtual Tensor<T> TensorWhere<T>(Tensor<Bit> condition, Tensor<T> x, Tensor<T> y)
     {
         if (condition == null) throw new ArgumentNullException(nameof(condition));
         if (x == null) throw new ArgumentNullException(nameof(x));
@@ -36923,7 +37169,7 @@ public partial class CpuEngine : ITensorLevelEngine
     #region Instant-NGP Operations
 
     /// <inheritdoc/>
-    public Tensor<T> MultiresolutionHashEncoding<T>(
+    public virtual Tensor<T> MultiresolutionHashEncoding<T>(
         Tensor<T> positions,
         Tensor<T>[] hashTables,
         int[] resolutions,
@@ -36934,7 +37180,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T>[] MultiresolutionHashEncodingBackward<T>(
+    public virtual Tensor<T>[] MultiresolutionHashEncodingBackward<T>(
         Tensor<T> positions,
         Tensor<T>[] hashTables,
         int[] resolutions,
@@ -39452,8 +39698,9 @@ public partial class CpuEngine : ITensorLevelEngine
         int numFreqs = magnitude._shape[^2];
         int numFrames = magnitude._shape[^1];
 
-        // Initialize with random phase
-        var random = RandomHelper.ThreadSafeRandom;
+        // Use the same deterministic initialization as the resident GPU path so
+        // repeated calls and CPU/GPU executions start from identical phases.
+        var random = RandomHelper.CreateSeededRandom(42);
         var phase = AutoTensorCache.RentOrAllocate<T>(magnitude._shape);
         var phaseData = phase.GetDataArray();
         for (int i = 0; i < phase.Length; i++)
@@ -40432,6 +40679,21 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = new T[gradOutput.Length];
         var gData = gradOutput.GetDataArray();
         var iData = input.GetDataArray();
+
+        if (typeof(T) == typeof(float))
+        {
+            float derivative = 1.0f / 6.0f;
+            for (int i = 0; i < result.Length; i++)
+            {
+                float x = System.Runtime.CompilerServices.Unsafe.As<T, float>(ref iData[i]);
+                float grad = System.Runtime.CompilerServices.Unsafe.As<T, float>(ref gData[i]);
+                float localDerivative = (x > -3.0f && x < 3.0f) ? derivative : 0.0f;
+                float value = grad * localDerivative;
+                System.Runtime.CompilerServices.Unsafe.As<T, float>(ref result[i]) = value;
+            }
+            return new Tensor<T>(result, gradOutput.Shape.ToArray());
+        }
+
         for (int i = 0; i < result.Length; i++)
         {
             double x = numOps.ToDouble(iData[i]);
@@ -41785,6 +42047,20 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+
+        if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorLerp", a._shape); if (ac is not null) return ac.Execute(); }
+
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ca = a; var cb = b; var ct = t;
+                return scope.RecordBinary(LazyNodeType.Custom, "TensorLerp", a, b, a._shape,
+                    (eng, output) => { var r = eng.TensorLerp(ca, cb, ct); DirectGpuTensorEngine.CopyResultInto(eng, r, output); });
+            }
+        }
+
         var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!a.IsContiguous) a = a.Contiguous();
         var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -41795,11 +42071,55 @@ public partial class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
 
-        // lerp(a, b, t) = a + t * (b - a) = (1-t)*a + t*b
-        // Using a + t*(b-a) is more numerically stable and requires fewer ops
-        var diff = TensorSubtract(b, a);  // b - a
-        var scaled = TensorMultiplyScalar(diff, t);  // t * (b - a)
-        return TensorAdd(a, scaled);  // a + t * (b - a)
+        var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
+        var aData = a.GetFlattenedData();
+        var bData = b.GetFlattenedData();
+        var resultData = result.GetDataArray();
+
+        // Keep the float path identical to the resident GPU kernels: round b-a once,
+        // then perform a correctly-rounded fused t*(b-a)+a.
+        if (typeof(T) == typeof(float))
+        {
+            float[] af = Unsafe.As<T[], float[]>(ref aData);
+            float[] bf = Unsafe.As<T[], float[]>(ref bData);
+            float[] rf = Unsafe.As<T[], float[]>(ref resultData);
+            float tf = Unsafe.As<T, float>(ref t);
+            for (int i = 0; i < af.Length; i++)
+            {
+#if NET7_0_OR_GREATER
+                rf[i] = MathF.FusedMultiplyAdd(tf, bf[i] - af[i], af[i]);
+#else
+                rf[i] = af[i] + tf * (bf[i] - af[i]);
+#endif
+            }
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            double[] ad = Unsafe.As<T[], double[]>(ref aData);
+            double[] bd = Unsafe.As<T[], double[]>(ref bData);
+            double[] rd = Unsafe.As<T[], double[]>(ref resultData);
+            double td = Unsafe.As<T, double>(ref t);
+            for (int i = 0; i < ad.Length; i++)
+            {
+#if NET7_0_OR_GREATER
+                rd[i] = Math.FusedMultiplyAdd(td, bd[i] - ad[i], ad[i]);
+#else
+                rd[i] = ad[i] + td * (bd[i] - ad[i]);
+#endif
+            }
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            for (int i = 0; i < aData.Length; i++)
+                resultData[i] = numOps.Add(aData[i], numOps.Multiply(t, numOps.Subtract(bData[i], aData[i])));
+        }
+
+        object boxedT = t is not null ? (object)t : throw new InvalidOperationException("t cannot be null");
+        DifferentiableOps.RecordBinary("TensorLerp", result, aOrig, bOrig,
+            BackwardFunctions<T>.LerpBackward, new object[] { boxedT });
+        AutoTracer.RecordOp("TensorLerp", result, eng => eng.TensorLerp(aOrig, bOrig, t));
+        return result;
     }
 
     /// <inheritdoc/>
@@ -41827,18 +42147,54 @@ public partial class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
         var aData = a.GetFlattenedData();
         var bData = b.GetFlattenedData();
         var rData = result.GetDataArray();
 
-        // Single pass: result[i] = scaleA * a[i] + scaleB * b[i]
-        for (int i = 0; i < a.Length; i++)
+        if (typeof(T) == typeof(float))
         {
-            rData[i] = numOps.Add(
-                numOps.Multiply(aData[i], scaleA),
-                numOps.Multiply(bData[i], scaleB));
+            float[] af = Unsafe.As<T[], float[]>(ref aData);
+            float[] bf = Unsafe.As<T[], float[]>(ref bData);
+            float[] rf = Unsafe.As<T[], float[]>(ref rData);
+            float sa = Unsafe.As<T, float>(ref scaleA);
+            float sb = Unsafe.As<T, float>(ref scaleB);
+            for (int i = 0; i < af.Length; i++)
+            {
+                float right = sb * bf[i];
+#if NET7_0_OR_GREATER
+                rf[i] = MathF.FusedMultiplyAdd(sa, af[i], right);
+#else
+                rf[i] = sa * af[i] + right;
+#endif
+            }
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            double[] ad = Unsafe.As<T[], double[]>(ref aData);
+            double[] bd = Unsafe.As<T[], double[]>(ref bData);
+            double[] rd = Unsafe.As<T[], double[]>(ref rData);
+            double sa = Unsafe.As<T, double>(ref scaleA);
+            double sb = Unsafe.As<T, double>(ref scaleB);
+            for (int i = 0; i < ad.Length; i++)
+            {
+                double right = sb * bd[i];
+#if NET7_0_OR_GREATER
+                rd[i] = Math.FusedMultiplyAdd(sa, ad[i], right);
+#else
+                rd[i] = sa * ad[i] + right;
+#endif
+            }
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            for (int i = 0; i < a.Length; i++)
+            {
+                rData[i] = numOps.Add(
+                    numOps.Multiply(aData[i], scaleA),
+                    numOps.Multiply(bData[i], scaleB));
+            }
         }
 
         object boxedScaleA = scaleA is not null ? (object)scaleA : throw new InvalidOperationException("scaleA cannot be null");
@@ -42748,6 +43104,23 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         var noise = new Tensor<T>(tensor._shape);
         var rng = new Random();
+
+        if (typeof(T) == typeof(float))
+        {
+            for (int i = 0; i < tensor.Length; i++)
+            {
+                float x = (float)numOps.ToDouble(tensor[i]);
+                float slope = training
+                    ? (float)(lower + rng.NextDouble() * (upper - lower))
+                    : (float)((lower + upper) / 2.0);
+                noise[i] = numOps.FromDouble(slope);
+                result[i] = numOps.FromDouble(x >= 0.0f ? x : slope * x);
+            }
+            DifferentiableOps.RecordUnary("RReLU", result, tensor, BackwardFunctions<T>.RReLUBackward, savedState: new object[] { noise });
+            AutoTracer.RecordOp("RReLU", result, eng => eng.TensorRReLU(tensor, lower, upper, training));
+            return result;
+        }
+
         for (int i = 0; i < tensor.Length; i++)
         {
             double x = numOps.ToDouble(tensor[i]);
@@ -45970,11 +46343,29 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var re = ops.ToDouble(input[i].Real);
             var im = ops.ToDouble(input[i].Imaginary);
-            magSq[i] = (re * re + im * im, i);
+            if (typeof(T) == typeof(float))
+            {
+                float re32 = (float)re;
+                float im32 = (float)im;
+                magSq[i] = (re32 * re32 + im32 * im32, i);
+            }
+            else
+            {
+                magSq[i] = (re * re + im * im, i);
+            }
         }
 
-        // Partial sort: find top-K by magnitude
-        Array.Sort(magSq, (a, b) => b.mag.CompareTo(a.mag));
+        // Stable total order shared with the GPU kernels: numeric magnitudes descending,
+        // NaNs last, and lower input index first for equal magnitudes.
+        Array.Sort(magSq, (a, b) =>
+        {
+            bool aIsNaN = double.IsNaN(a.mag);
+            bool bIsNaN = double.IsNaN(b.mag);
+            if (aIsNaN != bIsNaN)
+                return aIsNaN ? 1 : -1;
+            int magnitudeOrder = b.mag.CompareTo(a.mag);
+            return magnitudeOrder != 0 ? magnitudeOrder : a.idx.CompareTo(b.idx);
+        });
 
         var topKIndices = new HashSet<int>();
         for (int i = 0; i < k; i++) topKIndices.Add(magSq[i].idx);
