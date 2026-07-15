@@ -39,8 +39,8 @@ public sealed class CrossBackendKernelCoverageTests
     // include spiral_conv[_backward_*], trilinear_interpolate[_backward], conv_transpose3d[_backward_*],
     // adaptive_max_pool2d and the scatter_*_rows / *_backward_rows GNN family. Ratchet DOWN as kernels
     // are mirrored; the gate's job is to stop the diff GROWING (a new OpenCL kernel with no twin fails).
-    private const int CudaMissingFloor = 165;
-    private const int HipMissingFloor = 165;
+    private const int CudaMissingFloor = 163;
+    private const int HipMissingFloor = 163;
 
     [Fact]
     public void MirrorBackends_CoverEveryOpenClComputeKernel()

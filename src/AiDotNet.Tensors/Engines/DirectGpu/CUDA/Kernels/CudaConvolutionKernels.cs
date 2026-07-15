@@ -637,6 +637,69 @@ extern ""C"" __global__ __launch_bounds__(256) void conv3d_direct(
 
     output[(((b * outChannels + oc) * outDepth + od) * outHeight + oh) * outWidth + ow] = sum;
 }
+
+// #775: Trilinear interpolation of a [D,H,W,C] grid at [P,3] positions -> [P,C]. One thread per output
+// element (n,c). CUDA mirror of the OpenCL trilinear_interpolate kernel.
+extern ""C"" __global__ __launch_bounds__(256) void trilinear_interpolate(
+    const float* __restrict__ grid,
+    const float* __restrict__ positions,
+    float* __restrict__ output,
+    int D, int H, int W, int C,
+    int P, float upperEps)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= P * C) return;
+    int c = idx % C;
+    int n = idx / C;
+    float z = fmaxf(0.0f, fminf((float)(D - 1) - upperEps, positions[n * 3 + 0]));
+    float y = fmaxf(0.0f, fminf((float)(H - 1) - upperEps, positions[n * 3 + 1]));
+    float x = fmaxf(0.0f, fminf((float)(W - 1) - upperEps, positions[n * 3 + 2]));
+    int z0 = (int)floorf(z), y0 = (int)floorf(y), x0 = (int)floorf(x);
+    int z1 = min(z0 + 1, D - 1), y1 = min(y0 + 1, H - 1), x1 = min(x0 + 1, W - 1);
+    float fz = z - z0, fy = y - y0, fx = x - x0;
+    float w000 = (1 - fz) * (1 - fy) * (1 - fx), w001 = (1 - fz) * (1 - fy) * fx;
+    float w010 = (1 - fz) * fy * (1 - fx),       w011 = (1 - fz) * fy * fx;
+    float w100 = fz * (1 - fy) * (1 - fx),       w101 = fz * (1 - fy) * fx;
+    float w110 = fz * fy * (1 - fx),             w111 = fz * fy * fx;
+    output[n * C + c] =
+        w000 * grid[(((z0 * H + y0) * W + x0) * C) + c] + w001 * grid[(((z0 * H + y0) * W + x1) * C) + c] +
+        w010 * grid[(((z0 * H + y1) * W + x0) * C) + c] + w011 * grid[(((z0 * H + y1) * W + x1) * C) + c] +
+        w100 * grid[(((z1 * H + y0) * W + x0) * C) + c] + w101 * grid[(((z1 * H + y0) * W + x1) * C) + c] +
+        w110 * grid[(((z1 * H + y1) * W + x0) * C) + c] + w111 * grid[(((z1 * H + y1) * W + x1) * C) + c];
+}
+
+// #775: Trilinear-interpolate backward w.r.t. the grid. GATHER form (one thread per grid cell,
+// deterministic, no atomics): the 8-corner weight factorizes per axis. CUDA mirror of OpenCL.
+extern ""C"" __global__ __launch_bounds__(256) void trilinear_interpolate_backward(
+    const float* __restrict__ gradOutput,
+    const float* __restrict__ positions,
+    float* __restrict__ gradGrid,
+    int D, int H, int W, int C,
+    int P, float upperEps)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= D * H * W * C) return;
+    int c = idx % C;
+    int gx = (idx / C) % W;
+    int gy = (idx / (C * W)) % H;
+    int gz = idx / (C * W * H);
+    float sum = 0.0f;
+    for (int n = 0; n < P; n++) {
+        float z = fmaxf(0.0f, fminf((float)(D - 1) - upperEps, positions[n * 3 + 0]));
+        float y = fmaxf(0.0f, fminf((float)(H - 1) - upperEps, positions[n * 3 + 1]));
+        float x = fmaxf(0.0f, fminf((float)(W - 1) - upperEps, positions[n * 3 + 2]));
+        int z0 = (int)floorf(z), y0 = (int)floorf(y), x0 = (int)floorf(x);
+        int z1 = min(z0 + 1, D - 1), y1 = min(y0 + 1, H - 1), x1 = min(x0 + 1, W - 1);
+        float fz = z - z0, fy = y - y0, fx = x - x0;
+        float wz = (gz == z0 ? (1.0f - fz) : 0.0f) + (gz == z1 ? fz : 0.0f);
+        if (wz == 0.0f) continue;
+        float wy = (gy == y0 ? (1.0f - fy) : 0.0f) + (gy == y1 ? fy : 0.0f);
+        if (wy == 0.0f) continue;
+        float wx = (gx == x0 ? (1.0f - fx) : 0.0f) + (gx == x1 ? fx : 0.0f);
+        sum += wz * wy * wx * gradOutput[n * C + c];
+    }
+    gradGrid[idx] = sum;
+}
 ";
         }
 
@@ -655,7 +718,9 @@ extern ""C"" __global__ __launch_bounds__(256) void conv3d_direct(
                 "conv_transpose2d_backward_kernel",
                 "conv2d_tiled",
                 "conv2d_winograd_f2x2_3x3",
-                "conv3d_direct"
+                "conv3d_direct",
+                "trilinear_interpolate",
+                "trilinear_interpolate_backward"
             };
         }
     }
