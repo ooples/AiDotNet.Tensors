@@ -897,6 +897,79 @@ extern ""C"" __global__ __launch_bounds__(256) void spiral_conv_backward_weights
     }
     gradWeights[idx] = sum;
 }
+
+// #775: Depthwise Conv2D backward w.r.t. input (NCHW, oc = ic*M + m). GATHER over gradInput. CUDA mirror.
+extern ""C"" __global__ __launch_bounds__(256) void depthwise_conv2d_backward_input(
+    const float* __restrict__ gradOutput,
+    const float* __restrict__ weights,
+    float* __restrict__ gradInput,
+    int N, int inC, int H, int W,
+    int M, int outH, int outW,
+    int kH, int kW,
+    int strideH, int strideW, int padH, int padW)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * inC * H * W;
+    if (idx >= total) return;
+    int iw = idx % W;
+    int ih = (idx / W) % H;
+    int ic = (idx / (W * H)) % inC;
+    int b = idx / (W * H * inC);
+    int outC = inC * M;
+    float sum = 0.0f;
+    for (int m = 0; m < M; m++) {
+        int oc = ic * M + m;
+        for (int kh = 0; kh < kH; kh++) {
+            int t = ih + padH - kh;
+            if (t < 0 || (t % strideH) != 0) continue;
+            int oh = t / strideH;
+            if (oh < 0 || oh >= outH) continue;
+            for (int kw = 0; kw < kW; kw++) {
+                int tw = iw + padW - kw;
+                if (tw < 0 || (tw % strideW) != 0) continue;
+                int ow = tw / strideW;
+                if (ow < 0 || ow >= outW) continue;
+                sum += weights[(oc * kH + kh) * kW + kw]
+                     * gradOutput[((b * outC + oc) * outH + oh) * outW + ow];
+            }
+        }
+    }
+    gradInput[idx] = sum;
+}
+
+// #775: Depthwise Conv2D backward w.r.t. weights (NCHW). Gathers per gradKernel element (no race). CUDA mirror.
+extern ""C"" __global__ __launch_bounds__(256) void depthwise_conv2d_backward_weights(
+    const float* __restrict__ gradOutput,
+    const float* __restrict__ input,
+    float* __restrict__ gradKernel,
+    int N, int inC, int H, int W,
+    int M, int outH, int outW,
+    int kH, int kW,
+    int strideH, int strideW, int padH, int padW)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int outC = inC * M;
+    int total = outC * kH * kW;
+    if (idx >= total) return;
+    int kw = idx % kW;
+    int kh = (idx / kW) % kH;
+    int oc = idx / (kW * kH);
+    int ic = oc / M;
+    float sum = 0.0f;
+    for (int b = 0; b < N; b++) {
+        for (int oh = 0; oh < outH; oh++) {
+            int ih = oh * strideH - padH + kh;
+            if (ih < 0 || ih >= H) continue;
+            for (int ow = 0; ow < outW; ow++) {
+                int iw = ow * strideW - padW + kw;
+                if (iw < 0 || iw >= W) continue;
+                sum += input[((b * inC + ic) * H + ih) * W + iw]
+                     * gradOutput[((b * outC + oc) * outH + oh) * outW + ow];
+            }
+        }
+    }
+    gradKernel[idx] = sum;
+}
 ";
         }
 
@@ -923,7 +996,9 @@ extern ""C"" __global__ __launch_bounds__(256) void spiral_conv_backward_weights
                 "conv_transpose3d_backward_weights",
                 "spiral_conv",
                 "spiral_conv_backward_input",
-                "spiral_conv_backward_weights"
+                "spiral_conv_backward_weights",
+                "depthwise_conv2d_backward_input",
+                "depthwise_conv2d_backward_weights"
             };
         }
     }

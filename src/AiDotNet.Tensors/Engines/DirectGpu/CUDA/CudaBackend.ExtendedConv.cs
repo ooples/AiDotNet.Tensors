@@ -6,8 +6,41 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 // added incrementally (interface + kernels) so a partially-ported backend still opts into exactly the
 // families it can run; the engine routes the rest to the CPU. Kernels live in the existing compiled
 // modules (trilinear in the convolution module); this partial only wires the launch.
-public sealed partial class CudaBackend : ITrilinearInterpolationKernels, IConvTranspose3DKernels, ISpiralConvKernels, IAdaptiveMaxPool2DKernels, IConv3DBackwardKernels, IPool3DKernels
+public sealed partial class CudaBackend : ITrilinearInterpolationKernels, IConvTranspose3DKernels, ISpiralConvKernels, IAdaptiveMaxPool2DKernels, IConv3DBackwardKernels, IPool3DKernels, IDepthwiseConv2DBackwardKernels
 {
+    public void DepthwiseConv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
+        int n, int inC, int h, int w, int m, int outH, int outW, int kH, int kW,
+        int strideH, int strideW, int padH, int padW) =>
+        LaunchDepthwise2DGrid("depthwise_conv2d_backward_input", checked(n * inC * h * w),
+            gradOutput, kernel, gradInput, n, inC, h, w, m, outH, outW, kH, kW, strideH, strideW, padH, padW);
+
+    public void DepthwiseConv2DBackwardKernel(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradKernel,
+        int n, int inC, int h, int w, int m, int outH, int outW, int kH, int kW,
+        int strideH, int strideW, int padH, int padW) =>
+        LaunchDepthwise2DGrid("depthwise_conv2d_backward_weights", checked(inC * m * kH * kW),
+            gradOutput, input, gradKernel, n, inC, h, w, m, outH, outW, kH, kW, strideH, strideW, padH, padW);
+
+    private unsafe void LaunchDepthwise2DGrid(string kernelName, int total,
+        IGpuBuffer a, IGpuBuffer b, IGpuBuffer c,
+        int n, int inC, int h, int w, int m, int outH, int outW, int kH, int kW,
+        int strideH, int strideW, int padH, int padW)
+    {
+        if (total <= 0) return;
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+        using var _ = PushContext();
+        uint gridDim = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pa = a.Handle, pb = b.Handle, pc = c.Handle;
+        int vN = n, vInC = inC, vH = h, vW = w, vM = m, vOH = outH, vOW = outW, vKH = kH, vKW = kW;
+        int vSH = strideH, vSW = strideW, vPH = padH, vPW = padW;
+        void** args = stackalloc void*[16];
+        args[0] = &pa; args[1] = &pb; args[2] = &pc;
+        args[3] = &vN; args[4] = &vInC; args[5] = &vH; args[6] = &vW; args[7] = &vM;
+        args[8] = &vOH; args[9] = &vOW; args[10] = &vKH; args[11] = &vKW;
+        args[12] = &vSH; args[13] = &vSW; args[14] = &vPH; args[15] = &vPW;
+        LaunchKernel(kernel, gridDim, DefaultBlockSize, args);
+    }
+
     public unsafe void AvgPool3D(IGpuBuffer input, IGpuBuffer output,
         int batch, int channels, int inDepth, int inHeight, int inWidth,
         int outDepth, int outHeight, int outWidth,
