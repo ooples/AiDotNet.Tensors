@@ -6,8 +6,22 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 // (interface + kernels) so a partially-ported backend opts into exactly the families it can run; the
 // engine routes the rest to the CPU. Kernels live in the existing compiled modules (trilinear in the
 // convolution module); this partial only wires the launch.
-public sealed partial class HipBackend : ITrilinearInterpolationKernels, IConvTranspose3DKernels, ISpiralConvKernels, IAdaptiveMaxPool2DKernels
+public sealed partial class HipBackend : ITrilinearInterpolationKernels, IConvTranspose3DKernels, ISpiralConvKernels, IAdaptiveMaxPool2DKernels, IConv3DBackwardKernels
 {
+    public void Conv3DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer weights, IGpuBuffer gradInput,
+        int n, int inC, int inD, int inH, int inW, int outC, int outD, int outH, int outW,
+        int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW) =>
+        LaunchConv3DGrid("conv3d_backward_input", checked(n * inC * inD * inH * inW),
+            gradOutput, weights, gradInput, n, inC, inD, inH, inW, outC, outD, outH, outW,
+            kD, kH, kW, strideD, strideH, strideW, padD, padH, padW);
+
+    public void Conv3DBackwardKernel(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradKernel,
+        int n, int inC, int inD, int inH, int inW, int outC, int outD, int outH, int outW,
+        int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW) =>
+        LaunchConv3DGrid("conv3d_backward_weights", checked(outC * inC * kD * kH * kW),
+            gradOutput, input, gradKernel, n, inC, inD, inH, inW, outC, outD, outH, outW,
+            kD, kH, kW, strideD, strideH, strideW, padD, padH, padW);
+
     public unsafe void AdaptiveMaxPool2D(IGpuBuffer input, IGpuBuffer output,
         int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
     {
@@ -64,21 +78,21 @@ public sealed partial class HipBackend : ITrilinearInterpolationKernels, IConvTr
     public void ConvTranspose3D(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer output,
         int n, int inC, int iD, int iH, int iW, int outC, int outD, int outH, int outW,
         int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW) =>
-        LaunchConvTranspose3D("conv_transpose3d", checked(n * outC * outD * outH * outW),
+        LaunchConv3DGrid("conv_transpose3d", checked(n * outC * outD * outH * outW),
             input, weights, output, n, inC, iD, iH, iW, outC, outD, outH, outW,
             kD, kH, kW, strideD, strideH, strideW, padD, padH, padW);
 
     public void ConvTranspose3DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer weights, IGpuBuffer gradInput,
         int n, int inC, int iD, int iH, int iW, int outC, int outD, int outH, int outW,
         int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW) =>
-        LaunchConvTranspose3D("conv_transpose3d_backward_input", checked(n * inC * iD * iH * iW),
+        LaunchConv3DGrid("conv_transpose3d_backward_input", checked(n * inC * iD * iH * iW),
             gradOutput, weights, gradInput, n, inC, iD, iH, iW, outC, outD, outH, outW,
             kD, kH, kW, strideD, strideH, strideW, padD, padH, padW);
 
     public void ConvTranspose3DBackwardKernel(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradWeights,
         int n, int inC, int iD, int iH, int iW, int outC, int outD, int outH, int outW,
         int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW) =>
-        LaunchConvTranspose3D("conv_transpose3d_backward_weights", checked(inC * outC * kD * kH * kW),
+        LaunchConv3DGrid("conv_transpose3d_backward_weights", checked(inC * outC * kD * kH * kW),
             gradOutput, input, gradWeights, n, inC, iD, iH, iW, outC, outD, outH, outW,
             kD, kH, kW, strideD, strideH, strideW, padD, padH, padW);
 
@@ -133,7 +147,7 @@ public sealed partial class HipBackend : ITrilinearInterpolationKernels, IConvTr
         Synchronize();
     }
 
-    private unsafe void LaunchConvTranspose3D(string kernelName, int total,
+    private unsafe void LaunchConv3DGrid(string kernelName, int total,
         IGpuBuffer a, IGpuBuffer b, IGpuBuffer c,
         int n, int inC, int iD, int iH, int iW, int outC, int outD, int outH, int outW,
         int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW)
