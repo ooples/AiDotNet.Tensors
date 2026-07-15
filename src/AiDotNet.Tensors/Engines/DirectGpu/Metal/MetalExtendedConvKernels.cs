@@ -282,5 +282,197 @@ kernel void spiral_conv_backward_weights(
     }
     gradWeights[idx] = sum;
 }
+
+kernel void adaptive_max_pool2d(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant int& batch [[buffer(2)]], constant int& channels [[buffer(3)]],
+    constant int& inHeight [[buffer(4)]], constant int& inWidth [[buffer(5)]],
+    constant int& outHeight [[buffer(6)]], constant int& outWidth [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int idx = int(gid);
+    if (idx >= batch * channels * outHeight * outWidth) return;
+    int ow = idx % outWidth;
+    int oh = (idx / outWidth) % outHeight;
+    int c = (idx / (outWidth * outHeight)) % channels;
+    int b = idx / (outWidth * outHeight * channels);
+    int hStart = (oh * inHeight) / outHeight;
+    int hEnd = ((oh + 1) * inHeight) / outHeight;
+    int wStart = (ow * inWidth) / outWidth;
+    int wEnd = ((ow + 1) * inWidth) / outWidth;
+    float maxV = -INFINITY;
+    for (int ih = hStart; ih < hEnd; ih++) {
+        for (int iw = wStart; iw < wEnd; iw++) {
+            float v = input[((b * channels + c) * inHeight + ih) * inWidth + iw];
+            if (v > maxV) maxV = v;
+        }
+    }
+    output[((b * channels + c) * outHeight + oh) * outWidth + ow] = maxV;
+}
+
+kernel void conv3d_backward_input(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* weights [[buffer(1)]],
+    device float* gradInput [[buffer(2)]],
+    constant int& N [[buffer(3)]], constant int& inC [[buffer(4)]],
+    constant int& D [[buffer(5)]], constant int& H [[buffer(6)]], constant int& W [[buffer(7)]],
+    constant int& outC [[buffer(8)]], constant int& outD [[buffer(9)]],
+    constant int& outH [[buffer(10)]], constant int& outW [[buffer(11)]],
+    constant int& kD [[buffer(12)]], constant int& kH [[buffer(13)]], constant int& kW [[buffer(14)]],
+    constant int& strideD [[buffer(15)]], constant int& strideH [[buffer(16)]], constant int& strideW [[buffer(17)]],
+    constant int& padD [[buffer(18)]], constant int& padH [[buffer(19)]], constant int& padW [[buffer(20)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int idx = int(gid);
+    int totalSize = N * inC * D * H * W;
+    if (idx >= totalSize) return;
+    int w = idx % W;
+    int h = (idx / W) % H;
+    int d = (idx / (W * H)) % D;
+    int ic = (idx / (W * H * D)) % inC;
+    int n = idx / (W * H * D * inC);
+    float sum = 0.0f;
+    for (int oc = 0; oc < outC; oc++) {
+        for (int kd = 0; kd < kD; kd++) {
+            for (int kh = 0; kh < kH; kh++) {
+                for (int kw = 0; kw < kW; kw++) {
+                    int od = (d + padD - kd);
+                    int oh = (h + padH - kh);
+                    int ow = (w + padW - kw);
+                    if (od % strideD == 0 && oh % strideH == 0 && ow % strideW == 0) {
+                        od /= strideD;
+                        oh /= strideH;
+                        ow /= strideW;
+                        if (od >= 0 && od < outD && oh >= 0 && oh < outH && ow >= 0 && ow < outW) {
+                            int gradOutIdx = ((n * outC + oc) * outD + od) * outH * outW + oh * outW + ow;
+                            int kernelIdx = ((oc * inC + ic) * kD + kd) * kH * kW + kh * kW + kw;
+                            sum += gradOutput[gradOutIdx] * weights[kernelIdx];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    gradInput[idx] = sum;
+}
+
+kernel void conv3d_backward_weights(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* gradKernel [[buffer(2)]],
+    constant int& N [[buffer(3)]], constant int& inC [[buffer(4)]],
+    constant int& D [[buffer(5)]], constant int& H [[buffer(6)]], constant int& W [[buffer(7)]],
+    constant int& outC [[buffer(8)]], constant int& outD [[buffer(9)]],
+    constant int& outH [[buffer(10)]], constant int& outW [[buffer(11)]],
+    constant int& kD [[buffer(12)]], constant int& kH [[buffer(13)]], constant int& kW [[buffer(14)]],
+    constant int& strideD [[buffer(15)]], constant int& strideH [[buffer(16)]], constant int& strideW [[buffer(17)]],
+    constant int& padD [[buffer(18)]], constant int& padH [[buffer(19)]], constant int& padW [[buffer(20)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int idx = int(gid);
+    int totalKernelSize = outC * inC * kD * kH * kW;
+    if (idx >= totalKernelSize) return;
+    int kw = idx % kW;
+    int kh = (idx / kW) % kH;
+    int kd = (idx / (kW * kH)) % kD;
+    int ic = (idx / (kW * kH * kD)) % inC;
+    int oc = idx / (kW * kH * kD * inC);
+    float sum = 0.0f;
+    for (int n = 0; n < N; n++) {
+        for (int od = 0; od < outD; od++) {
+            for (int oh = 0; oh < outH; oh++) {
+                for (int ow = 0; ow < outW; ow++) {
+                    int d = od * strideD + kd - padD;
+                    int h = oh * strideH + kh - padH;
+                    int w = ow * strideW + kw - padW;
+                    if (d >= 0 && d < D && h >= 0 && h < H && w >= 0 && w < W) {
+                        int gradOutIdx = ((n * outC + oc) * outD + od) * outH * outW + oh * outW + ow;
+                        int inputIdx = ((n * inC + ic) * D + d) * H * W + h * W + w;
+                        sum += gradOutput[gradOutIdx] * input[inputIdx];
+                    }
+                }
+            }
+        }
+    }
+    gradKernel[idx] = sum;
+}
+
+kernel void depthwise_conv2d_backward_input(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* weights [[buffer(1)]],
+    device float* gradInput [[buffer(2)]],
+    constant int& N [[buffer(3)]], constant int& inC [[buffer(4)]],
+    constant int& H [[buffer(5)]], constant int& W [[buffer(6)]], constant int& M [[buffer(7)]],
+    constant int& outH [[buffer(8)]], constant int& outW [[buffer(9)]],
+    constant int& kH [[buffer(10)]], constant int& kW [[buffer(11)]],
+    constant int& strideH [[buffer(12)]], constant int& strideW [[buffer(13)]],
+    constant int& padH [[buffer(14)]], constant int& padW [[buffer(15)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int idx = int(gid);
+    int total = N * inC * H * W;
+    if (idx >= total) return;
+    int iw = idx % W;
+    int ih = (idx / W) % H;
+    int ic = (idx / (W * H)) % inC;
+    int b = idx / (W * H * inC);
+    int outC = inC * M;
+    float sum = 0.0f;
+    for (int m = 0; m < M; m++) {
+        int oc = ic * M + m;
+        for (int kh = 0; kh < kH; kh++) {
+            int t = ih + padH - kh;
+            if (t < 0 || (t % strideH) != 0) continue;
+            int oh = t / strideH;
+            if (oh < 0 || oh >= outH) continue;
+            for (int kw = 0; kw < kW; kw++) {
+                int tw = iw + padW - kw;
+                if (tw < 0 || (tw % strideW) != 0) continue;
+                int ow = tw / strideW;
+                if (ow < 0 || ow >= outW) continue;
+                sum += weights[(oc * kH + kh) * kW + kw]
+                     * gradOutput[((b * outC + oc) * outH + oh) * outW + ow];
+            }
+        }
+    }
+    gradInput[idx] = sum;
+}
+
+kernel void depthwise_conv2d_backward_weights(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* gradKernel [[buffer(2)]],
+    constant int& N [[buffer(3)]], constant int& inC [[buffer(4)]],
+    constant int& H [[buffer(5)]], constant int& W [[buffer(6)]], constant int& M [[buffer(7)]],
+    constant int& outH [[buffer(8)]], constant int& outW [[buffer(9)]],
+    constant int& kH [[buffer(10)]], constant int& kW [[buffer(11)]],
+    constant int& strideH [[buffer(12)]], constant int& strideW [[buffer(13)]],
+    constant int& padH [[buffer(14)]], constant int& padW [[buffer(15)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int idx = int(gid);
+    int outC = inC * M;
+    int total = outC * kH * kW;
+    if (idx >= total) return;
+    int kw = idx % kW;
+    int kh = (idx / kW) % kH;
+    int oc = idx / (kW * kH);
+    int ic = oc / M;
+    float sum = 0.0f;
+    for (int b = 0; b < N; b++) {
+        for (int oh = 0; oh < outH; oh++) {
+            int ih = oh * strideH - padH + kh;
+            if (ih < 0 || ih >= H) continue;
+            for (int ow = 0; ow < outW; ow++) {
+                int iw = ow * strideW - padW + kw;
+                if (iw < 0 || iw >= W) continue;
+                sum += input[((b * inC + ic) * H + ih) * W + iw]
+                     * gradOutput[((b * outC + oc) * outH + oh) * outW + ow];
+            }
+        }
+    }
+    gradKernel[idx] = sum;
+}
 ";
 }
