@@ -20542,7 +20542,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // records the argmax for the backward pass.
             if (typeof(T) == typeof(float) && outH > 0 && outW > 0
                 && !IsTapeActive<T>() && !Compilation.GraphMode.IsActive
-                && backend is IExtendedConvKernels gpu)
+                && backend is IAdaptiveMaxPool2DKernels gpu)
             {
                 int outLen = batch * channels * outH * outW;
                 using var bufIn2 = GetOrAllocateBuffer(backend, input);
