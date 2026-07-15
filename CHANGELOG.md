@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.114.5](https://github.com/ooples/AiDotNet.Tensors/compare/v0.114.4...v0.114.5) (2026-07-15)
+
+
+### Bug Fixes
+
+* **autodiff:** manual backward tape nodes now propagate input gradients through the graph path ([#786](https://github.com/ooples/AiDotNet.Tensors/issues/786)) ([db5029d](https://github.com/ooples/AiDotNet.Tensors/commit/db5029dbe8b0e631ec7e939f195e70d08cf31329))
+* **gpu:** LayerNorm forward returns TRUE variance, not inverse-std, so compiled-replay backward gradients are correct ([#784](https://github.com/ooples/AiDotNet.Tensors/issues/784)) ([e735690](https://github.com/ooples/AiDotNet.Tensors/commit/e7356905c2d8f1c6dfb1352ac4007c1716351784))
+
 ## [0.114.4](https://github.com/ooples/AiDotNet.Tensors/compare/v0.114.3...v0.114.4) (2026-07-15)
 
 
