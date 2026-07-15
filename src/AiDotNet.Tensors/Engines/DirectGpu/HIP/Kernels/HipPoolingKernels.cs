@@ -709,6 +709,33 @@ extern ""C"" __global__ __launch_bounds__(256) void nearest_neighbor_upsample_ba
 
     gradInput[idx] = grad_sum;
 }
+
+// #775: Adaptive max pooling 2D (NCHW). One thread per output element; the pooling window bounds derive
+// from the output/input ratio. HIP mirror of the OpenCL adaptive_max_pool2d kernel (1D-dispatched here).
+extern ""C"" __global__ __launch_bounds__(256) void adaptive_max_pool2d(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch * channels * outHeight * outWidth) return;
+    int ow = idx % outWidth;
+    int oh = (idx / outWidth) % outHeight;
+    int c = (idx / (outWidth * outHeight)) % channels;
+    int b = idx / (outWidth * outHeight * channels);
+    int hStart = (oh * inHeight) / outHeight;
+    int hEnd = ((oh + 1) * inHeight) / outHeight;
+    int wStart = (ow * inWidth) / outWidth;
+    int wEnd = ((ow + 1) * inWidth) / outWidth;
+    float maxV = -INFINITY;
+    for (int ih = hStart; ih < hEnd; ih++) {
+        for (int iw = wStart; iw < wEnd; iw++) {
+            float v = input[((b * channels + c) * inHeight + ih) * inWidth + iw];
+            if (v > maxV) maxV = v;
+        }
+    }
+    output[((b * channels + c) * outHeight + oh) * outWidth + ow] = maxV;
+}
 ";
     }
 
@@ -720,7 +747,7 @@ extern ""C"" __global__ __launch_bounds__(256) void nearest_neighbor_upsample_ba
             "avgpool2d", "avgpool2d_backward",
             "global_avgpool2d", "global_maxpool2d", "global_avgpool2d_backward",
             "global_maxpool2d_backward", "global_maxpool2d_backward_deterministic",
-            "adaptive_avgpool2d",
+            "adaptive_avgpool2d", "adaptive_max_pool2d",
             "maxpool3d", "maxpool3d_backward", "maxpool3d_backward_deterministic",
             "avgpool3d", "avgpool3d_backward",
             "nearest_upsample3d", "nearest_upsample3d_backward", "nearest_upsample3d_backward_deterministic",

@@ -6,8 +6,25 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 // (interface + kernels) so a partially-ported backend opts into exactly the families it can run; the
 // engine routes the rest to the CPU. Kernels live in the existing compiled modules (trilinear in the
 // convolution module); this partial only wires the launch.
-public sealed partial class HipBackend : ITrilinearInterpolationKernels, IConvTranspose3DKernels, ISpiralConvKernels
+public sealed partial class HipBackend : ITrilinearInterpolationKernels, IConvTranspose3DKernels, ISpiralConvKernels, IAdaptiveMaxPool2DKernels
 {
+    public unsafe void AdaptiveMaxPool2D(IGpuBuffer input, IGpuBuffer output,
+        int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
+    {
+        int total = checked(batch * channels * outHeight * outWidth);
+        if (total <= 0) return;
+        if (!_kernelCache.TryGetValue("adaptive_max_pool2d", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: adaptive_max_pool2d");
+        uint gridDim = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr i = input.Handle, o = output.Handle;
+        int vB = batch, vC = channels, vIH = inHeight, vIW = inWidth, vOH = outHeight, vOW = outWidth;
+        void** args = stackalloc void*[8];
+        args[0] = &i; args[1] = &o; args[2] = &vB; args[3] = &vC;
+        args[4] = &vIH; args[5] = &vIW; args[6] = &vOH; args[7] = &vOW;
+        LaunchKernel(kernel, gridDim, DefaultBlockSize, args);
+        Synchronize();
+    }
+
     public unsafe void TrilinearInterpolate(IGpuBuffer grid, IGpuBuffer positions, IGpuBuffer output,
         int d, int h, int w, int c, int p, float upperEps)
     {
