@@ -18,21 +18,22 @@ public sealed class TrilinearKernelSourceTests
     private const string OpenClConv = "AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.ConvolutionKernels";
     private const string MetalExt = "AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalExtendedConvKernels";
     private const string VulkanExt = "AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanExtendedConvKernels";
+    private const string WebGpuExt = "AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuExtendedConvKernels";
 
-    // The trilinear forward 8-corner weights factorize identically in every backend's source
-    // (C/MSL/GLSL all agree — no float literals, only int 1). OpenCL/CUDA/HIP expose GetSource(), Metal
-    // the Source field, Vulkan a per-kernel GLSL property (TrilinearInterpolate).
+    // The trilinear forward 8-corner weights factorize identically in C/MSL/GLSL (no float literals, only
+    // int 1); WGSL uses let-bindings and 1.0 literals, so the WebGPU row carries the WGSL-form markers.
     [Theory]
-    [InlineData(CudaConv, "GetSource")]
-    [InlineData(HipConv, "GetSource")]
-    [InlineData(OpenClConv, "GetSource")]
-    [InlineData(MetalExt, "Source")]
-    [InlineData(VulkanExt, "TrilinearInterpolate")]
-    public void ForwardEightCornerWeights_MatchAcrossBackends(string typeName, string memberName)
+    [InlineData(CudaConv, "GetSource", "w000 = (1 - fz) * (1 - fy) * (1 - fx)", "w111 = fz * fy * fx")]
+    [InlineData(HipConv, "GetSource", "w000 = (1 - fz) * (1 - fy) * (1 - fx)", "w111 = fz * fy * fx")]
+    [InlineData(OpenClConv, "GetSource", "w000 = (1 - fz) * (1 - fy) * (1 - fx)", "w111 = fz * fy * fx")]
+    [InlineData(MetalExt, "Source", "w000 = (1 - fz) * (1 - fy) * (1 - fx)", "w111 = fz * fy * fx")]
+    [InlineData(VulkanExt, "TrilinearInterpolate", "w000 = (1 - fz) * (1 - fy) * (1 - fx)", "w111 = fz * fy * fx")]
+    [InlineData(WebGpuExt, "TrilinearInterpolate", "let w000=(1.0-fz)*(1.0-fy)*(1.0-fx);", "let w111=fz*fy*fx;")]
+    public void ForwardEightCornerWeights_MatchAcrossBackends(string typeName, string memberName, string m1, string m2)
     {
         string source = GetStaticString(typeName, memberName);
-        Assert.Contains("w000 = (1 - fz) * (1 - fy) * (1 - fx)", source, StringComparison.Ordinal);
-        Assert.Contains("w111 = fz * fy * fx", source, StringComparison.Ordinal);
+        Assert.Contains(m1, source, StringComparison.Ordinal);
+        Assert.Contains(m2, source, StringComparison.Ordinal);
     }
 
     // The backward gather weight per axis matches each backend's source; GLSL drops the `f` float suffix,
@@ -43,6 +44,7 @@ public sealed class TrilinearKernelSourceTests
     [InlineData(OpenClConv, "GetSource", "float wz = (gz == z0 ? (1.0f - fz) : 0.0f) + (gz == z1 ? fz : 0.0f);")]
     [InlineData(MetalExt, "Source", "float wz = (gz == z0 ? (1.0f - fz) : 0.0f) + (gz == z1 ? fz : 0.0f);")]
     [InlineData(VulkanExt, "TrilinearInterpolateBackward", "float wz = (gz == z0 ? (1.0 - fz) : 0.0) + (gz == z1 ? fz : 0.0);")]
+    [InlineData(WebGpuExt, "TrilinearInterpolateBackward", "let wz=select(0.0,1.0-fz,gz==z0)+select(0.0,fz,gz==z1);")]
     public void BackwardPerAxisGatherWeight_MatchesAcrossBackends(string typeName, string memberName, string marker)
     {
         string source = GetStaticString(typeName, memberName);
