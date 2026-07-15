@@ -1,3 +1,4 @@
+#if NET7_0_OR_GREATER
 using System;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
@@ -32,3 +33,4 @@ public sealed partial class WebGpuBackend : ITrilinearInterpolationKernels
             [Bits(d), Bits(h), Bits(w), Bits(c), Bits(p), upperEps, 0f, 0f], total).GetAwaiter().GetResult();
     }
 }
+#endif
