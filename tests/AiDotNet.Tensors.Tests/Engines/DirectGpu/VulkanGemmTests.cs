@@ -9,6 +9,7 @@ using System;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 using AiDotNet.Tensors.Engines.Gpu;
+using AiDotNet.Tensors.Engines.Simd;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -95,6 +96,24 @@ public sealed class VulkanGemmTests
         return c;
     }
 
+    private static float[] CpuReferenceTransposed(float[] a, float[] b, float[] c,
+        int m, int n, int k, float alpha, float beta)
+    {
+        var result = (float[])c.Clone();
+        for (int i = 0; i < m; i++)
+        {
+            for (int j = 0; j < n; j++)
+            {
+                float acc = 0f;
+                for (int l = 0; l < k; l++)
+                    acc += a[i * k + l] * b[j * k + l];
+                result[i * n + j] = alpha * acc + beta * result[i * n + j];
+            }
+        }
+
+        return result;
+    }
+
     private static void AssertClose(float[] expected, float[] actual, double absTol, double relTol)
     {
         Assert.Equal(expected.Length, actual.Length);
@@ -143,6 +162,51 @@ public sealed class VulkanGemmTests
         using var bBuf = _backend.AllocateBuffer(b);
         using var cBuf = _backend.AllocateBuffer(m * n);
         _backend.Gemm(aBuf, bBuf, cBuf, m, n, k);
+        var actual = _backend.DownloadBuffer(cBuf);
+
+        AssertClose(expected, actual, absTol: 1e-3, relTol: 1e-4);
+    }
+
+    [SkippableTheory]
+    [InlineData(false, 0)]
+    [InlineData(true, 8)]
+    public void UnitPhaseCodebook_IsBitIdenticalToCpu(bool kPsk, int k)
+    {
+        Skip.If(!EnsureReady(needFp16: false), "Vulkan GLSL compute is unavailable on this system.");
+        const int seed = -1729, vocabulary = 5, dimension = 17;
+        int length = vocabulary * dimension;
+        var expectedReal = new float[length];
+        var expectedImag = new float[length];
+        SimdHrrKernels.UnitPhaseCodebookFloat(
+            expectedReal, expectedImag, seed, vocabulary, dimension, kPsk, k);
+
+        using var realBuffer = _backend.AllocateBuffer(length);
+        using var imagBuffer = _backend.AllocateBuffer(length);
+        _backend.SplitComplexUnitPhaseCodebook(
+            realBuffer, imagBuffer, seed, vocabulary, dimension, kPsk, k);
+
+        Assert.Equal(expectedReal, _backend.DownloadBuffer(realBuffer));
+        Assert.Equal(expectedImag, _backend.DownloadBuffer(imagBuffer));
+    }
+
+    [SkippableTheory]
+    [InlineData(16, 13, 9)]
+    [InlineData(37, 29, 11)]
+    public void MatMulTransposed_Fp32_MatchesCpuReference(int m, int n, int k)
+    {
+        Skip.If(!EnsureReady(needFp16: false), "Vulkan not available on this system.");
+
+        const float alpha = 0.75f;
+        const float beta = -0.25f;
+        var a = RandomMatrix(m, k, seed: 31 + m + k);
+        var b = RandomMatrix(n, k, seed: 47 + n + k);
+        var initial = RandomMatrix(m, n, seed: 59 + m + n);
+        var expected = CpuReferenceTransposed(a, b, initial, m, n, k, alpha, beta);
+
+        using var aBuf = _backend.AllocateBuffer(a);
+        using var bBuf = _backend.AllocateBuffer(b);
+        using var cBuf = _backend.AllocateBuffer(initial);
+        _backend.MatMulTransposed(aBuf, bBuf, cBuf, m, n, k, alpha, beta);
         var actual = _backend.DownloadBuffer(cBuf);
 
         AssertClose(expected, actual, absTol: 1e-3, relTol: 1e-4);

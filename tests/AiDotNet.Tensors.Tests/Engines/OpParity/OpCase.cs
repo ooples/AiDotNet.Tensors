@@ -8,6 +8,13 @@ using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Tests.Engines.OpParity;
 
+public enum GpuProbeExpectation
+{
+    Kernel,
+    MetadataOnly,
+    HostContract
+}
+
 /// <summary>
 /// A deterministic tensor input shared between the float run, the GPU float run, and the double
 /// ORACLE run. The SAME numeric samples (generated once as double[]) feed all three, so any
@@ -113,6 +120,32 @@ public sealed class OpCase
     /// to carry the reason.</summary>
     public bool GpuUnsafe { get; init; }
 
+    /// <summary>
+    /// Metadata-only operations intentionally launch no kernel. The residency probe
+    /// tracks these separately; dedicated tests verify they preserve a resident buffer.
+    /// </summary>
+    public GpuProbeExpectation GpuProbeExpectation { get; init; }
+
+    /// <summary>
+    /// Minimum dispatches required before the residency probe accepts this case as GPU-covered.
+    /// Cases that project a non-floating or multi-output result through another GPU primitive use
+    /// two so that the projection kernel cannot hide a CPU fallback in the operation under test.
+    /// </summary>
+    public int GpuMinimumKernelLaunches { get; }
+
+    /// <summary>Required explanation when <see cref="GpuProbeExpectation"/> is
+    /// <see cref="Engines.OpParity.GpuProbeExpectation.HostContract"/>.</summary>
+    public string? GpuHostContractReason { get; init; }
+
+    /// <summary>
+    /// Number of readbacks inherent in the current synchronous public contract. Tensor-valued
+    /// alternatives must use separate zero-readback registry cases.
+    /// </summary>
+    public int GpuAllowedReadbacks { get; init; }
+
+    /// <summary>Required contract-level justification for every nonzero readback allowance.</summary>
+    public string? GpuReadbackReason { get; init; }
+
     public OpCase(
         string name, string category,
         Func<IEngine, Tensor<float>> runFloat,
@@ -121,7 +154,8 @@ public sealed class OpCase
         Func<IEngine, Tensor<float>>? runFloatGrad = null,
         Func<IEngine, Tensor<double>>? runDoubleGrad = null,
         ParityTol bwdTol = default,
-        string? opMethod = null)
+        string? opMethod = null,
+        int gpuMinimumKernelLaunches = 1)
     {
         Name = name;
         // Default the covered op method to the leading identifier of the display name
@@ -134,6 +168,7 @@ public sealed class OpCase
         RunFloatGrad = runFloatGrad;
         RunDoubleGrad = runDoubleGrad;
         BwdTol = bwdTol;
+        GpuMinimumKernelLaunches = gpuMinimumKernelLaunches;
     }
 
     private static string LeadingIdentifier(string name)

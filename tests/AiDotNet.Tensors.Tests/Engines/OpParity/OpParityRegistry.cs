@@ -34,7 +34,643 @@ public static class OpParityRegistry
         .Concat(AttentionGraphBwd()).Concat(FlashBwdFusedTrilinear()).Concat(TrilinearBwdMhgaGrid())
         .Concat(BceScatterMaskBwd()).Concat(MaxoutSpectral()).Concat(NerfSplatSh())
         .Concat(ShBwdCtcSpectralBatch()).Concat(MaxPoolBwdAudio()).Concat(FoldReorderUnique())
-        .Concat(ConjReorderNdIfft()).Concat(MaskedSelectScatter()).Concat(IrfftBatch());
+        .Concat(ConjReorderNdIfft()).Concat(MaskedSelectScatter()).Concat(IrfftBatch())
+        .Concat(ResidentLayoutEmbeddingHashBackward()).Concat(DeterministicPendingAudio())
+        .Concat(NativeComplexPending()).Concat(TensorPredicatePending()).Concat(MultiOutputPending())
+        .Concat(IntegerIndexPending()).Concat(DeterministicDiscretePending())
+        .Concat(RandomAndHostContractPending());
+
+    public static IEnumerable<OpCase> RandomAndHostContractPending()
+    {
+        yield return new OpCase("TensorRandomUniform[4,8;range-invariant]", "random",
+            e => ValidateUnitInterval(e, e.TensorRandomUniform<float>(new[] { 4, 8 })),
+            e => ValidateUnitInterval(e, e.TensorRandomUniform<double>(new[] { 4, 8 })),
+            ParityTol.Exact, opMethod: "TensorRandomUniform");
+
+        yield return new OpCase("TensorRandomUniformRange[20000;seeded-exact]", "random",
+            e => e.TensorRandomUniformRange(new[] { 20000 }, -2f, 2f, 0),
+            e => e.TensorRandomUniformRange(new[] { 20000 }, -2.0, 2.0, 0),
+            ParityTol.Exact, opMethod: "TensorRandomUniformRange");
+
+        yield return new OpCase("TensorRandomNormal[4,8;std0]", "random",
+            e => e.TensorRandomNormal(new[] { 4, 8 }, 1.25f, 0f),
+            e => e.TensorRandomNormal(new[] { 4, 8 }, 1.25, 0.0),
+            ParityTol.Exact, opMethod: "TensorRandomNormal");
+
+        yield return new OpCase("TensorDropoutMask[4,8;p0;seed]", "random",
+            e => e.TensorDropoutMask(new[] { 4, 8 }, 0f, 1.75f, 991),
+            e => e.TensorDropoutMask(new[] { 4, 8 }, 0.0, 1.75, 991),
+            ParityTol.Exact, opMethod: "TensorDropoutMask");
+
+        yield return new OpCase("TensorDropoutMask[20000;p0.4;seeded-exact]", "random",
+            e => e.TensorDropoutMask(new[] { 20000 }, 0.4f, 1.75f, 992),
+            e => e.TensorDropoutMask(new[] { 20000 }, (double)0.4f, 1.75, 992),
+            ParityTol.Exact, opMethod: "TensorDropoutMask");
+
+        var singletonLogits = OpInput.Rand(6120, new[] { 4, 1 });
+        yield return new OpCase("GumbelSoftmax[4,1;singleton-axis]", "random",
+            e => e.GumbelSoftmax(singletonLogits.F(), 0.7, false, 1),
+            e => e.GumbelSoftmax(singletonLogits.D(), 0.7, false, 1),
+            ParityTol.Exact, opMethod: "GumbelSoftmax");
+
+        var constantSamples = OpInput.From(Enumerable.Repeat(2.0, 8).ToArray(), new[] { 2, 4 });
+        var importanceWeights = OpInput.From(
+            new[] { 1.0, 2.0, 3.0, 4.0, 4.0, 3.0, 2.0, 1.0 }, new[] { 2, 4 });
+        yield return new OpCase("ImportanceSampling[2,4->5;constant-t]", "random",
+            e => e.ImportanceSampling(constantSamples.F(), importanceWeights.F(), 5),
+            e => e.ImportanceSampling(constantSamples.D(), importanceWeights.D(), 5),
+            ParityTol.Exact, opMethod: "ImportanceSampling");
+
+        var mapInput = OpInput.From(
+            new[] { -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0 }, new[] { 2, 4 });
+        yield return new OpCase("TensorMap[2,4;managed-square-plus-one]", "host-contract",
+            e => e.TensorMap(mapInput.F(), x => x * x + 1f),
+            e => e.TensorMap(mapInput.D(), x => x * x + 1.0),
+            ParityTol.Exact, opMethod: "TensorMap")
+        {
+            GpuProbeExpectation = GpuProbeExpectation.HostContract,
+            GpuHostContractReason = "The public signature accepts an arbitrary managed Func<T,T> with no serializable expression or shader IR."
+        };
+
+        byte[] Png() => Convert.FromBase64String(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=");
+        yield return new OpCase("ImageDecode[png;1x1]", "host-contract",
+            e => ProjectBytes(e, e.ImageDecode(Png(), ImageFormat.Png)),
+            e => ProjectBytesDouble(e, e.ImageDecode(Png(), ImageFormat.Png)),
+            ParityTol.Exact, opMethod: "ImageDecode")
+        {
+            GpuProbeExpectation = GpuProbeExpectation.HostContract,
+            GpuHostContractReason = "Compressed host byte[] decoding and its data-dependent HWC shape are a host codec boundary."
+        };
+    }
+
+    private static Tensor<T> ValidateUnitInterval<T>(IEngine engine, Tensor<T> values)
+    {
+        var ops = AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<T>();
+        using (values)
+        using (var below = engine.TensorLessThan(values, ops.Zero))
+        using (var above = engine.TensorGreaterThan(values, ops.One))
+            return engine.TensorAdd(below, above);
+    }
+
+    public static IEnumerable<OpCase> DeterministicDiscretePending()
+    {
+        var boxes = OpInput.From(new[]
+        {
+            0.0, 0.0, 2.0, 2.0,
+            0.25, 0.25, 2.25, 2.25,
+            3.0, 3.0, 5.0, 5.0,
+            3.25, 3.25, 5.25, 5.25,
+            0.0, 3.0, 2.0, 5.0,
+            6.0, 0.0, 8.0, 2.0,
+        }, new[] { 6, 4 });
+        var scores = OpInput.From(new[] { 0.90, 0.80, 0.70, 0.60, 0.95, 0.50 }, new[] { 6 });
+        Tensor<int> ClassIds() => new Tensor<int>(new[] { 0, 1, 0, 0, 1, 0 }, new[] { 6 });
+        yield return new OpCase("Nms[6;thr0.5]", "detection",
+            e => ProjectIndices(e, e.Nms(boxes.F(), scores.F(), 0.5), 16),
+            e => ProjectIndicesDouble(e, e.Nms(boxes.D(), scores.D(), 0.5), 16),
+            ParityTol.Exact, opMethod: "Nms", gpuMinimumKernelLaunches: 2)
+        {
+            GpuAllowedReadbacks = 1,
+            GpuReadbackReason = "Nms must synchronously read its dynamic kept-index count to construct Tensor.Shape."
+        };
+        yield return new OpCase("BatchedNms[6;2class;thr0.5]", "detection",
+            e => ProjectIndices(e, e.BatchedNms(boxes.F(), scores.F(), ClassIds(), 0.5), 16),
+            e => ProjectIndicesDouble(e, e.BatchedNms(boxes.D(), scores.D(), ClassIds(), 0.5), 16),
+            ParityTol.Exact, opMethod: "BatchedNms", gpuMinimumKernelLaunches: 2)
+        {
+            GpuAllowedReadbacks = 1,
+            GpuReadbackReason = "BatchedNms must synchronously read its dynamic kept-index count to construct Tensor.Shape."
+        };
+
+        var masks = OpInput.From(new[]
+        {
+            0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 1.0, 1.0, 0.0,
+            0.0, 1.0, 1.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0,
+
+            0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0,
+        }, new[] { 2, 4, 5 });
+        yield return new OpCase("MasksToBoxes[2,4,5]", "detection",
+            e => ProjectIndices(e, e.MasksToBoxes(masks.F()), 16),
+            e => ProjectIndicesDouble(e, e.MasksToBoxes(masks.D()), 16),
+            ParityTol.Exact, opMethod: "MasksToBoxes", gpuMinimumKernelLaunches: 2);
+
+        var histogramInput = OpInput.From(new[]
+        {
+            -1.0, 0.0, 0.5, 1.0, 1.5, 2.0,
+             2.5, 3.0, 3.5, 4.0, 5.0, double.NaN,
+        }, new[] { 12 });
+        yield return new OpCase("TensorHistogram[12;4bins]", "statistics",
+            e => ProjectIndices(e, e.TensorHistogram(histogramInput.F(), 4, 0f, 4f), 32),
+            e => ProjectIndicesDouble(e, e.TensorHistogram(histogramInput.D(), 4, 0.0, 4.0), 32),
+            ParityTol.Exact, opMethod: "TensorHistogram", gpuMinimumKernelLaunches: 2);
+
+        var samples = OpInput.From(new[]
+        {
+             0.0, 0.0,
+             0.5, 0.5,
+             1.0, 1.0,
+             1.5, 2.5,
+             2.0, 3.0,
+            -1.0, 1.0,
+             1.0, 4.0,
+             double.NaN, 1.0,
+        }, new[] { 8, 2 });
+        yield return new OpCase("TensorHistogramDD[8,2;2x3bins]", "statistics",
+            e => ProjectIndices(e, e.TensorHistogramDD(samples.F(), new[] { 2, 3 },
+                new[] { 0f, 0f }, new[] { 2f, 3f }), 32),
+            e => ProjectIndicesDouble(e, e.TensorHistogramDD(samples.D(), new[] { 2, 3 },
+                new[] { 0.0, 0.0 }, new[] { 2.0, 3.0 }), 32),
+            ParityTol.Exact, opMethod: "TensorHistogramDD", gpuMinimumKernelLaunches: 2);
+
+        Tensor<int> BinValues() => new Tensor<int>(new[] { 0, 2, 1, 2, 5, 2, 5, 0 }, new[] { 8 });
+        yield return new OpCase("TensorBinCount[8;min8]", "statistics",
+            e => ProjectIndices(e, e.TensorBinCount(BinValues(), 8), 16),
+            e => ProjectIndicesDouble(e, e.TensorBinCount(BinValues(), 8), 16),
+            ParityTol.Exact, opMethod: "TensorBinCount", gpuMinimumKernelLaunches: 2)
+        {
+            GpuAllowedReadbacks = 1,
+            GpuReadbackReason = "TensorBinCount must synchronously read its dynamic maximum and negative-input flag to construct Tensor.Shape."
+        };
+
+        var audio = OpInput.From(
+            new[] { -1.0, -0.75, -0.5, -0.1, 0.0, 0.1, 0.5, 0.75, 1.0 }, new[] { 9 });
+        yield return new OpCase("MuLawEncoding[9;q256]", "audio",
+            e => ProjectIndices(e, e.MuLawEncoding(audio.F(), 256), 256),
+            e => ProjectIndicesDouble(e, e.MuLawEncoding(audio.D(), 256), 256),
+            ParityTol.Exact, opMethod: "MuLawEncoding", gpuMinimumKernelLaunches: 2);
+
+        Tensor<byte> Packed() => new Tensor<byte>(new byte[]
+        {
+            0x12, 0x34, 0x56,
+            0x78, 0x9A, 0xBC,
+            0xDE, 0xF0, 0x11,
+            0x22, 0x33, 0x44,
+        }, new[] { 4, 3 });
+        Tensor<int> PackedIndices() => new Tensor<int>(new[] { 2, 0 }, new[] { 2 });
+        Tensor<byte> PackedUpdates() => new Tensor<byte>(
+            new byte[] { 0xAA, 0xBB, 0xCC, 0x10, 0x20, 0x30 }, new[] { 2, 3 });
+        yield return new OpCase("TensorGatherPacked[4,3;idx2;vpb2]", "index",
+            e => ProjectBytes(e, e.TensorGatherPacked(Packed(), PackedIndices(), 0, 2)),
+            e => ProjectBytesDouble(e, e.TensorGatherPacked(Packed(), PackedIndices(), 0, 2)),
+            ParityTol.Exact, opMethod: "TensorGatherPacked", gpuMinimumKernelLaunches: 2);
+        yield return new OpCase("TensorScatterPacked[4,3;idx2;vpb2]", "index",
+            e => ProjectBytes(e, e.TensorScatterPacked(Packed(), PackedIndices(), PackedUpdates(), 0, 2)),
+            e => ProjectBytesDouble(e, e.TensorScatterPacked(Packed(), PackedIndices(), PackedUpdates(), 0, 2)),
+            ParityTol.Exact, opMethod: "TensorScatterPacked", gpuMinimumKernelLaunches: 2);
+    }
+
+    private static Tensor<float> ProjectBytes(IEngine engine, Tensor<byte> values)
+    {
+        var tableData = Enumerable.Range(0, 256).Select(i => (float)i).ToArray();
+        using (values)
+        using (var table = new Tensor<float>(tableData, new[] { 256, 1 }))
+            return engine.TensorEmbeddingLookup(table, values);
+    }
+
+    private static Tensor<double> ProjectBytesDouble(IEngine engine, Tensor<byte> values)
+    {
+        var tableData = Enumerable.Range(0, 256).Select(i => (double)i).ToArray();
+        using (values)
+        using (var table = new Tensor<double>(tableData, new[] { 256, 1 }))
+            return engine.TensorEmbeddingLookup(table, values);
+    }
+
+    public static IEnumerable<OpCase> IntegerIndexPending()
+    {
+        var extrema = OpInput.From(new[]
+        {
+             3.0, -2.0,  9.0,  1.0,  5.0,
+            -4.0,  7.0,  2.0,  8.0, -1.0,
+             6.0,  0.0, -3.0,  4.0, 10.0,
+        }, new[] { 3, 5 });
+        yield return new OpCase("TensorArgMax[3,5;ax1]", "index",
+            e => ProjectIndices(e, e.TensorArgMax(extrema.F(), 1), 16),
+            e => ProjectIndicesDouble(e, e.TensorArgMax(extrema.D(), 1), 16),
+            ParityTol.Exact, opMethod: "TensorArgMax", gpuMinimumKernelLaunches: 2);
+        yield return new OpCase("TensorArgMin[3,5;ax1]", "index",
+            e => ProjectIndices(e, e.TensorArgMin(extrema.F(), 1), 16),
+            e => ProjectIndicesDouble(e, e.TensorArgMin(extrema.D(), 1), 16),
+            ParityTol.Exact, opMethod: "TensorArgMin", gpuMinimumKernelLaunches: 2);
+
+        var sortable = OpInput.From(new[]
+        {
+             4.0, -1.0, 8.0, 2.0, 7.0, 0.0, 5.0, 3.0,
+            -3.0,  6.0, 1.0, 9.0, 2.5, 8.0, 4.0, 0.5,
+        }, new[] { 2, 8 });
+        yield return new OpCase("TensorArgsort[2,8;asc]", "index",
+            e => ProjectIndices(e, e.TensorArgsort(sortable.F(), 1), 16),
+            e => ProjectIndicesDouble(e, e.TensorArgsort(sortable.D(), 1), 16),
+            ParityTol.Exact, opMethod: "TensorArgsort", gpuMinimumKernelLaunches: 2);
+        yield return new OpCase("ArgSort[2,8;desc]", "index",
+            e => ProjectIndices(e, e.ArgSort(sortable.F(), 1, true), 16),
+            e => ProjectIndicesDouble(e, e.ArgSort(sortable.D(), 1, true), 16),
+            ParityTol.Exact, opMethod: "ArgSort", gpuMinimumKernelLaunches: 2);
+
+        var sorted = OpInput.From(new[] { -4.0, -1.0, 0.0, 2.0, 5.0, 9.0 }, new[] { 6 });
+        var queries = OpInput.From(new[] { -5.0, -1.0, 1.0, 2.0, 9.0, 10.0 }, new[] { 2, 3 });
+        yield return new OpCase("TensorSearchSorted[6;2,3;right]", "index",
+            e => ProjectIndices(e, e.TensorSearchSorted(sorted.F(), queries.F(), true), 16),
+            e => ProjectIndicesDouble(e, e.TensorSearchSorted(sorted.D(), queries.D(), true), 16),
+            ParityTol.Exact, opMethod: "TensorSearchSorted", gpuMinimumKernelLaunches: 2);
+        yield return new OpCase("TensorBucketize[2,3;6;left]", "index",
+            e => ProjectIndices(e, e.TensorBucketize(queries.F(), sorted.F()), 16),
+            e => ProjectIndicesDouble(e, e.TensorBucketize(queries.D(), sorted.D()), 16),
+            ParityTol.Exact, opMethod: "TensorBucketize", gpuMinimumKernelLaunches: 2);
+
+        var sparse = OpInput.From(new[]
+        {
+            0.0, 2.0, -0.0, -3.0,
+            4.0, 0.0,  5.0,  0.0,
+            0.0, 6.0,  0.0,  7.0,
+        }, new[] { 3, 4 });
+        yield return new OpCase("TensorNonzero[3,4;6nz]", "index",
+            e => ProjectIndices(e, e.TensorNonzero(sparse.F()), 16),
+            e => ProjectIndicesDouble(e, e.TensorNonzero(sparse.D()), 16),
+            ParityTol.Exact, opMethod: "TensorNonzero", gpuMinimumKernelLaunches: 2)
+        {
+            GpuAllowedReadbacks = 1,
+            GpuReadbackReason = "TensorNonzero must synchronously read its dynamic row count to construct Tensor.Shape."
+        };
+
+        var vertices = OpInput.From(new[]
+        {
+             1.0,  1.0,  1.0,
+            -1.0, -1.0,  1.0,
+            -1.0,  1.0, -1.0,
+             1.0, -1.0, -1.0,
+        }, new[] { 4, 3 });
+        Tensor<int> Faces() => new Tensor<int>(new[]
+        {
+            0, 1, 2,
+            0, 3, 1,
+            0, 2, 3,
+            1, 3, 2,
+        }, new[] { 4, 3 });
+        yield return new OpCase("GenerateSpiralIndices[tetra4;len3]", "index",
+            e => ProjectIndices(e, e.GenerateSpiralIndices(vertices.F(), Faces(), 3), 16),
+            e => ProjectIndicesDouble(e, e.GenerateSpiralIndices(vertices.D(), Faces(), 3), 16),
+            ParityTol.Exact, opMethod: "GenerateSpiralIndices", gpuMinimumKernelLaunches: 2);
+    }
+
+    private static Tensor<float> ProjectIndices(IEngine engine, Tensor<int> indices, int vocabularySize)
+    {
+        var tableData = Enumerable.Range(0, vocabularySize).Select(i => (float)i).ToArray();
+        using (indices)
+        using (var table = new Tensor<float>(tableData, new[] { vocabularySize, 1 }))
+            return engine.TensorEmbeddingLookup(table, indices);
+    }
+
+    private static Tensor<double> ProjectIndicesDouble(IEngine engine, Tensor<int> indices, int vocabularySize)
+    {
+        var tableData = Enumerable.Range(0, vocabularySize).Select(i => (double)i).ToArray();
+        using (indices)
+        using (var table = new Tensor<double>(tableData, new[] { vocabularySize, 1 }))
+            return engine.TensorEmbeddingLookup(table, indices);
+    }
+
+    public static IEnumerable<OpCase> TensorPredicatePending()
+    {
+        var equalLeft = OpInput.From(
+            new[] { 0.0, 3.0, 3.000000238418579, 1.0, double.NaN, double.PositiveInfinity, double.NegativeInfinity, -0.0 },
+            new[] { 8 });
+        var equalRight = OpInput.From(
+            new[] { 1e-8, 2.0, 3.0, 1.0, double.NaN, double.PositiveInfinity, double.PositiveInfinity, 0.0 },
+            new[] { 8 });
+        yield return new OpCase("TensorEq[8;nan-inf]", "comparison",
+            e => ProjectBits(e, e.TensorEq(equalLeft.F(), equalRight.F())),
+            e => ProjectBitsDouble(e, e.TensorEq(equalLeft.D(), equalRight.D())),
+            ParityTol.Exact, opMethod: "TensorEq", gpuMinimumKernelLaunches: 2);
+        yield return new OpCase("TensorEqScalar[8;3]", "comparison",
+            e => ProjectBits(e, e.TensorEqScalar(equalLeft.F(), 3f)),
+            e => ProjectBitsDouble(e, e.TensorEqScalar(equalLeft.D(), 3.0)),
+            ParityTol.Exact, opMethod: "TensorEqScalar", gpuMinimumKernelLaunches: 2);
+        yield return new OpCase("TensorIsClose[8;equalNan]", "comparison",
+            e => ProjectBits(e, e.TensorIsClose(equalLeft.F(), equalRight.F(), 1e-5f, 1e-8f, true)),
+            e => ProjectBitsDouble(e, e.TensorIsClose(equalLeft.D(), equalRight.D(), 1e-5, 1e-8, true)),
+            ParityTol.Exact, opMethod: "TensorIsClose", gpuMinimumKernelLaunches: 2);
+        yield return new OpCase("TensorIsFinite[8;nan-inf]", "comparison",
+            e => ProjectBits(e, e.TensorIsFinite(equalLeft.F())),
+            e => ProjectBitsDouble(e, e.TensorIsFinite(equalLeft.D())),
+            ParityTol.Exact, opMethod: "TensorIsFinite", gpuMinimumKernelLaunches: 2);
+        yield return new OpCase("TensorIsNan[8;nan-inf]", "comparison",
+            e => ProjectBits(e, e.TensorIsNan(equalLeft.F())),
+            e => ProjectBitsDouble(e, e.TensorIsNan(equalLeft.D())),
+            ParityTol.Exact, opMethod: "TensorIsNan", gpuMinimumKernelLaunches: 2);
+        yield return new OpCase("TensorIsInf[8;nan-inf]", "comparison",
+            e => ProjectBits(e, e.TensorIsInf(equalLeft.F())),
+            e => ProjectBitsDouble(e, e.TensorIsInf(equalLeft.D())),
+            ParityTol.Exact, opMethod: "TensorIsInf", gpuMinimumKernelLaunches: 2);
+
+        var elements = OpInput.From(new[] { 1.0, 2.0, 3.0, 4.0, 5.0, 6.0 }, new[] { 2, 3 });
+        var testElements = OpInput.From(new[] { 5.0, 2.0, 9.0, 4.0 }, new[] { 4 });
+        yield return new OpCase("TensorIsIn[2,3;4]", "comparison",
+            e => ProjectBits(e, e.TensorIsIn(elements.F(), testElements.F())),
+            e => ProjectBitsDouble(e, e.TensorIsIn(elements.D(), testElements.D())),
+            ParityTol.Exact, opMethod: "TensorIsIn", gpuMinimumKernelLaunches: 2);
+
+        Bit[] maskA = { true, true, false, false, true, false, true, false };
+        Bit[] maskB = { true, false, true, false, false, true, true, false };
+        Tensor<Bit> A() => new Tensor<Bit>((Bit[])maskA.Clone(), new[] { 2, 4 });
+        Tensor<Bit> B() => new Tensor<Bit>((Bit[])maskB.Clone(), new[] { 2, 4 });
+        yield return new OpCase("TensorLogicalAnd[2,4]", "comparison",
+            e => ProjectBits(e, e.TensorLogicalAnd(A(), B())),
+            e => ProjectBitsDouble(e, e.TensorLogicalAnd(A(), B())),
+            ParityTol.Exact, opMethod: "TensorLogicalAnd", gpuMinimumKernelLaunches: 2);
+        yield return new OpCase("TensorLogicalOr[2,4]", "comparison",
+            e => ProjectBits(e, e.TensorLogicalOr(A(), B())),
+            e => ProjectBitsDouble(e, e.TensorLogicalOr(A(), B())),
+            ParityTol.Exact, opMethod: "TensorLogicalOr", gpuMinimumKernelLaunches: 2);
+        yield return new OpCase("TensorLogicalXor[2,4]", "comparison",
+            e => ProjectBits(e, e.TensorLogicalXor(A(), B())),
+            e => ProjectBitsDouble(e, e.TensorLogicalXor(A(), B())),
+            ParityTol.Exact, opMethod: "TensorLogicalXor", gpuMinimumKernelLaunches: 2);
+        yield return new OpCase("TensorLogicalNot[2,4]", "comparison",
+            e => ProjectBits(e, e.TensorLogicalNot(A())),
+            e => ProjectBitsDouble(e, e.TensorLogicalNot(A())),
+            ParityTol.Exact, opMethod: "TensorLogicalNot", gpuMinimumKernelLaunches: 2);
+    }
+
+    private static Tensor<float> ProjectBits(IEngine engine, Tensor<Bit> value)
+    {
+        int[] shape = value.Shape.ToArray();
+        using (value)
+        using (var zeros = new Tensor<float>(new float[value.Length], shape))
+        using (var ones = new Tensor<float>(Enumerable.Repeat(1f, value.Length).ToArray(), shape))
+            return engine.TensorWhere(value, ones, zeros);
+    }
+
+    private static Tensor<double> ProjectBitsDouble(IEngine engine, Tensor<Bit> value)
+    {
+        int[] shape = value.Shape.ToArray();
+        using (value)
+        using (var zeros = new Tensor<double>(new double[value.Length], shape))
+        using (var ones = new Tensor<double>(Enumerable.Repeat(1.0, value.Length).ToArray(), shape))
+            return engine.TensorWhere(value, ones, zeros);
+    }
+
+    public static IEnumerable<OpCase> MultiOutputPending()
+    {
+        var split = OpInput.Rand(6090, new[] { 4, 6 });
+        yield return new OpCase("TensorSplit[4,6;3;ax1]", "shape",
+            e => ProjectMany(e, e.TensorSplit(split.F(), 3, 1)),
+            e => ProjectMany(e, e.TensorSplit(split.D(), 3, 1)),
+            ParityTol.Exact, opMethod: "TensorSplit", gpuMinimumKernelLaunches: 2);
+
+        var uneven = OpInput.Rand(6091, new[] { 4, 7 });
+        yield return new OpCase("TensorTensorSplit[4,7;3;ax1]", "shape",
+            e => ProjectMany(e, e.TensorTensorSplit(uneven.F(), 3, 1)),
+            e => ProjectMany(e, e.TensorTensorSplit(uneven.D(), 3, 1)),
+            ParityTol.Exact, opMethod: "TensorTensorSplit", gpuMinimumKernelLaunches: 2);
+        yield return new OpCase("TensorHSplit[4,6;3]", "shape",
+            e => ProjectMany(e, e.TensorHSplit(split.F(), 3)),
+            e => ProjectMany(e, e.TensorHSplit(split.D(), 3)),
+            ParityTol.Exact, opMethod: "TensorHSplit", gpuMinimumKernelLaunches: 2);
+
+        var vertical = OpInput.Rand(6092, new[] { 6, 4 });
+        yield return new OpCase("TensorVSplit[6,4;3]", "shape",
+            e => ProjectMany(e, e.TensorVSplit(vertical.F(), 3)),
+            e => ProjectMany(e, e.TensorVSplit(vertical.D(), 3)),
+            ParityTol.Exact, opMethod: "TensorVSplit", gpuMinimumKernelLaunches: 2);
+
+        var depth = OpInput.Rand(6093, new[] { 2, 3, 6 });
+        yield return new OpCase("TensorDSplit[2,3,6;3]", "shape",
+            e => ProjectMany(e, e.TensorDSplit(depth.F(), 3)),
+            e => ProjectMany(e, e.TensorDSplit(depth.D(), 3)),
+            ParityTol.Exact, opMethod: "TensorDSplit", gpuMinimumKernelLaunches: 2);
+
+        var unstack = OpInput.Rand(6094, new[] { 2, 3, 4 });
+        yield return new OpCase("TensorUnstack[2,3,4;ax1]", "shape",
+            e => ProjectMany(e, e.TensorUnstack(unstack.F(), 1)),
+            e => ProjectMany(e, e.TensorUnstack(unstack.D(), 1)),
+            ParityTol.Exact, opMethod: "TensorUnstack", gpuMinimumKernelLaunches: 2);
+
+        var broadcastA = OpInput.Rand(6095, new[] { 2, 1, 3 });
+        var broadcastB = OpInput.Rand(6096, new[] { 1, 4, 1 });
+        yield return new OpCase("TensorBroadcastTensors[2,1,3;1,4,1]", "shape",
+            e => ProjectMany(e, e.TensorBroadcastTensors(new[] { broadcastA.F(), broadcastB.F() })),
+            e => ProjectMany(e, e.TensorBroadcastTensors(new[] { broadcastA.D(), broadcastB.D() })),
+            ParityTol.Exact, opMethod: "TensorBroadcastTensors", gpuMinimumKernelLaunches: 2);
+
+        var gridX = OpInput.From(new[] { -1.0, 0.0, 2.0 }, new[] { 3 });
+        var gridY = OpInput.From(new[] { 10.0, 20.0, 30.0, 40.0 }, new[] { 4 });
+        yield return new OpCase("TensorMeshgrid[3;4;xy]", "shape",
+            e => ProjectMany(e, e.TensorMeshgrid(new[] { gridX.F(), gridY.F() }, "xy")),
+            e => ProjectMany(e, e.TensorMeshgrid(new[] { gridX.D(), gridY.D() }, "xy")),
+            ParityTol.Exact, opMethod: "TensorMeshgrid", gpuMinimumKernelLaunches: 2);
+    }
+
+    private static Tensor<T> ProjectMany<T>(IEngine engine, Tensor<T>[] values)
+    {
+        if (values.Length == 0)
+            return new Tensor<T>(new[] { 0 });
+
+        var flattened = new Tensor<T>[values.Length];
+        try
+        {
+            for (int i = 0; i < values.Length; i++)
+                flattened[i] = engine.Reshape(values[i], new[] { values[i].Length });
+            return engine.TensorConcatenate(flattened, 0);
+        }
+        finally
+        {
+            for (int i = 0; i < flattened.Length; i++) flattened[i]?.Dispose();
+            for (int i = 0; i < values.Length; i++) values[i]?.Dispose();
+        }
+    }
+
+    public static IEnumerable<OpCase> NativeComplexPending()
+    {
+        var realA = OpInput.Rand(6080, new[] { 2, 8 });
+        var imaginaryA = OpInput.Rand(6081, new[] { 2, 8 });
+        var realB = OpInput.Rand(6082, new[] { 2, 8 });
+        var imaginaryB = OpInput.Rand(6083, new[] { 2, 8 });
+
+        yield return new OpCase("NativeComplexAdd[2,8]", "complex",
+            e => ProjectComplex(e, e.NativeComplexAdd(realA.CF(imaginaryA), realB.CF(imaginaryB))),
+            e => ProjectComplex(e, e.NativeComplexAdd(realA.CD(imaginaryA), realB.CD(imaginaryB))),
+            ParityTol.Accum(2e-3), opMethod: "NativeComplexAdd");
+        yield return new OpCase("NativeComplexConjugate[2,8]", "complex",
+            e => ProjectComplex(e, e.NativeComplexConjugate(realA.CF(imaginaryA))),
+            e => ProjectComplex(e, e.NativeComplexConjugate(realA.CD(imaginaryA))),
+            ParityTol.Accum(2e-3), opMethod: "NativeComplexConjugate");
+        yield return new OpCase("NativeComplexMultiply[2,8]", "complex",
+            e => ProjectComplex(e, e.NativeComplexMultiply(realA.CF(imaginaryA), realB.CF(imaginaryB))),
+            e => ProjectComplex(e, e.NativeComplexMultiply(realA.CD(imaginaryA), realB.CD(imaginaryB))),
+            ParityTol.Accum(2e-3), opMethod: "NativeComplexMultiply");
+        yield return new OpCase("NativeComplexCrossSpectral[2,8]", "complex",
+            e => ProjectComplex(e, e.NativeComplexCrossSpectral(realA.CF(imaginaryA), realB.CF(imaginaryB))),
+            e => ProjectComplex(e, e.NativeComplexCrossSpectral(realA.CD(imaginaryA), realB.CD(imaginaryB))),
+            ParityTol.Accum(2e-3), opMethod: "NativeComplexCrossSpectral");
+        yield return new OpCase("NativeComplexScale[2,8]", "complex",
+            e => ProjectComplex(e, e.NativeComplexScale(realA.CF(imaginaryA), 0.375f)),
+            e => ProjectComplex(e, e.NativeComplexScale(realA.CD(imaginaryA), 0.375)),
+            ParityTol.Accum(2e-3), opMethod: "NativeComplexScale");
+
+        var magnitudes = OpInput.RandPositive(6084, new[] { 2, 8 }, 0.2, 2.0);
+        var phases = OpInput.Rand(6085, new[] { 2, 8 }, -2.5, 2.5);
+        yield return new OpCase("NativeComplexFromPolar[2,8]", "complex",
+            e => ProjectComplex(e, e.NativeComplexFromPolar(magnitudes.F(), phases.F())),
+            e => ProjectComplex(e, e.NativeComplexFromPolar(magnitudes.D(), phases.D())),
+            ParityTol.Accum(2e-3), opMethod: "NativeComplexFromPolar");
+        yield return new OpCase("NativeComplexTopK[2,8;k5]", "complex",
+            e => ProjectComplex(e, e.NativeComplexTopK(realA.CF(imaginaryA), 5)),
+            e => ProjectComplex(e, e.NativeComplexTopK(realA.CD(imaginaryA), 5)),
+            ParityTol.Accum(2e-3), opMethod: "NativeComplexTopK");
+
+        yield return new OpCase("NativeComplexFFT[2,8]", "complex",
+            e => ProjectComplex(e, e.NativeComplexFFT(realA.F())),
+            e => ProjectComplex(e, e.NativeComplexFFT(realA.D())),
+            ParityTol.Accum(4e-3), opMethod: "NativeComplexFFT");
+        yield return new OpCase("NativeComplexFFTComplex[2,8]", "complex",
+            e => ProjectComplex(e, e.NativeComplexFFTComplex(realA.CF(imaginaryA))),
+            e => ProjectComplex(e, e.NativeComplexFFTComplex(realA.CD(imaginaryA))),
+            ParityTol.Accum(4e-3), opMethod: "NativeComplexFFTComplex");
+        yield return new OpCase("NativeComplexIFFT[2,8]", "complex",
+            e => ProjectComplex(e, e.NativeComplexIFFT(realA.CF(imaginaryA))),
+            e => ProjectComplex(e, e.NativeComplexIFFT(realA.CD(imaginaryA))),
+            ParityTol.Accum(4e-3), opMethod: "NativeComplexIFFT");
+
+        var real2D = OpInput.Rand(6090, new[] { 2, 4, 8 });
+        yield return new OpCase("NativeComplexFFT2D[2,4,8]", "complex",
+            e => ProjectComplex(e, e.NativeComplexFFT2D(real2D.F())),
+            e => ProjectComplex(e, e.NativeComplexFFT2D(real2D.D())),
+            ParityTol.Accum(5e-3), opMethod: "NativeComplexFFT2D");
+        var realND = OpInput.Rand(6091, new[] { 4, 3, 8 });
+        yield return new OpCase("NativeComplexFFTND[4,3,8;axes0,2]", "complex",
+            e => ProjectComplex(e, e.NativeComplexFFTND(realND.F(), new[] { 0, 2 })),
+            e => ProjectComplex(e, e.NativeComplexFFTND(realND.D(), new[] { 0, 2 })),
+            ParityTol.Accum(5e-3), opMethod: "NativeComplexFFTND");
+
+        var waveform = OpInput.Rand(6092, new[] { 2, 16 });
+        yield return new OpCase("NativeAnalyticSignal[2,16;2-6Hz]", "complex",
+            e => ProjectComplex(e, e.NativeAnalyticSignal(waveform.F(), 2.0, 6.0, 32.0)),
+            e => ProjectComplex(e, e.NativeAnalyticSignal(waveform.D(), 2.0, 6.0, 32.0)),
+            ParityTol.Accum(4e-3), opMethod: "NativeAnalyticSignal");
+
+        var spectrumReal = OpInput.Rand(6093, new[] { 16 });
+        var spectrumImaginary = OpInput.Rand(6094, new[] { 16 });
+        yield return new OpCase("NativeBispectrum[16;4,4]", "complex",
+            e => ProjectComplex(e, e.NativeBispectrum(spectrumReal.CF(spectrumImaginary), 4, 4)),
+            e => ProjectComplex(e, e.NativeBispectrum(spectrumReal.CD(spectrumImaginary), 4, 4)),
+            ParityTol.Accum(3e-3), opMethod: "NativeBispectrum");
+        yield return new OpCase("NativeTrispectrum[16;3,3,3]", "complex",
+            e => ProjectComplex(e, e.NativeTrispectrum(spectrumReal.CF(spectrumImaginary), 3, 3, 3)),
+            e => ProjectComplex(e, e.NativeTrispectrum(spectrumReal.CD(spectrumImaginary), 3, 3, 3)),
+            ParityTol.Accum(4e-3), opMethod: "NativeTrispectrum");
+    }
+
+    private static Tensor<T> ProjectComplex<T>(IEngine engine, Tensor<Complex<T>> value)
+    {
+        using (value)
+        using (var magnitude = engine.NativeComplexMagnitude(value))
+        using (var phase = engine.NativeComplexPhase(value))
+            return engine.TensorConcatenate(new[] { magnitude, phase }, 0);
+    }
+
+    public static IEnumerable<OpCase> DeterministicPendingAudio()
+    {
+        const int nFft = 16;
+        const int hopLength = 4;
+        var window = OpInput.From(Enumerable.Range(0, nFft)
+            .Select(i => 0.5 - 0.5 * System.Math.Cos(2.0 * System.Math.PI * i / nFft))
+            .ToArray(), new[] { nFft });
+        var magnitude = OpInput.RandPositive(6040, new[] { 2, 9, 9 }, 0.05, 2.0);
+        var phase = OpInput.Rand(6041, new[] { 2, 9, 9 }, -System.Math.PI, System.Math.PI);
+        yield return new OpCase("ISTFT[2,9,9;n16;h4]", "audio",
+            e => e.ISTFT(magnitude.F(), phase.F(), nFft, hopLength, window.F(), center: true),
+            e => e.ISTFT(magnitude.D(), phase.D(), nFft, hopLength, window.D(), center: true),
+            ParityTol.Accum(1e-3), opMethod: "ISTFT");
+
+        var griffinMagnitude = OpInput.RandPositive(6050, new[] { 5, 17 }, 0.05, 2.0);
+        var griffinWindow = OpInput.From(Enumerable.Range(0, 8)
+            .Select(i => 0.5 - 0.5 * System.Math.Cos(2.0 * System.Math.PI * i / 8.0))
+            .ToArray(), new[] { 8 });
+        yield return new OpCase("GriffinLim[5,17;n8;2iter]", "audio",
+            e => e.GriffinLim(griffinMagnitude.F(), 8, 2, griffinWindow.F(), 2, 0.5),
+            e => e.GriffinLim(griffinMagnitude.D(), 8, 2, griffinWindow.D(), 2, 0.5),
+            ParityTol.Accum(5e-3), opMethod: "GriffinLim");
+
+        var stretchWaveform = OpInput.Rand(6060, new[] { 128 });
+        yield return new OpCase("TimeStretch[128;r1.5;n16]", "audio",
+            e => e.TimeStretch(stretchWaveform.F(), 1.5, nFft, hopLength),
+            e => e.TimeStretch(stretchWaveform.D(), 1.5, nFft, hopLength),
+            ParityTol.Accum(3e-3), opMethod: "TimeStretch");
+
+        var pitchWaveform = OpInput.Rand(6061, new[] { 256 });
+        yield return new OpCase("PitchShift[256;3st;n16]", "audio",
+            e => e.PitchShift(pitchWaveform.F(), 16000, 3.0, nFft, hopLength),
+            e => e.PitchShift(pitchWaveform.D(), 16000, 3.0, nFft, hopLength),
+            ParityTol.Accum(5e-3), opMethod: "PitchShift");
+
+        var cavityInput = OpInput.Rand(6070, new[] { 2, 16 });
+        var cavityFilterReal = OpInput.Rand(6071, new[] { 3, 16 });
+        var cavityFilterImaginary = OpInput.Rand(6072, new[] { 3, 16 });
+        yield return new OpCase("NativeBatchedCavityForward[2,16;3c;2b]", "audio",
+            e => e.NativeBatchedCavityForward(
+                cavityInput.F(), cavityFilterReal.CF(cavityFilterImaginary), 2),
+            e => e.NativeBatchedCavityForward(
+                cavityInput.D(), cavityFilterReal.CD(cavityFilterImaginary), 2),
+            ParityTol.Accum(3e-3), opMethod: "NativeBatchedCavityForward");
+    }
+
+    // Previously unregistered resident layout, embedding, and hash-grid backward paths.
+    public static IEnumerable<OpCase> ResidentLayoutEmbeddingHashBackward()
+    {
+        var layoutInput = OpInput.Rand(6000, new[] { 1, 8, 2, 3 });
+        yield return new OpCase("ReorderToNchwc[1,8,2,3;c8]", "shape",
+            e => e.ReorderToNchwc(layoutInput.F(), TensorLayout.Nchwc8),
+            e => e.ReorderToNchwc(layoutInput.D(), TensorLayout.Nchwc8),
+            ParityTol.Exact, opMethod: "ReorderToNchwc");
+
+        var embeddings = OpInput.Rand(6010, new[] { 6, 4 });
+        var indices = new Tensor<int>(new[] { 4, 1, 4, 0 }, new[] { 2, 2 });
+        yield return new OpCase("TensorEmbeddingLookup[6,4;2,2]", "index",
+            e => e.TensorEmbeddingLookup(embeddings.F(), indices),
+            e => e.TensorEmbeddingLookup(embeddings.D(), indices),
+            ParityTol.Exact, opMethod: "TensorEmbeddingLookup");
+
+        var embeddingGrad = OpInput.Rand(6011, new[] { 2, 2, 4 });
+        yield return new OpCase("TensorEmbeddingLookupBackward[2,2,4;v6]", "index",
+            e => e.TensorEmbeddingLookupBackward(embeddingGrad.F(), indices, 6, 4),
+            e => e.TensorEmbeddingLookupBackward(embeddingGrad.D(), indices, 6, 4),
+            ParityTol.Accum(1e-6), opMethod: "TensorEmbeddingLookupBackward");
+
+        var positions = OpInput.Rand(6020, new[] { 5, 3 }, 0.0, 1.0);
+        var table0 = OpInput.Rand(6021, new[] { 16, 2 });
+        var table1 = OpInput.Rand(6022, new[] { 16, 2 });
+        var outputGradient = OpInput.Rand(6023, new[] { 5, 4 });
+        yield return new OpCase("MultiresolutionHashEncodingBackward[5,3;2lvl;t0]", "encoding",
+            e => FirstHashGradient(e.MultiresolutionHashEncodingBackward(
+                positions.F(), new[] { table0.F(), table1.F() }, new[] { 4, 8 }, 2, outputGradient.F())),
+            e => FirstHashGradient(e.MultiresolutionHashEncodingBackward(
+                positions.D(), new[] { table0.D(), table1.D() }, new[] { 4, 8 }, 2, outputGradient.D())),
+            ParityTol.Accum(1e-3), opMethod: "MultiresolutionHashEncodingBackward");
+
+        var pacWaveforms = OpInput.Rand(6030, new[] { 2, 32 });
+        var gammaBands = new[] { (12.0, 18.0), (18.0, 26.0) };
+        yield return new OpCase("NativePacFeatures[2,32;2bands]", "audio",
+            e => e.NativePacFeatures(pacWaveforms.F(), 64, 32, 4.0, 8.0, gammaBands),
+            e => e.NativePacFeatures(pacWaveforms.D(), 64, 32, 4.0, 8.0, gammaBands),
+            ParityTol.Accum(2e-3), opMethod: "NativePacFeatures");
+
+        var paddedPacWaveforms = OpInput.Rand(6031, new[] { 2, 30 });
+        yield return new OpCase("NativePacFeatures[2,30->32;2bands]", "audio",
+            e => e.NativePacFeatures(paddedPacWaveforms.F(), 64, 32, 4.0, 8.0, gammaBands),
+            e => e.NativePacFeatures(paddedPacWaveforms.D(), 64, 32, 4.0, 8.0, gammaBands),
+            ParityTol.Accum(2e-3), opMethod: "NativePacFeatures");
+    }
+
+    private static Tensor<T> FirstHashGradient<T>(Tensor<T>[] gradients)
+    {
+        for (int i = 1; i < gradients.Length; i++) gradients[i].Dispose();
+        return gradients[0];
+    }
 
     // Inverse real FFT (interleaved-complex input -> real signal).
     public static IEnumerable<OpCase> IrfftBatch()
@@ -110,14 +746,18 @@ public static class OpParityRegistry
         var reIn = OpInput.Rand(5620, new[] { 2, 3, 4, 5 });
         yield return new OpCase("ReorderToNchw[2,3,4,5]", "shape",
             e => e.ReorderToNchw(reIn.F()), e => e.ReorderToNchw(reIn.D()),
-            ParityTol.Exact, opMethod: "ReorderToNchw");
+            ParityTol.Exact, opMethod: "ReorderToNchw") { GpuProbeExpectation = GpuProbeExpectation.MetadataOnly };
 
         // Unique-consecutive: consecutive duplicates ARE collapsed while non-consecutive repeats are
         // kept, so the deterministic input [1,1,2,2,2,3,3,1] must reduce to [1,2,3,1] (not an identity).
         var uc = OpInput.From(new double[] { 1, 1, 2, 2, 2, 3, 3, 1 }, new[] { 8 });
         yield return new OpCase("TensorUniqueConsecutive[8;dupes]", "index",
             e => e.TensorUniqueConsecutive(uc.F()), e => e.TensorUniqueConsecutive(uc.D()),
-            ParityTol.Exact, opMethod: "TensorUniqueConsecutive");
+            ParityTol.Exact, opMethod: "TensorUniqueConsecutive")
+        {
+            GpuAllowedReadbacks = 1,
+            GpuReadbackReason = "One scalar cardinality is required to construct the exact-size synchronous Tensor result."
+        };
     }
 
     // MaxPool 2D/3D backward (indices from WithIndices) + pitch shift.
@@ -126,18 +766,31 @@ public static class OpParityRegistry
         // 2D: input [1,2,8,8], pool/stride [2,2] -> pooled [1,2,4,4].
         var in2 = OpInput.Rand(5500, new[] { 1, 2, 8, 8 });
         var go2 = OpInput.Rand(5501, new[] { 1, 2, 4, 4 });
+        var setupCpu = new CpuEngine();
+        setupCpu.MaxPool2DWithIndices(in2.F(), new[] { 2, 2 }, new[] { 2, 2 }, out var idx2F).Dispose();
+        setupCpu.MaxPool2DWithIndices(in2.D(), new[] { 2, 2 }, new[] { 2, 2 }, out var idx2D).Dispose();
         yield return new OpCase("MaxPool2DBackward[1,2,8,8]", "pool",
-            e => { e.MaxPool2DWithIndices(in2.F(), new[] { 2, 2 }, new[] { 2, 2 }, out var idx); return e.MaxPool2DBackward(go2.F(), idx, new[] { 1, 2, 8, 8 }, new[] { 2, 2 }, new[] { 2, 2 }); },
-            e => { e.MaxPool2DWithIndices(in2.D(), new[] { 2, 2 }, new[] { 2, 2 }, out var idx); return e.MaxPool2DBackward(go2.D(), idx, new[] { 1, 2, 8, 8 }, new[] { 2, 2 }, new[] { 2, 2 }); },
+            e => e.MaxPool2DBackward(go2.F(), idx2F, new[] { 1, 2, 8, 8 }, new[] { 2, 2 }, new[] { 2, 2 }),
+            e => e.MaxPool2DBackward(go2.D(), idx2D, new[] { 1, 2, 8, 8 }, new[] { 2, 2 }, new[] { 2, 2 }),
             ParityTol.Exact, opMethod: "MaxPool2DBackward");
+        yield return new OpCase("MaxPool2DBackwardWithTensorIndices[1,2,8,8]", "pool",
+            e => { e.MaxPool2DWithTensorIndices(in2.F(), new[] { 2, 2 }, new[] { 2, 2 }, out var idx); return e.MaxPool2DBackwardWithTensorIndices(go2.F(), idx, new[] { 1, 2, 8, 8 }, new[] { 2, 2 }, new[] { 2, 2 }); },
+            e => { e.MaxPool2DWithTensorIndices(in2.D(), new[] { 2, 2 }, new[] { 2, 2 }, out var idx); return e.MaxPool2DBackwardWithTensorIndices(go2.D(), idx, new[] { 1, 2, 8, 8 }, new[] { 2, 2 }, new[] { 2, 2 }); },
+            ParityTol.Exact, opMethod: "MaxPool2DBackwardWithTensorIndices");
 
         // 3D: input [1,2,4,4,4], pool/stride [2,2,2] -> pooled [1,2,2,2,2].
         var in3 = OpInput.Rand(5510, new[] { 1, 2, 4, 4, 4 });
         var go3 = OpInput.Rand(5511, new[] { 1, 2, 2, 2, 2 });
+        setupCpu.MaxPool3DWithIndices(in3.F(), new[] { 2, 2, 2 }, new[] { 2, 2, 2 }, out var idx3F).Dispose();
+        setupCpu.MaxPool3DWithIndices(in3.D(), new[] { 2, 2, 2 }, new[] { 2, 2, 2 }, out var idx3D).Dispose();
         yield return new OpCase("MaxPool3DBackward[1,2,4,4,4]", "pool",
-            e => { e.MaxPool3DWithIndices(in3.F(), new[] { 2, 2, 2 }, new[] { 2, 2, 2 }, out var idx); return e.MaxPool3DBackward(go3.F(), idx, new[] { 1, 2, 4, 4, 4 }, new[] { 2, 2, 2 }, new[] { 2, 2, 2 }); },
-            e => { e.MaxPool3DWithIndices(in3.D(), new[] { 2, 2, 2 }, new[] { 2, 2, 2 }, out var idx); return e.MaxPool3DBackward(go3.D(), idx, new[] { 1, 2, 4, 4, 4 }, new[] { 2, 2, 2 }, new[] { 2, 2, 2 }); },
+            e => e.MaxPool3DBackward(go3.F(), idx3F, new[] { 1, 2, 4, 4, 4 }, new[] { 2, 2, 2 }, new[] { 2, 2, 2 }),
+            e => e.MaxPool3DBackward(go3.D(), idx3D, new[] { 1, 2, 4, 4, 4 }, new[] { 2, 2, 2 }, new[] { 2, 2, 2 }),
             ParityTol.Exact, opMethod: "MaxPool3DBackward");
+        yield return new OpCase("MaxPool3DBackwardWithTensorIndices[1,2,4,4,4]", "pool",
+            e => { e.MaxPool3DWithTensorIndices(in3.F(), new[] { 2, 2, 2 }, new[] { 2, 2, 2 }, out var idx); return e.MaxPool3DBackwardWithTensorIndices(go3.F(), idx, new[] { 1, 2, 4, 4, 4 }, new[] { 2, 2, 2 }, new[] { 2, 2, 2 }); },
+            e => { e.MaxPool3DWithTensorIndices(in3.D(), new[] { 2, 2, 2 }, new[] { 2, 2, 2 }, out var idx); return e.MaxPool3DBackwardWithTensorIndices(go3.D(), idx, new[] { 1, 2, 4, 4, 4 }, new[] { 2, 2, 2 }, new[] { 2, 2, 2 }); },
+            ParityTol.Exact, opMethod: "MaxPool3DBackwardWithTensorIndices");
     }
 
     // SH backward, CTC loss, batched spectral filter.
@@ -626,7 +1279,15 @@ public static class OpParityRegistry
         yield return new OpCase("MaxPool3DWithIndices[1,2,4,4,4;2x2x2]", "pool",
             e => e.MaxPool3DWithIndices(mp3.F(), new[] { 2, 2, 2 }, new[] { 2, 2, 2 }, out _),
             e => e.MaxPool3DWithIndices(mp3.D(), new[] { 2, 2, 2 }, new[] { 2, 2, 2 }, out _),
-            ParityTol.Exact, opMethod: "MaxPool3DWithIndices");
+            ParityTol.Exact, opMethod: "MaxPool3DWithIndices")
+        {
+            GpuAllowedReadbacks = 1,
+            GpuReadbackReason = "The legacy CLR multidimensional-array out parameter is host-owned; MaxPool3DWithTensorIndices is the resident replacement."
+        };
+        yield return new OpCase("MaxPool3DWithTensorIndices[1,2,4,4,4;2x2x2]", "pool",
+            e => e.MaxPool3DWithTensorIndices(mp3.F(), new[] { 2, 2, 2 }, new[] { 2, 2, 2 }, out _),
+            e => e.MaxPool3DWithTensorIndices(mp3.D(), new[] { 2, 2, 2 }, new[] { 2, 2, 2 }, out _),
+            ParityTol.Exact, opMethod: "MaxPool3DWithTensorIndices");
     }
 
     // Deformable-conv backwards, grid-sample backwards, scatter-add backward.
@@ -909,6 +1570,24 @@ public static class OpParityRegistry
             e => e.ScaledDotProductAttention(q.D(), k.D(), val.D(), null, null, out _),
             ParityTol.Accum(1e-3), opMethod: "ScaledDotProductAttention");
 
+        bool[] maskData =
+        [
+            true, false, true, true,
+            true, true, false, true,
+            false, true, true, false,
+            true, false, true, true,
+            false, true, true, true,
+            true, true, false, false,
+            true, false, true, false,
+            false, true, true, true
+        ];
+        yield return new OpCase("ScaledDotProductAttentionMasked[1,2,4,8]", "attention",
+            e => e.ScaledDotProductAttention(q.F(), k.F(), val.F(),
+                new Tensor<bool>((bool[])maskData.Clone(), new[] { 1, 2, 4, 4 }), null, out _),
+            e => e.ScaledDotProductAttention(q.D(), k.D(), val.D(),
+                new Tensor<bool>((bool[])maskData.Clone(), new[] { 1, 2, 4, 4 }), null, out _),
+            ParityTol.Accum(1e-3), opMethod: "ScaledDotProductAttention");
+
         // ScatterMax: every output index covered (0..3) so no empty-group -inf; max is deterministic.
         var smSrc = OpInput.Rand(3510, new[] { 6 });
         var smIdx = new int[] { 0, 1, 2, 3, 0, 1 };
@@ -922,7 +1601,11 @@ public static class OpParityRegistry
         var uniq = OpInput.From(new double[] { 3, 1, 2, 1, 3, 2, 4, 1, 5, 2, 3, 4 }, new[] { 12 });
         yield return new OpCase("TensorUnique[12;dupes]", "index",
             e => e.TensorUnique(uniq.F(), true), e => e.TensorUnique(uniq.D(), true),
-            ParityTol.Exact, opMethod: "TensorUnique");
+            ParityTol.Exact, opMethod: "TensorUnique")
+        {
+            GpuAllowedReadbacks = 1,
+            GpuReadbackReason = "One scalar cardinality is required to construct the exact-size synchronous Tensor result."
+        };
     }
 
     // Gather/scatter with explicit int indices + max-pool-with-indices.
@@ -961,12 +1644,24 @@ public static class OpParityRegistry
             e => e.TensorIndexSelectDiff(src.F(), new Tensor<int>((int[])selIdx.Clone(), new[] { 3 }), 0),
             e => e.TensorIndexSelectDiff(src.D(), new Tensor<int>((int[])selIdx.Clone(), new[] { 3 }), 0),
             ParityTol.Exact, opMethod: "TensorIndexSelectDiff");
+        yield return new OpCase("TensorIndexSelectDiff[4,6;idx3;axis1]", "index",
+            e => e.TensorIndexSelectDiff(src.F(), new Tensor<int>((int[])selIdx.Clone(), new[] { 3 }), 1),
+            e => e.TensorIndexSelectDiff(src.D(), new Tensor<int>((int[])selIdx.Clone(), new[] { 3 }), 1),
+            ParityTol.Exact, opMethod: "TensorIndexSelectDiff");
 
         var poolIn = OpInput.Rand(3420, new[] { 1, 2, 8, 8 });
         yield return new OpCase("MaxPool2DWithIndices[1,2,8,8;2x2]", "pool",
             e => e.MaxPool2DWithIndices(poolIn.F(), new[] { 2, 2 }, new[] { 2, 2 }, out _),
             e => e.MaxPool2DWithIndices(poolIn.D(), new[] { 2, 2 }, new[] { 2, 2 }, out _),
-            ParityTol.Exact, opMethod: "MaxPool2DWithIndices");
+            ParityTol.Exact, opMethod: "MaxPool2DWithIndices")
+        {
+            GpuAllowedReadbacks = 1,
+            GpuReadbackReason = "The legacy CLR multidimensional-array out parameter is host-owned; MaxPool2DWithTensorIndices is the resident replacement."
+        };
+        yield return new OpCase("MaxPool2DWithTensorIndices[1,2,8,8;2x2]", "pool",
+            e => e.MaxPool2DWithTensorIndices(poolIn.F(), new[] { 2, 2 }, new[] { 2, 2 }, out _),
+            e => e.MaxPool2DWithTensorIndices(poolIn.D(), new[] { 2, 2 }, new[] { 2, 2 }, out _),
+            ParityTol.Exact, opMethod: "MaxPool2DWithTensorIndices");
     }
 
     // Fused conv2d/3d/transpose, convT3d backward, mel filterbank, MLP forward.
@@ -985,20 +1680,10 @@ public static class OpParityRegistry
         var c3In = OpInput.Rand(3310, new[] { 1, 2, 4, 4, 4 });
         var c3K = OpInput.Rand(3311, new[] { 3, 2, 2, 2, 2 });
         var c3B = OpInput.Rand(3312, new[] { 3 });
-        // QUARANTINED — NOT an op correctness bug. FusedConv3D is CORRECT in isolation and in every
-        // tested subset (verified passing 3x isolated, and in the C/D/E/F ~69-op and A/B/F ~35-op
-        // subsets). It diverges (deterministically) ONLY in the full ~400-op suite run. Exhaustively
-        // ruled out: activation+weight cache staleness (cleared both, no change), Synchronize before
-        // alloc AND after the conv3d dispatch (no change), output-buffer pool aliasing (fresh
-        // AllocateBuffer off the resident path), stale kernel args (backend.Conv3D sets all 23),
-        // run-to-run nondeterminism (gpuF==gpuF2 bit-exact), and GPU OOM (tensors are tiny). Consistent
-        // with AMD RX 5500 OpenCL driver state degradation after many kernel dispatches for the
-        // 3D-dispatched conv3d_direct kernel — a driver/environment artifact, not our kernel. Tracked.
         yield return new OpCase("FusedConv3D[1,2,4,4,4;k3,2,2,2,2]", "conv",
             e => e.FusedConv3D(c3In.F(), c3K.F(), c3B.F(), 1, 1, 1, 0, 0, 0, 1, 1, 1, FusedActivationType.None),
             e => e.FusedConv3D(c3In.D(), c3K.D(), c3B.D(), 1, 1, 1, 0, 0, 0, 1, 1, 1, FusedActivationType.None),
-            ParityTol.Accum(1e-3), opMethod: "FusedConv3D")
-        { KnownDivergence = "Full-suite-only cumulative artifact (correct in isolation + all subsets <=70 ops; survives sync + cache-clear; tiny tensors) — consistent with AMD OpenCL driver state after many dispatches, not a kernel bug. Degrades faster than NativeMagnitudeAndPhase: even the harness engine-reset every 64 ops (#775) does not clear it (fails both the early OpParityTests and late generated copies), so it stays quarantined while NativeMag is un-quarantined." };
+            ParityTol.Accum(1e-3), opMethod: "FusedConv3D");
 
         // FusedConvTranspose2D: input [1,2,4,4], kernel [2,3,2,2], stride2 -> [1,3,8,8].
         var ctIn = OpInput.Rand(3320, new[] { 1, 2, 4, 4 });
@@ -1048,7 +1733,7 @@ public static class OpParityRegistry
             ParityTol.Ulp(2), opMethod: "TensorLeakyReLU");
         yield return new OpCase("TensorPower[4,6;^2]", "elementwise",
             e => e.TensorPower(a.F(), 2f), e => e.TensorPower(a.D(), 2.0),
-            ParityTol.Ulp(8), opMethod: "TensorPower");
+            ParityTol.Exact, opMethod: "TensorPower");
         yield return new OpCase("TensorInner[4,6;4,6]", "matmul",
             e => e.TensorInner(a.F(), b.F()), e => e.TensorInner(a.D(), b.D()),
             ParityTol.Accum(1e-3), opMethod: "TensorInner");
@@ -1117,17 +1802,17 @@ public static class OpParityRegistry
         yield return new OpCase("ScalarMinusTensor[2-;4,6]", "elementwise",
             e => e.ScalarMinusTensor(2f, a.F()), e => e.ScalarMinusTensor(2.0, a.D()),
             ParityTol.Exact, opMethod: "ScalarMinusTensor");
-        yield return new OpCase("TensorAddScaled[4,6;2,3]", "elementwise",
-            e => e.TensorAddScaled(a.F(), b.F(), 2f, 3f), e => e.TensorAddScaled(a.D(), b.D(), 2.0, 3.0),
-            ParityTol.Ulp(4), opMethod: "TensorAddScaled");
+        yield return new OpCase("TensorAddScaled[4,6;0.3,-1.7]", "elementwise",
+            e => e.TensorAddScaled(a.F(), b.F(), 0.3f, -1.7f), e => e.TensorAddScaled(a.D(), b.D(), 0.3, -1.7),
+            ParityTol.Exact, opMethod: "TensorAddScaled");
 
         var v = OpInput.Rand(3010, new[] { 4 });
         yield return new OpCase("TensorAtLeast1D[4]", "shape",
-            e => e.TensorAtLeast1D(v.F()), e => e.TensorAtLeast1D(v.D()), ParityTol.Exact, opMethod: "TensorAtLeast1D");
+            e => e.TensorAtLeast1D(v.F()), e => e.TensorAtLeast1D(v.D()), ParityTol.Exact, opMethod: "TensorAtLeast1D") { GpuProbeExpectation = GpuProbeExpectation.MetadataOnly };
         yield return new OpCase("TensorAtLeast2D[4]", "shape",
-            e => e.TensorAtLeast2D(v.F()), e => e.TensorAtLeast2D(v.D()), ParityTol.Exact, opMethod: "TensorAtLeast2D");
+            e => e.TensorAtLeast2D(v.F()), e => e.TensorAtLeast2D(v.D()), ParityTol.Exact, opMethod: "TensorAtLeast2D") { GpuProbeExpectation = GpuProbeExpectation.MetadataOnly };
         yield return new OpCase("TensorAtLeast3D[4]", "shape",
-            e => e.TensorAtLeast3D(v.F()), e => e.TensorAtLeast3D(v.D()), ParityTol.Exact, opMethod: "TensorAtLeast3D");
+            e => e.TensorAtLeast3D(v.F()), e => e.TensorAtLeast3D(v.D()), ParityTol.Exact, opMethod: "TensorAtLeast3D") { GpuProbeExpectation = GpuProbeExpectation.MetadataOnly };
 
         var padIn = OpInput.Rand(3020, new[] { 2, 4 });
         yield return new OpCase("PadNd[2,4;1,1,1,1;constant]", "pad",
@@ -1476,6 +2161,12 @@ public static class OpParityRegistry
         yield return new OpCase("LayerNormBackward[4,64]", "norm-bwd",
             e => { e.LayerNorm(x.F(), g.F(), beta.F(), 1e-5, out var mn, out var vr); return e.LayerNormBackward(go.F(), x.F(), g.F(), mn, vr, 1e-5, out _, out _); },
             e => { e.LayerNorm(x.D(), g.D(), beta.D(), 1e-5, out var mn, out var vr); return e.LayerNormBackward(go.D(), x.D(), g.D(), mn, vr, 1e-5, out _, out _); }, ParityTol.Accum(2e-3), opMethod: "LayerNormBackward");
+        yield return new OpCase("LayerNormBackwardGradGamma[4,64]", "norm-bwd",
+            e => { e.LayerNorm(x.F(), g.F(), beta.F(), 1e-5, out var mn, out var vr); e.LayerNormBackward(go.F(), x.F(), g.F(), mn, vr, 1e-5, out var gg, out _); return gg; },
+            e => { e.LayerNorm(x.D(), g.D(), beta.D(), 1e-5, out var mn, out var vr); e.LayerNormBackward(go.D(), x.D(), g.D(), mn, vr, 1e-5, out var gg, out _); return gg; }, ParityTol.Accum(2e-3), opMethod: "LayerNormBackward");
+        yield return new OpCase("LayerNormBackwardGradBeta[4,64]", "norm-bwd",
+            e => { e.LayerNorm(x.F(), g.F(), beta.F(), 1e-5, out var mn, out var vr); e.LayerNormBackward(go.F(), x.F(), g.F(), mn, vr, 1e-5, out _, out var gb); return gb; },
+            e => { e.LayerNorm(x.D(), g.D(), beta.D(), 1e-5, out var mn, out var vr); e.LayerNormBackward(go.D(), x.D(), g.D(), mn, vr, 1e-5, out _, out var gb); return gb; }, ParityTol.Accum(2e-3), opMethod: "LayerNormBackward");
         yield return new OpCase("RMSNormBackward[4,64]", "norm-bwd",
             e => { e.RMSNorm(x.F(), g.F(), 1e-5, out var rms); return e.RMSNormBackward(go.F(), x.F(), g.F(), rms, 1e-5, out _); },
             e => { e.RMSNorm(x.D(), g.D(), 1e-5, out var rms); return e.RMSNormBackward(go.D(), x.D(), g.D(), rms, 1e-5, out _); }, ParityTol.Accum(2e-3), opMethod: "RMSNormBackward");
@@ -1580,7 +2271,7 @@ public static class OpParityRegistry
         yield return new OpCase("TensorMaxPool1D[1,4,16;k2s2]", "pool", e => e.TensorMaxPool1D(seq.F(), 2, 2), e => e.TensorMaxPool1D(seq.D(), 2, 2), ParityTol.Exact, opMethod: "TensorMaxPool1D");
 
         var t3 = OpInput.Rand(1601, new[] { 2, 3, 4 });
-        yield return new OpCase("TensorPermute[2,3,4;201]", "shape", e => e.TensorPermute(t3.F(), new[] { 2, 0, 1 }), e => e.TensorPermute(t3.D(), new[] { 2, 0, 1 }), ParityTol.Exact, opMethod: "TensorPermute");
+        yield return new OpCase("TensorPermute[2,3,4;201]", "shape", e => e.TensorPermute(t3.F(), new[] { 2, 0, 1 }), e => e.TensorPermute(t3.D(), new[] { 2, 0, 1 }), ParityTol.Exact, opMethod: "TensorPermute") { GpuProbeExpectation = GpuProbeExpectation.MetadataOnly };
         var m = OpInput.Rand(1602, new[] { 4, 8 });
         yield return new OpCase("TensorSlice[4,8;s1,2;l2,4]", "shape", e => e.TensorSlice(m.F(), new[] { 1, 2 }, new[] { 2, 4 }), e => e.TensorSlice(m.D(), new[] { 1, 2 }, new[] { 2, 4 }), ParityTol.Exact, opMethod: "TensorSlice");
         yield return new OpCase("TensorSliceAxis[4,8;ax0,i1]", "shape", e => e.TensorSliceAxis(m.F(), 0, 1), e => e.TensorSliceAxis(m.D(), 0, 1), ParityTol.Exact, opMethod: "TensorSliceAxis");
@@ -1681,7 +2372,7 @@ public static class OpParityRegistry
         var a = OpInput.Rand(1310, new[] { 4, 8 }, -4.0, 4.0);
         yield return U("TensorSELU", "activation", (e, t) => e.TensorSELU(t), (e, t) => e.TensorSELU(t), ParityTol.Ulp(64, 1e-6), a);
         yield return new OpCase("TensorPReLU[4,8]", "activation", e => e.TensorPReLU(a.F(), OpInput.Rand(1311, new[] { 8 }, 0.1, 0.5).F()), e => e.TensorPReLU(a.D(), OpInput.Rand(1311, new[] { 8 }, 0.1, 0.5).D()), ParityTol.Ulp(4, 1e-6), opMethod: "TensorPReLU");
-        yield return new OpCase("TensorRReLU[4,8;eval]", "activation", e => e.TensorRReLU(a.F(), 0.125, 0.333, false), e => e.TensorRReLU(a.D(), 0.125, 0.333, false), ParityTol.Ulp(4, 1e-6), opMethod: "TensorRReLU");
+        yield return new OpCase("TensorRReLU[4,8;eval]", "activation", e => e.TensorRReLU(a.F(), 0.125, 0.333, false), e => e.TensorRReLU(a.D(), 0.125, 0.333, false), ParityTol.Exact, opMethod: "TensorRReLU");
         yield return new OpCase("TensorSquash[4,8]", "activation", e => e.TensorSquash(OpInput.Rand(1312, new[] { 4, 8 }).F(), -1), e => e.TensorSquash(OpInput.Rand(1312, new[] { 4, 8 }).D(), -1), ParityTol.Accum(1e-3), opMethod: "TensorSquash");
         yield return new OpCase("SphericalSoftmax[4,8]", "activation", e => e.SphericalSoftmax(OpInput.Rand(1313, new[] { 4, 8 }, -3.0, 3.0).F(), -1), e => e.SphericalSoftmax(OpInput.Rand(1313, new[] { 4, 8 }, -3.0, 3.0).D(), -1), ParityTol.Accum(1e-3), opMethod: "SphericalSoftmax");
 
@@ -1830,7 +2521,7 @@ public static class OpParityRegistry
         yield return B("TensorFmod", "arithmetic", (e, u, v) => e.TensorFmod(u, v), (e, u, v) => e.TensorFmod(u, v), ParityTol.Ulp(8, 1e-6), a, bnz);
         yield return B("TensorRemainder", "arithmetic", (e, u, v) => e.TensorRemainder(u, v), (e, u, v) => e.TensorRemainder(u, v), ParityTol.Ulp(8, 1e-6), a, bnz);
 
-        yield return new OpCase("TensorLerp[4,64]", "arithmetic", e => e.TensorLerp(a.F(), b.F(), 0.3f), e => e.TensorLerp(a.D(), b.D(), 0.3), ParityTol.Ulp(4, 1e-6), opMethod: "TensorLerp");
+        yield return new OpCase("TensorLerp[4,64]", "arithmetic", e => e.TensorLerp(a.F(), b.F(), 0.3f), e => e.TensorLerp(a.D(), b.D(), 0.3), ParityTol.Exact, opMethod: "TensorLerp");
         yield return new OpCase("TensorClip[4,64]", "arithmetic", e => e.TensorClip(a.F(), -0.5f, 0.5f), e => e.TensorClip(a.D(), -0.5, 0.5), ParityTol.Exact, opMethod: "TensorClip");
         yield return new OpCase("TensorThreshold[4,64]", "arithmetic", e => e.TensorThreshold(a.F(), 0.0f, 0.0f), e => e.TensorThreshold(a.D(), 0.0, 0.0), ParityTol.Exact, opMethod: "TensorThreshold");
 
@@ -1841,7 +2532,7 @@ public static class OpParityRegistry
         var m = OpInput.Rand(810, new[] { 4, 8 });
         var sq = OpInput.Rand(811, new[] { 4, 1, 8 });
         var diag = OpInput.Rand(812, new[] { 4 });
-        yield return new OpCase("TensorSqueeze[4,1,8;ax1]", "shape", e => e.TensorSqueeze(sq.F(), 1), e => e.TensorSqueeze(sq.D(), 1), ParityTol.Exact, opMethod: "TensorSqueeze");
+        yield return new OpCase("TensorSqueeze[4,1,8;ax1]", "shape", e => e.TensorSqueeze(sq.F(), 1), e => e.TensorSqueeze(sq.D(), 1), ParityTol.Exact, opMethod: "TensorSqueeze") { GpuProbeExpectation = GpuProbeExpectation.MetadataOnly };
         yield return new OpCase("TensorNarrow[4,8;d1,1,4]", "shape", e => e.TensorNarrow(m.F(), 1, 1, 4), e => e.TensorNarrow(m.D(), 1, 1, 4), ParityTol.Exact, opMethod: "TensorNarrow");
         yield return new OpCase("TensorRepeatInterleave[4,8;2,d0]", "shape", e => e.TensorRepeatInterleave(m.F(), 2, 0), e => e.TensorRepeatInterleave(m.D(), 2, 0), ParityTol.Exact, opMethod: "TensorRepeatInterleave");
         yield return new OpCase("TensorTile[4,8;2,1]", "shape", e => e.TensorTile(m.F(), new[] { 2, 1 }), e => e.TensorTile(m.D(), new[] { 2, 1 }), ParityTol.Exact, opMethod: "TensorTile");
@@ -1910,7 +2601,7 @@ public static class OpParityRegistry
         yield return new OpCase("SoftplusBackward[4,64]", "activation-bwd", e => e.SoftplusBackward(go.F(), inp.F()), e => e.SoftplusBackward(go.D(), inp.D()), ParityTol.Ulp(64, 1e-6), opMethod: "SoftplusBackward");
         yield return new OpCase("SeluBackward[4,64]", "activation-bwd", e => e.SeluBackward(go.F(), inp.F()), e => e.SeluBackward(go.D(), inp.D()), ParityTol.Ulp(64, 1e-6), opMethod: "SeluBackward");
         yield return new OpCase("HardswishBackward[4,64]", "activation-bwd", e => e.HardswishBackward(go.F(), inp.F()), e => e.HardswishBackward(go.D(), inp.D()), ParityTol.Ulp(16, 1e-6), opMethod: "HardswishBackward");
-        yield return new OpCase("HardsigmoidBackward[4,64]", "activation-bwd", e => e.HardsigmoidBackward(go.F(), inp.F()), e => e.HardsigmoidBackward(go.D(), inp.D()), ParityTol.Ulp(16, 1e-6), opMethod: "HardsigmoidBackward");
+        yield return new OpCase("HardsigmoidBackward[4,64]", "activation-bwd", e => e.HardsigmoidBackward(go.F(), inp.F()), e => e.HardsigmoidBackward(go.D(), inp.D()), ParityTol.Exact, opMethod: "HardsigmoidBackward");
         // #775: CPU GeluBackward now evaluates its derivative via the accurate Padé sigmoid (same
         // fix family as the forward), so it matches the GPU builtin-tanh derivative tightly.
         yield return new OpCase("GeluBackward[4,64]", "activation-bwd", e => e.GeluBackward(go.F(), inp.F()), e => e.GeluBackward(go.D(), inp.D()), ParityTol.Accum(1e-3), opMethod: "GeluBackward");
@@ -2006,6 +2697,8 @@ public static class OpParityRegistry
         var b = OpInput.Rand(401, s);
         var bpos = OpInput.Rand(402, s, 0.5, 3.0);
         var brow = OpInput.Rand(403, new[] { 1, 64 });
+        var bcol = OpInput.Rand(405, new[] { 64, 1 });
+        var square = OpInput.Rand(406, new[] { 64, 64 });
 
         // Binary (two same-shape tensors).
         yield return B("TensorMax", "arithmetic", (e, u, v) => e.TensorMax(u, v), (e, u, v) => e.TensorMax(u, v), ParityTol.Exact, a, b);
@@ -2019,6 +2712,9 @@ public static class OpParityRegistry
         yield return B("TensorBroadcastSubtract", "arithmetic", (e, u, v) => e.TensorBroadcastSubtract(u, v), (e, u, v) => e.TensorBroadcastSubtract(u, v), ParityTol.Exact, a, brow);
         yield return B("TensorBroadcastMultiply", "arithmetic", (e, u, v) => e.TensorBroadcastMultiply(u, v), (e, u, v) => e.TensorBroadcastMultiply(u, v), ParityTol.Ulp(2, 1e-6), a, brow);
         yield return B("TensorBroadcastDivide", "arithmetic", (e, u, v) => e.TensorBroadcastDivide(u, v), (e, u, v) => e.TensorBroadcastDivide(u, v), ParityTol.Ulp(4, 1e-6), a, OpInput.Rand(404, new[] { 1, 64 }, 0.5, 3.0));
+        yield return B("TensorBroadcastAdd", "arithmetic", (e, u, v) => e.TensorBroadcastAdd(u, v), (e, u, v) => e.TensorBroadcastAdd(u, v), ParityTol.Exact, square, bcol);
+        yield return B("TensorBroadcastSubtract", "arithmetic", (e, u, v) => e.TensorBroadcastSubtract(u, v), (e, u, v) => e.TensorBroadcastSubtract(u, v), ParityTol.Exact, square, bcol);
+        yield return B("TensorBroadcastDivide", "arithmetic", (e, u, v) => e.TensorBroadcastDivide(u, v), (e, u, v) => e.TensorBroadcastDivide(u, v), ParityTol.Ulp(4, 1e-6), square, OpInput.Rand(407, new[] { 64, 1 }, 0.5, 3.0));
 
         // Scalar-arg ops.
         yield return new OpCase("TensorAddScalar[4,64]", "arithmetic", e => e.TensorAddScalar(a.F(), 1.5f), e => e.TensorAddScalar(a.D(), 1.5), ParityTol.Exact, opMethod: "TensorAddScalar");
@@ -2032,15 +2728,15 @@ public static class OpParityRegistry
 
         // Shape / movement ops — bit-exact (no arithmetic).
         var m = OpInput.Rand(410, new[] { 4, 8 });
-        yield return new OpCase("TensorFlatten[4,8]", "shape", e => e.TensorFlatten(m.F()), e => e.TensorFlatten(m.D()), ParityTol.Exact, opMethod: "TensorFlatten");
+        yield return new OpCase("TensorFlatten[4,8]", "shape", e => e.TensorFlatten(m.F()), e => e.TensorFlatten(m.D()), ParityTol.Exact, opMethod: "TensorFlatten") { GpuProbeExpectation = GpuProbeExpectation.MetadataOnly };
         yield return new OpCase("TensorTranspose[4,8]", "shape", e => e.TensorTranspose(m.F()), e => e.TensorTranspose(m.D()), ParityTol.Exact, opMethod: "TensorTranspose");
         yield return new OpCase("TensorFlip[4,8;ax0]", "shape", e => e.TensorFlip(m.F(), new[] { 0 }), e => e.TensorFlip(m.D(), new[] { 0 }), ParityTol.Exact, opMethod: "TensorFlip");
         yield return new OpCase("TensorTril[4,8]", "shape", e => e.TensorTril(m.F(), 0), e => e.TensorTril(m.D(), 0), ParityTol.Exact, opMethod: "TensorTril");
         yield return new OpCase("TensorTriu[4,8]", "shape", e => e.TensorTriu(m.F(), 0), e => e.TensorTriu(m.D(), 0), ParityTol.Exact, opMethod: "TensorTriu");
         yield return new OpCase("TensorRoll[4,8]", "shape", e => e.TensorRoll(m.F(), new[] { 1 }, new[] { 0 }), e => e.TensorRoll(m.D(), new[] { 1 }, new[] { 0 }), ParityTol.Exact, opMethod: "TensorRoll");
-        yield return new OpCase("TensorMoveDim[4,8]", "shape", e => e.TensorMoveDim(m.F(), 0, 1), e => e.TensorMoveDim(m.D(), 0, 1), ParityTol.Exact, opMethod: "TensorMoveDim");
-        yield return new OpCase("TensorSwapAxes[4,8]", "shape", e => e.TensorSwapAxes(m.F(), 0, 1), e => e.TensorSwapAxes(m.D(), 0, 1), ParityTol.Exact, opMethod: "TensorSwapAxes");
-        yield return new OpCase("TensorExpandDims[4,8;ax0]", "shape", e => e.TensorExpandDims(m.F(), 0), e => e.TensorExpandDims(m.D(), 0), ParityTol.Exact, opMethod: "TensorExpandDims");
+        yield return new OpCase("TensorMoveDim[4,8]", "shape", e => e.TensorMoveDim(m.F(), 0, 1), e => e.TensorMoveDim(m.D(), 0, 1), ParityTol.Exact, opMethod: "TensorMoveDim") { GpuProbeExpectation = GpuProbeExpectation.MetadataOnly };
+        yield return new OpCase("TensorSwapAxes[4,8]", "shape", e => e.TensorSwapAxes(m.F(), 0, 1), e => e.TensorSwapAxes(m.D(), 0, 1), ParityTol.Exact, opMethod: "TensorSwapAxes") { GpuProbeExpectation = GpuProbeExpectation.MetadataOnly };
+        yield return new OpCase("TensorExpandDims[4,8;ax0]", "shape", e => e.TensorExpandDims(m.F(), 0), e => e.TensorExpandDims(m.D(), 0), ParityTol.Exact, opMethod: "TensorExpandDims") { GpuProbeExpectation = GpuProbeExpectation.MetadataOnly };
         yield return new OpCase("TensorBroadcastTo[1,64->4,64]", "shape", e => e.TensorBroadcastTo(brow.F(), new[] { 4, 64 }), e => e.TensorBroadcastTo(brow.D(), new[] { 4, 64 }), ParityTol.Exact, opMethod: "TensorBroadcastTo");
     }
 
@@ -2103,7 +2799,31 @@ public static class OpParityRegistry
         yield return new OpCase("ReduceMean[4,32;ax1]", "reduction",
             e => e.ReduceMean(red.F(), new[] { 1 }, false), e => e.ReduceMean(red.D(), new[] { 1 }, false), ParityTol.Accum(1e-3), opMethod: "ReduceMean");
         yield return new OpCase("ReduceMax[4,32;ax1]", "reduction",
-            e => e.ReduceMax(red.F(), new[] { 1 }, false, out _), e => e.ReduceMax(red.D(), new[] { 1 }, false, out _), ParityTol.Ulp(0, 1e-6), opMethod: "ReduceMax");
+            e => e.ReduceMax(red.F(), new[] { 1 }, false), e => e.ReduceMax(red.D(), new[] { 1 }, false), ParityTol.Ulp(0, 1e-6), opMethod: "ReduceMax");
+        var residentMax = OpInput.Rand(221, new[] { 2, 3, 4 });
+        var residentMaxGrad = OpInput.From(new[] { 1.25, -2.5, 4.0 }, new[] { 3 });
+        yield return new OpCase("ReduceMax[2,3,4;all]", "reduction",
+            e => e.ReduceMax(residentMax.F(), Array.Empty<int>(), false),
+            e => e.ReduceMax(residentMax.D(), Array.Empty<int>(), false),
+            ParityTol.Exact, opMethod: "ReduceMax");
+        yield return new OpCase("ReduceMaxWithTensorIndices[2,3,4;ax0,2]", "reduction",
+            e => e.ReduceMaxWithTensorIndices(residentMax.F(), new[] { 0, 2 }, false, out _),
+            e => e.ReduceMaxWithTensorIndices(residentMax.D(), new[] { 0, 2 }, false, out _),
+            ParityTol.Exact, opMethod: "ReduceMaxWithTensorIndices");
+        yield return new OpCase("ReduceMaxBackwardWithTensorIndices[2,3,4;ax0,2]", "reduction",
+            e =>
+            {
+                e.ReduceMaxWithTensorIndices(residentMax.F(), new[] { 0, 2 }, false, out var indices);
+                return e.ReduceMaxBackwardWithTensorIndices(
+                    residentMaxGrad.F(), indices, new[] { 2, 3, 4 }, new[] { 0, 2 });
+            },
+            e =>
+            {
+                e.ReduceMaxWithTensorIndices(residentMax.D(), new[] { 0, 2 }, false, out var indices);
+                return e.ReduceMaxBackwardWithTensorIndices(
+                    residentMaxGrad.D(), indices, new[] { 2, 3, 4 }, new[] { 0, 2 });
+            },
+            ParityTol.Exact, opMethod: "ReduceMaxBackwardWithTensorIndices");
     }
 
     // Second elementwise batch: the broad Tensor* unary math/activation family + softmax variants.
@@ -2164,7 +2884,7 @@ public static class OpParityRegistry
         {
             var a = OpInput.Rand(3, new[] { 2, 64 });
             yield return new OpCase("Reshape[2,64->128]", "shape",
-                e => e.Reshape(a.F(), new[] { 128 }), e => e.Reshape(a.D(), new[] { 128 }), ParityTol.Exact, opMethod: "Reshape");
+                e => e.Reshape(a.F(), new[] { 128 }), e => e.Reshape(a.D(), new[] { 128 }), ParityTol.Exact, opMethod: "Reshape") { GpuProbeExpectation = GpuProbeExpectation.MetadataOnly };
         }
 
         // --- Accumulation ops (summation order differs across engines → relative bound) ---

@@ -438,6 +438,29 @@ public class NativeComplexOpsTests
             Assert.Equal(input[i].Real, result[i].Real, 10);
     }
 
+    [Fact]
+    public void TopKComplex_EqualMagnitudesUseLowerIndexAndNaNsSortLast()
+    {
+        var input = new Tensor<Complex<float>>(new[]
+        {
+            new Complex<float>(3, 4),
+            new Complex<float>(-3, 4),
+            new Complex<float>(0, 5),
+            new Complex<float>(4, 0),
+            new Complex<float>(float.NaN, 0),
+            new Complex<float>(0, -5),
+            new Complex<float>(2, 0)
+        }, [7]);
+
+        var result = _engine.NativeComplexTopK(input, 3);
+
+        Assert.Equal(input[0], result[0]);
+        Assert.Equal(input[1], result[1]);
+        Assert.Equal(input[2], result[2]);
+        for (int i = 3; i < result.Length; i++)
+            Assert.Equal(new Complex<float>(0, 0), result[i]);
+    }
+
     // ================================================================
     // CrossSpectral (X * conj(Y))
     // ================================================================

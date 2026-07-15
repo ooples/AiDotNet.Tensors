@@ -54,9 +54,19 @@ public sealed class BackendCompletenessTests
         // (intentionally empty for now — every gap is surfaced until proven zero-compute)
     };
 
+    /// <summary>Host-defined contracts which cannot be implemented by a portable GPU kernel
+    /// under their current public signature. These are reported separately rather than hidden
+    /// as compute gaps. Adding a tensor/shader-IR overload would create a GPU-capable contract.</summary>
+    private static readonly IReadOnlyDictionary<string, string> HostContractOps =
+        new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["TensorMap"] = "Accepts an arbitrary managed Func<T,T>; no serializable expression or shader IR is supplied.",
+            ["ImageDecode"] = "Accepts compressed host byte[] and returns a data-dependent decoded HWC shape; decoding is a host codec boundary."
+        };
+
     // Current count of tensor ops still lacking a GPU override. GOAL: 0. This floor only ratchets
     // DOWN — add a GPU kernel, lower the number. It must never be raised to hide a new gap.
-    private const int GpuOverrideMissingFloor = 113;
+    private const int GpuOverrideMissingFloor = 0;
 
     [Fact]
     public void EveryTensorOp_HasRealGpuEngineOverride()
@@ -74,6 +84,7 @@ public sealed class BackendCompletenessTests
 
         var missing = new SortedSet<string>(StringComparer.Ordinal);
         var covered = new SortedSet<string>(StringComparer.Ordinal);
+        var hostContracts = new SortedSet<string>(StringComparer.Ordinal);
 
         for (int i = 0; i < map.InterfaceMethods.Length; i++)
         {
@@ -81,6 +92,7 @@ public sealed class BackendCompletenessTests
             if (!IsTensorReturning(iface)) continue;
             bool hasGpuKernel = gpuOverridden.Contains(iface.Name) || gpuOverridden.Contains(iface.Name + "Into");
             if (hasGpuKernel) covered.Add(iface.Name);
+            else if (HostContractOps.ContainsKey(iface.Name)) hostContracts.Add(iface.Name);
             else if (!ZeroComputeOps.Contains(iface.Name)) missing.Add(iface.Name);
         }
         // An op can appear covered via one overload and missing via another; coverage wins.
@@ -98,7 +110,7 @@ public sealed class BackendCompletenessTests
             $"tensor-returning IEngine ops with a dedicated GPU override : {covered.Count}",
             $"tensor-returning IEngine ops WITHOUT a dedicated override   : {missing.Count} " +
             $"(goal 0; many still run on GPU via composed primitives)",
-            covered, missing);
+            covered, missing, hostContracts);
 
         Assert.True(missing.Count <= GpuOverrideMissingFloor,
             $"{missing.Count} tensor IEngine ops lack a dedicated GPU override (floor " +
@@ -110,7 +122,7 @@ public sealed class BackendCompletenessTests
 
     // Per-backend count of kernel-surface methods currently implemented as a NotSupported/
     // NotImplemented stub. GOAL: 0 for every backend. Ratchets DOWN only.
-    private const int BackendStubFloor = 2;
+    private const int BackendStubFloor = 0;
 
     [Fact]
     public void NoGpuBackend_LeavesAKernelAsANotImplementedStub()
@@ -140,6 +152,20 @@ public sealed class BackendCompletenessTests
         Assert.True(worst <= BackendStubFloor,
             $"{worstName} has {worst} kernel-surface methods stubbed with NotSupported/NotImplemented " +
             $"(floor {BackendStubFloor}). Implement the real kernel; do not raise the floor. See gpu-backend-stubs.md.");
+    }
+
+    [Fact]
+    public void EveryGpuReadbackAllowance_HasAContractReason()
+    {
+        var undocumented = OpParityRegistry.All()
+            .Where(op => op.GpuAllowedReadbacks > 0 && string.IsNullOrWhiteSpace(op.GpuReadbackReason))
+            .Select(op => op.Name)
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToArray();
+
+        Assert.True(undocumented.Length == 0,
+            "GPU readback allowances must identify the synchronous host contract that requires them: " +
+            string.Join(", ", undocumented));
     }
 
     // ---- helpers ---------------------------------------------------------------------------
@@ -218,6 +244,8 @@ public sealed class BackendCompletenessTests
 
         var module = m.Module;
         var typeArgs = m.DeclaringType is { IsGenericType: true } dt ? dt.GetGenericArguments() : null;
+        bool constructsUnsupportedException = false;
+        bool callsImplementationMethod = false;
         int pos = 0;
         while (pos < il.Length)
         {
@@ -238,28 +266,36 @@ public sealed class BackendCompletenessTests
             }
             if (ot is null) return false; // unknown opcode — bail rather than mis-step
 
-            if (isNewobj && pos + 4 <= il.Length)
+            bool isCall = b == 0x28 || b == 0x29 || b == 0x6F;
+            if ((isNewobj || isCall) && pos + 4 <= il.Length)
             {
                 int token = BitConverter.ToInt32(il, pos);
                 try
                 {
-                    var ctor = module.ResolveMethod(token, typeArgs, null);
-                    var dt2 = ctor?.DeclaringType;
-                    if (dt2 == typeof(NotImplementedException) || dt2 == typeof(NotSupportedException))
-                        return true;
+                    var called = module.ResolveMethod(token, typeArgs, null);
+                    var calledType = called?.DeclaringType;
+                    if (isNewobj && (calledType == typeof(NotImplementedException)
+                        || calledType == typeof(NotSupportedException)))
+                    {
+                        constructsUnsupportedException = true;
+                    }
+                    else if (isCall)
+                    {
+                        callsImplementationMethod = true;
+                    }
                 }
                 catch { /* unresolvable token in a generic context — ignore */ }
             }
             pos += OperandSize(ot.Value, il, pos);
         }
-        return false;
+        return constructsUnsupportedException && !callsImplementationMethod;
     }
 
     private static string Signature(MethodInfo m) =>
         $"{m.Name}({string.Join(",", m.GetParameters().Select(p => p.ParameterType.Name))})";
 
     private static void WriteReport(string file, string headerCovered, string headerMissing,
-        IEnumerable<string> covered, IEnumerable<string> missing)
+        IEnumerable<string> covered, IEnumerable<string> missing, IEnumerable<string> hostContracts)
     {
         var sb = new StringBuilder();
         sb.AppendLine("# GPU engine op-override completeness (#775)");
@@ -268,6 +304,10 @@ public sealed class BackendCompletenessTests
         sb.AppendLine();
         sb.AppendLine("## missing a GPU override (runs on CPU) — the worklist");
         foreach (var n in missing) sb.AppendLine($"  [ ] {n}");
+        sb.AppendLine();
+        sb.AppendLine("## host-contract boundaries (not GPU compute APIs)");
+        foreach (var n in hostContracts)
+            sb.AppendLine($"  [-] {n}: {HostContractOps[n]}");
         sb.AppendLine();
         sb.AppendLine("## has a real GPU override");
         foreach (var n in covered) sb.AppendLine($"  [x] {n}");

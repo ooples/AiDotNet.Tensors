@@ -858,7 +858,9 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         if (!EnsureGpuReady()) return;
         var data = new float[] { 0f, 1f, 0f, 0f, 2f, 0f, 3f, 0f, 0f, 4f, 5f, 0f };
         var t = new Tensor<float>(data, new[] { 3, 4 });
-        Assert.Equal(_cpu.TensorNonzero(t).ToArray(), _gpu.TensorNonzero(t).ToArray());
+        var actual = _gpu.TensorNonzero(t);
+        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actual.DataVector));
+        Assert.Equal(_cpu.TensorNonzero(t).ToArray(), actual.ToArray());
     }
 
     [Fact]

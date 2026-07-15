@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Threading;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu;
@@ -22,13 +23,68 @@ internal static class GpuLaunchProbe
 {
     private static long _count;
     private static long _kernelMisses;
+    private static long _readbacks;
+    private static long _readbackBytes;
+    private static int _captureReadbackSites;
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _missedNames = new();
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> _readbackSites = new();
 
     /// <summary>Total kernel launches observed since the last <see cref="Reset"/> (lock-free read).</summary>
     public static long Count => Interlocked.Read(ref _count);
 
     /// <summary>Called once per GPU kernel dispatch. Cheap; safe to call from any thread.</summary>
     public static void OnLaunch() => Interlocked.Increment(ref _count);
+
+    /// <summary>Device-to-host transfers observed since the last <see cref="Reset"/>.</summary>
+    public static long Readbacks => Interlocked.Read(ref _readbacks);
+
+    /// <summary>Total bytes transferred device-to-host since the last <see cref="Reset"/>.</summary>
+    public static long ReadbackBytes => Interlocked.Read(ref _readbackBytes);
+
+    /// <summary>Enables call-site collection for residency diagnostics. Disabled outside targeted tests.</summary>
+    public static bool CaptureReadbackSites
+    {
+        get => Volatile.Read(ref _captureReadbackSites) != 0;
+        set => Volatile.Write(ref _captureReadbackSites, value ? 1 : 0);
+    }
+
+    /// <summary>Distinct readback call sites and their invocation counts since the last reset.</summary>
+    public static string[] ReadbackSites => System.Linq.Enumerable.ToArray(
+        System.Linq.Enumerable.Select(
+            System.Linq.Enumerable.OrderBy(_readbackSites, entry => entry.Key),
+            entry => $"{entry.Value}x {entry.Key}"));
+
+    /// <summary>Records one device-to-host transfer at a backend download choke point.</summary>
+    public static void OnReadback(long byteCount)
+    {
+        Interlocked.Increment(ref _readbacks);
+        Interlocked.Add(ref _readbackBytes, byteCount);
+        if (CaptureReadbackSites)
+        {
+            var frames = new StackTrace(1, true).GetFrames();
+            var frame = frames is null ? null : System.Linq.Enumerable.FirstOrDefault(frames, candidate =>
+            {
+                var method = candidate.GetMethod();
+                if (method is null) return false;
+                var declaringType = method.DeclaringType;
+                if (declaringType == typeof(DirectGpuTensorEngine))
+                {
+                    return method.Name is not "DeferTensorResult" and not "FinishGpuOp"
+                        and not "GetOrAllocateBuffer" and not "UploadTensorRaw"
+                        and not "MaterializeIfDeferred";
+                }
+                string? typeName = declaringType?.FullName;
+                return typeName is not null
+                    && typeName.StartsWith("AiDotNet.Tensors.Engines.DirectGpu.", System.StringComparison.Ordinal)
+                    && method.Name != "DownloadBuffer";
+            });
+            var method = frame?.GetMethod();
+            var site = frame is null || method is null
+                ? "unknown"
+                : $"{method.DeclaringType?.FullName}.{method.Name}:{frame.GetFileLineNumber()}";
+            _readbackSites.AddOrUpdate(site, 1, static (_, count) => count + 1);
+        }
+    }
 
     /// <summary>Kernel-not-found lookups (throwing indexer) since the last <see cref="Reset"/>. A op that
     /// does ZERO launches but has a miss recorded is a HOLLOW override: it asked for an unregistered kernel
@@ -49,7 +105,10 @@ internal static class GpuLaunchProbe
     public static long Reset()
     {
         Interlocked.Exchange(ref _kernelMisses, 0);
+        Interlocked.Exchange(ref _readbacks, 0);
+        Interlocked.Exchange(ref _readbackBytes, 0);
         _missedNames.Clear();
+        _readbackSites.Clear();
         return Interlocked.Exchange(ref _count, 0);
     }
 }

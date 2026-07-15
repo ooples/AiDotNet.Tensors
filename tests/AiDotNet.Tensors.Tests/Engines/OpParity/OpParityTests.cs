@@ -27,5 +27,6 @@ public sealed class OpParityTests
     [MemberData(nameof(ForwardCases))]
     public void Forward_CpuMatchesGpu(string opName)
         => OpParityHarness.CheckForward(Cases[opName], _fx);
+
 }
 #endif

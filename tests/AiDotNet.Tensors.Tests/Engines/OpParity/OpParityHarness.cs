@@ -97,7 +97,9 @@ public sealed class OpParityFixture : IDisposable
                 Directory.CreateDirectory(dir);
                 var path = Path.Combine(dir, "op-parity-report.tsv");
                 var sb = new StringBuilder();
-                sb.AppendLine("op\tcategory\tcpu_vs_gpu\tcpu_vs_oracle\tgpu_vs_oracle\tworse_engine");
+                sb.AppendLine(
+                    "op\tcategory\tcpu_vs_gpu_ulp\tcpu_vs_gpu_abs\tcpu_vs_gpu_rel\tworst_index\tcpu_value\tgpu_value\t" +
+                    "tol_ulp\ttol_abs\ttol_rel\tcpu_vs_oracle_ulp\tgpu_vs_oracle_ulp\tworse_engine");
                 foreach (var l in _report.OrderBy(s => s, StringComparer.Ordinal)) sb.AppendLine(l);
                 File.WriteAllText(path, sb.ToString());
             }
@@ -222,6 +224,14 @@ public static class OpParityHarness
         {
             $"{op.Name}:{phase}", op.Category,
             cpuVsGpu.MaxUlp.ToString(CultureInfo.InvariantCulture),
+            cpuVsGpu.MaxAbs.ToString("R", CultureInfo.InvariantCulture),
+            cpuVsGpu.MaxRel.ToString("R", CultureInfo.InvariantCulture),
+            cpuVsGpu.WorstIndex.ToString(CultureInfo.InvariantCulture),
+            cpuVsGpu.WorstA.ToString("R", CultureInfo.InvariantCulture),
+            cpuVsGpu.WorstB.ToString("R", CultureInfo.InvariantCulture),
+            tol.Ulps.ToString(CultureInfo.InvariantCulture),
+            tol.AbsFloor.ToString("R", CultureInfo.InvariantCulture),
+            tol.Rel.ToString("R", CultureInfo.InvariantCulture),
             cpuVsOracle.MaxUlp.ToString(CultureInfo.InvariantCulture),
             gpuVsOracle.MaxUlp.ToString(CultureInfo.InvariantCulture),
             worse,
