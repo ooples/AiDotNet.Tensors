@@ -278,6 +278,88 @@ struct PA{batch:i32,channels:i32,inHeight:i32,inWidth:i32,outHeight:i32,outWidth
     gradKernel[idx]=sum;
 }";
 
+    private const string Pool3DStruct =
+        "struct PP{batch:i32,channels:i32,inDepth:i32,inHeight:i32,inWidth:i32,outDepth:i32,outHeight:i32,outWidth:i32,kernelD:i32,kernelH:i32,kernelW:i32,strideD:i32,strideH:i32,strideW:i32,countIncludePad:i32,pad0:i32};";
+
+    public static readonly string AvgPool3D = @"
+@group(0) @binding(0) var<storage,read> input_:array<f32>;
+@group(0) @binding(1) var<storage,read_write> output_:array<f32>;
+" + Pool3DStruct + @"
+@group(0) @binding(2) var<uniform> pm:PP;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid_:vec3<u32>){
+    let idx=i32(gid_.x);
+    if(idx>=pm.batch*pm.channels*pm.outDepth*pm.outHeight*pm.outWidth){return;}
+    let ow=idx%pm.outWidth;
+    let oh=(idx/pm.outWidth)%pm.outHeight;
+    let od=(idx/(pm.outWidth*pm.outHeight))%pm.outDepth;
+    let c=(idx/(pm.outWidth*pm.outHeight*pm.outDepth))%pm.channels;
+    let b=idx/(pm.outWidth*pm.outHeight*pm.outDepth*pm.channels);
+    var sum=0.0;
+    var count=0;
+    for(var kd=0;kd<pm.kernelD;kd=kd+1){
+        let id=od*pm.strideD+kd;
+        if(id>=pm.inDepth){continue;}
+        for(var kh=0;kh<pm.kernelH;kh=kh+1){
+            let ih=oh*pm.strideH+kh;
+            if(ih>=pm.inHeight){continue;}
+            for(var kw=0;kw<pm.kernelW;kw=kw+1){
+                let iw=ow*pm.strideW+kw;
+                if(iw>=pm.inWidth){continue;}
+                let inputIdx=((b*pm.channels+c)*pm.inDepth+id)*pm.inHeight*pm.inWidth+ih*pm.inWidth+iw;
+                sum=sum+input_[inputIdx];
+                count=count+1;
+            }
+        }
+    }
+    let divisor=select(count,pm.kernelD*pm.kernelH*pm.kernelW,pm.countIncludePad!=0);
+    let outIdx=((b*pm.channels+c)*pm.outDepth+od)*pm.outHeight*pm.outWidth+oh*pm.outWidth+ow;
+    output_[outIdx]=sum/f32(max(divisor,1));
+}";
+
+    public static readonly string AvgPool3DBackward = @"
+@group(0) @binding(0) var<storage,read> gradOutput:array<f32>;
+@group(0) @binding(1) var<storage,read_write> gradInput:array<f32>;
+" + Pool3DStruct + @"
+@group(0) @binding(2) var<uniform> pm:PP;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid_:vec3<u32>){
+    let idx=i32(gid_.x);
+    if(idx>=pm.batch*pm.channels*pm.inDepth*pm.inHeight*pm.inWidth){return;}
+    let iw=idx%pm.inWidth;
+    let ih=(idx/pm.inWidth)%pm.inHeight;
+    let id=(idx/(pm.inWidth*pm.inHeight))%pm.inDepth;
+    let c=(idx/(pm.inWidth*pm.inHeight*pm.inDepth))%pm.channels;
+    let b=idx/(pm.inWidth*pm.inHeight*pm.inDepth*pm.channels);
+    var sum=0.0;
+    for(var od=0;od<pm.outDepth;od=od+1){
+        let dStart=od*pm.strideD;
+        let dEnd=dStart+pm.kernelD;
+        if(id<dStart||id>=dEnd){continue;}
+        for(var oh=0;oh<pm.outHeight;oh=oh+1){
+            let hStart=oh*pm.strideH;
+            let hEnd=hStart+pm.kernelH;
+            if(ih<hStart||ih>=hEnd){continue;}
+            for(var ow=0;ow<pm.outWidth;ow=ow+1){
+                let wStart=ow*pm.strideW;
+                let wEnd=wStart+pm.kernelW;
+                if(iw<wStart||iw>=wEnd){continue;}
+                var poolSize=0;
+                if(pm.countIncludePad!=0){
+                    poolSize=pm.kernelD*pm.kernelH*pm.kernelW;
+                }else{
+                    let dEndClamp=min(dEnd,pm.inDepth);
+                    let hEndClamp=min(hEnd,pm.inHeight);
+                    let wEndClamp=min(wEnd,pm.inWidth);
+                    poolSize=(dEndClamp-dStart)*(hEndClamp-hStart)*(wEndClamp-wStart);
+                }
+                let outIdx=((b*pm.channels+c)*pm.outDepth+od)*pm.outHeight*pm.outWidth+oh*pm.outWidth+ow;
+                sum=sum+gradOutput[outIdx]/f32(max(poolSize,1));
+            }
+        }
+    }
+    let inputIdx=((b*pm.channels+c)*pm.inDepth+id)*pm.inHeight*pm.inWidth+ih*pm.inWidth+iw;
+    gradInput[inputIdx]=sum;
+}";
+
     private const string DepthwiseStruct =
         "struct PD{N:i32,inC:i32,H:i32,W:i32,M:i32,outH:i32,outW:i32,kH:i32,kW:i32,strideH:i32,strideW:i32,padH:i32,padW:i32,pad0:i32,pad1:i32,pad2:i32};";
 

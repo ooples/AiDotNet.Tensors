@@ -37,6 +37,7 @@ public sealed class AvgPool3dKernelSourceTests
     [InlineData(OpenClPool, "GetSource")]
     [InlineData(MetalExt, "Source")]
     [InlineData(VulkanExt, "AvgPool3D")]
+    [InlineData("AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuExtendedConvKernels", "AvgPool3D")]
     public void CountIncludePadDivisor_IsPresentAcrossBackends(string typeName, string memberName)
     {
         string source = GetStaticString(typeName, memberName);

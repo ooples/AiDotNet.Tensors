@@ -10,9 +10,44 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 // uniform block (ints reinterpreted as their float bit pattern, floats stored directly, padded to a
 // 16-byte multiple to satisfy WGSL uniform alignment).
 public sealed partial class WebGpuBackend : ITrilinearInterpolationKernels, IConvTranspose3DKernels, ISpiralConvKernels,
-    IAdaptiveMaxPool2DKernels, IConv3DBackwardKernels, IDepthwiseConv2DBackwardKernels
+    IAdaptiveMaxPool2DKernels, IConv3DBackwardKernels, IDepthwiseConv2DBackwardKernels, IPool3DKernels
 {
     private static float Bits(int value) => BitConverter.Int32BitsToSingle(value);
+
+    private static float[] Pool3DUniforms(int batch, int channels, int inDepth, int inHeight, int inWidth,
+        int outDepth, int outHeight, int outWidth, int kernelD, int kernelH, int kernelW,
+        int strideD, int strideH, int strideW, int countIncludePad) =>
+        [Bits(batch), Bits(channels), Bits(inDepth), Bits(inHeight), Bits(inWidth),
+         Bits(outDepth), Bits(outHeight), Bits(outWidth), Bits(kernelD), Bits(kernelH), Bits(kernelW),
+         Bits(strideD), Bits(strideH), Bits(strideW), Bits(countIncludePad), 0f];
+
+    public void AvgPool3D(IGpuBuffer input, IGpuBuffer output,
+        int batch, int channels, int inDepth, int inHeight, int inWidth,
+        int outDepth, int outHeight, int outWidth, int kernelD, int kernelH, int kernelW,
+        int strideD, int strideH, int strideW, int countIncludePad)
+    {
+        int total = checked(batch * channels * outDepth * outHeight * outWidth);
+        if (total <= 0) return;
+        Dispatch2BufferAsync("ExtAvgPool3D", WebGpuExtendedConvKernels.AvgPool3D, "main",
+            input, output,
+            Pool3DUniforms(batch, channels, inDepth, inHeight, inWidth, outDepth, outHeight, outWidth,
+                kernelD, kernelH, kernelW, strideD, strideH, strideW, countIncludePad),
+            total).GetAwaiter().GetResult();
+    }
+
+    public void AvgPool3DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput,
+        int batch, int channels, int inDepth, int inHeight, int inWidth,
+        int outDepth, int outHeight, int outWidth, int kernelD, int kernelH, int kernelW,
+        int strideD, int strideH, int strideW, int countIncludePad)
+    {
+        int total = checked(batch * channels * inDepth * inHeight * inWidth);
+        if (total <= 0) return;
+        Dispatch2BufferAsync("ExtAvgPool3DBwd", WebGpuExtendedConvKernels.AvgPool3DBackward, "main",
+            gradOutput, gradInput,
+            Pool3DUniforms(batch, channels, inDepth, inHeight, inWidth, outDepth, outHeight, outWidth,
+                kernelD, kernelH, kernelW, strideD, strideH, strideW, countIncludePad),
+            total).GetAwaiter().GetResult();
+    }
 
     private static float[] DepthwiseUniforms(int n, int inC, int h, int w, int m, int outH, int outW,
         int kH, int kW, int strideH, int strideW, int padH, int padW) =>
