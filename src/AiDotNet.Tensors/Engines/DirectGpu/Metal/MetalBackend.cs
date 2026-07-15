@@ -26,7 +26,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 /// The MPS library provides hand-tuned implementations of common operations.
 /// </para>
 /// </remarks>
-public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend
+public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IPixelShuffleBackend
 {
     /// <summary>
     /// Metal MPSGraph has half/bfloat conv support but it's not wired
@@ -71,7 +71,9 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     private IntPtr _geometryLibrary;
     private IntPtr _roiLibrary;
     private IntPtr _audioLibrary;
+    private IntPtr _extendedConvLibrary;
     private IntPtr _fusedAdvancedLibrary;
+    private IntPtr _residentLibrary;
     // Sparse-op compute kernels (CSR SpMM + SDDMM). Compiled from
     // MetalSparseKernels.Source; the sparse-autograd backward's dB and dA
     // dispatch through here on Apple hardware without touching MPS.
@@ -258,6 +260,16 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
 
         try
         {
+            _residentLibrary = _shaderLibrary.CompileLibrary("Resident", MetalResidentKernels.Source);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Metal resident-kernel pre-compilation warning: {ex.Message}");
+            _residentLibrary = IntPtr.Zero;
+        }
+
+        try
+        {
             _iouLibrary = _shaderLibrary.CompileLibrary("IoULoss", MetalKernels.IoULossKernels);
         }
         catch (Exception ex)
@@ -349,6 +361,18 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         {
             System.Diagnostics.Debug.WriteLine($"Metal Audio pre-compilation warning: {ex.Message}");
             _audioLibrary = IntPtr.Zero;
+        }
+
+        // #775 extended conv/pool/interp/mesh/splat kernels. Per-family capability interfaces
+        // (ITrilinearInterpolationKernels et al.) dispatch here; see MetalBackend.ExtendedConv.cs.
+        try
+        {
+            _extendedConvLibrary = _shaderLibrary.CompileLibrary("ExtendedConv", MetalExtendedConvKernels.Source);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Metal ExtendedConv pre-compilation warning: {ex.Message}");
+            _extendedConvLibrary = IntPtr.Zero;
         }
 
         // Parity-212 FFT kernels — custom radix-2 Cooley-Tukey (no external
@@ -451,6 +475,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     /// </summary>
     public float[] DownloadBuffer(IGpuBuffer buffer)
     {
+        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float));
         ThrowIfDisposed();
 
         if (buffer is not MetalGpuBuffer metalBuffer)
@@ -468,6 +493,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     /// </summary>
     public void DownloadBuffer(IGpuBuffer buffer, float[] destination)
     {
+        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float));
         ThrowIfDisposed();
 
         if (buffer is not MetalGpuBuffer metalBuffer)
@@ -556,6 +582,8 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         encoder.SetBuffer(srcBuffer, 0);
         encoder.SetBuffer(destBuffer, 1);
         encoder.SetBytes((uint)size, 2);
+        encoder.SetBytes((uint)srcOffset, 3);
+        encoder.SetBytes((uint)destOffset, 4);
         encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
 
@@ -606,7 +634,20 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     /// </summary>
     /// <inheritdoc/>
     public void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer)
-        => throw new NotSupportedException("UploadIntBufferInPlace is not supported by the Metal backend.");
+    {
+        ThrowIfDisposed();
+        if (data is null) throw new ArgumentNullException(nameof(data));
+        if (buffer is not MetalGpuBuffer metalBuffer)
+            throw new ArgumentException("Buffer is not a MetalGpuBuffer.", nameof(buffer));
+        if (data.Length > metalBuffer.Size)
+            throw new ArgumentException($"Host data ({data.Length}) exceeds buffer capacity ({metalBuffer.Size}).", nameof(data));
+        if (data.Length == 0) return;
+
+        var packed = new float[data.Length];
+        for (int i = 0; i < data.Length; i++)
+            packed[i] = Int32BitsToSingleCompat(data[i]);
+        metalBuffer.CopyFrom(packed, 0, packed.Length);
+    }
 
     public IGpuBuffer AllocateIntBuffer(int[] data)
     {
@@ -1930,16 +1971,19 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     public void SplitComplexTopK(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n, int k)
     {
         if (n <= 0 || k <= 0) return;
-        var magBuf = AllocateBuffer(n);
-        try
-        {
-            SplitComplexMagnitudeSquared(inReal, inImag, magBuf, n);
-            var magData = DownloadBuffer(magBuf);
-            Array.Sort(magData); Array.Reverse(magData);
-            float threshold = k <= n ? magData[Math.Min(k, n) - 1] : 0f;
-            DispatchComplexMetal("split_complex_topk", [AsMetal(inReal), AsMetal(inImag), AsMetal(outReal), AsMetal(outImag)], n, threshold);
-        }
-        finally { magBuf.Dispose(); }
+        ThrowIfDisposed(); EnsureComplexLibrary();
+        k = Math.Min(k, n);
+        var pipeline = GetPipeline("Complex", _complexLibrary, "split_complex_topk");
+        var (tg, tpg) = pipeline.Calculate1DDispatch(n);
+        using var enc = _commandQueue.CreateScopedComputeEncoder();
+        enc.SetPipelineState(pipeline.Handle);
+        enc.SetBuffer(AsMetal(inReal), 0);
+        enc.SetBuffer(AsMetal(inImag), 1);
+        enc.SetBuffer(AsMetal(outReal), 2);
+        enc.SetBuffer(AsMetal(outImag), 3);
+        enc.SetBytes((uint)k, 4);
+        enc.SetBytes((uint)n, 5);
+        enc.DispatchThreadgroups(tg, tpg);
     }
 
     public void SoftmaxRows(IGpuBuffer input, IGpuBuffer output, int rows, int cols)

@@ -166,8 +166,8 @@ public class GeometryOpsTests
     [Fact]
     public void GridSample_Bilinear_Zeros_CentreSamplesInputCentre()
     {
-        // 2×2 NHWC input, sample at centre.
-        var input = new Tensor<float>(new float[] { 1, 2, 3, 4 }, new[] { 1, 2, 2, 1 });
+        // 2×2 NCHW input [N,C,H,W], sample at centre.
+        var input = new Tensor<float>(new float[] { 1, 2, 3, 4 }, new[] { 1, 1, 2, 2 });
         // grid at normalised (0, 0) — that's the centre, interpolates all four corners equally.
         var grid = new Tensor<float>(new float[] { 0f, 0f }, new[] { 1, 1, 1, 2 });
         var output = _cpu.GridSample(input, grid, GridSampleMode.Bilinear, GridSamplePadding.Zeros, alignCorners: false);
@@ -179,7 +179,7 @@ public class GeometryOpsTests
     [Fact]
     public void GridSample_Nearest_OutOfRangeWithZerosPadding()
     {
-        var input = new Tensor<float>(new float[] { 1, 2, 3, 4 }, new[] { 1, 2, 2, 1 });
+        var input = new Tensor<float>(new float[] { 1, 2, 3, 4 }, new[] { 1, 1, 2, 2 });
         // (2, 2) normalised is way outside [-1, 1], padding=Zeros → 0.
         var grid = new Tensor<float>(new float[] { 2f, 2f }, new[] { 1, 1, 1, 2 });
         var output = _cpu.GridSample(input, grid, GridSampleMode.Nearest, GridSamplePadding.Zeros, alignCorners: false);
@@ -189,7 +189,7 @@ public class GeometryOpsTests
     [Fact]
     public void GridSample_Nearest_OutOfRangeWithBorderPadding()
     {
-        var input = new Tensor<float>(new float[] { 1, 2, 3, 4 }, new[] { 1, 2, 2, 1 });
+        var input = new Tensor<float>(new float[] { 1, 2, 3, 4 }, new[] { 1, 1, 2, 2 });
         var grid = new Tensor<float>(new float[] { 2f, 2f }, new[] { 1, 1, 1, 2 });
         // padding=Border should clamp to the nearest corner — here pixel (1, 1) = 4.
         var output = _cpu.GridSample(input, grid, GridSampleMode.Nearest, GridSamplePadding.Border, alignCorners: false);

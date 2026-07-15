@@ -175,6 +175,32 @@ kernel void multiply_scalar(
     }
 }
 
+kernel void strided_gather(
+    device const float* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant uint& offset [[buffer(2)]],
+    constant uint& stride [[buffer(3)]],
+    constant uint& count [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < count) {
+        dst[gid] = src[offset + gid * stride];
+    }
+}
+
+kernel void strided_scatter(
+    device const float* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant uint& offset [[buffer(2)]],
+    constant uint& stride [[buffer(3)]],
+    constant uint& count [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < count) {
+        dst[offset + gid * stride] = src[gid];
+    }
+}
+
 // Scalar addition: B = A + scalar
 kernel void add_scalar(
     device const float* A [[buffer(0)]],
@@ -291,11 +317,81 @@ kernel void copy_buffer(
     device const float* src [[buffer(0)]],
     device float* dst [[buffer(1)]],
     constant uint& size [[buffer(2)]],
+    constant uint& srcOffset [[buffer(3)]],
+    constant uint& dstOffset [[buffer(4)]],
     uint gid [[thread_position_in_grid]])
 {
     if (gid < size) {
-        dst[gid] = src[gid];
+        dst[dstOffset + gid] = src[srcOffset + gid];
     }
+}
+
+// Repeat each logical axis element as a contiguous inner block.
+kernel void tile_axis(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& outerSize [[buffer(2)]],
+    constant uint& axisSize [[buffer(3)]],
+    constant uint& innerSize [[buffer(4)]],
+    constant uint& repeats [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint expandedAxis = axisSize * repeats;
+    uint total = outerSize * expandedAxis * innerSize;
+    if (gid >= total) return;
+    uint inner = gid % innerSize;
+    uint expandedIndex = (gid / innerSize) % expandedAxis;
+    uint outer = gid / (expandedAxis * innerSize);
+    uint axis = expandedIndex / repeats;
+    output[gid] = input[(outer * axisSize + axis) * innerSize + inner];
+}
+
+kernel void pixel_shuffle(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& batch [[buffer(2)]],
+    constant uint& channels [[buffer(3)]],
+    constant uint& inH [[buffer(4)]],
+    constant uint& inW [[buffer(5)]],
+    constant uint& scale [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint outH = inH * scale;
+    uint outW = inW * scale;
+    if (gid >= batch * channels * outH * outW) return;
+    uint ow = gid % outW;
+    uint temp = gid / outW;
+    uint oh = temp % outH;
+    temp /= outH;
+    uint oc = temp % channels;
+    uint b = temp / channels;
+    uint srcC = oc * scale * scale + (oh % scale) * scale + (ow % scale);
+    output[gid] = input[((b * channels * scale * scale + srcC) * inH + oh / scale) * inW + ow / scale];
+}
+
+kernel void pixel_shuffle_backward(
+    device const float* gradOutput [[buffer(0)]],
+    device float* gradInput [[buffer(1)]],
+    constant uint& batch [[buffer(2)]],
+    constant uint& channels [[buffer(3)]],
+    constant uint& inH [[buffer(4)]],
+    constant uint& inW [[buffer(5)]],
+    constant uint& scale [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint inputChannels = channels * scale * scale;
+    if (gid >= batch * inputChannels * inH * inW) return;
+    uint iw = gid % inW;
+    uint temp = gid / inW;
+    uint ih = temp % inH;
+    temp /= inH;
+    uint ic = temp % inputChannels;
+    uint b = temp / inputChannels;
+    uint oc = ic / (scale * scale);
+    uint sub = ic % (scale * scale);
+    uint outH = inH * scale;
+    uint outW = inW * scale;
+    gradInput[gid] = gradOutput[((b * channels + oc) * outH + ih * scale + sub / scale) * outW + iw * scale + sub % scale];
 }
 
 // Fill buffer with constant value
@@ -4219,7 +4315,13 @@ kernel void not_equal_scalar(
     uint gid [[thread_position_in_grid]])
 {
     if (gid < size) {
-        B[gid] = abs(A[gid] - scalar) > EPSILON ? 1.0f : 0.0f;
+        uint ab = as_type<uint>(A[gid]);
+        uint bb = as_type<uint>(scalar);
+        uint aa = ab & 0x7FFFFFFFu;
+        uint ba = bb & 0x7FFFFFFFu;
+        bool equal = aa <= 0x7F800000u && ba <= 0x7F800000u
+            && (ab == bb || ((aa | ba) == 0u));
+        B[gid] = equal ? 0.0f : 1.0f;
     }
 }
 
@@ -4417,9 +4519,10 @@ kernel void geglu_forward(device const float* input [[buffer(0)]],
     uint outer = gid / halfDim; uint d = gid % halfDim; uint fullDim = halfDim * 2;
     float value = input[outer * fullDim + d];
     float gate = input[outer * fullDim + halfDim + d];
-    float x3 = value * value * value;
-    float gelu = 0.5f * value * (1.0f + tanh(0.7978845608f * (value + 0.044715f * x3)));
-    output[gid] = gelu * gate;
+    // #775: activation on the GATE — out = value * GELU(gate) (was GELU(value)*gate).
+    float g3 = gate * gate * gate;
+    float gelu = 0.5f * gate * (1.0f + tanh(0.7978845608f * (gate + 0.044715f * g3)));
+    output[gid] = value * gelu;
 }
 
 kernel void reglu_forward(device const float* input [[buffer(0)]],
@@ -4432,7 +4535,7 @@ kernel void reglu_forward(device const float* input [[buffer(0)]],
     uint outer = gid / halfDim; uint d = gid % halfDim; uint fullDim = halfDim * 2;
     float value = input[outer * fullDim + d];
     float gate = input[outer * fullDim + halfDim + d];
-    output[gid] = max(value, 0.0f) * gate;
+    output[gid] = value * max(gate, 0.0f); // #775: act on gate
 }
 
 kernel void swiglu_forward(device const float* input [[buffer(0)]],
@@ -4445,8 +4548,8 @@ kernel void swiglu_forward(device const float* input [[buffer(0)]],
     uint outer = gid / halfDim; uint d = gid % halfDim; uint fullDim = halfDim * 2;
     float value = input[outer * fullDim + d];
     float gate = input[outer * fullDim + halfDim + d];
-    float sig = 1.0f / (1.0f + exp(-value));
-    output[gid] = value * sig * gate;
+    float sig = 1.0f / (1.0f + exp(-gate)); // #775: act on gate
+    output[gid] = value * (gate * sig);
 }
 
 kernel void relu_derivative(device const float* input [[buffer(0)]],
@@ -4707,8 +4810,8 @@ kernel void poincare_project(
     float sqNorm = 0.0f;
     for (uint d = 0; d < dim; d++) sqNorm += input[off + d] * input[off + d];
     float maxNorm = 1.0f / sqrt(curvature) - epsilon;
-    float norm = sqrt(max(sqNorm, 1e-20f));
-    float scale = (norm > maxNorm) ? (maxNorm / norm) : 1.0f;
+    float maxNormSq = maxNorm * maxNorm;
+    float scale = sqNorm >= maxNormSq ? maxNorm / sqrt(sqNorm) : 1.0f;
     for (uint d = 0; d < dim; d++) output[off + d] = input[off + d] * scale;
 }
 

@@ -228,11 +228,11 @@ struct P { size: i32 };
 struct P { fillValue: f32, mode: i32, outerSize: i32, idxAxis: i32, innerSize: i32, dstAxis: i32 };
 @group(0) @binding(3) var<uniform> pc : P;
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let idx = i32(gid.x); let total = pc.outerSize * pc.idxAxis * pc.innerSize; if (idx >= total) { return; }
-  let inner = idx % pc.innerSize; let j = (idx / pc.innerSize) % pc.idxAxis; let outer = (idx / pc.innerSize) / pc.idxAxis; let dstJ = indices[j];
-  if (dstJ < 0 || dstJ >= pc.dstAxis) { return; }
-  let v = select(pc.fillValue, source[idx], pc.mode == 0);
-  outp[(outer * pc.dstAxis + dstJ) * pc.innerSize + inner] = v;
+  let idx = i32(gid.x); let total = pc.outerSize * pc.dstAxis * pc.innerSize; if (idx >= total) { return; }
+  let inner = idx % pc.innerSize; let dstJ = (idx / pc.innerSize) % pc.dstAxis; let outer = (idx / pc.innerSize) / pc.dstAxis; var last = -1;
+  for (var j = 0; j < pc.idxAxis; j = j + 1) { if (indices[j] == dstJ) { last = j; } }
+  if (last < 0) { return; }
+  outp[idx] = select(pc.fillValue, source[(outer * pc.idxAxis + last) * pc.innerSize + inner], pc.mode == 0);
 }";
 
     public static string Cdist => @"
@@ -411,10 +411,10 @@ struct P { batch: i32, H: i32, W: i32, C: i32, outH: i32, outW: i32 };
     let in00 = h0 >= 0 && h0 < pc.H && w0 >= 0 && w0 < pc.W; let in01 = h0 >= 0 && h0 < pc.H && w1 >= 0 && w1 < pc.W;
     let in10 = h1 >= 0 && h1 < pc.H && w0 >= 0 && w0 < pc.W; let in11 = h1 >= 0 && h1 < pc.H && w1 >= 0 && w1 < pc.W;
     for (var c = 0; c < pc.C; c = c + 1) {
-      let v00 = select(0.0, inp[((b*pc.H+h0)*pc.W+w0)*pc.C+c], in00); let v01 = select(0.0, inp[((b*pc.H+h0)*pc.W+w1)*pc.C+c], in01);
-      let v10 = select(0.0, inp[((b*pc.H+h1)*pc.W+w0)*pc.C+c], in10); let v11 = select(0.0, inp[((b*pc.H+h1)*pc.W+w1)*pc.C+c], in11);
+      let v00 = select(0.0, inp[((b*pc.C+c)*pc.H+h0)*pc.W+w0], in00); let v01 = select(0.0, inp[((b*pc.C+c)*pc.H+h0)*pc.W+w1], in01);
+      let v10 = select(0.0, inp[((b*pc.C+c)*pc.H+h1)*pc.W+w0], in10); let v11 = select(0.0, inp[((b*pc.C+c)*pc.H+h1)*pc.W+w1], in11);
       let dH = (1.0 - lw) * (v10 - v00) + lw * (v11 - v01); let dW = (1.0 - lh) * (v01 - v00) + lh * (v11 - v10);
-      let go = gradOut[((b*pc.outH+oh)*pc.outW+ow)*pc.C+c];
+      let go = gradOut[((b*pc.C+c)*pc.outH+oh)*pc.outW+ow];
       gradGx = gradGx + go * dW * f32(pc.W - 1) * 0.5; gradGy = gradGy + go * dH * f32(pc.H - 1) * 0.5;
     }
   }
@@ -456,7 +456,9 @@ struct P { n: i32, d: i32 };
   let i = i32(gid.x); if (i >= pc.n) { return; } var linIdx = 0; var valid = true;
   for (var k = 0; k < pc.d; k = k + 1) {
     let v = samples[i * pc.d + k]; let mn = mins[k]; let mx = maxs[k]; if (!(v >= mn && v <= mx)) { valid = false; break; }
-    let width = (mx - mn) / f32(bins[k]); var kIdx = i32(floor((v - mn) / width)); if (kIdx >= bins[k]) { kIdx = bins[k] - 1; } if (kIdx < 0) { kIdx = 0; }
+    var kIdx: i32;
+    if (v == mx) { kIdx = bins[k] - 1; }
+    else { let width = (mx - mn) / f32(bins[k]); kIdx = i32(floor((v - mn) / width)); if (kIdx >= bins[k]) { kIdx = bins[k] - 1; } if (kIdx < 0) { kIdx = 0; } }
     linIdx = linIdx * bins[k] + kIdx;
   }
   if (valid) { p210_atomicAddF(&hist, linIdx, 1.0); }
@@ -470,33 +472,38 @@ struct P { batch: i32, H: i32, W: i32, C: i32, outH: i32, outW: i32 };
 @group(0) @binding(3) var<uniform> pc : P;
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let idx = i32(gid.x); let total = pc.batch * pc.outH * pc.outW * pc.C; if (idx >= total) { return; }
-  let c = idx % pc.C; var tmp = idx / pc.C; let ow = tmp % pc.outW; tmp = tmp / pc.outW; let oh = tmp % pc.outH; let b = tmp / pc.outH;
+  let ow = idx % pc.outW; var tmp = idx / pc.outW; let oh = tmp % pc.outH; tmp = tmp / pc.outH; let c = tmp % pc.C; let b = tmp / pc.C;
   let gridBase = ((b * pc.outH + oh) * pc.outW + ow) * 2; let gx = grid[gridBase]; let gy = grid[gridBase + 1];
   let srcH = (gy + 1.0) * 0.5 * f32(pc.H - 1); let srcW = (gx + 1.0) * 0.5 * f32(pc.W - 1);
   if (srcH <= -1.0 || srcH >= f32(pc.H) || srcW <= -1.0 || srcW >= f32(pc.W)) { return; }
   let h0 = i32(floor(srcH)); let h1 = h0 + 1; let w0 = i32(floor(srcW)); let w1 = w0 + 1; let lh = srcH - f32(h0); let lw = srcW - f32(w0); let g = gradOut[idx];
-  if (h0 >= 0 && h0 < pc.H && w0 >= 0 && w0 < pc.W) { p210_atomicAddF(&gradIn, ((b*pc.H+h0)*pc.W+w0)*pc.C+c, g*(1.0-lh)*(1.0-lw)); }
-  if (h0 >= 0 && h0 < pc.H && w1 >= 0 && w1 < pc.W) { p210_atomicAddF(&gradIn, ((b*pc.H+h0)*pc.W+w1)*pc.C+c, g*(1.0-lh)*lw); }
-  if (h1 >= 0 && h1 < pc.H && w0 >= 0 && w0 < pc.W) { p210_atomicAddF(&gradIn, ((b*pc.H+h1)*pc.W+w0)*pc.C+c, g*lh*(1.0-lw)); }
-  if (h1 >= 0 && h1 < pc.H && w1 >= 0 && w1 < pc.W) { p210_atomicAddF(&gradIn, ((b*pc.H+h1)*pc.W+w1)*pc.C+c, g*lh*lw); }
+  if (h0 >= 0 && h0 < pc.H && w0 >= 0 && w0 < pc.W) { p210_atomicAddF(&gradIn, ((b*pc.C+c)*pc.H+h0)*pc.W+w0, g*(1.0-lh)*(1.0-lw)); }
+  if (h0 >= 0 && h0 < pc.H && w1 >= 0 && w1 < pc.W) { p210_atomicAddF(&gradIn, ((b*pc.C+c)*pc.H+h0)*pc.W+w1, g*(1.0-lh)*lw); }
+  if (h1 >= 0 && h1 < pc.H && w0 >= 0 && w0 < pc.W) { p210_atomicAddF(&gradIn, ((b*pc.C+c)*pc.H+h1)*pc.W+w0, g*lh*(1.0-lw)); }
+  if (h1 >= 0 && h1 < pc.H && w1 >= 0 && w1 < pc.W) { p210_atomicAddF(&gradIn, ((b*pc.C+c)*pc.H+h1)*pc.W+w1, g*lh*lw); }
 }";
 
-    public static string IstftFromSpectrum => AtomicAddF + @"
+    public static string IstftFromSpectrum => @"
 @group(0) @binding(0) var<storage, read> specRe : array<f32>;
 @group(0) @binding(1) var<storage, read> specIm : array<f32>;
 @group(0) @binding(2) var<storage, read> window : array<f32>;
-@group(0) @binding(3) var<storage, read_write> resultb : array<atomic<u32>>;
-@group(0) @binding(4) var<storage, read_write> windowSum : array<atomic<u32>>;
+@group(0) @binding(3) var<storage, read_write> resultb : array<f32>;
+@group(0) @binding(4) var<storage, read_write> windowSum : array<f32>;
 struct P { batch: i32, numFrames: i32, nFft: i32, hop: i32, outputLength: i32, center: i32 };
 @group(0) @binding(5) var<uniform> pc : P;
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let idx = i32(gid.x); let total = pc.batch * pc.numFrames * pc.nFft; if (idx >= total) { return; }
-  let i = idx % pc.nFft; let tmp = idx / pc.nFft; let frame = tmp % pc.numFrames; let b = tmp / pc.numFrames; let specOff = (b * pc.numFrames + frame) * pc.nFft;
-  var acc = 0.0;
-  for (var k = 0; k < pc.nFft; k = k + 1) { let a = 2.0 * 3.14159265358979 * f32(k) * f32(i) / f32(pc.nFft); acc = acc + specRe[specOff + k] * cos(a) - specIm[specOff + k] * sin(a); }
-  var writeStart = frame * pc.hop; if (pc.center != 0) { writeStart = max(0, frame * pc.hop - pc.nFft / 2); }
-  let outIdx = writeStart + i;
-  if (outIdx >= 0 && outIdx < pc.outputLength) { let w = window[i]; p210_atomicAddF(&resultb, b * pc.outputLength + outIdx, acc * (1.0 / f32(pc.nFft)) * w); p210_atomicAddF(&windowSum, b * pc.outputLength + outIdx, w * w); }
+  let idx = i32(gid.x); let total = pc.batch * pc.outputLength; if (idx >= total) { return; }
+  let outIdx = idx % pc.outputLength; let b = idx / pc.outputLength; var resultAcc = 0.0; var windowAcc = 0.0;
+  for (var frame = 0; frame < pc.numFrames; frame = frame + 1) {
+    var writeStart = frame * pc.hop; if (pc.center != 0) { writeStart = max(0, frame * pc.hop - pc.nFft / 2); }
+    let i = outIdx - writeStart;
+    if (i >= 0 && i < pc.nFft) {
+      let specOff = (b * pc.numFrames + frame) * pc.nFft; var acc = 0.0;
+      for (var k = 0; k < pc.nFft; k = k + 1) { let a = 2.0 * 3.14159265358979 * f32(k) * f32(i) / f32(pc.nFft); acc = acc + specRe[specOff + k] * cos(a) - specIm[specOff + k] * sin(a); }
+      let w = window[i]; resultAcc = resultAcc + acc * (1.0 / f32(pc.nFft)) * w; windowAcc = windowAcc + w * w;
+    }
+  }
+  resultb[idx] = resultAcc; windowSum[idx] = windowAcc;
 }";
 
     public static string ScatterReduce => @"

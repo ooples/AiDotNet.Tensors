@@ -15,7 +15,7 @@ using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IMultiTensorGpuOptimizerBackend, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend
+public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IMultiTensorGpuOptimizerBackend, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend, IPixelShuffleBackend
 {
     // During teardown the CUDA driver/context may already be destroyed, so calling driver
     // APIs (cuCtxPushCurrent / cuMemFree / cuCtxPopCurrent / cuCtxDestroy / cuModuleUnload)
@@ -648,14 +648,16 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     /// <summary>
     /// Computes a hash key for the kernel cache based on source code and compilation options.
     /// </summary>
-    private static string ComputeCacheKey(string source, string arch)
+    private static string ComputeCacheKey(string source, string arch, bool useFastMath)
     {
         using var sha = System.Security.Cryptography.SHA256.Create();
-        byte[] hash = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(source + "|" + arch));
+        byte[] hash = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(
+            source + "|" + arch + "|fastMath=" + useFastMath));
         return BitConverter.ToString(hash).Replace("-", "").Substring(0, 32);
     }
 
-    private IntPtr CompileKernelModule(int device, string source, string moduleName, string[] kernelNames)
+    private IntPtr CompileKernelModule(
+        int device, string source, string moduleName, string[] kernelNames, bool useFastMath = true)
     {
         // NVRTC doesn't support standard C headers — strip #include <math.h> etc.
         source = source.Replace("#include <math.h>", "// math.h stripped for NVRTC (built-in)")
@@ -689,7 +691,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         // Try loading from disk cache first
         string? cacheDir = GetKernelCacheDirectory();
-        string cacheKey = ComputeCacheKey(source, arch);
+        string cacheKey = ComputeCacheKey(source, arch, useFastMath);
         string? cacheFile = cacheDir != null ? Path.Combine(cacheDir, $"{moduleName}_{cacheKey}.cubin") : null;
 
         if (cacheFile != null && File.Exists(cacheFile))
@@ -728,7 +730,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         }
 
         // Compile with NVRTC
-        var optionsList = new List<string> { arch, "--use_fast_math" };
+        var optionsList = new List<string> { arch };
+        if (useFastMath)
+            optionsList.Add("--use_fast_math");
         var cudaInclude = GetCudaIncludePath();
         if (cudaInclude != null)
             optionsList.Add($"--include-path={cudaInclude}");
@@ -1020,7 +1024,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             _parity210Module = CompileKernelModule(device,
                 Kernels.CudaParity210Kernels.GetSource(),
                 "parity210_kernels",
-                Kernels.CudaParity210Kernels.GetKernelNames());
+                Kernels.CudaParity210Kernels.GetKernelNames(),
+                useFastMath: false);
         }
         catch
         {
@@ -1603,6 +1608,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public void DownloadBuffer(IGpuBuffer buffer, float[] destination)
     {
+        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float));
         // #226: never issue a device→host copy from a released buffer. After CudaGpuBuffer.Release
         // the device pointer is zeroed; cuMemcpyDtoH from a null/freed pointer is an ILLEGAL memory
         // access that corrupts the CUDA context — every subsequent driver call then fails with error
@@ -3091,6 +3097,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new ArgumentOutOfRangeException(nameof(M), $"M*K ({(long)M * K}) exceeds denseInput length ({denseInput.Size}).");
         if ((long)M * (K / 2) > sparseValues.Size)
             throw new ArgumentOutOfRangeException(nameof(M), $"M*(K/2) ({(long)M * (K / 2)}) exceeds sparseValues length ({sparseValues.Size}).");
+        long requiredIndexBytes = (long)M * (K / 4);
+        if (requiredIndexBytes > sparseIndices.SizeInBytes)
+            throw new ArgumentOutOfRangeException(nameof(M), $"Packed 2:4 metadata requires {requiredIndexBytes} bytes but sparseIndices has {sparseIndices.SizeInBytes}.");
 
         if (!_kernelCache.TryGetValue("enforce_2x4_sparsity", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: enforce_2x4_sparsity");
@@ -3116,6 +3125,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (K % 4 != 0)
             throw new ArgumentException("K must be a multiple of 4 for 2:4 structured sparsity.");
+        if (M <= 0 || K <= 0)
+            throw new ArgumentOutOfRangeException(nameof(M), "M and K must be positive.");
+        long totalGroupsLong = (long)M * (K / 4);
+        if ((long)M * (K / 2) > sparseValues.Size || totalGroupsLong > sparseIndices.SizeInBytes || (long)M * K > denseOutput.Size)
+            throw new ArgumentException("One or more buffers are too small for the requested 2:4 decompression.");
 
         if (!_kernelCache.TryGetValue("decompress_2x4_sparse", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: decompress_2x4_sparse");
@@ -3131,7 +3145,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[2] = &densePtr;
         args[3] = &mVal;
         args[4] = &kVal;
-        uint total = (uint)(M * K);
+        uint total = checked((uint)totalGroupsLong);
         uint grid = (total + DefaultBlockSize - 1) / DefaultBlockSize;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
@@ -3674,24 +3688,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public float Sum(IGpuBuffer A, int size)
     {
-        if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
-
-        if (size <= 0)
-            return 0.0f;
-
-        using var _ = PushContext();
-        int blockSize = DefaultBlockSize;
-        int gridSize = (size + blockSize - 1) / blockSize;
-
-        using var partialBuffer = AllocateBuffer(gridSize);
-        LaunchReductionKernel("reduce_sum", A, partialBuffer, size, blockSize);
-        // Synchronize() removed: DownloadBuffer uses cuMemcpyDtoH which is synchronous
-        var partials = DownloadBuffer(partialBuffer);
-        float sum = 0.0f;
-        for (int i = 0; i < partials.Length; i++)
-            sum += partials[i];
-        return sum;
+        return ReduceGpuScalar("reduce_sum", A, size, 0.0f);
     }
 
     /// <summary>
@@ -3699,100 +3696,47 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     /// then downloads just that single scalar value to avoid multiple D2H transfers for partial sums.
     /// </summary>
     private float SumGpuReduction(IGpuBuffer A, int size)
+        => ReduceGpuScalar("reduce_sum", A, size, 0.0f);
+
+    private float ReduceGpuScalar(string kernelName, IGpuBuffer input, int size, float emptyValue)
     {
         if (!IsAvailable)
             throw new InvalidOperationException("CUDA backend is not available.");
 
         if (size <= 0)
-            return 0.0f;
+            return emptyValue;
 
         using var _ = PushContext();
         int blockSize = DefaultBlockSize;
+        int maximumPartials = (size + blockSize - 1) / blockSize;
+        using var temporaryA = AllocateBuffer(maximumPartials);
+        using var temporaryB = AllocateBuffer(maximumPartials);
+        IGpuBuffer current = input;
         int currentSize = size;
-
-        // We need at least one iteration
-        IGpuBuffer currentBuffer = A;
-        IGpuBuffer? tempBuffer1 = null;
-        IGpuBuffer? tempBuffer2 = null;
-
-        try
+        bool writeA = true;
+        while (currentSize > 1)
         {
-            while (currentSize > 1)
-            {
-                int gridSize = (currentSize + blockSize - 1) / blockSize;
-
-                // Allocate output buffer for this reduction pass
-                var outputBuffer = (tempBuffer1 is null || tempBuffer1.Size < gridSize)
-                    ? AllocateBuffer(gridSize)
-                    : tempBuffer1;
-
-                LaunchReductionKernel("reduce_sum", currentBuffer, outputBuffer, currentSize, blockSize);
-
-                // Swap buffers for next iteration
-                if (currentBuffer != A)
-                {
-                    // Return previous temp buffer to pool (swap)
-                    tempBuffer2?.Dispose();
-                    tempBuffer2 = tempBuffer1;
-                }
-                tempBuffer1 = outputBuffer;
-                currentBuffer = outputBuffer;
-                currentSize = gridSize;
-            }
-
-            // Synchronize() removed: DownloadBuffer uses cuMemcpyDtoH which is synchronous
-            var result = new float[1];
-            DownloadBuffer(currentBuffer, result);
-            return result[0];
+            int partialCount = (currentSize + blockSize - 1) / blockSize;
+            IGpuBuffer next = writeA ? temporaryA : temporaryB;
+            LaunchReductionKernel(kernelName, current, next, currentSize, blockSize);
+            current = next;
+            currentSize = partialCount;
+            writeA = !writeA;
         }
-        finally
-        {
-            tempBuffer1?.Dispose();
-            tempBuffer2?.Dispose();
-        }
+
+        var result = new float[1];
+        DownloadBuffer(current, result);
+        return result[0];
     }
 
     public float Max(IGpuBuffer A, int size)
     {
-        if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
-
-        if (size <= 0)
-            return float.MinValue;
-
-        using var _ = PushContext();
-        int blockSize = DefaultBlockSize;
-        int gridSize = (size + blockSize - 1) / blockSize;
-
-        using var partialBuffer = AllocateBuffer(gridSize);
-        LaunchReductionKernel("reduce_max", A, partialBuffer, size, blockSize);
-        // Synchronize() removed: DownloadBuffer uses cuMemcpyDtoH which is synchronous
-        var partials = DownloadBuffer(partialBuffer);
-        float max = float.MinValue;
-        for (int i = 0; i < partials.Length; i++)
-            if (partials[i] > max) max = partials[i];
-        return max;
+        return ReduceGpuScalar("reduce_max", A, size, float.MinValue);
     }
 
     public float Min(IGpuBuffer A, int size)
     {
-        if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
-
-        if (size <= 0)
-            return float.MaxValue;
-
-        using var _ = PushContext();
-        int blockSize = DefaultBlockSize;
-        int gridSize = (size + blockSize - 1) / blockSize;
-
-        using var partialBuffer = AllocateBuffer(gridSize);
-        LaunchReductionKernel("reduce_min", A, partialBuffer, size, blockSize);
-        var partials = DownloadBuffer(partialBuffer);
-        float min = float.MaxValue;
-        for (int i = 0; i < partials.Length; i++)
-            if (partials[i] < min) min = partials[i];
-        return min;
+        return ReduceGpuScalar("reduce_min", A, size, float.MaxValue);
     }
 
     public void SumAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
@@ -7067,86 +7011,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (gradBeta.Size < channels)
             throw new ArgumentException($"gradBeta buffer too small: expected at least {channels} elements, got {gradBeta.Size}.", nameof(gradBeta));
 
-        // Use instancenorm_backward kernel if available, otherwise fall back to layernorm pattern
         if (!_kernelCache.TryGetValue("instancenorm_backward", out var kernel))
-        {
-            // Fallback: implement using basic CUDA operations
-            // This computes: dx = invStd * (1/N) * (N * delta - sum(delta) - xNorm * sum(delta * xNorm))
-            // where delta = gradOutput * gamma
-
-            // For now, use CPU fallback via buffer download/upload
-            var gradOutData = DownloadBuffer(gradOutput);
-            var inputData = DownloadBuffer(input);
-            var gammaData = DownloadBuffer(gamma);
-            var meanData = DownloadBuffer(saveMean);
-            var invVarData = DownloadBuffer(saveInvVar);
-            var gradInputData = new float[gradOutData.Length];
-            var gradGammaData = new float[channels];
-            var gradBetaData = new float[channels];
-
-            for (int b = 0; b < batch; b++)
-            {
-                for (int c = 0; c < channels; c++)
-                {
-                    int offset = (b * channels + c) * spatialSize;
-                    float meanVal = meanData[b * channels + c];
-                    float invStd = invVarData[b * channels + c];
-                    float g = gammaData[c];
-
-                    // First pass: compute sums for gradient correction
-                    float sumDelta = 0.0f;
-                    float sumDeltaXNorm = 0.0f;
-                    for (int s = 0; s < spatialSize; s++)
-                    {
-                        float go = gradOutData[offset + s];
-                        float x = inputData[offset + s];
-                        float xNorm = (x - meanVal) * invStd;
-                        float delta = go * g;
-
-                        gradGammaData[c] += go * xNorm;
-                        gradBetaData[c] += go;
-
-                        sumDelta += delta;
-                        sumDeltaXNorm += delta * xNorm;
-                    }
-
-                    // Second pass: compute gradInput with proper correction terms
-                    float invN = 1.0f / spatialSize;
-                    for (int s = 0; s < spatialSize; s++)
-                    {
-                        float go = gradOutData[offset + s];
-                        float x = inputData[offset + s];
-                        float xNorm = (x - meanVal) * invStd;
-                        float delta = go * g;
-
-                        // dx = invStd * invN * (N * delta - sum(delta) - xNorm * sum(delta * xNorm))
-                        gradInputData[offset + s] = invStd * invN * (spatialSize * delta - sumDelta - xNorm * sumDeltaXNorm);
-                    }
-                }
-            }
-
-            // Upload results to GPU buffers
-            using var ctx = PushContext();
-            fixed (float* gradInputDataPtr = gradInputData)
-            {
-                CuBlasNative.CheckCudaResult(
-                    CuBlasNative.cuMemcpyHtoD(gradInput.Handle, (IntPtr)gradInputDataPtr, (ulong)(gradInputData.Length * sizeof(float))),
-                    "cuMemcpyHtoD (InstanceNormBackward gradInput)");
-            }
-            fixed (float* gradGammaDataPtr = gradGammaData)
-            {
-                CuBlasNative.CheckCudaResult(
-                    CuBlasNative.cuMemcpyHtoD(gradGamma.Handle, (IntPtr)gradGammaDataPtr, (ulong)(gradGammaData.Length * sizeof(float))),
-                    "cuMemcpyHtoD (InstanceNormBackward gradGamma)");
-            }
-            fixed (float* gradBetaDataPtr = gradBetaData)
-            {
-                CuBlasNative.CheckCudaResult(
-                    CuBlasNative.cuMemcpyHtoD(gradBeta.Handle, (IntPtr)gradBetaDataPtr, (ulong)(gradBetaData.Length * sizeof(float))),
-                    "cuMemcpyHtoD (InstanceNormBackward gradBeta)");
-            }
-            return;
-        }
+            throw new InvalidOperationException("CUDA kernel not found: instancenorm_backward");
 
         using var _ = PushContext();
         uint gridX = (uint)(batch * channels);
@@ -7463,98 +7329,116 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     #region Attention Operations
 
-    public void ScaledDotProductAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
+    public unsafe void ScaledDotProductAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer? attentionWeights, IGpuBuffer? mask,
-        int batch, int numHeads, int seqLen, int headDim, float scale, bool isCausal)
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
     {
-        // Attention: softmax(Q * K^T / sqrt(d_k)) * V
         using var _ = PushContext();
-        int batchHeads = batch * numHeads;
-        int qkSize = seqLen * seqLen;
+        if (batch <= 0 || numHeads <= 0 || seqQ <= 0 || seqK <= 0 || headDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "Attention dimensions must be positive.");
+        if (!_kernelCache.TryGetValue("scaled_dot_product_attention", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: scaled_dot_product_attention");
 
-        // Allocate temporary buffers
-        using var scores = AllocateBuffer(batchHeads * qkSize);
-        using var keyTransposed = AllocateBuffer(batchHeads * seqLen * headDim);
+        int querySize = checked(batch * numHeads * seqQ * headDim);
+        int keyValueSize = checked(batch * numHeads * seqK * headDim);
+        int weightsSize = checked(batch * numHeads * seqQ * seqK);
+        if (query.Size < querySize || key.Size < keyValueSize || value.Size < keyValueSize || output.Size < querySize)
+            throw new ArgumentException("Attention tensor buffers are smaller than the requested dimensions.");
+        if (attentionWeights is not null && attentionWeights.Size < weightsSize)
+            throw new ArgumentException("The attention-weights buffer is too small.", nameof(attentionWeights));
+        if (mask is not null && mask.Size < seqQ * seqK)
+            throw new ArgumentException("The attention mask must contain at least seqQ * seqK elements.", nameof(mask));
 
-        // Transpose K: [batch*heads, seqLen, headDim] -> [batch*heads, headDim, seqLen]
-        BatchedTranspose(key, keyTransposed, batchHeads, seqLen, headDim);
+        IntPtr queryPtr = query.Handle;
+        IntPtr keyPtr = key.Handle;
+        IntPtr valuePtr = value.Handle;
+        IntPtr outputPtr = output.Handle;
+        IntPtr weightsPtr = attentionWeights?.Handle ?? IntPtr.Zero;
+        IntPtr maskPtr = mask?.Handle ?? IntPtr.Zero;
+        int causalFlag = isCausal ? 1 : 0;
+        int maskMode = mask is null ? 0 : mask.Size >= weightsSize ? 2 : 1;
+        int storeWeights = attentionWeights is null ? 0 : 1;
+        void** args = stackalloc void*[15];
+        args[0] = &queryPtr;
+        args[1] = &keyPtr;
+        args[2] = &valuePtr;
+        args[3] = &outputPtr;
+        args[4] = &weightsPtr;
+        args[5] = &maskPtr;
+        args[6] = &batch;
+        args[7] = &numHeads;
+        args[8] = &seqQ;
+        args[9] = &seqK;
+        args[10] = &headDim;
+        args[11] = &scale;
+        args[12] = &causalFlag;
+        args[13] = &maskMode;
+        args[14] = &storeWeights;
 
-        // Q * K^T: [batch*heads, seqLen, headDim] x [batch*heads, headDim, seqLen] -> [batch*heads, seqLen, seqLen]
-        BatchedGemm(query, keyTransposed, scores, seqLen, seqLen, headDim, batchHeads);
-
-        // Scale by 1/sqrt(d_k)
-        Scale(scores, scores, scale, batchHeads * qkSize);
-
-        // Apply causal mask if needed
-        if (isCausal && mask is not null)
-        {
-            Add(scores, mask, scores, batchHeads * qkSize);
-        }
-
-        // Softmax along the last dimension
-        Softmax(scores, scores, batchHeads * seqLen, seqLen);
-
-        // Copy attention weights if requested
-        if (attentionWeights is not null)
-        {
-            Copy(scores, attentionWeights, batchHeads * qkSize);
-        }
-
-        // Multiply by V: [batch*heads, seqLen, seqLen] x [batch*heads, seqLen, headDim] -> [batch*heads, seqLen, headDim]
-        BatchedGemm(scores, value, output, seqLen, headDim, seqLen, batchHeads);
+        int rows = checked(batch * numHeads * seqQ);
+        uint grid = (uint)((rows + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
     public void ScaledDotProductAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer attentionWeights, IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
-        int batch, int numHeads, int seqLen, int headDim, float scale, bool isCausal)
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
     {
         using var _ = PushContext();
-        int batchHeads = batch * numHeads;
-        int qkSize = seqLen * seqLen;
+        int batchHeads = checked(batch * numHeads);
+        int qkSize = checked(seqQ * seqK);
 
         // Allocate temporary buffers
         using var gradScores = AllocateBuffer(batchHeads * qkSize);
         using var tempScores = AllocateBuffer(batchHeads * qkSize);
         using var attnTransposed = AllocateBuffer(batchHeads * qkSize);
-        using var valueTransposed = AllocateBuffer(batchHeads * seqLen * headDim);
+        using var valueTransposed = AllocateBuffer(checked(batchHeads * seqK * headDim));
         using var gradScoresTransposed = AllocateBuffer(batchHeads * qkSize);
 
-        // Transpose attention weights: [batch*heads, seqLen, seqLen]
-        BatchedTranspose(attentionWeights, attnTransposed, batchHeads, seqLen, seqLen);
+        // Transpose attention weights: [batch*heads, seqQ, seqK]
+        BatchedTranspose(attentionWeights, attnTransposed, batchHeads, seqQ, seqK);
 
         // gradValue = attention_weights^T * gradOutput
-        BatchedGemm(attnTransposed, gradOutput, gradValue, seqLen, headDim, seqLen, batchHeads);
+        BatchedGemm(attnTransposed, gradOutput, gradValue, seqK, headDim, seqQ, batchHeads);
 
-        // Transpose V: [batch*heads, seqLen, headDim] -> [batch*heads, headDim, seqLen]
-        BatchedTranspose(value, valueTransposed, batchHeads, seqLen, headDim);
+        // Transpose V: [batch*heads, seqK, headDim] -> [batch*heads, headDim, seqK]
+        BatchedTranspose(value, valueTransposed, batchHeads, seqK, headDim);
 
         // gradScores = gradOutput * V^T
-        BatchedGemm(gradOutput, valueTransposed, gradScores, seqLen, seqLen, headDim, batchHeads);
+        BatchedGemm(gradOutput, valueTransposed, gradScores, seqQ, seqK, headDim, batchHeads);
 
         // Softmax backward
-        SoftmaxBackward(gradScores, attentionWeights, tempScores, batchHeads * seqLen, seqLen);
+        SoftmaxBackward(gradScores, attentionWeights, tempScores, batchHeads * seqQ, seqK);
 
         // Scale
         Scale(tempScores, gradScores, scale, batchHeads * qkSize);
 
         // gradQuery = gradScores * K
-        BatchedGemm(gradScores, key, gradQuery, seqLen, headDim, seqLen, batchHeads);
+        BatchedGemm(gradScores, key, gradQuery, seqQ, headDim, seqK, batchHeads);
 
         // Transpose gradScores for gradKey computation
-        BatchedTranspose(gradScores, gradScoresTransposed, batchHeads, seqLen, seqLen);
+        BatchedTranspose(gradScores, gradScoresTransposed, batchHeads, seqQ, seqK);
 
         // gradKey = gradScores^T * Q
-        BatchedGemm(gradScoresTransposed, query, gradKey, seqLen, headDim, seqLen, batchHeads);
+        BatchedGemm(gradScoresTransposed, query, gradKey, seqK, headDim, seqQ, batchHeads);
     }
 
     public void FlashAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer? mask, int batch, int numHeads, int seqLen, int headDim, float scale, bool isCausal)
     {
+        if (mask is not null)
+        {
+            ScaledDotProductAttention(query, key, value, output, null, mask,
+                batch, numHeads, seqLen, seqLen, headDim, scale, isCausal);
+            return;
+        }
+
         // Allocate temporary buffer for softmax stats (not returned but required by FlashAttentionV2)
         using var softmaxStats = AllocateBuffer(batch * numHeads * seqLen);
 
         // Use FlashAttentionV2 which is the proper GPU-accelerated implementation
-        FlashAttentionV2(query, key, value, output, softmaxStats, batch, numHeads, seqLen, seqLen, headDim, scale, isCausal);
+        FlashAttentionV2(query, key, value, output, softmaxStats,
+            batch, numHeads, seqLen, seqLen, headDim, scale, isCausal);
     }
 
     public unsafe void FlashAttentionV2(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
@@ -8055,13 +7939,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (!IsAvailable)
             throw new InvalidOperationException("CUDA backend is not available.");
 
-        // Check for the kernel, if not available fall back to CPU implementation via memcpy pattern
         if (!_kernelCache.TryGetValue("nearest_neighbor_upsample", out var kernel))
-        {
-            // Fallback: Download, upsample on CPU, upload
-            NearestNeighborUpsampleFallback(input, output, batchChannels, height, width, scaleFactor);
-            return;
-        }
+            throw new InvalidOperationException("CUDA kernel not found: nearest_neighbor_upsample");
 
         using var _ = PushContext();
 
@@ -8096,48 +7975,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             "cuLaunchKernel (nearest_neighbor_upsample)");
     }
 
-    /// <summary>
-    /// CPU fallback for nearest-neighbor upsampling when kernel is not available.
-    /// </summary>
-    private unsafe void NearestNeighborUpsampleFallback(IGpuBuffer input, IGpuBuffer output, int batchChannels, int height, int width, int scaleFactor)
-    {
-        int inputSize = batchChannels * height * width;
-        int outHeight = height * scaleFactor;
-        int outWidth = width * scaleFactor;
-        int outputSize = batchChannels * outHeight * outWidth;
-
-        // Download input using existing method
-        var inputData = new float[inputSize];
-        DownloadBuffer(input, inputData);
-
-        // Perform CPU upsampling
-        var outputData = new float[outputSize];
-        for (int bc = 0; bc < batchChannels; bc++)
-        {
-            for (int oh = 0; oh < outHeight; oh++)
-            {
-                for (int ow = 0; ow < outWidth; ow++)
-                {
-                    int ih = oh / scaleFactor;
-                    int iw = ow / scaleFactor;
-                    int inputIdx = bc * height * width + ih * width + iw;
-                    int outputIdx = bc * outHeight * outWidth + oh * outWidth + ow;
-                    outputData[outputIdx] = inputData[inputIdx];
-                }
-            }
-        }
-
-        // Upload output using CUDA memory copy
-        using var _ = PushContext();
-        ulong byteSize = (ulong)outputSize * sizeof(float);
-        fixed (float* src = outputData)
-        {
-            CuBlasNative.CheckCudaResult(
-                CuBlasNative.cuMemcpyHtoD(output.Handle, (IntPtr)src, byteSize),
-                "cuMemcpyHtoD (upsample fallback)");
-        }
-    }
-
     /// <inheritdoc/>
     public unsafe void NearestNeighborUpsampleBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batchChannels, int height, int width, int scaleFactor)
     {
@@ -8166,11 +8003,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int inputSize = (int)inputSizeLong;
 
         if (!_kernelCache.TryGetValue("nearest_neighbor_upsample_backward", out var kernel))
-        {
-            // Fallback: CPU implementation
-            NearestNeighborUpsampleBackwardFallback(gradOutput, gradInput, batchChannels, height, width, scaleFactor);
-            return;
-        }
+            throw new InvalidOperationException("CUDA kernel not found: nearest_neighbor_upsample_backward");
 
         using var _ = PushContext();
 
@@ -8206,84 +8039,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 (IntPtr)args,
                 IntPtr.Zero),
             "cuLaunchKernel (nearest_neighbor_upsample_backward)");
-    }
-
-    /// <summary>
-    /// CPU fallback for nearest-neighbor upsampling backward when kernel is not available.
-    /// </summary>
-    private unsafe void NearestNeighborUpsampleBackwardFallback(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batchChannels, int height, int width, int scaleFactor)
-    {
-        // Use checked arithmetic for all dimension calculations
-        int outHeight, outWidth;
-        long outputSizeLong, inputSizeLong;
-        try
-        {
-            checked
-            {
-                outHeight = height * scaleFactor;
-                outWidth = width * scaleFactor;
-                outputSizeLong = (long)batchChannels * outHeight * outWidth;
-                inputSizeLong = (long)batchChannels * height * width;
-            }
-        }
-        catch (OverflowException)
-        {
-            throw new OverflowException($"NearestNeighborUpsampleBackwardFallback: Dimension overflow (batchChannels={batchChannels}, height={height}, width={width}, scaleFactor={scaleFactor}).");
-        }
-
-        // Validate sizes fit in int (required for array indexing)
-        if (outputSizeLong > int.MaxValue)
-        {
-            throw new InvalidOperationException($"NearestNeighborUpsampleBackwardFallback: Output size {outputSizeLong} exceeds int.MaxValue.");
-        }
-        if (inputSizeLong > int.MaxValue)
-        {
-            throw new InvalidOperationException($"NearestNeighborUpsampleBackwardFallback: Input size {inputSizeLong} exceeds int.MaxValue.");
-        }
-        int outputSize = (int)outputSizeLong;
-        int inputSize = (int)inputSizeLong;
-
-        // Download gradOutput
-        var gradOutData = new float[outputSize];
-        DownloadBuffer(gradOutput, gradOutData);
-
-        // Accumulate gradients on CPU
-        var gradInData = new float[inputSize];
-        for (int bc = 0; bc < batchChannels; bc++)
-        {
-            for (int oh = 0; oh < outHeight; oh++)
-            {
-                for (int ow = 0; ow < outWidth; ow++)
-                {
-                    int ih = oh / scaleFactor;
-                    int iw = ow / scaleFactor;
-                    int inputIdx = bc * height * width + ih * width + iw;
-                    int outputIdx = bc * outHeight * outWidth + oh * outWidth + ow;
-                    gradInData[inputIdx] += gradOutData[outputIdx];
-                }
-            }
-        }
-
-        // Upload gradInput - compute byte size from checked long element count
-        using var _ = PushContext();
-        ulong byteSize;
-        try
-        {
-            checked
-            {
-                byteSize = (ulong)(inputSizeLong * sizeof(float));
-            }
-        }
-        catch (OverflowException)
-        {
-            throw new OverflowException($"NearestNeighborUpsampleBackwardFallback: Byte size overflow for {inputSizeLong} elements.");
-        }
-        fixed (float* src = gradInData)
-        {
-            CuBlasNative.CheckCudaResult(
-                CuBlasNative.cuMemcpyHtoD(gradInput.Handle, (IntPtr)src, byteSize),
-                "cuMemcpyHtoD (upsample backward fallback)");
-        }
     }
 
     #endregion
@@ -10489,84 +10244,30 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new ArgumentException($"Buffer 'input' capacity ({input.Size}) is less than size ({size}).", nameof(input));
         if (size <= 1) return 0.0f;
 
-        using var _ = PushContext();
-        int blockSize = DefaultBlockSize;
-        int gridSize = (size + blockSize - 1) / blockSize;
+        using var mean = AllocateBuffer(1);
+        using var squaredDeviations = AllocateBuffer(size);
+        SumAxis(input, mean, 1, size);
+        Scale(mean, mean, 1.0f / size, 1);
 
-        // Step 1: Compute mean via GPU reduction
-        // Issue #382: under DeterministicMode, the deterministic variant computes
-        // mean directly (writes sum/size) and uses a single-block grid; in non-
-        // deterministic mode the multi-block atomic kernel writes sum (caller divides).
-        float mean;
-        string meanKernelName = GpuDeterminism.IsActive ? "reduce_mean_kernel_deterministic" : "reduce_mean_kernel";
-        if (_kernelCache.TryGetValue(meanKernelName, out var meanKernel))
+        if (!_kernelCache.TryGetValue("squared_deviation_from_mean", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: squared_deviation_from_mean");
+
+        using (PushContext())
         {
-            var zeroData = new float[1];
-            using var meanBuffer = AllocateBuffer(zeroData);
-
             IntPtr inputPtr = input.Handle;
-            IntPtr meanPtr = meanBuffer.Handle;
-            int n = size;
-            void** args = stackalloc void*[3];
-            args[0] = &inputPtr;
-            args[1] = &meanPtr;
-            args[2] = &n;
-            uint sharedBytes = (uint)(blockSize * sizeof(float));
-            uint launchGrid = GpuDeterminism.IsActive ? 1u : (uint)gridSize;
-            LaunchKernelWithSharedMem(meanKernel, launchGrid, (uint)blockSize, sharedBytes, args);
-            // Synchronize() removed: DownloadBuffer uses cuMemcpyDtoH which is synchronous
-            float[] meanResult = DownloadBuffer(meanBuffer);
-            // Both kernels now write the raw sum; normalize once on the host so
-            // deterministic and non-deterministic paths agree (CodeRabbit PR #390 —
-            // previously the deterministic kernel divided internally and the host
-            // skipped the division, but that was fragile and easy to mis-match).
-            mean = meanResult[0] / size;
-        }
-        else
-        {
-            mean = Sum(input, size) / size;
-        }
-
-        // Step 2: Compute variance via GPU reduction
-        float variance;
-        string varKernelName = GpuDeterminism.IsActive ? "reduce_variance_kernel_deterministic" : "reduce_variance_kernel";
-        if (_kernelCache.TryGetValue(varKernelName, out var varKernel))
-        {
-            var zeroData = new float[1];
-            using var varianceBuffer = AllocateBuffer(zeroData);
-
-            IntPtr inputPtr = input.Handle;
-            IntPtr varPtr = varianceBuffer.Handle;
-            float meanVal = mean;
+            IntPtr meanPtr = mean.Handle;
+            IntPtr outputPtr = squaredDeviations.Handle;
             int n = size;
             void** args = stackalloc void*[4];
             args[0] = &inputPtr;
-            args[1] = &varPtr;
-            args[2] = &meanVal;
+            args[1] = &meanPtr;
+            args[2] = &outputPtr;
             args[3] = &n;
-            uint sharedBytes = (uint)(blockSize * sizeof(float));
-            uint launchGrid = GpuDeterminism.IsActive ? 1u : (uint)gridSize;
-            LaunchKernelWithSharedMem(varKernel, launchGrid, (uint)blockSize, sharedBytes, args);
-            // Synchronize() removed: DownloadBuffer uses cuMemcpyDtoH which is synchronous
-            float[] varResult = DownloadBuffer(varianceBuffer);
-            variance = varResult[0] / size;
-        }
-        else
-        {
-            // Fallback: download and compute on CPU
-            float[] data = DownloadBuffer(input);
-            float varSum = 0.0f;
-            for (int i = 0; i < size; i++)
-            {
-                float diff = data[i] - mean;
-                varSum += diff * diff;
-            }
-            variance = varSum / size;
+            LaunchKernel(kernel, (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
         }
 
-        // Clamp variance to avoid NaN from floating-point round-off
-        variance = Math.Max(0, variance);
-        return MathF.Sqrt(variance);
+        float variance = SumGpuReduction(squaredDeviations, size) / size;
+        return MathF.Sqrt(Math.Max(0.0f, variance));
     }
 
     public unsafe void ScatterAdd(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer destination, int sourceSize, int destSize)
@@ -10795,7 +10496,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         var kernel = ResolveParity210Kernel("parity210_index_write");
         using var _ = PushContext();
-        int __total = outerSize*idxAxis*innerSize; if (__total <= 0) return;
+        int __total = outerSize*dstAxis*innerSize; if (__total <= 0) return;
         uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr la0 = output.Handle; IntPtr la1 = indices.Handle; IntPtr la2 = source.Handle; float la3 = fillValue; int la4 = mode; int la5 = outerSize; int la6 = idxAxis; int la7 = innerSize; int la8 = dstAxis;
         void** args = stackalloc void*[9];
@@ -10993,7 +10694,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         var kernel = ResolveParity210Kernel("parity210_istft_from_spectrum");
         using var _ = PushContext();
-        int __total = batch*numFrames*nFft; if (__total <= 0) return;
+        int __total = batch*outputLength; if (__total <= 0) return;
         uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr la0 = specRe.Handle; IntPtr la1 = specIm.Handle; IntPtr la2 = window.Handle; IntPtr la3 = result.Handle; IntPtr la4 = windowSum.Handle; int la5 = batch; int la6 = numFrames; int la7 = nFft; int la8 = hop; int la9 = outputLength; int la10 = center;
         void** args = stackalloc void*[11];
@@ -12916,8 +12617,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         using var _ = PushContext();
 
         // Copy input to output for in-place FFT
-        CudaCopyBuffer(inputReal, outputReal, n);
-        CudaCopyBuffer(inputImag, outputImag, n);
+        if (inputReal.Handle != outputReal.Handle)
+            CudaCopyBuffer(inputReal, outputReal, n);
+        if (inputImag.Handle != outputImag.Handle)
+            CudaCopyBuffer(inputImag, outputImag, n);
 
         int log2n = (int)MathHelper.Log2(n);
         IntPtr outRealPtr = outputReal.Handle;
@@ -13444,6 +13147,24 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    public unsafe void GenerateStatelessDropoutMask(
+        IGpuBuffer output, int size, uint threshold, float scale, uint seed)
+    {
+        if (!_kernelCache.TryGetValue("stateless_dropout_mask", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: stateless_dropout_mask");
+
+        using var _ = PushContext();
+        IntPtr outputPtr = output.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &outputPtr;
+        args[1] = &size;
+        args[2] = &threshold;
+        args[3] = &scale;
+        args[4] = &seed;
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
     public unsafe void GenerateRandomNormal(IGpuBuffer output, int size, float mean, float stdDev, ulong seed)
     {
         if (!_kernelCache.TryGetValue("generate_random_normal", out var kernel))
@@ -13465,24 +13186,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
-    public unsafe void GenerateSecureRandomUniform(IGpuBuffer output, int size, float min, float max)
+    public void GenerateSecureRandomUniform(IGpuBuffer output, int size, float min, float max)
     {
         if (size <= 0) return;
-        using var _ = PushContext();
-        var data = new float[size];
-        try
-        {
-            Helpers.SimdRandom.SecureFillFloats(data.AsSpan());
-            float range = max - min;
-            for (int i = 0; i < size; i++) data[i] = data[i] * range + min;
-            fixed (float* ptr = data)
-            {
-                CuBlasNative.CheckCudaResult(
-                    CuBlasNative.cuMemcpyHtoD(output.Handle, (IntPtr)ptr, (ulong)(size * sizeof(float))),
-                    "cuMemcpyHtoD (GenerateSecureRandomUniform)");
-            }
-        }
-        finally { Array.Clear(data, 0, size); }
+        GenerateRandomUniform(output, size, min, max, GpuRandomSeed.Create());
     }
 
     public unsafe void RbfForward(IGpuBuffer input, IGpuBuffer centers, IGpuBuffer epsilons, IGpuBuffer output, int batchSize, int numCenters, int inputDim)
@@ -13654,8 +13361,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void HyperbolicLinearForward(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
         int batchSize, int inputFeatures, int outputFeatures, float curvature, float epsilon)
     {
-        if (!_kernelCache.TryGetValue("hyperbolic_linear_forward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: hyperbolic_linear_forward");
+        if (!_kernelCache.TryGetValue("hyperbolic_linear_euclidean_forward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: hyperbolic_linear_euclidean_forward");
 
         using var _ = PushContext();
         int totalThreads = batchSize * outputFeatures;
@@ -13676,6 +13383,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[7] = &curvature;
         args[8] = &epsilon;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        PoincareProject(output, output, batchSize, outputFeatures, curvature, epsilon);
     }
 
     /// <inheritdoc/>
@@ -14129,25 +13837,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         ValidateSplitBuffers(n, nameof(SplitComplexTopK), inReal, inImag, outReal, outImag);
         if (!_kernelCache.TryGetValue("split_complex_topk", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: split_complex_topk");
-
-        // Compute threshold on CPU: download magnitudes, find K-th largest
-        var magBuf = AllocateBuffer(n);
-        try
-        {
-        SplitComplexMagnitudeSquared(inReal, inImag, magBuf, n);
-        var magData = DownloadBuffer(magBuf);
-        Array.Sort(magData);
-        Array.Reverse(magData);
-        float threshold = k <= n ? magData[Math.Min(k, n) - 1] : 0f;
-
+        k = Math.Min(k, n);
         using var _ = PushContext();
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pIR = inReal.Handle, pII = inImag.Handle, pOR = outReal.Handle, pOI = outImag.Handle;
         void** args = stackalloc void*[6];
-        args[0] = &pIR; args[1] = &pII; args[2] = &pOR; args[3] = &pOI; args[4] = &threshold; args[5] = &n;
+        args[0] = &pIR; args[1] = &pII; args[2] = &pOR; args[3] = &pOI; args[4] = &k; args[5] = &n;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
-        }
-        finally { magBuf.Dispose(); }
     }
 
     public unsafe void SoftmaxRows(IGpuBuffer input, IGpuBuffer output, int rows, int cols)
@@ -14921,23 +14617,41 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target, int n, int d, int vocab)
         => FusedCeLaunch("fused_linear_ce_dense", hidden, weight, bias, target, n, d, vocab);
 
+    public unsafe void FusedLinearCrossEntropyIndex(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer targetIds,
+        IGpuBuffer meanLoss, int n, int d, int vocab)
+        => FusedCeLaunchResident("fused_linear_ce_index", hidden, weight, bias, targetIds, meanLoss, n, d, vocab);
+
+    public unsafe void FusedLinearCrossEntropyDense(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target,
+        IGpuBuffer meanLoss, int n, int d, int vocab)
+        => FusedCeLaunchResident("fused_linear_ce_dense", hidden, weight, bias, target, meanLoss, n, d, vocab);
+
     private unsafe float FusedCeLaunch(
         string kernelName, IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer tgt, int n, int d, int vocab)
+    {
+        using var lossBuf = AllocateBuffer(1);
+        FusedCeLaunchResident(kernelName, hidden, weight, bias, tgt, lossBuf, n, d, vocab);
+        return DownloadBuffer(lossBuf)[0];
+    }
+
+    private unsafe void FusedCeLaunchResident(
+        string kernelName, IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer tgt,
+        IGpuBuffer meanLoss, int n, int d, int vocab)
     {
         if (n <= 0 || d <= 0 || vocab <= 0)
             throw new ArgumentOutOfRangeException(nameof(n), "Fused CE dimensions (n, d, vocab) must be positive.");
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
             throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
         using var _ = PushContext();
-        using var lossBuf = AllocateBuffer(1); // zeroed
-        IntPtr ph = hidden.Handle, pw = weight.Handle, pb = bias.Handle, pt = tgt.Handle, pl = lossBuf.Handle;
+        Fill(meanLoss, 0f, 1);
+        IntPtr ph = hidden.Handle, pw = weight.Handle, pb = bias.Handle, pt = tgt.Handle, pl = meanLoss.Handle;
         void** args = stackalloc void*[8];
         args[0] = &ph; args[1] = &pw; args[2] = &pb; args[3] = &pt; args[4] = &pl;
         args[5] = &n; args[6] = &d; args[7] = &vocab;
         uint total = (uint)n;
         LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
-        var loss = DownloadBuffer(lossBuf);
-        return loss[0] / n;
+        Scale(meanLoss, meanLoss, 1f / n, 1);
     }
 
     public unsafe void LstmForwardSequence(

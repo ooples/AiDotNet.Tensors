@@ -22,6 +22,692 @@ layout(set = 0, binding = 1) readonly buffer B { float bdata[]; };
 layout(set = 0, binding = 2) writeonly buffer C { float c[]; };
 ";
 
+    public static string UnaryElementwise => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint size; uint op; uint p0; uint p1; uint p2; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= size) return;
+    float x = a[idx];
+    float v0 = uintBitsToFloat(p0), v1 = uintBitsToFloat(p1), v2 = uintBitsToFloat(p2);
+    float y = 0.0;
+    switch (op) {
+        case 0u: y = pow(x, v0); break;
+        case 1u: y = abs(x); break;
+        case 2u: y = exp(x); break;
+        case 3u: y = exp2(x); break;
+        case 4u: y = pow(10.0, x); break;
+        case 5u: y = exp(x) - 1.0; break;
+        case 6u: y = log(x); break;
+        case 7u: y = log2(x); break;
+        case 8u: y = log(1.0 + x); break;
+        case 9u: y = sqrt(x); break;
+        case 10u: y = sign(x); break;
+        case 11u: y = 0.5*x*(1.0+tanh(0.7978845608*(x+0.044715*x*x*x))); break;
+        case 12u: y = sin(x); break;
+        case 13u: y = cos(x); break;
+        case 14u: y = tan(x); break;
+        case 15u: y = asin(x); break;
+        case 16u: y = acos(x); break;
+        case 17u: y = atan(x); break;
+        case 18u: y = sinh(x); break;
+        case 19u: y = cosh(x); break;
+        case 20u: y = asinh(x); break;
+        case 21u: y = acosh(x); break;
+        case 22u: y = atanh(x); break;
+        case 23u: y = 1.0 / x; break;
+        case 24u: y = sign(x) * pow(abs(x), 0.3333333333333333); break;
+        case 25u: y = log(x) * 0.4342944819032518; break;
+        case 26u: y = -x; break;
+        case 27u: y = floor(x); break;
+        case 28u: y = ceil(x); break;
+        case 29u: y = roundEven(x); break;
+        case 30u: y = trunc(x); break;
+        case 31u: y = x >= 0.0 ? x : v0 * x; break;
+        case 32u: y = x >= 0.0 ? x : v0 * (exp(x) - 1.0); break;
+        case 33u: y = x / (1.0 + exp(-x)); break;
+        case 34u: y = x * tanh(log(1.0 + exp(x))); break;
+        case 35u: y = log(1.0 + exp(x)); break;
+        case 36u: y = x <= -3.0 ? 0.0 : (x >= 3.0 ? x : x * (x + 3.0) / 6.0); break;
+        case 37u: y = v1 * (x >= 0.0 ? x : v0 * (exp(x) - 1.0)); break;
+        case 38u: y = clamp(x / 6.0 + 0.5, 0.0, 1.0); break;
+        case 39u: y = clamp(x, v0, v1); break;
+        case 40u: {
+            uint xb = floatBitsToUint(x), vb = p0;
+            uint xa = xb & 0x7FFFFFFFu, va = vb & 0x7FFFFFFFu;
+            bool equal = xa <= 0x7F800000u && va <= 0x7F800000u
+                && (xb == vb || ((xa | va) == 0u));
+            y = equal ? 0.0 : 1.0;
+            break;
+        }
+        case 41u: y = max(v1, 10.0 * log(max(1e-10, x / v0)) * 0.4342944819032518); break;
+        case 42u: y = v0 * pow(10.0, x / 10.0); break;
+        default: y = x; break;
+    }
+    b[idx] = y;
+}";
+
+    public static string BinaryElementwise => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint size; uint op; uint p0; uint p1; uint p2; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= size) return;
+    float x = a[idx], y = bdata[idx];
+    float v0 = uintBitsToFloat(p0), v1 = uintBitsToFloat(p1);
+    float z = 0.0;
+    switch (op) {
+        case 0u: z = min(x, y); break;
+        case 1u: z = max(x, y); break;
+        case 2u: z = x * (y >= 0.0 ? 1.0 : v0); break;
+        case 3u: z = y > 0.0 ? x : 0.0; break;
+        case 4u: z = x * y * (1.0 - y); break;
+        case 5u: z = x * (1.0 - y * y); break;
+        case 6u: z = x / (1.0 + exp(-y)); break;
+        case 7u: z = x * (y <= -3.0 ? 0.0 : (y >= 3.0 ? 1.0 : (2.0*y+3.0)/6.0)); break;
+        case 8u: z = x * v1 * (y >= 0.0 ? 1.0 : v0 * exp(y)); break;
+        case 9u: z = x * (y > -3.0 && y < 3.0 ? 0.1666666666666667 : 0.0); break;
+        case 10u: z = y > v0 && y < v1 ? x : 0.0; break;
+        case 11u: z = x > y ? 1.0 : 0.0; break;
+        case 12u: z = x < y ? 1.0 : 0.0; break;
+        case 13u: {
+            uint xb = floatBitsToUint(x), yb = floatBitsToUint(y);
+            uint xa = xb & 0x7FFFFFFFu, ya = yb & 0x7FFFFFFFu;
+            bool equal = xa <= 0x7F800000u && ya <= 0x7F800000u
+                && (xb == yb || ((xa | ya) == 0u));
+            z = equal ? 1.0 : 0.0;
+            break;
+        }
+        case 14u: z = fma(v0, y - x, x); break;
+        case 15u: z = fma(v0, x, v1 * y); break;
+        case 16u: z = sqrt(x*x + y*y); break;
+        case 17u: z = atan(y, x); break;
+        case 18u: z = x * y; break;
+        case 19u: {
+            float sig = 1.0 / (1.0 + exp(-y));
+            z = x * (sig + y * sig * (1.0 - sig));
+            break;
+        }
+        case 20u: {
+            float t = tanh(0.7978845608 * (y + 0.044715 * y*y*y));
+            float dtdy = 0.7978845608 * (1.0 + 0.134145 * y*y) * (1.0 - t*t);
+            z = x * (0.5 * (1.0 + t) + 0.5 * y * dtdy);
+            break;
+        }
+        case 21u: {
+            float sp = log(1.0 + exp(y));
+            float tsp = tanh(sp);
+            float sig = 1.0 / (1.0 + exp(-y));
+            z = x * (tsp + y * sig * (1.0 - tsp*tsp));
+            break;
+        }
+        default: z = x; break;
+    }
+    c[idx] = z;
+}";
+
+    public static string EluBackward => Header + FourBufferLayout + @"
+layout(push_constant) uniform Params { uint size; uint alphaBits; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= size) return;
+    float alpha = uintBitsToFloat(alphaBits);
+    d[idx] = a[idx] * (bdata[idx] >= 0.0 ? 1.0 : c[idx] + alpha);
+}";
+
+    public static string Fma => Header + FourBufferLayout + @"
+layout(push_constant) uniform Params { uint size; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= size) return;
+    d[idx] = a[idx] * bdata[idx] + c[idx];
+}";
+
+    public static string Where => Header + FourBufferLayout + @"
+layout(push_constant) uniform Params { uint size; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= size) return;
+    d[idx] = a[idx] != 0.0 ? bdata[idx] : c[idx];
+}";
+
+    public static string SoftmaxRows => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint rows; uint cols; };
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= rows) return;
+    uint offset = row * cols;
+    float rowMax = -3.402823466e+38;
+    for (uint col = 0u; col < cols; ++col) rowMax = max(rowMax, a[offset + col]);
+    float sum = 0.0;
+    for (uint col = 0u; col < cols; ++col) sum += exp(a[offset + col] - rowMax);
+    for (uint col = 0u; col < cols; ++col) b[offset + col] = exp(a[offset + col] - rowMax) / sum;
+}";
+
+    public static string SoftmaxBackward => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint rows; uint cols; };
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= rows) return;
+    uint offset = row * cols;
+    float dot = 0.0;
+    for (uint col = 0u; col < cols; ++col) dot += a[offset + col] * bdata[offset + col];
+    for (uint col = 0u; col < cols; ++col) {
+        uint idx = offset + col;
+        c[idx] = bdata[idx] * (a[idx] - dot);
+    }
+}";
+
+    public static string BiasAdd => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint size; uint cols; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= size) return;
+    c[idx] = a[idx] + bdata[idx % cols];
+}";
+
+    public static string Conv2DBiasAdd => Header + @"
+layout(set = 0, binding = 0) buffer Output { float outputData[]; };
+layout(set = 0, binding = 1) readonly buffer Bias { float biasData[]; };
+layout(push_constant) uniform Params { uint size; uint channels; uint spatialSize; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= size) return;
+    uint channel = (idx / spatialSize) % channels;
+    outputData[idx] += biasData[channel];
+}";
+
+    public static string StridedDot => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint aSize; uint bSize; int bOffset; int bStride; };
+void main() {
+    if (gl_GlobalInvocationID.x != 0u) return;
+    float sum = 0.0;
+    for (uint i = 0u; i < aSize; ++i) {
+        int bIndex = bOffset + int(i) * bStride;
+        if (bIndex >= 0 && bIndex < int(bSize)) sum += a[i] * bdata[bIndex];
+    }
+    c[0] = sum;
+}";
+
+    public static string Transpose => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint batch; uint rows; uint cols; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint matrixSize = rows * cols;
+    if (idx >= batch * matrixSize) return;
+    uint matrix = idx / matrixSize;
+    uint local = idx % matrixSize;
+    uint row = local / cols;
+    uint col = local % cols;
+    b[matrix * matrixSize + col * rows + row] = a[idx];
+}";
+
+    public static string Copy2DStrided => Header + @"
+layout(set = 0, binding = 0) readonly buffer Source { float sourceData[]; };
+layout(set = 0, binding = 1) buffer Destination { float destinationData[]; };
+layout(push_constant) uniform Params { uint rows; uint srcCols; uint destCols; uint destOffset; uint copyCols; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= rows * copyCols) return;
+    uint row = idx / copyCols;
+    uint col = idx % copyCols;
+    destinationData[row * destCols + destOffset + col] = sourceData[row * srcCols + col];
+}";
+
+    public static string NearestNeighborUpsample => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint batchChannels; uint height; uint width; uint scaleFactor; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint outHeight = height * scaleFactor, outWidth = width * scaleFactor;
+    if (idx >= batchChannels * outHeight * outWidth) return;
+    uint plane = idx / (outHeight * outWidth);
+    uint local = idx % (outHeight * outWidth);
+    uint outRow = local / outWidth, outCol = local % outWidth;
+    b[idx] = a[plane * height * width + (outRow / scaleFactor) * width + outCol / scaleFactor];
+}";
+
+    public static string NearestNeighborUpsampleBackward => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint batchChannels; uint height; uint width; uint scaleFactor; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= batchChannels * height * width) return;
+    uint plane = idx / (height * width);
+    uint local = idx % (height * width);
+    uint inRow = local / width, inCol = local % width;
+    uint outHeight = height * scaleFactor, outWidth = width * scaleFactor;
+    float sum = 0.0;
+    for (uint dy = 0u; dy < scaleFactor; ++dy)
+        for (uint dx = 0u; dx < scaleFactor; ++dx)
+            sum += a[plane * outHeight * outWidth + (inRow * scaleFactor + dy) * outWidth + inCol * scaleFactor + dx];
+    b[idx] = sum;
+}";
+
+    public static string NearestNeighborUpsample3D => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint batch; uint channels; uint depth; uint height; uint width; uint scaleD; uint scaleH; uint scaleW; };
+void main(){uint idx=gl_GlobalInvocationID.x;uint outD=depth*scaleD,outH=height*scaleH,outW=width*scaleW;if(idx>=batch*channels*outD*outH*outW)return;uint ow=idx%outW,q=idx/outW,oh=q%outH;q/=outH;uint od=q%outD;q/=outD;uint channel=q%channels,batchIndex=q/channels;b[idx]=a[(((batchIndex*channels+channel)*depth+od/scaleD)*height+oh/scaleH)*width+ow/scaleW];}";
+
+    public static string NearestNeighborUpsample3DBackward => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint batch; uint channels; uint depth; uint height; uint width; uint scaleD; uint scaleH; uint scaleW; };
+void main(){uint idx=gl_GlobalInvocationID.x;if(idx>=batch*channels*depth*height*width)return;uint iw=idx%width,q=idx/width,ih=q%height;q/=height;uint id=q%depth;q/=depth;uint channel=q%channels,batchIndex=q/channels;uint outD=depth*scaleD,outH=height*scaleH,outW=width*scaleW;float sum=0.0;for(uint dz=0u;dz<scaleD;++dz)for(uint dy=0u;dy<scaleH;++dy)for(uint dx=0u;dx<scaleW;++dx)sum+=a[(((batchIndex*channels+channel)*outD+id*scaleD+dz)*outH+ih*scaleH+dy)*outW+iw*scaleW+dx];b[idx]=sum;}";
+
+    public static string AffineGrid2D => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint batch; uint outputHeight; uint outputWidth; };
+void main(){uint point=gl_GlobalInvocationID.x;if(point>=batch*outputHeight*outputWidth)return;uint w=point%outputWidth,q=point/outputWidth,h=q%outputHeight,batchIndex=q/outputHeight;float ny=outputHeight>1u?2.0*float(h)/float(outputHeight-1u)-1.0:0.0;float nx=outputWidth>1u?2.0*float(w)/float(outputWidth-1u)-1.0:0.0;uint t=batchIndex*6u;b[point*2u]=a[t]*nx+a[t+1u]*ny+a[t+2u];b[point*2u+1u]=a[t+3u]*nx+a[t+4u]*ny+a[t+5u];}";
+
+    private const string GridSampleHelpers = @"
+int gridPad(int coordinate,int size,uint paddingMode){if(coordinate>=0&&coordinate<size)return coordinate;if(paddingMode==0u)return -1;if(paddingMode==1u)return clamp(coordinate,0,size-1);if(size<=1)return 0;int period=2*(size-1),value=coordinate%period;if(value<0)value+=period;return value<size?value:period-value;}
+";
+
+    public static string GridSampleBackwardInput => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint batch; uint channels; uint inHeight; uint inWidth; uint outHeight; uint outWidth; uint paddingMode; uint alignCorners; };
+" + GridSampleHelpers + @"
+void main(){uint idx=gl_GlobalInvocationID.x;if(idx>=batch*channels*inHeight*inWidth)return;uint ixTarget=idx%inWidth,q=idx/inWidth,iyTarget=q%inHeight;q/=inHeight;uint channel=q%channels,batchIndex=q/channels;float sum=0.0;for(uint oh=0u;oh<outHeight;++oh)for(uint ow=0u;ow<outWidth;++ow){uint gridOffset=(batchIndex*outHeight*outWidth+oh*outWidth+ow)*2u;float gx=bdata[gridOffset],gy=bdata[gridOffset+1u];float ix=alignCorners!=0u?(gx+1.0)*0.5*float(inWidth-1u):(gx+1.0)*0.5*float(inWidth)-0.5;float iy=alignCorners!=0u?(gy+1.0)*0.5*float(inHeight-1u):(gy+1.0)*0.5*float(inHeight)-0.5;int ix0=int(floor(ix)),iy0=int(floor(iy));float dx=ix-float(ix0),dy=iy-float(iy0);for(int jy=0;jy<=1;++jy)for(int jx=0;jx<=1;++jx){int py=gridPad(iy0+jy,int(inHeight),paddingMode),px=gridPad(ix0+jx,int(inWidth),paddingMode);if(py==int(iyTarget)&&px==int(ixTarget)){float wy=jy==0?1.0-dy:dy,wx=jx==0?1.0-dx:dx;sum+=a[((batchIndex*channels+channel)*outHeight+oh)*outWidth+ow]*wy*wx;}}}c[idx]=sum;}";
+
+    public static string GridSampleBackwardGrid => Header + FourBufferLayout + @"
+layout(push_constant) uniform Params { uint batch; uint channels; uint inHeight; uint inWidth; uint outHeight; uint outWidth; uint paddingMode; uint alignCorners; };
+" + GridSampleHelpers + @"
+void main(){uint point=gl_GlobalInvocationID.x;if(point>=batch*outHeight*outWidth)return;uint ow=point%outWidth,q=point/outWidth,oh=q%outHeight,batchIndex=q/outHeight;float gx=c[point*2u],gy=c[point*2u+1u];float ix=alignCorners!=0u?(gx+1.0)*0.5*float(inWidth-1u):(gx+1.0)*0.5*float(inWidth)-0.5;float iy=alignCorners!=0u?(gy+1.0)*0.5*float(inHeight-1u):(gy+1.0)*0.5*float(inHeight)-0.5;float dix=alignCorners!=0u?0.5*float(inWidth-1u):0.5*float(inWidth),diy=alignCorners!=0u?0.5*float(inHeight-1u):0.5*float(inHeight);int ix0=int(floor(ix)),iy0=int(floor(iy));float dx=ix-float(ix0),dy=iy-float(iy0),gradX=0.0,gradY=0.0;for(uint channel=0u;channel<channels;++channel){float grad=a[((batchIndex*channels+channel)*outHeight+oh)*outWidth+ow];for(int jy=0;jy<=1;++jy)for(int jx=0;jx<=1;++jx){int py=gridPad(iy0+jy,int(inHeight),paddingMode),px=gridPad(ix0+jx,int(inWidth),paddingMode);if(py>=0&&px>=0){float wy=jy==0?1.0-dy:dy,wx=jx==0?1.0-dx:dx,pixel=bdata[((batchIndex*channels+channel)*inHeight+uint(py))*inWidth+uint(px)];gradY+=grad*pixel*(jy==0?-1.0:1.0)*wx;gradX+=grad*pixel*wy*(jx==0?-1.0:1.0);}}}d[point*2u]=gradX*dix;d[point*2u+1u]=gradY*diy;}";
+
+    public static string TileBatch => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint repeats; uint innerSize; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= repeats * innerSize) return;
+    b[idx] = a[idx % innerSize];
+}";
+
+    public static string CapsuleSquash => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint numCapsules; uint capsuleDim; float epsilon; };
+void main() {
+    uint capsule = gl_GlobalInvocationID.x;
+    if (capsule >= numCapsules) return;
+    uint offset = capsule * capsuleDim;
+    float squaredNorm = 0.0;
+    for (uint d0 = 0u; d0 < capsuleDim; ++d0) squaredNorm += a[offset + d0] * a[offset + d0];
+    float scale = squaredNorm / ((1.0 + squaredNorm) * sqrt(squaredNorm + epsilon));
+    for (uint d0 = 0u; d0 < capsuleDim; ++d0) b[offset + d0] = a[offset + d0] * scale;
+}";
+
+    public static string CapsuleSquashBackward => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint numCapsules; uint capsuleDim; float epsilon; };
+void main() {
+    uint capsule = gl_GlobalInvocationID.x;
+    if (capsule >= numCapsules) return;
+    uint offset = capsule * capsuleDim;
+    float squaredNorm = 0.0;
+    for (uint d0 = 0u; d0 < capsuleDim; ++d0) squaredNorm += bdata[offset + d0] * bdata[offset + d0];
+    float norm = sqrt(squaredNorm + epsilon);
+    float denominator = (1.0 + squaredNorm) * norm;
+    float factor = (squaredNorm + 2.0 * squaredNorm / (1.0 + squaredNorm)) / (denominator * denominator);
+    for (uint d0 = 0u; d0 < capsuleDim; ++d0) c[offset + d0] = a[offset + d0] * factor;
+}";
+
+    public static string CapsulePredictions => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint batchSize; uint inputCapsules; uint inputDim; uint outputCapsules; uint outputDim; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = batchSize * inputCapsules * outputCapsules * outputDim;
+    if (idx >= total) return;
+    uint outputDimIndex = idx % outputDim;
+    uint q = idx / outputDim;
+    uint outputCapsule = q % outputCapsules;
+    q /= outputCapsules;
+    uint inputCapsule = q % inputCapsules;
+    uint batch = q / inputCapsules;
+    float sum = 0.0;
+    for (uint inputDimIndex = 0u; inputDimIndex < inputDim; ++inputDimIndex)
+        sum += a[(batch * inputCapsules + inputCapsule) * inputDim + inputDimIndex] *
+            bdata[((inputCapsule * outputCapsules + outputCapsule) * outputDim + outputDimIndex) * inputDim + inputDimIndex];
+    c[idx] = sum;
+}";
+
+    public static string CapsuleWeightedSum => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint batchSize; uint inputCapsules; uint outputCapsules; uint capsuleDim; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = batchSize * outputCapsules * capsuleDim;
+    if (idx >= total) return;
+    uint dim = idx % capsuleDim;
+    uint q = idx / capsuleDim;
+    uint outputCapsule = q % outputCapsules;
+    uint batch = q / outputCapsules;
+    float sum = 0.0;
+    for (uint inputCapsule = 0u; inputCapsule < inputCapsules; ++inputCapsule)
+        sum += a[(batch * inputCapsules + inputCapsule) * outputCapsules + outputCapsule] *
+            bdata[((batch * inputCapsules + inputCapsule) * outputCapsules + outputCapsule) * capsuleDim + dim];
+    c[idx] = sum;
+}";
+
+    public static string CapsuleAgreement => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint batchSize; uint inputCapsules; uint outputCapsules; uint capsuleDim; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = batchSize * inputCapsules * outputCapsules;
+    if (idx >= total) return;
+    uint outputCapsule = idx % outputCapsules;
+    uint q = idx / outputCapsules;
+    uint inputCapsule = q % inputCapsules;
+    uint batch = q / inputCapsules;
+    float dot = 0.0;
+    for (uint dim = 0u; dim < capsuleDim; ++dim)
+        dot += a[((batch * inputCapsules + inputCapsule) * outputCapsules + outputCapsule) * capsuleDim + dim] *
+            bdata[(batch * outputCapsules + outputCapsule) * capsuleDim + dim];
+    c[idx] = dot;
+}";
+
+    public static string AttentionForward => Header + @"
+layout(set = 0, binding = 0) readonly buffer Query { float queryData[]; };
+layout(set = 0, binding = 1) readonly buffer Key { float keyData[]; };
+layout(set = 0, binding = 2) readonly buffer Value { float valueData[]; };
+layout(set = 0, binding = 3) writeonly buffer Output { float outputData[]; };
+layout(set = 0, binding = 4) writeonly buffer Weights { float weightData[]; };
+layout(set = 0, binding = 5) readonly buffer Mask { float maskData[]; };
+layout(push_constant) uniform Params {
+    uint batch; uint queryHeads; uint kvHeads; uint seqQ; uint seqK; uint headDim;
+    float scale; uint causal; uint writeWeights; uint maskMode; uint maskBatchStride;
+};
+float attentionScore(uint batchIndex, uint queryHead, uint kvHead, uint queryIndex, uint keyIndex) {
+    uint queryOffset = ((batchIndex * queryHeads + queryHead) * seqQ + queryIndex) * headDim;
+    uint keyOffset = ((batchIndex * kvHeads + kvHead) * seqK + keyIndex) * headDim;
+    float score = 0.0;
+    for (uint d0 = 0u; d0 < headDim; ++d0) score += queryData[queryOffset + d0] * keyData[keyOffset + d0];
+    return score * scale;
+}
+bool attentionMasked(uint batchIndex, uint queryHead, uint queryIndex, uint keyIndex) {
+    if (maskMode == 0u) return false;
+    uint maskOffset = maskMode == 2u ? batchIndex * maskBatchStride + queryHead * seqQ * seqK : 0u;
+    return maskData[maskOffset + queryIndex * seqK + keyIndex] == 0.0;
+}
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= batch * queryHeads * seqQ) return;
+    uint queryIndex = row % seqQ;
+    uint q = row / seqQ;
+    uint queryHead = q % queryHeads;
+    uint batchIndex = q / queryHeads;
+    uint queriesPerKv = queryHeads / kvHeads;
+    uint kvHead = queryHead / queriesPerKv;
+    float rowMax = -3.402823466e+38;
+    for (uint keyIndex = 0u; keyIndex < seqK; ++keyIndex) {
+        if ((causal != 0u && keyIndex > queryIndex) || attentionMasked(batchIndex, queryHead, queryIndex, keyIndex)) continue;
+        rowMax = max(rowMax, attentionScore(batchIndex, queryHead, kvHead, queryIndex, keyIndex));
+    }
+    float denominator = 0.0;
+    for (uint keyIndex = 0u; keyIndex < seqK; ++keyIndex) {
+        if ((causal != 0u && keyIndex > queryIndex) || attentionMasked(batchIndex, queryHead, queryIndex, keyIndex)) continue;
+        denominator += exp(attentionScore(batchIndex, queryHead, kvHead, queryIndex, keyIndex) - rowMax);
+    }
+    uint weightOffset = row * seqK;
+    if (writeWeights != 0u) {
+        for (uint keyIndex = 0u; keyIndex < seqK; ++keyIndex) {
+            float weight = 0.0;
+            if ((causal == 0u || keyIndex <= queryIndex) && !attentionMasked(batchIndex, queryHead, queryIndex, keyIndex) && denominator > 0.0)
+                weight = exp(attentionScore(batchIndex, queryHead, kvHead, queryIndex, keyIndex) - rowMax) / denominator;
+            weightData[weightOffset + keyIndex] = weight;
+        }
+    }
+    uint valueOffset = (batchIndex * kvHeads + kvHead) * seqK * headDim;
+    uint outputOffset = row * headDim;
+    for (uint d0 = 0u; d0 < headDim; ++d0) {
+        float sum = 0.0;
+        for (uint keyIndex = 0u; keyIndex < seqK; ++keyIndex) {
+            if ((causal != 0u && keyIndex > queryIndex) || attentionMasked(batchIndex, queryHead, queryIndex, keyIndex) || denominator <= 0.0) continue;
+            float weight = exp(attentionScore(batchIndex, queryHead, kvHead, queryIndex, keyIndex) - rowMax) / denominator;
+            sum += weight * valueData[valueOffset + keyIndex * headDim + d0];
+        }
+        outputData[outputOffset + d0] = sum;
+    }
+}";
+
+    public static string AttentionStats => Header + @"
+layout(set = 0, binding = 0) readonly buffer Query { float queryData[]; };
+layout(set = 0, binding = 1) readonly buffer Key { float keyData[]; };
+layout(set = 0, binding = 2) readonly buffer Bias { float biasData[]; };
+layout(set = 0, binding = 3) writeonly buffer Stats { float statsData[]; };
+layout(push_constant) uniform Params {
+    uint batch; uint heads; uint seqQ; uint seqK; uint headDim; float scale;
+    uint causal; uint hasBias; uint biasBatchStride;
+};
+void main(){
+    uint row=gl_GlobalInvocationID.x;if(row>=batch*heads*seqQ)return;
+    uint queryIndex=row%seqQ,q=row/seqQ,head=q%heads,batchIndex=q/heads;
+    uint queryOffset=((batchIndex*heads+head)*seqQ+queryIndex)*headDim;
+    uint keyBase=(batchIndex*heads+head)*seqK*headDim;
+    uint biasBase=batchIndex*biasBatchStride+head*seqQ*seqK+queryIndex*seqK;
+    float rowMax=-3.402823466e+38;
+    for(uint keyIndex=0u;keyIndex<seqK;++keyIndex){if(causal!=0u&&keyIndex>queryIndex)continue;float score=0.0;for(uint d=0u;d<headDim;++d)score+=queryData[queryOffset+d]*keyData[keyBase+keyIndex*headDim+d];score*=scale;if(hasBias!=0u)score+=biasData[biasBase+keyIndex];rowMax=max(rowMax,score);}
+    float rowSum=0.0;
+    for(uint keyIndex=0u;keyIndex<seqK;++keyIndex){if(causal!=0u&&keyIndex>queryIndex)continue;float score=0.0;for(uint d=0u;d<headDim;++d)score+=queryData[queryOffset+d]*keyData[keyBase+keyIndex*headDim+d];score*=scale;if(hasBias!=0u)score+=biasData[biasBase+keyIndex];rowSum+=exp(score-rowMax);}
+    statsData[row]=rowMax+log(max(rowSum,1.0e-20));
+}";
+
+    public static string AttentionBackward => Header + @"
+layout(set = 0, binding = 0) readonly buffer GradOutput { float gradOutputData[]; };
+layout(set = 0, binding = 1) readonly buffer Query { float queryData[]; };
+layout(set = 0, binding = 2) readonly buffer Key { float keyData[]; };
+layout(set = 0, binding = 3) readonly buffer Value { float valueData[]; };
+layout(set = 0, binding = 4) readonly buffer Weights { float weightData[]; };
+layout(set = 0, binding = 5) writeonly buffer Grad { float gradData[]; };
+layout(push_constant) uniform Params {
+    uint batch; uint queryHeads; uint kvHeads; uint seqQ; uint seqK; uint headDim;
+    float scale; uint causal; uint operation;
+};
+float gradAttention(uint batchIndex, uint queryHead, uint queryIndex, uint keyIndex, uint kvHead) {
+    uint goOffset = ((batchIndex * queryHeads + queryHead) * seqQ + queryIndex) * headDim;
+    uint valueOffset = ((batchIndex * kvHeads + kvHead) * seqK + keyIndex) * headDim;
+    float sum = 0.0;
+    for (uint d0 = 0u; d0 < headDim; ++d0) sum += gradOutputData[goOffset + d0] * valueData[valueOffset + d0];
+    return sum;
+}
+float gradScore(uint batchIndex, uint queryHead, uint queryIndex, uint keyIndex, uint kvHead) {
+    if (causal != 0u && keyIndex > queryIndex) return 0.0;
+    uint weightOffset = ((batchIndex * queryHeads + queryHead) * seqQ + queryIndex) * seqK;
+    float dot = 0.0;
+    for (uint j = 0u; j < seqK; ++j)
+        dot += gradAttention(batchIndex, queryHead, queryIndex, j, kvHead) * weightData[weightOffset + j];
+    return weightData[weightOffset + keyIndex] *
+        (gradAttention(batchIndex, queryHead, queryIndex, keyIndex, kvHead) - dot);
+}
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint queriesPerKv = queryHeads / kvHeads;
+    if (operation == 0u) {
+        if (idx >= batch * queryHeads * seqQ * headDim) return;
+        uint dim = idx % headDim;
+        uint q = idx / headDim;
+        uint queryIndex = q % seqQ; q /= seqQ;
+        uint queryHead = q % queryHeads; uint batchIndex = q / queryHeads;
+        uint kvHead = queryHead / queriesPerKv;
+        uint keyBase = (batchIndex * kvHeads + kvHead) * seqK * headDim;
+        float sum = 0.0;
+        for (uint keyIndex = 0u; keyIndex < seqK; ++keyIndex)
+            sum += gradScore(batchIndex, queryHead, queryIndex, keyIndex, kvHead) * keyData[keyBase + keyIndex * headDim + dim];
+        gradData[idx] = sum * scale;
+    } else {
+        if (idx >= batch * kvHeads * seqK * headDim) return;
+        uint dim = idx % headDim;
+        uint q = idx / headDim;
+        uint keyIndex = q % seqK; q /= seqK;
+        uint kvHead = q % kvHeads; uint batchIndex = q / kvHeads;
+        float sum = 0.0;
+        for (uint queryHead = kvHead * queriesPerKv; queryHead < (kvHead + 1u) * queriesPerKv; ++queryHead) {
+            uint weightHeadOffset = (batchIndex * queryHeads + queryHead) * seqQ * seqK;
+            for (uint queryIndex = 0u; queryIndex < seqQ; ++queryIndex) {
+                if (operation == 2u) {
+                    uint goOffset = ((batchIndex * queryHeads + queryHead) * seqQ + queryIndex) * headDim;
+                    sum += weightData[weightHeadOffset + queryIndex * seqK + keyIndex] * gradOutputData[goOffset + dim];
+                } else {
+                    uint queryOffset = ((batchIndex * queryHeads + queryHead) * seqQ + queryIndex) * headDim;
+                    sum += gradScore(batchIndex, queryHead, queryIndex, keyIndex, kvHead) * queryData[queryOffset + dim] * scale;
+                }
+            }
+        }
+        gradData[idx] = sum;
+    }
+}";
+
+    public static string ScatterAdd => Header + @"
+layout(set = 0, binding = 0) readonly buffer Source { float sourceData[]; };
+layout(set = 0, binding = 1) readonly buffer Indices { float indexData[]; };
+layout(set = 0, binding = 2) buffer Destination { float destinationData[]; };
+layout(push_constant) uniform Params { uint sourceSize; uint destSize; };
+void main() {
+    uint destination = gl_GlobalInvocationID.x;
+    if (destination >= destSize) return;
+    float sum = destinationData[destination];
+    for (uint i = 0u; i < sourceSize; ++i)
+        if (floatBitsToInt(indexData[i]) == int(destination)) sum += sourceData[i];
+    destinationData[destination] = sum;
+}";
+
+    public static string GatherRows => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint numIndices; uint featureSize; uint sourceRows; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= numIndices * featureSize) return;
+    uint indexPosition = idx / featureSize;
+    uint feature = idx % featureSize;
+    int sourceRow = floatBitsToInt(bdata[indexPosition]);
+    c[idx] = sourceRow >= 0 && sourceRow < int(sourceRows) ? a[uint(sourceRow) * featureSize + feature] : 0.0;
+}";
+
+    public static string EmbeddingBackward => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint numIndices; uint embeddingDim; uint vocabSize; };
+void main(){
+    uint idx=gl_GlobalInvocationID.x;
+    if(idx>=vocabSize*embeddingDim)return;
+    uint word=idx/embeddingDim,dimension=idx%embeddingDim;float sum=0.0;
+    for(uint i=0u;i<numIndices;++i)if(floatBitsToUint(bdata[i])==word)sum+=a[i*embeddingDim+dimension];
+    c[idx]=sum;
+}";
+
+    public static string GenericLoss => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint size; uint operation; float p0; float p1; };
+float lossValue(float prediction, float target) {
+    float difference = prediction - target;
+    if (operation == 0u) return difference * difference;
+    if (operation == 1u) return abs(difference);
+    if (operation == 2u) { float cp = clamp(prediction, 1e-7, 1.0-1e-7); return -(target*log(cp)+(1.0-target)*log(1.0-cp)); }
+    if (operation == 3u) { float d=abs(difference); return d<p0 ? 0.5*d*d/p0 : d-0.5*p0; }
+    if (operation == 4u) { float cp=clamp(prediction,1e-7,1.0-1e-7); float pt=target>0.5?cp:1.0-cp; return -p0*pow(1.0-pt,p1)*log(pt); }
+    if (operation == 5u) return log(cosh(difference));
+    if (operation == 6u) { float d=target-prediction; return d>=0.0?p0*d:(p0-1.0)*d; }
+    if (operation == 7u) return max(0.0,1.0-target*prediction);
+    if (operation == 8u) { float h=max(0.0,1.0-target*prediction); return h*h; }
+    if (operation == 9u) return exp(prediction)-target*prediction;
+    if (operation == 10u) return exp(-target*prediction);
+    if (operation == 11u) { float yp=target*prediction; float h=max(0.0,1.0-yp); return yp>=-1.0?h*h:-4.0*yp; }
+    if (operation == 12u) return -target*log(max(1e-7,prediction));
+    if (operation == 13u) return sqrt(difference*difference+p0*p0);
+    return p0*abs(difference)+p1*difference*difference;
+}
+void main() {
+    uint idx=gl_GlobalInvocationID.x;
+    if(idx>=size)return;
+    c[idx]=lossValue(a[idx],bdata[idx]);
+}";
+
+    public static string GenericLossBackward => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint size; uint operation; float p0; float p1; };
+float lossGradient(float prediction, float target) {
+    float difference=prediction-target;
+    if(operation==0u)return 2.0*difference;
+    if(operation==1u)return sign(difference);
+    if(operation==2u){float cp=clamp(prediction,1e-7,1.0-1e-7);return -target/cp+(1.0-target)/(1.0-cp);}
+    if(operation==3u)return abs(difference)<p0?difference/p0:sign(difference);
+    if(operation==4u){float cp=clamp(prediction,1e-7,1.0-1e-7);bool positive=target>0.5;float pt=positive?cp:1.0-cp;float direction=positive?-1.0:1.0;return -p0*direction*pow(1.0-pt,p1)*(p1*log(pt)+1.0/pt);}
+    if(operation==5u)return tanh(difference);
+    if(operation==6u)return target-prediction>=0.0?-p0:1.0-p0;
+    if(operation==7u)return target*prediction<1.0?-target:0.0;
+    if(operation==8u){float h=max(0.0,1.0-target*prediction);return h>0.0?-2.0*h*target:0.0;}
+    if(operation==9u)return exp(prediction)-target;
+    if(operation==10u)return -target*exp(-target*prediction);
+    if(operation==11u){float yp=target*prediction;return yp>=1.0?0.0:(yp>=-1.0?-2.0*target*(1.0-yp):-4.0*target);}
+    if(operation==12u)return -target/max(1e-7,prediction);
+    if(operation==13u)return difference/sqrt(difference*difference+p0*p0);
+    return p0*sign(difference)+2.0*p1*difference;
+}
+void main(){uint idx=gl_GlobalInvocationID.x;if(idx>=size)return;c[idx]=lossGradient(a[idx],bdata[idx])/float(size);}";
+
+    public static string SparseCrossEntropyRows => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint batchSize; uint numClasses; };
+void main(){
+    uint row=gl_GlobalInvocationID.x;if(row>=batchSize)return;
+    uint offset=row*numClasses;float rowMax=-3.402823466e+38;
+    for(uint cls=0u;cls<numClasses;++cls)rowMax=max(rowMax,a[offset+cls]);
+    float sum=0.0;for(uint cls=0u;cls<numClasses;++cls)sum+=exp(a[offset+cls]-rowMax);
+    uint target=floatBitsToUint(bdata[row]);
+    c[row]=target<numClasses?-(a[offset+target]-(rowMax+log(sum))):uintBitsToFloat(0x7fc00000u);
+}";
+
+    public static string SparseCrossEntropyBackward => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint batchSize; uint numClasses; };
+void main(){
+    uint idx=gl_GlobalInvocationID.x;if(idx>=batchSize*numClasses)return;
+    uint row=idx/numClasses,cls=idx%numClasses,offset=row*numClasses;float rowMax=-3.402823466e+38;
+    for(uint j=0u;j<numClasses;++j)rowMax=max(rowMax,a[offset+j]);
+    float sum=0.0;for(uint j=0u;j<numClasses;++j)sum+=exp(a[offset+j]-rowMax);
+    uint target=floatBitsToUint(bdata[row]);
+    c[idx]=(exp(a[idx]-rowMax)/sum-(cls==target?1.0:0.0))/float(batchSize);
+}";
+
+    public static string TripletLossRows => Header + FourBufferLayout + @"
+layout(push_constant) uniform Params { uint batchSize; uint embeddingDim; float margin; };
+void main(){uint row=gl_GlobalInvocationID.x;if(row>=batchSize)return;uint offset=row*embeddingDim;float dp=0.0,dn=0.0;for(uint j=0u;j<embeddingDim;++j){float x=a[offset+j]-bdata[offset+j];dp+=x*x;x=a[offset+j]-c[offset+j];dn+=x*x;}d[row]=max(0.0,sqrt(dp)-sqrt(dn)+margin);}";
+
+    public static string TripletLossBackward => Header + FourBufferLayout + @"
+layout(push_constant) uniform Params { uint batchSize; uint embeddingDim; float margin; uint operation; };
+void main(){uint idx=gl_GlobalInvocationID.x;if(idx>=batchSize*embeddingDim)return;uint row=idx/embeddingDim,offset=row*embeddingDim;float dp=0.0,dn=0.0;for(uint j=0u;j<embeddingDim;++j){float x=a[offset+j]-bdata[offset+j];dp+=x*x;x=a[offset+j]-c[offset+j];dn+=x*x;}float distP=sqrt(dp+1e-8),distN=sqrt(dn+1e-8),value=0.0;if(distP-distN+margin>0.0){float diffP=a[idx]-bdata[idx],diffN=a[idx]-c[idx];value=operation==0u?diffP/distP-diffN/distN:(operation==1u?-diffP/distP:diffN/distN);}d[idx]=value/float(batchSize);}";
+
+    public static string ContrastiveLossRows => Header + FourBufferLayout + @"
+layout(push_constant) uniform Params { uint batchSize; uint embeddingDim; float margin; };
+void main(){uint row=gl_GlobalInvocationID.x;if(row>=batchSize)return;uint offset=row*embeddingDim;float ds=0.0;for(uint j=0u;j<embeddingDim;++j){float x=a[offset+j]-bdata[offset+j];ds+=x*x;}float dist=sqrt(ds),h=max(0.0,margin-dist),label=c[row];d[row]=0.5*(label*ds+(1.0-label)*h*h);}";
+
+    public static string ContrastiveLossBackward => Header + FourBufferLayout + @"
+layout(push_constant) uniform Params { uint batchSize; uint embeddingDim; float margin; uint operation; };
+void main(){uint idx=gl_GlobalInvocationID.x;if(idx>=batchSize*embeddingDim)return;uint row=idx/embeddingDim,offset=row*embeddingDim;float ds=0.0;for(uint j=0u;j<embeddingDim;++j){float x=a[offset+j]-bdata[offset+j];ds+=x*x;}float dist=sqrt(ds+1e-8),diff=a[idx]-bdata[idx],label=c[row];float value=label*diff;if(margin-dist>0.0)value-=(1.0-label)*(margin-dist)*diff/dist;d[idx]=(operation==0u?value:-value)/float(batchSize);}";
+
+    public static string NormalizationForward => Header + @"
+layout(set=0,binding=0) readonly buffer Input { float inputData[]; };
+layout(set=0,binding=1) writeonly buffer Output { float outputData[]; };
+layout(set=0,binding=2) readonly buffer Gamma { float gammaData[]; };
+layout(set=0,binding=3) readonly buffer Beta { float betaData[]; };
+layout(set=0,binding=4) buffer RunningMean { float runningMeanData[]; };
+layout(set=0,binding=5) buffer RunningVariance { float runningVarianceData[]; };
+layout(set=0,binding=6) writeonly buffer SavedMean { float savedMeanData[]; };
+layout(set=0,binding=7) writeonly buffer SavedScale { float savedScaleData[]; };
+layout(push_constant) uniform Params { uint mode; uint batch; uint channels; uint spatial; uint groups; float epsilon; float momentum; uint training; };
+void main(){
+    uint unit=gl_GlobalInvocationID.x;
+    if(mode==0u){
+        if(unit>=channels)return;float mean,variance;
+        if(training!=0u){mean=0.0;for(uint b0=0u;b0<batch;++b0)for(uint s=0u;s<spatial;++s)mean+=inputData[(b0*channels+unit)*spatial+s];mean/=float(batch*spatial);variance=0.0;for(uint b0=0u;b0<batch;++b0)for(uint s=0u;s<spatial;++s){float x=inputData[(b0*channels+unit)*spatial+s]-mean;variance+=x*x;}variance/=float(batch*spatial);runningMeanData[unit]=(1.0-momentum)*runningMeanData[unit]+momentum*mean;runningVarianceData[unit]=(1.0-momentum)*runningVarianceData[unit]+momentum*variance;}else{mean=runningMeanData[unit];variance=runningVarianceData[unit];}
+        float inv=1.0/sqrt(variance+epsilon);savedMeanData[unit]=mean;savedScaleData[unit]=inv;for(uint b0=0u;b0<batch;++b0)for(uint s=0u;s<spatial;++s){uint idx=(b0*channels+unit)*spatial+s;outputData[idx]=gammaData[unit]*(inputData[idx]-mean)*inv+betaData[unit];}
+    }else if(mode==1u){
+        if(unit>=batch)return;uint offset=unit*channels;float mean=0.0;for(uint i=0u;i<channels;++i)mean+=inputData[offset+i];mean/=float(channels);float variance=0.0;for(uint i=0u;i<channels;++i){float x=inputData[offset+i]-mean;variance+=x*x;}variance/=float(channels);float inv=1.0/sqrt(variance+epsilon);savedMeanData[unit]=mean;savedScaleData[unit]=inv;for(uint i=0u;i<channels;++i)outputData[offset+i]=gammaData[i]*(inputData[offset+i]-mean)*inv+betaData[i];
+    }else if(mode==2u){
+        if(unit>=batch*groups)return;uint batchIndex=unit/groups,group=unit%groups,channelsPerGroup=channels/groups,groupSize=channelsPerGroup*spatial;float mean=0.0;for(uint c0=group*channelsPerGroup;c0<(group+1u)*channelsPerGroup;++c0)for(uint s=0u;s<spatial;++s)mean+=inputData[(batchIndex*channels+c0)*spatial+s];mean/=float(groupSize);float variance=0.0;for(uint c0=group*channelsPerGroup;c0<(group+1u)*channelsPerGroup;++c0)for(uint s=0u;s<spatial;++s){float x=inputData[(batchIndex*channels+c0)*spatial+s]-mean;variance+=x*x;}variance/=float(groupSize);float inv=1.0/sqrt(variance+epsilon);savedMeanData[unit]=mean;savedScaleData[unit]=inv;for(uint c0=group*channelsPerGroup;c0<(group+1u)*channelsPerGroup;++c0)for(uint s=0u;s<spatial;++s){uint idx=(batchIndex*channels+c0)*spatial+s;outputData[idx]=gammaData[c0]*(inputData[idx]-mean)*inv+betaData[c0];}
+    }else{
+        if(unit>=batch)return;uint offset=unit*channels;float sumSquares=0.0;for(uint i=0u;i<channels;++i)sumSquares+=inputData[offset+i]*inputData[offset+i];float rms=sqrt(sumSquares/float(channels)+epsilon);savedScaleData[unit]=rms;for(uint i=0u;i<channels;++i)outputData[offset+i]=gammaData[i]*inputData[offset+i]/rms;
+    }
+}";
+
+    public static string NormalizationBackward => Header + @"
+layout(set=0,binding=0) readonly buffer GradOutput { float go[]; };
+layout(set=0,binding=1) readonly buffer Input { float inputData[]; };
+layout(set=0,binding=2) readonly buffer Gamma { float gammaData[]; };
+layout(set=0,binding=3) readonly buffer SavedMean { float savedMeanData[]; };
+layout(set=0,binding=4) readonly buffer SavedScale { float savedScaleData[]; };
+layout(set=0,binding=5) writeonly buffer GradInput { float gi[]; };
+layout(set=0,binding=6) writeonly buffer GradGamma { float gg[]; };
+layout(set=0,binding=7) writeonly buffer GradBeta { float gb[]; };
+layout(push_constant) uniform Params { uint mode; uint operation; uint batch; uint channels; uint spatial; };
+void main(){
+    uint unit=gl_GlobalInvocationID.x;
+    if(mode==0u){if(unit>=channels)return;float mean=savedMeanData[unit],inv=savedScaleData[unit],sumGrad=0.0,sumGradX=0.0;for(uint b0=0u;b0<batch;++b0)for(uint s=0u;s<spatial;++s){uint idx=(b0*channels+unit)*spatial+s;float xhat=(inputData[idx]-mean)*inv;sumGrad+=go[idx];sumGradX+=go[idx]*xhat;}gg[unit]=sumGradX;gb[unit]=sumGrad;float count=float(batch*spatial);for(uint b0=0u;b0<batch;++b0)for(uint s=0u;s<spatial;++s){uint idx=(b0*channels+unit)*spatial+s;float xhat=(inputData[idx]-mean)*inv;gi[idx]=gammaData[unit]*inv/count*(count*go[idx]-sumGrad-xhat*sumGradX);}return;}
+    if(mode==1u){if(operation==0u){if(unit>=batch)return;uint offset=unit*channels;float mean=savedMeanData[unit],inv=savedScaleData[unit],sumGrad=0.0,sumGradX=0.0;for(uint i=0u;i<channels;++i){float xhat=(inputData[offset+i]-mean)*inv;sumGrad+=go[offset+i]*gammaData[i];sumGradX+=go[offset+i]*gammaData[i]*xhat;}for(uint i=0u;i<channels;++i){float xhat=(inputData[offset+i]-mean)*inv;gi[offset+i]=inv/float(channels)*(float(channels)*go[offset+i]*gammaData[i]-sumGrad-xhat*sumGradX);}}else{if(unit>=channels)return;float gradGamma=0.0,gradBeta=0.0;for(uint b0=0u;b0<batch;++b0){uint idx=b0*channels+unit;gradGamma+=go[idx]*(inputData[idx]-savedMeanData[b0])*savedScaleData[b0];gradBeta+=go[idx];}gg[unit]=gradGamma;gb[unit]=gradBeta;}return;}
+    if(mode==2u){if(operation==0u){if(unit>=batch*channels)return;uint batchIndex=unit/channels,channel=unit%channels,offset=(batchIndex*channels+channel)*spatial,stat=batchIndex*channels+channel;float mean=savedMeanData[stat],inv=savedScaleData[stat],sumGrad=0.0,sumGradX=0.0;for(uint s=0u;s<spatial;++s){float xhat=(inputData[offset+s]-mean)*inv;sumGrad+=go[offset+s];sumGradX+=go[offset+s]*xhat;}for(uint s=0u;s<spatial;++s){float xhat=(inputData[offset+s]-mean)*inv;gi[offset+s]=gammaData[channel]*inv/float(spatial)*(float(spatial)*go[offset+s]-sumGrad-xhat*sumGradX);}}else{if(unit>=channels)return;float gradGamma=0.0,gradBeta=0.0;for(uint b0=0u;b0<batch;++b0){uint stat=b0*channels+unit,offset=(b0*channels+unit)*spatial;for(uint s=0u;s<spatial;++s){gradGamma+=go[offset+s]*(inputData[offset+s]-savedMeanData[stat])*savedScaleData[stat];gradBeta+=go[offset+s];}}gg[unit]=gradGamma;gb[unit]=gradBeta;}return;}
+    if(operation==0u){if(unit>=batch)return;uint offset=unit*channels;float rms=savedScaleData[unit],inv=1.0/rms,sumGradX=0.0;for(uint i=0u;i<channels;++i)sumGradX+=go[offset+i]*gammaData[i]*inputData[offset+i];sumGradX*=inv*inv/float(channels);for(uint i=0u;i<channels;++i)gi[offset+i]=(go[offset+i]*gammaData[i]-inputData[offset+i]*sumGradX)*inv;}else{if(unit>=channels)return;float gradGamma=0.0;for(uint b0=0u;b0<batch;++b0){uint idx=b0*channels+unit;gradGamma+=go[idx]*inputData[idx]/savedScaleData[b0];}gg[unit]=gradGamma;}
+}";
+
     // =====================================================================
     // Scalar ops
     // =====================================================================
@@ -567,6 +1253,140 @@ void main() {
     b[idx] = a[(idx / tiledInner) * innerSize + ((idx % tiledInner) % innerSize)];
 }";
 
+    public static string SumAxis => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint reduceSize; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= outerSize) return;
+    float sum = 0.0;
+    uint offset = idx * reduceSize;
+    for (uint j = 0u; j < reduceSize; ++j) sum += a[offset + j];
+    b[idx] = sum;
+}";
+
+    public static string ScalarReduce => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint size; uint op; };
+void main() {
+    if (gl_GlobalInvocationID.x != 0u) return;
+    if (op == 0u) {
+        float value = 0.0;
+        for (uint i = 0u; i < size; ++i) value += a[i];
+        b[0] = value;
+    } else if (op == 1u) {
+        float value = -3.402823466e+38;
+        for (uint i = 0u; i < size; ++i) value = max(value, a[i]);
+        b[0] = value;
+    } else if (op == 2u) {
+        float value = 3.402823466e+38;
+        for (uint i = 0u; i < size; ++i) value = min(value, a[i]);
+        b[0] = value;
+    } else if (op == 3u) {
+        float mean = 0.0;
+        for (uint i = 0u; i < size; ++i) mean += a[i];
+        mean /= float(size);
+        float variance = 0.0;
+        for (uint i = 0u; i < size; ++i) { float delta = a[i] - mean; variance += delta * delta; }
+        b[0] = sqrt(max(0.0, variance / float(size)));
+    } else {
+        float sumSquares = 0.0;
+        for (uint i = 0u; i < size; ++i) sumSquares += a[i] * a[i];
+        b[0] = sqrt(sumSquares);
+    }
+}";
+
+    public static string VarianceAxisFromMean => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint reduceSize; };
+void main() {
+    uint outer = gl_GlobalInvocationID.x;
+    if (outer >= outerSize) return;
+    float variance = 0.0;
+    uint offset = outer * reduceSize;
+    for (uint j = 0u; j < reduceSize; ++j) { float delta = a[offset + j] - bdata[outer]; variance += delta * delta; }
+    c[outer] = variance / float(reduceSize);
+}";
+
+    public static string ArgExtremaAxis => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint reduceSize; uint findMax; };
+void main() {
+    uint outer = gl_GlobalInvocationID.x;
+    if (outer >= outerSize) return;
+    uint offset = outer * reduceSize;
+    float best = findMax != 0u ? -3.402823466e+38 : 3.402823466e+38;
+    uint bestIndex = 0u;
+    for (uint j = 0u; j < reduceSize; ++j) {
+        float value = a[offset + j];
+        bool better = findMax != 0u ? value > best : value < best;
+        if (better) { best = value; bestIndex = j; }
+    }
+    b[outer] = float(bestIndex);
+}";
+
+    public static string MaxAxis => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint reduceSize; };
+void main() {
+    uint outer = gl_GlobalInvocationID.x;
+    if (outer >= outerSize) return;
+    float value = -3.402823466e+38;
+    uint offset = outer * reduceSize;
+    for (uint j = 0u; j < reduceSize; ++j) if (a[offset + j] > value) value = a[offset + j];
+    b[outer] = value;
+}";
+
+    public static string TopKAxis => Header + @"
+layout(set = 0, binding = 0) readonly buffer Input { float inputData[]; };
+layout(set = 0, binding = 1) writeonly buffer Values { float values[]; };
+layout(set = 0, binding = 2) writeonly buffer Indices { float indices[]; };
+layout(push_constant) uniform Params { uint outerSize; uint reduceSize; uint k; };
+bool isNanValue(float value) { uint bits = floatBitsToUint(value); return (bits & 0x7fffffffu) > 0x7f800000u; }
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= outerSize * reduceSize) return;
+    uint outer = idx / reduceSize;
+    uint local = idx % reduceSize;
+    float value = inputData[idx];
+    bool valueNan = isNanValue(value);
+    uint rank = 0u;
+    uint offset = outer * reduceSize;
+    for (uint j = 0u; j < reduceSize; ++j) {
+        float other = inputData[offset + j];
+        bool otherNan = isNanValue(other);
+        bool before = (!otherNan && valueNan) ||
+            (otherNan == valueNan && (other > value || (other == value && j < local)));
+        if (before) ++rank;
+    }
+    if (rank < k) { values[outer * k + rank] = value; indices[outer * k + rank] = uintBitsToFloat(local); }
+}";
+
+    public static string BroadcastMultiplyLastAxis => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint innerSize; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= outerSize * innerSize) return;
+    c[idx] = a[idx] * bdata[idx % innerSize];
+}";
+
+    public static string TileAxisGlsl => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint axisSize; uint innerSize; uint repeats; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint expandedAxis = axisSize * repeats;
+    uint total = outerSize * expandedAxis * innerSize;
+    if (idx >= total) return;
+    uint inner = idx % innerSize;
+    uint expandedIndex = (idx / innerSize) % expandedAxis;
+    uint outer = idx / (expandedAxis * innerSize);
+    uint axis = expandedIndex / repeats;
+    b[idx] = a[(outer * axisSize + axis) * innerSize + inner];
+}";
+
+    public static string FillGlsl => Header + @"
+layout(set = 0, binding = 0) buffer O { float o[]; };
+layout(push_constant) uniform Params { float value; uint size; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx < size) o[idx] = value;
+}";
+
     public static string PixelShuffleGlsl => Header + TwoBufferLayout + @"
 layout(push_constant) uniform Params { uint batch; uint channels; uint inH; uint inW; uint scale; };
 void main() {
@@ -747,6 +1567,14 @@ void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= outerSize * innerSize) return;
     c[idx] = a[idx / innerSize] * bdata[idx];
+}";
+
+    public static string BroadcastMultiplyFirstAxis => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint innerSize; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= outerSize * innerSize) return;
+    c[idx] = a[idx] * bdata[idx / innerSize];
 }";
 
     public static string EqualsKernel => Header + ThreeBufferLayout + @"
@@ -1542,8 +2370,8 @@ void main() {
     float sqNorm = 0.0;
     for (uint d = 0; d < dim; d++) sqNorm += a[off + d] * a[off + d];
     float maxNorm = (1.0 / sqrt(curvature)) - epsilon;
-    float norm = sqrt(max(sqNorm, 1e-20));
-    float scale = (norm > maxNorm) ? (maxNorm / norm) : 1.0;
+    float maxNormSq = maxNorm * maxNorm;
+    float scale = sqNorm >= maxNormSq ? maxNorm / sqrt(sqNorm) : 1.0;
     for (uint d = 0; d < dim; d++) b[off + d] = a[off + d] * scale;
 }";
 
@@ -1913,6 +2741,16 @@ layout(push_constant) uniform Params { uint batchSize; uint inFeatures; uint out
     public static string FusedLinearTanh => Header + FusedLinearLayout + @"void main() { uint idx=gl_GlobalInvocationID.x; if(idx>=batchSize*outFeatures)return; uint b=idx/outFeatures,j=idx%outFeatures; float sum=bias[j]; for(uint k=0;k<inFeatures;k++)sum+=inp[b*inFeatures+k]*wt[k*outFeatures+j]; outp[idx]=tanh(sum); }";
     public static string FusedLinearGELU => Header + FusedLinearLayout + @"void main() { uint idx=gl_GlobalInvocationID.x; if(idx>=batchSize*outFeatures)return; uint b=idx/outFeatures,j=idx%outFeatures; float sum=bias[j]; for(uint k=0;k<inFeatures;k++)sum+=inp[b*inFeatures+k]*wt[k*outFeatures+j]; outp[idx]=0.5*sum*(1.0+tanh(0.7978845608*(sum+0.044715*sum*sum*sum))); }";
     public static string FusedLinearSwish => Header + FusedLinearLayout + @"void main() { uint idx=gl_GlobalInvocationID.x; if(idx>=batchSize*outFeatures)return; uint b=idx/outFeatures,j=idx%outFeatures; float sum=bias[j]; for(uint k=0;k<inFeatures;k++)sum+=inp[b*inFeatures+k]*wt[k*outFeatures+j]; outp[idx]=sum/(1.0+exp(-sum)); }";
+    public static string FusedLinearIdentity => Header + FusedLinearLayout + @"void main() { uint idx=gl_GlobalInvocationID.x; if(idx>=batchSize*outFeatures)return; uint b=idx/outFeatures,j=idx%outFeatures; float sum=bias[j]; for(uint k=0;k<inFeatures;k++)sum+=inp[b*inFeatures+k]*wt[k*outFeatures+j]; outp[idx]=sum; }";
+
+    private const string FusedLinearLeakyReluLayout = @"
+layout(set = 0, binding = 0) readonly buffer Input { float inp[]; };
+layout(set = 0, binding = 1) readonly buffer Weight { float wt[]; };
+layout(set = 0, binding = 2) readonly buffer Bias { float bias[]; };
+layout(set = 0, binding = 3) writeonly buffer Output { float outp[]; };
+layout(push_constant) uniform Params { uint batchSize; uint inFeatures; uint outFeatures; float alpha; };
+";
+    public static string FusedLinearLeakyRelu => Header + FusedLinearLeakyReluLayout + @"void main() { uint idx=gl_GlobalInvocationID.x; if(idx>=batchSize*outFeatures)return; uint b=idx/outFeatures,j=idx%outFeatures; float sum=bias[j]; for(uint k=0;k<inFeatures;k++)sum+=inp[b*inFeatures+k]*wt[k*outFeatures+j]; outp[idx]=sum>=0.0?sum:alpha*sum; }";
 
     // IoU Loss GLSL kernels
     private const string IoULayout = @"
@@ -2083,5 +2921,32 @@ void main() {
     if (i >= numPairs) return;
     uint o = i * 2;
     b[i] = sqrt(a[o]*a[o] + a[o+1]*a[o+1]);
+}";
+
+    public static string SplitComplexTopK => Header + @"
+layout(set = 0, binding = 0) readonly buffer InReal { float inReal[]; };
+layout(set = 0, binding = 1) readonly buffer InImag { float inImag[]; };
+layout(set = 0, binding = 2) writeonly buffer OutReal { float outReal[]; };
+layout(set = 0, binding = 3) writeonly buffer OutImag { float outImag[]; };
+layout(push_constant) uniform Params { uint n; uint k; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= n) return;
+    float re = inReal[idx], im = inImag[idx];
+    precise float magSq = re * re + im * im;
+    bool magIsNan = (floatBitsToUint(magSq) & 0x7fffffffu) > 0x7f800000u;
+    uint rank = 0u;
+    for (uint other = 0u; other < n; ++other) {
+        float otherRe = inReal[other], otherIm = inImag[other];
+        precise float otherMagSq = otherRe * otherRe + otherIm * otherIm;
+        bool otherIsNan = (floatBitsToUint(otherMagSq) & 0x7fffffffu) > 0x7f800000u;
+        bool otherBefore = magIsNan
+            ? (!otherIsNan || (otherIsNan && other < idx))
+            : (!otherIsNan && (otherMagSq > magSq || (otherMagSq == magSq && other < idx)));
+        rank += otherBefore ? 1u : 0u;
+    }
+    bool keep = rank < k;
+    outReal[idx] = keep ? re : 0.0;
+    outImag[idx] = keep ? im : 0.0;
 }";
 }

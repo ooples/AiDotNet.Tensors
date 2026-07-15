@@ -40,6 +40,28 @@ __kernel void tile_last_axis(__global const float* input, __global float* output
     int idx = get_global_id(0); int tiledInner = innerSize * repeats; if (idx >= outerSize * tiledInner) return;
     output[idx] = input[(idx / tiledInner) * innerSize + ((idx % tiledInner) % innerSize)];
 }
+__kernel void tile_axis(__global const float* input, __global float* output, int outerSize, int axisSize, int innerSize, int repeats) {
+    int idx = get_global_id(0); int expandedAxis = axisSize * repeats;
+    if (idx >= outerSize * expandedAxis * innerSize) return;
+    int inner = idx % innerSize;
+    int expandedIndex = (idx / innerSize) % expandedAxis;
+    int outer = idx / (expandedAxis * innerSize);
+    int axis = expandedIndex / repeats;
+    output[idx] = input[(outer * axisSize + axis) * innerSize + inner];
+}
+__kernel void permute_general(__global const float* input, __global float* output,
+    __global const int* inputStrides, __global const int* outputStrides,
+    __global const int* permutation, int ndims, int totalSize) {
+    int outIdx = get_global_id(0); if (outIdx >= totalSize) return;
+    int remaining = outIdx;
+    int inputIdx = 0;
+    for (int d = 0; d < ndims; d++) {
+        int coord = remaining / outputStrides[d];
+        remaining %= outputStrides[d];
+        inputIdx += coord * inputStrides[permutation[d]];
+    }
+    output[outIdx] = input[inputIdx];
+}
 __kernel void repeat_elements(__global const float* input, __global float* output, int outerSize, int innerSize, int repeats) {
     int idx = get_global_id(0); if (idx >= outerSize * innerSize * repeats) return;
     int outer = idx / (innerSize * repeats); int inner = (idx % (innerSize * repeats)) / repeats;
@@ -155,14 +177,14 @@ __kernel void search_sorted(__global const float* seq, __global const float* val
 // slices. mode 0 = copy from source[outer,j,inner]; mode 1 = write fillValue. indices is 1-D [idxAxis].
 __kernel void index_write(__global float* output, __global const int* indices, __global const float* source,
     float fillValue, int mode, int outerSize, int idxAxis, int innerSize, int dstAxis) {
-    int idx = get_global_id(0); int total = outerSize * idxAxis * innerSize; if (idx >= total) return;
+    int idx = get_global_id(0); int total = outerSize * dstAxis * innerSize; if (idx >= total) return;
     int inner = idx % innerSize;
-    int j = (idx / innerSize) % idxAxis;
-    int outer = (idx / innerSize) / idxAxis;
-    int dstJ = indices[j];
-    if (dstJ < 0 || dstJ >= dstAxis) return;
-    float v = (mode == 0) ? source[idx] : fillValue;
-    output[(outer * dstAxis + dstJ) * innerSize + inner] = v;
+    int dstJ = (idx / innerSize) % dstAxis;
+    int outer = (idx / innerSize) / dstAxis;
+    int last = -1;
+    for (int j = 0; j < idxAxis; j++) if (indices[j] == dstJ) last = j;
+    if (last < 0) return;
+    output[idx] = (mode == 0) ? source[(outer * idxAxis + last) * innerSize + inner] : fillValue;
 }
 // Cross pairwise p-norm distance: x1[m,d], x2[n,d] -> out[m,n], out[i,j]=||x1[i]-x2[j]||_p.
 __kernel void cdist(__global const float* x1, __global const float* x2, __global float* output, int m, int n, int d, float p) {
@@ -471,10 +493,15 @@ __kernel void histogramdd(__global const float* samples, volatile __global float
     for (int k = 0; k < d; k++) {
         float v = samples[i*d + k]; float mn = mins[k]; float mx = maxs[k];
         if (!(v >= mn && v <= mx)) { valid = 0; break; } // drops NaN + out-of-range
-        float width = (mx - mn) / (float)bins[k];
-        int kIdx = (int)floor((v - mn) / width);
-        if (kIdx >= bins[k]) kIdx = bins[k] - 1;
-        if (kIdx < 0) kIdx = 0;
+        int kIdx;
+        if (v == mx) {
+            kIdx = bins[k] - 1;
+        } else {
+            float width = (mx - mn) / (float)bins[k];
+            kIdx = (int)floor((v - mn) / width);
+            if (kIdx >= bins[k]) kIdx = bins[k] - 1;
+            if (kIdx < 0) kIdx = 0;
+        }
         linIdx = linIdx * bins[k] + kIdx;
     }
     if (valid) atomicAddF(&hist[linIdx], 1.0f);
@@ -485,10 +512,11 @@ __kernel void histogramdd(__global const float* samples, volatile __global float
 // (b,oh,ow,c) output: scatter gradOut into the 4 bilinear input corners (atomic). gradIn pre-zeroed.
 __kernel void gridsample_backward_input(__global const float* gradOut, __global const float* grid,
     volatile __global float* gradIn, int batch, int H, int W, int C, int outH, int outW) {
-    int idx = get_global_id(0); int total = batch*outH*outW*C; if (idx >= total) return;
-    int c = idx % C; int tmp = idx / C;
-    int ow = tmp % outW; tmp /= outW;
-    int oh = tmp % outH; int b = tmp / outH;
+    // NCHW: gradOut [b,c,oh,ow], gradIn [b,c,H,W], grid [b,oh,ow,2]. idx == the gradOut flat index.
+    int idx = get_global_id(0); int total = batch*C*outH*outW; if (idx >= total) return;
+    int ow = idx % outW; int tmp = idx / outW;
+    int oh = tmp % outH; tmp /= outH;
+    int c = tmp % C; int b = tmp / C;
     int gridBase = ((b*outH + oh)*outW + ow)*2;
     float gx = grid[gridBase]; float gy = grid[gridBase+1];
     float srcH = (gy + 1.0f) * 0.5f * (float)(H - 1);
@@ -497,12 +525,13 @@ __kernel void gridsample_backward_input(__global const float* gradOut, __global 
     int h0 = (int)floor(srcH); int h1 = h0 + 1; int w0 = (int)floor(srcW); int w1 = w0 + 1;
     float lh = srcH - (float)h0; float lw = srcW - (float)w0;
     float g = gradOut[idx];
-    if (h0>=0 && h0<H && w0>=0 && w0<W) atomicAddF(&gradIn[((b*H+h0)*W+w0)*C+c], g*(1.0f-lh)*(1.0f-lw));
-    if (h0>=0 && h0<H && w1>=0 && w1<W) atomicAddF(&gradIn[((b*H+h0)*W+w1)*C+c], g*(1.0f-lh)*lw);
-    if (h1>=0 && h1<H && w0>=0 && w0<W) atomicAddF(&gradIn[((b*H+h1)*W+w0)*C+c], g*lh*(1.0f-lw));
-    if (h1>=0 && h1<H && w1>=0 && w1<W) atomicAddF(&gradIn[((b*H+h1)*W+w1)*C+c], g*lh*lw);
+    int plane = (b*C+c)*H*W;
+    if (h0>=0 && h0<H && w0>=0 && w0<W) atomicAddF(&gradIn[plane+h0*W+w0], g*(1.0f-lh)*(1.0f-lw));
+    if (h0>=0 && h0<H && w1>=0 && w1<W) atomicAddF(&gradIn[plane+h0*W+w1], g*(1.0f-lh)*lw);
+    if (h1>=0 && h1<H && w0>=0 && w0<W) atomicAddF(&gradIn[plane+h1*W+w0], g*lh*(1.0f-lw));
+    if (h1>=0 && h1<H && w1>=0 && w1<W) atomicAddF(&gradIn[plane+h1*W+w1], g*lh*lw);
 }
-// GridSample bilinear backward-to-grid (NHWC). One thread per (b,oh,ow): gradGrid = d(out)/d(g) summed
+// GridSample bilinear backward-to-grid (NCHW). One thread per (b,oh,ow): gradGrid = d(out)/d(g) summed
 // over channels via the bilinear coordinate derivative, chain-ruled by (size-1)/2. No atomics.
 __kernel void gridsample_backward_grid(__global const float* gradOut, __global const float* input,
     __global const float* grid, __global float* gradGrid, int batch, int H, int W, int C, int outH, int outW) {
@@ -518,13 +547,14 @@ __kernel void gridsample_backward_grid(__global const float* gradOut, __global c
         int in00 = (h0>=0&&h0<H&&w0>=0&&w0<W); int in01 = (h0>=0&&h0<H&&w1>=0&&w1<W);
         int in10 = (h1>=0&&h1<H&&w0>=0&&w0<W); int in11 = (h1>=0&&h1<H&&w1>=0&&w1<W);
         for (int c = 0; c < C; c++) {
-            float v00 = in00 ? input[((b*H+h0)*W+w0)*C+c] : 0.0f;
-            float v01 = in01 ? input[((b*H+h0)*W+w1)*C+c] : 0.0f;
-            float v10 = in10 ? input[((b*H+h1)*W+w0)*C+c] : 0.0f;
-            float v11 = in11 ? input[((b*H+h1)*W+w1)*C+c] : 0.0f;
+            int plane = (b*C+c)*H*W;
+            float v00 = in00 ? input[plane+h0*W+w0] : 0.0f;
+            float v01 = in01 ? input[plane+h0*W+w1] : 0.0f;
+            float v10 = in10 ? input[plane+h1*W+w0] : 0.0f;
+            float v11 = in11 ? input[plane+h1*W+w1] : 0.0f;
             float dH = (1.0f-lw)*(v10-v00) + lw*(v11-v01);
             float dW = (1.0f-lh)*(v01-v00) + lh*(v11-v10);
-            float go = gradOut[((b*outH+oh)*outW+ow)*C+c];
+            float go = gradOut[((b*C+c)*outH+oh)*outW+ow];
             gradGx += go * dW * (float)(W-1)*0.5f;
             gradGy += go * dH * (float)(H-1)*0.5f;
         }
@@ -553,25 +583,30 @@ __kernel void build_spectrum(__global const float* mag, __global const float* ph
         }
     }
 }
-// istft_from_spectrum: per (b,frame,i) inverse-DFT sample from the full spectrum, windowed overlap-add.
+// istft_from_spectrum: one work-item per output sample scans frames in CPU order. This avoids atomic
+// accumulation and makes overlapping-frame addition deterministic across devices and runs.
 __kernel void istft_from_spectrum(__global const float* specRe, __global const float* specIm, __global const float* window,
-    volatile __global float* result, volatile __global float* windowSum,
+    __global float* result, __global float* windowSum,
     int batch, int numFrames, int nFft, int hop, int outputLength, int center) {
-    int idx = get_global_id(0); int total = batch*numFrames*nFft; if (idx >= total) return;
-    int i = idx % nFft; int tmp = idx / nFft; int frame = tmp % numFrames; int b = tmp / numFrames;
-    int specOff = (b*numFrames + frame) * nFft;
-    float acc = 0.0f;
-    for (int k = 0; k < nFft; k++) {
-        float a = 2.0f*M_PI_F*(float)k*(float)i/(float)nFft;
-        acc += specRe[specOff+k]*cos(a) - specIm[specOff+k]*sin(a);
+    int idx = get_global_id(0); int total = batch*outputLength; if (idx >= total) return;
+    int outIdx = idx % outputLength; int b = idx / outputLength;
+    float resultAcc = 0.0f; float windowAcc = 0.0f;
+    for (int frame = 0; frame < numFrames; frame++) {
+        int writeStart = center ? max(0, frame*hop - nFft/2) : frame*hop;
+        int i = outIdx - writeStart;
+        if (i >= 0 && i < nFft) {
+            int specOff = (b*numFrames + frame) * nFft;
+            float acc = 0.0f;
+            for (int k = 0; k < nFft; k++) {
+                float a = 2.0f*M_PI_F*(float)k*(float)i/(float)nFft;
+                acc += specRe[specOff+k]*cos(a) - specIm[specOff+k]*sin(a);
+            }
+            float w = window[i];
+            resultAcc += acc*(1.0f/(float)nFft)*w;
+            windowAcc += w*w;
+        }
     }
-    int writeStart = center ? max(0, frame*hop - nFft/2) : frame*hop;
-    int outIdx = writeStart + i;
-    if (outIdx >= 0 && outIdx < outputLength) {
-        float w = window[i];
-        atomicAddF(&result[b*outputLength + outIdx], acc*(1.0f/(float)nFft)*w);
-        atomicAddF(&windowSum[b*outputLength + outIdx], w*w);
-    }
+    result[idx] = resultAcc; windowSum[idx] = windowAcc;
 }
 __kernel void istft_normalize(__global float* result, __global const float* windowSum, int total) {
     int idx = get_global_id(0); if (idx >= total) return;
@@ -616,7 +651,7 @@ __kernel void next_after(__global const float* a, __global const float* b, __glo
         return new[]
         {
             "concat_axis", "slice_last_axis", "set_slice_last_axis", "stack_2",
-            "pad_2d", "pad_2d_backward", "tile_last_axis", "repeat_elements",
+            "pad_2d", "pad_2d_backward", "tile_last_axis", "tile_axis", "permute_general", "repeat_elements",
             "pixel_shuffle", "pixel_shuffle_backward", "crop_2d",
             "eye_kernel", "linspace_kernel", "one_hot_kernel",
             "diag_kernel", "extract_diag_kernel", "triangular_mask",

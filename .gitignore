@@ -83,3 +83,4 @@ src/AiDotNet.Native.CUDA/obj/cuda-split/
 
 # local CLI/device state (gh)
 .local/
+scratch-opparity/

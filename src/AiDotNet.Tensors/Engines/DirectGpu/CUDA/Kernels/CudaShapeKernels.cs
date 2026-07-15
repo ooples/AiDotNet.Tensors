@@ -378,6 +378,24 @@ extern ""C"" __global__ __launch_bounds__(256) void extract_diag_kernel(
     output[idx] = input[idx * cols + idx];
 }
 
+extern ""C"" __global__ __launch_bounds__(256) void strided_gather(
+    const float* __restrict__ src, float* __restrict__ dst,
+    int offset, int stride, int count)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= count) return;
+    dst[idx] = src[offset + idx * stride];
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void strided_scatter(
+    const float* __restrict__ src, float* __restrict__ dst,
+    int offset, int stride, int count)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= count) return;
+    dst[offset + idx * stride] = src[idx];
+}
+
 extern ""C"" __global__ __launch_bounds__(256) void triangular_mask(
     float* __restrict__ output, int rows, int cols, int diagonal, float maskValue)
 {
@@ -454,6 +472,8 @@ extern ""C"" __global__ __launch_bounds__(256) void index_select(
             "one_hot_kernel",
             "diag_kernel",
             "extract_diag_kernel",
+            "strided_gather",
+            "strided_scatter",
             "triangular_mask",
             "masked_fill_kernel",
             "where_kernel",

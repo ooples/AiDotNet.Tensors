@@ -1,0 +1,239 @@
+#if NET7_0_OR_GREATER
+using System;
+
+namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
+
+// #775: WebGPU implementations of the per-family extended-conv capability interfaces. Added
+// incrementally (interface + WGSL kernels) so a partially-ported backend opts into exactly the families
+// it can run; the engine routes the rest to the CPU. WGSL kernels live in WebGpuExtendedConvKernels; this
+// partial only wires the dispatch via Dispatch{N}BufferAsync. Scalar params are packed into a float[]
+// uniform block (ints reinterpreted as their float bit pattern, floats stored directly, padded to a
+// 16-byte multiple to satisfy WGSL uniform alignment).
+public sealed partial class WebGpuBackend : ITrilinearInterpolationKernels, IConvTranspose3DKernels, ISpiralConvKernels,
+    IAdaptiveMaxPool2DKernels, IConv3DBackwardKernels, IDepthwiseConv2DBackwardKernels, IPool3DKernels,
+    IGaussianSplatKernels
+{
+    private static float Bits(int value) => BitConverter.Int32BitsToSingle(value);
+
+    public void GaussianCovariance(IGpuBuffer rotations, IGpuBuffer scales, IGpuBuffer covariances, int numGaussians)
+    {
+        if (numGaussians <= 0) return;
+        Dispatch3BufferAsync("ExtGaussianCovariance", WebGpuExtendedConvKernels.GaussianCovariance, "main",
+            rotations, scales, covariances,
+            [Bits(numGaussians), 0f, 0f, 0f], numGaussians).GetAwaiter().GetResult();
+    }
+
+    public void SphericalHarmonics(IGpuBuffer shCoefficients, IGpuBuffer viewDirections, IGpuBuffer output,
+        int numPoints, int basisCount, int numChannels, int degree, int broadcastDir)
+    {
+        int total = checked(numPoints * numChannels);
+        if (total <= 0) return;
+        Dispatch3BufferAsync("ExtSphericalHarmonics", WebGpuExtendedConvKernels.SphericalHarmonics, "main",
+            shCoefficients, viewDirections, output,
+            [Bits(numPoints), Bits(basisCount), Bits(numChannels), Bits(degree), Bits(broadcastDir), 0f, 0f, 0f],
+            total).GetAwaiter().GetResult();
+    }
+
+    public void SphericalHarmonicsBackward(IGpuBuffer shCoefficients, IGpuBuffer viewDirections,
+        IGpuBuffer outputGradient, IGpuBuffer shGrad,
+        int numPoints, int basisCount, int numChannels, int degree, int broadcastDir)
+    {
+        int total = checked(numPoints * basisCount * numChannels);
+        if (total <= 0) return;
+        Dispatch4BufferAsync("ExtSphericalHarmonicsBwd", WebGpuExtendedConvKernels.SphericalHarmonicsBackward, "main",
+            shCoefficients, viewDirections, outputGradient, shGrad,
+            [Bits(numPoints), Bits(basisCount), Bits(numChannels), Bits(degree), Bits(broadcastDir), 0f, 0f, 0f],
+            total).GetAwaiter().GetResult();
+    }
+
+    private static float[] Pool3DUniforms(int batch, int channels, int inDepth, int inHeight, int inWidth,
+        int outDepth, int outHeight, int outWidth, int kernelD, int kernelH, int kernelW,
+        int strideD, int strideH, int strideW, int countIncludePad) =>
+        [Bits(batch), Bits(channels), Bits(inDepth), Bits(inHeight), Bits(inWidth),
+         Bits(outDepth), Bits(outHeight), Bits(outWidth), Bits(kernelD), Bits(kernelH), Bits(kernelW),
+         Bits(strideD), Bits(strideH), Bits(strideW), Bits(countIncludePad), 0f];
+
+    public void AvgPool3D(IGpuBuffer input, IGpuBuffer output,
+        int batch, int channels, int inDepth, int inHeight, int inWidth,
+        int outDepth, int outHeight, int outWidth, int kernelD, int kernelH, int kernelW,
+        int strideD, int strideH, int strideW, int countIncludePad)
+    {
+        int total = checked(batch * channels * outDepth * outHeight * outWidth);
+        if (total <= 0) return;
+        Dispatch2BufferAsync("ExtAvgPool3D", WebGpuExtendedConvKernels.AvgPool3D, "main",
+            input, output,
+            Pool3DUniforms(batch, channels, inDepth, inHeight, inWidth, outDepth, outHeight, outWidth,
+                kernelD, kernelH, kernelW, strideD, strideH, strideW, countIncludePad),
+            total).GetAwaiter().GetResult();
+    }
+
+    public void AvgPool3DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput,
+        int batch, int channels, int inDepth, int inHeight, int inWidth,
+        int outDepth, int outHeight, int outWidth, int kernelD, int kernelH, int kernelW,
+        int strideD, int strideH, int strideW, int countIncludePad)
+    {
+        int total = checked(batch * channels * inDepth * inHeight * inWidth);
+        if (total <= 0) return;
+        Dispatch2BufferAsync("ExtAvgPool3DBwd", WebGpuExtendedConvKernels.AvgPool3DBackward, "main",
+            gradOutput, gradInput,
+            Pool3DUniforms(batch, channels, inDepth, inHeight, inWidth, outDepth, outHeight, outWidth,
+                kernelD, kernelH, kernelW, strideD, strideH, strideW, countIncludePad),
+            total).GetAwaiter().GetResult();
+    }
+
+    private static float[] DepthwiseUniforms(int n, int inC, int h, int w, int m, int outH, int outW,
+        int kH, int kW, int strideH, int strideW, int padH, int padW) =>
+        [Bits(n), Bits(inC), Bits(h), Bits(w), Bits(m), Bits(outH), Bits(outW),
+         Bits(kH), Bits(kW), Bits(strideH), Bits(strideW), Bits(padH), Bits(padW), 0f, 0f, 0f];
+
+    public void DepthwiseConv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
+        int n, int inC, int h, int w, int m, int outH, int outW, int kH, int kW,
+        int strideH, int strideW, int padH, int padW)
+    {
+        int total = checked(n * inC * h * w);
+        if (total <= 0) return;
+        Dispatch3BufferAsync("ExtDepthwiseBwdIn", WebGpuExtendedConvKernels.DepthwiseConv2DBackwardInput, "main",
+            gradOutput, kernel, gradInput,
+            DepthwiseUniforms(n, inC, h, w, m, outH, outW, kH, kW, strideH, strideW, padH, padW),
+            total).GetAwaiter().GetResult();
+    }
+
+    public void DepthwiseConv2DBackwardKernel(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradKernel,
+        int n, int inC, int h, int w, int m, int outH, int outW, int kH, int kW,
+        int strideH, int strideW, int padH, int padW)
+    {
+        int total = checked(inC * m * kH * kW);
+        if (total <= 0) return;
+        Dispatch3BufferAsync("ExtDepthwiseBwdW", WebGpuExtendedConvKernels.DepthwiseConv2DBackwardWeights, "main",
+            gradOutput, input, gradKernel,
+            DepthwiseUniforms(n, inC, h, w, m, outH, outW, kH, kW, strideH, strideW, padH, padW),
+            total).GetAwaiter().GetResult();
+    }
+
+    public void Conv3DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer weights, IGpuBuffer gradInput,
+        int n, int inC, int inD, int inH, int inW, int outC, int outD, int outH, int outW,
+        int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW)
+    {
+        int total = checked(n * inC * inD * inH * inW);
+        if (total <= 0) return;
+        Dispatch3BufferAsync("ExtConv3DBwdIn", WebGpuExtendedConvKernels.Conv3DBackwardInput, "main",
+            gradOutput, weights, gradInput,
+            Conv3DUniforms(n, inC, inD, inH, inW, outC, outD, outH, outW, kD, kH, kW, strideD, strideH, strideW, padD, padH, padW),
+            total).GetAwaiter().GetResult();
+    }
+
+    public void Conv3DBackwardKernel(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradKernel,
+        int n, int inC, int inD, int inH, int inW, int outC, int outD, int outH, int outW,
+        int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW)
+    {
+        int total = checked(outC * inC * kD * kH * kW);
+        if (total <= 0) return;
+        Dispatch3BufferAsync("ExtConv3DBwdW", WebGpuExtendedConvKernels.Conv3DBackwardWeights, "main",
+            gradOutput, input, gradKernel,
+            Conv3DUniforms(n, inC, inD, inH, inW, outC, outD, outH, outW, kD, kH, kW, strideD, strideH, strideW, padD, padH, padW),
+            total).GetAwaiter().GetResult();
+    }
+
+    public void AdaptiveMaxPool2D(IGpuBuffer input, IGpuBuffer output,
+        int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
+    {
+        int total = checked(batch * channels * outHeight * outWidth);
+        if (total <= 0) return;
+        Dispatch2BufferAsync("ExtAdaptiveMaxPool2D", WebGpuExtendedConvKernels.AdaptiveMaxPool2D, "main",
+            input, output,
+            [Bits(batch), Bits(channels), Bits(inHeight), Bits(inWidth), Bits(outHeight), Bits(outWidth), 0f, 0f],
+            total).GetAwaiter().GetResult();
+    }
+
+    public void SpiralConv(IGpuBuffer vertexFeatures, IGpuBuffer spiralIndices, IGpuBuffer weights,
+        IGpuBuffer biases, IGpuBuffer output, int v, int inC, int spiralLength, int outC)
+    {
+        int total = checked(v * outC);
+        if (total <= 0) return;
+        Dispatch5BufferAsync("ExtSpiralConv", WebGpuExtendedConvKernels.SpiralConv, "main",
+            vertexFeatures, spiralIndices, weights, biases, output,
+            [Bits(v), Bits(inC), Bits(spiralLength), Bits(outC)], total).GetAwaiter().GetResult();
+    }
+
+    public void SpiralConvBackwardInput(IGpuBuffer gradOutput, IGpuBuffer spiralIndices, IGpuBuffer weights,
+        IGpuBuffer gradVertexFeatures, int v, int inC, int spiralLength, int outC)
+    {
+        int total = checked(v * inC);
+        if (total <= 0) return;
+        Dispatch4BufferAsync("ExtSpiralConvBwdIn", WebGpuExtendedConvKernels.SpiralConvBackwardInput, "main",
+            gradOutput, spiralIndices, weights, gradVertexFeatures,
+            [Bits(v), Bits(inC), Bits(spiralLength), Bits(outC)], total).GetAwaiter().GetResult();
+    }
+
+    public void SpiralConvBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer vertexFeatures, IGpuBuffer spiralIndices,
+        IGpuBuffer gradWeights, int v, int inC, int spiralLength, int outC)
+    {
+        int total = checked(outC * inC * spiralLength);
+        if (total <= 0) return;
+        Dispatch4BufferAsync("ExtSpiralConvBwdW", WebGpuExtendedConvKernels.SpiralConvBackwardWeights, "main",
+            gradOutput, vertexFeatures, spiralIndices, gradWeights,
+            [Bits(v), Bits(inC), Bits(spiralLength), Bits(outC)], total).GetAwaiter().GetResult();
+    }
+
+    private static float[] Conv3DUniforms(int n, int inC, int iD, int iH, int iW, int outC, int outD, int outH, int outW,
+        int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW) =>
+        [Bits(n), Bits(inC), Bits(iD), Bits(iH), Bits(iW), Bits(outC), Bits(outD), Bits(outH), Bits(outW),
+         Bits(kD), Bits(kH), Bits(kW), Bits(strideD), Bits(strideH), Bits(strideW), Bits(padD), Bits(padH), Bits(padW), 0f, 0f];
+
+    public void ConvTranspose3D(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer output,
+        int n, int inC, int iD, int iH, int iW, int outC, int outD, int outH, int outW,
+        int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW)
+    {
+        int total = checked(n * outC * outD * outH * outW);
+        if (total <= 0) return;
+        Dispatch3BufferAsync("ExtConvT3D", WebGpuExtendedConvKernels.ConvTranspose3D, "main",
+            input, weights, output,
+            Conv3DUniforms(n, inC, iD, iH, iW, outC, outD, outH, outW, kD, kH, kW, strideD, strideH, strideW, padD, padH, padW),
+            total).GetAwaiter().GetResult();
+    }
+
+    public void ConvTranspose3DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer weights, IGpuBuffer gradInput,
+        int n, int inC, int iD, int iH, int iW, int outC, int outD, int outH, int outW,
+        int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW)
+    {
+        int total = checked(n * inC * iD * iH * iW);
+        if (total <= 0) return;
+        Dispatch3BufferAsync("ExtConvT3DBwdIn", WebGpuExtendedConvKernels.ConvTranspose3DBackwardInput, "main",
+            gradOutput, weights, gradInput,
+            Conv3DUniforms(n, inC, iD, iH, iW, outC, outD, outH, outW, kD, kH, kW, strideD, strideH, strideW, padD, padH, padW),
+            total).GetAwaiter().GetResult();
+    }
+
+    public void ConvTranspose3DBackwardKernel(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradWeights,
+        int n, int inC, int iD, int iH, int iW, int outC, int outD, int outH, int outW,
+        int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW)
+    {
+        int total = checked(inC * outC * kD * kH * kW);
+        if (total <= 0) return;
+        Dispatch3BufferAsync("ExtConvT3DBwdW", WebGpuExtendedConvKernels.ConvTranspose3DBackwardWeights, "main",
+            gradOutput, input, gradWeights,
+            Conv3DUniforms(n, inC, iD, iH, iW, outC, outD, outH, outW, kD, kH, kW, strideD, strideH, strideW, padD, padH, padW),
+            total).GetAwaiter().GetResult();
+    }
+
+    public void TrilinearInterpolate(IGpuBuffer grid, IGpuBuffer positions, IGpuBuffer output,
+        int d, int h, int w, int c, int p, float upperEps)
+    {
+        int total = checked(p * c);
+        if (total <= 0) return;
+        Dispatch3BufferAsync("ExtTrilinear", WebGpuExtendedConvKernels.TrilinearInterpolate, "main",
+            grid, positions, output,
+            [Bits(d), Bits(h), Bits(w), Bits(c), Bits(p), upperEps, 0f, 0f], total).GetAwaiter().GetResult();
+    }
+
+    public void TrilinearInterpolateBackward(IGpuBuffer gradOutput, IGpuBuffer positions, IGpuBuffer gradGrid,
+        int d, int h, int w, int c, int p, float upperEps)
+    {
+        int total = checked(d * h * w * c);
+        if (total <= 0) return;
+        Dispatch3BufferAsync("ExtTrilinearBackward", WebGpuExtendedConvKernels.TrilinearInterpolateBackward, "main",
+            gradOutput, positions, gradGrid,
+            [Bits(d), Bits(h), Bits(w), Bits(c), Bits(p), upperEps, 0f, 0f], total).GetAwaiter().GetResult();
+    }
+}
+#endif

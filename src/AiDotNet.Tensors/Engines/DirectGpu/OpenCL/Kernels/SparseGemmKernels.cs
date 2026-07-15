@@ -339,24 +339,6 @@ __kernel void decompress_2_4_sparse(
     dense_output[row * K + kBase + idx0] = val0;
     dense_output[row * K + kBase + idx1] = val1;
 }
-
-// ===========================================================================
-// Compute sparsity ratio of a matrix
-// ===========================================================================
-__kernel void compute_sparsity_ratio(
-    __global const float* input,
-    __global int* zero_count,
-    const int size,
-    const float threshold)
-{
-    const int idx = get_global_id(0);
-
-    if (idx >= size) return;
-
-    if (fabs(input[idx]) < threshold) {
-        atomic_add(zero_count, 1);
-    }
-}
 ";
     }
 
@@ -370,8 +352,7 @@ __kernel void compute_sparsity_ratio(
             "sparse_gemm_2_4",
             "sparse_gemm_bias_relu",
             "enforce_2_4_sparsity",
-            "decompress_2_4_sparse",
-            "compute_sparsity_ratio"
+            "decompress_2_4_sparse"
         };
     }
 }

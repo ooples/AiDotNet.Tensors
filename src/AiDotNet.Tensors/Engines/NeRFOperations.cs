@@ -427,6 +427,22 @@ public static class NeRFOperations
         if (weightsCoarse == null) throw new ArgumentNullException(nameof(weightsCoarse));
         if (numFineSamples <= 0)
             throw new ArgumentOutOfRangeException(nameof(numFineSamples), "Number of fine samples must be positive.");
+        if (tValuesCoarse.Rank != 2 || weightsCoarse.Rank != 2)
+            throw new ArgumentException("Importance sampling expects rank-2 [numRays, numCoarseSamples] tensors.");
+        if (tValuesCoarse._shape[0] != weightsCoarse._shape[0] ||
+            tValuesCoarse._shape[1] != weightsCoarse._shape[1])
+            throw new ArgumentException("Coarse t-values and weights must have identical shapes.");
+        if (tValuesCoarse._shape[1] <= 0)
+            throw new ArgumentException("Importance sampling requires at least one coarse sample per ray.");
+
+        if (typeof(T) == typeof(float))
+        {
+            var result = ImportanceSamplingFloat(
+                (Tensor<float>)(object)tValuesCoarse,
+                (Tensor<float>)(object)weightsCoarse,
+                numFineSamples);
+            return (Tensor<T>)(object)result;
+        }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         int numRays = tValuesCoarse._shape[0];
@@ -506,6 +522,83 @@ public static class NeRFOperations
             _ => { });
 
         return new Tensor<T>(fineTValues, [numRays, numFineSamples]);
+    }
+
+    private static Tensor<float> ImportanceSamplingFloat(
+        Tensor<float> tValuesCoarse,
+        Tensor<float> weightsCoarse,
+        int numFineSamples)
+    {
+        int numRays = tValuesCoarse._shape[0];
+        int numCoarseSamples = tValuesCoarse._shape[1];
+        var tValues = tValuesCoarse.AsSpan();
+        var weights = weightsCoarse.AsSpan();
+        var output = new float[checked(numRays * numFineSamples)];
+
+        for (int ray = 0; ray < numRays; ray++)
+        {
+            int coarseOffset = ray * numCoarseSamples;
+            float weightSum = 0f;
+            for (int s = 0; s < numCoarseSamples; s++)
+            {
+                float weight = weights[coarseOffset + s];
+                if (weight > 0f) weightSum += weight;
+            }
+
+            for (int sample = 0; sample < numFineSamples; sample++)
+            {
+                int outputIndex = ray * numFineSamples + sample;
+                uint bits = ImportanceSamplingHash(
+                    DirectGpu.GpuRandomSeed.StatelessImportanceSampling ^
+                    unchecked((uint)outputIndex * 747796405u + 2891336453u));
+                float random = (bits >> 8) * (1f / 16777216f);
+                float u = (sample + random) / numFineSamples;
+
+                if (weightSum <= 1e-10f)
+                {
+                    float tMin = tValues[coarseOffset];
+                    float tMax = tValues[coarseOffset + numCoarseSamples - 1];
+                    output[outputIndex] = tMin + u * (tMax - tMin);
+                    continue;
+                }
+
+                float previous = 0f;
+                float current = 0f;
+                int index = 0;
+                for (int s = 0; s < numCoarseSamples; s++)
+                {
+                    float weight = weights[coarseOffset + s];
+                    if (weight > 0f) current += weight / weightSum;
+                    index = s;
+                    if (u <= current || s == numCoarseSamples - 1) break;
+                    previous = current;
+                }
+
+                if (index == 0)
+                {
+                    output[outputIndex] = tValues[coarseOffset];
+                    continue;
+                }
+
+                float denominator = current - previous;
+                float t0 = tValues[coarseOffset + index - 1];
+                float t1 = tValues[coarseOffset + index];
+                output[outputIndex] = denominator > 1e-10f
+                    ? t0 + ((u - previous) / denominator) * (t1 - t0)
+                    : t0;
+            }
+        }
+
+        return new Tensor<float>(output, [numRays, numFineSamples]);
+    }
+
+    private static uint ImportanceSamplingHash(uint value)
+    {
+        value ^= value >> 16;
+        value = unchecked(value * 0x7feb352du);
+        value ^= value >> 15;
+        value = unchecked(value * 0x846ca68bu);
+        return value ^ (value >> 16);
     }
 
     /// <summary>

@@ -32,6 +32,10 @@ __kernel void broadcast_mul_first(__global const float* a, __global const float*
     int idx = get_global_id(0); if (idx >= outerSize * innerSize) return;
     output[idx] = a[idx / innerSize] * b[idx];
 }
+__kernel void broadcast_multiply_first_axis(__global const float* a, __global const float* b, __global float* output, int outerSize, int innerSize) {
+    int idx = get_global_id(0); if (idx >= outerSize * innerSize) return;
+    output[idx] = a[idx] * b[idx / innerSize];
+}
 __kernel void add_scalar(__global const float* input, __global float* output, float scalar, int size) {
     int idx = get_global_id(0); if (idx >= size) return;
     output[idx] = input[idx] + scalar;
@@ -49,9 +53,21 @@ __kernel void pow_scalar(__global const float* input, __global float* output, fl
     int idx = get_global_id(0); if (idx >= size) return;
     output[idx] = pow(input[idx], exponent);
 }
+// #775: frac_kernel is dispatched via ExecuteActivation, which launches (size+3)/4 work items
+// because it assumes FLOAT4-VECTORIZED kernels (each work item handles 4 elements). The old scalar
+// form (one element per work item) therefore wrote only the first quarter of the output and left
+// the rest uninitialized — nondeterministic garbage (the CPU-vs-GPU op-parity scaffold caught it as
+// a run-to-run mismatch). Vectorize to float4 so one work item covers 4 elements, matching the
+// ExecuteActivation contract and the other activation kernels.
 __kernel void frac_kernel(__global const float* input, __global float* output, int size) {
-    int idx = get_global_id(0); if (idx >= size) return;
-    output[idx] = input[idx] - floor(input[idx]);
+    int idx = get_global_id(0);
+    int idx4 = idx * 4;
+    if (idx4 + 3 < size) {
+        float4 x = vload4(idx, input);
+        vstore4(x - floor(x), idx, output);
+    } else {
+        for (int i = idx4; i < size; i++) output[i] = input[i] - floor(input[i]);
+    }
 }
 __kernel void clip_kernel(__global const float* input, __global float* output, float minVal, float maxVal, int size) {
     int idx = get_global_id(0); if (idx >= size) return;
@@ -63,11 +79,33 @@ __kernel void rsqrt_kernel(__global const float* input, __global float* output, 
 }
 __kernel void equals_kernel(__global const float* a, __global const float* b, __global float* output, int size) {
     int idx = get_global_id(0); if (idx >= size) return;
-    output[idx] = (a[idx] == b[idx]) ? 1.0f : 0.0f;
+    uint ab = as_uint(a[idx]);
+    uint bb = as_uint(b[idx]);
+    uint aa = ab & 0x7FFFFFFFu;
+    uint ba = bb & 0x7FFFFFFFu;
+    int equal = aa <= 0x7F800000u && ba <= 0x7F800000u
+        && (ab == bb || ((aa | ba) == 0u));
+    output[idx] = equal ? 1.0f : 0.0f;
 }
 __kernel void not_equals_kernel(__global const float* a, __global const float* b, __global float* output, int size) {
     int idx = get_global_id(0); if (idx >= size) return;
-    output[idx] = (a[idx] != b[idx]) ? 1.0f : 0.0f;
+    uint ab = as_uint(a[idx]);
+    uint bb = as_uint(b[idx]);
+    uint aa = ab & 0x7FFFFFFFu;
+    uint ba = bb & 0x7FFFFFFFu;
+    int equal = aa <= 0x7F800000u && ba <= 0x7F800000u
+        && (ab == bb || ((aa | ba) == 0u));
+    output[idx] = equal ? 0.0f : 1.0f;
+}
+__kernel void not_equal_scalar(__global const float* input, __global float* output, float scalar, int size) {
+    int idx = get_global_id(0); if (idx >= size) return;
+    uint ab = as_uint(input[idx]);
+    uint bb = as_uint(scalar);
+    uint aa = ab & 0x7FFFFFFFu;
+    uint ba = bb & 0x7FFFFFFFu;
+    int equal = aa <= 0x7F800000u && ba <= 0x7F800000u
+        && (ab == bb || ((aa | ba) == 0u));
+    output[idx] = equal ? 0.0f : 1.0f;
 }
 // IEEE-754 classify via the bit pattern (robust to fast/finite-math which folds isnan/!= away).
 // mode: 0 = isnan, 1 = isinf, 2 = isfinite.
@@ -92,10 +130,10 @@ __kernel void classify_float(__global const float* a, __global float* output, in
         return new[]
         {
             "broadcast_add_last", "broadcast_sub_last", "broadcast_mul_last", "broadcast_div_last",
-            "broadcast_add_first", "broadcast_mul_first",
+            "broadcast_add_first", "broadcast_mul_first", "broadcast_multiply_first_axis",
             "add_scalar", "sub_scalar", "div_scalar", "pow_scalar",
             "frac_kernel", "clip_kernel", "rsqrt_kernel",
-            "equals_kernel", "not_equals_kernel", "classify_float"
+            "equals_kernel", "not_equals_kernel", "not_equal_scalar", "classify_float"
         };
     }
 }

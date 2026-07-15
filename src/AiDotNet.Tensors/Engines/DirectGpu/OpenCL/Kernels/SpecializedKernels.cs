@@ -280,6 +280,68 @@ __kernel void hyperbolic_linear_forward(
     output[b * outputFeatures + o] = (2.0f / sqrtC) * atanh(arg);
 }
 
+// Current hyperbolic-linear contract: Euclidean linear followed by a separate
+// Poincare projection pass. Weights are [outputFeatures,inputFeatures] and
+// biases are [outputFeatures].
+__kernel void hyperbolic_linear_euclidean_forward(
+    __global const float* input, __global const float* weights,
+    __global const float* biases, __global float* output,
+    const int batchSize, const int inputFeatures, const int outputFeatures,
+    const float curvature, const float epsilon)
+{
+    int tid = get_global_id(0);
+    int total = batchSize * outputFeatures;
+    if (tid >= total) return;
+    int b = tid / outputFeatures;
+    int o = tid % outputFeatures;
+    float sum = biases[o];
+    for (int i = 0; i < inputFeatures; i++)
+        sum += input[b * inputFeatures + i] * weights[o * inputFeatures + i];
+    output[tid] = sum;
+}
+
+__kernel void hyperbolic_linear_backward_input(
+    __global const float* gradOutput, __global const float* input,
+    __global const float* weights, __global float* gradInput,
+    const int batchSize, const int inputFeatures, const int outputFeatures, const float curvature)
+{
+    int tid = get_global_id(0);
+    int total = batchSize * inputFeatures;
+    if (tid >= total) return;
+    int b = tid / inputFeatures;
+    int i = tid % inputFeatures;
+    float sum = 0.0f;
+    for (int o = 0; o < outputFeatures; o++)
+        sum += gradOutput[b * outputFeatures + o] * weights[o * inputFeatures + i];
+    gradInput[tid] = sum;
+}
+
+__kernel void hyperbolic_linear_backward_weights(
+    __global const float* gradOutput, __global const float* input, __global float* gradWeights,
+    const int batchSize, const int inputFeatures, const int outputFeatures, const float curvature)
+{
+    int tid = get_global_id(0);
+    int total = outputFeatures * inputFeatures;
+    if (tid >= total) return;
+    int o = tid / inputFeatures;
+    int i = tid % inputFeatures;
+    float sum = 0.0f;
+    for (int b = 0; b < batchSize; b++)
+        sum += gradOutput[b * outputFeatures + o] * input[b * inputFeatures + i];
+    gradWeights[tid] = sum;
+}
+
+__kernel void hyperbolic_linear_backward_biases(
+    __global const float* gradOutput, __global const float* input, __global float* gradBiases,
+    const int batchSize, const int inputFeatures, const int outputFeatures, const float curvature)
+{
+    int o = get_global_id(0);
+    if (o >= outputFeatures) return;
+    float sum = 0.0f;
+    for (int b = 0; b < batchSize; b++) sum += gradOutput[b * outputFeatures + o];
+    gradBiases[o] = sum;
+}
+
 // ============================================================================
 // OCTONION ALGEBRA KERNELS
 // ============================================================================
@@ -604,6 +666,10 @@ __kernel void complex_magnitude(
             "poincare_exp_map",
             "poincare_distance",
             "hyperbolic_linear_forward",
+            "hyperbolic_linear_euclidean_forward",
+            "hyperbolic_linear_backward_input",
+            "hyperbolic_linear_backward_weights",
+            "hyperbolic_linear_backward_biases",
             // Octonion algebra
             "octonion_multiply",
             "octonion_add",

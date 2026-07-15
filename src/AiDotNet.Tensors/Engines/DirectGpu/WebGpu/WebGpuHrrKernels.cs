@@ -3,9 +3,8 @@
 //
 // Each kernel keeps work on the GPU — no download/upload. Per-cell
 // phases use a 32-bit Murmur3 fmix hash seeded from (seed, cellIdx).
-// Deterministic within the WebGPU backend (same seed + same (V, D) →
-// identical output). Does not bit-match CPU, CUDA, or Vulkan phase
-// sequences — each backend generates its own uniform distribution.
+// The CPU reference and every GPU backend use the same hash and phase
+// construction, so the random phase sequence is backend-independent.
 //
 // Int buffers (keyIds / valIds) arrive as Int32BitsToSingle-packed
 // floats (see WebGpuBackend.AllocateIntBuffer); shader reverses with
@@ -33,11 +32,64 @@ fn hrr_hash(seed_u : u32, cell_u : u32) -> u32 {
     return z;
 }
 
-fn hrr_phase_from_cell(seed : i32, cellIdx : u32) -> f32 {
-    let z = hrr_hash(bitcast<u32>(seed), cellIdx);
-    // Upper 24 bits → exact-representable f32 in [0, 1).
-    let top24 = z >> 8u;
-    return f32(top24) * (1.0 / 16777216.0) * 6.28318530717958647692;
+fn hrr_mul_hi(a : u32, b : u32) -> u32 {
+    let a0 = a & 0xFFFFu;
+    let a1 = a >> 16u;
+    let b0 = b & 0xFFFFu;
+    let b1 = b >> 16u;
+    let p0 = a0 * b0;
+    let p1 = a1 * b0;
+    let p2 = a0 * b1;
+    let carry = (p0 >> 16u) + (p1 & 0xFFFFu) + (p2 & 0xFFFFu);
+    return a1 * b1 + (p1 >> 16u) + (p2 >> 16u) + (carry >> 16u);
+}
+
+fn hrr_quantize_turn(turn : u32, k : u32) -> u32 {
+    var lattice = hrr_mul_hi(turn, k);
+    if (turn * k >= 0x80000000u) { lattice = lattice + 1u; }
+    if (lattice == k) { lattice = 0u; }
+    var quotient = 0u;
+    var remainder = lattice;
+    for (var i = 0; i < 32; i = i + 1) {
+        remainder = remainder << 1u;
+        quotient = quotient << 1u;
+        if (remainder >= k) {
+            remainder = remainder - k;
+            quotient = quotient | 1u;
+        }
+    }
+    return quotient;
+}
+
+const hrr_cordic_angles = array<i32, 30>(
+    536870912, 316933406, 167458907, 85004756, 42667331,
+    21354465, 10679838, 5340245, 2670163, 1335087,
+    667544, 333772, 166886, 83443, 41722,
+    20861, 10430, 5215, 2608, 1304,
+    652, 326, 163, 81, 41, 20, 10, 5, 3, 1);
+
+fn hrr_sincos(turn : u32) -> vec2<f32> {
+    let quadrant = turn >> 30u;
+    let offset = turn & 0x3FFFFFFFu;
+    var z = i32(offset);
+    if (quadrant == 1u || quadrant == 3u) { z = i32(0x40000000u - offset); }
+    var x = 652032874;
+    var y = 0;
+    for (var i = 0; i < 30; i = i + 1) {
+        let oldX = x;
+        if (z >= 0) {
+            x = x - (y >> u32(i));
+            y = y + (oldX >> u32(i));
+            z = z - hrr_cordic_angles[i];
+        } else {
+            x = x + (y >> u32(i));
+            y = y - (oldX >> u32(i));
+            z = z + hrr_cordic_angles[i];
+        }
+    }
+    if (quadrant == 1u || quadrant == 2u) { x = -x; }
+    if (quadrant >= 2u) { y = -y; }
+    return vec2<f32>(f32(x), f32(y)) * (1.0 / 1073741824.0);
 }
 ";
 
@@ -56,13 +108,13 @@ struct P { seed : i32, V : i32, D : i32, kPsk : i32, k : i32, total : i32 };
     let gid = id.x;
     if (gid >= u32(p.total)) { return; }
 
-    var phase = hrr_phase_from_cell(p.seed, gid);
+    var turn = hrr_hash(bitcast<u32>(p.seed), gid) & 0xFFFFFF00u;
     if (p.kPsk != 0) {
-        let step = 6.28318530717958647692 / f32(p.k);
-        phase = floor(phase / step + 0.5) * step;
+        turn = hrr_quantize_turn(turn, u32(p.k));
     }
-    outReal[gid] = cos(phase);
-    outImag[gid] = sin(phase);
+    let value = hrr_sincos(turn);
+    outReal[gid] = value.x;
+    outImag[gid] = value.y;
 }
 ";
 

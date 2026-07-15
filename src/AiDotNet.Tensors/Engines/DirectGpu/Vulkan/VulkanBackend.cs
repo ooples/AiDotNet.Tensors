@@ -33,7 +33,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 /// Shader modules are compiled once and reused across operations.
 /// </para>
 /// </remarks>
-public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchExecution, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend
+public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchExecution, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IPixelShuffleBackend
 {
     /// <summary>
     /// Vulkan has no cuDNN-equivalent half/bfloat16 conv path — returns
@@ -295,10 +295,8 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         if (dispatchSize <= 0) return;
         var pipeline = GetOrCreateGlslPipeline(glslSource, 2, pushConstantSize);
         if (pipeline is null)
-        {
-            CpuFallbackUnary(A, B, dispatchSize);
-            return;
-        }
+            throw new InvalidOperationException(
+                "Vulkan GLSL pipeline unavailable. Install libshaderc or use another GPU backend.");
         var vbA = AsVulkan(A);
         var vbB = AsVulkan(B);
         var threadRes = _device.AcquireThreadResources();
@@ -323,10 +321,8 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         if (dispatchSize <= 0) return;
         var pipeline = GetOrCreateGlslPipeline(glslSource, 3, pushConstantSize);
         if (pipeline is null)
-        {
-            CpuFallbackBinary(A, B, C, dispatchSize);
-            return;
-        }
+            throw new InvalidOperationException(
+                "Vulkan GLSL pipeline unavailable. Install libshaderc or use another GPU backend.");
         var vbA = AsVulkan(A);
         var vbB = AsVulkan(B);
         var vbC = AsVulkan(C);
@@ -398,7 +394,8 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         EnsureInitialized();
         if (dispatchSize <= 0) return;
         var pipeline = GetOrCreateGlslPipeline(glslSource, 4, pushConstantSize);
-        if (pipeline is null) return;
+        if (pipeline is null)
+            throw new InvalidOperationException("Vulkan GLSL pipeline unavailable - install libshaderc for runtime compilation.");
         var vbA = AsVulkan(A); var vbB = AsVulkan(B); var vbC = AsVulkan(C); var vbD = AsVulkan(D);
         var threadRes = _device.AcquireThreadResources();
         lock (_computeLock)
@@ -452,24 +449,6 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
             pipeline.UpdateDescriptorSet(vbA.Storage, vbB.Storage, vbC.Storage, vbD.Storage, vbE.Storage, vbF.Storage, vbG.Storage, vbH.Storage);
             RecordAndExecuteWithPushData(pipeline, dispatchSize, pushConstants, pushConstantSize, threadRes);
         }
-    }
-
-    // CPU fallback when GLSL pipeline creation fails (shaderc unavailable or compilation error).
-    // When GLSL pipeline creation fails (shaderc unavailable or compilation error),
-    // throw instead of silently returning wrong results. An identity copy would produce
-    // incorrect data (e.g., sigmoid returning raw input values) with no indication of failure.
-    private void CpuFallbackUnary(IGpuBuffer A, IGpuBuffer B, int size)
-    {
-        throw new InvalidOperationException(
-            "Vulkan GLSL pipeline unavailable — cannot execute compute shader. " +
-            "Install libshaderc to enable runtime GLSL compilation, or use a different GPU backend.");
-    }
-
-    private void CpuFallbackBinary(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
-    {
-        throw new InvalidOperationException(
-            "Vulkan GLSL pipeline unavailable — cannot execute compute shader. " +
-            "Install libshaderc to enable runtime GLSL compilation, or use a different GPU backend.");
     }
 
     /// <summary>
@@ -998,7 +977,19 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
 
     /// <inheritdoc/>
     public void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer)
-        => throw new NotSupportedException("UploadIntBufferInPlace is not supported by the Vulkan backend.");
+    {
+        EnsureInitialized();
+        if (data is null) throw new ArgumentNullException(nameof(data));
+        if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+        if (data.Length > buffer.Size)
+            throw new ArgumentException($"Host data ({data.Length}) exceeds buffer capacity ({buffer.Size}).", nameof(data));
+        if (data.Length == 0) return;
+
+        var packed = new float[data.Length];
+        for (int i = 0; i < data.Length; i++)
+            packed[i] = Int32BitsToSingleCompat(data[i]);
+        UploadToBuffer(packed, buffer);
+    }
 
     /// <inheritdoc/>
     public IGpuBuffer AllocateWorkspaceBuffer(int totalElements)

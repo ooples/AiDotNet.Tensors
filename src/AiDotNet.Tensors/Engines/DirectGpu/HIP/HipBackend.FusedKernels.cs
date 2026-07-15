@@ -5,30 +5,120 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 
 public sealed partial class HipBackend
 {
-    // Every method tries GPU kernel first via _kernelCache, CPU fallback only if kernel not compiled.
+    // GPU buffer APIs never emulate a missing kernel on the host. A registration or
+    // compilation gap must remain observable instead of silently breaking residency.
+    public unsafe void ReduceMean(IGpuBuffer input, IGpuBuffer output, int size)
+    {
+        if (size <= 0) return;
+        string kernelName = GpuDeterminism.IsActive ? "reduce_mean_deterministic" : "reduce_mean";
+        IntPtr kernel = RequireResidentKernel(kernelName);
+        Fill(output, 0f, 1);
+        IntPtr inputPtr = input.Handle, outputPtr = output.Handle;
+        void** args = stackalloc void*[3];
+        args[0] = &inputPtr; args[1] = &outputPtr; args[2] = &size;
+        LaunchKernel(kernel, GpuDeterminism.IsActive ? 1u : GridFor(size), DefaultBlockSize, args);
+    }
 
-    public unsafe void ReduceMean(IGpuBuffer i, IGpuBuffer o, int sz) { if (_kernelCache.TryGetValue("reduce_mean", out var k)) { IntPtr ip=i.Handle,op=o.Handle; void** a=stackalloc void*[3]; a[0]=&ip;a[1]=&op;a[2]=&sz; LaunchKernel(k,(uint)((sz+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); return; } float[] d=DownloadBuffer(i); float s=0; for(int j=0;j<sz;j++)s+=d[j]; UploadToExistingHip(new[]{s/sz},o); }
-    public unsafe void ClipKernel(IGpuBuffer i, IGpuBuffer o, float mn, float mx, int sz) { if (_kernelCache.TryGetValue("clip_kernel", out var k)) { IntPtr ip=i.Handle,op=o.Handle; void** a=stackalloc void*[5]; a[0]=&ip;a[1]=&op;a[2]=&mn;a[3]=&mx;a[4]=&sz; LaunchKernel(k,(uint)((sz+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); return; } float[] d=DownloadBuffer(i);float[] r=new float[sz];for(int j=0;j<sz;j++)r[j]=Math.Min(Math.Max(d[j],mn),mx);UploadToExistingHip(r,o); }
-    public unsafe void PowScalar(IGpuBuffer i, IGpuBuffer o, float ex, int sz) { if (_kernelCache.TryGetValue("pow_scalar", out var k)) { IntPtr ip=i.Handle,op=o.Handle; void** a=stackalloc void*[4]; a[0]=&ip;a[1]=&op;a[2]=&ex;a[3]=&sz; LaunchKernel(k,(uint)((sz+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); return; } float[] d=DownloadBuffer(i);float[] r=new float[sz];for(int j=0;j<sz;j++)r[j]=MathF.Pow(d[j],ex);UploadToExistingHip(r,o); }
-    public unsafe void FracKernel(IGpuBuffer i, IGpuBuffer o, int sz) { if (_kernelCache.TryGetValue("frac_kernel", out var k)) { IntPtr ip=i.Handle,op=o.Handle; void** a=stackalloc void*[3]; a[0]=&ip;a[1]=&op;a[2]=&sz; LaunchKernel(k,(uint)((sz+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); return; } float[] d=DownloadBuffer(i);float[] r=new float[sz];for(int j=0;j<sz;j++)r[j]=d[j]-MathF.Floor(d[j]);UploadToExistingHip(r,o); }
-    public unsafe void EyeKernel(IGpuBuffer o, int n) { if (_kernelCache.TryGetValue("eye_kernel", out var k)) { IntPtr op=o.Handle; void** a=stackalloc void*[2]; a[0]=&op;a[1]=&n; LaunchKernel(k,(uint)((n*n+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); return; } float[] r=new float[n*n]; for(int j=0;j<n;j++) r[j*n+j]=1f; UploadToExistingHip(r,o); }
-    public unsafe void OneHotKernel(IGpuBuffer idx, IGpuBuffer o, int bs, int nc) { if (_kernelCache.TryGetValue("one_hot_kernel", out var k)) { IntPtr ip=idx.Handle,op=o.Handle; void** a=stackalloc void*[4]; a[0]=&ip;a[1]=&op;a[2]=&bs;a[3]=&nc; LaunchKernel(k,(uint)((bs*nc+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); return; } float[] id=DownloadBuffer(idx); float[] r=new float[bs*nc]; for(int b=0;b<bs;b++) r[b*nc+(int)id[b]]=1f; UploadToExistingHip(r,o); }
-    public unsafe void MaskedFillKernel(IGpuBuffer i, IGpuBuffer m, IGpuBuffer o, float fv, int sz) { if (_kernelCache.TryGetValue("masked_fill_kernel", out var k)) { IntPtr ip=i.Handle,mp=m.Handle,op=o.Handle; void** a=stackalloc void*[5]; a[0]=&ip;a[1]=&mp;a[2]=&op;a[3]=&fv;a[4]=&sz; LaunchKernel(k,(uint)((sz+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); return; } float[] d=DownloadBuffer(i); float[] md=DownloadBuffer(m); float[] r=new float[sz]; for(int j=0;j<sz;j++) r[j]=md[j]!=0?fv:d[j]; UploadToExistingHip(r,o); }
-    public unsafe void EqualsKernel(IGpuBuffer a1, IGpuBuffer b1, IGpuBuffer o, int sz) { if (_kernelCache.TryGetValue("equals_kernel", out var k)) { IntPtr ap=a1.Handle,bp=b1.Handle,op=o.Handle; void** a=stackalloc void*[4]; a[0]=&ap;a[1]=&bp;a[2]=&op;a[3]=&sz; LaunchKernel(k,(uint)((sz+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); return; } float[] ad=DownloadBuffer(a1);float[] bd=DownloadBuffer(b1);float[] r=new float[sz];for(int j=0;j<sz;j++)r[j]=ad[j]==bd[j]?1f:0f;UploadToExistingHip(r,o); }
-    public unsafe void NotEqualsKernel(IGpuBuffer a1, IGpuBuffer b1, IGpuBuffer o, int sz) { if (_kernelCache.TryGetValue("not_equals_kernel", out var k)) { IntPtr ap=a1.Handle,bp=b1.Handle,op=o.Handle; void** a=stackalloc void*[4]; a[0]=&ap;a[1]=&bp;a[2]=&op;a[3]=&sz; LaunchKernel(k,(uint)((sz+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); return; } float[] ad=DownloadBuffer(a1);float[] bd=DownloadBuffer(b1);float[] r=new float[sz];for(int j=0;j<sz;j++)r[j]=ad[j]!=bd[j]?1f:0f;UploadToExistingHip(r,o); }
-    public unsafe void OuterProduct(IGpuBuffer a1, IGpuBuffer b1, IGpuBuffer o, int M, int N) { if (_kernelCache.TryGetValue("outer_product", out var k)) { IntPtr ap=a1.Handle,bp=b1.Handle,op=o.Handle; void** a=stackalloc void*[5]; a[0]=&ap;a[1]=&bp;a[2]=&op;a[3]=&M;a[4]=&N; LaunchKernel(k,(uint)((M*N+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); return; } float[] ad=DownloadBuffer(a1);float[] bd=DownloadBuffer(b1);float[] r=new float[M*N];for(int i2=0;i2<M;i2++)for(int j=0;j<N;j++)r[i2*N+j]=ad[i2]*bd[j];UploadToExistingHip(r,o); }
-    public unsafe void BatchDotProduct(IGpuBuffer a1, IGpuBuffer b1, IGpuBuffer o, int bs, int dim) { if (_kernelCache.TryGetValue("batch_dot_product", out var k)) { IntPtr ap=a1.Handle,bp=b1.Handle,op=o.Handle; void** a=stackalloc void*[5]; a[0]=&ap;a[1]=&bp;a[2]=&op;a[3]=&bs;a[4]=&dim; LaunchKernel(k,(uint)((bs+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); return; } float[] ad=DownloadBuffer(a1);float[] bd=DownloadBuffer(b1);float[] r=new float[bs];for(int i2=0;i2<bs;i2++){float s=0;for(int j=0;j<dim;j++)s+=ad[i2*dim+j]*bd[i2*dim+j];r[i2]=s;}UploadToExistingHip(r,o); }
-    public unsafe void GluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { if (_kernelCache.TryGetValue("glu_forward", out var k)) { IntPtr ip=i.Handle,op=o.Handle; void** a=stackalloc void*[4]; a[0]=&ip;a[1]=&op;a[2]=&os;a[3]=&hd; LaunchKernel(k,(uint)((os*hd+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); return; } float[] d=DownloadBuffer(i);float[] r=new float[os*hd];int fd=hd*2;for(int j=0;j<os;j++)for(int x=0;x<hd;x++){float v=d[j*fd+x];float g=d[j*fd+hd+x];r[j*hd+x]=v*(1f/(1f+MathF.Exp(-g)));}UploadToExistingHip(r,o); }
-    public unsafe void GeGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { if (_kernelCache.TryGetValue("geglu_forward", out var k)) { IntPtr ip=i.Handle,op=o.Handle; void** a=stackalloc void*[4]; a[0]=&ip;a[1]=&op;a[2]=&os;a[3]=&hd; LaunchKernel(k,(uint)((os*hd+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); return; } float[] d=DownloadBuffer(i);float[] r=new float[os*hd];int fd=hd*2;for(int j=0;j<os;j++)for(int x=0;x<hd;x++){float v=d[j*fd+x];float g=d[j*fd+hd+x];float x3=v*v*v;r[j*hd+x]=0.5f*v*(1f+MathF.Tanh(0.7978845608f*(v+0.044715f*x3)))*g;}UploadToExistingHip(r,o); }
-    public unsafe void ReGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { if (_kernelCache.TryGetValue("reglu_forward", out var k)) { IntPtr ip=i.Handle,op=o.Handle; void** a=stackalloc void*[4]; a[0]=&ip;a[1]=&op;a[2]=&os;a[3]=&hd; LaunchKernel(k,(uint)((os*hd+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); return; } float[] d=DownloadBuffer(i);float[] r=new float[os*hd];int fd=hd*2;for(int j=0;j<os;j++)for(int x=0;x<hd;x++)r[j*hd+x]=Math.Max(d[j*fd+x],0f)*d[j*fd+hd+x];UploadToExistingHip(r,o); }
-    public unsafe void SwiGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { if (_kernelCache.TryGetValue("swiglu_forward", out var k)) { IntPtr ip=i.Handle,op=o.Handle; void** a=stackalloc void*[4]; a[0]=&ip;a[1]=&op;a[2]=&os;a[3]=&hd; LaunchKernel(k,(uint)((os*hd+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); return; } float[] d=DownloadBuffer(i);float[] r=new float[os*hd];int fd=hd*2;for(int j=0;j<os;j++)for(int x=0;x<hd;x++){float v=d[j*fd+x];float sig=1f/(1f+MathF.Exp(-v));r[j*hd+x]=v*sig*d[j*fd+hd+x];}UploadToExistingHip(r,o); }
-    public unsafe void BceLoss(IGpuBuffer p, IGpuBuffer t, IGpuBuffer l, int sz) { if (_kernelCache.TryGetValue("bce_loss", out var k)) { IntPtr pp=p.Handle,tp=t.Handle,lp=l.Handle; void** a=stackalloc void*[4]; a[0]=&pp;a[1]=&tp;a[2]=&lp;a[3]=&sz; LaunchKernel(k,(uint)((sz+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); return; } float[] pd=DownloadBuffer(p);float[] td=DownloadBuffer(t);float[] r=new float[sz];for(int j=0;j<sz;j++){float pc=Math.Min(Math.Max(pd[j],1e-7f),1f-1e-7f);r[j]=-(td[j]*MathF.Log(pc)+(1f-td[j])*MathF.Log(1f-pc));}UploadToExistingHip(r,l); }
-    public unsafe void AddScalar(IGpuBuffer i, IGpuBuffer o, float sc, int sz) { if (_kernelCache.TryGetValue("add_scalar", out var k)) { IntPtr ip=i.Handle,op=o.Handle; void** a=stackalloc void*[4]; a[0]=&ip;a[1]=&op;a[2]=&sc;a[3]=&sz; LaunchKernel(k,(uint)((sz+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); return; } float[] d=DownloadBuffer(i);float[] r=new float[sz];for(int j=0;j<sz;j++)r[j]=d[j]+sc;UploadToExistingHip(r,o); }
-    public unsafe void SubScalar(IGpuBuffer i, IGpuBuffer o, float sc, int sz) { if (_kernelCache.TryGetValue("sub_scalar", out var k)) { IntPtr ip=i.Handle,op=o.Handle; void** a=stackalloc void*[4]; a[0]=&ip;a[1]=&op;a[2]=&sc;a[3]=&sz; LaunchKernel(k,(uint)((sz+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); return; } float[] d=DownloadBuffer(i);float[] r=new float[sz];for(int j=0;j<sz;j++)r[j]=d[j]-sc;UploadToExistingHip(r,o); }
-    public unsafe void BroadcastAddLast(IGpuBuffer a1, IGpuBuffer b1, IGpuBuffer o, int os, int isz) { if (_kernelCache.TryGetValue("broadcast_add_last", out var k)) { IntPtr ap=a1.Handle,bp=b1.Handle,op=o.Handle; void** a=stackalloc void*[5]; a[0]=&ap;a[1]=&bp;a[2]=&op;a[3]=&os;a[4]=&isz; LaunchKernel(k,(uint)((os*isz+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); return; } float[] ad=DownloadBuffer(a1);float[] bd=DownloadBuffer(b1);float[] r=new float[os*isz];for(int j=0;j<os*isz;j++)r[j]=ad[j]+bd[j%isz];UploadToExistingHip(r,o); }
-    public unsafe void BroadcastSubLast(IGpuBuffer a1, IGpuBuffer b1, IGpuBuffer o, int os, int isz) { if (_kernelCache.TryGetValue("broadcast_sub_last", out var k)) { IntPtr ap=a1.Handle,bp=b1.Handle,op=o.Handle; void** a=stackalloc void*[5]; a[0]=&ap;a[1]=&bp;a[2]=&op;a[3]=&os;a[4]=&isz; LaunchKernel(k,(uint)((os*isz+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); return; } float[] ad=DownloadBuffer(a1);float[] bd=DownloadBuffer(b1);float[] r=new float[os*isz];for(int j=0;j<os*isz;j++)r[j]=ad[j]-bd[j%isz];UploadToExistingHip(r,o); }
-    public unsafe void BroadcastMulLast(IGpuBuffer a1, IGpuBuffer b1, IGpuBuffer o, int os, int isz) { if (_kernelCache.TryGetValue("broadcast_mul_last", out var k)) { IntPtr ap=a1.Handle,bp=b1.Handle,op=o.Handle; void** a=stackalloc void*[5]; a[0]=&ap;a[1]=&bp;a[2]=&op;a[3]=&os;a[4]=&isz; LaunchKernel(k,(uint)((os*isz+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); return; } float[] ad=DownloadBuffer(a1);float[] bd=DownloadBuffer(b1);float[] r=new float[os*isz];for(int j=0;j<os*isz;j++)r[j]=ad[j]*bd[j%isz];UploadToExistingHip(r,o); }
-    public unsafe void BroadcastDivLast(IGpuBuffer a1, IGpuBuffer b1, IGpuBuffer o, int os, int isz) { if (_kernelCache.TryGetValue("broadcast_div_last", out var k)) { IntPtr ap=a1.Handle,bp=b1.Handle,op=o.Handle; void** a=stackalloc void*[5]; a[0]=&ap;a[1]=&bp;a[2]=&op;a[3]=&os;a[4]=&isz; LaunchKernel(k,(uint)((os*isz+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); return; } float[] ad=DownloadBuffer(a1);float[] bd=DownloadBuffer(b1);float[] r=new float[os*isz];for(int j=0;j<os*isz;j++)r[j]=ad[j]/(bd[j%isz]+1e-12f);UploadToExistingHip(r,o); }
+    public unsafe void ClipKernel(IGpuBuffer input, IGpuBuffer output, float min, float max, int size)
+    {
+        if (size <= 0) return;
+        IntPtr kernel = RequireResidentKernel("clip_kernel");
+        IntPtr inputPtr = input.Handle, outputPtr = output.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &inputPtr; args[1] = &outputPtr; args[2] = &min; args[3] = &max; args[4] = &size;
+        LaunchKernel(kernel, GridFor(size), DefaultBlockSize, args);
+    }
+
+    public void PowScalar(IGpuBuffer input, IGpuBuffer output, float exponent, int size)
+        => LaunchResidentScalar("pow_scalar", input, output, exponent, size);
+
+    public void FracKernel(IGpuBuffer input, IGpuBuffer output, int size)
+        => LaunchResidentUnary("frac_kernel", input, output, size, size);
+
+    public unsafe void EyeKernel(IGpuBuffer output, int n)
+    {
+        int total = n * n;
+        if (total <= 0) return;
+        IntPtr kernel = RequireResidentKernel("eye_kernel");
+        IntPtr outputPtr = output.Handle;
+        void** args = stackalloc void*[2];
+        args[0] = &outputPtr; args[1] = &n;
+        LaunchKernel(kernel, GridFor(total), DefaultBlockSize, args);
+    }
+
+    public unsafe void OneHotKernel(IGpuBuffer indices, IGpuBuffer output, int batchSize, int numClasses)
+    {
+        int total = batchSize * numClasses;
+        if (total <= 0) return;
+        IntPtr kernel = RequireResidentKernel("one_hot_kernel");
+        IntPtr indicesPtr = indices.Handle, outputPtr = output.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &indicesPtr; args[1] = &outputPtr; args[2] = &batchSize; args[3] = &numClasses;
+        LaunchKernel(kernel, GridFor(total), DefaultBlockSize, args);
+    }
+
+    public unsafe void MaskedFillKernel(IGpuBuffer input, IGpuBuffer mask, IGpuBuffer output, float fillValue, int size)
+    {
+        if (size <= 0) return;
+        IntPtr kernel = RequireResidentKernel("masked_fill_kernel");
+        IntPtr inputPtr = input.Handle, maskPtr = mask.Handle, outputPtr = output.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &inputPtr; args[1] = &maskPtr; args[2] = &outputPtr; args[3] = &fillValue; args[4] = &size;
+        LaunchKernel(kernel, GridFor(size), DefaultBlockSize, args);
+    }
+
+    public void EqualsKernel(IGpuBuffer left, IGpuBuffer right, IGpuBuffer output, int size)
+        => LaunchResidentBinary("equals_kernel", left, right, output, size, size);
+
+    public void NotEqualsKernel(IGpuBuffer left, IGpuBuffer right, IGpuBuffer output, int size)
+        => LaunchResidentBinary("not_equals_kernel", left, right, output, size, size);
+
+    public unsafe void OuterProduct(IGpuBuffer left, IGpuBuffer right, IGpuBuffer output, int m, int n)
+    {
+        int total = m * n;
+        if (total <= 0) return;
+        IntPtr kernel = RequireResidentKernel("outer_product");
+        IntPtr leftPtr = left.Handle, rightPtr = right.Handle, outputPtr = output.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &leftPtr; args[1] = &rightPtr; args[2] = &outputPtr; args[3] = &m; args[4] = &n;
+        LaunchKernel(kernel, GridFor(total), DefaultBlockSize, args);
+    }
+
+    public void BatchDotProduct(IGpuBuffer left, IGpuBuffer right, IGpuBuffer output, int batchSize, int dim)
+        => LaunchResidentAxis("batch_dot_product", left, right, output, batchSize, dim, batchSize);
+
+    public void GluForward(IGpuBuffer input, IGpuBuffer output, int outerSize, int halfDim)
+        => LaunchResidentUnary("glu_forward", input, output, outerSize, halfDim, outerSize * halfDim);
+
+    public void GeGluForward(IGpuBuffer input, IGpuBuffer output, int outerSize, int halfDim)
+        => LaunchResidentUnary("geglu_forward", input, output, outerSize, halfDim, outerSize * halfDim);
+
+    public void ReGluForward(IGpuBuffer input, IGpuBuffer output, int outerSize, int halfDim)
+        => LaunchResidentUnary("reglu_forward", input, output, outerSize, halfDim, outerSize * halfDim);
+
+    public void SwiGluForward(IGpuBuffer input, IGpuBuffer output, int outerSize, int halfDim)
+        => LaunchResidentUnary("swiglu_forward", input, output, outerSize, halfDim, outerSize * halfDim);
+
+    public void BceLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int size)
+        => LaunchResidentBinary("bce_loss", predictions, targets, loss, size, size);
+
+    public void AddScalar(IGpuBuffer input, IGpuBuffer output, float scalar, int size)
+        => LaunchResidentScalar("add_scalar", input, output, scalar, size);
+
+    public void SubScalar(IGpuBuffer input, IGpuBuffer output, float scalar, int size)
+        => LaunchResidentScalar("sub_scalar", input, output, scalar, size);
+
+    public void BroadcastAddLast(IGpuBuffer left, IGpuBuffer right, IGpuBuffer output, int outerSize, int innerSize)
+        => LaunchResidentAxis("broadcast_add_last", left, right, output, outerSize, innerSize, outerSize * innerSize);
+
+    public void BroadcastSubLast(IGpuBuffer left, IGpuBuffer right, IGpuBuffer output, int outerSize, int innerSize)
+        => LaunchResidentAxis("broadcast_sub_last", left, right, output, outerSize, innerSize, outerSize * innerSize);
+
+    public void BroadcastMulLast(IGpuBuffer left, IGpuBuffer right, IGpuBuffer output, int outerSize, int innerSize)
+        => LaunchResidentAxis("broadcast_mul_last", left, right, output, outerSize, innerSize, outerSize * innerSize);
+
+    public void BroadcastDivLast(IGpuBuffer left, IGpuBuffer right, IGpuBuffer output, int outerSize, int innerSize)
+        => LaunchResidentAxis("broadcast_div_last", left, right, output, outerSize, innerSize, outerSize * innerSize);
     public unsafe void DotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size)
     {
         // Issue #382: deterministic variant fixes accumulation order by
@@ -36,16 +126,13 @@ public sealed partial class HipBackend
         // threadIdx.x stride is used) and writing `*result = sum` instead of
         // atomicAdd.
         string kname = GpuDeterminism.IsActive ? "dot_product_deterministic" : "dot_product";
-        if (_kernelCache.TryGetValue(kname, out var k))
-        {
-            IntPtr ap=a.Handle,bp=b.Handle,op=output.Handle;
-            void** ar=stackalloc void*[4];
-            ar[0]=&ap;ar[1]=&bp;ar[2]=&op;ar[3]=&size;
-            uint grid = GpuDeterminism.IsActive ? 1u : (uint)((size+DefaultBlockSize-1)/DefaultBlockSize);
-            LaunchKernel(k, grid, DefaultBlockSize, ar);
-            return;
-        }
-        float[] ad=DownloadBuffer(a);float[] bd=DownloadBuffer(b);float s=0;for(int i=0;i<size;i++)s+=ad[i]*bd[i]; UploadToExistingHip(new[]{s},output);
+        if (size <= 0) return;
+        IntPtr kernel = RequireResidentKernel(kname);
+        IntPtr aPtr = a.Handle, bPtr = b.Handle, outputPtr = output.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &aPtr; args[1] = &bPtr; args[2] = &outputPtr; args[3] = &size;
+        uint grid = GpuDeterminism.IsActive ? 1u : GridFor(size);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
     public unsafe void StridedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size, int strideA, int strideB, int count)
     {
@@ -54,29 +141,84 @@ public sealed partial class HipBackend
         // (a, b, result, aSize, bSize, bOffset, bStride) — preserve the existing
         // wire-up; argument-name mismatch is a separate concern.
         string kname = GpuDeterminism.IsActive ? "strided_dot_product_deterministic" : "strided_dot_product";
-        if (_kernelCache.TryGetValue(kname, out var k))
-        {
-            IntPtr ap=a.Handle,bp=b.Handle,op=output.Handle;
-            void** ar=stackalloc void*[7];
-            ar[0]=&ap;ar[1]=&bp;ar[2]=&op;ar[3]=&size;ar[4]=&strideA;ar[5]=&strideB;ar[6]=&count;
-            uint grid = GpuDeterminism.IsActive ? 1u : (uint)((count+DefaultBlockSize-1)/DefaultBlockSize);
-            LaunchKernel(k, grid, DefaultBlockSize, ar);
-            return;
-        }
-        float[] ad=DownloadBuffer(a);float[] bd=DownloadBuffer(b);float[] r=new float[count];for(int c2=0;c2<count;c2++){float s=0;for(int i=0;i<size;i++)s+=ad[c2*strideA+i]*bd[c2*strideB+i];r[c2]=s;}UploadToExistingHip(r,output);
+        if (size <= 0 || count <= 0) return;
+        IntPtr kernel = RequireResidentKernel(kname);
+        IntPtr aPtr = a.Handle, bPtr = b.Handle, outputPtr = output.Handle;
+        void** args = stackalloc void*[7];
+        args[0] = &aPtr; args[1] = &bPtr; args[2] = &outputPtr; args[3] = &size;
+        args[4] = &strideA; args[5] = &strideB; args[6] = &count;
+        uint grid = GpuDeterminism.IsActive ? 1u : GridFor(count);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
-    public unsafe void BatchedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int batchSize, int dim) { if (_kernelCache.TryGetValue("batched_dot_product", out var k)) { IntPtr ap=a.Handle,bp=b.Handle,op=output.Handle; void** ar=stackalloc void*[5]; ar[0]=&ap;ar[1]=&bp;ar[2]=&op;ar[3]=&batchSize;ar[4]=&dim; LaunchKernel(k,(uint)((batchSize+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,ar); return; } float[] ad=DownloadBuffer(a);float[] bd=DownloadBuffer(b);float[] r=new float[batchSize];for(int i=0;i<batchSize;i++){float s=0;for(int j=0;j<dim;j++)s+=ad[i*dim+j]*bd[i*dim+j];r[i]=s;}UploadToExistingHip(r,output); }
 
-    private void UploadToExistingHip(float[] data, IGpuBuffer buffer)
+    public void BatchedDotProduct(IGpuBuffer left, IGpuBuffer right, IGpuBuffer output, int batchSize, int dim)
+        => LaunchResidentAxis("batched_dot_product", left, right, output, batchSize, dim, batchSize);
+
+    private IntPtr RequireResidentKernel(string kernelName)
     {
-        unsafe
-        {
-            fixed (float* src = data)
-            {
-                var sizeBytes = (UIntPtr)(data.Length * sizeof(float));
-                HipNativeBindings.hipMemcpy(buffer.Handle, (IntPtr)src, sizeBytes, HipMemcpyKind.HostToDevice);
-            }
-        }
+        if (!_kernelCache.TryGetValue(kernelName, out IntPtr kernel))
+            throw new InvalidOperationException($"HIP kernel not found: {kernelName}");
+        return kernel;
+    }
+
+    private static uint GridFor(int workSize)
+        => (uint)((workSize + DefaultBlockSize - 1) / DefaultBlockSize);
+
+    private unsafe void LaunchResidentUnary(string kernelName, IGpuBuffer input, IGpuBuffer output, int size, int workSize)
+    {
+        if (workSize <= 0) return;
+        IntPtr kernel = RequireResidentKernel(kernelName);
+        IntPtr inputPtr = input.Handle, outputPtr = output.Handle;
+        void** args = stackalloc void*[3];
+        args[0] = &inputPtr; args[1] = &outputPtr; args[2] = &size;
+        LaunchKernel(kernel, GridFor(workSize), DefaultBlockSize, args);
+    }
+
+    private unsafe void LaunchResidentUnary(
+        string kernelName, IGpuBuffer input, IGpuBuffer output,
+        int outerSize, int innerSize, int workSize)
+    {
+        if (workSize <= 0) return;
+        IntPtr kernel = RequireResidentKernel(kernelName);
+        IntPtr inputPtr = input.Handle, outputPtr = output.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &inputPtr; args[1] = &outputPtr; args[2] = &outerSize; args[3] = &innerSize;
+        LaunchKernel(kernel, GridFor(workSize), DefaultBlockSize, args);
+    }
+
+    private unsafe void LaunchResidentScalar(
+        string kernelName, IGpuBuffer input, IGpuBuffer output, float scalar, int size)
+    {
+        if (size <= 0) return;
+        IntPtr kernel = RequireResidentKernel(kernelName);
+        IntPtr inputPtr = input.Handle, outputPtr = output.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &inputPtr; args[1] = &outputPtr; args[2] = &scalar; args[3] = &size;
+        LaunchKernel(kernel, GridFor(size), DefaultBlockSize, args);
+    }
+
+    private unsafe void LaunchResidentBinary(
+        string kernelName, IGpuBuffer left, IGpuBuffer right, IGpuBuffer output, int size, int workSize)
+    {
+        if (workSize <= 0) return;
+        IntPtr kernel = RequireResidentKernel(kernelName);
+        IntPtr leftPtr = left.Handle, rightPtr = right.Handle, outputPtr = output.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &leftPtr; args[1] = &rightPtr; args[2] = &outputPtr; args[3] = &size;
+        LaunchKernel(kernel, GridFor(workSize), DefaultBlockSize, args);
+    }
+
+    private unsafe void LaunchResidentAxis(
+        string kernelName, IGpuBuffer left, IGpuBuffer right, IGpuBuffer output,
+        int outerSize, int innerSize, int workSize)
+    {
+        if (workSize <= 0) return;
+        IntPtr kernel = RequireResidentKernel(kernelName);
+        IntPtr leftPtr = left.Handle, rightPtr = right.Handle, outputPtr = output.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &leftPtr; args[1] = &rightPtr; args[2] = &outputPtr;
+        args[3] = &outerSize; args[4] = &innerSize;
+        LaunchKernel(kernel, GridFor(workSize), DefaultBlockSize, args);
     }
 
     // --- Split-buffer native Complex<T> operations (HIP dispatch) ---
@@ -204,21 +346,12 @@ public sealed partial class HipBackend
         ValidateHipSplitBuffers(n, nameof(SplitComplexTopK), inReal, inImag, outReal, outImag);
         if (!_kernelCache.TryGetValue("split_complex_topk", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: split_complex_topk");
-        // Compute threshold on CPU
-        var magBuf = AllocateBuffer(n);
-        try
-        {
-            SplitComplexMagnitudeSquared(inReal, inImag, magBuf, n);
-            var magData = DownloadBuffer(magBuf);
-            Array.Sort(magData); Array.Reverse(magData);
-            float threshold = k <= n ? magData[Math.Min(k, n) - 1] : 0f;
-            uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
-            IntPtr pIR = inReal.Handle, pII = inImag.Handle, pOR = outReal.Handle, pOI = outImag.Handle;
-            void** args = stackalloc void*[6];
-            args[0] = &pIR; args[1] = &pII; args[2] = &pOR; args[3] = &pOI; args[4] = &threshold; args[5] = &n;
-            LaunchKernel(kernel, grid, (uint)DefaultBlockSize, args);
-        }
-        finally { magBuf.Dispose(); }
+        k = Math.Min(k, n);
+        uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pIR = inReal.Handle, pII = inImag.Handle, pOR = outReal.Handle, pOI = outImag.Handle;
+        void** args = stackalloc void*[6];
+        args[0] = &pIR; args[1] = &pII; args[2] = &pOR; args[3] = &pOI; args[4] = &k; args[5] = &n;
+        LaunchKernel(kernel, grid, (uint)DefaultBlockSize, args);
     }
 
     public unsafe void SoftmaxRows(IGpuBuffer input, IGpuBuffer output, int rows, int cols)
@@ -567,21 +700,39 @@ public sealed partial class HipBackend
         IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target, int n, int d, int vocab)
         => FusedCeLaunch("fused_linear_ce_dense", hidden, weight, bias, target, n, d, vocab);
 
+    public unsafe void FusedLinearCrossEntropyIndex(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer targetIds,
+        IGpuBuffer meanLoss, int n, int d, int vocab)
+        => FusedCeLaunchResident("fused_linear_ce_index", hidden, weight, bias, targetIds, meanLoss, n, d, vocab);
+
+    public unsafe void FusedLinearCrossEntropyDense(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target,
+        IGpuBuffer meanLoss, int n, int d, int vocab)
+        => FusedCeLaunchResident("fused_linear_ce_dense", hidden, weight, bias, target, meanLoss, n, d, vocab);
+
     private unsafe float FusedCeLaunch(
         string kernelName, IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer tgt, int n, int d, int vocab)
+    {
+        using var lossBuf = AllocateBuffer(1);
+        FusedCeLaunchResident(kernelName, hidden, weight, bias, tgt, lossBuf, n, d, vocab);
+        return DownloadBuffer(lossBuf)[0];
+    }
+
+    private unsafe void FusedCeLaunchResident(
+        string kernelName, IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer tgt,
+        IGpuBuffer meanLoss, int n, int d, int vocab)
     {
         if (n <= 0 || d <= 0 || vocab <= 0)
             throw new ArgumentOutOfRangeException(nameof(n), "Fused CE dimensions (n, d, vocab) must be positive.");
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
             throw new InvalidOperationException($"HIP kernel not found: {kernelName}");
-        using var lossBuf = AllocateBuffer(1); // zeroed
-        IntPtr ph = hidden.Handle, pw = weight.Handle, pb = bias.Handle, pt = tgt.Handle, pl = lossBuf.Handle;
+        Fill(meanLoss, 0f, 1);
+        IntPtr ph = hidden.Handle, pw = weight.Handle, pb = bias.Handle, pt = tgt.Handle, pl = meanLoss.Handle;
         void** args = stackalloc void*[8];
         args[0] = &ph; args[1] = &pw; args[2] = &pb; args[3] = &pt; args[4] = &pl;
         args[5] = &n; args[6] = &d; args[7] = &vocab;
         uint total = (uint)n;
         LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
-        var loss = DownloadBuffer(lossBuf);
-        return loss[0] / n;
+        Scale(meanLoss, meanLoss, 1f / n, 1);
     }
 }

@@ -1409,6 +1409,20 @@ extern ""C"" __global__ __launch_bounds__(256) void coordinate_descent_step(
 // DROPOUT AND EMBEDDING KERNELS
 // ===========================================================================
 
+extern ""C"" __global__ __launch_bounds__(256) void dropout_dotnet_random_serial(
+    const float* input, float* output, float* mask, int size, float rate, int seed, int training)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    if (!training || rate <= 0.0f) { for (int i = 0; i < size; ++i) { mask[i] = 1.0f; output[i] = input[i]; } return; }
+    if (rate >= 1.0f) { for (int i = 0; i < size; ++i) { mask[i] = 0.0f; output[i] = 0.0f; } return; }
+    int seedArray[56]; for (int i = 0; i < 56; ++i) seedArray[i] = 0;
+    int mj = 161803398 - seed, mk = 1; seedArray[55] = mj;
+    for (int i = 1; i < 55; ++i) { int ii = (21 * i) % 55; seedArray[ii] = mk; mk = mj - mk; if (mk < 0) mk += 2147483647; mj = seedArray[ii]; }
+    for (int pass = 1; pass < 5; ++pass) for (int i = 1; i < 56; ++i) { seedArray[i] -= seedArray[1 + (i + 30) % 55]; if (seedArray[i] < 0) seedArray[i] += 2147483647; }
+    int inext = 0, inextp = 21; float scale = 1.0f / (1.0f - rate);
+    for (int i = 0; i < size; ++i) { if (++inext >= 56) inext = 1; if (++inextp >= 56) inextp = 1; int sample = seedArray[inext] - seedArray[inextp]; if (sample == 2147483647) --sample; if (sample < 0) sample += 2147483647; seedArray[inext] = sample; bool keep = ((double)sample / 2147483647.0) > (double)rate; mask[i] = keep ? 1.0f : 0.0f; output[i] = keep ? input[i] * scale : 0.0f; }
+}
+
 extern ""C"" __global__ __launch_bounds__(256) void dropout_forward(
     const float* input, float* output, const float* mask,
     float scale, int size)
@@ -2507,7 +2521,7 @@ extern ""C"" __global__ __launch_bounds__(256) void batched_gemm(
             "lbfgs_copy_vector", "lbfgs_dot_product_reduce", "lbfgs_reduce_partials", "lbfgs_axpy",
             "lbfgs_scale_vector", "lbfgs_apply_direction", "lbfgs_compute_rho", "lbfgs_update_history",
             "bfgs_step", "levenberg_marquardt_step", "trust_region_step", "admm_step", "newton_method_step", "dfp_step", "coordinate_descent_step",
-            "dropout_forward", "dropout_backward", "embedding_forward", "embedding_backward",
+            "dropout_dotnet_random_serial", "dropout_forward", "dropout_backward", "embedding_forward", "embedding_backward",
             "embedding_backward_deterministic",
             "transpose_2d", "batched_transpose", "permute_general",
             // LSTM kernels

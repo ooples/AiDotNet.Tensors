@@ -523,6 +523,97 @@ public sealed unsafe class VulkanBufferTransfer : IDisposable
         _device.SubmitAndWait(cmdBuffer, threadRes.Fence);
     }
 
+    /// <summary>Copies a byte range directly between device-local buffers.</summary>
+    public void CopyDeviceToDevice(
+        VulkanBuffer source, ulong sourceOffset,
+        VulkanBuffer destination, ulong destinationOffset,
+        ulong byteCount)
+    {
+        if (_disposed)
+            throw new ObjectDisposedException(nameof(VulkanBufferTransfer));
+        if (source is null) throw new ArgumentNullException(nameof(source));
+        if (destination is null) throw new ArgumentNullException(nameof(destination));
+        if (sourceOffset + byteCount > source.SizeInBytes)
+            throw new ArgumentOutOfRangeException(nameof(byteCount));
+        if (destinationOffset + byteCount > destination.SizeInBytes)
+            throw new ArgumentOutOfRangeException(nameof(byteCount));
+        if (byteCount == 0) return;
+
+        var threadRes = _device.AcquireThreadResources();
+        var cmdBuffer = threadRes.CommandBuffer;
+        VulkanNativeBindings.vkResetCommandBuffer(cmdBuffer, 0);
+
+        var beginInfo = new VkCommandBufferBeginInfo
+        {
+            sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            pNext = null,
+            flags = VkCommandBufferUsageFlags.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            pInheritanceInfo = null
+        };
+        VulkanNativeBindings.vkBeginCommandBuffer(cmdBuffer, &beginInfo);
+
+        var preBarriers = stackalloc VkBufferMemoryBarrier[2];
+        preBarriers[0] = new VkBufferMemoryBarrier
+        {
+            sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            pNext = null,
+            srcAccessMask = VkAccessFlags.VK_ACCESS_SHADER_WRITE_BIT,
+            dstAccessMask = VkAccessFlags.VK_ACCESS_TRANSFER_READ_BIT,
+            srcQueueFamilyIndex = VulkanNativeBindings.VK_QUEUE_FAMILY_IGNORED,
+            dstQueueFamilyIndex = VulkanNativeBindings.VK_QUEUE_FAMILY_IGNORED,
+            buffer = source.Handle,
+            offset = sourceOffset,
+            size = byteCount
+        };
+        preBarriers[1] = new VkBufferMemoryBarrier
+        {
+            sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            pNext = null,
+            srcAccessMask = VkAccessFlags.VK_ACCESS_SHADER_READ_BIT | VkAccessFlags.VK_ACCESS_SHADER_WRITE_BIT,
+            dstAccessMask = VkAccessFlags.VK_ACCESS_TRANSFER_WRITE_BIT,
+            srcQueueFamilyIndex = VulkanNativeBindings.VK_QUEUE_FAMILY_IGNORED,
+            dstQueueFamilyIndex = VulkanNativeBindings.VK_QUEUE_FAMILY_IGNORED,
+            buffer = destination.Handle,
+            offset = destinationOffset,
+            size = byteCount
+        };
+        VulkanNativeBindings.vkCmdPipelineBarrier(
+            cmdBuffer,
+            VkPipelineStageFlags.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VkPipelineStageFlags.VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, IntPtr.Zero, 2, preBarriers, 0, IntPtr.Zero);
+
+        var copyRegion = new VkBufferCopy
+        {
+            srcOffset = sourceOffset,
+            dstOffset = destinationOffset,
+            size = byteCount
+        };
+        VulkanNativeBindings.vkCmdCopyBuffer(
+            cmdBuffer, source.Handle, destination.Handle, 1, &copyRegion);
+
+        var postBarrier = new VkBufferMemoryBarrier
+        {
+            sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            pNext = null,
+            srcAccessMask = VkAccessFlags.VK_ACCESS_TRANSFER_WRITE_BIT,
+            dstAccessMask = VkAccessFlags.VK_ACCESS_SHADER_READ_BIT | VkAccessFlags.VK_ACCESS_SHADER_WRITE_BIT,
+            srcQueueFamilyIndex = VulkanNativeBindings.VK_QUEUE_FAMILY_IGNORED,
+            dstQueueFamilyIndex = VulkanNativeBindings.VK_QUEUE_FAMILY_IGNORED,
+            buffer = destination.Handle,
+            offset = destinationOffset,
+            size = byteCount
+        };
+        VulkanNativeBindings.vkCmdPipelineBarrier(
+            cmdBuffer,
+            VkPipelineStageFlags.VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VkPipelineStageFlags.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 0, IntPtr.Zero, 1, &postBarrier, 0, IntPtr.Zero);
+
+        VulkanNativeBindings.vkEndCommandBuffer(cmdBuffer);
+        _device.SubmitAndWait(cmdBuffer, threadRes.Fence);
+    }
+
     /// <summary>
     /// Copies data from a device buffer to a staging buffer.
     /// </summary>

@@ -10,101 +10,189 @@ public sealed partial class WebGpuBackend
 {
     #region Attention Operations
 
-    public void ScaledDotProductAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
-        IGpuBuffer output, IGpuBuffer? attentionWeights, IGpuBuffer? mask,
-        int batch, int numHeads, int seqLen, int headDim, float scale, bool isCausal)
+    private static int CheckedAttentionSize(string name, params int[] dimensions)
     {
-        // AttentionSource: binding(0)=query, binding(1)=key, binding(2)=value, binding(3)=output,
-        // binding(4)=mask, binding(5)=uniform
-        // Uniform: batch_heads, seq_len, head_dim, is_causal, scale, has_mask, pad, pad
-        int batchHeads = batch * numHeads;
-        bool hasMask = mask is not null;
-        var uniforms = new float[]
+        int size = 1;
+        foreach (int dimension in dimensions)
         {
-            BitConverter.Int32BitsToSingle(batchHeads),
-            BitConverter.Int32BitsToSingle(seqLen),
+            if (dimension <= 0)
+                throw new ArgumentOutOfRangeException(name, $"Attention dimensions must be positive; got {dimension}.");
+            size = checked(size * dimension);
+        }
+        return size;
+    }
+
+    private static void RequireAttentionBuffer(IGpuBuffer buffer, int size, string name)
+    {
+        if (buffer is null) throw new ArgumentNullException(name);
+        if (buffer.Size < size)
+            throw new ArgumentException($"{name} requires at least {size} elements, but the buffer has {buffer.Size}.", name);
+    }
+
+    private static float[] MakeAttentionParams(
+        int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim,
+        int queriesPerKV, float scale, bool isCausal, bool hasBias, int biasBatchStride,
+        bool flag0, bool flag1 = false, int booleanMaskMode = 0)
+    {
+        return new float[]
+        {
+            BitConverter.Int32BitsToSingle(batch),
+            BitConverter.Int32BitsToSingle(numQHeads),
+            BitConverter.Int32BitsToSingle(numKVHeads),
+            BitConverter.Int32BitsToSingle(seqQ),
+            BitConverter.Int32BitsToSingle(seqK),
             BitConverter.Int32BitsToSingle(headDim),
+            BitConverter.Int32BitsToSingle(queriesPerKV),
             BitConverter.Int32BitsToSingle(isCausal ? 1 : 0),
             scale,
-            BitConverter.Int32BitsToSingle(hasMask ? 1 : 0),
+            BitConverter.Int32BitsToSingle(hasBias ? 1 : 0),
+            BitConverter.Int32BitsToSingle(biasBatchStride),
+            BitConverter.Int32BitsToSingle(flag0 ? 1 : 0),
+            BitConverter.Int32BitsToSingle(flag1 ? 1 : 0),
+            BitConverter.Int32BitsToSingle(booleanMaskMode),
             0, 0
         };
-        int totalElements = batchHeads * seqLen * headDim;
-        // Use the mask buffer if provided, otherwise pass the shared dummy buffer for the binding slot
-        IGpuBuffer maskBuffer = mask ?? (IGpuBuffer)SharedDummyBuffer;
-        Dispatch5BufferAsync("Attention", WebGpuKernels.AttentionSource, "scaled_dot_product_attention",
-            query, key, value, output, maskBuffer, uniforms, totalElements).GetAwaiter().GetResult();
-        // attentionWeights not produced by this kernel; fill with zeros if requested
+    }
+
+    private void AttentionForwardResident(
+        IGpuBuffer query, IGpuBuffer key, IGpuBuffer value, IGpuBuffer output,
+        IGpuBuffer? attentionWeights, IGpuBuffer? softmaxStats, IGpuBuffer? attentionBias,
+        int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim,
+        float scale, bool isCausal, int biasBatchStride, int booleanMaskMode = 0)
+    {
+        if (numKVHeads <= 0 || numQHeads <= 0 || numQHeads % numKVHeads != 0)
+            throw new ArgumentException("The number of query heads must be divisible by the number of KV heads.");
+        int queriesPerKV = numQHeads / numKVHeads;
+        int querySize = CheckedAttentionSize(nameof(query), batch, numQHeads, seqQ, headDim);
+        int kvSize = CheckedAttentionSize(nameof(key), batch, numKVHeads, seqK, headDim);
+        int rowCount = CheckedAttentionSize(nameof(output), batch, numQHeads, seqQ);
+        int outputSize = checked(rowCount * headDim);
+        int weightsSize = checked(rowCount * seqK);
+
+        RequireAttentionBuffer(query, querySize, nameof(query));
+        RequireAttentionBuffer(key, kvSize, nameof(key));
+        RequireAttentionBuffer(value, kvSize, nameof(value));
+        RequireAttentionBuffer(output, outputSize, nameof(output));
         if (attentionWeights is not null)
-            Fill(attentionWeights, 0f, batchHeads * seqLen * seqLen);
+            RequireAttentionBuffer(attentionWeights, weightsSize, nameof(attentionWeights));
+        if (softmaxStats is not null)
+            RequireAttentionBuffer(softmaxStats, rowCount, nameof(softmaxStats));
+
+        if (attentionBias is not null)
+        {
+            int biasHeadSize = booleanMaskMode == 1
+                ? CheckedAttentionSize(nameof(attentionBias), seqQ, seqK)
+                : CheckedAttentionSize(nameof(attentionBias), numQHeads, seqQ, seqK);
+            if (biasBatchStride != 0 && biasBatchStride < biasHeadSize)
+                throw new ArgumentOutOfRangeException(nameof(biasBatchStride),
+                    "A nonzero bias batch stride must span every head and query row.");
+            int biasSize = biasBatchStride == 0
+                ? biasHeadSize
+                : checked((batch - 1) * biasBatchStride + biasHeadSize);
+            RequireAttentionBuffer(attentionBias, biasSize, nameof(attentionBias));
+        }
+
+        var uniforms = MakeAttentionParams(batch, numQHeads, numKVHeads, seqQ, seqK, headDim,
+            queriesPerKV, scale, isCausal, attentionBias is not null, biasBatchStride,
+            attentionWeights is not null, softmaxStats is not null, booleanMaskMode);
+        IGpuBuffer dummy = SharedDummyBuffer;
+        DispatchNBufferAsync("AttentionResident", WebGpuKernels.AttentionSource, "attention_forward_resident",
+            new[]
+            {
+                query, key, value, output,
+                attentionBias ?? dummy, attentionWeights ?? dummy, softmaxStats ?? dummy
+            }, uniforms, rowCount).GetAwaiter().GetResult();
+    }
+
+    private void AttentionBackwardResident(
+        IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
+        IGpuBuffer? attentionWeights, IGpuBuffer? attentionBias,
+        IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
+        int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim,
+        float scale, bool isCausal, int queriesPerKV, int biasBatchStride)
+    {
+        if (queriesPerKV <= 0 || (numQHeads - 1) / queriesPerKV >= numKVHeads)
+            throw new ArgumentOutOfRangeException(nameof(queriesPerKV),
+                "queriesPerKV must map every query head to an existing KV head.");
+        int querySize = CheckedAttentionSize(nameof(query), batch, numQHeads, seqQ, headDim);
+        int kvSize = CheckedAttentionSize(nameof(key), batch, numKVHeads, seqK, headDim);
+        int rowCount = CheckedAttentionSize(nameof(gradOutput), batch, numQHeads, seqQ);
+        int weightsSize = checked(rowCount * seqK);
+
+        RequireAttentionBuffer(gradOutput, querySize, nameof(gradOutput));
+        RequireAttentionBuffer(query, querySize, nameof(query));
+        RequireAttentionBuffer(key, kvSize, nameof(key));
+        RequireAttentionBuffer(value, kvSize, nameof(value));
+        RequireAttentionBuffer(gradQuery, querySize, nameof(gradQuery));
+        RequireAttentionBuffer(gradKey, kvSize, nameof(gradKey));
+        RequireAttentionBuffer(gradValue, kvSize, nameof(gradValue));
+        if (attentionWeights is not null)
+            RequireAttentionBuffer(attentionWeights, weightsSize, nameof(attentionWeights));
+
+        if (attentionBias is not null)
+        {
+            int biasHeadSize = CheckedAttentionSize(nameof(attentionBias), numQHeads, seqQ, seqK);
+            if (biasBatchStride != 0 && biasBatchStride < biasHeadSize)
+                throw new ArgumentOutOfRangeException(nameof(biasBatchStride));
+            int biasSize = biasBatchStride == 0
+                ? biasHeadSize
+                : checked((batch - 1) * biasBatchStride + biasHeadSize);
+            RequireAttentionBuffer(attentionBias, biasSize, nameof(attentionBias));
+        }
+
+        var uniforms = MakeAttentionParams(batch, numQHeads, numKVHeads, seqQ, seqK, headDim,
+            queriesPerKV, scale, isCausal, attentionBias is not null, biasBatchStride,
+            attentionWeights is not null);
+        IGpuBuffer dummy = SharedDummyBuffer;
+        var queryBuffers = new[]
+        {
+            gradOutput, query, key, value, attentionWeights ?? dummy, attentionBias ?? dummy,
+            gradQuery, dummy
+        };
+        DispatchNBufferAsync("AttentionBackwardResident", WebGpuKernels.AttentionBackwardResidentSource,
+            "attention_backward_resident_query", queryBuffers, uniforms, querySize).GetAwaiter().GetResult();
+        var keyValueBuffers = new[]
+        {
+            gradOutput, query, key, value, attentionWeights ?? dummy, attentionBias ?? dummy,
+            gradKey, gradValue
+        };
+        DispatchNBufferAsync("AttentionBackwardResident", WebGpuKernels.AttentionBackwardResidentSource,
+            "attention_backward_resident_key_value", keyValueBuffers, uniforms, kvSize).GetAwaiter().GetResult();
+    }
+    public void ScaledDotProductAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
+        IGpuBuffer output, IGpuBuffer? attentionWeights, IGpuBuffer? mask,
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
+    {
+        int sharedMaskSize = CheckedAttentionSize(nameof(mask), seqQ, seqK);
+        int fullMaskSize = CheckedAttentionSize(nameof(mask), batch, numHeads, seqQ, seqK);
+        if (mask is not null && mask.Size < sharedMaskSize)
+            throw new ArgumentException("The attention mask must contain at least seqQ * seqK elements.", nameof(mask));
+        int maskMode = mask is null ? 0 : mask.Size >= fullMaskSize ? 2 : 1;
+        int maskBatchStride = maskMode == 2 ? checked(numHeads * seqQ * seqK) : 0;
+        AttentionForwardResident(query, key, value, output, attentionWeights, null, mask,
+            batch, numHeads, numHeads, seqQ, seqK, headDim, scale, isCausal, maskBatchStride, maskMode);
     }
 
     public void ScaledDotProductAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer attentionWeights, IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
-        int batch, int numHeads, int seqLen, int headDim, float scale, bool isCausal)
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
     {
-        int batchHeads = batch * numHeads;
-        int total = batchHeads * seqLen * headDim;
-        var uniforms = new float[]
-        {
-            BitConverter.Int32BitsToSingle(batchHeads),
-            BitConverter.Int32BitsToSingle(seqLen),
-            BitConverter.Int32BitsToSingle(headDim),
-            0
-        };
-        // Compute gradQuery via attention_backward_query kernel
-        // 6-buffer: gradOutput, query, key, value, gradQuery, gradKV_combined
-        using var gradKV = (WebGpuBuffer)AllocateBuffer(total * 2);
-        Dispatch6BufferAsync("AttentionBackward", WebGpuKernels.AttentionBackwardSource, "attention_backward_query",
-            gradOutput, query, key, value, gradQuery, gradKV, uniforms, total).GetAwaiter().GetResult();
-        // Compute gradKey and gradValue via attention_backward_kv kernel
-        Dispatch6BufferAsync("AttentionBackward", WebGpuKernels.AttentionBackwardSource, "attention_backward_kv",
-            gradOutput, query, key, value, gradKey, gradKV, uniforms, total).GetAwaiter().GetResult();
-        // Copy gradKV results: first half = gradKey, second half = gradValue
-        Copy(gradKV, 0, gradKey, 0, total);
-        Copy(gradKV, total, gradValue, 0, total);
+        AttentionBackwardResident(gradOutput, query, key, value, attentionWeights, null,
+            gradQuery, gradKey, gradValue, batch, numHeads, numHeads, seqQ, seqK, headDim,
+            scale, isCausal, 1, 0);
     }
 
     public void FlashAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer? mask, int batch, int numHeads, int seqLen, int headDim, float scale, bool isCausal) =>
-        ScaledDotProductAttention(query, key, value, output, null, mask, batch, numHeads, seqLen, headDim, scale, isCausal);
+        ScaledDotProductAttention(query, key, value, output, null, mask, batch, numHeads, seqLen, seqLen, headDim, scale, isCausal);
 
     public void FlashAttentionV2(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer softmaxStats,
         int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal,
         IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
     {
-        // Use the full sequence lengths: seqQ for queries, seqK for keys/values.
-        // When seqQ == seqK, delegate to standard attention. When they differ,
-        // we must handle the asymmetric case.
-        int batchHeads = batch * numHeads;
-        int totalElements = batchHeads * seqQ * headDim;
-        // When seqQ == seqK, use the standard attention path
-        if (seqQ == seqK)
-        {
-            ScaledDotProductAttention(query, key, value, output, null, attentionBias,
-                batch, numHeads, seqQ, headDim, scale, isCausal);
-        }
-        else
-        {
-            // For asymmetric lengths, use seqK for the kernel's KV loop range.
-            // The output still covers seqQ positions, so we dispatch over seqQ.
-            var asymUniforms = new float[]
-            {
-                BitConverter.Int32BitsToSingle(batchHeads),
-                BitConverter.Int32BitsToSingle(seqK),
-                BitConverter.Int32BitsToSingle(headDim),
-                BitConverter.Int32BitsToSingle(isCausal ? 1 : 0),
-                scale,
-                BitConverter.Int32BitsToSingle(attentionBias is not null ? 1 : 0),
-                0, 0
-            };
-            IGpuBuffer maskBuffer = attentionBias ?? (IGpuBuffer)SharedDummyBuffer;
-            Dispatch5BufferAsync("Attention", WebGpuKernels.AttentionSource, "scaled_dot_product_attention",
-                query, key, value, output, maskBuffer, asymUniforms, totalElements).GetAwaiter().GetResult();
-        }
-        // Fill softmaxStats with per-head logsumexp values (zeros for now, actual stats would require a separate kernel)
-        Fill(softmaxStats, 0f, batch * numHeads * seqQ);
+        AttentionForwardResident(query, key, value, output, null, softmaxStats, attentionBias,
+            batch, numHeads, numHeads, seqQ, seqK, headDim, scale, isCausal, biasBatchStride);
     }
 
     public void FlashAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
@@ -113,57 +201,17 @@ public sealed partial class WebGpuBackend
         int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal,
         IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
     {
-        // Delegate to the standard attention backward with seqQ as the shared length.
-        // When seqQ != seqK, we use seqQ for the query gradient and seqK for KV gradients.
-        // Flash attention does not materialize attention weights, so pass a dummy buffer
-        // for the attentionWeights slot (the backward kernel recomputes weights internally).
-        int seqLen = Math.Min(seqQ, seqK);
-        IGpuBuffer dummyAttnWeights = SharedDummyBuffer;
-        ScaledDotProductAttentionBackward(gradOutput, query, key, value, dummyAttnWeights, gradQuery, gradKey, gradValue,
-            batch, numHeads, seqLen, headDim, scale, isCausal);
-        // Zero-fill any remaining elements if seqQ > seqK or vice versa
-        if (seqQ > seqLen)
-        {
-            int extraQ = batch * numHeads * (seqQ - seqLen) * headDim;
-            if (extraQ > 0)
-            {
-                Fill(gradQuery, 0f, batch * numHeads * seqQ * headDim);
-                ScaledDotProductAttentionBackward(gradOutput, query, key, value, dummyAttnWeights, gradQuery, gradKey, gradValue,
-                    batch, numHeads, seqLen, headDim, scale, isCausal);
-            }
-        }
+        AttentionBackwardResident(gradOutput, query, key, value, null, attentionBias,
+            gradQuery, gradKey, gradValue, batch, numHeads, numHeads, seqQ, seqK, headDim,
+            scale, isCausal, 1, biasBatchStride);
     }
 
     public void GroupedQueryAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer? attentionWeights,
         int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
     {
-        int seqLen = Math.Min(seqQ, seqK);
-        if (numQHeads == numKVHeads)
-        {
-            // Standard multi-head attention: no head grouping needed
-            ScaledDotProductAttention(query, key, value, output, attentionWeights, null, batch, numQHeads, seqLen, headDim, scale, isCausal);
-        }
-        else
-        {
-            // Grouped Query Attention: map Q-heads to KV-heads via head_ratio
-            // Use dedicated GQA kernel that computes kv_head = q_head / (numQHeads / numKVHeads)
-            int totalOutput = batch * numQHeads * seqLen * headDim;
-            var uniforms = new float[]
-            {
-                BitConverter.Int32BitsToSingle(batch),
-                BitConverter.Int32BitsToSingle(numQHeads),
-                BitConverter.Int32BitsToSingle(numKVHeads),
-                BitConverter.Int32BitsToSingle(seqLen),
-                BitConverter.Int32BitsToSingle(headDim),
-                0, 0, 0
-            };
-            Dispatch4BufferAsync("GroupedQueryAttention", WebGpuKernels.GroupedQueryAttentionSource, "grouped_query_attention",
-                query, key, value, output, uniforms, totalOutput).GetAwaiter().GetResult();
-        }
-        // attentionWeights not produced by these kernels; fill with zeros if requested
-        if (attentionWeights is not null)
-            Fill(attentionWeights, 0f, batch * numQHeads * seqLen * seqLen);
+        AttentionForwardResident(query, key, value, output, attentionWeights, null, null,
+            batch, numQHeads, numKVHeads, seqQ, seqK, headDim, scale, isCausal, 0);
     }
 
     public void GroupedQueryAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
@@ -172,96 +220,9 @@ public sealed partial class WebGpuBackend
         int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale,
         int numQueriesPerKV)
     {
-        // Compute gradients using the attention backward kernel.
-        // For GQA, multiple Q-heads share the same KV-head, so KV gradients must be accumulated.
-        int seqLen = Math.Min(seqQ, seqK);
-        if (numQHeads == numKVHeads)
-        {
-            ScaledDotProductAttentionBackward(gradOutput, query, key, value, attentionWeights,
-                gradQuery, gradKey, gradValue, batch, numQHeads, seqLen, headDim, scale, false);
-        }
-        else
-        {
-            // Grouped query attention: multiple Q-heads share a single KV-head.
-            // We compute per-(batch, Q-head) gradients and accumulate K/V gradients
-            // into the corresponding shared KV-head.
-            int headRatio = numQueriesPerKV; // #628: honor the explicit param (kvh = qh / numQueriesPerKV)
-
-            // Zero KV gradients; we'll accumulate into them.
-            Fill(gradKey, 0f, batch * numKVHeads * seqLen * headDim);
-            Fill(gradValue, 0f, batch * numKVHeads * seqLen * headDim);
-
-            // Each (batch=1, head=1) instance covers seqLen * headDim elements.
-            int headStride = seqLen * headDim;
-
-            // Temporary buffers for per-(batch, head) slicing and gradient computation.
-            // Each slice is for a single (batch=1, numHeads=1) attention operation.
-            using var sliceGO = (WebGpuBuffer)AllocateBuffer(headStride);
-            using var sliceQ = (WebGpuBuffer)AllocateBuffer(headStride);
-            using var sliceK = (WebGpuBuffer)AllocateBuffer(headStride);
-            using var sliceV = (WebGpuBuffer)AllocateBuffer(headStride);
-            using var sliceAttn = (WebGpuBuffer)AllocateBuffer(headStride);
-            using var sliceGQ = (WebGpuBuffer)AllocateBuffer(headStride);
-            using var tempGradK = (WebGpuBuffer)AllocateBuffer(headStride);
-            using var tempGradV = (WebGpuBuffer)AllocateBuffer(headStride);
-            // Reusable buffers for reading current KV grad slices during accumulation
-            using var currentGK = (WebGpuBuffer)AllocateBuffer(headStride);
-            using var currentGV = (WebGpuBuffer)AllocateBuffer(headStride);
-
-            var goBuffer = (WebGpuBuffer)gradOutput;
-            var qBuffer = (WebGpuBuffer)query;
-            var kBuffer = (WebGpuBuffer)key;
-            var vBuffer = (WebGpuBuffer)value;
-            var attnBuffer = (WebGpuBuffer)attentionWeights;
-            var gqBuffer = (WebGpuBuffer)gradQuery;
-            var gkBuffer = (WebGpuBuffer)gradKey;
-            var gvBuffer = (WebGpuBuffer)gradValue;
-
-            // Iterate over batch, KV-head, and Q-heads within each KV group.
-            for (int b = 0; b < batch; b++)
-            {
-                for (int kvh = 0; kvh < numKVHeads; kvh++)
-                {
-                    // Copy the KV-head slice for this (batch, kvh) into temp buffers
-                    int kvBhIndex = b * numKVHeads + kvh;
-                    int kvOffset = kvBhIndex * headStride;
-                    sliceK.CopyFromBuffer(kBuffer, kvOffset, 0, headStride);
-                    sliceV.CopyFromBuffer(vBuffer, kvOffset, 0, headStride);
-
-                    for (int g = 0; g < headRatio; g++)
-                    {
-                        int qh = kvh * headRatio + g;
-
-                        // Flattened (batch * head) index for this Q-head
-                        int qBhIndex = b * numQHeads + qh;
-                        int qOffset = qBhIndex * headStride;
-
-                        // Copy per-head slices for Q, gradOutput, and attentionWeights
-                        sliceGO.CopyFromBuffer(goBuffer, qOffset, 0, headStride);
-                        sliceQ.CopyFromBuffer(qBuffer, qOffset, 0, headStride);
-                        sliceAttn.CopyFromBuffer(attnBuffer, qOffset, 0, headStride);
-
-                        // Compute backward gradients for this single (batch=1, head=1) slice
-                        ScaledDotProductAttentionBackward(
-                            sliceGO, sliceQ, sliceK, sliceV, sliceAttn,
-                            sliceGQ, tempGradK, tempGradV,
-                            1, 1, seqLen, headDim, scale, false);
-
-                        // Write gradQuery back to the correct Q-head offset
-                        gqBuffer.CopyFromBuffer(sliceGQ, 0, qOffset, headStride);
-
-                        // Accumulate KV gradients into the shared KV-head position:
-                        // gradKey[kvOffset..] += tempGradK, gradValue[kvOffset..] += tempGradV
-                        currentGK.CopyFromBuffer(gkBuffer, kvOffset, 0, headStride);
-                        currentGV.CopyFromBuffer(gvBuffer, kvOffset, 0, headStride);
-                        Add(currentGK, tempGradK, currentGK, headStride);
-                        Add(currentGV, tempGradV, currentGV, headStride);
-                        gkBuffer.CopyFromBuffer(currentGK, 0, kvOffset, headStride);
-                        gvBuffer.CopyFromBuffer(currentGV, 0, kvOffset, headStride);
-                    }
-                }
-            }
-        }
+        AttentionBackwardResident(gradOutput, query, key, value, attentionWeights, null,
+            gradQuery, gradKey, gradValue, batch, numQHeads, numKVHeads, seqQ, seqK, headDim,
+            scale, false, numQueriesPerKV, 0);
     }
 
     #endregion
@@ -449,9 +410,19 @@ public sealed partial class WebGpuBackend
 
     public void ScatterMean(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, IGpuBuffer counts, int sourceSize, int outputSize, int featureSize)
     {
-        // ScatterMean needs atomic operations which WGSL supports poorly
-        // Fall back to CPU for now via base engine
-        throw new NotSupportedException("ScatterMean not yet supported on WebGPU — use CPU fallback");
+        if (sourceSize < 0 || outputSize < 0 || featureSize < 0)
+            throw new ArgumentOutOfRangeException(nameof(sourceSize), "ScatterMean dimensions cannot be negative.");
+        int total = checked(outputSize * featureSize);
+        if (total == 0) return;
+        var uniforms = new[]
+        {
+            BitConverter.Int32BitsToSingle(sourceSize),
+            BitConverter.Int32BitsToSingle(outputSize),
+            BitConverter.Int32BitsToSingle(featureSize),
+            0f
+        };
+        Dispatch4BufferAsync("ScatterMean", WebGpuKernels.ScatterMeanSource, "scatter_mean_deterministic",
+            source, indices, output, counts, uniforms, total).GetAwaiter().GetResult();
     }
 
     public void VarBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer mean, IGpuBuffer gradInput, int outerSize, int reduceSize)
@@ -522,38 +493,24 @@ public sealed partial class WebGpuBackend
 
     public void MseLossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
     {
-        // Use existing 3-buffer WGSL loss backward (predictions, targets, grad_input)
-        // The gradOutput scalar is folded into inv_size uniform
-        float goScalar = DownloadBuffer(gradOutput)[0];
-        float scaledInvN = goScalar * invN;
-        Dispatch3BufferAsync("LossBackward", WebGpuKernels.LossBackwardSource, "mse_backward",
-            predictions, targets, gradInput, MakeUniform4(size, scaledInvN, 0f, 0f), size).GetAwaiter().GetResult();
+        Dispatch4BufferAsync("LossBackward4", WebGpuKernels.LossBackward4Source, "mse_4buf_backward",
+            gradOutput, predictions, targets, gradInput, MakeUniform4(size, invN, 0f, 0f), size).GetAwaiter().GetResult();
     }
 
     public void L1LossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
     {
-        float goScalar = DownloadBuffer(gradOutput)[0];
-        float scaledInvN = goScalar * invN;
-        Dispatch3BufferAsync("LossBackward", WebGpuKernels.LossBackwardSource, "mae_backward",
-            predictions, targets, gradInput, MakeUniform4(size, scaledInvN, 0f, 0f), size).GetAwaiter().GetResult();
+        Dispatch4BufferAsync("LossBackward4", WebGpuKernels.LossBackward4Source, "l1_4buf_backward",
+            gradOutput, predictions, targets, gradInput, MakeUniform4(size, invN, 0f, 0f), size).GetAwaiter().GetResult();
     }
 
     public void HuberLossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN, float delta)
     {
-        float goScalar = DownloadBuffer(gradOutput)[0];
-        float scaledInvN = goScalar * invN;
-        Dispatch3BufferAsync("LossBackward", WebGpuKernels.LossBackwardSource, "huber_backward",
-            predictions, targets, gradInput, MakeUniform4(size, scaledInvN, delta, 0f), size).GetAwaiter().GetResult();
+        Dispatch4BufferAsync("LossBackward4", WebGpuKernels.LossBackward4Source, "huber_4buf_backward",
+            gradOutput, predictions, targets, gradInput, MakeUniform4(size, invN, delta, 0f), size).GetAwaiter().GetResult();
     }
 
     public void BceWithLogitsBackward(IGpuBuffer gradOutput, IGpuBuffer logits, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
     {
-        // BCE with logits backward: sigmoid(x) - t, scaled by gradOutput and invN
-        // The existing bce_backward kernel uses predictions (sigmoid output), not logits
-        // Need to compute sigmoid first or use a dedicated kernel
-        float goScalar = DownloadBuffer(gradOutput)[0];
-        float scaledInvN = goScalar * invN;
-        // Use the 4-buffer dispatch with a dedicated WGSL shader
         Dispatch4BufferAsync("LossBackward4", WebGpuKernels.LossBackward4Source, "bce_logits_backward",
             gradOutput, logits, targets, gradInput, MakeUniform4(size, invN, 0f, 0f), size).GetAwaiter().GetResult();
     }
@@ -614,15 +571,6 @@ public sealed partial class WebGpuBackend
             throw new ArgumentOutOfRangeException(nameof(batchSize), "Batch size must be positive.");
         if (numClasses <= 0)
             throw new ArgumentOutOfRangeException(nameof(numClasses), "Number of classes must be positive.");
-        // Validate target indices are in bounds by downloading and checking
-        var targetData = DownloadBufferData(targets);
-        for (int i = 0; i < batchSize; i++)
-        {
-            int classIdx = BitConverter.SingleToInt32Bits(targetData[i]);
-            if (classIdx < 0 || classIdx >= numClasses)
-                throw new ArgumentOutOfRangeException(nameof(targets),
-                    $"Target index {classIdx} at position {i} is out of bounds for {numClasses} classes.");
-        }
         // GPU kernel computes per-batch loss, then reduce
         using var temp = (WebGpuBuffer)AllocateBuffer(batchSize);
         var uniforms = new float[]
@@ -643,15 +591,6 @@ public sealed partial class WebGpuBackend
             throw new ArgumentOutOfRangeException(nameof(batchSize), "Batch size must be positive.");
         if (numClasses <= 0)
             throw new ArgumentOutOfRangeException(nameof(numClasses), "Number of classes must be positive.");
-        // Validate target indices are in bounds
-        var targetData = DownloadBufferData(targets);
-        for (int i = 0; i < batchSize; i++)
-        {
-            int classIdx = BitConverter.SingleToInt32Bits(targetData[i]);
-            if (classIdx < 0 || classIdx >= numClasses)
-                throw new ArgumentOutOfRangeException(nameof(targets),
-                    $"Target index {classIdx} at position {i} is out of bounds for {numClasses} classes.");
-        }
         // Convert integer-encoded targets to one-hot via GPU kernel
         int total = batchSize * numClasses;
         using var oneHotBuf = (WebGpuBuffer)AllocateBuffer(total);
@@ -943,15 +882,6 @@ public sealed partial class WebGpuBackend
             throw new ArgumentOutOfRangeException(nameof(sourceSize), "Source size must be positive.");
         if (destSize <= 0)
             throw new ArgumentOutOfRangeException(nameof(destSize), "Destination size must be positive.");
-        // Validate index bounds by downloading indices
-        var indexData = DownloadBufferData(indices);
-        for (int i = 0; i < sourceSize; i++)
-        {
-            int idx = BitConverter.SingleToInt32Bits(indexData[i]);
-            if (idx < 0 || idx >= destSize)
-                throw new ArgumentOutOfRangeException(nameof(indices),
-                    $"Index {idx} at position {i} is out of bounds for destination size {destSize}.");
-        }
         // ScatterGatherExtSource scatter_add: gather pattern - for each dest element, scan source for matching indices
         // binding(0)=source, binding(1)=indices, binding(2)=destination
         // Uniform: num_indices=sourceSize, inner_size=1 (flat), dest_outer=destSize, pad
@@ -978,15 +908,6 @@ public sealed partial class WebGpuBackend
             throw new ArgumentOutOfRangeException(nameof(numIndices), "Number of indices must be positive.");
         if (featureSize <= 0)
             throw new ArgumentOutOfRangeException(nameof(featureSize), "Feature size must be positive.");
-        // Validate index bounds by downloading indices
-        var indexData = DownloadBufferData(indices);
-        for (int i = 0; i < numIndices; i++)
-        {
-            int idx = BitConverter.SingleToInt32Bits(indexData[i]);
-            if (idx < 0)
-                throw new ArgumentOutOfRangeException(nameof(indices),
-                    $"Index {idx} at position {i} is negative.");
-        }
         // ScatterGatherExtSource gather_op: binding(0)=source, binding(1)=indices, binding(2)=output(destination)
         // Uniform: num_indices, inner_size=featureSize, dest_outer(unused), pad
         var uniforms = new float[]
@@ -1099,7 +1020,7 @@ public sealed partial class WebGpuBackend
     }
 
     /// <inheritdoc/>
-    public bool ArgMaxIndicesAreBitReinterpreted => true; // WebGPU shader uses bitcast<f32>(i32(idx))
+    public bool ArgMaxIndicesAreBitReinterpreted => false; // shared contract: numeric float index
 
     public void ArgMaxAxis(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
         => ArgMax(A, indices, outerSize, reduceSize);
@@ -1119,8 +1040,7 @@ public sealed partial class WebGpuBackend
     public void TopK(IGpuBuffer A, IGpuBuffer values, IGpuBuffer indices, int outerSize, int reduceSize, int k, bool sorted = true)
     {
         // TopKSource topk_select: binding(0)=input, binding(1)=values, binding(2)=indices
-        // Note: The WGSL kernel uses selection sort which inherently produces sorted (descending) output.
-        // When sorted=false, we shuffle the results to remove the ordering guarantee.
+        // The kernel's descending order is also valid when sorted=false, where order is unspecified.
         var uniforms = new float[]
         {
             BitConverter.Int32BitsToSingle(outerSize),
@@ -1131,28 +1051,6 @@ public sealed partial class WebGpuBackend
         Dispatch3BufferAsync("TopK", WebGpuKernels.TopKSource, "topk_select",
             A, values, indices, uniforms, outerSize).GetAwaiter().GetResult();
 
-        if (!sorted && k > 1)
-        {
-            // Shuffle the top-K results to remove the descending sort order.
-            // Download, shuffle per batch, re-upload.
-            int totalK = outerSize * k;
-            var valData = DownloadBufferData(values);
-            var idxData = DownloadBufferData(indices);
-            var rng = new Random();
-            for (int b = 0; b < outerSize; b++)
-            {
-                int baseIdx = b * k;
-                // Fisher-Yates shuffle
-                for (int i = k - 1; i > 0; i--)
-                {
-                    int j = rng.Next(i + 1);
-                    (valData[baseIdx + i], valData[baseIdx + j]) = (valData[baseIdx + j], valData[baseIdx + i]);
-                    (idxData[baseIdx + i], idxData[baseIdx + j]) = (idxData[baseIdx + j], idxData[baseIdx + i]);
-                }
-            }
-            UploadToBuffer(valData, values);
-            UploadToBuffer(idxData, indices);
-        }
     }
 
     public void BroadcastMultiplyLastAxis(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int outerSize, int innerSize)
@@ -1219,9 +1117,7 @@ public sealed partial class WebGpuBackend
 
     public void CopyBuffer(IGpuBuffer source, IGpuBuffer destination, int size)
     {
-        var src = DownloadBuffer(source);
-        var trimmed = src.Length > size ? src.AsSpan(0, size).ToArray() : src;
-        UploadToBuffer(trimmed, destination);
+        Copy(source, destination, size);
     }
 
     public void FusedLinearReLU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearForward(WebGpuKernels.FusedLinearReLU, input, weight, bias, output, batchSize, inFeatures, outFeatures); }

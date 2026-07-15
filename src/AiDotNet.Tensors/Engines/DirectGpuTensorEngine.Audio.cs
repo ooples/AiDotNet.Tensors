@@ -28,8 +28,10 @@ public partial class DirectGpuTensorEngine
                 {
                     audio.AmplitudeToDB(inBuf.Buffer, outBuf.Buffer, len,
                         minAmplitude, 0.0f, clipTopDb: false);
-                    var arr = FinishGpuOp<T>(backend, outBuf, len);
-                    return new Tensor<T>(arr, (int[])input._shape.Clone());
+                    var result = DeferTensorResult<T>(
+                        backend, outBuf.Buffer, len, (int[])input._shape.Clone());
+                    outBuf.RelinquishOwnership();
+                    return result;
                 }
                 catch { outBuf.Dispose(); throw; }
             }
@@ -54,11 +56,10 @@ public partial class DirectGpuTensorEngine
                 try
                 {
                     audio.MuLawEncoding(inBuf.Buffer, outBuf.Buffer, len, quantizationChannels);
-                    var arr = FinishGpuOp<float>(backend, outBuf, len);
-                    var outInt = new Tensor<int>((int[])input._shape.Clone());
-                    var dst = outInt.AsWritableSpan();
-                    for (int i = 0; i < len; i++) dst[i] = (int)arr[i];
-                    return outInt;
+                    var result = DeferTensorResult<int>(
+                        backend, outBuf.Buffer, len, (int[])input._shape.Clone());
+                    outBuf.RelinquishOwnership();
+                    return result;
                 }
                 catch { outBuf.Dispose(); throw; }
             }
@@ -77,20 +78,26 @@ public partial class DirectGpuTensorEngine
             {
                 int len = input.Length;
                 if (len == 0) return new Tensor<T>((int[])input._shape.Clone());
-                var floatInput = new Tensor<float>((int[])input._shape.Clone());
-                var src = input.AsSpan();
-                var dst = floatInput.AsWritableSpan();
-                for (int i = 0; i < len; i++) dst[i] = src[i];
-
-                using var inBuf = GetOrAllocateBuffer(backend, floatInput);
+                var contiguousInput = input.IsContiguous
+                    ? input
+                    : (Tensor<int>)input.Contiguous();
+                using var inBuf = GetOrAllocateInt32IndexBuffer(backend, contiguousInput);
                 var outBuf = AllocateOutputBuffer(backend, len);
+                bool outputHandedOff = false;
                 try
                 {
                     audio.MuLawDecoding(inBuf.Buffer, outBuf.Buffer, len, quantizationChannels);
-                    var arr = FinishGpuOp<T>(backend, outBuf, len);
-                    return new Tensor<T>(arr, (int[])input._shape.Clone());
+                    var result = DeferTensorResult<T>(
+                        backend, outBuf.Buffer, len, (int[])input._shape.Clone());
+                    outBuf.RelinquishOwnership();
+                    outputHandedOff = true;
+                    return result;
                 }
-                catch { outBuf.Dispose(); throw; }
+                finally
+                {
+                    if (!outputHandedOff)
+                        outBuf.Dispose();
+                }
             }
         }
         return base.MuLawDecoding<T>(input, quantizationChannels);
@@ -116,8 +123,10 @@ public partial class DirectGpuTensorEngine
                 try
                 {
                     audio.ComputeDeltas(inBuf.Buffer, outBuf.Buffer, leading, timeAxis, winLength);
-                    var arr = FinishGpuOp<T>(backend, outBuf, input.Length);
-                    return new Tensor<T>(arr, (int[])input._shape.Clone());
+                    var result = DeferTensorResult<T>(
+                        backend, outBuf.Buffer, input.Length, (int[])input._shape.Clone());
+                    outBuf.RelinquishOwnership();
+                    return result;
                 }
                 catch { outBuf.Dispose(); throw; }
             }
@@ -128,6 +137,14 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> Resample<T>(Tensor<T> waveform, int origRate, int newRate)
     {
+        if (waveform is null) throw new ArgumentNullException(nameof(waveform));
+        if (typeof(T) == typeof(float) && origRate > 0 && newRate == origRate
+            && TryGetBackend(out var copyBackend))
+        {
+            using var inputBuffer = GetOrAllocateBuffer(copyBackend, waveform);
+            return DispatchDeferredGpuOp<T>(copyBackend, waveform.Length, waveform.Shape.ToArray(),
+                output => copyBackend.Copy(inputBuffer.Buffer, output, waveform.Length));
+        }
         if (typeof(T) == typeof(float) && waveform.Rank >= 1
             && origRate > 0 && newRate > 0 && origRate != newRate)
         {
@@ -165,10 +182,11 @@ public partial class DirectGpuTensorEngine
                 try
                 {
                     audio.Resample(inBuf.Buffer, outBuf.Buffer, leading, inLen, outLen, up, down, halfWidth);
-                    var arr = FinishGpuOp<T>(backend, outBuf, outTotal);
                     var outShape = (int[])waveform._shape.Clone();
                     outShape[waveform.Rank - 1] = outLen;
-                    return new Tensor<T>(arr, outShape);
+                    var result = DeferTensorResult<T>(backend, outBuf.Buffer, outTotal, outShape);
+                    outBuf.RelinquishOwnership();
+                    return result;
                 }
                 catch { outBuf.Dispose(); throw; }
             }

@@ -30,7 +30,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     /// <item>Bank-conflict-free shared memory</item>
     /// </list>
     /// </remarks>
-    public sealed partial class OpenClBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend
+    public sealed partial class OpenClBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IExtendedConvKernels, IPixelShuffleBackend
     {
         /// <summary>
         /// OpenCL has no cuDNN-equivalent half/bfloat16 conv path —
@@ -67,7 +67,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
 
         private DirectOpenClContext? _context;
-        private readonly Dictionary<string, DirectOpenClKernel> _kernelCache;
+        private readonly OpenClKernelCache _kernelCache;
         private readonly List<DirectOpenClProgram> _programs;
         private DynamicGemmKernel? _dynamicGemm;
         private bool _disposed;
@@ -173,7 +173,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public OpenClBackend(int deviceIndex, ILogger? logger = null)
         {
             _logger = logger;
-            _kernelCache = new Dictionary<string, DirectOpenClKernel>();
+            _kernelCache = new OpenClKernelCache();
             _programs = new List<DirectOpenClProgram>();
             _maxWorkItemSizes = Array.Empty<ulong>();
 
@@ -304,7 +304,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             // -cl-unsafe-math-optimizations: More aggressive optimizations
             // -cl-finite-math-only: Assume no NaN/Inf (safe for GEMM)
             // -cl-no-signed-zeros: Ignore sign of zeros for faster math
-            const string optimizationFlags = OpenClBuildOptions.OptimizationFlags;
+            string optimizationFlags = OpenClBuildOptions.OptimizationFlags;
 
             try
             {
@@ -487,7 +487,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 // Compile spatial transformer kernels (TopK, AffineGrid, GridSample)
                 var stProgram = CompileOrLoadCached(SpatialTransformerKernels.GetSource(), optimizationFlags, "Spatial transformer kernels");
                 _programs.Add(stProgram);
-                foreach (var name in new[] { "topk", "affine_grid", "grid_sample", "grid_sample_backward", "grid_sample_backward_grad_grid_deterministic", "grid_sample_backward_grad_input_deterministic" })
+                foreach (var name in new[] { "topk", "affine_grid", "grid_sample", "grid_sample_backward", "grid_sample_backward_grad_grid_deterministic", "grid_sample_backward_grad_input_deterministic", "gaussian_covariance", "spherical_harmonics", "spherical_harmonics_backward" })
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, stProgram, name);
                 }
@@ -658,7 +658,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     _kernelCache[name] = new DirectOpenClKernel(_context, gatedProgram, name);
 
                 // Compile shape/layout kernels
-                var shapeProgram = CompileOrLoadCached(ShapeKernels.GetSource(), optimizationFlags, "Shape kernels");
+                // Shape predicates and histogram binning must preserve NaN comparisons and exact
+                // boundary divisions. Fast/finite-only math can count NaNs and move samples that
+                // lie exactly on an interior bin edge.
+                var shapeProgram = CompileOrLoadCached(ShapeKernels.GetSource(), OpenClBuildOptions.SafeMathFlags, "Shape kernels");
                 _programs.Add(shapeProgram);
                 foreach (var name in ShapeKernels.GetKernelNames())
                     _kernelCache[name] = new DirectOpenClKernel(_context, shapeProgram, name);
@@ -1178,12 +1181,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         public float[] DownloadBuffer(IGpuBuffer buffer)
         {
+            GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float));
             var openClBuffer = (DirectOpenClGpuBuffer)buffer;
             return openClBuffer.Download();
         }
 
         public void DownloadBuffer(IGpuBuffer buffer, float[] destination)
         {
+            GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float));
             var openClBuffer = (DirectOpenClGpuBuffer)buffer;
             openClBuffer.Download(destination);
         }
@@ -1230,6 +1235,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var destOffsetBytes = new UIntPtr((ulong)destOffset * sizeof(float));
             var sizeBytes = new UIntPtr((ulong)size * sizeof(float));
 
+            GpuLaunchProbe.OnLaunch(); // device-to-device copy = GPU-resident work (keeps data on device)
             int err = OpenClNativeBindings.EnqueueCopyBuffer(
                 _context.CommandQueue,
                 srcHandle,
@@ -2230,33 +2236,53 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
-            if (!ClBlastNative.IsAvailable)
-                throw new NotSupportedException(
-                    "MatMulTransposed currently requires CLBlast on the OpenCL path. " +
-                    "Either install CLBlast or use TensorMatMul(A, transpose(B)).");
+
+            if (M <= 0 || N <= 0 || K <= 0)
+                throw new ArgumentOutOfRangeException(nameof(M), "Matrix dimensions M, N, K must all be positive.");
+            if ((long)A.Size < (long)M * K)
+                throw new ArgumentException($"A.Size {A.Size} < M*K = {(long)M * K}.", nameof(A));
+            if ((long)B.Size < (long)N * K)
+                throw new ArgumentException($"B.Size {B.Size} < N*K = {(long)N * K}.", nameof(B));
+            if ((long)C.Size < (long)M * N)
+                throw new ArgumentException($"C.Size {C.Size} < M*N = {(long)M * N}.", nameof(C));
 
             var bufferA = ((DirectOpenClGpuBuffer)A).Buffer;
             var bufferB = ((DirectOpenClGpuBuffer)B).Buffer;
             var bufferC = ((DirectOpenClGpuBuffer)C).Buffer;
-            IntPtr queue = _context.CommandQueue;
 
-            // CLBlast row-major: C[M,N] = A[M,K] · Bᵀ where B is stored as
-            // [N, K] row-major. We pass transA=No, transB=Yes; ldA=K (row
-            // stride of A), ldB=K (row stride of B as stored), ldC=N.
-            var status = ClBlastNative.Sgemm(
-                ClBlastNative.Layout.RowMajor,
-                ClBlastNative.Transpose.No,
-                ClBlastNative.Transpose.Yes,
-                (UIntPtr)M, (UIntPtr)N, (UIntPtr)K,
-                alpha,
-                bufferA.Handle, UIntPtr.Zero, (UIntPtr)K,
-                bufferB.Handle, UIntPtr.Zero, (UIntPtr)K,
-                beta,
-                bufferC.Handle, UIntPtr.Zero, (UIntPtr)N,
-                ref queue,
-                IntPtr.Zero);
-            if (status != ClBlastNative.StatusCode.Success)
-                throw new InvalidOperationException($"CLBlast Sgemm(MatMulTransposed) failed: {status}");
+            if (ClBlastNative.IsAvailable)
+            {
+                IntPtr queue = _context.CommandQueue;
+
+                // CLBlast row-major: C[M,N] = A[M,K] · Bᵀ where B is stored as
+                // [N, K] row-major. We pass transA=No, transB=Yes; ldA=K (row
+                // stride of A), ldB=K (row stride of B as stored), ldC=N.
+                var status = ClBlastNative.Sgemm(
+                    ClBlastNative.Layout.RowMajor,
+                    ClBlastNative.Transpose.No,
+                    ClBlastNative.Transpose.Yes,
+                    (UIntPtr)M, (UIntPtr)N, (UIntPtr)K,
+                    alpha,
+                    bufferA.Handle, UIntPtr.Zero, (UIntPtr)K,
+                    bufferB.Handle, UIntPtr.Zero, (UIntPtr)K,
+                    beta,
+                    bufferC.Handle, UIntPtr.Zero, (UIntPtr)N,
+                    ref queue,
+                    IntPtr.Zero);
+                if (status == ClBlastNative.StatusCode.Success)
+                {
+                    // CLBlast enqueues directly through the native OpenCL command queue,
+                    // bypassing DirectOpenClKernel's dispatch hook.
+                    GpuLaunchProbe.OnLaunch();
+                    return;
+                }
+            }
+
+            // CLBlast is optional. Keep the fallback fully resident by materializing Bᵀ
+            // with the existing transpose kernel and feeding the normal on-device GEMM path.
+            using var transposedB = AllocateBuffer(N * K);
+            Transpose(B, transposedB, N, K);
+            Gemm(A, transposedB, C, M, N, K, alpha, beta);
         }
 
         public void Gemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
@@ -3220,6 +3246,19 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             kernel.Execute1D(workItems, localSize);
         }
 
+        private void ExecuteScalarElementwise(string kernelName, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context not available");
+
+            var kernel = _kernelCache[kernelName];
+            kernel.SetArg(0, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
+            kernel.SetArg(1, ((DirectOpenClGpuBuffer)B).Buffer.Handle);
+            kernel.SetArg(2, ((DirectOpenClGpuBuffer)C).Buffer.Handle);
+            kernel.SetArg(3, size);
+            kernel.Execute1D(size, CalculateOptimalWorkGroupSize1D(size));
+        }
+
         private void ExecuteUnary(string kernelName, IGpuBuffer A, IGpuBuffer B, int size)
         {
             // The kernels routed through ExecuteUnary (negate_vector, floor_vector,
@@ -3522,90 +3561,57 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         public float Sum(IGpuBuffer A, int size)
         {
-            if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
-
-            var bufferA = ((DirectOpenClGpuBuffer)A).Buffer;
-            // Kernel lookup happens before clamping to honor kernel work-group constraints.
-            var kernel = _kernelCache["reduce_sum"];
-            int localSize = CalculateOptimalWorkGroupSize1D(size);
-            localSize = ClampLocalSizeForKernel(kernel, localSize, sizeof(float));
-            int groupCount = (size + localSize - 1) / localSize;
-
-            using var partialBuffer = AllocateBuffer(groupCount);
-            var partial = ((DirectOpenClGpuBuffer)partialBuffer).Buffer;
-
-            kernel.SetArg(0, bufferA.Handle);
-            kernel.SetArg(1, partial.Handle);
-            kernel.SetLocalArg(2, localSize * sizeof(float));
-            kernel.SetArg(3, size);
-
-            kernel.Execute1D(size, localSize);
-            _context?.Finish();
-
-            var partials = DownloadBuffer(partialBuffer);
-            float sum = 0.0f;
-            for (int i = 0; i < partials.Length; i++)
-                sum += partials[i];
-            return sum;
+            return ReduceScalar("reduce_sum", A, size, 0.0f);
         }
 
         public float Max(IGpuBuffer A, int size)
         {
-            if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
-
-            var bufferA = ((DirectOpenClGpuBuffer)A).Buffer;
-            var kernel = _kernelCache["reduce_max"];
-            int localSize = CalculateOptimalWorkGroupSize1D(size);
-            localSize = ClampLocalSizeForKernel(kernel, localSize, sizeof(float));
-            int groupCount = (size + localSize - 1) / localSize;
-
-            using var partialBuffer = AllocateBuffer(groupCount);
-            var partial = ((DirectOpenClGpuBuffer)partialBuffer).Buffer;
-
-            kernel.SetArg(0, bufferA.Handle);
-            kernel.SetArg(1, partial.Handle);
-            kernel.SetLocalArg(2, localSize * sizeof(float));
-            kernel.SetArg(3, size);
-
-            kernel.Execute1D(size, localSize);
-            _context?.Finish();
-
-            var partials = DownloadBuffer(partialBuffer);
-            float max = float.MinValue;
-            for (int i = 0; i < partials.Length; i++)
-                if (partials[i] > max) max = partials[i];
-            return max;
+            return ReduceScalar("reduce_max", A, size, float.MinValue);
         }
 
         public float Min(IGpuBuffer A, int size)
         {
+            return ReduceScalar("reduce_min", A, size, float.MaxValue);
+        }
+
+        private float ReduceScalar(string kernelName, IGpuBuffer input, int size, float emptyValue)
+        {
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
+            if (size <= 0) return emptyValue;
+            var kernel = _kernelCache[kernelName];
+            int maximumLocalSize = CalculateOptimalWorkGroupSize1D(size);
+            maximumLocalSize = ClampLocalSizeForKernel(kernel, maximumLocalSize, sizeof(float));
+            int maximumPartials = (size + maximumLocalSize - 1) / maximumLocalSize;
+            using var temporaryA = AllocateBuffer(Math.Max(1, maximumPartials));
+            using var temporaryB = AllocateBuffer(Math.Max(1, maximumPartials));
+            IGpuBuffer current = input;
+            int currentSize = size;
+            bool writeA = true;
+            while (currentSize > 1)
+            {
+                int localSize = CalculateOptimalWorkGroupSize1D(currentSize);
+                localSize = ClampLocalSizeForKernel(kernel, localSize, sizeof(float));
+                if (localSize <= 1)
+                    throw new NotSupportedException(
+                        $"OpenCL kernel '{kernelName}' cannot reduce {currentSize} values because the device only supports a local size of one.");
+                int partialCount = (currentSize + localSize - 1) / localSize;
+                IGpuBuffer next = writeA ? temporaryA : temporaryB;
+                var currentBuffer = ((DirectOpenClGpuBuffer)current).Buffer;
+                var nextBuffer = ((DirectOpenClGpuBuffer)next).Buffer;
+                kernel.SetArg(0, currentBuffer.Handle);
+                kernel.SetArg(1, nextBuffer.Handle);
+                kernel.SetLocalArg(2, localSize * sizeof(float));
+                kernel.SetArg(3, currentSize);
+                kernel.Execute1D(currentSize, localSize);
+                current = next;
+                currentSize = partialCount;
+                writeA = !writeA;
+            }
 
-            var bufferA = ((DirectOpenClGpuBuffer)A).Buffer;
-            var kernel = _kernelCache["reduce_min"];
-            int localSize = CalculateOptimalWorkGroupSize1D(size);
-            localSize = ClampLocalSizeForKernel(kernel, localSize, sizeof(float));
-            int groupCount = (size + localSize - 1) / localSize;
-
-            using var partialBuffer = AllocateBuffer(groupCount);
-            var partial = ((DirectOpenClGpuBuffer)partialBuffer).Buffer;
-
-            kernel.SetArg(0, bufferA.Handle);
-            kernel.SetArg(1, partial.Handle);
-            kernel.SetLocalArg(2, localSize * sizeof(float));
-            kernel.SetArg(3, size);
-
-            kernel.Execute1D(size, localSize);
-            _context?.Finish();
-
-            var partials = DownloadBuffer(partialBuffer);
-            float min = float.MaxValue;
-            for (int i = 0; i < partials.Length; i++)
-                if (partials[i] < min) min = partials[i];
-            return min;
+            var result = new float[1];
+            DownloadBuffer(current, result);
+            return result[0];
         }
 
         public void SumAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
@@ -4228,6 +4234,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var srcBuffer = (DirectOpenClGpuBuffer)source;
             var dstBuffer = (DirectOpenClGpuBuffer)destination;
 
+            GpuLaunchProbe.OnLaunch(); // device-to-device copy = GPU-resident work
             int err = OpenClNativeBindings.EnqueueCopyBuffer(
                 stream.Handle,
                 srcBuffer.Buffer.Handle,
@@ -6873,6 +6880,24 @@ KERNEL VARIANTS (A/B testing):
             k.Execute3D(outWidth, outHeight, batch * channels, localX, localY, localZ);
         }
 
+        // #775: adaptive max pooling 2D on the adaptive_max_pool2d kernel (same 3D dispatch as avg).
+        public void AdaptiveMaxPool2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
+        {
+            var k = _kernelCache["adaptive_max_pool2d"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, batch);
+            k.SetArg(arg++, channels);
+            k.SetArg(arg++, inHeight);
+            k.SetArg(arg++, inWidth);
+            k.SetArg(arg++, outHeight);
+            k.SetArg(arg++, outWidth);
+
+            int localX = 8, localY = 8, localZ = 1;
+            k.Execute3D(outWidth, outHeight, batch * channels, localX, localY, localZ);
+        }
+
         public void MaxPool3D(IGpuBuffer input, IGpuBuffer output, IGpuBuffer? indices,
             int batch, int channels,
             int inDepth, int inHeight, int inWidth,
@@ -6926,6 +6951,270 @@ KERNEL VARIANTS (A/B testing):
 
             int localX = 8, localY = 8, localZ = 1;
             k.Execute3D(outWidth, outHeight, batch * channels * outDepth, localX, localY, localZ);
+        }
+
+        // #775: 3D average pooling on the existing avgpool3d kernel (NCDHW, no padding).
+        public void AvgPool3D(IGpuBuffer input, IGpuBuffer output,
+            int batch, int channels,
+            int inDepth, int inHeight, int inWidth,
+            int outDepth, int outHeight, int outWidth,
+            int kernelD, int kernelH, int kernelW,
+            int strideD, int strideH, int strideW, int countIncludePad)
+        {
+            var k = _kernelCache["avgpool3d"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, batch);
+            k.SetArg(arg++, channels);
+            k.SetArg(arg++, inDepth);
+            k.SetArg(arg++, inHeight);
+            k.SetArg(arg++, inWidth);
+            k.SetArg(arg++, outDepth);
+            k.SetArg(arg++, outHeight);
+            k.SetArg(arg++, outWidth);
+            k.SetArg(arg++, kernelD);
+            k.SetArg(arg++, kernelH);
+            k.SetArg(arg++, kernelW);
+            k.SetArg(arg++, strideD);
+            k.SetArg(arg++, strideH);
+            k.SetArg(arg++, strideW);
+            k.SetArg(arg++, countIncludePad);
+            k.Execute3D(outWidth, outHeight, batch * channels * outDepth, 8, 8, 1);
+        }
+
+        // #775: 3D average-pool backward. The kernel parallelizes over INPUT elements (each gathers from
+        // the output windows covering it), so no scatter race and no pre-zeroing needed.
+        public void AvgPool3DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput,
+            int batch, int channels,
+            int inDepth, int inHeight, int inWidth,
+            int outDepth, int outHeight, int outWidth,
+            int kernelD, int kernelH, int kernelW,
+            int strideD, int strideH, int strideW, int countIncludePad)
+        {
+            var k = _kernelCache["avgpool3d_backward"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
+            k.SetArg(arg++, batch);
+            k.SetArg(arg++, channels);
+            k.SetArg(arg++, inDepth);
+            k.SetArg(arg++, inHeight);
+            k.SetArg(arg++, inWidth);
+            k.SetArg(arg++, outDepth);
+            k.SetArg(arg++, outHeight);
+            k.SetArg(arg++, outWidth);
+            k.SetArg(arg++, kernelD);
+            k.SetArg(arg++, kernelH);
+            k.SetArg(arg++, kernelW);
+            k.SetArg(arg++, strideD);
+            k.SetArg(arg++, strideH);
+            k.SetArg(arg++, strideW);
+            k.SetArg(arg++, countIncludePad);
+            k.Execute3D(inWidth, inHeight, batch * channels * inDepth, 8, 8, 1);
+        }
+
+        // #775: Conv3D backward w.r.t. input (no dilation). 1D over gradInput elements (gather, no zero/atomic).
+        public void Conv3DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer weights, IGpuBuffer gradInput,
+            int n, int inC, int inD, int inH, int inW, int outC, int outD, int outH, int outW,
+            int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW)
+        {
+            var k = _kernelCache["conv3d_backward_input"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)weights).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
+            k.SetArg(arg++, n); k.SetArg(arg++, inC); k.SetArg(arg++, inD); k.SetArg(arg++, inH); k.SetArg(arg++, inW);
+            k.SetArg(arg++, outC); k.SetArg(arg++, outD); k.SetArg(arg++, outH); k.SetArg(arg++, outW);
+            k.SetArg(arg++, kD); k.SetArg(arg++, kH); k.SetArg(arg++, kW);
+            k.SetArg(arg++, strideD); k.SetArg(arg++, strideH); k.SetArg(arg++, strideW);
+            k.SetArg(arg++, padD); k.SetArg(arg++, padH); k.SetArg(arg++, padW);
+            int total = n * inC * inD * inH * inW;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
+        // #775: Conv3D backward w.r.t. weights (no dilation). 1D over gradKernel elements (gather).
+        public void Conv3DBackwardKernel(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradKernel,
+            int n, int inC, int inD, int inH, int inW, int outC, int outD, int outH, int outW,
+            int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW)
+        {
+            var k = _kernelCache["conv3d_backward_weights"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradKernel).Buffer.Handle);
+            k.SetArg(arg++, n); k.SetArg(arg++, inC); k.SetArg(arg++, inD); k.SetArg(arg++, inH); k.SetArg(arg++, inW);
+            k.SetArg(arg++, outC); k.SetArg(arg++, outD); k.SetArg(arg++, outH); k.SetArg(arg++, outW);
+            k.SetArg(arg++, kD); k.SetArg(arg++, kH); k.SetArg(arg++, kW);
+            k.SetArg(arg++, strideD); k.SetArg(arg++, strideH); k.SetArg(arg++, strideW);
+            k.SetArg(arg++, padD); k.SetArg(arg++, padH); k.SetArg(arg++, padW);
+            int total = outC * inC * kD * kH * kW;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
+        // #775: Depthwise Conv2D backward w.r.t. input. 1D over gradInput elements (gather).
+        public void DepthwiseConv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
+            int n, int inC, int h, int w, int m, int outH, int outW, int kH, int kW,
+            int strideH, int strideW, int padH, int padW)
+        {
+            var k = _kernelCache["depthwise_conv2d_backward_input"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)kernel).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
+            k.SetArg(arg++, n); k.SetArg(arg++, inC); k.SetArg(arg++, h); k.SetArg(arg++, w);
+            k.SetArg(arg++, m); k.SetArg(arg++, outH); k.SetArg(arg++, outW); k.SetArg(arg++, kH); k.SetArg(arg++, kW);
+            k.SetArg(arg++, strideH); k.SetArg(arg++, strideW); k.SetArg(arg++, padH); k.SetArg(arg++, padW);
+            int total = n * inC * h * w;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
+        // #775: Depthwise Conv2D backward w.r.t. weights. 1D over gradKernel elements (gather).
+        public void DepthwiseConv2DBackwardKernel(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradKernel,
+            int n, int inC, int h, int w, int m, int outH, int outW, int kH, int kW,
+            int strideH, int strideW, int padH, int padW)
+        {
+            var k = _kernelCache["depthwise_conv2d_backward_weights"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradKernel).Buffer.Handle);
+            k.SetArg(arg++, n); k.SetArg(arg++, inC); k.SetArg(arg++, h); k.SetArg(arg++, w);
+            k.SetArg(arg++, m); k.SetArg(arg++, outH); k.SetArg(arg++, outW); k.SetArg(arg++, kH); k.SetArg(arg++, kW);
+            k.SetArg(arg++, strideH); k.SetArg(arg++, strideW); k.SetArg(arg++, padH); k.SetArg(arg++, padW);
+            int total = inC * m * kH * kW;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
+        // #775: Trilinear interpolation of a [D,H,W,C] grid at [P,3] positions -> [P,C]. 1D over P*C.
+        public void TrilinearInterpolate(IGpuBuffer grid, IGpuBuffer positions, IGpuBuffer output,
+            int d, int h, int w, int c, int p, float upperEps)
+        {
+            var k = _kernelCache["trilinear_interpolate"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)grid).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)positions).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, d); k.SetArg(arg++, h); k.SetArg(arg++, w); k.SetArg(arg++, c);
+            k.SetArg(arg++, p); k.SetArg(arg++, upperEps);
+            int total = p * c;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
+        // #775: Trilinear-interpolate backward w.r.t. the grid. 1D over grid cells (gather, deterministic).
+        public void TrilinearInterpolateBackward(IGpuBuffer gradOutput, IGpuBuffer positions, IGpuBuffer gradGrid,
+            int d, int h, int w, int c, int p, float upperEps)
+        {
+            var k = _kernelCache["trilinear_interpolate_backward"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)positions).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradGrid).Buffer.Handle);
+            k.SetArg(arg++, d); k.SetArg(arg++, h); k.SetArg(arg++, w); k.SetArg(arg++, c);
+            k.SetArg(arg++, p); k.SetArg(arg++, upperEps);
+            int total = d * h * w * c;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
+        // #775: ConvTranspose3D forward. 1D over output elements (gather), weights [inC,outC,kD,kH,kW].
+        public void ConvTranspose3D(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer output,
+            int n, int inC, int iD, int iH, int iW, int outC, int outD, int outH, int outW,
+            int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW)
+        {
+            var k = _kernelCache["conv_transpose3d"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)weights).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, n); k.SetArg(arg++, inC); k.SetArg(arg++, iD); k.SetArg(arg++, iH); k.SetArg(arg++, iW);
+            k.SetArg(arg++, outC); k.SetArg(arg++, outD); k.SetArg(arg++, outH); k.SetArg(arg++, outW);
+            k.SetArg(arg++, kD); k.SetArg(arg++, kH); k.SetArg(arg++, kW);
+            k.SetArg(arg++, strideD); k.SetArg(arg++, strideH); k.SetArg(arg++, strideW);
+            k.SetArg(arg++, padD); k.SetArg(arg++, padH); k.SetArg(arg++, padW);
+            int total = n * outC * outD * outH * outW;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
+        // #775: ConvTranspose3D backward w.r.t. input. 1D over gradInput (gather).
+        public void ConvTranspose3DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer weights, IGpuBuffer gradInput,
+            int n, int inC, int iD, int iH, int iW, int outC, int outD, int outH, int outW,
+            int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW)
+        {
+            var k = _kernelCache["conv_transpose3d_backward_input"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)weights).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
+            k.SetArg(arg++, n); k.SetArg(arg++, inC); k.SetArg(arg++, iD); k.SetArg(arg++, iH); k.SetArg(arg++, iW);
+            k.SetArg(arg++, outC); k.SetArg(arg++, outD); k.SetArg(arg++, outH); k.SetArg(arg++, outW);
+            k.SetArg(arg++, kD); k.SetArg(arg++, kH); k.SetArg(arg++, kW);
+            k.SetArg(arg++, strideD); k.SetArg(arg++, strideH); k.SetArg(arg++, strideW);
+            k.SetArg(arg++, padD); k.SetArg(arg++, padH); k.SetArg(arg++, padW);
+            int total = n * inC * iD * iH * iW;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
+        // #775: ConvTranspose3D backward w.r.t. weights. 1D over gradWeights (gather).
+        public void ConvTranspose3DBackwardKernel(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradWeights,
+            int n, int inC, int iD, int iH, int iW, int outC, int outD, int outH, int outW,
+            int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW)
+        {
+            var k = _kernelCache["conv_transpose3d_backward_weights"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradWeights).Buffer.Handle);
+            k.SetArg(arg++, n); k.SetArg(arg++, inC); k.SetArg(arg++, iD); k.SetArg(arg++, iH); k.SetArg(arg++, iW);
+            k.SetArg(arg++, outC); k.SetArg(arg++, outD); k.SetArg(arg++, outH); k.SetArg(arg++, outW);
+            k.SetArg(arg++, kD); k.SetArg(arg++, kH); k.SetArg(arg++, kW);
+            k.SetArg(arg++, strideD); k.SetArg(arg++, strideH); k.SetArg(arg++, strideW);
+            k.SetArg(arg++, padD); k.SetArg(arg++, padH); k.SetArg(arg++, padW);
+            int total = inC * outC * kD * kH * kW;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
+        // #775: SpiralConv (mesh conv). 1D over V*outC.
+        public void SpiralConv(IGpuBuffer vertexFeatures, IGpuBuffer spiralIndices, IGpuBuffer weights,
+            IGpuBuffer biases, IGpuBuffer output, int v, int inC, int spiralLength, int outC)
+        {
+            var k = _kernelCache["spiral_conv"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)vertexFeatures).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)spiralIndices).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)weights).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)biases).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, v); k.SetArg(arg++, inC); k.SetArg(arg++, spiralLength); k.SetArg(arg++, outC);
+            int total = v * outC;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
+        public void SpiralConvBackwardInput(IGpuBuffer gradOutput, IGpuBuffer spiralIndices, IGpuBuffer weights,
+            IGpuBuffer gradVertexFeatures, int v, int inC, int spiralLength, int outC)
+        {
+            var k = _kernelCache["spiral_conv_backward_input"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)spiralIndices).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)weights).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradVertexFeatures).Buffer.Handle);
+            k.SetArg(arg++, v); k.SetArg(arg++, inC); k.SetArg(arg++, spiralLength); k.SetArg(arg++, outC);
+            int total = v * inC;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
+        public void SpiralConvBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer vertexFeatures, IGpuBuffer spiralIndices,
+            IGpuBuffer gradWeights, int v, int inC, int spiralLength, int outC)
+        {
+            var k = _kernelCache["spiral_conv_backward_weights"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)vertexFeatures).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)spiralIndices).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradWeights).Buffer.Handle);
+            k.SetArg(arg++, v); k.SetArg(arg++, inC); k.SetArg(arg++, spiralLength); k.SetArg(arg++, outC);
+            int total = outC * inC * spiralLength;
+            k.Execute1D(total, Math.Min(256, total));
         }
 
         public void NearestNeighborUpsample3D(IGpuBuffer input, IGpuBuffer output,
@@ -6996,6 +7285,51 @@ KERNEL VARIANTS (A/B testing):
 
             int localX = 16, localY = 16, localZ = 1;
             k.Execute3D(outputWidth, outputHeight, batch, localX, localY, localZ);
+        }
+
+        // #775: 3D Gaussian-splat covariance. rotations [N,4], scales [N,3] -> covariances [N,6].
+        public void GaussianCovariance(IGpuBuffer rotations, IGpuBuffer scales, IGpuBuffer covariances, int numGaussians)
+        {
+            var k = _kernelCache["gaussian_covariance"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)rotations).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)scales).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)covariances).Buffer.Handle);
+            k.SetArg(arg++, numGaussians);
+            k.Execute1D(numGaussians, Math.Min(256, numGaussians));
+        }
+
+        // #775: spherical-harmonics color eval. shCoefficients [N,basisCount,numChannels], viewDirections
+        // [N or 1,3] -> colors [N,numChannels].
+        public void SphericalHarmonics(IGpuBuffer shCoefficients, IGpuBuffer viewDirections, IGpuBuffer output,
+            int numPoints, int basisCount, int numChannels, int degree, int broadcastDir)
+        {
+            var k = _kernelCache["spherical_harmonics"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)shCoefficients).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)viewDirections).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, numPoints); k.SetArg(arg++, basisCount); k.SetArg(arg++, numChannels);
+            k.SetArg(arg++, degree); k.SetArg(arg++, broadcastDir);
+            int total = numPoints * numChannels;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
+        // #775: SH backward w.r.t. coefficients -> shGrad [N, basisCount, numChannels].
+        public void SphericalHarmonicsBackward(IGpuBuffer shCoefficients, IGpuBuffer viewDirections,
+            IGpuBuffer outputGradient, IGpuBuffer shGrad,
+            int numPoints, int basisCount, int numChannels, int degree, int broadcastDir)
+        {
+            var k = _kernelCache["spherical_harmonics_backward"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)shCoefficients).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)viewDirections).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)outputGradient).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)shGrad).Buffer.Handle);
+            k.SetArg(arg++, numPoints); k.SetArg(arg++, basisCount); k.SetArg(arg++, numChannels);
+            k.SetArg(arg++, degree); k.SetArg(arg++, broadcastDir);
+            int total = numPoints * basisCount * numChannels;
+            k.Execute1D(total, Math.Min(256, total));
         }
 
         public void GridSample(IGpuBuffer input, IGpuBuffer grid, IGpuBuffer output,
@@ -7463,7 +7797,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)mask).Buffer.Handle);
             k.SetArg(arg++, size);
             k.SetArg(arg++, dropoutRate);
-            k.SetArg(arg++, (int)(seed & 0xFFFFFFFF));
+            k.SetArg(arg++, seed);
             k.SetArg(arg++, training ? 1 : 0);
 
             k.Execute1D(size, Math.Min(256, size));
@@ -7477,7 +7811,6 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)mask).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
             k.SetArg(arg++, size);
-            k.SetArg(arg++, dropoutRate);
 
             k.Execute1D(size, Math.Min(256, size));
         }
@@ -7583,7 +7916,17 @@ KERNEL VARIANTS (A/B testing):
 
         /// <inheritdoc/>
         public void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer)
-            => throw new NotSupportedException("UploadIntBufferInPlace is not supported by the OpenCL backend.");
+        {
+            if (data is null) throw new ArgumentNullException(nameof(data));
+            if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+            // Mirror AllocateIntBuffer: the OpenCL backend stores int buffers as the reinterpreted
+            // float bit pattern (net471-compatible), so convert and write the floats into the existing
+            // buffer in place (blocking) rather than allocating a new one.
+            var floatData = new float[data.Length];
+            for (int i = 0; i < data.Length; i++)
+                floatData[i] = BitConverter.ToSingle(BitConverter.GetBytes(data[i]), 0);
+            ((DirectOpenClGpuBuffer)buffer).Buffer.CopyFromHost(floatData);
+        }
 
         public IGpuBuffer AllocateIntBuffer(int[] data)
         {
@@ -7608,8 +7951,21 @@ KERNEL VARIANTS (A/B testing):
 
         public void ScaledDotProductAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
             IGpuBuffer output, IGpuBuffer? attentionWeights, IGpuBuffer? mask,
-            int batch, int numHeads, int seqLen, int headDim, float scale, bool isCausal)
+            int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
         {
+            if (batch <= 0 || numHeads <= 0 || seqQ <= 0 || seqK <= 0 || headDim <= 0)
+                throw new ArgumentOutOfRangeException(nameof(batch), "Attention dimensions must be positive.");
+            int querySize = checked(batch * numHeads * seqQ * headDim);
+            int keyValueSize = checked(batch * numHeads * seqK * headDim);
+            int weightsSize = checked(batch * numHeads * seqQ * seqK);
+            if (query.Size < querySize || key.Size < keyValueSize || value.Size < keyValueSize || output.Size < querySize)
+                throw new ArgumentException("Attention tensor buffers are smaller than the requested dimensions.");
+            if (attentionWeights is not null && attentionWeights.Size < weightsSize)
+                throw new ArgumentException("The attention-weights buffer is too small.", nameof(attentionWeights));
+            if (mask is not null && mask.Size < seqQ * seqK)
+                throw new ArgumentException("The attention mask must contain at least seqQ * seqK elements.", nameof(mask));
+            int maskMode = mask is null ? 0 : mask.Size >= weightsSize ? 2 : 1;
+
             var k = _kernelCache["scaled_dot_product_attention"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)query).Buffer.Handle);
@@ -7620,47 +7976,37 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, mask != null ? ((DirectOpenClGpuBuffer)mask).Buffer.Handle : IntPtr.Zero);
             k.SetArg(arg++, batch);
             k.SetArg(arg++, numHeads);
-            k.SetArg(arg++, seqLen);
+            k.SetArg(arg++, seqQ);
+            k.SetArg(arg++, seqK);
             k.SetArg(arg++, headDim);
             k.SetArg(arg++, scale);
             k.SetArg(arg++, isCausal ? 1 : 0);
+            k.SetArg(arg++, maskMode);
             k.SetArg(arg++, attentionWeights != null ? 1 : 0);
-            k.SetArg(arg++, mask != null ? 1 : 0);
 
-            int localX = Math.Min(16, headDim);
-            int localY = Math.Min(8, seqLen);
-            k.Execute3D(headDim, seqLen, batch * numHeads, localX, localY, 1);
+            int rows = checked(batch * numHeads * seqQ);
+            k.Execute1D(rows, Math.Min(256, rows));
         }
 
         public void ScaledDotProductAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
             IGpuBuffer attentionWeights, IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
-            int batch, int numHeads, int seqLen, int headDim, float scale, bool isCausal)
+            int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
         {
-            var k = _kernelCache["attention_backward"];
-            uint arg = 0;
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)query).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)key).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)value).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)attentionWeights).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradQuery).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradKey).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradValue).Buffer.Handle);
-            k.SetArg(arg++, batch);
-            k.SetArg(arg++, numHeads);
-            k.SetArg(arg++, seqLen);
-            k.SetArg(arg++, headDim);
-            k.SetArg(arg++, scale);
-            k.SetArg(arg++, isCausal ? 1 : 0);
-
-            int localX = Math.Min(16, headDim);
-            int localY = Math.Min(8, seqLen);
-            k.Execute3D(headDim, seqLen, batch * numHeads, localX, localY, 1);
+            GroupedQueryAttentionBackward(gradOutput, query, key, value, attentionWeights,
+                gradQuery, gradKey, gradValue, batch, numHeads, numHeads,
+                seqQ, seqK, headDim, scale, 1);
         }
 
         public void FlashAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
             IGpuBuffer output, IGpuBuffer? mask, int batch, int numHeads, int seqLen, int headDim, float scale, bool isCausal)
         {
+            if (mask is not null)
+            {
+                ScaledDotProductAttention(query, key, value, output, null, mask,
+                    batch, numHeads, seqLen, seqLen, headDim, scale, isCausal);
+                return;
+            }
+
             // FlashAttention is a memory-efficient version - for OpenCL, use tiled implementation
             var k = _kernelCache["flash_attention_forward"];
             uint arg = 0;
@@ -7991,25 +8337,29 @@ KERNEL VARIANTS (A/B testing):
 
         public void Permute(IGpuBuffer input, IGpuBuffer output, int[] shape, int[] permutation)
         {
-            // Permute is a general operation - handle common cases
+            if (shape is null) throw new ArgumentNullException(nameof(shape));
+            if (permutation is null) throw new ArgumentNullException(nameof(permutation));
+            if (shape.Length == 0 || permutation.Length != shape.Length)
+                throw new ArgumentException("Shape and permutation must have the same non-zero rank.", nameof(permutation));
+
             if (shape.Length == 2 && permutation[0] == 1 && permutation[1] == 0)
             {
-                // 2D transpose
                 Transpose(input, output, shape[0], shape[1]);
                 return;
             }
 
-            // For general permute, use CPU fallback (could implement general permute kernel)
-            var srcBuffer = ((DirectOpenClGpuBuffer)input).Buffer;
-            var dstBuffer = ((DirectOpenClGpuBuffer)output).Buffer;
-            var data = srcBuffer.ToArray();
-
+            bool[] seen = new bool[shape.Length];
             int totalSize = 1;
-            foreach (var dim in shape) totalSize *= dim;
+            for (int i = 0; i < shape.Length; i++)
+            {
+                if (shape[i] < 0) throw new ArgumentOutOfRangeException(nameof(shape), "Shape dimensions cannot be negative.");
+                if ((uint)permutation[i] >= (uint)shape.Length || seen[permutation[i]])
+                    throw new ArgumentException("Permutation must contain each axis exactly once.", nameof(permutation));
+                seen[permutation[i]] = true;
+                totalSize = checked(totalSize * shape[i]);
+            }
+            if (totalSize == 0) return;
 
-            var result = new float[totalSize];
-
-            // Calculate strides for original and permuted tensors
             int[] strides = new int[shape.Length];
             int[] permutedShape = new int[shape.Length];
             int[] permutedStrides = new int[shape.Length];
@@ -8025,54 +8375,65 @@ KERNEL VARIANTS (A/B testing):
             for (int i = shape.Length - 2; i >= 0; i--)
                 permutedStrides[i] = permutedStrides[i + 1] * permutedShape[i + 1];
 
-            // Perform permutation
-            for (int i = 0; i < totalSize; i++)
-            {
-                int[] coords = new int[shape.Length];
-                int idx = i;
-                for (int d = 0; d < shape.Length; d++)
-                {
-                    coords[d] = idx / strides[d];
-                    idx %= strides[d];
-                }
-
-                int newIdx = 0;
-                for (int d = 0; d < shape.Length; d++)
-                    newIdx += coords[permutation[d]] * permutedStrides[d];
-
-                result[newIdx] = data[i];
-            }
-
-            dstBuffer.CopyFromHost(result);
+            using var inputStridesBuffer = AllocateIntBuffer(strides);
+            using var outputStridesBuffer = AllocateIntBuffer(permutedStrides);
+            using var permutationBuffer = AllocateIntBuffer(permutation);
+            var kernel = _kernelCache["permute_general"];
+            kernel.SetArg(0, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            kernel.SetArg(1, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            kernel.SetArg(2, ((DirectOpenClGpuBuffer)inputStridesBuffer).Buffer.Handle);
+            kernel.SetArg(3, ((DirectOpenClGpuBuffer)outputStridesBuffer).Buffer.Handle);
+            kernel.SetArg(4, ((DirectOpenClGpuBuffer)permutationBuffer).Buffer.Handle);
+            kernel.SetArg(5, shape.Length);
+            kernel.SetArg(6, totalSize);
+            kernel.Execute1D(totalSize, CalculateOptimalWorkGroupSize1D(totalSize));
         }
 
         public void Copy(IGpuBuffer source, IGpuBuffer destination, int size)
         {
-            if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+            Copy(source, 0, destination, 0, size);
+        }
 
-            // Use CPU fallback for copy - download from source and upload to destination
-            var srcBuffer = ((DirectOpenClGpuBuffer)source).Buffer;
-            var dstBuffer = ((DirectOpenClGpuBuffer)destination).Buffer;
+        public void PixelShuffle(IGpuBuffer input, IGpuBuffer output,
+            int batch, int channels, int inH, int inW, int scale)
+        {
+            int total = checked(batch * channels * inH * scale * inW * scale);
+            var kernel = _kernelCache["pixel_shuffle"];
+            kernel.SetArg(0, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            kernel.SetArg(1, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            kernel.SetArg(2, batch);
+            kernel.SetArg(3, channels);
+            kernel.SetArg(4, inH);
+            kernel.SetArg(5, inW);
+            kernel.SetArg(6, scale);
+            kernel.Execute1D(total, CalculateOptimalWorkGroupSize1D(total));
+        }
 
-            var data = srcBuffer.ToArray();
-            dstBuffer.CopyFromHost(data);
+        public void PixelShuffleBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput,
+            int batch, int channels, int inH, int inW, int scale)
+        {
+            int total = checked(batch * channels * scale * scale * inH * inW);
+            var kernel = _kernelCache["pixel_shuffle_backward"];
+            kernel.SetArg(0, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            kernel.SetArg(1, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
+            kernel.SetArg(2, batch);
+            kernel.SetArg(3, channels);
+            kernel.SetArg(4, inH);
+            kernel.SetArg(5, inW);
+            kernel.SetArg(6, scale);
+            kernel.Execute1D(total, CalculateOptimalWorkGroupSize1D(total));
         }
 
         public void Fill(IGpuBuffer buffer, float value, int size)
         {
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
-
-            // Use CPU fallback for fill
-            var data = new float[size];
-            for (int i = 0; i < size; i++)
-            {
-                data[i] = value;
-            }
-
-            var clBuffer = ((DirectOpenClGpuBuffer)buffer).Buffer;
-            clBuffer.CopyFromHost(data);
+            if (size <= 0) return;
+            var kernel = _kernelCache["fill_buffer"];
+            kernel.SetArg(0, ((DirectOpenClGpuBuffer)buffer).Buffer.Handle);
+            kernel.SetArg(1, value);
+            kernel.SetArg(2, size);
+            kernel.Execute1D(size, CalculateOptimalWorkGroupSize1D(size));
         }
 
         /// <inheritdoc/>
@@ -8102,12 +8463,8 @@ KERNEL VARIANTS (A/B testing):
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
 
-            // Try to use kernel if available, otherwise fallback to CPU
             if (!_kernelCache.TryGetValue("nearest_neighbor_upsample", out var kernel))
-            {
-                NearestNeighborUpsampleFallback(input, output, batchChannels, height, width, scaleFactor);
-                return;
-            }
+                throw new InvalidOperationException("OpenCL kernel not found: nearest_neighbor_upsample");
 
             var bufferIn = ((DirectOpenClGpuBuffer)input).Buffer;
             var bufferOut = ((DirectOpenClGpuBuffer)output).Buffer;
@@ -8127,43 +8484,6 @@ KERNEL VARIANTS (A/B testing):
             kernel.Execute1D(outputSize, Math.Min(256, outputSize));
         }
 
-        /// <summary>
-        /// CPU fallback for nearest-neighbor upsampling when kernel is not available.
-        /// </summary>
-        private void NearestNeighborUpsampleFallback(IGpuBuffer input, IGpuBuffer output, int batchChannels, int height, int width, int scaleFactor)
-        {
-            int inputSize = batchChannels * height * width;
-            int outHeight = height * scaleFactor;
-            int outWidth = width * scaleFactor;
-            int outputSize = batchChannels * outHeight * outWidth;
-
-            // Download input
-            var inputData = new float[inputSize];
-            var bufferIn = ((DirectOpenClGpuBuffer)input).Buffer;
-            bufferIn.CopyToHost(inputData);
-
-            // Perform CPU upsampling
-            var outputData = new float[outputSize];
-            for (int bc = 0; bc < batchChannels; bc++)
-            {
-                for (int oh = 0; oh < outHeight; oh++)
-                {
-                    for (int ow = 0; ow < outWidth; ow++)
-                    {
-                        int ih = oh / scaleFactor;
-                        int iw = ow / scaleFactor;
-                        int inputIdx = bc * height * width + ih * width + iw;
-                        int outputIdx = bc * outHeight * outWidth + oh * outWidth + ow;
-                        outputData[outputIdx] = inputData[inputIdx];
-                    }
-                }
-            }
-
-            // Upload output
-            var bufferOut = ((DirectOpenClGpuBuffer)output).Buffer;
-            bufferOut.CopyFromHost(outputData);
-        }
-
         /// <inheritdoc/>
         public void NearestNeighborUpsampleBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batchChannels, int height, int width, int scaleFactor)
         {
@@ -8171,10 +8491,7 @@ KERNEL VARIANTS (A/B testing):
                 throw new InvalidOperationException("OpenCL context not available");
 
             if (!_kernelCache.TryGetValue("nearest_neighbor_upsample_backward", out var kernel))
-            {
-                NearestNeighborUpsampleBackwardFallback(gradOutput, gradInput, batchChannels, height, width, scaleFactor);
-                return;
-            }
+                throw new InvalidOperationException("OpenCL kernel not found: nearest_neighbor_upsample_backward");
 
             int inputSize = batchChannels * height * width;
 
@@ -8192,43 +8509,6 @@ KERNEL VARIANTS (A/B testing):
             kernel.SetArg(6, inputSize);
 
             kernel.Execute1D(inputSize, Math.Min(256, inputSize));
-        }
-
-        /// <summary>
-        /// CPU fallback for nearest-neighbor upsampling backward when kernel is not available.
-        /// </summary>
-        private void NearestNeighborUpsampleBackwardFallback(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batchChannels, int height, int width, int scaleFactor)
-        {
-            int inputSize = batchChannels * height * width;
-            int outHeight = height * scaleFactor;
-            int outWidth = width * scaleFactor;
-            int outputSize = batchChannels * outHeight * outWidth;
-
-            // Download gradient output
-            var gradOutputData = new float[outputSize];
-            var bufferIn = ((DirectOpenClGpuBuffer)gradOutput).Buffer;
-            bufferIn.CopyToHost(gradOutputData);
-
-            // Perform CPU backward (accumulate gradients)
-            var gradInputData = new float[inputSize];
-            for (int bc = 0; bc < batchChannels; bc++)
-            {
-                for (int oh = 0; oh < outHeight; oh++)
-                {
-                    for (int ow = 0; ow < outWidth; ow++)
-                    {
-                        int ih = oh / scaleFactor;
-                        int iw = ow / scaleFactor;
-                        int inputIdx = bc * height * width + ih * width + iw;
-                        int outputIdx = bc * outHeight * outWidth + oh * outWidth + ow;
-                        gradInputData[inputIdx] += gradOutputData[outputIdx];
-                    }
-                }
-            }
-
-            // Upload gradient input
-            var bufferOut = ((DirectOpenClGpuBuffer)gradInput).Buffer;
-            bufferOut.CopyFromHost(gradInputData);
         }
 
         #endregion
@@ -8421,12 +8701,15 @@ KERNEL VARIANTS (A/B testing):
 
         public void Selu(IGpuBuffer A, IGpuBuffer B, float alpha, float scale, int size)
         {
-            var k = _kernelCache["selu_forward"];
+            // #775: the registered kernel is "selu" (was the unregistered "selu_forward" -> silent CPU
+            // fallback). SELU has FIXED constants by definition, and the "selu" kernel hardcodes exactly
+            // the standard scale/alpha every caller passes, so it takes (input, output, size) only — the
+            // alpha/scale params are redundant here and intentionally not forwarded.
+            _ = alpha; _ = scale;
+            var k = _kernelCache["selu"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)B).Buffer.Handle);
-            k.SetArg(arg++, alpha);
-            k.SetArg(arg++, scale);
             k.SetArg(arg++, size);
 
             k.Execute1D(size, Math.Min(256, size));
@@ -8434,7 +8717,7 @@ KERNEL VARIANTS (A/B testing):
 
         public void Hardsigmoid(IGpuBuffer A, IGpuBuffer B, int size)
         {
-            var k = _kernelCache["hardsigmoid_forward"];
+            var k = _kernelCache["hardsigmoid"]; // #775: kernel is registered as "hardsigmoid" (was silent CPU fallback)
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)B).Buffer.Handle);
@@ -8500,13 +8783,14 @@ KERNEL VARIANTS (A/B testing):
 
         public void SeluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float alpha, float scale, int size)
         {
+            // #775: the selu_backward kernel hardcodes the SELU constants and takes 4 args
+            // (gradOutput, input, gradInput, size) — NOT alpha/scale. Setting those extra args wrote
+            // alpha's bits into `size` and hit an invalid arg index (threw), so this was routed to base.
             var k = _kernelCache["selu_backward"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
-            k.SetArg(arg++, alpha);
-            k.SetArg(arg++, scale);
             k.SetArg(arg++, size);
 
             k.Execute1D(size, Math.Min(256, size));
@@ -9023,6 +9307,12 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
             k.SetArg(arg++, batchSize);
             k.SetArg(arg++, numClasses);
+
+            // The kernel is per-element over batchSize * numClasses (idx = b*numClasses + c).
+            // Without this dispatch gradInput was never written, so the GPU returned all-zero
+            // gradients (op-parity #775 quarantine "GPU CrossEntropyBackward returns 0").
+            int total = batchSize * numClasses;
+            k.Execute1D(total, Math.Min(256, total));
         }
 
         public float BinaryCrossEntropyLoss(IGpuBuffer predictions, IGpuBuffer targets, int size)
@@ -9705,7 +9995,7 @@ KERNEL VARIANTS (A/B testing):
 
         public void Clamp(IGpuBuffer A, IGpuBuffer B, float min, float max, int size)
         {
-            var k = _kernelCache["clamp"];
+            var k = _kernelCache["clamp_values"]; // #775: kernel is registered as "clamp_values" (was silent CPU fallback)
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)B).Buffer.Handle);
@@ -9739,23 +10029,22 @@ KERNEL VARIANTS (A/B testing):
 
         public void ClipByNorm(IGpuBuffer A, IGpuBuffer B, float maxNorm, int size)
         {
-            float norm = L2Norm(A, size);
-            if (norm > maxNorm)
-            {
-                float scale = maxNorm / norm;
-                var k = _kernelCache["scale"];
-                uint arg = 0;
-                k.SetArg(arg++, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
-                k.SetArg(arg++, ((DirectOpenClGpuBuffer)B).Buffer.Handle);
-                k.SetArg(arg++, scale);
-                k.SetArg(arg++, size);
-
-                k.Execute1D(size, Math.Min(256, size));
-            }
-            else
-            {
-                Copy(A, B, size);
-            }
+            if (size <= 0) return;
+            using var squared = AllocateBuffer(size);
+            using var squaredSum = AllocateBuffer(1);
+            var squareKernel = _kernelCache["l2_norm_squared"];
+            squareKernel.SetArg(0, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
+            squareKernel.SetArg(1, ((DirectOpenClGpuBuffer)squared).Buffer.Handle);
+            squareKernel.SetArg(2, size);
+            squareKernel.Execute1D(size, Math.Min(256, size));
+            SumAxis(squared, squaredSum, 1, size);
+            var clipKernel = _kernelCache["clip_by_norm_from_squared_sum"];
+            clipKernel.SetArg(0, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
+            clipKernel.SetArg(1, ((DirectOpenClGpuBuffer)squaredSum).Buffer.Handle);
+            clipKernel.SetArg(2, ((DirectOpenClGpuBuffer)B).Buffer.Handle);
+            clipKernel.SetArg(3, maxNorm);
+            clipKernel.SetArg(4, size);
+            clipKernel.Execute1D(size, Math.Min(256, size));
         }
 
         public void Fma(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, IGpuBuffer D, int size)
@@ -9812,53 +10101,18 @@ KERNEL VARIANTS (A/B testing):
                 throw new ArgumentException($"Buffer 'input' capacity ({input.Size}) is less than size ({size}).", nameof(input));
             if (size <= 1) return 0.0f;
 
-            // Step 1: Compute mean using GPU reduction
-            float mean = Sum(input, size) / size;
-
-            // Step 2: Compute variance using reduce_variance_local kernel
-            if (_kernelCache.TryGetValue("reduce_variance_local", out var varKernel))
-            {
-                var bufferA = ((DirectOpenClGpuBuffer)input).Buffer;
-                int localSize = CalculateOptimalWorkGroupSize1D(size);
-                localSize = ClampLocalSizeForKernel(varKernel, localSize, sizeof(float));
-                int groupCount = (size + localSize - 1) / localSize;
-
-                using var partialBuffer = AllocateBuffer(groupCount);
-                var partial = ((DirectOpenClGpuBuffer)partialBuffer).Buffer;
-
-                varKernel.SetArg(0, bufferA.Handle);
-                varKernel.SetArg(1, partial.Handle);
-                varKernel.SetLocalArg(2, localSize * sizeof(float));
-                varKernel.SetArg(3, mean);
-                varKernel.SetArg(4, size);
-
-                varKernel.Execute1D(size, localSize);
-
-                if (_context != null)
-                    _context?.Finish();
-
-                var partials = DownloadBuffer(partialBuffer);
-                float varianceSum = 0.0f;
-                for (int i = 0; i < partials.Length; i++)
-                    varianceSum += partials[i];
-
-                // Clamp variance to zero before sqrt to handle floating-point roundoff
-                float gpuVariance = Math.Max(0, varianceSum / size);
-                return MathF.Sqrt(gpuVariance);
-            }
-
-            // Fallback: download and compute on CPU
-            float[] data = DownloadBuffer(input);
-            float varSum = 0.0f;
-            for (int i = 0; i < size; i++)
-            {
-                float diff = data[i] - mean;
-                varSum += diff * diff;
-            }
-
-            // Clamp variance to zero before sqrt to handle floating-point roundoff
-            float variance = Math.Max(0, varSum / size);
-            return MathF.Sqrt(variance);
+            using var mean = AllocateBuffer(1);
+            using var squaredDeviations = AllocateBuffer(size);
+            SumAxis(input, mean, 1, size);
+            Scale(mean, mean, 1.0f / size, 1);
+            var kernel = _kernelCache["squared_deviation_from_mean"];
+            kernel.SetArg(0, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            kernel.SetArg(1, ((DirectOpenClGpuBuffer)mean).Buffer.Handle);
+            kernel.SetArg(2, ((DirectOpenClGpuBuffer)squaredDeviations).Buffer.Handle);
+            kernel.SetArg(3, size);
+            kernel.Execute1D(size, Math.Min(256, size));
+            float variance = Sum(squaredDeviations, size) / size;
+            return MathF.Sqrt(Math.Max(0.0f, variance));
         }
 
         public void ScatterAdd(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer destination, int sourceSize, int destSize)
@@ -9897,6 +10151,120 @@ KERNEL VARIANTS (A/B testing):
             k.Execute1D(sourceSize, Math.Min(256, sourceSize));
         }
 
+        // #775: GNN scatter-add (index_add) along dim 0 -> [outDimSize, innerSize]. Gather over output.
+        public void ScatterAddRows(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output,
+            int srcDimSize, int innerSize, int outDimSize)
+        {
+            var k = _kernelCache["scatter_add_rows"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)source).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, srcDimSize); k.SetArg(arg++, innerSize); k.SetArg(arg++, outDimSize);
+            int total = outDimSize * innerSize;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
+        // #775: GNN scatter-mean along dim 0 -> [outDimSize, innerSize] (scatter-add / per-row count).
+        public void ScatterMeanRows(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output,
+            int srcDimSize, int innerSize, int outDimSize)
+        {
+            var k = _kernelCache["scatter_mean_rows"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)source).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, srcDimSize); k.SetArg(arg++, innerSize); k.SetArg(arg++, outDimSize);
+            int total = outDimSize * innerSize;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
+        // #775: GNN scatter-max along dim 0 -> [outDimSize, innerSize] (empty groups -> -INFINITY).
+        public void ScatterMaxRows(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output,
+            int srcDimSize, int innerSize, int outDimSize)
+        {
+            var k = _kernelCache["scatter_max_rows"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)source).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, srcDimSize); k.SetArg(arg++, innerSize); k.SetArg(arg++, outDimSize);
+            int total = outDimSize * innerSize;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
+        // #775: GNN scatter-softmax (softmax within each index-group); output has the source shape.
+        public void ScatterSoftmaxRows(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output,
+            int srcDimSize, int innerSize, int numGroups)
+        {
+            var k = _kernelCache["scatter_softmax_rows"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)source).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, srcDimSize); k.SetArg(arg++, innerSize); k.SetArg(arg++, numGroups);
+            int total = srcDimSize * innerSize;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
+        // #775: ScatterAdd backward (gather) -> gradSource [srcDimSize, innerSize].
+        public void ScatterAddBackwardRows(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradSource,
+            int srcDimSize, int innerSize, int outDimSize)
+        {
+            var k = _kernelCache["scatter_add_backward_rows"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradSource).Buffer.Handle);
+            k.SetArg(arg++, srcDimSize); k.SetArg(arg++, innerSize); k.SetArg(arg++, outDimSize);
+            int total = srcDimSize * innerSize;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
+        // #775: ScatterMean backward (gather / count) -> gradSource [srcDimSize, innerSize].
+        public void ScatterMeanBackwardRows(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer counts,
+            IGpuBuffer gradSource, int srcDimSize, int innerSize, int outDimSize)
+        {
+            var k = _kernelCache["scatter_mean_backward_rows"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)counts).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradSource).Buffer.Handle);
+            k.SetArg(arg++, srcDimSize); k.SetArg(arg++, innerSize); k.SetArg(arg++, outDimSize);
+            int total = srcDimSize * innerSize;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
+        // #775: ScatterMax backward (route each output's grad to its argmax source row) -> gradSource.
+        public void ScatterMaxBackwardRows(IGpuBuffer gradOutput, IGpuBuffer argmax, IGpuBuffer gradSource,
+            int srcDimSize, int innerSize, int outDimSize)
+        {
+            var k = _kernelCache["scatter_max_backward_rows"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)argmax).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradSource).Buffer.Handle);
+            k.SetArg(arg++, srcDimSize); k.SetArg(arg++, innerSize); k.SetArg(arg++, outDimSize);
+            int total = srcDimSize * innerSize;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
+        // #775: ScatterSoftmax backward (softmax jacobian per index-group) -> gradSource [source shape].
+        public void ScatterSoftmaxBackwardRows(IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer indices,
+            IGpuBuffer gradSource, int srcDimSize, int innerSize, int numGroups)
+        {
+            var k = _kernelCache["scatter_softmax_backward_rows"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradSource).Buffer.Handle);
+            k.SetArg(arg++, srcDimSize); k.SetArg(arg++, innerSize); k.SetArg(arg++, numGroups);
+            int total = srcDimSize * innerSize;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
         public void ScatterAddBackward(IGpuBuffer gradDestination, IGpuBuffer indices, IGpuBuffer gradSource,
             int numIndices, int featureSize)
         {
@@ -9913,7 +10281,11 @@ KERNEL VARIANTS (A/B testing):
 
         public void Gather(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, int numIndices, int featureSize)
         {
-            var k = _kernelCache["gather"];
+            // #775: registered as "gather_kernel". It is a 1D axis-0 ROW gather over `numIndices` output
+            // rows (get_global_id(0) = output row, loops featureSize), reading INT indices — which all 9
+            // callers upload via AllocateIntBuffer. (The prior "gather" lookup threw and every caller's
+            // catch silently fell to the CPU; the residency probe surfaced it.)
+            var k = _kernelCache["gather_kernel"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)source).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
@@ -9921,7 +10293,10 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, numIndices);
             k.SetArg(arg++, featureSize);
 
-            k.Execute2D(featureSize, numIndices, Math.Min(16, featureSize), Math.Min(16, numIndices));
+            // 1D over the OUTPUT ROWS (get_global_id(0) in [0,numIndices), loops featureSize internally).
+            // Execute2D(featureSize, numIndices) would leave get_global_id(0) spanning featureSize and drop
+            // rows whenever featureSize < numIndices.
+            k.Execute1D(numIndices, Math.Min(256, numIndices));
         }
 
         #endregion
@@ -9954,7 +10329,7 @@ KERNEL VARIANTS (A/B testing):
 
         public void Equal(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
         {
-            var k = _kernelCache["equal"];
+            var k = _kernelCache["equal_values"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)B).Buffer.Handle);
@@ -10020,7 +10395,7 @@ KERNEL VARIANTS (A/B testing):
 
         public void ArgMax(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
         {
-            var k = _kernelCache["argmax"];
+            var k = _kernelCache["argmax_axis"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
@@ -10032,7 +10407,7 @@ KERNEL VARIANTS (A/B testing):
 
         public void ArgMin(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
         {
-            var k = _kernelCache["argmin"];
+            var k = _kernelCache["argmin_axis"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
@@ -10106,7 +10481,7 @@ KERNEL VARIANTS (A/B testing):
 
         public void BroadcastMultiplyLastAxis(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int outerSize, int innerSize)
         {
-            var k = _kernelCache["broadcast_multiply_last_axis"];
+            var k = _kernelCache["broadcast_mul_last"]; // #775: kernel is registered as "broadcast_mul_last" (was silent CPU fallback)
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)B).Buffer.Handle);
@@ -10525,8 +10900,10 @@ KERNEL VARIANTS (A/B testing):
             var outImag = ((DirectOpenClGpuBuffer)outputImag).Buffer;
 
             // Copy input to output for in-place FFT
-            CopyBuffer(inputReal, outputReal, n);
-            CopyBuffer(inputImag, outputImag, n);
+            if (inputReal.Handle != outputReal.Handle)
+                CopyBuffer(inputReal, outputReal, n);
+            if (inputImag.Handle != outputImag.Handle)
+                CopyBuffer(inputImag, outputImag, n);
 
             int log2n = (int)MathHelper.Log2(n);
 
@@ -10642,16 +11019,23 @@ KERNEL VARIANTS (A/B testing):
 
             int log2n = (int)MathHelper.Log2(n);
 
-            // Batched bit-reversal
+            // Batched bit-reversal. NOTE: batched_bit_reverse / batched_fft_butterfly index via a
+            // FLATTENED get_global_id(0) (b = idx/n, batchIdx = tid/(n/2)), so they MUST be dispatched
+            // 1D over batch*n (resp. batch*(n/2)). They were dispatched via Execute2D — a real 2D
+            // NDRange where get_global_id(0) only spanned one signal's worth — so only batch 0 was
+            // transformed and every other signal passed through untouched (op-parity #775: the batched
+            // FFT path that N-D IFFT / wideband / mel-spectrogram all route through).
+            int bitRevItems = batch * n;
             var bitRevKernel = _kernelCache["batched_bit_reverse"];
             bitRevKernel.SetArg(0, outReal.Handle);
             bitRevKernel.SetArg(1, outImag.Handle);
             bitRevKernel.SetArg(2, batch);
             bitRevKernel.SetArg(3, n);
             bitRevKernel.SetArg(4, log2n);
-            bitRevKernel.Execute2D(n, batch, Math.Min(256, n), 1);
+            bitRevKernel.Execute1D(bitRevItems, Math.Min(256, bitRevItems));
 
-            // Batched FFT butterfly stages
+            // Batched FFT butterfly stages (batch * (n/2) butterfly pairs per stage)
+            int butterflyItems = batch * (n / 2);
             var butterflyKernel = _kernelCache["batched_fft_butterfly"];
             for (int stride = 2; stride <= n; stride *= 2)
             {
@@ -10661,7 +11045,7 @@ KERNEL VARIANTS (A/B testing):
                 butterflyKernel.SetArg(3, n);
                 butterflyKernel.SetArg(4, stride);
                 butterflyKernel.SetArg(5, inverse ? 1 : 0);
-                butterflyKernel.Execute2D(n / 2, batch, Math.Min(256, n / 2), 1);
+                butterflyKernel.Execute1D(butterflyItems, Math.Min(256, butterflyItems));
             }
 
             // Scale for inverse FFT
@@ -10689,16 +11073,22 @@ KERNEL VARIANTS (A/B testing):
             int log2Width = (int)MathHelper.Log2(width);
             int log2Height = (int)MathHelper.Log2(height);
 
-            // Row-wise bit reversal
+            // Row-wise bit reversal. NOTE: these 2D-FFT kernels index via a FLATTENED
+            // get_global_id(0) (row = tid/width etc.), so they MUST be dispatched 1D over the full
+            // element count. They were dispatched via Execute2D (a real 2D NDRange), so
+            // get_global_id(0) only spanned one row/col's worth and every row/col but the first was
+            // left untransformed — the root cause of the whole GPU 2D/ND-FFT divergence family (#775).
+            int rowsTotal = width * height;
             var bitRevRowsKernel = _kernelCache["bit_reverse_rows"];
             bitRevRowsKernel.SetArg(0, outReal.Handle);
             bitRevRowsKernel.SetArg(1, outImag.Handle);
             bitRevRowsKernel.SetArg(2, height);
             bitRevRowsKernel.SetArg(3, width);
             bitRevRowsKernel.SetArg(4, log2Width);
-            bitRevRowsKernel.Execute2D(width, height, Math.Min(16, width), Math.Min(16, height));
+            bitRevRowsKernel.Execute1D(rowsTotal, Math.Min(256, rowsTotal));
 
-            // Row-wise FFT
+            // Row-wise FFT (one butterfly pair per work item: (width/2) pairs per row × height rows)
+            int rowButterflyItems = (width / 2) * height;
             var rowButterfly = _kernelCache["fft_rows_butterfly"];
             for (int stride = 2; stride <= width; stride *= 2)
             {
@@ -10708,7 +11098,7 @@ KERNEL VARIANTS (A/B testing):
                 rowButterfly.SetArg(3, width);
                 rowButterfly.SetArg(4, stride);
                 rowButterfly.SetArg(5, inverse ? 1 : 0);
-                rowButterfly.Execute2D(width / 2, height, Math.Min(16, width / 2), Math.Min(16, height));
+                rowButterfly.Execute1D(rowButterflyItems, Math.Min(256, rowButterflyItems));
             }
 
             // Column-wise bit reversal
@@ -10718,9 +11108,10 @@ KERNEL VARIANTS (A/B testing):
             bitRevColsKernel.SetArg(2, height);
             bitRevColsKernel.SetArg(3, width);
             bitRevColsKernel.SetArg(4, log2Height);
-            bitRevColsKernel.Execute2D(width, height, Math.Min(16, width), Math.Min(16, height));
+            bitRevColsKernel.Execute1D(rowsTotal, Math.Min(256, rowsTotal));
 
-            // Column-wise FFT
+            // Column-wise FFT ((height/2) pairs per col × width cols)
+            int colButterflyItems = (height / 2) * width;
             var colButterfly = _kernelCache["fft_cols_butterfly"];
             for (int stride = 2; stride <= height; stride *= 2)
             {
@@ -10730,7 +11121,7 @@ KERNEL VARIANTS (A/B testing):
                 colButterfly.SetArg(3, width);
                 colButterfly.SetArg(4, stride);
                 colButterfly.SetArg(5, inverse ? 1 : 0);
-                colButterfly.Execute2D(height / 2, width, Math.Min(16, height / 2), Math.Min(16, width));
+                colButterfly.Execute1D(colButterflyItems, Math.Min(256, colButterflyItems));
             }
 
             // Scale for inverse FFT
@@ -10868,7 +11259,11 @@ KERNEL VARIANTS (A/B testing):
             kernel.SetArg(3, numFrames);
             kernel.SetArg(4, numFreqs);
             kernel.SetArg(5, nMels);
-            kernel.Execute2D(nMels, numFrames, Math.Min(32, nMels), 1);
+            // apply_mel_filterbank indexes a FLATTENED get_global_id(0) (frame = idx/nMels), so it MUST
+            // be dispatched 1D over numFrames*nMels. Dispatching Execute2D made get_global_id(0) span only
+            // [0,nMels), leaving all but the first frame's higher mel bins uncomputed (op-parity #775).
+            int melTotal = numFrames * nMels;
+            kernel.Execute1D(melTotal, Math.Min(256, melTotal));
         }
 
         /// <inheritdoc/>
@@ -10960,6 +11355,7 @@ KERNEL VARIANTS (A/B testing):
             var dstBuf = ((DirectOpenClGpuBuffer)dst).Buffer;
 
             // Use EnqueueCopyBuffer for device-to-device copy
+            GpuLaunchProbe.OnLaunch(); // device-to-device copy = GPU-resident work
             int err = OpenClNativeBindings.EnqueueCopyBuffer(
                 _context.CommandQueue,
                 srcBuf.Handle,
@@ -10977,9 +11373,7 @@ KERNEL VARIANTS (A/B testing):
 
         private void ZeroBuffer(IGpuBuffer buffer, int size)
         {
-            var data = new float[size];
-            var buf = ((DirectOpenClGpuBuffer)buffer).Buffer;
-            buf.CopyFromHost(data);
+            ZeroBufferOnDevice(buffer, size);
         }
 
         // Device-side buffer zeroing via the zero_buffer kernel — no host array
@@ -11050,6 +11444,21 @@ KERNEL VARIANTS (A/B testing):
             kernel.Execute1D(size, Math.Min(256, size));
         }
 
+        public void GenerateStatelessDropoutMask(
+            IGpuBuffer output, int size, uint threshold, float scale, uint seed)
+        {
+            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            if (size <= 0) return;
+            var kernel = _kernelCache["stateless_dropout_mask"];
+            uint arg = 0;
+            kernel.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            kernel.SetArg(arg++, size);
+            kernel.SetArg(arg++, threshold);
+            kernel.SetArg(arg++, scale);
+            kernel.SetArg(arg++, seed);
+            kernel.Execute1D(size, Math.Min(256, size));
+        }
+
         public void GenerateRandomNormal(IGpuBuffer output, int size, float mean, float stdDev, ulong seed)
         {
             if (_context == null) throw new InvalidOperationException("OpenCL context not available");
@@ -11068,31 +11477,11 @@ KERNEL VARIANTS (A/B testing):
             kernel.Execute1D(numThreads, Math.Min(256, numThreads));
         }
 
-        public unsafe void GenerateSecureRandomUniform(IGpuBuffer output, int size, float min, float max)
+        public void GenerateSecureRandomUniform(IGpuBuffer output, int size, float min, float max)
         {
             if (_context == null) throw new InvalidOperationException("OpenCL context not available");
             if (size <= 0) return;
-            var data = new float[size];
-            try
-            {
-                Helpers.SimdRandom.SecureFillFloats(data.AsSpan());
-                float range = max - min;
-                for (int i = 0; i < size; i++) data[i] = data[i] * range + min;
-                var openClBuffer = (DirectOpenClGpuBuffer)output;
-                fixed (float* ptr = data)
-                {
-                    int err = OpenClNativeBindings.EnqueueWriteBuffer(
-                        _defaultStream?.Handle ?? _context.CommandQueue,
-                        openClBuffer.Buffer.Handle,
-                        1, // blocking
-                        UIntPtr.Zero,
-                        (UIntPtr)(size * sizeof(float)),
-                        (IntPtr)ptr, 0, IntPtr.Zero, IntPtr.Zero);
-                    if (err != OpenClNativeBindings.CL_SUCCESS)
-                        throw new InvalidOperationException($"clEnqueueWriteBuffer failed: {err}");
-                }
-            }
-            finally { Array.Clear(data, 0, size); }
+            GenerateRandomUniform(output, size, min, max, GpuRandomSeed.Create());
         }
 
         #endregion
@@ -11240,8 +11629,8 @@ KERNEL VARIANTS (A/B testing):
         public void HyperbolicLinearForward(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
             int batchSize, int inputFeatures, int outputFeatures, float curvature, float epsilon)
         {
-            if (!_kernelCache.TryGetValue("hyperbolic_linear_forward", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: hyperbolic_linear_forward");
+            if (!_kernelCache.TryGetValue("hyperbolic_linear_euclidean_forward", out var kernel))
+                throw new InvalidOperationException("OpenCL kernel not found: hyperbolic_linear_euclidean_forward");
 
             int totalThreads = batchSize * outputFeatures;
             int localSize = CalculateOptimalWorkGroupSize1D(totalThreads);
@@ -11255,6 +11644,7 @@ KERNEL VARIANTS (A/B testing):
             kernel.SetArg(7u, curvature);
             kernel.SetArg(8u, epsilon);
             kernel.Execute1D(totalThreads, localSize);
+            PoincareProject(output, output, batchSize, outputFeatures, curvature, epsilon);
         }
 
         /// <inheritdoc/>
@@ -11540,24 +11930,15 @@ KERNEL VARIANTS (A/B testing):
         // GPU magnitude + CPU threshold + GPU kernel
         if (!_kernelCache.TryGetValue("split_complex_topk", out var kernel))
             throw new InvalidOperationException("OpenCL kernel not found: split_complex_topk");
-        // Compute magnitudes squared on GPU
-        var magBuf = AllocateBuffer(n);
-        try
-        {
-            SplitComplexMagnitudeSquared(inReal, inImag, magBuf, n);
-            var magData = DownloadBuffer(magBuf);
-            Array.Sort(magData); Array.Reverse(magData);
-            float threshold = k <= n ? magData[Math.Min(k, n) - 1] : 0f;
-            int localSize = CalculateOptimalWorkGroupSize1D(n);
-            kernel.SetArg(0u, ((DirectOpenClGpuBuffer)inReal).Buffer.Handle);
-            kernel.SetArg(1u, ((DirectOpenClGpuBuffer)inImag).Buffer.Handle);
-            kernel.SetArg(2u, ((DirectOpenClGpuBuffer)outReal).Buffer.Handle);
-            kernel.SetArg(3u, ((DirectOpenClGpuBuffer)outImag).Buffer.Handle);
-            kernel.SetArg(4u, threshold);
-            kernel.SetArg(5u, n);
-            kernel.Execute1D(n, localSize);
-        }
-        finally { magBuf.Dispose(); }
+        k = Math.Min(k, n);
+        int localSize = CalculateOptimalWorkGroupSize1D(n);
+        kernel.SetArg(0u, ((DirectOpenClGpuBuffer)inReal).Buffer.Handle);
+        kernel.SetArg(1u, ((DirectOpenClGpuBuffer)inImag).Buffer.Handle);
+        kernel.SetArg(2u, ((DirectOpenClGpuBuffer)outReal).Buffer.Handle);
+        kernel.SetArg(3u, ((DirectOpenClGpuBuffer)outImag).Buffer.Handle);
+        kernel.SetArg(4u, k);
+        kernel.SetArg(5u, n);
+        kernel.Execute1D(n, localSize);
     }
 
     public void SoftmaxRows(IGpuBuffer input, IGpuBuffer output, int rows, int cols)
@@ -12218,6 +12599,13 @@ KERNEL VARIANTS (A/B testing):
             if (!_kernelCache.TryGetValue("mamba_selective_scan_forward", out var kernel))
                 throw new InvalidOperationException("OpenCL kernel not found: mamba_selective_scan_forward");
 
+            int total = batch * innerDim;
+
+            // Global scratch for the scan state (one stateDim slice per work-item), replacing the old
+            // per-work-item private float[256] that faulted on register-constrained GPUs (#775). The
+            // kernel zero-inits its own slice, so no pre-fill is needed.
+            using var hState = AllocateBuffer(total * stateDim);
+
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)x).Buffer.Handle);
             kernel.SetArg(1u, ((DirectOpenClGpuBuffer)delta).Buffer.Handle);
             kernel.SetArg(2u, ((DirectOpenClGpuBuffer)aLog).Buffer.Handle);
@@ -12225,15 +12613,16 @@ KERNEL VARIANTS (A/B testing):
             kernel.SetArg(4u, ((DirectOpenClGpuBuffer)cParam).Buffer.Handle);
             kernel.SetArg(5u, ((DirectOpenClGpuBuffer)dParam).Buffer.Handle);
             kernel.SetArg(6u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
-            kernel.SetArg(7u, batch);
-            kernel.SetArg(8u, seqLen);
-            kernel.SetArg(9u, innerDim);
-            kernel.SetArg(10u, stateDim);
+            kernel.SetArg(7u, ((DirectOpenClGpuBuffer)hState).Buffer.Handle);
+            kernel.SetArg(8u, batch);
+            kernel.SetArg(9u, seqLen);
+            kernel.SetArg(10u, innerDim);
+            kernel.SetArg(11u, stateDim);
 
-            int total = batch * innerDim;
             int localSize = CalculateOptimalWorkGroupSize1D(total);
             int globalSize = ((total + localSize - 1) / localSize) * localSize;
             kernel.Execute1D(globalSize, localSize);
+            _context?.Finish();
         }
 
         // ── Fused Mamba-2 SSD scan forward (#1464) ──────────────────────────────────────────
@@ -12281,8 +12670,27 @@ KERNEL VARIANTS (A/B testing):
             IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target, int n, int d, int vocab)
             => FusedCeLaunch("fused_linear_ce_dense", hidden, weight, bias, target, n, d, vocab);
 
+        public void FusedLinearCrossEntropyIndex(
+            IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer targetIds,
+            IGpuBuffer meanLoss, int n, int d, int vocab)
+            => FusedCeLaunchResident("fused_linear_ce_index", hidden, weight, bias, targetIds, meanLoss, n, d, vocab);
+
+        public void FusedLinearCrossEntropyDense(
+            IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target,
+            IGpuBuffer meanLoss, int n, int d, int vocab)
+            => FusedCeLaunchResident("fused_linear_ce_dense", hidden, weight, bias, target, meanLoss, n, d, vocab);
+
         private float FusedCeLaunch(
             string kernelName, IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer tgt, int n, int d, int vocab)
+        {
+            using var lossBuf = AllocateBuffer(1);
+            FusedCeLaunchResident(kernelName, hidden, weight, bias, tgt, lossBuf, n, d, vocab);
+            return DownloadBuffer(lossBuf)[0];
+        }
+
+        private void FusedCeLaunchResident(
+            string kernelName, IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer tgt,
+            IGpuBuffer meanLoss, int n, int d, int vocab)
         {
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute FusedLinearCrossEntropy.");
@@ -12291,12 +12699,12 @@ KERNEL VARIANTS (A/B testing):
             if (!_kernelCache.TryGetValue(kernelName, out var kernel))
                 throw new InvalidOperationException($"OpenCL kernel not found: {kernelName}");
 
-            using var lossBuf = AllocateBuffer(new float[] { 0.0f }); // zeroed accumulator
+            Fill(meanLoss, 0f, 1);
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)hidden).Buffer.Handle);
             kernel.SetArg(1u, ((DirectOpenClGpuBuffer)weight).Buffer.Handle);
             kernel.SetArg(2u, ((DirectOpenClGpuBuffer)bias).Buffer.Handle);
             kernel.SetArg(3u, ((DirectOpenClGpuBuffer)tgt).Buffer.Handle);
-            kernel.SetArg(4u, ((DirectOpenClGpuBuffer)lossBuf).Buffer.Handle);
+            kernel.SetArg(4u, ((DirectOpenClGpuBuffer)meanLoss).Buffer.Handle);
             kernel.SetArg(5u, n);
             kernel.SetArg(6u, d);
             kernel.SetArg(7u, vocab);
@@ -12304,8 +12712,7 @@ KERNEL VARIANTS (A/B testing):
             int localSize = CalculateOptimalWorkGroupSize1D(n);
             int globalSize = ((n + localSize - 1) / localSize) * localSize;
             kernel.Execute1D(globalSize, localSize);
-            var loss = DownloadBuffer(lossBuf);
-            return loss[0] / n;
+            Scale(meanLoss, meanLoss, 1f / n, 1);
         }
 
         public void LstmForwardSequence(
@@ -12593,8 +13000,8 @@ KERNEL VARIANTS (A/B testing):
     public void EyeKernel(IGpuBuffer o, int n) { if(_context==null)return; var k=_kernelCache["eye_kernel"]; k.SetArg(0,((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(1,n); k.Execute1D(n*n,CalculateOptimalWorkGroupSize1D(n*n)); }
     public void OneHotKernel(IGpuBuffer idx, IGpuBuffer o, int bs, int nc) { if(_context==null)return; var k=_kernelCache["one_hot_kernel"]; k.SetArg(0,((DirectOpenClGpuBuffer)idx).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(2,bs); k.SetArg(3,nc); k.Execute1D(bs*nc,CalculateOptimalWorkGroupSize1D(bs*nc)); }
     public void MaskedFillKernel(IGpuBuffer i, IGpuBuffer m, IGpuBuffer o, float fv, int sz) { if(_context==null)return; var k=_kernelCache["masked_fill_kernel"]; k.SetArg(0,((DirectOpenClGpuBuffer)i).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)m).Buffer.Handle); k.SetArg(2,((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(3,fv); k.SetArg(4,sz); k.Execute1D(sz,CalculateOptimalWorkGroupSize1D(sz)); }
-    public void EqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) { ExecuteElementwise("equals_kernel", a, b, o, sz); }
-    public void NotEqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) { ExecuteElementwise("not_equals_kernel", a, b, o, sz); }
+    public void EqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) { ExecuteScalarElementwise("equals_kernel", a, b, o, sz); }
+    public void NotEqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) { ExecuteScalarElementwise("not_equals_kernel", a, b, o, sz); }
     public void ClassifyFloat(IGpuBuffer a, IGpuBuffer c, int mode, int sz) { if(_context==null)return; var k=_kernelCache["classify_float"]; k.SetArg(0,((DirectOpenClGpuBuffer)a).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)c).Buffer.Handle); k.SetArg(2,mode); k.SetArg(3,sz); k.Execute1D(sz,CalculateOptimalWorkGroupSize1D(sz)); }
     public void TakeAlongDim(IGpuBuffer input, IGpuBuffer indices, IGpuBuffer output, int outerSize, int axisOut, int innerSize, int axisIn) { if(_context==null)return; var k=_kernelCache["take_along_dim"]; k.SetArg(0,((DirectOpenClGpuBuffer)input).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)indices).Buffer.Handle); k.SetArg(2,((DirectOpenClGpuBuffer)output).Buffer.Handle); k.SetArg(3,outerSize); k.SetArg(4,axisOut); k.SetArg(5,innerSize); k.SetArg(6,axisIn); int total=outerSize*axisOut*innerSize; k.Execute1D(total,CalculateOptimalWorkGroupSize1D(total)); }
     public void Cross3(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int outerSize, int innerSize) { if(_context==null)return; var k=_kernelCache["cross3"]; k.SetArg(0,((DirectOpenClGpuBuffer)a).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)b).Buffer.Handle); k.SetArg(2,((DirectOpenClGpuBuffer)output).Buffer.Handle); k.SetArg(3,outerSize); k.SetArg(4,innerSize); int total=outerSize*innerSize; k.Execute1D(total,CalculateOptimalWorkGroupSize1D(total)); }
@@ -12602,7 +13009,7 @@ KERNEL VARIANTS (A/B testing):
     public void Kron2D(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int am, int an, int bp, int bq) { if(_context==null)return; var k=_kernelCache["kron2d"]; k.SetArg(0,((DirectOpenClGpuBuffer)a).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)b).Buffer.Handle); k.SetArg(2,((DirectOpenClGpuBuffer)output).Buffer.Handle); k.SetArg(3,am); k.SetArg(4,an); k.SetArg(5,bp); k.SetArg(6,bq); int total=am*bp*an*bq; k.Execute1D(total,CalculateOptimalWorkGroupSize1D(total)); }
     public void SearchSorted(IGpuBuffer sortedSeq, IGpuBuffer values, IGpuBuffer output, int seqLen, int numValues, int right) { if(_context==null)return; var k=_kernelCache["search_sorted"]; k.SetArg(0,((DirectOpenClGpuBuffer)sortedSeq).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)values).Buffer.Handle); k.SetArg(2,((DirectOpenClGpuBuffer)output).Buffer.Handle); k.SetArg(3,seqLen); k.SetArg(4,numValues); k.SetArg(5,right); k.Execute1D(numValues,CalculateOptimalWorkGroupSize1D(numValues)); }
     public void NextAfter(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size) { if(_context==null)return; var k=_kernelCache["next_after"]; k.SetArg(0,((DirectOpenClGpuBuffer)a).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)b).Buffer.Handle); k.SetArg(2,((DirectOpenClGpuBuffer)output).Buffer.Handle); k.SetArg(3,size); k.Execute1D(size,CalculateOptimalWorkGroupSize1D(size)); }
-    public void IndexWrite(IGpuBuffer output, IGpuBuffer indices, IGpuBuffer source, float fillValue, int mode, int outerSize, int idxAxis, int innerSize, int dstAxis) { if(_context==null)return; var k=_kernelCache["index_write"]; k.SetArg(0,((DirectOpenClGpuBuffer)output).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)indices).Buffer.Handle); k.SetArg(2,((DirectOpenClGpuBuffer)source).Buffer.Handle); k.SetArg(3,fillValue); k.SetArg(4,mode); k.SetArg(5,outerSize); k.SetArg(6,idxAxis); k.SetArg(7,innerSize); k.SetArg(8,dstAxis); int total=outerSize*idxAxis*innerSize; k.Execute1D(total,CalculateOptimalWorkGroupSize1D(total)); }
+    public void IndexWrite(IGpuBuffer output, IGpuBuffer indices, IGpuBuffer source, float fillValue, int mode, int outerSize, int idxAxis, int innerSize, int dstAxis) { if(_context==null)return; var k=_kernelCache["index_write"]; k.SetArg(0,((DirectOpenClGpuBuffer)output).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)indices).Buffer.Handle); k.SetArg(2,((DirectOpenClGpuBuffer)source).Buffer.Handle); k.SetArg(3,fillValue); k.SetArg(4,mode); k.SetArg(5,outerSize); k.SetArg(6,idxAxis); k.SetArg(7,innerSize); k.SetArg(8,dstAxis); int total=outerSize*dstAxis*innerSize; k.Execute1D(total,CalculateOptimalWorkGroupSize1D(total)); }
     public void CDist(IGpuBuffer x1, IGpuBuffer x2, IGpuBuffer output, int m, int n, int d, float p) { if(_context==null)return; var k=_kernelCache["cdist"]; k.SetArg(0,((DirectOpenClGpuBuffer)x1).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)x2).Buffer.Handle); k.SetArg(2,((DirectOpenClGpuBuffer)output).Buffer.Handle); k.SetArg(3,m); k.SetArg(4,n); k.SetArg(5,d); k.SetArg(6,p); int total=m*n; k.Execute1D(total,CalculateOptimalWorkGroupSize1D(total)); }
     public void PDist(IGpuBuffer input, IGpuBuffer output, int n, int d, float p) { if(_context==null)return; var k=_kernelCache["pdist"]; k.SetArg(0,((DirectOpenClGpuBuffer)input).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)output).Buffer.Handle); k.SetArg(2,n); k.SetArg(3,d); k.SetArg(4,p); int total=n*n; k.Execute1D(total,CalculateOptimalWorkGroupSize1D(total)); }
     public void Histc(IGpuBuffer input, IGpuBuffer hist, int n, int bins, float mn, float mx) { if(_context==null)return; var k=_kernelCache["histc"]; k.SetArg(0,((DirectOpenClGpuBuffer)input).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)hist).Buffer.Handle); k.SetArg(2,n); k.SetArg(3,bins); k.SetArg(4,mn); k.SetArg(5,mx); k.Execute1D(n,CalculateOptimalWorkGroupSize1D(n)); }
@@ -12620,7 +13027,7 @@ KERNEL VARIANTS (A/B testing):
     public void StftMagPhase(IGpuBuffer padded, IGpuBuffer window, IGpuBuffer mag, IGpuBuffer phase, int batch, int lp, int nFft, int hop, int numFrames, int numFreqs) { if(_context==null)return; var k=_kernelCache["stft_mag_phase"]; k.SetArg(0,((DirectOpenClGpuBuffer)padded).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)window).Buffer.Handle); k.SetArg(2,((DirectOpenClGpuBuffer)mag).Buffer.Handle); k.SetArg(3,((DirectOpenClGpuBuffer)phase).Buffer.Handle); k.SetArg(4,batch); k.SetArg(5,lp); k.SetArg(6,nFft); k.SetArg(7,hop); k.SetArg(8,numFrames); k.SetArg(9,numFreqs); int total=batch*numFreqs*numFrames; k.Execute1D(total,CalculateOptimalWorkGroupSize1D(total)); }
     public void PhaseVocoder(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer newMag, IGpuBuffer newPhase, int leading, int nFramesV, int nFreqV, int outFrames, float rate) { if(_context==null)return; var k=_kernelCache["phase_vocoder"]; k.SetArg(0,((DirectOpenClGpuBuffer)mag).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)phase).Buffer.Handle); k.SetArg(2,((DirectOpenClGpuBuffer)newMag).Buffer.Handle); k.SetArg(3,((DirectOpenClGpuBuffer)newPhase).Buffer.Handle); k.SetArg(4,leading); k.SetArg(5,nFramesV); k.SetArg(6,nFreqV); k.SetArg(7,outFrames); k.SetArg(8,rate); int total=leading*nFreqV; k.Execute1D(total,CalculateOptimalWorkGroupSize1D(total)); }
     public void BuildSpectrum(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer specRe, IGpuBuffer specIm, int batch, int numFreqs, int numFrames, int nFft) { if(_context==null)return; var k=_kernelCache["build_spectrum"]; k.SetArg(0,((DirectOpenClGpuBuffer)mag).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)phase).Buffer.Handle); k.SetArg(2,((DirectOpenClGpuBuffer)specRe).Buffer.Handle); k.SetArg(3,((DirectOpenClGpuBuffer)specIm).Buffer.Handle); k.SetArg(4,batch); k.SetArg(5,numFreqs); k.SetArg(6,numFrames); k.SetArg(7,nFft); int total=batch*numFrames; k.Execute1D(total,CalculateOptimalWorkGroupSize1D(total)); }
-    public void IstftFromSpectrum(IGpuBuffer specRe, IGpuBuffer specIm, IGpuBuffer window, IGpuBuffer result, IGpuBuffer windowSum, int batch, int numFrames, int nFft, int hop, int outputLength, int center) { if(_context==null)return; var k=_kernelCache["istft_from_spectrum"]; k.SetArg(0,((DirectOpenClGpuBuffer)specRe).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)specIm).Buffer.Handle); k.SetArg(2,((DirectOpenClGpuBuffer)window).Buffer.Handle); k.SetArg(3,((DirectOpenClGpuBuffer)result).Buffer.Handle); k.SetArg(4,((DirectOpenClGpuBuffer)windowSum).Buffer.Handle); k.SetArg(5,batch); k.SetArg(6,numFrames); k.SetArg(7,nFft); k.SetArg(8,hop); k.SetArg(9,outputLength); k.SetArg(10,center); int total=batch*numFrames*nFft; k.Execute1D(total,CalculateOptimalWorkGroupSize1D(total)); }
+    public void IstftFromSpectrum(IGpuBuffer specRe, IGpuBuffer specIm, IGpuBuffer window, IGpuBuffer result, IGpuBuffer windowSum, int batch, int numFrames, int nFft, int hop, int outputLength, int center) { if(_context==null)return; var k=_kernelCache["istft_from_spectrum"]; k.SetArg(0,((DirectOpenClGpuBuffer)specRe).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)specIm).Buffer.Handle); k.SetArg(2,((DirectOpenClGpuBuffer)window).Buffer.Handle); k.SetArg(3,((DirectOpenClGpuBuffer)result).Buffer.Handle); k.SetArg(4,((DirectOpenClGpuBuffer)windowSum).Buffer.Handle); k.SetArg(5,batch); k.SetArg(6,numFrames); k.SetArg(7,nFft); k.SetArg(8,hop); k.SetArg(9,outputLength); k.SetArg(10,center); int total=batch*outputLength; k.Execute1D(total,CalculateOptimalWorkGroupSize1D(total)); }
     public void IstftNormalize(IGpuBuffer result, IGpuBuffer windowSum, int total) { if(_context==null)return; var k=_kernelCache["istft_normalize"]; k.SetArg(0,((DirectOpenClGpuBuffer)result).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)windowSum).Buffer.Handle); k.SetArg(2,total); k.Execute1D(total,CalculateOptimalWorkGroupSize1D(total)); }
     public void HistogramDD(IGpuBuffer samples, IGpuBuffer hist, IGpuBuffer bins, IGpuBuffer mins, IGpuBuffer maxs, int n, int d) { if(_context==null)return; var k=_kernelCache["histogramdd"]; k.SetArg(0,((DirectOpenClGpuBuffer)samples).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)hist).Buffer.Handle); k.SetArg(2,((DirectOpenClGpuBuffer)bins).Buffer.Handle); k.SetArg(3,((DirectOpenClGpuBuffer)mins).Buffer.Handle); k.SetArg(4,((DirectOpenClGpuBuffer)maxs).Buffer.Handle); k.SetArg(5,n); k.SetArg(6,d); k.Execute1D(n,CalculateOptimalWorkGroupSize1D(n)); }
     public void MasksToBoxes(IGpuBuffer masks, IGpuBuffer output, int n, int h, int w) { if(_context==null)return; var k=_kernelCache["masks_to_boxes"]; k.SetArg(0,((DirectOpenClGpuBuffer)masks).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)output).Buffer.Handle); k.SetArg(2,n); k.SetArg(3,h); k.SetArg(4,w); k.Execute1D(n,CalculateOptimalWorkGroupSize1D(n)); }

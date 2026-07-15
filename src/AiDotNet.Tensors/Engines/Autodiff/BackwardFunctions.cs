@@ -1076,6 +1076,19 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
+    /// <summary>MaxPool2D backward with tensor-resident flat spatial indices.</summary>
+    internal static void MaxPool2DTensorIndicesBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var maxIndices = (Tensor<int>)savedState[0];
+        var poolSize = (int[])savedState[1];
+        var stride = (int[])savedState[2];
+        var grad = engine.MaxPool2DBackwardWithTensorIndices(
+            gradOutput, maxIndices, inputs[0]._shape, poolSize, stride);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
     /// <summary>AvgPool2D backward: uses engine.AvgPool2DBackward</summary>
     internal static void AvgPool2DBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
@@ -2418,13 +2431,13 @@ internal static class BackwardFunctions<T>
             double srcY = (oy + 0.5) * h / outH - 0.5;
             int y0 = Math.Max(0, (int)Math.Floor(srcY));
             int y1 = Math.Min(y0 + 1, h - 1);
-            double fy = srcY - y0;
+            double fy = Math.Max(0.0, srcY - y0); // clamp to match the forward (#775 align_corners=False edge).
             for (int ox = 0; ox < outW; ox++)
             {
                 double srcX = (ox + 0.5) * w / outW - 0.5;
                 int x0 = Math.Max(0, (int)Math.Floor(srcX));
                 int x1 = Math.Min(x0 + 1, w - 1);
-                double fx = srcX - x0;
+                double fx = Math.Max(0.0, srcX - x0); // clamp to match the forward (#775).
                 double g = numOps.ToDouble(gradOutput[bc * outH * outW + oy * outW + ox]);
                 int baseIdx = bc * h * w;
                 inputGrad[baseIdx + y0 * w + x0] = numOps.Add(inputGrad[baseIdx + y0 * w + x0], numOps.FromDouble(g * (1 - fy) * (1 - fx)));
@@ -3857,6 +3870,20 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
+    /// <summary>MaxPool3D backward with tensor-resident flat spatial indices.</summary>
+    internal static void MaxPool3DTensorIndicesBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var maxIndices = (Tensor<int>)savedState[0];
+        var inputShape = inputs[0]._shape;
+        var poolSize = (int[])savedState[1];
+        var stride = (int[])savedState[2];
+        var grad = engine.MaxPool3DBackwardWithTensorIndices(
+            gradOutput, maxIndices, inputShape, poolSize, stride);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
     /// <summary>DepthwiseConv2D backward via engine backward helpers</summary>
     internal static void DepthwiseConv2DBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
@@ -4096,6 +4123,18 @@ internal static class BackwardFunctions<T>
         var maxIndices = (int[])savedState[0];
         var inputShape = inputs[0]._shape;
         var grad = engine.ReduceMaxBackward(gradOutput, maxIndices, inputShape);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
+    /// <summary>ReduceMax backward with tensor-resident relative argmax positions.</summary>
+    internal static void ReduceMaxTensorIndicesBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var maxIndices = (Tensor<int>)savedState[0];
+        var axes = (int[])savedState[1];
+        var grad = engine.ReduceMaxBackwardWithTensorIndices(
+            gradOutput, maxIndices, inputs[0]._shape, axes);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 

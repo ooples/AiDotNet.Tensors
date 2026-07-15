@@ -1,121 +1,139 @@
 // Copyright (c) AiDotNet. All rights reserved.
-// Vulkan backend - sparse optimizer scatter updates.
+// Vulkan backend - deterministic resident sparse optimizer scatter updates.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
 public sealed unsafe partial class VulkanBackend
 {
-    // Staged correctness fallback: Vulkan sparse optimizer updates currently download and
-    // upload full param/state buffers, so host-device traffic is O(param.Size + state.Size + nnz)
-    // rather than native O(nnz). This preserves backend correctness until native SPIR-V scatter
-    // kernels land; throughput-sensitive sparse embedding workloads should use a native
-    // scatter backend.
-
-    public void SparseSgdUpdate(IGpuBuffer param, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float learningRate, float weightDecay)
-        => ApplySparse(param, sparseIndices, sparseValues, (p, i, v) =>
-            SparseOptimizerReference.SparseSgdUpdate(p, i, v, nnz, learningRate, weightDecay));
-
-    public void SparseSgdMomentumUpdate(IGpuBuffer param, IGpuBuffer velocity, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float learningRate, float momentum, float weightDecay)
-        => ApplySparse1(param, velocity, sparseIndices, sparseValues, (p, s, i, v) =>
-            SparseOptimizerReference.SparseSgdMomentumUpdate(p, s, i, v, nnz, learningRate, momentum, weightDecay));
-
-    public void SparseAdamUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer v, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step)
-        => ApplySparse2(param, m, v, sparseIndices, sparseValues, (p, s1, s2, i, vals) =>
-            SparseOptimizerReference.SparseAdamUpdate(p, s1, s2, i, vals, nnz, learningRate, beta1, beta2, epsilon, weightDecay, step));
-
-    public void SparseAdamWUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer v, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step)
-        => ApplySparse2(param, m, v, sparseIndices, sparseValues, (p, s1, s2, i, vals) =>
-            SparseOptimizerReference.SparseAdamWUpdate(p, s1, s2, i, vals, nnz, learningRate, beta1, beta2, epsilon, weightDecay, step));
-
-    public void SparseRmspropUpdate(IGpuBuffer param, IGpuBuffer squaredAvg, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float learningRate, float rho, float epsilon, float weightDecay)
-        => ApplySparse1(param, squaredAvg, sparseIndices, sparseValues, (p, s, i, v) =>
-            SparseOptimizerReference.SparseRmspropUpdate(p, s, i, v, nnz, learningRate, rho, epsilon, weightDecay));
-
-    public void SparseAdagradUpdate(IGpuBuffer param, IGpuBuffer accumulatedGrad, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float learningRate, float epsilon, float weightDecay)
-        => ApplySparse1(param, accumulatedGrad, sparseIndices, sparseValues, (p, s, i, v) =>
-            SparseOptimizerReference.SparseAdagradUpdate(p, s, i, v, nnz, learningRate, epsilon, weightDecay));
-
-    public void SparseNagUpdate(IGpuBuffer param, IGpuBuffer velocity, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float learningRate, float momentum, float weightDecay)
-        => ApplySparse1(param, velocity, sparseIndices, sparseValues, (p, s, i, v) =>
-            SparseOptimizerReference.SparseNagUpdate(p, s, i, v, nnz, learningRate, momentum, weightDecay));
-
-    public void SparseAdadeltaUpdate(IGpuBuffer param, IGpuBuffer accumGrad, IGpuBuffer accumUpdate, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float rho, float epsilon, float weightDecay)
-        => ApplySparse2(param, accumGrad, accumUpdate, sparseIndices, sparseValues, (p, s1, s2, i, v) =>
-            SparseOptimizerReference.SparseAdadeltaUpdate(p, s1, s2, i, v, nnz, rho, epsilon, weightDecay));
-
-    public void SparseAmsgradUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer v, IGpuBuffer vMax, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step)
-        => ApplySparse3(param, m, v, vMax, sparseIndices, sparseValues, (p, s1, s2, s3, i, vals) =>
-            SparseOptimizerReference.SparseAmsgradUpdate(p, s1, s2, s3, i, vals, nnz, learningRate, beta1, beta2, epsilon, weightDecay, step));
-
-    public void SparseAdamaxUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer u, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step)
-        => ApplySparse2(param, m, u, sparseIndices, sparseValues, (p, s1, s2, i, vals) =>
-            SparseOptimizerReference.SparseAdamaxUpdate(p, s1, s2, i, vals, nnz, learningRate, beta1, beta2, epsilon, weightDecay, step));
-
-    public void SparseLionUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float learningRate, float beta1, float beta2, float weightDecay)
-        => ApplySparse1(param, m, sparseIndices, sparseValues, (p, s, i, v) =>
-            SparseOptimizerReference.SparseLionUpdate(p, s, i, v, nnz, learningRate, beta1, beta2, weightDecay));
-
-    public void SparseNadamUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer v, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step)
-        => ApplySparse2(param, m, v, sparseIndices, sparseValues, (p, s1, s2, i, vals) =>
-            SparseOptimizerReference.SparseNadamUpdate(p, s1, s2, i, vals, nnz, learningRate, beta1, beta2, epsilon, weightDecay, step));
-
-    public void SparseFtrlUpdate(IGpuBuffer param, IGpuBuffer z, IGpuBuffer n, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float learningRate, float l1Reg, float l2Reg, float beta)
-        => ApplySparse2(param, z, n, sparseIndices, sparseValues, (p, s1, s2, i, v) =>
-            SparseOptimizerReference.SparseFtrlUpdate(p, s1, s2, i, v, nnz, learningRate, l1Reg, l2Reg, beta));
-
-    public void SparseProximalL1Update(IGpuBuffer param, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float learningRate, float l1Strength)
-        => ApplySparse(param, sparseIndices, sparseValues, (p, i, v) =>
-            SparseOptimizerReference.SparseProximalL1Update(p, i, v, nnz, learningRate, l1Strength));
-
-    private void ApplySparse(IGpuBuffer param, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, Action<float[], float[], float[]> update)
+    private void DispatchSparseOptimizer(IGpuBuffer param, IGpuBuffer? state1, IGpuBuffer? state2,
+        IGpuBuffer? state3, IGpuBuffer sparseIndices, IGpuBuffer sparseValues,
+        int nnz, int operation, int step, float learningRate, float p0, float p1, float p2, float p3)
     {
         EnsureInitialized();
-        var p = DownloadBuffer(param);
-        var i = DownloadBuffer(sparseIndices);
-        var v = DownloadBuffer(sparseValues);
-        update(p, i, v);
-        UploadToBuffer(p, param);
+        if (nnz < 0 || nnz > sparseIndices.Size || nnz > sparseValues.Size)
+            throw new ArgumentOutOfRangeException(nameof(nnz), "nnz must fit both sparse input buffers.");
+        if ((state1 is not null && state1.Size < param.Size) ||
+            (state2 is not null && state2.Size < param.Size) ||
+            (state3 is not null && state3.Size < param.Size))
+            throw new ArgumentException("Sparse optimizer state buffers must be at least as large as the parameter buffer.");
+        if (nnz == 0) return;
+
+        using var state1Dummy = state1 is null ? AllocateBuffer(1) : null;
+        using var state2Dummy = state2 is null ? AllocateBuffer(1) : null;
+        using var state3Dummy = state3 is null ? AllocateBuffer(1) : null;
+        GlslNaryOp(VulkanOptimizerKernels.Sparse,
+            new[] { param, state1 ?? state1Dummy!, state2 ?? state2Dummy!, state3 ?? state3Dummy!, sparseIndices, sparseValues },
+            1, new[] { (uint)param.Size, (uint)nnz, (uint)operation, (uint)step, FloatBits(learningRate),
+                FloatBits(p0), FloatBits(p1), FloatBits(p2), FloatBits(p3) });
     }
 
-    private void ApplySparse1(IGpuBuffer param, IGpuBuffer state, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, Action<float[], float[], float[], float[]> update)
+    public void SparseSgdUpdate(IGpuBuffer param, IGpuBuffer sparseIndices, IGpuBuffer sparseValues,
+        int nnz, float learningRate, float weightDecay)
+        => DispatchSparseOptimizer(param, null, null, null, sparseIndices, sparseValues,
+            nnz, 0, 0, learningRate, weightDecay, 0f, 0f, 0f);
+
+    public void SparseSgdMomentumUpdate(IGpuBuffer param, IGpuBuffer velocity, IGpuBuffer sparseIndices,
+        IGpuBuffer sparseValues, int nnz, float learningRate, float momentum, float weightDecay)
+        => DispatchSparseOptimizer(param, velocity, null, null, sparseIndices, sparseValues,
+            nnz, 1, 0, learningRate, momentum, weightDecay, 0f, 0f);
+
+    public void SparseAdamUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer v, IGpuBuffer sparseIndices,
+        IGpuBuffer sparseValues, int nnz, float learningRate, float beta1, float beta2, float epsilon,
+        float weightDecay, int step)
     {
-        EnsureInitialized();
-        var p = DownloadBuffer(param);
-        var s = DownloadBuffer(state);
-        var i = DownloadBuffer(sparseIndices);
-        var v = DownloadBuffer(sparseValues);
-        update(p, s, i, v);
-        UploadToBuffer(p, param);
-        UploadToBuffer(s, state);
+        ValidateSparseBiasCorrected(step, epsilon);
+        DispatchSparseOptimizer(param, m, v, null, sparseIndices, sparseValues,
+            nnz, 2, step, learningRate, beta1, beta2, epsilon, weightDecay);
     }
 
-    private void ApplySparse2(IGpuBuffer param, IGpuBuffer state1, IGpuBuffer state2, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, Action<float[], float[], float[], float[], float[]> update)
+    public void SparseAdamWUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer v, IGpuBuffer sparseIndices,
+        IGpuBuffer sparseValues, int nnz, float learningRate, float beta1, float beta2, float epsilon,
+        float weightDecay, int step)
     {
-        EnsureInitialized();
-        var p = DownloadBuffer(param);
-        var s1 = DownloadBuffer(state1);
-        var s2 = DownloadBuffer(state2);
-        var i = DownloadBuffer(sparseIndices);
-        var v = DownloadBuffer(sparseValues);
-        update(p, s1, s2, i, v);
-        UploadToBuffer(p, param);
-        UploadToBuffer(s1, state1);
-        UploadToBuffer(s2, state2);
+        ValidateSparseBiasCorrected(step, epsilon);
+        DispatchSparseOptimizer(param, m, v, null, sparseIndices, sparseValues,
+            nnz, 3, step, learningRate, beta1, beta2, epsilon, weightDecay);
     }
 
-    private void ApplySparse3(IGpuBuffer param, IGpuBuffer state1, IGpuBuffer state2, IGpuBuffer state3, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, Action<float[], float[], float[], float[], float[], float[]> update)
+    public void SparseRmspropUpdate(IGpuBuffer param, IGpuBuffer squaredAvg, IGpuBuffer sparseIndices,
+        IGpuBuffer sparseValues, int nnz, float learningRate, float rho, float epsilon, float weightDecay)
     {
-        EnsureInitialized();
-        var p = DownloadBuffer(param);
-        var s1 = DownloadBuffer(state1);
-        var s2 = DownloadBuffer(state2);
-        var s3 = DownloadBuffer(state3);
-        var i = DownloadBuffer(sparseIndices);
-        var v = DownloadBuffer(sparseValues);
-        update(p, s1, s2, s3, i, v);
-        UploadToBuffer(p, param);
-        UploadToBuffer(s1, state1);
-        UploadToBuffer(s2, state2);
-        UploadToBuffer(s3, state3);
+        ValidateSparseEpsilon(epsilon);
+        DispatchSparseOptimizer(param, squaredAvg, null, null, sparseIndices, sparseValues,
+            nnz, 4, 0, learningRate, rho, epsilon, weightDecay, 0f);
+    }
+
+    public void SparseAdagradUpdate(IGpuBuffer param, IGpuBuffer accumulatedGrad, IGpuBuffer sparseIndices,
+        IGpuBuffer sparseValues, int nnz, float learningRate, float epsilon, float weightDecay)
+    {
+        ValidateSparseEpsilon(epsilon);
+        DispatchSparseOptimizer(param, accumulatedGrad, null, null, sparseIndices, sparseValues,
+            nnz, 5, 0, learningRate, epsilon, weightDecay, 0f, 0f);
+    }
+
+    public void SparseNagUpdate(IGpuBuffer param, IGpuBuffer velocity, IGpuBuffer sparseIndices,
+        IGpuBuffer sparseValues, int nnz, float learningRate, float momentum, float weightDecay)
+        => DispatchSparseOptimizer(param, velocity, null, null, sparseIndices, sparseValues,
+            nnz, 6, 0, learningRate, momentum, weightDecay, 0f, 0f);
+
+    public void SparseAdadeltaUpdate(IGpuBuffer param, IGpuBuffer accumGrad, IGpuBuffer accumUpdate,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float rho, float epsilon, float weightDecay)
+    {
+        ValidateSparseEpsilon(epsilon);
+        DispatchSparseOptimizer(param, accumGrad, accumUpdate, null, sparseIndices, sparseValues,
+            nnz, 7, 0, 0f, rho, epsilon, weightDecay, 0f);
+    }
+
+    public void SparseAmsgradUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer v, IGpuBuffer vMax,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float learningRate, float beta1,
+        float beta2, float epsilon, float weightDecay, int step)
+    {
+        ValidateSparseBiasCorrected(step, epsilon);
+        DispatchSparseOptimizer(param, m, v, vMax, sparseIndices, sparseValues,
+            nnz, 8, step, learningRate, beta1, beta2, epsilon, weightDecay);
+    }
+
+    public void SparseAdamaxUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer u, IGpuBuffer sparseIndices,
+        IGpuBuffer sparseValues, int nnz, float learningRate, float beta1, float beta2, float epsilon,
+        float weightDecay, int step)
+    {
+        ValidateSparseBiasCorrected(step, epsilon);
+        DispatchSparseOptimizer(param, m, u, null, sparseIndices, sparseValues,
+            nnz, 9, step, learningRate, beta1, beta2, epsilon, weightDecay);
+    }
+
+    public void SparseLionUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer sparseIndices,
+        IGpuBuffer sparseValues, int nnz, float learningRate, float beta1, float beta2, float weightDecay)
+        => DispatchSparseOptimizer(param, m, null, null, sparseIndices, sparseValues,
+            nnz, 10, 0, learningRate, beta1, beta2, weightDecay, 0f);
+
+    public void SparseNadamUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer v, IGpuBuffer sparseIndices,
+        IGpuBuffer sparseValues, int nnz, float learningRate, float beta1, float beta2, float epsilon,
+        float weightDecay, int step)
+    {
+        ValidateSparseBiasCorrected(step, epsilon);
+        DispatchSparseOptimizer(param, m, v, null, sparseIndices, sparseValues,
+            nnz, 11, step, learningRate, beta1, beta2, epsilon, weightDecay);
+    }
+
+    public void SparseFtrlUpdate(IGpuBuffer param, IGpuBuffer z, IGpuBuffer n, IGpuBuffer sparseIndices,
+        IGpuBuffer sparseValues, int nnz, float learningRate, float l1Reg, float l2Reg, float beta)
+        => DispatchSparseOptimizer(param, z, n, null, sparseIndices, sparseValues,
+            nnz, 12, 0, learningRate, l1Reg, l2Reg, beta, 0f);
+
+    public void SparseProximalL1Update(IGpuBuffer param, IGpuBuffer sparseIndices, IGpuBuffer sparseValues,
+        int nnz, float learningRate, float l1Strength)
+        => DispatchSparseOptimizer(param, null, null, null, sparseIndices, sparseValues,
+            nnz, 13, 0, learningRate, l1Strength, 0f, 0f, 0f);
+
+    private static void ValidateSparseBiasCorrected(int step, float epsilon)
+    {
+        if (step < 1) throw new ArgumentOutOfRangeException(nameof(step));
+        ValidateSparseEpsilon(epsilon);
+    }
+
+    private static void ValidateSparseEpsilon(float epsilon)
+    {
+        if (epsilon <= 0f) throw new ArgumentOutOfRangeException(nameof(epsilon));
     }
 }

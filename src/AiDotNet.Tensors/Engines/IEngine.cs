@@ -3283,6 +3283,12 @@ public interface IEngine
     Tensor<T> MaxPool2DWithIndices<T>(Tensor<T> input, int[] poolSize, int[] stride, out int[,,,,] maxIndices);
 
     /// <summary>
+    /// Performs 2D max pooling and returns flat spatial argmax indices as a tensor.
+    /// Unlike the CLR-array overload, device engines can keep the indices resident for backpropagation.
+    /// </summary>
+    Tensor<T> MaxPool2DWithTensorIndices<T>(Tensor<T> input, int[] poolSize, int[] stride, out Tensor<int> maxIndices);
+
+    /// <summary>
     /// Computes the gradient of MaxPool2D with respect to the input.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
@@ -3293,6 +3299,11 @@ public interface IEngine
     /// <param name="stride">The stride used in forward pass.</param>
     /// <returns>The gradient with respect to the input.</returns>
     Tensor<T> MaxPool2DBackward<T>(Tensor<T> gradOutput, int[,,,,] maxIndices, int[] inputShape, int[] poolSize, int[] stride);
+
+    /// <summary>
+    /// Computes the 2D max-pool input gradient from tensor-resident flat spatial indices.
+    /// </summary>
+    Tensor<T> MaxPool2DBackwardWithTensorIndices<T>(Tensor<T> gradOutput, Tensor<int> maxIndices, int[] inputShape, int[] poolSize, int[] stride);
 
     /// <summary>
     /// Performs 2D average pooling with asymmetric pool size and stride.
@@ -3845,6 +3856,12 @@ public interface IEngine
     Tensor<T> MaxPool3DWithIndices<T>(Tensor<T> input, int[] poolSize, int[] stride, out int[,,,,,] maxIndices);
 
     /// <summary>
+    /// Performs 3D max pooling and returns flat spatial argmax indices as a tensor.
+    /// Unlike the CLR-array overload, device engines can keep the indices resident for backpropagation.
+    /// </summary>
+    Tensor<T> MaxPool3DWithTensorIndices<T>(Tensor<T> input, int[] poolSize, int[] stride, out Tensor<int> maxIndices);
+
+    /// <summary>
     /// Computes the gradient of MaxPool3D with respect to the input.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
@@ -3861,6 +3878,11 @@ public interface IEngine
     /// </para>
     /// </remarks>
     Tensor<T> MaxPool3DBackward<T>(Tensor<T> gradOutput, int[,,,,,] maxIndices, int[] inputShape, int[] poolSize, int[] stride);
+
+    /// <summary>
+    /// Computes the 3D max-pool input gradient from tensor-resident flat spatial indices.
+    /// </summary>
+    Tensor<T> MaxPool3DBackwardWithTensorIndices<T>(Tensor<T> gradOutput, Tensor<int> maxIndices, int[] inputShape, int[] poolSize, int[] stride);
 
     /// <summary>
     /// Performs 3D average pooling on a 5D tensor (batch, channels, depth, height, width).
@@ -5563,6 +5585,18 @@ public interface IEngine
     Tensor<T> ReduceMax<T>(Tensor<T> input, int[] axes, bool keepDims, out int[] maxIndices);
 
     /// <summary>
+    /// Computes maximum values without requesting host-visible argmax indices.
+    /// Device engines can therefore keep the complete operation resident.
+    /// </summary>
+    Tensor<T> ReduceMax<T>(Tensor<T> input, int[] axes, bool keepDims);
+
+    /// <summary>
+    /// Computes maximum values and returns argmax positions relative to the collapsed reduction span.
+    /// Device engines can retain both outputs for a resident backward pass.
+    /// </summary>
+    Tensor<T> ReduceMaxWithTensorIndices<T>(Tensor<T> input, int[] axes, bool keepDims, out Tensor<int> maxIndices);
+
+    /// <summary>
     /// Computes the backward pass for reduce max.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
@@ -5571,6 +5605,11 @@ public interface IEngine
     /// <param name="inputShape">The original input shape.</param>
     /// <returns>The gradient with respect to the input.</returns>
     Tensor<T> ReduceMaxBackward<T>(Tensor<T> gradOutput, int[] maxIndices, int[] inputShape);
+
+    /// <summary>
+    /// Computes the reduce-max input gradient from tensor-resident relative argmax positions.
+    /// </summary>
+    Tensor<T> ReduceMaxBackwardWithTensorIndices<T>(Tensor<T> gradOutput, Tensor<int> maxIndices, int[] inputShape, int[] axes);
 
     /// <summary>
     /// Computes the mean along specified axes.
@@ -8540,8 +8579,11 @@ public interface IEngine
     /// <summary>PReLU with learnable alpha.</summary>
     Tensor<T> TensorPReLU<T>(Tensor<T> tensor, Tensor<T> alpha);
 
-    /// <summary>RReLU with random leaky slope.</summary>
-    Tensor<T> TensorRReLU<T>(Tensor<T> tensor, double lower = 0.125, double upper = 0.333, bool training = true);
+    /// <summary>RReLU with random leaky slope. When <paramref name="seed"/> is provided, the per-element
+    /// negative-side slopes are drawn from the counter-based stateless generator so training-mode output
+    /// is deterministic and matches the resident GPU path bit-for-bit; when null, a thread-safe shared
+    /// RNG is used (non-deterministic, as PyTorch's training-mode RReLU is).</summary>
+    Tensor<T> TensorRReLU<T>(Tensor<T> tensor, double lower = 0.125, double upper = 0.333, bool training = true, int? seed = null);
 
     /// <summary>Threshold: x > threshold ? x : value.</summary>
     Tensor<T> TensorThreshold<T>(Tensor<T> tensor, T threshold, T value);

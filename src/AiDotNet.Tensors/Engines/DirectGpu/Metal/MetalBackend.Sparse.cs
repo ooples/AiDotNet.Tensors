@@ -15,56 +15,12 @@ public sealed partial class MetalBackend
     public void Enforce2x4Sparsity(IGpuBuffer denseInput, IGpuBuffer sparseValues, IGpuBuffer sparseIndices, int M, int K)
     {
         ThrowIfDisposed();
-
-        var denseData = DownloadBuffer(denseInput);
-        var sparseValuesData = new float[M * K / 2];
-        var sparseIndicesData = new byte[M * K / 4];
-
-        for (int row = 0; row < M; row++)
-        {
-            for (int group = 0; group < K / 4; group++)
-            {
-                int baseIdx = row * K + group * 4;
-
-                // Find 2 largest magnitude elements in group of 4
-                var indices = new int[4];
-                var values = new float[4];
-                for (int i = 0; i < 4; i++)
-                {
-                    indices[i] = i;
-                    values[i] = MathF.Abs(denseData[baseIdx + i]);
-                }
-
-                // Sort by magnitude descending
-                for (int i = 0; i < 3; i++)
-                {
-                    for (int j = i + 1; j < 4; j++)
-                    {
-                        if (values[j] > values[i])
-                        {
-                            (values[i], values[j]) = (values[j], values[i]);
-                            (indices[i], indices[j]) = (indices[j], indices[i]);
-                        }
-                    }
-                }
-
-                // Store the top 2 values
-                int sparseValueOffset = row * K / 2 + group * 2;
-                sparseValuesData[sparseValueOffset] = denseData[baseIdx + indices[0]];
-                sparseValuesData[sparseValueOffset + 1] = denseData[baseIdx + indices[1]];
-
-                // Pack indices into byte (2 bits per index)
-                byte packedIndices = (byte)((indices[0] & 0x3) | ((indices[1] & 0x3) << 2));
-                sparseIndicesData[row * K / 4 + group] = packedIndices;
-            }
-        }
-
-        UploadToBuffer(sparseValues, sparseValuesData);
-
-        // Convert byte indices to float for upload
-        var floatIndices = new float[(M * K / 4 + 3) / 4];
-        Buffer.BlockCopy(sparseIndicesData, 0, floatIndices, 0, sparseIndicesData.Length);
-        UploadToBuffer(sparseIndices, floatIndices);
+        if (M <= 0 || K <= 0) return;
+        if (K % 4 != 0)
+            throw new ArgumentException("The K dimension must be divisible by four.", nameof(K));
+        int groups = checked(M * (K / 4));
+        DispatchResidentMetal("enforce_2x4", groups,
+            new[] { denseInput, sparseValues, sparseIndices }, (uint)M, (uint)K);
     }
 
     /// <summary>
@@ -73,31 +29,16 @@ public sealed partial class MetalBackend
     public void Decompress2x4Sparse(IGpuBuffer sparseValues, IGpuBuffer sparseIndices, IGpuBuffer denseOutput, int M, int K)
     {
         ThrowIfDisposed();
-
-        var sparseValuesData = DownloadBuffer(sparseValues);
-        var floatIndices = DownloadBuffer(sparseIndices);
-        var sparseIndicesData = new byte[M * K / 4];
-        Buffer.BlockCopy(floatIndices, 0, sparseIndicesData, 0, sparseIndicesData.Length);
-
-        var denseData = new float[M * K];
-
-        for (int row = 0; row < M; row++)
-        {
-            for (int group = 0; group < K / 4; group++)
-            {
-                int sparseValueOffset = row * K / 2 + group * 2;
-                byte packedIndices = sparseIndicesData[row * K / 4 + group];
-
-                int idx0 = packedIndices & 0x3;
-                int idx1 = (packedIndices >> 2) & 0x3;
-
-                int baseIdx = row * K + group * 4;
-                denseData[baseIdx + idx0] = sparseValuesData[sparseValueOffset];
-                denseData[baseIdx + idx1] = sparseValuesData[sparseValueOffset + 1];
-            }
-        }
-
-        UploadToBuffer(denseOutput, denseData);
+        if (M <= 0 || K <= 0) return;
+        if (K % 4 != 0)
+            throw new ArgumentException("The K dimension must be divisible by four.", nameof(K));
+        int count = checked(M * K);
+        bool aliasesInput = ReferenceEquals(denseOutput, sparseValues) || ReferenceEquals(denseOutput, sparseIndices);
+        using var temporary = aliasesInput ? AllocateBuffer(count) : null;
+        IGpuBuffer target = temporary ?? denseOutput;
+        DispatchResidentMetal("decompress_2x4", count,
+            new[] { sparseValues, sparseIndices, target }, (uint)M, (uint)K);
+        if (temporary is not null) Copy(temporary, denseOutput, count);
     }
 
     /// <summary>
@@ -144,6 +85,20 @@ public sealed partial class MetalBackend
                 "Metal Sparse compute library was not compiled — install a Metal-capable runtime " +
                 "or route to a different GPU backend.");
         return GetPipeline(SparseLibName, _sparseLibrary, kernelName);
+    }
+
+    private void DispatchCsrSegmentedMetal(IGpuBuffer columns, IGpuBuffer rows, IGpuBuffer input,
+        IGpuBuffer output, int rowCount, int inputRows, int features, uint operation, float epsilon)
+    {
+        int count = checked(rowCount * features);
+        if (count <= 0) return;
+        bool aliasesInput = ReferenceEquals(input, output);
+        using var temporary = aliasesInput ? AllocateBuffer(count) : null;
+        IGpuBuffer target = temporary ?? output;
+        DispatchResidentMetal("csr_segmented", count, new[] { columns, rows, input, target },
+            (uint)rowCount, (uint)inputRows, (uint)features, operation,
+            unchecked((uint)SingleToInt32BitsCompat(epsilon)));
+        if (temporary is not null) Copy(temporary, output, count);
     }
 
     /// <summary>
@@ -251,22 +206,8 @@ public sealed partial class MetalBackend
         IGpuBuffer denseB, IGpuBuffer bias, IGpuBuffer output, int M, int K, int N, int nnz)
     {
         ThrowIfDisposed();
-
         CsrSpMM(csrValues, csrColIndices, csrRowPointers, denseB, output, M, K, N, nnz);
-
-        // Add bias
-        var outputData = DownloadBuffer(output);
-        var biasData = DownloadBuffer(bias);
-
-        for (int row = 0; row < M; row++)
-        {
-            for (int col = 0; col < N; col++)
-            {
-                outputData[row * N + col] += biasData[col];
-            }
-        }
-
-        UploadToBuffer(output, outputData);
+        BiasAdd(output, bias, output, M, N);
     }
 
     /// <summary>
@@ -276,27 +217,22 @@ public sealed partial class MetalBackend
         IGpuBuffer? edgeValues, IGpuBuffer output, int numNodes, int numEdges, int features)
     {
         ThrowIfDisposed();
-
-        var inputData = DownloadBuffer(input);
-        var srcIdx = DownloadIntBuffer(sourceIndices, numEdges);
-        var tgtIdx = DownloadIntBuffer(targetIndices, numEdges);
-        float[]? edgeData = edgeValues is not null ? DownloadBuffer(edgeValues) : null;
-
-        var outputData = DownloadBuffer(output);
-
-        for (int e = 0; e < numEdges; e++)
+        int count = checked(numNodes * features);
+        if (count <= 0) return;
+        bool aliasesInput = ReferenceEquals(input, output);
+        using var inputCopy = aliasesInput ? AllocateBuffer(count) : null;
+        IGpuBuffer effectiveInput = input;
+        if (inputCopy is not null)
         {
-            int src = srcIdx[e];
-            int tgt = tgtIdx[e];
-            float weight = edgeData?[e] ?? 1.0f;
-
-            for (int f = 0; f < features; f++)
-            {
-                outputData[tgt * features + f] += weight * inputData[src * features + f];
-            }
+            Copy(input, inputCopy, count);
+            effectiveInput = inputCopy;
         }
-
-        UploadToBuffer(output, outputData);
+        using var unusedEdgeValues = edgeValues is null ? AllocateBuffer(1) : null;
+        if (unusedEdgeValues is not null) Fill(unusedEdgeValues, 1f, 1);
+        IGpuBuffer effectiveEdgeValues = edgeValues ?? unusedEdgeValues!;
+        DispatchResidentMetal("scatter_add_edges_deterministic", count,
+            new[] { effectiveInput, sourceIndices, targetIndices, effectiveEdgeValues, output },
+            (uint)numNodes, (uint)numEdges, (uint)features, edgeValues is null ? 0u : 1u);
     }
 
     /// <summary>
@@ -306,39 +242,7 @@ public sealed partial class MetalBackend
         IGpuBuffer input, IGpuBuffer output, int M, int K, int N)
     {
         ThrowIfDisposed();
-
-        var colIndices = DownloadIntBuffer(csrColIndices, -1);
-        var rowPointers = DownloadIntBuffer(csrRowPointers, M + 1);
-        var inputData = DownloadBuffer(input);
-
-        var outputData = new float[M * N];
-        for (int i = 0; i < outputData.Length; i++) outputData[i] = float.NegativeInfinity;
-
-        for (int row = 0; row < M; row++)
-        {
-            int rowStart = rowPointers[row];
-            int rowEnd = rowPointers[row + 1];
-
-            for (int i = rowStart; i < rowEnd; i++)
-            {
-                int k = colIndices[i];
-                for (int f = 0; f < N; f++)
-                {
-                    outputData[row * N + f] = MathF.Max(outputData[row * N + f], inputData[k * N + f]);
-                }
-            }
-
-            // Handle empty rows
-            if (rowStart == rowEnd)
-            {
-                for (int f = 0; f < N; f++)
-                {
-                    outputData[row * N + f] = 0;
-                }
-            }
-        }
-
-        UploadToBuffer(output, outputData);
+        DispatchCsrSegmentedMetal(csrColIndices, csrRowPointers, input, output, M, K, N, 0u, 0f);
     }
 
     /// <summary>
@@ -348,39 +252,7 @@ public sealed partial class MetalBackend
         IGpuBuffer input, IGpuBuffer output, int M, int K, int N)
     {
         ThrowIfDisposed();
-
-        var colIndices = DownloadIntBuffer(csrColIndices, -1);
-        var rowPointers = DownloadIntBuffer(csrRowPointers, M + 1);
-        var inputData = DownloadBuffer(input);
-
-        var outputData = new float[M * N];
-        for (int i = 0; i < outputData.Length; i++) outputData[i] = float.PositiveInfinity;
-
-        for (int row = 0; row < M; row++)
-        {
-            int rowStart = rowPointers[row];
-            int rowEnd = rowPointers[row + 1];
-
-            for (int i = rowStart; i < rowEnd; i++)
-            {
-                int k = colIndices[i];
-                for (int f = 0; f < N; f++)
-                {
-                    outputData[row * N + f] = MathF.Min(outputData[row * N + f], inputData[k * N + f]);
-                }
-            }
-
-            // Handle empty rows
-            if (rowStart == rowEnd)
-            {
-                for (int f = 0; f < N; f++)
-                {
-                    outputData[row * N + f] = 0;
-                }
-            }
-        }
-
-        UploadToBuffer(output, outputData);
+        DispatchCsrSegmentedMetal(csrColIndices, csrRowPointers, input, output, M, K, N, 1u, 0f);
     }
 
     /// <summary>
@@ -390,58 +262,7 @@ public sealed partial class MetalBackend
         IGpuBuffer input, IGpuBuffer output, int M, int K, int N, float epsilon = 1e-8f)
     {
         ThrowIfDisposed();
-
-        var colIndices = DownloadIntBuffer(csrColIndices, -1);
-        var rowPointers = DownloadIntBuffer(csrRowPointers, M + 1);
-        var inputData = DownloadBuffer(input);
-
-        var outputData = new float[M * N];
-
-        for (int row = 0; row < M; row++)
-        {
-            int rowStart = rowPointers[row];
-            int rowEnd = rowPointers[row + 1];
-            int count = rowEnd - rowStart;
-
-            if (count == 0)
-            {
-                continue;
-            }
-
-            // Compute mean
-            var mean = new float[N];
-            for (int i = rowStart; i < rowEnd; i++)
-            {
-                int k = colIndices[i];
-                for (int f = 0; f < N; f++)
-                {
-                    mean[f] += inputData[k * N + f];
-                }
-            }
-            for (int f = 0; f < N; f++)
-            {
-                mean[f] /= count;
-            }
-
-            // Compute variance
-            var variance = new float[N];
-            for (int i = rowStart; i < rowEnd; i++)
-            {
-                int k = colIndices[i];
-                for (int f = 0; f < N; f++)
-                {
-                    float diff = inputData[k * N + f] - mean[f];
-                    variance[f] += diff * diff;
-                }
-            }
-            for (int f = 0; f < N; f++)
-            {
-                variance[f] /= count;
-                outputData[row * N + f] = MathF.Sqrt(variance[f] + epsilon);
-            }
-        }
-
-        UploadToBuffer(output, outputData);
+        DispatchCsrSegmentedMetal(csrColIndices, csrRowPointers, input, output, M, K, N, 2u, epsilon);
     }
 
     #endregion
@@ -454,17 +275,7 @@ public sealed partial class MetalBackend
     public void GreaterThan(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
         ThrowIfDisposed();
-
-        var aData = DownloadBuffer(A);
-        var bData = DownloadBuffer(B);
-        var cData = new float[size];
-
-        for (int i = 0; i < size; i++)
-        {
-            cData[i] = aData[i] > bData[i] ? 1.0f : 0.0f;
-        }
-
-        UploadToBuffer(C, cData);
+        DispatchResidentMetal("comparison_binary", size, new[] { A, B, C }, (uint)size, 0u);
     }
 
     /// <summary>
@@ -473,17 +284,7 @@ public sealed partial class MetalBackend
     public void LessThan(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
         ThrowIfDisposed();
-
-        var aData = DownloadBuffer(A);
-        var bData = DownloadBuffer(B);
-        var cData = new float[size];
-
-        for (int i = 0; i < size; i++)
-        {
-            cData[i] = aData[i] < bData[i] ? 1.0f : 0.0f;
-        }
-
-        UploadToBuffer(C, cData);
+        DispatchResidentMetal("comparison_binary", size, new[] { A, B, C }, (uint)size, 1u);
     }
 
     /// <summary>
@@ -492,17 +293,7 @@ public sealed partial class MetalBackend
     public void Equal(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
         ThrowIfDisposed();
-
-        var aData = DownloadBuffer(A);
-        var bData = DownloadBuffer(B);
-        var cData = new float[size];
-
-        for (int i = 0; i < size; i++)
-        {
-            cData[i] = MathF.Abs(aData[i] - bData[i]) < 1e-7f ? 1.0f : 0.0f;
-        }
-
-        UploadToBuffer(C, cData);
+        DispatchResidentMetal("comparison_binary", size, new[] { A, B, C }, (uint)size, 2u);
     }
 
     /// <summary>
@@ -511,18 +302,7 @@ public sealed partial class MetalBackend
     public void Where(IGpuBuffer condition, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
         ThrowIfDisposed();
-
-        var condData = DownloadBuffer(condition);
-        var aData = DownloadBuffer(A);
-        var bData = DownloadBuffer(B);
-        var cData = new float[size];
-
-        for (int i = 0; i < size; i++)
-        {
-            cData[i] = condData[i] != 0 ? aData[i] : bData[i];
-        }
-
-        UploadToBuffer(C, cData);
+        DispatchResidentMetal("comparison_where", size, new[] { condition, A, B, C }, (uint)size);
     }
 
     /// <summary>
@@ -531,16 +311,8 @@ public sealed partial class MetalBackend
     public void NotEqualScalar(IGpuBuffer A, IGpuBuffer C, float scalar, int size)
     {
         ThrowIfDisposed();
-
-        var aData = DownloadBuffer(A);
-        var cData = new float[size];
-
-        for (int i = 0; i < size; i++)
-        {
-            cData[i] = MathF.Abs(aData[i] - scalar) >= 1e-7f ? 1.0f : 0.0f;
-        }
-
-        UploadToBuffer(C, cData);
+        DispatchResidentMetal("comparison_not_equal_scalar", size, new[] { A, C },
+            (uint)size, unchecked((uint)SingleToInt32BitsCompat(scalar)));
     }
 
     #endregion
@@ -553,33 +325,9 @@ public sealed partial class MetalBackend
     public void VarAxis(IGpuBuffer A, IGpuBuffer mean, IGpuBuffer variance, int outerSize, int reduceSize)
     {
         ThrowIfDisposed();
-
-        var aData = DownloadBuffer(A);
-        var meanData = new float[outerSize];
-        var varData = new float[outerSize];
-
-        for (int i = 0; i < outerSize; i++)
-        {
-            // Compute mean
-            float sum = 0;
-            for (int j = 0; j < reduceSize; j++)
-            {
-                sum += aData[i * reduceSize + j];
-            }
-            meanData[i] = sum / reduceSize;
-
-            // Compute variance
-            float varSum = 0;
-            for (int j = 0; j < reduceSize; j++)
-            {
-                float diff = aData[i * reduceSize + j] - meanData[i];
-                varSum += diff * diff;
-            }
-            varData[i] = varSum / reduceSize;
-        }
-
-        UploadToBuffer(mean, meanData);
-        UploadToBuffer(variance, varData);
+        if (reduceSize <= 0) throw new ArgumentOutOfRangeException(nameof(reduceSize));
+        DispatchResidentMetal("variance_axis", outerSize, new[] { A, mean, variance },
+            (uint)outerSize, (uint)reduceSize);
     }
 
     /// <summary>
@@ -588,26 +336,9 @@ public sealed partial class MetalBackend
     public void ArgMax(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
         ThrowIfDisposed();
-
-        var aData = DownloadBuffer(A);
-        var indicesData = new float[outerSize];
-
-        for (int i = 0; i < outerSize; i++)
-        {
-            float maxVal = float.NegativeInfinity;
-            int maxIdx = 0;
-            for (int j = 0; j < reduceSize; j++)
-            {
-                if (aData[i * reduceSize + j] > maxVal)
-                {
-                    maxVal = aData[i * reduceSize + j];
-                    maxIdx = j;
-                }
-            }
-            indicesData[i] = maxIdx;
-        }
-
-        UploadToBuffer(indices, indicesData);
+        if (reduceSize <= 0) throw new ArgumentOutOfRangeException(nameof(reduceSize));
+        DispatchResidentMetal("arg_extrema_axis", outerSize, new[] { A, indices },
+            (uint)outerSize, (uint)reduceSize, 1u);
     }
 
     /// <summary>
@@ -616,26 +347,9 @@ public sealed partial class MetalBackend
     public void ArgMin(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
         ThrowIfDisposed();
-
-        var aData = DownloadBuffer(A);
-        var indicesData = new float[outerSize];
-
-        for (int i = 0; i < outerSize; i++)
-        {
-            float minVal = float.PositiveInfinity;
-            int minIdx = 0;
-            for (int j = 0; j < reduceSize; j++)
-            {
-                if (aData[i * reduceSize + j] < minVal)
-                {
-                    minVal = aData[i * reduceSize + j];
-                    minIdx = j;
-                }
-            }
-            indicesData[i] = minIdx;
-        }
-
-        UploadToBuffer(indices, indicesData);
+        if (reduceSize <= 0) throw new ArgumentOutOfRangeException(nameof(reduceSize));
+        DispatchResidentMetal("arg_extrema_axis", outerSize, new[] { A, indices },
+            (uint)outerSize, (uint)reduceSize, 0u);
     }
 
     /// <summary>
@@ -644,33 +358,10 @@ public sealed partial class MetalBackend
     public void TopK(IGpuBuffer A, IGpuBuffer values, IGpuBuffer indices, int outerSize, int reduceSize, int k, bool sorted = true)
     {
         ThrowIfDisposed();
-
-        var aData = DownloadBuffer(A);
-        var valuesData = new float[outerSize * k];
-        var indicesData = new float[outerSize * k];
-
-        for (int i = 0; i < outerSize; i++)
-        {
-            // Extract row
-            var rowValues = new (float value, int index)[reduceSize];
-            for (int j = 0; j < reduceSize; j++)
-            {
-                rowValues[j] = (aData[i * reduceSize + j], j);
-            }
-
-            // Partial sort to get top K
-            Array.Sort(rowValues, (a, b) => b.value.CompareTo(a.value));
-
-            // Copy top K
-            for (int j = 0; j < k; j++)
-            {
-                valuesData[i * k + j] = rowValues[j].value;
-                indicesData[i * k + j] = rowValues[j].index;
-            }
-        }
-
-        UploadToBuffer(values, valuesData);
-        UploadToBuffer(indices, indicesData);
+        if (outerSize <= 0 || reduceSize <= 0 || k <= 0) return;
+        if (k > reduceSize) throw new ArgumentOutOfRangeException(nameof(k), "k cannot exceed reduceSize.");
+        DispatchResidentMetal("topk_axis_serial", outerSize, new[] { A, values, indices },
+            (uint)outerSize, (uint)reduceSize, (uint)k);
     }
 
     #endregion

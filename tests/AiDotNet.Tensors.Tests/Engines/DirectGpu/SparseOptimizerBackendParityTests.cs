@@ -160,21 +160,17 @@ public sealed class SparseOptimizerBackendParityTests
     }
 
     [Fact]
-    public void StagedSparseBackends_DocumentFullBufferTransferFallback()
+    public void MetalAndVulkanSparseOptimizers_AreResident()
     {
-        string[] stagedBackendFiles =
-        {
-            SourcePath("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "Metal", "MetalBackend.SparseOptimizer.cs"),
-            SourcePath("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "Vulkan", "VulkanBackend.SparseOptimizer.cs")
-        };
+        string metal = File.ReadAllText(SourcePath(
+            "src", "AiDotNet.Tensors", "Engines", "DirectGpu", "Metal", "MetalBackend.SparseOptimizer.cs"));
+        string vulkan = File.ReadAllText(SourcePath(
+            "src", "AiDotNet.Tensors", "Engines", "DirectGpu", "Vulkan", "VulkanBackend.SparseOptimizer.cs"));
 
-        foreach (string file in stagedBackendFiles)
-        {
-            string source = File.ReadAllText(file);
-            Assert.Contains("Staged correctness fallback", source);
-            Assert.Contains("O(param.Size + state.Size + nnz)", source);
-            Assert.Contains("throughput-sensitive sparse embedding workloads", source);
-        }
+        Assert.Contains("DispatchResidentMetal(\"sparse_optimizer_serial\"", metal);
+        Assert.Contains("GlslNaryOp(VulkanOptimizerKernels.Sparse", vulkan);
+        Assert.DoesNotContain("DownloadBuffer", metal);
+        Assert.DoesNotContain("DownloadBuffer", vulkan);
     }
 
     [Fact]

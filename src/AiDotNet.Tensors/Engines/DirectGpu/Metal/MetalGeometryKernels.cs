@@ -191,7 +191,7 @@ inline float grid_sample_safe_msl(device const float* src, int n, int y, int x, 
     } else {
         y = reflect_index(y, H); x = reflect_index(x, W);
     }
-    return src[((n * H + y) * W + x) * C + c];
+    return src[((n * C + c) * H + y) * W + x];
 }
 
 kernel void geometry_grid_sample_2d(
@@ -218,7 +218,7 @@ kernel void geometry_grid_sample_2d(
     if (mode == 1) {
         int nx = (int)round(sx), ny = (int)round(sy);
         for (int c = 0; c < C; c++)
-            output[((n * outH + oy) * outW + ox) * C + c] =
+            output[((n * C + c) * outH + oy) * outW + ox] =
                 grid_sample_safe_msl(input, n, ny, nx, c, H, W, C, padding);
     } else if (mode == 0) {
         int x0 = (int)floor(sx), y0 = (int)floor(sy);
@@ -229,7 +229,7 @@ kernel void geometry_grid_sample_2d(
             float v01 = grid_sample_safe_msl(input, n, y0, x1, c, H, W, C, padding);
             float v10 = grid_sample_safe_msl(input, n, y1, x0, c, H, W, C, padding);
             float v11 = grid_sample_safe_msl(input, n, y1, x1, c, H, W, C, padding);
-            output[((n * outH + oy) * outW + ox) * C + c] =
+            output[((n * C + c) * outH + oy) * outW + ox] =
                 v00 * (1 - fx) * (1 - fy) + v01 * fx * (1 - fy)
               + v10 * (1 - fx) * fy + v11 * fx * fy;
         }
@@ -251,7 +251,7 @@ kernel void geometry_grid_sample_2d(
                 }
                 acc += wy[yy] * rowAcc;
             }
-            output[((n * outH + oy) * outW + ox) * C + c] = acc;
+            output[((n * C + c) * outH + oy) * outW + ox] = acc;
         }
     }
 }

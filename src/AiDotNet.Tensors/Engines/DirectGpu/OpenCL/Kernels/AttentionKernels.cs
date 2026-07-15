@@ -49,7 +49,7 @@ __kernel void scaled_dot_product_attention(
     __global const float* value,      // [batch * heads * seqK * headDim]
     __global float* output,           // [batch * heads * seqQ * headDim]
     __global float* attentionWeights, // [batch * heads * seqQ * seqK] (optional)
-    __global const int* mask,         // [seqQ * seqK] (optional, 0=masked, 1=valid)
+    __global const float* mask,       // shared [seqQ * seqK] or full [batch * heads * seqQ * seqK]
     const int batch,
     const int numHeads,
     const int seqQ,
@@ -57,29 +57,24 @@ __kernel void scaled_dot_product_attention(
     const int headDim,
     const float scale,
     const int isCausal,
-    const int hasMask,
+    const int maskMode,
     const int storeWeights)
 {
-    const int bh = get_global_id(1);  // batch * head index
-    const int qi = get_global_id(0);  // query position
+    const int row = get_global_id(0);
+    if (row >= batch * numHeads * seqQ) return;
 
-    if (bh >= batch * numHeads || qi >= seqQ) return;
-
-    const int b = bh / numHeads;
-    const int h = bh % numHeads;
-
-    // Offsets
-    const int qOffset = bh * seqQ * headDim + qi * headDim;
+    const int qi = row % seqQ;
+    const int bh = row / seqQ;
+    const int qOffset = row * headDim;
     const int kOffset = bh * seqK * headDim;
     const int vOffset = bh * seqK * headDim;
-    const int oOffset = bh * seqQ * headDim + qi * headDim;
-    const int wOffset = bh * seqQ * seqK + qi * seqK;
+    const int wOffset = row * seqK;
+    const int maskOffset = (maskMode == 2 ? bh * seqQ * seqK : 0) + qi * seqK;
 
     // Compute attention scores and find max for numerical stability
     float maxScore = NEGATIVE_INFINITY;
     for (int ki = 0; ki < seqK; ki++) {
-        // Causal mask
-        if (isCausal && ki > qi) continue;
+        if ((isCausal && ki > qi) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f)) continue;
 
         float score = 0.0f;
         for (int d = 0; d < headDim; d++) {
@@ -89,14 +84,9 @@ __kernel void scaled_dot_product_attention(
         maxScore = fmax(maxScore, score);
     }
 
-    // Compute softmax
     float sumExp = 0.0f;
-    float scores[1024]; // Temporary storage (adjust size as needed)
     for (int ki = 0; ki < seqK; ki++) {
-        if (isCausal && ki > qi) {
-            scores[ki] = 0.0f;
-            continue;
-        }
+        if ((isCausal && ki > qi) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f)) continue;
 
         float score = 0.0f;
         for (int d = 0; d < headDim; d++) {
@@ -104,26 +94,36 @@ __kernel void scaled_dot_product_attention(
         }
         score *= scale;
 
-        float expScore = exp(score - maxScore);
-        scores[ki] = expScore;
-        sumExp += expScore;
+        sumExp += exp(score - maxScore);
     }
 
-    // Normalize and compute output
+    const float invSum = sumExp > 0.0f ? 1.0f / sumExp : 0.0f;
+    if (storeWeights) {
+        for (int ki = 0; ki < seqK; ki++) {
+            float weight = 0.0f;
+            if (!((isCausal && ki > qi) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f))) {
+                float score = 0.0f;
+                for (int inner = 0; inner < headDim; inner++) {
+                    score += query[qOffset + inner] * key[kOffset + ki * headDim + inner];
+                }
+                weight = exp(score * scale - maxScore) * invSum;
+            }
+            attentionWeights[wOffset + ki] = weight;
+        }
+    }
+
     for (int d = 0; d < headDim; d++) {
         float val = 0.0f;
         for (int ki = 0; ki < seqK; ki++) {
-            float weight = scores[ki] / sumExp;
+            if ((isCausal && ki > qi) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f)) continue;
+            float score = 0.0f;
+            for (int inner = 0; inner < headDim; inner++) {
+                score += query[qOffset + inner] * key[kOffset + ki * headDim + inner];
+            }
+            float weight = exp(score * scale - maxScore) * invSum;
             val += weight * value[vOffset + ki * headDim + d];
         }
-        output[oOffset + d] = val;
-    }
-
-    // Store attention weights if requested
-    if (storeWeights) {
-        for (int ki = 0; ki < seqK; ki++) {
-            attentionWeights[wOffset + ki] = scores[ki] / sumExp;
-        }
+        output[qOffset + d] = val;
     }
 }
 
@@ -304,6 +304,7 @@ __kernel void flash_attention_backward_gradq_deterministic(
     float doO = 0.0f;
     for (int d = 0; d < headDim; d++) {
         doO += gradOutput[gOffset + d] * output[qOffset + d];
+        gradQuery[qOffset + d] = 0.0f;
     }
 
     for (int ki = 0; ki < seqK; ki++) {
@@ -401,8 +402,8 @@ __kernel void flash_attention_backward_gradkv_deterministic(
         accK += dS * query[qOffset + d];
     }
 
-    gradValue[vOffset + ki * headDim + d] += accV;
-    gradKey[kOffset + ki * headDim + d] += accK;
+    gradValue[vOffset + ki * headDim + d] = accV;
+    gradKey[kOffset + ki * headDim + d] = accK;
 }
 
 // FlashAttention backward pass with recomputation

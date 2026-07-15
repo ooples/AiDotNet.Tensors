@@ -41,7 +41,7 @@ void main() {
 ";
 
     public static string MuLawDecoding => Header + @"
-layout(set = 0, binding = 0) readonly buffer I { float input_[]; };
+layout(set = 0, binding = 0) readonly buffer I { int input_[]; };
 layout(set = 0, binding = 1) writeonly buffer O { float output_[]; };
 layout(push_constant) uniform P { int length; int quantizationChannels; };
 void main() {
@@ -49,7 +49,7 @@ void main() {
     if (gid >= length) return;
     if (quantizationChannels < 2) { output_[gid] = 0.0; return; }
     float mu = float(quantizationChannels - 1);
-    float q = input_[gid];
+    float q = float(input_[gid]);
     float y = (q / mu) * 2.0 - 1.0;
     float sgn = float(y > 0.0) - float(y < 0.0);
     output_[gid] = sgn * (pow(1.0 + mu, abs(y)) - 1.0) / mu;

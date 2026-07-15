@@ -6,6 +6,27 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
 public sealed partial class MetalBackend
 {
+    private void DispatchResidentMetal(string kernelName, int threads, IGpuBuffer[] buffers, params uint[] values)
+    {
+        if (threads <= 0) return;
+        if (_residentLibrary == IntPtr.Zero)
+            throw new InvalidOperationException("Metal resident kernels are unavailable.");
+
+        var pipeline = GetPipeline("Resident", _residentLibrary, kernelName);
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(threads);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        for (int i = 0; i < buffers.Length; ++i)
+        {
+            if (buffers[i] is not MetalGpuBuffer buffer)
+                throw new ArgumentException("Buffers must be MetalGpuBuffer.", nameof(buffers));
+            encoder.SetBuffer(buffer, i);
+        }
+        for (int i = 0; i < values.Length; ++i)
+            encoder.SetBytes(values[i], (uint)(buffers.Length + i));
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
     #region Hyperbolic Geometry Operations (Poincare Ball Model)
 
     private static void ValidateCurvature(float curvature)
@@ -96,67 +117,37 @@ public sealed partial class MetalBackend
     public void HyperbolicLinearForward(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
         int batchSize, int inputFeatures, int outputFeatures, float curvature, float epsilon)
     {
-        // Euclidean matmul + bias via existing GPU GEMM, then project onto Poincare ball
-        var matResult = AllocateBuffer(batchSize * outputFeatures);
-        Gemm(input, weights, matResult, batchSize, outputFeatures, inputFeatures);
-        BiasAdd(matResult, biases, output, batchSize, outputFeatures);
-        matResult.Dispose();
+        ThrowIfDisposed();
+        DispatchResidentMetal("hyperbolic_linear_forward", checked(batchSize * outputFeatures),
+            new[] { input, weights, biases, output },
+            (uint)batchSize, (uint)inputFeatures, (uint)outputFeatures);
         PoincareProject(output, output, batchSize, outputFeatures, curvature, epsilon);
     }
 
     public void HyperbolicLinearBackwardInput(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer gradInput,
         int batchSize, int inputFeatures, int outputFeatures, float curvature)
     {
-        // gradInput = gradOutput * weights^T (Euclidean approximation)
         ThrowIfDisposed();
-        var gradOutData = DownloadBuffer(gradOutput);
-        var weightsData = DownloadBuffer(weights);
-        var gradInputData = new float[batchSize * inputFeatures];
-        for (int b = 0; b < batchSize; b++)
-            for (int i = 0; i < inputFeatures; i++)
-            {
-                float sum = 0;
-                for (int o = 0; o < outputFeatures; o++)
-                    sum += gradOutData[b * outputFeatures + o] * weightsData[o * inputFeatures + i];
-                gradInputData[b * inputFeatures + i] = sum;
-            }
-        UploadToBuffer(gradInput, gradInputData);
+        DispatchResidentMetal("hyperbolic_backward_input", checked(batchSize * inputFeatures),
+            new[] { gradOutput, weights, gradInput },
+            (uint)batchSize, (uint)inputFeatures, (uint)outputFeatures);
     }
 
     public void HyperbolicLinearBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradWeights,
         int batchSize, int inputFeatures, int outputFeatures, float curvature)
     {
-        // gradWeights = gradOutput^T * input
         ThrowIfDisposed();
-        var gradOutData = DownloadBuffer(gradOutput);
-        var inputData = DownloadBuffer(input);
-        var gradWeightsData = new float[outputFeatures * inputFeatures];
-        for (int o = 0; o < outputFeatures; o++)
-            for (int i = 0; i < inputFeatures; i++)
-            {
-                float sum = 0;
-                for (int b = 0; b < batchSize; b++)
-                    sum += gradOutData[b * outputFeatures + o] * inputData[b * inputFeatures + i];
-                gradWeightsData[o * inputFeatures + i] = sum;
-            }
-        UploadToBuffer(gradWeights, gradWeightsData);
+        DispatchResidentMetal("hyperbolic_backward_weights", checked(outputFeatures * inputFeatures),
+            new[] { gradOutput, input, gradWeights },
+            (uint)batchSize, (uint)inputFeatures, (uint)outputFeatures);
     }
 
     public void HyperbolicLinearBackwardBiases(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradBiases,
         int batchSize, int inputFeatures, int outputFeatures, float curvature)
     {
-        // gradBiases = sum over batch of gradOutput
         ThrowIfDisposed();
-        var gradOutData = DownloadBuffer(gradOutput);
-        var gradBiasesData = new float[outputFeatures];
-        for (int o = 0; o < outputFeatures; o++)
-        {
-            float sum = 0;
-            for (int b = 0; b < batchSize; b++)
-                sum += gradOutData[b * outputFeatures + o];
-            gradBiasesData[o] = sum;
-        }
-        UploadToBuffer(gradBiases, gradBiasesData);
+        DispatchResidentMetal("hyperbolic_backward_biases", outputFeatures,
+            new[] { gradOutput, gradBiases }, (uint)batchSize, (uint)outputFeatures);
     }
 
     #endregion
@@ -302,30 +293,27 @@ public sealed partial class MetalBackend
     public void ComplexMultiply(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int numPairs)
     {
         ThrowIfDisposed();
-        var ad = DownloadBuffer(a); var bd = DownloadBuffer(b); var o = new float[numPairs * 2];
-        for (int i = 0; i < numPairs; i++)
-        {
-            int idx = i * 2;
-            o[idx] = ad[idx]*bd[idx] - ad[idx+1]*bd[idx+1];
-            o[idx+1] = ad[idx]*bd[idx+1] + ad[idx+1]*bd[idx];
-        }
-        UploadToBuffer(output, o);
+        DispatchResidentMetal("complex_multiply_interleaved", numPairs,
+            new[] { a, b, output }, (uint)numPairs);
     }
 
     public void ComplexConjugate(IGpuBuffer input, IGpuBuffer output, int numPairs)
     {
         ThrowIfDisposed();
-        var d = DownloadBuffer(input); var o = new float[numPairs * 2];
-        for (int i = 0; i < numPairs; i++) { int idx = i * 2; o[idx] = d[idx]; o[idx+1] = -d[idx+1]; }
-        UploadToBuffer(output, o);
+        DispatchResidentMetal("complex_conjugate_interleaved", numPairs,
+            new[] { input, output }, (uint)numPairs);
     }
 
     public void ComplexMagnitude(IGpuBuffer input, IGpuBuffer output, int numPairs)
     {
         ThrowIfDisposed();
-        var d = DownloadBuffer(input); var o = new float[numPairs];
-        for (int i = 0; i < numPairs; i++) { int idx = i * 2; o[i] = MathF.Sqrt(d[idx]*d[idx] + d[idx+1]*d[idx+1]); }
-        UploadToBuffer(output, o);
+        bool aliasesInput = ReferenceEquals(input, output);
+        using var temporary = aliasesInput ? AllocateBuffer(numPairs) : null;
+        IGpuBuffer target = temporary ?? output;
+        DispatchResidentMetal("complex_magnitude_interleaved", numPairs,
+            new[] { input, target }, (uint)numPairs);
+        if (temporary is not null)
+            Copy(temporary, output, numPairs);
     }
 
     #endregion
@@ -335,90 +323,76 @@ public sealed partial class MetalBackend
     public void QuantumMeasurement(IGpuBuffer realPart, IGpuBuffer imagPart, IGpuBuffer probabilities, int batchSize, int stateSize)
     {
         ThrowIfDisposed();
-        var re = DownloadBuffer(realPart); var im = DownloadBuffer(imagPart);
-        var prob = new float[batchSize * stateSize];
-        for (int b = 0; b < batchSize; b++)
-            for (int s = 0; s < stateSize; s++)
-            {
-                int idx = b * stateSize + s;
-                prob[idx] = re[idx] * re[idx] + im[idx] * im[idx];
-            }
-        UploadToBuffer(probabilities, prob);
+        int count = checked(batchSize * stateSize);
+        DispatchResidentMetal("quantum_measurement", count,
+            new[] { realPart, imagPart, probabilities }, (uint)count);
     }
 
     public void NormalizeProbabilities(IGpuBuffer probabilities, int batchSize, int stateSize)
     {
         ThrowIfDisposed();
-        var prob = DownloadBuffer(probabilities);
-        for (int b = 0; b < batchSize; b++)
-        {
-            int off = b * stateSize; float sum = 0;
-            for (int s = 0; s < stateSize; s++) sum += prob[off + s];
-            if (sum > 0) for (int s = 0; s < stateSize; s++) prob[off + s] /= sum;
-        }
-        UploadToBuffer(probabilities, prob);
+        DispatchResidentMetal("normalize_probabilities", batchSize,
+            new[] { probabilities }, (uint)batchSize, (uint)stateSize);
     }
 
     public void ComplexMatVec(IGpuBuffer matReal, IGpuBuffer matImag, IGpuBuffer vecReal, IGpuBuffer vecImag,
         IGpuBuffer outReal, IGpuBuffer outImag, int batchSize, int dim)
     {
         ThrowIfDisposed();
-        var mr = DownloadBuffer(matReal); var mi = DownloadBuffer(matImag);
-        var vr = DownloadBuffer(vecReal); var vi = DownloadBuffer(vecImag);
-        var or_ = new float[batchSize * dim]; var oi = new float[batchSize * dim];
-        for (int b = 0; b < batchSize; b++)
+        int count = checked(batchSize * dim);
+        bool aliasesInput = ReferenceEquals(outReal, matReal) || ReferenceEquals(outReal, matImag)
+            || ReferenceEquals(outReal, vecReal) || ReferenceEquals(outReal, vecImag)
+            || ReferenceEquals(outImag, matReal) || ReferenceEquals(outImag, matImag)
+            || ReferenceEquals(outImag, vecReal) || ReferenceEquals(outImag, vecImag)
+            || ReferenceEquals(outReal, outImag);
+        using var temporaryReal = aliasesInput ? AllocateBuffer(count) : null;
+        using var temporaryImag = aliasesInput ? AllocateBuffer(count) : null;
+        IGpuBuffer realTarget = temporaryReal ?? outReal;
+        IGpuBuffer imagTarget = temporaryImag ?? outImag;
+        DispatchResidentMetal("complex_matvec", count,
+            new[] { matReal, matImag, vecReal, vecImag, realTarget, imagTarget },
+            (uint)batchSize, (uint)dim);
+        if (temporaryReal is not null)
         {
-            int vOff = b * dim, mOff = b * dim * dim;
-            for (int i = 0; i < dim; i++)
-            {
-                float sumR = 0, sumI = 0;
-                for (int j = 0; j < dim; j++)
-                {
-                    int mIdx = mOff + i * dim + j;
-                    sumR += mr[mIdx] * vr[vOff + j] - mi[mIdx] * vi[vOff + j];
-                    sumI += mr[mIdx] * vi[vOff + j] + mi[mIdx] * vr[vOff + j];
-                }
-                or_[vOff + i] = sumR; oi[vOff + i] = sumI;
-            }
+            Copy(temporaryReal, outReal, count);
+            Copy(temporaryImag!, outImag, count);
         }
-        UploadToBuffer(outReal, or_); UploadToBuffer(outImag, oi);
     }
 
     public void MeasurementForward(IGpuBuffer input, IGpuBuffer output, int batchSize, int stateSize)
     {
         ThrowIfDisposed();
-        var data = DownloadBuffer(input);
-        var prob = new float[batchSize * stateSize];
-        for (int b = 0; b < batchSize; b++)
-            for (int s = 0; s < stateSize; s++)
-            {
-                int idx = (b * stateSize + s) * 2;
-                float re = data[idx], im = data[idx + 1];
-                prob[b * stateSize + s] = re * re + im * im;
-            }
-        UploadToBuffer(output, prob);
+        int count = checked(batchSize * stateSize);
+        bool aliasesInput = ReferenceEquals(input, output);
+        using var temporary = aliasesInput ? AllocateBuffer(count) : null;
+        IGpuBuffer target = temporary ?? output;
+        DispatchResidentMetal("measurement_forward", count,
+            new[] { input, target }, (uint)count);
+        if (temporary is not null)
+            Copy(temporary, output, count);
     }
 
     public void QuantumRotation(IGpuBuffer stateReal, IGpuBuffer stateImag, IGpuBuffer outReal, IGpuBuffer outImag,
         IGpuBuffer angles, int numQubits, int batchSize)
     {
         ThrowIfDisposed();
-        var sr = DownloadBuffer(stateReal); var si = DownloadBuffer(stateImag);
-        var ang = DownloadBuffer(angles);
+        if ((uint)numQubits >= 31u)
+            throw new ArgumentOutOfRangeException(nameof(numQubits), "Qubit count must be between 0 and 30.");
         int stateSize = 1 << numQubits;
-        var orr = new float[batchSize * stateSize]; var oir = new float[batchSize * stateSize];
-        for (int b = 0; b < batchSize; b++)
+        int count = checked(batchSize * stateSize);
+        bool outputsAlias = ReferenceEquals(outReal, outImag);
+        using var temporaryReal = outputsAlias ? AllocateBuffer(count) : null;
+        using var temporaryImag = outputsAlias ? AllocateBuffer(count) : null;
+        IGpuBuffer realTarget = temporaryReal ?? outReal;
+        IGpuBuffer imagTarget = temporaryImag ?? outImag;
+        DispatchResidentMetal("quantum_rotation", count,
+            new[] { stateReal, stateImag, angles, realTarget, imagTarget },
+            (uint)stateSize, (uint)numQubits, (uint)batchSize);
+        if (temporaryReal is not null)
         {
-            for (int s = 0; s < stateSize; s++)
-            {
-                int idx = b * stateSize + s;
-                float angle = ang[b * numQubits]; // Simplified: apply first qubit angle
-                float cosA = MathF.Cos(angle / 2), sinA = MathF.Sin(angle / 2);
-                orr[idx] = cosA * sr[idx] - sinA * si[idx];
-                oir[idx] = sinA * sr[idx] + cosA * si[idx];
-            }
+            Copy(temporaryReal, outReal, count);
+            Copy(temporaryImag!, outImag, count);
         }
-        UploadToBuffer(outReal, orr); UploadToBuffer(outImag, oir);
     }
 
     #endregion

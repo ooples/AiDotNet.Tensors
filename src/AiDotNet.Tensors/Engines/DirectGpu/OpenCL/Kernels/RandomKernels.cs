@@ -53,16 +53,12 @@ public static class RandomKernels
                 int i = get_global_id(0);
                 if (i >= size) return;
 
-                // Initialize state unique to this thread
-                ulong h1 = hash(i + seed);
-                ulong h2 = hash(h1);
-                ulong2 state = (ulong2)(h1, h2);
-
-                // Generate random float [0, 1)
-                float u = to_float_unorm(next_rand(&state));
-
-                // Scale to [min, max)
-                output[i] = minVal + u * (maxVal - minVal);
+                uint seed32 = (uint)seed ^ (uint)(seed >> 32);
+                uint state = (uint)i * 747796405u + seed32 + 2891336453u;
+                uint word = ((state >> ((state >> 28) + 4u)) ^ state) * 277803737u;
+                uint sample = (word >> 22) ^ word;
+                float uniform = (float)(sample >> 8) * (1.0f / 16777216.0f);
+                output[i] = fma(uniform, maxVal - minVal, minVal);
             }
         ");
 

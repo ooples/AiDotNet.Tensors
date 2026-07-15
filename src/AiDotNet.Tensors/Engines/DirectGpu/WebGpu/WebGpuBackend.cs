@@ -32,7 +32,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 /// Always check IsAvailable before using GPU operations.
 /// </para>
 /// </remarks>
-public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend
+public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IPixelShuffleBackend
 {
     /// <summary>
     /// WebGpu has no cuDNN-equivalent half/bfloat16 conv path — returns
@@ -165,7 +165,19 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
     /// </summary>
     /// <inheritdoc/>
     public void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer)
-        => throw new NotSupportedException("UploadIntBufferInPlace is not supported by the WebGPU backend.");
+    {
+        ThrowIfNotInitialized();
+        if (data is null) throw new ArgumentNullException(nameof(data));
+        if (buffer is not WebGpuBuffer webGpuBuffer)
+            throw new ArgumentException("Buffer is not a WebGpuBuffer.", nameof(buffer));
+        if (data.Length > webGpuBuffer.Size)
+            throw new ArgumentException($"Host data ({data.Length}) exceeds buffer capacity ({webGpuBuffer.Size}).", nameof(data));
+        if (data.Length == 0) return;
+
+        var bytes = new byte[data.Length * sizeof(int)];
+        Buffer.BlockCopy(data, 0, bytes, 0, bytes.Length);
+        webGpuBuffer.CopyBytesFrom(bytes);
+    }
 
     /// <param name="elementCount">Number of float elements.</param>
     /// <returns>A new GPU buffer.</returns>
@@ -1288,53 +1300,23 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
     public void SplitComplexTopK(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n, int k)
     {
         if (n <= 0 || k <= 0) return;
-        var magBuf = AllocateBuffer(n);
-        try
-        {
-            SplitComplexMagnitudeSquared(inReal, inImag, magBuf, n);
-            var magData = DownloadBuffer(magBuf);
-            var rData = DownloadBuffer(inReal);
-            var iData = DownloadBuffer(inImag);
-            Array.Sort(magData); Array.Reverse(magData);
-            float threshold = k <= n ? magData[Math.Min(k, n) - 1] : 0f;
-            for (int i = 0; i < n; i++)
-            {
-                float ms = rData[i] * rData[i] + iData[i] * iData[i];
-                if (ms < threshold) { rData[i] = 0; iData[i] = 0; }
-            }
-            var rBuf = AllocateBuffer(rData); var iBuf = AllocateBuffer(iData);
-            try { Copy(rBuf, 0, outReal, 0, n); Copy(iBuf, 0, outImag, 0, n); }
-            finally { rBuf.Dispose(); iBuf.Dispose(); }
-        }
-        finally { magBuf.Dispose(); }
+        k = Math.Min(k, n);
+        Dispatch4BufferAsync("SplitComplexTopK", WebGpuKernels.SplitComplexTopKSource,
+            "split_complex_topk", inReal, inImag, outReal, outImag,
+            MakeUniformInts2(n, k), n).GetAwaiter().GetResult();
     }
 
     public void SoftmaxRows(IGpuBuffer input, IGpuBuffer output, int rows, int cols)
     {
         if (rows <= 0 || cols <= 0) return;
-        var data = DownloadBuffer(input);
-        var result = new float[rows * cols];
-        for (int r = 0; r < rows; r++)
-        {
-            int off = r * cols;
-            float mx = float.MinValue;
-            for (int c = 0; c < cols; c++) mx = Math.Max(mx, data[off + c]);
-            float se = 0;
-            for (int c = 0; c < cols; c++) { result[off + c] = MathF.Exp(data[off + c] - mx); se += result[off + c]; }
-            for (int c = 0; c < cols; c++) result[off + c] /= se;
-        }
-        var rb = AllocateBuffer(result);
-        try { Copy(rb, 0, output, 0, rows * cols); }
-        finally { rb.Dispose(); }
+        Softmax(input, output, rows, cols);
     }
 
     // ─── HRR binding primitives (issue #248) ────────────────────────
     //
     // Native WGSL compute shaders — work stays on the GPU end-to-end.
-    // Per-cell phases use a 32-bit Murmur3 fmix; deterministic within
-    // the WebGPU backend (same seed + same (V, D) → identical output)
-    // but does not bit-match the CPU xorshift64* or CUDA splitmix64
-    // sequences. Cross-device bit-identity is not part of the contract.
+    // Per-cell phases use the same 32-bit Murmur3 fmix and phase
+    // construction as the CPU reference and every other GPU backend.
 
     private const string HrrModuleKey = "Hrr";
 

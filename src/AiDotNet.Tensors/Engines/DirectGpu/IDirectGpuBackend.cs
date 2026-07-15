@@ -1383,7 +1383,7 @@ public interface IDirectGpuBackend : IDisposable
     IGpuBuffer AllocateIntBuffer(int[] data);
 
     /// <summary>In-place int upload (no allocation) — refreshes a stable embedding-index buffer each step.
-    /// Only the CUDA graph-capture cortex path needs it; other backends may throw NotSupported.</summary>
+    /// Used to refresh device-resident embedding indices without replacing the buffer object.</summary>
     void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer);
 
     #endregion
@@ -1414,11 +1414,11 @@ public interface IDirectGpuBackend : IDisposable
 
     void ScaledDotProductAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer? attentionWeights, IGpuBuffer? mask,
-        int batch, int numHeads, int seqLen, int headDim, float scale, bool isCausal);
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal);
 
     void ScaledDotProductAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer attentionWeights, IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
-        int batch, int numHeads, int seqLen, int headDim, float scale, bool isCausal);
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal);
 
     void FlashAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer? mask, int batch, int numHeads, int seqLen, int headDim, float scale, bool isCausal);
@@ -2025,7 +2025,7 @@ public interface IDirectGpuBackend : IDisposable
     /// <summary>Build the full conj-symmetric spectrum (two CPU passes in order) from mag/phase.</summary>
     void BuildSpectrum(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer specRe, IGpuBuffer specIm, int batch, int numFreqs, int numFrames, int nFft);
 
-    /// <summary>Inverse STFT from the full spectrum: windowed overlap-add (atomic) into result + windowSum.</summary>
+    /// <summary>Inverse STFT from the full spectrum: deterministic frame-ordered overlap-add into result + windowSum.</summary>
     void IstftFromSpectrum(IGpuBuffer specRe, IGpuBuffer specIm, IGpuBuffer window, IGpuBuffer result, IGpuBuffer windowSum, int batch, int numFrames, int nFft, int hop, int outputLength, int center);
 
     /// <summary>ISTFT normalize: result /= windowSum where windowSum &gt; 1e-8.</summary>
@@ -2594,6 +2594,13 @@ public interface IDirectGpuBackend : IDisposable
     void GenerateRandomUniform(IGpuBuffer output, int size, float min, float max, ulong seed);
 
     /// <summary>
+    /// Generates a seeded dropout mask with the shared integer-only CPU/GPU random contract.
+    /// Each output is exactly zero when the unsigned sample is below <paramref name="threshold"/>,
+    /// otherwise exactly <paramref name="scale"/>.
+    /// </summary>
+    void GenerateStatelessDropoutMask(IGpuBuffer output, int size, uint threshold, float scale, uint seed);
+
+    /// <summary>
     /// Generates normally distributed (Gaussian) random numbers on GPU using Box-Muller transform.
     /// </summary>
     /// <param name="output">Output buffer [size].</param>
@@ -2718,7 +2725,7 @@ public interface IDirectGpuBackend : IDisposable
     /// </summary>
     /// <param name="input">Input [batchSize * inputFeatures].</param>
     /// <param name="weights">Weights [outputFeatures * inputFeatures].</param>
-    /// <param name="biases">Biases [outputFeatures * inputFeatures].</param>
+    /// <param name="biases">Biases [outputFeatures].</param>
     /// <param name="output">Output [batchSize * outputFeatures].</param>
     /// <param name="batchSize">Batch size.</param>
     /// <param name="inputFeatures">Input features.</param>
@@ -2760,7 +2767,7 @@ public interface IDirectGpuBackend : IDisposable
     /// </summary>
     /// <param name="gradOutput">Output gradient [batchSize, outputFeatures].</param>
     /// <param name="input">Input from forward pass [batchSize, inputFeatures].</param>
-    /// <param name="gradBiases">Output: bias gradient [outputFeatures, inputFeatures].</param>
+    /// <param name="gradBiases">Output: bias gradient [outputFeatures].</param>
     /// <param name="batchSize">Batch size.</param>
     /// <param name="inputFeatures">Input features.</param>
     /// <param name="outputFeatures">Output features.</param>
@@ -3027,11 +3034,21 @@ public interface IDirectGpuBackend : IDisposable
     float FusedLinearCrossEntropyIndex(
         IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer targetIds, int n, int d, int vocab);
 
+    /// <summary>Resident-output variant. Writes the mean CE to <paramref name="meanLoss"/>.</summary>
+    void FusedLinearCrossEntropyIndex(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer targetIds,
+        IGpuBuffer meanLoss, int n, int d, int vocab);
+
     /// <summary>
     /// Fused linear (LM head) + cross-entropy with dense [N, vocab] soft targets (#1464). Returns mean CE.
     /// </summary>
     float FusedLinearCrossEntropyDense(
         IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target, int n, int d, int vocab);
+
+    /// <summary>Resident-output variant. Writes the mean CE to <paramref name="meanLoss"/>.</summary>
+    void FusedLinearCrossEntropyDense(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target,
+        IGpuBuffer meanLoss, int n, int d, int vocab);
 
     /// <summary>
     /// Backward pass for LSTM sequence - computes gradients via BPTT.
@@ -3332,11 +3349,9 @@ public interface IDirectGpuBackend : IDisposable
         IGpuBuffer outReal, IGpuBuffer outImag, int n);
 
     /// <summary>
-    /// Top-K by magnitude: retain elements whose magnitude-squared is at or above the K-th largest,
-    /// zeroing the rest. When ties exist at the threshold, all tied elements are retained, so some
-    /// GPU threshold-based implementations may produce more than K non-zero elements. This differs
-    /// from the CPU NativeComplexTopK behavior, which uses an index-based approach to guarantee
-    /// exactly min(k,n) retained elements.
+    /// Top-K by magnitude: retain exactly min(k,n) input indices and zero the rest. Magnitudes are
+    /// ordered descending, equal magnitudes use the lower input index first, and NaN magnitudes sort
+    /// after numeric magnitudes. Output elements remain at their original indices.
     /// </summary>
     void SplitComplexTopK(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n, int k);
 
@@ -3347,12 +3362,10 @@ public interface IDirectGpuBackend : IDisposable
     // Backend-native kernels for the HRR ops the engine exposes through
     // NativeUnitPhaseCodebook<T>, NativeComplexPhaseCoherenceDecode<T>,
     // NativeHRRBindAccumulate<T>. Split Re/Im, fp32 (matches the rest of
-    // the GPU surface). Per-cell deterministic phase generation uses a
-    // splitmix64 hash so different threads produce independent phases
-    // from (seed, v, d) without sharing state — matches the engine's
-    // deterministic-per-seed contract but not the exact CPU phase
-    // sequence (which is fine; random init doesn't need cross-device
-    // bit-identity).
+    // the GPU surface). Per-cell deterministic phase generation uses the
+    // same 32-bit hash as the CPU reference so different threads produce
+    // independent phases from (seed, v, d) without sharing state or
+    // changing the phase sequence across backends.
 
     /// <summary>
     /// Fill a V×D codebook of unit-phase complex numbers: every entry
@@ -3620,6 +3633,18 @@ public interface IGpuBatchExecution : IDirectGpuBackend
     void CosineSimilarity(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int batchSize, int dim);
     void PairwiseDistance(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int M, int N, int dim);
     void PairwiseDistanceSquared(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int M, int N, int dim);
+}
+
+/// <summary>
+/// Cross-backend pixel-shuffle capability. Kept separate from batch execution because pixel
+/// shuffle is a layout transform available on every native backend, including OpenCL and Metal.
+/// </summary>
+public interface IPixelShuffleBackend
+{
+    void PixelShuffle(IGpuBuffer input, IGpuBuffer output,
+        int batch, int channels, int inH, int inW, int scale);
+    void PixelShuffleBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput,
+        int batch, int channels, int inH, int inW, int scale);
 }
 
 /// <summary>

@@ -118,7 +118,7 @@ public sealed class CompressedMomentGpuOptimizerTests
     [MemberData(nameof(Backends))]
     public void Fp32AdamAndAdamW_MatchCpuReference(BackendKind kind)
     {
-        var acquired = TryCreate(kind);
+        var acquired = TryCreate(kind, requiresGlslCompiler: true);
         using var scope = acquired;
         var backend = RequireReady(kind, acquired);
 
@@ -224,7 +224,7 @@ public sealed class CompressedMomentGpuOptimizerTests
     [MemberData(nameof(DenseOptimizerBackends))]
     public void DensePlanSupportedOptimizer_MatchesCpuReference(BackendKind kind, OptimizerType optimizer)
     {
-        var acquired = TryCreate(kind);
+        var acquired = TryCreate(kind, requiresGlslCompiler: true);
         using var scope = acquired;
         var backend = RequireReady(kind, acquired);
 
@@ -295,7 +295,7 @@ public sealed class CompressedMomentGpuOptimizerTests
     [MemberData(nameof(Backends))]
     public void Bf16AdamAndAdamW_MatchCpuReference(BackendKind kind)
     {
-        var acquired = TryCreate(kind);
+        var acquired = TryCreate(kind, requiresGlslCompiler: true);
         using var scope = acquired;
         var backend = RequireReady(kind, acquired);
         var compressed = Assert.IsAssignableFrom<ICompressedMomentGpuOptimizerBackend>(backend);
@@ -332,7 +332,7 @@ public sealed class CompressedMomentGpuOptimizerTests
     [MemberData(nameof(Backends))]
     public void Int8Adam_MatchesCpuReference(BackendKind kind)
     {
-        var acquired = TryCreate(kind);
+        var acquired = TryCreate(kind, requiresGlslCompiler: true);
         using var scope = acquired;
         var backend = RequireReady(kind, acquired);
         var compressed = Assert.IsAssignableFrom<ICompressedMomentGpuOptimizerBackend>(backend);
@@ -367,7 +367,7 @@ public sealed class CompressedMomentGpuOptimizerTests
             backend.DownloadBuffer(param), length, 2e-3f, $"{kind} int8 Adam");
     }
 
-    private static AcquiredBackend TryCreate(BackendKind kind)
+    private static AcquiredBackend TryCreate(BackendKind kind, bool requiresGlslCompiler = false)
     {
         try
         {
@@ -405,9 +405,13 @@ public sealed class CompressedMomentGpuOptimizerTests
                 case BackendKind.Vulkan:
                 {
                     var b = VulkanBackend.Instance;
-                    return b.Initialize()
+                    bool initialized = b.Initialize();
+                    return initialized && (!requiresGlslCompiler || b.IsGlslCompilerAvailable)
                         ? new AcquiredBackend(b, () => { }, null)
-                        : new AcquiredBackend(null, () => { }, null);
+                        : new AcquiredBackend(null, () => { }, initialized
+                            ? new InvalidOperationException(
+                                "Vulkan optimizer kernels require a runtime GLSL compiler (libshaderc).")
+                            : null);
                 }
 #if NET7_0_OR_GREATER
                 case BackendKind.WebGpu:

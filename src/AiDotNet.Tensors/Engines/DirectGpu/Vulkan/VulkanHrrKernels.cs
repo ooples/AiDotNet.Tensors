@@ -3,10 +3,8 @@
 //
 // Each kernel keeps work on the GPU — no download/upload. Per-cell
 // phases use a 32-bit Murmur3 fmix hash seeded from (seed, cellIdx).
-// This does NOT bit-match the CPU xorshift64* sequence or the CUDA
-// splitmix64 sequence; each backend generates its own uniformly
-// distributed phase. Determinism within a backend (same seed + same
-// (V, D) → identical output) is preserved.
+// The CPU reference and every GPU backend use the same hash and phase
+// construction, so the random phase sequence is backend-independent.
 //
 // Int buffers (keyIds / valIds) arrive as float bitcasts — see
 // VulkanBackend.AllocateIntBuffer which packs via Int32BitsToSingle.
@@ -28,11 +26,50 @@ uint hrr_hash(uint seed_u, uint cell_u) {
     return z;
 }
 
-float hrr_phase_from_cell(int seed, uint cellIdx) {
-    uint z = hrr_hash(uint(seed), cellIdx);
-    // Upper 24 bits → exact-representable float in [0, 1).
-    uint top24 = z >> 8;
-    return float(top24) * (1.0 / 16777216.0) * 6.28318530717958647692;
+uint hrr_mul_hi(uint a, uint b) {
+    uint a0 = a & 0xFFFFu, a1 = a >> 16;
+    uint b0 = b & 0xFFFFu, b1 = b >> 16;
+    uint p0 = a0 * b0, p1 = a1 * b0, p2 = a0 * b1;
+    uint carry = (p0 >> 16) + (p1 & 0xFFFFu) + (p2 & 0xFFFFu);
+    return a1 * b1 + (p1 >> 16) + (p2 >> 16) + (carry >> 16);
+}
+
+uint hrr_quantize_turn(uint turn, uint k) {
+    uint lattice = hrr_mul_hi(turn, k);
+    if (turn * k >= 0x80000000u) lattice++;
+    if (lattice == k) lattice = 0;
+    uint quotient = 0, remainder = lattice;
+    for (int i = 0; i < 32; i++) {
+        remainder <<= 1;
+        quotient <<= 1;
+        if (remainder >= k) { remainder -= k; quotient |= 1u; }
+    }
+    return quotient;
+}
+
+const int hrr_cordic_angles[30] = int[30](
+    536870912, 316933406, 167458907, 85004756, 42667331,
+    21354465, 10679838, 5340245, 2670163, 1335087,
+    667544, 333772, 166886, 83443, 41722,
+    20861, 10430, 5215, 2608, 1304,
+    652, 326, 163, 81, 41, 20, 10, 5, 3, 1);
+
+vec2 hrr_sincos(uint turn) {
+    uint quadrant = turn >> 30;
+    uint offset = turn & 0x3FFFFFFFu;
+    int z = int((quadrant == 1u || quadrant == 3u) ? 0x40000000u - offset : offset);
+    int x = 652032874, y = 0;
+    for (int i = 0; i < 30; i++) {
+        int oldX = x;
+        if (z >= 0) {
+            x -= y >> i; y += oldX >> i; z -= hrr_cordic_angles[i];
+        } else {
+            x += y >> i; y -= oldX >> i; z += hrr_cordic_angles[i];
+        }
+    }
+    if (quadrant == 1u || quadrant == 2u) x = -x;
+    if (quadrant >= 2u) y = -y;
+    return vec2(float(x), float(y)) * (1.0 / 1073741824.0);
 }
 ";
 
@@ -57,18 +94,13 @@ void main() {
     uint gid = gl_GlobalInvocationID.x;
     if (gid >= uint(p.total)) return;
 
-    float phase = hrr_phase_from_cell(p.seed, gid);
-    // Defense-in-depth: host validates (kPsk && k <= 0) → throw, so
-    // the shader should never see k <= 0 with kPsk set, but guard
-    // against division-by-zero anyway to avoid NaN propagation if
-    // that invariant is ever broken (e.g., by a future caller that
-    // bypasses the host check).
+    uint turn = hrr_hash(uint(p.seed), gid) & 0xFFFFFF00u;
     if (p.kPsk != 0 && p.k > 0) {
-        float step = 6.28318530717958647692 / float(p.k);
-        phase = floor(phase / step + 0.5) * step;
+        turn = hrr_quantize_turn(turn, uint(p.k));
     }
-    outReal[gid] = cos(phase);
-    outImag[gid] = sin(phase);
+    vec2 value = hrr_sincos(turn);
+    outReal[gid] = value.x;
+    outImag[gid] = value.y;
 }
 ";
 

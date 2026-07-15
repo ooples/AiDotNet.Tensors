@@ -568,7 +568,13 @@ __kernel void equal_values(
     const int idx = get_global_id(0);
     if (idx >= size) return;
 
-    C[idx] = A[idx] == B[idx] ? 1.0f : 0.0f;
+    uint ab = as_uint(A[idx]);
+    uint bb = as_uint(B[idx]);
+    uint aa = ab & 0x7FFFFFFFu;
+    uint ba = bb & 0x7FFFFFFFu;
+    int equal = aa <= 0x7F800000u && ba <= 0x7F800000u
+        && (ab == bb || ((aa | ba) == 0u));
+    C[idx] = equal ? 1.0f : 0.0f;
 }
 
 // Where (conditional select)
@@ -816,7 +822,7 @@ __kernel void fma_kernel(
 // Gather operation
 __kernel void gather_kernel(
     __global const float* source,
-    __global const float* indices,
+    __global const int* indices,
     __global float* output,
     const int numIndices,
     const int featureSize)
@@ -824,7 +830,7 @@ __kernel void gather_kernel(
     const int idx = get_global_id(0);
     if (idx >= numIndices) return;
 
-    int index = (int)indices[idx];
+    int index = indices[idx];
     for (int f = 0; f < featureSize; f++) {
         output[idx * featureSize + f] = source[index * featureSize + f];
     }
@@ -1700,6 +1706,169 @@ __kernel void adaptive_avgpool_backward(
 
     gradInput[idx] = sum;
 }
+
+// #775: GNN scatter-add (index_add) along dim 0. output[m, inner] = sum over source rows d whose
+// index == m of source[d, inner]. GATHER over the output (no atomics); ascending d matches the
+// CpuEngine accumulation order bit-for-bit. Uses the first srcDimSize flattened index values
+// (indices[d]), mirroring CpuEngine.ScatterAdd's indicesData[d].
+__kernel void scatter_add_rows(
+    __global const float* source,   // [srcDimSize, innerSize]
+    __global const int* indices,    // first srcDimSize values are the per-row targets
+    __global float* output,         // [outDimSize, innerSize]
+    const int srcDimSize, const int innerSize, const int outDimSize)
+{
+    int idx = get_global_id(0);
+    if (idx >= outDimSize * innerSize) return;
+    int inner = idx % innerSize;
+    int m = idx / innerSize;
+    float sum = 0.0f;
+    for (int d = 0; d < srcDimSize; d++) {
+        if (indices[d] == m) sum += source[d * innerSize + inner];
+    }
+    output[idx] = sum;
+}
+
+// #775: GNN scatter-mean along dim 0 = scatter-add / per-output-row count. Multiply by 1/count
+// (matching CpuEngine's invDivisor) rather than divide, and leave 0 where the count is 0.
+__kernel void scatter_mean_rows(
+    __global const float* source,
+    __global const int* indices,
+    __global float* output,
+    const int srcDimSize, const int innerSize, const int outDimSize)
+{
+    int idx = get_global_id(0);
+    if (idx >= outDimSize * innerSize) return;
+    int inner = idx % innerSize;
+    int m = idx / innerSize;
+    float sum = 0.0f;
+    int count = 0;
+    for (int d = 0; d < srcDimSize; d++) {
+        if (indices[d] == m) { sum += source[d * innerSize + inner]; count++; }
+    }
+    output[idx] = count > 0 ? sum * (1.0f / (float)count) : 0.0f;
+}
+
+// #775: GNN scatter-max along dim 0. output[m,inner] = max over source rows d whose index == m of
+// source[d,inner]; empty groups stay -INFINITY (matching CpuEngine's negInf init). Strict > in
+// ascending d = first-row-on-ties, so the host argmax re-scan matches. Only the max is produced here.
+__kernel void scatter_max_rows(
+    __global const float* source,
+    __global const int* indices,
+    __global float* output,
+    const int srcDimSize, const int innerSize, const int outDimSize)
+{
+    int idx = get_global_id(0);
+    if (idx >= outDimSize * innerSize) return;
+    int inner = idx % innerSize;
+    int m = idx / innerSize;
+    float mx = -INFINITY;
+    for (int d = 0; d < srcDimSize; d++) {
+        if (indices[d] == m) { float v = source[d * innerSize + inner]; if (v > mx) mx = v; }
+    }
+    output[idx] = mx;
+}
+
+// #775: GNN scatter-softmax = softmax within each index-group. output has the SAME shape as source;
+// for element (d,inner) with group g=indices[d]: exp(source[d,inner]-maxg)/sumg over the group (max
+// for stability). Invalid group (out of [0,numGroups)) -> 0, matching CpuEngine. Gather over source.
+__kernel void scatter_softmax_rows(
+    __global const float* source,
+    __global const int* indices,
+    __global float* output,
+    const int srcDimSize, const int innerSize, const int numGroups)
+{
+    int idx = get_global_id(0);
+    if (idx >= srcDimSize * innerSize) return;
+    int inner = idx % innerSize;
+    int d = idx / innerSize;
+    int g = indices[d];
+    if (g < 0 || g >= numGroups) { output[idx] = 0.0f; return; }
+    float maxg = -INFINITY;
+    for (int dd = 0; dd < srcDimSize; dd++)
+        if (indices[dd] == g) { float v = source[dd * innerSize + inner]; if (v > maxg) maxg = v; }
+    float sumg = 0.0f;
+    for (int dd = 0; dd < srcDimSize; dd++)
+        if (indices[dd] == g) sumg += exp(source[dd * innerSize + inner] - maxg);
+    float e = exp(source[d * innerSize + inner] - maxg);
+    output[idx] = (sumg != 0.0f) ? (e / sumg) : e;
+}
+
+// #775: ScatterAdd backward = gather. gradSource[d,inner] = gradOutput[index[d],inner], or 0 when the
+// index is out of range (matching CpuEngine).
+__kernel void scatter_add_backward_rows(
+    __global const float* gradOutput,
+    __global const int* indices,
+    __global float* gradSource,
+    const int srcDimSize, const int innerSize, const int outDimSize)
+{
+    int idx = get_global_id(0);
+    if (idx >= srcDimSize * innerSize) return;
+    int inner = idx % innerSize;
+    int d = idx / innerSize;
+    int g = indices[d];
+    gradSource[idx] = (g >= 0 && g < outDimSize) ? gradOutput[g * innerSize + inner] : 0.0f;
+}
+
+// #775: ScatterMean backward = gather / count. gradSource[d,inner] = gradOutput[index[d],inner] /
+// max(count[index[d]], 1) (CpuEngine divides by 1 when the count is 0). Out-of-range index -> 0.
+__kernel void scatter_mean_backward_rows(
+    __global const float* gradOutput,
+    __global const int* indices,
+    __global const int* counts,
+    __global float* gradSource,
+    const int srcDimSize, const int innerSize, const int outDimSize)
+{
+    int idx = get_global_id(0);
+    if (idx >= srcDimSize * innerSize) return;
+    int inner = idx % innerSize;
+    int d = idx / innerSize;
+    int g = indices[d];
+    if (g < 0 || g >= outDimSize) { gradSource[idx] = 0.0f; return; }
+    int cnt = counts[g];
+    float divisor = cnt > 0 ? (float)cnt : 1.0f;
+    gradSource[idx] = gradOutput[g * innerSize + inner] / divisor;
+}
+
+// #775: ScatterMax backward routes each output element's gradient to its argmax source row:
+// gradSource[argmax[m,inner],inner] = gradOutput[m,inner]. As a gather over gradSource, scan all
+// output rows m and keep the LAST match (matches CpuEngine's ascending-m scatter, last write wins).
+__kernel void scatter_max_backward_rows(
+    __global const float* gradOutput,
+    __global const int* argmax,
+    __global float* gradSource,
+    const int srcDimSize, const int innerSize, const int outDimSize)
+{
+    int idx = get_global_id(0);
+    if (idx >= srcDimSize * innerSize) return;
+    int inner = idx % innerSize;
+    int dsrc = idx / innerSize;
+    float g = 0.0f;
+    for (int m = 0; m < outDimSize; m++)
+        if (argmax[m * innerSize + inner] == dsrc) g = gradOutput[m * innerSize + inner];
+    gradSource[idx] = g;
+}
+
+// #775: ScatterSoftmax backward (softmax jacobian within each index-group):
+// gradSource[d,inner] = output[d,inner] * (gradOutput[d,inner] - sum_{d' in group} output*gradOutput).
+// Gather over source elements; each recomputes the per-group weighted sum. Invalid group -> 0.
+__kernel void scatter_softmax_backward_rows(
+    __global const float* gradOutput,
+    __global const float* output,
+    __global const int* indices,
+    __global float* gradSource,
+    const int srcDimSize, const int innerSize, const int numGroups)
+{
+    int idx = get_global_id(0);
+    if (idx >= srcDimSize * innerSize) return;
+    int inner = idx % innerSize;
+    int d = idx / innerSize;
+    int g = indices[d];
+    if (g < 0 || g >= numGroups) { gradSource[idx] = 0.0f; return; }
+    float sumg = 0.0f;
+    for (int dd = 0; dd < srcDimSize; dd++)
+        if (indices[dd] == g) sumg += output[dd * innerSize + inner] * gradOutput[dd * innerSize + inner];
+    gradSource[idx] = output[idx] * (gradOutput[idx] - sumg);
+}
 ";
         }
 
@@ -1731,7 +1900,7 @@ __kernel void adaptive_avgpool_backward(
                 "mean_axis", "var_axis", "argmax_axis", "argmin_axis",
                 "dropout_forward", "dropout_backward",
                 "embedding_lookup", "embedding_backward", "embedding_backward_deterministic",
-                "fma_kernel", "gather_kernel", "scatter_add_kernel", "scatter_add_kernel_deterministic",
+                "fma_kernel", "gather_kernel", "scatter_add_kernel", "scatter_add_kernel_deterministic", "scatter_add_rows", "scatter_mean_rows", "scatter_max_rows", "scatter_softmax_rows", "scatter_add_backward_rows", "scatter_mean_backward_rows", "scatter_max_backward_rows", "scatter_softmax_backward_rows",
                 // LSTM kernels
                 "lstm_cell_forward", "lstm_cell_backward", "lstm_gates_precompute",
                 // GRU kernels

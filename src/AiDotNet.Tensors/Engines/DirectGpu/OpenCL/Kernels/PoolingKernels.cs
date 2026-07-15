@@ -796,6 +796,42 @@ __kernel void nearest_neighbor_upsample_backward(
 
     gradInput[idx] = grad_sum;
 }
+
+// #775: adaptive max pooling 2D. Same adaptive window bounds as adaptive_avgpool2d but takes the max
+// (gather over output; strict > keeps the first max on ties, matching CpuEngine -> bit-exact).
+__kernel void adaptive_max_pool2d(
+    __global const float* input,
+    __global float* output,
+    const int batch,
+    const int channels,
+    const int inHeight,
+    const int inWidth,
+    const int outHeight,
+    const int outWidth)
+{
+    const int ow = get_global_id(0);
+    const int oh = get_global_id(1);
+    const int idx2 = get_global_id(2);
+    const int c = idx2 % channels;
+    const int b = idx2 / channels;
+
+    if (ow >= outWidth || oh >= outHeight || b >= batch) return;
+
+    int hStart = (oh * inHeight) / outHeight;
+    int hEnd = ((oh + 1) * inHeight) / outHeight;
+    int wStart = (ow * inWidth) / outWidth;
+    int wEnd = ((ow + 1) * inWidth) / outWidth;
+
+    float maxV = -INFINITY;
+    for (int ih = hStart; ih < hEnd; ih++) {
+        for (int iw = wStart; iw < wEnd; iw++) {
+            float v = input[((b * channels + c) * inHeight + ih) * inWidth + iw];
+            if (v > maxV) maxV = v;
+        }
+    }
+
+    output[((b * channels + c) * outHeight + oh) * outWidth + ow] = maxV;
+}
 ";
         }
 
@@ -816,6 +852,7 @@ __kernel void nearest_neighbor_upsample_backward(
                 "global_avgpool2d_backward",
                 "global_maxpool2d_backward",
                 "adaptive_avgpool2d",
+                "adaptive_max_pool2d",
                 "maxpool3d",
                 "maxpool3d_backward",
                 "avgpool3d",

@@ -1028,7 +1028,9 @@ __kernel void selu_backward(
     const float alpha = 1.6732632423543772848170429916717f;
 
     float x = input[idx];
-    float grad = x > 0.0f ? scale : scale * alpha * exp(x);
+    // #775: use >= to match CpuEngine (deriv = x >= 0 ? scale : scale*alpha*exp(x)); differs only at
+    // exactly x==0 but keeps CPU/GPU bit-identical. Constants are hardcoded (kernel takes 4 args, not 6).
+    float grad = x >= 0.0f ? scale : scale * alpha * exp(x);
     gradInput[idx] = gradOutput[idx] * grad;
 }
 
@@ -1119,10 +1121,13 @@ __kernel void threshold_backward(__global const float* gradOutput, __global cons
     gradInput[idx] = input[idx] > thresh ? gradOutput[idx] : 0.0f;
 }
 // Reciprocal backward: -1/x^2
+// #775: `input` here is the reciprocal OUTPUT y=1/x (what IEngine.ReciprocalBackward passes). The
+// derivative d(1/x)/dx = -1/x^2 = -y^2, so grad = -gradOutput * y^2. The old kernel DIVIDED by y^2
+// (-gradOutput / y^2) which is wrong; it was deliberately routed to CpuEngine. Multiply instead.
 __kernel void reciprocal_backward(__global const float* gradOutput, __global const float* input, __global float* gradInput, const int size)
 {
     const int idx = get_global_id(0); if (idx >= size) return;
-    float x = input[idx]; gradInput[idx] = -gradOutput[idx] / (x * x);
+    float y = input[idx]; gradInput[idx] = -gradOutput[idx] * (y * y);
 }
 
 __kernel void var_backward(__global const float* gradOutput, __global const float* input, __global const float* mean, __global float* gradInput, const int outerSize, const int reduceSize)
@@ -1479,6 +1484,23 @@ __kernel void scale_add(__global const float* A, __global const float* B, __glob
         vstore4(fma(vload4(idx, A), (float4)(scalar), vload4(idx, B)), idx, C);
     } else { for (int i = idx4; i < size; i++) C[i] = fma(A[i], scalar, B[i]); }
 }
+
+__kernel void l2_norm_squared(__global const float* input, __global float* output, const int size) {
+    int index = get_global_id(0); if (index < size) output[index] = input[index] * input[index];
+}
+
+__kernel void squared_deviation_from_mean(
+    __global const float* input, __global const float* mean, __global float* output, const int size) {
+    int index = get_global_id(0); if (index < size) { float difference = input[index] - mean[0]; output[index] = difference * difference; }
+}
+
+__kernel void clip_by_norm_from_squared_sum(
+    __global const float* input, __global const float* squaredSum, __global float* output,
+    const float maximumNorm, const int size) {
+    int index = get_global_id(0); if (index >= size) return;
+    float norm = sqrt(fmax(squaredSum[0], 0.0f)); float scale = norm > maximumNorm ? maximumNorm / norm : 1.0f;
+    output[index] = input[index] * scale;
+}
 ";
         }
 
@@ -1512,6 +1534,7 @@ __kernel void scale_add(__global const float* A, __global const float* B, __glob
                 "divide_vectors", "min_vectors", "max_vectors",
                 // Fused element-wise
                 "add_relu", "add_sigmoid", "add_gelu", "fused_mul_add", "scale_add",
+                "l2_norm_squared", "squared_deviation_from_mean", "clip_by_norm_from_squared_sum",
                 // Scalar ops
                 "scale_vector", "scale_by_device_scalar", "power_scalar",
                 // Unary math

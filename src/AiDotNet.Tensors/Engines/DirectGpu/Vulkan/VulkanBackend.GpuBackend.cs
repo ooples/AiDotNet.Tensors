@@ -10,6 +10,99 @@ public sealed unsafe partial class VulkanBackend
 {
     #region Internal Helpers
 
+    private enum ResidentUnaryOp : uint
+    {
+        Power,
+        Abs,
+        Exp,
+        Exp2,
+        Exp10,
+        ExpM1,
+        Log,
+        Log2,
+        Log1P,
+        Sqrt,
+        Sign,
+        Gelu,
+        Sin,
+        Cos,
+        Tan,
+        Asin,
+        Acos,
+        Atan,
+        Sinh,
+        Cosh,
+        Asinh,
+        Acosh,
+        Atanh,
+        Reciprocal,
+        Cbrt,
+        Log10,
+        Negate,
+        Floor,
+        Ceiling,
+        Round,
+        Truncate,
+        LeakyRelu,
+        Elu,
+        Swish,
+        Mish,
+        Softplus,
+        HardSwish,
+        Selu,
+        HardSigmoid,
+        Clamp,
+        NotEqualScalar,
+        PowerToDb,
+        DbToPower
+    }
+
+    private enum ResidentBinaryOp : uint
+    {
+        Min,
+        Max,
+        LeakyReluBackward,
+        ReluBackward,
+        SigmoidBackward,
+        TanhBackward,
+        SoftplusBackward,
+        HardSwishBackward,
+        SeluBackward,
+        HardSigmoidBackward,
+        HardTanhBackward,
+        Greater,
+        Less,
+        Equal,
+        Lerp,
+        AddScaled,
+        ComplexMagnitude,
+        ComplexPhase,
+        Multiply,
+        SwishBackward,
+        GeluBackward,
+        MishBackward
+    }
+
+    private void ResidentUnary(ResidentUnaryOp op, IGpuBuffer input, IGpuBuffer output, int size,
+        float p0 = 0f, float p1 = 0f, float p2 = 0f)
+    {
+        var pushConstants = new uint[]
+        {
+            (uint)size, (uint)op, FloatBits(p0), FloatBits(p1), FloatBits(p2)
+        };
+        GlslUnaryOp(VulkanGlslKernels.UnaryElementwise, input, output, size, pushConstants, 5 * sizeof(uint));
+    }
+
+    private void ResidentBinary(ResidentBinaryOp op, IGpuBuffer left, IGpuBuffer right, IGpuBuffer output,
+        int size, float p0 = 0f, float p1 = 0f, float p2 = 0f)
+    {
+        var pushConstants = new uint[]
+        {
+            (uint)size, (uint)op, FloatBits(p0), FloatBits(p1), FloatBits(p2)
+        };
+        GlslBinaryOp(VulkanGlslKernels.BinaryElementwise, left, right, output, size, pushConstants, 5 * sizeof(uint));
+    }
+
     // Bit conversion helpers compatible with net471 and later
     private static int SingleToInt32BitsCompat(float value)
     {
@@ -143,52 +236,16 @@ public sealed unsafe partial class VulkanBackend
         }
     }
 
-    private void CpuUnary(IGpuBuffer A, IGpuBuffer B, int size, Func<float, float> op)
+    private float ResidentScalarReduce(IGpuBuffer input, int size, uint operation)
     {
         EnsureInitialized();
-        if (size < 0)
-            throw new ArgumentOutOfRangeException(nameof(size), "Size must be non-negative.");
-        if (size == 0) return;
-        if (size > A.Size)
-            throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds input buffer length ({A.Size}).");
-        if (size > B.Size)
-            throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds output buffer length ({B.Size}).");
-        var a = DownloadBuffer(A);
-        var b = new float[size];
-        for (int i = 0; i < size; i++) b[i] = op(a[i]);
-        UploadToBuffer(b, B);
-    }
-
-    private void CpuBinary(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size, Func<float, float, float> op)
-    {
-        EnsureInitialized();
-        if (size < 0)
-            throw new ArgumentOutOfRangeException(nameof(size), "Size must be non-negative.");
-        if (size == 0) return;
-        if (size > A.Size)
-            throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds first input buffer length ({A.Size}).");
-        if (size > B.Size)
-            throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds second input buffer length ({B.Size}).");
-        if (size > C.Size)
-            throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds output buffer length ({C.Size}).");
-        var a = DownloadBuffer(A);
-        var b = DownloadBuffer(B);
-        var c = new float[size];
-        for (int i = 0; i < size; i++) c[i] = op(a[i], b[i]);
-        UploadToBuffer(c, C);
-    }
-
-    private float CpuReduce(IGpuBuffer A, int size, float seed, Func<float, float, float> accumulate)
-    {
-        EnsureInitialized();
-        if (size < 0)
-            throw new ArgumentOutOfRangeException(nameof(size), "Size must be non-negative.");
-        if (size > A.Size)
-            throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds buffer length ({A.Size}).");
-        var a = DownloadBuffer(A);
-        float result = seed;
-        for (int i = 0; i < size; i++) result = accumulate(result, a[i]);
-        return result;
+        if (size <= 0) throw new ArgumentOutOfRangeException(nameof(size), "Size must be positive.");
+        if (size > input.Size)
+            throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds buffer length ({input.Size}).");
+        using var result = AllocateBuffer(1);
+        GlslUnaryOp(VulkanGlslKernels.ScalarReduce, input, result, 1,
+            new uint[] { (uint)size, operation }, 2 * sizeof(uint));
+        return DownloadBuffer(result)[0];
     }
 
     #endregion
@@ -218,6 +275,7 @@ public sealed unsafe partial class VulkanBackend
 
     public float[] DownloadBuffer(IGpuBuffer buffer)
     {
+        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float));
         EnsureInitialized();
         var vb = AsVulkan(buffer);
         if (_transfer is null)
@@ -230,6 +288,7 @@ public sealed unsafe partial class VulkanBackend
 
     public void DownloadBuffer(IGpuBuffer buffer, float[] destination)
     {
+        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float));
         EnsureInitialized();
         if (destination.Length < buffer.Size)
             throw new ArgumentException($"Destination array length ({destination.Length}) is less than buffer size ({buffer.Size}).", nameof(destination));
@@ -292,21 +351,16 @@ public sealed unsafe partial class VulkanBackend
         if (destOffset + size > destination.Size)
             throw new ArgumentOutOfRangeException(nameof(size), $"Destination offset ({destOffset}) + size ({size}) exceeds destination buffer length ({destination.Size}).");
 
-        var src = DownloadBuffer(source);
-        // Only download destination when partial copy needs to preserve existing data.
-        // Use strict equality to avoid allocating a too-small array when size > destination.Size
-        // (which is already prevented by the validation above, but defensive coding).
-        float[] dst;
-        if (destOffset == 0 && size == destination.Size)
-        {
-            dst = new float[destination.Size];
-        }
-        else
-        {
-            dst = DownloadBuffer(destination);
-        }
-        Array.Copy(src, srcOffset, dst, destOffset, size);
-        UploadToBuffer(dst, destination);
+        if (_transfer is null)
+            throw new InvalidOperationException("Vulkan transfer manager not initialized.");
+        if (source is not VulkanGpuBuffer src || destination is not VulkanGpuBuffer dst)
+            throw new ArgumentException("Buffers must be VulkanGpuBuffer instances.");
+
+        GpuLaunchProbe.OnLaunch();
+        _transfer.CopyDeviceToDevice(
+            src.Storage, checked((ulong)srcOffset * sizeof(float)),
+            dst.Storage, checked((ulong)destOffset * sizeof(float)),
+            checked((ulong)size * sizeof(float)));
     }
 
     public IGpuBuffer AllocateIntBuffer(int size)
@@ -369,29 +423,9 @@ public sealed unsafe partial class VulkanBackend
     public void Gemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
     {
         EnsureInitialized();
-
-        // GPU fast path: plain C = A·B (alpha=1, beta=0) runs on-device via the
-        // GLSL GEMM compute shader. This is the common case (MatMul calls Gemm
-        // with the defaults). Scaled/accumulating GEMM (alpha≠1 or beta≠0) and
-        // hosts without libshaderc fall through to the managed loop below.
-        if (alpha == 1.0f && beta == 0.0f && TryGlslGemmFp32(A, B, C, M, N, K))
-            return;
-
-        var a = DownloadBuffer(A);
-        var b = DownloadBuffer(B);
-        // Skip downloading C when beta is 0 since existing values are not needed
-        var c = beta != 0.0f ? DownloadBuffer(C) : new float[M * N];
-        for (int i = 0; i < M; i++)
-        {
-            for (int j = 0; j < N; j++)
-            {
-                float sum = 0;
-                for (int k = 0; k < K; k++)
-                    sum += a[i * K + k] * b[k * N + j];
-                c[i * N + j] = beta != 0.0f ? alpha * sum + beta * c[i * N + j] : alpha * sum;
-            }
-        }
-        UploadToBuffer(c, C);
+        ValidateGemmBuffers(A, B, C, M, N, K, false);
+        if (!TryGlslGemmFp32(A, B, C, M, N, K, alpha, beta))
+            throw new InvalidOperationException("Vulkan GEMM pipeline creation failed.");
     }
 
     /// <summary>
@@ -400,24 +434,52 @@ public sealed unsafe partial class VulkanBackend
     /// dimensions are non-positive or libshaderc isn't available to compile the
     /// shader. One invocation per output element; push constants carry {M, N, K}.
     /// </summary>
-    private bool TryGlslGemmFp32(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K)
+    private bool TryGlslGemmFp32(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K,
+        float alpha, float beta)
     {
         if (M <= 0 || N <= 0 || K <= 0)
             return false;
 
-        var pipeline = GetOrCreateGlslPipeline(VulkanGemmKernels.GemmFp32, 3, 3 * sizeof(uint));
+        var pipeline = GetOrCreateGlslPipeline(VulkanGemmKernels.GemmFp32, 3, 5 * sizeof(uint));
         if (pipeline is null)
             return false;
 
         var vbA = AsVulkan(A);
         var vbB = AsVulkan(B);
         var vbC = AsVulkan(C);
-        var pushConstants = new uint[] { (uint)M, (uint)N, (uint)K };
+        var pushConstants = new uint[] { (uint)M, (uint)N, (uint)K, FloatBits(alpha), FloatBits(beta) };
         var threadRes = _device.AcquireThreadResources();
         lock (_computeLock)
         {
             pipeline.UpdateDescriptorSet(vbA.Storage, vbB.Storage, vbC.Storage);
-            RecordAndExecuteWithPushData(pipeline, M * N, pushConstants, 3 * sizeof(uint), threadRes);
+            RecordAndExecuteWithPushData(pipeline, M * N, pushConstants, 5 * sizeof(uint), threadRes);
+        }
+
+        return true;
+    }
+
+    /// <summary>Runs C = alpha * A * B-transpose + beta * C entirely on the Vulkan device.</summary>
+    private bool TryGlslGemmTransposedFp32(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C,
+        int M, int N, int K, float alpha, float beta)
+    {
+        var pipeline = GetOrCreateGlslPipeline(
+            VulkanGemmKernels.GemmFp32Transposed, 3, 5 * sizeof(uint));
+        if (pipeline is null)
+            return false;
+
+        var pushConstants = new uint[]
+        {
+            (uint)M,
+            (uint)N,
+            (uint)K,
+            unchecked((uint)SingleToInt32BitsCompat(alpha)),
+            unchecked((uint)SingleToInt32BitsCompat(beta))
+        };
+        var threadRes = _device.AcquireThreadResources();
+        lock (_computeLock)
+        {
+            pipeline.UpdateDescriptorSet(AsVulkan(A).Storage, AsVulkan(B).Storage, AsVulkan(C).Storage);
+            RecordAndExecuteWithPushData(pipeline, M * N, pushConstants, 5 * sizeof(uint), threadRes);
         }
 
         return true;
@@ -447,92 +509,74 @@ public sealed unsafe partial class VulkanBackend
         if ((long)C.Size < (long)M * N)
             throw new ArgumentException($"C.Size {C.Size} < M*N = {(long)M * N}.", nameof(C));
 
-        // Same managed-fallback shape as Gemm — Vulkan compute pipeline
-        // for matmul isn't wired here yet; the buffer download/upload
-        // pair lets the kernel operate on host floats. The transposed-B
-        // index pattern accesses B[j, k] = b[j*K+k] instead of b[k*N+j].
-        var a = DownloadBuffer(A);
-        var b = DownloadBuffer(B);
-        var c = beta != 0.0f ? DownloadBuffer(C) : new float[M * N];
-        for (int i = 0; i < M; i++)
-        {
-            for (int j = 0; j < N; j++)
-            {
-                float sum = 0;
-                for (int k = 0; k < K; k++)
-                    sum += a[i * K + k] * b[j * K + k];
-                c[i * N + j] = beta != 0.0f ? alpha * sum + beta * c[i * N + j] : alpha * sum;
-            }
-        }
-        UploadToBuffer(c, C);
+        if (!TryGlslGemmTransposedFp32(A, B, C, M, N, K, alpha, beta))
+            throw new InvalidOperationException("Vulkan transposed GEMM pipeline creation failed.");
     }
 
     public void BatchedGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, int batchCount, float alpha = 1.0f, float beta = 0.0f)
     {
         EnsureInitialized();
-        var a = DownloadBuffer(A);
-        var b = DownloadBuffer(B);
-        // Skip downloading C when beta is 0 since existing values are not needed
-        var c = beta != 0.0f ? DownloadBuffer(C) : new float[batchCount * M * N];
-        int aStride = M * K, bStride = K * N, cStride = M * N;
-        for (int batch = 0; batch < batchCount; batch++)
+        if (batchCount <= 0) throw new ArgumentOutOfRangeException(nameof(batchCount));
+        ValidateGemmBuffers(A, B, C, M, N, K, false, batchCount);
+        var pushConstants = new uint[]
         {
-            int aOff = batch * aStride, bOff = batch * bStride, cOff = batch * cStride;
-            for (int i = 0; i < M; i++)
-                for (int j = 0; j < N; j++)
-                {
-                    float sum = 0;
-                    for (int k = 0; k < K; k++)
-                        sum += a[aOff + i * K + k] * b[bOff + k * N + j];
-                    c[cOff + i * N + j] = beta != 0.0f ? alpha * sum + beta * c[cOff + i * N + j] : alpha * sum;
-                }
-        }
-        UploadToBuffer(c, C);
+            (uint)M, (uint)N, (uint)K, (uint)batchCount, FloatBits(alpha), FloatBits(beta)
+        };
+        GlslBinaryOp(VulkanGemmKernels.BatchedGemmFp32, A, B, C, batchCount * M * N,
+            pushConstants, 6 * sizeof(uint));
+    }
+
+    private static void ValidateGemmBuffers(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C,
+        int M, int N, int K, bool transposeB, int batchCount = 1)
+    {
+        if (M <= 0 || N <= 0 || K <= 0)
+            throw new ArgumentOutOfRangeException(nameof(M), "Matrix dimensions M, N, K must all be positive.");
+        long aRequired = (long)batchCount * M * K;
+        long bRequired = (long)batchCount * (transposeB ? N * K : K * N);
+        long cRequired = (long)batchCount * M * N;
+        if (A.Size < aRequired) throw new ArgumentException($"A.Size {A.Size} < required {aRequired}.", nameof(A));
+        if (B.Size < bRequired) throw new ArgumentException($"B.Size {B.Size} < required {bRequired}.", nameof(B));
+        if (C.Size < cRequired) throw new ArgumentException($"C.Size {C.Size} < required {cRequired}.", nameof(C));
     }
 
     #endregion
 
     #region Fused GEMM Operations
 
-    private IGpuBuffer GemmBiasActivation(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K, Func<float, float> activation)
+    private IGpuBuffer GemmBiasActivation(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K,
+        string shader, float? alpha = null)
     {
         EnsureInitialized();
-        var a = DownloadBuffer(A);
-        var b = DownloadBuffer(B);
-        var bi = DownloadBuffer(bias);
-        var c = new float[M * N];
-        for (int i = 0; i < M; i++)
-            for (int j = 0; j < N; j++)
-            {
-                float sum = bi[j];
-                for (int k = 0; k < K; k++)
-                    sum += a[i * K + k] * b[k * N + j];
-                c[i * N + j] = activation(sum);
-            }
-        var result = AllocateBuffer(c);
+        if (M <= 0 || N <= 0 || K <= 0) throw new ArgumentOutOfRangeException(nameof(M));
+        var result = AllocateBuffer(M * N);
+        var pushConstants = alpha.HasValue
+            ? new uint[] { (uint)M, (uint)K, (uint)N, FloatBits(alpha.Value) }
+            : new uint[] { (uint)M, (uint)K, (uint)N };
+        GlslQuadOp(shader, A, B, bias, result, M * N, pushConstants,
+            (uint)(pushConstants.Length * sizeof(uint)));
         return result;
     }
 
     public IGpuBuffer GemmBiasRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-        => GemmBiasActivation(A, B, bias, M, N, K, v => MathF.Max(0, v));
+        => GemmBiasActivation(A, B, bias, M, N, K, VulkanGlslKernels.FusedLinearReLU);
 
     public IGpuBuffer GemmBiasGelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-        => GemmBiasActivation(A, B, bias, M, N, K, v => 0.5f * v * (1f + MathF.Tanh(0.7978845608f * (v + 0.044715f * v * v * v))));
+        => GemmBiasActivation(A, B, bias, M, N, K, VulkanGlslKernels.FusedLinearGELU);
 
     public IGpuBuffer GemmBiasSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-        => GemmBiasActivation(A, B, bias, M, N, K, v => 1f / (1f + MathF.Exp(-v)));
+        => GemmBiasActivation(A, B, bias, M, N, K, VulkanGlslKernels.FusedLinearSigmoid);
 
     public IGpuBuffer GemmBiasTanh(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-        => GemmBiasActivation(A, B, bias, M, N, K, MathF.Tanh);
+        => GemmBiasActivation(A, B, bias, M, N, K, VulkanGlslKernels.FusedLinearTanh);
 
     public IGpuBuffer GemmBias(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-        => GemmBiasActivation(A, B, bias, M, N, K, v => v);
+        => GemmBiasActivation(A, B, bias, M, N, K, VulkanGlslKernels.FusedLinearIdentity);
 
     public IGpuBuffer GemmBiasSwish(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-        => GemmBiasActivation(A, B, bias, M, N, K, v => v * (1.0f / (1.0f + MathF.Exp(-v))));
+        => GemmBiasActivation(A, B, bias, M, N, K, VulkanGlslKernels.FusedLinearSwish);
 
     public IGpuBuffer GemmBiasLeakyRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K, float alpha = 0.01f)
-        => GemmBiasActivation(A, B, bias, M, N, K, v => v >= 0 ? v : alpha * v);
+        => GemmBiasActivation(A, B, bias, M, N, K, VulkanGlslKernels.FusedLinearLeakyRelu, alpha);
 
     #endregion
 
@@ -540,30 +584,15 @@ public sealed unsafe partial class VulkanBackend
 
     public void BiasAdd(IGpuBuffer A, IGpuBuffer bias, IGpuBuffer C, int M, int N)
     {
-        EnsureInitialized();
-        var a = DownloadBuffer(A);
-        var bi = DownloadBuffer(bias);
-        var c = new float[M * N];
-        for (int i = 0; i < M; i++)
-            for (int j = 0; j < N; j++)
-                c[i * N + j] = a[i * N + j] + bi[j];
-        UploadToBuffer(c, C);
+        GlslBinaryOp(VulkanGlslKernels.BiasAdd, A, bias, C, M * N,
+            new uint[] { (uint)(M * N), (uint)N }, 2 * sizeof(uint));
     }
 
     public void Conv2DBiasAdd(IGpuBuffer output, IGpuBuffer bias, int batch, int channels, int spatialSize)
     {
-        EnsureInitialized();
-        var o = DownloadBuffer(output);
-        var bi = DownloadBuffer(bias);
-        for (int b = 0; b < batch; b++)
-            for (int c = 0; c < channels; c++)
-            {
-                float bv = bi[c];
-                int offset = (b * channels + c) * spatialSize;
-                for (int s = 0; s < spatialSize; s++)
-                    o[offset + s] += bv;
-            }
-        UploadToBuffer(o, output);
+        GlslUnaryOp(VulkanGlslKernels.Conv2DBiasAdd, output, bias, batch * channels * spatialSize,
+            new uint[] { (uint)(batch * channels * spatialSize), (uint)channels, (uint)spatialSize },
+            3 * sizeof(uint));
     }
 
     #endregion
@@ -632,18 +661,9 @@ public sealed unsafe partial class VulkanBackend
         EnsureInitialized();
         if (aSize <= 0) return;
 
-        // Extract strided window into contiguous buffer then standard DotProduct
-        var bFull = DownloadBuffer(b);
-
-        var window = new float[aSize];
-        for (int i = 0; i < aSize; i++)
-        {
-            int bIdx = bOffset + i * bStride;
-            window[i] = (bIdx >= 0 && bIdx < bSize && bIdx < bFull.Length) ? bFull[bIdx] : 0f;
-        }
-
-        using var windowBuf = AllocateBuffer(window);
-        DotProduct(a, windowBuf, result, aSize);
+        GlslBinaryOp(VulkanGlslKernels.StridedDot, a, b, result, 1,
+            new uint[] { (uint)aSize, (uint)bSize, unchecked((uint)bOffset), unchecked((uint)bStride) },
+            4 * sizeof(uint));
     }
 
     public void BatchedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
@@ -681,13 +701,13 @@ public sealed unsafe partial class VulkanBackend
 
     #endregion
 
-    #region Element-wise Operations (CPU fallback)
+    #region Element-wise Operations
 
     public void Min(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
-        => CpuBinary(A, B, C, size, MathF.Min);
+        => ResidentBinary(ResidentBinaryOp.Min, A, B, C, size);
 
     public void Max(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
-        => CpuBinary(A, B, C, size, MathF.Max);
+        => ResidentBinary(ResidentBinaryOp.Max, A, B, C, size);
 
     private const string StridedGatherGlsl = @"
 #version 450
@@ -729,12 +749,7 @@ void main() {
             return;
         }
 
-        // Fallback: CPU roundtrip if GLSL compiler unavailable
-        var srcData = DownloadBuffer(src);
-        var dstData = new float[count];
-        for (int i = 0; i < count; i++)
-            dstData[i] = srcData[offset + i * stride];
-        UploadToBuffer(dstData, dst);
+        throw new InvalidOperationException("Vulkan strided-gather pipeline creation failed.");
     }
 
     public void StridedScatter(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
@@ -755,72 +770,50 @@ void main() {
             return;
         }
 
-        // Fallback: CPU roundtrip if GLSL compiler unavailable
-        var srcData = DownloadBuffer(src);
-        var dstData = DownloadBuffer(dst);
-        for (int i = 0; i < count; i++)
-            dstData[offset + i * stride] = srcData[i];
-        UploadToBuffer(dstData, dst);
+        throw new InvalidOperationException("Vulkan strided-scatter pipeline creation failed.");
     }
 
     public void Power(IGpuBuffer A, IGpuBuffer B, float exponent, int size)
-        => CpuUnary(A, B, size, v => MathF.Pow(v, exponent));
+        => ResidentUnary(ResidentUnaryOp.Power, A, B, size, exponent);
 
     public void Abs(IGpuBuffer A, IGpuBuffer B, int size)
-        => CpuUnary(A, B, size, MathF.Abs);
+        => ResidentUnary(ResidentUnaryOp.Abs, A, B, size);
 
     public void Exp(IGpuBuffer A, IGpuBuffer B, int size)
-        => CpuUnary(A, B, size, MathF.Exp);
+        => ResidentUnary(ResidentUnaryOp.Exp, A, B, size);
 
     public void Exp2(IGpuBuffer A, IGpuBuffer B, int size)
-        => CpuUnary(A, B, size, v => MathF.Pow(2f, v));
+        => ResidentUnary(ResidentUnaryOp.Exp2, A, B, size);
 
     public void Exp10(IGpuBuffer A, IGpuBuffer B, int size)
-        => CpuUnary(A, B, size, v => MathF.Pow(10f, v));
+        => ResidentUnary(ResidentUnaryOp.Exp10, A, B, size);
 
     public void ExpM1(IGpuBuffer A, IGpuBuffer B, int size)
-        => CpuUnary(A, B, size, v => MathF.Exp(v) - 1f);
+        => ResidentUnary(ResidentUnaryOp.ExpM1, A, B, size);
 
     public void Log(IGpuBuffer A, IGpuBuffer B, int size)
-        => CpuUnary(A, B, size, MathF.Log);
+        => ResidentUnary(ResidentUnaryOp.Log, A, B, size);
 
     public void Log2(IGpuBuffer A, IGpuBuffer B, int size)
-        => CpuUnary(A, B, size, Log2Compat);
+        => ResidentUnary(ResidentUnaryOp.Log2, A, B, size);
 
     public void Log1P(IGpuBuffer A, IGpuBuffer B, int size)
-        => CpuUnary(A, B, size, v => MathF.Log(1f + v));
+        => ResidentUnary(ResidentUnaryOp.Log1P, A, B, size);
 
     public void Sqrt(IGpuBuffer A, IGpuBuffer B, int size)
-        => CpuUnary(A, B, size, MathF.Sqrt);
+        => ResidentUnary(ResidentUnaryOp.Sqrt, A, B, size);
 
     public void Sign(IGpuBuffer A, IGpuBuffer B, int size)
-        => CpuUnary(A, B, size, v => MathF.Sign(v));
+        => ResidentUnary(ResidentUnaryOp.Sign, A, B, size);
 
     public void Gelu(IGpuBuffer A, IGpuBuffer B, int size)
-        => CpuUnary(A, B, size, v => 0.5f * v * (1f + MathF.Tanh(0.7978845608f * (v + 0.044715f * v * v * v))));
+        => ResidentUnary(ResidentUnaryOp.Gelu, A, B, size);
 
     public void Softmax(IGpuBuffer A, IGpuBuffer B, int batchSize, int features)
     {
-        EnsureInitialized();
-        var a = DownloadBuffer(A);
-        var b = new float[batchSize * features];
-        for (int i = 0; i < batchSize; i++)
-        {
-            int off = i * features;
-            float max = float.MinValue;
-            for (int j = 0; j < features; j++)
-                if (a[off + j] > max) max = a[off + j];
-            float sum = 0;
-            for (int j = 0; j < features; j++)
-            {
-                b[off + j] = MathF.Exp(a[off + j] - max);
-                sum += b[off + j];
-            }
-            if (sum > 0)
-                for (int j = 0; j < features; j++)
-                    b[off + j] /= sum;
-        }
-        UploadToBuffer(b, B);
+        if (batchSize <= 0 || features <= 0) return;
+        GlslUnaryOp(VulkanGlslKernels.SoftmaxRows, A, B, batchSize,
+            new uint[] { (uint)batchSize, (uint)features }, 2 * sizeof(uint));
     }
 
     #endregion
@@ -829,59 +822,23 @@ void main() {
 
     public void Squash(IGpuBuffer input, IGpuBuffer output, int numCapsules, int capsuleDim, float epsilon)
     {
-        EnsureInitialized();
-        var inp = DownloadBuffer(input);
-        var outp = new float[numCapsules * capsuleDim];
-        for (int c = 0; c < numCapsules; c++)
-        {
-            int off = c * capsuleDim;
-            float sqNorm = 0;
-            for (int d = 0; d < capsuleDim; d++) sqNorm += inp[off + d] * inp[off + d];
-            float scale = sqNorm / ((1f + sqNorm) * MathF.Sqrt(sqNorm + epsilon));
-            for (int d = 0; d < capsuleDim; d++) outp[off + d] = inp[off + d] * scale;
-        }
-        UploadToBuffer(outp, output);
+        GlslUnaryOp(VulkanGlslKernels.CapsuleSquash, input, output, numCapsules,
+            new uint[] { (uint)numCapsules, (uint)capsuleDim, FloatBits(epsilon) }, 3 * sizeof(uint));
     }
 
     public void SquashBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int numCapsules, int capsuleDim, float epsilon)
     {
-        EnsureInitialized();
-        var grad = DownloadBuffer(gradOutput);
-        var inp = DownloadBuffer(input);
-        var gi = new float[numCapsules * capsuleDim];
-        for (int c = 0; c < numCapsules; c++)
-        {
-            int off = c * capsuleDim;
-            float sqNorm = 0;
-            for (int d = 0; d < capsuleDim; d++) sqNorm += inp[off + d] * inp[off + d];
-            float norm = MathF.Sqrt(sqNorm + epsilon);
-            float denom = (1f + sqNorm) * norm;
-            float factor = 1f / (denom * denom) * (sqNorm + 2f * sqNorm / (1f + sqNorm));
-            for (int d = 0; d < capsuleDim; d++)
-                gi[off + d] = grad[off + d] * factor;
-        }
-        UploadToBuffer(gi, gradInput);
+        GlslBinaryOp(VulkanGlslKernels.CapsuleSquashBackward, gradOutput, input, gradInput, numCapsules,
+            new uint[] { (uint)numCapsules, (uint)capsuleDim, FloatBits(epsilon) }, 3 * sizeof(uint));
     }
 
     public void CapsulePredictions(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer output,
         int batchSize, int inputCapsules, int inputDim, int outputCapsules, int outputDim)
     {
-        EnsureInitialized();
-        var inp = DownloadBuffer(input);
-        var w = DownloadBuffer(weights);
-        var o = new float[batchSize * inputCapsules * outputCapsules * outputDim];
-        for (int b = 0; b < batchSize; b++)
-            for (int ic = 0; ic < inputCapsules; ic++)
-                for (int oc = 0; oc < outputCapsules; oc++)
-                    for (int od = 0; od < outputDim; od++)
-                    {
-                        float sum = 0;
-                        for (int id = 0; id < inputDim; id++)
-                            sum += inp[b * inputCapsules * inputDim + ic * inputDim + id]
-                                * w[(ic * outputCapsules + oc) * outputDim * inputDim + od * inputDim + id];
-                        o[((b * inputCapsules + ic) * outputCapsules + oc) * outputDim + od] = sum;
-                    }
-        UploadToBuffer(o, output);
+        int total = checked(batchSize * inputCapsules * outputCapsules * outputDim);
+        GlslBinaryOp(VulkanGlslKernels.CapsulePredictions, input, weights, output, total,
+            new uint[] { (uint)batchSize, (uint)inputCapsules, (uint)inputDim, (uint)outputCapsules, (uint)outputDim },
+            5 * sizeof(uint));
     }
 
     public void CapsuleTransform(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer output,
@@ -891,122 +848,82 @@ void main() {
     public void CapsuleWeightedSum(IGpuBuffer coupling, IGpuBuffer predictions, IGpuBuffer output,
         int batchSize, int inputCapsules, int outputCapsules, int capsuleDim)
     {
-        EnsureInitialized();
-        var c = DownloadBuffer(coupling);
-        var p = DownloadBuffer(predictions);
-        var o = new float[batchSize * outputCapsules * capsuleDim];
-        for (int b = 0; b < batchSize; b++)
-            for (int oc = 0; oc < outputCapsules; oc++)
-                for (int d = 0; d < capsuleDim; d++)
-                {
-                    float sum = 0;
-                    for (int ic = 0; ic < inputCapsules; ic++)
-                        sum += c[b * inputCapsules * outputCapsules + ic * outputCapsules + oc]
-                            * p[((b * inputCapsules + ic) * outputCapsules + oc) * capsuleDim + d];
-                    o[(b * outputCapsules + oc) * capsuleDim + d] = sum;
-                }
-        UploadToBuffer(o, output);
+        int total = checked(batchSize * outputCapsules * capsuleDim);
+        GlslBinaryOp(VulkanGlslKernels.CapsuleWeightedSum, coupling, predictions, output, total,
+            new uint[] { (uint)batchSize, (uint)inputCapsules, (uint)outputCapsules, (uint)capsuleDim },
+            4 * sizeof(uint));
     }
 
     public void CapsuleAgreement(IGpuBuffer predictions, IGpuBuffer output, IGpuBuffer agreement,
         int batchSize, int inputCapsules, int outputCapsules, int capsuleDim)
     {
-        EnsureInitialized();
-        var p = DownloadBuffer(predictions);
-        var o = DownloadBuffer(output);
-        var ag = new float[batchSize * inputCapsules * outputCapsules];
-        for (int b = 0; b < batchSize; b++)
-            for (int ic = 0; ic < inputCapsules; ic++)
-                for (int oc = 0; oc < outputCapsules; oc++)
-                {
-                    float dot = 0;
-                    for (int d = 0; d < capsuleDim; d++)
-                        dot += p[((b * inputCapsules + ic) * outputCapsules + oc) * capsuleDim + d]
-                            * o[(b * outputCapsules + oc) * capsuleDim + d];
-                    ag[b * inputCapsules * outputCapsules + ic * outputCapsules + oc] = dot;
-                }
-        UploadToBuffer(ag, agreement);
+        int total = checked(batchSize * inputCapsules * outputCapsules);
+        GlslBinaryOp(VulkanGlslKernels.CapsuleAgreement, predictions, output, agreement, total,
+            new uint[] { (uint)batchSize, (uint)inputCapsules, (uint)outputCapsules, (uint)capsuleDim },
+            4 * sizeof(uint));
     }
 
     public void TileBatch(IGpuBuffer input, IGpuBuffer output, int repeats, int innerSize)
     {
-        EnsureInitialized();
-        var inp = DownloadBuffer(input);
-        var o = new float[repeats * innerSize];
-        for (int r = 0; r < repeats; r++)
-            Array.Copy(inp, 0, o, r * innerSize, innerSize);
-        UploadToBuffer(o, output);
+        GlslUnaryOp(VulkanGlslKernels.TileBatch, input, output, repeats * innerSize,
+            new uint[] { (uint)repeats, (uint)innerSize }, 2 * sizeof(uint));
     }
 
     public void TileAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int axisSize, int innerSize, int repeats)
     {
-        EnsureInitialized();
-        var inp = DownloadBuffer(input);
-        var o = new float[outerSize * axisSize * repeats * innerSize];
-        for (int outer = 0; outer < outerSize; outer++)
-            for (int ax = 0; ax < axisSize; ax++)
-                for (int r = 0; r < repeats; r++)
-                    Array.Copy(inp, (outer * axisSize + ax) * innerSize, o,
-                        ((outer * axisSize + ax) * repeats + r) * innerSize, innerSize);
-        UploadToBuffer(o, output);
+        int total = checked(outerSize * axisSize * repeats * innerSize);
+        GlslUnaryOp(VulkanGlslKernels.TileAxisGlsl, input, output, total,
+            new uint[] { (uint)outerSize, (uint)axisSize, (uint)innerSize, (uint)repeats },
+            4 * sizeof(uint));
     }
 
     #endregion
 
     #region Trigonometric Operations
 
-    public void Sin(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Sin);
-    public void Cos(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Cos);
-    public void Tan(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Tan);
-    public void Asin(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Asin);
-    public void Acos(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Acos);
-    public void Atan(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Atan);
+    public void Sin(IGpuBuffer A, IGpuBuffer B, int size) => ResidentUnary(ResidentUnaryOp.Sin, A, B, size);
+    public void Cos(IGpuBuffer A, IGpuBuffer B, int size) => ResidentUnary(ResidentUnaryOp.Cos, A, B, size);
+    public void Tan(IGpuBuffer A, IGpuBuffer B, int size) => ResidentUnary(ResidentUnaryOp.Tan, A, B, size);
+    public void Asin(IGpuBuffer A, IGpuBuffer B, int size) => ResidentUnary(ResidentUnaryOp.Asin, A, B, size);
+    public void Acos(IGpuBuffer A, IGpuBuffer B, int size) => ResidentUnary(ResidentUnaryOp.Acos, A, B, size);
+    public void Atan(IGpuBuffer A, IGpuBuffer B, int size) => ResidentUnary(ResidentUnaryOp.Atan, A, B, size);
 
     #endregion
 
     #region Hyperbolic Operations
 
-    public void Sinh(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Sinh);
-    public void Cosh(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Cosh);
-    public void Asinh(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, AsinhCompat);
-    public void Acosh(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, AcoshCompat);
-    public void Atanh(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, AtanhCompat);
+    public void Sinh(IGpuBuffer A, IGpuBuffer B, int size) => ResidentUnary(ResidentUnaryOp.Sinh, A, B, size);
+    public void Cosh(IGpuBuffer A, IGpuBuffer B, int size) => ResidentUnary(ResidentUnaryOp.Cosh, A, B, size);
+    public void Asinh(IGpuBuffer A, IGpuBuffer B, int size) => ResidentUnary(ResidentUnaryOp.Asinh, A, B, size);
+    public void Acosh(IGpuBuffer A, IGpuBuffer B, int size) => ResidentUnary(ResidentUnaryOp.Acosh, A, B, size);
+    public void Atanh(IGpuBuffer A, IGpuBuffer B, int size) => ResidentUnary(ResidentUnaryOp.Atanh, A, B, size);
 
     #endregion
 
     #region Additional Unary Operations
 
-    public void Reciprocal(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, v => 1f / v);
-    public void Cbrt(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, CbrtCompat);
-    public void Log10(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Log10);
-    public void Negate(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, v => -v);
-    public void Floor(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Floor);
-    public void Ceiling(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Ceiling);
-    public void Round(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Round);
-    public void Truncate(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Truncate);
+    public void Reciprocal(IGpuBuffer A, IGpuBuffer B, int size) => ResidentUnary(ResidentUnaryOp.Reciprocal, A, B, size);
+    public void Cbrt(IGpuBuffer A, IGpuBuffer B, int size) => ResidentUnary(ResidentUnaryOp.Cbrt, A, B, size);
+    public void Log10(IGpuBuffer A, IGpuBuffer B, int size) => ResidentUnary(ResidentUnaryOp.Log10, A, B, size);
+    public void Negate(IGpuBuffer A, IGpuBuffer B, int size) => ResidentUnary(ResidentUnaryOp.Negate, A, B, size);
+    public void Floor(IGpuBuffer A, IGpuBuffer B, int size) => ResidentUnary(ResidentUnaryOp.Floor, A, B, size);
+    public void Ceiling(IGpuBuffer A, IGpuBuffer B, int size) => ResidentUnary(ResidentUnaryOp.Ceiling, A, B, size);
+    public void Round(IGpuBuffer A, IGpuBuffer B, int size) => ResidentUnary(ResidentUnaryOp.Round, A, B, size);
+    public void Truncate(IGpuBuffer A, IGpuBuffer B, int size) => ResidentUnary(ResidentUnaryOp.Truncate, A, B, size);
 
     #endregion
 
     #region Reduction Operations
 
-    public float Sum(IGpuBuffer A, int size) => CpuReduce(A, size, 0f, (acc, v) => acc + v);
+    public float Sum(IGpuBuffer A, int size) => ResidentScalarReduce(A, size, 0);
 
-    public float Max(IGpuBuffer A, int size) => CpuReduce(A, size, float.MinValue, MathF.Max);
-    public float Min(IGpuBuffer A, int size) => CpuReduce(A, size, float.MaxValue, MathF.Min);
+    public float Max(IGpuBuffer A, int size) => ResidentScalarReduce(A, size, 1);
+    public float Min(IGpuBuffer A, int size) => ResidentScalarReduce(A, size, 2);
 
     public void SumAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
     {
-        EnsureInitialized();
-        var a = DownloadBuffer(A);
-        var b = new float[outerSize];
-        for (int i = 0; i < outerSize; i++)
-        {
-            float sum = 0;
-            for (int j = 0; j < reduceSize; j++)
-                sum += a[i * reduceSize + j];
-            b[i] = sum;
-        }
-        UploadToBuffer(b, B);
+        GlslUnaryOp(VulkanGlslKernels.SumAxis, A, B, outerSize,
+            new uint[] { (uint)outerSize, (uint)reduceSize }, 2 * sizeof(uint));
     }
 
     #endregion
@@ -1014,33 +931,14 @@ void main() {
     #region Fused Operations
 
     public void Lerp(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, float t, int size)
-        => CpuBinary(a, b, output, size, (va, vb) => va + t * (vb - va));
+        => ResidentBinary(ResidentBinaryOp.Lerp, a, b, output, size, t);
 
     public void AddScaled(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, float scaleA, float scaleB, int size)
-        => CpuBinary(a, b, output, size, (va, vb) => scaleA * va + scaleB * vb);
+        => ResidentBinary(ResidentBinaryOp.AddScaled, a, b, output, size, scaleA, scaleB);
 
     public float StdDev(IGpuBuffer input, int size)
     {
-        EnsureInitialized();
-        if (size <= 0)
-            throw new ArgumentOutOfRangeException(nameof(size), "Size must be positive.");
-        if (size > input.Size)
-            throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds input buffer length ({input.Size}).");
-        var data = DownloadBuffer(input);
-        // Welford's algorithm for numerically stable variance computation
-        double mean = 0;
-        double m2 = 0;
-        for (int i = 0; i < size; i++)
-        {
-            double delta = data[i] - mean;
-            mean += delta / (i + 1);
-            double delta2 = data[i] - mean;
-            m2 += delta * delta2;
-        }
-        double variance = m2 / size;
-        // Clamp variance to zero before sqrt to handle floating-point roundoff
-        if (variance < 0) variance = 0;
-        return (float)Math.Sqrt(variance);
+        return ResidentScalarReduce(input, size, 3);
     }
 
     #endregion
@@ -1059,29 +957,14 @@ void main() {
 
     public void Transpose(IGpuBuffer A, IGpuBuffer B, int rows, int cols)
     {
-        EnsureInitialized();
-        var a = DownloadBuffer(A);
-        var b = new float[rows * cols];
-        for (int i = 0; i < rows; i++)
-            for (int j = 0; j < cols; j++)
-                b[j * rows + i] = a[i * cols + j];
-        UploadToBuffer(b, B);
+        GlslUnaryOp(VulkanGlslKernels.Transpose, A, B, rows * cols,
+            new uint[] { 1, (uint)rows, (uint)cols }, 3 * sizeof(uint));
     }
 
     public void BatchedTranspose(IGpuBuffer A, IGpuBuffer B, int batch, int rows, int cols)
     {
-        EnsureInitialized();
-        var a = DownloadBuffer(A);
-        var b = new float[batch * rows * cols];
-        int stride = rows * cols;
-        for (int bi = 0; bi < batch; bi++)
-        {
-            int off = bi * stride;
-            for (int i = 0; i < rows; i++)
-                for (int j = 0; j < cols; j++)
-                    b[off + j * rows + i] = a[off + i * cols + j];
-        }
-        UploadToBuffer(b, B);
+        GlslUnaryOp(VulkanGlslKernels.Transpose, A, B, batch * rows * cols,
+            new uint[] { (uint)batch, (uint)rows, (uint)cols }, 3 * sizeof(uint));
     }
 
     public void Permute(IGpuBuffer input, IGpuBuffer output, int[] shape, int[] permutation)
@@ -1107,10 +990,8 @@ void main() {
             seen[permutation[i]] = true;
         }
 
-        var inp = DownloadBuffer(input);
         int totalSize = 1;
         for (int i = 0; i < ndim; i++) totalSize *= shape[i];
-        var outp = new float[totalSize];
 
         var outShape = new int[ndim];
         for (int i = 0; i < ndim; i++) outShape[i] = shape[permutation[i]];
@@ -1125,49 +1006,34 @@ void main() {
             inStrides[i] = inStrides[i + 1] * shape[i + 1];
         }
 
-        // Pre-allocate coords array outside the loop to avoid per-element allocation
-        var coords = new int[ndim];
-        for (int idx = 0; idx < totalSize; idx++)
-        {
-            int remaining = idx;
-            for (int d = 0; d < ndim; d++)
-            {
-                coords[d] = remaining / outStrides[d];
-                remaining %= outStrides[d];
-            }
-
-            int srcIdx = 0;
-            for (int d = 0; d < ndim; d++)
-                srcIdx += coords[d] * inStrides[permutation[d]];
-            outp[idx] = inp[srcIdx];
-        }
-        UploadToBuffer(outp, output);
+        var sourceStrides = new int[ndim];
+        for (int d = 0; d < ndim; d++) sourceStrides[d] = inStrides[permutation[d]];
+        string outStrideValues = string.Join(", ", Array.ConvertAll(outStrides, value => value + "u"));
+        string sourceStrideValues = string.Join(", ", Array.ConvertAll(sourceStrides, value => value + "u"));
+        string shader = $@"#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer Input {{ float inputData[]; }};
+layout(set = 0, binding = 1) writeonly buffer Output {{ float outputData[]; }};
+layout(push_constant) uniform Params {{ uint totalSize; }};
+const uint outStrides[{ndim}] = uint[{ndim}]({outStrideValues});
+const uint sourceStrides[{ndim}] = uint[{ndim}]({sourceStrideValues});
+void main() {{
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= totalSize) return;
+    uint remaining = idx, sourceIndex = 0u;
+    for (uint d = 0u; d < {ndim}u; ++d) {{
+        uint coordinate = remaining / outStrides[d];
+        remaining %= outStrides[d];
+        sourceIndex += coordinate * sourceStrides[d];
+    }}
+    outputData[idx] = inputData[sourceIndex];
+}}";
+        GlslUnaryOp(shader, input, output, totalSize);
     }
 
     public void Copy(IGpuBuffer source, IGpuBuffer destination, int size)
     {
-        EnsureInitialized();
-        if (size < 0)
-            throw new ArgumentOutOfRangeException(nameof(size), "Size must be non-negative.");
-        if (size == 0) return;
-        if (size > source.Size)
-            throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds source buffer capacity ({source.Size}).");
-        if (size > destination.Size)
-            throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds destination buffer capacity ({destination.Size}).");
-
-        var s = DownloadBuffer(source);
-        // Use destination.Size for the array to preserve trailing elements when size < destination.Size
-        float[] d;
-        if (size >= destination.Size)
-        {
-            d = new float[destination.Size];
-        }
-        else
-        {
-            d = DownloadBuffer(destination);
-        }
-        Array.Copy(s, 0, d, 0, size);
-        UploadToBuffer(d, destination);
+        Copy(source, 0, destination, 0, size);
     }
 
     public void Copy2DStrided(IGpuBuffer source, IGpuBuffer destination, int numRows,
@@ -1185,130 +1051,69 @@ void main() {
         if (srcCols <= 0)
             throw new ArgumentOutOfRangeException(nameof(srcCols), srcCols, "srcCols must be positive.");
 
-        var s = DownloadBuffer(source);
-        // Only download destination if the strided copy does not cover all columns,
-        // since we need to preserve existing data in non-written columns.
-        // Use strict equality to avoid out-of-bounds writes when srcCols > destTotalCols.
-        float[] d;
-        if (destColOffset == 0 && srcCols == destTotalCols)
-        {
-            d = new float[destination.Size];
-        }
-        else
-        {
-            d = DownloadBuffer(destination);
-        }
         int colsToCopy = Math.Min(srcCols, destTotalCols - destColOffset);
-        for (int r = 0; r < numRows; r++)
-            Array.Copy(s, r * srcCols, d, r * destTotalCols + destColOffset, colsToCopy);
-        UploadToBuffer(d, destination);
+        if (numRows == 0 || colsToCopy == 0) return;
+        GlslUnaryOp(VulkanGlslKernels.Copy2DStrided, source, destination, numRows * colsToCopy,
+            new uint[] { (uint)numRows, (uint)srcCols, (uint)destTotalCols, (uint)destColOffset, (uint)colsToCopy },
+            5 * sizeof(uint));
     }
 
     public void NearestNeighborUpsample(IGpuBuffer input, IGpuBuffer output, int batchChannels, int height, int width, int scaleFactor)
     {
-        EnsureInitialized();
-        var inp = DownloadBuffer(input);
         int outH = height * scaleFactor, outW = width * scaleFactor;
-        var outp = new float[batchChannels * outH * outW];
-        for (int bc = 0; bc < batchChannels; bc++)
-        {
-            int inOff = bc * height * width;
-            int outOff = bc * outH * outW;
-            for (int oh = 0; oh < outH; oh++)
-            {
-                int ih = oh / scaleFactor;
-                for (int ow = 0; ow < outW; ow++)
-                    outp[outOff + oh * outW + ow] = inp[inOff + ih * width + ow / scaleFactor];
-            }
-        }
-        UploadToBuffer(outp, output);
+        GlslUnaryOp(VulkanGlslKernels.NearestNeighborUpsample, input, output, batchChannels * outH * outW,
+            new uint[] { (uint)batchChannels, (uint)height, (uint)width, (uint)scaleFactor }, 4 * sizeof(uint));
     }
 
     public void NearestNeighborUpsampleBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batchChannels, int height, int width, int scaleFactor)
     {
-        EnsureInitialized();
-        var go = DownloadBuffer(gradOutput);
-        int outH = height * scaleFactor, outW = width * scaleFactor;
-        var gi = new float[batchChannels * height * width];
-        for (int bc = 0; bc < batchChannels; bc++)
-        {
-            int giOff = bc * height * width;
-            int goOff = bc * outH * outW;
-            for (int oh = 0; oh < outH; oh++)
-            {
-                int ih = oh / scaleFactor;
-                for (int ow = 0; ow < outW; ow++)
-                    gi[giOff + ih * width + ow / scaleFactor] += go[goOff + oh * outW + ow];
-            }
-        }
-        UploadToBuffer(gi, gradInput);
+        GlslUnaryOp(VulkanGlslKernels.NearestNeighborUpsampleBackward, gradOutput, gradInput,
+            batchChannels * height * width,
+            new uint[] { (uint)batchChannels, (uint)height, (uint)width, (uint)scaleFactor }, 4 * sizeof(uint));
     }
 
     public void Fill(IGpuBuffer buffer, float value, int size)
     {
-        EnsureInitialized();
-        var data = new float[size];
-        ArrayFillCompat(data, value);
-        UploadToBuffer(data, buffer);
+        GlslGenerateOp(VulkanGlslKernels.FillGlsl, buffer, size,
+            new uint[] { FloatBits(value), (uint)size }, 2 * sizeof(uint));
     }
 
     #endregion
 
     #region Random Number Generation
 
-    /// <summary>
-    /// Creates a deterministic Random from a 64-bit seed by combining both halves
-    /// into a single 32-bit seed via XOR, preserving entropy from the full 64-bit value.
-    /// </summary>
-    private static Random CreateSeededRandom(ulong seed)
-    {
-        // Split the 64-bit seed into two 32-bit halves and XOR them together
-        // to preserve entropy from both halves instead of truncating to 31 bits.
-        int combinedSeed = (int)(seed & 0xFFFFFFFF) ^ (int)(seed >> 32);
-        return new Random(combinedSeed);
-    }
-
     public void GenerateRandomUniform(IGpuBuffer output, int size, float min, float max, ulong seed)
     {
         EnsureInitialized();
-        var rng = CreateSeededRandom(seed);
-        var data = new float[size];
-        float range = max - min;
-        for (int i = 0; i < size; i++)
-            data[i] = (float)(rng.NextDouble() * range + min);
-        UploadToBuffer(data, output);
+        if (size <= 0) return;
+        GlslGenerateOp(VulkanResidentKernels.RandomGenerate, output, size,
+            new uint[] { (uint)size, (uint)seed, (uint)(seed >> 32), 0u, FloatBits(min), FloatBits(max), 0u, 0u },
+            8 * sizeof(uint));
+    }
+
+    public void GenerateStatelessDropoutMask(
+        IGpuBuffer output, int size, uint threshold, float scale, uint seed)
+    {
+        EnsureInitialized();
+        if (size <= 0) return;
+        GlslGenerateOp(VulkanResidentKernels.StatelessDropoutMask, output, size,
+            new uint[] { (uint)size, threshold, FloatBits(scale), seed }, 4 * sizeof(uint));
     }
 
     public void GenerateRandomNormal(IGpuBuffer output, int size, float mean, float stdDev, ulong seed)
     {
         EnsureInitialized();
-        var rng = CreateSeededRandom(seed);
-        var data = new float[size];
-        for (int i = 0; i < size; i += 2)
-        {
-            double u1 = 1.0 - rng.NextDouble();
-            double u2 = rng.NextDouble();
-            double mag = Math.Sqrt(-2.0 * Math.Log(u1));
-            data[i] = (float)(mag * Math.Cos(2.0 * Math.PI * u2) * stdDev + mean);
-            if (i + 1 < size)
-                data[i + 1] = (float)(mag * Math.Sin(2.0 * Math.PI * u2) * stdDev + mean);
-        }
-        UploadToBuffer(data, output);
+        if (size <= 0) return;
+        GlslGenerateOp(VulkanResidentKernels.RandomGenerate, output, size,
+            new uint[] { (uint)size, (uint)seed, (uint)(seed >> 32), 1u, 0u, 0u, FloatBits(mean), FloatBits(stdDev) },
+            8 * sizeof(uint));
     }
 
     public void GenerateSecureRandomUniform(IGpuBuffer output, int size, float min, float max)
     {
         EnsureInitialized();
         if (size <= 0) return;
-        var data = new float[size];
-        try
-        {
-            Helpers.SimdRandom.SecureFillFloats(data.AsSpan());
-            float range = max - min;
-            for (int i = 0; i < size; i++) data[i] = data[i] * range + min;
-            UploadToBuffer(data, output);
-        }
-        finally { Array.Clear(data, 0, size); }
+        GenerateRandomUniform(output, size, min, max, GpuRandomSeed.Create());
     }
 
     #endregion

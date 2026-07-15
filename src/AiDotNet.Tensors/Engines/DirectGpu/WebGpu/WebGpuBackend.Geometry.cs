@@ -1,16 +1,36 @@
 // Copyright (c) AiDotNet. All rights reserved.
 // WebGPU launcher shims for the geometry / sampling kernels (Issue #217).
-// WebGPU's compute API is async — these methods are exposed as *Async and
-// NOT wired through DirectGpuTensorEngine's sync IGeometryBackend dispatch
-// (same constraint as Parity-210 / Detection). Direct callers holding a
-// WebGpuBackend can invoke them.
+// WebGPU's compute API is async (*Async methods below); the sync IGeometryBackend
+// members block on them via GetAwaiter().GetResult() — the same sync-over-async
+// pattern the extended-conv / scatter families use — so the engine's synchronous
+// IGeometryBackend dispatch runs these on WebGPU instead of CPU-falling-back (#775).
 
 #if NET7_0_OR_GREATER
 namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
-public sealed partial class WebGpuBackend
+public sealed partial class WebGpuBackend : IGeometryBackend
 {
     private const string GeometryModuleKey = "Geometry";
+
+    void IGeometryBackend.Interpolate2D(IGpuBuffer input, IGpuBuffer output,
+        int N, int C, int Hin, int Win, int Hout, int Wout, int mode, bool alignCorners)
+        => Interpolate2DAsync(input, output, N, C, Hin, Win, Hout, Wout, mode, alignCorners)
+            .GetAwaiter().GetResult();
+
+    void IGeometryBackend.Pad4D(IGpuBuffer input, IGpuBuffer output,
+        int N, int C, int Hin, int Win, int padN0, int padN1, int padC0, int padC1,
+        int padH0, int padH1, int padW0, int padW1, int mode, float padValue)
+        => Pad4DAsync(input, output, N, C, Hin, Win, padN0, padN1, padC0, padC1,
+            padH0, padH1, padW0, padW1, mode, padValue).GetAwaiter().GetResult();
+
+    void IGeometryBackend.GridSample2D(IGpuBuffer input, IGpuBuffer grid, IGpuBuffer output,
+        int N, int H, int W, int C, int outH, int outW, int mode, int padding, bool alignCorners)
+        => GridSample2DAsync(input, grid, output, N, H, W, C, outH, outW, mode, padding, alignCorners)
+            .GetAwaiter().GetResult();
+
+    void IGeometryBackend.AffineGrid3D(IGpuBuffer theta, IGpuBuffer grid,
+        int N, int D, int H, int W, bool alignCorners)
+        => AffineGrid3DAsync(theta, grid, N, D, H, W, alignCorners).GetAwaiter().GetResult();
 
     public async Task Interpolate2DAsync(IGpuBuffer input, IGpuBuffer output,
         int N, int C, int Hin, int Win, int Hout, int Wout,

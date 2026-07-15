@@ -8,12 +8,21 @@ public static class LossForwardKernels
     public static string GetSource()
     {
         return @"
+// #775: TensorCrossEntropyLoss takes LOGITS (not probabilities). The old kernel did -sum(t*log(pred)),
+// treating pred as probabilities, which diverged from CpuEngine's softmax cross-entropy. Compute the
+// numerically-stable softmax CE from logits: logSumExp then -sum_c t[c]*(logit[c] - logSumExp), matching
+// CpuEngine.ComputeCrossEntropyBatch (dense targets) bit-for-bit modulo float vs double intermediates.
 __kernel void cross_entropy_loss(__global const float* predictions, __global const float* targets, __global float* loss, int batchSize, int numClasses) {
     int b = get_global_id(0); if (b >= batchSize) return;
+    float maxVal = -INFINITY;
+    for (int c = 0; c < numClasses; c++) { float v = predictions[b * numClasses + c]; if (v > maxVal) maxVal = v; }
+    float sumExp = 0.0f;
+    for (int c = 0; c < numClasses; c++) sumExp += exp(predictions[b * numClasses + c] - maxVal);
+    float logSumExp = maxVal + log(sumExp);
     float sample_loss = 0.0f;
     for (int c = 0; c < numClasses; c++) {
-        float target = targets[b * numClasses + c];
-        if (target > 0.0f) sample_loss -= target * log(fmax(predictions[b * numClasses + c], 1e-7f));
+        float t = targets[b * numClasses + c];
+        if (t > 0.0f) sample_loss -= t * (predictions[b * numClasses + c] - logSumExp);
     }
     loss[b] = sample_loss;
 }
@@ -38,6 +47,13 @@ __kernel void dropout_mask(__global float* mask, int size, float keepProb, ulong
     float u = (float)(counter >> 8) * (1.0f / 16777216.0f);
     float safe_keep = fmax(keepProb, 1e-7f);
     mask[idx] = (u < keepProb) ? (1.0f / safe_keep) : 0.0f;
+}
+__kernel void stateless_dropout_mask(__global float* mask, int size, uint threshold, float scale, uint seed) {
+    int idx = get_global_id(0); if (idx >= size) return;
+    uint state = (uint)idx * 747796405u + seed + 2891336453u;
+    uint word = ((state >> ((state >> 28) + 4u)) ^ state) * 277803737u;
+    uint sample = (word >> 22) ^ word;
+    mask[idx] = sample < threshold ? 0.0f : scale;
 }
 __kernel void gaussian_noise(__global float* output, int size, float mean, float stdDev, ulong seed) {
     int idx = get_global_id(0); if (idx >= size) return;
@@ -73,9 +89,13 @@ __kernel void bce_with_logits_loss(__global const float* logits, __global const 
     float x = logits[idx]; float t = targets[idx]; float ax = fabs(x);
     loss[idx] = fmax(x, 0.0f) - x * t + log1p(exp(-ax));
 }
-__kernel void nll_loss(__global const float* logProbs, __global const int* targets, __global float* loss, int batchSize, int numClasses) {
+__kernel void nll_loss(__global const float* logProbs, __global const float* targets, __global float* loss, int batchSize, int numClasses) {
     int b = get_global_id(0); if (b >= batchSize) return;
-    int tc = targets[b];
+    // targets holds class indices as float VALUES (e.g. 3.0f == class 3), matching
+    // CpuEngine.TensorNLLLoss which does (int)targetValue. Reading the buffer as int*
+    // reinterpreted the float bit pattern (1.0f -> 1065353216), always out of range, so
+    // the GPU returned 0 (op-parity #775 quarantine: GPU TensorNLLLoss returns 0).
+    int tc = (int)targets[b];
     loss[b] = (tc >= 0 && tc < numClasses) ? -logProbs[b * numClasses + tc] : 0.0f;
 }
 __kernel void kl_div_loss(__global const float* input, __global const float* target, __global float* loss, int size) {
@@ -109,7 +129,7 @@ __kernel void bce_with_logits_backward(__global const float* gradOutput, __globa
 
     public static string[] GetKernelNames()
     {
-        return new[] { "cross_entropy_loss", "mse_loss", "bce_loss", "dropout_mask", "gaussian_noise",
+        return new[] { "cross_entropy_loss", "mse_loss", "bce_loss", "dropout_mask", "stateless_dropout_mask", "gaussian_noise",
             "l1_loss", "huber_loss", "bce_with_logits_loss", "nll_loss", "kl_div_loss",
             "mse_loss_backward", "l1_loss_backward", "huber_loss_backward", "bce_with_logits_backward" };
     }

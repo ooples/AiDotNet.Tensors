@@ -612,8 +612,8 @@ public static class SimdComplexKernels
     }
 
     /// <summary>
-    /// SIMD complex phase: out = atan2(im, re) using SVML-style polynomial approximation.
-    /// ~6 ulp max error, ~4x faster than scalar Math.Atan2.
+    /// SIMD complex phase: out = atan2(im, re) using an SVML-style polynomial approximation.
+    /// ~1e-7 max abs error (near float epsilon), ~4x faster than scalar Math.Atan2.
     /// </summary>
     [MethodImpl(HotInline)]
     public static void ComplexPhase(ReadOnlySpan<float> inR, ReadOnlySpan<float> inI, Span<float> output)
@@ -624,12 +624,17 @@ public static class SimdComplexKernels
 #if NET5_0_OR_GREATER
         if (Avx.IsSupported && n >= 8)
         {
-            // Minimax polynomial atan(x) ≈ x * (c0 + x² * (c1 + x² * (c2 + x² * c3)))
-            // Valid for |x| <= 1. For |x| > 1, use atan(x) = pi/2 - atan(1/x).
-            var c0 = Vector256.Create(0.9998660f);
-            var c1 = Vector256.Create(-0.3302995f);
-            var c2 = Vector256.Create(0.1801410f);
-            var c3 = Vector256.Create(-0.0851330f);
+            // Degree-15 odd minimax for atan(x) on |x| <= 1 (8 coefficients), accurate to ~1e-7 —
+            // the previous 4-term poly was ~0.02 off at x=1 (atan(1)=pi/4), which showed up as a
+            // ~1.8% CPU-vs-GPU phase divergence. For |x| > 1 the swap below maps into [0,1].
+            var c0 = Vector256.Create(0.9999993329f);
+            var c1 = Vector256.Create(-0.3332985605f);
+            var c2 = Vector256.Create(0.1994653599f);
+            var c3 = Vector256.Create(-0.1390853351f);
+            var c4 = Vector256.Create(0.0964200441f);
+            var c5 = Vector256.Create(-0.0559098861f);
+            var c6 = Vector256.Create(0.0218612288f);
+            var c7 = Vector256.Create(-0.0040540580f);
             var halfPi = Vector256.Create(MathF.PI / 2f);
             var pi = Vector256.Create(MathF.PI);
             var zero = Vector256<float>.Zero;
@@ -656,16 +661,16 @@ public static class SimdComplexKernels
                 var t = Avx.Divide(num, den); // t = min/max, so |t| <= 1
                 var t2 = Avx.Multiply(t, t);
 
-                // Horner: atan(t) = t * (c0 + t2*(c1 + t2*(c2 + t2*c3)))
+                // Horner: atan(t) = t * (c0 + t2*(c1 + ... + t2*c7))
                 var poly = Fma.IsSupported
-                    ? Fma.MultiplyAdd(t2, c3, c2)
-                    : Avx.Add(Avx.Multiply(t2, c3), c2);
-                poly = Fma.IsSupported
-                    ? Fma.MultiplyAdd(t2, poly, c1)
-                    : Avx.Add(Avx.Multiply(t2, poly), c1);
-                poly = Fma.IsSupported
-                    ? Fma.MultiplyAdd(t2, poly, c0)
-                    : Avx.Add(Avx.Multiply(t2, poly), c0);
+                    ? Fma.MultiplyAdd(t2, c7, c6)
+                    : Avx.Add(Avx.Multiply(t2, c7), c6);
+                poly = Fma.IsSupported ? Fma.MultiplyAdd(t2, poly, c5) : Avx.Add(Avx.Multiply(t2, poly), c5);
+                poly = Fma.IsSupported ? Fma.MultiplyAdd(t2, poly, c4) : Avx.Add(Avx.Multiply(t2, poly), c4);
+                poly = Fma.IsSupported ? Fma.MultiplyAdd(t2, poly, c3) : Avx.Add(Avx.Multiply(t2, poly), c3);
+                poly = Fma.IsSupported ? Fma.MultiplyAdd(t2, poly, c2) : Avx.Add(Avx.Multiply(t2, poly), c2);
+                poly = Fma.IsSupported ? Fma.MultiplyAdd(t2, poly, c1) : Avx.Add(Avx.Multiply(t2, poly), c1);
+                poly = Fma.IsSupported ? Fma.MultiplyAdd(t2, poly, c0) : Avx.Add(Avx.Multiply(t2, poly), c0);
                 var atanVal = Avx.Multiply(t, poly);
 
                 // If swapped: atan = pi/2 - atan
@@ -697,73 +702,14 @@ public static class SimdComplexKernels
     public static void ComplexFromPolar(ReadOnlySpan<float> mag, ReadOnlySpan<float> phase,
         Span<float> outR, Span<float> outI)
     {
-        int n = mag.Length;
-        int i = 0;
+        if (mag.Length != phase.Length || mag.Length != outR.Length || mag.Length != outI.Length)
+            throw new ArgumentException("All spans must have the same length.");
 
-#if NET5_0_OR_GREATER
-        if (Avx.IsSupported && n >= 8)
-        {
-            // Cody-Waite range reduction + minimax polynomial for sin/cos
-            var twoPi = Vector256.Create(MathF.PI * 2f);
-            var invTwoPi = Vector256.Create(1f / (MathF.PI * 2f));
-            var halfPi = Vector256.Create(MathF.PI / 2f);
-            // Minimax sin(x) for x in [-pi, pi]: x * (1 + x²*(s1 + x²*(s2 + x²*s3)))
-            var s1 = Vector256.Create(-0.16666667f);
-            var s2 = Vector256.Create(0.0083333f);
-            var s3 = Vector256.Create(-0.00019841f);
-            var one = Vector256.Create(1.0f);
-
-            int simdLen = n & ~7;
-            for (; i < simdLen; i += 8)
-            {
-                var m = SimdKernels.ReadVector256(mag, i);
-                var p = SimdKernels.ReadVector256(phase, i);
-
-                // Range reduce to [-pi, pi]
-                var k = Avx.RoundToNearestInteger(Avx.Multiply(p, invTwoPi));
-                p = Avx.Subtract(p, Avx.Multiply(k, twoPi));
-
-                // sin(p) via polynomial
-                var p2 = Avx.Multiply(p, p);
-                var sinPoly = Fma.IsSupported
-                    ? Fma.MultiplyAdd(p2, s3, s2)
-                    : Avx.Add(Avx.Multiply(p2, s3), s2);
-                sinPoly = Fma.IsSupported
-                    ? Fma.MultiplyAdd(p2, sinPoly, s1)
-                    : Avx.Add(Avx.Multiply(p2, sinPoly), s1);
-                sinPoly = Fma.IsSupported
-                    ? Fma.MultiplyAdd(p2, sinPoly, one)
-                    : Avx.Add(Avx.Multiply(p2, sinPoly), one);
-                var sinVal = Avx.Multiply(p, sinPoly);
-
-                // cos(p) = sin(p + pi/2) — must range-reduce pCos back to [-pi, pi]
-                var pCos = Avx.Add(p, halfPi);
-                // If pCos > pi, subtract 2pi to bring back into range
-                var piVec = Vector256.Create(MathF.PI);
-                var gtPi = Avx.Compare(pCos, piVec, FloatComparisonMode.OrderedGreaterThanSignaling);
-                pCos = Avx.BlendVariable(pCos, Avx.Subtract(pCos, twoPi), gtPi);
-                var pCos2 = Avx.Multiply(pCos, pCos);
-                var cosPoly = Fma.IsSupported
-                    ? Fma.MultiplyAdd(pCos2, s3, s2)
-                    : Avx.Add(Avx.Multiply(pCos2, s3), s2);
-                cosPoly = Fma.IsSupported
-                    ? Fma.MultiplyAdd(pCos2, cosPoly, s1)
-                    : Avx.Add(Avx.Multiply(pCos2, cosPoly), s1);
-                cosPoly = Fma.IsSupported
-                    ? Fma.MultiplyAdd(pCos2, cosPoly, one)
-                    : Avx.Add(Avx.Multiply(pCos2, cosPoly), one);
-                var cosVal = Avx.Multiply(pCos, cosPoly);
-
-                SimdKernels.WriteVector256(outR, i, Avx.Multiply(m, cosVal));
-                SimdKernels.WriteVector256(outI, i, Avx.Multiply(m, sinVal));
-            }
-        }
-#endif
-
-        for (; i < n; i++)
-        {
-            outR[i] = mag[i] * MathF.Cos(phase[i]);
-            outI[i] = mag[i] * MathF.Sin(phase[i]);
-        }
+        // Reuse the quadrant-reduced SIMD implementation. The previous polynomial
+        // evaluated sin(x + pi/2) directly over [-pi, pi], where its error grows to
+        // several percent near the endpoints.
+        SimdKernels.SinCos(phase, outI, outR);
+        SimdKernels.VectorMultiply(mag, outR, outR);
+        SimdKernels.VectorMultiply(mag, outI, outI);
     }
 }
