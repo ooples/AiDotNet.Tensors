@@ -17,6 +17,7 @@ public sealed class AvgPool3dKernelSourceTests
     private const string HipPool = "AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels.HipPoolingKernels";
     private const string OpenClPool = "AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.PoolingKernels";
     private const string MetalExt = "AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalExtendedConvKernels";
+    private const string VulkanExt = "AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanExtendedConvKernels";
 
     [Theory]
     [InlineData(CudaPool)]
@@ -35,6 +36,7 @@ public sealed class AvgPool3dKernelSourceTests
     [InlineData(HipPool, "GetSource")]
     [InlineData(OpenClPool, "GetSource")]
     [InlineData(MetalExt, "Source")]
+    [InlineData(VulkanExt, "AvgPool3D")]
     public void CountIncludePadDivisor_IsPresentAcrossBackends(string typeName, string memberName)
     {
         string source = GetStaticString(typeName, memberName);

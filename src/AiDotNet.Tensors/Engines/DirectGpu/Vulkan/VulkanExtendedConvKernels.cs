@@ -429,4 +429,187 @@ void main() {
     }
     gradKernel[idx] = sum;
 }";
+
+    private const string Pool3DParams =
+        "layout(push_constant) uniform PC { int batch; int channels; int inDepth; int inHeight; int inWidth; int outDepth; int outHeight; int outWidth; int kernelD; int kernelH; int kernelW; int strideD; int strideH; int strideW; int countIncludePad; };";
+
+    public static readonly string AvgPool3D = @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0,binding=0) readonly buffer Input { float input_[]; };
+layout(set=0,binding=1) writeonly buffer Output { float output_[]; };
+" + Pool3DParams + @"
+void main() {
+    int idx = int(gl_GlobalInvocationID.x);
+    if (idx >= batch * channels * outDepth * outHeight * outWidth) return;
+    int ow = idx % outWidth;
+    int oh = (idx / outWidth) % outHeight;
+    int od = (idx / (outWidth * outHeight)) % outDepth;
+    int c = (idx / (outWidth * outHeight * outDepth)) % channels;
+    int b = idx / (outWidth * outHeight * outDepth * channels);
+    float sum = 0.0;
+    int count = 0;
+    for (int kd = 0; kd < kernelD; kd++) {
+        int id = od * strideD + kd;
+        if (id >= inDepth) continue;
+        for (int kh = 0; kh < kernelH; kh++) {
+            int ih = oh * strideH + kh;
+            if (ih >= inHeight) continue;
+            for (int kw = 0; kw < kernelW; kw++) {
+                int iw = ow * strideW + kw;
+                if (iw >= inWidth) continue;
+                int inputIdx = ((b * channels + c) * inDepth + id) * inHeight * inWidth + ih * inWidth + iw;
+                sum += input_[inputIdx];
+                count++;
+            }
+        }
+    }
+    int divisor = countIncludePad != 0 ? (kernelD * kernelH * kernelW) : count;
+    int outIdx = ((b * channels + c) * outDepth + od) * outHeight * outWidth + oh * outWidth + ow;
+    output_[outIdx] = sum / float(max(divisor, 1));
+}";
+
+    public static readonly string AvgPool3DBackward = @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0,binding=0) readonly buffer GradOutput { float gradOutput[]; };
+layout(set=0,binding=1) writeonly buffer GradInput { float gradInput[]; };
+" + Pool3DParams + @"
+void main() {
+    int idx = int(gl_GlobalInvocationID.x);
+    if (idx >= batch * channels * inDepth * inHeight * inWidth) return;
+    int iw = idx % inWidth;
+    int ih = (idx / inWidth) % inHeight;
+    int id = (idx / (inWidth * inHeight)) % inDepth;
+    int c = (idx / (inWidth * inHeight * inDepth)) % channels;
+    int b = idx / (inWidth * inHeight * inDepth * channels);
+    float sum = 0.0;
+    for (int od = 0; od < outDepth; od++) {
+        int dStart = od * strideD;
+        int dEnd = dStart + kernelD;
+        if (id < dStart || id >= dEnd) continue;
+        for (int oh = 0; oh < outHeight; oh++) {
+            int hStart = oh * strideH;
+            int hEnd = hStart + kernelH;
+            if (ih < hStart || ih >= hEnd) continue;
+            for (int ow = 0; ow < outWidth; ow++) {
+                int wStart = ow * strideW;
+                int wEnd = wStart + kernelW;
+                if (iw < wStart || iw >= wEnd) continue;
+                int poolSize;
+                if (countIncludePad != 0) {
+                    poolSize = kernelD * kernelH * kernelW;
+                } else {
+                    int dEndClamp = min(dEnd, inDepth);
+                    int hEndClamp = min(hEnd, inHeight);
+                    int wEndClamp = min(wEnd, inWidth);
+                    poolSize = (dEndClamp - dStart) * (hEndClamp - hStart) * (wEndClamp - wStart);
+                }
+                int outIdx = ((b * channels + c) * outDepth + od) * outHeight * outWidth + oh * outWidth + ow;
+                sum += gradOutput[outIdx] / float(max(poolSize, 1));
+            }
+        }
+    }
+    int inputIdx = ((b * channels + c) * inDepth + id) * inHeight * inWidth + ih * inWidth + iw;
+    gradInput[inputIdx] = sum;
+}";
+
+    private const string ShBasis = @"
+    float basis[16];
+    basis[0] = 0.282095;
+    if (degree >= 1) { basis[1] = 0.488603 * dy; basis[2] = 0.488603 * dz; basis[3] = 0.488603 * dx; }
+    if (degree >= 2) {
+        basis[4] = 1.092548 * dx * dy; basis[5] = 1.092548 * dy * dz;
+        basis[6] = 0.315392 * (3.0 * dz * dz - 1.0);
+        basis[7] = 1.092548 * dx * dz; basis[8] = 0.546274 * (dx * dx - dy * dy);
+    }
+    if (degree >= 3) {
+        basis[9]  = 0.590044 * dy * (3.0 * dx * dx - dy * dy);
+        basis[10] = 2.890611 * dx * dy * dz;
+        basis[11] = 0.457046 * dy * (5.0 * dz * dz - 1.0);
+        basis[12] = 0.373176 * dz * (5.0 * dz * dz - 3.0);
+        basis[13] = 0.457046 * dx * (5.0 * dz * dz - 1.0);
+        basis[14] = 1.445306 * dz * (dx * dx - dy * dy);
+        basis[15] = 0.590044 * dx * (dx * dx - 3.0 * dy * dy);
+    }";
+
+    public static readonly string GaussianCovariance = @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0,binding=0) readonly buffer Rotations { float rotations[]; };
+layout(set=0,binding=1) readonly buffer Scales { float scales[]; };
+layout(set=0,binding=2) writeonly buffer Covariances { float covariances[]; };
+layout(push_constant) uniform PC { int numGaussians; };
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= numGaussians) return;
+    float qw = rotations[i * 4], qx = rotations[i * 4 + 1], qy = rotations[i * 4 + 2], qz = rotations[i * 4 + 3];
+    float qNorm = sqrt(qw * qw + qx * qx + qy * qy + qz * qz);
+    if (qNorm > 0.0) { float inv = 1.0 / qNorm; qw *= inv; qx *= inv; qy *= inv; qz *= inv; }
+    float r00 = 1.0 - 2.0 * (qy * qy + qz * qz);
+    float r01 = 2.0 * (qx * qy - qw * qz);
+    float r02 = 2.0 * (qx * qz + qw * qy);
+    float r10 = 2.0 * (qx * qy + qw * qz);
+    float r11 = 1.0 - 2.0 * (qx * qx + qz * qz);
+    float r12 = 2.0 * (qy * qz - qw * qx);
+    float r20 = 2.0 * (qx * qz - qw * qy);
+    float r21 = 2.0 * (qy * qz + qw * qx);
+    float r22 = 1.0 - 2.0 * (qx * qx + qy * qy);
+    float sx = max(1e-6, abs(scales[i * 3])); float sx2 = sx * sx;
+    float sy = max(1e-6, abs(scales[i * 3 + 1])); float sy2 = sy * sy;
+    float sz = max(1e-6, abs(scales[i * 3 + 2])); float sz2 = sz * sz;
+    float m00 = r00 * sx2, m01 = r01 * sy2, m02 = r02 * sz2;
+    float m10 = r10 * sx2, m11 = r11 * sy2, m12 = r12 * sz2;
+    float m20 = r20 * sx2, m21 = r21 * sy2, m22 = r22 * sz2;
+    int o = i * 6;
+    covariances[o]     = m00 * r00 + m01 * r01 + m02 * r02;
+    covariances[o + 1] = m00 * r10 + m01 * r11 + m02 * r12;
+    covariances[o + 2] = m00 * r20 + m01 * r21 + m02 * r22;
+    covariances[o + 3] = m10 * r10 + m11 * r11 + m12 * r12;
+    covariances[o + 4] = m10 * r20 + m11 * r21 + m12 * r22;
+    covariances[o + 5] = m20 * r20 + m21 * r21 + m22 * r22;
+}";
+
+    public static readonly string SphericalHarmonics = @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0,binding=0) readonly buffer ShCoefficients { float shCoefficients[]; };
+layout(set=0,binding=1) readonly buffer ViewDirections { float viewDirections[]; };
+layout(set=0,binding=2) writeonly buffer Output { float output_[]; };
+layout(push_constant) uniform PC { int numPoints; int basisCount; int numChannels; int degree; int broadcastDir; };
+void main() {
+    int idx = int(gl_GlobalInvocationID.x);
+    if (idx >= numPoints * numChannels) return;
+    int ch = idx % numChannels;
+    int i = idx / numChannels;
+    int dirIdx = broadcastDir != 0 ? 0 : i;
+    float dx = viewDirections[dirIdx * 3], dy = viewDirections[dirIdx * 3 + 1], dz = viewDirections[dirIdx * 3 + 2];
+    float norm = sqrt(dx * dx + dy * dy + dz * dz);
+    if (norm > 0.0) { float inv = 1.0 / norm; dx *= inv; dy *= inv; dz *= inv; }" + ShBasis + @"
+    float color = 0.0;
+    for (int b = 0; b < basisCount; b++)
+        color += shCoefficients[i * basisCount * numChannels + b * numChannels + ch] * basis[b];
+    output_[i * numChannels + ch] = min(max(color, 0.0), 1.0);
+}";
+
+    public static readonly string SphericalHarmonicsBackward = @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0,binding=0) readonly buffer ShCoefficients { float shCoefficients[]; };
+layout(set=0,binding=1) readonly buffer ViewDirections { float viewDirections[]; };
+layout(set=0,binding=2) readonly buffer OutputGradient { float outputGradient[]; };
+layout(set=0,binding=3) writeonly buffer ShGrad { float shGrad[]; };
+layout(push_constant) uniform PC { int numPoints; int basisCount; int numChannels; int degree; int broadcastDir; };
+void main() {
+    int idx = int(gl_GlobalInvocationID.x);
+    if (idx >= numPoints * basisCount * numChannels) return;
+    int ch = idx % numChannels;
+    int b = (idx / numChannels) % basisCount;
+    int i = idx / (basisCount * numChannels);
+    int dirIdx = broadcastDir != 0 ? 0 : i;
+    float dx = viewDirections[dirIdx * 3], dy = viewDirections[dirIdx * 3 + 1], dz = viewDirections[dirIdx * 3 + 2];
+    float norm = sqrt(dx * dx + dy * dy + dz * dz);
+    if (norm > 0.0) { float inv = 1.0 / norm; dx *= inv; dy *= inv; dz *= inv; }" + ShBasis + @"
+    float preclamp = 0.0;
+    for (int bb = 0; bb < basisCount; bb++)
+        preclamp += shCoefficients[i * basisCount * numChannels + bb * numChannels + ch] * basis[bb];
+    float colorGrad = outputGradient[i * numChannels + ch];
+    if (preclamp < 0.0 || preclamp > 1.0) colorGrad = 0.0;
+    shGrad[idx] = colorGrad * basis[b];
+}";
 }

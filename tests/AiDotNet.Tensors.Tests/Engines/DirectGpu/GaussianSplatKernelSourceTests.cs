@@ -17,29 +17,33 @@ public sealed class GaussianSplatKernelSourceTests
     private const string HipSpatial = "AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels.HipSpatialTransformerKernels";
     private const string OpenClSpatial = "AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.SpatialTransformerKernels";
     private const string MetalExt = "AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalExtendedConvKernels";
+    private const string VulkanExt = "AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanExtendedConvKernels";
 
+    // GLSL drops the f float suffix, so the Vulkan rows carry the GLSL-form markers.
     [Theory]
-    [InlineData(CudaSpatial, "GetSource")]
-    [InlineData(HipSpatial, "GetSource")]
-    [InlineData(OpenClSpatial, "GetSource")]
-    [InlineData(MetalExt, "Source")]
-    public void QuaternionRotationEntry_MatchesAcrossBackends(string typeName, string memberName)
+    [InlineData(CudaSpatial, "GetSource", "float r00 = 1.0f - 2.0f * (qy * qy + qz * qz);", "float r12 = 2.0f * (qy * qz - qw * qx);")]
+    [InlineData(HipSpatial, "GetSource", "float r00 = 1.0f - 2.0f * (qy * qy + qz * qz);", "float r12 = 2.0f * (qy * qz - qw * qx);")]
+    [InlineData(OpenClSpatial, "GetSource", "float r00 = 1.0f - 2.0f * (qy * qy + qz * qz);", "float r12 = 2.0f * (qy * qz - qw * qx);")]
+    [InlineData(MetalExt, "Source", "float r00 = 1.0f - 2.0f * (qy * qy + qz * qz);", "float r12 = 2.0f * (qy * qz - qw * qx);")]
+    [InlineData(VulkanExt, "GaussianCovariance", "float r00 = 1.0 - 2.0 * (qy * qy + qz * qz);", "float r12 = 2.0 * (qy * qz - qw * qx);")]
+    public void QuaternionRotationEntry_MatchesAcrossBackends(string typeName, string memberName, string m1, string m2)
     {
         string source = GetStaticString(typeName, memberName);
-        Assert.Contains("float r00 = 1.0f - 2.0f * (qy * qy + qz * qz);", source, StringComparison.Ordinal);
-        Assert.Contains("float r12 = 2.0f * (qy * qz - qw * qx);", source, StringComparison.Ordinal);
+        Assert.Contains(m1, source, StringComparison.Ordinal);
+        Assert.Contains(m2, source, StringComparison.Ordinal);
     }
 
     [Theory]
-    [InlineData(CudaSpatial, "GetSource")]
-    [InlineData(HipSpatial, "GetSource")]
-    [InlineData(OpenClSpatial, "GetSource")]
-    [InlineData(MetalExt, "Source")]
-    public void SphericalHarmonicsBasisConstants_MatchAcrossBackends(string typeName, string memberName)
+    [InlineData(CudaSpatial, "GetSource", "basis[0] = 0.282095f;", "basis[6] = 0.315392f * (3.0f * dz * dz - 1.0f);")]
+    [InlineData(HipSpatial, "GetSource", "basis[0] = 0.282095f;", "basis[6] = 0.315392f * (3.0f * dz * dz - 1.0f);")]
+    [InlineData(OpenClSpatial, "GetSource", "basis[0] = 0.282095f;", "basis[6] = 0.315392f * (3.0f * dz * dz - 1.0f);")]
+    [InlineData(MetalExt, "Source", "basis[0] = 0.282095f;", "basis[6] = 0.315392f * (3.0f * dz * dz - 1.0f);")]
+    [InlineData(VulkanExt, "SphericalHarmonics", "basis[0] = 0.282095;", "basis[6] = 0.315392 * (3.0 * dz * dz - 1.0);")]
+    public void SphericalHarmonicsBasisConstants_MatchAcrossBackends(string typeName, string memberName, string m1, string m2)
     {
         string source = GetStaticString(typeName, memberName);
-        Assert.Contains("basis[0] = 0.282095f;", source, StringComparison.Ordinal);
-        Assert.Contains("basis[6] = 0.315392f * (3.0f * dz * dz - 1.0f);", source, StringComparison.Ordinal);
+        Assert.Contains(m1, source, StringComparison.Ordinal);
+        Assert.Contains(m2, source, StringComparison.Ordinal);
     }
 
     // CUDA/HIP register these in GetKernelNames so their module compilation picks them up; OpenCL

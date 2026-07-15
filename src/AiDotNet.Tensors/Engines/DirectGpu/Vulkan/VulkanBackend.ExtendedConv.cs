@@ -6,8 +6,69 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 // this partial only wires the dispatch via GlslDispatchN (int params -> push constants; a float param is
 // passed as its raw bit pattern via the shared FloatBits helper and declared `float` in the push block).
 public sealed partial class VulkanBackend : ITrilinearInterpolationKernels, IConvTranspose3DKernels, ISpiralConvKernels,
-    IAdaptiveMaxPool2DKernels, IConv3DBackwardKernels, IDepthwiseConv2DBackwardKernels
+    IAdaptiveMaxPool2DKernels, IConv3DBackwardKernels, IDepthwiseConv2DBackwardKernels, IPool3DKernels, IGaussianSplatKernels
 {
+    private static uint[] Pool3DPush(int batch, int channels, int inDepth, int inHeight, int inWidth,
+        int outDepth, int outHeight, int outWidth, int kernelD, int kernelH, int kernelW,
+        int strideD, int strideH, int strideW, int countIncludePad) =>
+        [(uint)batch, (uint)channels, (uint)inDepth, (uint)inHeight, (uint)inWidth,
+         (uint)outDepth, (uint)outHeight, (uint)outWidth, (uint)kernelD, (uint)kernelH, (uint)kernelW,
+         (uint)strideD, (uint)strideH, (uint)strideW, (uint)countIncludePad];
+
+    public void AvgPool3D(IGpuBuffer input, IGpuBuffer output,
+        int batch, int channels, int inDepth, int inHeight, int inWidth,
+        int outDepth, int outHeight, int outWidth,
+        int kernelD, int kernelH, int kernelW,
+        int strideD, int strideH, int strideW, int countIncludePad)
+    {
+        int total = checked(batch * channels * outDepth * outHeight * outWidth);
+        if (total <= 0) return;
+        GlslDispatchN(VulkanExtendedConvKernels.AvgPool3D, total, [input, output],
+            Pool3DPush(batch, channels, inDepth, inHeight, inWidth, outDepth, outHeight, outWidth,
+                kernelD, kernelH, kernelW, strideD, strideH, strideW, countIncludePad));
+    }
+
+    public void AvgPool3DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput,
+        int batch, int channels, int inDepth, int inHeight, int inWidth,
+        int outDepth, int outHeight, int outWidth,
+        int kernelD, int kernelH, int kernelW,
+        int strideD, int strideH, int strideW, int countIncludePad)
+    {
+        int total = checked(batch * channels * inDepth * inHeight * inWidth);
+        if (total <= 0) return;
+        GlslDispatchN(VulkanExtendedConvKernels.AvgPool3DBackward, total, [gradOutput, gradInput],
+            Pool3DPush(batch, channels, inDepth, inHeight, inWidth, outDepth, outHeight, outWidth,
+                kernelD, kernelH, kernelW, strideD, strideH, strideW, countIncludePad));
+    }
+
+    public void GaussianCovariance(IGpuBuffer rotations, IGpuBuffer scales, IGpuBuffer covariances, int numGaussians)
+    {
+        if (numGaussians <= 0) return;
+        GlslDispatchN(VulkanExtendedConvKernels.GaussianCovariance, numGaussians,
+            [rotations, scales, covariances], [(uint)numGaussians]);
+    }
+
+    public void SphericalHarmonics(IGpuBuffer shCoefficients, IGpuBuffer viewDirections, IGpuBuffer output,
+        int numPoints, int basisCount, int numChannels, int degree, int broadcastDir)
+    {
+        int total = checked(numPoints * numChannels);
+        if (total <= 0) return;
+        GlslDispatchN(VulkanExtendedConvKernels.SphericalHarmonics, total,
+            [shCoefficients, viewDirections, output],
+            [(uint)numPoints, (uint)basisCount, (uint)numChannels, (uint)degree, (uint)broadcastDir]);
+    }
+
+    public void SphericalHarmonicsBackward(IGpuBuffer shCoefficients, IGpuBuffer viewDirections,
+        IGpuBuffer outputGradient, IGpuBuffer shGrad,
+        int numPoints, int basisCount, int numChannels, int degree, int broadcastDir)
+    {
+        int total = checked(numPoints * basisCount * numChannels);
+        if (total <= 0) return;
+        GlslDispatchN(VulkanExtendedConvKernels.SphericalHarmonicsBackward, total,
+            [shCoefficients, viewDirections, outputGradient, shGrad],
+            [(uint)numPoints, (uint)basisCount, (uint)numChannels, (uint)degree, (uint)broadcastDir]);
+    }
+
     public void AdaptiveMaxPool2D(IGpuBuffer input, IGpuBuffer output,
         int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
     {
