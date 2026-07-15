@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.114.4](https://github.com/ooples/AiDotNet.Tensors/compare/v0.114.3...v0.114.4) (2026-07-15)
+
+
+### Bug Fixes
+
+* **autodiff:** manual backward tape nodes now propagate input gradients through the graph path ([#786](https://github.com/ooples/AiDotNet.Tensors/issues/786)) ([3547028](https://github.com/ooples/AiDotNet.Tensors/commit/3547028282295b735cb484451459be19bab7a32b))
+
 ## [0.114.3](https://github.com/ooples/AiDotNet.Tensors/compare/v0.114.2...v0.114.3) (2026-07-13)
 
 
