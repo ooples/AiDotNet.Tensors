@@ -200,6 +200,84 @@ struct PA{batch:i32,channels:i32,inHeight:i32,inWidth:i32,outHeight:i32,outWidth
     output_[((b*pm.channels+c)*pm.outHeight+oh)*pm.outWidth+ow]=maxV;
 }";
 
+    // conv3d_backward reuses the 18-int Conv3DUniforms packing but names the input spatial dims D/H/W
+    // (matching the OpenCL/GLSL body) rather than iD/iH/iW.
+    private const string Conv3DBackwardStruct =
+        "struct P3B{N:i32,inC:i32,D:i32,H:i32,W:i32,outC:i32,outD:i32,outH:i32,outW:i32,kD:i32,kH:i32,kW:i32,strideD:i32,strideH:i32,strideW:i32,padD:i32,padH:i32,padW:i32,pad0:i32,pad1:i32};";
+
+    public static readonly string Conv3DBackwardInput = @"
+@group(0) @binding(0) var<storage,read> gradOutput:array<f32>;
+@group(0) @binding(1) var<storage,read> weights:array<f32>;
+@group(0) @binding(2) var<storage,read_write> gradInput:array<f32>;
+" + Conv3DBackwardStruct + @"
+@group(0) @binding(3) var<uniform> pm:P3B;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid_:vec3<u32>){
+    let idx=i32(gid_.x);
+    if(idx>=pm.N*pm.inC*pm.D*pm.H*pm.W){return;}
+    let w=idx%pm.W;
+    let h=(idx/pm.W)%pm.H;
+    let d=(idx/(pm.W*pm.H))%pm.D;
+    let ic=(idx/(pm.W*pm.H*pm.D))%pm.inC;
+    let n=idx/(pm.W*pm.H*pm.D*pm.inC);
+    var sum=0.0;
+    for(var oc=0;oc<pm.outC;oc=oc+1){
+        for(var kd=0;kd<pm.kD;kd=kd+1){
+            for(var kh=0;kh<pm.kH;kh=kh+1){
+                for(var kw=0;kw<pm.kW;kw=kw+1){
+                    var od=(d+pm.padD-kd);
+                    var oh=(h+pm.padH-kh);
+                    var ow=(w+pm.padW-kw);
+                    if(od%pm.strideD==0&&oh%pm.strideH==0&&ow%pm.strideW==0){
+                        od=od/pm.strideD;
+                        oh=oh/pm.strideH;
+                        ow=ow/pm.strideW;
+                        if(od>=0&&od<pm.outD&&oh>=0&&oh<pm.outH&&ow>=0&&ow<pm.outW){
+                            let gradOutIdx=((n*pm.outC+oc)*pm.outD+od)*pm.outH*pm.outW+oh*pm.outW+ow;
+                            let kernelIdx=((oc*pm.inC+ic)*pm.kD+kd)*pm.kH*pm.kW+kh*pm.kW+kw;
+                            sum=sum+gradOutput[gradOutIdx]*weights[kernelIdx];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    gradInput[idx]=sum;
+}";
+
+    public static readonly string Conv3DBackwardWeights = @"
+@group(0) @binding(0) var<storage,read> gradOutput:array<f32>;
+@group(0) @binding(1) var<storage,read> input_:array<f32>;
+@group(0) @binding(2) var<storage,read_write> gradKernel:array<f32>;
+" + Conv3DBackwardStruct + @"
+@group(0) @binding(3) var<uniform> pm:P3B;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid_:vec3<u32>){
+    let idx=i32(gid_.x);
+    if(idx>=pm.outC*pm.inC*pm.kD*pm.kH*pm.kW){return;}
+    let kw=idx%pm.kW;
+    let kh=(idx/pm.kW)%pm.kH;
+    let kd=(idx/(pm.kW*pm.kH))%pm.kD;
+    let ic=(idx/(pm.kW*pm.kH*pm.kD))%pm.inC;
+    let oc=idx/(pm.kW*pm.kH*pm.kD*pm.inC);
+    var sum=0.0;
+    for(var n=0;n<pm.N;n=n+1){
+        for(var od=0;od<pm.outD;od=od+1){
+            for(var oh=0;oh<pm.outH;oh=oh+1){
+                for(var ow=0;ow<pm.outW;ow=ow+1){
+                    let d=od*pm.strideD+kd-pm.padD;
+                    let h=oh*pm.strideH+kh-pm.padH;
+                    let w=ow*pm.strideW+kw-pm.padW;
+                    if(d>=0&&d<pm.D&&h>=0&&h<pm.H&&w>=0&&w<pm.W){
+                        let gradOutIdx=((n*pm.outC+oc)*pm.outD+od)*pm.outH*pm.outW+oh*pm.outW+ow;
+                        let inputIdx=((n*pm.inC+ic)*pm.D+d)*pm.H*pm.W+h*pm.W+w;
+                        sum=sum+gradOutput[gradOutIdx]*input_[inputIdx];
+                    }
+                }
+            }
+        }
+    }
+    gradKernel[idx]=sum;
+}";
+
     private const string SpiralStruct = "struct PS{V:i32,inC:i32,spiralLength:i32,outC:i32};";
 
     public static readonly string SpiralConv = @"

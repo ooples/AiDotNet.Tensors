@@ -10,9 +10,33 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 // uniform block (ints reinterpreted as their float bit pattern, floats stored directly, padded to a
 // 16-byte multiple to satisfy WGSL uniform alignment).
 public sealed partial class WebGpuBackend : ITrilinearInterpolationKernels, IConvTranspose3DKernels, ISpiralConvKernels,
-    IAdaptiveMaxPool2DKernels
+    IAdaptiveMaxPool2DKernels, IConv3DBackwardKernels
 {
     private static float Bits(int value) => BitConverter.Int32BitsToSingle(value);
+
+    public void Conv3DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer weights, IGpuBuffer gradInput,
+        int n, int inC, int inD, int inH, int inW, int outC, int outD, int outH, int outW,
+        int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW)
+    {
+        int total = checked(n * inC * inD * inH * inW);
+        if (total <= 0) return;
+        Dispatch3BufferAsync("ExtConv3DBwdIn", WebGpuExtendedConvKernels.Conv3DBackwardInput, "main",
+            gradOutput, weights, gradInput,
+            Conv3DUniforms(n, inC, inD, inH, inW, outC, outD, outH, outW, kD, kH, kW, strideD, strideH, strideW, padD, padH, padW),
+            total).GetAwaiter().GetResult();
+    }
+
+    public void Conv3DBackwardKernel(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradKernel,
+        int n, int inC, int inD, int inH, int inW, int outC, int outD, int outH, int outW,
+        int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW)
+    {
+        int total = checked(outC * inC * kD * kH * kW);
+        if (total <= 0) return;
+        Dispatch3BufferAsync("ExtConv3DBwdW", WebGpuExtendedConvKernels.Conv3DBackwardWeights, "main",
+            gradOutput, input, gradKernel,
+            Conv3DUniforms(n, inC, inD, inH, inW, outC, outD, outH, outW, kD, kH, kW, strideD, strideH, strideW, padD, padH, padW),
+            total).GetAwaiter().GetResult();
+    }
 
     public void AdaptiveMaxPool2D(IGpuBuffer input, IGpuBuffer output,
         int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)

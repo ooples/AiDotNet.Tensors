@@ -18,29 +18,38 @@ public sealed class Conv3dBackwardKernelSourceTests
     private const string OpenClNeural = "AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.NeuralNetKernels";
     private const string MetalExt = "AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalExtendedConvKernels";
     private const string VulkanExt = "AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanExtendedConvKernels";
+    private const string WebGpuExt = "AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuExtendedConvKernels";
+
+    private const string KernelIdxC = "int kernelIdx = ((oc * inC + ic) * kD + kd) * kH * kW + kh * kW + kw;";
+    private const string KernelIdxWgsl = "let kernelIdx=((oc*pm.inC+ic)*pm.kD+kd)*pm.kH*pm.kW+kh*pm.kW+kw;";
 
     [Theory]
-    [InlineData(CudaConv, "GetSource")]
-    [InlineData(HipConv, "GetSource")]
-    [InlineData(OpenClNeural, "GetSource")]
-    [InlineData(MetalExt, "Source")]
-    [InlineData(VulkanExt, "Conv3DBackwardInput")]
-    public void InputGradientWeightIndex_MatchesAcrossBackends(string typeName, string memberName)
+    [InlineData(CudaConv, "GetSource", KernelIdxC)]
+    [InlineData(HipConv, "GetSource", KernelIdxC)]
+    [InlineData(OpenClNeural, "GetSource", KernelIdxC)]
+    [InlineData(MetalExt, "Source", KernelIdxC)]
+    [InlineData(VulkanExt, "Conv3DBackwardInput", KernelIdxC)]
+    [InlineData(WebGpuExt, "Conv3DBackwardInput", KernelIdxWgsl)]
+    public void InputGradientWeightIndex_MatchesAcrossBackends(string typeName, string memberName, string marker)
     {
         string source = GetStaticString(typeName, memberName);
-        Assert.Contains("int kernelIdx = ((oc * inC + ic) * kD + kd) * kH * kW + kh * kW + kw;", source, StringComparison.Ordinal);
+        Assert.Contains(marker, source, StringComparison.Ordinal);
     }
 
+    private const string InputIdxC = "int inputIdx = ((n * inC + ic) * D + d) * H * W + h * W + w;";
+    private const string InputIdxWgsl = "let inputIdx=((n*pm.inC+ic)*pm.D+d)*pm.H*pm.W+h*pm.W+w;";
+
     [Theory]
-    [InlineData(CudaConv, "GetSource")]
-    [InlineData(HipConv, "GetSource")]
-    [InlineData(OpenClNeural, "GetSource")]
-    [InlineData(MetalExt, "Source")]
-    [InlineData(VulkanExt, "Conv3DBackwardWeights")]
-    public void WeightGradientInputIndex_MatchesAcrossBackends(string typeName, string memberName)
+    [InlineData(CudaConv, "GetSource", InputIdxC)]
+    [InlineData(HipConv, "GetSource", InputIdxC)]
+    [InlineData(OpenClNeural, "GetSource", InputIdxC)]
+    [InlineData(MetalExt, "Source", InputIdxC)]
+    [InlineData(VulkanExt, "Conv3DBackwardWeights", InputIdxC)]
+    [InlineData(WebGpuExt, "Conv3DBackwardWeights", InputIdxWgsl)]
+    public void WeightGradientInputIndex_MatchesAcrossBackends(string typeName, string memberName, string marker)
     {
         string source = GetStaticString(typeName, memberName);
-        Assert.Contains("int inputIdx = ((n * inC + ic) * D + d) * H * W + h * W + w;", source, StringComparison.Ordinal);
+        Assert.Contains(marker, source, StringComparison.Ordinal);
     }
 
     // CUDA/HIP register the two backward kernels (OpenCL registers them in the neural-net module).
