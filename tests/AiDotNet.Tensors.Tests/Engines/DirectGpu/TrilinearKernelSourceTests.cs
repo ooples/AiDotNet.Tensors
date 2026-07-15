@@ -17,14 +17,17 @@ public sealed class TrilinearKernelSourceTests
     private const string HipConv = "AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels.HipConvolutionKernels";
     private const string OpenClConv = "AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.ConvolutionKernels";
     private const string MetalExt = "AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalExtendedConvKernels";
+    private const string VulkanExt = "AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanExtendedConvKernels";
 
     // The trilinear forward 8-corner weights factorize identically in every backend's source
-    // (OpenCL/CUDA/HIP expose GetSource(); Metal exposes the Source field of its MSL library).
+    // (C/MSL/GLSL all agree — no float literals, only int 1). OpenCL/CUDA/HIP expose GetSource(), Metal
+    // the Source field, Vulkan a per-kernel GLSL property (TrilinearInterpolate).
     [Theory]
     [InlineData(CudaConv, "GetSource")]
     [InlineData(HipConv, "GetSource")]
     [InlineData(OpenClConv, "GetSource")]
     [InlineData(MetalExt, "Source")]
+    [InlineData(VulkanExt, "TrilinearInterpolate")]
     public void ForwardEightCornerWeights_MatchAcrossBackends(string typeName, string memberName)
     {
         string source = GetStaticString(typeName, memberName);
@@ -32,16 +35,18 @@ public sealed class TrilinearKernelSourceTests
         Assert.Contains("w111 = fz * fy * fx", source, StringComparison.Ordinal);
     }
 
-    // The backward gather weight per axis is identical in every backend's source.
+    // The backward gather weight per axis matches each backend's source; GLSL drops the `f` float suffix,
+    // so the Vulkan row carries the GLSL-form marker.
     [Theory]
-    [InlineData(CudaConv, "GetSource")]
-    [InlineData(HipConv, "GetSource")]
-    [InlineData(OpenClConv, "GetSource")]
-    [InlineData(MetalExt, "Source")]
-    public void BackwardPerAxisGatherWeight_MatchesAcrossBackends(string typeName, string memberName)
+    [InlineData(CudaConv, "GetSource", "float wz = (gz == z0 ? (1.0f - fz) : 0.0f) + (gz == z1 ? fz : 0.0f);")]
+    [InlineData(HipConv, "GetSource", "float wz = (gz == z0 ? (1.0f - fz) : 0.0f) + (gz == z1 ? fz : 0.0f);")]
+    [InlineData(OpenClConv, "GetSource", "float wz = (gz == z0 ? (1.0f - fz) : 0.0f) + (gz == z1 ? fz : 0.0f);")]
+    [InlineData(MetalExt, "Source", "float wz = (gz == z0 ? (1.0f - fz) : 0.0f) + (gz == z1 ? fz : 0.0f);")]
+    [InlineData(VulkanExt, "TrilinearInterpolateBackward", "float wz = (gz == z0 ? (1.0 - fz) : 0.0) + (gz == z1 ? fz : 0.0);")]
+    public void BackwardPerAxisGatherWeight_MatchesAcrossBackends(string typeName, string memberName, string marker)
     {
         string source = GetStaticString(typeName, memberName);
-        Assert.Contains("float wz = (gz == z0 ? (1.0f - fz) : 0.0f) + (gz == z1 ? fz : 0.0f);", source, StringComparison.Ordinal);
+        Assert.Contains(marker, source, StringComparison.Ordinal);
     }
 
     // Every backend that carries the kernels must register both names so the launch can resolve them.
