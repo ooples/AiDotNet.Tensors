@@ -18,31 +18,38 @@ public sealed class SpiralConvKernelSourceTests
     private const string OpenClConv = "AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.ConvolutionKernels";
     private const string MetalExt = "AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalExtendedConvKernels";
     private const string VulkanExt = "AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanExtendedConvKernels";
+    private const string WebGpuExt = "AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuExtendedConvKernels";
+
+    private const string FwdC = "sum += vertexFeatures[neighborIdx * inC + c] * weights[oc * gatheredSize + gatherOffset + c];";
+    private const string FwdWgsl = "sum=sum+vertexFeatures[neighborIdx*pm.inC+c]*weights[oc*gatheredSize+gatherOffset+c];";
 
     [Theory]
-    [InlineData(CudaConv, "GetSource")]
-    [InlineData(HipConv, "GetSource")]
-    [InlineData(OpenClConv, "GetSource")]
-    [InlineData(MetalExt, "Source")]
-    [InlineData(VulkanExt, "SpiralConv")]
-    public void ForwardNeighbourGatherMatmul_MatchesAcrossBackends(string typeName, string memberName)
+    [InlineData(CudaConv, "GetSource", FwdC)]
+    [InlineData(HipConv, "GetSource", FwdC)]
+    [InlineData(OpenClConv, "GetSource", FwdC)]
+    [InlineData(MetalExt, "Source", FwdC)]
+    [InlineData(VulkanExt, "SpiralConv", FwdC)]
+    [InlineData(WebGpuExt, "SpiralConv", FwdWgsl)]
+    public void ForwardNeighbourGatherMatmul_MatchesAcrossBackends(string typeName, string memberName, string marker)
     {
         string source = GetStaticString(typeName, memberName);
-        Assert.Contains("sum += vertexFeatures[neighborIdx * inC + c] * weights[oc * gatheredSize + gatherOffset + c];",
-            source, StringComparison.Ordinal);
+        Assert.Contains(marker, source, StringComparison.Ordinal);
     }
 
+    private const string BwdC = "sum += gradOutput[v * outC + oc] * vertexFeatures[neighborIdx * inC + ic];";
+    private const string BwdWgsl = "sum=sum+gradOutput[v*pm.outC+oc]*vertexFeatures[neighborIdx*pm.inC+ic];";
+
     [Theory]
-    [InlineData(CudaConv, "GetSource")]
-    [InlineData(HipConv, "GetSource")]
-    [InlineData(OpenClConv, "GetSource")]
-    [InlineData(MetalExt, "Source")]
-    [InlineData(VulkanExt, "SpiralConvBackwardWeights")]
-    public void BackwardWeightsGather_MatchesAcrossBackends(string typeName, string memberName)
+    [InlineData(CudaConv, "GetSource", BwdC)]
+    [InlineData(HipConv, "GetSource", BwdC)]
+    [InlineData(OpenClConv, "GetSource", BwdC)]
+    [InlineData(MetalExt, "Source", BwdC)]
+    [InlineData(VulkanExt, "SpiralConvBackwardWeights", BwdC)]
+    [InlineData(WebGpuExt, "SpiralConvBackwardWeights", BwdWgsl)]
+    public void BackwardWeightsGather_MatchesAcrossBackends(string typeName, string memberName, string marker)
     {
         string source = GetStaticString(typeName, memberName);
-        Assert.Contains("sum += gradOutput[v * outC + oc] * vertexFeatures[neighborIdx * inC + ic];",
-            source, StringComparison.Ordinal);
+        Assert.Contains(marker, source, StringComparison.Ordinal);
     }
 
     [Theory]

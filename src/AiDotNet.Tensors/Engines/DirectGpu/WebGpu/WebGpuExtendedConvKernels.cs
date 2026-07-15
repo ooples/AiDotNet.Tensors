@@ -173,4 +173,81 @@ struct Params{D:i32,H:i32,W:i32,C:i32,P:i32,upperEps:f32,pad0:i32,pad1:i32};
     }
     gradWeights[idx]=sum;
 }";
+
+    private const string SpiralStruct = "struct PS{V:i32,inC:i32,spiralLength:i32,outC:i32};";
+
+    public static readonly string SpiralConv = @"
+@group(0) @binding(0) var<storage,read> vertexFeatures:array<f32>;
+@group(0) @binding(1) var<storage,read> spiralIndices:array<i32>;
+@group(0) @binding(2) var<storage,read> weights:array<f32>;
+@group(0) @binding(3) var<storage,read> biases:array<f32>;
+@group(0) @binding(4) var<storage,read_write> output_:array<f32>;
+" + SpiralStruct + @"
+@group(0) @binding(5) var<uniform> pm:PS;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid_:vec3<u32>){
+    let idx=i32(gid_.x);
+    if(idx>=pm.V*pm.outC){return;}
+    let oc=idx%pm.outC;
+    let v=idx/pm.outC;
+    let gatheredSize=pm.inC*pm.spiralLength;
+    var sum=biases[oc];
+    for(var s=0;s<pm.spiralLength;s=s+1){
+        let neighborIdx=spiralIndices[v*pm.spiralLength+s];
+        if(neighborIdx<0||neighborIdx>=pm.V){continue;}
+        let gatherOffset=s*pm.inC;
+        for(var c=0;c<pm.inC;c=c+1){
+            sum=sum+vertexFeatures[neighborIdx*pm.inC+c]*weights[oc*gatheredSize+gatherOffset+c];
+        }
+    }
+    output_[idx]=sum;
+}";
+
+    public static readonly string SpiralConvBackwardInput = @"
+@group(0) @binding(0) var<storage,read> gradOutput:array<f32>;
+@group(0) @binding(1) var<storage,read> spiralIndices:array<i32>;
+@group(0) @binding(2) var<storage,read> weights:array<f32>;
+@group(0) @binding(3) var<storage,read_write> gradVertexFeatures:array<f32>;
+" + SpiralStruct + @"
+@group(0) @binding(4) var<uniform> pm:PS;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid_:vec3<u32>){
+    let idx=i32(gid_.x);
+    if(idx>=pm.V*pm.inC){return;}
+    let ic=idx%pm.inC;
+    let nbr=idx/pm.inC;
+    let gatheredSize=pm.inC*pm.spiralLength;
+    var sum=0.0;
+    for(var v=0;v<pm.V;v=v+1){
+        for(var s=0;s<pm.spiralLength;s=s+1){
+            if(spiralIndices[v*pm.spiralLength+s]!=nbr){continue;}
+            for(var oc=0;oc<pm.outC;oc=oc+1){
+                sum=sum+gradOutput[v*pm.outC+oc]*weights[oc*gatheredSize+s*pm.inC+ic];
+            }
+        }
+    }
+    gradVertexFeatures[idx]=sum;
+}";
+
+    public static readonly string SpiralConvBackwardWeights = @"
+@group(0) @binding(0) var<storage,read> gradOutput:array<f32>;
+@group(0) @binding(1) var<storage,read> vertexFeatures:array<f32>;
+@group(0) @binding(2) var<storage,read> spiralIndices:array<i32>;
+@group(0) @binding(3) var<storage,read_write> gradWeights:array<f32>;
+" + SpiralStruct + @"
+@group(0) @binding(4) var<uniform> pm:PS;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid_:vec3<u32>){
+    let idx=i32(gid_.x);
+    let gatheredSize=pm.inC*pm.spiralLength;
+    if(idx>=pm.outC*gatheredSize){return;}
+    let g=idx%gatheredSize;
+    let oc=idx/gatheredSize;
+    let s=g/pm.inC;
+    let ic=g%pm.inC;
+    var sum=0.0;
+    for(var v=0;v<pm.V;v=v+1){
+        let neighborIdx=spiralIndices[v*pm.spiralLength+s];
+        if(neighborIdx<0||neighborIdx>=pm.V){continue;}
+        sum=sum+gradOutput[v*pm.outC+oc]*vertexFeatures[neighborIdx*pm.inC+ic];
+    }
+    gradWeights[idx]=sum;
+}";
 }

@@ -9,9 +9,39 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 // partial only wires the dispatch via Dispatch{N}BufferAsync. Scalar params are packed into a float[]
 // uniform block (ints reinterpreted as their float bit pattern, floats stored directly, padded to a
 // 16-byte multiple to satisfy WGSL uniform alignment).
-public sealed partial class WebGpuBackend : ITrilinearInterpolationKernels, IConvTranspose3DKernels
+public sealed partial class WebGpuBackend : ITrilinearInterpolationKernels, IConvTranspose3DKernels, ISpiralConvKernels
 {
     private static float Bits(int value) => BitConverter.Int32BitsToSingle(value);
+
+    public void SpiralConv(IGpuBuffer vertexFeatures, IGpuBuffer spiralIndices, IGpuBuffer weights,
+        IGpuBuffer biases, IGpuBuffer output, int v, int inC, int spiralLength, int outC)
+    {
+        int total = checked(v * outC);
+        if (total <= 0) return;
+        Dispatch5BufferAsync("ExtSpiralConv", WebGpuExtendedConvKernels.SpiralConv, "main",
+            vertexFeatures, spiralIndices, weights, biases, output,
+            [Bits(v), Bits(inC), Bits(spiralLength), Bits(outC)], total).GetAwaiter().GetResult();
+    }
+
+    public void SpiralConvBackwardInput(IGpuBuffer gradOutput, IGpuBuffer spiralIndices, IGpuBuffer weights,
+        IGpuBuffer gradVertexFeatures, int v, int inC, int spiralLength, int outC)
+    {
+        int total = checked(v * inC);
+        if (total <= 0) return;
+        Dispatch4BufferAsync("ExtSpiralConvBwdIn", WebGpuExtendedConvKernels.SpiralConvBackwardInput, "main",
+            gradOutput, spiralIndices, weights, gradVertexFeatures,
+            [Bits(v), Bits(inC), Bits(spiralLength), Bits(outC)], total).GetAwaiter().GetResult();
+    }
+
+    public void SpiralConvBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer vertexFeatures, IGpuBuffer spiralIndices,
+        IGpuBuffer gradWeights, int v, int inC, int spiralLength, int outC)
+    {
+        int total = checked(outC * inC * spiralLength);
+        if (total <= 0) return;
+        Dispatch4BufferAsync("ExtSpiralConvBwdW", WebGpuExtendedConvKernels.SpiralConvBackwardWeights, "main",
+            gradOutput, vertexFeatures, spiralIndices, gradWeights,
+            [Bits(v), Bits(inC), Bits(spiralLength), Bits(outC)], total).GetAwaiter().GetResult();
+    }
 
     private static float[] Conv3DUniforms(int n, int inC, int iD, int iH, int iW, int outC, int outD, int outH, int outW,
         int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW) =>
