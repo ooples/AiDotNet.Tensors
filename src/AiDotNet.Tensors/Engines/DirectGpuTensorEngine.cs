@@ -12221,6 +12221,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             float[] meanFloat = backend.DownloadBuffer(saveMeanBuffer.Buffer);
             float[] varFloat = backend.DownloadBuffer(saveVarBuffer.Buffer);
 
+            // VARIANCE-SEMANTICS FIX: the CUDA layernorm_forward kernel writes INVERSE-STD
+            // (saveInvVar = rsqrtf(var/N + eps)) into the save-variance buffer, but this method's contract —
+            // matching CpuEngine.LayerNorm, which the tape/GraphMode path falls back to — is that the
+            // `variance` out-param is the TRUE variance. Both LayerNormBackward consumers re-derive
+            // invVar = 1/sqrt(variance+eps) from this out-param (the host path via 1f/MathF.Sqrt(varF+eps);
+            // the resident GPU path via AddScalar+Sqrt+Reciprocal). Handed the kernel's invVar instead of
+            // true variance they double-invert → systematically WRONG gradGamma/gradInput on the
+            // compiled-replay path (this GPU forward runs there, no tape). Convert invVar → true variance
+            // here so BOTH the forward's out-param semantics AND the backward's re-derivation are correct:
+            // invVar = 1/sqrt(V+eps) ⇒ V = 1/invVar² − eps.
+            for (int i = 0; i < varFloat.Length; i++)
+            {
+                float iv = varFloat[i];
+                varFloat[i] = iv > 0f ? 1f / (iv * iv) - (float)epsilon : 0f;
+            }
+
             mean = new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(meanFloat), batchShape);
             variance = new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(varFloat), batchShape);
             return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(outputFloat), input.Shape.ToArray());
