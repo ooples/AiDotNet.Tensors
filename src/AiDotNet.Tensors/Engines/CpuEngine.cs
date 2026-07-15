@@ -1,4 +1,4 @@
-﻿#pragma warning disable CS0618 // SimdGemm.Sgemm/Dgemm (no-trans shims) are [Obsolete] — internal call sites pending migration to BlasManaged.Gemm<T> in later K tasks.
+#pragma warning disable CS0618 // SimdGemm.Sgemm/Dgemm (no-trans shims) are [Obsolete] — internal call sites pending migration to BlasManaged.Gemm<T> in later K tasks.
 using System;
 using System.Buffers;
 using System.Runtime.CompilerServices;
@@ -33332,6 +33332,30 @@ public partial class CpuEngine : ITensorLevelEngine
                 throw new ArgumentOutOfRangeException(nameof(start), $"Slice starting at {start[i]} with size {source._shape[i]} exceeds destination axis {i} size {destination._shape[i]}");
         }
 
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope is not null)
+            {
+                var capturedDestination = destination;
+                var capturedSource = source;
+                var capturedStart = (int[])start.Clone();
+                return scope.RecordBinary(
+                    LazyNodeType.Custom,
+                    "TensorSetSlice",
+                    destination,
+                    source,
+                    destination._shape,
+                    (eng, output) =>
+                    {
+                        var result = eng.TensorSetSlice(capturedDestination, capturedSource, capturedStart);
+                        DirectGpuTensorEngine.CopyResultInto(eng, result, output);
+                    },
+                    BackwardFunctions<T>.SetSliceBackward,
+                    new object[] { capturedStart });
+            }
+        }
+
         // Create a copy of destination to avoid modifying the original
         var result = AutoTensorCache.RentOrAllocate<T>(destination._shape);
         var destData = destination.GetDataArray();
@@ -33359,6 +33383,18 @@ public partial class CpuEngine : ITensorLevelEngine
             resultData[destFlat] = sourceData[flatIdx];
         });
 
+        var savedStart = (int[])start.Clone();
+        DifferentiableOps.RecordBinary(
+            "TensorSetSlice",
+            result,
+            destination,
+            source,
+            BackwardFunctions<T>.SetSliceBackward,
+            new object[] { savedStart });
+        AutoTracer.RecordOp(
+            "TensorSetSlice",
+            result,
+            eng => eng.TensorSetSlice(destination, source, savedStart));
         return result;
     }
 
@@ -35328,9 +35364,52 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        // Fast path for axis=0 contiguous tensors: direct Array.Copy (any rank)
+        // Fast path for contiguous tensors concatenated on the last axis.
+        // Each leading-index row is a contiguous block, so copy one block per
+        // input instead of Tensor<T>.Concatenate's element-wise recursive walk.
         Tensor<T> result;
-        if (axis == 0 && tensors.All(t => t.IsContiguous))
+        int concatRank = tensors[0].Rank;
+        int normalizedAxis = axis < 0 ? concatRank + axis : axis;
+        if (normalizedAxis == concatRank - 1 && tensors.All(t => t.IsContiguous))
+        {
+            var outShape = (int[])tensors[0]._shape.Clone();
+            int outerRows = 1;
+            for (int d = 0; d < concatRank - 1; d++)
+                outerRows *= outShape[d];
+
+            int outputWidth = 0;
+            for (int i = 0; i < tensors.Length; i++)
+            {
+                var shape = tensors[i]._shape;
+                if (shape.Length != concatRank)
+                    throw new ArgumentException("All tensors must have the same rank.", nameof(tensors));
+                for (int d = 0; d < concatRank - 1; d++)
+                {
+                    if (shape[d] != outShape[d])
+                        throw new ArgumentException(
+                            "All tensors must have the same shape except along the concatenation axis.",
+                            nameof(tensors));
+                }
+                outputWidth += shape[concatRank - 1];
+            }
+            outShape[concatRank - 1] = outputWidth;
+
+            result = AutoTensorCache.RentOrAllocate<T>(outShape);
+            var destination = result.AsWritableSpan();
+            for (int row = 0; row < outerRows; row++)
+            {
+                int destinationOffset = row * outputWidth;
+                for (int i = 0; i < tensors.Length; i++)
+                {
+                    int width = tensors[i]._shape[concatRank - 1];
+                    tensors[i].AsSpan().Slice(row * width, width)
+                        .CopyTo(destination.Slice(destinationOffset, width));
+                    destinationOffset += width;
+                }
+            }
+        }
+        // Fast path for axis=0 contiguous tensors: direct Array.Copy (any rank)
+        else if (axis == 0 && tensors.All(t => t.IsContiguous))
         {
             // Compute output shape first
             var outShape = (int[])tensors[0]._shape.Clone();

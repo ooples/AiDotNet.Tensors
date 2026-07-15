@@ -2533,12 +2533,33 @@ internal static class BackwardFunctions<T>
         var numOps = MathHelper.GetNumericOperations<T>();
 
         // Create a zero gradient with original input shape, then copy chunk into correct position
-        var grad = TensorPool<T>.RentZeroed(originalShape);
-        engine.TensorFill(grad, numOps.Zero);
+        var zeroGradient = TensorPool<T>.RentZeroed(originalShape);
+        engine.TensorFill(zeroGradient, numOps.Zero);
         var startArr = new int[originalShape.Length];
         startArr[axis] = start;
-        engine.TensorSetSlice(grad, gradOutput, startArr);
+        var grad = engine.TensorSetSlice(zeroGradient, gradOutput, startArr);
+        TensorPool<T>.Return(zeroGradient);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
+    /// <summary>
+    /// Set-slice backward: the source receives the overwritten output region,
+    /// while the destination receives every gradient outside that region.
+    /// </summary>
+    internal static void SetSliceBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        int[] start = (int[])savedState[0];
+        var sourceShape = inputs[1]._shape;
+
+        var gradSource = engine.TensorSlice(gradOutput, start, sourceShape);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradSource, engine);
+
+        var zeroSlice = TensorPool<T>.RentZeroed(sourceShape);
+        var gradDestination = engine.TensorSetSlice(gradOutput, zeroSlice, start);
+        TensorPool<T>.Return(zeroSlice);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradDestination, engine);
     }
 
     /// <summary>AvgPool1D backward</summary>
