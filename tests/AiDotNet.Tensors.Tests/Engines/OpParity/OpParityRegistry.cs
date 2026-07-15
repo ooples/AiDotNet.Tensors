@@ -1121,7 +1121,9 @@ public static class OpParityRegistry
         // Scatter-reduce (Sum): indices and source share shape; distinct rows -> deterministic.
         var srT = OpInput.Rand(4620, new[] { 4, 6 });
         var srSrc = OpInput.Rand(4621, new[] { 3, 6 });
-        var srIdx = new int[] { 0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3 };
+        // Deliberate collision: src rows 0 and 1 both index dest row 0, so Sum mode actually accumulates
+        // two contributions there (a reduce that never sums would diverge); row 2 -> dest 3.
+        var srIdx = new int[] { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 3, 3, 3, 3, 3 };
         yield return new OpCase("TensorScatterReduce[4,6;idx3,6;sum]", "index",
             e => e.TensorScatterReduce(srT.F(), 0, new Tensor<int>((int[])srIdx.Clone(), new[] { 3, 6 }), srSrc.F(), ScatterReduceMode.Sum, true),
             e => e.TensorScatterReduce(srT.D(), 0, new Tensor<int>((int[])srIdx.Clone(), new[] { 3, 6 }), srSrc.D(), ScatterReduceMode.Sum, true),
@@ -1469,7 +1471,9 @@ public static class OpParityRegistry
         // Distinct permutation over axis-1 (length 6) -> deterministic, values [4,6].
         var sd = OpInput.Rand(3730, new[] { 4, 6 });
         var sv = OpInput.Rand(3731, new[] { 4, 6 });
-        var sIdx = new int[] { 0, 1, 2, 3, 4, 5 };
+        // Non-identity permutation so Scatter actually reorders along axis 1 (identity would pass even a
+        // no-op kernel).
+        var sIdx = new int[] { 5, 3, 1, 4, 2, 0 };
         yield return new OpCase("Scatter[4,6;idx6;axis1]", "index",
             e => e.Scatter(sd.F(), new Tensor<int>((int[])sIdx.Clone(), new[] { 6 }), sv.F(), 1),
             e => e.Scatter(sd.D(), new Tensor<int>((int[])sIdx.Clone(), new[] { 6 }), sv.D(), 1),
