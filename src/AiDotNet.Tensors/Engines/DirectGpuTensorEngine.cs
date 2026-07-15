@@ -12250,6 +12250,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.AddScalar(trueVarBuffer.Buffer, trueVarBuffer.Buffer, -(float)epsilon, batchSize);
             backend.Synchronize();
 
+            // Resolved (#775 merge): keep the fully GPU-RESIDENT return — trueVarBuffer is computed
+            // on-device above (Multiply+Reciprocal+AddScalar) and deferred, superseding main's parallel
+            // host-readback fix (DownloadBuffer -> varFloat loop) of the SAME invVar->true-variance bug.
             var result = DeferTensorResult<T>(backend, outputBuffer.Buffer,
                 input.Length, input.Shape.ToArray());
             mean = DeferTensorResult<T>(backend, saveMeanBuffer.Buffer, batchSize, batchShape);

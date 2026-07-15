@@ -391,6 +391,11 @@ class Program
             PyTorchComparison.GapInvestigationBench.SelectStrategyHotPath();
             return;
         }
+        if (args[0] == "--decide-hotpath")
+        {
+            PyTorchComparison.GapInvestigationBench.DecideHotPath();
+            return;
+        }
         if (args[0] == "--hybrid-win")
         {
             PyTorchComparison.GapInvestigationBench.HybridWin();

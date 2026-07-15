@@ -232,6 +232,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         {
             var step = steps[i];
             bool allowCachedB = !IsMutableSecondMatMulInput(step, compiledInputTensor);
+            MaybeRegisterFrozenMatMulWeight(step, allowCachedB);
             var spec = CompiledTrainingPlan<T>.TryBuildSpecializedForward(step, pinnedHandles, allowCachedB);
             if (spec != null)
             {
@@ -1339,6 +1340,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             }
 
             bool allowCachedB = !IsMutableSecondMatMulInput(step, inputTensor);
+            MaybeRegisterFrozenMatMulWeight(step, allowCachedB);
             var specialized = CompiledTrainingPlan<T>.TryBuildSpecializedForward(step, pinnedHandles, allowCachedB);
             if (specialized != null)
             {
@@ -1515,6 +1517,28 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             && step.OpType == OpType.TensorMatMul
             && step.Inputs.Length >= 2
             && ReferenceEquals(step.Inputs[1], mutableInput);
+    }
+
+    /// <summary>
+    /// When a compiled matmul's second operand B is a frozen constant weight (not the mutable
+    /// input, i.e. <paramref name="allowCachedB"/> is true), register it in the process-wide
+    /// <see cref="AiDotNet.Tensors.Engines.BlasManaged.FrozenWeightRegistry"/> so the eager
+    /// TensorMatMul path adopts a pre-packed B (via WeightPackCache) instead of re-packing the
+    /// weight on every Execute. Nothing populated that registry before, so TryGetHandle always
+    /// missed and compiled-replay re-packed B per call (~14% of the compiled hot path). Only rank-2
+    /// float/double weights are packable; anything else (or a failure) simply falls back to the
+    /// existing re-pack. B's tensor identity is stable across Execute() calls for a frozen weight,
+    /// which is exactly what the identity-keyed registry needs.
+    /// </summary>
+    private static void MaybeRegisterFrozenMatMulWeight(CompiledStep<T> step, bool allowCachedB)
+    {
+        if (!allowCachedB || step.OpType != OpType.TensorMatMul || step.Inputs.Length < 2) return;
+        var b = step.Inputs[1];
+        if (b is { Rank: 2 } && (typeof(T) == typeof(float) || typeof(T) == typeof(double)))
+        {
+            try { AiDotNet.Tensors.Engines.BlasManaged.FrozenWeightRegistry.Register(b); }
+            catch { /* best effort: unregistered B just re-packs, same as before */ }
+        }
     }
 
     /// <summary>

@@ -1,5 +1,42 @@
 # Changelog
 
+## [0.114.5](https://github.com/ooples/AiDotNet.Tensors/compare/v0.114.4...v0.114.5) (2026-07-15)
+
+
+### Bug Fixes
+
+* **autodiff:** manual backward tape nodes now propagate input gradients through the graph path ([#786](https://github.com/ooples/AiDotNet.Tensors/issues/786)) ([db5029d](https://github.com/ooples/AiDotNet.Tensors/commit/db5029dbe8b0e631ec7e939f195e70d08cf31329))
+* **gpu:** LayerNorm forward returns TRUE variance, not inverse-std, so compiled-replay backward gradients are correct ([#784](https://github.com/ooples/AiDotNet.Tensors/issues/784)) ([e735690](https://github.com/ooples/AiDotNet.Tensors/commit/e7356905c2d8f1c6dfb1352ac4007c1716351784))
+
+## [0.114.4](https://github.com/ooples/AiDotNet.Tensors/compare/v0.114.3...v0.114.4) (2026-07-15)
+
+
+### Bug Fixes
+
+* **autodiff:** manual backward tape nodes now propagate input gradients through the graph path ([#786](https://github.com/ooples/AiDotNet.Tensors/issues/786)) ([3547028](https://github.com/ooples/AiDotNet.Tensors/commit/3547028282295b735cb484451459be19bab7a32b))
+
+## [0.114.3](https://github.com/ooples/AiDotNet.Tensors/compare/v0.114.2...v0.114.3) (2026-07-13)
+
+
+### Performance
+
+* **autotune:** eliminate per-GEMM disk touches on the compiled-replay hot path ([#782](https://github.com/ooples/AiDotNet.Tensors/issues/782)) ([4fedc3b](https://github.com/ooples/AiDotNet.Tensors/commit/4fedc3b9e78accd596849459ff50dd272663fd37))
+
+## [0.114.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.114.1...v0.114.2) (2026-07-13)
+
+
+### Bug Fixes
+
+* **cpu:** support groups&lt;deformGroups in DeformableConv2DGrouped (key deform group on input channel) ([#780](https://github.com/ooples/AiDotNet.Tensors/issues/780)) ([2b5a080](https://github.com/ooples/AiDotNet.Tensors/commit/2b5a0809389eed4df45c105954dfb5a99abbde36))
+
+## [0.114.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.114.0...v0.114.1) (2026-07-13)
+
+
+### Bug Fixes
+
+* **cpu:** race-free GridSample-3D backward scatter (thread-local accumulators) ([#774](https://github.com/ooples/AiDotNet.Tensors/issues/774)) ([7773fc8](https://github.com/ooples/AiDotNet.Tensors/commit/7773fc8ac2048d0920589375d9e349a3e9dbfb54))
+* **fft:** guard IRFFT against degenerate length-1 transform (nFft=0 OOR) ([#779](https://github.com/ooples/AiDotNet.Tensors/issues/779)) ([f72615b](https://github.com/ooples/AiDotNet.Tensors/commit/f72615b7bf131f6124a6fccad36755f4b320268e))
+
 ## [0.114.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.113.0...v0.114.0) (2026-07-11)
 
 
