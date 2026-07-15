@@ -17,12 +17,14 @@ public sealed class SpiralConvKernelSourceTests
     private const string HipConv = "AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels.HipConvolutionKernels";
     private const string OpenClConv = "AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.ConvolutionKernels";
     private const string MetalExt = "AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalExtendedConvKernels";
+    private const string VulkanExt = "AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanExtendedConvKernels";
 
     [Theory]
     [InlineData(CudaConv, "GetSource")]
     [InlineData(HipConv, "GetSource")]
     [InlineData(OpenClConv, "GetSource")]
     [InlineData(MetalExt, "Source")]
+    [InlineData(VulkanExt, "SpiralConv")]
     public void ForwardNeighbourGatherMatmul_MatchesAcrossBackends(string typeName, string memberName)
     {
         string source = GetStaticString(typeName, memberName);
@@ -35,6 +37,7 @@ public sealed class SpiralConvKernelSourceTests
     [InlineData(HipConv, "GetSource")]
     [InlineData(OpenClConv, "GetSource")]
     [InlineData(MetalExt, "Source")]
+    [InlineData(VulkanExt, "SpiralConvBackwardWeights")]
     public void BackwardWeightsGather_MatchesAcrossBackends(string typeName, string memberName)
     {
         string source = GetStaticString(typeName, memberName);

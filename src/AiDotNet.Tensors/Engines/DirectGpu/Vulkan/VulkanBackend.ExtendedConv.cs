@@ -5,8 +5,38 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 // it can run; the engine routes the rest to the CPU. GLSL kernels live in VulkanExtendedConvKernels;
 // this partial only wires the dispatch via GlslDispatchN (int params -> push constants; a float param is
 // passed as its raw bit pattern via the shared FloatBits helper and declared `float` in the push block).
-public sealed partial class VulkanBackend : ITrilinearInterpolationKernels, IConvTranspose3DKernels
+public sealed partial class VulkanBackend : ITrilinearInterpolationKernels, IConvTranspose3DKernels, ISpiralConvKernels
 {
+    public void SpiralConv(IGpuBuffer vertexFeatures, IGpuBuffer spiralIndices, IGpuBuffer weights,
+        IGpuBuffer biases, IGpuBuffer output, int v, int inC, int spiralLength, int outC)
+    {
+        int total = checked(v * outC);
+        if (total <= 0) return;
+        GlslDispatchN(VulkanExtendedConvKernels.SpiralConv, total,
+            [vertexFeatures, spiralIndices, weights, biases, output],
+            [(uint)v, (uint)inC, (uint)spiralLength, (uint)outC]);
+    }
+
+    public void SpiralConvBackwardInput(IGpuBuffer gradOutput, IGpuBuffer spiralIndices, IGpuBuffer weights,
+        IGpuBuffer gradVertexFeatures, int v, int inC, int spiralLength, int outC)
+    {
+        int total = checked(v * inC);
+        if (total <= 0) return;
+        GlslDispatchN(VulkanExtendedConvKernels.SpiralConvBackwardInput, total,
+            [gradOutput, spiralIndices, weights, gradVertexFeatures],
+            [(uint)v, (uint)inC, (uint)spiralLength, (uint)outC]);
+    }
+
+    public void SpiralConvBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer vertexFeatures, IGpuBuffer spiralIndices,
+        IGpuBuffer gradWeights, int v, int inC, int spiralLength, int outC)
+    {
+        int total = checked(outC * inC * spiralLength);
+        if (total <= 0) return;
+        GlslDispatchN(VulkanExtendedConvKernels.SpiralConvBackwardWeights, total,
+            [gradOutput, vertexFeatures, spiralIndices, gradWeights],
+            [(uint)v, (uint)inC, (uint)spiralLength, (uint)outC]);
+    }
+
     private static uint[] Conv3DPush(int n, int inC, int iD, int iH, int iW, int outC, int outD, int outH, int outW,
         int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW) =>
         [(uint)n, (uint)inC, (uint)iD, (uint)iH, (uint)iW, (uint)outC, (uint)outD, (uint)outH, (uint)outW,

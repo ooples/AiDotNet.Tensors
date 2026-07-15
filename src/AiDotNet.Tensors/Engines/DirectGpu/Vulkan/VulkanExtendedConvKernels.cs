@@ -177,4 +177,82 @@ void main() {
     }
     gradWeights[idx] = sum;
 }";
+
+    private const string SpiralParams =
+        "layout(push_constant) uniform PC { int V; int inC; int spiralLength; int outC; };";
+
+    public static readonly string SpiralConv = @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0,binding=0) readonly buffer VertexFeatures { float vertexFeatures[]; };
+layout(set=0,binding=1) readonly buffer SpiralIndices { int spiralIndices[]; };
+layout(set=0,binding=2) readonly buffer Weights { float weights[]; };
+layout(set=0,binding=3) readonly buffer Biases { float biases[]; };
+layout(set=0,binding=4) writeonly buffer Output { float output_[]; };
+" + SpiralParams + @"
+void main() {
+    int idx = int(gl_GlobalInvocationID.x);
+    if (idx >= V * outC) return;
+    int oc = idx % outC;
+    int v = idx / outC;
+    int gatheredSize = inC * spiralLength;
+    float sum = biases[oc];
+    for (int s = 0; s < spiralLength; s++) {
+        int neighborIdx = spiralIndices[v * spiralLength + s];
+        if (neighborIdx < 0 || neighborIdx >= V) continue;
+        int gatherOffset = s * inC;
+        for (int c = 0; c < inC; c++) {
+            sum += vertexFeatures[neighborIdx * inC + c] * weights[oc * gatheredSize + gatherOffset + c];
+        }
+    }
+    output_[idx] = sum;
+}";
+
+    public static readonly string SpiralConvBackwardInput = @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0,binding=0) readonly buffer GradOutput { float gradOutput[]; };
+layout(set=0,binding=1) readonly buffer SpiralIndices { int spiralIndices[]; };
+layout(set=0,binding=2) readonly buffer Weights { float weights[]; };
+layout(set=0,binding=3) writeonly buffer GradVertexFeatures { float gradVertexFeatures[]; };
+" + SpiralParams + @"
+void main() {
+    int idx = int(gl_GlobalInvocationID.x);
+    if (idx >= V * inC) return;
+    int ic = idx % inC;
+    int nbr = idx / inC;
+    int gatheredSize = inC * spiralLength;
+    float sum = 0.0;
+    for (int v = 0; v < V; v++) {
+        for (int s = 0; s < spiralLength; s++) {
+            if (spiralIndices[v * spiralLength + s] != nbr) continue;
+            for (int oc = 0; oc < outC; oc++) {
+                sum += gradOutput[v * outC + oc] * weights[oc * gatheredSize + s * inC + ic];
+            }
+        }
+    }
+    gradVertexFeatures[idx] = sum;
+}";
+
+    public static readonly string SpiralConvBackwardWeights = @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0,binding=0) readonly buffer GradOutput { float gradOutput[]; };
+layout(set=0,binding=1) readonly buffer VertexFeatures { float vertexFeatures[]; };
+layout(set=0,binding=2) readonly buffer SpiralIndices { int spiralIndices[]; };
+layout(set=0,binding=3) writeonly buffer GradWeights { float gradWeights[]; };
+" + SpiralParams + @"
+void main() {
+    int idx = int(gl_GlobalInvocationID.x);
+    int gatheredSize = inC * spiralLength;
+    if (idx >= outC * gatheredSize) return;
+    int g = idx % gatheredSize;
+    int oc = idx / gatheredSize;
+    int s = g / inC;
+    int ic = g % inC;
+    float sum = 0.0;
+    for (int v = 0; v < V; v++) {
+        int neighborIdx = spiralIndices[v * spiralLength + s];
+        if (neighborIdx < 0 || neighborIdx >= V) continue;
+        sum += gradOutput[v * outC + oc] * vertexFeatures[neighborIdx * inC + ic];
+    }
+    gradWeights[idx] = sum;
+}";
 }
