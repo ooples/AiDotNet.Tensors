@@ -37,7 +37,7 @@ public sealed class CrossBackendKernelCoverageTests
     // allowlist (each entry a verified same-op rename or a helper sub-kernel of a resident op). What
     // survives reconciliation is the GENUINE gap: an OpenCL kernel whose OP has no on-device CUDA/HIP path
     // under ANY name. This floor ratchets DOWN only — drive it to 0 by porting the kernel to CUDA+HIP.
-    private const int GenuineGapFloor = 3;
+    private const int GenuineGapFloor = 0;
 
     // OpenCL-specific plumbing CUDA/HIP cover via cuBLAS / cudaMemset — mirrored by design, never ported.
     private static readonly HashSet<string> OpenClOnlyByDesign = new(StringComparer.Ordinal)
@@ -75,6 +75,9 @@ public sealed class CrossBackendKernelCoverageTests
         "accumulate_gradient_fp32",                            // helpers of resident fft/reduce/elementwise/optimizer
         "normalize_overlap_add", "bit_reverse_cols", "bit_reverse_rows", // helpers of resident istft/fft
         "cosine_similarity_gradient",                          // -> cosine_similarity (backward composes)
+        "embedding_lookup",                                    // -> CUDA/HIP backend.Embedding launches embedding_forward
+        "sddmm_collab",                                        // -> CUDA CsrSddmm resident via 'sddmm'; _collab is an
+                                                               // OpenCL-specific collaborative-tiling perf variant
     };
 
     // OpenCL kernels registered in GetKernelNames() but launched from NOWHERE (referenced only in their own
@@ -85,6 +88,7 @@ public sealed class CrossBackendKernelCoverageTests
     {
         "create_hann_window", "create_hamming_window",  // CreateWindow composes (TensorLinspace+cos+scalar ops); unused
         "dice_gradient", "jaccard_gradient",            // no DiceLoss/JaccardLoss IEngine op dispatches these (unused)
+        "compute_sparsity_ratio",                       // referenced only in SparseGemmKernels.cs (unused)
     };
 
     /// <summary>Reduce a kernel name to a convention-independent token set so an OpenCL name and its
