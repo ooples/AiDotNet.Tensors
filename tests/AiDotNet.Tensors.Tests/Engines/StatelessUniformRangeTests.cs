@@ -1,4 +1,5 @@
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Tests.TestHelpers;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines;
@@ -16,7 +17,7 @@ public sealed class StatelessUniformRangeTests
         for (int i = 0; i < large.Length; i++)
         {
             Assert.Equal(large[i], (float)oracle[i]);
-            Assert.InRange(large[i], 0f, float.BitDecrement(1f));
+            Assert.InRange(large[i], 0f, MathCompat.BitDecrement(1f));
             if (i < small.Length)
                 Assert.Equal(small[i], large[i]);
         }
@@ -32,7 +33,7 @@ public sealed class StatelessUniformRangeTests
 
         Assert.Equal(first, repeat);
         Assert.NotEqual(first, different);
-        Assert.All(first, value => Assert.InRange(value, -3.25f, float.BitDecrement(7.5f)));
+        Assert.All(first, value => Assert.InRange(value, -3.25f, MathCompat.BitDecrement(7.5f)));
     }
 
     [Fact]

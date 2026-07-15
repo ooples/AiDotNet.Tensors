@@ -9,6 +9,7 @@ using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Tests.TestHelpers;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -137,8 +138,8 @@ public class GpuCpuConsistencyTests
         for (int i = 0; i < expected.Length; i++)
         {
             Assert.Equal(
-                BitConverter.SingleToInt32Bits(expected[i]),
-                BitConverter.SingleToInt32Bits(actual[i]));
+                MathCompat.SingleToInt32Bits(expected[i]),
+                MathCompat.SingleToInt32Bits(actual[i]));
         }
     }
 
@@ -170,8 +171,8 @@ public class GpuCpuConsistencyTests
         {
             float expectedOutput = inputValues[i] >= 0.0f ? inputValues[i] : slope * inputValues[i];
             float expectedGradient = inputValues[i] >= 0.0f ? 1.0f : slope;
-            Assert.Equal(BitConverter.SingleToInt32Bits(expectedOutput), BitConverter.SingleToInt32Bits(actualOutput[i]));
-            Assert.Equal(BitConverter.SingleToInt32Bits(expectedGradient), BitConverter.SingleToInt32Bits(actualGradient[i]));
+            Assert.Equal(MathCompat.SingleToInt32Bits(expectedOutput), MathCompat.SingleToInt32Bits(actualOutput[i]));
+            Assert.Equal(MathCompat.SingleToInt32Bits(expectedGradient), MathCompat.SingleToInt32Bits(actualGradient[i]));
         }
     }
 
