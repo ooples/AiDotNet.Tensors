@@ -278,6 +278,72 @@ struct PA{batch:i32,channels:i32,inHeight:i32,inWidth:i32,outHeight:i32,outWidth
     gradKernel[idx]=sum;
 }";
 
+    private const string DepthwiseStruct =
+        "struct PD{N:i32,inC:i32,H:i32,W:i32,M:i32,outH:i32,outW:i32,kH:i32,kW:i32,strideH:i32,strideW:i32,padH:i32,padW:i32,pad0:i32,pad1:i32,pad2:i32};";
+
+    public static readonly string DepthwiseConv2DBackwardInput = @"
+@group(0) @binding(0) var<storage,read> gradOutput:array<f32>;
+@group(0) @binding(1) var<storage,read> weights:array<f32>;
+@group(0) @binding(2) var<storage,read_write> gradInput:array<f32>;
+" + DepthwiseStruct + @"
+@group(0) @binding(3) var<uniform> pm:PD;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid_:vec3<u32>){
+    let idx=i32(gid_.x);
+    if(idx>=pm.N*pm.inC*pm.H*pm.W){return;}
+    let iw=idx%pm.W;
+    let ih=(idx/pm.W)%pm.H;
+    let ic=(idx/(pm.W*pm.H))%pm.inC;
+    let b=idx/(pm.W*pm.H*pm.inC);
+    let outC=pm.inC*pm.M;
+    var sum=0.0;
+    for(var m=0;m<pm.M;m=m+1){
+        let oc=ic*pm.M+m;
+        for(var kh=0;kh<pm.kH;kh=kh+1){
+            let t=ih+pm.padH-kh;
+            if(t<0||(t%pm.strideH)!=0){continue;}
+            let oh=t/pm.strideH;
+            if(oh<0||oh>=pm.outH){continue;}
+            for(var kw=0;kw<pm.kW;kw=kw+1){
+                let tw=iw+pm.padW-kw;
+                if(tw<0||(tw%pm.strideW)!=0){continue;}
+                let ow=tw/pm.strideW;
+                if(ow<0||ow>=pm.outW){continue;}
+                sum=sum+weights[(oc*pm.kH+kh)*pm.kW+kw]*gradOutput[((b*outC+oc)*pm.outH+oh)*pm.outW+ow];
+            }
+        }
+    }
+    gradInput[idx]=sum;
+}";
+
+    public static readonly string DepthwiseConv2DBackwardWeights = @"
+@group(0) @binding(0) var<storage,read> gradOutput:array<f32>;
+@group(0) @binding(1) var<storage,read> input_:array<f32>;
+@group(0) @binding(2) var<storage,read_write> gradKernel:array<f32>;
+" + DepthwiseStruct + @"
+@group(0) @binding(3) var<uniform> pm:PD;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid_:vec3<u32>){
+    let idx=i32(gid_.x);
+    let outC=pm.inC*pm.M;
+    if(idx>=outC*pm.kH*pm.kW){return;}
+    let kw=idx%pm.kW;
+    let kh=(idx/pm.kW)%pm.kH;
+    let oc=idx/(pm.kW*pm.kH);
+    let ic=oc/pm.M;
+    var sum=0.0;
+    for(var b=0;b<pm.N;b=b+1){
+        for(var oh=0;oh<pm.outH;oh=oh+1){
+            let ih=oh*pm.strideH-pm.padH+kh;
+            if(ih<0||ih>=pm.H){continue;}
+            for(var ow=0;ow<pm.outW;ow=ow+1){
+                let iw=ow*pm.strideW-pm.padW+kw;
+                if(iw<0||iw>=pm.W){continue;}
+                sum=sum+input_[((b*pm.inC+ic)*pm.H+ih)*pm.W+iw]*gradOutput[((b*outC+oc)*pm.outH+oh)*pm.outW+ow];
+            }
+        }
+    }
+    gradKernel[idx]=sum;
+}";
+
     private const string SpiralStruct = "struct PS{V:i32,inC:i32,spiralLength:i32,outC:i32};";
 
     public static readonly string SpiralConv = @"

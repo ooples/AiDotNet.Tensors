@@ -10,9 +10,38 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 // uniform block (ints reinterpreted as their float bit pattern, floats stored directly, padded to a
 // 16-byte multiple to satisfy WGSL uniform alignment).
 public sealed partial class WebGpuBackend : ITrilinearInterpolationKernels, IConvTranspose3DKernels, ISpiralConvKernels,
-    IAdaptiveMaxPool2DKernels, IConv3DBackwardKernels
+    IAdaptiveMaxPool2DKernels, IConv3DBackwardKernels, IDepthwiseConv2DBackwardKernels
 {
     private static float Bits(int value) => BitConverter.Int32BitsToSingle(value);
+
+    private static float[] DepthwiseUniforms(int n, int inC, int h, int w, int m, int outH, int outW,
+        int kH, int kW, int strideH, int strideW, int padH, int padW) =>
+        [Bits(n), Bits(inC), Bits(h), Bits(w), Bits(m), Bits(outH), Bits(outW),
+         Bits(kH), Bits(kW), Bits(strideH), Bits(strideW), Bits(padH), Bits(padW), 0f, 0f, 0f];
+
+    public void DepthwiseConv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
+        int n, int inC, int h, int w, int m, int outH, int outW, int kH, int kW,
+        int strideH, int strideW, int padH, int padW)
+    {
+        int total = checked(n * inC * h * w);
+        if (total <= 0) return;
+        Dispatch3BufferAsync("ExtDepthwiseBwdIn", WebGpuExtendedConvKernels.DepthwiseConv2DBackwardInput, "main",
+            gradOutput, kernel, gradInput,
+            DepthwiseUniforms(n, inC, h, w, m, outH, outW, kH, kW, strideH, strideW, padH, padW),
+            total).GetAwaiter().GetResult();
+    }
+
+    public void DepthwiseConv2DBackwardKernel(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradKernel,
+        int n, int inC, int h, int w, int m, int outH, int outW, int kH, int kW,
+        int strideH, int strideW, int padH, int padW)
+    {
+        int total = checked(inC * m * kH * kW);
+        if (total <= 0) return;
+        Dispatch3BufferAsync("ExtDepthwiseBwdW", WebGpuExtendedConvKernels.DepthwiseConv2DBackwardWeights, "main",
+            gradOutput, input, gradKernel,
+            DepthwiseUniforms(n, inC, h, w, m, outH, outW, kH, kW, strideH, strideW, padH, padW),
+            total).GetAwaiter().GetResult();
+    }
 
     public void Conv3DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer weights, IGpuBuffer gradInput,
         int n, int inC, int inD, int inH, int inW, int outC, int outD, int outH, int outW,
