@@ -615,48 +615,6 @@ __kernel void cosine_similarity_gradient(
 }
 
 // ---------------------------------------------------------------------------
-// Dice Loss
-// ---------------------------------------------------------------------------
-__kernel void dice_gradient(
-    __global const float* predicted,
-    __global const float* actual,
-    __global float* gradient,
-    const float intersection,
-    const float pred_sum,
-    const float actual_sum,
-    const float smooth,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-    
-    float denom = pred_sum + actual_sum + smooth;
-    float numer = 2.0f * intersection + smooth;
-    gradient[idx] = -2.0f * (actual[idx] * denom - numer) / (denom * denom);
-}
-
-// ---------------------------------------------------------------------------
-// Jaccard Loss
-// ---------------------------------------------------------------------------
-__kernel void jaccard_gradient(
-    __global const float* predicted,
-    __global const float* actual,
-    __global float* gradient,
-    const float intersection,
-    const float union_sum,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-    
-    // Add epsilon guard to prevent division by zero when union_sum is near zero
-    const float EPSILON = 1e-7f;
-    float safe_union = fmax(union_sum, EPSILON);
-    float denom = safe_union * safe_union;
-    gradient[idx] = -(actual[idx] * safe_union - intersection * (1.0f - actual[idx])) / denom;
-}
-
-// ---------------------------------------------------------------------------
 // Poisson Loss
 // ---------------------------------------------------------------------------
 __kernel void poisson_loss(
@@ -967,10 +925,6 @@ __kernel void elastic_net_gradient(
             "squared_hinge_loss", "squared_hinge_gradient",
             // Cosine Similarity Loss
             "cosine_similarity_gradient",
-            // Dice Loss
-            "dice_gradient",
-            // Jaccard Loss
-            "jaccard_gradient",
             // Poisson Loss
             "poisson_loss", "poisson_gradient",
             // Exponential Loss

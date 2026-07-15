@@ -80,16 +80,9 @@ public sealed class CrossBackendKernelCoverageTests
                                                                // OpenCL-specific collaborative-tiling perf variant
     };
 
-    // OpenCL kernels registered in GetKernelNames() but launched from NOWHERE (referenced only in their own
-    // *Kernels.cs) — dead/legacy code, not a residency gap. Either the op composes from resident primitives
-    // or no IEngine op dispatches them at all. Porting them to CUDA would just add dead kernels. (A cleaner
-    // future cleanup is to delete these from the OpenCL registry; until then they are reconciled here.)
-    private static readonly HashSet<string> UnusedLegacyOpenClKernels = new(StringComparer.Ordinal)
-    {
-        "create_hann_window", "create_hamming_window",  // CreateWindow composes (TensorLinspace+cos+scalar ops); unused
-        "dice_gradient", "jaccard_gradient",            // no DiceLoss/JaccardLoss IEngine op dispatches these (unused)
-        "compute_sparsity_ratio",                       // referenced only in SparseGemmKernels.cs (unused)
-    };
+    // (Five dead OpenCL kernels that used to be reconciled here — create_hann_window, create_hamming_window,
+    // dice_gradient, jaccard_gradient, compute_sparsity_ratio — were deleted outright from the OpenCL
+    // registry, so they no longer appear in the raw diff and need no allowlist entry.)
 
     /// <summary>Reduce a kernel name to a convention-independent token set so an OpenCL name and its
     /// CUDA/HIP twin (different prefix/suffix/word-order) normalize to the same value. Strips the
@@ -137,8 +130,7 @@ public sealed class CrossBackendKernelCoverageTests
             return mirrorNorm.Any(k => k.SetEquals(nm) || nm.IsSubsetOf(k));
         }
         bool Reconciled(string name) =>
-            OpenClOnlyByDesign.Contains(name) || CoveredUnderDifferentName.Contains(name)
-            || UnusedLegacyOpenClKernels.Contains(name) || CoveredByShape(name);
+            OpenClOnlyByDesign.Contains(name) || CoveredUnderDifferentName.Contains(name) || CoveredByShape(name);
 
         // Genuine gaps = OpenCL kernels present in neither CUDA nor HIP whose op has no on-device twin.
         var genuine = ocl.Except(cuda).Union(ocl.Except(hip))

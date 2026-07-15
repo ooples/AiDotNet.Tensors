@@ -387,28 +387,6 @@ __kernel void normalize_overlap_add(
     output[i] /= windowSum[i];
 }
 
-// Create Hann window
-__kernel void create_hann_window(
-    __global float* window,
-    const int length)
-{
-    int i = get_global_id(0);
-    if (i >= length) return;
-
-    window[i] = 0.5f * (1.0f - cos(2.0f * 3.14159265358979323846f * i / (length - 1)));
-}
-
-// Create Hamming window
-__kernel void create_hamming_window(
-    __global float* window,
-    const int length)
-{
-    int i = get_global_id(0);
-    if (i >= length) return;
-
-    window[i] = 0.54f - 0.46f * cos(2.0f * 3.14159265358979323846f * i / (length - 1));
-}
-
 // 2D FFT: row-wise FFT followed by column-wise FFT
 // This kernel handles row-wise processing
 __kernel void fft_rows_butterfly(
@@ -585,8 +563,6 @@ __kernel void bit_reverse_cols(
         "db_to_power",
         "overlap_add",
         "normalize_overlap_add",
-        "create_hann_window",
-        "create_hamming_window",
         "fft_rows_butterfly",
         "fft_cols_butterfly",
         "bit_reverse_rows",
