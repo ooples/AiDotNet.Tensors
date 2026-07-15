@@ -5,9 +5,99 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 // engine routes the rest to the CPU. MSL kernels live in the ExtendedConv library
 // (MetalExtendedConvKernels); this partial only wires the dispatch.
 public sealed partial class MetalBackend : ITrilinearInterpolationKernels, IConvTranspose3DKernels, ISpiralConvKernels,
-    IAdaptiveMaxPool2DKernels, IConv3DBackwardKernels, IDepthwiseConv2DBackwardKernels
+    IAdaptiveMaxPool2DKernels, IConv3DBackwardKernels, IDepthwiseConv2DBackwardKernels, IPool3DKernels, IGaussianSplatKernels
 {
     private const string ExtendedConvLibName = "ExtendedConv";
+
+    public void AvgPool3D(IGpuBuffer input, IGpuBuffer output,
+        int batch, int channels, int inDepth, int inHeight, int inWidth,
+        int outDepth, int outHeight, int outWidth,
+        int kernelD, int kernelH, int kernelW,
+        int strideD, int strideH, int strideW, int countIncludePad) =>
+        DispatchPool3D("avgpool3d", checked(batch * channels * outDepth * outHeight * outWidth),
+            input, output, batch, channels, inDepth, inHeight, inWidth, outDepth, outHeight, outWidth,
+            kernelD, kernelH, kernelW, strideD, strideH, strideW, countIncludePad);
+
+    public void AvgPool3DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput,
+        int batch, int channels, int inDepth, int inHeight, int inWidth,
+        int outDepth, int outHeight, int outWidth,
+        int kernelD, int kernelH, int kernelW,
+        int strideD, int strideH, int strideW, int countIncludePad) =>
+        DispatchPool3D("avgpool3d_backward", checked(batch * channels * inDepth * inHeight * inWidth),
+            gradOutput, gradInput, batch, channels, inDepth, inHeight, inWidth, outDepth, outHeight, outWidth,
+            kernelD, kernelH, kernelW, strideD, strideH, strideW, countIncludePad);
+
+    private void DispatchPool3D(string name, int total, IGpuBuffer a, IGpuBuffer b,
+        int batch, int channels, int inDepth, int inHeight, int inWidth,
+        int outDepth, int outHeight, int outWidth,
+        int kernelD, int kernelH, int kernelW,
+        int strideD, int strideH, int strideW, int countIncludePad)
+    {
+        if (total <= 0) return;
+        var pipeline = GetPipeline(ExtendedConvLibName, _extendedConvLibrary, name);
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(total);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer((MetalGpuBuffer)a, 0);
+        encoder.SetBuffer((MetalGpuBuffer)b, 1);
+        encoder.SetBytes(batch, 2); encoder.SetBytes(channels, 3);
+        encoder.SetBytes(inDepth, 4); encoder.SetBytes(inHeight, 5); encoder.SetBytes(inWidth, 6);
+        encoder.SetBytes(outDepth, 7); encoder.SetBytes(outHeight, 8); encoder.SetBytes(outWidth, 9);
+        encoder.SetBytes(kernelD, 10); encoder.SetBytes(kernelH, 11); encoder.SetBytes(kernelW, 12);
+        encoder.SetBytes(strideD, 13); encoder.SetBytes(strideH, 14); encoder.SetBytes(strideW, 15);
+        encoder.SetBytes(countIncludePad, 16);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
+    public void GaussianCovariance(IGpuBuffer rotations, IGpuBuffer scales, IGpuBuffer covariances, int numGaussians)
+    {
+        if (numGaussians <= 0) return;
+        var pipeline = GetPipeline(ExtendedConvLibName, _extendedConvLibrary, "gaussian_covariance");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(numGaussians);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer((MetalGpuBuffer)rotations, 0);
+        encoder.SetBuffer((MetalGpuBuffer)scales, 1);
+        encoder.SetBuffer((MetalGpuBuffer)covariances, 2);
+        encoder.SetBytes(numGaussians, 3);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
+    public void SphericalHarmonics(IGpuBuffer shCoefficients, IGpuBuffer viewDirections, IGpuBuffer output,
+        int numPoints, int basisCount, int numChannels, int degree, int broadcastDir)
+    {
+        int total = checked(numPoints * numChannels);
+        if (total <= 0) return;
+        var pipeline = GetPipeline(ExtendedConvLibName, _extendedConvLibrary, "spherical_harmonics");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(total);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer((MetalGpuBuffer)shCoefficients, 0);
+        encoder.SetBuffer((MetalGpuBuffer)viewDirections, 1);
+        encoder.SetBuffer((MetalGpuBuffer)output, 2);
+        encoder.SetBytes(numPoints, 3); encoder.SetBytes(basisCount, 4);
+        encoder.SetBytes(numChannels, 5); encoder.SetBytes(degree, 6); encoder.SetBytes(broadcastDir, 7);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
+    public void SphericalHarmonicsBackward(IGpuBuffer shCoefficients, IGpuBuffer viewDirections,
+        IGpuBuffer outputGradient, IGpuBuffer shGrad,
+        int numPoints, int basisCount, int numChannels, int degree, int broadcastDir)
+    {
+        int total = checked(numPoints * basisCount * numChannels);
+        if (total <= 0) return;
+        var pipeline = GetPipeline(ExtendedConvLibName, _extendedConvLibrary, "spherical_harmonics_backward");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(total);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer((MetalGpuBuffer)shCoefficients, 0);
+        encoder.SetBuffer((MetalGpuBuffer)viewDirections, 1);
+        encoder.SetBuffer((MetalGpuBuffer)outputGradient, 2);
+        encoder.SetBuffer((MetalGpuBuffer)shGrad, 3);
+        encoder.SetBytes(numPoints, 4); encoder.SetBytes(basisCount, 5);
+        encoder.SetBytes(numChannels, 6); encoder.SetBytes(degree, 7); encoder.SetBytes(broadcastDir, 8);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
 
     public void AdaptiveMaxPool2D(IGpuBuffer input, IGpuBuffer output,
         int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)

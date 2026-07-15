@@ -16,6 +16,7 @@ public sealed class AvgPool3dKernelSourceTests
     private const string CudaPool = "AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels.CudaPoolingKernels";
     private const string HipPool = "AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels.HipPoolingKernels";
     private const string OpenClPool = "AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.PoolingKernels";
+    private const string MetalExt = "AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalExtendedConvKernels";
 
     [Theory]
     [InlineData(CudaPool)]
@@ -30,12 +31,13 @@ public sealed class AvgPool3dKernelSourceTests
 
     // The count-include-pad divisor branch is present in every backend's avgpool3d source.
     [Theory]
-    [InlineData(CudaPool)]
-    [InlineData(HipPool)]
-    [InlineData(OpenClPool)]
-    public void CountIncludePadDivisor_IsPresentAcrossBackends(string typeName)
+    [InlineData(CudaPool, "GetSource")]
+    [InlineData(HipPool, "GetSource")]
+    [InlineData(OpenClPool, "GetSource")]
+    [InlineData(MetalExt, "Source")]
+    public void CountIncludePadDivisor_IsPresentAcrossBackends(string typeName, string memberName)
     {
-        string source = GetStaticString(typeName, "GetSource");
+        string source = GetStaticString(typeName, memberName);
         Assert.Contains("countIncludePad", source, StringComparison.Ordinal);
     }
 
@@ -52,8 +54,12 @@ public sealed class AvgPool3dKernelSourceTests
         Type type = typeof(DirectGpuTensorEngine).Assembly.GetType(typeName)
             ?? throw new InvalidOperationException($"Kernel source type not found: {typeName}");
         const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static;
-        MethodInfo method = type.GetMethod(memberName, flags)
-            ?? throw new InvalidOperationException($"Static method not found: {typeName}.{memberName}");
-        return method.Invoke(null, null);
+        MethodInfo? method = type.GetMethod(memberName, flags, binder: null, Type.EmptyTypes, modifiers: null);
+        if (method is not null) return method.Invoke(null, null);
+        FieldInfo? field = type.GetField(memberName, flags);
+        if (field is not null) return field.GetValue(null);
+        PropertyInfo? property = type.GetProperty(memberName, flags);
+        if (property is not null) return property.GetValue(null);
+        throw new InvalidOperationException($"Static member not found: {typeName}.{memberName}");
     }
 }
