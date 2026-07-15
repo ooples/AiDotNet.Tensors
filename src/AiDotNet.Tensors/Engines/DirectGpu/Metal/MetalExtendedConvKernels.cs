@@ -204,5 +204,83 @@ kernel void conv_transpose3d_backward_weights(
     }
     gradWeights[idx] = sum;
 }
+
+kernel void spiral_conv(
+    device const float* vertexFeatures [[buffer(0)]],
+    device const int* spiralIndices [[buffer(1)]],
+    device const float* weights [[buffer(2)]],
+    device const float* biases [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant int& V [[buffer(5)]], constant int& inC [[buffer(6)]],
+    constant int& spiralLength [[buffer(7)]], constant int& outC [[buffer(8)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int idx = int(gid);
+    if (idx >= V * outC) return;
+    int oc = idx % outC;
+    int v = idx / outC;
+    int gatheredSize = inC * spiralLength;
+    float sum = biases[oc];
+    for (int s = 0; s < spiralLength; s++) {
+        int neighborIdx = spiralIndices[v * spiralLength + s];
+        if (neighborIdx < 0 || neighborIdx >= V) continue;
+        int gatherOffset = s * inC;
+        for (int c = 0; c < inC; c++) {
+            sum += vertexFeatures[neighborIdx * inC + c] * weights[oc * gatheredSize + gatherOffset + c];
+        }
+    }
+    output[idx] = sum;
+}
+
+kernel void spiral_conv_backward_input(
+    device const float* gradOutput [[buffer(0)]],
+    device const int* spiralIndices [[buffer(1)]],
+    device const float* weights [[buffer(2)]],
+    device float* gradVertexFeatures [[buffer(3)]],
+    constant int& V [[buffer(4)]], constant int& inC [[buffer(5)]],
+    constant int& spiralLength [[buffer(6)]], constant int& outC [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int idx = int(gid);
+    if (idx >= V * inC) return;
+    int ic = idx % inC;
+    int nbr = idx / inC;
+    int gatheredSize = inC * spiralLength;
+    float sum = 0.0f;
+    for (int v = 0; v < V; v++) {
+        for (int s = 0; s < spiralLength; s++) {
+            if (spiralIndices[v * spiralLength + s] != nbr) continue;
+            for (int oc = 0; oc < outC; oc++) {
+                sum += gradOutput[v * outC + oc] * weights[oc * gatheredSize + s * inC + ic];
+            }
+        }
+    }
+    gradVertexFeatures[idx] = sum;
+}
+
+kernel void spiral_conv_backward_weights(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* vertexFeatures [[buffer(1)]],
+    device const int* spiralIndices [[buffer(2)]],
+    device float* gradWeights [[buffer(3)]],
+    constant int& V [[buffer(4)]], constant int& inC [[buffer(5)]],
+    constant int& spiralLength [[buffer(6)]], constant int& outC [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int idx = int(gid);
+    int gatheredSize = inC * spiralLength;
+    if (idx >= outC * gatheredSize) return;
+    int g = idx % gatheredSize;
+    int oc = idx / gatheredSize;
+    int s = g / inC;
+    int ic = g % inC;
+    float sum = 0.0f;
+    for (int v = 0; v < V; v++) {
+        int neighborIdx = spiralIndices[v * spiralLength + s];
+        if (neighborIdx < 0 || neighborIdx >= V) continue;
+        sum += gradOutput[v * outC + oc] * vertexFeatures[neighborIdx * inC + ic];
+    }
+    gradWeights[idx] = sum;
+}
 ";
 }

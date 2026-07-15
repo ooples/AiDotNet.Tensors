@@ -4,9 +4,54 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 // (interface + kernels) so a partially-ported backend opts into exactly the families it can run; the
 // engine routes the rest to the CPU. MSL kernels live in the ExtendedConv library
 // (MetalExtendedConvKernels); this partial only wires the dispatch.
-public sealed partial class MetalBackend : ITrilinearInterpolationKernels, IConvTranspose3DKernels
+public sealed partial class MetalBackend : ITrilinearInterpolationKernels, IConvTranspose3DKernels, ISpiralConvKernels
 {
     private const string ExtendedConvLibName = "ExtendedConv";
+
+    public void SpiralConv(IGpuBuffer vertexFeatures, IGpuBuffer spiralIndices, IGpuBuffer weights,
+        IGpuBuffer biases, IGpuBuffer output, int v, int inC, int spiralLength, int outC)
+    {
+        int total = checked(v * outC);
+        if (total <= 0) return;
+        var pipeline = GetPipeline(ExtendedConvLibName, _extendedConvLibrary, "spiral_conv");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(total);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer((MetalGpuBuffer)vertexFeatures, 0);
+        encoder.SetBuffer((MetalGpuBuffer)spiralIndices, 1);
+        encoder.SetBuffer((MetalGpuBuffer)weights, 2);
+        encoder.SetBuffer((MetalGpuBuffer)biases, 3);
+        encoder.SetBuffer((MetalGpuBuffer)output, 4);
+        encoder.SetBytes(v, 5); encoder.SetBytes(inC, 6); encoder.SetBytes(spiralLength, 7); encoder.SetBytes(outC, 8);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
+    public void SpiralConvBackwardInput(IGpuBuffer gradOutput, IGpuBuffer spiralIndices, IGpuBuffer weights,
+        IGpuBuffer gradVertexFeatures, int v, int inC, int spiralLength, int outC) =>
+        DispatchSpiral4("spiral_conv_backward_input", checked(v * inC),
+            gradOutput, spiralIndices, weights, gradVertexFeatures, v, inC, spiralLength, outC);
+
+    public void SpiralConvBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer vertexFeatures, IGpuBuffer spiralIndices,
+        IGpuBuffer gradWeights, int v, int inC, int spiralLength, int outC) =>
+        DispatchSpiral4("spiral_conv_backward_weights", checked(outC * inC * spiralLength),
+            gradOutput, vertexFeatures, spiralIndices, gradWeights, v, inC, spiralLength, outC);
+
+    private void DispatchSpiral4(string name, int total,
+        IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, IGpuBuffer d,
+        int v, int inC, int spiralLength, int outC)
+    {
+        if (total <= 0) return;
+        var pipeline = GetPipeline(ExtendedConvLibName, _extendedConvLibrary, name);
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(total);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer((MetalGpuBuffer)a, 0);
+        encoder.SetBuffer((MetalGpuBuffer)b, 1);
+        encoder.SetBuffer((MetalGpuBuffer)c, 2);
+        encoder.SetBuffer((MetalGpuBuffer)d, 3);
+        encoder.SetBytes(v, 4); encoder.SetBytes(inC, 5); encoder.SetBytes(spiralLength, 6); encoder.SetBytes(outC, 7);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
 
     public void ConvTranspose3D(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer output,
         int n, int inC, int iD, int iH, int iW, int outC, int outD, int outH, int outW,
