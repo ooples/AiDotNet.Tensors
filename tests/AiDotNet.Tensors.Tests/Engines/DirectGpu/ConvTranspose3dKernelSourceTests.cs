@@ -17,13 +17,15 @@ public sealed class ConvTranspose3dKernelSourceTests
     private const string HipConv = "AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels.HipConvolutionKernels";
     private const string OpenClConv = "AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.ConvolutionKernels";
     private const string MetalExt = "AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalExtendedConvKernels";
+    private const string VulkanExt = "AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanExtendedConvKernels";
 
-    // The weight index expression is byte-identical in every backend (forward + input backward share it).
+    // The weight index expression is byte-identical in every backend (pure index — C/MSL/GLSL agree).
     [Theory]
     [InlineData(CudaConv, "GetSource")]
     [InlineData(HipConv, "GetSource")]
     [InlineData(OpenClConv, "GetSource")]
     [InlineData(MetalExt, "Source")]
+    [InlineData(VulkanExt, "ConvTranspose3D")]
     public void WeightIndexExpression_MatchesAcrossBackends(string typeName, string memberName)
     {
         string source = GetStaticString(typeName, memberName);
@@ -36,6 +38,7 @@ public sealed class ConvTranspose3dKernelSourceTests
     [InlineData(HipConv, "GetSource")]
     [InlineData(OpenClConv, "GetSource")]
     [InlineData(MetalExt, "Source")]
+    [InlineData(VulkanExt, "ConvTranspose3D")]
     public void ForwardTransposeStrideTest_MatchesAcrossBackends(string typeName, string memberName)
     {
         string source = GetStaticString(typeName, memberName);

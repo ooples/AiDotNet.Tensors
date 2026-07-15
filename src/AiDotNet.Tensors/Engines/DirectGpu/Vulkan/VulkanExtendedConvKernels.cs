@@ -66,4 +66,115 @@ void main() {
     }
     gradGrid[idx] = sum;
 }";
+
+    private const string ConvT3DParams =
+        "layout(push_constant) uniform PC { int N; int inC; int iD; int iH; int iW; int outC; int outD; int outH; int outW; int kD; int kH; int kW; int strideD; int strideH; int strideW; int padD; int padH; int padW; };";
+
+    public static readonly string ConvTranspose3D = @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0,binding=0) readonly buffer Input { float input_[]; };
+layout(set=0,binding=1) readonly buffer Weights { float weights[]; };
+layout(set=0,binding=2) writeonly buffer Output { float output_[]; };
+" + ConvT3DParams + @"
+void main() {
+    int idx = int(gl_GlobalInvocationID.x);
+    if (idx >= N * outC * outD * outH * outW) return;
+    int ow = idx % outW;
+    int oh = (idx / outW) % outH;
+    int od = (idx / (outW * outH)) % outD;
+    int oc = (idx / (outW * outH * outD)) % outC;
+    int n = idx / (outW * outH * outD * outC);
+    float sum = 0.0;
+    for (int kd = 0; kd < kD; kd++) {
+        int td = od + padD - kd;
+        if (td < 0 || (td % strideD) != 0) continue;
+        int id = td / strideD;
+        if (id < 0 || id >= iD) continue;
+        for (int kh = 0; kh < kH; kh++) {
+            int th = oh + padH - kh;
+            if (th < 0 || (th % strideH) != 0) continue;
+            int ih = th / strideH;
+            if (ih < 0 || ih >= iH) continue;
+            for (int kw = 0; kw < kW; kw++) {
+                int tw = ow + padW - kw;
+                if (tw < 0 || (tw % strideW) != 0) continue;
+                int iw = tw / strideW;
+                if (iw < 0 || iw >= iW) continue;
+                for (int ic = 0; ic < inC; ic++) {
+                    sum += input_[(((n * inC + ic) * iD + id) * iH + ih) * iW + iw]
+                         * weights[((((ic * outC + oc) * kD + kd) * kH + kh) * kW + kw)];
+                }
+            }
+        }
+    }
+    output_[idx] = sum;
+}";
+
+    public static readonly string ConvTranspose3DBackwardInput = @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0,binding=0) readonly buffer GradOutput { float gradOutput[]; };
+layout(set=0,binding=1) readonly buffer Weights { float weights[]; };
+layout(set=0,binding=2) writeonly buffer GradInput { float gradInput[]; };
+" + ConvT3DParams + @"
+void main() {
+    int idx = int(gl_GlobalInvocationID.x);
+    if (idx >= N * inC * iD * iH * iW) return;
+    int iw = idx % iW;
+    int ih = (idx / iW) % iH;
+    int id = (idx / (iW * iH)) % iD;
+    int ic = (idx / (iW * iH * iD)) % inC;
+    int n = idx / (iW * iH * iD * inC);
+    float sum = 0.0;
+    for (int kd = 0; kd < kD; kd++) {
+        int od = id * strideD - padD + kd;
+        if (od < 0 || od >= outD) continue;
+        for (int kh = 0; kh < kH; kh++) {
+            int oh = ih * strideH - padH + kh;
+            if (oh < 0 || oh >= outH) continue;
+            for (int kw = 0; kw < kW; kw++) {
+                int ow = iw * strideW - padW + kw;
+                if (ow < 0 || ow >= outW) continue;
+                for (int oc = 0; oc < outC; oc++) {
+                    sum += gradOutput[(((n * outC + oc) * outD + od) * outH + oh) * outW + ow]
+                         * weights[((((ic * outC + oc) * kD + kd) * kH + kh) * kW + kw)];
+                }
+            }
+        }
+    }
+    gradInput[idx] = sum;
+}";
+
+    public static readonly string ConvTranspose3DBackwardWeights = @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0,binding=0) readonly buffer GradOutput { float gradOutput[]; };
+layout(set=0,binding=1) readonly buffer Input { float input_[]; };
+layout(set=0,binding=2) writeonly buffer GradWeights { float gradWeights[]; };
+" + ConvT3DParams + @"
+void main() {
+    int idx = int(gl_GlobalInvocationID.x);
+    if (idx >= inC * outC * kD * kH * kW) return;
+    int kw = idx % kW;
+    int kh = (idx / kW) % kH;
+    int kd = (idx / (kW * kH)) % kD;
+    int oc = (idx / (kW * kH * kD)) % outC;
+    int ic = idx / (kW * kH * kD * outC);
+    float sum = 0.0;
+    for (int n = 0; n < N; n++) {
+        for (int id = 0; id < iD; id++) {
+            int od = id * strideD - padD + kd;
+            if (od < 0 || od >= outD) continue;
+            for (int ih = 0; ih < iH; ih++) {
+                int oh = ih * strideH - padH + kh;
+                if (oh < 0 || oh >= outH) continue;
+                for (int iw = 0; iw < iW; iw++) {
+                    int ow = iw * strideW - padW + kw;
+                    if (ow < 0 || ow >= outW) continue;
+                    sum += input_[(((n * inC + ic) * iD + id) * iH + ih) * iW + iw]
+                         * gradOutput[(((n * outC + oc) * outD + od) * outH + oh) * outW + ow];
+                }
+            }
+        }
+    }
+    gradWeights[idx] = sum;
+}";
 }
