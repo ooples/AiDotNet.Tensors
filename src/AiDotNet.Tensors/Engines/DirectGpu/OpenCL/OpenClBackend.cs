@@ -304,7 +304,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             // -cl-unsafe-math-optimizations: More aggressive optimizations
             // -cl-finite-math-only: Assume no NaN/Inf (safe for GEMM)
             // -cl-no-signed-zeros: Ignore sign of zeros for faster math
-            const string optimizationFlags = OpenClBuildOptions.OptimizationFlags;
+            string optimizationFlags = OpenClBuildOptions.OptimizationFlags;
 
             try
             {
