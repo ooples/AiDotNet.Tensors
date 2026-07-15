@@ -821,6 +821,82 @@ extern ""C"" __global__ __launch_bounds__(256) void conv_transpose3d_backward_we
     }
     gradWeights[idx] = sum;
 }
+
+// #775: SpiralConv (mesh conv). Per (vertex, out-channel): gather spiralLength neighbour features and
+// matmul with weights [outC, inC*spiralLength] + bias. Invalid neighbour -> 0. CUDA mirror of OpenCL.
+extern ""C"" __global__ __launch_bounds__(256) void spiral_conv(
+    const float* __restrict__ vertexFeatures,
+    const int* __restrict__ spiralIndices,
+    const float* __restrict__ weights,
+    const float* __restrict__ biases,
+    float* __restrict__ output,
+    int V, int inC, int spiralLength, int outC)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= V * outC) return;
+    int oc = idx % outC;
+    int v = idx / outC;
+    int gatheredSize = inC * spiralLength;
+    float sum = biases[oc];
+    for (int s = 0; s < spiralLength; s++) {
+        int neighborIdx = spiralIndices[v * spiralLength + s];
+        if (neighborIdx < 0 || neighborIdx >= V) continue;
+        int gatherOffset = s * inC;
+        for (int c = 0; c < inC; c++) {
+            sum += vertexFeatures[neighborIdx * inC + c] * weights[oc * gatheredSize + gatherOffset + c];
+        }
+    }
+    output[idx] = sum;
+}
+
+// #775: SpiralConv backward w.r.t. vertex features. GATHER over gradVertexFeatures [V,inC]. CUDA mirror.
+extern ""C"" __global__ __launch_bounds__(256) void spiral_conv_backward_input(
+    const float* __restrict__ gradOutput,
+    const int* __restrict__ spiralIndices,
+    const float* __restrict__ weights,
+    float* __restrict__ gradVertexFeatures,
+    int V, int inC, int spiralLength, int outC)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= V * inC) return;
+    int ic = idx % inC;
+    int nbr = idx / inC;
+    int gatheredSize = inC * spiralLength;
+    float sum = 0.0f;
+    for (int v = 0; v < V; v++) {
+        for (int s = 0; s < spiralLength; s++) {
+            if (spiralIndices[v * spiralLength + s] != nbr) continue;
+            for (int oc = 0; oc < outC; oc++) {
+                sum += gradOutput[v * outC + oc] * weights[oc * gatheredSize + s * inC + ic];
+            }
+        }
+    }
+    gradVertexFeatures[idx] = sum;
+}
+
+// #775: SpiralConv backward w.r.t. weights. GATHER over gradWeights [outC, inC*spiralLength]. CUDA mirror.
+extern ""C"" __global__ __launch_bounds__(256) void spiral_conv_backward_weights(
+    const float* __restrict__ gradOutput,
+    const float* __restrict__ vertexFeatures,
+    const int* __restrict__ spiralIndices,
+    float* __restrict__ gradWeights,
+    int V, int inC, int spiralLength, int outC)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int gatheredSize = inC * spiralLength;
+    if (idx >= outC * gatheredSize) return;
+    int g = idx % gatheredSize;
+    int oc = idx / gatheredSize;
+    int s = g / inC;
+    int ic = g % inC;
+    float sum = 0.0f;
+    for (int v = 0; v < V; v++) {
+        int neighborIdx = spiralIndices[v * spiralLength + s];
+        if (neighborIdx < 0 || neighborIdx >= V) continue;
+        sum += gradOutput[v * outC + oc] * vertexFeatures[neighborIdx * inC + ic];
+    }
+    gradWeights[idx] = sum;
+}
 ";
         }
 
@@ -844,7 +920,10 @@ extern ""C"" __global__ __launch_bounds__(256) void conv_transpose3d_backward_we
                 "trilinear_interpolate_backward",
                 "conv_transpose3d",
                 "conv_transpose3d_backward_input",
-                "conv_transpose3d_backward_weights"
+                "conv_transpose3d_backward_weights",
+                "spiral_conv",
+                "spiral_conv_backward_input",
+                "spiral_conv_backward_weights"
             };
         }
     }

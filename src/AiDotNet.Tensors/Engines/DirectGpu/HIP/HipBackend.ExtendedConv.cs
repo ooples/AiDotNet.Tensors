@@ -6,7 +6,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 // (interface + kernels) so a partially-ported backend opts into exactly the families it can run; the
 // engine routes the rest to the CPU. Kernels live in the existing compiled modules (trilinear in the
 // convolution module); this partial only wires the launch.
-public sealed partial class HipBackend : ITrilinearInterpolationKernels, IConvTranspose3DKernels
+public sealed partial class HipBackend : ITrilinearInterpolationKernels, IConvTranspose3DKernels, ISpiralConvKernels
 {
     public unsafe void TrilinearInterpolate(IGpuBuffer grid, IGpuBuffer positions, IGpuBuffer output,
         int d, int h, int w, int c, int p, float upperEps)
@@ -64,6 +64,57 @@ public sealed partial class HipBackend : ITrilinearInterpolationKernels, IConvTr
         LaunchConvTranspose3D("conv_transpose3d_backward_weights", checked(inC * outC * kD * kH * kW),
             gradOutput, input, gradWeights, n, inC, iD, iH, iW, outC, outD, outH, outW,
             kD, kH, kW, strideD, strideH, strideW, padD, padH, padW);
+
+    public unsafe void SpiralConv(IGpuBuffer vertexFeatures, IGpuBuffer spiralIndices, IGpuBuffer weights,
+        IGpuBuffer biases, IGpuBuffer output, int v, int inC, int spiralLength, int outC)
+    {
+        int total = checked(v * outC);
+        if (total <= 0) return;
+        if (!_kernelCache.TryGetValue("spiral_conv", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: spiral_conv");
+        uint gridDim = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr vf = vertexFeatures.Handle, si = spiralIndices.Handle, w = weights.Handle, b = biases.Handle, o = output.Handle;
+        int vv = v, vInC = inC, vSL = spiralLength, vOutC = outC;
+        void** args = stackalloc void*[9];
+        args[0] = &vf; args[1] = &si; args[2] = &w; args[3] = &b; args[4] = &o;
+        args[5] = &vv; args[6] = &vInC; args[7] = &vSL; args[8] = &vOutC;
+        LaunchKernel(kernel, gridDim, DefaultBlockSize, args);
+        Synchronize();
+    }
+
+    public unsafe void SpiralConvBackwardInput(IGpuBuffer gradOutput, IGpuBuffer spiralIndices, IGpuBuffer weights,
+        IGpuBuffer gradVertexFeatures, int v, int inC, int spiralLength, int outC)
+    {
+        int total = checked(v * inC);
+        if (total <= 0) return;
+        if (!_kernelCache.TryGetValue("spiral_conv_backward_input", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: spiral_conv_backward_input");
+        uint gridDim = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr go = gradOutput.Handle, si = spiralIndices.Handle, w = weights.Handle, gvf = gradVertexFeatures.Handle;
+        int vv = v, vInC = inC, vSL = spiralLength, vOutC = outC;
+        void** args = stackalloc void*[8];
+        args[0] = &go; args[1] = &si; args[2] = &w; args[3] = &gvf;
+        args[4] = &vv; args[5] = &vInC; args[6] = &vSL; args[7] = &vOutC;
+        LaunchKernel(kernel, gridDim, DefaultBlockSize, args);
+        Synchronize();
+    }
+
+    public unsafe void SpiralConvBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer vertexFeatures, IGpuBuffer spiralIndices,
+        IGpuBuffer gradWeights, int v, int inC, int spiralLength, int outC)
+    {
+        int total = checked(outC * inC * spiralLength);
+        if (total <= 0) return;
+        if (!_kernelCache.TryGetValue("spiral_conv_backward_weights", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: spiral_conv_backward_weights");
+        uint gridDim = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr go = gradOutput.Handle, vf = vertexFeatures.Handle, si = spiralIndices.Handle, gw = gradWeights.Handle;
+        int vv = v, vInC = inC, vSL = spiralLength, vOutC = outC;
+        void** args = stackalloc void*[8];
+        args[0] = &go; args[1] = &vf; args[2] = &si; args[3] = &gw;
+        args[4] = &vv; args[5] = &vInC; args[6] = &vSL; args[7] = &vOutC;
+        LaunchKernel(kernel, gridDim, DefaultBlockSize, args);
+        Synchronize();
+    }
 
     private unsafe void LaunchConvTranspose3D(string kernelName, int total,
         IGpuBuffer a, IGpuBuffer b, IGpuBuffer c,
