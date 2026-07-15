@@ -174,6 +174,32 @@ struct Params{D:i32,H:i32,W:i32,C:i32,P:i32,upperEps:f32,pad0:i32,pad1:i32};
     gradWeights[idx]=sum;
 }";
 
+    public const string AdaptiveMaxPool2D = @"
+@group(0) @binding(0) var<storage,read> input_:array<f32>;
+@group(0) @binding(1) var<storage,read_write> output_:array<f32>;
+struct PA{batch:i32,channels:i32,inHeight:i32,inWidth:i32,outHeight:i32,outWidth:i32,pad0:i32,pad1:i32};
+@group(0) @binding(2) var<uniform> pm:PA;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid_:vec3<u32>){
+    let idx=i32(gid_.x);
+    if(idx>=pm.batch*pm.channels*pm.outHeight*pm.outWidth){return;}
+    let ow=idx%pm.outWidth;
+    let oh=(idx/pm.outWidth)%pm.outHeight;
+    let c=(idx/(pm.outWidth*pm.outHeight))%pm.channels;
+    let b=idx/(pm.outWidth*pm.outHeight*pm.channels);
+    let hStart=(oh*pm.inHeight)/pm.outHeight;
+    let hEnd=((oh+1)*pm.inHeight)/pm.outHeight;
+    let wStart=(ow*pm.inWidth)/pm.outWidth;
+    let wEnd=((ow+1)*pm.inWidth)/pm.outWidth;
+    var maxV=-3.402823466e38;
+    for(var ih=hStart;ih<hEnd;ih=ih+1){
+        for(var iw=wStart;iw<wEnd;iw=iw+1){
+            let v=input_[((b*pm.channels+c)*pm.inHeight+ih)*pm.inWidth+iw];
+            if(v>maxV){maxV=v;}
+        }
+    }
+    output_[((b*pm.channels+c)*pm.outHeight+oh)*pm.outWidth+ow]=maxV;
+}";
+
     private const string SpiralStruct = "struct PS{V:i32,inC:i32,spiralLength:i32,outC:i32};";
 
     public static readonly string SpiralConv = @"

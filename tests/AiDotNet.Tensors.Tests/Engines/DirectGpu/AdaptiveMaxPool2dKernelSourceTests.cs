@@ -18,20 +18,23 @@ public sealed class AdaptiveMaxPool2dKernelSourceTests
     private const string OpenClPool = "AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.PoolingKernels";
     private const string MetalExt = "AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalExtendedConvKernels";
     private const string VulkanExt = "AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanExtendedConvKernels";
+    private const string WebGpuExt = "AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuExtendedConvKernels";
 
-    // The pooling-window bound derivation is byte-identical across all backends (pure int arithmetic, no
-    // buffer names or float literals — so it holds even where GLSL differs on -INFINITY / input_ naming).
+    // The pooling-window bound derivation is byte-identical across C/MSL/GLSL (pure int arithmetic, no
+    // buffer names or float literals). WGSL prefixes params with pm. and drops spaces, so the WebGPU row
+    // carries the WGSL-form markers.
     [Theory]
-    [InlineData(CudaPool, "GetSource")]
-    [InlineData(HipPool, "GetSource")]
-    [InlineData(OpenClPool, "GetSource")]
-    [InlineData(MetalExt, "Source")]
-    [InlineData(VulkanExt, "AdaptiveMaxPool2D")]
-    public void WindowBoundsAndMaxReduction_MatchAcrossBackends(string typeName, string memberName)
+    [InlineData(CudaPool, "GetSource", "int hStart = (oh * inHeight) / outHeight;", "int wEnd = ((ow + 1) * inWidth) / outWidth;")]
+    [InlineData(HipPool, "GetSource", "int hStart = (oh * inHeight) / outHeight;", "int wEnd = ((ow + 1) * inWidth) / outWidth;")]
+    [InlineData(OpenClPool, "GetSource", "int hStart = (oh * inHeight) / outHeight;", "int wEnd = ((ow + 1) * inWidth) / outWidth;")]
+    [InlineData(MetalExt, "Source", "int hStart = (oh * inHeight) / outHeight;", "int wEnd = ((ow + 1) * inWidth) / outWidth;")]
+    [InlineData(VulkanExt, "AdaptiveMaxPool2D", "int hStart = (oh * inHeight) / outHeight;", "int wEnd = ((ow + 1) * inWidth) / outWidth;")]
+    [InlineData(WebGpuExt, "AdaptiveMaxPool2D", "let hStart=(oh*pm.inHeight)/pm.outHeight;", "let wEnd=((ow+1)*pm.inWidth)/pm.outWidth;")]
+    public void WindowBoundsAndMaxReduction_MatchAcrossBackends(string typeName, string memberName, string m1, string m2)
     {
         string source = GetStaticString(typeName, memberName);
-        Assert.Contains("int hStart = (oh * inHeight) / outHeight;", source, StringComparison.Ordinal);
-        Assert.Contains("int wEnd = ((ow + 1) * inWidth) / outWidth;", source, StringComparison.Ordinal);
+        Assert.Contains(m1, source, StringComparison.Ordinal);
+        Assert.Contains(m2, source, StringComparison.Ordinal);
     }
 
     [Theory]

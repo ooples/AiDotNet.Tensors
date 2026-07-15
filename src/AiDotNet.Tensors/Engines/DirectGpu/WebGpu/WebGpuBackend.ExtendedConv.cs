@@ -9,9 +9,21 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 // partial only wires the dispatch via Dispatch{N}BufferAsync. Scalar params are packed into a float[]
 // uniform block (ints reinterpreted as their float bit pattern, floats stored directly, padded to a
 // 16-byte multiple to satisfy WGSL uniform alignment).
-public sealed partial class WebGpuBackend : ITrilinearInterpolationKernels, IConvTranspose3DKernels, ISpiralConvKernels
+public sealed partial class WebGpuBackend : ITrilinearInterpolationKernels, IConvTranspose3DKernels, ISpiralConvKernels,
+    IAdaptiveMaxPool2DKernels
 {
     private static float Bits(int value) => BitConverter.Int32BitsToSingle(value);
+
+    public void AdaptiveMaxPool2D(IGpuBuffer input, IGpuBuffer output,
+        int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
+    {
+        int total = checked(batch * channels * outHeight * outWidth);
+        if (total <= 0) return;
+        Dispatch2BufferAsync("ExtAdaptiveMaxPool2D", WebGpuExtendedConvKernels.AdaptiveMaxPool2D, "main",
+            input, output,
+            [Bits(batch), Bits(channels), Bits(inHeight), Bits(inWidth), Bits(outHeight), Bits(outWidth), 0f, 0f],
+            total).GetAwaiter().GetResult();
+    }
 
     public void SpiralConv(IGpuBuffer vertexFeatures, IGpuBuffer spiralIndices, IGpuBuffer weights,
         IGpuBuffer biases, IGpuBuffer output, int v, int inC, int spiralLength, int outC)
