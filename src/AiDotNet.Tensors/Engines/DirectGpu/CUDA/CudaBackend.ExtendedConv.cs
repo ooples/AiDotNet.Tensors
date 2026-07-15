@@ -6,8 +6,57 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 // added incrementally (interface + kernels) so a partially-ported backend still opts into exactly the
 // families it can run; the engine routes the rest to the CPU. Kernels live in the existing compiled
 // modules (trilinear in the convolution module); this partial only wires the launch.
-public sealed partial class CudaBackend : ITrilinearInterpolationKernels, IConvTranspose3DKernels, ISpiralConvKernels, IAdaptiveMaxPool2DKernels, IConv3DBackwardKernels, IPool3DKernels, IDepthwiseConv2DBackwardKernels
+public sealed partial class CudaBackend : ITrilinearInterpolationKernels, IConvTranspose3DKernels, ISpiralConvKernels, IAdaptiveMaxPool2DKernels, IConv3DBackwardKernels, IPool3DKernels, IDepthwiseConv2DBackwardKernels, IGaussianSplatKernels
 {
+    public unsafe void GaussianCovariance(IGpuBuffer rotations, IGpuBuffer scales, IGpuBuffer covariances, int numGaussians)
+    {
+        if (numGaussians <= 0) return;
+        if (!_kernelCache.TryGetValue("gaussian_covariance", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: gaussian_covariance");
+        using var _ = PushContext();
+        uint gridDim = (uint)((numGaussians + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr r = rotations.Handle, s = scales.Handle, c = covariances.Handle;
+        int ng = numGaussians;
+        void** args = stackalloc void*[4];
+        args[0] = &r; args[1] = &s; args[2] = &c; args[3] = &ng;
+        LaunchKernel(kernel, gridDim, DefaultBlockSize, args);
+    }
+
+    public unsafe void SphericalHarmonics(IGpuBuffer shCoefficients, IGpuBuffer viewDirections, IGpuBuffer output,
+        int numPoints, int basisCount, int numChannels, int degree, int broadcastDir)
+    {
+        int total = checked(numPoints * numChannels);
+        if (total <= 0) return;
+        if (!_kernelCache.TryGetValue("spherical_harmonics", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: spherical_harmonics");
+        using var _ = PushContext();
+        uint gridDim = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr sh = shCoefficients.Handle, vd = viewDirections.Handle, o = output.Handle;
+        int np = numPoints, bc = basisCount, nc = numChannels, deg = degree, bd = broadcastDir;
+        void** args = stackalloc void*[8];
+        args[0] = &sh; args[1] = &vd; args[2] = &o; args[3] = &np;
+        args[4] = &bc; args[5] = &nc; args[6] = &deg; args[7] = &bd;
+        LaunchKernel(kernel, gridDim, DefaultBlockSize, args);
+    }
+
+    public unsafe void SphericalHarmonicsBackward(IGpuBuffer shCoefficients, IGpuBuffer viewDirections,
+        IGpuBuffer outputGradient, IGpuBuffer shGrad,
+        int numPoints, int basisCount, int numChannels, int degree, int broadcastDir)
+    {
+        int total = checked(numPoints * basisCount * numChannels);
+        if (total <= 0) return;
+        if (!_kernelCache.TryGetValue("spherical_harmonics_backward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: spherical_harmonics_backward");
+        using var _ = PushContext();
+        uint gridDim = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr sh = shCoefficients.Handle, vd = viewDirections.Handle, og = outputGradient.Handle, sg = shGrad.Handle;
+        int np = numPoints, bc = basisCount, nc = numChannels, deg = degree, bd = broadcastDir;
+        void** args = stackalloc void*[9];
+        args[0] = &sh; args[1] = &vd; args[2] = &og; args[3] = &sg; args[4] = &np;
+        args[5] = &bc; args[6] = &nc; args[7] = &deg; args[8] = &bd;
+        LaunchKernel(kernel, gridDim, DefaultBlockSize, args);
+    }
+
     public void DepthwiseConv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
         int n, int inC, int h, int w, int m, int outH, int outW, int kH, int kW,
         int strideH, int strideW, int padH, int padW) =>
