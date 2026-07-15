@@ -3,18 +3,40 @@
 // WGSL source in WebGpuDetectionKernels is a self-contained compute shader
 // (one pipeline per source), dispatched 1-D over n*m (IoU) or n (per-box).
 //
-// Note: WebGPU's compute API is async, so detection ops here are exposed as
-// *Async methods. They are NOT wired through DirectGpuTensorEngine's sync
-// IDetectionBackend dispatch (same constraint as the Parity-210 surface) —
-// the engine falls through to the CpuEngine reference for WebGPU. Direct
-// callers who hold a WebGpuBackend can invoke these Async methods.
+// The *Async methods do the work; the synchronous IDetectionBackend members block
+// on them (GetAwaiter().GetResult()) so the engine's sync dispatch runs these on
+// WebGPU instead of CPU-falling-back (#775). Caveat: safe under native wgpu (no
+// captured SynchronizationContext); a single-threaded UI/JS event-loop host should
+// call the *Async methods directly.
 
 #if NET7_0_OR_GREATER
 namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
-public sealed partial class WebGpuBackend
+public sealed partial class WebGpuBackend : IDetectionBackend
 {
     private const string DetectionModuleKey = "Detection";
+
+    void IDetectionBackend.BoxIou(IGpuBuffer boxesA, IGpuBuffer boxesB, IGpuBuffer output, int n, int m)
+        => BoxIouAsync(boxesA, boxesB, output, n, m).GetAwaiter().GetResult();
+
+    void IDetectionBackend.GeneralizedBoxIou(IGpuBuffer boxesA, IGpuBuffer boxesB, IGpuBuffer output, int n, int m)
+        => GeneralizedBoxIouAsync(boxesA, boxesB, output, n, m).GetAwaiter().GetResult();
+
+    void IDetectionBackend.DistanceBoxIou(IGpuBuffer boxesA, IGpuBuffer boxesB, IGpuBuffer output, int n, int m)
+        => DistanceBoxIouAsync(boxesA, boxesB, output, n, m).GetAwaiter().GetResult();
+
+    void IDetectionBackend.CompleteBoxIou(IGpuBuffer boxesA, IGpuBuffer boxesB, IGpuBuffer output, int n, int m)
+        => CompleteBoxIouAsync(boxesA, boxesB, output, n, m).GetAwaiter().GetResult();
+
+    void IDetectionBackend.BoxArea(IGpuBuffer boxes, IGpuBuffer output, int n)
+        => BoxAreaAsync(boxes, output, n).GetAwaiter().GetResult();
+
+    void IDetectionBackend.BoxConvert(IGpuBuffer boxes, IGpuBuffer output, int n, int fromFormat, int toFormat)
+        => BoxConvertAsync(boxes, output, n, fromFormat, toFormat).GetAwaiter().GetResult();
+
+    void IDetectionBackend.IouFamilyBackward(IGpuBuffer gradOutput, IGpuBuffer boxesA, IGpuBuffer boxesB,
+        IGpuBuffer gradA, IGpuBuffer gradB, int n, int m, int variant)
+        => IouFamilyBackwardAsync(gradOutput, boxesA, boxesB, gradA, gradB, n, m, variant).GetAwaiter().GetResult();
 
     private async Task DispatchPairwiseIouAsync(string tag, string source,
         IGpuBuffer boxesA, IGpuBuffer boxesB, IGpuBuffer output, int n, int m)
