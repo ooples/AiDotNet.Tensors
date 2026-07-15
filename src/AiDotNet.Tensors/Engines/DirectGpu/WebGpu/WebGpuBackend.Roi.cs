@@ -14,9 +14,38 @@
 #if NET7_0_OR_GREATER
 namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
-public sealed partial class WebGpuBackend
+// #775: WebGpuBackend now implements the synchronous IRoiBackend by blocking on the
+// *Async methods (GetAwaiter().GetResult()), the same sync-over-async pattern the
+// extended-conv / scatter families use, so the engine's sync dispatch runs these on
+// WebGPU. CAVEAT: safe under the native wgpu P/Invoke path (no captured
+// SynchronizationContext); a single-threaded UI/JS event-loop host could deadlock —
+// such callers should use the *Async methods directly.
+public sealed partial class WebGpuBackend : IRoiBackend
 {
     private const string RoiModuleKey = "Roi";
+
+    void IRoiBackend.RoIAlign(IGpuBuffer input, IGpuBuffer boxes, IGpuBuffer output,
+        int N, int C, int H, int W, int K, int outH, int outW,
+        float spatialScale, int samplingRatio, bool aligned)
+        => RoIAlignAsync(input, boxes, output, N, C, H, W, K, outH, outW,
+            spatialScale, samplingRatio, aligned).GetAwaiter().GetResult();
+
+    void IRoiBackend.RoIPool(IGpuBuffer input, IGpuBuffer boxes, IGpuBuffer output,
+        int N, int C, int H, int W, int K, int outH, int outW, float spatialScale)
+        => RoIPoolAsync(input, boxes, output, N, C, H, W, K, outH, outW, spatialScale)
+            .GetAwaiter().GetResult();
+
+    void IRoiBackend.PsRoIAlign(IGpuBuffer input, IGpuBuffer boxes, IGpuBuffer output,
+        int N, int C, int H, int W, int K, int outH, int outW, int outputChannels,
+        float spatialScale, int samplingRatio)
+        => PsRoIAlignAsync(input, boxes, output, N, C, H, W, K, outH, outW, outputChannels,
+            spatialScale, samplingRatio).GetAwaiter().GetResult();
+
+    void IRoiBackend.PsRoIPool(IGpuBuffer input, IGpuBuffer boxes, IGpuBuffer output,
+        int N, int C, int H, int W, int K, int outH, int outW, int outputChannels,
+        float spatialScale)
+        => PsRoIPoolAsync(input, boxes, output, N, C, H, W, K, outH, outW, outputChannels,
+            spatialScale).GetAwaiter().GetResult();
 
     public async Task RoIAlignAsync(IGpuBuffer input, IGpuBuffer boxes, IGpuBuffer output,
         int N, int C, int H, int W, int K, int outH, int outW,
