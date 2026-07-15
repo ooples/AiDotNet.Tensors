@@ -8579,8 +8579,11 @@ public interface IEngine
     /// <summary>PReLU with learnable alpha.</summary>
     Tensor<T> TensorPReLU<T>(Tensor<T> tensor, Tensor<T> alpha);
 
-    /// <summary>RReLU with random leaky slope.</summary>
-    Tensor<T> TensorRReLU<T>(Tensor<T> tensor, double lower = 0.125, double upper = 0.333, bool training = true);
+    /// <summary>RReLU with random leaky slope. When <paramref name="seed"/> is provided, the per-element
+    /// negative-side slopes are drawn from the counter-based stateless generator so training-mode output
+    /// is deterministic and matches the resident GPU path bit-for-bit; when null, a thread-safe shared
+    /// RNG is used (non-deterministic, as PyTorch's training-mode RReLU is).</summary>
+    Tensor<T> TensorRReLU<T>(Tensor<T> tensor, double lower = 0.125, double upper = 0.333, bool training = true, int? seed = null);
 
     /// <summary>Threshold: x > threshold ? x : value.</summary>
     Tensor<T> TensorThreshold<T>(Tensor<T> tensor, T threshold, T value);

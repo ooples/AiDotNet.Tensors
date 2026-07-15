@@ -20234,12 +20234,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // GPU-accelerated remaining activations (RReLU) and indexing (IndexSelect, MaskedFill)
     // ──────────────────────────────────────────────────────────────
 
-    public override Tensor<T> TensorRReLU<T>(Tensor<T> tensor, double lower, double upper, bool training)
+    public override Tensor<T> TensorRReLU<T>(Tensor<T> tensor, double lower, double upper, bool training, int? seed = null)
     {
         if (Compilation.GraphMode.IsActive || DirectGpuEngine.ShouldFallbackForPrecision<T>())
-            return base.TensorRReLU(tensor, lower, upper, training);
+            return base.TensorRReLU(tensor, lower, upper, training, seed);
         if (!TryGetBackend(out var backend))
-            return base.TensorRReLU(tensor, lower, upper, training);
+            return base.TensorRReLU(tensor, lower, upper, training, seed);
 
         try
         {
@@ -20252,7 +20252,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 if (training)
                 {
-                    backend.GenerateRandomUniform(bufNoise.Buffer, tensor.Length, lowerF, upperF, (ulong)Environment.TickCount);
+                    // Seeded training uses the same counter-based stateless generator as the CPU path so
+                    // the per-element slopes match bit-for-bit; unseeded uses a monotonic process seed.
+                    ulong gpuSeed = seed.HasValue
+                        ? (ulong)(uint)seed.GetValueOrDefault()
+                        : (ulong)System.Threading.Interlocked.Increment(ref _gpuRngSeed);
+                    backend.GenerateRandomUniform(bufNoise.Buffer, tensor.Length, lowerF, upperF, gpuSeed);
                 }
                 else
                 {
@@ -20277,7 +20282,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch (Exception)
         {
-            return base.TensorRReLU(tensor, lower, upper, training);
+            return base.TensorRReLU(tensor, lower, upper, training, seed);
         }
     }
 

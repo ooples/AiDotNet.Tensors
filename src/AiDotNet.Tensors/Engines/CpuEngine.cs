@@ -43082,7 +43082,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>RReLU: random leaky ReLU (lower, upper bounds)</summary>
-    public virtual Tensor<T> TensorRReLU<T>(Tensor<T> tensor, double lower = 1.0/8, double upper = 1.0/3, bool training = true)
+    public virtual Tensor<T> TensorRReLU<T>(Tensor<T> tensor, double lower = 1.0/8, double upper = 1.0/3, bool training = true, int? seed = null)
     {
         if (GraphMode.IsActive)
         { var ac = AutoTracer.TryGetCompiledPlan<T>("RReLU", tensor._shape); if (ac is not null) return ac.Execute(); }
@@ -43094,8 +43094,9 @@ public partial class CpuEngine : ITensorLevelEngine
                 var captured = tensor;
                 double capLower = lower, capUpper = upper;
                 bool capTraining = training;
+                int? capSeed = seed;
                 return scope.RecordUnary(LazyNodeType.Custom, "RReLU", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.TensorRReLU(captured, capLower, capUpper, capTraining); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
+                    (eng, output) => { var r = eng.TensorRReLU(captured, capLower, capUpper, capTraining, capSeed); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.RReLUBackward);
             }
         }
@@ -43103,33 +43104,48 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         var noise = new Tensor<T>(tensor._shape);
-        var rng = new Random();
+
+        // Seeded training draws each negative-side slope from the counter-based stateless generator
+        // (indexed by element position) so the sequence matches the resident GPU path bit-for-bit and
+        // is reproducible across runs; unseeded training uses the thread-safe shared RNG.
+        bool seeded = training && seed.HasValue;
+        uint seedState = seeded ? unchecked((uint)seed.GetValueOrDefault()) : 0u;
+        var rng = RandomHelper.ThreadSafeRandom;
 
         if (typeof(T) == typeof(float))
         {
+            float lowerF = (float)lower, upperF = (float)upper;
+            float mid = (float)((lower + upper) / 2.0); // match the resident GPU Fill midpoint exactly
             for (int i = 0; i < tensor.Length; i++)
             {
                 float x = (float)numOps.ToDouble(tensor[i]);
-                float slope = training
-                    ? (float)(lower + rng.NextDouble() * (upper - lower))
-                    : (float)((lower + upper) / 2.0);
+                float slope = !training
+                    ? mid
+                    : seeded
+                        ? StatelessRandom.UniformRange(seedState, (uint)i, lowerF, upperF)
+                        : (float)(lower + rng.NextDouble() * (upper - lower));
                 noise[i] = numOps.FromDouble(slope);
                 result[i] = numOps.FromDouble(x >= 0.0f ? x : slope * x);
             }
             DifferentiableOps.RecordUnary("RReLU", result, tensor, BackwardFunctions<T>.RReLUBackward, savedState: new object[] { noise });
-            AutoTracer.RecordOp("RReLU", result, eng => eng.TensorRReLU(tensor, lower, upper, training));
+            AutoTracer.RecordOp("RReLU", result, eng => eng.TensorRReLU(tensor, lower, upper, training, seed));
             return result;
         }
 
+        double midD = (lower + upper) / 2.0;
         for (int i = 0; i < tensor.Length; i++)
         {
             double x = numOps.ToDouble(tensor[i]);
-            double a = training ? lower + rng.NextDouble() * (upper - lower) : (lower + upper) / 2.0;
+            double a = !training
+                ? midD
+                : seeded
+                    ? StatelessRandom.UniformRange(seedState, (uint)i, lower, upper)
+                    : lower + rng.NextDouble() * (upper - lower);
             noise[i] = numOps.FromDouble(a);
             result[i] = numOps.FromDouble(x >= 0 ? x : a * x);
         }
         DifferentiableOps.RecordUnary("RReLU", result, tensor, BackwardFunctions<T>.RReLUBackward, savedState: new object[] { noise });
-        AutoTracer.RecordOp("RReLU", result, eng => eng.TensorRReLU(tensor, lower, upper, training));
+        AutoTracer.RecordOp("RReLU", result, eng => eng.TensorRReLU(tensor, lower, upper, training, seed));
         return result;
     }
 
