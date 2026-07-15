@@ -6,8 +6,62 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 // (interface + kernels) so a partially-ported backend opts into exactly the families it can run; the
 // engine routes the rest to the CPU. Kernels live in the existing compiled modules (trilinear in the
 // convolution module); this partial only wires the launch.
-public sealed partial class HipBackend : ITrilinearInterpolationKernels, IConvTranspose3DKernels, ISpiralConvKernels, IAdaptiveMaxPool2DKernels, IConv3DBackwardKernels
+public sealed partial class HipBackend : ITrilinearInterpolationKernels, IConvTranspose3DKernels, ISpiralConvKernels, IAdaptiveMaxPool2DKernels, IConv3DBackwardKernels, IPool3DKernels
 {
+    public unsafe void AvgPool3D(IGpuBuffer input, IGpuBuffer output,
+        int batch, int channels, int inDepth, int inHeight, int inWidth,
+        int outDepth, int outHeight, int outWidth,
+        int kernelD, int kernelH, int kernelW,
+        int strideD, int strideH, int strideW, int countIncludePad)
+    {
+        if (batch * channels * outDepth <= 0) return;
+        if (!_kernelCache.TryGetValue("avgpool3d", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: avgpool3d");
+        const int blockSize = 8;
+        uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
+        uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
+        uint gridZ = (uint)(batch * channels * outDepth);
+        IntPtr i = input.Handle, o = output.Handle;
+        int vB = batch, vC = channels, vID = inDepth, vIH = inHeight, vIW = inWidth;
+        int vOD = outDepth, vOH = outHeight, vOW = outWidth, vKD = kernelD, vKH = kernelH, vKW = kernelW;
+        int vSD = strideD, vSH = strideH, vSW = strideW, vCIP = countIncludePad;
+        void** args = stackalloc void*[17];
+        args[0] = &i; args[1] = &o; args[2] = &vB; args[3] = &vC;
+        args[4] = &vID; args[5] = &vIH; args[6] = &vIW;
+        args[7] = &vOD; args[8] = &vOH; args[9] = &vOW;
+        args[10] = &vKD; args[11] = &vKH; args[12] = &vKW;
+        args[13] = &vSD; args[14] = &vSH; args[15] = &vSW; args[16] = &vCIP;
+        LaunchKernel3D(kernel, gridX, gridY, gridZ, (uint)blockSize, (uint)blockSize, 1u, args);
+        Synchronize();
+    }
+
+    public unsafe void AvgPool3DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput,
+        int batch, int channels, int inDepth, int inHeight, int inWidth,
+        int outDepth, int outHeight, int outWidth,
+        int kernelD, int kernelH, int kernelW,
+        int strideD, int strideH, int strideW, int countIncludePad)
+    {
+        if (batch * channels * inDepth <= 0) return;
+        if (!_kernelCache.TryGetValue("avgpool3d_backward", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: avgpool3d_backward");
+        const int blockSize = 8;
+        uint gridX = (uint)((inWidth + blockSize - 1) / blockSize);
+        uint gridY = (uint)((inHeight + blockSize - 1) / blockSize);
+        uint gridZ = (uint)(batch * channels * inDepth);
+        IntPtr go = gradOutput.Handle, gi = gradInput.Handle;
+        int vB = batch, vC = channels, vID = inDepth, vIH = inHeight, vIW = inWidth;
+        int vOD = outDepth, vOH = outHeight, vOW = outWidth, vKD = kernelD, vKH = kernelH, vKW = kernelW;
+        int vSD = strideD, vSH = strideH, vSW = strideW, vCIP = countIncludePad;
+        void** args = stackalloc void*[17];
+        args[0] = &go; args[1] = &gi; args[2] = &vB; args[3] = &vC;
+        args[4] = &vID; args[5] = &vIH; args[6] = &vIW;
+        args[7] = &vOD; args[8] = &vOH; args[9] = &vOW;
+        args[10] = &vKD; args[11] = &vKH; args[12] = &vKW;
+        args[13] = &vSD; args[14] = &vSH; args[15] = &vSW; args[16] = &vCIP;
+        LaunchKernel3D(kernel, gridX, gridY, gridZ, (uint)blockSize, (uint)blockSize, 1u, args);
+        Synchronize();
+    }
+
     public void Conv3DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer weights, IGpuBuffer gradInput,
         int n, int inC, int inD, int inH, int inW, int outC, int outD, int outH, int outW,
         int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW) =>
