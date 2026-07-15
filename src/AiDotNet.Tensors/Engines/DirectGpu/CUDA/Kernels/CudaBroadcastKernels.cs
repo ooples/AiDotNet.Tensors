@@ -78,6 +78,17 @@ extern ""C"" __global__ __launch_bounds__(256) void broadcast_mul_first(
     output[idx] = a[outer] * b[idx];
 }
 
+// Full-tensor first-axis broadcast: a[outer, inner] * b[outer]
+extern ""C"" __global__ __launch_bounds__(256) void broadcast_multiply_first_axis(
+    const float* __restrict__ a, const float* __restrict__ b,
+    float* __restrict__ output, int outerSize, int innerSize)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = outerSize * innerSize;
+    if (idx >= total) return;
+    output[idx] = a[idx] * b[idx / innerSize];
+}
+
 // ============================================================================
 // Scalar operations
 // ============================================================================
@@ -208,7 +219,13 @@ extern ""C"" __global__ __launch_bounds__(256) void equals_kernel(
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    output[idx] = (a[idx] == b[idx]) ? 1.0f : 0.0f;
+    unsigned int ab = __float_as_uint(a[idx]);
+    unsigned int bb = __float_as_uint(b[idx]);
+    unsigned int aa = ab & 0x7FFFFFFFu;
+    unsigned int ba = bb & 0x7FFFFFFFu;
+    bool equal = aa <= 0x7F800000u && ba <= 0x7F800000u
+        && (ab == bb || ((aa | ba) == 0u));
+    output[idx] = equal ? 1.0f : 0.0f;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void not_equals_kernel(
@@ -217,7 +234,28 @@ extern ""C"" __global__ __launch_bounds__(256) void not_equals_kernel(
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    output[idx] = (a[idx] != b[idx]) ? 1.0f : 0.0f;
+    unsigned int ab = __float_as_uint(a[idx]);
+    unsigned int bb = __float_as_uint(b[idx]);
+    unsigned int aa = ab & 0x7FFFFFFFu;
+    unsigned int ba = bb & 0x7FFFFFFFu;
+    bool equal = aa <= 0x7F800000u && ba <= 0x7F800000u
+        && (ab == bb || ((aa | ba) == 0u));
+    output[idx] = equal ? 0.0f : 1.0f;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void not_equal_scalar(
+    const float* __restrict__ input, float* __restrict__ output,
+    float scalar, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    unsigned int ab = __float_as_uint(input[idx]);
+    unsigned int bb = __float_as_uint(scalar);
+    unsigned int aa = ab & 0x7FFFFFFFu;
+    unsigned int ba = bb & 0x7FFFFFFFu;
+    bool equal = aa <= 0x7F800000u && ba <= 0x7F800000u
+        && (ab == bb || ((aa | ba) == 0u));
+    output[idx] = equal ? 0.0f : 1.0f;
 }
 ";
     }
@@ -232,6 +270,7 @@ extern ""C"" __global__ __launch_bounds__(256) void not_equals_kernel(
             "broadcast_div_last",
             "broadcast_add_first",
             "broadcast_mul_first",
+            "broadcast_multiply_first_axis",
             "add_scalar",
             "sub_scalar",
             "div_scalar",
@@ -245,7 +284,8 @@ extern ""C"" __global__ __launch_bounds__(256) void not_equals_kernel(
             "rsqrt_kernel",
             "sincos_kernel",
             "equals_kernel",
-            "not_equals_kernel"
+            "not_equals_kernel",
+            "not_equal_scalar"
         ];
     }
 }

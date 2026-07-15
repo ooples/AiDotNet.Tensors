@@ -924,8 +924,8 @@ kernel void parity210_istft_from_spectrum(
     device const float* specRe [[buffer(0)]],
     device const float* specIm [[buffer(1)]],
     device const float* window [[buffer(2)]],
-    device atomic_float* result [[buffer(3)]],
-    device atomic_float* windowSum [[buffer(4)]],
+    device float* result [[buffer(3)]],
+    device float* windowSum [[buffer(4)]],
     constant int& batch [[buffer(5)]],
     constant int& numFrames [[buffer(6)]],
     constant int& nFft [[buffer(7)]],
@@ -933,12 +933,17 @@ kernel void parity210_istft_from_spectrum(
     constant int& outputLength [[buffer(9)]],
     constant int& center [[buffer(10)]],
     uint gid [[thread_position_in_grid]]) {
-    int idx = (int)gid; int total = batch*numFrames*nFft; if (idx >= total) return;
-    int i = idx % nFft; int tmp = idx / nFft; int frame = tmp % numFrames; int b = tmp / numFrames; int specOff = (b*numFrames + frame) * nFft;
-    float acc = 0.0f;
-    for (int k = 0; k < nFft; k++) { float a = 2.0f*M_PI_F*(float)k*(float)i/(float)nFft; acc += specRe[specOff+k]*cos(a) - specIm[specOff+k]*sin(a); }
-    int writeStart = center ? max(0, frame*hop - nFft/2) : frame*hop; int outIdx = writeStart + i;
-    if (outIdx >= 0 && outIdx < outputLength) { float w = window[i]; atomic_fetch_add_explicit(&result[b*outputLength + outIdx], acc*(1.0f/(float)nFft)*w, memory_order_relaxed); atomic_fetch_add_explicit(&windowSum[b*outputLength + outIdx], w*w, memory_order_relaxed); }
+    int idx = (int)gid; int total = batch*outputLength; if (idx >= total) return;
+    int outIdx = idx % outputLength; int b = idx / outputLength; float resultAcc = 0.0f; float windowAcc = 0.0f;
+    for (int frame = 0; frame < numFrames; frame++) {
+        int writeStart = center ? max(0, frame*hop - nFft/2) : frame*hop; int i = outIdx - writeStart;
+        if (i >= 0 && i < nFft) {
+            int specOff = (b*numFrames + frame) * nFft; float acc = 0.0f;
+            for (int k = 0; k < nFft; k++) { float a = 2.0f*M_PI_F*(float)k*(float)i/(float)nFft; acc += specRe[specOff+k]*cos(a) - specIm[specOff+k]*sin(a); }
+            float w = window[i]; resultAcc += acc*(1.0f/(float)nFft)*w; windowAcc += w*w;
+        }
+    }
+    result[idx] = resultAcc; windowSum[idx] = windowAcc;
 }
 
 kernel void parity210_istft_normalize(
@@ -1019,7 +1024,7 @@ kernel void parity210_histogramdd(
     constant int& d [[buffer(6)]],
     uint gid [[thread_position_in_grid]]) {
     int i = (int)gid; if (i >= n) return; int linIdx = 0; int valid = 1;
-    for (int k = 0; k < d; k++) { float v = samples[i*d + k]; float mn = mins[k]; float mx = maxs[k]; if (!(v >= mn && v <= mx)) { valid = 0; break; } float width = (mx - mn) / (float)bins[k]; int kIdx = (int)floor((v - mn) / width); if (kIdx >= bins[k]) kIdx = bins[k] - 1; if (kIdx < 0) kIdx = 0; linIdx = linIdx * bins[k] + kIdx; }
+    for (int k = 0; k < d; k++) { float v = samples[i*d + k]; float mn = mins[k]; float mx = maxs[k]; if (!(v >= mn && v <= mx)) { valid = 0; break; } int kIdx; if (v == mx) { kIdx = bins[k] - 1; } else { float width = (mx - mn) / (float)bins[k]; kIdx = (int)floor((v - mn) / width); if (kIdx >= bins[k]) kIdx = bins[k] - 1; if (kIdx < 0) kIdx = 0; } linIdx = linIdx * bins[k] + kIdx; }
     if (valid) atomic_fetch_add_explicit(&hist[linIdx], 1.0f, memory_order_relaxed);
 }
 
@@ -1172,10 +1177,11 @@ kernel void parity210_index_write(
     constant int& innerSize [[buffer(7)]],
     constant int& dstAxis [[buffer(8)]],
     uint gid [[thread_position_in_grid]]) {
-    int idx = (int)gid; int total=outerSize*idxAxis*innerSize; if (idx>=total) return;
-    int inner=idx%innerSize; int j=(idx/innerSize)%idxAxis; int outer=(idx/innerSize)/idxAxis; int dstJ=indices[j];
-    if (dstJ<0||dstJ>=dstAxis) return; float v=(mode==0)?source[idx]:fillValue;
-    output[(outer*dstAxis+dstJ)*innerSize+inner]=v;
+    int idx = (int)gid; int total=outerSize*dstAxis*innerSize; if (idx>=total) return;
+    int inner=idx%innerSize; int dstJ=(idx/innerSize)%dstAxis; int outer=(idx/innerSize)/dstAxis; int last=-1;
+    for (int j=0;j<idxAxis;j++) if (indices[j]==dstJ) last=j;
+    if (last<0) return;
+    output[idx]=(mode==0)?source[(outer*idxAxis+last)*innerSize+inner]:fillValue;
 }
 
 kernel void parity210_cdist(

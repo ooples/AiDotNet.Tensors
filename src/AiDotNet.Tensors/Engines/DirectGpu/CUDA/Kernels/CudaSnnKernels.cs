@@ -126,15 +126,12 @@ extern ""C"" __global__ __launch_bounds__(256) void generate_random_uniform(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
 
-    // Philox 2-round counter-based PRNG
-    unsigned int counter = (unsigned int)idx;
-    unsigned int key = (unsigned int)(seed ^ (seed >> 32));
-    // Standard Philox uses 10 rounds for good statistical properties
-    for (int r = 0; r < 10; r++)
-        counter = philox_round(counter, key + (unsigned int)r);
-
-    float u = uint_to_float01(counter);
-    output[idx] = minVal + u * (maxVal - minVal);
+    unsigned int seed32 = (unsigned int)seed ^ (unsigned int)(seed >> 32);
+    unsigned int state = (unsigned int)idx * 747796405u + seed32 + 2891336453u;
+    unsigned int word = ((state >> ((state >> 28) + 4u)) ^ state) * 277803737u;
+    unsigned int sample = (word >> 22) ^ word;
+    float uniform = (float)(sample >> 8) * (1.0f / 16777216.0f);
+    output[idx] = fmaf(uniform, maxVal - minVal, minVal);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void generate_random_normal(
@@ -168,7 +165,7 @@ extern ""C"" __global__ __launch_bounds__(256) void generate_random_normal(
 extern ""C"" __global__ __launch_bounds__(256) void enforce_2x4_sparsity(
     const float* __restrict__ denseInput,
     float* __restrict__ sparseValues,
-    float* __restrict__ sparseIndices,
+    unsigned char* __restrict__ sparseIndices,
     int M, int K)
 {
     // Each thread handles one group of 4 elements
@@ -201,7 +198,7 @@ extern ""C"" __global__ __launch_bounds__(256) void enforce_2x4_sparsity(
         }
     }
 
-    // Output: 2 values + 2 indices per group
+    // Output: 2 values and one packed byte per group.
     int outIdx = idx * 2;
     // Sort the kept indices ascending for consistent ordering
     int k0 = indices[0], k1 = indices[1];
@@ -209,36 +206,32 @@ extern ""C"" __global__ __launch_bounds__(256) void enforce_2x4_sparsity(
 
     sparseValues[outIdx] = vals[k0];
     sparseValues[outIdx + 1] = vals[k1];
-    sparseIndices[outIdx] = (float)k0;
-    sparseIndices[outIdx + 1] = (float)k1;
+    sparseIndices[idx] = (unsigned char)((k1 << 2) | k0);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void decompress_2x4_sparse(
     const float* __restrict__ sparseValues,
-    const float* __restrict__ sparseIndices,
+    const unsigned char* __restrict__ sparseIndices,
     float* __restrict__ denseOutput,
     int M, int K)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int totalElements = M * K;
-    if (idx >= totalElements) return;
-
-    // Zero the output first
-    denseOutput[idx] = 0.0f;
-
-    int row = idx / K;
-    int col = idx % K;
-    int group = col / 4;
-    int localCol = col % 4;
-
-    // Check if this column is one of the 2 kept in this group
-    int sparseIdx = (row * (K / 4) + group) * 2;
-    for (int i = 0; i < 2; i++) {
-        if ((int)sparseIndices[sparseIdx + i] == localCol) {
-            denseOutput[idx] = sparseValues[sparseIdx + i];
-            break;
-        }
-    }
+    int groupsPerRow = K / 4;
+    int totalGroups = M * groupsPerRow;
+    if (idx >= totalGroups) return;
+    int row = idx / groupsPerRow;
+    int group = idx % groupsPerRow;
+    int denseBase = row * K + group * 4;
+    int sparseBase = idx * 2;
+    unsigned char packed = sparseIndices[idx];
+    int k0 = packed & 3;
+    int k1 = (packed >> 2) & 3;
+    denseOutput[denseBase] = 0.0f;
+    denseOutput[denseBase + 1] = 0.0f;
+    denseOutput[denseBase + 2] = 0.0f;
+    denseOutput[denseBase + 3] = 0.0f;
+    denseOutput[denseBase + k0] = sparseValues[sparseBase];
+    denseOutput[denseBase + k1] = sparseValues[sparseBase + 1];
 }
 
 // ============================================================================
@@ -248,7 +241,7 @@ extern ""C"" __global__ __launch_bounds__(256) void decompress_2x4_sparse(
 
 extern ""C"" __global__ __launch_bounds__(256) void sparse_gemm_2x4(
     const float* __restrict__ sparseAValues,
-    const float* __restrict__ sparseAIndices,
+    const unsigned char* __restrict__ sparseAIndices,
     const float* __restrict__ B,
     float* __restrict__ C,
     int M, int N, int K, float alpha, float beta)
@@ -263,11 +256,11 @@ extern ""C"" __global__ __launch_bounds__(256) void sparse_gemm_2x4(
 
     for (int g = 0; g < numGroups; g++) {
         int sparseBase = (row * numGroups + g) * 2;
-        for (int i = 0; i < 2; i++) {
-            float aVal = sparseAValues[sparseBase + i];
-            int aCol = (int)sparseAIndices[sparseBase + i] + g * 4;
-            sum += aVal * B[aCol * N + col];
-        }
+        unsigned char packed = sparseAIndices[row * numGroups + g];
+        int first = packed & 3;
+        int second = (packed >> 2) & 3;
+        sum += sparseAValues[sparseBase] * B[(g * 4 + first) * N + col];
+        sum += sparseAValues[sparseBase + 1] * B[(g * 4 + second) * N + col];
     }
 
     int cIdx = row * N + col;
@@ -276,7 +269,7 @@ extern ""C"" __global__ __launch_bounds__(256) void sparse_gemm_2x4(
 
 extern ""C"" __global__ __launch_bounds__(256) void sparse_gemm_bias_relu(
     const float* __restrict__ sparseAValues,
-    const float* __restrict__ sparseAIndices,
+    const unsigned char* __restrict__ sparseAIndices,
     const float* __restrict__ B,
     const float* __restrict__ bias,
     float* __restrict__ C,
@@ -292,11 +285,11 @@ extern ""C"" __global__ __launch_bounds__(256) void sparse_gemm_bias_relu(
 
     for (int g = 0; g < numGroups; g++) {
         int sparseBase = (row * numGroups + g) * 2;
-        for (int i = 0; i < 2; i++) {
-            float aVal = sparseAValues[sparseBase + i];
-            int aCol = (int)sparseAIndices[sparseBase + i] + g * 4;
-            sum += aVal * B[aCol * N + col];
-        }
+        unsigned char packed = sparseAIndices[row * numGroups + g];
+        int first = packed & 3;
+        int second = (packed >> 2) & 3;
+        sum += sparseAValues[sparseBase] * B[(g * 4 + first) * N + col];
+        sum += sparseAValues[sparseBase + 1] * B[(g * 4 + second) * N + col];
     }
 
     // Add bias and ReLU

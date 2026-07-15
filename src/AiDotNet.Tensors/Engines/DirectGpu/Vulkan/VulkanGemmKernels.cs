@@ -29,8 +29,8 @@ layout(local_size_x = 256) in;
     public static string GemmFp32 => Header + @"
 layout(set=0,binding=0) readonly buffer Ab { float A[]; };
 layout(set=0,binding=1) readonly buffer Bb { float B[]; };
-layout(set=0,binding=2) writeonly buffer Cb { float C[]; };
-layout(push_constant) uniform PC { uint M; uint N; uint K; };
+layout(set=0,binding=2) buffer Cb { float C[]; };
+layout(push_constant) uniform PC { uint M; uint N; uint K; float alpha; float beta; };
 void main() {
     uint gid = gl_GlobalInvocationID.x;
     if (gid >= M * N) return;
@@ -40,7 +40,46 @@ void main() {
     float acc = 0.0;
     for (uint kk = 0u; kk < K; ++kk)
         acc += A[aBase + kk] * B[kk * N + col];
-    C[gid] = acc;
+    C[gid] = (beta != 0.0) ? alpha * acc + beta * C[gid] : alpha * acc;
+}";
+
+    public static string BatchedGemmFp32 => Header + @"
+layout(set=0,binding=0) readonly buffer Ab { float A[]; };
+layout(set=0,binding=1) readonly buffer Bb { float B[]; };
+layout(set=0,binding=2) buffer Cb { float C[]; };
+layout(push_constant) uniform PC { uint M; uint N; uint K; uint batchCount; float alpha; float beta; };
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint matrixSize = M * N;
+    if (gid >= batchCount * matrixSize) return;
+    uint batch = gid / matrixSize;
+    uint local = gid % matrixSize;
+    uint row = local / N;
+    uint col = local % N;
+    uint aBase = batch * M * K + row * K;
+    uint bBase = batch * K * N;
+    float acc = 0.0;
+    for (uint kk = 0u; kk < K; ++kk) acc += A[aBase + kk] * B[bBase + kk * N + col];
+    C[gid] = (beta != 0.0) ? alpha * acc + beta * C[gid] : alpha * acc;
+}";
+
+    /// <summary>FP32 C = alpha * A * B-transpose + beta * C without materializing B-transpose.</summary>
+    public static string GemmFp32Transposed => Header + @"
+layout(set=0,binding=0) readonly buffer Ab { float A[]; };
+layout(set=0,binding=1) readonly buffer Bb { float B[]; };
+layout(set=0,binding=2) buffer Cb { float C[]; };
+layout(push_constant) uniform PC { uint M; uint N; uint K; float alpha; float beta; };
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= M * N) return;
+    uint row = gid / N;
+    uint col = gid % N;
+    uint aBase = row * K;
+    uint bBase = col * K;
+    float acc = 0.0;
+    for (uint kk = 0u; kk < K; ++kk)
+        acc += A[aBase + kk] * B[bBase + kk];
+    C[gid] = (beta != 0.0) ? alpha * acc + beta * C[gid] : alpha * acc;
 }";
 
     /// <summary>

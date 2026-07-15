@@ -9,7 +9,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal
             "audio_compute_deltas", "audio_resample",
         };
 
-        public const string Source = @"
+        public static string Source => @"
 #include <metal_stdlib>
 #include <metal_math>
 using namespace metal;
@@ -51,7 +51,7 @@ kernel void audio_mulaw_encoding(
 }
 
 kernel void audio_mulaw_decoding(
-    device const float* input [[buffer(0)]],
+    device const int* input [[buffer(0)]],
     device float* output [[buffer(1)]],
     constant int& length [[buffer(2)]],
     constant int& quantizationChannels [[buffer(3)]],
@@ -60,7 +60,7 @@ kernel void audio_mulaw_decoding(
     if ((int)gid >= length) return;
     if (quantizationChannels < 2) { output[gid] = 0.0; return; }
     float mu = float(quantizationChannels - 1);
-    float q = input[gid];
+    float q = float(input[gid]);
     float y = (q / mu) * 2.0 - 1.0;
     float sgn = float(y > 0.0) - float(y < 0.0);
     output[gid] = sgn * (pow(1.0 + mu, fabs(y)) - 1.0) / mu;
@@ -126,6 +126,6 @@ kernel void audio_resample(
     }
     output[gid] = wSum > 0.0 ? acc / wSum : 0.0;
 }
-";
+" + MetalInstantNgpKernels.Source;
     }
 }

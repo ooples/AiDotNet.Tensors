@@ -25,10 +25,9 @@ internal static class HipAttentionKernels
 
 // ===========================================================================
 // SCALED DOT-PRODUCT ATTENTION
-// Uses online softmax + shared memory for K/V tiles.
-// Eliminates float scores[1024] VLA, supports arbitrary seqK.
-// Grid: (ceil(seqQ/ATTN_BR), batch*numHeads), Block: (ATTN_BR, 1)
-// Shared mem: 2 * ATTN_BC * headDim floats
+// One invocation owns one query row. Scores are recomputed in fixed key order,
+// avoiding sequence-sized local arrays and supporting arbitrary sequence/head sizes.
+// Grid: ceil(batch*numHeads*seqQ/blockDim.x), Block: implementation-selected.
 // ===========================================================================
 
 extern ""C"" __global__ __launch_bounds__(256) void scaled_dot_product_attention(
@@ -37,6 +36,7 @@ extern ""C"" __global__ __launch_bounds__(256) void scaled_dot_product_attention
     const float* value,      // [batch * heads * seqK * headDim]
     float* output,           // [batch * heads * seqQ * headDim]
     float* attentionWeights, // [batch * heads * seqQ * seqK] (optional)
+    const float* mask,       // shared [seqQ * seqK] or full [batch * heads * seqQ * seqK]
     int batch,
     int numHeads,
     int seqQ,
@@ -44,96 +44,68 @@ extern ""C"" __global__ __launch_bounds__(256) void scaled_dot_product_attention
     int headDim,
     float scale,
     int isCausal,
+    int maskMode,
     int storeWeights)
 {
-    int qBase = blockIdx.x * ATTN_BR;
-    int qi = qBase + threadIdx.x;
-    int bh = blockIdx.y;
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int totalRows = batch * numHeads * seqQ;
+    if (row >= totalRows) return;
 
-    if (bh >= batch * numHeads) return;
-    if (headDim > MAX_HEAD_DIM) return;
-
-    extern __shared__ float smem[];
-    float* Ks = smem;
-    float* Vs = smem + ATTN_BC * headDim;
-
-    int kBase = bh * seqK * headDim;
-    int vBase = bh * seqK * headDim;
+    int qi = row % seqQ;
+    int bh = row / seqQ;
+    int qOffset = row * headDim;
+    int kOffset = bh * seqK * headDim;
+    int vOffset = kOffset;
+    int wOffset = row * seqK;
+    int maskOffset = (maskMode == 2 ? bh * seqQ * seqK : 0) + qi * seqK;
 
     float rowMax = -INFINITY;
-    float rowSum = 0.0f;
-    float outAcc[MAX_HEAD_DIM];
-    for (int d = 0; d < headDim; d++) outAcc[d] = 0.0f;
-
-    for (int kvStart = 0; kvStart < seqK; kvStart += ATTN_BC) {
-        int tileSize = min(ATTN_BC, seqK - kvStart);
-
-        if (isCausal && kvStart > qBase + ATTN_BR - 1) break;
-
-        for (int i = threadIdx.x; i < tileSize * headDim; i += ATTN_BR) {
-            int row = i / headDim;
-            int col = i % headDim;
-            Ks[row * headDim + col] = key[kBase + (kvStart + row) * headDim + col];
+    for (int ki = 0; ki < seqK; ki++) {
+        if ((isCausal && ki > qi) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f)) continue;
+        float score = 0.0f;
+        for (int d = 0; d < headDim; d++) {
+            score += query[qOffset + d] * key[kOffset + ki * headDim + d];
         }
-        for (int i = threadIdx.x; i < tileSize * headDim; i += ATTN_BR) {
-            int row = i / headDim;
-            int col = i % headDim;
-            Vs[row * headDim + col] = value[vBase + (kvStart + row) * headDim + col];
-        }
-        __syncthreads();
-
-        if (qi < seqQ) {
-            int qOffset = bh * seqQ * headDim + qi * headDim;
-
-            for (int t = 0; t < tileSize; t++) {
-                int ki = kvStart + t;
-                if (isCausal && ki > qi) continue;
-
-                float score = 0.0f;
-                for (int d = 0; d < headDim; d++) {
-                    score += query[qOffset + d] * Ks[t * headDim + d];
-                }
-                score *= scale;
-
-                float newMax = fmaxf(rowMax, score);
-                float rescale = expf(rowMax - newMax);
-                float expScore = expf(score - newMax);
-                rowSum = rowSum * rescale + expScore;
-
-                for (int d = 0; d < headDim; d++) {
-                    outAcc[d] = outAcc[d] * rescale + expScore * Vs[t * headDim + d];
-                }
-                rowMax = newMax;
-            }
-        }
-        __syncthreads();
+        rowMax = fmaxf(rowMax, score * scale);
     }
 
-    if (qi < seqQ) {
-        int oOffset = bh * seqQ * headDim + qi * headDim;
-        float invSum = (rowSum > 0.0f) ? (1.0f / rowSum) : 0.0f;
+    float denominator = 0.0f;
+    for (int ki = 0; ki < seqK; ki++) {
+        if ((isCausal && ki > qi) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f)) continue;
+        float score = 0.0f;
         for (int d = 0; d < headDim; d++) {
-            output[oOffset + d] = outAcc[d] * invSum;
+            score += query[qOffset + d] * key[kOffset + ki * headDim + d];
         }
+        denominator += expf(score * scale - rowMax);
+    }
 
-        if (storeWeights) {
-            float logsumexp = rowMax + logf(rowSum);
-            int wOffset = bh * seqQ * seqK + qi * seqK;
-            int qOffset = bh * seqQ * headDim + qi * headDim;
-            int kOff = bh * seqK * headDim;
-            for (int ki = 0; ki < seqK; ki++) {
-                if (isCausal && ki > qi) {
-                    attentionWeights[wOffset + ki] = 0.0f;
-                    continue;
-                }
+    float inverseDenominator = denominator > 0.0f ? 1.0f / denominator : 0.0f;
+    if (storeWeights) {
+        for (int ki = 0; ki < seqK; ki++) {
+            float weight = 0.0f;
+            if (!((isCausal && ki > qi) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f))) {
                 float score = 0.0f;
                 for (int d = 0; d < headDim; d++) {
-                    score += query[qOffset + d] * key[kOff + ki * headDim + d];
+                    score += query[qOffset + d] * key[kOffset + ki * headDim + d];
                 }
-                score *= scale;
-                attentionWeights[wOffset + ki] = expf(score - logsumexp);
+                weight = expf(score * scale - rowMax) * inverseDenominator;
             }
+            attentionWeights[wOffset + ki] = weight;
         }
+    }
+
+    for (int d = 0; d < headDim; d++) {
+        float sum = 0.0f;
+        for (int ki = 0; ki < seqK; ki++) {
+            if ((isCausal && ki > qi) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f)) continue;
+            float score = 0.0f;
+            for (int inner = 0; inner < headDim; inner++) {
+                score += query[qOffset + inner] * key[kOffset + ki * headDim + inner];
+            }
+            float weight = expf(score * scale - rowMax) * inverseDenominator;
+            sum += weight * value[vOffset + ki * headDim + d];
+        }
+        output[qOffset + d] = sum;
     }
 }
 
@@ -294,6 +266,7 @@ extern ""C"" __global__ __launch_bounds__(256) void flash_attention_backward_gra
     float doO = 0.0f;
     for (int d = 0; d < headDim; d++) {
         doO += gradOutput[gOffset + d] * output[qOffset + d];
+        gradQuery[qOffset + d] = 0.0f;
     }
 
     for (int ki = 0; ki < seqK; ki++) {
@@ -389,8 +362,8 @@ extern ""C"" __global__ __launch_bounds__(256) void flash_attention_backward_gra
         accK += dS * query[qOffset + d];
     }
 
-    gradValue[vOffset + ki * headDim + d] += accV;
-    gradKey[kOffset + ki * headDim + d] += accK;
+    gradValue[vOffset + ki * headDim + d] = accV;
+    gradKey[kOffset + ki * headDim + d] = accK;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void flash_attention_backward(
@@ -666,6 +639,7 @@ extern ""C"" __global__ __launch_bounds__(256) void grouped_query_attention_back
     int wOffset = bqh * seqQ * seqK + qi * seqK;
 
     float dotProduct = 0.0f;
+    for (int dd = 0; dd < headDim; dd++) gradQuery[qOffset + dd] = 0.0f;
     for (int ki = 0; ki < seqK; ki++) {
         float w = attentionWeights[wOffset + ki];
         float gw = 0.0f;
@@ -719,6 +693,7 @@ extern ""C"" __global__ __launch_bounds__(256) void grouped_query_attention_back
 
     for (int qhOff = 0; qhOff < queriesPerKV; qhOff++) {
         int qh = kvh * queriesPerKV + qhOff;
+        if (qh >= numQHeads) break;
         int bqh = b * numQHeads + qh;
         int qheadBase = bqh * seqQ * headDim;
         int wheadBase = bqh * seqQ * seqK;
@@ -750,8 +725,8 @@ extern ""C"" __global__ __launch_bounds__(256) void grouped_query_attention_back
         }
     }
 
-    gradValue[kvOffsetBase + ki * headDim + d] += accV;
-    gradKey[kvOffsetBase + ki * headDim + d] += accK;
+    gradValue[kvOffsetBase + ki * headDim + d] = accV;
+    gradKey[kvOffsetBase + ki * headDim + d] = accK;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void grouped_query_attention_backward(

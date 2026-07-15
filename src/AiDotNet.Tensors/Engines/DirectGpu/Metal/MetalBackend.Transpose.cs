@@ -62,93 +62,50 @@ public sealed partial class MetalBackend
     public void Permute(IGpuBuffer input, IGpuBuffer output, int[] shape, int[] permutation)
     {
         ThrowIfDisposed();
+        int dimensions = shape.Length;
+        if (dimensions == 0)
+            throw new ArgumentException("Shape must contain at least one dimension.", nameof(shape));
+        if (permutation.Length != dimensions)
+            throw new ArgumentException($"Permutation length ({permutation.Length}) must match shape dimensions ({dimensions}).", nameof(permutation));
 
-        int ndim = shape.Length;
-
-        // Validate permutation array
-        if (permutation.Length != ndim)
+        var seen = new bool[dimensions];
+        var outputShape = new int[dimensions];
+        var inputStrides = new int[dimensions];
+        var outputStrides = new int[dimensions];
+        for (int i = 0; i < dimensions; ++i)
         {
-            throw new ArgumentException($"Permutation length ({permutation.Length}) must match shape dimensions ({ndim}).", nameof(permutation));
+            int axis = permutation[i];
+            if ((uint)axis >= (uint)dimensions)
+                throw new ArgumentOutOfRangeException(nameof(permutation), $"Permutation index {axis} at position {i} is out of range [0, {dimensions}).");
+            if (seen[axis])
+                throw new ArgumentException($"Duplicate index {axis} in permutation array.", nameof(permutation));
+            seen[axis] = true;
+            outputShape[i] = shape[axis];
         }
 
-        var seen = new bool[ndim];
-        for (int i = 0; i < ndim; i++)
+        inputStrides[dimensions - 1] = 1;
+        outputStrides[dimensions - 1] = 1;
+        for (int i = dimensions - 2; i >= 0; --i)
         {
-            if (permutation[i] < 0 || permutation[i] >= ndim)
-            {
-                throw new ArgumentOutOfRangeException(nameof(permutation), $"Permutation index {permutation[i]} at position {i} is out of range [0, {ndim}).");
-            }
-            if (seen[permutation[i]])
-            {
-                throw new ArgumentException($"Duplicate index {permutation[i]} in permutation array.", nameof(permutation));
-            }
-            seen[permutation[i]] = true;
+            inputStrides[i] = checked(inputStrides[i + 1] * shape[i + 1]);
+            outputStrides[i] = checked(outputStrides[i + 1] * outputShape[i + 1]);
         }
+        int count = 1;
+        for (int i = 0; i < dimensions; ++i)
+            count = checked(count * shape[i]);
+        if (count <= 0) return;
 
-        var inputData = DownloadBuffer(input);
-
-        // Compute output shape and strides
-        var outputShape = new int[ndim];
-        for (int i = 0; i < ndim; i++)
-        {
-            outputShape[i] = shape[permutation[i]];
-        }
-
-        // Compute input strides
-        var inputStrides = new int[ndim];
-        inputStrides[ndim - 1] = 1;
-        for (int i = ndim - 2; i >= 0; i--)
-        {
-            inputStrides[i] = inputStrides[i + 1] * shape[i + 1];
-        }
-
-        // Compute output strides
-        var outputStrides = new int[ndim];
-        outputStrides[ndim - 1] = 1;
-        for (int i = ndim - 2; i >= 0; i--)
-        {
-            outputStrides[i] = outputStrides[i + 1] * outputShape[i + 1];
-        }
-
-        int totalSize = 1;
-        for (int i = 0; i < ndim; i++)
-        {
-            totalSize *= shape[i];
-        }
-
-        var outputData = new float[totalSize];
-
-        // Preallocate coordinate arrays outside loop to avoid per-element GC pressure
-        var outCoords = new int[ndim];
-        var inCoords = new int[ndim];
-
-        for (int outIdx = 0; outIdx < totalSize; outIdx++)
-        {
-            // Convert output index to coordinates
-            int remaining = outIdx;
-            for (int d = 0; d < ndim; d++)
-            {
-                outCoords[d] = remaining / outputStrides[d];
-                remaining %= outputStrides[d];
-            }
-
-            // Convert to input coordinates using inverse permutation
-            for (int d = 0; d < ndim; d++)
-            {
-                inCoords[permutation[d]] = outCoords[d];
-            }
-
-            // Convert input coordinates to index
-            int inIdx = 0;
-            for (int d = 0; d < ndim; d++)
-            {
-                inIdx += inCoords[d] * inputStrides[d];
-            }
-
-            outputData[outIdx] = inputData[inIdx];
-        }
-
-        UploadToBuffer(output, outputData);
+        using var inputStrideBuffer = AllocateIntBuffer(inputStrides);
+        using var outputStrideBuffer = AllocateIntBuffer(outputStrides);
+        using var permutationBuffer = AllocateIntBuffer(permutation);
+        bool aliasesInput = ReferenceEquals(input, output);
+        using var temporary = aliasesInput ? AllocateBuffer(count) : null;
+        IGpuBuffer target = temporary ?? output;
+        DispatchResidentMetal("permute_tensor", count,
+            new[] { input, target, inputStrideBuffer, outputStrideBuffer, permutationBuffer },
+            (uint)dimensions, (uint)count);
+        if (temporary is not null)
+            Copy(temporary, output, count);
     }
 
     /// <summary>
@@ -156,18 +113,7 @@ public sealed partial class MetalBackend
     /// </summary>
     public void Copy(IGpuBuffer source, IGpuBuffer destination, int size)
     {
-        ThrowIfDisposed();
-        var data = DownloadBuffer(source);
-        if (data.Length > size)
-        {
-            var slice = new float[size];
-            Array.Copy(data, slice, size);
-            UploadToBuffer(destination, slice);
-        }
-        else
-        {
-            UploadToBuffer(destination, data);
-        }
+        Copy(source, 0, destination, 0, size);
     }
 
     /// <summary>
@@ -176,9 +122,18 @@ public sealed partial class MetalBackend
     public void Fill(IGpuBuffer buffer, float value, int size)
     {
         ThrowIfDisposed();
-        var data = new float[size];
-        for (int i = 0; i < data.Length; i++) data[i] = value;
-        UploadToBuffer(buffer, data);
+        if (size <= 0) return;
+        if (buffer is not MetalGpuBuffer metalBuffer)
+            throw new ArgumentException("Buffer must be MetalGpuBuffer", nameof(buffer));
+
+        var pipeline = GetPipeline("ElementWise", _elementWiseLibrary, "fill_buffer");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(size);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(metalBuffer, 0);
+        encoder.SetBytes(value, 1);
+        encoder.SetBytes((uint)size, 2);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
 
     /// <summary>
@@ -187,19 +142,18 @@ public sealed partial class MetalBackend
     public void Copy2DStrided(IGpuBuffer source, IGpuBuffer destination, int numRows, int srcCols, int destTotalCols, int destColOffset)
     {
         ThrowIfDisposed();
-
-        var srcData = DownloadBuffer(source);
-        var destData = DownloadBuffer(destination);
-
-        for (int row = 0; row < numRows; row++)
+        int count = checked(numRows * srcCols);
+        if (count <= 0) return;
+        bool aliasesSource = ReferenceEquals(source, destination);
+        using var sourceCopy = aliasesSource ? AllocateBuffer(count) : null;
+        IGpuBuffer effectiveSource = source;
+        if (sourceCopy is not null)
         {
-            for (int col = 0; col < srcCols; col++)
-            {
-                destData[row * destTotalCols + destColOffset + col] = srcData[row * srcCols + col];
-            }
+            Copy(source, sourceCopy, count);
+            effectiveSource = sourceCopy;
         }
-
-        UploadToBuffer(destination, destData);
+        DispatchResidentMetal("copy_2d_strided", count, new[] { effectiveSource, destination },
+            (uint)numRows, (uint)srcCols, (uint)destTotalCols, (uint)destColOffset);
     }
 
     /// <summary>
@@ -208,28 +162,15 @@ public sealed partial class MetalBackend
     public void NearestNeighborUpsample(IGpuBuffer input, IGpuBuffer output, int batchChannels, int height, int width, int scaleFactor)
     {
         ThrowIfDisposed();
-
-        var inputData = DownloadBuffer(input);
-        int outHeight = height * scaleFactor;
-        int outWidth = width * scaleFactor;
-        var outputData = new float[batchChannels * outHeight * outWidth];
-
-        for (int bc = 0; bc < batchChannels; bc++)
-        {
-            for (int oh = 0; oh < outHeight; oh++)
-            {
-                int ih = oh / scaleFactor;
-                for (int ow = 0; ow < outWidth; ow++)
-                {
-                    int iw = ow / scaleFactor;
-                    int outIdx = bc * outHeight * outWidth + oh * outWidth + ow;
-                    int inIdx = bc * height * width + ih * width + iw;
-                    outputData[outIdx] = inputData[inIdx];
-                }
-            }
-        }
-
-        UploadToBuffer(output, outputData);
+        if (scaleFactor <= 0) throw new ArgumentOutOfRangeException(nameof(scaleFactor));
+        int count = checked(batchChannels * height * scaleFactor * width * scaleFactor);
+        if (count <= 0) return;
+        bool aliasesInput = ReferenceEquals(input, output);
+        using var temporary = aliasesInput ? AllocateBuffer(count) : null;
+        IGpuBuffer target = temporary ?? output;
+        DispatchResidentMetal("nearest_upsample_2d", count, new[] { input, target },
+            (uint)batchChannels, (uint)height, (uint)width, (uint)scaleFactor);
+        if (temporary is not null) Copy(temporary, output, count);
     }
 
     /// <summary>
@@ -238,28 +179,11 @@ public sealed partial class MetalBackend
     public void NearestNeighborUpsampleBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batchChannels, int height, int width, int scaleFactor)
     {
         ThrowIfDisposed();
-
-        var gradOutputData = DownloadBuffer(gradOutput);
-        int outHeight = height * scaleFactor;
-        int outWidth = width * scaleFactor;
-        var gradInputData = new float[batchChannels * height * width];
-
-        for (int bc = 0; bc < batchChannels; bc++)
-        {
-            for (int oh = 0; oh < outHeight; oh++)
-            {
-                int ih = oh / scaleFactor;
-                for (int ow = 0; ow < outWidth; ow++)
-                {
-                    int iw = ow / scaleFactor;
-                    int outIdx = bc * outHeight * outWidth + oh * outWidth + ow;
-                    int inIdx = bc * height * width + ih * width + iw;
-                    gradInputData[inIdx] += gradOutputData[outIdx];
-                }
-            }
-        }
-
-        UploadToBuffer(gradInput, gradInputData);
+        if (scaleFactor <= 0) throw new ArgumentOutOfRangeException(nameof(scaleFactor));
+        int count = checked(batchChannels * height * width);
+        if (count <= 0) return;
+        DispatchResidentMetal("nearest_upsample_2d_backward", count, new[] { gradOutput, gradInput },
+            (uint)batchChannels, (uint)height, (uint)width, (uint)scaleFactor);
     }
 
     /// <summary>
@@ -270,36 +194,17 @@ public sealed partial class MetalBackend
         int scaleD, int scaleH, int scaleW)
     {
         ThrowIfDisposed();
-
-        var inputData = DownloadBuffer(input);
-        int outDepth = inDepth * scaleD;
-        int outHeight = inHeight * scaleH;
-        int outWidth = inWidth * scaleW;
-        var outputData = new float[batch * channels * outDepth * outHeight * outWidth];
-
-        for (int b = 0; b < batch; b++)
-        {
-            for (int c = 0; c < channels; c++)
-            {
-                for (int od = 0; od < outDepth; od++)
-                {
-                    int id = od / scaleD;
-                    for (int oh = 0; oh < outHeight; oh++)
-                    {
-                        int ih = oh / scaleH;
-                        for (int ow = 0; ow < outWidth; ow++)
-                        {
-                            int iw = ow / scaleW;
-                            int outIdx = ((b * channels + c) * outDepth + od) * outHeight * outWidth + oh * outWidth + ow;
-                            int inIdx = ((b * channels + c) * inDepth + id) * inHeight * inWidth + ih * inWidth + iw;
-                            outputData[outIdx] = inputData[inIdx];
-                        }
-                    }
-                }
-            }
-        }
-
-        UploadToBuffer(output, outputData);
+        if (scaleD <= 0 || scaleH <= 0 || scaleW <= 0)
+            throw new ArgumentOutOfRangeException(nameof(scaleD), "Scale factors must be positive.");
+        int count = checked(batch * channels * inDepth * scaleD * inHeight * scaleH * inWidth * scaleW);
+        if (count <= 0) return;
+        bool aliasesInput = ReferenceEquals(input, output);
+        using var temporary = aliasesInput ? AllocateBuffer(count) : null;
+        IGpuBuffer target = temporary ?? output;
+        DispatchResidentMetal("nearest_upsample_3d", count, new[] { input, target },
+            (uint)batch, (uint)channels, (uint)inDepth, (uint)inHeight, (uint)inWidth,
+            (uint)scaleD, (uint)scaleH, (uint)scaleW);
+        if (temporary is not null) Copy(temporary, output, count);
     }
 
     /// <summary>
@@ -310,36 +215,13 @@ public sealed partial class MetalBackend
         int scaleD, int scaleH, int scaleW)
     {
         ThrowIfDisposed();
-
-        var gradOutputData = DownloadBuffer(gradOutput);
-        int outDepth = inDepth * scaleD;
-        int outHeight = inHeight * scaleH;
-        int outWidth = inWidth * scaleW;
-        var gradInputData = new float[batch * channels * inDepth * inHeight * inWidth];
-
-        for (int b = 0; b < batch; b++)
-        {
-            for (int c = 0; c < channels; c++)
-            {
-                for (int od = 0; od < outDepth; od++)
-                {
-                    int id = od / scaleD;
-                    for (int oh = 0; oh < outHeight; oh++)
-                    {
-                        int ih = oh / scaleH;
-                        for (int ow = 0; ow < outWidth; ow++)
-                        {
-                            int iw = ow / scaleW;
-                            int outIdx = ((b * channels + c) * outDepth + od) * outHeight * outWidth + oh * outWidth + ow;
-                            int inIdx = ((b * channels + c) * inDepth + id) * inHeight * inWidth + ih * inWidth + iw;
-                            gradInputData[inIdx] += gradOutputData[outIdx];
-                        }
-                    }
-                }
-            }
-        }
-
-        UploadToBuffer(gradInput, gradInputData);
+        if (scaleD <= 0 || scaleH <= 0 || scaleW <= 0)
+            throw new ArgumentOutOfRangeException(nameof(scaleD), "Scale factors must be positive.");
+        int count = checked(batch * channels * inDepth * inHeight * inWidth);
+        if (count <= 0) return;
+        DispatchResidentMetal("nearest_upsample_3d_backward", count, new[] { gradOutput, gradInput },
+            (uint)batch, (uint)channels, (uint)inDepth, (uint)inHeight, (uint)inWidth,
+            (uint)scaleD, (uint)scaleH, (uint)scaleW);
     }
 
     #endregion
@@ -352,16 +234,19 @@ public sealed partial class MetalBackend
     public void Clamp(IGpuBuffer A, IGpuBuffer B, float min, float max, int size)
     {
         ThrowIfDisposed();
-
-        var aData = DownloadBuffer(A);
-        var bData = new float[size];
-
-        for (int i = 0; i < size; i++)
-        {
-            bData[i] = MathF.Max(min, MathF.Min(max, aData[i]));
-        }
-
-        UploadToBuffer(B, bData);
+        if (size <= 0) return;
+        if (A is not MetalGpuBuffer input || B is not MetalGpuBuffer output)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer.");
+        var pipeline = GetPipeline("ElementWise", _elementWiseLibrary, "clamp_kernel");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(size);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(input, 0);
+        encoder.SetBuffer(output, 1);
+        encoder.SetBytes(min, 2);
+        encoder.SetBytes(max, 3);
+        encoder.SetBytes((uint)size, 4);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
 
     /// <summary>
@@ -370,16 +255,10 @@ public sealed partial class MetalBackend
     public float L2Norm(IGpuBuffer A, int size)
     {
         ThrowIfDisposed();
-
-        var aData = DownloadBuffer(A);
-        float sumSq = 0;
-
-        for (int i = 0; i < size; i++)
-        {
-            sumSq += aData[i] * aData[i];
-        }
-
-        return MathF.Sqrt(sumSq);
+        if (size <= 0) return 0f;
+        using var result = AllocateBuffer(1);
+        DispatchResidentMetal("l2_norm_serial", 1, new[] { A, result }, (uint)size);
+        return DownloadBuffer(result)[0];
     }
 
     /// <summary>
@@ -397,26 +276,20 @@ public sealed partial class MetalBackend
     public void ClipByNorm(IGpuBuffer A, IGpuBuffer B, float maxNorm, int size)
     {
         ThrowIfDisposed();
-
-        var aData = DownloadBuffer(A);
-        var bData = new float[size];
-
-        float norm = L2Norm(A, size);
-
-        if (norm > maxNorm)
-        {
-            float scale = maxNorm / norm;
-            for (int i = 0; i < size; i++)
-            {
-                bData[i] = aData[i] * scale;
-            }
-        }
-        else
-        {
-            Array.Copy(aData, bData, size);
-        }
-
-        UploadToBuffer(B, bData);
+        if (size <= 0) return;
+        if (A is not MetalGpuBuffer input || B is not MetalGpuBuffer output)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer.");
+        if (_residentLibrary == IntPtr.Zero)
+            throw new InvalidOperationException("Metal resident kernels are unavailable.");
+        var pipeline = GetPipeline("Resident", _residentLibrary, "clip_by_norm_serial");
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(input, 0);
+        encoder.SetBuffer(output, 1);
+        encoder.SetBytes((uint)size, 2);
+        encoder.SetBytes(maxNorm, 3);
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(1);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
 
     /// <summary>
@@ -425,18 +298,20 @@ public sealed partial class MetalBackend
     public void Fma(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, IGpuBuffer D, int size)
     {
         ThrowIfDisposed();
-
-        var aData = DownloadBuffer(A);
-        var bData = DownloadBuffer(B);
-        var cData = DownloadBuffer(C);
-        var dData = new float[size];
-
-        for (int i = 0; i < size; i++)
-        {
-            dData[i] = aData[i] * bData[i] + cData[i];
-        }
-
-        UploadToBuffer(D, dData);
+        if (size <= 0) return;
+        if (A is not MetalGpuBuffer a || B is not MetalGpuBuffer b ||
+            C is not MetalGpuBuffer c || D is not MetalGpuBuffer output)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer.");
+        var pipeline = GetPipeline("ElementWise", _elementWiseLibrary, "fma_kernel");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(size);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(a, 0);
+        encoder.SetBuffer(b, 1);
+        encoder.SetBuffer(c, 2);
+        encoder.SetBuffer(output, 3);
+        encoder.SetBytes((uint)size, 4);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
 
     /// <summary>
@@ -527,23 +402,17 @@ public sealed partial class MetalBackend
     public void ScatterAdd(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer destination, int sourceSize, int destSize)
     {
         ThrowIfDisposed();
-
-        var srcData = DownloadBuffer(source);
-        var idxData = DownloadIntBuffer(indices, sourceSize);
-        var destData = DownloadBuffer(destination);
-
-        for (int i = 0; i < sourceSize; i++)
+        if (sourceSize <= 0 || destSize <= 0) return;
+        bool aliasesSource = ReferenceEquals(source, destination);
+        using var sourceCopy = aliasesSource ? AllocateBuffer(sourceSize) : null;
+        IGpuBuffer effectiveSource = source;
+        if (sourceCopy is not null)
         {
-            int idx = idxData[i];
-            if (idx < 0 || idx >= destSize)
-            {
-                throw new ArgumentOutOfRangeException(nameof(indices), $"Index {idx} at position {i} is out of range [0, {destSize})");
-            }
-
-            destData[idx] += srcData[i];
+            Copy(source, sourceCopy, sourceSize);
+            effectiveSource = sourceCopy;
         }
-
-        UploadToBuffer(destination, destData);
+        DispatchResidentMetal("scatter_add_deterministic", destSize,
+            new[] { effectiveSource, indices, destination }, (uint)sourceSize, (uint)destSize);
     }
 
     /// <summary>
@@ -553,27 +422,10 @@ public sealed partial class MetalBackend
         int numIndices, int featureSize)
     {
         ThrowIfDisposed();
-
-        var gradDestData = DownloadBuffer(gradDestination);
-        var idxData = DownloadIntBuffer(indices, numIndices);
-        var gradSrcData = new float[numIndices * featureSize];
-
-        int maxGradIdx = gradDestData.Length / featureSize;
-        for (int i = 0; i < numIndices; i++)
-        {
-            int idx = idxData[i];
-            if (idx < 0 || idx >= maxGradIdx)
-            {
-                throw new ArgumentOutOfRangeException(nameof(indices), $"Index {idx} at position {i} is out of range [0, {maxGradIdx})");
-            }
-
-            for (int f = 0; f < featureSize; f++)
-            {
-                gradSrcData[i * featureSize + f] = gradDestData[idx * featureSize + f];
-            }
-        }
-
-        UploadToBuffer(gradSource, gradSrcData);
+        int count = checked(numIndices * featureSize);
+        if (count <= 0) return;
+        DispatchResidentMetal("indexed_gather", count,
+            new[] { gradDestination, indices, gradSource }, (uint)numIndices, (uint)featureSize);
     }
 
     /// <summary>
@@ -582,27 +434,14 @@ public sealed partial class MetalBackend
     public void Gather(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, int numIndices, int featureSize)
     {
         ThrowIfDisposed();
-
-        var srcData = DownloadBuffer(source);
-        var idxData = DownloadIntBuffer(indices, numIndices);
-        var outData = new float[numIndices * featureSize];
-
-        int maxSrcIdx = srcData.Length / featureSize;
-        for (int i = 0; i < numIndices; i++)
-        {
-            int idx = idxData[i];
-            if (idx < 0 || idx >= maxSrcIdx)
-            {
-                throw new ArgumentOutOfRangeException(nameof(indices), $"Index {idx} at position {i} is out of range [0, {maxSrcIdx})");
-            }
-
-            for (int f = 0; f < featureSize; f++)
-            {
-                outData[i * featureSize + f] = srcData[idx * featureSize + f];
-            }
-        }
-
-        UploadToBuffer(output, outData);
+        int count = checked(numIndices * featureSize);
+        if (count <= 0) return;
+        bool aliasesSource = ReferenceEquals(source, output);
+        using var temporary = aliasesSource ? AllocateBuffer(count) : null;
+        IGpuBuffer target = temporary ?? output;
+        DispatchResidentMetal("indexed_gather", count,
+            new[] { source, indices, target }, (uint)numIndices, (uint)featureSize);
+        if (temporary is not null) Copy(temporary, output, count);
     }
 
     #endregion
@@ -615,21 +454,10 @@ public sealed partial class MetalBackend
     public void ConvertToFp16(IGpuBuffer input, IGpuBuffer output, int size)
     {
         ThrowIfDisposed();
-
-        var inputData = DownloadBuffer(input);
-        var outputBytes = new byte[size * 2];
-
-        for (int i = 0; i < size; i++)
-        {
-            ushort fp16 = FloatToHalf(inputData[i]);
-            outputBytes[i * 2] = (byte)(fp16 & 0xFF);
-            outputBytes[i * 2 + 1] = (byte)((fp16 >> 8) & 0xFF);
-        }
-
-        // Upload as float buffer (reinterpreted bytes)
-        var floatData = new float[(size + 1) / 2];
-        Buffer.BlockCopy(outputBytes, 0, floatData, 0, size * 2);
-        UploadToBuffer(output, floatData);
+        if (size <= 0) return;
+        int packedCount = checked((size + 1) / 2);
+        DispatchResidentMetal("convert_to_fp16_packed", packedCount,
+            new[] { input, output }, (uint)size);
     }
 
     /// <summary>
@@ -638,31 +466,12 @@ public sealed partial class MetalBackend
     public void ConvertToFp32(IGpuBuffer input, IGpuBuffer output, int size)
     {
         ThrowIfDisposed();
-
-        var inputFloatData = DownloadBuffer(input);
-
-        // Input buffer must have at least (size + 1) / 2 floats to hold size FP16 values
-        int requiredFloats = (size + 1) / 2;
-        if (inputFloatData.Length < requiredFloats)
-        {
-            throw new ArgumentException(
-                $"Input buffer too small: has {inputFloatData.Length} floats but needs at least {requiredFloats} to hold {size} FP16 values.",
-                nameof(input));
-        }
-
-        int bytesToCopy = size * 2;
-        var inputBytes = new byte[bytesToCopy];
-        Buffer.BlockCopy(inputFloatData, 0, inputBytes, 0, bytesToCopy);
-
-        var outputData = new float[size];
-
-        for (int i = 0; i < size; i++)
-        {
-            ushort fp16 = (ushort)(inputBytes[i * 2] | (inputBytes[i * 2 + 1] << 8));
-            outputData[i] = HalfToFloat(fp16);
-        }
-
-        UploadToBuffer(output, outputData);
+        if (size <= 0) return;
+        int requiredFloats = checked((size + 1) / 2);
+        if (input.Size < requiredFloats)
+            throw new ArgumentException($"Input buffer too small: has {input.Size} floats but needs at least {requiredFloats} to hold {size} FP16 values.", nameof(input));
+        DispatchResidentMetal("convert_from_fp16_packed", size,
+            new[] { input, output }, (uint)size);
     }
 
     private static ushort FloatToHalf(float value)

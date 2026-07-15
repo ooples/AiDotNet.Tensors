@@ -127,7 +127,7 @@ public sealed partial class MetalBackend
     {
         ThrowIfDisposed();
         var pipeline = GetParity210Pipeline("parity210_index_write");
-        int __total = outerSize*idxAxis*innerSize; if (__total <= 0) return;
+        int __total = outerSize*dstAxis*innerSize; if (__total <= 0) return;
         var (tgr, tpg) = pipeline.Calculate1DDispatch(__total);
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
         encoder.SetPipelineState(pipeline.Handle);
@@ -424,7 +424,7 @@ public sealed partial class MetalBackend
     {
         ThrowIfDisposed();
         var pipeline = GetParity210Pipeline("parity210_istft_from_spectrum");
-        int __total = batch*numFrames*nFft; if (__total <= 0) return;
+        int __total = batch*outputLength; if (__total <= 0) return;
         var (tgr, tpg) = pipeline.Calculate1DDispatch(__total);
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
         encoder.SetPipelineState(pipeline.Handle);

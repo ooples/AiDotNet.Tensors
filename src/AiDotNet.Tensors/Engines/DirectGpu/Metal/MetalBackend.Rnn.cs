@@ -121,18 +121,35 @@ public partial class MetalBackend
         IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target, int n, int d, int vocab)
         => FusedCeRowLoss("fused_linear_ce_dense", hidden, weight, bias, target, n, d, vocab);
 
+    public void FusedLinearCrossEntropyIndex(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer targetIds,
+        IGpuBuffer meanLoss, int n, int d, int vocab)
+        => FusedCeRowLossResident("fused_linear_ce_index", hidden, weight, bias, targetIds, meanLoss, n, d, vocab);
+
+    public void FusedLinearCrossEntropyDense(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target,
+        IGpuBuffer meanLoss, int n, int d, int vocab)
+        => FusedCeRowLossResident("fused_linear_ce_dense", hidden, weight, bias, target, meanLoss, n, d, vocab);
+
     private float FusedCeRowLoss(
         string kernelName, IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer tgt, int n, int d, int vocab)
+    {
+        using var meanLoss = AllocateBuffer(1);
+        FusedCeRowLossResident(kernelName, hidden, weight, bias, tgt, meanLoss, n, d, vocab);
+        return DownloadBuffer(meanLoss)[0];
+    }
+
+    private void FusedCeRowLossResident(
+        string kernelName, IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer tgt,
+        IGpuBuffer meanLoss, int n, int d, int vocab)
     {
         if (n <= 0 || d <= 0 || vocab <= 0)
             throw new ArgumentOutOfRangeException(nameof(n), "Fused CE dimensions (n, d, vocab) must be positive.");
         using var rowLoss = AllocateBuffer(n);
         DispatchRecurrence(kernelName, n,
             new[] { M(hidden), M(weight), M(bias), M(tgt), M(rowLoss) }, new[] { n, d, vocab });
-        var rl = DownloadBuffer(rowLoss);
-        double sum = 0.0;
-        for (int i = 0; i < n; i++) sum += rl[i];
-        return (float)(sum / n);
+        SumAxis(rowLoss, meanLoss, 1, n);
+        Scale(meanLoss, meanLoss, 1f / n, 1);
     }
 
     /// <summary>
@@ -163,114 +180,16 @@ public partial class MetalBackend
         IGpuBuffer allH, IGpuBuffer allC, IGpuBuffer cacheGates,
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
-        // CPU fallback implementation for LSTM forward sequence
-        var inputData = DownloadBuffer(input);
-        var hInitData = DownloadBuffer(hInit);
-        var cInitData = DownloadBuffer(cInit);
-        var wIh = DownloadBuffer(weightsIh);
-        var wHh = DownloadBuffer(weightsHh);
-        var bIh = DownloadBuffer(biasIh);
-        var bHh = DownloadBuffer(biasHh);
-
-        var outputData = new float[seqLen * batch * hiddenSize];
-        var allHData = new float[(seqLen + 1) * batch * hiddenSize];
-        var allCData = new float[(seqLen + 1) * batch * hiddenSize];
-        var gatesData = new float[seqLen * batch * hiddenSize * 4];
-
-        // Copy initial states to allH[0] and allC[0]
-        int stateSize = batch * hiddenSize;
-        Array.Copy(hInitData, 0, allHData, 0, stateSize);
-        Array.Copy(cInitData, 0, allCData, 0, stateSize);
-
-        // Process each timestep
-        for (int t = 0; t < seqLen; t++)
-        {
-            int inputOffset = t * batch * inputSize;
-            int hPrevOffset = t * stateSize;
-            int hCurrOffset = (t + 1) * stateSize;
-            int outputOffset = t * batch * hiddenSize;
-            int gateOffset = t * batch * hiddenSize * 4;
-
-            // For each batch element
-            for (int b = 0; b < batch; b++)
-            {
-                // Compute gates: i, f, g, o
-                var gates = new float[4 * hiddenSize];
-
-                // Input to hidden contribution
-                for (int g = 0; g < 4; g++)
-                {
-                    for (int h = 0; h < hiddenSize; h++)
-                    {
-                        float sum = bIh[g * hiddenSize + h] + bHh[g * hiddenSize + h];
-
-                        // Input contribution
-                        for (int i = 0; i < inputSize; i++)
-                        {
-                            int wIdx = g * hiddenSize * inputSize + h * inputSize + i;
-                            sum += wIh[wIdx] * inputData[inputOffset + b * inputSize + i];
-                        }
-
-                        // Hidden contribution
-                        for (int hp = 0; hp < hiddenSize; hp++)
-                        {
-                            int wIdx = g * hiddenSize * hiddenSize + h * hiddenSize + hp;
-                            sum += wHh[wIdx] * allHData[hPrevOffset + b * hiddenSize + hp];
-                        }
-
-                        gates[g * hiddenSize + h] = sum;
-                    }
-                }
-
-                // Apply activations and compute cell/hidden states
-                for (int h = 0; h < hiddenSize; h++)
-                {
-                    // Input gate (sigmoid)
-                    float i_gate = SigmoidActivation(gates[0 * hiddenSize + h]);
-                    // Forget gate (sigmoid)
-                    float f_gate = SigmoidActivation(gates[1 * hiddenSize + h]);
-                    // Cell candidate (tanh)
-                    float g_gate = (float)Math.Tanh(gates[2 * hiddenSize + h]);
-                    // Output gate (sigmoid)
-                    float o_gate = SigmoidActivation(gates[3 * hiddenSize + h]);
-
-                    // Cache gates for backward pass
-                    int cacheIdx = gateOffset + b * hiddenSize * 4 + h * 4;
-                    gatesData[cacheIdx + 0] = i_gate;
-                    gatesData[cacheIdx + 1] = f_gate;
-                    gatesData[cacheIdx + 2] = g_gate;
-                    gatesData[cacheIdx + 3] = o_gate;
-
-                    // Cell state update: c_t = f * c_{t-1} + i * g
-                    float cPrev = allCData[hPrevOffset + b * hiddenSize + h];
-                    float cCurr = f_gate * cPrev + i_gate * g_gate;
-                    allCData[hCurrOffset + b * hiddenSize + h] = cCurr;
-
-                    // Hidden state update: h_t = o * tanh(c_t)
-                    float hCurr = o_gate * (float)Math.Tanh(cCurr);
-                    allHData[hCurrOffset + b * hiddenSize + h] = hCurr;
-                    outputData[outputOffset + b * hiddenSize + h] = hCurr;
-                }
-            }
-        }
-
-        // Copy final states
-        Array.Copy(allHData, seqLen * stateSize, new float[stateSize], 0, stateSize);
-        Array.Copy(allCData, seqLen * stateSize, new float[stateSize], 0, stateSize);
-
-        // Upload results
-        UploadToBuffer(output, outputData);
-        UploadToBuffer(allH, allHData);
-        UploadToBuffer(allC, allCData);
-        UploadToBuffer(cacheGates, gatesData);
-
-        // Copy final hidden and cell states
-        var hFinalData = new float[stateSize];
-        var cFinalData = new float[stateSize];
-        Array.Copy(allHData, seqLen * stateSize, hFinalData, 0, stateSize);
-        Array.Copy(allCData, seqLen * stateSize, cFinalData, 0, stateSize);
-        UploadToBuffer(hFinal, hFinalData);
-        UploadToBuffer(cFinal, cFinalData);
+        ThrowIfDisposed();
+        if (seqLen <= 0 || batch <= 0 || inputSize <= 0 || hiddenSize <= 0) return;
+        int stateSize = checked(batch * hiddenSize);
+        Copy(hInit, 0, allH, 0, stateSize);
+        Copy(cInit, 0, allC, 0, stateSize);
+        DispatchResidentMetal("lstm_forward_sequence", batch,
+            new[] { input, weightsIh, weightsHh, biasIh, biasHh, output, allH, allC, cacheGates },
+            (uint)seqLen, (uint)batch, (uint)inputSize, (uint)hiddenSize);
+        Copy(allH, checked(seqLen * stateSize), hFinal, 0, stateSize);
+        Copy(allC, checked(seqLen * stateSize), cFinal, 0, stateSize);
     }
 
     /// <summary>
@@ -284,148 +203,17 @@ public partial class MetalBackend
         IGpuBuffer gradWeightsIh, IGpuBuffer gradWeightsHh, IGpuBuffer gradBiasIh, IGpuBuffer gradBiasHh,
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
-        // CPU fallback implementation for LSTM backward sequence
-        var gradOutData = DownloadBuffer(gradOutput);
-        var allHData = DownloadBuffer(allH);
-        var allCData = DownloadBuffer(allC);
-        var gatesData = DownloadBuffer(cacheGates);
-        var wIh = DownloadBuffer(weightsIh);
-        var wHh = DownloadBuffer(weightsHh);
-        var inputData = DownloadBuffer(input);
-
-        int stateSize = batch * hiddenSize;
-
-        // Initialize gradient buffers
-        var dInput = new float[seqLen * batch * inputSize];
-        var dHInit = new float[stateSize];
-        var dCInit = new float[stateSize];
-        var dWIh = new float[4 * hiddenSize * inputSize];
-        var dWHh = new float[4 * hiddenSize * hiddenSize];
-        var dBIh = new float[4 * hiddenSize];
-        var dBHh = new float[4 * hiddenSize];
-
-        // Gradient accumulators for hidden and cell states
-        var dHNext = new float[stateSize];
-        var dCNext = new float[stateSize];
-
-        // Backprop through time (reverse order)
-        for (int t = seqLen - 1; t >= 0; t--)
-        {
-            int inputOffset = t * batch * inputSize;
-            int hPrevOffset = t * stateSize;
-            int hCurrOffset = (t + 1) * stateSize;
-            int outputOffset = t * batch * hiddenSize;
-            int gateOffset = t * batch * hiddenSize * 4;
-
-            for (int b = 0; b < batch; b++)
-            {
-                for (int h = 0; h < hiddenSize; h++)
-                {
-                    // Get cached gate values
-                    int cacheIdx = gateOffset + b * hiddenSize * 4 + h * 4;
-                    float i_gate = gatesData[cacheIdx + 0];
-                    float f_gate = gatesData[cacheIdx + 1];
-                    float g_gate = gatesData[cacheIdx + 2];
-                    float o_gate = gatesData[cacheIdx + 3];
-
-                    float cPrev = allCData[hPrevOffset + b * hiddenSize + h];
-                    float cCurr = allCData[hCurrOffset + b * hiddenSize + h];
-
-                    // Gradient from output + gradient from next timestep
-                    float dH = gradOutData[outputOffset + b * hiddenSize + h] + dHNext[b * hiddenSize + h];
-
-                    // Gradient through tanh(c_t)
-                    float tanhC = (float)Math.Tanh(cCurr);
-                    float dO = dH * tanhC;
-                    float dC = dH * o_gate * (1 - tanhC * tanhC) + dCNext[b * hiddenSize + h];
-
-                    // Gate gradients (before sigmoid/tanh)
-                    float dI = dC * g_gate;
-                    float dF = dC * cPrev;
-                    float dG = dC * i_gate;
-
-                    // Gradient through activations
-                    float dI_raw = dI * i_gate * (1 - i_gate);
-                    float dF_raw = dF * f_gate * (1 - f_gate);
-                    float dG_raw = dG * (1 - g_gate * g_gate);
-                    float dO_raw = dO * o_gate * (1 - o_gate);
-
-                    float[] dGates = [dI_raw, dF_raw, dG_raw, dO_raw];
-
-                    // Accumulate weight and bias gradients
-                    for (int g = 0; g < 4; g++)
-                    {
-                        dBIh[g * hiddenSize + h] += dGates[g];
-                        dBHh[g * hiddenSize + h] += dGates[g];
-
-                        // Input weight gradients
-                        for (int i = 0; i < inputSize; i++)
-                        {
-                            int wIdx = g * hiddenSize * inputSize + h * inputSize + i;
-                            dWIh[wIdx] += dGates[g] * inputData[inputOffset + b * inputSize + i];
-                        }
-
-                        // Hidden weight gradients
-                        for (int hp = 0; hp < hiddenSize; hp++)
-                        {
-                            int wIdx = g * hiddenSize * hiddenSize + h * hiddenSize + hp;
-                            dWHh[wIdx] += dGates[g] * allHData[hPrevOffset + b * hiddenSize + hp];
-                        }
-                    }
-
-                    // Input gradient
-                    for (int i = 0; i < inputSize; i++)
-                    {
-                        float dInputVal = 0;
-                        for (int g = 0; g < 4; g++)
-                        {
-                            int wIdx = g * hiddenSize * inputSize + h * inputSize + i;
-                            dInputVal += dGates[g] * wIh[wIdx];
-                        }
-                        dInput[inputOffset + b * inputSize + i] += dInputVal;
-                    }
-
-                    // Gradient to previous hidden state
-                    for (int hp = 0; hp < hiddenSize; hp++)
-                    {
-                        float dHPrev = 0;
-                        for (int g = 0; g < 4; g++)
-                        {
-                            int wIdx = g * hiddenSize * hiddenSize + hp * hiddenSize + h;
-                            dHPrev += dGates[g] * wHh[wIdx];
-                        }
-                        if (t > 0)
-                        {
-                            dHNext[b * hiddenSize + hp] = dHPrev;
-                        }
-                        else
-                        {
-                            dHInit[b * hiddenSize + hp] += dHPrev;
-                        }
-                    }
-
-                    // Gradient to previous cell state
-                    float dCPrev = dC * f_gate;
-                    if (t > 0)
-                    {
-                        dCNext[b * hiddenSize + h] = dCPrev;
-                    }
-                    else
-                    {
-                        dCInit[b * hiddenSize + h] = dCPrev;
-                    }
-                }
-            }
-        }
-
-        // Upload gradients
-        UploadToBuffer(gradInput, dInput);
-        UploadToBuffer(gradHInit, dHInit);
-        UploadToBuffer(gradCInit, dCInit);
-        UploadToBuffer(gradWeightsIh, dWIh);
-        UploadToBuffer(gradWeightsHh, dWHh);
-        UploadToBuffer(gradBiasIh, dBIh);
-        UploadToBuffer(gradBiasHh, dBHh);
+        ThrowIfDisposed();
+        if (seqLen <= 0 || batch <= 0 || inputSize <= 0 || hiddenSize <= 0) return;
+        int stateSize = checked(batch * hiddenSize);
+        using var nextHidden = AllocateBuffer(stateSize);
+        using var nextCell = AllocateBuffer(stateSize);
+        DispatchResidentMetal("lstm_backward_sequence_serial", 1,
+            new[] { gradOutput, allH, allC, cacheGates, weightsIh, weightsHh, input,
+                gradInput, gradHInit, gradCInit, gradWeightsIh, gradWeightsHh, gradBiasIh,
+                nextHidden, nextCell },
+            (uint)seqLen, (uint)batch, (uint)inputSize, (uint)hiddenSize);
+        Copy(gradBiasIh, gradBiasHh, checked(4 * hiddenSize));
     }
 
     /// <summary>
@@ -438,123 +226,14 @@ public partial class MetalBackend
         IGpuBuffer output, IGpuBuffer hFinal, IGpuBuffer allH, IGpuBuffer cacheGates,
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
-        // CPU fallback implementation for GRU forward sequence
-        var inputData = DownloadBuffer(input);
-        var hInitData = DownloadBuffer(hInit);
-        var wIh = DownloadBuffer(weightsIh);
-        var wHh = DownloadBuffer(weightsHh);
-        var bIh = DownloadBuffer(biasIh);
-        var bHh = DownloadBuffer(biasHh);
-
-        var outputData = new float[seqLen * batch * hiddenSize];
-        var allHData = new float[(seqLen + 1) * batch * hiddenSize];
-        var gatesData = new float[seqLen * batch * hiddenSize * 3];
-
-        int stateSize = batch * hiddenSize;
-
-        // Copy initial state to allH[0]
-        Array.Copy(hInitData, 0, allHData, 0, stateSize);
-
-        // Process each timestep
-        for (int t = 0; t < seqLen; t++)
-        {
-            int inputOffset = t * batch * inputSize;
-            int hPrevOffset = t * stateSize;
-            int hCurrOffset = (t + 1) * stateSize;
-            int outputOffset = t * batch * hiddenSize;
-            int gateOffset = t * batch * hiddenSize * 3;
-
-            for (int b = 0; b < batch; b++)
-            {
-                // Compute gates: r (reset), z (update), n (new/candidate)
-                var gates = new float[3 * hiddenSize];
-                var hPrevGated = new float[hiddenSize];
-
-                // First compute r and z gates
-                for (int g = 0; g < 2; g++)
-                {
-                    for (int h = 0; h < hiddenSize; h++)
-                    {
-                        float sum = bIh[g * hiddenSize + h] + bHh[g * hiddenSize + h];
-
-                        // Input contribution
-                        for (int i = 0; i < inputSize; i++)
-                        {
-                            int wIdx = g * hiddenSize * inputSize + h * inputSize + i;
-                            sum += wIh[wIdx] * inputData[inputOffset + b * inputSize + i];
-                        }
-
-                        // Hidden contribution
-                        for (int hp = 0; hp < hiddenSize; hp++)
-                        {
-                            int wIdx = g * hiddenSize * hiddenSize + h * hiddenSize + hp;
-                            sum += wHh[wIdx] * allHData[hPrevOffset + b * hiddenSize + hp];
-                        }
-
-                        gates[g * hiddenSize + h] = SigmoidActivation(sum);
-                    }
-                }
-
-                // Apply reset gate to previous hidden state
-                for (int h = 0; h < hiddenSize; h++)
-                {
-                    float r_gate = gates[0 * hiddenSize + h];
-                    hPrevGated[h] = r_gate * allHData[hPrevOffset + b * hiddenSize + h];
-                }
-
-                // Compute n (candidate) gate with reset-gated hidden state
-                for (int h = 0; h < hiddenSize; h++)
-                {
-                    float sum = bIh[2 * hiddenSize + h] + bHh[2 * hiddenSize + h];
-
-                    // Input contribution
-                    for (int i = 0; i < inputSize; i++)
-                    {
-                        int wIdx = 2 * hiddenSize * inputSize + h * inputSize + i;
-                        sum += wIh[wIdx] * inputData[inputOffset + b * inputSize + i];
-                    }
-
-                    // Reset-gated hidden contribution
-                    for (int hp = 0; hp < hiddenSize; hp++)
-                    {
-                        int wIdx = 2 * hiddenSize * hiddenSize + h * hiddenSize + hp;
-                        sum += wHh[wIdx] * hPrevGated[hp];
-                    }
-
-                    gates[2 * hiddenSize + h] = (float)Math.Tanh(sum);
-                }
-
-                // Compute new hidden state and cache gates
-                for (int h = 0; h < hiddenSize; h++)
-                {
-                    float r_gate = gates[0 * hiddenSize + h];
-                    float z_gate = gates[1 * hiddenSize + h];
-                    float n_gate = gates[2 * hiddenSize + h];
-
-                    // Cache gates for backward pass
-                    int cacheIdx = gateOffset + b * hiddenSize * 3 + h * 3;
-                    gatesData[cacheIdx + 0] = r_gate;
-                    gatesData[cacheIdx + 1] = z_gate;
-                    gatesData[cacheIdx + 2] = n_gate;
-
-                    // Hidden state update: h_t = (1 - z) * n + z * h_{t-1}
-                    float hPrev = allHData[hPrevOffset + b * hiddenSize + h];
-                    float hCurr = (1 - z_gate) * n_gate + z_gate * hPrev;
-                    allHData[hCurrOffset + b * hiddenSize + h] = hCurr;
-                    outputData[outputOffset + b * hiddenSize + h] = hCurr;
-                }
-            }
-        }
-
-        // Upload results
-        UploadToBuffer(output, outputData);
-        UploadToBuffer(allH, allHData);
-        UploadToBuffer(cacheGates, gatesData);
-
-        // Copy final hidden state
-        var hFinalData = new float[stateSize];
-        Array.Copy(allHData, seqLen * stateSize, hFinalData, 0, stateSize);
-        UploadToBuffer(hFinal, hFinalData);
+        ThrowIfDisposed();
+        if (seqLen <= 0 || batch <= 0 || inputSize <= 0 || hiddenSize <= 0) return;
+        int stateSize = checked(batch * hiddenSize);
+        Copy(hInit, 0, allH, 0, stateSize);
+        DispatchResidentMetal("gru_forward_sequence", batch,
+            new[] { input, weightsIh, weightsHh, biasIh, biasHh, output, allH, cacheGates },
+            (uint)seqLen, (uint)batch, (uint)inputSize, (uint)hiddenSize);
+        Copy(allH, checked(seqLen * stateSize), hFinal, 0, stateSize);
     }
 
     /// <summary>
@@ -567,139 +246,13 @@ public partial class MetalBackend
         IGpuBuffer gradWeightsIh, IGpuBuffer gradWeightsHh, IGpuBuffer gradBiasIh, IGpuBuffer gradBiasHh,
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
-        // CPU fallback implementation for GRU backward sequence
-        var gradOutData = DownloadBuffer(gradOutput);
-        var allHData = DownloadBuffer(allH);
-        var gatesData = DownloadBuffer(cacheGates);
-        var wIh = DownloadBuffer(weightsIh);
-        var wHh = DownloadBuffer(weightsHh);
-        var inputData = DownloadBuffer(input);
-
-        int stateSize = batch * hiddenSize;
-
-        // Initialize gradient buffers
-        var dInput = new float[seqLen * batch * inputSize];
-        var dHInit = new float[stateSize];
-        var dHNext = new float[stateSize];
-        var dWIh = new float[3 * hiddenSize * inputSize];
-        var dWHh = new float[3 * hiddenSize * hiddenSize];
-        var dBIh = new float[3 * hiddenSize];
-        var dBHh = new float[3 * hiddenSize];
-
-        // Backprop through time (reverse order)
-        for (int t = seqLen - 1; t >= 0; t--)
-        {
-            int inputOffset = t * batch * inputSize;
-            int hPrevOffset = t * stateSize;
-            int outputOffset = t * batch * hiddenSize;
-            int gateOffset = t * batch * hiddenSize * 3;
-
-            for (int b = 0; b < batch; b++)
-            {
-                for (int h = 0; h < hiddenSize; h++)
-                {
-                    // Get cached gate values
-                    int cacheIdx = gateOffset + b * hiddenSize * 3 + h * 3;
-                    float r_gate = gatesData[cacheIdx + 0];
-                    float z_gate = gatesData[cacheIdx + 1];
-                    float n_gate = gatesData[cacheIdx + 2];
-
-                    float hPrev = allHData[hPrevOffset + b * hiddenSize + h];
-
-                    // Gradient from output + gradient from next timestep
-                    float dH = gradOutData[outputOffset + b * hiddenSize + h] + dHNext[b * hiddenSize + h];
-
-                    // Gradient through GRU update: h = (1-z)*n + z*h_prev
-                    float dN = dH * (1 - z_gate);
-                    float dZ = dH * (hPrev - n_gate);
-                    float dHPrev_direct = dH * z_gate;
-
-                    // Gradient through n gate (tanh)
-                    float dN_raw = dN * (1 - n_gate * n_gate);
-
-                    // Gradient through z gate (sigmoid)
-                    float dZ_raw = dZ * z_gate * (1 - z_gate);
-
-                    // Gradient through reset gate interaction with n
-                    // n = tanh(Wih*x + Whh*(r*h_prev) + b)
-                    // dR contribution comes from the hidden state path
-                    float dHPrev_gated = 0;
-                    for (int hp = 0; hp < hiddenSize; hp++)
-                    {
-                        int wIdx = 2 * hiddenSize * hiddenSize + h * hiddenSize + hp;
-                        dHPrev_gated += dN_raw * wHh[wIdx];
-                    }
-                    float dR = dHPrev_gated * hPrev;
-                    float dR_raw = dR * r_gate * (1 - r_gate);
-
-                    float[] dGates = [dR_raw, dZ_raw, dN_raw];
-
-                    // Accumulate weight and bias gradients
-                    for (int g = 0; g < 3; g++)
-                    {
-                        dBIh[g * hiddenSize + h] += dGates[g];
-                        dBHh[g * hiddenSize + h] += dGates[g];
-
-                        // Input weight gradients
-                        for (int i = 0; i < inputSize; i++)
-                        {
-                            int wIdx = g * hiddenSize * inputSize + h * inputSize + i;
-                            dWIh[wIdx] += dGates[g] * inputData[inputOffset + b * inputSize + i];
-                        }
-
-                        // Hidden weight gradients (use reset-gated hidden for n gate)
-                        for (int hp = 0; hp < hiddenSize; hp++)
-                        {
-                            int wIdx = g * hiddenSize * hiddenSize + h * hiddenSize + hp;
-                            float hVal = (g == 2) ? r_gate * allHData[hPrevOffset + b * hiddenSize + hp]
-                                                  : allHData[hPrevOffset + b * hiddenSize + hp];
-                            dWHh[wIdx] += dGates[g] * hVal;
-                        }
-                    }
-
-                    // Input gradient
-                    for (int i = 0; i < inputSize; i++)
-                    {
-                        float dInputVal = 0;
-                        for (int g = 0; g < 3; g++)
-                        {
-                            int wIdx = g * hiddenSize * inputSize + h * inputSize + i;
-                            dInputVal += dGates[g] * wIh[wIdx];
-                        }
-                        dInput[inputOffset + b * inputSize + i] += dInputVal;
-                    }
-
-                    // Gradient to previous hidden state
-                    float dHPrev = dHPrev_direct + dHPrev_gated * r_gate;
-                    for (int g = 0; g < 2; g++)
-                    {
-                        for (int hp = 0; hp < hiddenSize; hp++)
-                        {
-                            int wIdx = g * hiddenSize * hiddenSize + hp * hiddenSize + h;
-                            dHPrev += dGates[g] * wHh[wIdx];
-                        }
-                    }
-
-                    if (t > 0)
-                    {
-                        dHNext[b * hiddenSize + h] = dHPrev;
-                    }
-                    else
-                    {
-                        dHInit[b * hiddenSize + h] = dHPrev;
-                    }
-                }
-            }
-        }
-
-        // Upload gradients
-        UploadToBuffer(gradInput, dInput);
-        UploadToBuffer(gradHInit, dHInit);
-        UploadToBuffer(dHBuffer, dHNext);
-        UploadToBuffer(gradWeightsIh, dWIh);
-        UploadToBuffer(gradWeightsHh, dWHh);
-        UploadToBuffer(gradBiasIh, dBIh);
-        UploadToBuffer(gradBiasHh, dBHh);
+        ThrowIfDisposed();
+        if (seqLen <= 0 || batch <= 0 || inputSize <= 0 || hiddenSize <= 0) return;
+        DispatchResidentMetal("gru_backward_sequence_serial", 1,
+            new[] { gradOutput, allH, cacheGates, weightsIh, weightsHh, input,
+                gradInput, gradHInit, dHBuffer, gradWeightsIh, gradWeightsHh, gradBiasIh },
+            (uint)seqLen, (uint)batch, (uint)inputSize, (uint)hiddenSize);
+        Copy(gradBiasIh, gradBiasHh, checked(3 * hiddenSize));
     }
 
     /// <summary>
@@ -711,87 +264,13 @@ public partial class MetalBackend
         IGpuBuffer gradPrevH, IGpuBuffer gradGateR, IGpuBuffer gradGateZ, IGpuBuffer gradGateN,
         int batch, int hiddenSize)
     {
-        // CPU fallback implementation for single GRU cell backward
-        var dH = DownloadBuffer(gradH);
-        var r = DownloadBuffer(gateR);
-        var z = DownloadBuffer(gateZ);
-        var n = DownloadBuffer(gateN);
-        var hPrev = DownloadBuffer(prevH);
-        var wHh = DownloadBuffer(weightsHh);
-
-        var dPrevH = new float[batch * hiddenSize];
-        var dR = new float[batch * hiddenSize];
-        var dZ = new float[batch * hiddenSize];
-        var dN = new float[batch * hiddenSize];
-
-        for (int b = 0; b < batch; b++)
-        {
-            for (int h = 0; h < hiddenSize; h++)
-            {
-                int idx = b * hiddenSize + h;
-
-                float gradH_val = dH[idx];
-                float r_val = r[idx];
-                float z_val = z[idx];
-                float n_val = n[idx];
-                float hPrev_val = hPrev[idx];
-
-                // GRU update: h = (1-z)*n + z*h_prev
-                // dN = dH * (1 - z)
-                float dN_val = gradH_val * (1 - z_val);
-
-                // dZ = dH * (h_prev - n)
-                float dZ_val = gradH_val * (hPrev_val - n_val);
-
-                // dH_prev_direct = dH * z
-                float dHPrev_direct = gradH_val * z_val;
-
-                // Gradient through n (tanh derivative)
-                float dN_raw = dN_val * (1 - n_val * n_val);
-
-                // Gradient through z (sigmoid derivative)
-                float dZ_raw = dZ_val * z_val * (1 - z_val);
-
-                // Compute gradient through reset gate path
-                // n = tanh(... + Whh_n * (r * h_prev))
-                // dR contribution from hidden path
-                float dHPrev_gated = 0;
-                for (int hp = 0; hp < hiddenSize; hp++)
-                {
-                    // Weights for n gate (gate index 2)
-                    int wIdx = 2 * hiddenSize * hiddenSize + h * hiddenSize + hp;
-                    dHPrev_gated += dN_raw * wHh[wIdx];
-                }
-
-                float dR_val = dHPrev_gated * hPrev_val;
-                float dR_raw = dR_val * r_val * (1 - r_val);
-
-                // Gradient to previous hidden state
-                float dHPrev = dHPrev_direct + dHPrev_gated * r_val;
-
-                // Add contribution from r and z gates to h_prev gradient
-                for (int g = 0; g < 2; g++)
-                {
-                    float gateGrad = (g == 0) ? dR_raw : dZ_raw;
-                    for (int hp = 0; hp < hiddenSize; hp++)
-                    {
-                        int wIdx = g * hiddenSize * hiddenSize + hp * hiddenSize + h;
-                        dHPrev += gateGrad * wHh[wIdx];
-                    }
-                }
-
-                dPrevH[idx] = dHPrev;
-                dR[idx] = dR_raw;
-                dZ[idx] = dZ_raw;
-                dN[idx] = dN_raw;
-            }
-        }
-
-        // Upload gradients
-        UploadToBuffer(gradPrevH, dPrevH);
-        UploadToBuffer(gradGateR, dR);
-        UploadToBuffer(gradGateZ, dZ);
-        UploadToBuffer(gradGateN, dN);
+        ThrowIfDisposed();
+        int count = checked(batch * hiddenSize);
+        if (count <= 0) return;
+        DispatchResidentMetal("gru_cell_backward", count,
+            new[] { gradH, gateR, gateZ, gateN, prevH, weightsHh,
+                gradPrevH, gradGateR, gradGateZ, gradGateN },
+            (uint)batch, (uint)hiddenSize);
     }
 
     #endregion

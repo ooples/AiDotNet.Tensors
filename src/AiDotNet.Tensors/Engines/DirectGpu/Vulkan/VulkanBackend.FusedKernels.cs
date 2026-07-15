@@ -124,7 +124,7 @@ public sealed partial class VulkanBackend
     }
     public void IndexWrite(IGpuBuffer output, IGpuBuffer indices, IGpuBuffer source, float fillValue, int mode, int outerSize, int idxAxis, int innerSize, int dstAxis)
     {
-        GlslDispatchN(VulkanAuditKernels.IndexWrite, outerSize*idxAxis*innerSize,
+        GlslDispatchN(VulkanAuditKernels.IndexWrite, outerSize*dstAxis*innerSize,
             new IGpuBuffer[] { output, indices, source },
             new uint[] { FloatBits(fillValue), (uint)mode, (uint)outerSize, (uint)idxAxis, (uint)innerSize, (uint)dstAxis });
     }
@@ -232,7 +232,7 @@ public sealed partial class VulkanBackend
     }
     public void IstftFromSpectrum(IGpuBuffer specRe, IGpuBuffer specIm, IGpuBuffer window, IGpuBuffer result, IGpuBuffer windowSum, int batch, int numFrames, int nFft, int hop, int outputLength, int center)
     {
-        GlslDispatchN(VulkanAuditKernels.IstftFromSpectrum, batch*numFrames*nFft,
+        GlslDispatchN(VulkanAuditKernels.IstftFromSpectrum, batch*outputLength,
             new IGpuBuffer[] { specRe, specIm, window, result, windowSum },
             new uint[] { (uint)batch, (uint)numFrames, (uint)nFft, (uint)hop, (uint)outputLength, (uint)center });
     }

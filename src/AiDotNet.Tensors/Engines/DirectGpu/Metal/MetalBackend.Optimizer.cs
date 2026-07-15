@@ -5,6 +5,24 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
 public sealed partial class MetalBackend
 {
+    private void DispatchOptimizerMetal(uint operation, IGpuBuffer parameter, IGpuBuffer gradient,
+        IGpuBuffer? state1, IGpuBuffer? state2, IGpuBuffer? state3, int size, int step,
+        float learningRate, float a = 0f, float b = 0f, float c = 0f, float d = 0f)
+    {
+        if (size <= 0) return;
+        using var dummy1 = state1 is null ? AllocateBuffer(1) : null;
+        using var dummy2 = state2 is null ? AllocateBuffer(1) : null;
+        using var dummy3 = state3 is null ? AllocateBuffer(1) : null;
+        DispatchResidentMetal("optimizer_update", size,
+            new[] { parameter, gradient, state1 ?? dummy1!, state2 ?? dummy2!, state3 ?? dummy3! },
+            (uint)size, operation, (uint)step,
+            unchecked((uint)SingleToInt32BitsCompat(learningRate)),
+            unchecked((uint)SingleToInt32BitsCompat(a)),
+            unchecked((uint)SingleToInt32BitsCompat(b)),
+            unchecked((uint)SingleToInt32BitsCompat(c)),
+            unchecked((uint)SingleToInt32BitsCompat(d)));
+    }
+
     #region Optimizer Operations
 
     /// <summary>
@@ -14,20 +32,8 @@ public sealed partial class MetalBackend
         float learningRate, float momentum, float weightDecay, int size)
     {
         ThrowIfDisposed();
-
-        var paramData = DownloadBuffer(param);
-        var gradData = DownloadBuffer(gradient);
-        var velData = DownloadBuffer(velocity);
-
-        for (int i = 0; i < size; i++)
-        {
-            float grad = gradData[i] + weightDecay * paramData[i];
-            velData[i] = momentum * velData[i] + grad;
-            paramData[i] -= learningRate * velData[i];
-        }
-
-        UploadToBuffer(param, paramData);
-        UploadToBuffer(velocity, velData);
+        DispatchOptimizerMetal(1u, param, gradient, velocity, null, null, size, 0,
+            learningRate, momentum, weightDecay);
     }
 
     /// <summary>
@@ -36,17 +42,8 @@ public sealed partial class MetalBackend
     public void SgdUpdate(IGpuBuffer param, IGpuBuffer gradient, float learningRate, float weightDecay, int size)
     {
         ThrowIfDisposed();
-
-        var paramData = DownloadBuffer(param);
-        var gradData = DownloadBuffer(gradient);
-
-        for (int i = 0; i < size; i++)
-        {
-            float grad = gradData[i] + weightDecay * paramData[i];
-            paramData[i] -= learningRate * grad;
-        }
-
-        UploadToBuffer(param, paramData);
+        DispatchOptimizerMetal(0u, param, gradient, null, null, null, size, 0,
+            learningRate, weightDecay);
     }
 
     /// <summary>
@@ -56,30 +53,8 @@ public sealed partial class MetalBackend
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
         ThrowIfDisposed();
-
-        var paramData = DownloadBuffer(param);
-        var gradData = DownloadBuffer(gradient);
-        var mData = DownloadBuffer(m);
-        var vData = DownloadBuffer(v);
-
-        float bc1 = 1.0f - MathF.Pow(beta1, step);
-        float bc2 = 1.0f - MathF.Pow(beta2, step);
-
-        for (int i = 0; i < size; i++)
-        {
-            float grad = gradData[i] + weightDecay * paramData[i];
-            mData[i] = beta1 * mData[i] + (1 - beta1) * grad;
-            vData[i] = beta2 * vData[i] + (1 - beta2) * grad * grad;
-
-            float mHat = mData[i] / bc1;
-            float vHat = vData[i] / bc2;
-
-            paramData[i] -= learningRate * mHat / (MathF.Sqrt(vHat) + epsilon);
-        }
-
-        UploadToBuffer(param, paramData);
-        UploadToBuffer(m, mData);
-        UploadToBuffer(v, vData);
+        DispatchOptimizerMetal(2u, param, gradient, m, v, null, size, step,
+            learningRate, beta1, beta2, epsilon, weightDecay);
     }
 
     /// <summary>
@@ -89,31 +64,8 @@ public sealed partial class MetalBackend
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
         ThrowIfDisposed();
-
-        var paramData = DownloadBuffer(param);
-        var gradData = DownloadBuffer(gradient);
-        var mData = DownloadBuffer(m);
-        var vData = DownloadBuffer(v);
-
-        float bc1 = 1.0f - MathF.Pow(beta1, step);
-        float bc2 = 1.0f - MathF.Pow(beta2, step);
-
-        for (int i = 0; i < size; i++)
-        {
-            float grad = gradData[i];
-            mData[i] = beta1 * mData[i] + (1 - beta1) * grad;
-            vData[i] = beta2 * vData[i] + (1 - beta2) * grad * grad;
-
-            float mHat = mData[i] / bc1;
-            float vHat = vData[i] / bc2;
-
-            // Decoupled weight decay
-            paramData[i] = paramData[i] * (1 - learningRate * weightDecay) - learningRate * mHat / (MathF.Sqrt(vHat) + epsilon);
-        }
-
-        UploadToBuffer(param, paramData);
-        UploadToBuffer(m, mData);
-        UploadToBuffer(v, vData);
+        DispatchOptimizerMetal(3u, param, gradient, m, v, null, size, step,
+            learningRate, beta1, beta2, epsilon, weightDecay);
     }
 
     // Lazily-compiled MSL library for the native compressed-moment kernels. IntPtr.Zero if the compile
@@ -152,45 +104,30 @@ public sealed partial class MetalBackend
     {
         ThrowIfDisposed();
         if (size <= 0) return;
+        IntPtr library = GetCompressedOptLibrary();
+        if (library == IntPtr.Zero)
+            throw new InvalidOperationException("Metal compressed optimizer kernels are unavailable.");
+        if (param is not MetalGpuBuffer parameter || gradient is not MetalGpuBuffer grad ||
+            m is not MetalGpuBuffer firstMoment || v is not MetalGpuBuffer secondMoment)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer.");
 
-        var lib = GetCompressedOptLibrary();
-        var pipeline = lib != IntPtr.Zero ? TryGetPipeline("CompressedOptimizer", lib, "adam_bf16") : null;
-        if (pipeline is not null
-            && param is MetalGpuBuffer pb && gradient is MetalGpuBuffer gb
-            && m is MetalGpuBuffer mb && v is MetalGpuBuffer vb)
-        {
-            // Native GPU path: one thread per 32-bit word (= two bf16 moments).
-            var (tg, tpg) = pipeline.Calculate1DDispatch((size + 1) / 2);
-            using var encoder = _commandQueue.CreateScopedComputeEncoder();
-            encoder.SetPipelineState(pipeline.Handle);
-            encoder.SetBuffer(pb, 0);
-            encoder.SetBuffer(gb, 1);
-            encoder.SetBuffer(mb, 2);
-            encoder.SetBuffer(vb, 3);
-            encoder.SetBytes((uint)size, 4);
-            encoder.SetBytes((uint)step, 5);
-            encoder.SetBytes(decoupled, 6);
-            encoder.SetBytes(learningRate, 7);
-            encoder.SetBytes(beta1, 8);
-            encoder.SetBytes(beta2, 9);
-            encoder.SetBytes(epsilon, 10);
-            encoder.SetBytes(weightDecay, 11);
-            encoder.DispatchThreadgroups(tg, tpg);
-            return;
-        }
-
-        // Fallback only when the MSL library/pipeline is unavailable: host round-trip.
-        CompressedMomentHostFallback.WarnHostFallbackOnce("Metal");
-        var paramData = DownloadBuffer(param);
-        var gradData = DownloadBuffer(gradient);
-        var mBytes = CompressedMomentHostFallback.DownloadPackedBytes(DownloadBuffer(m), size * sizeof(ushort));
-        var vBytes = CompressedMomentHostFallback.DownloadPackedBytes(DownloadBuffer(v), size * sizeof(ushort));
-        CompressedMomentHostFallback.AdamBf16(
-            paramData, gradData, mBytes, vBytes, learningRate, beta1, beta2, epsilon, weightDecay, step, size,
-            decoupledWeightDecay: decoupled == 1u);
-        UploadToBuffer(param, paramData);
-        UploadToBuffer(m, CompressedMomentHostFallback.PackBytesAsFloats(mBytes));
-        UploadToBuffer(v, CompressedMomentHostFallback.PackBytesAsFloats(vBytes));
+        var pipeline = GetPipeline("CompressedOptimizer", library, "adam_bf16");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch((size + 1) / 2);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(parameter, 0);
+        encoder.SetBuffer(grad, 1);
+        encoder.SetBuffer(firstMoment, 2);
+        encoder.SetBuffer(secondMoment, 3);
+        encoder.SetBytes((uint)size, 4);
+        encoder.SetBytes((uint)step, 5);
+        encoder.SetBytes(decoupled, 6);
+        encoder.SetBytes(learningRate, 7);
+        encoder.SetBytes(beta1, 8);
+        encoder.SetBytes(beta2, 9);
+        encoder.SetBytes(epsilon, 10);
+        encoder.SetBytes(weightDecay, 11);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
 
     public void Adam8BitUpdate(IGpuBuffer param, IGpuBuffer gradient,
@@ -201,57 +138,36 @@ public sealed partial class MetalBackend
     {
         ThrowIfDisposed();
         if (paramLength <= 0 || numBlocks <= 0) return;
+        IntPtr library = GetCompressedOptLibrary();
+        if (library == IntPtr.Zero)
+            throw new InvalidOperationException("Metal compressed optimizer kernels are unavailable.");
+        if (param is not MetalGpuBuffer parameter || gradient is not MetalGpuBuffer grad ||
+            mQuant is not MetalGpuBuffer firstQuantized || vQuant is not MetalGpuBuffer secondQuantized ||
+            mScales is not MetalGpuBuffer firstScales || vScales is not MetalGpuBuffer secondScales)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer.");
 
-        var lib = GetCompressedOptLibrary();
-        var pipeline = lib != IntPtr.Zero ? TryGetPipeline("CompressedOptimizer", lib, "adam8bit") : null;
-        if (pipeline is not null
-            && param is MetalGpuBuffer pb && gradient is MetalGpuBuffer gb
-            && mQuant is MetalGpuBuffer mqb && vQuant is MetalGpuBuffer vqb
-            && mScales is MetalGpuBuffer msb && vScales is MetalGpuBuffer vsb)
-        {
-            // Native GPU path: one threadgroup (256 threads) per block; shared reduction for the scales.
-            var (tg, tpg) = pipeline.Calculate1DDispatch(numBlocks * 256);
-            using var encoder = _commandQueue.CreateScopedComputeEncoder();
-            encoder.SetPipelineState(pipeline.Handle);
-            encoder.SetBuffer(pb, 0);
-            encoder.SetBuffer(gb, 1);
-            encoder.SetBuffer(mqb, 2);
-            encoder.SetBuffer(vqb, 3);
-            encoder.SetBuffer(msb, 4);
-            encoder.SetBuffer(vsb, 5);
-            encoder.SetBytes((uint)paramLength, 6);
-            encoder.SetBytes((uint)blockSize, 7);
-            encoder.SetBytes((uint)numBlocks, 8);
-            encoder.SetBytes(learningRate, 9);
-            encoder.SetBytes(beta1, 10);
-            encoder.SetBytes(beta2, 11);
-            encoder.SetBytes(epsilon, 12);
-            encoder.SetBytes(oneMinusBeta1, 13);
-            encoder.SetBytes(oneMinusBeta2, 14);
-            encoder.SetBytes(biasCorrection1, 15);
-            encoder.SetBytes(biasCorrection2, 16);
-            encoder.DispatchThreadgroups(tg, tpg);
-            return;
-        }
-
-        CompressedMomentHostFallback.WarnHostFallbackOnce("Metal");
-        var paramData = DownloadBuffer(param);
-        var gradData = DownloadBuffer(gradient);
-        var mQuantBytes = CompressedMomentHostFallback.DownloadPackedBytes(DownloadBuffer(mQuant), paramLength);
-        var vQuantBytes = CompressedMomentHostFallback.DownloadPackedBytes(DownloadBuffer(vQuant), paramLength);
-        var mScaleData = DownloadBuffer(mScales);
-        var vScaleData = DownloadBuffer(vScales);
-
-        CompressedMomentHostFallback.Adam8Bit(
-            paramData, gradData, mQuantBytes, vQuantBytes, mScaleData, vScaleData,
-            learningRate, beta1, beta2, epsilon, oneMinusBeta1, oneMinusBeta2,
-            biasCorrection1, biasCorrection2, blockSize, paramLength, numBlocks);
-
-        UploadToBuffer(param, paramData);
-        UploadToBuffer(mQuant, CompressedMomentHostFallback.PackBytesAsFloats(mQuantBytes));
-        UploadToBuffer(vQuant, CompressedMomentHostFallback.PackBytesAsFloats(vQuantBytes));
-        UploadToBuffer(mScales, mScaleData);
-        UploadToBuffer(vScales, vScaleData);
+        var pipeline = GetPipeline("CompressedOptimizer", library, "adam8bit");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(checked(numBlocks * 256));
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(parameter, 0);
+        encoder.SetBuffer(grad, 1);
+        encoder.SetBuffer(firstQuantized, 2);
+        encoder.SetBuffer(secondQuantized, 3);
+        encoder.SetBuffer(firstScales, 4);
+        encoder.SetBuffer(secondScales, 5);
+        encoder.SetBytes((uint)paramLength, 6);
+        encoder.SetBytes((uint)blockSize, 7);
+        encoder.SetBytes((uint)numBlocks, 8);
+        encoder.SetBytes(learningRate, 9);
+        encoder.SetBytes(beta1, 10);
+        encoder.SetBytes(beta2, 11);
+        encoder.SetBytes(epsilon, 12);
+        encoder.SetBytes(oneMinusBeta1, 13);
+        encoder.SetBytes(oneMinusBeta2, 14);
+        encoder.SetBytes(biasCorrection1, 15);
+        encoder.SetBytes(biasCorrection2, 16);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
 
     /// <summary>
@@ -261,20 +177,8 @@ public sealed partial class MetalBackend
         float learningRate, float rho, float epsilon, float weightDecay, int size)
     {
         ThrowIfDisposed();
-
-        var paramData = DownloadBuffer(param);
-        var gradData = DownloadBuffer(gradient);
-        var sqAvgData = DownloadBuffer(squaredAvg);
-
-        for (int i = 0; i < size; i++)
-        {
-            float grad = gradData[i] + weightDecay * paramData[i];
-            sqAvgData[i] = rho * sqAvgData[i] + (1 - rho) * grad * grad;
-            paramData[i] -= learningRate * grad / (MathF.Sqrt(sqAvgData[i]) + epsilon);
-        }
-
-        UploadToBuffer(param, paramData);
-        UploadToBuffer(squaredAvg, sqAvgData);
+        DispatchOptimizerMetal(4u, param, gradient, squaredAvg, null, null, size, 0,
+            learningRate, rho, epsilon, weightDecay);
     }
 
     /// <summary>
@@ -284,20 +188,8 @@ public sealed partial class MetalBackend
         float learningRate, float epsilon, float weightDecay, int size)
     {
         ThrowIfDisposed();
-
-        var paramData = DownloadBuffer(param);
-        var gradData = DownloadBuffer(gradient);
-        var accumData = DownloadBuffer(accumulatedGrad);
-
-        for (int i = 0; i < size; i++)
-        {
-            float grad = gradData[i] + weightDecay * paramData[i];
-            accumData[i] += grad * grad;
-            paramData[i] -= learningRate * grad / (MathF.Sqrt(accumData[i]) + epsilon);
-        }
-
-        UploadToBuffer(param, paramData);
-        UploadToBuffer(accumulatedGrad, accumData);
+        DispatchOptimizerMetal(5u, param, gradient, accumulatedGrad, null, null, size, 0,
+            learningRate, epsilon, weightDecay);
     }
 
     /// <summary>
@@ -307,21 +199,8 @@ public sealed partial class MetalBackend
         float learningRate, float momentum, float weightDecay, int size)
     {
         ThrowIfDisposed();
-
-        var paramData = DownloadBuffer(param);
-        var gradData = DownloadBuffer(gradient);
-        var velData = DownloadBuffer(velocity);
-
-        for (int i = 0; i < size; i++)
-        {
-            float grad = gradData[i] + weightDecay * paramData[i];
-            float vPrev = velData[i];
-            velData[i] = momentum * velData[i] - learningRate * grad;
-            paramData[i] += -momentum * vPrev + (1 + momentum) * velData[i];
-        }
-
-        UploadToBuffer(param, paramData);
-        UploadToBuffer(velocity, velData);
+        DispatchOptimizerMetal(6u, param, gradient, velocity, null, null, size, 0,
+            learningRate, momentum, weightDecay);
     }
 
     /// <summary>
@@ -331,37 +210,10 @@ public sealed partial class MetalBackend
         float learningRate, float momentum, float weightDecay, float trustCoeff, int size)
     {
         ThrowIfDisposed();
-
-        var paramData = DownloadBuffer(param);
-        var gradData = DownloadBuffer(gradient);
-        var velData = DownloadBuffer(velocity);
-
-        // Compute norms
-        float paramNorm = 0, gradNorm = 0;
-        for (int i = 0; i < size; i++)
-        {
-            paramNorm += paramData[i] * paramData[i];
-            gradNorm += gradData[i] * gradData[i];
-        }
-        paramNorm = MathF.Sqrt(paramNorm);
-        gradNorm = MathF.Sqrt(gradNorm);
-
-        // Compute local learning rate
-        float localLr = learningRate;
-        if (paramNorm > 0 && gradNorm > 0)
-        {
-            localLr = learningRate * trustCoeff * paramNorm / (gradNorm + weightDecay * paramNorm);
-        }
-
-        for (int i = 0; i < size; i++)
-        {
-            float grad = gradData[i] + weightDecay * paramData[i];
-            velData[i] = momentum * velData[i] + localLr * grad;
-            paramData[i] -= velData[i];
-        }
-
-        UploadToBuffer(param, paramData);
-        UploadToBuffer(velocity, velData);
+        if (size <= 0) return;
+        DispatchResidentMetal("lars_update_serial", 1, new[] { param, gradient, velocity },
+            (uint)size, unchecked((uint)SingleToInt32BitsCompat(learningRate)), unchecked((uint)SingleToInt32BitsCompat(momentum)),
+            unchecked((uint)SingleToInt32BitsCompat(weightDecay)), unchecked((uint)SingleToInt32BitsCompat(trustCoeff)));
     }
 
     /// <summary>
@@ -371,50 +223,10 @@ public sealed partial class MetalBackend
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
         ThrowIfDisposed();
-
-        var paramData = DownloadBuffer(param);
-        var gradData = DownloadBuffer(gradient);
-        var mData = DownloadBuffer(m);
-        var vData = DownloadBuffer(v);
-
-        float bc1 = 1.0f - MathF.Pow(beta1, step);
-        float bc2 = 1.0f - MathF.Pow(beta2, step);
-
-        // First compute Adam update direction
-        var updateDir = new float[size];
-        float updateNorm = 0, paramNorm = 0;
-
-        for (int i = 0; i < size; i++)
-        {
-            mData[i] = beta1 * mData[i] + (1 - beta1) * gradData[i];
-            vData[i] = beta2 * vData[i] + (1 - beta2) * gradData[i] * gradData[i];
-
-            float mHat = mData[i] / bc1;
-            float vHat = vData[i] / bc2;
-
-            updateDir[i] = mHat / (MathF.Sqrt(vHat) + epsilon) + weightDecay * paramData[i];
-            updateNorm += updateDir[i] * updateDir[i];
-            paramNorm += paramData[i] * paramData[i];
-        }
-        updateNorm = MathF.Sqrt(updateNorm);
-        paramNorm = MathF.Sqrt(paramNorm);
-
-        // Compute trust ratio
-        float trustRatio = 1.0f;
-        if (paramNorm > 0 && updateNorm > 0)
-        {
-            trustRatio = paramNorm / updateNorm;
-        }
-
-        // Apply update
-        for (int i = 0; i < size; i++)
-        {
-            paramData[i] -= learningRate * trustRatio * updateDir[i];
-        }
-
-        UploadToBuffer(param, paramData);
-        UploadToBuffer(m, mData);
-        UploadToBuffer(v, vData);
+        if (size <= 0) return;
+        DispatchResidentMetal("lamb_update_serial", 1, new[] { param, gradient, m, v },
+            (uint)size, (uint)step, unchecked((uint)SingleToInt32BitsCompat(learningRate)), unchecked((uint)SingleToInt32BitsCompat(beta1)),
+            unchecked((uint)SingleToInt32BitsCompat(beta2)), unchecked((uint)SingleToInt32BitsCompat(epsilon)), unchecked((uint)SingleToInt32BitsCompat(weightDecay)));
     }
 
     /// <summary>
@@ -424,28 +236,8 @@ public sealed partial class MetalBackend
         float rho, float epsilon, float weightDecay, int size)
     {
         ThrowIfDisposed();
-
-        var paramData = DownloadBuffer(param);
-        var gradData = DownloadBuffer(gradient);
-        var accumGradData = DownloadBuffer(accumGrad);
-        var accumUpdateData = DownloadBuffer(accumUpdate);
-
-        for (int i = 0; i < size; i++)
-        {
-            float grad = gradData[i] + weightDecay * paramData[i];
-            accumGradData[i] = rho * accumGradData[i] + (1 - rho) * grad * grad;
-
-            float rmsUpdate = MathF.Sqrt(accumUpdateData[i] + epsilon);
-            float rmsGrad = MathF.Sqrt(accumGradData[i] + epsilon);
-            float update = rmsUpdate / rmsGrad * grad;
-
-            accumUpdateData[i] = rho * accumUpdateData[i] + (1 - rho) * update * update;
-            paramData[i] -= update;
-        }
-
-        UploadToBuffer(param, paramData);
-        UploadToBuffer(accumGrad, accumGradData);
-        UploadToBuffer(accumUpdate, accumUpdateData);
+        DispatchOptimizerMetal(7u, param, gradient, accumGrad, accumUpdate, null, size, 0,
+            0f, rho, epsilon, weightDecay);
     }
 
     /// <summary>
@@ -455,33 +247,8 @@ public sealed partial class MetalBackend
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
         ThrowIfDisposed();
-
-        var paramData = DownloadBuffer(param);
-        var gradData = DownloadBuffer(gradient);
-        var mData = DownloadBuffer(m);
-        var vData = DownloadBuffer(v);
-        var vMaxData = DownloadBuffer(vMax);
-
-        float bc1 = 1.0f - MathF.Pow(beta1, step);
-        float bc2 = 1.0f - MathF.Pow(beta2, step);
-
-        for (int i = 0; i < size; i++)
-        {
-            float grad = gradData[i] + weightDecay * paramData[i];
-            mData[i] = beta1 * mData[i] + (1 - beta1) * grad;
-            vData[i] = beta2 * vData[i] + (1 - beta2) * grad * grad;
-            vMaxData[i] = MathF.Max(vMaxData[i], vData[i]);
-
-            float mHat = mData[i] / bc1;
-            float vMaxHat = vMaxData[i] / bc2;
-
-            paramData[i] -= learningRate * mHat / (MathF.Sqrt(vMaxHat) + epsilon);
-        }
-
-        UploadToBuffer(param, paramData);
-        UploadToBuffer(m, mData);
-        UploadToBuffer(v, vData);
-        UploadToBuffer(vMax, vMaxData);
+        DispatchOptimizerMetal(8u, param, gradient, m, v, vMax, size, step,
+            learningRate, beta1, beta2, epsilon, weightDecay);
     }
 
     /// <summary>
@@ -491,27 +258,8 @@ public sealed partial class MetalBackend
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
         ThrowIfDisposed();
-
-        var paramData = DownloadBuffer(param);
-        var gradData = DownloadBuffer(gradient);
-        var mData = DownloadBuffer(m);
-        var uData = DownloadBuffer(u);
-
-        float bc1 = 1.0f - MathF.Pow(beta1, step);
-
-        for (int i = 0; i < size; i++)
-        {
-            float grad = gradData[i] + weightDecay * paramData[i];
-            mData[i] = beta1 * mData[i] + (1 - beta1) * grad;
-            uData[i] = MathF.Max(beta2 * uData[i], MathF.Abs(grad));
-
-            float mHat = mData[i] / bc1;
-            paramData[i] -= learningRate * mHat / (uData[i] + epsilon);
-        }
-
-        UploadToBuffer(param, paramData);
-        UploadToBuffer(m, mData);
-        UploadToBuffer(u, uData);
+        DispatchOptimizerMetal(9u, param, gradient, m, u, null, size, step,
+            learningRate, beta1, beta2, epsilon, weightDecay);
     }
 
     /// <summary>
@@ -521,26 +269,8 @@ public sealed partial class MetalBackend
         float learningRate, float beta1, float beta2, float weightDecay, int size)
     {
         ThrowIfDisposed();
-
-        var paramData = DownloadBuffer(param);
-        var gradData = DownloadBuffer(gradient);
-        var mData = DownloadBuffer(m);
-
-        for (int i = 0; i < size; i++)
-        {
-            // Compute update direction using interpolated momentum
-            float update = beta1 * mData[i] + (1 - beta1) * gradData[i];
-            float signUpdate = MathF.Sign(update);
-
-            // Update momentum
-            mData[i] = beta2 * mData[i] + (1 - beta2) * gradData[i];
-
-            // Decoupled weight decay + sign update
-            paramData[i] = paramData[i] * (1 - learningRate * weightDecay) - learningRate * signUpdate;
-        }
-
-        UploadToBuffer(param, paramData);
-        UploadToBuffer(m, mData);
+        DispatchOptimizerMetal(10u, param, gradient, m, null, null, size, 0,
+            learningRate, beta1, beta2, weightDecay);
     }
 
     /// <summary>
@@ -550,34 +280,8 @@ public sealed partial class MetalBackend
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
         ThrowIfDisposed();
-
-        var paramData = DownloadBuffer(param);
-        var gradData = DownloadBuffer(gradient);
-        var mData = DownloadBuffer(m);
-        var vData = DownloadBuffer(v);
-
-        float bc1 = 1.0f - MathF.Pow(beta1, step);
-        float bc1Next = 1.0f - MathF.Pow(beta1, step + 1);
-        float bc2 = 1.0f - MathF.Pow(beta2, step);
-
-        for (int i = 0; i < size; i++)
-        {
-            float grad = gradData[i] + weightDecay * paramData[i];
-            mData[i] = beta1 * mData[i] + (1 - beta1) * grad;
-            vData[i] = beta2 * vData[i] + (1 - beta2) * grad * grad;
-
-            float mHat = mData[i] / bc1;
-            float vHat = vData[i] / bc2;
-
-            // Nesterov momentum
-            float mNesterov = beta1 * mHat + (1 - beta1) * grad / bc1Next;
-
-            paramData[i] -= learningRate * mNesterov / (MathF.Sqrt(vHat) + epsilon);
-        }
-
-        UploadToBuffer(param, paramData);
-        UploadToBuffer(m, mData);
-        UploadToBuffer(v, vData);
+        DispatchOptimizerMetal(11u, param, gradient, m, v, null, size, step,
+            learningRate, beta1, beta2, epsilon, weightDecay);
     }
 
     /// <summary>
@@ -587,37 +291,8 @@ public sealed partial class MetalBackend
         float learningRate, float l1Reg, float l2Reg, float beta, int size)
     {
         ThrowIfDisposed();
-
-        var paramData = DownloadBuffer(param);
-        var gradData = DownloadBuffer(gradient);
-        var zData = DownloadBuffer(z);
-        var nData = DownloadBuffer(n);
-
-        for (int i = 0; i < size; i++)
-        {
-            float grad = gradData[i];
-            float nPrev = nData[i];
-            nData[i] += grad * grad;
-
-            float sigma = (MathF.Sqrt(nData[i]) - MathF.Sqrt(nPrev)) / learningRate;
-            zData[i] += grad - sigma * paramData[i];
-
-            // Soft thresholding
-            float zSign = MathF.Sign(zData[i]);
-            if (MathF.Abs(zData[i]) <= l1Reg)
-            {
-                paramData[i] = 0;
-            }
-            else
-            {
-                float denom = (beta + MathF.Sqrt(nData[i])) / learningRate + l2Reg;
-                paramData[i] = -(zData[i] - zSign * l1Reg) / denom;
-            }
-        }
-
-        UploadToBuffer(param, paramData);
-        UploadToBuffer(z, zData);
-        UploadToBuffer(n, nData);
+        DispatchOptimizerMetal(12u, param, gradient, z, n, null, size, 0,
+            learningRate, l1Reg, l2Reg, beta);
     }
 
     /// <summary>
@@ -627,21 +302,8 @@ public sealed partial class MetalBackend
         float learningRate, float l1Strength, int size)
     {
         ThrowIfDisposed();
-
-        if (param is not MetalGpuBuffer paramBuffer || gradient is not MetalGpuBuffer gradientBuffer)
-            throw new ArgumentException("Buffers must be MetalGpuBuffer");
-
-        var pipeline = GetPipeline("Optimizer", _optimizerLibrary, "proximal_l1_update");
-        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(size);
-
-        using var encoder = _commandQueue.CreateScopedComputeEncoder();
-        encoder.SetPipelineState(pipeline.Handle);
-        encoder.SetBuffer(paramBuffer, 0);
-        encoder.SetBuffer(gradientBuffer, 1);
-        encoder.SetBytes(learningRate, 2);
-        encoder.SetBytes(l1Strength, 3);
-        encoder.SetBytes((uint)size, 4);
-        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+        DispatchOptimizerMetal(13u, param, gradient, null, null, null, size, 0,
+            learningRate, l1Strength);
     }
 
     #endregion

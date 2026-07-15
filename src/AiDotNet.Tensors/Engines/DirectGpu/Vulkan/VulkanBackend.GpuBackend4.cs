@@ -9,116 +9,74 @@ public sealed unsafe partial class VulkanBackend
 {
     #region Optimizer Operations
 
+    private void DispatchOptimizer(string shader, int threads, IGpuBuffer[] buffers, params uint[] pushConstants)
+        => GlslNaryOp(shader, buffers, threads, pushConstants);
+
     public void SgdUpdate(IGpuBuffer param, IGpuBuffer gradient, float learningRate, float weightDecay, int size)
     {
         EnsureInitialized();
-        var p = DownloadBuffer(param); var g = DownloadBuffer(gradient);
-        for (int i = 0; i < size; i++)
-            p[i] -= learningRate * (g[i] + weightDecay * p[i]);
-        UploadToBuffer(p, param);
+        DispatchOptimizer(VulkanOptimizerKernels.TwoBuffer, size, new[] { param, gradient },
+            (uint)size, 0, FloatBits(learningRate), FloatBits(weightDecay));
     }
 
     public void SgdMomentumUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer velocity,
         float learningRate, float momentum, float weightDecay, int size)
     {
         EnsureInitialized();
-        var p = DownloadBuffer(param); var g = DownloadBuffer(gradient); var v = DownloadBuffer(velocity);
-        for (int i = 0; i < size; i++)
-        {
-            v[i] = momentum * v[i] + g[i] + weightDecay * p[i];
-            p[i] -= learningRate * v[i];
-        }
-        UploadToBuffer(p, param); UploadToBuffer(v, velocity);
+        DispatchOptimizer(VulkanOptimizerKernels.ThreeBuffer, size, new[] { param, gradient, velocity },
+            (uint)size, 0, FloatBits(learningRate), FloatBits(momentum), FloatBits(weightDecay), 0);
     }
 
     public void AdamUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
-        EnsureInitialized();
-        if (step <= 0)
-            throw new ArgumentOutOfRangeException(nameof(step), step, "Step must be > 0 for bias-corrected optimizers to avoid division by zero.");
-        var p = DownloadBuffer(param); var g = DownloadBuffer(gradient);
-        var mArr = DownloadBuffer(m); var vArr = DownloadBuffer(v);
-        float bc1 = 1f - MathF.Pow(beta1, step), bc2 = 1f - MathF.Pow(beta2, step);
-        for (int i = 0; i < size; i++)
-        {
-            float grad = g[i] + weightDecay * p[i];
-            mArr[i] = beta1 * mArr[i] + (1f - beta1) * grad;
-            vArr[i] = beta2 * vArr[i] + (1f - beta2) * grad * grad;
-            float mHat = mArr[i] / bc1, vHat = vArr[i] / bc2;
-            p[i] -= learningRate * mHat / (MathF.Sqrt(vHat) + epsilon);
-        }
-        UploadToBuffer(p, param); UploadToBuffer(mArr, m); UploadToBuffer(vArr, v);
+        ValidateOptimizerStep(step);
+        DispatchOptimizer(VulkanOptimizerKernels.FourBuffer, size, new[] { param, gradient, m, v },
+            (uint)size, 0, (uint)step, FloatBits(learningRate), FloatBits(beta1), FloatBits(beta2),
+            FloatBits(epsilon), FloatBits(weightDecay));
     }
 
     public void AdamWUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
-        EnsureInitialized();
-        if (step <= 0)
-            throw new ArgumentOutOfRangeException(nameof(step), step, "Step must be > 0 for bias-corrected optimizers to avoid division by zero.");
-        var p = DownloadBuffer(param); var g = DownloadBuffer(gradient);
-        var mArr = DownloadBuffer(m); var vArr = DownloadBuffer(v);
-        float bc1 = 1f - MathF.Pow(beta1, step), bc2 = 1f - MathF.Pow(beta2, step);
-        for (int i = 0; i < size; i++)
-        {
-            p[i] *= 1f - learningRate * weightDecay;
-            mArr[i] = beta1 * mArr[i] + (1f - beta1) * g[i];
-            vArr[i] = beta2 * vArr[i] + (1f - beta2) * g[i] * g[i];
-            float mHat = mArr[i] / bc1, vHat = vArr[i] / bc2;
-            p[i] -= learningRate * mHat / (MathF.Sqrt(vHat) + epsilon);
-        }
-        UploadToBuffer(p, param); UploadToBuffer(mArr, m); UploadToBuffer(vArr, v);
+        ValidateOptimizerStep(step);
+        DispatchOptimizer(VulkanOptimizerKernels.FourBuffer, size, new[] { param, gradient, m, v },
+            (uint)size, 1, (uint)step, FloatBits(learningRate), FloatBits(beta1), FloatBits(beta2),
+            FloatBits(epsilon), FloatBits(weightDecay));
     }
 
-    // Reinterpret a float's bits as uint for a GLSL push-constant slot (the shader declares the field
-    // `float`, so the same 32 bits read back as the float value). net471-safe.
-    private static uint FBits(float f)
+    private static void ValidateOptimizerStep(int step)
+    {
+        if (step <= 0)
+            throw new ArgumentOutOfRangeException(nameof(step), step,
+                "Step must be > 0 for bias-corrected optimizers to avoid division by zero.");
+    }
+
+    private static uint FBits(float value)
 #if NETFRAMEWORK
-        => unchecked((uint)BitConverter.ToInt32(BitConverter.GetBytes(f), 0));
+        => unchecked((uint)BitConverter.ToInt32(BitConverter.GetBytes(value), 0));
 #else
-        => BitConverter.SingleToUInt32Bits(f);
+        => BitConverter.SingleToUInt32Bits(value);
 #endif
 
     public void AdamUpdateBf16(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
-        => AdamBf16Impl(param, gradient, m, v, learningRate, beta1, beta2, epsilon, weightDecay, step, size, decoupled: false);
+        => AdamBf16Impl(param, gradient, m, v, learningRate, beta1, beta2, epsilon, weightDecay, step, size, false);
 
     public void AdamWUpdateBf16(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
-        => AdamBf16Impl(param, gradient, m, v, learningRate, beta1, beta2, epsilon, weightDecay, step, size, decoupled: true);
+        => AdamBf16Impl(param, gradient, m, v, learningRate, beta1, beta2, epsilon, weightDecay, step, size, true);
 
     private void AdamBf16Impl(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size, bool decoupled)
     {
         EnsureInitialized();
-        if (step <= 0)
-            throw new ArgumentOutOfRangeException(nameof(step), step, "Step must be > 0 for bias-corrected optimizers to avoid division by zero.");
+        ValidateOptimizerStep(step);
         if (size <= 0) return;
-
-        // Native GPU path: one GLSL thread per 32-bit word (= 2 bf16 moments), no host round-trip.
-        if (IsGlslCompilerAvailable)
-        {
-            int words = (size + 1) / 2;
-            GlslDispatchN(VulkanCompressedOptimizerKernels.AdamBf16, words,
-                new[] { param, gradient, m, v },
-                new uint[] { (uint)size, (uint)step, decoupled ? 1u : 0u,
-                    FBits(learningRate), FBits(beta1), FBits(beta2), FBits(epsilon), FBits(weightDecay) });
-            return;
-        }
-
-        // Fallback only when libshaderc is unavailable (no runtime GLSL→SPIR-V): host round-trip.
-        CompressedMomentHostFallback.WarnHostFallbackOnce("Vulkan");
-        var p = DownloadBuffer(param);
-        var g = DownloadBuffer(gradient);
-        var mBytes = CompressedMomentHostFallback.DownloadPackedBytes(DownloadBuffer(m), size * sizeof(ushort));
-        var vBytes = CompressedMomentHostFallback.DownloadPackedBytes(DownloadBuffer(v), size * sizeof(ushort));
-        CompressedMomentHostFallback.AdamBf16(
-            p, g, mBytes, vBytes, learningRate, beta1, beta2, epsilon, weightDecay, step, size,
-            decoupledWeightDecay: decoupled);
-        UploadToBuffer(p, param);
-        UploadToBuffer(CompressedMomentHostFallback.PackBytesAsFloats(mBytes), m);
-        UploadToBuffer(CompressedMomentHostFallback.PackBytesAsFloats(vBytes), v);
+        GlslDispatchN(VulkanCompressedOptimizerKernels.AdamBf16, (size + 1) / 2,
+            new[] { param, gradient, m, v },
+            new[] { (uint)size, (uint)step, decoupled ? 1u : 0u,
+                FBits(learningRate), FBits(beta1), FBits(beta2), FBits(epsilon), FBits(weightDecay) });
     }
 
     public void Adam8BitUpdate(IGpuBuffer param, IGpuBuffer gradient,
@@ -129,350 +87,124 @@ public sealed unsafe partial class VulkanBackend
     {
         EnsureInitialized();
         if (paramLength <= 0 || numBlocks <= 0) return;
-
-        // Native GPU path: one workgroup per block (256-wide shared-memory reduction for the scales).
-        if (IsGlslCompilerAvailable)
-        {
-            GlslDispatchN(VulkanCompressedOptimizerKernels.Adam8Bit, numBlocks * 256,
-                new[] { param, gradient, mQuant, vQuant, mScales, vScales },
-                new uint[] { (uint)paramLength, (uint)blockSize, (uint)numBlocks,
-                    FBits(learningRate), FBits(beta1), FBits(beta2), FBits(epsilon),
-                    FBits(oneMinusBeta1), FBits(oneMinusBeta2), FBits(biasCorrection1), FBits(biasCorrection2) });
-            return;
-        }
-
-        CompressedMomentHostFallback.WarnHostFallbackOnce("Vulkan");
-        var p = DownloadBuffer(param);
-        var g = DownloadBuffer(gradient);
-        var mQuantBytes = CompressedMomentHostFallback.DownloadPackedBytes(DownloadBuffer(mQuant), paramLength);
-        var vQuantBytes = CompressedMomentHostFallback.DownloadPackedBytes(DownloadBuffer(vQuant), paramLength);
-        var mScaleData = DownloadBuffer(mScales);
-        var vScaleData = DownloadBuffer(vScales);
-        CompressedMomentHostFallback.Adam8Bit(
-            p, g, mQuantBytes, vQuantBytes, mScaleData, vScaleData,
-            learningRate, beta1, beta2, epsilon, oneMinusBeta1, oneMinusBeta2,
-            biasCorrection1, biasCorrection2, blockSize, paramLength, numBlocks);
-        UploadToBuffer(p, param);
-        UploadToBuffer(CompressedMomentHostFallback.PackBytesAsFloats(mQuantBytes), mQuant);
-        UploadToBuffer(CompressedMomentHostFallback.PackBytesAsFloats(vQuantBytes), vQuant);
-        UploadToBuffer(mScaleData, mScales);
-        UploadToBuffer(vScaleData, vScales);
+        GlslDispatchN(VulkanCompressedOptimizerKernels.Adam8Bit, checked(numBlocks * 256),
+            new[] { param, gradient, mQuant, vQuant, mScales, vScales },
+            new[] { (uint)paramLength, (uint)blockSize, (uint)numBlocks,
+                FBits(learningRate), FBits(beta1), FBits(beta2), FBits(epsilon),
+                FBits(oneMinusBeta1), FBits(oneMinusBeta2), FBits(biasCorrection1), FBits(biasCorrection2) });
     }
 
     public void RmspropUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer squaredAvg,
         float learningRate, float rho, float epsilon, float weightDecay, int size)
     {
         EnsureInitialized();
-        var p = DownloadBuffer(param); var g = DownloadBuffer(gradient); var sa = DownloadBuffer(squaredAvg);
-        for (int i = 0; i < size; i++)
-        {
-            float grad = g[i] + weightDecay * p[i];
-            sa[i] = rho * sa[i] + (1f - rho) * grad * grad;
-            p[i] -= learningRate * grad / (MathF.Sqrt(sa[i]) + epsilon);
-        }
-        UploadToBuffer(p, param); UploadToBuffer(sa, squaredAvg);
+        DispatchOptimizer(VulkanOptimizerKernels.ThreeBuffer, size, new[] { param, gradient, squaredAvg },
+            (uint)size, 1, FloatBits(learningRate), FloatBits(rho), FloatBits(epsilon), FloatBits(weightDecay));
     }
 
     public void AdagradUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer accumulatedGrad,
         float learningRate, float epsilon, float weightDecay, int size)
     {
         EnsureInitialized();
-        var p = DownloadBuffer(param); var g = DownloadBuffer(gradient); var ag = DownloadBuffer(accumulatedGrad);
-        for (int i = 0; i < size; i++)
-        {
-            float grad = g[i] + weightDecay * p[i];
-            ag[i] += grad * grad;
-            p[i] -= learningRate * grad / (MathF.Sqrt(ag[i]) + epsilon);
-        }
-        UploadToBuffer(p, param); UploadToBuffer(ag, accumulatedGrad);
+        DispatchOptimizer(VulkanOptimizerKernels.ThreeBuffer, size, new[] { param, gradient, accumulatedGrad },
+            (uint)size, 2, FloatBits(learningRate), FloatBits(epsilon), FloatBits(weightDecay), 0);
     }
 
     public void NagUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer velocity,
         float learningRate, float momentum, float weightDecay, int size)
     {
         EnsureInitialized();
-        var p = DownloadBuffer(param); var g = DownloadBuffer(gradient); var v = DownloadBuffer(velocity);
-        for (int i = 0; i < size; i++)
-        {
-            float vPrev = v[i];
-            v[i] = momentum * v[i] - learningRate * (g[i] + weightDecay * p[i]);
-            p[i] += -momentum * vPrev + (1f + momentum) * v[i];
-        }
-        UploadToBuffer(p, param); UploadToBuffer(v, velocity);
+        DispatchOptimizer(VulkanOptimizerKernels.ThreeBuffer, size, new[] { param, gradient, velocity },
+            (uint)size, 3, FloatBits(learningRate), FloatBits(momentum), FloatBits(weightDecay), 0);
     }
 
     public void LarsUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer velocity,
         float learningRate, float momentum, float weightDecay, float trustCoeff, int size)
     {
         EnsureInitialized();
-        var p = DownloadBuffer(param); var g = DownloadBuffer(gradient); var v = DownloadBuffer(velocity);
-        float pNorm = 0, gNorm = 0;
-        for (int i = 0; i < size; i++) { pNorm += p[i] * p[i]; gNorm += g[i] * g[i]; }
-        pNorm = MathF.Sqrt(pNorm); gNorm = MathF.Sqrt(gNorm);
-        float localLr = pNorm > 0 && gNorm > 0 ? trustCoeff * pNorm / (gNorm + weightDecay * pNorm) : 1f;
-        for (int i = 0; i < size; i++)
-        {
-            v[i] = momentum * v[i] + localLr * (g[i] + weightDecay * p[i]);
-            p[i] -= learningRate * v[i];
-        }
-        UploadToBuffer(p, param); UploadToBuffer(v, velocity);
+        DispatchOptimizer(VulkanOptimizerKernels.Lars, 1, new[] { param, gradient, velocity },
+            (uint)size, FloatBits(learningRate), FloatBits(momentum), FloatBits(weightDecay), FloatBits(trustCoeff));
     }
 
     public void LambUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
-        EnsureInitialized();
-        if (step <= 0)
-            throw new ArgumentOutOfRangeException(nameof(step), step, "Step must be > 0 for bias-corrected optimizers to avoid division by zero.");
-        var p = DownloadBuffer(param); var g = DownloadBuffer(gradient);
-        var mArr = DownloadBuffer(m); var vArr = DownloadBuffer(v);
-        float bc1 = 1f - MathF.Pow(beta1, step), bc2 = 1f - MathF.Pow(beta2, step);
-        var update = new float[size];
-        for (int i = 0; i < size; i++)
-        {
-            mArr[i] = beta1 * mArr[i] + (1f - beta1) * g[i];
-            vArr[i] = beta2 * vArr[i] + (1f - beta2) * g[i] * g[i];
-            update[i] = mArr[i] / bc1 / (MathF.Sqrt(vArr[i] / bc2) + epsilon) + weightDecay * p[i];
-        }
-        float pNorm = 0, uNorm = 0;
-        for (int i = 0; i < size; i++) { pNorm += p[i] * p[i]; uNorm += update[i] * update[i]; }
-        float ratio = uNorm > 0 ? MathF.Sqrt(pNorm) / MathF.Sqrt(uNorm) : 1f;
-        for (int i = 0; i < size; i++) p[i] -= learningRate * ratio * update[i];
-        UploadToBuffer(p, param); UploadToBuffer(mArr, m); UploadToBuffer(vArr, v);
+        ValidateOptimizerStep(step);
+        DispatchOptimizer(VulkanOptimizerKernels.Lamb, 1, new[] { param, gradient, m, v },
+            (uint)size, (uint)step, FloatBits(learningRate), FloatBits(beta1), FloatBits(beta2),
+            FloatBits(epsilon), FloatBits(weightDecay));
     }
 
     public void AdadeltaUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer accumGrad, IGpuBuffer accumUpdate,
         float rho, float epsilon, float weightDecay, int size)
     {
         EnsureInitialized();
-        var p = DownloadBuffer(param); var g = DownloadBuffer(gradient);
-        var ag = DownloadBuffer(accumGrad); var au = DownloadBuffer(accumUpdate);
-        for (int i = 0; i < size; i++)
-        {
-            ag[i] = rho * ag[i] + (1f - rho) * g[i] * g[i];
-            float update = MathF.Sqrt(au[i] + epsilon) / MathF.Sqrt(ag[i] + epsilon) * g[i];
-            au[i] = rho * au[i] + (1f - rho) * update * update;
-            p[i] -= update + weightDecay * p[i];
-        }
-        UploadToBuffer(p, param); UploadToBuffer(ag, accumGrad); UploadToBuffer(au, accumUpdate);
+        DispatchOptimizer(VulkanOptimizerKernels.FourBuffer, size, new[] { param, gradient, accumGrad, accumUpdate },
+            (uint)size, 2, 0, 0, FloatBits(rho), FloatBits(epsilon), FloatBits(weightDecay), 0);
     }
 
     public void AmsgradUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v, IGpuBuffer vMax,
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
-        EnsureInitialized();
-        if (step <= 0)
-            throw new ArgumentOutOfRangeException(nameof(step), step, "Step must be > 0 for bias-corrected optimizers to avoid division by zero.");
-        var p = DownloadBuffer(param); var g = DownloadBuffer(gradient);
-        var mArr = DownloadBuffer(m); var vArr = DownloadBuffer(v); var vmArr = DownloadBuffer(vMax);
-        float bc1 = 1f - MathF.Pow(beta1, step), bc2 = 1f - MathF.Pow(beta2, step);
-        for (int i = 0; i < size; i++)
-        {
-            float grad = g[i] + weightDecay * p[i];
-            mArr[i] = beta1 * mArr[i] + (1f - beta1) * grad;
-            vArr[i] = beta2 * vArr[i] + (1f - beta2) * grad * grad;
-            vmArr[i] = MathF.Max(vmArr[i], vArr[i]);
-            float mHat = mArr[i] / bc1;
-            p[i] -= learningRate * mHat / (MathF.Sqrt(vmArr[i] / bc2) + epsilon);
-        }
-        UploadToBuffer(p, param); UploadToBuffer(mArr, m); UploadToBuffer(vArr, v); UploadToBuffer(vmArr, vMax);
+        ValidateOptimizerStep(step);
+        DispatchOptimizer(VulkanOptimizerKernels.Amsgrad, size, new[] { param, gradient, m, v, vMax },
+            (uint)size, (uint)step, FloatBits(learningRate), FloatBits(beta1), FloatBits(beta2),
+            FloatBits(epsilon), FloatBits(weightDecay));
     }
 
     public void AdamaxUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer u,
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
-        EnsureInitialized();
-        if (step <= 0)
-            throw new ArgumentOutOfRangeException(nameof(step), step, "Step must be > 0 for bias-corrected optimizers to avoid division by zero.");
-        var p = DownloadBuffer(param); var g = DownloadBuffer(gradient);
-        var mArr = DownloadBuffer(m); var uArr = DownloadBuffer(u);
-        float bc1 = 1f - MathF.Pow(beta1, step);
-        for (int i = 0; i < size; i++)
-        {
-            float grad = g[i] + weightDecay * p[i];
-            mArr[i] = beta1 * mArr[i] + (1f - beta1) * grad;
-            uArr[i] = MathF.Max(beta2 * uArr[i], MathF.Abs(grad));
-            p[i] -= learningRate / bc1 * mArr[i] / (uArr[i] + epsilon);
-        }
-        UploadToBuffer(p, param); UploadToBuffer(mArr, m); UploadToBuffer(uArr, u);
+        ValidateOptimizerStep(step);
+        DispatchOptimizer(VulkanOptimizerKernels.FourBuffer, size, new[] { param, gradient, m, u },
+            (uint)size, 3, (uint)step, FloatBits(learningRate), FloatBits(beta1), FloatBits(beta2),
+            FloatBits(epsilon), FloatBits(weightDecay));
     }
 
     public void LionUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m,
         float learningRate, float beta1, float beta2, float weightDecay, int size)
     {
         EnsureInitialized();
-        var p = DownloadBuffer(param); var g = DownloadBuffer(gradient); var mArr = DownloadBuffer(m);
-        for (int i = 0; i < size; i++)
-        {
-            float update = beta1 * mArr[i] + (1f - beta1) * g[i];
-            p[i] -= learningRate * (MathF.Sign(update) + weightDecay * p[i]);
-            mArr[i] = beta2 * mArr[i] + (1f - beta2) * g[i];
-        }
-        UploadToBuffer(p, param); UploadToBuffer(mArr, m);
+        DispatchOptimizer(VulkanOptimizerKernels.ThreeBuffer, size, new[] { param, gradient, m },
+            (uint)size, 4, FloatBits(learningRate), FloatBits(beta1), FloatBits(beta2), FloatBits(weightDecay));
     }
 
     public void NadamUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
-        EnsureInitialized();
-        if (step <= 0)
-            throw new ArgumentOutOfRangeException(nameof(step), step, "Step must be > 0 for bias-corrected optimizers to avoid division by zero.");
-        var p = DownloadBuffer(param); var g = DownloadBuffer(gradient);
-        var mArr = DownloadBuffer(m); var vArr = DownloadBuffer(v);
-        float bc1 = 1f - MathF.Pow(beta1, step);
-        float bc1Next = 1f - MathF.Pow(beta1, step + 1);
-        float bc2 = 1f - MathF.Pow(beta2, step);
-        for (int i = 0; i < size; i++)
-        {
-            float grad = g[i] + weightDecay * p[i];
-            mArr[i] = beta1 * mArr[i] + (1f - beta1) * grad;
-            vArr[i] = beta2 * vArr[i] + (1f - beta2) * grad * grad;
-            float mHat = mArr[i] / bc1, vHat = vArr[i] / bc2;
-            float nesterov = beta1 * mHat + (1f - beta1) * grad / bc1Next;
-            p[i] -= learningRate * nesterov / (MathF.Sqrt(vHat) + epsilon);
-        }
-        UploadToBuffer(p, param); UploadToBuffer(mArr, m); UploadToBuffer(vArr, v);
+        ValidateOptimizerStep(step);
+        DispatchOptimizer(VulkanOptimizerKernels.FourBuffer, size, new[] { param, gradient, m, v },
+            (uint)size, 4, (uint)step, FloatBits(learningRate), FloatBits(beta1), FloatBits(beta2),
+            FloatBits(epsilon), FloatBits(weightDecay));
     }
 
     public void FtrlUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer z, IGpuBuffer n,
         float learningRate, float l1Reg, float l2Reg, float beta, int size)
     {
         EnsureInitialized();
-        var p = DownloadBuffer(param); var g = DownloadBuffer(gradient);
-        var zArr = DownloadBuffer(z); var nArr = DownloadBuffer(n);
-        for (int i = 0; i < size; i++)
-        {
-            float sigma = (MathF.Sqrt(nArr[i] + g[i] * g[i]) - MathF.Sqrt(nArr[i])) / learningRate;
-            zArr[i] += g[i] - sigma * p[i];
-            nArr[i] += g[i] * g[i];
-            if (MathF.Abs(zArr[i]) <= l1Reg) p[i] = 0;
-            else p[i] = -(zArr[i] - l1Reg * MathF.Sign(zArr[i])) / (l2Reg + (beta + MathF.Sqrt(nArr[i])) / learningRate);
-        }
-        UploadToBuffer(p, param); UploadToBuffer(zArr, z); UploadToBuffer(nArr, n);
+        DispatchOptimizer(VulkanOptimizerKernels.FourBuffer, size, new[] { param, gradient, z, n },
+            (uint)size, 5, 0, FloatBits(learningRate), FloatBits(l1Reg), FloatBits(l2Reg), FloatBits(beta), 0);
     }
 
     public void ProximalL1Update(IGpuBuffer param, IGpuBuffer gradient,
         float learningRate, float l1Strength, int size)
     {
         EnsureInitialized();
-        var p = DownloadBuffer(param);
-        var g = DownloadBuffer(gradient);
-        for (int i = 0; i < size; i++)
-        {
-            float tmp = p[i] - learningRate * g[i];
-            float mag = MathF.Abs(tmp) - learningRate * l1Strength;
-            p[i] = mag > 0 ? MathF.Sign(tmp) * mag : 0f;
-        }
-        UploadToBuffer(p, param);
+        DispatchOptimizer(VulkanOptimizerKernels.TwoBuffer, size, new[] { param, gradient },
+            (uint)size, 1, FloatBits(learningRate), FloatBits(l1Strength));
     }
 
     public void ConvertToFp16(IGpuBuffer input, IGpuBuffer output, int size)
     {
         EnsureInitialized();
-        var inputData = DownloadBuffer(input);
-        var outputBytes = new byte[size * 2];
-
-        for (int i = 0; i < size; i++)
-        {
-            ushort fp16 = FloatToHalfCompat(inputData[i]);
-            outputBytes[i * 2] = (byte)(fp16 & 0xFF);
-            outputBytes[i * 2 + 1] = (byte)((fp16 >> 8) & 0xFF);
-        }
-
-        var floatData = new float[(size + 1) / 2];
-        Buffer.BlockCopy(outputBytes, 0, floatData, 0, size * 2);
-        UploadToBuffer(floatData, output);
+        DispatchOptimizer(VulkanOptimizerKernels.ConvertToFp16, (size + 1) / 2,
+            new[] { input, output }, (uint)size);
     }
 
     public void ConvertToFp32(IGpuBuffer input, IGpuBuffer output, int size)
     {
         EnsureInitialized();
-        var inputFloatData = DownloadBuffer(input);
-
-        int requiredFloats = (size + 1) / 2;
-        if (inputFloatData.Length < requiredFloats)
-        {
-            throw new ArgumentException(
-                $"Input buffer too small: has {inputFloatData.Length} floats but needs at least {requiredFloats} to hold {size} FP16 values.",
-                nameof(input));
-        }
-
-        int bytesToCopy = size * 2;
-        var inputBytes = new byte[bytesToCopy];
-        Buffer.BlockCopy(inputFloatData, 0, inputBytes, 0, bytesToCopy);
-
-        var outputData = new float[size];
-        for (int i = 0; i < size; i++)
-        {
-            ushort fp16 = (ushort)(inputBytes[i * 2] | (inputBytes[i * 2 + 1] << 8));
-            outputData[i] = HalfToFloatCompat(fp16);
-        }
-
-        UploadToBuffer(outputData, output);
-    }
-
-    private static ushort FloatToHalfCompat(float value)
-    {
-        int bits = SingleToInt32BitsCompat(value);
-        int sign = (bits >> 16) & 0x8000;
-        int exp = ((bits >> 23) & 0xFF) - 112;
-        int mantissa = bits & 0x7FFFFF;
-
-        if (exp <= 0)
-        {
-            if (exp < -10)
-            {
-                return (ushort)sign;
-            }
-            mantissa |= 0x800000;
-            int shift = 14 - exp;
-            mantissa >>= shift;
-            return (ushort)(sign | mantissa);
-        }
-        else if (exp >= 31)
-        {
-            if ((bits & 0x7FFFFFFF) > 0x7F800000)
-            {
-                return 0x7FFF; // NaN
-            }
-            return (ushort)(sign | 0x7C00); // Infinity
-        }
-
-        return (ushort)(sign | (exp << 10) | (mantissa >> 13));
-    }
-
-    private static float HalfToFloatCompat(ushort value)
-    {
-        int sign = (value & 0x8000) << 16;
-        int exp = (value >> 10) & 0x1F;
-        int mantissa = value & 0x3FF;
-
-        if (exp == 0)
-        {
-            if (mantissa == 0)
-            {
-                return Int32BitsToSingleCompat(sign);
-            }
-            while ((mantissa & 0x400) == 0)
-            {
-                mantissa <<= 1;
-                exp--;
-            }
-            exp++;
-            mantissa &= 0x3FF;
-        }
-        else if (exp == 31)
-        {
-            if (mantissa == 0)
-            {
-                return Int32BitsToSingleCompat(sign | 0x7F800000);
-            }
-            return Int32BitsToSingleCompat(sign | 0x7FC00000);
-        }
-
-        exp += 112;
-        int bits = sign | (exp << 23) | (mantissa << 13);
-        return Int32BitsToSingleCompat(bits);
+        DispatchOptimizer(VulkanOptimizerKernels.ConvertToFp32, size, new[] { input, output }, (uint)size);
     }
 
     #endregion
@@ -486,33 +218,10 @@ public sealed unsafe partial class VulkanBackend
             throw new ArgumentException($"K ({K}) must be a multiple of 4 for 2:4 sparsity.", nameof(K));
         if (M <= 0)
             throw new ArgumentOutOfRangeException(nameof(M), "M must be positive.");
-        var dense = DownloadBuffer(denseInput);
-        int sparseK = K / 2;
-        var sv = new float[M * sparseK];
-        var sparseIndicesData = new byte[M * K / 4];
-
-        for (int row = 0; row < M; row++)
-        {
-            for (int blk = 0; blk < K / 4; blk++)
-            {
-                int baseIdx = row * K + blk * 4;
-                var vals = new (float v, int idx)[4];
-                for (int j = 0; j < 4; j++) vals[j] = (MathF.Abs(dense[baseIdx + j]), j);
-                Array.Sort(vals, (a, b) => b.v.CompareTo(a.v));
-                int sOff = row * sparseK + blk * 2;
-                sv[sOff] = dense[baseIdx + vals[0].idx];
-                sv[sOff + 1] = dense[baseIdx + vals[1].idx];
-
-                // Pack indices into byte (2 bits per index), matching IDirectGpuBackend contract
-                byte packedIndices = (byte)((vals[0].idx & 0x3) | ((vals[1].idx & 0x3) << 2));
-                sparseIndicesData[row * K / 4 + blk] = packedIndices;
-            }
-        }
-
-        UploadToBuffer(sv, sparseValues);
-        var floatIndices = new float[(M * K / 4 + 3) / 4];
-        Buffer.BlockCopy(sparseIndicesData, 0, floatIndices, 0, sparseIndicesData.Length);
-        UploadToBuffer(floatIndices, sparseIndices);
+        int groups = checked(M * (K / 4));
+        GlslNaryOp(VulkanResidentKernels.Enforce2x4,
+            new[] { denseInput, sparseValues, sparseIndices }, (groups + 3) / 4,
+            new[] { (uint)M, (uint)K, (uint)groups });
     }
 
     public void Decompress2x4Sparse(IGpuBuffer sparseValues, IGpuBuffer sparseIndices, IGpuBuffer denseOutput, int M, int K)
@@ -522,29 +231,9 @@ public sealed unsafe partial class VulkanBackend
             throw new ArgumentException($"K ({K}) must be a multiple of 4 for 2:4 sparsity.", nameof(K));
         if (M <= 0)
             throw new ArgumentOutOfRangeException(nameof(M), "M must be positive.");
-        var sv = DownloadBuffer(sparseValues);
-        var floatIndices = DownloadBuffer(sparseIndices);
-        var sparseIndicesData = new byte[M * K / 4];
-        Buffer.BlockCopy(floatIndices, 0, sparseIndicesData, 0, sparseIndicesData.Length);
-
-        var dense = new float[M * K];
-        int sparseK = K / 2;
-        for (int row = 0; row < M; row++)
-        {
-            for (int blk = 0; blk < K / 4; blk++)
-            {
-                int sparseValueOffset = row * sparseK + blk * 2;
-                byte packedIndices = sparseIndicesData[row * K / 4 + blk];
-
-                int idx0 = packedIndices & 0x3;
-                int idx1 = (packedIndices >> 2) & 0x3;
-
-                int baseIdx = row * K + blk * 4;
-                dense[baseIdx + idx0] = sv[sparseValueOffset];
-                dense[baseIdx + idx1] = sv[sparseValueOffset + 1];
-            }
-        }
-        UploadToBuffer(dense, denseOutput);
+        GlslNaryOp(VulkanResidentKernels.Decompress2x4,
+            new[] { sparseValues, sparseIndices, denseOutput }, checked(M * K),
+            new[] { (uint)M, (uint)K });
     }
 
     public void SparseGemm(IGpuBuffer sparseAValues, IGpuBuffer sparseAIndices, IGpuBuffer B, IGpuBuffer C,
@@ -577,115 +266,41 @@ public sealed unsafe partial class VulkanBackend
     public void CsrSpMMBias(IGpuBuffer csrValues, IGpuBuffer csrColIndices, IGpuBuffer csrRowPointers, IGpuBuffer denseB, IGpuBuffer bias, IGpuBuffer output, int M, int K, int N, int nnz)
     {
         CsrSpMM(csrValues, csrColIndices, csrRowPointers, denseB, output, M, K, N, nnz);
-        var o = DownloadBuffer(output);
-        var bi = DownloadBuffer(bias);
-        for (int i = 0; i < M; i++)
-            for (int j = 0; j < N; j++) o[i * N + j] += bi[j];
-        UploadToBuffer(o, output);
+        BiasAdd(output, bias, output, M, N);
     }
 
     public void ScatterAddEdges(IGpuBuffer input, IGpuBuffer sourceIndices, IGpuBuffer targetIndices, IGpuBuffer? edgeValues, IGpuBuffer output, int numNodes, int numEdges, int features)
     {
         EnsureInitialized();
-        var inp = DownloadBuffer(input);
-        var src = DownloadBuffer(sourceIndices);
-        var tgt = DownloadBuffer(targetIndices);
-        float[]? ev = edgeValues is not null ? DownloadBuffer(edgeValues) : null;
-        var o = new float[numNodes * features];
-        Array.Copy(inp, 0, o, 0, Math.Min(inp.Length, o.Length));
-        for (int e = 0; e < numEdges; e++)
-        {
-            int s = SingleToInt32BitsCompat(src[e]);
-            int t = SingleToInt32BitsCompat(tgt[e]);
-            if ((uint)s >= (uint)numNodes)
-                throw new ArgumentOutOfRangeException(nameof(sourceIndices), $"Decoded source index {s} at edge {e} is out of range [0, {numNodes}).");
-            if ((uint)t >= (uint)numNodes)
-                throw new ArgumentOutOfRangeException(nameof(targetIndices), $"Decoded target index {t} at edge {e} is out of range [0, {numNodes}).");
-            float w = ev is not null ? ev[e] : 1f;
-            for (int f = 0; f < features; f++) o[t * features + f] += w * inp[s * features + f];
-        }
-        UploadToBuffer(o, output);
+        using var edgeValueDummy = edgeValues is null ? AllocateBuffer(1) : null;
+        GlslNaryOp(VulkanResidentKernels.ScatterAddEdges,
+            new[] { input, sourceIndices, targetIndices, edgeValues ?? edgeValueDummy!, output },
+            checked(numNodes * features),
+            new[] { (uint)numNodes, (uint)numEdges, (uint)features, edgeValues is null ? 0u : 1u });
     }
 
     public void CsrSegmentedMax(IGpuBuffer csrColIndices, IGpuBuffer csrRowPointers, IGpuBuffer input, IGpuBuffer output, int M, int K, int N)
     {
         EnsureInitialized();
-        var cols = DownloadBuffer(csrColIndices); var rows = DownloadBuffer(csrRowPointers);
-        var inp = DownloadBuffer(input); var o = new float[M * N];
-        ArrayFillCompat(o, float.MinValue);
-        for (int i = 0; i < M; i++)
-        {
-            int rowStart = SingleToInt32BitsCompat(rows[i]);
-            int rowEnd = SingleToInt32BitsCompat(rows[i + 1]);
-            for (int idx = rowStart; idx < rowEnd; idx++)
-            {
-                int col = SingleToInt32BitsCompat(cols[idx]);
-                if ((uint)col >= (uint)K)
-                    throw new ArgumentOutOfRangeException(nameof(csrColIndices), $"Decoded CSR column index {col} at position {idx} is out of range [0, {K}).");
-                for (int j = 0; j < N; j++) o[i * N + j] = MathF.Max(o[i * N + j], inp[col * N + j]);
-            }
-            if (rowStart == rowEnd) for (int j = 0; j < N; j++) o[i * N + j] = 0;
-        }
-        UploadToBuffer(o, output);
+        GlslNaryOp(VulkanResidentKernels.CsrSegmented,
+            new[] { csrColIndices, csrRowPointers, input, output }, checked(M * N),
+            new[] { (uint)M, (uint)K, (uint)N, 0u, FloatBits(0f) });
     }
 
     public void CsrSegmentedMin(IGpuBuffer csrColIndices, IGpuBuffer csrRowPointers, IGpuBuffer input, IGpuBuffer output, int M, int K, int N)
     {
         EnsureInitialized();
-        var cols = DownloadBuffer(csrColIndices); var rows = DownloadBuffer(csrRowPointers);
-        var inp = DownloadBuffer(input); var o = new float[M * N];
-        ArrayFillCompat(o, float.MaxValue);
-        for (int i = 0; i < M; i++)
-        {
-            int rowStart = SingleToInt32BitsCompat(rows[i]);
-            int rowEnd = SingleToInt32BitsCompat(rows[i + 1]);
-            for (int idx = rowStart; idx < rowEnd; idx++)
-            {
-                int col = SingleToInt32BitsCompat(cols[idx]);
-                if ((uint)col >= (uint)K)
-                    throw new ArgumentOutOfRangeException(nameof(csrColIndices), $"Decoded CSR column index {col} at position {idx} is out of range [0, {K}).");
-                for (int j = 0; j < N; j++) o[i * N + j] = MathF.Min(o[i * N + j], inp[col * N + j]);
-            }
-            if (rowStart == rowEnd) for (int j = 0; j < N; j++) o[i * N + j] = 0;
-        }
-        UploadToBuffer(o, output);
+        GlslNaryOp(VulkanResidentKernels.CsrSegmented,
+            new[] { csrColIndices, csrRowPointers, input, output }, checked(M * N),
+            new[] { (uint)M, (uint)K, (uint)N, 1u, FloatBits(0f) });
     }
 
     public void CsrSegmentedStdDev(IGpuBuffer csrColIndices, IGpuBuffer csrRowPointers, IGpuBuffer input, IGpuBuffer output, int M, int K, int N, float epsilon = 1e-8f)
     {
         EnsureInitialized();
-        var cols = DownloadBuffer(csrColIndices); var rows = DownloadBuffer(csrRowPointers);
-        var inp = DownloadBuffer(input); var o = new float[M * N];
-        for (int i = 0; i < M; i++)
-        {
-            int rowStart = SingleToInt32BitsCompat(rows[i]);
-            int rowEnd = SingleToInt32BitsCompat(rows[i + 1]);
-            int count = rowEnd - rowStart;
-            if (count == 0) continue;
-            for (int j = 0; j < N; j++)
-            {
-                float mean = 0;
-                for (int idx = rowStart; idx < rowEnd; idx++)
-                {
-                    int col = SingleToInt32BitsCompat(cols[idx]);
-                    if ((uint)col >= (uint)K)
-                        throw new ArgumentOutOfRangeException(nameof(csrColIndices), $"Decoded CSR column index {col} at position {idx} is out of range [0, {K}).");
-                    mean += inp[col * N + j];
-                }
-                mean /= count;
-                float var_ = 0;
-                for (int idx = rowStart; idx < rowEnd; idx++)
-                {
-                    int col = SingleToInt32BitsCompat(cols[idx]);
-                    if ((uint)col >= (uint)K)
-                        throw new ArgumentOutOfRangeException(nameof(csrColIndices), $"Decoded CSR column index {col} at position {idx} is out of range [0, {K}).");
-                    float d = inp[col * N + j] - mean;
-                    var_ += d * d;
-                }
-                o[i * N + j] = MathF.Sqrt(var_ / count + epsilon);
-            }
-        }
-        UploadToBuffer(o, output);
+        GlslNaryOp(VulkanResidentKernels.CsrSegmented,
+            new[] { csrColIndices, csrRowPointers, input, output }, checked(M * N),
+            new[] { (uint)M, (uint)K, (uint)N, 2u, FloatBits(epsilon) });
     }
 
     #endregion
@@ -695,45 +310,24 @@ public sealed unsafe partial class VulkanBackend
     public void RbfForward(IGpuBuffer input, IGpuBuffer centers, IGpuBuffer epsilons, IGpuBuffer output, int batchSize, int numCenters, int inputDim)
     {
         EnsureInitialized();
-        var inp = DownloadBuffer(input); var c = DownloadBuffer(centers); var eps = DownloadBuffer(epsilons);
-        var o = new float[batchSize * numCenters];
-        for (int b = 0; b < batchSize; b++)
-            for (int nc = 0; nc < numCenters; nc++)
-            {
-                float dist = 0;
-                for (int d = 0; d < inputDim; d++) { float diff = inp[b * inputDim + d] - c[nc * inputDim + d]; dist += diff * diff; }
-                o[b * numCenters + nc] = MathF.Exp(-eps[nc] * dist);
-            }
-        UploadToBuffer(o, output);
+        GlslNaryOp(VulkanResidentKernels.RbfForward, new[] { input, centers, epsilons, output },
+            checked(batchSize * numCenters), new[] { (uint)batchSize, (uint)numCenters, (uint)inputDim });
     }
 
     public void StdpUpdate(IGpuBuffer weights, IGpuBuffer preTrace, IGpuBuffer postTrace, IGpuBuffer preSpike, IGpuBuffer postSpike,
         float ltpRate, float ltdRate, float homeostasisRate, float minWeight, float maxWeight, int numPre, int numPost)
     {
         EnsureInitialized();
-        var w = DownloadBuffer(weights); var preT = DownloadBuffer(preTrace); var postT = DownloadBuffer(postTrace);
-        var preS = DownloadBuffer(preSpike); var postS = DownloadBuffer(postSpike);
-        for (int i = 0; i < numPre; i++)
-            for (int j = 0; j < numPost; j++)
-            {
-                int idx = i * numPost + j;
-                if (postS[j] > 0.5f) w[idx] += ltpRate * preT[i];
-                if (preS[i] > 0.5f) w[idx] -= ltdRate * postT[j];
-                w[idx] = MathF.Max(minWeight, MathF.Min(maxWeight, w[idx]));
-            }
-        UploadToBuffer(w, weights);
+        GlslNaryOp(VulkanResidentKernels.StdpUpdate,
+            new[] { weights, preTrace, postTrace, preSpike, postSpike }, checked(numPre * numPost),
+            new[] { (uint)numPre, (uint)numPost, FloatBits(ltpRate), FloatBits(ltdRate), FloatBits(minWeight), FloatBits(maxWeight) });
     }
 
     public void UpdateTraces(IGpuBuffer traces, IGpuBuffer spikes, IGpuBuffer input, float decay, float threshold, int size)
     {
         EnsureInitialized();
-        var t = DownloadBuffer(traces); var s = DownloadBuffer(spikes); var inp = DownloadBuffer(input);
-        for (int i = 0; i < size; i++)
-        {
-            t[i] = decay * t[i];
-            if (s[i] > 0.5f) t[i] += 1f;
-        }
-        UploadToBuffer(t, traces);
+        GlslNaryOp(VulkanResidentKernels.UpdateTraces, new[] { traces, spikes }, size,
+            new[] { (uint)size, FloatBits(decay) });
     }
 
     #endregion
@@ -790,51 +384,28 @@ public sealed unsafe partial class VulkanBackend
     public void HyperbolicLinearBackwardInput(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer gradInput,
         int batchSize, int inputFeatures, int outputFeatures, float curvature)
     {
-        // gradInput = gradOutput * weights^T (Euclidean approximation)
-        // Compute via two GEMMs: create transposed weight buffer then multiply
         EnsureInitialized();
-        var wt = DownloadBuffer(weights);
-        var wtT = new float[inputFeatures * outputFeatures];
-        for (int o = 0; o < outputFeatures; o++)
-            for (int i = 0; i < inputFeatures; i++)
-                wtT[i * outputFeatures + o] = wt[o * inputFeatures + i];
-        var wtTBuf = AllocateBuffer(inputFeatures * outputFeatures);
-        UploadToBuffer(wtT, wtTBuf);
-        Gemm(gradOutput, wtTBuf, gradInput, batchSize, inputFeatures, outputFeatures);
-        wtTBuf.Dispose();
+        GlslNaryOp(VulkanResidentKernels.HyperbolicBackwardInput,
+            new[] { gradOutput, weights, gradInput }, checked(batchSize * inputFeatures),
+            new[] { (uint)batchSize, (uint)inputFeatures, (uint)outputFeatures });
     }
 
     public void HyperbolicLinearBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradWeights,
         int batchSize, int inputFeatures, int outputFeatures, float curvature)
     {
-        // gradWeights = gradOutput^T * input
         EnsureInitialized();
-        var go = DownloadBuffer(gradOutput);
-        var goT = new float[outputFeatures * batchSize];
-        for (int b = 0; b < batchSize; b++)
-            for (int o = 0; o < outputFeatures; o++)
-                goT[o * batchSize + b] = go[b * outputFeatures + o];
-        var goTBuf = AllocateBuffer(outputFeatures * batchSize);
-        UploadToBuffer(goT, goTBuf);
-        Gemm(goTBuf, input, gradWeights, outputFeatures, inputFeatures, batchSize);
-        goTBuf.Dispose();
+        GlslNaryOp(VulkanResidentKernels.HyperbolicBackwardWeights,
+            new[] { gradOutput, input, gradWeights }, checked(outputFeatures * inputFeatures),
+            new[] { (uint)batchSize, (uint)inputFeatures, (uint)outputFeatures });
     }
 
     public void HyperbolicLinearBackwardBiases(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradBiases,
         int batchSize, int inputFeatures, int outputFeatures, float curvature)
     {
-        // gradBiases[o] = sum_b gradOutput[b,o]
         EnsureInitialized();
-        var go = DownloadBuffer(gradOutput);
-        var gb = new float[outputFeatures];
-        for (int o = 0; o < outputFeatures; o++)
-        {
-            float sum = 0;
-            for (int b = 0; b < batchSize; b++)
-                sum += go[b * outputFeatures + o];
-            gb[o] = sum;
-        }
-        UploadToBuffer(gb, gradBiases);
+        GlslNaryOp(VulkanResidentKernels.HyperbolicBackwardBiases,
+            new[] { gradOutput, gradBiases }, outputFeatures,
+            new[] { (uint)batchSize, (uint)outputFeatures });
     }
 
     #endregion
@@ -940,113 +511,118 @@ public sealed unsafe partial class VulkanBackend
     public void QuantumMeasurement(IGpuBuffer realPart, IGpuBuffer imagPart, IGpuBuffer probabilities, int batchSize, int stateSize)
     {
         EnsureInitialized();
-        var re = DownloadBuffer(realPart); var im = DownloadBuffer(imagPart);
-        var prob = new float[batchSize * stateSize];
-        for (int b = 0; b < batchSize; b++)
-            for (int s = 0; s < stateSize; s++)
-            {
-                int idx = b * stateSize + s;
-                prob[idx] = re[idx] * re[idx] + im[idx] * im[idx];
-            }
-        UploadToBuffer(prob, probabilities);
+        int size = checked(batchSize * stateSize);
+        GlslNaryOp(VulkanResidentKernels.QuantumMeasurement,
+            new[] { realPart, imagPart, probabilities }, size, new[] { (uint)size });
     }
 
     public void NormalizeProbabilities(IGpuBuffer probabilities, int batchSize, int stateSize)
     {
         EnsureInitialized();
-        var prob = DownloadBuffer(probabilities);
-        for (int b = 0; b < batchSize; b++)
-        {
-            int off = b * stateSize; float sum = 0;
-            for (int s = 0; s < stateSize; s++) sum += prob[off + s];
-            if (sum > 0) for (int s = 0; s < stateSize; s++) prob[off + s] /= sum;
-        }
-        UploadToBuffer(prob, probabilities);
+        GlslNaryOp(VulkanResidentKernels.NormalizeProbabilities, new[] { probabilities }, batchSize,
+            new[] { (uint)batchSize, (uint)stateSize });
     }
 
     public void ComplexMatVec(IGpuBuffer matReal, IGpuBuffer matImag, IGpuBuffer vecReal, IGpuBuffer vecImag,
         IGpuBuffer outReal, IGpuBuffer outImag, int batchSize, int dim)
     {
         EnsureInitialized();
-        var mr = DownloadBuffer(matReal); var mi = DownloadBuffer(matImag);
-        var vr = DownloadBuffer(vecReal); var vi = DownloadBuffer(vecImag);
-        var or_ = new float[batchSize * dim]; var oi = new float[batchSize * dim];
-        for (int b = 0; b < batchSize; b++)
-        {
-            int vOff = b * dim, mOff = b * dim * dim;
-            for (int i = 0; i < dim; i++)
-            {
-                float sumR = 0, sumI = 0;
-                for (int j = 0; j < dim; j++)
-                {
-                    int mIdx = mOff + i * dim + j;
-                    sumR += mr[mIdx] * vr[vOff + j] - mi[mIdx] * vi[vOff + j];
-                    sumI += mr[mIdx] * vi[vOff + j] + mi[mIdx] * vr[vOff + j];
-                }
-                or_[vOff + i] = sumR; oi[vOff + i] = sumI;
-            }
-        }
-        UploadToBuffer(or_, outReal); UploadToBuffer(oi, outImag);
+        GlslNaryOp(VulkanResidentKernels.ComplexMatVec,
+            new[] { matReal, matImag, vecReal, vecImag, outReal, outImag }, checked(batchSize * dim),
+            new[] { (uint)batchSize, (uint)dim });
     }
 
     public void QuantumRotation(IGpuBuffer stateReal, IGpuBuffer stateImag, IGpuBuffer outReal, IGpuBuffer outImag,
         IGpuBuffer angles, int numQubits, int batchSize)
     {
         EnsureInitialized();
-        var sr = DownloadBuffer(stateReal); var si = DownloadBuffer(stateImag);
-        var ang = DownloadBuffer(angles);
-        int stateSize = 1 << numQubits;
-        var or_ = new float[batchSize * stateSize]; var oi = new float[batchSize * stateSize];
-        for (int b = 0; b < batchSize; b++)
-        {
-            int off = b * stateSize;
-            float cosA = MathF.Cos(ang[b % ang.Length]);
-            float sinA = MathF.Sin(ang[b % ang.Length]);
-            for (int s = 0; s < stateSize; s++)
-            {
-                or_[off + s] = cosA * sr[off + s] - sinA * si[off + s];
-                oi[off + s] = sinA * sr[off + s] + cosA * si[off + s];
-            }
-        }
-        UploadToBuffer(or_, outReal); UploadToBuffer(oi, outImag);
+        int stateSize = checked(1 << numQubits);
+        GlslNaryOp(VulkanResidentKernels.QuantumRotation,
+            new[] { stateReal, stateImag, angles, outReal, outImag }, checked(batchSize * stateSize),
+            new[] { (uint)batchSize, (uint)stateSize, (uint)angles.Size });
     }
 
     public void MeasurementForward(IGpuBuffer input, IGpuBuffer output, int batchSize, int stateSize)
     {
         EnsureInitialized();
-        var inp = DownloadBuffer(input);
-        var o = new float[batchSize * stateSize];
-        for (int b = 0; b < batchSize; b++)
-        {
-            int off = b * stateSize; float sum = 0;
-            for (int s = 0; s < stateSize; s++) { o[off + s] = inp[off + s] * inp[off + s]; sum += o[off + s]; }
-            if (sum > 0) for (int s = 0; s < stateSize; s++) o[off + s] /= sum;
-        }
-        UploadToBuffer(o, output);
+        GlslNaryOp(VulkanResidentKernels.MeasurementForward, new[] { input, output }, batchSize,
+            new[] { (uint)batchSize, (uint)stateSize });
     }
 
     #endregion
 
     #region FFT and Signal Processing
 
+    private void DispatchSplitDft(IGpuBuffer inputReal, IGpuBuffer inputImag,
+        IGpuBuffer outputReal, IGpuBuffer outputImag, int batch, int n, bool inverse)
+    {
+        int size = checked(batch * n);
+        IGpuBuffer realSource = inputReal;
+        IGpuBuffer imagSource = inputImag;
+        IGpuBuffer? realCopy = null;
+        IGpuBuffer? imagCopy = null;
+        try
+        {
+            if (ReferenceEquals(inputReal, outputReal) || ReferenceEquals(inputReal, outputImag))
+            {
+                realCopy = AllocateBuffer(size);
+                Copy(inputReal, realCopy, size);
+                realSource = realCopy;
+            }
+            if (ReferenceEquals(inputImag, outputReal) || ReferenceEquals(inputImag, outputImag))
+            {
+                imagCopy = AllocateBuffer(size);
+                Copy(inputImag, imagCopy, size);
+                imagSource = imagCopy;
+            }
+            GlslNaryOp(VulkanResidentKernels.SplitDft,
+                new[] { realSource, imagSource, outputReal, outputImag }, size,
+                new[] { (uint)batch, (uint)n, inverse ? 1u : 0u });
+        }
+        finally
+        {
+            realCopy?.Dispose();
+            imagCopy?.Dispose();
+        }
+    }
+
+    private void DispatchSplitDft2D(IGpuBuffer inputReal, IGpuBuffer inputImag,
+        IGpuBuffer outputReal, IGpuBuffer outputImag, int batch, int height, int width, bool inverse)
+    {
+        int size = checked(checked(batch * height) * width);
+        IGpuBuffer realSource = inputReal;
+        IGpuBuffer imagSource = inputImag;
+        IGpuBuffer? realCopy = null;
+        IGpuBuffer? imagCopy = null;
+        try
+        {
+            if (ReferenceEquals(inputReal, outputReal) || ReferenceEquals(inputReal, outputImag))
+            {
+                realCopy = AllocateBuffer(size);
+                Copy(inputReal, realCopy, size);
+                realSource = realCopy;
+            }
+            if (ReferenceEquals(inputImag, outputReal) || ReferenceEquals(inputImag, outputImag))
+            {
+                imagCopy = AllocateBuffer(size);
+                Copy(inputImag, imagCopy, size);
+                imagSource = imagCopy;
+            }
+            GlslNaryOp(VulkanResidentKernels.SplitDft2D,
+                new[] { realSource, imagSource, outputReal, outputImag }, size,
+                new[] { (uint)batch, (uint)height, (uint)width, inverse ? 1u : 0u });
+        }
+        finally
+        {
+            realCopy?.Dispose();
+            imagCopy?.Dispose();
+        }
+    }
+
     public void FFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag, int n, bool inverse)
     {
         EnsureInitialized();
-        var ir = DownloadBuffer(inputReal); var ii = DownloadBuffer(inputImag);
-        var or_ = new float[n]; var oi = new float[n];
-
-        if (n > 0 && (n & (n - 1)) == 0)
-        {
-            // Cooley-Tukey radix-2 FFT for power-of-2 sizes: O(n log n)
-            CooleyTukeyFFT(ir, ii, or_, oi, n, inverse);
-        }
-        else
-        {
-            // Fallback to naive DFT for non-power-of-2 sizes: O(n^2)
-            NaiveDFT(ir, ii, or_, oi, n, inverse);
-        }
-
-        UploadToBuffer(or_, outputReal); UploadToBuffer(oi, outputImag);
+        DispatchSplitDft(inputReal, inputImag, outputReal, outputImag, 1, n, inverse);
     }
 
     private static void CooleyTukeyFFT(float[] inR, float[] inI, float[] outR, float[] outI, int n, bool inverse)
@@ -1141,77 +717,13 @@ public sealed unsafe partial class VulkanBackend
     public void BatchedFFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag, int batch, int n, bool inverse)
     {
         EnsureInitialized();
-        var ir = DownloadBuffer(inputReal); var ii = DownloadBuffer(inputImag);
-        var or_ = new float[batch * n]; var oi = new float[batch * n];
-        bool isPow2 = n > 0 && (n & (n - 1)) == 0;
-
-        for (int b = 0; b < batch; b++)
-        {
-            int off = b * n;
-            var rowR = new float[n]; var rowI = new float[n];
-            var resR = new float[n]; var resI = new float[n];
-            Array.Copy(ir, off, rowR, 0, n);
-            Array.Copy(ii, off, rowI, 0, n);
-
-            if (isPow2)
-                CooleyTukeyFFT(rowR, rowI, resR, resI, n, inverse);
-            else
-                NaiveDFT(rowR, rowI, resR, resI, n, inverse);
-
-            Array.Copy(resR, 0, or_, off, n);
-            Array.Copy(resI, 0, oi, off, n);
-        }
-        UploadToBuffer(or_, outputReal); UploadToBuffer(oi, outputImag);
+        DispatchSplitDft(inputReal, inputImag, outputReal, outputImag, batch, n, inverse);
     }
 
     public void FFT2D(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag, int height, int width, bool inverse)
     {
         EnsureInitialized();
-
-        // Step 1: FFT along rows (treating height rows of width elements)
-        BatchedFFT(inputReal, inputImag, outputReal, outputImag, height, width, inverse);
-
-        // Step 2: FFT along columns (transpose, FFT rows, transpose back)
-        var rowR = DownloadBuffer(outputReal); var rowI = DownloadBuffer(outputImag);
-
-        // Transpose: height x width -> width x height
-        var trR = new float[width * height]; var trI = new float[width * height];
-        for (int r = 0; r < height; r++)
-            for (int c = 0; c < width; c++)
-            {
-                trR[c * height + r] = rowR[r * width + c];
-                trI[c * height + r] = rowI[r * width + c];
-            }
-
-        // FFT along transposed rows (= original columns)
-        bool isPow2 = height > 0 && (height & (height - 1)) == 0;
-        var colR = new float[width * height]; var colI = new float[width * height];
-        for (int c = 0; c < width; c++)
-        {
-            var inR = new float[height]; var inI = new float[height];
-            var outR = new float[height]; var outI = new float[height];
-            Array.Copy(trR, c * height, inR, 0, height);
-            Array.Copy(trI, c * height, inI, 0, height);
-
-            if (isPow2)
-                CooleyTukeyFFT(inR, inI, outR, outI, height, inverse);
-            else
-                NaiveDFT(inR, inI, outR, outI, height, inverse);
-
-            Array.Copy(outR, 0, colR, c * height, height);
-            Array.Copy(outI, 0, colI, c * height, height);
-        }
-
-        // Transpose back: width x height -> height x width
-        var finalR = new float[height * width]; var finalI = new float[height * width];
-        for (int r = 0; r < height; r++)
-            for (int c = 0; c < width; c++)
-            {
-                finalR[r * width + c] = colR[c * height + r];
-                finalI[r * width + c] = colI[c * height + r];
-            }
-
-        UploadToBuffer(finalR, outputReal); UploadToBuffer(finalI, outputImag);
+        DispatchSplitDft2D(inputReal, inputImag, outputReal, outputImag, 1, height, width, inverse);
     }
 
     /// <inheritdoc/>
@@ -1219,81 +731,39 @@ public sealed unsafe partial class VulkanBackend
         IGpuBuffer outputReal, IGpuBuffer outputImag,
         int batch, int height, int width, bool inverse)
     {
-        if (batch <= 0 || height <= 0 || width <= 0) return;
-        int sliceSize = height * width;
-
-        if (batch == 1)
-        {
-            // Single image — direct FFT2D, no temp buffers needed
-            FFT2D(inputReal, inputImag, outputReal, outputImag, height, width, inverse);
-            return;
-        }
-
-        // Allocate temp slice-sized buffers ONCE (reused across all slices)
-        var tempInR = AllocateBuffer(sliceSize);
-        var tempInI = AllocateBuffer(sliceSize);
-        var tempOutR = AllocateBuffer(sliceSize);
-        var tempOutI = AllocateBuffer(sliceSize);
-        try
-        {
-            for (int b = 0; b < batch; b++)
-            {
-                int off = b * sliceSize;
-                // GPU-to-GPU copy: extract slice from batched buffer
-                Copy(inputReal, off, tempInR, 0, sliceSize);
-                Copy(inputImag, off, tempInI, 0, sliceSize);
-                // FFT2D on GPU (fully GPU-resident, no CPU round-trip)
-                FFT2D(tempInR, tempInI, tempOutR, tempOutI, height, width, inverse);
-                // GPU-to-GPU copy: write result back to batched output
-                Copy(tempOutR, 0, outputReal, off, sliceSize);
-                Copy(tempOutI, 0, outputImag, off, sliceSize);
-            }
-        }
-        finally
-        {
-            tempInR.Dispose(); tempInI.Dispose();
-            tempOutR.Dispose(); tempOutI.Dispose();
-        }
+        EnsureInitialized();
+        DispatchSplitDft2D(inputReal, inputImag, outputReal, outputImag, batch, height, width, inverse);
     }
 
     public void ApplyWindow(IGpuBuffer input, IGpuBuffer window, IGpuBuffer output, int n)
-        => CpuBinary(input, window, output, n, (a, w) => a * w);
+        => ResidentBinary(ResidentBinaryOp.Multiply, input, window, output, n);
 
     public void ComplexMagnitude(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer magnitude, int n)
-        => CpuBinary(real, imag, magnitude, n, (r, i) => MathF.Sqrt(r * r + i * i));
+        => ResidentBinary(ResidentBinaryOp.ComplexMagnitude, real, imag, magnitude, n);
 
     public void ComplexPhase(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer phase, int n)
-        => CpuBinary(real, imag, phase, n, (r, i) => MathF.Atan2(i, r));
+        => ResidentBinary(ResidentBinaryOp.ComplexPhase, real, imag, phase, n);
 
     public void PolarToComplex(IGpuBuffer magnitude, IGpuBuffer phase, IGpuBuffer real, IGpuBuffer imag, int n)
     {
         EnsureInitialized();
-        var mag = DownloadBuffer(magnitude); var ph = DownloadBuffer(phase);
-        var r = new float[n]; var im = new float[n];
-        for (int i = 0; i < n; i++) { r[i] = mag[i] * MathF.Cos(ph[i]); im[i] = mag[i] * MathF.Sin(ph[i]); }
-        UploadToBuffer(r, real); UploadToBuffer(im, imag);
+        GlslNaryOp(VulkanResidentKernels.PolarToComplex,
+            new[] { magnitude, phase, real, imag }, n, new[] { (uint)n });
     }
 
     public void ApplyMelFilterbank(IGpuBuffer powerSpec, IGpuBuffer filterbank, IGpuBuffer melSpec, int numFrames, int numFreqs, int nMels)
     {
         EnsureInitialized();
-        var ps = DownloadBuffer(powerSpec); var fb = DownloadBuffer(filterbank);
-        var ms = new float[numFrames * nMels];
-        for (int f = 0; f < numFrames; f++)
-            for (int m = 0; m < nMels; m++)
-            {
-                float sum = 0;
-                for (int k = 0; k < numFreqs; k++) sum += ps[f * numFreqs + k] * fb[m * numFreqs + k];
-                ms[f * nMels + m] = sum;
-            }
-        UploadToBuffer(ms, melSpec);
+        GlslNaryOp(VulkanResidentKernels.MelFilterbank,
+            new[] { powerSpec, filterbank, melSpec }, checked(numFrames * nMels),
+            new[] { (uint)numFrames, (uint)numFreqs, (uint)nMels });
     }
 
     public void PowerToDb(IGpuBuffer power, IGpuBuffer db, int n, float refValue, float minDb)
-        => CpuUnary(power, db, n, v => MathF.Max(minDb, 10f * MathF.Log10(MathF.Max(1e-10f, v / refValue))));
+        => ResidentUnary(ResidentUnaryOp.PowerToDb, power, db, n, refValue, minDb);
 
     public void DbToPower(IGpuBuffer db, IGpuBuffer power, int n, float refValue)
-        => CpuUnary(db, power, n, v => refValue * MathF.Pow(10f, v / 10f));
+        => ResidentUnary(ResidentUnaryOp.DbToPower, db, power, n, refValue);
 
     #endregion
 
@@ -1386,19 +856,118 @@ public sealed unsafe partial class VulkanBackend
         IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target, int n, int d, int vocab)
         => FusedCeRowLoss(VulkanRecurrenceKernels.FusedCeDense, hidden, weight, bias, target, n, d, vocab);
 
+    public void FusedLinearCrossEntropyIndex(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer targetIds,
+        IGpuBuffer meanLoss, int n, int d, int vocab)
+        => FusedCeRowLossResident(VulkanRecurrenceKernels.FusedCeIndex, hidden, weight, bias, targetIds, meanLoss, n, d, vocab);
+
+    public void FusedLinearCrossEntropyDense(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target,
+        IGpuBuffer meanLoss, int n, int d, int vocab)
+        => FusedCeRowLossResident(VulkanRecurrenceKernels.FusedCeDense, hidden, weight, bias, target, meanLoss, n, d, vocab);
+
     // CE kernels write a per-row loss vector; the host sums the N-element vector. Returns mean CE.
     private float FusedCeRowLoss(
         string glsl, IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer tgt, int n, int d, int vocab)
+    {
+        using var meanLoss = AllocateBuffer(1);
+        FusedCeRowLossResident(glsl, hidden, weight, bias, tgt, meanLoss, n, d, vocab);
+        return DownloadBuffer(meanLoss)[0];
+    }
+
+    private void FusedCeRowLossResident(
+        string glsl, IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer tgt,
+        IGpuBuffer meanLoss, int n, int d, int vocab)
     {
         if (n <= 0 || d <= 0 || vocab <= 0)
             throw new ArgumentOutOfRangeException(nameof(n), "Fused CE dimensions (n, d, vocab) must be positive.");
         using var rowLoss = AllocateBuffer(n);
         GlslNaryOp(glsl, new[] { hidden, weight, bias, tgt, rowLoss }, n,
             new[] { (uint)n, (uint)d, (uint)vocab });
-        var rl = DownloadBuffer(rowLoss);
-        double sum = 0.0;
-        for (int i = 0; i < n; i++) sum += rl[i];
-        return (float)(sum / n);
+        SumAxis(rowLoss, meanLoss, 1, n);
+        Scale(meanLoss, meanLoss, 1f / n, 1);
+    }
+
+    private bool DispatchLstmForwardSequence(
+        IGpuBuffer input, IGpuBuffer hInit, IGpuBuffer cInit,
+        IGpuBuffer weightsIh, IGpuBuffer weightsHh, IGpuBuffer biasIh, IGpuBuffer biasHh,
+        IGpuBuffer output, IGpuBuffer hFinal, IGpuBuffer cFinal,
+        IGpuBuffer allH, IGpuBuffer allC, IGpuBuffer cacheGates,
+        int seqLen, int batch, int inputSize, int hiddenSize)
+    {
+        if (seqLen <= 0 || batch <= 0 || inputSize <= 0 || hiddenSize <= 0) return true;
+        int stateSize = checked(batch * hiddenSize);
+        Copy(hInit, 0, allH, 0, stateSize);
+        Copy(cInit, 0, allC, 0, stateSize);
+        GlslNaryOp(VulkanResidentKernels.LstmForwardSequence,
+            new[] { input, weightsIh, weightsHh, biasIh, biasHh, output, allH, allC, cacheGates }, batch,
+            new[] { (uint)seqLen, (uint)batch, (uint)inputSize, (uint)hiddenSize });
+        Copy(allH, checked(seqLen * stateSize), hFinal, 0, stateSize);
+        Copy(allC, checked(seqLen * stateSize), cFinal, 0, stateSize);
+        return true;
+    }
+
+    private bool DispatchLstmBackwardSequence(
+        IGpuBuffer gradOutput, IGpuBuffer allH, IGpuBuffer allC, IGpuBuffer cacheGates,
+        IGpuBuffer weightsIh, IGpuBuffer weightsHh, IGpuBuffer input,
+        IGpuBuffer gradInput, IGpuBuffer gradHInit, IGpuBuffer gradCInit,
+        IGpuBuffer gradWeightsIh, IGpuBuffer gradWeightsHh, IGpuBuffer gradBiasIh, IGpuBuffer gradBiasHh,
+        int seqLen, int batch, int inputSize, int hiddenSize)
+    {
+        if (seqLen <= 0 || batch <= 0 || inputSize <= 0 || hiddenSize <= 0) return true;
+        using var nextDh = AllocateBuffer(checked(batch * hiddenSize));
+        GlslNaryOp(VulkanResidentKernels.LstmBackwardSequence,
+            new[] { gradOutput, allH, allC, cacheGates, weightsIh, weightsHh, input,
+                gradInput, gradHInit, gradCInit, gradWeightsIh, gradWeightsHh, gradBiasIh, nextDh }, 1,
+            new[] { (uint)seqLen, (uint)batch, (uint)inputSize, (uint)hiddenSize });
+        Copy(gradBiasIh, gradBiasHh, checked(4 * hiddenSize));
+        return true;
+    }
+
+    private bool DispatchGruForwardSequence(
+        IGpuBuffer input, IGpuBuffer hInit,
+        IGpuBuffer weightsIh, IGpuBuffer weightsHh, IGpuBuffer biasIh, IGpuBuffer biasHh,
+        IGpuBuffer output, IGpuBuffer hFinal, IGpuBuffer allH, IGpuBuffer cacheGates,
+        int seqLen, int batch, int inputSize, int hiddenSize)
+    {
+        if (seqLen <= 0 || batch <= 0 || inputSize <= 0 || hiddenSize <= 0) return true;
+        int stateSize = checked(batch * hiddenSize);
+        Copy(hInit, 0, allH, 0, stateSize);
+        GlslNaryOp(VulkanResidentKernels.GruForwardSequence,
+            new[] { input, weightsIh, weightsHh, biasIh, biasHh, output, allH, cacheGates }, batch,
+            new[] { (uint)seqLen, (uint)batch, (uint)inputSize, (uint)hiddenSize });
+        Copy(allH, checked(seqLen * stateSize), hFinal, 0, stateSize);
+        return true;
+    }
+
+    private bool DispatchGruBackwardSequence(
+        IGpuBuffer gradOutput, IGpuBuffer allH, IGpuBuffer cacheGates,
+        IGpuBuffer weightsIh, IGpuBuffer weightsHh, IGpuBuffer input,
+        IGpuBuffer gradInput, IGpuBuffer gradHInit, IGpuBuffer dHBuffer,
+        IGpuBuffer gradWeightsIh, IGpuBuffer gradWeightsHh, IGpuBuffer gradBiasIh, IGpuBuffer gradBiasHh,
+        int seqLen, int batch, int inputSize, int hiddenSize)
+    {
+        if (seqLen <= 0 || batch <= 0 || inputSize <= 0 || hiddenSize <= 0) return true;
+        int stateSize = checked(batch * hiddenSize);
+        using var nextDh = AllocateBuffer(stateSize);
+        GlslNaryOp(VulkanResidentKernels.GruBackwardSequence,
+            new[] { gradOutput, allH, cacheGates, weightsIh, weightsHh, input,
+                gradInput, gradHInit, gradWeightsIh, gradWeightsHh, gradBiasIh, nextDh }, 1,
+            new[] { (uint)seqLen, (uint)batch, (uint)inputSize, (uint)hiddenSize });
+        Copy(gradHInit, dHBuffer, stateSize);
+        Copy(gradBiasIh, gradBiasHh, checked(3 * hiddenSize));
+        return true;
+    }
+
+    private bool DispatchGruCellBackward(
+        IGpuBuffer gradH, IGpuBuffer gateR, IGpuBuffer gateZ, IGpuBuffer gateN, IGpuBuffer prevH,
+        IGpuBuffer weightsHh, IGpuBuffer gradPrevH, IGpuBuffer gradGateR, IGpuBuffer gradGateZ,
+        IGpuBuffer gradGateN, int batch, int hiddenSize)
+    {
+        GlslNaryOp(VulkanResidentKernels.GruCellBackward,
+            new[] { gradH, gateR, gateZ, gateN, prevH, weightsHh, gradPrevH, gradGateR, gradGateZ, gradGateN },
+            checked(batch * hiddenSize), new[] { (uint)batch, (uint)hiddenSize });
+        return true;
     }
 
     public void LstmForwardSequence(
@@ -1409,54 +978,8 @@ public sealed unsafe partial class VulkanBackend
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
         EnsureInitialized();
-        var inp = DownloadBuffer(input);
-        var h = DownloadBuffer(hInit); var c = DownloadBuffer(cInit);
-        var wIh = DownloadBuffer(weightsIh); var wHh = DownloadBuffer(weightsHh);
-        var bIh = DownloadBuffer(biasIh); var bHh = DownloadBuffer(biasHh);
-        int gateSize = 4 * hiddenSize;
-        var outp = new float[seqLen * batch * hiddenSize];
-        var aH = new float[(seqLen + 1) * batch * hiddenSize];
-        var aC = new float[(seqLen + 1) * batch * hiddenSize];
-        var cg = new float[seqLen * batch * gateSize];
-        Array.Copy(h, 0, aH, 0, batch * hiddenSize);
-        Array.Copy(c, 0, aC, 0, batch * hiddenSize);
-
-        for (int t = 0; t < seqLen; t++)
-        {
-            int hOff = t * batch * hiddenSize;
-            int hNextOff = (t + 1) * batch * hiddenSize;
-            for (int b = 0; b < batch; b++)
-            {
-                var gates = new float[gateSize];
-                for (int g = 0; g < gateSize; g++)
-                {
-                    float sum = bIh[g] + bHh[g];
-                    for (int k = 0; k < inputSize; k++) sum += inp[t * batch * inputSize + b * inputSize + k] * wIh[g * inputSize + k];
-                    for (int k = 0; k < hiddenSize; k++) sum += aH[hOff + b * hiddenSize + k] * wHh[g * hiddenSize + k];
-                    gates[g] = sum;
-                }
-                Array.Copy(gates, 0, cg, t * batch * gateSize + b * gateSize, gateSize);
-                for (int i = 0; i < hiddenSize; i++)
-                {
-                    float ig = 1f / (1f + MathF.Exp(-gates[i]));
-                    float fg = 1f / (1f + MathF.Exp(-gates[hiddenSize + i]));
-                    float gg = MathF.Tanh(gates[2 * hiddenSize + i]);
-                    float og = 1f / (1f + MathF.Exp(-gates[3 * hiddenSize + i]));
-                    float ct = fg * aC[hOff + b * hiddenSize + i] + ig * gg;
-                    float ht = og * MathF.Tanh(ct);
-                    aC[hNextOff + b * hiddenSize + i] = ct;
-                    aH[hNextOff + b * hiddenSize + i] = ht;
-                    outp[t * batch * hiddenSize + b * hiddenSize + i] = ht;
-                }
-            }
-        }
-
-        UploadToBuffer(outp, output);
-        var hf = new float[batch * hiddenSize]; var cf = new float[batch * hiddenSize];
-        Array.Copy(aH, seqLen * batch * hiddenSize, hf, 0, batch * hiddenSize);
-        Array.Copy(aC, seqLen * batch * hiddenSize, cf, 0, batch * hiddenSize);
-        UploadToBuffer(hf, hFinal); UploadToBuffer(cf, cFinal);
-        UploadToBuffer(aH, allH); UploadToBuffer(aC, allC); UploadToBuffer(cg, cacheGates);
+        DispatchLstmForwardSequence(input, hInit, cInit, weightsIh, weightsHh, biasIh, biasHh,
+            output, hFinal, cFinal, allH, allC, cacheGates, seqLen, batch, inputSize, hiddenSize);
     }
 
     public void LstmBackwardSequence(
@@ -1468,103 +991,9 @@ public sealed unsafe partial class VulkanBackend
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
         EnsureInitialized();
-        var go = DownloadBuffer(gradOutput);
-        var aH = DownloadBuffer(allH);
-        var aC = DownloadBuffer(allC);
-        var cg = DownloadBuffer(cacheGates);
-        var wIh = DownloadBuffer(weightsIh);
-        var wHh = DownloadBuffer(weightsHh);
-        var inp = DownloadBuffer(input);
-        int gateSize = 4 * hiddenSize;
-
-        var gI = new float[seqLen * batch * inputSize];
-        var gWih = new float[gateSize * inputSize];
-        var gWhh = new float[gateSize * hiddenSize];
-        var gBih = new float[gateSize];
-        var gBhh = new float[gateSize];
-        var dH = new float[batch * hiddenSize];
-        var dC = new float[batch * hiddenSize];
-
-        for (int t = seqLen - 1; t >= 0; t--)
-        {
-            int hOff = t * batch * hiddenSize;
-            int hNextOff = (t + 1) * batch * hiddenSize;
-            for (int b = 0; b < batch; b++)
-            {
-                for (int i = 0; i < hiddenSize; i++)
-                    dH[b * hiddenSize + i] += go[t * batch * hiddenSize + b * hiddenSize + i];
-
-                int cgOff = t * batch * gateSize + b * gateSize;
-                for (int i = 0; i < hiddenSize; i++)
-                {
-                    float ig = 1f / (1f + MathF.Exp(-cg[cgOff + i]));
-                    float fg = 1f / (1f + MathF.Exp(-cg[cgOff + hiddenSize + i]));
-                    float gg = MathF.Tanh(cg[cgOff + 2 * hiddenSize + i]);
-                    float og = 1f / (1f + MathF.Exp(-cg[cgOff + 3 * hiddenSize + i]));
-                    float ct = aC[hNextOff + b * hiddenSize + i];
-                    float tanhCt = MathF.Tanh(ct);
-
-                    float dOg = dH[b * hiddenSize + i] * tanhCt * og * (1f - og);
-                    dC[b * hiddenSize + i] += dH[b * hiddenSize + i] * og * (1f - tanhCt * tanhCt);
-                    float dIg = dC[b * hiddenSize + i] * gg * ig * (1f - ig);
-                    float dFg = dC[b * hiddenSize + i] * aC[hOff + b * hiddenSize + i] * fg * (1f - fg);
-                    float dGg = dC[b * hiddenSize + i] * ig * (1f - gg * gg);
-
-                    float[] dGates = { dIg, dFg, dGg, dOg };
-                    for (int gi = 0; gi < 4; gi++)
-                    {
-                        int gIdx = gi * hiddenSize + i;
-                        gBih[gIdx] += dGates[gi];
-                        gBhh[gIdx] += dGates[gi];
-                        for (int k = 0; k < inputSize; k++)
-                            gWih[gIdx * inputSize + k] += dGates[gi] * inp[t * batch * inputSize + b * inputSize + k];
-                        for (int k = 0; k < hiddenSize; k++)
-                            gWhh[gIdx * hiddenSize + k] += dGates[gi] * aH[hOff + b * hiddenSize + k];
-                    }
-
-                    for (int k = 0; k < inputSize; k++)
-                        for (int gi = 0; gi < 4; gi++)
-                            gI[t * batch * inputSize + b * inputSize + k] += dGates[gi] * wIh[(gi * hiddenSize + i) * inputSize + k];
-
-                    dC[b * hiddenSize + i] *= fg;
-                }
-
-                var newDh = new float[hiddenSize];
-                for (int i = 0; i < hiddenSize; i++)
-                {
-                    float ig = 1f / (1f + MathF.Exp(-cg[cgOff + i]));
-                    float fg = 1f / (1f + MathF.Exp(-cg[cgOff + hiddenSize + i]));
-                    float gg = MathF.Tanh(cg[cgOff + 2 * hiddenSize + i]);
-                    float og = 1f / (1f + MathF.Exp(-cg[cgOff + 3 * hiddenSize + i]));
-                    float ct = aC[hNextOff + b * hiddenSize + i];
-                    float tanhCt = MathF.Tanh(ct);
-                    float localDh = dH[b * hiddenSize + i];
-                    float localDc = dC[b * hiddenSize + i];
-
-                    float dOgPre = localDh * tanhCt * og * (1f - og);
-                    float dIgPre = localDc * gg * ig * (1f - ig);
-                    float dFgPre = localDc * aC[hOff + b * hiddenSize + i] * fg * (1f - fg);
-                    float dGgPre = localDc * ig * (1f - gg * gg);
-
-                    for (int k = 0; k < hiddenSize; k++)
-                    {
-                        newDh[k] += dIgPre * wHh[i * hiddenSize + k];
-                        newDh[k] += dFgPre * wHh[(hiddenSize + i) * hiddenSize + k];
-                        newDh[k] += dGgPre * wHh[(2 * hiddenSize + i) * hiddenSize + k];
-                        newDh[k] += dOgPre * wHh[(3 * hiddenSize + i) * hiddenSize + k];
-                    }
-                }
-                Array.Copy(newDh, 0, dH, b * hiddenSize, hiddenSize);
-            }
-        }
-
-        UploadToBuffer(gI, gradInput);
-        UploadToBuffer(dH, gradHInit);
-        UploadToBuffer(dC, gradCInit);
-        UploadToBuffer(gWih, gradWeightsIh);
-        UploadToBuffer(gWhh, gradWeightsHh);
-        UploadToBuffer(gBih, gradBiasIh);
-        UploadToBuffer(gBhh, gradBiasHh);
+        DispatchLstmBackwardSequence(gradOutput, allH, allC, cacheGates, weightsIh, weightsHh, input,
+            gradInput, gradHInit, gradCInit, gradWeightsIh, gradWeightsHh, gradBiasIh, gradBiasHh,
+            seqLen, batch, inputSize, hiddenSize);
     }
 
     public void GruForwardSequence(
@@ -1574,69 +1003,8 @@ public sealed unsafe partial class VulkanBackend
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
         EnsureInitialized();
-        var inp = DownloadBuffer(input);
-        var h = DownloadBuffer(hInit);
-        var wIh = DownloadBuffer(weightsIh); var wHh = DownloadBuffer(weightsHh);
-        var bIh = DownloadBuffer(biasIh); var bHh = DownloadBuffer(biasHh);
-        int gateSize = 3 * hiddenSize;
-        var outp = new float[seqLen * batch * hiddenSize];
-        var aH = new float[(seqLen + 1) * batch * hiddenSize];
-        var cg = new float[seqLen * batch * gateSize];
-        Array.Copy(h, 0, aH, 0, batch * hiddenSize);
-
-        for (int t = 0; t < seqLen; t++)
-        {
-            int hOff = t * batch * hiddenSize;
-            int hNextOff = (t + 1) * batch * hiddenSize;
-            for (int b = 0; b < batch; b++)
-            {
-                // Step 1: Compute r (reset) and z (update) gates
-                var gates = new float[gateSize];
-                for (int g = 0; g < 2 * hiddenSize; g++)
-                {
-                    float sum = bIh[g] + bHh[g];
-                    for (int k = 0; k < inputSize; k++) sum += inp[t * batch * inputSize + b * inputSize + k] * wIh[g * inputSize + k];
-                    for (int k = 0; k < hiddenSize; k++) sum += aH[hOff + b * hiddenSize + k] * wHh[g * hiddenSize + k];
-                    gates[g] = sum;
-                }
-
-                // Apply sigmoid to r and z gates
-                for (int i = 0; i < hiddenSize; i++)
-                {
-                    gates[i] = 1f / (1f + MathF.Exp(-gates[i]));                 // r gate
-                    gates[hiddenSize + i] = 1f / (1f + MathF.Exp(-gates[hiddenSize + i])); // z gate
-                }
-
-                // Step 2: Compute candidate n using reset-gated hidden state (r * hPrev)
-                for (int i = 0; i < hiddenSize; i++)
-                {
-                    float sum = bIh[2 * hiddenSize + i] + bHh[2 * hiddenSize + i];
-                    for (int k = 0; k < inputSize; k++) sum += inp[t * batch * inputSize + b * inputSize + k] * wIh[(2 * hiddenSize + i) * inputSize + k];
-                    // Apply reset gate: use r * hPrev instead of raw hPrev
-                    for (int k = 0; k < hiddenSize; k++) sum += gates[k] * aH[hOff + b * hiddenSize + k] * wHh[(2 * hiddenSize + i) * hiddenSize + k];
-                    gates[2 * hiddenSize + i] = MathF.Tanh(sum);
-                }
-
-                // Cache all gates for backward pass
-                Array.Copy(gates, 0, cg, t * batch * gateSize + b * gateSize, gateSize);
-
-                // Step 3: Compute new hidden state: ht = (1-z)*n + z*hPrev
-                for (int i = 0; i < hiddenSize; i++)
-                {
-                    float r = gates[i];
-                    float z = gates[hiddenSize + i];
-                    float n_ = gates[2 * hiddenSize + i];
-                    float ht = (1f - z) * n_ + z * aH[hOff + b * hiddenSize + i];
-                    aH[hNextOff + b * hiddenSize + i] = ht;
-                    outp[t * batch * hiddenSize + b * hiddenSize + i] = ht;
-                }
-            }
-        }
-
-        UploadToBuffer(outp, output);
-        var hf = new float[batch * hiddenSize];
-        Array.Copy(aH, seqLen * batch * hiddenSize, hf, 0, batch * hiddenSize);
-        UploadToBuffer(hf, hFinal); UploadToBuffer(aH, allH); UploadToBuffer(cg, cacheGates);
+        DispatchGruForwardSequence(input, hInit, weightsIh, weightsHh, biasIh, biasHh,
+            output, hFinal, allH, cacheGates, seqLen, batch, inputSize, hiddenSize);
     }
 
     public void GruBackwardSequence(
@@ -1647,106 +1015,9 @@ public sealed unsafe partial class VulkanBackend
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
         EnsureInitialized();
-        var go = DownloadBuffer(gradOutput);
-        var aH = DownloadBuffer(allH);
-        var cg = DownloadBuffer(cacheGates);
-        var wIh = DownloadBuffer(weightsIh);
-        var wHh = DownloadBuffer(weightsHh);
-        var inp = DownloadBuffer(input);
-        int gateSize = 3 * hiddenSize;
-
-        var gI = new float[seqLen * batch * inputSize];
-        var gWih = new float[gateSize * inputSize];
-        var gWhh = new float[gateSize * hiddenSize];
-        var gBih = new float[gateSize];
-        var gBhh = new float[gateSize];
-        var dH = new float[batch * hiddenSize];
-
-        for (int t = seqLen - 1; t >= 0; t--)
-        {
-            int hOff = t * batch * hiddenSize;
-            for (int b = 0; b < batch; b++)
-            {
-                for (int i = 0; i < hiddenSize; i++)
-                    dH[b * hiddenSize + i] += go[t * batch * hiddenSize + b * hiddenSize + i];
-
-                int cgOff = t * batch * gateSize + b * gateSize;
-                var newDh = new float[hiddenSize];
-
-                // Cached gates are already activated (sigmoid for r/z, tanh for n)
-                // so we use them directly without re-applying activations.
-                // First pass: compute dN for each hidden unit (needed for dR computation)
-                var dNArr = new float[hiddenSize];
-                var dZArr = new float[hiddenSize];
-                for (int i = 0; i < hiddenSize; i++)
-                {
-                    float r = cg[cgOff + i];               // already sigmoid-activated
-                    float z = cg[cgOff + hiddenSize + i];   // already sigmoid-activated
-                    float n_ = cg[cgOff + 2 * hiddenSize + i]; // already tanh-activated
-                    float hPrev = aH[hOff + b * hiddenSize + i];
-                    float localDh = dH[b * hiddenSize + i];
-
-                    // ht = (1-z)*n + z*hPrev
-                    // dL/dn (pre-tanh) = dL/dht * (1-z) * (1-n^2)
-                    dNArr[i] = localDh * (1f - z) * (1f - n_ * n_);
-                    // dL/dz (pre-sigmoid) = dL/dht * (hPrev - n) * z * (1-z)
-                    dZArr[i] = localDh * (hPrev - n_) * z * (1f - z);
-                }
-
-                // Second pass: compute dR using chain rule through n's dependence on r
-                // n = tanh(W_in*x + b_in + r*(W_hn*hPrev + b_hn))
-                // dn/dr_i = sum_j(dN_j * W_hn[j,i] * hPrev_i) -- but the inner sum couples through r*hPrev
-                // For each hidden unit i: dR_i = r_i*(1-r_i) * sum_j(dN_j * hPrev_i * W_hn[j,i])
-                for (int i = 0; i < hiddenSize; i++)
-                {
-                    float r = cg[cgOff + i];
-                    float hPrev = aH[hOff + b * hiddenSize + i];
-
-                    float dRPre = 0f;
-                    for (int j = 0; j < hiddenSize; j++)
-                        dRPre += dNArr[j] * wHh[(2 * hiddenSize + j) * hiddenSize + i] * hPrev;
-                    float dR = dRPre * r * (1f - r);
-
-                    float dZ = dZArr[i];
-                    float dN = dNArr[i];
-                    float localDh = dH[b * hiddenSize + i];
-
-                    float[] dGates = { dR, dZ, dN };
-                    for (int gi = 0; gi < 3; gi++)
-                    {
-                        int gIdx = gi * hiddenSize + i;
-                        gBih[gIdx] += dGates[gi];
-                        gBhh[gIdx] += dGates[gi];
-                        for (int k = 0; k < inputSize; k++)
-                            gWih[gIdx * inputSize + k] += dGates[gi] * inp[t * batch * inputSize + b * inputSize + k];
-                        for (int k = 0; k < hiddenSize; k++)
-                            gWhh[gIdx * hiddenSize + k] += dGates[gi] * aH[hOff + b * hiddenSize + k];
-                    }
-
-                    for (int k = 0; k < inputSize; k++)
-                        for (int gi = 0; gi < 3; gi++)
-                            gI[t * batch * inputSize + b * inputSize + k] += dGates[gi] * wIh[(gi * hiddenSize + i) * inputSize + k];
-
-                    // gradient to previous hidden state
-                    newDh[i] = localDh * cg[cgOff + hiddenSize + i]; // z
-                    for (int k = 0; k < hiddenSize; k++)
-                    {
-                        newDh[k] += dR * wHh[i * hiddenSize + k];
-                        newDh[k] += dZ * wHh[(hiddenSize + i) * hiddenSize + k];
-                        newDh[k] += dN * wHh[(2 * hiddenSize + i) * hiddenSize + k];
-                    }
-                }
-                Array.Copy(newDh, 0, dH, b * hiddenSize, hiddenSize);
-            }
-        }
-
-        UploadToBuffer(gI, gradInput);
-        UploadToBuffer(dH, gradHInit);
-        UploadToBuffer(dH, dHBuffer);
-        UploadToBuffer(gWih, gradWeightsIh);
-        UploadToBuffer(gWhh, gradWeightsHh);
-        UploadToBuffer(gBih, gradBiasIh);
-        UploadToBuffer(gBhh, gradBiasHh);
+        DispatchGruBackwardSequence(gradOutput, allH, cacheGates, weightsIh, weightsHh, input,
+            gradInput, gradHInit, dHBuffer, gradWeightsIh, gradWeightsHh, gradBiasIh, gradBiasHh,
+            seqLen, batch, inputSize, hiddenSize);
     }
 
     public void GruCellBackward(
@@ -1756,59 +1027,8 @@ public sealed unsafe partial class VulkanBackend
         int batch, int hiddenSize)
     {
         EnsureInitialized();
-        var dH = DownloadBuffer(gradH);
-        var rGate = DownloadBuffer(gateR);
-        var zGate = DownloadBuffer(gateZ);
-        var nGate = DownloadBuffer(gateN);
-        var pH = DownloadBuffer(prevH);
-        var wHh = DownloadBuffer(weightsHh);
-
-        var gPH = new float[batch * hiddenSize];
-        var gR = new float[batch * hiddenSize];
-        var gZ = new float[batch * hiddenSize];
-        var gN = new float[batch * hiddenSize];
-
-        for (int b = 0; b < batch; b++)
-        {
-            int off = b * hiddenSize;
-
-            // First pass: compute dN for all hidden units (needed for dR)
-            var dNArr = new float[hiddenSize];
-            for (int i = 0; i < hiddenSize; i++)
-            {
-                float z = zGate[off + i];
-                float n_ = nGate[off + i];
-                float localDh = dH[off + i];
-
-                // ht = (1-z)*n + z*hPrev
-                dNArr[i] = localDh * (1f - z) * (1f - n_ * n_);
-            }
-
-            // Second pass: compute all gate gradients including proper dR
-            for (int i = 0; i < hiddenSize; i++)
-            {
-                float r = rGate[off + i];
-                float z = zGate[off + i];
-                float n_ = nGate[off + i];
-                float hPrev = pH[off + i];
-                float localDh = dH[off + i];
-
-                // dR_i = r_i*(1-r_i) * sum_j(dN_j * W_hn[j,i] * hPrev_i)
-                float dRPre = 0f;
-                for (int j = 0; j < hiddenSize; j++)
-                    dRPre += dNArr[j] * wHh[(2 * hiddenSize + j) * hiddenSize + i] * hPrev;
-
-                gZ[off + i] = localDh * (hPrev - n_) * z * (1f - z);
-                gN[off + i] = dNArr[i];
-                gR[off + i] = dRPre * r * (1f - r);
-                gPH[off + i] = localDh * z;
-            }
-        }
-
-        UploadToBuffer(gPH, gradPrevH);
-        UploadToBuffer(gR, gradGateR);
-        UploadToBuffer(gZ, gradGateZ);
-        UploadToBuffer(gN, gradGateN);
+        DispatchGruCellBackward(gradH, gateR, gateZ, gateN, prevH, weightsHh,
+            gradPrevH, gradGateR, gradGateZ, gradGateN, batch, hiddenSize);
     }
 
     #endregion
@@ -1892,55 +1112,19 @@ public sealed unsafe partial class VulkanBackend
     public void SplitComplexTopK(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n, int k)
     {
         if (n <= 0 || k <= 0) return;
-        // GPU mag computation + CPU threshold + GPU mask
-        var magBuf = AllocateBuffer(n);
-        try
-        {
-            SplitComplexMagnitudeSquared(inReal, inImag, magBuf, n);
-            var magData = DownloadBuffer(magBuf);
-            var rData = DownloadBuffer(inReal);
-            var iData = DownloadBuffer(inImag);
-            Array.Sort(magData); Array.Reverse(magData);
-            float threshold = k <= n ? magData[Math.Min(k, n) - 1] : 0f;
-            for (int i = 0; i < n; i++)
-            {
-                float ms = rData[i] * rData[i] + iData[i] * iData[i];
-                if (ms < threshold) { rData[i] = 0; iData[i] = 0; }
-            }
-            var rBuf = AllocateBuffer(rData); var iBuf = AllocateBuffer(iData);
-            try { Copy(rBuf, 0, outReal, 0, n); Copy(iBuf, 0, outImag, 0, n); }
-            finally { rBuf.Dispose(); iBuf.Dispose(); }
-        }
-        finally { magBuf.Dispose(); }
+        k = Math.Min(k, n);
+        GlslDispatchN(VulkanGlslKernels.SplitComplexTopK, n,
+            new[] { inReal, inImag, outReal, outImag }, new[] { (uint)n, (uint)k });
     }
 
     public void SoftmaxRows(IGpuBuffer input, IGpuBuffer output, int rows, int cols)
-    {
-        if (rows <= 0 || cols <= 0) return;
-        var data = DownloadBuffer(input);
-        var result = new float[rows * cols];
-        for (int r = 0; r < rows; r++)
-        {
-            int off = r * cols;
-            float mx = float.MinValue;
-            for (int c = 0; c < cols; c++) mx = Math.Max(mx, data[off + c]);
-            float se = 0;
-            for (int c = 0; c < cols; c++) { result[off + c] = MathF.Exp(data[off + c] - mx); se += result[off + c]; }
-            for (int c = 0; c < cols; c++) result[off + c] /= se;
-        }
-        var rb = AllocateBuffer(result);
-        try { Copy(rb, 0, output, 0, rows * cols); }
-        finally { rb.Dispose(); }
-    }
+        => Softmax(input, output, rows, cols);
 
     // ─── HRR binding primitives (issue #248) ────────────────────────
     //
     // Native GLSL compute shaders — work stays on the GPU end-to-end.
-    // Per-cell phases use a 32-bit Murmur3 fmix; deterministic within
-    // the Vulkan backend (same seed + same (V, D) → identical output)
-    // but does not bit-match the CPU xorshift64* or CUDA splitmix64
-    // sequences. This is acceptable — cross-device bit-identity on
-    // random initialization is not part of the contract.
+    // Per-cell phases use the same 32-bit Murmur3 fmix and phase
+    // construction as the CPU reference and every other GPU backend.
 
     public void SplitComplexUnitPhaseCodebook(
         IGpuBuffer outReal, IGpuBuffer outImag, int seed, int V, int D, bool kPsk, int k)

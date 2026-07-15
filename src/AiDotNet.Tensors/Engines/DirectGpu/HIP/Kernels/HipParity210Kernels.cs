@@ -825,12 +825,17 @@ extern ""C"" __global__ void parity210_istft_from_spectrum(
     const float* __restrict__ specRe, const float* __restrict__ specIm, const float* __restrict__ window,
     float* __restrict__ result, float* __restrict__ windowSum, int batch, int numFrames, int nFft, int hop, int outputLength, int center)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x; int total = batch*numFrames*nFft; if (idx >= total) return;
-    int i = idx % nFft; int tmp = idx / nFft; int frame = tmp % numFrames; int b = tmp / numFrames; int specOff = (b*numFrames + frame) * nFft;
-    float acc = 0.0f;
-    for (int k = 0; k < nFft; k++) { float a = 2.0f*(float)M_PI*(float)k*(float)i/(float)nFft; acc += specRe[specOff+k]*cosf(a) - specIm[specOff+k]*sinf(a); }
-    int writeStart = center ? max(0, frame*hop - nFft/2) : frame*hop; int outIdx = writeStart + i;
-    if (outIdx >= 0 && outIdx < outputLength) { float w = window[i]; atomicAdd(&result[b*outputLength + outIdx], acc*(1.0f/(float)nFft)*w); atomicAdd(&windowSum[b*outputLength + outIdx], w*w); }
+    int idx = blockIdx.x * blockDim.x + threadIdx.x; int total = batch*outputLength; if (idx >= total) return;
+    int outIdx = idx % outputLength; int b = idx / outputLength; float resultAcc = 0.0f; float windowAcc = 0.0f;
+    for (int frame = 0; frame < numFrames; frame++) {
+        int writeStart = center ? max(0, frame*hop - nFft/2) : frame*hop; int i = outIdx - writeStart;
+        if (i >= 0 && i < nFft) {
+            int specOff = (b*numFrames + frame) * nFft; float acc = 0.0f;
+            for (int k = 0; k < nFft; k++) { float a = 2.0f*(float)M_PI*(float)k*(float)i/(float)nFft; acc += specRe[specOff+k]*cosf(a) - specIm[specOff+k]*sinf(a); }
+            float w = window[i]; resultAcc += acc*(1.0f/(float)nFft)*w; windowAcc += w*w;
+        }
+    }
+    result[idx] = resultAcc; windowSum[idx] = windowAcc;
 }
 extern ""C"" __global__ void parity210_istft_normalize(float* __restrict__ result, const float* __restrict__ windowSum, int total)
 {
@@ -879,7 +884,7 @@ extern ""C"" __global__ void parity210_pairwise_iou(const float* __restrict__ bo
 extern ""C"" __global__ void parity210_histogramdd(const float* __restrict__ samples, float* __restrict__ hist, const int* __restrict__ bins, const float* __restrict__ mins, const float* __restrict__ maxs, int n, int d)
 {
     int i = blockIdx.x*blockDim.x+threadIdx.x; if (i >= n) return; int linIdx = 0; int valid = 1;
-    for (int k = 0; k < d; k++) { float v = samples[i*d + k]; float mn = mins[k]; float mx = maxs[k]; if (!(v >= mn && v <= mx)) { valid = 0; break; } float width = (mx - mn) / (float)bins[k]; int kIdx = (int)floorf((v - mn) / width); if (kIdx >= bins[k]) kIdx = bins[k] - 1; if (kIdx < 0) kIdx = 0; linIdx = linIdx * bins[k] + kIdx; }
+    for (int k = 0; k < d; k++) { float v = samples[i*d + k]; float mn = mins[k]; float mx = maxs[k]; if (!(v >= mn && v <= mx)) { valid = 0; break; } int kIdx; if (v == mx) { kIdx = bins[k] - 1; } else { float width = (mx - mn) / (float)bins[k]; kIdx = (int)floorf((v - mn) / width); if (kIdx >= bins[k]) kIdx = bins[k] - 1; if (kIdx < 0) kIdx = 0; } linIdx = linIdx * bins[k] + kIdx; }
     if (valid) atomicAdd(&hist[linIdx], 1.0f);
 }
 extern ""C"" __global__ void parity210_gridsample_backward_input(const float* __restrict__ gradOut, const float* __restrict__ grid, float* __restrict__ gradIn, int batch, int H, int W, int C, int outH, int outW)
@@ -994,10 +999,11 @@ extern ""C"" __global__ void parity210_next_after(const float* __restrict__ a, c
     output[idx]=__uint_as_float(r);
 }
 extern ""C"" __global__ void parity210_index_write(float* __restrict__ output, const int* __restrict__ indices, const float* __restrict__ source, float fillValue, int mode, int outerSize, int idxAxis, int innerSize, int dstAxis) {
-    int idx = blockIdx.x*blockDim.x+threadIdx.x; int total=outerSize*idxAxis*innerSize; if (idx>=total) return;
-    int inner=idx%innerSize; int j=(idx/innerSize)%idxAxis; int outer=(idx/innerSize)/idxAxis; int dstJ=indices[j];
-    if (dstJ<0||dstJ>=dstAxis) return; float v=(mode==0)?source[idx]:fillValue;
-    output[(outer*dstAxis+dstJ)*innerSize+inner]=v;
+    int idx = blockIdx.x*blockDim.x+threadIdx.x; int total=outerSize*dstAxis*innerSize; if (idx>=total) return;
+    int inner=idx%innerSize; int dstJ=(idx/innerSize)%dstAxis; int outer=(idx/innerSize)/dstAxis; int last=-1;
+    for (int j=0;j<idxAxis;j++) if (indices[j]==dstJ) last=j;
+    if (last<0) return;
+    output[idx]=(mode==0)?source[(outer*idxAxis+last)*innerSize+inner]:fillValue;
 }
 extern ""C"" __global__ void parity210_cdist(const float* __restrict__ x1, const float* __restrict__ x2, float* __restrict__ output, int m, int n, int d, float p) {
     int idx = blockIdx.x*blockDim.x+threadIdx.x; if (idx>=m*n) return; int j=idx%n; int i=idx/n; float sum=0.0f;

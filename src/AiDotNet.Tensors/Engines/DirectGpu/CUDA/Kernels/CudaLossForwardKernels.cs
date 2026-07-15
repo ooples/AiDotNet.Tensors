@@ -95,6 +95,19 @@ extern ""C"" __global__ __launch_bounds__(256) void dropout_mask(
     mask[idx] = (u < keepProb) ? invKeep : 0.0f;
 }
 
+// Shared CPU/GPU seeded dropout contract. All arithmetic before the final write is
+// unsigned integer arithmetic, so compiler fast-math settings cannot change a decision.
+extern ""C"" __global__ __launch_bounds__(256) void stateless_dropout_mask(
+    float* __restrict__ mask, int size, unsigned int threshold, float scale, unsigned int seed)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    unsigned int state = (unsigned int)idx * 747796405u + seed + 2891336453u;
+    unsigned int word = ((state >> ((state >> 28) + 4u)) ^ state) * 277803737u;
+    unsigned int sample = (word >> 22) ^ word;
+    mask[idx] = sample < threshold ? 0.0f : scale;
+}
+
 // ============================================================================
 // Gaussian noise generation
 // ============================================================================
@@ -350,6 +363,7 @@ extern ""C"" __global__ __launch_bounds__(256) void bce_with_logits_backward(
             "mse_loss",
             "bce_loss",
             "dropout_mask",
+            "stateless_dropout_mask",
             "gaussian_noise",
             // New loss kernels
             "l1_loss",

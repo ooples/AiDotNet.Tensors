@@ -309,6 +309,36 @@ extern ""C"" __global__ __launch_bounds__(256) void sign_vector(const float* A, 
     B[idx] = x > 0.0f ? 1.0f : (x < 0.0f ? -1.0f : 0.0f);
 }
 
+extern ""C"" __global__ __launch_bounds__(256) void squared_deviation_from_mean(
+    const float* input, const float* mean, float* output, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float difference = input[idx] - mean[0];
+    output[idx] = difference * difference;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void clip_by_norm_from_squared_sum(
+    const float* input, const float* squaredSum, float* output, float maximumNorm, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float norm = sqrtf(fmaxf(squaredSum[0], 0.0f));
+    float scale = norm > maximumNorm ? maximumNorm / norm : 1.0f;
+    output[idx] = input[idx] * scale;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void scatter_add_accumulate_deterministic(
+    const float* source, const int* indices, float* destination, int sourceSize, int destinationSize)
+{
+    int destinationIndex = blockIdx.x * blockDim.x + threadIdx.x;
+    if (destinationIndex >= destinationSize) return;
+    float value = destination[destinationIndex];
+    for (int sourceIndex = 0; sourceIndex < sourceSize; ++sourceIndex)
+        if (indices[sourceIndex] == destinationIndex) value += source[sourceIndex];
+    destination[destinationIndex] = value;
+}
+
 extern ""C"" __global__ __launch_bounds__(256) void power_scalar(const float* A, float* B, float exponent, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1200,6 +1230,7 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
             "leaky_relu", "leaky_relu_backward", "elu", "elu_backward", "swish_backward",
             "add_vectors", "subtract_vectors", "multiply_vectors", "divide_vectors",
             "min_vectors", "max_vectors", "scale_vector", "scale_by_device_scalar", "power_scalar",
+            "squared_deviation_from_mean", "clip_by_norm_from_squared_sum", "scatter_add_accumulate_deterministic",
             "abs_vector", "exp_vector", "log_vector", "log2_vector", "exp2_vector",
             "exp10_vector", "expm1_vector", "log1p_vector", "sqrt_vector", "sign_vector",
             "sin_vector", "cos_vector", "tan_vector", "asin_vector", "acos_vector", "atan_vector",

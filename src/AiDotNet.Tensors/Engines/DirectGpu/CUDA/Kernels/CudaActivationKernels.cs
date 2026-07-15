@@ -861,6 +861,15 @@ extern ""C"" __global__ __launch_bounds__(256) void sign_vector(const float* __r
     B[idx] = x > 0.0f ? 1.0f : (x < 0.0f ? -1.0f : 0.0f);
 }
 
+extern ""C"" __global__ __launch_bounds__(256) void squared_deviation_from_mean(
+    const float* __restrict__ input, const float* __restrict__ mean, float* __restrict__ output, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float difference = input[idx] - mean[0];
+    output[idx] = difference * difference;
+}
+
 extern ""C"" __global__ __launch_bounds__(256) void power_scalar(const float* __restrict__ A, float* __restrict__ B, float exponent, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1481,6 +1490,7 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
                 "reduce_sum",
                 "reduce_max",
                 "reduce_min",
+                "squared_deviation_from_mean",
                 "sum_axis",
                 "bias_add",
                 "bias_add_out",

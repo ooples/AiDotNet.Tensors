@@ -508,6 +508,55 @@ extern ""C"" __global__ __launch_bounds__(256) void sddmm(
 
     output[p] = sum;
 }
+
+extern ""C"" __global__ __launch_bounds__(256) void enforce_2x4_sparsity(
+    const float* __restrict__ denseInput, float* __restrict__ sparseValues,
+    unsigned char* __restrict__ sparseIndices, int M, int K)
+{
+    int groupIndex = blockIdx.x * blockDim.x + threadIdx.x;
+    int groupsPerRow = K / 4;
+    if (groupIndex >= M * groupsPerRow) return;
+    int row = groupIndex / groupsPerRow, group = groupIndex % groupsPerRow, baseColumn = group * 4;
+    float values[4], magnitudes[4]; int indices[4] = { 0, 1, 2, 3 };
+    for (int i = 0; i < 4; ++i) { values[i] = denseInput[row * K + baseColumn + i]; magnitudes[i] = fabsf(values[i]); }
+    for (int i = 0; i < 2; ++i) for (int j = i + 1; j < 4; ++j) if (magnitudes[indices[j]] > magnitudes[indices[i]]) { int temporary = indices[i]; indices[i] = indices[j]; indices[j] = temporary; }
+    int first = indices[0], second = indices[1]; if (first > second) { int temporary = first; first = second; second = temporary; }
+    sparseValues[groupIndex * 2] = values[first]; sparseValues[groupIndex * 2 + 1] = values[second];
+    sparseIndices[groupIndex] = (unsigned char)((second << 2) | first);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void decompress_2x4_sparse(
+    const float* __restrict__ sparseValues, const unsigned char* __restrict__ sparseIndices,
+    float* __restrict__ denseOutput, int M, int K)
+{
+    int groupIndex = blockIdx.x * blockDim.x + threadIdx.x;
+    int groupsPerRow = K / 4;
+    if (groupIndex >= M * groupsPerRow) return;
+    int row = groupIndex / groupsPerRow, group = groupIndex % groupsPerRow, base = row * K + group * 4;
+    denseOutput[base] = 0.0f; denseOutput[base + 1] = 0.0f; denseOutput[base + 2] = 0.0f; denseOutput[base + 3] = 0.0f;
+    unsigned char packed = sparseIndices[groupIndex]; int first = packed & 3, second = (packed >> 2) & 3;
+    denseOutput[base + first] = sparseValues[groupIndex * 2]; denseOutput[base + second] = sparseValues[groupIndex * 2 + 1];
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void sparse_gemm_2x4(
+    const float* __restrict__ sparseValues, const unsigned char* __restrict__ sparseIndices,
+    const float* __restrict__ B, float* __restrict__ C, int M, int N, int K, float alpha, float beta)
+{
+    int row = blockIdx.y * blockDim.y + threadIdx.y, column = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M || column >= N) return; float sum = 0.0f; int groupsPerRow = K / 4;
+    for (int group = 0; group < groupsPerRow; ++group) { int compressed = row * groupsPerRow + group; unsigned char packed = sparseIndices[compressed]; int first = packed & 3, second = (packed >> 2) & 3; sum += sparseValues[compressed * 2] * B[(group * 4 + first) * N + column]; sum += sparseValues[compressed * 2 + 1] * B[(group * 4 + second) * N + column]; }
+    int outputIndex = row * N + column; C[outputIndex] = alpha * sum + beta * C[outputIndex];
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void sparse_gemm_bias_relu(
+    const float* __restrict__ sparseValues, const unsigned char* __restrict__ sparseIndices,
+    const float* __restrict__ B, const float* __restrict__ bias, float* __restrict__ C, int M, int N, int K)
+{
+    int row = blockIdx.y * blockDim.y + threadIdx.y, column = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M || column >= N) return; float sum = 0.0f; int groupsPerRow = K / 4;
+    for (int group = 0; group < groupsPerRow; ++group) { int compressed = row * groupsPerRow + group; unsigned char packed = sparseIndices[compressed]; int first = packed & 3, second = (packed >> 2) & 3; sum += sparseValues[compressed * 2] * B[(group * 4 + first) * N + column]; sum += sparseValues[compressed * 2 + 1] * B[(group * 4 + second) * N + column]; }
+    C[row * N + column] = fmaxf(sum + bias[column], 0.0f);
+}
 ";
     }
 
@@ -536,7 +585,11 @@ extern ""C"" __global__ __launch_bounds__(256) void sddmm(
             "zero_buffer",
             "init_neg_inf",
             "degree_normalize",
-            "symmetric_degree_normalize"
+            "symmetric_degree_normalize",
+            "enforce_2x4_sparsity",
+            "decompress_2x4_sparse",
+            "sparse_gemm_2x4",
+            "sparse_gemm_bias_relu"
         ];
     }
 }
