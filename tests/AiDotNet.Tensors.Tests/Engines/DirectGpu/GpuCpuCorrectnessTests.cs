@@ -112,6 +112,30 @@ public sealed class GpuCpuCorrectnessTests : IDisposable
         Assert.True(err < Tol, $"{op}: GPU vs CPU max_abs_err {err:E3} exceeded tolerance {Tol:E3}");
     }
 
+    // Dedicated coverage for TensorWhere(Tensor<Bit>, x, y): the boolean-mask overload can't be driven by
+    // the generic float-fuzzer (EveryGpuKernel_IsAutoTestedOrAllowlisted), so it's exercised here and listed
+    // in that test's DedicatedlyCovered allowlist. Verifies the GPU where-select picks x where the mask is
+    // true and y where false, matching CpuEngine bit-for-bit.
+    [Theory]
+    [InlineData(1)]
+    [InlineData(7)]
+    [InlineData(64)]
+    [InlineData(129)]
+    public void TensorWhere_BitMask_GpuMatchesCpu(int n)
+    {
+        if (!EnsureGpuReady()) return;
+        var rng = new Random(20 + n);
+        var cond = new Bit[n];
+        for (int i = 0; i < n; i++) cond[i] = rng.Next(2) == 0 ? Bit.False : Bit.True;
+        var condition = new Tensor<Bit>(cond, new[] { n });
+        var x = Rand(21, n);
+        var y = Rand(22, n);
+
+        var cpu = _cpu.TensorWhere(condition, x, y);
+        var gpu = _gpu.TensorWhere(condition, x, y);
+        AssertGpuMatchesCpu(gpu, cpu, $"TensorWhere(Bit)[{n}]");
+    }
+
     // Regression: LayerNorm must normalize over the trailing (gamma-length) dims for EVERY rank,
     // not just rank-2. The GPU path previously took outerSize = shape[0] / normSize = Length/shape[0],
     // which for a transformer's rank-3 [B, S, D] input normalized over S*D and read gamma/beta

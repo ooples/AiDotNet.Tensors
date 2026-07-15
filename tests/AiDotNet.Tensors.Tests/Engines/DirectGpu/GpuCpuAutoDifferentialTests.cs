@@ -530,6 +530,9 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
         "TensorArgsort(Tensor<T>,Int32,Boolean)",
         "TensorBucketize(Tensor<T>,Tensor<T>,Boolean)",
         "TensorCross(Tensor<T>,Tensor<T>,Int32)",
+        // Bit-mask condition can't be driven by the generic float-fuzzer — covered by
+        // GpuCpuCorrectnessTests.TensorWhere_BitMask_GpuMatchesCpu.
+        "TensorWhere(Tensor<Bit>,Tensor<T>,Tensor<T>)",
         "TensorEq(Tensor<T>,Tensor<T>)",
         "TensorEqScalar(Tensor<T>,T)",
         "TensorHistogram(Tensor<T>,Int32,T,T)",
