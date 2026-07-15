@@ -65,4 +65,112 @@ struct Params{D:i32,H:i32,W:i32,C:i32,P:i32,upperEps:f32,pad0:i32,pad1:i32};
     }
     gradGrid[idx]=sum;
 }";
+
+    private const string ConvT3DStruct =
+        "struct P3{N:i32,inC:i32,iD:i32,iH:i32,iW:i32,outC:i32,outD:i32,outH:i32,outW:i32,kD:i32,kH:i32,kW:i32,strideD:i32,strideH:i32,strideW:i32,padD:i32,padH:i32,padW:i32,pad0:i32,pad1:i32};";
+
+    public static readonly string ConvTranspose3D = @"
+@group(0) @binding(0) var<storage,read> input_:array<f32>;
+@group(0) @binding(1) var<storage,read> weights:array<f32>;
+@group(0) @binding(2) var<storage,read_write> output_:array<f32>;
+" + ConvT3DStruct + @"
+@group(0) @binding(3) var<uniform> pm:P3;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid_:vec3<u32>){
+    let idx=i32(gid_.x);
+    if(idx>=pm.N*pm.outC*pm.outD*pm.outH*pm.outW){return;}
+    let ow=idx%pm.outW;
+    let oh=(idx/pm.outW)%pm.outH;
+    let od=(idx/(pm.outW*pm.outH))%pm.outD;
+    let oc=(idx/(pm.outW*pm.outH*pm.outD))%pm.outC;
+    let n=idx/(pm.outW*pm.outH*pm.outD*pm.outC);
+    var sum=0.0;
+    for(var kd=0;kd<pm.kD;kd=kd+1){
+        let td=od+pm.padD-kd;
+        if(td<0||(td%pm.strideD)!=0){continue;}
+        let id=td/pm.strideD;
+        if(id<0||id>=pm.iD){continue;}
+        for(var kh=0;kh<pm.kH;kh=kh+1){
+            let th=oh+pm.padH-kh;
+            if(th<0||(th%pm.strideH)!=0){continue;}
+            let ih=th/pm.strideH;
+            if(ih<0||ih>=pm.iH){continue;}
+            for(var kw=0;kw<pm.kW;kw=kw+1){
+                let tw=ow+pm.padW-kw;
+                if(tw<0||(tw%pm.strideW)!=0){continue;}
+                let iw=tw/pm.strideW;
+                if(iw<0||iw>=pm.iW){continue;}
+                for(var ic=0;ic<pm.inC;ic=ic+1){
+                    sum=sum+input_[(((n*pm.inC+ic)*pm.iD+id)*pm.iH+ih)*pm.iW+iw]*weights[((((ic*pm.outC+oc)*pm.kD+kd)*pm.kH+kh)*pm.kW+kw)];
+                }
+            }
+        }
+    }
+    output_[idx]=sum;
+}";
+
+    public static readonly string ConvTranspose3DBackwardInput = @"
+@group(0) @binding(0) var<storage,read> gradOutput:array<f32>;
+@group(0) @binding(1) var<storage,read> weights:array<f32>;
+@group(0) @binding(2) var<storage,read_write> gradInput:array<f32>;
+" + ConvT3DStruct + @"
+@group(0) @binding(3) var<uniform> pm:P3;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid_:vec3<u32>){
+    let idx=i32(gid_.x);
+    if(idx>=pm.N*pm.inC*pm.iD*pm.iH*pm.iW){return;}
+    let iw=idx%pm.iW;
+    let ih=(idx/pm.iW)%pm.iH;
+    let id=(idx/(pm.iW*pm.iH))%pm.iD;
+    let ic=(idx/(pm.iW*pm.iH*pm.iD))%pm.inC;
+    let n=idx/(pm.iW*pm.iH*pm.iD*pm.inC);
+    var sum=0.0;
+    for(var kd=0;kd<pm.kD;kd=kd+1){
+        let od=id*pm.strideD-pm.padD+kd;
+        if(od<0||od>=pm.outD){continue;}
+        for(var kh=0;kh<pm.kH;kh=kh+1){
+            let oh=ih*pm.strideH-pm.padH+kh;
+            if(oh<0||oh>=pm.outH){continue;}
+            for(var kw=0;kw<pm.kW;kw=kw+1){
+                let ow=iw*pm.strideW-pm.padW+kw;
+                if(ow<0||ow>=pm.outW){continue;}
+                for(var oc=0;oc<pm.outC;oc=oc+1){
+                    sum=sum+gradOutput[(((n*pm.outC+oc)*pm.outD+od)*pm.outH+oh)*pm.outW+ow]*weights[((((ic*pm.outC+oc)*pm.kD+kd)*pm.kH+kh)*pm.kW+kw)];
+                }
+            }
+        }
+    }
+    gradInput[idx]=sum;
+}";
+
+    public static readonly string ConvTranspose3DBackwardWeights = @"
+@group(0) @binding(0) var<storage,read> gradOutput:array<f32>;
+@group(0) @binding(1) var<storage,read> input_:array<f32>;
+@group(0) @binding(2) var<storage,read_write> gradWeights:array<f32>;
+" + ConvT3DStruct + @"
+@group(0) @binding(3) var<uniform> pm:P3;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid_:vec3<u32>){
+    let idx=i32(gid_.x);
+    if(idx>=pm.inC*pm.outC*pm.kD*pm.kH*pm.kW){return;}
+    let kw=idx%pm.kW;
+    let kh=(idx/pm.kW)%pm.kH;
+    let kd=(idx/(pm.kW*pm.kH))%pm.kD;
+    let oc=(idx/(pm.kW*pm.kH*pm.kD))%pm.outC;
+    let ic=idx/(pm.kW*pm.kH*pm.kD*pm.outC);
+    var sum=0.0;
+    for(var n=0;n<pm.N;n=n+1){
+        for(var id=0;id<pm.iD;id=id+1){
+            let od=id*pm.strideD-pm.padD+kd;
+            if(od<0||od>=pm.outD){continue;}
+            for(var ih=0;ih<pm.iH;ih=ih+1){
+                let oh=ih*pm.strideH-pm.padH+kh;
+                if(oh<0||oh>=pm.outH){continue;}
+                for(var iw=0;iw<pm.iW;iw=iw+1){
+                    let ow=iw*pm.strideW-pm.padW+kw;
+                    if(ow<0||ow>=pm.outW){continue;}
+                    sum=sum+input_[(((n*pm.inC+ic)*pm.iD+id)*pm.iH+ih)*pm.iW+iw]*gradOutput[(((n*pm.outC+oc)*pm.outD+od)*pm.outH+oh)*pm.outW+ow];
+                }
+            }
+        }
+    }
+    gradWeights[idx]=sum;
+}";
 }

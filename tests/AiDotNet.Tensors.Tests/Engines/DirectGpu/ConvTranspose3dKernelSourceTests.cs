@@ -18,32 +18,36 @@ public sealed class ConvTranspose3dKernelSourceTests
     private const string OpenClConv = "AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.ConvolutionKernels";
     private const string MetalExt = "AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalExtendedConvKernels";
     private const string VulkanExt = "AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanExtendedConvKernels";
+    private const string WebGpuExt = "AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuExtendedConvKernels";
 
-    // The weight index expression is byte-identical in every backend (pure index — C/MSL/GLSL agree).
+    // The weight index expression is byte-identical in C/MSL/GLSL (pure index); WGSL prefixes params with
+    // pm. and drops spaces, so the WebGPU row carries the WGSL-form marker.
     [Theory]
-    [InlineData(CudaConv, "GetSource")]
-    [InlineData(HipConv, "GetSource")]
-    [InlineData(OpenClConv, "GetSource")]
-    [InlineData(MetalExt, "Source")]
-    [InlineData(VulkanExt, "ConvTranspose3D")]
-    public void WeightIndexExpression_MatchesAcrossBackends(string typeName, string memberName)
+    [InlineData(CudaConv, "GetSource", "weights[((((ic * outC + oc) * kD + kd) * kH + kh) * kW + kw)]")]
+    [InlineData(HipConv, "GetSource", "weights[((((ic * outC + oc) * kD + kd) * kH + kh) * kW + kw)]")]
+    [InlineData(OpenClConv, "GetSource", "weights[((((ic * outC + oc) * kD + kd) * kH + kh) * kW + kw)]")]
+    [InlineData(MetalExt, "Source", "weights[((((ic * outC + oc) * kD + kd) * kH + kh) * kW + kw)]")]
+    [InlineData(VulkanExt, "ConvTranspose3D", "weights[((((ic * outC + oc) * kD + kd) * kH + kh) * kW + kw)]")]
+    [InlineData(WebGpuExt, "ConvTranspose3D", "weights[((((ic*pm.outC+oc)*pm.kD+kd)*pm.kH+kh)*pm.kW+kw)]")]
+    public void WeightIndexExpression_MatchesAcrossBackends(string typeName, string memberName, string marker)
     {
         string source = GetStaticString(typeName, memberName);
-        Assert.Contains("weights[((((ic * outC + oc) * kD + kd) * kH + kh) * kW + kw)]", source, StringComparison.Ordinal);
+        Assert.Contains(marker, source, StringComparison.Ordinal);
     }
 
-    // The forward transpose-stride test (od + pad - kd, divisible by stride) is identical across backends.
+    // The forward transpose-stride test (od + pad - kd, divisible by stride); WGSL row carries WGSL form.
     [Theory]
-    [InlineData(CudaConv, "GetSource")]
-    [InlineData(HipConv, "GetSource")]
-    [InlineData(OpenClConv, "GetSource")]
-    [InlineData(MetalExt, "Source")]
-    [InlineData(VulkanExt, "ConvTranspose3D")]
-    public void ForwardTransposeStrideTest_MatchesAcrossBackends(string typeName, string memberName)
+    [InlineData(CudaConv, "GetSource", "int td = od + padD - kd;", "if (td < 0 || (td % strideD) != 0) continue;")]
+    [InlineData(HipConv, "GetSource", "int td = od + padD - kd;", "if (td < 0 || (td % strideD) != 0) continue;")]
+    [InlineData(OpenClConv, "GetSource", "int td = od + padD - kd;", "if (td < 0 || (td % strideD) != 0) continue;")]
+    [InlineData(MetalExt, "Source", "int td = od + padD - kd;", "if (td < 0 || (td % strideD) != 0) continue;")]
+    [InlineData(VulkanExt, "ConvTranspose3D", "int td = od + padD - kd;", "if (td < 0 || (td % strideD) != 0) continue;")]
+    [InlineData(WebGpuExt, "ConvTranspose3D", "let td=od+pm.padD-kd;", "if(td<0||(td%pm.strideD)!=0){continue;}")]
+    public void ForwardTransposeStrideTest_MatchesAcrossBackends(string typeName, string memberName, string m1, string m2)
     {
         string source = GetStaticString(typeName, memberName);
-        Assert.Contains("int td = od + padD - kd;", source, StringComparison.Ordinal);
-        Assert.Contains("if (td < 0 || (td % strideD) != 0) continue;", source, StringComparison.Ordinal);
+        Assert.Contains(m1, source, StringComparison.Ordinal);
+        Assert.Contains(m2, source, StringComparison.Ordinal);
     }
 
     [Theory]
