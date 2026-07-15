@@ -6,7 +6,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 // added incrementally (interface + kernels) so a partially-ported backend still opts into exactly the
 // families it can run; the engine routes the rest to the CPU. Kernels live in the existing compiled
 // modules (trilinear in the convolution module); this partial only wires the launch.
-public sealed partial class CudaBackend : ITrilinearInterpolationKernels
+public sealed partial class CudaBackend : ITrilinearInterpolationKernels, IConvTranspose3DKernels
 {
     public unsafe void TrilinearInterpolate(IGpuBuffer grid, IGpuBuffer positions, IGpuBuffer output,
         int d, int h, int w, int c, int p, float upperEps)
@@ -41,6 +41,50 @@ public sealed partial class CudaBackend : ITrilinearInterpolationKernels
         void** args = stackalloc void*[9];
         args[0] = &go; args[1] = &pos; args[2] = &gg; args[3] = &dd; args[4] = &hh;
         args[5] = &ww; args[6] = &cc; args[7] = &pp; args[8] = &eps;
+        LaunchKernel(kernel, gridDim, DefaultBlockSize, args);
+    }
+
+    public void ConvTranspose3D(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer output,
+        int n, int inC, int iD, int iH, int iW, int outC, int outD, int outH, int outW,
+        int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW) =>
+        LaunchConvTranspose3D("conv_transpose3d", checked(n * outC * outD * outH * outW),
+            input, weights, output, n, inC, iD, iH, iW, outC, outD, outH, outW,
+            kD, kH, kW, strideD, strideH, strideW, padD, padH, padW);
+
+    public void ConvTranspose3DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer weights, IGpuBuffer gradInput,
+        int n, int inC, int iD, int iH, int iW, int outC, int outD, int outH, int outW,
+        int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW) =>
+        LaunchConvTranspose3D("conv_transpose3d_backward_input", checked(n * inC * iD * iH * iW),
+            gradOutput, weights, gradInput, n, inC, iD, iH, iW, outC, outD, outH, outW,
+            kD, kH, kW, strideD, strideH, strideW, padD, padH, padW);
+
+    public void ConvTranspose3DBackwardKernel(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradWeights,
+        int n, int inC, int iD, int iH, int iW, int outC, int outD, int outH, int outW,
+        int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW) =>
+        LaunchConvTranspose3D("conv_transpose3d_backward_weights", checked(inC * outC * kD * kH * kW),
+            gradOutput, input, gradWeights, n, inC, iD, iH, iW, outC, outD, outH, outW,
+            kD, kH, kW, strideD, strideH, strideW, padD, padH, padW);
+
+    private unsafe void LaunchConvTranspose3D(string kernelName, int total,
+        IGpuBuffer a, IGpuBuffer b, IGpuBuffer c,
+        int n, int inC, int iD, int iH, int iW, int outC, int outD, int outH, int outW,
+        int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW)
+    {
+        if (total <= 0) return;
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+        using var _ = PushContext();
+        uint gridDim = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pa = a.Handle, pb = b.Handle, pc = c.Handle;
+        int vN = n, vInC = inC, vID = iD, vIH = iH, vIW = iW, vOutC = outC, vOutD = outD, vOutH = outH, vOutW = outW;
+        int vKD = kD, vKH = kH, vKW = kW, vSD = strideD, vSH = strideH, vSW = strideW, vPD = padD, vPH = padH, vPW = padW;
+        void** args = stackalloc void*[21];
+        args[0] = &pa; args[1] = &pb; args[2] = &pc;
+        args[3] = &vN; args[4] = &vInC; args[5] = &vID; args[6] = &vIH; args[7] = &vIW;
+        args[8] = &vOutC; args[9] = &vOutD; args[10] = &vOutH; args[11] = &vOutW;
+        args[12] = &vKD; args[13] = &vKH; args[14] = &vKW;
+        args[15] = &vSD; args[16] = &vSH; args[17] = &vSW;
+        args[18] = &vPD; args[19] = &vPH; args[20] = &vPW;
         LaunchKernel(kernel, gridDim, DefaultBlockSize, args);
     }
 }

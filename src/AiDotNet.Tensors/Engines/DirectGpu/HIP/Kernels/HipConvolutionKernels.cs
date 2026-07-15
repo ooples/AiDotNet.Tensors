@@ -614,6 +614,127 @@ extern ""C"" __global__ __launch_bounds__(256) void trilinear_interpolate_backwa
     }
     gradGrid[idx] = sum;
 }
+
+// #775: ConvTranspose3D forward (NCDHW), weights [inC,outC,kD,kH,kW]. GATHER over output elements.
+// HIP mirror of the OpenCL conv_transpose3d kernel.
+extern ""C"" __global__ __launch_bounds__(256) void conv_transpose3d(
+    const float* __restrict__ input,
+    const float* __restrict__ weights,
+    float* __restrict__ output,
+    int N, int inC, int iD, int iH, int iW,
+    int outC, int outD, int outH, int outW,
+    int kD, int kH, int kW,
+    int strideD, int strideH, int strideW,
+    int padD, int padH, int padW)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * outC * outD * outH * outW) return;
+    int ow = idx % outW;
+    int oh = (idx / outW) % outH;
+    int od = (idx / (outW * outH)) % outD;
+    int oc = (idx / (outW * outH * outD)) % outC;
+    int n = idx / (outW * outH * outD * outC);
+    float sum = 0.0f;
+    for (int kd = 0; kd < kD; kd++) {
+        int td = od + padD - kd;
+        if (td < 0 || (td % strideD) != 0) continue;
+        int id = td / strideD;
+        if (id < 0 || id >= iD) continue;
+        for (int kh = 0; kh < kH; kh++) {
+            int th = oh + padH - kh;
+            if (th < 0 || (th % strideH) != 0) continue;
+            int ih = th / strideH;
+            if (ih < 0 || ih >= iH) continue;
+            for (int kw = 0; kw < kW; kw++) {
+                int tw = ow + padW - kw;
+                if (tw < 0 || (tw % strideW) != 0) continue;
+                int iw = tw / strideW;
+                if (iw < 0 || iw >= iW) continue;
+                for (int ic = 0; ic < inC; ic++) {
+                    sum += input[(((n * inC + ic) * iD + id) * iH + ih) * iW + iw]
+                         * weights[((((ic * outC + oc) * kD + kd) * kH + kh) * kW + kw)];
+                }
+            }
+        }
+    }
+    output[idx] = sum;
+}
+
+// #775: ConvTranspose3D backward w.r.t. input. GATHER over gradInput. HIP mirror of OpenCL.
+extern ""C"" __global__ __launch_bounds__(256) void conv_transpose3d_backward_input(
+    const float* __restrict__ gradOutput,
+    const float* __restrict__ weights,
+    float* __restrict__ gradInput,
+    int N, int inC, int iD, int iH, int iW,
+    int outC, int outD, int outH, int outW,
+    int kD, int kH, int kW,
+    int strideD, int strideH, int strideW,
+    int padD, int padH, int padW)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * inC * iD * iH * iW) return;
+    int iw = idx % iW;
+    int ih = (idx / iW) % iH;
+    int id = (idx / (iW * iH)) % iD;
+    int ic = (idx / (iW * iH * iD)) % inC;
+    int n = idx / (iW * iH * iD * inC);
+    float sum = 0.0f;
+    for (int kd = 0; kd < kD; kd++) {
+        int od = id * strideD - padD + kd;
+        if (od < 0 || od >= outD) continue;
+        for (int kh = 0; kh < kH; kh++) {
+            int oh = ih * strideH - padH + kh;
+            if (oh < 0 || oh >= outH) continue;
+            for (int kw = 0; kw < kW; kw++) {
+                int ow = iw * strideW - padW + kw;
+                if (ow < 0 || ow >= outW) continue;
+                for (int oc = 0; oc < outC; oc++) {
+                    sum += gradOutput[(((n * outC + oc) * outD + od) * outH + oh) * outW + ow]
+                         * weights[((((ic * outC + oc) * kD + kd) * kH + kh) * kW + kw)];
+                }
+            }
+        }
+    }
+    gradInput[idx] = sum;
+}
+
+// #775: ConvTranspose3D backward w.r.t. weights. GATHER over gradWeights [inC,outC,kD,kH,kW]. HIP mirror.
+extern ""C"" __global__ __launch_bounds__(256) void conv_transpose3d_backward_weights(
+    const float* __restrict__ gradOutput,
+    const float* __restrict__ input,
+    float* __restrict__ gradWeights,
+    int N, int inC, int iD, int iH, int iW,
+    int outC, int outD, int outH, int outW,
+    int kD, int kH, int kW,
+    int strideD, int strideH, int strideW,
+    int padD, int padH, int padW)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= inC * outC * kD * kH * kW) return;
+    int kw = idx % kW;
+    int kh = (idx / kW) % kH;
+    int kd = (idx / (kW * kH)) % kD;
+    int oc = (idx / (kW * kH * kD)) % outC;
+    int ic = idx / (kW * kH * kD * outC);
+    float sum = 0.0f;
+    for (int n = 0; n < N; n++) {
+        for (int id = 0; id < iD; id++) {
+            int od = id * strideD - padD + kd;
+            if (od < 0 || od >= outD) continue;
+            for (int ih = 0; ih < iH; ih++) {
+                int oh = ih * strideH - padH + kh;
+                if (oh < 0 || oh >= outH) continue;
+                for (int iw = 0; iw < iW; iw++) {
+                    int ow = iw * strideW - padW + kw;
+                    if (ow < 0 || ow >= outW) continue;
+                    sum += input[(((n * inC + ic) * iD + id) * iH + ih) * iW + iw]
+                         * gradOutput[(((n * outC + oc) * outD + od) * outH + oh) * outW + ow];
+                }
+            }
+        }
+    }
+    gradWeights[idx] = sum;
+}
 ";
     }
 
@@ -625,7 +746,9 @@ extern ""C"" __global__ __launch_bounds__(256) void trilinear_interpolate_backwa
             "conv2d_backward_kernel", "depthwise_conv2d", "conv_transpose2d",
             "conv_transpose2d_backward_input", "conv_transpose2d_backward_kernel",
             "conv2d_tiled", "conv2d_winograd_f2x2_3x3", "conv3d_direct",
-            "trilinear_interpolate", "trilinear_interpolate_backward"
+            "trilinear_interpolate", "trilinear_interpolate_backward",
+            "conv_transpose3d", "conv_transpose3d_backward_input",
+            "conv_transpose3d_backward_weights"
         };
     }
 }
