@@ -10,9 +10,41 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 // uniform block (ints reinterpreted as their float bit pattern, floats stored directly, padded to a
 // 16-byte multiple to satisfy WGSL uniform alignment).
 public sealed partial class WebGpuBackend : ITrilinearInterpolationKernels, IConvTranspose3DKernels, ISpiralConvKernels,
-    IAdaptiveMaxPool2DKernels, IConv3DBackwardKernels, IDepthwiseConv2DBackwardKernels, IPool3DKernels
+    IAdaptiveMaxPool2DKernels, IConv3DBackwardKernels, IDepthwiseConv2DBackwardKernels, IPool3DKernels,
+    IGaussianSplatKernels
 {
     private static float Bits(int value) => BitConverter.Int32BitsToSingle(value);
+
+    public void GaussianCovariance(IGpuBuffer rotations, IGpuBuffer scales, IGpuBuffer covariances, int numGaussians)
+    {
+        if (numGaussians <= 0) return;
+        Dispatch3BufferAsync("ExtGaussianCovariance", WebGpuExtendedConvKernels.GaussianCovariance, "main",
+            rotations, scales, covariances,
+            [Bits(numGaussians), 0f, 0f, 0f], numGaussians).GetAwaiter().GetResult();
+    }
+
+    public void SphericalHarmonics(IGpuBuffer shCoefficients, IGpuBuffer viewDirections, IGpuBuffer output,
+        int numPoints, int basisCount, int numChannels, int degree, int broadcastDir)
+    {
+        int total = checked(numPoints * numChannels);
+        if (total <= 0) return;
+        Dispatch3BufferAsync("ExtSphericalHarmonics", WebGpuExtendedConvKernels.SphericalHarmonics, "main",
+            shCoefficients, viewDirections, output,
+            [Bits(numPoints), Bits(basisCount), Bits(numChannels), Bits(degree), Bits(broadcastDir), 0f, 0f, 0f],
+            total).GetAwaiter().GetResult();
+    }
+
+    public void SphericalHarmonicsBackward(IGpuBuffer shCoefficients, IGpuBuffer viewDirections,
+        IGpuBuffer outputGradient, IGpuBuffer shGrad,
+        int numPoints, int basisCount, int numChannels, int degree, int broadcastDir)
+    {
+        int total = checked(numPoints * basisCount * numChannels);
+        if (total <= 0) return;
+        Dispatch4BufferAsync("ExtSphericalHarmonicsBwd", WebGpuExtendedConvKernels.SphericalHarmonicsBackward, "main",
+            shCoefficients, viewDirections, outputGradient, shGrad,
+            [Bits(numPoints), Bits(basisCount), Bits(numChannels), Bits(degree), Bits(broadcastDir), 0f, 0f, 0f],
+            total).GetAwaiter().GetResult();
+    }
 
     private static float[] Pool3DUniforms(int batch, int channels, int inDepth, int inHeight, int inWidth,
         int outDepth, int outHeight, int outWidth, int kernelD, int kernelH, int kernelW,

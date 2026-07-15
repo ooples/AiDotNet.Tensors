@@ -278,6 +278,114 @@ struct PA{batch:i32,channels:i32,inHeight:i32,inWidth:i32,outHeight:i32,outWidth
     gradKernel[idx]=sum;
 }";
 
+    // Real spherical-harmonics basis up to degree 3 (16 coeffs). WGSL zero-initializes the local array, so
+    // entries above the active degree stay 0 as in the C reference. Uses pm.degree from the PSH uniform.
+    private const string ShBasisWgsl = @"
+    var basis:array<f32,16>;
+    basis[0]=0.282095;
+    if(pm.degree>=1){basis[1]=0.488603*dy;basis[2]=0.488603*dz;basis[3]=0.488603*dx;}
+    if(pm.degree>=2){
+        basis[4]=1.092548*dx*dy;basis[5]=1.092548*dy*dz;
+        basis[6]=0.315392*(3.0*dz*dz-1.0);
+        basis[7]=1.092548*dx*dz;basis[8]=0.546274*(dx*dx-dy*dy);
+    }
+    if(pm.degree>=3){
+        basis[9]=0.590044*dy*(3.0*dx*dx-dy*dy);
+        basis[10]=2.890611*dx*dy*dz;
+        basis[11]=0.457046*dy*(5.0*dz*dz-1.0);
+        basis[12]=0.373176*dz*(5.0*dz*dz-3.0);
+        basis[13]=0.457046*dx*(5.0*dz*dz-1.0);
+        basis[14]=1.445306*dz*(dx*dx-dy*dy);
+        basis[15]=0.590044*dx*(dx*dx-3.0*dy*dy);
+    }";
+
+    private const string ShStruct =
+        "struct PSH{numPoints:i32,basisCount:i32,numChannels:i32,degree:i32,broadcastDir:i32,pad0:i32,pad1:i32,pad2:i32};";
+
+    public static readonly string GaussianCovariance = @"
+@group(0) @binding(0) var<storage,read> rotations:array<f32>;
+@group(0) @binding(1) var<storage,read> scales:array<f32>;
+@group(0) @binding(2) var<storage,read_write> covariances:array<f32>;
+struct PG{numGaussians:i32,pad0:i32,pad1:i32,pad2:i32};
+@group(0) @binding(3) var<uniform> pm:PG;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid_:vec3<u32>){
+    let i=i32(gid_.x);
+    if(i>=pm.numGaussians){return;}
+    var qw=rotations[i*4]; var qx=rotations[i*4+1]; var qy=rotations[i*4+2]; var qz=rotations[i*4+3];
+    let qNorm=sqrt(qw*qw+qx*qx+qy*qy+qz*qz);
+    if(qNorm>0.0){let inv=1.0/qNorm; qw=qw*inv; qx=qx*inv; qy=qy*inv; qz=qz*inv;}
+    let r00=1.0-2.0*(qy*qy+qz*qz);
+    let r01=2.0*(qx*qy-qw*qz);
+    let r02=2.0*(qx*qz+qw*qy);
+    let r10=2.0*(qx*qy+qw*qz);
+    let r11=1.0-2.0*(qx*qx+qz*qz);
+    let r12=2.0*(qy*qz-qw*qx);
+    let r20=2.0*(qx*qz-qw*qy);
+    let r21=2.0*(qy*qz+qw*qx);
+    let r22=1.0-2.0*(qx*qx+qy*qy);
+    let sx=max(1e-6,abs(scales[i*3])); let sx2=sx*sx;
+    let sy=max(1e-6,abs(scales[i*3+1])); let sy2=sy*sy;
+    let sz=max(1e-6,abs(scales[i*3+2])); let sz2=sz*sz;
+    let m00=r00*sx2; let m01=r01*sy2; let m02=r02*sz2;
+    let m10=r10*sx2; let m11=r11*sy2; let m12=r12*sz2;
+    let m20=r20*sx2; let m21=r21*sy2; let m22=r22*sz2;
+    let o=i*6;
+    covariances[o]=m00*r00+m01*r01+m02*r02;
+    covariances[o+1]=m00*r10+m01*r11+m02*r12;
+    covariances[o+2]=m00*r20+m01*r21+m02*r22;
+    covariances[o+3]=m10*r10+m11*r11+m12*r12;
+    covariances[o+4]=m10*r20+m11*r21+m12*r22;
+    covariances[o+5]=m20*r20+m21*r21+m22*r22;
+}";
+
+    public static readonly string SphericalHarmonics = @"
+@group(0) @binding(0) var<storage,read> shCoefficients:array<f32>;
+@group(0) @binding(1) var<storage,read> viewDirections:array<f32>;
+@group(0) @binding(2) var<storage,read_write> output_:array<f32>;
+" + ShStruct + @"
+@group(0) @binding(3) var<uniform> pm:PSH;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid_:vec3<u32>){
+    let idx=i32(gid_.x);
+    if(idx>=pm.numPoints*pm.numChannels){return;}
+    let ch=idx%pm.numChannels;
+    let i=idx/pm.numChannels;
+    let dirIdx=select(i,0,pm.broadcastDir!=0);
+    var dx=viewDirections[dirIdx*3]; var dy=viewDirections[dirIdx*3+1]; var dz=viewDirections[dirIdx*3+2];
+    let norm=sqrt(dx*dx+dy*dy+dz*dz);
+    if(norm>0.0){let inv=1.0/norm; dx=dx*inv; dy=dy*inv; dz=dz*inv;}" + ShBasisWgsl + @"
+    var color=0.0;
+    for(var b=0;b<pm.basisCount;b=b+1){
+        color=color+shCoefficients[i*pm.basisCount*pm.numChannels+b*pm.numChannels+ch]*basis[b];
+    }
+    output_[i*pm.numChannels+ch]=min(max(color,0.0),1.0);
+}";
+
+    public static readonly string SphericalHarmonicsBackward = @"
+@group(0) @binding(0) var<storage,read> shCoefficients:array<f32>;
+@group(0) @binding(1) var<storage,read> viewDirections:array<f32>;
+@group(0) @binding(2) var<storage,read> outputGradient:array<f32>;
+@group(0) @binding(3) var<storage,read_write> shGrad:array<f32>;
+" + ShStruct + @"
+@group(0) @binding(4) var<uniform> pm:PSH;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid_:vec3<u32>){
+    let idx=i32(gid_.x);
+    if(idx>=pm.numPoints*pm.basisCount*pm.numChannels){return;}
+    let ch=idx%pm.numChannels;
+    let b=(idx/pm.numChannels)%pm.basisCount;
+    let i=idx/(pm.basisCount*pm.numChannels);
+    let dirIdx=select(i,0,pm.broadcastDir!=0);
+    var dx=viewDirections[dirIdx*3]; var dy=viewDirections[dirIdx*3+1]; var dz=viewDirections[dirIdx*3+2];
+    let norm=sqrt(dx*dx+dy*dy+dz*dz);
+    if(norm>0.0){let inv=1.0/norm; dx=dx*inv; dy=dy*inv; dz=dz*inv;}" + ShBasisWgsl + @"
+    var preclamp=0.0;
+    for(var bb=0;bb<pm.basisCount;bb=bb+1){
+        preclamp=preclamp+shCoefficients[i*pm.basisCount*pm.numChannels+bb*pm.numChannels+ch]*basis[bb];
+    }
+    var colorGrad=outputGradient[i*pm.numChannels+ch];
+    if(preclamp<0.0||preclamp>1.0){colorGrad=0.0;}
+    shGrad[idx]=colorGrad*basis[b];
+}";
+
     private const string Pool3DStruct =
         "struct PP{batch:i32,channels:i32,inDepth:i32,inHeight:i32,inWidth:i32,outDepth:i32,outHeight:i32,outWidth:i32,kernelD:i32,kernelH:i32,kernelW:i32,strideD:i32,strideH:i32,strideW:i32,countIncludePad:i32,pad0:i32};";
 
