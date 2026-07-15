@@ -16,27 +16,31 @@ public sealed class TrilinearKernelSourceTests
     private const string CudaConv = "AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels.CudaConvolutionKernels";
     private const string HipConv = "AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels.HipConvolutionKernels";
     private const string OpenClConv = "AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.ConvolutionKernels";
+    private const string MetalExt = "AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalExtendedConvKernels";
 
-    // The trilinear forward 8-corner weights factorize identically in every backend's source.
+    // The trilinear forward 8-corner weights factorize identically in every backend's source
+    // (OpenCL/CUDA/HIP expose GetSource(); Metal exposes the Source field of its MSL library).
     [Theory]
-    [InlineData(CudaConv)]
-    [InlineData(HipConv)]
-    [InlineData(OpenClConv)]
-    public void ForwardEightCornerWeights_MatchAcrossBackends(string typeName)
+    [InlineData(CudaConv, "GetSource")]
+    [InlineData(HipConv, "GetSource")]
+    [InlineData(OpenClConv, "GetSource")]
+    [InlineData(MetalExt, "Source")]
+    public void ForwardEightCornerWeights_MatchAcrossBackends(string typeName, string memberName)
     {
-        string source = GetStaticString(typeName, "GetSource");
+        string source = GetStaticString(typeName, memberName);
         Assert.Contains("w000 = (1 - fz) * (1 - fy) * (1 - fx)", source, StringComparison.Ordinal);
         Assert.Contains("w111 = fz * fy * fx", source, StringComparison.Ordinal);
     }
 
     // The backward gather weight per axis is identical in every backend's source.
     [Theory]
-    [InlineData(CudaConv)]
-    [InlineData(HipConv)]
-    [InlineData(OpenClConv)]
-    public void BackwardPerAxisGatherWeight_MatchesAcrossBackends(string typeName)
+    [InlineData(CudaConv, "GetSource")]
+    [InlineData(HipConv, "GetSource")]
+    [InlineData(OpenClConv, "GetSource")]
+    [InlineData(MetalExt, "Source")]
+    public void BackwardPerAxisGatherWeight_MatchesAcrossBackends(string typeName, string memberName)
     {
-        string source = GetStaticString(typeName, "GetSource");
+        string source = GetStaticString(typeName, memberName);
         Assert.Contains("float wz = (gz == z0 ? (1.0f - fz) : 0.0f) + (gz == z1 ? fz : 0.0f);", source, StringComparison.Ordinal);
     }
 
@@ -65,8 +69,12 @@ public sealed class TrilinearKernelSourceTests
         Type type = typeof(DirectGpuTensorEngine).Assembly.GetType(typeName)
             ?? throw new InvalidOperationException($"Kernel source type not found: {typeName}");
         const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static;
-        MethodInfo method = type.GetMethod(memberName, flags)
-            ?? throw new InvalidOperationException($"Static method not found: {typeName}.{memberName}");
-        return method.Invoke(null, null);
+        MethodInfo? method = type.GetMethod(memberName, flags, binder: null, Type.EmptyTypes, modifiers: null);
+        if (method is not null) return method.Invoke(null, null);
+        FieldInfo? field = type.GetField(memberName, flags);
+        if (field is not null) return field.GetValue(null);
+        PropertyInfo? property = type.GetProperty(memberName, flags);
+        if (property is not null) return property.GetValue(null);
+        throw new InvalidOperationException($"Static member not found: {typeName}.{memberName}");
     }
 }

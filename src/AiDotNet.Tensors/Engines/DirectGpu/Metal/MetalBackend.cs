@@ -71,6 +71,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     private IntPtr _geometryLibrary;
     private IntPtr _roiLibrary;
     private IntPtr _audioLibrary;
+    private IntPtr _extendedConvLibrary;
     private IntPtr _fusedAdvancedLibrary;
     private IntPtr _residentLibrary;
     // Sparse-op compute kernels (CSR SpMM + SDDMM). Compiled from
@@ -360,6 +361,18 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         {
             System.Diagnostics.Debug.WriteLine($"Metal Audio pre-compilation warning: {ex.Message}");
             _audioLibrary = IntPtr.Zero;
+        }
+
+        // #775 extended conv/pool/interp/mesh/splat kernels. Per-family capability interfaces
+        // (ITrilinearInterpolationKernels et al.) dispatch here; see MetalBackend.ExtendedConv.cs.
+        try
+        {
+            _extendedConvLibrary = _shaderLibrary.CompileLibrary("ExtendedConv", MetalExtendedConvKernels.Source);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Metal ExtendedConv pre-compilation warning: {ex.Message}");
+            _extendedConvLibrary = IntPtr.Zero;
         }
 
         // Parity-212 FFT kernels — custom radix-2 Cooley-Tukey (no external
