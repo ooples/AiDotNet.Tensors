@@ -1,11 +1,32 @@
 // Copyright (c) AiDotNet. All rights reserved.
-// WebGPU audio launchers — async-only.
+// WebGPU audio launchers. The *Async methods do the work; the synchronous
+// IAudioBackend members block on them (GetAwaiter().GetResult()) so the engine's
+// sync dispatch runs these on WebGPU instead of CPU-falling-back (#775). Caveat:
+// safe under native wgpu (no captured SynchronizationContext); a single-threaded
+// UI/JS event-loop host should call the *Async methods directly.
 #if NET7_0_OR_GREATER
 namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
-public sealed partial class WebGpuBackend
+public sealed partial class WebGpuBackend : IAudioBackend
 {
     private const string AudioModuleKey = "Audio";
+
+    void IAudioBackend.AmplitudeToDB(IGpuBuffer input, IGpuBuffer output, int length,
+        float minAmplitude, float topDb, bool clipTopDb)
+        => AmplitudeToDBAsync(input, output, length, minAmplitude, topDb, clipTopDb).GetAwaiter().GetResult();
+
+    void IAudioBackend.MuLawEncoding(IGpuBuffer input, IGpuBuffer output, int length, int quantizationChannels)
+        => MuLawEncodingAsync(input, output, length, quantizationChannels).GetAwaiter().GetResult();
+
+    void IAudioBackend.MuLawDecoding(IGpuBuffer input, IGpuBuffer output, int length, int quantizationChannels)
+        => MuLawDecodingAsync(input, output, length, quantizationChannels).GetAwaiter().GetResult();
+
+    void IAudioBackend.ComputeDeltas(IGpuBuffer input, IGpuBuffer output, int leading, int timeAxis, int winLength)
+        => ComputeDeltasAsync(input, output, leading, timeAxis, winLength).GetAwaiter().GetResult();
+
+    void IAudioBackend.Resample(IGpuBuffer input, IGpuBuffer output,
+        int leading, int inLen, int outLen, int up, int down, int halfWidth)
+        => ResampleAsync(input, output, leading, inLen, outLen, up, down, halfWidth).GetAwaiter().GetResult();
 
     public async Task AmplitudeToDBAsync(IGpuBuffer input, IGpuBuffer output, int length,
         float minAmplitude, float topDb, bool clipTopDb)
