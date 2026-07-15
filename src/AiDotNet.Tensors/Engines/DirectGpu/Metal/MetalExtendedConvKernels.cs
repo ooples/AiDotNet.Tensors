@@ -78,5 +78,131 @@ kernel void trilinear_interpolate_backward(
     }
     gradGrid[idx] = sum;
 }
+
+kernel void conv_transpose3d(
+    device const float* input [[buffer(0)]],
+    device const float* weights [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant int& N [[buffer(3)]], constant int& inC [[buffer(4)]],
+    constant int& iD [[buffer(5)]], constant int& iH [[buffer(6)]], constant int& iW [[buffer(7)]],
+    constant int& outC [[buffer(8)]], constant int& outD [[buffer(9)]],
+    constant int& outH [[buffer(10)]], constant int& outW [[buffer(11)]],
+    constant int& kD [[buffer(12)]], constant int& kH [[buffer(13)]], constant int& kW [[buffer(14)]],
+    constant int& strideD [[buffer(15)]], constant int& strideH [[buffer(16)]], constant int& strideW [[buffer(17)]],
+    constant int& padD [[buffer(18)]], constant int& padH [[buffer(19)]], constant int& padW [[buffer(20)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int idx = int(gid);
+    if (idx >= N * outC * outD * outH * outW) return;
+    int ow = idx % outW;
+    int oh = (idx / outW) % outH;
+    int od = (idx / (outW * outH)) % outD;
+    int oc = (idx / (outW * outH * outD)) % outC;
+    int n = idx / (outW * outH * outD * outC);
+    float sum = 0.0f;
+    for (int kd = 0; kd < kD; kd++) {
+        int td = od + padD - kd;
+        if (td < 0 || (td % strideD) != 0) continue;
+        int id = td / strideD;
+        if (id < 0 || id >= iD) continue;
+        for (int kh = 0; kh < kH; kh++) {
+            int th = oh + padH - kh;
+            if (th < 0 || (th % strideH) != 0) continue;
+            int ih = th / strideH;
+            if (ih < 0 || ih >= iH) continue;
+            for (int kw = 0; kw < kW; kw++) {
+                int tw = ow + padW - kw;
+                if (tw < 0 || (tw % strideW) != 0) continue;
+                int iw = tw / strideW;
+                if (iw < 0 || iw >= iW) continue;
+                for (int ic = 0; ic < inC; ic++) {
+                    sum += input[(((n * inC + ic) * iD + id) * iH + ih) * iW + iw]
+                         * weights[((((ic * outC + oc) * kD + kd) * kH + kh) * kW + kw)];
+                }
+            }
+        }
+    }
+    output[idx] = sum;
+}
+
+kernel void conv_transpose3d_backward_input(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* weights [[buffer(1)]],
+    device float* gradInput [[buffer(2)]],
+    constant int& N [[buffer(3)]], constant int& inC [[buffer(4)]],
+    constant int& iD [[buffer(5)]], constant int& iH [[buffer(6)]], constant int& iW [[buffer(7)]],
+    constant int& outC [[buffer(8)]], constant int& outD [[buffer(9)]],
+    constant int& outH [[buffer(10)]], constant int& outW [[buffer(11)]],
+    constant int& kD [[buffer(12)]], constant int& kH [[buffer(13)]], constant int& kW [[buffer(14)]],
+    constant int& strideD [[buffer(15)]], constant int& strideH [[buffer(16)]], constant int& strideW [[buffer(17)]],
+    constant int& padD [[buffer(18)]], constant int& padH [[buffer(19)]], constant int& padW [[buffer(20)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int idx = int(gid);
+    if (idx >= N * inC * iD * iH * iW) return;
+    int iw = idx % iW;
+    int ih = (idx / iW) % iH;
+    int id = (idx / (iW * iH)) % iD;
+    int ic = (idx / (iW * iH * iD)) % inC;
+    int n = idx / (iW * iH * iD * inC);
+    float sum = 0.0f;
+    for (int kd = 0; kd < kD; kd++) {
+        int od = id * strideD - padD + kd;
+        if (od < 0 || od >= outD) continue;
+        for (int kh = 0; kh < kH; kh++) {
+            int oh = ih * strideH - padH + kh;
+            if (oh < 0 || oh >= outH) continue;
+            for (int kw = 0; kw < kW; kw++) {
+                int ow = iw * strideW - padW + kw;
+                if (ow < 0 || ow >= outW) continue;
+                for (int oc = 0; oc < outC; oc++) {
+                    sum += gradOutput[(((n * outC + oc) * outD + od) * outH + oh) * outW + ow]
+                         * weights[((((ic * outC + oc) * kD + kd) * kH + kh) * kW + kw)];
+                }
+            }
+        }
+    }
+    gradInput[idx] = sum;
+}
+
+kernel void conv_transpose3d_backward_weights(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* gradWeights [[buffer(2)]],
+    constant int& N [[buffer(3)]], constant int& inC [[buffer(4)]],
+    constant int& iD [[buffer(5)]], constant int& iH [[buffer(6)]], constant int& iW [[buffer(7)]],
+    constant int& outC [[buffer(8)]], constant int& outD [[buffer(9)]],
+    constant int& outH [[buffer(10)]], constant int& outW [[buffer(11)]],
+    constant int& kD [[buffer(12)]], constant int& kH [[buffer(13)]], constant int& kW [[buffer(14)]],
+    constant int& strideD [[buffer(15)]], constant int& strideH [[buffer(16)]], constant int& strideW [[buffer(17)]],
+    constant int& padD [[buffer(18)]], constant int& padH [[buffer(19)]], constant int& padW [[buffer(20)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int idx = int(gid);
+    if (idx >= inC * outC * kD * kH * kW) return;
+    int kw = idx % kW;
+    int kh = (idx / kW) % kH;
+    int kd = (idx / (kW * kH)) % kD;
+    int oc = (idx / (kW * kH * kD)) % outC;
+    int ic = idx / (kW * kH * kD * outC);
+    float sum = 0.0f;
+    for (int n = 0; n < N; n++) {
+        for (int id = 0; id < iD; id++) {
+            int od = id * strideD - padD + kd;
+            if (od < 0 || od >= outD) continue;
+            for (int ih = 0; ih < iH; ih++) {
+                int oh = ih * strideH - padH + kh;
+                if (oh < 0 || oh >= outH) continue;
+                for (int iw = 0; iw < iW; iw++) {
+                    int ow = iw * strideW - padW + kw;
+                    if (ow < 0 || ow >= outW) continue;
+                    sum += input[(((n * inC + ic) * iD + id) * iH + ih) * iW + iw]
+                         * gradOutput[(((n * outC + oc) * outD + od) * outH + oh) * outW + ow];
+                }
+            }
+        }
+    }
+    gradWeights[idx] = sum;
+}
 ";
 }
