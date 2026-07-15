@@ -255,4 +255,178 @@ void main() {
     }
     gradWeights[idx] = sum;
 }";
+
+    public static readonly string AdaptiveMaxPool2D = @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0,binding=0) readonly buffer Input { float input_[]; };
+layout(set=0,binding=1) writeonly buffer Output { float output_[]; };
+layout(push_constant) uniform PC { int batch; int channels; int inHeight; int inWidth; int outHeight; int outWidth; };
+void main() {
+    int idx = int(gl_GlobalInvocationID.x);
+    if (idx >= batch * channels * outHeight * outWidth) return;
+    int ow = idx % outWidth;
+    int oh = (idx / outWidth) % outHeight;
+    int c = (idx / (outWidth * outHeight)) % channels;
+    int b = idx / (outWidth * outHeight * channels);
+    int hStart = (oh * inHeight) / outHeight;
+    int hEnd = ((oh + 1) * inHeight) / outHeight;
+    int wStart = (ow * inWidth) / outWidth;
+    int wEnd = ((ow + 1) * inWidth) / outWidth;
+    float maxV = -3.402823466e38;
+    for (int ih = hStart; ih < hEnd; ih++) {
+        for (int iw = wStart; iw < wEnd; iw++) {
+            float v = input_[((b * channels + c) * inHeight + ih) * inWidth + iw];
+            if (v > maxV) maxV = v;
+        }
+    }
+    output_[((b * channels + c) * outHeight + oh) * outWidth + ow] = maxV;
+}";
+
+    private const string Conv3DBackwardParams =
+        "layout(push_constant) uniform PC { int N; int inC; int D; int H; int W; int outC; int outD; int outH; int outW; int kD; int kH; int kW; int strideD; int strideH; int strideW; int padD; int padH; int padW; };";
+
+    public static readonly string Conv3DBackwardInput = @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0,binding=0) readonly buffer GradOutput { float gradOutput[]; };
+layout(set=0,binding=1) readonly buffer Weights { float weights[]; };
+layout(set=0,binding=2) writeonly buffer GradInput { float gradInput[]; };
+" + Conv3DBackwardParams + @"
+void main() {
+    int idx = int(gl_GlobalInvocationID.x);
+    int totalSize = N * inC * D * H * W;
+    if (idx >= totalSize) return;
+    int w = idx % W;
+    int h = (idx / W) % H;
+    int d = (idx / (W * H)) % D;
+    int ic = (idx / (W * H * D)) % inC;
+    int n = idx / (W * H * D * inC);
+    float sum = 0.0;
+    for (int oc = 0; oc < outC; oc++) {
+        for (int kd = 0; kd < kD; kd++) {
+            for (int kh = 0; kh < kH; kh++) {
+                for (int kw = 0; kw < kW; kw++) {
+                    int od = (d + padD - kd);
+                    int oh = (h + padH - kh);
+                    int ow = (w + padW - kw);
+                    if (od % strideD == 0 && oh % strideH == 0 && ow % strideW == 0) {
+                        od /= strideD;
+                        oh /= strideH;
+                        ow /= strideW;
+                        if (od >= 0 && od < outD && oh >= 0 && oh < outH && ow >= 0 && ow < outW) {
+                            int gradOutIdx = ((n * outC + oc) * outD + od) * outH * outW + oh * outW + ow;
+                            int kernelIdx = ((oc * inC + ic) * kD + kd) * kH * kW + kh * kW + kw;
+                            sum += gradOutput[gradOutIdx] * weights[kernelIdx];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    gradInput[idx] = sum;
+}";
+
+    public static readonly string Conv3DBackwardWeights = @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0,binding=0) readonly buffer GradOutput { float gradOutput[]; };
+layout(set=0,binding=1) readonly buffer Input { float input_[]; };
+layout(set=0,binding=2) writeonly buffer GradKernel { float gradKernel[]; };
+" + Conv3DBackwardParams + @"
+void main() {
+    int idx = int(gl_GlobalInvocationID.x);
+    int totalKernelSize = outC * inC * kD * kH * kW;
+    if (idx >= totalKernelSize) return;
+    int kw = idx % kW;
+    int kh = (idx / kW) % kH;
+    int kd = (idx / (kW * kH)) % kD;
+    int ic = (idx / (kW * kH * kD)) % inC;
+    int oc = idx / (kW * kH * kD * inC);
+    float sum = 0.0;
+    for (int n = 0; n < N; n++) {
+        for (int od = 0; od < outD; od++) {
+            for (int oh = 0; oh < outH; oh++) {
+                for (int ow = 0; ow < outW; ow++) {
+                    int d = od * strideD + kd - padD;
+                    int h = oh * strideH + kh - padH;
+                    int w = ow * strideW + kw - padW;
+                    if (d >= 0 && d < D && h >= 0 && h < H && w >= 0 && w < W) {
+                        int gradOutIdx = ((n * outC + oc) * outD + od) * outH * outW + oh * outW + ow;
+                        int inputIdx = ((n * inC + ic) * D + d) * H * W + h * W + w;
+                        sum += gradOutput[gradOutIdx] * input_[inputIdx];
+                    }
+                }
+            }
+        }
+    }
+    gradKernel[idx] = sum;
+}";
+
+    private const string DepthwiseParams =
+        "layout(push_constant) uniform PC { int N; int inC; int H; int W; int M; int outH; int outW; int kH; int kW; int strideH; int strideW; int padH; int padW; };";
+
+    public static readonly string DepthwiseConv2DBackwardInput = @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0,binding=0) readonly buffer GradOutput { float gradOutput[]; };
+layout(set=0,binding=1) readonly buffer Weights { float weights[]; };
+layout(set=0,binding=2) writeonly buffer GradInput { float gradInput[]; };
+" + DepthwiseParams + @"
+void main() {
+    int idx = int(gl_GlobalInvocationID.x);
+    int total = N * inC * H * W;
+    if (idx >= total) return;
+    int iw = idx % W;
+    int ih = (idx / W) % H;
+    int ic = (idx / (W * H)) % inC;
+    int b = idx / (W * H * inC);
+    int outC = inC * M;
+    float sum = 0.0;
+    for (int m = 0; m < M; m++) {
+        int oc = ic * M + m;
+        for (int kh = 0; kh < kH; kh++) {
+            int t = ih + padH - kh;
+            if (t < 0 || (t % strideH) != 0) continue;
+            int oh = t / strideH;
+            if (oh < 0 || oh >= outH) continue;
+            for (int kw = 0; kw < kW; kw++) {
+                int tw = iw + padW - kw;
+                if (tw < 0 || (tw % strideW) != 0) continue;
+                int ow = tw / strideW;
+                if (ow < 0 || ow >= outW) continue;
+                sum += weights[(oc * kH + kh) * kW + kw]
+                     * gradOutput[((b * outC + oc) * outH + oh) * outW + ow];
+            }
+        }
+    }
+    gradInput[idx] = sum;
+}";
+
+    public static readonly string DepthwiseConv2DBackwardWeights = @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0,binding=0) readonly buffer GradOutput { float gradOutput[]; };
+layout(set=0,binding=1) readonly buffer Input { float input_[]; };
+layout(set=0,binding=2) writeonly buffer GradKernel { float gradKernel[]; };
+" + DepthwiseParams + @"
+void main() {
+    int idx = int(gl_GlobalInvocationID.x);
+    int outC = inC * M;
+    int total = outC * kH * kW;
+    if (idx >= total) return;
+    int kw = idx % kW;
+    int kh = (idx / kW) % kH;
+    int oc = idx / (kW * kH);
+    int ic = oc / M;
+    float sum = 0.0;
+    for (int b = 0; b < N; b++) {
+        for (int oh = 0; oh < outH; oh++) {
+            int ih = oh * strideH - padH + kh;
+            if (ih < 0 || ih >= H) continue;
+            for (int ow = 0; ow < outW; ow++) {
+                int iw = ow * strideW - padW + kw;
+                if (iw < 0 || iw >= W) continue;
+                sum += input_[((b * inC + ic) * H + ih) * W + iw]
+                     * gradOutput[((b * outC + oc) * outH + oh) * outW + ow];
+            }
+        }
+    }
+    gradKernel[idx] = sum;
+}";
 }

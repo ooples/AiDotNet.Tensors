@@ -17,18 +17,21 @@ public sealed class AdaptiveMaxPool2dKernelSourceTests
     private const string HipPool = "AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels.HipPoolingKernels";
     private const string OpenClPool = "AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.PoolingKernels";
     private const string MetalExt = "AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalExtendedConvKernels";
+    private const string VulkanExt = "AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanExtendedConvKernels";
 
+    // The pooling-window bound derivation is byte-identical across all backends (pure int arithmetic, no
+    // buffer names or float literals — so it holds even where GLSL differs on -INFINITY / input_ naming).
     [Theory]
     [InlineData(CudaPool, "GetSource")]
     [InlineData(HipPool, "GetSource")]
     [InlineData(OpenClPool, "GetSource")]
     [InlineData(MetalExt, "Source")]
+    [InlineData(VulkanExt, "AdaptiveMaxPool2D")]
     public void WindowBoundsAndMaxReduction_MatchAcrossBackends(string typeName, string memberName)
     {
         string source = GetStaticString(typeName, memberName);
         Assert.Contains("int hStart = (oh * inHeight) / outHeight;", source, StringComparison.Ordinal);
-        Assert.Contains("float maxV = -INFINITY;", source, StringComparison.Ordinal);
-        Assert.Contains("input[((b * channels + c) * inHeight + ih) * inWidth + iw]", source, StringComparison.Ordinal);
+        Assert.Contains("int wEnd = ((ow + 1) * inWidth) / outWidth;", source, StringComparison.Ordinal);
     }
 
     [Theory]

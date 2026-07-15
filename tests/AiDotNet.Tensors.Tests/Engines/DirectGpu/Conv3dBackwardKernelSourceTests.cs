@@ -17,12 +17,14 @@ public sealed class Conv3dBackwardKernelSourceTests
     private const string HipConv = "AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels.HipNeuralNetKernels";
     private const string OpenClNeural = "AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.NeuralNetKernels";
     private const string MetalExt = "AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalExtendedConvKernels";
+    private const string VulkanExt = "AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanExtendedConvKernels";
 
     [Theory]
     [InlineData(CudaConv, "GetSource")]
     [InlineData(HipConv, "GetSource")]
     [InlineData(OpenClNeural, "GetSource")]
     [InlineData(MetalExt, "Source")]
+    [InlineData(VulkanExt, "Conv3DBackwardInput")]
     public void InputGradientWeightIndex_MatchesAcrossBackends(string typeName, string memberName)
     {
         string source = GetStaticString(typeName, memberName);
@@ -34,6 +36,7 @@ public sealed class Conv3dBackwardKernelSourceTests
     [InlineData(HipConv, "GetSource")]
     [InlineData(OpenClNeural, "GetSource")]
     [InlineData(MetalExt, "Source")]
+    [InlineData(VulkanExt, "Conv3DBackwardWeights")]
     public void WeightGradientInputIndex_MatchesAcrossBackends(string typeName, string memberName)
     {
         string source = GetStaticString(typeName, memberName);

@@ -17,27 +17,32 @@ public sealed class DepthwiseConv2dBackwardKernelSourceTests
     private const string HipConv = "AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels.HipConvolutionKernels";
     private const string OpenClConv = "AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.ConvolutionKernels";
     private const string MetalExt = "AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalExtendedConvKernels";
+    private const string VulkanExt = "AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanExtendedConvKernels";
 
+    // The weights-gather line is byte-identical everywhere (weights buffer name is the same in GLSL).
     [Theory]
     [InlineData(CudaConv, "GetSource")]
     [InlineData(HipConv, "GetSource")]
     [InlineData(OpenClConv, "GetSource")]
     [InlineData(MetalExt, "Source")]
+    [InlineData(VulkanExt, "DepthwiseConv2DBackwardInput")]
     public void InputGradientWeightGather_MatchesAcrossBackends(string typeName, string memberName)
     {
         string source = GetStaticString(typeName, memberName);
         Assert.Contains("sum += weights[(oc * kH + kh) * kW + kw]", source, StringComparison.Ordinal);
     }
 
+    // GLSL renames the reserved 'input' buffer to input_, so the Vulkan row carries the GLSL-form marker.
     [Theory]
-    [InlineData(CudaConv, "GetSource")]
-    [InlineData(HipConv, "GetSource")]
-    [InlineData(OpenClConv, "GetSource")]
-    [InlineData(MetalExt, "Source")]
-    public void WeightGradientInputGather_MatchesAcrossBackends(string typeName, string memberName)
+    [InlineData(CudaConv, "GetSource", "sum += input[((b * inC + ic) * H + ih) * W + iw]")]
+    [InlineData(HipConv, "GetSource", "sum += input[((b * inC + ic) * H + ih) * W + iw]")]
+    [InlineData(OpenClConv, "GetSource", "sum += input[((b * inC + ic) * H + ih) * W + iw]")]
+    [InlineData(MetalExt, "Source", "sum += input[((b * inC + ic) * H + ih) * W + iw]")]
+    [InlineData(VulkanExt, "DepthwiseConv2DBackwardWeights", "sum += input_[((b * inC + ic) * H + ih) * W + iw]")]
+    public void WeightGradientInputGather_MatchesAcrossBackends(string typeName, string memberName, string marker)
     {
         string source = GetStaticString(typeName, memberName);
-        Assert.Contains("sum += input[((b * inC + ic) * H + ih) * W + iw]", source, StringComparison.Ordinal);
+        Assert.Contains(marker, source, StringComparison.Ordinal);
     }
 
     [Theory]

@@ -5,8 +5,63 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 // it can run; the engine routes the rest to the CPU. GLSL kernels live in VulkanExtendedConvKernels;
 // this partial only wires the dispatch via GlslDispatchN (int params -> push constants; a float param is
 // passed as its raw bit pattern via the shared FloatBits helper and declared `float` in the push block).
-public sealed partial class VulkanBackend : ITrilinearInterpolationKernels, IConvTranspose3DKernels, ISpiralConvKernels
+public sealed partial class VulkanBackend : ITrilinearInterpolationKernels, IConvTranspose3DKernels, ISpiralConvKernels,
+    IAdaptiveMaxPool2DKernels, IConv3DBackwardKernels, IDepthwiseConv2DBackwardKernels
 {
+    public void AdaptiveMaxPool2D(IGpuBuffer input, IGpuBuffer output,
+        int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
+    {
+        int total = checked(batch * channels * outHeight * outWidth);
+        if (total <= 0) return;
+        GlslDispatchN(VulkanExtendedConvKernels.AdaptiveMaxPool2D, total, [input, output],
+            [(uint)batch, (uint)channels, (uint)inHeight, (uint)inWidth, (uint)outHeight, (uint)outWidth]);
+    }
+
+    public void Conv3DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer weights, IGpuBuffer gradInput,
+        int n, int inC, int inD, int inH, int inW, int outC, int outD, int outH, int outW,
+        int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW)
+    {
+        int total = checked(n * inC * inD * inH * inW);
+        if (total <= 0) return;
+        GlslDispatchN(VulkanExtendedConvKernels.Conv3DBackwardInput, total, [gradOutput, weights, gradInput],
+            Conv3DPush(n, inC, inD, inH, inW, outC, outD, outH, outW, kD, kH, kW, strideD, strideH, strideW, padD, padH, padW));
+    }
+
+    public void Conv3DBackwardKernel(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradKernel,
+        int n, int inC, int inD, int inH, int inW, int outC, int outD, int outH, int outW,
+        int kD, int kH, int kW, int strideD, int strideH, int strideW, int padD, int padH, int padW)
+    {
+        int total = checked(outC * inC * kD * kH * kW);
+        if (total <= 0) return;
+        GlslDispatchN(VulkanExtendedConvKernels.Conv3DBackwardWeights, total, [gradOutput, input, gradKernel],
+            Conv3DPush(n, inC, inD, inH, inW, outC, outD, outH, outW, kD, kH, kW, strideD, strideH, strideW, padD, padH, padW));
+    }
+
+    private static uint[] DepthwisePush(int n, int inC, int h, int w, int m, int outH, int outW, int kH, int kW,
+        int strideH, int strideW, int padH, int padW) =>
+        [(uint)n, (uint)inC, (uint)h, (uint)w, (uint)m, (uint)outH, (uint)outW, (uint)kH, (uint)kW,
+         (uint)strideH, (uint)strideW, (uint)padH, (uint)padW];
+
+    public void DepthwiseConv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
+        int n, int inC, int h, int w, int m, int outH, int outW, int kH, int kW,
+        int strideH, int strideW, int padH, int padW)
+    {
+        int total = checked(n * inC * h * w);
+        if (total <= 0) return;
+        GlslDispatchN(VulkanExtendedConvKernels.DepthwiseConv2DBackwardInput, total, [gradOutput, kernel, gradInput],
+            DepthwisePush(n, inC, h, w, m, outH, outW, kH, kW, strideH, strideW, padH, padW));
+    }
+
+    public void DepthwiseConv2DBackwardKernel(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradKernel,
+        int n, int inC, int h, int w, int m, int outH, int outW, int kH, int kW,
+        int strideH, int strideW, int padH, int padW)
+    {
+        int total = checked(inC * m * kH * kW);
+        if (total <= 0) return;
+        GlslDispatchN(VulkanExtendedConvKernels.DepthwiseConv2DBackwardWeights, total, [gradOutput, input, gradKernel],
+            DepthwisePush(n, inC, h, w, m, outH, outW, kH, kW, strideH, strideW, padH, padW));
+    }
+
     public void SpiralConv(IGpuBuffer vertexFeatures, IGpuBuffer spiralIndices, IGpuBuffer weights,
         IGpuBuffer biases, IGpuBuffer output, int v, int inC, int spiralLength, int outC)
     {
