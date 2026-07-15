@@ -304,6 +304,33 @@ public sealed class GradientTape<T> : IDisposable
         }
 
         _entries.Add(entry);
+
+        // Graph-path visibility for MANUAL backward nodes. This public Record(entry) API is the
+        // manual-backward entry point (e.g. the neural-network layer library's
+        // RegisterManualBackwardNode, used for Conv im2col → col2im input-gradient wiring). Engine
+        // ops record via RecordSlot and additionally set output.GradFn so the graph-based backward
+        // fast path (ComputeGradientsViaGraph) — which traverses per-tensor GradFn links and does NOT
+        // walk the tape entry list — can reach them. A manual node that only appended a tape entry set
+        // NO GradFn, so the fast path treated its output as a leaf and silently DROPPED the node's
+        // input gradient (every Conv3D layer but the last was frozen during training). Mirror the
+        // RecordUnary GradFn wiring here so manual nodes are seen by BOTH backward paths. Only wire
+        // when the output has no GradFn yet (a fresh materialized tensor, e.g. im2col output) and the
+        // node actually has a backward to run.
+        var manualOutput = entry.Output;
+        if (manualOutput is not null && entry.Backward is not null && manualOutput.GradFn is null)
+        {
+            var node = GradNodePool<T>.Rent();
+            node.OwningTape = this;
+            node.Backward = entry.Backward;
+            node.Output = manualOutput;
+            node.Input0 = entry.Input0;
+            node.Input1 = entry.Input1;
+            node.Input2 = entry.Input2;
+            node.InputCount = entry.InputCount;
+            node.InputsOverflow = entry.InputsOverflow;
+            node.SavedState = entry.SavedState;
+            manualOutput.GradFn = node;
+        }
     }
 
     /// <summary>
