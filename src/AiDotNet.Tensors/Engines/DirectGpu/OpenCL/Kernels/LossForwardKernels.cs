@@ -48,6 +48,13 @@ __kernel void dropout_mask(__global float* mask, int size, float keepProb, ulong
     float safe_keep = fmax(keepProb, 1e-7f);
     mask[idx] = (u < keepProb) ? (1.0f / safe_keep) : 0.0f;
 }
+__kernel void stateless_dropout_mask(__global float* mask, int size, uint threshold, float scale, uint seed) {
+    int idx = get_global_id(0); if (idx >= size) return;
+    uint state = (uint)idx * 747796405u + seed + 2891336453u;
+    uint word = ((state >> ((state >> 28) + 4u)) ^ state) * 277803737u;
+    uint sample = (word >> 22) ^ word;
+    mask[idx] = sample < threshold ? 0.0f : scale;
+}
 __kernel void gaussian_noise(__global float* output, int size, float mean, float stdDev, ulong seed) {
     int idx = get_global_id(0); if (idx >= size) return;
     uint key = (uint)(seed ^ (seed >> 32));
@@ -122,7 +129,7 @@ __kernel void bce_with_logits_backward(__global const float* gradOutput, __globa
 
     public static string[] GetKernelNames()
     {
-        return new[] { "cross_entropy_loss", "mse_loss", "bce_loss", "dropout_mask", "gaussian_noise",
+        return new[] { "cross_entropy_loss", "mse_loss", "bce_loss", "dropout_mask", "stateless_dropout_mask", "gaussian_noise",
             "l1_loss", "huber_loss", "bce_with_logits_loss", "nll_loss", "kl_div_loss",
             "mse_loss_backward", "l1_loss_backward", "huber_loss_backward", "bce_with_logits_backward" };
     }

@@ -568,7 +568,13 @@ __kernel void equal_values(
     const int idx = get_global_id(0);
     if (idx >= size) return;
 
-    C[idx] = A[idx] == B[idx] ? 1.0f : 0.0f;
+    uint ab = as_uint(A[idx]);
+    uint bb = as_uint(B[idx]);
+    uint aa = ab & 0x7FFFFFFFu;
+    uint ba = bb & 0x7FFFFFFFu;
+    int equal = aa <= 0x7F800000u && ba <= 0x7F800000u
+        && (ab == bb || ((aa | ba) == 0u));
+    C[idx] = equal ? 1.0f : 0.0f;
 }
 
 // Where (conditional select)

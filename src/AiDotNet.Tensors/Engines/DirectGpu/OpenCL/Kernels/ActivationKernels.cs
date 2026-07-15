@@ -1484,6 +1484,23 @@ __kernel void scale_add(__global const float* A, __global const float* B, __glob
         vstore4(fma(vload4(idx, A), (float4)(scalar), vload4(idx, B)), idx, C);
     } else { for (int i = idx4; i < size; i++) C[i] = fma(A[i], scalar, B[i]); }
 }
+
+__kernel void l2_norm_squared(__global const float* input, __global float* output, const int size) {
+    int index = get_global_id(0); if (index < size) output[index] = input[index] * input[index];
+}
+
+__kernel void squared_deviation_from_mean(
+    __global const float* input, __global const float* mean, __global float* output, const int size) {
+    int index = get_global_id(0); if (index < size) { float difference = input[index] - mean[0]; output[index] = difference * difference; }
+}
+
+__kernel void clip_by_norm_from_squared_sum(
+    __global const float* input, __global const float* squaredSum, __global float* output,
+    const float maximumNorm, const int size) {
+    int index = get_global_id(0); if (index >= size) return;
+    float norm = sqrt(fmax(squaredSum[0], 0.0f)); float scale = norm > maximumNorm ? maximumNorm / norm : 1.0f;
+    output[index] = input[index] * scale;
+}
 ";
         }
 
@@ -1517,6 +1534,7 @@ __kernel void scale_add(__global const float* A, __global const float* B, __glob
                 "divide_vectors", "min_vectors", "max_vectors",
                 // Fused element-wise
                 "add_relu", "add_sigmoid", "add_gelu", "fused_mul_add", "scale_add",
+                "l2_norm_squared", "squared_deviation_from_mean", "clip_by_norm_from_squared_sum",
                 // Scalar ops
                 "scale_vector", "scale_by_device_scalar", "power_scalar",
                 // Unary math

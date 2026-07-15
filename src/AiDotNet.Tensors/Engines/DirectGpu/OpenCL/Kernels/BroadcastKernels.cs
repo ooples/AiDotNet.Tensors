@@ -32,6 +32,10 @@ __kernel void broadcast_mul_first(__global const float* a, __global const float*
     int idx = get_global_id(0); if (idx >= outerSize * innerSize) return;
     output[idx] = a[idx / innerSize] * b[idx];
 }
+__kernel void broadcast_multiply_first_axis(__global const float* a, __global const float* b, __global float* output, int outerSize, int innerSize) {
+    int idx = get_global_id(0); if (idx >= outerSize * innerSize) return;
+    output[idx] = a[idx] * b[idx / innerSize];
+}
 __kernel void add_scalar(__global const float* input, __global float* output, float scalar, int size) {
     int idx = get_global_id(0); if (idx >= size) return;
     output[idx] = input[idx] + scalar;
@@ -75,11 +79,33 @@ __kernel void rsqrt_kernel(__global const float* input, __global float* output, 
 }
 __kernel void equals_kernel(__global const float* a, __global const float* b, __global float* output, int size) {
     int idx = get_global_id(0); if (idx >= size) return;
-    output[idx] = (a[idx] == b[idx]) ? 1.0f : 0.0f;
+    uint ab = as_uint(a[idx]);
+    uint bb = as_uint(b[idx]);
+    uint aa = ab & 0x7FFFFFFFu;
+    uint ba = bb & 0x7FFFFFFFu;
+    int equal = aa <= 0x7F800000u && ba <= 0x7F800000u
+        && (ab == bb || ((aa | ba) == 0u));
+    output[idx] = equal ? 1.0f : 0.0f;
 }
 __kernel void not_equals_kernel(__global const float* a, __global const float* b, __global float* output, int size) {
     int idx = get_global_id(0); if (idx >= size) return;
-    output[idx] = (a[idx] != b[idx]) ? 1.0f : 0.0f;
+    uint ab = as_uint(a[idx]);
+    uint bb = as_uint(b[idx]);
+    uint aa = ab & 0x7FFFFFFFu;
+    uint ba = bb & 0x7FFFFFFFu;
+    int equal = aa <= 0x7F800000u && ba <= 0x7F800000u
+        && (ab == bb || ((aa | ba) == 0u));
+    output[idx] = equal ? 0.0f : 1.0f;
+}
+__kernel void not_equal_scalar(__global const float* input, __global float* output, float scalar, int size) {
+    int idx = get_global_id(0); if (idx >= size) return;
+    uint ab = as_uint(input[idx]);
+    uint bb = as_uint(scalar);
+    uint aa = ab & 0x7FFFFFFFu;
+    uint ba = bb & 0x7FFFFFFFu;
+    int equal = aa <= 0x7F800000u && ba <= 0x7F800000u
+        && (ab == bb || ((aa | ba) == 0u));
+    output[idx] = equal ? 0.0f : 1.0f;
 }
 // IEEE-754 classify via the bit pattern (robust to fast/finite-math which folds isnan/!= away).
 // mode: 0 = isnan, 1 = isinf, 2 = isfinite.
@@ -104,10 +130,10 @@ __kernel void classify_float(__global const float* a, __global float* output, in
         return new[]
         {
             "broadcast_add_last", "broadcast_sub_last", "broadcast_mul_last", "broadcast_div_last",
-            "broadcast_add_first", "broadcast_mul_first",
+            "broadcast_add_first", "broadcast_mul_first", "broadcast_multiply_first_axis",
             "add_scalar", "sub_scalar", "div_scalar", "pow_scalar",
             "frac_kernel", "clip_kernel", "rsqrt_kernel",
-            "equals_kernel", "not_equals_kernel", "classify_float"
+            "equals_kernel", "not_equals_kernel", "not_equal_scalar", "classify_float"
         };
     }
 }

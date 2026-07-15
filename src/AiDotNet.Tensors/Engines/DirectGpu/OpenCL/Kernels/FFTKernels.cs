@@ -174,8 +174,9 @@ __kernel void fft_scale(
     imag[i] *= scale;
 }
 
-// Real-to-complex FFT post-processing
-// Converts N-point real FFT to N/2+1 complex values
+// The backend computes a full N-point complex FFT with an all-zero imaginary
+// input. RFFT therefore only extracts the positive-frequency half; no packed
+// real-FFT twiddle post-processing is required here.
 __kernel void rfft_postprocess(
     __global const float* fftReal,
     __global const float* fftImag,
@@ -184,35 +185,10 @@ __kernel void rfft_postprocess(
     const int n)
 {
     int k = get_global_id(0);
-    int halfN = n / 2;
-
-    if (k > halfN) return;
-
-    if (k == 0) {
-        // DC component
-        outReal[0] = fftReal[0] + fftImag[0];
-        outImag[0] = 0.0f;
-    } else if (k == halfN) {
-        // Nyquist component
-        outReal[halfN] = fftReal[0] - fftImag[0];
-        outImag[halfN] = 0.0f;
-    } else {
-        // General case: use conjugate symmetry
-        float evenReal = 0.5f * (fftReal[k] + fftReal[n - k]);
-        float evenImag = 0.5f * (fftImag[k] - fftImag[n - k]);
-        float oddReal = 0.5f * (fftImag[k] + fftImag[n - k]);
-        float oddImag = 0.5f * (fftReal[n - k] - fftReal[k]);
-
-        float angle = -2.0f * 3.14159265358979323846f * k / n;
-        float wReal = cos(angle);
-        float wImag = sin(angle);
-
-        float twiddledReal = oddReal * wReal - oddImag * wImag;
-        float twiddledImag = oddReal * wImag + oddImag * wReal;
-
-        outReal[k] = evenReal + twiddledReal;
-        outImag[k] = evenImag + twiddledImag;
-    }
+    int outLen = n / 2 + 1;
+    if (k >= outLen) return;
+    outReal[k] = fftReal[k];
+    outImag[k] = fftImag[k];
 }
 
 // Complex-to-real IFFT pre-processing

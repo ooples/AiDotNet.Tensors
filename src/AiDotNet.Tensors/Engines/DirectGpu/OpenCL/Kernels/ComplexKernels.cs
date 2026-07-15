@@ -121,14 +121,26 @@ __kernel void split_complex_cross_spectral(
 __kernel void split_complex_topk(
     __global const float* inReal, __global const float* inImag,
     __global float* outReal, __global float* outImag,
-    const float thresholdMagSq, const int n)
+    const int k, const int n)
 {
     int idx = get_global_id(0);
     if (idx >= n) return;
     float re = inReal[idx], im = inImag[idx];
     float magSq = re * re + im * im;
-    outReal[idx] = (magSq >= thresholdMagSq) ? re : 0.0f;
-    outImag[idx] = (magSq >= thresholdMagSq) ? im : 0.0f;
+    bool magIsNan = (as_uint(magSq) & 0x7fffffffu) > 0x7f800000u;
+    int rank = 0;
+    for (int other = 0; other < n; ++other) {
+        float otherRe = inReal[other], otherIm = inImag[other];
+        float otherMagSq = otherRe * otherRe + otherIm * otherIm;
+        bool otherIsNan = (as_uint(otherMagSq) & 0x7fffffffu) > 0x7f800000u;
+        bool otherBefore = magIsNan
+            ? (!otherIsNan || (otherIsNan && other < idx))
+            : (!otherIsNan && (otherMagSq > magSq || (otherMagSq == magSq && other < idx)));
+        rank += otherBefore ? 1 : 0;
+    }
+    bool keep = rank < k;
+    outReal[idx] = keep ? re : 0.0f;
+    outImag[idx] = keep ? im : 0.0f;
 }
 
 __kernel void softmax_rows(
@@ -148,8 +160,7 @@ __kernel void softmax_rows(
 // ─── HRR binding primitives (issue #248) ────────────────────────────
 // Matches CUDA/HIP/Metal/Vulkan/WebGPU — see CudaComplexKernels.cs for
 // the hash rationale (32-bit Murmur3 fmix chosen for WebGPU
-// compatibility; per-backend GPU determinism preserved, CPU
-// xorshift64* path intentionally divergent for single-thread speed).
+// compatibility and shared with the CPU reference).
 inline uint hrr_hash(uint seed_u, uint cell_u)
 {
     uint z = seed_u * 0x9E3779B9u + cell_u * 0x85EBCA6Bu;
@@ -159,11 +170,55 @@ inline uint hrr_hash(uint seed_u, uint cell_u)
     return z;
 }
 
-inline float hrr_phase_from_cell(int seed, long cellIdx)
+inline uint hrr_mul_hi(uint a, uint b)
 {
-    uint z = hrr_hash((uint)seed, (uint)cellIdx);
-    uint top24 = z >> 8;
-    return (float)top24 * (1.0f / 16777216.0f) * 6.28318530717958647692f;
+    uint a0 = a & 0xFFFFu, a1 = a >> 16;
+    uint b0 = b & 0xFFFFu, b1 = b >> 16;
+    uint p0 = a0 * b0, p1 = a1 * b0, p2 = a0 * b1;
+    uint carry = (p0 >> 16) + (p1 & 0xFFFFu) + (p2 & 0xFFFFu);
+    return a1 * b1 + (p1 >> 16) + (p2 >> 16) + (carry >> 16);
+}
+
+inline uint hrr_quantize_turn(uint turn, uint k)
+{
+    uint lattice = hrr_mul_hi(turn, k);
+    if (turn * k >= 0x80000000u) lattice++;
+    if (lattice == k) lattice = 0;
+
+    uint quotient = 0, remainder = lattice;
+    for (int i = 0; i < 32; i++) {
+        remainder <<= 1;
+        quotient <<= 1;
+        if (remainder >= k) { remainder -= k; quotient |= 1u; }
+    }
+    return quotient;
+}
+
+__constant int hrr_cordic_angles[30] = {
+    536870912, 316933406, 167458907, 85004756, 42667331,
+    21354465, 10679838, 5340245, 2670163, 1335087,
+    667544, 333772, 166886, 83443, 41722,
+    20861, 10430, 5215, 2608, 1304,
+    652, 326, 163, 81, 41, 20, 10, 5, 3, 1
+};
+
+inline float2 hrr_sincos(uint turn)
+{
+    uint quadrant = turn >> 30;
+    uint offset = turn & 0x3FFFFFFFu;
+    int z = (int)((quadrant == 1u || quadrant == 3u) ? 0x40000000u - offset : offset);
+    int x = 652032874, y = 0;
+    for (int i = 0; i < 30; i++) {
+        int oldX = x;
+        if (z >= 0) {
+            x -= y >> i; y += oldX >> i; z -= hrr_cordic_angles[i];
+        } else {
+            x += y >> i; y -= oldX >> i; z += hrr_cordic_angles[i];
+        }
+    }
+    if (quadrant == 1u || quadrant == 2u) x = -x;
+    if (quadrant >= 2u) y = -y;
+    return (float2)((float)x, (float)y) * (1.0f / 1073741824.0f);
 }
 
 __kernel void hrr_unit_phase_codebook(
@@ -174,13 +229,11 @@ __kernel void hrr_unit_phase_codebook(
     long idx = get_global_id(0);
     long total = (long)V * D;
     if (idx >= total) return;
-    float phase = hrr_phase_from_cell(seed, idx);
-    if (kPsk != 0) {
-        float step = 6.28318530717958647692f / (float)k;
-        phase = floor(phase / step + 0.5f) * step;
-    }
-    outReal[idx] = cos(phase);
-    outImag[idx] = sin(phase);
+    uint turn = hrr_hash((uint)seed, (uint)idx) & 0xFFFFFF00u;
+    if (kPsk != 0) turn = hrr_quantize_turn(turn, (uint)k);
+    float2 value = hrr_sincos(turn);
+    outReal[idx] = value.x;
+    outImag[idx] = value.y;
 }
 
 // One work-item per V row. Each work-item iterates all D entries of
