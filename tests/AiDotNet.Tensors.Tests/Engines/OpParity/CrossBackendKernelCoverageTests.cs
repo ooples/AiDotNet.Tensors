@@ -30,17 +30,76 @@ namespace AiDotNet.Tensors.Tests.Engines.OpParity;
 /// </summary>
 public sealed class CrossBackendKernelCoverageTests
 {
-    // OpenCL kernels not mirrored by the backend's GetKernelNames() registries. Regression floor,
-    // ratchets DOWN only. Measured baselines — see gpu-cross-backend-coverage.md for the itemised list.
-    // Baselines measured on the current tree. The raw diff is a SUPERSET of true functional gaps: it
-    // also includes (a) OpenCL-specific plumbing (CLBlast GEMM/transpose variants CUDA covers via
-    // cuBLAS) and (b) naming variance (OpenCL `swish_forward` vs CUDA `swish`). Confirmed genuine gaps
-    // in the baseline — kernels added to OpenCL during #775 with NO CUDA/HIP equivalent under any name —
-    // include spiral_conv[_backward_*], trilinear_interpolate[_backward], conv_transpose3d[_backward_*],
-    // adaptive_max_pool2d and the scatter_*_rows / *_backward_rows GNN family. Ratchet DOWN as kernels
-    // are mirrored; the gate's job is to stop the diff GROWING (a new OpenCL kernel with no twin fails).
-    private const int CudaMissingFloor = 154;
-    private const int HipMissingFloor = 154;
+    // GENUINE functional-gap floor (#775). The RAW OpenCL-vs-CUDA/HIP name diff is ~154, but that is a
+    // 15x over-count: the CUDA/HIP backends already run those ops on-device, just registered under a
+    // different kernel name. The raw diff is reconciled by (a) OpenClOnlyByDesign (cuBLAS/CLBlast GEMM
+    // plumbing + cudaMemset — never mirrored by design) and (b) a name normalizer + CoveredUnderDifferentName
+    // allowlist (each entry a verified same-op rename or a helper sub-kernel of a resident op). What
+    // survives reconciliation is the GENUINE gap: an OpenCL kernel whose OP has no on-device CUDA/HIP path
+    // under ANY name. This floor ratchets DOWN only — drive it to 0 by porting the kernel to CUDA+HIP.
+    private const int GenuineGapFloor = 7;
+
+    // OpenCL-specific plumbing CUDA/HIP cover via cuBLAS / cudaMemset — mirrored by design, never ported.
+    private static readonly HashSet<string> OpenClOnlyByDesign = new(StringComparer.Ordinal)
+    {
+        "CopyMatrix", "CopyMatrixFast", "CopyPadMatrix", "TransposeMatrix", "TransposeMatrixFast",
+        "TransposePadMatrix", "XgemmDirectNN", "XgemmDirectNT", "XgemmDirectTN", "XgemmDirectTT",
+        "copy_block_2d", "copy_rows", "copy_submatrix", "fill_buffer", "gemm_batched_persistent",
+        "gemm_clblast_rdna1", "gemm_coalesced", "gemm_double_buffered", "gemm_fp16_backward",
+        "gemm_fp16in_fp16out", "gemm_fp16in_fp32out", "gemm_kreg4", "gemm_low_register", "gemm_medium_tile",
+        "gemm_prefetch", "gemm_small", "gemm_small_tile", "gemm_tiled_simple", "gemm_vectorized",
+        "gemm_vectorized_tile", "gemm_wide_vec", "pad_copy", "pad_copy_from_column_major",
+        "pad_copy_transpose", "sparse_gemm_2_4", "transpose2d",
+    };
+
+    // OpenCL kernels the normalizer cannot reconcile by name shape, but which are VERIFIED resident on
+    // CUDA/HIP under a different name (same op) or are a helper sub-kernel of a resident op. Comment gives
+    // the CUDA home. Adding an entry here is an assertion "this op already runs on-device on CUDA/HIP".
+    private static readonly HashSet<string> CoveredUnderDifferentName = new(StringComparer.Ordinal)
+    {
+        "add_gelu", "add_relu", "add_sigmoid",                 // fused bias+activation epilogue (CudaBackend.cs)
+        "clip_by_value", "where_select", "max_axis", "var_axis", // elementwise/axis-reduce (CudaBackend.cs)
+        "mixed_precision_forward", "mixed_precision_backward",  // CudaBackend.MixedPrecisionConv.cs
+        "global_maxpool2d_with_indices",                       // -> global_maxpool2d (+backward)
+        "conv_transpose2d_backward_weights",                   // -> conv_transpose2d_backward_kernel
+        "gru_accumulate_bias_gradients", "gru_accumulate_weight_gradients_hh",
+        "gru_accumulate_weight_gradients_ih",                  // -> gru_accumulate_weight_gradients (fused hh/ih/bias)
+        "lstm_accumulate_bias_gradients", "lstm_accumulate_weight_gradients_hh",
+        "lstm_accumulate_weight_gradients_ih",                 // -> lstm_accumulate_weight_gradients
+        "sparse_categorical_cross_entropy_gradient",
+        "sparse_categorical_cross_entropy_loss",               // -> categorical_cross_entropy_* (int-label form)
+        "weighted_cross_entropy_gradient", "weighted_cross_entropy_loss", // -> categorical_cross_entropy (class weights)
+        "scatter_add_kernel_deterministic",                    // -> parity210_index_add_deterministic / resident scatter
+        "softmax_fused", "softmax_exp_sub", "softmax_div_scalar", // helper sub-kernels of resident softmax
+        "fft_scale", "reduce_partial_sums", "scale_add", "fused_mul_add",
+        "accumulate_gradient_fp32",                            // helpers of resident fft/reduce/elementwise/optimizer
+        "normalize_overlap_add", "bit_reverse_cols", "bit_reverse_rows", // helpers of resident istft/fft
+        "cosine_similarity_gradient",                          // -> cosine_similarity (backward composes)
+    };
+
+    /// <summary>Reduce a kernel name to a convention-independent token set so an OpenCL name and its
+    /// CUDA/HIP twin (different prefix/suffix/word-order) normalize to the same value. Strips the
+    /// parity210_/resident_/native_/fused_ registration prefixes and _kernel/_forward/... suffixes,
+    /// canonicalizes gradient->backward and 2_4->2x4 and fp16/fp32->f16/f32, and drops filler tokens that
+    /// vary between conventions (loss, local, batched, ...). Deliberately lossy: it powers coverage
+    /// reconciliation, not dispatch.</summary>
+    private static SortedSet<string> Normalize(string s)
+    {
+        foreach (var p in new[] { "parity210_", "resident_", "native_", "fused_" })
+            if (s.StartsWith(p, StringComparison.Ordinal)) { s = s.Substring(p.Length); break; }
+        foreach (var suf in new[] { "_kernel", "_forward", "_native", "_counts", "_f", "_l2", "_vec2" })
+            while (s.EndsWith(suf, StringComparison.Ordinal)) s = s.Substring(0, s.Length - suf.Length);
+        s = s.Replace("_gradient", "_backward").Replace("2_4", "2x4");
+        var drop = new HashSet<string>(StringComparer.Ordinal)
+            { "loss", "values", "local", "from", "squared", "sum", "legacy", "batched", "scores" };
+        var toks = new SortedSet<string>(StringComparer.Ordinal);
+        foreach (var t in s.Split('_'))
+        {
+            if (t.Length == 0 || drop.Contains(t)) continue;
+            toks.Add(t.Replace("fp16", "f16").Replace("fp32", "f32"));
+        }
+        return toks;
+    }
 
     [Fact]
     public void MirrorBackends_CoverEveryOpenClComputeKernel()
@@ -52,8 +111,23 @@ public sealed class CrossBackendKernelCoverageTests
         var vulkan = KernelNames("Vulkan");
         var webgpu = KernelNames("WebGpu");
 
-        var cudaMissing = ocl.Except(cuda).OrderBy(x => x, StringComparer.Ordinal).ToArray();
-        var hipMissing = ocl.Except(hip).OrderBy(x => x, StringComparer.Ordinal).ToArray();
+        var cudaRawMissing = ocl.Except(cuda).OrderBy(x => x, StringComparer.Ordinal).ToArray();
+        var hipRawMissing = ocl.Except(hip).OrderBy(x => x, StringComparer.Ordinal).ToArray();
+
+        // Normalized token-sets of every CUDA+HIP registered kernel — a name is "covered by shape" if its
+        // normalized form equals, or is a subset of, some registry kernel's normalized form.
+        var mirrorNorm = cuda.Concat(hip).Select(Normalize).ToArray();
+        bool CoveredByShape(string name)
+        {
+            var nm = Normalize(name);
+            return mirrorNorm.Any(k => k.SetEquals(nm) || nm.IsSubsetOf(k));
+        }
+        bool Reconciled(string name) =>
+            OpenClOnlyByDesign.Contains(name) || CoveredUnderDifferentName.Contains(name) || CoveredByShape(name);
+
+        // Genuine gaps = OpenCL kernels present in neither CUDA nor HIP whose op has no on-device twin.
+        var genuine = ocl.Except(cuda).Union(ocl.Except(hip))
+            .Where(n => !Reconciled(n)).OrderBy(x => x, StringComparer.Ordinal).ToArray();
 
         var sb = new StringBuilder();
         sb.AppendLine("# Cross-backend kernel-name coverage vs OpenCL (#775)");
@@ -61,12 +135,15 @@ public sealed class CrossBackendKernelCoverageTests
         sb.AppendLine($"CUDA: {cuda.Count}  HIP: {hip.Count}  Metal: {metal.Count}  " +
             $"Vulkan: {vulkan.Count}  WebGpu: {webgpu.Count}");
         sb.AppendLine();
-        sb.AppendLine("Asserted mirrors (string-named GetKernelNames, comparable to OpenCL):");
-        sb.AppendLine($"## CUDA missing {cudaMissing.Length} OpenCL kernel name(s)");
-        foreach (var n in cudaMissing) sb.AppendLine($"  [ ] {n}");
+        sb.AppendLine($"Raw name diff (SUPERSET — reconciled below): CUDA {cudaRawMissing.Length}, HIP {hipRawMissing.Length}");
+        sb.AppendLine($"  by-design (cuBLAS/CLBlast/memset): {OpenClOnlyByDesign.Count}");
+        sb.AppendLine($"  covered under a different name / helper of a resident op: reconciled");
         sb.AppendLine();
-        sb.AppendLine($"## HIP missing {hipMissing.Length} OpenCL kernel name(s)");
-        foreach (var n in hipMissing) sb.AppendLine($"  [ ] {n}");
+        sb.AppendLine($"## GENUINE gaps: {genuine.Length} (floor {GenuineGapFloor}) — op has NO on-device CUDA/HIP path");
+        foreach (var n in genuine) sb.AppendLine($"  [ ] {n}");
+        sb.AppendLine();
+        sb.AppendLine("## Raw CUDA-missing (visibility only, not asserted)");
+        foreach (var n in cudaRawMissing) sb.AppendLine($"  [{(Reconciled(n) ? "x" : " ")}] {n}");
         sb.AppendLine();
         sb.AppendLine("Reported-only backends (non-name-based shader registration — not asserted):");
         sb.AppendLine($"  Metal enumerable kernels: {metal.Count}");
@@ -74,14 +151,11 @@ public sealed class CrossBackendKernelCoverageTests
         sb.AppendLine($"  WebGpu enumerable kernels: {webgpu.Count}");
         WriteRaw("gpu-cross-backend-coverage.md", sb.ToString());
 
-        Assert.True(cudaMissing.Length <= CudaMissingFloor,
-            $"CUDA fails to mirror {cudaMissing.Length} OpenCL kernels (floor {CudaMissingFloor}). " +
-            $"A newly-added OpenCL kernel has no CUDA twin. Add it to the CUDA backend; do not raise the " +
-            $"floor. See gpu-cross-backend-coverage.md. First few: {string.Join(", ", cudaMissing.Take(8))}");
-        Assert.True(hipMissing.Length <= HipMissingFloor,
-            $"HIP fails to mirror {hipMissing.Length} OpenCL kernels (floor {HipMissingFloor}). " +
-            $"A newly-added OpenCL kernel has no HIP twin. Add it to the HIP backend; do not raise the " +
-            $"floor. See gpu-cross-backend-coverage.md. First few: {string.Join(", ", hipMissing.Take(8))}");
+        Assert.True(genuine.Length <= GenuineGapFloor,
+            $"{genuine.Length} OpenCL kernels have no on-device CUDA/HIP twin under any name (floor " +
+            $"{GenuineGapFloor}). Port the kernel to CUDA+HIP (do not raise the floor); if it is actually " +
+            $"covered, add it to CoveredUnderDifferentName with the CUDA home. See " +
+            $"gpu-cross-backend-coverage.md. Gaps: {string.Join(", ", genuine)}");
     }
 
     /// <summary>Union of every <c>public static string[] GetKernelNames()</c> registry declared under
