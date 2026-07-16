@@ -30,7 +30,7 @@ A high-performance .NET tensor library with hand-written AVX2/AVX-512 SIMD kerne
 - **Hand-Tuned SIMD**: Custom AVX2/FMA kernels with 4x loop unrolling, not just `Vector<T>` wrappers
 - **JIT-Compiled Kernels**: Runtime x86-64 machine code generation for size-specialized operations
 - **BLIS-Style GEMM**: Tiled matrix multiply with FMA micro-kernel, cache-aware panel packing
-- **GPU Acceleration**: Optional CUDA, HIP/ROCm, and OpenCL support via separate packages
+- **GPU Acceleration**: Optional CUDA, HIP/ROCm, OpenCL, Metal, Vulkan, and WebGPU support via separate packages, with CPU-vs-GPU op-parity validated across every backend (#775)
 - **Multi-Target**: Supports .NET 10.0 and .NET Framework 4.7.1
 - **Generic Math**: Works with any numeric type via `INumericOperations<T>` interface
 
