@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.115.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.114.5...v0.115.0) (2026-07-16)
+
+
+### Features
+
+* **gpu:** cross-backend CPU/GPU op-parity + full residency ([#775](https://github.com/ooples/AiDotNet.Tensors/issues/775)) ([#790](https://github.com/ooples/AiDotNet.Tensors/issues/790)) ([106bbca](https://github.com/ooples/AiDotNet.Tensors/commit/106bbca0ff1213c503b5b83520a8b18c959088c4))
+
 ## [0.114.5](https://github.com/ooples/AiDotNet.Tensors/compare/v0.114.4...v0.114.5) (2026-07-15)
 
 
