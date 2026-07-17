@@ -336,6 +336,7 @@ public sealed partial class WebGpuBackend
     {
         GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmInt));
         GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmInt));
+        GpuKernelGuards.Capacity(weightsInt, (long)K * N, nameof(weightsInt), nameof(DequantGemmInt));
         GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmInt));
         var output = AllocateBuffer(M * N);
         Dispatch4BufferAsync("DequantGemmInt", WebGpuKernels.DequantGemmIntSource, "dequant_gemm_int",
@@ -354,6 +355,7 @@ public sealed partial class WebGpuBackend
     {
         GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmFp8E4M3));
         GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmFp8E4M3));
+        GpuKernelGuards.Capacity(weightsFp8Raw, (long)K * N, nameof(weightsFp8Raw), nameof(DequantGemmFp8E4M3));
         GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmFp8E4M3));
         var output = AllocateBuffer(M * N);
         Dispatch4BufferAsync("DequantGemmFp8", WebGpuKernels.DequantGemmFp8Source, "dequant_gemm_fp8",
