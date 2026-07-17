@@ -318,6 +318,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 }
                 WriteDiag($"[OpenClBackend] GEMM kernels: {string.Join(", ", GemmKernel.GetKernelNames())}");
 
+                // Paged attention (P1). SafeMathFlags: the kernel relies on INFINITY / exp semantics
+                // that -cl-finite-math-only would optimize away.
+                var pagedAttnProgram = CompileOrLoadCached(PagedAttentionKernels.GetSource(), OpenClBuildOptions.SafeMathFlags, "Paged attention kernels");
+                _programs.Add(pagedAttnProgram);
+                foreach (var name in PagedAttentionKernels.GetKernelNames())
+                {
+                    _kernelCache[name] = new DirectOpenClKernel(_context, pagedAttnProgram, name);
+                }
+                WriteDiag($"[OpenClBackend] Paged attention kernels: {string.Join(", ", PagedAttentionKernels.GetKernelNames())}");
+
                 // Compile activation kernels with NaN-preserving math flags: the
                 // relu kernel propagates NaN by contract, which -cl-finite-math-only
                 // / -cl-fast-relaxed-math would optimize away (the compiler assumes
@@ -2623,6 +2633,43 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             {
                 output?.Dispose();
                 temp?.Dispose();
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Paged-attention decode for a single query token (P1): out[heads*headDim] =
+        /// softmax(scale · Q·K) · V over the sequence, reading K/V from the physical block pool
+        /// (layout [maxBlocks, blockSize, heads, headDim]) via <paramref name="blockTable"/> (an int
+        /// buffer of physical block ids). headDim &lt;= 256. Matches a standard-attention CPU oracle.
+        /// </summary>
+        public IGpuBuffer PagedAttentionDecode(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+            int heads, int headDim, int blockSize, int seqLen, float scale)
+        {
+            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            var output = AllocateBuffer(heads * headDim);
+            try
+            {
+                var kernel = _kernelCache["paged_attention_decode"];
+                kernel.SetArg(0, ((DirectOpenClGpuBuffer)q).Buffer.Handle);
+                kernel.SetArg(1, ((DirectOpenClGpuBuffer)kcache).Buffer.Handle);
+                kernel.SetArg(2, ((DirectOpenClGpuBuffer)vcache).Buffer.Handle);
+                kernel.SetArg(3, ((DirectOpenClGpuBuffer)blockTable).Buffer.Handle);
+                kernel.SetArg(4, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+                kernel.SetArg(5, heads);
+                kernel.SetArg(6, headDim);
+                kernel.SetArg(7, blockSize);
+                kernel.SetArg(8, seqLen);
+                kernel.SetArg(9, scale);
+                int local = CalculateOptimalWorkGroupSize1D(heads);
+                int global = ((heads + local - 1) / local) * local;
+                kernel.Execute1D(global, local);
+                _context.Finish();
+                return output;
+            }
+            catch
+            {
+                output.Dispose();
                 throw;
             }
         }

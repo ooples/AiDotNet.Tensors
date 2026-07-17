@@ -1,0 +1,67 @@
+// Copyright (c) AiDotNet. All rights reserved.
+// GPU paged-attention kernels (P1): attention that gathers K/V through a block table (vLLM-style),
+// so the KV cache need not be contiguous. Works on ALL .NET versions incl. .NET Framework 4.6.2.
+
+namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels
+{
+    /// <summary>
+    /// Paged-attention decode kernel. K/V live in a physical block pool laid out as
+    /// <c>[maxBlocks, blockSize, heads, headDim]</c> (matching the CPU <c>PagedKVCache</c>); a per-sequence
+    /// block table maps logical block index -&gt; physical block id. For a single query token this computes
+    /// <c>out[h] = softmax(scale · Q[h]·K[.,h]) · V[.,h]</c> over the sequence, reading K/V via the block
+    /// table — the core mechanism that lets vLLM pack many sequences without KV fragmentation.
+    /// </summary>
+    /// <remarks>
+    /// Online-softmax (FlashAttention-style) single pass; one work-item per head; correctness-first
+    /// baseline (headDim ≤ 256). Validated against a CPU attention oracle on the materialized K/V.
+    /// </remarks>
+    internal static class PagedAttentionKernels
+    {
+        public static string[] GetKernelNames() => new[] { "paged_attention_decode" };
+
+        public static string GetSource()
+        {
+            return @"
+#define PA_MAX_HEAD_DIM 256
+// Single-query paged attention. Block pool: [maxBlocks, blockSize, heads, headDim].
+__kernel void paged_attention_decode(
+    __global const float* q,          // [heads*headDim]
+    __global const float* kcache,     // [maxBlocks*blockSize*heads*headDim]
+    __global const float* vcache,     // same layout as kcache
+    __global const int*   blockTable, // [ceil(seqLen/blockSize)] physical block ids
+    __global float*       outbuf,     // [heads*headDim]
+    const int heads, const int headDim, const int blockSize, const int seqLen, const float scale)
+{
+    int h = get_global_id(0);
+    if (h >= heads) return;
+
+    float acc[PA_MAX_HEAD_DIM];
+    for (int d = 0; d < headDim; ++d) acc[d] = 0.0f;
+
+    float m = -INFINITY;   // running max logit
+    float l = 0.0f;        // running softmax denominator
+
+    for (int t = 0; t < seqLen; ++t) {
+        int blk = blockTable[t / blockSize];
+        int pos = t % blockSize;
+        long base = (((long)blk * blockSize + pos) * heads + h) * headDim;
+
+        float dot = 0.0f;
+        for (int d = 0; d < headDim; ++d) dot += q[h * headDim + d] * kcache[base + d];
+        float logit = dot * scale;
+
+        float new_m = fmax(m, logit);
+        float corr = exp(m - new_m);
+        float p = exp(logit - new_m);
+        l = l * corr + p;
+        for (int d = 0; d < headDim; ++d) acc[d] = acc[d] * corr + p * vcache[base + d];
+        m = new_m;
+    }
+
+    float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    for (int d = 0; d < headDim; ++d) outbuf[h * headDim + d] = acc[d] * inv;
+}
+";
+        }
+    }
+}
