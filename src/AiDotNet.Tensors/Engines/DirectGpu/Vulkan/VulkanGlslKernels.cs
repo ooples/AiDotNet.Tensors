@@ -2736,6 +2736,24 @@ layout(set = 0, binding = 3) writeonly buffer Output { float outp[]; };
 layout(push_constant) uniform Params { uint batchSize; uint inFeatures; uint outFeatures; };
 ";
 
+    // Weight-only fused dequant-GEMM (P0). bindings: 0=act(float) 1=w(int) 2=scales(float) 3=out(float).
+    // Contract matches FusedDequantMatmulKernels: C[M,N]=act[M,K].dequant(W[K,N]); symmetric scales,
+    // per-tensor (scaleCount==1) or per-group over flat k*N. Integer weights are pre-decoded values
+    // (int8, or unpacked int4); fp8 uses the raw e4m3 byte + in-shader decode.
+    private const string DequantGemmLayout = @"
+layout(set = 0, binding = 0) readonly buffer A { float act[]; };
+layout(set = 0, binding = 1) readonly buffer W { int w[]; };
+layout(set = 0, binding = 2) readonly buffer S { float scales[]; };
+layout(set = 0, binding = 3) writeonly buffer O { float outp[]; };
+layout(push_constant) uniform P { uint M; uint K; uint N; uint groupSize; uint scaleCount; };
+";
+
+    /// <summary>Integer weight-only dequant-GEMM (int8 / unpacked int4).</summary>
+    public static string DequantGemmInt => Header + DequantGemmLayout + @"void main(){ uint idx=gl_GlobalInvocationID.x; if(idx>=M*N) return; uint i=idx/N, j=idx%N; float acc=0.0; if(scaleCount==1u){ float s=scales[0]; for(uint k=0u;k<K;k++) acc+=act[i*K+k]*float(w[k*N+j]); acc*=s; } else { for(uint k=0u;k<K;k++){ uint flat=k*N+j; acc+=act[i*K+k]*float(w[flat])*scales[flat/groupSize]; } } outp[idx]=acc; }";
+
+    /// <summary>FP8 E4M3 weight-only dequant-GEMM (in-shader decode matching Float8E4M3.ToFloat).</summary>
+    public static string DequantGemmFp8E4M3 => Header + DequantGemmLayout + @"float decode_e4m3(uint raw){ uint r=raw&0xFFu; if((r&0x7Fu)==0x7Fu) return uintBitsToFloat(0x7FC00000u); if((r&0x7Fu)==0u) return 0.0; uint sign=(r&0x80u)>>7u; uint exp4=(r&0x78u)>>3u; uint m3=(r&0x07u); int exp32=int(exp4)-7+127; uint bits=(sign<<31u)|(uint(exp32 & 0xFF)<<23u)|(m3<<20u); return uintBitsToFloat(bits);} void main(){ uint idx=gl_GlobalInvocationID.x; if(idx>=M*N) return; uint i=idx/N, j=idx%N; float acc=0.0; if(scaleCount==1u){ float s=scales[0]; for(uint k=0u;k<K;k++) acc+=act[i*K+k]*decode_e4m3(uint(w[k*N+j])); acc*=s; } else { for(uint k=0u;k<K;k++){ uint flat=k*N+j; acc+=act[i*K+k]*decode_e4m3(uint(w[flat]))*scales[flat/groupSize]; } } outp[idx]=acc; }";
+
     public static string FusedLinearReLU => Header + FusedLinearLayout + @"void main() { uint idx=gl_GlobalInvocationID.x; if(idx>=batchSize*outFeatures)return; uint b=idx/outFeatures,j=idx%outFeatures; float sum=bias[j]; for(uint k=0;k<inFeatures;k++)sum+=inp[b*inFeatures+k]*wt[k*outFeatures+j]; outp[idx]=max(sum,0.0); }";
     public static string FusedLinearSigmoid => Header + FusedLinearLayout + @"void main() { uint idx=gl_GlobalInvocationID.x; if(idx>=batchSize*outFeatures)return; uint b=idx/outFeatures,j=idx%outFeatures; float sum=bias[j]; for(uint k=0;k<inFeatures;k++)sum+=inp[b*inFeatures+k]*wt[k*outFeatures+j]; outp[idx]=1.0/(1.0+exp(-sum)); }";
     public static string FusedLinearTanh => Header + FusedLinearLayout + @"void main() { uint idx=gl_GlobalInvocationID.x; if(idx>=batchSize*outFeatures)return; uint b=idx/outFeatures,j=idx%outFeatures; float sum=bias[j]; for(uint k=0;k<inFeatures;k++)sum+=inp[b*inFeatures+k]*wt[k*outFeatures+j]; outp[idx]=tanh(sum); }";

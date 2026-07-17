@@ -557,6 +557,39 @@ public sealed unsafe partial class VulkanBackend
         return result;
     }
 
+    /// <summary>
+    /// Weight-only fused dequant-GEMM for integer weights (int8 or unpacked int4): C[M,N] =
+    /// act[M,K] · (scale · W[K,N]). Symmetric scales (per-tensor when scaleCount == 1, else per-group
+    /// over the flattened K*N buffer), matching FusedDequantMatmulKernels Q8/Q4. <paramref name="weightsInt"/>
+    /// is a Vulkan int buffer (AllocateIntBuffer) of the decoded integer weight values.
+    /// </summary>
+    public IGpuBuffer DequantGemmInt(IGpuBuffer activations, IGpuBuffer weightsInt, IGpuBuffer scales,
+        int M, int K, int N, int groupSize, int scaleCount)
+    {
+        EnsureInitialized();
+        if (M <= 0 || N <= 0 || K <= 0) throw new ArgumentOutOfRangeException(nameof(M));
+        var result = AllocateBuffer(M * N);
+        var pc = new uint[] { (uint)M, (uint)K, (uint)N, (uint)groupSize, (uint)scaleCount };
+        GlslQuadOp(VulkanGlslKernels.DequantGemmInt, activations, weightsInt, scales, result, M * N, pc, (uint)(pc.Length * sizeof(uint)));
+        return result;
+    }
+
+    /// <summary>
+    /// Weight-only fused dequant-GEMM for OCP FP8 E4M3 weights: C[M,N] = act[M,K] ·
+    /// (scale · decode_e4m3(W[K,N])). <paramref name="weightsFp8Raw"/> is a Vulkan int buffer
+    /// (AllocateIntBuffer) holding the raw fp8 e4m3 bytes (0..255); decode matches Float8E4M3.ToFloat.
+    /// </summary>
+    public IGpuBuffer DequantGemmFp8E4M3(IGpuBuffer activations, IGpuBuffer weightsFp8Raw, IGpuBuffer scales,
+        int M, int K, int N, int groupSize, int scaleCount)
+    {
+        EnsureInitialized();
+        if (M <= 0 || N <= 0 || K <= 0) throw new ArgumentOutOfRangeException(nameof(M));
+        var result = AllocateBuffer(M * N);
+        var pc = new uint[] { (uint)M, (uint)K, (uint)N, (uint)groupSize, (uint)scaleCount };
+        GlslQuadOp(VulkanGlslKernels.DequantGemmFp8E4M3, activations, weightsFp8Raw, scales, result, M * N, pc, (uint)(pc.Length * sizeof(uint)));
+        return result;
+    }
+
     public IGpuBuffer GemmBiasRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
         => GemmBiasActivation(A, B, bias, M, N, K, VulkanGlslKernels.FusedLinearReLU);
 
