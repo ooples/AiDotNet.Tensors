@@ -19,7 +19,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels
     /// </remarks>
     internal static class QuantGemmKernels
     {
-        public static string[] GetKernelNames() => new[] { "dequant_gemm_int8", "dequant_gemm_int4" };
+        public static string[] GetKernelNames() => new[] { "dequant_gemm_int8", "dequant_gemm_int4", "dequant_gemm_fp8_e4m3" };
 
         public static string GetSource()
         {
@@ -95,6 +95,52 @@ __kernel void dequant_gemm_int4(
             const int val = (nib & 0x07) - (nib & 0x08);
             const float s = scales[flat / groupSize];
             acc += act[actRow + k] * (float)val * s;
+        }
+    }
+
+    outbuf[i * N + j] = acc;
+}
+
+// Decode one OCP FP8 E4M3 byte to float, bit-for-bit matching Float8E4M3.ToFloat()
+// (1 sign, 4 exp bias-7, 3 mantissa; 0x7F/0xFF = NaN; no Inf).
+inline float decode_e4m3(uchar raw) {
+    if ((raw & 0x7F) == 0x7F) return NAN;
+    if ((raw & 0x7F) == 0)    return (raw & 0x80) ? -0.0f : 0.0f;
+    uint sign  = (uint)((raw & 0x80) >> 7);
+    uint exp4  = (uint)((raw & 0x78) >> 3);
+    uint m3    = (uint)(raw & 0x07);
+    int  exp32 = (int)exp4 - 7 + 127;
+    uint bits  = (sign << 31) | (((uint)(exp32 & 0xFF)) << 23) | (m3 << 20);
+    return as_float(bits);
+}
+
+// fp8 (E4M3) weight-only variant: C[M,N] = act[M,K] . (scale * decode_e4m3(W[K,N])).
+// Symmetric scales; per-tensor (scaleCount==1) or per-group over flat k*N.
+__kernel void dequant_gemm_fp8_e4m3(
+    __global const float* act,     // [M*K]
+    __global const uchar* w,       // [K*N] fp8 e4m3 bytes
+    __global const float* scales,  // [scaleCount]
+    __global float*       outbuf,  // [M*N]
+    const int M, const int K, const int N,
+    const int groupSize, const int scaleCount)
+{
+    const int i = get_global_id(0);
+    const int j = get_global_id(1);
+    if (i >= M || j >= N) return;
+
+    const int actRow = i * K;
+    float acc = 0.0f;
+
+    if (scaleCount == 1) {
+        const float s = scales[0];
+        for (int k = 0; k < K; ++k)
+            acc += act[actRow + k] * decode_e4m3(w[k * N + j]);
+        acc *= s;
+    } else {
+        for (int k = 0; k < K; ++k) {
+            const int flat = k * N + j;
+            const float s = scales[flat / groupSize];
+            acc += act[actRow + k] * decode_e4m3(w[flat]) * s;
         }
     }
 

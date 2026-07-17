@@ -2722,6 +2722,48 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             }
         }
 
+        /// <summary>
+        /// Weight-only fused dequant-GEMM for OCP FP8 E4M3 weights: <c>C[M,N] = act[M,K] ·
+        /// (scale · decode_e4m3(W[K,N]))</c>. <paramref name="weightsFp8"/> is a byte buffer of the
+        /// raw fp8 e4m3 bytes (matching <c>Float8E4M3.RawValue</c> / decode via <c>ToFloat</c>);
+        /// symmetric scales (per-tensor when <paramref name="scaleCount"/> == 1, else per-group over
+        /// the flattened K*N buffer).
+        /// </summary>
+        public IGpuBuffer DequantGemmFp8E4M3(
+            IGpuBuffer activations, IGpuBuffer weightsFp8, IGpuBuffer scales,
+            int M, int K, int N, int groupSize, int scaleCount)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context not available");
+
+            var output = AllocateBuffer(M * N);
+            try
+            {
+                var kernel = _kernelCache["dequant_gemm_fp8_e4m3"];
+                kernel.SetArg(0, ((DirectOpenClGpuBuffer)activations).Buffer.Handle);
+                kernel.SetArg(1, ((DirectOpenClGpuByteBuffer)weightsFp8).Buffer.Handle);
+                kernel.SetArg(2, ((DirectOpenClGpuBuffer)scales).Buffer.Handle);
+                kernel.SetArg(3, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+                kernel.SetArg(4, M);
+                kernel.SetArg(5, K);
+                kernel.SetArg(6, N);
+                kernel.SetArg(7, groupSize);
+                kernel.SetArg(8, scaleCount);
+
+                var (localX, localY) = CalculateOptimalWorkGroupSize(M, N);
+                int globalX = ((M + localX - 1) / localX) * localX;
+                int globalY = ((N + localY - 1) / localY) * localY;
+                kernel.Execute2D(globalX, globalY, localX, localY);
+                _context.Finish();
+                return output;
+            }
+            catch
+            {
+                output.Dispose();
+                throw;
+            }
+        }
+
         public IGpuBuffer GemmBiasSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
         {
             IGpuBuffer? temp = null;

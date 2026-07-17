@@ -7,6 +7,7 @@
 
 using System;
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
+using AiDotNet.Tensors.NumericOperations;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -213,6 +214,97 @@ public sealed class QuantGemmOpenClTests : IDisposable
             float tol = 1e-2f + 1e-3f * Math.Abs(e);
             Assert.True(Math.Abs(e - a) <= tol,
                 $"int4 mismatch at {idx}: expected {e}, got {a} (tol {tol}, groupSize {groupSize})");
+        }
+    }
+
+    [Theory]
+    [InlineData(0)]    // per-tensor (scaleCount == 1)
+    [InlineData(64)]   // per-group over flattened K*N
+    [InlineData(128)]  // per-group, different group size
+    public void DequantGemmFp8E4M3_MatchesCpuOracle(int groupSize)
+    {
+        if (!EnsureReady()) return;
+        var backend = _backend!;
+
+        const int M = 8, K = 128, N = 64;
+        const int kn = K * N;
+        var rng = new Random(0xF8F8);
+
+        var act = new float[M * K];
+        for (int i = 0; i < act.Length; i++) act[i] = (float)(rng.NextDouble() * 2.0 - 1.0);
+
+        // fp8 e4m3 weights: raw bytes for the GPU, decoded floats (Float8E4M3.ToFloat) for the reference.
+        var raws = new byte[kn];
+        var decoded = new float[kn];
+        for (int i = 0; i < kn; i++)
+        {
+            var f8 = Float8E4M3.FromFloat((float)(rng.NextDouble() * 8.0 - 4.0)); // within E4M3 finite range
+            raws[i] = f8.RawValue;
+            decoded[i] = f8.ToFloat();
+        }
+
+        bool perTensor = groupSize <= 0;
+        int scaleCount;
+        float[] scales;
+        int gsArg;
+        if (perTensor)
+        {
+            scaleCount = 1;
+            scales = new[] { 0.05f };
+            gsArg = kn;
+        }
+        else
+        {
+            int totalGroups = (kn + groupSize - 1) / groupSize;
+            scaleCount = totalGroups;
+            scales = new float[totalGroups];
+            for (int g = 0; g < totalGroups; g++) scales[g] = 0.01f + (float)(rng.NextDouble() * 0.05);
+            gsArg = groupSize;
+        }
+
+        // Reference: C[i,j] = sum_k act[i,k] * decoded[k*N+j] * scale(flat).
+        var expected = new float[M * N];
+        for (int i = 0; i < M; i++)
+            for (int j = 0; j < N; j++)
+            {
+                float acc = 0f;
+                if (perTensor)
+                {
+                    for (int k = 0; k < K; k++) acc += act[i * K + k] * decoded[k * N + j];
+                    acc *= scales[0];
+                }
+                else
+                {
+                    for (int k = 0; k < K; k++)
+                    {
+                        int flat = k * N + j;
+                        acc += act[i * K + k] * decoded[flat] * scales[flat / gsArg];
+                    }
+                }
+                expected[i * N + j] = acc;
+            }
+
+        var actBuf = backend.AllocateBuffer(act);
+        var scaleBuf = backend.AllocateBuffer(scales);
+        var wBuf = backend.AllocateByteBuffer(kn);
+        backend.UploadByteBuffer(wBuf, raws);
+
+        var outBuf = backend.DequantGemmFp8E4M3(actBuf, wBuf, scaleBuf, M, K, N, gsArg, scaleCount);
+        var actual = backend.DownloadBuffer(outBuf);
+
+        actBuf.Dispose();
+        scaleBuf.Dispose();
+        wBuf.Dispose();
+        outBuf.Dispose();
+
+        Assert.Equal(M * N, actual.Length);
+        for (int idx = 0; idx < expected.Length; idx++)
+        {
+            float e = expected[idx];
+            float a = actual[idx];
+            float tol = 1e-2f + 1e-3f * Math.Abs(e);
+            Assert.True(Math.Abs(e - a) <= tol,
+                $"fp8 mismatch at {idx}: expected {e}, got {a} (tol {tol}, groupSize {groupSize})");
         }
     }
 }
