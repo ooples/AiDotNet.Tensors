@@ -65,9 +65,6 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     private IntPtr _poolingModule;
     private IntPtr _normalizationModule;
     private IntPtr _fusedModule;
-    private IntPtr _quantGemmModule; // P0: weight-only fused dequant-GEMM (int8/int4/fp8)
-    private IntPtr _pagedAttnModule; // P1: paged-attention decode
-    private IntPtr _flashDecodeModule; // P2: fused decode attention (FlashDecoding)
     private IntPtr _attentionModule;
     private IntPtr _fftModule;
     private IntPtr _spectralPerfModule;
@@ -497,15 +494,6 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             CompileKernelModule(HipFusedKernels.GetSource(), "fused", ref _fusedModule,
                 HipFusedKernels.GetKernelNames());
 
-            CompileKernelModule(Kernels.HipQuantGemmKernels.GetSource(), "quant_gemm", ref _quantGemmModule,
-                Kernels.HipQuantGemmKernels.GetKernelNames());
-
-            CompileKernelModule(Kernels.HipPagedAttentionKernels.GetSource(), "paged_attention", ref _pagedAttnModule,
-                Kernels.HipPagedAttentionKernels.GetKernelNames());
-
-            CompileKernelModule(Kernels.HipFlashDecodeKernels.GetSource(), "flash_decode", ref _flashDecodeModule,
-                Kernels.HipFlashDecodeKernels.GetKernelNames());
-
             // Compile Attention kernels (FlashAttention, GQA, ScaledDotProduct)
             CompileKernelModule(HipAttentionKernels.GetSource(), "attention", ref _attentionModule,
                 HipAttentionKernels.GetKernelNames());
@@ -814,187 +802,6 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             kernel, gridX, 1, 1, blockSize, 1, 1,
             sharedMem, _stream, (IntPtr)args, IntPtr.Zero);
         HipNativeBindings.CheckError(result, "hipModuleLaunchKernel");
-    }
-
-    /// <summary>Paged-attention decode (P1): out[heads*headDim] = softmax(scale·Q·K)·V over the
-    /// sequence, reading K/V from the physical block pool [maxBlocks, blockSize, heads, headDim] via
-    /// <paramref name="blockTable"/> (an int buffer of physical block ids). headDim &lt;= 256.
-    /// Matches a standard-attention CPU oracle.</summary>
-    public unsafe IGpuBuffer PagedAttentionDecode(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
-        int heads, int headDim, int blockSize, int seqLen, float scale)
-    {
-        GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecode));
-        if (!_kernelCache.TryGetValue("paged_attention_decode", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: paged_attention_decode");
-        var output = AllocateBuffer(heads * headDim);
-        uint grid = (uint)(((long)heads + DefaultBlockSize - 1) / DefaultBlockSize);
-        IntPtr qPtr = q.Handle, kPtr = kcache.Handle, vPtr = vcache.Handle, btPtr = blockTable.Handle, oPtr = output.Handle;
-        int hh = heads, hd = headDim, bs = blockSize, sl = seqLen; float sc = scale;
-        void** args = stackalloc void*[10];
-        args[0] = &qPtr; args[1] = &kPtr; args[2] = &vPtr; args[3] = &btPtr; args[4] = &oPtr;
-        args[5] = &hh; args[6] = &hd; args[7] = &bs; args[8] = &sl; args[9] = &sc;
-        LaunchKernel(kernel, grid, (uint)DefaultBlockSize, args);
-        return output;
-    }
-
-    /// <summary>Prefill / multi-query paged attention (P1, causal): out[numQueries,heads,headDim];
-    /// query qi (logical position startPos+qi) attends to key positions 0..(startPos+qi). headDim &lt;= 256.</summary>
-    public unsafe IGpuBuffer PagedAttentionPrefill(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
-        int heads, int headDim, int blockSize, int numQueries, int startPos, float scale)
-    {
-        GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefill));
-        if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
-        if (!_kernelCache.TryGetValue("paged_attention_prefill", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: paged_attention_prefill");
-        var output = AllocateBuffer(numQueries * heads * headDim);
-        int totalItems = numQueries * heads;
-        uint grid = (uint)(((long)totalItems + DefaultBlockSize - 1) / DefaultBlockSize);
-        IntPtr qPtr = q.Handle, kPtr = kcache.Handle, vPtr = vcache.Handle, btPtr = blockTable.Handle, oPtr = output.Handle;
-        int hh = heads, hd = headDim, bs = blockSize, nq = numQueries, sp = startPos; float sc = scale;
-        void** args = stackalloc void*[11];
-        args[0] = &qPtr; args[1] = &kPtr; args[2] = &vPtr; args[3] = &btPtr; args[4] = &oPtr;
-        args[5] = &hh; args[6] = &hd; args[7] = &bs; args[8] = &nq; args[9] = &sp; args[10] = &sc;
-        LaunchKernel(kernel, grid, (uint)DefaultBlockSize, args);
-        return output;
-    }
-
-    /// <summary>GQA decode (P1): like <see cref="PagedAttentionDecode"/> but query head h shares KV head
-    /// h/(heads/kvHeads); K/V pool is [maxBlocks, blockSize, kvHeads, headDim]. headDim &lt;= 256.</summary>
-    public unsafe IGpuBuffer PagedAttentionDecodeGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
-        int heads, int kvHeads, int headDim, int blockSize, int seqLen, float scale)
-    {
-        GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecodeGqa));
-        GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionDecodeGqa));
-        if (!_kernelCache.TryGetValue("paged_attention_decode_gqa", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: paged_attention_decode_gqa");
-        var output = AllocateBuffer(heads * headDim);
-        uint grid = (uint)(((long)heads + DefaultBlockSize - 1) / DefaultBlockSize);
-        IntPtr qPtr = q.Handle, kPtr = kcache.Handle, vPtr = vcache.Handle, btPtr = blockTable.Handle, oPtr = output.Handle;
-        int hh = heads, kv = kvHeads, hd = headDim, bs = blockSize, sl = seqLen; float sc = scale;
-        void** args = stackalloc void*[11];
-        args[0] = &qPtr; args[1] = &kPtr; args[2] = &vPtr; args[3] = &btPtr; args[4] = &oPtr;
-        args[5] = &hh; args[6] = &kv; args[7] = &hd; args[8] = &bs; args[9] = &sl; args[10] = &sc;
-        LaunchKernel(kernel, grid, (uint)DefaultBlockSize, args);
-        return output;
-    }
-
-    /// <summary>GQA prefill (P1, causal): like <see cref="PagedAttentionPrefill"/> but query head h shares
-    /// KV head h/(heads/kvHeads); K/V pool is [maxBlocks, blockSize, kvHeads, headDim]. headDim &lt;= 256.</summary>
-    public unsafe IGpuBuffer PagedAttentionPrefillGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
-        int heads, int kvHeads, int headDim, int blockSize, int numQueries, int startPos, float scale)
-    {
-        GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefillGqa));
-        GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionPrefillGqa));
-        if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
-        if (!_kernelCache.TryGetValue("paged_attention_prefill_gqa", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: paged_attention_prefill_gqa");
-        var output = AllocateBuffer(numQueries * heads * headDim);
-        int totalItems = numQueries * heads;
-        uint grid = (uint)(((long)totalItems + DefaultBlockSize - 1) / DefaultBlockSize);
-        IntPtr qPtr = q.Handle, kPtr = kcache.Handle, vPtr = vcache.Handle, btPtr = blockTable.Handle, oPtr = output.Handle;
-        int hh = heads, kv = kvHeads, hd = headDim, bs = blockSize, nq = numQueries, sp = startPos; float sc = scale;
-        void** args = stackalloc void*[12];
-        args[0] = &qPtr; args[1] = &kPtr; args[2] = &vPtr; args[3] = &btPtr; args[4] = &oPtr;
-        args[5] = &hh; args[6] = &kv; args[7] = &hd; args[8] = &bs; args[9] = &nq; args[10] = &sp; args[11] = &sc;
-        LaunchKernel(kernel, grid, (uint)DefaultBlockSize, args);
-        return output;
-    }
-
-    /// <summary>Fused decode attention (P2, FlashDecoding): single-query attention over contiguous K/V
-    /// [seqLen,kvHeads,headDim], split across threads and merged by an online-softmax reduction. GQA via
-    /// kvHead=h/(heads/kvHeads); pass kvHeads==heads for MHA. headDim &lt;= 256.</summary>
-    public unsafe IGpuBuffer FlashDecode(IGpuBuffer q, IGpuBuffer k, IGpuBuffer v,
-        int heads, int kvHeads, int headDim, int seqLen, float scale, int splits = 0)
-    {
-        if (!_kernelCache.TryGetValue("flash_decode_partial", out var partKernel))
-            throw new InvalidOperationException("HIP kernel not found: flash_decode_partial");
-        if (!_kernelCache.TryGetValue("flash_decode_reduce", out var reduceKernel))
-            throw new InvalidOperationException("HIP kernel not found: flash_decode_reduce");
-        GpuKernelGuards.FlashDecode(heads, kvHeads, headDim, seqLen, nameof(FlashDecode));
-        GpuKernelGuards.Capacity(q, (long)heads * headDim, nameof(q), nameof(FlashDecode));
-        GpuKernelGuards.Capacity(k, (long)seqLen * kvHeads * headDim, nameof(k), nameof(FlashDecode));
-        GpuKernelGuards.Capacity(v, (long)seqLen * kvHeads * headDim, nameof(v), nameof(FlashDecode));
-        if (seqLen <= 0) throw new ArgumentOutOfRangeException(nameof(seqLen));
-        int effSplits = splits > 0 ? splits : System.Math.Min(seqLen, 8);
-        if (effSplits > seqLen) effSplits = seqLen;
-        int splitLen = (seqLen + effSplits - 1) / effSplits;
-
-        var output = AllocateBuffer(heads * headDim);
-        var partialM = AllocateBuffer(heads * effSplits);
-        var partialL = AllocateBuffer(heads * effSplits);
-        var partialAcc = AllocateBuffer(heads * effSplits * headDim);
-        try
-        {
-            IntPtr qPtr = q.Handle, kPtr = k.Handle, vPtr = v.Handle;
-            IntPtr pmPtr = partialM.Handle, plPtr = partialL.Handle, paPtr = partialAcc.Handle, oPtr = output.Handle;
-            int hh = heads, kv = kvHeads, hd = headDim, sl = seqLen, sp = effSplits, slen = splitLen; float sc = scale;
-
-            int totalItems = heads * effSplits;
-            uint gridP = (uint)(((long)totalItems + DefaultBlockSize - 1) / DefaultBlockSize);
-            void** argsP = stackalloc void*[13];
-            argsP[0] = &qPtr; argsP[1] = &kPtr; argsP[2] = &vPtr;
-            argsP[3] = &pmPtr; argsP[4] = &plPtr; argsP[5] = &paPtr;
-            argsP[6] = &hh; argsP[7] = &kv; argsP[8] = &hd; argsP[9] = &sl; argsP[10] = &sp; argsP[11] = &slen; argsP[12] = &sc;
-            LaunchKernel(partKernel, gridP, (uint)DefaultBlockSize, argsP);
-
-            uint gridR = (uint)(((long)heads + DefaultBlockSize - 1) / DefaultBlockSize);
-            void** argsR = stackalloc void*[7];
-            argsR[0] = &pmPtr; argsR[1] = &plPtr; argsR[2] = &paPtr; argsR[3] = &oPtr;
-            argsR[4] = &hh; argsR[5] = &hd; argsR[6] = &sp;
-            LaunchKernel(reduceKernel, gridR, (uint)DefaultBlockSize, argsR);
-            return output;
-        }
-        catch { output.Dispose(); throw; }
-        finally { partialM.Dispose(); partialL.Dispose(); partialAcc.Dispose(); }
-    }
-
-    /// <summary>Weight-only fused dequant-GEMM (int8), symmetric per-tensor/per-group; weights are a
-    /// byte buffer of the int8 payload. Matches FusedDequantMatmulKernels.Q8MatMul.</summary>
-    public IGpuBuffer DequantGemmInt8(IGpuBuffer activations, IGpuBuffer weightsInt8, IGpuBuffer scales,
-        int M, int K, int N, int groupSize, int scaleCount)
-    {
-        GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmInt8));
-        GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmInt8));
-        GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmInt8));
-        return LaunchDequantGemm("dequant_gemm_int8", activations, weightsInt8, scales, M, K, N, groupSize, scaleCount);
-    }
-
-    /// <summary>Weight-only fused dequant-GEMM (int4, 2 signed nibbles/byte). Weights are a byte buffer
-    /// of length ceil(K*N/2). Matches FusedDequantMatmulKernels.Q4MatMul.</summary>
-    public IGpuBuffer DequantGemmInt4(IGpuBuffer activations, IGpuBuffer weightsInt4Packed, IGpuBuffer scales,
-        int M, int K, int N, int groupSize, int scaleCount)
-    {
-        GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmInt4));
-        GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmInt4));
-        GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmInt4));
-        return LaunchDequantGemm("dequant_gemm_int4", activations, weightsInt4Packed, scales, M, K, N, groupSize, scaleCount);
-    }
-
-    /// <summary>Weight-only fused dequant-GEMM (OCP FP8 E4M3). Weights are a byte buffer of raw e4m3
-    /// bytes; in-kernel decode matches Float8E4M3.ToFloat.</summary>
-    public IGpuBuffer DequantGemmFp8E4M3(IGpuBuffer activations, IGpuBuffer weightsFp8, IGpuBuffer scales,
-        int M, int K, int N, int groupSize, int scaleCount)
-    {
-        GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmFp8E4M3));
-        GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmFp8E4M3));
-        GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmFp8E4M3));
-        return LaunchDequantGemm("dequant_gemm_fp8_e4m3", activations, weightsFp8, scales, M, K, N, groupSize, scaleCount);
-    }
-
-    private unsafe IGpuBuffer LaunchDequantGemm(string kernelName, IGpuBuffer act, IGpuBuffer weights, IGpuBuffer scales,
-        int M, int K, int N, int groupSize, int scaleCount)
-    {
-        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"HIP kernel not found: {kernelName}");
-        var output = AllocateBuffer(M * N);
-        uint grid = (uint)(((long)M * N + DefaultBlockSize - 1) / DefaultBlockSize);
-        IntPtr aPtr = act.Handle, wPtr = weights.Handle, sPtr = scales.Handle, oPtr = output.Handle;
-        int m = M, k = K, n = N, gs = groupSize, sc = scaleCount;
-        void** args = stackalloc void*[9];
-        args[0] = &aPtr; args[1] = &wPtr; args[2] = &sPtr; args[3] = &oPtr;
-        args[4] = &m; args[5] = &k; args[6] = &n; args[7] = &gs; args[8] = &sc;
-        LaunchKernel(kernel, grid, (uint)DefaultBlockSize, args);
-        return output;
     }
 
     /// <summary>
@@ -11031,24 +10838,6 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         {
             HipNativeBindings.hipModuleUnload(_fusedModule);
             _fusedModule = IntPtr.Zero;
-        }
-
-        if (_quantGemmModule != IntPtr.Zero)
-        {
-            HipNativeBindings.hipModuleUnload(_quantGemmModule);
-            _quantGemmModule = IntPtr.Zero;
-        }
-
-        if (_pagedAttnModule != IntPtr.Zero)
-        {
-            HipNativeBindings.hipModuleUnload(_pagedAttnModule);
-            _pagedAttnModule = IntPtr.Zero;
-        }
-
-        if (_flashDecodeModule != IntPtr.Zero)
-        {
-            HipNativeBindings.hipModuleUnload(_flashDecodeModule);
-            _flashDecodeModule = IntPtr.Zero;
         }
         if (_attentionModule != IntPtr.Zero)
         {
