@@ -1,0 +1,100 @@
+name: Auto-Fix Line Endings (git renormalize)
+
+# Enforces the .gitattributes EOL policy (LF for text; CRLF for *.bat/*.cmd/*.ps1).
+# `git add --renormalize .` re-applies the clean filters to every tracked file, so any blob
+# committed with the wrong line endings is corrected. Runs on a schedule and on demand, and
+# opens/updates a single PR when it finds drift.
+
+on:
+  schedule:
+    # Daily at 03:15 UTC
+    - cron: '15 3 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: normalize-line-endings
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  renormalize:
+    name: Renormalize line endings and open PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Renormalize per .gitattributes
+        id: renorm
+        shell: bash
+        run: |
+          git add --renormalize .
+          if git diff --cached --quiet; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "No line-ending drift detected."
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "Files renormalized:"
+            git diff --cached --name-only
+          fi
+
+      - name: Configure git
+        if: steps.renorm.outputs.has_changes == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit changes
+        if: steps.renorm.outputs.has_changes == 'true'
+        run: git commit -m "chore: normalize line endings (git renormalize)"
+
+      - name: Push branch
+        if: steps.renorm.outputs.has_changes == 'true'
+        env:
+          # If AUTOFIX_PAT is set, the PR triggers normal CI; GITHUB_TOKEN pushes may not.
+          AUTOFIX_PAT: ${{ secrets.AUTOFIX_PAT }}
+        shell: bash
+        run: |
+          BRANCH="automation/normalize-line-endings"
+          git checkout -B "$BRANCH"
+          if [ -n "$AUTOFIX_PAT" ]; then
+            git push "https://x-access-token:${AUTOFIX_PAT}@github.com/${GITHUB_REPOSITORY}.git" "$BRANCH" --force-with-lease
+          else
+            git push origin "$BRANCH" --force-with-lease
+            echo "::warning::AUTOFIX_PAT is not set; the PR may not trigger CI automatically."
+          fi
+
+      - name: Create or update PR
+        if: steps.renorm.outputs.has_changes == 'true'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const head = `${owner}:automation/normalize-line-endings`;
+            const base = context.payload.repository.default_branch;
+            const title = 'chore: normalize line endings';
+            const body = [
+              'Automated line-ending maintenance PR.',
+              '',
+              '- Runs `git add --renormalize .` against `.gitattributes` on a schedule.',
+              '- Corrects any blob committed with the wrong EOL (keeps diffs clean for review).',
+            ].join('\n');
+
+            const existing = await github.rest.pulls.list({ owner, repo, state: 'open', head, base });
+            if (existing.data.length > 0) {
+              await github.rest.pulls.update({ owner, repo, pull_number: existing.data[0].number, title, body });
+              return;
+            }
+            await github.rest.pulls.create({ owner, repo, head: 'automation/normalize-line-endings', base, title, body });
+
+      - name: No changes
+        if: steps.renorm.outputs.has_changes == 'false'
+        run: echo "No line-ending drift detected."
