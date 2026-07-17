@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.115.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.115.0...v0.115.1) (2026-07-17)
+
+
+### Bug Fixes
+
+* **ci:** repair line-ending autofix workflow (revives release automation) ([#804](https://github.com/ooples/AiDotNet.Tensors/issues/804)) ([e35fc35](https://github.com/ooples/AiDotNet.Tensors/commit/e35fc355adf4eacfa025a0c65f853f003eef95be))
+
 ## [0.115.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.114.5...v0.115.0) (2026-07-16)
 
 
