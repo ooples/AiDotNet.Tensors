@@ -50,6 +50,15 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private IntPtr _cudaContext;
     private IntPtr _stream;
     private IntPtr _cublasHandle;
+
+    // Fused-epilogue matmul (matmul + bias + activation in ONE launch) via cuBLASLt. Lazily created.
+    // Gated OFF by default: the mapping is correct-by-construction (see TryGemmBiasFusedEpilogue) but has
+    // not been numerically validated on NVIDIA hardware in this tree. Set AIDOTNET_CUBLASLT_FUSED=1 to
+    // enable; any cuBLASLt failure falls back to the existing multi-launch path, so it is safe to flip on.
+    private CuBlasLtMatmul? _cublasLt;
+    private bool _cublasLtUnavailable;
+    private static readonly bool CuBlasLtFusedEnabled =
+        Environment.GetEnvironmentVariable("AIDOTNET_CUBLASLT_FUSED") == "1";
     // #742: the handle's default fp32 GEMM math mode chosen at init (TF32 tensor-op on Ampere+, else
     // PEDANTIC). Under SetDeterministicMode(true) we switch the handle to PEDANTIC (true fp32, no
     // tensor-core rounding) so backward GEMMs are reproducible on ANY GPU/driver; we restore the
@@ -2372,9 +2381,74 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         scheduler.SynchronizeEvents(batch);
     }
 
+    /// <summary>Lazily creates the cuBLASLt fused-epilogue wrapper, or returns null if unavailable.</summary>
+    private CuBlasLtMatmul? TryGetCuBlasLt()
+    {
+        if (_cublasLtUnavailable) return null;
+        if (_cublasLt is not null) return _cublasLt;
+        try
+        {
+            if (!CuBlasLtMatmul.IsAvailable) { _cublasLtUnavailable = true; return null; }
+            _cublasLt = new CuBlasLtMatmul();
+            return _cublasLt;
+        }
+        catch
+        {
+            _cublasLtUnavailable = true;
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Attempts a single-launch fused matmul + bias + activation via cuBLASLt. Returns the fused output
+    /// on success, or <c>null</c> to tell the caller to use the multi-launch fallback (feature disabled,
+    /// cuBLASLt unavailable, or any runtime failure such as an unsupported algo/workspace combination).
+    /// </summary>
+    /// <remarks>
+    /// Row-major mapping: our result C = A(MxK) @ B(KxN) + bias(N) is produced as cuBLASLt
+    /// D (col-major NxM == row-major MxN) with A_lt = B (m=N, k=K), B_lt = A (n=M), both non-transposed.
+    /// The Bias epilogue broadcasts over D's leading (m = N) dimension, i.e. adds bias[feature] to every
+    /// output row — exactly a Linear layer's per-output-feature bias. Validate on NVIDIA hardware before
+    /// enabling by default (AIDOTNET_CUBLASLT_FUSED=1).
+    /// </remarks>
+    private IGpuBuffer? TryGemmBiasFusedEpilogue(
+        IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K, CublasLtEpilogue epilogue)
+    {
+        if (!CuBlasLtFusedEnabled) return null;
+        var lt = TryGetCuBlasLt();
+        if (lt is null) return null;
+
+        IGpuBuffer? output = null;
+        try
+        {
+            output = AllocateBuffer(M * N);
+            lt.MatmulFused(
+                aDev: B.Handle, m: N, k: K, transA: false,
+                bDev: A.Handle, n: M, transB: false,
+                cDev: IntPtr.Zero, dDev: output.Handle,
+                biasDev: bias.Handle,
+                epilogue: epilogue,
+                alpha: 1f, beta: 0f,
+                stream: _stream,
+                dtype: CublasDataType.Float32,
+                computeType: CublasComputeType.Float32);
+            return output;
+        }
+        catch
+        {
+            output?.Dispose();
+            return null;
+        }
+    }
+
     public IGpuBuffer GemmBiasRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
     {
         ValidateBiasBuffer(bias, N);
+
+        // Single-launch fused path (matmul + bias + ReLU) when enabled; falls back on any failure.
+        var fused = TryGemmBiasFusedEpilogue(A, B, bias, M, N, K, CublasLtEpilogue.ReLUBias);
+        if (fused is not null) return fused;
+
         IGpuBuffer? temp = null;
         IGpuBuffer? output = null;
         try
@@ -2397,6 +2471,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public IGpuBuffer GemmBiasGelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
     {
         ValidateBiasBuffer(bias, N);
+
+        // Single-launch fused path (matmul + bias + GELU) when enabled; falls back on any failure.
+        var fused = TryGemmBiasFusedEpilogue(A, B, bias, M, N, K, CublasLtEpilogue.GELUBias);
+        if (fused is not null) return fused;
+
         IGpuBuffer? temp = null;
         IGpuBuffer? output = null;
         try
@@ -15051,6 +15130,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         {
             _cudnnContext.Dispose();
             _cudnnContext = null;
+        }
+
+        if (_cublasLt is not null)
+        {
+            _cublasLt.Dispose();
+            _cublasLt = null;
         }
 
         if (_cublasHandle != IntPtr.Zero)
