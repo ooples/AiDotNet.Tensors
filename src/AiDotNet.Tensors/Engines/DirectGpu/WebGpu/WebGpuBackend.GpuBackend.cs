@@ -223,6 +223,43 @@ public sealed partial class WebGpuBackend
     public IGpuBuffer GemmBias(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
         => GemmBiasActivation(A, B, bias, M, N, K, 0);
 
+    // Uniform padded to 8 floats (32 bytes) for WebGPU's 16-byte uniform-buffer alignment.
+    private static float[] QuantUniforms(int M, int K, int N, int groupSize, int scaleCount) => new float[]
+    {
+        BitConverter.Int32BitsToSingle(M), BitConverter.Int32BitsToSingle(K), BitConverter.Int32BitsToSingle(N),
+        BitConverter.Int32BitsToSingle(groupSize), BitConverter.Int32BitsToSingle(scaleCount), 0f, 0f, 0f
+    };
+
+    /// <summary>
+    /// Weight-only fused dequant-GEMM for integer weights (int8 or unpacked int4): C[M,N] =
+    /// act[M,K] · (scale · W[K,N]). Symmetric per-tensor/per-group scales, matching the CPU oracle
+    /// FusedDequantMatmulKernels Q8/Q4. <paramref name="weightsInt"/> is an int buffer (AllocateIntBuffer).
+    /// </summary>
+    public IGpuBuffer DequantGemmInt(IGpuBuffer activations, IGpuBuffer weightsInt, IGpuBuffer scales,
+        int M, int K, int N, int groupSize, int scaleCount)
+    {
+        var output = AllocateBuffer(M * N);
+        Dispatch4BufferAsync("DequantGemmInt", WebGpuKernels.DequantGemmIntSource, "dequant_gemm_int",
+            activations, weightsInt, scales, output, QuantUniforms(M, K, N, groupSize, scaleCount), M * N)
+            .GetAwaiter().GetResult();
+        return output;
+    }
+
+    /// <summary>
+    /// Weight-only fused dequant-GEMM for OCP FP8 E4M3 weights: C[M,N] = act[M,K] ·
+    /// (scale · decode_e4m3(W[K,N])). <paramref name="weightsFp8Raw"/> is an int buffer of raw fp8
+    /// bytes (0..255); decode matches Float8E4M3.ToFloat.
+    /// </summary>
+    public IGpuBuffer DequantGemmFp8E4M3(IGpuBuffer activations, IGpuBuffer weightsFp8Raw, IGpuBuffer scales,
+        int M, int K, int N, int groupSize, int scaleCount)
+    {
+        var output = AllocateBuffer(M * N);
+        Dispatch4BufferAsync("DequantGemmFp8", WebGpuKernels.DequantGemmFp8Source, "dequant_gemm_fp8",
+            activations, weightsFp8Raw, scales, output, QuantUniforms(M, K, N, groupSize, scaleCount), M * N)
+            .GetAwaiter().GetResult();
+        return output;
+    }
+
     public IGpuBuffer GemmBiasSwish(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
     {
         var temp = GemmBias(A, B, bias, M, N, K);

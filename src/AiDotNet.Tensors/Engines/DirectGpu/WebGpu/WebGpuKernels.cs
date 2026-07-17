@@ -5724,6 +5724,85 @@ fn permute_op(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// <summary>
     /// Fused GEMM + Bias + Activation kernel with proper separate bias buffer.
     /// </summary>
+    // Weight-only fused dequant-GEMM (P0). Contract matches FusedDequantMatmulKernels:
+    // C[M,N]=act[M,K].dequant(W[K,N]); symmetric scales, per-tensor (scaleCount==1) or per-group
+    // over flat k*N. Integer weights (int8 / unpacked int4) uploaded as array<i32>; fp8 uses raw
+    // e4m3 byte + in-shader decode. Uniform struct padded to 32 bytes (WebGPU 16-byte alignment).
+    public const string DequantGemmIntSource = @"
+@group(0) @binding(0) var<storage, read> act: array<f32>;
+@group(0) @binding(1) var<storage, read> W: array<i32>;
+@group(0) @binding(2) var<storage, read> scales: array<f32>;
+@group(0) @binding(3) var<storage, read_write> outbuf: array<f32>;
+struct QParams { M: u32, K: u32, N: u32, groupSize: u32, scaleCount: u32 }
+@group(0) @binding(4) var<uniform> params: QParams;
+
+@compute @workgroup_size(256)
+fn dequant_gemm_int(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.M * params.N) { return; }
+    let i = idx / params.N;
+    let j = idx % params.N;
+    var acc = 0.0;
+    if (params.scaleCount == 1u) {
+        let s = scales[0];
+        for (var k: u32 = 0u; k < params.K; k = k + 1u) {
+            acc = acc + act[i * params.K + k] * f32(W[k * params.N + j]);
+        }
+        acc = acc * s;
+    } else {
+        for (var k: u32 = 0u; k < params.K; k = k + 1u) {
+            let flat = k * params.N + j;
+            acc = acc + act[i * params.K + k] * f32(W[flat]) * scales[flat / params.groupSize];
+        }
+    }
+    outbuf[idx] = acc;
+}
+";
+
+    // FP8 E4M3 weight-only variant; decode matches Float8E4M3.ToFloat.
+    public const string DequantGemmFp8Source = @"
+@group(0) @binding(0) var<storage, read> act: array<f32>;
+@group(0) @binding(1) var<storage, read> W: array<i32>;
+@group(0) @binding(2) var<storage, read> scales: array<f32>;
+@group(0) @binding(3) var<storage, read_write> outbuf: array<f32>;
+struct QParams { M: u32, K: u32, N: u32, groupSize: u32, scaleCount: u32 }
+@group(0) @binding(4) var<uniform> params: QParams;
+
+fn decode_e4m3(raw: u32) -> f32 {
+    let r = raw & 0xFFu;
+    if ((r & 0x7Fu) == 0x7Fu) { return bitcast<f32>(0x7FC00000u); }
+    if ((r & 0x7Fu) == 0u) { return 0.0; }
+    let sign = (r & 0x80u) >> 7u;
+    let exp4 = (r & 0x78u) >> 3u;
+    let m3 = r & 0x07u;
+    let exp32 = i32(exp4) - 7 + 127;
+    let bits = (sign << 31u) | (u32(exp32 & 0xFF) << 23u) | (m3 << 20u);
+    return bitcast<f32>(bits);
+}
+
+@compute @workgroup_size(256)
+fn dequant_gemm_fp8(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.M * params.N) { return; }
+    let i = idx / params.N;
+    let j = idx % params.N;
+    var acc = 0.0;
+    if (params.scaleCount == 1u) {
+        let s = scales[0];
+        for (var k: u32 = 0u; k < params.K; k = k + 1u) {
+            acc = acc + act[i * params.K + k] * decode_e4m3(u32(W[k * params.N + j]));
+        }
+        acc = acc * s;
+    } else {
+        for (var k: u32 = 0u; k < params.K; k = k + 1u) {
+            let flat = k * params.N + j;
+            acc = acc + act[i * params.K + k] * decode_e4m3(u32(W[flat])) * scales[flat / params.groupSize];
+        }
+    }
+    outbuf[idx] = acc;
+}
+";
+
     public const string FusedGemmBiasSource = @"
 @group(0) @binding(0) var<storage, read> A: array<f32>;
 @group(0) @binding(1) var<storage, read> B: array<f32>;
