@@ -5104,6 +5104,73 @@ kernel void octonion_linear_backward_weights(
 
     #region Fused Linear Kernels
 
+    // Weight-only fused dequant-GEMM (P0). Contract matches FusedDequantMatmulKernels: C[M,N] =
+    // act[M,K] . dequant(W[K,N]); symmetric scales, per-tensor (scaleCount==1) or per-group over flat
+    // k*N. Integer weights (int8 / unpacked int4) are device const int*; fp8 uses the raw e4m3 byte.
+    public const string QuantGemmKernels = CommonHeader + @"
+inline float decode_e4m3(uint raw){
+    uint r = raw & 0xFFu;
+    if ((r & 0x7Fu) == 0x7Fu) return as_type<float>(0x7FC00000u);
+    if ((r & 0x7Fu) == 0u) return 0.0f;
+    uint sign=(r&0x80u)>>7, exp4=(r&0x78u)>>3, m3=(r&0x07u);
+    int exp32=int(exp4)-7+127;
+    uint bits=(sign<<31)|(uint(exp32 & 0xFF)<<23)|(m3<<20);
+    return as_type<float>(bits);
+}
+
+kernel void dequant_gemm_int(
+    device const float* act [[buffer(0)]],
+    device const int* w [[buffer(1)]],
+    device const float* scales [[buffer(2)]],
+    device float* outbuf [[buffer(3)]],
+    constant int& M [[buffer(4)]],
+    constant int& K [[buffer(5)]],
+    constant int& N [[buffer(6)]],
+    constant int& groupSize [[buffer(7)]],
+    constant int& scaleCount [[buffer(8)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int idx = int(gid);
+    if (idx >= M * N) return;
+    int i = idx / N; int j = idx % N;
+    float acc = 0.0f;
+    if (scaleCount == 1) {
+        float s = scales[0];
+        for (int k = 0; k < K; ++k) acc += act[i*K+k] * float(w[k*N+j]);
+        acc *= s;
+    } else {
+        for (int k = 0; k < K; ++k) { int flat = k*N+j; acc += act[i*K+k] * float(w[flat]) * scales[flat/groupSize]; }
+    }
+    outbuf[idx] = acc;
+}
+
+kernel void dequant_gemm_fp8(
+    device const float* act [[buffer(0)]],
+    device const int* w [[buffer(1)]],
+    device const float* scales [[buffer(2)]],
+    device float* outbuf [[buffer(3)]],
+    constant int& M [[buffer(4)]],
+    constant int& K [[buffer(5)]],
+    constant int& N [[buffer(6)]],
+    constant int& groupSize [[buffer(7)]],
+    constant int& scaleCount [[buffer(8)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int idx = int(gid);
+    if (idx >= M * N) return;
+    int i = idx / N; int j = idx % N;
+    float acc = 0.0f;
+    if (scaleCount == 1) {
+        float s = scales[0];
+        for (int k = 0; k < K; ++k) acc += act[i*K+k] * decode_e4m3(uint(w[k*N+j]));
+        acc *= s;
+    } else {
+        for (int k = 0; k < K; ++k) { int flat = k*N+j; acc += act[i*K+k] * decode_e4m3(uint(w[flat])) * scales[flat/groupSize]; }
+    }
+    outbuf[idx] = acc;
+}
+";
+
     public const string FusedLinearKernels = CommonHeader + @"
 inline float act_relu(float x) { return max(x, 0.0f); }
 inline float act_tanh_fn(float x) { return tanh(x); }

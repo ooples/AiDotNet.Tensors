@@ -60,6 +60,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     private IntPtr _randomLibrary;
     private IntPtr _dotProductLibrary;
     private IntPtr _fusedLinearLibrary;
+    private IntPtr _quantGemmLibrary; // P0: weight-only fused dequant-GEMM (int8/int4/fp8)
     private IntPtr _iouLibrary;
     private IntPtr _hyperbolicLibrary;
     private IntPtr _octonionLibrary;
@@ -242,6 +243,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         try
         {
             _fusedLinearLibrary = _shaderLibrary.CompileLibrary("FusedLinear", MetalKernels.FusedLinearKernels);
+            _quantGemmLibrary = _shaderLibrary.CompileLibrary("QuantGemm", MetalKernels.QuantGemmKernels);
         }
         catch (Exception ex)
         {
