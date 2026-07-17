@@ -1,0 +1,49 @@
+name: Lint PR Title (Conventional Commits)
+
+# Squash-merge uses the PR title as the commit subject, and release-please only reacts to
+# conventional-commit subjects. This check fails a PR whose title is not a valid conventional
+# commit, so non-conventional subjects (which silently disable release-please) can't reach main.
+# Mark this check "required" in branch protection for it to block merges.
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+concurrency:
+  group: pr-title-lint-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  pull-requests: read
+  contents: read
+
+jobs:
+  lint-title:
+    name: Validate PR title
+    runs-on: ubuntu-latest
+    # release-please maintains its own PRs; don't lint those.
+    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
+    steps:
+      - name: Check conventional-commit format
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
+        with:
+          script: |
+            const title = context.payload.pull_request.title || '';
+            // Types kept in sync with release-please-config.json changelog-sections.
+            const types = ['feat','fix','perf','revert','refactor','build','ci','docs','chore','style','test'];
+            const pattern = new RegExp('^(' + types.join('|') + ')(\\([^)]+\\))?!?: .+');
+            if (pattern.test(title)) {
+              core.info(`PR title OK: ${title}`);
+              return;
+            }
+            const releasing = ['feat','fix','perf','revert','refactor','build','docs'];
+            core.setFailed(
+              `PR title is not a Conventional Commit: "${title}"\n\n` +
+              `Squash-merge uses the PR title as the commit subject, and release-please only cuts a\n` +
+              `release when it sees a conventional subject — a non-conventional title silently stops\n` +
+              `release PRs from being created.\n\n` +
+              `Use: <type>(optional-scope): <description>\n` +
+              `  Allowed types: ${types.join(', ')}\n` +
+              `  Trigger a release: ${releasing.join(', ')}  (chore/ci/style/test do not)\n` +
+              `  Examples: "feat(gpu): add paged attention", "fix(ci): repair release workflow"`
+            );
