@@ -156,6 +156,9 @@ public sealed class QuantGemmMetalTests : IDisposable
             Float8E4M3.MaxFinite, Float8E4M3.MinFinite, Float8E4M3.Zero, Float8E4M3.FromFloat(-0f),
             Float8E4M3.FromFloat(448f), Float8E4M3.FromFloat(-448f),
             Float8E4M3.FromFloat(0.015625f), Float8E4M3.FromFloat(-0.015625f),
+            // Raw exponent-zero encodings FromFloat would round to signed zero — GPU decode must match CPU.
+            Float8E4M3.FromRawValue(0x01), Float8E4M3.FromRawValue(0x07),
+            Float8E4M3.FromRawValue(0x81), Float8E4M3.FromRawValue(0x87),
         };
         for (int b = 0; b < fp8Boundaries.Length && b < KN; b++)
         {

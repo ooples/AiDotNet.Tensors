@@ -66,5 +66,36 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
                 throw new ArgumentException(
                     $"{op}: {bufferName} holds {buffer.Size} elements but the kernel needs {requiredElements}.", bufferName);
         }
+
+        /// <summary>
+        /// Validates the buffer contract shared by the paged-attention decode/prefill kernels (MHA and GQA):
+        /// the query buffer, the block table, and the K/V physical pools. <paramref name="kvDim"/> is the
+        /// per-token KV head count in the pool layout (heads for MHA, kvHeads for GQA);
+        /// <paramref name="qRows"/> is 1 for decode and numQueries for prefill; <paramref name="keyLen"/> is
+        /// the number of key positions read (seqLen for decode, startPos+numQueries for prefill).
+        /// </summary>
+        /// <remarks>
+        /// Physical block ids live in the device <paramref name="blockTable"/> buffer, so validating that
+        /// each id is in-range would require a device→host read; that is intentionally left off this fast
+        /// path. These host-checkable capacity guards catch the common undersized-buffer mistakes before a
+        /// native out-of-bounds read.
+        /// </remarks>
+        public static void PagedAttentionBuffers(
+            IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+            int heads, int kvDim, int headDim, int blockSize, int keyLen, int qRows, string op)
+        {
+            Capacity(q, (long)qRows * heads * headDim, "q", op);
+            long logicalBlocks = ((long)keyLen + blockSize - 1) / blockSize;
+            Capacity(blockTable, logicalBlocks, "blockTable", op);
+            if (kcache is null || vcache is null)
+                throw new ArgumentNullException(kcache is null ? "kcache" : "vcache", $"{op}: K/V pools must not be null.");
+            if (kcache.Size <= 0 || kcache.Size != vcache.Size)
+                throw new ArgumentException(
+                    $"{op}: kcache/vcache must be equal-sized, non-empty K/V pools (got {kcache.Size}/{vcache.Size}).", "kcache");
+            long perBlock = (long)blockSize * kvDim * headDim;
+            if (kcache.Size % perBlock != 0)
+                throw new ArgumentException(
+                    $"{op}: K/V pool size {kcache.Size} is not a whole number of blocks (blockSize*kvDim*headDim = {perBlock}).", "kcache");
+        }
     }
 }

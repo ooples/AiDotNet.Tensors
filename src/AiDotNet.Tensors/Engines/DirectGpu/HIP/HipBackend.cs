@@ -824,6 +824,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int heads, int headDim, int blockSize, int seqLen, float scale)
     {
         GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecode));
+        GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, heads, headDim, blockSize, seqLen, 1, nameof(PagedAttentionDecode));
         if (!_kernelCache.TryGetValue("paged_attention_decode", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: paged_attention_decode");
         var output = AllocateBuffer(heads * headDim);
@@ -844,6 +845,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefill));
         if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
+        GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, heads, headDim, blockSize, checked(startPos + numQueries), numQueries, nameof(PagedAttentionPrefill));
         if (!_kernelCache.TryGetValue("paged_attention_prefill", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: paged_attention_prefill");
         var output = AllocateBuffer(numQueries * heads * headDim);
@@ -865,6 +867,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecodeGqa));
         GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionDecodeGqa));
+        GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, kvHeads, headDim, blockSize, seqLen, 1, nameof(PagedAttentionDecodeGqa));
         if (!_kernelCache.TryGetValue("paged_attention_decode_gqa", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: paged_attention_decode_gqa");
         var output = AllocateBuffer(heads * headDim);
@@ -886,6 +889,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefillGqa));
         GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionPrefillGqa));
         if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
+        GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, kvHeads, headDim, blockSize, checked(startPos + numQueries), numQueries, nameof(PagedAttentionPrefillGqa));
         if (!_kernelCache.TryGetValue("paged_attention_prefill_gqa", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: paged_attention_prefill_gqa");
         var output = AllocateBuffer(numQueries * heads * headDim);
@@ -955,6 +959,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmInt8));
         GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmInt8));
+        GpuKernelGuards.Capacity(weightsInt8, (long)K * N, nameof(weightsInt8), nameof(DequantGemmInt8));
         GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmInt8));
         return LaunchDequantGemm("dequant_gemm_int8", activations, weightsInt8, scales, M, K, N, groupSize, scaleCount);
     }
@@ -966,6 +971,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmInt4));
         GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmInt4));
+        GpuKernelGuards.Capacity(weightsInt4Packed, ((long)K * N + 1) / 2, nameof(weightsInt4Packed), nameof(DequantGemmInt4));
         GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmInt4));
         return LaunchDequantGemm("dequant_gemm_int4", activations, weightsInt4Packed, scales, M, K, N, groupSize, scaleCount);
     }
@@ -977,6 +983,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmFp8E4M3));
         GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmFp8E4M3));
+        GpuKernelGuards.Capacity(weightsFp8, (long)K * N, nameof(weightsFp8), nameof(DequantGemmFp8E4M3));
         GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmFp8E4M3));
         return LaunchDequantGemm("dequant_gemm_fp8_e4m3", activations, weightsFp8, scales, M, K, N, groupSize, scaleCount);
     }

@@ -65,6 +65,11 @@ public readonly struct Float8E4M3 : IEquatable<Float8E4M3>, IComparable<Float8E4
     /// <summary>NaN encoding (exp-max + mantissa-max, positive sign).</summary>
     public static Float8E4M3 NaN => new(NaNRawPos);
 
+    /// <summary>Constructs the value from its raw 8-bit encoding (inverse of <see cref="RawValue"/>).
+    /// Lets callers exercise exact encodings — e.g. exponent-zero raws like 0x01/0x81 — that
+    /// <see cref="FromFloat"/> would round away.</summary>
+    public static Float8E4M3 FromRawValue(byte raw) => new(raw);
+
     /// <summary>True iff this value encodes NaN.</summary>
     public bool IsNaN
     {
