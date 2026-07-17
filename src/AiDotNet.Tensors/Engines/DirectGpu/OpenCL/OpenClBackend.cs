@@ -318,6 +318,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 }
                 WriteDiag($"[OpenClBackend] GEMM kernels: {string.Join(", ", GemmKernel.GetKernelNames())}");
 
+                // Weight-only fused dequant-GEMM (P0: quantized LLM-serving hot path).
+                var quantGemmProgram = CompileOrLoadCached(QuantGemmKernels.GetSource(), optimizationFlags, "Quant dequant-GEMM kernels");
+                _programs.Add(quantGemmProgram);
+                foreach (var name in QuantGemmKernels.GetKernelNames())
+                {
+                    _kernelCache[name] = new DirectOpenClKernel(_context, quantGemmProgram, name);
+                }
+                WriteDiag($"[OpenClBackend] Quant GEMM kernels: {string.Join(", ", QuantGemmKernels.GetKernelNames())}");
+
                 // Compile activation kernels with NaN-preserving math flags: the
                 // relu kernel propagates NaN by contract, which -cl-finite-math-only
                 // / -cl-fast-relaxed-math would optimize away (the compiler assumes
@@ -2623,6 +2632,50 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             {
                 output?.Dispose();
                 temp?.Dispose();
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Weight-only fused dequant-GEMM: <c>C[M,N] = activations[M,K] · dequant(int8 W[K,N])</c>.
+        /// Symmetric scales, matching the CPU oracle <c>FusedDequantMatmulKernels.Q8MatMul</c>
+        /// (per-tensor when <paramref name="scaleCount"/> == 1, else per-group over the flattened
+        /// buffer with <paramref name="groupSize"/>). <paramref name="weightsInt8"/> is a byte buffer
+        /// (the sbyte payload reinterpreted as bytes via <see cref="AllocateByteBuffer"/> +
+        /// <see cref="UploadByteBuffer"/>); <paramref name="scales"/> is a float buffer. Returns a
+        /// freshly allocated float output buffer [M*N].
+        /// </summary>
+        public IGpuBuffer DequantGemmInt8(
+            IGpuBuffer activations, IGpuBuffer weightsInt8, IGpuBuffer scales,
+            int M, int K, int N, int groupSize, int scaleCount)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context not available");
+
+            var output = AllocateBuffer(M * N);
+            try
+            {
+                var kernel = _kernelCache["dequant_gemm_int8"];
+                kernel.SetArg(0, ((DirectOpenClGpuBuffer)activations).Buffer.Handle);
+                kernel.SetArg(1, ((DirectOpenClGpuByteBuffer)weightsInt8).Buffer.Handle);
+                kernel.SetArg(2, ((DirectOpenClGpuBuffer)scales).Buffer.Handle);
+                kernel.SetArg(3, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+                kernel.SetArg(4, M);
+                kernel.SetArg(5, K);
+                kernel.SetArg(6, N);
+                kernel.SetArg(7, groupSize);
+                kernel.SetArg(8, scaleCount);
+
+                var (localX, localY) = CalculateOptimalWorkGroupSize(M, N);
+                int globalX = ((M + localX - 1) / localX) * localX;
+                int globalY = ((N + localY - 1) / localY) * localY;
+                kernel.Execute2D(globalX, globalY, localX, localY);
+                _context.Finish();
+                return output;
+            }
+            catch
+            {
+                output.Dispose();
                 throw;
             }
         }
