@@ -9,19 +9,24 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// block pool lives entirely in GPU memory as two flat device buffers
 /// (<see cref="KeyBlocks"/> / <see cref="ValueBlocks"/>, laid out
 /// <c>[MaxBlocks, BlockSize, Heads, HeadDim]</c>); per-sequence block-table
-/// bookkeeping and the free list stay host-side, exactly as vLLM's block
-/// manager does. Appends copy device-to-device into the pool (no host
-/// round-trip on the resident path) and the block table is uploaded on
-/// demand as an int buffer that feeds straight into the paged-attention
-/// kernels (<c>PagedAttentionDecode</c> / <c>Prefill</c> and their GQA
-/// variants) on any backend.
+/// bookkeeping, the free list, and per-block reference counts stay host-side,
+/// exactly as vLLM's block manager does. Appends copy device-to-device into the
+/// pool (no host round-trip on the resident path) and the block table is
+/// uploaded on demand as an int buffer that feeds straight into the
+/// paged-attention kernels (<c>PagedAttentionDecode</c> / <c>Prefill</c> and
+/// their GQA variants) on any backend.
 ///
-/// <para>Contract mirrors the CPU <c>PagedKVCache&lt;float&gt;</c> reference:
-/// append + block table + free + prefix-share, so results are validated
-/// against the same standard-attention oracle. Backend-agnostic — it only
-/// uses <see cref="IDirectGpuBackend"/> buffer primitives (AllocateBuffer,
-/// AllocateIntBuffer, device Copy at offsets), so it runs on all six GPU
-/// backends.</para>
+/// <para>Sharing is reference-counted with copy-on-write: <see cref="ShareBlocks"/>
+/// aliases a prefix and bumps the shared blocks' refcounts; <see cref="Free"/>
+/// only returns a block to the pool when its last holder releases it; and an
+/// <see cref="Append"/> that would write into a shared partially-filled tail
+/// block first copies it to a private block. This makes independent sequence
+/// lifetimes safe (no double-free, no cross-sequence corruption).</para>
+///
+/// <para>Backend-agnostic — it only uses <see cref="IDirectGpuBackend"/> buffer
+/// primitives (AllocateBuffer, AllocateIntBuffer, device Copy at offsets), so it
+/// runs on all six GPU backends. Results are validated against the same
+/// standard-attention oracle as the CPU <c>PagedKVCache&lt;float&gt;</c>.</para>
 /// </summary>
 public sealed class DevicePagedKVCache : IDisposable
 {
@@ -44,6 +49,7 @@ public sealed class DevicePagedKVCache : IDisposable
     private readonly Stack<int> _free;              // Available physical block ids.
     private readonly Dictionary<int, List<int>> _blockTables = new();
     private readonly Dictionary<int, int> _lengths = new();
+    private readonly Dictionary<int, int> _refCount = new(); // physical block id -> holders
     private bool _disposed;
 
     public DevicePagedKVCache(IDirectGpuBackend backend, int maxBlocks, int blockSize, int heads, int headDim)
@@ -54,36 +60,58 @@ public sealed class DevicePagedKVCache : IDisposable
         if (heads <= 0) throw new ArgumentOutOfRangeException(nameof(heads));
         if (headDim <= 0) throw new ArgumentOutOfRangeException(nameof(headDim));
 
+        // Pool size is computed in 64-bit and range-checked: the flat buffer is addressed with int
+        // element offsets, so the whole pool must fit in a positive int to stay copy-safe.
+        long stepStride = (long)heads * headDim;
+        long poolLen = (long)maxBlocks * blockSize * stepStride;
+        if (poolLen > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(maxBlocks),
+                $"Pool size {poolLen} (maxBlocks*blockSize*heads*headDim) exceeds int.MaxValue; " +
+                "reduce maxBlocks/blockSize/headDim.");
+
         MaxBlocks = maxBlocks;
         BlockSize = blockSize;
         Heads = heads;
         HeadDim = headDim;
-        _stepStride = heads * headDim;
+        _stepStride = (int)stepStride;
 
-        int poolLen = maxBlocks * blockSize * heads * headDim;
-        KeyBlocks = backend.AllocateBuffer(poolLen);
-        ValueBlocks = backend.AllocateBuffer(poolLen);
+        // Allocate into locals and dispose the first pool if the second allocation throws, so a
+        // partially-constructed cache never leaks a native buffer.
+        var keyBlocks = backend.AllocateBuffer((int)poolLen);
+        try
+        {
+            ValueBlocks = backend.AllocateBuffer((int)poolLen);
+        }
+        catch
+        {
+            keyBlocks.Dispose();
+            throw;
+        }
+        KeyBlocks = keyBlocks;
 
         _free = new Stack<int>(maxBlocks);
         // Push in reverse so the first allocation hands out block id 0.
         for (int i = maxBlocks - 1; i >= 0; i--) _free.Push(i);
     }
 
-    /// <summary>Number of physical blocks currently allocated.</summary>
+    /// <summary>Number of physical blocks currently allocated (not on the free list).</summary>
     public int AllocatedBlocks => MaxBlocks - _free.Count;
 
     /// <summary>Current token length of sequence <paramref name="seqId"/>.</summary>
     public int GetLength(int seqId) => _lengths.TryGetValue(seqId, out var l) ? l : 0;
 
-    /// <summary>Read-only view of the block table for <paramref name="seqId"/> (physical block ids).</summary>
+    /// <summary>Immutable snapshot of the block table for <paramref name="seqId"/> (physical block ids).</summary>
     public IReadOnlyList<int> GetBlockTable(int seqId)
-        => _blockTables.TryGetValue(seqId, out var t) ? t : (IReadOnlyList<int>)Array.Empty<int>();
+        => _blockTables.TryGetValue(seqId, out var t) ? t.ToArray() : Array.Empty<int>();
 
     /// <summary>
     /// Append <paramref name="newLen"/> new (K, V) tokens for <paramref name="seqId"/>, already resident
     /// in device buffers of shape <c>[newLen, Heads, HeadDim]</c>. New physical blocks are allocated on
     /// demand as the sequence crosses block boundaries; each maximal run that lands contiguously inside a
-    /// single block is copied device-to-device in one shot (no host round-trip).
+    /// single block is copied device-to-device in one shot. If the sequence's current tail block is shared
+    /// (refcount &gt; 1) it is copied to a private block first (copy-on-write). The operation is atomic:
+    /// on exhaustion or a failed device copy, all reservations made in this call are rolled back and the
+    /// sequence is left exactly as it was.
     /// </summary>
     public void Append(int seqId, IGpuBuffer newKeys, IGpuBuffer newValues, int newLen)
     {
@@ -93,6 +121,14 @@ public sealed class DevicePagedKVCache : IDisposable
         if (newLen < 0) throw new ArgumentOutOfRangeException(nameof(newLen));
         if (newLen == 0) return;
 
+        // Validate source capacity before any device copy: IGpuBuffer exposes only size metadata, and
+        // some backends forward Copy straight to native calls, so an oversized append would read OOB.
+        long required = (long)newLen * _stepStride;
+        if (newKeys.Size < required || newValues.Size < required)
+            throw new ArgumentException(
+                $"newKeys/newValues must each hold at least newLen*Heads*HeadDim = {required} elements " +
+                $"(got {newKeys.Size}/{newValues.Size}).");
+
         if (!_blockTables.TryGetValue(seqId, out var table))
         {
             table = new List<int>();
@@ -101,33 +137,83 @@ public sealed class DevicePagedKVCache : IDisposable
         }
 
         int len = _lengths[seqId];
-        // Atomic exhaustion check: reserve all blocks up front so a mid-append shortfall can't leave the
-        // sequence partially extended (blocks popped + data copied but _lengths not advanced).
-        int blocksNeeded = (len + newLen + BlockSize - 1) / BlockSize - (len + BlockSize - 1) / BlockSize;
-        if (blocksNeeded > _free.Count)
+
+        // Capacity: the whole sequence must fit the pool.
+        if ((long)len + newLen > (long)MaxBlocks * BlockSize)
             throw new InvalidOperationException(
-                $"Device paged KV cache exhausted: appending {newLen} token(s) needs {blocksNeeded} more " +
+                $"Device paged KV cache: sequence would reach {(long)len + newLen} tokens, exceeding " +
+                $"pool capacity {(long)MaxBlocks * BlockSize} (MaxBlocks*BlockSize).");
+
+        int posInBlock0 = len % BlockSize;
+        bool needCow = posInBlock0 != 0 && table.Count > 0 && _refCount[table[table.Count - 1]] > 1;
+        int growthBlocks = (len + newLen + BlockSize - 1) / BlockSize - (len + BlockSize - 1) / BlockSize;
+        int needed = growthBlocks + (needCow ? 1 : 0);
+        if (needed > _free.Count)
+            throw new InvalidOperationException(
+                $"Device paged KV cache exhausted: appending {newLen} token(s) needs {needed} more " +
                 $"block(s) but only {_free.Count} of {MaxBlocks} are free.");
 
-        int i = 0;
-        while (i < newLen)
+        // Track everything mutated so the whole append can roll back atomically on any failure.
+        int originalTableCount = table.Count;
+        var reserved = new List<int>();      // blocks popped from the free list this call
+        int cowIndex = -1, cowOldBlock = -1; // tail block replaced by copy-on-write, if any
+
+        try
         {
-            int posInBlock = len % BlockSize;
-            if (posInBlock == 0)
+            if (needCow)
             {
-                table.Add(_free.Pop()); // guaranteed available by the up-front reservation check
+                int oldBlk = table[table.Count - 1];
+                int nb = _free.Pop();
+                reserved.Add(nb);
+                int copyElems = posInBlock0 * _stepStride;
+                int oldBase = oldBlk * BlockSize * _stepStride;
+                int nbBase = nb * BlockSize * _stepStride;
+                _backend.Copy(KeyBlocks, oldBase, KeyBlocks, nbBase, copyElems);
+                _backend.Copy(ValueBlocks, oldBase, ValueBlocks, nbBase, copyElems);
+                _refCount[oldBlk]--;   // release this sequence's reference to the shared block
+                _refCount[nb] = 1;
+                cowIndex = table.Count - 1;
+                cowOldBlock = oldBlk;
+                table[cowIndex] = nb;
             }
-            int blockId = table[table.Count - 1];
-            int runTokens = Math.Min(BlockSize - posInBlock, newLen - i);
-            int srcOffset = i * _stepStride;
-            int dstOffset = (blockId * BlockSize + posInBlock) * _stepStride;
-            int runElems = runTokens * _stepStride;
-            _backend.Copy(newKeys, srcOffset, KeyBlocks, dstOffset, runElems);
-            _backend.Copy(newValues, srcOffset, ValueBlocks, dstOffset, runElems);
-            i += runTokens;
-            len += runTokens;
+
+            int i = 0;
+            while (i < newLen)
+            {
+                int posInBlock = len % BlockSize;
+                if (posInBlock == 0)
+                {
+                    int nb = _free.Pop();
+                    reserved.Add(nb);
+                    table.Add(nb);
+                    _refCount[nb] = 1;
+                }
+                int blockId = table[table.Count - 1];
+                int runTokens = Math.Min(BlockSize - posInBlock, newLen - i);
+                int srcOffset = i * _stepStride;
+                int dstOffset = (blockId * BlockSize + posInBlock) * _stepStride;
+                int runElems = runTokens * _stepStride;
+                _backend.Copy(newKeys, srcOffset, KeyBlocks, dstOffset, runElems);
+                _backend.Copy(newValues, srcOffset, ValueBlocks, dstOffset, runElems);
+                i += runTokens;
+                len += runTokens;
+            }
+            _lengths[seqId] = len;
         }
-        _lengths[seqId] = len;
+        catch
+        {
+            // Roll back: drop growth blocks appended this call, undo the COW swap, and return every
+            // reserved physical block to the free list. _lengths was not yet advanced.
+            if (table.Count > originalTableCount)
+                table.RemoveRange(originalTableCount, table.Count - originalTableCount);
+            if (cowIndex >= 0)
+            {
+                table[cowIndex] = cowOldBlock;
+                _refCount[cowOldBlock]++; // undo the decrement
+            }
+            foreach (var b in reserved) { _refCount.Remove(b); _free.Push(b); }
+            throw;
+        }
     }
 
     /// <summary>
@@ -144,10 +230,19 @@ public sealed class DevicePagedKVCache : IDisposable
         int newLen = newKeys.Length / _stepStride;
         if (newLen == 0) return;
 
+        // Dispose the first temp buffer even if the second allocation throws.
         var kTmp = _backend.AllocateBuffer(newKeys);
-        var vTmp = _backend.AllocateBuffer(newValues);
-        try { Append(seqId, kTmp, vTmp, newLen); }
-        finally { kTmp.Dispose(); vTmp.Dispose(); }
+        IGpuBuffer? vTmp = null;
+        try
+        {
+            vTmp = _backend.AllocateBuffer(newValues);
+            Append(seqId, kTmp, vTmp, newLen);
+        }
+        finally
+        {
+            kTmp.Dispose();
+            vTmp?.Dispose();
+        }
     }
 
     /// <summary>
@@ -165,15 +260,23 @@ public sealed class DevicePagedKVCache : IDisposable
     }
 
     /// <summary>
-    /// Release every physical block owned by <paramref name="seqId"/> back to the free list (unless the
-    /// block is shared — see <see cref="ShareBlocks"/>). The sequence is removed from the block table map.
+    /// Release sequence <paramref name="seqId"/>. Each of its physical blocks is returned to the free
+    /// list only when its reference count reaches zero, so freeing one holder of a shared prefix leaves
+    /// the blocks live for the others.
     /// </summary>
     public void Free(int seqId)
     {
         ThrowIfDisposed();
         if (_blockTables.TryGetValue(seqId, out var table))
         {
-            foreach (var blockId in table) _free.Push(blockId);
+            foreach (var blockId in table)
+            {
+                if (--_refCount[blockId] <= 0)
+                {
+                    _refCount.Remove(blockId);
+                    _free.Push(blockId);
+                }
+            }
             _blockTables.Remove(seqId);
             _lengths.Remove(seqId);
         }
@@ -182,25 +285,13 @@ public sealed class DevicePagedKVCache : IDisposable
     /// <summary>
     /// Share the first <paramref name="prefixLen"/> tokens of <paramref name="sourceSeqId"/> with
     /// <paramref name="targetSeqId"/> — the target's block table points at the source's first blocks
-    /// (prefix-dedup for long shared system prompts).
+    /// (prefix-dedup for long shared system prompts), bumping each shared block's reference count.
     /// </summary>
     /// <remarks>
-    /// <para>
-    /// This mirrors the CPU <c>PagedKVCache</c> reference's simple <b>non-refcounted</b> contract, which
-    /// imposes two caller obligations:
-    /// </para>
-    /// <list type="bullet">
-    /// <item><description><b>Read-only reuse only.</b> Shared blocks are aliased, not copy-on-write:
-    /// appending to <paramref name="targetSeqId"/> after sharing writes through into the source's blocks
-    /// (and, when <paramref name="prefixLen"/> is not a multiple of <see cref="BlockSize"/>, into the
-    /// partially-filled last shared block). Treat a shared prefix as immutable, or only continue the
-    /// sequence that owns it.</description></item>
-    /// <item><description><b>Free a shared block once.</b> Because there is no refcount, calling
-    /// <see cref="Free"/> on both the source and a sharer returns the same physical block ids to the free
-    /// list twice — a later allocation would hand the same block to two sequences. Free only one holder of
-    /// a shared prefix (or drop refcounting in a future revision if independent lifetimes are needed).
-    /// </description></item>
-    /// </list>
+    /// Sharing is safe for independent lifetimes: <see cref="Free"/> is reference-counted (a shared block
+    /// is returned to the pool only when its last holder frees it), and a later <see cref="Append"/> to
+    /// either sequence copies a shared partially-filled tail block to a private block before writing
+    /// (copy-on-write), so continuations never corrupt the other sequence.
     /// </remarks>
     public void ShareBlocks(int sourceSeqId, int targetSeqId, int prefixLen)
     {
@@ -214,7 +305,12 @@ public sealed class DevicePagedKVCache : IDisposable
             throw new ArgumentOutOfRangeException(nameof(prefixLen));
         int blocksNeeded = (prefixLen + BlockSize - 1) / BlockSize;
         var targetTable = new List<int>(blocksNeeded);
-        for (int i = 0; i < blocksNeeded; i++) targetTable.Add(src[i]);
+        for (int i = 0; i < blocksNeeded; i++)
+        {
+            int blk = src[i];
+            targetTable.Add(blk);
+            _refCount[blk]++;
+        }
         _blockTables[targetSeqId] = targetTable;
         _lengths[targetSeqId] = prefixLen;
     }

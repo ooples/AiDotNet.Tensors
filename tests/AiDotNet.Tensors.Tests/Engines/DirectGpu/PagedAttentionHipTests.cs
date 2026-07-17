@@ -5,6 +5,7 @@
 #if NET6_0_OR_GREATER
 
 using System;
+using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.HIP;
 using Xunit;
 
@@ -31,13 +32,21 @@ public sealed class PagedAttentionHipTests : IDisposable
         Assert.True(_ready, "HIP/ROCm backend NOT available on this host");
     }
 
+    private bool EnsureReady()
+    {
+        if (_ready) return true;
+        if (string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_HIP"), "1", StringComparison.Ordinal))
+            throw new InvalidOperationException("GPU tests required but HIP/ROCm was unavailable.");
+        return false;
+    }
+
     [Theory]
     [InlineData(4, 64, 16, 40)]
     [InlineData(2, 128, 8, 20)]
     [InlineData(8, 32, 32, 100)]
     public void PagedAttentionDecode_MatchesCpuOracle(int heads, int headDim, int blockSize, int seqLen)
     {
-        if (!_ready) return;
+        if (!EnsureReady()) return;
         var backend = _backend!;
         var rng = new Random(0xA77 + heads + seqLen);
 
@@ -84,13 +93,21 @@ public sealed class PagedAttentionHipTests : IDisposable
             }
         }
 
-        var qBuf = backend.AllocateBuffer(q);
-        var kBuf = backend.AllocateBuffer(kcache);
-        var vBuf = backend.AllocateBuffer(vcache);
-        var btBuf = backend.AllocateIntBuffer(blockTable);
-        var outBuf = backend.PagedAttentionDecode(qBuf, kBuf, vBuf, btBuf, heads, headDim, blockSize, seqLen, scale);
-        var actual = backend.DownloadBuffer(outBuf);
-        qBuf.Dispose(); kBuf.Dispose(); vBuf.Dispose(); btBuf.Dispose(); outBuf.Dispose();
+        float[] actual;
+        IGpuBuffer? qBuf = null, kBuf = null, vBuf = null, btBuf = null, outBuf = null;
+        try
+        {
+            qBuf = backend.AllocateBuffer(q);
+            kBuf = backend.AllocateBuffer(kcache);
+            vBuf = backend.AllocateBuffer(vcache);
+            btBuf = backend.AllocateIntBuffer(blockTable);
+            outBuf = backend.PagedAttentionDecode(qBuf, kBuf, vBuf, btBuf, heads, headDim, blockSize, seqLen, scale);
+            actual = backend.DownloadBuffer(outBuf);
+        }
+        finally
+        {
+            qBuf?.Dispose(); kBuf?.Dispose(); vBuf?.Dispose(); btBuf?.Dispose(); outBuf?.Dispose();
+        }
 
         Assert.Equal(heads * headDim, actual.Length);
         for (int i = 0; i < expected.Length; i++)
@@ -107,7 +124,7 @@ public sealed class PagedAttentionHipTests : IDisposable
     [InlineData(8, 32, 32, 20, 40)]
     public void PagedAttentionPrefill_MatchesCpuOracle(int heads, int headDim, int blockSize, int numQueries, int startPos)
     {
-        if (!_ready) return;
+        if (!EnsureReady()) return;
         var backend = _backend!;
         var rng = new Random(0xB99 + heads + numQueries + startPos);
 
@@ -160,13 +177,21 @@ public sealed class PagedAttentionHipTests : IDisposable
             }
         }
 
-        var qBuf = backend.AllocateBuffer(q);
-        var kBuf = backend.AllocateBuffer(kcache);
-        var vBuf = backend.AllocateBuffer(vcache);
-        var btBuf = backend.AllocateIntBuffer(blockTable);
-        var outBuf = backend.PagedAttentionPrefill(qBuf, kBuf, vBuf, btBuf, heads, headDim, blockSize, numQueries, startPos, scale);
-        var actual = backend.DownloadBuffer(outBuf);
-        qBuf.Dispose(); kBuf.Dispose(); vBuf.Dispose(); btBuf.Dispose(); outBuf.Dispose();
+        float[] actual;
+        IGpuBuffer? qBuf = null, kBuf = null, vBuf = null, btBuf = null, outBuf = null;
+        try
+        {
+            qBuf = backend.AllocateBuffer(q);
+            kBuf = backend.AllocateBuffer(kcache);
+            vBuf = backend.AllocateBuffer(vcache);
+            btBuf = backend.AllocateIntBuffer(blockTable);
+            outBuf = backend.PagedAttentionPrefill(qBuf, kBuf, vBuf, btBuf, heads, headDim, blockSize, numQueries, startPos, scale);
+            actual = backend.DownloadBuffer(outBuf);
+        }
+        finally
+        {
+            qBuf?.Dispose(); kBuf?.Dispose(); vBuf?.Dispose(); btBuf?.Dispose(); outBuf?.Dispose();
+        }
 
         Assert.Equal(numQueries * heads * headDim, actual.Length);
         for (int i = 0; i < expected.Length; i++)
@@ -183,7 +208,7 @@ public sealed class PagedAttentionHipTests : IDisposable
     [InlineData(8, 1, 64, 32, 50)]
     public void PagedAttentionDecodeGqa_MatchesCpuOracle(int heads, int kvHeads, int headDim, int blockSize, int seqLen)
     {
-        if (!_ready) return;
+        if (!EnsureReady()) return;
         var backend = _backend!;
         var rng = new Random(0xC55 + heads + kvHeads + seqLen);
         int numLogicalBlocks = (seqLen + blockSize - 1) / blockSize;
@@ -226,13 +251,21 @@ public sealed class PagedAttentionHipTests : IDisposable
             }
         }
 
-        var qBuf = backend.AllocateBuffer(q);
-        var kBuf = backend.AllocateBuffer(kcache);
-        var vBuf = backend.AllocateBuffer(vcache);
-        var btBuf = backend.AllocateIntBuffer(blockTable);
-        var outBuf = backend.PagedAttentionDecodeGqa(qBuf, kBuf, vBuf, btBuf, heads, kvHeads, headDim, blockSize, seqLen, scale);
-        var actual = backend.DownloadBuffer(outBuf);
-        qBuf.Dispose(); kBuf.Dispose(); vBuf.Dispose(); btBuf.Dispose(); outBuf.Dispose();
+        float[] actual;
+        IGpuBuffer? qBuf = null, kBuf = null, vBuf = null, btBuf = null, outBuf = null;
+        try
+        {
+            qBuf = backend.AllocateBuffer(q);
+            kBuf = backend.AllocateBuffer(kcache);
+            vBuf = backend.AllocateBuffer(vcache);
+            btBuf = backend.AllocateIntBuffer(blockTable);
+            outBuf = backend.PagedAttentionDecodeGqa(qBuf, kBuf, vBuf, btBuf, heads, kvHeads, headDim, blockSize, seqLen, scale);
+            actual = backend.DownloadBuffer(outBuf);
+        }
+        finally
+        {
+            qBuf?.Dispose(); kBuf?.Dispose(); vBuf?.Dispose(); btBuf?.Dispose(); outBuf?.Dispose();
+        }
 
         Assert.Equal(heads * headDim, actual.Length);
         for (int i = 0; i < expected.Length; i++)
@@ -248,7 +281,7 @@ public sealed class PagedAttentionHipTests : IDisposable
     [InlineData(8, 1, 32, 8, 12, 5)]
     public void PagedAttentionPrefillGqa_MatchesCpuOracle(int heads, int kvHeads, int headDim, int blockSize, int numQueries, int startPos)
     {
-        if (!_ready) return;
+        if (!EnsureReady()) return;
         var backend = _backend!;
         var rng = new Random(0xD66 + heads + kvHeads + numQueries + startPos);
         int maxKeyLen = startPos + numQueries;
@@ -297,13 +330,21 @@ public sealed class PagedAttentionHipTests : IDisposable
             }
         }
 
-        var qBuf = backend.AllocateBuffer(q);
-        var kBuf = backend.AllocateBuffer(kcache);
-        var vBuf = backend.AllocateBuffer(vcache);
-        var btBuf = backend.AllocateIntBuffer(blockTable);
-        var outBuf = backend.PagedAttentionPrefillGqa(qBuf, kBuf, vBuf, btBuf, heads, kvHeads, headDim, blockSize, numQueries, startPos, scale);
-        var actual = backend.DownloadBuffer(outBuf);
-        qBuf.Dispose(); kBuf.Dispose(); vBuf.Dispose(); btBuf.Dispose(); outBuf.Dispose();
+        float[] actual;
+        IGpuBuffer? qBuf = null, kBuf = null, vBuf = null, btBuf = null, outBuf = null;
+        try
+        {
+            qBuf = backend.AllocateBuffer(q);
+            kBuf = backend.AllocateBuffer(kcache);
+            vBuf = backend.AllocateBuffer(vcache);
+            btBuf = backend.AllocateIntBuffer(blockTable);
+            outBuf = backend.PagedAttentionPrefillGqa(qBuf, kBuf, vBuf, btBuf, heads, kvHeads, headDim, blockSize, numQueries, startPos, scale);
+            actual = backend.DownloadBuffer(outBuf);
+        }
+        finally
+        {
+            qBuf?.Dispose(); kBuf?.Dispose(); vBuf?.Dispose(); btBuf?.Dispose(); outBuf?.Dispose();
+        }
 
         Assert.Equal(numQueries * heads * headDim, actual.Length);
         for (int i = 0; i < expected.Length; i++)

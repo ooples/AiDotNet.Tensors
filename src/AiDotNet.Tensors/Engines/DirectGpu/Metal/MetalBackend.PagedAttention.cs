@@ -15,6 +15,7 @@ public sealed partial class MetalBackend
         int heads, int headDim, int blockSize, int seqLen, float scale)
     {
         ThrowIfDisposed();
+        GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecode));
         var output = AllocateBuffer(heads * headDim);
         var pipeline = GetPipeline("PagedAttention", _pagedAttnLibrary, "paged_attention_decode");
         var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(heads);
@@ -42,6 +43,8 @@ public sealed partial class MetalBackend
         int heads, int headDim, int blockSize, int numQueries, int startPos, float scale)
     {
         ThrowIfDisposed();
+        GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefill));
+        if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
         var output = AllocateBuffer(numQueries * heads * headDim);
         var pipeline = GetPipeline("PagedAttention", _pagedAttnLibrary, "paged_attention_prefill");
         var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(numQueries * heads);
@@ -70,6 +73,8 @@ public sealed partial class MetalBackend
         int heads, int kvHeads, int headDim, int blockSize, int seqLen, float scale)
     {
         ThrowIfDisposed();
+        GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecodeGqa));
+        GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionDecodeGqa));
         var output = AllocateBuffer(heads * headDim);
         var pipeline = GetPipeline("PagedAttention", _pagedAttnLibrary, "paged_attention_decode_gqa");
         var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(heads);
@@ -98,6 +103,9 @@ public sealed partial class MetalBackend
         int heads, int kvHeads, int headDim, int blockSize, int numQueries, int startPos, float scale)
     {
         ThrowIfDisposed();
+        GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefillGqa));
+        GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionPrefillGqa));
+        if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
         var output = AllocateBuffer(numQueries * heads * headDim);
         var pipeline = GetPipeline("PagedAttention", _pagedAttnLibrary, "paged_attention_prefill_gqa");
         var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(numQueries * heads);
@@ -128,6 +136,10 @@ public sealed partial class MetalBackend
         int heads, int kvHeads, int headDim, int seqLen, float scale, int splits = 0)
     {
         ThrowIfDisposed();
+        GpuKernelGuards.FlashDecode(heads, kvHeads, headDim, seqLen, nameof(FlashDecode));
+        GpuKernelGuards.Capacity(q, (long)heads * headDim, nameof(q), nameof(FlashDecode));
+        GpuKernelGuards.Capacity(k, (long)seqLen * kvHeads * headDim, nameof(k), nameof(FlashDecode));
+        GpuKernelGuards.Capacity(v, (long)seqLen * kvHeads * headDim, nameof(v), nameof(FlashDecode));
         if (seqLen <= 0) throw new ArgumentOutOfRangeException(nameof(seqLen));
         int effSplits = splits > 0 ? splits : System.Math.Min(seqLen, 8);
         if (effSplits > seqLen) effSplits = seqLen;

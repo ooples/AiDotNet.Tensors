@@ -57,6 +57,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     // enable; any cuBLASLt failure falls back to the existing multi-launch path, so it is safe to flip on.
     private CuBlasLtMatmul? _cublasLt;
     private bool _cublasLtUnavailable;
+    private readonly object _cublasLtInitLock = new(); // guards TryGetCuBlasLt lazy init against races
     private static readonly bool CuBlasLtFusedEnabled =
         Environment.GetEnvironmentVariable("AIDOTNET_CUBLASLT_FUSED") == "1";
     // #742: the handle's default fp32 GEMM math mode chosen at init (TF32 tensor-op on Ampere+, else
@@ -847,9 +848,19 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         _normalizationModule = CompileKernelModule(device, CudaNormalizationKernels.GetSource(), "normalization_kernels", CudaNormalizationKernels.GetKernelNames());
         _neuralNetModule = CompileKernelModule(device, CudaNeuralNetKernels.GetSource(), "neuralnet_kernels", CudaNeuralNetKernels.GetKernelNames());
         _fusedModule = CompileKernelModule(device, CudaFusedKernels.GetSource(), "fused_kernels", CudaFusedKernels.GetKernelNames());
-        _quantGemmModule = CompileKernelModule(device, Kernels.CudaQuantGemmKernels.GetSource(), "quant_gemm_kernels", Kernels.CudaQuantGemmKernels.GetKernelNames());
-        _pagedAttnModule = CompileKernelModule(device, Kernels.CudaPagedAttentionKernels.GetSource(), "paged_attention_kernels", Kernels.CudaPagedAttentionKernels.GetKernelNames());
-        _flashDecodeModule = CompileKernelModule(device, Kernels.CudaFlashDecodeKernels.GetSource(), "flash_decode_kernels", Kernels.CudaFlashDecodeKernels.GetKernelNames());
+        // Serving-parity kernels (P0 dequant-GEMM, P1 paged attention, P2 flash-decode) compile in their
+        // OWN try/catch so an nvRTC failure on a minimal CUDA Toolkit degrades just these features
+        // (calls throw "kernel not found") instead of taking down the whole backend at construction.
+        try
+        {
+            _quantGemmModule = CompileKernelModule(device, Kernels.CudaQuantGemmKernels.GetSource(), "quant_gemm_kernels", Kernels.CudaQuantGemmKernels.GetKernelNames());
+            _pagedAttnModule = CompileKernelModule(device, Kernels.CudaPagedAttentionKernels.GetSource(), "paged_attention_kernels", Kernels.CudaPagedAttentionKernels.GetKernelNames());
+            _flashDecodeModule = CompileKernelModule(device, Kernels.CudaFlashDecodeKernels.GetSource(), "flash_decode_kernels", Kernels.CudaFlashDecodeKernels.GetKernelNames());
+        }
+        catch
+        {
+            // P0/P1/P2 serving kernels are optional; leave their modules unset and degrade gracefully.
+        }
         _attentionModule = CompileKernelModule(device, CudaAttentionKernels.GetSource(), "attention_kernels", CudaAttentionKernels.GetKernelNames());
         _fftModule = CompileKernelModule(device, Kernels.CudaFFTKernels.GetSource(), "fft_kernels", Kernels.CudaFFTKernels.GetKernelNames());
         _spectralPerfModule = CompileKernelModule(device, Kernels.CudaSpectralPerfKernels.GetSource(), "spectral_perf_kernels", Kernels.CudaSpectralPerfKernels.GetKernelNames());
@@ -2392,16 +2403,23 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (_cublasLtUnavailable) return null;
         if (_cublasLt is not null) return _cublasLt;
-        try
+        // Double-checked locking: without this, two concurrent first callers could each construct a
+        // CuBlasLtMatmul and leak the loser's native handle (mirrors the _cudnnInitLock guard).
+        lock (_cublasLtInitLock)
         {
-            if (!CuBlasLtMatmul.IsAvailable) { _cublasLtUnavailable = true; return null; }
-            _cublasLt = new CuBlasLtMatmul();
-            return _cublasLt;
-        }
-        catch
-        {
-            _cublasLtUnavailable = true;
-            return null;
+            if (_cublasLtUnavailable) return null;
+            if (_cublasLt is not null) return _cublasLt;
+            try
+            {
+                if (!CuBlasLtMatmul.IsAvailable) { _cublasLtUnavailable = true; return null; }
+                _cublasLt = new CuBlasLtMatmul();
+                return _cublasLt;
+            }
+            catch
+            {
+                _cublasLtUnavailable = true;
+                return null;
+            }
         }
     }
 
@@ -2555,19 +2573,34 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     /// buffer of the int8 payload.</summary>
     public IGpuBuffer DequantGemmInt8(IGpuBuffer activations, IGpuBuffer weightsInt8, IGpuBuffer scales,
         int M, int K, int N, int groupSize, int scaleCount)
-        => LaunchDequantGemm("dequant_gemm_int8", activations, weightsInt8, scales, M, K, N, groupSize, scaleCount);
+    {
+        GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmInt8));
+        GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmInt8));
+        GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmInt8));
+        return LaunchDequantGemm("dequant_gemm_int8", activations, weightsInt8, scales, M, K, N, groupSize, scaleCount);
+    }
 
     /// <summary>Weight-only fused dequant-GEMM (int4, 2 signed nibbles/byte, low nibble even). Weights
     /// are a byte buffer of length ceil(K*N/2); matches FusedDequantMatmulKernels.Q4MatMul.</summary>
     public IGpuBuffer DequantGemmInt4(IGpuBuffer activations, IGpuBuffer weightsInt4Packed, IGpuBuffer scales,
         int M, int K, int N, int groupSize, int scaleCount)
-        => LaunchDequantGemm("dequant_gemm_int4", activations, weightsInt4Packed, scales, M, K, N, groupSize, scaleCount);
+    {
+        GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmInt4));
+        GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmInt4));
+        GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmInt4));
+        return LaunchDequantGemm("dequant_gemm_int4", activations, weightsInt4Packed, scales, M, K, N, groupSize, scaleCount);
+    }
 
     /// <summary>Weight-only fused dequant-GEMM (OCP FP8 E4M3). Weights are a byte buffer of raw e4m3
     /// bytes; in-kernel decode matches Float8E4M3.ToFloat.</summary>
     public IGpuBuffer DequantGemmFp8E4M3(IGpuBuffer activations, IGpuBuffer weightsFp8, IGpuBuffer scales,
         int M, int K, int N, int groupSize, int scaleCount)
-        => LaunchDequantGemm("dequant_gemm_fp8_e4m3", activations, weightsFp8, scales, M, K, N, groupSize, scaleCount);
+    {
+        GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmFp8E4M3));
+        GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmFp8E4M3));
+        GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmFp8E4M3));
+        return LaunchDequantGemm("dequant_gemm_fp8_e4m3", activations, weightsFp8, scales, M, K, N, groupSize, scaleCount);
+    }
 
     private unsafe IGpuBuffer LaunchDequantGemm(string kernelName, IGpuBuffer act, IGpuBuffer weights, IGpuBuffer scales,
         int M, int K, int N, int groupSize, int scaleCount)
@@ -2595,6 +2628,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (!_kernelCache.TryGetValue("paged_attention_decode", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: paged_attention_decode");
+        GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecode));
         var output = AllocateBuffer(heads * headDim);
         using var _ = PushContext();
         uint grid = (uint)(((long)heads + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -2615,6 +2649,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (!_kernelCache.TryGetValue("paged_attention_prefill", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: paged_attention_prefill");
+        GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefill));
+        if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
         var output = AllocateBuffer(numQueries * heads * headDim);
         using var _ = PushContext();
         int totalItems = numQueries * heads;
@@ -2635,6 +2671,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (!_kernelCache.TryGetValue("paged_attention_decode_gqa", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: paged_attention_decode_gqa");
+        GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecodeGqa));
+        GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionDecodeGqa));
         var output = AllocateBuffer(heads * headDim);
         using var _ = PushContext();
         uint grid = (uint)(((long)heads + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -2653,6 +2691,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (!_kernelCache.TryGetValue("paged_attention_prefill_gqa", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: paged_attention_prefill_gqa");
+        GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefillGqa));
+        GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionPrefillGqa));
+        if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
         var output = AllocateBuffer(numQueries * heads * headDim);
         using var _ = PushContext();
         int totalItems = numQueries * heads;
@@ -2676,6 +2717,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new InvalidOperationException("CUDA kernel not found: flash_decode_partial");
         if (!_kernelCache.TryGetValue("flash_decode_reduce", out var reduceKernel))
             throw new InvalidOperationException("CUDA kernel not found: flash_decode_reduce");
+        GpuKernelGuards.FlashDecode(heads, kvHeads, headDim, seqLen, nameof(FlashDecode));
+        GpuKernelGuards.Capacity(q, (long)heads * headDim, nameof(q), nameof(FlashDecode));
+        GpuKernelGuards.Capacity(k, (long)seqLen * kvHeads * headDim, nameof(k), nameof(FlashDecode));
+        GpuKernelGuards.Capacity(v, (long)seqLen * kvHeads * headDim, nameof(v), nameof(FlashDecode));
         if (seqLen <= 0) throw new ArgumentOutOfRangeException(nameof(seqLen));
         int effSplits = splits > 0 ? splits : System.Math.Min(seqLen, 8);
         if (effSplits > seqLen) effSplits = seqLen;

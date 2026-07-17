@@ -6,6 +6,7 @@
 #if NET6_0_OR_GREATER
 
 using System;
+using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 using Xunit;
 
@@ -74,12 +75,20 @@ public sealed class FlashDecodeOpenClTests : IDisposable
         for (int i = 0; i < q.Length; i++) q[i] = (float)(rng.NextDouble() * 2 - 1);
         float scale = 1.0f / MathF.Sqrt(headDim);
 
-        var qBuf = backend.AllocateBuffer(q);
-        var kBuf = backend.AllocateBuffer(k);
-        var vBuf = backend.AllocateBuffer(v);
-        var outBuf = backend.FlashDecode(qBuf, kBuf, vBuf, heads, kvHeads, headDim, seqLen, scale, splits);
-        var actual = backend.DownloadBuffer(outBuf);
-        qBuf.Dispose(); kBuf.Dispose(); vBuf.Dispose(); outBuf.Dispose();
+        float[] actual;
+        IGpuBuffer? qBuf = null, kBuf = null, vBuf = null, outBuf = null;
+        try
+        {
+            qBuf = backend.AllocateBuffer(q);
+            kBuf = backend.AllocateBuffer(k);
+            vBuf = backend.AllocateBuffer(v);
+            outBuf = backend.FlashDecode(qBuf, kBuf, vBuf, heads, kvHeads, headDim, seqLen, scale, splits);
+            actual = backend.DownloadBuffer(outBuf);
+        }
+        finally
+        {
+            qBuf?.Dispose(); kBuf?.Dispose(); vBuf?.Dispose(); outBuf?.Dispose();
+        }
 
         var expected = DecodeOracle(q, k, v, heads, kvHeads, headDim, seqLen, scale);
         Assert.Equal(expected.Length, actual.Length);

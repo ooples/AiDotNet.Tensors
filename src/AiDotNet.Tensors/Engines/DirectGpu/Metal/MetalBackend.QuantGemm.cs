@@ -28,6 +28,9 @@ public sealed partial class MetalBackend
         int M, int K, int N, int groupSize, int scaleCount)
     {
         ThrowIfDisposed();
+        GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(LaunchDequantGemm));
+        GpuKernelGuards.Capacity(act, (long)M * K, nameof(act), nameof(LaunchDequantGemm));
+        GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(LaunchDequantGemm));
         var output = AllocateBuffer(M * N);
         var pipeline = GetPipeline("QuantGemm", _quantGemmLibrary, kernelName);
         var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(M * N);

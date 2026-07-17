@@ -6,6 +6,7 @@
 #if NET6_0_OR_GREATER
 
 using System;
+using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.NumericOperations;
 using Xunit;
@@ -33,6 +34,14 @@ public sealed class QuantGemmCudaTests : IDisposable
     {
         if (Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_CUDA") != "1") return;
         Assert.True(_ready, "CUDA backend NOT available on this host");
+    }
+
+    private bool EnsureReady()
+    {
+        if (_ready) return true;
+        if (string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_CUDA"), "1", StringComparison.Ordinal))
+            throw new InvalidOperationException("GPU tests required but CUDA was unavailable.");
+        return false;
     }
 
     private static float[] RandomAct(Random rng)
@@ -92,7 +101,7 @@ public sealed class QuantGemmCudaTests : IDisposable
     [InlineData(64)]
     public void DequantGemmInt8_MatchesCpuOracle(int groupSize)
     {
-        if (!_ready) return;
+        if (!EnsureReady()) return;
         var backend = _backend!;
         var rng = new Random(0x8100 + groupSize);
 
@@ -108,13 +117,21 @@ public sealed class QuantGemmCudaTests : IDisposable
         var wbytes = new byte[KN];
         for (int i = 0; i < KN; i++) wbytes[i] = unchecked((byte)w[i]);
 
-        var actBuf = backend.AllocateBuffer(act);
-        var scaleBuf = backend.AllocateBuffer(scales);
-        var wBuf = backend.AllocateByteBuffer(KN);
-        backend.UploadByteBuffer(wBuf, wbytes);
-        var outBuf = backend.DequantGemmInt8(actBuf, wBuf, scaleBuf, M, K, N, gsArg, scaleCount);
-        var actual = backend.DownloadBuffer(outBuf);
-        actBuf.Dispose(); scaleBuf.Dispose(); wBuf.Dispose(); outBuf.Dispose();
+        float[] actual;
+        IGpuBuffer? actBuf = null, scaleBuf = null, wBuf = null, outBuf = null;
+        try
+        {
+            actBuf = backend.AllocateBuffer(act);
+            scaleBuf = backend.AllocateBuffer(scales);
+            wBuf = backend.AllocateByteBuffer(KN);
+            backend.UploadByteBuffer(wBuf, wbytes);
+            outBuf = backend.DequantGemmInt8(actBuf, wBuf, scaleBuf, M, K, N, gsArg, scaleCount);
+            actual = backend.DownloadBuffer(outBuf);
+        }
+        finally
+        {
+            actBuf?.Dispose(); scaleBuf?.Dispose(); wBuf?.Dispose(); outBuf?.Dispose();
+        }
 
         AssertClose(expected, actual, $"int8(gs={groupSize})");
     }
@@ -124,7 +141,7 @@ public sealed class QuantGemmCudaTests : IDisposable
     [InlineData(64)]
     public void DequantGemmInt4_MatchesCpuOracle(int groupSize)
     {
-        if (!_ready) return;
+        if (!EnsureReady()) return;
         var backend = _backend!;
         var rng = new Random(0x4400 + groupSize);
 
@@ -144,13 +161,21 @@ public sealed class QuantGemmCudaTests : IDisposable
         for (int i = 0; i < KN; i++) decoded[i] = w[i];
         var expected = Reference(act, decoded, scales, gsArg, scaleCount);
 
-        var actBuf = backend.AllocateBuffer(act);
-        var scaleBuf = backend.AllocateBuffer(scales);
-        var wBuf = backend.AllocateByteBuffer(packed.Length);
-        backend.UploadByteBuffer(wBuf, packed);
-        var outBuf = backend.DequantGemmInt4(actBuf, wBuf, scaleBuf, M, K, N, gsArg, scaleCount);
-        var actual = backend.DownloadBuffer(outBuf);
-        actBuf.Dispose(); scaleBuf.Dispose(); wBuf.Dispose(); outBuf.Dispose();
+        float[] actual;
+        IGpuBuffer? actBuf = null, scaleBuf = null, wBuf = null, outBuf = null;
+        try
+        {
+            actBuf = backend.AllocateBuffer(act);
+            scaleBuf = backend.AllocateBuffer(scales);
+            wBuf = backend.AllocateByteBuffer(packed.Length);
+            backend.UploadByteBuffer(wBuf, packed);
+            outBuf = backend.DequantGemmInt4(actBuf, wBuf, scaleBuf, M, K, N, gsArg, scaleCount);
+            actual = backend.DownloadBuffer(outBuf);
+        }
+        finally
+        {
+            actBuf?.Dispose(); scaleBuf?.Dispose(); wBuf?.Dispose(); outBuf?.Dispose();
+        }
 
         AssertClose(expected, actual, $"int4(gs={groupSize})");
     }
@@ -160,7 +185,7 @@ public sealed class QuantGemmCudaTests : IDisposable
     [InlineData(64)]
     public void DequantGemmFp8E4M3_MatchesCpuOracle(int groupSize)
     {
-        if (!_ready) return;
+        if (!EnsureReady()) return;
         var backend = _backend!;
         var rng = new Random(0xF800 + groupSize);
 
@@ -176,13 +201,21 @@ public sealed class QuantGemmCudaTests : IDisposable
         var (scales, scaleCount, gsArg) = MakeScales(rng, groupSize);
         var expected = Reference(act, decoded, scales, gsArg, scaleCount);
 
-        var actBuf = backend.AllocateBuffer(act);
-        var scaleBuf = backend.AllocateBuffer(scales);
-        var wBuf = backend.AllocateByteBuffer(KN);
-        backend.UploadByteBuffer(wBuf, raws);
-        var outBuf = backend.DequantGemmFp8E4M3(actBuf, wBuf, scaleBuf, M, K, N, gsArg, scaleCount);
-        var actual = backend.DownloadBuffer(outBuf);
-        actBuf.Dispose(); scaleBuf.Dispose(); wBuf.Dispose(); outBuf.Dispose();
+        float[] actual;
+        IGpuBuffer? actBuf = null, scaleBuf = null, wBuf = null, outBuf = null;
+        try
+        {
+            actBuf = backend.AllocateBuffer(act);
+            scaleBuf = backend.AllocateBuffer(scales);
+            wBuf = backend.AllocateByteBuffer(KN);
+            backend.UploadByteBuffer(wBuf, raws);
+            outBuf = backend.DequantGemmFp8E4M3(actBuf, wBuf, scaleBuf, M, K, N, gsArg, scaleCount);
+            actual = backend.DownloadBuffer(outBuf);
+        }
+        finally
+        {
+            actBuf?.Dispose(); scaleBuf?.Dispose(); wBuf?.Dispose(); outBuf?.Dispose();
+        }
 
         AssertClose(expected, actual, $"fp8(gs={groupSize})");
     }

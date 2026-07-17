@@ -6,6 +6,7 @@
 #if NET6_0_OR_GREATER
 
 using System;
+using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 using Xunit;
 
@@ -89,13 +90,21 @@ public sealed class PagedAttentionOpenClTests : IDisposable
             }
         }
 
-        var qBuf = backend.AllocateBuffer(q);
-        var kBuf = backend.AllocateBuffer(kcache);
-        var vBuf = backend.AllocateBuffer(vcache);
-        var btBuf = backend.AllocateIntBuffer(blockTable);
-        var outBuf = backend.PagedAttentionDecode(qBuf, kBuf, vBuf, btBuf, heads, headDim, blockSize, seqLen, scale);
-        var actual = backend.DownloadBuffer(outBuf);
-        qBuf.Dispose(); kBuf.Dispose(); vBuf.Dispose(); btBuf.Dispose(); outBuf.Dispose();
+        float[] actual;
+        IGpuBuffer? qBuf = null, kBuf = null, vBuf = null, btBuf = null, outBuf = null;
+        try
+        {
+            qBuf = backend.AllocateBuffer(q);
+            kBuf = backend.AllocateBuffer(kcache);
+            vBuf = backend.AllocateBuffer(vcache);
+            btBuf = backend.AllocateIntBuffer(blockTable);
+            outBuf = backend.PagedAttentionDecode(qBuf, kBuf, vBuf, btBuf, heads, headDim, blockSize, seqLen, scale);
+            actual = backend.DownloadBuffer(outBuf);
+        }
+        finally
+        {
+            qBuf?.Dispose(); kBuf?.Dispose(); vBuf?.Dispose(); btBuf?.Dispose(); outBuf?.Dispose();
+        }
 
         Assert.Equal(heads * headDim, actual.Length);
         for (int i = 0; i < expected.Length; i++)
@@ -166,13 +175,21 @@ public sealed class PagedAttentionOpenClTests : IDisposable
             }
         }
 
-        var qBuf = backend.AllocateBuffer(q);
-        var kBuf = backend.AllocateBuffer(kcache);
-        var vBuf = backend.AllocateBuffer(vcache);
-        var btBuf = backend.AllocateIntBuffer(blockTable);
-        var outBuf = backend.PagedAttentionPrefill(qBuf, kBuf, vBuf, btBuf, heads, headDim, blockSize, numQueries, startPos, scale);
-        var actual = backend.DownloadBuffer(outBuf);
-        qBuf.Dispose(); kBuf.Dispose(); vBuf.Dispose(); btBuf.Dispose(); outBuf.Dispose();
+        float[] actual;
+        IGpuBuffer? qBuf = null, kBuf = null, vBuf = null, btBuf = null, outBuf = null;
+        try
+        {
+            qBuf = backend.AllocateBuffer(q);
+            kBuf = backend.AllocateBuffer(kcache);
+            vBuf = backend.AllocateBuffer(vcache);
+            btBuf = backend.AllocateIntBuffer(blockTable);
+            outBuf = backend.PagedAttentionPrefill(qBuf, kBuf, vBuf, btBuf, heads, headDim, blockSize, numQueries, startPos, scale);
+            actual = backend.DownloadBuffer(outBuf);
+        }
+        finally
+        {
+            qBuf?.Dispose(); kBuf?.Dispose(); vBuf?.Dispose(); btBuf?.Dispose(); outBuf?.Dispose();
+        }
 
         Assert.Equal(numQueries * heads * headDim, actual.Length);
         for (int i = 0; i < expected.Length; i++)
@@ -233,13 +250,21 @@ public sealed class PagedAttentionOpenClTests : IDisposable
             }
         }
 
-        var qBuf = backend.AllocateBuffer(q);
-        var kBuf = backend.AllocateBuffer(kcache);
-        var vBuf = backend.AllocateBuffer(vcache);
-        var btBuf = backend.AllocateIntBuffer(blockTable);
-        var outBuf = backend.PagedAttentionDecodeGqa(qBuf, kBuf, vBuf, btBuf, heads, kvHeads, headDim, blockSize, seqLen, scale);
-        var actual = backend.DownloadBuffer(outBuf);
-        qBuf.Dispose(); kBuf.Dispose(); vBuf.Dispose(); btBuf.Dispose(); outBuf.Dispose();
+        float[] actual;
+        IGpuBuffer? qBuf = null, kBuf = null, vBuf = null, btBuf = null, outBuf = null;
+        try
+        {
+            qBuf = backend.AllocateBuffer(q);
+            kBuf = backend.AllocateBuffer(kcache);
+            vBuf = backend.AllocateBuffer(vcache);
+            btBuf = backend.AllocateIntBuffer(blockTable);
+            outBuf = backend.PagedAttentionDecodeGqa(qBuf, kBuf, vBuf, btBuf, heads, kvHeads, headDim, blockSize, seqLen, scale);
+            actual = backend.DownloadBuffer(outBuf);
+        }
+        finally
+        {
+            qBuf?.Dispose(); kBuf?.Dispose(); vBuf?.Dispose(); btBuf?.Dispose(); outBuf?.Dispose();
+        }
 
         Assert.Equal(heads * headDim, actual.Length);
         for (int i = 0; i < expected.Length; i++)
@@ -305,13 +330,21 @@ public sealed class PagedAttentionOpenClTests : IDisposable
             }
         }
 
-        var qBuf = backend.AllocateBuffer(q);
-        var kBuf = backend.AllocateBuffer(kcache);
-        var vBuf = backend.AllocateBuffer(vcache);
-        var btBuf = backend.AllocateIntBuffer(blockTable);
-        var outBuf = backend.PagedAttentionPrefillGqa(qBuf, kBuf, vBuf, btBuf, heads, kvHeads, headDim, blockSize, numQueries, startPos, scale);
-        var actual = backend.DownloadBuffer(outBuf);
-        qBuf.Dispose(); kBuf.Dispose(); vBuf.Dispose(); btBuf.Dispose(); outBuf.Dispose();
+        float[] actual;
+        IGpuBuffer? qBuf = null, kBuf = null, vBuf = null, btBuf = null, outBuf = null;
+        try
+        {
+            qBuf = backend.AllocateBuffer(q);
+            kBuf = backend.AllocateBuffer(kcache);
+            vBuf = backend.AllocateBuffer(vcache);
+            btBuf = backend.AllocateIntBuffer(blockTable);
+            outBuf = backend.PagedAttentionPrefillGqa(qBuf, kBuf, vBuf, btBuf, heads, kvHeads, headDim, blockSize, numQueries, startPos, scale);
+            actual = backend.DownloadBuffer(outBuf);
+        }
+        finally
+        {
+            qBuf?.Dispose(); kBuf?.Dispose(); vBuf?.Dispose(); btBuf?.Dispose(); outBuf?.Dispose();
+        }
 
         Assert.Equal(numQueries * heads * headDim, actual.Length);
         for (int i = 0; i < expected.Length; i++)

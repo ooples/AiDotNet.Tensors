@@ -233,6 +233,7 @@ public sealed partial class WebGpuBackend
     public IGpuBuffer PagedAttentionDecode(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
         int heads, int headDim, int blockSize, int seqLen, float scale)
     {
+        GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecode));
         var output = AllocateBuffer(heads * headDim);
         DispatchRecurrence("paged_attention_decode", WebGpuKernels.PagedAttentionDecodeSource, heads,
             new[] { q, kcache, vcache, blockTable, output },
@@ -247,6 +248,8 @@ public sealed partial class WebGpuBackend
     public IGpuBuffer PagedAttentionPrefill(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
         int heads, int headDim, int blockSize, int numQueries, int startPos, float scale)
     {
+        GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefill));
+        if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
         var output = AllocateBuffer(numQueries * heads * headDim);
         DispatchRecurrence("paged_attention_prefill", WebGpuKernels.PagedAttentionPrefillSource, numQueries * heads,
             new[] { q, kcache, vcache, blockTable, output },
@@ -259,6 +262,8 @@ public sealed partial class WebGpuBackend
     public IGpuBuffer PagedAttentionDecodeGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
         int heads, int kvHeads, int headDim, int blockSize, int seqLen, float scale)
     {
+        GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecodeGqa));
+        GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionDecodeGqa));
         var output = AllocateBuffer(heads * headDim);
         DispatchRecurrence("paged_attention_decode_gqa", WebGpuKernels.PagedAttentionDecodeGqaSource, heads,
             new[] { q, kcache, vcache, blockTable, output },
@@ -271,6 +276,9 @@ public sealed partial class WebGpuBackend
     public IGpuBuffer PagedAttentionPrefillGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
         int heads, int kvHeads, int headDim, int blockSize, int numQueries, int startPos, float scale)
     {
+        GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefillGqa));
+        GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionPrefillGqa));
+        if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
         var output = AllocateBuffer(numQueries * heads * headDim);
         DispatchRecurrence("paged_attention_prefill_gqa", WebGpuKernels.PagedAttentionPrefillGqaSource, numQueries * heads,
             new[] { q, kcache, vcache, blockTable, output },
@@ -284,6 +292,10 @@ public sealed partial class WebGpuBackend
     public IGpuBuffer FlashDecode(IGpuBuffer q, IGpuBuffer k, IGpuBuffer v,
         int heads, int kvHeads, int headDim, int seqLen, float scale, int splits = 0)
     {
+        GpuKernelGuards.FlashDecode(heads, kvHeads, headDim, seqLen, nameof(FlashDecode));
+        GpuKernelGuards.Capacity(q, (long)heads * headDim, nameof(q), nameof(FlashDecode));
+        GpuKernelGuards.Capacity(k, (long)seqLen * kvHeads * headDim, nameof(k), nameof(FlashDecode));
+        GpuKernelGuards.Capacity(v, (long)seqLen * kvHeads * headDim, nameof(v), nameof(FlashDecode));
         if (seqLen <= 0) throw new ArgumentOutOfRangeException(nameof(seqLen));
         int effSplits = splits > 0 ? splits : Math.Min(seqLen, 8);
         if (effSplits > seqLen) effSplits = seqLen;
@@ -322,6 +334,9 @@ public sealed partial class WebGpuBackend
     public IGpuBuffer DequantGemmInt(IGpuBuffer activations, IGpuBuffer weightsInt, IGpuBuffer scales,
         int M, int K, int N, int groupSize, int scaleCount)
     {
+        GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmInt));
+        GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmInt));
+        GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmInt));
         var output = AllocateBuffer(M * N);
         Dispatch4BufferAsync("DequantGemmInt", WebGpuKernels.DequantGemmIntSource, "dequant_gemm_int",
             activations, weightsInt, scales, output, QuantUniforms(M, K, N, groupSize, scaleCount), M * N)
@@ -337,6 +352,9 @@ public sealed partial class WebGpuBackend
     public IGpuBuffer DequantGemmFp8E4M3(IGpuBuffer activations, IGpuBuffer weightsFp8Raw, IGpuBuffer scales,
         int M, int K, int N, int groupSize, int scaleCount)
     {
+        GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmFp8E4M3));
+        GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmFp8E4M3));
+        GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmFp8E4M3));
         var output = AllocateBuffer(M * N);
         Dispatch4BufferAsync("DequantGemmFp8", WebGpuKernels.DequantGemmFp8Source, "dequant_gemm_fp8",
             activations, weightsFp8Raw, scales, output, QuantUniforms(M, K, N, groupSize, scaleCount), M * N)

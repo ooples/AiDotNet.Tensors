@@ -2665,6 +2665,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int heads, int headDim, int blockSize, int seqLen, float scale)
         {
             if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecode));
             var output = AllocateBuffer(heads * headDim);
             try
             {
@@ -2702,6 +2703,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int heads, int headDim, int blockSize, int numQueries, int startPos, float scale)
         {
             if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefill));
+            if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
             var output = AllocateBuffer(numQueries * heads * headDim);
             try
             {
@@ -2737,6 +2740,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int heads, int kvHeads, int headDim, int blockSize, int seqLen, float scale)
         {
             if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecodeGqa));
+            GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionDecodeGqa));
             var output = AllocateBuffer(heads * headDim);
             try
             {
@@ -2766,6 +2771,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int heads, int kvHeads, int headDim, int blockSize, int numQueries, int startPos, float scale)
         {
             if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefillGqa));
+            GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionPrefillGqa));
+            if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
             var output = AllocateBuffer(numQueries * heads * headDim);
             try
             {
@@ -2804,7 +2812,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int heads, int kvHeads, int headDim, int seqLen, float scale, int splits = 0)
         {
             if (_context == null) throw new InvalidOperationException("OpenCL context not available");
-            if (seqLen <= 0) throw new ArgumentOutOfRangeException(nameof(seqLen));
+            GpuKernelGuards.FlashDecode(heads, kvHeads, headDim, seqLen, nameof(FlashDecode));
+            GpuKernelGuards.Capacity(q, (long)heads * headDim, nameof(q), nameof(FlashDecode));
+            GpuKernelGuards.Capacity(k, (long)seqLen * kvHeads * headDim, nameof(k), nameof(FlashDecode));
+            GpuKernelGuards.Capacity(v, (long)seqLen * kvHeads * headDim, nameof(v), nameof(FlashDecode));
             // Default split count: enough to expose parallelism without tiny chunks. Clamp to seqLen.
             int effSplits = splits > 0 ? splits : Math.Min(seqLen, 8);
             if (effSplits > seqLen) effSplits = seqLen;
@@ -2868,6 +2879,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
+            GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmInt8));
+            GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmInt8));
+            GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmInt8));
 
             var output = AllocateBuffer(M * N);
             try
@@ -2910,6 +2924,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
+            GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmInt4));
+            GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmInt4));
+            GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmInt4));
 
             var output = AllocateBuffer(M * N);
             try
@@ -2952,6 +2969,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
+            GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmFp8E4M3));
+            GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmFp8E4M3));
+            GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmFp8E4M3));
 
             var output = AllocateBuffer(M * N);
             try

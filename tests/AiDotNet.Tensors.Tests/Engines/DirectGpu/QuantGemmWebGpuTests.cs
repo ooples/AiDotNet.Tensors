@@ -6,6 +6,7 @@
 #if NET6_0_OR_GREATER
 
 using System;
+using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 using AiDotNet.Tensors.NumericOperations;
 using Xunit;
@@ -33,6 +34,14 @@ public sealed class QuantGemmWebGpuTests : IDisposable
     {
         if (Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_WEBGPU") != "1") return;
         Assert.True(_ready, "WebGPU backend NOT available on this host");
+    }
+
+    private bool EnsureReady()
+    {
+        if (_ready) return true;
+        if (string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_WEBGPU"), "1", StringComparison.Ordinal))
+            throw new InvalidOperationException("GPU tests required but WebGPU was unavailable.");
+        return false;
     }
 
     private static float[] RandomAct(Random rng)
@@ -88,31 +97,40 @@ public sealed class QuantGemmWebGpuTests : IDisposable
     }
 
     [Theory]
-    [InlineData(-127, 128, 0)]
-    [InlineData(-127, 128, 64)]
+    [InlineData(-128, 128, 0)]   // int8 full signed range, incl. the signed-min -128
+    [InlineData(-128, 128, 64)]  // int8 full signed range, incl. the signed-min -128
     [InlineData(-8, 8, 0)]
     [InlineData(-8, 8, 64)]
     public void DequantGemmInt_MatchesCpuOracle(int lo, int hi, int groupSize)
     {
-        if (!_ready) return;
+        if (!EnsureReady()) return;
         var backend = _backend!;
         var rng = new Random(0x2000 + lo + groupSize);
 
         var act = RandomAct(rng);
         var w = new int[KN];
         for (int i = 0; i < KN; i++) w[i] = rng.Next(lo, hi);
+        w[0] = lo; // guarantee the signed-min of the range (int8 -128 / int4 -8) is exercised
         var (scales, scaleCount, gsArg) = MakeScales(rng, groupSize);
 
         var decoded = new float[KN];
         for (int i = 0; i < KN; i++) decoded[i] = w[i];
         var expected = Reference(act, decoded, scales, gsArg, scaleCount);
 
-        var actBuf = backend.AllocateBuffer(act);
-        var scaleBuf = backend.AllocateBuffer(scales);
-        var wBuf = backend.AllocateIntBuffer(w);
-        var outBuf = backend.DequantGemmInt(actBuf, wBuf, scaleBuf, M, K, N, gsArg, scaleCount);
-        var actual = backend.DownloadBuffer(outBuf);
-        actBuf.Dispose(); scaleBuf.Dispose(); wBuf.Dispose(); outBuf.Dispose();
+        float[] actual;
+        IGpuBuffer? actBuf = null, scaleBuf = null, wBuf = null, outBuf = null;
+        try
+        {
+            actBuf = backend.AllocateBuffer(act);
+            scaleBuf = backend.AllocateBuffer(scales);
+            wBuf = backend.AllocateIntBuffer(w);
+            outBuf = backend.DequantGemmInt(actBuf, wBuf, scaleBuf, M, K, N, gsArg, scaleCount);
+            actual = backend.DownloadBuffer(outBuf);
+        }
+        finally
+        {
+            actBuf?.Dispose(); scaleBuf?.Dispose(); wBuf?.Dispose(); outBuf?.Dispose();
+        }
 
         AssertClose(expected, actual, $"int(lo={lo},gs={groupSize})");
     }
@@ -122,7 +140,7 @@ public sealed class QuantGemmWebGpuTests : IDisposable
     [InlineData(64)]
     public void DequantGemmFp8E4M3_MatchesCpuOracle(int groupSize)
     {
-        if (!_ready) return;
+        if (!EnsureReady()) return;
         var backend = _backend!;
         var rng = new Random(0xF900 + groupSize);
 
@@ -131,19 +149,40 @@ public sealed class QuantGemmWebGpuTests : IDisposable
         var decoded = new float[KN];
         for (int i = 0; i < KN; i++)
         {
-            var f8 = Float8E4M3.FromFloat((float)(rng.NextDouble() * 8.0 - 4.0));
+            // Sweep a broad magnitude range so the E4M3 encoding space (incl. saturation to ±MaxFinite) is exercised.
+            var f8 = Float8E4M3.FromFloat((float)(rng.NextDouble() * 900.0 - 450.0));
             raws[i] = f8.RawValue;
             decoded[i] = f8.ToFloat();
+        }
+        // Explicitly include boundary encodings so coverage isn't confined to a narrow value band.
+        var fp8Boundaries = new[]
+        {
+            Float8E4M3.MaxFinite, Float8E4M3.MinFinite, Float8E4M3.Zero, Float8E4M3.FromFloat(-0f),
+            Float8E4M3.FromFloat(448f), Float8E4M3.FromFloat(-448f),
+            Float8E4M3.FromFloat(0.015625f), Float8E4M3.FromFloat(-0.015625f),
+        };
+        for (int b = 0; b < fp8Boundaries.Length && b < KN; b++)
+        {
+            raws[b] = fp8Boundaries[b].RawValue;
+            decoded[b] = fp8Boundaries[b].ToFloat();
         }
         var (scales, scaleCount, gsArg) = MakeScales(rng, groupSize);
         var expected = Reference(act, decoded, scales, gsArg, scaleCount);
 
-        var actBuf = backend.AllocateBuffer(act);
-        var scaleBuf = backend.AllocateBuffer(scales);
-        var wBuf = backend.AllocateIntBuffer(raws);
-        var outBuf = backend.DequantGemmFp8E4M3(actBuf, wBuf, scaleBuf, M, K, N, gsArg, scaleCount);
-        var actual = backend.DownloadBuffer(outBuf);
-        actBuf.Dispose(); scaleBuf.Dispose(); wBuf.Dispose(); outBuf.Dispose();
+        float[] actual;
+        IGpuBuffer? actBuf = null, scaleBuf = null, wBuf = null, outBuf = null;
+        try
+        {
+            actBuf = backend.AllocateBuffer(act);
+            scaleBuf = backend.AllocateBuffer(scales);
+            wBuf = backend.AllocateIntBuffer(raws);
+            outBuf = backend.DequantGemmFp8E4M3(actBuf, wBuf, scaleBuf, M, K, N, gsArg, scaleCount);
+            actual = backend.DownloadBuffer(outBuf);
+        }
+        finally
+        {
+            actBuf?.Dispose(); scaleBuf?.Dispose(); wBuf?.Dispose(); outBuf?.Dispose();
+        }
 
         AssertClose(expected, actual, $"fp8(gs={groupSize})");
     }

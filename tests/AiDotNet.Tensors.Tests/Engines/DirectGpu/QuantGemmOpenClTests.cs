@@ -6,6 +6,7 @@
 #if NET6_0_OR_GREATER
 
 using System;
+using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 using AiDotNet.Tensors.NumericOperations;
 using Xunit;
@@ -120,18 +121,24 @@ public sealed class QuantGemmOpenClTests : IDisposable
         var wbytes = new byte[w.Length];
         for (int i = 0; i < w.Length; i++) wbytes[i] = unchecked((byte)w[i]);
 
-        var actBuf = backend.AllocateBuffer(act);
-        var scaleBuf = backend.AllocateBuffer(scales);
-        var wBuf = backend.AllocateByteBuffer(w.Length);
-        backend.UploadByteBuffer(wBuf, wbytes);
-
-        var outBuf = backend.DequantGemmInt8(actBuf, wBuf, scaleBuf, M, K, N, gsArg, scaleCount);
-        var actual = backend.DownloadBuffer(outBuf);
-
-        actBuf.Dispose();
-        scaleBuf.Dispose();
-        wBuf.Dispose();
-        outBuf.Dispose();
+        float[] actual;
+        IGpuBuffer? actBuf = null, scaleBuf = null, wBuf = null, outBuf = null;
+        try
+        {
+            actBuf = backend.AllocateBuffer(act);
+            scaleBuf = backend.AllocateBuffer(scales);
+            wBuf = backend.AllocateByteBuffer(w.Length);
+            backend.UploadByteBuffer(wBuf, wbytes);
+            outBuf = backend.DequantGemmInt8(actBuf, wBuf, scaleBuf, M, K, N, gsArg, scaleCount);
+            actual = backend.DownloadBuffer(outBuf);
+        }
+        finally
+        {
+            actBuf?.Dispose();
+            scaleBuf?.Dispose();
+            wBuf?.Dispose();
+            outBuf?.Dispose();
+        }
 
         Assert.Equal(M * N, actual.Length);
         for (int idx = 0; idx < expected.Length; idx++)
@@ -193,18 +200,24 @@ public sealed class QuantGemmOpenClTests : IDisposable
 
         var expected = Reference(act, w, scales, M, K, N, gsArg, scaleCount);
 
-        var actBuf = backend.AllocateBuffer(act);
-        var scaleBuf = backend.AllocateBuffer(scales);
-        var wBuf = backend.AllocateByteBuffer(packed.Length);
-        backend.UploadByteBuffer(wBuf, packed);
-
-        var outBuf = backend.DequantGemmInt4(actBuf, wBuf, scaleBuf, M, K, N, gsArg, scaleCount);
-        var actual = backend.DownloadBuffer(outBuf);
-
-        actBuf.Dispose();
-        scaleBuf.Dispose();
-        wBuf.Dispose();
-        outBuf.Dispose();
+        float[] actual;
+        IGpuBuffer? actBuf = null, scaleBuf = null, wBuf = null, outBuf = null;
+        try
+        {
+            actBuf = backend.AllocateBuffer(act);
+            scaleBuf = backend.AllocateBuffer(scales);
+            wBuf = backend.AllocateByteBuffer(packed.Length);
+            backend.UploadByteBuffer(wBuf, packed);
+            outBuf = backend.DequantGemmInt4(actBuf, wBuf, scaleBuf, M, K, N, gsArg, scaleCount);
+            actual = backend.DownloadBuffer(outBuf);
+        }
+        finally
+        {
+            actBuf?.Dispose();
+            scaleBuf?.Dispose();
+            wBuf?.Dispose();
+            outBuf?.Dispose();
+        }
 
         Assert.Equal(M * N, actual.Length);
         for (int idx = 0; idx < expected.Length; idx++)
@@ -284,18 +297,24 @@ public sealed class QuantGemmOpenClTests : IDisposable
                 expected[i * N + j] = acc;
             }
 
-        var actBuf = backend.AllocateBuffer(act);
-        var scaleBuf = backend.AllocateBuffer(scales);
-        var wBuf = backend.AllocateByteBuffer(kn);
-        backend.UploadByteBuffer(wBuf, raws);
-
-        var outBuf = backend.DequantGemmFp8E4M3(actBuf, wBuf, scaleBuf, M, K, N, gsArg, scaleCount);
-        var actual = backend.DownloadBuffer(outBuf);
-
-        actBuf.Dispose();
-        scaleBuf.Dispose();
-        wBuf.Dispose();
-        outBuf.Dispose();
+        float[] actual;
+        IGpuBuffer? actBuf = null, scaleBuf = null, wBuf = null, outBuf = null;
+        try
+        {
+            actBuf = backend.AllocateBuffer(act);
+            scaleBuf = backend.AllocateBuffer(scales);
+            wBuf = backend.AllocateByteBuffer(kn);
+            backend.UploadByteBuffer(wBuf, raws);
+            outBuf = backend.DequantGemmFp8E4M3(actBuf, wBuf, scaleBuf, M, K, N, gsArg, scaleCount);
+            actual = backend.DownloadBuffer(outBuf);
+        }
+        finally
+        {
+            actBuf?.Dispose();
+            scaleBuf?.Dispose();
+            wBuf?.Dispose();
+            outBuf?.Dispose();
+        }
 
         Assert.Equal(M * N, actual.Length);
         for (int idx = 0; idx < expected.Length; idx++)

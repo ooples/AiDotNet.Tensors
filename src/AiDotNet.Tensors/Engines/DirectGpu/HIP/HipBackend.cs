@@ -823,6 +823,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe IGpuBuffer PagedAttentionDecode(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
         int heads, int headDim, int blockSize, int seqLen, float scale)
     {
+        GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecode));
         if (!_kernelCache.TryGetValue("paged_attention_decode", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: paged_attention_decode");
         var output = AllocateBuffer(heads * headDim);
@@ -841,6 +842,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe IGpuBuffer PagedAttentionPrefill(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
         int heads, int headDim, int blockSize, int numQueries, int startPos, float scale)
     {
+        GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefill));
+        if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
         if (!_kernelCache.TryGetValue("paged_attention_prefill", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: paged_attention_prefill");
         var output = AllocateBuffer(numQueries * heads * headDim);
@@ -860,6 +863,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe IGpuBuffer PagedAttentionDecodeGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
         int heads, int kvHeads, int headDim, int blockSize, int seqLen, float scale)
     {
+        GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecodeGqa));
+        GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionDecodeGqa));
         if (!_kernelCache.TryGetValue("paged_attention_decode_gqa", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: paged_attention_decode_gqa");
         var output = AllocateBuffer(heads * headDim);
@@ -878,6 +883,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe IGpuBuffer PagedAttentionPrefillGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
         int heads, int kvHeads, int headDim, int blockSize, int numQueries, int startPos, float scale)
     {
+        GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefillGqa));
+        GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionPrefillGqa));
+        if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
         if (!_kernelCache.TryGetValue("paged_attention_prefill_gqa", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: paged_attention_prefill_gqa");
         var output = AllocateBuffer(numQueries * heads * headDim);
@@ -902,6 +910,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             throw new InvalidOperationException("HIP kernel not found: flash_decode_partial");
         if (!_kernelCache.TryGetValue("flash_decode_reduce", out var reduceKernel))
             throw new InvalidOperationException("HIP kernel not found: flash_decode_reduce");
+        GpuKernelGuards.FlashDecode(heads, kvHeads, headDim, seqLen, nameof(FlashDecode));
+        GpuKernelGuards.Capacity(q, (long)heads * headDim, nameof(q), nameof(FlashDecode));
+        GpuKernelGuards.Capacity(k, (long)seqLen * kvHeads * headDim, nameof(k), nameof(FlashDecode));
+        GpuKernelGuards.Capacity(v, (long)seqLen * kvHeads * headDim, nameof(v), nameof(FlashDecode));
         if (seqLen <= 0) throw new ArgumentOutOfRangeException(nameof(seqLen));
         int effSplits = splits > 0 ? splits : System.Math.Min(seqLen, 8);
         if (effSplits > seqLen) effSplits = seqLen;
@@ -940,19 +952,34 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     /// byte buffer of the int8 payload. Matches FusedDequantMatmulKernels.Q8MatMul.</summary>
     public IGpuBuffer DequantGemmInt8(IGpuBuffer activations, IGpuBuffer weightsInt8, IGpuBuffer scales,
         int M, int K, int N, int groupSize, int scaleCount)
-        => LaunchDequantGemm("dequant_gemm_int8", activations, weightsInt8, scales, M, K, N, groupSize, scaleCount);
+    {
+        GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmInt8));
+        GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmInt8));
+        GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmInt8));
+        return LaunchDequantGemm("dequant_gemm_int8", activations, weightsInt8, scales, M, K, N, groupSize, scaleCount);
+    }
 
     /// <summary>Weight-only fused dequant-GEMM (int4, 2 signed nibbles/byte). Weights are a byte buffer
     /// of length ceil(K*N/2). Matches FusedDequantMatmulKernels.Q4MatMul.</summary>
     public IGpuBuffer DequantGemmInt4(IGpuBuffer activations, IGpuBuffer weightsInt4Packed, IGpuBuffer scales,
         int M, int K, int N, int groupSize, int scaleCount)
-        => LaunchDequantGemm("dequant_gemm_int4", activations, weightsInt4Packed, scales, M, K, N, groupSize, scaleCount);
+    {
+        GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmInt4));
+        GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmInt4));
+        GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmInt4));
+        return LaunchDequantGemm("dequant_gemm_int4", activations, weightsInt4Packed, scales, M, K, N, groupSize, scaleCount);
+    }
 
     /// <summary>Weight-only fused dequant-GEMM (OCP FP8 E4M3). Weights are a byte buffer of raw e4m3
     /// bytes; in-kernel decode matches Float8E4M3.ToFloat.</summary>
     public IGpuBuffer DequantGemmFp8E4M3(IGpuBuffer activations, IGpuBuffer weightsFp8, IGpuBuffer scales,
         int M, int K, int N, int groupSize, int scaleCount)
-        => LaunchDequantGemm("dequant_gemm_fp8_e4m3", activations, weightsFp8, scales, M, K, N, groupSize, scaleCount);
+    {
+        GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmFp8E4M3));
+        GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmFp8E4M3));
+        GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmFp8E4M3));
+        return LaunchDequantGemm("dequant_gemm_fp8_e4m3", activations, weightsFp8, scales, M, K, N, groupSize, scaleCount);
+    }
 
     private unsafe IGpuBuffer LaunchDequantGemm(string kernelName, IGpuBuffer act, IGpuBuffer weights, IGpuBuffer scales,
         int M, int K, int N, int groupSize, int scaleCount)

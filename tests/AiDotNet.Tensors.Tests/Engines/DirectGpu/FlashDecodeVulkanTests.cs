@@ -5,6 +5,7 @@
 #if NET6_0_OR_GREATER
 
 using System;
+using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 using Xunit;
 
@@ -20,6 +21,14 @@ public sealed class FlashDecodeVulkanTests
             try { return VulkanBackend.Instance.IsAvailable && VulkanBackend.Instance.IsGlslCompilerAvailable; }
             catch { return false; }
         }
+    }
+
+    private static bool EnsureReady()
+    {
+        if (Ready) return true;
+        if (string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_VULKAN"), "1", StringComparison.Ordinal))
+            throw new InvalidOperationException("GPU tests required but Vulkan was unavailable.");
+        return false;
     }
 
     private static float[] DecodeOracle(float[] q, float[] k, float[] v, int heads, int kvHeads, int headDim, int seqLen, float scale)
@@ -62,12 +71,20 @@ public sealed class FlashDecodeVulkanTests
         for (int i = 0; i < q.Length; i++) q[i] = (float)(rng.NextDouble() * 2 - 1);
         float scale = 1.0f / MathF.Sqrt(headDim);
 
-        var qBuf = backend.AllocateBuffer(q);
-        var kBuf = backend.AllocateBuffer(k);
-        var vBuf = backend.AllocateBuffer(v);
-        var outBuf = backend.FlashDecode(qBuf, kBuf, vBuf, heads, kvHeads, headDim, seqLen, scale, splits);
-        var actual = backend.DownloadBuffer(outBuf);
-        qBuf.Dispose(); kBuf.Dispose(); vBuf.Dispose(); outBuf.Dispose();
+        float[] actual;
+        IGpuBuffer? qBuf = null, kBuf = null, vBuf = null, outBuf = null;
+        try
+        {
+            qBuf = backend.AllocateBuffer(q);
+            kBuf = backend.AllocateBuffer(k);
+            vBuf = backend.AllocateBuffer(v);
+            outBuf = backend.FlashDecode(qBuf, kBuf, vBuf, heads, kvHeads, headDim, seqLen, scale, splits);
+            actual = backend.DownloadBuffer(outBuf);
+        }
+        finally
+        {
+            qBuf?.Dispose(); kBuf?.Dispose(); vBuf?.Dispose(); outBuf?.Dispose();
+        }
 
         var expected = DecodeOracle(q, k, v, heads, kvHeads, headDim, seqLen, scale);
         for (int i = 0; i < expected.Length; i++)
@@ -83,9 +100,10 @@ public sealed class FlashDecodeVulkanTests
     [InlineData(8, 32, 100, 8)]
     [InlineData(4, 64, 7, 8)]
     [InlineData(4, 64, 64, 1)]
+    [InlineData(6, 48, 77, 0)]   // splits=0 -> internal default derivation
     public void MhaDecode_MatchesOracle(int heads, int headDim, int seqLen, int splits)
     {
-        if (!Ready) return;
+        if (!EnsureReady()) return;
         RunAndCompare(heads, heads, headDim, seqLen, splits);
     }
 
@@ -94,7 +112,7 @@ public sealed class FlashDecodeVulkanTests
     [InlineData(8, 1, 64, 40, 8)]
     public void GqaDecode_MatchesOracle(int heads, int kvHeads, int headDim, int seqLen, int splits)
     {
-        if (!Ready) return;
+        if (!EnsureReady()) return;
         RunAndCompare(heads, kvHeads, headDim, seqLen, splits);
     }
 }

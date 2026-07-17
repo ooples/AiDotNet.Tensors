@@ -95,12 +95,20 @@ public sealed class DevicePagedKVCacheOpenClTests : IDisposable
         }
         Assert.Equal(seqLen, cache.GetLength(7));
 
-        var qBuf = backend.AllocateBuffer(q);
-        var btBuf = cache.GetBlockTableBuffer(7);
-        var outBuf = backend.PagedAttentionDecode(qBuf, cache.KeyBlocks, cache.ValueBlocks, btBuf,
-            heads, headDim, blockSize, cache.GetLength(7), scale);
-        var actual = backend.DownloadBuffer(outBuf);
-        qBuf.Dispose(); btBuf.Dispose(); outBuf.Dispose();
+        float[] actual;
+        IGpuBuffer? qBuf = null, btBuf = null, outBuf = null;
+        try
+        {
+            qBuf = backend.AllocateBuffer(q);
+            btBuf = cache.GetBlockTableBuffer(7);
+            outBuf = backend.PagedAttentionDecode(qBuf, cache.KeyBlocks, cache.ValueBlocks, btBuf,
+                heads, headDim, blockSize, cache.GetLength(7), scale);
+            actual = backend.DownloadBuffer(outBuf);
+        }
+        finally
+        {
+            qBuf?.Dispose(); btBuf?.Dispose(); outBuf?.Dispose();
+        }
 
         var expected = AttnOracle(q, k, v, heads, headDim, seqLen, scale);
         Assert.Equal(expected.Length, actual.Length);
@@ -154,12 +162,20 @@ public sealed class DevicePagedKVCacheOpenClTests : IDisposable
         for (int i = 0; i < q.Length; i++) q[i] = (float)(rng.NextDouble() * 2 - 1);
         float scale = 1.0f / MathF.Sqrt(headDim);
 
-        var qBuf = backend.AllocateBuffer(q);
-        var btBuf = cache.GetBlockTableBuffer(2);
-        var outBuf = backend.PagedAttentionDecode(qBuf, cache.KeyBlocks, cache.ValueBlocks, btBuf,
-            heads, headDim, blockSize, prefixTokens, scale);
-        var actual = backend.DownloadBuffer(outBuf);
-        qBuf.Dispose(); btBuf.Dispose(); outBuf.Dispose();
+        float[] actual;
+        IGpuBuffer? qBuf = null, btBuf = null, outBuf = null;
+        try
+        {
+            qBuf = backend.AllocateBuffer(q);
+            btBuf = cache.GetBlockTableBuffer(2);
+            outBuf = backend.PagedAttentionDecode(qBuf, cache.KeyBlocks, cache.ValueBlocks, btBuf,
+                heads, headDim, blockSize, prefixTokens, scale);
+            actual = backend.DownloadBuffer(outBuf);
+        }
+        finally
+        {
+            qBuf?.Dispose(); btBuf?.Dispose(); outBuf?.Dispose();
+        }
 
         var expected = AttnOracle(q, k, v, heads, headDim, prefixTokens, scale);
         for (int i = 0; i < expected.Length; i++)
@@ -167,6 +183,114 @@ public sealed class DevicePagedKVCacheOpenClTests : IDisposable
             float e = expected[i], a = actual[i];
             float tol = 2e-3f + 2e-3f * Math.Abs(e);
             Assert.True(Math.Abs(e - a) <= tol, $"shared-prefix mismatch at {i}: expected {e}, got {a} (tol {tol})");
+        }
+    }
+
+    [Fact]
+    public void ShareBlocks_RefcountedFree_NoDoubleFree()
+    {
+        if (!EnsureReady()) return;
+        var backend = _backend!;
+        int heads = 2, headDim = 16, blockSize = 8, stepStride = heads * headDim;
+        using var cache = new DevicePagedKVCache(backend, maxBlocks: 8, blockSize, heads, headDim);
+
+        var k = new float[12 * stepStride];
+        var v = new float[12 * stepStride];
+        cache.Append(1, k, v);                                  // 12 tokens -> 2 blocks
+        cache.ShareBlocks(1, 2, 12);                            // both blocks now refcount 2
+        Assert.Equal(2, cache.AllocatedBlocks);
+
+        cache.Free(1);                                          // holder 1 gone; blocks still held by 2
+        Assert.Equal(2, cache.AllocatedBlocks);                // NOT returned yet (refcount 1)
+        Assert.Equal(0, cache.GetLength(1));
+        Assert.Equal(12, cache.GetLength(2));
+
+        cache.Free(2);                                          // last holder -> blocks released
+        Assert.Equal(0, cache.AllocatedBlocks);
+
+        // The two physical blocks must be reusable exactly once (no duplicate ids on the free list).
+        cache.Append(3, k, v);
+        cache.Append(4, k, v);
+        Assert.Equal(4, cache.AllocatedBlocks);                // 2 + 2 distinct blocks; no double-hand-out
+    }
+
+    [Fact]
+    public void CowAppend_AfterShare_LeavesSourceIntact()
+    {
+        if (!EnsureReady()) return;
+        var backend = _backend!;
+        int heads = 2, headDim = 16, blockSize = 8, stepStride = heads * headDim;
+        using var cache = new DevicePagedKVCache(backend, maxBlocks: 16, blockSize, heads, headDim);
+
+        var rng = new Random(0xC0FFEE);
+        int srcLen = 10;                                        // 2 blocks, last block partially filled (2 tokens)
+        var k = new float[srcLen * stepStride];
+        var v = new float[srcLen * stepStride];
+        for (int i = 0; i < k.Length; i++) { k[i] = (float)(rng.NextDouble() * 2 - 1); v[i] = (float)(rng.NextDouble() * 2 - 1); }
+        cache.Append(1, k, v);
+        cache.ShareBlocks(1, 2, srcLen);                       // seq2 shares seq1's blocks incl. the partial tail
+
+        // Append to seq2 -> must copy-on-write the shared partial tail block, not overwrite seq1's data.
+        int extra = 5;
+        var k2 = new float[extra * stepStride];
+        var v2 = new float[extra * stepStride];
+        for (int i = 0; i < k2.Length; i++) { k2[i] = (float)(rng.NextDouble() * 2 - 1); v2[i] = (float)(rng.NextDouble() * 2 - 1); }
+        cache.Append(2, k2, v2);
+        Assert.Equal(srcLen + extra, cache.GetLength(2));
+        Assert.Equal(srcLen, cache.GetLength(1));
+
+        var q = new float[stepStride];
+        for (int i = 0; i < q.Length; i++) q[i] = (float)(rng.NextDouble() * 2 - 1);
+        float scale = 1.0f / MathF.Sqrt(headDim);
+
+        // seq1 output must still match the ORIGINAL srcLen K/V (unchanged by seq2's COW append).
+        float[] seq1Actual;
+        IGpuBuffer? q1 = null, bt1 = null, o1 = null;
+        try
+        {
+            q1 = backend.AllocateBuffer(q);
+            bt1 = cache.GetBlockTableBuffer(1);
+            o1 = backend.PagedAttentionDecode(q1, cache.KeyBlocks, cache.ValueBlocks, bt1, heads, headDim, blockSize, srcLen, scale);
+            seq1Actual = backend.DownloadBuffer(o1);
+        }
+        finally
+        {
+            q1?.Dispose(); bt1?.Dispose(); o1?.Dispose();
+        }
+
+        var seq1Expected = AttnOracle(q, k, v, heads, headDim, srcLen, scale);
+        for (int i = 0; i < seq1Expected.Length; i++)
+        {
+            float e = seq1Expected[i], a = seq1Actual[i];
+            float tol = 2e-3f + 2e-3f * Math.Abs(e);
+            Assert.True(Math.Abs(e - a) <= tol, $"COW corrupted source at {i}: expected {e}, got {a} (tol {tol})");
+        }
+
+        // seq2 output must match the concatenation of the shared prefix + its appended tokens.
+        var kFull = new float[(srcLen + extra) * stepStride];
+        var vFull = new float[(srcLen + extra) * stepStride];
+        Array.Copy(k, 0, kFull, 0, k.Length); Array.Copy(k2, 0, kFull, k.Length, k2.Length);
+        Array.Copy(v, 0, vFull, 0, v.Length); Array.Copy(v2, 0, vFull, v.Length, v2.Length);
+        float[] seq2Actual;
+        IGpuBuffer? q2 = null, bt2 = null, o2 = null;
+        try
+        {
+            q2 = backend.AllocateBuffer(q);
+            bt2 = cache.GetBlockTableBuffer(2);
+            o2 = backend.PagedAttentionDecode(q2, cache.KeyBlocks, cache.ValueBlocks, bt2, heads, headDim, blockSize, srcLen + extra, scale);
+            seq2Actual = backend.DownloadBuffer(o2);
+        }
+        finally
+        {
+            q2?.Dispose(); bt2?.Dispose(); o2?.Dispose();
+        }
+
+        var seq2Expected = AttnOracle(q, kFull, vFull, heads, headDim, srcLen + extra, scale);
+        for (int i = 0; i < seq2Expected.Length; i++)
+        {
+            float e = seq2Expected[i], a = seq2Actual[i];
+            float tol = 2e-3f + 2e-3f * Math.Abs(e);
+            Assert.True(Math.Abs(e - a) <= tol, $"COW seq2 mismatch at {i}: expected {e}, got {a} (tol {tol})");
         }
     }
 }
