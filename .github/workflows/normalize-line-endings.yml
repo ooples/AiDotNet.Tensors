@@ -53,7 +53,8 @@ jobs:
 
       - name: Commit changes
         if: steps.renorm.outputs.has_changes == 'true'
-        run: git commit -m "chore: normalize line endings (git renormalize)"
+        run: |
+          git commit -m "chore: normalize line endings (git renormalize)"
 
       - name: Push branch
         if: steps.renorm.outputs.has_changes == 'true'
