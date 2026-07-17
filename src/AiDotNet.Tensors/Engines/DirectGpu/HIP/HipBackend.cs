@@ -65,6 +65,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     private IntPtr _poolingModule;
     private IntPtr _normalizationModule;
     private IntPtr _fusedModule;
+    private IntPtr _quantGemmModule; // P0: weight-only fused dequant-GEMM (int8/int4/fp8)
     private IntPtr _attentionModule;
     private IntPtr _fftModule;
     private IntPtr _spectralPerfModule;
@@ -494,6 +495,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             CompileKernelModule(HipFusedKernels.GetSource(), "fused", ref _fusedModule,
                 HipFusedKernels.GetKernelNames());
 
+            CompileKernelModule(Kernels.HipQuantGemmKernels.GetSource(), "quant_gemm", ref _quantGemmModule,
+                Kernels.HipQuantGemmKernels.GetKernelNames());
+
             // Compile Attention kernels (FlashAttention, GQA, ScaledDotProduct)
             CompileKernelModule(HipAttentionKernels.GetSource(), "attention", ref _attentionModule,
                 HipAttentionKernels.GetKernelNames());
@@ -802,6 +806,40 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             kernel, gridX, 1, 1, blockSize, 1, 1,
             sharedMem, _stream, (IntPtr)args, IntPtr.Zero);
         HipNativeBindings.CheckError(result, "hipModuleLaunchKernel");
+    }
+
+    /// <summary>Weight-only fused dequant-GEMM (int8), symmetric per-tensor/per-group; weights are a
+    /// byte buffer of the int8 payload. Matches FusedDequantMatmulKernels.Q8MatMul.</summary>
+    public IGpuBuffer DequantGemmInt8(IGpuBuffer activations, IGpuBuffer weightsInt8, IGpuBuffer scales,
+        int M, int K, int N, int groupSize, int scaleCount)
+        => LaunchDequantGemm("dequant_gemm_int8", activations, weightsInt8, scales, M, K, N, groupSize, scaleCount);
+
+    /// <summary>Weight-only fused dequant-GEMM (int4, 2 signed nibbles/byte). Weights are a byte buffer
+    /// of length ceil(K*N/2). Matches FusedDequantMatmulKernels.Q4MatMul.</summary>
+    public IGpuBuffer DequantGemmInt4(IGpuBuffer activations, IGpuBuffer weightsInt4Packed, IGpuBuffer scales,
+        int M, int K, int N, int groupSize, int scaleCount)
+        => LaunchDequantGemm("dequant_gemm_int4", activations, weightsInt4Packed, scales, M, K, N, groupSize, scaleCount);
+
+    /// <summary>Weight-only fused dequant-GEMM (OCP FP8 E4M3). Weights are a byte buffer of raw e4m3
+    /// bytes; in-kernel decode matches Float8E4M3.ToFloat.</summary>
+    public IGpuBuffer DequantGemmFp8E4M3(IGpuBuffer activations, IGpuBuffer weightsFp8, IGpuBuffer scales,
+        int M, int K, int N, int groupSize, int scaleCount)
+        => LaunchDequantGemm("dequant_gemm_fp8_e4m3", activations, weightsFp8, scales, M, K, N, groupSize, scaleCount);
+
+    private unsafe IGpuBuffer LaunchDequantGemm(string kernelName, IGpuBuffer act, IGpuBuffer weights, IGpuBuffer scales,
+        int M, int K, int N, int groupSize, int scaleCount)
+    {
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException($"HIP kernel not found: {kernelName}");
+        var output = AllocateBuffer(M * N);
+        uint grid = (uint)(((long)M * N + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr aPtr = act.Handle, wPtr = weights.Handle, sPtr = scales.Handle, oPtr = output.Handle;
+        int m = M, k = K, n = N, gs = groupSize, sc = scaleCount;
+        void** args = stackalloc void*[9];
+        args[0] = &aPtr; args[1] = &wPtr; args[2] = &sPtr; args[3] = &oPtr;
+        args[4] = &m; args[5] = &k; args[6] = &n; args[7] = &gs; args[8] = &sc;
+        LaunchKernel(kernel, grid, (uint)DefaultBlockSize, args);
+        return output;
     }
 
     /// <summary>
@@ -10838,6 +10876,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         {
             HipNativeBindings.hipModuleUnload(_fusedModule);
             _fusedModule = IntPtr.Zero;
+        }
+
+        if (_quantGemmModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_quantGemmModule);
+            _quantGemmModule = IntPtr.Zero;
         }
         if (_attentionModule != IntPtr.Zero)
         {
