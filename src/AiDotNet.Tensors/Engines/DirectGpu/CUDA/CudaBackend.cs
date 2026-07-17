@@ -95,6 +95,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private IntPtr _normalizationModule;
     private IntPtr _neuralNetModule;
     private IntPtr _fusedModule;
+    private IntPtr _quantGemmModule; // P0: weight-only fused dequant-GEMM (int8/int4/fp8)
     private IntPtr _attentionModule;
     private IntPtr _fftModule;
     private IntPtr _spectralPerfModule;
@@ -835,6 +836,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         _normalizationModule = CompileKernelModule(device, CudaNormalizationKernels.GetSource(), "normalization_kernels", CudaNormalizationKernels.GetKernelNames());
         _neuralNetModule = CompileKernelModule(device, CudaNeuralNetKernels.GetSource(), "neuralnet_kernels", CudaNeuralNetKernels.GetKernelNames());
         _fusedModule = CompileKernelModule(device, CudaFusedKernels.GetSource(), "fused_kernels", CudaFusedKernels.GetKernelNames());
+        _quantGemmModule = CompileKernelModule(device, Kernels.CudaQuantGemmKernels.GetSource(), "quant_gemm_kernels", Kernels.CudaQuantGemmKernels.GetKernelNames());
         _attentionModule = CompileKernelModule(device, CudaAttentionKernels.GetSource(), "attention_kernels", CudaAttentionKernels.GetKernelNames());
         _fftModule = CompileKernelModule(device, Kernels.CudaFFTKernels.GetSource(), "fft_kernels", Kernels.CudaFFTKernels.GetKernelNames());
         _spectralPerfModule = CompileKernelModule(device, Kernels.CudaSpectralPerfKernels.GetSource(), "spectral_perf_kernels", Kernels.CudaSpectralPerfKernels.GetKernelNames());
@@ -2462,6 +2464,42 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         ValidateBiasBuffer(bias, N);
         var output = MatMul(A, B, M, N, K);
         ApplyBiasInPlace(output, bias, M, N);
+        return output;
+    }
+
+    /// <summary>Weight-only fused dequant-GEMM (int8): C[M,N]=act[M,K]·dequant(int8 W[K,N]). Symmetric
+    /// per-tensor/per-group scales, matching FusedDequantMatmulKernels.Q8MatMul. Weights are a byte
+    /// buffer of the int8 payload.</summary>
+    public IGpuBuffer DequantGemmInt8(IGpuBuffer activations, IGpuBuffer weightsInt8, IGpuBuffer scales,
+        int M, int K, int N, int groupSize, int scaleCount)
+        => LaunchDequantGemm("dequant_gemm_int8", activations, weightsInt8, scales, M, K, N, groupSize, scaleCount);
+
+    /// <summary>Weight-only fused dequant-GEMM (int4, 2 signed nibbles/byte, low nibble even). Weights
+    /// are a byte buffer of length ceil(K*N/2); matches FusedDequantMatmulKernels.Q4MatMul.</summary>
+    public IGpuBuffer DequantGemmInt4(IGpuBuffer activations, IGpuBuffer weightsInt4Packed, IGpuBuffer scales,
+        int M, int K, int N, int groupSize, int scaleCount)
+        => LaunchDequantGemm("dequant_gemm_int4", activations, weightsInt4Packed, scales, M, K, N, groupSize, scaleCount);
+
+    /// <summary>Weight-only fused dequant-GEMM (OCP FP8 E4M3). Weights are a byte buffer of raw e4m3
+    /// bytes; in-kernel decode matches Float8E4M3.ToFloat.</summary>
+    public IGpuBuffer DequantGemmFp8E4M3(IGpuBuffer activations, IGpuBuffer weightsFp8, IGpuBuffer scales,
+        int M, int K, int N, int groupSize, int scaleCount)
+        => LaunchDequantGemm("dequant_gemm_fp8_e4m3", activations, weightsFp8, scales, M, K, N, groupSize, scaleCount);
+
+    private unsafe IGpuBuffer LaunchDequantGemm(string kernelName, IGpuBuffer act, IGpuBuffer weights, IGpuBuffer scales,
+        int M, int K, int N, int groupSize, int scaleCount)
+    {
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+        var output = AllocateBuffer(M * N);
+        using var _ = PushContext();
+        uint grid = (uint)(((long)M * N + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr aPtr = act.Handle, wPtr = weights.Handle, sPtr = scales.Handle, oPtr = output.Handle;
+        int m = M, k = K, n = N, gs = groupSize, sc = scaleCount;
+        void** args = stackalloc void*[9];
+        args[0] = &aPtr; args[1] = &wPtr; args[2] = &sPtr; args[3] = &oPtr;
+        args[4] = &m; args[5] = &k; args[6] = &n; args[7] = &gs; args[8] = &sc;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
         return output;
     }
 
@@ -15225,6 +15263,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         {
             CudaNativeBindings.cuModuleUnload(_fusedConvolutionModule);
             _fusedConvolutionModule = IntPtr.Zero;
+        }
+
+        if (_quantGemmModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_quantGemmModule);
+            _quantGemmModule = IntPtr.Zero;
         }
 
         if (_fusedModule != IntPtr.Zero)
