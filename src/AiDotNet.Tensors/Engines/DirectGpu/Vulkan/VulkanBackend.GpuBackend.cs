@@ -557,6 +557,128 @@ public sealed unsafe partial class VulkanBackend
         return result;
     }
 
+    /// <summary>
+    /// Weight-only fused dequant-GEMM for integer weights (int8 or unpacked int4): C[M,N] =
+    /// act[M,K] · (scale · W[K,N]). Symmetric scales (per-tensor when scaleCount == 1, else per-group
+    /// over the flattened K*N buffer), matching FusedDequantMatmulKernels Q8/Q4. <paramref name="weightsInt"/>
+    /// is a Vulkan int buffer (AllocateIntBuffer) of the decoded integer weight values.
+    /// </summary>
+    public IGpuBuffer DequantGemmInt(IGpuBuffer activations, IGpuBuffer weightsInt, IGpuBuffer scales,
+        int M, int K, int N, int groupSize, int scaleCount)
+    {
+        EnsureInitialized();
+        if (M <= 0 || N <= 0 || K <= 0) throw new ArgumentOutOfRangeException(nameof(M));
+        var result = AllocateBuffer(M * N);
+        var pc = new uint[] { (uint)M, (uint)K, (uint)N, (uint)groupSize, (uint)scaleCount };
+        GlslQuadOp(VulkanGlslKernels.DequantGemmInt, activations, weightsInt, scales, result, M * N, pc, (uint)(pc.Length * sizeof(uint)));
+        return result;
+    }
+
+    /// <summary>
+    /// Weight-only fused dequant-GEMM for OCP FP8 E4M3 weights: C[M,N] = act[M,K] ·
+    /// (scale · decode_e4m3(W[K,N])). <paramref name="weightsFp8Raw"/> is a Vulkan int buffer
+    /// (AllocateIntBuffer) holding the raw fp8 e4m3 bytes (0..255); decode matches Float8E4M3.ToFloat.
+    /// </summary>
+    public IGpuBuffer DequantGemmFp8E4M3(IGpuBuffer activations, IGpuBuffer weightsFp8Raw, IGpuBuffer scales,
+        int M, int K, int N, int groupSize, int scaleCount)
+    {
+        EnsureInitialized();
+        if (M <= 0 || N <= 0 || K <= 0) throw new ArgumentOutOfRangeException(nameof(M));
+        var result = AllocateBuffer(M * N);
+        var pc = new uint[] { (uint)M, (uint)K, (uint)N, (uint)groupSize, (uint)scaleCount };
+        GlslQuadOp(VulkanGlslKernels.DequantGemmFp8E4M3, activations, weightsFp8Raw, scales, result, M * N, pc, (uint)(pc.Length * sizeof(uint)));
+        return result;
+    }
+
+    /// <summary>
+    /// Paged-attention decode (P1): out[heads*headDim] = softmax(scale·Q·K)·V over the sequence,
+    /// reading K/V from the physical block pool [maxBlocks, blockSize, heads, headDim] via
+    /// <paramref name="blockTable"/> (an int buffer of physical block ids). headDim &lt;= 256.
+    /// Matches a standard-attention CPU oracle.
+    /// </summary>
+    public IGpuBuffer PagedAttentionDecode(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int headDim, int blockSize, int seqLen, float scale)
+    {
+        EnsureInitialized();
+        if (heads <= 0 || headDim <= 0) throw new ArgumentOutOfRangeException(nameof(heads));
+        var result = AllocateBuffer(heads * headDim);
+        var pc = new uint[] { (uint)heads, (uint)headDim, (uint)blockSize, (uint)seqLen, FloatBits(scale) };
+        GlslQuintOp(VulkanGlslKernels.PagedAttentionDecode, q, kcache, vcache, blockTable, result, heads, pc, (uint)(pc.Length * sizeof(uint)));
+        return result;
+    }
+
+    /// <summary>
+    /// Prefill / multi-query paged attention (P1, causal): out[numQueries,heads,headDim]; query qi
+    /// (logical position startPos+qi) attends to key positions 0..(startPos+qi). headDim &lt;= 256.
+    /// </summary>
+    public IGpuBuffer PagedAttentionPrefill(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int headDim, int blockSize, int numQueries, int startPos, float scale)
+    {
+        EnsureInitialized();
+        if (heads <= 0 || headDim <= 0 || numQueries <= 0) throw new ArgumentOutOfRangeException(nameof(heads));
+        var result = AllocateBuffer(numQueries * heads * headDim);
+        var pc = new uint[] { (uint)heads, (uint)headDim, (uint)blockSize, (uint)numQueries, (uint)startPos, FloatBits(scale) };
+        GlslQuintOp(VulkanGlslKernels.PagedAttentionPrefill, q, kcache, vcache, blockTable, result, numQueries * heads, pc, (uint)(pc.Length * sizeof(uint)));
+        return result;
+    }
+
+    /// <summary>GQA decode (P1): like <see cref="PagedAttentionDecode"/> but query head h shares KV head
+    /// h/(heads/kvHeads); K/V pool is [maxBlocks, blockSize, kvHeads, headDim]. headDim &lt;= 256.</summary>
+    public IGpuBuffer PagedAttentionDecodeGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int kvHeads, int headDim, int blockSize, int seqLen, float scale)
+    {
+        EnsureInitialized();
+        if (heads <= 0 || kvHeads <= 0 || headDim <= 0) throw new ArgumentOutOfRangeException(nameof(heads));
+        var result = AllocateBuffer(heads * headDim);
+        var pc = new uint[] { (uint)heads, (uint)kvHeads, (uint)headDim, (uint)blockSize, (uint)seqLen, FloatBits(scale) };
+        GlslQuintOp(VulkanGlslKernels.PagedAttentionDecodeGqa, q, kcache, vcache, blockTable, result, heads, pc, (uint)(pc.Length * sizeof(uint)));
+        return result;
+    }
+
+    /// <summary>GQA prefill (P1, causal): like <see cref="PagedAttentionPrefill"/> but query head h shares
+    /// KV head h/(heads/kvHeads); K/V pool is [maxBlocks, blockSize, kvHeads, headDim]. headDim &lt;= 256.</summary>
+    public IGpuBuffer PagedAttentionPrefillGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int kvHeads, int headDim, int blockSize, int numQueries, int startPos, float scale)
+    {
+        EnsureInitialized();
+        if (heads <= 0 || kvHeads <= 0 || headDim <= 0 || numQueries <= 0) throw new ArgumentOutOfRangeException(nameof(heads));
+        var result = AllocateBuffer(numQueries * heads * headDim);
+        var pc = new uint[] { (uint)heads, (uint)kvHeads, (uint)headDim, (uint)blockSize, (uint)numQueries, (uint)startPos, FloatBits(scale) };
+        GlslQuintOp(VulkanGlslKernels.PagedAttentionPrefillGqa, q, kcache, vcache, blockTable, result, numQueries * heads, pc, (uint)(pc.Length * sizeof(uint)));
+        return result;
+    }
+
+    /// <summary>Fused decode attention (P2, FlashDecoding): single-query attention over contiguous K/V
+    /// [seqLen,kvHeads,headDim], split across work-items and merged by an online-softmax reduction. GQA via
+    /// kvHead=h/(heads/kvHeads); pass <paramref name="kvHeads"/> == heads for MHA. headDim &lt;= 256.</summary>
+    public IGpuBuffer FlashDecode(IGpuBuffer q, IGpuBuffer k, IGpuBuffer v,
+        int heads, int kvHeads, int headDim, int seqLen, float scale, int splits = 0)
+    {
+        EnsureInitialized();
+        if (heads <= 0 || kvHeads <= 0 || headDim <= 0 || seqLen <= 0) throw new ArgumentOutOfRangeException(nameof(heads));
+        int effSplits = splits > 0 ? splits : System.Math.Min(seqLen, 8);
+        if (effSplits > seqLen) effSplits = seqLen;
+        int splitLen = (seqLen + effSplits - 1) / effSplits;
+
+        var output = AllocateBuffer(heads * headDim);
+        var partialM = AllocateBuffer(heads * effSplits);
+        var partialL = AllocateBuffer(heads * effSplits);
+        var partialAcc = AllocateBuffer(heads * effSplits * headDim);
+        try
+        {
+            var pcP = new uint[] { (uint)heads, (uint)kvHeads, (uint)headDim, (uint)seqLen, (uint)effSplits, (uint)splitLen, FloatBits(scale) };
+            GlslDispatchN(VulkanGlslKernels.FlashDecodePartial, heads * effSplits,
+                new[] { q, k, v, partialM, partialL, partialAcc }, pcP);
+
+            var pcR = new uint[] { (uint)heads, (uint)headDim, (uint)effSplits };
+            GlslDispatchN(VulkanGlslKernels.FlashDecodeReduce, heads,
+                new[] { partialM, partialL, partialAcc, output }, pcR);
+            return output;
+        }
+        catch { output.Dispose(); throw; }
+        finally { partialM.Dispose(); partialL.Dispose(); partialAcc.Dispose(); }
+    }
+
     public IGpuBuffer GemmBiasRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
         => GemmBiasActivation(A, B, bias, M, N, K, VulkanGlslKernels.FusedLinearReLU);
 

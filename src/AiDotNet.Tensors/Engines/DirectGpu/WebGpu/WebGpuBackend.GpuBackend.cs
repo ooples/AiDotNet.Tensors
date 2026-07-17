@@ -223,6 +223,127 @@ public sealed partial class WebGpuBackend
     public IGpuBuffer GemmBias(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
         => GemmBiasActivation(A, B, bias, M, N, K, 0);
 
+    /// <summary>
+    /// Paged-attention decode (P1): out[heads*headDim] = softmax(scale·Q·K)·V over the sequence,
+    /// reading K/V from the physical block pool [maxBlocks, blockSize, heads, headDim] via
+    /// <paramref name="blockTable"/> (an int buffer of physical block ids). headDim &lt;= 256.
+    /// Matches a standard-attention CPU oracle. (scale is passed as its int bit pattern; the WGSL
+    /// recovers it via bitcast, since the recurrence-dispatch uniform is i32-only.)
+    /// </summary>
+    public IGpuBuffer PagedAttentionDecode(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int headDim, int blockSize, int seqLen, float scale)
+    {
+        var output = AllocateBuffer(heads * headDim);
+        DispatchRecurrence("paged_attention_decode", WebGpuKernels.PagedAttentionDecodeSource, heads,
+            new[] { q, kcache, vcache, blockTable, output },
+            new[] { heads, headDim, blockSize, seqLen, BitConverter.SingleToInt32Bits(scale) });
+        return output;
+    }
+
+    /// <summary>
+    /// Prefill / multi-query paged attention (P1, causal): out[numQueries,heads,headDim]; query qi
+    /// (logical position startPos+qi) attends to key positions 0..(startPos+qi). headDim &lt;= 256.
+    /// </summary>
+    public IGpuBuffer PagedAttentionPrefill(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int headDim, int blockSize, int numQueries, int startPos, float scale)
+    {
+        var output = AllocateBuffer(numQueries * heads * headDim);
+        DispatchRecurrence("paged_attention_prefill", WebGpuKernels.PagedAttentionPrefillSource, numQueries * heads,
+            new[] { q, kcache, vcache, blockTable, output },
+            new[] { heads, headDim, blockSize, numQueries, startPos, BitConverter.SingleToInt32Bits(scale) });
+        return output;
+    }
+
+    /// <summary>GQA decode (P1): like <see cref="PagedAttentionDecode"/> but query head h shares KV head
+    /// h/(heads/kvHeads); K/V pool is [maxBlocks, blockSize, kvHeads, headDim]. headDim &lt;= 256.</summary>
+    public IGpuBuffer PagedAttentionDecodeGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int kvHeads, int headDim, int blockSize, int seqLen, float scale)
+    {
+        var output = AllocateBuffer(heads * headDim);
+        DispatchRecurrence("paged_attention_decode_gqa", WebGpuKernels.PagedAttentionDecodeGqaSource, heads,
+            new[] { q, kcache, vcache, blockTable, output },
+            new[] { heads, kvHeads, headDim, blockSize, seqLen, BitConverter.SingleToInt32Bits(scale) });
+        return output;
+    }
+
+    /// <summary>GQA prefill (P1, causal): like <see cref="PagedAttentionPrefill"/> but query head h shares
+    /// KV head h/(heads/kvHeads); K/V pool is [maxBlocks, blockSize, kvHeads, headDim]. headDim &lt;= 256.</summary>
+    public IGpuBuffer PagedAttentionPrefillGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int kvHeads, int headDim, int blockSize, int numQueries, int startPos, float scale)
+    {
+        var output = AllocateBuffer(numQueries * heads * headDim);
+        DispatchRecurrence("paged_attention_prefill_gqa", WebGpuKernels.PagedAttentionPrefillGqaSource, numQueries * heads,
+            new[] { q, kcache, vcache, blockTable, output },
+            new[] { heads, kvHeads, headDim, blockSize, numQueries, startPos, BitConverter.SingleToInt32Bits(scale) });
+        return output;
+    }
+
+    /// <summary>Fused decode attention (P2, FlashDecoding): single-query attention over contiguous K/V
+    /// [seqLen,kvHeads,headDim], split across work-items and merged by an online-softmax reduction. GQA via
+    /// kvHead=h/(heads/kvHeads); pass <paramref name="kvHeads"/> == heads for MHA. headDim &lt;= 256.</summary>
+    public IGpuBuffer FlashDecode(IGpuBuffer q, IGpuBuffer k, IGpuBuffer v,
+        int heads, int kvHeads, int headDim, int seqLen, float scale, int splits = 0)
+    {
+        if (seqLen <= 0) throw new ArgumentOutOfRangeException(nameof(seqLen));
+        int effSplits = splits > 0 ? splits : Math.Min(seqLen, 8);
+        if (effSplits > seqLen) effSplits = seqLen;
+        int splitLen = (seqLen + effSplits - 1) / effSplits;
+
+        var output = AllocateBuffer(heads * headDim);
+        var partialM = AllocateBuffer(heads * effSplits);
+        var partialL = AllocateBuffer(heads * effSplits);
+        var partialAcc = AllocateBuffer(heads * effSplits * headDim);
+        try
+        {
+            DispatchRecurrence("flash_decode_partial", WebGpuKernels.FlashDecodePartialSource, heads * effSplits,
+                new[] { q, k, v, partialM, partialL, partialAcc },
+                new[] { heads, kvHeads, headDim, seqLen, effSplits, splitLen, BitConverter.SingleToInt32Bits(scale) });
+            DispatchRecurrence("flash_decode_reduce", WebGpuKernels.FlashDecodeReduceSource, heads,
+                new[] { partialM, partialL, partialAcc, output },
+                new[] { heads, headDim, effSplits });
+            return output;
+        }
+        catch { output.Dispose(); throw; }
+        finally { partialM.Dispose(); partialL.Dispose(); partialAcc.Dispose(); }
+    }
+
+    // Uniform padded to 8 floats (32 bytes) for WebGPU's 16-byte uniform-buffer alignment.
+    private static float[] QuantUniforms(int M, int K, int N, int groupSize, int scaleCount) => new float[]
+    {
+        BitConverter.Int32BitsToSingle(M), BitConverter.Int32BitsToSingle(K), BitConverter.Int32BitsToSingle(N),
+        BitConverter.Int32BitsToSingle(groupSize), BitConverter.Int32BitsToSingle(scaleCount), 0f, 0f, 0f
+    };
+
+    /// <summary>
+    /// Weight-only fused dequant-GEMM for integer weights (int8 or unpacked int4): C[M,N] =
+    /// act[M,K] · (scale · W[K,N]). Symmetric per-tensor/per-group scales, matching the CPU oracle
+    /// FusedDequantMatmulKernels Q8/Q4. <paramref name="weightsInt"/> is an int buffer (AllocateIntBuffer).
+    /// </summary>
+    public IGpuBuffer DequantGemmInt(IGpuBuffer activations, IGpuBuffer weightsInt, IGpuBuffer scales,
+        int M, int K, int N, int groupSize, int scaleCount)
+    {
+        var output = AllocateBuffer(M * N);
+        Dispatch4BufferAsync("DequantGemmInt", WebGpuKernels.DequantGemmIntSource, "dequant_gemm_int",
+            activations, weightsInt, scales, output, QuantUniforms(M, K, N, groupSize, scaleCount), M * N)
+            .GetAwaiter().GetResult();
+        return output;
+    }
+
+    /// <summary>
+    /// Weight-only fused dequant-GEMM for OCP FP8 E4M3 weights: C[M,N] = act[M,K] ·
+    /// (scale · decode_e4m3(W[K,N])). <paramref name="weightsFp8Raw"/> is an int buffer of raw fp8
+    /// bytes (0..255); decode matches Float8E4M3.ToFloat.
+    /// </summary>
+    public IGpuBuffer DequantGemmFp8E4M3(IGpuBuffer activations, IGpuBuffer weightsFp8Raw, IGpuBuffer scales,
+        int M, int K, int N, int groupSize, int scaleCount)
+    {
+        var output = AllocateBuffer(M * N);
+        Dispatch4BufferAsync("DequantGemmFp8", WebGpuKernels.DequantGemmFp8Source, "dequant_gemm_fp8",
+            activations, weightsFp8Raw, scales, output, QuantUniforms(M, K, N, groupSize, scaleCount), M * N)
+            .GetAwaiter().GetResult();
+        return output;
+    }
+
     public IGpuBuffer GemmBiasSwish(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
     {
         var temp = GemmBias(A, B, bias, M, N, K);
