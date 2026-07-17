@@ -2666,6 +2666,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             if (_context == null) throw new InvalidOperationException("OpenCL context not available");
             GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecode));
+            GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, heads, headDim, blockSize, seqLen, 1, nameof(PagedAttentionDecode));
             var output = AllocateBuffer(heads * headDim);
             try
             {
@@ -2705,6 +2706,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (_context == null) throw new InvalidOperationException("OpenCL context not available");
             GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefill));
             if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
+            GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, heads, headDim, blockSize, checked(startPos + numQueries), numQueries, nameof(PagedAttentionPrefill));
             var output = AllocateBuffer(numQueries * heads * headDim);
             try
             {
@@ -2742,6 +2744,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (_context == null) throw new InvalidOperationException("OpenCL context not available");
             GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecodeGqa));
             GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionDecodeGqa));
+            GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, kvHeads, headDim, blockSize, seqLen, 1, nameof(PagedAttentionDecodeGqa));
             var output = AllocateBuffer(heads * headDim);
             try
             {
@@ -2774,6 +2777,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefillGqa));
             GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionPrefillGqa));
             if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
+            GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, kvHeads, headDim, blockSize, checked(startPos + numQueries), numQueries, nameof(PagedAttentionPrefillGqa));
             var output = AllocateBuffer(numQueries * heads * headDim);
             try
             {
@@ -2881,6 +2885,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 throw new InvalidOperationException("OpenCL context not available");
             GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmInt8));
             GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmInt8));
+            GpuKernelGuards.Capacity(weightsInt8, (long)K * N, nameof(weightsInt8), nameof(DequantGemmInt8));
             GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmInt8));
 
             var output = AllocateBuffer(M * N);
@@ -2926,6 +2931,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 throw new InvalidOperationException("OpenCL context not available");
             GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmInt4));
             GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmInt4));
+            GpuKernelGuards.Capacity(weightsInt4Packed, ((long)K * N + 1) / 2, nameof(weightsInt4Packed), nameof(DequantGemmInt4));
             GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmInt4));
 
             var output = AllocateBuffer(M * N);
@@ -2971,6 +2977,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 throw new InvalidOperationException("OpenCL context not available");
             GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmFp8E4M3));
             GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmFp8E4M3));
+            GpuKernelGuards.Capacity(weightsFp8, (long)K * N, nameof(weightsFp8), nameof(DequantGemmFp8E4M3));
             GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmFp8E4M3));
 
             var output = AllocateBuffer(M * N);

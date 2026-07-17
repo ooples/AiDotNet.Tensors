@@ -569,6 +569,7 @@ public sealed unsafe partial class VulkanBackend
         EnsureInitialized();
         GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmInt));
         GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmInt));
+        GpuKernelGuards.Capacity(weightsInt, (long)K * N, nameof(weightsInt), nameof(DequantGemmInt));
         GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmInt));
         var result = AllocateBuffer(M * N);
         var pc = new uint[] { (uint)M, (uint)K, (uint)N, (uint)groupSize, (uint)scaleCount };
@@ -587,6 +588,7 @@ public sealed unsafe partial class VulkanBackend
         EnsureInitialized();
         GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmFp8E4M3));
         GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmFp8E4M3));
+        GpuKernelGuards.Capacity(weightsFp8Raw, (long)K * N, nameof(weightsFp8Raw), nameof(DequantGemmFp8E4M3));
         GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmFp8E4M3));
         var result = AllocateBuffer(M * N);
         var pc = new uint[] { (uint)M, (uint)K, (uint)N, (uint)groupSize, (uint)scaleCount };
@@ -605,6 +607,7 @@ public sealed unsafe partial class VulkanBackend
     {
         EnsureInitialized();
         GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecode));
+        GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, heads, headDim, blockSize, seqLen, 1, nameof(PagedAttentionDecode));
         var result = AllocateBuffer(heads * headDim);
         var pc = new uint[] { (uint)heads, (uint)headDim, (uint)blockSize, (uint)seqLen, FloatBits(scale) };
         GlslQuintOp(VulkanGlslKernels.PagedAttentionDecode, q, kcache, vcache, blockTable, result, heads, pc, (uint)(pc.Length * sizeof(uint)));
@@ -621,6 +624,7 @@ public sealed unsafe partial class VulkanBackend
         EnsureInitialized();
         GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefill));
         if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
+        GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, heads, headDim, blockSize, checked(startPos + numQueries), numQueries, nameof(PagedAttentionPrefill));
         var result = AllocateBuffer(numQueries * heads * headDim);
         var pc = new uint[] { (uint)heads, (uint)headDim, (uint)blockSize, (uint)numQueries, (uint)startPos, FloatBits(scale) };
         GlslQuintOp(VulkanGlslKernels.PagedAttentionPrefill, q, kcache, vcache, blockTable, result, numQueries * heads, pc, (uint)(pc.Length * sizeof(uint)));
@@ -635,6 +639,7 @@ public sealed unsafe partial class VulkanBackend
         EnsureInitialized();
         GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecodeGqa));
         GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionDecodeGqa));
+        GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, kvHeads, headDim, blockSize, seqLen, 1, nameof(PagedAttentionDecodeGqa));
         var result = AllocateBuffer(heads * headDim);
         var pc = new uint[] { (uint)heads, (uint)kvHeads, (uint)headDim, (uint)blockSize, (uint)seqLen, FloatBits(scale) };
         GlslQuintOp(VulkanGlslKernels.PagedAttentionDecodeGqa, q, kcache, vcache, blockTable, result, heads, pc, (uint)(pc.Length * sizeof(uint)));
@@ -650,6 +655,7 @@ public sealed unsafe partial class VulkanBackend
         GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefillGqa));
         GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionPrefillGqa));
         if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
+        GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, kvHeads, headDim, blockSize, checked(startPos + numQueries), numQueries, nameof(PagedAttentionPrefillGqa));
         var result = AllocateBuffer(numQueries * heads * headDim);
         var pc = new uint[] { (uint)heads, (uint)kvHeads, (uint)headDim, (uint)blockSize, (uint)numQueries, (uint)startPos, FloatBits(scale) };
         GlslQuintOp(VulkanGlslKernels.PagedAttentionPrefillGqa, q, kcache, vcache, blockTable, result, numQueries * heads, pc, (uint)(pc.Length * sizeof(uint)));

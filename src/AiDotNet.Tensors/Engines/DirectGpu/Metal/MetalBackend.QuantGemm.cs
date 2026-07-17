@@ -13,7 +13,10 @@ public sealed partial class MetalBackend
     /// </summary>
     public IGpuBuffer DequantGemmInt(IGpuBuffer activations, IGpuBuffer weightsInt, IGpuBuffer scales,
         int M, int K, int N, int groupSize, int scaleCount)
-        => LaunchDequantGemm("dequant_gemm_int", activations, weightsInt, scales, M, K, N, groupSize, scaleCount);
+    {
+        GpuKernelGuards.Capacity(weightsInt, (long)K * N, nameof(weightsInt), nameof(DequantGemmInt));
+        return LaunchDequantGemm("dequant_gemm_int", activations, weightsInt, scales, M, K, N, groupSize, scaleCount);
+    }
 
     /// <summary>
     /// Weight-only fused dequant-GEMM for OCP FP8 E4M3 weights: C[M,N] = act[M,K] ·
@@ -22,7 +25,10 @@ public sealed partial class MetalBackend
     /// </summary>
     public IGpuBuffer DequantGemmFp8E4M3(IGpuBuffer activations, IGpuBuffer weightsFp8Raw, IGpuBuffer scales,
         int M, int K, int N, int groupSize, int scaleCount)
-        => LaunchDequantGemm("dequant_gemm_fp8", activations, weightsFp8Raw, scales, M, K, N, groupSize, scaleCount);
+    {
+        GpuKernelGuards.Capacity(weightsFp8Raw, (long)K * N, nameof(weightsFp8Raw), nameof(DequantGemmFp8E4M3));
+        return LaunchDequantGemm("dequant_gemm_fp8", activations, weightsFp8Raw, scales, M, K, N, groupSize, scaleCount);
+    }
 
     private IGpuBuffer LaunchDequantGemm(string kernelName, IGpuBuffer act, IGpuBuffer weights, IGpuBuffer scales,
         int M, int K, int N, int groupSize, int scaleCount)

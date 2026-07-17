@@ -255,6 +255,15 @@ public sealed class QuantGemmOpenClTests : IDisposable
             raws[i] = f8.RawValue;
             decoded[i] = f8.ToFloat();
         }
+        // Hardware-validate exact raw E4M3 encodings FromFloat can't produce, incl. exponent-zero raws
+        // (0x01/0x07/0x81/0x87) and the ±MaxFinite/±smallest-normal boundaries — GPU decode must match CPU.
+        byte[] rawBoundaries = { 0x01, 0x07, 0x81, 0x87, 0x7E, 0xFE, 0x08, 0x88 };
+        for (int b = 0; b < rawBoundaries.Length && b < kn; b++)
+        {
+            var f8 = Float8E4M3.FromRawValue(rawBoundaries[b]);
+            raws[b] = f8.RawValue;
+            decoded[b] = f8.ToFloat();
+        }
 
         bool perTensor = groupSize <= 0;
         int scaleCount;
