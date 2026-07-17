@@ -95,6 +95,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private IntPtr _normalizationModule;
     private IntPtr _neuralNetModule;
     private IntPtr _fusedModule;
+    private IntPtr _pagedAttnModule; // P1: paged-attention decode
     private IntPtr _attentionModule;
     private IntPtr _fftModule;
     private IntPtr _spectralPerfModule;
@@ -835,6 +836,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         _normalizationModule = CompileKernelModule(device, CudaNormalizationKernels.GetSource(), "normalization_kernels", CudaNormalizationKernels.GetKernelNames());
         _neuralNetModule = CompileKernelModule(device, CudaNeuralNetKernels.GetSource(), "neuralnet_kernels", CudaNeuralNetKernels.GetKernelNames());
         _fusedModule = CompileKernelModule(device, CudaFusedKernels.GetSource(), "fused_kernels", CudaFusedKernels.GetKernelNames());
+        _pagedAttnModule = CompileKernelModule(device, Kernels.CudaPagedAttentionKernels.GetSource(), "paged_attention_kernels", Kernels.CudaPagedAttentionKernels.GetKernelNames());
         _attentionModule = CompileKernelModule(device, CudaAttentionKernels.GetSource(), "attention_kernels", CudaAttentionKernels.GetKernelNames());
         _fftModule = CompileKernelModule(device, Kernels.CudaFFTKernels.GetSource(), "fft_kernels", Kernels.CudaFFTKernels.GetKernelNames());
         _spectralPerfModule = CompileKernelModule(device, Kernels.CudaSpectralPerfKernels.GetSource(), "spectral_perf_kernels", Kernels.CudaSpectralPerfKernels.GetKernelNames());
@@ -2462,6 +2464,27 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         ValidateBiasBuffer(bias, N);
         var output = MatMul(A, B, M, N, K);
         ApplyBiasInPlace(output, bias, M, N);
+        return output;
+    }
+
+    /// <summary>Paged-attention decode (P1): out[heads*headDim] = softmax(scale·Q·K)·V over the
+    /// sequence, reading K/V from the physical block pool [maxBlocks, blockSize, heads, headDim] via
+    /// <paramref name="blockTable"/> (an int buffer of physical block ids). headDim &lt;= 256.
+    /// Matches a standard-attention CPU oracle.</summary>
+    public unsafe IGpuBuffer PagedAttentionDecode(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int headDim, int blockSize, int seqLen, float scale)
+    {
+        if (!_kernelCache.TryGetValue("paged_attention_decode", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: paged_attention_decode");
+        var output = AllocateBuffer(heads * headDim);
+        using var _ = PushContext();
+        uint grid = (uint)(((long)heads + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr qPtr = q.Handle, kPtr = kcache.Handle, vPtr = vcache.Handle, btPtr = blockTable.Handle, oPtr = output.Handle;
+        int hh = heads, hd = headDim, bs = blockSize, sl = seqLen; float sc = scale;
+        void** args = stackalloc void*[10];
+        args[0] = &qPtr; args[1] = &kPtr; args[2] = &vPtr; args[3] = &btPtr; args[4] = &oPtr;
+        args[5] = &hh; args[6] = &hd; args[7] = &bs; args[8] = &sl; args[9] = &sc;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
         return output;
     }
 
@@ -15225,6 +15248,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         {
             CudaNativeBindings.cuModuleUnload(_fusedConvolutionModule);
             _fusedConvolutionModule = IntPtr.Zero;
+        }
+
+        if (_pagedAttnModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_pagedAttnModule);
+            _pagedAttnModule = IntPtr.Zero;
         }
 
         if (_fusedModule != IntPtr.Zero)
