@@ -2680,6 +2680,48 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             }
         }
 
+        /// <summary>
+        /// Weight-only fused dequant-GEMM for int4 weights (2 signed nibbles per byte, low nibble =
+        /// even element; matches <c>PackedInt4</c> / llama.cpp Q4_0 and the CPU oracle
+        /// <c>FusedDequantMatmulKernels.Q4MatMul</c>). <paramref name="weightsInt4Packed"/> is a byte
+        /// buffer of length <c>ceil(K*N/2)</c>; scales are symmetric (per-tensor when
+        /// <paramref name="scaleCount"/> == 1, else per-group over the flattened K*N buffer).
+        /// </summary>
+        public IGpuBuffer DequantGemmInt4(
+            IGpuBuffer activations, IGpuBuffer weightsInt4Packed, IGpuBuffer scales,
+            int M, int K, int N, int groupSize, int scaleCount)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context not available");
+
+            var output = AllocateBuffer(M * N);
+            try
+            {
+                var kernel = _kernelCache["dequant_gemm_int4"];
+                kernel.SetArg(0, ((DirectOpenClGpuBuffer)activations).Buffer.Handle);
+                kernel.SetArg(1, ((DirectOpenClGpuByteBuffer)weightsInt4Packed).Buffer.Handle);
+                kernel.SetArg(2, ((DirectOpenClGpuBuffer)scales).Buffer.Handle);
+                kernel.SetArg(3, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+                kernel.SetArg(4, M);
+                kernel.SetArg(5, K);
+                kernel.SetArg(6, N);
+                kernel.SetArg(7, groupSize);
+                kernel.SetArg(8, scaleCount);
+
+                var (localX, localY) = CalculateOptimalWorkGroupSize(M, N);
+                int globalX = ((M + localX - 1) / localX) * localX;
+                int globalY = ((N + localY - 1) / localY) * localY;
+                kernel.Execute2D(globalX, globalY, localX, localY);
+                _context.Finish();
+                return output;
+            }
+            catch
+            {
+                output.Dispose();
+                throw;
+            }
+        }
+
         public IGpuBuffer GemmBiasSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
         {
             IGpuBuffer? temp = null;

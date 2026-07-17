@@ -142,6 +142,79 @@ public sealed class QuantGemmOpenClTests : IDisposable
                 $"Mismatch at {idx}: expected {e}, got {a} (tol {tol}, groupSize {groupSize})");
         }
     }
+
+    [Theory]
+    [InlineData(0)]    // per-tensor (scaleCount == 1)
+    [InlineData(64)]   // per-group over flattened K*N
+    [InlineData(128)]  // per-group, different group size
+    public void DequantGemmInt4_MatchesCpuOracle(int groupSize)
+    {
+        if (!EnsureReady()) return;
+        var backend = _backend!;
+
+        const int M = 8, K = 128, N = 64;
+        const int kn = K * N;
+        var rng = new Random(0x4B4B4B);
+
+        var act = new float[M * K];
+        for (int i = 0; i < act.Length; i++) act[i] = (float)(rng.NextDouble() * 2.0 - 1.0);
+
+        // int4 values in [-8,7]: keep an unpacked sbyte[] for the reference, and a
+        // 2-per-byte packed byte[] (low nibble = even element) for the GPU — matching PackedInt4.
+        var w = new sbyte[kn];
+        for (int i = 0; i < kn; i++) w[i] = (sbyte)rng.Next(-8, 8);
+        var packed = new byte[(kn + 1) / 2];
+        for (int idx = 0; idx < kn; idx++)
+        {
+            int lo = w[idx] & 0x0F;
+            if ((idx & 1) == 0) packed[idx >> 1] = (byte)((packed[idx >> 1] & 0xF0) | lo);
+            else packed[idx >> 1] = (byte)((packed[idx >> 1] & 0x0F) | (lo << 4));
+        }
+
+        bool perTensor = groupSize <= 0;
+        int scaleCount;
+        float[] scales;
+        int gsArg;
+        if (perTensor)
+        {
+            scaleCount = 1;
+            scales = new[] { 0.02f };
+            gsArg = kn;
+        }
+        else
+        {
+            int totalGroups = (kn + groupSize - 1) / groupSize;
+            scaleCount = totalGroups;
+            scales = new float[totalGroups];
+            for (int g = 0; g < totalGroups; g++) scales[g] = 0.01f + (float)(rng.NextDouble() * 0.05);
+            gsArg = groupSize;
+        }
+
+        var expected = Reference(act, w, scales, M, K, N, gsArg, scaleCount);
+
+        var actBuf = backend.AllocateBuffer(act);
+        var scaleBuf = backend.AllocateBuffer(scales);
+        var wBuf = backend.AllocateByteBuffer(packed.Length);
+        backend.UploadByteBuffer(wBuf, packed);
+
+        var outBuf = backend.DequantGemmInt4(actBuf, wBuf, scaleBuf, M, K, N, gsArg, scaleCount);
+        var actual = backend.DownloadBuffer(outBuf);
+
+        actBuf.Dispose();
+        scaleBuf.Dispose();
+        wBuf.Dispose();
+        outBuf.Dispose();
+
+        Assert.Equal(M * N, actual.Length);
+        for (int idx = 0; idx < expected.Length; idx++)
+        {
+            float e = expected[idx];
+            float a = actual[idx];
+            float tol = 1e-2f + 1e-3f * Math.Abs(e);
+            Assert.True(Math.Abs(e - a) <= tol,
+                $"int4 mismatch at {idx}: expected {e}, got {a} (tol {tol}, groupSize {groupSize})");
+        }
+    }
 }
 
 #endif

@@ -19,7 +19,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels
     /// </remarks>
     internal static class QuantGemmKernels
     {
-        public static string[] GetKernelNames() => new[] { "dequant_gemm_int8" };
+        public static string[] GetKernelNames() => new[] { "dequant_gemm_int8", "dequant_gemm_int4" };
 
         public static string GetSource()
         {
@@ -53,6 +53,48 @@ __kernel void dequant_gemm_int8(
             const int flat = k * N + j;
             const float s = scales[flat / groupSize];
             acc += act[actRow + k] * (float)(w[flat]) * s;
+        }
+    }
+
+    outbuf[i * N + j] = acc;
+}
+
+// int4 variant: weights are 2 signed nibbles per byte (low nibble = even element,
+// high nibble = odd element; two's-complement, matching PackedInt4 / llama.cpp Q4_0).
+// C[M,N] = act[M,K] . dequant(int4 W[K,N]); symmetric scales; flat = k*N + j.
+__kernel void dequant_gemm_int4(
+    __global const float* act,      // [M*K]
+    __global const uchar* wpacked,  // [ceil(K*N/2)] two int4 per byte
+    __global const float* scales,   // [scaleCount]
+    __global float*       outbuf,   // [M*N]
+    const int M, const int K, const int N,
+    const int groupSize, const int scaleCount)
+{
+    const int i = get_global_id(0);
+    const int j = get_global_id(1);
+    if (i >= M || j >= N) return;
+
+    const int actRow = i * K;
+    float acc = 0.0f;
+
+    if (scaleCount == 1) {
+        const float s = scales[0];
+        for (int k = 0; k < K; ++k) {
+            const int flat = k * N + j;
+            const uchar b = wpacked[flat >> 1];
+            const int nib = (flat & 1) ? ((b >> 4) & 0x0F) : (b & 0x0F);
+            const int val = (nib & 0x07) - (nib & 0x08); // sign-extend 4-bit two's-complement
+            acc += act[actRow + k] * (float)val;
+        }
+        acc *= s;
+    } else {
+        for (int k = 0; k < K; ++k) {
+            const int flat = k * N + j;
+            const uchar b = wpacked[flat >> 1];
+            const int nib = (flat & 1) ? ((b >> 4) & 0x0F) : (b & 0x0F);
+            const int val = (nib & 0x07) - (nib & 0x08);
+            const float s = scales[flat / groupSize];
+            acc += act[actRow + k] * (float)val * s;
         }
     }
 
