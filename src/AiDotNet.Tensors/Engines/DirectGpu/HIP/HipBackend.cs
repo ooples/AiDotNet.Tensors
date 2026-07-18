@@ -9000,17 +9000,19 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             }
         }
 
-        // Scale by 1/N for inverse FFT
+        // Scale by 1/n for inverse FFT (n elements, factor 1/n).
         if (inverse && _kernelCache.TryGetValue("scale_inverse", out var scaleKernel))
         {
             uint gridSize = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
                 {
                 IntPtr _p0 = outputReal.Handle;
                 IntPtr _p1 = outputImag.Handle;
-                void** args = stackalloc void*[3];
+                float invScale = 1.0f / n;
+                void** args = stackalloc void*[4];
                 args[0] = &_p0;
                 args[1] = &_p1;
                 args[2] = &n;
+                args[3] = &invScale;
 
 
                 LaunchKernel(scaleKernel, gridSize, (uint)DefaultBlockSize, args);
@@ -9167,7 +9169,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             }
         }
 
-        // Scale by 1/N for inverse FFT (batched)
+        // Scale batched inverse: touch batch*n elements but scale each by 1/n (NOT 1/(batch*n)).
         if (inverse && _kernelCache.TryGetValue("scale_inverse", out var scaleKernel))
         {
             int total = batch * n;
@@ -9175,10 +9177,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 {
                 IntPtr _p0 = outputReal.Handle;
                 IntPtr _p1 = outputImag.Handle;
-                void** args = stackalloc void*[3];
+                float invScale = 1.0f / n;   // per-transform length, NOT 1/(batch*n)
+                void** args = stackalloc void*[4];
                 args[0] = &_p0;
                 args[1] = &_p1;
                 args[2] = &total;
+                args[3] = &invScale;
 
 
                 LaunchKernel(scaleKernel, gridSize, (uint)DefaultBlockSize, args);
@@ -9204,17 +9208,27 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         HipCopyBuffer(inputReal, outputReal, total);
         HipCopyBuffer(inputImag, outputImag, total);
 
-        // Row-wise bit reversal and FFT
-        if (_kernelCache.TryGetValue("bit_reverse_permutation", out var bitRevKernel) &&
+        // Row-wise bit reversal (DIT operates on bit-reversed input) then row butterflies. The previous
+        // code left an EMPTY per-row loop here (no bit reversal at all), so the DIT butterflies ran on
+        // un-permuted data and the whole 2D FFT produced garbage. Now each row is bit-reversed first.
+        if (_kernelCache.TryGetValue("fft_rows_bit_reverse", out var rowsBitRevKernel) &&
             _kernelCache.TryGetValue("fft_rows_butterfly", out var rowsButterflyKernel))
         {
-            // Bit reversal for each row (using batched approach)
-            for (int row = 0; row < height; row++)
-            {
-                int offset = row * width;
-                // Note: For production, we should use offset buffers or batched kernel
-                // This is a simplified version that operates row by row
-            }
+                {
+                uint gridBrX = (uint)((width + DefaultBlockSize - 1) / DefaultBlockSize);
+                uint gridBrY = (uint)height;
+                IntPtr _b0 = outputReal.Handle;
+                IntPtr _b1 = outputImag.Handle;
+#pragma warning disable CA2014
+                void** brArgs = stackalloc void*[5];
+#pragma warning restore CA2014
+                brArgs[0] = &_b0;
+                brArgs[1] = &_b1;
+                brArgs[2] = &height;
+                brArgs[3] = &width;
+                brArgs[4] = &log2Width;
+                LaunchKernel2D(rowsBitRevKernel, gridBrX, gridBrY, (uint)DefaultBlockSize, 1, brArgs);
+                }
 
             int inverseFlag = inverse ? 1 : 0;
             for (int stride = 2; stride <= width; stride *= 2)
@@ -9240,9 +9254,26 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             }
         }
 
-        // Column-wise FFT
+        // Column-wise bit reversal then column butterflies (same missing-bit-reversal fix as the rows).
         if (_kernelCache.TryGetValue("fft_cols_butterfly", out var colsButterflyKernel))
         {
+            if (_kernelCache.TryGetValue("fft_cols_bit_reverse", out var colsBitRevKernel))
+            {
+                uint gridBrX = (uint)((height + DefaultBlockSize - 1) / DefaultBlockSize);
+                uint gridBrY = (uint)width;
+                IntPtr _b0 = outputReal.Handle;
+                IntPtr _b1 = outputImag.Handle;
+#pragma warning disable CA2014
+                void** brArgs = stackalloc void*[5];
+#pragma warning restore CA2014
+                brArgs[0] = &_b0;
+                brArgs[1] = &_b1;
+                brArgs[2] = &height;
+                brArgs[3] = &width;
+                brArgs[4] = &log2Height;
+                LaunchKernel2D(colsBitRevKernel, gridBrX, gridBrY, (uint)DefaultBlockSize, 1, brArgs);
+            }
+
             int inverseFlag = inverse ? 1 : 0;
             for (int stride = 2; stride <= height; stride *= 2)
             {
@@ -9269,17 +9300,19 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             }
         }
 
-        // Scale by 1/(height*width) for inverse FFT
+        // Scale by 1/(height*width) for inverse 2D FFT.
         if (inverse && _kernelCache.TryGetValue("scale_inverse", out var scaleKernel))
         {
             uint gridSize = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
                 {
                 IntPtr _p0 = outputReal.Handle;
                 IntPtr _p1 = outputImag.Handle;
-                void** args = stackalloc void*[3];
+                float invScale = 1.0f / total;   // 2D transform length = height*width
+                void** args = stackalloc void*[4];
                 args[0] = &_p0;
                 args[1] = &_p1;
                 args[2] = &total;
+                args[3] = &invScale;
 
 
                 LaunchKernel(scaleKernel, gridSize, (uint)DefaultBlockSize, args);

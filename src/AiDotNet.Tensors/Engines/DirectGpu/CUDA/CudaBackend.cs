@@ -12959,10 +12959,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (inverse && _kernelCache.TryGetValue("scale_inverse", out var scaleKernel))
         {
             uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
-            void** args = stackalloc void*[3];
+            float invScale = 1.0f / n;
+            void** args = stackalloc void*[4];
             args[0] = &outRealPtr;
             args[1] = &outImagPtr;
             args[2] = &n;
+            args[3] = &invScale;
             LaunchKernel(scaleKernel, grid, (uint)DefaultBlockSize, args);
         }
     }
@@ -13104,11 +13106,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (inverse && _kernelCache.TryGetValue("scale_inverse", out var scaleKernel))
         {
             int total = batch * n;
+            float invScale = 1.0f / n;   // per-transform length, NOT 1/(batch*n)
             uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
-            void** args = stackalloc void*[3];
+            void** args = stackalloc void*[4];
             args[0] = &outRealPtr;
             args[1] = &outImagPtr;
             args[2] = &total;
+            args[3] = &invScale;
             LaunchKernel(scaleKernel, grid, (uint)DefaultBlockSize, args);
         }
     }
@@ -13130,6 +13134,18 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IntPtr outImagPtr = outputImag.Handle;
         int inv = inverse ? 1 : 0;
 
+        // Row-wise bit-reversal (prerequisite for the DIT row butterflies)
+        if (_kernelCache.TryGetValue("fft_rows_bit_reverse", out var rowBitRev))
+        {
+            void** brArgs = stackalloc void*[5];
+            brArgs[0] = &outRealPtr;
+            brArgs[1] = &outImagPtr;
+            brArgs[2] = &height;
+            brArgs[3] = &width;
+            brArgs[4] = &log2Width;
+            LaunchKernel2D(rowBitRev, (uint)((width + 15) / 16), (uint)((height + 15) / 16), 1, 16, 16, brArgs);
+        }
+
         // Row-wise FFT (process each row as a separate FFT)
         if (_kernelCache.TryGetValue("fft_rows_butterfly", out var rowButterfly))
         {
@@ -13146,6 +13162,18 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 rowArgs[4] = &stride;
                 LaunchKernel2D(rowButterfly, (uint)((width / 2 + 15) / 16), (uint)((height + 15) / 16), 1, 16, 16, rowArgs);
             }
+        }
+
+        // Column-wise bit-reversal (prerequisite for the DIT column butterflies)
+        if (_kernelCache.TryGetValue("fft_cols_bit_reverse", out var colBitRev))
+        {
+            void** brArgs = stackalloc void*[5];
+            brArgs[0] = &outRealPtr;
+            brArgs[1] = &outImagPtr;
+            brArgs[2] = &height;
+            brArgs[3] = &width;
+            brArgs[4] = &log2Height;
+            LaunchKernel2D(colBitRev, (uint)((height + 15) / 16), (uint)((width + 15) / 16), 1, 16, 16, brArgs);
         }
 
         // Column-wise FFT
@@ -13170,11 +13198,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (inverse && _kernelCache.TryGetValue("scale_inverse", out var scaleKernel))
         {
             int total = height * width;
+            float invScale = 1.0f / total;   // 2D transform length = height*width
             uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
-            void** args = stackalloc void*[3];
+            void** args = stackalloc void*[4];
             args[0] = &outRealPtr;
             args[1] = &outImagPtr;
             args[2] = &total;
+            args[3] = &invScale;
             LaunchKernel(scaleKernel, grid, (uint)DefaultBlockSize, args);
         }
     }
