@@ -40,6 +40,7 @@ internal static class Ed25519LicenseRevocation
 
     private static readonly object _lock = new();
     private static bool _embeddedLoaded;
+    private static bool _diskCacheLoaded;
     private static Crl? _embedded;   // release-embedded CRL (verified once)
     private static Crl? _fetched;    // newer CRL installed from an online refresh (verified on install)
 
@@ -82,6 +83,9 @@ internal static class Ed25519LicenseRevocation
         lock (_lock)
         {
             _embeddedLoaded = true;
+            // Also mark the disk cache as "handled" so a test's explicit CRL isn't silently overridden by a
+            // real ~/.aidotnet/revocations.crl left on the machine — tests must be deterministic.
+            _diskCacheLoaded = true;
             _embedded = null;
             _fetched = crlJson is null ? null : ParseAndVerify(crlJson, nowUtc);
         }
@@ -93,9 +97,34 @@ internal static class Ed25519LicenseRevocation
         lock (_lock)
         {
             EnsureEmbeddedLoadedNoLock();
+            EnsureDiskCacheLoadedNoLock();
             if (_embedded is null) return _fetched;
             if (_fetched is null) return _embedded;
             return _fetched.Iat >= _embedded.Iat ? _fetched : _embedded;
+        }
+    }
+
+    /// <summary>
+    /// Loads the last online-fetched CRL cached on disk (by <see cref="TensorsOnlineLicenseServices"/>) once
+    /// per process, so revocation is enforced even on a fully-offline start that never refreshes. A later live
+    /// refresh via <see cref="TryInstallFetched"/> supersedes it (newer iat wins). Fail-open on any error.
+    /// </summary>
+    private static void EnsureDiskCacheLoadedNoLock()
+    {
+        if (_diskCacheLoaded) return;
+        _diskCacheLoaded = true;
+        try
+        {
+            string? json = TensorsOnlineLicenseServices.ReadCachedCrl();
+            if (json is null) return;
+            var candidate = ParseAndVerify(json, DateTimeOffset.UtcNow);
+            if (candidate is null) return;
+            if (_fetched is null || candidate.Iat > _fetched.Iat) _fetched = candidate;
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Trace.TraceWarning(
+                "Ed25519LicenseRevocation: failed to load cached CRL: " + ex.GetType().Name + ": " + ex.Message);
         }
     }
 
