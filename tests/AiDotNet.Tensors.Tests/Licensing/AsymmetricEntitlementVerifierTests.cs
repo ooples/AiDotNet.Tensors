@@ -242,10 +242,16 @@ public class AsymmetricEntitlementVerifierTests
     public void PersistenceGuard_Aidn2TokenMissingCapability_DoesNotAuthorise_FallsThroughToKeyPath()
     {
         var savedKeyEnv = Environment.GetEnvironmentVariable("AIDOTNET_LICENSE_KEY");
+        // A pre-existing RSA entitlement token in AIDOTNET_LICENSE_TOKEN could grant 'tensors:save' after the
+        // aidn2 result declines it, masking the key-path fall-through this test asserts. Clear it for the
+        // duration and restore it in finally.
+        var savedTokenEnv = Environment.GetEnvironmentVariable("AIDOTNET_LICENSE_TOKEN");
         using (Aidn2TestSupport.WithPublicKeys(Aidn2TestSupport.DefaultTestKeySet()))
         {
             try
             {
+                Environment.SetEnvironmentVariable("AIDOTNET_LICENSE_TOKEN", null);
+
                 // Token grants only load — save is not granted by aidn2, so the guard falls through. With
                 // AIDOTNET_LICENSE_KEY set to an aidn2 token (not a valid server-key format), the key path
                 // then rejects it → LicenseRequiredException (positive-grant-only aidn2 never hard-fails
@@ -261,6 +267,7 @@ public class AsymmetricEntitlementVerifierTests
             finally
             {
                 Environment.SetEnvironmentVariable("AIDOTNET_LICENSE_KEY", savedKeyEnv);
+                Environment.SetEnvironmentVariable("AIDOTNET_LICENSE_TOKEN", savedTokenEnv);
                 PersistenceGuard.ClearValidatorCacheForTesting();
             }
         }

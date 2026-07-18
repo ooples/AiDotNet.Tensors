@@ -37,16 +37,26 @@ def main() -> int:
     ap.add_argument("--tenant", required=True, help="tenant / customer name (recorded in the signed payload)")
     ap.add_argument("--caps", default="tensors:save,tensors:load,model:save,model:load",
                     help="comma-separated capabilities")
-    ap.add_argument("--days", type=int, default=365, help="validity in days (omit --days 0 for perpetual)")
+    ap.add_argument("--days", type=int, default=365,
+                    help="validity in days (use 0 for a perpetual token; omitting the option defaults to 365)")
     ap.add_argument("--scope", default=None, help="optional audience binding; host must set AIDOTNET_LICENSE_SCOPE to match")
     ap.add_argument("--jti", default=None, help="optional token id for CRL revocation")
     ap.add_argument("--out", default="tensors-entitlement.json", help="output path")
     args = ap.parse_args()
 
+    # Reject negative validity: a negative --days would silently omit `expires` and mint a PERPETUAL token.
+    # A perpetual token is requested EXPLICITLY with --days 0, never by a negative value.
+    if args.days < 0:
+        ap.error("--days must be non-negative (use 0 for a perpetual token)")
+
     with open(args.private_key_pem, "rb") as f:
         priv = serialization.load_pem_private_key(f.read(), password=None)
     if not isinstance(priv, RSAPrivateKey):
         print("ERROR: provided PEM is not an RSA private key", file=sys.stderr)
+        return 2
+    # Reject a weak externally-supplied key — the documented trust root is RSA-2048.
+    if priv.key_size < 2048:
+        print(f"ERROR: RSA private key is only {priv.key_size} bits; the minimum is 2048", file=sys.stderr)
         return 2
 
     payload = {

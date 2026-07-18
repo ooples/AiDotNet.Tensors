@@ -138,12 +138,19 @@ internal static class TensorsMachineFingerprint
                 return null;
             }
 
-            string output = process.StandardOutput.ReadToEnd();
+            // Drain stdout asynchronously so a hung ioreg cannot block us indefinitely on ReadToEnd() before
+            // the timeout is ever consulted. The background read keeps the pipe from filling; we then bound
+            // the total wait with WaitForExit(5000) and kill the process (returning null) if it overruns.
+            var outputTask = process.StandardOutput.ReadToEndAsync();
             if (!process.WaitForExit(5000))
             {
                 try { process.Kill(); } catch { /* best effort */ }
                 return null;
             }
+
+            string output;
+            try { output = outputTask.GetAwaiter().GetResult(); }
+            catch { return null; }
 
             const string marker = "\"IOPlatformUUID\" = \"";
             int start = output.IndexOf(marker, StringComparison.Ordinal);

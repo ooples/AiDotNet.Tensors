@@ -35,9 +35,13 @@ def i2b(n: int) -> bytes:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Generate a Tensors entitlement RSA signing keypair.")
-    ap.add_argument("--bits", type=int, default=2048, help="RSA key size (default 2048)")
+    ap.add_argument("--bits", type=int, default=2048, help="RSA key size (default 2048; minimum 2048)")
     ap.add_argument("--out-dir", default=".", help="where to write private_key.pem (default: cwd)")
     args = ap.parse_args()
+
+    # Enforce the documented RSA-2048 trust-root minimum — a weaker key must never be minted.
+    if args.bits < 2048:
+        ap.error("--bits must be at least 2048 (RSA-2048 is the documented trust-root minimum)")
 
     priv = rsa.generate_private_key(public_exponent=65537, key_size=args.bits)
     nums = priv.public_key().public_numbers()
@@ -48,7 +52,15 @@ def main() -> int:
 
     os.makedirs(args.out_dir, exist_ok=True)
     priv_path = os.path.join(args.out_dir, "private_key.pem")
-    with open(priv_path, "wb") as f:
+    # Create the private key file owner-readable/writable ONLY (0600) so a leaked copy can't be world-read.
+    # os.open honours the mode on creation; fchmod additionally forces 0600 on an existing file. Both are
+    # effectively no-ops on Windows (which lacks POSIX permission bits / fchmod), so this is safe there.
+    fd = os.open(priv_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        try:
+            os.fchmod(f.fileno(), 0o600)
+        except (AttributeError, OSError):
+            pass  # Windows / platforms without fchmod — best effort.
         f.write(priv.private_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PrivateFormat.PKCS8,

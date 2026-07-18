@@ -42,6 +42,11 @@ internal static class Ed25519LicenseRevocation
     /// <see cref="DateTimeOffset.FromUnixTimeSeconds"/>.</summary>
     private const long MaxUnixSeconds = 253402300799L;
 
+    /// <summary>Clock-skew tolerance for a CRL's <c>iat</c>: an <c>iat</c> more than this far in the future is
+    /// rejected (it decides CRL ordering, so a grossly future-dated value must not win), while benign clock
+    /// differences are tolerated.</summary>
+    private static readonly TimeSpan IatFutureSkew = TimeSpan.FromMinutes(5);
+
     private static readonly object _lock = new();
     private static bool _embeddedLoaded;
     private static bool _diskCacheLoaded;
@@ -126,7 +131,10 @@ internal static class Ed25519LicenseRevocation
             var fet = IsCurrentlyValid(_fetched, now) ? _fetched : null;
             if (emb is null) return fet;
             if (fet is null) return emb;
-            return fet.Iat >= emb.Iat ? fet : emb;
+            // Equal iat (1s precision): union embedded + fetched deny-lists so source/load ordering can
+            // never drop a valid revocation. Otherwise the strictly-newer CRL wins.
+            if (fet.Iat == emb.Iat) return Merge(fet, emb);
+            return fet.Iat > emb.Iat ? fet : emb;
         }
     }
 
@@ -150,7 +158,10 @@ internal static class Ed25519LicenseRevocation
             if (json is null) return;
             var candidate = ParseAndVerify(json, DateTimeOffset.UtcNow);
             if (candidate is null) return;
+            // Newer disk-cached CRL wins; an equal-iat one is unioned (same-second additive refresh) so a
+            // valid revocation is never dropped by load ordering.
             if (_fetched is null || candidate.Iat > _fetched.Iat) _fetched = candidate;
+            else if (candidate.Iat == _fetched.Iat) _fetched = Merge(_fetched, candidate);
         }
         catch (Exception ex)
         {
@@ -232,8 +243,17 @@ internal static class Ed25519LicenseRevocation
             var p = payloadDoc.RootElement;
             if (p.ValueKind != JsonValueKind.Object) return null;
 
-            long iat = p.TryGetProperty("iat", out var iatEl) && iatEl.ValueKind == JsonValueKind.Number
-                ? iatEl.GetInt64() : 0;
+            // Validate iat BEFORE using it for CRL ordering. Require a JSON number parsed non-throwingly
+            // (GetInt64 would throw FormatException, which the outer catch does NOT cover), reject
+            // non-positive / out-of-range values, and reject a grossly future-dated iat. No zero fallback:
+            // a missing or invalid iat is a malformed CRL, not "iat 0".
+            if (!p.TryGetProperty("iat", out var iatEl) || iatEl.ValueKind != JsonValueKind.Number
+                || !iatEl.TryGetInt64(out long iat) || iat <= 0 || iat > MaxUnixSeconds)
+            {
+                return null;
+            }
+            if (DateTimeOffset.FromUnixTimeSeconds(iat) - nowUtc > IatFutureSkew) return null;
+
             long exp = 0;
             if (p.TryGetProperty("exp", out var expEl) && expEl.ValueKind == JsonValueKind.Number
                 && !expEl.TryGetInt64(out exp))
@@ -248,7 +268,14 @@ internal static class Ed25519LicenseRevocation
             // so a CRL valid now does not stay authoritative past its expiry. (exp==0 => no expiry.)
             if (exp > 0 && DateTimeOffset.FromUnixTimeSeconds(exp) < nowUtc) return null;
 
-            return new Crl(iat, exp, ReadStringSet(p, "rkids"), ReadStringSet(p, "rjti"));
+            // Reject malformed present revocation arrays (non-array, or non-string entries) rather than
+            // silently treating them as empty — a malformed newer CRL must not replace an older deny-list.
+            if (!TryReadStringSet(p, "rkids", out var rkids) || !TryReadStringSet(p, "rjti", out var rjti))
+            {
+                return null;
+            }
+
+            return new Crl(iat, exp, rkids, rjti);
         }
         catch (Exception ex) when (ex is JsonException or ArgumentException)
         {
@@ -256,21 +283,33 @@ internal static class Ed25519LicenseRevocation
         }
     }
 
-    private static HashSet<string> ReadStringSet(JsonElement obj, string name)
+    /// <summary>
+    /// Reads a revocation string set. An ABSENT field yields an empty set (<c>true</c>). A PRESENT field
+    /// that is not a JSON array, or that contains any non-string entry, is malformed and yields
+    /// <c>false</c> so the caller can reject the whole CRL instead of silently accepting an empty deny-list.
+    /// A present, valid empty array yields an empty set (<c>true</c>).
+    /// </summary>
+    private static bool TryReadStringSet(JsonElement obj, string name, out HashSet<string> set)
     {
-        var set = new HashSet<string>(StringComparer.Ordinal);
-        if (obj.TryGetProperty(name, out var arr) && arr.ValueKind == JsonValueKind.Array)
+        set = new HashSet<string>(StringComparer.Ordinal);
+        if (!obj.TryGetProperty(name, out var arr))
         {
-            foreach (var e in arr.EnumerateArray())
-            {
-                if (e.ValueKind == JsonValueKind.String)
-                {
-                    var v = e.GetString();
-                    if (!string.IsNullOrEmpty(v)) set.Add(v!);
-                }
-            }
+            return true; // absent field => empty set is fine.
         }
-        return set;
+        if (arr.ValueKind != JsonValueKind.Array)
+        {
+            return false; // present but not an array => malformed.
+        }
+        foreach (var e in arr.EnumerateArray())
+        {
+            if (e.ValueKind != JsonValueKind.String)
+            {
+                return false; // non-string entry => malformed.
+            }
+            var v = e.GetString();
+            if (!string.IsNullOrEmpty(v)) set.Add(v!);
+        }
+        return true;
     }
 
     private static bool TryGetString(JsonElement obj, string name, out string value)

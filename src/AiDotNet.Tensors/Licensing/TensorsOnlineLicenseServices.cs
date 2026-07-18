@@ -50,6 +50,10 @@ internal static class TensorsOnlineLicenseServices
 
 #if !NET471
     private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(10) };
+#else
+    /// <summary>Explicit HTTP timeout for the net471 <see cref="System.Net.HttpWebRequest"/> path (WebClient
+    /// has none), matching the modern <see cref="HttpClient"/> 10-second budget.</summary>
+    private const int Net471TimeoutMs = 10_000;
 #endif
 
     private static string CacheDir => _cacheDirOverrideForTests ?? Path.Combine(
@@ -87,7 +91,10 @@ internal static class TensorsOnlineLicenseServices
     /// </summary>
     internal static void RefreshInBackground(string validateUrl, string licenseKey, string machineIdHash)
     {
-        if (!ShouldRefresh())
+        // Throttle the CRL and this key's offline token INDEPENDENTLY: a fresh CRL must not suppress minting
+        // a missing token for this key, and a fresh token (for this or any other key) must not suppress the
+        // CRL refresh. Skip scheduling only when BOTH relevant artifacts are already fresh.
+        if (!ShouldRefreshCrl() && !ShouldRefreshToken(licenseKey))
         {
             return;
         }
@@ -115,17 +122,21 @@ internal static class TensorsOnlineLicenseServices
 
     private static void RefreshCore(string validateUrl, string licenseKey, string machineIdHash)
     {
-        // CRL first: cheapest, benefits every key type (revocation enforcement offline).
+        // CRL first: cheapest, benefits every key type (revocation enforcement offline). Guarded by its OWN
+        // freshness so a fresh offline token never suppresses a needed CRL refresh.
         try
         {
-            string? crlUrl = DeriveFunctionUrl(validateUrl, "get-revocations");
-            if (crlUrl is not null)
+            if (ShouldRefreshCrl())
             {
-                string? crl = HttpGet(crlUrl);
-                if (!string.IsNullOrWhiteSpace(crl) &&
-                    Ed25519LicenseRevocation.TryInstallFetched(crl!, DateTimeOffset.UtcNow))
+                string? crlUrl = DeriveFunctionUrl(validateUrl, "get-revocations");
+                if (crlUrl is not null)
                 {
-                    WriteAtomic(CrlPath, crl!);
+                    string? crl = HttpGet(crlUrl);
+                    if (!string.IsNullOrWhiteSpace(crl) &&
+                        Ed25519LicenseRevocation.TryInstallFetched(crl!, DateTimeOffset.UtcNow))
+                    {
+                        WriteAtomic(CrlPath, crl!);
+                    }
                 }
             }
         }
@@ -136,9 +147,11 @@ internal static class TensorsOnlineLicenseServices
         }
 
         // Offline token: only meaningful for a server AIDN-* key (aidn./aidn2. keys already verify offline).
+        // Guarded by THIS key's own token freshness so a fresh CRL (or another key's token) never suppresses
+        // minting a missing token for this key.
         try
         {
-            if (LicenseValidator.IsServerValidatedKeyFormat(licenseKey))
+            if (ShouldRefreshToken(licenseKey))
             {
                 string? issueUrl = DeriveFunctionUrl(validateUrl, "issue-license");
                 if (issueUrl is not null)
@@ -296,38 +309,35 @@ internal static class TensorsOnlineLicenseServices
         }
     }
 
-    /// <summary>True when no cache file exists yet or the freshest one is older than <see cref="RefreshInterval"/>.</summary>
-    private static bool ShouldRefresh()
+    /// <summary>True when the CRL cache is missing or older than <see cref="RefreshInterval"/>.</summary>
+    private static bool ShouldRefreshCrl() => IsArtifactStale(CrlPath);
+
+    /// <summary>True when <paramref name="licenseKey"/> is a server <c>AIDN-*</c> key (the only kind for which
+    /// an offline token is minted) AND that key's own cached token is missing or older than
+    /// <see cref="RefreshInterval"/>. Only THIS key's token file is consulted, so another key's fresh token
+    /// can never suppress this key's refresh.</summary>
+    private static bool ShouldRefreshToken(string licenseKey) =>
+        LicenseValidator.IsServerValidatedKeyFormat(licenseKey) && IsArtifactStale(TokenPath(licenseKey));
+
+    /// <summary>True when a specific cache artifact is missing or older than <see cref="RefreshInterval"/>.</summary>
+    private static bool IsArtifactStale(string path)
     {
         try
         {
-            DateTime newest = DateTime.MinValue;
             lock (FileLock)
             {
-                if (Directory.Exists(CacheDir))
+                if (!File.Exists(path))
                 {
-                    if (File.Exists(CrlPath))
-                    {
-                        newest = File.GetLastWriteTimeUtc(CrlPath);
-                    }
-
-                    foreach (string f in Directory.EnumerateFiles(CacheDir, "offline-*.token"))
-                    {
-                        DateTime t = File.GetLastWriteTimeUtc(f);
-                        if (t > newest)
-                        {
-                            newest = t;
-                        }
-                    }
+                    return true;
                 }
-            }
 
-            return DateTime.UtcNow - newest >= RefreshInterval;
+                return DateTime.UtcNow - File.GetLastWriteTimeUtc(path) >= RefreshInterval;
+            }
         }
         catch
         {
-            // If we can't tell how fresh the cache is, err toward refreshing (still throttled by the fact that
-            // it only runs after a successful online validation).
+            // If we can't tell how fresh the artifact is, err toward refreshing (still throttled by the fact
+            // that a refresh only runs after a successful online validation).
             return true;
         }
     }
@@ -342,15 +352,35 @@ internal static class TensorsOnlineLicenseServices
                 Directory.CreateDirectory(dir);
             }
 
-            // Write to a temp file then move, so a concurrent reader never sees a half-written file.
-            string tmp = path + ".tmp";
-            File.WriteAllText(tmp, content);
-            if (File.Exists(path))
+            // Uniquely named temp file in the SAME directory (same volume, so the swap is a rename), then a
+            // SINGLE atomic replace — never delete the destination first. This closes both the missing-file
+            // window a concurrent reader could hit and the fixed-"*.tmp"-name race with the main SDK / another
+            // process.
+            string tmp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            try
             {
-                File.Delete(path);
+                File.WriteAllText(tmp, content);
+#if NET471
+                // .NET Framework has no File.Move overwrite overload. File.Replace is an atomic swap but
+                // requires the destination to already exist; fall back to a plain Move when it does not (a
+                // best-effort equivalent, matching the modern overwrite Move).
+                if (File.Exists(path))
+                {
+                    File.Replace(tmp, path, destinationBackupFileName: null);
+                }
+                else
+                {
+                    File.Move(tmp, path);
+                }
+#else
+                File.Move(tmp, path, overwrite: true);
+#endif
             }
-
-            File.Move(tmp, path);
+            finally
+            {
+                // Clean up the temp file if the replace didn't consume it (e.g. an exception mid-write).
+                try { if (File.Exists(tmp)) File.Delete(tmp); } catch { /* best effort */ }
+            }
         }
     }
 
@@ -375,8 +405,16 @@ internal static class TensorsOnlineLicenseServices
     private static string? HttpGet(string url)
     {
 #if NET471
-        using var client = new System.Net.WebClient();
-        return client.DownloadString(url);
+        // WebClient has NO default timeout, so a hung endpoint could pin a background thread far beyond the
+        // documented refresh budget. Use HttpWebRequest with an explicit 10s timeout (matching the modern
+        // HttpClient path).
+        var req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
+        req.Method = "GET";
+        req.Timeout = Net471TimeoutMs;
+        req.ReadWriteTimeout = Net471TimeoutMs;
+        using var resp = (System.Net.HttpWebResponse)req.GetResponse();
+        using var reader = new System.IO.StreamReader(resp.GetResponseStream()!);
+        return reader.ReadToEnd();
 #else
         using var resp = Http.GetAsync(url).ConfigureAwait(false).GetAwaiter().GetResult();
         return resp.Content.ReadAsStringAsync().ConfigureAwait(false).GetAwaiter().GetResult();
@@ -386,11 +424,25 @@ internal static class TensorsOnlineLicenseServices
     private static string? HttpPost(string url, string json)
     {
 #if NET471
-        using var client = new System.Net.WebClient();
-        client.Headers[System.Net.HttpRequestHeader.ContentType] = "application/json";
+        // Same reasoning as HttpGet: enforce an explicit 10s timeout that WebClient.UploadString lacks.
+        var req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
+        req.Method = "POST";
+        req.ContentType = "application/json";
+        req.Timeout = Net471TimeoutMs;
+        req.ReadWriteTimeout = Net471TimeoutMs;
+
+        byte[] payload = Encoding.UTF8.GetBytes(json);
+        req.ContentLength = payload.Length;
+        using (var reqStream = req.GetRequestStream())
+        {
+            reqStream.Write(payload, 0, payload.Length);
+        }
+
         try
         {
-            return client.UploadString(url, "POST", json);
+            using var resp = (System.Net.HttpWebResponse)req.GetResponse();
+            using var reader = new System.IO.StreamReader(resp.GetResponseStream()!);
+            return reader.ReadToEnd();
         }
         catch (System.Net.WebException ex) when (ex.Response is System.Net.HttpWebResponse http)
         {

@@ -4,6 +4,7 @@
 #nullable disable
 
 using System;
+using System.Collections.Generic;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -35,9 +36,35 @@ public class SignedEntitlementTests
         return (rsa, embedded);
     }
 
-    private static string SignToken(RSA rsa, string marker, string expires, string[] capabilities)
+    private static string SignToken(RSA rsa, string marker, string expires, string[] capabilities,
+        string scope = null, string jti = null)
     {
-        var payload = new { marker, tenant = "ACME Corp.", expires, capabilities };
+        // Dictionary (not an anonymous type) so optional scope/jti claims can be included conditionally; the
+        // RSA signature is computed over the EXACT serialized bytes, so claim order/shape doesn't matter.
+        var payload = new Dictionary<string, object>
+        {
+            ["marker"] = marker,
+            ["tenant"] = "ACME Corp.",
+            ["expires"] = expires,
+            ["capabilities"] = capabilities,
+        };
+        if (scope != null) payload["scope"] = scope;
+        if (jti != null) payload["jti"] = jti;
+
+        var payloadBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(payload));
+        var sig = rsa.SignData(payloadBytes, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        var envelope = new
+        {
+            payload = Convert.ToBase64String(payloadBytes),
+            signature = Convert.ToBase64String(sig),
+        };
+        return JsonSerializer.Serialize(envelope);
+    }
+
+    /// <summary>Signs an RSA CRL envelope (same key/format as the entitlement) revoking <paramref name="rjti"/>.</summary>
+    private static string SignCrl(RSA rsa, string[] rjti, DateTimeOffset iat, DateTimeOffset exp)
+    {
+        var payload = new { iat = iat.ToUnixTimeSeconds(), exp = exp.ToUnixTimeSeconds(), rjti };
         var payloadBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(payload));
         var sig = rsa.SignData(payloadBytes, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
         var envelope = new
@@ -224,6 +251,109 @@ public class SignedEntitlementTests
         }
     }
 
+    // ───────────── RSA scope binding (mirrors the aidn2 scope tests) ─────────────
+
+    [Fact]
+    public void Verify_Scope_AcceptedWhenHostScopeMatches()
+    {
+        var (rsa, embedded) = NewKeypair();
+        using (rsa)
+        using (new ScopeEnv("ci"))
+        WithEmbeddedKey(embedded, () =>
+        {
+            string token = SignToken(rsa, SignedEntitlement.Marker, "2099-12-31",
+                new[] { "tensors:save" }, scope: "ci");
+            var r = SignedEntitlement.Verify(token);
+            Assert.True(r.IsValid, r.Message);
+        });
+    }
+
+    [Fact]
+    public void Verify_Scope_RejectedWhenHostScopeDiffers()
+    {
+        var (rsa, embedded) = NewKeypair();
+        using (rsa)
+        using (new ScopeEnv("prod"))
+        WithEmbeddedKey(embedded, () =>
+        {
+            string token = SignToken(rsa, SignedEntitlement.Marker, "2099-12-31",
+                new[] { "tensors:save" }, scope: "ci");
+            var r = SignedEntitlement.Verify(token);
+            Assert.False(r.IsValid);
+            Assert.Contains("scope", r.Message, StringComparison.OrdinalIgnoreCase);
+        });
+    }
+
+    [Fact]
+    public void Verify_Scope_RejectedWhenHostScopeUnset()
+    {
+        var (rsa, embedded) = NewKeypair();
+        using (rsa)
+        using (new ScopeEnv(null))
+        WithEmbeddedKey(embedded, () =>
+        {
+            // A scoped entitlement on an unscoped host is rejected (scope "" != "ci").
+            string token = SignToken(rsa, SignedEntitlement.Marker, "2099-12-31",
+                new[] { "tensors:save" }, scope: "ci");
+            var r = SignedEntitlement.Verify(token);
+            Assert.False(r.IsValid);
+        });
+    }
+
+    // ───────────── RSA revocation (mirrors the aidn2 CRL tests) ─────────────
+
+    [Fact]
+    public void Verify_RevokedJti_Rejected()
+    {
+        var (rsa, embedded) = NewKeypair();
+        var now = DateTimeOffset.UtcNow;
+        using (rsa)
+        WithEmbeddedKey(embedded, () =>
+        {
+            try
+            {
+                // A CRL signed by the SAME entitlement key (unexpired) revokes this jti.
+                TensorsLicenseRevocation.OverrideForTesting(
+                    SignCrl(rsa, new[] { "leaked-ent-1" }, now, now.AddDays(1)), now);
+
+                string token = SignToken(rsa, SignedEntitlement.Marker, "2099-12-31",
+                    new[] { "tensors:save" }, jti: "leaked-ent-1");
+                var r = SignedEntitlement.Verify(token);
+                Assert.False(r.IsValid);
+                Assert.Contains("revoked", r.Message, StringComparison.OrdinalIgnoreCase);
+            }
+            finally
+            {
+                TensorsLicenseRevocation.OverrideForTesting(null, now);
+            }
+        });
+    }
+
+    [Fact]
+    public void Verify_NonRevokedJti_IsValid()
+    {
+        var (rsa, embedded) = NewKeypair();
+        var now = DateTimeOffset.UtcNow;
+        using (rsa)
+        WithEmbeddedKey(embedded, () =>
+        {
+            try
+            {
+                TensorsLicenseRevocation.OverrideForTesting(
+                    SignCrl(rsa, new[] { "some-other-ent" }, now, now.AddDays(1)), now);
+
+                string token = SignToken(rsa, SignedEntitlement.Marker, "2099-12-31",
+                    new[] { "tensors:save" }, jti: "my-ent");
+                var r = SignedEntitlement.Verify(token);
+                Assert.True(r.IsValid, r.Message);
+            }
+            finally
+            {
+                TensorsLicenseRevocation.OverrideForTesting(null, now);
+            }
+        });
+    }
+
     [Fact]
     public void PersistenceGuard_InvalidEntitlementPresent_Throws_DoesNotFallThroughToTrial()
     {
@@ -250,5 +380,17 @@ public class SignedEntitlementTests
             SignedEntitlement.s_overridePublicKey = savedKey;
             PersistenceGuard.ClearValidatorCacheForTesting();
         }
+    }
+
+    /// <summary>Sets AIDOTNET_LICENSE_SCOPE for the scope tests, restoring the prior value on dispose.</summary>
+    private sealed class ScopeEnv : IDisposable
+    {
+        private readonly string _previous;
+        public ScopeEnv(string value)
+        {
+            _previous = Environment.GetEnvironmentVariable("AIDOTNET_LICENSE_SCOPE");
+            Environment.SetEnvironmentVariable("AIDOTNET_LICENSE_SCOPE", value);
+        }
+        public void Dispose() => Environment.SetEnvironmentVariable("AIDOTNET_LICENSE_SCOPE", _previous);
     }
 }

@@ -58,6 +58,13 @@ internal static class AsymmetricEntitlementVerifier
     private static readonly TimeSpan ClockSkew = TimeSpan.FromMinutes(5);
 
     /// <summary>
+    /// Strict UTF-8 decoder (no BOM, throw on invalid bytes). Unlike <see cref="Encoding.UTF8"/>, which
+    /// silently replaces malformed byte sequences with U+FFFD, this fails closed so malformed claim bytes
+    /// are rejected rather than decoded into replacement characters.
+    /// </summary>
+    private static readonly UTF8Encoding StrictUtf8 = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+
+    /// <summary>
     /// Returns true if <paramref name="key"/> is in the asymmetric token shape:
     /// <c>aidn2.&lt;base64url&gt;.&lt;base64url&gt;</c>. Does NOT verify the signature — a cheap structural
     /// check used for routing.
@@ -196,7 +203,11 @@ internal static class AsymmetricEntitlementVerifier
         string claimsJson;
         try
         {
-            claimsJson = Encoding.UTF8.GetString(claimsBytes);
+            claimsJson = StrictUtf8.GetString(claimsBytes);
+        }
+        catch (DecoderFallbackException)
+        {
+            return EntitlementResult.Invalid("License token claims are not valid UTF-8.");
         }
         catch (ArgumentException)
         {
@@ -284,7 +295,9 @@ internal static class AsymmetricEntitlementVerifier
         }
 
         DateTimeOffset expiresAt = DateTimeOffset.FromUnixTimeSeconds(claims.Exp);
-        if (expiresAt + ClockSkew < nowUtc)
+        // Compare via subtraction rather than `expiresAt + ClockSkew` so an exp at the upper bound
+        // (MaxUnixSeconds, near DateTimeOffset.MaxValue) cannot overflow when adding the skew.
+        if (nowUtc > expiresAt && nowUtc - expiresAt > ClockSkew)
         {
             return EntitlementResult.Invalid("License token expired on " + expiresAt.UtcDateTime.ToString("u") + ".");
         }

@@ -180,28 +180,42 @@ public static class PersistenceGuard
         }
     }
 
-    // ─── aidn2 (Ed25519) offline-token cache ───────────────────────
+    // ─── aidn2 (Ed25519) offline-token resolution ──────────────────
     //
-    // Additive to the RSA SignedEntitlement path: an aidn2. token is resolved from AIDOTNET_LICENSE_KEY
-    // (when it's an aidn2. token) or the main SDK's cached ~/.aidotnet/offline-*.token files, verified
-    // offline against the embedded Ed25519 public key, and — when Active — grants its SIGNED capabilities.
-    // Resolved + verified once per process (constant for a run). null == no valid aidn2 token; this path
-    // is positive-grant-only and NEVER hard-fails (absence/failure falls through to RSA/key/trial).
-    private static readonly object _aidn2Lock = new();
-    private static bool _aidn2Resolved;
-    private static EntitlementResult? _aidn2Entitlement;
-
-    private static EntitlementResult? GetCachedAidn2Entitlement()
+    // Additive to the RSA SignedEntitlement path: an aidn2. token grants its SIGNED capabilities when it
+    // verifies Active offline against the embedded Ed25519 public key. Positive-grant-only and NEVER
+    // hard-fails (absence/failure falls through to RSA/key/trial).
+    //
+    // Re-verified on EVERY enforcement (NO process-lifetime cache): a token that later expires or is revoked
+    // must stop granting, and a token freshly minted by the background refresh must start granting without a
+    // process restart. Verification is fully offline (signature + CRL + exp) and persistence ops are
+    // low-frequency, so re-verifying per op is cheap enough.
+    //
+    // Explicit active-key precedence (SetActiveLicenseKey / AsyncLocal) is honoured: when a key is explicitly
+    // selected, ONLY that exact token is eligible for the aidn2 grant — an unrelated cached disk/env token
+    // must never authorise on behalf of an explicitly-selected (possibly invalid/revoked) key. The global
+    // env/disk aidn2 sources are consulted ONLY when no key is explicitly selected.
+    private static EntitlementResult? ResolveAidn2Entitlement()
     {
-        lock (_aidn2Lock)
+        var now = DateTimeOffset.UtcNow;
+
+        if (_activeKey.Value is { } explicitKey)
         {
-            if (!_aidn2Resolved)
+            // A key was explicitly selected. Only an aidn2-format explicit token can grant here; verify
+            // EXACTLY it. A non-aidn2 explicit key is evaluated by the key path below, and an invalid/revoked
+            // explicit aidn2 token yields no grant (it must NOT be bypassed by a cached disk/env token).
+            string? k = explicitKey.Key?.Trim();
+            if (k is not null && AsymmetricEntitlementVerifier.IsAsymmetricKeyFormat(k))
             {
-                _aidn2Entitlement = AsymmetricEntitlementVerifier.TryVerifyConfigured();
-                _aidn2Resolved = true;
+                var r = AsymmetricEntitlementVerifier.Verify(k, now);
+                return r.IsValid ? r : null;
             }
-            return _aidn2Entitlement;
+            return null;
         }
+
+        // No explicit key selected → resolve from the configured env/disk sources (re-read + re-verified
+        // each call so expiry/revocation and freshly-minted tokens take effect immediately).
+        return AsymmetricEntitlementVerifier.TryVerifyConfigured();
     }
 
     // Per-key "pending allowance consumed" set. The first
@@ -292,7 +306,7 @@ public static class PersistenceGuard
         // state. Unlike the RSA entitlement below, a NON-granting/absent aidn2 result is NOT a hard failure
         // — it simply falls through (a genuinely forged aidn2 token yields no grant here and, if it was in
         // AIDOTNET_LICENSE_KEY, is then rejected by the invalid-key path exactly as before).
-        var aidn2 = GetCachedAidn2Entitlement();
+        var aidn2 = ResolveAidn2Entitlement();
         if (aidn2 is not null && aidn2.IsValid && aidn2.HasCapability(requiredCapability))
             return;
 
@@ -468,10 +482,7 @@ public static class PersistenceGuard
             _entitlementResolved = false;
             _entitlement = null;
         }
-        lock (_aidn2Lock)
-        {
-            _aidn2Resolved = false;
-            _aidn2Entitlement = null;
-        }
+        // The aidn2 path no longer caches (it re-verifies per enforcement), so there is nothing to reset
+        // here for it — a fresh env/disk/active-key resolution happens on the next EnforceCore call.
     }
 }

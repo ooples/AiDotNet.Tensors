@@ -91,3 +91,7 @@ scratch-opparity/
 *.pem
 private_key.pem
 tensors-entitlement.json
+
+# Python tool caches
+__pycache__/
+*.pyc

@@ -164,10 +164,17 @@ public class TensorsOnlineLicenseServicesTests
         // The cached CRL round-trips AND is a genuine signature-verified CRL that TryInstallFetched accepts.
         using (Aidn2TestSupport.WithPublicKeys(Aidn2TestSupport.DefaultTestKeySet()))
         {
-            string crl = Aidn2TestSupport.SignedCrlV2(revokedJti: new[] { "leaked-token-1" });
-            Assert.True(Ed25519LicenseRevocation.TryInstallFetched(crl, Now));
-            // Reset shared static state so this test doesn't leak a fetched CRL into others.
-            Ed25519LicenseRevocation.OverrideForTesting(null, Now);
+            try
+            {
+                string crl = Aidn2TestSupport.SignedCrlV2(revokedJti: new[] { "leaked-token-1" });
+                Assert.True(Ed25519LicenseRevocation.TryInstallFetched(crl, Now));
+            }
+            finally
+            {
+                // Reset shared static state so this test doesn't leak a fetched CRL into others, even if the
+                // installation/assertion above throws.
+                Ed25519LicenseRevocation.OverrideForTesting(null, Now);
+            }
         }
     }
 

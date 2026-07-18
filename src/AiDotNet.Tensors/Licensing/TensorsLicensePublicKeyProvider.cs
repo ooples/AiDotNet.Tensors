@@ -166,21 +166,18 @@ internal static class TensorsLicensePublicKeyProvider
         {
             if (entry.ValueKind != JsonValueKind.Object) continue;
 
+            string? kty = GetString(entry, "kty");
             string? kid = GetString(entry, "kid");
             string? x = GetString(entry, "x");
             string? crv = GetString(entry, "crv");
 
-            if (kid is null || kid.Length == 0 || x is null || x.Length == 0)
+            // Enforce the COMPLETE Ed25519 JWK type contract: kty MUST be "OKP" and crv MUST be "Ed25519"
+            // (both present and exact), in addition to a non-empty kid and x. A missing/incorrect kty or crv
+            // is rejected so an entry of an unknown/unsupported key type can never be trusted as Ed25519.
+            if (kid is null || kid.Length == 0 || x is null || x.Length == 0
+                || !string.Equals(kty, "OKP", StringComparison.Ordinal)
+                || !string.Equals(crv, "Ed25519", StringComparison.Ordinal))
             {
-                continue;
-            }
-
-            // Only Ed25519 OKP keys are accepted. A missing crv is tolerated for brevity but a present,
-            // non-Ed25519 crv is rejected so a future curve cannot be silently treated as Ed25519.
-            if (crv is not null && crv.Length > 0 && !string.Equals(crv, "Ed25519", StringComparison.Ordinal))
-            {
-                System.Diagnostics.Trace.TraceWarning(
-                    "TensorsLicensePublicKeyProvider: skipping key '" + kid + "' with unsupported crv '" + crv + "'.");
                 continue;
             }
 

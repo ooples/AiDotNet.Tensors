@@ -28,6 +28,10 @@ internal static class TensorsLicenseRevocation
     /// <summary>Embedded manifest resource holding the release-time signed CRL (may be absent).</summary>
     private const string ResourceName = "AiDotNet.Tensors.LicenseRevocation";
 
+    /// <summary>Max Unix-seconds (9999-12-31T23:59:59Z) so an out-of-range signed exp can't throw from
+    /// <see cref="DateTimeOffset.FromUnixTimeSeconds"/>.</summary>
+    private const long MaxUnixSeconds = 253402300799L;
+
     private static readonly object _lock = new();
     private static bool _embeddedLoaded;
     private static Crl? _embedded;
@@ -54,10 +58,28 @@ internal static class TensorsLicenseRevocation
         if (candidate is null) return false;
         lock (_lock)
         {
-            if (_fetched is not null && candidate.Iat <= _fetched.Iat) return false;
+            if (_fetched is not null)
+            {
+                // A STRICTLY OLDER CRL (replay) must never shrink the deny-list.
+                if (candidate.Iat < _fetched.Iat) return false;
+                // SAME-SECOND CRL (iat is 1s-precision Unix seconds): a later signed refresh with additional
+                // revoked JTIs can share the same iat, so UNION rather than discard, keeping the later expiry.
+                if (candidate.Iat == _fetched.Iat)
+                {
+                    _fetched = Merge(_fetched, candidate);
+                    return true;
+                }
+            }
             _fetched = candidate;
             return true;
         }
+    }
+
+    private static Crl Merge(Crl a, Crl b)
+    {
+        var jti = new HashSet<string>(a.RevokedJti, StringComparer.Ordinal);
+        jti.UnionWith(b.RevokedJti);
+        return new Crl(a.Iat, Math.Max(a.Exp, b.Exp), jti);
     }
 
     /// <summary>TEST-ONLY: set the effective fetched CRL (from JSON) or clear both to a known state.</summary>
@@ -76,11 +98,23 @@ internal static class TensorsLicenseRevocation
         lock (_lock)
         {
             EnsureEmbeddedLoadedNoLock();
-            if (_embedded is null) return _fetched;
-            if (_fetched is null) return _embedded;
-            return _fetched.Iat >= _embedded.Iat ? _fetched : _embedded;
+            var now = DateTimeOffset.UtcNow;
+            // Exclude a CRL whose exp has passed since it was installed — its stored expiry is enforced at
+            // ACCESS time (not just at parse), so a CRL cannot deny valid entitlements forever (fail-open).
+            var emb = IsCurrentlyValid(_embedded, now) ? _embedded : null;
+            var fet = IsCurrentlyValid(_fetched, now) ? _fetched : null;
+            if (emb is null) return fet;
+            if (fet is null) return emb;
+            // Equal iat (1s precision): union both deny-lists so load ordering can't drop a revocation.
+            if (fet.Iat == emb.Iat) return Merge(fet, emb);
+            return fet.Iat > emb.Iat ? fet : emb;
         }
     }
+
+    /// <summary>A CRL remains valid only until its (always-present, positive) exp passes, so a CRL valid
+    /// when installed does not stay authoritative past its expiry.</summary>
+    private static bool IsCurrentlyValid(Crl? c, DateTimeOffset now) =>
+        c is not null && DateTimeOffset.FromUnixTimeSeconds(c.Exp) >= now;
 
     private static void EnsureEmbeddedLoadedNoLock()
     {
@@ -138,13 +172,22 @@ internal static class TensorsLicenseRevocation
             var p = payloadDoc.RootElement;
             if (p.ValueKind != JsonValueKind.Object) return null;
 
-            long iat = p.TryGetProperty("iat", out var iatEl) && iatEl.ValueKind == JsonValueKind.Number
-                ? iatEl.GetInt64() : 0;
-            long exp = p.TryGetProperty("exp", out var expEl) && expEl.ValueKind == JsonValueKind.Number
-                ? expEl.GetInt64() : 0;
+            // iat orders CRLs; parse non-throwingly (GetInt64 would throw FormatException, uncaught here).
+            long iat = 0;
+            if (p.TryGetProperty("iat", out var iatEl) && iatEl.ValueKind == JsonValueKind.Number)
+            {
+                iatEl.TryGetInt64(out iat);
+            }
 
-            // Ignore a stale (expired) CRL — client should refetch; entitlement expiry still applies.
-            if (exp > 0 && DateTimeOffset.FromUnixTimeSeconds(exp) < nowUtc) return null;
+            // exp MUST be present, a positive number, and strictly later than nowUtc. A missing / zero /
+            // negative / non-representable exp is rejected so a CRL cannot deny valid entitlements forever;
+            // the stored exp is ALSO enforced at access time in Effective().
+            if (!p.TryGetProperty("exp", out var expEl) || expEl.ValueKind != JsonValueKind.Number
+                || !expEl.TryGetInt64(out long exp) || exp <= 0 || exp > MaxUnixSeconds
+                || DateTimeOffset.FromUnixTimeSeconds(exp) <= nowUtc)
+            {
+                return null;
+            }
 
             var rjti = new HashSet<string>(StringComparer.Ordinal);
             if (p.TryGetProperty("rjti", out var rjtiEl) && rjtiEl.ValueKind == JsonValueKind.Array)
@@ -159,7 +202,7 @@ internal static class TensorsLicenseRevocation
                 }
             }
 
-            return new Crl(iat, rjti);
+            return new Crl(iat, exp, rjti);
         }
         catch (JsonException) { return null; }
     }
@@ -178,7 +221,8 @@ internal static class TensorsLicenseRevocation
     internal sealed class Crl
     {
         internal long Iat { get; }
+        internal long Exp { get; }
         internal HashSet<string> RevokedJti { get; }
-        internal Crl(long iat, HashSet<string> rjti) { Iat = iat; RevokedJti = rjti; }
+        internal Crl(long iat, long exp, HashSet<string> rjti) { Iat = iat; Exp = exp; RevokedJti = rjti; }
     }
 }
