@@ -230,11 +230,63 @@ extern ""C"" __global__ __launch_bounds__(256) void apply_window(
     output[idx] = input[idx] * window[idx];
 }
 
+// 2D FFT row-wise bit-reversal (permute each row of length `width` in place).
+// Required before the DIT row butterflies — without it FFT2D transforms
+// un-permuted data and returns garbage.
+extern ""C"" __global__ __launch_bounds__(256) void fft_rows_bit_reverse(
+    float* real, float* imag, int height, int width, int log2width)
+{
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= height || idx >= width) return;
+
+    int reversed = 0;
+    int temp = idx;
+    for (int i = 0; i < log2width; i++) { reversed = (reversed << 1) | (temp & 1); temp >>= 1; }
+
+    if (reversed > idx) {
+        int base = row * width;
+        float tr = real[base + idx];
+        float ti = imag[base + idx];
+        real[base + idx] = real[base + reversed];
+        imag[base + idx] = imag[base + reversed];
+        real[base + reversed] = tr;
+        imag[base + reversed] = ti;
+    }
+}
+
+// 2D FFT column-wise bit-reversal (permute each column of length `height`,
+// stride `width`, in place). Required before the DIT column butterflies.
+extern ""C"" __global__ __launch_bounds__(256) void fft_cols_bit_reverse(
+    float* real, float* imag, int height, int width, int log2height)
+{
+    int col = blockIdx.y * blockDim.y + threadIdx.y;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;   // position within the column
+    if (col >= width || idx >= height) return;
+
+    int reversed = 0;
+    int temp = idx;
+    for (int i = 0; i < log2height; i++) { reversed = (reversed << 1) | (temp & 1); temp >>= 1; }
+
+    if (reversed > idx) {
+        int a = idx * width + col;
+        int b = reversed * width + col;
+        float tr = real[a];
+        float ti = imag[a];
+        real[a] = real[b];
+        imag[a] = imag[b];
+        real[b] = tr;
+        imag[b] = ti;
+    }
+}
+
 // 2D FFT row-wise butterfly
 extern ""C"" __global__ __launch_bounds__(256) void fft_rows_butterfly(
     float* real, float* imag, int height, int width, int stride, int inverse)
 {
-    int row = blockIdx.y;
+    // Launched with blockDim.y==16: the row index must fold in threadIdx.y,
+    // else 16 y-threads race on the same row and only height/16 rows run.
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int halfStride = stride / 2;
     int numButterflies = width / stride;
@@ -268,7 +320,9 @@ extern ""C"" __global__ __launch_bounds__(256) void fft_rows_butterfly(
 extern ""C"" __global__ __launch_bounds__(256) void fft_cols_butterfly(
     float* real, float* imag, int height, int width, int stride, int inverse)
 {
-    int col = blockIdx.y;
+    // Launched with blockDim.y==16: fold threadIdx.y into the column index
+    // (same bug/fix as fft_rows_butterfly).
+    int col = blockIdx.y * blockDim.y + threadIdx.y;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int halfStride = stride / 2;
     int numButterflies = height / stride;
@@ -298,13 +352,14 @@ extern ""C"" __global__ __launch_bounds__(256) void fft_cols_butterfly(
     imag[botIdx] = topImag - twiddledImag;
 }
 
-// Scale by 1/N for inverse FFT
-extern ""C"" __global__ __launch_bounds__(256) void scale_inverse(float* real, float* imag, int n)
+// Scale for inverse FFT. `count` = number of elements to touch; `scale` = the
+// per-element factor (1/transformLength). These are separate because a batched
+// inverse must scale batch*n elements by 1/n (NOT 1/(batch*n)).
+extern ""C"" __global__ __launch_bounds__(256) void scale_inverse(float* real, float* imag, int count, float scale)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
+    if (idx >= count) return;
 
-    float scale = 1.0f / n;
     real[idx] *= scale;
     imag[idx] *= scale;
 }
@@ -339,7 +394,11 @@ extern ""C"" __global__ __launch_bounds__(256) void batched_bit_reverse(
 extern ""C"" __global__ __launch_bounds__(256) void batched_fft_butterfly(
     float* real, float* imag, int batch, int n, int stride, int inverse)
 {
-    int b = blockIdx.z;
+    // Batch index comes from gridY (blockIdx.y) — the BatchedFFT launch passes
+    // `batch` as gridDimY (matching batched_bit_reverse). Reading blockIdx.z
+    // here (always 0, since gridDimZ==1) made every batch row transform row 0's
+    // data in place: races (non-deterministic output) + rows 1..N never done.
+    int b = blockIdx.y;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int halfStride = stride / 2;
     int numButterflies = n / stride;
@@ -387,6 +446,8 @@ extern ""C"" __global__ __launch_bounds__(256) void batched_fft_butterfly(
             "overlap_add",
             "window_sum_squares",
             "apply_window",
+            "fft_rows_bit_reverse",
+            "fft_cols_bit_reverse",
             "fft_rows_butterfly",
             "fft_cols_butterfly",
             "scale_inverse",
