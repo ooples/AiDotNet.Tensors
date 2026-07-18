@@ -489,6 +489,39 @@ public sealed class GradientTape<T> : IDisposable
         => ComputeGradients(loss, sources, createGraph, seedOverride: null);
 
     /// <summary>
+    /// Reverse pass seeded by a supplied upstream gradient at <paramref name="output"/>, instead of the
+    /// default "ones at the loss" seed. This is the entry point for wrapping a tape-recorded forward as a
+    /// classic manual-backward layer (e.g. an <c>ILayer.Backward(outputGradient)</c>): record the op(s) in
+    /// <c>Forward</c>, then in <c>Backward</c> call this with the layer's output tensor and the incoming
+    /// output-gradient to obtain, in one tape walk, the gradients for the trainable parameters AND the
+    /// layer input — no manual adjoint code required. Equivalent to seeding the backward with the single
+    /// pair (<paramref name="output"/>, <paramref name="outputGradient"/>).
+    /// </summary>
+    /// <param name="output">A tape-recorded tensor whose incoming gradient is supplied (typically the layer output).</param>
+    /// <param name="outputGradient">The upstream gradient flowing into <paramref name="output"/>; must match its shape.</param>
+    /// <param name="sources">Tensors to return gradients for (e.g. the layer parameters and its input). Null returns all reached leaves.</param>
+    /// <returns>Map from each reached source tensor to its accumulated gradient.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="output"/> or <paramref name="outputGradient"/> is null.</exception>
+    /// <exception cref="ArgumentException">The two tensors' shapes differ.</exception>
+    public Dictionary<Tensor<T>, Tensor<T>> ComputeGradientsFromSeed(
+        Tensor<T> output,
+        Tensor<T> outputGradient,
+        IReadOnlyList<Tensor<T>>? sources = null)
+    {
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (outputGradient is null) throw new ArgumentNullException(nameof(outputGradient));
+        bool sameShape = output.Shape.Length == outputGradient.Shape.Length;
+        for (int i = 0; sameShape && i < output.Shape.Length; i++)
+            if (output.Shape[i] != outputGradient.Shape[i]) sameShape = false;
+        if (!sameShape)
+            throw new ArgumentException(
+                $"outputGradient shape [{string.Join(",", outputGradient.Shape)}] must match output shape [{string.Join(",", output.Shape)}].",
+                nameof(outputGradient));
+        return ComputeGradients(output, sources, createGraph: false,
+            seedOverride: new[] { new KeyValuePair<Tensor<T>, Tensor<T>>(output, outputGradient) });
+    }
+
+    /// <summary>
     /// Backward with an optional custom gradient seed. When <paramref name="seedOverride"/>
     /// is null this is byte-identical to the public <see cref="ComputeGradients(Tensor{T},IReadOnlyList{Tensor{T}},bool)"/>
     /// (ones-at-loss seeding, compiled/graph fast paths eligible). When it is supplied, the
