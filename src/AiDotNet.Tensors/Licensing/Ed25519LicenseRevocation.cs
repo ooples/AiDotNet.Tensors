@@ -38,6 +38,10 @@ internal static class Ed25519LicenseRevocation
 
     private const int Ed25519SignatureSize = 64;
 
+    /// <summary>Max Unix-seconds (9999-12-31T23:59:59Z) so an out-of-range signed exp can't throw from
+    /// <see cref="DateTimeOffset.FromUnixTimeSeconds"/>.</summary>
+    private const long MaxUnixSeconds = 253402300799L;
+
     private static readonly object _lock = new();
     private static bool _embeddedLoaded;
     private static bool _diskCacheLoaded;
@@ -70,11 +74,30 @@ internal static class Ed25519LicenseRevocation
 
         lock (_lock)
         {
-            // Only move forward in time — a replayed older CRL must never shrink the deny-list.
-            if (_fetched is not null && candidate.Iat <= _fetched.Iat) return false;
+            if (_fetched is not null)
+            {
+                // A STRICTLY OLDER CRL (replay) must never shrink the deny-list.
+                if (candidate.Iat < _fetched.Iat) return false;
+                // SAME-SECOND CRL (1s iat precision): merge (union) rather than discard, so a second
+                // additive CRL issued in the same second isn't lost. Keep the later expiry.
+                if (candidate.Iat == _fetched.Iat)
+                {
+                    _fetched = Merge(_fetched, candidate);
+                    return true;
+                }
+            }
             _fetched = candidate;
             return true;
         }
+    }
+
+    private static Crl Merge(Crl a, Crl b)
+    {
+        var kids = new HashSet<string>(a.RevokedKids, StringComparer.Ordinal);
+        kids.UnionWith(b.RevokedKids);
+        var jti = new HashSet<string>(a.RevokedJti, StringComparer.Ordinal);
+        jti.UnionWith(b.RevokedJti);
+        return new Crl(a.Iat, Math.Max(a.Exp, b.Exp), kids, jti);
     }
 
     /// <summary>TEST-ONLY: sets the effective fetched CRL (from JSON) or clears both to a known state.</summary>
@@ -98,11 +121,19 @@ internal static class Ed25519LicenseRevocation
         {
             EnsureEmbeddedLoadedNoLock();
             EnsureDiskCacheLoadedNoLock();
-            if (_embedded is null) return _fetched;
-            if (_fetched is null) return _embedded;
-            return _fetched.Iat >= _embedded.Iat ? _fetched : _embedded;
+            var now = DateTimeOffset.UtcNow;
+            var emb = IsCurrentlyValid(_embedded, now) ? _embedded : null;
+            var fet = IsCurrentlyValid(_fetched, now) ? _fetched : null;
+            if (emb is null) return fet;
+            if (fet is null) return emb;
+            return fet.Iat >= emb.Iat ? fet : emb;
         }
     }
+
+    /// <summary>A CRL is currently valid when it has no expiry (exp&lt;=0) or its expiry is still in the future,
+    /// so a CRL valid when loaded does not stay authoritative past its exp. (exp is bounded at parse time.)</summary>
+    private static bool IsCurrentlyValid(Crl? c, DateTimeOffset now) =>
+        c is not null && (c.Exp <= 0 || DateTimeOffset.FromUnixTimeSeconds(c.Exp) >= now);
 
     /// <summary>
     /// Loads the last online-fetched CRL cached on disk (by <see cref="TensorsOnlineLicenseServices"/>) once
@@ -203,14 +234,21 @@ internal static class Ed25519LicenseRevocation
 
             long iat = p.TryGetProperty("iat", out var iatEl) && iatEl.ValueKind == JsonValueKind.Number
                 ? iatEl.GetInt64() : 0;
-            long exp = p.TryGetProperty("exp", out var expEl) && expEl.ValueKind == JsonValueKind.Number
-                ? expEl.GetInt64() : 0;
+            long exp = 0;
+            if (p.TryGetProperty("exp", out var expEl) && expEl.ValueKind == JsonValueKind.Number
+                && !expEl.TryGetInt64(out exp))
+            {
+                return null; // exp is a number but not representable as int64 — reject, don't throw.
+            }
 
-            // Ignore an expired CRL: it is stale, not authoritative. Offline, the token's own exp still
-            // applies. (exp==0 => no expiry; treated as always-current.)
+            // Reject an out-of-range exp BEFORE converting (FromUnixTimeSeconds throws outside its range).
+            if (exp < 0 || exp > MaxUnixSeconds) return null;
+
+            // Ignore an already-expired CRL. The stored exp is ALSO enforced at access time in Effective(),
+            // so a CRL valid now does not stay authoritative past its expiry. (exp==0 => no expiry.)
             if (exp > 0 && DateTimeOffset.FromUnixTimeSeconds(exp) < nowUtc) return null;
 
-            return new Crl(iat, ReadStringSet(p, "rkids"), ReadStringSet(p, "rjti"));
+            return new Crl(iat, exp, ReadStringSet(p, "rkids"), ReadStringSet(p, "rjti"));
         }
         catch (Exception ex) when (ex is JsonException or ArgumentException)
         {
@@ -249,11 +287,12 @@ internal static class Ed25519LicenseRevocation
     internal sealed class Crl
     {
         internal long Iat { get; }
+        internal long Exp { get; }
         internal HashSet<string> RevokedKids { get; }
         internal HashSet<string> RevokedJti { get; }
-        internal Crl(long iat, HashSet<string> kids, HashSet<string> jti)
+        internal Crl(long iat, long exp, HashSet<string> kids, HashSet<string> jti)
         {
-            Iat = iat; RevokedKids = kids; RevokedJti = jti;
+            Iat = iat; Exp = exp; RevokedKids = kids; RevokedJti = jti;
         }
     }
 }
