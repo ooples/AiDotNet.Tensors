@@ -328,4 +328,13 @@
     <EmbeddedResource Include="Engines\BlasManaged\Autotune\prewarm\*.prewarm.json" />
   </ItemGroup>
 
+  <!-- Optional signed revocation deny-list (CRL) for signed entitlements, verified by
+       TensorsLicenseRevocation against the embedded entitlement key. Additive/fail-open: absent =>
+       nothing revoked. Injected (and refreshed) at release with the current signed CRL. -->
+  <ItemGroup>
+    <EmbeddedResource Include="Licensing\LicenseRevocation.json" Condition="Exists('Licensing\LicenseRevocation.json')">
+      <LogicalName>AiDotNet.Tensors.LicenseRevocation</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
 </Project>
