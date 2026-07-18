@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.116.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.115.1...v0.116.0) (2026-07-18)
+
+
+### Features
+
+* **gpu:** expose paged-attention kernels via IPagedAttentionBackend capability interface ([#806](https://github.com/ooples/AiDotNet.Tensors/issues/806)) ([2ccba00](https://github.com/ooples/AiDotNet.Tensors/commit/2ccba0029f5e3e7ccad7740832e018cdbc4ee683))
+* **licensing:** P1 mirror — scope binding + jti/CRL revocation on signed entitlements ([#808](https://github.com/ooples/AiDotNet.Tensors/issues/808)) ([1db25fc](https://github.com/ooples/AiDotNet.Tensors/commit/1db25fcdfc0c2c503c672c1c3373f54470a755f5))
+
+
+### Refactoring
+
+* **gpu:** put paged-attention on IDirectGpuBackend; drop the capability interface ([#809](https://github.com/ooples/AiDotNet.Tensors/issues/809)) ([c369ab4](https://github.com/ooples/AiDotNet.Tensors/commit/c369ab4cc692500b9fff42b8212352d1dd5bca2a))
+
 ## [0.115.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.115.0...v0.115.1) (2026-07-17)
 
 
