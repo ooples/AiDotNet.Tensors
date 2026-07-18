@@ -121,6 +121,52 @@ public sealed class DevicePagedKVCacheOpenClTests : IDisposable
     }
 
     [Fact]
+    public void Backend_ExposesPagedAttentionCapability_AndInterfacePathMatchesOracle()
+    {
+        // The capability interface (IPagedAttentionBackend) is how higher layers (e.g. an inference/serving
+        // engine) consume paged attention without depending on a concrete backend type. Verify the backend
+        // advertises it and that dispatching through the interface produces the same result as the oracle.
+        if (!EnsureReady()) return;
+        var backend = _backend!;
+        Assert.True(backend is IPagedAttentionBackend, "OpenClBackend must expose IPagedAttentionBackend.");
+        var paged = (IPagedAttentionBackend)backend;
+
+        const int heads = 2, headDim = 32, blockSize = 8, seqLen = 20;
+        int stride = heads * headDim;
+        var rng = new Random(123);
+        var k = new float[seqLen * stride];
+        var v = new float[seqLen * stride];
+        for (int i = 0; i < k.Length; i++) { k[i] = (float)(rng.NextDouble() * 2 - 1); v[i] = (float)(rng.NextDouble() * 2 - 1); }
+        var q = new float[stride];
+        for (int i = 0; i < q.Length; i++) q[i] = (float)(rng.NextDouble() * 2 - 1);
+        float scale = 1.0f / MathF.Sqrt(headDim);
+
+        using var cache = new DevicePagedKVCache(backend, (seqLen + blockSize - 1) / blockSize + 2, blockSize, heads, headDim);
+        cache.Append(1, k, v);
+
+        float[] actual;
+        IGpuBuffer? qBuf = null, btBuf = null, outBuf = null;
+        try
+        {
+            qBuf = backend.AllocateBuffer(q);
+            btBuf = cache.GetBlockTableBuffer(1);
+            outBuf = paged.PagedAttentionDecode(qBuf, cache.KeyBlocks, cache.ValueBlocks, btBuf,
+                heads, headDim, blockSize, cache.GetLength(1), scale);
+            actual = backend.DownloadBuffer(outBuf);
+        }
+        finally { qBuf?.Dispose(); btBuf?.Dispose(); outBuf?.Dispose(); }
+
+        var expected = AttnOracle(q, k, v, heads, headDim, seqLen, scale);
+        Assert.Equal(expected.Length, actual.Length);
+        for (int i = 0; i < expected.Length; i++)
+        {
+            float tol = 2e-3f + 2e-3f * Math.Abs(expected[i]);
+            Assert.True(Math.Abs(expected[i] - actual[i]) <= tol,
+                $"interface-path decode mismatch at {i}: expected {expected[i]}, got {actual[i]}");
+        }
+    }
+
+    [Fact]
     public void Free_ReturnsBlocksToPool_AndReuses()
     {
         if (!EnsureReady()) return;
