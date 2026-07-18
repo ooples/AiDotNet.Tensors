@@ -1,0 +1,230 @@
+// Copyright (c) AiDotNet. All rights reserved.
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using System.Text.Json;
+using Org.BouncyCastle.Crypto.Parameters;
+using Org.BouncyCastle.Crypto.Signers;
+
+namespace AiDotNet.Tensors.Licensing;
+
+/// <summary>
+/// Offline revocation deny-list (CRL) for <c>aidn2.</c> tokens. Lets a specific leaked token (<c>jti</c>)
+/// or a compromised signing key (<c>kid</c>) be killed BEFORE its <c>exp</c>. The Tensors port of the main
+/// SDK's <c>LicenseRevocationProvider</c>, anchored to the same embedded Ed25519 public key via
+/// <see cref="TensorsLicensePublicKeyProvider"/>. Kept SEPARATE from the RSA
+/// <see cref="TensorsLicenseRevocation"/>, which anchors to the RSA entitlement key.
+/// </summary>
+/// <remarks>
+/// <para><b>Fail-open by design:</b> revocation is ADDITIVE. A build with no CRL, or a CRL that is
+/// expired / unsigned / malformed, revokes nothing — the token's own <c>exp</c> and bindings still bound
+/// it. Only a valid (signature-verified, unexpired) CRL can revoke.</para>
+///
+/// <para><b>Wire format</b> (JWS-style, sign-over-exact-bytes like aidn2):</para>
+/// <code>
+/// { "kid": "&lt;signing kid&gt;",
+///   "payload": "&lt;base64url(payload_json)&gt;",   // { "iat":.., "exp":.., "rkids":[..], "rjti":[..] }
+///   "sig": "&lt;base64url(ed25519 sig over the decoded payload bytes)&gt;" }
+/// </code>
+/// The signature is computed over the RAW bytes recovered by base64url-decoding <c>payload</c>, so there
+/// is no JSON canonicalization ambiguity (identical guarantee to <see cref="AsymmetricEntitlementVerifier"/>).
+/// </remarks>
+internal static class Ed25519LicenseRevocation
+{
+    /// <summary>Embedded manifest resource holding the release-time CRL (may be absent).</summary>
+    private const string ResourceName = "AiDotNet.Tensors.LicenseRevocationEd25519";
+
+    private const int Ed25519SignatureSize = 64;
+
+    private static readonly object _lock = new();
+    private static bool _embeddedLoaded;
+    private static Crl? _embedded;   // release-embedded CRL (verified once)
+    private static Crl? _fetched;    // newer CRL installed from an online refresh (verified on install)
+
+    /// <summary>
+    /// Returns true when a valid (signature-verified, unexpired) CRL revokes this token by its
+    /// <paramref name="kid"/> or <paramref name="jti"/>. Fails open (returns false) when no valid CRL
+    /// is present.
+    /// </summary>
+    internal static bool IsRevoked(string? kid, string? jti)
+    {
+        var crl = Effective();
+        if (crl is null) return false;
+
+        if (kid is { Length: > 0 } && crl.RevokedKids.Contains(kid)) return true;
+        if (jti is { Length: > 0 } && crl.RevokedJti.Contains(jti)) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// Installs a CRL obtained from an ONLINE refresh. Verified and expiry-checked here; ignored if it
+    /// fails to verify, is expired, or is older than the one already installed. Returns true when accepted.
+    /// </summary>
+    internal static bool TryInstallFetched(string json, DateTimeOffset nowUtc)
+    {
+        var candidate = ParseAndVerify(json, nowUtc);
+        if (candidate is null) return false;
+
+        lock (_lock)
+        {
+            // Only move forward in time — a replayed older CRL must never shrink the deny-list.
+            if (_fetched is not null && candidate.Iat <= _fetched.Iat) return false;
+            _fetched = candidate;
+            return true;
+        }
+    }
+
+    /// <summary>TEST-ONLY: sets the effective fetched CRL (from JSON) or clears both to a known state.</summary>
+    internal static void OverrideForTesting(string? crlJson, DateTimeOffset nowUtc)
+    {
+        lock (_lock)
+        {
+            _embeddedLoaded = true;
+            _embedded = null;
+            _fetched = crlJson is null ? null : ParseAndVerify(crlJson, nowUtc);
+        }
+    }
+
+    /// <summary>The most recent valid CRL among the embedded and fetched copies (or null).</summary>
+    private static Crl? Effective()
+    {
+        lock (_lock)
+        {
+            EnsureEmbeddedLoadedNoLock();
+            if (_embedded is null) return _fetched;
+            if (_fetched is null) return _embedded;
+            return _fetched.Iat >= _embedded.Iat ? _fetched : _embedded;
+        }
+    }
+
+    private static void EnsureEmbeddedLoadedNoLock()
+    {
+        if (_embeddedLoaded) return;
+        _embeddedLoaded = true;
+        try
+        {
+            var assembly = typeof(Ed25519LicenseRevocation).Assembly;
+            using var stream = assembly.GetManifestResourceStream(ResourceName);
+            if (stream is null || stream.Length == 0) return;
+            using var reader = new StreamReader(stream, Encoding.UTF8);
+            _embedded = ParseAndVerify(reader.ReadToEnd(), DateTimeOffset.UtcNow);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Trace.TraceWarning(
+                "Ed25519LicenseRevocation: failed to load embedded CRL: " + ex.GetType().Name + ": " + ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Parses a CRL envelope, verifies its Ed25519 signature against the embedded public key selected by
+    /// its <c>kid</c>, and enforces expiry. Returns null on any problem (fail-open: not enforced).
+    /// </summary>
+    internal static Crl? ParseAndVerify(string json, DateTimeOffset nowUtc)
+    {
+        if (string.IsNullOrWhiteSpace(json)) return null;
+
+        string kid, payloadB64, sigB64;
+        try
+        {
+            using var envelope = JsonDocument.Parse(json);
+            var root = envelope.RootElement;
+            if (root.ValueKind != JsonValueKind.Object
+                || !TryGetString(root, "kid", out kid)
+                || !TryGetString(root, "payload", out payloadB64)
+                || !TryGetString(root, "sig", out sigB64))
+            {
+                return null;
+            }
+        }
+        catch (JsonException) { return null; }
+
+        byte[] payloadBytes, sig;
+        try
+        {
+            payloadBytes = Base64UrlHelper.Decode(payloadB64);
+            sig = Base64UrlHelper.Decode(sigB64);
+        }
+        catch (FormatException) { return null; }
+
+        if (payloadBytes.Length == 0 || sig.Length != Ed25519SignatureSize) return null;
+        if (!TensorsLicensePublicKeyProvider.TryGetPublicKey(kid, out byte[] publicKey)) return null;
+
+        try
+        {
+            var verifier = new Ed25519Signer();
+            verifier.Init(false, new Ed25519PublicKeyParameters(publicKey, 0));
+            verifier.BlockUpdate(payloadBytes, 0, payloadBytes.Length);
+            if (!verifier.VerifySignature(sig)) return null;
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Trace.TraceWarning(
+                "Ed25519LicenseRevocation: CRL signature verification error: " + ex.GetType().Name + ": " + ex.Message);
+            return null;
+        }
+
+        try
+        {
+            using var payloadDoc = JsonDocument.Parse(new ReadOnlyMemory<byte>(payloadBytes));
+            var p = payloadDoc.RootElement;
+            if (p.ValueKind != JsonValueKind.Object) return null;
+
+            long iat = p.TryGetProperty("iat", out var iatEl) && iatEl.ValueKind == JsonValueKind.Number
+                ? iatEl.GetInt64() : 0;
+            long exp = p.TryGetProperty("exp", out var expEl) && expEl.ValueKind == JsonValueKind.Number
+                ? expEl.GetInt64() : 0;
+
+            // Ignore an expired CRL: it is stale, not authoritative. Offline, the token's own exp still
+            // applies. (exp==0 => no expiry; treated as always-current.)
+            if (exp > 0 && DateTimeOffset.FromUnixTimeSeconds(exp) < nowUtc) return null;
+
+            return new Crl(iat, ReadStringSet(p, "rkids"), ReadStringSet(p, "rjti"));
+        }
+        catch (Exception ex) when (ex is JsonException or ArgumentException)
+        {
+            return null;
+        }
+    }
+
+    private static HashSet<string> ReadStringSet(JsonElement obj, string name)
+    {
+        var set = new HashSet<string>(StringComparer.Ordinal);
+        if (obj.TryGetProperty(name, out var arr) && arr.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var e in arr.EnumerateArray())
+            {
+                if (e.ValueKind == JsonValueKind.String)
+                {
+                    var v = e.GetString();
+                    if (!string.IsNullOrEmpty(v)) set.Add(v!);
+                }
+            }
+        }
+        return set;
+    }
+
+    private static bool TryGetString(JsonElement obj, string name, out string value)
+    {
+        if (obj.TryGetProperty(name, out var el) && el.ValueKind == JsonValueKind.String)
+        {
+            value = el.GetString() ?? string.Empty;
+            return value.Length > 0;
+        }
+        value = string.Empty;
+        return false;
+    }
+
+    internal sealed class Crl
+    {
+        internal long Iat { get; }
+        internal HashSet<string> RevokedKids { get; }
+        internal HashSet<string> RevokedJti { get; }
+        internal Crl(long iat, HashSet<string> kids, HashSet<string> jti)
+        {
+            Iat = iat; RevokedKids = kids; RevokedJti = jti;
+        }
+    }
+}

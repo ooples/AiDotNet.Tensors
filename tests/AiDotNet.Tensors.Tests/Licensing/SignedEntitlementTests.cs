@@ -152,16 +152,25 @@ public class SignedEntitlementTests
     {
         // Even with a token present in the env, the placeholder key makes the
         // feature inert (returns null → guard falls through to key/trial path).
+        // Production now embeds a REAL entitlement key, so this test explicitly
+        // pins the placeholder via the override to exercise the inert-build path
+        // (rather than relying on the default embedded key still being the placeholder).
         var saved = Environment.GetEnvironmentVariable("AIDOTNET_LICENSE_TOKEN");
+        var savedKey = SignedEntitlement.s_overridePublicKey;
         var (rsa, _) = NewKeypair();
         using (rsa)
         try
         {
+            SignedEntitlement.s_overridePublicKey = SignedEntitlement.PublicKeyPlaceholderMarker;
             Environment.SetEnvironmentVariable("AIDOTNET_LICENSE_TOKEN",
                 SignToken(rsa, SignedEntitlement.Marker, "2099-12-31", new[] { "tensors:save" }));
             Assert.Null(SignedEntitlement.TryVerifyConfigured()); // placeholder → inert
         }
-        finally { Environment.SetEnvironmentVariable("AIDOTNET_LICENSE_TOKEN", saved); }
+        finally
+        {
+            Environment.SetEnvironmentVariable("AIDOTNET_LICENSE_TOKEN", saved);
+            SignedEntitlement.s_overridePublicKey = savedKey;
+        }
     }
 
     [Fact]

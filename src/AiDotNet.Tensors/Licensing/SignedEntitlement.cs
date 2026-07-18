@@ -61,10 +61,16 @@ public static class SignedEntitlement
     /// Embedded RSA public key as <c>{modulusBase64}:{exponentBase64}</c>
     /// (RSAParameters form — chosen over PKCS#1 DER so import works on both
     /// net471 and net10.0 with no BouncyCastle dependency in the runtime
-    /// assembly). Replace for production per build/LicenseValidator/README.md;
-    /// the PRIVATE key never ships.
+    /// assembly). The PRIVATE half never ships; it lives with the operator and
+    /// signs per-tenant entitlements via tools/license-issuer/rsa_entitlement_issuer.py.
+    /// This is the real production RSA-2048 entitlement key (kid-less; a single
+    /// trust root for offline air-gapped entitlements) — replacing it ACTIVATES
+    /// the offline entitlement path (a configured but invalid token now hard-fails
+    /// rather than falling through). It is a SEPARATE trust root from the Ed25519
+    /// aidn2 key embedded for AsymmetricEntitlementVerifier.
     /// </summary>
-    public const string EntitlementPublicKey = PublicKeyPlaceholderMarker;
+    public const string EntitlementPublicKey =
+        "tmsQ6ZHZxje8vKPbaUV0FG+JBERML+M1rvV5rfudnRVC+NWYBpcIFOLE45lOvTbQRI9c36RzCGwOtQQGYw1hQNhDLjiNYinuC9R1IRH0dSl/WO8cskz2Gx8Fec38AdtJMWvs22dSlw0nKgbFKB6H4zA2+W8/vBv079Ea+65+3clxFxkX2aixIG8rToD8F2K8ZoHb4t3AMRHthfUJ7EcWD8E3JEQoMtYPE7aHfpfbXmOBqrJwpURU2dw4nOIyf0pgANnCZxcNQ6FRdD78u6LK5cFI4Ye0GFI6//qexNk8N2nTy0xLiK725mJzFIguHKyF66J8hHJlxTF0gDfOunkVNQ==:AQAB";
 
     /// <summary>Test-only override of the embedded key (see the build-time validator's identical hook).</summary>
     internal static string? s_overridePublicKey;

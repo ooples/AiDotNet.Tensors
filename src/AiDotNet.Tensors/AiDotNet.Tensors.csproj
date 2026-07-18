@@ -161,6 +161,18 @@
   </ItemGroup>
 
   <!--
+    BouncyCastle.Cryptography (Org.BouncyCastle) — Ed25519 (EdDSA, RFC 8032) verification for the offline
+    `aidn2.` license-token path (AsymmetricEntitlementVerifier / Ed25519LicenseRevocation). This is the
+    Tensors runtime's FIRST BouncyCastle dependency: the rest of the runtime deliberately uses only
+    System.Security.Cryptography, but .NET ships no Ed25519 type on ANY target (net471/net8/net10), so the
+    signed-token verifier needs a portable Ed25519 implementation across all three TFMs. Version pinned to
+    2.6.2 to match the main AiDotNet SDK, so a token minted by the SDK verifies identically here. Cross-TFM
+    (net461+), 100% managed, no native/transitive deps. -->
+  <ItemGroup>
+    <PackageReference Include="BouncyCastle.Cryptography" Version="2.6.2" />
+  </ItemGroup>
+
+  <!--
     CPU BLAS native (#327): industry-standard pattern matching PyTorch / NumPy
     / TensorFlow — ship libopenblas alongside the managed package so consumers
     get MKL-class GEMM throughput out of the box. Without this reference,
@@ -334,6 +346,24 @@
   <ItemGroup>
     <EmbeddedResource Include="Licensing\LicenseRevocation.json" Condition="Exists('Licensing\LicenseRevocation.json')">
       <LogicalName>AiDotNet.Tensors.LicenseRevocation</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+  <!-- Embedded PUBLIC Ed25519 signing key(s) (JWK OKP set) used by AsymmetricEntitlementVerifier to verify
+       `aidn2.` tokens offline. Contains the real prod-2026a public key; the private half never ships. -->
+  <ItemGroup>
+    <EmbeddedResource Include="Licensing\LicensePublicKey.json">
+      <LogicalName>AiDotNet.Tensors.LicensePublicKey</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+  <!-- Optional signed Ed25519 revocation deny-list (CRL) for `aidn2.` tokens, verified by
+       Ed25519LicenseRevocation against the embedded Ed25519 public key. Additive/fail-open: absent =>
+       nothing revoked. Injected (and refreshed) at release with the current signed CRL. Kept separate from
+       the RSA LicenseRevocation.json above (different signing key / trust root). -->
+  <ItemGroup>
+    <EmbeddedResource Include="Licensing\LicenseRevocationEd25519.json" Condition="Exists('Licensing\LicenseRevocationEd25519.json')">
+      <LogicalName>AiDotNet.Tensors.LicenseRevocationEd25519</LogicalName>
     </EmbeddedResource>
   </ItemGroup>
 

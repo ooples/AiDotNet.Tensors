@@ -180,6 +180,30 @@ public static class PersistenceGuard
         }
     }
 
+    // ─── aidn2 (Ed25519) offline-token cache ───────────────────────
+    //
+    // Additive to the RSA SignedEntitlement path: an aidn2. token is resolved from AIDOTNET_LICENSE_KEY
+    // (when it's an aidn2. token) or the main SDK's cached ~/.aidotnet/offline-*.token files, verified
+    // offline against the embedded Ed25519 public key, and — when Active — grants its SIGNED capabilities.
+    // Resolved + verified once per process (constant for a run). null == no valid aidn2 token; this path
+    // is positive-grant-only and NEVER hard-fails (absence/failure falls through to RSA/key/trial).
+    private static readonly object _aidn2Lock = new();
+    private static bool _aidn2Resolved;
+    private static EntitlementResult? _aidn2Entitlement;
+
+    private static EntitlementResult? GetCachedAidn2Entitlement()
+    {
+        lock (_aidn2Lock)
+        {
+            if (!_aidn2Resolved)
+            {
+                _aidn2Entitlement = AsymmetricEntitlementVerifier.TryVerifyConfigured();
+                _aidn2Resolved = true;
+            }
+            return _aidn2Entitlement;
+        }
+    }
+
     // Per-key "pending allowance consumed" set. The first
     // ValidationPending result for a key is allowed (lets users on a
     // flaky network bootstrap into the offline-grace window), but
@@ -259,6 +283,18 @@ public static class PersistenceGuard
         // Suppressed under InternalOperation — upstream AiDotNet
         // already enforced before delegating to us.
         if (_internalDepth.Value > 0) return;
+
+        // ── Offline, Ed25519-signed aidn2 token (machine-bound offline grant) ───
+        // ADDITIVE / positive-grant-only: a machine-bound aidn2. token (from AIDOTNET_LICENSE_KEY or a
+        // main-SDK-minted ~/.aidotnet/offline-*.token) that verifies Active offline and carries the
+        // required capability authorises the op with no network call and no trial tick. Checked BEFORE the
+        // RSA entitlement/key/trial paths so a valid offline token wins regardless of RSA placeholder
+        // state. Unlike the RSA entitlement below, a NON-granting/absent aidn2 result is NOT a hard failure
+        // — it simply falls through (a genuinely forged aidn2 token yields no grant here and, if it was in
+        // AIDOTNET_LICENSE_KEY, is then rejected by the invalid-key path exactly as before).
+        var aidn2 = GetCachedAidn2Entitlement();
+        if (aidn2 is not null && aidn2.IsValid && aidn2.HasCapability(requiredCapability))
+            return;
 
         // ── Offline, RSA-signed entitlement (strongest trust anchor) ───
         // Checked FIRST. A signed entitlement is verified with an embedded
@@ -431,6 +467,11 @@ public static class PersistenceGuard
         {
             _entitlementResolved = false;
             _entitlement = null;
+        }
+        lock (_aidn2Lock)
+        {
+            _aidn2Resolved = false;
+            _aidn2Entitlement = null;
         }
     }
 }
