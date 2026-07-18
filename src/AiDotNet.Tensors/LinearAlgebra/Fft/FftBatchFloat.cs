@@ -32,27 +32,65 @@ internal static class FftBatchFloat
 {
     public static bool IsPowerOfTwo(int x) => x > 0 && (x & (x - 1)) == 0;
 
-    // Cached (bit-reversal perm, twiddle-real, twiddle-imag) per (n, inverse).
-    // Twiddle sign depends on direction; the bit-reversal perm does not, but we
-    // key the whole triple together for a single lookup.
-    private static readonly Dictionary<long, (int[] brev, float[] twR, float[] twI)> _cache = new();
+    // Byte-bounded LRU of FFT tables per (n, inverse). Twiddle sign depends on direction; the bit-reversal
+    // permutation (brev) does NOT, so it is shared between the forward and inverse entries for a given n
+    // rather than duplicated. Without a bound, varied/large transform sizes would root hundreds of MB for
+    // the process lifetime — the LRU evicts least-recently-used entries once the cap is exceeded.
+    private sealed class TableEntry
+    {
+        public long Key;
+        public int N;
+        public int[] Brev = default!;
+        public float[] TwR = default!;
+        public float[] TwI = default!;
+    }
+
+    private static readonly Dictionary<long, LinkedListNode<TableEntry>> _cache = new();
+    private static readonly LinkedList<TableEntry> _lru = new();   // front = least-recently-used
+    private static long _cacheBytes;
     private static readonly object _cacheLock = new();
+
+    // Cap the twiddle-table memory (twR + twI = 8 bytes/element per direction). 64 MB holds both directions
+    // of transforms up to ~4M points at once; beyond that the LRU recycles. The shared brev (4 bytes/element)
+    // rides along on the live entries and is reclaimed once both direction entries for an n are evicted.
+    private const long MaxCacheBytes = 64L * 1024 * 1024;
+
+    private static long TwiddleBytes(int n) => 8L * n;
 
     private static (int[] brev, float[] twR, float[] twI) GetTables(int n, bool inverse)
     {
         long key = ((long)n << 1) | (inverse ? 1L : 0L);
         lock (_cacheLock)
         {
-            if (_cache.TryGetValue(key, out var t)) return t;
+            if (_cache.TryGetValue(key, out var hitNode))
+            {
+                _lru.Remove(hitNode);
+                _lru.AddLast(hitNode);
+                var h = hitNode.Value;
+                return (h.Brev, h.TwR, h.TwI);
+            }
 
             int logn = 0; while ((1 << logn) < n) logn++;   // n is pow2 → exact log2 (net471-portable)
-            var brev = new int[n];
-            for (int i = 0; i < n; i++)
+
+            // Reuse the direction-independent bit-reversal permutation from the sibling (n, !inverse) entry
+            // if it is already cached, instead of building a second identical array.
+            long siblingKey = ((long)n << 1) | (inverse ? 0L : 1L);
+            int[] brev;
+            if (_cache.TryGetValue(siblingKey, out var sibNode))
             {
-                int r = 0, x = i;
-                for (int b = 0; b < logn; b++) { r = (r << 1) | (x & 1); x >>= 1; }
-                brev[i] = r;
+                brev = sibNode.Value.Brev;
             }
+            else
+            {
+                brev = new int[n];
+                for (int i = 0; i < n; i++)
+                {
+                    int r = 0, x = i;
+                    for (int b = 0; b < logn; b++) { r = (r << 1) | (x & 1); x >>= 1; }
+                    brev[i] = r;
+                }
+            }
+
             // Twiddles for stage lengths 2,4,...,n; k in [0, len/2). Total n-1 entries.
             var twR = new float[n];
             var twI = new float[n];
@@ -69,9 +107,20 @@ internal static class FftBatchFloat
                 }
                 off += half;
             }
-            var tables = (brev, twR, twI);
-            _cache[key] = tables;
-            return tables;
+
+            var node = _lru.AddLast(new TableEntry { Key = key, N = n, Brev = brev, TwR = twR, TwI = twI });
+            _cache[key] = node;
+            _cacheBytes += TwiddleBytes(n);
+
+            // Evict least-recently-used entries until under the cap (never evict the entry just added).
+            while (_cacheBytes > MaxCacheBytes && _lru.First is { } oldest && oldest.Value.Key != key)
+            {
+                _lru.RemoveFirst();
+                _cache.Remove(oldest.Value.Key);
+                _cacheBytes -= TwiddleBytes(oldest.Value.N);
+            }
+
+            return (brev, twR, twI);
         }
     }
 
@@ -96,7 +145,10 @@ internal static class FftBatchFloat
             FftNorm.Backward => inverse ? 1f / n : 1f,
             FftNorm.Forward => inverse ? 1f : 1f / n,
             FftNorm.Ortho => (float)(1.0 / Math.Sqrt(n)),
-            _ => 1f,
+            // Reject unknown normalization values rather than silently disabling scaling (scale 1f).
+            // The generic FftKernels.ScaleFor throws for these, so this fast path must too — otherwise the
+            // result would depend on element type / transform length.
+            _ => throw new ArgumentOutOfRangeException(nameof(norm), norm, "Unknown FFT normalization mode."),
         };
 
         int W = SVec.Count;
