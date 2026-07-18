@@ -61,10 +61,16 @@ public static class SignedEntitlement
     /// Embedded RSA public key as <c>{modulusBase64}:{exponentBase64}</c>
     /// (RSAParameters form — chosen over PKCS#1 DER so import works on both
     /// net471 and net10.0 with no BouncyCastle dependency in the runtime
-    /// assembly). Replace for production per build/LicenseValidator/README.md;
-    /// the PRIVATE key never ships.
+    /// assembly). The PRIVATE half never ships; it lives with the operator and
+    /// signs per-tenant entitlements via tools/license-issuer/rsa_entitlement_issuer.py.
+    /// This is the real production RSA-2048 entitlement key (kid-less; a single
+    /// trust root for offline air-gapped entitlements) — replacing it ACTIVATES
+    /// the offline entitlement path (a configured but invalid token now hard-fails
+    /// rather than falling through). It is a SEPARATE trust root from the Ed25519
+    /// aidn2 key embedded for AsymmetricEntitlementVerifier.
     /// </summary>
-    public const string EntitlementPublicKey = PublicKeyPlaceholderMarker;
+    public const string EntitlementPublicKey =
+        "tmsQ6ZHZxje8vKPbaUV0FG+JBERML+M1rvV5rfudnRVC+NWYBpcIFOLE45lOvTbQRI9c36RzCGwOtQQGYw1hQNhDLjiNYinuC9R1IRH0dSl/WO8cskz2Gx8Fec38AdtJMWvs22dSlw0nKgbFKB6H4zA2+W8/vBv079Ea+65+3clxFxkX2aixIG8rToD8F2K8ZoHb4t3AMRHthfUJ7EcWD8E3JEQoMtYPE7aHfpfbXmOBqrJwpURU2dw4nOIyf0pgANnCZxcNQ6FRdD78u6LK5cFI4Ye0GFI6//qexNk8N2nTy0xLiK725mJzFIguHKyF66J8hHJlxTF0gDfOunkVNQ==:AQAB";
 
     /// <summary>Test-only override of the embedded key (see the build-time validator's identical hook).</summary>
     internal static string? s_overridePublicKey;
@@ -220,6 +226,21 @@ public static class SignedEntitlement
                 }
             }
 
+            // Scope/audience binding (mirrors the AiDotNet aidn2 verifier): an entitlement that names a
+            // `scope` is valid only where the host declares the same expected scope
+            // (AIDOTNET_LICENSE_SCOPE) — fencing a scoped entitlement (e.g. a CI token) off from unintended
+            // contexts even if it leaks. Absent scope → unrestricted (back-compat).
+            if (TryGetString(signed, "scope", out var scope)
+                && !string.Equals(scope, ExpectedScope(), StringComparison.Ordinal))
+                return EntitlementResult.Invalid(
+                    $"Entitlement scope '{scope}' does not match this host's expected scope.");
+
+            // Revocation deny-list (CRL): a specific leaked entitlement (jti) can be killed before it
+            // expires. The signed CRL is verified with the same embedded entitlement key; absent/expired/
+            // unsigned CRL → nothing revoked (fail-open, additive). Mirrors LicenseRevocationProvider.
+            if (TryGetString(signed, "jti", out var jti) && TensorsLicenseRevocation.IsRevoked(jti))
+                return EntitlementResult.Invalid("Entitlement has been revoked.");
+
             string? tenant = TryGetString(signed, "tenant", out var t) && !string.IsNullOrWhiteSpace(t) ? t : null;
             return EntitlementResult.Valid(tenant, expires, caps);
         }
@@ -241,6 +262,16 @@ public static class SignedEntitlement
     }
 
     /// <summary>
+    /// The scope this host expects a scoped entitlement to declare, from the <c>AIDOTNET_LICENSE_SCOPE</c>
+    /// environment variable (empty when unset). A scoped entitlement is accepted only when it matches.
+    /// </summary>
+    private static string ExpectedScope()
+    {
+        try { return Environment.GetEnvironmentVariable("AIDOTNET_LICENSE_SCOPE")?.Trim() ?? string.Empty; }
+        catch { return string.Empty; }
+    }
+
+    /// <summary>
     /// Imports the embedded <c>{modulusBase64}:{exponentBase64}</c> public key.
     /// Uses <see cref="RSA.ImportParameters"/> (RSAParameters) so it works on
     /// net471 and net10.0 alike — <see cref="RSA.ImportRSAPublicKey(System.ReadOnlySpan{byte}, out int)"/>
@@ -256,6 +287,27 @@ public static class SignedEntitlement
         var rsa = RSA.Create();
         rsa.ImportParameters(new RSAParameters { Modulus = modulus, Exponent = exponent });
         return rsa;
+    }
+
+    /// <summary>
+    /// Verifies an RSA-SHA256 (PKCS#1 v1.5) signature over <paramref name="data"/> using the embedded
+    /// entitlement public key. Returns false when this build ships the placeholder key (not configured)
+    /// or on any error. Used by <see cref="TensorsLicenseRevocation"/> so the CRL is anchored to the same
+    /// trust root as the entitlement itself.
+    /// </summary>
+    internal static bool VerifyWithEntitlementKey(byte[] data, byte[] signature)
+    {
+        string pubKey = ResolvePublicKey();
+        if (string.Equals(pubKey, PublicKeyPlaceholderMarker, StringComparison.Ordinal)) return false;
+        try
+        {
+            using var rsa = ImportPublicKey(pubKey);
+            return rsa.VerifyData(data, signature, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        }
+        catch
+        {
+            return false;
+        }
     }
 }
 
