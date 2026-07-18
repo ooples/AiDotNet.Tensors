@@ -3510,6 +3510,29 @@ public interface IDirectGpuBackend : IDisposable
     AiDotNet.Tensors.Engines.Gpu.IGpuMixedPrecisionConvBackend? MixedPrecisionConv { get; }
 
     #endregion
+
+    #region Paged Attention (P1)
+
+    /// <summary>Single-query paged-attention decode over a vLLM-style paged KV cache (see DevicePagedKVCache):
+    /// <c>out[h] = softmax(scale · Q[h]·K[.,h]) · V[.,h]</c>, gathering K/V through the block table. All six
+    /// backends implement this; higher layers (inference/serving) invoke it via the engine's backend.</summary>
+    IGpuBuffer PagedAttentionDecode(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int headDim, int blockSize, int seqLen, float scale);
+
+    /// <summary>Multi-query paged-attention prefill with causal masking: query <c>qi</c> attends to key
+    /// positions <c>0..(startPos+qi)</c>.</summary>
+    IGpuBuffer PagedAttentionPrefill(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int headDim, int blockSize, int numQueries, int startPos, float scale);
+
+    /// <summary>Grouped-query variant of <see cref="PagedAttentionDecode"/> (<paramref name="kvHeads"/> &lt; heads).</summary>
+    IGpuBuffer PagedAttentionDecodeGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int kvHeads, int headDim, int blockSize, int seqLen, float scale);
+
+    /// <summary>Grouped-query variant of <see cref="PagedAttentionPrefill"/> (<paramref name="kvHeads"/> &lt; heads).</summary>
+    IGpuBuffer PagedAttentionPrefillGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int kvHeads, int headDim, int blockSize, int numQueries, int startPos, float scale);
+
+    #endregion
 }
 
 /// <summary>

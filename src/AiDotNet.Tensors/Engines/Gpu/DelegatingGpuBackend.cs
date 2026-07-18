@@ -95,6 +95,26 @@ public class DelegatingGpuBackend : IDirectGpuBackend
         => Inner.MatMul(A, B, M, N, K);
 
     /// <inheritdoc/>
+    public virtual IGpuBuffer PagedAttentionDecode(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int headDim, int blockSize, int seqLen, float scale)
+        => Inner.PagedAttentionDecode(q, kcache, vcache, blockTable, heads, headDim, blockSize, seqLen, scale);
+
+    /// <inheritdoc/>
+    public virtual IGpuBuffer PagedAttentionPrefill(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int headDim, int blockSize, int numQueries, int startPos, float scale)
+        => Inner.PagedAttentionPrefill(q, kcache, vcache, blockTable, heads, headDim, blockSize, numQueries, startPos, scale);
+
+    /// <inheritdoc/>
+    public virtual IGpuBuffer PagedAttentionDecodeGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int kvHeads, int headDim, int blockSize, int seqLen, float scale)
+        => Inner.PagedAttentionDecodeGqa(q, kcache, vcache, blockTable, heads, kvHeads, headDim, blockSize, seqLen, scale);
+
+    /// <inheritdoc/>
+    public virtual IGpuBuffer PagedAttentionPrefillGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int kvHeads, int headDim, int blockSize, int numQueries, int startPos, float scale)
+        => Inner.PagedAttentionPrefillGqa(q, kcache, vcache, blockTable, heads, kvHeads, headDim, blockSize, numQueries, startPos, scale);
+
+    /// <inheritdoc/>
     public virtual void MatMulTransposed(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
         => Inner.MatMulTransposed(A, B, C, M, N, K, alpha, beta);
 

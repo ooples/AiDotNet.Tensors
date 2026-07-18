@@ -121,15 +121,15 @@ public sealed class DevicePagedKVCacheOpenClTests : IDisposable
     }
 
     [Fact]
-    public void Backend_ExposesPagedAttentionCapability_AndInterfacePathMatchesOracle()
+    public void Backend_PagedAttention_OnInterface_MatchesOracle()
     {
         // The capability interface (IPagedAttentionBackend) is how higher layers (e.g. an inference/serving
         // engine) consume paged attention without depending on a concrete backend type. Verify the backend
         // advertises it and that dispatching through the interface produces the same result as the oracle.
         if (!EnsureReady()) return;
         var backend = _backend!;
-        Assert.True(backend is IPagedAttentionBackend, "OpenClBackend must expose IPagedAttentionBackend.");
-        var paged = (IPagedAttentionBackend)backend;
+        Assert.True(backend is IDirectGpuBackend, "OpenClBackend must implement IDirectGpuBackend paged attention.");
+        var paged = (IDirectGpuBackend)backend;
 
         const int heads = 2, headDim = 32, blockSize = 8, seqLen = 20;
         int stride = heads * headDim;
