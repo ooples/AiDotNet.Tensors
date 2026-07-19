@@ -26,16 +26,17 @@ env:
 
 jobs:
   build:
-    # Runs on release-please PRs too (a version-bump PR is build-safe) so the required
-    # `build` status is satisfied and the release PR merges without an admin override.
+    # SKIP entirely on the release-please Release PR ("release-please--…" head branch): it only bumps
+    # the version + CHANGELOG/manifest — code identical to the feature PRs that already passed this
+    # build — so re-running the full build+test is pure duplicate work. A job skipped via a `if:`
+    # CONDITIONAL (not a paths/branch filter) is reported to branch protection as SUCCESS, so the
+    # required `build` check is still satisfied and the Release PR merges with no admin override.
+    # (Mirrors AiDotNet #1839.)
     #
-    # But SKIP the post-merge rebuild of the release-please MERGE COMMIT itself — when the
-    # "chore(main): release X.Y.Z" PR merges, that version-bump commit is pushed to main and
-    # would re-run this exact build the Release PR already ran (identical code, only version/
-    # changelog bumped): pure duplicate work. Normal feature-merge pushes to main still build
-    # (post-merge validation is kept); only the release commit is skipped. Mirrors AiDotNet's
-    # Build & SonarCloud guard.
-    if: "${{ !(github.event_name == 'push' && startsWith(github.event.head_commit.message, 'chore(main): release')) }}"
+    # ALSO skip the post-merge rebuild of the release-please MERGE COMMIT push ("chore(main): release
+    # X.Y.Z") — same identical-code duplicate. Normal feature PRs and normal pushes to main still build
+    # (head_ref is empty on push, so the release-please guard is a no-op there).
+    if: "${{ !(github.event_name == 'push' && startsWith(github.event.head_commit.message, 'chore(main): release')) && !startsWith(github.head_ref, 'release-please--') }}"
     runs-on: ubuntu-latest
 
     steps:
@@ -249,10 +250,9 @@ jobs:
   # and assert bit-exactness, after which MachineKernelGemm.EnableAvx512 can be
   # flipped on by default.
   avx512-verify:
-    # Runs on release-please PRs too so the required `avx512-verify` status is satisfied, but
-    # skip the duplicate post-merge rebuild of the "chore(main): release X.Y.Z" merge commit
-    # (same rationale as the build job above).
-    if: "${{ !(github.event_name == 'push' && startsWith(github.event.head_commit.message, 'chore(main): release')) }}"
+    # Skip on the release-please Release PR and on the release merge-commit push — same rationale as
+    # the build job above (conditionally-skipped required checks report success to branch protection).
+    if: "${{ !(github.event_name == 'push' && startsWith(github.event.head_commit.message, 'chore(main): release')) && !startsWith(github.head_ref, 'release-please--') }}"
     runs-on: ${{ vars.AVX512_RUNNER || 'ubuntu-latest' }}
     steps:
     - uses: actions/checkout@v4
