@@ -5359,13 +5359,14 @@ public partial class DirectGpuTensorEngine
 
     /// <inheritdoc/>
     Tensor<T> IEngine.ScaledDotProductAttention<T>(Tensor<T> query, Tensor<T> key, Tensor<T> value,
-        Tensor<bool>? mask, double? scale, out Tensor<T> attentionWeights)
+        Tensor<bool>? mask, double? scale, out Tensor<T> attentionWeights, double softcap)
     {
         // GPU SDPA kernel: [batch, numHeads, seqQ/seqK, headDim]. Tape/graph,
-        // non-float, or unequal Q/K/V feature depths defer to the base implementation.
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        // non-float, unequal Q/K/V feature depths, or an attention-logit soft-cap (Gemma-2, GPU kernel
+        // has no softcap) defer to the base (CPU) implementation, which applies the softcap.
+        if (softcap > 0.0 || IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || query.Rank != 4 || key.Rank != 4 || value.Rank != 4 || !TryGetBackend(out var backend))
-            return base.ScaledDotProductAttention(query, key, value, mask, scale, out attentionWeights);
+            return base.ScaledDotProductAttention(query, key, value, mask, scale, out attentionWeights, softcap);
         try
         {
             int batch = query.Shape._dims[0], numHeads = query.Shape._dims[1];
