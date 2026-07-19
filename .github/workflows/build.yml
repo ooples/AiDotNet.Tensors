@@ -28,6 +28,14 @@ jobs:
   build:
     # Runs on release-please PRs too (a version-bump PR is build-safe) so the required
     # `build` status is satisfied and the release PR merges without an admin override.
+    #
+    # But SKIP the post-merge rebuild of the release-please MERGE COMMIT itself — when the
+    # "chore(main): release X.Y.Z" PR merges, that version-bump commit is pushed to main and
+    # would re-run this exact build the Release PR already ran (identical code, only version/
+    # changelog bumped): pure duplicate work. Normal feature-merge pushes to main still build
+    # (post-merge validation is kept); only the release commit is skipped. Mirrors AiDotNet's
+    # Build & SonarCloud guard.
+    if: "${{ !(github.event_name == 'push' && startsWith(github.event.head_commit.message, 'chore(main): release')) }}"
     runs-on: ubuntu-latest
 
     steps:
@@ -241,7 +249,10 @@ jobs:
   # and assert bit-exactness, after which MachineKernelGemm.EnableAvx512 can be
   # flipped on by default.
   avx512-verify:
-    # Runs on release-please PRs too so the required `avx512-verify` status is satisfied.
+    # Runs on release-please PRs too so the required `avx512-verify` status is satisfied, but
+    # skip the duplicate post-merge rebuild of the "chore(main): release X.Y.Z" merge commit
+    # (same rationale as the build job above).
+    if: "${{ !(github.event_name == 'push' && startsWith(github.event.head_commit.message, 'chore(main): release')) }}"
     runs-on: ${{ vars.AVX512_RUNNER || 'ubuntu-latest' }}
     steps:
     - uses: actions/checkout@v4
