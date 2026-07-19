@@ -1258,6 +1258,48 @@ public class GpuCpuConsistencyTests
                 "after an in-place, Version-bumping weight load with no explicit InvalidatePersistentTensor.");
     }
 
+    // Training scenario for the version-aware persistent weight cache: a forward populates (warms) the
+    // persistent GPU buffer, THEN an optimizer step updates the weights in place (as a CPU-side parameter
+    // step does — DenseLayer.UpdateParameters mutates via Engine.TensorSubtractInPlace, bumping Version).
+    // The next forward must reflect the updated weights, not the warm-cached pre-step values — otherwise the
+    // model would train against frozen weights (loss goes flat). Distinct from the load-then-forward repro:
+    // here the cache is already warm and stamped BEFORE the mutation, so it exercises the re-upload-on-stale
+    // path rather than the first-upload path.
+    [SkippableFact]
+    public void FusedLinear_PersistentWeightUpdatedAfterWarmCache_ReflectsUpdate()
+    {
+        SkipIfNoDirectGpu();
+
+        const int M = 4, K = 8, N = 6;
+        var w0 = Enumerable.Range(0, K * N).Select(i => -0.5f + 0.017f * (i % 13)).ToArray();
+        var x = new Tensor<float>(
+            Enumerable.Range(0, M * K).Select(i => 0.1f * (i % 7) - 0.2f).ToArray(), new[] { M, K });
+        var bias = new Tensor<float>(new float[N], new[] { N });
+
+        using var gpu = new DirectGpuTensorEngine();
+        var w = new Tensor<float>((float[])w0.Clone(), new[] { K, N });
+        ((IEngine)gpu).RegisterPersistentTensor(w, PersistentTensorRole.Weights);
+
+        // Forward #1 warms + version-stamps the persistent buffer (mirrors a training step's forward).
+        var warm = ((IEngine)gpu).FusedLinear(x, w, bias, FusedActivationType.None);
+        _ = warm.Contiguous().AsSpan().ToArray();
+
+        // Optimizer step: update the weights in place via the Version-bumping indexer, no re-register/invalidate.
+        for (int i = 0; i < w.Length; i++) w[i] = w0[i] - 0.05f;
+
+        // Forward #2 must use the stepped weights.
+        var stepped = ((IEngine)gpu).FusedLinear(x, w, bias, FusedActivationType.None);
+
+        var expected = new CpuEngine().FusedLinear(
+            x, new Tensor<float>(w0.Select(v => v - 0.05f).ToArray(), new[] { K, N }), bias, FusedActivationType.None);
+        var g = stepped.Contiguous().AsSpan();
+        var c = expected.AsSpan();
+        for (int i = 0; i < c.Length; i++)
+            Assert.True(MathF.Abs(g[i] - c[i]) <= 1e-4f,
+                $"idx {i}: GPU={g[i]} CPU={c[i]} — a post-warm-cache weight update was not reflected on GPU " +
+                "(model would train against frozen weights).");
+    }
+
     #endregion
 
     #region TensorMatMul GPU vs CPU Consistency Tests
