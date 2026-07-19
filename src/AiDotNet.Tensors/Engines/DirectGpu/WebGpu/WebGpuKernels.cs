@@ -4586,7 +4586,7 @@ struct AttentionForwardParams {
     store_weights: u32,
     store_stats: u32,
     boolean_mask_mode: u32,
-    _pad2: u32,
+    softcap: f32,
     _pad3: u32,
 }
 @group(0) @binding(7) var<uniform> attention_params: AttentionForwardParams;
@@ -4615,6 +4615,9 @@ fn attention_forward_score(b: u32, q_head: u32, kv_head: u32, q_pos: u32, k_pos:
     }
 
     var score = dot * attention_params.scale;
+    if (attention_params.softcap > 0.0) {
+        score = attention_params.softcap * tanh(score / attention_params.softcap);
+    }
     if (attention_params.has_bias != 0u && attention_params.boolean_mask_mode == 0u) {
         var bias_base: u32 = 0u;
         if (attention_params.bias_batch_stride != 0u) {

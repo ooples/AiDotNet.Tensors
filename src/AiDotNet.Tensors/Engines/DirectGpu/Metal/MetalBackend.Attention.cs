@@ -12,7 +12,8 @@ public sealed partial class MetalBackend
     /// </summary>
     public void ScaledDotProductAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer? attentionWeights, IGpuBuffer? mask,
-        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal,
+        float softcap = 0.0f)
     {
         ThrowIfDisposed();
         int outputCount = checked(batch * numHeads * seqQ * headDim);
@@ -29,7 +30,7 @@ public sealed partial class MetalBackend
         DispatchResidentMetal("attention_forward_serial", 1,
             new[] { query, key, value, outputTemporary, weightsTemporary ?? unusedWeights!, mask ?? unusedMask! },
             (uint)batch, (uint)numHeads, (uint)seqQ, (uint)seqK, (uint)headDim, unchecked((uint)SingleToInt32BitsCompat(scale)),
-            isCausal ? 1u : 0u, attentionWeights is null ? 0u : 1u, maskMode);
+            isCausal ? 1u : 0u, attentionWeights is null ? 0u : 1u, maskMode, unchecked((uint)SingleToInt32BitsCompat(softcap)));
         Copy(outputTemporary, output, outputCount);
         if (attentionWeights is not null) Copy(weightsTemporary!, attentionWeights, weightCount);
     }

@@ -402,14 +402,16 @@ layout(set = 0, binding = 4) writeonly buffer Weights { float weightData[]; };
 layout(set = 0, binding = 5) readonly buffer Mask { float maskData[]; };
 layout(push_constant) uniform Params {
     uint batch; uint queryHeads; uint kvHeads; uint seqQ; uint seqK; uint headDim;
-    float scale; uint causal; uint writeWeights; uint maskMode; uint maskBatchStride;
+    float scale; uint causal; uint writeWeights; uint maskMode; uint maskBatchStride; float softcap;
 };
 float attentionScore(uint batchIndex, uint queryHead, uint kvHead, uint queryIndex, uint keyIndex) {
     uint queryOffset = ((batchIndex * queryHeads + queryHead) * seqQ + queryIndex) * headDim;
     uint keyOffset = ((batchIndex * kvHeads + kvHead) * seqK + keyIndex) * headDim;
     float score = 0.0;
     for (uint d0 = 0u; d0 < headDim; ++d0) score += queryData[queryOffset + d0] * keyData[keyOffset + d0];
-    return score * scale;
+    float logit = score * scale;
+    // Attention-logit soft-cap (Gemma-2): softcap * tanh(logit / softcap); softcap<=0 disables.
+    return softcap > 0.0 ? softcap * tanh(logit / softcap) : logit;
 }
 bool attentionMasked(uint batchIndex, uint queryHead, uint queryIndex, uint keyIndex) {
     if (maskMode == 0u) return false;

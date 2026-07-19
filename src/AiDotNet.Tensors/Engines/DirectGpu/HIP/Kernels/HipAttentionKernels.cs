@@ -45,7 +45,8 @@ extern ""C"" __global__ __launch_bounds__(256) void scaled_dot_product_attention
     float scale,
     int isCausal,
     int maskMode,
-    int storeWeights)
+    int storeWeights,
+    float softcap)
 {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     int totalRows = batch * numHeads * seqQ;
@@ -59,6 +60,9 @@ extern ""C"" __global__ __launch_bounds__(256) void scaled_dot_product_attention
     int wOffset = row * seqK;
     int maskOffset = (maskMode == 2 ? bh * seqQ * seqK : 0) + qi * seqK;
 
+    // Attention-logit soft-cap (Gemma-2): softcap * tanh((score*scale)/softcap); softcap<=0 disables.
+    #define ATTN_LOGIT(sc) (softcap > 0.0f ? softcap * tanhf(((sc) * scale) / softcap) : (sc) * scale)
+
     float rowMax = -INFINITY;
     for (int ki = 0; ki < seqK; ki++) {
         if ((isCausal && ki > qi) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f)) continue;
@@ -66,7 +70,7 @@ extern ""C"" __global__ __launch_bounds__(256) void scaled_dot_product_attention
         for (int d = 0; d < headDim; d++) {
             score += query[qOffset + d] * key[kOffset + ki * headDim + d];
         }
-        rowMax = fmaxf(rowMax, score * scale);
+        rowMax = fmaxf(rowMax, ATTN_LOGIT(score));
     }
 
     float denominator = 0.0f;
@@ -76,7 +80,7 @@ extern ""C"" __global__ __launch_bounds__(256) void scaled_dot_product_attention
         for (int d = 0; d < headDim; d++) {
             score += query[qOffset + d] * key[kOffset + ki * headDim + d];
         }
-        denominator += expf(score * scale - rowMax);
+        denominator += expf(ATTN_LOGIT(score) - rowMax);
     }
 
     float inverseDenominator = denominator > 0.0f ? 1.0f / denominator : 0.0f;
@@ -88,7 +92,7 @@ extern ""C"" __global__ __launch_bounds__(256) void scaled_dot_product_attention
                 for (int d = 0; d < headDim; d++) {
                     score += query[qOffset + d] * key[kOffset + ki * headDim + d];
                 }
-                weight = expf(score * scale - rowMax) * inverseDenominator;
+                weight = expf(ATTN_LOGIT(score) - rowMax) * inverseDenominator;
             }
             attentionWeights[wOffset + ki] = weight;
         }
@@ -102,11 +106,12 @@ extern ""C"" __global__ __launch_bounds__(256) void scaled_dot_product_attention
             for (int inner = 0; inner < headDim; inner++) {
                 score += query[qOffset + inner] * key[kOffset + ki * headDim + inner];
             }
-            float weight = expf(score * scale - rowMax) * inverseDenominator;
+            float weight = expf(ATTN_LOGIT(score) - rowMax) * inverseDenominator;
             sum += weight * value[vOffset + ki * headDim + d];
         }
         output[qOffset + d] = sum;
     }
+    #undef ATTN_LOGIT
 }
 
 // ===========================================================================

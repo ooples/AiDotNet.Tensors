@@ -865,6 +865,48 @@ public class GpuCpuConsistencyTests
     }
 
     [SkippableFact]
+    public void ScaledDotProductAttention_LogitSoftcap_MatchesCpu()
+    {
+        SkipIfNoDirectGpu();
+
+        // Gemma-2 attention-logit soft-cap: the GPU kernel must apply softcap*tanh(scaledScore/softcap)
+        // before the softmax, byte-for-byte consistent with the CPU path. Large scores + a small cap
+        // make the softcap the dominant term (an uncapped run would diverge wildly here).
+        const int batch = 2, heads = 2, seqQ = 2, seqK = 3, dimension = 3;
+        const double scale = 1.5;
+        const double softcap = 2.0;
+        var query = new Tensor<float>(
+            Enumerable.Range(0, batch * heads * seqQ * dimension).Select(i => -0.9f + 0.17f * i).ToArray(),
+            new[] { batch, heads, seqQ, dimension });
+        var key = new Tensor<float>(
+            Enumerable.Range(0, batch * heads * seqK * dimension).Select(i => 1.3f - 0.11f * i).ToArray(),
+            new[] { batch, heads, seqK, dimension });
+        var value = new Tensor<float>(
+            Enumerable.Range(0, batch * heads * seqK * dimension).Select(i => -0.4f + 0.09f * i).ToArray(),
+            new[] { batch, heads, seqK, dimension });
+
+        var cpu = new CpuEngine();
+        var expected = cpu.ScaledDotProductAttention(query, key, value, null, scale, out var expectedWeights, softcap);
+
+        using var gpu = new DirectGpuTensorEngine();
+        using var scope = gpu.BeginGpuScope();
+        var actual = ((IEngine)gpu).ScaledDotProductAttention(
+            query, key, value, null, scale, out var actualWeights, softcap);
+
+        var expectedData = expected.AsSpan();
+        var actualData = actual.AsSpan();
+        for (int i = 0; i < expectedData.Length; i++)
+            Assert.True(MathF.Abs(expectedData[i] - actualData[i]) <= 2e-5f,
+                $"Soft-capped attention output mismatch at {i}: CPU={expectedData[i]}, GPU={actualData[i]}");
+
+        var expectedWeightData = expectedWeights.AsSpan();
+        var actualWeightData = actualWeights.AsSpan();
+        for (int i = 0; i < expectedWeightData.Length; i++)
+            Assert.True(MathF.Abs(expectedWeightData[i] - actualWeightData[i]) <= 2e-5f,
+                $"Soft-capped attention weight mismatch at {i}: CPU={expectedWeightData[i]}, GPU={actualWeightData[i]}");
+    }
+
+    [SkippableFact]
     public void ScaledDotProductAttention_FullBooleanMaskStaysResidentAndMatchesCpu()
     {
         SkipIfNoDirectGpu();

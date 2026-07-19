@@ -26287,7 +26287,8 @@ public partial class CpuEngine : ITensorLevelEngine
         Tensor<T> value,
         Tensor<bool>? mask,
         double? scale,
-        out Tensor<T> attentionWeights)
+        out Tensor<T> attentionWeights,
+        double softcap = 0.0)
     {
         using var _opScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("ScaledDotProductAttention");
         if (query == null)
@@ -26334,6 +26335,14 @@ public partial class CpuEngine : ITensorLevelEngine
             var scores = TensorMatMul(query, kT);
             // scaled = scores * (1/sqrt(d_k))
             var scaled = TensorMultiplyScalar(scores, scaleT_local);
+            // Optional attention-logit soft-cap (Gemma-2): scaled = softcap * tanh(scaled / softcap).
+            // Recorded as primitives so the compiled plan's backward chains through them.
+            if (softcap > 0.0)
+            {
+                var invCap = numOpsLocal.FromDouble(1.0 / softcap);
+                var capT = numOpsLocal.FromDouble(softcap);
+                scaled = TensorMultiplyScalar(Tanh(TensorMultiplyScalar(scaled, invCap)), capT);
+            }
             // softmax over last axis (S_k) — Softmax records its own lazy node
             // and the backward kernel handles the per-row Jacobian.
             attentionWeights = Softmax(scaled);
@@ -26398,7 +26407,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 (Tensor<float>)(object)value,
                 mask, scaleVal,
                 batch, heads, seqQ, d_k, seqK, d_v,
-                out var weightsF);
+                out var weightsF, softcap);
             attentionWeights = (Tensor<T>)(object)weightsF;
             var resultFCast = (Tensor<T>)(object)resultF;
             DifferentiableOps.RecordIfActive("ScaledDotProductAttention", resultFCast,
@@ -26424,7 +26433,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 (Tensor<double>)(object)value,
                 mask, scaleVal,
                 batch, heads, seqQ, d_k, seqK, d_v,
-                out var weightsD);
+                out var weightsD, softcap);
             attentionWeights = (Tensor<T>)(object)weightsD;
             var resultDCast = (Tensor<T>)(object)resultD;
             DifferentiableOps.RecordIfActive("ScaledDotProductAttention", resultDCast,
@@ -26456,7 +26465,11 @@ public partial class CpuEngine : ITensorLevelEngine
                     {
                         sum = numOps.Add(sum, numOps.Multiply(queryData[qOffset + i * d_k + k], keyData[kOffset + j * d_k + k]));
                     }
-                    scoresData[sOffset + i * seqK + j] = numOps.Multiply(sum, scaleFactor);
+                    var scaledScore = numOps.Multiply(sum, scaleFactor);
+                    // Attention-logit soft-cap (Gemma-2), generic-T path.
+                    if (softcap > 0.0)
+                        scaledScore = numOps.FromDouble(softcap * Math.Tanh(Convert.ToDouble(scaledScore) / softcap));
+                    scoresData[sOffset + i * seqK + j] = scaledScore;
                 }
             }
         });
@@ -26557,7 +26570,8 @@ public partial class CpuEngine : ITensorLevelEngine
         Tensor<bool>? mask,
         double scaleValue,
         int batch, int heads, int seqQ, int d_k, int seqK, int d_v,
-        out Tensor<float> attentionWeights)
+        out Tensor<float> attentionWeights,
+        double softcap = 0.0)
     {
         int bhCount = batch * heads;
         var qf = query.GetFlattenedData();
@@ -26582,6 +26596,9 @@ public partial class CpuEngine : ITensorLevelEngine
 
         float scaleF  = (float)scaleValue;
         float negInfF = float.NegativeInfinity;
+        bool useSoftcap = softcap > 0.0;
+        float capF = (float)softcap;
+        float invCapF = useSoftcap ? 1f / capF : 0f;
 
         // Process each batch-head slice in parallel. Each slice is two independent
         // SGEMMs separated by a softmax pass. The individual SGEMMs are sized well
@@ -26648,6 +26665,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int j = 0; j < seqK; j++)
                 {
                     float v = scoresData[rowOff + j] * scaleF;
+                    // Attention-logit soft-cap (Gemma-2): applied to the scaled logit before masking/softmax.
+                    if (useSoftcap) v = capF * MathF.Tanh(v * invCapF);
                     if (mask != null && !mask[b, h, i, j]) v = negInfF;
                     if (v > maxVal) maxVal = v;
                     scoresData[rowOff + j] = v;
@@ -26922,7 +26941,8 @@ public partial class CpuEngine : ITensorLevelEngine
         Tensor<bool>? mask,
         double scaleValue,
         int batch, int heads, int seqQ, int d_k, int seqK, int d_v,
-        out Tensor<double> attentionWeights)
+        out Tensor<double> attentionWeights,
+        double softcap = 0.0)
     {
         int bhCount = batch * heads;
         // Use the stride-aware accessor on all three operands for consistency.
@@ -26986,6 +27006,8 @@ public partial class CpuEngine : ITensorLevelEngine
                     for (int j = 0; j < seqK; j++)
                     {
                         double v = scoresData[rowOff + j] * scaleValue;
+                        // Attention-logit soft-cap (Gemma-2): applied to the scaled logit before masking/softmax.
+                        if (softcap > 0.0) v = softcap * Math.Tanh(v / softcap);
                         if (mask != null && !mask[b, h, i, j]) v = negInfD;
                         if (v > maxVal) maxVal = v;
                         scoresData[rowOff + j] = v;
@@ -40321,7 +40343,10 @@ public partial class CpuEngine : ITensorLevelEngine
 #else
             var resultArr = new float[length];
 #endif
-            SigmoidBackwardFloat(gF, oF, resultArr);
+            // Bound by the LOGICAL length — gF/oF can be pool-over-allocated (longer than the tensor's
+            // logical Length) while resultArr is sized to `length`; iterating to grad.Length would write
+            // past resultArr (unchecked AVX store -> AccessViolation). See TanhBackward for the mechanism.
+            SigmoidBackwardFloat(gF, oF, resultArr, length);
             return (Tensor<T>)(object)TensorAllocator.Rent<T>(gradOutput._shape, (Vector<T>)(object)Vector<float>.FromMemory(resultArr));
         }
 
@@ -40353,9 +40378,13 @@ public partial class CpuEngine : ITensorLevelEngine
         return TensorAllocator.Rent<T>(gradOutput._shape, result);
     }
 
-    private static unsafe void SigmoidBackwardFloat(float[] grad, float[] sigmoid, float[] result)
+    private static unsafe void SigmoidBackwardFloat(float[] grad, float[] sigmoid, float[] result, int length)
     {
-        int length = grad.Length;
+        // Clamp to the shortest array — grad/sigmoid may be pool-over-allocated (longer than `length`);
+        // result is sized to the logical length. Never read/write past any buffer.
+        if (length > result.Length) length = result.Length;
+        if (length > grad.Length) length = grad.Length;
+        if (length > sigmoid.Length) length = sigmoid.Length;
         int i = 0;
 #if NET5_0_OR_GREATER
         if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && length >= 32)
@@ -40409,7 +40438,12 @@ public partial class CpuEngine : ITensorLevelEngine
 #else
             var resultArr = new float[length];
 #endif
-            TanhBackwardFloat(gF, oF, resultArr);
+            // Bound by the LOGICAL length: gF/oF come from GetFlattenedData/GetDataArray, which
+            // can hand back a pool-OVER-ALLOCATED backing array (physically longer than the tensor's
+            // logical Length — see VectorBase.GetDataArray returning the full segment.Array at offset 0).
+            // resultArr is sized to `length`, so iterating to grad.Length would write past it (the
+            // AVX store has no bounds check -> AccessViolation). Pass the logical length explicitly.
+            TanhBackwardFloat(gF, oF, resultArr, length);
             return (Tensor<T>)(object)TensorAllocator.Rent<T>(gradOutput._shape, (Vector<T>)(object)Vector<float>.FromMemory(resultArr));
         }
 
@@ -40441,9 +40475,14 @@ public partial class CpuEngine : ITensorLevelEngine
         return TensorAllocator.Rent<T>(gradOutput._shape, result);
     }
 
-    private static unsafe void TanhBackwardFloat(float[] grad, float[] tanh, float[] result)
+    private static unsafe void TanhBackwardFloat(float[] grad, float[] tanh, float[] result, int length)
     {
-        int length = grad.Length;
+        // Clamp to the shortest array so no read/write can exceed any buffer, even if a caller
+        // passes a `length` larger than one of the arrays (over-allocated pool backings mean
+        // grad/tanh may be LONGER than `length`, never shorter — but the clamp is O(1) insurance).
+        if (length > result.Length) length = result.Length;
+        if (length > grad.Length) length = grad.Length;
+        if (length > tanh.Length) length = tanh.Length;
         int i = 0;
 #if NET5_0_OR_GREATER
         if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && length >= 32)

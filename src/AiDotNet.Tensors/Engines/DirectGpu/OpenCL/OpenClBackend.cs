@@ -8332,7 +8332,7 @@ KERNEL VARIANTS (A/B testing):
 
         public void ScaledDotProductAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
             IGpuBuffer output, IGpuBuffer? attentionWeights, IGpuBuffer? mask,
-            int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
+            int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal, float softcap = 0.0f)
         {
             if (batch <= 0 || numHeads <= 0 || seqQ <= 0 || seqK <= 0 || headDim <= 0)
                 throw new ArgumentOutOfRangeException(nameof(batch), "Attention dimensions must be positive.");
@@ -8364,6 +8364,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, isCausal ? 1 : 0);
             k.SetArg(arg++, maskMode);
             k.SetArg(arg++, attentionWeights != null ? 1 : 0);
+            k.SetArg(arg++, softcap);
 
             int rows = checked(batch * numHeads * seqQ);
             k.Execute1D(rows, Math.Min(256, rows));

@@ -58,7 +58,8 @@ __kernel void scaled_dot_product_attention(
     const float scale,
     const int isCausal,
     const int maskMode,
-    const int storeWeights)
+    const int storeWeights,
+    const float softcap)
 {
     const int row = get_global_id(0);
     if (row >= batch * numHeads * seqQ) return;
@@ -71,6 +72,9 @@ __kernel void scaled_dot_product_attention(
     const int wOffset = row * seqK;
     const int maskOffset = (maskMode == 2 ? bh * seqQ * seqK : 0) + qi * seqK;
 
+    // Attention-logit soft-cap (Gemma-2): softcap * tanh((score*scale)/softcap); softcap<=0 disables.
+    #define ATTN_LOGIT(sc) (softcap > 0.0f ? softcap * tanh(((sc) * scale) / softcap) : (sc) * scale)
+
     // Compute attention scores and find max for numerical stability
     float maxScore = NEGATIVE_INFINITY;
     for (int ki = 0; ki < seqK; ki++) {
@@ -80,7 +84,7 @@ __kernel void scaled_dot_product_attention(
         for (int d = 0; d < headDim; d++) {
             score += query[qOffset + d] * key[kOffset + ki * headDim + d];
         }
-        score *= scale;
+        score = ATTN_LOGIT(score);
         maxScore = fmax(maxScore, score);
     }
 
@@ -92,7 +96,7 @@ __kernel void scaled_dot_product_attention(
         for (int d = 0; d < headDim; d++) {
             score += query[qOffset + d] * key[kOffset + ki * headDim + d];
         }
-        score *= scale;
+        score = ATTN_LOGIT(score);
 
         sumExp += exp(score - maxScore);
     }
@@ -106,7 +110,7 @@ __kernel void scaled_dot_product_attention(
                 for (int inner = 0; inner < headDim; inner++) {
                     score += query[qOffset + inner] * key[kOffset + ki * headDim + inner];
                 }
-                weight = exp(score * scale - maxScore) * invSum;
+                weight = exp(ATTN_LOGIT(score) - maxScore) * invSum;
             }
             attentionWeights[wOffset + ki] = weight;
         }
@@ -120,11 +124,12 @@ __kernel void scaled_dot_product_attention(
             for (int inner = 0; inner < headDim; inner++) {
                 score += query[qOffset + inner] * key[kOffset + ki * headDim + inner];
             }
-            float weight = exp(score * scale - maxScore) * invSum;
+            float weight = exp(ATTN_LOGIT(score) - maxScore) * invSum;
             val += weight * value[vOffset + ki * headDim + d];
         }
         output[qOffset + d] = val;
     }
+    #undef ATTN_LOGIT
 }
 
 // ===========================================================================

@@ -4184,13 +4184,17 @@ public interface IEngine
     /// <item><description>Combined: Element-wise AND of causal and padding masks</description></item>
     /// </list>
     /// </remarks>
+    /// <param name="softcap">Optional attention-logit soft-cap (Gemma-2): when &gt; 0, the scaled scores
+    /// are passed through <c>softcap · tanh(scores / softcap)</c> before the softmax, bounding them to
+    /// <c>(-softcap, softcap)</c>. 0 (the default) disables it.</param>
     Tensor<T> ScaledDotProductAttention<T>(
         Tensor<T> query,
         Tensor<T> key,
         Tensor<T> value,
         Tensor<bool>? mask,
         double? scale,
-        out Tensor<T> attentionWeights);
+        out Tensor<T> attentionWeights,
+        double softcap = 0.0);
 
     /// <summary>
     /// Fused multi-head attention forward (inference only): Q/K/V projection +
