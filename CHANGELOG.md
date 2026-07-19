@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.117.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.117.0...v0.117.1) (2026-07-19)
+
+
+### Bug Fixes
+
+* GPU [#226](https://github.com/ooples/AiDotNet.Tensors/issues/226) concurrency crash and a chain of pre-existing DirectGpu bugs ([#818](https://github.com/ooples/AiDotNet.Tensors/issues/818)) ([4af7ba8](https://github.com/ooples/AiDotNet.Tensors/commit/4af7ba83ed755be90ad9b8017713a417366dc1e0))
+
 ## [0.117.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.116.0...v0.117.0) (2026-07-19)
 
 
