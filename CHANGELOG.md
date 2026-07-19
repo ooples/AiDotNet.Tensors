@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.117.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.116.0...v0.117.0) (2026-07-19)
+
+
+### Features
+
+* **attention:** optional logit soft-cap on ScaledDotProductAttention (CPU + all 6 GPU backends) ([#816](https://github.com/ooples/AiDotNet.Tensors/issues/816)) ([ddccf57](https://github.com/ooples/AiDotNet.Tensors/commit/ddccf57207c9000ad51399fbedbd4d6f81e27bc9))
+* batch-vectorized float FFT + CUDA/HIP FFT correctness fixes ([#811](https://github.com/ooples/AiDotNet.Tensors/issues/811)) ([#812](https://github.com/ooples/AiDotNet.Tensors/issues/812)) ([77320ef](https://github.com/ooples/AiDotNet.Tensors/commit/77320ef07cf4ccf5f51115651cb2ec8c7345f2b1))
+
+
+### Bug Fixes
+
+* **cpu:** bound Tanh/Sigmoid SIMD backward by logical length (fixes OOB write / AccessViolation) ([#815](https://github.com/ooples/AiDotNet.Tensors/issues/815)) ([8daadc1](https://github.com/ooples/AiDotNet.Tensors/commit/8daadc1bd808bc48579cdf8416d69b346a970aba))
+
 ## [0.116.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.115.1...v0.116.0) (2026-07-18)
 
 
