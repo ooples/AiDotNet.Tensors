@@ -26,7 +26,8 @@ env:
 
 jobs:
   build:
-    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
+    # Runs on release-please PRs too (a version-bump PR is build-safe) so the required
+    # `build` status is satisfied and the release PR merges without an admin override.
     runs-on: ubuntu-latest
 
     steps:
@@ -240,7 +241,7 @@ jobs:
   # and assert bit-exactness, after which MachineKernelGemm.EnableAvx512 can be
   # flipped on by default.
   avx512-verify:
-    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
+    # Runs on release-please PRs too so the required `avx512-verify` status is satisfied.
     runs-on: ${{ vars.AVX512_RUNNER || 'ubuntu-latest' }}
     steps:
     - uses: actions/checkout@v4

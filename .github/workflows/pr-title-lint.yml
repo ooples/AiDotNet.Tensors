@@ -21,8 +21,9 @@ jobs:
   lint-title:
     name: Validate PR title
     runs-on: ubuntu-latest
-    # release-please maintains its own PRs; don't lint those.
-    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
+    # Runs on release-please PRs too: their titles ("chore(main): release X") are already
+    # conventional, so the check passes and the required `Validate PR title` status is
+    # satisfied — letting the release PR merge without an admin override.
     steps:
       - name: Check conventional-commit format
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
