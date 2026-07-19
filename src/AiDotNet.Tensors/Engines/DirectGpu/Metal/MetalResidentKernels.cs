@@ -1113,10 +1113,10 @@ kernel void attention_forward_serial(
     device float* output [[buffer(3)]], device float* weights [[buffer(4)]], device const float* mask [[buffer(5)]],
     constant uint& batch [[buffer(6)]], constant uint& heads [[buffer(7)]], constant uint& queryLength [[buffer(8)]], constant uint& keyLength [[buffer(9)]],
     constant uint& dimension [[buffer(10)]], constant uint& scaleBits [[buffer(11)]], constant uint& causal [[buffer(12)]],
-    constant uint& hasWeights [[buffer(13)]], constant uint& maskMode [[buffer(14)]],
+    constant uint& hasWeights [[buffer(13)]], constant uint& maskMode [[buffer(14)]], constant uint& softcapBits [[buffer(15)]],
     uint gid [[thread_position_in_grid]])
 {
-    if (gid != 0u) return; float scale = as_type<float>(scaleBits);
+    if (gid != 0u) return; float scale = as_type<float>(scaleBits); float softcap = as_type<float>(softcapBits);
     for (uint b = 0; b < batch; ++b) for (uint h = 0; h < heads; ++h) {
         uint queryOffset = (b * heads + h) * queryLength * dimension;
         uint keyOffset = (b * heads + h) * keyLength * dimension;
@@ -1124,11 +1124,11 @@ kernel void attention_forward_serial(
         uint maskOffset = (maskMode == 2u ? (b * heads + h) * queryLength * keyLength : 0u);
         for (uint i = 0; i < queryLength; ++i) {
             float maximum = -INFINITY;
-            for (uint j = 0; j < keyLength; ++j) { float score = resident_attention_dot(query, key, queryOffset + i * dimension, keyOffset + j * dimension, dimension) * scale; if ((causal != 0u && j > i) || (maskMode != 0u && mask[maskOffset + i * keyLength + j] == 0.0f)) score = -INFINITY; maximum = max(maximum, score); }
+            for (uint j = 0; j < keyLength; ++j) { float score = resident_attention_dot(query, key, queryOffset + i * dimension, keyOffset + j * dimension, dimension) * scale; if (softcap > 0.0f) score = softcap * tanh(score / softcap); if ((causal != 0u && j > i) || (maskMode != 0u && mask[maskOffset + i * keyLength + j] == 0.0f)) score = -INFINITY; maximum = max(maximum, score); }
             float sumExp = 0.0f;
-            for (uint j = 0; j < keyLength; ++j) { float score = resident_attention_dot(query, key, queryOffset + i * dimension, keyOffset + j * dimension, dimension) * scale; if ((causal != 0u && j > i) || (maskMode != 0u && mask[maskOffset + i * keyLength + j] == 0.0f)) score = -INFINITY; sumExp += exp(score - maximum); }
-            for (uint j = 0; j < keyLength; ++j) { float score = resident_attention_dot(query, key, queryOffset + i * dimension, keyOffset + j * dimension, dimension) * scale; if ((causal != 0u && j > i) || (maskMode != 0u && mask[maskOffset + i * keyLength + j] == 0.0f)) score = -INFINITY; float weight = sumExp > 0.0f ? exp(score - maximum) / sumExp : 0.0f; if (hasWeights != 0u) weights[weightOffset + i * keyLength + j] = weight; }
-            for (uint d = 0; d < dimension; ++d) { float sum = 0.0f; for (uint j = 0; j < keyLength; ++j) { float score = resident_attention_dot(query, key, queryOffset + i * dimension, keyOffset + j * dimension, dimension) * scale; if ((causal != 0u && j > i) || (maskMode != 0u && mask[maskOffset + i * keyLength + j] == 0.0f)) score = -INFINITY; sum += (sumExp > 0.0f ? exp(score - maximum) / sumExp : 0.0f) * value[keyOffset + j * dimension + d]; } output[queryOffset + i * dimension + d] = sum; }
+            for (uint j = 0; j < keyLength; ++j) { float score = resident_attention_dot(query, key, queryOffset + i * dimension, keyOffset + j * dimension, dimension) * scale; if (softcap > 0.0f) score = softcap * tanh(score / softcap); if ((causal != 0u && j > i) || (maskMode != 0u && mask[maskOffset + i * keyLength + j] == 0.0f)) score = -INFINITY; sumExp += exp(score - maximum); }
+            for (uint j = 0; j < keyLength; ++j) { float score = resident_attention_dot(query, key, queryOffset + i * dimension, keyOffset + j * dimension, dimension) * scale; if (softcap > 0.0f) score = softcap * tanh(score / softcap); if ((causal != 0u && j > i) || (maskMode != 0u && mask[maskOffset + i * keyLength + j] == 0.0f)) score = -INFINITY; float weight = sumExp > 0.0f ? exp(score - maximum) / sumExp : 0.0f; if (hasWeights != 0u) weights[weightOffset + i * keyLength + j] = weight; }
+            for (uint d = 0; d < dimension; ++d) { float sum = 0.0f; for (uint j = 0; j < keyLength; ++j) { float score = resident_attention_dot(query, key, queryOffset + i * dimension, keyOffset + j * dimension, dimension) * scale; if (softcap > 0.0f) score = softcap * tanh(score / softcap); if ((causal != 0u && j > i) || (maskMode != 0u && mask[maskOffset + i * keyLength + j] == 0.0f)) score = -INFINITY; sum += (sumExp > 0.0f ? exp(score - maximum) / sumExp : 0.0f) * value[keyOffset + j * dimension + d]; } output[queryOffset + i * dimension + d] = sum; }
         }
     }
 }

@@ -682,7 +682,7 @@ public class RecordingGpuBackend : DelegatingGpuBackend
     /// <inheritdoc/>
     public override void ScaledDotProductAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer? attentionWeights, IGpuBuffer? mask,
-        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal, float softcap = 0.0f)
     {
         var inputs = new List<IGpuBuffer> { query, key, value };
         if (mask != null) inputs.Add(mask);
@@ -695,7 +695,7 @@ public class RecordingGpuBackend : DelegatingGpuBackend
             inputs.ToArray(),
             outputs.ToArray(),
             () => Inner.ScaledDotProductAttention(query, key, value, output, attentionWeights, mask,
-                batch, numHeads, seqQ, seqK, headDim, scale, isCausal),
+                batch, numHeads, seqQ, seqK, headDim, scale, isCausal, softcap),
             new Dictionary<string, object>
             {
                 ["batch"] = batch,
@@ -704,7 +704,8 @@ public class RecordingGpuBackend : DelegatingGpuBackend
                 ["seqK"] = seqK,
                 ["headDim"] = headDim,
                 ["scale"] = scale,
-                ["isCausal"] = isCausal
+                ["isCausal"] = isCausal,
+                ["softcap"] = softcap
             });
     }
 

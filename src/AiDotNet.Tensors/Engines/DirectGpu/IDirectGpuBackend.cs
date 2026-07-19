@@ -1412,9 +1412,11 @@ public interface IDirectGpuBackend : IDisposable
 
     #region Attention Operations
 
+    /// <param name="softcap">Optional attention-logit soft-cap (Gemma-2): when &gt; 0, each scaled score
+    /// is passed through <c>softcap · tanh(score / softcap)</c> before the softmax. 0 disables it.</param>
     void ScaledDotProductAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer? attentionWeights, IGpuBuffer? mask,
-        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal);
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal, float softcap = 0.0f);
 
     void ScaledDotProductAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer attentionWeights, IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
