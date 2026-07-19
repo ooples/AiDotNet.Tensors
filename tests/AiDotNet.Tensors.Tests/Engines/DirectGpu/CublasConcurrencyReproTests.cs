@@ -102,8 +102,10 @@ public class CublasConcurrencyReproTests : IDisposable
             }
         });
 
+        // Take up to the first 5 (System.Linq.Take, not the range-slice `[..N]` which needs
+        // RuntimeHelpers.GetSubArray — unavailable on net471).
         Assert.True(failures.IsEmpty,
             $"{failures.Count} concurrent-GEMM failures (first few):\n" +
-            string.Join("\n", failures.ToArray()[..Math.Min(5, failures.Count)]));
+            string.Join("\n", System.Linq.Enumerable.Take(failures, 5)));
     }
 }
