@@ -40321,7 +40321,10 @@ public partial class CpuEngine : ITensorLevelEngine
 #else
             var resultArr = new float[length];
 #endif
-            SigmoidBackwardFloat(gF, oF, resultArr);
+            // Bound by the LOGICAL length — gF/oF can be pool-over-allocated (longer than the tensor's
+            // logical Length) while resultArr is sized to `length`; iterating to grad.Length would write
+            // past resultArr (unchecked AVX store -> AccessViolation). See TanhBackward for the mechanism.
+            SigmoidBackwardFloat(gF, oF, resultArr, length);
             return (Tensor<T>)(object)TensorAllocator.Rent<T>(gradOutput._shape, (Vector<T>)(object)Vector<float>.FromMemory(resultArr));
         }
 
@@ -40353,9 +40356,13 @@ public partial class CpuEngine : ITensorLevelEngine
         return TensorAllocator.Rent<T>(gradOutput._shape, result);
     }
 
-    private static unsafe void SigmoidBackwardFloat(float[] grad, float[] sigmoid, float[] result)
+    private static unsafe void SigmoidBackwardFloat(float[] grad, float[] sigmoid, float[] result, int length)
     {
-        int length = grad.Length;
+        // Clamp to the shortest array — grad/sigmoid may be pool-over-allocated (longer than `length`);
+        // result is sized to the logical length. Never read/write past any buffer.
+        if (length > result.Length) length = result.Length;
+        if (length > grad.Length) length = grad.Length;
+        if (length > sigmoid.Length) length = sigmoid.Length;
         int i = 0;
 #if NET5_0_OR_GREATER
         if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && length >= 32)
@@ -40409,7 +40416,12 @@ public partial class CpuEngine : ITensorLevelEngine
 #else
             var resultArr = new float[length];
 #endif
-            TanhBackwardFloat(gF, oF, resultArr);
+            // Bound by the LOGICAL length: gF/oF come from GetFlattenedData/GetDataArray, which
+            // can hand back a pool-OVER-ALLOCATED backing array (physically longer than the tensor's
+            // logical Length — see VectorBase.GetDataArray returning the full segment.Array at offset 0).
+            // resultArr is sized to `length`, so iterating to grad.Length would write past it (the
+            // AVX store has no bounds check -> AccessViolation). Pass the logical length explicitly.
+            TanhBackwardFloat(gF, oF, resultArr, length);
             return (Tensor<T>)(object)TensorAllocator.Rent<T>(gradOutput._shape, (Vector<T>)(object)Vector<float>.FromMemory(resultArr));
         }
 
@@ -40441,9 +40453,14 @@ public partial class CpuEngine : ITensorLevelEngine
         return TensorAllocator.Rent<T>(gradOutput._shape, result);
     }
 
-    private static unsafe void TanhBackwardFloat(float[] grad, float[] tanh, float[] result)
+    private static unsafe void TanhBackwardFloat(float[] grad, float[] tanh, float[] result, int length)
     {
-        int length = grad.Length;
+        // Clamp to the shortest array so no read/write can exceed any buffer, even if a caller
+        // passes a `length` larger than one of the arrays (over-allocated pool backings mean
+        // grad/tanh may be LONGER than `length`, never shorter — but the clamp is O(1) insurance).
+        if (length > result.Length) length = result.Length;
+        if (length > grad.Length) length = grad.Length;
+        if (length > tanh.Length) length = tanh.Length;
         int i = 0;
 #if NET5_0_OR_GREATER
         if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && length >= 32)
