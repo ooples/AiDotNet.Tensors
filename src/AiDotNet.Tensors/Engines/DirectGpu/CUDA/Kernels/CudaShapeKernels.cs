@@ -181,6 +181,23 @@ extern ""C"" __global__ __launch_bounds__(256) void tile_last_axis(
     output[idx] = input[outer * innerSize + (inner % innerSize)];
 }
 
+// Tile (repeat) a MIDDLE axis: output[outer, axis*repeats, inner] = input[outer, axis, inner].
+// Port of the OpenCL/Metal tile_axis kernel — CUDA was missing it, so TensorBroadcastTo of a
+// resident tensor fell back to a CPU readback (op-parity: GraphAttention internal-readback test).
+extern ""C"" __global__ __launch_bounds__(256) void tile_axis(
+    const float* __restrict__ input, float* __restrict__ output,
+    int outerSize, int axisSize, int innerSize, int repeats)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int expandedAxis = axisSize * repeats;
+    if (idx >= outerSize * expandedAxis * innerSize) return;
+    int inner = idx % innerSize;
+    int expandedIndex = (idx / innerSize) % expandedAxis;
+    int outer = idx / (expandedAxis * innerSize);
+    int axis = expandedIndex / repeats;
+    output[idx] = input[(outer * axisSize + axis) * innerSize + inner];
+}
+
 extern ""C"" __global__ __launch_bounds__(256) void repeat_elements(
     const float* __restrict__ input, float* __restrict__ output,
     int outerSize, int innerSize, int repeats)
@@ -461,6 +478,7 @@ extern ""C"" __global__ __launch_bounds__(256) void index_select(
             "pad_2d",
             "pad_2d_backward",
             "tile_last_axis",
+            "tile_axis",
             "repeat_elements",
             "pixel_shuffle",
             "pixel_shuffle_backward",

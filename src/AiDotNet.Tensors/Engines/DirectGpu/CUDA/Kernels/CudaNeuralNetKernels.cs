@@ -825,6 +825,24 @@ extern ""C"" __global__ __launch_bounds__(256) void argmin_axis(
     indices[outer] = (float)minIdx;
 }
 
+// Reduce-max along the innermost (contiguous) axis: output[outer] = max over the axisSize block.
+// Mirrors argmax_axis but emits the max VALUE (not its index). Consumers: GumbelSoftmax / softmax-max
+// subtraction, MelSpectrogram log-floor normalization, BinCount range sizing.
+extern ""C"" __global__ __launch_bounds__(256) void max_axis(
+    const float* input, float* output, int outerSize, int axisSize)
+{
+    int outer = blockIdx.x * blockDim.x + threadIdx.x;
+    if (outer >= outerSize) return;
+
+    int baseIdx = outer * axisSize;
+    float maxVal = input[baseIdx];
+    for (int i = 1; i < axisSize; i++) {
+        float val = input[baseIdx + i];
+        if (val > maxVal) maxVal = val;
+    }
+    output[outer] = maxVal;
+}
+
 // ===========================================================================
 // OPTIMIZER KERNELS
 // ===========================================================================
@@ -2725,6 +2743,7 @@ extern ""C"" __global__ __launch_bounds__(256) void adaptive_avgpool_backward(
                 "compute_mean_var",
                 "argmax_axis",
                 "argmin_axis",
+                "max_axis",
                 // Optimizers
                 "sgd_step",
                 "adam_step",
