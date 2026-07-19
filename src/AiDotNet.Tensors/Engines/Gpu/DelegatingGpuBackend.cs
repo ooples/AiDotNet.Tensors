@@ -873,9 +873,9 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     /// <inheritdoc/>
     public virtual void ScaledDotProductAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer? attentionWeights, IGpuBuffer? mask,
-        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal, float softcap = 0.0f)
         => Inner.ScaledDotProductAttention(query, key, value, output, attentionWeights, mask,
-            batch, numHeads, seqQ, seqK, headDim, scale, isCausal);
+            batch, numHeads, seqQ, seqK, headDim, scale, isCausal, softcap);
 
     /// <inheritdoc/>
     public virtual void ScaledDotProductAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,

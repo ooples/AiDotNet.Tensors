@@ -5362,9 +5362,9 @@ public partial class DirectGpuTensorEngine
         Tensor<bool>? mask, double? scale, out Tensor<T> attentionWeights, double softcap)
     {
         // GPU SDPA kernel: [batch, numHeads, seqQ/seqK, headDim]. Tape/graph,
-        // non-float, unequal Q/K/V feature depths, or an attention-logit soft-cap (Gemma-2, GPU kernel
-        // has no softcap) defer to the base (CPU) implementation, which applies the softcap.
-        if (softcap > 0.0 || IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        // non-float, or unequal Q/K/V feature depths defer to the base (CPU) implementation. The
+        // attention-logit soft-cap (Gemma-2) is threaded into every backend kernel below.
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || query.Rank != 4 || key.Rank != 4 || value.Rank != 4 || !TryGetBackend(out var backend))
             return base.ScaledDotProductAttention(query, key, value, mask, scale, out attentionWeights, softcap);
         try
@@ -5388,7 +5388,7 @@ public partial class DirectGpuTensorEngine
             using var outB = AllocateOutputBuffer(backend, outLen);
             using var awB = AllocateOutputBuffer(backend, awLen);
             backend.ScaledDotProductAttention(qB.Buffer, kB.Buffer, vB.Buffer, outB.Buffer, awB.Buffer, maskB?.Buffer,
-                batch, numHeads, seqQ, seqK, headDim, sc, false);
+                batch, numHeads, seqQ, seqK, headDim, sc, false, (float)softcap);
             var result = DeferTensorResult<T>(backend, outB.Buffer, outLen,
                 new[] { batch, numHeads, seqQ, headDim });
             attentionWeights = DeferTensorResult<T>(backend, awB.Buffer, awLen,

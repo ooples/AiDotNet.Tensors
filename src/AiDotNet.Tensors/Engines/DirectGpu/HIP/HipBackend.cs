@@ -6087,7 +6087,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void ScaledDotProductAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer? attentionWeights, IGpuBuffer? mask,
-        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal, float softcap = 0.0f)
     {
         if (batch <= 0 || numHeads <= 0 || seqQ <= 0 || seqK <= 0 || headDim <= 0)
             throw new ArgumentOutOfRangeException(nameof(batch), "Attention dimensions must be positive.");
@@ -6113,7 +6113,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int causalFlag = isCausal ? 1 : 0;
         int maskMode = mask is null ? 0 : mask.Size >= weightsSize ? 2 : 1;
         int storeWeights = attentionWeights is null ? 0 : 1;
-        void** args = stackalloc void*[15];
+        void** args = stackalloc void*[16];
         args[0] = &queryPtr;
         args[1] = &keyPtr;
         args[2] = &valuePtr;
@@ -6129,6 +6129,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         args[12] = &causalFlag;
         args[13] = &maskMode;
         args[14] = &storeWeights;
+        args[15] = &softcap;
 
         int rows = checked(batch * numHeads * seqQ);
         uint grid = (uint)((rows + DefaultBlockSize - 1) / DefaultBlockSize);
