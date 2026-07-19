@@ -32,7 +32,7 @@ public class ChunkerWithMockBackendTests
         // to the whole input.
         var state = new MockBackendState { MaxBufferAllocBytes = 16 };
         var backend = MockDirectGpuBackend.Create(state);
-        var engine = new DirectGpuTensorEngine(); // backend not used for chunker — we pass mock directly
+        using var engine = new DirectGpuTensorEngine(); // backend not used for chunker — we pass mock directly
 
         var input = new Tensor<float>(new float[] { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }, new[] { 12 });
         var ex = new GpuBufferTooLargeException("Mock", requestedBytes: 48, deviceMaxAllocBytes: 16, deviceName: "MockDevice");
@@ -74,7 +74,7 @@ public class ChunkerWithMockBackendTests
         // marker is NOT suppressed.
         var state = new MockBackendState { MaxBufferAllocBytes = 16 };
         var backend = MockDirectGpuBackend.Create(state);
-        var engine = new DirectGpuTensorEngine();
+        using var engine = new DirectGpuTensorEngine();
 
         var input = new Tensor<float>(new float[] { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }, new[] { 12 });
         var ex = new GpuBufferTooLargeException("Mock", requestedBytes: 48, deviceMaxAllocBytes: 16, deviceName: "MockDevice");
@@ -110,7 +110,7 @@ public class ChunkerWithMockBackendTests
         // EffectiveMaxChunkCount = 4 → chunker bails to CPU.
         var state = new MockBackendState { MaxBufferAllocBytes = 4 };
         var backend = MockDirectGpuBackend.Create(state);
-        var engine = new DirectGpuTensorEngine();
+        using var engine = new DirectGpuTensorEngine();
 
         var input = new Tensor<float>(new float[100], new[] { 100 });
         var ex = new GpuBufferTooLargeException("Mock", 400, 4, "MockDevice");
@@ -142,7 +142,7 @@ public class ChunkerWithMockBackendTests
         // 1-element tensors can't be chunked — bail to CPU silently.
         var state = new MockBackendState { MaxBufferAllocBytes = 4 };
         var backend = MockDirectGpuBackend.Create(state);
-        var engine = new DirectGpuTensorEngine();
+        using var engine = new DirectGpuTensorEngine();
 
         var input = new Tensor<float>(new float[] { 42 }, new[] { 1 });
         var ex = new GpuBufferTooLargeException("Mock", 4, 4, "MockDevice");
@@ -163,7 +163,7 @@ public class ChunkerWithMockBackendTests
         // retry chunking; bail to CPU silently.
         var state = new MockBackendState { MaxBufferAllocBytes = 3 };
         var backend = MockDirectGpuBackend.Create(state);
-        var engine = new DirectGpuTensorEngine();
+        using var engine = new DirectGpuTensorEngine();
 
         var input = new Tensor<float>(new float[] { 1, 2, 3, 4 }, new[] { 4 });
         var ex = new GpuBufferTooLargeException("Mock", 16, 3, "MockDevice");
@@ -184,7 +184,7 @@ public class ChunkerWithMockBackendTests
         // make a sizing decision and bails.
         var state = new MockBackendState { MaxBufferAllocBytes = 0 };
         var backend = MockDirectGpuBackend.Create(state);
-        var engine = new DirectGpuTensorEngine();
+        using var engine = new DirectGpuTensorEngine();
 
         var input = new Tensor<float>(new float[] { 1, 2, 3, 4 }, new[] { 4 });
         var ex = new GpuBufferTooLargeException("Mock", 16, 0, "MockDevice");
@@ -209,7 +209,7 @@ public class ChunkerWithMockBackendTests
         // 2 chunks. Op: c = a + b.
         var state = new MockBackendState { MaxBufferAllocBytes = 16 };
         var backend = MockDirectGpuBackend.Create(state);
-        var engine = new DirectGpuTensorEngine();
+        using var engine = new DirectGpuTensorEngine();
 
         var left = new Tensor<float>(new float[] { 1, 2, 3, 4, 5, 6, 7, 8 }, new[] { 8 });
         var right = new Tensor<float>(new float[] { 10, 20, 30, 40, 50, 60, 70, 80 }, new[] { 8 });
@@ -242,7 +242,7 @@ public class ChunkerWithMockBackendTests
     {
         var state = new MockBackendState { MaxBufferAllocBytes = 4 };
         var backend = MockDirectGpuBackend.Create(state);
-        var engine = new DirectGpuTensorEngine();
+        using var engine = new DirectGpuTensorEngine();
 
         var left = new Tensor<float>(new float[100], new[] { 100 });
         var right = new Tensor<float>(new float[100], new[] { 100 });
@@ -279,7 +279,7 @@ public class ChunkerWithMockBackendTests
         // returns null + emits a cpu_fallback_chunk_dispatch_error event.
         var state = new MockBackendState { MaxBufferAllocBytes = 16 };
         var backend = MockDirectGpuBackend.Create(state);
-        var engine = new DirectGpuTensorEngine();
+        using var engine = new DirectGpuTensorEngine();
 
         var input = new Tensor<float>(new float[] { 1, 2, 3, 4, 5, 6, 7, 8 }, new[] { 8 });
         var ex = new GpuBufferTooLargeException("Mock", 32, 16, "MockDevice");
@@ -306,7 +306,7 @@ public class ChunkerWithMockBackendTests
     {
         var state = new MockBackendState { MaxBufferAllocBytes = 16 };
         var backend = MockDirectGpuBackend.Create(state);
-        var engine = new DirectGpuTensorEngine();
+        using var engine = new DirectGpuTensorEngine();
 
         var left = new Tensor<float>(new float[] { 1, 2, 3, 4, 5, 6, 7, 8 }, new[] { 8 });
         var right = new Tensor<float>(new float[] { 10, 20, 30, 40, 50, 60, 70, 80 }, new[] { 8 });
@@ -338,7 +338,7 @@ public class ChunkerWithMockBackendTests
         // (swallow → CPU).
         var state = new MockBackendState { MaxBufferAllocBytes = 16 };
         var backend = MockDirectGpuBackend.Create(state);
-        var engine = new DirectGpuTensorEngine();
+        using var engine = new DirectGpuTensorEngine();
 
         var input = new Tensor<float>(new float[] { 1, 2, 3, 4, 5, 6, 7, 8 }, new[] { 8 });
         var ex = new GpuBufferTooLargeException("Mock", 32, 16, "MockDevice");
@@ -361,7 +361,7 @@ public class ChunkerWithMockBackendTests
     {
         var state = new MockBackendState { MaxBufferAllocBytes = 4 };
         var backend = MockDirectGpuBackend.Create(state);
-        var engine = new DirectGpuTensorEngine();
+        using var engine = new DirectGpuTensorEngine();
 
         var left = new Tensor<float>(new float[] { 1 }, new[] { 1 });
         var right = new Tensor<float>(new float[] { 2 }, new[] { 1 });
@@ -396,7 +396,7 @@ public class ChunkerWithMockBackendTests
     {
         var state = new MockBackendState { MaxBufferAllocBytes = 16 };
         var backend = MockDirectGpuBackend.Create(state);
-        var engine = new DirectGpuTensorEngine();
+        using var engine = new DirectGpuTensorEngine();
 
         var input = new Tensor<float>(new float[] { 1, 2, 3, 4, 5, 6, 7, 8 }, new[] { 8 });
         var ex = new GpuBufferTooLargeException("Mock", 32, 16, "MockDevice");
@@ -430,7 +430,7 @@ public class ChunkerWithMockBackendTests
     {
         var state = new MockBackendState { MaxBufferAllocBytes = 16 };
         var backend = MockDirectGpuBackend.Create(state);
-        var engine = new DirectGpuTensorEngine();
+        using var engine = new DirectGpuTensorEngine();
 
         var input = new Tensor<float>(new float[] { 1, 2, 3, 4, 5, 6, 7, 8 }, new[] { 8 });
         var ex = new GpuBufferTooLargeException("Mock", 32, 16, "MockDevice");
@@ -460,7 +460,7 @@ public class ChunkerWithMockBackendTests
     {
         var state = new MockBackendState { MaxBufferAllocBytes = 16 };
         var backend = MockDirectGpuBackend.Create(state);
-        var engine = new DirectGpuTensorEngine();
+        using var engine = new DirectGpuTensorEngine();
 
         var left = new Tensor<float>(new float[] { 1, 2, 3, 4, 5, 6, 7, 8 }, new[] { 8 });
         var right = new Tensor<float>(new float[] { 10, 20, 30, 40, 50, 60, 70, 80 }, new[] { 8 });

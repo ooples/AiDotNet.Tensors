@@ -4967,13 +4967,13 @@ public partial class DirectGpuTensorEngine
         if (B == 0 || S == 0)
             return base.LstmSequenceForward(input, h0, c0, wIh, wHh, bIh, bHh, returnSequences);
 
-        // Engine weights/bias/gates (PyTorch i,f,g,o; [4*hidden, *]) match the kernel exactly. Only the
-        // sequence layout differs: the kernel wants [seq, batch, *], the engine uses [batch, seq, *], so
-        // transpose in and (for returnSequences) out.
+        // Engine weights/bias/gates (PyTorch i,f,g,o; [4*hidden, *]) match the kernel exactly. The kernel
+        // ALSO reads input and writes output in [batch, seq, *] order (inputOffset/output use
+        // (b*timeSteps+t)), which is the engine's native layout — so NO sequence transpose is needed. The
+        // previous [B,S]->[S,B] permute (in AND out) corrupted results whenever batch != seq.
         var inBSI = input.IsContiguous ? input : (Tensor<T>)input.Contiguous();
-        var inSBI = PermuteResidentGpu(backend, inBSI, new[] { 1, 0, 2 });   // [S, B, In]
 
-        using var bufInput = GetOrAllocateBuffer(backend, inSBI);
+        using var bufInput = GetOrAllocateBuffer(backend, inBSI);
         using var bufWih = GetOrAllocateBuffer(backend, wIh);
         using var bufWhh = GetOrAllocateBuffer(backend, wHh);
         using var bufH0 = h0 is null
@@ -5012,9 +5012,11 @@ public partial class DirectGpuTensorEngine
 
             if (returnSequences)
             {
-                var outSBH = DeferTensorResult<T>(backend, bufOut, S * B * Hd, new[] { S, B, Hd });
+                // Kernel wrote output b-major [B, S, Hd] (output[(b*timeSteps+t)*hidden + h_idx]) — return
+                // it directly, no permute.
+                var outBSH = DeferTensorResult<T>(backend, bufOut, S * B * Hd, new[] { B, S, Hd });
                 sequenceHandedOff = true;
-                return PermuteResidentGpu(backend, outSBH, new[] { 1, 0, 2 });   // [B, S, Hd]
+                return outBSH;
             }
 
             var result = DeferTensorResult<T>(backend, bufHf, B * Hd, new[] { B, Hd });

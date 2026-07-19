@@ -440,12 +440,14 @@ extern ""C"" __global__ __launch_bounds__(256) void threshold_backward(const flo
 // ===========================================================================
 // Reciprocal backward: d(1/x)/dx = -1/x^2
 // ===========================================================================
-extern ""C"" __global__ __launch_bounds__(256) void reciprocal_backward(const float* __restrict__ gradOutput, const float* __restrict__ input, float* __restrict__ gradInput, int size)
+extern ""C"" __global__ __launch_bounds__(256) void reciprocal_backward(const float* __restrict__ gradOutput, const float* __restrict__ output, float* __restrict__ gradInput, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    float x = input[idx];
-    gradInput[idx] = -gradOutput[idx] / (x * x);
+    // Second arg is the reciprocal OUTPUT y = 1/x (see ReciprocalBackward signature), so
+    // d/dx(1/x) = -1/x^2 = -y^2. Must MULTIPLY by y*y, not divide (matches CpuEngine.ReciprocalBackward).
+    float y = output[idx];
+    gradInput[idx] = -gradOutput[idx] * (y * y);
 }
 
 // ===========================================================================

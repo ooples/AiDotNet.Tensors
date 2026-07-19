@@ -270,6 +270,24 @@ public static class CuBlasNative
     public static extern CudaResult cuCtxDestroy(IntPtr context);
 
     /// <summary>
+    /// Retains the device's PRIMARY context, creating it on first retain and bumping a refcount otherwise.
+    /// Unlike cuCtxCreate this does NOT reserve a fresh per-caller context (~200 MB); every retainer shares
+    /// the one primary context, so it is the memory-efficient way for a secondary consumer (e.g. the offload
+    /// allocator) to get a usable context without proliferating device memory. Balance with
+    /// cuDevicePrimaryCtxRelease. The returned context is NOT pushed onto the calling thread.
+    /// </summary>
+    [DllImport(CudaLibrary, EntryPoint = "cuDevicePrimaryCtxRetain")]
+    public static extern CudaResult cuDevicePrimaryCtxRetain(out IntPtr context, int device);
+
+    /// <summary>
+    /// Releases one reference to the device's primary context (obtained via cuDevicePrimaryCtxRetain). The
+    /// primary context is destroyed only when its retain count reaches zero, so this NEVER tears down a
+    /// context another consumer still holds — the counterpart to cuCtxDestroy for the retain/release model.
+    /// </summary>
+    [DllImport(CudaLibrary, EntryPoint = "cuDevicePrimaryCtxRelease_v2")]
+    public static extern CudaResult cuDevicePrimaryCtxRelease(int device);
+
+    /// <summary>
     /// Pushes a context on the current CPU thread's stack.
     /// </summary>
     [DllImport(CudaLibrary, EntryPoint = "cuCtxPushCurrent_v2")]

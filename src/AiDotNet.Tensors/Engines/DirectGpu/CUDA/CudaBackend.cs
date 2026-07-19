@@ -34,6 +34,15 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     // cuCtxCreate, removed immediately before cuCtxDestroy.
     internal static readonly ConcurrentDictionary<IntPtr, byte> LiveContexts = new();
 
+    // #226 crash fix: live async-free streams. A buffer finalizer defers its free as (ptr, ctx, stream) and
+    // DrainPendingFinalizerFrees replays it later; if the owning engine tore its stream down in between,
+    // cuMemFreeAsync on that dead stream is an uncatchable 0xC0000005. The drain uses cuMemFreeAsync only
+    // while the stream is still registered here (the common case — a buffer finalized during a live engine,
+    // so the free stays stream-ordered), and falls back to a synchronous cuMemFree once the stream is gone
+    // (teardown only). Registered at cuStreamCreate, removed atomically with cuStreamDestroy under
+    // ContextLifecycleLock, so the drain's {check + free} and dispose's {remove + destroy} never interleave.
+    internal static readonly ConcurrentDictionary<IntPtr, byte> LiveStreams = new();
+
     // Serializes a buffer's native free against its context's destruction. The LiveContexts check
     // alone is a TOCTOU race: a GC-thread buffer finalizer can observe its context as live, then a
     // concurrent engine Dispose removes + cuCtxDestroys it, and the finalizer's cuCtxPushCurrent /
@@ -42,6 +51,19 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     // the two mutually exclusive: a buffer either frees before the destroy or is skipped after it.
     internal static readonly object ContextLifecycleLock = new();
 
+    // #226 concurrency fix: the whole CUDA backend is a single-context resource — one shared _stream, one
+    // _cublasHandle, one stream-ordered async mem pool, shared cuDNN/cuBLASLt handles, shared launch state.
+    // That is correct single-threaded but corrupts when N threads (the honest-eval research sweep runs ~12
+    // model trainings in Parallel.For) enqueue kernels/gemm/memcpy/alloc/free concurrently on that shared
+    // state -> host-side race -> use-after-free -> sticky CUDA 700 (surfaced as "buffer released before
+    // materialization"). This re-entrant lock SERIALIZES the host-side native dispatch so those shared handles
+    // are never touched by two threads at once; the GPU work itself is already serialized by the single stream.
+    // DEADLOCK-SAFE INVARIANT: this is always the INNERMOST lock — acquired only around leaf native calls that
+    // never acquire another managed lock while holding it. Paths that hold ContextLifecycleLock/_deferredFreeLock
+    // then take this lock are fine (consistent order: other-lock -> GpuDispatchLock); nothing takes another lock
+    // while holding GpuDispatchLock, so no ordering cycle exists.
+    internal static readonly object GpuDispatchLock = new();
+
     private const int DefaultBlockSize = 256;
     private const int MaxRnnBlockSize = 1024;
     // FP16 (Half) element width in bytes — used to validate half-buffer sizes before launching FP16-native kernels.
@@ -49,7 +71,27 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private readonly ConcurrentDictionary<string, IntPtr> _kernelCache;
     private IntPtr _cudaContext;
     private IntPtr _stream;
-    private IntPtr _cublasHandle;
+
+    // #226 CONCURRENCY FIX — PER-THREAD cuBLAS HANDLE (instance-scoped).
+    // A cuBLAS handle is NOT thread-safe: NVIDIA requires one handle per host thread (the handle carries
+    // internal workspace + a bound stream + a math-mode; concurrent calls on ONE handle from N threads
+    // corrupt that state and fault with a sticky CUDA-700 illegal-address, later misreported at the
+    // deferred DtoH download as "#226 buffer released before materialization"). The research sweep trains
+    // ~12 models in parallel over this process-global engine, which is exactly that scenario. Each thread
+    // lazily creates its OWN handle bound to the shared _stream (so GEMMs still enqueue in stream order —
+    // correct results, pool stays stream-safe) with its own math-mode state.
+    //
+    // The store is a per-INSTANCE ThreadLocal — NOT a `[ThreadStatic]` static. A static would be keyed by
+    // thread alone and shared across every CudaBackend instance: the test suite creates many short-lived
+    // engines on shared thread-pool threads, so after one engine is disposed (its handles cublasDestroy'd),
+    // a pool thread would still hold that engine's now-dangling handle and the NEXT engine would reuse it →
+    // use-after-free → fatal host crash. ThreadLocal(trackAllValues:true) is scoped to THIS engine and lets
+    // Dispose() enumerate every thread's handle for cublasDestroy.
+    private sealed class ThreadCublas { public IntPtr Handle; public bool IsDeterministic; }
+    private ThreadLocal<ThreadCublas>? _threadCublas;
+    // The default fp32 GEMM math mode chosen at init (TF32 tensor-op on Ampere+, else PEDANTIC), captured
+    // so every per-thread handle applies the same mode on creation.
+    private int _initGemmMathMode;
 
     // Fused-epilogue matmul (matmul + bias + activation in ONE launch) via cuBLASLt. Lazily created.
     // Gated OFF by default: the mapping is correct-by-construction (see TryGemmBiasFusedEpilogue) but has
@@ -60,13 +102,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private readonly object _cublasLtInitLock = new(); // guards TryGetCuBlasLt lazy init against races
     private static readonly bool CuBlasLtFusedEnabled =
         Environment.GetEnvironmentVariable("AIDOTNET_CUBLASLT_FUSED") == "1";
-    // #742: the handle's default fp32 GEMM math mode chosen at init (TF32 tensor-op on Ampere+, else
-    // PEDANTIC). Under SetDeterministicMode(true) we switch the handle to PEDANTIC (true fp32, no
-    // tensor-core rounding) so backward GEMMs are reproducible on ANY GPU/driver; we restore the
-    // default when determinism is off. _gemmMathModeIsDeterministic tracks the current handle state
-    // so ApplyDeterministicGemmMathMode() only issues cublasSetMathMode on an actual transition.
-    private int _gemmDefaultMathMode;
-    private bool _gemmMathModeIsDeterministic;
+    // #742: under SetDeterministicMode(true) we switch each per-thread handle to PEDANTIC (true fp32, no
+    // tensor-core rounding) so backward GEMMs are reproducible on ANY GPU/driver, and restore the init
+    // default (_initGemmMathMode) when determinism is off. The current mode is tracked per-thread in
+    // ThreadCublas.IsDeterministic so ApplyDeterministicGemmMathMode() only issues cublasSetMathMode on an
+    // actual transition.
     // Stream-ordered allocator (#558 layer 6): when enabled, device buffers are allocated/freed via
     // cuMemAllocAsync/cuMemFreeAsync on _stream, so freed memory is reused in stream order without a host
     // sync (race-free + bounds mid-step peak). DEFAULT ON; opt out with AIDOTNET_CUDA_ASYNC_ALLOC=0
@@ -322,6 +362,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxCreate(out _cudaContext, 0, device), "cuCtxCreate");
             LiveContexts[_cudaContext] = 0; // register: a buffer finalizer may only free against a live context
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamCreate(out _stream, 0), "cuStreamCreate");
+            LiveStreams[_stream] = 0; // register: deferred finalizer frees stay stream-ordered while it's live
             _defaultStream = new CudaStream(this, _stream, GpuStreamType.Default, ownsHandle: false);
 
             // Stream-ordered allocator setup (#558 layer 6). Retain freed memory in the pool for reuse
@@ -391,8 +432,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 }
             }
 
-            CuBlasNative.CheckCublasStatus(CuBlasNative.cublasCreate(out _cublasHandle), "cublasCreate");
-            CuBlasNative.CheckCublasStatus(CuBlasNative.cublasSetStream(_cublasHandle, _stream), "cublasSetStream");
+            // #226: the cuBLAS handle is now PER-THREAD (see the _cublasHandle property). We no longer
+            // create a single shared handle here — each thread creates its own on first GEMM, bound to
+            // _stream, using the math mode computed just below (_initGemmMathMode).
 
             // Math mode dispatch:
             //   - Ampere+ (compute capability ≥ 8.0) + AllowTF32 = true:
@@ -428,11 +470,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             // failure here would make every subsequent fp32 GEMM run with
             // unspecified Tensor-Core behaviour (could be CUBLAS_DEFAULT_MATH,
             // strict fp32 with no acceleration; could be undefined).
-            CuBlasNative.CheckCublasStatus(
-                CuBlasNative.cublasSetMathMode(_cublasHandle, mathMode),
-                "cublasSetMathMode");
-            _gemmDefaultMathMode = mathMode;          // #742: remember for determinism toggling
-            _gemmMathModeIsDeterministic = false;     // handle currently in the default (fast) mode
+            // #226: math mode is applied per-thread when each handle is created (see CreateThreadCublas).
+            // Capture the chosen mode so every thread's handle uses the identical default, and create the
+            // per-thread handle store now (single-threaded here) so concurrent GEMMs never race on the field.
+            _initGemmMathMode = mathMode;             // #742: remember for determinism toggling (per-thread)
+            _threadCublas = new ThreadLocal<ThreadCublas>(CreateThreadCublas, trackAllValues: true);
 
             // Query clock rate for theoretical GFLOPS calculation
             if (CuBlasNative.cuDeviceGetAttribute(out int clockKHz, (int)CudaDeviceAttribute.ClockRate, device) == CudaResult.Success)
@@ -1106,10 +1148,15 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // Audio kernels (Issue #217 tail).
         try
         {
+            // useFastMath:false — audio_resample's 513-tap Hann filter uses cosf over [0,2π] where the
+            // fast intrinsics lose accuracy (~2% bias vs the CPU double-precision reference → PitchShift
+            // parity failure). Mirrors the parity210 STFT/ISTFT module, which also opts out of fast-math.
+            // Without this the plain sinf/cosf in the source are silently re-mapped to __sinf/__cosf.
             _audioModule = CompileKernelModule(device,
                 Kernels.CudaAudioKernels.GetSource(),
                 "audio_kernels",
-                Kernels.CudaAudioKernels.GetKernelNames());
+                Kernels.CudaAudioKernels.GetKernelNames(),
+                useFastMath: false);
         }
         catch (Exception ex)
         {
@@ -1709,13 +1756,16 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     /// </summary>
     private void ApplyDeterministicGemmMathMode()
     {
+        // Operate on THIS thread's handle + its tracked mode (the ThreadCublas is created in the current
+        // determinism mode, so this only fires on an actual toggle after creation).
+        var tc = (_threadCublas ??= new ThreadLocal<ThreadCublas>(CreateThreadCublas, trackAllValues: true)).Value!;
         bool wantDeterministic = GpuDeterminism.IsActive;
-        if (wantDeterministic == _gemmMathModeIsDeterministic) return;
-        int mode = wantDeterministic ? CuBlasNative.CUBLAS_PEDANTIC_MATH : _gemmDefaultMathMode;
+        if (wantDeterministic == tc.IsDeterministic) return;
+        int mode = wantDeterministic ? CuBlasNative.CUBLAS_PEDANTIC_MATH : _initGemmMathMode;
         CuBlasNative.CheckCublasStatus(
-            CuBlasNative.cublasSetMathMode(_cublasHandle, mode),
+            CuBlasNative.cublasSetMathMode(tc.Handle, mode),
             "cublasSetMathMode(determinism)");
-        _gemmMathModeIsDeterministic = wantDeterministic;
+        tc.IsDeterministic = wantDeterministic;
     }
 
     public void Gemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
@@ -3867,6 +3917,22 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 (IntPtr)args,
                 IntPtr.Zero),
             "cuLaunchKernel");
+        // Same AIDOTNET_KERNEL_LAUNCH_CHECK=1 probe as the 1D path (PR #638): localize an
+        // illegal-access CUDA-700 to the faulting 2D kernel (the batched FFT kernels launch here).
+        if (s_launchCheck)
+        {
+            var sync = CudaNativeBindings.cuStreamSynchronize(_stream);
+            if (sync != CudaResult.Success)
+            {
+                string op = AiDotNet.Tensors.Engines.DirectGpuTensorEngine.s_currentForwardOp
+                            ?? AiDotNet.Tensors.Engines.DirectGpuTensorEngine.s_currentBackwardOp ?? "(none)";
+                string kname = "(unknown)";
+                foreach (var kv in _kernelCache) if (kv.Value == kernel) { kname = kv.Key; break; }
+                try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_launch_fault.txt"),
+                    $"[LAUNCH-FAULT-2D] kernel={kname} op={op} grid=({gridX},{gridY}) block=({blockX},{blockY}) syncResult={sync}" + System.Environment.NewLine); } catch { }
+                throw new InvalidOperationException($"[LAUNCH-FAULT-2D] kernel '{kname}' fault: {sync} (op={op})");
+            }
+        }
     }
 
     /// <inheritdoc/>
@@ -4793,6 +4859,33 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (ctx != IntPtr.Zero && !IsRuntimeTearingDown && LiveContexts.ContainsKey(ctx))
             CudaNativeBindings.cuCtxSetCurrent(ctx);
         DrainPendingFinalizerFrees();
+        // Reclaim contexts leaked by undisposed engines (finalizer-deferred). Drain AFTER the buffer frees
+        // so any pending free targeting one of these contexts runs first; whatever's left is reclaimed
+        // wholesale by cuCtxDestroy. No-op fast path when the queue is empty (the common case).
+        DrainPendingContextDestroys();
+    }
+
+    // #226 CONCURRENCY FIX: the calling thread's OWN cuBLAS handle for THIS engine (created lazily on first
+    // use, bound to the shared _stream). Concurrent GEMMs from N threads no longer share one non-thread-safe
+    // handle — the root cause of the sticky CUDA-700 under the parallel sweep.
+    private IntPtr _cublasHandle => (_threadCublas ??= new ThreadLocal<ThreadCublas>(CreateThreadCublas, trackAllValues: true)).Value!.Handle;
+
+    // ThreadLocal factory: build this thread's cuBLAS handle for this engine. Runs on the accessing thread,
+    // so we assert the engine context current first (a fresh worker thread may not have it). The handle is
+    // created already in the CURRENT determinism mode: with the OLD shared handle the first GEMM that called
+    // ApplyDeterministicGemmMathMode() switched it to PEDANTIC and it stuck for every later GEMM on every
+    // thread — including the ~6 GEMM sites that never call the toggle (batched / GemmEx). A per-thread handle
+    // has no such shared stickiness, so it must reflect determinism from its very first GEMM or those
+    // non-toggling sites would run TF32 when strict fp32 was required (GPU-vs-CPU parity failures at K≥128).
+    private ThreadCublas CreateThreadCublas()
+    {
+        EnsureContextCurrent();
+        CuBlasNative.CheckCublasStatus(CuBlasNative.cublasCreate(out var h), "cublasCreate(per-thread)");
+        CuBlasNative.CheckCublasStatus(CuBlasNative.cublasSetStream(h, _stream), "cublasSetStream(per-thread)");
+        bool det = GpuDeterminism.IsActive;
+        int initMode = det ? CuBlasNative.CUBLAS_PEDANTIC_MATH : _initGemmMathMode;
+        CuBlasNative.CheckCublasStatus(CuBlasNative.cublasSetMathMode(h, initMode), "cublasSetMathMode(per-thread)");
+        return new ThreadCublas { Handle = h, IsDeterministic = det };
     }
 
     // Device frees DEFERRED from buffer FINALIZERS. Calling the CUDA driver (cuCtxPushCurrent /
@@ -4816,11 +4909,46 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 try
                 {
                     CuBlasNative.cuCtxPushCurrent(f.Ctx);
-                    if (f.Stream != IntPtr.Zero) CuBlasNative.cuMemFreeAsync(f.Ptr, f.Stream);
-                    else CuBlasNative.cuMemFree(f.Ptr);
+                    // #226 crash fix: stay stream-ordered while the stream is alive (the common case — a
+                    // buffer finalized during a live engine), but fall back to a synchronous cuMemFree once
+                    // the stream is gone. cuMemFreeAsync on a destroyed stream is an uncatchable 0xC0000005;
+                    // cuMemFree is documented to free cuMemAllocAsync memory and needs only a live context
+                    // (checked above under the lock). LiveStreams membership and the free are both under
+                    // ContextLifecycleLock, so this never races the atomic {remove + cuStreamDestroy} in Dispose.
+                    if (f.Stream != IntPtr.Zero && LiveStreams.ContainsKey(f.Stream))
+                        CuBlasNative.cuMemFreeAsync(f.Ptr, f.Stream);
+                    else
+                        CuBlasNative.cuMemFree(f.Ptr);
                     CuBlasNative.cuCtxPopCurrent(out _);
                 }
                 catch { }
+            }
+        }
+    }
+
+    // Whole-CONTEXT teardowns DEFERRED from the CudaBackend FINALIZER (an engine that was never Dispose()d).
+    // Like buffer frees, we cannot call the CUDA driver on the GC finalizer thread, but simply no-oping
+    // leaks the entire ~200 MB context for the rest of the process. So the finalizer captures the context
+    // handle (an IntPtr, safe to read) and a real op thread destroys it here. cuCtxDestroy reclaims the
+    // context's stream, buffers, cuBLAS handles and modules in ONE call, so the context is all we need.
+    internal static readonly ConcurrentQueue<(IntPtr Ctx, IntPtr Stream)> PendingContextDestroys = new();
+
+    internal static void DrainPendingContextDestroys()
+    {
+        while (PendingContextDestroys.TryDequeue(out var c))
+        {
+            if (c.Ctx == IntPtr.Zero) continue;
+            lock (ContextLifecycleLock)
+            {
+                if (IsRuntimeTearingDown || ProcessExiting || !LiveContexts.ContainsKey(c.Ctx))
+                    continue; // already torn down / process exiting (OS reclaims)
+                // Deregister BEFORE destroying so any concurrent buffer-free drain for this context (under
+                // the same lock) sees it gone and skips — never freeing into a context we just destroyed.
+                LiveContexts.TryRemove(c.Ctx, out _);
+                if (c.Stream != IntPtr.Zero) LiveStreams.TryRemove(c.Stream, out _);
+                // cuCtxDestroy neither needs nor disturbs the calling thread's current context (this is a
+                // different, abandoned context), and it reclaims every allocation made in it.
+                try { CuBlasNative.cuCtxDestroy(c.Ctx); } catch { }
             }
         }
     }
@@ -4840,6 +4968,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     private unsafe void LaunchKernelWithSharedMem(IntPtr kernel, uint gridX, uint blockX, uint sharedMemBytes, void** args)
     {
+        // #226: serialize the host-side launch (shared _stream + launch state) across threads. Innermost lock.
+        lock (GpuDispatchLock)
+        {
         CuBlasNative.CheckCudaResult(
             CudaNativeBindings.cuLaunchKernel(
                 kernel,
@@ -4850,6 +4981,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 (IntPtr)args,
                 IntPtr.Zero),
             "cuLaunchKernel");
+        // Residency instrumentation: CUDA is the only DirectGpu backend that never recorded launches, so
+        // residency-probe tests (GpuLaunchProbe.Count > 0) failed on CUDA even though the kernel ran. Mirror
+        // the OpenCL/Vulkan contract — increment at this single 1D-dispatch choke point.
+        GpuLaunchProbe.OnLaunch();
         if (s_launchCheck)
         {
             var sync = CudaNativeBindings.cuStreamSynchronize(_stream);
@@ -4864,6 +4999,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 throw new InvalidOperationException($"[LAUNCH-FAULT] kernel '{kname}' fault: {sync} (op={op})");
             }
         }
+        } // GpuDispatchLock
     }
 
     /// <summary>
@@ -4910,6 +5046,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 _stream,
                 (IntPtr)args),
             "cuLaunchCooperativeKernel");
+        GpuLaunchProbe.OnLaunch();
     }
 
     private unsafe void LaunchKernel2D(IntPtr kernel, uint gridX, uint gridY, uint gridZ, uint blockX, uint blockY, void** args)
@@ -4924,6 +5061,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 (IntPtr)args,
                 IntPtr.Zero),
             "cuLaunchKernel2D");
+        GpuLaunchProbe.OnLaunch();
     }
 
     private unsafe void LaunchKernel2DWithSharedMem(IntPtr kernel, uint gridX, uint gridY, uint blockX, uint blockY, uint sharedMemBytes, void** args)
@@ -4938,6 +5076,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 (IntPtr)args,
                 IntPtr.Zero),
             "cuLaunchKernel2DSharedMem");
+        GpuLaunchProbe.OnLaunch();
     }
 
     private unsafe void LaunchKernel3D(IntPtr kernel, uint gridX, uint gridY, uint gridZ, uint blockX, uint blockY, uint blockZ, void** args, uint sharedMemBytes = 0)
@@ -4952,6 +5091,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 (IntPtr)args,
                 IntPtr.Zero),
             "cuLaunchKernel3D");
+        GpuLaunchProbe.OnLaunch();
     }
 
     private static void ValidateGemmArgs(IGpuBuffer A, IGpuBuffer B, IGpuBuffer? C, int M, int N, int K)
@@ -11113,8 +11253,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void Equal(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
-        if (!_kernelCache.TryGetValue("equal", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: equal");
+        if (!_kernelCache.TryGetValue("equals", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: equals");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -11209,8 +11349,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void ArgMax(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
-        if (!_kernelCache.TryGetValue("argmax", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: argmax");
+        if (!_kernelCache.TryGetValue("argmax_axis", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: argmax_axis");
 
         using var _ = PushContext();
         uint grid = (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -11226,8 +11366,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void ArgMin(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
-        if (!_kernelCache.TryGetValue("argmin", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: argmin");
+        if (!_kernelCache.TryGetValue("argmin_axis", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: argmin_axis");
 
         using var _ = PushContext();
         uint grid = (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -13358,7 +13498,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[3] = &numFrames;
         args[4] = &numFreqs;
         args[5] = &nMels;
-        LaunchKernel2D(kernel, (uint)((nMels + 31) / 32), (uint)numFrames, 1, 32, 1, args);
+        // Kernel maps frame = blockIdx.x, mel = blockIdx.y*blockDim.x + threadIdx.x. gridX MUST be
+        // numFrames and gridY = ceil(nMels/32) — they were swapped, so only frame 0 was ever computed and
+        // every later frame read the -80 dB floor (op-parity #775; OpenCL already carries the fix).
+        LaunchKernel2D(kernel, (uint)numFrames, (uint)((nMels + 31) / 32), 1, 32, 1, args);
     }
 
     /// <inheritdoc/>
@@ -15041,10 +15184,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         LaunchKernel(kernel, grid, blockSize, args);
 
-        // Copy the last timestep from allH and allC into hFinal and cFinal
-        // allH layout: [(seqLen + 1) * batch * hiddenSize] where index 0 is hInit
-        // So final hidden state is at index seqLen (last timestep output)
-        int finalStateOffset = seqLen * batch * hiddenSize;
+        // Copy the last timestep from allH and allC into hFinal and cFinal. The kernel writes timestep t's
+        // state at block index t (stateOffset = t*batch*hidden, NO hInit slot at index 0), so the LAST
+        // written timestep is seqLen-1. (The old code read block seqLen, which the kernel never writes —
+        // hFinal/cFinal came back as uninitialized garbage, breaking the returnSequences:false overload.)
+        int finalStateOffset = (seqLen - 1) * batch * hiddenSize;
         int stateSize = batch * hiddenSize;
         ulong byteSize = (ulong)(stateSize * sizeof(float));
 
@@ -15349,7 +15493,18 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // ProcessExiting (the merged #536 CUDA-finalizer-safety fix) — either means the
         // driver/runtime may be gone, so skip the native + pool cleanup entirely.
         if (!disposing || IsRuntimeTearingDown || ProcessExiting)
+        {
+            // Finalizer path for a backend that was never Dispose()d. We cannot call the CUDA driver here
+            // (finalizer-thread race → uncatchable 0xC0000005) nor touch managed members — but no-oping
+            // leaks the whole ~200 MB CUDA context for the rest of the process (a real leak for any consumer
+            // that forgets to dispose the engine). Capture the native context + stream handles (IntPtrs are
+            // safe to read in a finalizer) and let a real op thread cuCtxDestroy it later, which reclaims the
+            // stream, buffers, cuBLAS handles and modules in one shot. Skip during process/runtime teardown
+            // (driver may be gone; the OS reclaims everything at exit).
+            if (!disposing && !IsRuntimeTearingDown && !ProcessExiting && _cudaContext != IntPtr.Zero)
+                PendingContextDestroys.Enqueue((_cudaContext, _stream));
             return;
+        }
 
         // Flush every event-deferred free BEFORE tearing down the pool/context, blocking
         // on incomplete events (the stream/context are still alive right here, so the
@@ -15388,16 +15543,35 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             _cublasLt = null;
         }
 
-        if (_cublasHandle != IntPtr.Zero)
+        // #226: destroy EVERY per-thread cuBLAS handle created over this engine's life (not just the init
+        // thread's). trackAllValues lets us enumerate handles created on any thread; reading the
+        // _cublasHandle property here would instead lazily create a fresh handle on the disposing thread.
+        if (_threadCublas is not null)
         {
-            CuBlasNative.cublasDestroy(_cublasHandle);
-            _cublasHandle = IntPtr.Zero;
+            foreach (var tc in _threadCublas.Values)
+            {
+                if (tc is not null && tc.Handle != IntPtr.Zero)
+                    CuBlasNative.cublasDestroy(tc.Handle);
+            }
+
+            _threadCublas.Dispose();
+            _threadCublas = null;
         }
 
         if (_stream != IntPtr.Zero)
         {
-            CudaNativeBindings.cuStreamDestroy(_stream);
-            _stream = IntPtr.Zero;
+            // #226 crash fix: buffer FINALIZERS enqueue deferred frees (ptr, ctx, _stream) that
+            // DrainPendingFinalizerFrees replays later. Deregister the stream from LiveStreams and destroy it
+            // ATOMICALLY under the lifecycle lock (the same lock the drain holds). A concurrent drain then runs
+            // either fully-before (stream still registered → stream-ordered cuMemFreeAsync) or fully-after
+            // (stream gone → synchronous cuMemFree on the still-live context), never cuMemFreeAsync on a
+            // destroyed stream (the uncatchable 0xC0000005 that FailFast-crashes the host).
+            lock (ContextLifecycleLock)
+            {
+                LiveStreams.TryRemove(_stream, out _);
+                CudaNativeBindings.cuStreamDestroy(_stream);
+                _stream = IntPtr.Zero;
+            }
         }
 
         if (_convolutionModule != IntPtr.Zero)
@@ -16408,8 +16582,16 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             if (Interlocked.Exchange(ref _poolState, 2) == 2)
                 return;
 
-            if (_devicePtr == IntPtr.Zero)
+            // Atomically CLAIM the device pointer. A concurrent finalizer (or a second ReleaseCore) that
+            // loses this exchange gets IntPtr.Zero and frees nothing — this is what prevents the SAME
+            // pointer being freed here AND enqueued by the finalizer for a deferred free, which double-frees
+            // in DrainPendingFinalizerFrees → uncatchable 0xC0000005 that FailFast-crashes the host.
+            var ptr = Interlocked.Exchange(ref _devicePtr, IntPtr.Zero);
+            if (ptr == IntPtr.Zero)
+            {
+                GC.SuppressFinalize(this);
                 return;
+            }
 
             // During CLR/AppDomain teardown the CUDA context may already be gone;
             // calling the driver here raises an uncatchable, finalizer-fatal access
@@ -16429,12 +16611,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                         try
                         {
                             CuBlasNative.cuCtxPushCurrent(_context);
-                            GpuMemoryTracker.OnFree(_devicePtr);
+                            GpuMemoryTracker.OnFree(ptr);
                             // Stream-ordered free (#558 layer 6): race-safe + pool-reused in stream order.
                             if (_asyncFreeStream != IntPtr.Zero)
-                                CuBlasNative.cuMemFreeAsync(_devicePtr, _asyncFreeStream);
+                                CuBlasNative.cuMemFreeAsync(ptr, _asyncFreeStream);
                             else
-                                CuBlasNative.cuMemFree(_devicePtr);
+                                CuBlasNative.cuMemFree(ptr);
                             CuBlasNative.cuCtxPopCurrent(out _);
                         }
                         catch
@@ -16445,7 +16627,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 }
             }
 
-            _devicePtr = IntPtr.Zero;
             _context = IntPtr.Zero;
             GC.SuppressFinalize(this);
         }
@@ -16485,10 +16666,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         {
             // NEVER call the CUDA driver on the GC finalizer thread (races with op threads →
             // 0xC0000005). Defer the device free to a real op thread via the pending-free queue.
-            var ptr = _devicePtr;
+            // Atomically CLAIM the pointer: if a concurrent ReleaseCore already took it we get Zero and
+            // enqueue nothing, so the pointer is never freed twice (the double-free that crashed the host).
+            var ptr = Interlocked.Exchange(ref _devicePtr, IntPtr.Zero);
             if (ptr != IntPtr.Zero && !IsRuntimeTearingDown && !ProcessExiting)
                 PendingFinalizerFrees.Enqueue((ptr, _context, _asyncFreeStream));
-            _devicePtr = IntPtr.Zero;
             _context = IntPtr.Zero;
         }
     }
@@ -16515,8 +16697,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         public void Dispose()
         {
-            if (_devicePtr == IntPtr.Zero)
+            // Atomically CLAIM the device pointer so a concurrent finalizer can't enqueue the SAME pointer
+            // for a deferred free (double-free → uncatchable 0xC0000005 in DrainPendingFinalizerFrees).
+            var ptr = Interlocked.Exchange(ref _devicePtr, IntPtr.Zero);
+            if (ptr == IntPtr.Zero)
+            {
+                GC.SuppressFinalize(this);
                 return;
+            }
 
             // See CudaGpuBuffer.Release: skip native CUDA calls during teardown to
             // avoid a finalizer-fatal access violation on an already-destroyed context.
@@ -16534,12 +16722,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                         try
                         {
                             CuBlasNative.cuCtxPushCurrent(_context);
-                            GpuMemoryTracker.OnFree(_devicePtr);
+                            GpuMemoryTracker.OnFree(ptr);
                             // Stream-ordered free (#558 layer 6): race-safe + pool-reused in stream order.
                             if (_asyncFreeStream != IntPtr.Zero)
-                                CuBlasNative.cuMemFreeAsync(_devicePtr, _asyncFreeStream);
+                                CuBlasNative.cuMemFreeAsync(ptr, _asyncFreeStream);
                             else
-                                CuBlasNative.cuMemFree(_devicePtr);
+                                CuBlasNative.cuMemFree(ptr);
                             CuBlasNative.cuCtxPopCurrent(out _);
                         }
                         catch
@@ -16550,7 +16738,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 }
             }
 
-            _devicePtr = IntPtr.Zero;
             _context = IntPtr.Zero;
             GC.SuppressFinalize(this);
         }
@@ -16559,10 +16746,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         {
             // NEVER call the CUDA driver on the GC finalizer thread — defer the device free to a real
             // op thread via the pending-free queue (see CudaBackend.PendingFinalizerFrees).
-            var ptr = _devicePtr;
+            // Atomically CLAIM the pointer: if Dispose already took it we get Zero and enqueue nothing,
+            // so it is never freed twice (the double-free that crashed the host).
+            var ptr = Interlocked.Exchange(ref _devicePtr, IntPtr.Zero);
             if (ptr != IntPtr.Zero && !IsRuntimeTearingDown && !ProcessExiting)
                 PendingFinalizerFrees.Enqueue((ptr, _context, _asyncFreeStream));
-            _devicePtr = IntPtr.Zero;
             _context = IntPtr.Zero;
         }
     }

@@ -182,9 +182,13 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_forward_sequence(
         float prev_c = 0.0f;
 
         if (isValid) {
+            // Gate slice layout is PyTorch/CPU order i,f,g,o: slice 0 = INPUT, slice 1 = FORGET,
+            // slice 2 = cell-candidate (g), slice 3 = OUTPUT. This kernel keeps variables named by ROLE
+            // (sumF=forget, sumI=input), so forget reads slice 1 and input reads slice 0. (The original
+            // code read forget from slice 0 → it multiplied prev_c by the INPUT gate: a gross parity bug.)
             // Bias is sum of input-hidden and hidden-hidden biases
-            sumF = biasIh[h_idx] + biasHh[h_idx];
-            sumI = biasIh[hiddenSize + h_idx] + biasHh[hiddenSize + h_idx];
+            sumI = biasIh[h_idx] + biasHh[h_idx];                                       // slice 0 = input
+            sumF = biasIh[hiddenSize + h_idx] + biasHh[hiddenSize + h_idx];             // slice 1 = forget
             sumC = biasIh[2 * hiddenSize + h_idx] + biasHh[2 * hiddenSize + h_idx];
             sumO = biasIh[3 * hiddenSize + h_idx] + biasHh[3 * hiddenSize + h_idx];
 
@@ -192,8 +196,8 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_forward_sequence(
             int inputOffset = (b * timeSteps + t) * inputSize;
             for (int i = 0; i < inputSize; i++) {
                 float x_val = input[inputOffset + i];
-                sumF += Wi[h_idx * inputSize + i] * x_val;
-                sumI += Wi[(hiddenSize + h_idx) * inputSize + i] * x_val;
+                sumI += Wi[h_idx * inputSize + i] * x_val;                               // slice 0 = input
+                sumF += Wi[(hiddenSize + h_idx) * inputSize + i] * x_val;                // slice 1 = forget
                 sumC += Wi[(2 * hiddenSize + h_idx) * inputSize + i] * x_val;
                 sumO += Wi[(3 * hiddenSize + h_idx) * inputSize + i] * x_val;
             }
@@ -209,8 +213,8 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_forward_sequence(
                     // Read from cached h_states for previous timestep
                     hj = h_states[(t - 1) * batch * hiddenSize + b * hiddenSize + j];
                 }
-                sumF += Wh[h_idx * hiddenSize + j] * hj;
-                sumI += Wh[(hiddenSize + h_idx) * hiddenSize + j] * hj;
+                sumI += Wh[h_idx * hiddenSize + j] * hj;                                 // slice 0 = input
+                sumF += Wh[(hiddenSize + h_idx) * hiddenSize + j] * hj;                  // slice 1 = forget
                 sumC += Wh[(2 * hiddenSize + h_idx) * hiddenSize + j] * hj;
                 sumO += Wh[(3 * hiddenSize + h_idx) * hiddenSize + j] * hj;
             }
