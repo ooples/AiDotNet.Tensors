@@ -2438,7 +2438,11 @@ public partial class DirectGpuTensorEngine
     Tensor<T> IEngine.Upsample3D<T>(Tensor<T> input, int scaleD, int scaleH, int scaleW)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        // No tape bail: the node is recorded below so the GPU path survives training. Signature and saved
+        // state match CpuEngine.Upsample3D exactly — same (input, scaleD, scaleH, scaleW) overload, same
+        // Upsample3DBackward, same object[] { scaleD, scaleH, scaleW }. Upsample3DBackward's own GPU
+        // override does not gate on the tape, so backprop reaches the device kernel.
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || input.Rank != 5 || scaleD <= 0 || scaleH <= 0 || scaleW <= 0
             || !input.IsContiguous || !TryGetBackend(out var backend))
             return base.Upsample3D(input, scaleD, scaleH, scaleW);
@@ -2452,7 +2456,7 @@ public partial class DirectGpuTensorEngine
             int outputWidth = checked(inputWidth * scaleW);
             int outputLength = checked(batch * channels * outputDepth * outputHeight * outputWidth);
             using var source = GetOrAllocateBuffer(backend, input);
-            return DispatchDeferredGpuOp<T>(backend, outputLength,
+            var up3dResult = DispatchDeferredGpuOp<T>(backend, outputLength,
                 new[] { batch, channels, outputDepth, outputHeight, outputWidth }, output =>
                 {
                     for (int b = 0; b < batch; b++)
@@ -2473,6 +2477,10 @@ public partial class DirectGpuTensorEngine
                         }
                     }
                 });
+
+            DifferentiableOps.RecordUnary("Upsample3D", up3dResult, input,
+                BackwardFunctions<T>.Upsample3DBackward, new object[] { scaleD, scaleH, scaleW });
+            return up3dResult;
         }
         catch { return base.Upsample3D(input, scaleD, scaleH, scaleW); }
     }
@@ -2737,6 +2745,11 @@ public partial class DirectGpuTensorEngine
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
         int normalizedAxis = axis < 0 ? axis + input.Rank : axis;
+        // Tape bail RESTORED. Removing it exposed that this GPU path cannot run at all: it calls
+        // backend.Where, and CudaBackend.Where looks up a "where_select" kernel that does not exist —
+        // no source, no registration — so it throws InvalidOperationException on first use. The bail had
+        // been hiding that, because without it the path was only reachable outside a tape and no test
+        // covered it. Re-enable this (and the recording below) once where_select exists on the backends.
         if (typeof(T) != typeof(float) || normalizedAxis != input.Rank - 1
             || input.Length == 0 || !input.IsContiguous || IsTapeActive<T>()
             || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend))
@@ -2766,7 +2779,7 @@ public partial class DirectGpuTensorEngine
         using (var expandedThresholds = backend.AllocateBuffer(length))
         using (var shiftedInput = backend.AllocateBuffer(length))
         {
-            return DispatchDeferredGpuOp<T>(backend, length, (int[])input._shape.Clone(), output =>
+            var sparsemaxResult = DispatchDeferredGpuOp<T>(backend, length, (int[])input._shape.Clone(), output =>
             {
                 for (int row = 0; row < rows; row++)
                 {
@@ -2793,6 +2806,8 @@ public partial class DirectGpuTensorEngine
                 backend.Subtract(inputBuffer.Buffer, expandedThresholds, shiftedInput, length);
                 backend.Relu(shiftedInput, output, length);
             });
+
+            return sparsemaxResult;
         }
     }
 
@@ -5521,10 +5536,17 @@ public partial class DirectGpuTensorEngine
     Tensor<T> IEngine.ScaledDotProductAttention<T>(Tensor<T> query, Tensor<T> key, Tensor<T> value,
         Tensor<bool>? mask, double? scale, out Tensor<T> attentionWeights, double softcap)
     {
-        // GPU SDPA kernel: [batch, numHeads, seqQ/seqK, headDim]. Tape/graph,
-        // non-float, or unequal Q/K/V feature depths defer to the base (CPU) implementation. The
-        // attention-logit soft-cap (Gemma-2) is threaded into every backend kernel below.
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        // GPU SDPA kernel: [batch, numHeads, seqQ/seqK, headDim]. Non-float, wrong rank, or unequal
+        // Q/K/V feature depths defer to the base (CPU) implementation. The attention-logit soft-cap
+        // (Gemma-2) is threaded into every backend kernel below.
+        //
+        // A LIVE TAPE NO LONGER DEFERS. The forward previously bailed whenever IsTapeActive was true, so
+        // attention ran on the CPU for every training step — the case it matters most for. The tape node is
+        // recorded on the GPU result instead (see the end of the try block). The backward it names,
+        // IEngine.ScaledDotProductAttentionBackward, has its own on-device kernel and IS reachable during
+        // backprop: GradientTape.ComputeGradients sets the current tape to null before replaying, so
+        // IsTapeActive is FALSE inside backward closures and the GPU backward override takes its normal path.
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || query.Rank != 4 || key.Rank != 4 || value.Rank != 4 || !TryGetBackend(out var backend))
             return base.ScaledDotProductAttention(query, key, value, mask, scale, out attentionWeights, softcap);
         try
@@ -5555,6 +5577,14 @@ public partial class DirectGpuTensorEngine
                 new[] { batch, numHeads, seqQ, seqK });
             outB.RelinquishOwnership();
             awB.RelinquishOwnership();
+
+            // Same node CpuEngine records, so gradients are identical in form; RecordIfActive is a no-op
+            // when no tape is live, leaving inference untouched.
+            float scaleForBackward = sc;
+            DifferentiableOps.RecordIfActive("ScaledDotProductAttention", result,
+                new[] { query, key, value },
+                BackwardFunctions<T>.ScaledDotProductAttentionBackward,
+                new object[] { attentionWeights, (double)scaleForBackward });
             return result;
         }
         catch { return base.ScaledDotProductAttention(query, key, value, mask, scale, out attentionWeights); }
@@ -7462,13 +7492,20 @@ public partial class DirectGpuTensorEngine
     // engine override called it. Tape/GraphMode/strided defer to the base.
     Tensor<T> IEngine.TensorCosh<T>(Tensor<T> tensor)
     {
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || !tensor.IsContiguous)
+        // No tape bail: the node is recorded below, so training keeps the GPU kernel. The backward is the
+        // same one CpuEngine names, and it is reachable during backprop because ComputeGradients nulls the
+        // current tape before replaying (so IsTapeActive is false inside backward closures).
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || !tensor.IsContiguous)
             return base.TensorCosh(tensor);
         try
         {
             var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Cosh(input, output, size));
             if (result != null)
-                return new Tensor<T>(result, tensor.Shape._dims);
+            {
+                var gpuOut = new Tensor<T>(result, tensor.Shape._dims);
+                DifferentiableOps.RecordUnary("TensorCosh", gpuOut, tensor, BackwardFunctions<T>.CoshBackward);
+                return gpuOut;
+            }
             return base.TensorCosh(tensor);
         }
         catch { return base.TensorCosh(tensor); }
@@ -7477,13 +7514,20 @@ public partial class DirectGpuTensorEngine
     // #775: TensorSinh on the existing backend.Sinh (sinh_vector) unary kernel — same as TensorCosh.
     Tensor<T> IEngine.TensorSinh<T>(Tensor<T> tensor)
     {
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || !tensor.IsContiguous)
+        // No tape bail: the node is recorded below, so training keeps the GPU kernel. The backward is the
+        // same one CpuEngine names, and it is reachable during backprop because ComputeGradients nulls the
+        // current tape before replaying (so IsTapeActive is false inside backward closures).
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || !tensor.IsContiguous)
             return base.TensorSinh(tensor);
         try
         {
             var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Sinh(input, output, size));
             if (result != null)
-                return new Tensor<T>(result, tensor.Shape._dims);
+            {
+                var gpuOut = new Tensor<T>(result, tensor.Shape._dims);
+                DifferentiableOps.RecordUnary("TensorSinh", gpuOut, tensor, BackwardFunctions<T>.SinhBackward);
+                return gpuOut;
+            }
             return base.TensorSinh(tensor);
         }
         catch { return base.TensorSinh(tensor); }
