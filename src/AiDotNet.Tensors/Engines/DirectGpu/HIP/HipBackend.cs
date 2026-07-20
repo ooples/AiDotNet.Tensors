@@ -6099,15 +6099,21 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void ScaledDotProductAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer? attentionWeights, IGpuBuffer? mask,
-        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal, float softcap = 0.0f)
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal, float softcap = 0.0f,
+        int numKVHeads = 0)
     {
         if (batch <= 0 || numHeads <= 0 || seqQ <= 0 || seqK <= 0 || headDim <= 0)
             throw new ArgumentOutOfRangeException(nameof(batch), "Attention dimensions must be positive.");
         if (!_kernelCache.TryGetValue("scaled_dot_product_attention", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: scaled_dot_product_attention");
 
+        // numKVHeads <= 0 means MHA (K/V have numHeads); >0 enables Grouped-Query Attention where each KV head is
+        // shared by numHeads/numKVHeads query heads and the K/V buffers are sized [batch * numKVHeads * seqK * headDim].
+        int kvHeads = numKVHeads > 0 ? numKVHeads : numHeads;
+        if (numHeads % kvHeads != 0)
+            throw new ArgumentException("numHeads must be an integer multiple of numKVHeads.", nameof(numKVHeads));
         int querySize = checked(batch * numHeads * seqQ * headDim);
-        int keyValueSize = checked(batch * numHeads * seqK * headDim);
+        int keyValueSize = checked(batch * kvHeads * seqK * headDim);
         int weightsSize = checked(batch * numHeads * seqQ * seqK);
         if (query.Size < querySize || key.Size < keyValueSize || value.Size < keyValueSize || output.Size < querySize)
             throw new ArgumentException("Attention tensor buffers are smaller than the requested dimensions.");
@@ -6125,7 +6131,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int causalFlag = isCausal ? 1 : 0;
         int maskMode = mask is null ? 0 : mask.Size >= weightsSize ? 2 : 1;
         int storeWeights = attentionWeights is null ? 0 : 1;
-        void** args = stackalloc void*[16];
+        void** args = stackalloc void*[17];
         args[0] = &queryPtr;
         args[1] = &keyPtr;
         args[2] = &valuePtr;
@@ -6142,9 +6148,43 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         args[13] = &maskMode;
         args[14] = &storeWeights;
         args[15] = &softcap;
+        args[16] = &kvHeads;
 
         int rows = checked(batch * numHeads * seqQ);
         uint grid = (uint)((rows + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        Synchronize();
+    }
+
+    public unsafe void RopeInterleaved(IGpuBuffer input, IGpuBuffer cos, IGpuBuffer sin, IGpuBuffer output,
+        int rows, int headDim, int seqLen, int startPosition)
+    {
+        if (rows <= 0 || headDim <= 0 || seqLen <= 0)
+            throw new ArgumentOutOfRangeException(nameof(rows), "RoPE dimensions must be positive.");
+        if ((headDim & 1) != 0)
+            throw new ArgumentException("RoPE requires an even head dimension.", nameof(headDim));
+        if (!_kernelCache.TryGetValue("rope_interleaved", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: rope_interleaved");
+        int total = checked(rows * headDim);
+        if (input.Size < total || output.Size < total)
+            throw new ArgumentException("RoPE input/output buffers are smaller than rows * headDim.");
+
+        IntPtr inputPtr = input.Handle;
+        IntPtr cosPtr = cos.Handle;
+        IntPtr sinPtr = sin.Handle;
+        IntPtr outputPtr = output.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &inputPtr;
+        args[1] = &cosPtr;
+        args[2] = &sinPtr;
+        args[3] = &outputPtr;
+        args[4] = &rows;
+        args[5] = &headDim;
+        args[6] = &seqLen;
+        args[7] = &startPosition;
+
+        int pairs = checked(rows * (headDim / 2));
+        uint grid = (uint)((pairs + DefaultBlockSize - 1) / DefaultBlockSize);
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
         Synchronize();
     }

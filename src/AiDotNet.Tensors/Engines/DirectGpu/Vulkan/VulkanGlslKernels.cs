@@ -393,6 +393,33 @@ void main() {
     c[idx] = dot;
 }";
 
+    // Fused interleaved RoPE (GPT-NeoX / LLaMA / GGML). One invocation per (row, pair).
+    // cos/sin are [maxSeq, headDim/2], indexed by absolute position (startPosition + rowWithinSequence).
+    public static string RopeInterleaved => Header + @"
+layout(set = 0, binding = 0) readonly buffer Input { float inputData[]; };
+layout(set = 0, binding = 1) readonly buffer Cos { float cosData[]; };
+layout(set = 0, binding = 2) readonly buffer Sin { float sinData[]; };
+layout(set = 0, binding = 3) writeonly buffer Output { float outputData[]; };
+layout(push_constant) uniform Params { uint rows; uint headDim; uint seqLen; uint startPosition; };
+void main() {
+    uint halfDim = headDim / 2u;
+    uint g = gl_GlobalInvocationID.x;
+    if (g >= rows * halfDim) return;
+    uint i = g % halfDim;
+    uint row = g / halfDim;
+    uint s = row % seqLen;
+    uint pos = startPosition + s;
+    uint baseIdx = row * headDim;
+    uint cacheIdx = pos * halfDim + i;
+    float c = cosData[cacheIdx];
+    float sn = sinData[cacheIdx];
+    float xEven = inputData[baseIdx + 2u * i];
+    float xOdd = inputData[baseIdx + 2u * i + 1u];
+    outputData[baseIdx + 2u * i] = xEven * c - xOdd * sn;
+    outputData[baseIdx + 2u * i + 1u] = xEven * sn + xOdd * c;
+}
+";
+
     public static string AttentionForward => Header + @"
 layout(set = 0, binding = 0) readonly buffer Query { float queryData[]; };
 layout(set = 0, binding = 1) readonly buffer Key { float keyData[]; };
