@@ -3343,16 +3343,40 @@ internal static class BackwardFunctions<T>
             var hi = hasIntersection ? numOps.One : numOps.Zero;
 
             // dIntersection/d(px1,py1,px2,py2)
-            var dI0 = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px1) > numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero, ih));
-            var dI1 = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py1) > numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero, iw));
-            var dI2 = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px2) < numOps.ToDouble(tx2) ? numOps.One : numOps.Zero, ih));
-            var dI3 = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py2) < numOps.ToDouble(ty2) ? numOps.One : numOps.Zero, iw));
+            //
+            // TIE-BREAKING MUST MATCH CpuEngine's decomposition, which builds these from TensorMax nodes.
+            // MaxBackward computes aMask = 1 - sign(|output - a|), so when a == b it routes the FULL
+            // gradient to inputs[0] and zero to inputs[1] — first argument wins ties. Strict > and < give
+            // ZERO at a tie instead, which is the disagreement.
+            //
+            // ix1 = max(px1, tx1)          -> inputs[0] is px1,  so px1 wins ties  -> use >=
+            // ix2 = min(px2, tx2), built as -max(-px2, -tx2) -> inputs[0] is -px2, so px2 wins ties -> use <=
+            //
+            // Not an edge case for box losses: integer-valued corners share coordinates constantly (the
+            // parity boxes include px1=tx1=0 and px2=tx2=2). Same failure shape as the SELU backward, where
+            // a strict > at the zero boundary disagreed with CpuEngine's >=.
+            var dI0 = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px1) >= numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero, ih));
+            var dI1 = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py1) >= numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero, iw));
+            var dI2 = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px2) <= numOps.ToDouble(tx2) ? numOps.One : numOps.Zero, ih));
+            var dI3 = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py2) <= numOps.ToDouble(ty2) ? numOps.One : numOps.Zero, iw));
 
             // dUnion/d(px1,py1,px2,py2)
-            var dU0 = numOps.Subtract(numOps.Negate(ph), dI0);
-            var dU1 = numOps.Subtract(numOps.Negate(pw), dI1);
-            var dU2 = numOps.Subtract(ph, dI2);
-            var dU3 = numOps.Subtract(pw, dI3);
+            //
+            // predArea = max(0, px2-px1) * max(0, py2-py1), so d(predArea)/d(px1) = -[px2 > px1] * ph and
+            // d(predArea)/d(px2) = +[px2 > px1] * ph. The ReLU INDICATORS were missing here: this used
+            // -ph / +ph unconditionally, so a degenerate box (px2 <= px1) got a non-zero width gradient
+            // where the CPU decomposition — which builds the same quantity out of real ReLU nodes and
+            // therefore carries the indicator through its backward — correctly gives zero.
+            //
+            // This is not an edge case under the parity inputs: coordinates come from OpInput.Rand(-1, 1)
+            // rather than well-formed boxes, so roughly half of them satisfy px2 <= px1.
+            var pwPos = numOps.ToDouble(numOps.Subtract(px2, px1)) > 0 ? numOps.One : numOps.Zero;
+            var phPos = numOps.ToDouble(numOps.Subtract(py2, py1)) > 0 ? numOps.One : numOps.Zero;
+
+            var dU0 = numOps.Subtract(numOps.Negate(numOps.Multiply(pwPos, ph)), dI0);
+            var dU1 = numOps.Subtract(numOps.Negate(numOps.Multiply(phPos, pw)), dI1);
+            var dU2 = numOps.Subtract(numOps.Multiply(pwPos, ph), dI2);
+            var dU3 = numOps.Subtract(numOps.Multiply(phPos, pw), dI3);
 
             // dIoU/d(coord) = (dI*U - I*dU) / U^2, loss = 1 - IoU, so d(loss) = -dIoU
             var go = gradOutput[i];
@@ -3367,6 +3391,15 @@ internal static class BackwardFunctions<T>
     }
 
     /// <summary>GIoU loss backward: IoU gradient + enclosing area penalty gradient.</summary>
+    /// <remarks>
+    /// TIE-BREAKING: every predicted-vs-target comparison here includes equality, matching CpuEngine's
+    /// decomposition. That path builds these terms from TensorMax nodes, and MaxBackward computes
+    /// aMask = 1 - sign(|output - a|), so at a == b the FULL gradient goes to inputs[0] and none to
+    /// inputs[1] — the first argument wins ties. Predicted is always inputs[0] (min(p,t) is built as
+    /// -max(-p,-t), so predicted stays first there too), hence predicted wins every tie. Strict > and <
+    /// gave ZERO at a tie and disagreed with the decomposition. Box corners share coordinates constantly
+    /// once they are integer-valued, so this is routine rather than an edge case.
+    /// </remarks>
     internal static void GIoULossBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
@@ -3401,10 +3434,10 @@ internal static class BackwardFunctions<T>
             var hi = hasIntersection ? numOps.One : numOps.Zero;
 
             var dI = new T[4];
-            dI[0] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px1) > numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero, ih));
-            dI[1] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py1) > numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero, iw));
-            dI[2] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px2) < numOps.ToDouble(tx2) ? numOps.One : numOps.Zero, ih));
-            dI[3] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py2) < numOps.ToDouble(ty2) ? numOps.One : numOps.Zero, iw));
+            dI[0] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px1) >= numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero, ih));
+            dI[1] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py1) >= numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero, iw));
+            dI[2] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px2) <= numOps.ToDouble(tx2) ? numOps.One : numOps.Zero, ih));
+            dI[3] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py2) <= numOps.ToDouble(ty2) ? numOps.One : numOps.Zero, iw));
             var dU = new T[] {
                 numOps.Subtract(numOps.Negate(ph), dI[0]), numOps.Subtract(numOps.Negate(pw), dI[1]),
                 numOps.Subtract(ph, dI[2]), numOps.Subtract(pw, dI[3])
@@ -3422,10 +3455,10 @@ internal static class BackwardFunctions<T>
             var encASq = numOps.Multiply(encA, encA);
 
             var dEncA = new T[4];
-            dEncA[0] = numOps.Multiply(numOps.ToDouble(px1) < numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero, encH);
-            dEncA[1] = numOps.Multiply(numOps.ToDouble(py1) < numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero, encW);
-            dEncA[2] = numOps.Multiply(numOps.ToDouble(px2) > numOps.ToDouble(tx2) ? numOps.One : numOps.Zero, encH);
-            dEncA[3] = numOps.Multiply(numOps.ToDouble(py2) > numOps.ToDouble(ty2) ? numOps.One : numOps.Zero, encW);
+            dEncA[0] = numOps.Multiply(numOps.ToDouble(px1) <= numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero, encH);
+            dEncA[1] = numOps.Multiply(numOps.ToDouble(py1) <= numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero, encW);
+            dEncA[2] = numOps.Multiply(numOps.ToDouble(px2) >= numOps.ToDouble(tx2) ? numOps.One : numOps.Zero, encH);
+            dEncA[3] = numOps.Multiply(numOps.ToDouble(py2) >= numOps.ToDouble(ty2) ? numOps.One : numOps.Zero, encW);
 
             // GIoU penalty = (U - encA) / encA → d/d(coord) = -(dU*encA - U*dEncA)/encA^2
             var go = gradOutput[i];
@@ -3475,10 +3508,10 @@ internal static class BackwardFunctions<T>
             var hi = hasIntersection ? numOps.One : numOps.Zero;
 
             var dI = new T[4];
-            dI[0] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px1) > numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero, ih));
-            dI[1] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py1) > numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero, iw));
-            dI[2] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px2) < numOps.ToDouble(tx2) ? numOps.One : numOps.Zero, ih));
-            dI[3] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py2) < numOps.ToDouble(ty2) ? numOps.One : numOps.Zero, iw));
+            dI[0] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px1) >= numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero, ih));
+            dI[1] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py1) >= numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero, iw));
+            dI[2] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px2) <= numOps.ToDouble(tx2) ? numOps.One : numOps.Zero, ih));
+            dI[3] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py2) <= numOps.ToDouble(ty2) ? numOps.One : numOps.Zero, iw));
             var dU = new T[] {
                 numOps.Subtract(numOps.Negate(ph), dI[0]), numOps.Subtract(numOps.Negate(pw), dI[1]),
                 numOps.Subtract(ph, dI[2]), numOps.Subtract(pw, dI[3])
@@ -3502,10 +3535,10 @@ internal static class BackwardFunctions<T>
 
             var two = numOps.FromDouble(2.0);
             var dCSq = new T[4];
-            dCSq[0] = numOps.Multiply(numOps.Multiply(two, encDx), numOps.ToDouble(px1) < numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero);
-            dCSq[1] = numOps.Multiply(numOps.Multiply(two, encDy), numOps.ToDouble(py1) < numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero);
-            dCSq[2] = numOps.Multiply(numOps.Multiply(two, encDx), numOps.ToDouble(px2) > numOps.ToDouble(tx2) ? numOps.One : numOps.Zero);
-            dCSq[3] = numOps.Multiply(numOps.Multiply(two, encDy), numOps.ToDouble(py2) > numOps.ToDouble(ty2) ? numOps.One : numOps.Zero);
+            dCSq[0] = numOps.Multiply(numOps.Multiply(two, encDx), numOps.ToDouble(px1) <= numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero);
+            dCSq[1] = numOps.Multiply(numOps.Multiply(two, encDy), numOps.ToDouble(py1) <= numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero);
+            dCSq[2] = numOps.Multiply(numOps.Multiply(two, encDx), numOps.ToDouble(px2) >= numOps.ToDouble(tx2) ? numOps.One : numOps.Zero);
+            dCSq[3] = numOps.Multiply(numOps.Multiply(two, encDy), numOps.ToDouble(py2) >= numOps.ToDouble(ty2) ? numOps.One : numOps.Zero);
 
             var go = gradOutput[i];
             for (int c = 0; c < 4; c++)
@@ -3555,10 +3588,10 @@ internal static class BackwardFunctions<T>
             var hi = hasIntersection ? numOps.One : numOps.Zero;
 
             var dI = new T[4];
-            dI[0] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px1) > numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero, ih));
-            dI[1] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py1) > numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero, iw));
-            dI[2] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px2) < numOps.ToDouble(tx2) ? numOps.One : numOps.Zero, ih));
-            dI[3] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py2) < numOps.ToDouble(ty2) ? numOps.One : numOps.Zero, iw));
+            dI[0] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px1) >= numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero, ih));
+            dI[1] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py1) >= numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero, iw));
+            dI[2] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px2) <= numOps.ToDouble(tx2) ? numOps.One : numOps.Zero, ih));
+            dI[3] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py2) <= numOps.ToDouble(ty2) ? numOps.One : numOps.Zero, iw));
             var dU = new T[] {
                 numOps.Subtract(numOps.Negate(ph), dI[0]), numOps.Subtract(numOps.Negate(pw), dI[1]),
                 numOps.Subtract(ph, dI[2]), numOps.Subtract(pw, dI[3])
@@ -3579,10 +3612,10 @@ internal static class BackwardFunctions<T>
             var cSqSq = numOps.Multiply(cSq, cSq);
             var two = numOps.FromDouble(2.0);
             var dCSq = new T[4];
-            dCSq[0] = numOps.Multiply(numOps.Multiply(two, encDx), numOps.ToDouble(px1) < numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero);
-            dCSq[1] = numOps.Multiply(numOps.Multiply(two, encDy), numOps.ToDouble(py1) < numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero);
-            dCSq[2] = numOps.Multiply(numOps.Multiply(two, encDx), numOps.ToDouble(px2) > numOps.ToDouble(tx2) ? numOps.One : numOps.Zero);
-            dCSq[3] = numOps.Multiply(numOps.Multiply(two, encDy), numOps.ToDouble(py2) > numOps.ToDouble(ty2) ? numOps.One : numOps.Zero);
+            dCSq[0] = numOps.Multiply(numOps.Multiply(two, encDx), numOps.ToDouble(px1) <= numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero);
+            dCSq[1] = numOps.Multiply(numOps.Multiply(two, encDy), numOps.ToDouble(py1) <= numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero);
+            dCSq[2] = numOps.Multiply(numOps.Multiply(two, encDx), numOps.ToDouble(px2) >= numOps.ToDouble(tx2) ? numOps.One : numOps.Zero);
+            dCSq[3] = numOps.Multiply(numOps.Multiply(two, encDy), numOps.ToDouble(py2) >= numOps.ToDouble(ty2) ? numOps.One : numOps.Zero);
 
             // Aspect ratio penalty: v = (4/pi^2) * (atan(tw/th) - atan(pw/ph))^2
             double piSq = Math.PI * Math.PI;
