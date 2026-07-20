@@ -449,6 +449,9 @@ void main() {
     uint row = gl_GlobalInvocationID.x;
     if (row >= batch * queryHeads * seqQ) return;
     uint queryIndex = row % seqQ;
+    // KV-cache causal offset: query row queryIndex is at absolute position queryIndex + (seqK - seqQ);
+    // seqQ==seqK collapses to keyIndex > queryIndex (prefill), decode attends to the whole cached prefix.
+    uint qPos = queryIndex + (seqK - seqQ);
     uint q = row / seqQ;
     uint queryHead = q % queryHeads;
     uint batchIndex = q / queryHeads;
@@ -456,19 +459,19 @@ void main() {
     uint kvHead = queryHead / queriesPerKv;
     float rowMax = -3.402823466e+38;
     for (uint keyIndex = 0u; keyIndex < seqK; ++keyIndex) {
-        if ((causal != 0u && keyIndex > queryIndex) || attentionMasked(batchIndex, queryHead, queryIndex, keyIndex)) continue;
+        if ((causal != 0u && keyIndex > qPos) || attentionMasked(batchIndex, queryHead, queryIndex, keyIndex)) continue;
         rowMax = max(rowMax, attentionScore(batchIndex, queryHead, kvHead, queryIndex, keyIndex));
     }
     float denominator = 0.0;
     for (uint keyIndex = 0u; keyIndex < seqK; ++keyIndex) {
-        if ((causal != 0u && keyIndex > queryIndex) || attentionMasked(batchIndex, queryHead, queryIndex, keyIndex)) continue;
+        if ((causal != 0u && keyIndex > qPos) || attentionMasked(batchIndex, queryHead, queryIndex, keyIndex)) continue;
         denominator += exp(attentionScore(batchIndex, queryHead, kvHead, queryIndex, keyIndex) - rowMax);
     }
     uint weightOffset = row * seqK;
     if (writeWeights != 0u) {
         for (uint keyIndex = 0u; keyIndex < seqK; ++keyIndex) {
             float weight = 0.0;
-            if ((causal == 0u || keyIndex <= queryIndex) && !attentionMasked(batchIndex, queryHead, queryIndex, keyIndex) && denominator > 0.0)
+            if ((causal == 0u || keyIndex <= qPos) && !attentionMasked(batchIndex, queryHead, queryIndex, keyIndex) && denominator > 0.0)
                 weight = exp(attentionScore(batchIndex, queryHead, kvHead, queryIndex, keyIndex) - rowMax) / denominator;
             weightData[weightOffset + keyIndex] = weight;
         }
@@ -478,7 +481,7 @@ void main() {
     for (uint d0 = 0u; d0 < headDim; ++d0) {
         float sum = 0.0;
         for (uint keyIndex = 0u; keyIndex < seqK; ++keyIndex) {
-            if ((causal != 0u && keyIndex > queryIndex) || attentionMasked(batchIndex, queryHead, queryIndex, keyIndex) || denominator <= 0.0) continue;
+            if ((causal != 0u && keyIndex > qPos) || attentionMasked(batchIndex, queryHead, queryIndex, keyIndex) || denominator <= 0.0) continue;
             float weight = exp(attentionScore(batchIndex, queryHead, kvHead, queryIndex, keyIndex) - rowMax) / denominator;
             sum += weight * valueData[valueOffset + keyIndex * headDim + d0];
         }
@@ -527,7 +530,7 @@ float gradAttention(uint batchIndex, uint queryHead, uint queryIndex, uint keyIn
     return sum;
 }
 float gradScore(uint batchIndex, uint queryHead, uint queryIndex, uint keyIndex, uint kvHead) {
-    if (causal != 0u && keyIndex > queryIndex) return 0.0;
+    if (causal != 0u && keyIndex > qPos) return 0.0;
     uint weightOffset = ((batchIndex * queryHeads + queryHead) * seqQ + queryIndex) * seqK;
     float dot = 0.0;
     for (uint j = 0u; j < seqK; ++j)

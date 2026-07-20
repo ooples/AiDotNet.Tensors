@@ -4632,7 +4632,9 @@ struct AttentionForwardParams {
 @group(0) @binding(7) var<uniform> attention_params: AttentionForwardParams;
 
 fn attention_forward_excluded(b: u32, q_head: u32, q_pos: u32, k_pos: u32) -> bool {
-    if (attention_params.is_causal != 0u && k_pos > q_pos) { return true; }
+    // KV-cache causal offset: query q_pos sits at absolute position q_pos + (seq_k - seq_q); seq_q==seq_k
+    // collapses to k_pos > q_pos (prefill), while a decode step attends to the whole cached prefix.
+    if (attention_params.is_causal != 0u && k_pos > q_pos + (attention_params.seq_k - attention_params.seq_q)) { return true; }
     if (attention_params.boolean_mask_mode == 0u) { return false; }
     var mask_base: u32 = 0u;
     if (attention_params.boolean_mask_mode == 2u) {
