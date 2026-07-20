@@ -26406,22 +26406,35 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             // The SDPA reads mask[b, h, i, j] with explicit head/batch indices, so materialize the full shape
             // (the same causal plane is shared across batch and heads). true = key visible to this query.
+            // The mask depends only on (batch, qHeads, seqQ, seqK), so cache it by shape: steady-state prefill
+            // (constant shape) reuses one immutable tensor instead of allocating + filling batch·qHeads·seqQ·seqK
+            // bools every forward. Decode grows seqK by one each step, so those shapes are distinct (bounded set).
             int batch = query._shape[0];
             int seqQ = query._shape[2];
             int seqK = k._shape[2];
-            int offset = seqK - seqQ; // KV-cache offset: query i is at absolute key position i + offset.
-            var maskData = new bool[batch * qHeads * seqQ * seqK];
-            int idx = 0;
-            for (int b = 0; b < batch; b++)
-                for (int h = 0; h < qHeads; h++)
-                    for (int i = 0; i < seqQ; i++)
-                        for (int j = 0; j < seqK; j++)
-                            maskData[idx++] = j <= i + offset;
-            mask = new Tensor<bool>(maskData, new[] { batch, qHeads, seqQ, seqK });
+            mask = _gqaCausalMaskCache.GetOrAdd((batch, qHeads, seqQ, seqK), static key =>
+            {
+                var (b0, h0, sq, sk) = key;
+                int offset = sk - sq; // KV-cache offset: query i is at absolute key position i + offset.
+                var maskData = new bool[b0 * h0 * sq * sk];
+                int idx = 0;
+                for (int b = 0; b < b0; b++)
+                    for (int h = 0; h < h0; h++)
+                        for (int i = 0; i < sq; i++)
+                            for (int j = 0; j < sk; j++)
+                                maskData[idx++] = j <= i + offset;
+                return new Tensor<bool>(maskData, new[] { b0, h0, sq, sk });
+            });
         }
 
         return ScaledDotProductAttention(query, k, v, mask, scale, out _, softcap);
     }
+
+    // Causal mask is a pure function of (batch, qHeads, seqQ, seqK); cache the materialized tensor so
+    // steady-state same-shape forwards reuse it instead of re-allocating. The cached tensors are treated
+    // as read-only by the SDPA kernel.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(int, int, int, int), Tensor<bool>>
+        _gqaCausalMaskCache = new();
 
     // Repeats each KV head across its query-head group: [batch, kvHeads, seq, headDim] -> [batch, qHeads, seq, headDim].
     private static Tensor<T> BroadcastKvHeads<T>(Tensor<T> kv, int qHeads)
