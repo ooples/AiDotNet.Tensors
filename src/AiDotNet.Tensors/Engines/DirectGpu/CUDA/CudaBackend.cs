@@ -175,6 +175,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private IntPtr _roiModule;
     private IntPtr _audioModule;
     private IntPtr _linalgModule;
+    private IntPtr _annModule;
     private bool _disposed;
 
     // Process-exit guard: at process/AppDomain teardown the CUDA driver may already be unloaded, so calling ANY
@@ -1180,6 +1181,23 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         catch
         {
             _linalgModule = IntPtr.Zero;
+        }
+
+        // Native ANN kernels (IAnnBackend): fused IVF / PQ / IVFPQ / HNSW
+        // primitives replacing the external FaissNet/MKL dependency. Same
+        // best-effort policy — NVRTC failure falls through to the managed
+        // AnnPrimitives CPU reference.
+        try
+        {
+            _annModule = CompileKernelModule(device,
+                Kernels.CudaAnnKernels.GetSource(),
+                "ann_kernels",
+                Kernels.CudaAnnKernels.GetKernelNames());
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"CUDA ANN kernel compilation failed: {ex.Message}");
+            _annModule = IntPtr.Zero;
         }
     }
 
@@ -15800,6 +15818,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         {
             CudaNativeBindings.cuModuleUnload(_audioModule);
             _audioModule = IntPtr.Zero;
+        }
+
+        if (_annModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_annModule);
+            _annModule = IntPtr.Zero;
         }
 
         if (_cudaContext != IntPtr.Zero)

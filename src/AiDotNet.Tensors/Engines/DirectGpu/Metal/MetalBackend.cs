@@ -71,6 +71,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     private IntPtr _linalgLibrary;
     private IntPtr _fftLibrary;
     private IntPtr _detectionLibrary;
+    private IntPtr _annLibrary; // fused ANN kernels (IAnnBackend: IVF / PQ / IVFPQ / HNSW primitives)
     private IntPtr _geometryLibrary;
     private IntPtr _roiLibrary;
     private IntPtr _audioLibrary;
@@ -333,6 +334,19 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         {
             System.Diagnostics.Debug.WriteLine($"Metal Detection pre-compilation warning: {ex.Message}");
             _detectionLibrary = IntPtr.Zero;
+        }
+
+        // Fused ANN kernels. IAnnBackend dispatch (IVF / PQ / IVFPQ / HNSW primitives).
+        // Supply-chain-clean replacement for FaissNet/MKL; optional — on compile
+        // failure IAnnBackend calls throw and the engine falls back to AnnPrimitives.
+        try
+        {
+            _annLibrary = _shaderLibrary.CompileLibrary("Ann", MetalAnnKernels.Source);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Metal ANN pre-compilation warning: {ex.Message}");
+            _annLibrary = IntPtr.Zero;
         }
 
         // Geometry / sampling kernels (#217). IGeometryBackend dispatch.
