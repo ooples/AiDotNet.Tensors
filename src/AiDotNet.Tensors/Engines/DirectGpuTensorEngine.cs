@@ -19549,9 +19549,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var bufOut = AllocateOutputBuffer(backend, tensor.Length);
             backend.Threshold(bufIn.Buffer, bufOut.Buffer, threshF, valueF, tensor.Length);
             var output = DeferTensorResult<T>(backend, bufOut.Buffer, tensor.Length, tensor.Shape.ToArray());
+            // Saved state MUST be a boxed double, matching what CpuEngine records and what
+            // ThresholdBackward unboxes with (double)savedState[0]. Boxing the raw T instead threw
+            // InvalidCastException("Single -> Double") on the FIRST backward pass of any float model,
+            // because unboxing in .NET requires the exact type — (double)(object)1.0f does not convert.
+            // Forward parity could never see it: the forward result was correct.
             Autodiff.DifferentiableOps.RecordUnary("Threshold", output, tensor,
                 Autodiff.BackwardFunctions<T>.ThresholdBackward,
-                new object[] { threshold as object ?? new object() });
+                new object[] { MathHelper.GetNumericOperations<T>().ToDouble(threshold) });
             return output;
         }
         catch (Exception)

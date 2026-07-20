@@ -1833,10 +1833,27 @@ internal static class BackwardFunctions<T>
         var indices = (Tensor<int>)savedState[0];
         var axis = (int)savedState[1];
 
-        // Gradient flows to both destination and updates
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradOutput, engine);
-        var gradUpdates = engine.TensorGather(gradOutput, indices, axis);
-        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradUpdates, engine);
+        // TWO different ops share this backward, and they have different arities:
+        //   TensorScatterAdd(destination, indices, updates, axis) records BINARY  — inputs[0], inputs[1]
+        //   ScatterAdd(source, indices, dim, outputSize)          records UNARY   — inputs[0] only
+        // Reading inputs[1] unconditionally threw IndexOutOfRangeException on every ScatterAdd backward.
+        //
+        // The arities also imply different gradients. For the BINARY form the output has the destination's
+        // shape, so d/d(destination) is a pass-through and d/d(updates) gathers. For the UNARY form the
+        // output is a larger scattered buffer (e.g. [4,8] -> [6,8]), so d/d(source) must GATHER the rows
+        // back from the scattered positions — passing gradOutput through would have been both the wrong
+        // shape and the wrong value.
+        var gradGathered = engine.TensorGather(gradOutput, indices, axis);
+
+        if (inputs.Length > 1)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], gradOutput, engine);
+            DifferentiableOps.AccumulateGrad(grads, inputs[1], gradGathered, engine);
+        }
+        else
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], gradGathered, engine);
+        }
     }
 
     /// <summary>ExpandDims backward: squeeze the added dimension</summary>
@@ -2764,10 +2781,45 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        // dx = gradOutput * x / norm — use broadcast ops for scalar norm
+        // dx = gradOutput * x / norm.
+        //
+        // The AXIS overload records its axis in savedState[0], but this backward used to ignore it and
+        // broadcast the reduced tensors directly against the input. Broadcasting aligns from the RIGHT, so
+        // TensorNorm(x[4,32], axis:1) produced output [4] and then threw
+        // "shapes [4] and [4,32] cannot be broadcast" — every axis norm crashed on its backward pass.
+        // Only the global overload (which records NO savedState and yields a scalar) ever worked.
+        //
+        // Restoring the reduced axis as a size-1 dimension makes the broadcast align correctly: [4,1]
+        // against [4,32]. keepDims:true already has that shape, so the reshape is a no-op there.
         var numOps = MathHelper.GetNumericOperations<T>();
-        var scaledInput = engine.TensorBroadcastMultiply(gradOutput, inputs[0]);
-        var normClamped = engine.TensorClamp(output, numOps.FromDouble(1e-12), numOps.FromDouble(1e30));
+
+        var reducedGrad = gradOutput;
+        var reducedNorm = output;
+        if (savedState is { Length: > 0 } && savedState[0] is int axis)
+        {
+            var inShape = inputs[0]._shape;
+            int rank = inShape.Length;
+            int ax = axis < 0 ? rank + axis : axis;
+            if (ax >= 0 && ax < rank)
+            {
+                var keepShape = new int[rank];
+                for (int d = 0; d < rank; d++) keepShape[d] = d == ax ? 1 : inShape[d];
+
+                // Guard the reshape: it is only valid when the reduced tensor holds exactly the elements
+                // the keep-dims shape describes. A mismatch means the recording and the forward disagree,
+                // which should surface as the original broadcast error rather than a silent reinterpretation.
+                long keepCount = 1;
+                for (int d = 0; d < rank; d++) keepCount *= keepShape[d];
+                if (reducedGrad.Length == keepCount && reducedNorm.Length == keepCount)
+                {
+                    reducedGrad = engine.Reshape(reducedGrad, keepShape);
+                    reducedNorm = engine.Reshape(reducedNorm, keepShape);
+                }
+            }
+        }
+
+        var scaledInput = engine.TensorBroadcastMultiply(reducedGrad, inputs[0]);
+        var normClamped = engine.TensorClamp(reducedNorm, numOps.FromDouble(1e-12), numOps.FromDouble(1e30));
         var grad = engine.TensorBroadcastDivide(scaledInput, normClamped);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -4310,6 +4362,30 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        // TensorBatchOuterProduct shares this backward with the unbatched TensorOuterProduct, but only the
+        // unbatched shapes were ever handled. Batched: a is [B,M], b is [B,N], grad is [B,M,N]. Flattening b
+        // to [B*N,1] collapses the batch dimension, so the matmul threw
+        // "last dim of a is 5, first dim of b is 20" for a=[4,3], b=[4,5].
+        //
+        // Batched gradients, from out[b,i,j] = a[b,i] * b[b,j]:
+        //   da[b,i] = sum_j grad[b,i,j] * b[b,j]      -> broadcast b as [B,1,N], reduce axis 2
+        //   db[b,j] = sum_i grad[b,i,j] * a[b,i]      -> broadcast a as [B,M,1], reduce axis 1
+        if (gradOutput.Rank == 3 && inputs[0].Rank == 2 && inputs[1].Rank == 2)
+        {
+            int batch = inputs[0]._shape[0];
+            int m = inputs[0]._shape[1];
+            int n = inputs[1]._shape[1];
+
+            var bBroadcast = inputs[1].Reshape(new[] { batch, 1, n });
+            var dA = engine.ReduceSum(engine.TensorBroadcastMultiply(gradOutput, bBroadcast), new[] { 2 });
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], dA.Reshape(inputs[0]._shape), engine);
+
+            var aBroadcast = inputs[0].Reshape(new[] { batch, m, 1 });
+            var dB = engine.ReduceSum(engine.TensorBroadcastMultiply(gradOutput, aBroadcast), new[] { 1 });
+            DifferentiableOps.AccumulateGrad(grads, inputs[1], dB.Reshape(inputs[1]._shape), engine);
+            return;
+        }
+
         // grad is [M, N], a is [M], b is [N]
         // da = sum(grad * b_broadcast, axis=1) = grad @ b
         var gradA = engine.TensorMatMul(gradOutput, inputs[1].Reshape(new[] { inputs[1].Length, 1 }));

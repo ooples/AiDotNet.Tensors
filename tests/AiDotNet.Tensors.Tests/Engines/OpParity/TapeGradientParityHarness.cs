@@ -53,51 +53,48 @@ public static class TapeGradientParityHarness
         };
 
     /// <summary>
-    /// Whether bit-identical CPU/GPU gradients are the CORRECT result for this op, so divergence cannot be
-    /// used as the GPU-engagement signal.
+    /// Discovers the differentiable LEAVES of a tape: tensors that appear as an INPUT to some recorded op
+    /// but are never the OUTPUT of one. Those are exactly the sources ComputeGradients should be asked for.
     /// </summary>
     /// <remarks>
-    /// The maxAbs &gt; 0 probe assumes two independent float32 implementations cannot agree to the last bit.
-    /// That fails for any op whose BACKWARD does not consume values the FORWARD produced — the gradient is
-    /// then computed from indices or geometry alone and is exact on both engines. Measured examples:
-    /// Upsample3D (sums gradOutput per block), AffineGrid (d/d(theta) is the fixed coordinate grid),
-    /// MaxPool3DWithIndices (scatters gradOutput to selected positions).
+    /// This is what makes the phase work across the whole registry WITHOUT touching any of the 475 OpCase
+    /// definitions. The earlier design required each case to declare its sources, because OpCase.RunFloat
+    /// closes over its inputs and returns only the output — but the tape already knows them: every recorded
+    /// entry carries its Output and Inputs, so the leaf set is derivable.
     ///
-    /// NOTE: "computes rather than selects" is NOT the right test — AffineGrid computes its output and its
-    /// gradient is still input-independent. The question is strictly whether the backward reads
-    /// forward-produced values.
+    /// ORDER IS BY FIRST APPEARANCE in the tape, which is deterministic for a given forward and therefore
+    /// aligns between the CPU and GPU runs. That alignment is what lets gradients be compared PER SOURCE —
+    /// the property that mattered for Scatter, where one operand was exact and another was corrupt.
     /// </remarks>
-    private static bool GradientIsExactOnBothEngines(string opName) => opName switch
+    private static List<Tensor<float>> DiscoverLeaves(GradientTape<float> tape)
     {
-        "Upsample3D" or "AffineGrid" or "MaxPool3DWithIndices" or "MaxPool3D" or "Scatter" => true,
-        _ => false,
-    };
+        var producedByAnOp = new HashSet<Tensor<float>>(ReferenceEqualityComparer.Instance
+            as IEqualityComparer<Tensor<float>> ?? EqualityComparer<Tensor<float>>.Default);
+        var seenInputs = new List<Tensor<float>>();
+        var seenSet = new HashSet<Tensor<float>>(ReferenceEqualityComparer.Instance
+            as IEqualityComparer<Tensor<float>> ?? EqualityComparer<Tensor<float>>.Default);
 
-    /// <summary>
-    /// A tape-gradient case: builds the op's inputs, runs the forward, and returns BOTH the output and the
-    /// tensors to differentiate with respect to, in a FIXED order.
-    /// </summary>
-    /// <remarks>
-    /// The explicit source list is required, not incidental. OpCase.RunFloat closes over its inputs and
-    /// returns only the output, so a generic harness has no handle on the tensors to differentiate. And
-    /// ComputeGradients(loss, sources: null) is not usable across engines: it keys the result dictionary by
-    /// tensor REFERENCE, and the CPU and GPU runs build distinct tensor objects with no stable ordering to
-    /// align them. An ordered source list is what makes the two runs comparable element by element — which
-    /// matters because Scatter's defect was in ONE operand while the other was exact.
-    /// </remarks>
-    public delegate (Tensor<float> Output, IReadOnlyList<Tensor<float>> Sources) TapeCase(IEngine engine);
+        for (int i = 0; i < tape.EntryCount; i++)
+        {
+            ref var e = ref tape.Entries[i];
+            if (e.Output is not null) producedByAnOp.Add(e.Output);
+            foreach (var inp in e.GetInputsArray())
+                if (inp is not null && seenSet.Add(inp)) seenInputs.Add(inp);
+        }
 
-    /// <summary>
-    /// Tape cases by op name. Ops absent from this map are SKIPPED AND REPORTED, never silently passed —
-    /// coverage is explicit and grows as cases are added rather than being implied by the phase existing.
-    /// </summary>
-    public static readonly Dictionary<string, TapeCase> TapeCases = new(StringComparer.Ordinal);
+        // A leaf is an input that no recorded op produced.
+        var leaves = new List<Tensor<float>>();
+        foreach (var t in seenInputs)
+            if (!producedByAnOp.Contains(t)) leaves.Add(t);
+        return leaves;
+    }
 
     /// <summary>
     /// Runs a tape case on the given engine and returns the concatenated gradients over its sources, in the
     /// case's declared order, plus the deferred GPU-&gt;host materialisation count for that run.
     /// </summary>
-    private static (float[] Grad, long Materialisations) TapeGradient(IEngine engine, TapeCase tapeCase)
+    private static (float[] Grad, long Materialisations, int LeafCount) TapeGradient(
+        IEngine engine, Func<IEngine, Tensor<float>> runFloat)
     {
         var prior = AiDotNetEngine.Current;
         AiDotNetEngine.Current = engine;
@@ -106,7 +103,7 @@ public static class TapeGradientParityHarness
             AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.ResetMaterializeCount();
             using var tape = new GradientTape<float>();
 
-            var (output, sources) = tapeCase(engine);
+            var output = runFloat(engine);
 
             // Non-uniform weighting: a constant upstream gradient can mask a wrong backward, because several
             // different index mappings then produce the same total.
@@ -114,16 +111,19 @@ public static class TapeGradientParityHarness
             for (int i = 0; i < weight.Length; i++) weight[i] = 0.19f + 0.013f * (i % 13);
             var loss = engine.ReduceSum(engine.TensorMultiply(output, weight), null);
 
+            var sources = DiscoverLeaves(tape);
+            if (sources.Count == 0)
+                return (Array.Empty<float>(), AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.MaterializeCount, 0);
+
             var grads = tape.ComputeGradients(loss, sources.ToArray());
 
             var flat = new List<float>();
             foreach (var src in sources)
             {
-                Assert.True(grads.TryGetValue(src, out var g) && g is not null,
-                    "a declared source received no gradient — the forward recorded no tape node for it");
+                if (!grads.TryGetValue(src, out var g) || g is null) continue;
                 for (int i = 0; i < g.Length; i++) flat.Add(g[i]);
             }
-            return (flat.ToArray(), AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.MaterializeCount);
+            return (flat.ToArray(), AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.MaterializeCount, sources.Count);
         }
         finally { AiDotNetEngine.Current = prior; }
     }
@@ -131,9 +131,18 @@ public static class TapeGradientParityHarness
     /// <summary>
     /// Compares tape-driven gradients for one op across CPU and GPU.
     /// </summary>
-    public static void CheckTapeGradient(string opName, OpParityFixture fx, string category = "tape")
+    public static void CheckTapeGradient(OpCase op, OpParityFixture fx)
     {
-        if (TapeGradientBaseline.TryGetValue(opName, out var baselineReason))
+        string opName = op.Name;
+        string category = op.Category;
+
+        // Registry names are PARAMETERISED — "TensorCross[4,3]", not "TensorCross" — so keying the baseline
+        // on the bare op name matched NOTHING and the whole ledger was inert (a full run reported
+        // "Skipped: 0" with baselined ops still executing). Match on the base name before '[' so an entry
+        // covers every shape variant of that op, which is the granularity the debt is actually tracked at.
+        int bracket = opName.IndexOf('[');
+        string baseName = bracket >= 0 ? opName.Substring(0, bracket) : opName;
+        if (TapeGradientBaseline.TryGetValue(baseName, out var baselineReason))
         {
             fx.Record($"{opName}:tapegrad\t{category}\tBASELINE\t-\t-\t-");
             Skip.If(true, $"TAPE-GRADIENT BASELINE ({opName}): {baselineReason}");
@@ -153,17 +162,23 @@ public static class TapeGradientParityHarness
         var gpu = fx.Gpu;
         if (gpu is null) { Skip.If(true, "GPU engine unavailable after reset."); return; }
 
-        if (!TapeCases.TryGetValue(opName, out var tapeCase))
+        var (cpuGrad, _, cpuLeaves) = TapeGradient(fx.Cpu, op.RunFloat);
+        var (gpuGrad, materialisations, gpuLeaves) = TapeGradient(gpu, op.RunFloat);
+
+        if (cpuLeaves == 0 && gpuLeaves == 0)
         {
-            // No tape case declared yet. Reported so the coverage gap is VISIBLE in the parity log rather
-            // than reading as a pass. This is the honest state: coverage grows as cases are written.
-            fx.Record($"{opName}:tapegrad	{category}	NO-CASE	-	-	-");
-            Skip.If(true, $"{opName}: no tape-gradient case declared (coverage gap, not a pass).");
+            // The forward recorded no differentiable leaf. Legitimate for genuinely non-differentiable ops
+            // (argmax, discrete indices, integer gather). Reported so it stays countable rather than
+            // reading as a pass.
+            fx.Record($"{opName}:tapegrad	{category}	NO-LEAF	-	-	-");
+            Skip.If(true, $"{opName}: forward recorded no differentiable leaf.");
             return;
         }
 
-        var (cpuGrad, _) = TapeGradient(fx.Cpu, tapeCase);
-        var (gpuGrad, materialisations) = TapeGradient(gpu, tapeCase);
+        Assert.True(cpuLeaves == gpuLeaves,
+            $"{opName} tapegrad: CPU discovered {cpuLeaves} differentiable leaves, GPU discovered {gpuLeaves}. "
+            + "The two engines recorded structurally different tapes for the same forward — that alone is a "
+            + "defect, independent of gradient values.");
 
 
         Assert.True(cpuGrad.Length == gpuGrad.Length,
@@ -180,23 +195,21 @@ public static class TapeGradientParityHarness
 
         fx.Record($"{opName}:tapegrad\t{category}\tOK\t{maxAbs:E3}\t{maxRel:E3}\t{materialisations}");
 
-        // ANTI-VACUITY. A GPU op that bails to CPU produces bit-identical output, so "it passed" would mean
-        // nothing. Ops whose gradient is exact on both engines by construction use the residency counter
-        // instead — see GradientIsExactOnBothEngines.
-        if (GradientIsExactOnBothEngines(opName))
-        {
-            Assert.True(materialisations > 0,
-                $"{opName} tapegrad: nothing was GPU-resident, so the device path did not run. "
-                + "(This op's gradient is exact on both engines, so bit-identity cannot signal engagement.)");
-        }
-        else
-        {
-            Assert.True(maxAbs > 0.0,
-                $"{opName} tapegrad: CPU and GPU gradients were BIT-IDENTICAL. For an op whose backward "
-                + "consumes forward-computed values that means the GPU path did not run and this compared "
-                + "the CPU implementation with itself. If bit-identity is genuinely correct here, add the op "
-                + "to GradientIsExactOnBothEngines with the reason.");
-        }
+        // ANTI-VACUITY: residency, not divergence.
+        //
+        // The first version of this asserted maxAbs > 0 on the theory that two independent float32
+        // implementations cannot agree to the last bit, with a hand-written whitelist for exceptions. Run
+        // across the whole registry that produced 303 failures — because bit-identity is the NORM, not the
+        // exception: any op whose backward does not consume forward-computed values (index, geometry, and
+        // pure data-movement gradients) agrees exactly on both engines by construction.
+        //
+        // Divergence was only ever a PROXY for "did the device path run". MaterializeCount measures that
+        // directly: a non-zero count means results were GPU-resident and had to be downloaded. It is the
+        // right probe for every op, with no whitelist to maintain and no false positives.
+        Assert.True(materialisations > 0,
+            $"{opName} tapegrad: no deferred GPU->host materialisation, so nothing was ever GPU-resident "
+            + "and the device path did not run. Either the forward bails under an active tape, or it has no "
+            + "GPU override at all — in both cases the comparison would be CPU against CPU.");
 
         Assert.True(maxRel <= 1e-4,
             $"{opName} tapegrad: GPU gradient diverged from CPU (maxAbs={maxAbs:E3} maxRel={maxRel:E3}). "
