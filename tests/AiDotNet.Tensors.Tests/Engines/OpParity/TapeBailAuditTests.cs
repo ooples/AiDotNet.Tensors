@@ -65,9 +65,7 @@ public class TapeBailAuditTests
     /// </remarks>
     private static readonly string[] KnownUnfixed =
     {
-        "AffineGrid",
         "MaxPool3DWithIndices",
-        "RBFKernel",
 
         // Reverted after a gradient test FAILED it. Recording CpuEngine's ScatterBackward on the GPU result
         // gave d(values) exactly right but d(input) wrong by 3.14e-01. Scatter overwrites input at the
@@ -103,6 +101,8 @@ public class TapeBailAuditTests
         "TensorCosh",
         "TensorSinh",
         "Upsample3D",
+        "AffineGrid",
+        "RBFKernel",
     };
 
     private static Dictionary<string, (bool HasKernel, bool Bails)> ScanGpuOverrides(string gpuSrc)

@@ -160,6 +160,93 @@ public class GpuTapeGradientParityTests : IDisposable
             static (e, t) => e.Upsample3D(t, 2, 2, 2),
             probe: Engagement.UseResidencyCounter);
 
+    /// <summary>
+    /// AffineGrid: theta is [batch, 2, 3], grid is [batch, H, W, 2].
+    /// </summary>
+    /// <remarks>
+    /// Uses the RESIDENCY probe, not divergence. d(grid)/d(theta) is the normalized coordinate grid, fixed
+    /// entirely by the output geometry (H, W) — it does NOT depend on any value the forward produced. So
+    /// forward precision never reaches the gradient and CPU/GPU agree to the last bit, exactly as for
+    /// Upsample3D. Measured: maxAbs 0.000E+000 with 4 materialisations, i.e. the device path ran and the
+    /// exact agreement is correct.
+    ///
+    /// The general rule this establishes: the divergence probe is only valid when the BACKWARD consumes
+    /// values the FORWARD computed. "Computes rather than selects" is not sufficient — that was the
+    /// distinction I first reasoned from, and it predicted a non-zero delta here, wrongly.
+    /// </remarks>
+    [Fact]
+    public void AffineGrid_gradients_match_cpu() =>
+        AssertGradientParity("AffineGrid", Rand([2, 2, 3], seed: 41),
+            static (e, t) => e.AffineGrid(t, 5, 7),
+            probe: Engagement.UseResidencyCounter);
+
+    /// <summary>
+    /// RBFKernel records THREE differentiable inputs (input, centers, epsilons), so all three are checked.
+    /// Scatter showed one operand can be exactly right while another is corrupt.
+    /// </summary>
+    /// <remarks>
+    /// EPSILONS ARE DELIBERATELY UNIFORM. CpuEngine saves only epsilons[0] as backward state, so
+    /// RBFKernelBackward treats the width as shared across all centers — with varying epsilons the CPU
+    /// reference is itself wrong for centers 1..n, and agreeing with a wrong reference would prove nothing.
+    /// Uniform epsilons keep the reference correct so this test measures the GPU, not the shared defect.
+    /// </remarks>
+    [Fact]
+    public void RBFKernel_gradients_match_cpu_for_all_three_operands()
+    {
+        Assert.True(TryGpu(out var gpu) && gpu is not null,
+            "GPU backend did not resolve — RBFKernel would have been compared against itself.");
+
+        using (gpu)
+        {
+            const int batch = 4, features = 3, centers = 5;
+            var inputSeed = Rand([batch, features], seed: 51);
+            var centerSeed = Rand([centers, features], seed: 52);
+
+            (float[] gi, float[] gc, float[] ge, long mat) Run(IEngine engine)
+            {
+                AiDotNetEngine.Current = engine;
+                var x = new Tensor<float>([batch, features]);
+                for (int i = 0; i < x.Length; i++) x[i] = inputSeed[i];
+                var c = new Tensor<float>([centers, features]);
+                for (int i = 0; i < c.Length; i++) c[i] = centerSeed[i];
+                var eps = new Tensor<float>([centers]);
+                for (int i = 0; i < centers; i++) eps[i] = 0.75f;   // uniform — see remarks
+
+                AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.ResetMaterializeCount();
+                using var tape = new GradientTape<float>();
+                var y = engine.RBFKernel(x, c, eps);
+
+                var w = new Tensor<float>(y.Shape.ToArray());
+                for (int i = 0; i < w.Length; i++) w[i] = 0.17f + 0.011f * (i % 7);
+                var loss = engine.ReduceSum(engine.TensorMultiply(y, w), null);
+
+                var grads = tape.ComputeGradients(loss, new[] { x, c, eps });
+                Assert.True(grads.TryGetValue(x, out var g1) && g1 is not null, "no gradient to input");
+                Assert.True(grads.TryGetValue(c, out var g2) && g2 is not null, "no gradient to centers");
+                Assert.True(grads.TryGetValue(eps, out var g3) && g3 is not null, "no gradient to epsilons");
+
+                float[] Flat(Tensor<float> t) { var a = new float[t.Length]; for (int i = 0; i < a.Length; i++) a[i] = t[i]; return a; }
+                return (Flat(g1), Flat(g2), Flat(g3),
+                        AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.MaterializeCount);
+            }
+
+            var (cI, cC, cE, _) = Run(new CpuEngine());
+            var (gI, gC, gE, mat) = Run(gpu);
+
+            double dI = 0, dC = 0, dE = 0;
+            for (int i = 0; i < cI.Length; i++) dI = Math.Max(dI, Math.Abs(cI[i] - gI[i]));
+            for (int i = 0; i < cC.Length; i++) dC = Math.Max(dC, Math.Abs(cC[i] - gC[i]));
+            for (int i = 0; i < cE.Length; i++) dE = Math.Max(dE, Math.Abs(cE[i] - gE[i]));
+
+            _out.WriteLine($"RBFKernel      d(input)={dI:E3}  d(centers)={dC:E3}  d(epsilons)={dE:E3}  materialisations={mat}");
+
+            Assert.True(mat > 0, "RBFKernel: nothing was GPU-resident, so the device path did not run.");
+            Assert.True(dI <= 1e-4, $"RBFKernel input gradient diverged: {dI:E3}");
+            Assert.True(dC <= 1e-4, $"RBFKernel centers gradient diverged: {dC:E3}");
+            Assert.True(dE <= 1e-4, $"RBFKernel epsilons gradient diverged: {dE:E3}");
+        }
+    }
+
     // Scatter has NO test here: its bail was RESTORED because this very test caught a real defect —
     // recording CpuEngine's ScatterBackward on the GPU result gave d(values) exactly right but d(input)
     // wrong by 3.14e-01. Scatter overwrites input at the scattered positions, so d/d(input) must be zero

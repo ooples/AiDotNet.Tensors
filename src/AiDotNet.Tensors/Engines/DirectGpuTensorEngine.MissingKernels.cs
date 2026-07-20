@@ -2390,7 +2390,17 @@ public partial class DirectGpuTensorEngine
 
     Tensor<T> IEngine.RBFKernel<T>(Tensor<T> input, Tensor<T> centers, Tensor<T> epsilons)
     {
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        // No tape bail: the node is recorded below so the GPU kernel survives training. Matches
+        // CpuEngine.RBFKernel — same (input, centers, epsilons) overload, RecordIfActive over all THREE
+        // inputs, RBFKernelBackward, saved state { (double)epsilons[0] }.
+        //
+        // NOTE on that saved state: CpuEngine stores ONLY epsilons[0], so RBFKernelBackward treats the
+        // width as shared across every center. If epsilons vary per center the CPU backward is already
+        // wrong for centers 1..n — a pre-existing question in the CPU path, not introduced here. This
+        // override reproduces the CPU contract exactly rather than silently diverging from it; the
+        // gradient test therefore uses UNIFORM epsilons, so it verifies the GPU against a reference that
+        // is itself correct.
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || input.Rank != 2 || centers.Rank != 2 || epsilons.Rank != 1
             || input._shape[1] != centers._shape[1] || centers._shape[0] != epsilons._shape[0]
             || !input.IsContiguous || !centers.IsContiguous || !epsilons.IsContiguous
@@ -2415,7 +2425,7 @@ public partial class DirectGpuTensorEngine
             using var negated = backend.AllocateBuffer(numCenters);
             using var row = backend.AllocateBuffer(numCenters);
 
-            return DispatchDeferredGpuOp<T>(backend, outputLength,
+            var rbfResult = DispatchDeferredGpuOp<T>(backend, outputLength,
                 new[] { batchSize, numCenters }, output =>
                 {
                     for (int batch = 0; batch < batchSize; batch++)
@@ -2431,6 +2441,14 @@ public partial class DirectGpuTensorEngine
                         backend.Copy(row, 0, output, batch * numCenters, numCenters);
                     }
                 });
+
+            // epsilons is a caller-supplied host tensor here, so reading element 0 costs no device sync.
+            var rbfSaved = epsilons.Length > 0
+                ? new object[] { Convert.ToDouble(epsilons[0]) }
+                : Array.Empty<object>();
+            DifferentiableOps.RecordIfActive("RBFKernel", rbfResult,
+                new[] { input, centers, epsilons }, BackwardFunctions<T>.RBFKernelBackward, rbfSaved);
+            return rbfResult;
         }
         catch { return base.RBFKernel(input, centers, epsilons); }
     }
@@ -7469,7 +7487,13 @@ public partial class DirectGpuTensorEngine
     // so it ran on the host. Tape/GraphMode defer to the base so it records AffineGridBackward.
     Tensor<T> IEngine.AffineGrid<T>(Tensor<T> theta, int outputHeight, int outputWidth)
     {
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        // No tape bail: the node is recorded below so the GPU kernel survives training. Matches
+        // CpuEngine.AffineGrid exactly — same (theta, outputHeight, outputWidth) overload, RecordUnary over
+        // theta, AffineGridBackward, saved state { outputHeight, outputWidth }. Unlike Scatter this op does
+        // not overwrite or select: the grid is computed FROM theta, so d/d(theta) is a scale rather than an
+        // index-dependent mask — the failure mode that broke Scatter does not apply. Verified by the
+        // gradient test in GpuTapeGradientParityTests, not by that reasoning alone.
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || theta.Rank != 3 || theta.Shape._dims[1] != 2 || theta.Shape._dims[2] != 3
             || outputHeight <= 0 || outputWidth <= 0
             || !TryGetBackend(out var backend))
@@ -7484,7 +7508,10 @@ public partial class DirectGpuTensorEngine
             {
                 backend.AffineGrid(thetaBuf.Buffer, gridBuf.Buffer, batch, outputHeight, outputWidth);
                 var arr = FinishGpuOp<T>(backend, gridBuf, outLen);
-                return new Tensor<T>(arr, new[] { batch, outputHeight, outputWidth, 2 });
+                var grid = new Tensor<T>(arr, new[] { batch, outputHeight, outputWidth, 2 });
+                DifferentiableOps.RecordUnary("AffineGrid", grid, theta,
+                    BackwardFunctions<T>.AffineGridBackward, new object[] { outputHeight, outputWidth });
+                return grid;
             }
             catch { gridBuf.Dispose(); throw; }
         }
