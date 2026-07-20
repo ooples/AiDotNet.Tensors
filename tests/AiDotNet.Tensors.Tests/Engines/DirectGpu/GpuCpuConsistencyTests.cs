@@ -1135,13 +1135,17 @@ public class GpuCpuConsistencyTests
             new[] { hidden, inter });
 
         // Double-precision reference: the ground truth the fp32 GPU accumulation is graded against.
+        // Index the contiguous backing spans directly — the [r,k] indexer would allocate a throwaway
+        // int[] per element (~28M arrays across the triple loop).
         var reference = new double[seq * inter];
+        var inputSpan = input.AsSpan();
+        var weightSpan = weights.AsSpan();
         for (int r = 0; r < seq; r++)
             for (int c = 0; c < inter; c++)
             {
                 double acc = 0.0;
                 for (int k = 0; k < hidden; k++)
-                    acc += (double)input[new[] { r, k }] * weights[new[] { k, c }];
+                    acc += (double)inputSpan[r * hidden + k] * weightSpan[k * inter + c];
                 reference[r * inter + c] = acc;
             }
 
