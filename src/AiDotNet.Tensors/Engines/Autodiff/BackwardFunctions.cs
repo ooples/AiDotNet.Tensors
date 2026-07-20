@@ -3390,6 +3390,71 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradTensor, engine);
     }
 
+    /// <summary>
+    /// Gradient of the CIoU aspect-ratio term v w.r.t. the PREDICTED boxes.
+    /// </summary>
+    /// <remarks>
+    /// CpuEngine.TensorCIoULoss computes v = (4/pi^2)*(atan(tw/th) - atan(pw/ph))^2 in a numeric loop and
+    /// materialises it as `new Tensor&lt;T&gt;(vData, ...)` — a CONSTANT LEAF on the tape. Combined with the
+    /// deliberate StopGradient on alpha, that left CIoU with NO aspect-ratio gradient at all, which makes it
+    /// numerically identical to DIoU during training: the term CIoU exists to add contributed nothing.
+    /// The engine has no differentiable atan to rebuild v from ops, so the node is recorded here with its
+    /// analytic derivative instead.
+    ///
+    /// Using the forward's own definitions pw = relu(px2-px1)+eps, ph = relu(py2-py1)+eps:
+    ///   d(atan(pw/ph))/d(pw) =  ph / (pw^2 + ph^2)
+    ///   d(atan(pw/ph))/d(ph) = -pw / (pw^2 + ph^2)
+    ///   dv/d(pw) = 2*(4/pi^2)*atanDiff*(-d(atan)/d(pw))          [atanDiff = targAtan - predAtan]
+    /// then chained through pw = relu(px2-px1), whose ReLU indicator is carried explicitly so a degenerate
+    /// box contributes zero — matching how the rest of the forward treats those widths.
+    /// </remarks>
+    internal static void CIoUAspectBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var predicted = inputs[0];
+        var target = (Tensor<T>)savedState[0];
+        double eps = 1e-7;
+        double fourOverPiSq = 4.0 / (Math.PI * Math.PI);
+
+        int n = predicted.Shape[0];
+        var gradPred = new T[n * 4];
+
+        for (int i = 0; i < n; i++)
+        {
+            int o = i * 4;
+            double px1 = numOps.ToDouble(predicted[o]), py1 = numOps.ToDouble(predicted[o + 1]);
+            double px2 = numOps.ToDouble(predicted[o + 2]), py2 = numOps.ToDouble(predicted[o + 3]);
+            double tx1 = numOps.ToDouble(target[o]), ty1 = numOps.ToDouble(target[o + 1]);
+            double tx2 = numOps.ToDouble(target[o + 2]), ty2 = numOps.ToDouble(target[o + 3]);
+
+            double rawPw = px2 - px1, rawPh = py2 - py1;
+            double pw = Math.Max(0.0, rawPw) + eps;
+            double ph = Math.Max(0.0, rawPh) + eps;
+            double tw = Math.Max(0.0, tx2 - tx1) + eps;
+            double th = Math.Max(0.0, ty2 - ty1) + eps;
+
+            double atanDiff = Math.Atan(tw / th) - Math.Atan(pw / ph);
+            double rss = pw * pw + ph * ph;
+
+            double dvdPw = 2.0 * fourOverPiSq * atanDiff * -(ph / rss);
+            double dvdPh = 2.0 * fourOverPiSq * atanDiff * (pw / rss);
+
+            // ReLU indicators: d(relu(px2-px1))/d(px2) = 1 only where the width is positive.
+            double wOn = rawPw > 0 ? 1.0 : 0.0;
+            double hOn = rawPh > 0 ? 1.0 : 0.0;
+
+            double go = numOps.ToDouble(gradOutput[i]);
+            gradPred[o] = numOps.FromDouble(go * dvdPw * -wOn);
+            gradPred[o + 1] = numOps.FromDouble(go * dvdPh * -hOn);
+            gradPred[o + 2] = numOps.FromDouble(go * dvdPw * wOn);
+            gradPred[o + 3] = numOps.FromDouble(go * dvdPh * hOn);
+        }
+
+        DifferentiableOps.AccumulateGrad(grads, predicted, new Tensor<T>(gradPred, new[] { n, 4 }), engine);
+    }
+
     /// <summary>GIoU loss backward: IoU gradient + enclosing area penalty gradient.</summary>
     /// <remarks>
     /// TIE-BREAKING: every predicted-vs-target comparison here includes equality, matching CpuEngine's

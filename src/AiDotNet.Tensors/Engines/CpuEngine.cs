@@ -44667,7 +44667,16 @@ public partial class CpuEngine : ITensorLevelEngine
             alphaData[i] = numOps.FromDouble(vVal / (1.0 - iouVal + vVal + 1e-7));
         }
         var v = new Tensor<T>(vData, new[] { n, 1 });
-        // alpha is detached from gradient (constant w.r.t. backward)
+
+        // v is computed numerically above, which made it a CONSTANT LEAF on the tape. With alpha also
+        // (correctly) detached, CIoU therefore had NO aspect-ratio gradient at all — training with it was
+        // numerically identical to DIoU, so the one term CIoU adds over DIoU contributed nothing. The
+        // engine has no differentiable atan to rebuild v from ops, so the node is recorded here with its
+        // analytic derivative w.r.t. the predicted boxes.
+        DifferentiableOps.RecordUnary("CIoUAspect", v, predicted,
+            BackwardFunctions<T>.CIoUAspectBackward, savedState: new object[] { target });
+
+        // alpha is detached from gradient (constant w.r.t. backward), per the CIoU paper.
         var alpha = StopGradient(new Tensor<T>(alphaData, new[] { n, 1 }));
 
         // CIoU = IoU - distPenalty - alpha * v
