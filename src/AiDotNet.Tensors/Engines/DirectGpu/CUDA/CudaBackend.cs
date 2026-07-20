@@ -7467,11 +7467,40 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (gradBeta.Size < channels)
             throw new ArgumentException($"gradBeta buffer too small: expected at least {channels} elements, got {gradBeta.Size}.", nameof(gradBeta));
 
+        // TWO-STAGE LAUNCH. instancenorm_backward consumes PRECOMPUTED per-instance sums and writes ONLY
+        // gradInput; instancenorm_backward_sums produces those sums along with gradGamma/gradBeta. The
+        // previous code launched only the second kernel, and its argument list did not match the kernel
+        // signature at almost any position:
+        //     C# arg2..7 = gamma, saveMean, saveInvVar, gradInput, gradGamma, gradBeta
+        //     kernel     = mean,  invStd,   gamma,      sumDy,     sumDyXhat, gradInput
+        // so the kernel wrote its gradInput result into the gradBeta BUFFER, read the uninitialised
+        // gradInput/gradGamma buffers as its input sums, and reinterpreted the float epsilon as the int W.
+        // Measured effect: d(input) and d(gamma) came back all ZEROS (never written) while d(beta) held
+        // garbage (-0.026 where CPU gives 8.446).
+        //
+        // Both kernels index with (idx / (W*H)) % C and use instanceSize = H*W, so only the PRODUCT H*W
+        // matters — passing H = spatialSize, W = 1 is exact and avoids threading H and W separately.
+        //
+        // Both accumulate with atomicAdd, so every destination must be zeroed first.
+        if (!_kernelCache.TryGetValue("instancenorm_backward_sums", out var sumsKernel))
+            throw new InvalidOperationException("CUDA kernel not found: instancenorm_backward_sums");
         if (!_kernelCache.TryGetValue("instancenorm_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: instancenorm_backward");
 
         using var _ = PushContext();
-        uint gridX = (uint)(batch * channels);
+
+        int stats = batch * channels;
+        int total = batch * channels * spatialSize;
+        int hDim = spatialSize;
+        int wDim = 1;
+
+        using var sumDyBuf = AllocateBuffer(stats);
+        using var sumDyXhatBuf = AllocateBuffer(stats);
+        Fill(sumDyBuf, 0f, stats);
+        Fill(sumDyXhatBuf, 0f, stats);
+        Fill(gradGamma, 0f, channels);
+        Fill(gradBeta, 0f, channels);
+
         IntPtr gradOutputPtr = gradOutput.Handle;
         IntPtr inputPtr = input.Handle;
         IntPtr gammaPtr = gamma.Handle;
@@ -7480,21 +7509,43 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IntPtr gradInputPtr = gradInput.Handle;
         IntPtr gradGammaPtr = gradGamma.Handle;
         IntPtr gradBetaPtr = gradBeta.Handle;
+        IntPtr sumDyPtr = sumDyBuf.Handle;
+        IntPtr sumDyXhatPtr = sumDyXhatBuf.Handle;
+
+        uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+
+        // Stage 1: sums + gradGamma + gradBeta.
+        void** sumsArgs = stackalloc void*[13];
+        sumsArgs[0] = &gradOutputPtr;
+        sumsArgs[1] = &inputPtr;
+        sumsArgs[2] = &saveMeanPtr;
+        sumsArgs[3] = &saveInvVarPtr;
+        sumsArgs[4] = &gammaPtr;
+        sumsArgs[5] = &sumDyPtr;
+        sumsArgs[6] = &sumDyXhatPtr;
+        sumsArgs[7] = &gradGammaPtr;
+        sumsArgs[8] = &gradBetaPtr;
+        sumsArgs[9] = &batch;
+        sumsArgs[10] = &channels;
+        sumsArgs[11] = &hDim;
+        sumsArgs[12] = &wDim;
+        LaunchKernel(sumsKernel, grid, DefaultBlockSize, sumsArgs);
+
+        // Stage 2: gradInput, consuming the sums above.
         void** args = stackalloc void*[12];
         args[0] = &gradOutputPtr;
         args[1] = &inputPtr;
-        args[2] = &gammaPtr;
-        args[3] = &saveMeanPtr;
-        args[4] = &saveInvVarPtr;
-        args[5] = &gradInputPtr;
-        args[6] = &gradGammaPtr;
-        args[7] = &gradBetaPtr;
+        args[2] = &saveMeanPtr;
+        args[3] = &saveInvVarPtr;
+        args[4] = &gammaPtr;
+        args[5] = &sumDyPtr;
+        args[6] = &sumDyXhatPtr;
+        args[7] = &gradInputPtr;
         args[8] = &batch;
         args[9] = &channels;
-        args[10] = &spatialSize;
-        args[11] = &epsilon;
-        // InstanceNormBackward: 1 block per (batch, channel)
-        LaunchKernelWithSharedMem(kernel, gridX, DefaultBlockSize, (uint)(DefaultBlockSize * sizeof(float)), args);
+        args[10] = &hDim;
+        args[11] = &wDim;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
     public unsafe void RmsNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer saveRms,
