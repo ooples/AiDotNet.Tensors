@@ -987,6 +987,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
+    /// The live GPU backend this dispatcher uses, exposed for device PLACEMENT (<see cref="Tensor{T}.To"/>).
+    /// Unlike <see cref="TryGetBackend"/> it ignores GraphMode / the DeferredScope recording backend — placement
+    /// moves data to the device, it is not a recorded op — so a tensor placed with <c>To(device)</c> lands on the
+    /// SAME backend the engine executes on, keeping placement and dispatch from diverging. Null when no GPU.
+    /// </summary>
+    internal IDirectGpuBackend? PlacementBackend => IsGpuAvailable ? _directGpu?.Backend : null;
+
+    /// <summary>
     /// Tries to get the batch execution backend (which has the fused kernel methods).
     /// Returns false if GPU is not available or backend doesn't support batch execution.
     /// </summary>
