@@ -302,7 +302,12 @@ extern ""C"" __global__ __launch_bounds__(256) void selu_backward(const float* _
     const float alpha = 1.6732632423543772848170429916717f;
     const float scale = 1.0507009873554804934193349852946f;
     float x = input[idx];
-    float grad = x > 0.0f ? scale : scale * alpha * expf(x);
+    // #775: use >= to match CpuEngine (deriv = x >= 0 ? scale : scale*alpha*exp(x)). The fix landed in the
+    // OpenCL and WebGpu kernels but was missed here, in HIP and in Metal, while this kernel's own caller in
+    // DirectGpuTensorEngine documented it as already using >=. Measured divergence at x==0 and x==-0 was
+    // 1.7E-01 / 1.8E-01 absolute (a factor of alpha), zero elsewhere. -0.0 matters: `-0.0 >= 0` is true but
+    // `-0.0 > 0` is false, so signed zero took the wrong branch too.
+    float grad = x >= 0.0f ? scale : scale * alpha * expf(x);
     gradInput[idx] = gradOutput[idx] * grad;
 }
 

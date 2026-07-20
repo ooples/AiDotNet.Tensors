@@ -743,7 +743,9 @@ extern ""C"" __global__ __launch_bounds__(256) void selu_backward(const float* g
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     float x = input[idx];
-    float grad = x > 0.0f ? scale : scale * alpha * expf(x);
+    // #775: use >= to match CpuEngine (deriv = x >= 0 ? scale : scale*alpha*exp(x)), as OpenCL and WebGpu
+    // already do. Differs only at x==0 and x==-0, where it is a factor-of-alpha error.
+    float grad = x >= 0.0f ? scale : scale * alpha * expf(x);
     gradInput[idx] = gradOutput[idx] * grad;
 }
 

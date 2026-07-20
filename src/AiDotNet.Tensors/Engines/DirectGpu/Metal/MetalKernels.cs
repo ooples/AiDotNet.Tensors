@@ -1171,7 +1171,9 @@ kernel void selu_backward(
         const float alpha = 1.6732632423543772f;
         const float scale = 1.0507009873554805f;
         float x = input[gid];
-        float grad = x > 0.0f ? scale : scale * alpha * exp(x);
+        // #775: use >= to match CpuEngine (deriv = x >= 0 ? scale : scale*alpha*exp(x)), as OpenCL and
+        // WebGpu already do. Differs only at x==0 and x==-0, where it is a factor-of-alpha error.
+        float grad = x >= 0.0f ? scale : scale * alpha * exp(x);
         gradInput[gid] = gradOutput[gid] * grad;
     }
 }
