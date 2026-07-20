@@ -256,6 +256,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // Version tracking for invalidation
     private readonly ConcurrentDictionary<object, int> _tensorVersions = new();
 
+    // Host-tensor Version stamped onto each PERSISTENT weight/bias buffer at the moment it was uploaded.
+    // The persistent cache is keyed by the host backing array, but a weight is commonly registered at
+    // construction (with random INIT values) and then loaded IN PLACE by SetParameters — which bumps the
+    // tensor Version but shares the same backing array, so the cache key does not change. Without a version
+    // gate the reader would keep serving the stale random buffer (a real GGUF decoder loaded under the GPU
+    // engine produced pure garbage this way). GetWeightBufferPreferResident compares the tensor's current
+    // Version to this stamp and re-uploads on a mismatch, mirroring the resident _gpuBuffer version gate so
+    // an explicit InvalidatePersistentTensor is no longer required for correctness.
+    private readonly ConcurrentDictionary<object, int> _persistentWeightHostVersion = new();
+
     // Monotonic per-call counter for stochastic-op seeds (dropout, etc.). The old code seeded the
     // GPU dropout RNG from Environment.TickCount / DateTime.UtcNow.Ticks. TickCount has ~15 ms
     // resolution, so the many dropout calls a training step fires in <1 ms all got the SAME seed →
@@ -1526,6 +1536,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 if (_persistentBufferCache.TryRemove(backing, out var pe)) pe.Dispose();
                 _tensorVersions.TryRemove(backing, out _);
+                _persistentWeightHostVersion.TryRemove(backing, out _);
             }
         }
     }
@@ -2459,7 +2470,48 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (ResidentStepActive || !versionTracked || weights._gpuBufferVersion == weights.Version)
                 return new OwnedBuffer(resident, ownsBuffer: false);
         }
-        return GetOrCacheWeightBuffer(backend, weights.GetDataArray(), role);
+        return GetOrCacheWeightBufferVersionAware(backend, weights, role);
+    }
+
+    /// <summary>
+    /// Host-array persistent weight cache, gated on the host tensor <see cref="Tensor{T}.Version"/> so an
+    /// in-place weight load performed AFTER registration is served correctly. A layer registers its weight
+    /// as a persistent buffer at construction (random init), then <c>SetParameters</c> loads the real
+    /// weights into the same backing array — bumping Version via the indexer/SetFlat/CopyFromArray paths —
+    /// but the cache key (the array) is unchanged, so a version-blind lookup would return the stale
+    /// construction-time buffer. This compares the current Version to the stamp recorded at upload and
+    /// re-uploads on a mismatch, so correctness no longer depends on the layer also calling
+    /// <see cref="InvalidatePersistentTensor{T}"/>. Raw-span writes (AsWritableSpan) that bypass the
+    /// version bump still require an explicit invalidate, per the documented Tensor mutation contract.
+    /// </summary>
+    private OwnedBuffer GetOrCacheWeightBufferVersionAware<T>(IDirectGpuBackend backend, Tensor<T> weights, PersistentTensorRole role)
+    {
+        T[] data = weights.GetDataArray();
+        int hostVersion = weights.Version;
+        lock (_persistentBufferLock)
+        {
+            bool cached = _persistentBufferCache.TryGetValue(data, out var entry);
+            if (cached
+                && _persistentWeightHostVersion.TryGetValue(data, out int stampedVersion)
+                && stampedVersion == hostVersion)
+            {
+                return new OwnedBuffer(entry!.Buffer, ownsBuffer: false);
+            }
+
+            // Not cached, or the host tensor was mutated in place since the buffer was uploaded: (re)upload
+            // the current host data and (re)stamp its version. Dispose the superseded buffer first.
+            if (cached)
+                entry!.Buffer.Dispose();
+
+            float[] floatData = DirectGpuEngine.ToFloatArray(data);
+            IGpuBuffer gpuBuffer = backend.AllocateBuffer(floatData);
+            backend.Synchronize();
+
+            var newEntry = new GpuBufferCacheEntry(gpuBuffer, role);
+            _persistentBufferCache[data] = newEntry;
+            _persistentWeightHostVersion[data] = hostVersion;
+            return new OwnedBuffer(gpuBuffer, ownsBuffer: false);
+        }
     }
 
     /// <summary>
@@ -6678,6 +6730,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 entry.Dispose();
                 _tensorVersions.TryRemove(data, out _);
+                _persistentWeightHostVersion.TryRemove(data, out _);
                 return true;
             }
             return false;
@@ -6698,6 +6751,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
             _persistentBufferCache.Clear();
             _tensorVersions.Clear();
+            _persistentWeightHostVersion.Clear();
         }
     }
 
@@ -10756,6 +10810,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var entry = new GpuBufferCacheEntry(gpuBuffer, role);
             _persistentBufferCache.TryAdd(key, entry);
             _tensorVersions.TryAdd(key, 0);
+            // Stamp the host Version this buffer was uploaded at, so the version-aware weight reader
+            // (GetOrCacheWeightBufferVersionAware) detects a later in-place load and re-uploads.
+            _persistentWeightHostVersion[key] = tensor.Version;
         }
         catch
         {
@@ -10786,6 +10843,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 entry.Dispose();
             }
             _tensorVersions.TryRemove(key, out _);
+            _persistentWeightHostVersion.TryRemove(key, out _);
         }
     }
 
@@ -10828,12 +10886,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             _persistentBufferCache[key] = newEntry;
             _tensorVersions[key] = newEntry.Version;
+            // Re-stamp with the host Version this fresh buffer matches, so the version-aware weight reader
+            // does not needlessly re-upload it again on the next read.
+            _persistentWeightHostVersion[key] = tensor.Version;
         }
         catch
         {
             // On failure, remove from cache - operations will fall back to CPU
             _persistentBufferCache.TryRemove(key, out _);
             _tensorVersions.TryRemove(key, out _);
+            _persistentWeightHostVersion.TryRemove(key, out _);
         }
     }
 
@@ -21984,6 +22046,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         _persistentBufferCache.Clear();
         _tensorVersions.Clear();
+        _persistentWeightHostVersion.Clear();
 
         // Dispose cached CSR GPU buffers
         foreach (var entry in _csrBufferCache.Values)
