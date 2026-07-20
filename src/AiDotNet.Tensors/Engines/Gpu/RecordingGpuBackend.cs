@@ -884,6 +884,42 @@ public class RecordingGpuBackend : DelegatingGpuBackend
     }
 
     /// <inheritdoc/>
+    public override void RmsNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer saveRms,
+        int batchSize, int normalizedSize, float epsilon)
+    {
+        // Decoder / LLaMA-family normalization. Must record — without it the op ran eagerly mid-record on
+        // buffers the deferred GEMMs had not filled yet, poisoning the whole forward (all-zero logits).
+        RecordOrExecute(
+            KernelType.LayerNorm,
+            new[] { input, gamma },
+            new[] { output, saveRms },
+            () => Inner.RmsNorm(input, output, gamma, saveRms, batchSize, normalizedSize, epsilon),
+            new Dictionary<string, object>
+            {
+                ["batchSize"] = batchSize,
+                ["normalizedSize"] = normalizedSize,
+                ["epsilon"] = epsilon
+            });
+    }
+
+    /// <inheritdoc/>
+    public override void Permute(IGpuBuffer input, IGpuBuffer output, int[] shape, int[] permutation)
+    {
+        // Axis permutation for the attention head transpose ([B,S,H,D] <-> [B,H,S,D]). Same recordability
+        // requirement as Transpose — an unrecorded permute reads unfilled buffers mid-record.
+        RecordOrExecute(
+            KernelType.Transpose,
+            new[] { input },
+            new[] { output },
+            () => Inner.Permute(input, output, shape, permutation),
+            new Dictionary<string, object>
+            {
+                ["shape"] = shape,
+                ["permutation"] = permutation
+            });
+    }
+
+    /// <inheritdoc/>
     public override void Conv2DBiasAdd(IGpuBuffer output, IGpuBuffer bias, int batch, int channels, int spatialSize)
     {
         // #642: in-place per-channel bias add after conv — `output` is both read and written, so it is
