@@ -881,7 +881,25 @@ extern ""C"" __global__ __launch_bounds__(256) void power_scalar(const float* __
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    B[idx] = powf(A[idx], exponent);
+    float x = A[idx];
+    // This module compiles with --use_fast_math, under which powf lowers to the fast intrinsic
+    // exp2(y * log2(x)). log2 of a negative number is NaN, so powf(-2, 2) returned NaN instead of 4 —
+    // i.e. squaring any negative value produced NaN on GPU while the CPU path returned the right answer.
+    // pow(x, y) IS defined for x < 0 when y is integral, so handle that case explicitly via |x| and
+    // restore the sign from the exponent's parity. Non-integral exponents with x < 0 remain genuinely
+    // undefined and keep propagating NaN, matching the CPU/IEEE behaviour.
+    float r;
+    if (x < 0.0f && exponent == truncf(exponent))
+    {
+        float magnitude = powf(-x, exponent);
+        // Odd exponent keeps the negative sign; even exponent is positive.
+        r = (fmodf(fabsf(exponent), 2.0f) == 1.0f) ? -magnitude : magnitude;
+    }
+    else
+    {
+        r = powf(x, exponent);
+    }
+    B[idx] = r;
 }
 extern ""C"" __global__ __launch_bounds__(256) void reduce_sum(const float* __restrict__ input, float* __restrict__ output, int size)
 {
