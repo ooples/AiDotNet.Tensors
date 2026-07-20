@@ -79,13 +79,18 @@ public static class Q8BlockGemm
     /// C[M,N] = activations[M,K] · Wᵀ where W is Q8_0 blocks [N,K]. Activation is quantized to
     /// Q8_0 internally. Parallelized over M rows.
     /// </summary>
+    /// <summary>
+    /// C[M,N] = activations[M,K] · Wᵀ where W is Q8_0 blocks [N,K]. Takes arrays (not spans) so the frozen
+    /// weight is pinned directly by the parallel body with zero per-call copy — the weight array is passed
+    /// straight from the layer and never duplicated. Activation is quantized to Q8_0 internally.
+    /// </summary>
     public static void MatMul(
-        ReadOnlySpan<float> activations,
-        ReadOnlySpan<sbyte> weightQs,
-        ReadOnlySpan<float> weightScales,
-        Span<float> output,
-        int m, int k, int n)
+        float[] activations, sbyte[] weightQs, float[] weightScales, float[] output, int m, int k, int n)
     {
+        if (activations is null) throw new ArgumentNullException(nameof(activations));
+        if (weightQs is null) throw new ArgumentNullException(nameof(weightQs));
+        if (weightScales is null) throw new ArgumentNullException(nameof(weightScales));
+        if (output is null) throw new ArgumentNullException(nameof(output));
         if (!IsSupportedK(k)) throw new ArgumentException($"K ({k}) must be a positive multiple of {QK}.", nameof(k));
         if (m < 0 || n < 0) throw new ArgumentException($"shapes must be non-negative; got m={m}, n={n}.");
         if (activations.Length != m * k) throw new ArgumentException($"activations length {activations.Length} != m*k {m * k}.");
@@ -93,74 +98,89 @@ public static class Q8BlockGemm
         int bpr = k / QK;
         if (weightScales.Length != n * bpr) throw new ArgumentException($"weightScales length {weightScales.Length} != n*(k/32) {n * bpr}.");
         if (output.Length != m * n) throw new ArgumentException($"output length {output.Length} != m*n {m * n}.");
-        if (m == 0 || n == 0) { output.Clear(); return; }
+        if (m == 0 || n == 0) { Array.Clear(output, 0, output.Length); return; }
 
-        // Quantize all activation rows up front (small vs the N-wide inner loop; reused across all n).
+        // Only the activation is quantized per call (it changes every forward); it is small (M·K) relative to
+        // the frozen N·K weight, which is used in place with no copy.
         var actQs = new sbyte[m * k];
         var actScales = new float[m * bpr];
         QuantizeRows(activations, m, k, actQs, actScales);
 
-        // Copy to arrays the parallel body can pin (spans can't cross the lambda boundary).
-        var wQs = weightQs.ToArray();
-        var wSc = weightScales.ToArray();
-        var outArr = new float[m * n];
-
+        // Parallelize over M rows: each row computes its full output vector with the dot accumulator held in
+        // a register and written once (good output locality). Bandwidth-bound: beats fp32 BLAS at small M
+        // (decode) where each weight byte is read once. At large M (prefill) fp32 BLAS's 2D register tiling
+        // wins — callers gate this kernel to small M. A competitive large-M int8 path needs a 2D-tiled
+        // microkernel (tracked separately).
         AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(
-            0, m, (long)m * n * k, i => RowProduct(actQs, actScales, wQs, wSc, outArr, i, k, n, bpr));
-
-        outArr.CopyTo(output);
+            0, m, (long)m * n * k, i => RowProduct(actQs, actScales, weightQs, weightScales, output, i, k, n, bpr));
     }
 
-    private static void RowProduct(
+#if NET5_0_OR_GREATER
+    private static unsafe void RowProduct(
         sbyte[] actQs, float[] actScales, sbyte[] wQs, float[] wSc, float[] outArr,
         int i, int k, int n, int bpr)
     {
+        int aRow = i * k, aScaleRow = i * bpr;
+        if (Avx2.IsSupported)
+        {
+            // Pin the arrays ONCE for the whole output row (not once per element) — per-element pinning was
+            // an order of magnitude of overhead on wide layers (e.g. 49k lm_head columns).
+            fixed (sbyte* ap = actQs, wp = wQs)
+            fixed (float* asp = actScales, wsp = wSc, op = outArr)
+            {
+                var ones = Vector256.Create((short)1);
+                sbyte* aBase = ap + aRow;
+                float* asBase = asp + aScaleRow;
+                for (int j = 0; j < n; j++)
+                {
+                    sbyte* wBase = wp + j * k;
+                    float* wsBase = wsp + j * bpr;
+                    float acc = 0f;
+                    for (int b = 0; b < bpr; b++)
+                    {
+                        var x = Avx.LoadVector256(aBase + b * QK);
+                        var y = Avx.LoadVector256(wBase + b * QK);
+                        var ax = Avx2.Sign(x, x).AsByte();
+                        var sy = Avx2.Sign(y, x);
+                        var dot16 = Avx2.MultiplyAddAdjacent(ax, sy);
+                        var dot32 = Avx2.MultiplyAddAdjacent(dot16, ones);
+                        var lo = dot32.GetLower();
+                        var hi = dot32.GetUpper();
+                        var s = Sse2.Add(lo, hi);
+                        s = Sse2.Add(s, Sse2.Shuffle(s, 0x4E));
+                        s = Sse2.Add(s, Sse2.Shuffle(s, 0xB1));
+                        acc += s.ToScalar() * asBase[b] * wsBase[b];
+                    }
+                    op[i * n + j] = acc;
+                }
+            }
+            return;
+        }
+        RowProductScalar(actQs, actScales, wQs, wSc, outArr, i, k, n, bpr);
+    }
+#else
+    private static void RowProduct(
+        sbyte[] actQs, float[] actScales, sbyte[] wQs, float[] wSc, float[] outArr,
+        int i, int k, int n, int bpr)
+        => RowProductScalar(actQs, actScales, wQs, wSc, outArr, i, k, n, bpr);
+#endif
+
+    private static void RowProductScalar(
+        sbyte[] actQs, float[] actScales, sbyte[] wQs, float[] wSc, float[] outArr,
+        int i, int k, int n, int bpr)
+    {
+        int aRow = i * k, aScaleRow = i * bpr;
         for (int j = 0; j < n; j++)
         {
-            float acc = 0f;
-            int aRow = i * k, aScaleRow = i * bpr;
             int wRow = j * k, wScaleRow = j * bpr;
+            float acc = 0f;
             for (int b = 0; b < bpr; b++)
             {
-                int di = DotBlock(actQs, aRow + b * QK, wQs, wRow + b * QK);
+                int di = 0, aOff = aRow + b * QK, wOff = wRow + b * QK;
+                for (int t = 0; t < QK; t++) di += actQs[aOff + t] * wQs[wOff + t];
                 acc += di * actScales[aScaleRow + b] * wSc[wScaleRow + b];
             }
             outArr[i * n + j] = acc;
         }
-    }
-
-#if NET5_0_OR_GREATER
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static unsafe int DotBlock(sbyte[] a, int aOff, sbyte[] b, int bOff)
-    {
-        if (Avx2.IsSupported)
-        {
-            fixed (sbyte* ap = a, bp = b)
-            {
-                var x = Avx.LoadVector256(ap + aOff);
-                var y = Avx.LoadVector256(bp + bOff);
-                var ax = Avx2.Sign(x, x).AsByte();               // |a| as unsigned magnitude
-                var sy = Avx2.Sign(y, x);                        // apply a's sign to b
-                var dot16 = Avx2.MultiplyAddAdjacent(ax, sy);    // maddubs -> int16 pairs
-                var dot32 = Avx2.MultiplyAddAdjacent(dot16, Vector256.Create((short)1)); // madd -> int32
-                var lo = dot32.GetLower();
-                var hi = dot32.GetUpper();
-                var s = Sse2.Add(lo, hi);
-                s = Sse2.Add(s, Sse2.Shuffle(s, 0x4E));
-                s = Sse2.Add(s, Sse2.Shuffle(s, 0xB1));
-                return s.ToScalar();
-            }
-        }
-        return DotBlockScalar(a, aOff, b, bOff);
-    }
-#else
-    private static int DotBlock(sbyte[] a, int aOff, sbyte[] b, int bOff) => DotBlockScalar(a, aOff, b, bOff);
-#endif
-
-    private static int DotBlockScalar(sbyte[] a, int aOff, sbyte[] b, int bOff)
-    {
-        int sum = 0;
-        for (int j = 0; j < QK; j++) sum += a[aOff + j] * b[bOff + j];
-        return sum;
     }
 }
