@@ -121,4 +121,18 @@ public static class DeviceDispatch
         // Permissive GPU+CPU mix, or a clean all-GPU op: run on the GPU.
         return new DeviceResolution(gpuDevice, gpuIndex);
     }
+
+    /// <summary>
+    /// Op-entry guard for strict device dispatch. A COMPLETE no-op while <see cref="Mode"/> is
+    /// <see cref="DeviceDispatchMode.Permissive"/> (a single enum comparison), so wiring it into an operation
+    /// changes nothing until strict mode is deliberately enabled. Under <see cref="DeviceDispatchMode.Strict"/>
+    /// it throws <see cref="DeviceMismatchException"/> when the operands span different devices (the PyTorch
+    /// same-device rule). Kept separate from <see cref="Resolve{T}"/> — which the engine also uses to pick a
+    /// device — so ops can validate without the overhead of building a result they don't consume.
+    /// </summary>
+    public static void EnforceStrict<T>(params Tensor<T>[] operands)
+    {
+        if (Mode != DeviceDispatchMode.Strict) return;
+        Resolve(operands); // throws DeviceMismatchException on a cross-device / cross-GPU op
+    }
 }

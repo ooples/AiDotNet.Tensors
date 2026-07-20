@@ -16823,6 +16823,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorAdd<T>(Tensor<T> a, Tensor<T> b)
     {
+        DeviceDispatch.EnforceStrict(a, b); // no-op unless strict mode is enabled
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
             return base.TensorAdd(a, b);
         if (TryBinaryResidentOutOfPlace(a, b, static (be, ia, ib, o, n) => be.Add(ia, ib, o, n)) is { } radd)
@@ -16895,6 +16896,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorMultiply<T>(Tensor<T> a, Tensor<T> b)
     {
+        DeviceDispatch.EnforceStrict(a, b); // no-op unless strict mode is enabled
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
             return base.TensorMultiply(a, b);
         if (TryBinaryResidentOutOfPlace(a, b, static (be, ia, ib, o, n) => be.Multiply(ia, ib, o, n)) is { } rmul)
@@ -17902,6 +17904,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorMatMul<T>(Tensor<T> a, Tensor<T> b)
     {
+        DeviceDispatch.EnforceStrict(a, b); // no-op unless strict mode is enabled
         if (!TryGetBackend(out var backend))
             return base.TensorMatMul(a, b);
 

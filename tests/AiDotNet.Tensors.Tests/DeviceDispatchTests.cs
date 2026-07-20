@@ -102,4 +102,34 @@ public sealed class DeviceDispatchTests
         var r = DeviceDispatch.Resolve<float>();
         Assert.Equal(TensorDevice.CPU, r.Device);
     }
+
+    [Fact]
+    public void EnforceStrict_Permissive_IsCompleteNoOp()
+    {
+        var previous = DeviceDispatch.Mode;
+        try
+        {
+            DeviceDispatch.Mode = DeviceDispatchMode.Permissive;
+            // Even genuinely-mismatched operands do not throw while permissive: the guard returns immediately.
+            DeviceDispatch.EnforceStrict(OnDevice(TensorDevice.CUDA), Cpu());
+            DeviceDispatch.EnforceStrict(OnDevice(TensorDevice.CUDA, 0), OnDevice(TensorDevice.OpenCL));
+        }
+        finally { DeviceDispatch.Mode = previous; }
+    }
+
+    [Fact]
+    public void EnforceStrict_Strict_ThrowsOnMismatch_PassesOnSameDevice()
+    {
+        var previous = DeviceDispatch.Mode;
+        try
+        {
+            DeviceDispatch.Mode = DeviceDispatchMode.Strict;
+            Assert.Throws<DeviceMismatchException>(
+                () => DeviceDispatch.EnforceStrict(OnDevice(TensorDevice.CUDA), Cpu()));
+            // Same device (and all-CPU) pass cleanly.
+            DeviceDispatch.EnforceStrict(OnDevice(TensorDevice.CUDA, 1), OnDevice(TensorDevice.CUDA, 1));
+            DeviceDispatch.EnforceStrict(Cpu(), Cpu());
+        }
+        finally { DeviceDispatch.Mode = previous; }
+    }
 }
