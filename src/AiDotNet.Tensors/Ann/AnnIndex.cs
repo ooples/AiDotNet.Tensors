@@ -2,6 +2,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using AiDotNet.Tensors.Engines.DirectGpu;
 
 namespace AiDotNet.Tensors.Ann
 {
@@ -47,6 +48,7 @@ namespace AiDotNet.Tensors.Ann
         private byte[]? _codes;                              // PQ/IVFPQ: [count * m]
         private int _count;
         private bool _trained;
+        private IDirectGpuBackend? _gpu;                     // optional GPU backend for fused ANN kernels
 
         public AnnIndexType IndexType => _type;
         public int Dimension => _dim;
@@ -65,6 +67,14 @@ namespace AiDotNet.Tensors.Ann
             _trained = type == AnnIndexType.Flat; // Flat needs no training
         }
 
+        /// <summary>
+        /// Attaches a GPU backend so training and search dispatch to the fused ANN kernels
+        /// (<see cref="IAnnBackend"/>) when the backend implements them and the problem is large enough;
+        /// otherwise, or on any GPU failure, compute falls back to the managed CPU reference. Pass the backend
+        /// from <see cref="DirectGpuBackendFactory"/>.Create(); pass <c>null</c> to force the CPU path.
+        /// </summary>
+        public void AttachGpu(IDirectGpuBackend? backend) => _gpu = backend;
+
         /// <summary>Trains the coarse quantizer (IVF) and/or PQ codebooks on a representative sample.</summary>
         public void Train(float[] trainingVectors, int numVectors)
         {
@@ -72,7 +82,7 @@ namespace AiDotNet.Tensors.Ann
             if (numVectors < 1) throw new ArgumentException("Need training vectors", nameof(numVectors));
 
             if (_type == AnnIndexType.Ivf || _type == AnnIndexType.IvfPq)
-                _coarse = KMeans(trainingVectors, numVectors, _dim, Math.Min(_nlist, numVectors), _metric, _seed);
+                _coarse = KMeans(trainingVectors, numVectors, _dim, Math.Min(_nlist, numVectors), _metric, _seed, _gpu);
 
             if (_type == AnnIndexType.Pq || _type == AnnIndexType.IvfPq)
             {
@@ -136,7 +146,7 @@ namespace AiDotNet.Tensors.Ann
         {
             var db = FlattenAll();
             var dist = new float[_count];
-            AnnPrimitives.ComputeDistances(query, db, dist, 1, _count, _dim, _metric);
+            AnnGpuDispatch.ComputeDistances(_gpu, query, db, dist, 1, _count, _dim, _metric);
             return TopK(dist, k, i => _ids[i]);
         }
 
@@ -151,7 +161,7 @@ namespace AiDotNet.Tensors.Ann
             var db = new float[cand.Count * _dim];
             for (int c = 0; c < cand.Count; c++) Array.Copy(_flatVectors[cand[c]], 0, db, c * _dim, _dim);
             var dist = new float[cand.Count];
-            AnnPrimitives.ComputeDistances(query, db, dist, 1, cand.Count, _dim, _metric);
+            AnnGpuDispatch.ComputeDistances(_gpu, query, db, dist, 1, cand.Count, _dim, _metric);
             return TopK(dist, Math.Min(k, cand.Count), i => _ids[cand[i]]);
         }
 
@@ -159,9 +169,9 @@ namespace AiDotNet.Tensors.Ann
         private (long[], float[]) SearchPq(float[] query, int k)
         {
             var tables = new float[_m * _ksub];
-            AnnPrimitives.PqComputeDistanceTables(query, _pqCodebooks!, tables, 1, _m, _ksub, _dsub, _metric);
+            AnnGpuDispatch.PqComputeDistanceTables(_gpu, query, _pqCodebooks!, tables, 1, _m, _ksub, _dsub, _metric);
             var dist = new float[_count];
-            AnnPrimitives.PqAdcScan(_codes!, tables, dist, 1, _count, _m, _ksub);
+            AnnGpuDispatch.PqAdcScan(_gpu, _codes!, tables, dist, 1, _count, _m, _ksub);
             return TopK(dist, k, i => _ids[i]);
         }
 
@@ -183,7 +193,7 @@ namespace AiDotNet.Tensors.Ann
                 {
                     var qres = Subtract(query, _coarse!, list * _dim);
                     tbl = new float[_m * _ksub];
-                    AnnPrimitives.PqComputeDistanceTables(qres, _pqCodebooks!, tbl, 1, _m, _ksub, _dsub, _metric);
+                    AnnGpuDispatch.PqComputeDistanceTables(_gpu, qres, _pqCodebooks!, tbl, 1, _m, _ksub, _dsub, _metric);
                     listTables[list] = tbl;
                 }
                 float sum = 0f;
@@ -216,14 +226,14 @@ namespace AiDotNet.Tensors.Ann
         private int NearestCoarse(float[] v)
         {
             var a = new int[1];
-            AnnPrimitives.IvfAssign(v, _coarse!, a, 1, _nlist, _dim, _metric);
+            AnnGpuDispatch.IvfAssign(_gpu, v, _coarse!, a, 1, _nlist, _dim, _metric);
             return a[0];
         }
 
         private HashSet<int> NearestCoarseLists(float[] query, int nprobe)
         {
             var dist = new float[_nlist];
-            AnnPrimitives.ComputeDistances(query, _coarse!, dist, 1, _nlist, _dim, _metric);
+            AnnGpuDispatch.ComputeDistances(_gpu, query, _coarse!, dist, 1, _nlist, _dim, _metric);
             var order = Enumerable.Range(0, _nlist).ToArray();
             Array.Sort(order, (a, b) => _metric == AnnPrimitives.MetricInnerProduct
                 ? dist[b].CompareTo(dist[a]) : dist[a].CompareTo(dist[b]));
@@ -234,7 +244,7 @@ namespace AiDotNet.Tensors.Ann
         {
             var res = new float[n * _dim];
             var a = new int[n];
-            AnnPrimitives.IvfAssign(vectors, _coarse!, a, n, _nlist, _dim, _metric);
+            AnnGpuDispatch.IvfAssign(_gpu, vectors, _coarse!, a, n, _nlist, _dim, _metric);
             for (int i = 0; i < n; i++)
                 for (int d = 0; d < _dim; d++)
                     res[i * _dim + d] = vectors[i * _dim + d] - _coarse![a[i] * _dim + d];
@@ -286,7 +296,7 @@ namespace AiDotNet.Tensors.Ann
                 var sub = new float[n * _dsub];
                 for (int i = 0; i < n; i++)
                     Array.Copy(vectors, i * _dim + s * _dsub, sub, i * _dsub, _dsub);
-                var centroids = KMeans(sub, n, _dsub, Math.Min(_ksub, n), _metric, _seed + s);
+                var centroids = KMeans(sub, n, _dsub, Math.Min(_ksub, n), _metric, _seed + s, _gpu);
                 // Pad to ksub centroids if fewer training points than ksub.
                 Array.Copy(centroids, 0, cb, s * _ksub * _dsub, Math.Min(centroids.Length, _ksub * _dsub));
             }
@@ -294,7 +304,8 @@ namespace AiDotNet.Tensors.Ann
         }
 
         /// <summary>Lloyd's k-means (seeded, fixed iterations) using the ANN assignment primitive.</summary>
-        private static float[] KMeans(float[] vectors, int n, int dim, int kRaw, int metric, int seed)
+        private static float[] KMeans(float[] vectors, int n, int dim, int kRaw, int metric, int seed,
+            IDirectGpuBackend? gpu = null)
         {
             int k = Math.Max(1, Math.Min(kRaw, n));
             var rng = new Random(seed);
@@ -309,7 +320,7 @@ namespace AiDotNet.Tensors.Ann
             var assign = new int[n];
             for (int iter = 0; iter < 12; iter++)
             {
-                AnnPrimitives.IvfAssign(vectors, centroids, assign, n, k, dim, metric);
+                AnnGpuDispatch.IvfAssign(gpu, vectors, centroids, assign, n, k, dim, metric);
                 var sums = new float[k * dim];
                 var counts = new int[k];
                 for (int i = 0; i < n; i++)
