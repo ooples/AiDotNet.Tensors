@@ -162,8 +162,13 @@ public sealed partial class WebGpuBackend
     public void ScaledDotProductAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer? attentionWeights, IGpuBuffer? mask,
         int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal,
-        float softcap = 0.0f)
+        float softcap = 0.0f, int numKVHeads = 0)
     {
+        // numKVHeads <= 0 means MHA; >0 enables Grouped-Query Attention, broadcasting the shared K/V heads
+        // internally (the resident kernel already handles numQHeads != numKVHeads).
+        int kvHeads = numKVHeads > 0 ? numKVHeads : numHeads;
+        if (numHeads % kvHeads != 0)
+            throw new ArgumentException("numHeads must be an integer multiple of numKVHeads.", nameof(numKVHeads));
         int sharedMaskSize = CheckedAttentionSize(nameof(mask), seqQ, seqK);
         int fullMaskSize = CheckedAttentionSize(nameof(mask), batch, numHeads, seqQ, seqK);
         if (mask is not null && mask.Size < sharedMaskSize)
@@ -171,7 +176,27 @@ public sealed partial class WebGpuBackend
         int maskMode = mask is null ? 0 : mask.Size >= fullMaskSize ? 2 : 1;
         int maskBatchStride = maskMode == 2 ? checked(numHeads * seqQ * seqK) : 0;
         AttentionForwardResident(query, key, value, output, attentionWeights, null, mask,
-            batch, numHeads, numHeads, seqQ, seqK, headDim, scale, isCausal, maskBatchStride, maskMode, softcap);
+            batch, numHeads, kvHeads, seqQ, seqK, headDim, scale, isCausal, maskBatchStride, maskMode, softcap);
+    }
+
+    public void RopeInterleaved(IGpuBuffer input, IGpuBuffer cos, IGpuBuffer sin, IGpuBuffer output,
+        int rows, int headDim, int seqLen, int startPosition)
+    {
+        if (rows <= 0 || headDim <= 0 || seqLen <= 0)
+            throw new ArgumentOutOfRangeException(nameof(rows), "RoPE dimensions must be positive.");
+        if ((headDim & 1) != 0)
+            throw new ArgumentException("RoPE requires an even head dimension.", nameof(headDim));
+        int total = checked(rows * headDim);
+        if (input.Size < total || output.Size < total)
+            throw new ArgumentException("RoPE input/output buffers are smaller than rows * headDim.");
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(rows), BitConverter.Int32BitsToSingle(headDim),
+            BitConverter.Int32BitsToSingle(seqLen), BitConverter.Int32BitsToSingle(startPosition)
+        };
+        int pairs = checked(rows * (headDim / 2));
+        DispatchNBufferAsync("Rope", WebGpuKernels.RopeSource, "rope_interleaved",
+            new[] { input, cos, sin, output }, uniforms, pairs).GetAwaiter().GetResult();
     }
 
     public void ScaledDotProductAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,

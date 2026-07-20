@@ -192,6 +192,46 @@ fn clamp_scalar(@builtin(global_invocation_id) gid: vec3<u32>) {
 ";
 
     /// <summary>
+    /// Fused interleaved Rotary Position Embedding (RoPE) — GPT-NeoX / LLaMA / GGML variant.
+    /// Rotates each adjacent dim pair (2i, 2i+1) of every [rows, headDim] row. One invocation per (row, pair).
+    /// </summary>
+    public const string RopeSource = @"
+@group(0) @binding(0) var<storage, read> inputBuf: array<f32>;
+@group(0) @binding(1) var<storage, read> cosCache: array<f32>;
+@group(0) @binding(2) var<storage, read> sinCache: array<f32>;
+@group(0) @binding(3) var<storage, read_write> outputBuf: array<f32>;
+
+struct RopeParams {
+    rows: u32,
+    headDim: u32,
+    seqLen: u32,
+    startPosition: u32,
+}
+@group(0) @binding(4) var<uniform> params: RopeParams;
+
+@compute @workgroup_size(256)
+fn rope_interleaved(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let halfDim = params.headDim / 2u;
+    let g = gid.x;
+    if (g >= params.rows * halfDim) {
+        return;
+    }
+    let i = g % halfDim;
+    let row = g / halfDim;
+    let s = row % params.seqLen;
+    let pos = params.startPosition + s;
+    let baseIdx = row * params.headDim;
+    let cacheIdx = pos * halfDim + i;
+    let c = cosCache[cacheIdx];
+    let sn = sinCache[cacheIdx];
+    let xEven = inputBuf[baseIdx + 2u * i];
+    let xOdd = inputBuf[baseIdx + 2u * i + 1u];
+    outputBuf[baseIdx + 2u * i] = xEven * c - xOdd * sn;
+    outputBuf[baseIdx + 2u * i + 1u] = xEven * sn + xOdd * c;
+}
+";
+
+    /// <summary>
     /// Strided memory access operations for wavelet transforms and interleaved data.
     /// </summary>
     public const string StridedOpsSource = @"

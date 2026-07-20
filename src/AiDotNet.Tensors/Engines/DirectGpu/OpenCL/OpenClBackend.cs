@@ -8353,12 +8353,18 @@ KERNEL VARIANTS (A/B testing):
 
         public void ScaledDotProductAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
             IGpuBuffer output, IGpuBuffer? attentionWeights, IGpuBuffer? mask,
-            int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal, float softcap = 0.0f)
+            int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal, float softcap = 0.0f,
+            int numKVHeads = 0)
         {
             if (batch <= 0 || numHeads <= 0 || seqQ <= 0 || seqK <= 0 || headDim <= 0)
                 throw new ArgumentOutOfRangeException(nameof(batch), "Attention dimensions must be positive.");
+            // numKVHeads <= 0 means MHA (K/V have numHeads); >0 enables Grouped-Query Attention where each KV head is
+            // shared by numHeads/numKVHeads query heads and the K/V buffers are sized [batch * numKVHeads * seqK * headDim].
+            int kvHeads = numKVHeads > 0 ? numKVHeads : numHeads;
+            if (numHeads % kvHeads != 0)
+                throw new ArgumentException("numHeads must be an integer multiple of numKVHeads.", nameof(numKVHeads));
             int querySize = checked(batch * numHeads * seqQ * headDim);
-            int keyValueSize = checked(batch * numHeads * seqK * headDim);
+            int keyValueSize = checked(batch * kvHeads * seqK * headDim);
             int weightsSize = checked(batch * numHeads * seqQ * seqK);
             if (query.Size < querySize || key.Size < keyValueSize || value.Size < keyValueSize || output.Size < querySize)
                 throw new ArgumentException("Attention tensor buffers are smaller than the requested dimensions.");
@@ -8386,9 +8392,36 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, maskMode);
             k.SetArg(arg++, attentionWeights != null ? 1 : 0);
             k.SetArg(arg++, softcap);
+            k.SetArg(arg++, kvHeads);
 
             int rows = checked(batch * numHeads * seqQ);
             k.Execute1D(rows, Math.Min(256, rows));
+        }
+
+        public void RopeInterleaved(IGpuBuffer input, IGpuBuffer cos, IGpuBuffer sin, IGpuBuffer output,
+            int rows, int headDim, int seqLen, int startPosition)
+        {
+            if (rows <= 0 || headDim <= 0 || seqLen <= 0)
+                throw new ArgumentOutOfRangeException(nameof(rows), "RoPE dimensions must be positive.");
+            if ((headDim & 1) != 0)
+                throw new ArgumentException("RoPE requires an even head dimension.", nameof(headDim));
+            int total = checked(rows * headDim);
+            if (input.Size < total || output.Size < total)
+                throw new ArgumentException("RoPE input/output buffers are smaller than rows * headDim.");
+
+            var k = _kernelCache["rope_interleaved"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)cos).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)sin).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, rows);
+            k.SetArg(arg++, headDim);
+            k.SetArg(arg++, seqLen);
+            k.SetArg(arg++, startPosition);
+
+            int pairs = checked(rows * (headDim / 2));
+            k.Execute1D(pairs, Math.Min(256, pairs));
         }
 
         public void ScaledDotProductAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
