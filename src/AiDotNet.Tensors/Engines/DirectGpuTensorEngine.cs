@@ -10386,13 +10386,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (kvHeads <= 0 || heads % kvHeads != 0)
             throw new ArgumentException("Query heads must be a positive integer multiple of key/value heads.");
 
+        // The kernel indexes Q/K/V as flat row-major [batch, heads, seq, headDim]; a permuted view (e.g. the
+        // [0,2,1,3] transpose that produced the per-head layout) must be materialized contiguous first, and a
+        // host tensor uploaded. GetOrAllocateBuffer does both; contiguous-resident inputs pass straight through.
+        using var qBuf = GetOrAllocateBuffer(backend, query.IsContiguous ? query : (Tensor<T>)query.Contiguous());
+        using var kBuf = GetOrAllocateBuffer(backend, key.IsContiguous ? key : (Tensor<T>)key.Contiguous());
+        using var vBuf = GetOrAllocateBuffer(backend, value.IsContiguous ? value : (Tensor<T>)value.Contiguous());
+
         // Allocate output and attention weights buffers
         var outputBuffer = backend.AllocateBuffer(batch * heads * seqQ * headDim);
         var attnWeightsBuffer = backend.AllocateBuffer(batch * heads * seqQ * seqK);
 
         // Execute GPU ScaledDotProductAttention (numKVHeads == heads collapses to MHA inside the kernel)
         backend.ScaledDotProductAttention(
-            query.Buffer, key.Buffer, value.Buffer,
+            qBuf.Buffer, kBuf.Buffer, vBuf.Buffer,
             outputBuffer, attnWeightsBuffer, null,
             batch, heads, seqQ, seqK, headDim, (float)scale, isCausal, softcap, kvHeads);
 
@@ -10409,9 +10416,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// rotates each adjacent dim pair (2i, 2i+1). Keeps Q/K device-resident: no host round-trip, one kernel launch.
     /// </summary>
     /// <typeparam name="T">The element type.</typeparam>
-    /// <param name="input">GPU-resident Q or K, shape [.., seqLen, headDim] (rank &gt;= 2).</param>
-    /// <param name="cos">GPU-resident cosine cache [maxSeq, headDim/2].</param>
-    /// <param name="sin">GPU-resident sine cache [maxSeq, headDim/2].</param>
+    /// <param name="input">Q or K, shape [.., seqLen, headDim] (rank &gt;= 2). Resident or host; uploaded if needed.</param>
+    /// <param name="cos">Cosine cache [maxSeq, headDim/2]. Auto-cached device-resident (uploaded once).</param>
+    /// <param name="sin">Sine cache [maxSeq, headDim/2]. Auto-cached device-resident (uploaded once).</param>
     /// <param name="startPosition">Absolute position of the first sequence element (for incremental decode).</param>
     /// <returns>GPU-resident rotated tensor with the same shape as <paramref name="input"/>.</returns>
     public Tensor<T> ApplyRoPEInterleavedGpu<T>(Tensor<T> input, Tensor<T> cos, Tensor<T> sin, int startPosition = 0)
@@ -10430,8 +10437,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var contiguousInput = input.IsContiguous ? input : (Tensor<T>)input.Contiguous();
         int rows = contiguousInput.Length / headDim;
 
+        // input is an activation (upload if host, reuse if resident); cos/sin are constant caches that stay
+        // resident across every layer/step via the weight-buffer cache, so they upload exactly once.
+        using var inputBuffer = GetOrAllocateBuffer(backend, contiguousInput);
+        using var cosBuffer = GetWeightBufferPreferResident(backend, cos, PersistentTensorRole.Weights);
+        using var sinBuffer = GetWeightBufferPreferResident(backend, sin, PersistentTensorRole.Weights);
+
         var outputBuffer = backend.AllocateBuffer(contiguousInput.Length);
-        backend.RopeInterleaved(contiguousInput.Buffer, cos.Buffer, sin.Buffer, outputBuffer,
+        backend.RopeInterleaved(inputBuffer.Buffer, cosBuffer.Buffer, sinBuffer.Buffer, outputBuffer,
             rows, headDim, seqLen, startPosition);
 
         int[] outputShape = new int[rank];
