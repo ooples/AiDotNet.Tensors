@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.117.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.117.1...v0.117.2) (2026-07-20)
+
+
+### Bug Fixes
+
+* **gpu:** centralize the persistent-weight version gate into the shared cache lookup ([#821](https://github.com/ooples/AiDotNet.Tensors/issues/821) follow-up) ([#822](https://github.com/ooples/AiDotNet.Tensors/issues/822)) ([87aebd0](https://github.com/ooples/AiDotNet.Tensors/commit/87aebd067219a231d7852d16431f9b99d12188ef))
+* **gpu:** version-gate the persistent weight buffer so in-place weight loads under a GPU engine are not served stale ([#821](https://github.com/ooples/AiDotNet.Tensors/issues/821)) ([4c44737](https://github.com/ooples/AiDotNet.Tensors/commit/4c447370c0a08e4777de2d5f68fe2868efe92f20))
+
 ## [0.117.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.117.0...v0.117.1) (2026-07-19)
 
 
