@@ -178,7 +178,22 @@ fn mul_scalar(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn pow_scalar(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < params.size) {
-        B[idx] = pow(A[idx], params.scalar);
+        let x = A[idx];
+        let exponent = params.scalar;
+        // WGSL pow is undefined for a negative base. Integral exponents are
+        // valid, so evaluate |x|^exponent and restore odd parity.
+        if (x < 0.0) {
+            if (exponent == trunc(exponent)) {
+                let magnitude = pow(-x, exponent);
+                let abs_exponent = abs(exponent);
+                let is_odd = (abs_exponent - 2.0 * floor(abs_exponent * 0.5)) == 1.0;
+                B[idx] = select(magnitude, -magnitude, is_odd);
+            } else {
+                B[idx] = bitcast<f32>(0x7fc00000u);
+            }
+        } else {
+            B[idx] = pow(x, exponent);
+        }
     }
 }
 

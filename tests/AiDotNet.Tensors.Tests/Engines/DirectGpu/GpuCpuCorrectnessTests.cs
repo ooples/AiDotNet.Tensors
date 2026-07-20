@@ -424,6 +424,44 @@ public sealed class GpuCpuCorrectnessTests : IDisposable
     [Theory] [MemberData(nameof(UnarySizes))] public void TensorExp_Gpu_Matches_Cpu(int[] s) => AssertUnary((e, a) => e.TensorExp(a), s, "TensorExp", TolTranscendental);
     [Theory] [MemberData(nameof(UnarySizes))] public void TensorDivideScalar_Gpu_Matches_Cpu(int[] s) => AssertUnary((e, a) => e.TensorDivideScalar(a, 3f), s, "TensorDivideScalar", Tol);
 
+    public static IEnumerable<object[]> NegativeBasePowerExponents() => new List<object[]>
+    {
+        new object[] { 3.0f },
+        new object[] { 4.0f },
+        new object[] { -3.0f },
+        new object[] { -4.0f },
+        new object[] { 0.5f },
+    };
+
+    // PR #827 fixed CUDA fast-math pow for negative bases. Keep every backend aligned with the CPU
+    // reference for odd, even, negative-integral, and genuinely undefined fractional exponents.
+    // Exponent 2 is intentionally absent: TensorPower optimizes x^2 to Multiply before Power is called.
+    [Theory]
+    [MemberData(nameof(NegativeBasePowerExponents))]
+    public void TensorPower_NegativeBases_GpuMatchesCpu(float exponent)
+    {
+        if (!EnsureGpuReady()) return;
+
+        var input = new Tensor<float>(new[] { -8.0f, -2.0f, -0.5f, 0.5f, 2.0f, 8.0f }, new[] { 6 });
+        float[] expected = _cpu.TensorPower(input, exponent).ToArray();
+        float[] actual = _gpu.TensorPower(input, exponent).ToArray();
+
+        Assert.Equal(expected.Length, actual.Length);
+        for (int i = 0; i < expected.Length; i++)
+        {
+            if (float.IsNaN(expected[i]))
+            {
+                Assert.True(float.IsNaN(actual[i]),
+                    $"TensorPower exponent {exponent}: expected NaN at index {i}, got {actual[i]}");
+                continue;
+            }
+
+            double tolerance = 5e-4 * Math.Max(1.0, Math.Abs(expected[i]));
+            Assert.True(Math.Abs((double)actual[i] - expected[i]) <= tolerance,
+                $"TensorPower exponent {exponent}: expected {expected[i]} at index {i}, got {actual[i]}");
+        }
+    }
+
     [Theory]
     [MemberData(nameof(ElementwiseShapes))]
     public void TensorDivide_Gpu_Matches_Cpu(int[] shape)
