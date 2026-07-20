@@ -10421,6 +10421,32 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="sin">Sine cache [maxSeq, headDim/2]. Auto-cached device-resident (uploaded once).</param>
     /// <param name="startPosition">Absolute position of the first sequence element (for incremental decode).</param>
     /// <returns>GPU-resident rotated tensor with the same shape as <paramref name="input"/>.</returns>
+    /// <summary>
+    /// GPU-resident axis permute that keeps the result ON-DEVICE (unlike <see cref="TensorPermute{T}"/>, which
+    /// returns a strided host-materializing view, and <see cref="TensorPermuteInto{T}"/>, whose eager path downloads
+    /// to host). Runs the backend transpose kernel into a fresh contiguous device buffer and returns it resident, so
+    /// a resident forward (e.g. the [b,s,H,hd]→[b,H,s,hd] attention reshape) never round-trips to the CPU.
+    /// </summary>
+    /// <typeparam name="T">The element type.</typeparam>
+    /// <param name="tensor">GPU-resident (or host) input tensor.</param>
+    /// <param name="axes">Permutation of the axes, length == rank.</param>
+    /// <returns>Contiguous GPU-resident tensor with the permuted shape.</returns>
+    public Tensor<T> PermuteResidentGpu<T>(Tensor<T> tensor, int[] axes)
+    {
+        if (!TryGetBackend(out var backend))
+            throw new InvalidOperationException("No GPU backend available for PermuteResidentGpu");
+        int rank = tensor.Shape._dims.Length;
+        if (axes.Length != rank)
+            throw new ArgumentException("Axes length must match tensor rank.", nameof(axes));
+        var outDims = new int[rank];
+        for (int i = 0; i < rank; i++) outDims[i] = tensor.Shape._dims[axes[i]];
+
+        using var bufIn = GetOrAllocateBuffer(backend, tensor);
+        var outBuf = backend.AllocateBuffer(tensor.Length);
+        backend.Permute(bufIn.Buffer, outBuf, tensor.Shape._dims, axes);
+        return Tensor<T>.FromGpuBuffer(backend, outBuf, outDims, GpuTensorRole.Activation, ownsBuffer: true);
+    }
+
     public Tensor<T> ApplyRoPEInterleavedGpu<T>(Tensor<T> input, Tensor<T> cos, Tensor<T> sin, int startPosition = 0)
     {
         if (!TryGetBackend(out var backend))
