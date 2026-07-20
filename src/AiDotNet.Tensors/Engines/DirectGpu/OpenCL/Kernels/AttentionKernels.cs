@@ -78,6 +78,10 @@ __kernel void scaled_dot_product_attention(
     const int vOffset = bkvh * seqK * headDim;
     const int wOffset = row * seqK;
     const int maskOffset = (maskMode == 2 ? bh * seqQ * seqK : 0) + qi * seqK;
+    // Causal with a KV-cache offset: query row qi sits at absolute position qi + (seqK - seqQ), so it may
+    // attend to keys up to there. seqQ==seqK (prefill) collapses this to the standard ki > qi; a decode step
+    // (seqQ=1 < seqK) correctly attends to the whole cached prefix instead of only key 0.
+    const int qPos = qi + (seqK - seqQ);
 
     // Attention-logit soft-cap (Gemma-2): softcap * tanh((score*scale)/softcap); softcap<=0 disables.
     #define ATTN_LOGIT(sc) (softcap > 0.0f ? softcap * tanh(((sc) * scale) / softcap) : (sc) * scale)
@@ -85,7 +89,7 @@ __kernel void scaled_dot_product_attention(
     // Compute attention scores and find max for numerical stability
     float maxScore = NEGATIVE_INFINITY;
     for (int ki = 0; ki < seqK; ki++) {
-        if ((isCausal && ki > qi) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f)) continue;
+        if ((isCausal && ki > qPos) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f)) continue;
 
         float score = 0.0f;
         for (int d = 0; d < headDim; d++) {
@@ -97,7 +101,7 @@ __kernel void scaled_dot_product_attention(
 
     float sumExp = 0.0f;
     for (int ki = 0; ki < seqK; ki++) {
-        if ((isCausal && ki > qi) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f)) continue;
+        if ((isCausal && ki > qPos) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f)) continue;
 
         float score = 0.0f;
         for (int d = 0; d < headDim; d++) {
@@ -112,7 +116,7 @@ __kernel void scaled_dot_product_attention(
     if (storeWeights) {
         for (int ki = 0; ki < seqK; ki++) {
             float weight = 0.0f;
-            if (!((isCausal && ki > qi) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f))) {
+            if (!((isCausal && ki > qPos) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f))) {
                 float score = 0.0f;
                 for (int inner = 0; inner < headDim; inner++) {
                     score += query[qOffset + inner] * key[kOffset + ki * headDim + inner];
@@ -126,7 +130,7 @@ __kernel void scaled_dot_product_attention(
     for (int d = 0; d < headDim; d++) {
         float val = 0.0f;
         for (int ki = 0; ki < seqK; ki++) {
-            if ((isCausal && ki > qi) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f)) continue;
+            if ((isCausal && ki > qPos) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f)) continue;
             float score = 0.0f;
             for (int inner = 0; inner < headDim; inner++) {
                 score += query[qOffset + inner] * key[kOffset + ki * headDim + inner];
