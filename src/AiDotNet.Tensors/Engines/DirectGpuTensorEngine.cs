@@ -12610,6 +12610,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <summary>
     /// GPU-accelerated RMSNorm operation.
     /// </summary>
+    /// <summary>
+    /// Device-agnostic interleaved RoPE entry point: dispatches to the fused GPU <c>rope_interleaved</c> kernel
+    /// (recordable under a deferred scope) for the float GPU path, and falls back to the CPU implementation for
+    /// the tape, graph-mode, non-float, or no-GPU cases. The two paths use the same interleaving convention.
+    /// </summary>
+    Tensor<T> IEngine.ApplyRoPEInterleaved<T>(Tensor<T> input, Tensor<T> cos, Tensor<T> sin, int startPosition)
+    {
+        if (IsTapeActive<T>()) return base.ApplyRoPEInterleaved(input, cos, sin, startPosition);
+        if (Compilation.GraphMode.IsActive) return base.ApplyRoPEInterleaved(input, cos, sin, startPosition);
+        if (typeof(T) != typeof(float)) return base.ApplyRoPEInterleaved(input, cos, sin, startPosition);
+        if (!TryGetBackend(out _)) return base.ApplyRoPEInterleaved(input, cos, sin, startPosition);
+        try
+        {
+            return ApplyRoPEInterleavedGpu(input, cos, sin, startPosition);
+        }
+        catch
+        {
+            return base.ApplyRoPEInterleaved(input, cos, sin, startPosition);
+        }
+    }
+
     Tensor<T> IEngine.RMSNorm<T>(Tensor<T> input, Tensor<T> gamma, double epsilon, out Tensor<T> rms)
     {
         if (IsTapeActive<T>()) return base.RMSNorm(input, gamma, epsilon, out rms);

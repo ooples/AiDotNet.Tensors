@@ -25967,6 +25967,55 @@ public partial class CpuEngine : ITensorLevelEngine
 
 
     /// <inheritdoc/>
+    /// <inheritdoc/>
+    public virtual Tensor<T> ApplyRoPEInterleaved<T>(Tensor<T> input, Tensor<T> cos, Tensor<T> sin, int startPosition = 0)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (cos == null) throw new ArgumentNullException(nameof(cos));
+        if (sin == null) throw new ArgumentNullException(nameof(sin));
+
+        int rank = input._shape.Length;
+        if (rank < 2)
+            throw new ArgumentException("RoPE input must have rank >= 2 ([.., seqLen, headDim]).", nameof(input));
+        int headDim = input._shape[rank - 1];
+        int seqLen = input._shape[rank - 2];
+        if (headDim <= 0 || seqLen <= 0 || (headDim & 1) != 0)
+            throw new ArgumentException("RoPE requires positive seqLen and an even headDim.", nameof(input));
+        int halfDim = headDim / 2;
+
+        var src = input.IsContiguous ? input : input.Contiguous();
+        int total = src.Length;
+        int rows = total / headDim;
+
+        var inSpan = src.AsSpan();
+        var cosSpan = cos.AsSpan();
+        var sinSpan = sin.AsSpan();
+        var outArr = new T[total];
+        var numOps = MathHelper.GetNumericOperations<T>();
+
+        // Matches the fused rope_interleaved kernel exactly (GPT-J / GGML interleaving): row r sits at sequence
+        // position startPosition + (r % seqLen); pair (2i, 2i+1) rotates by the angle cached at [pos, i].
+        for (int row = 0; row < rows; row++)
+        {
+            int pos = startPosition + (row % seqLen);
+            int baseIdx = row * headDim;
+            int cacheBase = pos * halfDim;
+            for (int i = 0; i < halfDim; i++)
+            {
+                T c = cosSpan[cacheBase + i];
+                T sn = sinSpan[cacheBase + i];
+                T xEven = inSpan[baseIdx + 2 * i];
+                T xOdd = inSpan[baseIdx + 2 * i + 1];
+                outArr[baseIdx + 2 * i] = numOps.Subtract(numOps.Multiply(xEven, c), numOps.Multiply(xOdd, sn));
+                outArr[baseIdx + 2 * i + 1] = numOps.Add(numOps.Multiply(xEven, sn), numOps.Multiply(xOdd, c));
+            }
+        }
+
+        var outShape = new int[rank];
+        for (int i = 0; i < rank; i++) outShape[i] = input._shape[i];
+        return new Tensor<T>(outArr, outShape);
+    }
+
     public virtual Tensor<T> RMSNorm<T>(Tensor<T> input, Tensor<T> gamma, double epsilon, out Tensor<T> rms)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));

@@ -131,6 +131,37 @@ public sealed class RopeGqaOpenClTests : IDisposable
                 $"RoPE mismatch at {i}: expected {expected[i]}, got {actual[i]}");
     }
 
+    /// <summary>
+    /// The device-agnostic <c>IEngine.ApplyRoPEInterleaved</c> CPU path must use the SAME interleaving
+    /// convention as the GPU kernel (validated against the same reference above), so a decoder's RoPE stays
+    /// numerically identical whether it runs on CPU or GPU. Runs anywhere (no GPU required).
+    /// </summary>
+    [Fact]
+    public void ApplyRoPEInterleaved_CpuEngine_MatchesReference()
+    {
+        const int heads = 3, seqLen = 6, headDim = 8, maxSeq = 32, startPosition = 5;
+        int rows = heads * seqLen;
+        var rng = new Random(11);
+        var input = new float[rows * headDim];
+        for (int i = 0; i < input.Length; i++) input[i] = (float)(rng.NextDouble() * 2 - 1);
+        var (cos, sin) = BuildRopeCache(maxSeq, headDim, 10000f);
+
+        var expected = RopeReference(input, cos, sin, rows, headDim, seqLen, startPosition);
+
+        var engine = new AiDotNet.Tensors.Engines.CpuEngine();
+        var inT = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(input, new[] { heads, seqLen, headDim });
+        var cosT = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(cos, new[] { maxSeq, headDim / 2 });
+        var sinT = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(sin, new[] { maxSeq, headDim / 2 });
+
+        var actual = ((AiDotNet.Tensors.Engines.IEngine)engine)
+            .ApplyRoPEInterleaved(inT, cosT, sinT, startPosition).AsSpan().ToArray();
+
+        Assert.Equal(expected.Length, actual.Length);
+        for (int i = 0; i < expected.Length; i++)
+            Assert.True(Math.Abs(expected[i] - actual[i]) < 1e-5f,
+                $"CPU RoPE mismatch at {i}: expected {expected[i]}, got {actual[i]}");
+    }
+
     // ---- Grouped-Query Attention --------------------------------------------
 
     private static float[] GqaReference(float[] q, float[] k, float[] v,

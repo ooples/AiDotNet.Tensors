@@ -5375,6 +5375,22 @@ public interface IEngine
     Tensor<T> RMSNorm<T>(Tensor<T> input, Tensor<T> gamma, double epsilon, out Tensor<T> rms);
 
     /// <summary>
+    /// Applies interleaved rotary positional embedding (RoPE, GPT-J / GGML layout) to a
+    /// <c>[.., seqLen, headDim]</c> activation, device-agnostically: the GPU engine dispatches to the fused
+    /// <c>rope_interleaved</c> kernel (recordable under a deferred scope), while the CPU engine runs the same
+    /// interleaved rotation. Adjacent dimensions <c>(2i, 2i+1)</c> are rotated by the angle at
+    /// <c>cos/sin[position, i]</c> where <c>position = startPosition + (row % seqLen)</c>:
+    /// <c>out[2i] = x[2i]·cos − x[2i+1]·sin</c>, <c>out[2i+1] = x[2i]·sin + x[2i+1]·cos</c>.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="input">Activation to rotate, shape <c>[.., seqLen, headDim]</c> with an even <c>headDim</c>.</param>
+    /// <param name="cos">Precomputed cosine cache <c>[maxSeq, headDim/2]</c>.</param>
+    /// <param name="sin">Precomputed sine cache <c>[maxSeq, headDim/2]</c>.</param>
+    /// <param name="startPosition">Absolute position of the first sequence element (KV-cache offset).</param>
+    /// <returns>The rotated tensor, same shape as <paramref name="input"/>.</returns>
+    Tensor<T> ApplyRoPEInterleaved<T>(Tensor<T> input, Tensor<T> cos, Tensor<T> sin, int startPosition = 0);
+
+    /// <summary>
     /// Computes the backward pass for RMSNorm.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
