@@ -1429,7 +1429,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (backingArray is not null)
         {
             // Check caches using the raw array reference (no download triggered)
-            var cached = TryGetCachedBuffer(backingArray);
+            var cached = TryGetCachedBuffer(backingArray, tensor.Version);
             if (cached != null)
                 return new OwnedBuffer(cached, ownsBuffer: false);
 
@@ -1719,7 +1719,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var backingArray = tensor.DataVector.GetBackingArrayUnsafe();
         if (backingArray is not null)
         {
-            var cached = TryGetCachedBuffer(backingArray);
+            var cached = TryGetCachedBuffer(backingArray, tensor.Version);
             if (cached != null) return new OwnedBuffer(cached, ownsBuffer: false);
 
             bool upcastNeeded2 = false;
@@ -2487,9 +2487,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private OwnedBuffer GetOrCacheWeightBufferVersionAware<T>(IDirectGpuBackend backend, Tensor<T> weights, PersistentTensorRole role)
     {
         T[] data = weights.GetDataArray();
-        int hostVersion = weights.Version;
         lock (_persistentBufferLock)
         {
+            // Sample Version INSIDE the lock so the stamp we record cannot be an older value than the data
+            // we upload (a concurrent in-place write between the sample and the stamp would otherwise leave
+            // the cache falsely "fresh"). data is the live backing array, so ToFloatArray below always reads
+            // the latest bytes; pairing it with the in-lock Version keeps the stamp consistent, and any write
+            // racing the upload just bumps Version again and self-heals on the next read.
+            int hostVersion = weights.Version;
             bool cached = _persistentBufferCache.TryGetValue(data, out var entry);
             if (cached
                 && _persistentWeightHostVersion.TryGetValue(data, out int stampedVersion)
@@ -2838,7 +2843,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // stops tracking weight changes), which broke the standalone/host-optimizer mixed-precision paths.
             if (x._gpuBuffer is not null && ReferenceEquals(x._gpuBackend, backend) && x._gpuBufferVersion == x.Version)
             {
-                var persistent = xarr is not null ? TryGetCachedBuffer(xarr) : null;
+                var persistent = xarr is not null ? TryGetCachedBuffer(xarr, x.Version) : null;
                 if ((persistent is not null && ReferenceEquals(persistent, x._gpuBuffer))
                     || IsCachedGpuBufferLive(x, backend))
                     xbuf = x._gpuBuffer;
@@ -3143,7 +3148,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // param resident in _persistentBufferCache (uploaded once by the optimizer / an earlier op) but NOT in
             // the activation cache; without this the alias declines and host-copies, dropping the param's reshape
             // off the residency chain.
-            if (srcArr is not null) { var pc = TryGetCachedBuffer(srcArr); if (pc != null) srcBuf = pc; }
+            if (srcArr is not null) { var pc = TryGetCachedBuffer(srcArr, src.Version); if (pc != null) srcBuf = pc; }
             if (srcBuf is null)
                 lock (_activationCacheLock)
                 {
@@ -3164,7 +3169,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var cArr = src.DataVector.GetBackingArrayUnsafe();
             if (cArr is not null && src.IsContiguous && !Helpers.DeferredArrayMaterializer.IsPending(cArr))
             {
-                try { srcBuf = GetOrCacheWeightBuffer(backend, src.GetDataArray(), PersistentTensorRole.Weights).Buffer; }
+                try { srcBuf = GetOrCacheWeightBufferVersionAware(backend, src, PersistentTensorRole.Weights).Buffer; }
                 catch { srcBuf = null; }
             }
         }
@@ -4196,7 +4201,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var arr = t.DataVector.GetBackingArrayUnsafe();
         if (arr is not null)
         {
-            var cached = TryGetCachedBuffer(arr);
+            var cached = TryGetCachedBuffer(arr, t.Version);
             if (cached is not null && cached.Handle != System.IntPtr.Zero && cached.Size >= need)
                 return cached;
             lock (_activationCacheLock)
@@ -4662,7 +4667,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var arr = t.DataVector.GetBackingArrayUnsafe();
         if (arr is not null)
         {
-            var cached = TryGetCachedBuffer(arr);
+            var cached = TryGetCachedBuffer(arr, t.Version);
             if (cached != null && cached.Handle != System.IntPtr.Zero && cached.Size >= need)
                 return new OwnedBuffer(cached, ownsBuffer: false);
             lock (_activationCacheLock)
@@ -6711,7 +6716,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 $"GetOrCacheWeightsGpu only supports Weight, Bias, Statistics, AttentionCache, or Constant roles. " +
                 $"Got: {role}. Use UploadToGpu for other tensor types.", nameof(role))
         };
-        var ownedBuffer = GetOrCacheWeightBuffer(backend, tensor.GetDataArray(), persistentRole);
+        var ownedBuffer = GetOrCacheWeightBufferVersionAware(backend, tensor, persistentRole);
 
         // Propagate ownership: if cache owns buffer, GpuTensor shouldn't dispose;
         // if we own buffer (race condition fallback), GpuTensor should take ownership
@@ -10910,6 +10915,26 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return entry.Buffer;
         }
         return null;
+    }
+
+    /// <summary>
+    /// Version-aware persistent-cache lookup. Returns the cached device buffer only when it is CURRENT with
+    /// the host tensor: if the buffer was uploaded for a persistent weight/param (it carries a
+    /// <see cref="_persistentWeightHostVersion"/> stamp) and the host has since been mutated in place
+    /// (<paramref name="hostVersion"/> advanced past the stamp), this returns null so the caller re-uploads
+    /// the current data instead of reusing the stale buffer. Buffers with no stamp (transient activations
+    /// cached by backing array) are returned unconditionally — they are not persistent weights and their
+    /// residency is governed elsewhere. Mirrors the resident <c>_gpuBuffer</c> version gate for the paths
+    /// that resolve an operand straight from the persistent cache (matmul/elementwise/reshape operands),
+    /// which the dedicated <see cref="GetWeightBufferPreferResident{T}"/> path does not cover.
+    /// </summary>
+    internal IGpuBuffer? TryGetCachedBuffer<T>(T[] tensorData, int hostVersion)
+    {
+        if (!_persistentBufferCache.TryGetValue(tensorData, out var entry))
+            return null;
+        if (_persistentWeightHostVersion.TryGetValue(tensorData, out int stamped) && stamped != hostVersion)
+            return null; // stale persistent weight — force the caller to re-upload current host data
+        return entry.Buffer;
     }
 
     private void RemoveCsrBufferCacheForSparse(object sparse)
