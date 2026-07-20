@@ -814,6 +814,27 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     System.Diagnostics.Debug.WriteLine($"OpenCL Detection compilation failed: {ex.Message}");
                 }
 
+                // Compile fused ANN kernels (IVF / PQ / IVFPQ / HNSW). Optional —
+                // same fallback pattern as Detection: on compile failure the
+                // kernels are simply absent from _kernelCache, the IAnnBackend
+                // implementation throws on call, and the engine falls through to
+                // the managed AnnPrimitives CPU reference.
+                try
+                {
+                    var annProgram = CompileOrLoadCached(OpenClAnnKernels.GetSource(), optimizationFlags, "ANN kernels");
+                    // Commit program + kernels together so a partial failure
+                    // doesn't leave _kernelCache in a half-populated state.
+                    var built = new System.Collections.Generic.List<(string, DirectOpenClKernel)>();
+                    foreach (var name in OpenClAnnKernels.GetKernelNames())
+                        built.Add((name, new DirectOpenClKernel(_context, annProgram, name)));
+                    _programs.Add(annProgram);
+                    foreach (var (name, kernel) in built) _kernelCache[name] = kernel;
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"OpenCL ANN compilation failed: {ex.Message}");
+                }
+
                 // Compile Geometry / sampling kernels (Issue #217 second half).
                 try
                 {
