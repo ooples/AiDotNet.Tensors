@@ -39142,6 +39142,43 @@ public partial class CpuEngine : ITensorLevelEngine
     #region FFT and Signal Processing
 
     /// <inheritdoc/>
+    /// <summary>
+    /// Exact-size per-thread scratch for the FFT cores.
+    /// </summary>
+    /// <remarks>
+    /// ArrayPool is deliberately NOT used: Rent may hand back a LONGER array than requested, and
+    /// NativeFFTInPlace derives the transform length from the array length — an oversized buffer would
+    /// silently compute the wrong-size transform rather than fail. Keyed on exact length, the buffer is
+    /// reused by every signal on the thread, so after the first signal the parallel loop allocates nothing.
+    ///
+    /// Reuse is safe for both callers because nFft is always a power of two (hence even) and both fill the
+    /// buffer completely before transforming: RFFT writes [0, n) from the input and zero-fills [n, nFft);
+    /// IRFFT writes [0, nFft/2] from the positive frequencies and (nFft/2, nFft) by conjugate symmetry,
+    /// which together cover every bin. No stale element from a previous signal can survive.
+    /// </remarks>
+    /// <summary>
+    /// Test-only switch selecting the legacy FFTCore path instead of NativeFFTInPlace.
+    /// </summary>
+    /// <remarks>
+    /// Exists so both cores can be exercised in ONE process and interleaved within a single thermal window.
+    /// Comparing them across separate runs is not sound on a many-core box that throttles under sustained
+    /// load: identical code re-measured minutes apart varied by up to 3.7x here, which swamps the effect
+    /// being measured. Interleaving A/B/A/B inside one process is what makes the comparison meaningful.
+    /// Never set outside benchmarks.
+    /// </remarks>
+    internal static bool UseLegacyFftCore;
+
+    [ThreadStatic] private static object? _fftScratch;
+
+    private static Complex<T>[] FftScratch<T>(int nFft)
+    {
+        if (_fftScratch is Complex<T>[] buf && buf.Length == nFft) return buf;
+        var fresh = new Complex<T>[nFft];
+        _fftScratch = fresh;
+        return fresh;
+    }
+
+    /// <inheritdoc/>
     public Tensor<T> RFFT<T>(Tensor<T> input)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
@@ -39167,25 +39204,47 @@ public partial class CpuEngine : ITensorLevelEngine
         // Handle batched input
         int batchSize = input.Length / n;
 
+        // Routed through NativeFFTInPlace, not FFTCore. FFTCore recomputed Math.Cos/Math.Sin INSIDE the
+        // innermost butterfly loop — the twiddle for a given (size, k) is identical across every block, so a
+        // length-256 transform burned (n/2)*log2(n)*2 = 2048 trig calls per signal, and it round-tripped every
+        // value through numOps.ToDouble/FromDouble (6 per butterfly). NativeFFTInPlace already caches twiddles
+        // per (n, inverse) and dispatches float/double to non-generic span kernels, so RFFT gets that for free.
+        // Measured before this change on the Autoformer aggregation benchmark: the FFT path ran ~9-12x SLOWER
+        // than the scalar loop it was meant to replace despite issuing ~3x fewer FLOPs.
         CpuParallelSettings.ParallelForOrSerial(0, batchSize, input.Length, batchIdx =>
         {
-            // Extract signal for this batch
-            var signal = new Vector<T>(nFft);
+            // One exact-size buffer per signal (was ~6 Vector<T> allocations). Not pooled: ArrayPool.Rent may
+            // hand back a longer array and the in-place core keys its transform length off the array length.
             int inputOffset = batchIdx * n;
+            int outputOffsetLegacy = batchIdx * numFreqs * 2;
+            if (UseLegacyFftCore)
+            {
+                var signal = new Vector<T>(nFft);
+                for (int i = 0; i < n; i++) signal[i] = inputData[inputOffset + i];
+                for (int i = n; i < nFft; i++) signal[i] = numOps.Zero;
+                var (lr, li) = FFTCore<T>(signal, inverse: false);
+                for (int k = 0; k < numFreqs; k++)
+                {
+                    resultData[outputOffsetLegacy + k * 2] = lr[k];
+                    resultData[outputOffsetLegacy + k * 2 + 1] = li[k];
+                }
+                return;
+            }
+
+            var work = FftScratch<T>(nFft);
             for (int i = 0; i < n; i++)
-                signal[i] = inputData[inputOffset + i];
+                work[i] = new Complex<T>(inputData[inputOffset + i], numOps.Zero);
             for (int i = n; i < nFft; i++)
-                signal[i] = numOps.Zero;
+                work[i] = new Complex<T>(numOps.Zero, numOps.Zero);
 
-            // Compute FFT using Cooley-Tukey algorithm
-            var (realOut, imagOut) = FFTCore<T>(signal, inverse: false);
+            NativeFFTInPlace(work, inverse: false, numOps);
 
-            // Copy only positive frequencies (0 to Nyquist)
+            // Keep only the positive frequencies (0 to Nyquist), interleaved re/im.
             int outputOffset = batchIdx * numFreqs * 2;
             for (int k = 0; k < numFreqs; k++)
             {
-                resultData[outputOffset + k * 2] = realOut[k];
-                resultData[outputOffset + k * 2 + 1] = imagOut[k];
+                resultData[outputOffset + k * 2] = work[k].Real;
+                resultData[outputOffset + k * 2 + 1] = work[k].Imaginary;
             }
         });
 
@@ -39238,35 +39297,28 @@ public partial class CpuEngine : ITensorLevelEngine
 
         CpuParallelSettings.ParallelForOrSerial(0, batchSize, input.Length, batchIdx =>
         {
-            // Reconstruct full spectrum using conjugate symmetry
-            var realIn = new Vector<T>(nFft);
-            var imagIn = new Vector<T>(nFft);
+            // Same routing change as RFFT: NativeFFTInPlace (cached twiddles + non-generic float/double span
+            // kernels) instead of FFTCore, which recomputed Math.Cos/Math.Sin per butterfly and converted
+            // through numOps on every element. One exact-size buffer replaces the two Vector<T> allocations
+            // plus FFTCore's own internal allocations.
+            var work = FftScratch<T>(nFft);
             int inputOffset = batchIdx * numFreqs * 2;
 
-            // Copy positive frequencies
+            // Positive frequencies as given.
             for (int k = 0; k < numFreqs; k++)
-            {
-                realIn[k] = inputData[inputOffset + k * 2];
-                imagIn[k] = inputData[inputOffset + k * 2 + 1];
-            }
+                work[k] = new Complex<T>(inputData[inputOffset + k * 2], inputData[inputOffset + k * 2 + 1]);
 
-            // Conjugate symmetry for negative frequencies
+            // Negative frequencies by conjugate symmetry: X[n-k] = conj(X[k]).
             for (int k = 1; k < numFreqs - 1; k++)
-            {
-                realIn[nFft - k] = realIn[k];
-                imagIn[nFft - k] = numOps.Negate(imagIn[k]);
-            }
+                work[nFft - k] = new Complex<T>(work[k].Real, numOps.Negate(work[k].Imaginary));
 
-            // Compute inverse FFT
-            var (realOut, _) = FFTCore<T>(realIn, imagIn, inverse: true);
+            NativeFFTInPlace(work, inverse: true, numOps);
 
-            // Copy result with normalization
+            // Real part only, normalized by 1/nFft.
             int outputOffset = batchIdx * outputLength;
             T scale = numOps.FromDouble(1.0 / nFft);
             for (int i = 0; i < outputLength; i++)
-            {
-                resultData[outputOffset + i] = numOps.Multiply(realOut[i], scale);
-            }
+                resultData[outputOffset + i] = numOps.Multiply(work[i].Real, scale);
         });
 
         DifferentiableOps.RecordUnary("IRFFT", result, inputOrig, static (gradOutput, inputs, output, savedState, engine, grads) =>
