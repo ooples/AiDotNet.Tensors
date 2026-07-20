@@ -210,6 +210,41 @@ public sealed class RopeGqaOpenClTests : IDisposable
         return outp;
     }
 
+    /// <summary>
+    /// The device-agnostic <c>IEngine.ScaledDotProductAttentionGqa</c> CPU path (broadcast KV heads + attend)
+    /// must match the same reference the fused GPU GQA kernel passes, so a decoder's attention is numerically
+    /// identical whether it runs on CPU or the recordable GPU kernel — with UNEXPANDED K/V (no ExpandKVHeads).
+    /// Runs anywhere (no GPU required).
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ScaledDotProductAttentionGqa_CpuEngine_MatchesReference(bool causal)
+    {
+        const int batch = 1, qHeads = 6, kvHeads = 2, seqQ = 5, seqK = 5, headDim = 8;
+        float scale = 1f / (float)Math.Sqrt(headDim);
+        var rng = new Random(23);
+        float[] Rand(int n) { var a = new float[n]; for (int i = 0; i < n; i++) a[i] = (float)(rng.NextDouble() * 2 - 1); return a; }
+        var q = Rand(batch * qHeads * seqQ * headDim);
+        var k = Rand(batch * kvHeads * seqK * headDim);
+        var v = Rand(batch * kvHeads * seqK * headDim);
+
+        var expected = GqaReference(q, k, v, batch, qHeads, kvHeads, seqQ, seqK, headDim, scale, causal);
+
+        var engine = new AiDotNet.Tensors.Engines.CpuEngine();
+        var qT = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(q, new[] { batch, qHeads, seqQ, headDim });
+        var kT = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(k, new[] { batch, kvHeads, seqK, headDim });
+        var vT = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(v, new[] { batch, kvHeads, seqK, headDim });
+
+        var actual = ((AiDotNet.Tensors.Engines.IEngine)engine)
+            .ScaledDotProductAttentionGqa(qT, kT, vT, scale, causal).AsSpan().ToArray();
+
+        Assert.Equal(expected.Length, actual.Length);
+        for (int i = 0; i < expected.Length; i++)
+            Assert.True(Math.Abs(expected[i] - actual[i]) < 1e-4f,
+                $"CPU GQA-SDPA mismatch at {i}: expected {expected[i]}, got {actual[i]}");
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

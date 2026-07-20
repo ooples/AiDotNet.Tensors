@@ -12631,6 +12631,28 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    /// <summary>
+    /// Device-agnostic grouped-query attention entry point: dispatches to the fused GQA-aware GPU kernel
+    /// (recordable, broadcasts the shared KV heads inside the kernel) for the float GPU path, and falls back to
+    /// the CPU broadcast-then-attend implementation for the tape, graph-mode, non-float, or no-GPU cases.
+    /// </summary>
+    Tensor<T> IEngine.ScaledDotProductAttentionGqa<T>(
+        Tensor<T> query, Tensor<T> key, Tensor<T> value, double scale, bool isCausal, double softcap)
+    {
+        if (IsTapeActive<T>()) return base.ScaledDotProductAttentionGqa(query, key, value, scale, isCausal, softcap);
+        if (Compilation.GraphMode.IsActive) return base.ScaledDotProductAttentionGqa(query, key, value, scale, isCausal, softcap);
+        if (typeof(T) != typeof(float)) return base.ScaledDotProductAttentionGqa(query, key, value, scale, isCausal, softcap);
+        if (!TryGetBackend(out _)) return base.ScaledDotProductAttentionGqa(query, key, value, scale, isCausal, softcap);
+        try
+        {
+            return ScaledDotProductAttentionGpu(query, key, value, scale, isCausal, (float)softcap);
+        }
+        catch
+        {
+            return base.ScaledDotProductAttentionGqa(query, key, value, scale, isCausal, softcap);
+        }
+    }
+
     Tensor<T> IEngine.RMSNorm<T>(Tensor<T> input, Tensor<T> gamma, double epsilon, out Tensor<T> rms)
     {
         if (IsTapeActive<T>()) return base.RMSNorm(input, gamma, epsilon, out rms);

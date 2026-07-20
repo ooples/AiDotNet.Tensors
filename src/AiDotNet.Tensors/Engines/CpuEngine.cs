@@ -26330,6 +26330,70 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Attention(Q, K, V) = softmax(Q @ K^T / sqrt(d_k)) @ V
     /// From "Attention Is All You Need" (Vaswani et al., 2017)
     /// </summary>
+    /// <inheritdoc/>
+    public virtual Tensor<T> ScaledDotProductAttentionGqa<T>(
+        Tensor<T> query, Tensor<T> key, Tensor<T> value, double scale, bool isCausal, double softcap = 0.0)
+    {
+        if (query == null) throw new ArgumentNullException(nameof(query));
+        if (key == null) throw new ArgumentNullException(nameof(key));
+        if (value == null) throw new ArgumentNullException(nameof(value));
+        if (query._shape.Length != 4 || key._shape.Length != 4 || value._shape.Length != 4)
+            throw new ArgumentException("Q/K/V must be 4D [batch, heads, seq, headDim].");
+
+        int qHeads = query._shape[1];
+        int kvHeads = key._shape[1];
+        if (kvHeads <= 0 || qHeads % kvHeads != 0)
+            throw new ArgumentException($"Query heads ({qHeads}) must be a positive multiple of KV heads ({kvHeads}).");
+
+        // CPU path: materialize the shared KV heads (managed, not on the record path — the GPU engine overrides
+        // this to the fused GQA kernel that broadcasts inside the kernel with no copy), then run standard SDPA.
+        Tensor<T> k = qHeads == kvHeads ? key : BroadcastKvHeads(key, qHeads);
+        Tensor<T> v = qHeads == kvHeads ? value : BroadcastKvHeads(value, qHeads);
+
+        Tensor<bool>? mask = null;
+        if (isCausal)
+        {
+            // The SDPA reads mask[b, h, i, j] with explicit head/batch indices, so materialize the full shape
+            // (the same causal plane is shared across batch and heads). true = key visible to this query.
+            int batch = query._shape[0];
+            int seqQ = query._shape[2];
+            int seqK = k._shape[2];
+            int offset = seqK - seqQ; // KV-cache offset: query i is at absolute key position i + offset.
+            var maskData = new bool[batch * qHeads * seqQ * seqK];
+            int idx = 0;
+            for (int b = 0; b < batch; b++)
+                for (int h = 0; h < qHeads; h++)
+                    for (int i = 0; i < seqQ; i++)
+                        for (int j = 0; j < seqK; j++)
+                            maskData[idx++] = j <= i + offset;
+            mask = new Tensor<bool>(maskData, new[] { batch, qHeads, seqQ, seqK });
+        }
+
+        return ScaledDotProductAttention(query, k, v, mask, scale, out _, softcap);
+    }
+
+    // Repeats each KV head across its query-head group: [batch, kvHeads, seq, headDim] -> [batch, qHeads, seq, headDim].
+    private static Tensor<T> BroadcastKvHeads<T>(Tensor<T> kv, int qHeads)
+    {
+        int batch = kv._shape[0], kvHeads = kv._shape[1], seq = kv._shape[2], headDim = kv._shape[3];
+        int group = qHeads / kvHeads;
+        var src = kv.IsContiguous ? kv : kv.Contiguous();
+        var srcSpan = src.AsSpan();
+        int perHead = seq * headDim;
+        var outArr = new T[batch * qHeads * perHead];
+        for (int b = 0; b < batch; b++)
+        {
+            for (int h = 0; h < qHeads; h++)
+            {
+                int kvh = h / group;
+                int srcOff = (b * kvHeads + kvh) * perHead;
+                int dstOff = (b * qHeads + h) * perHead;
+                srcSpan.Slice(srcOff, perHead).CopyTo(new Span<T>(outArr, dstOff, perHead));
+            }
+        }
+        return new Tensor<T>(outArr, new[] { batch, qHeads, seq, headDim });
+    }
+
     public Tensor<T> ScaledDotProductAttention<T>(
         Tensor<T> query,
         Tensor<T> key,
