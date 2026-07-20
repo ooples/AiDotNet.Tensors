@@ -2484,76 +2484,73 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <see cref="InvalidatePersistentTensor{T}"/>. Raw-span writes (AsWritableSpan) that bypass the
     /// version bump still require an explicit invalidate, per the documented Tensor mutation contract.
     /// </summary>
+    /// <summary>Sentinel for <see cref="GetOrCacheWeightBuffer{T}(IDirectGpuBackend,T[],PersistentTensorRole,int)"/>:
+    /// skip the host-Version staleness gate (legacy version-blind behavior for non-weight callers).</summary>
+    private const int NoHostVersionGate = -1;
+
     private OwnedBuffer GetOrCacheWeightBufferVersionAware<T>(IDirectGpuBackend backend, Tensor<T> weights, PersistentTensorRole role)
-    {
-        T[] data = weights.GetDataArray();
-        int hostVersion = weights.Version;
-        lock (_persistentBufferLock)
-        {
-            bool cached = _persistentBufferCache.TryGetValue(data, out var entry);
-            if (cached
-                && _persistentWeightHostVersion.TryGetValue(data, out int stampedVersion)
-                && stampedVersion == hostVersion)
-            {
-                return new OwnedBuffer(entry!.Buffer, ownsBuffer: false);
-            }
-
-            // Not cached, or the host tensor was mutated in place since the buffer was uploaded: (re)upload
-            // the current host data and (re)stamp its version. Dispose the superseded buffer first.
-            if (cached)
-                entry!.Buffer.Dispose();
-
-            float[] floatData = DirectGpuEngine.ToFloatArray(data);
-            IGpuBuffer gpuBuffer = backend.AllocateBuffer(floatData);
-            backend.Synchronize();
-
-            var newEntry = new GpuBufferCacheEntry(gpuBuffer, role);
-            _persistentBufferCache[data] = newEntry;
-            _persistentWeightHostVersion[data] = hostVersion;
-            return new OwnedBuffer(gpuBuffer, ownsBuffer: false);
-        }
-    }
+        // Thin wrapper: the version gate itself lives in the shared persistent-cache lookup below, so EVERY
+        // persistent-weight read path that passes the host Tensor.Version gets the same in-place-load
+        // protection — not just this one (CodeRabbit #821). We hold the Version at read time.
+        => GetOrCacheWeightBuffer(backend, weights.GetDataArray(), role, weights.Version);
 
     /// <summary>
     /// Gets a GPU buffer for weight/bias tensor, auto-caching if not already persistent.
     /// Unlike GetOrAllocateBuffer, this caches the buffer in the persistent cache
     /// so subsequent calls reuse the same GPU buffer without re-uploading.
     /// Thread-safe: uses lock to coordinate with cache invalidation.
+    /// <para>
+    /// SHARED version gate: when <paramref name="hostVersion"/> is not <see cref="NoHostVersionGate"/>, a
+    /// cached buffer is served only if it was uploaded at that same host <see cref="Tensor{T}.Version"/>. An
+    /// in-place weight load (indexer / SetFlat / CopyFromArray) bumps Version WITHOUT changing the backing
+    /// array (the cache key), so a version-blind hit would keep serving the stale construction-time buffer
+    /// (a real GGUF-decoder-under-GPU garbage bug). Callers reading persistent WEIGHTS pass the tensor's
+    /// Version; version-blind callers (activations/inputs, which are not in-place-loaded) pass the sentinel.
+    /// </para>
     /// </summary>
-    private OwnedBuffer GetOrCacheWeightBuffer<T>(IDirectGpuBackend backend, T[] data, PersistentTensorRole role)
+    private OwnedBuffer GetOrCacheWeightBuffer<T>(IDirectGpuBackend backend, T[] data, PersistentTensorRole role, int hostVersion = NoHostVersionGate)
     {
         lock (_persistentBufferLock)
         {
-            // First check persistent tensor cache
-            var cached = TryGetCachedBuffer(data);
-            if (cached != null)
-                return new OwnedBuffer(cached, ownsBuffer: false);
+            // Persistent-cache lookup WITH the shared version gate.
+            if (_persistentBufferCache.TryGetValue(data, out var existing))
+            {
+                bool valid = hostVersion == NoHostVersionGate
+                    || (_persistentWeightHostVersion.TryGetValue(data, out int stamped) && stamped == hostVersion);
+                if (valid)
+                    return new OwnedBuffer(existing.Buffer, ownsBuffer: false);
 
-            // Not cached - upload and cache for future use
+                // Stale: the host tensor was mutated in place since upload. Dispose the superseded buffer and
+                // re-upload the current data below (re-stamping its Version).
+                existing.Buffer.Dispose();
+                _persistentBufferCache.TryRemove(data, out _);
+            }
+
+            // Not cached (or just invalidated) - upload and cache for future use.
             float[] floatData = DirectGpuEngine.ToFloatArray(data);
             IGpuBuffer gpuBuffer = backend.AllocateBuffer(floatData);
+            if (hostVersion != NoHostVersionGate)
+                backend.Synchronize();
 
-            // Add to persistent cache so future calls don't re-upload
+            // Insert via TryAdd, not a direct set: RegisterPersistentTensor adds lock-free (it does not take
+            // _persistentBufferLock), so a concurrent register could have populated this key while we uploaded.
+            // If so, dispose our buffer and alias the existing one rather than overwrite-and-leak it.
             var entry = new GpuBufferCacheEntry(gpuBuffer, role);
-            if (_persistentBufferCache.TryAdd(data, entry))
+            if (!_persistentBufferCache.TryAdd(data, entry))
             {
-                _tensorVersions.TryAdd(data, 0);
-                // Return with ownsBuffer=false since cache now owns it
-                return new OwnedBuffer(gpuBuffer, ownsBuffer: false);
-            }
-            else
-            {
-                // Another thread may have cached it; try to use that one
-                var alreadyCached = TryGetCachedBuffer(data);
-                if (alreadyCached != null)
+                // Concurrent register won the slot: alias its buffer and drop ours.
+                if (_persistentBufferCache.TryGetValue(data, out var raced))
                 {
                     gpuBuffer.Dispose();
-                    return new OwnedBuffer(alreadyCached, ownsBuffer: false);
+                    return new OwnedBuffer(raced.Buffer, ownsBuffer: false);
                 }
-
-                // Entry was removed between TryAdd and lookup; fall back to our buffer
+                // Removed again between TryAdd and lookup: keep our buffer, caller owns it.
                 return new OwnedBuffer(gpuBuffer, ownsBuffer: true);
             }
+            _tensorVersions.TryAdd(data, 0);
+            if (hostVersion != NoHostVersionGate)
+                _persistentWeightHostVersion[data] = hostVersion;
+            return new OwnedBuffer(gpuBuffer, ownsBuffer: false);
         }
     }
 
@@ -3164,7 +3161,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var cArr = src.DataVector.GetBackingArrayUnsafe();
             if (cArr is not null && src.IsContiguous && !Helpers.DeferredArrayMaterializer.IsPending(cArr))
             {
-                try { srcBuf = GetOrCacheWeightBuffer(backend, src.GetDataArray(), PersistentTensorRole.Weights).Buffer; }
+                try { srcBuf = GetOrCacheWeightBuffer(backend, src.GetDataArray(), PersistentTensorRole.Weights, src.Version).Buffer; }
                 catch { srcBuf = null; }
             }
         }
@@ -6711,7 +6708,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 $"GetOrCacheWeightsGpu only supports Weight, Bias, Statistics, AttentionCache, or Constant roles. " +
                 $"Got: {role}. Use UploadToGpu for other tensor types.", nameof(role))
         };
-        var ownedBuffer = GetOrCacheWeightBuffer(backend, tensor.GetDataArray(), persistentRole);
+        // Persistent-weight read: pass the host Version so an in-place weight load re-uploads (shared gate).
+        var ownedBuffer = GetOrCacheWeightBuffer(backend, tensor.GetDataArray(), persistentRole, tensor.Version);
 
         // Propagate ownership: if cache owns buffer, GpuTensor shouldn't dispose;
         // if we own buffer (race condition fallback), GpuTensor should take ownership
