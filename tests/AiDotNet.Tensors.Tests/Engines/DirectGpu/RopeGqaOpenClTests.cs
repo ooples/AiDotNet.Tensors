@@ -162,6 +162,39 @@ public sealed class RopeGqaOpenClTests : IDisposable
                 $"CPU RoPE mismatch at {i}: expected {expected[i]}, got {actual[i]}");
     }
 
+    /// <summary>
+    /// RoPE's backward (ApplyRoPEInterleavedBackward) recovers the input gradient by re-applying the
+    /// interleaved rotation with the sine negated — i.e. R(-θ)·R(θ) = I. This verifies that exact operation:
+    /// rotating forward then rotating by the negated angle returns the original tensor. If this holds, the
+    /// recorded backward (which computes gradInput = ApplyRoPEInterleaved(gradOut, cos, -sin)) is correct.
+    /// </summary>
+    [Fact]
+    public void ApplyRoPEInterleaved_InverseRotation_RecoversInput()
+    {
+        const int heads = 3, seqLen = 6, headDim = 8, maxSeq = 32, startPosition = 5;
+        int rows = heads * seqLen;
+        var rng = new Random(29);
+        var input = new float[rows * headDim];
+        for (int i = 0; i < input.Length; i++) input[i] = (float)(rng.NextDouble() * 2 - 1);
+        var (cos, sin) = BuildRopeCache(maxSeq, headDim, 10000f);
+        var negSin = new float[sin.Length];
+        for (int i = 0; i < sin.Length; i++) negSin[i] = -sin[i];
+
+        var engine = (AiDotNet.Tensors.Engines.IEngine)new AiDotNet.Tensors.Engines.CpuEngine();
+        var inT = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(input, new[] { heads, seqLen, headDim });
+        var cosT = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(cos, new[] { maxSeq, headDim / 2 });
+        var sinT = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(sin, new[] { maxSeq, headDim / 2 });
+        var negSinT = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(negSin, new[] { maxSeq, headDim / 2 });
+
+        var rotated = engine.ApplyRoPEInterleaved(inT, cosT, sinT, startPosition);
+        var recovered = engine.ApplyRoPEInterleaved(rotated, cosT, negSinT, startPosition).AsSpan().ToArray();
+
+        Assert.Equal(input.Length, recovered.Length);
+        for (int i = 0; i < input.Length; i++)
+            Assert.True(Math.Abs(input[i] - recovered[i]) < 1e-5f,
+                $"Inverse RoPE did not recover input at {i}: expected {input[i]}, got {recovered[i]}");
+    }
+
     // ---- Grouped-Query Attention --------------------------------------------
 
     private static float[] GqaReference(float[] q, float[] k, float[] v,

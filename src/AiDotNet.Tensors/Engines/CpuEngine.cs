@@ -26064,7 +26064,15 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var outShape = new int[rank];
         for (int i = 0; i < rank; i++) outShape[i] = input._shape[i];
-        return new Tensor<T>(outArr, outShape);
+        var result = new Tensor<T>(outArr, outShape);
+
+        // RoPE is an orthogonal rotation, so it is differentiable: record on the tape (when active) with an
+        // inverse-rotation backward so the op is safe under any caller, not just the inference fast-path.
+        DifferentiableOps.RecordIfActive("ApplyRoPEInterleaved", result, new[] { input },
+            BackwardFunctions<T>.ApplyRoPEInterleavedBackward,
+            new object[] { cos, sin, startPosition });
+
+        return result;
     }
 
     public virtual Tensor<T> RMSNorm<T>(Tensor<T> input, Tensor<T> gamma, double epsilon, out Tensor<T> rms)
