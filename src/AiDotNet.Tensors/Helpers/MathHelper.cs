@@ -20,9 +20,6 @@ namespace AiDotNet.Tensors.Helpers;
 /// </remarks>
 public static class MathHelper
 {
-    // Cache for numeric operations instances - avoids creating new objects on every call
-    private static readonly ConcurrentDictionary<Type, object> _operationsCache = new();
-
     // Cache for acceleration support flags - avoids repeated type checks
     private static readonly ConcurrentDictionary<Type, (bool Cpu, bool Gpu)> _accelerationCache = new();
 
@@ -47,7 +44,25 @@ public static class MathHelper
     /// </remarks>
     public static INumericOperations<T> GetNumericOperations<T>()
     {
-        return (INumericOperations<T>)_operationsCache.GetOrAdd(typeof(T), _ => CreateNumericOperations<T>());
+        // Hot path: a JIT-specialized static-generic field read (no dictionary hash/lookup).
+        // This method is called on essentially every tensor element operation, so the
+        // per-call cost of a ConcurrentDictionary.GetOrAdd(typeof(T), ...) is a measurable
+        // tax on inference throughput. NumericOperationsCache<T>.Instance resolves the
+        // instance exactly once per closed generic type T and is thereafter a single
+        // static field load.
+        return NumericOperationsCache<T>.Instance;
+    }
+
+    /// <summary>
+    /// Per-type static cache of the numeric operations instance. The runtime creates one
+    /// closed <c>NumericOperationsCache&lt;T&gt;</c> per distinct T and initializes
+    /// <see cref="Instance"/> exactly once, so <see cref="GetNumericOperations{T}"/> becomes
+    /// a branch-free static field read on the hot path.
+    /// </summary>
+    private static class NumericOperationsCache<T>
+    {
+        public static readonly INumericOperations<T> Instance =
+            (INumericOperations<T>)CreateNumericOperations<T>();
     }
 
     /// <summary>

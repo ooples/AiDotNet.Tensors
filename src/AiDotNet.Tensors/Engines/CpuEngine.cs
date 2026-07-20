@@ -25986,28 +25986,79 @@ public partial class CpuEngine : ITensorLevelEngine
         var src = input.IsContiguous ? input : input.Contiguous();
         int total = src.Length;
         int rows = total / headDim;
-
-        var inSpan = src.AsSpan();
-        var cosSpan = cos.AsSpan();
-        var sinSpan = sin.AsSpan();
         var outArr = new T[total];
-        var numOps = MathHelper.GetNumericOperations<T>();
 
         // Matches the fused rope_interleaved kernel exactly (GPT-J / GGML interleaving): row r sits at sequence
         // position startPosition + (r % seqLen); pair (2i, 2i+1) rotates by the angle cached at [pos, i].
-        for (int row = 0; row < rows; row++)
+        // Primitive fast paths cast to float/double and rotate with direct arithmetic (no INumericOperations<T>
+        // virtual dispatch), parallelized over rows — this is called per-token per-layer per-step on every
+        // LLaMA-style decoder, so the generic path was a measurable inference tax.
+        if (typeof(T) == typeof(float))
         {
-            int pos = startPosition + (row % seqLen);
-            int baseIdx = row * headDim;
-            int cacheBase = pos * halfDim;
-            for (int i = 0; i < halfDim; i++)
+            var fIn = (float[])(object)src.GetDataArray();
+            var fCos = (float[])(object)cos.GetDataArray();
+            var fSin = (float[])(object)sin.GetDataArray();
+            var fOut = (float[])(object)outArr;
+            int hd = headDim, half = halfDim, sl = seqLen, sp = startPosition;
+            CpuParallelSettings.ParallelForOrSerial(0, rows, total, row =>
             {
-                T c = cosSpan[cacheBase + i];
-                T sn = sinSpan[cacheBase + i];
-                T xEven = inSpan[baseIdx + 2 * i];
-                T xOdd = inSpan[baseIdx + 2 * i + 1];
-                outArr[baseIdx + 2 * i] = numOps.Subtract(numOps.Multiply(xEven, c), numOps.Multiply(xOdd, sn));
-                outArr[baseIdx + 2 * i + 1] = numOps.Add(numOps.Multiply(xEven, sn), numOps.Multiply(xOdd, c));
+                int pos = sp + (row % sl);
+                int baseIdx = row * hd;
+                int cacheBase = pos * half;
+                for (int i = 0; i < half; i++)
+                {
+                    float c = fCos[cacheBase + i];
+                    float sn = fSin[cacheBase + i];
+                    float xEven = fIn[baseIdx + 2 * i];
+                    float xOdd = fIn[baseIdx + 2 * i + 1];
+                    fOut[baseIdx + 2 * i] = xEven * c - xOdd * sn;
+                    fOut[baseIdx + 2 * i + 1] = xEven * sn + xOdd * c;
+                }
+            });
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var dIn = (double[])(object)src.GetDataArray();
+            var dCos = (double[])(object)cos.GetDataArray();
+            var dSin = (double[])(object)sin.GetDataArray();
+            var dOut = (double[])(object)outArr;
+            int hd = headDim, half = halfDim, sl = seqLen, sp = startPosition;
+            CpuParallelSettings.ParallelForOrSerial(0, rows, total, row =>
+            {
+                int pos = sp + (row % sl);
+                int baseIdx = row * hd;
+                int cacheBase = pos * half;
+                for (int i = 0; i < half; i++)
+                {
+                    double c = dCos[cacheBase + i];
+                    double sn = dSin[cacheBase + i];
+                    double xEven = dIn[baseIdx + 2 * i];
+                    double xOdd = dIn[baseIdx + 2 * i + 1];
+                    dOut[baseIdx + 2 * i] = xEven * c - xOdd * sn;
+                    dOut[baseIdx + 2 * i + 1] = xEven * sn + xOdd * c;
+                }
+            });
+        }
+        else
+        {
+            var inSpan = src.AsSpan();
+            var cosSpan = cos.AsSpan();
+            var sinSpan = sin.AsSpan();
+            var numOps = MathHelper.GetNumericOperations<T>();
+            for (int row = 0; row < rows; row++)
+            {
+                int pos = startPosition + (row % seqLen);
+                int baseIdx = row * headDim;
+                int cacheBase = pos * halfDim;
+                for (int i = 0; i < halfDim; i++)
+                {
+                    T c = cosSpan[cacheBase + i];
+                    T sn = sinSpan[cacheBase + i];
+                    T xEven = inSpan[baseIdx + 2 * i];
+                    T xOdd = inSpan[baseIdx + 2 * i + 1];
+                    outArr[baseIdx + 2 * i] = numOps.Subtract(numOps.Multiply(xEven, c), numOps.Multiply(xOdd, sn));
+                    outArr[baseIdx + 2 * i + 1] = numOps.Add(numOps.Multiply(xEven, sn), numOps.Multiply(xOdd, c));
+                }
             }
         }
 
