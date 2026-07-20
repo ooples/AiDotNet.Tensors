@@ -6834,7 +6834,18 @@ public partial class DirectGpuTensorEngine
     // 6D maxIndices[b,c,od,oh,ow,{id,ih,iw}] the CpuEngine/MaxPool3DBackward contract expects. No padding.
     Tensor<T> IEngine.MaxPool3DWithIndices<T>(Tensor<T> input, int[] poolSize, int[] stride, out int[,,,,,] maxIndices)
     {
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        // No tape bail: the node is recorded below so the GPU kernel survives training. Matches
+        // CpuEngine.MaxPool3DWithIndices — same (input, poolSize, stride, out maxIndices) overload,
+        // RecordUnary over input, MaxPool3DBackward, saved { maxIndices, poolSize, stride }.
+        //
+        // WHY THIS IS SAFE WHERE Scatter WAS NOT: Scatter's gradient mask came from EXTERNALLY supplied
+        // indices and the reused CPU recording failed to reproduce it against the GPU result. Here
+        // maxIndices is produced by THIS forward (decoded from the kernel's own idxBuf below), so the
+        // recorded backward routes gradient to exactly the positions this forward selected — it cannot
+        // disagree with itself. Residual risks are the index decode (spatial / hw) and CPU-vs-GPU tie
+        // breaking on equal pooled values; the gradient test uses continuous random input so ties do not
+        // occur, and a decode error would show as a gross mismatch.
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || input.Rank != 5 || poolSize is not { Length: 3 } || stride is not { Length: 3 } || !TryGetBackend(out var backend))
             return base.MaxPool3DWithIndices(input, poolSize, stride, out maxIndices);
         try
@@ -6874,6 +6885,8 @@ public partial class DirectGpuTensorEngine
                 var result = DeferTensorResult<T>(backend, outBuf.Buffer, outLen,
                     new[] { batch, channels, outD, outH, outW });
                 outBuf.RelinquishOwnership();
+                DifferentiableOps.RecordUnary("MaxPool3DWithIndices", result, input,
+                    BackwardFunctions<T>.MaxPool3DBackward, new object[] { maxIndices, poolSize, stride });
                 return result;
             }
             finally { idxBuf.Dispose(); }

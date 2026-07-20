@@ -247,6 +247,25 @@ public class GpuTapeGradientParityTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// MaxPool3DWithIndices: gradient routes only to the pooled maxima, so this verifies the index decode
+    /// as much as the recording.
+    /// </summary>
+    /// <remarks>
+    /// TIE-FREE INPUT IS REQUIRED. Continuous random values make exact ties measure-zero. With ties, CPU
+    /// and GPU could select different argmax positions — the forward output would be IDENTICAL (same max
+    /// value) while gradients landed on different elements, which reads as a defect but is really a
+    /// test-design flaw.
+    ///
+    /// Residency probe: the backward scatters gradOutput to the selected positions with no arithmetic on
+    /// forward values, so CPU and GPU agree bit-for-bit when the indices agree.
+    /// </remarks>
+    [Fact]
+    public void MaxPool3DWithIndices_gradients_match_cpu() =>
+        AssertGradientParity("MaxPool3D", Rand([2, 2, 4, 4, 4], seed: 61, lo: -5.0, hi: 5.0),
+            static (e, t) => e.MaxPool3DWithIndices(t, new[] { 2, 2, 2 }, new[] { 2, 2, 2 }, out _),
+            probe: Engagement.UseResidencyCounter);
+
     // Scatter has NO test here: its bail was RESTORED because this very test caught a real defect —
     // recording CpuEngine's ScatterBackward on the GPU result gave d(values) exactly right but d(input)
     // wrong by 3.14e-01. Scatter overwrites input at the scattered positions, so d/d(input) must be zero
