@@ -54,10 +54,6 @@ public static class TapeGradientParityHarness
     public static readonly IReadOnlyDictionary<string, string> TapeGradientBaseline =
         new Dictionary<string, string>(StringComparer.Ordinal)
         {
-            ["Scatter"] = "GPU forward bails on an active tape because recording CpuEngine's ScatterBackward "
-                        + "gave d(values) exact but d(input) wrong by 3.14e-01 — Scatter overwrites input at "
-                        + "the scattered positions and the reused saved state does not reproduce that mask. "
-                        + "Needs a GPU-side ScatterBackward.",
             ["Sparsemax"] = "GPU forward bails: the path throws InvalidOperationException because "
                         + "CudaBackend.Where looks up a \"where_select\" kernel that has no source and no "
                         + "registration on any backend.",

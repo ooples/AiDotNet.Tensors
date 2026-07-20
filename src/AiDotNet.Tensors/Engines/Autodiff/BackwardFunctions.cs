@@ -4359,8 +4359,18 @@ internal static class BackwardFunctions<T>
             : (int[])savedState[0];
         var axis = (int)savedState[1];
 
-        // dL/dinput = gradOutput with scattered positions zeroed
-        var gradInput = gradOutput.Clone();
+        // dL/dinput = gradOutput with scattered positions zeroed.
+        //
+        // FRESH allocation, NOT gradOutput.Clone(): Clone() shares gradOutput's TensorStorage
+        // copy-on-write, and the privatised buffer is pool-backed, so it is recycled when the backward
+        // scope ends while the grads dictionary still references it — the stored gradient silently
+        // becomes zeros. Same defect fixed in MaskedScatter/IndexFill/IndexCopy.
+        var gradInput = new Tensor<T>(gradOutput._shape);
+        {
+            var scSrc = gradOutput.AsSpan();
+            var scDst = gradInput.AsWritableSpan();
+            for (int i = 0; i < scSrc.Length; i++) scDst[i] = scSrc[i];
+        }
         var gradInputData = gradInput.GetDataArray();
         var inputShape = inputs[0]._shape;
         int axisSize = inputShape[axis];
@@ -4516,9 +4526,16 @@ internal static class BackwardFunctions<T>
     {
         // Each input gets its own copy of gradOutput to prevent AccumulateGrad
         // from mutating a shared tensor via TensorAddInPlace
+        // Every input gets its OWN fresh copy — including the first. Handing gradOutput itself to
+        // input[0] aliases the upstream gradient into the grads dictionary, and Clone() for the rest
+        // shares its storage copy-on-write over a pool-backed buffer that is recycled once the backward
+        // scope ends. Both leave a gradient that can be mutated or zeroed after the fact.
         for (int i = 0; i < inputs.Length; i++)
         {
-            var grad = i == 0 ? gradOutput : gradOutput.Clone();
+            var grad = new Tensor<T>(gradOutput._shape);
+            var amSrc = gradOutput.AsSpan();
+            var amDst = grad.AsWritableSpan();
+            for (int k = 0; k < amSrc.Length; k++) amDst[k] = amSrc[k];
             DifferentiableOps.AccumulateGrad(grads, inputs[i], grad, engine);
         }
     }
@@ -5859,7 +5876,20 @@ internal static class BackwardFunctions<T>
         var ops = MathHelper.GetNumericOperations<T>();
 
         // dL/d(input): clone gradOutput, zero the overwritten positions.
-        var grad = (Tensor<T>)gradOutput.Clone();
+            // FRESH allocation, NOT gradOutput.Clone(). Clone() shares gradOutput's TensorStorage
+            // copy-on-write; the write below privatises it, but the privatised buffer is pool-backed and
+            // gets recycled once the backward scope ends — while the grads dictionary still holds a
+            // REFERENCE to it. The gradient was measured correct at every step (correct entering
+            // AccumulateGrad, correctly stored on the existing==null branch) and then read back as all
+            // zeros, because the buffer had been reclaimed underneath it. Building a fresh tensor and
+            // copying is what the sibling source-gradient path in MaskedScatterBackward already did, which
+            // is exactly why that one always survived while this one did not.
+        var grad = new Tensor<T>(gradOutput._shape);
+        {
+            var srcSpan0 = gradOutput.AsSpan();
+            var dstSpan0 = grad.AsWritableSpan();
+            for (int i = 0; i < srcSpan0.Length; i++) dstSpan0[i] = srcSpan0[i];
+        }
         var dst = grad.AsWritableSpan();
         int rank = input.Rank;
         if (axis < 0) axis += rank;
@@ -5912,7 +5942,20 @@ internal static class BackwardFunctions<T>
         var indices = (Tensor<int>)savedState[1];
         var input = inputs[0];
         var ops = MathHelper.GetNumericOperations<T>();
-        var grad = (Tensor<T>)gradOutput.Clone();
+            // FRESH allocation, NOT gradOutput.Clone(). Clone() shares gradOutput's TensorStorage
+            // copy-on-write; the write below privatises it, but the privatised buffer is pool-backed and
+            // gets recycled once the backward scope ends — while the grads dictionary still holds a
+            // REFERENCE to it. The gradient was measured correct at every step (correct entering
+            // AccumulateGrad, correctly stored on the existing==null branch) and then read back as all
+            // zeros, because the buffer had been reclaimed underneath it. Building a fresh tensor and
+            // copying is what the sibling source-gradient path in MaskedScatterBackward already did, which
+            // is exactly why that one always survived while this one did not.
+        var grad = new Tensor<T>(gradOutput._shape);
+        {
+            var srcSpan0 = gradOutput.AsSpan();
+            var dstSpan0 = grad.AsWritableSpan();
+            for (int i = 0; i < srcSpan0.Length; i++) dstSpan0[i] = srcSpan0[i];
+        }
         var dst = grad.AsWritableSpan();
         int rank = input.Rank;
         if (axis < 0) axis += rank;
@@ -5985,8 +6028,21 @@ internal static class BackwardFunctions<T>
         var mask = (Tensor<Bit>)savedState[0];
         var ops = MathHelper.GetNumericOperations<T>();
 
-        // dL/d(input): clone gradOutput, zero masked positions.
-        var inputGrad = (Tensor<T>)gradOutput.Clone();
+        // dL/d(input): copy gradOutput into a fresh tensor, then zero masked positions.
+            // FRESH allocation, NOT gradOutput.Clone(). Clone() shares gradOutput's TensorStorage
+            // copy-on-write; the write below privatises it, but the privatised buffer is pool-backed and
+            // gets recycled once the backward scope ends — while the grads dictionary still holds a
+            // REFERENCE to it. The gradient was measured correct at every step (correct entering
+            // AccumulateGrad, correctly stored on the existing==null branch) and then read back as all
+            // zeros, because the buffer had been reclaimed underneath it. Building a fresh tensor and
+            // copying is what the sibling source-gradient path in MaskedScatterBackward already did, which
+            // is exactly why that one always survived while this one did not.
+            var inputGrad = new Tensor<T>(gradOutput._shape);
+        {
+            var srcSpan = gradOutput.AsSpan();
+            var dstSpan = inputGrad.AsWritableSpan();
+            for (int i = 0; i < srcSpan.Length; i++) dstSpan[i] = srcSpan[i];
+        }
         var inputDst = inputGrad.AsWritableSpan();
         var maskSpan = mask.AsSpan();
         var go = gradOutput.AsSpan();
