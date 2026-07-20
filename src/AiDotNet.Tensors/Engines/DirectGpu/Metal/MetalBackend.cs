@@ -1979,6 +1979,10 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     }
 
     public void SplitComplexMultiply(IGpuBuffer aR, IGpuBuffer aI, IGpuBuffer bR, IGpuBuffer bI, IGpuBuffer oR, IGpuBuffer oI, int n) { if (n > 0) DispatchComplexMetal("split_complex_multiply", [AsMetal(aR), AsMetal(aI), AsMetal(bR), AsMetal(bI), AsMetal(oR), AsMetal(oI)], n); }
+    public void InterleaveComplex(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer interleaved, int n) { if (n > 0) DispatchComplexMetal("interleave_complex", [AsMetal(real), AsMetal(imag), AsMetal(interleaved)], n); }
+
+    public void DeinterleaveComplex(IGpuBuffer interleaved, IGpuBuffer real, IGpuBuffer imag, int n) { if (n > 0) DispatchComplexMetal("deinterleave_complex", [AsMetal(interleaved), AsMetal(real), AsMetal(imag)], n); }
+
     public void SplitComplexConjugate(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer oR, IGpuBuffer oI, int n) { if (n > 0) DispatchComplexMetal("split_complex_conjugate", [AsMetal(iR), AsMetal(iI), AsMetal(oR), AsMetal(oI)], n); }
     public void SplitComplexMagnitude(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer o, int n) { if (n > 0) DispatchComplexMetal("split_complex_magnitude", [AsMetal(iR), AsMetal(iI), AsMetal(o)], n); }
     public void SplitComplexMagnitudeSquared(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer o, int n) { if (n > 0) DispatchComplexMetal("split_complex_magnitude_squared", [AsMetal(iR), AsMetal(iI), AsMetal(o)], n); }

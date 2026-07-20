@@ -12303,6 +12303,12 @@ KERNEL VARIANTS (A/B testing):
     public void SplitComplexMultiply(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag, IGpuBuffer outReal, IGpuBuffer outImag, int n)
         => DispatchSplitComplex("split_complex_multiply", [aReal, aImag, bReal, bImag, outReal, outImag], n);
 
+    public void InterleaveComplex(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer interleaved, int n)
+        => DispatchSplitComplex("interleave_complex", [real, imag, interleaved], n);
+
+    public void DeinterleaveComplex(IGpuBuffer interleaved, IGpuBuffer real, IGpuBuffer imag, int n)
+        => DispatchSplitComplex("deinterleave_complex", [interleaved, real, imag], n);
+
     public void SplitComplexConjugate(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n)
         => DispatchSplitComplex("split_complex_conjugate", [inReal, inImag, outReal, outImag], n);
 

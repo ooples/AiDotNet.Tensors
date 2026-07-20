@@ -1000,7 +1000,11 @@ public partial class DirectGpuTensorEngine
     Tensor<T> IEngine.RFFT<T>(Tensor<T> input)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
-        if (Compilation.GraphMode.IsActive || IsTapeActive<T>() || typeof(T) != typeof(float)
+        // NOTE: deliberately does NOT bail on IsTapeActive. The tape node is recorded below instead, the
+        // same way Spectrogram/TensorTake do it, so the GPU path stays usable while training. Bailing here
+        // meant every training step fell back to the managed CPU transform — the GPU FFT kernels on all
+        // seven backends were dead code in exactly the scenario they matter most for.
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || input.Rank == 0 || !TryGetBackend(out var backend))
             return base.RFFT(input);
 
@@ -1013,34 +1017,60 @@ public partial class DirectGpuTensorEngine
         outputShape[^1] = numFreqs * 2;
         using var inputBuffer = GetOrAllocateBuffer(backend, input);
 
-        return DispatchDeferredGpuOp<T>(backend, batchSize * numFreqs * 2, outputShape, output =>
+        // Batched throughout: a fixed number of kernel launches regardless of batchSize.
+        //
+        // The previous shape of this was one backend.RFFT PER SIGNAL, then TWO backend.Copy calls PER
+        // FREQUENCY BIN to weave the split real/imag results into the interleaved layout IEngine.RFFT
+        // returns. At numFreqs=129 and batchSize=4096 that is 4096 transform launches plus ~1.06 MILLION
+        // single-element device-to-device copies for ONE call — the copies, not the transforms, dominated.
+        //
+        // BatchedFFT was already on IDirectGpuBackend and simply unused here. The interleave had no
+        // primitive at all (every SplitComplex* op works on separate real/imag buffers, which is the
+        // GPU-native layout), so InterleaveComplex was added to all backends to close that gap.
+        var gpuResult = DispatchDeferredGpuOp<T>(backend, batchSize * numFreqs * 2, outputShape, output =>
         {
-            using var padded = backend.AllocateBuffer(nFft);
-            using var real = backend.AllocateBuffer(numFreqs);
-            using var imag = backend.AllocateBuffer(numFreqs);
-            for (int batch = 0; batch < batchSize; batch++)
-            {
-                backend.Fill(padded, 0f, nFft);
-                backend.Copy(inputBuffer.Buffer, batch * signalLength, padded, 0, signalLength);
-                backend.RFFT(padded, real, imag, nFft);
-                int outputBase = batch * numFreqs * 2;
-                for (int k = 0; k < numFreqs; k++)
-                {
-                    backend.Copy(real, k, output, outputBase + k * 2, 1);
-                    backend.Copy(imag, k, output, outputBase + k * 2 + 1, 1);
-                }
-            }
-            // The split real/imag buffers are transient; complete their final D2D copies
-            // before returning them to backend pools. The result itself remains resident.
+            using var padReal = backend.AllocateBuffer(batchSize * nFft);
+            using var padImag = backend.AllocateBuffer(batchSize * nFft);
+            using var specReal = backend.AllocateBuffer(batchSize * nFft);
+            using var specImag = backend.AllocateBuffer(batchSize * nFft);
+            using var packReal = backend.AllocateBuffer(batchSize * numFreqs);
+            using var packImag = backend.AllocateBuffer(batchSize * numFreqs);
+
+            // Zero-pad every signal from signalLength up to nFft in one strided copy.
+            backend.Fill(padReal, 0f, batchSize * nFft);
+            backend.Fill(padImag, 0f, batchSize * nFft);
+            backend.CopyRows(inputBuffer.Buffer, padReal, signalLength, nFft, batchSize, signalLength);
+
+            backend.BatchedFFT(padReal, padImag, specReal, specImag, batchSize, nFft, inverse: false);
+
+            // Keep only the positive frequencies (0..Nyquist) of each row, then weave to interleaved.
+            backend.CopyRows(specReal, packReal, nFft, numFreqs, batchSize, numFreqs);
+            backend.CopyRows(specImag, packImag, nFft, numFreqs, batchSize, numFreqs);
+            backend.InterleaveComplex(packReal, packImag, output, batchSize * numFreqs);
+
+            // Transient scratch returns to backend pools on dispose; the result stays resident.
             backend.Synchronize();
         });
+
+        // Same backward contract as CpuEngine.RFFT (grad flows back through IRFFT). RecordUnary is a no-op
+        // when no tape is active, so this costs nothing outside training while making the GPU path usable
+        // inside it. The grad-side IRFFT dispatches to the GPU override too.
+        Autodiff.DifferentiableOps.RecordUnary("RFFT", gpuResult, input,
+            static (gradOutput, inputs, output, savedState, engine, grads) =>
+            {
+                var signalLengthSaved = (int)savedState[0];
+                var grad = engine.IRFFT(gradOutput, signalLengthSaved);
+                Autodiff.DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+            }, new object[] { signalLength });
+        return gpuResult;
     }
 
     Tensor<T> IEngine.IRFFT<T>(Tensor<T> input, int outputLength)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (outputLength <= 0) throw new ArgumentException("outputLength must be positive", nameof(outputLength));
-        if (Compilation.GraphMode.IsActive || IsTapeActive<T>() || typeof(T) != typeof(float)
+        // As with RFFT: record the tape node rather than bailing, so training keeps the GPU path.
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || input.Rank == 0 || !TryGetBackend(out var backend))
             return base.IRFFT(input, outputLength);
 
@@ -1054,24 +1084,40 @@ public partial class DirectGpuTensorEngine
         outputShape[^1] = outputLength;
         using var inputBuffer = GetOrAllocateBuffer(backend, input);
 
-        return DispatchDeferredGpuOp<T>(backend, batchSize * outputLength, outputShape, output =>
+        var gpuResult = DispatchDeferredGpuOp<T>(backend, batchSize * outputLength, outputShape, output =>
         {
+            // The de-interleave is now ONE kernel over the whole batch instead of two single-element
+            // device copies per frequency bin per signal (~1.06M copies at numFreqs=129, batchSize=4096).
+            using var allReal = backend.AllocateBuffer(batchSize * numFreqs);
+            using var allImag = backend.AllocateBuffer(batchSize * numFreqs);
+            backend.DeinterleaveComplex(inputBuffer.Buffer, allReal, allImag, batchSize * numFreqs);
+
+            // The transform itself stays per-signal: IDirectGpuBackend exposes BatchedFFT (full complex)
+            // but no batched IRFFT, and backend.IRFFT reconstructs the conjugate-symmetric half-spectrum
+            // internally — a symmetry expansion that CopyRows cannot express (it needs reversed indexing).
+            // Each iteration is now 4 bulk calls rather than 2*numFreqs+2, so the per-bin copies are gone.
             using var real = backend.AllocateBuffer(numFreqs);
             using var imag = backend.AllocateBuffer(numFreqs);
             using var signal = backend.AllocateBuffer(nFft);
             for (int batch = 0; batch < batchSize; batch++)
             {
-                int inputBase = batch * interleavedLength;
-                for (int k = 0; k < numFreqs; k++)
-                {
-                    backend.Copy(inputBuffer.Buffer, inputBase + k * 2, real, k, 1);
-                    backend.Copy(inputBuffer.Buffer, inputBase + k * 2 + 1, imag, k, 1);
-                }
+                int rowBase = batch * numFreqs;
+                backend.Copy(allReal, rowBase, real, 0, numFreqs);
+                backend.Copy(allImag, rowBase, imag, 0, numFreqs);
                 backend.IRFFT(real, imag, signal, nFft);
                 backend.Copy(signal, 0, output, batch * outputLength, outputLength);
             }
             backend.Synchronize();
         });
+
+        // Mirrors CpuEngine.IRFFT: the backward of IRFFT is RFFT.
+        Autodiff.DifferentiableOps.RecordUnary("IRFFT", gpuResult, input,
+            static (gradOutput, inputs, output, savedState, engine, grads) =>
+            {
+                var grad = engine.RFFT(gradOutput);
+                Autodiff.DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+            }, System.Array.Empty<object>());
+        return gpuResult;
     }
 
     /// <inheritdoc/>

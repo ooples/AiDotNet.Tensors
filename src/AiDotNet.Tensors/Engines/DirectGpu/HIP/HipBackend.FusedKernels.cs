@@ -244,6 +244,30 @@ public sealed partial class HipBackend
         LaunchKernel(kernel, grid, (uint)DefaultBlockSize, args);
     }
 
+    public unsafe void InterleaveComplex(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer interleaved, int n)
+    {
+        if (n <= 0) return;
+        ValidateHipSplitBuffers(n, nameof(InterleaveComplex), real, imag);
+        if (!_kernelCache.TryGetValue("interleave_complex", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: interleave_complex");
+        uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pR = real.Handle, pI = imag.Handle, pO = interleaved.Handle;
+        void** args = stackalloc void*[4]; args[0] = &pR; args[1] = &pI; args[2] = &pO; args[3] = &n;
+        LaunchKernel(kernel, grid, (uint)DefaultBlockSize, args);
+    }
+
+    public unsafe void DeinterleaveComplex(IGpuBuffer interleaved, IGpuBuffer real, IGpuBuffer imag, int n)
+    {
+        if (n <= 0) return;
+        ValidateHipSplitBuffers(n, nameof(DeinterleaveComplex), real, imag);
+        if (!_kernelCache.TryGetValue("deinterleave_complex", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: deinterleave_complex");
+        uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pIn = interleaved.Handle, pR = real.Handle, pI = imag.Handle;
+        void** args = stackalloc void*[4]; args[0] = &pIn; args[1] = &pR; args[2] = &pI; args[3] = &n;
+        LaunchKernel(kernel, grid, (uint)DefaultBlockSize, args);
+    }
+
     public unsafe void SplitComplexConjugate(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n)
     {
         if (n <= 0) return;

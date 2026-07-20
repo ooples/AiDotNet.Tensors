@@ -1063,6 +1063,20 @@ public sealed unsafe partial class VulkanBackend
         }
     }
 
+    public void InterleaveComplex(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer interleaved, int n)
+    {
+        if (n <= 0) return;
+        GlslDispatchN(VulkanAuditKernels.InterleaveComplex, n,
+            new IGpuBuffer[] { real, imag, interleaved }, new uint[] { (uint)n });
+    }
+
+    public void DeinterleaveComplex(IGpuBuffer interleaved, IGpuBuffer real, IGpuBuffer imag, int n)
+    {
+        if (n <= 0) return;
+        GlslDispatchN(VulkanAuditKernels.DeinterleaveComplex, n,
+            new IGpuBuffer[] { interleaved, real, imag }, new uint[] { (uint)n });
+    }
+
     public void SplitComplexConjugate(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer oR, IGpuBuffer oI, int n)
     {
         if (n <= 0) return;

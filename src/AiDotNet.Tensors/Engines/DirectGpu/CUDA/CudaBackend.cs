@@ -14200,6 +14200,34 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    public unsafe void InterleaveComplex(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer interleaved, int n)
+    {
+        if (n <= 0) return;
+        ValidateSplitBuffers(n, nameof(InterleaveComplex), real, imag);
+        if (!_kernelCache.TryGetValue("interleave_complex", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: interleave_complex. Register CudaComplexKernels.");
+        using var _ = PushContext();
+        uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pR = real.Handle, pI = imag.Handle, pO = interleaved.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &pR; args[1] = &pI; args[2] = &pO; args[3] = &n;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void DeinterleaveComplex(IGpuBuffer interleaved, IGpuBuffer real, IGpuBuffer imag, int n)
+    {
+        if (n <= 0) return;
+        ValidateSplitBuffers(n, nameof(DeinterleaveComplex), real, imag);
+        if (!_kernelCache.TryGetValue("deinterleave_complex", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: deinterleave_complex. Register CudaComplexKernels.");
+        using var _ = PushContext();
+        uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pIn = interleaved.Handle, pR = real.Handle, pI = imag.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &pIn; args[1] = &pR; args[2] = &pI; args[3] = &n;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
     public unsafe void SplitComplexConjugate(IGpuBuffer inReal, IGpuBuffer inImag,
         IGpuBuffer outReal, IGpuBuffer outImag, int n)
     {

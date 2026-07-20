@@ -20,8 +20,37 @@ namespace AiDotNet.Tensors.Helpers;
 /// </remarks>
 public static class MathHelper
 {
-    // Cache for numeric operations instances - avoids creating new objects on every call
-    private static readonly ConcurrentDictionary<Type, object> _operationsCache = new();
+    /// <summary>
+    /// Per-closed-generic-type cache for numeric operations.
+    /// </summary>
+    /// <remarks>
+    /// A static field on a generic type gets its own storage for each closed T, initialised once by the
+    /// runtime's type initialiser (thread-safe by CLR guarantee). Reading it is a direct static field
+    /// access the JIT can inline — no hashing, no dictionary probe, no lambda.
+    ///
+    /// This replaces a ConcurrentDictionary&lt;Type, object&gt;.GetOrAdd(typeof(T), ...) that ran on EVERY
+    /// call. GetNumericOperations sits under essentially every generic numeric operation in the library,
+    /// so that probe was not a one-off: a PerfView profile of the FFT benchmark (96,074 samples) put
+    /// MathHelper.GetNumericOperations at 6.7% of all CPU, with the System.RuntimeType.GetHashCode it
+    /// triggers adding a further 2.5% — ~9.2% of total CPU spent deciding which numeric ops to use rather
+    /// than doing arithmetic.
+    /// </remarks>
+    private static class OperationsCache<T>
+    {
+        public static readonly INumericOperations<T>? Instance;
+        public static readonly Exception? Error;
+
+        static OperationsCache()
+        {
+            // Capture rather than propagate. Letting CreateNumericOperations throw out of a static field
+            // initialiser would surface a TypeInitializationException wrapping the NotSupportedException,
+            // changing the exception callers see for an unsupported T. Storing it and rethrowing from the
+            // accessor keeps the observable behaviour identical to the previous GetOrAdd implementation —
+            // the cost is one perfectly-predicted null check, against a dictionary probe it removes.
+            try { Instance = (INumericOperations<T>)CreateNumericOperations<T>(); }
+            catch (Exception ex) { Error = ex; }
+        }
+    }
 
     // Cache for acceleration support flags - avoids repeated type checks
     private static readonly ConcurrentDictionary<Type, (bool Cpu, bool Gpu)> _accelerationCache = new();
@@ -47,7 +76,11 @@ public static class MathHelper
     /// </remarks>
     public static INumericOperations<T> GetNumericOperations<T>()
     {
-        return (INumericOperations<T>)_operationsCache.GetOrAdd(typeof(T), _ => CreateNumericOperations<T>());
+        var instance = OperationsCache<T>.Instance;
+        if (instance is not null) return instance;
+
+        throw OperationsCache<T>.Error
+            ?? new NotSupportedException($"Numeric operations for type {typeof(T)} are not supported.");
     }
 
     /// <summary>

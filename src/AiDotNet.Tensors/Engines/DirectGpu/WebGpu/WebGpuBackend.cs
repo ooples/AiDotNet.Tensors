@@ -1251,6 +1251,22 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         }
     }
 
+    public void InterleaveComplex(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer interleaved, int n)
+    {
+        if (n <= 0) return;
+        DispatchNBufferAsync("Complex:InterleaveComplex", WebGpuAuditKernels.InterleaveComplex, "main",
+            new IGpuBuffer[] { real, imag, interleaved },
+            new float[] { BitConverter.Int32BitsToSingle(n) }, n).GetAwaiter().GetResult();
+    }
+
+    public void DeinterleaveComplex(IGpuBuffer interleaved, IGpuBuffer real, IGpuBuffer imag, int n)
+    {
+        if (n <= 0) return;
+        DispatchNBufferAsync("Complex:DeinterleaveComplex", WebGpuAuditKernels.DeinterleaveComplex, "main",
+            new IGpuBuffer[] { interleaved, real, imag },
+            new float[] { BitConverter.Int32BitsToSingle(n) }, n).GetAwaiter().GetResult();
+    }
+
     public void SplitComplexConjugate(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer oR, IGpuBuffer oI, int n)
     {
         if (n <= 0) return;
