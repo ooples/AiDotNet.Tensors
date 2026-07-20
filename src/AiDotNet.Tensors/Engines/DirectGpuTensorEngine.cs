@@ -266,6 +266,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // an explicit InvalidatePersistentTensor is no longer required for correctness.
     private readonly ConcurrentDictionary<object, int> _persistentWeightHostVersion = new();
 
+    // Persistent weight buffers superseded by a version-gated re-upload, awaiting DEFERRED reclamation. The
+    // version-blind readers (TryGetCachedBuffer) fetch a cache buffer WITHOUT the lock or a refcount, so
+    // disposing a superseded buffer inline is a use-after-free (CodeRabbit #822): a stale read could launch
+    // GPU work on a freed allocation. Instead we evict the entry (no NEW reader can obtain it) and retire the
+    // buffer here; it is disposed only by a later drain that first issues a device backend.Synchronize() — a
+    // quiescence barrier after which no in-flight kernel references it. Guarded by _persistentBufferLock.
+    private readonly List<IGpuBuffer> _retiredWeightBuffers = new();
+
     // Monotonic per-call counter for stochastic-op seeds (dropout, etc.). The old code seeded the
     // GPU dropout RNG from Environment.TickCount / DateTime.UtcNow.Ticks. TickCount has ~15 ms
     // resolution, so the many dropout calls a training step fires in <1 ms all got the SAME seed →
@@ -2510,8 +2518,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private OwnedBuffer GetOrCacheWeightBuffer<T>(IDirectGpuBackend backend, T[] data, PersistentTensorRole role, int hostVersion = NoHostVersionGate)
     {
+        // A synchronize is illegal inside CUDA graph capture (it aborts the capture, CUDA-900). This path is
+        // reachable during capture via TryAliasResidentOutput on a nonresident source under ResidentStepActive,
+        // so gate every backend.Synchronize() below on this (mirrors the FP16 / ones-buffer capture fail-fast).
+        bool capturing = backend is Engines.DirectGpu.CUDA.CudaBackend cudaCap && cudaCap.IsStreamCapturing();
         lock (_persistentBufferLock)
         {
+            // Deferred reclamation: dispose buffers retired by EARLIER stale re-uploads. They were already
+            // evicted from the cache (no new reader can obtain them); the synchronize is a quiescence barrier
+            // draining any in-flight kernel that fetched them lock-free before eviction, so freeing them now is
+            // safe. Skipped under capture (sync illegal) — they persist to the next non-capturing drain.
+            if (!capturing && _retiredWeightBuffers.Count > 0)
+            {
+                backend.Synchronize();
+                foreach (var retired in _retiredWeightBuffers) retired.Dispose();
+                _retiredWeightBuffers.Clear();
+            }
+
             // Persistent-cache lookup WITH the shared version gate.
             if (_persistentBufferCache.TryGetValue(data, out var existing))
             {
@@ -2520,16 +2543,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (valid)
                     return new OwnedBuffer(existing.Buffer, ownsBuffer: false);
 
-                // Stale: the host tensor was mutated in place since upload. Dispose the superseded buffer and
-                // re-upload the current data below (re-stamping its Version).
-                existing.Buffer.Dispose();
+                // Stale: the host tensor was mutated in place since upload. Evict the entry now (no new reader
+                // can obtain it) but RETIRE the superseded buffer for deferred disposal — a lock-free
+                // TryGetCachedBuffer reader may still hold it, so freeing it inline is a use-after-free. It is
+                // reclaimed by a later drain past a synchronize barrier (above). Re-upload the current data below.
                 _persistentBufferCache.TryRemove(data, out _);
+                _retiredWeightBuffers.Add(existing.Buffer);
             }
 
             // Not cached (or just invalidated) - upload and cache for future use.
             float[] floatData = DirectGpuEngine.ToFloatArray(data);
             IGpuBuffer gpuBuffer = backend.AllocateBuffer(floatData);
-            if (hostVersion != NoHostVersionGate)
+            if (hostVersion != NoHostVersionGate && !capturing)
                 backend.Synchronize();
 
             // Insert via TryAdd, not a direct set: RegisterPersistentTensor adds lock-free (it does not take
@@ -6750,6 +6775,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             _persistentBufferCache.Clear();
             _tensorVersions.Clear();
             _persistentWeightHostVersion.Clear();
+            // Reclaim any buffers still awaiting deferred disposal: the whole cache is being torn down, so
+            // there is no reader to race and they would otherwise leak.
+            foreach (var retired in _retiredWeightBuffers) retired.Dispose();
+            _retiredWeightBuffers.Clear();
         }
     }
 
@@ -22045,6 +22074,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         _persistentBufferCache.Clear();
         _tensorVersions.Clear();
         _persistentWeightHostVersion.Clear();
+        // Reclaim buffers awaiting deferred disposal (engine teardown — no reader to race).
+        foreach (var retired in _retiredWeightBuffers) retired.Dispose();
+        _retiredWeightBuffers.Clear();
 
         // Dispose cached CSR GPU buffers
         foreach (var entry in _csrBufferCache.Values)
