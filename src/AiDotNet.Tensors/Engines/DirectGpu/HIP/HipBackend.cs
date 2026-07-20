@@ -708,6 +708,18 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 _audioModule = IntPtr.Zero;
             }
 
+            // Fused ANN kernels (IAnnBackend). Supply-chain-clean replacement for FaissNet/MKL.
+            try
+            {
+                CompileKernelModule(Kernels.HipAnnKernels.GetSource(), "ann",
+                    ref _annModule, Kernels.HipAnnKernels.GetKernelNames());
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"HIP ANN kernel compilation failed: {ex.Message}");
+                _annModule = IntPtr.Zero;
+            }
+
             Console.WriteLine($"[HipBackend] Kernel compilation complete. Available kernels: {_kernelCache.Count}");
             System.Diagnostics.Debug.WriteLine($"HIP kernels compiled successfully for {_architecture}. Total: {_kernelCache.Count}");
         }
@@ -11223,6 +11235,13 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 HipNativeBindings.hipModuleUnload(modRef);
         }
         _detectionModule = _geometryModule = _roiModule = _audioModule = IntPtr.Zero;
+
+        // Unload the fused ANN kernel module (IAnnBackend).
+        if (_annModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_annModule);
+            _annModule = IntPtr.Zero;
+        }
 
         // Unload all additional kernel modules
         foreach (var modField in new[] { _dotProductModule, _reductionModule2, _broadcastModule, _gatedModule, _shapeModule, _lossModule, _softmaxVarModule, _fusedLinearModule, _fusedAdvancedModule, _iouModule, _complexModule })
