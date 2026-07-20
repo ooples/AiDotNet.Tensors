@@ -9,11 +9,25 @@ namespace AiDotNet.Tensors.Tests.Engines.OpParity;
 /// Third parity phase: TAPE-DRIVEN gradients. Runs each op's forward under a live GradientTape on CPU and
 /// on GPU, calls ComputeGradients, and compares the resulting input gradients.
 ///
-/// WHY THE EXISTING TWO PHASES CANNOT CATCH THIS:
-///   CheckForward  runs the forward op and compares outputs      -> verifies the FORWARD kernel.
-///   CheckBackward calls the backward op DIRECTLY (RunFloatGrad) -> verifies the BACKWARD kernel.
-/// Neither exercises the WIRING between them: whether the forward records a tape node at all, and whether
-/// the saved state it records makes ComputeGradients produce the right gradient.
+/// WHAT THE OTHER PHASES ACTUALLY COVER — corrected 2026-07-20, having originally claimed otherwise here:
+///   CheckForward  runs the forward op and compares outputs -> verifies the FORWARD kernel. This RUNS.
+///   CheckBackward is DEAD CODE. It is fully written in OpParityHarness (lines ~171-195), but NO test method
+///     invokes it, and it opens with `if (!op.HasBackward) Skip` while ZERO of the 475 registry cases pass a
+///     runFloatGrad/runDoubleGrad delegate — so even if a test called it, every case would skip.
+///
+/// The consequence is the reason this file matters: GPU BACKWARD KERNELS HAVE HAD NO CPU-VS-GPU COVERAGE AT
+/// ALL. This phase is not a third check refining two existing ones — it is the ONLY thing that has ever
+/// compared a GPU backward against CPU. It covers them end-to-end without needing a per-case delegate,
+/// which is precisely why CheckBackward never got populated: supplying gradients by hand for 475 cases is
+/// the work nobody did.
+///
+/// Two distinct defect classes show up here, distinguishable by dumping the recorded tape on each engine:
+///   SAME tape, different gradients  -> a GPU BACKWARD KERNEL is wrong (the backward receives IEngine and
+///     runs its internal ops on it). Seen in SELU, MaskedScatter, IndexFill, IndexCopy.
+///   DIFFERENT tape                  -> CPU decomposes while GPU fuses, and the fused backward disagrees.
+///     Seen in the IoU family: CPU records 39 ops for IoULoss, GPU records 1 fused node.
+/// Neither is a wiring defect, which is what this phase was originally built to find — the Scatter class of
+/// bug is real, but it turned out to be the smaller half of what the phase surfaces.
 ///
 /// That gap is not hypothetical. GPU Scatter (2026-07-20) passed both existing phases — ScatterBackward the
 /// kernel is correct — while its recording produced d(values) exactly right and d(input) WRONG BY 3.14e-01,
