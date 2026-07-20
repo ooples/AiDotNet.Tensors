@@ -31,6 +31,7 @@ A high-performance .NET tensor library with hand-written AVX2/AVX-512 SIMD kerne
 - **JIT-Compiled Kernels**: Runtime x86-64 machine code generation for size-specialized operations
 - **BLIS-Style GEMM**: Tiled matrix multiply with FMA micro-kernel, cache-aware panel packing
 - **GPU Acceleration**: Optional CUDA, HIP/ROCm, OpenCL, Metal, Vulkan, and WebGPU support via separate packages, with CPU-vs-GPU op-parity validated across every backend (#775)
+- **Native ANN Index**: Dependency-free approximate-nearest-neighbour search (Flat / IVF / PQ / IVFPQ) via `AnnIndex`, with fused `IAnnBackend` GPU kernels across all seven backends — no FAISS / MKL dependency (#824)
 - **Multi-Target**: Supports .NET 10.0 and .NET Framework 4.7.1
 - **Generic Math**: Works with any numeric type via `INumericOperations<T>` interface
 
