@@ -5711,6 +5711,13 @@ public partial class DirectGpuTensorEngine
         if (indices is null) throw new ArgumentNullException(nameof(indices));
         if (values is null) throw new ArgumentNullException(nameof(values));
         int normalizedAxis = axis < 0 ? axis + input.Rank : axis;
+        // Tape bail RESTORED after a gradient test caught a real defect. Recording the node here with
+        // CpuEngine's ScatterBackward produced d(values) exactly correct but d(input) wrong by 3.14e-01
+        // — not rounding. Scatter OVERWRITES input at the scattered positions, so d/d(input) must be ZERO
+        // there and 1 elsewhere; that mask depends on the indices, and reusing the CPU recording did not
+        // reproduce it against the GPU result. Signature matching was NOT sufficient here: the forward is
+        // correct and only the gradient is wrong, so forward parity would never have caught it.
+        // Re-attempt only with a gradient test proving BOTH operands, not by inspection.
         if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || normalizedAxis < 0 || normalizedAxis >= input.Rank || !TryGetBackend(out var backend))
             return base.Scatter(input, indices, values, axis);
@@ -5738,12 +5745,14 @@ public partial class DirectGpuTensorEngine
             using var inputBuffer = GetOrAllocateBuffer(backend, contiguousInput);
             using var valuesBuffer = GetOrAllocateBuffer(backend, contiguousValues);
             using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices);
-            return DispatchDeferredGpuOp<T>(backend, input.Length, input.Shape.ToArray(), output =>
+            var scatterResult = DispatchDeferredGpuOp<T>(backend, input.Length, input.Shape.ToArray(), output =>
             {
                 backend.Copy(inputBuffer.Buffer, output, input.Length);
                 backend.IndexWrite(output, indexBuffer.Buffer, valuesBuffer.Buffer, 0f, mode: 0,
                     outerSize, indices.Length, innerSize, axisSize);
             });
+
+            return scatterResult;
         }
         catch
         {

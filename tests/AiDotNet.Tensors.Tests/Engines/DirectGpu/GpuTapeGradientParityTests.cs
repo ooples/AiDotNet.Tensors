@@ -160,6 +160,12 @@ public class GpuTapeGradientParityTests : IDisposable
             static (e, t) => e.Upsample3D(t, 2, 2, 2),
             probe: Engagement.UseResidencyCounter);
 
+    // Scatter has NO test here: its bail was RESTORED because this very test caught a real defect —
+    // recording CpuEngine's ScatterBackward on the GPU result gave d(values) exactly right but d(input)
+    // wrong by 3.14e-01. Scatter overwrites input at the scattered positions, so d/d(input) must be zero
+    // there, and the reused recording did not reproduce that mask. Restore this test together with a
+    // correct GPU-side backward. Keeping it while the op bails would only assert CPU against CPU.
+
     // Sparsemax has NO test here on purpose: its bail was restored because the GPU path throws
     // InvalidOperationException("CUDA kernel not found: where_select"). Add the test back together with
     // the where_select kernel.

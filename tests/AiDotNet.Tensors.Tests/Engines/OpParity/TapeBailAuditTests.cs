@@ -68,6 +68,12 @@ public class TapeBailAuditTests
         "AffineGrid",
         "MaxPool3DWithIndices",
         "RBFKernel",
+
+        // Reverted after a gradient test FAILED it. Recording CpuEngine's ScatterBackward on the GPU result
+        // gave d(values) exactly right but d(input) wrong by 3.14e-01. Scatter overwrites input at the
+        // scattered positions, so d/d(input) must be zero there — a mask the reused recording did not
+        // reproduce. Signature matching was not enough: only the gradient is wrong, the forward is perfect,
+        // so forward parity could never surface it. Needs its own GPU-side backward, not a reused one.
         "Scatter",
 
         // Reverted after testing: removing its bail surfaced that the GPU path throws
