@@ -111,6 +111,86 @@ public sealed class DeferredScopeReproTests
             gpu.Dispose();
         }
     }
+
+    private static (Tensor<float> cos, Tensor<float> sin) BuildRopeCache(int maxSeq, int headDim, float theta)
+    {
+        int half = headDim / 2;
+        var cos = new float[maxSeq * half];
+        var sin = new float[maxSeq * half];
+        for (int pos = 0; pos < maxSeq; pos++)
+            for (int i = 0; i < half; i++)
+            {
+                double freq = 1.0 / Math.Pow(theta, (2.0 * i) / headDim);
+                double angle = pos * freq;
+                cos[pos * half + i] = (float)Math.Cos(angle);
+                sin[pos * half + i] = (float)Math.Sin(angle);
+            }
+        return (new Tensor<float>(cos, new[] { maxSeq, half }), new Tensor<float>(sin, new[] { maxSeq, half }));
+    }
+
+    /// <summary>
+    /// The decoder's actual attention op chain — interleaved RoPE on Q and K, then grouped-query attention with
+    /// UNEXPANDED K/V — must replay from a deferred graph identically to eager. This is the end-to-end proof
+    /// that the device-agnostic ApplyRoPEInterleaved + ScaledDotProductAttentionGqa are graph-recordable, so a
+    /// decoder attention rewritten onto them (dropping managed RoPE + ExpandKVHeads) becomes fully recordable.
+    /// </summary>
+    [SkippableFact]
+    public void DeferredScope_RoPEThenGqaAttention_MatchesEager()
+    {
+        DirectGpuTensorEngine gpu;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch { Skip.If(true, "No GPU backend"); return; }
+        if (!gpu.IsGpuAvailable) { gpu.Dispose(); Skip.If(true, "No GPU available"); return; }
+
+        var previous = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = gpu;
+        try
+        {
+            const int qHeads = 4, kvHeads = 2, seq = 3, headDim = 4, maxSeq = 8;
+            float scale = 1f / (float)Math.Sqrt(headDim);
+            var rng = new Random(31);
+            float[] Rand(int n) { var a = new float[n]; for (int i = 0; i < n; i++) a[i] = (float)(rng.NextDouble() * 2 - 1); return a; }
+            var q = new Tensor<float>(Rand(qHeads * seq * headDim), new[] { 1, qHeads, seq, headDim });
+            var k = new Tensor<float>(Rand(kvHeads * seq * headDim), new[] { 1, kvHeads, seq, headDim });
+            var v = new Tensor<float>(Rand(kvHeads * seq * headDim), new[] { 1, kvHeads, seq, headDim });
+            var (cos, sin) = BuildRopeCache(maxSeq, headDim, 10000f);
+
+            var eng = (IEngine)gpu;
+
+            // Eager reference on the GPU engine.
+            var eRq = eng.ApplyRoPEInterleaved(q, cos, sin, 0);
+            var eRk = eng.ApplyRoPEInterleaved(k, cos, sin, 0);
+            var eager = eng.ScaledDotProductAttentionGqa(eRq, eRk, v, scale, isCausal: true)
+                .Contiguous().AsSpan().ToArray();
+
+            var scope = gpu.BeginDeferredScope();
+            if (scope is null) { Skip.If(true, "Backend has no deferred execution"); return; }
+
+            float[] deferred;
+            using (scope)
+            {
+                var rq = eng.ApplyRoPEInterleaved(q, cos, sin, 0);
+                var rk = eng.ApplyRoPEInterleaved(k, cos, sin, 0);
+                var attn = eng.ScaledDotProductAttentionGqa(rq, rk, v, scale, isCausal: true);
+                scope.Execute();
+                deferred = attn.Contiguous().AsSpan().ToArray();
+            }
+
+            bool allZero = true;
+            for (int i = 0; i < deferred.Length; i++) if (Math.Abs(deferred[i]) > 1e-9) { allZero = false; break; }
+            Assert.False(allZero, "Deferred RoPE+GQA replay produced all-zero output — an op was not recorded.");
+
+            Assert.Equal(eager.Length, deferred.Length);
+            for (int i = 0; i < eager.Length; i++)
+                Assert.True(Math.Abs(eager[i] - deferred[i]) < 1e-3f,
+                    $"[{i}] eager {eager[i]} vs deferred {deferred[i]}");
+        }
+        finally
+        {
+            AiDotNetEngine.Current = previous;
+            gpu.Dispose();
+        }
+    }
 }
 
 #endif
