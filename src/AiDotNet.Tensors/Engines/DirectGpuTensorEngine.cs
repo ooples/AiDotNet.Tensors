@@ -987,6 +987,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
+    /// The live GPU backend this dispatcher uses, exposed for device PLACEMENT (<see cref="Tensor{T}.To"/>).
+    /// Unlike <see cref="TryGetBackend"/> it ignores GraphMode / the DeferredScope recording backend — placement
+    /// moves data to the device, it is not a recorded op — so a tensor placed with <c>To(device)</c> lands on the
+    /// SAME backend the engine executes on, keeping placement and dispatch from diverging. Null when no GPU.
+    /// </summary>
+    internal IDirectGpuBackend? PlacementBackend => IsGpuAvailable ? _directGpu?.Backend : null;
+
+    /// <summary>
     /// Tries to get the batch execution backend (which has the fused kernel methods).
     /// Returns false if GPU is not available or backend doesn't support batch execution.
     /// </summary>
@@ -10354,13 +10362,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="value">GPU-resident value tensor [batch, heads, seqK, headDim].</param>
     /// <param name="scale">Scaling factor (typically 1/sqrt(headDim)).</param>
     /// <param name="isCausal">If true, applies causal masking.</param>
+    /// <param name="softcap">Optional attention-logit soft-cap (Gemma-2); 0 disables it.</param>
     /// <returns>GPU-resident output tensor [batch, heads, seqQ, headDim].</returns>
+    /// <remarks>
+    /// Grouped-Query Attention is inferred automatically: when the key/value tensors carry fewer heads than the
+    /// query (their dim[1] &lt; query dim[1]), each KV head is broadcast across numHeads/numKVHeads query heads
+    /// inside the kernel — the caller never materializes the expanded K/V.
+    /// </remarks>
     public Tensor<T> ScaledDotProductAttentionGpu<T>(
         Tensor<T> query,
         Tensor<T> key,
         Tensor<T> value,
         double scale,
-        bool isCausal = false)
+        bool isCausal = false,
+        float softcap = 0.0f)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for ScaledDotProductAttentionGpu");
@@ -10374,16 +10389,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int seqQ = query.Shape._dims[2];
         int headDim = query.Shape._dims[3];
         int seqK = key.Shape._dims[2];
+        // GQA is inferred from the K/V head count; equal to query heads for standard MHA.
+        int kvHeads = key.Shape._dims[1];
+        if (kvHeads <= 0 || heads % kvHeads != 0)
+            throw new ArgumentException("Query heads must be a positive integer multiple of key/value heads.");
+
+        // The kernel indexes Q/K/V as flat row-major [batch, heads, seq, headDim]; a permuted view (e.g. the
+        // [0,2,1,3] transpose that produced the per-head layout) must be materialized contiguous first, and a
+        // host tensor uploaded. GetOrAllocateBuffer does both; contiguous-resident inputs pass straight through.
+        using var qBuf = GetOrAllocateBuffer(backend, query.IsContiguous ? query : (Tensor<T>)query.Contiguous());
+        using var kBuf = GetOrAllocateBuffer(backend, key.IsContiguous ? key : (Tensor<T>)key.Contiguous());
+        using var vBuf = GetOrAllocateBuffer(backend, value.IsContiguous ? value : (Tensor<T>)value.Contiguous());
 
         // Allocate output and attention weights buffers
         var outputBuffer = backend.AllocateBuffer(batch * heads * seqQ * headDim);
         var attnWeightsBuffer = backend.AllocateBuffer(batch * heads * seqQ * seqK);
 
-        // Execute GPU ScaledDotProductAttention
+        // Execute GPU ScaledDotProductAttention (numKVHeads == heads collapses to MHA inside the kernel)
         backend.ScaledDotProductAttention(
-            query.Buffer, key.Buffer, value.Buffer,
+            qBuf.Buffer, kBuf.Buffer, vBuf.Buffer,
             outputBuffer, attnWeightsBuffer, null,
-            batch, heads, seqQ, seqK, headDim, (float)scale, isCausal);
+            batch, heads, seqQ, seqK, headDim, (float)scale, isCausal, softcap, kvHeads);
 
         // Free attention weights buffer (not needed when not returning weights)
         attnWeightsBuffer.Dispose();
@@ -10391,6 +10417,73 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Return GPU-resident output
         return Tensor<T>.FromGpuBuffer(backend, outputBuffer, new[] { batch, heads, seqQ, headDim },
             GpuTensorRole.Activation, ownsBuffer: true);
+    }
+
+    /// <summary>
+    /// GPU-resident fused interleaved Rotary Position Embedding (RoPE) — the GPT-NeoX / LLaMA / GGML variant that
+    /// rotates each adjacent dim pair (2i, 2i+1). Keeps Q/K device-resident: no host round-trip, one kernel launch.
+    /// </summary>
+    /// <typeparam name="T">The element type.</typeparam>
+    /// <param name="input">Q or K, shape [.., seqLen, headDim] (rank &gt;= 2). Resident or host; uploaded if needed.</param>
+    /// <param name="cos">Cosine cache [maxSeq, headDim/2]. Auto-cached device-resident (uploaded once).</param>
+    /// <param name="sin">Sine cache [maxSeq, headDim/2]. Auto-cached device-resident (uploaded once).</param>
+    /// <param name="startPosition">Absolute position of the first sequence element (for incremental decode).</param>
+    /// <returns>GPU-resident rotated tensor with the same shape as <paramref name="input"/>.</returns>
+    /// <summary>
+    /// GPU-resident axis permute that keeps the result ON-DEVICE (unlike <see cref="TensorPermute{T}"/>, which
+    /// returns a strided host-materializing view, and <see cref="TensorPermuteInto{T}"/>, whose eager path downloads
+    /// to host). Runs the backend transpose kernel into a fresh contiguous device buffer and returns it resident, so
+    /// a resident forward (e.g. the [b,s,H,hd]→[b,H,s,hd] attention reshape) never round-trips to the CPU.
+    /// </summary>
+    /// <typeparam name="T">The element type.</typeparam>
+    /// <param name="tensor">GPU-resident (or host) input tensor.</param>
+    /// <param name="axes">Permutation of the axes, length == rank.</param>
+    /// <returns>Contiguous GPU-resident tensor with the permuted shape.</returns>
+    public Tensor<T> PermuteResidentGpu<T>(Tensor<T> tensor, int[] axes)
+    {
+        if (!TryGetBackend(out var backend))
+            throw new InvalidOperationException("No GPU backend available for PermuteResidentGpu");
+        int rank = tensor.Shape._dims.Length;
+        if (axes.Length != rank)
+            throw new ArgumentException("Axes length must match tensor rank.", nameof(axes));
+        var outDims = new int[rank];
+        for (int i = 0; i < rank; i++) outDims[i] = tensor.Shape._dims[axes[i]];
+
+        using var bufIn = GetOrAllocateBuffer(backend, tensor);
+        var outBuf = backend.AllocateBuffer(tensor.Length);
+        backend.Permute(bufIn.Buffer, outBuf, tensor.Shape._dims, axes);
+        return Tensor<T>.FromGpuBuffer(backend, outBuf, outDims, GpuTensorRole.Activation, ownsBuffer: true);
+    }
+
+    public Tensor<T> ApplyRoPEInterleavedGpu<T>(Tensor<T> input, Tensor<T> cos, Tensor<T> sin, int startPosition = 0)
+    {
+        if (!TryGetBackend(out var backend))
+            throw new InvalidOperationException("No GPU backend available for ApplyRoPEInterleavedGpu");
+
+        int rank = input.Shape._dims.Length;
+        if (rank < 2)
+            throw new ArgumentException("RoPE input must have rank >= 2 ([.., seqLen, headDim]).", nameof(input));
+        int headDim = input.Shape._dims[rank - 1];
+        int seqLen = input.Shape._dims[rank - 2];
+        if (headDim <= 0 || seqLen <= 0 || (headDim & 1) != 0)
+            throw new ArgumentException("RoPE requires positive seqLen and an even headDim.", nameof(input));
+
+        var contiguousInput = input.IsContiguous ? input : (Tensor<T>)input.Contiguous();
+        int rows = contiguousInput.Length / headDim;
+
+        // input is an activation (upload if host, reuse if resident); cos/sin are constant caches that stay
+        // resident across every layer/step via the weight-buffer cache, so they upload exactly once.
+        using var inputBuffer = GetOrAllocateBuffer(backend, contiguousInput);
+        using var cosBuffer = GetWeightBufferPreferResident(backend, cos, PersistentTensorRole.Weights);
+        using var sinBuffer = GetWeightBufferPreferResident(backend, sin, PersistentTensorRole.Weights);
+
+        var outputBuffer = backend.AllocateBuffer(contiguousInput.Length);
+        backend.RopeInterleaved(inputBuffer.Buffer, cosBuffer.Buffer, sinBuffer.Buffer, outputBuffer,
+            rows, headDim, seqLen, startPosition);
+
+        int[] outputShape = new int[rank];
+        for (int i = 0; i < rank; i++) outputShape[i] = input.Shape._dims[i];
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, outputShape, GpuTensorRole.Activation, ownsBuffer: true);
     }
 
     /// <summary>
@@ -12517,6 +12610,49 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <summary>
     /// GPU-accelerated RMSNorm operation.
     /// </summary>
+    /// <summary>
+    /// Device-agnostic interleaved RoPE entry point: dispatches to the fused GPU <c>rope_interleaved</c> kernel
+    /// (recordable under a deferred scope) for the float GPU path, and falls back to the CPU implementation for
+    /// the tape, graph-mode, non-float, or no-GPU cases. The two paths use the same interleaving convention.
+    /// </summary>
+    Tensor<T> IEngine.ApplyRoPEInterleaved<T>(Tensor<T> input, Tensor<T> cos, Tensor<T> sin, int startPosition)
+    {
+        if (IsTapeActive<T>()) return base.ApplyRoPEInterleaved(input, cos, sin, startPosition);
+        if (Compilation.GraphMode.IsActive) return base.ApplyRoPEInterleaved(input, cos, sin, startPosition);
+        if (typeof(T) != typeof(float)) return base.ApplyRoPEInterleaved(input, cos, sin, startPosition);
+        if (!TryGetBackend(out _)) return base.ApplyRoPEInterleaved(input, cos, sin, startPosition);
+        try
+        {
+            return ApplyRoPEInterleavedGpu(input, cos, sin, startPosition);
+        }
+        catch
+        {
+            return base.ApplyRoPEInterleaved(input, cos, sin, startPosition);
+        }
+    }
+
+    /// <summary>
+    /// Device-agnostic grouped-query attention entry point: dispatches to the fused GQA-aware GPU kernel
+    /// (recordable, broadcasts the shared KV heads inside the kernel) for the float GPU path, and falls back to
+    /// the CPU broadcast-then-attend implementation for the tape, graph-mode, non-float, or no-GPU cases.
+    /// </summary>
+    Tensor<T> IEngine.ScaledDotProductAttentionGqa<T>(
+        Tensor<T> query, Tensor<T> key, Tensor<T> value, double scale, bool isCausal, double softcap)
+    {
+        if (IsTapeActive<T>()) return base.ScaledDotProductAttentionGqa(query, key, value, scale, isCausal, softcap);
+        if (Compilation.GraphMode.IsActive) return base.ScaledDotProductAttentionGqa(query, key, value, scale, isCausal, softcap);
+        if (typeof(T) != typeof(float)) return base.ScaledDotProductAttentionGqa(query, key, value, scale, isCausal, softcap);
+        if (!TryGetBackend(out _)) return base.ScaledDotProductAttentionGqa(query, key, value, scale, isCausal, softcap);
+        try
+        {
+            return ScaledDotProductAttentionGpu(query, key, value, scale, isCausal, (float)softcap);
+        }
+        catch
+        {
+            return base.ScaledDotProductAttentionGqa(query, key, value, scale, isCausal, softcap);
+        }
+    }
+
     Tensor<T> IEngine.RMSNorm<T>(Tensor<T> input, Tensor<T> gamma, double epsilon, out Tensor<T> rms)
     {
         if (IsTapeActive<T>()) return base.RMSNorm(input, gamma, epsilon, out rms);
@@ -16815,6 +16951,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorAdd<T>(Tensor<T> a, Tensor<T> b)
     {
+        DeviceDispatch.EnforceStrict(a, b); // no-op unless strict mode is enabled
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
             return base.TensorAdd(a, b);
         if (TryBinaryResidentOutOfPlace(a, b, static (be, ia, ib, o, n) => be.Add(ia, ib, o, n)) is { } radd)
@@ -16887,6 +17024,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorMultiply<T>(Tensor<T> a, Tensor<T> b)
     {
+        DeviceDispatch.EnforceStrict(a, b); // no-op unless strict mode is enabled
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
             return base.TensorMultiply(a, b);
         if (TryBinaryResidentOutOfPlace(a, b, static (be, ia, ib, o, n) => be.Multiply(ia, ib, o, n)) is { } rmul)
@@ -17894,6 +18032,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorMatMul<T>(Tensor<T> a, Tensor<T> b)
     {
+        DeviceDispatch.EnforceStrict(a, b); // no-op unless strict mode is enabled
         if (!TryGetBackend(out var backend))
             return base.TensorMatMul(a, b);
 

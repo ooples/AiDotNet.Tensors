@@ -192,6 +192,46 @@ fn clamp_scalar(@builtin(global_invocation_id) gid: vec3<u32>) {
 ";
 
     /// <summary>
+    /// Fused interleaved Rotary Position Embedding (RoPE) — GPT-NeoX / LLaMA / GGML variant.
+    /// Rotates each adjacent dim pair (2i, 2i+1) of every [rows, headDim] row. One invocation per (row, pair).
+    /// </summary>
+    public const string RopeSource = @"
+@group(0) @binding(0) var<storage, read> inputBuf: array<f32>;
+@group(0) @binding(1) var<storage, read> cosCache: array<f32>;
+@group(0) @binding(2) var<storage, read> sinCache: array<f32>;
+@group(0) @binding(3) var<storage, read_write> outputBuf: array<f32>;
+
+struct RopeParams {
+    rows: u32,
+    headDim: u32,
+    seqLen: u32,
+    startPosition: u32,
+}
+@group(0) @binding(4) var<uniform> params: RopeParams;
+
+@compute @workgroup_size(256)
+fn rope_interleaved(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let halfDim = params.headDim / 2u;
+    let g = gid.x;
+    if (g >= params.rows * halfDim) {
+        return;
+    }
+    let i = g % halfDim;
+    let row = g / halfDim;
+    let s = row % params.seqLen;
+    let pos = params.startPosition + s;
+    let baseIdx = row * params.headDim;
+    let cacheIdx = pos * halfDim + i;
+    let c = cosCache[cacheIdx];
+    let sn = sinCache[cacheIdx];
+    let xEven = inputBuf[baseIdx + 2u * i];
+    let xOdd = inputBuf[baseIdx + 2u * i + 1u];
+    outputBuf[baseIdx + 2u * i] = xEven * c - xOdd * sn;
+    outputBuf[baseIdx + 2u * i + 1u] = xEven * sn + xOdd * c;
+}
+";
+
+    /// <summary>
     /// Strided memory access operations for wavelet transforms and interleaved data.
     /// </summary>
     public const string StridedOpsSource = @"
@@ -4592,7 +4632,9 @@ struct AttentionForwardParams {
 @group(0) @binding(7) var<uniform> attention_params: AttentionForwardParams;
 
 fn attention_forward_excluded(b: u32, q_head: u32, q_pos: u32, k_pos: u32) -> bool {
-    if (attention_params.is_causal != 0u && k_pos > q_pos) { return true; }
+    // KV-cache causal offset: query q_pos sits at absolute position q_pos + (seq_k - seq_q); seq_q==seq_k
+    // collapses to k_pos > q_pos (prefill), while a decode step attends to the whole cached prefix.
+    if (attention_params.is_causal != 0u && k_pos > q_pos + (attention_params.seq_k - attention_params.seq_q)) { return true; }
     if (attention_params.boolean_mask_mode == 0u) { return false; }
     var mask_base: u32 = 0u;
     if (attention_params.boolean_mask_mode == 2u) {

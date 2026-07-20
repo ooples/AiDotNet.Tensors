@@ -13,9 +13,14 @@ public sealed partial class MetalBackend
     public void ScaledDotProductAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer? attentionWeights, IGpuBuffer? mask,
         int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal,
-        float softcap = 0.0f)
+        float softcap = 0.0f, int numKVHeads = 0)
     {
         ThrowIfDisposed();
+        // numKVHeads <= 0 means MHA (K/V have numHeads); >0 enables Grouped-Query Attention where each KV head is
+        // shared by numHeads/numKVHeads query heads and the K/V buffers are sized [batch * numKVHeads * seqK * headDim].
+        int kvHeads = numKVHeads > 0 ? numKVHeads : numHeads;
+        if (numHeads % kvHeads != 0)
+            throw new ArgumentException("numHeads must be an integer multiple of numKVHeads.", nameof(numKVHeads));
         int outputCount = checked(batch * numHeads * seqQ * headDim);
         int weightCount = checked(batch * numHeads * seqQ * seqK);
         if (outputCount <= 0) return;
@@ -30,9 +35,30 @@ public sealed partial class MetalBackend
         DispatchResidentMetal("attention_forward_serial", 1,
             new[] { query, key, value, outputTemporary, weightsTemporary ?? unusedWeights!, mask ?? unusedMask! },
             (uint)batch, (uint)numHeads, (uint)seqQ, (uint)seqK, (uint)headDim, unchecked((uint)SingleToInt32BitsCompat(scale)),
-            isCausal ? 1u : 0u, attentionWeights is null ? 0u : 1u, maskMode, unchecked((uint)SingleToInt32BitsCompat(softcap)));
+            isCausal ? 1u : 0u, attentionWeights is null ? 0u : 1u, maskMode, unchecked((uint)SingleToInt32BitsCompat(softcap)),
+            (uint)kvHeads);
         Copy(outputTemporary, output, outputCount);
         if (attentionWeights is not null) Copy(weightsTemporary!, attentionWeights, weightCount);
+    }
+
+    /// <summary>
+    /// Fused interleaved RoPE (GPT-NeoX / LLaMA / GGML). Rotates each adjacent dim pair of every [rows, headDim] row.
+    /// </summary>
+    public void RopeInterleaved(IGpuBuffer input, IGpuBuffer cos, IGpuBuffer sin, IGpuBuffer output,
+        int rows, int headDim, int seqLen, int startPosition)
+    {
+        ThrowIfDisposed();
+        if (rows <= 0 || headDim <= 0 || seqLen <= 0)
+            throw new ArgumentOutOfRangeException(nameof(rows), "RoPE dimensions must be positive.");
+        if ((headDim & 1) != 0)
+            throw new ArgumentException("RoPE requires an even head dimension.", nameof(headDim));
+        int total = checked(rows * headDim);
+        if (input.Size < total || output.Size < total)
+            throw new ArgumentException("RoPE input/output buffers are smaller than rows * headDim.");
+        int pairs = checked(rows * (headDim / 2));
+        DispatchResidentMetal("rope_interleaved", pairs,
+            new[] { input, cos, sin, output },
+            (uint)rows, (uint)headDim, (uint)seqLen, (uint)startPosition);
     }
 
     /// <summary>

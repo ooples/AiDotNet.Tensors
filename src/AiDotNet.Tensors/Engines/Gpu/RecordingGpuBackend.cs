@@ -682,7 +682,8 @@ public class RecordingGpuBackend : DelegatingGpuBackend
     /// <inheritdoc/>
     public override void ScaledDotProductAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer? attentionWeights, IGpuBuffer? mask,
-        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal, float softcap = 0.0f)
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal, float softcap = 0.0f,
+        int numKVHeads = 0)
     {
         var inputs = new List<IGpuBuffer> { query, key, value };
         if (mask != null) inputs.Add(mask);
@@ -695,7 +696,7 @@ public class RecordingGpuBackend : DelegatingGpuBackend
             inputs.ToArray(),
             outputs.ToArray(),
             () => Inner.ScaledDotProductAttention(query, key, value, output, attentionWeights, mask,
-                batch, numHeads, seqQ, seqK, headDim, scale, isCausal, softcap),
+                batch, numHeads, seqQ, seqK, headDim, scale, isCausal, softcap, numKVHeads),
             new Dictionary<string, object>
             {
                 ["batch"] = batch,
@@ -871,6 +872,51 @@ public class RecordingGpuBackend : DelegatingGpuBackend
         // is an input; indices is a separate (int) input the kernel reads.
         RecordOrExecute(KernelType.ElementWise, new[] { indices, embeddingTable }, new[] { output },
             () => Inner.Embedding(indices, embeddingTable, output, numIndices, embeddingDim));
+    }
+
+    /// <inheritdoc/>
+    public override void RopeInterleaved(IGpuBuffer input, IGpuBuffer cos, IGpuBuffer sin, IGpuBuffer output,
+        int rows, int headDim, int seqLen, int startPosition)
+    {
+        // Fused RoPE: input/cos/sin are read, output is written (output may alias input for in-place rotation).
+        RecordOrExecute(KernelType.ElementWise, new[] { input, cos, sin }, new[] { output },
+            () => Inner.RopeInterleaved(input, cos, sin, output, rows, headDim, seqLen, startPosition));
+    }
+
+    /// <inheritdoc/>
+    public override void RmsNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer saveRms,
+        int batchSize, int normalizedSize, float epsilon)
+    {
+        // Decoder / LLaMA-family normalization. Must record — without it the op ran eagerly mid-record on
+        // buffers the deferred GEMMs had not filled yet, poisoning the whole forward (all-zero logits).
+        RecordOrExecute(
+            KernelType.LayerNorm,
+            new[] { input, gamma },
+            new[] { output, saveRms },
+            () => Inner.RmsNorm(input, output, gamma, saveRms, batchSize, normalizedSize, epsilon),
+            new Dictionary<string, object>
+            {
+                ["batchSize"] = batchSize,
+                ["normalizedSize"] = normalizedSize,
+                ["epsilon"] = epsilon
+            });
+    }
+
+    /// <inheritdoc/>
+    public override void Permute(IGpuBuffer input, IGpuBuffer output, int[] shape, int[] permutation)
+    {
+        // Axis permutation for the attention head transpose ([B,S,H,D] <-> [B,H,S,D]). Same recordability
+        // requirement as Transpose — an unrecorded permute reads unfilled buffers mid-record.
+        RecordOrExecute(
+            KernelType.Transpose,
+            new[] { input },
+            new[] { output },
+            () => Inner.Permute(input, output, shape, permutation),
+            new Dictionary<string, object>
+            {
+                ["shape"] = shape,
+                ["permutation"] = permutation
+            });
     }
 
     /// <inheritdoc/>

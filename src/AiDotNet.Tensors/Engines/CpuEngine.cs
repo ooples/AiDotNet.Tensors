@@ -25967,6 +25967,114 @@ public partial class CpuEngine : ITensorLevelEngine
 
 
     /// <inheritdoc/>
+    /// <inheritdoc/>
+    public virtual Tensor<T> ApplyRoPEInterleaved<T>(Tensor<T> input, Tensor<T> cos, Tensor<T> sin, int startPosition = 0)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (cos == null) throw new ArgumentNullException(nameof(cos));
+        if (sin == null) throw new ArgumentNullException(nameof(sin));
+
+        int rank = input._shape.Length;
+        if (rank < 2)
+            throw new ArgumentException("RoPE input must have rank >= 2 ([.., seqLen, headDim]).", nameof(input));
+        int headDim = input._shape[rank - 1];
+        int seqLen = input._shape[rank - 2];
+        if (headDim <= 0 || seqLen <= 0 || (headDim & 1) != 0)
+            throw new ArgumentException("RoPE requires positive seqLen and an even headDim.", nameof(input));
+        int halfDim = headDim / 2;
+
+        var src = input.IsContiguous ? input : input.Contiguous();
+        int total = src.Length;
+        int rows = total / headDim;
+        var outArr = new T[total];
+
+        // Matches the fused rope_interleaved kernel exactly (GPT-J / GGML interleaving): row r sits at sequence
+        // position startPosition + (r % seqLen); pair (2i, 2i+1) rotates by the angle cached at [pos, i].
+        // Primitive fast paths cast to float/double and rotate with direct arithmetic (no INumericOperations<T>
+        // virtual dispatch), parallelized over rows — this is called per-token per-layer per-step on every
+        // LLaMA-style decoder, so the generic path was a measurable inference tax.
+        if (typeof(T) == typeof(float))
+        {
+            var fIn = (float[])(object)src.GetDataArray();
+            var fCos = (float[])(object)cos.GetDataArray();
+            var fSin = (float[])(object)sin.GetDataArray();
+            var fOut = (float[])(object)outArr;
+            int hd = headDim, half = halfDim, sl = seqLen, sp = startPosition;
+            CpuParallelSettings.ParallelForOrSerial(0, rows, total, row =>
+            {
+                int pos = sp + (row % sl);
+                int baseIdx = row * hd;
+                int cacheBase = pos * half;
+                for (int i = 0; i < half; i++)
+                {
+                    float c = fCos[cacheBase + i];
+                    float sn = fSin[cacheBase + i];
+                    float xEven = fIn[baseIdx + 2 * i];
+                    float xOdd = fIn[baseIdx + 2 * i + 1];
+                    fOut[baseIdx + 2 * i] = xEven * c - xOdd * sn;
+                    fOut[baseIdx + 2 * i + 1] = xEven * sn + xOdd * c;
+                }
+            });
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var dIn = (double[])(object)src.GetDataArray();
+            var dCos = (double[])(object)cos.GetDataArray();
+            var dSin = (double[])(object)sin.GetDataArray();
+            var dOut = (double[])(object)outArr;
+            int hd = headDim, half = halfDim, sl = seqLen, sp = startPosition;
+            CpuParallelSettings.ParallelForOrSerial(0, rows, total, row =>
+            {
+                int pos = sp + (row % sl);
+                int baseIdx = row * hd;
+                int cacheBase = pos * half;
+                for (int i = 0; i < half; i++)
+                {
+                    double c = dCos[cacheBase + i];
+                    double sn = dSin[cacheBase + i];
+                    double xEven = dIn[baseIdx + 2 * i];
+                    double xOdd = dIn[baseIdx + 2 * i + 1];
+                    dOut[baseIdx + 2 * i] = xEven * c - xOdd * sn;
+                    dOut[baseIdx + 2 * i + 1] = xEven * sn + xOdd * c;
+                }
+            });
+        }
+        else
+        {
+            var inSpan = src.AsSpan();
+            var cosSpan = cos.AsSpan();
+            var sinSpan = sin.AsSpan();
+            var numOps = MathHelper.GetNumericOperations<T>();
+            for (int row = 0; row < rows; row++)
+            {
+                int pos = startPosition + (row % seqLen);
+                int baseIdx = row * headDim;
+                int cacheBase = pos * halfDim;
+                for (int i = 0; i < halfDim; i++)
+                {
+                    T c = cosSpan[cacheBase + i];
+                    T sn = sinSpan[cacheBase + i];
+                    T xEven = inSpan[baseIdx + 2 * i];
+                    T xOdd = inSpan[baseIdx + 2 * i + 1];
+                    outArr[baseIdx + 2 * i] = numOps.Subtract(numOps.Multiply(xEven, c), numOps.Multiply(xOdd, sn));
+                    outArr[baseIdx + 2 * i + 1] = numOps.Add(numOps.Multiply(xEven, sn), numOps.Multiply(xOdd, c));
+                }
+            }
+        }
+
+        var outShape = new int[rank];
+        for (int i = 0; i < rank; i++) outShape[i] = input._shape[i];
+        var result = new Tensor<T>(outArr, outShape);
+
+        // RoPE is an orthogonal rotation, so it is differentiable: record on the tape (when active) with an
+        // inverse-rotation backward so the op is safe under any caller, not just the inference fast-path.
+        DifferentiableOps.RecordIfActive("ApplyRoPEInterleaved", result, new[] { input },
+            BackwardFunctions<T>.ApplyRoPEInterleavedBackward,
+            new object[] { cos, sin, startPosition });
+
+        return result;
+    }
+
     public virtual Tensor<T> RMSNorm<T>(Tensor<T> input, Tensor<T> gamma, double epsilon, out Tensor<T> rms)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
@@ -26281,6 +26389,83 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Attention(Q, K, V) = softmax(Q @ K^T / sqrt(d_k)) @ V
     /// From "Attention Is All You Need" (Vaswani et al., 2017)
     /// </summary>
+    /// <inheritdoc/>
+    public virtual Tensor<T> ScaledDotProductAttentionGqa<T>(
+        Tensor<T> query, Tensor<T> key, Tensor<T> value, double scale, bool isCausal, double softcap = 0.0)
+    {
+        if (query == null) throw new ArgumentNullException(nameof(query));
+        if (key == null) throw new ArgumentNullException(nameof(key));
+        if (value == null) throw new ArgumentNullException(nameof(value));
+        if (query._shape.Length != 4 || key._shape.Length != 4 || value._shape.Length != 4)
+            throw new ArgumentException("Q/K/V must be 4D [batch, heads, seq, headDim].");
+
+        int qHeads = query._shape[1];
+        int kvHeads = key._shape[1];
+        if (kvHeads <= 0 || qHeads % kvHeads != 0)
+            throw new ArgumentException($"Query heads ({qHeads}) must be a positive multiple of KV heads ({kvHeads}).");
+
+        // CPU path: materialize the shared KV heads (managed, not on the record path — the GPU engine overrides
+        // this to the fused GQA kernel that broadcasts inside the kernel with no copy), then run standard SDPA.
+        Tensor<T> k = qHeads == kvHeads ? key : BroadcastKvHeads(key, qHeads);
+        Tensor<T> v = qHeads == kvHeads ? value : BroadcastKvHeads(value, qHeads);
+
+        Tensor<bool>? mask = null;
+        if (isCausal)
+        {
+            // The SDPA reads mask[b, h, i, j] with explicit head/batch indices, so materialize the full shape
+            // (the same causal plane is shared across batch and heads). true = key visible to this query.
+            // The mask depends only on (batch, qHeads, seqQ, seqK), so cache it by shape: steady-state prefill
+            // (constant shape) reuses one immutable tensor instead of allocating + filling batch·qHeads·seqQ·seqK
+            // bools every forward. Decode grows seqK by one each step, so those shapes are distinct (bounded set).
+            int batch = query._shape[0];
+            int seqQ = query._shape[2];
+            int seqK = k._shape[2];
+            mask = _gqaCausalMaskCache.GetOrAdd((batch, qHeads, seqQ, seqK), static key =>
+            {
+                var (b0, h0, sq, sk) = key;
+                int offset = sk - sq; // KV-cache offset: query i is at absolute key position i + offset.
+                var maskData = new bool[b0 * h0 * sq * sk];
+                int idx = 0;
+                for (int b = 0; b < b0; b++)
+                    for (int h = 0; h < h0; h++)
+                        for (int i = 0; i < sq; i++)
+                            for (int j = 0; j < sk; j++)
+                                maskData[idx++] = j <= i + offset;
+                return new Tensor<bool>(maskData, new[] { b0, h0, sq, sk });
+            });
+        }
+
+        return ScaledDotProductAttention(query, k, v, mask, scale, out _, softcap);
+    }
+
+    // Causal mask is a pure function of (batch, qHeads, seqQ, seqK); cache the materialized tensor so
+    // steady-state same-shape forwards reuse it instead of re-allocating. The cached tensors are treated
+    // as read-only by the SDPA kernel.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(int, int, int, int), Tensor<bool>>
+        _gqaCausalMaskCache = new();
+
+    // Repeats each KV head across its query-head group: [batch, kvHeads, seq, headDim] -> [batch, qHeads, seq, headDim].
+    private static Tensor<T> BroadcastKvHeads<T>(Tensor<T> kv, int qHeads)
+    {
+        int batch = kv._shape[0], kvHeads = kv._shape[1], seq = kv._shape[2], headDim = kv._shape[3];
+        int group = qHeads / kvHeads;
+        var src = kv.IsContiguous ? kv : kv.Contiguous();
+        var srcSpan = src.AsSpan();
+        int perHead = seq * headDim;
+        var outArr = new T[batch * qHeads * perHead];
+        for (int b = 0; b < batch; b++)
+        {
+            for (int h = 0; h < qHeads; h++)
+            {
+                int kvh = h / group;
+                int srcOff = (b * kvHeads + kvh) * perHead;
+                int dstOff = (b * qHeads + h) * perHead;
+                srcSpan.Slice(srcOff, perHead).CopyTo(new Span<T>(outArr, dstOff, perHead));
+            }
+        }
+        return new Tensor<T>(outArr, new[] { batch, qHeads, seq, headDim });
+    }
+
     public Tensor<T> ScaledDotProductAttention<T>(
         Tensor<T> query,
         Tensor<T> key,

@@ -1114,23 +1114,53 @@ kernel void attention_forward_serial(
     constant uint& batch [[buffer(6)]], constant uint& heads [[buffer(7)]], constant uint& queryLength [[buffer(8)]], constant uint& keyLength [[buffer(9)]],
     constant uint& dimension [[buffer(10)]], constant uint& scaleBits [[buffer(11)]], constant uint& causal [[buffer(12)]],
     constant uint& hasWeights [[buffer(13)]], constant uint& maskMode [[buffer(14)]], constant uint& softcapBits [[buffer(15)]],
+    constant uint& numKVHeads [[buffer(16)]],
     uint gid [[thread_position_in_grid]])
 {
     if (gid != 0u) return; float scale = as_type<float>(scaleBits); float softcap = as_type<float>(softcapBits);
+    // GQA: query head h shares KV head h / (heads/numKVHeads); numKVHeads==heads collapses to MHA.
+    uint kvGroup = heads / numKVHeads;
     for (uint b = 0; b < batch; ++b) for (uint h = 0; h < heads; ++h) {
         uint queryOffset = (b * heads + h) * queryLength * dimension;
-        uint keyOffset = (b * heads + h) * keyLength * dimension;
+        uint keyOffset = (b * numKVHeads + h / kvGroup) * keyLength * dimension;
         uint weightOffset = (b * heads + h) * queryLength * keyLength;
         uint maskOffset = (maskMode == 2u ? (b * heads + h) * queryLength * keyLength : 0u);
         for (uint i = 0; i < queryLength; ++i) {
+            // KV-cache causal offset: query i is at absolute position i + (keyLength - queryLength); queryLength
+            // ==keyLength collapses to j > i (prefill), decode attends to the whole cached prefix.
+            uint qPos = i + (keyLength - queryLength);
             float maximum = -INFINITY;
-            for (uint j = 0; j < keyLength; ++j) { float score = resident_attention_dot(query, key, queryOffset + i * dimension, keyOffset + j * dimension, dimension) * scale; if (softcap > 0.0f) score = softcap * tanh(score / softcap); if ((causal != 0u && j > i) || (maskMode != 0u && mask[maskOffset + i * keyLength + j] == 0.0f)) score = -INFINITY; maximum = max(maximum, score); }
+            for (uint j = 0; j < keyLength; ++j) { float score = resident_attention_dot(query, key, queryOffset + i * dimension, keyOffset + j * dimension, dimension) * scale; if (softcap > 0.0f) score = softcap * tanh(score / softcap); if ((causal != 0u && j > qPos) || (maskMode != 0u && mask[maskOffset + i * keyLength + j] == 0.0f)) score = -INFINITY; maximum = max(maximum, score); }
             float sumExp = 0.0f;
-            for (uint j = 0; j < keyLength; ++j) { float score = resident_attention_dot(query, key, queryOffset + i * dimension, keyOffset + j * dimension, dimension) * scale; if (softcap > 0.0f) score = softcap * tanh(score / softcap); if ((causal != 0u && j > i) || (maskMode != 0u && mask[maskOffset + i * keyLength + j] == 0.0f)) score = -INFINITY; sumExp += exp(score - maximum); }
-            for (uint j = 0; j < keyLength; ++j) { float score = resident_attention_dot(query, key, queryOffset + i * dimension, keyOffset + j * dimension, dimension) * scale; if (softcap > 0.0f) score = softcap * tanh(score / softcap); if ((causal != 0u && j > i) || (maskMode != 0u && mask[maskOffset + i * keyLength + j] == 0.0f)) score = -INFINITY; float weight = sumExp > 0.0f ? exp(score - maximum) / sumExp : 0.0f; if (hasWeights != 0u) weights[weightOffset + i * keyLength + j] = weight; }
-            for (uint d = 0; d < dimension; ++d) { float sum = 0.0f; for (uint j = 0; j < keyLength; ++j) { float score = resident_attention_dot(query, key, queryOffset + i * dimension, keyOffset + j * dimension, dimension) * scale; if (softcap > 0.0f) score = softcap * tanh(score / softcap); if ((causal != 0u && j > i) || (maskMode != 0u && mask[maskOffset + i * keyLength + j] == 0.0f)) score = -INFINITY; sum += (sumExp > 0.0f ? exp(score - maximum) / sumExp : 0.0f) * value[keyOffset + j * dimension + d]; } output[queryOffset + i * dimension + d] = sum; }
+            for (uint j = 0; j < keyLength; ++j) { float score = resident_attention_dot(query, key, queryOffset + i * dimension, keyOffset + j * dimension, dimension) * scale; if (softcap > 0.0f) score = softcap * tanh(score / softcap); if ((causal != 0u && j > qPos) || (maskMode != 0u && mask[maskOffset + i * keyLength + j] == 0.0f)) score = -INFINITY; sumExp += exp(score - maximum); }
+            for (uint j = 0; j < keyLength; ++j) { float score = resident_attention_dot(query, key, queryOffset + i * dimension, keyOffset + j * dimension, dimension) * scale; if (softcap > 0.0f) score = softcap * tanh(score / softcap); if ((causal != 0u && j > qPos) || (maskMode != 0u && mask[maskOffset + i * keyLength + j] == 0.0f)) score = -INFINITY; float weight = sumExp > 0.0f ? exp(score - maximum) / sumExp : 0.0f; if (hasWeights != 0u) weights[weightOffset + i * keyLength + j] = weight; }
+            for (uint d = 0; d < dimension; ++d) { float sum = 0.0f; for (uint j = 0; j < keyLength; ++j) { float score = resident_attention_dot(query, key, queryOffset + i * dimension, keyOffset + j * dimension, dimension) * scale; if (softcap > 0.0f) score = softcap * tanh(score / softcap); if ((causal != 0u && j > qPos) || (maskMode != 0u && mask[maskOffset + i * keyLength + j] == 0.0f)) score = -INFINITY; sum += (sumExp > 0.0f ? exp(score - maximum) / sumExp : 0.0f) * value[keyOffset + j * dimension + d]; } output[queryOffset + i * dimension + d] = sum; }
         }
     }
+}
+
+// Fused interleaved RoPE (GPT-NeoX / LLaMA / GGML). One thread per (row, pair).
+// cos/sin are [maxSeq, headDim/2] indexed by absolute position (startPosition + rowWithinSequence).
+kernel void rope_interleaved(
+    device const float* input [[buffer(0)]], device const float* cosCache [[buffer(1)]], device const float* sinCache [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& rows [[buffer(4)]], constant uint& headDim [[buffer(5)]], constant uint& seqLen [[buffer(6)]], constant uint& startPosition [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint halfDim = headDim / 2u;
+    if (gid >= rows * halfDim) return;
+    uint i = gid % halfDim;
+    uint row = gid / halfDim;
+    uint s = row % seqLen;
+    uint pos = startPosition + s;
+    uint baseIdx = row * headDim;
+    uint cacheIdx = pos * halfDim + i;
+    float c = cosCache[cacheIdx];
+    float sn = sinCache[cacheIdx];
+    float xEven = input[baseIdx + 2u * i];
+    float xOdd = input[baseIdx + 2u * i + 1u];
+    output[baseIdx + 2u * i] = xEven * c - xOdd * sn;
+    output[baseIdx + 2u * i + 1u] = xEven * sn + xOdd * c;
 }
 
 kernel void attention_backward_serial(
