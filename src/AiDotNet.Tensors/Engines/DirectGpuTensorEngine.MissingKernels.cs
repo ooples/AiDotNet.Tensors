@@ -2559,6 +2559,28 @@ public partial class DirectGpuTensorEngine
     Tensor<T> IEngine.PositionalEncoding<T>(Tensor<T> positions, int numFrequencies)
     {
         if (positions is null) throw new ArgumentNullException(nameof(positions));
+        // OPEN, and NOT a logic defect — characterised 2026-07-20 so the decision is informed.
+        //
+        // PositionalEncoding[4,3;f4] is the last forward-parity failure, at
+        //     maxUlp 415, maxAbs 1.192E-06, maxRel 3.189E-05
+        //     oracle drift: CPU 89 ULP vs GPU 379 ULP, tolerance 64 ULP
+        // I first called this accumulation-order drift. It is not. NeRFOperations.PositionalEncoding
+        // computes in DOUBLE even when T is float:
+        //     double value = numOps.ToDouble(...); double angle = frequencies[l] * value;
+        //     result[idx] = numOps.FromDouble(Math.Sin(angle));
+        // so the CPU reference is double-precision math rounded once at the end. That is why it sits at
+        // 89 ULP while a float GPU path sits at 379 — intermediate PRECISION, not summation order.
+        //
+        // The GPU already emulates this: the high/low buffers below are a two-product (Dekker) split with
+        // the angle-addition identities sin(h+l) = sin h cos l + cos h sin l and
+        // cos(h+l) = cos h cos l - sin h sin l. It closes most of the gap but not to 64 ULP.
+        //
+        // Remaining options, both with real costs — deliberately NOT chosen here:
+        //   (a) compute the angle and trig in fp64 in the kernel. Matches the reference, but fp64 is 1/64
+        //       rate on this consumer card and PositionalEncoding is a NeRF inner loop over many points.
+        //   (b) widen this case's tolerance from 64 ULP. Legitimate only if 1.19E-06 absolute is
+        //       acceptable for the op's users — a product call, not a test-hygiene one.
+        // Do not "fix" this by quietly relaxing the tolerance.
         if (typeof(T) != typeof(float) || positions.Rank != 2 || numFrequencies <= 0
             || !positions.IsContiguous || !TryGetBackend(out var backend))
             return base.PositionalEncoding(positions, numFrequencies);
