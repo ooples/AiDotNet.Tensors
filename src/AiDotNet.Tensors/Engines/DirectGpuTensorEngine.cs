@@ -20630,10 +20630,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var output = DeferTensorResult<T>(backend, outBuf.Buffer, x.Length, x.Shape.ToArray());
             // Same byte[] 0/1 encoding CpuEngine records. WhereBackward accepts Tensor<T> or byte[];
             // handing it a Tensor<Bit> matches neither and falls through to the wrong branch.
-            var condBytes = new byte[condition.Length];
-            for (int i = 0; i < condBytes.Length; i++) condBytes[i] = (bool)condition[i] ? (byte)1 : (byte)0;
+            //
+            // Build it ONLY when a tape will consume it. Indexing the mask element-by-element pulls a
+            // GPU-resident Bit tensor back to the host, and this line was the single call site behind
+            // ALL 11 entries on the internal-readback worklist (every comparison op reaches Where, each
+            // showing 1 transfer before materialization). RecordBinary returns immediately when no tape
+            // is recording, so with no tape the array was pure waste that also broke residency. With a
+            // tape it is built exactly as before, so backward behaviour is unchanged.
+            object[]? savedState = null;
+            if (IsTapeActive<T>())
+            {
+                var condBytes = new byte[condition.Length];
+                for (int i = 0; i < condBytes.Length; i++) condBytes[i] = (bool)condition[i] ? (byte)1 : (byte)0;
+                savedState = new object[] { condBytes };
+            }
             Autodiff.DifferentiableOps.RecordBinary("TensorWhere", output, x, y,
-                Autodiff.BackwardFunctions<T>.WhereBackward, new object[] { condBytes });
+                Autodiff.BackwardFunctions<T>.WhereBackward, savedState);
             return output;
         }
         catch (Exception)
