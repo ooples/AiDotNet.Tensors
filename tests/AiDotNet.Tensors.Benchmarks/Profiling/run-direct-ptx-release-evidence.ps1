@@ -6,6 +6,8 @@ param(
     [switch]$SkipBuild,
     [switch]$SkipExternal,
     [switch]$Issue834Only,
+    [ValidateRange(0, 10)]
+    [int]$ContaminationRetries = 4,
     [switch]$AllowDirty
 )
 
@@ -140,32 +142,65 @@ try {
         for ($run = 1; $run -le $Runs; $run++) {
             foreach ($suite in $suites) {
                 $label = "run-$('{0:D2}' -f $run)-$($suite.Name)"
-                Assert-GpuReady "$label-start"
-                $log = Join-Path $evidenceRoot ("{0}.log" -f $label)
-                "# independent process $run/$Runs; suite=$($suite.Name); started_utc=$([DateTime]::UtcNow.ToString('O'))" |
-                    Set-Content -LiteralPath $log -Encoding utf8
-                "# git_commit=$gitCommit; dirty_worktree=$($dirtyLines.Count -ne 0); AIDOTNET_DIRECT_PTX=1; AIDOTNET_DIRECT_PTX_AUTOTUNE=0" |
-                    Add-Content -LiteralPath $log -Encoding utf8
-                "# host_os=$([System.Runtime.InteropServices.RuntimeInformation]::OSDescription); powershell=$($PSVersionTable.PSVersion); dotnet=$(& dotnet --version)" |
-                    Add-Content -LiteralPath $log -Encoding utf8
-                "# GPU name, uuid, driver, pstate, SM MHz, memory MHz, C, W, limit W, utilization %, memory MiB: $(Get-GpuSnapshot)" |
-                    Add-Content -LiteralPath $log -Encoding utf8
-                "# command=$(Format-Command $suite.Command $suite.Arguments)" |
-                    Add-Content -LiteralPath $log -Encoding utf8
+                $captured = $false
+                for ($attempt = 1; $attempt -le 1 + $ContaminationRetries; $attempt++) {
+                    $ready = $false
+                    for ($poll = 1; $poll -le 15; $poll++) {
+                        try {
+                            Assert-GpuReady "$label-start"
+                            $ready = $true
+                            break
+                        }
+                        catch {
+                            if ($poll -eq 15) { throw }
+                            Start-Sleep -Seconds 2
+                        }
+                    }
+                    if (-not $ready) { throw "GPU readiness polling ended unexpectedly for '$label'." }
 
-                # Keep the GPU-accelerated terminal out of the measured interval.
-                # The complete TUI is emitted only to the immutable process log.
-                $arguments = $suite.Arguments
-                & $suite.Command @arguments 2>&1 |
-                    Out-File -LiteralPath $log -Append -Encoding utf8
-                $exitCode = $LASTEXITCODE
-                Assert-GpuReady "$label-end" -AfterSuite
-                "# ending_gpu=$(Get-GpuSnapshot)" | Add-Content -LiteralPath $log -Encoding utf8
-                "# completed_utc=$([DateTime]::UtcNow.ToString('O')); exit_code=$exitCode" |
-                    Add-Content -LiteralPath $log -Encoding utf8
-                if ($exitCode -ne 0) {
-                    throw "Evidence suite '$($suite.Name)' run $run failed with exit code $exitCode. See '$log'."
+                    $log = Join-Path $evidenceRoot ("{0}.log" -f $label)
+                    "# independent process $run/$Runs; suite=$($suite.Name); attempt=$attempt; started_utc=$([DateTime]::UtcNow.ToString('O'))" |
+                        Set-Content -LiteralPath $log -Encoding utf8
+                    "# git_commit=$gitCommit; dirty_worktree=$($dirtyLines.Count -ne 0); AIDOTNET_DIRECT_PTX=1; AIDOTNET_DIRECT_PTX_AUTOTUNE=0" |
+                        Add-Content -LiteralPath $log -Encoding utf8
+                    "# host_os=$([System.Runtime.InteropServices.RuntimeInformation]::OSDescription); powershell=$($PSVersionTable.PSVersion); dotnet=$(& dotnet --version)" |
+                        Add-Content -LiteralPath $log -Encoding utf8
+                    "# GPU name, uuid, driver, pstate, SM MHz, memory MHz, C, W, limit W, utilization %, memory MiB: $(Get-GpuSnapshot)" |
+                        Add-Content -LiteralPath $log -Encoding utf8
+                    "# command=$(Format-Command $suite.Command $suite.Arguments)" |
+                        Add-Content -LiteralPath $log -Encoding utf8
+
+                    # Keep the GPU-accelerated terminal out of the measured interval.
+                    # The complete TUI is emitted only to the immutable process log.
+                    $arguments = $suite.Arguments
+                    & $suite.Command @arguments 2>&1 |
+                        Out-File -LiteralPath $log -Append -Encoding utf8
+                    $exitCode = $LASTEXITCODE
+                    "# ending_gpu=$(Get-GpuSnapshot)" | Add-Content -LiteralPath $log -Encoding utf8
+                    "# completed_utc=$([DateTime]::UtcNow.ToString('O')); exit_code=$exitCode" |
+                        Add-Content -LiteralPath $log -Encoding utf8
+                    if ($exitCode -ne 0) {
+                        throw "Evidence suite '$($suite.Name)' run $run failed with exit code $exitCode. See '$log'."
+                    }
+
+                    $contamination = $null
+                    try { Assert-GpuReady "$label-end" -AfterSuite }
+                    catch { $contamination = $_.Exception.Message }
+                    if ($contamination) {
+                        "# rejected_environment=$contamination" | Add-Content -LiteralPath $log -Encoding utf8
+                        $rejected = Join-Path $evidenceRoot ("{0}-attempt-{1:D2}.rejected.txt" -f $label, $attempt)
+                        Move-Item -LiteralPath $log -Destination $rejected -Force
+                        if ($attempt -gt $ContaminationRetries) {
+                            throw "Evidence suite '$($suite.Name)' run $run remained contaminated after $attempt attempts. Last reason: $contamination"
+                        }
+                        Start-Sleep -Seconds 2
+                        continue
+                    }
+
+                    $captured = $true
+                    break
                 }
+                if (-not $captured) { throw "No clean evidence was captured for '$label'." }
             }
         }
     }
@@ -178,11 +213,16 @@ try {
         $hash = Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256
         [ordered]@{ file = $_.Name; sha256 = $hash.Hash.ToLowerInvariant() }
     }
+    $rejectedFiles = Get-ChildItem -LiteralPath $evidenceRoot -Filter '*.rejected.txt' | Sort-Object Name | ForEach-Object {
+        $hash = Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256
+        [ordered]@{ file = $_.Name; sha256 = $hash.Hash.ToLowerInvariant() }
+    }
     $manifest = [ordered]@{
         generated_utc = [DateTime]::UtcNow.ToString('O')
         git_commit = $gitCommit
         dirty_worktree = $dirtyLines.Count -ne 0
         requested_independent_runs = $Runs
+        contamination_retries_per_suite = $ContaminationRetries
         issue_834_only = [bool]$Issue834Only
         external_gpu_baselines_included = -not [bool]$SkipExternal
         feature_gates = [ordered]@{
@@ -194,6 +234,7 @@ try {
             suites = @($suites | ForEach-Object { Format-Command $_.Command $_.Arguments })
         }
         files = @($files)
+        rejected_environment_attempts = @($rejectedFiles)
     } | ConvertTo-Json -Depth 5
     $manifestPath = Join-Path $evidenceRoot 'manifest.json'
     [System.IO.File]::WriteAllText($manifestPath, $manifest + [Environment]::NewLine)
