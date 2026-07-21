@@ -6,8 +6,8 @@ Baseline: `b386d35` plus the working-tree experiment described here
 ## Verdict
 
 The forward-inference experiment is implemented end to end for NVIDIA SM80+
-and the declared shape family. A separate deterministic FP32
-materialized-probability backward family is implemented for Ampere SM86:
+and the declared shape family. Deterministic FP32 materialized-probability
+and Flash/LSE-recomputation backward families are implemented for Ampere SM86:
 
 ```text
 FP16 Q/K/V, dense BHSD, Sq and Skv independently in {16,32,64,128}, D=64
@@ -32,7 +32,7 @@ repeated one-launch host captures on this display GPU. The fused experiment
 therefore clears the competition gate; the attention-only saturation case
 remains an optimization lane rather than a robust universal win. These claims
 apply only to this GPU, dtype, shape family, and semantic contract—not other
-GPUs, dimensions, dropout, arbitrary masks, or backward.
+GPUs, dimensions, dropout, arbitrary masks, or undeclared backward variants.
 
 The issue-#834 v3 expansion generalizes the previously square/equal-head
 emitter to rectangular attention and shared KV heads. Its correctness and
@@ -52,7 +52,7 @@ missing or duplicate assignment.
 | ScaledDotProductAttention | `scaled_dot_product_attention` | v3 weight-free dense FP16 inference implemented; weights/masks/softcap planned |
 | ScaledDotProductAttentionBackward | GEMM + softmax-backward composition | v1 deterministic materialized-probability FP32 D64 MHA backward implemented; recomputation planned |
 | FlashAttention / FlashAttentionV2 | `flash_attention_v2` | v3 rectangular dense FP16, LSE, no-bias route implemented |
-| FlashAttentionBackward | atomic and deterministic NVRTC variants | atomic/deterministic direct-PTX families planned |
+| FlashAttentionBackward | atomic and deterministic NVRTC variants | v1 deterministic FP32 D64 LSE-recomputation MHA implemented for no-bias unmasked/causal; remaining semantics planned |
 | GroupedQueryAttention | `grouped_query_attention` | v3 weight-free GQA/MQA inference implemented; weights mode planned |
 | GroupedQueryAttentionBackward | atomic and deterministic NVRTC variants | v1 deterministic materialized-probability FP32 D64 GQA/MQA backward implemented; recomputation planned |
 | FlashDecode | `flash_decode_partial` + `flash_decode_reduce` | v1 register-online D64 FP32 MHA/GQA/MQA decode implemented for S=16/32/64/128; explicit split hints fall back |
@@ -364,12 +364,41 @@ adding shared-memory staging or Tensor Core packing; those mechanisms remain
 appropriate for the existing FP16 tile-matrix family.
 
 Backward is intentionally a different blueprint rather than a branch in the
-forward hot loop. The v1 public backward APIs already provide materialized
-probabilities, so an online-softmax forward recurrence cannot eliminate that
-input. The kernel instead eliminates derivative-score matrices, transpose
-buffers, atomics, dynamic strides, and intermediate allocation. A future
-`FlashAttentionBackward` specialization will recompute probabilities from
-Q/K plus LSE and is tracked separately in the coverage manifest.
+forward hot loop. The v1 SDPA/GQA public backward APIs provide materialized
+probabilities, so that family consumes the probability tensor while eliminating
+derivative-score matrices, transpose buffers, atomics, dynamic strides, and
+intermediate allocation.
+
+`FlashAttentionBackward` instead uses the actual Flash pattern: it recomputes
+each probability from Q/K and the forward LSE statistic. Two deterministic
+non-atomic entry points assign one warp to a dQ row or dK/dV row. QK, dO.V,
+softmax-gradient reduction, dQ/dK accumulation, and dV accumulation stay in
+registers; only final dQ/dK/dV vectors are written. It has no SxS score or
+probability buffer, temporary allocation, stride argument, shared/local memory,
+or atomics. The currently admitted family is FP32 BHSD, D=64, MHA,
+Sq/Skv independently in {16,32,64,128}, unmasked or top-left causal, no bias.
+
+### Flash/LSE recomputation-backward evidence
+
+The in-process championship uses CUDA events for the raw production gate and
+also reports one-launch synchronized E2E latency. Device samples average ten
+back-to-back launches. Across three independent RTX 3080 runs, every paired
+AiDotNet gate passed (>=1.10x median, bounded p95, zero allocation, numerical
+tolerance, and zero local bytes).
+
+| Shape | Direct worst device median / p95 (us) | Current best device median / p95 (us) | Minimum paired median win | Direct peak GFLOPS | Direct worst E2E median / p95 (us) | PyTorch Efficient best E2E median / p95 (us) | Direct B/call | PyTorch peak bytes | Max direct error |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| H8, Sq16, Skv16 | 30.92 / 56.63 | 141.31 / 145.72 | 4.59x | 39.40 | 43.50 / 99.70 | 369.40 / 586.00 | 0 | 263,168 | 3.725e-8 |
+| H8, Sq16, Skv32 | 29.59 / 55.91 | 230.71 / 263.78 | 7.80x | 75.57 | 49.80 / 98.90 | 352.90 / 628.50 | 0 | 328,704 | 1.863e-8 |
+| H8, Sq32, Skv32, causal | 38.40 / 62.57 | 337.72 / 365.06 | 8.95x | 135.63 | 45.10 / 90.30 | 328.60 / 517.40 | 0 | 394,752 | 1.490e-7 |
+| H8, Sq64, Skv64, causal | 46.69 / 66.97 | 1,010.48 / 1,064.86 | 22.29x | 376.64 | 63.50 / 82.50 | 336.20 / 557.20 | 0 | 659,456 | 1.192e-7 |
+
+“Worst” and “best” are conservative extrema across the three captures, while
+the minimum win is calculated within paired runs. GFLOPS is the best observed
+direct device throughput and counts `8*H*Sq*Skv*D` useful backward FLOPs. The
+forced PyTorch cuDNN and Flash lanes explicitly skipped: FP32 is unsupported by
+cuDNN attention here and this Windows wheel has no FlashAttention kernel.
+Efficient and Math ran natively; no fallback was relabeled as a competitor.
 
 ## Runtime and feature gate
 
@@ -393,7 +422,8 @@ Production integration is fail-closed:
   `AIDOTNET_DIRECT_PTX_FLASH_DECODE=1`, or
   `AIDOTNET_DIRECT_PTX_PAGED_DECODE=1`, or
   `AIDOTNET_DIRECT_PTX_PAGED_PREFILL=1`, or
-  `AIDOTNET_DIRECT_PTX_ATTENTION_BACKWARD=1` to admit only that family.
+  `AIDOTNET_DIRECT_PTX_ATTENTION_BACKWARD=1`, or
+  `AIDOTNET_DIRECT_PTX_FLASH_ATTENTION_BACKWARD=1` to admit only that family.
 - SM < 8.0, unsupported shape/dtype/layout, bias, active autodiff tape, stream
   capture, JIT failure, or launch failure falls back to the existing path.
 - The runtime borrows the existing `CudaBackend` context and stream, so
@@ -418,7 +448,8 @@ The implemented token is `DirectPtxTensorView`:
 - zero logical storage offset and exact logical backing extent at the tensor
   boundary;
 - FP16 physical Q/K/V and FP32 output/stats/gamma/beta;
-- backward uses exact-extent FP32 BHSD tensors and FP32 BHSqSkv probabilities;
+- materialized backward uses exact-extent FP32 BHSD tensors and FP32 BHSqSkv
+  probabilities; Flash backward uses exact-extent FP32 BHSD plus FP32 BHSq LSE;
 - at least 16-byte device-pointer alignment;
 - sufficient byte extent and dtype-compatible extent;
 - no stride fields and no shape fields passed to PTX.
@@ -446,6 +477,8 @@ The final S=128 functions on this RTX 3080 report:
 |---|---:|---:|---:|
 | Unmasked | 66 | 25,088 bytes | 0 |
 | Causal | 80 | 25,088 bytes | 0 |
+| Flash backward dQ | 29 | 0 bytes | 0 |
+| Flash backward dK/dV | 33 | 0 bytes | 0 |
 
 `local bytes/thread = 0` is direct runtime evidence that this JIT result has
 no local stack or register-spill allocation. Tests carry the value through
@@ -489,7 +522,8 @@ attribute remains the available zero-spill admission proof for this capture.
 | Causal future K/V tile | Compute skipped per owning query warp |
 | Inference output-only | No score, probability, or LSE global store |
 | Materialized-probability backward, FP32 D64, supported shape/head map | Three-entry deterministic direct PTX; final dQ allocation supplies the row-delta workspace |
-| Flash/recomputation backward, unsupported dtype/D/shape, or invalid explicit GQA map | Existing CUDA implementation with an exact rejection reason |
+| Flash/recomputation backward, FP32 D64 MHA, Sq/Skv=16/32/64/128, no bias | Two-entry deterministic direct PTX; probabilities recomputed from Q/K/LSE; no scratch |
+| Flash/recomputation backward with bias, unsupported dtype/D/shape, or GQA | Existing CUDA implementation with an exact rejection reason |
 
 ## Reusable kernel assembly line
 
@@ -540,6 +574,8 @@ The reusable code layers are:
   causal paged traversal, online recurrence, and single final vector store.
 - `PtxFusedAttentionBackwardD64Kernel`: deterministic row-delta, key-owned
   dK/dV, and query-owned dQ entry points with output-workspace reuse.
+- `PtxFlashAttentionBackwardD64Kernel`: deterministic LSE-recomputation dQ and
+  dK/dV entry points with no materialized probability or scratch tensor.
 - `CudaBackend.DirectPtx`: production cache, existing stream/context, audit,
   fallback, and teardown.
 - `DirectPtxWmmaTests`: structural, scalar-oracle, layout, gate, borrowed-
@@ -557,7 +593,7 @@ copied into another one-off emitter.
 | Autotuned dispatch | Attention tries valid query-warp variants, persists the winner through the existing autotune cache, keys it by GPU UUID/SM/driver and semantics, and bounds loaded modules with an LRU | A clean production release run still requires three independent captures |
 | Stronger spill proof | Runtime admission enforces register/shared/local budgets and records PTX SHA-256, JIT attributes, occupancy, GPU fingerprint, and log; an Nsight CSV parser and deterministic profile target enforce executed spill/local counters | Nsight attached, but `ERR_NVGPUCTRPERM` blocks counter access until enabled by the host administrator |
 | Hardened performance gate | Policy requires >=1.10x median, bounded p95, zero hot managed/device temporary bytes, numerical tolerance, zero local bytes, and three independent runs | Windows display scheduling can hold an otherwise fast candidate |
-| Expanded correctness | Rectangular Sq/Skv D64 FP16 attention, D64 FP32 dense/paged decode, causal D64 FP32 paged prefill, and deterministic materialized-probability D64 FP32 backward admit tested MHA/GQA/MQA buckets; explicit reasons cover dtype, D, invalid head maps, page geometry, mask, dropout, phase, and ragged requests | BF16, non-causal/arbitrary-mask prefill, Flash/recomputation backward, and ragged semantics remain implementation work |
+| Expanded correctness | Rectangular Sq/Skv D64 FP16 attention, D64 FP32 dense/paged decode, causal D64 FP32 paged prefill, deterministic materialized-probability D64 FP32 backward, and deterministic no-bias Flash/LSE-recomputation D64 FP32 backward admit their tested buckets; explicit reasons cover dtype, D, invalid head maps, page geometry, mask, bias, dropout, phase, and ragged requests | BF16, arbitrary-mask prefill/backward, additive-bias Flash backward, Flash GQA, and ragged semantics remain implementation work |
 | Real second fusion | `residual + RMSNorm(D=64)` is one warp-owned reduction/fusion using the same ABI, audit, gate, cache, graph-prewarm, tests, and benchmark framework | QKV projection/RoPE remains the next tensor-core fusion |
 | Architecture families | Ampere, Ada, Hopper, and Blackwell are distinct dispatch domains | Only Ampere SM86 was executed here; other families deliberately reject rather than inherit Ampere tuning |
 
@@ -653,6 +689,9 @@ tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-ncu.ps1 `
 
 tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-ncu.ps1 `
   -Target attention-backward -OutputCsv attention-backward-ncu.csv
+
+tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-ncu.ps1 `
+  -Target flash-attention-backward -OutputCsv flash-attention-backward-ncu.csv
 ```
 
 The script profiles a deterministic kernel target and fails unless executed
@@ -702,12 +741,20 @@ dotnet run --project tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmar
 C:\Users\cheat\.cache\aidotnet-direct-ptx-py312\Scripts\python.exe `
   tests/AiDotNet.Tensors.Benchmarks/BaselineRunners/py/run_direct_ptx_attention_backward_competitors.py --runs 3
 
+$env:AIDOTNET_DIRECT_PTX_FLASH_ATTENTION_BACKWARD='1'
+dotnet run --project tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.csproj `
+  -c Release --no-build -- --direct-ptx-flash-attention-backward 3
+
+C:\Users\cheat\.cache\aidotnet-direct-ptx-py312\Scripts\python.exe `
+  tests/AiDotNet.Tensors.Benchmarks/BaselineRunners/py/run_direct_ptx_flash_attention_backward_competitors.py --runs 3
+
 $env:AIDOTNET_DIRECT_PTX_ATTENTION='1'
 $env:AIDOTNET_DIRECT_PTX_RESIDUAL_RMSNORM='1'
 $env:AIDOTNET_DIRECT_PTX_FLASH_DECODE='1'
 $env:AIDOTNET_DIRECT_PTX_PAGED_DECODE='1'
 $env:AIDOTNET_DIRECT_PTX_PAGED_PREFILL='1'
 $env:AIDOTNET_DIRECT_PTX_ATTENTION_BACKWARD='1'
+$env:AIDOTNET_DIRECT_PTX_FLASH_ATTENTION_BACKWARD='1'
 # Or enable all admitted direct kernels:
 $env:AIDOTNET_DIRECT_PTX='1'
 ```

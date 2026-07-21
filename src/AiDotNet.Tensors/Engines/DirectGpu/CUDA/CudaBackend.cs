@@ -8259,6 +8259,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
     {
         using var _ = PushContext();
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxFlashAttentionBackwardD64(
+            gradOutput, query, key, value, output, softmaxStats,
+            gradQuery, gradKey, gradValue,
+            batch, numHeads, seqQ, seqK, headDim, scale, isCausal, attentionBias))
+            return;
+#endif
         int causalFlag = isCausal ? 1 : 0;
         int hasBias = attentionBias is not null ? 1 : 0;
         IntPtr biasPtr = attentionBias is not null ? attentionBias.Handle : IntPtr.Zero;
@@ -8357,6 +8364,111 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[17] = &hasBias;
         args[18] = &biasBatchStride;
 
+        uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
+        LaunchKernel2DWithSharedMem(kernel, gridX, gridY, 32, 1, sharedBytes, args);
+    }
+
+    /// <summary>
+    /// Benchmark-only resident hook for the established NVRTC FlashAttention
+    /// backward. It bypasses direct-PTX routing while retaining the same stream,
+    /// deterministic selection, launch geometry, and public tensor ABI.
+    /// </summary>
+    internal unsafe void FlashAttentionBackwardCurrentInto(
+        IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
+        IGpuBuffer output, IGpuBuffer softmaxStats,
+        IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale,
+        bool isCausal, IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
+    {
+        using var _ = PushContext();
+        int causalFlag = isCausal ? 1 : 0;
+        int hasBias = attentionBias is not null ? 1 : 0;
+        IntPtr biasPtr = attentionBias is not null ? attentionBias.Handle : IntPtr.Zero;
+        IntPtr goPtr = gradOutput.Handle;
+        IntPtr qPtr = query.Handle;
+        IntPtr kPtr = key.Handle;
+        IntPtr vPtr = value.Handle;
+        IntPtr oPtr = output.Handle;
+        IntPtr sPtr = softmaxStats.Handle;
+        IntPtr gqPtr = gradQuery.Handle;
+        IntPtr gkPtr = gradKey.Handle;
+        IntPtr gvPtr = gradValue.Handle;
+
+        if (GpuDeterminism.IsActive)
+        {
+            var kernelQ = _kernelCache["flash_attention_backward_gradq_deterministic"];
+            void** argsQ = stackalloc void*[17];
+            argsQ[0] = &goPtr;
+            argsQ[1] = &qPtr;
+            argsQ[2] = &kPtr;
+            argsQ[3] = &vPtr;
+            argsQ[4] = &oPtr;
+            argsQ[5] = &sPtr;
+            argsQ[6] = &gqPtr;
+            argsQ[7] = &batch;
+            argsQ[8] = &numHeads;
+            argsQ[9] = &seqQ;
+            argsQ[10] = &seqK;
+            argsQ[11] = &headDim;
+            argsQ[12] = &scale;
+            argsQ[13] = &causalFlag;
+            argsQ[14] = &biasPtr;
+            argsQ[15] = &hasBias;
+            argsQ[16] = &biasBatchStride;
+            uint gridQX = (uint)((seqQ + 63) / 64);
+            uint gridQY = (uint)(batch * numHeads);
+            LaunchKernel2D(kernelQ, gridQX, gridQY, 64, 1, argsQ);
+
+            var kernelKV = _kernelCache["flash_attention_backward_gradkv_deterministic"];
+            void** argsKV = stackalloc void*[18];
+            argsKV[0] = &goPtr;
+            argsKV[1] = &qPtr;
+            argsKV[2] = &kPtr;
+            argsKV[3] = &vPtr;
+            argsKV[4] = &oPtr;
+            argsKV[5] = &sPtr;
+            argsKV[6] = &gkPtr;
+            argsKV[7] = &gvPtr;
+            argsKV[8] = &batch;
+            argsKV[9] = &numHeads;
+            argsKV[10] = &seqQ;
+            argsKV[11] = &seqK;
+            argsKV[12] = &headDim;
+            argsKV[13] = &scale;
+            argsKV[14] = &causalFlag;
+            argsKV[15] = &biasPtr;
+            argsKV[16] = &hasBias;
+            argsKV[17] = &biasBatchStride;
+            uint gridKVX = (uint)((headDim + 15) / 16);
+            uint gridKVY = (uint)((seqK + 3) / 4);
+            uint gridKVZ = (uint)(batch * numHeads);
+            LaunchKernel3D(kernelKV, gridKVX, gridKVY, gridKVZ, 16, 4, 1, argsKV);
+            return;
+        }
+
+        var kernel = _kernelCache["flash_attention_backward"];
+        uint gridX = (uint)((seqQ + 31) / 32);
+        uint gridY = (uint)(batch * numHeads);
+        void** args = stackalloc void*[19];
+        args[0] = &goPtr;
+        args[1] = &qPtr;
+        args[2] = &kPtr;
+        args[3] = &vPtr;
+        args[4] = &oPtr;
+        args[5] = &sPtr;
+        args[6] = &gqPtr;
+        args[7] = &gkPtr;
+        args[8] = &gvPtr;
+        args[9] = &batch;
+        args[10] = &numHeads;
+        args[11] = &seqQ;
+        args[12] = &seqK;
+        args[13] = &headDim;
+        args[14] = &scale;
+        args[15] = &causalFlag;
+        args[16] = &biasPtr;
+        args[17] = &hasBias;
+        args[18] = &biasBatchStride;
         uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
         LaunchKernel2DWithSharedMem(kernel, gridX, gridY, 32, 1, sharedBytes, args);
     }
