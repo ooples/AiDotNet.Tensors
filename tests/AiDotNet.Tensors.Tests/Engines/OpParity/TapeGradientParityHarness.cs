@@ -63,6 +63,35 @@ public static class TapeGradientParityHarness
         };
 
     /// <summary>
+    /// MINIMAL REPRODUCTION for the remaining TensorNormalize / TensorSquash failures (2026-07-20).
+    /// </summary>
+    /// <remarks>
+    /// Reduced to three lines. Reproduce with:
+    ///     var y    = engine.TensorBroadcastDivide(x, engine.TensorNorm(x, 1, keepDims: true));
+    ///     var loss = engine.ReduceSum(engine.TensorMultiply(y, w), null);
+    ///     compare d/dx across CPU and GPU.
+    ///
+    /// Measured worst absolute CPU-vs-GPU gradient difference:
+    ///     TensorBroadcastDivide [4,8]/[4,1]   d/dx 1.490E-08, d/dn 0.000E+00   CLEARED
+    ///     TensorNorm axis=1 keepDims=true     d/dx 1.490E-08                   CLEARED
+    ///     TensorNorm axis=1 keepDims=false    d/dx 1.490E-08                   CLEARED
+    ///     x * x  (two-path accumulation)      0.000E+00                        CLEARED
+    ///     x + x  (two-path accumulation)      0.000E+00                        CLEARED
+    ///     x / norm(x)                         3.056E-01                        FAILS
+    ///
+    /// The GPU result is a pure ramp with CONSTANT step 0.008305 against gradOutput's step of 0.013 —
+    /// gradOutput scaled by a single constant rather than divided per row, with the denominator path's
+    /// contribution absent. TensorNormalize and TensorSquash both show that signature and both route
+    /// through this construction.
+    ///
+    /// So the defect is NOT in TensorNorm, NOT in TensorBroadcastDivide, and NOT in gradient accumulation
+    /// generally — each is exact alone. It appears only when the divisor is COMPUTED FROM the same tensor
+    /// as the numerator. Iterate on the three-line case, not the composite op.
+    /// </remarks>
+    private const string NormalizeRepro =
+        "y = BroadcastDivide(x, Norm(x, 1, keepDims:true)); loss = ReduceSum(y*w); compare d/dx";
+
+    /// <summary>
     /// Ops whose FORWARD parity already fails. Their tape gradients differ only because the forward value
     /// they are built from differs, so reporting them here double-counts a defect that belongs to
     /// OpParityTests.Forward_CpuMatchesGpu.
