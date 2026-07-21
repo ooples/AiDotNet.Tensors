@@ -62,12 +62,15 @@ missing or duplicate assignment.
 The machine-readable manifest is authoritative; this compact table is its
 human-readable summary.
 
-The same assembly-line contract now also governs issue #835 QKV/RoPE/cache and
-issue #836 dense-linear work. Their executable inventories and evidence live
+The same assembly-line contract now also governs issue #835 QKV/RoPE/cache,
+issue #836 dense-linear, and issue #837 mixed/quantized/sparse work. Their
+executable inventories and evidence live
 in `DirectPtxQkvRopeCacheCoverageManifest`,
 `DirectPtxDenseLinearCoverageManifest`,
+`DirectPtxQuantizedMixedSparseCoverageManifest`,
 `2026-07-21-fused-qkv-rope-cache-blueprint.md`, and
-`2026-07-21-direct-ptx-dense-linear-blueprint.md`.
+`2026-07-21-direct-ptx-dense-linear-blueprint.md`, and
+`2026-07-21-direct-ptx-mixed-quantized-sparse-blueprint.md`.
 
 ## Apples-to-apples contracts
 
