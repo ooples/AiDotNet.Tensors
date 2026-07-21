@@ -72,6 +72,7 @@ internal static class DirectPtxProfileTarget
 
     internal static void RunDecode()
     {
+        GpuBenchmarkEnvironment.RequireIdleGpu("ncu-decode-start");
         using var runtime = new DirectPtxRuntime();
         const int heads = 8, kvHeads = 1, sequence = 128, blockSize = 16, poolBlocks = 10;
         using var dense = new PtxFusedDecodeAttentionD64Kernel(
@@ -103,18 +104,17 @@ internal static class DirectPtxProfileTarget
             DirectPtxTensorView.CreateOwned(pagedV, paged.Blueprint.Tensors[2]),
             DirectPtxTensorView.CreateOwned(table, paged.Blueprint.Tensors[3]),
             DirectPtxTensorView.CreateOwned(pagedOutput, paged.Blueprint.Tensors[4]));
-        for (int i = 0; i < 10; i++)
-        {
-            launchDense();
-            launchPaged();
-        }
+        launchDense();
+        launchPaged();
         runtime.Synchronize();
         Console.WriteLine(dense.Audit.ToJson());
         Console.WriteLine(paged.Audit.ToJson());
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-decode-end");
     }
 
     internal static void RunPagedPrefill()
     {
+        GpuBenchmarkEnvironment.RequireIdleGpu("ncu-paged-prefill-start");
         using var runtime = new DirectPtxRuntime();
         const int heads = 8, kvHeads = 2, queries = 16, start = 112;
         const int blockSize = 16, poolBlocks = 10;
@@ -136,13 +136,15 @@ internal static class DirectPtxProfileTarget
             DirectPtxTensorView.CreateOwned(v, kernel.Blueprint.Tensors[2]),
             DirectPtxTensorView.CreateOwned(table, kernel.Blueprint.Tensors[3]),
             DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[4]));
-        for (int i = 0; i < 10; i++) launch();
+        launch();
         runtime.Synchronize();
         Console.WriteLine(kernel.Audit.ToJson());
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-paged-prefill-end");
     }
 
     internal static void RunAttentionBackward()
     {
+        GpuBenchmarkEnvironment.RequireIdleGpu("ncu-attention-backward-start");
         using var runtime = new DirectPtxRuntime();
         const int batch = 1, heads = 8, kvHeads = 2, querySequence = 64, keySequence = 64;
         using var kernel = new PtxFusedAttentionBackwardD64Kernel(
@@ -170,15 +172,17 @@ internal static class DirectPtxProfileTarget
             DirectPtxTensorView.CreateOwned(gradQuery, kernel.Blueprint.Tensors[5]),
             DirectPtxTensorView.CreateOwned(gradKey, kernel.Blueprint.Tensors[6]),
             DirectPtxTensorView.CreateOwned(gradValue, kernel.Blueprint.Tensors[7]));
-        for (int i = 0; i < 10; i++) launch();
+        launch();
         runtime.Synchronize();
         Console.WriteLine(kernel.RowDeltaAudit.ToJson());
         Console.WriteLine(kernel.GradKeyValueAudit.ToJson());
         Console.WriteLine(kernel.GradQueryAudit.ToJson());
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-attention-backward-end");
     }
 
     internal static void RunFlashAttentionBackward()
     {
+        GpuBenchmarkEnvironment.RequireIdleGpu("ncu-flash-attention-backward-start");
         using var runtime = new DirectPtxRuntime();
         const int batch = 1, heads = 8, querySequence = 64, keySequence = 64;
         using var kernel = new PtxFlashAttentionBackwardD64Kernel(
@@ -210,10 +214,11 @@ internal static class DirectPtxProfileTarget
             DirectPtxTensorView.CreateOwned(gradQuery, kernel.Blueprint.Tensors[6]),
             DirectPtxTensorView.CreateOwned(gradKey, kernel.Blueprint.Tensors[7]),
             DirectPtxTensorView.CreateOwned(gradValue, kernel.Blueprint.Tensors[8]));
-        for (int i = 0; i < 10; i++) launch();
+        launch();
         runtime.Synchronize();
         Console.WriteLine(kernel.GradQueryAudit.ToJson());
         Console.WriteLine(kernel.GradKeyValueAudit.ToJson());
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-flash-attention-backward-end");
     }
 
     internal static void VerifyNcuCsv(string path)

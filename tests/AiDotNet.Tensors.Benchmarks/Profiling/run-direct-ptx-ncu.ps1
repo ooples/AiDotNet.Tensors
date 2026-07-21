@@ -35,7 +35,14 @@ $kernel = switch ($Target) {
     'attention-backward' { 'regex:aidotnet_attention_backward_(delta|dq|dkv)_d64' }
     'flash-attention-backward' { 'regex:aidotnet_flash_attention_backward_(dq|dkv)_d64' }
 }
-$expectedLaunches = if ($Target -eq 'attention') { 16 } else { 4 }
+$expectedLaunches = switch ($Target) {
+    'attention' { 16 }
+    'residual-rmsnorm' { 4 }
+    'decode' { 2 }
+    'paged-prefill' { 1 }
+    'attention-backward' { 3 }
+    'flash-attention-backward' { 2 }
+}
 $metricNames = @(
     'sass__inst_executed_register_spilling',
     'sass__inst_executed_register_spilling_mem_local',
@@ -63,10 +70,10 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 dotnet $targetDll --direct-ptx-verify-ncu $OutputCsv
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-# One deterministic launch is emitted for every admitted specialization:
-# attention = four sequence buckets x causal/plain x fused/unfused; residual =
-# four row buckets. Requiring one raw row per requested metric and launch keeps
-# a partial capture from being mistaken for whole-domain zero-spill evidence.
+# One deterministic launch is emitted for every promoted kernel entry point;
+# attention and residual-RMSNorm additionally enumerate all promoted sequence/
+# row, causal, and fusion variants. Requiring one raw row per requested metric
+# and launch keeps a partial capture from being mistaken for complete evidence.
 foreach ($metricName in $metricNames) {
     $pattern = '"' + [Regex]::Escape($metricName) + '(?:\.[^",]+)?",'
     $matchCount = @(

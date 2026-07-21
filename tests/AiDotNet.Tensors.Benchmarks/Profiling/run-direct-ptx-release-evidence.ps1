@@ -40,7 +40,7 @@ function Get-GpuSnapshot {
     return ($output -join [Environment]::NewLine).Trim()
 }
 
-function Assert-GpuReady([string]$Label) {
+function Assert-GpuReady([string]$Label, [switch]$AfterSuite) {
     $status = & nvidia-smi '--query-gpu=utilization.gpu,memory.used,temperature.gpu' '--format=csv,noheader,nounits' 2>&1
     if ($LASTEXITCODE -ne 0) { throw "[$Label] nvidia-smi status failed: $status" }
     $cells = @((($status -join '') -split ',') | ForEach-Object { $_.Trim() })
@@ -50,9 +50,16 @@ function Assert-GpuReady([string]$Label) {
         $temperatureCelsius = 0
         if ([int]::TryParse($cells[0], [ref]$utilization) -and
             [int]::TryParse($cells[1], [ref]$usedMegabytes) -and
-            [int]::TryParse($cells[2], [ref]$temperatureCelsius) -and
-            ($utilization -gt 20 -or $usedMegabytes -gt 2048 -or $temperatureCelsius -gt 75)) {
-            throw "[$Label] GPU is not benchmark-ready (utilization=$utilization%, memory.used=$usedMegabytes MiB, temperature=$temperatureCelsius C)."
+            [int]::TryParse($cells[2], [ref]$temperatureCelsius)) {
+            if ($temperatureCelsius -gt 75) {
+                throw "[$Label] GPU temperature $temperatureCelsius C exceeds the 75 C evidence ceiling."
+            }
+            # A process that just exited can still own the current utilization
+            # sample. Apply idle/memory admission only before a suite; after a
+            # suite, require no foreign compute and a safe temperature.
+            if (-not $AfterSuite -and ($utilization -gt 20 -or $usedMegabytes -gt 2048)) {
+                throw "[$Label] GPU is not benchmark-ready (utilization=$utilization%, memory.used=$usedMegabytes MiB, temperature=$temperatureCelsius C)."
+            }
         }
     }
 
@@ -152,7 +159,7 @@ try {
                 & $suite.Command @arguments 2>&1 |
                     Out-File -LiteralPath $log -Append -Encoding utf8
                 $exitCode = $LASTEXITCODE
-                Assert-GpuReady "$label-end"
+                Assert-GpuReady "$label-end" -AfterSuite
                 "# ending_gpu=$(Get-GpuSnapshot)" | Add-Content -LiteralPath $log -Encoding utf8
                 "# completed_utc=$([DateTime]::UtcNow.ToString('O')); exit_code=$exitCode" |
                     Add-Content -LiteralPath $log -Encoding utf8
