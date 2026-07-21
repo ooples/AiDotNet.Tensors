@@ -57,6 +57,49 @@ internal static class DirectPtxProfileTarget
         Console.WriteLine(kernel.Audit.ToJson());
     }
 
+    internal static void RunDecode()
+    {
+        using var runtime = new DirectPtxRuntime();
+        const int heads = 8, kvHeads = 1, sequence = 128, blockSize = 16, poolBlocks = 10;
+        using var dense = new PtxFusedDecodeAttentionD64Kernel(
+            runtime, false, heads, kvHeads, sequence, 0, 0, 0.125f);
+        using var paged = new PtxFusedDecodeAttentionD64Kernel(
+            runtime, true, heads, kvHeads, sequence, blockSize, poolBlocks, 0.125f);
+        using var q = runtime.AllocateBytes(dense.QueryBytes);
+        using var denseK = runtime.AllocateBytes(dense.KeyValueBytes);
+        using var denseV = runtime.AllocateBytes(dense.KeyValueBytes);
+        using var denseOutput = runtime.AllocateBytes(dense.OutputBytes);
+        using var pagedK = runtime.AllocateBytes(paged.KeyValueBytes);
+        using var pagedV = runtime.AllocateBytes(paged.KeyValueBytes);
+        using var table = runtime.AllocateBytes(paged.BlockTableBytes);
+        using var pagedOutput = runtime.AllocateBytes(paged.OutputBytes);
+        q.Upload<float>(new float[heads * 64]);
+        denseK.Upload<float>(new float[sequence * kvHeads * 64]);
+        denseV.Upload<float>(new float[sequence * kvHeads * 64]);
+        pagedK.Upload<float>(new float[poolBlocks * blockSize * kvHeads * 64]);
+        pagedV.Upload<float>(new float[poolBlocks * blockSize * kvHeads * 64]);
+        table.Upload<int>(Enumerable.Range(0, sequence / blockSize).Reverse().ToArray());
+        Action launchDense = () => dense.LaunchDense(
+            DirectPtxTensorView.CreateOwned(q, dense.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(denseK, dense.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(denseV, dense.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(denseOutput, dense.Blueprint.Tensors[3]));
+        Action launchPaged = () => paged.LaunchPaged(
+            DirectPtxTensorView.CreateOwned(q, paged.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(pagedK, paged.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(pagedV, paged.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(table, paged.Blueprint.Tensors[3]),
+            DirectPtxTensorView.CreateOwned(pagedOutput, paged.Blueprint.Tensors[4]));
+        for (int i = 0; i < 10; i++)
+        {
+            launchDense();
+            launchPaged();
+        }
+        runtime.Synchronize();
+        Console.WriteLine(dense.Audit.ToJson());
+        Console.WriteLine(paged.Audit.ToJson());
+    }
+
     internal static void VerifyNcuCsv(string path)
     {
         DirectPtxProfilerEvidence evidence = DirectPtxProfilerEvidence.FromNcuCsv(path);

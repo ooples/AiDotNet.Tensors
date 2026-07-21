@@ -747,6 +747,233 @@ public class DirectPtxWmmaTests
         Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void DecodeEmitters_AreWarpResidentStrideFreeAndSeparatePagedAbi()
+    {
+        string dense = PtxFusedDecodeAttentionD64Kernel.EmitPtx(
+            8, 6, isPaged: false, queryHeads: 8, keyValueHeads: 2,
+            sequenceLength: 32, blockSize: 0, poolBlocks: 0, scale: 0.125f);
+        Assert.Contains(PtxFusedDecodeAttentionD64Kernel.DenseEntryPoint, dense);
+        Assert.Contains("shfl.sync.bfly.b32", dense);
+        Assert.Contains("st.global.v2.f32", dense);
+        Assert.DoesNotContain(".shared", dense, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", dense, StringComparison.Ordinal);
+        Assert.DoesNotContain(".param .u32", dense, StringComparison.Ordinal);
+        Assert.DoesNotContain("stride", dense, StringComparison.OrdinalIgnoreCase);
+
+        string paged = PtxFusedDecodeAttentionD64Kernel.EmitPtx(
+            8, 6, isPaged: true, queryHeads: 8, keyValueHeads: 1,
+            sequenceLength: 32, blockSize: 16, poolBlocks: 4, scale: 0.125f);
+        Assert.Contains(PtxFusedDecodeAttentionD64Kernel.PagedEntryPoint, paged);
+        Assert.Contains("ld.param.u64 %rd3, [block_table_ptr]", paged);
+        Assert.Equal(2, Count(paged, "ld.global.u32 %r6"));
+        Assert.DoesNotContain(PtxFusedDecodeAttentionD64Kernel.DenseEntryPoint, paged);
+    }
+
+    [Fact]
+    public void DecodeEmitter_RejectsEveryUnsupportedSpecializationDomain()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxFusedDecodeAttentionD64Kernel.EmitPtx(
+                8, 6, false, 8, 2, 17, 0, 0, 0.125f));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxFusedDecodeAttentionD64Kernel.EmitPtx(
+                8, 6, false, 3, 2, 32, 0, 0, 0.125f));
+        Assert.Throws<ArgumentException>(() =>
+            PtxFusedDecodeAttentionD64Kernel.EmitPtx(
+                8, 6, false, 8, 2, 32, 16, 2, 0.125f));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxFusedDecodeAttentionD64Kernel.EmitPtx(
+                8, 6, true, 8, 2, 32, 8, 4, 0.125f));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxFusedDecodeAttentionD64Kernel.EmitPtx(
+                8, 6, true, 8, 2, 64, 16, 2, 0.125f));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxFusedDecodeAttentionD64Kernel.EmitPtx(
+                8, 6, false, 8, 2, 32, 0, 0, float.NaN));
+    }
+
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void DriverOnlyDecodeD64_MatchesOracleAndHasZeroLocalBytes(bool paged)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(runtime.ArchitectureFamily == DirectPtxArchitectureFamily.Ampere,
+            "The checked-in decode family is validated on Ampere.");
+        const int heads = 4, kvHeads = 2, sequence = 32, dimension = 64, blockSize = 16;
+        int poolBlocks = paged ? 4 : 0;
+        int keyValueElements = paged
+            ? poolBlocks * blockSize * kvHeads * dimension
+            : sequence * kvHeads * dimension;
+        var random = new Random(paged ? 20260841 : 20260840);
+        float[] q = Enumerable.Range(0, heads * dimension)
+            .Select(_ => (random.NextSingle() - 0.5f) * 0.5f).ToArray();
+        float[] k = Enumerable.Range(0, keyValueElements)
+            .Select(_ => (random.NextSingle() - 0.5f) * 0.5f).ToArray();
+        float[] v = Enumerable.Range(0, keyValueElements)
+            .Select(_ => (random.NextSingle() - 0.5f) * 0.5f).ToArray();
+        int[] table = [3, 1];
+        using var kernel = new PtxFusedDecodeAttentionD64Kernel(
+            runtime, paged, heads, kvHeads, sequence,
+            paged ? blockSize : 0, poolBlocks, 0.125f);
+        Assert.Equal(0, kernel.FunctionInfo.LocalBytesPerThread);
+        Assert.Equal(0, kernel.FunctionInfo.StaticSharedBytes);
+        Assert.True(kernel.Audit.ActiveBlocksPerMultiprocessor >= 8);
+        Assert.Equal(paged ? 48 : 40, kernel.Blueprint.ResourceBudget.MaxRegistersPerThread);
+        Assert.Equal(paged ? 4 : 3, kernel.Blueprint.Tensors[1].LogicalExtent.Rank);
+        Assert.Equal(64, kernel.Audit.PtxSha256.Length);
+        using var qDevice = runtime.AllocateBytes(kernel.QueryBytes);
+        using var kDevice = runtime.AllocateBytes(kernel.KeyValueBytes);
+        using var vDevice = runtime.AllocateBytes(kernel.KeyValueBytes);
+        using var outputDevice = runtime.AllocateBytes(kernel.OutputBytes);
+        qDevice.Upload<float>(q); kDevice.Upload<float>(k); vDevice.Upload<float>(v);
+        if (paged)
+        {
+            using var tableDevice = runtime.AllocateBytes(kernel.BlockTableBytes);
+            tableDevice.Upload<int>(table);
+            kernel.LaunchPaged(
+                DirectPtxTensorView.CreateOwned(qDevice, kernel.Blueprint.Tensors[0]),
+                DirectPtxTensorView.CreateOwned(kDevice, kernel.Blueprint.Tensors[1]),
+                DirectPtxTensorView.CreateOwned(vDevice, kernel.Blueprint.Tensors[2]),
+                DirectPtxTensorView.CreateOwned(tableDevice, kernel.Blueprint.Tensors[3]),
+                DirectPtxTensorView.CreateOwned(outputDevice, kernel.Blueprint.Tensors[4]));
+        }
+        else
+        {
+            kernel.LaunchDense(
+                DirectPtxTensorView.CreateOwned(qDevice, kernel.Blueprint.Tensors[0]),
+                DirectPtxTensorView.CreateOwned(kDevice, kernel.Blueprint.Tensors[1]),
+                DirectPtxTensorView.CreateOwned(vDevice, kernel.Blueprint.Tensors[2]),
+                DirectPtxTensorView.CreateOwned(outputDevice, kernel.Blueprint.Tensors[3]));
+        }
+        runtime.Synchronize();
+        var actual = new float[q.Length];
+        outputDevice.Download<float>(actual);
+        float[] expected = DecodeOracle(
+            q, k, v, heads, kvHeads, sequence,
+            paged ? blockSize : 0, paged ? table : null, 0.125f);
+        float error = 0;
+        for (int i = 0; i < actual.Length; i++)
+            error = MathF.Max(error, MathF.Abs(actual[i] - expected[i]));
+        Assert.True(error < 2e-5f, $"Direct PTX decode max error {error:G9}.");
+    }
+
+    [SkippableFact]
+    public void BackendDecodeD64_IsZeroAllocationCapturableAndRoutesDenseAndPagedApis()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previous = DirectPtxFeatureGate.TestOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxFlashDecodeEnabled, "Requires an Ampere CUDA backend.");
+            const int heads = 4, kvHeads = 2, sequence = 32, dimension = 64, blockSize = 16;
+            const int poolBlocks = 4;
+            var random = new Random(20260842);
+            float[] qHost = Enumerable.Range(0, heads * dimension)
+                .Select(_ => (random.NextSingle() - 0.5f) * 0.5f).ToArray();
+            float[] denseK = Enumerable.Range(0, sequence * kvHeads * dimension)
+                .Select(_ => (random.NextSingle() - 0.5f) * 0.5f).ToArray();
+            float[] denseV = Enumerable.Range(0, sequence * kvHeads * dimension)
+                .Select(_ => (random.NextSingle() - 0.5f) * 0.5f).ToArray();
+            using var q = backend.AllocateBuffer(qHost);
+            using var k = backend.AllocateBuffer(denseK);
+            using var v = backend.AllocateBuffer(denseV);
+            using var output = backend.AllocateBuffer(qHost.Length);
+            Assert.True(backend.PrewarmDirectPtxDecodeD64(
+                false, heads, kvHeads, sequence, 0, 0, 0.125f), backend.DirectPtxLastError);
+            for (int i = 0; i < 8; i++)
+                Assert.True(backend.TryDirectPtxFlashDecodeD64(
+                    q, k, v, output, heads, kvHeads, sequence, 0.125f));
+            backend.Synchronize();
+            long beforeAllocation = GC.GetAllocatedBytesForCurrentThread();
+            bool allLaunched = true;
+            for (int i = 0; i < 32; i++)
+                allLaunched &= backend.TryDirectPtxFlashDecodeD64(
+                    q, k, v, output, heads, kvHeads, sequence, 0.125f);
+            long allocated = GC.GetAllocatedBytesForCurrentThread() - beforeAllocation;
+            backend.Synchronize();
+            Assert.True(allLaunched, backend.DirectPtxLastError);
+            Assert.Equal(0, allocated);
+            Assert.True(backend.TryGetDirectPtxDecodeAudit(
+                false, heads, kvHeads, sequence, 0, 0, 0.125f,
+                out DirectPtxKernelAudit denseAudit));
+            Assert.Equal(0, denseAudit.Function.LocalBytesPerThread);
+            Assert.False(backend.TryDirectPtxFlashDecodeD64(
+                q, k, v, output, heads, kvHeads, 48, 0.125f));
+            Assert.Equal("decode-sequence-bucket-not-implemented", backend.DirectPtxLastError);
+            Assert.False(backend.TryDirectPtxFlashDecodeD64(
+                q, k, v, q, heads, kvHeads, sequence, 0.125f));
+            Assert.Contains("alias", backend.DirectPtxLastError!, StringComparison.OrdinalIgnoreCase);
+
+            bool captureLaunch = true;
+            IntPtr graph = backend.CaptureGraph(() =>
+                captureLaunch &= backend.TryDirectPtxFlashDecodeD64(
+                    q, k, v, output, heads, kvHeads, sequence, 0.125f));
+            Assert.True(captureLaunch, backend.DirectPtxLastError);
+            try { backend.LaunchCapturedGraph(graph); }
+            finally { backend.DestroyCapturedGraph(graph); }
+
+            long beforePublicDense = backend.DirectPtxDecodeDispatchCount;
+            using IGpuBuffer publicDense = backend.FlashDecode(
+                q, k, v, heads, kvHeads, dimension, sequence, 0.125f);
+            Assert.Equal(beforePublicDense + 1, backend.DirectPtxDecodeDispatchCount);
+            float[] expectedDense = DecodeOracle(
+                qHost, denseK, denseV, heads, kvHeads, sequence, 0, null, 0.125f);
+            AssertDecodeClose(backend.DownloadBuffer(publicDense), expectedDense);
+            long beforeExplicitSplit = backend.DirectPtxDecodeDispatchCount;
+            using IGpuBuffer publicSplitFallback = backend.FlashDecode(
+                q, k, v, heads, kvHeads, dimension, sequence, 0.125f, splits: 2);
+            Assert.Equal(beforeExplicitSplit, backend.DirectPtxDecodeDispatchCount);
+            AssertDecodeClose(backend.DownloadBuffer(publicSplitFallback), expectedDense);
+
+            float[] pagedK = Enumerable.Range(0, poolBlocks * blockSize * kvHeads * dimension)
+                .Select(_ => (random.NextSingle() - 0.5f) * 0.5f).ToArray();
+            float[] pagedV = Enumerable.Range(0, poolBlocks * blockSize * kvHeads * dimension)
+                .Select(_ => (random.NextSingle() - 0.5f) * 0.5f).ToArray();
+            int[] tableHost = [3, 1];
+            using var keyPages = backend.AllocateBuffer(pagedK);
+            using var valuePages = backend.AllocateBuffer(pagedV);
+            using var table = backend.AllocateIntBuffer(tableHost);
+            using var pagedOutput = backend.AllocateBuffer(qHost.Length);
+            Assert.False(backend.TryDirectPtxPagedDecodeD64(
+                q, keyPages, valuePages, table, pagedOutput,
+                heads, kvHeads, 8, sequence, 0.125f));
+            Assert.Equal("paged-decode-block-size-not-implemented", backend.DirectPtxLastError);
+            Assert.True(backend.PrewarmDirectPtxDecodeD64(
+                true, heads, kvHeads, sequence, blockSize, poolBlocks, 0.125f),
+                backend.DirectPtxLastError);
+            bool pagedCaptureLaunch = true;
+            IntPtr pagedGraph = backend.CaptureGraph(() =>
+                pagedCaptureLaunch &= backend.TryDirectPtxPagedDecodeD64(
+                    q, keyPages, valuePages, table, pagedOutput,
+                    heads, kvHeads, blockSize, sequence, 0.125f));
+            Assert.True(pagedCaptureLaunch, backend.DirectPtxLastError);
+            try { backend.LaunchCapturedGraph(pagedGraph); }
+            finally { backend.DestroyCapturedGraph(pagedGraph); }
+            long beforePublicPaged = backend.DirectPtxDecodeDispatchCount;
+            using IGpuBuffer publicPaged = backend.PagedAttentionDecodeGqa(
+                q, keyPages, valuePages, table,
+                heads, kvHeads, dimension, blockSize, sequence, 0.125f);
+            Assert.Equal(beforePublicPaged + 1, backend.DirectPtxDecodeDispatchCount);
+            float[] expectedPaged = DecodeOracle(
+                qHost, pagedK, pagedV, heads, kvHeads, sequence,
+                blockSize, tableHost, 0.125f);
+            AssertDecodeClose(backend.DownloadBuffer(publicPaged), expectedPaged);
+            Assert.True(backend.TryGetDirectPtxDecodeAudit(
+                true, heads, kvHeads, sequence, blockSize, poolBlocks, 0.125f,
+                out DirectPtxKernelAudit pagedAudit));
+            Assert.Equal(0, pagedAudit.Function.LocalBytesPerThread);
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previous;
+        }
+    }
+
     [SkippableFact]
     public void DriverOnlyResidualRmsNorm_MatchesReferenceAndHasZeroLocalBytes()
     {
@@ -1038,6 +1265,66 @@ public class DirectPtxWmmaTests
             result[i] = BitConverter.HalfToUInt16Bits(
                 (Half)((random.NextSingle() - 0.5f) * 2f * magnitude));
         return result;
+    }
+
+    private static float[] DecodeOracle(
+        float[] query,
+        float[] key,
+        float[] value,
+        int queryHeads,
+        int keyValueHeads,
+        int sequenceLength,
+        int blockSize,
+        int[]? blockTable,
+        float scale)
+    {
+        const int dimension = 64;
+        var output = new float[queryHeads * dimension];
+        var logits = new float[sequenceLength];
+        int queriesPerKeyValue = queryHeads / keyValueHeads;
+        for (int head = 0; head < queryHeads; head++)
+        {
+            int keyValueHead = head / queriesPerKeyValue;
+            float maximum = float.NegativeInfinity;
+            for (int token = 0; token < sequenceLength; token++)
+            {
+                int physicalToken = blockTable is null
+                    ? token
+                    : blockTable[token / blockSize] * blockSize + token % blockSize;
+                int keyBase = (physicalToken * keyValueHeads + keyValueHead) * dimension;
+                float dot = 0;
+                for (int d = 0; d < dimension; d++)
+                    dot += query[head * dimension + d] * key[keyBase + d];
+                logits[token] = dot * scale;
+                maximum = MathF.Max(maximum, logits[token]);
+            }
+            float denominator = 0;
+            for (int token = 0; token < sequenceLength; token++)
+            {
+                logits[token] = MathF.Exp(logits[token] - maximum);
+                denominator += logits[token];
+            }
+            for (int token = 0; token < sequenceLength; token++)
+            {
+                int physicalToken = blockTable is null
+                    ? token
+                    : blockTable[token / blockSize] * blockSize + token % blockSize;
+                int valueBase = (physicalToken * keyValueHeads + keyValueHead) * dimension;
+                float probability = logits[token] / denominator;
+                for (int d = 0; d < dimension; d++)
+                    output[head * dimension + d] += probability * value[valueBase + d];
+            }
+        }
+        return output;
+    }
+
+    private static void AssertDecodeClose(float[] actual, float[] expected)
+    {
+        Assert.Equal(expected.Length, actual.Length);
+        float error = 0;
+        for (int i = 0; i < actual.Length; i++)
+            error = MathF.Max(error, MathF.Abs(actual[i] - expected[i]));
+        Assert.True(error < 2e-5f, $"Direct PTX decode max error {error:G9}.");
     }
 
     private static (float OutputError, float StatsError) ValidateOnlineFamily(

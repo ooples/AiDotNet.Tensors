@@ -69,6 +69,9 @@ internal readonly record struct DirectPtxExtent
     internal DirectPtxExtent(int d0, int d1)
         : this(2, d0, d1, 1, 1) { }
 
+    internal DirectPtxExtent(int d0, int d1, int d2)
+        : this(3, d0, d1, d2, 1) { }
+
     internal DirectPtxExtent(int d0, int d1, int d2, int d3)
         : this(4, d0, d1, d2, d3) { }
 

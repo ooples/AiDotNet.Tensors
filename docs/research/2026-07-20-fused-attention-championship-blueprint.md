@@ -54,8 +54,9 @@ missing or duplicate assignment.
 | FlashAttentionBackward | atomic and deterministic NVRTC variants | atomic/deterministic direct-PTX families planned |
 | GroupedQueryAttention | `grouped_query_attention` | v3 weight-free GQA/MQA inference implemented; weights mode planned |
 | GroupedQueryAttentionBackward | atomic and deterministic NVRTC variants | GQA/MQA recomputation backward planned |
-| FlashDecode | `flash_decode_partial` + `flash_decode_reduce` | contiguous decode family planned |
-| PagedAttention decode/prefill, MHA/GQA | four `paged_attention_*` kernels | paged physical-ABI families planned |
+| FlashDecode | `flash_decode_partial` + `flash_decode_reduce` | v1 register-online D64 FP32 MHA/GQA/MQA decode implemented for S=16/32/64/128; explicit split hints fall back |
+| PagedAttention decode, MHA/GQA | two `paged_attention_decode*` kernels | v1 block-table D64 FP32 decode implemented for block size 16/32 |
+| PagedAttention prefill, MHA/GQA | two `paged_attention_prefill*` kernels | paged prefill family planned |
 
 The machine-readable manifest is authoritative; this compact table is its
 human-readable summary.
@@ -174,6 +175,54 @@ more than their margin. They did not erase the fused lane's 2.47x--7.86x
 median advantage. Use the CUDA-event championship cell for raw device work,
 and an otherwise idle GPU for release-gate host distributions.
 
+## Decode championship slice
+
+The first #834 follow-on specialization covers FP32 D=64 single-token decode
+for MHA/GQA/MQA, dense sequence lengths 16/32/64/128, and paged block sizes
+16/32. The table below summarizes three independent clean runs; every run has
+30 warmups and 101 synchronized end-to-end samples. Ranges retain run-to-run
+Windows display-GPU scheduling variation rather than selecting one favorable
+capture.
+
+```text
+Shape       Direct median us  Direct P95 us  Direct P99 us   GFLOPS    AiDotNet median us  Min speedup  B/call  tmp MiB  max error  regs/shared/local  blocks/SM
+--------------------------------------------------------------------------------------------------------------------------------------------------------------
+dense-mha       20.7-21.8       41.8-43.2      43.4-189.9   3.01-3.17      64.3-64.7            2.96x        0    0.000   2.608e-8      40 / 0 / 0          12
+dense-gqa       22.5-26.2       42.7-46.5      43.8-64.4    5.00-5.83      64.7-65.7            2.48x        0    0.000   2.980e-8      40 / 0 / 0          12
+dense-mqa       26.5-27.8       43.1-50.9      47.7-231.8   9.43-9.89      92.1-93.5            3.31x        0    0.000   2.794e-8      40 / 0 / 0          12
+paged-gqa       25.1-27.6       43.4-56.1      47.8-128.0   4.75-5.22     189.3-190.7           6.86x        0    0.000   2.608e-8      40 / 0 / 0          12
+paged-mqa       28.2-30.9       32.4-39.1      43.1-55.1    8.48-9.30     350.9-354.6          11.48x        0    0.000   2.049e-8      46 / 0 / 0          10
+```
+
+The established dense AiDotNet split-K path uses 0.016 MiB of partial
+max/sum/accumulator storage per measured cell; the direct path has no temporary
+device allocation. The paged comparison has no temporary tensor on either
+side, but the direct path removes the general dynamic kernel's address and
+launch overhead. All five cells pass the paired-run production policy in all
+three captures: at least 1.10x median, P95 within competitor P95 +10%, zero hot
+managed bytes, zero temporary device bytes, error below 5e-5, and zero local
+bytes.
+
+The exact FP32 PyTorch public-SDPA competitor run forced each backend rather
+than allowing fallback. This Windows PyTorch 2.12.1+cu130 wheel has no eligible
+FP32 Flash or cuDNN lane. Efficient-SDPA accepts only dense MHA; native GQA/MQA
+uses Math-SDPA. Across the same three-run/101-sample protocol, the eligible
+competitor ranges were:
+
+| Shape | Forced PyTorch backend | Median us | P95 us | P99 us | Mean us | GFLOPS | Peak device bytes | Max error |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| dense MHA | Efficient | 53.2-85.7 | 76.2-212.8 | 168.0-429.5 | 59.42-121.57 | 0.76-1.23 | 2,048 | 3.725e-8 |
+| dense GQA | Math | 371.9-385.7 | 532.7-667.9 | 601.7-1159.3 | 390.51-425.03 | 0.34-0.35 | 397,312 | 0 |
+| dense MQA | Math | 337.6-385.1 | 491.8-548.2 | 585.3-745.8 | 371.10-398.86 | 0.68-0.78 | 792,576 | 0 |
+
+PyTorch peak bytes include its required result allocation; public SDPA has no
+caller-supplied output. PyTorch exposes no equivalent paged block-table SDPA
+operation, so the paged cells use AiDotNet's existing NVIDIA kernel as their
+semantic and hardware peer. The runtime local-memory attribute proves zero JIT
+local allocation for all promoted decode cells. Executed Nsight spill counters
+remain externally blocked by `ERR_NVGPUCTRPERM`; this slice remains experimental
+until that host permission is available and the required CSV evidence is attached.
+
 ## Kernel dataflow
 
 ```text
@@ -213,6 +262,17 @@ shared memory. Its online max, sum, score fragments, and 16x64 output fragment
 remain in registers. The inference specialization writes only the output; the
 API-compatible inference specialization additionally writes the required LSE stats.
 
+Decode is a distinct FP32 ABI: Q and output are `[Hq,64]`; dense K/V are
+canonical `[S,Hkv,64]`; paged K/V are `[poolBlock,blockPosition,Hkv,64]` plus
+an exact-length Int32 block table. One warp owns one query head and each lane
+owns two output dimensions. QK reduction, online max/sum, and PV recurrence
+remain in registers; there is one final vector output store. There is no SxS
+score/probability tensor, split-K scratch, shared-memory allocation, or dynamic
+stride parameter. `cp.async` and Tensor Cores are deliberately not used in
+this FP32 GEMV-like decode cell: warp shuffles and coalesced vector loads were
+the measurably winning dataflow. Paged address translation has its own formal
+ABI and resource domain rather than a runtime layout branch in the dense PTX.
+
 ## Runtime and feature gate
 
 The custom path uses `nvcuda.dll` Driver API calls directly:
@@ -231,7 +291,9 @@ hardware, not a hand-encoded SASS binary.
 
 Production integration is fail-closed:
 
-- The default is off. Set `AIDOTNET_DIRECT_PTX_ATTENTION=1` to opt in.
+- Every family defaults off. Set `AIDOTNET_DIRECT_PTX_ATTENTION=1`,
+  `AIDOTNET_DIRECT_PTX_FLASH_DECODE=1`, or
+  `AIDOTNET_DIRECT_PTX_PAGED_DECODE=1` to admit only that family.
 - SM < 8.0, unsupported shape/dtype/layout, bias, active autodiff tape, stream
   capture, JIT failure, or launch failure falls back to the existing path.
 - The runtime borrows the existing `CudaBackend` context and stream, so
@@ -239,9 +301,9 @@ Production integration is fail-closed:
 - Modules are cached by BH, S, mask, fusion signature, scale bits, and epsilon
   bits, and unloaded before the backend destroys its context/stream.
 - The kernel cache and launches use the backend's existing dispatch locks.
-- Stream capture stays on the established resident NVRTC path because lazy
-  PTX JIT and eager scratch allocation are not capture safe. A later graph API
-  should prewarm the specialization and provide stable output buffers first.
+- Capture may use an already prewarmed attention or decode specialization with
+  stable caller-owned buffers. A capture-time JIT/cache miss fails closed;
+  capture never tunes, allocates, performs file I/O, or evicts a live module.
 
 ## Canonical physical-layout policy
 
@@ -312,10 +374,14 @@ attribute remains the available zero-spill admission proof for this capture.
 | Arbitrary attention bias or padding mask | Fallback |
 | Dropout | Fallback |
 | FP16 physical Q/K/V, FP32 output | Accepted |
+| FP32 D64 decode; S=16/32/64/128; no explicit split hint | Dense warp-online decode specialization |
+| FP32 D64 paged decode; block size 16/32 | Separate paged ABI; MHA/GQA/MQA head map baked into PTX |
+| Other decode dtype, D, sequence bucket, block geometry, or explicit split-K request | Existing CUDA fallback with an exact reason |
+| Paged table/pool byte extent mismatch | Rejected before launch; page indices are trusted device metadata under the same caller precondition as the established paged kernel |
 | Noncontiguous, sparse, nonzero-offset, or aliased larger logical view | Materialize/general fallback; never enter stride-free PTX |
 | Misaligned or undersized device pointer | Capability-token rejection and fallback |
 | Active autodiff tape / backward | Existing recorded implementation |
-| CUDA graph capture | Backend direct launch is allowed only after explicit prewarm; the high-level route retains its resident NVRTC fallback because FP16 scratch/output materialization is not capture-safe yet |
+| CUDA graph capture | Caller-owned-buffer direct launches are allowed only after explicit prewarm; capture-time JIT/cache misses fail closed, and allocating high-level routes retain their established behavior |
 | Non-Ampere architecture | Gate disabled until a separately tuned Ada/Hopper/Blackwell family exists |
 | Driver JIT reports local bytes | Module rejected and fallback |
 | Rectangular causal | Separate baked domains: FlashAttentionV2 top-left (`offset=0`), SDPA bottom-right (`offset=Skv-Sq`); negative offsets remain fail-closed until fully-masked leading rows have a dedicated specialization |
@@ -366,6 +432,8 @@ The reusable code layers are:
   persisted device-specific winners, and prewarm-only graph capture.
 - `PtxOnlineFusedAttention128x64Kernel`: shape emitter, async online dataflow,
   causal specialization, optional LSE, and fused epilogue.
+- `PtxFusedDecodeAttentionD64Kernel`: separate dense/paged physical ABIs,
+  warp-owned online decode, block-table translation, and single final store.
 - `CudaBackend.DirectPtx`: production cache, existing stream/context, audit,
   fallback, and teardown.
 - `DirectPtxWmmaTests`: structural, scalar-oracle, layout, gate, borrowed-
@@ -379,11 +447,11 @@ copied into another one-off emitter.
 
 | Improvement | Implemented result | Remaining evidence boundary |
 |---|---|---|
-| Formal layout ABI | Logical and physical extents, layout identity, dtype, alignment, access, padding, byte offset, and allocation extent are validated once in `DirectPtxTensorContract`; the PTX has no stride path | Packed QKV and paged KV have ABI identities but no kernel yet |
+| Formal layout ABI | Logical and physical extents, layout identity, dtype, alignment, access, padding, byte offset, and allocation extent are validated once in `DirectPtxTensorContract`; dense sequence-head-dimension and paged KV decode now have distinct executable ABIs; the PTX has no stride path | Packed QKV and ragged-offset kernels remain |
 | Autotuned dispatch | Attention tries valid query-warp variants, persists the winner through the existing autotune cache, keys it by GPU UUID/SM/driver and semantics, and bounds loaded modules with an LRU | A clean production release run still requires three independent captures |
 | Stronger spill proof | Runtime admission enforces register/shared/local budgets and records PTX SHA-256, JIT attributes, occupancy, GPU fingerprint, and log; an Nsight CSV parser and deterministic profile target enforce executed spill/local counters | Nsight attached, but `ERR_NVGPUCTRPERM` blocks counter access until enabled by the host administrator |
 | Hardened performance gate | Policy requires >=1.10x median, bounded p95, zero hot managed/device temporary bytes, numerical tolerance, zero local bytes, and three independent runs | Windows display scheduling can hold an otherwise fast candidate |
-| Expanded correctness | Rectangular Sq/Skv and MHA/GQA/MQA are now admitted only for tested D64 FP16 buckets; explicit reasons still cover dtype, D, invalid head maps, mask, dropout, phase/backward, ragged and paged requests | BF16/FP32, masks, training/backward, ragged and paged semantics remain implementation work |
+| Expanded correctness | Rectangular Sq/Skv D64 FP16 attention plus D64 FP32 dense/paged decode admit tested MHA/GQA/MQA buckets; explicit reasons cover dtype, D, invalid head maps, page geometry, mask, dropout, phase/backward, and ragged requests | BF16, broader FP32 prefill, masks, training/backward, and ragged semantics remain implementation work |
 | Real second fusion | `residual + RMSNorm(D=64)` is one warp-owned reduction/fusion using the same ABI, audit, gate, cache, graph-prewarm, tests, and benchmark framework | QKV projection/RoPE remains the next tensor-core fusion |
 | Architecture families | Ampere, Ada, Hopper, and Blackwell are distinct dispatch domains | Only Ampere SM86 was executed here; other families deliberately reject rather than inherit Ampere tuning |
 
@@ -470,6 +538,9 @@ tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-ncu.ps1 `
 
 tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-ncu.ps1 `
   -Target residual-rmsnorm -OutputCsv residual-rmsnorm-ncu.csv
+
+tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-ncu.ps1 `
+  -Target decode -OutputCsv decode-ncu.csv
 ```
 
 The script profiles a deterministic kernel target and fails unless executed
@@ -497,8 +568,18 @@ dotnet run --project tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmar
 dotnet run --project tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.csproj `
   -c Release --no-build -- --direct-ptx-external-gpu-baselines
 
+$env:AIDOTNET_DIRECT_PTX_FLASH_DECODE='1'
+$env:AIDOTNET_DIRECT_PTX_PAGED_DECODE='1'
+dotnet run --project tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.csproj `
+  -c Release --no-build -- --direct-ptx-decode 3
+
+python `
+  tests/AiDotNet.Tensors.Benchmarks/BaselineRunners/py/run_direct_ptx_decode_competitors.py --runs 3
+
 $env:AIDOTNET_DIRECT_PTX_ATTENTION='1'
 $env:AIDOTNET_DIRECT_PTX_RESIDUAL_RMSNORM='1'
+$env:AIDOTNET_DIRECT_PTX_FLASH_DECODE='1'
+$env:AIDOTNET_DIRECT_PTX_PAGED_DECODE='1'
 # Or enable all admitted direct kernels:
 $env:AIDOTNET_DIRECT_PTX='1'
 ```

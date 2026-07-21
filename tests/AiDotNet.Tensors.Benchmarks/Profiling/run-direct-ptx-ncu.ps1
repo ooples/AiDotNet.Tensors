@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('attention', 'residual-rmsnorm')]
+    [ValidateSet('attention', 'residual-rmsnorm', 'decode')]
     [string]$Target = 'attention',
     [string]$OutputCsv = 'direct-ptx-ncu.csv',
     [string]$NcuPath = $env:NSIGHT_COMPUTE_CLI
@@ -19,15 +19,15 @@ if (-not (Test-Path -LiteralPath $targetDll -PathType Leaf)) {
     throw "Benchmark target is missing. Build AiDotNet.Tensors.Benchmarks in Release/net10.0 first."
 }
 $targetDll = (Resolve-Path -LiteralPath $targetDll).Path
-$switch = if ($Target -eq 'attention') {
-    '--direct-ptx-profile-attention'
-} else {
-    '--direct-ptx-profile-residual-rmsnorm'
+$switch = switch ($Target) {
+    'attention' { '--direct-ptx-profile-attention' }
+    'residual-rmsnorm' { '--direct-ptx-profile-residual-rmsnorm' }
+    'decode' { '--direct-ptx-profile-decode' }
 }
-$kernel = if ($Target -eq 'attention') {
-    'regex:aidotnet_online_attention_128x64'
-} else {
-    'regex:aidotnet_fused_residual_rmsnorm_d64'
+$kernel = switch ($Target) {
+    'attention' { 'regex:aidotnet_online_attention_128x64' }
+    'residual-rmsnorm' { 'regex:aidotnet_fused_residual_rmsnorm_d64' }
+    'decode' { 'regex:aidotnet_(flash|paged)_decode_d64' }
 }
 $metrics = @(
     'sass__inst_executed_register_spilling',
