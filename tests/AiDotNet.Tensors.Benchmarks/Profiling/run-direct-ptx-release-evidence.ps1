@@ -2,7 +2,7 @@
 param(
     [ValidateRange(3, 20)]
     [int]$Runs = 3,
-    [string]$OutputDirectory = (Join-Path $PSScriptRoot ("direct-ptx-evidence-" + (Get-Date -Format 'yyyyMMdd-HHmmss'))),
+    [string]$OutputDirectory = (Join-Path ([System.IO.Path]::GetTempPath()) ("aidotnet-direct-ptx-evidence-" + (Get-Date -Format 'yyyyMMdd-HHmmss'))),
     [switch]$SkipBuild,
     [switch]$SkipExternal,
     [switch]$AllowDirty
