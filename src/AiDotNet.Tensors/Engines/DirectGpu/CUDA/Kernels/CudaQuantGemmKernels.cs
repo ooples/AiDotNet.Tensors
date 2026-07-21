@@ -12,7 +12,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
     /// </summary>
     internal static class CudaQuantGemmKernels
     {
-        public static string[] GetKernelNames() => new[] { "dequant_gemm_int8", "dequant_gemm_int4", "dequant_gemm_fp8_e4m3" };
+        public static string[] GetKernelNames() => new[] { "dequant_gemm_int8", "dequant_gemm_int4", "dequant_gemm_fp8_e4m3", "fused_linear_gelu_w8a8_m1", "w8a8_dequant_bias_gelu" };
 
         public static string GetSource() => @"
 extern ""C"" __global__ void dequant_gemm_int8(
@@ -77,6 +77,35 @@ extern ""C"" __global__ void dequant_gemm_fp8_e4m3(
         for (int k = 0; k < K; ++k) { int flat=k*N+j; acc += act[i*K+k] * decode_e4m3(w[flat]) * scales[flat/groupSize]; }
     }
     outbuf[idx] = acc;
+}
+
+// Symmetric W8A8 decode projection. This correctness fallback preserves the
+// direct-PTX physical ABI: contiguous input[K], output-major weights[N,K],
+// scalar activation scale, per-output weight scales/bias, and FP32 output.
+extern ""C"" __global__ void fused_linear_gelu_w8a8_m1(
+    const signed char* input, const signed char* weights,
+    const float* activationScale, const float* weightScales,
+    const float* bias, float* output, int K, int N)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= N) return;
+    const signed char* row = weights + (long long)j * K;
+    int acc = 0;
+    for (int k = 0; k < K; ++k) acc += (int)input[k] * (int)row[k];
+    float x = (float)acc * activationScale[0] * weightScales[j] + bias[j];
+    float x3 = x * x * x;
+    output[j] = 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x3)));
+}
+
+extern ""C"" __global__ void w8a8_dequant_bias_gelu(
+    const int* accumulator, const float* activationScale,
+    const float* weightScales, const float* bias, float* output, int N)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= N) return;
+    float x = (float)accumulator[j] * activationScale[0] * weightScales[j] + bias[j];
+    float x3 = x * x * x;
+    output[j] = 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x3)));
 }
 ";
     }

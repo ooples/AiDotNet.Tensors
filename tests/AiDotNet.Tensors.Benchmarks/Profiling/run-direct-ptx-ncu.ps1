@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'fused-linear', 'mixed-linear', 'mixed-linear-m16')]
+    [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'fused-linear', 'mixed-linear', 'mixed-linear-m16', 'w8a8-linear')]
     [string]$Target = 'attention',
     [string]$OutputCsv = 'direct-ptx-ncu.csv',
     [string]$NcuPath = $env:NSIGHT_COMPUTE_CLI
@@ -29,6 +29,7 @@ $switch = switch ($Target) {
     'fused-linear' { '--direct-ptx-profile-fused-linear' }
     'mixed-linear' { '--direct-ptx-profile-mixed-linear' }
     'mixed-linear-m16' { '--direct-ptx-profile-mixed-linear-m16' }
+    'w8a8-linear' { '--direct-ptx-profile-w8a8-linear' }
 }
 $kernel = switch ($Target) {
     'attention' { 'regex:aidotnet_online_attention_128x64' }
@@ -40,6 +41,7 @@ $kernel = switch ($Target) {
     'fused-linear' { 'regex:aidotnet_fused_linear_gelu_m1' }
     'mixed-linear' { 'regex:aidotnet_fused_linear_gelu_fp16_m1' }
     'mixed-linear-m16' { 'regex:aidotnet_fused_linear_gelu_fp16_m16' }
+    'w8a8-linear' { 'regex:aidotnet_fused_linear_gelu_w8a8_m1' }
 }
 $metrics = @(
     'sass__inst_executed_register_spilling',

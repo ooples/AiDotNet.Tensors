@@ -30,10 +30,18 @@ The M=16 v3 slice extends that result with bank-conflict-free shared panels,
 double-buffered `cp.async`, `mma.sync.m16n8k16`, a register-resident fused
 epilogue, and one final output store. The 1024/4096 cell passes the full 1.10x
 production gate; 512/2048 remains experiment-only because its conservative
-1.057x ratio misses that gate. The executable 15-cell
+1.057x ratio misses that gate. The executable 16-cell
 `DirectPtxQuantizedMixedSparseCoverageManifest` assigns the remaining FP16
 GEMM/backward, INT8, INT4, FP8, 2:4, and CSR operations to later direct-PTX
 families.
+
+The v4 W8A8 decode slice adds a distinct symmetric-quantized ABI for exact
+`M=1,K=1024,N=4096`. Four output rows share each warp's contiguous packed
+activation loads; `dp4a.s32.s32` accumulates in registers, then scalar
+activation scale, per-output weight scale, bias, and tanh-GELU are fused before
+the sole FP32 output store. Its conservative stabilized advantage over the
+strongest eligible resident NVIDIA peer is 1.507x, so this exact cell is
+production-promoted. It does not replace the existing W8A32 weight-only API.
 
 ## Why this kernel does not use Tensor Cores
 
@@ -83,6 +91,13 @@ K=16 subpanels so MMA fragment loads do not introduce shared-bank conflicts.
 Four warps reuse one staged A panel across 32 output columns. Accumulators,
 bias, and GELU remain in FP32 registers until one `st.global.v2.f32` per
 fragment row.
+
+The v4 W8A8 ABI has six pointers and no dynamic shape, stride, layout,
+zero-point, or activation parameters: INT8 input `[1024]`, output-major INT8
+weights `[4096,1024]`, FP32 activation scale `[1]`, FP32 per-output scales
+`[4096]`, FP32 bias `[4096]`, and FP32 output `[4096]`. Quantization is
+symmetric and both zero-points are exactly zero. Packing and quantization are
+model-load responsibilities and are never timed or repeated on the hot path.
 
 ## GPU-only championship evidence
 
@@ -164,6 +179,27 @@ P95/P99 samples. The small cell wins two of three paired P95 samples; this
 tail caveat is retained in the evidence. Only 1024x4096 is promoted: the
 512x2048 ratio is below the epic's required 1.10x production threshold.
 
+## W8A8 decode championship evidence
+
+The exact W8A8 cell uses the same environment and the same 30-warmup,
+101-sample, 50-resident-launch sampling contract. `GOPS = 2*K*N / median` is
+an equivalent integer-operation rate, not floating-point FLOPS. Ranges below
+are from three independent backend instances. Packing, upload, allocation,
+and download are outside timing.
+
+| Method | median us | P95 us | P99 us | TOPS | managed B/call | temp device B | max error |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Direct PTX DP4A | 9.36-12.08 | 13.33-19.44 | 14.62-21.50 | 0.694-0.896 | 0 | 0 | 3.4e-7-1.3e-6 |
+| AiDotNet NVRTC fallback | 142.68-144.32 | 148.75-152.84 | 153.85-155.55 | 0.058-0.059 | 0 | 0 | 3.6e-7-1.4e-6 |
+| NVRTC CUDA Graph | 159.38-161.87 | 167.18-169.88 | 171.46-173.53 | 0.052-0.053 | 0 | 0 | 3.6e-7-1.4e-6 |
+| NVIDIA cuBLASLt + resident epilogue | 21.79-22.02 | 25.70-33.87 | 29.49-37.21 | 0.381-0.385 | 112 | 16,384 | 3.6e-7-1.4e-6 |
+| cuBLASLt CUDA Graph | 18.21-29.57 | 24.10-36.93 | 26.15-38.07 | 0.284-0.461 | 0 | 16,384 | 3.6e-7-1.4e-6 |
+
+The conservative ratio is `18.21/12.08 = 1.507x`. Direct P95 beats the
+strongest paired eligible P95 in all three runs. PyTorch 2.12.1+cu130
+`torch._int_mm` is recorded as ineligible rather than silently padded because
+it rejects exact M=1 with `self.size(0) needs to be greater than 16`.
+
 ## Resource and spill evidence
 
 The promoted 512x2048 module records:
@@ -207,6 +243,16 @@ the compiled function has no local-memory frame or spill allocation. The new
 `mixed-linear-m16` Nsight target attaches to the correct entry point, but the
 host again returns `ERR_NVGPUCTRPERM`; executed-counter proof is not claimed.
 
+The promoted W8A8 module records blueprint
+`fused-linear-bias-gelu-v4-Ampere-decode-w8a8-s32acc-dp4a-m1-k1024-n4096`,
+PTX SHA-256
+`3838bdcd779794f12d5231324a9c6c7325f7213690258287b4c0a8a1c98a5a78`,
+28 registers/thread, 0 static shared bytes, 0 local bytes/thread, and 12 active
+128-thread blocks/SM. The loader enforces these limits before caching. The
+dedicated `w8a8-linear` Nsight target attaches to the exact entry point, but
+this host returns `ERR_NVGPUCTRPERM`; executed-counter zero-spill proof is not
+claimed until an administrator enables NVIDIA performance counters.
+
 ## Reproduction
 
 ```powershell
@@ -217,6 +263,10 @@ dotnet run --project tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmar
 dotnet run --project tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.csproj `
   -c Release -- --direct-ptx-mixed-linear-m16 3
 
+$env:AIDOTNET_DIRECT_PTX_QUANTIZED_LINEAR = '1'
+dotnet run --project tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.csproj `
+  -c Release -- --direct-ptx-w8a8-linear 3
+
 powershell -ExecutionPolicy Bypass -File `
   tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-ncu.ps1 `
   -Target mixed-linear
@@ -224,13 +274,18 @@ powershell -ExecutionPolicy Bypass -File `
 powershell -ExecutionPolicy Bypass -File `
   tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-ncu.ps1 `
   -Target mixed-linear-m16
+
+powershell -ExecutionPolicy Bypass -File `
+  tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-ncu.ps1 `
+  -Target w8a8-linear
 ```
 
 ## Next #837 increments
 
 1. Generalize the proven FP16 M=16 async panel family to larger M buckets,
    BF16, and fused residual epilogues without adding dynamic stride checks.
-2. W8A8 INT8 DP4A/IMMA and W4A16 register-dequant projection families.
+2. Extend W8A8 to M>=16 asynchronous IMMA buckets and add W4A16
+   register-dequant projection families.
 3. FP8 E4M3/E5M2 architecture-specific families with explicit scale ABI.
 4. Native 2:4 `mma.sp` GEMM and fused bias/activation without decompression.
 5. CSR sparse-linear density buckets, including a deliberate dense fallback

@@ -307,6 +307,35 @@ internal static class DirectPtxProfileTarget
         Console.WriteLine(kernel.Audit.ToJson());
     }
 
+    internal static void RunW8A8Linear()
+    {
+        using var runtime = new DirectPtxRuntime();
+        const int inputFeatures = 1024, outputFeatures = 4096;
+        using var kernel = new PtxFusedLinearGeluW8A8M1Kernel(
+            runtime, inputFeatures, outputFeatures);
+        using var input = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var weights = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var activationScale = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        using var weightScales = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
+        using var bias = runtime.AllocateBytes(kernel.Blueprint.Tensors[4].RequiredBytes);
+        using var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[5].RequiredBytes);
+        input.Upload<sbyte>(new sbyte[inputFeatures]);
+        weights.Upload<sbyte>(new sbyte[inputFeatures * outputFeatures]);
+        activationScale.Upload<float>([0.01f]);
+        weightScales.Upload<float>(Enumerable.Repeat(0.005f, outputFeatures).ToArray());
+        bias.Upload<float>(new float[outputFeatures]);
+        Action launch = () => kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(weights, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(activationScale, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(weightScales, kernel.Blueprint.Tensors[3]),
+            DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[4]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[5]));
+        for (int i = 0; i < 10; i++) launch();
+        runtime.Synchronize();
+        Console.WriteLine(kernel.Audit.ToJson());
+    }
+
     internal static void VerifyNcuCsv(string path)
     {
         DirectPtxProfilerEvidence evidence = DirectPtxProfilerEvidence.FromNcuCsv(path);

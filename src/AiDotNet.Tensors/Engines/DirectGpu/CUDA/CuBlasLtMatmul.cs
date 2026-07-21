@@ -123,6 +123,59 @@ public sealed class CuBlasLtMatmul : IDisposable
         }
     }
 
+    /// <summary>
+    /// Resident signed-INT8 GEMM with exact INT32 accumulation/output. The
+    /// caller supplies already-packed device operands; scaling and nonlinear
+    /// epilogues are intentionally separate because cuBLASLt's INT32 compute
+    /// contract does not accept the FP32 per-channel scale ABI used by W8A8.
+    /// </summary>
+    public void MatmulInt8ToInt32(
+        IntPtr aDev, int m, int k, bool transA,
+        IntPtr bDev, int n, bool transB,
+        IntPtr dDev,
+        IntPtr stream = default)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CuBlasLtMatmul));
+
+        IntPtr opDesc = IntPtr.Zero, aDesc = IntPtr.Zero, bDesc = IntPtr.Zero;
+        IntPtr cDesc = IntPtr.Zero, dDesc = IntPtr.Zero;
+        try
+        {
+            Check(CuBlasLtNative.cublasLtMatmulDescCreate(
+                out opDesc, CublasComputeType.Int32, CublasDataType.Int32), "INT8 DescCreate");
+            int tA = transA ? 1 : 0;
+            int tB = transB ? 1 : 0;
+            SetAttr(opDesc, CublasLtMatmulDescAttributes.TransA, ref tA, sizeof(int));
+            SetAttr(opDesc, CublasLtMatmulDescAttributes.TransB, ref tB, sizeof(int));
+            Check(CuBlasLtNative.cublasLtMatrixLayoutCreate(
+                out aDesc, CublasDataType.Int8, (ulong)m, (ulong)k,
+                transA ? k : m), "INT8 A layout");
+            Check(CuBlasLtNative.cublasLtMatrixLayoutCreate(
+                out bDesc, CublasDataType.Int8, (ulong)k, (ulong)n,
+                transB ? n : k), "INT8 B layout");
+            Check(CuBlasLtNative.cublasLtMatrixLayoutCreate(
+                out cDesc, CublasDataType.Int32, (ulong)m, (ulong)n, m),
+                "INT32 C layout");
+            Check(CuBlasLtNative.cublasLtMatrixLayoutCreate(
+                out dDesc, CublasDataType.Int32, (ulong)m, (ulong)n, m),
+                "INT32 D layout");
+            int alpha = 1, beta = 0;
+            Check(CuBlasLtNative.cublasLtMatmulInt32(
+                _handle, opDesc, ref alpha,
+                aDev, aDesc, bDev, bDesc, ref beta,
+                dDev, cDesc, dDev, dDesc,
+                IntPtr.Zero, IntPtr.Zero, 0, stream), "INT8 Matmul");
+        }
+        finally
+        {
+            if (dDesc != IntPtr.Zero) CuBlasLtNative.cublasLtMatrixLayoutDestroy(dDesc);
+            if (cDesc != IntPtr.Zero) CuBlasLtNative.cublasLtMatrixLayoutDestroy(cDesc);
+            if (bDesc != IntPtr.Zero) CuBlasLtNative.cublasLtMatrixLayoutDestroy(bDesc);
+            if (aDesc != IntPtr.Zero) CuBlasLtNative.cublasLtMatrixLayoutDestroy(aDesc);
+            if (opDesc != IntPtr.Zero) CuBlasLtNative.cublasLtMatmulDescDestroy(opDesc);
+        }
+    }
+
     private static void SetAttr<TAttr>(IntPtr desc, CublasLtMatmulDescAttributes attr, ref TAttr value, int sizeInBytes)
         where TAttr : unmanaged
     {
