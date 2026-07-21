@@ -770,7 +770,30 @@ extern ""C"" __global__ __launch_bounds__(256) void equals(
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    C[idx] = fabsf(A[idx] - B[idx]) < 1e-6f ? 1.0f : 0.0f;
+
+    // IEEE equality, NOT a tolerance. This kernel used fabsf(a-b) < 1e-6f, which is a different
+    // predicate and was measurably wrong in three distinct ways against CpuEngine:
+    //     idx  a           b       CPU  GPU(old)
+    //     0    0.0         1e-8     0    1        near-equal counted as equal
+    //     2    3.0000002   3.0      0    1        near-equal counted as equal
+    //     5    +Inf        +Inf     1    0        Inf-Inf = NaN, NaN < 1e-6 is false
+    // Measured raw masks: CPU 00010101 (exactly IEEE ==) vs GPU 10110001.
+    //
+    // NOTE there are TWO equality kernels in this backend: the bit-exact equals_kernel in
+    // CudaBroadcastKernels, and this one. CudaBackend.Equal looks up the name equals - this one - so the correct
+    // implementation was present but unreachable. Bodies are kept in sync rather than rewiring the lookup,
+    // because several callers (TensorEq, TensorEqScalar, TensorIsIn, the mode/threshold masks) go through
+    // backend.Equal and all of them want IEEE semantics.
+    //
+    // Bit-pattern form: aa/ba <= 0x7F800000 rejects NaN on either side (NaN != NaN); ab == bb covers the
+    // ordinary case; (aa | ba) == 0 makes -0.0 == +0.0 as IEEE requires.
+    unsigned int ab = __float_as_uint(A[idx]);
+    unsigned int bb = __float_as_uint(B[idx]);
+    unsigned int aa = ab & 0x7FFFFFFFu;
+    unsigned int ba = bb & 0x7FFFFFFFu;
+    bool eq = aa <= 0x7F800000u && ba <= 0x7F800000u
+        && (ab == bb || ((aa | ba) == 0u));
+    C[idx] = eq ? 1.0f : 0.0f;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void where_cond(

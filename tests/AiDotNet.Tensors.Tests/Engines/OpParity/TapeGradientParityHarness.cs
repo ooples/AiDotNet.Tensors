@@ -107,10 +107,6 @@ public static class TapeGradientParityHarness
     public static readonly IReadOnlyDictionary<string, string> ForwardParityBroken =
         new Dictionary<string, string>(StringComparer.Ordinal)
         {
-            ["TensorEq"] = "Forward parity fails: maxUlp=1065353216 @[0] a=0 b=1 (GPU worse than the double "
-                         + "oracle). The gradient divergence is that same wrong comparison result flowing "
-                         + "through ProjectBits' TensorWhere. Fix belongs to the forward kernel.",
-            ["TensorIsClose"] = "Forward parity fails: maxUlp=1065353216 @[6] a=1 b=0. As TensorEq.",
         };
 
     /// <summary>
