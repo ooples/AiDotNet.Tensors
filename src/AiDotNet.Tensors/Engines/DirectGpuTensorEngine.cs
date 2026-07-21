@@ -7,6 +7,9 @@ using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.Gpu;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
+#if NET5_0_OR_GREATER
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+#endif
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -4001,17 +4004,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return destinationArray is not null;
     }
 
+    private static bool IsCanonicalDenseAllocation<T>(Tensor<T> tensor)
+        => tensor.IsContiguous && !tensor.IsSparse
+            && tensor._storageOffset == 0 && tensor._storage.Length == tensor.Length;
+
     private OwnedBuffer GetOrAllocateContiguousInputBuffer<T>(IDirectGpuBackend backend, Tensor<T> tensor)
     {
         // Validate the logical-to-physical contract before accepting ANY
         // resident/cached fast path. A contiguous view with a storage offset,
         // or a view into a larger backing allocation, is not a canonical base
         // pointer and cannot be passed to a stride-free device kernel.
-        if (!tensor.IsContiguous || tensor.IsSparse)
-            throw new InvalidOperationException("GPU destination-aware tensor ops require contiguous dense inputs.");
-        if (tensor._storageOffset != 0 || tensor._storage.Length != tensor.Length)
+        if (!IsCanonicalDenseAllocation(tensor))
             throw new InvalidOperationException(
-                "GPU destination-aware tensor ops require a zero-offset canonical allocation.");
+                "GPU destination-aware tensor ops require a contiguous, dense, zero-offset canonical allocation.");
 
         // #3 FP16-act CONVERT-AT-GAP: an FP16-tagged input → stable up-converted FP32 (see GetResidentOrPersistentInputBuffer).
         var tHalfC = TryFp16ResidentInput(tensor, out var tCountC);
@@ -10066,17 +10071,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // stream-capture safe. Captured graphs keep the established
             // resident NVRTC path until a PTX prewarm/capture API is added.
             && !directCuda.IsStreamCapturing()
-            && seqQ == seqK && seqQ is 16 or 32 or 64 or 128 && headDim == 64
+            && seqQ == seqK
+            && PtxOnlineFusedAttention128x64Kernel.IsSupportedSequenceLength(seqQ)
+            && headDim == PtxOnlineFusedAttention128x64Kernel.HeadDimension
             && key.Shape._dims[0] == batch && value.Shape._dims[0] == batch
             && key.Shape._dims[1] == heads && value.Shape._dims[1] == heads
             && key.Shape._dims[3] == headDim && value.Shape._dims[2] == seqK
             && value.Shape._dims[3] == headDim
-            && query.IsContiguous && key.IsContiguous && value.IsContiguous
-            && !query.IsSparse && !key.IsSparse && !value.IsSparse
-            && query._storageOffset == 0 && key._storageOffset == 0 && value._storageOffset == 0
-            && query._storage.Length == query.Length
-            && key._storage.Length == key.Length
-            && value._storage.Length == value.Length)
+            && IsCanonicalDenseAllocation(query)
+            && IsCanonicalDenseAllocation(key)
+            && IsCanonicalDenseAllocation(value))
         {
             IGpuBuffer? queryHalfOwned = null;
             IGpuBuffer? keyHalfOwned = null;

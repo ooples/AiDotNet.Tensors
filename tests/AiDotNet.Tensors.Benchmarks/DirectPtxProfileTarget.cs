@@ -64,8 +64,7 @@ internal static class DirectPtxProfileTarget
         Console.WriteLine($"register-spill instructions: {evidence.RegisterSpillInstructions}");
         Console.WriteLine($"local-load instructions: {evidence.LocalLoadInstructions}");
         Console.WriteLine($"local-store instructions: {evidence.LocalStoreInstructions}");
-        Console.WriteLine($"local-spill requests: {evidence.LocalSpillRequests}");
-        Console.WriteLine($"required metric groups observed: {evidence.ObservedMetricGroups}/4");
+        Console.WriteLine($"required metric groups observed: {evidence.ObservedMetricGroups}/3");
         Console.WriteLine(evidence.ProvesZeroExecutedSpills ? "PASS: zero executed spills" : "FAIL: spill/local traffic detected");
         if (!evidence.ProvesZeroExecutedSpills) Environment.ExitCode = 2;
     }

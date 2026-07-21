@@ -16,7 +16,7 @@ internal static class GpuBenchmarkEnvironment
                 FileName = "nvidia-smi",
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
-                RedirectStandardError = true,
+                RedirectStandardError = false,
                 CreateNoWindow = true
             };
             start.ArgumentList.Add("--query-gpu=name,uuid,driver_version,pstate,clocks.sm,clocks.mem,temperature.gpu,power.draw,power.limit");

@@ -30,6 +30,21 @@ internal static class DirectPtxGpuMatrixExperiment
 
     internal static void Run()
     {
+        if (!DirectPtxRuntime.IsAvailable)
+        {
+            Console.WriteLine("NVIDIA CUDA Driver API is unavailable.");
+            return;
+        }
+        using (var probe = new DirectPtxRuntime())
+        {
+            if (!DirectPtxArchitecture.HasValidatedOnlineAttention(probe.ArchitectureFamily))
+            {
+                Console.WriteLine(
+                    $"Direct PTX online attention has no validated {probe.ArchitectureFamily} specialization.");
+                return;
+            }
+        }
+
         GpuBenchmarkEnvironment.PrintSnapshot("start");
         Console.WriteLine(
             $"NVIDIA GPU-only steady-state matrix ({LaunchesPerSample} launches/sample, FP16 Q/K/V, FP32 output, D=64)");

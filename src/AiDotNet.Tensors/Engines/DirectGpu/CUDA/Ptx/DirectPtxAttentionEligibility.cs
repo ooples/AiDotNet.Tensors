@@ -61,7 +61,7 @@ internal static class DirectPtxAttentionEligibility
             return DirectPtxEligibilityResult.Reject("gqa-mqa-not-implemented");
         if (request.QuerySequence != request.KeyValueSequence)
             return DirectPtxEligibilityResult.Reject("non-square-attention-not-implemented");
-        if (request.QuerySequence is not (16 or 32 or 64 or 128))
+        if (!PtxOnlineFusedAttention128x64Kernel.IsSupportedSequenceLength(request.QuerySequence))
             return DirectPtxEligibilityResult.Reject("sequence-bucket-not-implemented");
         if (request.HeadDimension != PtxOnlineFusedAttention128x64Kernel.HeadDimension)
             return DirectPtxEligibilityResult.Reject("head-dimension-not-64");

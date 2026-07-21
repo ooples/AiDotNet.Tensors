@@ -32,7 +32,7 @@ internal sealed class PtxAttentionSoftmax32Kernel : IDisposable
     {
         _runtime = runtime ?? throw new ArgumentNullException(nameof(runtime));
         if (batchHeads <= 0 || batchHeads > 65535) throw new ArgumentOutOfRangeException(nameof(batchHeads));
-        if (sequenceLength is not (16 or 32 or 64 or 128))
+        if (!PtxOnlineFusedAttention128x64Kernel.IsSupportedSequenceLength(sequenceLength))
             throw new ArgumentOutOfRangeException(nameof(sequenceLength));
 
         BatchHeads = batchHeads;
@@ -71,7 +71,7 @@ internal sealed class PtxAttentionSoftmax32Kernel : IDisposable
         int ccMajor, int ccMinor, bool isCausal,
         int sequenceLength = DefaultSequenceLength)
     {
-        if (sequenceLength is not (16 or 32 or 64 or 128))
+        if (!PtxOnlineFusedAttention128x64Kernel.IsSupportedSequenceLength(sequenceLength))
             throw new ArgumentOutOfRangeException(nameof(sequenceLength));
         int valuesPerLane = (sequenceLength + 31) / 32;
         var ptx = new StringBuilder(16 * 1024);

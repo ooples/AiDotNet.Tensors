@@ -19,6 +19,9 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
     internal const int QueryTileRows = 16;
     internal const int KeyTileRows = 16;
 
+    internal static bool IsSupportedSequenceLength(int sequenceLength)
+        => sequenceLength is 16 or 32 or 64 or 128;
+
     private readonly DirectPtxModule _module;
     private readonly IntPtr _function;
 
@@ -64,7 +67,7 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
         if (batchHeads <= 0 || batchHeads > 65535) throw new ArgumentOutOfRangeException(nameof(batchHeads));
         if (!float.IsFinite(scale)) throw new ArgumentOutOfRangeException(nameof(scale));
         if (!float.IsFinite(epsilon) || epsilon <= 0) throw new ArgumentOutOfRangeException(nameof(epsilon));
-        if (sequenceLength is not (16 or 32 or 64 or 128))
+        if (!IsSupportedSequenceLength(sequenceLength))
             throw new ArgumentOutOfRangeException(
                 nameof(sequenceLength), "Online PTX sequence length must be one of 16, 32, 64, or 128.");
         if (!DirectPtxArchitecture.HasValidatedOnlineAttention(runtime.ArchitectureFamily))
@@ -237,7 +240,7 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
         bool emitSoftmaxStats = true,
         int? warpsPerBlock = null)
     {
-        if (sequenceLength is not (16 or 32 or 64 or 128))
+        if (!IsSupportedSequenceLength(sequenceLength))
             throw new ArgumentOutOfRangeException(nameof(sequenceLength));
         int inputBytesPerHead = sequenceLength * HeadDimension * sizeof(ushort);
         int outputBytesPerHead = sequenceLength * HeadDimension * sizeof(float);

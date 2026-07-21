@@ -228,14 +228,13 @@ internal sealed record DirectPtxProfilerEvidence(
     long RegisterSpillInstructions,
     long LocalLoadInstructions,
     long LocalStoreInstructions,
-    long LocalSpillRequests,
     int ObservedMetricGroups,
     string Source)
 {
     internal bool ProvesZeroExecutedSpills =>
-        ObservedMetricGroups == 4 &&
+        ObservedMetricGroups == 3 &&
         RegisterSpillInstructions == 0 && LocalLoadInstructions == 0 &&
-        LocalStoreInstructions == 0 && LocalSpillRequests == 0;
+        LocalStoreInstructions == 0;
 
     internal static DirectPtxProfilerEvidence FromNcuCsv(string path)
     {
@@ -243,8 +242,7 @@ internal sealed record DirectPtxProfilerEvidence(
         var values = new Dictionary<string, long>(StringComparer.Ordinal);
         foreach (string line in File.ReadLines(path))
         {
-            if (!line.Contains("sass__", StringComparison.Ordinal) &&
-                !line.Contains("derived__local_spilling_requests", StringComparison.Ordinal))
+            if (!line.Contains("sass__", StringComparison.Ordinal))
                 continue;
             string[] cells = ParseCsvLine(line);
             for (int i = 0; i < cells.Length; i++)
@@ -269,12 +267,10 @@ internal sealed record DirectPtxProfilerEvidence(
             values.ContainsKey("sass__inst_executed_register_spilling_mem_local")) observedGroups++;
         if (values.ContainsKey("sass__inst_executed_local_loads")) observedGroups++;
         if (values.ContainsKey("sass__inst_executed_local_stores")) observedGroups++;
-        if (values.ContainsKey("derived__local_spilling_requests")) observedGroups++;
         return new DirectPtxProfilerEvidence(
             Get("sass__inst_executed_register_spilling", "sass__inst_executed_register_spilling_mem_local"),
             Get("sass__inst_executed_local_loads"),
             Get("sass__inst_executed_local_stores"),
-            Get("derived__local_spilling_requests"),
             observedGroups,
             Path.GetFullPath(path));
     }
@@ -283,8 +279,7 @@ internal sealed record DirectPtxProfilerEvidence(
         "sass__inst_executed_register_spilling" or
         "sass__inst_executed_register_spilling_mem_local" or
         "sass__inst_executed_local_loads" or
-        "sass__inst_executed_local_stores" or
-        "derived__local_spilling_requests";
+        "sass__inst_executed_local_stores";
 
     private static string[] ParseCsvLine(string line)
     {

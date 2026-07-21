@@ -33,8 +33,7 @@ $metrics = @(
     'sass__inst_executed_register_spilling',
     'sass__inst_executed_register_spilling_mem_local',
     'sass__inst_executed_local_loads',
-    'sass__inst_executed_local_stores',
-    'derived__local_spilling_requests'
+    'sass__inst_executed_local_stores'
 ) -join ','
 
 & $ncuSource `

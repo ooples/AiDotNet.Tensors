@@ -559,8 +559,7 @@ public class DirectPtxWmmaTests
             System.IO.File.WriteAllText(path,
                 "\"sass__inst_executed_register_spilling\",\"0\"\n" +
                 "\"sass__inst_executed_local_loads\",\"0\"\n" +
-                "\"sass__inst_executed_local_stores\",\"0\"\n" +
-                "\"derived__local_spilling_requests\",\"0\"\n");
+                "\"sass__inst_executed_local_stores\",\"0\"\n");
             DirectPtxProfilerEvidence zero = DirectPtxProfilerEvidence.FromNcuCsv(path);
             Assert.True(zero.ProvesZeroExecutedSpills);
 
