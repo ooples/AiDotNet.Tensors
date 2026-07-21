@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'fused-linear', 'mixed-linear')]
+    [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'fused-linear', 'mixed-linear', 'mixed-linear-m16')]
     [string]$Target = 'attention',
     [string]$OutputCsv = (Join-Path ([System.IO.Path]::GetTempPath()) ("aidotnet-direct-ptx-ncu-" + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.csv')),
     [string]$NcuPath = $env:NSIGHT_COMPUTE_CLI
@@ -29,6 +29,7 @@ $switch = switch ($Target) {
     'qkv-rope-cache' { '--direct-ptx-profile-qkv-rope-cache' }
     'fused-linear' { '--direct-ptx-profile-fused-linear' }
     'mixed-linear' { '--direct-ptx-profile-mixed-linear' }
+    'mixed-linear-m16' { '--direct-ptx-profile-mixed-linear-m16' }
 }
 $kernel = switch ($Target) {
     'attention' { 'regex:aidotnet_online_attention_128x64' }
@@ -40,6 +41,7 @@ $kernel = switch ($Target) {
     'qkv-rope-cache' { 'regex:aidotnet_qkv_rope_cache_d64' }
     'fused-linear' { 'regex:aidotnet_fused_linear_gelu_m1' }
     'mixed-linear' { 'regex:aidotnet_fused_linear_gelu_fp16_m1' }
+    'mixed-linear-m16' { 'regex:aidotnet_fused_linear_gelu_fp16_m16' }
 }
 $expectedLaunches = switch ($Target) {
     'attention' { 16 }
@@ -51,6 +53,7 @@ $expectedLaunches = switch ($Target) {
     'qkv-rope-cache' { 3 }
     'fused-linear' { 10 }
     'mixed-linear' { 10 }
+    'mixed-linear-m16' { 10 }
 }
 $metricNames = @(
     'smsp__sass_inst_executed_op_local.sum',

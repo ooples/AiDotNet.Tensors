@@ -8,12 +8,15 @@ Parent blueprint: `2026-07-20-fused-attention-championship-blueprint.md`
 
 ## Verdict
 
-The first #837 golden slice is a decode-token FP16 linear with FP32
+The first two #837 golden slices are FP16 linear kernels with FP32
 accumulation, FP32 bias, and tanh-GELU:
 
 ```text
 input FP16 [K] + output-major weights FP16 [N,K] + bias FP32 [N]
     -> gelu_tanh(fp32(input @ transpose(weights)) + bias) FP32 [N]
+
+input FP16 [16,K] + output-major weights FP16 [N,K] + bias FP32 [N]
+    -> gelu_tanh(fp32(input @ transpose(weights)) + bias) FP32 [16,N]
 ```
 
 The Ampere `K=512,N=2048` and `K=1024,N=4096` cells beat every measured
@@ -23,7 +26,10 @@ all three paired runs, also win paired P95, allocate 0 managed bytes/call, use
 only promoted v2 cells. `256x256` remains fail-closed because one run was a
 1.01x near tie with PyTorch CUDA Graph.
 
-This PR is the first increment of #837, not closure. The executable 14-cell
+The M=16 v3 slice extends that result with bank-conflict-free shared panels,
+double-buffered `cp.async`, `mma.sync.m16n8k16`, a register-resident fused
+epilogue, and one final output store. Its two promoted cells beat every
+measured GPU peer on median in all three final runs. The executable 15-cell
 `DirectPtxQuantizedMixedSparseCoverageManifest` assigns the remaining FP16
 GEMM/backward, INT8, INT4, FP8, 2:4, and CSR operations to later direct-PTX
 families.
@@ -40,7 +46,7 @@ one warp own two output rows:
 3. warp shuffles reduce the two dot products;
 4. lane zero adds FP32 bias, evaluates tanh-GELU, and stores each output once.
 
-The next M>=16 specialization is a separate kernel family using
+The M=16 specialization is a separate kernel family using
 `cp.async`-staged panels and `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32`.
 The blueprint chooses the primitive by shape evidence rather than requiring
 Tensor Cores where their tile geometry is counterproductive.
@@ -66,6 +72,16 @@ fallback reasons and execute FP16 cuBLAS plus resident bias/GELU kernels.
 The kernel has no shared memory, global intermediate, scratch allocation, or
 second output write. FP16 halves input/weight traffic relative to #836 while
 retaining FP32 accumulation and output accuracy.
+
+The v3 M=16 ABI keeps the same four-pointer launch and changes only the exact
+input/output extents to `[16,K]` and `[16,N]` with canonical `RowMajor2D`
+tokens. It has no runtime stride, M, K, N, layout, dtype, or epilogue
+parameters. K=512 uses K=64 asynchronous stages (12,288 shared bytes); K=1024
+uses K=128 stages (24,576 shared bytes). Each stage is rearranged into compact
+K=16 subpanels so MMA fragment loads do not introduce shared-bank conflicts.
+Four warps reuse one staged A panel across 32 output columns. Accumulators,
+bias, and GELU remain in FP32 registers until one `st.global.v2.f32` per
+fragment row.
 
 ## GPU-only championship evidence
 
@@ -115,6 +131,37 @@ For 512x2048 the conservative cross-run median ratio is
 are 1.35x, 1.37x, and 1.37x. Direct P95 is below the paired PyTorch P95 in
 all six promoted-shape runs.
 
+## M=16 Tensor Core championship evidence
+
+The M=16 harness uses the same environment and sampling contract. FLOP rate
+is `2*16*K*N / device median`; epilogue operations are excluded. The table is
+the min-max range from the final three independent runs. PyTorch's FP16 GEMM
+rounding explains its larger reported error. No conversion, transpose,
+allocation, or transfer is timed for any peer.
+
+| Shape | Method | median us | P95 us | P99 us | TFLOPS | managed B/call | temp device B | max error |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| M16 512x2048 | Direct PTX | 7.76-11.61 | 9.11-18.31 | 13.78-21.71 | 2.890-4.323 | 0 | 0 | 2.5e-7-3.7e-7 |
+| M16 512x2048 | NVIDIA cuBLAS | 26.99-39.32 | 32.30-47.19 | 37.31-55.56 | 0.853-1.243 | 40 | 0 | 2.5e-7-3.7e-7 |
+| M16 512x2048 | cuBLAS Graph | 15.83-22.87 | 21.59-28.02 | 23.61-33.61 | 1.467-2.120 | 0 | 0 | 2.5e-7-3.7e-7 |
+| M16 512x2048 | NVIDIA cuBLASLt | 23.27-29.70 | 27.69-38.60 | 32.07-48.01 | 1.130-1.442 | 248 | 0 | 2.5e-7-3.7e-7 |
+| M16 512x2048 | cuBLASLt Graph | 25.50-29.37 | 30.72-35.04 | 34.25-38.79 | 1.143-1.316 | 0 | 0 | 2.5e-7-3.7e-7 |
+| M16 512x2048 | PyTorch eager | 116.04-116.98 | 123.62-145.22 | 128.31-157.27 | 0.287-0.289 | n/a | 262,144 | 3.9e-5-4.1e-5 |
+| M16 512x2048 | PyTorch Graph | 12.27-12.51 | 15.38-17.76 | 16.63-20.34 | 2.682-2.735 | n/a | 0 | 3.9e-5-4.1e-5 |
+| M16 1024x4096 | Direct PTX | 14.25-14.68 | 15.22-16.22 | 15.54-18.15 | 9.140-9.416 | 0 | 0 | 8.0e-7-1.3e-6 |
+| M16 1024x4096 | NVIDIA cuBLAS | 33.46-37.09 | 41.31-42.99 | 44.97-47.49 | 3.619-4.011 | 40 | 0 | 8.0e-7-1.3e-6 |
+| M16 1024x4096 | cuBLAS Graph | 31.08-35.33 | 35.10-39.71 | 39.67-45.83 | 3.799-4.318 | 0 | 0 | 8.0e-7-1.3e-6 |
+| M16 1024x4096 | NVIDIA cuBLASLt | 22.04-27.93 | 25.50-35.16 | 28.75-38.58 | 4.805-6.091 | 248 | 0 | 8.0e-7-1.3e-6 |
+| M16 1024x4096 | cuBLASLt Graph | 31.89-36.45 | 35.94-40.47 | 39.57-45.47 | 3.682-4.209 | 0 | 0 | 8.0e-7-1.3e-6 |
+| M16 1024x4096 | PyTorch eager | 107.19-112.74 | 113.73-135.27 | 117.43-149.89 | 1.190-1.252 | n/a | 524,288 | 8.6e-5-9.3e-5 |
+| M16 1024x4096 | PyTorch Graph | 21.16-21.25 | 21.83-24.00 | 25.29-26.91 | 6.315-6.344 | n/a | 0 | 8.6e-5-9.3e-5 |
+
+Direct PTX wins all six paired medians. Conservative worst-direct versus
+best-PyTorch-Graph median ratios are `12.27/11.61 = 1.057x` for 512x2048 and
+`21.16/14.68 = 1.441x` for 1024x4096. The large cell also wins all paired
+P95/P99 samples. The small cell wins two of three paired P95 samples; this
+tail caveat is retained in the evidence even though its median gate passes.
+
 ## Resource and spill evidence
 
 The promoted 512x2048 module records:
@@ -138,6 +185,26 @@ Nsight Compute 2026.2.1 attaches to
 therefore not claimed. The CSV verifier remains the release-evidence gate once
 an administrator enables NVIDIA performance counters.
 
+The v3 M=16 K=1024/N=4096 module records:
+
+```text
+BlueprintId: fused-linear-bias-gelu-v3-Ampere-tensorcore-async-fp16-fp32acc-m16-k1024-n4096
+DeviceFingerprint: gpu-79d5ac8ef419a3bce86d78a8222664cd-sm86-drv13030
+PTX SHA-256: 5cd14a7a65fde5f1aa86a3c4633ee03448f373c3bd617b667f39fa3ff2a57cd1
+registers/thread: 32
+static shared: 24,576
+local bytes/thread: 0
+active 128-thread blocks/SM: 4
+PTX/binary version: 86/86
+```
+
+The K=512/N=2048 module reports 40 registers/thread, 12,288 static shared
+bytes, 0 local bytes/thread, and seven active blocks/SM. These driver-JIT
+attributes are enforced before either module enters the cache and prove that
+the compiled function has no local-memory frame or spill allocation. The new
+`mixed-linear-m16` Nsight target attaches to the correct entry point, but the
+host again returns `ERR_NVGPUCTRPERM`; executed-counter proof is not claimed.
+
 ## Reproduction
 
 ```powershell
@@ -145,15 +212,22 @@ $env:AIDOTNET_DIRECT_PTX_MIXED_LINEAR = '1'
 dotnet run --project tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.csproj `
   -c Release -- --direct-ptx-mixed-linear 3
 
+dotnet run --project tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.csproj `
+  -c Release -- --direct-ptx-mixed-linear-m16 3
+
 powershell -ExecutionPolicy Bypass -File `
   tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-ncu.ps1 `
   -Target mixed-linear
+
+powershell -ExecutionPolicy Bypass -File `
+  tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-ncu.ps1 `
+  -Target mixed-linear-m16
 ```
 
 ## Next #837 increments
 
-1. FP16 and BF16 M>=16 async panel staging plus Tensor Core MMA with fused
-   bias/GELU/residual epilogues.
+1. Generalize the proven FP16 M=16 async panel family to larger M buckets,
+   BF16, and fused residual epilogues without adding dynamic stride checks.
 2. W8A8 INT8 DP4A/IMMA and W4A16 register-dequant projection families.
 3. FP8 E4M3/E5M2 architecture-specific families with explicit scale ABI.
 4. Native 2:4 `mma.sp` GEMM and fused bias/activation without decompression.
