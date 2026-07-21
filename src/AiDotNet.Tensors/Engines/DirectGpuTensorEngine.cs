@@ -20549,6 +20549,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // comparison ops (TensorIsNan/IsInf/IsFinite, TensorEqScalar, TensorLogicalAnd/Not/Or/Xor,
         // TensorIsIn) when where_select was first added. Requiring an already-resident condition keeps those
         // correct on the CPU path while letting the comparison -> where chain stay on the device.
+        // MEASURED 2026-07-20 for the comparison family (TensorIsNan/IsInf/IsFinite, TensorEq,
+        // TensorLogicalAnd/Not/Or/Xor): the mask arriving here reports
+        //     arr=Bit[]  cached=False  tensorBuf=False  IsGpuResident=False
+        // i.e. it is NOT resident by any measure, so this gate cannot fire for them and they stay on the
+        // CPU path. Those ops sit at "launches 1/2" on the residency worklist, and the missing launch is NOT
+        // this Where — the chain has already left the device before it. Fixing them means making the
+        // PRODUCING comparison op keep its mask resident; this gate is then already in place to carry the
+        // mask through.
         // Residency for a Bit mask lives in the ACTIVATION CACHE, keyed by backing array — FinishGpuOp
         // registers it there and defers the download; it is NOT exposed through Tensor.TryGetGpuBuffer(),
         // which stays null for these. Probe the cache directly, or this always falls back and the
