@@ -21,6 +21,7 @@ internal static class DirectPtxFeatureGate
     internal const string FlashAttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FLASH_ATTENTION_BACKWARD";
     internal const string QkvRopeCacheEnvironmentVariable = "AIDOTNET_DIRECT_PTX_QKV_ROPE_CACHE";
     internal const string FusedLinearEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FUSED_LINEAR";
+    internal const string MixedPrecisionLinearEnvironmentVariable = "AIDOTNET_DIRECT_PTX_MIXED_LINEAR";
     internal const string AutotuneEnvironmentVariable = "AIDOTNET_DIRECT_PTX_AUTOTUNE";
     internal const string CacheCapacityEnvironmentVariable = "AIDOTNET_DIRECT_PTX_CACHE_CAPACITY";
 
@@ -37,6 +38,7 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentFlashAttentionBackwardEnabled = ReadEnabled(FlashAttentionBackwardEnvironmentVariable);
     private static readonly bool EnvironmentQkvRopeCacheEnabled = ReadEnabled(QkvRopeCacheEnvironmentVariable);
     private static readonly bool EnvironmentFusedLinearEnabled = ReadEnabled(FusedLinearEnvironmentVariable);
+    private static readonly bool EnvironmentMixedPrecisionLinearEnabled = ReadEnabled(MixedPrecisionLinearEnvironmentVariable);
     private static readonly bool EnvironmentAutotuneEnabled =
         !string.Equals(Environment.GetEnvironmentVariable(AutotuneEnvironmentVariable), "0", StringComparison.Ordinal);
     private static readonly int EnvironmentCacheCapacity = ReadCacheCapacity();
@@ -45,6 +47,8 @@ internal static class DirectPtxFeatureGate
     internal static bool? TestOverride { get; set; }
     /// <summary>Benchmark-only access to measured cells that have not passed promotion.</summary>
     internal static bool FusedLinearExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to mixed-precision cells that have not passed promotion.</summary>
+    internal static bool MixedPrecisionLinearExperimentOverride { get; set; }
 
     internal static bool IsEnabled => IsAttentionEnabled;
 
@@ -74,6 +78,9 @@ internal static class DirectPtxFeatureGate
 
     internal static bool IsFusedLinearEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentFusedLinearEnabled);
+
+    internal static bool IsMixedPrecisionLinearEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentMixedPrecisionLinearEnabled);
 
     internal static bool IsAutotuneEnabled => EnvironmentAutotuneEnabled;
 

@@ -84,6 +84,12 @@ class Program
             DirectPtxFusedLinearExperiment.Run(runs);
             return;
         }
+        if (args.Length > 0 && args[0] == "--direct-ptx-mixed-linear")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxMixedLinearExperiment.Run(runs);
+            return;
+        }
         if (args.Length > 0 && args[0] == "--direct-ptx-external-gpu-baselines")
         {
             DirectPtxExternalBaselines.Run();
@@ -102,6 +108,11 @@ class Program
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-fused-linear")
         {
             DirectPtxProfileTarget.RunFusedLinear();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-mixed-linear")
+        {
+            DirectPtxProfileTarget.RunMixedLinear();
             return;
         }
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-decode")
@@ -1071,6 +1082,7 @@ class Program
         Console.WriteLine("  --direct-ptx-online-attention: Async online S128/D64 GPU championship table");
         Console.WriteLine("  --direct-ptx-gpu-matrix: NVIDIA-only S16/S32/S64/S128 attention matrix");
         Console.WriteLine("  --direct-ptx-fused-linear [runs]: FP32 M=1 linear+bias+GELU championship matrix");
+        Console.WriteLine("  --direct-ptx-mixed-linear [runs]: FP16 M=1 linear+bias+GELU championship matrix");
         Console.WriteLine("  --direct-ptx-attention-family [runs]: rectangular MHA/GQA/MQA resident release matrix");
         Console.WriteLine("  --direct-ptx-decode [runs]: dense and paged D64 decode resident release matrix");
         Console.WriteLine("  --direct-ptx-paged-prefill [runs]: causal D64 paged-prefill release matrix");
@@ -1081,6 +1093,7 @@ class Program
         Console.WriteLine("  --direct-ptx-profile-attention: deterministic Nsight Compute attention target");
         Console.WriteLine("  --direct-ptx-profile-residual-rmsnorm: deterministic Nsight Compute fusion target");
         Console.WriteLine("  --direct-ptx-profile-fused-linear: deterministic Nsight fused-linear target");
+        Console.WriteLine("  --direct-ptx-profile-mixed-linear: deterministic Nsight FP16 mixed-linear target");
         Console.WriteLine("  --direct-ptx-profile-decode: deterministic Nsight Compute dense+paged decode target");
         Console.WriteLine("  --direct-ptx-profile-paged-prefill: deterministic Nsight Compute paged-prefill target");
         Console.WriteLine("  --direct-ptx-profile-attention-backward: deterministic Nsight Compute backward target");

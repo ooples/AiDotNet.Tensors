@@ -32,6 +32,8 @@ public sealed partial class CudaBackend
         _directPtxQkvRopeCacheKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<DirectPtxFusedLinearKey, PtxFusedLinearGeluM1Kernel>
         _directPtxFusedLinearKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<DirectPtxFusedLinearKey, PtxFusedLinearGeluFp16M1Kernel>
+        _directPtxMixedLinearKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private DirectPtxRuntime? _directPtxRuntime;
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
@@ -46,6 +48,7 @@ public sealed partial class CudaBackend
     private long _directPtxFlashAttentionBackwardDispatchCount;
     private long _directPtxQkvRopeCacheDispatchCount;
     private long _directPtxFusedLinearDispatchCount;
+    private long _directPtxMixedLinearDispatchCount;
     internal int DirectPtxCachedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxAttentionKernels.Count; }
@@ -86,6 +89,10 @@ public sealed partial class CudaBackend
     internal bool IsDirectPtxFusedLinearEnabled =>
         DirectPtxFeatureGate.IsFusedLinearEnabled && IsAvailable &&
         DirectPtxArchitecture.HasValidatedFusedLinear(_ccMajor, _ccMinor);
+
+    internal bool IsDirectPtxMixedLinearEnabled =>
+        DirectPtxFeatureGate.IsMixedPrecisionLinearEnabled && IsAvailable &&
+        DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) == DirectPtxArchitectureFamily.Ampere;
 
     internal long DirectPtxResidualRmsNormDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxResidualRmsNormDispatchCount);
@@ -350,6 +357,145 @@ public sealed partial class CudaBackend
         {
             var key = new DirectPtxQkvRopeCacheKey(heads, cacheCapacity, position);
             if (_directPtxQkvRopeCacheKernels.TryGetValue(key, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null!;
+        return false;
+    }
+
+    internal long DirectPtxMixedLinearDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxMixedLinearDispatchCount);
+
+    /// <summary>
+    /// Attempts the exact contiguous FP16-input/weight, FP32-accumulate M=1
+    /// linear + FP32 bias + tanh-GELU specialization.
+    /// </summary>
+    internal bool TryDirectPtxFusedLinearGeluFp16M1(
+        IGpuBuffer inputHalf,
+        IGpuBuffer outputMajorWeightsHalf,
+        IGpuBuffer biasFloat,
+        IGpuBuffer outputFloat,
+        int inputFeatures,
+        int outputFeatures)
+    {
+        if (!IsDirectPtxMixedLinearEnabled) return false;
+        if (!PtxFusedLinearGeluFp16M1Kernel.IsSupportedShape(inputFeatures, outputFeatures))
+        {
+            DirectPtxLastError = "mixed-linear-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedLinearGeluFp16M1Kernel.IsPromotedShape(inputFeatures, outputFeatures) &&
+            !DirectPtxFeatureGate.MixedPrecisionLinearExperimentOverride)
+        {
+            DirectPtxLastError = "mixed-linear-performance-gate-not-met";
+            return false;
+        }
+        long inputBytes = checked((long)inputFeatures * sizeof(ushort));
+        long weightBytes = checked((long)inputFeatures * outputFeatures * sizeof(ushort));
+        long outputBytes = checked((long)outputFeatures * sizeof(float));
+        if (inputHalf.SizeInBytes != inputBytes ||
+            outputMajorWeightsHalf.SizeInBytes != weightBytes ||
+            biasFloat.SizeInBytes != outputBytes || outputFloat.SizeInBytes != outputBytes)
+        {
+            DirectPtxLastError = "mixed-linear-physical-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            EnsureContextCurrent();
+            var key = new DirectPtxFusedLinearKey(inputFeatures, outputFeatures);
+            lock (_directPtxLock)
+            {
+                if (!_directPtxMixedLinearKernels.TryGetValue(
+                    key, out PtxFusedLinearGeluFp16M1Kernel? kernel))
+                {
+                    if (IsStreamCapturing())
+                    {
+                        DirectPtxLastError =
+                            "Direct PTX mixed linear must be prewarmed before CUDA graph capture.";
+                        return false;
+                    }
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    kernel = CreateAndCacheMixedLinearKernelSlow(key);
+                }
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(inputHalf, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(outputMajorWeightsHalf, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(biasFloat, kernel.Blueprint.Tensors[2]),
+                        DirectPtxTensorView.Create(outputFloat, kernel.Blueprint.Tensors[3]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxMixedLinearDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    private PtxFusedLinearGeluFp16M1Kernel CreateAndCacheMixedLinearKernelSlow(
+        DirectPtxFusedLinearKey key) =>
+        _directPtxMixedLinearKernels.GetOrAdd(key, () =>
+            new PtxFusedLinearGeluFp16M1Kernel(
+                _directPtxRuntime!, key.InputFeatures, key.OutputFeatures));
+
+    internal bool PrewarmDirectPtxFusedLinearGeluFp16M1(
+        int inputFeatures,
+        int outputFeatures)
+    {
+        if (!IsDirectPtxMixedLinearEnabled) return false;
+        if (!PtxFusedLinearGeluFp16M1Kernel.IsSupportedShape(inputFeatures, outputFeatures))
+        {
+            DirectPtxLastError = "mixed-linear-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedLinearGeluFp16M1Kernel.IsPromotedShape(inputFeatures, outputFeatures) &&
+            !DirectPtxFeatureGate.MixedPrecisionLinearExperimentOverride)
+        {
+            DirectPtxLastError = "mixed-linear-performance-gate-not-met";
+            return false;
+        }
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX mixed linear prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                var key = new DirectPtxFusedLinearKey(inputFeatures, outputFeatures);
+                if (!_directPtxMixedLinearKernels.TryGetValue(key, out _))
+                    _ = CreateAndCacheMixedLinearKernelSlow(key);
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxMixedLinearAudit(
+        int inputFeatures,
+        int outputFeatures,
+        out DirectPtxKernelAudit audit)
+    {
+        lock (_directPtxLock)
+        {
+            var key = new DirectPtxFusedLinearKey(inputFeatures, outputFeatures);
+            if (_directPtxMixedLinearKernels.TryGetValue(key, out var kernel))
             {
                 audit = kernel.Audit;
                 return true;
@@ -1953,6 +2099,7 @@ public sealed partial class CudaBackend
             _directPtxFlashAttentionBackwardKernels.Dispose();
             _directPtxQkvRopeCacheKernels.Dispose();
             _directPtxFusedLinearKernels.Dispose();
+            _directPtxMixedLinearKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }
