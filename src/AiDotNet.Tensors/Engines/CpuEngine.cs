@@ -48035,10 +48035,42 @@ public partial class CpuEngine : ITensorLevelEngine
         }
     }
 
+#if NET7_0_OR_GREATER
+    // Interleaved [re,im,re,im,...] scratch buffer reused across the rows of a
+    // batched transform so the SIMD radix-2 delegation allocates at most once
+    // per thread (grown on demand). Never handed out; local to a single call.
+    [ThreadStatic] private static double[]? _fftSimdScratch;
+#endif
+
     // Span-based overload — zero-copy entry point used by NativeComplexFFTSpan hot paths.
     private static void NativeFFTInPlaceDoubleSpan(Span<Complex<double>> data, bool inverse)
     {
         int n = data.Length;
+#if NET7_0_OR_GREATER
+        // Delegate the power-of-2 transform to the SIMD radix-2 kernel used by the
+        // tested Fft.* module. IterativeRadix2NoCache is raw/unnormalized — exactly
+        // the contract of this scalar butterfly (callers apply any 1/n scaling
+        // themselves), so output layout and normalization are identical.
+        if (n >= 2 && AiDotNet.Tensors.LinearAlgebra.Fft.FftKernels.IsPowerOfTwo(n))
+        {
+            var scratch = _fftSimdScratch;
+            if (scratch is null || scratch.Length < 2 * n)
+            {
+                scratch = new double[2 * n];
+                _fftSimdScratch = scratch;
+            }
+            var buf = scratch.AsSpan(0, 2 * n);
+            for (int i = 0; i < n; i++)
+            {
+                buf[2 * i] = data[i].Real;
+                buf[2 * i + 1] = data[i].Imaginary;
+            }
+            AiDotNet.Tensors.LinearAlgebra.Fft.FftKernels.IterativeRadix2NoCache(buf, n, inverse);
+            for (int i = 0; i < n; i++)
+                data[i] = new Complex<double>(buf[2 * i], buf[2 * i + 1]);
+            return;
+        }
+#endif
         int bits = 0;
         for (int tmp = n >> 1; tmp > 0; tmp >>= 1) bits++;
 
@@ -48094,6 +48126,31 @@ public partial class CpuEngine : ITensorLevelEngine
     private static void NativeFFTInPlaceFloatSpan(Span<Complex<float>> data, bool inverse)
     {
         int n = data.Length;
+#if NET7_0_OR_GREATER
+        // Delegate power-of-2 transforms to the SIMD radix-2 kernel. The kernel
+        // is double-internal; float lanes are widened for the butterflies and
+        // rounded back on store (strictly no worse than the all-float scalar path,
+        // same raw/unnormalized contract).
+        if (n >= 2 && AiDotNet.Tensors.LinearAlgebra.Fft.FftKernels.IsPowerOfTwo(n))
+        {
+            var scratch = _fftSimdScratch;
+            if (scratch is null || scratch.Length < 2 * n)
+            {
+                scratch = new double[2 * n];
+                _fftSimdScratch = scratch;
+            }
+            var buf = scratch.AsSpan(0, 2 * n);
+            for (int i = 0; i < n; i++)
+            {
+                buf[2 * i] = data[i].Real;
+                buf[2 * i + 1] = data[i].Imaginary;
+            }
+            AiDotNet.Tensors.LinearAlgebra.Fft.FftKernels.IterativeRadix2NoCache(buf, n, inverse);
+            for (int i = 0; i < n; i++)
+                data[i] = new Complex<float>((float)buf[2 * i], (float)buf[2 * i + 1]);
+            return;
+        }
+#endif
         int bits = 0;
         for (int tmp = n >> 1; tmp > 0; tmp >>= 1) bits++;
 

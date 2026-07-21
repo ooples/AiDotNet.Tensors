@@ -362,6 +362,86 @@ public class NativeComplexOpsTests
     }
 
     // ================================================================
+    // FFT SIMD-delegation equivalence — NativeComplexFFT must match an
+    // independent naive DFT reference across power-of-2 sizes. Guards the
+    // radix-2 SIMD delegation (layout + normalization) against the scalar
+    // math contract.
+    // ================================================================
+
+    // Independent O(n^2) DFT reference (forward, unnormalized).
+    private static Complex<double>[] NaiveDft(double[] re)
+    {
+        int n = re.Length;
+        var outp = new Complex<double>[n];
+        for (int k = 0; k < n; k++)
+        {
+            double sumRe = 0.0, sumIm = 0.0;
+            for (int t = 0; t < n; t++)
+            {
+                double ang = -2.0 * Math.PI * k * t / n;
+                sumRe += re[t] * Math.Cos(ang);
+                sumIm += re[t] * Math.Sin(ang);
+            }
+            outp[k] = new Complex<double>(sumRe, sumIm);
+        }
+        return outp;
+    }
+
+    [Theory]
+    [InlineData(256)]
+    [InlineData(512)]
+    [InlineData(1024)]
+    public void FFT_MatchesNaiveDft_Double(int n)
+    {
+        var re = new double[n];
+        var rng = new Random(1234);
+        for (int i = 0; i < n; i++) re[i] = rng.NextDouble() * 2.0 - 1.0;
+
+        var input = new Tensor<double>([n]);
+        for (int i = 0; i < n; i++) input[i] = re[i];
+
+        var spectrum = _engine.NativeComplexFFT(input);
+        var reference = NaiveDft(re);
+
+        // Absolute tolerance scaled by n (DFT magnitudes grow with n).
+        double tol = 1e-4 * n;
+        for (int k = 0; k < n; k++)
+        {
+            Assert.True(Math.Abs(spectrum[k].Real - reference[k].Real) < tol,
+                $"Re mismatch at k={k}, n={n}: {spectrum[k].Real} vs {reference[k].Real}");
+            Assert.True(Math.Abs(spectrum[k].Imaginary - reference[k].Imaginary) < tol,
+                $"Im mismatch at k={k}, n={n}: {spectrum[k].Imaginary} vs {reference[k].Imaginary}");
+        }
+    }
+
+    [Theory]
+    [InlineData(256)]
+    [InlineData(512)]
+    [InlineData(1024)]
+    public void FFT_MatchesNaiveDft_Float(int n)
+    {
+        var re = new double[n];
+        var rng = new Random(4321);
+        for (int i = 0; i < n; i++) re[i] = rng.NextDouble() * 2.0 - 1.0;
+
+        var input = new Tensor<float>([n]);
+        for (int i = 0; i < n; i++) input[i] = (float)re[i];
+
+        var spectrum = _engine.NativeComplexFFT(input);
+        var reference = NaiveDft(re);
+
+        // Float accumulation over n terms: tolerance scaled for single precision.
+        double tol = 1e-2 * n;
+        for (int k = 0; k < n; k++)
+        {
+            Assert.True(Math.Abs(spectrum[k].Real - reference[k].Real) < tol,
+                $"Re mismatch at k={k}, n={n}: {spectrum[k].Real} vs {reference[k].Real}");
+            Assert.True(Math.Abs(spectrum[k].Imaginary - reference[k].Imaginary) < tol,
+                $"Im mismatch at k={k}, n={n}: {spectrum[k].Imaginary} vs {reference[k].Imaginary}");
+        }
+    }
+
+    // ================================================================
     // FFT Complex-to-Complex
     // ================================================================
 
