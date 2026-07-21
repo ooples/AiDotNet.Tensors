@@ -11661,6 +11661,11 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // NOTE: GLU is the only *GLU variant with a compiled-plan lookup (GeGLU/SwiGLU/ReGLU have none),
+        // and it is the only one failing forward parity — which looks like a strong lead and is NOT one.
+        // MEASURED 2026-07-20: instrumenting this lookup during the failing test logged 4 MISSES and ZERO
+        // hits, so the cached-plan path never executes and cannot be the source of GLU's
+        // "buffer released before materialization" (#226). Do not re-investigate this line.
         { var ac = AutoTracer.TryGetCompiledPlan<T>("GLU", input._shape); if (ac is not null) return ac.Execute(); }
 
         int dimSize = input._shape[actualDim];
