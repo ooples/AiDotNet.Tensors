@@ -206,14 +206,23 @@ extern ""C"" __global__ __launch_bounds__(256) void bce_with_logits_loss(
 
 extern ""C"" __global__ __launch_bounds__(256) void nll_loss(
     const float* __restrict__ logProbs,
-    const int* __restrict__ targets,
+    const float* __restrict__ targets,
     float* __restrict__ loss,
     int batchSize, int numClasses)
 {
     int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= batchSize) return;
 
-    int targetClass = targets[b];
+    // targets holds class indices as float VALUES (3.0f == class 3), matching
+    // CpuEngine.TensorNLLLoss which does (int)targetValue. This kernel declared them as
+    // `const int*` and so reinterpreted the float BIT PATTERN (1.0f -> 1065353216), which is
+    // always out of range, so every element took the else branch and the GPU returned 0.
+    //
+    // Same partial rollout as the SELU >= fix: #775 corrected this on OpenCL (whose kernel
+    // carries the identical explanation) and Metal, but CUDA was never updated — the registry
+    // case still records it as FIXED (#775) while forward parity measured
+    // maxAbs 4.102E+00 @[0] a=4.1015635 b=0, i.e. the CPU loss against a GPU zero.
+    int targetClass = (int)targets[b];
     loss[b] = (targetClass >= 0 && targetClass < numClasses)
         ? -logProbs[b * numClasses + targetClass] : 0.0f;
 }
