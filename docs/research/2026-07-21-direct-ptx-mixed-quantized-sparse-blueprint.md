@@ -28,8 +28,9 @@ only promoted v2 cells. `256x256` remains fail-closed because one run was a
 
 The M=16 v3 slice extends that result with bank-conflict-free shared panels,
 double-buffered `cp.async`, `mma.sync.m16n8k16`, a register-resident fused
-epilogue, and one final output store. Its two promoted cells beat every
-measured GPU peer on median in all three final runs. The executable 15-cell
+epilogue, and one final output store. The 1024/4096 cell passes the full 1.10x
+production gate; 512/2048 remains experiment-only because its conservative
+1.057x ratio misses that gate. The executable 15-cell
 `DirectPtxQuantizedMixedSparseCoverageManifest` assigns the remaining FP16
 GEMM/backward, INT8, INT4, FP8, 2:4, and CSR operations to later direct-PTX
 families.
@@ -160,7 +161,8 @@ Direct PTX wins all six paired medians. Conservative worst-direct versus
 best-PyTorch-Graph median ratios are `12.27/11.61 = 1.057x` for 512x2048 and
 `21.16/14.68 = 1.441x` for 1024x4096. The large cell also wins all paired
 P95/P99 samples. The small cell wins two of three paired P95 samples; this
-tail caveat is retained in the evidence even though its median gate passes.
+tail caveat is retained in the evidence. Only 1024x4096 is promoted: the
+512x2048 ratio is below the epic's required 1.10x production threshold.
 
 ## Resource and spill evidence
 
@@ -198,7 +200,7 @@ active 128-thread blocks/SM: 4
 PTX/binary version: 86/86
 ```
 
-The K=512/N=2048 module reports 40 registers/thread, 12,288 static shared
+The experiment-only K=512/N=2048 module reports 40 registers/thread, 12,288 static shared
 bytes, 0 local bytes/thread, and seven active blocks/SM. These driver-JIT
 attributes are enforced before either module enters the cache and prove that
 the compiled function has no local-memory frame or spill allocation. The new
