@@ -187,8 +187,27 @@ extern ""C"" __global__ __launch_bounds__(256) void cross_entropy_backward(
     int total = batchSize * numClasses;
     if (idx >= total) return;
 
-    float pred = fmaxf(predictions[idx], 1e-7f);
-    gradInput[idx] = (-targets[idx] / pred) / (float)batchSize;
+    // CONTRACT: `predictions` are LOGITS. CpuEngine.CrossEntropyBackward softmaxes them per row and
+    // returns (softmax - target) / batchSize; the OpenCL kernel does the same. This kernel instead treated
+    // them as probabilities and returned (-target / pred) / batchSize — a different derivative entirely,
+    // which forward parity measured as maxAbs 4.526E+01 @[18]: CPU 0.008488914 vs GPU -8.555251.
+    //
+    // Third instance this branch of a #775 fix landing on OpenCL/Metal and never reaching CUDA (after the
+    // SELU >= boundary and nll_loss reading float targets as int*). The registry case is even annotated
+    // FIXED (#775) while the test kept failing.
+    int b = idx / numClasses;
+    int rowOffset = b * numClasses;
+
+    float maxVal = -INFINITY;
+    for (int i = 0; i < numClasses; i++)
+        maxVal = fmaxf(maxVal, predictions[rowOffset + i]);
+
+    float sumExp = 0.0f;
+    for (int i = 0; i < numClasses; i++)
+        sumExp += expf(predictions[rowOffset + i] - maxVal);
+
+    float softmax = expf(predictions[idx] - maxVal) / sumExp;
+    gradInput[idx] = (softmax - targets[idx]) / (float)batchSize;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void bce_loss(

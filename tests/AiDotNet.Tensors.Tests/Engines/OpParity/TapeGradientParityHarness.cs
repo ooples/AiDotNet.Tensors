@@ -111,8 +111,6 @@ public static class TapeGradientParityHarness
                          + "oracle). The gradient divergence is that same wrong comparison result flowing "
                          + "through ProjectBits' TensorWhere. Fix belongs to the forward kernel.",
             ["TensorIsClose"] = "Forward parity fails: maxUlp=1065353216 @[6] a=1 b=0. As TensorEq.",
-            ["CrossEntropyBackward"] = "Forward parity fails for this op, so its tape gradient is compared "
-                         + "against an already-divergent forward value.",
         };
 
     /// <summary>
