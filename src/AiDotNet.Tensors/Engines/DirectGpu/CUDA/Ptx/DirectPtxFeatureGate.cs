@@ -95,6 +95,8 @@ internal enum DirectPtxPhysicalLayout
     SequenceHeadDim,
     /// <summary>Dense [row, qkv, head, feature] projection output.</summary>
     PackedQkv,
+    /// <summary>Dense additive attention bias, [H,Sq,Skv] or [B,H,Sq,Skv].</summary>
+    AttentionBias,
     /// <summary>One-dimensional canonical vector.</summary>
     Vector,
     /// <summary>Block table plus packed pages for decode attention.</summary>

@@ -21,10 +21,11 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 D = 64
 SCALE = 0.125
 SHAPES = (
-    ("flash-bwd-mha", 8, 16, 16, False),
-    ("flash-bwd-rect", 8, 16, 32, False),
-    ("flash-bwd-causal", 8, 32, 32, True),
-    ("flash-bwd-long", 8, 64, 64, True),
+    ("flash-bwd-mha", 8, 16, 16, False, False),
+    ("flash-bwd-rect", 8, 16, 32, False, False),
+    ("flash-bwd-bias", 8, 16, 32, False, True),
+    ("flash-bwd-causal", 8, 32, 32, True, False),
+    ("flash-bwd-long", 8, 64, 64, True, False),
 )
 BACKENDS = (
     ("cuDNN", SDPBackend.CUDNN_ATTENTION),
@@ -65,11 +66,13 @@ def measure(operation, warmups=30, samples=101):
     }
 
 
-def reference(query, key, value, grad_output, is_causal):
+def reference(query, key, value, grad_output, is_causal, attention_bias):
     q = query.double().detach().requires_grad_(True)
     k = key.double().detach().requires_grad_(True)
     v = value.double().detach().requires_grad_(True)
     scores = torch.matmul(q, k.transpose(-2, -1)) * SCALE
+    if attention_bias is not None:
+        scores = scores + attention_bias.double()
     if is_causal:
         mask = torch.ones(
             (scores.shape[-2], scores.shape[-1]),
@@ -130,12 +133,15 @@ def main():
 
     for run in range(1, args.runs + 1):
         torch.manual_seed(20261200 + run)
-        for shape_name, heads, sq, sk, is_causal in SHAPES:
+        for shape_name, heads, sq, sk, is_causal, has_bias in SHAPES:
             grad_output = (torch.rand((1, heads, sq, D), device=device) - 0.5) * 0.5
             query_seed = (torch.rand((1, heads, sq, D), device=device) - 0.5) * 0.5
             key_seed = (torch.rand((1, heads, sk, D), device=device) - 0.5) * 0.5
             value_seed = (torch.rand((1, heads, sk, D), device=device) - 0.5) * 0.5
-            expected = reference(query_seed, key_seed, value_seed, grad_output, is_causal)
+            attention_bias = ((torch.rand((1, heads, sq, sk), device=device) - 0.5) * 0.5
+                              if has_bias else None)
+            expected = reference(
+                query_seed, key_seed, value_seed, grad_output, is_causal, attention_bias)
             useful_flops = 8.0 * heads * sq * sk * D
 
             for backend_name, backend in BACKENDS:
@@ -145,7 +151,8 @@ def main():
                     value = value_seed.detach().requires_grad_(True)
                     with sdpa_kernel([backend]):
                         output = functional.scaled_dot_product_attention(
-                            query, key, value, is_causal=is_causal, scale=SCALE)
+                            query, key, value, attn_mask=attention_bias,
+                            is_causal=is_causal, scale=SCALE)
 
                     def operation():
                         return torch.autograd.grad(
@@ -174,7 +181,7 @@ def main():
                         "method": f"PyTorch {backend_name}",
                         "reason": f"{type(exc).__name__}: {exc}",
                     }, args.json_lines)
-            del expected, grad_output, query_seed, key_seed, value_seed
+            del expected, grad_output, query_seed, key_seed, value_seed, attention_bias
     return 0
 
 

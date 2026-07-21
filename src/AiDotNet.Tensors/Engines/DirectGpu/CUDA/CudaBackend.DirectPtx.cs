@@ -815,14 +815,10 @@ public sealed partial class CudaBackend
         int headDimension,
         float scale,
         bool isCausal,
-        IGpuBuffer? attentionBias)
+        IGpuBuffer? attentionBias,
+        int biasBatchStride = 0)
     {
         if (!IsDirectPtxFlashAttentionBackwardEnabled) return false;
-        if (attentionBias is not null)
-        {
-            DirectPtxLastError = "flash-attention-backward-attention-bias-not-implemented";
-            return false;
-        }
         if (headDimension != PtxFlashAttentionBackwardD64Kernel.HeadDimension)
         {
             DirectPtxLastError = "flash-attention-backward-head-dimension-not-implemented";
@@ -853,6 +849,25 @@ public sealed partial class CudaBackend
         long queryElements = checked((long)batch * heads * querySequence * headDimension);
         long keyValueElements = checked((long)batch * heads * keyValueSequence * headDimension);
         long statsElements = checked((long)batch * heads * querySequence);
+        int canonicalBiasBatchStride = checked(heads * querySequence * keyValueSequence);
+        int bakedBiasBatchStride = -1;
+        if (attentionBias is not null)
+        {
+            if (biasBatchStride != 0 && biasBatchStride != canonicalBiasBatchStride)
+            {
+                DirectPtxLastError = "flash-attention-backward-bias-stride-not-canonical";
+                return false;
+            }
+            long biasElements = biasBatchStride == 0
+                ? canonicalBiasBatchStride
+                : checked((long)batch * canonicalBiasBatchStride);
+            if (attentionBias.SizeInBytes != biasElements * sizeof(float))
+            {
+                DirectPtxLastError = "flash-attention-backward-bias-physical-extent-mismatch";
+                return false;
+            }
+            bakedBiasBatchStride = biasBatchStride;
+        }
         if (gradOutput.SizeInBytes != queryElements * sizeof(float) ||
             query.SizeInBytes != queryElements * sizeof(float) ||
             output.SizeInBytes != queryElements * sizeof(float) ||
@@ -873,7 +888,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             var keyShape = new DirectPtxFlashAttentionBackwardKey(
                 batch, heads, querySequence, keyValueSequence, isCausal,
-                BitConverter.SingleToInt32Bits(scale));
+                BitConverter.SingleToInt32Bits(scale), bakedBiasBatchStride);
             lock (_directPtxLock)
             {
                 if (capturing && !_directPtxFlashAttentionBackwardKernels.TryGetValue(keyShape, out _))
@@ -885,6 +900,9 @@ public sealed partial class CudaBackend
                 _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                 PtxFlashAttentionBackwardD64Kernel kernel =
                     GetOrCreateFlashAttentionBackwardKernel(keyShape, scale);
+                DirectPtxTensorView? biasView = attentionBias is null
+                    ? null
+                    : DirectPtxTensorView.Create(attentionBias, kernel.Blueprint.Tensors[9]);
                 lock (GpuDispatchLock)
                     kernel.Launch(
                         DirectPtxTensorView.Create(gradOutput, kernel.Blueprint.Tensors[0]),
@@ -895,7 +913,8 @@ public sealed partial class CudaBackend
                         DirectPtxTensorView.Create(softmaxStats, kernel.Blueprint.Tensors[5]),
                         DirectPtxTensorView.Create(gradQuery, kernel.Blueprint.Tensors[6]),
                         DirectPtxTensorView.Create(gradKey, kernel.Blueprint.Tensors[7]),
-                        DirectPtxTensorView.Create(gradValue, kernel.Blueprint.Tensors[8]));
+                        DirectPtxTensorView.Create(gradValue, kernel.Blueprint.Tensors[8]),
+                        biasView);
             }
             System.Threading.Interlocked.Increment(ref _directPtxFlashAttentionBackwardDispatchCount);
             DirectPtxLastError = null;
@@ -926,7 +945,7 @@ public sealed partial class CudaBackend
         _directPtxFlashAttentionBackwardKernels.GetOrAdd(key, () =>
             new PtxFlashAttentionBackwardD64Kernel(
                 _directPtxRuntime!, key.Batch, key.Heads, key.QuerySequence,
-                key.KeyValueSequence, scale, key.IsCausal));
+                key.KeyValueSequence, scale, key.IsCausal, key.BiasBatchStride));
 
     internal bool PrewarmDirectPtxFlashAttentionBackwardD64(
         int batch,
@@ -934,7 +953,8 @@ public sealed partial class CudaBackend
         int querySequence,
         int keyValueSequence,
         float scale,
-        bool isCausal)
+        bool isCausal,
+        int biasBatchStride = -1)
     {
         if (!IsDirectPtxFlashAttentionBackwardEnabled) return false;
         try
@@ -950,7 +970,7 @@ public sealed partial class CudaBackend
                 _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                 var key = new DirectPtxFlashAttentionBackwardKey(
                     batch, heads, querySequence, keyValueSequence, isCausal,
-                    BitConverter.SingleToInt32Bits(scale));
+                    BitConverter.SingleToInt32Bits(scale), biasBatchStride);
                 _ = GetOrCreateFlashAttentionBackwardKernel(key, scale);
             }
             DirectPtxLastError = null;
@@ -971,13 +991,14 @@ public sealed partial class CudaBackend
         float scale,
         bool isCausal,
         out DirectPtxKernelAudit gradQueryAudit,
-        out DirectPtxKernelAudit gradKeyValueAudit)
+        out DirectPtxKernelAudit gradKeyValueAudit,
+        int biasBatchStride = -1)
     {
         lock (_directPtxLock)
         {
             var key = new DirectPtxFlashAttentionBackwardKey(
                 batch, heads, querySequence, keyValueSequence, isCausal,
-                BitConverter.SingleToInt32Bits(scale));
+                BitConverter.SingleToInt32Bits(scale), biasBatchStride);
             if (_directPtxFlashAttentionBackwardKernels.TryGetValue(key, out var kernel))
             {
                 gradQueryAudit = kernel.GradQueryAudit;
@@ -1528,7 +1549,8 @@ public sealed partial class CudaBackend
         int QuerySequence,
         int KeyValueSequence,
         bool IsCausal,
-        int ScaleBits);
+        int ScaleBits,
+        int BiasBatchStride);
 
 }
 #endif
