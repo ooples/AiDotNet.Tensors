@@ -34,13 +34,30 @@ public sealed class CudaKernelLookupIntegrityTests
     // The four below are deliberately NOT implemented, because implementing them means INVENTING a
     // contract, and a wrong kernel is worse than the current state: today these throw and the caller
     // degrades to a correct CPU result, whereas a wrong kernel would return a plausible wrong answer.
-    //   tile_batch    : its two call sites disagree. The documented contract (comment at the
-    //                   mean-pool-backward site) is output[i*repeats + r] = input[i], total =
-    //                   innerSize*repeats — but that site passes (reduceSize, 1), giving a total of
-    //                   reduceSize for a buffer it sized outer*reduceSize, and the tile site's
-    //                   arguments imply a different tiling again. Neither has ever executed, since the
-    //                   kernel never existed, so their argument choices are unverified. Pin the
-    //                   contract with a test first, then write the kernel to it.
+    //   tile_batch    : BOTH CALL SITES ARE THEMSELVES WRONG — this is not just a missing kernel, and
+    //                   adding one without fixing them would replace a safe throw-and-fall-back with
+    //                   silent corruption. Neither has ever executed (the kernel never existed), so
+    //                   nothing has ever validated their arguments. Diagnosis and fix, both verified
+    //                   by reading the callers:
+    //
+    //                   The documented contract is  out[i*repeats + r] = in[i],  total = innerSize*repeats.
+    //
+    //                   (a) GlobalMeanPoolBackwardGpu wants out[o*reduceSize + r] = grad[o]. It calls
+    //                       TileBatch(grad, out, reduceSize, 1) => total reduceSize, into a buffer it
+    //                       sized outerSize*reduceSize, and then Scales all totalSize elements — so for
+    //                       outerSize > 1 it scales UNINITIALISED memory. The call should be
+    //                       TileBatch(grad, out, reduceSize, outerSize), which under the contract above
+    //                       yields exactly total = outerSize*reduceSize and out[o*reduceSize+r] = grad[o].
+    //
+    //                   (b) TileBatchGpu wants the whole input repeated: out[i] = in[i % inputLength],
+    //                       an INTERLEAVED tile, not the blocked repeat this contract describes. It also
+    //                       never passes batchSize, so this kernel signature cannot express what it
+    //                       needs at all. It requires a different kernel (out[idx] = in[idx % inLen]),
+    //                       not this one — see the registered tile_last_axis family.
+    //
+    //                   So: write tile_batch to the documented contract, fix (a)'s arguments, and route
+    //                   (b) elsewhere — with a test that exercises outerSize > 1 and batchSize > 1,
+    //                   which is precisely the case both callers get wrong today.
     //   csr_segmented_{max,min,stddev}
     //                 : no engine caller at all — only backend impls and IDirectGpuBackend. No
     //                   reference in any other backend, and the empty-row result is undefined (0? the
