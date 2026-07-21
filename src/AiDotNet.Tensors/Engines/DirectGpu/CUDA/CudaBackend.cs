@@ -834,6 +834,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // module so expf/tanhf/sigmoid keep the fast intrinsics. See CudaPreciseTrigKernels.
         CompileKernelModule(device, Kernels.CudaPreciseTrigKernels.GetSource(), "precise_trig_kernels",
             Kernels.CudaPreciseTrigKernels.GetKernelNames(), useFastMath: false);
+
+        // Kernels for lookups that previously resolved to nothing (copy_2d_strided, squash,
+        // squash_backward, var_axis). Each threw kernel-not-found on every call; where the caller had a
+        // catch that degraded silently to the CPU. See CudaMissingLookupKernels.
+        CompileKernelModule(device, Kernels.CudaMissingLookupKernels.GetSource(), "missing_lookup_kernels",
+            Kernels.CudaMissingLookupKernels.GetKernelNames());
         _convolutionModule = CompileKernelModule(device, CudaConvolutionKernels.GetSource(), "convolution_kernels", CudaConvolutionKernels.GetKernelNames());
         _fusedConvolutionModule = CompileKernelModule(device, CudaFusedConvolutionKernels.GetSource(), "fused_convolution_kernels", CudaFusedConvolutionKernels.GetKernelNames());
         _poolingModule = CompileKernelModule(device, CudaPoolingKernels.GetSource(), "pooling_kernels", CudaPoolingKernels.GetKernelNames());

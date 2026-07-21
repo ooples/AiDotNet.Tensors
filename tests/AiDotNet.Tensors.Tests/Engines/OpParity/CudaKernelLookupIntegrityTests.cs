@@ -27,28 +27,32 @@ public sealed class CudaKernelLookupIntegrityTests
     // Kernel names CudaBackend looks up that have NO definition in any CUDA kernel source. Each one
     // throws the moment its op runs on CUDA. They are NOT renames — verified against the nearest
     // similarly named kernels:
-    //   var_axis      : VarAxis passes (input, mean, variance, outer, reduce) = 5 args and wants BOTH
-    //                   outputs. variance_axis(input, output, outer, reduce) takes 4 and emits variance
-    //                   only. Repointing would reproduce the 15-vs-16 argument truncation fixed in
-    //                   3aed217 — a 5-arg launch into a 4-param kernel.
-    //   tile_batch    : nearest is tile_axis, different shape contract.
-    //   copy_2d_strided, squash, squash_backward, csr_segmented_{max,min,stddev}:
-    //                   no similar kernel exists in CUDA or OpenCL. These must be WRITTEN.
-    // Callers are live (Squash/SquashBackward from the capsule path, TileBatch from tile/repeat,
-    // VarAxis from variance, Copy2DStrided from the concat/slice path), so these are latent defects,
-    // not dead API. They are invisible to the op-parity registry because it does not exercise them.
+    // copy_2d_strided, squash, squash_backward and var_axis are now IMPLEMENTED in
+    // CudaMissingLookupKernels — each had an unambiguous reference to match (the caller's own index
+    // arithmetic, or FusedActivationBackwardMath's exact double-precision math).
+    //
+    // The four below are deliberately NOT implemented, because implementing them means INVENTING a
+    // contract, and a wrong kernel is worse than the current state: today these throw and the caller
+    // degrades to a correct CPU result, whereas a wrong kernel would return a plausible wrong answer.
+    //   tile_batch    : its two call sites disagree. The documented contract (comment at the
+    //                   mean-pool-backward site) is output[i*repeats + r] = input[i], total =
+    //                   innerSize*repeats — but that site passes (reduceSize, 1), giving a total of
+    //                   reduceSize for a buffer it sized outer*reduceSize, and the tile site's
+    //                   arguments imply a different tiling again. Neither has ever executed, since the
+    //                   kernel never existed, so their argument choices are unverified. Pin the
+    //                   contract with a test first, then write the kernel to it.
+    //   csr_segmented_{max,min,stddev}
+    //                 : no engine caller at all — only backend impls and IDirectGpuBackend. No
+    //                   reference in any other backend, and the empty-row result is undefined (0? the
+    //                   -INFINITY that OpenCL scatter_max uses?). Needs a consumer and a decision.
     //
     // RATCHETS DOWN ONLY. Define or correctly repoint a kernel and remove its entry. Never add one.
     private static readonly HashSet<string> KnownDangling = new(StringComparer.Ordinal)
     {
-        "copy_2d_strided",
         "csr_segmented_max",
         "csr_segmented_min",
         "csr_segmented_stddev",
-        "squash",
-        "squash_backward",
         "tile_batch",
-        "var_axis",
     };
 
     private static string RepoRoot()
