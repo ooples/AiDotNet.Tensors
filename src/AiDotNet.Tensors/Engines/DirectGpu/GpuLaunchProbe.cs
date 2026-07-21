@@ -28,6 +28,7 @@ internal static class GpuLaunchProbe
     private static int _captureReadbackSites;
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _missedNames = new();
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> _readbackSites = new();
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> _fallbacks = new();
 
     /// <summary>Total kernel launches observed since the last <see cref="Reset"/> (lock-free read).</summary>
     public static long Count => Interlocked.Read(ref _count);
@@ -101,6 +102,29 @@ internal static class GpuLaunchProbe
         if (name is not null) _missedNames.TryAdd(name, 0);
     }
 
+    /// <summary>Reasons GPU overrides silently routed to the CPU since the last <see cref="Reset"/>.</summary>
+    /// <remarks>
+    /// The launch counter tells you an op did zero GPU work; it cannot tell you WHY. Most overrides in
+    /// <c>DirectGpuTensorEngine</c> wrap their device path in <c>catch (Exception) { return base.Op(...); }</c>,
+    /// which turns a genuine kernel defect into a silent, correct-looking CPU result — invisible to both
+    /// parity (the CPU answer is right) and the hollow-override check (no kernel-cache miss is recorded).
+    /// This channel makes that class observable: a fallback records the op and the exception that caused it.
+    /// </remarks>
+    public static string[] Fallbacks => System.Linq.Enumerable.ToArray(
+        System.Linq.Enumerable.Select(
+            System.Linq.Enumerable.OrderBy(_fallbacks, entry => entry.Key),
+            entry => $"{entry.Value}x {entry.Key}"));
+
+    /// <summary>Records one silent GPU-to-CPU fallback. <paramref name="reason"/> is the caught exception, or
+    /// null when a guard (unsupported rank/dtype/backend) declined the device path before attempting it.</summary>
+    public static void OnFallback(string op, System.Exception? reason)
+    {
+        string key = reason is null
+            ? $"{op}: guard declined (unsupported rank/dtype/backend)"
+            : $"{op}: {reason.GetType().Name}: {reason.Message}";
+        _fallbacks.AddOrUpdate(key, 1, static (_, count) => count + 1);
+    }
+
     /// <summary>Zeroes launches AND misses before a measured region. Returns the pre-reset launch count.</summary>
     public static long Reset()
     {
@@ -109,6 +133,7 @@ internal static class GpuLaunchProbe
         Interlocked.Exchange(ref _readbackBytes, 0);
         _missedNames.Clear();
         _readbackSites.Clear();
+        _fallbacks.Clear();
         return Interlocked.Exchange(ref _count, 0);
     }
 }

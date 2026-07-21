@@ -113,7 +113,14 @@ public sealed class GpuResidencyProbeTests
                 metadata.Add($"{op.Name}\t{op.Category}");
                 continue;
             }
-            fallback.Add($"{op.Name}\t{op.Category}\tlaunches {launches}/{op.GpuMinimumKernelLaunches}");
+            // Record WHY, not just THAT. A below-floor op with no kernel-cache miss is not a hollow
+            // override — its device path was declined by a guard or threw and got swallowed by a
+            // `catch { return base.Op(...); }`. GpuLaunchProbe.Fallbacks carries that reason when the
+            // override is instrumented; without it the worklist says "launches 0/1" and stops there.
+            string reasons = GpuLaunchProbe.Fallbacks.Length == 0
+                ? string.Empty
+                : "\t" + string.Join(" | ", GpuLaunchProbe.Fallbacks);
+            fallback.Add($"{op.Name}\t{op.Category}\tlaunches {launches}/{op.GpuMinimumKernelLaunches}{reasons}");
             if (GpuLaunchProbe.KernelMisses > 0)
                 hollow.Add($"{op.Name}\t{op.Category}\tmissing-kernel: {string.Join(",", GpuLaunchProbe.MissedKernelNames)}");
         }

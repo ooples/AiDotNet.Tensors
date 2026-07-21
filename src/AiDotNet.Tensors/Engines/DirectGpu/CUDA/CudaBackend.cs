@@ -5799,12 +5799,19 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int totalPatches = batch * outH * outW;
         int dilationH = 1, dilationW = 1;
 
-        void** args = stackalloc void*[15];
+        // The im2col kernel takes SIXTEEN parameters, ending (..., dilationH, dilationW, outH, outW).
+        // This built a 15-entry argument array and stopped at outH, so outW was never passed and
+        // cuLaunchKernel read the 16th parameter off unallocated stack -> CUDA_ERROR_INVALID_VALUE on
+        // every call. DirectGpuTensorEngine.Unfold swallows that in `catch (Exception) { return base... }`,
+        // so the op silently produced a correct CPU result while dispatching ZERO kernels -- invisible to
+        // op-parity (the CPU answer is right) and to the hollow-override check (the kernel IS registered;
+        // the launch is what failed). It surfaced only once GpuLaunchProbe.OnFallback recorded the reason.
+        void** args = stackalloc void*[16];
         args[0] = &inputPtr; args[1] = &outputPtr;
         args[2] = &batch; args[3] = &channels; args[4] = &height; args[5] = &width;
         args[6] = &kernelH; args[7] = &kernelW; args[8] = &strideH; args[9] = &strideW;
         args[10] = &padH; args[11] = &padW; args[12] = &dilationH; args[13] = &dilationW;
-        args[14] = &outH;
+        args[14] = &outH; args[15] = &outW;
 
         uint gridX = (uint)((totalPatches + DefaultBlockSize - 1) / DefaultBlockSize);
         LaunchKernel(im2colKernel, gridX, DefaultBlockSize, args);
@@ -5829,12 +5836,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // Zero output first
         ZeroBuffer(output, totalSize);
 
-        void** args = stackalloc void*[15];
+        // Same 16-vs-15 argument truncation as Unfold above: col2im's last parameter outW was never
+        // passed, so every Fold launch failed with CUDA_ERROR_INVALID_VALUE and fell back to the CPU.
+        void** args = stackalloc void*[16];
         args[0] = &inputPtr; args[1] = &outputPtr;
         args[2] = &batch; args[3] = &channels; args[4] = &outputH; args[5] = &outputW;
         args[6] = &kernelH; args[7] = &kernelW; args[8] = &strideH; args[9] = &strideW;
         args[10] = &padH; args[11] = &padW; args[12] = &dilationH; args[13] = &dilationW;
-        args[14] = &outH;
+        args[14] = &outH; args[15] = &outW;
 
         uint gridX = (uint)((totalSize + DefaultBlockSize - 1) / DefaultBlockSize);
         LaunchKernel(col2imKernel, gridX, DefaultBlockSize, args);

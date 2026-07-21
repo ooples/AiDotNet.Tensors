@@ -15133,7 +15133,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> TensorBroadcastMultiply<T>(Tensor<T> a, Tensor<T> b)
     {
         if (!TryGetBackend(out var backend))
+        {
+            GpuLaunchProbe.OnFallback("TensorBroadcastMultiply", null);
             return base.TensorBroadcastMultiply(a, b);
+        }
 
         Tensor<T> RecordGpuResult(Tensor<T> output)
         {
@@ -15153,8 +15156,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return RecordGpuResult(DispatchDeferredGpuOp<T>(backend, a.Length, a.Shape.ToArray(),
                     output => backend.Multiply(bufferA.Buffer, bufferB.Buffer, output, a.Length)));
             }
-            catch
+            catch (Exception ex)
             {
+                GpuLaunchProbe.OnFallback("TensorBroadcastMultiply", ex);
                 return base.TensorBroadcastMultiply(a, b);
             }
         }
@@ -19457,7 +19461,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> Upsample<T>(Tensor<T> input, int scaleH, int scaleW)
     {
         if (!TryGetBackend(out var backend) || input.Rank != 4 || scaleH != scaleW)
+        {
+            GpuLaunchProbe.OnFallback("Upsample", null);
             return base.Upsample(input, scaleH, scaleW);
+        }
 
         try
         {
@@ -19470,8 +19477,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return DeferTensorResult<T>(backend, bufOut.Buffer, batch * channels * outH * outW,
                 new[] { batch, channels, outH, outW });
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            GpuLaunchProbe.OnFallback("Upsample", ex);
             return base.Upsample(input, scaleH, scaleW);
         }
     }
@@ -19647,7 +19655,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> Unfold<T>(Tensor<T> input, int[] kernelSize, int[] stride, int[] padding)
     {
         if (!TryGetBackend(out var backend) || input.Rank != 4)
+        {
+            GpuLaunchProbe.OnFallback("Unfold", null);
             return base.Unfold(input, kernelSize, stride, padding);
+        }
 
         try
         {
@@ -19665,8 +19676,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return DeferTensorResult<T>(backend, bufOut.Buffer, colSize,
                 new[] { batch, channels * kH * kW, outH * outW });
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            GpuLaunchProbe.OnFallback("Unfold", ex);
             return base.Unfold(input, kernelSize, stride, padding);
         }
     }
@@ -22796,7 +22808,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.UpsampleBackward<T>(Tensor<T> gradOutput, int[] inputShape, int scaleH, int scaleW)
     {
         if (typeof(T)==typeof(float) && TryGetBackend(out var b) && inputShape.Length==4 && scaleH==scaleW)
-        { try { int ba=inputShape[0],ch=inputShape[1],ih=inputShape[2],iw=inputShape[3]; int total=ba*ch*ih*iw; var gi=UploadTensorRaw(b, gradOutput); var go=b.AllocateBuffer(total); b.NearestNeighborUpsampleBackward(gi,go,ba*ch,ih,iw,scaleH); return DeferTensorResult<T>(b,go,total,inputShape); } catch{} }
+        { try { int ba=inputShape[0],ch=inputShape[1],ih=inputShape[2],iw=inputShape[3]; int total=ba*ch*ih*iw; var gi=UploadTensorRaw(b, gradOutput); var go=b.AllocateBuffer(total); b.NearestNeighborUpsampleBackward(gi,go,ba*ch,ih,iw,scaleH); return DeferTensorResult<T>(b,go,total,inputShape); } catch(Exception ex){ GpuLaunchProbe.OnFallback("UpsampleBackward", ex); } }
         return base.UpsampleBackward(gradOutput,inputShape,scaleH,scaleW);
     }
 
@@ -24582,8 +24594,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> NativeNormalizeRows<T>(Tensor<T> input, bool inPlace = false)
     {
-        if (!TryGetBackend(out var backend)) return base.NativeNormalizeRows(input, inPlace);
-        if (input.Rank != 2) return base.NativeNormalizeRows(input, inPlace);
+        if (!TryGetBackend(out var backend)) { GpuLaunchProbe.OnFallback("NativeNormalizeRows", null); return base.NativeNormalizeRows(input, inPlace); }
+        if (input.Rank != 2) { GpuLaunchProbe.OnFallback("NativeNormalizeRows", null); return base.NativeNormalizeRows(input, inPlace); }
         try
         {
             int rows = input._shape[0];
@@ -24604,7 +24616,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
             return result;
         }
-        catch { return base.NativeNormalizeRows(input, inPlace); }
+        catch (Exception ex) { GpuLaunchProbe.OnFallback("NativeNormalizeRows", ex); return base.NativeNormalizeRows(input, inPlace); }
     }
 
     public override Tensor<Complex<T>> NativeBispectrum<T>(Tensor<Complex<T>> spectrum, int maxF1, int maxF2)
