@@ -19028,6 +19028,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             using var bufIn = GetOrAllocateBuffer(backend, input);
             var bufOut = AllocateOutputBuffer(backend, input.Length);
+            // MEASURED 2026-07-20: this line IS reached for the registry's softmax cases — instrumenting it
+            // logged "T=Single outer=4 feat=16" (Softmax[4,16]) and "outer=4 feat=64" (TensorSoftmax[4,64]).
+            // CudaBackend.Softmax dispatches through LaunchKernelWithSharedMem, which DOES call
+            // GpuLaunchProbe.OnLaunch. So the softmax family is NOT a CPU fallback, despite the residency
+            // worklist listing it at "launches 0/1".
+            //
+            // Not yet resolved: why the per-op count is still zero. The probe brackets Reset() -> RunFloat ->
+            // Count, so an eager dispatch inside RunFloat should be counted. Attributing the logged hits to a
+            // specific registry case needs per-op tagging the engine cannot see on its own. Whoever picks
+            // this up: tag the launch with the op under test (thread-local set by the probe harness) rather
+            // than re-deriving from source — three source-level hypotheses were wrong here
+            // (non-last-axis bail, shared-mem launcher not counting, cuBLAS literal mismatch).
             backend.Softmax(bufIn.Buffer, bufOut.Buffer, outerSize, features);
             var output = DeferTensorResult<T>(backend, bufOut.Buffer, input.Length, input.Shape.ToArray());
             // SoftmaxBackward reads the axis from savedState[0] — pass it
