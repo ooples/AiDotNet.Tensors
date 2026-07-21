@@ -9360,6 +9360,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         CuBlasNative.CheckCudaResult(
             CuBlasNative.cuMemcpyDtoD(destination.Handle, source.Handle, (nuint)(size * sizeof(float))),
             "cuMemcpyDtoD (CopyBuffer)");
+        GpuLaunchProbe.OnLaunch();   // device-side copy IS GPU work — see the note on the 3-arg Copy
     }
 
     public unsafe void FusedLinearReLU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output,
@@ -13651,6 +13652,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         CuBlasNative.CheckCudaResult(
             CudaNativeBindings.cuMemcpyDtoDAsync(dstPtr, srcPtr, byteSize, _stream),
             "cuMemcpyDtoDAsync(strided)");
+        GpuLaunchProbe.OnLaunch();   // device-side strided copy IS GPU work
     }
 
     /// <inheritdoc/>
