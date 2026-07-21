@@ -845,6 +845,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         _poolingModule = CompileKernelModule(device, CudaPoolingKernels.GetSource(), "pooling_kernels", CudaPoolingKernels.GetKernelNames());
         _normalizationModule = CompileKernelModule(device, CudaNormalizationKernels.GetSource(), "normalization_kernels", CudaNormalizationKernels.GetKernelNames());
         _neuralNetModule = CompileKernelModule(device, CudaNeuralNetKernels.GetSource(), "neuralnet_kernels", CudaNeuralNetKernels.GetKernelNames());
+
+        // tanh/Mish are compared against the CPU's IEEE-accurate implementations. Compiling them with
+        // --use_fast_math remaps tanhf/expf/log1pf to low-precision intrinsics (observed up to 9,177 ULP
+        // for MishBackward). Compile just these hot-path overrides accurately after neuralnet_kernels,
+        // which also exports "mish" and would otherwise replace the accurate lookup in the cache.
+        CompileKernelModule(device, Kernels.CudaPreciseNonlinearKernels.GetSource(), "precise_nonlinear_kernels",
+            Kernels.CudaPreciseNonlinearKernels.GetKernelNames(), useFastMath: false);
         _fusedModule = CompileKernelModule(device, CudaFusedKernels.GetSource(), "fused_kernels", CudaFusedKernels.GetKernelNames());
         // Serving-parity kernels (P0 dequant-GEMM, P1 paged attention, P2 flash-decode) compile in their
         // OWN try/catch so an nvRTC failure on a minimal CUDA Toolkit degrades just these features

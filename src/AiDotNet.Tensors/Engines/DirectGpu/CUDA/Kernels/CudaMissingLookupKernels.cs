@@ -100,7 +100,6 @@ extern ""C"" __global__ __launch_bounds__(256) void squash_backward(
             + coefficient * (double)input[off + j] * dot);
 }
 
-// ===========================================================================
 // var_axis — VarAxis(input, mean, variance, outerSize, reduceSize)
 // Population variance about a PRECOMPUTED per-row mean: variance[o] = sum((x - mean[o])^2)/reduceSize.
 // The mean is an INPUT here — TensorVar calls MeanAxis first and feeds its result in. That is why this
@@ -127,6 +126,99 @@ extern ""C"" __global__ __launch_bounds__(256) void var_axis(
     }
     variance[o] = (float)(acc / (double)reduceSize);
 }
+
+// ===========================================================================
+// csr_segmented_{max,min,stddev} — CsrSegmented*(colIndices, rowPointers, input, output, M, K, N[, eps])
+//
+// PORTED FROM THE WebGPU REFERENCE (WebGpuKernels csr_segmented_*), not invented. Segmented reduction
+// over a CSR row's gathered rows: for output element (row, j), walk the row's nonzero column indices
+// and reduce input[col * N + j].
+//
+// The EMPTY-ROW result is 0.0, which is the reference's explicit contract
+// (`if (start >= end) { output[idx] = 0.0; return; }`) — NOT the -INFINITY that OpenCL's scatter_max
+// uses for empty groups. These two conventions differ; this follows the one its own siblings use.
+//
+// CudaBackend launches these 2D as gridX = M rows, gridY = ceil(N / block), so row comes from
+// blockIdx.x and j from the y-dimension, unlike the reference's flat 1D index. The col/row-pointer
+// buffers are float-typed on the device and hold integral values, matching the other CSR kernels.
+// ===========================================================================
+extern ""C"" __global__ __launch_bounds__(256) void csr_segmented_max(
+    const float* __restrict__ colIndices, const float* __restrict__ rowPointers,
+    const float* __restrict__ input, float* __restrict__ output, int M, int K, int N)
+{
+    int row = blockIdx.x;
+    int j = blockIdx.y * blockDim.x + threadIdx.x;
+    if (row >= M || j >= N) return;
+
+    int start = (int)rowPointers[row];
+    int end = (int)rowPointers[row + 1];
+    int idx = row * N + j;
+    if (start >= end) { output[idx] = 0.0f; return; }
+
+    float maxVal = -3.402823e+38f;
+    for (int i = start; i < end; i++)
+    {
+        int col = (int)colIndices[i];
+        maxVal = fmaxf(maxVal, input[col * N + j]);
+    }
+    output[idx] = maxVal;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void csr_segmented_min(
+    const float* __restrict__ colIndices, const float* __restrict__ rowPointers,
+    const float* __restrict__ input, float* __restrict__ output, int M, int K, int N)
+{
+    int row = blockIdx.x;
+    int j = blockIdx.y * blockDim.x + threadIdx.x;
+    if (row >= M || j >= N) return;
+
+    int start = (int)rowPointers[row];
+    int end = (int)rowPointers[row + 1];
+    int idx = row * N + j;
+    if (start >= end) { output[idx] = 0.0f; return; }
+
+    float minVal = 3.402823e+38f;
+    for (int i = start; i < end; i++)
+    {
+        int col = (int)colIndices[i];
+        minVal = fminf(minVal, input[col * N + j]);
+    }
+    output[idx] = minVal;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void csr_segmented_stddev(
+    const float* __restrict__ colIndices, const float* __restrict__ rowPointers,
+    const float* __restrict__ input, float* __restrict__ output, int M, int K, int N, float epsilon)
+{
+    int row = blockIdx.x;
+    int j = blockIdx.y * blockDim.x + threadIdx.x;
+    if (row >= M || j >= N) return;
+
+    int start = (int)rowPointers[row];
+    int end = (int)rowPointers[row + 1];
+    int idx = row * N + j;
+    int count = end - start;
+    if (count <= 0) { output[idx] = 0.0f; return; }
+
+    // Two-pass mean then variance, exactly as the reference does (not a sum-of-squares shortcut,
+    // which would differ in rounding).
+    float mean = 0.0f;
+    for (int i = start; i < end; i++)
+    {
+        int col = (int)colIndices[i];
+        mean += input[col * N + j];
+    }
+    mean /= (float)count;
+
+    float varAcc = 0.0f;
+    for (int i = start; i < end; i++)
+    {
+        int col = (int)colIndices[i];
+        float d = input[col * N + j] - mean;
+        varAcc += d * d;
+    }
+    output[idx] = sqrtf(varAcc / (float)count + epsilon);
+}
 ";
         }
 
@@ -136,6 +228,9 @@ extern ""C"" __global__ __launch_bounds__(256) void var_axis(
             "squash",
             "squash_backward",
             "var_axis",
+            "csr_segmented_max",
+            "csr_segmented_min",
+            "csr_segmented_stddev",
         };
     }
 }

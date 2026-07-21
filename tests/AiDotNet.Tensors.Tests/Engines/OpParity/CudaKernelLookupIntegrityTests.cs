@@ -58,17 +58,9 @@ public sealed class CudaKernelLookupIntegrityTests
     //                   So: write tile_batch to the documented contract, fix (a)'s arguments, and route
     //                   (b) elsewhere — with a test that exercises outerSize > 1 and batchSize > 1,
     //                   which is precisely the case both callers get wrong today.
-    //   csr_segmented_{max,min,stddev}
-    //                 : no engine caller at all — only backend impls and IDirectGpuBackend. No
-    //                   reference in any other backend, and the empty-row result is undefined (0? the
-    //                   -INFINITY that OpenCL scatter_max uses?). Needs a consumer and a decision.
-    //
     // RATCHETS DOWN ONLY. Define or correctly repoint a kernel and remove its entry. Never add one.
     private static readonly HashSet<string> KnownDangling = new(StringComparer.Ordinal)
     {
-        "csr_segmented_max",
-        "csr_segmented_min",
-        "csr_segmented_stddev",
     };
 
     private static string? RepoRoot()
