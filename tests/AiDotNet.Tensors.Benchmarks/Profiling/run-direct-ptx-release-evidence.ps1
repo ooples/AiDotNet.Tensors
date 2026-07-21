@@ -76,7 +76,13 @@ function Assert-GpuReady([string]$Label, [switch]$AfterSuite) {
         $processType = $parts[2]
         $smPercent = 0
         $isComputeOnly = $processType -eq 'C'
-        $isActiveMixed = $processType.Contains('C') -and [int]::TryParse($parts[3], [ref]$smPercent) -and $smPercent -gt 5
+        # WDDM's single pmon sample can report stale C+G percentages after the
+        # benchmark process exits (including values inconsistent with a 1%
+        # whole-device snapshot). Enforce mixed graphics/compute admission at
+        # the stable pre-suite boundary; the post boundary still rejects every
+        # compute-only process and unsafe temperature.
+        $isActiveMixed = -not $AfterSuite -and $processType.Contains('C') -and
+            [int]::TryParse($parts[3], [ref]$smPercent) -and $smPercent -gt 5
         if ($isComputeOnly -or $isActiveMixed) {
             $conflicts += "pid=$($parts[1]) $($parts[-1]) type=$processType sm=$($parts[3])%"
         }
@@ -145,16 +151,21 @@ try {
                 $captured = $false
                 for ($attempt = 1; $attempt -le 1 + $ContaminationRetries; $attempt++) {
                     $ready = $false
-                    for ($poll = 1; $poll -le 15; $poll++) {
+                    $consecutiveReadySamples = 0
+                    for ($poll = 1; $poll -le 30; $poll++) {
                         try {
                             Assert-GpuReady "$label-start"
-                            $ready = $true
-                            break
+                            $consecutiveReadySamples++
+                            if ($consecutiveReadySamples -ge 3) {
+                                $ready = $true
+                                break
+                            }
                         }
                         catch {
-                            if ($poll -eq 15) { throw }
-                            Start-Sleep -Seconds 2
+                            $consecutiveReadySamples = 0
+                            if ($poll -eq 30) { throw }
                         }
+                        Start-Sleep -Seconds 1
                     }
                     if (-not $ready) { throw "GPU readiness polling ended unexpectedly for '$label'." }
 
