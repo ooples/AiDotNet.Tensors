@@ -22546,7 +22546,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 for (int i = 0; i < ea; i++) outerSize *= input.Shape._dims[i];
                 int outputLen = outerSize * halfDim;
                 var gi = UploadTensorRaw(b, input);
-                using var go = b.AllocateBuffer(outputLen);
+                // NOT `using`. DeferTensorResult hands this buffer to a deferred materializer that runs on
+                // first host access, so disposing it when this method returns zeroes the handle out from
+                // under the pending download. Measured: the failing materializer saw handle=0x0 while the
+                // registration had recorded a live handle (0x204C00200 etc.), and GLU failed forward parity
+                // DETERMINISTICALLY with "buffer released before materialization" (#226) — despite that
+                // message naming an eviction race. GeGLU, SwiGLU and ReGLU are identical apart from this
+                // `using` and all three pass, which is what isolated it.
+                var go = b.AllocateBuffer(outputLen);
                 b.GluForward(gi, go, outerSize, halfDim);
                 int[] outShape = (int[])input.Shape._dims.Clone();
                 outShape[ea] = halfDim;
