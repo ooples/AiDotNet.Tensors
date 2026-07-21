@@ -51,10 +51,10 @@ internal static class DirectPtxFlashAttentionBackwardExperiment
                 "the production gate uses device time and E2E remains diagnostic.");
             Console.WriteLine(
                 $"{"Run",3} {"Shape",-16} {"Method",-29} {"dev med",9} {"dev p95",9} " +
-                $"{"dev p99",9} {"E2E med",9} {"E2E p95",9} {"E2E p99",9} " +
+                $"{"dev p99",9} {"dev mean",9} {"E2E med",9} {"E2E p95",9} {"E2E p99",9} {"E2E mean",9} " +
                 $"{"GFLOPS",9} {"B/call",9} {"tmp MiB",9} " +
                 $"{"max err",10} {"regs dq/dkv",11} {"shared",7} {"local",5} {"occ",7}");
-            Console.WriteLine(new string('-', 184));
+            Console.WriteLine(new string('-', 204));
             var evidence = new List<CellEvidence>(independentRuns * Shapes.Length);
             for (int run = 1; run <= independentRuns; run++)
             {
@@ -355,8 +355,8 @@ internal static class DirectPtxFlashAttentionBackwardExperiment
             : $"{gradQueryOccupancy}/{gradKeyValueOccupancy}";
         Console.WriteLine(
             $"{run,3} {shape.Name,-16} {method,-29} " +
-            $"{device.Median,9:F2} {device.P95,9:F2} {device.P99,9:F2} " +
-            $"{endToEnd.Median,9:F2} {endToEnd.P95,9:F2} {endToEnd.P99,9:F2} " +
+            $"{device.Median,9:F2} {device.P95,9:F2} {device.P99,9:F2} {device.Mean,9:F2} " +
+            $"{endToEnd.Median,9:F2} {endToEnd.P95,9:F2} {endToEnd.P99,9:F2} {endToEnd.Mean,9:F2} " +
             $"{gflops,9:F2} {bytes,9} {0,9:F3} " +
             $"{error,10:G4} {registers,11} {Metric(shared),7} {Metric(local),5} {occupancy,7}");
     }
