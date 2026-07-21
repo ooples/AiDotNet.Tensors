@@ -1064,86 +1064,31 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_bias_add(float* __res
 // TRIGONOMETRIC KERNELS
 // ===========================================================================
 
-extern ""C"" __global__ __launch_bounds__(256) void sin_vector(const float* __restrict__ A, float* __restrict__ B, int size)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size) return;
-    B[idx] = sinf(A[idx]);
-}
 
-extern ""C"" __global__ __launch_bounds__(256) void cos_vector(const float* __restrict__ A, float* __restrict__ B, int size)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size) return;
-    B[idx] = cosf(A[idx]);
-}
 
-extern ""C"" __global__ __launch_bounds__(256) void tan_vector(const float* __restrict__ A, float* __restrict__ B, int size)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size) return;
-    B[idx] = tanf(A[idx]);
-}
 
-extern ""C"" __global__ __launch_bounds__(256) void asin_vector(const float* __restrict__ A, float* __restrict__ B, int size)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size) return;
-    B[idx] = asinf(A[idx]);
-}
 
-extern ""C"" __global__ __launch_bounds__(256) void acos_vector(const float* __restrict__ A, float* __restrict__ B, int size)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size) return;
-    B[idx] = acosf(A[idx]);
-}
 
-extern ""C"" __global__ __launch_bounds__(256) void atan_vector(const float* __restrict__ A, float* __restrict__ B, int size)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size) return;
-    B[idx] = atanf(A[idx]);
-}
+
+
+
+
+
+
 
 // ===========================================================================
 // HYPERBOLIC KERNELS
 // ===========================================================================
 
-extern ""C"" __global__ __launch_bounds__(256) void sinh_vector(const float* __restrict__ A, float* __restrict__ B, int size)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size) return;
-    B[idx] = sinhf(A[idx]);
-}
 
-extern ""C"" __global__ __launch_bounds__(256) void cosh_vector(const float* __restrict__ A, float* __restrict__ B, int size)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size) return;
-    B[idx] = coshf(A[idx]);
-}
 
-extern ""C"" __global__ __launch_bounds__(256) void asinh_vector(const float* __restrict__ A, float* __restrict__ B, int size)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size) return;
-    B[idx] = asinhf(A[idx]);
-}
 
-extern ""C"" __global__ __launch_bounds__(256) void acosh_vector(const float* __restrict__ A, float* __restrict__ B, int size)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size) return;
-    B[idx] = acoshf(A[idx]);
-}
 
-extern ""C"" __global__ __launch_bounds__(256) void atanh_vector(const float* __restrict__ A, float* __restrict__ B, int size)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size) return;
-    B[idx] = atanhf(A[idx]);
-}
+
+
+
+
+
 
 // ===========================================================================
 // ADDITIONAL UNARY KERNELS
@@ -1490,18 +1435,7 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
                 "sqrt_vector",
                 "sign_vector",
                 // Trigonometric
-                "sin_vector",
-                "cos_vector",
-                "tan_vector",
-                "asin_vector",
-                "acos_vector",
-                "atan_vector",
                 // Hyperbolic
-                "sinh_vector",
-                "cosh_vector",
-                "asinh_vector",
-                "acosh_vector",
-                "atanh_vector",
                 // Additional unary
                 "reciprocal_vector",
                 "cbrt_vector",

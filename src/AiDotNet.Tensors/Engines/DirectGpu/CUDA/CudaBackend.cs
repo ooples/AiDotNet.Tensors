@@ -622,64 +622,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         return smCount * coresPerSm * 2.0 * clockGHz;
     }
 
-    private void CompileActivationKernels(int device)
-    {
-        using var _ = PushContext();
-
-        string source = CudaActivationKernels.GetSource();
-        string[] kernelNames = CudaActivationKernels.GetKernelNames();
-
-        var (major, minor) = GetComputeCapability(device);
-        string arch = $"--gpu-architecture=compute_{major}{minor}";
-        string[] options = new[] { arch, "--use_fast_math" };
-
-        IntPtr program = IntPtr.Zero;
-        var result = NvrtcNativeBindings.nvrtcCreateProgram(
-            ref program,
-            source,
-            "activation_kernels.cu",
-            0,
-            IntPtr.Zero,
-            IntPtr.Zero);
-        if (result != NvrtcResult.Success)
-            throw new InvalidOperationException($"NVRTC program creation failed: {NvrtcNativeBindings.GetErrorString(result)}");
-
-        result = NvrtcNativeBindings.nvrtcCompileProgram(program, options.Length, options);
-        if (result != NvrtcResult.Success)
-        {
-            string log = GetNvrtcLog(program);
-            NvrtcNativeBindings.nvrtcDestroyProgram(ref program);
-            throw new InvalidOperationException($"NVRTC compile failed: {NvrtcNativeBindings.GetErrorString(result)}\n{log}");
-        }
-
-        result = NvrtcNativeBindings.nvrtcGetPTXSize(program, out UIntPtr ptxSize);
-        if (result != NvrtcResult.Success || ptxSize == UIntPtr.Zero)
-        {
-            NvrtcNativeBindings.nvrtcDestroyProgram(ref program);
-            throw new InvalidOperationException("NVRTC failed to return PTX size.");
-        }
-
-        IntPtr ptx = Marshal.AllocHGlobal((int)ptxSize);
-        result = NvrtcNativeBindings.nvrtcGetPTX(program, ptx);
-        NvrtcNativeBindings.nvrtcDestroyProgram(ref program);
-
-        if (result != NvrtcResult.Success)
-        {
-            Marshal.FreeHGlobal(ptx);
-            throw new InvalidOperationException($"NVRTC get PTX failed: {NvrtcNativeBindings.GetErrorString(result)}");
-        }
-
-        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuModuleLoadData(out _activationModule, ptx), "cuModuleLoadData");
-        Marshal.FreeHGlobal(ptx);
-
-        foreach (var kernelName in kernelNames)
-        {
-            CuBlasNative.CheckCudaResult(
-                CudaNativeBindings.cuModuleGetFunction(out IntPtr kernel, _activationModule, kernelName),
-                $"cuModuleGetFunction({kernelName})");
-            _kernelCache[kernelName] = kernel;
-        }
-    }
 
     /// <summary>
     /// Gets the disk cache directory for compiled CUBIN files.
@@ -885,6 +827,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         using var _ = PushContext();
 
         _activationModule = CompileKernelModule(device, CudaActivationKernels.GetSource(), "activation_kernels", CudaActivationKernels.GetKernelNames());
+
+        // useFastMath:false — sinf/cosf here must be the accurate libm versions. --use_fast_math remaps
+        // them to __sinf/__cosf, which discarded the Dekker-split angle PositionalEncoding builds
+        // (measured 379 ULP vs a 64 ULP tolerance, worse than naive float). Split out of the activation
+        // module so expf/tanhf/sigmoid keep the fast intrinsics. See CudaPreciseTrigKernels.
+        CompileKernelModule(device, Kernels.CudaPreciseTrigKernels.GetSource(), "precise_trig_kernels",
+            Kernels.CudaPreciseTrigKernels.GetKernelNames(), useFastMath: false);
         _convolutionModule = CompileKernelModule(device, CudaConvolutionKernels.GetSource(), "convolution_kernels", CudaConvolutionKernels.GetKernelNames());
         _fusedConvolutionModule = CompileKernelModule(device, CudaFusedConvolutionKernels.GetSource(), "fused_convolution_kernels", CudaFusedConvolutionKernels.GetKernelNames());
         _poolingModule = CompileKernelModule(device, CudaPoolingKernels.GetSource(), "pooling_kernels", CudaPoolingKernels.GetKernelNames());
