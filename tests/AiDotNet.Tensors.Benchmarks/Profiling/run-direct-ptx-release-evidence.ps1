@@ -27,9 +27,9 @@ try {
     if (-not $SkipBuild) {
         $buildLog = Join-Path $evidenceRoot 'build.log'
         "# command=dotnet build `"$project`" -c Release -f net10.0" |
-            Set-Content -LiteralPath $buildLog
+            Set-Content -LiteralPath $buildLog -Encoding utf8
         & dotnet build $project -c Release -f net10.0 2>&1 |
-            Out-File -LiteralPath $buildLog -Append
+            Out-File -LiteralPath $buildLog -Append -Encoding utf8
         if ($LASTEXITCODE -ne 0) {
             throw "Release benchmark build failed with exit code $LASTEXITCODE. See '$buildLog'."
         }
@@ -51,17 +51,17 @@ try {
         foreach ($suite in $suites.GetEnumerator()) {
             $log = Join-Path $evidenceRoot ("run-{0:D2}-{1}.log" -f $run, $suite.Key)
             "# independent process $run/$Runs; suite=$($suite.Key); started_utc=$([DateTime]::UtcNow.ToString('O'))" |
-                Set-Content -LiteralPath $log
+                Set-Content -LiteralPath $log -Encoding utf8
             "# command=dotnet `"$targetDll`" $($suite.Value)" |
-                Add-Content -LiteralPath $log
+                Add-Content -LiteralPath $log -Encoding utf8
             # Do not mirror the wide TUI to a GPU-accelerated terminal while a
             # later shape is being measured. The complete output remains in the
             # immutable per-process log and is printed only after capture ends.
             & dotnet $targetDll $suite.Value 2>&1 |
-                Out-File -LiteralPath $log -Append
+                Out-File -LiteralPath $log -Append -Encoding utf8
             $exitCode = $LASTEXITCODE
             "# completed_utc=$([DateTime]::UtcNow.ToString('O')); exit_code=$exitCode" |
-                Add-Content -LiteralPath $log
+                Add-Content -LiteralPath $log -Encoding utf8
             if ($exitCode -ne 0) {
                 throw "Evidence suite '$($suite.Key)' run $run failed with exit code $exitCode. See '$log'."
             }

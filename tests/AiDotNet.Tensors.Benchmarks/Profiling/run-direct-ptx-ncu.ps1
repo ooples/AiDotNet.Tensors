@@ -1,7 +1,7 @@
 param(
     [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward')]
     [string]$Target = 'attention',
-    [string]$OutputCsv = 'direct-ptx-ncu.csv',
+    [string]$OutputCsv = (Join-Path ([System.IO.Path]::GetTempPath()) ("aidotnet-direct-ptx-ncu-" + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.csv')),
     [string]$NcuPath = $env:NSIGHT_COMPUTE_CLI
 )
 
@@ -79,4 +79,4 @@ foreach ($metricName in $metricNames) {
     }
 }
 
-Write-Host "Nsight evidence verified for $expectedLaunches '$Target' specializations."
+Write-Host "Nsight evidence verified for $expectedLaunches '$Target' specializations: $OutputCsv"
