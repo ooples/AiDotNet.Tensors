@@ -3259,22 +3259,15 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void TileBatch(IGpuBuffer input, IGpuBuffer output, int repeats, int innerSize)
     {
-        if (!_kernelCache.TryGetValue("tile_batch", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: tile_batch");
-
-        using var _ = PushContext();
-        int totalSize = repeats * innerSize;
-        uint grid = (uint)((totalSize + DefaultBlockSize - 1) / DefaultBlockSize);
-        IntPtr inputPtr = input.Handle;
-        IntPtr outputPtr = output.Handle;
-        int reps = repeats;
-        int inner = innerSize;
-        void** args = stackalloc void*[4];
-        args[0] = &inputPtr;
-        args[1] = &outputPtr;
-        args[2] = &reps;
-        args[3] = &inner;
-        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        // Contract (from the mean-pool-backward call site): out[i * repeats + r] = in[i]
+        // for i in [0, innerSize), r in [0, repeats); total = innerSize * repeats.
+        //
+        // This used to look up "tile_batch", a kernel defined NOWHERE, so every call threw
+        // kernel-not-found. The already-registered repeat_elements kernel computes
+        //     output[idx] = input[idx / repeats]
+        // when launched with (outerSize: innerSize, innerSize: 1, repeats: repeats) — which IS this
+        // contract, exactly. No new kernel is needed; the lookup was simply pointing at nothing.
+        RepeatElements(input, output, innerSize, 1, repeats);
     }
 
     public unsafe void TileAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int axisSize, int innerSize, int repeats)

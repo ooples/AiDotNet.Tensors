@@ -69,7 +69,6 @@ public sealed class CudaKernelLookupIntegrityTests
         "csr_segmented_max",
         "csr_segmented_min",
         "csr_segmented_stddev",
-        "tile_batch",
     };
 
     private static string RepoRoot()

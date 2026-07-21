@@ -11915,7 +11915,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             outputShape[i] = input.Shape._dims[i];
 
         var outputBuffer = backend.AllocateBuffer(outputTotalSize);
-        backend.TileBatch(input.Buffer, outputBuffer, repeats * batchSize, innerSize);
+        // TileBatchGpu repeats the WHOLE tensor along axis 0: out[i] = in[i % input.Length] — an
+        // INTERLEAVED tile. TileBatch is a BLOCKED repeat (out[i*repeats + r] = in[i]) and this call
+        // never passed batchSize, so TileBatch could not express what is needed here at all; it was the
+        // wrong operation, not just a missing kernel.
+        //
+        // tile_axis with (outerSize:1, axisSize:1, innerSize:input.Length, repeats) gives exactly the
+        // interleave: expandedAxis=repeats, inner=idx%L, axis=((idx/L)%repeats)/repeats=0, so
+        // output[idx] = input[idx % L], with total = repeats*L = the allocated size.
+        // TileAxis is on IDirectGpuBackend; TileLastAxis/RepeatElements are on the OPTIONAL
+        // IGpuBatchExecution, which OpenCL/Metal/WebGPU do not implement — so this path must not use them.
+        backend.TileAxis(input.Buffer, outputBuffer, 1, 1, input.Length, repeats);
 
         return Tensor<T>.FromGpuBuffer(backend, outputBuffer, outputShape, GpuTensorRole.Intermediate, true);
     }
@@ -12166,7 +12176,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         // Use TileBatch to repeat gradient values
         // TileBatch(input, output, repeats, innerSize) tiles input[i] to output[i*repeats:(i+1)*repeats]
-        backend.TileBatch(gradOutput.Buffer, outputBuffer, reduceSize, 1);
+        // Was TileBatch(grad, out, reduceSize, 1): under TileBatch's contract that writes only
+        // reduceSize elements into a buffer sized outerSize*reduceSize, and the Scale below then
+        // scaled UNINITIALISED memory for outerSize > 1. The gradient needs out[o*reduceSize + r] =
+        // grad[o], which is (repeats: reduceSize, innerSize: outerSize).
+        backend.TileBatch(gradOutput.Buffer, outputBuffer, reduceSize, outerSize);
 
         // Scale the output by 1/reduceSize
         backend.Scale(outputBuffer, outputBuffer, scale, totalSize);
