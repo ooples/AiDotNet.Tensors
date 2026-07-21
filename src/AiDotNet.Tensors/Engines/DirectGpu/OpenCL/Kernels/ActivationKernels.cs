@@ -485,7 +485,19 @@ __kernel void power_scalar(
     const int idx = get_global_id(0);
     if (idx >= size) return;
 
-    B[idx] = pow(A[idx], exponent);
+    const float x = A[idx];
+    // Some pow implementations route through log2(x), which is invalid for a
+    // negative x even when the exponent is integral. Compute the magnitude
+    // from |x| and restore the sign for odd exponents.
+    if (x < 0.0f && exponent == trunc(exponent))
+    {
+        const float magnitude = pow(-x, exponent);
+        B[idx] = (fmod(fabs(exponent), 2.0f) == 1.0f) ? -magnitude : magnitude;
+    }
+    else
+    {
+        B[idx] = pow(x, exponent);
+    }
 }
 
 // ===========================================================================
