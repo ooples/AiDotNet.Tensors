@@ -2841,6 +2841,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 CudaNativeBindings.cuLaunchKernel(kernel, gridX, gridY, 1, 128, 1, 1,
                     0, _stream, (IntPtr)args, IntPtr.Zero),
                 "cuLaunchKernel(WMMA LeakyReLU)");
+                GpuLaunchProbe.OnLaunch();
         }
         else
         {
@@ -3884,6 +3885,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 (IntPtr)args,
                 IntPtr.Zero),
             "cuLaunchKernel");
+            GpuLaunchProbe.OnLaunch();
         // Same AIDOTNET_KERNEL_LAUNCH_CHECK=1 probe as the 1D path (PR #638): localize an
         // illegal-access CUDA-700 to the faulting 2D kernel (the batched FFT kernels launch here).
         if (s_launchCheck)
@@ -5195,6 +5197,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             CudaNativeBindings.cuLaunchKernel(kernel, gridX, gridY, 1, WMMA_THREADS, 1, 1,
                 0, _stream, (IntPtr)args, IntPtr.Zero),
             "cuLaunchKernel(WMMA)");
+            GpuLaunchProbe.OnLaunch();
     }
 
     private static void ValidateBatchedGemmArgs(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, int batchCount)
@@ -8413,6 +8416,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 (IntPtr)args,
                 IntPtr.Zero),
             "cuLaunchKernel (copy_2d_strided)");
+            GpuLaunchProbe.OnLaunch();
     }
 
     /// <inheritdoc/>
@@ -8455,6 +8459,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 (IntPtr)args,
                 IntPtr.Zero),
             "cuLaunchKernel (nearest_neighbor_upsample)");
+            GpuLaunchProbe.OnLaunch();
     }
 
     /// <inheritdoc/>
@@ -8521,6 +8526,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 (IntPtr)args,
                 IntPtr.Zero),
             "cuLaunchKernel (nearest_neighbor_upsample_backward)");
+            GpuLaunchProbe.OnLaunch();
     }
 
     #endregion
@@ -14418,6 +14424,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             CudaNativeBindings.cuLaunchKernel(kernel, grid, 1, 1, (uint)blockSize, 1, 1,
                 (uint)sharedMem, _stream, (IntPtr)args, IntPtr.Zero),
             "cuLaunchKernel(softmax_rows)");
+            GpuLaunchProbe.OnLaunch();
     }
 
     // ─── HRR binding primitives (issue #248) ────────────────────────
@@ -14645,6 +14652,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         uint sharedMem = block * sizeof(float);
         CudaNativeBindings.cuLaunchKernel(kernel, grid, 1, 1, block, 1, 1,
             sharedMem, IntPtr.Zero, (IntPtr)args, IntPtr.Zero);
+        GpuLaunchProbe.OnLaunch();
     }
 
     /// <inheritdoc/>
@@ -14810,6 +14818,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             CudaNativeBindings.cuLaunchKernel(kernel, grid, 1, 1, block, 1, 1,
                 sharedMem, _stream, (IntPtr)args, IntPtr.Zero),
             "cuLaunchKernel(pac_phase_bin_mi)");
+            GpuLaunchProbe.OnLaunch();
     }
 
     #endregion
