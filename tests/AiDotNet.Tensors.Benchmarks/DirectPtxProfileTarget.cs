@@ -221,6 +221,40 @@ internal static class DirectPtxProfileTarget
         GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-flash-attention-backward-end");
     }
 
+    internal static void RunQkvRopeCache()
+    {
+        using var runtime = new DirectPtxRuntime();
+        const int heads = 16, capacity = 128, position = 127;
+        using var kernel = new PtxFusedQkvRopeCacheD64Kernel(
+            runtime, heads, capacity, position);
+        int model = heads * PtxFusedQkvRopeCacheD64Kernel.HeadDimension;
+        using var input = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var weights = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var bias = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        using var cosine = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
+        using var sine = runtime.AllocateBytes(kernel.Blueprint.Tensors[4].RequiredBytes);
+        using var query = runtime.AllocateBytes(kernel.Blueprint.Tensors[5].RequiredBytes);
+        using var keyCache = runtime.AllocateBytes(kernel.Blueprint.Tensors[6].RequiredBytes);
+        using var valueCache = runtime.AllocateBytes(kernel.Blueprint.Tensors[7].RequiredBytes);
+        input.Upload<float>(new float[model]);
+        weights.Upload<float>(new float[3 * model * model]);
+        bias.Upload<float>(new float[3 * model]);
+        cosine.Upload<float>(Enumerable.Repeat(1f, capacity * 32).ToArray());
+        sine.Upload<float>(new float[capacity * 32]);
+        Action launch = () => kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(weights, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(cosine, kernel.Blueprint.Tensors[3]),
+            DirectPtxTensorView.CreateOwned(sine, kernel.Blueprint.Tensors[4]),
+            DirectPtxTensorView.CreateOwned(query, kernel.Blueprint.Tensors[5]),
+            DirectPtxTensorView.CreateOwned(keyCache, kernel.Blueprint.Tensors[6]),
+            DirectPtxTensorView.CreateOwned(valueCache, kernel.Blueprint.Tensors[7]));
+        for (int i = 0; i < 10; i++) launch();
+        runtime.Synchronize();
+        Console.WriteLine(kernel.Audit.ToJson());
+    }
+
     internal static void VerifyNcuCsv(string path)
     {
         DirectPtxProfilerEvidence evidence = DirectPtxProfilerEvidence.FromNcuCsv(path);

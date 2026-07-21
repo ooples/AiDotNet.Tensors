@@ -8111,6 +8111,60 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    /// <summary>
+    /// Projects one resident FP32 decode token through output-major packed Q/K/V
+    /// weights, adds packed bias, applies interleaved RoPE to Q/K, and writes Q
+    /// plus the selected dense KV-cache row. D=64 and cache layout is
+    /// <c>[capacity,heads,64]</c>. The admitted direct-PTX path performs the
+    /// complete operation in one launch; unsupported contracts use the
+    /// established cuBLAS/NVRTC composition.
+    /// </summary>
+    public void QkvProjectionRoPECacheD64(
+        IGpuBuffer input,
+        IGpuBuffer packedWeights,
+        IGpuBuffer bias,
+        IGpuBuffer cosine,
+        IGpuBuffer sine,
+        IGpuBuffer query,
+        IGpuBuffer keyCache,
+        IGpuBuffer valueCache,
+        int heads,
+        int cacheCapacity,
+        int position)
+    {
+        using var _ = PushContext();
+        if (heads <= 0) throw new ArgumentOutOfRangeException(nameof(heads));
+        if (cacheCapacity <= 0) throw new ArgumentOutOfRangeException(nameof(cacheCapacity));
+        if (position < 0 || position >= cacheCapacity)
+            throw new ArgumentOutOfRangeException(nameof(position));
+        const int dimension = 64;
+        int model = checked(heads * dimension);
+        int projection = checked(3 * model);
+        int cacheElements = checked(cacheCapacity * model);
+        int ropeElements = checked(cacheCapacity * (dimension / 2));
+        if (input.Size < model || packedWeights.Size < checked(projection * model) ||
+            bias.Size < projection || cosine.Size < ropeElements || sine.Size < ropeElements ||
+            query.Size < model || keyCache.Size < cacheElements || valueCache.Size < cacheElements)
+            throw new ArgumentException("QKV/RoPE/cache buffers are smaller than the requested canonical extents.");
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxQkvRopeCacheD64(
+            input, packedWeights, bias, cosine, sine, query, keyCache, valueCache,
+            heads, cacheCapacity, position))
+            return;
+#endif
+        using var projected = AllocateBuffer(projection);
+        using var biased = AllocateBuffer(projection);
+        using var rotatedQueryKey = AllocateBuffer(checked(2 * model));
+        MatMulTransposed(input, packedWeights, projected, 1, projection, model);
+        BiasAdd(projected, bias, biased, 1, projection);
+        RopeInterleaved(
+            biased, cosine, sine, rotatedQueryKey,
+            rows: 2 * heads, headDim: dimension, seqLen: 1, startPosition: position);
+        Copy(rotatedQueryKey, 0, query, 0, model);
+        Copy(rotatedQueryKey, model, keyCache, checked(position * model), model);
+        Copy(biased, checked(2 * model), valueCache, checked(position * model), model);
+    }
+
     public unsafe void RopeInterleaved(IGpuBuffer input, IGpuBuffer cos, IGpuBuffer sin, IGpuBuffer output,
         int rows, int headDim, int seqLen, int startPosition)
     {
