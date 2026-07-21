@@ -10974,6 +10974,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Attempts to get a cached GPU buffer for a tensor.
     /// Returns null if the tensor is not registered as persistent.
     /// </summary>
+    /// <summary>
+    /// True when <paramref name="arr"/> has a device buffer in EITHER cache.
+    /// </summary>
+    /// <remarks>
+    /// There are two: <c>_persistentBufferCache</c> (weights/biases, read by TryGetCachedBuffer) and
+    /// <c>_activationCache</c> (intermediate results, written by CacheActivation via FinishGpuOp).
+    /// GetOrAllocateBuffer consults BOTH, so a residency test that checks only the persistent one reports
+    /// false for every op output. That mistake made the Bit-mask gate in TensorWhere look permanently dead:
+    /// PackMaskResident caches the mask as an ACTIVATION, so TryGetCachedBuffer alone always said "not
+    /// resident" even though the buffer was right there.
+    /// </remarks>
+    internal bool IsDeviceResidentArray<T>(T[] arr)
+    {
+        if (arr is null) return false;
+        if (TryGetCachedBuffer(arr) is not null) return true;
+        lock (_activationCacheLock)
+            return _activationCache.ContainsKey(arr);
+    }
+
     internal IGpuBuffer? TryGetCachedBuffer<T>(T[] tensorData)
     {
         if (_persistentBufferCache.TryGetValue(tensorData, out var entry))
@@ -20562,8 +20581,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // which stays null for these. Probe the cache directly, or this always falls back and the
         // comparison -> where chain never stays on the device.
         var condArr = condition.DataVector.GetBackingArrayUnsafe();
-        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)
-            || condArr is null || TryGetCachedBuffer(condArr) is null)
+        // MEASURED 2026-07-20: enabling this path (gate = IsDeviceResidentArray, which correctly finds the
+        // mask in the ACTIVATION cache) moves the residency worklist from 18 ops below the kernel floor to
+        // 10 — but BREAKS 10 comparison ops in tape-gradient parity, 0 failures -> 10. So the mask buffer is
+        // genuinely resident and reachable, yet where_select applied to it does not reproduce the CPU
+        // result. Something about the mask's device encoding still differs from the plain float 0/1 the
+        // kernel assumes (ClassifyFloat / PackMaskResident write it, and PackMaskResident can also
+        // LogicalNot in place).
+        //
+        // Held CPU-only deliberately: a residency count is not worth 10 wrong-gradient ops. Diagnose by
+        // downloading the mask buffer and comparing it against the CPU mask before re-enabling — do not
+        // simply flip the gate back on.
+        if (true || typeof(T) != typeof(float) || !TryGetBackend(out var backend)
+            || condArr is null || !IsDeviceResidentArray(condArr))
             return base.TensorWhere(condition, x, y);
 
         try
