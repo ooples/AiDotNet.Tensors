@@ -29,6 +29,8 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
     internal int KeyValueSequence { get; }
     internal float Scale { get; }
     internal bool IsCausal { get; }
+    internal int BiasBatchStride { get; }
+    internal bool HasAttentionBias => BiasBatchStride >= 0;
     internal string Ptx { get; }
     internal DirectPtxKernelBlueprint Blueprint { get; }
     internal DirectPtxKernelAudit GradQueryAudit { get; }
@@ -41,13 +43,14 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
         int querySequence,
         int keyValueSequence,
         float scale,
-        bool isCausal)
+        bool isCausal,
+        int biasBatchStride = -1)
     {
         ArgumentNullException.ThrowIfNull(runtime);
         if (runtime.ArchitectureFamily != DirectPtxArchitectureFamily.Ampere)
             throw new PlatformNotSupportedException(
                 "The checked-in FlashAttention-backward specialization is validated only on Ampere.");
-        ValidateShape(batch, heads, querySequence, keyValueSequence, scale);
+        ValidateShape(batch, heads, querySequence, keyValueSequence, scale, biasBatchStride);
 
         Batch = batch;
         Heads = heads;
@@ -55,11 +58,14 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
         KeyValueSequence = keyValueSequence;
         Scale = scale;
         IsCausal = isCausal;
+        BiasBatchStride = biasBatchStride;
         Blueprint = CreateBlueprint(
-            runtime.ArchitectureFamily, batch, heads, querySequence, keyValueSequence, isCausal);
+            runtime.ArchitectureFamily, batch, heads, querySequence, keyValueSequence,
+            isCausal, biasBatchStride);
         Ptx = EmitPtx(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
-            batch, heads, querySequence, keyValueSequence, scale, isCausal);
+            batch, heads, querySequence, keyValueSequence, scale, isCausal,
+            biasBatchStride);
         _module = runtime.LoadModule(Ptx);
         _gradQueryFunction = _module.GetFunction(
             GradQueryEntryPoint, out DirectPtxFunctionInfo gradQueryInfo);
@@ -92,7 +98,8 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
         DirectPtxTensorView softmaxStats,
         DirectPtxTensorView gradQuery,
         DirectPtxTensorView gradKey,
-        DirectPtxTensorView gradValue)
+        DirectPtxTensorView gradValue,
+        DirectPtxTensorView? attentionBias = null)
     {
         Require(gradOutput, Blueprint.Tensors[0], nameof(gradOutput));
         Require(query, Blueprint.Tensors[1], nameof(query));
@@ -103,9 +110,15 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
         Require(gradQuery, Blueprint.Tensors[6], nameof(gradQuery));
         Require(gradKey, Blueprint.Tensors[7], nameof(gradKey));
         Require(gradValue, Blueprint.Tensors[8], nameof(gradValue));
+        if (HasAttentionBias != attentionBias.HasValue)
+            throw new ArgumentException(
+                "The attention-bias view must match the baked FlashAttention-backward specialization.",
+                nameof(attentionBias));
+        if (attentionBias is DirectPtxTensorView bias)
+            Require(bias, Blueprint.Tensors[9], nameof(attentionBias));
         RejectOutputAliasing(
             gradOutput, query, key, value, output, softmaxStats,
-            gradQuery, gradKey, gradValue);
+            gradQuery, gradKey, gradValue, attentionBias);
 
         IntPtr go = gradOutput.Pointer;
         IntPtr q = query.Pointer;
@@ -115,7 +128,8 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
         IntPtr lse = softmaxStats.Pointer;
         IntPtr gk = gradKey.Pointer;
         IntPtr gv = gradValue.Pointer;
-        void** gradKeyValueArguments = stackalloc void*[8];
+        IntPtr biasPointer = attentionBias?.Pointer ?? IntPtr.Zero;
+        void** gradKeyValueArguments = stackalloc void*[HasAttentionBias ? 9 : 8];
         gradKeyValueArguments[0] = &go;
         gradKeyValueArguments[1] = &q;
         gradKeyValueArguments[2] = &k;
@@ -124,6 +138,7 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
         gradKeyValueArguments[5] = &lse;
         gradKeyValueArguments[6] = &gk;
         gradKeyValueArguments[7] = &gv;
+        if (HasAttentionBias) gradKeyValueArguments[8] = &biasPointer;
         int keyRows = checked(Batch * Heads * KeyValueSequence);
         _module.Launch(
             _gradKeyValueFunction,
@@ -131,7 +146,7 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
             (uint)(WarpsPerBlock * 32), 1, 1, 0, gradKeyValueArguments);
 
         IntPtr gq = gradQuery.Pointer;
-        void** gradQueryArguments = stackalloc void*[7];
+        void** gradQueryArguments = stackalloc void*[HasAttentionBias ? 8 : 7];
         gradQueryArguments[0] = &go;
         gradQueryArguments[1] = &q;
         gradQueryArguments[2] = &k;
@@ -139,6 +154,7 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
         gradQueryArguments[4] = &o;
         gradQueryArguments[5] = &lse;
         gradQueryArguments[6] = &gq;
+        if (HasAttentionBias) gradQueryArguments[7] = &biasPointer;
         int queryRows = checked(Batch * Heads * QuerySequence);
         _module.Launch(
             _gradQueryFunction,
@@ -167,16 +183,19 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
         DirectPtxTensorView softmaxStats,
         DirectPtxTensorView gradQuery,
         DirectPtxTensorView gradKey,
-        DirectPtxTensorView gradValue)
+        DirectPtxTensorView gradValue,
+        DirectPtxTensorView? attentionBias)
     {
         IntPtr go = gradOutput.Pointer, q = query.Pointer, k = key.Pointer;
         IntPtr v = value.Pointer, o = output.Pointer, lse = softmaxStats.Pointer;
         IntPtr gq = gradQuery.Pointer, gk = gradKey.Pointer, gv = gradValue.Pointer;
+        IntPtr bias = attentionBias?.Pointer ?? IntPtr.Zero;
         if (gq == go || gq == q || gq == k || gq == v || gq == o || gq == lse ||
             gq == gk || gq == gv ||
             gk == go || gk == q || gk == k || gk == v || gk == o || gk == lse ||
             gk == gv ||
-            gv == go || gv == q || gv == k || gv == v || gv == o || gv == lse)
+            gv == go || gv == q || gv == k || gv == v || gv == o || gv == lse ||
+            (bias != IntPtr.Zero && (gq == bias || gk == bias || gv == bias)))
             throw new ArgumentException(
                 "FlashAttention-backward outputs may not alias inputs or each other.");
     }
@@ -191,17 +210,22 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
         int querySequence,
         int keyValueSequence,
         float scale,
-        bool isCausal)
+        bool isCausal,
+        int biasBatchStride = -1)
     {
-        ValidateShape(batch, heads, querySequence, keyValueSequence, scale);
+        ValidateShape(batch, heads, querySequence, keyValueSequence, scale, biasBatchStride);
         var ptx = new StringBuilder(20_000);
         ptx.AppendLine(".version 7.1");
         ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
-        EmitGradQuery(ptx, batch, heads, querySequence, keyValueSequence, scale, isCausal);
+        EmitGradQuery(
+            ptx, batch, heads, querySequence, keyValueSequence, scale, isCausal,
+            biasBatchStride);
         ptx.AppendLine();
-        EmitGradKeyValue(ptx, batch, heads, querySequence, keyValueSequence, scale, isCausal);
+        EmitGradKeyValue(
+            ptx, batch, heads, querySequence, keyValueSequence, scale, isCausal,
+            biasBatchStride);
         return ptx.ToString();
     }
 
@@ -212,11 +236,12 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
         int querySequence,
         int keyValueSequence,
         float scale,
-        bool isCausal)
+        bool isCausal,
+        int biasBatchStride)
     {
         int totalRows = checked(batch * heads * querySequence);
         ptx.AppendLine($".visible .entry {GradQueryEntryPoint}(");
-        EmitParameters(ptx, includeGradKeyValue: false);
+        EmitParameters(ptx, includeGradKeyValue: false, hasAttentionBias: biasBatchStride >= 0);
         ptx.AppendLine(")");
         ptx.AppendLine("{");
         ptx.AppendLine("    .reg .pred %p<4>;");
@@ -225,6 +250,8 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
         ptx.AppendLine("    .reg .f32 %f<32>;");
         LoadCommonParameters(ptx);
         ptx.AppendLine("    ld.param.u64 %rd6, [grad_query_ptr];");
+        if (biasBatchStride >= 0)
+            ptx.AppendLine("    ld.param.u64 %rd20, [attention_bias_ptr];");
         EmitWarpRow(ptx, totalRows, querySequence, "DQ_RETURN");
         ptx.AppendLine("    shl.b32 %r7, %r2, 1;");
         ptx.AppendLine("    mul.wide.u32 %rd7, %r4, 256;");
@@ -261,6 +288,14 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
         ptx.AppendLine("    fma.rn.f32 %f13, %f1, %f12, %f13;");
         EmitWarpSum(ptx, "%f13", "%f14", "%r20", "%r21");
         ptx.AppendLine($"    mul.rn.f32 %f15, %f13, {FloatLiteral(scale)};");
+        if (biasBatchStride >= 0)
+        {
+            EmitBiasAddress(
+                ptx, "%rd18", "%r5", "%r6", "%r8", heads,
+                querySequence, keyValueSequence, biasBatchStride);
+            ptx.AppendLine("    ld.global.f32 %f24, [%rd18];");
+            ptx.AppendLine("    add.rn.f32 %f15, %f15, %f24;");
+        }
         ptx.AppendLine("    sub.rn.f32 %f15, %f15, %f8;");
         ptx.AppendLine($"    mul.rn.f32 %f15, %f15, {FloatLiteral(1.4426950408889634f)};");
         ptx.AppendLine("    ex2.approx.f32 %f16, %f15;");
@@ -293,11 +328,12 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
         int querySequence,
         int keyValueSequence,
         float scale,
-        bool isCausal)
+        bool isCausal,
+        int biasBatchStride)
     {
         int totalRows = checked(batch * heads * keyValueSequence);
         ptx.AppendLine($".visible .entry {GradKeyValueEntryPoint}(");
-        EmitParameters(ptx, includeGradKeyValue: true);
+        EmitParameters(ptx, includeGradKeyValue: true, hasAttentionBias: biasBatchStride >= 0);
         ptx.AppendLine(")");
         ptx.AppendLine("{");
         ptx.AppendLine("    .reg .pred %p<4>;");
@@ -307,6 +343,8 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
         LoadCommonParameters(ptx);
         ptx.AppendLine("    ld.param.u64 %rd6, [grad_key_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd7, [grad_value_ptr];");
+        if (biasBatchStride >= 0)
+            ptx.AppendLine("    ld.param.u64 %rd20, [attention_bias_ptr];");
         EmitWarpRow(ptx, totalRows, keyValueSequence, "DKV_RETURN");
         ptx.AppendLine("    shl.b32 %r7, %r2, 1;");
         EmitBhKeyPairAddress(ptx, "%rd2", "%rd8", "%r5", "%r6", "%r7", keyValueSequence);
@@ -342,6 +380,14 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
         ptx.AppendLine("    fma.rn.f32 %f14, %f9, %f1, %f14;");
         EmitWarpSum(ptx, "%f14", "%f15", "%r20", "%r21");
         ptx.AppendLine($"    mul.rn.f32 %f16, %f14, {FloatLiteral(scale)};");
+        if (biasBatchStride >= 0)
+        {
+            EmitBiasAddress(
+                ptx, "%rd18", "%r5", "%r8", "%r6", heads,
+                querySequence, keyValueSequence, biasBatchStride);
+            ptx.AppendLine("    ld.global.f32 %f24, [%rd18];");
+            ptx.AppendLine("    add.rn.f32 %f16, %f16, %f24;");
+        }
         ptx.AppendLine("    mul.wide.u32 %rd15, %r9, 4;");
         ptx.AppendLine("    add.u64 %rd15, %rd5, %rd15;");
         ptx.AppendLine("    ld.global.f32 %f17, [%rd15];");
@@ -374,7 +420,10 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
         ptx.AppendLine("}");
     }
 
-    private static void EmitParameters(StringBuilder ptx, bool includeGradKeyValue)
+    private static void EmitParameters(
+        StringBuilder ptx,
+        bool includeGradKeyValue,
+        bool hasAttentionBias)
     {
         ptx.AppendLine("    .param .u64 grad_output_ptr,");
         ptx.AppendLine("    .param .u64 query_ptr,");
@@ -385,12 +434,18 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
         if (includeGradKeyValue)
         {
             ptx.AppendLine("    .param .u64 grad_key_ptr,");
-            ptx.AppendLine("    .param .u64 grad_value_ptr");
+            ptx.AppendLine(hasAttentionBias
+                ? "    .param .u64 grad_value_ptr,"
+                : "    .param .u64 grad_value_ptr");
         }
         else
         {
-            ptx.AppendLine("    .param .u64 grad_query_ptr");
+            ptx.AppendLine(hasAttentionBias
+                ? "    .param .u64 grad_query_ptr,"
+                : "    .param .u64 grad_query_ptr");
         }
+        if (hasAttentionBias)
+            ptx.AppendLine("    .param .u64 attention_bias_ptr");
     }
 
     private static void LoadCommonParameters(StringBuilder ptx)
@@ -435,6 +490,27 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
         ptx.AppendLine($"    add.u64 {destination}, {basePointer}, %rd25;");
     }
 
+    private static void EmitBiasAddress(
+        StringBuilder ptx,
+        string destination,
+        string batchHead,
+        string queryIndex,
+        string keyIndex,
+        int heads,
+        int querySequence,
+        int keyValueSequence,
+        int biasBatchStride)
+    {
+        if (biasBatchStride == 0)
+            ptx.AppendLine($"    rem.u32 %r14, {batchHead}, {heads};");
+        else
+            ptx.AppendLine($"    mov.u32 %r14, {batchHead};");
+        ptx.AppendLine($"    mad.lo.u32 %r14, %r14, {querySequence}, {queryIndex};");
+        ptx.AppendLine($"    mad.lo.u32 %r14, %r14, {keyValueSequence}, {keyIndex};");
+        ptx.AppendLine("    mul.wide.u32 %rd26, %r14, 4;");
+        ptx.AppendLine($"    add.u64 {destination}, %rd20, %rd26;");
+    }
+
     private static void EmitWarpSum(
         StringBuilder ptx,
         string value,
@@ -457,7 +533,8 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
         int heads,
         int querySequence,
         int keyValueSequence,
-        bool isCausal)
+        bool isCausal,
+        int biasBatchStride)
     {
         var query = new DirectPtxExtent(batch, heads, querySequence, HeadDimension);
         var keyValue = new DirectPtxExtent(batch, heads, keyValueSequence, HeadDimension);
@@ -466,28 +543,12 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
             Operation: "flash-attention-recompute-backward-d64",
             Version: 1,
             Architecture: architecture,
-            Variant: isCausal ? "deterministic-causal-top-left" : "deterministic-unmasked",
-            Tensors:
-            [
-                new("grad-output", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Bhsd,
-                    query, query, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact),
-                new("query", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Bhsd,
-                    query, query, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact),
-                new("key", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Bhsd,
-                    keyValue, keyValue, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact),
-                new("value", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Bhsd,
-                    keyValue, keyValue, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact),
-                new("output", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Bhsd,
-                    query, query, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact),
-                new("softmax-stats", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.RowMajor2D,
-                    stats, stats, 4, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact),
-                new("grad-query", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Bhsd,
-                    query, query, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact),
-                new("grad-key", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Bhsd,
-                    keyValue, keyValue, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact),
-                new("grad-value", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Bhsd,
-                    keyValue, keyValue, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
-            ],
+            Variant: (isCausal ? "deterministic-causal-top-left" : "deterministic-unmasked") +
+                (biasBatchStride < 0 ? "-no-bias" :
+                    biasBatchStride == 0 ? "-bias-broadcast" : "-bias-per-batch"),
+            Tensors: CreateTensorContracts(
+                batch, heads, querySequence, keyValueSequence,
+                query, keyValue, stats, biasBatchStride),
             ResourceBudget: new DirectPtxResourceBudget(
                 MaxRegistersPerThread: 64,
                 MaxStaticSharedBytes: 0,
@@ -501,6 +562,8 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
                 ["output"] = "fp32-dq-dk-dv",
                 ["layout"] = "canonical-bhsd",
                 ["mask"] = isCausal ? "causal-top-left-baked" : "none",
+                ["bias"] = biasBatchStride < 0 ? "none" :
+                    biasBatchStride == 0 ? "broadcast-baked" : "per-batch-baked",
                 ["determinism"] = "fixed-order-no-atomics",
                 ["global-intermediates"] = "none",
                 ["temporary-device-allocation"] = "none",
@@ -508,12 +571,57 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
             });
     }
 
+    private static IReadOnlyList<DirectPtxTensorContract> CreateTensorContracts(
+        int batch,
+        int heads,
+        int querySequence,
+        int keyValueSequence,
+        DirectPtxExtent query,
+        DirectPtxExtent keyValue,
+        DirectPtxExtent stats,
+        int biasBatchStride)
+    {
+        var tensors = new List<DirectPtxTensorContract>(biasBatchStride < 0 ? 9 : 10)
+        {
+            new("grad-output", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Bhsd,
+                query, query, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact),
+            new("query", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Bhsd,
+                query, query, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact),
+            new("key", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Bhsd,
+                keyValue, keyValue, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact),
+            new("value", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Bhsd,
+                keyValue, keyValue, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact),
+            new("output", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Bhsd,
+                query, query, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact),
+            new("softmax-stats", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.RowMajor2D,
+                stats, stats, 4, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact),
+            new("grad-query", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Bhsd,
+                query, query, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact),
+            new("grad-key", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Bhsd,
+                keyValue, keyValue, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact),
+            new("grad-value", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Bhsd,
+                keyValue, keyValue, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
+        };
+        if (biasBatchStride >= 0)
+        {
+            DirectPtxExtent bias = biasBatchStride == 0
+                ? new DirectPtxExtent(heads, querySequence, keyValueSequence)
+                : new DirectPtxExtent(batch, heads, querySequence, keyValueSequence);
+            tensors.Add(new DirectPtxTensorContract(
+                "attention-bias", DirectPtxPhysicalType.Float32,
+                DirectPtxPhysicalLayout.AttentionBias, bias, bias, 16,
+                DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact));
+        }
+        return tensors;
+    }
+
     private static void ValidateShape(
         int batch,
         int heads,
         int querySequence,
         int keyValueSequence,
-        float scale)
+        float scale,
+        int biasBatchStride = -1)
     {
         if (batch <= 0 || batch > 16) throw new ArgumentOutOfRangeException(nameof(batch));
         if (heads <= 0 || heads > 128) throw new ArgumentOutOfRangeException(nameof(heads));
@@ -522,6 +630,11 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
         if (keyValueSequence is not (16 or 32 or 64 or 128))
             throw new ArgumentOutOfRangeException(nameof(keyValueSequence));
         if (!float.IsFinite(scale)) throw new ArgumentOutOfRangeException(nameof(scale));
+        int fullBiasBatchStride = checked(heads * querySequence * keyValueSequence);
+        if (biasBatchStride is not (-1 or 0) && biasBatchStride != fullBiasBatchStride)
+            throw new ArgumentOutOfRangeException(
+                nameof(biasBatchStride),
+                "Bias must be absent (-1), head-broadcast (0), or canonical per-batch stride.");
     }
 
     private static string FloatLiteral(float value) =>

@@ -52,7 +52,7 @@ missing or duplicate assignment.
 | ScaledDotProductAttention | `scaled_dot_product_attention` | v3 weight-free dense FP16 inference implemented; weights/masks/softcap planned |
 | ScaledDotProductAttentionBackward | GEMM + softmax-backward composition | v1 deterministic materialized-probability FP32 D64 MHA backward implemented; recomputation planned |
 | FlashAttention / FlashAttentionV2 | `flash_attention_v2` | v3 rectangular dense FP16, LSE, no-bias route implemented |
-| FlashAttentionBackward | atomic and deterministic NVRTC variants | v1 deterministic FP32 D64 LSE-recomputation MHA implemented for no-bias unmasked/causal; remaining semantics planned |
+| FlashAttentionBackward | atomic and deterministic NVRTC variants | v1 deterministic FP32 D64 LSE-recomputation MHA implemented for unmasked/causal with optional broadcast/per-batch additive bias; remaining semantics planned |
 | GroupedQueryAttention | `grouped_query_attention` | v3 weight-free GQA/MQA inference implemented; weights mode planned |
 | GroupedQueryAttentionBackward | atomic and deterministic NVRTC variants | v1 deterministic materialized-probability FP32 D64 GQA/MQA backward implemented; recomputation planned |
 | FlashDecode | `flash_decode_partial` + `flash_decode_reduce` | v1 register-online D64 FP32 MHA/GQA/MQA decode implemented for S=16/32/64/128; explicit split hints fall back |
@@ -376,7 +376,8 @@ softmax-gradient reduction, dQ/dK accumulation, and dV accumulation stay in
 registers; only final dQ/dK/dV vectors are written. It has no SxS score or
 probability buffer, temporary allocation, stride argument, shared/local memory,
 or atomics. The currently admitted family is FP32 BHSD, D=64, MHA,
-Sq/Skv independently in {16,32,64,128}, unmasked or top-left causal, no bias.
+Sq/Skv independently in {16,32,64,128}, unmasked or top-left causal, with
+optional canonical `[H,Sq,Skv]` broadcast or `[B,H,Sq,Skv]` additive bias.
 
 ### Flash/LSE recomputation-backward evidence
 
@@ -390,6 +391,7 @@ tolerance, and zero local bytes).
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | H8, Sq16, Skv16 | 30.92 / 56.63 | 141.31 / 145.72 | 4.59x | 39.40 | 43.50 / 99.70 | 369.40 / 586.00 | 0 | 263,168 | 3.725e-8 |
 | H8, Sq16, Skv32 | 29.59 / 55.91 | 230.71 / 263.78 | 7.80x | 75.57 | 49.80 / 98.90 | 352.90 / 628.50 | 0 | 328,704 | 1.863e-8 |
+| H8, Sq16, Skv32, bias | 30.62 / 46.49 | 236.24 / 261.63 | 7.82x | 76.70 | 40.00 / 79.30 | 335.30 / 579.60 | 0 | 328,704 | 2.235e-8 |
 | H8, Sq32, Skv32, causal | 38.40 / 62.57 | 337.72 / 365.06 | 8.95x | 135.63 | 45.10 / 90.30 | 328.60 / 517.40 | 0 | 394,752 | 1.490e-7 |
 | H8, Sq64, Skv64, causal | 46.69 / 66.97 | 1,010.48 / 1,064.86 | 22.29x | 376.64 | 63.50 / 82.50 | 336.20 / 557.20 | 0 | 659,456 | 1.192e-7 |
 
@@ -450,6 +452,8 @@ The implemented token is `DirectPtxTensorView`:
 - FP16 physical Q/K/V and FP32 output/stats/gamma/beta;
 - materialized backward uses exact-extent FP32 BHSD tensors and FP32 BHSqSkv
   probabilities; Flash backward uses exact-extent FP32 BHSD plus FP32 BHSq LSE;
+- additive Flash-backward bias is a separate baked ABI: exact FP32
+  `[H,Sq,Skv]` batch broadcast or `[B,H,Sq,Skv]` per batch;
 - at least 16-byte device-pointer alignment;
 - sufficient byte extent and dtype-compatible extent;
 - no stride fields and no shape fields passed to PTX.
@@ -477,8 +481,8 @@ The final S=128 functions on this RTX 3080 report:
 |---|---:|---:|---:|
 | Unmasked | 66 | 25,088 bytes | 0 |
 | Causal | 80 | 25,088 bytes | 0 |
-| Flash backward dQ | 29 | 0 bytes | 0 |
-| Flash backward dK/dV | 33 | 0 bytes | 0 |
+| Flash backward dQ, no bias / bias | 29 / 33 | 0 bytes | 0 |
+| Flash backward dK/dV, no bias / bias | 33 / 35 | 0 bytes | 0 |
 
 `local bytes/thread = 0` is direct runtime evidence that this JIT result has
 no local stack or register-spill allocation. Tests carry the value through
@@ -522,8 +526,8 @@ attribute remains the available zero-spill admission proof for this capture.
 | Causal future K/V tile | Compute skipped per owning query warp |
 | Inference output-only | No score, probability, or LSE global store |
 | Materialized-probability backward, FP32 D64, supported shape/head map | Three-entry deterministic direct PTX; final dQ allocation supplies the row-delta workspace |
-| Flash/recomputation backward, FP32 D64 MHA, Sq/Skv=16/32/64/128, no bias | Two-entry deterministic direct PTX; probabilities recomputed from Q/K/LSE; no scratch |
-| Flash/recomputation backward with bias, unsupported dtype/D/shape, or GQA | Existing CUDA implementation with an exact rejection reason |
+| Flash/recomputation backward, FP32 D64 MHA, Sq/Skv=16/32/64/128, optional canonical broadcast/per-batch bias | Two-entry deterministic direct PTX; probabilities recomputed from Q/K/bias/LSE; no scratch |
+| Flash/recomputation backward with noncanonical bias, unsupported dtype/D/shape, or GQA | Existing CUDA implementation with an exact rejection reason |
 
 ## Reusable kernel assembly line
 
@@ -593,7 +597,7 @@ copied into another one-off emitter.
 | Autotuned dispatch | Attention tries valid query-warp variants, persists the winner through the existing autotune cache, keys it by GPU UUID/SM/driver and semantics, and bounds loaded modules with an LRU | A clean production release run still requires three independent captures |
 | Stronger spill proof | Runtime admission enforces register/shared/local budgets and records PTX SHA-256, JIT attributes, occupancy, GPU fingerprint, and log; an Nsight CSV parser and deterministic profile target enforce executed spill/local counters | Nsight attached, but `ERR_NVGPUCTRPERM` blocks counter access until enabled by the host administrator |
 | Hardened performance gate | Policy requires >=1.10x median, bounded p95, zero hot managed/device temporary bytes, numerical tolerance, zero local bytes, and three independent runs | Windows display scheduling can hold an otherwise fast candidate |
-| Expanded correctness | Rectangular Sq/Skv D64 FP16 attention, D64 FP32 dense/paged decode, causal D64 FP32 paged prefill, deterministic materialized-probability D64 FP32 backward, and deterministic no-bias Flash/LSE-recomputation D64 FP32 backward admit their tested buckets; explicit reasons cover dtype, D, invalid head maps, page geometry, mask, bias, dropout, phase, and ragged requests | BF16, arbitrary-mask prefill/backward, additive-bias Flash backward, Flash GQA, and ragged semantics remain implementation work |
+| Expanded correctness | Rectangular Sq/Skv D64 FP16 attention, D64 FP32 dense/paged decode, causal D64 FP32 paged prefill, deterministic materialized-probability D64 FP32 backward, and deterministic optionally biased Flash/LSE-recomputation D64 FP32 backward admit their tested buckets; explicit reasons cover dtype, D, invalid head maps, page geometry, mask, bias, dropout, phase, and ragged requests | BF16, arbitrary-mask prefill/backward, Flash GQA, and ragged semantics remain implementation work |
 | Real second fusion | `residual + RMSNorm(D=64)` is one warp-owned reduction/fusion using the same ABI, audit, gate, cache, graph-prewarm, tests, and benchmark framework | QKV projection/RoPE remains the next tensor-core fusion |
 | Architecture families | Ampere, Ada, Hopper, and Blackwell are distinct dispatch domains | Only Ampere SM86 was executed here; other families deliberately reject rather than inherit Ampere tuning |
 

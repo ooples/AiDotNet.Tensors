@@ -1133,6 +1133,11 @@ public class DirectPtxWmmaTests
         Assert.DoesNotContain("atom.", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+        string biasPtx = PtxFlashAttentionBackwardD64Kernel.EmitPtx(
+            8, 6, 2, 4, 16, 32, 0.125f, isCausal: false,
+            biasBatchStride: 4 * 16 * 32);
+        Assert.Contains("attention_bias_ptr", biasPtx);
+        Assert.DoesNotContain("has_bias", biasPtx, StringComparison.OrdinalIgnoreCase);
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             PtxFusedAttentionBackwardD64Kernel.EmitPtx(
                 8, 6, 1, 8, 3, 16, 16, 0.125f));
@@ -1353,14 +1358,16 @@ public class DirectPtxWmmaTests
     }
 
     [SkippableTheory]
-    [InlineData(4, 16, 16, false)]
-    [InlineData(4, 16, 32, true)]
-    [InlineData(4, 32, 16, false)]
+    [InlineData(4, 16, 16, false, false)]
+    [InlineData(4, 16, 32, true, false)]
+    [InlineData(4, 32, 16, false, false)]
+    [InlineData(4, 16, 32, false, true)]
     public void DriverOnlyFlashAttentionBackwardD64_MatchesOracleAndHasZeroLocalBytes(
         int heads,
         int querySequence,
         int keyValueSequence,
-        bool isCausal)
+        bool isCausal,
+        bool hasBias)
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
         using var runtime = new DirectPtxRuntime();
@@ -1368,8 +1375,10 @@ public class DirectPtxWmmaTests
             "The checked-in FlashAttention-backward specialization is validated on Ampere.");
         const int batch = 1, dimension = 64;
         const float scale = 0.125f;
+        int biasBatchStride = hasBias ? 0 : -1;
         using var kernel = new PtxFlashAttentionBackwardD64Kernel(
-            runtime, batch, heads, querySequence, keyValueSequence, scale, isCausal);
+            runtime, batch, heads, querySequence, keyValueSequence, scale, isCausal,
+            biasBatchStride);
         Assert.Equal(0, kernel.GradQueryAudit.Function.LocalBytesPerThread);
         Assert.Equal(0, kernel.GradKeyValueAudit.Function.LocalBytesPerThread);
         Assert.Equal(0, kernel.GradQueryAudit.Function.StaticSharedBytes);
@@ -1387,9 +1396,13 @@ public class DirectPtxWmmaTests
             .Select(_ => (random.NextSingle() - 0.5f) * 0.5f).ToArray();
         float[] valueHost = Enumerable.Range(0, keyValueElements)
             .Select(_ => (random.NextSingle() - 0.5f) * 0.5f).ToArray();
+        float[]? biasHost = hasBias
+            ? Enumerable.Range(0, heads * querySequence * keyValueSequence)
+                .Select(_ => (random.NextSingle() - 0.5f) * 0.25f).ToArray()
+            : null;
         (float[] probabilities, float[] outputHost, float[] statsHost) = FlashForwardReference(
             queryHost, keyHost, valueHost, batch, heads,
-            querySequence, keyValueSequence, scale, isCausal);
+            querySequence, keyValueSequence, scale, isCausal, biasHost);
         (float[] expectedQ, float[] expectedK, float[] expectedV) = AttentionBackwardOracle(
             gradOutputHost, queryHost, keyHost, valueHost, probabilities,
             batch, heads, heads, querySequence, keyValueSequence, scale);
@@ -1403,12 +1416,16 @@ public class DirectPtxWmmaTests
         using var gradQuery = runtime.AllocateBytes((nuint)(queryElements * sizeof(float)));
         using var gradKey = runtime.AllocateBytes((nuint)(keyValueElements * sizeof(float)));
         using var gradValue = runtime.AllocateBytes((nuint)(keyValueElements * sizeof(float)));
+        using DirectPtxBuffer? bias = hasBias
+            ? runtime.AllocateBytes((nuint)(biasHost!.Length * sizeof(float)))
+            : null;
         gradOutput.Upload<float>(gradOutputHost);
         query.Upload<float>(queryHost);
         key.Upload<float>(keyHost);
         value.Upload<float>(valueHost);
         output.Upload<float>(outputHost);
         stats.Upload<float>(statsHost);
+        bias?.Upload<float>(biasHost!);
         kernel.Launch(
             DirectPtxTensorView.CreateOwned(gradOutput, kernel.Blueprint.Tensors[0]),
             DirectPtxTensorView.CreateOwned(query, kernel.Blueprint.Tensors[1]),
@@ -1418,7 +1435,10 @@ public class DirectPtxWmmaTests
             DirectPtxTensorView.CreateOwned(stats, kernel.Blueprint.Tensors[5]),
             DirectPtxTensorView.CreateOwned(gradQuery, kernel.Blueprint.Tensors[6]),
             DirectPtxTensorView.CreateOwned(gradKey, kernel.Blueprint.Tensors[7]),
-            DirectPtxTensorView.CreateOwned(gradValue, kernel.Blueprint.Tensors[8]));
+            DirectPtxTensorView.CreateOwned(gradValue, kernel.Blueprint.Tensors[8]),
+            bias is null
+                ? null
+                : DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[9]));
         runtime.Synchronize();
         var actualQ = new float[queryElements];
         var actualK = new float[keyValueElements];
@@ -1473,14 +1493,15 @@ public class DirectPtxWmmaTests
             using var gradQuery = backend.AllocateBuffer(queryElements);
             using var gradKey = backend.AllocateBuffer(keyValueElements);
             using var gradValue = backend.AllocateBuffer(keyValueElements);
-            using var bias = backend.AllocateBuffer(batch * heads * querySequence * keyValueSequence);
+            using var badBias = backend.AllocateBuffer(
+                batch * heads * querySequence * keyValueSequence + 1);
             Assert.False(backend.TryDirectPtxFlashAttentionBackwardD64(
                 gradOutput, query, key, value, output, stats,
                 gradQuery, gradKey, gradValue,
                 batch, heads, querySequence, keyValueSequence,
-                dimension, scale, isCausal, bias));
+                dimension, scale, isCausal, badBias));
             Assert.Equal(
-                "flash-attention-backward-attention-bias-not-implemented",
+                "flash-attention-backward-bias-physical-extent-mismatch",
                 backend.DirectPtxLastError);
             Assert.True(backend.PrewarmDirectPtxFlashAttentionBackwardD64(
                 batch, heads, querySequence, keyValueSequence, scale, isCausal),
@@ -1541,6 +1562,114 @@ public class DirectPtxWmmaTests
                 batch, heads, querySequence, keyValueSequence, scale, isCausal,
                 out DirectPtxKernelAudit gradQueryAudit,
                 out DirectPtxKernelAudit gradKeyValueAudit));
+            Assert.Equal(0, gradQueryAudit.Function.LocalBytesPerThread);
+            Assert.Equal(0, gradKeyValueAudit.Function.LocalBytesPerThread);
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previous;
+        }
+    }
+
+    [SkippableTheory]
+    [InlineData(0)]
+    [InlineData(4 * 16 * 32)]
+    public void BackendFlashAttentionBackwardBias_BroadcastAndPerBatchMatchOracle(
+        int biasBatchStride)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previous = DirectPtxFeatureGate.TestOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxFlashAttentionBackwardEnabled,
+                "Requires an Ampere CUDA backend.");
+            const int batch = 2, heads = 4, querySequence = 16, keyValueSequence = 32;
+            const int dimension = 64;
+            const float scale = 0.125f;
+            const bool isCausal = false;
+            int queryElements = batch * heads * querySequence * dimension;
+            int keyValueElements = batch * heads * keyValueSequence * dimension;
+            int biasElements = biasBatchStride == 0
+                ? heads * querySequence * keyValueSequence
+                : batch * biasBatchStride;
+            var random = new Random(20260822 + biasBatchStride);
+            float[] gradOutputHost = Values(random, queryElements);
+            float[] queryHost = Values(random, queryElements);
+            float[] keyHost = Values(random, keyValueElements);
+            float[] valueHost = Values(random, keyValueElements);
+            float[] biasHost = Values(random, biasElements);
+            (float[] probabilities, float[] outputHost, float[] statsHost) =
+                FlashForwardReference(
+                    queryHost, keyHost, valueHost, batch, heads,
+                    querySequence, keyValueSequence, scale, isCausal,
+                    biasHost, biasBatchStride);
+            (float[] expectedQ, float[] expectedK, float[] expectedV) = AttentionBackwardOracle(
+                gradOutputHost, queryHost, keyHost, valueHost, probabilities,
+                batch, heads, heads, querySequence, keyValueSequence, scale);
+
+            using var gradOutput = backend.AllocateBuffer(gradOutputHost);
+            using var query = backend.AllocateBuffer(queryHost);
+            using var key = backend.AllocateBuffer(keyHost);
+            using var value = backend.AllocateBuffer(valueHost);
+            using var output = backend.AllocateBuffer(outputHost);
+            using var stats = backend.AllocateBuffer(statsHost);
+            using var bias = backend.AllocateBuffer(biasHost);
+            using var gradQuery = backend.AllocateBuffer(queryElements);
+            using var gradKey = backend.AllocateBuffer(keyValueElements);
+            using var gradValue = backend.AllocateBuffer(keyValueElements);
+
+            Assert.True(backend.PrewarmDirectPtxFlashAttentionBackwardD64(
+                batch, heads, querySequence, keyValueSequence, scale, isCausal,
+                biasBatchStride), backend.DirectPtxLastError);
+            for (int i = 0; i < 8; i++)
+                Assert.True(backend.TryDirectPtxFlashAttentionBackwardD64(
+                    gradOutput, query, key, value, output, stats,
+                    gradQuery, gradKey, gradValue,
+                    batch, heads, querySequence, keyValueSequence,
+                    dimension, scale, isCausal, bias, biasBatchStride),
+                    backend.DirectPtxLastError);
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            bool allLaunched = true;
+            for (int i = 0; i < 32; i++)
+                allLaunched &= backend.TryDirectPtxFlashAttentionBackwardD64(
+                    gradOutput, query, key, value, output, stats,
+                    gradQuery, gradKey, gradValue,
+                    batch, heads, querySequence, keyValueSequence,
+                    dimension, scale, isCausal, bias, biasBatchStride);
+            long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+            backend.Synchronize();
+            Assert.True(allLaunched, backend.DirectPtxLastError);
+            Assert.Equal(0, allocated);
+            AssertAttentionGradientClose(backend.DownloadBuffer(gradQuery), expectedQ, "biased dQ");
+            AssertAttentionGradientClose(backend.DownloadBuffer(gradKey), expectedK, "biased dK");
+            AssertAttentionGradientClose(backend.DownloadBuffer(gradValue), expectedV, "biased dV");
+
+            bool captureLaunch = true;
+            IntPtr graph = backend.CaptureGraph(() =>
+                captureLaunch &= backend.TryDirectPtxFlashAttentionBackwardD64(
+                    gradOutput, query, key, value, output, stats,
+                    gradQuery, gradKey, gradValue,
+                    batch, heads, querySequence, keyValueSequence,
+                    dimension, scale, isCausal, bias, biasBatchStride));
+            Assert.True(captureLaunch, backend.DirectPtxLastError);
+            try { backend.LaunchCapturedGraph(graph); }
+            finally { backend.DestroyCapturedGraph(graph); }
+
+            long dispatchBefore = backend.DirectPtxFlashAttentionBackwardDispatchCount;
+            backend.FlashAttentionBackward(
+                gradOutput, query, key, value, output, stats,
+                gradQuery, gradKey, gradValue,
+                batch, heads, querySequence, keyValueSequence,
+                dimension, scale, isCausal, bias, biasBatchStride);
+            backend.Synchronize();
+            Assert.Equal(dispatchBefore + 1, backend.DirectPtxFlashAttentionBackwardDispatchCount);
+            Assert.True(backend.TryGetDirectPtxFlashAttentionBackwardAudits(
+                batch, heads, querySequence, keyValueSequence, scale, isCausal,
+                out DirectPtxKernelAudit gradQueryAudit,
+                out DirectPtxKernelAudit gradKeyValueAudit,
+                biasBatchStride));
             Assert.Equal(0, gradQueryAudit.Function.LocalBytesPerThread);
             Assert.Equal(0, gradKeyValueAudit.Function.LocalBytesPerThread);
         }
@@ -1843,12 +1972,15 @@ public class DirectPtxWmmaTests
         int querySequence,
         int keyValueSequence,
         float scale,
-        bool isCausal)
+        bool isCausal,
+        float[]? attentionBias = null,
+        int biasBatchStride = 0)
     {
         const int dimension = 64;
         float[] probabilities = AttentionProbabilities(
             query, key, batch, heads, heads,
-            querySequence, keyValueSequence, scale, isCausal);
+            querySequence, keyValueSequence, scale, isCausal,
+            attentionBias, biasBatchStride);
         var output = new float[query.Length];
         var stats = new float[batch * heads * querySequence];
         for (int b = 0; b < batch; b++)
@@ -1868,6 +2000,9 @@ public class DirectPtxWmmaTests
                 for (int d = 0; d < dimension; d++)
                     score += query[queryBase + d] * key[keyBase + d];
                 score *= scale;
+                if (attentionBias is not null)
+                    score += attentionBias[
+                        b * biasBatchStride + (h * querySequence + qi) * keyValueSequence + ki];
                 maximum = MathF.Max(maximum, score);
             }
             for (int ki = 0; ki < keyValueSequence; ki++)
@@ -1887,6 +2022,9 @@ public class DirectPtxWmmaTests
             for (int d = 0; d < dimension; d++)
                 firstScore += query[queryBase + d] * key[firstKeyBase + d];
             firstScore *= scale;
+            if (attentionBias is not null)
+                firstScore += attentionBias[
+                    b * biasBatchStride + (h * querySequence + qi) * keyValueSequence + firstKey];
             stats[row] = firstScore - MathF.Log(probabilities[probabilityBase + firstKey]);
             Assert.InRange(sum, 0.9999f, 1.0001f);
             Assert.True(float.IsFinite(maximum));
@@ -1903,7 +2041,9 @@ public class DirectPtxWmmaTests
         int querySequence,
         int keyValueSequence,
         float scale,
-        bool isCausal = false)
+        bool isCausal = false,
+        float[]? attentionBias = null,
+        int biasBatchStride = 0)
     {
         const int dimension = 64;
         int queriesPerKeyValue = queryHeads / keyValueHeads;
@@ -1928,6 +2068,9 @@ public class DirectPtxWmmaTests
                 for (int d = 0; d < dimension; d++)
                     score += query[queryBase + d] * key[keyBase + d];
                 score *= scale;
+                if (attentionBias is not null)
+                    score += attentionBias[
+                        b * biasBatchStride + (qh * querySequence + qi) * keyValueSequence + ki];
                 probabilities[probabilityBase + ki] = score;
                 maximum = MathF.Max(maximum, score);
             }
@@ -2000,6 +2143,11 @@ public class DirectPtxWmmaTests
         }
         return (gradQuery, gradKey, gradValue);
     }
+
+    private static float[] Values(Random random, int count) =>
+        Enumerable.Range(0, count)
+            .Select(_ => (random.NextSingle() - 0.5f) * 0.5f)
+            .ToArray();
 
     private static void AssertAttentionGradientClose(float[] actual, float[] expected, string name)
     {

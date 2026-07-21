@@ -50,7 +50,7 @@ internal static class DirectPtxAttentionCoverageManifest
             "recomputation backward; LSE; causal; additive bias; deterministic mode",
             "dense BHSD", "FP32",
             DirectPtxAttentionCoverageStatus.ExperimentalDirectPtx,
-            "v1 deterministic recomputation D64 MHA for Sq/Skv=16/32/64/128, no-bias unmasked/causal; additive bias, other dimensions/dtypes, and GQA planned"),
+            "v1 deterministic recomputation D64 MHA for Sq/Skv=16/32/64/128, optional broadcast/per-batch additive bias, unmasked/causal; other dimensions/dtypes and GQA planned"),
         new("GroupedQueryAttention", "grouped_query_attention (NVRTC)",
             "forward; optional materialized weights; causal; GQA/MQA", "dense BHSD", "FP32",
             DirectPtxAttentionCoverageStatus.ExperimentalDirectPtx,

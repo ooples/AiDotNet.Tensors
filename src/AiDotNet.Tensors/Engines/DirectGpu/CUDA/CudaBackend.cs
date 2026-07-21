@@ -8263,7 +8263,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (TryDirectPtxFlashAttentionBackwardD64(
             gradOutput, query, key, value, output, softmaxStats,
             gradQuery, gradKey, gradValue,
-            batch, numHeads, seqQ, seqK, headDim, scale, isCausal, attentionBias))
+            batch, numHeads, seqQ, seqK, headDim, scale, isCausal,
+            attentionBias, biasBatchStride))
             return;
 #endif
         int causalFlag = isCausal ? 1 : 0;

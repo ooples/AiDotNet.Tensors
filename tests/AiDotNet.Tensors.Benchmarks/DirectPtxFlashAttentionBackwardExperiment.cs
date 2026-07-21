@@ -17,7 +17,8 @@ internal static class DirectPtxFlashAttentionBackwardExperiment
     private const int LaunchesPerDeviceSample = 10;
 
     private readonly record struct Shape(
-        string Name, int Heads, int QuerySequence, int KeyValueSequence, bool IsCausal);
+        string Name, int Heads, int QuerySequence, int KeyValueSequence,
+        bool IsCausal, bool HasBias);
     private readonly record struct Distribution(double Mean, double Median, double P95, double P99);
     private readonly record struct CellEvidence(
         int Run, Shape Shape,
@@ -28,10 +29,11 @@ internal static class DirectPtxFlashAttentionBackwardExperiment
 
     private static readonly Shape[] Shapes =
     [
-        new("flash-bwd-mha", 8, 16, 16, false),
-        new("flash-bwd-rect", 8, 16, 32, false),
-        new("flash-bwd-causal", 8, 32, 32, true),
-        new("flash-bwd-long", 8, 64, 64, true)
+        new("flash-bwd-mha", 8, 16, 16, false, false),
+        new("flash-bwd-rect", 8, 16, 32, false, false),
+        new("flash-bwd-bias", 8, 16, 32, false, true),
+        new("flash-bwd-causal", 8, 32, 32, true, false),
+        new("flash-bwd-long", 8, 64, 64, true, false)
     ];
 
     internal static void Run(int independentRuns = 3)
@@ -81,8 +83,11 @@ internal static class DirectPtxFlashAttentionBackwardExperiment
         float[] queryHost = Values(random, queryElements);
         float[] keyHost = Values(random, keyValueElements);
         float[] valueHost = Values(random, keyValueElements);
+        float[]? biasHost = shape.HasBias
+            ? Values(random, shape.Heads * shape.QuerySequence * shape.KeyValueSequence)
+            : null;
         (float[] probabilities, float[] outputHost, float[] statsHost) =
-            ForwardReference(queryHost, keyHost, valueHost, shape);
+            ForwardReference(queryHost, keyHost, valueHost, shape, biasHost);
         (float[] expectedQ, float[] expectedK, float[] expectedV) = Oracle(
             gradOutputHost, queryHost, keyHost, valueHost, probabilities, shape);
 
@@ -98,6 +103,7 @@ internal static class DirectPtxFlashAttentionBackwardExperiment
         using var currentGradQuery = backend.AllocateBuffer(queryElements);
         using var currentGradKey = backend.AllocateBuffer(keyValueElements);
         using var currentGradValue = backend.AllocateBuffer(keyValueElements);
+        using IGpuBuffer? bias = biasHost is null ? null : backend.AllocateBuffer(biasHost);
 
         void DirectLaunch()
         {
@@ -105,7 +111,7 @@ internal static class DirectPtxFlashAttentionBackwardExperiment
                 gradOutput, query, key, value, output, stats,
                 directGradQuery, directGradKey, directGradValue,
                 batch, shape.Heads, shape.QuerySequence, shape.KeyValueSequence,
-                Dimension, Scale, shape.IsCausal, attentionBias: null))
+                Dimension, Scale, shape.IsCausal, bias, biasBatchStride: 0))
                 throw new InvalidOperationException(backend.DirectPtxLastError);
         }
 
@@ -113,7 +119,7 @@ internal static class DirectPtxFlashAttentionBackwardExperiment
             gradOutput, query, key, value, output, stats,
             currentGradQuery, currentGradKey, currentGradValue,
             batch, shape.Heads, shape.QuerySequence, shape.KeyValueSequence,
-            Dimension, Scale, shape.IsCausal);
+            Dimension, Scale, shape.IsCausal, bias, biasBatchStride: 0);
 
         DirectLaunch(); CurrentLaunch(); backend.Synchronize();
         float directError = MaximumGradientError(
@@ -129,7 +135,8 @@ internal static class DirectPtxFlashAttentionBackwardExperiment
             batch, shape.Heads, shape.QuerySequence, shape.KeyValueSequence,
             Scale, shape.IsCausal,
             out DirectPtxKernelAudit gradQueryAudit,
-            out DirectPtxKernelAudit gradKeyValueAudit))
+            out DirectPtxKernelAudit gradKeyValueAudit,
+            shape.HasBias ? 0 : -1))
             throw new InvalidOperationException("No audit for measured FlashAttention-backward module.");
         Print(run, shape, "Direct PTX deterministic", directDevice, directEndToEnd,
             Gflops(shape, directDevice.Median), directBytes, directError,
@@ -201,7 +208,7 @@ internal static class DirectPtxFlashAttentionBackwardExperiment
     }
 
     private static (float[] Probabilities, float[] Output, float[] Stats) ForwardReference(
-        float[] query, float[] key, float[] value, Shape shape)
+        float[] query, float[] key, float[] value, Shape shape, float[]? attentionBias)
     {
         var probabilities = new float[shape.Heads * shape.QuerySequence * shape.KeyValueSequence];
         var output = new float[query.Length];
@@ -220,6 +227,8 @@ internal static class DirectPtxFlashAttentionBackwardExperiment
                 for (int d = 0; d < Dimension; d++)
                     score += query[queryBase + d] * key[keyBase + d];
                 score *= Scale;
+                if (attentionBias is not null)
+                    score += attentionBias[probabilityBase + ki];
                 probabilities[probabilityBase + ki] = score;
                 maximum = MathF.Max(maximum, score);
             }
