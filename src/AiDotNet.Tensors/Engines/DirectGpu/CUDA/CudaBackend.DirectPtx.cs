@@ -20,6 +20,8 @@ public sealed partial class CudaBackend
         _directPtxPagedPrefillKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<DirectPtxAttentionBackwardKey, PtxFusedAttentionBackwardD64Kernel>
         _directPtxAttentionBackwardKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<DirectPtxFlashAttentionBackwardKey, PtxFlashAttentionBackwardD64Kernel>
+        _directPtxFlashAttentionBackwardKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private DirectPtxRuntime? _directPtxRuntime;
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
@@ -31,6 +33,7 @@ public sealed partial class CudaBackend
     private long _directPtxDecodeDispatchCount;
     private long _directPtxPagedPrefillDispatchCount;
     private long _directPtxAttentionBackwardDispatchCount;
+    private long _directPtxFlashAttentionBackwardDispatchCount;
     internal int DirectPtxCachedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxAttentionKernels.Count; }
@@ -61,6 +64,10 @@ public sealed partial class CudaBackend
         DirectPtxFeatureGate.IsAttentionBackwardEnabled && IsAvailable &&
         DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) == DirectPtxArchitectureFamily.Ampere;
 
+    internal bool IsDirectPtxFlashAttentionBackwardEnabled =>
+        DirectPtxFeatureGate.IsFlashAttentionBackwardEnabled && IsAvailable &&
+        DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) == DirectPtxArchitectureFamily.Ampere;
+
     internal long DirectPtxResidualRmsNormDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxResidualRmsNormDispatchCount);
 
@@ -72,6 +79,9 @@ public sealed partial class CudaBackend
 
     internal long DirectPtxAttentionBackwardDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxAttentionBackwardDispatchCount);
+
+    internal long DirectPtxFlashAttentionBackwardDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxFlashAttentionBackwardDispatchCount);
 
     /// <summary>
     /// Attempts the canonical FP16-BHSD S in {16,32,64,128}, D=64 online attention
@@ -784,6 +794,203 @@ public sealed partial class CudaBackend
     }
 
     /// <summary>
+    /// Deterministic FP32 D64 FlashAttention backward. The specialization
+    /// recomputes probabilities from Q/K plus the forward LSE statistic and
+    /// writes dQ/dK/dV without SxS intermediates, atomics, or dynamic strides.
+    /// </summary>
+    internal bool TryDirectPtxFlashAttentionBackwardD64(
+        IGpuBuffer gradOutput,
+        IGpuBuffer query,
+        IGpuBuffer key,
+        IGpuBuffer value,
+        IGpuBuffer output,
+        IGpuBuffer softmaxStats,
+        IGpuBuffer gradQuery,
+        IGpuBuffer gradKey,
+        IGpuBuffer gradValue,
+        int batch,
+        int heads,
+        int querySequence,
+        int keyValueSequence,
+        int headDimension,
+        float scale,
+        bool isCausal,
+        IGpuBuffer? attentionBias)
+    {
+        if (!IsDirectPtxFlashAttentionBackwardEnabled) return false;
+        if (attentionBias is not null)
+        {
+            DirectPtxLastError = "flash-attention-backward-attention-bias-not-implemented";
+            return false;
+        }
+        if (headDimension != PtxFlashAttentionBackwardD64Kernel.HeadDimension)
+        {
+            DirectPtxLastError = "flash-attention-backward-head-dimension-not-implemented";
+            return false;
+        }
+        if (batch is <= 0 or > 16)
+        {
+            DirectPtxLastError = "flash-attention-backward-batch-not-implemented";
+            return false;
+        }
+        if (heads is <= 0 or > 128)
+        {
+            DirectPtxLastError = "flash-attention-backward-head-count-not-implemented";
+            return false;
+        }
+        if (querySequence is not (16 or 32 or 64 or 128) ||
+            keyValueSequence is not (16 or 32 or 64 or 128))
+        {
+            DirectPtxLastError = "flash-attention-backward-sequence-bucket-not-implemented";
+            return false;
+        }
+        if (!float.IsFinite(scale))
+        {
+            DirectPtxLastError = "flash-attention-backward-scale-not-finite";
+            return false;
+        }
+
+        long queryElements = checked((long)batch * heads * querySequence * headDimension);
+        long keyValueElements = checked((long)batch * heads * keyValueSequence * headDimension);
+        long statsElements = checked((long)batch * heads * querySequence);
+        if (gradOutput.SizeInBytes != queryElements * sizeof(float) ||
+            query.SizeInBytes != queryElements * sizeof(float) ||
+            output.SizeInBytes != queryElements * sizeof(float) ||
+            gradQuery.SizeInBytes != queryElements * sizeof(float) ||
+            key.SizeInBytes != keyValueElements * sizeof(float) ||
+            value.SizeInBytes != keyValueElements * sizeof(float) ||
+            gradKey.SizeInBytes != keyValueElements * sizeof(float) ||
+            gradValue.SizeInBytes != keyValueElements * sizeof(float) ||
+            softmaxStats.SizeInBytes != statsElements * sizeof(float))
+        {
+            DirectPtxLastError = "flash-attention-backward-physical-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var keyShape = new DirectPtxFlashAttentionBackwardKey(
+                batch, heads, querySequence, keyValueSequence, isCausal,
+                BitConverter.SingleToInt32Bits(scale));
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxFlashAttentionBackwardKernels.TryGetValue(keyShape, out _))
+                {
+                    DirectPtxLastError =
+                        "Direct PTX FlashAttention backward must be prewarmed before CUDA graph capture.";
+                    return false;
+                }
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxFlashAttentionBackwardD64Kernel kernel =
+                    GetOrCreateFlashAttentionBackwardKernel(keyShape, scale);
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(gradOutput, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(query, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(key, kernel.Blueprint.Tensors[2]),
+                        DirectPtxTensorView.Create(value, kernel.Blueprint.Tensors[3]),
+                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[4]),
+                        DirectPtxTensorView.Create(softmaxStats, kernel.Blueprint.Tensors[5]),
+                        DirectPtxTensorView.Create(gradQuery, kernel.Blueprint.Tensors[6]),
+                        DirectPtxTensorView.Create(gradKey, kernel.Blueprint.Tensors[7]),
+                        DirectPtxTensorView.Create(gradValue, kernel.Blueprint.Tensors[8]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxFlashAttentionBackwardDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    private PtxFlashAttentionBackwardD64Kernel GetOrCreateFlashAttentionBackwardKernel(
+        DirectPtxFlashAttentionBackwardKey key,
+        float scale)
+    {
+        if (_directPtxFlashAttentionBackwardKernels.TryGetValue(
+            key, out PtxFlashAttentionBackwardD64Kernel? existing))
+            return existing;
+        return CreateAndCacheFlashAttentionBackwardKernelSlow(key, scale);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxFlashAttentionBackwardD64Kernel CreateAndCacheFlashAttentionBackwardKernelSlow(
+        DirectPtxFlashAttentionBackwardKey key,
+        float scale) =>
+        _directPtxFlashAttentionBackwardKernels.GetOrAdd(key, () =>
+            new PtxFlashAttentionBackwardD64Kernel(
+                _directPtxRuntime!, key.Batch, key.Heads, key.QuerySequence,
+                key.KeyValueSequence, scale, key.IsCausal));
+
+    internal bool PrewarmDirectPtxFlashAttentionBackwardD64(
+        int batch,
+        int heads,
+        int querySequence,
+        int keyValueSequence,
+        float scale,
+        bool isCausal)
+    {
+        if (!IsDirectPtxFlashAttentionBackwardEnabled) return false;
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX FlashAttention-backward prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                var key = new DirectPtxFlashAttentionBackwardKey(
+                    batch, heads, querySequence, keyValueSequence, isCausal,
+                    BitConverter.SingleToInt32Bits(scale));
+                _ = GetOrCreateFlashAttentionBackwardKernel(key, scale);
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxFlashAttentionBackwardAudits(
+        int batch,
+        int heads,
+        int querySequence,
+        int keyValueSequence,
+        float scale,
+        bool isCausal,
+        out DirectPtxKernelAudit gradQueryAudit,
+        out DirectPtxKernelAudit gradKeyValueAudit)
+    {
+        lock (_directPtxLock)
+        {
+            var key = new DirectPtxFlashAttentionBackwardKey(
+                batch, heads, querySequence, keyValueSequence, isCausal,
+                BitConverter.SingleToInt32Bits(scale));
+            if (_directPtxFlashAttentionBackwardKernels.TryGetValue(key, out var kernel))
+            {
+                gradQueryAudit = kernel.GradQueryAudit;
+                gradKeyValueAudit = kernel.GradKeyValueAudit;
+                return true;
+            }
+        }
+        gradQueryAudit = null!;
+        gradKeyValueAudit = null!;
+        return false;
+    }
+
+    /// <summary>
     /// Fused deterministic FP32 D64 backward for APIs that provide the exact
     /// softmax probabilities. The specialization writes dQ/dK/dV directly and
     /// uses no global scratch, transposes, atomics, or runtime stride arguments.
@@ -1260,6 +1467,7 @@ public sealed partial class CudaBackend
             _directPtxDecodeKernels.Dispose();
             _directPtxPagedPrefillKernels.Dispose();
             _directPtxAttentionBackwardKernels.Dispose();
+            _directPtxFlashAttentionBackwardKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }
@@ -1313,6 +1521,13 @@ public sealed partial class CudaBackend
         int KeyValueHeads,
         int QuerySequence,
         int KeyValueSequence,
+        int ScaleBits);
+    private readonly record struct DirectPtxFlashAttentionBackwardKey(
+        int Batch,
+        int Heads,
+        int QuerySequence,
+        int KeyValueSequence,
+        bool IsCausal,
         int ScaleBits);
 
 }

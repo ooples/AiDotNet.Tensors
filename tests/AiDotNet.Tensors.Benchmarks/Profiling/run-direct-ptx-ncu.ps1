@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward')]
+    [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward')]
     [string]$Target = 'attention',
     [string]$OutputCsv = 'direct-ptx-ncu.csv',
     [string]$NcuPath = $env:NSIGHT_COMPUTE_CLI
@@ -25,6 +25,7 @@ $switch = switch ($Target) {
     'decode' { '--direct-ptx-profile-decode' }
     'paged-prefill' { '--direct-ptx-profile-paged-prefill' }
     'attention-backward' { '--direct-ptx-profile-attention-backward' }
+    'flash-attention-backward' { '--direct-ptx-profile-flash-attention-backward' }
 }
 $kernel = switch ($Target) {
     'attention' { 'regex:aidotnet_online_attention_128x64' }
@@ -32,6 +33,7 @@ $kernel = switch ($Target) {
     'decode' { 'regex:aidotnet_(flash|paged)_decode_d64' }
     'paged-prefill' { 'regex:aidotnet_paged_prefill_d64' }
     'attention-backward' { 'regex:aidotnet_attention_backward_(delta|dq|dkv)_d64' }
+    'flash-attention-backward' { 'regex:aidotnet_flash_attention_backward_(dq|dkv)_d64' }
 }
 $metrics = @(
     'sass__inst_executed_register_spilling',
