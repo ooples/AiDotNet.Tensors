@@ -20581,18 +20581,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // which stays null for these. Probe the cache directly, or this always falls back and the
         // comparison -> where chain never stays on the device.
         var condArr = condition.DataVector.GetBackingArrayUnsafe();
-        // MEASURED 2026-07-20: enabling this path (gate = IsDeviceResidentArray, which correctly finds the
-        // mask in the ACTIVATION cache) moves the residency worklist from 18 ops below the kernel floor to
-        // 10 — but BREAKS 10 comparison ops in tape-gradient parity, 0 failures -> 10. So the mask buffer is
-        // genuinely resident and reachable, yet where_select applied to it does not reproduce the CPU
-        // result. Something about the mask's device encoding still differs from the plain float 0/1 the
-        // kernel assumes (ClassifyFloat / PackMaskResident write it, and PackMaskResident can also
-        // LogicalNot in place).
+        // The mask IS resident and its DEVICE BUFFER IS CORRECT — measured by downloading it:
+        // deviceFloats = 0,0,0,0,1,0,0,0 for TensorIsNan, exactly the float 0/1 where_select reads.
         //
-        // Held CPU-only deliberately: a residency count is not worth 10 wrong-gradient ops. Diagnose by
-        // downloading the mask buffer and comparing it against the CPU mask before re-enabling — do not
-        // simply flip the gate back on.
-        if (true || typeof(T) != typeof(float) || !TryGetBackend(out var backend)
+        // Enabling this previously broke 10 comparison ops, but NOT in the forward: forward parity stayed
+        // at 12 while tape-gradient went 0 -> 10. The cause was the SAVED STATE, not the kernel. CpuEngine
+        // records the condition as a byte[] of 0/1; this override recorded the Tensor<Bit> object itself,
+        // and WhereBackward matches `Tensor<T>` or `byte[]` and otherwise falls through — a Tensor<Bit> is
+        // neither when T is float, so the backward silently took the wrong branch. Recording the same
+        // byte[] encoding CpuEngine uses makes the two paths agree.
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)
             || condArr is null || !IsDeviceResidentArray(condArr))
             return base.TensorWhere(condition, x, y);
 
@@ -20604,8 +20602,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var outBuf = AllocateOutputBuffer(backend, x.Length);
             backend.Where(condBuf.Buffer, xBuf.Buffer, yBuf.Buffer, outBuf.Buffer, x.Length);
             var output = DeferTensorResult<T>(backend, outBuf.Buffer, x.Length, x.Shape.ToArray());
+            // Same byte[] 0/1 encoding CpuEngine records. WhereBackward accepts Tensor<T> or byte[];
+            // handing it a Tensor<Bit> matches neither and falls through to the wrong branch.
+            var condBytes = new byte[condition.Length];
+            for (int i = 0; i < condBytes.Length; i++) condBytes[i] = (bool)condition[i] ? (byte)1 : (byte)0;
             Autodiff.DifferentiableOps.RecordBinary("TensorWhere", output, x, y,
-                Autodiff.BackwardFunctions<T>.WhereBackward, new object[] { condition });
+                Autodiff.BackwardFunctions<T>.WhereBackward, new object[] { condBytes });
             return output;
         }
         catch (Exception)
