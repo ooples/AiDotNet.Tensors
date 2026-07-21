@@ -13,6 +13,55 @@ class Program
 
     static void Main(string[] args)
     {
+        if (args.Length > 0 && args[0] == "--direct-ptx-attention")
+        {
+            DirectPtxAttentionExperiment.Run();
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--direct-ptx-fused-attention")
+        {
+            DirectPtxFusedAttentionExperiment.Run();
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--direct-ptx-online-attention")
+        {
+            DirectPtxOnlineAttentionExperiment.Run();
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--direct-ptx-gpu-matrix")
+        {
+            DirectPtxGpuMatrixExperiment.Run();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-residual-rmsnorm")
+        {
+            DirectPtxResidualRmsNormExperiment.Run();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-external-gpu-baselines")
+        {
+            DirectPtxExternalBaselines.Run();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-attention")
+        {
+            DirectPtxProfileTarget.RunAttention();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-residual-rmsnorm")
+        {
+            DirectPtxProfileTarget.RunResidualRmsNorm();
+            return;
+        }
+        if (args.Length > 1 && args[0] == "--direct-ptx-verify-ncu")
+        {
+            DirectPtxProfileTarget.VerifyNcuCsv(args[1]);
+            return;
+        }
+
         // Run quick performance test first for immediate feedback
         if (args.Length == 0 || args[0] == "--quick")
         {
@@ -944,6 +993,15 @@ class Program
         Console.WriteLine("  --verify-vdpbf16: Verify emitted VDPBF16PS (run under Intel SDE); exits non-zero on mismatch (#378)");
         Console.WriteLine("  --verify-bf16gemm: Verify the BF16 GEMM microkernel end to end (run under Intel SDE); exits non-zero on mismatch (#378)");
 #if !NET462
+        Console.WriteLine("  --direct-ptx-attention: Driver-only emitted-PTX Q*K^T vs cuBLAS/current CUDA path");
+        Console.WriteLine("  --direct-ptx-fused-attention: Fused PTX QK+softmax+PV championship cell");
+        Console.WriteLine("  --direct-ptx-online-attention: Async online S128/D64 GPU championship table");
+        Console.WriteLine("  --direct-ptx-gpu-matrix: NVIDIA-only S16/S32/S64/S128 attention matrix");
+        Console.WriteLine("  --direct-ptx-residual-rmsnorm: second-blueprint fused residual + RMSNorm D64");
+        Console.WriteLine("  --direct-ptx-external-gpu-baselines: forced cuDNN/Flash/Math/compiled Python GPU matrix");
+        Console.WriteLine("  --direct-ptx-profile-attention: deterministic Nsight Compute attention target");
+        Console.WriteLine("  --direct-ptx-profile-residual-rmsnorm: deterministic Nsight Compute fusion target");
+        Console.WriteLine("  --direct-ptx-verify-ncu <csv>: enforce zero executed spill/local-memory counters");
         Console.WriteLine("  --cublas   : Run cuBLAS vs DirectGpu GEMM benchmark");
         Console.WriteLine("  --opencl   : Run OpenCL GEMM benchmark (AMD/Intel GPUs)");
         Console.WriteLine("  --clblast  : Run CLBlast vs AiDotNet OpenCL comparison (AMD/Intel)");

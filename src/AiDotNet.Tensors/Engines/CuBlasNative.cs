@@ -55,6 +55,7 @@ public enum CudaResult
     NotMapped = 211,
     NotMappedAsArray = 212,
     NotMappedAsPointer = 213,
+    InvalidPtx = 218,
     LaunchFailed = 719,
     NotReady = 600,
     Unknown = 999
@@ -589,6 +590,26 @@ public static class CuBlasNative
         IntPtr B, int Btype, int ldb,
         IntPtr beta,
         IntPtr C, int Ctype, int ldc,
+        int computeType,
+        int algo);
+
+    /// <summary>
+    /// Mixed-precision strided-batched GEMM. This is the closest cuBLAS
+    /// comparison for a packed batch of attention heads because it performs
+    /// the entire Q*K^T fanout with one host launch.
+    /// </summary>
+    [DllImport(CublasLibrary, EntryPoint = "cublasGemmStridedBatchedEx")]
+    public static extern CublasStatus cublasGemmStridedBatchedEx(
+        IntPtr handle,
+        CublasOperation transa,
+        CublasOperation transb,
+        int m, int n, int k,
+        IntPtr alpha,
+        IntPtr A, int Atype, int lda, long strideA,
+        IntPtr B, int Btype, int ldb, long strideB,
+        IntPtr beta,
+        IntPtr C, int Ctype, int ldc, long strideC,
+        int batchCount,
         int computeType,
         int algo);
 

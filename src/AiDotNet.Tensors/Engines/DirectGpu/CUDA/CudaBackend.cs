@@ -15572,6 +15572,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // finalizer-fatal 0xC0000005 path this method's teardown guards exist to prevent.
         DrainDeferredFrees(blockOldest: true);
 
+        // Direct-PTX modules borrow this backend's context and stream. Unload
+        // them while both handles are still alive, before pool/stream teardown.
+#if NET5_0_OR_GREATER
+        DisposeDirectPtxRuntime();
+#endif
+
         _pinnedPool.Dispose();
         _bufferPool.Dispose();
 
