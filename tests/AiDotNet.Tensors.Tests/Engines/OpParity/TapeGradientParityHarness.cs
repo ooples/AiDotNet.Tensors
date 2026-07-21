@@ -298,11 +298,20 @@ public static class TapeGradientParityHarness
             + "the backward KERNEL were correct.");
     }
 
-    /// <summary>Mirrors the engine-reset cadence the forward/backward phases use.</summary>
+    /// <summary>Shares the forward phase's engine-reset cadence.</summary>
+    /// <remarks>
+    /// This was a deliberate no-op, on the reasoning that OpParityHarness owned the counter and calling it
+    /// here would reset twice as often. That reasoning was wrong, and it cost real time: TensorSELU PASSES
+    /// this phase in isolation and FAILS it deep in a 557-test run, which is precisely the failure mode
+    /// OpParityHarness already documents — a driver that "accumulates internal state across a large number
+    /// of kernel dispatches and, past a threshold, returns subtly wrong results for some later kernels
+    /// (correct in isolation, wrong only deep into a long full-suite run)". The other phases defend against
+    /// it by recreating the GPU engine every 64 ops; this phase adds ~557 more dispatches and did not.
+    ///
+    /// Sharing the SAME static counter is the point: the threshold is about dispatches per context, so all
+    /// phases must count into one budget. That is the opposite of double-resetting.
+    /// </remarks>
     private static void MaybeResetGpuEngineViaHarness(OpParityFixture fx)
-    {
-        // Deliberately a no-op hook: OpParityHarness owns the reset counter, and duplicating it here would
-        // reset twice as often and change the very GPU-pool state the reset exists to bound. Wired through
-        // the existing phases' call instead when this phase is registered into the generated test set.
-    }
+        => OpParityHarness.MaybeResetGpuEngine(fx);
+
 }

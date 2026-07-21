@@ -127,7 +127,7 @@ public static class OpParityHarness
     private static int _opsSinceEngineReset;
     private const int ResetEngineEveryNOps = 64;
 
-    private static void MaybeResetGpuEngine(OpParityFixture fx)
+    internal static void MaybeResetGpuEngine(OpParityFixture fx)
     {
         if (System.Threading.Interlocked.Increment(ref _opsSinceEngineReset) >= ResetEngineEveryNOps)
         {
