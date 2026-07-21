@@ -100,6 +100,34 @@ internal static class DirectPtxProfileTarget
         Console.WriteLine(paged.Audit.ToJson());
     }
 
+    internal static void RunPagedPrefill()
+    {
+        using var runtime = new DirectPtxRuntime();
+        const int heads = 8, kvHeads = 2, queries = 16, start = 112;
+        const int blockSize = 16, poolBlocks = 10;
+        using var kernel = new PtxFusedPagedPrefillAttentionD64Kernel(
+            runtime, heads, kvHeads, queries, start,
+            blockSize, poolBlocks, 0.125f);
+        using var q = runtime.AllocateBytes(kernel.QueryBytes);
+        using var k = runtime.AllocateBytes(kernel.KeyValueBytes);
+        using var v = runtime.AllocateBytes(kernel.KeyValueBytes);
+        using var table = runtime.AllocateBytes(kernel.BlockTableBytes);
+        using var output = runtime.AllocateBytes(kernel.OutputBytes);
+        q.Upload<float>(new float[queries * heads * 64]);
+        k.Upload<float>(new float[poolBlocks * blockSize * kvHeads * 64]);
+        v.Upload<float>(new float[poolBlocks * blockSize * kvHeads * 64]);
+        table.Upload<int>(Enumerable.Range(2, 8).Reverse().ToArray());
+        Action launch = () => kernel.Launch(
+            DirectPtxTensorView.CreateOwned(q, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(k, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(v, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(table, kernel.Blueprint.Tensors[3]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[4]));
+        for (int i = 0; i < 10; i++) launch();
+        runtime.Synchronize();
+        Console.WriteLine(kernel.Audit.ToJson());
+    }
+
     internal static void VerifyNcuCsv(string path)
     {
         DirectPtxProfilerEvidence evidence = DirectPtxProfilerEvidence.FromNcuCsv(path);

@@ -2728,12 +2728,20 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe IGpuBuffer PagedAttentionPrefill(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
         int heads, int headDim, int blockSize, int numQueries, int startPos, float scale)
     {
-        if (!_kernelCache.TryGetValue("paged_attention_prefill", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: paged_attention_prefill");
         GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefill));
         if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
         GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, heads, headDim, blockSize, checked(startPos + numQueries), numQueries, nameof(PagedAttentionPrefill));
         var output = AllocateBuffer(numQueries * heads * headDim);
+        if (headDim == PtxFusedPagedPrefillAttentionD64Kernel.HeadDimension &&
+            TryDirectPtxPagedPrefillD64(
+                q, kcache, vcache, blockTable, output,
+                heads, heads, numQueries, startPos, blockSize, scale))
+            return output;
+        if (!_kernelCache.TryGetValue("paged_attention_prefill", out var kernel))
+        {
+            output.Dispose();
+            throw new InvalidOperationException("CUDA kernel not found: paged_attention_prefill");
+        }
         using var _ = PushContext();
         int totalItems = numQueries * heads;
         uint grid = (uint)(((long)totalItems + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -2780,13 +2788,21 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe IGpuBuffer PagedAttentionPrefillGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
         int heads, int kvHeads, int headDim, int blockSize, int numQueries, int startPos, float scale)
     {
-        if (!_kernelCache.TryGetValue("paged_attention_prefill_gqa", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: paged_attention_prefill_gqa");
         GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefillGqa));
         GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionPrefillGqa));
         if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
         GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, kvHeads, headDim, blockSize, checked(startPos + numQueries), numQueries, nameof(PagedAttentionPrefillGqa));
         var output = AllocateBuffer(numQueries * heads * headDim);
+        if (headDim == PtxFusedPagedPrefillAttentionD64Kernel.HeadDimension &&
+            TryDirectPtxPagedPrefillD64(
+                q, kcache, vcache, blockTable, output,
+                heads, kvHeads, numQueries, startPos, blockSize, scale))
+            return output;
+        if (!_kernelCache.TryGetValue("paged_attention_prefill_gqa", out var kernel))
+        {
+            output.Dispose();
+            throw new InvalidOperationException("CUDA kernel not found: paged_attention_prefill_gqa");
+        }
         using var _ = PushContext();
         int totalItems = numQueries * heads;
         uint grid = (uint)(((long)totalItems + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -2928,6 +2944,50 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             args[0] = &qPtr; args[1] = &kPtr; args[2] = &vPtr; args[3] = &btPtr; args[4] = &oPtr;
             args[5] = &hh;
             args[6] = &hd; args[7] = &bs; args[8] = &sl; args[9] = &sc;
+            LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        }
+    }
+
+    /// <summary>Resident benchmark hook for the established paged-prefill NVRTC path.</summary>
+    internal unsafe void PagedAttentionPrefillCurrentInto(
+        IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        IGpuBuffer output, int heads, int kvHeads, int headDim,
+        int blockSize, int numQueries, int startPos, float scale)
+    {
+        bool gqa = heads != kvHeads;
+        string kernelName = gqa ? "paged_attention_prefill_gqa" : "paged_attention_prefill";
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+        GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefillCurrentInto));
+        GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionPrefillCurrentInto));
+        if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
+        GpuKernelGuards.PagedAttentionBuffers(
+            q, kcache, vcache, blockTable, heads, kvHeads, headDim,
+            blockSize, checked(startPos + numQueries), numQueries,
+            nameof(PagedAttentionPrefillCurrentInto));
+        GpuKernelGuards.Capacity(
+            output, (long)numQueries * heads * headDim,
+            nameof(output), nameof(PagedAttentionPrefillCurrentInto));
+        using var _ = PushContext();
+        uint grid = (uint)(((long)numQueries * heads + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr qPtr = q.Handle, kPtr = kcache.Handle, vPtr = vcache.Handle;
+        IntPtr btPtr = blockTable.Handle, oPtr = output.Handle;
+        int hh = heads, kv = kvHeads, hd = headDim, bs = blockSize, nq = numQueries, sp = startPos;
+        float sc = scale;
+        if (gqa)
+        {
+            void** args = stackalloc void*[12];
+            args[0] = &qPtr; args[1] = &kPtr; args[2] = &vPtr; args[3] = &btPtr; args[4] = &oPtr;
+            args[5] = &hh; args[6] = &kv; args[7] = &hd; args[8] = &bs;
+            args[9] = &nq; args[10] = &sp; args[11] = &sc;
+            LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        }
+        else
+        {
+            void** args = stackalloc void*[11];
+            args[0] = &qPtr; args[1] = &kPtr; args[2] = &vPtr; args[3] = &btPtr; args[4] = &oPtr;
+            args[5] = &hh; args[6] = &hd; args[7] = &bs;
+            args[8] = &nq; args[9] = &sp; args[10] = &sc;
             LaunchKernel(kernel, grid, DefaultBlockSize, args);
         }
     }

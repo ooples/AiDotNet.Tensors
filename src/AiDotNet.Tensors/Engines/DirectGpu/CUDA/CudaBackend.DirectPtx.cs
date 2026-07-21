@@ -16,6 +16,8 @@ public sealed partial class CudaBackend
         _directPtxResidualRmsNormKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<DirectPtxDecodeKey, PtxFusedDecodeAttentionD64Kernel>
         _directPtxDecodeKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<DirectPtxPagedPrefillKey, PtxFusedPagedPrefillAttentionD64Kernel>
+        _directPtxPagedPrefillKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private DirectPtxRuntime? _directPtxRuntime;
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
@@ -25,6 +27,7 @@ public sealed partial class CudaBackend
     private long _directPtxAttentionDispatchCount;
     private long _directPtxResidualRmsNormDispatchCount;
     private long _directPtxDecodeDispatchCount;
+    private long _directPtxPagedPrefillDispatchCount;
     internal int DirectPtxCachedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxAttentionKernels.Count; }
@@ -47,11 +50,18 @@ public sealed partial class CudaBackend
         DirectPtxFeatureGate.IsPagedDecodeEnabled && IsAvailable &&
         DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) == DirectPtxArchitectureFamily.Ampere;
 
+    internal bool IsDirectPtxPagedPrefillEnabled =>
+        DirectPtxFeatureGate.IsPagedPrefillEnabled && IsAvailable &&
+        DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) == DirectPtxArchitectureFamily.Ampere;
+
     internal long DirectPtxResidualRmsNormDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxResidualRmsNormDispatchCount);
 
     internal long DirectPtxDecodeDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxDecodeDispatchCount);
+
+    internal long DirectPtxPagedPrefillDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxPagedPrefillDispatchCount);
 
     /// <summary>
     /// Attempts the canonical FP16-BHSD S in {16,32,64,128}, D=64 online attention
@@ -589,6 +599,180 @@ public sealed partial class CudaBackend
         return false;
     }
 
+    internal bool TryDirectPtxPagedPrefillD64(
+        IGpuBuffer query,
+        IGpuBuffer keyPages,
+        IGpuBuffer valuePages,
+        IGpuBuffer blockTable,
+        IGpuBuffer output,
+        int queryHeads,
+        int keyValueHeads,
+        int queryCount,
+        int startPosition,
+        int blockSize,
+        float scale)
+    {
+        if (!IsDirectPtxPagedPrefillEnabled) return false;
+        if (queryHeads <= 0 || keyValueHeads <= 0 || queryHeads % keyValueHeads != 0)
+        {
+            DirectPtxLastError = "paged-prefill-head-map-not-implemented";
+            return false;
+        }
+        if (queryCount is not (2 or 4 or 8 or 16 or 32))
+        {
+            DirectPtxLastError = "paged-prefill-query-bucket-not-implemented";
+            return false;
+        }
+        if (startPosition < 0 || checked(startPosition + queryCount) > 128)
+        {
+            DirectPtxLastError = "paged-prefill-key-domain-not-implemented";
+            return false;
+        }
+        if (blockSize is not (16 or 32))
+        {
+            DirectPtxLastError = "paged-prefill-block-size-not-implemented";
+            return false;
+        }
+        if (!float.IsFinite(scale))
+        {
+            DirectPtxLastError = "paged-prefill-scale-not-finite";
+            return false;
+        }
+
+        int maximumKeyLength = checked(startPosition + queryCount);
+        long elementsPerBlock = checked(
+            (long)blockSize * keyValueHeads * PtxFusedPagedPrefillAttentionD64Kernel.HeadDimension);
+        if (keyPages.SizeInBytes != valuePages.SizeInBytes || keyPages.SizeInBytes <= 0 ||
+            keyPages.SizeInBytes % (elementsPerBlock * sizeof(float)) != 0)
+        {
+            DirectPtxLastError = "paged-prefill-kv-physical-extent-mismatch";
+            return false;
+        }
+        int poolBlocks = checked((int)(keyPages.SizeInBytes / (elementsPerBlock * sizeof(float))));
+        int logicalBlocks = (maximumKeyLength + blockSize - 1) / blockSize;
+        if (poolBlocks < logicalBlocks || blockTable.SizeInBytes != checked(logicalBlocks * sizeof(int)))
+        {
+            DirectPtxLastError = "paged-prefill-table-or-pool-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var key = new DirectPtxPagedPrefillKey(
+                queryHeads, keyValueHeads, queryCount, startPosition,
+                blockSize, poolBlocks, BitConverter.SingleToInt32Bits(scale));
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxPagedPrefillKernels.TryGetValue(key, out _))
+                {
+                    DirectPtxLastError = "Direct PTX paged prefill must be prewarmed before CUDA graph capture.";
+                    return false;
+                }
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxFusedPagedPrefillAttentionD64Kernel kernel = GetOrCreatePagedPrefillKernel(key, scale);
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(query, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(keyPages, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(valuePages, kernel.Blueprint.Tensors[2]),
+                        DirectPtxTensorView.Create(blockTable, kernel.Blueprint.Tensors[3]),
+                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[4]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxPagedPrefillDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    private PtxFusedPagedPrefillAttentionD64Kernel GetOrCreatePagedPrefillKernel(
+        DirectPtxPagedPrefillKey key,
+        float scale)
+    {
+        if (_directPtxPagedPrefillKernels.TryGetValue(
+            key, out PtxFusedPagedPrefillAttentionD64Kernel? existing))
+            return existing;
+        return CreateAndCachePagedPrefillKernelSlow(key, scale);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxFusedPagedPrefillAttentionD64Kernel CreateAndCachePagedPrefillKernelSlow(
+        DirectPtxPagedPrefillKey key,
+        float scale) =>
+        _directPtxPagedPrefillKernels.GetOrAdd(key, () =>
+            new PtxFusedPagedPrefillAttentionD64Kernel(
+                _directPtxRuntime!, key.QueryHeads, key.KeyValueHeads,
+                key.QueryCount, key.StartPosition, key.BlockSize,
+                key.PoolBlocks, scale));
+
+    internal bool PrewarmDirectPtxPagedPrefillD64(
+        int queryHeads,
+        int keyValueHeads,
+        int queryCount,
+        int startPosition,
+        int blockSize,
+        int poolBlocks,
+        float scale)
+    {
+        if (!IsDirectPtxPagedPrefillEnabled) return false;
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX paged-prefill prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                var key = new DirectPtxPagedPrefillKey(
+                    queryHeads, keyValueHeads, queryCount, startPosition,
+                    blockSize, poolBlocks, BitConverter.SingleToInt32Bits(scale));
+                _ = GetOrCreatePagedPrefillKernel(key, scale);
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxPagedPrefillAudit(
+        int queryHeads,
+        int keyValueHeads,
+        int queryCount,
+        int startPosition,
+        int blockSize,
+        int poolBlocks,
+        float scale,
+        out DirectPtxKernelAudit audit)
+    {
+        lock (_directPtxLock)
+        {
+            var key = new DirectPtxPagedPrefillKey(
+                queryHeads, keyValueHeads, queryCount, startPosition,
+                blockSize, poolBlocks, BitConverter.SingleToInt32Bits(scale));
+            if (_directPtxPagedPrefillKernels.TryGetValue(key, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null!;
+        return false;
+    }
+
     /// <summary>
     /// Loads a persisted/default specialization outside capture. Stable caller-
     /// owned buffers may subsequently launch it while a CUDA graph is recording.
@@ -869,6 +1053,7 @@ public sealed partial class CudaBackend
             _directPtxAttentionPlans.Clear();
             _directPtxResidualRmsNormKernels.Dispose();
             _directPtxDecodeKernels.Dispose();
+            _directPtxPagedPrefillKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }
@@ -905,6 +1090,14 @@ public sealed partial class CudaBackend
         int QueryHeads,
         int KeyValueHeads,
         int SequenceLength,
+        int BlockSize,
+        int PoolBlocks,
+        int ScaleBits);
+    private readonly record struct DirectPtxPagedPrefillKey(
+        int QueryHeads,
+        int KeyValueHeads,
+        int QueryCount,
+        int StartPosition,
         int BlockSize,
         int PoolBlocks,
         int ScaleBits);

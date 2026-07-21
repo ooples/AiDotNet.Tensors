@@ -56,7 +56,7 @@ missing or duplicate assignment.
 | GroupedQueryAttentionBackward | atomic and deterministic NVRTC variants | GQA/MQA recomputation backward planned |
 | FlashDecode | `flash_decode_partial` + `flash_decode_reduce` | v1 register-online D64 FP32 MHA/GQA/MQA decode implemented for S=16/32/64/128; explicit split hints fall back |
 | PagedAttention decode, MHA/GQA | two `paged_attention_decode*` kernels | v1 block-table D64 FP32 decode implemented for block size 16/32 |
-| PagedAttention prefill, MHA/GQA | two `paged_attention_prefill*` kernels | paged prefill family planned |
+| PagedAttention prefill, MHA/GQA | two `paged_attention_prefill*` kernels | v1 causal block-table D64 FP32 MHA/GQA/MQA prefill implemented for Q=2/4/8/16/32, total KV<=128, block size 16/32 |
 
 The machine-readable manifest is authoritative; this compact table is its
 human-readable summary.
@@ -223,6 +223,43 @@ local allocation for all promoted decode cells. Executed Nsight spill counters
 remain externally blocked by `ERR_NVGPUCTRPERM`; this slice remains experimental
 until that host permission is available and the required CSV evidence is attached.
 
+## Paged-prefill championship slice
+
+The next #834 specialization covers causal FP32 D=64 paged prefill with
+canonical query/output `[Q,Hq,D]`, paged K/V
+`[poolBlock,blockPosition,Hkv,D]`, and an exact Int32 block table. Each range
+below comes from three independent clean runs with 30 warmups and 101
+synchronized end-to-end samples per run.
+
+```text
+Shape          Direct median us  Direct P95 us  Direct P99 us   GFLOPS     AiDotNet median us  Min speedup  B/call  tmp MiB  max error  regs/shared/local  blocks/SM
+------------------------------------------------------------------------------------------------------------------------------------------------------------------
+prefill-mha        22.7-25.1       42.5-46.5      50.0-92.6    4.73-5.23       85.2-89.2            3.55x        0    0.000   2.980e-8      25 / 0 / 0          12
+prefill-gqa        26.6-27.8       44.7-49.4      47.4-59.8   16.80-17.55     159.9-161.7           5.75x        0    0.000   2.980e-8      29 / 0 / 0          12
+prefill-mqa        33.2-35.0       38.8-48.3      42.5-64.5   52.90-55.76     380.6-381.5          10.87x        0    0.000   3.353e-8      29 / 0 / 0          12
+prefill-long       50.2-53.0       60.7-129.2     83.9-362.2  74.50-78.66     795.7-807.7          15.11x        0    0.000   2.980e-8      29 / 0 / 0          12
+```
+
+All four cells pass the paired-run policy in all three captures. The direct
+kernel keeps online max, normalization sum, and PV accumulators in registers,
+emits one final vector store, and allocates neither a score matrix nor split
+scratch. Driver-JIT admission reports zero shared and local bytes. Nsight
+attached to the deterministic target, but counter collection remains blocked
+by the host's `ERR_NVGPUCTRPERM` policy.
+
+The exact FP32 PyTorch comparison forced eligible SDPA backends and gathered
+the logical K/V sequence from pages before timing, deliberately excluding
+page translation in PyTorch's favor. Public PyTorch SDPA has no paged ABI.
+Flash and cuDNN rejected FP32; Efficient accepted MHA only, while GQA/MQA used
+the independently forced Math backend.
+
+| Shape | Forced PyTorch backend | Median us | P95 us | P99 us | Mean us | GFLOPS | Peak device bytes | Max error |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| prefill MHA | Efficient | 120.2-122.6 | 172.7-266.9 | 223.3-395.9 | 127.31-147.24 | 0.97-0.99 | 8,704 | 4.470e-8 |
+| prefill GQA | Math | 402.1-529.6 | 671.2-739.6 | 755.9-1438.5 | 455.58-546.90 | 0.88-1.16 | 222,208 | 2.980e-8 |
+| prefill MQA | Math | 405.2-466.6 | 601.1-708.8 | 684.1-993.2 | 448.25-498.09 | 3.97-4.57 | 462,848 | 2.980e-8 |
+| prefill long | Math | 404.2-454.7 | 600.4-677.3 | 623.8-911.6 | 440.45-493.54 | 8.68-9.77 | 892,928 | 2.980e-8 |
+
 ## Kernel dataflow
 
 ```text
@@ -273,6 +310,15 @@ this FP32 GEMV-like decode cell: warp shuffles and coalesced vector loads were
 the measurably winning dataflow. Paged address translation has its own formal
 ABI and resource domain rather than a runtime layout branch in the dense PTX.
 
+Paged prefill assigns one warp to each `(query,queryHead)` pair. Its causal
+key bound and query-to-KV-head mapping are compile-time constants; block-table
+translation is the only address indirection. Each lane streams its two D=64
+components from paged global K/V, performs warp reductions for QK and the
+online recurrence, retains PV in registers, and writes output once. Because
+this FP32 cell is GEMV-like at each query, measured coalesced vector loads beat
+adding shared-memory staging or Tensor Core packing; those mechanisms remain
+appropriate for the existing FP16 tile-matrix family.
+
 ## Runtime and feature gate
 
 The custom path uses `nvcuda.dll` Driver API calls directly:
@@ -293,7 +339,8 @@ Production integration is fail-closed:
 
 - Every family defaults off. Set `AIDOTNET_DIRECT_PTX_ATTENTION=1`,
   `AIDOTNET_DIRECT_PTX_FLASH_DECODE=1`, or
-  `AIDOTNET_DIRECT_PTX_PAGED_DECODE=1` to admit only that family.
+  `AIDOTNET_DIRECT_PTX_PAGED_DECODE=1`, or
+  `AIDOTNET_DIRECT_PTX_PAGED_PREFILL=1` to admit only that family.
 - SM < 8.0, unsupported shape/dtype/layout, bias, active autodiff tape, stream
   capture, JIT failure, or launch failure falls back to the existing path.
 - The runtime borrows the existing `CudaBackend` context and stream, so
@@ -434,6 +481,8 @@ The reusable code layers are:
   causal specialization, optional LSE, and fused epilogue.
 - `PtxFusedDecodeAttentionD64Kernel`: separate dense/paged physical ABIs,
   warp-owned online decode, block-table translation, and single final store.
+- `PtxFusedPagedPrefillAttentionD64Kernel`: query-head warp ownership,
+  causal paged traversal, online recurrence, and single final vector store.
 - `CudaBackend.DirectPtx`: production cache, existing stream/context, audit,
   fallback, and teardown.
 - `DirectPtxWmmaTests`: structural, scalar-oracle, layout, gate, borrowed-
@@ -447,11 +496,11 @@ copied into another one-off emitter.
 
 | Improvement | Implemented result | Remaining evidence boundary |
 |---|---|---|
-| Formal layout ABI | Logical and physical extents, layout identity, dtype, alignment, access, padding, byte offset, and allocation extent are validated once in `DirectPtxTensorContract`; dense sequence-head-dimension and paged KV decode now have distinct executable ABIs; the PTX has no stride path | Packed QKV and ragged-offset kernels remain |
+| Formal layout ABI | Logical and physical extents, layout identity, dtype, alignment, access, padding, byte offset, and allocation extent are validated once in `DirectPtxTensorContract`; dense sequence-head-dimension and paged KV decode/prefill now have distinct executable ABIs; the PTX has no stride path | Packed QKV and ragged-offset kernels remain |
 | Autotuned dispatch | Attention tries valid query-warp variants, persists the winner through the existing autotune cache, keys it by GPU UUID/SM/driver and semantics, and bounds loaded modules with an LRU | A clean production release run still requires three independent captures |
 | Stronger spill proof | Runtime admission enforces register/shared/local budgets and records PTX SHA-256, JIT attributes, occupancy, GPU fingerprint, and log; an Nsight CSV parser and deterministic profile target enforce executed spill/local counters | Nsight attached, but `ERR_NVGPUCTRPERM` blocks counter access until enabled by the host administrator |
 | Hardened performance gate | Policy requires >=1.10x median, bounded p95, zero hot managed/device temporary bytes, numerical tolerance, zero local bytes, and three independent runs | Windows display scheduling can hold an otherwise fast candidate |
-| Expanded correctness | Rectangular Sq/Skv D64 FP16 attention plus D64 FP32 dense/paged decode admit tested MHA/GQA/MQA buckets; explicit reasons cover dtype, D, invalid head maps, page geometry, mask, dropout, phase/backward, and ragged requests | BF16, broader FP32 prefill, masks, training/backward, and ragged semantics remain implementation work |
+| Expanded correctness | Rectangular Sq/Skv D64 FP16 attention, D64 FP32 dense/paged decode, and causal D64 FP32 paged prefill admit tested MHA/GQA/MQA buckets; explicit reasons cover dtype, D, invalid head maps, page geometry, mask, dropout, phase/backward, and ragged requests | BF16, non-causal/arbitrary-mask prefill, training/backward, and ragged semantics remain implementation work |
 | Real second fusion | `residual + RMSNorm(D=64)` is one warp-owned reduction/fusion using the same ABI, audit, gate, cache, graph-prewarm, tests, and benchmark framework | QKV projection/RoPE remains the next tensor-core fusion |
 | Architecture families | Ampere, Ada, Hopper, and Blackwell are distinct dispatch domains | Only Ampere SM86 was executed here; other families deliberately reject rather than inherit Ampere tuning |
 
@@ -541,6 +590,9 @@ tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-ncu.ps1 `
 
 tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-ncu.ps1 `
   -Target decode -OutputCsv decode-ncu.csv
+
+tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-ncu.ps1 `
+  -Target paged-prefill -OutputCsv paged-prefill-ncu.csv
 ```
 
 The script profiles a deterministic kernel target and fails unless executed
@@ -576,10 +628,18 @@ dotnet run --project tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmar
 python `
   tests/AiDotNet.Tensors.Benchmarks/BaselineRunners/py/run_direct_ptx_decode_competitors.py --runs 3
 
+$env:AIDOTNET_DIRECT_PTX_PAGED_PREFILL='1'
+dotnet run --project tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.csproj `
+  -c Release --no-build -- --direct-ptx-paged-prefill 3
+
+python `
+  tests/AiDotNet.Tensors.Benchmarks/BaselineRunners/py/run_direct_ptx_paged_prefill_competitors.py --runs 3
+
 $env:AIDOTNET_DIRECT_PTX_ATTENTION='1'
 $env:AIDOTNET_DIRECT_PTX_RESIDUAL_RMSNORM='1'
 $env:AIDOTNET_DIRECT_PTX_FLASH_DECODE='1'
 $env:AIDOTNET_DIRECT_PTX_PAGED_DECODE='1'
+$env:AIDOTNET_DIRECT_PTX_PAGED_PREFILL='1'
 # Or enable all admitted direct kernels:
 $env:AIDOTNET_DIRECT_PTX='1'
 ```
