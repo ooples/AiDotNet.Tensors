@@ -47,6 +47,23 @@ public class ComplexLayoutBufferValidationTests
             backend.DeinterleaveComplex(packed, full, shortSplit, n));
     }
 
+    [Fact]
+    public void CudaTileBatch_RejectsUndersizedBuffersBeforeDispatch()
+    {
+        const int innerSize = 4;
+        const int repeats = 3;
+        IDirectGpuBackend backend = CreateWithoutHardware("CUDA");
+        var input = new MockGpuBuffer(new float[innerSize]);
+        var shortInput = new MockGpuBuffer(new float[innerSize - 1]);
+        var output = new MockGpuBuffer(new float[innerSize * repeats]);
+        var shortOutput = new MockGpuBuffer(new float[innerSize * repeats - 1]);
+
+        Assert.Throws<ArgumentException>(() =>
+            backend.TileBatch(shortInput, output, repeats, innerSize));
+        Assert.Throws<ArgumentException>(() =>
+            backend.TileBatch(input, shortOutput, repeats, innerSize));
+    }
+
     private static IDirectGpuBackend CreateWithoutHardware(string backendName)
     {
 #pragma warning disable SYSLIB0050 // Validation is deliberately exercised before constructor-owned GPU state.

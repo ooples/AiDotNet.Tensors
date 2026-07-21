@@ -22777,26 +22777,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 for (int i = 0; i < ea; i++) outerSize *= input.Shape._dims[i];
                 int outputLen = outerSize * halfDim;
                 var gi = UploadTensorRaw(b, input);
-                // NOT `using`. DeferTensorResult hands this buffer to a deferred materializer that runs on
-                // first host access, so disposing it when this method returns zeroes the handle out from
-                // under the pending download. Measured: the failing materializer saw handle=0x0 while the
-                // registration had recorded a live handle (0x204C00200 etc.), and GLU failed forward parity
-                // DETERMINISTICALLY with "buffer released before materialization" (#226) — despite that
-                // message naming an eviction race. GeGLU, SwiGLU and ReGLU are identical apart from this
-                // `using` and all three pass, which is what isolated it.
-                var go = b.AllocateBuffer(outputLen);
-                try
-                {
-                    b.GluForward(gi, go, outerSize, halfDim);
-                    int[] outShape = (int[])input.Shape._dims.Clone();
-                    outShape[ea] = halfDim;
-                    return DeferTensorResult<T>(b, go, outputLen, outShape);
-                }
-                catch
-                {
-                    go.Dispose();
-                    throw;
-                }
+                int[] outShape = (int[])input.Shape._dims.Clone();
+                outShape[ea] = halfDim;
+                return DispatchDeferredGpuOp<T>(b, outputLen, outShape,
+                    output => b.GluForward(gi, output, outerSize, halfDim));
             }
             catch { }
         }
@@ -22817,11 +22801,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 for (int i = 0; i < ea; i++) outerSize *= input.Shape._dims[i];
                 int outputLen = outerSize * halfDim;
                 var gi = UploadTensorRaw(b, input);
-                var go = b.AllocateBuffer(outputLen);
-                b.GeGluForward(gi, go, outerSize, halfDim);
                 int[] outShape = (int[])input.Shape._dims.Clone();
                 outShape[ea] = halfDim;
-                return DeferTensorResult<T>(b, go, outputLen, outShape);
+                return DispatchDeferredGpuOp<T>(b, outputLen, outShape,
+                    output => b.GeGluForward(gi, output, outerSize, halfDim));
             }
             catch { }
         }
@@ -22841,11 +22824,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 for (int i = 0; i < ea; i++) outerSize *= input.Shape._dims[i];
                 int outputLen = outerSize * halfDim;
                 var gi = UploadTensorRaw(b, input);
-                var go = b.AllocateBuffer(outputLen);
-                b.ReGluForward(gi, go, outerSize, halfDim);
                 int[] outShape = (int[])input.Shape._dims.Clone();
                 outShape[ea] = halfDim;
-                return DeferTensorResult<T>(b, go, outputLen, outShape);
+                return DispatchDeferredGpuOp<T>(b, outputLen, outShape,
+                    output => b.ReGluForward(gi, output, outerSize, halfDim));
             }
             catch { }
         }
@@ -22865,11 +22847,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 for (int i = 0; i < ea; i++) outerSize *= input.Shape._dims[i];
                 int outputLen = outerSize * halfDim;
                 var gi = UploadTensorRaw(b, input);
-                var go = b.AllocateBuffer(outputLen);
-                b.SwiGluForward(gi, go, outerSize, halfDim);
                 int[] outShape = (int[])input.Shape._dims.Clone();
                 outShape[ea] = halfDim;
-                return DeferTensorResult<T>(b, go, outputLen, outShape);
+                return DispatchDeferredGpuOp<T>(b, outputLen, outShape,
+                    output => b.SwiGluForward(gi, output, outerSize, halfDim));
             }
             catch { }
         }
@@ -23028,7 +23009,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (IsTapeActive<T>()) return base.Upsample(input, scaleH, scaleW);
         if (typeof(T)==typeof(float) && TryGetBackend(out var b) && input.Rank==4 && scaleH==scaleW)
-        { try { int ba=input.Shape._dims[0],ch=input.Shape._dims[1],ih=input.Shape._dims[2],iw=input.Shape._dims[3]; int oh=ih*scaleH,ow=iw*scaleW; int total=ba*ch*oh*ow; var gi=UploadTensorRaw(b, input); var go=b.AllocateBuffer(total); b.NearestNeighborUpsample(gi,go,ba*ch,ih,iw,scaleH); return DeferTensorResult<T>(b,go,total,new[]{ba,ch,oh,ow}); } catch{} }
+        {
+            try
+            {
+                int ba=input.Shape._dims[0],ch=input.Shape._dims[1],ih=input.Shape._dims[2],iw=input.Shape._dims[3];
+                int oh=ih*scaleH,ow=iw*scaleW;
+                int total=ba*ch*oh*ow;
+                var gi=UploadTensorRaw(b, input);
+                return DispatchDeferredGpuOp<T>(b,total,new[]{ba,ch,oh,ow},
+                    output => b.NearestNeighborUpsample(gi,output,ba*ch,ih,iw,scaleH));
+            }
+            catch { }
+        }
         return base.Upsample(input,scaleH,scaleW);
     }
 
@@ -23115,7 +23107,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.TensorSoftmaxBackward<T>(Tensor<T> softmaxOutput, Tensor<T> gradOutput, int axis)
     {
         if (typeof(T)==typeof(float) && TryGetBackend(out var b))
-        { try { var gso=UploadTensorRaw(b, softmaxOutput); var ggo=UploadTensorRaw(b, gradOutput); var go=b.AllocateBuffer(softmaxOutput.Length); int rank=softmaxOutput.Rank; int ea=axis<0?rank+axis:axis; int features=softmaxOutput.Shape._dims[ea]; int outerSize=softmaxOutput.Length/features; /* backend sig is SoftmaxBackward(gradOutput, output, ...); args were swapped -> wrong gradient (#775). */ b.SoftmaxBackward(ggo,gso,go,outerSize,features); return DeferTensorResult<T>(b,go,softmaxOutput.Length,softmaxOutput.Shape.ToArray()); } catch{} }
+        {
+            try
+            {
+                var gso=UploadTensorRaw(b, softmaxOutput);
+                var ggo=UploadTensorRaw(b, gradOutput);
+                int rank=softmaxOutput.Rank;
+                int ea=axis<0?rank+axis:axis;
+                int features=softmaxOutput.Shape._dims[ea];
+                int outerSize=softmaxOutput.Length/features;
+                return DispatchDeferredGpuOp<T>(b,softmaxOutput.Length,softmaxOutput.Shape.ToArray(),
+                    output =>
+                    {
+                        // Backend signature is SoftmaxBackward(gradOutput, output, ...); these args were
+                        // previously swapped, producing the wrong gradient (#775).
+                        b.SoftmaxBackward(ggo,gso,output,outerSize,features);
+                    });
+            }
+            catch { }
+        }
         return base.TensorSoftmaxBackward(softmaxOutput,gradOutput,axis);
     }
 
