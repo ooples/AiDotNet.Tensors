@@ -6,7 +6,8 @@ Baseline: `b386d35` plus the working-tree experiment described here
 ## Verdict
 
 The forward-inference experiment is implemented end to end for NVIDIA SM80+
-and the declared shape family:
+and the declared shape family. A separate deterministic FP32
+materialized-probability backward family is implemented for Ampere SM86:
 
 ```text
 FP16 Q/K/V, dense BHSD, Sq and Skv independently in {16,32,64,128}, D=64
@@ -49,11 +50,11 @@ missing or duplicate assignment.
 | API | Existing CUDA implementation | Direct-PTX assignment |
 |---|---|---|
 | ScaledDotProductAttention | `scaled_dot_product_attention` | v3 weight-free dense FP16 inference implemented; weights/masks/softcap planned |
-| ScaledDotProductAttentionBackward | GEMM + softmax-backward composition | recomputation backward planned |
+| ScaledDotProductAttentionBackward | GEMM + softmax-backward composition | v1 deterministic materialized-probability FP32 D64 MHA backward implemented; recomputation planned |
 | FlashAttention / FlashAttentionV2 | `flash_attention_v2` | v3 rectangular dense FP16, LSE, no-bias route implemented |
 | FlashAttentionBackward | atomic and deterministic NVRTC variants | atomic/deterministic direct-PTX families planned |
 | GroupedQueryAttention | `grouped_query_attention` | v3 weight-free GQA/MQA inference implemented; weights mode planned |
-| GroupedQueryAttentionBackward | atomic and deterministic NVRTC variants | GQA/MQA recomputation backward planned |
+| GroupedQueryAttentionBackward | atomic and deterministic NVRTC variants | v1 deterministic materialized-probability FP32 D64 GQA/MQA backward implemented; recomputation planned |
 | FlashDecode | `flash_decode_partial` + `flash_decode_reduce` | v1 register-online D64 FP32 MHA/GQA/MQA decode implemented for S=16/32/64/128; explicit split hints fall back |
 | PagedAttention decode, MHA/GQA | two `paged_attention_decode*` kernels | v1 block-table D64 FP32 decode implemented for block size 16/32 |
 | PagedAttention prefill, MHA/GQA | two `paged_attention_prefill*` kernels | v1 causal block-table D64 FP32 MHA/GQA/MQA prefill implemented for Q=2/4/8/16/32, total KV<=128, block size 16/32 |
@@ -260,6 +261,49 @@ the independently forced Math backend.
 | prefill MQA | Math | 405.2-466.6 | 601.1-708.8 | 684.1-993.2 | 448.25-498.09 | 3.97-4.57 | 462,848 | 2.980e-8 |
 | prefill long | Math | 404.2-454.7 | 600.4-677.3 | 623.8-911.6 | 440.45-493.54 | 8.68-9.77 | 892,928 | 2.980e-8 |
 
+## Deterministic attention-backward championship slice
+
+The v1 backward specialization accepts the exact FP32 probabilities already
+produced by `ScaledDotProductAttention` or `GroupedQueryAttention`. Its formal
+ABI is dense canonical BHSD for `dO/Q/K/V/dQ/dK/dV` and dense BHSqSkv for the
+probabilities, with D=64, batch <=16, and Sq/Skv independently in
+`{16,32,64,128}`. MHA, GQA, and MQA use a baked query-head-to-KV-head map.
+
+The deterministic dataflow has three entry points. A row-owned warp computes
+`delta = sum(dP * P)` and writes one scalar per query row into the final dQ
+allocation as temporary output workspace. Key-owned warps then write each dK
+and dV element exactly once, without atomics. Query-owned warps finally
+overwrite the complete dQ allocation. This avoids the current implementation's
+five SxS/transpose temporaries and makes no additional allocation. It does not
+claim recomputation backward: the API-provided probability tensor is read once
+per derivative pass and remains part of this v1 contract.
+
+RTX 3080, 30 warmups and 101 synchronized E2E samples per cell, three
+independent runs. `GFLOPS = 8 * B * Hq * Sq * Skv * D / time`, counting the
+four derivative matrix products. The ranges below are from the final captured
+three-run gate:
+
+```text
+Shape          Direct median us  Direct P95 us  Direct P99 us  Direct mean us   GFLOPS   AiDotNet median us  Min speedup  B/call  tmp MiB  max error  regs d/dq/dkv  shared/local  blocks/SM
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+backward-mha       43.0-60.7       99.0-109.5     118.6-228.1     56.68-68.94   17.27-24.39     433.4-481.6          7.14x        0    0.000  2.235e-8      22/25/29          0/0       12/12/12
+backward-gqa       69.9-73.4      105.4-184.2     200.5-308.8     79.76-94.39   28.57-30.00    2109.4-2344.9        28.74x        0    0.000  4.470e-8      22/25/29          0/0       12/12/12
+backward-mqa      114.2-118.2     138.1-155.8     193.9-276.3    122.72-123.76  17.74-18.36    4028.6-4236.9        35.13x        0    0.000  1.490e-7      22/25/29          0/0       12/12/12
+backward-long     132.4-139.6     156.8-167.8     196.4-338.0    137.85-145.77 120.18-126.72  17410.9-17441.2      124.94x        0    0.000  3.725e-8      22/25/29          0/0       12/12/12
+```
+
+Every paired run passes the policy against AiDotNet's established deterministic
+CUDA implementation. The exact external PyTorch composition uses resident
+CUDA tensors and the same materialized probabilities. Its best three-run
+median ranges are 426.3-439.3 us (MHA), 603.2-820.4 us (GQA), 532.0-927.0 us
+(MQA), and 554.9-589.4 us (long), so the conservative direct-PTX median wins
+are 7.02x, 8.22x, 4.50x, and 3.97x using the slowest direct and fastest external
+median from this capture. PyTorch peak allocation ranges from 115,200 to
+722,944 bytes; the direct route reports zero managed bytes and zero device
+temporary bytes. `torch.compile(max-autotune)` was attempted and records an
+explicit skip because this Windows PyTorch environment has no working Triton
+backend.
+
 ## Kernel dataflow
 
 ```text
@@ -319,6 +363,14 @@ this FP32 cell is GEMV-like at each query, measured coalesced vector loads beat
 adding shared-memory staging or Tensor Core packing; those mechanisms remain
 appropriate for the existing FP16 tile-matrix family.
 
+Backward is intentionally a different blueprint rather than a branch in the
+forward hot loop. The v1 public backward APIs already provide materialized
+probabilities, so an online-softmax forward recurrence cannot eliminate that
+input. The kernel instead eliminates derivative-score matrices, transpose
+buffers, atomics, dynamic strides, and intermediate allocation. A future
+`FlashAttentionBackward` specialization will recompute probabilities from
+Q/K plus LSE and is tracked separately in the coverage manifest.
+
 ## Runtime and feature gate
 
 The custom path uses `nvcuda.dll` Driver API calls directly:
@@ -340,7 +392,8 @@ Production integration is fail-closed:
 - Every family defaults off. Set `AIDOTNET_DIRECT_PTX_ATTENTION=1`,
   `AIDOTNET_DIRECT_PTX_FLASH_DECODE=1`, or
   `AIDOTNET_DIRECT_PTX_PAGED_DECODE=1`, or
-  `AIDOTNET_DIRECT_PTX_PAGED_PREFILL=1` to admit only that family.
+  `AIDOTNET_DIRECT_PTX_PAGED_PREFILL=1`, or
+  `AIDOTNET_DIRECT_PTX_ATTENTION_BACKWARD=1` to admit only that family.
 - SM < 8.0, unsupported shape/dtype/layout, bias, active autodiff tape, stream
   capture, JIT failure, or launch failure falls back to the existing path.
 - The runtime borrows the existing `CudaBackend` context and stream, so
@@ -365,6 +418,7 @@ The implemented token is `DirectPtxTensorView`:
 - zero logical storage offset and exact logical backing extent at the tensor
   boundary;
 - FP16 physical Q/K/V and FP32 output/stats/gamma/beta;
+- backward uses exact-extent FP32 BHSD tensors and FP32 BHSqSkv probabilities;
 - at least 16-byte device-pointer alignment;
 - sufficient byte extent and dtype-compatible extent;
 - no stride fields and no shape fields passed to PTX.
@@ -401,7 +455,7 @@ pointers, and absence of stride parameters.
 
 `ptxas`, `nvdisasm`, and `cuobjdump` are not installed on this machine, so the
 report does not claim a separately inspected SASS listing. Nsight Compute
-2025.4.1 was installed as a user-local portable tool and successfully attached
+2026.2.1 was extracted as a user-local portable tool and successfully attached
 to the deterministic target, but the driver returned `ERR_NVGPUCTRPERM` because
 performance-counter access is disabled for this Windows user. No executed
 hardware-counter result is claimed until that OS/driver permission is enabled
@@ -427,14 +481,15 @@ attribute remains the available zero-spill admission proof for this capture.
 | Paged table/pool byte extent mismatch | Rejected before launch; page indices are trusted device metadata under the same caller precondition as the established paged kernel |
 | Noncontiguous, sparse, nonzero-offset, or aliased larger logical view | Materialize/general fallback; never enter stride-free PTX |
 | Misaligned or undersized device pointer | Capability-token rejection and fallback |
-| Active autodiff tape / backward | Existing recorded implementation |
+| Active autodiff tape / forward recording | Existing recorded implementation |
 | CUDA graph capture | Caller-owned-buffer direct launches are allowed only after explicit prewarm; capture-time JIT/cache misses fail closed, and allocating high-level routes retain their established behavior |
 | Non-Ampere architecture | Gate disabled until a separately tuned Ada/Hopper/Blackwell family exists |
 | Driver JIT reports local bytes | Module rejected and fallback |
 | Rectangular causal | Separate baked domains: FlashAttentionV2 top-left (`offset=0`), SDPA bottom-right (`offset=Skv-Sq`); negative offsets remain fail-closed until fully-masked leading rows have a dedicated specialization |
 | Causal future K/V tile | Compute skipped per owning query warp |
 | Inference output-only | No score, probability, or LSE global store |
-| Training-forward / backward | Existing recorded CUDA implementation; direct PTX is inference-only |
+| Materialized-probability backward, FP32 D64, supported shape/head map | Three-entry deterministic direct PTX; final dQ allocation supplies the row-delta workspace |
+| Flash/recomputation backward, unsupported dtype/D/shape, or invalid explicit GQA map | Existing CUDA implementation with an exact rejection reason |
 
 ## Reusable kernel assembly line
 
@@ -483,6 +538,8 @@ The reusable code layers are:
   warp-owned online decode, block-table translation, and single final store.
 - `PtxFusedPagedPrefillAttentionD64Kernel`: query-head warp ownership,
   causal paged traversal, online recurrence, and single final vector store.
+- `PtxFusedAttentionBackwardD64Kernel`: deterministic row-delta, key-owned
+  dK/dV, and query-owned dQ entry points with output-workspace reuse.
 - `CudaBackend.DirectPtx`: production cache, existing stream/context, audit,
   fallback, and teardown.
 - `DirectPtxWmmaTests`: structural, scalar-oracle, layout, gate, borrowed-
@@ -500,7 +557,7 @@ copied into another one-off emitter.
 | Autotuned dispatch | Attention tries valid query-warp variants, persists the winner through the existing autotune cache, keys it by GPU UUID/SM/driver and semantics, and bounds loaded modules with an LRU | A clean production release run still requires three independent captures |
 | Stronger spill proof | Runtime admission enforces register/shared/local budgets and records PTX SHA-256, JIT attributes, occupancy, GPU fingerprint, and log; an Nsight CSV parser and deterministic profile target enforce executed spill/local counters | Nsight attached, but `ERR_NVGPUCTRPERM` blocks counter access until enabled by the host administrator |
 | Hardened performance gate | Policy requires >=1.10x median, bounded p95, zero hot managed/device temporary bytes, numerical tolerance, zero local bytes, and three independent runs | Windows display scheduling can hold an otherwise fast candidate |
-| Expanded correctness | Rectangular Sq/Skv D64 FP16 attention, D64 FP32 dense/paged decode, and causal D64 FP32 paged prefill admit tested MHA/GQA/MQA buckets; explicit reasons cover dtype, D, invalid head maps, page geometry, mask, dropout, phase/backward, and ragged requests | BF16, non-causal/arbitrary-mask prefill, training/backward, and ragged semantics remain implementation work |
+| Expanded correctness | Rectangular Sq/Skv D64 FP16 attention, D64 FP32 dense/paged decode, causal D64 FP32 paged prefill, and deterministic materialized-probability D64 FP32 backward admit tested MHA/GQA/MQA buckets; explicit reasons cover dtype, D, invalid head maps, page geometry, mask, dropout, phase, and ragged requests | BF16, non-causal/arbitrary-mask prefill, Flash/recomputation backward, and ragged semantics remain implementation work |
 | Real second fusion | `residual + RMSNorm(D=64)` is one warp-owned reduction/fusion using the same ABI, audit, gate, cache, graph-prewarm, tests, and benchmark framework | QKV projection/RoPE remains the next tensor-core fusion |
 | Architecture families | Ampere, Ada, Hopper, and Blackwell are distinct dispatch domains | Only Ampere SM86 was executed here; other families deliberately reject rather than inherit Ampere tuning |
 
@@ -593,6 +650,9 @@ tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-ncu.ps1 `
 
 tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-ncu.ps1 `
   -Target paged-prefill -OutputCsv paged-prefill-ncu.csv
+
+tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-ncu.ps1 `
+  -Target attention-backward -OutputCsv attention-backward-ncu.csv
 ```
 
 The script profiles a deterministic kernel target and fails unless executed
@@ -635,11 +695,19 @@ dotnet run --project tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmar
 python `
   tests/AiDotNet.Tensors.Benchmarks/BaselineRunners/py/run_direct_ptx_paged_prefill_competitors.py --runs 3
 
+$env:AIDOTNET_DIRECT_PTX_ATTENTION_BACKWARD='1'
+dotnet run --project tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.csproj `
+  -c Release --no-build -- --direct-ptx-attention-backward 3
+
+C:\Users\cheat\.cache\aidotnet-direct-ptx-py312\Scripts\python.exe `
+  tests/AiDotNet.Tensors.Benchmarks/BaselineRunners/py/run_direct_ptx_attention_backward_competitors.py --runs 3
+
 $env:AIDOTNET_DIRECT_PTX_ATTENTION='1'
 $env:AIDOTNET_DIRECT_PTX_RESIDUAL_RMSNORM='1'
 $env:AIDOTNET_DIRECT_PTX_FLASH_DECODE='1'
 $env:AIDOTNET_DIRECT_PTX_PAGED_DECODE='1'
 $env:AIDOTNET_DIRECT_PTX_PAGED_PREFILL='1'
+$env:AIDOTNET_DIRECT_PTX_ATTENTION_BACKWARD='1'
 # Or enable all admitted direct kernels:
 $env:AIDOTNET_DIRECT_PTX='1'
 ```
