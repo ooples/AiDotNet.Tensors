@@ -444,7 +444,19 @@ public sealed class GpuCpuCorrectnessTests : IDisposable
 
         var input = new Tensor<float>(new[] { -8.0f, -2.0f, -0.5f, 0.5f, 2.0f, 8.0f }, new[] { 6 });
         float[] expected = _cpu.TensorPower(input, exponent).ToArray();
-        float[] actual = _gpu.TensorPower(input, exponent).ToArray();
+        float[] actual;
+        bool savedThrowOnFallback = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;
+        try
+        {
+            // This diagnostic mode turns every TensorPower fallback into a test failure, proving that
+            // backend.Power dispatched successfully before the numerical comparison can pass.
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = true;
+            actual = _gpu.TensorPower(input, exponent).ToArray();
+        }
+        finally
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = savedThrowOnFallback;
+        }
 
         Assert.Equal(expected.Length, actual.Length);
         for (int i = 0; i < expected.Length; i++)
