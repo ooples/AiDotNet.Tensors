@@ -264,6 +264,29 @@ internal static class DirectPtxProfileTarget
         GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-qkv-rope-cache-end");
     }
 
+    internal static void RunFusedLinear()
+    {
+        using var runtime = new DirectPtxRuntime();
+        const int inputFeatures = 512, outputFeatures = 2048;
+        using var kernel = new PtxFusedLinearGeluM1Kernel(
+            runtime, inputFeatures, outputFeatures);
+        using var input = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var weights = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var bias = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        using var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
+        input.Upload<float>(new float[inputFeatures]);
+        weights.Upload<float>(new float[inputFeatures * outputFeatures]);
+        bias.Upload<float>(new float[outputFeatures]);
+        Action launch = () => kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(weights, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[3]));
+        for (int i = 0; i < 10; i++) launch();
+        runtime.Synchronize();
+        Console.WriteLine(kernel.Audit.ToJson());
+    }
+
     internal static void VerifyNcuCsv(string path)
     {
         DirectPtxProfilerEvidence evidence = DirectPtxProfilerEvidence.FromNcuCsv(path);
