@@ -4547,6 +4547,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 (IntPtr)args,
                 IntPtr.Zero),
             "cuLaunchKernel");
+            GpuLaunchProbe.OnLaunch();
     }
 
     /// <summary>
@@ -4564,6 +4565,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 (IntPtr)args,
                 IntPtr.Zero),
             "cuLaunchKernel2D");
+            GpuLaunchProbe.OnLaunch();
     }
 
     /// <summary>
@@ -4781,6 +4783,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             CudaNativeBindings.cuLaunchKernel(kernel, grid, 1, 1, blockSize, 1, 1,
                 sharedMem, _stream, (IntPtr)args, IntPtr.Zero),
             "cuLaunchKernel(softmax)");
+        // GPU-DISPATCH INSTRUMENTATION: this launcher called cuLaunchKernel without OnLaunch, so every
+        // op dispatched through it counted ZERO launches and the residency probe reported it as a CPU
+        // fallback. Count the real dispatch — do not raise the floor.
+        GpuLaunchProbe.OnLaunch();
     }
 
     private unsafe void LaunchReductionKernel(string kernelName, IGpuBuffer input, IGpuBuffer output, int size, int blockSize)

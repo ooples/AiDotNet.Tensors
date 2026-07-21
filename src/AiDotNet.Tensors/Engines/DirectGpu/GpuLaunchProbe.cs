@@ -22,6 +22,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 internal static class GpuLaunchProbe
 {
     private static long _count;
+    private static long _totalEver;   // DIAGNOSTIC: never reset, distinguishes "no launch" from "count zeroed"
     private static long _kernelMisses;
     private static long _readbacks;
     private static long _readbackBytes;
@@ -34,7 +35,10 @@ internal static class GpuLaunchProbe
     public static long Count => Interlocked.Read(ref _count);
 
     /// <summary>Called once per GPU kernel dispatch. Cheap; safe to call from any thread.</summary>
-    public static void OnLaunch() => Interlocked.Increment(ref _count);
+    public static void OnLaunch() { Interlocked.Increment(ref _count); Interlocked.Increment(ref _totalEver); }
+
+    /// <summary>DIAGNOSTIC: launches since process start; <see cref="Reset"/> does NOT clear it.</summary>
+    public static long TotalEver => Interlocked.Read(ref _totalEver);
 
     /// <summary>Device-to-host transfers observed since the last <see cref="Reset"/>.</summary>
     public static long Readbacks => Interlocked.Read(ref _readbacks);
