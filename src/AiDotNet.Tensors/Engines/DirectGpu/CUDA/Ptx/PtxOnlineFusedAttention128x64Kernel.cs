@@ -6,10 +6,12 @@ using System.Text;
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
 /// <summary>
-/// SM80+ online FlashAttention proof for S in {16,32,64,128}, D=64. Each warp owns a 16-row
-/// query tile, keeps the FP32 online max/sum and 16x64 output fragment in registers, and the
-/// warps in a block share double-buffered 16-row K/V tiles staged with cp.async. No score or
-/// probability matrix is materialized in global or shared memory.
+/// SM80+ online FlashAttention family for Sq/Skv in {16,32,64,128}, D=64, including MHA,
+/// GQA, and MQA. Each warp owns a 16-row query tile, keeps the FP32 online max/sum and
+/// 16x64 output fragment in registers, and the warps in a block share double-buffered
+/// 16-row K/V tiles staged with cp.async. No score or probability matrix is materialized
+/// in global or shared memory. Batch/head/shape mapping is baked into each emitted module;
+/// the PTX contains no dynamic shape, layout, or stride checks.
 /// </summary>
 internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
 {
@@ -22,8 +24,14 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
     private readonly DirectPtxModule _module;
     private readonly IntPtr _function;
 
-    internal int BatchHeads { get; }
-    internal int SequenceLength { get; }
+    internal int Batch { get; }
+    internal int QueryHeads { get; }
+    internal int KeyValueHeads { get; }
+    internal int QuerySequence { get; }
+    internal int KeyValueSequence { get; }
+    internal int CausalQueryOffset { get; }
+    internal int BatchHeads => checked(Batch * QueryHeads);
+    internal int SequenceLength => QuerySequence;
     internal bool IsCausal { get; }
     internal bool FuseLayerNormGelu { get; }
     internal bool EmitSoftmaxStats { get; }
@@ -35,15 +43,17 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
     internal DirectPtxKernelAudit Audit { get; }
     internal string JitInfoLog => _module.JitInfoLog;
 
-    private int InputElementsPerHead => SequenceLength * HeadDimension;
-    private int InputBytesPerHead => InputElementsPerHead * sizeof(ushort);
-    private int OutputBytesPerHead => InputElementsPerHead * sizeof(float);
-    private int StatsBytesPerHead => SequenceLength * sizeof(float);
+    private int QueryElementsPerHead => QuerySequence * HeadDimension;
+    private int KeyValueElementsPerHead => KeyValueSequence * HeadDimension;
+    private int QueryBytesPerHead => QueryElementsPerHead * sizeof(ushort);
+    private int KeyValueBytesPerHead => KeyValueElementsPerHead * sizeof(ushort);
+    private int OutputBytesPerHead => QueryElementsPerHead * sizeof(float);
+    private int StatsBytesPerHead => QuerySequence * sizeof(float);
     internal int WarpsPerBlock { get; }
 
-    internal nuint QBytes => checked((nuint)BatchHeads * (nuint)InputBytesPerHead);
-    internal nuint KBytes => QBytes;
-    internal nuint VBytes => QBytes;
+    internal nuint QBytes => checked((nuint)BatchHeads * (nuint)QueryBytesPerHead);
+    internal nuint KBytes => checked((nuint)Batch * (nuint)KeyValueHeads * (nuint)KeyValueBytesPerHead);
+    internal nuint VBytes => KBytes;
     internal nuint OutputBytes => checked((nuint)BatchHeads * (nuint)OutputBytesPerHead);
     internal nuint StatsBytes => checked((nuint)BatchHeads * (nuint)StatsBytesPerHead);
     internal const nuint GammaBytes = HeadDimension * sizeof(float);
@@ -59,27 +69,66 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
         int sequenceLength = DefaultSequenceLength,
         bool emitSoftmaxStats = true,
         int? warpsPerBlock = null)
+        : this(
+            runtime, 1, batchHeads, batchHeads, sequenceLength, sequenceLength,
+            isCausal, fuseLayerNormGelu, scale, epsilon, emitSoftmaxStats, warpsPerBlock,
+            causalQueryOffset: 0)
+    {
+    }
+
+    internal PtxOnlineFusedAttention128x64Kernel(
+        DirectPtxRuntime runtime,
+        int batch,
+        int queryHeads,
+        int keyValueHeads,
+        int querySequence,
+        int keyValueSequence,
+        bool isCausal,
+        bool fuseLayerNormGelu,
+        float scale = 0.125f,
+        float epsilon = 1e-5f,
+        bool emitSoftmaxStats = true,
+        int? warpsPerBlock = null,
+        int causalQueryOffset = 0)
     {
         ArgumentNullException.ThrowIfNull(runtime);
-        if (batchHeads <= 0 || batchHeads > 65535) throw new ArgumentOutOfRangeException(nameof(batchHeads));
+        if (batch <= 0) throw new ArgumentOutOfRangeException(nameof(batch));
+        if (queryHeads <= 0) throw new ArgumentOutOfRangeException(nameof(queryHeads));
+        if (keyValueHeads <= 0 || queryHeads % keyValueHeads != 0)
+            throw new ArgumentOutOfRangeException(
+                nameof(keyValueHeads), "Query heads must be evenly divisible by positive KV heads.");
+        if (checked((long)batch * queryHeads) > 65535)
+            throw new ArgumentOutOfRangeException(nameof(queryHeads), "The flattened query-head grid exceeds CUDA grid-y.");
         if (!float.IsFinite(scale)) throw new ArgumentOutOfRangeException(nameof(scale));
         if (!float.IsFinite(epsilon) || epsilon <= 0) throw new ArgumentOutOfRangeException(nameof(epsilon));
-        if (sequenceLength is not (16 or 32 or 64 or 128))
+        if (causalQueryOffset < 0)
             throw new ArgumentOutOfRangeException(
-                nameof(sequenceLength), "Online PTX sequence length must be one of 16, 32, 64, or 128.");
+                nameof(causalQueryOffset), "Negative causal query offsets require a fully-masked-row specialization.");
+        if (!isCausal && causalQueryOffset != 0)
+            throw new ArgumentException("A causal query offset is valid only for a causal specialization.", nameof(causalQueryOffset));
+        if (querySequence is not (16 or 32 or 64 or 128))
+            throw new ArgumentOutOfRangeException(
+                nameof(querySequence), "Online PTX query length must be one of 16, 32, 64, or 128.");
+        if (keyValueSequence is not (16 or 32 or 64 or 128))
+            throw new ArgumentOutOfRangeException(
+                nameof(keyValueSequence), "Online PTX KV length must be one of 16, 32, 64, or 128.");
         if (!DirectPtxArchitecture.HasValidatedOnlineAttention(runtime.ArchitectureFamily))
             throw new NotSupportedException(
                 $"Online attention has no validated {runtime.ArchitectureFamily} specialization. " +
                 "Architecture families fail closed until separately tuned and benchmarked.");
 
-        int queryTiles = sequenceLength / QueryTileRows;
+        int queryTiles = querySequence / QueryTileRows;
         int selectedWarps = warpsPerBlock ?? Math.Min(8, queryTiles);
         if (selectedWarps is not (1 or 2 or 4 or 8) || selectedWarps > queryTiles || queryTiles % selectedWarps != 0)
             throw new ArgumentOutOfRangeException(
                 nameof(warpsPerBlock), "Warp count must be 1/2/4/8 and evenly divide the query-tile count.");
 
-        BatchHeads = batchHeads;
-        SequenceLength = sequenceLength;
+        Batch = batch;
+        QueryHeads = queryHeads;
+        KeyValueHeads = keyValueHeads;
+        QuerySequence = querySequence;
+        KeyValueSequence = keyValueSequence;
+        CausalQueryOffset = causalQueryOffset;
         IsCausal = isCausal;
         FuseLayerNormGelu = fuseLayerNormGelu;
         EmitSoftmaxStats = emitSoftmaxStats;
@@ -87,18 +136,23 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
         Epsilon = epsilon;
         WarpsPerBlock = selectedWarps;
         Blueprint = CreateBlueprint(
-            runtime.ArchitectureFamily, batchHeads, sequenceLength,
-            isCausal, fuseLayerNormGelu, emitSoftmaxStats, selectedWarps);
-        Ptx = EmitPtx(
+            runtime.ArchitectureFamily, batch, queryHeads, keyValueHeads,
+            querySequence, keyValueSequence,
+            isCausal, causalQueryOffset, fuseLayerNormGelu, emitSoftmaxStats, selectedWarps);
+        Ptx = EmitFamilyPtx(
             runtime.ComputeCapabilityMajor,
             runtime.ComputeCapabilityMinor,
+            queryHeads,
+            keyValueHeads,
             isCausal,
             fuseLayerNormGelu,
             scale,
             epsilon,
-            sequenceLength,
+            querySequence,
+            keyValueSequence,
             emitSoftmaxStats,
-            selectedWarps);
+            selectedWarps,
+            causalQueryOffset);
         _module = runtime.LoadModule(Ptx);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
         FunctionInfo = functionInfo;
@@ -112,36 +166,41 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
 
     private static DirectPtxKernelBlueprint CreateBlueprint(
         DirectPtxArchitectureFamily architecture,
-        int batchHeads,
-        int sequenceLength,
+        int batch,
+        int queryHeads,
+        int keyValueHeads,
+        int querySequence,
+        int keyValueSequence,
         bool isCausal,
+        int causalQueryOffset,
         bool fuseLayerNormGelu,
         bool emitSoftmaxStats,
         int warpsPerBlock)
     {
-        var bhsdHalf = new DirectPtxExtent(1, batchHeads, sequenceLength, HeadDimension);
-        var bhsdFloat = new DirectPtxExtent(1, batchHeads, sequenceLength, HeadDimension);
-        var stats = new DirectPtxExtent(batchHeads, sequenceLength);
+        var queryHalf = new DirectPtxExtent(batch, queryHeads, querySequence, HeadDimension);
+        var keyValueHalf = new DirectPtxExtent(batch, keyValueHeads, keyValueSequence, HeadDimension);
+        var outputFloat = new DirectPtxExtent(batch, queryHeads, querySequence, HeadDimension);
+        var stats = new DirectPtxExtent(batch * queryHeads, querySequence);
         var vector = new DirectPtxExtent(HeadDimension);
         return new DirectPtxKernelBlueprint(
             Operation: "online-attention-d64",
-            Version: 2,
+            Version: 3,
             Architecture: architecture,
             Variant: $"q16-k16-w{warpsPerBlock}",
             Tensors:
             [
                 new("query", DirectPtxPhysicalType.Float16, DirectPtxPhysicalLayout.Bhsd,
-                    bhsdHalf, bhsdHalf, 16, DirectPtxTensorAccess.Read),
+                    queryHalf, queryHalf, 16, DirectPtxTensorAccess.Read),
                 new("key", DirectPtxPhysicalType.Float16, DirectPtxPhysicalLayout.Bhsd,
-                    bhsdHalf, bhsdHalf, 16, DirectPtxTensorAccess.Read),
+                    keyValueHalf, keyValueHalf, 16, DirectPtxTensorAccess.Read),
                 new("value", DirectPtxPhysicalType.Float16, DirectPtxPhysicalLayout.Bhsd,
-                    bhsdHalf, bhsdHalf, 16, DirectPtxTensorAccess.Read),
+                    keyValueHalf, keyValueHalf, 16, DirectPtxTensorAccess.Read),
                 new("gamma", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
                     vector, vector, 16, DirectPtxTensorAccess.Read),
                 new("beta", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
                     vector, vector, 16, DirectPtxTensorAccess.Read),
                 new("output", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Bhsd,
-                    bhsdFloat, bhsdFloat, 16, DirectPtxTensorAccess.Write),
+                    outputFloat, outputFloat, 16, DirectPtxTensorAccess.Write),
                 new("softmax-stats", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.RowMajor2D,
                     stats, stats, 16, DirectPtxTensorAccess.Write)
             ],
@@ -155,10 +214,18 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
                 ["input"] = "fp16",
                 ["accumulator"] = "fp32",
                 ["output"] = "fp32",
-                ["mask"] = isCausal ? "causal-top-left" : "none",
+                ["mask"] = isCausal
+                    ? causalQueryOffset == 0
+                        ? "causal-top-left"
+                        : $"causal-query-offset-{causalQueryOffset}"
+                    : "none",
                 ["epilogue"] = fuseLayerNormGelu ? "layernorm-affine-tanh-gelu" : "none",
                 ["stats"] = emitSoftmaxStats ? "lse" : "none",
-                ["layout"] = "dense-bhsd"
+                ["layout"] = "dense-bhsd",
+                ["head-mapping"] = queryHeads == keyValueHeads
+                    ? "mha"
+                    : keyValueHeads == 1 ? "mqa" : "gqa",
+                ["shape"] = $"b{batch}-hq{queryHeads}-hkv{keyValueHeads}-sq{querySequence}-skv{keyValueSequence}-d64"
             });
     }
 
@@ -175,7 +242,8 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
         Require(key, Blueprint.Tensors[1], nameof(key));
         Require(value, Blueprint.Tensors[2], nameof(value));
         Require(output, Blueprint.Tensors[5], nameof(output));
-        Require(softmaxStats, Blueprint.Tensors[6], nameof(softmaxStats));
+        if (EmitSoftmaxStats)
+            Require(softmaxStats, Blueprint.Tensors[6], nameof(softmaxStats));
         if (FuseLayerNormGelu)
         {
             Require(gamma, Blueprint.Tensors[3], nameof(gamma));
@@ -202,7 +270,7 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
 
         _module.Launch(
             _function,
-            (uint)((SequenceLength / QueryTileRows) / WarpsPerBlock), (uint)BatchHeads, 1,
+            (uint)((QuerySequence / QueryTileRows) / WarpsPerBlock), (uint)BatchHeads, 1,
             (uint)(WarpsPerBlock * 32), 1, 1,
             0,
             args);
@@ -220,7 +288,7 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
 
     internal double AttentionTflops(float milliseconds)
     {
-        double flops = 4.0 * BatchHeads * SequenceLength * SequenceLength * HeadDimension;
+        double flops = 4.0 * BatchHeads * QuerySequence * KeyValueSequence * HeadDimension;
         return flops / (milliseconds * 1e-3) / 1e12;
     }
 
@@ -237,12 +305,46 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
         bool emitSoftmaxStats = true,
         int? warpsPerBlock = null)
     {
-        if (sequenceLength is not (16 or 32 or 64 or 128))
-            throw new ArgumentOutOfRangeException(nameof(sequenceLength));
-        int inputBytesPerHead = sequenceLength * HeadDimension * sizeof(ushort);
-        int outputBytesPerHead = sequenceLength * HeadDimension * sizeof(float);
-        int statsBytesPerHead = sequenceLength * sizeof(float);
-        int queryTiles = sequenceLength / QueryTileRows;
+        return EmitFamilyPtx(
+            ccMajor, ccMinor, queryHeads: 1, keyValueHeads: 1,
+            isCausal, fuseLayerNormGelu, scale, epsilon,
+            querySequence: sequenceLength, keyValueSequence: sequenceLength,
+            emitSoftmaxStats, warpsPerBlock, causalQueryOffset: 0);
+    }
+
+    internal static string EmitFamilyPtx(
+        int ccMajor,
+        int ccMinor,
+        int queryHeads,
+        int keyValueHeads,
+        bool isCausal,
+        bool fuseLayerNormGelu,
+        float scale,
+        float epsilon,
+        int querySequence,
+        int keyValueSequence,
+        bool emitSoftmaxStats = true,
+        int? warpsPerBlock = null,
+        int causalQueryOffset = 0)
+    {
+        if (queryHeads <= 0) throw new ArgumentOutOfRangeException(nameof(queryHeads));
+        if (keyValueHeads <= 0 || queryHeads % keyValueHeads != 0)
+            throw new ArgumentOutOfRangeException(nameof(keyValueHeads));
+        if (causalQueryOffset < 0)
+            throw new ArgumentOutOfRangeException(nameof(causalQueryOffset));
+        if (!isCausal && causalQueryOffset != 0)
+            throw new ArgumentException("Causal query offset requires causal masking.", nameof(causalQueryOffset));
+        if (querySequence is not (16 or 32 or 64 or 128))
+            throw new ArgumentOutOfRangeException(nameof(querySequence));
+        if (keyValueSequence is not (16 or 32 or 64 or 128))
+            throw new ArgumentOutOfRangeException(nameof(keyValueSequence));
+        int queryBytesPerHead = querySequence * HeadDimension * sizeof(ushort);
+        int keyValueBytesPerHead = keyValueSequence * HeadDimension * sizeof(ushort);
+        int outputBytesPerHead = querySequence * HeadDimension * sizeof(float);
+        int statsBytesPerHead = querySequence * sizeof(float);
+        int queryTiles = querySequence / QueryTileRows;
+        int keyValueTiles = keyValueSequence / KeyTileRows;
+        int queriesPerKeyValue = queryHeads / keyValueHeads;
         int selectedWarpsPerBlock = warpsPerBlock ?? Math.Min(8, queryTiles);
         if (selectedWarpsPerBlock is not (1 or 2 or 4 or 8) ||
             selectedWarpsPerBlock > queryTiles || queryTiles % selectedWarpsPerBlock != 0)
@@ -311,14 +413,25 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
         ptx.AppendLine("    shl.b32 %r7, %r1, 4;");
         ptx.AppendLine("    add.u32 %r8, %r7, %r3;"); // global query row 0
         ptx.AppendLine("    add.u32 %r9, %r8, 8;"); // global query row 1
+        if (causalQueryOffset != 0)
+        {
+            ptx.AppendLine($"    add.u32 %r8, %r8, {causalQueryOffset};");
+            ptx.AppendLine($"    add.u32 %r9, %r9, {causalQueryOffset};");
+        }
         // Shared symbols are already addresses in the shared state space. PTX
         // cvta.to requires a generic-address register source, so use mov for
         // the statically allocated symbol and keep all following arithmetic u64.
         ptx.AppendLine("    mov.u64 %rd7, smem;");
         ptx.AppendLine("    mul.wide.u32 %rd29, %r22, 2048;");
         ptx.AppendLine("    add.u64 %rd28, %rd7, %rd29;"); // warp-private Q tile
-        ptx.AppendLine($"    mul.wide.u32 %rd8, %r2, {inputBytesPerHead};");
+        ptx.AppendLine($"    mul.wide.u32 %rd8, %r2, {queryBytesPerHead};");
         ptx.AppendLine("    add.u64 %rd0, %rd0, %rd8;");
+        ptx.AppendLine($"    div.u32 %r24, %r2, {queryHeads};");
+        ptx.AppendLine($"    mul.lo.u32 %r25, %r24, {queryHeads};");
+        ptx.AppendLine("    sub.u32 %r25, %r2, %r25;");
+        ptx.AppendLine($"    div.u32 %r25, %r25, {queriesPerKeyValue};");
+        ptx.AppendLine($"    mad.lo.u32 %r26, %r24, {keyValueHeads}, %r25;");
+        ptx.AppendLine($"    mul.wide.u32 %rd8, %r26, {keyValueBytesPerHead};");
         ptx.AppendLine("    add.u64 %rd1, %rd1, %rd8;");
         ptx.AppendLine("    add.u64 %rd2, %rd2, %rd8;");
         ptx.AppendLine($"    mul.wide.u32 %rd9, %r2, {outputBytesPerHead};");
@@ -370,7 +483,7 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
         for (int i = 0; i < 32; i++) ptx.AppendLine($"    mov.f32 %o{i}, 0f00000000;");
         ptx.AppendLine();
 
-        for (int tile = 0; tile < sequenceLength / KeyTileRows; tile++)
+        for (int tile = 0; tile < keyValueTiles; tile++)
         {
             int currentK = (tile & 1) == 0 ? kShared0 : kShared1;
             int currentV = (tile & 1) == 0 ? vShared0 : vShared1;
@@ -378,7 +491,7 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
             int nextV = (tile & 1) == 0 ? vShared1 : vShared0;
 
             ptx.AppendLine($"    // ---- online K/V tile {tile} ----");
-            if (tile + 1 < sequenceLength / KeyTileRows)
+            if (tile + 1 < keyValueTiles)
             {
                 int nextByteOffset = (tile + 1) * 2048;
                 ptx.AppendLine($"    add.u64 %rd18, %rd1, {nextByteOffset};");
@@ -390,7 +503,14 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
 
             if (isCausal)
             {
-                ptx.AppendLine($"    setp.gt.u32 %p6, {tile}, %r1;");
+                int skipTileOffset = (causalQueryOffset + KeyTileRows - 1) / KeyTileRows;
+                if (skipTileOffset == 0)
+                    ptx.AppendLine($"    setp.gt.u32 %p6, {tile}, %r1;");
+                else
+                {
+                    ptx.AppendLine($"    add.u32 %r27, %r1, {skipTileOffset};");
+                    ptx.AppendLine($"    setp.gt.u32 %p6, {tile}, %r27;");
+                }
                 ptx.AppendLine($"    @%p6 bra SKIP_CAUSAL_TILE_{tile};");
             }
             EmitScoreTile(ptx, currentK, tile, isCausal, scaleHex);
@@ -398,7 +518,7 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
             if (isCausal)
                 ptx.AppendLine($"SKIP_CAUSAL_TILE_{tile}:");
 
-            if (tile + 1 < sequenceLength / KeyTileRows)
+            if (tile + 1 < keyValueTiles)
             {
                 ptx.AppendLine("    cp.async.wait_group 0;");
                 ptx.AppendLine("    bar.sync 0;");

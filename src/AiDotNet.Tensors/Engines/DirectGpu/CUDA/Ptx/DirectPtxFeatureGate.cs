@@ -17,29 +17,38 @@ internal static class DirectPtxFeatureGate
     internal const string AutotuneEnvironmentVariable = "AIDOTNET_DIRECT_PTX_AUTOTUNE";
     internal const string CacheCapacityEnvironmentVariable = "AIDOTNET_DIRECT_PTX_CACHE_CAPACITY";
 
+    // Feature configuration is a process-start contract. Snapshot it once so
+    // the resident launch path never allocates strings while re-reading the
+    // environment. Tests retain an explicit dynamic override below.
+    private static readonly bool EnvironmentMasterEnabled = ReadEnabled(MasterEnvironmentVariable);
+    private static readonly bool EnvironmentAttentionEnabled = ReadEnabled(EnvironmentVariable);
+    private static readonly bool EnvironmentResidualRmsNormEnabled = ReadEnabled(ResidualRmsNormEnvironmentVariable);
+    private static readonly bool EnvironmentAutotuneEnabled =
+        !string.Equals(Environment.GetEnvironmentVariable(AutotuneEnvironmentVariable), "0", StringComparison.Ordinal);
+    private static readonly int EnvironmentCacheCapacity = ReadCacheCapacity();
+
     /// <summary>Test-only override. Null restores environment-based behavior.</summary>
     internal static bool? TestOverride { get; set; }
 
     internal static bool IsEnabled => IsAttentionEnabled;
 
     internal static bool IsAttentionEnabled => TestOverride ??
-        (string.Equals(Environment.GetEnvironmentVariable(MasterEnvironmentVariable), "1", StringComparison.Ordinal) ||
-         string.Equals(Environment.GetEnvironmentVariable(EnvironmentVariable), "1", StringComparison.Ordinal));
+        (EnvironmentMasterEnabled || EnvironmentAttentionEnabled);
 
     internal static bool IsResidualRmsNormEnabled => TestOverride ??
-        (string.Equals(Environment.GetEnvironmentVariable(MasterEnvironmentVariable), "1", StringComparison.Ordinal) ||
-         string.Equals(Environment.GetEnvironmentVariable(ResidualRmsNormEnvironmentVariable), "1", StringComparison.Ordinal));
+        (EnvironmentMasterEnabled || EnvironmentResidualRmsNormEnabled);
 
-    internal static bool IsAutotuneEnabled =>
-        !string.Equals(Environment.GetEnvironmentVariable(AutotuneEnvironmentVariable), "0", StringComparison.Ordinal);
+    internal static bool IsAutotuneEnabled => EnvironmentAutotuneEnabled;
 
-    internal static int CacheCapacity
+    internal static int CacheCapacity => EnvironmentCacheCapacity;
+
+    private static bool ReadEnabled(string variable) =>
+        string.Equals(Environment.GetEnvironmentVariable(variable), "1", StringComparison.Ordinal);
+
+    private static int ReadCacheCapacity()
     {
-        get
-        {
-            string? text = Environment.GetEnvironmentVariable(CacheCapacityEnvironmentVariable);
-            return int.TryParse(text, out int value) && value is >= 4 and <= 256 ? value : 32;
-        }
+        string? text = Environment.GetEnvironmentVariable(CacheCapacityEnvironmentVariable);
+        return int.TryParse(text, out int value) && value is >= 4 and <= 256 ? value : 32;
     }
 }
 

@@ -5,6 +5,7 @@ internal enum DirectPtxAttentionMaskKind
 {
     None,
     CausalTopLeft,
+    CausalBottomRight,
     AdditiveBias,
     Padding,
     SlidingWindow,
@@ -57,15 +58,17 @@ internal static class DirectPtxAttentionEligibility
             return DirectPtxEligibilityResult.Reject("layout-not-dense-bhsd");
         if (request.Batch <= 0 || request.QueryHeads <= 0 || request.KeyValueHeads <= 0)
             return DirectPtxEligibilityResult.Reject("invalid-batch-or-head-count");
-        if (request.QueryHeads != request.KeyValueHeads)
-            return DirectPtxEligibilityResult.Reject("gqa-mqa-not-implemented");
-        if (request.QuerySequence != request.KeyValueSequence)
-            return DirectPtxEligibilityResult.Reject("non-square-attention-not-implemented");
+        if (request.QueryHeads % request.KeyValueHeads != 0)
+            return DirectPtxEligibilityResult.Reject("query-heads-not-divisible-by-kv-heads");
         if (request.QuerySequence is not (16 or 32 or 64 or 128))
-            return DirectPtxEligibilityResult.Reject("sequence-bucket-not-implemented");
+            return DirectPtxEligibilityResult.Reject("query-sequence-bucket-not-implemented");
+        if (request.KeyValueSequence is not (16 or 32 or 64 or 128))
+            return DirectPtxEligibilityResult.Reject("kv-sequence-bucket-not-implemented");
         if (request.HeadDimension != PtxOnlineFusedAttention128x64Kernel.HeadDimension)
             return DirectPtxEligibilityResult.Reject("head-dimension-not-64");
-        if (request.Mask is not (DirectPtxAttentionMaskKind.None or DirectPtxAttentionMaskKind.CausalTopLeft))
+        if (request.Mask is not (DirectPtxAttentionMaskKind.None or
+            DirectPtxAttentionMaskKind.CausalTopLeft or
+            DirectPtxAttentionMaskKind.CausalBottomRight))
             return DirectPtxEligibilityResult.Reject("mask-kind-not-implemented");
         if (request.Phase != DirectPtxAttentionPhase.Inference)
             return DirectPtxEligibilityResult.Reject("training-or-backward-not-implemented");
