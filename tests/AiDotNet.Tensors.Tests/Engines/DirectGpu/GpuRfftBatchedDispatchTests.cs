@@ -21,6 +21,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 ///
 /// The GPU engine is constructed DIRECTLY rather than via auto-detect, which vetoes adoption.
 /// </summary>
+[Collection("DirectGpuSerial")]
 public class GpuRfftBatchedDispatchTests : IDisposable
 {
     private readonly ITestOutputHelper _out;
@@ -74,19 +75,19 @@ public class GpuRfftBatchedDispatchTests : IDisposable
     /// NON-power-of-two length (192) that forces the zero-pad-to-nFft branch, which is where the strided
     /// CopyRows padding could go wrong.
     /// </summary>
-    [Theory]
+    [SkippableTheory]
     [InlineData(1, 128)]
     [InlineData(8, 128)]
     [InlineData(64, 192)]
     [InlineData(256, 256)]
     public void Gpu_rfft_matches_cpu(int batch, int n)
     {
-        Assert.True(TryGpu(out var gpu) && gpu is not null,
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null,
             "GPU backend did not resolve, so this test would have silently exercised the CPU path. " +
             "Copy the CUDA natives (cublas64_12, cublasLt64_12, cudart64_12, nvrtc64_120_0, " +
             "nvrtc64_120_0.alt, nvrtc-builtins64_126) into the test output directory after every build.");
 
-        using (gpu)
+        using (gpu!)
         {
             var x = Signal(batch, n, seed: 11);
 
@@ -139,13 +140,13 @@ public class GpuRfftBatchedDispatchTests : IDisposable
     /// This asserts the gradient, not just that the forward ran: a tape node that records the wrong
     /// backward, or a deferred GPU result the tape cannot resolve, would still produce a correct forward.
     /// </remarks>
-    [Fact]
+    [SkippableFact]
     public void Gpu_rfft_gradients_match_cpu_with_tape_active()
     {
-        Assert.True(TryGpu(out var gpu) && gpu is not null,
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null,
             "GPU backend did not resolve — see Gpu_rfft_matches_cpu for the natives this needs.");
 
-        using (gpu)
+        using (gpu!)
         {
             const int batch = 8, n = 128;
             var x = Signal(batch, n, seed: 17);
@@ -196,15 +197,15 @@ public class GpuRfftBatchedDispatchTests : IDisposable
     /// catches a de-interleave that mirrors the interleave's own mistake — both halves being consistently
     /// wrong would still pass a one-way comparison against a differently-laid-out reference.
     /// </summary>
-    [Theory]
+    [SkippableTheory]
     [InlineData(8, 128)]
     [InlineData(64, 256)]
     public void Gpu_rfft_irfft_roundtrip_recovers_input(int batch, int n)
     {
-        Assert.True(TryGpu(out var gpu) && gpu is not null,
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null,
             "GPU backend did not resolve — see Gpu_rfft_matches_cpu for the natives this needs.");
 
-        using (gpu)
+        using (gpu!)
         {
             var x = Signal(batch, n, seed: 13);
 
