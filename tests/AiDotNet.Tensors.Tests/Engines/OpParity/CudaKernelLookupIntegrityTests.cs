@@ -66,9 +66,6 @@ public sealed class CudaKernelLookupIntegrityTests
     // RATCHETS DOWN ONLY. Define or correctly repoint a kernel and remove its entry. Never add one.
     private static readonly HashSet<string> KnownDangling = new(StringComparer.Ordinal)
     {
-        "csr_segmented_max",
-        "csr_segmented_min",
-        "csr_segmented_stddev",
     };
 
     private static string RepoRoot()
