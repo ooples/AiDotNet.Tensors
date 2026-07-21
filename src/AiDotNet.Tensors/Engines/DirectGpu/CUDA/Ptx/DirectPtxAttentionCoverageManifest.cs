@@ -70,16 +70,16 @@ internal static class DirectPtxAttentionCoverageManifest
             "v1 block-table D64 FP32 MHA decode for S=16/32/64/128 and block size 16/32"),
         new("PagedAttentionPrefill", "paged_attention_prefill (NVRTC)",
             "causal prefill with absolute start position; MHA", "block-table paged KV", "FP32",
-            DirectPtxAttentionCoverageStatus.PlannedDirectPtx,
-            "paged prefill direct-PTX family"),
+            DirectPtxAttentionCoverageStatus.ExperimentalDirectPtx,
+            "v1 register-online D64 FP32 MHA prefill for Q=2/4/8/16/32, max key length <=128, block size 16/32"),
         new("PagedAttentionDecodeGqa", "paged_attention_decode_gqa (NVRTC)",
             "single-token paged decode; GQA/MQA", "block-table paged KV", "FP32",
             DirectPtxAttentionCoverageStatus.ExperimentalDirectPtx,
             "v1 block-table D64 FP32 GQA/MQA decode for S=16/32/64/128 and block size 16/32"),
         new("PagedAttentionPrefillGqa", "paged_attention_prefill_gqa (NVRTC)",
             "causal prefill with absolute start position; GQA/MQA", "block-table paged KV", "FP32",
-            DirectPtxAttentionCoverageStatus.PlannedDirectPtx,
-            "paged GQA/MQA prefill direct-PTX family")
+            DirectPtxAttentionCoverageStatus.ExperimentalDirectPtx,
+            "v1 register-online D64 FP32 GQA/MQA prefill for Q=2/4/8/16/32, max key length <=128, block size 16/32")
     ];
 
     internal static DirectPtxAttentionCoverageCell Get(string api)

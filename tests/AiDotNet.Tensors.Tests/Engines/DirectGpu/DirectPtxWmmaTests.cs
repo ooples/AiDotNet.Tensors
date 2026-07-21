@@ -792,6 +792,152 @@ public class DirectPtxWmmaTests
                 8, 6, false, 8, 2, 32, 0, 0, float.NaN));
     }
 
+    [Fact]
+    public void PagedPrefillEmitter_IsCausalWarpResidentAndStrideFree()
+    {
+        string ptx = PtxFusedPagedPrefillAttentionD64Kernel.EmitPtx(
+            8, 6, queryHeads: 8, keyValueHeads: 2,
+            queryCount: 4, startPosition: 12,
+            blockSize: 16, poolBlocks: 4, scale: 0.125f);
+        Assert.Contains(PtxFusedPagedPrefillAttentionD64Kernel.EntryPoint, ptx);
+        Assert.Contains("mov.u32 %r9, %ctaid.y", ptx);
+        Assert.Equal(16, Count(ptx, "setp.ge.u32 %p0"));
+        Assert.Equal(1, Count(ptx, "ld.global.u32 %r6"));
+        Assert.Contains("shfl.sync.bfly.b32", ptx);
+        Assert.Contains("st.global.v2.f32", ptx);
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxFusedPagedPrefillAttentionD64Kernel.EmitPtx(
+                8, 6, 8, 2, 3, 12, 16, 4, 0.125f));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxFusedPagedPrefillAttentionD64Kernel.EmitPtx(
+                8, 6, 8, 2, 32, 112, 16, 10, 0.125f));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxFusedPagedPrefillAttentionD64Kernel.EmitPtx(
+                8, 6, 8, 2, 4, 12, 8, 4, 0.125f));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyPagedPrefillD64_MatchesOracleAndHasZeroLocalBytes()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(runtime.ArchitectureFamily == DirectPtxArchitectureFamily.Ampere,
+            "The checked-in paged-prefill family is validated on Ampere.");
+        const int heads = 8, kvHeads = 2, queries = 4, start = 12;
+        const int dimension = 64, blockSize = 16, poolBlocks = 4;
+        var random = new Random(20260843);
+        float[] q = Enumerable.Range(0, queries * heads * dimension)
+            .Select(_ => (random.NextSingle() - 0.5f) * 0.5f).ToArray();
+        float[] k = Enumerable.Range(0, poolBlocks * blockSize * kvHeads * dimension)
+            .Select(_ => (random.NextSingle() - 0.5f) * 0.5f).ToArray();
+        float[] v = Enumerable.Range(0, poolBlocks * blockSize * kvHeads * dimension)
+            .Select(_ => (random.NextSingle() - 0.5f) * 0.5f).ToArray();
+        int[] table = [3];
+        using var kernel = new PtxFusedPagedPrefillAttentionD64Kernel(
+            runtime, heads, kvHeads, queries, start, blockSize, poolBlocks, 0.125f);
+        Assert.Equal(0, kernel.FunctionInfo.LocalBytesPerThread);
+        Assert.Equal(0, kernel.FunctionInfo.StaticSharedBytes);
+        Assert.True(kernel.Audit.ActiveBlocksPerMultiprocessor >= 8);
+        Assert.Equal(3, kernel.Blueprint.Tensors[0].LogicalExtent.Rank);
+        Assert.Equal(4, kernel.Blueprint.Tensors[1].LogicalExtent.Rank);
+        using var qDevice = runtime.AllocateBytes(kernel.QueryBytes);
+        using var kDevice = runtime.AllocateBytes(kernel.KeyValueBytes);
+        using var vDevice = runtime.AllocateBytes(kernel.KeyValueBytes);
+        using var tableDevice = runtime.AllocateBytes(kernel.BlockTableBytes);
+        using var outputDevice = runtime.AllocateBytes(kernel.OutputBytes);
+        qDevice.Upload<float>(q); kDevice.Upload<float>(k); vDevice.Upload<float>(v);
+        tableDevice.Upload<int>(table);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(qDevice, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(kDevice, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(vDevice, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(tableDevice, kernel.Blueprint.Tensors[3]),
+            DirectPtxTensorView.CreateOwned(outputDevice, kernel.Blueprint.Tensors[4]));
+        runtime.Synchronize();
+        var actual = new float[q.Length];
+        outputDevice.Download<float>(actual);
+        AssertDecodeClose(actual, PagedPrefillOracle(
+            q, k, v, table, heads, kvHeads, queries, start, blockSize, 0.125f));
+    }
+
+    [SkippableFact]
+    public void BackendPagedPrefillD64_IsZeroAllocationCapturableAndRoutesPublicGqa()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previous = DirectPtxFeatureGate.TestOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxPagedPrefillEnabled, "Requires an Ampere CUDA backend.");
+            const int heads = 8, kvHeads = 2, queries = 4, start = 12;
+            const int dimension = 64, blockSize = 16, poolBlocks = 4;
+            var random = new Random(20260844);
+            float[] qHost = Enumerable.Range(0, queries * heads * dimension)
+                .Select(_ => (random.NextSingle() - 0.5f) * 0.5f).ToArray();
+            float[] kHost = Enumerable.Range(0, poolBlocks * blockSize * kvHeads * dimension)
+                .Select(_ => (random.NextSingle() - 0.5f) * 0.5f).ToArray();
+            float[] vHost = Enumerable.Range(0, poolBlocks * blockSize * kvHeads * dimension)
+                .Select(_ => (random.NextSingle() - 0.5f) * 0.5f).ToArray();
+            int[] tableHost = [3];
+            using var q = backend.AllocateBuffer(qHost);
+            using var k = backend.AllocateBuffer(kHost);
+            using var v = backend.AllocateBuffer(vHost);
+            using var table = backend.AllocateIntBuffer(tableHost);
+            using var output = backend.AllocateBuffer(qHost.Length);
+            Assert.True(backend.PrewarmDirectPtxPagedPrefillD64(
+                heads, kvHeads, queries, start, blockSize, poolBlocks, 0.125f),
+                backend.DirectPtxLastError);
+            for (int i = 0; i < 8; i++)
+                Assert.True(backend.TryDirectPtxPagedPrefillD64(
+                    q, k, v, table, output, heads, kvHeads,
+                    queries, start, blockSize, 0.125f), backend.DirectPtxLastError);
+            backend.Synchronize();
+            long beforeAllocation = GC.GetAllocatedBytesForCurrentThread();
+            bool allLaunched = true;
+            for (int i = 0; i < 32; i++)
+                allLaunched &= backend.TryDirectPtxPagedPrefillD64(
+                    q, k, v, table, output, heads, kvHeads,
+                    queries, start, blockSize, 0.125f);
+            long allocated = GC.GetAllocatedBytesForCurrentThread() - beforeAllocation;
+            backend.Synchronize();
+            Assert.True(allLaunched, backend.DirectPtxLastError);
+            Assert.Equal(0, allocated);
+
+            bool captureLaunch = true;
+            IntPtr graph = backend.CaptureGraph(() =>
+                captureLaunch &= backend.TryDirectPtxPagedPrefillD64(
+                    q, k, v, table, output, heads, kvHeads,
+                    queries, start, blockSize, 0.125f));
+            Assert.True(captureLaunch, backend.DirectPtxLastError);
+            try { backend.LaunchCapturedGraph(graph); }
+            finally { backend.DestroyCapturedGraph(graph); }
+
+            long beforePublic = backend.DirectPtxPagedPrefillDispatchCount;
+            using IGpuBuffer publicOutput = backend.PagedAttentionPrefillGqa(
+                q, k, v, table, heads, kvHeads, dimension,
+                blockSize, queries, start, 0.125f);
+            Assert.Equal(beforePublic + 1, backend.DirectPtxPagedPrefillDispatchCount);
+            float[] expected = PagedPrefillOracle(
+                qHost, kHost, vHost, tableHost,
+                heads, kvHeads, queries, start, blockSize, 0.125f);
+            AssertDecodeClose(backend.DownloadBuffer(publicOutput), expected);
+            Assert.True(backend.TryGetDirectPtxPagedPrefillAudit(
+                heads, kvHeads, queries, start, blockSize, poolBlocks, 0.125f,
+                out DirectPtxKernelAudit audit));
+            Assert.Equal(0, audit.Function.LocalBytesPerThread);
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previous;
+        }
+    }
+
     [SkippableTheory]
     [InlineData(false)]
     [InlineData(true)]
@@ -1324,6 +1470,57 @@ public class DirectPtxWmmaTests
         for (int i = 0; i < actual.Length; i++)
             error = MathF.Max(error, MathF.Abs(actual[i] - expected[i]));
         Assert.True(error < 2e-5f, $"Direct PTX decode max error {error:G9}.");
+    }
+
+    private static float[] PagedPrefillOracle(
+        float[] query,
+        float[] key,
+        float[] value,
+        int[] blockTable,
+        int queryHeads,
+        int keyValueHeads,
+        int queryCount,
+        int startPosition,
+        int blockSize,
+        float scale)
+    {
+        const int dimension = 64;
+        var output = new float[query.Length];
+        var logits = new float[startPosition + queryCount];
+        int queriesPerKeyValue = queryHeads / keyValueHeads;
+        for (int queryIndex = 0; queryIndex < queryCount; queryIndex++)
+        for (int head = 0; head < queryHeads; head++)
+        {
+            int keyValueHead = head / queriesPerKeyValue;
+            int keyLength = startPosition + queryIndex + 1;
+            int queryBase = (queryIndex * queryHeads + head) * dimension;
+            float maximum = float.NegativeInfinity;
+            for (int token = 0; token < keyLength; token++)
+            {
+                int physicalToken = blockTable[token / blockSize] * blockSize + token % blockSize;
+                int keyBase = (physicalToken * keyValueHeads + keyValueHead) * dimension;
+                float dot = 0;
+                for (int d = 0; d < dimension; d++)
+                    dot += query[queryBase + d] * key[keyBase + d];
+                logits[token] = dot * scale;
+                maximum = MathF.Max(maximum, logits[token]);
+            }
+            float denominator = 0;
+            for (int token = 0; token < keyLength; token++)
+            {
+                logits[token] = MathF.Exp(logits[token] - maximum);
+                denominator += logits[token];
+            }
+            for (int token = 0; token < keyLength; token++)
+            {
+                int physicalToken = blockTable[token / blockSize] * blockSize + token % blockSize;
+                int valueBase = (physicalToken * keyValueHeads + keyValueHead) * dimension;
+                float probability = logits[token] / denominator;
+                for (int d = 0; d < dimension; d++)
+                    output[queryBase + d] += probability * value[valueBase + d];
+            }
+        }
+        return output;
     }
 
     private static (float OutputError, float StatsError) ValidateOnlineFamily(

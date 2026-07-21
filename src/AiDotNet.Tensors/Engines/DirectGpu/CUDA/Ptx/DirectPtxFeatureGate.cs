@@ -16,6 +16,7 @@ internal static class DirectPtxFeatureGate
     internal const string ResidualRmsNormEnvironmentVariable = "AIDOTNET_DIRECT_PTX_RESIDUAL_RMSNORM";
     internal const string FlashDecodeEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FLASH_DECODE";
     internal const string PagedDecodeEnvironmentVariable = "AIDOTNET_DIRECT_PTX_PAGED_DECODE";
+    internal const string PagedPrefillEnvironmentVariable = "AIDOTNET_DIRECT_PTX_PAGED_PREFILL";
     internal const string AutotuneEnvironmentVariable = "AIDOTNET_DIRECT_PTX_AUTOTUNE";
     internal const string CacheCapacityEnvironmentVariable = "AIDOTNET_DIRECT_PTX_CACHE_CAPACITY";
 
@@ -27,6 +28,7 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentResidualRmsNormEnabled = ReadEnabled(ResidualRmsNormEnvironmentVariable);
     private static readonly bool EnvironmentFlashDecodeEnabled = ReadEnabled(FlashDecodeEnvironmentVariable);
     private static readonly bool EnvironmentPagedDecodeEnabled = ReadEnabled(PagedDecodeEnvironmentVariable);
+    private static readonly bool EnvironmentPagedPrefillEnabled = ReadEnabled(PagedPrefillEnvironmentVariable);
     private static readonly bool EnvironmentAutotuneEnabled =
         !string.Equals(Environment.GetEnvironmentVariable(AutotuneEnvironmentVariable), "0", StringComparison.Ordinal);
     private static readonly int EnvironmentCacheCapacity = ReadCacheCapacity();
@@ -47,6 +49,9 @@ internal static class DirectPtxFeatureGate
 
     internal static bool IsPagedDecodeEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentPagedDecodeEnabled);
+
+    internal static bool IsPagedPrefillEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentPagedPrefillEnabled);
 
     internal static bool IsAutotuneEnabled => EnvironmentAutotuneEnabled;
 
