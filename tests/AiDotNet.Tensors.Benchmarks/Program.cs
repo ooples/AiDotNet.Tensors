@@ -72,6 +72,12 @@ class Program
             DirectPtxQkvRopeCacheExperiment.Run(runs);
             return;
         }
+        if (args.Length > 0 && args[0] == "--direct-ptx-fused-linear")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxFusedLinearExperiment.Run(runs);
+            return;
+        }
         if (args.Length > 0 && args[0] == "--direct-ptx-residual-rmsnorm")
         {
             DirectPtxResidualRmsNormExperiment.Run();
@@ -115,6 +121,11 @@ class Program
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-qkv-rope-cache")
         {
             DirectPtxProfileTarget.RunQkvRopeCache();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-fused-linear")
+        {
+            DirectPtxProfileTarget.RunFusedLinear();
             return;
         }
         if (args.Length > 1 && args[0] == "--direct-ptx-verify-ncu")
@@ -1063,6 +1074,7 @@ class Program
         Console.WriteLine("  --direct-ptx-paged-prefill [runs]: causal D64 paged-prefill release matrix");
         Console.WriteLine("  --direct-ptx-attention-backward [runs]: deterministic D64 backward release matrix");
         Console.WriteLine("  --direct-ptx-flash-attention-backward [runs]: D64 Flash recomputation-backward release matrix");
+        Console.WriteLine("  --direct-ptx-fused-linear [runs]: FP32 M=1 linear+bias+GELU championship matrix");
         Console.WriteLine("  --direct-ptx-residual-rmsnorm: second-blueprint fused residual + RMSNorm D64");
         Console.WriteLine("  --direct-ptx-external-gpu-baselines: forced cuDNN/Flash/Math/compiled Python GPU matrix");
         Console.WriteLine("  --direct-ptx-profile-attention: deterministic Nsight Compute attention target");
@@ -1071,6 +1083,7 @@ class Program
         Console.WriteLine("  --direct-ptx-profile-paged-prefill: deterministic Nsight Compute paged-prefill target");
         Console.WriteLine("  --direct-ptx-profile-attention-backward: deterministic Nsight Compute backward target");
         Console.WriteLine("  --direct-ptx-profile-flash-attention-backward: deterministic Nsight Flash-backward target");
+        Console.WriteLine("  --direct-ptx-profile-fused-linear: deterministic Nsight fused-linear target");
         Console.WriteLine("  --direct-ptx-verify-ncu <csv>: enforce zero executed spill/local-memory counters");
         Console.WriteLine("  --cublas   : Run cuBLAS vs DirectGpu GEMM benchmark");
         Console.WriteLine("  --opencl   : Run OpenCL GEMM benchmark (AMD/Intel GPUs)");

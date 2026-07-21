@@ -9850,6 +9850,36 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    /// <summary>
+    /// Applies a decode-token linear layer whose resident FP32 weights use the
+    /// canonical output-major <c>[outFeatures,inFeatures]</c> physical layout,
+    /// then adds bias and applies tanh-GELU. The admitted direct-PTX path keeps
+    /// both the accumulator and activation in registers and writes output once.
+    /// </summary>
+    public void FusedLinearGELUTransposedM1(
+        IGpuBuffer input,
+        IGpuBuffer outputMajorWeight,
+        IGpuBuffer bias,
+        IGpuBuffer output,
+        int inFeatures,
+        int outFeatures)
+    {
+        if (inFeatures <= 0) throw new ArgumentOutOfRangeException(nameof(inFeatures));
+        if (outFeatures <= 0) throw new ArgumentOutOfRangeException(nameof(outFeatures));
+        if (input.Size < inFeatures ||
+            outputMajorWeight.Size < checked(inFeatures * outFeatures) ||
+            bias.Size < outFeatures || output.Size < outFeatures)
+            throw new ArgumentException("Fused-linear buffers are smaller than the requested canonical extents.");
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxFusedLinearGeluM1(
+            input, outputMajorWeight, bias, output, inFeatures, outFeatures))
+            return;
+#endif
+        MatMulTransposed(input, outputMajorWeight, output, 1, outFeatures, inFeatures);
+        BiasAdd(output, bias, output, 1, outFeatures);
+        Gelu(output, output, outFeatures);
+    }
+
     public unsafe void FusedLinearSwish(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output,
         int batchSize, int inFeatures, int outFeatures)
     {

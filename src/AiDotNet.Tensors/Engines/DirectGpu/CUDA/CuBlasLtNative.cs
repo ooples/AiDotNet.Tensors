@@ -106,8 +106,8 @@ public enum CublasLtMatmulDescAttributes
 {
     TransA = 3,
     TransB = 4,
-    Epilogue = 23,
-    EpilogueBiasPointer = 10,
+    Epilogue = 7,
+    EpilogueBiasPointer = 8,
 }
 
 /// <summary>
