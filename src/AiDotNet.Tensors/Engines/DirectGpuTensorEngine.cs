@@ -10140,8 +10140,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // stream-capture safe. Captured graphs keep the established
             // resident NVRTC path until a PTX prewarm/capture API is added.
             && !directCuda.IsStreamCapturing()
-            && seqQ == seqK
             && PtxOnlineFusedAttention128x64Kernel.IsSupportedSequenceLength(seqQ)
+            && PtxOnlineFusedAttention128x64Kernel.IsSupportedSequenceLength(seqK)
             && headDim == PtxOnlineFusedAttention128x64Kernel.HeadDimension
             && key.Shape._dims[0] == batch && value.Shape._dims[0] == batch
             && key.Shape._dims[1] == heads && value.Shape._dims[1] == heads
@@ -10159,17 +10159,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             bool directHanded = false;
             try
             {
-                int inputElements = batch * heads * seqQ * headDim;
+                int queryElements = batch * heads * seqQ * headDim;
+                int keyValueElements = batch * heads * seqK * headDim;
                 IGpuBuffer queryHalf = ResolveToFp16(
-                    query, inputElements, directCuda, backend, out queryHalfOwned);
+                    query, queryElements, directCuda, backend, out queryHalfOwned);
                 IGpuBuffer keyHalf = ResolveToFp16(
-                    key, inputElements, directCuda, backend, out keyHalfOwned);
+                    key, keyValueElements, directCuda, backend, out keyHalfOwned);
                 IGpuBuffer valueHalf = ResolveToFp16(
-                    value, inputElements, directCuda, backend, out valueHalfOwned);
-                if (directCuda.TryDirectPtxOnlineAttention(
+                    value, keyValueElements, directCuda, backend, out valueHalfOwned);
+                if (directCuda.TryDirectPtxOnlineAttentionFamily(
                     queryHalf, keyHalf, valueHalf,
                     directOutput.Buffer, directStats.Buffer,
-                    batch * heads, scaleFloat, isCausal, seqQ))
+                    batch, heads, heads, seqQ, seqK, scaleFloat, isCausal))
                 {
                     var directResult = DeferTensorResult<T>(
                         backend, directOutput.Buffer,
@@ -10547,6 +10548,69 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int kvHeads = key.Shape._dims[1];
         if (kvHeads <= 0 || heads % kvHeads != 0)
             throw new ArgumentException("Query heads must be a positive integer multiple of key/value heads.");
+        if (key.Shape._dims[0] != batch || value.Shape._dims[0] != batch
+            || value.Shape._dims[1] != kvHeads || value.Shape._dims[2] != seqK
+            || key.Shape._dims[3] != headDim || value.Shape._dims[3] != headDim)
+            throw new ArgumentException("Query, key, and value batch/KV/head dimensions must agree.");
+
+#if NET5_0_OR_GREATER
+        // Weight-free inference can use the same online PTX family as FlashAttention,
+        // including GQA/MQA. Physical FP16 conversion and dense-BHSD proof happen
+        // once at this boundary; the emitted kernel receives only canonical pointers.
+        if (typeof(T) == typeof(float) && softcap == 0
+            && backend is Engines.DirectGpu.CUDA.CudaBackend directCuda
+            && directCuda.IsDirectPtxAttentionEnabled && !directCuda.IsStreamCapturing()
+            && seqQ is 16 or 32 or 64 or 128
+            && seqK is 16 or 32 or 64 or 128 && headDim == 64
+            && query.IsContiguous && key.IsContiguous && value.IsContiguous
+            && !query.IsSparse && !key.IsSparse && !value.IsSparse
+            && query._storageOffset == 0 && key._storageOffset == 0 && value._storageOffset == 0
+            && query._storage.Length == query.Length
+            && key._storage.Length == key.Length
+            && value._storage.Length == value.Length)
+        {
+            IGpuBuffer? queryHalfOwned = null;
+            IGpuBuffer? keyHalfOwned = null;
+            IGpuBuffer? valueHalfOwned = null;
+            IGpuBuffer? directOutput = null;
+            try
+            {
+                int queryElements = checked(batch * heads * seqQ * headDim);
+                int keyValueElements = checked(batch * kvHeads * seqK * headDim);
+                IGpuBuffer queryHalf = ResolveToFp16(
+                    query, queryElements, directCuda, backend, out queryHalfOwned);
+                IGpuBuffer keyHalf = ResolveToFp16(
+                    key, keyValueElements, directCuda, backend, out keyHalfOwned);
+                IGpuBuffer valueHalf = ResolveToFp16(
+                    value, keyValueElements, directCuda, backend, out valueHalfOwned);
+                directOutput = backend.AllocateBuffer(queryElements);
+                if (directCuda.TryDirectPtxOnlineAttentionFamily(
+                    queryHalf, keyHalf, valueHalf, directOutput, null,
+                    batch, heads, kvHeads, seqQ, seqK, (float)scale, isCausal,
+                    emitSoftmaxStats: false,
+                    causalQueryOffset: isCausal ? seqK - seqQ : 0))
+                {
+                    IGpuBuffer resultBuffer = directOutput;
+                    directOutput = null;
+                    return Tensor<T>.FromGpuBuffer(
+                        backend, resultBuffer, new[] { batch, heads, seqQ, headDim },
+                        GpuTensorRole.Activation, ownsBuffer: true);
+                }
+                AliasDiag($"ScaledDotProductAttentionGpu direct-PTX FELLBACK: {directCuda.DirectPtxLastError ?? "specialization unavailable"}");
+            }
+            catch (Exception ptxEx)
+            {
+                AliasDiag($"ScaledDotProductAttentionGpu direct-PTX FELLBACK: {ptxEx.GetType().Name}: {ptxEx.Message}");
+            }
+            finally
+            {
+                queryHalfOwned?.Dispose();
+                keyHalfOwned?.Dispose();
+                valueHalfOwned?.Dispose();
+                directOutput?.Dispose();
+            }
+        }
+#endif
 
         // The kernel indexes Q/K/V as flat row-major [batch, heads, seq, headDim]; a permuted view (e.g. the
         // [0,2,1,3] transpose that produced the per-head layout) must be materialized contiguous first, and a

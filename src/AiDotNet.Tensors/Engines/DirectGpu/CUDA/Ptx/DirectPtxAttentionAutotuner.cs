@@ -21,9 +21,13 @@ internal static class DirectPtxAttentionAutotuner
 
     internal static bool TryLoad(
         DirectPtxRuntime runtime,
-        int batchHeads,
-        int sequenceLength,
+        int batch,
+        int queryHeads,
+        int keyValueHeads,
+        int querySequence,
+        int keyValueSequence,
         bool isCausal,
+        int causalQueryOffset,
         bool fused,
         bool emitStats,
         float scale,
@@ -31,11 +35,13 @@ internal static class DirectPtxAttentionAutotuner
         out int warps)
     {
         KernelChoice? choice = AutotuneCache.Lookup(
-            KernelId(runtime), Shape(batchHeads, sequenceLength, isCausal, fused, emitStats, scale, epsilon));
+            KernelId(runtime), Shape(
+                batch, queryHeads, keyValueHeads, querySequence, keyValueSequence,
+                isCausal, causalQueryOffset, fused, emitStats, scale, epsilon));
         if (choice?.Variant?.StartsWith(VariantPrefix, StringComparison.Ordinal) == true &&
             int.TryParse(choice.Variant.AsSpan(VariantPrefix.Length), NumberStyles.None,
                 CultureInfo.InvariantCulture, out int parsed) &&
-            Array.IndexOf(Candidates(sequenceLength), parsed) >= 0)
+            Array.IndexOf(Candidates(querySequence), parsed) >= 0)
         {
             warps = parsed;
             return true;
@@ -46,9 +52,13 @@ internal static class DirectPtxAttentionAutotuner
 
     internal static void Store(
         DirectPtxRuntime runtime,
-        int batchHeads,
-        int sequenceLength,
+        int batch,
+        int queryHeads,
+        int keyValueHeads,
+        int querySequence,
+        int keyValueSequence,
         bool isCausal,
+        int causalQueryOffset,
         bool fused,
         bool emitStats,
         float scale,
@@ -61,7 +71,8 @@ internal static class DirectPtxAttentionAutotuner
         {
             AutotuneCache.Store(
                 KernelId(runtime),
-                Shape(batchHeads, sequenceLength, isCausal, fused, emitStats, scale, epsilon),
+                Shape(batch, queryHeads, keyValueHeads, querySequence, keyValueSequence,
+                    isCausal, causalQueryOffset, fused, emitStats, scale, epsilon),
                 new KernelChoice
                 {
                     Variant = VariantPrefix + warps.ToString(CultureInfo.InvariantCulture),
@@ -85,18 +96,24 @@ internal static class DirectPtxAttentionAutotuner
     }
 
     private static KernelId KernelId(DirectPtxRuntime runtime) =>
-        new("direct-ptx-sdpa", $"online-attention-v2-{runtime.DeviceFingerprint}");
+        new("direct-ptx-sdpa", $"online-attention-v3-{runtime.DeviceFingerprint}");
 
     private static ShapeProfile Shape(
-        int batchHeads,
-        int sequenceLength,
+        int batch,
+        int queryHeads,
+        int keyValueHeads,
+        int querySequence,
+        int keyValueSequence,
         bool isCausal,
+        int causalQueryOffset,
         bool fused,
         bool emitStats,
         float scale,
         float epsilon) =>
-        new(batchHeads, sequenceLength, PtxOnlineFusedAttention128x64Kernel.HeadDimension,
-            isCausal ? 1 : 0, fused ? 1 : 0, emitStats ? 1 : 0,
+        new(batch, queryHeads, keyValueHeads, querySequence, keyValueSequence,
+            PtxOnlineFusedAttention128x64Kernel.HeadDimension,
+            isCausal ? 1 : 0, causalQueryOffset,
+            fused ? 1 : 0, emitStats ? 1 : 0,
             BitConverter.SingleToInt32Bits(scale), BitConverter.SingleToInt32Bits(epsilon));
 }
 #endif

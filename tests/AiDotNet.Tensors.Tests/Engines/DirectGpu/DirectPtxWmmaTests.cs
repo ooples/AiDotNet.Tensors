@@ -274,6 +274,40 @@ public class DirectPtxWmmaTests
     }
 
     [Fact]
+    public void OnlineFamilyEmitter_BakesRectangularGqaMappingWithoutStrideParameters()
+    {
+        string ptx = PtxOnlineFusedAttention128x64Kernel.EmitFamilyPtx(
+            8, 6, queryHeads: 8, keyValueHeads: 2,
+            isCausal: false, fuseLayerNormGelu: false,
+            scale: 0.125f, epsilon: 1e-5f,
+            querySequence: 32, keyValueSequence: 128,
+            emitSoftmaxStats: true, warpsPerBlock: 2);
+
+        Assert.Contains("div.u32 %r24, %r2, 8", ptx);
+        Assert.Contains("div.u32 %r25, %r25, 4", ptx);
+        Assert.Contains("mad.lo.u32 %r26, %r24, 2, %r25", ptx);
+        Assert.Contains("// ---- online K/V tile 7 ----", ptx);
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void OnlineFamilyEmitter_BakesBottomRightCausalOffsetWithoutRuntimeParameters()
+    {
+        string ptx = PtxOnlineFusedAttention128x64Kernel.EmitFamilyPtx(
+            8, 6, queryHeads: 8, keyValueHeads: 2,
+            isCausal: true, fuseLayerNormGelu: false,
+            scale: 0.125f, epsilon: 1e-5f,
+            querySequence: 32, keyValueSequence: 64,
+            emitSoftmaxStats: false, warpsPerBlock: 2,
+            causalQueryOffset: 32);
+
+        Assert.Contains("add.u32 %r8, %r8, 32", ptx);
+        Assert.Contains("add.u32 %r27, %r1, 2", ptx);
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void CanonicalPhysicalView_RejectsBadExtentAlignmentAndDtypeExtent()
     {
         using var aligned = new SyntheticGpuBuffer((IntPtr)0x1000, 1024);
@@ -370,6 +404,78 @@ public class DirectPtxWmmaTests
             $"Online PTX max abs error {maxError:G9}.");
     }
 
+    [SkippableTheory]
+    [InlineData(2, 4, 2, 32, 64, false, 0)]
+    [InlineData(2, 8, 1, 32, 64, true, 0)]
+    [InlineData(2, 8, 2, 32, 64, true, 32)]
+    [InlineData(1, 4, 4, 128, 32, true, 0)]
+    public void DriverOnlyOnlineAttentionFamily_MatchesRectangularGqaOracleAndHasZeroLocalBytes(
+        int batch, int queryHeads, int keyValueHeads,
+        int querySequence, int keyValueSequence, bool isCausal, int causalQueryOffset)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        const int dimension = 64;
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(runtime.ArchitectureFamily == DirectPtxArchitectureFamily.Ampere,
+            "The checked-in v3 attention family is validated on Ampere.");
+        using var current = runtime.Enter();
+        using var kernel = new PtxOnlineFusedAttention128x64Kernel(
+            runtime, batch, queryHeads, keyValueHeads, querySequence, keyValueSequence,
+            isCausal, false, 0.125f, 1e-5f, emitSoftmaxStats: true,
+            causalQueryOffset: causalQueryOffset);
+        Assert.Equal(0, kernel.FunctionInfo.LocalBytesPerThread);
+        Assert.Equal((long)batch * queryHeads * querySequence * dimension * sizeof(float),
+            (long)kernel.OutputBytes);
+        Assert.Equal((long)batch * keyValueHeads * keyValueSequence * dimension * sizeof(ushort),
+            (long)kernel.KBytes);
+
+        using var qDevice = runtime.AllocateBytes(kernel.QBytes);
+        using var kDevice = runtime.AllocateBytes(kernel.KBytes);
+        using var vDevice = runtime.AllocateBytes(kernel.VBytes);
+        using var outputDevice = runtime.AllocateBytes(kernel.OutputBytes);
+        using var statsDevice = runtime.AllocateBytes(kernel.StatsBytes);
+        var random = new Random(
+            20260800 + batch * 1000 + queryHeads * 100 + keyValueHeads * 10 +
+            querySequence + keyValueSequence + (isCausal ? 1 : 0));
+        ushort[] q = RandomHalfRange(
+            random, batch * queryHeads * querySequence * dimension, 0.25f);
+        ushort[] k = RandomHalfRange(
+            random, batch * keyValueHeads * keyValueSequence * dimension, 0.25f);
+        ushort[] v = RandomHalfRange(
+            random, batch * keyValueHeads * keyValueSequence * dimension, 0.25f);
+        qDevice.Upload<ushort>(q);
+        kDevice.Upload<ushort>(k);
+        vDevice.Upload<ushort>(v);
+
+        DirectPtxTensorView qView = DirectPtxTensorView.CreateOwned(qDevice, kernel.Blueprint.Tensors[0]);
+        DirectPtxTensorView kView = DirectPtxTensorView.CreateOwned(kDevice, kernel.Blueprint.Tensors[1]);
+        DirectPtxTensorView vView = DirectPtxTensorView.CreateOwned(vDevice, kernel.Blueprint.Tensors[2]);
+        DirectPtxTensorView outputView = DirectPtxTensorView.CreateOwned(outputDevice, kernel.Blueprint.Tensors[5]);
+        DirectPtxTensorView statsView = DirectPtxTensorView.CreateOwned(statsDevice, kernel.Blueprint.Tensors[6]);
+        kernel.Launch(qView, kView, vView, default, default, outputView, statsView);
+        runtime.Synchronize();
+        long launchBefore = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < 32; i++)
+            kernel.Launch(qView, kView, vView, default, default, outputView, statsView);
+        long launchAllocated = GC.GetAllocatedBytesForCurrentThread() - launchBefore;
+        runtime.Synchronize();
+        Assert.True(launchAllocated == 0, $"raw module launch allocated {launchAllocated} bytes");
+        var actual = new float[batch * queryHeads * querySequence * dimension];
+        var actualStats = new float[batch * queryHeads * querySequence];
+        outputDevice.Download<float>(actual);
+        statsDevice.Download<float>(actualStats);
+
+        (float outputError, float statsError) = ValidateOnlineFamily(
+            actual, actualStats, q, k, v, batch, queryHeads, keyValueHeads,
+            querySequence, keyValueSequence, isCausal, causalQueryOffset);
+        Assert.True(outputError <= 0.012f,
+            $"Rectangular GQA PTX max output error {outputError:G9}.");
+        Assert.True(statsError <= 0.02f,
+            $"Rectangular GQA PTX max LSE error {statsError:G9}.");
+        Assert.Contains(queryHeads == keyValueHeads ? "mha" : keyValueHeads == 1 ? "mqa" : "gqa",
+            kernel.Blueprint.Semantics["head-mapping"]);
+    }
+
     [SkippableFact]
     public void CudaBackend_OptInUsesBorrowedContextAndCarriesZeroSpillAudit()
     {
@@ -406,7 +512,7 @@ public class DirectPtxWmmaTests
             Assert.True(backend.TryGetDirectPtxAttentionKernelAudit(
                 1, 0.125f, false, false, 1e-5f, 128,
                 out DirectPtxKernelAudit audit));
-            Assert.Contains("online-attention-d64-v2-Ampere-q16-k16-w", audit.BlueprintId);
+            Assert.Contains("online-attention-d64-v3-Ampere-q16-k16-w", audit.BlueprintId);
             Assert.Equal(64, audit.PtxSha256.Length);
         }
         finally
@@ -534,10 +640,14 @@ public class DirectPtxWmmaTests
 
         Assert.Equal("dtype-not-fp16", DirectPtxAttentionEligibility.Evaluate(
             supported with { InputType = DirectPtxPhysicalType.BFloat16 }).Reason);
-        Assert.Equal("non-square-attention-not-implemented", DirectPtxAttentionEligibility.Evaluate(
-            supported with { KeyValueSequence = 64 }).Reason);
-        Assert.Equal("gqa-mqa-not-implemented", DirectPtxAttentionEligibility.Evaluate(
-            supported with { KeyValueHeads = 2 }).Reason);
+        Assert.True(DirectPtxAttentionEligibility.Evaluate(
+            supported with { KeyValueSequence = 64, KeyValueHeads = 2 }).IsEligible);
+        Assert.Equal("query-heads-not-divisible-by-kv-heads", DirectPtxAttentionEligibility.Evaluate(
+            supported with { KeyValueHeads = 3 }).Reason);
+        Assert.Equal("query-sequence-bucket-not-implemented", DirectPtxAttentionEligibility.Evaluate(
+            supported with { QuerySequence = 48 }).Reason);
+        Assert.Equal("kv-sequence-bucket-not-implemented", DirectPtxAttentionEligibility.Evaluate(
+            supported with { KeyValueSequence = 48 }).Reason);
         Assert.Equal("mask-kind-not-implemented", DirectPtxAttentionEligibility.Evaluate(
             supported with { Mask = DirectPtxAttentionMaskKind.AdditiveBias }).Reason);
         Assert.Equal("dropout-not-implemented", DirectPtxAttentionEligibility.Evaluate(
@@ -548,6 +658,31 @@ public class DirectPtxWmmaTests
             supported with { IsRagged = true }).Reason);
         Assert.Equal("paged-kv-not-implemented", DirectPtxAttentionEligibility.Evaluate(
             supported with { UsesPagedKv = true }).Reason);
+    }
+
+    [Fact]
+    public void AttentionCoverageManifest_AssignsEveryScopedApiExactlyOnce()
+    {
+        string[] expected =
+        [
+            "ScaledDotProductAttention", "ScaledDotProductAttentionBackward",
+            "FlashAttention", "FlashAttentionV2", "FlashAttentionBackward",
+            "GroupedQueryAttention", "GroupedQueryAttentionBackward", "FlashDecode",
+            "PagedAttentionDecode", "PagedAttentionPrefill",
+            "PagedAttentionDecodeGqa", "PagedAttentionPrefillGqa"
+        ];
+        string[] actual = DirectPtxAttentionCoverageManifest.All
+            .Select(cell => cell.Api).OrderBy(name => name, StringComparer.Ordinal).ToArray();
+        Assert.Equal(
+            expected.OrderBy(name => name, StringComparer.Ordinal).ToArray(), actual);
+        Assert.Equal(actual.Length, actual.Distinct(StringComparer.Ordinal).Count());
+        Assert.All(DirectPtxAttentionCoverageManifest.All, cell =>
+        {
+            Assert.False(string.IsNullOrWhiteSpace(cell.ExistingCudaImplementation));
+            Assert.False(string.IsNullOrWhiteSpace(cell.DirectPtxAssignment));
+        });
+        Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() =>
+            DirectPtxAttentionCoverageManifest.Get("UnassignedAttentionApi"));
     }
 
     [Fact]
@@ -758,6 +893,143 @@ public class DirectPtxWmmaTests
         }
     }
 
+    [SkippableFact]
+    public void BackendAttentionFamily_PrewarmedRectangularMqaKernelIsCudaGraphCapturable()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previous = DirectPtxFeatureGate.TestOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxAttentionEnabled, "Requires an Ampere CUDA backend.");
+            const int batch = 1, queryHeads = 4, keyValueHeads = 1;
+            const int querySequence = 16, keyValueSequence = 32, dimension = 64;
+            int queryElements = batch * queryHeads * querySequence * dimension;
+            int keyValueElements = batch * keyValueHeads * keyValueSequence * dimension;
+            using var qFloat = backend.AllocateBuffer(Enumerable.Repeat(0.03125f, queryElements).ToArray());
+            using var kFloat = backend.AllocateBuffer(Enumerable.Repeat(0.015625f, keyValueElements).ToArray());
+            using var vFloat = backend.AllocateBuffer(Enumerable.Repeat(0.0625f, keyValueElements).ToArray());
+            using var q = backend.AllocateByteBuffer(queryElements * sizeof(ushort));
+            using var k = backend.AllocateByteBuffer(keyValueElements * sizeof(ushort));
+            using var v = backend.AllocateByteBuffer(keyValueElements * sizeof(ushort));
+            using var output = backend.AllocateBuffer(queryElements);
+            backend.ConvertToFp16Native(qFloat, q, queryElements);
+            backend.ConvertToFp16Native(kFloat, k, keyValueElements);
+            backend.ConvertToFp16Native(vFloat, v, keyValueElements);
+            Assert.True(backend.PrewarmDirectPtxAttentionFamily(
+                batch, queryHeads, keyValueHeads, querySequence, keyValueSequence,
+                false, false, 0.125f, emitSoftmaxStats: false),
+                backend.DirectPtxLastError);
+
+            for (int i = 0; i < 8; i++)
+                Assert.True(backend.TryDirectPtxOnlineAttentionFamily(
+                    q, k, v, output, null,
+                    batch, queryHeads, keyValueHeads, querySequence, keyValueSequence,
+                    0.125f, isCausal: false, emitSoftmaxStats: false));
+            backend.Synchronize();
+            long captureBefore = GC.GetAllocatedBytesForCurrentThread();
+            bool captureStatus = false;
+            for (int i = 0; i < 32; i++) captureStatus |= backend.IsStreamCapturing();
+            long captureAllocated = GC.GetAllocatedBytesForCurrentThread() - captureBefore;
+            Assert.False(captureStatus);
+            Assert.True(captureAllocated == 0, $"capture check allocated {captureAllocated} bytes");
+
+            long gateBefore = GC.GetAllocatedBytesForCurrentThread();
+            bool gateStatus = true;
+            for (int i = 0; i < 32; i++) gateStatus &= backend.IsDirectPtxAttentionEnabled;
+            long gateAllocated = GC.GetAllocatedBytesForCurrentThread() - gateBefore;
+            Assert.True(gateStatus);
+            Assert.True(gateAllocated == 0, $"feature gate allocated {gateAllocated} bytes");
+
+            long cacheBefore = GC.GetAllocatedBytesForCurrentThread();
+            bool cacheStatus = true;
+            for (int i = 0; i < 32; i++)
+                cacheStatus &= backend.TryGetDirectPtxAttentionKernelAuditFamily(
+                    batch, queryHeads, keyValueHeads, querySequence, keyValueSequence,
+                    0.125f, false, false, 1e-5f, false, 0, out _);
+            long cacheAllocated = GC.GetAllocatedBytesForCurrentThread() - cacheBefore;
+            Assert.True(cacheStatus);
+            Assert.True(cacheAllocated == 0, $"cache audit allocated {cacheAllocated} bytes");
+
+            var eligibilityRequest = new DirectPtxAttentionRequest(
+                DirectPtxArchitectureFamily.Ampere, DirectPtxPhysicalType.Float16,
+                DirectPtxPhysicalLayout.Bhsd, batch, queryHeads, keyValueHeads,
+                querySequence, keyValueSequence, 64, DirectPtxAttentionMaskKind.None,
+                DirectPtxAttentionPhase.Inference, 0, false, false);
+            long eligibilityBefore = GC.GetAllocatedBytesForCurrentThread();
+            bool eligibilityStatus = true;
+            for (int i = 0; i < 32; i++)
+                eligibilityStatus &= DirectPtxAttentionEligibility.Evaluate(eligibilityRequest).IsEligible;
+            long eligibilityAllocated = GC.GetAllocatedBytesForCurrentThread() - eligibilityBefore;
+            Assert.True(eligibilityStatus);
+            Assert.True(eligibilityAllocated == 0, $"eligibility allocated {eligibilityAllocated} bytes");
+
+            long contextBefore = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < 32; i++) backend.EnsureContextCurrent();
+            long contextAllocated = GC.GetAllocatedBytesForCurrentThread() - contextBefore;
+            Assert.True(contextAllocated == 0, $"context assertion allocated {contextAllocated} bytes");
+
+            var qContract = new DirectPtxTensorContract(
+                "q", DirectPtxPhysicalType.Float16, DirectPtxPhysicalLayout.Bhsd,
+                new DirectPtxExtent(batch, queryHeads, querySequence, 64),
+                new DirectPtxExtent(batch, queryHeads, querySequence, 64),
+                16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact);
+            var kContract = new DirectPtxTensorContract(
+                "k", DirectPtxPhysicalType.Float16, DirectPtxPhysicalLayout.Bhsd,
+                new DirectPtxExtent(batch, keyValueHeads, keyValueSequence, 64),
+                new DirectPtxExtent(batch, keyValueHeads, keyValueSequence, 64),
+                16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact);
+            var outputContract = new DirectPtxTensorContract(
+                "o", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Bhsd,
+                new DirectPtxExtent(batch, queryHeads, querySequence, 64),
+                new DirectPtxExtent(batch, queryHeads, querySequence, 64),
+                16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact);
+            long viewBefore = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < 32; i++)
+            {
+                _ = DirectPtxTensorView.Create(q, qContract);
+                _ = DirectPtxTensorView.Create(k, kContract);
+                _ = DirectPtxTensorView.Create(v, kContract);
+                _ = DirectPtxTensorView.Create(output, outputContract);
+            }
+            long viewAllocated = GC.GetAllocatedBytesForCurrentThread() - viewBefore;
+            Assert.True(viewAllocated == 0, $"physical views allocated {viewAllocated} bytes");
+
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            bool allLaunched = true;
+            for (int i = 0; i < 32; i++)
+                allLaunched &= backend.TryDirectPtxOnlineAttentionFamily(
+                    q, k, v, output, null,
+                    batch, queryHeads, keyValueHeads, querySequence, keyValueSequence,
+                    0.125f, isCausal: false, emitSoftmaxStats: false);
+            long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+            backend.Synchronize();
+            Assert.True(allLaunched, backend.DirectPtxLastError);
+            Assert.Equal(0, allocated);
+
+            IntPtr graph = backend.CaptureGraph(() =>
+                Assert.True(backend.TryDirectPtxOnlineAttentionFamily(
+                    q, k, v, output, null,
+                    batch, queryHeads, keyValueHeads, querySequence, keyValueSequence,
+                    0.125f, isCausal: false, emitSoftmaxStats: false), backend.DirectPtxLastError));
+            Assert.NotEqual(IntPtr.Zero, graph);
+            try
+            {
+                backend.LaunchCapturedGraph(graph);
+                Assert.All(backend.DownloadBuffer(output), value => Assert.True(float.IsFinite(value)));
+            }
+            finally
+            {
+                backend.DestroyCapturedGraph(graph);
+            }
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previous;
+        }
+    }
+
     private static ushort[] RandomHalfRange(Random random, int length, float magnitude)
     {
         var result = new ushort[length];
@@ -765,6 +1037,74 @@ public class DirectPtxWmmaTests
             result[i] = BitConverter.HalfToUInt16Bits(
                 (Half)((random.NextSingle() - 0.5f) * 2f * magnitude));
         return result;
+    }
+
+    private static (float OutputError, float StatsError) ValidateOnlineFamily(
+        float[] actual,
+        float[] actualStats,
+        ushort[] q,
+        ushort[] k,
+        ushort[] v,
+        int batch,
+        int queryHeads,
+        int keyValueHeads,
+        int querySequence,
+        int keyValueSequence,
+        bool causal,
+        int causalQueryOffset = 0)
+    {
+        const int dimension = 64;
+        const float scale = 0.125f;
+        int queriesPerKeyValue = queryHeads / keyValueHeads;
+        var scores = new float[keyValueSequence];
+        float maxOutputError = 0;
+        float maxStatsError = 0;
+        for (int b = 0; b < batch; b++)
+        for (int queryHead = 0; queryHead < queryHeads; queryHead++)
+        {
+            int keyValueHead = queryHead / queriesPerKeyValue;
+            int flatQueryHead = b * queryHeads + queryHead;
+            int flatKeyValueHead = b * keyValueHeads + keyValueHead;
+            for (int row = 0; row < querySequence; row++)
+            {
+                int lastKey = causal
+                    ? Math.Min(row + causalQueryOffset, keyValueSequence - 1)
+                    : keyValueSequence - 1;
+                float maximum = float.NegativeInfinity;
+                int queryBase = (flatQueryHead * querySequence + row) * dimension;
+                for (int column = 0; column <= lastKey; column++)
+                {
+                    int keyBase = (flatKeyValueHead * keyValueSequence + column) * dimension;
+                    float score = 0;
+                    for (int d = 0; d < dimension; d++)
+                        score += Half(q[queryBase + d]) * Half(k[keyBase + d]);
+                    scores[column] = score * scale;
+                    maximum = MathF.Max(maximum, scores[column]);
+                }
+
+                float sum = 0;
+                for (int column = 0; column <= lastKey; column++)
+                {
+                    scores[column] = MathF.Exp(scores[column] - maximum);
+                    sum += scores[column];
+                }
+                for (int d = 0; d < dimension; d++)
+                {
+                    float expected = 0;
+                    for (int column = 0; column <= lastKey; column++)
+                    {
+                        int valueBase = (flatKeyValueHead * keyValueSequence + column) * dimension;
+                        expected += scores[column] / sum * Half(v[valueBase + d]);
+                    }
+                    maxOutputError = MathF.Max(maxOutputError,
+                        MathF.Abs(actual[queryBase + d] - expected));
+                }
+                float expectedStats = maximum + MathF.Log(sum);
+                maxStatsError = MathF.Max(maxStatsError,
+                    MathF.Abs(actualStats[flatQueryHead * querySequence + row] - expectedStats));
+            }
+        }
+        return (maxOutputError, maxStatsError);
     }
 
     private static float ValidateOnlineFirstHead(

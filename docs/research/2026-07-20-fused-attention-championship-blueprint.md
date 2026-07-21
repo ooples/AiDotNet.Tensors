@@ -9,7 +9,8 @@ The forward-inference experiment is implemented end to end for NVIDIA SM80+
 and the declared shape family:
 
 ```text
-FP16 Q/K/V, dense BHSD, S in {16,32,64,128}, D=64
+FP16 Q/K/V, dense BHSD, Sq and Skv independently in {16,32,64,128}, D=64
+  -> MHA, GQA, or MQA with baked query-head-to-KV-head mapping
   -> scaled attention, unmasked or causal
   -> optional head-local LayerNorm(D=64) + affine + tanh-GELU
   -> FP32 BHSD output
@@ -31,6 +32,33 @@ therefore clears the competition gate; the attention-only saturation case
 remains an optimization lane rather than a robust universal win. These claims
 apply only to this GPU, dtype, shape family, and semantic contract—not other
 GPUs, dimensions, dropout, arbitrary masks, or backward.
+
+The issue-#834 v3 expansion generalizes the previously square/equal-head
+emitter to rectangular attention and shared KV heads. Its correctness and
+zero-local-memory tests are complete on the RTX 3080; its championship matrix
+is deliberately not inferred from the older square-MHA numbers below. Each new
+rectangular/GQA cell remains experimental until its own three-run performance
+and Nsight evidence passes the release gate.
+
+## Executable #834 coverage inventory
+
+`DirectPtxAttentionCoverageManifest` assigns every scoped entry point to an
+existing implementation and a direct-PTX work lane. A focused test fails on a
+missing or duplicate assignment.
+
+| API | Existing CUDA implementation | Direct-PTX assignment |
+|---|---|---|
+| ScaledDotProductAttention | `scaled_dot_product_attention` | v3 weight-free dense FP16 inference implemented; weights/masks/softcap planned |
+| ScaledDotProductAttentionBackward | GEMM + softmax-backward composition | recomputation backward planned |
+| FlashAttention / FlashAttentionV2 | `flash_attention_v2` | v3 rectangular dense FP16, LSE, no-bias route implemented |
+| FlashAttentionBackward | atomic and deterministic NVRTC variants | atomic/deterministic direct-PTX families planned |
+| GroupedQueryAttention | `grouped_query_attention` | v3 weight-free GQA/MQA inference implemented; weights mode planned |
+| GroupedQueryAttentionBackward | atomic and deterministic NVRTC variants | GQA/MQA recomputation backward planned |
+| FlashDecode | `flash_decode_partial` + `flash_decode_reduce` | contiguous decode family planned |
+| PagedAttention decode/prefill, MHA/GQA | four `paged_attention_*` kernels | paged physical-ABI families planned |
+
+The machine-readable manifest is authoritative; this compact table is its
+human-readable summary.
 
 ## Apples-to-apples contracts
 
@@ -277,8 +305,9 @@ attribute remains the available zero-spill admission proof for this capture.
 
 | Condition | Direct PTX behavior |
 |---|---|
-| S = 16, 32, 64, or 128; D=64 | Shape-specialized kernel |
-| Other S or D | Existing CUDA fallback; no semantic padding |
+| Sq and Skv independently = 16, 32, 64, or 128; D=64 | Shape-specialized kernel |
+| MHA / GQA / MQA with `Hq % Hkv == 0` | Baked batch/head mapping; no expanded K/V tensor |
+| Other Sq, Skv, D, or non-divisible head mapping | Existing CUDA fallback; no semantic padding |
 | Unmasked / causal | Separate compile-time specializations |
 | Arbitrary attention bias or padding mask | Fallback |
 | Dropout | Fallback |
@@ -289,6 +318,7 @@ attribute remains the available zero-spill admission proof for this capture.
 | CUDA graph capture | Backend direct launch is allowed only after explicit prewarm; the high-level route retains its resident NVRTC fallback because FP16 scratch/output materialization is not capture-safe yet |
 | Non-Ampere architecture | Gate disabled until a separately tuned Ada/Hopper/Blackwell family exists |
 | Driver JIT reports local bytes | Module rejected and fallback |
+| Rectangular causal | Separate baked domains: FlashAttentionV2 top-left (`offset=0`), SDPA bottom-right (`offset=Skv-Sq`); negative offsets remain fail-closed until fully-masked leading rows have a dedicated specialization |
 | Causal future K/V tile | Compute skipped per owning query warp |
 | Inference output-only | No score, probability, or LSE global store |
 | Training-forward / backward | Existing recorded CUDA implementation; direct PTX is inference-only |
@@ -353,7 +383,7 @@ copied into another one-off emitter.
 | Autotuned dispatch | Attention tries valid query-warp variants, persists the winner through the existing autotune cache, keys it by GPU UUID/SM/driver and semantics, and bounds loaded modules with an LRU | A clean production release run still requires three independent captures |
 | Stronger spill proof | Runtime admission enforces register/shared/local budgets and records PTX SHA-256, JIT attributes, occupancy, GPU fingerprint, and log; an Nsight CSV parser and deterministic profile target enforce executed spill/local counters | Nsight attached, but `ERR_NVGPUCTRPERM` blocks counter access until enabled by the host administrator |
 | Hardened performance gate | Policy requires >=1.10x median, bounded p95, zero hot managed/device temporary bytes, numerical tolerance, zero local bytes, and three independent runs | Windows display scheduling can hold an otherwise fast candidate |
-| Expanded correctness | Explicit eligibility reasons cover dtype, non-square Q/KV, D, GQA/MQA, mask, dropout, phase/backward, ragged and paged requests; unsupported cells fail closed | Those semantics remain implementation work, not silently advertised support |
+| Expanded correctness | Rectangular Sq/Skv and MHA/GQA/MQA are now admitted only for tested D64 FP16 buckets; explicit reasons still cover dtype, D, invalid head maps, mask, dropout, phase/backward, ragged and paged requests | BF16/FP32, masks, training/backward, ragged and paged semantics remain implementation work |
 | Real second fusion | `residual + RMSNorm(D=64)` is one warp-owned reduction/fusion using the same ABI, audit, gate, cache, graph-prewarm, tests, and benchmark framework | QKV projection/RoPE remains the next tensor-core fusion |
 | Architecture families | Ampere, Ada, Hopper, and Blackwell are distinct dispatch domains | Only Ampere SM86 was executed here; other families deliberately reject rather than inherit Ampere tuning |
 
