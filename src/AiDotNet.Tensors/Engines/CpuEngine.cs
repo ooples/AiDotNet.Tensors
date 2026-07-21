@@ -45317,8 +45317,48 @@ public partial class CpuEngine : ITensorLevelEngine
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeComplexFFT", input, input._shape, (eng, output) => { var r = eng.NativeComplexFFT(ci); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexFFT", input._shape); if (ac is not null) return ac.Execute(); }
 
-        var ops = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<Complex<T>>(input._shape);
+
+        // Blittable fast path: float/double + contiguous input. See the
+        // "Blittable FFT fast path" comment near NativeFFTInPlace for rationale.
+        if ((typeof(T) == typeof(double) || typeof(T) == typeof(float)) && input.IsContiguous)
+        {
+            var inSpan = input.AsSpan();
+            var outSpan = result.AsWritableSpan();
+            var scratch = RentFftBlittableScratch(2 * fftSize);
+            bool isDouble = typeof(T) == typeof(double);
+            for (int b = 0; b < batchCount; b++)
+            {
+                int offset = b * fftSize;
+                for (int i = 0; i < fftSize; i++)
+                {
+                    T v = inSpan[offset + i];
+                    scratch[2 * i] = isDouble
+                        ? System.Runtime.CompilerServices.Unsafe.As<T, double>(ref v)
+                        : (double)System.Runtime.CompilerServices.Unsafe.As<T, float>(ref v);
+                    scratch[2 * i + 1] = 0.0;
+                }
+                AiDotNet.Tensors.LinearAlgebra.Fft.FftKernels.IterativeRadix2NoCache(
+                    scratch.AsSpan(0, 2 * fftSize), fftSize, inverse: false);
+                for (int i = 0; i < fftSize; i++)
+                {
+                    if (isDouble)
+                    {
+                        var c = new Complex<double>(scratch[2 * i], scratch[2 * i + 1]);
+                        outSpan[offset + i] = System.Runtime.CompilerServices.Unsafe.As<Complex<double>, Complex<T>>(ref c);
+                    }
+                    else
+                    {
+                        var c = new Complex<float>((float)scratch[2 * i], (float)scratch[2 * i + 1]);
+                        outSpan[offset + i] = System.Runtime.CompilerServices.Unsafe.As<Complex<float>, Complex<T>>(ref c);
+                    }
+                }
+            }
+            { var ci = input; AutoTracer.RecordOp("NativeComplexFFT", result, eng => eng.NativeComplexFFT(ci)); }
+            return result;
+        }
+
+        var ops = MathHelper.GetNumericOperations<T>();
 
         // Transform along last axis, batch over leading dimensions
         var slice = new Complex<T>[fftSize];
@@ -46587,9 +46627,57 @@ public partial class CpuEngine : ITensorLevelEngine
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexIFFTReal", input, input._shape, (eng, output) => { var r = eng.NativeComplexIFFTReal(ci); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("NativeComplexIFFTReal", input._shape); if (ac is not null) return ac.Execute(); }
 
+        var result = new Tensor<T>(input._shape);
+
+        // Blittable fast path: float/double + contiguous input. Mirrors the
+        // NativeComplexFFT fast path (unnormalized inverse kernel, then /fftSize).
+        if ((typeof(T) == typeof(double) || typeof(T) == typeof(float)) && input.IsContiguous)
+        {
+            var inSpan = input.AsSpan();
+            var outSpan = result.AsWritableSpan();
+            var scratch = RentFftBlittableScratch(2 * fftSize);
+            bool isDouble = typeof(T) == typeof(double);
+            for (int b = 0; b < batchCount; b++)
+            {
+                int offset = b * fftSize;
+                for (int i = 0; i < fftSize; i++)
+                {
+                    Complex<T> cv = inSpan[offset + i];
+                    if (isDouble)
+                    {
+                        var cd = System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<double>>(ref cv);
+                        scratch[2 * i] = cd.Real;
+                        scratch[2 * i + 1] = cd.Imaginary;
+                    }
+                    else
+                    {
+                        var cf = System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<float>>(ref cv);
+                        scratch[2 * i] = cf.Real;
+                        scratch[2 * i + 1] = cf.Imaginary;
+                    }
+                }
+                AiDotNet.Tensors.LinearAlgebra.Fft.FftKernels.IterativeRadix2NoCache(
+                    scratch.AsSpan(0, 2 * fftSize), fftSize, inverse: true);
+                for (int i = 0; i < fftSize; i++)
+                {
+                    double re = scratch[2 * i] / fftSize;
+                    if (isDouble)
+                    {
+                        outSpan[offset + i] = System.Runtime.CompilerServices.Unsafe.As<double, T>(ref re);
+                    }
+                    else
+                    {
+                        float rf = (float)re;
+                        outSpan[offset + i] = System.Runtime.CompilerServices.Unsafe.As<float, T>(ref rf);
+                    }
+                }
+            }
+            { var ci = input; AutoTracer.RecordOp("NativeComplexIFFTReal", result, eng => eng.NativeComplexIFFTReal(ci)); }
+            return result;
+        }
+
         var ops = MathHelper.GetNumericOperations<T>();
         var scale = ops.FromDouble(fftSize);
-        var result = new Tensor<T>(input._shape);
 
         var slice = new Complex<T>[fftSize];
         for (int b = 0; b < batchCount; b++)
@@ -47957,6 +48045,82 @@ public partial class CpuEngine : ITensorLevelEngine
     /// </summary>
     // Cache twiddle factors across FFT calls — key is (n, inverse)
     [ThreadStatic] private static Dictionary<(int n, bool inverse), Complex<double>[]>? _twiddleCache;
+
+    // ── Blittable FFT fast path (float/double) ──────────────────────────────
+    // NativeComplexFFT / NativeComplexIFFTReal historically allocated a per-call
+    // Complex<T>[] working buffer and ran the radix-2 butterfly over Complex<T>
+    // structs. Complex<T> carries a redundant INumericOperations<T> reference
+    // field (24 bytes/element for double, 16 for float), so every butterfly
+    // wrote that ref on top of the arithmetic and the hot loop touched
+    // cache-sparse memory through property accessors. Profiling the HRE spectral
+    // FFN path (SpectralHebbianLayer.ForwardBatch) showed this Complex<T>
+    // overhead — not the O(n log n) arithmetic — dominated wall time (~10x vs
+    // the blittable Fft.RFft kernel on identical shapes). For the common
+    // float/double element types we instead run the SAME tested SIMD radix-2
+    // kernel (FftKernels.IterativeRadix2NoCache — raw/unnormalized, the exact
+    // contract of the old scalar butterfly: callers still apply any 1/n scaling)
+    // over a [ThreadStatic] interleaved double[] scratch ([re,im,re,im,...]).
+    // Result: no per-call FFT working allocation, native double arithmetic over
+    // tight 16-byte-per-complex memory, and the ONLY remaining allocation is the
+    // returned tensor (the theoretical floor). Non-float/double element types and
+    // non-contiguous inputs keep the exact generic Complex<T> path below.
+    [ThreadStatic] private static double[]? _fftBlittableScratch;
+
+    private static double[] RentFftBlittableScratch(int minLen)
+    {
+        var buf = _fftBlittableScratch;
+        if (buf is null || buf.Length < minLen)
+        {
+            buf = new double[minLen];
+            _fftBlittableScratch = buf;
+        }
+        return buf;
+    }
+
+    // Test-only reference: the pre-blittable generic Complex<T>[] path, retained
+    // so bit-exactness and allocation-regression tests can A/B the fast path
+    // against the exact prior implementation in the same process (immune to
+    // cross-build / machine-load noise). NOT called by production code.
+    internal Tensor<Complex<T>> NativeComplexFFTLegacyGeneric<T>(Tensor<T> input)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        var (batchCount, fftSize) = GetBatchedFFTDims(input._shape);
+        ValidatePowerOfTwo(fftSize, nameof(input));
+        var ops = MathHelper.GetNumericOperations<T>();
+        var result = new Tensor<Complex<T>>(input._shape);
+        var slice = new Complex<T>[fftSize];
+        for (int b = 0; b < batchCount; b++)
+        {
+            int offset = b * fftSize;
+            for (int i = 0; i < fftSize; i++)
+                slice[i] = new Complex<T>(input[offset + i], ops.Zero);
+            NativeFFTInPlace(slice, false, ops);
+            for (int i = 0; i < fftSize; i++)
+                result[offset + i] = slice[i];
+        }
+        return result;
+    }
+
+    // Test-only reference for the inverse-real path (see NativeComplexFFTLegacyGeneric).
+    internal Tensor<T> NativeComplexIFFTRealLegacyGeneric<T>(Tensor<Complex<T>> input)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        var (batchCount, fftSize) = GetBatchedFFTDims(input._shape);
+        ValidatePowerOfTwo(fftSize, nameof(input));
+        var ops = MathHelper.GetNumericOperations<T>();
+        var scale = ops.FromDouble(fftSize);
+        var result = new Tensor<T>(input._shape);
+        var slice = new Complex<T>[fftSize];
+        for (int b = 0; b < batchCount; b++)
+        {
+            int offset = b * fftSize;
+            for (int i = 0; i < fftSize; i++) slice[i] = input[offset + i];
+            NativeFFTInPlace(slice, true, ops);
+            for (int i = 0; i < fftSize; i++)
+                result[offset + i] = ops.Divide(slice[i].Real, scale);
+        }
+        return result;
+    }
 
     private static void NativeFFTInPlace<T>(Complex<T>[] data, bool inverse,
         INumericOperations<T> ops)
