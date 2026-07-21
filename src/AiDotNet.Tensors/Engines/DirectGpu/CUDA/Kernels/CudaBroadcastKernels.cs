@@ -228,6 +228,17 @@ extern ""C"" __global__ __launch_bounds__(256) void equals_kernel(
     output[idx] = equal ? 1.0f : 0.0f;
 }
 
+extern ""C"" __global__ __launch_bounds__(256) void where_select(
+    const float* __restrict__ condition, const float* __restrict__ a,
+    const float* __restrict__ b, float* __restrict__ output, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    // The condition buffer is produced by this file's comparison kernels, which emit exactly 1.0f or 0.0f
+    // (see equals_kernel). Test against zero rather than == 1.0f so any non-zero truthy encoding also works.
+    output[idx] = condition[idx] != 0.0f ? a[idx] : b[idx];
+}
+
 extern ""C"" __global__ __launch_bounds__(256) void not_equals_kernel(
     const float* __restrict__ a, const float* __restrict__ b,
     float* __restrict__ output, int size)
@@ -285,6 +296,7 @@ extern ""C"" __global__ __launch_bounds__(256) void not_equal_scalar(
             "sincos_kernel",
             "equals_kernel",
             "not_equals_kernel",
+            "where_select",
             "not_equal_scalar"
         ];
     }

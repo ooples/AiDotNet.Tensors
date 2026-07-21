@@ -1811,6 +1811,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 ref betaVal,
                 C.Handle, N),
             "cublasSgemm");
+        GpuLaunchProbe.OnLaunch();   // cuBLAS dispatch IS GPU work
     }
 
     public void MatMulTransposed(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
@@ -1916,6 +1917,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 C.Handle, N, strideC,
                 batchCount),
             "cublasSgemmStridedBatched");
+        GpuLaunchProbe.OnLaunch();   // cuBLAS dispatch IS GPU work
     }
 
     /// <summary>
@@ -4446,12 +4448,21 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         using var _ = PushContext();
         ulong byteSize = (ulong)size * sizeof(float);
+            // GPU-DISPATCH INSTRUMENTATION (see GpuLaunchProbe). OnLaunch() previously fired ONLY at the
+            // cuLaunchKernel choke point, so every op implemented with cuBLAS or a device-side
+            // memcpy/memset counted ZERO launches and the residency probe reported it as a CPU fallback.
+            // That produced 63 false entries on the worklist — matmul (cuBLAS), the shape/copy family
+            // (cuMemcpyDtoDAsync) and Dropout-eval (memcpy + memset) all run ON-DEVICE. Counting real
+            // device dispatch fixes the MEASUREMENT rather than raising the floor, which the test
+            // explicitly forbids. Deliberately NOT counted: HtoD uploads and DtoH downloads, because a
+            // genuine CPU fallback also transfers and must keep reporting zero.
         var result = CudaNativeBindings.cuMemcpyDtoDAsync(
             destination.Handle,
             source.Handle,
             byteSize,
             stream.Handle);
         CuBlasNative.CheckCudaResult(result, "cuMemcpyDtoDAsync");
+        GpuLaunchProbe.OnLaunch();   // device-side copy IS GPU work — see note above
     }
 
     /// <inheritdoc/>
@@ -4485,6 +4496,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                     ref betaVal,
                     C.Handle, N),
                 "cublasSgemm");
+        GpuLaunchProbe.OnLaunch();   // cuBLAS dispatch IS GPU work
         }
         finally
         {
@@ -8397,6 +8409,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         using var _ = PushContext();
         // cuMemsetD32 sets 32-bit values (net471 compatible conversion)
         byte[] bytes = BitConverter.GetBytes(value);
+        GpuLaunchProbe.OnLaunch();   // device-side memset IS GPU work
         uint bits = BitConverter.ToUInt32(bytes, 0);
         CuBlasNative.CheckCudaResult(
             CuBlasNative.cuMemsetD32(buffer.Handle, bits, (ulong)size),

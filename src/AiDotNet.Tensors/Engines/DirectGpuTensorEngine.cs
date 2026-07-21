@@ -20539,25 +20539,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (y is null) throw new ArgumentNullException(nameof(y));
         if (x.Length != y.Length || x.Length != condition.Length)
             throw new ArgumentException("All tensors must have the same length.");
-        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
-            return base.TensorWhere(condition, x, y);
-
-        try
-        {
-            using var condBuf = GetOrAllocateBuffer(backend, condition);
-            using var xBuf = GetOrAllocateBuffer(backend, x);
-            using var yBuf = GetOrAllocateBuffer(backend, y);
-            var outBuf = AllocateOutputBuffer(backend, x.Length);
-            backend.Where(condBuf.Buffer, xBuf.Buffer, yBuf.Buffer, outBuf.Buffer, x.Length);
-            var output = DeferTensorResult<T>(backend, outBuf.Buffer, x.Length, x.Shape.ToArray());
-            Autodiff.DifferentiableOps.RecordBinary("TensorWhere", output, x, y,
-                Autodiff.BackwardFunctions<T>.WhereBackward, new object[] { condition });
-            return output;
-        }
-        catch (Exception)
-        {
-            return base.TensorWhere(condition, x, y);
-        }
+        // The Bit-CONDITION overload stays on the CPU. backend.Where's where_select kernel reads its
+        // condition buffer as FLOAT 0/1 — which is what backend.GreaterThan and this file's comparison
+        // kernels emit, and what the float-condition overload above supplies. A Tensor<Bit> uploaded via
+        // GetOrAllocateBuffer does NOT carry that encoding, so reinterpreting its storage as floats selects
+        // on garbage.
+        //
+        // This path was previously "safe" only by accident: where_select did not exist, backend.Where threw
+        // kernel-not-found, and the surrounding catch fell back to the correct CPU implementation. Adding the
+        // kernel removed that accident and broke 10 comparison ops (TensorIsNan, TensorIsInf, TensorIsFinite,
+        // TensorEqScalar, TensorLogicalAnd/Not/Or/Xor, TensorIsIn) whose ProjectBits helper routes through
+        // here. Making the fallback EXPLICIT keeps them correct and no longer depends on a missing kernel.
+        //
+        // To move this on-device later, convert the Bit mask to a float 0/1 buffer first (or add a
+        // where_select variant that reads the Bit encoding) — do not just hand the Bit buffer to the float
+        // kernel.
+        return base.TensorWhere(condition, x, y);
     }
 
     // ──────────────────────────────────────────────────────────────

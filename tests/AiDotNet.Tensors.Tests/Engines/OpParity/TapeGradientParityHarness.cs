@@ -54,9 +54,6 @@ public static class TapeGradientParityHarness
     public static readonly IReadOnlyDictionary<string, string> TapeGradientBaseline =
         new Dictionary<string, string>(StringComparer.Ordinal)
         {
-            ["Sparsemax"] = "GPU forward bails: the path throws InvalidOperationException because "
-                        + "CudaBackend.Where looks up a \"where_select\" kernel that has no source and no "
-                        + "registration on any backend.",
             ["TensorMax"] = "The (tensor, scalar) overload has NO tape recording on either engine, so there "
                         + "is no gradient to compare. CpuEngine records only (tensor, tensor).",
             ["TensorMin"] = "As TensorMax.",
