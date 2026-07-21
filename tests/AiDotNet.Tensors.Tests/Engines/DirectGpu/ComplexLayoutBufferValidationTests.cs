@@ -2,6 +2,8 @@ using System.Runtime.Serialization;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.HIP;
+using AiDotNet.Tensors.Engines.DirectGpu.Metal;
+using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 using AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 #if NET5_0_OR_GREATER
 using AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
@@ -20,6 +22,8 @@ public class ComplexLayoutBufferValidationTests
     [Theory]
     [InlineData("CUDA")]
     [InlineData("HIP")]
+    [InlineData("Metal")]
+    [InlineData("OpenCL")]
     [InlineData("Vulkan")]
 #if NET5_0_OR_GREATER
     [InlineData("WebGPU")]
@@ -50,6 +54,8 @@ public class ComplexLayoutBufferValidationTests
         {
             "CUDA" => FormatterServices.GetUninitializedObject(typeof(CudaBackend)),
             "HIP" => FormatterServices.GetUninitializedObject(typeof(HipBackend)),
+            "Metal" => FormatterServices.GetUninitializedObject(typeof(MetalBackend)),
+            "OpenCL" => FormatterServices.GetUninitializedObject(typeof(OpenClBackend)),
             "Vulkan" => FormatterServices.GetUninitializedObject(typeof(VulkanBackend)),
 #if NET5_0_OR_GREATER
             "WebGPU" => FormatterServices.GetUninitializedObject(typeof(WebGpuBackend)),
