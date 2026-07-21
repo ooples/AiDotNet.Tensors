@@ -1120,6 +1120,219 @@ public class DirectPtxWmmaTests
         }
     }
 
+    [Fact]
+    public void AttentionBackwardEmitter_IsDeterministicScratchFreeAndStrideFree()
+    {
+        string ptx = PtxFusedAttentionBackwardD64Kernel.EmitPtx(
+            8, 6, 1, 8, 2, 16, 32, 0.125f);
+
+        Assert.Contains(PtxFusedAttentionBackwardD64Kernel.GradQueryEntryPoint, ptx);
+        Assert.Contains(PtxFusedAttentionBackwardD64Kernel.GradKeyValueEntryPoint, ptx);
+        Assert.Contains(PtxFusedAttentionBackwardD64Kernel.RowDeltaEntryPoint, ptx);
+        Assert.Contains("grad_query_workspace_ptr", ptx);
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("atom.", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxFusedAttentionBackwardD64Kernel.EmitPtx(
+                8, 6, 1, 8, 3, 16, 16, 0.125f));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxFusedAttentionBackwardD64Kernel.EmitPtx(
+                8, 6, 1, 8, 2, 8, 16, 0.125f));
+    }
+
+    [SkippableTheory]
+    [InlineData(4, 4, 16, 16)]
+    [InlineData(4, 2, 16, 32)]
+    [InlineData(4, 1, 32, 16)]
+    public void DriverOnlyAttentionBackwardD64_MatchesOracleAndHasZeroLocalBytes(
+        int queryHeads,
+        int keyValueHeads,
+        int querySequence,
+        int keyValueSequence)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(runtime.ArchitectureFamily == DirectPtxArchitectureFamily.Ampere,
+            "The checked-in attention-backward specialization is validated on Ampere.");
+        const int batch = 1, dimension = 64;
+        const float scale = 0.125f;
+        using var kernel = new PtxFusedAttentionBackwardD64Kernel(
+            runtime, batch, queryHeads, keyValueHeads,
+            querySequence, keyValueSequence, scale);
+        Assert.Equal(0, kernel.GradQueryFunctionInfo.LocalBytesPerThread);
+        Assert.Equal(0, kernel.GradKeyValueFunctionInfo.LocalBytesPerThread);
+        Assert.Equal(0, kernel.RowDeltaFunctionInfo.LocalBytesPerThread);
+        Assert.Equal(0, kernel.GradQueryFunctionInfo.StaticSharedBytes);
+        Assert.Equal(0, kernel.GradKeyValueFunctionInfo.StaticSharedBytes);
+        Assert.Equal(0, kernel.RowDeltaFunctionInfo.StaticSharedBytes);
+
+        int queryElements = batch * queryHeads * querySequence * dimension;
+        int keyValueElements = batch * keyValueHeads * keyValueSequence * dimension;
+        int probabilityElements = batch * queryHeads * querySequence * keyValueSequence;
+        var random = new Random(
+            20260800 + queryHeads * 100 + keyValueHeads * 10 + querySequence + keyValueSequence);
+        float[] gradOutputHost = Enumerable.Range(0, queryElements)
+            .Select(_ => (random.NextSingle() - 0.5f) * 0.5f).ToArray();
+        float[] queryHost = Enumerable.Range(0, queryElements)
+            .Select(_ => (random.NextSingle() - 0.5f) * 0.5f).ToArray();
+        float[] keyHost = Enumerable.Range(0, keyValueElements)
+            .Select(_ => (random.NextSingle() - 0.5f) * 0.5f).ToArray();
+        float[] valueHost = Enumerable.Range(0, keyValueElements)
+            .Select(_ => (random.NextSingle() - 0.5f) * 0.5f).ToArray();
+        float[] probabilitiesHost = AttentionProbabilities(
+            queryHost, keyHost, batch, queryHeads, keyValueHeads,
+            querySequence, keyValueSequence, scale);
+        (float[] expectedQ, float[] expectedK, float[] expectedV) = AttentionBackwardOracle(
+            gradOutputHost, queryHost, keyHost, valueHost, probabilitiesHost,
+            batch, queryHeads, keyValueHeads, querySequence, keyValueSequence, scale);
+
+        using var gradOutput = runtime.AllocateBytes((nuint)(queryElements * sizeof(float)));
+        using var query = runtime.AllocateBytes((nuint)(queryElements * sizeof(float)));
+        using var key = runtime.AllocateBytes((nuint)(keyValueElements * sizeof(float)));
+        using var value = runtime.AllocateBytes((nuint)(keyValueElements * sizeof(float)));
+        using var probabilities = runtime.AllocateBytes((nuint)(probabilityElements * sizeof(float)));
+        using var gradQuery = runtime.AllocateBytes((nuint)(queryElements * sizeof(float)));
+        using var gradKey = runtime.AllocateBytes((nuint)(keyValueElements * sizeof(float)));
+        using var gradValue = runtime.AllocateBytes((nuint)(keyValueElements * sizeof(float)));
+        gradOutput.Upload<float>(gradOutputHost);
+        query.Upload<float>(queryHost);
+        key.Upload<float>(keyHost);
+        value.Upload<float>(valueHost);
+        probabilities.Upload<float>(probabilitiesHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(gradOutput, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(query, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(key, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(value, kernel.Blueprint.Tensors[3]),
+            DirectPtxTensorView.CreateOwned(probabilities, kernel.Blueprint.Tensors[4]),
+            DirectPtxTensorView.CreateOwned(gradQuery, kernel.Blueprint.Tensors[5]),
+            DirectPtxTensorView.CreateOwned(gradKey, kernel.Blueprint.Tensors[6]),
+            DirectPtxTensorView.CreateOwned(gradValue, kernel.Blueprint.Tensors[7]));
+        runtime.Synchronize();
+        var actualQ = new float[queryElements];
+        var actualK = new float[keyValueElements];
+        var actualV = new float[keyValueElements];
+        gradQuery.Download<float>(actualQ);
+        gradKey.Download<float>(actualK);
+        gradValue.Download<float>(actualV);
+        AssertAttentionGradientClose(actualQ, expectedQ, "dQ");
+        AssertAttentionGradientClose(actualK, expectedK, "dK");
+        AssertAttentionGradientClose(actualV, expectedV, "dV");
+    }
+
+    [SkippableFact]
+    public void BackendAttentionBackwardD64_IsZeroAllocationCapturableAndRoutesPublicGqa()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previous = DirectPtxFeatureGate.TestOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxAttentionBackwardEnabled,
+                "Requires an Ampere CUDA backend.");
+            const int batch = 1, queryHeads = 4, keyValueHeads = 2;
+            const int querySequence = 16, keyValueSequence = 32, dimension = 64;
+            const float scale = 0.125f;
+            int queryElements = batch * queryHeads * querySequence * dimension;
+            int keyValueElements = batch * keyValueHeads * keyValueSequence * dimension;
+            var random = new Random(20260817);
+            float[] gradOutputHost = Enumerable.Range(0, queryElements)
+                .Select(_ => (random.NextSingle() - 0.5f) * 0.5f).ToArray();
+            float[] queryHost = Enumerable.Range(0, queryElements)
+                .Select(_ => (random.NextSingle() - 0.5f) * 0.5f).ToArray();
+            float[] keyHost = Enumerable.Range(0, keyValueElements)
+                .Select(_ => (random.NextSingle() - 0.5f) * 0.5f).ToArray();
+            float[] valueHost = Enumerable.Range(0, keyValueElements)
+                .Select(_ => (random.NextSingle() - 0.5f) * 0.5f).ToArray();
+            float[] probabilitiesHost = AttentionProbabilities(
+                queryHost, keyHost, batch, queryHeads, keyValueHeads,
+                querySequence, keyValueSequence, scale);
+            (float[] expectedQ, float[] expectedK, float[] expectedV) = AttentionBackwardOracle(
+                gradOutputHost, queryHost, keyHost, valueHost, probabilitiesHost,
+                batch, queryHeads, keyValueHeads, querySequence, keyValueSequence, scale);
+
+            using var gradOutput = backend.AllocateBuffer(gradOutputHost);
+            using var query = backend.AllocateBuffer(queryHost);
+            using var key = backend.AllocateBuffer(keyHost);
+            using var value = backend.AllocateBuffer(valueHost);
+            using var probabilities = backend.AllocateBuffer(probabilitiesHost);
+            using var gradQuery = backend.AllocateBuffer(queryElements);
+            using var gradKey = backend.AllocateBuffer(keyValueElements);
+            using var gradValue = backend.AllocateBuffer(keyValueElements);
+            Assert.False(backend.TryDirectPtxAttentionBackwardD64(
+                gradOutput, query, key, value, probabilities,
+                gradQuery, gradKey, gradValue,
+                batch, queryHeads, keyValueHeads, querySequence, keyValueSequence,
+                32, scale));
+            Assert.Equal("attention-backward-head-dimension-not-implemented", backend.DirectPtxLastError);
+            Assert.True(backend.PrewarmDirectPtxAttentionBackwardD64(
+                batch, queryHeads, keyValueHeads, querySequence, keyValueSequence, scale),
+                backend.DirectPtxLastError);
+            for (int i = 0; i < 8; i++)
+                Assert.True(backend.TryDirectPtxAttentionBackwardD64(
+                    gradOutput, query, key, value, probabilities,
+                    gradQuery, gradKey, gradValue,
+                    batch, queryHeads, keyValueHeads, querySequence, keyValueSequence,
+                    dimension, scale), backend.DirectPtxLastError);
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            bool allLaunched = true;
+            for (int i = 0; i < 32; i++)
+                allLaunched &= backend.TryDirectPtxAttentionBackwardD64(
+                    gradOutput, query, key, value, probabilities,
+                    gradQuery, gradKey, gradValue,
+                    batch, queryHeads, keyValueHeads, querySequence, keyValueSequence,
+                    dimension, scale);
+            long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+            backend.Synchronize();
+            Assert.True(allLaunched, backend.DirectPtxLastError);
+            Assert.Equal(0, allocated);
+            AssertAttentionGradientClose(backend.DownloadBuffer(gradQuery), expectedQ, "dQ");
+            AssertAttentionGradientClose(backend.DownloadBuffer(gradKey), expectedK, "dK");
+            AssertAttentionGradientClose(backend.DownloadBuffer(gradValue), expectedV, "dV");
+
+            bool captureLaunch = true;
+            IntPtr graph = backend.CaptureGraph(() =>
+                captureLaunch &= backend.TryDirectPtxAttentionBackwardD64(
+                    gradOutput, query, key, value, probabilities,
+                    gradQuery, gradKey, gradValue,
+                    batch, queryHeads, keyValueHeads, querySequence, keyValueSequence,
+                    dimension, scale));
+            Assert.True(captureLaunch, backend.DirectPtxLastError);
+            try { backend.LaunchCapturedGraph(graph); }
+            finally { backend.DestroyCapturedGraph(graph); }
+
+            using var publicGradQuery = backend.AllocateBuffer(queryElements);
+            using var publicGradKey = backend.AllocateBuffer(keyValueElements);
+            using var publicGradValue = backend.AllocateBuffer(keyValueElements);
+            long dispatchBefore = backend.DirectPtxAttentionBackwardDispatchCount;
+            backend.GroupedQueryAttentionBackward(
+                gradOutput, query, key, value, probabilities,
+                publicGradQuery, publicGradKey, publicGradValue,
+                batch, queryHeads, keyValueHeads, querySequence, keyValueSequence,
+                dimension, scale, queryHeads / keyValueHeads);
+            backend.Synchronize();
+            Assert.Equal(dispatchBefore + 1, backend.DirectPtxAttentionBackwardDispatchCount);
+            AssertAttentionGradientClose(backend.DownloadBuffer(publicGradQuery), expectedQ, "public dQ");
+            AssertAttentionGradientClose(backend.DownloadBuffer(publicGradKey), expectedK, "public dK");
+            AssertAttentionGradientClose(backend.DownloadBuffer(publicGradValue), expectedV, "public dV");
+            Assert.True(backend.TryGetDirectPtxAttentionBackwardAudits(
+                batch, queryHeads, keyValueHeads, querySequence, keyValueSequence, scale,
+                out DirectPtxKernelAudit rowDeltaAudit,
+                out DirectPtxKernelAudit gradQueryAudit,
+                out DirectPtxKernelAudit gradKeyValueAudit));
+            Assert.Equal(0, rowDeltaAudit.Function.LocalBytesPerThread);
+            Assert.Equal(0, gradQueryAudit.Function.LocalBytesPerThread);
+            Assert.Equal(0, gradKeyValueAudit.Function.LocalBytesPerThread);
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previous;
+        }
+    }
+
     [SkippableFact]
     public void DriverOnlyResidualRmsNorm_MatchesReferenceAndHasZeroLocalBytes()
     {
@@ -1402,6 +1615,111 @@ public class DirectPtxWmmaTests
         {
             DirectPtxFeatureGate.TestOverride = previous;
         }
+    }
+
+    private static float[] AttentionProbabilities(
+        float[] query,
+        float[] key,
+        int batch,
+        int queryHeads,
+        int keyValueHeads,
+        int querySequence,
+        int keyValueSequence,
+        float scale)
+    {
+        const int dimension = 64;
+        int queriesPerKeyValue = queryHeads / keyValueHeads;
+        var probabilities = new float[batch * queryHeads * querySequence * keyValueSequence];
+        for (int b = 0; b < batch; b++)
+        for (int qh = 0; qh < queryHeads; qh++)
+        for (int qi = 0; qi < querySequence; qi++)
+        {
+            int kvh = qh / queriesPerKeyValue;
+            int queryBase = ((b * queryHeads + qh) * querySequence + qi) * dimension;
+            int probabilityBase = ((b * queryHeads + qh) * querySequence + qi) * keyValueSequence;
+            float maximum = float.NegativeInfinity;
+            for (int ki = 0; ki < keyValueSequence; ki++)
+            {
+                int keyBase = ((b * keyValueHeads + kvh) * keyValueSequence + ki) * dimension;
+                float score = 0;
+                for (int d = 0; d < dimension; d++)
+                    score += query[queryBase + d] * key[keyBase + d];
+                score *= scale;
+                probabilities[probabilityBase + ki] = score;
+                maximum = MathF.Max(maximum, score);
+            }
+            float sum = 0;
+            for (int ki = 0; ki < keyValueSequence; ki++)
+            {
+                float probability = MathF.Exp(probabilities[probabilityBase + ki] - maximum);
+                probabilities[probabilityBase + ki] = probability;
+                sum += probability;
+            }
+            for (int ki = 0; ki < keyValueSequence; ki++)
+                probabilities[probabilityBase + ki] /= sum;
+        }
+        return probabilities;
+    }
+
+    private static (float[] GradQuery, float[] GradKey, float[] GradValue) AttentionBackwardOracle(
+        float[] gradOutput,
+        float[] query,
+        float[] key,
+        float[] value,
+        float[] probabilities,
+        int batch,
+        int queryHeads,
+        int keyValueHeads,
+        int querySequence,
+        int keyValueSequence,
+        float scale)
+    {
+        const int dimension = 64;
+        int queriesPerKeyValue = queryHeads / keyValueHeads;
+        var gradQuery = new float[query.Length];
+        var gradKey = new float[key.Length];
+        var gradValue = new float[value.Length];
+        var gradProbability = new float[keyValueSequence];
+        for (int b = 0; b < batch; b++)
+        for (int qh = 0; qh < queryHeads; qh++)
+        for (int qi = 0; qi < querySequence; qi++)
+        {
+            int kvh = qh / queriesPerKeyValue;
+            int queryBase = ((b * queryHeads + qh) * querySequence + qi) * dimension;
+            int probabilityBase = ((b * queryHeads + qh) * querySequence + qi) * keyValueSequence;
+            float delta = 0;
+            for (int ki = 0; ki < keyValueSequence; ki++)
+            {
+                int valueBase = ((b * keyValueHeads + kvh) * keyValueSequence + ki) * dimension;
+                float dot = 0;
+                for (int d = 0; d < dimension; d++)
+                    dot += gradOutput[queryBase + d] * value[valueBase + d];
+                gradProbability[ki] = dot;
+                delta += probabilities[probabilityBase + ki] * dot;
+            }
+            for (int ki = 0; ki < keyValueSequence; ki++)
+            {
+                int keyValueBase = ((b * keyValueHeads + kvh) * keyValueSequence + ki) * dimension;
+                float probability = probabilities[probabilityBase + ki];
+                float gradScore = scale * probability * (gradProbability[ki] - delta);
+                for (int d = 0; d < dimension; d++)
+                {
+                    gradQuery[queryBase + d] += gradScore * key[keyValueBase + d];
+                    gradKey[keyValueBase + d] += gradScore * query[queryBase + d];
+                    gradValue[keyValueBase + d] += probability * gradOutput[queryBase + d];
+                }
+            }
+        }
+        return (gradQuery, gradKey, gradValue);
+    }
+
+    private static void AssertAttentionGradientClose(float[] actual, float[] expected, string name)
+    {
+        Assert.Equal(expected.Length, actual.Length);
+        float error = 0;
+        for (int i = 0; i < actual.Length; i++)
+            error = MathF.Max(error, MathF.Abs(actual[i] - expected[i]));
+        Assert.True(error < 5e-5f, $"Direct PTX attention backward {name} max error {error:G9}.");
     }
 
     private static ushort[] RandomHalfRange(Random random, int length, float magnitude)

@@ -128,6 +128,42 @@ internal static class DirectPtxProfileTarget
         Console.WriteLine(kernel.Audit.ToJson());
     }
 
+    internal static void RunAttentionBackward()
+    {
+        using var runtime = new DirectPtxRuntime();
+        const int batch = 1, heads = 8, kvHeads = 2, querySequence = 64, keySequence = 64;
+        using var kernel = new PtxFusedAttentionBackwardD64Kernel(
+            runtime, batch, heads, kvHeads, querySequence, keySequence, 0.125f);
+        using var gradOutput = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var query = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var key = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        using var value = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
+        using var probabilities = runtime.AllocateBytes(kernel.Blueprint.Tensors[4].RequiredBytes);
+        using var gradQuery = runtime.AllocateBytes(kernel.Blueprint.Tensors[5].RequiredBytes);
+        using var gradKey = runtime.AllocateBytes(kernel.Blueprint.Tensors[6].RequiredBytes);
+        using var gradValue = runtime.AllocateBytes(kernel.Blueprint.Tensors[7].RequiredBytes);
+        gradOutput.Upload<float>(new float[batch * heads * querySequence * 64]);
+        query.Upload<float>(new float[batch * heads * querySequence * 64]);
+        key.Upload<float>(new float[batch * kvHeads * keySequence * 64]);
+        value.Upload<float>(new float[batch * kvHeads * keySequence * 64]);
+        probabilities.Upload<float>(Enumerable.Repeat(
+            1f / keySequence, batch * heads * querySequence * keySequence).ToArray());
+        Action launch = () => kernel.Launch(
+            DirectPtxTensorView.CreateOwned(gradOutput, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(query, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(key, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(value, kernel.Blueprint.Tensors[3]),
+            DirectPtxTensorView.CreateOwned(probabilities, kernel.Blueprint.Tensors[4]),
+            DirectPtxTensorView.CreateOwned(gradQuery, kernel.Blueprint.Tensors[5]),
+            DirectPtxTensorView.CreateOwned(gradKey, kernel.Blueprint.Tensors[6]),
+            DirectPtxTensorView.CreateOwned(gradValue, kernel.Blueprint.Tensors[7]));
+        for (int i = 0; i < 10; i++) launch();
+        runtime.Synchronize();
+        Console.WriteLine(kernel.RowDeltaAudit.ToJson());
+        Console.WriteLine(kernel.GradKeyValueAudit.ToJson());
+        Console.WriteLine(kernel.GradQueryAudit.ToJson());
+    }
+
     internal static void VerifyNcuCsv(string path)
     {
         DirectPtxProfilerEvidence evidence = DirectPtxProfilerEvidence.FromNcuCsv(path);
