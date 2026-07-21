@@ -1734,6 +1734,182 @@ public class DirectPtxWmmaTests
         Assert.True(PtxFusedLinearGeluFp16M1Kernel.IsPromotedShape(1024, 4096));
     }
 
+    [Fact]
+    public void Fp16TensorCoreFusedLinearGeluEmitter_BakesAsyncM16AbiAndNoStrideChecks()
+    {
+        string ptx = PtxFusedLinearGeluFp16M16Kernel.EmitPtx(
+            8, 6, inputFeatures: 512, outputFeatures: 2048);
+
+        Assert.Contains(PtxFusedLinearGeluFp16M16Kernel.EntryPoint, ptx);
+        Assert.Equal(4, Count(ptx, ".param .u64"));
+        Assert.Equal(8, Count(ptx, "cp.async.ca.shared.global"));
+        Assert.Equal(16, Count(ptx, "cp.async.cg.shared.global"));
+        Assert.Equal(8, Count(ptx, "cp.async.commit_group"));
+        Assert.Equal(32, Count(ptx, "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"));
+        Assert.Contains(
+            $"smem[{PtxFusedLinearGeluFp16M16Kernel.GetStaticSharedBytes(512)}]", ptx);
+        Assert.Contains("ld.global.nc.v2.f32", ptx);
+        Assert.Contains("tanh.approx.f32", ptx);
+        Assert.Equal(2, Count(ptx, "st.global.v2.f32"));
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("batch", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxFusedLinearGeluFp16M16Kernel.EmitPtx(8, 6, 256, 2048));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxFusedLinearGeluFp16M16Kernel.EmitPtx(8, 6, 512, 768));
+        Assert.True(PtxFusedLinearGeluFp16M16Kernel.IsPromotedShape(512, 2048));
+        Assert.True(PtxFusedLinearGeluFp16M16Kernel.IsPromotedShape(1024, 4096));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyFp16TensorCoreFusedLinearGeluM16_MatchesOracleAndHasZeroLocalBytes()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(runtime.ArchitectureFamily == DirectPtxArchitectureFamily.Ampere,
+            "The checked-in FP16 Tensor Core fused-linear specialization is validated on Ampere.");
+        const int rows = PtxFusedLinearGeluFp16M16Kernel.Rows;
+        const int inputFeatures = 512, outputFeatures = 2048;
+        using var kernel = new PtxFusedLinearGeluFp16M16Kernel(
+            runtime, inputFeatures, outputFeatures);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+        Assert.Equal(PtxFusedLinearGeluFp16M16Kernel.GetStaticSharedBytes(inputFeatures),
+            kernel.Audit.Function.StaticSharedBytes);
+        Assert.True(kernel.Audit.ActiveBlocksPerMultiprocessor >= 4);
+        Assert.True(kernel.Audit.Function.RegistersPerThread <= 48);
+        Assert.Equal(DirectPtxPhysicalLayout.RowMajor2D, kernel.Blueprint.Tensors[0].Layout);
+        Assert.Equal(DirectPtxPhysicalLayout.LinearWeightOutputMajor,
+            kernel.Blueprint.Tensors[1].Layout);
+        Assert.Equal(DirectPtxPhysicalLayout.RowMajor2D, kernel.Blueprint.Tensors[3].Layout);
+
+        var random = new Random(20260872);
+        ushort[] inputBits = RandomHalfRange(random, rows * inputFeatures, 0.125f);
+        ushort[] weightBits = RandomHalfRange(
+            random, inputFeatures * outputFeatures, 0.0625f);
+        float[] inputHost = inputBits.Select(Half).ToArray();
+        float[] weightHost = weightBits.Select(Half).ToArray();
+        float[] biasHost = Values(random, outputFeatures, 0.0625f);
+        float[] expected = FusedLinearGeluOracle(
+            inputHost, weightHost, biasHost, rows, inputFeatures, outputFeatures);
+        using var input = runtime.AllocateBytes((nuint)(inputBits.Length * sizeof(ushort)));
+        using var weights = runtime.AllocateBytes((nuint)(weightBits.Length * sizeof(ushort)));
+        using var bias = runtime.AllocateBytes((nuint)(biasHost.Length * sizeof(float)));
+        using var output = runtime.AllocateBytes((nuint)(rows * outputFeatures * sizeof(float)));
+        input.Upload<ushort>(inputBits);
+        weights.Upload<ushort>(weightBits);
+        bias.Upload<float>(biasHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(weights, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[3]));
+        runtime.Synchronize();
+        var actual = new float[rows * outputFeatures];
+        output.Download<float>(actual);
+        AssertVectorClose(actual, expected, 2e-3f,
+            "direct FP16 Tensor Core fused linear GELU M16");
+    }
+
+    [SkippableFact]
+    public void BackendFp16TensorCoreFusedLinearGeluM16_IsZeroAllocationCapturableAndFailClosed()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previous = DirectPtxFeatureGate.TestOverride;
+        bool previousExperiment = DirectPtxFeatureGate.MixedPrecisionLinearExperimentOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        DirectPtxFeatureGate.MixedPrecisionLinearExperimentOverride = false;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxMixedLinearEnabled, "Requires an Ampere CUDA backend.");
+            const int rows = PtxFusedLinearGeluFp16M16Kernel.Rows;
+            const int inputFeatures = 512, outputFeatures = 2048;
+            var random = new Random(20260873);
+            ushort[] inputBits = RandomHalfRange(random, rows * inputFeatures, 0.125f);
+            ushort[] weightBits = RandomHalfRange(
+                random, inputFeatures * outputFeatures, 0.0625f);
+            float[] inputHost = inputBits.Select(Half).ToArray();
+            float[] weightHost = weightBits.Select(Half).ToArray();
+            float[] biasHost = Values(random, outputFeatures, 0.0625f);
+            float[] expected = FusedLinearGeluOracle(
+                inputHost, weightHost, biasHost, rows, inputFeatures, outputFeatures);
+            using var inputFloat = backend.AllocateBuffer(inputHost);
+            using var weightFloat = backend.AllocateBuffer(weightHost);
+            using var inputHalf = backend.AllocateByteBuffer(
+                rows * inputFeatures * sizeof(ushort));
+            using var weightHalf = backend.AllocateByteBuffer(
+                inputFeatures * outputFeatures * sizeof(ushort));
+            using var bias = backend.AllocateBuffer(biasHost);
+            using var output = backend.AllocateBuffer(rows * outputFeatures);
+            using var wrongOutput = backend.AllocateBuffer(rows * outputFeatures + 1);
+            backend.ConvertToFp16Native(inputFloat, inputHalf, rows * inputFeatures);
+            backend.ConvertToFp16Native(
+                weightFloat, weightHalf, inputFeatures * outputFeatures);
+
+            Assert.False(backend.TryDirectPtxFusedLinearGeluFp16M16(
+                inputHalf, weightHalf, bias, output, 256, 2048));
+            Assert.Equal("mixed-linear-m16-shape-not-implemented", backend.DirectPtxLastError);
+            DirectPtxFeatureGate.TestOverride = false;
+            long fallbackDispatchBefore = backend.DirectPtxMixedLinearDispatchCount;
+            backend.FusedLinearGELUFp16TransposedM16(
+                inputHalf, weightHalf, bias, output, inputFeatures, outputFeatures);
+            backend.Synchronize();
+            Assert.Equal(fallbackDispatchBefore, backend.DirectPtxMixedLinearDispatchCount);
+            AssertVectorClose(
+                backend.DownloadBuffer(output), expected, 2e-3f,
+                "cuBLAS fallback FP16 Tensor Core fused linear GELU M16");
+
+            DirectPtxFeatureGate.TestOverride = true;
+            Assert.False(backend.TryDirectPtxFusedLinearGeluFp16M16(
+                inputHalf, weightHalf, bias, wrongOutput, inputFeatures, outputFeatures));
+            Assert.Equal("mixed-linear-m16-physical-extent-mismatch", backend.DirectPtxLastError);
+            Assert.True(backend.PrewarmDirectPtxFusedLinearGeluFp16M16(
+                inputFeatures, outputFeatures), backend.DirectPtxLastError);
+            for (int i = 0; i < 8; i++)
+                Assert.True(backend.TryDirectPtxFusedLinearGeluFp16M16(
+                    inputHalf, weightHalf, bias, output, inputFeatures, outputFeatures),
+                    backend.DirectPtxLastError);
+
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            bool allLaunched = true;
+            for (int i = 0; i < 32; i++)
+                allLaunched &= backend.TryDirectPtxFusedLinearGeluFp16M16(
+                    inputHalf, weightHalf, bias, output, inputFeatures, outputFeatures);
+            long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+            backend.Synchronize();
+            Assert.True(allLaunched, backend.DirectPtxLastError);
+            Assert.Equal(0, allocated);
+            AssertVectorClose(
+                backend.DownloadBuffer(output), expected, 2e-3f,
+                "backend FP16 Tensor Core fused linear GELU M16");
+
+            bool captured = true;
+            IntPtr graph = backend.CaptureGraph(() =>
+                captured &= backend.TryDirectPtxFusedLinearGeluFp16M16(
+                    inputHalf, weightHalf, bias, output, inputFeatures, outputFeatures));
+            Assert.True(captured, backend.DirectPtxLastError);
+            try { backend.LaunchCapturedGraph(graph); }
+            finally { backend.DestroyCapturedGraph(graph); }
+            backend.Synchronize();
+            Assert.True(backend.TryGetDirectPtxMixedLinearM16Audit(
+                inputFeatures, outputFeatures, out DirectPtxKernelAudit audit));
+            Assert.Equal(0, audit.Function.LocalBytesPerThread);
+
+            long dispatchBefore = backend.DirectPtxMixedLinearDispatchCount;
+            backend.FusedLinearGELUFp16TransposedM16(
+                inputHalf, weightHalf, bias, output, inputFeatures, outputFeatures);
+            backend.Synchronize();
+            Assert.Equal(dispatchBefore + 1, backend.DirectPtxMixedLinearDispatchCount);
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previous;
+            DirectPtxFeatureGate.MixedPrecisionLinearExperimentOverride = previousExperiment;
+        }
+    }
+
     [SkippableFact]
     public void DriverOnlyFp16FusedLinearGeluM1_MatchesRoundedOracleAndHasZeroLocalBytes()
     {
@@ -1899,7 +2075,7 @@ public class DirectPtxWmmaTests
     [Fact]
     public void QuantizedMixedSparseCoverageManifest_AssignsEveryScopedApiExactlyOnce()
     {
-        Assert.Equal(14, DirectPtxQuantizedMixedSparseCoverageManifest.All.Count);
+        Assert.Equal(15, DirectPtxQuantizedMixedSparseCoverageManifest.All.Count);
         string[] names = DirectPtxQuantizedMixedSparseCoverageManifest.All
             .Select(cell => cell.Api).ToArray();
         Assert.Equal(names.Length, names.Distinct(StringComparer.Ordinal).Count());
@@ -1914,6 +2090,9 @@ public class DirectPtxWmmaTests
         Assert.Equal(DirectPtxQuantizedMixedSparseCoverageStatus.ExperimentalDirectPtx,
             DirectPtxQuantizedMixedSparseCoverageManifest.Get(
                 "CudaBackend.FusedLinearGELUFp16TransposedM1").Status);
+        Assert.Equal(DirectPtxQuantizedMixedSparseCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxQuantizedMixedSparseCoverageManifest.Get(
+                "CudaBackend.FusedLinearGELUFp16TransposedM16").Status);
         Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() =>
             DirectPtxQuantizedMixedSparseCoverageManifest.Get("UnassignedMixedApi"));
     }
@@ -3013,6 +3192,29 @@ public class DirectPtxWmmaTests
             for (int inner = 0; inner < inputFeatures; inner++)
                 value += input[inner] * weights[column * inputFeatures + inner];
             output[column] = 0.5f * value *
+                (1f + MathF.Tanh(0.7978845608f *
+                    (value + 0.044715f * value * value * value)));
+        }
+        return output;
+    }
+
+    private static float[] FusedLinearGeluOracle(
+        float[] input,
+        float[] weights,
+        float[] bias,
+        int rows,
+        int inputFeatures,
+        int outputFeatures)
+    {
+        var output = new float[rows * outputFeatures];
+        for (int row = 0; row < rows; row++)
+        for (int column = 0; column < outputFeatures; column++)
+        {
+            float value = bias[column];
+            for (int inner = 0; inner < inputFeatures; inner++)
+                value += input[row * inputFeatures + inner] *
+                    weights[column * inputFeatures + inner];
+            output[row * outputFeatures + column] = 0.5f * value *
                 (1f + MathF.Tanh(0.7978845608f *
                     (value + 0.044715f * value * value * value)));
         }

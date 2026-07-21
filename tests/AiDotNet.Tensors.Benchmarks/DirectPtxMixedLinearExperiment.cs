@@ -7,14 +7,14 @@ using AiDotNet.Tensors.Engines.Gpu;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
-/// <summary>Issue #837 M=1 FP16-input/weight, FP32-accumulate fused linear championship.</summary>
+/// <summary>Issue #837 FP16-input/weight, FP32-accumulate fused linear championship.</summary>
 internal static class DirectPtxMixedLinearExperiment
 {
     private const int Warmups = 30;
     private const int Samples = 101;
     private const int DeviceLaunches = 50;
 
-    private readonly record struct Shape(string Name, int K, int N);
+    private readonly record struct Shape(string Name, int M, int K, int N);
     private readonly record struct Distribution(double Mean, double Median, double P95, double P99);
     private sealed record PythonRecord(
         string Status, int Run, string Shape, string Method,
@@ -24,12 +24,27 @@ internal static class DirectPtxMixedLinearExperiment
 
     private static readonly Shape[] Shapes =
     [
-        new("decode-256x256", 256, 256),
-        new("decode-up-512x2048", 512, 2048),
-        new("decode-up-1024x4096", 1024, 4096)
+        new("decode-256x256", 1, 256, 256),
+        new("decode-up-512x2048", 1, 512, 2048),
+        new("decode-up-1024x4096", 1, 1024, 4096)
     ];
 
-    internal static void Run(int independentRuns = 1)
+    private static readonly Shape[] TensorCoreShapes =
+    [
+        new("m16-up-512x2048", 16, 512, 2048),
+        new("m16-up-1024x4096", 16, 1024, 4096)
+    ];
+
+    internal static void Run(int independentRuns = 1) =>
+        RunCore(independentRuns, Shapes, tensorCore: false);
+
+    internal static void RunM16(int independentRuns = 1) =>
+        RunCore(independentRuns, TensorCoreShapes, tensorCore: true);
+
+    private static void RunCore(
+        int independentRuns,
+        IReadOnlyList<Shape> shapes,
+        bool tensorCore)
     {
         if (independentRuns <= 0) throw new ArgumentOutOfRangeException(nameof(independentRuns));
         bool? previous = DirectPtxFeatureGate.TestOverride;
@@ -38,7 +53,8 @@ internal static class DirectPtxMixedLinearExperiment
         try
         {
             Console.WriteLine(
-                $"Direct-PTX FP16 fused linear+bias+tanh-GELU: {independentRuns} run(s), " +
+                $"Direct-PTX FP16 fused linear+bias+tanh-GELU M={(tensorCore ? 16 : 1)}: " +
+                $"{independentRuns} run(s), " +
                 $"{Warmups} warmups + {Samples} samples/cell");
             Console.WriteLine(
                 $"Resident, preallocated exact ABI; device samples average {DeviceLaunches} launches.");
@@ -48,10 +64,10 @@ internal static class DirectPtxMixedLinearExperiment
                 using var backend = new CudaBackend();
                 using var cublasLt = new CuBlasLtMatmul();
                 if (run == 1) Console.WriteLine($"GPU: {backend.DeviceName}");
-                foreach (Shape shape in Shapes) RunCell(backend, cublasLt, run, shape);
+                foreach (Shape shape in shapes) RunCell(backend, cublasLt, run, shape, tensorCore);
             }
-            foreach (PythonRecord record in RunPython(independentRuns))
-                if (record.Status == "ok") PrintPython(record);
+            foreach (PythonRecord record in RunPython(independentRuns, tensorCore ? 16 : 1))
+                if (record.Status == "ok") PrintPython(record, shapes);
         }
         finally
         {
@@ -60,42 +76,59 @@ internal static class DirectPtxMixedLinearExperiment
         }
     }
 
-    private static void RunCell(CudaBackend backend, CuBlasLtMatmul cublasLt, int run, Shape shape)
+    private static void RunCell(
+        CudaBackend backend,
+        CuBlasLtMatmul cublasLt,
+        int run,
+        Shape shape,
+        bool tensorCore)
     {
         var random = new Random(20261500 + run * 10_000 + shape.K + shape.N);
-        float[] inputHost = HalfRoundedValues(random, shape.K, 0.125f);
+        float[] inputHost = HalfRoundedValues(random, shape.M * shape.K, 0.125f);
         float[] weightsHost = HalfRoundedValues(random, shape.K * shape.N, 0.0625f);
         float[] inputMajorWeightsHost = TransposeOutputMajor(weightsHost, shape.K, shape.N);
         float[] biasHost = Values(random, shape.N, 0.0625f);
-        float[] expected = Oracle(inputHost, weightsHost, biasHost, shape.K, shape.N);
+        float[] expected = Oracle(
+            inputHost, weightsHost, biasHost, shape.M, shape.K, shape.N);
         using var inputFloat = backend.AllocateBuffer(inputHost);
         using var weightsFloat = backend.AllocateBuffer(weightsHost);
         using var inputMajorWeightsFloat = backend.AllocateBuffer(inputMajorWeightsHost);
-        using var inputHalf = backend.AllocateByteBuffer(shape.K * sizeof(ushort));
+        using var inputHalf = backend.AllocateByteBuffer(shape.M * shape.K * sizeof(ushort));
         using var weightsHalf = backend.AllocateByteBuffer(shape.K * shape.N * sizeof(ushort));
         using var inputMajorWeightsHalf = backend.AllocateByteBuffer(
             shape.K * shape.N * sizeof(ushort));
         using var bias = backend.AllocateBuffer(biasHost);
-        using var directOutput = backend.AllocateBuffer(shape.N);
-        using var baselineOutput = backend.AllocateBuffer(shape.N);
-        using var cublasLtOutput = backend.AllocateBuffer(shape.N);
-        backend.ConvertToFp16Native(inputFloat, inputHalf, shape.K);
+        using var directOutput = backend.AllocateBuffer(shape.M * shape.N);
+        using var baselineOutput = backend.AllocateBuffer(shape.M * shape.N);
+        using var cublasLtOutput = backend.AllocateBuffer(shape.M * shape.N);
+        backend.ConvertToFp16Native(inputFloat, inputHalf, shape.M * shape.K);
         backend.ConvertToFp16Native(weightsFloat, weightsHalf, shape.K * shape.N);
         backend.ConvertToFp16Native(
             inputMajorWeightsFloat, inputMajorWeightsHalf, shape.K * shape.N);
         backend.Synchronize();
 
-        void BaselineLaunch() => backend.FusedLinearGELUFp16TransposedM1(
-            inputHalf, weightsHalf, bias, baselineOutput, shape.K, shape.N);
+        void BaselineLaunch()
+        {
+            if (tensorCore)
+                backend.FusedLinearGELUFp16TransposedM16(
+                    inputHalf, weightsHalf, bias, baselineOutput, shape.K, shape.N);
+            else
+                backend.FusedLinearGELUFp16TransposedM1(
+                    inputHalf, weightsHalf, bias, baselineOutput, shape.K, shape.N);
+        }
         void DirectLaunch()
         {
-            if (!backend.TryDirectPtxFusedLinearGeluFp16M1(
-                inputHalf, weightsHalf, bias, directOutput, shape.K, shape.N))
+            bool launched = tensorCore
+                ? backend.TryDirectPtxFusedLinearGeluFp16M16(
+                    inputHalf, weightsHalf, bias, directOutput, shape.K, shape.N)
+                : backend.TryDirectPtxFusedLinearGeluFp16M1(
+                    inputHalf, weightsHalf, bias, directOutput, shape.K, shape.N);
+            if (!launched)
                 throw new InvalidOperationException(backend.DirectPtxLastError);
         }
         void CuBlasLtLaunch() => cublasLt.MatmulFused(
             aDev: inputMajorWeightsHalf.Handle, m: shape.N, k: shape.K, transA: false,
-            bDev: inputHalf.Handle, n: 1, transB: false,
+            bDev: inputHalf.Handle, n: shape.M, transB: false,
             cDev: IntPtr.Zero, dDev: cublasLtOutput.Handle,
             biasDev: bias.Handle, epilogue: CublasLtEpilogue.GELUBias,
             stream: backend.DefaultStream.Handle,
@@ -143,7 +176,10 @@ internal static class DirectPtxMixedLinearExperiment
         finally { backend.DestroyCapturedGraph(cublasLtGraph); }
 
         DirectPtxFeatureGate.TestOverride = true;
-        if (!backend.PrewarmDirectPtxFusedLinearGeluFp16M1(shape.K, shape.N))
+        bool prewarmed = tensorCore
+            ? backend.PrewarmDirectPtxFusedLinearGeluFp16M16(shape.K, shape.N)
+            : backend.PrewarmDirectPtxFusedLinearGeluFp16M1(shape.K, shape.N);
+        if (!prewarmed)
             throw new InvalidOperationException(backend.DirectPtxLastError);
         DirectLaunch();
         backend.Synchronize();
@@ -163,8 +199,12 @@ internal static class DirectPtxMixedLinearExperiment
             directGraphAllocation = MeasureAllocation(backend, GraphLaunch);
         }
         finally { backend.DestroyCapturedGraph(directGraph); }
-        if (!backend.TryGetDirectPtxMixedLinearAudit(
-            shape.K, shape.N, out DirectPtxKernelAudit audit))
+        bool hasAudit = tensorCore
+            ? backend.TryGetDirectPtxMixedLinearM16Audit(
+                shape.K, shape.N, out DirectPtxKernelAudit audit)
+            : backend.TryGetDirectPtxMixedLinearAudit(
+                shape.K, shape.N, out audit);
+        if (!hasAudit)
             throw new InvalidOperationException("No audit for the measured mixed-linear module.");
 
         Print(run, shape, "Direct PTX FP16", directDevice, directE2e,
@@ -245,7 +285,7 @@ internal static class DirectPtxMixedLinearExperiment
         return sorted[lower] + (sorted[upper] - sorted[lower]) * (position - lower);
     }
 
-    private static IReadOnlyList<PythonRecord> RunPython(int runs)
+    private static IReadOnlyList<PythonRecord> RunPython(int runs, int rows)
     {
         string script = Path.Combine(AppContext.BaseDirectory, "BaselineRunners", "py",
             "run_direct_ptx_mixed_linear_competitors.py");
@@ -264,6 +304,8 @@ internal static class DirectPtxMixedLinearExperiment
         start.ArgumentList.Add(script);
         start.ArgumentList.Add("--runs");
         start.ArgumentList.Add(runs.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        start.ArgumentList.Add("--rows");
+        start.ArgumentList.Add(rows.ToString(System.Globalization.CultureInfo.InvariantCulture));
         using Process process = Process.Start(start) ??
             throw new InvalidOperationException("Could not start the PyTorch CUDA baseline.");
         var records = new List<PythonRecord>();
@@ -286,9 +328,9 @@ internal static class DirectPtxMixedLinearExperiment
         return records;
     }
 
-    private static void PrintPython(PythonRecord record)
+    private static void PrintPython(PythonRecord record, IReadOnlyList<Shape> shapes)
     {
-        Shape shape = Shapes.Single(candidate => candidate.Name == record.Shape);
+        Shape shape = shapes.Single(candidate => candidate.Name == record.Shape);
         Print(record.Run, shape, record.Method,
             new Distribution(record.DeviceMeanUs, record.DeviceMedianUs, record.DeviceP95Us, record.DeviceP99Us),
             new Distribution(record.EndToEndMeanUs, record.EndToEndMedianUs, record.EndToEndP95Us, record.EndToEndP99Us),
@@ -308,7 +350,7 @@ internal static class DirectPtxMixedLinearExperiment
         long allocation, long temporaryBytes, float error,
         int registers, int shared, int local, int blocks)
     {
-        double flops = 2.0 * shape.K * shape.N;
+        double flops = 2.0 * shape.M * shape.K * shape.N;
         double tflops = flops / (device.Median * 1e-6) / 1e12;
         Console.WriteLine(
             $"{run,3} {shape.Name,-21} {method,-20} " +
@@ -326,15 +368,18 @@ internal static class DirectPtxMixedLinearExperiment
             .Select(_ => (float)(Half)((random.NextSingle() * 2f - 1f) * scale)).ToArray();
 
     private static float[] Oracle(
-        float[] input, float[] weights, float[] bias, int inputFeatures, int outputFeatures)
+        float[] input, float[] weights, float[] bias,
+        int rows, int inputFeatures, int outputFeatures)
     {
-        var output = new float[outputFeatures];
-        for (int row = 0; row < outputFeatures; row++)
+        var output = new float[rows * outputFeatures];
+        for (int inputRow = 0; inputRow < rows; inputRow++)
+        for (int outputColumn = 0; outputColumn < outputFeatures; outputColumn++)
         {
-            float value = bias[row];
+            float value = bias[outputColumn];
             for (int inner = 0; inner < inputFeatures; inner++)
-                value += input[inner] * weights[row * inputFeatures + inner];
-            output[row] = 0.5f * value *
+                value += input[inputRow * inputFeatures + inner] *
+                    weights[outputColumn * inputFeatures + inner];
+            output[inputRow * outputFeatures + outputColumn] = 0.5f * value *
                 (1f + MathF.Tanh(0.7978845608f *
                     (value + 0.044715f * value * value * value)));
         }

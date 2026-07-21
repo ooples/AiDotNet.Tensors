@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PyTorch CUDA FP16 peers for issue #837 M=1 linear+bias+tanh-GELU."""
+"""PyTorch CUDA FP16 peers for issue #837 linear+bias+tanh-GELU."""
 
 import argparse
 import json
@@ -18,6 +18,10 @@ SHAPES = (
     ("decode-256x256", 256, 256),
     ("decode-up-512x2048", 512, 2048),
     ("decode-up-1024x4096", 1024, 4096),
+)
+M16_SHAPES = (
+    ("m16-up-512x2048", 512, 2048),
+    ("m16-up-1024x4096", 1024, 4096),
 )
 
 
@@ -66,6 +70,7 @@ def measure_e2e(operation):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument("--rows", type=int, choices=(1, 16), default=1)
     args = parser.parse_args()
     if args.runs <= 0:
         parser.error("--runs must be positive")
@@ -77,8 +82,10 @@ def main():
     device = torch.device("cuda")
     for run in range(1, args.runs + 1):
         torch.manual_seed(20261500 + run)
-        for name, input_features, output_features in SHAPES:
-            x = (((torch.rand(input_features, device=device) * 2.0 - 1.0) * 0.125)
+        shapes = SHAPES if args.rows == 1 else M16_SHAPES
+        for name, input_features, output_features in shapes:
+            x_shape = (input_features,) if args.rows == 1 else (args.rows, input_features)
+            x = (((torch.rand(x_shape, device=device) * 2.0 - 1.0) * 0.125)
                  .to(torch.float16))
             weights = (((torch.rand((output_features, input_features), device=device) * 2.0 - 1.0)
                         * 0.0625).to(torch.float16))
