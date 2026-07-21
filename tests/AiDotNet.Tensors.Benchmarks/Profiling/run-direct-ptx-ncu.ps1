@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('attention', 'residual-rmsnorm', 'residual-layernorm-gelu', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'fused-linear', 'mixed-linear', 'mixed-linear-m16', 'w8a8-linear')]
+    [ValidateSet('attention', 'residual-rmsnorm', 'residual-layernorm-gelu', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'geglu', 'geglu-backward', 'fused-linear', 'mixed-linear', 'mixed-linear-m16', 'w8a8-linear')]
     [string]$Target = 'attention',
     [string]$OutputCsv = (Join-Path ([System.IO.Path]::GetTempPath()) ("aidotnet-direct-ptx-ncu-" + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.csv')),
     [string]$NcuPath = $env:NSIGHT_COMPUTE_CLI
@@ -28,6 +28,8 @@ $switch = switch ($Target) {
     'attention-backward' { '--direct-ptx-profile-attention-backward' }
     'flash-attention-backward' { '--direct-ptx-profile-flash-attention-backward' }
     'qkv-rope-cache' { '--direct-ptx-profile-qkv-rope-cache' }
+    'geglu' { '--direct-ptx-profile-geglu' }
+    'geglu-backward' { '--direct-ptx-profile-geglu-backward' }
     'fused-linear' { '--direct-ptx-profile-fused-linear' }
     'mixed-linear' { '--direct-ptx-profile-mixed-linear' }
     'mixed-linear-m16' { '--direct-ptx-profile-mixed-linear-m16' }
@@ -42,6 +44,8 @@ $kernel = switch ($Target) {
     'attention-backward' { 'regex:aidotnet_attention_backward_(delta|dq|dkv)_d64' }
     'flash-attention-backward' { 'regex:aidotnet_flash_attention_backward_(dq|dkv)_d64' }
     'qkv-rope-cache' { 'regex:aidotnet_qkv_rope_cache_d64' }
+    'geglu' { 'regex:aidotnet_fused_geglu_f32x4' }
+    'geglu-backward' { 'regex:aidotnet_fused_geglu_backward_f32x4' }
     'fused-linear' { 'regex:aidotnet_fused_linear_gelu_m1' }
     'mixed-linear' { 'regex:aidotnet_fused_linear_gelu_fp16_m1' }
     'mixed-linear-m16' { 'regex:aidotnet_fused_linear_gelu_fp16_m16' }
@@ -56,6 +60,8 @@ $expectedLaunches = switch ($Target) {
     'attention-backward' { 3 }
     'flash-attention-backward' { 2 }
     'qkv-rope-cache' { 3 }
+    'geglu' { 10 }
+    'geglu-backward' { 10 }
     'fused-linear' { 10 }
     'mixed-linear' { 10 }
     'mixed-linear-m16' { 10 }

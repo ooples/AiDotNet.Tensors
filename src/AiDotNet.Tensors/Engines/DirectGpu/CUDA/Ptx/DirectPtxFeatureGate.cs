@@ -21,6 +21,8 @@ internal static class DirectPtxFeatureGate
     internal const string AttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_ATTENTION_BACKWARD";
     internal const string FlashAttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FLASH_ATTENTION_BACKWARD";
     internal const string QkvRopeCacheEnvironmentVariable = "AIDOTNET_DIRECT_PTX_QKV_ROPE_CACHE";
+    internal const string SwiGluEnvironmentVariable = "AIDOTNET_DIRECT_PTX_SWIGLU";
+    internal const string GeGluEnvironmentVariable = "AIDOTNET_DIRECT_PTX_GEGLU";
     internal const string FusedLinearEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FUSED_LINEAR";
     internal const string MixedPrecisionLinearEnvironmentVariable = "AIDOTNET_DIRECT_PTX_MIXED_LINEAR";
     internal const string QuantizedLinearEnvironmentVariable = "AIDOTNET_DIRECT_PTX_QUANTIZED_LINEAR";
@@ -40,6 +42,8 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentAttentionBackwardEnabled = ReadEnabled(AttentionBackwardEnvironmentVariable);
     private static readonly bool EnvironmentFlashAttentionBackwardEnabled = ReadEnabled(FlashAttentionBackwardEnvironmentVariable);
     private static readonly bool EnvironmentQkvRopeCacheEnabled = ReadEnabled(QkvRopeCacheEnvironmentVariable);
+    private static readonly bool EnvironmentSwiGluEnabled = ReadEnabled(SwiGluEnvironmentVariable);
+    private static readonly bool EnvironmentGeGluEnabled = ReadEnabled(GeGluEnvironmentVariable);
     private static readonly bool EnvironmentFusedLinearEnabled = ReadEnabled(FusedLinearEnvironmentVariable);
     private static readonly bool EnvironmentMixedPrecisionLinearEnabled = ReadEnabled(MixedPrecisionLinearEnvironmentVariable);
     private static readonly bool EnvironmentQuantizedLinearEnabled = ReadEnabled(QuantizedLinearEnvironmentVariable);
@@ -57,6 +61,10 @@ internal static class DirectPtxFeatureGate
     internal static bool QuantizedLinearExperimentOverride { get; set; }
     /// <summary>Benchmark-only access to normalization cells that have not passed promotion.</summary>
     internal static bool NormalizationExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to SwiGLU cells that have not passed promotion.</summary>
+    internal static bool SwiGluExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to GeGLU cells that have not passed promotion.</summary>
+    internal static bool GeGluExperimentOverride { get; set; }
 
     internal static bool IsEnabled => IsAttentionEnabled;
 
@@ -71,6 +79,12 @@ internal static class DirectPtxFeatureGate
 
     internal static bool IsFlashDecodeEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentFlashDecodeEnabled);
+
+    internal static bool IsSwiGluEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentSwiGluEnabled);
+
+    internal static bool IsGeGluEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentGeGluEnabled);
 
     internal static bool IsPagedDecodeEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentPagedDecodeEnabled);

@@ -792,6 +792,34 @@ public class DirectPtxWmmaTests
     }
 
     [Fact]
+    public void PointwiseCoverageManifest_AssignsEveryScopedApiExactlyOnce()
+    {
+        Assert.Equal(74, DirectPtxPointwiseCoverageManifest.All.Count);
+        string[] names = DirectPtxPointwiseCoverageManifest.All
+            .Select(cell => cell.Api).OrderBy(name => name, StringComparer.Ordinal).ToArray();
+        Assert.Equal(names.Length, names.Distinct(StringComparer.Ordinal).Count());
+        Assert.All(DirectPtxPointwiseCoverageManifest.All, cell =>
+        {
+            Assert.False(string.IsNullOrWhiteSpace(cell.ExistingImplementation));
+            Assert.False(string.IsNullOrWhiteSpace(cell.Semantics));
+            Assert.False(string.IsNullOrWhiteSpace(cell.PhysicalLayout));
+            Assert.False(string.IsNullOrWhiteSpace(cell.DTypes));
+            Assert.False(string.IsNullOrWhiteSpace(cell.DirectPtxAssignment));
+        });
+        Assert.Equal(
+            DirectPtxPointwiseCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxPointwiseCoverageManifest.Get("CudaBackend.GeGluForward").Status);
+        Assert.Equal(
+            DirectPtxPointwiseCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxPointwiseCoverageManifest.Get("CudaBackend.SwiGluForward").Status);
+        Assert.Equal(
+            DirectPtxPointwiseCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxPointwiseCoverageManifest.Get("CudaBackend.GeGluBackward").Status);
+        Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() =>
+            DirectPtxPointwiseCoverageManifest.Get("UnassignedPointwiseApi"));
+    }
+
+    [Fact]
     public void NsightEvidence_RequiresEveryExecutedSpillCounterToBeZero()
     {
         string path = System.IO.Path.GetTempFileName();
@@ -919,6 +947,61 @@ public class DirectPtxWmmaTests
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void SwiGluEmitter_VectorizesTheSplitRowAndHasPointerOnlyAbi()
+    {
+        string ptx = PtxFusedSwiGluF32Kernel.EmitPtx(8, 6, 32, 4096);
+        Assert.Equal(2, Count(ptx, "ld.param.u64"));
+        Assert.Equal(2, Count(ptx, "ld.global.nc.v4.f32"));
+        Assert.Equal(1, Count(ptx, "st.global.v4.f32"));
+        Assert.Equal(4, Count(ptx, "ex2.approx.f32"));
+        Assert.Equal(4, Count(ptx, "rcp.approx.f32"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("div.", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("rem.", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxFusedSwiGluF32Kernel.EmitPtx(8, 6, 7, 4096));
+    }
+
+    [Fact]
+    public void GeGluEmitter_VectorizesTheSplitRowAndHasPointerOnlyAbi()
+    {
+        string ptx = PtxFusedGeGluF32Kernel.EmitPtx(8, 6, 32, 4096);
+        Assert.Equal(2, Count(ptx, "ld.param.u64"));
+        Assert.Equal(2, Count(ptx, "ld.global.nc.v4.f32"));
+        Assert.Equal(1, Count(ptx, "st.global.v4.f32"));
+        Assert.Equal(4, Count(ptx, "tanh.approx.f32"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("div.", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("rem.", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxFusedGeGluF32Kernel.EmitPtx(8, 6, 7, 4096));
+    }
+
+    [Fact]
+    public void GeGluBackwardEmitter_IsVectorizedFusedAndPointerOnly()
+    {
+        string ptx = PtxFusedGeGluBackwardF32Kernel.EmitPtx(8, 6, 32, 4096);
+        Assert.Equal(3, Count(ptx, "ld.param.u64"));
+        Assert.Equal(3, Count(ptx, "ld.global.nc.v4.f32"));
+        Assert.Equal(2, Count(ptx, "st.global.v4.f32"));
+        Assert.Equal(4, Count(ptx, "tanh.approx.f32"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("div.", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("rem.", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxFusedGeGluBackwardF32Kernel.EmitPtx(8, 6, 7, 4096));
     }
 
     [Fact]
@@ -3153,6 +3236,375 @@ public class DirectPtxWmmaTests
         var actual = new float[expected.Length];
         output.Download<float>(actual);
         AssertVectorClose(actual, expected, 2e-4f, "residual LayerNorm+GELU");
+    }
+
+    [SkippableFact]
+    public void DriverOnlySwiGlu_MatchesReferenceAndHasZeroLocalBytes()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(runtime.ArchitectureFamily == DirectPtxArchitectureFamily.Ampere,
+            "The checked-in SwiGLU specialization is validated on Ampere.");
+        const int outerSize = 1, halfDimension = 4096;
+        using var kernel = new PtxFusedSwiGluF32Kernel(runtime, outerSize, halfDimension);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+        Assert.Equal(0, kernel.Audit.Function.StaticSharedBytes);
+        Assert.True(kernel.Audit.ActiveBlocksPerMultiprocessor >= 6);
+
+        int inputElements = outerSize * halfDimension * 2;
+        using var input = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        float[] values = Enumerable.Range(0, inputElements)
+            .Select(i => (i % 257 - 128) / 64f).ToArray();
+        var expected = new float[outerSize * halfDimension];
+        for (int i = 0; i < expected.Length; i++)
+        {
+            double gate = values[i + halfDimension];
+            expected[i] = (float)(values[i] * gate / (1.0 + Math.Exp(-gate)));
+        }
+        input.Upload<float>(values);
+        Assert.Throws<ArgumentException>(() => kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[1])));
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[1]));
+        runtime.Synchronize();
+        var actual = new float[expected.Length];
+        output.Download<float>(actual);
+        AssertVectorClose(actual, expected, 2e-5f, "SwiGLU");
+    }
+
+    [SkippableFact]
+    public void DriverOnlyGeGlu_MatchesReferenceAndHasZeroLocalBytes()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(runtime.ArchitectureFamily == DirectPtxArchitectureFamily.Ampere,
+            "The checked-in GeGLU specialization is validated on Ampere.");
+        const int outerSize = 1, halfDimension = 4096;
+        using var kernel = new PtxFusedGeGluF32Kernel(runtime, outerSize, halfDimension);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+        Assert.Equal(0, kernel.Audit.Function.StaticSharedBytes);
+        Assert.True(kernel.Audit.ActiveBlocksPerMultiprocessor >= 6);
+        Assert.Equal(64, kernel.Audit.PtxSha256.Length);
+
+        using var input = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        float[] values = Enumerable.Range(0, outerSize * halfDimension * 2)
+            .Select(i => (i % 257 - 128) / 64f).ToArray();
+        var expected = new float[outerSize * halfDimension];
+        for (int i = 0; i < expected.Length; i++)
+        {
+            double gate = values[i + halfDimension];
+            double inner = 0.7978845608 * (gate + 0.044715 * gate * gate * gate);
+            expected[i] = (float)(values[i] * 0.5 * gate * (1.0 + Math.Tanh(inner)));
+        }
+        input.Upload<float>(values);
+        Assert.Throws<ArgumentException>(() => kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[1])));
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[1]));
+        runtime.Synchronize();
+        var actual = new float[expected.Length];
+        output.Download<float>(actual);
+        AssertVectorClose(actual, expected, 2e-4f, "GeGLU");
+    }
+
+    [SkippableFact]
+    public void DriverOnlyGeGluBackward_MatchesReferenceAndHasZeroLocalBytes()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(runtime.ArchitectureFamily == DirectPtxArchitectureFamily.Ampere,
+            "The checked-in GeGLU-backward specialization is validated on Ampere.");
+        const int outerSize = 1, halfDimension = 4096;
+        using var kernel = new PtxFusedGeGluBackwardF32Kernel(
+            runtime, outerSize, halfDimension);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+        Assert.Equal(0, kernel.Audit.Function.StaticSharedBytes);
+        Assert.True(kernel.Audit.ActiveBlocksPerMultiprocessor >= 4);
+
+        using var gradOutput = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var input = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var gradInput = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        float[] grad = Enumerable.Range(0, outerSize * halfDimension)
+            .Select(i => (i % 113 - 56) / 64f).ToArray();
+        float[] values = Enumerable.Range(0, outerSize * halfDimension * 2)
+            .Select(i => (i % 257 - 128) / 64f).ToArray();
+        var expected = new float[values.Length];
+        for (int i = 0; i < grad.Length; i++)
+        {
+            double value = values[i];
+            double gate = values[i + halfDimension];
+            double inner = 0.7978845608 * (gate + 0.044715 * gate * gate * gate);
+            double tanh = Math.Tanh(inner);
+            double gelu = 0.5 * gate * (1.0 + tanh);
+            double derivative = 0.5 * (1.0 + tanh) +
+                0.5 * gate * (1.0 - tanh * tanh) * 0.7978845608 *
+                (1.0 + 0.134145 * gate * gate);
+            expected[i] = (float)(grad[i] * gelu);
+            expected[i + halfDimension] = (float)(grad[i] * value * derivative);
+        }
+        gradOutput.Upload<float>(grad);
+        input.Upload<float>(values);
+        Assert.Throws<ArgumentException>(() => kernel.Launch(
+            DirectPtxTensorView.CreateOwned(gradOutput, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[2])));
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(gradOutput, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(gradInput, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[expected.Length];
+        gradInput.Download<float>(actual);
+        AssertVectorClose(actual, expected, 3e-4f, "GeGLU backward");
+    }
+
+    [SkippableFact]
+    public void GatedForwardFallback_LaunchesEveryRowAndFeature()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previousGate = DirectPtxFeatureGate.TestOverride;
+        bool previousSwiExperiment = DirectPtxFeatureGate.SwiGluExperimentOverride;
+        bool previousGeExperiment = DirectPtxFeatureGate.GeGluExperimentOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        DirectPtxFeatureGate.SwiGluExperimentOverride = true;
+        DirectPtxFeatureGate.GeGluExperimentOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            const int outerSize = 3, halfDimension = 257;
+            int outputElements = outerSize * halfDimension;
+            var host = new float[outputElements * 2];
+            for (int row = 0; row < outerSize; row++)
+            for (int d = 0; d < halfDimension; d++)
+            {
+                int rowBase = row * 2 * halfDimension;
+                host[rowBase + d] = 0.25f + (row * halfDimension + d) / 2048f;
+                host[rowBase + halfDimension + d] = 0.5f + d / 1024f;
+            }
+            using var input = backend.AllocateBuffer(host);
+            using var output = backend.AllocateBuffer(outputElements);
+
+            void Verify(Action launch, Func<double, double> activation, string name)
+            {
+                launch();
+                backend.Synchronize();
+                float[] actual = backend.DownloadBuffer(output);
+                var expected = new float[outputElements];
+                for (int row = 0; row < outerSize; row++)
+                for (int d = 0; d < halfDimension; d++)
+                {
+                    int rowBase = row * 2 * halfDimension;
+                    double value = host[rowBase + d];
+                    double gate = host[rowBase + halfDimension + d];
+                    expected[row * halfDimension + d] = (float)(value * activation(gate));
+                }
+                AssertVectorClose(actual, expected, 2e-5f, name);
+            }
+
+            Verify(() => backend.GluForward(input, output, outerSize, halfDimension),
+                gate => 1.0 / (1.0 + Math.Exp(-gate)), "GLU fallback launch geometry");
+            Verify(() => backend.GeGluForward(input, output, outerSize, halfDimension), gate =>
+            {
+                double inner = 0.7978845608 * (gate + 0.044715 * gate * gate * gate);
+                return 0.5 * gate * (1.0 + Math.Tanh(inner));
+            }, "GeGLU fallback launch geometry");
+            Verify(() => backend.ReGluForward(input, output, outerSize, halfDimension),
+                gate => Math.Max(gate, 0.0), "ReGLU fallback launch geometry");
+            Verify(() => backend.SwiGluForward(input, output, outerSize, halfDimension),
+                gate => gate / (1.0 + Math.Exp(-gate)), "SwiGLU fallback launch geometry");
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previousGate;
+            DirectPtxFeatureGate.SwiGluExperimentOverride = previousSwiExperiment;
+            DirectPtxFeatureGate.GeGluExperimentOverride = previousGeExperiment;
+        }
+    }
+
+    [SkippableFact]
+    public void BackendSwiGlu_PrewarmCaptureAndModuleLifetimeContractsHold()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previousGate = DirectPtxFeatureGate.TestOverride;
+        bool previousExperiment = DirectPtxFeatureGate.SwiGluExperimentOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        DirectPtxFeatureGate.SwiGluExperimentOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxSwiGluEnabled, "Requires an Ampere CUDA backend.");
+            const int outerSize = 1, halfDimension = 4096;
+            using var input = backend.AllocateBuffer(outerSize * halfDimension * 2);
+            using var output = backend.AllocateBuffer(outerSize * halfDimension);
+
+            Assert.True(backend.PrewarmDirectPtxSwiGluForward(outerSize, halfDimension),
+                backend.DirectPtxLastError);
+            bool captured = true;
+            IntPtr graph = backend.CaptureGraph(() =>
+                captured &= backend.TryDirectPtxSwiGluForward(
+                    input, output, outerSize, halfDimension));
+            Assert.True(captured, backend.DirectPtxLastError);
+            Assert.NotEqual(IntPtr.Zero, graph);
+            Assert.Equal(1, backend.DirectPtxSwiGluPinnedKernelCount);
+            try { backend.LaunchCapturedGraph(graph); }
+            finally { backend.DestroyCapturedGraph(graph); }
+            backend.Synchronize();
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previousGate;
+            DirectPtxFeatureGate.SwiGluExperimentOverride = previousExperiment;
+        }
+    }
+
+    [SkippableFact]
+    public void BackendGeGluForwardAndBackward_AdmissionPrewarmCaptureAndAllocationContractsHold()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previousGate = DirectPtxFeatureGate.TestOverride;
+        bool previousExperiment = DirectPtxFeatureGate.GeGluExperimentOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        DirectPtxFeatureGate.GeGluExperimentOverride = false;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxGeGluEnabled, "Requires an Ampere CUDA backend.");
+            const int outerSize = 1, halfDimension = 4096;
+            int outputElements = outerSize * halfDimension;
+            float[] host = Enumerable.Range(0, outputElements * 2)
+                .Select(i => (i % 193 - 96) / 64f).ToArray();
+            var expected = new float[outputElements];
+            for (int i = 0; i < outputElements; i++)
+            {
+                double gate = host[i + halfDimension];
+                double inner = 0.7978845608 * (gate + 0.044715 * gate * gate * gate);
+                expected[i] = (float)(host[i] * 0.5 * gate * (1.0 + Math.Tanh(inner)));
+            }
+            using var input = backend.AllocateBuffer(host);
+            using var output = backend.AllocateBuffer(outputElements);
+            float[] gradOutputHost = Enumerable.Range(0, outputElements)
+                .Select(i => (i % 127 - 63) / 64f).ToArray();
+            var backwardExpected = new float[outputElements * 2];
+            for (int i = 0; i < outputElements; i++)
+            {
+                double value = host[i];
+                double gate = host[i + halfDimension];
+                double grad = gradOutputHost[i];
+                double inner = 0.7978845608 * (gate + 0.044715 * gate * gate * gate);
+                double tanh = Math.Tanh(inner);
+                double gelu = 0.5 * gate * (1.0 + tanh);
+                double derivative = 0.5 * (1.0 + tanh) +
+                    0.5 * gate * (1.0 - tanh * tanh) * 0.7978845608 *
+                    (1.0 + 0.134145 * gate * gate);
+                backwardExpected[i] = (float)(grad * gelu);
+                backwardExpected[i + halfDimension] = (float)(grad * value * derivative);
+            }
+            using var gradOutput = backend.AllocateBuffer(gradOutputHost);
+            using var gradInput = backend.AllocateBuffer(outputElements * 2);
+
+            long dispatchBefore = backend.DirectPtxGeGluDispatchCount;
+            backend.GeGluForward(input, output, outerSize, halfDimension);
+            backend.Synchronize();
+            Assert.Equal(dispatchBefore, backend.DirectPtxGeGluDispatchCount);
+            Assert.Equal("geglu-performance-gate-not-met", backend.DirectPtxLastError);
+            AssertVectorClose(backend.DownloadBuffer(output), expected, 2e-4f, "GeGLU fallback");
+
+            long backwardDispatchBefore = backend.DirectPtxGeGluBackwardDispatchCount;
+            backend.GeGluBackward(
+                gradOutput, input, gradInput, outerSize, halfDimension);
+            backend.Synchronize();
+            Assert.Equal(backwardDispatchBefore, backend.DirectPtxGeGluBackwardDispatchCount);
+            Assert.Equal("geglu-backward-performance-gate-not-met", backend.DirectPtxLastError);
+            AssertVectorClose(
+                backend.DownloadBuffer(gradInput), backwardExpected, 3e-4f,
+                "GeGLU-backward fallback");
+
+            DirectPtxFeatureGate.GeGluExperimentOverride = true;
+            using (var oversizedOutput = backend.AllocateBuffer(outputElements + 1))
+            {
+                Assert.False(backend.TryDirectPtxGeGluForward(
+                    input, oversizedOutput, outerSize, halfDimension));
+                Assert.Equal("geglu-physical-extent-mismatch", backend.DirectPtxLastError);
+            }
+            Assert.True(backend.PrewarmDirectPtxGeGluForward(outerSize, halfDimension),
+                backend.DirectPtxLastError);
+            backend.GeGluForward(input, output, outerSize, halfDimension);
+            backend.Synchronize();
+            AssertVectorClose(backend.DownloadBuffer(output), expected, 2e-4f, "direct PTX GeGLU");
+
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < 40; i++)
+                backend.GeGluForward(input, output, outerSize, halfDimension);
+            long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+            backend.Synchronize();
+            Assert.Equal(0, allocated);
+            Assert.True(backend.TryGetDirectPtxGeGluAudit(
+                outerSize, halfDimension, out DirectPtxKernelAudit audit));
+            Assert.Equal(0, audit.Function.LocalBytesPerThread);
+            Assert.Equal(0, audit.Function.StaticSharedBytes);
+            Assert.True(audit.ActiveBlocksPerMultiprocessor >= 6);
+
+            IntPtr graph = backend.CaptureGraph(() =>
+                backend.GeGluForward(input, output, outerSize, halfDimension));
+            Assert.NotEqual(IntPtr.Zero, graph);
+            Assert.Equal(1, backend.DirectPtxGeGluPinnedKernelCount);
+            try { backend.LaunchCapturedGraph(graph); }
+            finally { backend.DestroyCapturedGraph(graph); }
+            backend.Synchronize();
+            Assert.True(backend.DirectPtxGeGluDispatchCount >= dispatchBefore + 42);
+
+            using (var oversizedGradInput = backend.AllocateBuffer(outputElements * 2 + 1))
+            {
+                Assert.False(backend.TryDirectPtxGeGluBackward(
+                    gradOutput, input, oversizedGradInput, outerSize, halfDimension));
+                Assert.Equal(
+                    "geglu-backward-physical-extent-mismatch", backend.DirectPtxLastError);
+            }
+            Assert.True(backend.PrewarmDirectPtxGeGluBackward(outerSize, halfDimension),
+                backend.DirectPtxLastError);
+            backend.GeGluBackward(
+                gradOutput, input, gradInput, outerSize, halfDimension);
+            backend.Synchronize();
+            AssertVectorClose(
+                backend.DownloadBuffer(gradInput), backwardExpected, 3e-4f,
+                "direct PTX GeGLU backward");
+
+            long backwardAllocationBefore = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < 40; i++)
+                backend.GeGluBackward(
+                    gradOutput, input, gradInput, outerSize, halfDimension);
+            long backwardAllocated =
+                GC.GetAllocatedBytesForCurrentThread() - backwardAllocationBefore;
+            backend.Synchronize();
+            Assert.Equal(0, backwardAllocated);
+            Assert.True(backend.TryGetDirectPtxGeGluBackwardAudit(
+                outerSize, halfDimension, out DirectPtxKernelAudit backwardAudit));
+            Assert.Equal(0, backwardAudit.Function.LocalBytesPerThread);
+            Assert.Equal(0, backwardAudit.Function.StaticSharedBytes);
+            Assert.True(backwardAudit.ActiveBlocksPerMultiprocessor >= 4);
+
+            IntPtr backwardGraph = backend.CaptureGraph(() =>
+                backend.GeGluBackward(
+                    gradOutput, input, gradInput, outerSize, halfDimension));
+            Assert.NotEqual(IntPtr.Zero, backwardGraph);
+            Assert.Equal(1, backend.DirectPtxGeGluBackwardPinnedKernelCount);
+            try { backend.LaunchCapturedGraph(backwardGraph); }
+            finally { backend.DestroyCapturedGraph(backwardGraph); }
+            backend.Synchronize();
+            Assert.True(
+                backend.DirectPtxGeGluBackwardDispatchCount >= backwardDispatchBefore + 42);
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previousGate;
+            DirectPtxFeatureGate.GeGluExperimentOverride = previousExperiment;
+        }
     }
 
     [SkippableFact]
