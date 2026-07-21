@@ -20,6 +20,8 @@ public sealed partial class CudaBackend
         _directPtxAttentionPlans = new(DirectPtxFeatureGate.CacheCapacity);
     private readonly DirectPtxKernelCache<DirectPtxResidualRmsNormKey, PtxFusedResidualRmsNormD64Kernel>
         _directPtxResidualRmsNormKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<DirectPtxResidualRmsNormKey, PtxFusedResidualBiasLayerNormGeluD64Kernel>
+        _directPtxResidualLayerNormGeluKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<DirectPtxDecodeKey, PtxFusedDecodeAttentionD64Kernel>
         _directPtxDecodeKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<DirectPtxPagedPrefillKey, PtxFusedPagedPrefillAttentionD64Kernel>
@@ -46,6 +48,7 @@ public sealed partial class CudaBackend
         System.Threading.Interlocked.Read(ref _directPtxAttentionDispatchCount);
     private long _directPtxAttentionDispatchCount;
     private long _directPtxResidualRmsNormDispatchCount;
+    private long _directPtxResidualLayerNormGeluDispatchCount;
     private long _directPtxDecodeDispatchCount;
     private long _directPtxPagedPrefillDispatchCount;
     private long _directPtxAttentionBackwardDispatchCount;
@@ -66,6 +69,10 @@ public sealed partial class CudaBackend
     internal bool IsDirectPtxResidualRmsNormEnabled =>
         _directPtxResidualRmsNormOptedIn && IsAvailable &&
         DirectPtxArchitecture.HasValidatedOnlineAttention(_ccMajor, _ccMinor);
+
+    internal bool IsDirectPtxResidualLayerNormGeluEnabled =>
+        DirectPtxFeatureGate.IsResidualLayerNormGeluEnabled && IsAvailable &&
+        DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) == DirectPtxArchitectureFamily.Ampere;
 
     internal bool IsDirectPtxFlashDecodeEnabled =>
         DirectPtxFeatureGate.IsFlashDecodeEnabled && IsAvailable &&
@@ -105,6 +112,12 @@ public sealed partial class CudaBackend
 
     internal long DirectPtxResidualRmsNormDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxResidualRmsNormDispatchCount);
+    internal long DirectPtxResidualLayerNormGeluDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxResidualLayerNormGeluDispatchCount);
+    internal int DirectPtxResidualLayerNormGeluPinnedKernelCount
+    {
+        get { lock (_directPtxLock) return _directPtxResidualLayerNormGeluKernels.PinnedCount; }
+    }
 
     internal long DirectPtxDecodeDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxDecodeDispatchCount);
@@ -2310,6 +2323,185 @@ public sealed partial class CudaBackend
         return false;
     }
 
+    /// <summary>
+    /// Attempts the exact contiguous FP32 D=64 transformer boundary
+    /// GELU(LayerNorm(input + residual + bias)). The direct kernel reads each
+    /// activation once, retains both values owned by a lane in registers, and
+    /// performs no intermediate global-memory stores.
+    /// </summary>
+    internal bool TryDirectPtxFusedResidualBiasLayerNormGeluD64(
+        IGpuBuffer input,
+        IGpuBuffer residual,
+        IGpuBuffer preNormBias,
+        IGpuBuffer gamma,
+        IGpuBuffer beta,
+        IGpuBuffer output,
+        int rows,
+        float epsilon = 1e-5f)
+    {
+        if (!DirectPtxFeatureGate.IsResidualLayerNormGeluEnabled)
+        {
+            DirectPtxLastError = "residual-layernorm-gelu-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "residual-layernorm-gelu-cuda-unavailable";
+            return false;
+        }
+        if (DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) !=
+            DirectPtxArchitectureFamily.Ampere)
+        {
+            DirectPtxLastError = "residual-layernorm-gelu-architecture-not-validated";
+            return false;
+        }
+        if (!PtxFusedResidualBiasLayerNormGeluD64Kernel.IsSupportedRows(rows))
+        {
+            DirectPtxLastError = "residual-layernorm-gelu-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedResidualBiasLayerNormGeluD64Kernel.IsPromotedRows(rows) &&
+            !DirectPtxFeatureGate.NormalizationExperimentOverride)
+        {
+            DirectPtxLastError = "residual-layernorm-gelu-performance-gate-not-met";
+            return false;
+        }
+
+        long matrixBytes = checked((long)rows * PtxFusedResidualBiasLayerNormGeluD64Kernel.Dimension * sizeof(float));
+        long vectorBytes = PtxFusedResidualBiasLayerNormGeluD64Kernel.Dimension * sizeof(float);
+        if (input.SizeInBytes != matrixBytes || residual.SizeInBytes != matrixBytes ||
+            preNormBias.SizeInBytes != vectorBytes || gamma.SizeInBytes != vectorBytes ||
+            beta.SizeInBytes != vectorBytes || output.SizeInBytes != matrixBytes)
+        {
+            DirectPtxLastError = "residual-layernorm-gelu-physical-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var key = new DirectPtxResidualRmsNormKey(rows, BitConverter.SingleToInt32Bits(epsilon));
+            lock (_directPtxLock)
+            {
+                if (!_directPtxResidualLayerNormGeluKernels.TryGetValue(
+                    key, out PtxFusedResidualBiasLayerNormGeluD64Kernel? kernel))
+                {
+                    if (capturing)
+                    {
+                        DirectPtxLastError =
+                            "Direct PTX residual LayerNorm+GELU must be prewarmed before CUDA graph capture.";
+                        return false;
+                    }
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    kernel = CreateAndCacheResidualLayerNormGeluKernelSlow(key);
+                }
+                if (capturing && !_directPtxResidualLayerNormGeluKernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX residual LayerNorm+GELU module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(residual, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(preNormBias, kernel.Blueprint.Tensors[2]),
+                        DirectPtxTensorView.Create(gamma, kernel.Blueprint.Tensors[3]),
+                        DirectPtxTensorView.Create(beta, kernel.Blueprint.Tensors[4]),
+                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[5]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxResidualLayerNormGeluDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxFusedResidualBiasLayerNormGeluD64Kernel
+        CreateAndCacheResidualLayerNormGeluKernelSlow(DirectPtxResidualRmsNormKey key) =>
+        _directPtxResidualLayerNormGeluKernels.GetOrAdd(key, () =>
+            new PtxFusedResidualBiasLayerNormGeluD64Kernel(
+                _directPtxRuntime!, key.Rows, BitConverter.Int32BitsToSingle(key.EpsilonBits)));
+
+    internal bool PrewarmDirectPtxFusedResidualBiasLayerNormGeluD64(
+        int rows,
+        float epsilon = 1e-5f)
+    {
+        if (!DirectPtxFeatureGate.IsResidualLayerNormGeluEnabled)
+        {
+            DirectPtxLastError = "residual-layernorm-gelu-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "residual-layernorm-gelu-cuda-unavailable";
+            return false;
+        }
+        if (DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) !=
+            DirectPtxArchitectureFamily.Ampere)
+        {
+            DirectPtxLastError = "residual-layernorm-gelu-architecture-not-validated";
+            return false;
+        }
+        if (!PtxFusedResidualBiasLayerNormGeluD64Kernel.IsSupportedRows(rows))
+        {
+            DirectPtxLastError = "residual-layernorm-gelu-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedResidualBiasLayerNormGeluD64Kernel.IsPromotedRows(rows) &&
+            !DirectPtxFeatureGate.NormalizationExperimentOverride)
+        {
+            DirectPtxLastError = "residual-layernorm-gelu-performance-gate-not-met";
+            return false;
+        }
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX residual LayerNorm+GELU prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                var key = new DirectPtxResidualRmsNormKey(
+                    rows, BitConverter.SingleToInt32Bits(epsilon));
+                if (!_directPtxResidualLayerNormGeluKernels.TryGetValue(key, out _))
+                    _ = CreateAndCacheResidualLayerNormGeluKernelSlow(key);
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxResidualLayerNormGeluAudit(
+        int rows,
+        float epsilon,
+        out DirectPtxKernelAudit audit)
+    {
+        lock (_directPtxLock)
+        {
+            var key = new DirectPtxResidualRmsNormKey(rows, BitConverter.SingleToInt32Bits(epsilon));
+            if (_directPtxResidualLayerNormGeluKernels.TryGetValue(key, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null!;
+        return false;
+    }
+
     internal bool TryGetDirectPtxAttentionAudit(
         int batchHeads,
         float scale,
@@ -2408,6 +2600,7 @@ public sealed partial class CudaBackend
             _directPtxAttentionKernels.Dispose();
             _directPtxAttentionPlans.Clear();
             _directPtxResidualRmsNormKernels.Dispose();
+            _directPtxResidualLayerNormGeluKernels.Dispose();
             _directPtxDecodeKernels.Dispose();
             _directPtxPagedPrefillKernels.Dispose();
             _directPtxAttentionBackwardKernels.Dispose();

@@ -3187,6 +3187,65 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel2D(kernel, gridX, gridY, DefaultBlockSize, 1, args);
     }
 
+    /// <summary>
+    /// Applies a canonical contiguous D=64 transformer boundary:
+    /// <c>GELU(LayerNorm(input + residual + preNormBias, gamma, beta))</c>.
+    /// Exact admitted shapes use a single direct-PTX kernel; all other shapes
+    /// fail closed to resident CUDA kernels without a temporary allocation.
+    /// </summary>
+    public unsafe void FusedResidualBiasLayerNormGeluD64(
+        IGpuBuffer input,
+        IGpuBuffer residual,
+        IGpuBuffer preNormBias,
+        IGpuBuffer gamma,
+        IGpuBuffer beta,
+        IGpuBuffer output,
+        int rows,
+        float epsilon = 1e-5f)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (residual is null) throw new ArgumentNullException(nameof(residual));
+        if (preNormBias is null) throw new ArgumentNullException(nameof(preNormBias));
+        if (gamma is null) throw new ArgumentNullException(nameof(gamma));
+        if (beta is null) throw new ArgumentNullException(nameof(beta));
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (rows <= 0) throw new ArgumentOutOfRangeException(nameof(rows));
+        if (float.IsNaN(epsilon) || float.IsInfinity(epsilon) || epsilon <= 0)
+            throw new ArgumentOutOfRangeException(nameof(epsilon));
+        int elements = checked(rows * 64);
+        if (input.Size < elements || residual.Size < elements || output.Size < elements ||
+            preNormBias.Size < 64 || gamma.Size < 64 || beta.Size < 64)
+            throw new ArgumentException(
+                "Residual LayerNorm+GELU buffers are smaller than the requested canonical extents.");
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxFusedResidualBiasLayerNormGeluD64(
+            input, residual, preNormBias, gamma, beta, output, rows, epsilon))
+            return;
+#endif
+
+        Add(input, residual, output, elements);
+        BiasAdd(output, preNormBias, output, rows, 64);
+        if (!_kernelCache.TryGetValue("layernorm_gelu", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: layernorm_gelu");
+        using var context = PushContext();
+        IntPtr inputPointer = output.Handle;
+        IntPtr outputPointer = output.Handle;
+        IntPtr gammaPointer = gamma.Handle;
+        IntPtr betaPointer = beta.Handle;
+        int normalizedSize = 64;
+        void** args = stackalloc void*[7];
+        args[0] = &inputPointer;
+        args[1] = &outputPointer;
+        args[2] = &gammaPointer;
+        args[3] = &betaPointer;
+        args[4] = &rows;
+        args[5] = &normalizedSize;
+        args[6] = &epsilon;
+        LaunchKernelWithSharedMem(
+            kernel, (uint)rows, DefaultBlockSize,
+            DefaultBlockSize * sizeof(float), args);
+    }
+
     public unsafe void Conv2DBiasAdd(IGpuBuffer output, IGpuBuffer bias, int batch, int channels, int spatialSize)
     {
         if (!_kernelCache.TryGetValue("conv2d_bias_add", out var kernel))

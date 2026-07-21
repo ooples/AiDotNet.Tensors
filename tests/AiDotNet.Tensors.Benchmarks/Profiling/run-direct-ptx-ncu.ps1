@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'fused-linear', 'mixed-linear', 'mixed-linear-m16', 'w8a8-linear')]
+    [ValidateSet('attention', 'residual-rmsnorm', 'residual-layernorm-gelu', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'fused-linear', 'mixed-linear', 'mixed-linear-m16', 'w8a8-linear')]
     [string]$Target = 'attention',
     [string]$OutputCsv = (Join-Path ([System.IO.Path]::GetTempPath()) ("aidotnet-direct-ptx-ncu-" + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.csv')),
     [string]$NcuPath = $env:NSIGHT_COMPUTE_CLI
@@ -22,6 +22,7 @@ $targetDll = (Resolve-Path -LiteralPath $targetDll).Path
 $switch = switch ($Target) {
     'attention' { '--direct-ptx-profile-attention' }
     'residual-rmsnorm' { '--direct-ptx-profile-residual-rmsnorm' }
+    'residual-layernorm-gelu' { '--direct-ptx-profile-residual-layernorm-gelu' }
     'decode' { '--direct-ptx-profile-decode' }
     'paged-prefill' { '--direct-ptx-profile-paged-prefill' }
     'attention-backward' { '--direct-ptx-profile-attention-backward' }
@@ -35,6 +36,7 @@ $switch = switch ($Target) {
 $kernel = switch ($Target) {
     'attention' { 'regex:aidotnet_online_attention_128x64' }
     'residual-rmsnorm' { 'regex:aidotnet_fused_residual_rmsnorm_d64' }
+    'residual-layernorm-gelu' { 'regex:aidotnet_fused_residual_bias_layernorm_gelu_d64' }
     'decode' { 'regex:aidotnet_(flash|paged)_decode_d64' }
     'paged-prefill' { 'regex:aidotnet_paged_prefill_d64' }
     'attention-backward' { 'regex:aidotnet_attention_backward_(delta|dq|dkv)_d64' }
@@ -48,6 +50,7 @@ $kernel = switch ($Target) {
 $expectedLaunches = switch ($Target) {
     'attention' { 16 }
     'residual-rmsnorm' { 4 }
+    'residual-layernorm-gelu' { 10 }
     'decode' { 2 }
     'paged-prefill' { 1 }
     'attention-backward' { 3 }

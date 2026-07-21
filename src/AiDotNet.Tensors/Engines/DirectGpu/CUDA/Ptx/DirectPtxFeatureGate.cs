@@ -14,6 +14,7 @@ internal static class DirectPtxFeatureGate
     internal const string MasterEnvironmentVariable = "AIDOTNET_DIRECT_PTX";
     internal const string EnvironmentVariable = "AIDOTNET_DIRECT_PTX_ATTENTION";
     internal const string ResidualRmsNormEnvironmentVariable = "AIDOTNET_DIRECT_PTX_RESIDUAL_RMSNORM";
+    internal const string ResidualLayerNormGeluEnvironmentVariable = "AIDOTNET_DIRECT_PTX_RESIDUAL_LAYERNORM_GELU";
     internal const string FlashDecodeEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FLASH_DECODE";
     internal const string PagedDecodeEnvironmentVariable = "AIDOTNET_DIRECT_PTX_PAGED_DECODE";
     internal const string PagedPrefillEnvironmentVariable = "AIDOTNET_DIRECT_PTX_PAGED_PREFILL";
@@ -32,6 +33,7 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentMasterEnabled = ReadEnabled(MasterEnvironmentVariable);
     private static readonly bool EnvironmentAttentionEnabled = ReadEnabled(EnvironmentVariable);
     private static readonly bool EnvironmentResidualRmsNormEnabled = ReadEnabled(ResidualRmsNormEnvironmentVariable);
+    private static readonly bool EnvironmentResidualLayerNormGeluEnabled = ReadEnabled(ResidualLayerNormGeluEnvironmentVariable);
     private static readonly bool EnvironmentFlashDecodeEnabled = ReadEnabled(FlashDecodeEnvironmentVariable);
     private static readonly bool EnvironmentPagedDecodeEnabled = ReadEnabled(PagedDecodeEnvironmentVariable);
     private static readonly bool EnvironmentPagedPrefillEnabled = ReadEnabled(PagedPrefillEnvironmentVariable);
@@ -53,6 +55,8 @@ internal static class DirectPtxFeatureGate
     internal static bool MixedPrecisionLinearExperimentOverride { get; set; }
     /// <summary>Benchmark-only access to quantized cells that have not passed promotion.</summary>
     internal static bool QuantizedLinearExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to normalization cells that have not passed promotion.</summary>
+    internal static bool NormalizationExperimentOverride { get; set; }
 
     internal static bool IsEnabled => IsAttentionEnabled;
 
@@ -61,6 +65,9 @@ internal static class DirectPtxFeatureGate
 
     internal static bool IsResidualRmsNormEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentResidualRmsNormEnabled);
+
+    internal static bool IsResidualLayerNormGeluEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentResidualLayerNormGeluEnabled);
 
     internal static bool IsFlashDecodeEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentFlashDecodeEnabled);

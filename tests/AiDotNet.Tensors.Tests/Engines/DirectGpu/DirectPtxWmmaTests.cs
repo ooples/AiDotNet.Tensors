@@ -865,6 +865,81 @@ public class DirectPtxWmmaTests
     }
 
     [Fact]
+    public void ResidualBiasLayerNormGelu_OnlyPromotesCellsThatClearThreeRunReleaseGate()
+    {
+        DirectPtxReleaseGatePolicy policy = DirectPtxReleaseGatePolicy.ProductionDefault;
+        var rows2048 = new DirectPtxPerformanceEvidence(
+            2.79, 3.28, 0, 0, 5.6e-6, 0, 3);
+        var rows2048Competitor = new DirectPtxPerformanceEvidence(
+            3.77, 3.79, 0, 1024, 7.2e-7, 0, 3);
+        var rows8192 = new DirectPtxPerformanceEvidence(
+            5.96, 7.29, 0, 0, 5.6e-6, 0, 3);
+        var rows8192Competitor = new DirectPtxPerformanceEvidence(
+            10.65, 11.30, 0, 1024, 7.2e-7, 0, 3);
+        var rows256 = new DirectPtxPerformanceEvidence(
+            2.17, 3.03, 0, 0, 5.6e-6, 0, 3);
+        var rows256Competitor = new DirectPtxPerformanceEvidence(
+            1.99, 2.48, 0, 1024, 4.8e-7, 0, 3);
+
+        Assert.True(policy.Evaluate(rows2048, rows2048Competitor).Passed);
+        Assert.True(policy.Evaluate(rows8192, rows8192Competitor).Passed);
+        Assert.False(policy.Evaluate(rows256, rows256Competitor).Passed);
+        Assert.True(PtxFusedResidualBiasLayerNormGeluD64Kernel.IsPromotedRows(2048));
+        Assert.True(PtxFusedResidualBiasLayerNormGeluD64Kernel.IsPromotedRows(8192));
+        Assert.False(PtxFusedResidualBiasLayerNormGeluD64Kernel.IsPromotedRows(256));
+    }
+
+    [Fact]
+    public void ResidualBiasLayerNormGeluEmitter_IsRegisterResidentAndStrideFree()
+    {
+        string ptx = PtxFusedResidualBiasLayerNormGeluD64Kernel.EmitPtx(
+            8, 6, 256, 1e-5f);
+        Assert.Equal(10, Count(ptx, "shfl.sync.bfly.b32"));
+        Assert.Equal(6, Count(ptx, "ld.param.u64"));
+        Assert.Equal(10, Count(ptx, "ld.global.nc.f32"));
+        Assert.Equal(2, Count(ptx, "st.global.f32"));
+        Assert.Contains("tanh.approx.f32", ptx);
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ResidualBiasLayerNormGeluEmitter_RejectsUnsupportedSpecializationDomains()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxFusedResidualBiasLayerNormGeluD64Kernel.EmitPtx(8, 6, 255, 1e-5f));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxFusedResidualBiasLayerNormGeluD64Kernel.EmitPtx(8, 6, 256, 0f));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxFusedResidualBiasLayerNormGeluD64Kernel.EmitPtx(8, 6, 256, float.NaN));
+    }
+
+    [Fact]
+    public void NormalizationCoverageManifest_AssignsEveryScopedApiExactlyOnce()
+    {
+        Assert.Equal(41, DirectPtxNormalizationCoverageManifest.All.Count);
+        string[] names = DirectPtxNormalizationCoverageManifest.All
+            .Select(cell => cell.Api).ToArray();
+        Assert.Equal(names.Length, names.Distinct(StringComparer.Ordinal).Count());
+        Assert.All(DirectPtxNormalizationCoverageManifest.All, cell =>
+        {
+            Assert.False(string.IsNullOrWhiteSpace(cell.ExistingImplementation));
+            Assert.False(string.IsNullOrWhiteSpace(cell.Semantics));
+            Assert.False(string.IsNullOrWhiteSpace(cell.PhysicalLayout));
+            Assert.False(string.IsNullOrWhiteSpace(cell.DTypes));
+            Assert.False(string.IsNullOrWhiteSpace(cell.DirectPtxAssignment));
+        });
+        Assert.Equal(
+            DirectPtxNormalizationCoverageStatus.PromotedDirectPtx,
+            DirectPtxNormalizationCoverageManifest.Get(
+                "CudaBackend.FusedResidualBiasLayerNormGeluD64").Status);
+        Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() =>
+            DirectPtxNormalizationCoverageManifest.Get("UnassignedNormalizationApi"));
+    }
+
+    [Fact]
     public void ResidualRmsNormEmitter_IsRegisterReducedAndStrideFree()
     {
         string ptx = PtxFusedResidualRmsNormD64Kernel.EmitPtx(8, 6, 1e-5f);
@@ -3007,6 +3082,143 @@ public class DirectPtxWmmaTests
     }
 
     [SkippableFact]
+    public void DriverOnlyResidualBiasLayerNormGelu_MatchesReferenceAndHasZeroLocalBytes()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(runtime.ArchitectureFamily == DirectPtxArchitectureFamily.Ampere,
+            "The checked-in residual LayerNorm+GELU specialization is validated on Ampere.");
+        const int rows = 256, dimension = 64;
+        using var kernel = new PtxFusedResidualBiasLayerNormGeluD64Kernel(runtime, rows);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+        Assert.Equal(0, kernel.Audit.Function.StaticSharedBytes);
+        Assert.True(kernel.Audit.ActiveBlocksPerMultiprocessor >= 6);
+        Assert.Equal(64, kernel.Audit.PtxSha256.Length);
+
+        using var input = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var residual = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var bias = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        using var gamma = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
+        using var beta = runtime.AllocateBytes(kernel.Blueprint.Tensors[4].RequiredBytes);
+        using var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[5].RequiredBytes);
+        var random = new Random(20260812);
+        float[] x = Enumerable.Range(0, rows * dimension)
+            .Select(_ => (random.NextSingle() - 0.5f) * 2f).ToArray();
+        float[] r = Enumerable.Range(0, rows * dimension)
+            .Select(_ => (random.NextSingle() - 0.5f) * 0.5f).ToArray();
+        float[] b = Enumerable.Range(0, dimension)
+            .Select(i => (i - 31.5f) / 512f).ToArray();
+        float[] g = Enumerable.Range(0, dimension)
+            .Select(i => 0.75f + i / 256f).ToArray();
+        float[] be = Enumerable.Range(0, dimension)
+            .Select(i => (31.5f - i) / 1024f).ToArray();
+        float[] expected = ResidualBiasLayerNormGeluOracle(x, r, b, g, be, rows, 1e-5f);
+        input.Upload<float>(x);
+        residual.Upload<float>(r);
+        bias.Upload<float>(b);
+        gamma.Upload<float>(g);
+        beta.Upload<float>(be);
+        Assert.Throws<ArgumentException>(() => kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(residual, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(gamma, kernel.Blueprint.Tensors[3]),
+            DirectPtxTensorView.CreateOwned(beta, kernel.Blueprint.Tensors[4]),
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[5])));
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(residual, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(gamma, kernel.Blueprint.Tensors[3]),
+            DirectPtxTensorView.CreateOwned(beta, kernel.Blueprint.Tensors[4]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[5]));
+        runtime.Synchronize();
+        var actual = new float[expected.Length];
+        output.Download<float>(actual);
+        AssertVectorClose(actual, expected, 2e-4f, "residual LayerNorm+GELU");
+    }
+
+    [SkippableFact]
+    public void BackendResidualBiasLayerNormGelu_AdmissionPrewarmCaptureAndAllocationContractsHold()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previousGate = DirectPtxFeatureGate.TestOverride;
+        bool previousExperiment = DirectPtxFeatureGate.NormalizationExperimentOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        DirectPtxFeatureGate.NormalizationExperimentOverride = false;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxResidualLayerNormGeluEnabled,
+                "Requires an Ampere CUDA backend.");
+            const int rows = 256, elements = rows * 64;
+            float[] x = Enumerable.Range(0, elements).Select(i => (i % 29 - 14) / 32f).ToArray();
+            float[] r = Enumerable.Range(0, elements).Select(i => (i % 17 - 8) / 64f).ToArray();
+            float[] b = Enumerable.Range(0, 64).Select(i => (i - 32) / 512f).ToArray();
+            float[] g = Enumerable.Range(0, 64).Select(i => 0.875f + i / 512f).ToArray();
+            float[] be = Enumerable.Range(0, 64).Select(i => (32 - i) / 1024f).ToArray();
+            float[] expected = ResidualBiasLayerNormGeluOracle(x, r, b, g, be, rows, 1e-5f);
+            using var input = backend.AllocateBuffer(x);
+            using var residual = backend.AllocateBuffer(r);
+            using var bias = backend.AllocateBuffer(b);
+            using var gamma = backend.AllocateBuffer(g);
+            using var beta = backend.AllocateBuffer(be);
+            using var output = backend.AllocateBuffer(elements);
+
+            long dispatchBefore = backend.DirectPtxResidualLayerNormGeluDispatchCount;
+            backend.FusedResidualBiasLayerNormGeluD64(
+                input, residual, bias, gamma, beta, output, rows);
+            backend.Synchronize();
+            Assert.Equal(dispatchBefore, backend.DirectPtxResidualLayerNormGeluDispatchCount);
+            Assert.Equal("residual-layernorm-gelu-performance-gate-not-met", backend.DirectPtxLastError);
+            AssertVectorClose(backend.DownloadBuffer(output), expected, 2e-4f, "fallback");
+
+            DirectPtxFeatureGate.NormalizationExperimentOverride = true;
+            using (var oversizedOutput = backend.AllocateBuffer(elements + 1))
+            {
+                Assert.False(backend.TryDirectPtxFusedResidualBiasLayerNormGeluD64(
+                    input, residual, bias, gamma, beta, oversizedOutput, rows));
+                Assert.Equal("residual-layernorm-gelu-physical-extent-mismatch",
+                    backend.DirectPtxLastError);
+            }
+            Assert.True(backend.PrewarmDirectPtxFusedResidualBiasLayerNormGeluD64(rows),
+                backend.DirectPtxLastError);
+            backend.FusedResidualBiasLayerNormGeluD64(
+                input, residual, bias, gamma, beta, output, rows);
+            backend.Synchronize();
+            AssertVectorClose(backend.DownloadBuffer(output), expected, 2e-4f, "direct PTX");
+
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < 40; i++)
+                backend.FusedResidualBiasLayerNormGeluD64(
+                    input, residual, bias, gamma, beta, output, rows);
+            long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+            backend.Synchronize();
+            Assert.Equal(0, allocated);
+            Assert.True(backend.TryGetDirectPtxResidualLayerNormGeluAudit(
+                rows, 1e-5f, out DirectPtxKernelAudit audit));
+            Assert.Equal(0, audit.Function.LocalBytesPerThread);
+            Assert.Equal(0, audit.Function.StaticSharedBytes);
+            Assert.True(audit.ActiveBlocksPerMultiprocessor >= 6);
+
+            IntPtr graph = backend.CaptureGraph(() =>
+                backend.FusedResidualBiasLayerNormGeluD64(
+                    input, residual, bias, gamma, beta, output, rows));
+            Assert.NotEqual(IntPtr.Zero, graph);
+            Assert.Equal(1, backend.DirectPtxResidualLayerNormGeluPinnedKernelCount);
+            try { backend.LaunchCapturedGraph(graph); }
+            finally { backend.DestroyCapturedGraph(graph); }
+            backend.Synchronize();
+            Assert.True(backend.DirectPtxResidualLayerNormGeluDispatchCount >= dispatchBefore + 42);
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previousGate;
+            DirectPtxFeatureGate.NormalizationExperimentOverride = previousExperiment;
+        }
+    }
+
+    [SkippableFact]
     public void BackendResidualRmsNorm_PrewarmedKernelIsCudaGraphCapturable()
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
@@ -3838,6 +4050,48 @@ public class DirectPtxWmmaTests
             output[row * outputFeatures + column] = 0.5f * value *
                 (1f + MathF.Tanh(0.7978845608f *
                     (value + 0.044715f * value * value * value)));
+        }
+        return output;
+    }
+
+    private static float[] ResidualBiasLayerNormGeluOracle(
+        float[] input,
+        float[] residual,
+        float[] bias,
+        float[] gamma,
+        float[] beta,
+        int rows,
+        float epsilon)
+    {
+        const int dimension = 64;
+        var output = new float[rows * dimension];
+        var rowValues = new double[dimension];
+        for (int row = 0; row < rows; row++)
+        {
+            int rowBase = row * dimension;
+            double sum = 0;
+            for (int feature = 0; feature < dimension; feature++)
+            {
+                double value = input[rowBase + feature] + residual[rowBase + feature] + bias[feature];
+                rowValues[feature] = value;
+                sum += value;
+            }
+            double mean = sum / dimension;
+            double varianceSum = 0;
+            for (int feature = 0; feature < dimension; feature++)
+            {
+                double difference = rowValues[feature] - mean;
+                varianceSum += difference * difference;
+            }
+            double inverseStandardDeviation = 1.0 / Math.Sqrt(varianceSum / dimension + epsilon);
+            for (int feature = 0; feature < dimension; feature++)
+            {
+                double normalized = (rowValues[feature] - mean) * inverseStandardDeviation;
+                double value = normalized * gamma[feature] + beta[feature];
+                output[rowBase + feature] = (float)(0.5 * value *
+                    (1.0 + Math.Tanh(0.7978845608 *
+                        (value + 0.044715 * value * value * value))));
+            }
         }
         return output;
     }
