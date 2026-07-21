@@ -14,6 +14,8 @@ internal static class DirectPtxFeatureGate
     internal const string MasterEnvironmentVariable = "AIDOTNET_DIRECT_PTX";
     internal const string EnvironmentVariable = "AIDOTNET_DIRECT_PTX_ATTENTION";
     internal const string ResidualRmsNormEnvironmentVariable = "AIDOTNET_DIRECT_PTX_RESIDUAL_RMSNORM";
+    internal const string FlashDecodeEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FLASH_DECODE";
+    internal const string PagedDecodeEnvironmentVariable = "AIDOTNET_DIRECT_PTX_PAGED_DECODE";
     internal const string AutotuneEnvironmentVariable = "AIDOTNET_DIRECT_PTX_AUTOTUNE";
     internal const string CacheCapacityEnvironmentVariable = "AIDOTNET_DIRECT_PTX_CACHE_CAPACITY";
 
@@ -23,6 +25,8 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentMasterEnabled = ReadEnabled(MasterEnvironmentVariable);
     private static readonly bool EnvironmentAttentionEnabled = ReadEnabled(EnvironmentVariable);
     private static readonly bool EnvironmentResidualRmsNormEnabled = ReadEnabled(ResidualRmsNormEnvironmentVariable);
+    private static readonly bool EnvironmentFlashDecodeEnabled = ReadEnabled(FlashDecodeEnvironmentVariable);
+    private static readonly bool EnvironmentPagedDecodeEnabled = ReadEnabled(PagedDecodeEnvironmentVariable);
     private static readonly bool EnvironmentAutotuneEnabled =
         !string.Equals(Environment.GetEnvironmentVariable(AutotuneEnvironmentVariable), "0", StringComparison.Ordinal);
     private static readonly int EnvironmentCacheCapacity = ReadCacheCapacity();
@@ -37,6 +41,12 @@ internal static class DirectPtxFeatureGate
 
     internal static bool IsResidualRmsNormEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentResidualRmsNormEnabled);
+
+    internal static bool IsFlashDecodeEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentFlashDecodeEnabled);
+
+    internal static bool IsPagedDecodeEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentPagedDecodeEnabled);
 
     internal static bool IsAutotuneEnabled => EnvironmentAutotuneEnabled;
 
@@ -66,6 +76,8 @@ internal enum DirectPtxPhysicalLayout
     Bhsd,
     /// <summary>Dense row-major [row, feature].</summary>
     RowMajor2D,
+    /// <summary>Dense row-major [sequence, head, dimension].</summary>
+    SequenceHeadDim,
     /// <summary>Dense [row, qkv, head, feature] projection output.</summary>
     PackedQkv,
     /// <summary>One-dimensional canonical vector.</summary>

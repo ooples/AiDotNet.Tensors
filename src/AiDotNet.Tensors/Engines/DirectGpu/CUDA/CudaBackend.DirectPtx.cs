@@ -14,6 +14,8 @@ public sealed partial class CudaBackend
         _directPtxAttentionPlans = new(DirectPtxFeatureGate.CacheCapacity);
     private readonly DirectPtxKernelCache<DirectPtxResidualRmsNormKey, PtxFusedResidualRmsNormD64Kernel>
         _directPtxResidualRmsNormKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<DirectPtxDecodeKey, PtxFusedDecodeAttentionD64Kernel>
+        _directPtxDecodeKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private DirectPtxRuntime? _directPtxRuntime;
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
@@ -22,6 +24,7 @@ public sealed partial class CudaBackend
         System.Threading.Interlocked.Read(ref _directPtxAttentionDispatchCount);
     private long _directPtxAttentionDispatchCount;
     private long _directPtxResidualRmsNormDispatchCount;
+    private long _directPtxDecodeDispatchCount;
     internal int DirectPtxCachedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxAttentionKernels.Count; }
@@ -36,8 +39,19 @@ public sealed partial class CudaBackend
         DirectPtxFeatureGate.IsResidualRmsNormEnabled && IsAvailable &&
         DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) == DirectPtxArchitectureFamily.Ampere;
 
+    internal bool IsDirectPtxFlashDecodeEnabled =>
+        DirectPtxFeatureGate.IsFlashDecodeEnabled && IsAvailable &&
+        DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) == DirectPtxArchitectureFamily.Ampere;
+
+    internal bool IsDirectPtxPagedDecodeEnabled =>
+        DirectPtxFeatureGate.IsPagedDecodeEnabled && IsAvailable &&
+        DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) == DirectPtxArchitectureFamily.Ampere;
+
     internal long DirectPtxResidualRmsNormDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxResidualRmsNormDispatchCount);
+
+    internal long DirectPtxDecodeDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxDecodeDispatchCount);
 
     /// <summary>
     /// Attempts the canonical FP16-BHSD S in {16,32,64,128}, D=64 online attention
@@ -356,6 +370,225 @@ public sealed partial class CudaBackend
             stats);
     }
 
+    internal bool TryDirectPtxFlashDecodeD64(
+        IGpuBuffer query,
+        IGpuBuffer key,
+        IGpuBuffer value,
+        IGpuBuffer output,
+        int queryHeads,
+        int keyValueHeads,
+        int sequenceLength,
+        float scale)
+    {
+        if (!IsDirectPtxFlashDecodeEnabled) return false;
+        return TryDirectPtxDecodeCore(
+            query, key, value, blockTable: null, output,
+            isPaged: false, queryHeads, keyValueHeads, sequenceLength,
+            blockSize: 0, scale);
+    }
+
+    internal bool TryDirectPtxPagedDecodeD64(
+        IGpuBuffer query,
+        IGpuBuffer keyPages,
+        IGpuBuffer valuePages,
+        IGpuBuffer blockTable,
+        IGpuBuffer output,
+        int queryHeads,
+        int keyValueHeads,
+        int blockSize,
+        int sequenceLength,
+        float scale)
+    {
+        if (!IsDirectPtxPagedDecodeEnabled) return false;
+        return TryDirectPtxDecodeCore(
+            query, keyPages, valuePages, blockTable, output,
+            isPaged: true, queryHeads, keyValueHeads, sequenceLength,
+            blockSize, scale);
+    }
+
+    private bool TryDirectPtxDecodeCore(
+        IGpuBuffer query,
+        IGpuBuffer key,
+        IGpuBuffer value,
+        IGpuBuffer? blockTable,
+        IGpuBuffer output,
+        bool isPaged,
+        int queryHeads,
+        int keyValueHeads,
+        int sequenceLength,
+        int blockSize,
+        float scale)
+    {
+        if (queryHeads <= 0 || keyValueHeads <= 0 || queryHeads % keyValueHeads != 0)
+        {
+            DirectPtxLastError = "decode-head-map-not-implemented";
+            return false;
+        }
+        if (sequenceLength is not (16 or 32 or 64 or 128))
+        {
+            DirectPtxLastError = "decode-sequence-bucket-not-implemented";
+            return false;
+        }
+        if (!float.IsFinite(scale))
+        {
+            DirectPtxLastError = "decode-scale-not-finite";
+            return false;
+        }
+        if (isPaged && blockSize is not (16 or 32))
+        {
+            DirectPtxLastError = "paged-decode-block-size-not-implemented";
+            return false;
+        }
+
+        long elementsPerBlock = isPaged
+            ? checked((long)blockSize * keyValueHeads * PtxFusedDecodeAttentionD64Kernel.HeadDimension)
+            : 0;
+        if (key.SizeInBytes != value.SizeInBytes || key.SizeInBytes <= 0 ||
+            (isPaged && (key.SizeInBytes % (elementsPerBlock * sizeof(float)) != 0)))
+        {
+            DirectPtxLastError = "decode-kv-physical-extent-mismatch";
+            return false;
+        }
+        int poolBlocks = isPaged
+            ? checked((int)(key.SizeInBytes / (elementsPerBlock * sizeof(float))))
+            : 0;
+        int logicalBlocks = isPaged ? (sequenceLength + blockSize - 1) / blockSize : 0;
+        if (isPaged && (poolBlocks < logicalBlocks || blockTable is null ||
+            blockTable.SizeInBytes != checked(logicalBlocks * sizeof(int))))
+        {
+            DirectPtxLastError = "paged-decode-table-or-pool-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var keyShape = new DirectPtxDecodeKey(
+                isPaged, queryHeads, keyValueHeads, sequenceLength,
+                blockSize, poolBlocks, BitConverter.SingleToInt32Bits(scale));
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxDecodeKernels.TryGetValue(keyShape, out _))
+                {
+                    DirectPtxLastError = "Direct PTX decode must be prewarmed before CUDA graph capture.";
+                    return false;
+                }
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxFusedDecodeAttentionD64Kernel kernel = GetOrCreateDecodeKernel(keyShape, scale);
+                lock (GpuDispatchLock)
+                {
+                    if (isPaged)
+                    {
+                        kernel.LaunchPaged(
+                            DirectPtxTensorView.Create(query, kernel.Blueprint.Tensors[0]),
+                            DirectPtxTensorView.Create(key, kernel.Blueprint.Tensors[1]),
+                            DirectPtxTensorView.Create(value, kernel.Blueprint.Tensors[2]),
+                            DirectPtxTensorView.Create(blockTable!, kernel.Blueprint.Tensors[3]),
+                            DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[4]));
+                    }
+                    else
+                    {
+                        kernel.LaunchDense(
+                            DirectPtxTensorView.Create(query, kernel.Blueprint.Tensors[0]),
+                            DirectPtxTensorView.Create(key, kernel.Blueprint.Tensors[1]),
+                            DirectPtxTensorView.Create(value, kernel.Blueprint.Tensors[2]),
+                            DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[3]));
+                    }
+                }
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxDecodeDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    private PtxFusedDecodeAttentionD64Kernel GetOrCreateDecodeKernel(
+        DirectPtxDecodeKey key,
+        float scale)
+    {
+        if (_directPtxDecodeKernels.TryGetValue(key, out PtxFusedDecodeAttentionD64Kernel? existing))
+            return existing;
+        return CreateAndCacheDecodeKernelSlow(key, scale);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxFusedDecodeAttentionD64Kernel CreateAndCacheDecodeKernelSlow(
+        DirectPtxDecodeKey key,
+        float scale) =>
+        _directPtxDecodeKernels.GetOrAdd(key, () =>
+            new PtxFusedDecodeAttentionD64Kernel(
+                _directPtxRuntime!, key.IsPaged, key.QueryHeads, key.KeyValueHeads,
+                key.SequenceLength, key.BlockSize, key.PoolBlocks, scale));
+
+    internal bool PrewarmDirectPtxDecodeD64(
+        bool isPaged,
+        int queryHeads,
+        int keyValueHeads,
+        int sequenceLength,
+        int blockSize,
+        int poolBlocks,
+        float scale)
+    {
+        if (isPaged ? !IsDirectPtxPagedDecodeEnabled : !IsDirectPtxFlashDecodeEnabled)
+            return false;
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX decode prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                var key = new DirectPtxDecodeKey(
+                    isPaged, queryHeads, keyValueHeads, sequenceLength,
+                    blockSize, poolBlocks, BitConverter.SingleToInt32Bits(scale));
+                _ = GetOrCreateDecodeKernel(key, scale);
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxDecodeAudit(
+        bool isPaged,
+        int queryHeads,
+        int keyValueHeads,
+        int sequenceLength,
+        int blockSize,
+        int poolBlocks,
+        float scale,
+        out DirectPtxKernelAudit audit)
+    {
+        lock (_directPtxLock)
+        {
+            var key = new DirectPtxDecodeKey(
+                isPaged, queryHeads, keyValueHeads, sequenceLength,
+                blockSize, poolBlocks, BitConverter.SingleToInt32Bits(scale));
+            if (_directPtxDecodeKernels.TryGetValue(key, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null!;
+        return false;
+    }
+
     /// <summary>
     /// Loads a persisted/default specialization outside capture. Stable caller-
     /// owned buffers may subsequently launch it while a CUDA graph is recording.
@@ -635,6 +868,7 @@ public sealed partial class CudaBackend
             _directPtxAttentionKernels.Dispose();
             _directPtxAttentionPlans.Clear();
             _directPtxResidualRmsNormKernels.Dispose();
+            _directPtxDecodeKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }
@@ -666,6 +900,14 @@ public sealed partial class CudaBackend
     }
 
     private readonly record struct DirectPtxResidualRmsNormKey(int Rows, int EpsilonBits);
+    private readonly record struct DirectPtxDecodeKey(
+        bool IsPaged,
+        int QueryHeads,
+        int KeyValueHeads,
+        int SequenceLength,
+        int BlockSize,
+        int PoolBlocks,
+        int ScaleBits);
 
 }
 #endif
