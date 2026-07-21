@@ -20539,22 +20539,42 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (y is null) throw new ArgumentNullException(nameof(y));
         if (x.Length != y.Length || x.Length != condition.Length)
             throw new ArgumentException("All tensors must have the same length.");
-        // The Bit-CONDITION overload stays on the CPU. backend.Where's where_select kernel reads its
-        // condition buffer as FLOAT 0/1 — which is what backend.GreaterThan and this file's comparison
-        // kernels emit, and what the float-condition overload above supplies. A Tensor<Bit> uploaded via
-        // GetOrAllocateBuffer does NOT carry that encoding, so reinterpreting its storage as floats selects
-        // on garbage.
+        // Bit masks ARE GPU-resident: PackMaskResident finishes through FinishGpuOp, which DEFERS the
+        // download and keeps the device buffer cached. That buffer holds exactly the float 0/1 the
+        // where_select kernel reads, because it is the output of the comparison kernel that produced the
+        // mask (see equals_kernel). So the resident case can and should run on-device.
         //
-        // This path was previously "safe" only by accident: where_select did not exist, backend.Where threw
-        // kernel-not-found, and the surrounding catch fell back to the correct CPU implementation. Adding the
-        // kernel removed that accident and broke 10 comparison ops (TensorIsNan, TensorIsInf, TensorIsFinite,
-        // TensorEqScalar, TensorLogicalAnd/Not/Or/Xor, TensorIsIn) whose ProjectBits helper routes through
-        // here. Making the fallback EXPLICIT keeps them correct and no longer depends on a missing kernel.
-        //
-        // To move this on-device later, convert the Bit mask to a float 0/1 buffer first (or add a
-        // where_select variant that reads the Bit encoding) — do not just hand the Bit buffer to the float
-        // kernel.
-        return base.TensorWhere(condition, x, y);
+        // The guard is residency, not type. A Tensor<Bit> built on the HOST has no cached buffer; uploading
+        // its Bit[] storage and reinterpreting it as float selects on garbage — that is what broke 10
+        // comparison ops (TensorIsNan/IsInf/IsFinite, TensorEqScalar, TensorLogicalAnd/Not/Or/Xor,
+        // TensorIsIn) when where_select was first added. Requiring an already-resident condition keeps those
+        // correct on the CPU path while letting the comparison -> where chain stay on the device.
+        // Residency for a Bit mask lives in the ACTIVATION CACHE, keyed by backing array — FinishGpuOp
+        // registers it there and defers the download; it is NOT exposed through Tensor.TryGetGpuBuffer(),
+        // which stays null for these. Probe the cache directly, or this always falls back and the
+        // comparison -> where chain never stays on the device.
+        var condArr = condition.DataVector.GetBackingArrayUnsafe();
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)
+            || condArr is null || TryGetCachedBuffer(condArr) is null)
+            return base.TensorWhere(condition, x, y);
+
+        try
+        {
+            using var condBuf = GetOrAllocateBuffer(backend, condition);
+            using var xBuf = GetOrAllocateBuffer(backend, x);
+            using var yBuf = GetOrAllocateBuffer(backend, y);
+            var outBuf = AllocateOutputBuffer(backend, x.Length);
+            backend.Where(condBuf.Buffer, xBuf.Buffer, yBuf.Buffer, outBuf.Buffer, x.Length);
+            var output = DeferTensorResult<T>(backend, outBuf.Buffer, x.Length, x.Shape.ToArray());
+            Autodiff.DifferentiableOps.RecordBinary("TensorWhere", output, x, y,
+                Autodiff.BackwardFunctions<T>.WhereBackward, new object[] { condition });
+            return output;
+        }
+        catch (Exception)
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            return base.TensorWhere(condition, x, y);
+        }
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -22723,15 +22743,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorSoftmax<T>(Tensor<T> tensor, int axis)
     {
-        // CrossEntropyLossBackward calls engine.TensorSoftmax(logits, axis)
-        // during backward (tape suspended). The deferred-result chain
-        // through softmax → subtract → multiplyscalar produced zero
-        // gradients on the test path — root-cause traced to interaction
-        // between the activation-cache buffer reuse and the deferred
-        // materializer. Routing through CpuEngine avoids the deferred
-        // chain entirely. Softmax is a small op so the CPU fallback is
-        // not a meaningful slowdown for backward.
-        return base.TensorSoftmax(tensor, axis);
+        // HISTORY: this used to route UNCONDITIONALLY to CpuEngine. The recorded reason was that
+        // CrossEntropyLossBackward's deferred chain (softmax -> subtract -> multiplyscalar) produced ZERO
+        // GRADIENTS, "root-cause traced to interaction between the activation-cache buffer reuse and the
+        // deferred materializer".
+        //
+        // That description matches the defect fixed in this branch: TryRunBinaryInPlace/TryRunUnaryInPlace
+        // computed on the device and then copied the result into the DETACHED COPY that GetDataArray()
+        // returns for a GPU-resident tensor, discarding the mutation while reporting success. Any gradient
+        // accumulated through such a chain kept only its first contribution — "zero gradients" is exactly
+        // what that looks like downstream. With the underlying bug fixed, the blanket CPU route is no longer
+        // needed, so the op goes back on-device via the Softmax override (which itself falls back to the base
+        // path for a non-last axis, where the GPU kernel's reduction order would be wrong).
+        return Softmax(tensor, axis);
     }
 
     Tensor<T> IEngine.TensorLogSoftmax<T>(Tensor<T> tensor, int axis)
