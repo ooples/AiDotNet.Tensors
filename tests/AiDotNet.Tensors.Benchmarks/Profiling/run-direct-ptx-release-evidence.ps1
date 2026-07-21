@@ -173,9 +173,20 @@ try {
                     # Keep the GPU-accelerated terminal out of the measured interval.
                     # The complete TUI is emitted only to the immutable process log.
                     $arguments = $suite.Arguments
-                    & $suite.Command @arguments 2>&1 |
-                        Out-File -LiteralPath $log -Append -Encoding utf8
-                    $exitCode = $LASTEXITCODE
+                    $savedErrorAction = $ErrorActionPreference
+                    try {
+                        # Windows PowerShell wraps a native process's stderr as
+                        # ErrorRecord objects. PyTorch uses stderr for backend
+                        # eligibility warnings, so capture both streams and use
+                        # the native exit code as the sole success criterion.
+                        $ErrorActionPreference = 'Continue'
+                        & $suite.Command @arguments 2>&1 |
+                            Out-File -LiteralPath $log -Append -Encoding utf8
+                        $exitCode = $LASTEXITCODE
+                    }
+                    finally {
+                        $ErrorActionPreference = $savedErrorAction
+                    }
                     "# ending_gpu=$(Get-GpuSnapshot)" | Add-Content -LiteralPath $log -Encoding utf8
                     "# completed_utc=$([DateTime]::UtcNow.ToString('O')); exit_code=$exitCode" |
                         Add-Content -LiteralPath $log -Encoding utf8
