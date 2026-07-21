@@ -1811,7 +1811,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 ref betaVal,
                 C.Handle, N),
             "cublasSgemm");
-        GpuLaunchProbe.OnLaunch();   // cuBLAS dispatch IS GPU work
     }
 
     public void MatMulTransposed(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
@@ -1917,7 +1916,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 C.Handle, N, strideC,
                 batchCount),
             "cublasSgemmStridedBatched");
-        GpuLaunchProbe.OnLaunch();   // cuBLAS dispatch IS GPU work
     }
 
     /// <summary>
@@ -4496,7 +4494,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                     ref betaVal,
                     C.Handle, N),
                 "cublasSgemm");
-        GpuLaunchProbe.OnLaunch();   // cuBLAS dispatch IS GPU work
         }
         finally
         {
