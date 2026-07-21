@@ -2774,7 +2774,8 @@ public partial class DirectGpuTensorEngine
         // would silently drop the input gradient.
         if (typeof(T) != typeof(float) || normalizedAxis != input.Rank - 1
             || input.Length == 0 || !input.IsContiguous || IsTapeActive<T>()
-            || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend))
+            || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend)
+            || (backend is DirectGpu.CUDA.CudaBackend cudaBackend && !cudaBackend.HasWhereSelectKernel))
             return base.Sparsemax(input, axis);
 
         int columns = input._shape[normalizedAxis];
