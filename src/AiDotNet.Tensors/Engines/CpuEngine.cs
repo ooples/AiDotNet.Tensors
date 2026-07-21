@@ -45317,8 +45317,48 @@ public partial class CpuEngine : ITensorLevelEngine
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeComplexFFT", input, input._shape, (eng, output) => { var r = eng.NativeComplexFFT(ci); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexFFT", input._shape); if (ac is not null) return ac.Execute(); }
 
-        var ops = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<Complex<T>>(input._shape);
+
+        // Blittable fast path: float/double + contiguous input. See the
+        // "Blittable FFT fast path" comment near NativeFFTInPlace for rationale.
+        if ((typeof(T) == typeof(double) || typeof(T) == typeof(float)) && input.IsContiguous)
+        {
+            var inSpan = input.AsSpan();
+            var outSpan = result.AsWritableSpan();
+            var scratch = RentFftBlittableScratch(2 * fftSize);
+            bool isDouble = typeof(T) == typeof(double);
+            for (int b = 0; b < batchCount; b++)
+            {
+                int offset = b * fftSize;
+                for (int i = 0; i < fftSize; i++)
+                {
+                    T v = inSpan[offset + i];
+                    scratch[2 * i] = isDouble
+                        ? System.Runtime.CompilerServices.Unsafe.As<T, double>(ref v)
+                        : (double)System.Runtime.CompilerServices.Unsafe.As<T, float>(ref v);
+                    scratch[2 * i + 1] = 0.0;
+                }
+                AiDotNet.Tensors.LinearAlgebra.Fft.FftKernels.IterativeRadix2NoCache(
+                    scratch.AsSpan(0, 2 * fftSize), fftSize, inverse: false);
+                for (int i = 0; i < fftSize; i++)
+                {
+                    if (isDouble)
+                    {
+                        var c = new Complex<double>(scratch[2 * i], scratch[2 * i + 1]);
+                        outSpan[offset + i] = System.Runtime.CompilerServices.Unsafe.As<Complex<double>, Complex<T>>(ref c);
+                    }
+                    else
+                    {
+                        var c = new Complex<float>((float)scratch[2 * i], (float)scratch[2 * i + 1]);
+                        outSpan[offset + i] = System.Runtime.CompilerServices.Unsafe.As<Complex<float>, Complex<T>>(ref c);
+                    }
+                }
+            }
+            { var ci = input; AutoTracer.RecordOp("NativeComplexFFT", result, eng => eng.NativeComplexFFT(ci)); }
+            return result;
+        }
+
+        var ops = MathHelper.GetNumericOperations<T>();
 
         // Transform along last axis, batch over leading dimensions
         var slice = new Complex<T>[fftSize];
@@ -46587,9 +46627,57 @@ public partial class CpuEngine : ITensorLevelEngine
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexIFFTReal", input, input._shape, (eng, output) => { var r = eng.NativeComplexIFFTReal(ci); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("NativeComplexIFFTReal", input._shape); if (ac is not null) return ac.Execute(); }
 
+        var result = new Tensor<T>(input._shape);
+
+        // Blittable fast path: float/double + contiguous input. Mirrors the
+        // NativeComplexFFT fast path (unnormalized inverse kernel, then /fftSize).
+        if ((typeof(T) == typeof(double) || typeof(T) == typeof(float)) && input.IsContiguous)
+        {
+            var inSpan = input.AsSpan();
+            var outSpan = result.AsWritableSpan();
+            var scratch = RentFftBlittableScratch(2 * fftSize);
+            bool isDouble = typeof(T) == typeof(double);
+            for (int b = 0; b < batchCount; b++)
+            {
+                int offset = b * fftSize;
+                for (int i = 0; i < fftSize; i++)
+                {
+                    Complex<T> cv = inSpan[offset + i];
+                    if (isDouble)
+                    {
+                        var cd = System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<double>>(ref cv);
+                        scratch[2 * i] = cd.Real;
+                        scratch[2 * i + 1] = cd.Imaginary;
+                    }
+                    else
+                    {
+                        var cf = System.Runtime.CompilerServices.Unsafe.As<Complex<T>, Complex<float>>(ref cv);
+                        scratch[2 * i] = cf.Real;
+                        scratch[2 * i + 1] = cf.Imaginary;
+                    }
+                }
+                AiDotNet.Tensors.LinearAlgebra.Fft.FftKernels.IterativeRadix2NoCache(
+                    scratch.AsSpan(0, 2 * fftSize), fftSize, inverse: true);
+                for (int i = 0; i < fftSize; i++)
+                {
+                    double re = scratch[2 * i] / fftSize;
+                    if (isDouble)
+                    {
+                        outSpan[offset + i] = System.Runtime.CompilerServices.Unsafe.As<double, T>(ref re);
+                    }
+                    else
+                    {
+                        float rf = (float)re;
+                        outSpan[offset + i] = System.Runtime.CompilerServices.Unsafe.As<float, T>(ref rf);
+                    }
+                }
+            }
+            { var ci = input; AutoTracer.RecordOp("NativeComplexIFFTReal", result, eng => eng.NativeComplexIFFTReal(ci)); }
+            return result;
+        }
+
         var ops = MathHelper.GetNumericOperations<T>();
         var scale = ops.FromDouble(fftSize);
-        var result = new Tensor<T>(input._shape);
 
         var slice = new Complex<T>[fftSize];
         for (int b = 0; b < batchCount; b++)
@@ -47602,6 +47690,16 @@ public partial class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    // Per-thread scratch reused by the fused spectral-filter path so the whole
+    // FFT2D → multiply → IFFT2D round trip allocates only its final real result
+    // instead of ~8 full-size Complex<T> intermediate tensors. Never handed out.
+    private static class SpectralScratch<T>
+    {
+        [ThreadStatic] public static Complex<T>[]? Work; // one 2D slice [h*w] (may be oversized)
+        [ThreadStatic] public static Complex<T>[]? Row;  // exactly w
+        [ThreadStatic] public static Complex<T>[]? Col;  // exactly h
+    }
+
     /// <inheritdoc />
     public virtual Tensor<T> NativeSpectralFilter<T>(Tensor<T> input, Tensor<Complex<T>> filter)
     {
@@ -47623,11 +47721,6 @@ public partial class CpuEngine : ITensorLevelEngine
                 $"Filter length ({filter.Length}) cannot exceed input length ({input.Length}).",
                 nameof(filter));
 
-        // Fused: FFT2D → pointwise multiply with broadcast → IFFT2D
-        var spectrum = NativeComplexFFT2D(input);
-
-        // Multiply spectrum by filter using modular broadcast on filter.Length.
-        // This naturally handles any rank: [H,W] wraps every H*W, [C,H,W] wraps every C*H*W, etc.
         int filterLen = filter.Length;
         if (filterLen <= 0)
             throw new ArgumentException("Filter length must be a positive multiple of spatial slice size.", nameof(filter));
@@ -47636,6 +47729,17 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException(
                 $"Filter length ({filterLen}) must be a positive multiple of spatial slice size ({sliceSize}).",
                 nameof(filter));
+
+        // Fast path: fused, buffer-reusing round trip. Bit-identical to the
+        // composed FFT2D → multiply → IFFT2D chain (same NativeFFTInPlace core,
+        // same 1/H·1/W inverse scaling and real extraction). Skipped when a lazy
+        // graph is being recorded so the composed public ops still register nodes.
+        if (!GraphMode.IsActive)
+            return NativeSpectralFilterFused(input, filter, h, w, filterLen);
+
+        // Composed fallback (graph-recording mode): FFT2D → multiply → IFFT2D.
+        // Kept byte-for-byte as the original so lazy-graph recording is unchanged.
+        var spectrum = NativeComplexFFT2D(input);
         var ops = MathHelper.GetNumericOperations<T>();
         var filtered = new Tensor<Complex<T>>(spectrum._shape);
         for (int i = 0; i < spectrum.Length; i++)
@@ -47649,6 +47753,97 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         return NativeComplexIFFT2DReal(filtered);
+    }
+
+    /// <summary>
+    /// Fused, allocation-lean spectral filter: performs FFT2D → filter multiply →
+    /// IFFT2D-real over per-thread reused work buffers, allocating only the returned
+    /// real result. Batches over all leading dims (any rank ≥ 2). Numerically
+    /// identical to <see cref="NativeComplexFFT2D"/> + pointwise multiply +
+    /// <see cref="NativeComplexIFFT2DReal"/> — it drives the same NativeFFTInPlace
+    /// butterfly and applies the same 1/H·1/W scaling and real extraction.
+    /// </summary>
+    private Tensor<T> NativeSpectralFilterFused<T>(Tensor<T> input, Tensor<Complex<T>> filter, int h, int w, int filterLen)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        int sliceSize = h * w;
+        int outer = input.Length / sliceSize;
+
+        var result = new Tensor<T>(input._shape);
+        var inData = input.GetDataArray();
+        var filtData = filter.GetDataArray();
+        var outData = result.GetDataArray();
+
+        var work = SpectralScratch<T>.Work;
+        if (work is null || work.Length < sliceSize) { work = new Complex<T>[sliceSize]; SpectralScratch<T>.Work = work; }
+        // NativeFFTInPlace transforms the WHOLE array (length == n), so the row/col
+        // buffers must be sized to exactly w / h respectively.
+        var rowBuf = SpectralScratch<T>.Row;
+        if (rowBuf is null || rowBuf.Length != w) { rowBuf = new Complex<T>[w]; SpectralScratch<T>.Row = rowBuf; }
+        var colBuf = SpectralScratch<T>.Col;
+        if (colBuf is null || colBuf.Length != h) { colBuf = new Complex<T>[h]; SpectralScratch<T>.Col = colBuf; }
+
+        var hScale = ops.FromDouble(h);
+        var wScale = ops.FromDouble(w);
+        var zero = ops.Zero;
+
+        for (int o = 0; o < outer; o++)
+        {
+            int baseIdx = o * sliceSize;
+
+            // Load real slice → complex work buffer.
+            for (int i = 0; i < sliceSize; i++)
+                work[i] = new Complex<T>(inData[baseIdx + i], zero);
+
+            // Forward FFT along rows (length w, contiguous).
+            for (int r = 0; r < h; r++)
+            {
+                Array.Copy(work, r * w, rowBuf, 0, w);
+                NativeFFTInPlace(rowBuf, false, ops);
+                Array.Copy(rowBuf, 0, work, r * w, w);
+            }
+            // Forward FFT along columns (length h, stride w) — equivalent to the
+            // composed transpose → row-FFT → transpose, same values.
+            for (int c = 0; c < w; c++)
+            {
+                for (int r = 0; r < h; r++) colBuf[r] = work[r * w + c];
+                NativeFFTInPlace(colBuf, false, ops);
+                for (int r = 0; r < h; r++) work[r * w + c] = colBuf[r];
+            }
+
+            // Pointwise multiply by filter (modular broadcast on filterLen), in the
+            // [h,w] spectrum layout — matches the composed path exactly.
+            for (int i = 0; i < sliceSize; i++)
+            {
+                int fi = (baseIdx + i) % filterLen;
+                var sr = work[i].Real; var si = work[i].Imaginary;
+                var fr = filtData[fi].Real; var fim = filtData[fi].Imaginary;
+                work[i] = new Complex<T>(
+                    ops.Subtract(ops.Multiply(sr, fr), ops.Multiply(si, fim)),
+                    ops.Add(ops.Multiply(sr, fim), ops.Multiply(si, fr)));
+            }
+
+            // Inverse FFT along columns (length h) with 1/h scaling.
+            for (int c = 0; c < w; c++)
+            {
+                for (int r = 0; r < h; r++) colBuf[r] = work[r * w + c];
+                NativeFFTInPlace(colBuf, true, ops);
+                for (int r = 0; r < h; r++)
+                    work[r * w + c] = new Complex<T>(
+                        ops.Divide(colBuf[r].Real, hScale),
+                        ops.Divide(colBuf[r].Imaginary, hScale));
+            }
+            // Inverse FFT along rows (length w) with 1/w scaling, take real part.
+            for (int r = 0; r < h; r++)
+            {
+                for (int cc = 0; cc < w; cc++) rowBuf[cc] = work[r * w + cc];
+                NativeFFTInPlace(rowBuf, true, ops);
+                for (int cc = 0; cc < w; cc++)
+                    outData[baseIdx + r * w + cc] = ops.Divide(rowBuf[cc].Real, wScale);
+            }
+        }
+
+        return result;
     }
 
     /// <inheritdoc />
@@ -47674,12 +47869,16 @@ public partial class CpuEngine : ITensorLevelEngine
                 $"Filter length ({filter.Length}) cannot exceed input length ({input.Length}).",
                 nameof(filter));
 
-        // FFT2D the entire [B,C,H,W] input — the FFT2D already batches over leading dims
-        var spectrum = NativeComplexFFT2D(input);
-
-        // Multiply spectrum by filter using modular broadcast on filter.Length.
-        // [H,W] wraps every H*W, [C,H,W] wraps every C*H*W, [B,C,H,W] is direct.
         int filterLen = filter.Length;
+
+        // Fast path: fused, buffer-reusing round trip (bit-identical to composed).
+        // Preserves the original modular-broadcast semantics for any filterLen.
+        if (!GraphMode.IsActive && filterLen > 0)
+            return NativeSpectralFilterFused(input, filter, h, w, filterLen);
+
+        // Composed fallback (graph-recording mode): FFT2D → multiply → IFFT2D.
+        // Kept byte-for-byte as the original so lazy-graph recording is unchanged.
+        var spectrum = NativeComplexFFT2D(input);
         var ops = MathHelper.GetNumericOperations<T>();
         var filtered = new Tensor<Complex<T>>(spectrum._shape);
         for (int i = 0; i < spectrum.Length; i++)
@@ -47958,6 +48157,82 @@ public partial class CpuEngine : ITensorLevelEngine
     // Cache twiddle factors across FFT calls — key is (n, inverse)
     [ThreadStatic] private static Dictionary<(int n, bool inverse), Complex<double>[]>? _twiddleCache;
 
+    // ── Blittable FFT fast path (float/double) ──────────────────────────────
+    // NativeComplexFFT / NativeComplexIFFTReal historically allocated a per-call
+    // Complex<T>[] working buffer and ran the radix-2 butterfly over Complex<T>
+    // structs. Complex<T> carries a redundant INumericOperations<T> reference
+    // field (24 bytes/element for double, 16 for float), so every butterfly
+    // wrote that ref on top of the arithmetic and the hot loop touched
+    // cache-sparse memory through property accessors. Profiling the HRE spectral
+    // FFN path (SpectralHebbianLayer.ForwardBatch) showed this Complex<T>
+    // overhead — not the O(n log n) arithmetic — dominated wall time (~10x vs
+    // the blittable Fft.RFft kernel on identical shapes). For the common
+    // float/double element types we instead run the SAME tested SIMD radix-2
+    // kernel (FftKernels.IterativeRadix2NoCache — raw/unnormalized, the exact
+    // contract of the old scalar butterfly: callers still apply any 1/n scaling)
+    // over a [ThreadStatic] interleaved double[] scratch ([re,im,re,im,...]).
+    // Result: no per-call FFT working allocation, native double arithmetic over
+    // tight 16-byte-per-complex memory, and the ONLY remaining allocation is the
+    // returned tensor (the theoretical floor). Non-float/double element types and
+    // non-contiguous inputs keep the exact generic Complex<T> path below.
+    [ThreadStatic] private static double[]? _fftBlittableScratch;
+
+    private static double[] RentFftBlittableScratch(int minLen)
+    {
+        var buf = _fftBlittableScratch;
+        if (buf is null || buf.Length < minLen)
+        {
+            buf = new double[minLen];
+            _fftBlittableScratch = buf;
+        }
+        return buf;
+    }
+
+    // Test-only reference: the pre-blittable generic Complex<T>[] path, retained
+    // so bit-exactness and allocation-regression tests can A/B the fast path
+    // against the exact prior implementation in the same process (immune to
+    // cross-build / machine-load noise). NOT called by production code.
+    internal Tensor<Complex<T>> NativeComplexFFTLegacyGeneric<T>(Tensor<T> input)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        var (batchCount, fftSize) = GetBatchedFFTDims(input._shape);
+        ValidatePowerOfTwo(fftSize, nameof(input));
+        var ops = MathHelper.GetNumericOperations<T>();
+        var result = new Tensor<Complex<T>>(input._shape);
+        var slice = new Complex<T>[fftSize];
+        for (int b = 0; b < batchCount; b++)
+        {
+            int offset = b * fftSize;
+            for (int i = 0; i < fftSize; i++)
+                slice[i] = new Complex<T>(input[offset + i], ops.Zero);
+            NativeFFTInPlace(slice, false, ops);
+            for (int i = 0; i < fftSize; i++)
+                result[offset + i] = slice[i];
+        }
+        return result;
+    }
+
+    // Test-only reference for the inverse-real path (see NativeComplexFFTLegacyGeneric).
+    internal Tensor<T> NativeComplexIFFTRealLegacyGeneric<T>(Tensor<Complex<T>> input)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        var (batchCount, fftSize) = GetBatchedFFTDims(input._shape);
+        ValidatePowerOfTwo(fftSize, nameof(input));
+        var ops = MathHelper.GetNumericOperations<T>();
+        var scale = ops.FromDouble(fftSize);
+        var result = new Tensor<T>(input._shape);
+        var slice = new Complex<T>[fftSize];
+        for (int b = 0; b < batchCount; b++)
+        {
+            int offset = b * fftSize;
+            for (int i = 0; i < fftSize; i++) slice[i] = input[offset + i];
+            NativeFFTInPlace(slice, true, ops);
+            for (int i = 0; i < fftSize; i++)
+                result[offset + i] = ops.Divide(slice[i].Real, scale);
+        }
+        return result;
+    }
+
     private static void NativeFFTInPlace<T>(Complex<T>[] data, bool inverse,
         INumericOperations<T> ops)
     {
@@ -48035,10 +48310,42 @@ public partial class CpuEngine : ITensorLevelEngine
         }
     }
 
+#if NET7_0_OR_GREATER
+    // Interleaved [re,im,re,im,...] scratch buffer reused across the rows of a
+    // batched transform so the SIMD radix-2 delegation allocates at most once
+    // per thread (grown on demand). Never handed out; local to a single call.
+    [ThreadStatic] private static double[]? _fftSimdScratch;
+#endif
+
     // Span-based overload — zero-copy entry point used by NativeComplexFFTSpan hot paths.
     private static void NativeFFTInPlaceDoubleSpan(Span<Complex<double>> data, bool inverse)
     {
         int n = data.Length;
+#if NET7_0_OR_GREATER
+        // Delegate the power-of-2 transform to the SIMD radix-2 kernel used by the
+        // tested Fft.* module. IterativeRadix2NoCache is raw/unnormalized — exactly
+        // the contract of this scalar butterfly (callers apply any 1/n scaling
+        // themselves), so output layout and normalization are identical.
+        if (n >= 2 && AiDotNet.Tensors.LinearAlgebra.Fft.FftKernels.IsPowerOfTwo(n))
+        {
+            var scratch = _fftSimdScratch;
+            if (scratch is null || scratch.Length < 2 * n)
+            {
+                scratch = new double[2 * n];
+                _fftSimdScratch = scratch;
+            }
+            var buf = scratch.AsSpan(0, 2 * n);
+            for (int i = 0; i < n; i++)
+            {
+                buf[2 * i] = data[i].Real;
+                buf[2 * i + 1] = data[i].Imaginary;
+            }
+            AiDotNet.Tensors.LinearAlgebra.Fft.FftKernels.IterativeRadix2NoCache(buf, n, inverse);
+            for (int i = 0; i < n; i++)
+                data[i] = new Complex<double>(buf[2 * i], buf[2 * i + 1]);
+            return;
+        }
+#endif
         int bits = 0;
         for (int tmp = n >> 1; tmp > 0; tmp >>= 1) bits++;
 
@@ -48094,6 +48401,31 @@ public partial class CpuEngine : ITensorLevelEngine
     private static void NativeFFTInPlaceFloatSpan(Span<Complex<float>> data, bool inverse)
     {
         int n = data.Length;
+#if NET7_0_OR_GREATER
+        // Delegate power-of-2 transforms to the SIMD radix-2 kernel. The kernel
+        // is double-internal; float lanes are widened for the butterflies and
+        // rounded back on store (strictly no worse than the all-float scalar path,
+        // same raw/unnormalized contract).
+        if (n >= 2 && AiDotNet.Tensors.LinearAlgebra.Fft.FftKernels.IsPowerOfTwo(n))
+        {
+            var scratch = _fftSimdScratch;
+            if (scratch is null || scratch.Length < 2 * n)
+            {
+                scratch = new double[2 * n];
+                _fftSimdScratch = scratch;
+            }
+            var buf = scratch.AsSpan(0, 2 * n);
+            for (int i = 0; i < n; i++)
+            {
+                buf[2 * i] = data[i].Real;
+                buf[2 * i + 1] = data[i].Imaginary;
+            }
+            AiDotNet.Tensors.LinearAlgebra.Fft.FftKernels.IterativeRadix2NoCache(buf, n, inverse);
+            for (int i = 0; i < n; i++)
+                data[i] = new Complex<float>((float)buf[2 * i], (float)buf[2 * i + 1]);
+            return;
+        }
+#endif
         int bits = 0;
         for (int tmp = n >> 1; tmp > 0; tmp >>= 1) bits++;
 

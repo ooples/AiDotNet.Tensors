@@ -31,7 +31,21 @@ void main() {
     float v0 = uintBitsToFloat(p0), v1 = uintBitsToFloat(p1), v2 = uintBitsToFloat(p2);
     float y = 0.0;
     switch (op) {
-        case 0u: y = pow(x, v0); break;
+        case 0u: {
+            // GLSL pow is undefined for a negative base. Integral exponents
+            // are valid, so evaluate |x|^v0 and restore odd parity.
+            if (x < 0.0) {
+                if (v0 == trunc(v0)) {
+                    float magnitude = pow(-x, v0);
+                    y = (mod(abs(v0), 2.0) == 1.0) ? -magnitude : magnitude;
+                } else {
+                    y = uintBitsToFloat(0x7fc00000u);
+                }
+            } else {
+                y = pow(x, v0);
+            }
+            break;
+        }
         case 1u: y = abs(x); break;
         case 2u: y = exp(x); break;
         case 3u: y = exp2(x); break;

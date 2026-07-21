@@ -8589,8 +8589,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <summary>
     /// Test/diagnostic hook (default <c>false</c>; <c>[ThreadStatic]</c> so it only affects the thread that
     /// sets it and never leaks into other parallel test collections). When <c>true</c>, the GPU-kernel
-    /// <c>catch</c> blocks that route conv / transpose / unfold-fold / pooling / locally-connected /
-    /// deformable / attention operations to their CPU reference RETHROW the kernel exception instead of
+    /// <c>catch</c> blocks that route selected GPU kernels, including Power, conv / transpose / unfold-fold /
+    /// pooling / locally-connected / deformable / attention operations, to their CPU reference RETHROW instead of
     /// silently falling back. Because the per-kernel fallback now lives partly inside the individual backends
     /// (Metal / Vulkan implement the conv/pool family in their own classes), the flag is a process-wide
     /// <c>static</c> so those backend <c>catch</c> blocks can honor it too
@@ -8602,7 +8602,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// would trivially pass (false green), exactly the gap that let issue #622 look "fixed" without proof.
     /// </para>
     /// <para>
-    /// Scope: this hook covers the conv/pool-family kernels exercised by the coverage suite (the methods whose
+    /// Scope: this hook covers the kernels exercised by strict GPU coverage tests (the methods whose
     /// <c>catch</c> blocks contain the rethrow, both here and in the Metal/Vulkan backends). It is a coverage
     /// aid, NOT a guarantee that every <c>catch</c> in the GPU stack rethrows; unrelated catch blocks (argument
     /// validation, capability probing, non-kernel host paths) deliberately keep their normal behavior.
@@ -17937,7 +17937,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> TensorPower<T>(Tensor<T> tensor, T exponent)
     {
         if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
+        {
+            if (ThrowOnGpuKernelFallback)
+                throw new NotSupportedException($"GPU Power dispatch does not support the requested precision for {typeof(T)}.");
             return base.TensorPower(tensor, exponent);
+        }
 
         try
         {
@@ -17956,7 +17960,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
             }
         }
-        catch { }
+        catch
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+        }
+        if (ThrowOnGpuKernelFallback)
+            throw new InvalidOperationException("GPU Power dispatch was unavailable or returned no result.");
         return base.TensorPower(tensor, exponent);
     }
 

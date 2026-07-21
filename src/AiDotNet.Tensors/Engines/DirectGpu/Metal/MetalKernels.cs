@@ -223,7 +223,19 @@ kernel void pow_kernel(
     uint gid [[thread_position_in_grid]])
 {
     if (gid < size) {
-        B[gid] = pow(A[gid], power);
+        float x = A[gid];
+        // Metal pow is undefined for a negative base. Integral exponents are
+        // mathematically valid, so evaluate |x|^power and restore odd parity.
+        if (x < 0.0f) {
+            if (power == trunc(power)) {
+                float magnitude = pow(-x, power);
+                B[gid] = (fmod(fabs(power), 2.0f) == 1.0f) ? -magnitude : magnitude;
+            } else {
+                B[gid] = NAN;
+            }
+        } else {
+            B[gid] = pow(x, power);
+        }
     }
 }
 
