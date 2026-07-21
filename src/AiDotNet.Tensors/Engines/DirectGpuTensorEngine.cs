@@ -15237,10 +15237,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
 
             // Fallback to CPU for complex broadcast patterns
+            GpuLaunchProbe.OnFallback($"TensorBroadcastMultiply:no-branch a={string.Join("x", a.Shape._dims)} b={string.Join("x", b.Shape._dims)}", null);
             return base.TensorBroadcastMultiply(a, b);
         }
-        catch
+        catch (Exception exBm)
         {
+            GpuLaunchProbe.OnFallback("TensorBroadcastMultiply:threw", exBm);
             return base.TensorBroadcastMultiply(a, b);
         }
     }

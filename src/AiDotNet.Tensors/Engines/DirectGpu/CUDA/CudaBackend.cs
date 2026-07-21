@@ -11494,8 +11494,15 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void BroadcastMultiplyLastAxis(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int outerSize, int innerSize)
     {
-        if (!_kernelCache.TryGetValue("broadcast_multiply_last_axis", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: broadcast_multiply_last_axis");
+        // The registered kernel is "broadcast_mul_last". This looked up "broadcast_multiply_last_axis",
+        // which is never defined or registered anywhere, so EVERY call threw kernel-not-found and
+        // DirectGpuTensorEngine.TensorBroadcastMultiply swallowed it in its bare catch -> silent CPU
+        // result. The hollow-override check missed it because that only counts the THROWING kernel-cache
+        // indexer; this used TryGetValue, so no miss was ever recorded. Note the asymmetry that hid it:
+        // broadcast_multiply_FIRST_axis does exist, so only the last-axis lookup was dangling.
+        // broadcast_mul_last is output[idx] = a[idx] * b[idx % innerSize] with these exact five args.
+        if (!_kernelCache.TryGetValue("broadcast_mul_last", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: broadcast_mul_last");
 
         using var _ = PushContext();
         int totalSize = outerSize * innerSize;
