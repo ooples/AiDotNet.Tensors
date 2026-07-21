@@ -1759,7 +1759,7 @@ public class DirectPtxWmmaTests
             PtxFusedLinearGeluFp16M16Kernel.EmitPtx(8, 6, 256, 2048));
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             PtxFusedLinearGeluFp16M16Kernel.EmitPtx(8, 6, 512, 768));
-        Assert.True(PtxFusedLinearGeluFp16M16Kernel.IsPromotedShape(512, 2048));
+        Assert.False(PtxFusedLinearGeluFp16M16Kernel.IsPromotedShape(512, 2048));
         Assert.True(PtxFusedLinearGeluFp16M16Kernel.IsPromotedShape(1024, 4096));
     }
 
@@ -1862,6 +1862,7 @@ public class DirectPtxWmmaTests
                 "cuBLAS fallback FP16 Tensor Core fused linear GELU M16");
 
             DirectPtxFeatureGate.TestOverride = true;
+            DirectPtxFeatureGate.MixedPrecisionLinearExperimentOverride = true;
             Assert.False(backend.TryDirectPtxFusedLinearGeluFp16M16(
                 inputHalf, weightHalf, bias, wrongOutput, inputFeatures, outputFeatures));
             Assert.Equal("mixed-linear-m16-physical-extent-mismatch", backend.DirectPtxLastError);

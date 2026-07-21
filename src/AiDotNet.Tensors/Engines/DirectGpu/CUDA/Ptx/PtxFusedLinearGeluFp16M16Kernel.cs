@@ -330,7 +330,7 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
         2 * (Rows + OutputsPerBlock) * GetKPerPanel(inputFeatures) * sizeof(ushort);
 
     internal static bool IsPromotedShape(int inputFeatures, int outputFeatures) =>
-        IsSupportedShape(inputFeatures, outputFeatures);
+        (inputFeatures, outputFeatures) == (1024, 4096);
 
     private static void ValidateShape(int inputFeatures, int outputFeatures)
     {
