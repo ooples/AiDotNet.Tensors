@@ -23,7 +23,7 @@ internal readonly record struct DirectPtxReleaseGatePolicy(
 {
     internal static DirectPtxReleaseGatePolicy ProductionDefault => new(
         MinimumMedianSpeedup: 1.10,
-        MaximumP95RegressionFraction: 0.10,
+        MaximumP95RegressionFraction: 0.0,
         MaximumManagedBytesPerCall: 0,
         MaximumTemporaryDeviceBytes: 0,
         MaximumAbsoluteError: 5e-5,

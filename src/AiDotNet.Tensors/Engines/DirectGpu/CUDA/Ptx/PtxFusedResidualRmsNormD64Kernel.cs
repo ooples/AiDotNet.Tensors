@@ -44,9 +44,10 @@ internal sealed class PtxFusedResidualRmsNormD64Kernel : IDisposable
         if (!float.IsFinite(epsilon) || epsilon <= 0) throw new ArgumentOutOfRangeException(nameof(epsilon));
         if (warpsPerBlock is not (1 or 2 or 4 or 8))
             throw new ArgumentOutOfRangeException(nameof(warpsPerBlock));
-        if (runtime.ArchitectureFamily != DirectPtxArchitectureFamily.Ampere)
+        if (!DirectPtxArchitecture.HasValidatedOnlineAttention(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new NotSupportedException(
-                $"Residual RMSNorm has no validated {runtime.ArchitectureFamily} specialization.");
+                $"Residual RMSNorm has no validated SM {runtime.ComputeCapabilityMajor}.{runtime.ComputeCapabilityMinor} specialization.");
 
         Rows = rows;
         Epsilon = epsilon;

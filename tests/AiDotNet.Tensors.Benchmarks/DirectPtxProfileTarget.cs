@@ -7,54 +7,67 @@ internal static class DirectPtxProfileTarget
 {
     internal static void RunAttention()
     {
+        GpuBenchmarkEnvironment.RequireIdleGpu("ncu-attention-start");
         using var runtime = new DirectPtxRuntime();
-        using var kernel = new PtxOnlineFusedAttention128x64Kernel(
-            runtime, 128, isCausal: false, fuseLayerNormGelu: false,
-            sequenceLength: 128, emitSoftmaxStats: false);
-        using var q = runtime.AllocateBytes(kernel.QBytes);
-        using var k = runtime.AllocateBytes(kernel.KBytes);
-        using var v = runtime.AllocateBytes(kernel.VBytes);
-        using var gamma = runtime.AllocateBytes(PtxOnlineFusedAttention128x64Kernel.GammaBytes);
-        using var beta = runtime.AllocateBytes(PtxOnlineFusedAttention128x64Kernel.BetaBytes);
-        using var output = runtime.AllocateBytes(kernel.OutputBytes);
-        using var stats = runtime.AllocateBytes(kernel.StatsBytes);
-        q.Upload<ushort>(new ushort[128 * 128 * 64]);
-        k.Upload<ushort>(new ushort[128 * 128 * 64]);
-        v.Upload<ushort>(new ushort[128 * 128 * 64]);
-        Action launch = () => kernel.Launch(
-            DirectPtxTensorView.CreateOwned(q, kernel.Blueprint.Tensors[0]),
-            DirectPtxTensorView.CreateOwned(k, kernel.Blueprint.Tensors[1]),
-            DirectPtxTensorView.CreateOwned(v, kernel.Blueprint.Tensors[2]),
-            DirectPtxTensorView.CreateOwned(gamma, kernel.Blueprint.Tensors[3]),
-            DirectPtxTensorView.CreateOwned(beta, kernel.Blueprint.Tensors[4]),
-            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[5]),
-            DirectPtxTensorView.CreateOwned(stats, kernel.Blueprint.Tensors[6]));
-        for (int i = 0; i < 10; i++) launch();
+        foreach (int sequence in new[] { 16, 32, 64, 128 })
+        foreach (bool causal in new[] { false, true })
+        foreach (bool fused in new[] { false, true })
+        {
+            using var kernel = new PtxOnlineFusedAttention128x64Kernel(
+                runtime, 128, causal, fused,
+                sequenceLength: sequence, emitSoftmaxStats: false);
+            using var q = runtime.AllocateBytes(kernel.QBytes);
+            using var k = runtime.AllocateBytes(kernel.KBytes);
+            using var v = runtime.AllocateBytes(kernel.VBytes);
+            using var gamma = runtime.AllocateBytes(PtxOnlineFusedAttention128x64Kernel.GammaBytes);
+            using var beta = runtime.AllocateBytes(PtxOnlineFusedAttention128x64Kernel.BetaBytes);
+            using var output = runtime.AllocateBytes(kernel.OutputBytes);
+            var input = new ushort[128 * sequence * 64];
+            q.Upload<ushort>(input);
+            k.Upload<ushort>(input);
+            v.Upload<ushort>(input);
+            gamma.Upload<float>(Enumerable.Repeat(1f, 64).ToArray());
+            beta.Upload<float>(new float[64]);
+            kernel.Launch(
+                DirectPtxTensorView.CreateOwned(q, kernel.Blueprint.Tensors[0]),
+                DirectPtxTensorView.CreateOwned(k, kernel.Blueprint.Tensors[1]),
+                DirectPtxTensorView.CreateOwned(v, kernel.Blueprint.Tensors[2]),
+                DirectPtxTensorView.CreateOwned(gamma, kernel.Blueprint.Tensors[3]),
+                DirectPtxTensorView.CreateOwned(beta, kernel.Blueprint.Tensors[4]),
+                DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[5]),
+                default);
+            runtime.Synchronize();
+            Console.WriteLine(kernel.Audit.ToJson());
+        }
         runtime.Synchronize();
-        Console.WriteLine(kernel.Audit.ToJson());
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-attention-end");
     }
 
     internal static void RunResidualRmsNorm()
     {
+        GpuBenchmarkEnvironment.RequireIdleGpu("ncu-residual-rmsnorm-start");
         using var runtime = new DirectPtxRuntime();
-        using var kernel = new PtxFusedResidualRmsNormD64Kernel(runtime, 8192);
-        using var input = runtime.AllocateBytes(kernel.InputBytes);
-        using var residual = runtime.AllocateBytes(kernel.InputBytes);
-        using var gamma = runtime.AllocateBytes(PtxFusedResidualRmsNormD64Kernel.GammaBytes);
-        using var output = runtime.AllocateBytes(kernel.OutputBytes);
-        using var rms = runtime.AllocateBytes(kernel.RmsBytes);
-        input.Upload<float>(new float[8192 * 64]);
-        residual.Upload<float>(new float[8192 * 64]);
-        gamma.Upload<float>(Enumerable.Repeat(1f, 64).ToArray());
-        Action launch = () => kernel.Launch(
-            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
-            DirectPtxTensorView.CreateOwned(residual, kernel.Blueprint.Tensors[1]),
-            DirectPtxTensorView.CreateOwned(gamma, kernel.Blueprint.Tensors[2]),
-            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[3]),
-            DirectPtxTensorView.CreateOwned(rms, kernel.Blueprint.Tensors[4]));
-        for (int i = 0; i < 10; i++) launch();
-        runtime.Synchronize();
-        Console.WriteLine(kernel.Audit.ToJson());
+        foreach (int rows in new[] { 32, 256, 2048, 8192 })
+        {
+            using var kernel = new PtxFusedResidualRmsNormD64Kernel(runtime, rows);
+            using var input = runtime.AllocateBytes(kernel.InputBytes);
+            using var residual = runtime.AllocateBytes(kernel.InputBytes);
+            using var gamma = runtime.AllocateBytes(PtxFusedResidualRmsNormD64Kernel.GammaBytes);
+            using var output = runtime.AllocateBytes(kernel.OutputBytes);
+            using var rms = runtime.AllocateBytes(kernel.RmsBytes);
+            input.Upload<float>(new float[rows * 64]);
+            residual.Upload<float>(new float[rows * 64]);
+            gamma.Upload<float>(Enumerable.Repeat(1f, 64).ToArray());
+            kernel.Launch(
+                DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+                DirectPtxTensorView.CreateOwned(residual, kernel.Blueprint.Tensors[1]),
+                DirectPtxTensorView.CreateOwned(gamma, kernel.Blueprint.Tensors[2]),
+                DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[3]),
+                DirectPtxTensorView.CreateOwned(rms, kernel.Blueprint.Tensors[4]));
+            runtime.Synchronize();
+            Console.WriteLine(kernel.Audit.ToJson());
+        }
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-residual-rmsnorm-end");
     }
 
     internal static void RunDecode()

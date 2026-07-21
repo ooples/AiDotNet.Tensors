@@ -359,7 +359,9 @@ public class DirectPtxWmmaTests
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
         const int dimension = 64;
         using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(runtime.ComputeCapabilityMajor >= 8, "Requires SM80+ cp.async and mma.m16n8k16.");
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedOnlineAttention(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "Requires the validated SM86 cp.async/mma specialization.");
         using var current = runtime.Enter();
         using var kernel = new PtxOnlineFusedAttention128x64Kernel(
             runtime, 1, isCausal, fuseLayerNormGelu, 0.125f, 1e-5f, sequence,
@@ -485,7 +487,7 @@ public class DirectPtxWmmaTests
         try
         {
             using var backend = new CudaBackend();
-            Skip.IfNot(backend.IsDirectPtxAttentionEnabled, "Requires an SM80+ CUDA backend.");
+            Skip.IfNot(backend.IsDirectPtxAttentionEnabled, "Requires a validated Ampere CUDA backend.");
             const int elements = 128 * 64;
             float[] host = Enumerable.Range(0, elements).Select(i => (i % 29 - 14) / 128f).ToArray();
             using var qFloat = backend.AllocateBuffer(host);
@@ -503,7 +505,33 @@ public class DirectPtxWmmaTests
             Assert.True(backend.TryDirectPtxOnlineAttention(
                 qHalf, kHalf, vHalf, output, stats, 1, 0.125f, isCausal: false),
                 backend.DirectPtxLastError);
+            // Cross the tiered-JIT promotion threshold before asserting the
+            // resident steady-state contract; JIT bookkeeping is not dispatch
+            // allocation and otherwise makes this assertion process-order dependent.
+            for (int i = 0; i < 64; i++)
+            {
+                Assert.True(backend.TryDirectPtxOnlineAttention(
+                    qHalf, kHalf, vHalf, output, stats, 1, 0.125f, isCausal: false),
+                    backend.DirectPtxLastError);
+            }
             backend.Synchronize();
+            long allocationBefore = GC.GetAllocatedBytesForCurrentThread();
+            bool everyLaunchSucceeded = true;
+            for (int i = 0; i < 32; i++)
+            {
+                everyLaunchSucceeded &= backend.TryDirectPtxOnlineAttention(
+                    qHalf, kHalf, vHalf, output, stats, 1, 0.125f, isCausal: false);
+            }
+            long launchAllocation =
+                GC.GetAllocatedBytesForCurrentThread() - allocationBefore;
+            backend.Synchronize();
+            long synchronizationBefore = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < 32; i++) backend.Synchronize();
+            long synchronizationAllocation =
+                GC.GetAllocatedBytesForCurrentThread() - synchronizationBefore;
+            Assert.True(everyLaunchSucceeded, backend.DirectPtxLastError);
+            Assert.Equal(0, launchAllocation);
+            Assert.Equal(0, synchronizationAllocation);
             Assert.All(backend.DownloadBuffer(output), value => Assert.True(float.IsFinite(value)));
             Assert.True(backend.TryGetDirectPtxAttentionAudit(
                 1, 0.125f, false, false, 1e-5f, 128,
@@ -532,7 +560,7 @@ public class DirectPtxWmmaTests
             using var engine = new DirectGpuTensorEngine();
             Skip.IfNot(engine.IsGpuAvailable, "CUDA tensor engine is unavailable.");
             var backend = Assert.IsType<CudaBackend>(engine.GetBackend());
-            Skip.IfNot(backend.IsDirectPtxAttentionEnabled, "Requires SM80+.");
+            Skip.IfNot(backend.IsDirectPtxAttentionEnabled, "Requires a validated Ampere CUDA backend.");
             const int elements = 128 * 64;
             var q = new Tensor<float>(
                 Enumerable.Range(0, elements).Select(i => (i % 17 - 8) / 128f).ToArray(),
@@ -551,6 +579,18 @@ public class DirectPtxWmmaTests
             Assert.True(float.IsFinite(result.GetFlat(0)));
             Assert.True(float.IsFinite(stats.GetFlat(0)));
             Assert.Equal(before + 1, backend.DirectPtxAttentionDispatchCount);
+
+            var paddedQuery = new Tensor<float>(
+                Enumerable.Range(0, 129 * 64).Select(i => (i % 17 - 8) / 128f).ToArray(),
+                [1, 1, 129, 64]);
+            Tensor<float> offsetQuery = paddedQuery.Slice(axis: 2, start: 1, end: 129);
+            long beforeFallback = backend.DirectPtxAttentionDispatchCount;
+            Tensor<float> fallbackResult = engine.FlashAttention(
+                offsetQuery, k, v, 0.125, false, out Tensor<float> fallbackStats);
+
+            Assert.True(float.IsFinite(fallbackResult.GetFlat(0)));
+            Assert.True(float.IsFinite(fallbackStats.GetFlat(0)));
+            Assert.Equal(beforeFallback, backend.DirectPtxAttentionDispatchCount);
         }
         finally
         {
@@ -591,8 +631,8 @@ public class DirectPtxWmmaTests
     {
         var expected = (DirectPtxArchitectureFamily)expectedValue;
         Assert.Equal(expected, DirectPtxArchitecture.Classify(major, minor));
-        Assert.Equal(expected == DirectPtxArchitectureFamily.Ampere,
-            DirectPtxArchitecture.HasValidatedOnlineAttention(expected));
+        Assert.Equal(major == 8 && minor == 6,
+            DirectPtxArchitecture.HasValidatedOnlineAttention(major, minor));
     }
 
     [Fact]
@@ -606,6 +646,10 @@ public class DirectPtxWmmaTests
         Assert.True(two.IsDisposed);
         Assert.False(one.IsDisposed);
         Assert.False(three.IsDisposed);
+        Assert.Equal(2, cache.Count);
+        var duplicate = new TrackingDisposable();
+        Assert.Same(one, cache.AddOrGetExisting(1, duplicate));
+        Assert.True(duplicate.IsDisposed);
         Assert.Equal(2, cache.Count);
 
         var plans = new DirectPtxPlanCache<int, string>(2);
@@ -632,11 +676,14 @@ public class DirectPtxWmmaTests
     public void AttentionEligibility_AdmitsOnlyTheProvenSemanticDomain()
     {
         var supported = new DirectPtxAttentionRequest(
-            DirectPtxArchitectureFamily.Ampere, DirectPtxPhysicalType.Float16,
+            DirectPtxArchitectureFamily.Ampere, 8, 6, DirectPtxPhysicalType.Float16,
             DirectPtxPhysicalLayout.Bhsd, 2, 8, 8, 128, 128, 64,
             DirectPtxAttentionMaskKind.CausalTopLeft, DirectPtxAttentionPhase.Inference,
             0, false, false);
         Assert.True(DirectPtxAttentionEligibility.Evaluate(supported).IsEligible);
+
+        Assert.Equal("sm-version-not-validated", DirectPtxAttentionEligibility.Evaluate(
+            supported with { ComputeCapabilityMinor = 0 }).Reason);
 
         Assert.Equal("dtype-not-fp16", DirectPtxAttentionEligibility.Evaluate(
             supported with { InputType = DirectPtxPhysicalType.BFloat16 }).Reason);
@@ -658,6 +705,34 @@ public class DirectPtxWmmaTests
             supported with { IsRagged = true }).Reason);
         Assert.Equal("paged-kv-not-implemented", DirectPtxAttentionEligibility.Evaluate(
             supported with { UsesPagedKv = true }).Reason);
+    }
+
+    [Theory]
+    [InlineData(16, true)]
+    [InlineData(32, true)]
+    [InlineData(64, true)]
+    [InlineData(128, true)]
+    [InlineData(0, false)]
+    [InlineData(15, false)]
+    [InlineData(96, false)]
+    [InlineData(256, false)]
+    public void OnlineAttentionSequenceAdmission_UsesCanonicalShapeDefinition(
+        int sequenceLength, bool expected) =>
+        Assert.Equal(expected,
+            PtxOnlineFusedAttention128x64Kernel.IsSupportedSequenceLength(sequenceLength));
+
+    [Fact]
+    public void CanonicalDenseAdmission_RejectsOffsetViews()
+    {
+        var canonical = new Tensor<float>(new float[8], [2, 4]);
+        Tensor<float> offsetView = canonical.Slice(axis: 0, start: 1, end: 2);
+        var definition = typeof(DirectGpuTensorEngine).GetMethod(
+            "IsCanonicalDenseAllocation",
+            System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!
+            .MakeGenericMethod(typeof(float));
+
+        Assert.True((bool)definition.Invoke(null, [canonical])!);
+        Assert.False((bool)definition.Invoke(null, [offsetView])!);
     }
 
     [Fact]
@@ -692,16 +767,24 @@ public class DirectPtxWmmaTests
         try
         {
             System.IO.File.WriteAllText(path,
-                "\"sass__inst_executed_register_spilling\",\"0\"\n" +
+                "\"sass__inst_executed_register_spilling.sum\",\"0\"\n" +
                 "\"sass__inst_executed_local_loads\",\"0\"\n" +
-                "\"sass__inst_executed_local_stores\",\"0\"\n");
+                "\"sass__inst_executed_local_stores.sum\",\"0\"\n");
             DirectPtxProfilerEvidence zero = DirectPtxProfilerEvidence.FromNcuCsv(path);
             Assert.True(zero.ProvesZeroExecutedSpills);
 
             System.IO.File.WriteAllText(path,
-                "\"sass__inst_executed_register_spilling\",\"4\"\n");
+                "\"sass__inst_executed_register_spilling\",\"4\"\n" +
+                "\"sass__inst_executed_local_loads\",\"0\"\n" +
+                "\"sass__inst_executed_local_stores\",\"0\"\n");
             DirectPtxProfilerEvidence spilling = DirectPtxProfilerEvidence.FromNcuCsv(path);
             Assert.False(spilling.ProvesZeroExecutedSpills);
+
+            System.IO.File.WriteAllText(path,
+                "\"sass__inst_executed_register_spilling\",\"0\"\n" +
+                "\"sass__inst_executed_local_loads\",\"0\"\n");
+            DirectPtxProfilerEvidence incomplete = DirectPtxProfilerEvidence.FromNcuCsv(path);
+            Assert.False(incomplete.ProvesZeroExecutedSpills);
         }
         finally
         {
@@ -1758,6 +1841,32 @@ public class DirectPtxWmmaTests
             using var output = backend.AllocateBuffer(elements);
             using var rms = backend.AllocateBuffer(rows);
             Assert.True(backend.PrewarmDirectPtxFusedResidualRmsNorm(rows), backend.DirectPtxLastError);
+
+            Assert.True(backend.TryDirectPtxFusedResidualRmsNorm(
+                input, residual, gamma, output, rms, rows), backend.DirectPtxLastError);
+            for (int i = 0; i < 64; i++)
+            {
+                Assert.True(backend.TryDirectPtxFusedResidualRmsNorm(
+                    input, residual, gamma, output, rms, rows), backend.DirectPtxLastError);
+            }
+            backend.Synchronize();
+            long allocationBefore = GC.GetAllocatedBytesForCurrentThread();
+            bool everyLaunchSucceeded = true;
+            for (int i = 0; i < 32; i++)
+            {
+                everyLaunchSucceeded &= backend.TryDirectPtxFusedResidualRmsNorm(
+                    input, residual, gamma, output, rms, rows);
+            }
+            long launchAllocation =
+                GC.GetAllocatedBytesForCurrentThread() - allocationBefore;
+            backend.Synchronize();
+            long synchronizationBefore = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < 32; i++) backend.Synchronize();
+            long synchronizationAllocation =
+                GC.GetAllocatedBytesForCurrentThread() - synchronizationBefore;
+            Assert.True(everyLaunchSucceeded, backend.DirectPtxLastError);
+            Assert.Equal(0, launchAllocation);
+            Assert.Equal(0, synchronizationAllocation);
 
             IntPtr graph = backend.CaptureGraph(() =>
                 Assert.True(backend.TryDirectPtxFusedResidualRmsNorm(

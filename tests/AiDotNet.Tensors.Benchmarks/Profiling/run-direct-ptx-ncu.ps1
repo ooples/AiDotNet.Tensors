@@ -35,21 +35,48 @@ $kernel = switch ($Target) {
     'attention-backward' { 'regex:aidotnet_attention_backward_(delta|dq|dkv)_d64' }
     'flash-attention-backward' { 'regex:aidotnet_flash_attention_backward_(dq|dkv)_d64' }
 }
-$metrics = @(
+$expectedLaunches = if ($Target -eq 'attention') { 16 } else { 4 }
+$metricNames = @(
     'sass__inst_executed_register_spilling',
     'sass__inst_executed_register_spilling_mem_local',
     'sass__inst_executed_local_loads',
-    'sass__inst_executed_local_stores'
-) -join ','
+    'sass__inst_executed_local_stores',
+    'launch__registers_per_thread',
+    'launch__shared_mem_per_block_static',
+    'launch__shared_mem_per_block_dynamic',
+    'sm__maximum_warps_per_active_cycle_pct',
+    'sm__warps_active.avg.pct_of_peak_sustained_active'
+)
+$metrics = $metricNames -join ','
 
 & $ncuSource `
     --target-processes all `
     --kernel-name $kernel `
     --metrics $metrics `
     --csv `
+    --page raw `
+    --force-overwrite `
     --log-file $OutputCsv `
     dotnet $targetDll $switch
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 dotnet $targetDll --direct-ptx-verify-ncu $OutputCsv
-exit $LASTEXITCODE
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+# One deterministic launch is emitted for every admitted specialization:
+# attention = four sequence buckets x causal/plain x fused/unfused; residual =
+# four row buckets. Requiring one raw row per requested metric and launch keeps
+# a partial capture from being mistaken for whole-domain zero-spill evidence.
+foreach ($metricName in $metricNames) {
+    $pattern = '"' + [Regex]::Escape($metricName) + '(?:\.[^",]+)?",'
+    $matchCount = @(
+        Select-String -LiteralPath $OutputCsv -Pattern $pattern -AllMatches | ForEach-Object {
+            $_.Matches
+        }
+    ).Count
+    if ($matchCount -ne $expectedLaunches) {
+        throw "Nsight evidence is incomplete for '$metricName': expected $expectedLaunches launch rows, found $matchCount."
+    }
+}
+
+Write-Host "Nsight evidence verified for $expectedLaunches '$Target' specializations."

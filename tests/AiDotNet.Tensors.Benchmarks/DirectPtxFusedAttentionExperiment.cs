@@ -142,9 +142,12 @@ internal static class DirectPtxFusedAttentionExperiment
             backend.Synchronize();
             long before = GC.GetAllocatedBytesForCurrentThread();
             const int calls = 50;
-            for (int i = 0; i < calls; i++) action();
+            for (int i = 0; i < calls; i++)
+            {
+                action();
+                backend.Synchronize();
+            }
             long allocation = (GC.GetAllocatedBytesForCurrentThread() - before) / calls;
-            backend.Synchronize();
 
             double tflops = EffectiveTflops(e2e.Median);
             Print(isCausal ? "causal" : "unmasked", "AiDotNet NVRTC FlashAttn E2E", e2e,
@@ -275,9 +278,9 @@ internal static class DirectPtxFusedAttentionExperiment
                         for (int i = 0; i < calls; i++)
                         {
                             using TorchTensor result = TorchAttention(q, k, v, mask);
+                            torch.cuda.synchronize();
                         }
                         long allocation = (GC.GetAllocatedBytesForCurrentThread() - before) / calls;
-                        torch.cuda.synchronize();
 
                         long minimumTemporaries =
                             2L * BatchHeads * Sequence * Sequence * sizeof(ushort) +
@@ -358,10 +361,10 @@ internal static class DirectPtxFusedAttentionExperiment
             for (int i = 0; i < calls; i++)
             {
                 using TorchTensor result = TorchFusedAttention(q, k, v, isCausal);
+                torch.cuda.synchronize();
             }
             long allocation = (GC.GetAllocatedBytesForCurrentThread() - before) / calls;
-            torch.cuda.synchronize();
-            Print(isCausal ? "causal" : "unmasked", "PyTorch Flash-SDPA E2E", e2e,
+            Print(isCausal ? "causal" : "unmasked", "TorchSharp flash-preferred SDPA E2E", e2e,
                 EffectiveTflops(e2e.Median), allocation, temporaryBytes: -1, error);
         }
     }
@@ -392,9 +395,12 @@ internal static class DirectPtxFusedAttentionExperiment
         runtime.Synchronize();
         long before = GC.GetAllocatedBytesForCurrentThread();
         const int calls = 200;
-        for (int i = 0; i < calls; i++) action();
+        for (int i = 0; i < calls; i++)
+        {
+            action();
+            runtime.Synchronize();
+        }
         long allocation = (GC.GetAllocatedBytesForCurrentThread() - before) / calls;
-        runtime.Synchronize();
         return allocation;
     }
 

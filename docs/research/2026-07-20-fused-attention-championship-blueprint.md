@@ -5,9 +5,10 @@ Baseline: `b386d35` plus the working-tree experiment described here
 
 ## Verdict
 
-The forward-inference experiment is implemented end to end for NVIDIA SM80+
-and the declared shape family. Deterministic FP32 materialized-probability
-and Flash/LSE-recomputation backward families are implemented for Ampere SM86:
+The forward-inference experiment is implemented end to end for the measured
+NVIDIA SM86 target and the declared shape family. Deterministic FP32
+materialized-probability and Flash/LSE-recomputation backward families are
+also implemented for SM86:
 
 ```text
 FP16 Q/K/V, dense BHSD, Sq and Skv independently in {16,32,64,128}, D=64
@@ -19,8 +20,10 @@ FP16 Q/K/V, dense BHSD, Sq and Skv independently in {16,32,64,128}, D=64
 
 The final wide benchmark is GPU-only. It compares the direct PTX kernel with
 the current AiDotNet CUDA/NVRTC implementation, a direct cuBLAS Tensor Core
-composition, and PyTorch SDPA with its exposed Flash and Math backends forced
-one at a time. Intel MKL and OpenBLAS are deliberately absent: they are CPU
+composition, and PyTorch SDPA. The in-process TorchSharp 0.106 lane can only
+toggle Flash and Math preferences, so it is labeled as a preference lane; the
+external Python harness is the authoritative forced-backend comparison for
+cuDNN, Flash, Efficient, and Math. Intel MKL and OpenBLAS are deliberately absent: they are CPU
 BLAS libraries, not NVIDIA GPU kernels. The NVIDIA analogue for this
 experiment is cuBLAS.
 
@@ -71,6 +74,12 @@ Two lanes are reported separately.
 | Attention | FP16 Q/K/V -> FP32 `softmax(QK^T * scale + mask)V` | `4 * BH * S^2 * D` |
 | Attention + epilogue | The same FP32 attention, then row-wise LayerNorm over D=64, affine, and tanh-GELU | Attention FLOPs only, labeled effective TFLOPS |
 
+The physical-kernel championship lane uses FP16 Q/K/V for direct PTX, cuBLAS,
+and PyTorch. Current AiDotNet NVRTC has no equivalent FP16 entry point; its
+separately labeled framework baseline receives the same half-rounded numerical
+values in FP32 storage. It is required coverage for the original implementation,
+but is not presented as dtype-identical to the physical-kernel lane.
+
 All steady-state rows use resident GPU inputs and outputs. Setup, allocation,
 host/device copies, module JIT, and PyTorch/AiDotNet construction are outside
 the timed region. Each invocation includes its framework or Driver-API launch
@@ -85,10 +94,14 @@ which does emit the existing API's FP32 statistics. The current AiDotNet benchma
 therefore performs a small additional documented side effect. No public
 PyTorch SDPA API in this package returns matching LSE output.
 
-`TFLOPS` counts the two attention matrix products. It does not invent FLOPs
+`GFLOPS` and `TFLOPS` count the same two attention matrix products at different
+scales. They do not invent FLOPs
 for softmax, mask predicates, normalization, or activation. `B/call` is
 managed allocation on the calling thread. `tmp MiB` is known intermediate
-VRAM, excluding inputs and final outputs.
+VRAM, excluding inputs and final outputs. Correctness rows report maximum
+absolute error and a stable symmetric relative error
+`2*abs(actual-expected)/(abs(actual)+abs(expected)+1e-3)` so values near zero
+do not turn the relative column into noise.
 
 ## Exact championship cell
 
@@ -108,8 +121,8 @@ unmasked  Direct PTX + LN + GELU [device]         38.60      66.05      89.91   
 unmasked  Direct PTX + LN + GELU [E2E]            52.90      63.70     308.50      62.78    10.149        0    0.000  5.491e-4     66        0
 unmasked  AiDotNet NVRTC attention [E2E]        1175.30    1578.20    1788.40    1261.20     0.457        0    0.062   2.980e-8    n/a      n/a
 unmasked  AiDotNet NVRTC + LN + GELU [E2E]      1259.90    1614.70    2068.30    1321.81     0.426       40    8.188   5.603e-6    n/a      n/a
-unmasked  PyTorch Flash-SDPA FP32 [E2E]           64.10     132.20     138.80      72.38     8.376       96      n/a   1.214e-5    n/a      n/a
-unmasked  PyTorch Flash + LN + GELU [E2E]        406.00    1681.90    2115.90     811.50     1.322      704      n/a   9.871e-4    n/a      n/a
+unmasked  TorchSharp flash-preferred SDPA [E2E]   64.10     132.20     138.80      72.38     8.376       96      n/a   1.214e-5    n/a      n/a
+unmasked  TorchSharp flash-preferred + epilogue  406.00    1681.90    2115.90     811.50     1.322      704      n/a   9.871e-4    n/a      n/a
 causal    Direct PTX attention [device]           25.60      53.04      59.90      28.84    20.972        0    0.000  2.855e-5     80        0
 causal    Direct PTX attention [E2E]              39.80     129.40     326.60      64.62    13.489        0    0.000  2.855e-5     80        0
 causal    cuBLAS+PTX softmax [device]             51.51      96.15     157.49      61.22    10.423        0   12.000  3.869e-5    n/a      n/a
@@ -118,13 +131,13 @@ causal    Direct PTX + LN + GELU [device]         26.73      36.76      46.80   
 causal    Direct PTX + LN + GELU [E2E]            41.20      43.70      45.40      41.42    13.031        0    0.000  5.491e-4     80        0
 causal    AiDotNet NVRTC attention [E2E]         912.30    1137.60    1527.30     943.25     0.588        0    0.062   2.980e-8    n/a      n/a
 causal    AiDotNet NVRTC + LN + GELU [E2E]      1025.10    1280.00    1529.30    1061.36     0.524       40    8.188   5.722e-6    n/a      n/a
-causal    PyTorch Flash-SDPA FP32 [E2E]          102.30     119.50     131.60     102.53     5.248       96      n/a   6.071e-5    n/a      n/a
-causal    PyTorch Flash + LN + GELU [E2E]        371.50    1598.10    1794.40     766.39     1.445      704      n/a   1.247e-3    n/a      n/a
+causal    TorchSharp flash-preferred SDPA [E2E]  102.30     119.50     131.60     102.53     5.248       96      n/a   6.071e-5    n/a      n/a
+causal    TorchSharp flash-preferred + epilogue  371.50    1598.10    1794.40     766.39     1.445      704      n/a   1.247e-3    n/a      n/a
 ```
 
 The direct kernel's device median is 1.52x faster than the decomposed cuBLAS
 floor unmasked and 2.01x faster causal. Its synchronized attention median is
-1.39x/2.57x faster than forced PyTorch Flash-SDPA. The fused median is
+1.39x/2.57x faster than the TorchSharp flash-preferred lane. The fused median is
 7.67x/9.02x faster than PyTorch's equivalent tanh-GELU composition and
 23.82x/24.88x faster than current AiDotNet.
 
@@ -138,22 +151,22 @@ values are reported rather than removed.
 The matrix covers six occupancy regimes, both mask modes, and both semantic
 lanes. The following is the compact championship view from a representative
 serialized capture; `best competitor` is the lowest median among cuBLAS composition,
-current AiDotNet, forced PyTorch Flash-SDPA, and forced PyTorch Math-SDPA.
+current AiDotNet, and the TorchSharp Flash-preferred/Flash-disabled preference lanes.
 
 | Shape | Mode | Lane | Direct median us | Direct p95 | Direct p99 | Direct TFLOPS | Best competitor | Competitor median us | Speedup |
 |---|---|---|---:|---:|---:|---:|---|---:|---:|
 | BH12 S16 | plain | attention | 21.40 | 41.95 | 44.25 | 0.037 | cuBLAS+PTX | 42.50 | 1.99x |
 | BH12 S16 | causal | attention | 17.80 | 19.35 | 21.70 | 0.044 | cuBLAS+PTX | 45.50 | 2.56x |
 | BH12 S32 | plain | attention | 19.20 | 35.40 | 44.10 | 0.164 | cuBLAS+PTX | 43.50 | 2.27x |
-| BH12 S32 | causal | attention | 17.80 | 33.65 | 41.85 | 0.177 | PyTorch Math | 52.10 | 2.93x |
+| BH12 S32 | causal | attention | 17.80 | 33.65 | 41.85 | 0.177 | TorchSharp Flash-disabled | 52.10 | 2.93x |
 | BH12 S64 | plain | attention | 21.20 | 40.20 | 73.40 | 0.594 | cuBLAS+PTX | 49.40 | 2.33x |
-| BH12 S64 | causal | attention | 20.20 | 39.70 | 45.60 | 0.623 | PyTorch Math | 52.00 | 2.57x |
+| BH12 S64 | causal | attention | 20.20 | 39.70 | 45.60 | 0.623 | TorchSharp Flash-disabled | 52.00 | 2.57x |
 | BH12 S128 | plain | attention | 35.40 | 56.15 | 97.15 | 1.422 | cuBLAS+PTX | 48.00 | 1.36x |
 | BH12 S128 | causal | attention | 27.70 | 48.75 | 107.45 | 1.817 | cuBLAS+PTX | 46.80 | 1.69x |
-| BH128 S128 | plain | attention | 48.00 | 51.80 | 54.75 | 11.185 | PyTorch Math | 65.20 | 1.36x |
-| BH128 S128 | causal | attention | 39.00 | 56.70 | 79.65 | 13.766 | PyTorch Flash | 64.20 | 1.65x |
-| BH512 S128 | plain | attention | 130.60 | 133.40 | 138.05 | 16.443 | PyTorch Flash | 132.10 | 1.01x |
-| BH512 S128 | causal | attention | 91.40 | 262.80 | 350.90 | 23.495 | PyTorch Math | 118.00 | 1.29x |
+| BH128 S128 | plain | attention | 48.00 | 51.80 | 54.75 | 11.185 | TorchSharp Flash-disabled | 65.20 | 1.36x |
+| BH128 S128 | causal | attention | 39.00 | 56.70 | 79.65 | 13.766 | TorchSharp Flash-preferred | 64.20 | 1.65x |
+| BH512 S128 | plain | attention | 130.60 | 133.40 | 138.05 | 16.443 | TorchSharp Flash-preferred | 132.10 | 1.01x |
+| BH512 S128 | causal | attention | 91.40 | 262.80 | 350.90 | 23.495 | TorchSharp Flash-disabled | 118.00 | 1.29x |
 | BH12 S16 | plain | attn+epi | 18.50 | 31.05 | 39.75 | 0.043 | AiDotNet NVRTC | 55.80 | 3.02x |
 | BH12 S16 | causal | attn+epi | 22.40 | 48.90 | 66.55 | 0.035 | AiDotNet NVRTC | 55.30 | 2.47x |
 | BH12 S32 | plain | attn+epi | 18.90 | 39.05 | 40.50 | 0.166 | AiDotNet NVRTC | 82.60 | 4.37x |
@@ -162,10 +175,10 @@ current AiDotNet, forced PyTorch Flash-SDPA, and forced PyTorch Math-SDPA.
 | BH12 S64 | causal | attn+epi | 20.80 | 41.55 | 44.30 | 0.605 | AiDotNet NVRTC | 132.90 | 6.39x |
 | BH12 S128 | plain | attn+epi | 32.10 | 32.85 | 35.20 | 1.568 | AiDotNet NVRTC | 238.90 | 7.44x |
 | BH12 S128 | causal | attn+epi | 35.40 | 69.50 | 163.15 | 1.422 | AiDotNet NVRTC | 241.70 | 6.83x |
-| BH128 S128 | plain | attn+epi | 52.40 | 56.55 | 59.65 | 10.246 | PyTorch Math | 304.60 | 5.81x |
-| BH128 S128 | causal | attn+epi | 39.00 | 40.10 | 43.70 | 13.766 | PyTorch Math | 275.20 | 7.06x |
-| BH512 S128 | plain | attn+epi | 135.70 | 182.35 | 320.05 | 15.825 | PyTorch Math | 804.70 | 5.93x |
-| BH512 S128 | causal | attn+epi | 103.00 | 114.25 | 255.30 | 20.849 | PyTorch Flash | 809.50 | 7.86x |
+| BH128 S128 | plain | attn+epi | 52.40 | 56.55 | 59.65 | 10.246 | TorchSharp Flash-disabled | 304.60 | 5.81x |
+| BH128 S128 | causal | attn+epi | 39.00 | 40.10 | 43.70 | 13.766 | TorchSharp Flash-disabled | 275.20 | 7.06x |
+| BH512 S128 | plain | attn+epi | 135.70 | 182.35 | 320.05 | 15.825 | TorchSharp Flash-disabled | 804.70 | 5.93x |
+| BH512 S128 | causal | attn+epi | 103.00 | 114.25 | 255.30 | 20.849 | TorchSharp Flash-preferred | 809.50 | 7.86x |
 
 The executable prints every competitor row with median, p95, p99, mean,
 effective TFLOPS, managed allocation, and known temporary VRAM. The table
@@ -426,7 +439,10 @@ Production integration is fail-closed:
   `AIDOTNET_DIRECT_PTX_PAGED_PREFILL=1`, or
   `AIDOTNET_DIRECT_PTX_ATTENTION_BACKWARD=1`, or
   `AIDOTNET_DIRECT_PTX_FLASH_ATTENTION_BACKWARD=1` to admit only that family.
-- SM < 8.0, unsupported shape/dtype/layout, bias, active autodiff tape, stream
+- The process-level gates are resolved once when a CUDA backend is constructed,
+  steady-state dispatch does not reread environment variables.
+- SM other than the executed SM86 target, unsupported shape/dtype/layout,
+  bias, active autodiff tape, stream
   capture, JIT failure, or launch failure falls back to the existing path.
 - The runtime borrows the existing `CudaBackend` context and stream, so
   resident AiDotNet buffers require no copy or context bridge.
@@ -436,6 +452,9 @@ Production integration is fail-closed:
 - Capture may use an already prewarmed attention or decode specialization with
   stable caller-owned buffers. A capture-time JIT/cache miss fails closed;
   capture never tunes, allocates, performs file I/O, or evicts a live module.
+- The allocating high-level route stays on the established resident NVRTC path
+  during stream capture; only the prewarmed physical backend route with stable
+  caller-owned buffers is graph-capturable.
 
 ## Canonical physical-layout policy
 
@@ -459,8 +478,11 @@ The implemented token is `DirectPtxTensorView`:
 - no stride fields and no shape fields passed to PTX.
 
 Shape, offsets, trip counts, mask mode, scale, and fusion choices are baked
-into the PTX specialization. Public `Tensor<float>` input is currently
-resolved to persistent/resident FP16 storage once at the dispatch boundary.
+into the PTX specialization. Public `Tensor<float>` input reuses an existing
+resident FP16 activation when one is available. Otherwise the current
+high-level bridge creates and owns an FP16 conversion buffer for that call;
+the zero-temporary-VRAM claim applies to the prevalidated physical FP16
+backend launch, not that conversion fallback.
 The longer-term tensor design should preserve logical views for usability but
 attach an immutable physical-layout proof (`layout id`, dtype, alignment,
 storage generation, extent) to resident allocations. View/transpose changes
@@ -484,8 +506,9 @@ The final S=128 functions on this RTX 3080 report:
 | Flash backward dQ, no bias / bias | 29 / 33 | 0 bytes | 0 |
 | Flash backward dK/dV, no bias / bias | 33 / 35 | 0 bytes | 0 |
 
-`local bytes/thread = 0` is direct runtime evidence that this JIT result has
-no local stack or register-spill allocation. Tests carry the value through
+`local bytes/thread = 0` is a mandatory JIT resource-admission result, but it
+is not by itself sufficient proof that no executed spill/local-memory traffic
+occurred. Tests carry the value through
 the borrowed production runtime and assert zero. Structural tests also assert
 the expected `cp.async`, `mma.sync`, online tiling, absence of score/probability
 pointers, and absence of stride parameters.
@@ -520,7 +543,7 @@ attribute remains the available zero-spill admission proof for this capture.
 | Misaligned or undersized device pointer | Capability-token rejection and fallback |
 | Active autodiff tape / forward recording | Existing recorded implementation |
 | CUDA graph capture | Caller-owned-buffer direct launches are allowed only after explicit prewarm; capture-time JIT/cache misses fail closed, and allocating high-level routes retain their established behavior |
-| Non-Ampere architecture | Gate disabled until a separately tuned Ada/Hopper/Blackwell family exists |
+| SM other than 8.6 | Gate disabled until that SM target is separately tuned and proven |
 | Driver JIT reports local bytes | Module rejected and fallback |
 | Rectangular causal | Separate baked domains: FlashAttentionV2 top-left (`offset=0`), SDPA bottom-right (`offset=Skv-Sq`); negative offsets remain fail-closed until fully-masked leading rows have a dedicated specialization |
 | Causal future K/V tile | Compute skipped per owning query warp |
@@ -549,17 +572,25 @@ Each future low-level kernel should be delivered as one repeatable unit:
 8. Fuse epilogues only when their semantic axis and approximation are exact.
    Here LayerNorm is per `[B,H,S]` row over D=64, with shared D64 gamma/beta.
 9. Query registers, shared memory, and local bytes from the compiled function.
-   Reject spills as a runtime admission rule.
+   Reject nonzero local-byte admission, then require executed Nsight spill/local
+   counters to be zero before release.
 10. Validate every supported bucket, mask, and fusion signature, including
     layout rejection and fallback behavior.
 11. Benchmark only semantic and hardware peers: current AiDotNet GPU,
     NVIDIA vendor composition, and framework GPU primitives with backends
     forced where the API permits. Keep CPU libraries in a separate study.
-12. Report median, p95, p99, mean, effective throughput, managed allocation,
-    known temporary VRAM, numerical error, registers, local bytes, and JIT
+12. Report median, p95, p99, mean, effective GFLOP/s and TFLOP/s, managed allocation,
+    known temporary VRAM, numerical error, registers, static/dynamic shared
+    memory, local bytes, occupancy, and JIT
     setup separately.
 13. Promote behind an opt-in gate only after the declared cell wins; retain a
     safe fallback and expand one shape/fusion cell at a time.
+14. Capture at least three clean independent processes with the checked-in
+    release-evidence script. A concurrent compute process or thermally invalid
+    start aborts the run instead of producing a publishable row.
+15. Run Nsight on every admitted specialization and size. Zero JIT local bytes
+    is necessary but release still requires zero executed spill, local-load,
+    and local-store counters plus recorded launch resources/occupancy.
 
 The reusable code layers are:
 
@@ -599,7 +630,7 @@ copied into another one-off emitter.
 | Hardened performance gate | Policy requires >=1.10x median, bounded p95, zero hot managed/device temporary bytes, numerical tolerance, zero local bytes, and three independent runs | Windows display scheduling can hold an otherwise fast candidate |
 | Expanded correctness | Rectangular Sq/Skv D64 FP16 attention, D64 FP32 dense/paged decode, causal D64 FP32 paged prefill, deterministic materialized-probability D64 FP32 backward, and deterministic optionally biased Flash/LSE-recomputation D64 FP32 backward admit their tested buckets; explicit reasons cover dtype, D, invalid head maps, page geometry, mask, bias, dropout, phase, and ragged requests | BF16, arbitrary-mask prefill/backward, Flash GQA, and ragged semantics remain implementation work |
 | Real second fusion | `residual + RMSNorm(D=64)` is one warp-owned reduction/fusion using the same ABI, audit, gate, cache, graph-prewarm, tests, and benchmark framework | QKV projection/RoPE remains the next tensor-core fusion |
-| Architecture families | Ampere, Ada, Hopper, and Blackwell are distinct dispatch domains | Only Ampere SM86 was executed here; other families deliberately reject rather than inherit Ampere tuning |
+| Architecture families | Ampere, Ada, Hopper, and Blackwell are distinct dispatch domains | Only SM86 was executed and is admitted; every other SM target rejects rather than inheriting its tuning |
 
 ### Physical layout rule
 
@@ -643,7 +674,8 @@ promotion additionally requires three clean independent runs.
 ### Strong GPU competitors
 
 The in-process suite still includes current AiDotNet CUDA, direct cuBLAS
-composition, and forced TorchSharp Flash/Math SDPA. The new external harness
+composition, and explicitly labeled TorchSharp Flash-preferred/Flash-disabled
+SDPA lanes. The external harness
 adds explicitly forced PyTorch cuDNN, Flash, Efficient, and Math SDPA, each in
 eager and `torch.compile(max-autotune)` form, plus the official
 `flash-attn` package when installed. It reports CUDA-event median/p95/p99/mean,
@@ -699,8 +731,9 @@ tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-ncu.ps1 `
 ```
 
 The script profiles a deterministic kernel target and fails unless executed
-register-spill instructions, local loads, local stores, and local spill
-requests are all zero. PerfView remains appropriate for managed allocation
+register-spill instructions, local loads, and local stores are all zero. Its
+raw CSV also records registers/thread, static/dynamic shared memory, theoretical
+occupancy, and achieved occupancy. PerfView remains appropriate for managed allocation
 and ETW; it is not accepted as GPU spill evidence.
 
 ## Reproduction
@@ -751,6 +784,10 @@ dotnet run --project tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmar
 
 C:\Users\cheat\.cache\aidotnet-direct-ptx-py312\Scripts\python.exe `
   tests/AiDotNet.Tensors.Benchmarks/BaselineRunners/py/run_direct_ptx_flash_attention_backward_competitors.py --runs 3
+
+# Mandatory release capture: three separate processes per suite, guarded
+# against concurrent compute, with SHA-256-addressed raw logs.
+tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-release-evidence.ps1
 
 $env:AIDOTNET_DIRECT_PTX_ATTENTION='1'
 $env:AIDOTNET_DIRECT_PTX_RESIDUAL_RMSNORM='1'

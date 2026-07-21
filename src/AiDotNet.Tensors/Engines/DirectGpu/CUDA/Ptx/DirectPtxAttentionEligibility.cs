@@ -21,6 +21,8 @@ internal enum DirectPtxAttentionPhase
 
 internal readonly record struct DirectPtxAttentionRequest(
     DirectPtxArchitectureFamily Architecture,
+    int ComputeCapabilityMajor,
+    int ComputeCapabilityMinor,
     DirectPtxPhysicalType InputType,
     DirectPtxPhysicalLayout Layout,
     int Batch,
@@ -50,8 +52,9 @@ internal static class DirectPtxAttentionEligibility
 {
     internal static DirectPtxEligibilityResult Evaluate(in DirectPtxAttentionRequest request)
     {
-        if (!DirectPtxArchitecture.HasValidatedOnlineAttention(request.Architecture))
-            return DirectPtxEligibilityResult.Reject("architecture-family-not-validated");
+        if (!DirectPtxArchitecture.HasValidatedOnlineAttention(
+            request.ComputeCapabilityMajor, request.ComputeCapabilityMinor))
+            return DirectPtxEligibilityResult.Reject("sm-version-not-validated");
         if (request.InputType != DirectPtxPhysicalType.Float16)
             return DirectPtxEligibilityResult.Reject("dtype-not-fp16");
         if (request.Layout != DirectPtxPhysicalLayout.Bhsd)

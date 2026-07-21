@@ -6,12 +6,13 @@ using System.Text;
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
 /// <summary>
-/// SM80+ online FlashAttention family for Sq/Skv in {16,32,64,128}, D=64, including MHA,
+/// Validated-SM86 online FlashAttention family for Sq/Skv in {16,32,64,128}, D=64, including MHA,
 /// GQA, and MQA. Each warp owns a 16-row query tile, keeps the FP32 online max/sum and
 /// 16x64 output fragment in registers, and the warps in a block share double-buffered
 /// 16-row K/V tiles staged with cp.async. No score or probability matrix is materialized
 /// in global or shared memory. Batch/head/shape mapping is baked into each emitted module;
-/// the PTX contains no dynamic shape, layout, or stride checks.
+/// the PTX contains no dynamic shape, layout, or stride checks. Other architecture
+/// families fail closed until their separately tuned specialization passes the release gate.
 /// </summary>
 internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
 {
@@ -115,9 +116,10 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
         if (!IsSupportedSequenceLength(keyValueSequence))
             throw new ArgumentOutOfRangeException(
                 nameof(keyValueSequence), "Online PTX KV length must be one of 16, 32, 64, or 128.");
-        if (!DirectPtxArchitecture.HasValidatedOnlineAttention(runtime.ArchitectureFamily))
+        if (!DirectPtxArchitecture.HasValidatedOnlineAttention(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new NotSupportedException(
-                $"Online attention has no validated {runtime.ArchitectureFamily} specialization. " +
+                $"Online attention has no validated SM {runtime.ComputeCapabilityMajor}.{runtime.ComputeCapabilityMinor} specialization. " +
                 "Architecture families fail closed until separately tuned and benchmarked.");
 
         int queryTiles = querySequence / QueryTileRows;
@@ -261,7 +263,7 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
         IntPtr g = gamma.Pointer;
         IntPtr b = beta.Pointer;
         IntPtr o = output.Pointer;
-        IntPtr s = softmaxStats.Pointer;
+        IntPtr s = EmitSoftmaxStats ? softmaxStats.Pointer : IntPtr.Zero;
         void** args = stackalloc void*[7];
         args[0] = &q;
         args[1] = &k;

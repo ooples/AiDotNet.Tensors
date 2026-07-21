@@ -36,8 +36,8 @@ internal static class DirectPtxArchitecture
     /// specialization. Other families must supply and benchmark their own
     /// implementation instead of silently inheriting Ampere's tuning.
     /// </summary>
-    internal static bool HasValidatedOnlineAttention(DirectPtxArchitectureFamily family) =>
-        family == DirectPtxArchitectureFamily.Ampere;
+    internal static bool HasValidatedOnlineAttention(int major, int minor) =>
+        (major, minor) == (8, 6);
 }
 
 internal enum DirectPtxExtentMode
@@ -264,12 +264,18 @@ internal sealed record DirectPtxProfilerEvidence(
             }
         }
 
-        long Get(params string[] names) => names.Sum(name => values.GetValueOrDefault(name));
+        static bool Matches(string metric, string baseName) =>
+            string.Equals(metric, baseName, StringComparison.Ordinal) ||
+            metric.StartsWith(baseName + ".", StringComparison.Ordinal);
+        long Get(params string[] names) => values
+            .Where(pair => names.Any(name => Matches(pair.Key, name)))
+            .Sum(pair => pair.Value);
+        bool Contains(string name) => values.Keys.Any(metric => Matches(metric, name));
         int observedGroups = 0;
-        if (values.ContainsKey("sass__inst_executed_register_spilling") ||
-            values.ContainsKey("sass__inst_executed_register_spilling_mem_local")) observedGroups++;
-        if (values.ContainsKey("sass__inst_executed_local_loads")) observedGroups++;
-        if (values.ContainsKey("sass__inst_executed_local_stores")) observedGroups++;
+        if (Contains("sass__inst_executed_register_spilling") ||
+            Contains("sass__inst_executed_register_spilling_mem_local")) observedGroups++;
+        if (Contains("sass__inst_executed_local_loads")) observedGroups++;
+        if (Contains("sass__inst_executed_local_stores")) observedGroups++;
         return new DirectPtxProfilerEvidence(
             Get("sass__inst_executed_register_spilling", "sass__inst_executed_register_spilling_mem_local"),
             Get("sass__inst_executed_local_loads"),
@@ -278,11 +284,15 @@ internal sealed record DirectPtxProfilerEvidence(
             Path.GetFullPath(path));
     }
 
-    private static bool IsSpillMetric(string value) => value is
-        "sass__inst_executed_register_spilling" or
-        "sass__inst_executed_register_spilling_mem_local" or
-        "sass__inst_executed_local_loads" or
-        "sass__inst_executed_local_stores";
+    private static bool IsSpillMetric(string value) =>
+        value == "sass__inst_executed_register_spilling" ||
+        value.StartsWith("sass__inst_executed_register_spilling.", StringComparison.Ordinal) ||
+        value == "sass__inst_executed_register_spilling_mem_local" ||
+        value.StartsWith("sass__inst_executed_register_spilling_mem_local.", StringComparison.Ordinal) ||
+        value == "sass__inst_executed_local_loads" ||
+        value.StartsWith("sass__inst_executed_local_loads.", StringComparison.Ordinal) ||
+        value == "sass__inst_executed_local_stores" ||
+        value.StartsWith("sass__inst_executed_local_stores.", StringComparison.Ordinal);
 
     private static string[] ParseCsvLine(string line)
     {

@@ -7,6 +7,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 public sealed partial class CudaBackend
 {
+    // Resolve process-level feature switches once when the backend is built.
+    // Reading environment variables in every dispatch would violate the
+    // zero-allocation hot-path contract even though the PTX launch is resident.
+    private readonly bool _directPtxAttentionOptedIn = DirectPtxFeatureGate.IsAttentionEnabled;
+    private readonly bool _directPtxResidualRmsNormOptedIn =
+        DirectPtxFeatureGate.IsResidualRmsNormEnabled;
     private readonly object _directPtxLock = new();
     private readonly DirectPtxKernelCache<DirectPtxAttentionKey, PtxOnlineFusedAttention128x64Kernel>
         _directPtxAttentionKernels = new(DirectPtxFeatureGate.CacheCapacity);
@@ -40,13 +46,12 @@ public sealed partial class CudaBackend
     }
 
     internal bool IsDirectPtxAttentionEnabled =>
-        DirectPtxFeatureGate.IsAttentionEnabled && IsAvailable &&
-        DirectPtxArchitecture.HasValidatedOnlineAttention(
-            DirectPtxArchitecture.Classify(_ccMajor, _ccMinor));
+        _directPtxAttentionOptedIn && IsAvailable &&
+        DirectPtxArchitecture.HasValidatedOnlineAttention(_ccMajor, _ccMinor);
 
     internal bool IsDirectPtxResidualRmsNormEnabled =>
-        DirectPtxFeatureGate.IsResidualRmsNormEnabled && IsAvailable &&
-        DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) == DirectPtxArchitectureFamily.Ampere;
+        _directPtxResidualRmsNormOptedIn && IsAvailable &&
+        DirectPtxArchitecture.HasValidatedOnlineAttention(_ccMajor, _ccMinor);
 
     internal bool IsDirectPtxFlashDecodeEnabled =>
         DirectPtxFeatureGate.IsFlashDecodeEnabled && IsAvailable &&
@@ -205,6 +210,8 @@ public sealed partial class CudaBackend
         DirectPtxEligibilityResult eligibility = DirectPtxAttentionEligibility.Evaluate(
             new DirectPtxAttentionRequest(
                 DirectPtxArchitecture.Classify(_ccMajor, _ccMinor),
+                _ccMajor,
+                _ccMinor,
                 DirectPtxPhysicalType.Float16,
                 DirectPtxPhysicalLayout.Bhsd,
                 Batch: batch,
@@ -348,7 +355,7 @@ public sealed partial class CudaBackend
         float epsilon)
     {
         DirectPtxAttentionKey key = DirectPtxAttentionKey.FromPlan(plan, warpsPerBlock);
-        if (_directPtxAttentionKernels.TryGetValue(key, out PtxOnlineFusedAttention128x64Kernel? existing))
+        if (_directPtxAttentionKernels.TryGetValue(key, out PtxOnlineFusedAttention128x64Kernel existing))
             return existing;
         return CreateAndCacheAttentionKernelSlow(key, plan, warpsPerBlock, scale, epsilon);
     }
@@ -362,12 +369,12 @@ public sealed partial class CudaBackend
         float scale,
         float epsilon)
     {
-        return _directPtxAttentionKernels.GetOrAdd(key, () =>
-            new PtxOnlineFusedAttention128x64Kernel(
-                _directPtxRuntime!, plan.Batch, plan.QueryHeads, plan.KeyValueHeads,
-                plan.QuerySequence, plan.KeyValueSequence, plan.IsCausal,
-                plan.FuseLayerNormGelu, scale, epsilon,
-                plan.EmitSoftmaxStats, warpsPerBlock, plan.CausalQueryOffset));
+        var created = new PtxOnlineFusedAttention128x64Kernel(
+            _directPtxRuntime!, plan.Batch, plan.QueryHeads, plan.KeyValueHeads,
+            plan.QuerySequence, plan.KeyValueSequence, plan.IsCausal,
+            plan.FuseLayerNormGelu, scale, epsilon,
+            plan.EmitSoftmaxStats, warpsPerBlock, plan.CausalQueryOffset);
+        return _directPtxAttentionKernels.AddOrGetExisting(key, created);
     }
 
     private static void LaunchAttentionKernel(
@@ -1323,9 +1330,9 @@ public sealed partial class CudaBackend
                 }
 
                 _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
-                PtxFusedResidualRmsNormD64Kernel kernel =
-                    _directPtxResidualRmsNormKernels.GetOrAdd(key, () =>
-                        new PtxFusedResidualRmsNormD64Kernel(_directPtxRuntime, rows, epsilon));
+                PtxFusedResidualRmsNormD64Kernel kernel;
+                if (!_directPtxResidualRmsNormKernels.TryGetValue(key, out kernel))
+                    kernel = CreateAndCacheResidualRmsNormKernel(key, rows, epsilon);
                 lock (GpuDispatchLock)
                 {
                     kernel.Launch(
@@ -1357,8 +1364,8 @@ public sealed partial class CudaBackend
             {
                 _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                 var key = new DirectPtxResidualRmsNormKey(rows, BitConverter.SingleToInt32Bits(epsilon));
-                _ = _directPtxResidualRmsNormKernels.GetOrAdd(key, () =>
-                    new PtxFusedResidualRmsNormD64Kernel(_directPtxRuntime, rows, epsilon));
+                if (!_directPtxResidualRmsNormKernels.TryGetValue(key, out _))
+                    _ = CreateAndCacheResidualRmsNormKernel(key, rows, epsilon);
                 return true;
             }
         }
@@ -1367,6 +1374,15 @@ public sealed partial class CudaBackend
             DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
             return false;
         }
+    }
+
+    private PtxFusedResidualRmsNormD64Kernel CreateAndCacheResidualRmsNormKernel(
+        DirectPtxResidualRmsNormKey key,
+        int rows,
+        float epsilon)
+    {
+        var created = new PtxFusedResidualRmsNormD64Kernel(_directPtxRuntime!, rows, epsilon);
+        return _directPtxResidualRmsNormKernels.AddOrGetExisting(key, created);
     }
 
     internal bool TryGetDirectPtxResidualRmsNormAudit(
