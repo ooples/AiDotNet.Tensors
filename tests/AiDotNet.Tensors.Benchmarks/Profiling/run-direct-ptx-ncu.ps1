@@ -44,10 +44,9 @@ $expectedLaunches = switch ($Target) {
     'flash-attention-backward' { 2 }
 }
 $metricNames = @(
-    'sass__inst_executed_register_spilling',
-    'sass__inst_executed_register_spilling_mem_local',
-    'sass__inst_executed_local_loads',
-    'sass__inst_executed_local_stores',
+    'smsp__sass_inst_executed_op_local.sum',
+    'smsp__sass_inst_executed_op_local_ld.sum',
+    'smsp__sass_inst_executed_op_local_st.sum',
     'launch__registers_per_thread',
     'launch__shared_mem_per_block_static',
     'launch__shared_mem_per_block_dynamic',
@@ -72,17 +71,32 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # One deterministic launch is emitted for every promoted kernel entry point;
 # attention and residual-RMSNorm additionally enumerate all promoted sequence/
-# row, causal, and fusion variants. Requiring one raw row per requested metric
-# and launch keeps a partial capture from being mistaken for complete evidence.
+# row, causal, and fusion variants. Nsight Compute 2026.2 raw CSV has one wide
+# data row per launch. Require every requested column on every expected launch
+# so a partial capture cannot be mistaken for complete evidence.
+$csvLines = @(Get-Content -LiteralPath $OutputCsv)
+$headerIndex = -1
+for ($index = 0; $index -lt $csvLines.Count; $index++) {
+    if ($csvLines[$index].StartsWith('"ID","Process ID","Process Name"', [StringComparison]::Ordinal)) {
+        $headerIndex = $index
+        break
+    }
+}
+if ($headerIndex -lt 0) { throw 'Nsight evidence does not contain a raw CSV header.' }
+$records = @(($csvLines[$headerIndex..($csvLines.Count - 1)] -join "`n") |
+    ConvertFrom-Csv | Where-Object { -not [string]::IsNullOrWhiteSpace($_.'Kernel Name') })
+if ($records.Count -ne $expectedLaunches) {
+    throw "Nsight evidence is incomplete for '$Target': expected $expectedLaunches launch rows, found $($records.Count)."
+}
 foreach ($metricName in $metricNames) {
-    $pattern = '"' + [Regex]::Escape($metricName) + '(?:\.[^",]+)?",'
-    $matchCount = @(
-        Select-String -LiteralPath $OutputCsv -Pattern $pattern -AllMatches | ForEach-Object {
-            $_.Matches
-        }
-    ).Count
-    if ($matchCount -ne $expectedLaunches) {
-        throw "Nsight evidence is incomplete for '$metricName': expected $expectedLaunches launch rows, found $matchCount."
+    if ($records[0].PSObject.Properties.Name -notcontains $metricName) {
+        throw "Nsight evidence is missing the '$metricName' column."
+    }
+    $valueCount = @($records | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_.$metricName)
+    }).Count
+    if ($valueCount -ne $expectedLaunches) {
+        throw "Nsight evidence is incomplete for '$metricName': expected $expectedLaunches values, found $valueCount."
     }
 }
 

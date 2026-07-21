@@ -786,6 +786,22 @@ public class DirectPtxWmmaTests
                 "\"sass__inst_executed_local_loads\",\"0\"\n");
             DirectPtxProfilerEvidence incomplete = DirectPtxProfilerEvidence.FromNcuCsv(path);
             Assert.False(incomplete.ProvesZeroExecutedSpills);
+
+            System.IO.File.WriteAllText(path,
+                "==PROF== Connected\n" +
+                "\"ID\",\"Kernel Name\",\"smsp__sass_inst_executed_op_local.sum\",\"smsp__sass_inst_executed_op_local_ld.sum\",\"smsp__sass_inst_executed_op_local_st.sum\"\n" +
+                "\"\",\"\",\"inst\",\"inst\",\"inst\"\n" +
+                "\"0\",\"kernel_a\",\"0\",\"0\",\"0\"\n" +
+                "\"1\",\"kernel_b\",\"0\",\"0\",\"0\"\n");
+            DirectPtxProfilerEvidence modern = DirectPtxProfilerEvidence.FromNcuCsv(path);
+            Assert.True(modern.ProvesZeroExecutedSpills);
+            Assert.Equal(3, modern.ObservedMetricGroups);
+
+            System.IO.File.WriteAllText(path,
+                "\"ID\",\"Kernel Name\",\"smsp__sass_inst_executed_op_local.sum\",\"smsp__sass_inst_executed_op_local_ld.sum\",\"smsp__sass_inst_executed_op_local_st.sum\"\n" +
+                "\"0\",\"kernel_a\",\"8\",\"8\",\"0\"\n");
+            DirectPtxProfilerEvidence modernSpilling = DirectPtxProfilerEvidence.FromNcuCsv(path);
+            Assert.False(modernSpilling.ProvesZeroExecutedSpills);
         }
         finally
         {
