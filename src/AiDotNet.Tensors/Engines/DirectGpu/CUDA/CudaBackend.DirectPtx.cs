@@ -22,6 +22,8 @@ public sealed partial class CudaBackend
         _directPtxAttentionBackwardKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<DirectPtxFlashAttentionBackwardKey, PtxFlashAttentionBackwardD64Kernel>
         _directPtxFlashAttentionBackwardKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<DirectPtxQkvRopeCacheKey, PtxFusedQkvRopeCacheD64Kernel>
+        _directPtxQkvRopeCacheKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private DirectPtxRuntime? _directPtxRuntime;
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
@@ -34,6 +36,7 @@ public sealed partial class CudaBackend
     private long _directPtxPagedPrefillDispatchCount;
     private long _directPtxAttentionBackwardDispatchCount;
     private long _directPtxFlashAttentionBackwardDispatchCount;
+    private long _directPtxQkvRopeCacheDispatchCount;
     internal int DirectPtxCachedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxAttentionKernels.Count; }
@@ -68,6 +71,10 @@ public sealed partial class CudaBackend
         DirectPtxFeatureGate.IsFlashAttentionBackwardEnabled && IsAvailable &&
         DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) == DirectPtxArchitectureFamily.Ampere;
 
+    internal bool IsDirectPtxQkvRopeCacheEnabled =>
+        DirectPtxFeatureGate.IsQkvRopeCacheEnabled && IsAvailable &&
+        DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) == DirectPtxArchitectureFamily.Ampere;
+
     internal long DirectPtxResidualRmsNormDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxResidualRmsNormDispatchCount);
 
@@ -82,6 +89,166 @@ public sealed partial class CudaBackend
 
     internal long DirectPtxFlashAttentionBackwardDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxFlashAttentionBackwardDispatchCount);
+
+    internal long DirectPtxQkvRopeCacheDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxQkvRopeCacheDispatchCount);
+
+    /// <summary>
+    /// Attempts the baked FP32 decode-token D64 specialization that projects
+    /// packed Q/K/V, adds bias, rotates Q/K, writes Q, and updates a dense KV
+    /// cache in one launch. The exact physical ABI is checked before dispatch;
+    /// the emitted PTX contains no shape, stride, layout, or position arguments.
+    /// </summary>
+    internal bool TryDirectPtxQkvRopeCacheD64(
+        IGpuBuffer input,
+        IGpuBuffer packedWeights,
+        IGpuBuffer bias,
+        IGpuBuffer cosine,
+        IGpuBuffer sine,
+        IGpuBuffer query,
+        IGpuBuffer keyCache,
+        IGpuBuffer valueCache,
+        int heads,
+        int cacheCapacity,
+        int position)
+    {
+        if (!IsDirectPtxQkvRopeCacheEnabled) return false;
+        if (heads is not (4 or 8 or 16))
+        {
+            DirectPtxLastError = "qkv-rope-cache-head-count-not-implemented";
+            return false;
+        }
+        if (cacheCapacity is not (16 or 32 or 64 or 128))
+        {
+            DirectPtxLastError = "qkv-rope-cache-capacity-not-implemented";
+            return false;
+        }
+        if (position < 0 || position >= cacheCapacity)
+        {
+            DirectPtxLastError = "qkv-rope-cache-position-out-of-range";
+            return false;
+        }
+
+        int modelDimension = checked(heads * PtxFusedQkvRopeCacheD64Kernel.HeadDimension);
+        long projectionElements = checked(3L * modelDimension);
+        long cacheElements = checked((long)cacheCapacity * modelDimension);
+        long ropeElements = checked((long)cacheCapacity *
+            (PtxFusedQkvRopeCacheD64Kernel.HeadDimension / 2));
+        if (input.SizeInBytes != (long)modelDimension * sizeof(float) ||
+            packedWeights.SizeInBytes != projectionElements * modelDimension * sizeof(float) ||
+            bias.SizeInBytes != projectionElements * sizeof(float) ||
+            cosine.SizeInBytes != ropeElements * sizeof(float) ||
+            sine.SizeInBytes != ropeElements * sizeof(float) ||
+            query.SizeInBytes != (long)modelDimension * sizeof(float) ||
+            keyCache.SizeInBytes != cacheElements * sizeof(float) ||
+            valueCache.SizeInBytes != cacheElements * sizeof(float))
+        {
+            DirectPtxLastError = "qkv-rope-cache-physical-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var key = new DirectPtxQkvRopeCacheKey(heads, cacheCapacity, position);
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxQkvRopeCacheKernels.TryGetValue(key, out _))
+                {
+                    DirectPtxLastError =
+                        "Direct PTX QKV/RoPE/cache must be prewarmed before CUDA graph capture.";
+                    return false;
+                }
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxFusedQkvRopeCacheD64Kernel kernel = GetOrCreateQkvRopeCacheKernel(key);
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(packedWeights, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(bias, kernel.Blueprint.Tensors[2]),
+                        DirectPtxTensorView.Create(cosine, kernel.Blueprint.Tensors[3]),
+                        DirectPtxTensorView.Create(sine, kernel.Blueprint.Tensors[4]),
+                        DirectPtxTensorView.Create(query, kernel.Blueprint.Tensors[5]),
+                        DirectPtxTensorView.Create(keyCache, kernel.Blueprint.Tensors[6]),
+                        DirectPtxTensorView.Create(valueCache, kernel.Blueprint.Tensors[7]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxQkvRopeCacheDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    private PtxFusedQkvRopeCacheD64Kernel GetOrCreateQkvRopeCacheKernel(
+        DirectPtxQkvRopeCacheKey key)
+    {
+        if (_directPtxQkvRopeCacheKernels.TryGetValue(
+            key, out PtxFusedQkvRopeCacheD64Kernel? existing))
+            return existing;
+        return CreateAndCacheQkvRopeCacheKernelSlow(key);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxFusedQkvRopeCacheD64Kernel CreateAndCacheQkvRopeCacheKernelSlow(
+        DirectPtxQkvRopeCacheKey key) =>
+        _directPtxQkvRopeCacheKernels.GetOrAdd(key, () =>
+            new PtxFusedQkvRopeCacheD64Kernel(
+                _directPtxRuntime!, key.Heads, key.CacheCapacity, key.Position));
+
+    internal bool PrewarmDirectPtxQkvRopeCacheD64(
+        int heads,
+        int cacheCapacity,
+        int position)
+    {
+        if (!IsDirectPtxQkvRopeCacheEnabled) return false;
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX QKV/RoPE/cache prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _ = GetOrCreateQkvRopeCacheKernel(
+                    new DirectPtxQkvRopeCacheKey(heads, cacheCapacity, position));
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxQkvRopeCacheAudit(
+        int heads,
+        int cacheCapacity,
+        int position,
+        out DirectPtxKernelAudit audit)
+    {
+        lock (_directPtxLock)
+        {
+            var key = new DirectPtxQkvRopeCacheKey(heads, cacheCapacity, position);
+            if (_directPtxQkvRopeCacheKernels.TryGetValue(key, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null!;
+        return false;
+    }
 
     /// <summary>
     /// Attempts the canonical FP16-BHSD S in {16,32,64,128}, D=64 online attention
@@ -1489,6 +1656,7 @@ public sealed partial class CudaBackend
             _directPtxPagedPrefillKernels.Dispose();
             _directPtxAttentionBackwardKernels.Dispose();
             _directPtxFlashAttentionBackwardKernels.Dispose();
+            _directPtxQkvRopeCacheKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }
@@ -1551,6 +1719,10 @@ public sealed partial class CudaBackend
         bool IsCausal,
         int ScaleBits,
         int BiasBatchStride);
+    private readonly record struct DirectPtxQkvRopeCacheKey(
+        int Heads,
+        int CacheCapacity,
+        int Position);
 
 }
 #endif
