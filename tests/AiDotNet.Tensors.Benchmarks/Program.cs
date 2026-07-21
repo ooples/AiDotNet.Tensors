@@ -78,6 +78,12 @@ class Program
             DirectPtxResidualRmsNormExperiment.Run();
             return;
         }
+        if (args.Length > 0 && args[0] == "--direct-ptx-fused-linear")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxFusedLinearExperiment.Run(runs);
+            return;
+        }
         if (args.Length > 0 && args[0] == "--direct-ptx-external-gpu-baselines")
         {
             DirectPtxExternalBaselines.Run();
@@ -91,6 +97,11 @@ class Program
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-residual-rmsnorm")
         {
             DirectPtxProfileTarget.RunResidualRmsNorm();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-fused-linear")
+        {
+            DirectPtxProfileTarget.RunFusedLinear();
             return;
         }
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-decode")
@@ -1059,6 +1070,7 @@ class Program
         Console.WriteLine("  --direct-ptx-fused-attention: Fused PTX QK+softmax+PV championship cell");
         Console.WriteLine("  --direct-ptx-online-attention: Async online S128/D64 GPU championship table");
         Console.WriteLine("  --direct-ptx-gpu-matrix: NVIDIA-only S16/S32/S64/S128 attention matrix");
+        Console.WriteLine("  --direct-ptx-fused-linear [runs]: FP32 M=1 linear+bias+GELU championship matrix");
         Console.WriteLine("  --direct-ptx-attention-family [runs]: rectangular MHA/GQA/MQA resident release matrix");
         Console.WriteLine("  --direct-ptx-decode [runs]: dense and paged D64 decode resident release matrix");
         Console.WriteLine("  --direct-ptx-paged-prefill [runs]: causal D64 paged-prefill release matrix");
@@ -1068,6 +1080,7 @@ class Program
         Console.WriteLine("  --direct-ptx-external-gpu-baselines: forced cuDNN/Flash/Math/compiled Python GPU matrix");
         Console.WriteLine("  --direct-ptx-profile-attention: deterministic Nsight Compute attention target");
         Console.WriteLine("  --direct-ptx-profile-residual-rmsnorm: deterministic Nsight Compute fusion target");
+        Console.WriteLine("  --direct-ptx-profile-fused-linear: deterministic Nsight fused-linear target");
         Console.WriteLine("  --direct-ptx-profile-decode: deterministic Nsight Compute dense+paged decode target");
         Console.WriteLine("  --direct-ptx-profile-paged-prefill: deterministic Nsight Compute paged-prefill target");
         Console.WriteLine("  --direct-ptx-profile-attention-backward: deterministic Nsight Compute backward target");
