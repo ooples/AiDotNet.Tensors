@@ -7,6 +7,7 @@ public static class ComplexKernels
 {
     public static string[] GetKernelNames() => new[]
     {
+        "interleave_complex", "deinterleave_complex",
         "split_complex_multiply", "split_complex_conjugate",
         "split_complex_magnitude", "split_complex_magnitude_squared",
         "split_complex_phase", "split_complex_from_polar",
@@ -31,6 +32,28 @@ __kernel void split_complex_multiply(
     float br = bReal[idx], bi = bImag[idx];
     outReal[idx] = ar * br - ai * bi;
     outImag[idx] = ar * bi + ai * br;
+}
+
+// Pack split real/imag into interleaved [re0,im0,...]. Replaces the dispatch layer's
+// two-Copy-per-frequency-bin bridge (~1.06M device copies per batched RFFT).
+__kernel void interleave_complex(
+    __global const float* real, __global const float* imag,
+    __global float* interleaved, const int n)
+{
+    int idx = get_global_id(0);
+    if (idx >= n) return;
+    interleaved[2 * idx] = real[idx];
+    interleaved[2 * idx + 1] = imag[idx];
+}
+
+__kernel void deinterleave_complex(
+    __global const float* interleaved,
+    __global float* real, __global float* imag, const int n)
+{
+    int idx = get_global_id(0);
+    if (idx >= n) return;
+    real[idx] = interleaved[2 * idx];
+    imag[idx] = interleaved[2 * idx + 1];
 }
 
 __kernel void split_complex_conjugate(

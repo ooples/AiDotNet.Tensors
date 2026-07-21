@@ -1000,8 +1000,13 @@ public partial class DirectGpuTensorEngine
     Tensor<T> IEngine.RFFT<T>(Tensor<T> input)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
-        if (Compilation.GraphMode.IsActive || IsTapeActive<T>() || typeof(T) != typeof(float)
-            || input.Rank == 0 || !TryGetBackend(out var backend))
+        // NOTE: deliberately does NOT bail on IsTapeActive. The tape node is recorded below instead, the
+        // same way Spectrogram/TensorTake do it, so the GPU path stays usable while training. Bailing here
+        // meant every training step fell back to the managed CPU transform — the GPU FFT kernels on all
+        // seven backends were dead code in exactly the scenario they matter most for.
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+            || input.Rank == 0 || input.Length == 0 || input._shape[^1] <= 0
+            || !TryGetBackend(out var backend))
             return base.RFFT(input);
 
         int signalLength = input._shape[^1];
@@ -1013,35 +1018,62 @@ public partial class DirectGpuTensorEngine
         outputShape[^1] = numFreqs * 2;
         using var inputBuffer = GetOrAllocateBuffer(backend, input);
 
-        return DispatchDeferredGpuOp<T>(backend, batchSize * numFreqs * 2, outputShape, output =>
+        // Batched throughout: a fixed number of kernel launches regardless of batchSize.
+        //
+        // The previous shape of this was one backend.RFFT PER SIGNAL, then TWO backend.Copy calls PER
+        // FREQUENCY BIN to weave the split real/imag results into the interleaved layout IEngine.RFFT
+        // returns. At numFreqs=129 and batchSize=4096 that is 4096 transform launches plus ~1.06 MILLION
+        // single-element device-to-device copies for ONE call — the copies, not the transforms, dominated.
+        //
+        // BatchedFFT was already on IDirectGpuBackend and simply unused here. The interleave had no
+        // primitive at all (every SplitComplex* op works on separate real/imag buffers, which is the
+        // GPU-native layout), so InterleaveComplex was added to all backends to close that gap.
+        var gpuResult = DispatchDeferredGpuOp<T>(backend, batchSize * numFreqs * 2, outputShape, output =>
         {
-            using var padded = backend.AllocateBuffer(nFft);
-            using var real = backend.AllocateBuffer(numFreqs);
-            using var imag = backend.AllocateBuffer(numFreqs);
-            for (int batch = 0; batch < batchSize; batch++)
-            {
-                backend.Fill(padded, 0f, nFft);
-                backend.Copy(inputBuffer.Buffer, batch * signalLength, padded, 0, signalLength);
-                backend.RFFT(padded, real, imag, nFft);
-                int outputBase = batch * numFreqs * 2;
-                for (int k = 0; k < numFreqs; k++)
-                {
-                    backend.Copy(real, k, output, outputBase + k * 2, 1);
-                    backend.Copy(imag, k, output, outputBase + k * 2 + 1, 1);
-                }
-            }
-            // The split real/imag buffers are transient; complete their final D2D copies
-            // before returning them to backend pools. The result itself remains resident.
+            using var padReal = backend.AllocateBuffer(batchSize * nFft);
+            using var padImag = backend.AllocateBuffer(batchSize * nFft);
+            using var specReal = backend.AllocateBuffer(batchSize * nFft);
+            using var specImag = backend.AllocateBuffer(batchSize * nFft);
+            using var packReal = backend.AllocateBuffer(batchSize * numFreqs);
+            using var packImag = backend.AllocateBuffer(batchSize * numFreqs);
+
+            // Zero-pad every signal from signalLength up to nFft in one strided copy.
+            backend.Fill(padReal, 0f, batchSize * nFft);
+            backend.Fill(padImag, 0f, batchSize * nFft);
+            backend.CopyRows(inputBuffer.Buffer, padReal, signalLength, nFft, batchSize, signalLength);
+
+            backend.BatchedFFT(padReal, padImag, specReal, specImag, batchSize, nFft, inverse: false);
+
+            // Keep only the positive frequencies (0..Nyquist) of each row, then weave to interleaved.
+            backend.CopyRows(specReal, packReal, nFft, numFreqs, batchSize, numFreqs);
+            backend.CopyRows(specImag, packImag, nFft, numFreqs, batchSize, numFreqs);
+            backend.InterleaveComplex(packReal, packImag, output, batchSize * numFreqs);
+
+            // Transient scratch returns to backend pools on dispose; the result stays resident.
             backend.Synchronize();
         });
+
+        // Same backward contract as CpuEngine.RFFT (grad flows back through IRFFT). RecordUnary is a no-op
+        // when no tape is active, so this costs nothing outside training while making the GPU path usable
+        // inside it. The grad-side IRFFT dispatches to the GPU override too.
+        Autodiff.DifferentiableOps.RecordUnary("RFFT", gpuResult, input,
+            static (gradOutput, inputs, output, savedState, engine, grads) =>
+            {
+                var signalLengthSaved = (int)savedState[0];
+                var grad = engine.IRFFT(gradOutput, signalLengthSaved);
+                Autodiff.DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+            }, new object[] { signalLength });
+        return gpuResult;
     }
 
     Tensor<T> IEngine.IRFFT<T>(Tensor<T> input, int outputLength)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (outputLength <= 0) throw new ArgumentException("outputLength must be positive", nameof(outputLength));
-        if (Compilation.GraphMode.IsActive || IsTapeActive<T>() || typeof(T) != typeof(float)
-            || input.Rank == 0 || !TryGetBackend(out var backend))
+        // As with RFFT: record the tape node rather than bailing, so training keeps the GPU path.
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+            || input.Rank == 0 || input.Length == 0 || (input._shape[^1] & 1) != 0
+            || !TryGetBackend(out var backend))
             return base.IRFFT(input, outputLength);
 
         int interleavedLength = input._shape[^1];
@@ -1054,24 +1086,40 @@ public partial class DirectGpuTensorEngine
         outputShape[^1] = outputLength;
         using var inputBuffer = GetOrAllocateBuffer(backend, input);
 
-        return DispatchDeferredGpuOp<T>(backend, batchSize * outputLength, outputShape, output =>
+        var gpuResult = DispatchDeferredGpuOp<T>(backend, batchSize * outputLength, outputShape, output =>
         {
+            // The de-interleave is now ONE kernel over the whole batch instead of two single-element
+            // device copies per frequency bin per signal (~1.06M copies at numFreqs=129, batchSize=4096).
+            using var allReal = backend.AllocateBuffer(batchSize * numFreqs);
+            using var allImag = backend.AllocateBuffer(batchSize * numFreqs);
+            backend.DeinterleaveComplex(inputBuffer.Buffer, allReal, allImag, batchSize * numFreqs);
+
+            // The transform itself stays per-signal: IDirectGpuBackend exposes BatchedFFT (full complex)
+            // but no batched IRFFT, and backend.IRFFT reconstructs the conjugate-symmetric half-spectrum
+            // internally — a symmetry expansion that CopyRows cannot express (it needs reversed indexing).
+            // Each iteration is now 4 bulk calls rather than 2*numFreqs+2, so the per-bin copies are gone.
             using var real = backend.AllocateBuffer(numFreqs);
             using var imag = backend.AllocateBuffer(numFreqs);
             using var signal = backend.AllocateBuffer(nFft);
             for (int batch = 0; batch < batchSize; batch++)
             {
-                int inputBase = batch * interleavedLength;
-                for (int k = 0; k < numFreqs; k++)
-                {
-                    backend.Copy(inputBuffer.Buffer, inputBase + k * 2, real, k, 1);
-                    backend.Copy(inputBuffer.Buffer, inputBase + k * 2 + 1, imag, k, 1);
-                }
+                int rowBase = batch * numFreqs;
+                backend.Copy(allReal, rowBase, real, 0, numFreqs);
+                backend.Copy(allImag, rowBase, imag, 0, numFreqs);
                 backend.IRFFT(real, imag, signal, nFft);
                 backend.Copy(signal, 0, output, batch * outputLength, outputLength);
             }
             backend.Synchronize();
         });
+
+        // Mirrors CpuEngine.IRFFT: the backward of IRFFT is RFFT.
+        Autodiff.DifferentiableOps.RecordUnary("IRFFT", gpuResult, input,
+            static (gradOutput, inputs, output, savedState, engine, grads) =>
+            {
+                var grad = engine.RFFT(gradOutput);
+                Autodiff.DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+            }, System.Array.Empty<object>());
+        return gpuResult;
     }
 
     /// <inheritdoc/>
@@ -2344,7 +2392,17 @@ public partial class DirectGpuTensorEngine
 
     Tensor<T> IEngine.RBFKernel<T>(Tensor<T> input, Tensor<T> centers, Tensor<T> epsilons)
     {
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        // No tape bail: the node is recorded below so the GPU kernel survives training. Matches
+        // CpuEngine.RBFKernel — same (input, centers, epsilons) overload, RecordIfActive over all THREE
+        // inputs, RBFKernelBackward, saved state { (double)epsilons[0] }.
+        //
+        // NOTE on that saved state: CpuEngine stores ONLY epsilons[0], so RBFKernelBackward treats the
+        // width as shared across every center. If epsilons vary per center the CPU backward is already
+        // wrong for centers 1..n — a pre-existing question in the CPU path, not introduced here. This
+        // override reproduces the CPU contract exactly rather than silently diverging from it; the
+        // gradient test therefore uses UNIFORM epsilons, so it verifies the GPU against a reference that
+        // is itself correct.
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || input.Rank != 2 || centers.Rank != 2 || epsilons.Rank != 1
             || input._shape[1] != centers._shape[1] || centers._shape[0] != epsilons._shape[0]
             || !input.IsContiguous || !centers.IsContiguous || !epsilons.IsContiguous
@@ -2369,7 +2427,7 @@ public partial class DirectGpuTensorEngine
             using var negated = backend.AllocateBuffer(numCenters);
             using var row = backend.AllocateBuffer(numCenters);
 
-            return DispatchDeferredGpuOp<T>(backend, outputLength,
+            var rbfResult = DispatchDeferredGpuOp<T>(backend, outputLength,
                 new[] { batchSize, numCenters }, output =>
                 {
                     for (int batch = 0; batch < batchSize; batch++)
@@ -2385,6 +2443,14 @@ public partial class DirectGpuTensorEngine
                         backend.Copy(row, 0, output, batch * numCenters, numCenters);
                     }
                 });
+
+            // epsilons is a caller-supplied host tensor here, so reading element 0 costs no device sync.
+            var rbfSaved = epsilons.Length > 0
+                ? new object[] { Convert.ToDouble(epsilons[0]) }
+                : Array.Empty<object>();
+            DifferentiableOps.RecordIfActive("RBFKernel", rbfResult,
+                new[] { input, centers, epsilons }, BackwardFunctions<T>.RBFKernelBackward, rbfSaved);
+            return rbfResult;
         }
         catch { return base.RBFKernel(input, centers, epsilons); }
     }
@@ -2392,7 +2458,11 @@ public partial class DirectGpuTensorEngine
     Tensor<T> IEngine.Upsample3D<T>(Tensor<T> input, int scaleD, int scaleH, int scaleW)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        // No tape bail: the node is recorded below so the GPU path survives training. Signature and saved
+        // state match CpuEngine.Upsample3D exactly — same (input, scaleD, scaleH, scaleW) overload, same
+        // Upsample3DBackward, same object[] { scaleD, scaleH, scaleW }. Upsample3DBackward's own GPU
+        // override does not gate on the tape, so backprop reaches the device kernel.
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || input.Rank != 5 || scaleD <= 0 || scaleH <= 0 || scaleW <= 0
             || !input.IsContiguous || !TryGetBackend(out var backend))
             return base.Upsample3D(input, scaleD, scaleH, scaleW);
@@ -2406,7 +2476,7 @@ public partial class DirectGpuTensorEngine
             int outputWidth = checked(inputWidth * scaleW);
             int outputLength = checked(batch * channels * outputDepth * outputHeight * outputWidth);
             using var source = GetOrAllocateBuffer(backend, input);
-            return DispatchDeferredGpuOp<T>(backend, outputLength,
+            var up3dResult = DispatchDeferredGpuOp<T>(backend, outputLength,
                 new[] { batch, channels, outputDepth, outputHeight, outputWidth }, output =>
                 {
                     for (int b = 0; b < batch; b++)
@@ -2427,6 +2497,10 @@ public partial class DirectGpuTensorEngine
                         }
                     }
                 });
+
+            DifferentiableOps.RecordUnary("Upsample3D", up3dResult, input,
+                BackwardFunctions<T>.Upsample3DBackward, new object[] { scaleD, scaleH, scaleW });
+            return up3dResult;
         }
         catch { return base.Upsample3D(input, scaleD, scaleH, scaleW); }
     }
@@ -2487,6 +2561,10 @@ public partial class DirectGpuTensorEngine
     Tensor<T> IEngine.PositionalEncoding<T>(Tensor<T> positions, int numFrequencies)
     {
         if (positions is null) throw new ArgumentNullException(nameof(positions));
+        // The CPU reference forms angles in double precision and rounds once to float. The GPU path below
+        // reproduces that precision with a Dekker two-product split and angle-addition identities. CUDA's
+        // sin/cos dispatch is registered from CudaPreciseTrigKernels (compiled without --use_fast_math),
+        // which removed the former 415-ULP mismatch while retaining the registry's 64-ULP contract.
         if (typeof(T) != typeof(float) || positions.Rank != 2 || numFrequencies <= 0
             || !positions.IsContiguous || !TryGetBackend(out var backend))
             return base.PositionalEncoding(positions, numFrequencies);
@@ -2691,6 +2769,9 @@ public partial class DirectGpuTensorEngine
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
         int normalizedAxis = axis < 0 ? axis + input.Rank : axis;
+        // CUDA now provides where_select, so the non-tape device path is complete. Keep the tape bail until
+        // Sparsemax records its composite backward; returning an unrecorded resident result during training
+        // would silently drop the input gradient.
         if (typeof(T) != typeof(float) || normalizedAxis != input.Rank - 1
             || input.Length == 0 || !input.IsContiguous || IsTapeActive<T>()
             || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend))
@@ -2720,7 +2801,7 @@ public partial class DirectGpuTensorEngine
         using (var expandedThresholds = backend.AllocateBuffer(length))
         using (var shiftedInput = backend.AllocateBuffer(length))
         {
-            return DispatchDeferredGpuOp<T>(backend, length, (int[])input._shape.Clone(), output =>
+            var sparsemaxResult = DispatchDeferredGpuOp<T>(backend, length, (int[])input._shape.Clone(), output =>
             {
                 for (int row = 0; row < rows; row++)
                 {
@@ -2747,6 +2828,8 @@ public partial class DirectGpuTensorEngine
                 backend.Subtract(inputBuffer.Buffer, expandedThresholds, shiftedInput, length);
                 backend.Relu(shiftedInput, output, length);
             });
+
+            return sparsemaxResult;
         }
     }
 
@@ -5475,10 +5558,17 @@ public partial class DirectGpuTensorEngine
     Tensor<T> IEngine.ScaledDotProductAttention<T>(Tensor<T> query, Tensor<T> key, Tensor<T> value,
         Tensor<bool>? mask, double? scale, out Tensor<T> attentionWeights, double softcap)
     {
-        // GPU SDPA kernel: [batch, numHeads, seqQ/seqK, headDim]. Tape/graph,
-        // non-float, or unequal Q/K/V feature depths defer to the base (CPU) implementation. The
-        // attention-logit soft-cap (Gemma-2) is threaded into every backend kernel below.
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        // GPU SDPA kernel: [batch, numHeads, seqQ/seqK, headDim]. Non-float, wrong rank, or unequal
+        // Q/K/V feature depths defer to the base (CPU) implementation. The attention-logit soft-cap
+        // (Gemma-2) is threaded into every backend kernel below.
+        //
+        // A LIVE TAPE NO LONGER DEFERS. The forward previously bailed whenever IsTapeActive was true, so
+        // attention ran on the CPU for every training step — the case it matters most for. The tape node is
+        // recorded on the GPU result instead (see the end of the try block). The backward it names,
+        // IEngine.ScaledDotProductAttentionBackward, has its own on-device kernel and IS reachable during
+        // backprop: GradientTape.ComputeGradients sets the current tape to null before replaying, so
+        // IsTapeActive is FALSE inside backward closures and the GPU backward override takes its normal path.
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || query.Rank != 4 || key.Rank != 4 || value.Rank != 4 || !TryGetBackend(out var backend))
             return base.ScaledDotProductAttention(query, key, value, mask, scale, out attentionWeights, softcap);
         try
@@ -5509,6 +5599,14 @@ public partial class DirectGpuTensorEngine
                 new[] { batch, numHeads, seqQ, seqK });
             outB.RelinquishOwnership();
             awB.RelinquishOwnership();
+
+            // Same node CpuEngine records, so gradients are identical in form; RecordIfActive is a no-op
+            // when no tape is live, leaving inference untouched.
+            float scaleForBackward = sc;
+            DifferentiableOps.RecordIfActive("ScaledDotProductAttention", result,
+                new[] { query, key, value },
+                BackwardFunctions<T>.ScaledDotProductAttentionBackward,
+                new object[] { attentionWeights, (double)scaleForBackward });
             return result;
         }
         catch { return base.ScaledDotProductAttention(query, key, value, mask, scale, out attentionWeights); }
@@ -5635,6 +5733,13 @@ public partial class DirectGpuTensorEngine
         if (indices is null) throw new ArgumentNullException(nameof(indices));
         if (values is null) throw new ArgumentNullException(nameof(values));
         int normalizedAxis = axis < 0 ? axis + input.Rank : axis;
+        // Tape bail RESTORED after a gradient test caught a real defect. Recording the node here with
+        // CpuEngine's ScatterBackward produced d(values) exactly correct but d(input) wrong by 3.14e-01
+        // — not rounding. Scatter OVERWRITES input at the scattered positions, so d/d(input) must be ZERO
+        // there and 1 elsewhere; that mask depends on the indices, and reusing the CPU recording did not
+        // reproduce it against the GPU result. Signature matching was NOT sufficient here: the forward is
+        // correct and only the gradient is wrong, so forward parity would never have caught it.
+        // Re-attempt only with a gradient test proving BOTH operands, not by inspection.
         if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || normalizedAxis < 0 || normalizedAxis >= input.Rank || !TryGetBackend(out var backend))
             return base.Scatter(input, indices, values, axis);
@@ -5662,12 +5767,14 @@ public partial class DirectGpuTensorEngine
             using var inputBuffer = GetOrAllocateBuffer(backend, contiguousInput);
             using var valuesBuffer = GetOrAllocateBuffer(backend, contiguousValues);
             using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices);
-            return DispatchDeferredGpuOp<T>(backend, input.Length, input.Shape.ToArray(), output =>
+            var scatterResult = DispatchDeferredGpuOp<T>(backend, input.Length, input.Shape.ToArray(), output =>
             {
                 backend.Copy(inputBuffer.Buffer, output, input.Length);
                 backend.IndexWrite(output, indexBuffer.Buffer, valuesBuffer.Buffer, 0f, mode: 0,
                     outerSize, indices.Length, innerSize, axisSize);
             });
+
+            return scatterResult;
         }
         catch
         {
@@ -6731,7 +6838,18 @@ public partial class DirectGpuTensorEngine
     // 6D maxIndices[b,c,od,oh,ow,{id,ih,iw}] the CpuEngine/MaxPool3DBackward contract expects. No padding.
     Tensor<T> IEngine.MaxPool3DWithIndices<T>(Tensor<T> input, int[] poolSize, int[] stride, out int[,,,,,] maxIndices)
     {
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        // No tape bail: the node is recorded below so the GPU kernel survives training. Matches
+        // CpuEngine.MaxPool3DWithIndices — same (input, poolSize, stride, out maxIndices) overload,
+        // RecordUnary over input, MaxPool3DBackward, saved { maxIndices, poolSize, stride }.
+        //
+        // WHY THIS IS SAFE WHERE Scatter WAS NOT: Scatter's gradient mask came from EXTERNALLY supplied
+        // indices and the reused CPU recording failed to reproduce it against the GPU result. Here
+        // maxIndices is produced by THIS forward (decoded from the kernel's own idxBuf below), so the
+        // recorded backward routes gradient to exactly the positions this forward selected — it cannot
+        // disagree with itself. Residual risks are the index decode (spatial / hw) and CPU-vs-GPU tie
+        // breaking on equal pooled values; the gradient test uses continuous random input so ties do not
+        // occur, and a decode error would show as a gross mismatch.
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || input.Rank != 5 || poolSize is not { Length: 3 } || stride is not { Length: 3 } || !TryGetBackend(out var backend))
             return base.MaxPool3DWithIndices(input, poolSize, stride, out maxIndices);
         try
@@ -6771,6 +6889,8 @@ public partial class DirectGpuTensorEngine
                 var result = DeferTensorResult<T>(backend, outBuf.Buffer, outLen,
                     new[] { batch, channels, outD, outH, outW });
                 outBuf.RelinquishOwnership();
+                DifferentiableOps.RecordUnary("MaxPool3DWithIndices", result, input,
+                    BackwardFunctions<T>.MaxPool3DBackward, new object[] { maxIndices, poolSize, stride });
                 return result;
             }
             finally { idxBuf.Dispose(); }
@@ -7384,7 +7504,13 @@ public partial class DirectGpuTensorEngine
     // so it ran on the host. Tape/GraphMode defer to the base so it records AffineGridBackward.
     Tensor<T> IEngine.AffineGrid<T>(Tensor<T> theta, int outputHeight, int outputWidth)
     {
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        // No tape bail: the node is recorded below so the GPU kernel survives training. Matches
+        // CpuEngine.AffineGrid exactly — same (theta, outputHeight, outputWidth) overload, RecordUnary over
+        // theta, AffineGridBackward, saved state { outputHeight, outputWidth }. Unlike Scatter this op does
+        // not overwrite or select: the grid is computed FROM theta, so d/d(theta) is a scale rather than an
+        // index-dependent mask — the failure mode that broke Scatter does not apply. Verified by the
+        // gradient test in GpuTapeGradientParityTests, not by that reasoning alone.
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || theta.Rank != 3 || theta.Shape._dims[1] != 2 || theta.Shape._dims[2] != 3
             || outputHeight <= 0 || outputWidth <= 0
             || !TryGetBackend(out var backend))
@@ -7399,7 +7525,10 @@ public partial class DirectGpuTensorEngine
             {
                 backend.AffineGrid(thetaBuf.Buffer, gridBuf.Buffer, batch, outputHeight, outputWidth);
                 var arr = FinishGpuOp<T>(backend, gridBuf, outLen);
-                return new Tensor<T>(arr, new[] { batch, outputHeight, outputWidth, 2 });
+                var grid = new Tensor<T>(arr, new[] { batch, outputHeight, outputWidth, 2 });
+                DifferentiableOps.RecordUnary("AffineGrid", grid, theta,
+                    BackwardFunctions<T>.AffineGridBackward, new object[] { outputHeight, outputWidth });
+                return grid;
             }
             catch { gridBuf.Dispose(); throw; }
         }
@@ -7416,13 +7545,20 @@ public partial class DirectGpuTensorEngine
     // engine override called it. Tape/GraphMode/strided defer to the base.
     Tensor<T> IEngine.TensorCosh<T>(Tensor<T> tensor)
     {
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || !tensor.IsContiguous)
+        // No tape bail: the node is recorded below, so training keeps the GPU kernel. The backward is the
+        // same one CpuEngine names, and it is reachable during backprop because ComputeGradients nulls the
+        // current tape before replaying (so IsTapeActive is false inside backward closures).
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || !tensor.IsContiguous)
             return base.TensorCosh(tensor);
         try
         {
             var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Cosh(input, output, size));
             if (result != null)
-                return new Tensor<T>(result, tensor.Shape._dims);
+            {
+                var gpuOut = new Tensor<T>(result, tensor.Shape._dims);
+                DifferentiableOps.RecordUnary("TensorCosh", gpuOut, tensor, BackwardFunctions<T>.CoshBackward);
+                return gpuOut;
+            }
             return base.TensorCosh(tensor);
         }
         catch { return base.TensorCosh(tensor); }
@@ -7431,13 +7567,20 @@ public partial class DirectGpuTensorEngine
     // #775: TensorSinh on the existing backend.Sinh (sinh_vector) unary kernel — same as TensorCosh.
     Tensor<T> IEngine.TensorSinh<T>(Tensor<T> tensor)
     {
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || !tensor.IsContiguous)
+        // No tape bail: the node is recorded below, so training keeps the GPU kernel. The backward is the
+        // same one CpuEngine names, and it is reachable during backprop because ComputeGradients nulls the
+        // current tape before replaying (so IsTapeActive is false inside backward closures).
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || !tensor.IsContiguous)
             return base.TensorSinh(tensor);
         try
         {
             var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Sinh(input, output, size));
             if (result != null)
-                return new Tensor<T>(result, tensor.Shape._dims);
+            {
+                var gpuOut = new Tensor<T>(result, tensor.Shape._dims);
+                DifferentiableOps.RecordUnary("TensorSinh", gpuOut, tensor, BackwardFunctions<T>.SinhBackward);
+                return gpuOut;
+            }
             return base.TensorSinh(tensor);
         }
         catch { return base.TensorSinh(tensor); }

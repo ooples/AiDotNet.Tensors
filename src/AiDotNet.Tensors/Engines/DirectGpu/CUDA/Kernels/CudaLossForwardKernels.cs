@@ -22,12 +22,34 @@ extern ""C"" __global__ __launch_bounds__(256) void cross_entropy_loss(
     int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= batchSize) return;
 
+    // TensorCrossEntropyLoss takes LOGITS, not probabilities. This kernel did
+    //     sample_loss -= target * logf(fmaxf(pred, 1e-7f));
+    // i.e. -sum(t * log(pred)) treating pred as a probability, which diverges from CpuEngine's softmax
+    // cross-entropy. Compute the numerically-stable softmax CE from logits instead: logSumExp, then
+    // -sum_c t[c] * (logit[c] - logSumExp).
+    //
+    // FOUND BY AUDIT, NOT BY A FAILING TEST -- and LATENT, not live. DirectGpuTensorEngine's
+    // TensorCrossEntropyLoss composes softmax-CE out of resident primitives (MaxAxis/OuterProduct/Exp/
+    // SumAxis/Log/Clamp/Multiply) so it works on backends without IGpuBatchExecution, and therefore never
+    // dispatches this kernel. Nothing in the engine calls the 5-arg IDirectGpuBackend.CrossEntropyLoss
+    // overload today, so no test covers this path and the op-parity counts are unchanged by this fix.
+    // It is corrected anyway because the overload is public backend API: any external caller got a value
+    // that silently disagreed with CpuEngine. If the engine is ever routed to this kernel, the composed
+    // path above is the reference to match.
+    float maxVal = -INFINITY;
+    for (int c = 0; c < numClasses; c++)
+        maxVal = fmaxf(maxVal, predictions[b * numClasses + c]);
+
+    float sumExp = 0.0f;
+    for (int c = 0; c < numClasses; c++)
+        sumExp += expf(predictions[b * numClasses + c] - maxVal);
+    float logSumExp = maxVal + logf(sumExp);
+
     float sample_loss = 0.0f;
     for (int c = 0; c < numClasses; c++) {
-        float pred = predictions[b * numClasses + c];
-        float target = targets[b * numClasses + c];
-        if (target > 0.0f)
-            sample_loss -= target * logf(fmaxf(pred, 1e-7f));
+        float t = targets[b * numClasses + c];
+        if (t > 0.0f)
+            sample_loss -= t * (predictions[b * numClasses + c] - logSumExp);
     }
     loss[b] = sample_loss;
 }
@@ -206,14 +228,23 @@ extern ""C"" __global__ __launch_bounds__(256) void bce_with_logits_loss(
 
 extern ""C"" __global__ __launch_bounds__(256) void nll_loss(
     const float* __restrict__ logProbs,
-    const int* __restrict__ targets,
+    const float* __restrict__ targets,
     float* __restrict__ loss,
     int batchSize, int numClasses)
 {
     int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= batchSize) return;
 
-    int targetClass = targets[b];
+    // targets holds class indices as float VALUES (3.0f == class 3), matching
+    // CpuEngine.TensorNLLLoss which does (int)targetValue. This kernel declared them as
+    // `const int*` and so reinterpreted the float BIT PATTERN (1.0f -> 1065353216), which is
+    // always out of range, so every element took the else branch and the GPU returned 0.
+    //
+    // Same partial rollout as the SELU >= fix: #775 corrected this on OpenCL (whose kernel
+    // carries the identical explanation) and Metal, but CUDA was never updated — the registry
+    // case still records it as FIXED (#775) while forward parity measured
+    // maxAbs 4.102E+00 @[0] a=4.1015635 b=0, i.e. the CPU loss against a GPU zero.
+    int targetClass = (int)targets[b];
     loss[b] = (targetClass >= 0 && targetClass < numClasses)
         ? -logProbs[b * numClasses + targetClass] : 0.0f;
 }

@@ -108,7 +108,7 @@ public sealed class OpParityFixture : IDisposable
     }
 }
 
-[CollectionDefinition("OpParity")]
+[CollectionDefinition("OpParity", DisableParallelization = true)]
 public sealed class OpParityCollection : ICollectionFixture<OpParityFixture> { }
 
 /// <summary>The parity checker. For one <see cref="OpCase"/> it runs the float op on CPU and GPU,
@@ -127,7 +127,7 @@ public static class OpParityHarness
     private static int _opsSinceEngineReset;
     private const int ResetEngineEveryNOps = 64;
 
-    private static void MaybeResetGpuEngine(OpParityFixture fx)
+    internal static void MaybeResetGpuEngine(OpParityFixture fx)
     {
         if (System.Threading.Interlocked.Increment(ref _opsSinceEngineReset) >= ResetEngineEveryNOps)
         {

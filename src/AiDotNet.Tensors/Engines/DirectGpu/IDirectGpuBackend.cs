@@ -3340,6 +3340,32 @@ public interface IDirectGpuBackend : IDisposable
     // Tensor<Complex<T>> (array-of-structs) and split buffers at the GPU boundary.
     // Callers of IEngine never see the split format — it's an internal GPU optimization.
 
+    /// <summary>
+    /// Packs split real/imag buffers into one interleaved [re0, im0, re1, im1, ...] buffer.
+    /// </summary>
+    /// <param name="real">Real parts, n elements.</param>
+    /// <param name="imag">Imaginary parts, n elements.</param>
+    /// <param name="interleaved">Destination, 2*n elements.</param>
+    /// <param name="n">Number of complex values.</param>
+    /// <remarks>
+    /// The GPU keeps complex data SPLIT (hence the SplitComplex* family below); interleaved is the layout
+    /// IEngine.RFFT's tensor contract requires. Without this primitive the dispatch layer bridged the two by
+    /// issuing two Copy calls PER FREQUENCY BIN — at numFreqs=129 and batch=4096 that is ~1.06 million
+    /// device-to-device copies for a single RFFT, which dominated the operation completely. One kernel with a
+    /// stride-2 write replaces all of them.
+    /// </remarks>
+    void InterleaveComplex(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer interleaved, int n);
+
+    /// <summary>
+    /// Splits an interleaved [re0, im0, ...] buffer into separate real/imag buffers. Inverse of
+    /// <see cref="InterleaveComplex"/>; used by IRFFT, whose input arrives interleaved.
+    /// </summary>
+    /// <param name="interleaved">Source, 2*n elements.</param>
+    /// <param name="real">Real destination, n elements.</param>
+    /// <param name="imag">Imaginary destination, n elements.</param>
+    /// <param name="n">Number of complex values.</param>
+    void DeinterleaveComplex(IGpuBuffer interleaved, IGpuBuffer real, IGpuBuffer imag, int n);
+
     /// <summary>Element-wise complex multiply with split real/imag buffers.</summary>
     void SplitComplexMultiply(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag,
         IGpuBuffer outReal, IGpuBuffer outImag, int n);

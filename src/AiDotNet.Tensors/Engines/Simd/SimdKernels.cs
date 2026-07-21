@@ -1506,7 +1506,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
-        /// Pointer-based Tanh — 2*sigmoid(2x)-1 with zero bounds-checking.
+        /// Pointer-based Tanh with zero bounds-checking.
         /// </summary>
         [MethodImpl(HotInline)]
         public static unsafe void TanhUnsafe(float* input, float* output, int length)
@@ -1517,34 +1517,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 return;
 #endif
 
-            int i = 0;
-#if NET5_0_OR_GREATER
-            if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
-            {
-                var vtwo = Vector256.Create(2.0f);
-                var vone = Vector256.Create(1.0f);
-                int simdLength = length & ~31;
-                for (; i < simdLength; i += 32)
-                {
-                    // tanh(x) = 2*sigmoid(2x) - 1
-                    Avx.Store(output + i, Avx.Subtract(Avx.Multiply(vtwo, FastSigmoid256(Avx.Multiply(vtwo, Avx.LoadVector256(input + i)))), vone));
-                    Avx.Store(output + i + 8, Avx.Subtract(Avx.Multiply(vtwo, FastSigmoid256(Avx.Multiply(vtwo, Avx.LoadVector256(input + i + 8)))), vone));
-                    Avx.Store(output + i + 16, Avx.Subtract(Avx.Multiply(vtwo, FastSigmoid256(Avx.Multiply(vtwo, Avx.LoadVector256(input + i + 16)))), vone));
-                    Avx.Store(output + i + 24, Avx.Subtract(Avx.Multiply(vtwo, FastSigmoid256(Avx.Multiply(vtwo, Avx.LoadVector256(input + i + 24)))), vone));
-                }
-            }
-            if (Avx2.IsSupported && Fma.IsSupported && length - i >= 8)
-            {
-                var vtwo = Vector256.Create(2.0f);
-                var vone = Vector256.Create(1.0f);
-                int simdLength = i + ((length - i) & ~7);
-                for (; i < simdLength; i += 8)
-                {
-                    Avx.Store(output + i, Avx.Subtract(Avx.Multiply(vtwo, FastSigmoid256(Avx.Multiply(vtwo, Avx.LoadVector256(input + i)))), vone));
-                }
-            }
-#endif
-            for (; i < length; i++)
+            // The former 2*FastSigmoid256(2*x)-1 path cancelled near zero and exceeded the
+            // public parity contract by hundreds of ULP. Keep VML above when available; the
+            // portable path must use libm until an equivalently accurate vector approximation exists.
+            for (int i = 0; i < length; i++)
             {
                 output[i] = MathF.Tanh(input[i]);
             }
@@ -1696,53 +1672,10 @@ namespace AiDotNet.Tensors.Engines.Simd
         [MethodImpl(HotInline)]
         public static unsafe void MishUnsafe(float* input, float* output, int length)
         {
-            int i = 0;
-#if NET5_0_OR_GREATER
-            if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
-            {
-                var vtwo = Vector256.Create(2.0f);
-                var vone = Vector256.Create(1.0f);
-                var vthreshold = Vector256.Create(20.0f);
-
-                int simdLength = length & ~31;
-                for (; i < simdLength; i += 32)
-                {
-                    for (int k = 0; k < 32; k += 8)
-                    {
-                        var x = Avx.LoadVector256(input + i + k);
-                        // softplus(x) = ln(1 + exp(x)), or x if x > 20
-                        var expx = FastExp256(x);
-                        var softplus = FastLog256(Avx.Add(vone, expx));
-                        // For large x, softplus ≈ x (avoid log overflow)
-                        var mask = Avx.Compare(x, vthreshold, FloatComparisonMode.OrderedGreaterThanSignaling);
-                        softplus = Avx.BlendVariable(softplus, x, mask);
-                        // tanh(softplus) via 2*sigmoid(2*softplus)-1
-                        var tanh_sp = Avx.Subtract(Avx.Multiply(vtwo, FastSigmoid256(Avx.Multiply(vtwo, softplus))), vone);
-                        // mish = x * tanh(softplus(x))
-                        Avx.Store(output + i + k, Avx.Multiply(x, tanh_sp));
-                    }
-                }
-            }
-            if (Avx2.IsSupported && Fma.IsSupported && length - i >= 8)
-            {
-                var vtwo = Vector256.Create(2.0f);
-                var vone = Vector256.Create(1.0f);
-                var vthreshold = Vector256.Create(20.0f);
-
-                int simdLength = i + ((length - i) & ~7);
-                for (; i < simdLength; i += 8)
-                {
-                    var x = Avx.LoadVector256(input + i);
-                    var expx = FastExp256(x);
-                    var softplus = FastLog256(Avx.Add(vone, expx));
-                    var mask = Avx.Compare(x, vthreshold, FloatComparisonMode.OrderedGreaterThanSignaling);
-                    softplus = Avx.BlendVariable(softplus, x, mask);
-                    var tanh_sp = Avx.Subtract(Avx.Multiply(vtwo, FastSigmoid256(Avx.Multiply(vtwo, softplus))), vone);
-                    Avx.Store(output + i, Avx.Multiply(x, tanh_sp));
-                }
-            }
-#endif
-            for (; i < length; i++)
+            // FastExp/FastLog plus the sigmoid tanh identity accumulated errors far beyond
+            // Mish's 64-ULP contract. Preserve the stable large-positive branch and use libm
+            // for the portable implementation until an accuracy-bounded SIMD kernel exists.
+            for (int i = 0; i < length; i++)
             {
                 float x = input[i];
                 float sp = x > 20f ? x : MathF.Log(1f + MathF.Exp(x));

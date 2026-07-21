@@ -776,6 +776,40 @@ void main() {
 
 }";
 
+    /// <summary>
+    /// Packs split real/imag buffers into one interleaved [re0, im0, re1, im1, ...] buffer.
+    /// </summary>
+    /// <remarks>
+    /// Cannot be composed from CopyRows: that expresses real -> interleaved[2i] (srcRowLen 1, dstRowLen 2)
+    /// but has no destination offset, so imag -> interleaved[2i+1] is inexpressible. Hence a shader.
+    /// </remarks>
+    public static string InterleaveComplex => @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0, binding=0) buffer B0 { float real[]; };
+layout(set=0, binding=1) buffer B1 { float imag[]; };
+layout(set=0, binding=2) buffer B2 { float interleaved[]; };
+layout(push_constant) uniform PC { int n; };
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x); if (gid>=n) return;
+    interleaved[2*gid]   = real[gid];
+    interleaved[2*gid+1] = imag[gid];
+}";
+
+    /// <summary>Splits an interleaved complex buffer into separate real/imag buffers.</summary>
+    public static string DeinterleaveComplex => @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0, binding=0) buffer B0 { float interleaved[]; };
+layout(set=0, binding=1) buffer B1 { float real[]; };
+layout(set=0, binding=2) buffer B2 { float imag[]; };
+layout(push_constant) uniform PC { int n; };
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x); if (gid>=n) return;
+    real[gid] = interleaved[2*gid];
+    imag[gid] = interleaved[2*gid+1];
+}";
+
     public static string CopyRows => @"#version 450
 layout(local_size_x = 256) in;
 layout(set=0, binding=0) buffer B0 { float src[]; };

@@ -7,6 +7,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
     {
         public static string[] GetKernelNames() => new[]
         {
+            "interleave_complex", "deinterleave_complex",
             "split_complex_multiply", "split_complex_conjugate",
             "split_complex_magnitude", "split_complex_magnitude_squared",
             "split_complex_phase", "split_complex_from_polar",
@@ -33,6 +34,29 @@ extern ""C"" __global__ __launch_bounds__(256) void split_complex_multiply(
     float br = bReal[idx], bi = bImag[idx];
     outReal[idx] = ar * br - ai * bi;
     outImag[idx] = ar * bi + ai * br;
+}
+
+// Pack split real/imag into one [re0, im0, re1, im1, ...] buffer. Replaces the dispatch layer's
+// two-Copy-calls-per-frequency-bin bridge, which cost ~1.06M device copies for a single batched RFFT.
+extern ""C"" __global__ __launch_bounds__(256) void interleave_complex(
+    const float* real, const float* imag,
+    float* interleaved, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    interleaved[2 * idx] = real[idx];
+    interleaved[2 * idx + 1] = imag[idx];
+}
+
+// Inverse of interleave_complex: used by IRFFT, whose spectrum arrives interleaved.
+extern ""C"" __global__ __launch_bounds__(256) void deinterleave_complex(
+    const float* interleaved,
+    float* real, float* imag, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    real[idx] = interleaved[2 * idx];
+    imag[idx] = interleaved[2 * idx + 1];
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void split_complex_conjugate(

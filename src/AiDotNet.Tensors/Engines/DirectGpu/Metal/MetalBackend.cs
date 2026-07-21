@@ -1978,7 +1978,34 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         enc.DispatchThreadgroups(tg, tpg);
     }
 
+    private static void ValidateComplexLayoutBuffers(
+        IGpuBuffer real, IGpuBuffer imag, IGpuBuffer interleaved, int n, string opName)
+    {
+        if (real is null) throw new ArgumentNullException(nameof(real));
+        if (imag is null) throw new ArgumentNullException(nameof(imag));
+        if (interleaved is null) throw new ArgumentNullException(nameof(interleaved));
+        long requiredInterleaved = checked((long)n * 2);
+        if (real.Size < n || imag.Size < n || interleaved.Size < requiredInterleaved)
+            throw new ArgumentException(
+                $"{opName}: real and imag require {n} elements and interleaved requires {requiredInterleaved}; "
+                + $"actual sizes are {real.Size}, {imag.Size}, and {interleaved.Size}.");
+    }
+
     public void SplitComplexMultiply(IGpuBuffer aR, IGpuBuffer aI, IGpuBuffer bR, IGpuBuffer bI, IGpuBuffer oR, IGpuBuffer oI, int n) { if (n > 0) DispatchComplexMetal("split_complex_multiply", [AsMetal(aR), AsMetal(aI), AsMetal(bR), AsMetal(bI), AsMetal(oR), AsMetal(oI)], n); }
+    public void InterleaveComplex(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer interleaved, int n)
+    {
+        if (n <= 0) return;
+        ValidateComplexLayoutBuffers(real, imag, interleaved, n, nameof(InterleaveComplex));
+        DispatchComplexMetal("interleave_complex", [AsMetal(real), AsMetal(imag), AsMetal(interleaved)], n);
+    }
+
+    public void DeinterleaveComplex(IGpuBuffer interleaved, IGpuBuffer real, IGpuBuffer imag, int n)
+    {
+        if (n <= 0) return;
+        ValidateComplexLayoutBuffers(real, imag, interleaved, n, nameof(DeinterleaveComplex));
+        DispatchComplexMetal("deinterleave_complex", [AsMetal(interleaved), AsMetal(real), AsMetal(imag)], n);
+    }
+
     public void SplitComplexConjugate(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer oR, IGpuBuffer oI, int n) { if (n > 0) DispatchComplexMetal("split_complex_conjugate", [AsMetal(iR), AsMetal(iI), AsMetal(oR), AsMetal(oI)], n); }
     public void SplitComplexMagnitude(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer o, int n) { if (n > 0) DispatchComplexMetal("split_complex_magnitude", [AsMetal(iR), AsMetal(iI), AsMetal(o)], n); }
     public void SplitComplexMagnitudeSquared(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer o, int n) { if (n > 0) DispatchComplexMetal("split_complex_magnitude_squared", [AsMetal(iR), AsMetal(iI), AsMetal(o)], n); }

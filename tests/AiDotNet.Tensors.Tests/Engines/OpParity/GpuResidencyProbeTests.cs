@@ -38,6 +38,30 @@ public sealed class GpuResidencyProbeTests
     // <= assertion cannot false-fail.
     private const int CpuFallbackFloor = 0;
 
+    // MEASURED 2026-07-21. Two of the ops that sat below this floor were NOT CPU fallbacks at all:
+    // CudaBackend.Softmax dispatches through LaunchSoftmaxKernel, which called cuLaunchKernel WITHOUT
+    // GpuLaunchProbe.OnLaunch. The kernels ran on the GPU; the probe was blind to them. Instrumenting
+    // that launcher (plus LaunchKernelOnStream / LaunchKernel2DOnStream, same gap) cleared
+    // Softmax[4,16] and TensorSoftmax[4,64]: 7 below floor -> 5.
+    //
+    // CAUTION FOR WHOEVER PICKS THIS UP — a counter cannot see past its own instrumentation point.
+    // I added GpuLaunchProbe.TotalEver (monotonic, Reset() does not clear it) to tell "no kernel ran"
+    // apart from "the per-op count was lost", read totalEverDelta=0 for all seven, and concluded they
+    // genuinely ran on the CPU. That was WRONG: TotalEver increments inside OnLaunch, so it shared the
+    // exact blind spot it was meant to rule out. Two counters agreeing is not independent confirmation
+    // when both hang off the same hook. 0f5be5e had it right that softmax reaches the GPU — its only
+    // error was naming LaunchKernelWithSharedMem instead of LaunchSoftmaxKernel.
+    //
+    // Historical worklist before the final launcher-instrumentation pass (5):
+    // NativeNormalizeRows[4,8], TensorBroadcastMultiply[4,64],
+    // TensorSoftmaxRows[4,64], Upsample[1,2,4,4;2x2], UpsampleBackward[1,2,8,8->1,2,4,4].
+    // TensorSoftmaxRows did NOT clear with the softmax launcher fix, so it takes a different path.
+    // Next step is the same one that worked here: find the launcher each op actually reaches and check
+    // whether it is instrumented, BEFORE concluding anything about CPU execution. GpuLaunchProbe.
+    // OnFallback records guard declines and swallowed exceptions and fired for NONE of these, which by
+    // itself does not distinguish "ran on GPU uncounted" from "left the device path uninstrumented".
+    // The final measurement after those launchers were instrumented reported zero operations below the floor.
+
     // Ops whose GPU override throws kernel-not-found and silently falls back to the CPU (a hollow
     // override — reflection counts it covered, the probe proves it does zero GPU work). GOAL 0.
     // Ratchets DOWN only: register/write the missing kernel or compose from a working primitive.
@@ -73,6 +97,10 @@ public sealed class GpuResidencyProbeTests
             // A quarantined op makes no residency claim (its GPU path is skipped/known-broken).
             if (op.KnownDivergence is not null || op.GpuUnsafe) continue;
 
+            // Isolate this case from deferred activations left by the previous registry operation.
+            // DropActivationCache discards those dead test temporaries without materializing them; doing
+            // this before Reset also prevents cleanup work from being attributed to the operation below.
+            gpu.DropActivationCache();
             GpuLaunchProbe.Reset();
             long launches;
             long internalReadbacks;
@@ -113,7 +141,14 @@ public sealed class GpuResidencyProbeTests
                 metadata.Add($"{op.Name}\t{op.Category}");
                 continue;
             }
-            fallback.Add($"{op.Name}\t{op.Category}\tlaunches {launches}/{op.GpuMinimumKernelLaunches}");
+            // Record WHY, not just THAT. A below-floor op with no kernel-cache miss is not a hollow
+            // override — its device path was declined by a guard or threw and got swallowed by a
+            // `catch { return base.Op(...); }`. GpuLaunchProbe.Fallbacks carries that reason when the
+            // override is instrumented; without it the worklist says "launches 0/1" and stops there.
+            string reasons = GpuLaunchProbe.Fallbacks.Length == 0
+                ? string.Empty
+                : "\t" + string.Join(" | ", GpuLaunchProbe.Fallbacks);
+            fallback.Add($"{op.Name}\t{op.Category}\tlaunches {launches}/{op.GpuMinimumKernelLaunches}{reasons}");
             if (GpuLaunchProbe.KernelMisses > 0)
                 hollow.Add($"{op.Name}\t{op.Category}\tmissing-kernel: {string.Join(",", GpuLaunchProbe.MissedKernelNames)}");
         }

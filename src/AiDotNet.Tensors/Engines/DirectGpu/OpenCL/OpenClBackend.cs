@@ -12333,8 +12333,35 @@ KERNEL VARIANTS (A/B testing):
         kernel.Execute1D(n, localSize);
     }
 
+    private static void ValidateComplexLayoutBuffers(
+        IGpuBuffer real, IGpuBuffer imag, IGpuBuffer interleaved, int n, string opName)
+    {
+        if (real is null) throw new ArgumentNullException(nameof(real));
+        if (imag is null) throw new ArgumentNullException(nameof(imag));
+        if (interleaved is null) throw new ArgumentNullException(nameof(interleaved));
+        long requiredInterleaved = checked((long)n * 2);
+        if (real.Size < n || imag.Size < n || interleaved.Size < requiredInterleaved)
+            throw new ArgumentException(
+                $"{opName}: real and imag require {n} elements and interleaved requires {requiredInterleaved}; "
+                + $"actual sizes are {real.Size}, {imag.Size}, and {interleaved.Size}.");
+    }
+
     public void SplitComplexMultiply(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag, IGpuBuffer outReal, IGpuBuffer outImag, int n)
         => DispatchSplitComplex("split_complex_multiply", [aReal, aImag, bReal, bImag, outReal, outImag], n);
+
+    public void InterleaveComplex(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer interleaved, int n)
+    {
+        if (n <= 0) return;
+        ValidateComplexLayoutBuffers(real, imag, interleaved, n, nameof(InterleaveComplex));
+        DispatchSplitComplex("interleave_complex", [real, imag, interleaved], n);
+    }
+
+    public void DeinterleaveComplex(IGpuBuffer interleaved, IGpuBuffer real, IGpuBuffer imag, int n)
+    {
+        if (n <= 0) return;
+        ValidateComplexLayoutBuffers(real, imag, interleaved, n, nameof(DeinterleaveComplex));
+        DispatchSplitComplex("deinterleave_complex", [interleaved, real, imag], n);
+    }
 
     public void SplitComplexConjugate(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n)
         => DispatchSplitComplex("split_complex_conjugate", [inReal, inImag, outReal, outImag], n);

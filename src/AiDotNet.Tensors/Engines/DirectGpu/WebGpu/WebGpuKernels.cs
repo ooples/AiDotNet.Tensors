@@ -6249,7 +6249,8 @@ fn squash(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var d: u32 = 0u; d < params.capsule_dim; d = d + 1u) {
         sq = sq + input[off + d] * input[off + d];
     }
-    let scale = sq / ((1.0 + sq) * sqrt(sq + params.epsilon));
+    let denominator = (1.0 + sq) * (sqrt(sq) + params.epsilon);
+    let scale = select(0.0, sq / denominator, denominator != 0.0);
     for (var d: u32 = 0u; d < params.capsule_dim; d = d + 1u) {
         output[off + d] = input[off + d] * scale;
     }
@@ -10913,10 +10914,14 @@ fn squash_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
         sq_norm = sq_norm + x * x;
         dot = dot + x * csb_grad_output[base + d];
     }
-    let norm = sqrt(sq_norm + csb_params.epsilon);
-    let scale = sq_norm / ((1.0 + sq_norm) * norm);
-    let dscale = 1.0 / ((1.0 + sq_norm) * (1.0 + sq_norm) * norm);
-    csb_grad_input[idx] = scale * csb_grad_output[idx] - dscale * csb_input[idx] * dot;
+    let norm = sqrt(sq_norm);
+    let norm_plus_epsilon = norm + csb_params.epsilon;
+    let denominator = (1.0 + sq_norm) * norm_plus_epsilon;
+    let valid = denominator != 0.0;
+    let scale = select(0.0, sq_norm / denominator, valid);
+    let coefficient = select(0.0,
+        (norm + 2.0 * csb_params.epsilon - sq_norm * norm) / (denominator * denominator), valid);
+    csb_grad_input[idx] = scale * csb_grad_output[idx] + coefficient * csb_input[idx] * dot;
 }
 ";
 

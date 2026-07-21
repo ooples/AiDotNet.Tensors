@@ -1,5 +1,6 @@
 using System;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.DirectGpu.Cpu;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -55,6 +56,26 @@ public class FusedLinearCeGpuParityTests
         float host = RecurrenceCpuKernels.FusedLinearCeDense(F(hidden), F(weight), F(bias), target, n, d, vocab);
 
         Assert.True(Math.Abs(reference - host) < 1e-4f, $"dense loss cpu={reference} host={host}");
+    }
+
+    [Fact]
+    public void TapeActiveDirectGpuOverloads_RejectSilentCpuFallback()
+    {
+        using var engine = new DirectGpuTensorEngine();
+        var hidden = new Tensor<float>(Gen(8, 1), new[] { 2, 4 });
+        var weight = new Tensor<float>(Gen(12, 2), new[] { 4, 3 });
+        var bias = new Tensor<float>(Gen(3, 3), new[] { 3 });
+        var ids = new Tensor<int>(new[] { 0, 2 }, new[] { 2 });
+        var target = new Tensor<float>(new[] { 1f, 0f, 0f, 0f, 0f, 1f }, new[] { 2, 3 });
+
+        using var tape = new GradientTape<float>();
+        NotSupportedException indexError = Assert.Throws<NotSupportedException>(() =>
+            engine.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, ids));
+        NotSupportedException denseError = Assert.Throws<NotSupportedException>(() =>
+            engine.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, target));
+
+        Assert.Contains("tape-active", indexError.Message, StringComparison.Ordinal);
+        Assert.Contains("tape-active", denseError.Message, StringComparison.Ordinal);
     }
 
     private static float[] F(Tensor<float> t) => (float[])(object)t.GetDataArray()!;

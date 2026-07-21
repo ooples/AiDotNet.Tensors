@@ -187,8 +187,27 @@ extern ""C"" __global__ __launch_bounds__(256) void cross_entropy_backward(
     int total = batchSize * numClasses;
     if (idx >= total) return;
 
-    float pred = fmaxf(predictions[idx], 1e-7f);
-    gradInput[idx] = (-targets[idx] / pred) / (float)batchSize;
+    // CONTRACT: `predictions` are LOGITS. CpuEngine.CrossEntropyBackward softmaxes them per row and
+    // returns (softmax - target) / batchSize; the OpenCL kernel does the same. This kernel instead treated
+    // them as probabilities and returned (-target / pred) / batchSize — a different derivative entirely,
+    // which forward parity measured as maxAbs 4.526E+01 @[18]: CPU 0.008488914 vs GPU -8.555251.
+    //
+    // Third instance this branch of a #775 fix landing on OpenCL/Metal and never reaching CUDA (after the
+    // SELU >= boundary and nll_loss reading float targets as int*). The registry case is even annotated
+    // FIXED (#775) while the test kept failing.
+    int b = idx / numClasses;
+    int rowOffset = b * numClasses;
+
+    float maxVal = -INFINITY;
+    for (int i = 0; i < numClasses; i++)
+        maxVal = fmaxf(maxVal, predictions[rowOffset + i]);
+
+    float sumExp = 0.0f;
+    for (int i = 0; i < numClasses; i++)
+        sumExp += expf(predictions[rowOffset + i] - maxVal);
+
+    float softmax = expf(predictions[idx] - maxVal) / sumExp;
+    gradInput[idx] = (softmax - targets[idx]) / (float)batchSize;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void bce_loss(
@@ -751,7 +770,30 @@ extern ""C"" __global__ __launch_bounds__(256) void equals(
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    C[idx] = fabsf(A[idx] - B[idx]) < 1e-6f ? 1.0f : 0.0f;
+
+    // IEEE equality, NOT a tolerance. This kernel used fabsf(a-b) < 1e-6f, which is a different
+    // predicate and was measurably wrong in three distinct ways against CpuEngine:
+    //     idx  a           b       CPU  GPU(old)
+    //     0    0.0         1e-8     0    1        near-equal counted as equal
+    //     2    3.0000002   3.0      0    1        near-equal counted as equal
+    //     5    +Inf        +Inf     1    0        Inf-Inf = NaN, NaN < 1e-6 is false
+    // Measured raw masks: CPU 00010101 (exactly IEEE ==) vs GPU 10110001.
+    //
+    // NOTE there are TWO equality kernels in this backend: the bit-exact equals_kernel in
+    // CudaBroadcastKernels, and this one. CudaBackend.Equal looks up the name equals - this one - so the correct
+    // implementation was present but unreachable. Bodies are kept in sync rather than rewiring the lookup,
+    // because several callers (TensorEq, TensorEqScalar, TensorIsIn, the mode/threshold masks) go through
+    // backend.Equal and all of them want IEEE semantics.
+    //
+    // Bit-pattern form: aa/ba <= 0x7F800000 rejects NaN on either side (NaN != NaN); ab == bb covers the
+    // ordinary case; (aa | ba) == 0 makes -0.0 == +0.0 as IEEE requires.
+    unsigned int ab = __float_as_uint(A[idx]);
+    unsigned int bb = __float_as_uint(B[idx]);
+    unsigned int aa = ab & 0x7FFFFFFFu;
+    unsigned int ba = bb & 0x7FFFFFFFu;
+    bool eq = aa <= 0x7F800000u && ba <= 0x7F800000u
+        && (ab == bb || ((aa | ba) == 0u));
+    C[idx] = eq ? 1.0f : 0.0f;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void where_cond(

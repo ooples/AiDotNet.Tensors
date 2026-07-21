@@ -34,7 +34,16 @@ extern ""C"" __global__ __launch_bounds__(256) void im2col(
     int ow = rem % outW;
 
     int patchSize = channels * kernelH * kernelW;
-    float* outPtr = output + idx * patchSize;
+
+    // Output is [batch, C*kH*kW, L] (L = outH*outW), matching CpuEngine.Unfold. This kernel wrote
+    //     float* outPtr = output + idx * patchSize;  outPtr[(c*kernelH+kh)*kernelW+kw] = val;
+    // which is the TRANSPOSED [batch, L, C*kH*kW] layout, so GPU columns came out permuted vs the CPU
+    // convention. OpenCL fixed this; CUDA never got the fix (same #775 drift class as the SELU >=,
+    // nll_loss int*, and cross_entropy_backward misses in this branch). col2im below reads this layout
+    // back and carried the identical transposition, so the two were self-consistent and only diverged
+    // from CPU -- which is why Unfold/Fold looked plausible on GPU while disagreeing with CpuEngine.
+    int L = outH * outW;
+    int s = oh * outW + ow;
 
     for (int c = 0; c < channels; c++) {
         for (int kh = 0; kh < kernelH; kh++) {
@@ -47,8 +56,8 @@ extern ""C"" __global__ __launch_bounds__(256) void im2col(
                     val = input[((b * channels + c) * height + ih) * width + iw];
                 }
 
-                int outIdx = (c * kernelH + kh) * kernelW + kw;
-                outPtr[outIdx] = val;
+                int colRow = (c * kernelH + kh) * kernelW + kw;
+                output[(b * patchSize + colRow) * L + s] = val;
             }
         }
     }
@@ -85,9 +94,13 @@ extern ""C"" __global__ __launch_bounds__(256) void col2im(
                 int ow = ow_base / strideW;
 
                 if (oh >= 0 && oh < outH && ow >= 0 && ow < outW) {
-                    int patchIdx = (b * outH + oh) * outW + ow;
+                    // Input is [batch, C*kH*kW, L] (L = outH*outW patches), matching CpuEngine.Fold:
+                    // flat = b*patchSize*L + colIdx*L + s. The old index (patchIdx*patchSize + colIdx)
+                    // assumed the transposed [batch, L, C*kH*kW] layout im2col used to write above.
+                    int L = outH * outW;
+                    int s = oh * outW + ow;
                     int colIdx = (c * kernelH + kh) * kernelW + kw;
-                    sum += input[patchIdx * patchSize + colIdx];
+                    sum += input[(b * patchSize + colIdx) * L + s];
                 }
             }
         }

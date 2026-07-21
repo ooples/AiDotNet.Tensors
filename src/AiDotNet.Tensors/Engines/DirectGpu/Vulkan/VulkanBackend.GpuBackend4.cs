@@ -1063,6 +1063,34 @@ public sealed unsafe partial class VulkanBackend
         }
     }
 
+    public void InterleaveComplex(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer interleaved, int n)
+    {
+        if (n <= 0) return;
+        ValidateComplexLayoutBuffers(real, imag, interleaved, n, nameof(InterleaveComplex));
+        GlslDispatchN(VulkanAuditKernels.InterleaveComplex, n,
+            new IGpuBuffer[] { real, imag, interleaved }, new uint[] { (uint)n });
+    }
+
+    public void DeinterleaveComplex(IGpuBuffer interleaved, IGpuBuffer real, IGpuBuffer imag, int n)
+    {
+        if (n <= 0) return;
+        ValidateComplexLayoutBuffers(real, imag, interleaved, n, nameof(DeinterleaveComplex));
+        GlslDispatchN(VulkanAuditKernels.DeinterleaveComplex, n,
+            new IGpuBuffer[] { interleaved, real, imag }, new uint[] { (uint)n });
+    }
+
+    private static void ValidateComplexLayoutBuffers(
+        IGpuBuffer real, IGpuBuffer imag, IGpuBuffer interleaved, int n, string opName)
+    {
+        if (real is null) throw new ArgumentNullException(nameof(real));
+        if (imag is null) throw new ArgumentNullException(nameof(imag));
+        if (interleaved is null) throw new ArgumentNullException(nameof(interleaved));
+        long requiredInterleaved = checked((long)n * 2);
+        if (real.Size < n || imag.Size < n || interleaved.Size < requiredInterleaved)
+            throw new ArgumentException(
+                $"{opName}: n ({n}) requires real/imag buffers of at least {n} elements and an interleaved buffer of at least {requiredInterleaved} elements; sizes are real={real.Size}, imag={imag.Size}, interleaved={interleaved.Size}.");
+    }
+
     public void SplitComplexConjugate(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer oR, IGpuBuffer oI, int n)
     {
         if (n <= 0) return;

@@ -67,16 +67,29 @@ public partial class CpuEngine
                     $"targetIds[{r}] ({ids[r]}) must be in [0, vocab={vocab}).");
 
         // logits = hidden·weight + bias, computed off-tape (this op records its own node).
+        //
+        // MATERIALIZE ONCE. TensorMatMul returns a GPU-RESIDENT tensor when this runs on the GPU engine
+        // (which it does whenever a tape is active, because the DirectGpu override bails to this base
+        // implementation). For a resident tensor GetDataArray() hands back a DETACHED COPY, and a fresh one
+        // per call — so the previous code added the bias into one copy inside AddBiasRows and then computed
+        // the loss from a SECOND copy that never saw the bias.
+        //
+        // Measured: forward loss with no tape agreed exactly (cpu 2.76591349 == gpu 2.76591349); with a tape
+        // active the GPU value dropped to 2.35062456 — the bias-free loss — while CPU was unchanged. That
+        // 4.153E-01 gap was the whole reported tape-gradient divergence for this op, and it reached every
+        // leaf because the recorded backward reconstructs softmax from these same logits.
         Tensor<T> logits;
+        T[] logitData;
         using (new NoGradScope<T>())
         {
             logits = TensorMatMul(hidden, weight);
-            AddBiasRows(logits, bias, n, vocab);
+            logitData = logits.GetDataArray()!;
+            AddBiasRowsInto(logitData, bias, n, vocab);
         }
 
         double lossValue = typeof(T) == typeof(double)
-            ? FusedCeLossIndexDouble((double[])(object)logits.GetDataArray()!, ids, n, vocab)
-            : FusedCeLossIndexGeneric<T>(logits.GetDataArray()!, ids, n, vocab);
+            ? FusedCeLossIndexDouble((double[])(object)logitData, ids, n, vocab)
+            : FusedCeLossIndexGeneric<T>(logitData, ids, n, vocab);
 
         var output = new Tensor<T>(new[] { 1 }); // scalar loss (length-1)
         output.GetDataArray()![0] = MathHelper.GetNumericOperations<T>().FromDouble(lossValue);
@@ -140,21 +153,25 @@ public partial class CpuEngine
         // (this op records its own single tape node). The logits tensor is transient — it never
         // enters the tape, so the big [N, vocab] allocation is freed after the forward.
         Tensor<T> logits;
+        T[] logitData;
         using (new NoGradScope<T>())
         {
             logits = TensorMatMul(hidden, weight);              // [N, vocab]
-            AddBiasRows(logits, bias, n, vocab);
+            // Materialize ONCE — see the int-id forward: GetDataArray() returns a fresh detached copy
+            // for a GPU-resident tensor, so adding the bias to one copy and reading another drops it.
+            logitData = logits.GetDataArray()!;
+            AddBiasRowsInto(logitData, bias, n, vocab);
         }
 
         double lossValue;
         if (typeof(T) == typeof(double))
         {
             lossValue = FusedCeLossDouble(
-                (double[])(object)logits.GetDataArray()!, (double[])(object)target.GetDataArray()!, n, vocab);
+                (double[])(object)logitData, (double[])(object)target.GetDataArray()!, n, vocab);
         }
         else
         {
-            lossValue = FusedCeLossGeneric<T>(logits.GetDataArray()!, target.GetDataArray()!, n, vocab);
+            lossValue = FusedCeLossGeneric<T>(logitData, target.GetDataArray()!, n, vocab);
         }
 
         var output = new Tensor<T>(new[] { 1 }); // scalar loss (length-1)
@@ -169,9 +186,16 @@ public partial class CpuEngine
         return output;
     }
 
-    private static void AddBiasRows<T>(Tensor<T> logits, Tensor<T> bias, int n, int vocab)
+    /// <summary>
+    /// Adds the bias row-wise into an ALREADY-MATERIALIZED logits array.
+    /// </summary>
+    /// <remarks>
+    /// Takes the array rather than the tensor so the caller performs exactly one GetDataArray(). For a
+    /// GPU-resident tensor that call returns a detached copy each time, so fetching separately here and in
+    /// the loss computation silently dropped the bias.
+    /// </remarks>
+    private static void AddBiasRowsInto<T>(T[] lo, Tensor<T> bias, int n, int vocab)
     {
-        var lo = logits.GetDataArray()!;
         var bi = bias.GetDataArray()!;
         if (typeof(T) == typeof(double))
         {
@@ -284,16 +308,19 @@ public partial class CpuEngine
         using (new NoGradScope<T>())
         {
             var logits = engine.TensorMatMul(hidden, weight);
-            AddBiasRows(logits, bias, n, vocab);
+            // Materialize ONCE — see the int-id forward: GetDataArray() returns a fresh detached copy
+            // for a GPU-resident tensor, so adding the bias to one copy and reading another drops it.
+            var logitData = logits.GetDataArray()!;
+            AddBiasRowsInto(logitData, bias, n, vocab);
             if (typeof(T) == typeof(double))
             {
                 SoftmaxMinusIndexDouble(
-                    (double[])(object)logits.GetDataArray()!, ids,
+                    (double[])(object)logitData, ids,
                     (double[])(object)dLogits.GetDataArray()!, n, vocab, g);
             }
             else
             {
-                SoftmaxMinusIndexGeneric<T>(logits.GetDataArray()!, ids, dLogits.GetDataArray()!, n, vocab, g);
+                SoftmaxMinusIndexGeneric<T>(logitData, ids, dLogits.GetDataArray()!, n, vocab, g);
             }
 
             var dHidden = engine.TensorMatMulTransposed(dLogits, weight);
@@ -372,17 +399,20 @@ public partial class CpuEngine
         using (new NoGradScope<T>())
         {
             var logits = engine.TensorMatMul(hidden, weight);
-            AddBiasRows(logits, bias, n, vocab);
+            // Materialize ONCE — see the int-id forward: GetDataArray() returns a fresh detached copy
+            // for a GPU-resident tensor, so adding the bias to one copy and reading another drops it.
+            var logitData = logits.GetDataArray()!;
+            AddBiasRowsInto(logitData, bias, n, vocab);
             if (typeof(T) == typeof(double))
             {
                 SoftmaxMinusTargetDouble(
-                    (double[])(object)logits.GetDataArray()!, (double[])(object)target.GetDataArray()!,
+                    (double[])(object)logitData, (double[])(object)target.GetDataArray()!,
                     (double[])(object)dLogits.GetDataArray()!, n, vocab, g);
             }
             else
             {
                 SoftmaxMinusTargetGeneric<T>(
-                    logits.GetDataArray()!, target.GetDataArray()!, dLogits.GetDataArray()!, n, vocab, g);
+                    logitData, target.GetDataArray()!, dLogits.GetDataArray()!, n, vocab, g);
             }
 
             // dHidden = dLogits·weightᵀ  [N,d]  (weight is [d,vocab] → weightᵀ [vocab,d]).

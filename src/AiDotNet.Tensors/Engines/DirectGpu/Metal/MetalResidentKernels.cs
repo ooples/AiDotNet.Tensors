@@ -418,8 +418,8 @@ kernel void capsule_squash(
     uint capsule = gid / dimension, offset = capsule * dimension;
     float normSquared = 0.0f;
     for (uint d = 0; d < dimension; ++d) { float value = input[offset + d]; normSquared += value * value; }
-    float norm = sqrt(normSquared + epsilon);
-    float scale = normSquared / ((1.0f + normSquared) * norm);
+    float denominator = (1.0f + normSquared) * (sqrt(normSquared) + epsilon);
+    float scale = denominator != 0.0f ? normSquared / denominator : 0.0f;
     output[gid] = input[gid] * scale;
 }
 
@@ -430,11 +430,20 @@ kernel void capsule_squash_backward(
 {
     if (gid >= capsules * dimension) return;
     uint capsule = gid / dimension, offset = capsule * dimension;
-    float normSquared = 0.0f;
-    for (uint d = 0; d < dimension; ++d) { float value = input[offset + d]; normSquared += value * value; }
-    float norm = sqrt(normSquared + epsilon);
-    float scale = normSquared / ((1.0f + normSquared) * norm);
-    gradInput[gid] = gradOutput[gid] * scale;
+    float normSquared = 0.0f, dot = 0.0f;
+    for (uint d = 0; d < dimension; ++d) {
+        float value = input[offset + d];
+        normSquared += value * value;
+        dot += value * gradOutput[offset + d];
+    }
+    float norm = sqrt(normSquared);
+    float normPlusEpsilon = norm + epsilon;
+    float denominator = (1.0f + normSquared) * normPlusEpsilon;
+    float scale = denominator != 0.0f ? normSquared / denominator : 0.0f;
+    float coefficient = denominator != 0.0f
+        ? (norm + 2.0f * epsilon - normSquared * norm) / (denominator * denominator)
+        : 0.0f;
+    gradInput[gid] = gradOutput[gid] * scale + input[gid] * dot * coefficient;
 }
 
 kernel void capsule_predictions(

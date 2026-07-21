@@ -2013,6 +2013,8 @@ public class DelegatingGpuBackend : IDirectGpuBackend
 
     // --- Split-buffer native Complex<T> operations ---
     public virtual void SplitComplexMultiply(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => Inner.SplitComplexMultiply(aReal, aImag, bReal, bImag, outReal, outImag, n);
+    public virtual void InterleaveComplex(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer interleaved, int n) => Inner.InterleaveComplex(real, imag, interleaved, n);
+    public virtual void DeinterleaveComplex(IGpuBuffer interleaved, IGpuBuffer real, IGpuBuffer imag, int n) => Inner.DeinterleaveComplex(interleaved, real, imag, n);
     public virtual void SplitComplexConjugate(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => Inner.SplitComplexConjugate(inReal, inImag, outReal, outImag, n);
     public virtual void SplitComplexMagnitude(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMag, int n) => Inner.SplitComplexMagnitude(inReal, inImag, outMag, n);
     public virtual void SplitComplexMagnitudeSquared(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMagSq, int n) => Inner.SplitComplexMagnitudeSquared(inReal, inImag, outMagSq, n);

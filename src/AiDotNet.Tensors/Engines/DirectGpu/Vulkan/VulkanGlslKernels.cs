@@ -336,7 +336,8 @@ void main() {
     uint offset = capsule * capsuleDim;
     float squaredNorm = 0.0;
     for (uint d0 = 0u; d0 < capsuleDim; ++d0) squaredNorm += a[offset + d0] * a[offset + d0];
-    float scale = squaredNorm / ((1.0 + squaredNorm) * sqrt(squaredNorm + epsilon));
+    float denominator = (1.0 + squaredNorm) * (sqrt(squaredNorm) + epsilon);
+    float scale = denominator != 0.0 ? squaredNorm / denominator : 0.0;
     for (uint d0 = 0u; d0 < capsuleDim; ++d0) b[offset + d0] = a[offset + d0] * scale;
 }";
 
@@ -347,11 +348,21 @@ void main() {
     if (capsule >= numCapsules) return;
     uint offset = capsule * capsuleDim;
     float squaredNorm = 0.0;
-    for (uint d0 = 0u; d0 < capsuleDim; ++d0) squaredNorm += bdata[offset + d0] * bdata[offset + d0];
-    float norm = sqrt(squaredNorm + epsilon);
-    float denominator = (1.0 + squaredNorm) * norm;
-    float factor = (squaredNorm + 2.0 * squaredNorm / (1.0 + squaredNorm)) / (denominator * denominator);
-    for (uint d0 = 0u; d0 < capsuleDim; ++d0) c[offset + d0] = a[offset + d0] * factor;
+    float dot = 0.0;
+    for (uint d0 = 0u; d0 < capsuleDim; ++d0) {
+        float value = bdata[offset + d0];
+        squaredNorm += value * value;
+        dot += value * a[offset + d0];
+    }
+    float norm = sqrt(squaredNorm);
+    float normPlusEpsilon = norm + epsilon;
+    float denominator = (1.0 + squaredNorm) * normPlusEpsilon;
+    float scale = denominator != 0.0 ? squaredNorm / denominator : 0.0;
+    float coefficient = denominator != 0.0
+        ? (norm + 2.0 * epsilon - squaredNorm * norm) / (denominator * denominator)
+        : 0.0;
+    for (uint d0 = 0u; d0 < capsuleDim; ++d0)
+        c[offset + d0] = scale * a[offset + d0] + coefficient * bdata[offset + d0] * dot;
 }";
 
     public static string CapsulePredictions => Header + ThreeBufferLayout + @"

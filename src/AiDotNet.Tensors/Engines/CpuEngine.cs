@@ -48,6 +48,7 @@ public partial class CpuEngine : ITensorLevelEngine
 {
     private static int _randomNormalSeedCounter = Environment.TickCount;
     private const int TensorMatMulGemvParallelThreshold = 128 * 1024;
+    private const double CapsuleSquashEpsilon = 1e-8;
 
     /// <inheritdoc/>
     public virtual string Name => "CPU Engine";
@@ -11661,6 +11662,11 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // NOTE: GLU is the only *GLU variant with a compiled-plan lookup (GeGLU/SwiGLU/ReGLU have none),
+        // and it is the only one failing forward parity — which looks like a strong lead and is NOT one.
+        // MEASURED 2026-07-20: instrumenting this lookup during the failing test logged 4 MISSES and ZERO
+        // hits, so the cached-plan path never executes and cannot be the source of GLU's
+        // "buffer released before materialization" (#226). Do not re-investigate this line.
         { var ac = AutoTracer.TryGetCompiledPlan<T>("GLU", input._shape); if (ac is not null) return ac.Execute(); }
 
         int dimSize = input._shape[actualDim];
@@ -35606,7 +35612,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Compute ||v||
         var norm = TensorSqrt(normSquared);
         var epsilon = AutoTensorCache.RentOrAllocate<T>(norm._shape);
-        epsilon.Fill(numOps.FromDouble(1e-8));
+        epsilon.Fill(numOps.FromDouble(CapsuleSquashEpsilon));
         norm = TensorAdd(norm, epsilon);
 
         // Normalize: v / ||v||
@@ -35628,16 +35634,37 @@ public partial class CpuEngine : ITensorLevelEngine
         // Normalize axis
         if (axis < 0) axis = input._shape.Length + axis;
 
-        // This is a simplified gradient - full implementation would require proper Jacobian
-        // For now, approximate with element-wise gradient scaling
+        // Forward is y = f(r) * x, where
+        //   f(r) = r^2 / ((1 + r^2) * (r + epsilon)).
+        // Therefore J^T*g = f(r)*g + (f'(r)/r)*x*dot(g,x), with
+        //   f'(r)/r = (r + 2*epsilon - r^3)
+        //               / ((1 + r^2)^2 * (r + epsilon)^2).
+        // This retains the epsilon terms from the exact forward expression; dropping them produces
+        // incorrect gradients for small, non-zero capsule norms.
         var squared = TensorMultiply(input, input);
         var normSquared = ReduceSum(squared, new[] { axis }, keepDims: true);
         var one = AutoTensorCache.RentOrAllocate<T>(normSquared._shape);
         one.Fill(numOps.One);
-        var denom = TensorAdd(one, normSquared);
-        var scale = TensorDivide(one, denom);
+        var onePlusNormSquared = TensorAdd(one, normSquared);
+        var norm = TensorSqrt(normSquared);
+        var normPlusEpsilon = TensorAddScalar(norm, numOps.FromDouble(CapsuleSquashEpsilon));
 
-        return TensorMultiply(gradOutput, scale);
+        var scaleDenominator = TensorMultiply(onePlusNormSquared, normPlusEpsilon);
+        var scale = TensorDivide(normSquared, scaleDenominator);
+
+        var normCubed = TensorMultiply(normSquared, norm);
+        var coefficientNumerator = TensorAddScalar(
+            TensorSubtract(norm, normCubed),
+            numOps.FromDouble(2 * CapsuleSquashEpsilon));
+        var onePlusNormSquaredSquared = TensorMultiply(onePlusNormSquared, onePlusNormSquared);
+        var normPlusEpsilonSquared = TensorMultiply(normPlusEpsilon, normPlusEpsilon);
+        var coefficientDenominator = TensorMultiply(onePlusNormSquaredSquared, normPlusEpsilonSquared);
+        var coefficient = TensorDivide(coefficientNumerator, coefficientDenominator);
+
+        var dot = ReduceSum(TensorMultiply(gradOutput, input), new[] { axis }, keepDims: true);
+        var direct = TensorMultiply(gradOutput, scale);
+        var radial = TensorMultiply(TensorMultiply(input, dot), coefficient);
+        return TensorAdd(direct, radial);
     }
 
     /// <inheritdoc/>
@@ -39326,6 +39353,40 @@ public partial class CpuEngine : ITensorLevelEngine
 
     #region FFT and Signal Processing
 
+    /// <summary>
+    /// Test-only switch selecting the legacy FFTCore path instead of NativeFFTInPlace.
+    /// </summary>
+    /// <remarks>
+    /// Exists so both cores can be exercised in one process and interleaved within a single thermal window.
+    /// The caller's value is captured before RFFT fans out to worker threads. Never set outside benchmarks.
+    /// </remarks>
+    [ThreadStatic]
+    internal static bool UseLegacyFftCore;
+
+    [ThreadStatic] private static object? _fftScratch;
+
+    /// <summary>
+    /// Exact-size per-thread scratch for the FFT cores.
+    /// </summary>
+    /// <remarks>
+    /// ArrayPool is deliberately NOT used: Rent may hand back a LONGER array than requested, and
+    /// NativeFFTInPlace derives the transform length from the array length — an oversized buffer would
+    /// silently compute the wrong-size transform rather than fail. Keyed on exact length, the buffer is
+    /// reused by every signal on the thread, so after the first signal the parallel loop allocates nothing.
+    ///
+    /// Reuse is safe for both callers because nFft is always a power of two (hence even) and both fill the
+    /// buffer completely before transforming: RFFT writes [0, n) from the input and zero-fills [n, nFft);
+    /// IRFFT writes [0, nFft/2] from the positive frequencies and (nFft/2, nFft) by conjugate symmetry,
+    /// which together cover every bin. No stale element from a previous signal can survive.
+    /// </remarks>
+    private static Complex<T>[] FftScratch<T>(int nFft)
+    {
+        if (_fftScratch is Complex<T>[] buf && buf.Length == nFft) return buf;
+        var fresh = new Complex<T>[nFft];
+        _fftScratch = fresh;
+        return fresh;
+    }
+
     /// <inheritdoc/>
     public Tensor<T> RFFT<T>(Tensor<T> input)
     {
@@ -39335,6 +39396,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         int n = input._shape[^1]; // Last dimension is the signal length
+        if (n <= 0)
+            throw new ArgumentException("The signal length must be positive.", nameof(input));
 
         // Pad to next power of 2 if needed
         int nFft = NextPowerOf2(n);
@@ -39352,25 +39415,49 @@ public partial class CpuEngine : ITensorLevelEngine
         // Handle batched input
         int batchSize = input.Length / n;
 
+        // Routed through NativeFFTInPlace, not FFTCore. FFTCore recomputed Math.Cos/Math.Sin INSIDE the
+        // innermost butterfly loop — the twiddle for a given (size, k) is identical across every block, so a
+        // length-256 transform burned (n/2)*log2(n)*2 = 2048 trig calls per signal, and it round-tripped every
+        // value through numOps.ToDouble/FromDouble (6 per butterfly). NativeFFTInPlace already caches twiddles
+        // per (n, inverse) and dispatches float/double to non-generic span kernels, so RFFT gets that for free.
+        // Measured before this change on the Autoformer aggregation benchmark: the FFT path ran ~9-12x SLOWER
+        // than the scalar loop it was meant to replace despite issuing ~3x fewer FLOPs.
+        // Snapshot the thread-local benchmark option before the work fans out to worker threads.
+        bool useLegacyFftCore = UseLegacyFftCore;
         CpuParallelSettings.ParallelForOrSerial(0, batchSize, input.Length, batchIdx =>
         {
-            // Extract signal for this batch
-            var signal = new Vector<T>(nFft);
+            // One exact-size buffer per signal (was ~6 Vector<T> allocations). Not pooled: ArrayPool.Rent may
+            // hand back a longer array and the in-place core keys its transform length off the array length.
             int inputOffset = batchIdx * n;
+            int outputOffsetLegacy = batchIdx * numFreqs * 2;
+            if (useLegacyFftCore)
+            {
+                var signal = new Vector<T>(nFft);
+                for (int i = 0; i < n; i++) signal[i] = inputData[inputOffset + i];
+                for (int i = n; i < nFft; i++) signal[i] = numOps.Zero;
+                var (lr, li) = FFTCore<T>(signal, inverse: false);
+                for (int k = 0; k < numFreqs; k++)
+                {
+                    resultData[outputOffsetLegacy + k * 2] = lr[k];
+                    resultData[outputOffsetLegacy + k * 2 + 1] = li[k];
+                }
+                return;
+            }
+
+            var work = FftScratch<T>(nFft);
             for (int i = 0; i < n; i++)
-                signal[i] = inputData[inputOffset + i];
+                work[i] = new Complex<T>(inputData[inputOffset + i], numOps.Zero);
             for (int i = n; i < nFft; i++)
-                signal[i] = numOps.Zero;
+                work[i] = new Complex<T>(numOps.Zero, numOps.Zero);
 
-            // Compute FFT using Cooley-Tukey algorithm
-            var (realOut, imagOut) = FFTCore<T>(signal, inverse: false);
+            NativeFFTInPlace(work, inverse: false, numOps);
 
-            // Copy only positive frequencies (0 to Nyquist)
+            // Keep only the positive frequencies (0 to Nyquist), interleaved re/im.
             int outputOffset = batchIdx * numFreqs * 2;
             for (int k = 0; k < numFreqs; k++)
             {
-                resultData[outputOffset + k * 2] = realOut[k];
-                resultData[outputOffset + k * 2 + 1] = imagOut[k];
+                resultData[outputOffset + k * 2] = work[k].Real;
+                resultData[outputOffset + k * 2 + 1] = work[k].Imaginary;
             }
         });
 
@@ -39423,35 +39510,28 @@ public partial class CpuEngine : ITensorLevelEngine
 
         CpuParallelSettings.ParallelForOrSerial(0, batchSize, input.Length, batchIdx =>
         {
-            // Reconstruct full spectrum using conjugate symmetry
-            var realIn = new Vector<T>(nFft);
-            var imagIn = new Vector<T>(nFft);
+            // Same routing change as RFFT: NativeFFTInPlace (cached twiddles + non-generic float/double span
+            // kernels) instead of FFTCore, which recomputed Math.Cos/Math.Sin per butterfly and converted
+            // through numOps on every element. One exact-size buffer replaces the two Vector<T> allocations
+            // plus FFTCore's own internal allocations.
+            var work = FftScratch<T>(nFft);
             int inputOffset = batchIdx * numFreqs * 2;
 
-            // Copy positive frequencies
+            // Positive frequencies as given.
             for (int k = 0; k < numFreqs; k++)
-            {
-                realIn[k] = inputData[inputOffset + k * 2];
-                imagIn[k] = inputData[inputOffset + k * 2 + 1];
-            }
+                work[k] = new Complex<T>(inputData[inputOffset + k * 2], inputData[inputOffset + k * 2 + 1]);
 
-            // Conjugate symmetry for negative frequencies
+            // Negative frequencies by conjugate symmetry: X[n-k] = conj(X[k]).
             for (int k = 1; k < numFreqs - 1; k++)
-            {
-                realIn[nFft - k] = realIn[k];
-                imagIn[nFft - k] = numOps.Negate(imagIn[k]);
-            }
+                work[nFft - k] = new Complex<T>(work[k].Real, numOps.Negate(work[k].Imaginary));
 
-            // Compute inverse FFT
-            var (realOut, _) = FFTCore<T>(realIn, imagIn, inverse: true);
+            NativeFFTInPlace(work, inverse: true, numOps);
 
-            // Copy result with normalization
+            // Real part only, normalized by 1/nFft.
             int outputOffset = batchIdx * outputLength;
             T scale = numOps.FromDouble(1.0 / nFft);
             for (int i = 0; i < outputLength; i++)
-            {
-                resultData[outputOffset + i] = numOps.Multiply(realOut[i], scale);
-            }
+                resultData[outputOffset + i] = numOps.Multiply(work[i].Real, scale);
         });
 
         DifferentiableOps.RecordUnary("IRFFT", result, inputOrig, static (gradOutput, inputs, output, savedState, engine, grads) =>
@@ -44800,7 +44880,16 @@ public partial class CpuEngine : ITensorLevelEngine
             alphaData[i] = numOps.FromDouble(vVal / (1.0 - iouVal + vVal + 1e-7));
         }
         var v = new Tensor<T>(vData, new[] { n, 1 });
-        // alpha is detached from gradient (constant w.r.t. backward)
+
+        // v is computed numerically above, which made it a CONSTANT LEAF on the tape. With alpha also
+        // (correctly) detached, CIoU therefore had NO aspect-ratio gradient at all — training with it was
+        // numerically identical to DIoU, so the one term CIoU adds over DIoU contributed nothing. The
+        // engine has no differentiable atan to rebuild v from ops, so the node is recorded here with its
+        // analytic derivative w.r.t. the predicted boxes.
+        DifferentiableOps.RecordUnary("CIoUAspect", v, predicted,
+            BackwardFunctions<T>.CIoUAspectBackward, savedState: new object[] { target });
+
+        // alpha is detached from gradient (constant w.r.t. backward), per the CIoU paper.
         var alpha = StopGradient(new Tensor<T>(alphaData, new[] { n, 1 }));
 
         // CIoU = IoU - distPenalty - alpha * v

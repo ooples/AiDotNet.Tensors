@@ -700,6 +700,23 @@ public static class CuBlasNative
     /// </summary>
     public static void CheckCublasStatus(CublasStatus status, string operation = "cuBLAS operation")
     {
+        // GPU-DISPATCH INSTRUMENTATION. GpuLaunchProbe.OnLaunch() fires at the cuLaunchKernel choke point,
+        // which misses every op implemented with cuBLAS — the residency probe then reports those as CPU
+        // fallbacks even though they run on-device. Instrumenting the individual gemm call sites proved
+        // fragile: they are checked with DIFFERENT message strings ("cublasSgemm" vs
+        // "cublasSgemm(MatMulTransposed)"), so a literal-matching pass instrumented 3 of 8 and left
+        // TensorMatMulTransposed and TensorInner reporting zero launches. This is the one choke point every
+        // cuBLAS call already passes through.
+        //
+        // Filtered to actual COMPUTE (gemm / gemv). Handle creation, cublasSetStream and math-mode calls are
+        // not dispatches and must not inflate the count — the probe's job is distinguishing "ran on the GPU"
+        // from "silently fell back to the CPU".
+        if (operation.IndexOf("gemm", StringComparison.OrdinalIgnoreCase) >= 0
+            || operation.IndexOf("gemv", StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            DirectGpu.GpuLaunchProbe.OnLaunch();
+        }
+
         if (status != CublasStatus.Success)
             throw new InvalidOperationException($"{operation} failed: {GetCublasErrorString(status)}");
     }

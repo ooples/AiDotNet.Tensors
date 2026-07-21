@@ -1251,6 +1251,36 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         }
     }
 
+    public void InterleaveComplex(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer interleaved, int n)
+    {
+        if (n <= 0) return;
+        ValidateComplexLayoutBuffers(real, imag, interleaved, n, nameof(InterleaveComplex));
+        DispatchNBufferAsync("Complex:InterleaveComplex", WebGpuAuditKernels.InterleaveComplex, "main",
+            new IGpuBuffer[] { real, imag, interleaved },
+            new float[] { BitConverter.Int32BitsToSingle(n) }, n).GetAwaiter().GetResult();
+    }
+
+    public void DeinterleaveComplex(IGpuBuffer interleaved, IGpuBuffer real, IGpuBuffer imag, int n)
+    {
+        if (n <= 0) return;
+        ValidateComplexLayoutBuffers(real, imag, interleaved, n, nameof(DeinterleaveComplex));
+        DispatchNBufferAsync("Complex:DeinterleaveComplex", WebGpuAuditKernels.DeinterleaveComplex, "main",
+            new IGpuBuffer[] { interleaved, real, imag },
+            new float[] { BitConverter.Int32BitsToSingle(n) }, n).GetAwaiter().GetResult();
+    }
+
+    private static void ValidateComplexLayoutBuffers(
+        IGpuBuffer real, IGpuBuffer imag, IGpuBuffer interleaved, int n, string opName)
+    {
+        if (real is null) throw new ArgumentNullException(nameof(real));
+        if (imag is null) throw new ArgumentNullException(nameof(imag));
+        if (interleaved is null) throw new ArgumentNullException(nameof(interleaved));
+        long requiredInterleaved = checked((long)n * 2);
+        if (real.Size < n || imag.Size < n || interleaved.Size < requiredInterleaved)
+            throw new ArgumentException(
+                $"{opName}: n ({n}) requires real/imag buffers of at least {n} elements and an interleaved buffer of at least {requiredInterleaved} elements; sizes are real={real.Size}, imag={imag.Size}, interleaved={interleaved.Size}.");
+    }
+
     public void SplitComplexConjugate(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer oR, IGpuBuffer oI, int n)
     {
         if (n <= 0) return;

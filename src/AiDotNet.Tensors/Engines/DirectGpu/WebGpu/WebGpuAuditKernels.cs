@@ -259,6 +259,35 @@ struct P { n: i32, d: i32, p: f32 };
   let outIdx = i * pc.n - (i * (i + 1)) / 2 + (j - i - 1); outp[outIdx] = dist;
 }";
 
+    /// <summary>
+    /// Packs split real/imag into one interleaved [re0, im0, ...] buffer. Not composable from CopyRows,
+    /// which can express real -> interleaved[2i] but has no destination offset for imag -> [2i+1].
+    /// </summary>
+    public static string InterleaveComplex => @"
+@group(0) @binding(0) var<storage, read> realv : array<f32>;
+@group(0) @binding(1) var<storage, read> imagv : array<f32>;
+@group(0) @binding(2) var<storage, read_write> inter : array<f32>;
+struct P { n: i32 };
+@group(0) @binding(3) var<uniform> pc : P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let g = i32(gid.x); if (g >= pc.n) { return; }
+  inter[2 * g] = realv[g];
+  inter[2 * g + 1] = imagv[g];
+}";
+
+    /// <summary>Splits an interleaved complex buffer into separate real/imag buffers.</summary>
+    public static string DeinterleaveComplex => @"
+@group(0) @binding(0) var<storage, read> inter : array<f32>;
+@group(0) @binding(1) var<storage, read_write> realv : array<f32>;
+@group(0) @binding(2) var<storage, read_write> imagv : array<f32>;
+struct P { n: i32 };
+@group(0) @binding(3) var<uniform> pc : P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let g = i32(gid.x); if (g >= pc.n) { return; }
+  realv[g] = inter[2 * g];
+  imagv[g] = inter[2 * g + 1];
+}";
+
     public static string CopyRows => @"
 @group(0) @binding(0) var<storage, read> src : array<f32>;
 @group(0) @binding(1) var<storage, read_write> dst : array<f32>;
