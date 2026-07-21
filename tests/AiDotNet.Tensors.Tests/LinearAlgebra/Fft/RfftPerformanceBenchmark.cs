@@ -59,6 +59,7 @@ public class RfftPerformanceBenchmark
     }
 
     [Fact(Timeout = 600000)]
+    [Trait("Category", "Benchmark")]
     public async Task Benchmark_rfft_irfft()
     {
         await Task.Yield();

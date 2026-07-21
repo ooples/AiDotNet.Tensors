@@ -98,6 +98,7 @@ public class RfftInterleavedAbBenchmark
     }
 
     [Fact(Timeout = 900000)]
+    [Trait("Category", "Benchmark")]
     public async Task Interleaved_ab_legacy_vs_modern()
     {
         await Task.Yield();
