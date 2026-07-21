@@ -669,6 +669,7 @@ public static class CuBlasNative
             CudaResult.NoDevice => "No CUDA device available",
             CudaResult.InvalidDevice => "Invalid device",
             CudaResult.InvalidContext => "Invalid context",
+            CudaResult.InvalidPtx => "Invalid PTX (JIT compilation failed)",
             CudaResult.LaunchFailed => "Kernel launch failed",
             CudaResult.NotReady => "Operation not ready (async operation still in progress)",
             _ => $"Unknown CUDA error ({(int)result})"
