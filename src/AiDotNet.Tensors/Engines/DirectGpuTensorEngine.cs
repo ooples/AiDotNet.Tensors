@@ -6046,7 +6046,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Training grad-accum (opt-in s_residentInPlace) OR inference CUDA-graph capture engage the resident
         // in-place path. Both still require BOTH operands already resident (checked below) — that is what makes
         // it safe (no owned upload to async-free under the kernel, the CUDA-700 the s_residentInPlace gate guarded).
-        if (((s_residentInPlace && InGradAccumulation) || InferenceCaptureActive) && ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
+        // GATE WIDENED (2026-07-20). This used to require (s_residentInPlace && InGradAccumulation) ||
+        // InferenceCaptureActive, plus ResidentStepActive. Outside those windows a RESIDENT `a` fell through
+        // to the host path below — where GetDataArray() returns a DETACHED COPY for a resident tensor, so
+        // the result was written into the copy, discarded, and `true` returned anyway. Silent data loss.
+        //
+        // Doing it on the device whenever BOTH operands are already resident is both the correct and the
+        // fast answer, and it does not reintroduce the CUDA-700 this gate originally guarded: that hazard
+        // came from resolving a NON-resident `b` through an owned upload buffer which the `using` async-freed
+        // under the running kernel. Requiring both operands resident (ResolveResidentBufferNoUpload, which
+        // never uploads) means there is no owned buffer to free, which is exactly the invariant the original
+        // comment identifies as making this safe.
+        if (!Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
             && a.IsContiguous && b.IsContiguous && a.Length == b.Length
             && ResolveResidentBufferNoUpload(backend, a, a.Length) is { } aResident
             && ResolveResidentBufferNoUpload(backend, b, b.Length) is { } bResident
@@ -6070,6 +6081,26 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 /* fall through to the host-download path below */
             }
         }
+
+        // CORRECTNESS GATE. TensorBase.GetDataArray() returns the LIVE backing array only for eager,
+        // simple-layout CPU tensors; for a lazy or GPU-RESIDENT tensor it falls back to ToArray(), which is
+        // a DETACHED COPY. The copy-back at the end of this method then writes the result into that copy,
+        // `a` keeps its old values, and we still `return true` — so TensorAddInPlace never falls back to the
+        // correct CPU path. The mutation is silently discarded.
+        //
+        // Measured on `x / norm(x)`, where d/dx accumulates two contributions:
+        //   contribution 1 (stored) 0.12138654, 0.12969194, ...
+        //   contribution 2 (added) -0.10327634, -0.041310538, ...
+        //   CPU result              0.0181102   (= 1 + 2, correct)
+        //   GPU result              0.121387    (= 1 only — the add vanished)
+        // Every multi-path gradient on the GPU lost all but its first contribution this way, which is
+        // silent wrong-gradient corruption rather than a crash.
+        //
+        // Bail to the base implementation whenever `a` is not writable in place. The resident fast path
+        // above is unaffected: it mutates a's device buffer and rebinds via BindResidentBuffer, which is
+        // the legitimate in-place route for a resident tensor.
+        if (a.GetLiveBackingArrayOrNull() is null)
+            return false;
 
         var aData = a.GetDataArray();
         var bData = b.GetDataArray();
@@ -6118,6 +6149,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (!TryGetBackend(out var backend))
             return false;
+
+        // Same correctness problem as TryRunBinaryInPlace: GetDataArray() hands back a DETACHED COPY for a
+        // lazy / GPU-resident tensor, so the copy-back below lands in the copy, the tensor keeps its old
+        // values, and `true` is still returned — suppressing the CPU fallback. Silent data loss.
+        //
+        // Route those to the resident variant rather than bailing. Bailing would be correct but would drop
+        // the tensor off the device (it fell back to the CPU base), which regressed
+        // GpuResidencyProbeTests.DropoutEvaluation_ReturnsResidentOutputAndMask. TryRunUnaryInPlaceResident
+        // runs buf->buf and keeps that buffer authoritative, which is precisely the case its own summary
+        // describes: "downloading them and mutating a temporary re-upload leaves the tensor bound to its
+        // original, unmodified device buffer."
+        if (tensor.GetLiveBackingArrayOrNull() is null)
+            return TryRunUnaryInPlaceResident(tensor, op);
 
         var data = tensor.GetDataArray();
         using var buffer = GetOrAllocateBuffer(backend, data);
