@@ -5,6 +5,7 @@ param(
     [string]$OutputDirectory = (Join-Path ([System.IO.Path]::GetTempPath()) ("aidotnet-direct-ptx-evidence-" + (Get-Date -Format 'yyyyMMdd-HHmmss'))),
     [switch]$SkipBuild,
     [switch]$SkipExternal,
+    [switch]$Issue834Only,
     [switch]$AllowDirty
 )
 
@@ -12,8 +13,69 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
 $project = Join-Path $repoRoot 'tests\AiDotNet.Tensors.Benchmarks\AiDotNet.Tensors.Benchmarks.csproj'
 $targetDll = Join-Path $repoRoot 'tests\AiDotNet.Tensors.Benchmarks\bin\Release\net10.0\AiDotNet.Tensors.Benchmarks.dll'
+$pythonRoot = Join-Path $repoRoot 'tests\AiDotNet.Tensors.Benchmarks\BaselineRunners\py'
 $evidenceRoot = [System.IO.Path]::GetFullPath($OutputDirectory)
 [System.IO.Directory]::CreateDirectory($evidenceRoot) | Out-Null
+
+function New-EvidenceSuite([string]$Name, [string]$Command, [string[]]$Arguments) {
+    [pscustomobject]@{
+        Name = $Name
+        Command = $Command
+        Arguments = $Arguments
+    }
+}
+
+function Format-Command([string]$Command, [string[]]$Arguments) {
+    $quoted = @($Arguments | ForEach-Object {
+        if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
+    })
+    return (@($Command) + $quoted) -join ' '
+}
+
+function Get-GpuSnapshot {
+    $output = & nvidia-smi `
+        '--query-gpu=name,uuid,driver_version,pstate,clocks.sm,clocks.mem,temperature.gpu,power.draw,power.limit,utilization.gpu,memory.used' `
+        '--format=csv,noheader,nounits' 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "nvidia-smi snapshot failed: $output" }
+    return ($output -join [Environment]::NewLine).Trim()
+}
+
+function Assert-GpuReady([string]$Label) {
+    $status = & nvidia-smi '--query-gpu=utilization.gpu,memory.used,temperature.gpu' '--format=csv,noheader,nounits' 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "[$Label] nvidia-smi status failed: $status" }
+    $cells = @((($status -join '') -split ',') | ForEach-Object { $_.Trim() })
+    if ($cells.Count -ge 3) {
+        $utilization = 0
+        $usedMegabytes = 0
+        $temperatureCelsius = 0
+        if ([int]::TryParse($cells[0], [ref]$utilization) -and
+            [int]::TryParse($cells[1], [ref]$usedMegabytes) -and
+            [int]::TryParse($cells[2], [ref]$temperatureCelsius) -and
+            ($utilization -gt 20 -or $usedMegabytes -gt 2048 -or $temperatureCelsius -gt 75)) {
+            throw "[$Label] GPU is not benchmark-ready (utilization=$utilization%, memory.used=$usedMegabytes MiB, temperature=$temperatureCelsius C)."
+        }
+    }
+
+    $pmon = @(& nvidia-smi pmon -c 1 -s u 2>&1)
+    if ($LASTEXITCODE -ne 0) { throw "[$Label] nvidia-smi pmon failed: $($pmon -join ' ')" }
+    $conflicts = @()
+    foreach ($line in $pmon) {
+        $trimmed = $line.Trim()
+        if (-not $trimmed -or $trimmed.StartsWith('#')) { continue }
+        $parts = $trimmed -split '\s+'
+        if ($parts.Count -lt 9) { continue }
+        $processType = $parts[2]
+        $smPercent = 0
+        $isComputeOnly = $processType -eq 'C'
+        $isActiveMixed = $processType.Contains('C') -and [int]::TryParse($parts[3], [ref]$smPercent) -and $smPercent -gt 5
+        if ($isComputeOnly -or $isActiveMixed) {
+            $conflicts += "pid=$($parts[1]) $($parts[-1]) type=$processType sm=$($parts[3])%"
+        }
+    }
+    if ($conflicts.Count -ne 0) {
+        throw "[$Label] Foreign GPU workload detected; clean benchmark refused: $($conflicts -join '; ')"
+    }
+}
 
 Push-Location $repoRoot
 try {
@@ -38,34 +100,71 @@ try {
         throw "Benchmark target is missing at '$targetDll'."
     }
 
-    $suites = [ordered]@{
-        'online-attention' = '--direct-ptx-online-attention'
-        'gpu-matrix' = '--direct-ptx-gpu-matrix'
-        'residual-rmsnorm' = '--direct-ptx-residual-rmsnorm'
-    }
-    if (-not $SkipExternal) {
-        $suites['external-gpu-baselines'] = '--direct-ptx-external-gpu-baselines'
+    $suites = [System.Collections.Generic.List[object]]::new()
+    if (-not $Issue834Only) {
+        $suites.Add((New-EvidenceSuite 'online-attention' 'dotnet' @($targetDll, '--direct-ptx-online-attention')))
+        $suites.Add((New-EvidenceSuite 'gpu-matrix' 'dotnet' @($targetDll, '--direct-ptx-gpu-matrix')))
+        $suites.Add((New-EvidenceSuite 'residual-rmsnorm' 'dotnet' @($targetDll, '--direct-ptx-residual-rmsnorm')))
+        if (-not $SkipExternal) {
+            $suites.Add((New-EvidenceSuite 'external-gpu-baselines' 'dotnet' @($targetDll, '--direct-ptx-external-gpu-baselines')))
+        }
     }
 
-    for ($run = 1; $run -le $Runs; $run++) {
-        foreach ($suite in $suites.GetEnumerator()) {
-            $log = Join-Path $evidenceRoot ("run-{0:D2}-{1}.log" -f $run, $suite.Key)
-            "# independent process $run/$Runs; suite=$($suite.Key); started_utc=$([DateTime]::UtcNow.ToString('O'))" |
-                Set-Content -LiteralPath $log -Encoding utf8
-            "# command=dotnet `"$targetDll`" $($suite.Value)" |
-                Add-Content -LiteralPath $log -Encoding utf8
-            # Do not mirror the wide TUI to a GPU-accelerated terminal while a
-            # later shape is being measured. The complete output remains in the
-            # immutable per-process log and is printed only after capture ends.
-            & dotnet $targetDll $suite.Value 2>&1 |
-                Out-File -LiteralPath $log -Append -Encoding utf8
-            $exitCode = $LASTEXITCODE
-            "# completed_utc=$([DateTime]::UtcNow.ToString('O')); exit_code=$exitCode" |
-                Add-Content -LiteralPath $log -Encoding utf8
-            if ($exitCode -ne 0) {
-                throw "Evidence suite '$($suite.Key)' run $run failed with exit code $exitCode. See '$log'."
+    $suites.Add((New-EvidenceSuite 'attention-family' 'dotnet' @($targetDll, '--direct-ptx-attention-family', '1')))
+    $suites.Add((New-EvidenceSuite 'decode' 'dotnet' @($targetDll, '--direct-ptx-decode', '1')))
+    $suites.Add((New-EvidenceSuite 'paged-prefill' 'dotnet' @($targetDll, '--direct-ptx-paged-prefill', '1')))
+    $suites.Add((New-EvidenceSuite 'attention-backward' 'dotnet' @($targetDll, '--direct-ptx-attention-backward', '1')))
+    $suites.Add((New-EvidenceSuite 'flash-attention-backward' 'dotnet' @($targetDll, '--direct-ptx-flash-attention-backward', '1')))
+
+    if (-not $SkipExternal) {
+        $python = (Get-Command python -ErrorAction Stop).Source
+        $suites.Add((New-EvidenceSuite 'attention-family-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_attention_family_competitors.py'), '--runs', '1')))
+        $suites.Add((New-EvidenceSuite 'decode-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_decode_competitors.py'), '--runs', '1')))
+        $suites.Add((New-EvidenceSuite 'paged-prefill-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_paged_prefill_competitors.py'), '--runs', '1')))
+        $suites.Add((New-EvidenceSuite 'attention-backward-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_attention_backward_competitors.py'), '--runs', '1')))
+        $suites.Add((New-EvidenceSuite 'flash-attention-backward-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_flash_attention_backward_competitors.py'), '--runs', '1')))
+    }
+
+    $previousDirectPtx = $env:AIDOTNET_DIRECT_PTX
+    $previousAutotune = $env:AIDOTNET_DIRECT_PTX_AUTOTUNE
+    $env:AIDOTNET_DIRECT_PTX = '1'
+    $env:AIDOTNET_DIRECT_PTX_AUTOTUNE = '0'
+    try {
+        for ($run = 1; $run -le $Runs; $run++) {
+            foreach ($suite in $suites) {
+                $label = "run-$('{0:D2}' -f $run)-$($suite.Name)"
+                Assert-GpuReady "$label-start"
+                $log = Join-Path $evidenceRoot ("{0}.log" -f $label)
+                "# independent process $run/$Runs; suite=$($suite.Name); started_utc=$([DateTime]::UtcNow.ToString('O'))" |
+                    Set-Content -LiteralPath $log -Encoding utf8
+                "# git_commit=$gitCommit; dirty_worktree=$($dirtyLines.Count -ne 0); AIDOTNET_DIRECT_PTX=1; AIDOTNET_DIRECT_PTX_AUTOTUNE=0" |
+                    Add-Content -LiteralPath $log -Encoding utf8
+                "# host_os=$([System.Runtime.InteropServices.RuntimeInformation]::OSDescription); powershell=$($PSVersionTable.PSVersion); dotnet=$(& dotnet --version)" |
+                    Add-Content -LiteralPath $log -Encoding utf8
+                "# GPU name, uuid, driver, pstate, SM MHz, memory MHz, C, W, limit W, utilization %, memory MiB: $(Get-GpuSnapshot)" |
+                    Add-Content -LiteralPath $log -Encoding utf8
+                "# command=$(Format-Command $suite.Command $suite.Arguments)" |
+                    Add-Content -LiteralPath $log -Encoding utf8
+
+                # Keep the GPU-accelerated terminal out of the measured interval.
+                # The complete TUI is emitted only to the immutable process log.
+                $arguments = $suite.Arguments
+                & $suite.Command @arguments 2>&1 |
+                    Out-File -LiteralPath $log -Append -Encoding utf8
+                $exitCode = $LASTEXITCODE
+                Assert-GpuReady "$label-end"
+                "# ending_gpu=$(Get-GpuSnapshot)" | Add-Content -LiteralPath $log -Encoding utf8
+                "# completed_utc=$([DateTime]::UtcNow.ToString('O')); exit_code=$exitCode" |
+                    Add-Content -LiteralPath $log -Encoding utf8
+                if ($exitCode -ne 0) {
+                    throw "Evidence suite '$($suite.Name)' run $run failed with exit code $exitCode. See '$log'."
+                }
             }
         }
+    }
+    finally {
+        $env:AIDOTNET_DIRECT_PTX = $previousDirectPtx
+        $env:AIDOTNET_DIRECT_PTX_AUTOTUNE = $previousAutotune
     }
 
     $files = Get-ChildItem -LiteralPath $evidenceRoot -Filter '*.log' | Sort-Object Name | ForEach-Object {
@@ -77,19 +176,22 @@ try {
         git_commit = $gitCommit
         dirty_worktree = $dirtyLines.Count -ne 0
         requested_independent_runs = $Runs
+        issue_834_only = [bool]$Issue834Only
         external_gpu_baselines_included = -not [bool]$SkipExternal
+        feature_gates = [ordered]@{
+            AIDOTNET_DIRECT_PTX = '1'
+            AIDOTNET_DIRECT_PTX_AUTOTUNE = '0'
+        }
         commands = [ordered]@{
             build = "dotnet build `"$project`" -c Release -f net10.0"
-            suites = @($suites.GetEnumerator() | ForEach-Object {
-                "dotnet `"$targetDll`" $($_.Value)"
-            })
+            suites = @($suites | ForEach-Object { Format-Command $_.Command $_.Arguments })
         }
         files = @($files)
-    } | ConvertTo-Json -Depth 4
+    } | ConvertTo-Json -Depth 5
     $manifestPath = Join-Path $evidenceRoot 'manifest.json'
     [System.IO.File]::WriteAllText($manifestPath, $manifest + [Environment]::NewLine)
     Write-Host "Evidence capture completed: $evidenceRoot"
-    Write-Host "Run both Nsight targets separately; performance-counter access is a mandatory release gate."
+    Write-Host 'Run both Nsight targets separately; performance-counter access is a mandatory release gate.'
 }
 finally {
     Pop-Location

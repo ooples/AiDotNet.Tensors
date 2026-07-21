@@ -105,9 +105,9 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
             throw new ArgumentOutOfRangeException(nameof(queryHeads), "The flattened query-head grid exceeds CUDA grid-y.");
         if (!float.IsFinite(scale)) throw new ArgumentOutOfRangeException(nameof(scale));
         if (!float.IsFinite(epsilon) || epsilon <= 0) throw new ArgumentOutOfRangeException(nameof(epsilon));
-        if (causalQueryOffset < 0)
+        if (causalQueryOffset < -querySequence)
             throw new ArgumentOutOfRangeException(
-                nameof(causalQueryOffset), "Negative causal query offsets require a fully-masked-row specialization.");
+                nameof(causalQueryOffset), "The causal offset cannot fully mask every query row.");
         if (!isCausal && causalQueryOffset != 0)
             throw new ArgumentException("A causal query offset is valid only for a causal specialization.", nameof(causalQueryOffset));
         if (!IsSupportedSequenceLength(querySequence))
@@ -335,7 +335,7 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
         if (queryHeads <= 0) throw new ArgumentOutOfRangeException(nameof(queryHeads));
         if (keyValueHeads <= 0 || queryHeads % keyValueHeads != 0)
             throw new ArgumentOutOfRangeException(nameof(keyValueHeads));
-        if (causalQueryOffset < 0)
+        if (causalQueryOffset < -querySequence)
             throw new ArgumentOutOfRangeException(nameof(causalQueryOffset));
         if (!isCausal && causalQueryOffset != 0)
             throw new ArgumentException("Causal query offset requires causal masking.", nameof(causalQueryOffset));
@@ -418,10 +418,18 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
         ptx.AppendLine("    shl.b32 %r7, %r1, 4;");
         ptx.AppendLine("    add.u32 %r8, %r7, %r3;"); // global query row 0
         ptx.AppendLine("    add.u32 %r9, %r8, 8;"); // global query row 1
-        if (causalQueryOffset != 0)
+        if (causalQueryOffset > 0)
         {
             ptx.AppendLine($"    add.u32 %r8, %r8, {causalQueryOffset};");
             ptx.AppendLine($"    add.u32 %r9, %r9, {causalQueryOffset};");
+        }
+        else if (causalQueryOffset < 0)
+        {
+            int leadingMaskedRows = -causalQueryOffset;
+            ptx.AppendLine($"    setp.ge.u32 %p4, %r8, {leadingMaskedRows};");
+            ptx.AppendLine($"    setp.ge.u32 %p5, %r9, {leadingMaskedRows};");
+            ptx.AppendLine($"    sub.u32 %r8, %r8, {leadingMaskedRows};");
+            ptx.AppendLine($"    sub.u32 %r9, %r9, {leadingMaskedRows};");
         }
         // Shared symbols are already addresses in the shared state space. PTX
         // cvta.to requires a generic-address register source, so use mov for
@@ -506,7 +514,7 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
                 ptx.AppendLine("    cp.async.commit_group;");
             }
 
-            if (isCausal)
+            if (isCausal && causalQueryOffset >= 0)
             {
                 int skipTileOffset = (causalQueryOffset + KeyTileRows - 1) / KeyTileRows;
                 if (skipTileOffset == 0)
@@ -520,7 +528,7 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
             }
             EmitScoreTile(ptx, currentK, tile, isCausal, scaleHex);
             EmitOnlineSoftmaxAndPv(ptx, currentV, log2E, firstTile: tile == 0);
-            if (isCausal)
+            if (isCausal && causalQueryOffset >= 0)
                 ptx.AppendLine($"SKIP_CAUSAL_TILE_{tile}:");
 
             if (tile + 1 < keyValueTiles)
@@ -542,6 +550,17 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
             ptx.AppendLine($"    mul.rn.f32 %o{o + 2}, %o{o + 2}, %f15;");
             ptx.AppendLine($"    mul.rn.f32 %o{o + 3}, %o{o + 3}, %f15;");
         }
+        if (causalQueryOffset < 0)
+        {
+            for (int n = 0; n < 8; n++)
+            {
+                int o = n * 4;
+                ptx.AppendLine($"    @!%p4 mov.f32 %o{o}, 0f00000000;");
+                ptx.AppendLine($"    @!%p4 mov.f32 %o{o + 1}, 0f00000000;");
+                ptx.AppendLine($"    @!%p5 mov.f32 %o{o + 2}, 0f00000000;");
+                ptx.AppendLine($"    @!%p5 mov.f32 %o{o + 3}, 0f00000000;");
+            }
+        }
         if (emitSoftmaxStats)
         {
             ptx.AppendLine("    setp.eq.u32 %p0, %r4, 0;");
@@ -549,6 +568,11 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
             ptx.AppendLine($"    fma.rn.f32 %f16, %f16, {ln2}, %f3;");
             ptx.AppendLine("    lg2.approx.f32 %f17, %f6;");
             ptx.AppendLine($"    fma.rn.f32 %f17, %f17, {ln2}, %f4;");
+            if (causalQueryOffset < 0)
+            {
+                ptx.AppendLine("    @!%p4 mov.f32 %f16, 0fFF800000;");
+                ptx.AppendLine("    @!%p5 mov.f32 %f17, 0fFF800000;");
+            }
             ptx.AppendLine("    mul.wide.u32 %rd18, %r3, 4;");
             ptx.AppendLine("    add.u64 %rd18, %rd6, %rd18;");
             ptx.AppendLine("    @%p0 st.global.f32 [%rd18], %f16;");

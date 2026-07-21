@@ -58,9 +58,6 @@ internal static class DirectPtxAttentionFamilyExperiment
             foreach (Shape shape in Shapes)
             foreach (bool causal in new[] { false, true })
             {
-                // Current SDPA bottom-right alignment yields leading fully-masked
-                // rows when Sq > Skv. That requires a separate zero-row PTX path.
-                if (causal && shape.QuerySequence > shape.KeyValueSequence) continue;
                 RunCell(backend, run, shape, causal);
             }
         }

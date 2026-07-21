@@ -113,8 +113,6 @@ def main():
             k = (torch.rand((batch, hkv, skv, D), device=device, dtype=torch.float16) - 0.5) * 0.5
             v = (torch.rand((batch, hkv, skv, D), device=device, dtype=torch.float16) - 0.5) * 0.5
             for causal in (False, True):
-                if causal and sq > skv:
-                    continue
                 mask = bottom_right_causal_mask(sq, skv, device) if causal else None
 
                 def operation():

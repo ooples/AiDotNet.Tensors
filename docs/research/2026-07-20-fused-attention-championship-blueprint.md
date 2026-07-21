@@ -545,7 +545,7 @@ attribute remains the available zero-spill admission proof for this capture.
 | CUDA graph capture | Caller-owned-buffer direct launches are allowed only after explicit prewarm; capture-time JIT/cache misses fail closed, and allocating high-level routes retain their established behavior |
 | SM other than 8.6 | Gate disabled until that SM target is separately tuned and proven |
 | Driver JIT reports local bytes | Module rejected and fallback |
-| Rectangular causal | Separate baked domains: FlashAttentionV2 top-left (`offset=0`), SDPA bottom-right (`offset=Skv-Sq`); negative offsets remain fail-closed until fully-masked leading rows have a dedicated specialization |
+| Rectangular causal | Separate baked domains: FlashAttentionV2 top-left (`offset=0`) and SDPA bottom-right (`offset=Skv-Sq`); negative offsets emit zero output and `-inf` LSE for fully masked leading rows |
 | Causal future K/V tile | Compute skipped per owning query warp |
 | Inference output-only | No score, probability, or LSE global store |
 | Materialized-probability backward, FP32 D64, supported shape/head map | Three-entry deterministic direct PTX; final dQ allocation supplies the row-delta workspace |

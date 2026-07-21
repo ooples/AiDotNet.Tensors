@@ -196,9 +196,9 @@ public sealed partial class CudaBackend
     {
         if (!IsDirectPtxAttentionEnabled)
             return false;
-        if (causalQueryOffset < 0)
+        if (causalQueryOffset < -querySequence)
         {
-            DirectPtxLastError = "causal-query-offset-negative-not-implemented";
+            DirectPtxLastError = "causal-query-offset-outside-query-domain";
             return false;
         }
         if (!isCausal && causalQueryOffset != 0)
@@ -1248,14 +1248,15 @@ public sealed partial class CudaBackend
         int causalQueryOffset = 0)
     {
         if (!IsDirectPtxAttentionEnabled || IsStreamCapturing()) return false;
-        if (causalQueryOffset < 0)
+        if (causalQueryOffset < -querySequence)
         {
-            DirectPtxLastError = "causal-query-offset-negative-not-implemented";
+            DirectPtxLastError = "causal-query-offset-outside-query-domain";
             return false;
         }
         DirectPtxEligibilityResult eligibility = DirectPtxAttentionEligibility.Evaluate(
             new DirectPtxAttentionRequest(
                 DirectPtxArchitecture.Classify(_ccMajor, _ccMinor),
+                _ccMajor, _ccMinor,
                 DirectPtxPhysicalType.Float16, DirectPtxPhysicalLayout.Bhsd,
                 batch, queryHeads, keyValueHeads, querySequence, keyValueSequence,
                 PtxOnlineFusedAttention128x64Kernel.HeadDimension,

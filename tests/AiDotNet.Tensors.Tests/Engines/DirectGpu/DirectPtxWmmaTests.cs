@@ -411,6 +411,7 @@ public class DirectPtxWmmaTests
     [InlineData(2, 8, 1, 32, 64, true, 0)]
     [InlineData(2, 8, 2, 32, 64, true, 32)]
     [InlineData(1, 4, 4, 128, 32, true, 0)]
+    [InlineData(1, 4, 2, 128, 64, true, -64)]
     public void DriverOnlyOnlineAttentionFamily_MatchesRectangularGqaOracleAndHasZeroLocalBytes(
         int batch, int queryHeads, int keyValueHeads,
         int querySequence, int keyValueSequence, bool isCausal, int causalQueryOffset)
@@ -1995,7 +1996,7 @@ public class DirectPtxWmmaTests
             Assert.True(cacheAllocated == 0, $"cache audit allocated {cacheAllocated} bytes");
 
             var eligibilityRequest = new DirectPtxAttentionRequest(
-                DirectPtxArchitectureFamily.Ampere, DirectPtxPhysicalType.Float16,
+                DirectPtxArchitectureFamily.Ampere, 8, 6, DirectPtxPhysicalType.Float16,
                 DirectPtxPhysicalLayout.Bhsd, batch, queryHeads, keyValueHeads,
                 querySequence, keyValueSequence, 64, DirectPtxAttentionMaskKind.None,
                 DirectPtxAttentionPhase.Inference, 0, false, false);
@@ -2447,9 +2448,15 @@ public class DirectPtxWmmaTests
                     maxOutputError = MathF.Max(maxOutputError,
                         MathF.Abs(actual[queryBase + d] - expected));
                 }
-                float expectedStats = maximum + MathF.Log(sum);
-                maxStatsError = MathF.Max(maxStatsError,
-                    MathF.Abs(actualStats[flatQueryHead * querySequence + row] - expectedStats));
+                float actualRowStats = actualStats[flatQueryHead * querySequence + row];
+                if (lastKey < 0)
+                    Assert.Equal(float.NegativeInfinity, actualRowStats);
+                else
+                {
+                    float expectedStats = maximum + MathF.Log(sum);
+                    maxStatsError = MathF.Max(maxStatsError,
+                        MathF.Abs(actualRowStats - expectedStats));
+                }
             }
         }
         return (maxOutputError, maxStatsError);
