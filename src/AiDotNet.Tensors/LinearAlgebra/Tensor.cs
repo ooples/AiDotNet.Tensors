@@ -4357,7 +4357,14 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
                     $"Use To(DeviceInfo.{actualType}({deviceInfo.Index})) instead.");
         }
 
-        var backend = Engines.DirectGpu.DirectGpuEngine.CreateBackendForDevice(deviceInfo.Index);
+        // Place onto the SAME backend the active dispatcher executes on, so placement and execution can't
+        // diverge (a tensor moved here is used by ops running on AiDotNetEngine.Current). Fall back to the
+        // global per-device backend registry only when the current engine is not a GPU dispatcher.
+        Engines.DirectGpu.IDirectGpuBackend? backend =
+            Engines.AiDotNetEngine.Current is Engines.DirectGpuTensorEngine dispatcher
+                ? dispatcher.PlacementBackend
+                : null;
+        backend ??= Engines.DirectGpu.DirectGpuEngine.CreateBackendForDevice(deviceInfo.Index);
         if (backend is null)
             throw new InvalidOperationException($"No GPU backend available at device index {deviceInfo.Index}.");
 

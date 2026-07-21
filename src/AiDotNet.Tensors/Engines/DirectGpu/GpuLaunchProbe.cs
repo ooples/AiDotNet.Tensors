@@ -120,12 +120,17 @@ internal static class GpuLaunchProbe
             entry => $"{entry.Value}x {entry.Key}"));
 
     /// <summary>Records one silent GPU-to-CPU fallback. <paramref name="reason"/> is the caught exception, or
-    /// null when a guard (unsupported rank/dtype/backend) declined the device path before attempting it.</summary>
+    /// null when a guard or route declined the device path before attempting it.</summary>
     public static void OnFallback(string op, System.Exception? reason)
     {
+        // Diagnostic keys must have bounded cardinality. Callers may append tensor shapes or route details
+        // after a colon, and exception messages often contain input-specific values; retaining either in the
+        // process-wide dictionary would allow a long-running workload to create an unbounded number of keys.
+        int detailSeparator = op.IndexOf(':');
+        string operation = detailSeparator >= 0 ? op.Substring(0, detailSeparator) : op;
         string key = reason is null
-            ? $"{op}: guard declined (unsupported rank/dtype/backend)"
-            : $"{op}: {reason.GetType().Name}: {reason.Message}";
+            ? $"{operation}: guard or route declined"
+            : $"{operation}: {reason.GetType().Name}";
         _fallbacks.AddOrUpdate(key, 1, static (_, count) => count + 1);
     }
 

@@ -178,7 +178,22 @@ fn mul_scalar(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn pow_scalar(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < params.size) {
-        B[idx] = pow(A[idx], params.scalar);
+        let x = A[idx];
+        let exponent = params.scalar;
+        // WGSL pow is undefined for a negative base. Integral exponents are
+        // valid, so evaluate |x|^exponent and restore odd parity.
+        if (x < 0.0) {
+            if (exponent == trunc(exponent)) {
+                let magnitude = pow(-x, exponent);
+                let abs_exponent = abs(exponent);
+                let is_odd = (abs_exponent - 2.0 * floor(abs_exponent * 0.5)) == 1.0;
+                B[idx] = select(magnitude, -magnitude, is_odd);
+            } else {
+                B[idx] = bitcast<f32>(0x7fc00000u);
+            }
+        } else {
+            B[idx] = pow(x, exponent);
+        }
     }
 }
 
@@ -188,6 +203,46 @@ fn clamp_scalar(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (idx < params.size) {
         B[idx] = clamp(A[idx], -params.scalar, params.scalar);
     }
+}
+";
+
+    /// <summary>
+    /// Fused interleaved Rotary Position Embedding (RoPE) — GPT-NeoX / LLaMA / GGML variant.
+    /// Rotates each adjacent dim pair (2i, 2i+1) of every [rows, headDim] row. One invocation per (row, pair).
+    /// </summary>
+    public const string RopeSource = @"
+@group(0) @binding(0) var<storage, read> inputBuf: array<f32>;
+@group(0) @binding(1) var<storage, read> cosCache: array<f32>;
+@group(0) @binding(2) var<storage, read> sinCache: array<f32>;
+@group(0) @binding(3) var<storage, read_write> outputBuf: array<f32>;
+
+struct RopeParams {
+    rows: u32,
+    headDim: u32,
+    seqLen: u32,
+    startPosition: u32,
+}
+@group(0) @binding(4) var<uniform> params: RopeParams;
+
+@compute @workgroup_size(256)
+fn rope_interleaved(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let halfDim = params.headDim / 2u;
+    let g = gid.x;
+    if (g >= params.rows * halfDim) {
+        return;
+    }
+    let i = g % halfDim;
+    let row = g / halfDim;
+    let s = row % params.seqLen;
+    let pos = params.startPosition + s;
+    let baseIdx = row * params.headDim;
+    let cacheIdx = pos * halfDim + i;
+    let c = cosCache[cacheIdx];
+    let sn = sinCache[cacheIdx];
+    let xEven = inputBuf[baseIdx + 2u * i];
+    let xOdd = inputBuf[baseIdx + 2u * i + 1u];
+    outputBuf[baseIdx + 2u * i] = xEven * c - xOdd * sn;
+    outputBuf[baseIdx + 2u * i + 1u] = xEven * sn + xOdd * c;
 }
 ";
 
@@ -4592,7 +4647,9 @@ struct AttentionForwardParams {
 @group(0) @binding(7) var<uniform> attention_params: AttentionForwardParams;
 
 fn attention_forward_excluded(b: u32, q_head: u32, q_pos: u32, k_pos: u32) -> bool {
-    if (attention_params.is_causal != 0u && k_pos > q_pos) { return true; }
+    // KV-cache causal offset: query q_pos sits at absolute position q_pos + (seq_k - seq_q); seq_q==seq_k
+    // collapses to k_pos > q_pos (prefill), while a decode step attends to the whole cached prefix.
+    if (attention_params.is_causal != 0u && k_pos > q_pos + (attention_params.seq_k - attention_params.seq_q)) { return true; }
     if (attention_params.boolean_mask_mode == 0u) { return false; }
     var mask_base: u32 = 0u;
     if (attention_params.boolean_mask_mode == 2u) {
@@ -6192,7 +6249,8 @@ fn squash(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var d: u32 = 0u; d < params.capsule_dim; d = d + 1u) {
         sq = sq + input[off + d] * input[off + d];
     }
-    let scale = sq / ((1.0 + sq) * sqrt(sq + params.epsilon));
+    let denominator = (1.0 + sq) * (sqrt(sq) + params.epsilon);
+    let scale = select(0.0, sq / denominator, denominator != 0.0);
     for (var d: u32 = 0u; d < params.capsule_dim; d = d + 1u) {
         output[off + d] = input[off + d] * scale;
     }
@@ -10856,10 +10914,14 @@ fn squash_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
         sq_norm = sq_norm + x * x;
         dot = dot + x * csb_grad_output[base + d];
     }
-    let norm = sqrt(sq_norm + csb_params.epsilon);
-    let scale = sq_norm / ((1.0 + sq_norm) * norm);
-    let dscale = 1.0 / ((1.0 + sq_norm) * (1.0 + sq_norm) * norm);
-    csb_grad_input[idx] = scale * csb_grad_output[idx] - dscale * csb_input[idx] * dot;
+    let norm = sqrt(sq_norm);
+    let norm_plus_epsilon = norm + csb_params.epsilon;
+    let denominator = (1.0 + sq_norm) * norm_plus_epsilon;
+    let valid = denominator != 0.0;
+    let scale = select(0.0, sq_norm / denominator, valid);
+    let coefficient = select(0.0,
+        (norm + 2.0 * csb_params.epsilon - sq_norm * norm) / (denominator * denominator), valid);
+    csb_grad_input[idx] = scale * csb_grad_output[idx] + coefficient * csb_input[idx] * dot;
 }
 ";
 

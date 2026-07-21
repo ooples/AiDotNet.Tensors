@@ -3,6 +3,7 @@
 #if !NETFRAMEWORK
 
 using System;
+using System.Collections.Generic;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -24,6 +25,9 @@ public enum GpuProbeExpectation
 /// </summary>
 public sealed class OpInput
 {
+    [ThreadStatic]
+    private static List<Tensor<float>>? s_floatInputCapture;
+
     private readonly double[] _data;
     public int[] Shape { get; }
 
@@ -51,7 +55,35 @@ public sealed class OpInput
     {
         var f = new float[_data.Length];
         for (int i = 0; i < _data.Length; i++) f[i] = (float)_data[i];
-        return new Tensor<float>(f, (int[])Shape.Clone());
+        var tensor = new Tensor<float>(f, (int[])Shape.Clone());
+        s_floatInputCapture?.Add(tensor);
+        return tensor;
+    }
+
+    /// <summary>
+    /// Captures the registry inputs materialized by <see cref="F"/> during one parity run. Their materialization
+    /// order is stable across CPU and GPU runs, providing a contract identity that cannot be confused by two
+    /// distinct leaves with identical contents.
+    /// </summary>
+    internal static IDisposable CaptureFloatInputs(List<Tensor<float>> destination)
+    {
+        if (destination is null) throw new ArgumentNullException(nameof(destination));
+        var previous = s_floatInputCapture;
+        s_floatInputCapture = destination;
+        return new FloatInputCaptureScope(previous);
+    }
+
+    private sealed class FloatInputCaptureScope : IDisposable
+    {
+        private List<Tensor<float>>? _previous;
+
+        public FloatInputCaptureScope(List<Tensor<float>>? previous) => _previous = previous;
+
+        public void Dispose()
+        {
+            s_floatInputCapture = _previous;
+            _previous = null;
+        }
     }
 
     public Tensor<double> D() => new Tensor<double>((double[])_data.Clone(), (int[])Shape.Clone());

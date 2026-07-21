@@ -171,7 +171,7 @@ public partial class CpuEngine
         }
         else
         {
-            lossValue = FusedCeLossGeneric<T>(logits.GetDataArray()!, target.GetDataArray()!, n, vocab);
+            lossValue = FusedCeLossGeneric<T>(logitData, target.GetDataArray()!, n, vocab);
         }
 
         var output = new Tensor<T>(new[] { 1 }); // scalar loss (length-1)

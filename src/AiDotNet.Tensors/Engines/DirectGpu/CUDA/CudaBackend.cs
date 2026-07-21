@@ -3259,6 +3259,20 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void TileBatch(IGpuBuffer input, IGpuBuffer output, int repeats, int innerSize)
     {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (repeats <= 0) throw new ArgumentOutOfRangeException(nameof(repeats), repeats, "repeats must be positive.");
+        if (innerSize <= 0) throw new ArgumentOutOfRangeException(nameof(innerSize), innerSize, "innerSize must be positive.");
+        long requiredOutput = checked((long)innerSize * repeats);
+        if (input.Size < innerSize)
+            throw new ArgumentException(
+                $"input buffer too small: expected at least {innerSize} elements, got {input.Size}.",
+                nameof(input));
+        if (output.Size < requiredOutput)
+            throw new ArgumentException(
+                $"output buffer too small: expected at least {requiredOutput} elements, got {output.Size}.",
+                nameof(output));
+
         // Contract (from the mean-pool-backward call site): out[i * repeats + r] = in[i]
         // for i in [0, innerSize), r in [0, repeats); total = innerSize * repeats.
         //
@@ -7456,9 +7470,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // Both kernels index with (idx / (W*H)) % C and use instanceSize = H*W, so only the PRODUCT H*W
         // matters — passing H = spatialSize, W = 1 is exact and avoids threading H and W separately.
         //
-        // Both accumulate with atomicAdd, so every destination must be zeroed first.
-        if (!_kernelCache.TryGetValue("instancenorm_backward_sums", out var sumsKernel))
-            throw new InvalidOperationException("CUDA kernel not found: instancenorm_backward_sums");
+        // Zero every destination before selecting the stage-one implementation. The throughput path
+        // accumulates with atomicAdd; the deterministic kernels overwrite these buffers in fixed order.
         if (!_kernelCache.TryGetValue("instancenorm_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: instancenorm_backward");
 
@@ -7489,22 +7502,69 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
 
-        // Stage 1: sums + gradGamma + gradBeta.
-        void** sumsArgs = stackalloc void*[13];
-        sumsArgs[0] = &gradOutputPtr;
-        sumsArgs[1] = &inputPtr;
-        sumsArgs[2] = &saveMeanPtr;
-        sumsArgs[3] = &saveInvVarPtr;
-        sumsArgs[4] = &gammaPtr;
-        sumsArgs[5] = &sumDyPtr;
-        sumsArgs[6] = &sumDyXhatPtr;
-        sumsArgs[7] = &gradGammaPtr;
-        sumsArgs[8] = &gradBetaPtr;
-        sumsArgs[9] = &batch;
-        sumsArgs[10] = &channels;
-        sumsArgs[11] = &hDim;
-        sumsArgs[12] = &wDim;
-        LaunchKernel(sumsKernel, grid, DefaultBlockSize, sumsArgs);
+        // Stage 1: sums + gradGamma + gradBeta. The normal path uses atomics for throughput. Under
+        // deterministic mode, give each channel and each (batch, channel) pair a single fixed-order owner.
+        if (GpuDeterminism.IsActive)
+        {
+            if (!_kernelCache.TryGetValue(
+                    "instancenorm_backward_sums_per_channel_deterministic", out var channelSumsKernel))
+                throw new InvalidOperationException(
+                    "CUDA kernel not found: instancenorm_backward_sums_per_channel_deterministic");
+            if (!_kernelCache.TryGetValue(
+                    "instancenorm_backward_sums_per_instance_deterministic", out var instanceSumsKernel))
+                throw new InvalidOperationException(
+                    "CUDA kernel not found: instancenorm_backward_sums_per_instance_deterministic");
+
+            void** channelArgs = stackalloc void*[10];
+            channelArgs[0] = &gradOutputPtr;
+            channelArgs[1] = &inputPtr;
+            channelArgs[2] = &saveMeanPtr;
+            channelArgs[3] = &saveInvVarPtr;
+            channelArgs[4] = &gradGammaPtr;
+            channelArgs[5] = &gradBetaPtr;
+            channelArgs[6] = &batch;
+            channelArgs[7] = &channels;
+            channelArgs[8] = &hDim;
+            channelArgs[9] = &wDim;
+            uint channelGrid = (uint)((channels + DefaultBlockSize - 1) / DefaultBlockSize);
+            LaunchKernel(channelSumsKernel, channelGrid, DefaultBlockSize, channelArgs);
+
+            void** instanceArgs = stackalloc void*[11];
+            instanceArgs[0] = &gradOutputPtr;
+            instanceArgs[1] = &inputPtr;
+            instanceArgs[2] = &saveMeanPtr;
+            instanceArgs[3] = &saveInvVarPtr;
+            instanceArgs[4] = &gammaPtr;
+            instanceArgs[5] = &sumDyPtr;
+            instanceArgs[6] = &sumDyXhatPtr;
+            instanceArgs[7] = &batch;
+            instanceArgs[8] = &channels;
+            instanceArgs[9] = &hDim;
+            instanceArgs[10] = &wDim;
+            uint instanceGrid = (uint)((stats + DefaultBlockSize - 1) / DefaultBlockSize);
+            LaunchKernel(instanceSumsKernel, instanceGrid, DefaultBlockSize, instanceArgs);
+        }
+        else
+        {
+            if (!_kernelCache.TryGetValue("instancenorm_backward_sums", out var sumsKernel))
+                throw new InvalidOperationException("CUDA kernel not found: instancenorm_backward_sums");
+
+            void** sumsArgs = stackalloc void*[13];
+            sumsArgs[0] = &gradOutputPtr;
+            sumsArgs[1] = &inputPtr;
+            sumsArgs[2] = &saveMeanPtr;
+            sumsArgs[3] = &saveInvVarPtr;
+            sumsArgs[4] = &gammaPtr;
+            sumsArgs[5] = &sumDyPtr;
+            sumsArgs[6] = &sumDyXhatPtr;
+            sumsArgs[7] = &gradGammaPtr;
+            sumsArgs[8] = &gradBetaPtr;
+            sumsArgs[9] = &batch;
+            sumsArgs[10] = &channels;
+            sumsArgs[11] = &hDim;
+            sumsArgs[12] = &wDim;
+            LaunchKernel(sumsKernel, grid, DefaultBlockSize, sumsArgs);
+        }
 
         // Stage 2: gradInput, consuming the sums above.
         void** args = stackalloc void*[12];
@@ -7813,7 +7873,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void ScaledDotProductAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer? attentionWeights, IGpuBuffer? mask,
-        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal, float softcap = 0.0f)
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal, float softcap = 0.0f,
+        int numKVHeads = 0)
     {
         using var _ = PushContext();
         if (batch <= 0 || numHeads <= 0 || seqQ <= 0 || seqK <= 0 || headDim <= 0)
@@ -7821,8 +7882,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (!_kernelCache.TryGetValue("scaled_dot_product_attention", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: scaled_dot_product_attention");
 
+        // numKVHeads <= 0 means MHA (K/V have numHeads); >0 enables Grouped-Query Attention where each KV head is
+        // shared by numHeads/numKVHeads query heads and the K/V buffers are sized [batch * numKVHeads * seqK * headDim].
+        int kvHeads = numKVHeads > 0 ? numKVHeads : numHeads;
+        if (numHeads % kvHeads != 0)
+            throw new ArgumentException("numHeads must be an integer multiple of numKVHeads.", nameof(numKVHeads));
         int querySize = checked(batch * numHeads * seqQ * headDim);
-        int keyValueSize = checked(batch * numHeads * seqK * headDim);
+        int keyValueSize = checked(batch * kvHeads * seqK * headDim);
         int weightsSize = checked(batch * numHeads * seqQ * seqK);
         if (query.Size < querySize || key.Size < keyValueSize || value.Size < keyValueSize || output.Size < querySize)
             throw new ArgumentException("Attention tensor buffers are smaller than the requested dimensions.");
@@ -7840,7 +7906,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int causalFlag = isCausal ? 1 : 0;
         int maskMode = mask is null ? 0 : mask.Size >= weightsSize ? 2 : 1;
         int storeWeights = attentionWeights is null ? 0 : 1;
-        void** args = stackalloc void*[16];
+        void** args = stackalloc void*[17];
         args[0] = &queryPtr;
         args[1] = &keyPtr;
         args[2] = &valuePtr;
@@ -7857,9 +7923,43 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[13] = &maskMode;
         args[14] = &storeWeights;
         args[15] = &softcap;
+        args[16] = &kvHeads;
 
         int rows = checked(batch * numHeads * seqQ);
         uint grid = (uint)((rows + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void RopeInterleaved(IGpuBuffer input, IGpuBuffer cos, IGpuBuffer sin, IGpuBuffer output,
+        int rows, int headDim, int seqLen, int startPosition)
+    {
+        using var _ = PushContext();
+        if (rows <= 0 || headDim <= 0 || seqLen <= 0)
+            throw new ArgumentOutOfRangeException(nameof(rows), "RoPE dimensions must be positive.");
+        if ((headDim & 1) != 0)
+            throw new ArgumentException("RoPE requires an even head dimension.", nameof(headDim));
+        if (!_kernelCache.TryGetValue("rope_interleaved", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: rope_interleaved");
+        int total = checked(rows * headDim);
+        if (input.Size < total || output.Size < total)
+            throw new ArgumentException("RoPE input/output buffers are smaller than rows * headDim.");
+
+        IntPtr inputPtr = input.Handle;
+        IntPtr cosPtr = cos.Handle;
+        IntPtr sinPtr = sin.Handle;
+        IntPtr outputPtr = output.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &inputPtr;
+        args[1] = &cosPtr;
+        args[2] = &sinPtr;
+        args[3] = &outputPtr;
+        args[4] = &rows;
+        args[5] = &headDim;
+        args[6] = &seqLen;
+        args[7] = &startPosition;
+
+        int pairs = checked(rows * (headDim / 2));
+        uint grid = (uint)((pairs + DefaultBlockSize - 1) / DefaultBlockSize);
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
@@ -8372,11 +8472,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         using var _ = PushContext();
         // cuMemsetD32 sets 32-bit values (net471 compatible conversion)
         byte[] bytes = BitConverter.GetBytes(value);
-        GpuLaunchProbe.OnLaunch();   // device-side memset IS GPU work
         uint bits = BitConverter.ToUInt32(bytes, 0);
         CuBlasNative.CheckCudaResult(
             CuBlasNative.cuMemsetD32(buffer.Handle, bits, (ulong)size),
             "cuMemsetD32");
+        GpuLaunchProbe.OnLaunch();   // device-side memset IS GPU work
     }
 
     /// <inheritdoc/>
@@ -14656,8 +14756,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         uint cap = (uint)Math.Min(256, cols);
         while (block * 2 <= cap) block *= 2;
         uint sharedMem = block * sizeof(float);
-        CudaNativeBindings.cuLaunchKernel(kernel, grid, 1, 1, block, 1, 1,
-            sharedMem, IntPtr.Zero, (IntPtr)args, IntPtr.Zero);
+        CuBlasNative.CheckCudaResult(
+            CudaNativeBindings.cuLaunchKernel(kernel, grid, 1, 1, block, 1, 1,
+                sharedMem, _stream, (IntPtr)args, IntPtr.Zero),
+            "cuLaunchKernel(normalize_rows_fused)");
         GpuLaunchProbe.OnLaunch();
     }
 

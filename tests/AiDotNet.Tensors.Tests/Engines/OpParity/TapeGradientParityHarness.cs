@@ -46,6 +46,11 @@ namespace AiDotNet.Tensors.Tests.Engines.OpParity;
 /// </summary>
 public static class TapeGradientParityHarness
 {
+    private const string IncompleteContractLeafReason =
+        "The identity-based complete-leaf audit measured an incomplete or ambiguous CPU/GPU contract "
+        + "gradient set. The old content-intersection harness silently ignored this case; it needs a "
+        + "dedicated recording/backward fix before it can participate in exact one-to-one parity.";
+
     /// <summary>
     /// Ops whose tape gradients are known-broken or known-unverifiable. Skipped, not failed.
     /// </summary>
@@ -59,6 +64,130 @@ public static class TapeGradientParityHarness
             ["TensorMax"] = "The (tensor, scalar) overload has NO tape recording on either engine, so there "
                         + "is no gradient to compare. CpuEngine records only (tensor, tensor).",
             ["TensorMin"] = "As TensorMax.",
+            ["FusedLinearCrossEntropyWithLogits"] = "The direct-GPU fused kernels do not yet expose a "
+                        + "tape-compatible backward. The GPU override rejects tape-active execution explicitly "
+                        + "instead of silently downloading logits through CpuEngine.",
+
+            // Measured legacy debt exposed by replacing partial content intersection with complete contract
+            // identity matching. These entries keep the rollout baseline-and-ratchet: every operator not named
+            // here must provide exactly one gradient for every differentiable contract leaf on both engines.
+            ["AffineGrid3D"] = IncompleteContractLeafReason,
+            ["AmplitudeToDB"] = IncompleteContractLeafReason,
+            ["BatchNormBackward"] = IncompleteContractLeafReason,
+            ["BoxIou"] = IncompleteContractLeafReason,
+            ["CompleteBoxIou"] = IncompleteContractLeafReason,
+            ["ComputeDeltas"] = IncompleteContractLeafReason,
+            ["Conv1D"] = IncompleteContractLeafReason,
+            ["Conv1DBackwardInput"] = IncompleteContractLeafReason,
+            ["Conv1DBackwardKernel"] = IncompleteContractLeafReason,
+            ["CreateMelFilterbank"] = IncompleteContractLeafReason,
+            ["CreateWindow"] = IncompleteContractLeafReason,
+            ["CrossEntropyBackward"] = IncompleteContractLeafReason,
+            ["DeformableConv2D"] = IncompleteContractLeafReason,
+            ["DeformableConv2DGrouped"] = IncompleteContractLeafReason,
+            ["DepthwiseConv1DBackwardInput"] = IncompleteContractLeafReason,
+            ["DepthwiseConv1DBackwardKernel"] = IncompleteContractLeafReason,
+            ["DepthwiseConv2D"] = IncompleteContractLeafReason,
+            ["DistanceBoxIou"] = IncompleteContractLeafReason,
+            ["EluBackward"] = IncompleteContractLeafReason,
+            ["FlashAttentionBackward"] = IncompleteContractLeafReason,
+            ["Fold"] = IncompleteContractLeafReason,
+            ["FusedConv3D"] = IncompleteContractLeafReason,
+            ["FusedConvTranspose2D"] = IncompleteContractLeafReason,
+            ["FusedHierarchicalSoftmax"] = IncompleteContractLeafReason,
+            ["FusedLinearBackward"] = IncompleteContractLeafReason,
+            ["FusedLinearMaxout"] = IncompleteContractLeafReason,
+            ["GeneralizedBoxIou"] = IncompleteContractLeafReason,
+            ["GridSample"] = IncompleteContractLeafReason,
+            ["GroupedQueryAttentionBackward"] = IncompleteContractLeafReason,
+            ["GroupNormBackward"] = IncompleteContractLeafReason,
+            ["GumbelSoftmaxBackward"] = IncompleteContractLeafReason,
+            ["InstanceNormBackward"] = IncompleteContractLeafReason,
+            ["Interpolate"] = IncompleteContractLeafReason,
+            ["InterpolateByScale"] = IncompleteContractLeafReason,
+            ["LayerNormBackward"] = IncompleteContractLeafReason,
+            ["LayerNormBackwardGradBeta"] = IncompleteContractLeafReason,
+            ["LayerNormBackwardGradGamma"] = IncompleteContractLeafReason,
+            ["LocallyConnectedConv2D"] = IncompleteContractLeafReason,
+            ["MaxPool2DBackwardWithTensorIndices"] = IncompleteContractLeafReason,
+            ["MaxPool2DWithIndices"] = IncompleteContractLeafReason,
+            ["MaxPool3DBackwardWithTensorIndices"] = IncompleteContractLeafReason,
+            ["MlpForward"] = IncompleteContractLeafReason,
+            ["MuLawDecoding"] = IncompleteContractLeafReason,
+            ["MultiHeadAttentionForward"] = IncompleteContractLeafReason,
+            ["NativeBispectrum"] = IncompleteContractLeafReason,
+            ["NativeComplexAdd"] = IncompleteContractLeafReason,
+            ["NativeComplexConjugate"] = IncompleteContractLeafReason,
+            ["NativeComplexCrossSpectral"] = IncompleteContractLeafReason,
+            ["NativeComplexFFTComplex"] = IncompleteContractLeafReason,
+            ["NativeComplexIFFT"] = IncompleteContractLeafReason,
+            ["NativeComplexIFFT2DReal"] = IncompleteContractLeafReason,
+            ["NativeComplexIFFTNDReal"] = IncompleteContractLeafReason,
+            ["NativeComplexIFFTReal"] = IncompleteContractLeafReason,
+            ["NativeComplexMagnitude"] = IncompleteContractLeafReason,
+            ["NativeComplexMagnitudeSquared"] = IncompleteContractLeafReason,
+            ["NativeComplexMultiply"] = IncompleteContractLeafReason,
+            ["NativeComplexPhase"] = IncompleteContractLeafReason,
+            ["NativeComplexScale"] = IncompleteContractLeafReason,
+            ["NativeComplexTopK"] = IncompleteContractLeafReason,
+            ["NativeMagnitudeAndPhase"] = IncompleteContractLeafReason,
+            ["NativeTrispectrum"] = IncompleteContractLeafReason,
+            ["PsRoIAlign"] = IncompleteContractLeafReason,
+            ["PsRoIPool"] = IncompleteContractLeafReason,
+            ["ReduceMaxBackwardWithTensorIndices"] = IncompleteContractLeafReason,
+            ["ReduceStd"] = IncompleteContractLeafReason,
+            ["ReduceVarianceBackward"] = IncompleteContractLeafReason,
+            ["Resample"] = IncompleteContractLeafReason,
+            ["RMSNormBackward"] = IncompleteContractLeafReason,
+            ["RoIAlign"] = IncompleteContractLeafReason,
+            ["RoIPool"] = IncompleteContractLeafReason,
+            ["Rwkv7SequenceForward"] = IncompleteContractLeafReason,
+            ["ScaledDotProductAttentionBackward"] = IncompleteContractLeafReason,
+            ["ScatterSoftmaxBackward"] = IncompleteContractLeafReason,
+            ["SoftmaxBackward"] = IncompleteContractLeafReason,
+            ["SparsemaxBackward"] = IncompleteContractLeafReason,
+            ["SphericalSoftmaxBackward"] = IncompleteContractLeafReason,
+            ["SpiralConvBackwardBias"] = IncompleteContractLeafReason,
+            ["StdBackward"] = IncompleteContractLeafReason,
+            ["TaylorSoftmaxBackward"] = IncompleteContractLeafReason,
+            ["TensorAddMM"] = IncompleteContractLeafReason,
+            ["TensorAddScaled"] = IncompleteContractLeafReason,
+            ["TensorBCEWithLogitsLoss"] = IncompleteContractLeafReason,
+            ["TensorBinaryCrossEntropy"] = IncompleteContractLeafReason,
+            ["TensorCIoULoss"] = IncompleteContractLeafReason,
+            ["TensorClampTensor"] = IncompleteContractLeafReason,
+            ["TensorCopysign"] = IncompleteContractLeafReason,
+            ["TensorCross"] = IncompleteContractLeafReason,
+            ["TensorCrossEntropyLoss"] = IncompleteContractLeafReason,
+            ["TensorDIoULoss"] = IncompleteContractLeafReason,
+            ["TensorDot"] = IncompleteContractLeafReason,
+            ["TensorGIoULoss"] = IncompleteContractLeafReason,
+            ["TensorHuberLoss"] = IncompleteContractLeafReason,
+            ["TensorIoULoss"] = IncompleteContractLeafReason,
+            ["TensorIsClose"] = IncompleteContractLeafReason,
+            ["TensorKLDivLoss"] = IncompleteContractLeafReason,
+            ["TensorKron"] = IncompleteContractLeafReason,
+            ["TensorL1Loss"] = IncompleteContractLeafReason,
+            ["TensorLdexp"] = IncompleteContractLeafReason,
+            ["TensorLerp"] = IncompleteContractLeafReason,
+            ["TensorMaskedSelect"] = IncompleteContractLeafReason,
+            ["TensorMoveDim"] = IncompleteContractLeafReason,
+            ["TensorMSELoss"] = IncompleteContractLeafReason,
+            ["TensorNLLLoss"] = IncompleteContractLeafReason,
+            ["TensorPolygamma"] = IncompleteContractLeafReason,
+            ["TensorRandomUniform"] = IncompleteContractLeafReason,
+            ["TensorRound"] = IncompleteContractLeafReason,
+            ["TensorSoftmaxBackward"] = IncompleteContractLeafReason,
+            ["TensorSquashBackward"] = IncompleteContractLeafReason,
+            ["TensorSwapAxes"] = IncompleteContractLeafReason,
+            ["TensorTakeAlongDim"] = IncompleteContractLeafReason,
+            ["TensorTensorSplit"] = IncompleteContractLeafReason,
+            ["TensorUnfold"] = IncompleteContractLeafReason,
+            ["TensorWhere"] = IncompleteContractLeafReason,
+            ["TensorZeta"] = IncompleteContractLeafReason,
+            ["Unfold"] = IncompleteContractLeafReason,
+            ["VarBackward"] = IncompleteContractLeafReason,
+            ["VolumeRendering"] = IncompleteContractLeafReason,
         };
 
     /// <summary>
@@ -89,6 +218,22 @@ public static class TapeGradientParityHarness
     /// </remarks>
     private const string NormalizeRepro =
         "y = BroadcastDivide(x, Norm(x, 1, keepDims:true)); loss = ReduceSum(y*w); compare d/dx";
+
+    private sealed class LeafGradientSnapshot
+    {
+        public int ContractIndex { get; }
+        public int[] Shape { get; }
+        public float[] Key { get; }
+        public float[] Grad { get; }
+
+        public LeafGradientSnapshot(int contractIndex, int[] shape, float[] key, float[] grad)
+        {
+            ContractIndex = contractIndex;
+            Shape = shape;
+            Key = key;
+            Grad = grad;
+        }
+    }
 
     /// <summary>
     /// Ops whose FORWARD parity already fails. Their tape gradients differ only because the forward value
@@ -150,45 +295,94 @@ public static class TapeGradientParityHarness
     /// Runs a tape case on the given engine and returns the concatenated gradients over its sources, in the
     /// case's declared order, plus the deferred GPU-&gt;host materialisation count for that run.
     /// </summary>
-    private static (List<(float[] Key, float[] Grad)> Leaves, long Materialisations, int LeafCount) TapeGradient(
+    private static (List<LeafGradientSnapshot> Leaves, long Materialisations, int LeafCount,
+        bool UsesContractIdentity, int CapturedInputCount) TapeGradient(
         IEngine engine, Func<IEngine, Tensor<float>> runFloat)
     {
         var prior = AiDotNetEngine.Current;
         AiDotNetEngine.Current = engine;
+        var capturedInputs = new List<Tensor<float>>();
+        var sources = new List<Tensor<float>>();
+        Dictionary<Tensor<float>, Tensor<float>>? grads = null;
+        Tensor<float>? output = null;
+        Tensor<float>? weight = null;
+        Tensor<float>? weighted = null;
+        Tensor<float>? loss = null;
         try
         {
             AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.ResetMaterializeCount();
             using var tape = new GradientTape<float>();
 
-            var output = runFloat(engine);
-
-            // Non-uniform weighting: a constant upstream gradient can mask a wrong backward, because several
-            // different index mappings then produce the same total.
-            var weight = new Tensor<float>(output.Shape.ToArray());
-            for (int i = 0; i < weight.Length; i++) weight[i] = 0.19f + 0.013f * (i % 13);
-            var loss = engine.ReduceSum(engine.TensorMultiply(output, weight), null);
-
-            var sources = DiscoverLeaves(tape);
-            var empty = new List<(float[], float[])>();
-            if (sources.Count == 0)
-                return (empty, AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.MaterializeCount, 0);
-
-            var grads = tape.ComputeGradients(loss, sources.ToArray());
-
-            // Each leaf is keyed by its own CONTENTS. Both engines run the case from the same fixed seeds,
-            // so a genuine user input holds bitwise-identical values in both runs and can be paired across
-            // them without relying on tape order.
-            var leaves = new List<(float[] Key, float[] Grad)>();
-            foreach (var src in sources)
+            try
             {
-                if (!grads.TryGetValue(src, out var g) || g is null) continue;
-                var key = new float[src.Length];
-                for (int i = 0; i < src.Length; i++) key[i] = src[i];
-                var gv = new float[g.Length];
-                for (int i = 0; i < g.Length; i++) gv[i] = g[i];
-                leaves.Add((key, gv));
+                using (OpInput.CaptureFloatInputs(capturedInputs))
+                    output = runFloat(engine);
+
+                // Non-uniform weighting: a constant upstream gradient can mask a wrong backward, because several
+                // different index mappings then produce the same total.
+                weight = new Tensor<float>(output.Shape.ToArray());
+                for (int i = 0; i < weight.Length; i++) weight[i] = 0.19f + 0.013f * (i % 13);
+                weighted = engine.TensorMultiply(output, weight);
+                loss = engine.ReduceSum(weighted, null);
+
+                sources = DiscoverLeaves(tape);
+                bool usesContractIdentity = capturedInputs.Count > 0;
+                if (sources.Count == 0)
+                    return (new List<LeafGradientSnapshot>(),
+                        AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.MaterializeCount,
+                        0, usesContractIdentity, capturedInputs.Count);
+
+                grads = tape.ComputeGradients(loss, sources.ToArray());
+
+                var capturedOrdinals = new Dictionary<Tensor<float>, int>(
+                    ReferenceEqualityComparer<Tensor<float>>.Instance);
+                for (int i = 0; i < capturedInputs.Count; i++)
+                {
+                    if (capturedOrdinals.ContainsKey(capturedInputs[i]))
+                        throw new InvalidOperationException("The same OpInput tensor was captured more than once in one parity run.");
+                    capturedOrdinals.Add(capturedInputs[i], i);
+                }
+
+                var leaves = new List<LeafGradientSnapshot>();
+                foreach (var src in sources)
+                {
+                    int contractIndex = -1;
+                    if (usesContractIdentity && !capturedOrdinals.TryGetValue(src, out contractIndex))
+                        continue; // An implementation-only temporary, not an OpCase input contract.
+
+                    if (!grads.TryGetValue(src, out var gradient) || gradient is null)
+                        throw new InvalidOperationException(
+                            $"GradientTape omitted an expected contract-leaf gradient with shape "
+                            + $"[{string.Join(",", src.Shape._dims)}].");
+
+                    var key = new float[src.Length];
+                    for (int i = 0; i < src.Length; i++) key[i] = src[i];
+                    var gradientValues = new float[gradient.Length];
+                    for (int i = 0; i < gradient.Length; i++) gradientValues[i] = gradient[i];
+                    leaves.Add(new LeafGradientSnapshot(
+                        contractIndex, src.Shape.ToArray(), key, gradientValues));
+                }
+
+                long materialisations = AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.MaterializeCount;
+                return (leaves, materialisations, leaves.Count, usesContractIdentity, capturedInputs.Count);
             }
-            return (leaves, AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.MaterializeCount, sources.Count);
+            finally
+            {
+                var disposed = new HashSet<Tensor<float>>(ReferenceEqualityComparer<Tensor<float>>.Instance);
+                void DisposeOnce(Tensor<float>? tensor)
+                {
+                    if (tensor is not null && disposed.Add(tensor)) tensor.Dispose();
+                }
+
+                if (grads is not null)
+                    foreach (var gradient in grads.Values) DisposeOnce(gradient);
+                DisposeOnce(loss);
+                DisposeOnce(weighted);
+                DisposeOnce(weight);
+                DisposeOnce(output);
+                foreach (var source in sources) DisposeOnce(source);
+                foreach (var input in capturedInputs) DisposeOnce(input);
+            }
         }
         finally { AiDotNetEngine.Current = prior; }
     }
@@ -234,8 +428,10 @@ public static class TapeGradientParityHarness
         var gpu = fx.Gpu;
         if (gpu is null) { Skip.If(true, "GPU engine unavailable after reset."); return; }
 
-        var (cpuLeafList, _, cpuLeaves) = TapeGradient(fx.Cpu, op.RunFloat);
-        var (gpuLeafList, materialisations, gpuLeaves) = TapeGradient(gpu, op.RunFloat);
+        var (cpuLeafList, _, cpuLeaves, cpuUsesContractIdentity, cpuCapturedInputs) =
+            TapeGradient(fx.Cpu, op.RunFloat);
+        var (gpuLeafList, materialisations, gpuLeaves, gpuUsesContractIdentity, gpuCapturedInputs) =
+            TapeGradient(gpu, op.RunFloat);
 
         if (cpuLeaves == 0 && gpuLeaves == 0)
         {
@@ -247,37 +443,78 @@ public static class TapeGradientParityHarness
             return;
         }
 
-        // PAIR LEAVES BY CONTENT, NOT BY TAPE ORDER.
-        //
-        // The first version asserted CPU and GPU must discover the same NUMBER of leaves, then compared them
-        // positionally by first appearance. That was wrong on both counts. A leaf here is "an input no
-        // RECORDED op produced", which also captures temporaries an op materialises eagerly inside itself —
-        // so when CPU composes an op out of sub-ops while GPU calls one fused kernel, the two tapes
-        // legitimately differ in shape with BOTH gradients correct. Across the registry that produced 54
-        // failures concentrated exactly in the composed/fused ops (Conv1D, DepthwiseConv, RoIPool,
-        // Interpolate, MlpForward, MultiHeadAttentionForward) — decomposition differences, not defects.
-        // Positional pairing compounded it: with differently-shaped tapes it could compare d(A) against d(B).
-        //
-        // Both engines run from the same fixed seeds, so a genuine user input has bitwise-equal contents in
-        // both runs. Matching on contents pairs exactly those, and a temporary that exists on only one side
-        // fails to match and is excluded — the correct treatment, since a temporary's gradient is an
-        // implementation detail rather than part of the op's contract.
-        var unmatchedGpu = new List<(float[] Key, float[] Grad)>(gpuLeafList);
+        // OpInput capture supplies a stable contract ordinal across CPU and GPU runs. This excludes
+        // implementation-only temporaries while still requiring every user-facing differentiable input to
+        // have exactly one gradient on both engines. Content matching is only a fail-closed fallback for the
+        // rare registry case that constructs inputs without OpInput.
         var pairs = new List<(float[] Cpu, float[] Gpu)>();
-        foreach (var c in cpuLeafList)
+        Assert.True(cpuUsesContractIdentity == gpuUsesContractIdentity,
+            $"{opName} tapegrad: only one engine captured OpInput contract identities.");
+
+        if (cpuUsesContractIdentity)
         {
-            int hit = unmatchedGpu.FindIndex(
-                g => g.Key.Length == c.Key.Length && g.Key.AsSpan().SequenceEqual(c.Key));
-            if (hit < 0) continue;
-            pairs.Add((c.Grad, unmatchedGpu[hit].Grad));
-            unmatchedGpu.RemoveAt(hit);
+            Assert.True(cpuCapturedInputs == gpuCapturedInputs,
+                $"{opName} tapegrad: the registry materialized a different number of inputs "
+                + $"(CPU={cpuCapturedInputs}, GPU={gpuCapturedInputs}).");
+
+            var cpuByIndex = cpuLeafList.ToDictionary(leaf => leaf.ContractIndex);
+            var gpuByIndex = gpuLeafList.ToDictionary(leaf => leaf.ContractIndex);
+            Assert.True(cpuByIndex.Count == gpuByIndex.Count,
+                $"{opName} tapegrad: differentiable contract-leaf count differs "
+                + $"(CPU={cpuByIndex.Count}, GPU={gpuByIndex.Count}).");
+
+            foreach (var (contractIndex, cpuLeaf) in cpuByIndex)
+            {
+                Assert.True(gpuByIndex.TryGetValue(contractIndex, out var gpuLeaf),
+                    $"{opName} tapegrad: GPU omitted gradient for contract input #{contractIndex}.");
+                Assert.True(cpuLeaf.Shape.AsSpan().SequenceEqual(gpuLeaf!.Shape),
+                    $"{opName} tapegrad: contract input #{contractIndex} has different CPU/GPU shapes.");
+                Assert.True(cpuLeaf.Key.AsSpan().SequenceEqual(gpuLeaf.Key),
+                    $"{opName} tapegrad: contract input #{contractIndex} has different CPU/GPU values.");
+                pairs.Add((cpuLeaf.Grad, gpuLeaf.Grad));
+            }
+
+            Assert.True(gpuByIndex.Keys.All(cpuByIndex.ContainsKey),
+                $"{opName} tapegrad: GPU produced a gradient for a contract input that CPU did not mark differentiable.");
+        }
+        else
+        {
+            // Cases that construct tensors without OpInput fall back to content keys. Fail closed when a key
+            // is duplicated, and require every leaf on both sides to be consumed one-to-one.
+            static bool SameKey(LeafGradientSnapshot left, LeafGradientSnapshot right)
+                => left.Shape.AsSpan().SequenceEqual(right.Shape)
+                    && left.Key.AsSpan().SequenceEqual(right.Key);
+
+            static void RequireUniqueKeys(List<LeafGradientSnapshot> leaves, string side, string name)
+            {
+                for (int i = 0; i < leaves.Count; i++)
+                    for (int j = i + 1; j < leaves.Count; j++)
+                        Assert.False(SameKey(leaves[i], leaves[j]),
+                            $"{name} tapegrad: {side} has duplicate-valued leaves, so content pairing is ambiguous.");
+            }
+
+            RequireUniqueKeys(cpuLeafList, "CPU", opName);
+            RequireUniqueKeys(gpuLeafList, "GPU", opName);
+            Assert.True(cpuLeafList.Count == gpuLeafList.Count,
+                $"{opName} tapegrad: untracked leaf count differs "
+                + $"(CPU={cpuLeafList.Count}, GPU={gpuLeafList.Count}).");
+
+            var unmatchedGpu = new List<LeafGradientSnapshot>(gpuLeafList);
+            foreach (var cpuLeaf in cpuLeafList)
+            {
+                int hit = unmatchedGpu.FindIndex(gpuLeaf => SameKey(cpuLeaf, gpuLeaf));
+                Assert.True(hit >= 0,
+                    $"{opName} tapegrad: GPU omitted a CPU leaf with shape [{string.Join(",", cpuLeaf.Shape)}].");
+                pairs.Add((cpuLeaf.Grad, unmatchedGpu[hit].Grad));
+                unmatchedGpu.RemoveAt(hit);
+            }
+            Assert.True(unmatchedGpu.Count == 0,
+                $"{opName} tapegrad: GPU had {unmatchedGpu.Count} unmatched leaf gradients.");
         }
 
         Assert.True(pairs.Count > 0,
-            $"{opName} tapegrad: no leaf could be paired between the engines by content "
-            + $"(CPU {cpuLeaves} leaves, GPU {gpuLeaves}). Both runs use the same seeds, so a shared user "
-            + "input must appear identically in both — none did, meaning the engines recorded tapes with no "
-            + "common differentiable input at all.");
+            $"{opName} tapegrad: no differentiable contract leaf could be paired between the engines "
+            + $"(CPU {cpuLeaves} leaves, GPU {gpuLeaves}).");
 
         double maxAbs = 0, maxRel = 0;
         foreach (var (cg, gg) in pairs)

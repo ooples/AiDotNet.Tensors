@@ -24,6 +24,7 @@ namespace AiDotNet.Tensors.Tests.LinearAlgebra.FftTests;
 /// HOW TO A/B: run this, then `git stash` the CpuEngine routing change, rebuild, run again, `git stash pop`.
 /// Same box, same shapes, same harness — the only variable is which core RFFT dispatches to.
 /// </summary>
+[Collection("EngineCurrentGlobalState")]
 public class RfftPerformanceBenchmark
 {
     private readonly ITestOutputHelper _out;
@@ -44,6 +45,17 @@ public class RfftPerformanceBenchmark
         var t = new Tensor<double>([batch, n]);
         for (int i = 0; i < t.Length; i++) t[i] = rng.NextDouble() * 2 - 1;
         return t;
+    }
+
+    private static void ValidateFiniteShape(Tensor<double> result, int batch, int width, string operation)
+    {
+        Assert.Equal(2, result.Rank);
+        Assert.Equal(batch, result.Shape[0]);
+        Assert.Equal(width, result.Shape[1]);
+        Assert.Equal(batch * width, result.Length);
+        for (int i = 0; i < result.Length; i++)
+            if (double.IsNaN(result[i]) || double.IsInfinity(result[i]))
+                Assert.Fail($"{operation} produced a non-finite value at index {i}.");
     }
 
     [Fact(Timeout = 600000)]
@@ -68,20 +80,21 @@ public class RfftPerformanceBenchmark
                          (256, 128), (1024, 128), (4096, 192), (4096, 256), (8192, 256), (1024, 1024),
                      })
             {
-                var x = Signal(batch, n, seed: 7);
+                using var x = Signal(batch, n, seed: 7);
 
                 int nFft = 1;
                 while (nFft < n) nFft <<= 1;
 
                 double Time(Func<Tensor<double>> f, out long bytes)
                 {
-                    for (int i = 0; i < Warmup; i++) _ = f();
+                    for (int i = 0; i < Warmup; i++)
+                        using (var warmup = f()) { }
                     var times = new double[Iters];
                     long before = AllocatedBytes();
                     for (int i = 0; i < Iters; i++)
                     {
                         var sw = Stopwatch.StartNew();
-                        _ = f();
+                        using var result = f();
                         sw.Stop();
                         times[i] = sw.Elapsed.TotalMilliseconds;
                     }
@@ -90,21 +103,35 @@ public class RfftPerformanceBenchmark
                     return times[Iters / 2];
                 }
 
+                using var spec = engine.RFFT(x);
+                int spectrumWidth = (nFft / 2 + 1) * 2;
+                ValidateFiniteShape(spec, batch, spectrumWidth, "RFFT");
+                using (var roundTrip = engine.IRFFT(spec, n))
+                {
+                    ValidateFiniteShape(roundTrip, batch, n, "IRFFT");
+                    double maxAbs = 0;
+                    for (int i = 0; i < x.Length; i++)
+                        maxAbs = Math.Max(maxAbs, Math.Abs(x[i] - roundTrip[i]));
+                    Assert.True(maxAbs <= 1e-9,
+                        $"RFFT/IRFFT round trip diverged for batch={batch}, n={n}: maxAbs={maxAbs:E3}.");
+                }
+
                 double tR = Time(() => engine.RFFT(x), out long aR);
-                var spec = engine.RFFT(x);
                 double tI = Time(() => engine.IRFFT(spec, n), out long aI);
 
                 // What the old core recomputed per call: (nFft/2)*log2(nFft) butterflies x 2 transcendentals,
                 // once per signal. The cached-twiddle core computes each (size, k) pair once per (n, inverse).
-                long trig = (long)batch * (nFft / 2) * (long)Math.Log(nFft, 2) * 2;
+                int log2 = 0;
+                for (int size = nFft; size > 1; size >>= 1) log2++;
+                long trig = (long)batch * (nFft / 2) * log2 * 2;
 
                 _out.WriteLine(
                     $"  {batch,5}  {n,5}  {nFft,5}  {tR,8:F3}  {aR / 1024.0,14:F1}  {tI,9:F3}  {aI / 1024.0,15:F1}  {trig / 1e6,15:F1} M");
             }
 
             _out.WriteLine("");
-            _out.WriteLine("Round-trip correctness (IRFFT(RFFT(x)) == x) is covered by FftApiTests/FftParityTests;");
-            _out.WriteLine("this file measures only, and asserts nothing about speed so it cannot fail a build.");
+            _out.WriteLine("Each shape passed finite-output, expected-shape, and RFFT/IRFFT round-trip smoke checks;");
+            _out.WriteLine("timings remain diagnostic and do not assert a speed threshold.");
         }
         finally { AiDotNetEngine.Current = prior; }
     }

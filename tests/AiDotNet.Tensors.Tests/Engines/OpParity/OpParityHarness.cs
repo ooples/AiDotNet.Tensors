@@ -108,7 +108,7 @@ public sealed class OpParityFixture : IDisposable
     }
 }
 
-[CollectionDefinition("OpParity")]
+[CollectionDefinition("OpParity", DisableParallelization = true)]
 public sealed class OpParityCollection : ICollectionFixture<OpParityFixture> { }
 
 /// <summary>The parity checker. For one <see cref="OpCase"/> it runs the float op on CPU and GPU,

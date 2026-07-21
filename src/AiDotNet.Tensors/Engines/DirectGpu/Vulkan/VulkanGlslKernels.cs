@@ -31,7 +31,21 @@ void main() {
     float v0 = uintBitsToFloat(p0), v1 = uintBitsToFloat(p1), v2 = uintBitsToFloat(p2);
     float y = 0.0;
     switch (op) {
-        case 0u: y = pow(x, v0); break;
+        case 0u: {
+            // GLSL pow is undefined for a negative base. Integral exponents
+            // are valid, so evaluate |x|^v0 and restore odd parity.
+            if (x < 0.0) {
+                if (v0 == trunc(v0)) {
+                    float magnitude = pow(-x, v0);
+                    y = (mod(abs(v0), 2.0) == 1.0) ? -magnitude : magnitude;
+                } else {
+                    y = uintBitsToFloat(0x7fc00000u);
+                }
+            } else {
+                y = pow(x, v0);
+            }
+            break;
+        }
         case 1u: y = abs(x); break;
         case 2u: y = exp(x); break;
         case 3u: y = exp2(x); break;
@@ -322,7 +336,8 @@ void main() {
     uint offset = capsule * capsuleDim;
     float squaredNorm = 0.0;
     for (uint d0 = 0u; d0 < capsuleDim; ++d0) squaredNorm += a[offset + d0] * a[offset + d0];
-    float scale = squaredNorm / ((1.0 + squaredNorm) * sqrt(squaredNorm + epsilon));
+    float denominator = (1.0 + squaredNorm) * (sqrt(squaredNorm) + epsilon);
+    float scale = denominator != 0.0 ? squaredNorm / denominator : 0.0;
     for (uint d0 = 0u; d0 < capsuleDim; ++d0) b[offset + d0] = a[offset + d0] * scale;
 }";
 
@@ -333,11 +348,21 @@ void main() {
     if (capsule >= numCapsules) return;
     uint offset = capsule * capsuleDim;
     float squaredNorm = 0.0;
-    for (uint d0 = 0u; d0 < capsuleDim; ++d0) squaredNorm += bdata[offset + d0] * bdata[offset + d0];
-    float norm = sqrt(squaredNorm + epsilon);
-    float denominator = (1.0 + squaredNorm) * norm;
-    float factor = (squaredNorm + 2.0 * squaredNorm / (1.0 + squaredNorm)) / (denominator * denominator);
-    for (uint d0 = 0u; d0 < capsuleDim; ++d0) c[offset + d0] = a[offset + d0] * factor;
+    float dot = 0.0;
+    for (uint d0 = 0u; d0 < capsuleDim; ++d0) {
+        float value = bdata[offset + d0];
+        squaredNorm += value * value;
+        dot += value * a[offset + d0];
+    }
+    float norm = sqrt(squaredNorm);
+    float normPlusEpsilon = norm + epsilon;
+    float denominator = (1.0 + squaredNorm) * normPlusEpsilon;
+    float scale = denominator != 0.0 ? squaredNorm / denominator : 0.0;
+    float coefficient = denominator != 0.0
+        ? (norm + 2.0 * epsilon - squaredNorm * norm) / (denominator * denominator)
+        : 0.0;
+    for (uint d0 = 0u; d0 < capsuleDim; ++d0)
+        c[offset + d0] = scale * a[offset + d0] + coefficient * bdata[offset + d0] * dot;
 }";
 
     public static string CapsulePredictions => Header + ThreeBufferLayout + @"
@@ -393,6 +418,33 @@ void main() {
     c[idx] = dot;
 }";
 
+    // Fused interleaved RoPE (GPT-NeoX / LLaMA / GGML). One invocation per (row, pair).
+    // cos/sin are [maxSeq, headDim/2], indexed by absolute position (startPosition + rowWithinSequence).
+    public static string RopeInterleaved => Header + @"
+layout(set = 0, binding = 0) readonly buffer Input { float inputData[]; };
+layout(set = 0, binding = 1) readonly buffer Cos { float cosData[]; };
+layout(set = 0, binding = 2) readonly buffer Sin { float sinData[]; };
+layout(set = 0, binding = 3) writeonly buffer Output { float outputData[]; };
+layout(push_constant) uniform Params { uint rows; uint headDim; uint seqLen; uint startPosition; };
+void main() {
+    uint halfDim = headDim / 2u;
+    uint g = gl_GlobalInvocationID.x;
+    if (g >= rows * halfDim) return;
+    uint i = g % halfDim;
+    uint row = g / halfDim;
+    uint s = row % seqLen;
+    uint pos = startPosition + s;
+    uint baseIdx = row * headDim;
+    uint cacheIdx = pos * halfDim + i;
+    float c = cosData[cacheIdx];
+    float sn = sinData[cacheIdx];
+    float xEven = inputData[baseIdx + 2u * i];
+    float xOdd = inputData[baseIdx + 2u * i + 1u];
+    outputData[baseIdx + 2u * i] = xEven * c - xOdd * sn;
+    outputData[baseIdx + 2u * i + 1u] = xEven * sn + xOdd * c;
+}
+";
+
     public static string AttentionForward => Header + @"
 layout(set = 0, binding = 0) readonly buffer Query { float queryData[]; };
 layout(set = 0, binding = 1) readonly buffer Key { float keyData[]; };
@@ -422,6 +474,9 @@ void main() {
     uint row = gl_GlobalInvocationID.x;
     if (row >= batch * queryHeads * seqQ) return;
     uint queryIndex = row % seqQ;
+    // KV-cache causal offset: query row queryIndex is at absolute position queryIndex + (seqK - seqQ);
+    // seqQ==seqK collapses to keyIndex > queryIndex (prefill), decode attends to the whole cached prefix.
+    uint qPos = queryIndex + (seqK - seqQ);
     uint q = row / seqQ;
     uint queryHead = q % queryHeads;
     uint batchIndex = q / queryHeads;
@@ -429,19 +484,19 @@ void main() {
     uint kvHead = queryHead / queriesPerKv;
     float rowMax = -3.402823466e+38;
     for (uint keyIndex = 0u; keyIndex < seqK; ++keyIndex) {
-        if ((causal != 0u && keyIndex > queryIndex) || attentionMasked(batchIndex, queryHead, queryIndex, keyIndex)) continue;
+        if ((causal != 0u && keyIndex > qPos) || attentionMasked(batchIndex, queryHead, queryIndex, keyIndex)) continue;
         rowMax = max(rowMax, attentionScore(batchIndex, queryHead, kvHead, queryIndex, keyIndex));
     }
     float denominator = 0.0;
     for (uint keyIndex = 0u; keyIndex < seqK; ++keyIndex) {
-        if ((causal != 0u && keyIndex > queryIndex) || attentionMasked(batchIndex, queryHead, queryIndex, keyIndex)) continue;
+        if ((causal != 0u && keyIndex > qPos) || attentionMasked(batchIndex, queryHead, queryIndex, keyIndex)) continue;
         denominator += exp(attentionScore(batchIndex, queryHead, kvHead, queryIndex, keyIndex) - rowMax);
     }
     uint weightOffset = row * seqK;
     if (writeWeights != 0u) {
         for (uint keyIndex = 0u; keyIndex < seqK; ++keyIndex) {
             float weight = 0.0;
-            if ((causal == 0u || keyIndex <= queryIndex) && !attentionMasked(batchIndex, queryHead, queryIndex, keyIndex) && denominator > 0.0)
+            if ((causal == 0u || keyIndex <= qPos) && !attentionMasked(batchIndex, queryHead, queryIndex, keyIndex) && denominator > 0.0)
                 weight = exp(attentionScore(batchIndex, queryHead, kvHead, queryIndex, keyIndex) - rowMax) / denominator;
             weightData[weightOffset + keyIndex] = weight;
         }
@@ -451,7 +506,7 @@ void main() {
     for (uint d0 = 0u; d0 < headDim; ++d0) {
         float sum = 0.0;
         for (uint keyIndex = 0u; keyIndex < seqK; ++keyIndex) {
-            if ((causal != 0u && keyIndex > queryIndex) || attentionMasked(batchIndex, queryHead, queryIndex, keyIndex) || denominator <= 0.0) continue;
+            if ((causal != 0u && keyIndex > qPos) || attentionMasked(batchIndex, queryHead, queryIndex, keyIndex) || denominator <= 0.0) continue;
             float weight = exp(attentionScore(batchIndex, queryHead, kvHead, queryIndex, keyIndex) - rowMax) / denominator;
             sum += weight * valueData[valueOffset + keyIndex * headDim + d0];
         }
@@ -500,7 +555,7 @@ float gradAttention(uint batchIndex, uint queryHead, uint queryIndex, uint keyIn
     return sum;
 }
 float gradScore(uint batchIndex, uint queryHead, uint queryIndex, uint keyIndex, uint kvHead) {
-    if (causal != 0u && keyIndex > queryIndex) return 0.0;
+    if (causal != 0u && keyIndex > qPos) return 0.0;
     uint weightOffset = ((batchIndex * queryHeads + queryHead) * seqQ + queryIndex) * seqK;
     float dot = 0.0;
     for (uint j = 0u; j < seqK; ++j)

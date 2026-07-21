@@ -23,6 +23,7 @@ namespace AiDotNet.Tensors.Tests.LinearAlgebra.FftTests;
 /// Allocation is reported separately and is deterministic — it reproduced to within 0.1% across runs while
 /// timings swung 3x, so it is the stronger evidence of the two.
 /// </summary>
+[Collection("EngineCurrentGlobalState")]
 public class RfftInterleavedAbBenchmark
 {
     private readonly ITestOutputHelper _out;
@@ -45,6 +46,20 @@ public class RfftInterleavedAbBenchmark
         return t;
     }
 
+    private static void ValidateRfftResult(Tensor<double> result, int batch, int n)
+    {
+        int nFft = 1;
+        while (nFft < n) nFft <<= 1;
+        int expectedWidth = (nFft / 2 + 1) * 2;
+        Assert.Equal(2, result.Rank);
+        Assert.Equal(batch, result.Shape[0]);
+        Assert.Equal(expectedWidth, result.Shape[1]);
+        Assert.Equal(batch * expectedWidth, result.Length);
+        for (int i = 0; i < result.Length; i++)
+            if (double.IsNaN(result[i]) || double.IsInfinity(result[i]))
+                Assert.Fail($"RFFT produced a non-finite value at index {i}.");
+    }
+
     /// <summary>
     /// Correctness first: the two cores must agree before any timing of them means anything. Both compute
     /// the same transform, so they should match to near machine precision — the summation order is identical,
@@ -54,18 +69,22 @@ public class RfftInterleavedAbBenchmark
     public void Legacy_and_modern_cores_agree()
     {
         var prior = AiDotNetEngine.Current;
+        bool priorFftCore = CpuEngine.UseLegacyFftCore;
         AiDotNetEngine.Current = new CpuEngine();
         try
         {
             var engine = AiDotNetEngine.Current;
             foreach (var (batch, n) in new[] { (8, 128), (16, 192), (4, 256), (2, 1024) })
             {
-                var x = Signal(batch, n, seed: 5);
+                using var x = Signal(batch, n, seed: 5);
 
                 CpuEngine.UseLegacyFftCore = true;
-                var legacy = engine.RFFT(x);
+                using var legacy = engine.RFFT(x);
                 CpuEngine.UseLegacyFftCore = false;
-                var modern = engine.RFFT(x);
+                using var modern = engine.RFFT(x);
+
+                ValidateRfftResult(legacy, batch, n);
+                ValidateRfftResult(modern, batch, n);
 
                 double maxRel = 0;
                 for (int i = 0; i < legacy.Length; i++)
@@ -75,7 +94,7 @@ public class RfftInterleavedAbBenchmark
                 Assert.True(maxRel <= 1e-12, $"cores diverged at batch={batch} n={n}: maxRel={maxRel:E3}");
             }
         }
-        finally { CpuEngine.UseLegacyFftCore = false; AiDotNetEngine.Current = prior; }
+        finally { CpuEngine.UseLegacyFftCore = priorFftCore; AiDotNetEngine.Current = prior; }
     }
 
     [Fact(Timeout = 900000)]
@@ -83,6 +102,7 @@ public class RfftInterleavedAbBenchmark
     {
         await Task.Yield();
         var prior = AiDotNetEngine.Current;
+        bool priorFftCore = CpuEngine.UseLegacyFftCore;
         AiDotNetEngine.Current = new CpuEngine();
         try
         {
@@ -97,12 +117,14 @@ public class RfftInterleavedAbBenchmark
 
             foreach (var (batch, n) in new[] { (256, 128), (1024, 128), (4096, 192), (4096, 256), (8192, 256), (1024, 1024) })
             {
-                var x = Signal(batch, n, seed: 7);
+                using var x = Signal(batch, n, seed: 7);
 
                 for (int i = 0; i < Warmup; i++)
                 {
-                    CpuEngine.UseLegacyFftCore = true; _ = engine.RFFT(x);
-                    CpuEngine.UseLegacyFftCore = false; _ = engine.RFFT(x);
+                    CpuEngine.UseLegacyFftCore = true;
+                    using (var legacyWarmup = engine.RFFT(x)) ValidateRfftResult(legacyWarmup, batch, n);
+                    CpuEngine.UseLegacyFftCore = false;
+                    using (var modernWarmup = engine.RFFT(x)) ValidateRfftResult(modernWarmup, batch, n);
                 }
 
                 var ratios = new double[Reps];
@@ -115,19 +137,26 @@ public class RfftInterleavedAbBenchmark
                     // Legacy half.
                     CpuEngine.UseLegacyFftCore = true;
                     long b0 = AllocatedBytes();
-                    var swL = Stopwatch.StartNew(); _ = engine.RFFT(x); swL.Stop();
+                    var swL = Stopwatch.StartNew();
+                    using var legacy = engine.RFFT(x);
+                    swL.Stop();
                     long b1 = AllocatedBytes();
+                    ValidateRfftResult(legacy, batch, n);
 
                     // Modern half, immediately after — same thermal state.
                     CpuEngine.UseLegacyFftCore = false;
-                    var swM = Stopwatch.StartNew(); _ = engine.RFFT(x); swM.Stop();
+                    long modernBefore = AllocatedBytes();
+                    var swM = Stopwatch.StartNew();
+                    using var modern = engine.RFFT(x);
+                    swM.Stop();
                     long b2 = AllocatedBytes();
+                    ValidateRfftResult(modern, batch, n);
 
                     legacyMs[r] = swL.Elapsed.TotalMilliseconds;
                     modernMs[r] = swM.Elapsed.TotalMilliseconds;
                     ratios[r] = legacyMs[r] / Math.Max(modernMs[r], 1e-9);
                     legacyBytes += b1 - b0;
-                    modernBytes += b2 - b1;
+                    modernBytes += b2 - modernBefore;
                 }
 
                 Array.Sort(ratios);
@@ -147,6 +176,6 @@ public class RfftInterleavedAbBenchmark
             _out.WriteLine("Ratio > 1 means the modern core is faster. The p25..p75 spread is the honest error bar:");
             _out.WriteLine("if it straddles 1.00 the shape shows no reliable difference, however good the median looks.");
         }
-        finally { CpuEngine.UseLegacyFftCore = false; AiDotNetEngine.Current = prior; }
+        finally { CpuEngine.UseLegacyFftCore = priorFftCore; AiDotNetEngine.Current = prior; }
     }
 }

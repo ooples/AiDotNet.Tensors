@@ -59,7 +59,8 @@ __kernel void scaled_dot_product_attention(
     const int isCausal,
     const int maskMode,
     const int storeWeights,
-    const float softcap)
+    const float softcap,
+    const int numKVHeads)  // Grouped-Query Attention: <numHeads shares each KV head; == numHeads for MHA.
 {
     const int row = get_global_id(0);
     if (row >= batch * numHeads * seqQ) return;
@@ -67,10 +68,20 @@ __kernel void scaled_dot_product_attention(
     const int qi = row % seqQ;
     const int bh = row / seqQ;
     const int qOffset = row * headDim;
-    const int kOffset = bh * seqK * headDim;
-    const int vOffset = bh * seqK * headDim;
+    // GQA: map query head -> shared KV head. bh = b*numHeads + h; kvHead = h / (numHeads/numKVHeads);
+    // the K/V slab for this row lives at (b*numKVHeads + kvHead). numKVHeads==numHeads collapses to bh.
+    const int b = bh / numHeads;
+    const int h = bh - b * numHeads;
+    const int kvGroup = numHeads / numKVHeads;
+    const int bkvh = b * numKVHeads + (h / kvGroup);
+    const int kOffset = bkvh * seqK * headDim;
+    const int vOffset = bkvh * seqK * headDim;
     const int wOffset = row * seqK;
     const int maskOffset = (maskMode == 2 ? bh * seqQ * seqK : 0) + qi * seqK;
+    // Causal with a KV-cache offset: query row qi sits at absolute position qi + (seqK - seqQ), so it may
+    // attend to keys up to there. seqQ==seqK (prefill) collapses this to the standard ki > qi; a decode step
+    // (seqQ=1 < seqK) correctly attends to the whole cached prefix instead of only key 0.
+    const int qPos = qi + (seqK - seqQ);
 
     // Attention-logit soft-cap (Gemma-2): softcap * tanh((score*scale)/softcap); softcap<=0 disables.
     #define ATTN_LOGIT(sc) (softcap > 0.0f ? softcap * tanh(((sc) * scale) / softcap) : (sc) * scale)
@@ -78,7 +89,7 @@ __kernel void scaled_dot_product_attention(
     // Compute attention scores and find max for numerical stability
     float maxScore = NEGATIVE_INFINITY;
     for (int ki = 0; ki < seqK; ki++) {
-        if ((isCausal && ki > qi) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f)) continue;
+        if ((isCausal && ki > qPos) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f)) continue;
 
         float score = 0.0f;
         for (int d = 0; d < headDim; d++) {
@@ -90,7 +101,7 @@ __kernel void scaled_dot_product_attention(
 
     float sumExp = 0.0f;
     for (int ki = 0; ki < seqK; ki++) {
-        if ((isCausal && ki > qi) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f)) continue;
+        if ((isCausal && ki > qPos) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f)) continue;
 
         float score = 0.0f;
         for (int d = 0; d < headDim; d++) {
@@ -105,7 +116,7 @@ __kernel void scaled_dot_product_attention(
     if (storeWeights) {
         for (int ki = 0; ki < seqK; ki++) {
             float weight = 0.0f;
-            if (!((isCausal && ki > qi) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f))) {
+            if (!((isCausal && ki > qPos) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f))) {
                 float score = 0.0f;
                 for (int inner = 0; inner < headDim; inner++) {
                     score += query[qOffset + inner] * key[kOffset + ki * headDim + inner];
@@ -119,7 +130,7 @@ __kernel void scaled_dot_product_attention(
     for (int d = 0; d < headDim; d++) {
         float val = 0.0f;
         for (int ki = 0; ki < seqK; ki++) {
-            if ((isCausal && ki > qi) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f)) continue;
+            if ((isCausal && ki > qPos) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f)) continue;
             float score = 0.0f;
             for (int inner = 0; inner < headDim; inner++) {
                 score += query[qOffset + inner] * key[kOffset + ki * headDim + inner];
@@ -864,6 +875,45 @@ __kernel void flash_attention_forward(
         output[oOffset + d] = outAcc[d] * invSum;
     }
 }
+
+// ===========================================================================
+// FUSED ROTARY POSITION EMBEDDING (RoPE) - interleaved (GPT-NeoX / LLaMA / GGML)
+// Rotates each adjacent dim pair (2i, 2i+1) of every [.., seq, headDim] row by the
+// precomputed angle for (position, i). One work-item per (row, pair). Out-of-place
+// (each item owns its pair exclusively, so it is also safe in place). cos/sin are
+// precomputed host-side as [maxSeq, headDim/2] and indexed by absolute position.
+// ===========================================================================
+__kernel void rope_interleaved(
+    __global const float* input,      // [rows * headDim], rows = leading * seqLen (row-major)
+    __global const float* cosCache,   // [maxSeq * halfDim]
+    __global const float* sinCache,   // [maxSeq * halfDim]
+    __global float* output,           // [rows * headDim]
+    const int rows,
+    const int headDim,
+    const int seqLen,
+    const int startPosition)
+{
+    const int halfDim = headDim / 2;
+    const int g = get_global_id(0);
+    if (g >= rows * halfDim) return;
+
+    const int i = g % halfDim;
+    const int row = g / halfDim;
+    const int s = row % seqLen;               // position within the sequence for this row
+    const int pos = startPosition + s;
+    const int baseIdx = row * headDim;
+    const int cacheIdx = pos * halfDim + i;
+
+    const float c = cosCache[cacheIdx];
+    const float sn = sinCache[cacheIdx];
+    const float xEven = input[baseIdx + 2 * i];
+    const float xOdd = input[baseIdx + 2 * i + 1];
+
+    // x'[2i]   = x[2i] * cos - x[2i+1] * sin
+    // x'[2i+1] = x[2i] * sin + x[2i+1] * cos
+    output[baseIdx + 2 * i] = xEven * c - xOdd * sn;
+    output[baseIdx + 2 * i + 1] = xEven * sn + xOdd * c;
+}
 ";
         }
 
@@ -883,7 +933,8 @@ __kernel void flash_attention_forward(
                 "grouped_query_attention_backward",
                 "grouped_query_attention_backward_gradq_deterministic",
                 "grouped_query_attention_backward_gradkv_deterministic",
-                "flash_attention_forward"
+                "flash_attention_forward",
+                "rope_interleaved"
             };
         }
     }

@@ -651,7 +651,7 @@ public static class CpuVsaOperations
             // STALE pre-multiplication spectrum: the result was IFFT(FFT(a)) = a, i.e. HrrBind
             // silently returned its first operand and ignored the second entirely.
             //
-            // Only reachable on the GPU engine (AIDOTNET_DISABLE_GPU=1 passed), and the tell was that
+            // Only reachable on the GPU engine (with GPU execution enabled), and the tell was that
             // the output was independent of N while differing in the last ~1e-8 — a recovered `a`
             // with N-dependent FFT rounding, not a constant.
             Aspec.IncrementVersion();

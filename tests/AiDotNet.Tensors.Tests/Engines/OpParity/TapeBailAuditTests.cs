@@ -75,12 +75,59 @@ public class TapeBailAuditTests
         // so forward parity could never surface it. Needs its own GPU-side backward, not a reused one.
         "Scatter",
 
-        // Reverted after testing: removing its bail surfaced that the GPU path throws
-        // InvalidOperationException("CUDA kernel not found: where_select") — CudaBackend.Where references a
-        // kernel with no source and no registration anywhere, so backend.Where is non-functional on CUDA.
-        // The bail was concealing that, since without it the path was only reachable outside a tape and had
-        // no test. Fix where_select first, then re-apply the recording.
+        // CUDA now provides where_select, so Sparsemax's non-tape device path is complete. It still bails under
+        // a tape because this composite forward does not record a backward; returning the resident result as-is
+        // would silently drop the input gradient. Remove this entry when that recording is implemented.
         "Sparsemax",
+
+        // The direct-GPU fused loss has inference kernels but no backend backward contract. Its override now
+        // throws NotSupportedException under a tape rather than silently downloading resident logits through
+        // CpuEngine. Remove this entry when a tape-compatible GPU backward is implemented.
+        "FusedLinearCrossEntropyWithLogits",
+
+        // Existing debt that lived in DirectGpuTensorEngine partial files the original single-file audit did
+        // not scan. These are deliberately baselined now that the audit covers the complete partial class;
+        // each one needs its CpuEngine saved-state/backward contract verified by a gradient test before its
+        // tape bail can be removed safely. New names still fail the audit, and this baseline must only shrink.
+        "FusedLinear",
+        "MaxPool2D",
+        "AvgPool2D",
+        "FlashAttention",
+        "GroupedQueryAttention",
+        "LayerNorm",
+        "RMSNorm",
+        "GroupNorm",
+        "InstanceNorm",
+        "Dropout",
+        "Embedding",
+        "AdaptiveAvgPool2D",
+        "ReduceSum",
+        "TensorWhere",
+        "TensorTranspose",
+        "BatchNorm",
+        "Conv3D",
+        "ConvTranspose2D",
+        "TensorGather",
+        "Upsample",
+        "TensorAddScalar",
+        "TensorSubtractScalar",
+        "TensorDivideScalar",
+        "TensorMaskedFill",
+        "TensorStack",
+        "TensorDiagonal",
+        "PixelShuffle",
+        "TensorSetSlice",
+        "FusedLinearReLU",
+        "FusedLinearSigmoid",
+        "FusedLinearTanh",
+        "FusedLinearGELU",
+        "FusedLinearSwish",
+        "PadNd",
+        "TensorClampMin",
+        "TensorClampMax",
+        "TensorMaskedScatter",
+        "TensorIndexCopy",
+        "TensorIndexFill",
 
         // NOT fixable, and NOT pending — these are here because the audit matches on op NAME and cannot
         // tell overloads apart. CpuEngine records a backward for TensorMax/TensorMin(tensor, TENSOR), while
@@ -107,56 +154,85 @@ public class TapeBailAuditTests
         "MaxPool3DWithIndices",
     };
 
-    private static Dictionary<string, (bool HasKernel, bool Bails)> ScanGpuOverrides(string gpuSrc)
+    private static string[] GpuEngineSources(string root)
+        => Directory.GetFiles(
+            Path.Combine(root, "src", "AiDotNet.Tensors", "Engines"),
+            "DirectGpuTensorEngine*.cs",
+            SearchOption.TopDirectoryOnly);
+
+    private static string[] CpuEngineSources(string root)
+        => Directory.GetFiles(
+            Path.Combine(root, "src", "AiDotNet.Tensors", "Engines"),
+            "CpuEngine*.cs",
+            SearchOption.TopDirectoryOnly);
+
+    private static Dictionary<string, (bool HasKernel, bool Bails)> ScanGpuOverrides(
+        IEnumerable<string> gpuSources)
     {
-        var lines = File.ReadAllLines(gpuSrc);
         var methodRe = new Regex(@"(?:Tensor<T> IEngine\.|public override Tensor<T> |void IEngine\.)([A-Za-z0-9_]+)<T>\s*\(");
         var result = new Dictionary<string, (bool, bool)>();
 
-        for (int i = 0; i < lines.Length; i++)
+        foreach (string gpuSrc in gpuSources)
         {
-            var m = methodRe.Match(lines[i]);
-            if (!m.Success) continue;
-
-            string name = m.Groups[1].Value;
-            int depth = 0; bool started = false;
-            var body = new List<string>();
-            for (int j = i; j < lines.Length && j < i + 400; j++)
+            var lines = File.ReadAllLines(gpuSrc);
+            for (int i = 0; i < lines.Length; i++)
             {
-                body.Add(lines[j]);
-                depth += lines[j].Count(c => c == '{') - lines[j].Count(c => c == '}');
-                if (lines[j].Contains('{')) started = true;
-                if (started && depth <= 0 && j > i) break;
-            }
+                var m = methodRe.Match(lines[i]);
+                if (!m.Success) continue;
 
-            // Strip line comments BEFORE analysing. A fixed op documents why its bail was removed, and
-            // those comments name IsTapeActive — matching raw text therefore reported every fixed op as
-            // still bailing. The audit must read code, not prose.
-            string text = string.Join("\n",
-                body.Select(l =>
+                string name = m.Groups[1].Value;
+                int depth = 0;
+                bool started = false;
+                bool completed = false;
+                var body = new List<string>();
+                for (int j = i; j < lines.Length && j < i + 400; j++)
                 {
-                    int c = l.IndexOf("//", StringComparison.Ordinal);
-                    return c >= 0 ? l.Substring(0, c) : l;
-                }));
+                    body.Add(lines[j]);
+                    depth += lines[j].Count(c => c == '{') - lines[j].Count(c => c == '}');
+                    if (lines[j].Contains('{')) started = true;
+                    if (started && depth <= 0)
+                    {
+                        completed = true;
+                        break;
+                    }
+                }
 
-            bool hasKernel = Regex.IsMatch(text, @"\bbackend\.[A-Za-z0-9_]+\(");
-            // The generic call form, so a mention in a string or identifier cannot trip it.
-            bool bails = Regex.IsMatch(text, @"\bIsTapeActive\s*<");
-            // An op can appear more than once (overloads); kernel/bail status ORs across them.
-            if (result.TryGetValue(name, out var prev))
-                result[name] = (prev.Item1 || hasKernel, prev.Item2 || bails);
-            else
-                result[name] = (hasKernel, bails);
+                if (!completed)
+                    throw new InvalidOperationException(
+                        $"Tape-bail audit could not parse the complete {name} method in {gpuSrc} within 400 lines.");
+
+                // Strip line comments BEFORE analysing. A fixed op documents why its bail was removed, and
+                // those comments name IsTapeActive — matching raw text therefore reported every fixed op as
+                // still bailing. The audit must read code, not prose.
+                string text = string.Join("\n",
+                    body.Select(l =>
+                    {
+                        int c = l.IndexOf("//", StringComparison.Ordinal);
+                        return c >= 0 ? l.Substring(0, c) : l;
+                    }));
+
+                bool hasKernel = Regex.IsMatch(text, @"\bbackend\.[A-Za-z0-9_]+\(");
+                // The generic call form, so a mention in a string or identifier cannot trip it.
+                bool bails = Regex.IsMatch(text, @"\bIsTapeActive\s*<");
+                // An op can appear more than once (overloads); kernel/bail status ORs across them.
+                if (result.TryGetValue(name, out var prev))
+                    result[name] = (prev.Item1 || hasKernel, prev.Item2 || bails);
+                else
+                    result[name] = (hasKernel, bails);
+            }
         }
         return result;
     }
 
-    private static HashSet<string> OpsWithCpuBackward(string cpuSrc)
+    private static HashSet<string> OpsWithCpuBackward(IEnumerable<string> cpuSources)
     {
-        string cpu = File.ReadAllText(cpuSrc);
         var found = new HashSet<string>();
-        foreach (Match m in Regex.Matches(cpu, @"DifferentiableOps\.Record[A-Za-z]*\(\s*""([A-Za-z0-9_]+)"""))
-            found.Add(m.Groups[1].Value);
+        foreach (string cpuSrc in cpuSources)
+        {
+            string cpu = File.ReadAllText(cpuSrc);
+            foreach (Match m in Regex.Matches(cpu, @"DifferentiableOps\.Record[A-Za-z]*\(\s*""([A-Za-z0-9_]+)"""))
+                found.Add(m.Groups[1].Value);
+        }
         return found;
     }
 
@@ -168,13 +244,13 @@ public class TapeBailAuditTests
     public void No_new_kernel_backed_op_bails_on_an_active_tape()
     {
         string root = RepoRoot();
-        string gpuSrc = Path.Combine(root, "src", "AiDotNet.Tensors", "Engines", "DirectGpuTensorEngine.MissingKernels.cs");
-        string cpuSrc = Path.Combine(root, "src", "AiDotNet.Tensors", "Engines", "CpuEngine.cs");
-        Assert.True(File.Exists(gpuSrc), $"GPU override source not found: {gpuSrc}");
-        Assert.True(File.Exists(cpuSrc), $"CpuEngine source not found: {cpuSrc}");
+        string[] gpuSources = GpuEngineSources(root);
+        string[] cpuSources = CpuEngineSources(root);
+        Assert.NotEmpty(gpuSources);
+        Assert.NotEmpty(cpuSources);
 
-        var overrides = ScanGpuOverrides(gpuSrc);
-        var withBackward = OpsWithCpuBackward(cpuSrc);
+        var overrides = ScanGpuOverrides(gpuSources);
+        var withBackward = OpsWithCpuBackward(cpuSources);
 
         var violations = new List<string>();
         foreach (var (name, info) in overrides)
@@ -206,8 +282,7 @@ public class TapeBailAuditTests
     public void Already_fixed_ops_do_not_regress_to_bailing()
     {
         string root = RepoRoot();
-        var overrides = ScanGpuOverrides(
-            Path.Combine(root, "src", "AiDotNet.Tensors", "Engines", "DirectGpuTensorEngine.MissingKernels.cs"));
+        var overrides = ScanGpuOverrides(GpuEngineSources(root));
 
         var regressed = MustNotBail.Where(op => overrides.TryGetValue(op, out var i) && i.Bails).ToList();
 
@@ -225,8 +300,7 @@ public class TapeBailAuditTests
     public void Known_unfixed_list_has_no_stale_entries()
     {
         string root = RepoRoot();
-        var overrides = ScanGpuOverrides(
-            Path.Combine(root, "src", "AiDotNet.Tensors", "Engines", "DirectGpuTensorEngine.MissingKernels.cs"));
+        var overrides = ScanGpuOverrides(GpuEngineSources(root));
 
         var stale = KnownUnfixed
             .Where(op => !overrides.TryGetValue(op, out var i) || !i.Bails)

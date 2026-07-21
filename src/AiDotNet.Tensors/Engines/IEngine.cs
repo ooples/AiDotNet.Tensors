@@ -4197,6 +4197,30 @@ public interface IEngine
         double softcap = 0.0);
 
     /// <summary>
+    /// Grouped-query scaled dot-product attention (inference), device-agnostically: <paramref name="key"/> and
+    /// <paramref name="value"/> may carry fewer heads than <paramref name="query"/> (<c>qHeads % kvHeads == 0</c>)
+    /// and each KV head is shared across its query-head group WITHOUT materializing an expanded copy. The GPU
+    /// engine dispatches to the fused GQA-aware attention kernel (recordable under a deferred scope); the CPU
+    /// engine broadcasts the KV heads internally and runs standard attention. Causality is expressed as a flag
+    /// (not a mask tensor) so it matches the kernel; attention weights are not returned (inference only).
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="query">Query tensor <c>[batch, qHeads, seqQ, headDim]</c>.</param>
+    /// <param name="key">Key tensor <c>[batch, kvHeads, seqK, headDim]</c> (kvHeads divides qHeads).</param>
+    /// <param name="value">Value tensor <c>[batch, kvHeads, seqK, headDim]</c>.</param>
+    /// <param name="scale">Softmax scale (typically <c>1/sqrt(headDim)</c>).</param>
+    /// <param name="isCausal">When <see langword="true"/>, position <c>q</c> attends only to keys <c>k &lt;= q</c>.</param>
+    /// <param name="softcap">Gemma-2 attention logit soft-cap; 0 disables it.</param>
+    /// <returns>Attention output <c>[batch, qHeads, seqQ, headDim]</c>.</returns>
+    Tensor<T> ScaledDotProductAttentionGqa<T>(
+        Tensor<T> query,
+        Tensor<T> key,
+        Tensor<T> value,
+        double scale,
+        bool isCausal,
+        double softcap = 0.0);
+
+    /// <summary>
     /// Fused multi-head attention forward (inference only): Q/K/V projection +
     /// multi-head reshape + scaled dot-product attention + output projection in
     /// a single call. Returns <c>[batch, seq, dModel]</c>.
@@ -5373,6 +5397,22 @@ public interface IEngine
     /// </list>
     /// </remarks>
     Tensor<T> RMSNorm<T>(Tensor<T> input, Tensor<T> gamma, double epsilon, out Tensor<T> rms);
+
+    /// <summary>
+    /// Applies interleaved rotary positional embedding (RoPE, GPT-J / GGML layout) to a
+    /// <c>[.., seqLen, headDim]</c> activation, device-agnostically: the GPU engine dispatches to the fused
+    /// <c>rope_interleaved</c> kernel (recordable under a deferred scope), while the CPU engine runs the same
+    /// interleaved rotation. Adjacent dimensions <c>(2i, 2i+1)</c> are rotated by the angle at
+    /// <c>cos/sin[position, i]</c> where <c>position = startPosition + (row % seqLen)</c>:
+    /// <c>out[2i] = x[2i]·cos − x[2i+1]·sin</c>, <c>out[2i+1] = x[2i]·sin + x[2i+1]·cos</c>.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="input">Activation to rotate, shape <c>[.., seqLen, headDim]</c> with an even <c>headDim</c>.</param>
+    /// <param name="cos">Precomputed cosine cache <c>[maxSeq, headDim/2]</c>.</param>
+    /// <param name="sin">Precomputed sine cache <c>[maxSeq, headDim/2]</c>.</param>
+    /// <param name="startPosition">Absolute position of the first sequence element (KV-cache offset).</param>
+    /// <returns>The rotated tensor, same shape as <paramref name="input"/>.</returns>
+    Tensor<T> ApplyRoPEInterleaved<T>(Tensor<T> input, Tensor<T> cos, Tensor<T> sin, int startPosition = 0);
 
     /// <summary>
     /// Computes the backward pass for RMSNorm.

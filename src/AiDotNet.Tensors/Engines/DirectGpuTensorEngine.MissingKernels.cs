@@ -1005,7 +1005,8 @@ public partial class DirectGpuTensorEngine
         // meant every training step fell back to the managed CPU transform — the GPU FFT kernels on all
         // seven backends were dead code in exactly the scenario they matter most for.
         if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
-            || input.Rank == 0 || !TryGetBackend(out var backend))
+            || input.Rank == 0 || input.Length == 0 || input._shape[^1] <= 0
+            || !TryGetBackend(out var backend))
             return base.RFFT(input);
 
         int signalLength = input._shape[^1];
@@ -1071,7 +1072,8 @@ public partial class DirectGpuTensorEngine
         if (outputLength <= 0) throw new ArgumentException("outputLength must be positive", nameof(outputLength));
         // As with RFFT: record the tape node rather than bailing, so training keeps the GPU path.
         if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
-            || input.Rank == 0 || !TryGetBackend(out var backend))
+            || input.Rank == 0 || input.Length == 0 || (input._shape[^1] & 1) != 0
+            || !TryGetBackend(out var backend))
             return base.IRFFT(input, outputLength);
 
         int interleavedLength = input._shape[^1];
@@ -2559,28 +2561,10 @@ public partial class DirectGpuTensorEngine
     Tensor<T> IEngine.PositionalEncoding<T>(Tensor<T> positions, int numFrequencies)
     {
         if (positions is null) throw new ArgumentNullException(nameof(positions));
-        // OPEN, and NOT a logic defect — characterised 2026-07-20 so the decision is informed.
-        //
-        // PositionalEncoding[4,3;f4] is the last forward-parity failure, at
-        //     maxUlp 415, maxAbs 1.192E-06, maxRel 3.189E-05
-        //     oracle drift: CPU 89 ULP vs GPU 379 ULP, tolerance 64 ULP
-        // I first called this accumulation-order drift. It is not. NeRFOperations.PositionalEncoding
-        // computes in DOUBLE even when T is float:
-        //     double value = numOps.ToDouble(...); double angle = frequencies[l] * value;
-        //     result[idx] = numOps.FromDouble(Math.Sin(angle));
-        // so the CPU reference is double-precision math rounded once at the end. That is why it sits at
-        // 89 ULP while a float GPU path sits at 379 — intermediate PRECISION, not summation order.
-        //
-        // The GPU already emulates this: the high/low buffers below are a two-product (Dekker) split with
-        // the angle-addition identities sin(h+l) = sin h cos l + cos h sin l and
-        // cos(h+l) = cos h cos l - sin h sin l. It closes most of the gap but not to 64 ULP.
-        //
-        // Remaining options, both with real costs — deliberately NOT chosen here:
-        //   (a) compute the angle and trig in fp64 in the kernel. Matches the reference, but fp64 is 1/64
-        //       rate on this consumer card and PositionalEncoding is a NeRF inner loop over many points.
-        //   (b) widen this case's tolerance from 64 ULP. Legitimate only if 1.19E-06 absolute is
-        //       acceptable for the op's users — a product call, not a test-hygiene one.
-        // Do not "fix" this by quietly relaxing the tolerance.
+        // The CPU reference forms angles in double precision and rounds once to float. The GPU path below
+        // reproduces that precision with a Dekker two-product split and angle-addition identities. CUDA's
+        // sin/cos dispatch is registered from CudaPreciseTrigKernels (compiled without --use_fast_math),
+        // which removed the former 415-ULP mismatch while retaining the registry's 64-ULP contract.
         if (typeof(T) != typeof(float) || positions.Rank != 2 || numFrequencies <= 0
             || !positions.IsContiguous || !TryGetBackend(out var backend))
             return base.PositionalEncoding(positions, numFrequencies);
@@ -2785,11 +2769,9 @@ public partial class DirectGpuTensorEngine
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
         int normalizedAxis = axis < 0 ? axis + input.Rank : axis;
-        // Tape bail RESTORED. Removing it exposed that this GPU path cannot run at all: it calls
-        // backend.Where, and CudaBackend.Where looks up a "where_select" kernel that does not exist —
-        // no source, no registration — so it throws InvalidOperationException on first use. The bail had
-        // been hiding that, because without it the path was only reachable outside a tape and no test
-        // covered it. Re-enable this (and the recording below) once where_select exists on the backends.
+        // CUDA now provides where_select, so the non-tape device path is complete. Keep the tape bail until
+        // Sparsemax records its composite backward; returning an unrecorded resident result during training
+        // would silently drop the input gradient.
         if (typeof(T) != typeof(float) || normalizedAxis != input.Rank - 1
             || input.Length == 0 || !input.IsContiguous || IsTapeActive<T>()
             || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend))

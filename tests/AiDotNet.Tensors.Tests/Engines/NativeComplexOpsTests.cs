@@ -1,6 +1,8 @@
+using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
+using Xunit.Abstractions;
 
 namespace AiDotNet.Tensors.Tests.Engines;
 
@@ -10,6 +12,12 @@ namespace AiDotNet.Tensors.Tests.Engines;
 public class NativeComplexOpsTests
 {
     private readonly IEngine _engine = AiDotNetEngine.Current;
+    private readonly ITestOutputHelper _output;
+
+    public NativeComplexOpsTests(ITestOutputHelper output)
+    {
+        _output = output;
+    }
 
     // ================================================================
     // FFT Round-Trip
@@ -359,6 +367,230 @@ public class NativeComplexOpsTests
 
         for (int i = 0; i < n; i++)
             Assert.Equal(input[i], recovered[i], 4);
+    }
+
+    // ================================================================
+    // FFT SIMD-delegation equivalence — NativeComplexFFT must match an
+    // independent naive DFT reference across power-of-2 sizes. Guards the
+    // radix-2 SIMD delegation (layout + normalization) against the scalar
+    // math contract.
+    // ================================================================
+
+    // Independent O(n^2) DFT reference (forward, unnormalized).
+    private static Complex<double>[] NaiveDft(double[] re)
+    {
+        int n = re.Length;
+        var outp = new Complex<double>[n];
+        for (int k = 0; k < n; k++)
+        {
+            double sumRe = 0.0, sumIm = 0.0;
+            for (int t = 0; t < n; t++)
+            {
+                double ang = -2.0 * Math.PI * k * t / n;
+                sumRe += re[t] * Math.Cos(ang);
+                sumIm += re[t] * Math.Sin(ang);
+            }
+            outp[k] = new Complex<double>(sumRe, sumIm);
+        }
+        return outp;
+    }
+
+    [Theory]
+    [InlineData(256)]
+    [InlineData(512)]
+    [InlineData(1024)]
+    public void FFT_MatchesNaiveDft_Double(int n)
+    {
+        var re = new double[n];
+        var rng = new Random(1234);
+        for (int i = 0; i < n; i++) re[i] = rng.NextDouble() * 2.0 - 1.0;
+
+        var input = new Tensor<double>([n]);
+        for (int i = 0; i < n; i++) input[i] = re[i];
+
+        var spectrum = _engine.NativeComplexFFT(input);
+        var reference = NaiveDft(re);
+
+        // Absolute tolerance scaled by n (DFT magnitudes grow with n).
+        double tol = 1e-4 * n;
+        for (int k = 0; k < n; k++)
+        {
+            Assert.True(Math.Abs(spectrum[k].Real - reference[k].Real) < tol,
+                $"Re mismatch at k={k}, n={n}: {spectrum[k].Real} vs {reference[k].Real}");
+            Assert.True(Math.Abs(spectrum[k].Imaginary - reference[k].Imaginary) < tol,
+                $"Im mismatch at k={k}, n={n}: {spectrum[k].Imaginary} vs {reference[k].Imaginary}");
+        }
+    }
+
+    [Theory]
+    [InlineData(256)]
+    [InlineData(512)]
+    [InlineData(1024)]
+    public void FFT_MatchesNaiveDft_Float(int n)
+    {
+        var re = new double[n];
+        var rng = new Random(4321);
+        for (int i = 0; i < n; i++) re[i] = rng.NextDouble() * 2.0 - 1.0;
+
+        var input = new Tensor<float>([n]);
+        for (int i = 0; i < n; i++) input[i] = (float)re[i];
+
+        var spectrum = _engine.NativeComplexFFT(input);
+        var reference = NaiveDft(re);
+
+        // Float accumulation over n terms: tolerance scaled for single precision.
+        double tol = 1e-2 * n;
+        for (int k = 0; k < n; k++)
+        {
+            Assert.True(Math.Abs(spectrum[k].Real - reference[k].Real) < tol,
+                $"Re mismatch at k={k}, n={n}: {spectrum[k].Real} vs {reference[k].Real}");
+            Assert.True(Math.Abs(spectrum[k].Imaginary - reference[k].Imaginary) < tol,
+                $"Im mismatch at k={k}, n={n}: {spectrum[k].Imaginary} vs {reference[k].Imaginary}");
+        }
+    }
+
+    // ================================================================
+    // Allocation metric — precise per-call heap allocation for the hot
+    // NativeComplexFFT / NativeSpectralFilter paths, via the exact,
+    // non-admin GC.GetAllocatedBytesForCurrentThread() counter.
+    // net8+ only (the API does not exist on net471).
+    // ================================================================
+#if NET8_0_OR_GREATER
+    [Fact]
+    public void FFT_AllocationBytes()
+    {
+        // Isolate the CpuEngine method bodies we optimize: pure CPU engine and
+        // AutoTracer disabled (its per-call trace closures are constant and
+        // orthogonal to the buffer/result allocations under test).
+        var engine = new CpuEngine();
+        bool priorTracer = SetAutoTracer(false);
+        try
+        {
+            const int H = 128, W = 1024, iters = 1000;
+
+            var input = new Tensor<double>(new[] { H, W });
+            var rng = new Random(7);
+            for (int i = 0; i < H * W; i++) input[i] = rng.NextDouble() * 2.0 - 1.0;
+
+            var filter = new Tensor<Complex<double>>(new[] { H, W });
+            for (int i = 0; i < H * W; i++)
+                filter[i] = new Complex<double>(rng.NextDouble(), rng.NextDouble());
+
+            // ---- NativeComplexFFT ----
+            for (int w = 0; w < 20; w++) { var _ = engine.NativeComplexFFT(input); }
+            long b0 = GC.GetAllocatedBytesForCurrentThread();
+            for (int it = 0; it < iters; it++) { var r = engine.NativeComplexFFT(input); GC.KeepAlive(r); }
+            long b1 = GC.GetAllocatedBytesForCurrentThread();
+            double fftBytesPerCall = (b1 - b0) / (double)iters;
+
+            // ---- NativeSpectralFilter ----
+            for (int w = 0; w < 20; w++) { var _ = engine.NativeSpectralFilter(input, filter); }
+            long s0 = GC.GetAllocatedBytesForCurrentThread();
+            for (int it = 0; it < iters; it++) { var r = engine.NativeSpectralFilter(input, filter); GC.KeepAlive(r); }
+            long s1 = GC.GetAllocatedBytesForCurrentThread();
+            double sfBytesPerCall = (s1 - s0) / (double)iters;
+
+            _output.WriteLine($"ALLOC NativeComplexFFT   [128,1024]: {fftBytesPerCall:N0} bytes/call");
+            _output.WriteLine($"ALLOC NativeSpectralFilter [128,1024]: {sfBytesPerCall:N0} bytes/call");
+
+            // Guard against a regression that would balloon allocation. These are
+            // generous ceilings (well above measured), not tight assertions.
+            Assert.True(fftBytesPerCall < 6_000_000, $"NativeComplexFFT alloc/call too high: {fftBytesPerCall:N0}");
+            Assert.True(sfBytesPerCall < 40_000_000, $"NativeSpectralFilter alloc/call too high: {sfBytesPerCall:N0}");
+        }
+        finally
+        {
+            SetAutoTracer(priorTracer);
+        }
+    }
+
+    // Toggle AutoTracer.Enabled (internal) via reflection; returns prior value.
+    private static bool SetAutoTracer(bool value)
+    {
+        var t = typeof(Tensor<double>).Assembly.GetType("AiDotNet.Tensors.Engines.Compilation.AutoTracer");
+        var p = t?.GetProperty("Enabled", System.Reflection.BindingFlags.Static
+            | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public);
+        bool prior = p is not null && (bool)p.GetValue(null)!;
+        p?.SetValue(null, value);
+        return prior;
+    }
+#endif
+
+    // ================================================================
+    // Fused spectral filter equivalence — the allocation-lean fused path
+    // must be numerically identical to the composed FFT2D → multiply →
+    // IFFT2DReal pipeline it replaces.
+    // ================================================================
+
+    // Reference: the exact composed pipeline via public ops (what the fused path replaces).
+    private static Tensor<double> SpectralFilterComposed(CpuEngine engine, Tensor<double> input, Tensor<Complex<double>> filter)
+    {
+        var spectrum = engine.NativeComplexFFT2D(input);
+        int filterLen = filter.Length;
+        var filtered = new Tensor<Complex<double>>(spectrum.Shape.ToArray());
+        for (int i = 0; i < spectrum.Length; i++)
+        {
+            int fi = i % filterLen;
+            double sr = spectrum[i].Real, si = spectrum[i].Imaginary;
+            double fr = filter[fi].Real, fim = filter[fi].Imaginary;
+            filtered[i] = new Complex<double>(sr * fr - si * fim, sr * fim + si * fr);
+        }
+        return engine.NativeComplexIFFT2DReal(filtered);
+    }
+
+    [Theory]
+    [InlineData(8, 16)]
+    [InlineData(16, 16)]
+    [InlineData(32, 64)]
+    [InlineData(128, 64)]
+    public void SpectralFilter_Fused_MatchesComposed_2D(int h, int w)
+    {
+        var engine = new CpuEngine();
+        var rng = new Random(2024);
+        var input = new Tensor<double>(new[] { h, w });
+        for (int i = 0; i < h * w; i++) input[i] = rng.NextDouble() * 2.0 - 1.0;
+        var filter = new Tensor<Complex<double>>(new[] { h, w });
+        for (int i = 0; i < h * w; i++) filter[i] = new Complex<double>(rng.NextDouble(), rng.NextDouble());
+
+        var reference = SpectralFilterComposed(engine, input, filter);
+        var actual = engine.NativeSpectralFilter(input, filter);
+
+        Assert.Equal(reference.Length, actual.Length);
+        for (int i = 0; i < reference.Length; i++)
+            Assert.True(Math.Abs(reference[i] - actual[i]) < 1e-9,
+                $"mismatch at {i}: {reference[i]} vs {actual[i]}");
+    }
+
+    [Fact]
+    public void SpectralFilter_Fused_MatchesComposed_Batch4D()
+    {
+        int b = 2, c = 3, h = 16, w = 32;
+        var engine = new CpuEngine();
+        var rng = new Random(55);
+        var input = new Tensor<double>(new[] { b, c, h, w });
+        for (int i = 0; i < input.Length; i++) input[i] = rng.NextDouble() * 2.0 - 1.0;
+        // Filter [C,H,W] to exercise modular broadcast across the batch.
+        var filter = new Tensor<Complex<double>>(new[] { c, h, w });
+        for (int i = 0; i < filter.Length; i++) filter[i] = new Complex<double>(rng.NextDouble(), rng.NextDouble());
+
+        // Reference via composed pipeline (batch broadcast identical to fused).
+        var spectrum = engine.NativeComplexFFT2D(input);
+        int filterLen = filter.Length;
+        var filtered = new Tensor<Complex<double>>(spectrum.Shape.ToArray());
+        for (int i = 0; i < spectrum.Length; i++)
+        {
+            int fi = i % filterLen;
+            double sr = spectrum[i].Real, si = spectrum[i].Imaginary;
+            double fr = filter[fi].Real, fim = filter[fi].Imaginary;
+            filtered[i] = new Complex<double>(sr * fr - si * fim, sr * fim + si * fr);
+        }
+        var reference = engine.NativeComplexIFFT2DReal(filtered);
+        var actual = engine.NativeSpectralFilterBatch(input, filter);
+
+        Assert.Equal(reference.Length, actual.Length);
+        for (int i = 0; i < reference.Length; i++)
+            Assert.True(Math.Abs(reference[i] - actual[i]) < 1e-9,
+                $"mismatch at {i}: {reference[i]} vs {actual[i]}");
     }
 
     // ================================================================

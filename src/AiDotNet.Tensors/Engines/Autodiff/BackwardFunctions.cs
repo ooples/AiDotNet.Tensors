@@ -1234,6 +1234,27 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradGamma, engine);
     }
 
+    /// <summary>
+    /// Interleaved-RoPE backward. RoPE is an orthogonal rotation R(θ) applied per (2i, 2i+1) pair, so its
+    /// Jacobian is that rotation matrix and the input gradient is R(θ)^T · gradOutput = R(-θ) · gradOutput —
+    /// i.e. the same interleaved rotation with the sine negated. Reuses the forward kernel with a negated sin
+    /// cache, so it stays float-specialized and matches the forward exactly.
+    /// </summary>
+    internal static void ApplyRoPEInterleavedBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var cos = (Tensor<T>)savedState[0];
+        var sin = (Tensor<T>)savedState[1];
+        var startPosition = (int)savedState[2];
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var negSin = engine.TensorMultiplyScalar(sin, numOps.FromDouble(-1.0));
+        var gradInput = engine.ApplyRoPEInterleaved(gradOutput, cos, negSin, startPosition);
+
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
+    }
+
     /// <summary>InstanceNorm backward: uses engine.InstanceNormBackward</summary>
     internal static void InstanceNormBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,

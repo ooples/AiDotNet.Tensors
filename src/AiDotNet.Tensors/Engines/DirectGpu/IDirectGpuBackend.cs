@@ -1414,13 +1414,36 @@ public interface IDirectGpuBackend : IDisposable
 
     /// <param name="softcap">Optional attention-logit soft-cap (Gemma-2): when &gt; 0, each scaled score
     /// is passed through <c>softcap · tanh(score / softcap)</c> before the softmax. 0 disables it.</param>
+    /// <param name="numKVHeads">Grouped-Query Attention: number of key/value heads, each shared by
+    /// <c>numHeads / numKVHeads</c> query heads. When &lt;= 0 it defaults to <paramref name="numHeads"/> (standard
+    /// multi-head attention). When &gt; 0 the key/value buffers are sized [batch * numKVHeads * seqK * headDim] and
+    /// the shared K/V heads are broadcast internally — the caller never materializes the expanded K/V.</param>
     void ScaledDotProductAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer? attentionWeights, IGpuBuffer? mask,
-        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal, float softcap = 0.0f);
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal, float softcap = 0.0f,
+        int numKVHeads = 0);
 
     void ScaledDotProductAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer attentionWeights, IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
         int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal);
+
+    /// <summary>
+    /// Fused interleaved Rotary Position Embedding (RoPE), the GPT-NeoX / LLaMA / GGML variant that rotates each
+    /// adjacent dim pair (2i, 2i+1). Operates on a row-major [rows, headDim] view (rows = leading * seqLen) and
+    /// writes the rotated result to <paramref name="output"/> (may alias <paramref name="input"/>). The cos/sin
+    /// caches are precomputed host-side as [maxSeq, headDim/2] and indexed by absolute position
+    /// (startPosition + rowWithinSequence).
+    /// </summary>
+    /// <param name="input">Q or K activations, [rows * headDim] row-major, GPU-resident.</param>
+    /// <param name="cos">Cosine cache [maxSeq * (headDim/2)], GPU-resident.</param>
+    /// <param name="sin">Sine cache [maxSeq * (headDim/2)], GPU-resident.</param>
+    /// <param name="output">Rotated output [rows * headDim], GPU-resident.</param>
+    /// <param name="rows">Number of (leading × seq) rows.</param>
+    /// <param name="headDim">Per-head dimension (must be even).</param>
+    /// <param name="seqLen">Sequence length, used to recover the position of each row.</param>
+    /// <param name="startPosition">Absolute position of the first sequence element (for incremental decode).</param>
+    void RopeInterleaved(IGpuBuffer input, IGpuBuffer cos, IGpuBuffer sin, IGpuBuffer output,
+        int rows, int headDim, int seqLen, int startPosition);
 
     void FlashAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer? mask, int batch, int numHeads, int seqLen, int headDim, float scale, bool isCausal);

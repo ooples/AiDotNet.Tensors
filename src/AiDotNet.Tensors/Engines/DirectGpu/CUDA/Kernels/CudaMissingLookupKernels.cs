@@ -39,13 +39,10 @@ extern ""C"" __global__ __launch_bounds__(256) void copy_2d_strided(
 
 // ===========================================================================
 // squash — Squash(input, output, numCapsules, capsuleDim, epsilon)
-// Capsule squash. Matches FusedActivationBackwardMath.SquashForward EXACTLY:
-//     r2 = sum(x^2);  norm = sqrt(r2);  a = norm > 0 ? norm / (1 + r2) : 0;  out = a * x
-// (equivalently the textbook (r2/(1+r2)) * (x/norm), same value).
+// Regularized capsule squash used by CpuEngine.TensorSquash:
+//     r2 = sum(x^2);  norm = sqrt(r2);  a = r2 / ((1 + r2) * (norm + epsilon));  out = a * x.
 // The CPU reference accumulates in double and rounds once, so this does too — a float accumulation
 // over capsuleDim would drift from the reference for long capsules.
-// The CPU guard is norm > 0; epsilon is the caller-supplied zero-threshold and is used in its place,
-// which is identical for any norm meaningfully above eps.
 // One thread per capsule; grid is ceil(numCapsules / block).
 // ===========================================================================
 extern ""C"" __global__ __launch_bounds__(256) void squash(
@@ -58,37 +55,21 @@ extern ""C"" __global__ __launch_bounds__(256) void squash(
     int off = cap * capsuleDim;
     double r2 = 0.0;
     for (int j = 0; j < capsuleDim; j++) { double x = (double)input[off + j]; r2 += x * x; }
-    // CpuEngine.TensorSquash: scale = r2/(1+r2); normalized = x/(norm + 1e-8); out = scale * normalized.
-    // The +1e-8 is CpuEngine's literal, not the caller's epsilon — matching its exact form keeps the two
-    // agreeing at small norms, where scale/(norm+1e-8) and the algebraically-equal norm/(1+r2) diverge.
+    // TensorSquash uses the engine default (1e-8); SquashGpu exposes epsilon for callers that need a
+    // different stability term, so the backend must preserve the value supplied by its caller.
     double norm = sqrt(r2);
-    double scale = r2 / (1.0 + r2);
-    double inv = 1.0 / (norm + 1e-8);
+    double denominator = (1.0 + r2) * (norm + (double)epsilon);
+    double scale = denominator != 0.0 ? r2 / denominator : 0.0;
     for (int j = 0; j < capsuleDim; j++)
-        output[off + j] = (float)(scale * (double)input[off + j] * inv);
+        output[off + j] = (float)(scale * (double)input[off + j]);
 }
 
 // ===========================================================================
 // squash_backward — SquashBackward(gradOutput, input, gradInput, numCapsules, capsuleDim, epsilon)
 //
-// Matches CpuEngine.TensorSquashBackward, which is:  gradInput = gradOutput * 1/(1 + ||x||^2)
-//
-// READ THIS BEFORE CHANGING IT. That CPU implementation is a documented approximation — its own
-// comment says: this is a simplified gradient, a full implementation would require the proper
-// Jacobian, and for now it approximates with element-wise gradient scaling. The codebase ALSO has the
-// gradient, in FusedActivationBackwardMath.SquashBackward:
-//     a = norm/(1+r2);  coef = (1-r2)/((1+r2)^2 * norm);  dx_j = a*g_j + x_j*(g.x)*coef
-// The two disagree substantially (measured: CPU -0.0032247882 vs true-Jacobian 0.012901765 at [4] of
-// TensorSquashBackward[4,8], maxRel 1.25).
-//
-// This kernel deliberately implements the CPU one. Before this kernel existed, SquashBackward threw
-// kernel-not-found and the caller fell back to CpuEngine — so the approximation is ALREADY what every
-// squash backward in this library computes. Matching it moves identical math onto the device and
-// changes no numerical behaviour. Implementing the true Jacobian here is what would silently alter
-// gradients on the GPU path only, giving CPU and GPU different training dynamics.
-//
-// Reconciling the two definitions is a real decision about capsule training semantics and belongs
-// upstream in CpuEngine, not in a backend kernel.
+// For y = f(r)x and f(r) = r^2 / ((1+r^2)(r+epsilon)), the exact vector-Jacobian product is
+//     dx = f(r)g + (f'(r)/r)x dot(g,x)
+// where f'(r)/r = (r + 2*epsilon - r^3) / ((1+r^2)^2(r+epsilon)^2).
 // ===========================================================================
 extern ""C"" __global__ __launch_bounds__(256) void squash_backward(
     const float* __restrict__ gradOutput, const float* __restrict__ input,
@@ -99,14 +80,24 @@ extern ""C"" __global__ __launch_bounds__(256) void squash_backward(
 
     int off = cap * capsuleDim;
     double r2 = 0.0;
+    double dot = 0.0;
     for (int j = 0; j < capsuleDim; j++)
     {
         double x = (double)input[off + j];
         r2 += x * x;
+        dot += x * (double)gradOutput[off + j];
     }
-    double scale = 1.0 / (1.0 + r2);
+    double norm = sqrt(r2);
+    double normPlusEpsilon = norm + (double)epsilon;
+    double onePlusR2 = 1.0 + r2;
+    double denominator = onePlusR2 * normPlusEpsilon;
+    double scale = denominator != 0.0 ? r2 / denominator : 0.0;
+    double coefficient = denominator != 0.0
+        ? (norm + 2.0 * (double)epsilon - r2 * norm) / (denominator * denominator)
+        : 0.0;
     for (int j = 0; j < capsuleDim; j++)
-        gradInput[off + j] = (float)(scale * (double)gradOutput[off + j]);
+        gradInput[off + j] = (float)(scale * (double)gradOutput[off + j]
+            + coefficient * (double)input[off + j] * dot);
 }
 
 // ===========================================================================

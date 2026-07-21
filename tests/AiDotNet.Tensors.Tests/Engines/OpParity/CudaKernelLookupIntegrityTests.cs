@@ -71,23 +71,45 @@ public sealed class CudaKernelLookupIntegrityTests
         "csr_segmented_stddev",
     };
 
-    private static string RepoRoot()
+    private static string? RepoRoot()
     {
         var dir = new DirectoryInfo(AppContext.BaseDirectory);
         while (dir is not null && !Directory.Exists(Path.Combine(dir.FullName, "src", "AiDotNet.Tensors")))
             dir = dir.Parent;
-        return dir?.FullName ?? throw new InvalidOperationException("repo root not found from " + AppContext.BaseDirectory);
+        return dir?.FullName;
+    }
+
+    private static IEnumerable<string> RegisteredKernelNames(string source)
+    {
+        // Read quoted names only from GetKernelNames' returned array. Matching arbitrary quoted lines in
+        // an entire source file admits exception text and diagnostics as fake definitions.
+        const string tablePattern =
+            @"GetKernelNames\s*\(\s*\)\s*(?:=>|\{[\s\S]*?\breturn)\s*"
+            + @"(?:new\s*\[\s*\]\s*)?(?:\[(?<square>[\s\S]*?)\]|\{(?<brace>[\s\S]*?)\})\s*;";
+        foreach (Match table in Regex.Matches(source, tablePattern))
+        {
+            string body = table.Groups["square"].Success
+                ? table.Groups["square"].Value
+                : table.Groups["brace"].Value;
+            foreach (Match name in Regex.Matches(body, @"""([a-z0-9_]+)"""))
+                yield return name.Groups[1].Value;
+        }
     }
 
     [Fact]
     public void EveryCudaKernelLookupHasADefinition()
     {
-        string cuda = Path.Combine(RepoRoot(), "src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA");
+        string? root = RepoRoot();
+        Skip.If(root is null, "Repository sources not present.");
+        string cuda = Path.Combine(root!, "src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA");
         Skip.If(!Directory.Exists(cuda), "CUDA backend sources not present.");
 
-        string backend = File.ReadAllText(Path.Combine(cuda, "CudaBackend.cs"));
+        string[] backendFiles = Directory.GetFiles(cuda, "CudaBackend*.cs", SearchOption.TopDirectoryOnly);
+        Assert.NotEmpty(backendFiles);
+        string backend = string.Join("\n", backendFiles.Select(File.ReadAllText));
         var lookedUp = new HashSet<string>(
-            Regex.Matches(backend, @"_kernelCache(?:\.TryGetValue\(|\[)""([a-z0-9_]+)""")
+            Regex.Matches(backend,
+                    @"_kernelCache\s*(?:(?:\.TryGetValue|\.ContainsKey)\s*\(\s*|\[\s*)""([a-z0-9_]+)""")
                  .Select(m => m.Groups[1].Value),
             StringComparer.Ordinal);
 
@@ -103,10 +125,10 @@ public sealed class CudaKernelLookupIntegrityTests
             // alarm that would have been "fixed" by padding the allowlist, hiding the real 8.
             foreach (Match m in Regex.Matches(src, @"__global__[\s\S]{0,120}?\bvoid\s+(\w+)\s*\("))
                 defined.Add(m.Groups[1].Value);
-            // Names the module registers with cuModuleGetFunction (GetKernelNames arrays) count as
-            // defined too — belt and braces for any declaration shape the pattern above misses.
-            foreach (Match m in Regex.Matches(src, @"^\s*""([a-z0-9_]+)"",\s*$", RegexOptions.Multiline))
-                defined.Add(m.Groups[1].Value);
+            // Names the module registers with cuModuleGetFunction count as defined too, but only when
+            // they occur in an actual GetKernelNames return table.
+            foreach (string name in RegisteredKernelNames(src))
+                defined.Add(name);
         }
 
         Assert.NotEmpty(lookedUp);

@@ -14,9 +14,27 @@ public sealed unsafe partial class VulkanBackend
 
     public void ScaledDotProductAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer? attentionWeights, IGpuBuffer? mask,
-        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal, float softcap = 0.0f)
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal, float softcap = 0.0f,
+        int numKVHeads = 0)
+        // numKVHeads <= 0 means MHA; >0 enables Grouped-Query Attention (the core already broadcasts shared K/V heads).
         => AttentionForwardCore(query, key, value, output, attentionWeights, mask,
-            batch, numHeads, numHeads, seqQ, seqK, headDim, scale, isCausal, softcap: softcap);
+            batch, numHeads, numKVHeads > 0 ? numKVHeads : numHeads, seqQ, seqK, headDim, scale, isCausal, softcap: softcap);
+
+    public void RopeInterleaved(IGpuBuffer input, IGpuBuffer cos, IGpuBuffer sin, IGpuBuffer output,
+        int rows, int headDim, int seqLen, int startPosition)
+    {
+        if (rows <= 0 || headDim <= 0 || seqLen <= 0)
+            throw new ArgumentOutOfRangeException(nameof(rows), "RoPE dimensions must be positive.");
+        if ((headDim & 1) != 0)
+            throw new ArgumentException("RoPE requires an even head dimension.", nameof(headDim));
+        int total = checked(rows * headDim);
+        if (input.Size < total || output.Size < total)
+            throw new ArgumentException("RoPE input/output buffers are smaller than rows * headDim.");
+        int pairs = checked(rows * (headDim / 2));
+        GlslNaryOp(VulkanGlslKernels.RopeInterleaved,
+            new[] { input, cos, sin, output }, pairs,
+            new[] { (uint)rows, (uint)headDim, (uint)seqLen, (uint)startPosition });
+    }
 
     private void AttentionForwardCore(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer? attentionWeights, IGpuBuffer? mask,

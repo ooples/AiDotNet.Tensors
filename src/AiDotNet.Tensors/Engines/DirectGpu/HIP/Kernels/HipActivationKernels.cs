@@ -343,7 +343,19 @@ extern ""C"" __global__ __launch_bounds__(256) void power_scalar(const float* A,
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    B[idx] = powf(A[idx], exponent);
+    float x = A[idx];
+    // Fast pow implementations route through log2(x), which is invalid for a
+    // negative x even when the exponent is integral. Compute the magnitude
+    // from |x| and restore the sign for odd exponents.
+    if (x < 0.0f && exponent == truncf(exponent))
+    {
+        float magnitude = powf(-x, exponent);
+        B[idx] = (fmodf(fabsf(exponent), 2.0f) == 1.0f) ? -magnitude : magnitude;
+    }
+    else
+    {
+        B[idx] = powf(x, exponent);
+    }
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void reduce_sum(const float* input, float* output, int size)

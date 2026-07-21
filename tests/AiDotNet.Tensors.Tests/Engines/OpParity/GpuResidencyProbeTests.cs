@@ -52,13 +52,15 @@ public sealed class GpuResidencyProbeTests
     // when both hang off the same hook. 0f5be5e had it right that softmax reaches the GPU — its only
     // error was naming LaunchKernelWithSharedMem instead of LaunchSoftmaxKernel.
     //
-    // Still below the floor (5): NativeNormalizeRows[4,8], TensorBroadcastMultiply[4,64],
+    // Historical worklist before the final launcher-instrumentation pass (5):
+    // NativeNormalizeRows[4,8], TensorBroadcastMultiply[4,64],
     // TensorSoftmaxRows[4,64], Upsample[1,2,4,4;2x2], UpsampleBackward[1,2,8,8->1,2,4,4].
     // TensorSoftmaxRows did NOT clear with the softmax launcher fix, so it takes a different path.
     // Next step is the same one that worked here: find the launcher each op actually reaches and check
     // whether it is instrumented, BEFORE concluding anything about CPU execution. GpuLaunchProbe.
     // OnFallback records guard declines and swallowed exceptions and fired for NONE of these, which by
     // itself does not distinguish "ran on GPU uncounted" from "left the device path uninstrumented".
+    // The final measurement after those launchers were instrumented reported zero operations below the floor.
 
     // Ops whose GPU override throws kernel-not-found and silently falls back to the CPU (a hollow
     // override — reflection counts it covered, the probe proves it does zero GPU work). GOAL 0.
@@ -95,6 +97,10 @@ public sealed class GpuResidencyProbeTests
             // A quarantined op makes no residency claim (its GPU path is skipped/known-broken).
             if (op.KnownDivergence is not null || op.GpuUnsafe) continue;
 
+            // Isolate this case from deferred activations left by the previous registry operation.
+            // DropActivationCache discards those dead test temporaries without materializing them; doing
+            // this before Reset also prevents cleanup work from being attributed to the operation below.
+            gpu.DropActivationCache();
             GpuLaunchProbe.Reset();
             long launches;
             long internalReadbacks;
