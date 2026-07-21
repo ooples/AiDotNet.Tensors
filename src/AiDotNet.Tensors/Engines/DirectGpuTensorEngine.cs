@@ -12176,11 +12176,29 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         // Use TileBatch to repeat gradient values
         // TileBatch(input, output, repeats, innerSize) tiles input[i] to output[i*repeats:(i+1)*repeats]
-        // Was TileBatch(grad, out, reduceSize, 1): under TileBatch's contract that writes only
-        // reduceSize elements into a buffer sized outerSize*reduceSize, and the Scale below then
-        // scaled UNINITIALISED memory for outerSize > 1. The gradient needs out[o*reduceSize + r] =
-        // grad[o], which is (repeats: reduceSize, innerSize: outerSize).
-        backend.TileBatch(gradOutput.Buffer, outputBuffer, reduceSize, outerSize);
+        // The reduced axes are always CONTIGUOUS MIDDLE dims, so the layout is [outer, reduce, inner]
+        // and the gradient is [outer, inner]. The required broadcast is therefore
+        //     gradInput[(o*reduceSize + r)*innerCount + i] = gradOutput[o*innerCount + i]
+        // i.e. INTERLEAVED over a middle axis.
+        //
+        // Two earlier forms were both wrong:
+        //   TileBatch(grad, out, reduceSize, 1)         wrote only reduceSize elements into a buffer
+        //                                               sized totalSize, so the Scale below ran over
+        //                                               UNINITIALISED memory whenever outerSize > 1.
+        //   TileBatch(grad, out, reduceSize, outerSize) fills the buffer but is a BLOCKED repeat,
+        //                                               out[idx] = grad[idx/reduceSize]. That is only
+        //                                               correct when innerCount == 1; for [2,3,4] it
+        //                                               puts grad[0] where grad[1] belongs.
+        //
+        // TileAxis(grad, out, outerCount, 1, innerCount, reduceSize) gives exactly the interleave:
+        // expandedAxis=reduceSize, outer=idx/(reduceSize*innerCount), inner=idx%innerCount, axis=0,
+        // so out[idx] = grad[outer*innerCount + inner], total = outerCount*reduceSize*innerCount.
+        int firstAxis = axes[0], lastAxis = axes[axes.Length - 1];
+        int outerCount = 1;
+        for (int d = 0; d < firstAxis; d++) outerCount *= inputShape[d];
+        int innerCount = 1;
+        for (int d = lastAxis + 1; d < rank; d++) innerCount *= inputShape[d];
+        backend.TileAxis(gradOutput.Buffer, outputBuffer, outerCount, 1, innerCount, reduceSize);
 
         // Scale the output by 1/reduceSize
         backend.Scale(outputBuffer, outputBuffer, scale, totalSize);
