@@ -96,6 +96,12 @@ class Program
             DirectPtxMixedLinearExperiment.RunM16(runs);
             return;
         }
+        if (args.Length > 0 && args[0] == "--direct-ptx-w8a8-linear")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxW8A8LinearExperiment.Run(runs);
+            return;
+        }
         if (args.Length > 0 && args[0] == "--direct-ptx-external-gpu-baselines")
         {
             DirectPtxExternalBaselines.Run();
@@ -124,6 +130,11 @@ class Program
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-mixed-linear-m16")
         {
             DirectPtxProfileTarget.RunMixedLinearM16();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-w8a8-linear")
+        {
+            DirectPtxProfileTarget.RunW8A8Linear();
             return;
         }
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-decode")

@@ -2565,6 +2565,168 @@ public class DirectPtxWmmaTests
     }
 
     [Fact]
+    public void W8A8FusedLinearEmitter_HasPackedDp4aAndNoDynamicShapeAbi()
+    {
+        string ptx = PtxFusedLinearGeluW8A8M1Kernel.EmitPtx(8, 6, 1024, 4096);
+        Assert.Contains("dp4a.s32.s32", ptx, StringComparison.Ordinal);
+        Assert.Contains("ld.global.nc.u32", ptx, StringComparison.Ordinal);
+        Assert.Contains("tanh.approx.f32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.Equal(6, Count(ptx, ".param .u64"));
+        Assert.True(PtxFusedLinearGeluW8A8M1Kernel.IsPromotedShape(1024, 4096));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxFusedLinearGeluW8A8M1Kernel.EmitPtx(8, 6, 512, 2048));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyW8A8FusedLinearGeluM1_MatchesOracleAndHasZeroLocalBytes()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(runtime.ArchitectureFamily == DirectPtxArchitectureFamily.Ampere,
+            "The checked-in W8A8 fused-linear specialization is validated on Ampere.");
+        const int inputFeatures = 1024, outputFeatures = 4096;
+        using var kernel = new PtxFusedLinearGeluW8A8M1Kernel(
+            runtime, inputFeatures, outputFeatures);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+        Assert.Equal(0, kernel.Audit.Function.StaticSharedBytes);
+        Assert.True(kernel.Audit.ActiveBlocksPerMultiprocessor >= 8);
+        Assert.Equal(DirectPtxPhysicalType.Int8, kernel.Blueprint.Tensors[0].PhysicalType);
+        Assert.Equal(DirectPtxPhysicalType.Int8, kernel.Blueprint.Tensors[1].PhysicalType);
+        Assert.Equal(6, kernel.Blueprint.Tensors.Count);
+
+        var random = new Random(20260874);
+        sbyte[] inputHost = QuantizedValues(random, inputFeatures);
+        sbyte[] weightHost = QuantizedValues(random, inputFeatures * outputFeatures);
+        const float activationScaleHost = 0.01f;
+        float[] weightScalesHost = Values(random, outputFeatures)
+            .Select(value => 0.004f + MathF.Abs(value) * 0.001f).ToArray();
+        float[] biasHost = Values(random, outputFeatures, 0.02f);
+        float[] expected = FusedLinearGeluW8A8Oracle(
+            inputHost, weightHost, activationScaleHost,
+            weightScalesHost, biasHost, inputFeatures, outputFeatures);
+        using var input = runtime.AllocateBytes((nuint)inputHost.Length);
+        using var weights = runtime.AllocateBytes((nuint)weightHost.Length);
+        using var activationScale = runtime.AllocateBytes(sizeof(float));
+        using var weightScales = runtime.AllocateBytes(
+            (nuint)(weightScalesHost.Length * sizeof(float)));
+        using var bias = runtime.AllocateBytes((nuint)(biasHost.Length * sizeof(float)));
+        using var output = runtime.AllocateBytes((nuint)(outputFeatures * sizeof(float)));
+        input.Upload<sbyte>(inputHost);
+        weights.Upload<sbyte>(weightHost);
+        activationScale.Upload<float>([activationScaleHost]);
+        weightScales.Upload<float>(weightScalesHost);
+        bias.Upload<float>(biasHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(weights, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(activationScale, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(weightScales, kernel.Blueprint.Tensors[3]),
+            DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[4]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[5]));
+        runtime.Synchronize();
+        var actual = new float[outputFeatures];
+        output.Download<float>(actual);
+        AssertVectorClose(actual, expected, 5e-4f, "direct W8A8 fused linear GELU");
+    }
+
+    [SkippableFact]
+    public void BackendW8A8FusedLinearGeluM1_IsZeroAllocationCapturableAndFailClosed()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previous = DirectPtxFeatureGate.TestOverride;
+        bool previousExperiment = DirectPtxFeatureGate.QuantizedLinearExperimentOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        DirectPtxFeatureGate.QuantizedLinearExperimentOverride = false;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxQuantizedLinearEnabled,
+                "Requires an Ampere CUDA backend.");
+            const int inputFeatures = 1024, outputFeatures = 4096;
+            var random = new Random(20260875);
+            sbyte[] inputHost = QuantizedValues(random, inputFeatures);
+            sbyte[] weightHost = QuantizedValues(random, inputFeatures * outputFeatures);
+            const float activationScaleHost = 0.01f;
+            float[] weightScalesHost = Values(random, outputFeatures)
+                .Select(value => 0.004f + MathF.Abs(value) * 0.001f).ToArray();
+            float[] biasHost = Values(random, outputFeatures, 0.02f);
+            float[] expected = FusedLinearGeluW8A8Oracle(
+                inputHost, weightHost, activationScaleHost,
+                weightScalesHost, biasHost, inputFeatures, outputFeatures);
+            using var input = backend.AllocateByteBuffer(inputHost.Length);
+            using var weights = backend.AllocateByteBuffer(weightHost.Length);
+            using var activationScale = backend.AllocateBuffer([activationScaleHost]);
+            using var weightScales = backend.AllocateBuffer(weightScalesHost);
+            using var bias = backend.AllocateBuffer(biasHost);
+            using var output = backend.AllocateBuffer(outputFeatures);
+            using var wrongOutput = backend.AllocateBuffer(outputFeatures + 1);
+            backend.UploadByteBuffer(input, inputHost.Select(value => unchecked((byte)value)).ToArray());
+            backend.UploadByteBuffer(weights, weightHost.Select(value => unchecked((byte)value)).ToArray());
+
+            Assert.False(backend.TryDirectPtxFusedLinearGeluW8A8M1(
+                input, weights, activationScale, weightScales, bias, output,
+                512, 2048));
+            Assert.Equal("quantized-linear-shape-not-implemented", backend.DirectPtxLastError);
+
+            DirectPtxFeatureGate.TestOverride = false;
+            long fallbackDispatchBefore = backend.DirectPtxQuantizedLinearDispatchCount;
+            backend.FusedLinearGELUW8A8TransposedM1(
+                input, weights, activationScale, weightScales, bias, output,
+                inputFeatures, outputFeatures);
+            backend.Synchronize();
+            Assert.Equal(fallbackDispatchBefore, backend.DirectPtxQuantizedLinearDispatchCount);
+            AssertVectorClose(backend.DownloadBuffer(output), expected, 5e-4f,
+                "NVRTC fallback W8A8 fused linear GELU");
+
+            DirectPtxFeatureGate.TestOverride = true;
+            DirectPtxFeatureGate.QuantizedLinearExperimentOverride = true;
+            Assert.False(backend.TryDirectPtxFusedLinearGeluW8A8M1(
+                input, weights, activationScale, weightScales, bias, wrongOutput,
+                inputFeatures, outputFeatures));
+            Assert.Equal("quantized-linear-physical-extent-mismatch", backend.DirectPtxLastError);
+            Assert.True(backend.PrewarmDirectPtxFusedLinearGeluW8A8M1(
+                inputFeatures, outputFeatures), backend.DirectPtxLastError);
+            for (int i = 0; i < 8; i++)
+                Assert.True(backend.TryDirectPtxFusedLinearGeluW8A8M1(
+                    input, weights, activationScale, weightScales, bias, output,
+                    inputFeatures, outputFeatures), backend.DirectPtxLastError);
+
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            bool allLaunched = true;
+            for (int i = 0; i < 32; i++)
+                allLaunched &= backend.TryDirectPtxFusedLinearGeluW8A8M1(
+                    input, weights, activationScale, weightScales, bias, output,
+                    inputFeatures, outputFeatures);
+            long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+            backend.Synchronize();
+            Assert.True(allLaunched, backend.DirectPtxLastError);
+            Assert.Equal(0, allocated);
+            AssertVectorClose(backend.DownloadBuffer(output), expected, 5e-4f,
+                "backend W8A8 fused linear GELU");
+
+            bool captured = true;
+            IntPtr graph = backend.CaptureGraph(() =>
+                captured &= backend.TryDirectPtxFusedLinearGeluW8A8M1(
+                    input, weights, activationScale, weightScales, bias, output,
+                    inputFeatures, outputFeatures));
+            Assert.True(captured, backend.DirectPtxLastError);
+            try { backend.LaunchCapturedGraph(graph); }
+            finally { backend.DestroyCapturedGraph(graph); }
+            backend.Synchronize();
+            Assert.True(backend.TryGetDirectPtxQuantizedLinearAudit(
+                inputFeatures, outputFeatures, out DirectPtxKernelAudit audit));
+            Assert.Equal(0, audit.Function.LocalBytesPerThread);
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previous;
+            DirectPtxFeatureGate.QuantizedLinearExperimentOverride = previousExperiment;
+        }
+    }
+
+    [Fact]
     public void DenseLinearCoverageManifest_AssignsEveryScopedApiExactlyOnce()
     {
         Assert.Equal(39, DirectPtxDenseLinearCoverageManifest.All.Count);
@@ -2605,7 +2767,7 @@ public class DirectPtxWmmaTests
     [Fact]
     public void QuantizedMixedSparseCoverageManifest_AssignsEveryScopedApiExactlyOnce()
     {
-        Assert.Equal(15, DirectPtxQuantizedMixedSparseCoverageManifest.All.Count);
+        Assert.Equal(16, DirectPtxQuantizedMixedSparseCoverageManifest.All.Count);
         string[] names = DirectPtxQuantizedMixedSparseCoverageManifest.All
             .Select(cell => cell.Api).ToArray();
         Assert.Equal(names.Length, names.Distinct(StringComparer.Ordinal).Count());
@@ -2623,6 +2785,9 @@ public class DirectPtxWmmaTests
         Assert.Equal(DirectPtxQuantizedMixedSparseCoverageStatus.ExperimentalDirectPtx,
             DirectPtxQuantizedMixedSparseCoverageManifest.Get(
                 "CudaBackend.FusedLinearGELUFp16TransposedM16").Status);
+        Assert.Equal(DirectPtxQuantizedMixedSparseCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxQuantizedMixedSparseCoverageManifest.Get(
+                "CudaBackend.FusedLinearGELUW8A8TransposedM1").Status);
         Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() =>
             DirectPtxQuantizedMixedSparseCoverageManifest.Get("UnassignedMixedApi"));
     }
@@ -3595,6 +3760,38 @@ public class DirectPtxWmmaTests
             valueCache[cacheBase + outputIndex + 1] = projection[2 * modelDimension + outputIndex + 1];
         }
         return (query, keyCache, valueCache);
+    }
+
+    private static float[] FusedLinearGeluW8A8Oracle(
+        sbyte[] input,
+        sbyte[] weights,
+        float activationScale,
+        float[] weightScales,
+        float[] bias,
+        int inputFeatures,
+        int outputFeatures)
+    {
+        var output = new float[outputFeatures];
+        for (int column = 0; column < outputFeatures; column++)
+        {
+            int accumulator = 0;
+            int weightBase = column * inputFeatures;
+            for (int inner = 0; inner < inputFeatures; inner++)
+                accumulator += input[inner] * weights[weightBase + inner];
+            float value = accumulator * activationScale * weightScales[column] + bias[column];
+            output[column] = 0.5f * value *
+                (1f + MathF.Tanh(0.7978845608f *
+                    (value + 0.044715f * value * value * value)));
+        }
+        return output;
+    }
+
+    private static sbyte[] QuantizedValues(Random random, int count)
+    {
+        var result = new sbyte[count];
+        for (int i = 0; i < result.Length; i++)
+            result[i] = (sbyte)random.Next(-16, 17);
+        return result;
     }
 
     private static float[] FusedLinearGeluOracle(

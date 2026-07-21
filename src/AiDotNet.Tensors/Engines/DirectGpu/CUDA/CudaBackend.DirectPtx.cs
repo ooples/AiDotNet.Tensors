@@ -36,6 +36,8 @@ public sealed partial class CudaBackend
         _directPtxMixedLinearKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<DirectPtxFusedLinearKey, PtxFusedLinearGeluFp16M16Kernel>
         _directPtxMixedLinearM16Kernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<DirectPtxFusedLinearKey, PtxFusedLinearGeluW8A8M1Kernel>
+        _directPtxQuantizedLinearKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private DirectPtxRuntime? _directPtxRuntime;
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
@@ -51,6 +53,7 @@ public sealed partial class CudaBackend
     private long _directPtxQkvRopeCacheDispatchCount;
     private long _directPtxFusedLinearDispatchCount;
     private long _directPtxMixedLinearDispatchCount;
+    private long _directPtxQuantizedLinearDispatchCount;
     internal int DirectPtxCachedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxAttentionKernels.Count; }
@@ -94,6 +97,10 @@ public sealed partial class CudaBackend
 
     internal bool IsDirectPtxMixedLinearEnabled =>
         DirectPtxFeatureGate.IsMixedPrecisionLinearEnabled && IsAvailable &&
+        DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) == DirectPtxArchitectureFamily.Ampere;
+
+    internal bool IsDirectPtxQuantizedLinearEnabled =>
+        DirectPtxFeatureGate.IsQuantizedLinearEnabled && IsAvailable &&
         DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) == DirectPtxArchitectureFamily.Ampere;
 
     internal long DirectPtxResidualRmsNormDispatchCount =>
@@ -371,6 +378,9 @@ public sealed partial class CudaBackend
     internal long DirectPtxMixedLinearDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxMixedLinearDispatchCount);
 
+    internal long DirectPtxQuantizedLinearDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxQuantizedLinearDispatchCount);
+
     /// <summary>
     /// Attempts the exact contiguous FP16-input/weight, FP32-accumulate M=1
     /// linear + FP32 bias + tanh-GELU specialization.
@@ -498,6 +508,146 @@ public sealed partial class CudaBackend
         {
             var key = new DirectPtxFusedLinearKey(inputFeatures, outputFeatures);
             if (_directPtxMixedLinearKernels.TryGetValue(key, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null!;
+        return false;
+    }
+
+    /// <summary>
+    /// Attempts the exact contiguous symmetric W8A8 M=1 projection with S32
+    /// DP4A accumulation and a fused FP32 dequant/bias/tanh-GELU epilogue.
+    /// </summary>
+    internal bool TryDirectPtxFusedLinearGeluW8A8M1(
+        IGpuBuffer inputInt8,
+        IGpuBuffer outputMajorWeightsInt8,
+        IGpuBuffer activationScaleFloat,
+        IGpuBuffer weightScalesFloat,
+        IGpuBuffer biasFloat,
+        IGpuBuffer outputFloat,
+        int inputFeatures,
+        int outputFeatures)
+    {
+        if (!IsDirectPtxQuantizedLinearEnabled) return false;
+        if (!PtxFusedLinearGeluW8A8M1Kernel.IsSupportedShape(inputFeatures, outputFeatures))
+        {
+            DirectPtxLastError = "quantized-linear-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedLinearGeluW8A8M1Kernel.IsPromotedShape(inputFeatures, outputFeatures) &&
+            !DirectPtxFeatureGate.QuantizedLinearExperimentOverride)
+        {
+            DirectPtxLastError = "quantized-linear-performance-gate-not-met";
+            return false;
+        }
+        long outputBytes = checked((long)outputFeatures * sizeof(float));
+        if (inputInt8.SizeInBytes != inputFeatures ||
+            outputMajorWeightsInt8.SizeInBytes != checked((long)inputFeatures * outputFeatures) ||
+            activationScaleFloat.SizeInBytes != sizeof(float) ||
+            weightScalesFloat.SizeInBytes != outputBytes ||
+            biasFloat.SizeInBytes != outputBytes || outputFloat.SizeInBytes != outputBytes)
+        {
+            DirectPtxLastError = "quantized-linear-physical-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            EnsureContextCurrent();
+            var key = new DirectPtxFusedLinearKey(inputFeatures, outputFeatures);
+            lock (_directPtxLock)
+            {
+                if (!_directPtxQuantizedLinearKernels.TryGetValue(
+                    key, out PtxFusedLinearGeluW8A8M1Kernel? kernel))
+                {
+                    if (IsStreamCapturing())
+                    {
+                        DirectPtxLastError =
+                            "Direct PTX W8A8 linear must be prewarmed before CUDA graph capture.";
+                        return false;
+                    }
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    kernel = CreateAndCacheQuantizedLinearKernelSlow(key);
+                }
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(inputInt8, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(outputMajorWeightsInt8, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(activationScaleFloat, kernel.Blueprint.Tensors[2]),
+                        DirectPtxTensorView.Create(weightScalesFloat, kernel.Blueprint.Tensors[3]),
+                        DirectPtxTensorView.Create(biasFloat, kernel.Blueprint.Tensors[4]),
+                        DirectPtxTensorView.Create(outputFloat, kernel.Blueprint.Tensors[5]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxQuantizedLinearDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    private PtxFusedLinearGeluW8A8M1Kernel CreateAndCacheQuantizedLinearKernelSlow(
+        DirectPtxFusedLinearKey key) =>
+        _directPtxQuantizedLinearKernels.GetOrAdd(key, () =>
+            new PtxFusedLinearGeluW8A8M1Kernel(
+                _directPtxRuntime!, key.InputFeatures, key.OutputFeatures));
+
+    internal bool PrewarmDirectPtxFusedLinearGeluW8A8M1(
+        int inputFeatures,
+        int outputFeatures)
+    {
+        if (!IsDirectPtxQuantizedLinearEnabled) return false;
+        if (!PtxFusedLinearGeluW8A8M1Kernel.IsSupportedShape(inputFeatures, outputFeatures))
+        {
+            DirectPtxLastError = "quantized-linear-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedLinearGeluW8A8M1Kernel.IsPromotedShape(inputFeatures, outputFeatures) &&
+            !DirectPtxFeatureGate.QuantizedLinearExperimentOverride)
+        {
+            DirectPtxLastError = "quantized-linear-performance-gate-not-met";
+            return false;
+        }
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX W8A8 linear prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                var key = new DirectPtxFusedLinearKey(inputFeatures, outputFeatures);
+                if (!_directPtxQuantizedLinearKernels.TryGetValue(key, out _))
+                    _ = CreateAndCacheQuantizedLinearKernelSlow(key);
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxQuantizedLinearAudit(
+        int inputFeatures,
+        int outputFeatures,
+        out DirectPtxKernelAudit audit)
+    {
+        lock (_directPtxLock)
+        {
+            var key = new DirectPtxFusedLinearKey(inputFeatures, outputFeatures);
+            if (_directPtxQuantizedLinearKernels.TryGetValue(key, out var kernel))
             {
                 audit = kernel.Audit;
                 return true;
@@ -2242,6 +2392,7 @@ public sealed partial class CudaBackend
             _directPtxFusedLinearKernels.Dispose();
             _directPtxMixedLinearKernels.Dispose();
             _directPtxMixedLinearM16Kernels.Dispose();
+            _directPtxQuantizedLinearKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }
