@@ -1,3 +1,5 @@
+#if !NETFRAMEWORK
+
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -59,3 +61,4 @@ public class SeluBackwardZeroBoundaryTests
         }
     }
 }
+#endif

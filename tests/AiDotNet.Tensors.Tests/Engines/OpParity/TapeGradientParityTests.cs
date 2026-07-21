@@ -1,3 +1,5 @@
+#if !NETFRAMEWORK
+
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.OpParity;
@@ -29,3 +31,4 @@ public class TapeGradientParityTests
         TapeGradientParityHarness.CheckTapeGradient(op, _fx);
     }
 }
+#endif

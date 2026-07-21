@@ -28,6 +28,15 @@ public class RfftInterleavedAbBenchmark
     private readonly ITestOutputHelper _out;
     public RfftInterleavedAbBenchmark(ITestOutputHelper output) => _out = output;
 
+    private static long AllocatedBytes()
+    {
+#if NET6_0_OR_GREATER
+        return GC.GetTotalAllocatedBytes(precise: false);
+#else
+        return GC.GetTotalMemory(forceFullCollection: false);
+#endif
+    }
+
     private static Tensor<double> Signal(int batch, int n, int seed)
     {
         var rng = new Random(seed);
@@ -105,14 +114,14 @@ public class RfftInterleavedAbBenchmark
                 {
                     // Legacy half.
                     CpuEngine.UseLegacyFftCore = true;
-                    long b0 = GC.GetTotalAllocatedBytes(precise: false);
+                    long b0 = AllocatedBytes();
                     var swL = Stopwatch.StartNew(); _ = engine.RFFT(x); swL.Stop();
-                    long b1 = GC.GetTotalAllocatedBytes(precise: false);
+                    long b1 = AllocatedBytes();
 
                     // Modern half, immediately after — same thermal state.
                     CpuEngine.UseLegacyFftCore = false;
                     var swM = Stopwatch.StartNew(); _ = engine.RFFT(x); swM.Stop();
-                    long b2 = GC.GetTotalAllocatedBytes(precise: false);
+                    long b2 = AllocatedBytes();
 
                     legacyMs[r] = swL.Elapsed.TotalMilliseconds;
                     modernMs[r] = swM.Elapsed.TotalMilliseconds;

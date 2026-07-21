@@ -39146,7 +39146,18 @@ public partial class CpuEngine : ITensorLevelEngine
 
     #region FFT and Signal Processing
 
-    /// <inheritdoc/>
+    /// <summary>
+    /// Test-only switch selecting the legacy FFTCore path instead of NativeFFTInPlace.
+    /// </summary>
+    /// <remarks>
+    /// Exists so both cores can be exercised in one process and interleaved within a single thermal window.
+    /// The caller's value is captured before RFFT fans out to worker threads. Never set outside benchmarks.
+    /// </remarks>
+    [ThreadStatic]
+    internal static bool UseLegacyFftCore;
+
+    [ThreadStatic] private static object? _fftScratch;
+
     /// <summary>
     /// Exact-size per-thread scratch for the FFT cores.
     /// </summary>
@@ -39161,20 +39172,6 @@ public partial class CpuEngine : ITensorLevelEngine
     /// IRFFT writes [0, nFft/2] from the positive frequencies and (nFft/2, nFft) by conjugate symmetry,
     /// which together cover every bin. No stale element from a previous signal can survive.
     /// </remarks>
-    /// <summary>
-    /// Test-only switch selecting the legacy FFTCore path instead of NativeFFTInPlace.
-    /// </summary>
-    /// <remarks>
-    /// Exists so both cores can be exercised in ONE process and interleaved within a single thermal window.
-    /// Comparing them across separate runs is not sound on a many-core box that throttles under sustained
-    /// load: identical code re-measured minutes apart varied by up to 3.7x here, which swamps the effect
-    /// being measured. Interleaving A/B/A/B inside one process is what makes the comparison meaningful.
-    /// Never set outside benchmarks.
-    /// </remarks>
-    internal static bool UseLegacyFftCore;
-
-    [ThreadStatic] private static object? _fftScratch;
-
     private static Complex<T>[] FftScratch<T>(int nFft)
     {
         if (_fftScratch is Complex<T>[] buf && buf.Length == nFft) return buf;
@@ -39216,13 +39213,15 @@ public partial class CpuEngine : ITensorLevelEngine
         // per (n, inverse) and dispatches float/double to non-generic span kernels, so RFFT gets that for free.
         // Measured before this change on the Autoformer aggregation benchmark: the FFT path ran ~9-12x SLOWER
         // than the scalar loop it was meant to replace despite issuing ~3x fewer FLOPs.
+        // Snapshot the thread-local benchmark option before the work fans out to worker threads.
+        bool useLegacyFftCore = UseLegacyFftCore;
         CpuParallelSettings.ParallelForOrSerial(0, batchSize, input.Length, batchIdx =>
         {
             // One exact-size buffer per signal (was ~6 Vector<T> allocations). Not pooled: ArrayPool.Rent may
             // hand back a longer array and the in-place core keys its transform length off the array length.
             int inputOffset = batchIdx * n;
             int outputOffsetLegacy = batchIdx * numFreqs * 2;
-            if (UseLegacyFftCore)
+            if (useLegacyFftCore)
             {
                 var signal = new Vector<T>(nFft);
                 for (int i = 0; i < n; i++) signal[i] = inputData[inputOffset + i];

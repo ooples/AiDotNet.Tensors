@@ -1,3 +1,5 @@
+#if !NETFRAMEWORK
+
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -125,11 +127,9 @@ public static class TapeGradientParityHarness
     /// </remarks>
     private static List<Tensor<float>> DiscoverLeaves(GradientTape<float> tape)
     {
-        var producedByAnOp = new HashSet<Tensor<float>>(ReferenceEqualityComparer.Instance
-            as IEqualityComparer<Tensor<float>> ?? EqualityComparer<Tensor<float>>.Default);
+        var producedByAnOp = new HashSet<Tensor<float>>(ReferenceEqualityComparer<Tensor<float>>.Instance);
         var seenInputs = new List<Tensor<float>>();
-        var seenSet = new HashSet<Tensor<float>>(ReferenceEqualityComparer.Instance
-            as IEqualityComparer<Tensor<float>> ?? EqualityComparer<Tensor<float>>.Default);
+        var seenSet = new HashSet<Tensor<float>>(ReferenceEqualityComparer<Tensor<float>>.Instance);
 
         for (int i = 0; i < tape.EntryCount; i++)
         {
@@ -335,3 +335,4 @@ public static class TapeGradientParityHarness
         => OpParityHarness.MaybeResetGpuEngine(fx);
 
 }
+#endif

@@ -1,3 +1,5 @@
+#if !NETFRAMEWORK
+
 using System.Reflection;
 using System.Text.RegularExpressions;
 using Xunit;
@@ -235,3 +237,4 @@ public class TapeBailAuditTests
             + "reflecting real debt: " + string.Join(", ", stale));
     }
 }
+#endif

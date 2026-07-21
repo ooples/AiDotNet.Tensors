@@ -29,6 +29,15 @@ public class RfftPerformanceBenchmark
     private readonly ITestOutputHelper _out;
     public RfftPerformanceBenchmark(ITestOutputHelper output) => _out = output;
 
+    private static long AllocatedBytes()
+    {
+#if NET6_0_OR_GREATER
+        return GC.GetTotalAllocatedBytes(precise: false);
+#else
+        return GC.GetTotalMemory(forceFullCollection: false);
+#endif
+    }
+
     private static Tensor<double> Signal(int batch, int n, int seed)
     {
         var rng = new Random(seed);
@@ -68,7 +77,7 @@ public class RfftPerformanceBenchmark
                 {
                     for (int i = 0; i < Warmup; i++) _ = f();
                     var times = new double[Iters];
-                    long before = GC.GetTotalAllocatedBytes(precise: false);
+                    long before = AllocatedBytes();
                     for (int i = 0; i < Iters; i++)
                     {
                         var sw = Stopwatch.StartNew();
@@ -76,7 +85,7 @@ public class RfftPerformanceBenchmark
                         sw.Stop();
                         times[i] = sw.Elapsed.TotalMilliseconds;
                     }
-                    bytes = (GC.GetTotalAllocatedBytes(precise: false) - before) / Iters;
+                    bytes = (AllocatedBytes() - before) / Iters;
                     Array.Sort(times);
                     return times[Iters / 2];
                 }
@@ -87,7 +96,7 @@ public class RfftPerformanceBenchmark
 
                 // What the old core recomputed per call: (nFft/2)*log2(nFft) butterflies x 2 transcendentals,
                 // once per signal. The cached-twiddle core computes each (size, k) pair once per (n, inverse).
-                long trig = (long)batch * (nFft / 2) * (long)Math.Log2(nFft) * 2;
+                long trig = (long)batch * (nFft / 2) * (long)Math.Log(nFft, 2) * 2;
 
                 _out.WriteLine(
                     $"  {batch,5}  {n,5}  {nFft,5}  {tR,8:F3}  {aR / 1024.0,14:F1}  {tI,9:F3}  {aI / 1024.0,15:F1}  {trig / 1e6,15:F1} M");

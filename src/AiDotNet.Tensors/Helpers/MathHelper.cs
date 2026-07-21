@@ -48,7 +48,7 @@ public static class MathHelper
             // accessor keeps the observable behaviour identical to the previous GetOrAdd implementation —
             // the cost is one perfectly-predicted null check, against a dictionary probe it removes.
             try { Instance = (INumericOperations<T>)CreateNumericOperations<T>(); }
-            catch (Exception ex) { Error = ex; }
+            catch (NotSupportedException ex) { Error = ex; }
         }
     }
 

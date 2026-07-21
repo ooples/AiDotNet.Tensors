@@ -14276,6 +14276,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (n <= 0) return;
         ValidateSplitBuffers(n, nameof(InterleaveComplex), real, imag);
+        if (interleaved is null) throw new ArgumentNullException(nameof(interleaved));
+        long requiredInterleaved = checked((long)n * 2);
+        if (interleaved.Size < requiredInterleaved)
+            throw new ArgumentException($"{nameof(InterleaveComplex)}: n ({n}) requires {requiredInterleaved} interleaved elements but buffer size is {interleaved.Size}.", nameof(interleaved));
         if (!_kernelCache.TryGetValue("interleave_complex", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: interleave_complex. Register CudaComplexKernels.");
         using var _ = PushContext();
@@ -14290,6 +14294,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (n <= 0) return;
         ValidateSplitBuffers(n, nameof(DeinterleaveComplex), real, imag);
+        if (interleaved is null) throw new ArgumentNullException(nameof(interleaved));
+        long requiredInterleaved = checked((long)n * 2);
+        if (interleaved.Size < requiredInterleaved)
+            throw new ArgumentException($"{nameof(DeinterleaveComplex)}: n ({n}) requires {requiredInterleaved} interleaved elements but buffer size is {interleaved.Size}.", nameof(interleaved));
         if (!_kernelCache.TryGetValue("deinterleave_complex", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: deinterleave_complex. Register CudaComplexKernels.");
         using var _ = PushContext();

@@ -248,6 +248,10 @@ public sealed partial class HipBackend
     {
         if (n <= 0) return;
         ValidateHipSplitBuffers(n, nameof(InterleaveComplex), real, imag);
+        if (interleaved is null) throw new ArgumentNullException(nameof(interleaved));
+        long requiredInterleaved = checked((long)n * 2);
+        if (interleaved.Size < requiredInterleaved)
+            throw new ArgumentException($"{nameof(InterleaveComplex)}: n ({n}) requires {requiredInterleaved} interleaved elements but buffer size is {interleaved.Size}.", nameof(interleaved));
         if (!_kernelCache.TryGetValue("interleave_complex", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: interleave_complex");
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -260,6 +264,10 @@ public sealed partial class HipBackend
     {
         if (n <= 0) return;
         ValidateHipSplitBuffers(n, nameof(DeinterleaveComplex), real, imag);
+        if (interleaved is null) throw new ArgumentNullException(nameof(interleaved));
+        long requiredInterleaved = checked((long)n * 2);
+        if (interleaved.Size < requiredInterleaved)
+            throw new ArgumentException($"{nameof(DeinterleaveComplex)}: n ({n}) requires {requiredInterleaved} interleaved elements but buffer size is {interleaved.Size}.", nameof(interleaved));
         if (!_kernelCache.TryGetValue("deinterleave_complex", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: deinterleave_complex");
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
