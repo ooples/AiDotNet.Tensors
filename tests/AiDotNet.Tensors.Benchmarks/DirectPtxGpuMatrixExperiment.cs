@@ -131,14 +131,15 @@ internal static class DirectPtxGpuMatrixExperiment
                     long allocation = Allocation(runtime.Synchronize, launch);
                     double occupancy = kernel.Audit.ActiveBlocksPerMultiprocessor *
                         kernel.Audit.BlockThreads / (double)runtime.MaxThreadsPerMultiprocessor;
-                    Print(shape, causal, fused, "Direct PTX online [device]", deviceTime,
+                    string directMethod = $"Direct PTX online w{kernel.WarpsPerBlock}";
+                    Print(shape, causal, fused, directMethod + " [device]", deviceTime,
                         Tflops(shape, deviceTime.Median), allocation, 0, error,
                         kernel.FunctionInfo.RegistersPerThread,
                         kernel.FunctionInfo.StaticSharedBytes,
                         0,
                         kernel.FunctionInfo.LocalBytesPerThread,
                         occupancy);
-                    Print(shape, causal, fused, "Direct PTX online [E2E]", time,
+                    Print(shape, causal, fused, directMethod + " [E2E]", time,
                         Tflops(shape, time.Median), allocation, 0, error,
                         kernel.FunctionInfo.RegistersPerThread,
                         kernel.FunctionInfo.StaticSharedBytes,

@@ -133,6 +133,11 @@ def measure(fn, samples=101, warmups=30):
             "managed_bytes_per_call": None,
             "peak_device_bytes": peak_memory,
             "temporary_device_bytes": temporary_memory,
+            "registers_per_thread": None,
+            "static_shared_bytes": None,
+            "dynamic_shared_bytes": None,
+            "local_bytes_per_thread": None,
+            "occupancy": None,
         }
 
     return [summarize("device", device_timings), summarize("E2E", e2e_timings)]
@@ -148,7 +153,8 @@ def emit(record, json_lines):
             f"{record['p99_us']:10.2f} {record['mean_us']:10.2f} {record['gflops']:10.2f} "
             f"{record['tflops']:9.3f} {'n/a':>10} "
             f"{record['peak_device_bytes']:12d} {record['temporary_device_bytes']:12d} "
-            f"{record['max_error']:10.4g} {record['max_relative_error']:10.4g}"
+            f"{record['max_error']:10.4g} {record['max_relative_error']:10.4g} "
+            f"{'n/a':>6} {'n/a':>8} {'n/a':>9} {'n/a':>8} {'n/a':>7}"
         )
 
 
@@ -208,8 +214,8 @@ def main():
             f"samples=101; warmups=30; device launches/sample={DEVICE_LAUNCHES_PER_SAMPLE}; "
             "E2E launches/sample=1; FP16 Q/K/V; FP32 output"
         )
-        print(f"{'Shape':<12} {'Mode':<7} {'Lane':<10} {'Bound':<7} {'Method':<31} {'median us':>10} {'p95 us':>10} {'p99 us':>10} {'mean us':>10} {'GFLOPS':>10} {'TFLOPS':>9} {'managed B':>10} {'peak B':>12} {'tmp B':>12} {'max abs':>10} {'max rel':>10}")
-        print("-" * 214)
+        print(f"{'Shape':<12} {'Mode':<7} {'Lane':<10} {'Bound':<7} {'Method':<31} {'median us':>10} {'p95 us':>10} {'p99 us':>10} {'mean us':>10} {'GFLOPS':>10} {'TFLOPS':>9} {'managed B':>10} {'peak B':>12} {'tmp B':>12} {'max abs':>10} {'max rel':>10} {'regs':>6} {'static B':>8} {'dynamic B':>9} {'local B':>8} {'occ':>7}")
+        print("-" * 262)
 
     backends = (
         ("PyTorch Flash-SDPA", SDPBackend.FLASH_ATTENTION),
