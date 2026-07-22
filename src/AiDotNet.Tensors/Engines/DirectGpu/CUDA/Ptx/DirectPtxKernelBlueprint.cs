@@ -71,6 +71,14 @@ internal static class DirectPtxArchitecture
     /// </summary>
     internal static bool HasValidatedResidualLayerNormGelu(int major, int minor) =>
         (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The quantized (W8A8) decode-linear specialization is measured only on
+    /// GA102/SM86, matching the other fused-linear predicates. Admitting the
+    /// whole Ampere family would run PTX that was never validated on SM80/SM87.
+    /// </summary>
+    internal static bool HasValidatedQuantizedLinear(int major, int minor) =>
+        (major, minor) == (8, 6);
 }
 
 internal enum DirectPtxExtentMode

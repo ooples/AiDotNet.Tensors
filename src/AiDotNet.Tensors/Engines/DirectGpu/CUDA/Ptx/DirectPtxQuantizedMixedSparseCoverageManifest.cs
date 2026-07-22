@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -63,4 +62,3 @@ internal static class DirectPtxQuantizedMixedSparseCoverageManifest
         new(api, implementation, semantics, layout, dtypes, assignment,
             DirectPtxQuantizedMixedSparseCoverageStatus.ExperimentalDirectPtx);
 }
-#endif
