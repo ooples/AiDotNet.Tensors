@@ -1859,7 +1859,7 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "global-avgpool-invalid-device-pointer";
             return false;
         }
-        if ((((nuint)input.Handle | (nuint)output.Handle) & 15u) != 0)
+        if (((PtxCompat.ToNuint(input.Handle) | PtxCompat.ToNuint(output.Handle)) & 15u) != 0)
         {
             DirectPtxLastError = "global-avgpool-alignment-mismatch";
             return false;
@@ -1974,8 +1974,8 @@ public sealed partial class CudaBackend
         IGpuBuffer input,
         IGpuBuffer output)
     {
-        nuint inputStart = (nuint)input.Handle;
-        nuint outputStart = (nuint)output.Handle;
+        nuint inputStart = PtxCompat.ToNuint(input.Handle);
+        nuint outputStart = PtxCompat.ToNuint(output.Handle);
         nuint inputEnd = checked(inputStart + (nuint)input.SizeInBytes);
         nuint outputEnd = checked(outputStart + (nuint)output.SizeInBytes);
         return inputStart < outputEnd && outputStart < inputEnd;
