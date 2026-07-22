@@ -4,6 +4,7 @@ using System.Linq;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+using AiDotNet.Tensors.Helpers;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -79,7 +80,7 @@ public class DirectPtxReductionTests
         int elements = rows * columns;
         using var input = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
         using var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
-        var random = new Random(20260722);
+        var random = RandomHelper.CreateSeededRandom(20260722);
         float[] values = Enumerable.Range(0, elements)
             .Select(_ => (random.NextSingle() * 2f - 1f) * 4f).ToArray();
         Array.Clear(values, 0, columns);
@@ -284,9 +285,58 @@ public class DirectPtxReductionTests
         }
     }
 
+    [SkippableFact]
+    public void BackendRowSum_ThreeWay_CudaAndPtxBothMatchCpuOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previousEnabled = DirectPtxFeatureGate.TestOverride;
+        bool previousExperiment = DirectPtxFeatureGate.ReductionExperimentOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        DirectPtxFeatureGate.ReductionExperimentOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxReductionEnabled, "Requires a GA10x/SM86 CUDA backend.");
+            const int rows = 2048, columns = 128;
+            float[] valuesHost = MakeRowValues(rows, columns, seed: 23);
+            float[] oracle = CpuRowSum(valuesHost, rows, columns); // CPU fp64-accumulated reference
+            using var input = backend.AllocateBuffer(valuesHost);
+            using var cudaOut = backend.AllocateBuffer(rows);
+            using var ptxOut = backend.AllocateBuffer(rows);
+
+            // Leg 1 - the existing CUDA kernel (direct-PTX disabled). It must match
+            // the CPU oracle and must NOT touch the direct-PTX dispatch counter.
+            DirectPtxFeatureGate.TestOverride = false;
+            long ptxBefore = backend.DirectPtxRowReduceDispatchCount;
+            backend.SumAxis(input, cudaOut, rows, columns);
+            backend.Synchronize();
+            Assert.Equal(ptxBefore, backend.DirectPtxRowReduceDispatchCount);
+            float[] cuda = backend.DownloadBuffer(cudaOut);
+            AssertRowSumsClose(cuda, oracle, "CUDA vs CPU oracle");
+
+            // Leg 2 - the direct-PTX kernel (gate on). It must match the CPU oracle
+            // and the dispatch counter must advance (proving the PTX path fired).
+            DirectPtxFeatureGate.TestOverride = true;
+            Assert.True(backend.TryDirectPtxRowSum(input, ptxOut, rows, columns),
+                backend.DirectPtxLastError);
+            backend.Synchronize();
+            Assert.Equal(ptxBefore + 1, backend.DirectPtxRowReduceDispatchCount);
+            float[] ptx = backend.DownloadBuffer(ptxOut);
+            AssertRowSumsClose(ptx, oracle, "direct-PTX vs CPU oracle");
+
+            // Leg 3 - the two GPU paths agree with each other.
+            AssertRowSumsClose(ptx, cuda, "direct-PTX vs CUDA");
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previousEnabled;
+            DirectPtxFeatureGate.ReductionExperimentOverride = previousExperiment;
+        }
+    }
+
     private static float[] MakeRowValues(int rows, int columns, int seed)
     {
-        var random = new Random(seed);
+        var random = RandomHelper.CreateSeededRandom(seed);
         var values = new float[rows * columns];
         for (int i = 0; i < values.Length; i++)
             values[i] = (random.NextSingle() * 2f - 1f) * 4f;
