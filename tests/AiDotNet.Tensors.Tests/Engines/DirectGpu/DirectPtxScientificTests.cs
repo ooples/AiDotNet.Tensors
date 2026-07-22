@@ -675,6 +675,71 @@ public class DirectPtxScientificTests
         }
     }
 
+    [SkippableFact]
+    public void Backend_DirectPtxScientific_AllRemainingRoutesDispatch()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previous = DirectPtxFeatureGate.TestOverride;
+        bool previousExperiment = DirectPtxFeatureGate.ScientificExperimentOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        DirectPtxFeatureGate.ScientificExperimentOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxScientificEnabled, "Requires a validated Ampere CUDA backend.");
+            var random = RandomHelper.CreateSeededRandom(20266900);
+            const int count = 16384, pairs = 16384, batch = 256, dim = 64;
+            const float c = 0.5f, eps = 1e-5f;
+
+            long AssertDispatched(long before, string what)
+            {
+                backend.Synchronize();
+                long now = backend.DirectPtxScientificDispatchCount;
+                Assert.True(now > before, $"{what}: {backend.DirectPtxLastError}");
+                return now;
+            }
+            long n = backend.DirectPtxScientificDispatchCount;
+
+            // Complex conjugate (exact) + magnitude (exact-ish) + phase.
+            float[] ci = Values(random, pairs * 2, 2.0f);
+            var conjExp = new float[pairs * 2];
+            for (int i = 0; i < pairs; i++) { conjExp[2 * i] = ci[2 * i]; conjExp[2 * i + 1] = -ci[2 * i + 1]; }
+            using (var inb = backend.AllocateBuffer(ci)) using (var ob = backend.AllocateBuffer(pairs * 2))
+            { backend.ComplexConjugate(inb, ob, pairs); n = AssertDispatched(n, "conjugate"); AssertVectorClose(backend.DownloadBuffer(ob), conjExp, 0f, "conjugate route"); }
+
+            float[] re = Values(random, count, 2.0f), im = Values(random, count, 2.0f);
+            var magExp = new float[count];
+            for (int i = 0; i < count; i++) magExp[i] = (float)Math.Sqrt((double)re[i] * re[i] + (double)im[i] * im[i]);
+            using (var rb = backend.AllocateBuffer(re)) using (var ib = backend.AllocateBuffer(im)) using (var mb = backend.AllocateBuffer(count))
+            { backend.ComplexMagnitude(rb, ib, mb, count); n = AssertDispatched(n, "magnitude"); AssertVectorClose(backend.DownloadBuffer(mb), magExp, 2e-3f, "magnitude route"); }
+            using (var rb = backend.AllocateBuffer(re)) using (var ib = backend.AllocateBuffer(im)) using (var pb = backend.AllocateBuffer(count))
+            { backend.ComplexPhase(rb, ib, pb, count); n = AssertDispatched(n, "phase"); }
+
+            // Octonion add (exact) + multiply.
+            float[] oa = Values(random, count * 8, 1.5f), ob2 = Values(random, count * 8, 1.5f);
+            var addExp = new float[count * 8];
+            for (int i = 0; i < addExp.Length; i++) addExp[i] = oa[i] + ob2[i];
+            using (var a = backend.AllocateBuffer(oa)) using (var b = backend.AllocateBuffer(ob2)) using (var o = backend.AllocateBuffer(count * 8))
+            { backend.OctonionAdd(a, b, o, count); n = AssertDispatched(n, "octonion-add"); AssertVectorClose(backend.DownloadBuffer(o), addExp, 0f, "octonion-add route"); }
+            using (var a = backend.AllocateBuffer(oa)) using (var b = backend.AllocateBuffer(ob2)) using (var o = backend.AllocateBuffer(count * 8))
+            { backend.OctonionMultiply(a, b, o, count); n = AssertDispatched(n, "octonion-multiply"); }
+
+            // Poincare distance / project / exp-map.
+            float[] px = Values(random, batch * dim, 0.15f), py = Values(random, batch * dim, 0.15f);
+            using (var x = backend.AllocateBuffer(px)) using (var y = backend.AllocateBuffer(py)) using (var o = backend.AllocateBuffer(batch))
+            { backend.PoincareDistance(x, y, o, batch, dim, c); n = AssertDispatched(n, "poincare-distance"); }
+            using (var x = backend.AllocateBuffer(px)) using (var o = backend.AllocateBuffer(batch * dim))
+            { backend.PoincareProject(x, o, batch, dim, c, eps); n = AssertDispatched(n, "poincare-project"); }
+            using (var x = backend.AllocateBuffer(px)) using (var v = backend.AllocateBuffer(py)) using (var o = backend.AllocateBuffer(batch * dim))
+            { backend.PoincareExpMap(x, v, o, batch, dim, c); n = AssertDispatched(n, "poincare-exp-map"); }
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previous;
+            DirectPtxFeatureGate.ScientificExperimentOverride = previousExperiment;
+        }
+    }
+
     private static float[] Values(Random random, int count, float magnitude)
     {
         var data = new float[count];
