@@ -10,6 +10,9 @@ using System.Threading;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
+#if NET5_0_OR_GREATER
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+#endif
 using AiDotNet.Tensors.Engines.Gpu;
 using AiDotNet.Tensors.Helpers;
 
@@ -2660,11 +2663,21 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe IGpuBuffer PagedAttentionDecode(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
         int heads, int headDim, int blockSize, int seqLen, float scale)
     {
-        if (!_kernelCache.TryGetValue("paged_attention_decode", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: paged_attention_decode");
         GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecode));
         GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, heads, headDim, blockSize, seqLen, 1, nameof(PagedAttentionDecode));
         var output = AllocateBuffer(heads * headDim);
+#if NET5_0_OR_GREATER
+        if (headDim == PtxFusedDecodeAttentionD64Kernel.HeadDimension &&
+            TryDirectPtxPagedDecodeD64(
+                q, kcache, vcache, blockTable, output,
+                heads, heads, blockSize, seqLen, scale))
+            return output;
+#endif
+        if (!_kernelCache.TryGetValue("paged_attention_decode", out var kernel))
+        {
+            output.Dispose();
+            throw new InvalidOperationException("CUDA kernel not found: paged_attention_decode");
+        }
         using var _ = PushContext();
         uint grid = (uint)(((long)heads + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr qPtr = q.Handle, kPtr = kcache.Handle, vPtr = vcache.Handle, btPtr = blockTable.Handle, oPtr = output.Handle;
@@ -2682,12 +2695,22 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe IGpuBuffer PagedAttentionPrefill(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
         int heads, int headDim, int blockSize, int numQueries, int startPos, float scale)
     {
-        if (!_kernelCache.TryGetValue("paged_attention_prefill", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: paged_attention_prefill");
         GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefill));
         if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
         GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, heads, headDim, blockSize, checked(startPos + numQueries), numQueries, nameof(PagedAttentionPrefill));
         var output = AllocateBuffer(numQueries * heads * headDim);
+#if NET5_0_OR_GREATER
+        if (headDim == PtxFusedPagedPrefillAttentionD64Kernel.HeadDimension &&
+            TryDirectPtxPagedPrefillD64(
+                q, kcache, vcache, blockTable, output,
+                heads, heads, numQueries, startPos, blockSize, scale))
+            return output;
+#endif
+        if (!_kernelCache.TryGetValue("paged_attention_prefill", out var kernel))
+        {
+            output.Dispose();
+            throw new InvalidOperationException("CUDA kernel not found: paged_attention_prefill");
+        }
         using var _ = PushContext();
         int totalItems = numQueries * heads;
         uint grid = (uint)(((long)totalItems + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -2705,12 +2728,22 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe IGpuBuffer PagedAttentionDecodeGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
         int heads, int kvHeads, int headDim, int blockSize, int seqLen, float scale)
     {
-        if (!_kernelCache.TryGetValue("paged_attention_decode_gqa", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: paged_attention_decode_gqa");
         GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecodeGqa));
         GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionDecodeGqa));
         GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, kvHeads, headDim, blockSize, seqLen, 1, nameof(PagedAttentionDecodeGqa));
         var output = AllocateBuffer(heads * headDim);
+#if NET5_0_OR_GREATER
+        if (headDim == PtxFusedDecodeAttentionD64Kernel.HeadDimension &&
+            TryDirectPtxPagedDecodeD64(
+                q, kcache, vcache, blockTable, output,
+                heads, kvHeads, blockSize, seqLen, scale))
+            return output;
+#endif
+        if (!_kernelCache.TryGetValue("paged_attention_decode_gqa", out var kernel))
+        {
+            output.Dispose();
+            throw new InvalidOperationException("CUDA kernel not found: paged_attention_decode_gqa");
+        }
         using var _ = PushContext();
         uint grid = (uint)(((long)heads + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr qPtr = q.Handle, kPtr = kcache.Handle, vPtr = vcache.Handle, btPtr = blockTable.Handle, oPtr = output.Handle;
@@ -2726,13 +2759,23 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe IGpuBuffer PagedAttentionPrefillGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
         int heads, int kvHeads, int headDim, int blockSize, int numQueries, int startPos, float scale)
     {
-        if (!_kernelCache.TryGetValue("paged_attention_prefill_gqa", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: paged_attention_prefill_gqa");
         GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefillGqa));
         GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionPrefillGqa));
         if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
         GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, kvHeads, headDim, blockSize, checked(startPos + numQueries), numQueries, nameof(PagedAttentionPrefillGqa));
         var output = AllocateBuffer(numQueries * heads * headDim);
+#if NET5_0_OR_GREATER
+        if (headDim == PtxFusedPagedPrefillAttentionD64Kernel.HeadDimension &&
+            TryDirectPtxPagedPrefillD64(
+                q, kcache, vcache, blockTable, output,
+                heads, kvHeads, numQueries, startPos, blockSize, scale))
+            return output;
+#endif
+        if (!_kernelCache.TryGetValue("paged_attention_prefill_gqa", out var kernel))
+        {
+            output.Dispose();
+            throw new InvalidOperationException("CUDA kernel not found: paged_attention_prefill_gqa");
+        }
         using var _ = PushContext();
         int totalItems = numQueries * heads;
         uint grid = (uint)(((long)totalItems + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -2751,20 +2794,31 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe IGpuBuffer FlashDecode(IGpuBuffer q, IGpuBuffer k, IGpuBuffer v,
         int heads, int kvHeads, int headDim, int seqLen, float scale, int splits = 0)
     {
-        if (!_kernelCache.TryGetValue("flash_decode_partial", out var partKernel))
-            throw new InvalidOperationException("CUDA kernel not found: flash_decode_partial");
-        if (!_kernelCache.TryGetValue("flash_decode_reduce", out var reduceKernel))
-            throw new InvalidOperationException("CUDA kernel not found: flash_decode_reduce");
         GpuKernelGuards.FlashDecode(heads, kvHeads, headDim, seqLen, nameof(FlashDecode));
         GpuKernelGuards.Capacity(q, (long)heads * headDim, nameof(q), nameof(FlashDecode));
         GpuKernelGuards.Capacity(k, (long)seqLen * kvHeads * headDim, nameof(k), nameof(FlashDecode));
         GpuKernelGuards.Capacity(v, (long)seqLen * kvHeads * headDim, nameof(v), nameof(FlashDecode));
         if (seqLen <= 0) throw new ArgumentOutOfRangeException(nameof(seqLen));
+        var output = AllocateBuffer(heads * headDim);
+#if NET5_0_OR_GREATER
+        if (splits <= 0 && headDim == PtxFusedDecodeAttentionD64Kernel.HeadDimension &&
+            TryDirectPtxFlashDecodeD64(q, k, v, output, heads, kvHeads, seqLen, scale))
+            return output;
+#endif
+        if (!_kernelCache.TryGetValue("flash_decode_partial", out var partKernel))
+        {
+            output.Dispose();
+            throw new InvalidOperationException("CUDA kernel not found: flash_decode_partial");
+        }
+        if (!_kernelCache.TryGetValue("flash_decode_reduce", out var reduceKernel))
+        {
+            output.Dispose();
+            throw new InvalidOperationException("CUDA kernel not found: flash_decode_reduce");
+        }
         int effSplits = splits > 0 ? splits : System.Math.Min(seqLen, 8);
         if (effSplits > seqLen) effSplits = seqLen;
         int splitLen = (seqLen + effSplits - 1) / effSplits;
 
-        var output = AllocateBuffer(heads * headDim);
         var partialM = AllocateBuffer(heads * effSplits);
         var partialL = AllocateBuffer(heads * effSplits);
         var partialAcc = AllocateBuffer(heads * effSplits * headDim);
@@ -2792,6 +2846,125 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         }
         catch { output.Dispose(); throw; }
         finally { partialM.Dispose(); partialL.Dispose(); partialAcc.Dispose(); }
+    }
+
+    /// <summary>Resident benchmark hook for the established two-pass NVRTC decode path.</summary>
+    internal unsafe void FlashDecodeCurrentInto(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v,
+        IGpuBuffer partialM, IGpuBuffer partialL, IGpuBuffer partialAcc, IGpuBuffer output,
+        int heads, int kvHeads, int headDim, int seqLen, float scale, int splits)
+    {
+        if (!_kernelCache.TryGetValue("flash_decode_partial", out var partKernel) ||
+            !_kernelCache.TryGetValue("flash_decode_reduce", out var reduceKernel))
+            throw new InvalidOperationException("CUDA flash-decode kernels are unavailable.");
+        GpuKernelGuards.FlashDecode(heads, kvHeads, headDim, seqLen, nameof(FlashDecodeCurrentInto));
+        if (splits <= 0 || splits > seqLen) throw new ArgumentOutOfRangeException(nameof(splits));
+        int splitLen = (seqLen + splits - 1) / splits;
+        GpuKernelGuards.Capacity(partialM, (long)heads * splits, nameof(partialM), nameof(FlashDecodeCurrentInto));
+        GpuKernelGuards.Capacity(partialL, (long)heads * splits, nameof(partialL), nameof(FlashDecodeCurrentInto));
+        GpuKernelGuards.Capacity(partialAcc, (long)heads * splits * headDim, nameof(partialAcc), nameof(FlashDecodeCurrentInto));
+        GpuKernelGuards.Capacity(output, (long)heads * headDim, nameof(output), nameof(FlashDecodeCurrentInto));
+        using var _ = PushContext();
+        IntPtr qPtr = q.Handle, kPtr = k.Handle, vPtr = v.Handle;
+        IntPtr pmPtr = partialM.Handle, plPtr = partialL.Handle, paPtr = partialAcc.Handle, oPtr = output.Handle;
+        int hh = heads, kv = kvHeads, hd = headDim, sl = seqLen, sp = splits, slen = splitLen;
+        float sc = scale;
+        uint gridP = (uint)(((long)heads * splits + DefaultBlockSize - 1) / DefaultBlockSize);
+        void** argsP = stackalloc void*[13];
+        argsP[0] = &qPtr; argsP[1] = &kPtr; argsP[2] = &vPtr;
+        argsP[3] = &pmPtr; argsP[4] = &plPtr; argsP[5] = &paPtr;
+        argsP[6] = &hh; argsP[7] = &kv; argsP[8] = &hd; argsP[9] = &sl;
+        argsP[10] = &sp; argsP[11] = &slen; argsP[12] = &sc;
+        LaunchKernel(partKernel, gridP, DefaultBlockSize, argsP);
+        uint gridR = (uint)(((long)heads + DefaultBlockSize - 1) / DefaultBlockSize);
+        void** argsR = stackalloc void*[7];
+        argsR[0] = &pmPtr; argsR[1] = &plPtr; argsR[2] = &paPtr; argsR[3] = &oPtr;
+        argsR[4] = &hh; argsR[5] = &hd; argsR[6] = &sp;
+        LaunchKernel(reduceKernel, gridR, DefaultBlockSize, argsR);
+    }
+
+    /// <summary>Resident benchmark hook for the established paged-decode NVRTC path.</summary>
+    internal unsafe void PagedAttentionDecodeCurrentInto(
+        IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        IGpuBuffer output, int heads, int kvHeads, int headDim,
+        int blockSize, int seqLen, float scale)
+    {
+        bool gqa = heads != kvHeads;
+        string kernelName = gqa ? "paged_attention_decode_gqa" : "paged_attention_decode";
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+        GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecodeCurrentInto));
+        GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionDecodeCurrentInto));
+        GpuKernelGuards.PagedAttentionBuffers(
+            q, kcache, vcache, blockTable, heads, kvHeads, headDim,
+            blockSize, seqLen, 1, nameof(PagedAttentionDecodeCurrentInto));
+        GpuKernelGuards.Capacity(output, (long)heads * headDim, nameof(output), nameof(PagedAttentionDecodeCurrentInto));
+        using var _ = PushContext();
+        uint grid = (uint)(((long)heads + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr qPtr = q.Handle, kPtr = kcache.Handle, vPtr = vcache.Handle;
+        IntPtr btPtr = blockTable.Handle, oPtr = output.Handle;
+        int hh = heads, kv = kvHeads, hd = headDim, bs = blockSize, sl = seqLen;
+        float sc = scale;
+        if (gqa)
+        {
+            void** args = stackalloc void*[11];
+            args[0] = &qPtr; args[1] = &kPtr; args[2] = &vPtr; args[3] = &btPtr; args[4] = &oPtr;
+            args[5] = &hh;
+            args[6] = &kv; args[7] = &hd; args[8] = &bs; args[9] = &sl; args[10] = &sc;
+            LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        }
+        else
+        {
+            void** args = stackalloc void*[10];
+            args[0] = &qPtr; args[1] = &kPtr; args[2] = &vPtr; args[3] = &btPtr; args[4] = &oPtr;
+            args[5] = &hh;
+            args[6] = &hd; args[7] = &bs; args[8] = &sl; args[9] = &sc;
+            LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        }
+    }
+
+    /// <summary>Resident benchmark hook for the established paged-prefill NVRTC path.</summary>
+    internal unsafe void PagedAttentionPrefillCurrentInto(
+        IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        IGpuBuffer output, int heads, int kvHeads, int headDim,
+        int blockSize, int numQueries, int startPos, float scale)
+    {
+        bool gqa = heads != kvHeads;
+        string kernelName = gqa ? "paged_attention_prefill_gqa" : "paged_attention_prefill";
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+        GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefillCurrentInto));
+        GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionPrefillCurrentInto));
+        if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
+        GpuKernelGuards.PagedAttentionBuffers(
+            q, kcache, vcache, blockTable, heads, kvHeads, headDim,
+            blockSize, checked(startPos + numQueries), numQueries,
+            nameof(PagedAttentionPrefillCurrentInto));
+        GpuKernelGuards.Capacity(
+            output, (long)numQueries * heads * headDim,
+            nameof(output), nameof(PagedAttentionPrefillCurrentInto));
+        using var _ = PushContext();
+        uint grid = (uint)(((long)numQueries * heads + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr qPtr = q.Handle, kPtr = kcache.Handle, vPtr = vcache.Handle;
+        IntPtr btPtr = blockTable.Handle, oPtr = output.Handle;
+        int hh = heads, kv = kvHeads, hd = headDim, bs = blockSize, nq = numQueries, sp = startPos;
+        float sc = scale;
+        if (gqa)
+        {
+            void** args = stackalloc void*[12];
+            args[0] = &qPtr; args[1] = &kPtr; args[2] = &vPtr; args[3] = &btPtr; args[4] = &oPtr;
+            args[5] = &hh; args[6] = &kv; args[7] = &hd; args[8] = &bs;
+            args[9] = &nq; args[10] = &sp; args[11] = &sc;
+            LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        }
+        else
+        {
+            void** args = stackalloc void*[11];
+            args[0] = &qPtr; args[1] = &kPtr; args[2] = &vPtr; args[3] = &btPtr; args[4] = &oPtr;
+            args[5] = &hh; args[6] = &hd; args[7] = &bs;
+            args[8] = &nq; args[9] = &sp; args[10] = &sc;
+            LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        }
     }
 
     public IGpuBuffer GemmBiasSwish(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
@@ -7976,6 +8149,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
     {
         using var _ = PushContext();
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxAttentionBackwardD64(
+            gradOutput, query, key, value, attentionWeights,
+            gradQuery, gradKey, gradValue,
+            batch, numHeads, numHeads, seqQ, seqK, headDim, scale))
+            return;
+#endif
         int batchHeads = checked(batch * numHeads);
         int qkSize = checked(seqQ * seqK);
 
@@ -8079,10 +8259,38 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
     {
         using var _ = PushContext();
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxFlashAttentionBackwardD64(
+            gradOutput, query, key, value, output, softmaxStats,
+            gradQuery, gradKey, gradValue,
+            batch, numHeads, seqQ, seqK, headDim, scale, isCausal,
+            attentionBias, biasBatchStride))
+            return;
+#endif
+            FlashAttentionBackwardLaunch(
+                gradOutput, query, key, value,
+                output, softmaxStats, gradQuery, gradKey,
+                gradValue, batch, numHeads, seqQ,
+                seqK, headDim, scale, isCausal,
+                attentionBias, biasBatchStride);
+    }
+
+    /// <summary>
+    /// Benchmark-only resident hook for the established NVRTC FlashAttention
+    /// backward. It bypasses direct-PTX routing while retaining the same stream,
+    /// deterministic selection, launch geometry, and public tensor ABI.
+    /// </summary>
+    private unsafe void FlashAttentionBackwardLaunch(
+        IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
+        IGpuBuffer output, IGpuBuffer softmaxStats,
+        IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale,
+        bool isCausal, IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
+
+    {
         int causalFlag = isCausal ? 1 : 0;
         int hasBias = attentionBias is not null ? 1 : 0;
         IntPtr biasPtr = attentionBias is not null ? attentionBias.Handle : IntPtr.Zero;
-
         IntPtr goPtr = gradOutput.Handle;
         IntPtr qPtr = query.Handle;
         IntPtr kPtr = key.Handle;
@@ -8095,11 +8303,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         if (GpuDeterminism.IsActive)
         {
-            // Issue #382: tiled flash_attention_backward uses atomicAdd for
-            // gradKey/gradValue — non-deterministic across runs. Split into two
-            // atomic-free kernels:
-            //   gradq: per (bh, qi) writes gradQuery only
-            //   gradkv: per (bh, ki, d) accumulates gradKey/gradValue with fixed qi order
             var kernelQ = _kernelCache["flash_attention_backward_gradq_deterministic"];
             void** argsQ = stackalloc void*[17];
             argsQ[0] = &goPtr;
@@ -8119,7 +8322,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             argsQ[14] = &biasPtr;
             argsQ[15] = &hasBias;
             argsQ[16] = &biasBatchStride;
-
             uint gridQX = (uint)((seqQ + 63) / 64);
             uint gridQY = (uint)(batch * numHeads);
             LaunchKernel2D(kernelQ, gridQX, gridQY, 64, 1, argsQ);
@@ -8144,7 +8346,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             argsKV[15] = &biasPtr;
             argsKV[16] = &hasBias;
             argsKV[17] = &biasBatchStride;
-
             uint gridKVX = (uint)((headDim + 15) / 16);
             uint gridKVY = (uint)((seqK + 3) / 4);
             uint gridKVZ = (uint)(batch * numHeads);
@@ -8155,7 +8356,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         var kernel = _kernelCache["flash_attention_backward"];
         uint gridX = (uint)((seqQ + 31) / 32);
         uint gridY = (uint)(batch * numHeads);
-
         void** args = stackalloc void*[19];
         args[0] = &goPtr;
         args[1] = &qPtr;
@@ -8176,9 +8376,23 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[16] = &biasPtr;
         args[17] = &hasBias;
         args[18] = &biasBatchStride;
-
         uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
         LaunchKernel2DWithSharedMem(kernel, gridX, gridY, 32, 1, sharedBytes, args);
+    }
+
+    internal unsafe void FlashAttentionBackwardCurrentInto(
+        IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
+        IGpuBuffer output, IGpuBuffer softmaxStats,
+        IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale,
+        bool isCausal, IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
+    {
+            FlashAttentionBackwardLaunch(
+                gradOutput, query, key, value,
+                output, softmaxStats, gradQuery, gradKey,
+                gradValue, batch, numHeads, seqQ,
+                seqK, headDim, scale, isCausal,
+                attentionBias, biasBatchStride);
     }
 
     public unsafe void GroupedQueryAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
@@ -8232,7 +8446,35 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // #628: honor the explicit numQueriesPerKV (matches the CPU's kvh = qh / numQueriesPerKV)
         // rather than recomputing numQHeads/numKVHeads, which diverges for inconsistent GQA configs.
         int queriesPerKV = numQueriesPerKV;
+#if NET5_0_OR_GREATER
+        if (numKVHeads > 0 && queriesPerKV == numQHeads / numKVHeads &&
+            TryDirectPtxAttentionBackwardD64(
+                gradOutput, query, key, value, attentionWeights,
+                gradQuery, gradKey, gradValue,
+                batch, numQHeads, numKVHeads, seqQ, seqK, headDim, scale))
+            return;
+#endif
+            GroupedQueryAttentionBackwardLaunch(
+                gradOutput, query, key, value,
+                attentionWeights, gradQuery, gradKey, gradValue,
+                batch, numQHeads, numKVHeads, seqQ,
+                seqK, headDim, scale, numQueriesPerKV);
+    }
 
+    /// <summary>
+    /// Benchmark-only resident hook for the established NVRTC GQA backward.
+    /// It deliberately bypasses direct-PTX routing while preserving the exact
+    /// public ABI, stream, determinism selection, and launch implementation.
+    /// </summary>
+    private unsafe void GroupedQueryAttentionBackwardLaunch(
+        IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
+        IGpuBuffer attentionWeights,
+        IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
+        int batch, int numQHeads, int numKVHeads, int seqQ, int seqK,
+        int headDim, float scale, int numQueriesPerKV)
+
+    {
+        int queriesPerKV = numQueriesPerKV;
         IntPtr goPtr = gradOutput.Handle;
         IntPtr qPtr = query.Handle;
         IntPtr kPtr = key.Handle;
@@ -8244,8 +8486,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         if (GpuDeterminism.IsActive)
         {
-            // Issue #382: split tiled GQA backward into gradq (per bqh, qi) and
-            // gradkv (per b, kvh, ki, d). No atomicAdd in either kernel.
             var kqGqa = _kernelCache["grouped_query_attention_backward_gradq_deterministic"];
             void** argsQg = stackalloc void*[14];
             argsQg[0] = &goPtr;
@@ -8293,7 +8533,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         var kernel = _kernelCache["grouped_query_attention_backward"];
         uint gridX = (uint)((seqQ + 31) / 32);
         uint gridY = (uint)(batch * numQHeads);
-
         void** args = stackalloc void*[16];
         args[0] = &goPtr;
         args[1] = &qPtr;
@@ -8311,9 +8550,22 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[13] = &seqK;
         args[14] = &headDim;
         args[15] = &scale;
-
         uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
         LaunchKernel2DWithSharedMem(kernel, gridX, gridY, 32, 1, sharedBytes, args);
+    }
+
+    internal unsafe void GroupedQueryAttentionBackwardCurrentInto(
+        IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
+        IGpuBuffer attentionWeights,
+        IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
+        int batch, int numQHeads, int numKVHeads, int seqQ, int seqK,
+        int headDim, float scale, int numQueriesPerKV)
+    {
+            GroupedQueryAttentionBackwardLaunch(
+                gradOutput, query, key, value,
+                attentionWeights, gradQuery, gradKey, gradValue,
+                batch, numQHeads, numKVHeads, seqQ,
+                seqK, headDim, scale, numQueriesPerKV);
     }
 
     #endregion

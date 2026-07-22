@@ -36,6 +36,36 @@ class Program
             DirectPtxGpuMatrixExperiment.Run();
             return;
         }
+        if (args.Length > 0 && args[0] == "--direct-ptx-attention-family")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxAttentionFamilyExperiment.Run(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-decode")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxDecodeExperiment.Run(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-paged-prefill")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxPagedPrefillExperiment.Run(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-attention-backward")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxAttentionBackwardExperiment.Run(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-flash-attention-backward")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxFlashAttentionBackwardExperiment.Run(runs);
+            return;
+        }
         if (args.Length > 0 && args[0] == "--direct-ptx-residual-rmsnorm")
         {
             DirectPtxResidualRmsNormExperiment.Run();
@@ -54,6 +84,26 @@ class Program
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-residual-rmsnorm")
         {
             DirectPtxProfileTarget.RunResidualRmsNorm();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-decode")
+        {
+            DirectPtxProfileTarget.RunDecode();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-paged-prefill")
+        {
+            DirectPtxProfileTarget.RunPagedPrefill();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-attention-backward")
+        {
+            DirectPtxProfileTarget.RunAttentionBackward();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-flash-attention-backward")
+        {
+            DirectPtxProfileTarget.RunFlashAttentionBackward();
             return;
         }
         if (args.Length > 1 && args[0] == "--direct-ptx-verify-ncu")
@@ -997,10 +1047,19 @@ class Program
         Console.WriteLine("  --direct-ptx-fused-attention: Fused PTX QK+softmax+PV championship cell");
         Console.WriteLine("  --direct-ptx-online-attention: Async online S128/D64 GPU championship table");
         Console.WriteLine("  --direct-ptx-gpu-matrix: NVIDIA-only S16/S32/S64/S128 attention matrix");
+        Console.WriteLine("  --direct-ptx-attention-family [runs]: rectangular MHA/GQA/MQA resident release matrix");
+        Console.WriteLine("  --direct-ptx-decode [runs]: dense and paged D64 decode resident release matrix");
+        Console.WriteLine("  --direct-ptx-paged-prefill [runs]: causal D64 paged-prefill release matrix");
+        Console.WriteLine("  --direct-ptx-attention-backward [runs]: deterministic D64 backward release matrix");
+        Console.WriteLine("  --direct-ptx-flash-attention-backward [runs]: D64 Flash recomputation-backward release matrix");
         Console.WriteLine("  --direct-ptx-residual-rmsnorm: second-blueprint fused residual + RMSNorm D64");
         Console.WriteLine("  --direct-ptx-external-gpu-baselines: forced cuDNN/Flash/Math/compiled Python GPU matrix");
         Console.WriteLine("  --direct-ptx-profile-attention: deterministic Nsight Compute attention target");
         Console.WriteLine("  --direct-ptx-profile-residual-rmsnorm: deterministic Nsight Compute fusion target");
+        Console.WriteLine("  --direct-ptx-profile-decode: deterministic Nsight Compute dense+paged decode target");
+        Console.WriteLine("  --direct-ptx-profile-paged-prefill: deterministic Nsight Compute paged-prefill target");
+        Console.WriteLine("  --direct-ptx-profile-attention-backward: deterministic Nsight Compute backward target");
+        Console.WriteLine("  --direct-ptx-profile-flash-attention-backward: deterministic Nsight Flash-backward target");
         Console.WriteLine("  --direct-ptx-verify-ncu <csv>: enforce zero executed spill/local-memory counters");
         Console.WriteLine("  --cublas   : Run cuBLAS vs DirectGpu GEMM benchmark");
         Console.WriteLine("  --opencl   : Run OpenCL GEMM benchmark (AMD/Intel GPUs)");

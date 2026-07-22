@@ -14,8 +14,28 @@ internal static class DirectPtxFeatureGate
     internal const string MasterEnvironmentVariable = "AIDOTNET_DIRECT_PTX";
     internal const string EnvironmentVariable = "AIDOTNET_DIRECT_PTX_ATTENTION";
     internal const string ResidualRmsNormEnvironmentVariable = "AIDOTNET_DIRECT_PTX_RESIDUAL_RMSNORM";
+    internal const string FlashDecodeEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FLASH_DECODE";
+    internal const string PagedDecodeEnvironmentVariable = "AIDOTNET_DIRECT_PTX_PAGED_DECODE";
+    internal const string PagedPrefillEnvironmentVariable = "AIDOTNET_DIRECT_PTX_PAGED_PREFILL";
+    internal const string AttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_ATTENTION_BACKWARD";
+    internal const string FlashAttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FLASH_ATTENTION_BACKWARD";
     internal const string AutotuneEnvironmentVariable = "AIDOTNET_DIRECT_PTX_AUTOTUNE";
     internal const string CacheCapacityEnvironmentVariable = "AIDOTNET_DIRECT_PTX_CACHE_CAPACITY";
+
+    // Feature configuration is a process-start contract. Snapshot it once so
+    // the resident launch path never allocates strings while re-reading the
+    // environment. Tests retain an explicit dynamic override below.
+    private static readonly bool EnvironmentMasterEnabled = ReadEnabled(MasterEnvironmentVariable);
+    private static readonly bool EnvironmentAttentionEnabled = ReadEnabled(EnvironmentVariable);
+    private static readonly bool EnvironmentResidualRmsNormEnabled = ReadEnabled(ResidualRmsNormEnvironmentVariable);
+    private static readonly bool EnvironmentFlashDecodeEnabled = ReadEnabled(FlashDecodeEnvironmentVariable);
+    private static readonly bool EnvironmentPagedDecodeEnabled = ReadEnabled(PagedDecodeEnvironmentVariable);
+    private static readonly bool EnvironmentPagedPrefillEnabled = ReadEnabled(PagedPrefillEnvironmentVariable);
+    private static readonly bool EnvironmentAttentionBackwardEnabled = ReadEnabled(AttentionBackwardEnvironmentVariable);
+    private static readonly bool EnvironmentFlashAttentionBackwardEnabled = ReadEnabled(FlashAttentionBackwardEnvironmentVariable);
+    private static readonly bool EnvironmentAutotuneEnabled =
+        !string.Equals(Environment.GetEnvironmentVariable(AutotuneEnvironmentVariable), "0", StringComparison.Ordinal);
+    private static readonly int EnvironmentCacheCapacity = ReadCacheCapacity();
 
     /// <summary>Test-only override. Null restores environment-based behavior.</summary>
     internal static bool? TestOverride { get; set; }
@@ -23,23 +43,37 @@ internal static class DirectPtxFeatureGate
     internal static bool IsEnabled => IsAttentionEnabled;
 
     internal static bool IsAttentionEnabled => TestOverride ??
-        (string.Equals(Environment.GetEnvironmentVariable(MasterEnvironmentVariable), "1", StringComparison.Ordinal) ||
-         string.Equals(Environment.GetEnvironmentVariable(EnvironmentVariable), "1", StringComparison.Ordinal));
+        (EnvironmentMasterEnabled || EnvironmentAttentionEnabled);
 
     internal static bool IsResidualRmsNormEnabled => TestOverride ??
-        (string.Equals(Environment.GetEnvironmentVariable(MasterEnvironmentVariable), "1", StringComparison.Ordinal) ||
-         string.Equals(Environment.GetEnvironmentVariable(ResidualRmsNormEnvironmentVariable), "1", StringComparison.Ordinal));
+        (EnvironmentMasterEnabled || EnvironmentResidualRmsNormEnabled);
 
-    internal static bool IsAutotuneEnabled =>
-        !string.Equals(Environment.GetEnvironmentVariable(AutotuneEnvironmentVariable), "0", StringComparison.Ordinal);
+    internal static bool IsFlashDecodeEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentFlashDecodeEnabled);
 
-    internal static int CacheCapacity
+    internal static bool IsPagedDecodeEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentPagedDecodeEnabled);
+
+    internal static bool IsPagedPrefillEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentPagedPrefillEnabled);
+
+    internal static bool IsAttentionBackwardEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentAttentionBackwardEnabled);
+
+    internal static bool IsFlashAttentionBackwardEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentFlashAttentionBackwardEnabled);
+
+    internal static bool IsAutotuneEnabled => EnvironmentAutotuneEnabled;
+
+    internal static int CacheCapacity => EnvironmentCacheCapacity;
+
+    private static bool ReadEnabled(string variable) =>
+        string.Equals(Environment.GetEnvironmentVariable(variable), "1", StringComparison.Ordinal);
+
+    private static int ReadCacheCapacity()
     {
-        get
-        {
-            string? text = Environment.GetEnvironmentVariable(CacheCapacityEnvironmentVariable);
-            return int.TryParse(text, out int value) && value is >= 4 and <= 256 ? value : 32;
-        }
+        string? text = Environment.GetEnvironmentVariable(CacheCapacityEnvironmentVariable);
+        return int.TryParse(text, out int value) && value is >= 4 and <= 256 ? value : 32;
     }
 }
 
@@ -57,8 +91,12 @@ internal enum DirectPtxPhysicalLayout
     Bhsd,
     /// <summary>Dense row-major [row, feature].</summary>
     RowMajor2D,
+    /// <summary>Dense row-major [sequence, head, dimension].</summary>
+    SequenceHeadDim,
     /// <summary>Dense [row, qkv, head, feature] projection output.</summary>
     PackedQkv,
+    /// <summary>Dense additive attention bias, [H,Sq,Skv] or [B,H,Sq,Skv].</summary>
+    AttentionBias,
     /// <summary>One-dimensional canonical vector.</summary>
     Vector,
     /// <summary>Block table plus packed pages for decode attention.</summary>

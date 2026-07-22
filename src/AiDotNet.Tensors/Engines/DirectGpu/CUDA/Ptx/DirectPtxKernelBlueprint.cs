@@ -36,8 +36,8 @@ internal static class DirectPtxArchitecture
     /// specialization. Other families must supply and benchmark their own
     /// implementation instead of silently inheriting Ampere's tuning.
     /// </summary>
-    internal static bool HasValidatedOnlineAttention(DirectPtxArchitectureFamily family) =>
-        family == DirectPtxArchitectureFamily.Ampere;
+    internal static bool HasValidatedOnlineAttention(int major, int minor) =>
+        (major, minor) == (8, 6);
 }
 
 internal enum DirectPtxExtentMode
@@ -68,6 +68,9 @@ internal readonly record struct DirectPtxExtent
 
     internal DirectPtxExtent(int d0, int d1)
         : this(2, d0, d1, 1, 1) { }
+
+    internal DirectPtxExtent(int d0, int d1, int d2)
+        : this(3, d0, d1, d2, 1) { }
 
     internal DirectPtxExtent(int d0, int d1, int d2, int d3)
         : this(4, d0, d1, d2, d3) { }
@@ -240,19 +243,44 @@ internal sealed record DirectPtxProfilerEvidence(
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
         var values = new Dictionary<string, long>(StringComparer.Ordinal);
-        foreach (string line in File.ReadLines(path))
+        string[][] rows = File.ReadLines(path).Select(ParseCsvLine).ToArray();
+
+        // Nsight Compute 2026.2 raw CSV is column-oriented: metric names are
+        // headers and every following data row is a kernel launch. Preserve
+        // support for the older row-oriented export below as well.
+        for (int rowIndex = 0; rowIndex < rows.Length; rowIndex++)
         {
-            if (!line.Contains("sass__", StringComparison.Ordinal))
-                continue;
-            string[] cells = ParseCsvLine(line);
+            string[] header = rows[rowIndex];
+            int[] metricColumns = Enumerable.Range(0, header.Length)
+                .Where(index => IsSpillMetric(header[index].Trim()))
+                .ToArray();
+            if (metricColumns.Length == 0) continue;
+
+            int nextHeader = rowIndex + 1;
+            while (nextHeader < rows.Length &&
+                   !rows[nextHeader].Any(cell => IsSpillMetric(cell.Trim())))
+            {
+                string[] data = rows[nextHeader];
+                foreach (int column in metricColumns)
+                {
+                    if (column >= data.Length || !TryParseCounter(data[column], out long value)) continue;
+                    string metric = header[column].Trim();
+                    values[metric] = checked(values.GetValueOrDefault(metric) + value);
+                }
+                nextHeader++;
+            }
+            rowIndex = nextHeader - 1;
+        }
+
+        foreach (string[] cells in rows)
+        {
             for (int i = 0; i < cells.Length; i++)
             {
                 string metric = cells[i].Trim();
                 if (!IsSpillMetric(metric)) continue;
                 for (int valueIndex = cells.Length - 1; valueIndex > i; valueIndex--)
                 {
-                    string normalized = cells[valueIndex].Trim().Replace(",", string.Empty, StringComparison.Ordinal);
-                    if (long.TryParse(normalized, NumberStyles.Integer, CultureInfo.InvariantCulture, out long value))
+                    if (TryParseCounter(cells[valueIndex], out long value))
                     {
                         values[metric] = checked(values.GetValueOrDefault(metric) + value);
                         break;
@@ -261,25 +289,51 @@ internal sealed record DirectPtxProfilerEvidence(
             }
         }
 
-        long Get(params string[] names) => names.Sum(name => values.GetValueOrDefault(name));
+        static bool Matches(string metric, string baseName) =>
+            string.Equals(metric, baseName, StringComparison.Ordinal) ||
+            metric.StartsWith(baseName + ".", StringComparison.Ordinal);
+        long Get(params string[] names) => values
+            .Where(pair => names.Any(name => Matches(pair.Key, name)))
+            .Sum(pair => pair.Value);
+        bool Contains(string name) => values.Keys.Any(metric => Matches(metric, name));
         int observedGroups = 0;
-        if (values.ContainsKey("sass__inst_executed_register_spilling") ||
-            values.ContainsKey("sass__inst_executed_register_spilling_mem_local")) observedGroups++;
-        if (values.ContainsKey("sass__inst_executed_local_loads")) observedGroups++;
-        if (values.ContainsKey("sass__inst_executed_local_stores")) observedGroups++;
+        if (Contains("sass__inst_executed_register_spilling") ||
+            Contains("sass__inst_executed_register_spilling_mem_local") ||
+            Contains("smsp__sass_inst_executed_op_local")) observedGroups++;
+        if (Contains("sass__inst_executed_local_loads") ||
+            Contains("smsp__sass_inst_executed_op_local_ld")) observedGroups++;
+        if (Contains("sass__inst_executed_local_stores") ||
+            Contains("smsp__sass_inst_executed_op_local_st")) observedGroups++;
         return new DirectPtxProfilerEvidence(
-            Get("sass__inst_executed_register_spilling", "sass__inst_executed_register_spilling_mem_local"),
-            Get("sass__inst_executed_local_loads"),
-            Get("sass__inst_executed_local_stores"),
+            Get("sass__inst_executed_register_spilling", "sass__inst_executed_register_spilling_mem_local",
+                "smsp__sass_inst_executed_op_local"),
+            Get("sass__inst_executed_local_loads", "smsp__sass_inst_executed_op_local_ld"),
+            Get("sass__inst_executed_local_stores", "smsp__sass_inst_executed_op_local_st"),
             observedGroups,
             Path.GetFullPath(path));
     }
 
-    private static bool IsSpillMetric(string value) => value is
-        "sass__inst_executed_register_spilling" or
-        "sass__inst_executed_register_spilling_mem_local" or
-        "sass__inst_executed_local_loads" or
-        "sass__inst_executed_local_stores";
+    private static bool IsSpillMetric(string value) =>
+        value == "sass__inst_executed_register_spilling" ||
+        value.StartsWith("sass__inst_executed_register_spilling.", StringComparison.Ordinal) ||
+        value == "sass__inst_executed_register_spilling_mem_local" ||
+        value.StartsWith("sass__inst_executed_register_spilling_mem_local.", StringComparison.Ordinal) ||
+        value == "sass__inst_executed_local_loads" ||
+        value.StartsWith("sass__inst_executed_local_loads.", StringComparison.Ordinal) ||
+        value == "sass__inst_executed_local_stores" ||
+        value.StartsWith("sass__inst_executed_local_stores.", StringComparison.Ordinal) ||
+        value == "smsp__sass_inst_executed_op_local" ||
+        value.StartsWith("smsp__sass_inst_executed_op_local.", StringComparison.Ordinal) ||
+        value == "smsp__sass_inst_executed_op_local_ld" ||
+        value.StartsWith("smsp__sass_inst_executed_op_local_ld.", StringComparison.Ordinal) ||
+        value == "smsp__sass_inst_executed_op_local_st" ||
+        value.StartsWith("smsp__sass_inst_executed_op_local_st.", StringComparison.Ordinal);
+
+    private static bool TryParseCounter(string value, out long result)
+    {
+        string normalized = value.Trim().Replace(",", string.Empty, StringComparison.Ordinal);
+        return long.TryParse(normalized, NumberStyles.Integer, CultureInfo.InvariantCulture, out result);
+    }
 
     private static string[] ParseCsvLine(string line)
     {

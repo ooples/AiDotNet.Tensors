@@ -233,6 +233,7 @@ jobs:
       if: always()
       with:
         files: ./coverage/**/coverage.cobertura.xml
+        disable_search: true
         flags: unittests
         name: codecov-umbrella
         fail_ci_if_error: false

@@ -11,35 +11,85 @@ internal static class DirectPtxResidualRmsNormExperiment
 {
     private const int Dimension = 64;
     private const float Epsilon = 1e-5f;
-    private readonly record struct Distribution(double Mean, double Median, double P95, double P99);
-    private readonly record struct Result(
-        int Rows, string Method, Distribution Time, double GigabytesPerSecond,
-        long Allocation, long TemporaryBytes, float MaxError, int Registers, int LocalBytes);
+    private readonly struct Error
+    {
+        internal Error(float maxAbsolute, float maxRelative) =>
+            (MaxAbsolute, MaxRelative) = (maxAbsolute, maxRelative);
+        internal float MaxAbsolute { get; }
+        internal float MaxRelative { get; }
+    }
+
+    private readonly struct Distribution
+    {
+        internal Distribution(double mean, double median, double p95, double p99) =>
+            (Mean, Median, P95, P99) = (mean, median, p95, p99);
+
+        internal double Mean { get; }
+        internal double Median { get; }
+        internal double P95 { get; }
+        internal double P99 { get; }
+    }
+
+    private readonly struct Result
+    {
+        internal Result(int rows, string method, Distribution time, double gigabytesPerSecond,
+            long allocation, long temporaryBytes, Error error, int registers,
+            int sharedBytes, int localBytes, double occupancy) =>
+            (Rows, Method, Time, GigabytesPerSecond, Allocation, TemporaryBytes, Error,
+                Registers, StaticSharedBytes, DynamicSharedBytes, LocalBytes, Occupancy) =
+            (rows, method, time, gigabytesPerSecond, allocation, temporaryBytes, error,
+                registers, sharedBytes, sharedBytes < 0 ? -1 : 0, localBytes, occupancy);
+
+        internal int Rows { get; }
+        internal string Method { get; }
+        internal Distribution Time { get; }
+        internal double GigabytesPerSecond { get; }
+        internal long Allocation { get; }
+        internal long TemporaryBytes { get; }
+        internal Error Error { get; }
+        internal int Registers { get; }
+        internal int StaticSharedBytes { get; }
+        internal int DynamicSharedBytes { get; }
+        internal int LocalBytes { get; }
+        internal double Occupancy { get; }
+    }
 
     internal static void Run()
     {
+        GpuBenchmarkEnvironment.RequireIdleGpu("residual-rmsnorm-start");
         GpuBenchmarkEnvironment.PrintSnapshot("start");
         int[] rowCounts = [32, 256, 2048, 8192];
         var results = new List<Result>();
         RunDirect(rowCounts, results);
+        GpuBenchmarkEnvironment.RequireIdleGpu("residual-rmsnorm-framework-baselines");
         RunAiDotNet(rowCounts, results);
         RunPyTorch(rowCounts, results);
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("residual-rmsnorm-end");
 
         Console.WriteLine("NVIDIA GPU-only fused residual + RMSNorm D=64 (resident FP32 tensors)");
-        Console.WriteLine($"{"Rows",7} {"Method",-29} {"median us",10} {"p95 us",10} {"p99 us",10} {"mean us",10} {"GB/s",9} {"B/call",9} {"tmp MiB",9} {"max err",10} {"regs",6} {"local B",8}");
-        Console.WriteLine(new string('-', 135));
+        Console.WriteLine("Correctness max-absolute tolerance: 5e-5 for both normalized output and saved RMS.");
+        Console.WriteLine("Effective FLOPs = 5 * elements + 3 * rows (add, square/reduction, normalize/affine, sqrt/reciprocal).");
+        Console.WriteLine($"{"Rows",7} {"Method",-29} {"median us",10} {"p95 us",10} {"p99 us",10} {"mean us",10} {"GB/s",9} {"GFLOPS",10} {"TFLOPS",9} {"managed B",9} {"tmp MiB",9} {"max abs",10} {"max rel",10} {"regs",6} {"static B",8} {"dynamic B",9} {"local B",8} {"occ",7}");
+        Console.WriteLine(new string('-', 202));
         foreach (Result result in results.OrderBy(r => r.Rows).ThenBy(r => r.Time.Median))
         {
             string temporary = result.TemporaryBytes < 0
                 ? "n/a"
                 : (result.TemporaryBytes / 1048576.0).ToString("F3");
             string registers = result.Registers < 0 ? "n/a" : result.Registers.ToString();
+            string staticShared = result.StaticSharedBytes < 0 ? "n/a" : result.StaticSharedBytes.ToString();
+            string dynamicShared = result.DynamicSharedBytes < 0 ? "n/a" : result.DynamicSharedBytes.ToString();
             string local = result.LocalBytes < 0 ? "n/a" : result.LocalBytes.ToString();
+            string occupancy = double.IsNaN(result.Occupancy) ? "n/a" : result.Occupancy.ToString("P0");
+            double gflops = EffectiveGflops(result.Rows, result.Time.Median);
             Console.WriteLine(
                 $"{result.Rows,7} {result.Method,-29} {result.Time.Median * 1000,10:F2} " +
                 $"{result.Time.P95 * 1000,10:F2} {result.Time.P99 * 1000,10:F2} " +
                 $"{result.Time.Mean * 1000,10:F2} {result.GigabytesPerSecond,9:F2} " +
-                $"{result.Allocation,9} {temporary,9} {result.MaxError,10:G4} {registers,6} {local,8}");
+                $"{gflops,10:F2} {gflops / 1000,9:F4} " +
+                $"{result.Allocation,9} {temporary,9} {result.Error.MaxAbsolute,10:G4} " +
+                $"{result.Error.MaxRelative,10:G4} {registers,6} " +
+                $"{staticShared,8} {dynamicShared,9} {local,8} {occupancy,7}");
         }
 
         Console.WriteLine();
@@ -55,11 +105,11 @@ internal static class DirectPtxResidualRmsNormExperiment
                 .OrderBy(r => r.Time.Median).First();
             var directEvidence = new DirectPtxPerformanceEvidence(
                 direct.Time.Median * 1000, direct.Time.P95 * 1000,
-                direct.Allocation, direct.TemporaryBytes, direct.MaxError,
+                direct.Allocation, direct.TemporaryBytes, direct.Error.MaxAbsolute,
                 direct.LocalBytes, IndependentRuns: 1);
             var competitorEvidence = new DirectPtxPerformanceEvidence(
                 best.Time.Median * 1000, best.Time.P95 * 1000,
-                best.Allocation, best.TemporaryBytes, best.MaxError,
+                best.Allocation, best.TemporaryBytes, best.Error.MaxAbsolute,
                 best.LocalBytes, IndependentRuns: 1);
             DirectPtxReleaseDecision decision = policy.Evaluate(directEvidence, competitorEvidence);
             Console.WriteLine(
@@ -76,6 +126,7 @@ internal static class DirectPtxResidualRmsNormExperiment
         using (runtime.Enter())
         foreach (int rows in rowCounts)
         {
+            GpuBenchmarkEnvironment.RequireNoForeignCompute($"residual-rmsnorm-direct-{rows}");
             using var kernel = new PtxFusedResidualRmsNormD64Kernel(runtime, rows, Epsilon);
             float[] x = Values(rows * Dimension, 100 + rows, 1f);
             float[] residualHost = Values(rows * Dimension, 200 + rows, 0.25f);
@@ -99,10 +150,15 @@ internal static class DirectPtxResidualRmsNormExperiment
             launch(); runtime.Synchronize();
             var actual = new float[x.Length];
             output.Download<float>(actual);
-            float error = Validate(actual, x, residualHost, gammaHost, rows);
+            var actualRms = new float[rows];
+            rms.Download<float>(actualRms);
+            Error error = Validate(actual, actualRms, x, residualHost, gammaHost, rows);
+            double occupancy = kernel.Audit.ActiveBlocksPerMultiprocessor *
+                kernel.Audit.BlockThreads / (double)runtime.MaxThreadsPerMultiprocessor;
             results.Add(new Result(rows, "Direct PTX fused", distribution,
                 Bandwidth(rows, distribution.Median), allocation, 0, error,
-                kernel.FunctionInfo.RegistersPerThread, kernel.FunctionInfo.LocalBytesPerThread));
+                kernel.FunctionInfo.RegistersPerThread, kernel.FunctionInfo.StaticSharedBytes,
+                kernel.FunctionInfo.LocalBytesPerThread, occupancy));
         }
     }
 
@@ -111,6 +167,7 @@ internal static class DirectPtxResidualRmsNormExperiment
         using var backend = new CudaBackend();
         foreach (int rows in rowCounts)
         {
+            GpuBenchmarkEnvironment.RequireNoForeignCompute($"residual-rmsnorm-aidotnet-{rows}");
             float[] x = Values(rows * Dimension, 100 + rows, 1f);
             float[] residualHost = Values(rows * Dimension, 200 + rows, 0.25f);
             float[] gammaHost = Enumerable.Range(0, Dimension).Select(i => 0.75f + i / 256f).ToArray();
@@ -128,10 +185,12 @@ internal static class DirectPtxResidualRmsNormExperiment
             Distribution distribution = Measure(backend.Synchronize, launch);
             long allocation = Allocation(backend.Synchronize, launch);
             launch(); backend.Synchronize();
-            float error = Validate(backend.DownloadBuffer(output), x, residualHost, gammaHost, rows);
+            Error error = Validate(
+                backend.DownloadBuffer(output), backend.DownloadBuffer(rms),
+                x, residualHost, gammaHost, rows);
             results.Add(new Result(rows, "AiDotNet add + RMSNorm", distribution,
                 Bandwidth(rows, distribution.Median), allocation, (long)x.Length * sizeof(float),
-                error, -1, -1));
+                error, -1, -1, -1, double.NaN));
         }
     }
 
@@ -140,24 +199,44 @@ internal static class DirectPtxResidualRmsNormExperiment
         if (!torch.cuda.is_available()) return;
         foreach (int rows in rowCounts)
         {
+            GpuBenchmarkEnvironment.RequireNoForeignCompute($"residual-rmsnorm-pytorch-{rows}");
             float[] xHost = Values(rows * Dimension, 100 + rows, 1f);
             float[] residualHost = Values(rows * Dimension, 200 + rows, 0.25f);
             float[] gammaHost = Enumerable.Range(0, Dimension).Select(i => 0.75f + i / 256f).ToArray();
             using TorchTensor input = torch.tensor(xHost, [rows, Dimension], device: torch.CUDA);
             using TorchTensor residual = torch.tensor(residualHost, [rows, Dimension], device: torch.CUDA);
             using TorchTensor gamma = torch.tensor(gammaHost, [Dimension], device: torch.CUDA);
-            void Launch()
+            (TorchTensor Output, TorchTensor Rms) Compute()
             {
                 using TorchTensor sum = input.add(residual);
                 using TorchTensor square = sum.mul(sum);
                 using TorchTensor mean = square.mean([1L], keepdim: true);
-                using TorchTensor rms = mean.add(Epsilon).sqrt();
-                using TorchTensor output = sum.div(rms).mul_(gamma);
+                using TorchTensor shifted = mean.add(Epsilon);
+                TorchTensor rms = shifted.sqrt();
+                TorchTensor output = sum.div(rms).mul_(gamma);
+                return (output, rms);
             }
+            void Launch()
+            {
+                (TorchTensor output, TorchTensor rms) = Compute();
+                using (output) using (rms) { }
+            }
+            Error error;
+            (TorchTensor checkOutput, TorchTensor checkRms) = Compute();
+            using (checkOutput)
+            using (checkRms)
+            using (TorchTensor outputCpu = checkOutput.cpu())
+            using (TorchTensor rmsCpu = checkRms.cpu())
+                error = Validate(
+                    outputCpu.data<float>().ToArray(), rmsCpu.data<float>().ToArray(),
+                    xHost, residualHost, gammaHost, rows);
             Distribution distribution = Measure(() => torch.cuda.synchronize(), Launch);
             long allocation = Allocation(() => torch.cuda.synchronize(), Launch);
+            long temporary = (long)xHost.Length * sizeof(float) * 2 +
+                (long)rows * sizeof(float) * 2;
             results.Add(new Result(rows, "PyTorch eager composition", distribution,
-                Bandwidth(rows, distribution.Median), allocation, -1, 0, -1, -1));
+                Bandwidth(rows, distribution.Median), allocation, temporary, error,
+                -1, -1, -1, double.NaN));
         }
     }
 
@@ -181,10 +260,15 @@ internal static class DirectPtxResidualRmsNormExperiment
     private static long Allocation(Action synchronize, Action launch)
     {
         launch(); synchronize();
+#if NET5_0_OR_GREATER
         long before = GC.GetAllocatedBytesForCurrentThread();
-        for (int i = 0; i < 50; i++) launch();
+        for (int i = 0; i < 50; i++) { launch(); synchronize(); }
         long allocation = (GC.GetAllocatedBytesForCurrentThread() - before) / 50;
-        synchronize();
+#else
+        long before = GC.GetTotalMemory(forceFullCollection: false);
+        for (int i = 0; i < 50; i++) { launch(); synchronize(); }
+        long allocation = Math.Max(0, GC.GetTotalMemory(forceFullCollection: false) - before) / 50;
+#endif
         return allocation;
     }
 
@@ -203,6 +287,13 @@ internal static class DirectPtxResidualRmsNormExperiment
         return bytes / (milliseconds * 1e-3) / 1e9;
     }
 
+    private static double EffectiveGflops(int rows, double milliseconds)
+    {
+        long elements = checked((long)rows * Dimension);
+        long operations = checked(5L * elements + 3L * rows);
+        return operations / milliseconds / 1e6;
+    }
+
     private static float[] Values(int length, int seed, float magnitude)
     {
         var random = new Random(seed);
@@ -210,10 +301,12 @@ internal static class DirectPtxResidualRmsNormExperiment
             .Select(_ => (random.NextSingle() - 0.5f) * 2f * magnitude).ToArray();
     }
 
-    private static float Validate(
-        float[] actual, float[] input, float[] residual, float[] gamma, int rows)
+    private static Error Validate(
+        float[] actual, float[] actualRms,
+        float[] input, float[] residual, float[] gamma, int rows)
     {
-        float maximum = 0;
+        float maxAbsolute = 0;
+        float maxRelative = 0;
         for (int row = 0; row < rows; row++)
         {
             float sumSquares = 0;
@@ -223,14 +316,28 @@ internal static class DirectPtxResidualRmsNormExperiment
                 sumSquares += value * value;
             }
             float rms = MathF.Sqrt(sumSquares / Dimension + Epsilon);
+            AccumulateError(actualRms[row], rms, ref maxAbsolute, ref maxRelative);
             for (int d = 0; d < Dimension; d++)
             {
                 float expected = (input[row * Dimension + d] + residual[row * Dimension + d]) /
                     rms * gamma[d];
-                maximum = MathF.Max(maximum,
-                    MathF.Abs(actual[row * Dimension + d] - expected));
+                float actualValue = actual[row * Dimension + d];
+                AccumulateError(actualValue, expected, ref maxAbsolute, ref maxRelative);
             }
         }
-        return maximum;
+        if (!float.IsFinite(maxAbsolute) || !float.IsFinite(maxRelative) || maxAbsolute >= 5e-5f)
+            throw new InvalidOperationException(
+                $"Residual RMSNorm validation failed: max abs {maxAbsolute:G9}, " +
+                $"max symmetric relative {maxRelative:G9}");
+        return new Error(maxAbsolute, maxRelative);
+    }
+
+    private static void AccumulateError(
+        float actual, float expected, ref float maxAbsolute, ref float maxRelative)
+    {
+        float absolute = MathF.Abs(actual - expected);
+        float relative = 2f * absolute / (MathF.Abs(actual) + MathF.Abs(expected) + 1e-3f);
+        maxAbsolute = MathF.Max(maxAbsolute, absolute);
+        maxRelative = MathF.Max(maxRelative, relative);
     }
 }

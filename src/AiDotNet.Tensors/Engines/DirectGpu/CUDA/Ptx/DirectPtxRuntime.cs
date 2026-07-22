@@ -23,6 +23,7 @@ internal sealed class DirectPtxRuntime : IDisposable
     internal string DeviceName { get; }
     internal int ComputeCapabilityMajor { get; }
     internal int ComputeCapabilityMinor { get; }
+    internal int MaxThreadsPerMultiprocessor { get; }
     internal DirectPtxArchitectureFamily ArchitectureFamily { get; }
     internal string DeviceUuid { get; }
     internal int DriverVersion { get; }
@@ -44,6 +45,10 @@ internal sealed class DirectPtxRuntime : IDisposable
         Check(CuBlasNative.cuDeviceGetAttribute(
             out int minor, (int)CudaDeviceAttribute.ComputeCapabilityMinor, device),
             "cuDeviceGetAttribute(ComputeCapabilityMinor)");
+        Check(CuBlasNative.cuDeviceGetAttribute(
+            out int maxThreadsPerMultiprocessor,
+            (int)CudaDeviceAttribute.MaxThreadsPerMultiprocessor, device),
+            "cuDeviceGetAttribute(MaxThreadsPerMultiprocessor)");
 
         Check(CuBlasNative.cuCtxCreate(out _context, 0, device), "cuCtxCreate");
         // cuCtxCreate makes the context current. Detach it so every operation
@@ -62,6 +67,7 @@ internal sealed class DirectPtxRuntime : IDisposable
         DeviceName = name.ToString();
         ComputeCapabilityMajor = major;
         ComputeCapabilityMinor = minor;
+        MaxThreadsPerMultiprocessor = maxThreadsPerMultiprocessor;
         ArchitectureFamily = DirectPtxArchitecture.Classify(major, minor);
         DeviceUuid = QueryDeviceUuid(device);
         DriverVersion = CudaNativeBindings.DriverVersion;
@@ -92,11 +98,16 @@ internal sealed class DirectPtxRuntime : IDisposable
         Check(CuBlasNative.cuDeviceGetAttribute(
             out int minor, (int)CudaDeviceAttribute.ComputeCapabilityMinor, device),
             "cuDeviceGetAttribute(ComputeCapabilityMinor)");
+        Check(CuBlasNative.cuDeviceGetAttribute(
+            out int maxThreadsPerMultiprocessor,
+            (int)CudaDeviceAttribute.MaxThreadsPerMultiprocessor, device),
+            "cuDeviceGetAttribute(MaxThreadsPerMultiprocessor)");
 
         DeviceOrdinal = device;
         DeviceName = name.ToString();
         ComputeCapabilityMajor = major;
         ComputeCapabilityMinor = minor;
+        MaxThreadsPerMultiprocessor = maxThreadsPerMultiprocessor;
         ArchitectureFamily = DirectPtxArchitecture.Classify(major, minor);
         DeviceUuid = QueryDeviceUuid(device);
         DriverVersion = CudaNativeBindings.DriverVersion;

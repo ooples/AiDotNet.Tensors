@@ -45,7 +45,22 @@ internal sealed class DirectPtxKernelCache<TKey, TKernel> : IDisposable
         ArgumentNullException.ThrowIfNull(factory);
         if (TryGetValue(key, out TKernel existing)) return existing;
 
-        TKernel created = factory();
+        return AddOrGetExisting(key, factory());
+    }
+
+    /// <summary>
+    /// Adds an already-created kernel. This overload lets allocation-sensitive
+    /// dispatchers keep factory delegates and their closure objects entirely on
+    /// the cache-miss path.
+    /// </summary>
+    internal TKernel AddOrGetExisting(TKey key, TKernel created)
+    {
+        ArgumentNullException.ThrowIfNull(created);
+        if (TryGetValue(key, out TKernel existing))
+        {
+            created.Dispose();
+            return existing;
+        }
         var node = new LinkedListNode<Entry>(new Entry(key, created));
         _entries.Add(key, node);
         _lru.AddFirst(node);

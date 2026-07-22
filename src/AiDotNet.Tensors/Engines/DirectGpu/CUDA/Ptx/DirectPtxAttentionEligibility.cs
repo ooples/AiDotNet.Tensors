@@ -5,6 +5,7 @@ internal enum DirectPtxAttentionMaskKind
 {
     None,
     CausalTopLeft,
+    CausalBottomRight,
     AdditiveBias,
     Padding,
     SlidingWindow,
@@ -20,6 +21,8 @@ internal enum DirectPtxAttentionPhase
 
 internal readonly record struct DirectPtxAttentionRequest(
     DirectPtxArchitectureFamily Architecture,
+    int ComputeCapabilityMajor,
+    int ComputeCapabilityMinor,
     DirectPtxPhysicalType InputType,
     DirectPtxPhysicalLayout Layout,
     int Batch,
@@ -49,23 +52,26 @@ internal static class DirectPtxAttentionEligibility
 {
     internal static DirectPtxEligibilityResult Evaluate(in DirectPtxAttentionRequest request)
     {
-        if (!DirectPtxArchitecture.HasValidatedOnlineAttention(request.Architecture))
-            return DirectPtxEligibilityResult.Reject("architecture-family-not-validated");
+        if (!DirectPtxArchitecture.HasValidatedOnlineAttention(
+            request.ComputeCapabilityMajor, request.ComputeCapabilityMinor))
+            return DirectPtxEligibilityResult.Reject("sm-version-not-validated");
         if (request.InputType != DirectPtxPhysicalType.Float16)
             return DirectPtxEligibilityResult.Reject("dtype-not-fp16");
         if (request.Layout != DirectPtxPhysicalLayout.Bhsd)
             return DirectPtxEligibilityResult.Reject("layout-not-dense-bhsd");
         if (request.Batch <= 0 || request.QueryHeads <= 0 || request.KeyValueHeads <= 0)
             return DirectPtxEligibilityResult.Reject("invalid-batch-or-head-count");
-        if (request.QueryHeads != request.KeyValueHeads)
-            return DirectPtxEligibilityResult.Reject("gqa-mqa-not-implemented");
-        if (request.QuerySequence != request.KeyValueSequence)
-            return DirectPtxEligibilityResult.Reject("non-square-attention-not-implemented");
+        if (request.QueryHeads % request.KeyValueHeads != 0)
+            return DirectPtxEligibilityResult.Reject("query-heads-not-divisible-by-kv-heads");
         if (!PtxOnlineFusedAttention128x64Kernel.IsSupportedSequenceLength(request.QuerySequence))
-            return DirectPtxEligibilityResult.Reject("sequence-bucket-not-implemented");
+            return DirectPtxEligibilityResult.Reject("query-sequence-bucket-not-implemented");
+        if (!PtxOnlineFusedAttention128x64Kernel.IsSupportedSequenceLength(request.KeyValueSequence))
+            return DirectPtxEligibilityResult.Reject("kv-sequence-bucket-not-implemented");
         if (request.HeadDimension != PtxOnlineFusedAttention128x64Kernel.HeadDimension)
             return DirectPtxEligibilityResult.Reject("head-dimension-not-64");
-        if (request.Mask is not (DirectPtxAttentionMaskKind.None or DirectPtxAttentionMaskKind.CausalTopLeft))
+        if (request.Mask is not (DirectPtxAttentionMaskKind.None or
+            DirectPtxAttentionMaskKind.CausalTopLeft or
+            DirectPtxAttentionMaskKind.CausalBottomRight))
             return DirectPtxEligibilityResult.Reject("mask-kind-not-implemented");
         if (request.Phase != DirectPtxAttentionPhase.Inference)
             return DirectPtxEligibilityResult.Reject("training-or-backward-not-implemented");

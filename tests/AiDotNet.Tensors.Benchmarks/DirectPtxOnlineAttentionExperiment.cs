@@ -14,24 +14,36 @@ internal static class DirectPtxOnlineAttentionExperiment
     private const int Sequence = 128;
     private const int Dimension = 64;
     private const float Scale = 0.125f;
+    private const float AttentionMaxAbsoluteTolerance = 5e-4f;
+    private const float FusedMaxAbsoluteTolerance = 3e-3f;
     private readonly record struct Distribution(double Mean, double Median, double P95, double P99);
+    private readonly record struct Error(float MaxAbsolute, float MaxRelative);
 
     internal static void Run()
     {
+        GpuBenchmarkEnvironment.RequireIdleGpu("online-attention-start");
         GpuBenchmarkEnvironment.PrintSnapshot("start");
         using var runtime = new DirectPtxRuntime();
         // Model a resident execution thread: establish the context once so
         // host timing measures launch/sync, not repeated context switching.
         Console.WriteLine("Async online FlashAttention championship: [BH=128,S=128,D=64]");
         Console.WriteLine($"GPU: {runtime.DeviceName} (SM {runtime.ComputeCapabilityMajor}.{runtime.ComputeCapabilityMinor})");
-        Console.WriteLine($"{"Mode",-9} {"Method",-34} {"median us",10} {"p95 us",10} {"p99 us",10} {"mean us",10} {"TFLOPS",9} {"B/call",10} {"tmp MiB",9} {"max err",10} {"regs",6} {"local B",8}");
-        Console.WriteLine(new string('-', 145));
+        Console.WriteLine(
+            "Physical direct/cuBLAS/TorchSharp lanes use FP16 Q/K/V; current AiDotNet NVRTC uses " +
+            "the same half-rounded values in FP32 storage and is reported separately.");
+        Console.WriteLine(
+            $"Correctness max-absolute tolerance: attention={AttentionMaxAbsoluteTolerance:G4}; " +
+            $"attention+epilogue={FusedMaxAbsoluteTolerance:G4}.");
+        Console.WriteLine($"{"Mode",-9} {"Method",-52} {"median us",10} {"p95 us",10} {"p99 us",10} {"mean us",10} {"GFLOPS",10} {"TFLOPS",9} {"managed B",10} {"tmp MiB",9} {"max abs",10} {"max rel",10} {"regs",6} {"static B",8} {"dynamic B",9} {"local B",8} {"occ",7}");
+        Console.WriteLine(new string('-', 220));
 
         using (runtime.Enter())
         {
         foreach (bool causal in new[] { false, true })
         foreach (bool epilogue in new[] { false, true })
         {
+            GpuBenchmarkEnvironment.RequireNoForeignCompute(
+                $"online-attention-{(causal ? "causal" : "plain")}-{(epilogue ? "epilogue" : "attention")}");
             using var kernel = new PtxOnlineFusedAttention128x64Kernel(
                 runtime, BatchHeads, causal, epilogue, Scale,
                 emitSoftmaxStats: false);
@@ -41,7 +53,6 @@ internal static class DirectPtxOnlineAttentionExperiment
             using var gamma = runtime.AllocateBytes(PtxOnlineFusedAttention128x64Kernel.GammaBytes);
             using var beta = runtime.AllocateBytes(PtxOnlineFusedAttention128x64Kernel.BetaBytes);
             using var output = runtime.AllocateBytes(kernel.OutputBytes);
-            using var stats = runtime.AllocateBytes(kernel.StatsBytes);
 
             var random = new Random(1771);
             ushort[] qHost = RandomHalf(random, BatchHeads * Sequence * Dimension);
@@ -62,25 +73,31 @@ internal static class DirectPtxOnlineAttentionExperiment
                 DirectPtxTensorView.CreateOwned(gamma, kernel.Blueprint.Tensors[3]),
                 DirectPtxTensorView.CreateOwned(beta, kernel.Blueprint.Tensors[4]),
                 DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[5]),
-                DirectPtxTensorView.CreateOwned(stats, kernel.Blueprint.Tensors[6]));
+                default);
 
             launch();
             runtime.Synchronize();
             var actual = new float[BatchHeads * Sequence * Dimension];
             output.Download<float>(actual);
-            float maxError = Validate(actual, qHost, kHost, vHost, gammaHost, betaHost, causal, epilogue);
+            Error error = Validate(actual, qHost, kHost, vHost, gammaHost, betaHost, causal, epilogue);
             Distribution device = Summarize(runtime.MeasureKernelSamples(
                 launch, warmup: 100, samples: 101, launchesPerSample: 10));
             Distribution e2e = MeasureEndToEnd(runtime, launch);
             long allocation = MeasureAllocation(runtime, launch);
             string mode = causal ? "causal" : "unmasked";
             string suffix = epilogue ? "+LN+GELU" : string.Empty;
+            double occupancy = kernel.Audit.ActiveBlocksPerMultiprocessor *
+                kernel.Audit.BlockThreads / (double)runtime.MaxThreadsPerMultiprocessor;
             Print(mode, $"Direct PTX online{suffix} [device]", device,
-                kernel.AttentionTflops((float)device.Median), allocation, 0, maxError,
-                kernel.FunctionInfo.RegistersPerThread, kernel.FunctionInfo.LocalBytesPerThread);
+                kernel.AttentionTflops((float)device.Median), allocation, 0, error,
+                kernel.FunctionInfo.RegistersPerThread, kernel.FunctionInfo.StaticSharedBytes,
+                0,
+                kernel.FunctionInfo.LocalBytesPerThread, occupancy);
             Print(mode, $"Direct PTX online{suffix} [E2E]", e2e,
-                kernel.AttentionTflops((float)e2e.Median), allocation, 0, maxError,
-                kernel.FunctionInfo.RegistersPerThread, kernel.FunctionInfo.LocalBytesPerThread);
+                kernel.AttentionTflops((float)e2e.Median), allocation, 0, error,
+                kernel.FunctionInfo.RegistersPerThread, kernel.FunctionInfo.StaticSharedBytes,
+                0,
+                kernel.FunctionInfo.LocalBytesPerThread, occupancy);
 
             if (!epilogue)
             {
@@ -90,7 +107,7 @@ internal static class DirectPtxOnlineAttentionExperiment
                 cuBlasLaunch();
                 runtime.Synchronize();
                 output.Download<float>(actual);
-                float cuBlasError = Validate(
+                Error cuBlasError = Validate(
                     actual, qHost, kHost, vHost, gammaHost, betaHost,
                     causal, epilogue: false);
                 Distribution cuBlasDevice = Summarize(runtime.MeasureKernelSamples(
@@ -108,8 +125,10 @@ internal static class DirectPtxOnlineAttentionExperiment
         }
         }
 
+        GpuBenchmarkEnvironment.RequireIdleGpu("online-attention-framework-baselines");
         RunAiDotNetNvrtc();
         RunTorchSharp();
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("online-attention-end");
         GpuBenchmarkEnvironment.PrintSnapshot("end");
     }
 
@@ -144,7 +163,7 @@ internal static class DirectPtxOnlineAttentionExperiment
                 1, BatchHeads, Sequence, Sequence, Dimension, Scale, causal);
             attentionAction();
             backend.Synchronize();
-            float attentionError = Validate(
+            Error attentionError = Validate(
                 backend.DownloadBuffer(attention), qHalf, kHalf, vHalf,
                 gammaHost, betaHost, causal, epilogue: false);
             Distribution attentionTime = MeasureEndToEnd(backend, attentionAction);
@@ -165,7 +184,7 @@ internal static class DirectPtxOnlineAttentionExperiment
             };
             composition();
             backend.Synchronize();
-            float fusedError = Validate(
+            Error fusedError = Validate(
                 backend.DownloadBuffer(final), qHalf, kHalf, vHalf,
                 gammaHost, betaHost, causal, epilogue: true);
             Distribution compositionTime = MeasureEndToEnd(backend, composition);
@@ -223,22 +242,22 @@ internal static class DirectPtxOnlineAttentionExperiment
                     using (TorchTensor check = Attention())
                     using (TorchTensor checkCpu = check.cpu())
                     {
-                        float error = Validate(checkCpu.data<float>().ToArray(), qHalf, kHalf, vHalf,
+                        Error error = Validate(checkCpu.data<float>().ToArray(), qHalf, kHalf, vHalf,
                             gammaHost, betaHost, causal, epilogue: false);
                         Distribution time = MeasureTorch(Attention);
                         long allocation = MeasureTorchAllocation(Attention);
-                        Print(causal ? "causal" : "unmasked", "PyTorch Flash-SDPA [E2E]", time,
+                        Print(causal ? "causal" : "unmasked", "TorchSharp flash-preferred SDPA [E2E]", time,
                             EffectiveTflops(time.Median), allocation, -1, error);
                     }
 
                     using (TorchTensor check = Composition())
                     using (TorchTensor checkCpu = check.cpu())
                     {
-                        float error = Validate(checkCpu.data<float>().ToArray(), qHalf, kHalf, vHalf,
+                        Error error = Validate(checkCpu.data<float>().ToArray(), qHalf, kHalf, vHalf,
                             gammaHost, betaHost, causal, epilogue: true);
                         Distribution time = MeasureTorch(Composition);
                         long allocation = MeasureTorchAllocation(Composition);
-                        Print(causal ? "causal" : "unmasked", "PyTorch Flash+LN+GELU [E2E]", time,
+                        Print(causal ? "causal" : "unmasked", "TorchSharp flash-preferred SDPA+LN+GELU [E2E]", time,
                             EffectiveTflops(time.Median), allocation, -1, error);
                     }
                 }
@@ -251,7 +270,7 @@ internal static class DirectPtxOnlineAttentionExperiment
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"PyTorch Flash baseline unavailable: {ex.GetType().Name}: {ex.Message}");
+            Console.WriteLine($"TorchSharp flash-preferred baseline unavailable: {ex.GetType().Name}: {ex.Message}");
         }
     }
 
@@ -265,7 +284,7 @@ internal static class DirectPtxOnlineAttentionExperiment
         return activated.mul(x).mul_(0.5);
     }
 
-    private static float Validate(
+    private static Error Validate(
         float[] actual,
         ushort[] q,
         ushort[] k,
@@ -277,16 +296,20 @@ internal static class DirectPtxOnlineAttentionExperiment
     {
         var scores = new float[Sequence];
         var expectedRow = new float[Dimension];
-        float maxError = 0;
+        float maxAbsolute = 0;
+        float maxRelative = 0;
+        foreach (int head in new[] { 0, BatchHeads / 2, BatchHeads - 1 })
         for (int row = 0; row < Sequence; row++)
         {
+            int headOffset = head * Sequence * Dimension;
             int lastKey = causal ? row : Sequence - 1;
             float maximum = float.NegativeInfinity;
             for (int column = 0; column <= lastKey; column++)
             {
                 float score = 0;
                 for (int d = 0; d < Dimension; d++)
-                    score += HalfAt(q, row * Dimension + d) * HalfAt(k, column * Dimension + d);
+                    score += HalfAt(q, headOffset + row * Dimension + d) *
+                        HalfAt(k, headOffset + column * Dimension + d);
                 scores[column] = score * Scale;
                 maximum = MathF.Max(maximum, scores[column]);
             }
@@ -301,7 +324,8 @@ internal static class DirectPtxOnlineAttentionExperiment
             {
                 float value = 0;
                 for (int column = 0; column <= lastKey; column++)
-                    value += scores[column] / sum * HalfAt(v, column * Dimension + d);
+                    value += scores[column] / sum *
+                        HalfAt(v, headOffset + column * Dimension + d);
                 expectedRow[d] = value;
             }
 
@@ -321,12 +345,22 @@ internal static class DirectPtxOnlineAttentionExperiment
             }
 
             for (int d = 0; d < Dimension; d++)
-                maxError = MathF.Max(maxError, MathF.Abs(actual[row * Dimension + d] - expectedRow[d]));
+            {
+                float actualValue = actual[headOffset + row * Dimension + d];
+                float absolute = MathF.Abs(actualValue - expectedRow[d]);
+                float relative = 2f * absolute /
+                    (MathF.Abs(actualValue) + MathF.Abs(expectedRow[d]) + 1e-3f);
+                maxAbsolute = MathF.Max(maxAbsolute, absolute);
+                maxRelative = MathF.Max(maxRelative, relative);
+            }
         }
 
-        if (!float.IsFinite(maxError) || maxError > (epilogue ? 0.025f : 0.012f))
-            throw new InvalidOperationException($"Online attention validation failed: max abs error {maxError:G9}.");
-        return maxError;
+        if (!float.IsFinite(maxAbsolute) || !float.IsFinite(maxRelative) ||
+            maxAbsolute > (epilogue ? FusedMaxAbsoluteTolerance : AttentionMaxAbsoluteTolerance))
+            throw new InvalidOperationException(
+                $"Online attention validation failed: max abs error {maxAbsolute:G9}, " +
+                $"max symmetric relative error {maxRelative:G9}.");
+        return new Error(maxAbsolute, maxRelative);
     }
 
     private static Distribution MeasureEndToEnd(DirectPtxRuntime runtime, Action action)
@@ -380,9 +414,8 @@ internal static class DirectPtxOnlineAttentionExperiment
         runtime.Synchronize();
         long before = GC.GetAllocatedBytesForCurrentThread();
         const int calls = 100;
-        for (int i = 0; i < calls; i++) action();
+        for (int i = 0; i < calls; i++) { action(); runtime.Synchronize(); }
         long result = (GC.GetAllocatedBytesForCurrentThread() - before) / calls;
-        runtime.Synchronize();
         return result;
     }
 
@@ -392,9 +425,8 @@ internal static class DirectPtxOnlineAttentionExperiment
         backend.Synchronize();
         long before = GC.GetAllocatedBytesForCurrentThread();
         const int calls = 100;
-        for (int i = 0; i < calls; i++) action();
+        for (int i = 0; i < calls; i++) { action(); backend.Synchronize(); }
         long result = (GC.GetAllocatedBytesForCurrentThread() - before) / calls;
-        backend.Synchronize();
         return result;
     }
 
@@ -403,9 +435,12 @@ internal static class DirectPtxOnlineAttentionExperiment
         using (TorchTensor warmup = action()) torch.cuda.synchronize();
         long before = GC.GetAllocatedBytesForCurrentThread();
         const int calls = 100;
-        for (int i = 0; i < calls; i++) using (TorchTensor result = action()) { }
+        for (int i = 0; i < calls; i++)
+        {
+            using TorchTensor result = action();
+            torch.cuda.synchronize();
+        }
         long allocated = (GC.GetAllocatedBytesForCurrentThread() - before) / calls;
-        torch.cuda.synchronize();
         return allocated;
     }
 
@@ -441,19 +476,26 @@ internal static class DirectPtxOnlineAttentionExperiment
         double tflops,
         long allocation,
         long temporaryBytes,
-        double maxError,
+        Error error,
         int registers = 0,
-        int localBytes = 0)
+        int staticSharedBytes = 0,
+        int dynamicSharedBytes = 0,
+        int localBytes = 0,
+        double occupancy = double.NaN)
     {
         string temporary = temporaryBytes < 0 ? "n/a" : (temporaryBytes / 1048576.0).ToString("F3");
-        string error = double.IsNaN(maxError) ? "n/a" : maxError.ToString("G4");
         string registerText = registers == 0 ? "n/a" : registers.ToString();
+        string staticSharedText = registers == 0 ? "n/a" : staticSharedBytes.ToString();
+        string dynamicSharedText = registers == 0 ? "n/a" : dynamicSharedBytes.ToString();
         string localText = registers == 0 ? "n/a" : localBytes.ToString();
+        string occupancyText = double.IsNaN(occupancy) ? "n/a" : occupancy.ToString("P0");
         Console.WriteLine(
-            $"{mode,-9} {method,-34} {distribution.Median * 1000,10:F2} " +
+            $"{mode,-9} {method,-52} {distribution.Median * 1000,10:F2} " +
             $"{distribution.P95 * 1000,10:F2} {distribution.P99 * 1000,10:F2} " +
-            $"{distribution.Mean * 1000,10:F2} {tflops,9:F3} {allocation,10} " +
-            $"{temporary,9} {error,10} {registerText,6} {localText,8}");
+            $"{distribution.Mean * 1000,10:F2} {tflops * 1000,10:F2} {tflops,9:F3} {allocation,10} " +
+            $"{temporary,9} {error.MaxAbsolute,10:G4} {error.MaxRelative,10:G4} " +
+            $"{registerText,6} {staticSharedText,8} {dynamicSharedText,9} " +
+            $"{localText,8} {occupancyText,7}");
     }
 
     private static ushort[] RandomHalf(Random random, int length)

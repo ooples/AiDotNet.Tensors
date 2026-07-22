@@ -164,9 +164,12 @@ internal static class DirectPtxAttentionExperiment
         action();
         runtime.Synchronize();
         long before = GC.GetAllocatedBytesForCurrentThread();
-        for (int i = 0; i < calls; i++) action();
+        for (int i = 0; i < calls; i++)
+        {
+            action();
+            runtime.Synchronize();
+        }
         long after = GC.GetAllocatedBytesForCurrentThread();
-        runtime.Synchronize();
         return (after - before) / calls;
     }
 
@@ -251,14 +254,20 @@ internal static class DirectPtxAttentionExperiment
             {
                 long start = Stopwatch.GetTimestamp();
                 action();
+                backend.Synchronize();
                 samples[i] = Stopwatch.GetElapsedTime(start).TotalMilliseconds;
             }
             Distribution stats = Summarize(samples);
 
             action();
+            backend.Synchronize();
             long before = GC.GetAllocatedBytesForCurrentThread();
             const int allocationCalls = 10;
-            for (int i = 0; i < allocationCalls; i++) action();
+            for (int i = 0; i < allocationCalls; i++)
+            {
+                action();
+                backend.Synchronize();
+            }
             long allocation = (GC.GetAllocatedBytesForCurrentThread() - before) / allocationCalls;
             double flops = 2.0 * shape.BatchHeads * shape.M * shape.N * shape.K;
             double tflops = flops / (stats.Median * 1e-3) / 1e12;

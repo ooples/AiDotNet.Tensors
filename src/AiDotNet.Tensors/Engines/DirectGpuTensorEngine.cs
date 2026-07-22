@@ -10133,72 +10133,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // to the kernel's physical FP16 dtype, then launch PTX containing no
         // shape/stride/layout checks. Unsupported shapes or any JIT failure
         // fall through to the existing NVRTC FlashAttention implementation.
-        if (typeof(T) == typeof(float) && attentionBias is null
-            && backend is Engines.DirectGpu.CUDA.CudaBackend directCuda
-            && directCuda.IsDirectPtxAttentionEnabled
-            // Module JIT and the eager scratch allocations below are not
-            // stream-capture safe. Captured graphs keep the established
-            // resident NVRTC path until a PTX prewarm/capture API is added.
-            && !directCuda.IsStreamCapturing()
-            && seqQ == seqK
-            && PtxOnlineFusedAttention128x64Kernel.IsSupportedSequenceLength(seqQ)
-            && headDim == PtxOnlineFusedAttention128x64Kernel.HeadDimension
-            && key.Shape._dims[0] == batch && value.Shape._dims[0] == batch
-            && key.Shape._dims[1] == heads && value.Shape._dims[1] == heads
-            && key.Shape._dims[3] == headDim && value.Shape._dims[2] == seqK
-            && value.Shape._dims[3] == headDim
-            && IsCanonicalDenseAllocation(query)
-            && IsCanonicalDenseAllocation(key)
-            && IsCanonicalDenseAllocation(value))
+        if (TryDirectPtxFlashAttention(query, key, value, attentionBias, backend,
+            batch, heads, seqQ, seqK, headDim, scaleFloat, isCausal,
+            out Tensor<T> directResult, out Tensor<T> directSoftmaxStats))
         {
-            IGpuBuffer? queryHalfOwned = null;
-            IGpuBuffer? keyHalfOwned = null;
-            IGpuBuffer? valueHalfOwned = null;
-            var directOutput = AllocateOutputBuffer(backend, batch * heads * seqQ * headDim);
-            var directStats = AllocateOutputBuffer(backend, batch * heads * seqQ);
-            bool directHanded = false;
-            try
-            {
-                int inputElements = batch * heads * seqQ * headDim;
-                IGpuBuffer queryHalf = ResolveToFp16(
-                    query, inputElements, directCuda, backend, out queryHalfOwned);
-                IGpuBuffer keyHalf = ResolveToFp16(
-                    key, inputElements, directCuda, backend, out keyHalfOwned);
-                IGpuBuffer valueHalf = ResolveToFp16(
-                    value, inputElements, directCuda, backend, out valueHalfOwned);
-                if (directCuda.TryDirectPtxOnlineAttention(
-                    queryHalf, keyHalf, valueHalf,
-                    directOutput.Buffer, directStats.Buffer,
-                    batch * heads, scaleFloat, isCausal, seqQ))
-                {
-                    var directResult = DeferTensorResult<T>(
-                        backend, directOutput.Buffer,
-                        batch * heads * seqQ * headDim,
-                        new[] { batch, heads, seqQ, headDim });
-                    softmaxStats = DeferTensorResult<T>(
-                        backend, directStats.Buffer,
-                        batch * heads * seqQ,
-                        new[] { batch, heads, seqQ });
-                    directHanded = true;
-                    return directResult;
-                }
-                AliasDiag($"FlashAttention direct-PTX FELLBACK: {directCuda.DirectPtxLastError ?? "specialization unavailable"}");
-            }
-            catch (Exception ptxEx)
-            {
-                AliasDiag($"FlashAttention direct-PTX FELLBACK: {ptxEx.GetType().Name}: {ptxEx.Message}");
-            }
-            finally
-            {
-                queryHalfOwned?.Dispose();
-                keyHalfOwned?.Dispose();
-                valueHalfOwned?.Dispose();
-                if (!directHanded)
-                {
-                    directOutput.Dispose();
-                    directStats.Dispose();
-                }
-            }
+            softmaxStats = directSoftmaxStats;
+            return directResult;
         }
 #endif
 
@@ -10276,6 +10216,105 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (!faHanded) { outputBuffer.Dispose(); statsBuffer.Dispose(); }
         }
     }
+
+#if NET5_0_OR_GREATER
+    // The hosted CI runners do not expose an NVIDIA Driver API device. Keep the
+    // pure admission rules independently testable while excluding only this
+    // hardware bridge; the GPU suite executes this method on supported hosts.
+    [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
+    private bool TryDirectPtxFlashAttention<T>(
+        Tensor<T> query,
+        Tensor<T> key,
+        Tensor<T> value,
+        Tensor<T>? attentionBias,
+        IDirectGpuBackend backend,
+        int batch,
+        int heads,
+        int seqQ,
+        int seqK,
+        int headDim,
+        float scale,
+        bool isCausal,
+        out Tensor<T> result,
+        out Tensor<T> softmaxStats)
+    {
+        result = null!;
+        softmaxStats = null!;
+        if (typeof(T) != typeof(float) || attentionBias is not null
+            || backend is not Engines.DirectGpu.CUDA.CudaBackend directCuda)
+            return false;
+
+        if (!directCuda.IsDirectPtxAttentionEnabled
+            // Module JIT and the eager scratch allocations below are not
+            // stream-capture safe. Captured graphs keep the established
+            // resident NVRTC path until a PTX prewarm/capture API is added.
+            || directCuda.IsStreamCapturing()
+            || !PtxOnlineFusedAttention128x64Kernel.IsSupportedSequenceLength(seqQ)
+            || !PtxOnlineFusedAttention128x64Kernel.IsSupportedSequenceLength(seqK)
+            || headDim != PtxOnlineFusedAttention128x64Kernel.HeadDimension
+            || key.Shape._dims[0] != batch || value.Shape._dims[0] != batch
+            || key.Shape._dims[1] != heads || value.Shape._dims[1] != heads
+            || key.Shape._dims[3] != headDim || value.Shape._dims[2] != seqK
+            || value.Shape._dims[3] != headDim
+            || !IsCanonicalDenseAllocation(query)
+            || !IsCanonicalDenseAllocation(key)
+            || !IsCanonicalDenseAllocation(value))
+            return false;
+
+        IGpuBuffer? queryHalfOwned = null;
+        IGpuBuffer? keyHalfOwned = null;
+        IGpuBuffer? valueHalfOwned = null;
+        var directOutput = AllocateOutputBuffer(backend, batch * heads * seqQ * headDim);
+        var directStats = AllocateOutputBuffer(backend, batch * heads * seqQ);
+        bool directHanded = false;
+        try
+        {
+            int queryElements = batch * heads * seqQ * headDim;
+            int keyValueElements = batch * heads * seqK * headDim;
+            IGpuBuffer queryHalf = ResolveToFp16(
+                query, queryElements, directCuda, backend, out queryHalfOwned);
+            IGpuBuffer keyHalf = ResolveToFp16(
+                key, keyValueElements, directCuda, backend, out keyHalfOwned);
+            IGpuBuffer valueHalf = ResolveToFp16(
+                value, keyValueElements, directCuda, backend, out valueHalfOwned);
+            if (!directCuda.TryDirectPtxOnlineAttentionFamily(
+                queryHalf, keyHalf, valueHalf,
+                directOutput.Buffer, directStats.Buffer,
+                batch, heads, heads, seqQ, seqK, scale, isCausal))
+            {
+                AliasDiag($"FlashAttention direct-PTX FELLBACK: {directCuda.DirectPtxLastError ?? "specialization unavailable"}");
+                return false;
+            }
+
+            result = DeferTensorResult<T>(
+                backend, directOutput.Buffer,
+                batch * heads * seqQ * headDim,
+                new[] { batch, heads, seqQ, headDim });
+            softmaxStats = DeferTensorResult<T>(
+                backend, directStats.Buffer,
+                batch * heads * seqQ,
+                new[] { batch, heads, seqQ });
+            directHanded = true;
+            return true;
+        }
+        catch (Exception ptxEx)
+        {
+            AliasDiag($"FlashAttention direct-PTX FELLBACK: {ptxEx.GetType().Name}: {ptxEx.Message}");
+            return false;
+        }
+        finally
+        {
+            queryHalfOwned?.Dispose();
+            keyHalfOwned?.Dispose();
+            valueHalfOwned?.Dispose();
+            if (!directHanded)
+            {
+                directOutput.Dispose();
+                directStats.Dispose();
+            }
+        }
+    }
+#endif
 
     /// <summary>
     /// GPU-accelerated backward pass for FlashAttention.
@@ -10547,6 +10586,70 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int kvHeads = key.Shape._dims[1];
         if (kvHeads <= 0 || heads % kvHeads != 0)
             throw new ArgumentException("Query heads must be a positive integer multiple of key/value heads.");
+        if (key.Shape._dims[0] != batch || value.Shape._dims[0] != batch
+            || value.Shape._dims[1] != kvHeads || value.Shape._dims[2] != seqK
+            || key.Shape._dims[3] != headDim || value.Shape._dims[3] != headDim)
+            throw new ArgumentException("Query, key, and value batch/KV/head dimensions must agree.");
+
+#if NET5_0_OR_GREATER
+        // Weight-free inference can use the same online PTX family as FlashAttention,
+        // including GQA/MQA. Physical FP16 conversion and dense-BHSD proof happen
+        // once at this boundary; the emitted kernel receives only canonical pointers.
+        if (typeof(T) == typeof(float) && softcap == 0
+            && backend is Engines.DirectGpu.CUDA.CudaBackend directCuda
+            && directCuda.IsDirectPtxAttentionEnabled && !directCuda.IsStreamCapturing()
+            // Track the kernel's supported shape set and the extracted canonical-dense contract instead
+            // of re-inlining them, so this gate cannot silently diverge from what the PTX actually accepts
+            // when the kernel's supported lengths/head-dim change.
+            && PtxOnlineFusedAttention128x64Kernel.IsSupportedSequenceLength(seqQ)
+            && PtxOnlineFusedAttention128x64Kernel.IsSupportedSequenceLength(seqK)
+            && headDim == PtxOnlineFusedAttention128x64Kernel.HeadDimension
+            && IsCanonicalDenseAllocation(query)
+            && IsCanonicalDenseAllocation(key)
+            && IsCanonicalDenseAllocation(value))
+        {
+            IGpuBuffer? queryHalfOwned = null;
+            IGpuBuffer? keyHalfOwned = null;
+            IGpuBuffer? valueHalfOwned = null;
+            IGpuBuffer? directOutput = null;
+            try
+            {
+                int queryElements = checked(batch * heads * seqQ * headDim);
+                int keyValueElements = checked(batch * kvHeads * seqK * headDim);
+                IGpuBuffer queryHalf = ResolveToFp16(
+                    query, queryElements, directCuda, backend, out queryHalfOwned);
+                IGpuBuffer keyHalf = ResolveToFp16(
+                    key, keyValueElements, directCuda, backend, out keyHalfOwned);
+                IGpuBuffer valueHalf = ResolveToFp16(
+                    value, keyValueElements, directCuda, backend, out valueHalfOwned);
+                directOutput = backend.AllocateBuffer(queryElements);
+                if (directCuda.TryDirectPtxOnlineAttentionFamily(
+                    queryHalf, keyHalf, valueHalf, directOutput, null,
+                    batch, heads, kvHeads, seqQ, seqK, (float)scale, isCausal,
+                    emitSoftmaxStats: false,
+                    causalQueryOffset: isCausal ? seqK - seqQ : 0))
+                {
+                    IGpuBuffer resultBuffer = directOutput;
+                    directOutput = null;
+                    return Tensor<T>.FromGpuBuffer(
+                        backend, resultBuffer, new[] { batch, heads, seqQ, headDim },
+                        GpuTensorRole.Activation, ownsBuffer: true);
+                }
+                AliasDiag($"ScaledDotProductAttentionGpu direct-PTX FELLBACK: {directCuda.DirectPtxLastError ?? "specialization unavailable"}");
+            }
+            catch (Exception ptxEx)
+            {
+                AliasDiag($"ScaledDotProductAttentionGpu direct-PTX FELLBACK: {ptxEx.GetType().Name}: {ptxEx.Message}");
+            }
+            finally
+            {
+                queryHalfOwned?.Dispose();
+                keyHalfOwned?.Dispose();
+                valueHalfOwned?.Dispose();
+                directOutput?.Dispose();
+            }
+        }
+#endif
 
         // The kernel indexes Q/K/V as flat row-major [batch, heads, seq, headDim]; a permuted view (e.g. the
         // [0,2,1,3] transpose that produced the per-head layout) must be materialized contiguous first, and a
