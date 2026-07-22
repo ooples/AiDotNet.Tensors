@@ -57,8 +57,20 @@ public class DirectPtxComplexMultiplyTests
             Assert.False(string.IsNullOrWhiteSpace(cell.DTypes));
             Assert.False(string.IsNullOrWhiteSpace(cell.DirectPtxAssignment));
         });
-        Assert.Single(DirectPtxSpectralCoverageManifest.All,
-            cell => cell.Status == DirectPtxSpectralCoverageStatus.ExperimentalDirectPtx);
+        // Name the live cells rather than counting them: this pins WHICH cells
+        // are experimental, so a new cell cannot quietly take a live slot.
+        Assert.Equal(
+            new[]
+            {
+                "CudaBackend.ComplexConjugate",
+                "CudaBackend.ComplexMagnitude",
+                "CudaBackend.ComplexMultiply",
+            },
+            DirectPtxSpectralCoverageManifest.All
+                .Where(cell => cell.Status == DirectPtxSpectralCoverageStatus.ExperimentalDirectPtx)
+                .Select(cell => cell.Api)
+                .OrderBy(api => api, StringComparer.Ordinal)
+                .ToArray());
         Assert.DoesNotContain(DirectPtxSpectralCoverageManifest.All,
             cell => cell.Status == DirectPtxSpectralCoverageStatus.PromotedDirectPtx);
         Assert.Equal(

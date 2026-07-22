@@ -82,6 +82,14 @@ public static class PtxParityRegistry
             "fused QKV + RoPE + KV-cache write (#858)",
             "multi-output (Q + K/V cache) with baked RoPE tables; needs a dedicated QKV/RoPE/cache oracle."),
 
+        new PtxParitySpec("PtxFusedComplexUnaryF32Kernel", PtxParityStatus.Deferred,
+            "complex conjugate and magnitude, fp32 (#850) - CudaBackend.ComplexConjugate, CudaBackend.ComplexMagnitude",
+            "one module per operator. Conjugate is a sign-bit flip, so its spec can be bit-exact and " +
+            "must include NaN payloads and both signed zeros. Magnitude can be bit-exact too, but only " +
+            "because the emitter deliberately leaves the multiply-add UNFUSED: an fma would be more " +
+            "accurate than sqrtf(re*re + im*im) and would therefore disagree with the reference, so " +
+            "the spec must assert equality rather than a tolerance to keep that property honest."),
+
         new PtxParitySpec("PtxFusedComplexMultiplyF32Kernel", PtxParityStatus.Deferred,
             "interleaved-complex multiply, fp32 (#850)",
             "structurally ready for a three-way spec — it is the first direct-PTX kernel with both a " +

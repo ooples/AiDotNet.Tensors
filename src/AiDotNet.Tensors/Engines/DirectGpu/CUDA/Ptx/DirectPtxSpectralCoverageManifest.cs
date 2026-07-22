@@ -35,8 +35,8 @@ internal static class DirectPtxSpectralCoverageManifest
     internal static IReadOnlyList<DirectPtxSpectralCoverageCell> All { get; } =
     [
         Experimental("CudaBackend.ComplexMultiply", "NVRTC complex_multiply", "pairwise complex product", Interleaved, "FP32", "v1 SM86 pairwise-v2 exact-count cells"),
-        Planned("CudaBackend.ComplexConjugate", "NVRTC complex_conjugate", "complex conjugate", Interleaved, "FP32", "interleaved-conjugate-cells"),
-        Planned("CudaBackend.ComplexMagnitude", "NVRTC complex_magnitude", "complex magnitude", Interleaved, "FP32", "interleaved-magnitude-cells"),
+        Experimental("CudaBackend.ComplexConjugate", "NVRTC complex_conjugate", "complex conjugate", Interleaved, "FP32", "v1 Ampere pairwise-v2 exact-pair cells; neg.f32 sign flip preserves NaN payloads and signed zeros"),
+        Experimental("CudaBackend.ComplexMagnitude", "NVRTC complex_magnitude", "complex magnitude", Interleaved, "FP32", "v1 Ampere pairwise-v2 exact-pair cells; unfused mul-mul-add then sqrt.rn to match sqrtf rounding"),
         Planned("CudaBackend.InterleaveComplex", "NVRTC interleave_complex", "split-to-interleaved conversion", Split, "FP32", "split-interleave-cells"),
         Planned("CudaBackend.DeinterleaveComplex", "NVRTC deinterleave_complex", "interleaved-to-split conversion", Interleaved, "FP32", "interleave-split-cells"),
         Planned("CudaBackend.SplitComplexMultiply", "NVRTC split_complex_multiply", "pairwise split complex product", Split, "FP32", "split-complex-product-cells"),
