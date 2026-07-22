@@ -10249,8 +10249,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // stream-capture safe. Captured graphs keep the established
             // resident NVRTC path until a PTX prewarm/capture API is added.
             || directCuda.IsStreamCapturing()
-            || seqQ != seqK
             || !PtxOnlineFusedAttention128x64Kernel.IsSupportedSequenceLength(seqQ)
+            || !PtxOnlineFusedAttention128x64Kernel.IsSupportedSequenceLength(seqK)
             || headDim != PtxOnlineFusedAttention128x64Kernel.HeadDimension
             || key.Shape._dims[0] != batch || value.Shape._dims[0] != batch
             || key.Shape._dims[1] != heads || value.Shape._dims[1] != heads
@@ -10269,17 +10269,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         bool directHanded = false;
         try
         {
-            int inputElements = batch * heads * seqQ * headDim;
+            int queryElements = batch * heads * seqQ * headDim;
+            int keyValueElements = batch * heads * seqK * headDim;
             IGpuBuffer queryHalf = ResolveToFp16(
-                query, inputElements, directCuda, backend, out queryHalfOwned);
+                query, queryElements, directCuda, backend, out queryHalfOwned);
             IGpuBuffer keyHalf = ResolveToFp16(
-                key, inputElements, directCuda, backend, out keyHalfOwned);
+                key, keyValueElements, directCuda, backend, out keyHalfOwned);
             IGpuBuffer valueHalf = ResolveToFp16(
-                value, inputElements, directCuda, backend, out valueHalfOwned);
-            if (!directCuda.TryDirectPtxOnlineAttention(
+                value, keyValueElements, directCuda, backend, out valueHalfOwned);
+            if (!directCuda.TryDirectPtxOnlineAttentionFamily(
                 queryHalf, keyHalf, valueHalf,
                 directOutput.Buffer, directStats.Buffer,
-                batch * heads, scale, isCausal, seqQ))
+                batch, heads, heads, seqQ, seqK, scale, isCausal))
             {
                 AliasDiag($"FlashAttention direct-PTX FELLBACK: {directCuda.DirectPtxLastError ?? "specialization unavailable"}");
                 return false;

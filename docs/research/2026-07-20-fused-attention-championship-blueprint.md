@@ -440,7 +440,7 @@ Production integration is fail-closed:
   `AIDOTNET_DIRECT_PTX_ATTENTION_BACKWARD=1`, or
   `AIDOTNET_DIRECT_PTX_FLASH_ATTENTION_BACKWARD=1` to admit only that family.
 - The process-level gates are resolved once when a CUDA backend is constructed,
-  steady-state dispatch does not reread environment variables.
+  so steady-state dispatch does not reread environment variables.
 - SM other than the executed SM86 target, unsupported shape/dtype/layout,
   bias, active autodiff tape, stream
   capture, JIT failure, or launch failure falls back to the existing path.

@@ -8286,7 +8286,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
         int batch, int numHeads, int seqQ, int seqK, int headDim, float scale,
         bool isCausal, IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
-    
+
     {
         int causalFlag = isCausal ? 1 : 0;
         int hasBias = attentionBias is not null ? 1 : 0;
@@ -8472,7 +8472,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
         int batch, int numQHeads, int numKVHeads, int seqQ, int seqK,
         int headDim, float scale, int numQueriesPerKV)
-    
+
     {
         int queriesPerKV = numQueriesPerKV;
         IntPtr goPtr = gradOutput.Handle;
