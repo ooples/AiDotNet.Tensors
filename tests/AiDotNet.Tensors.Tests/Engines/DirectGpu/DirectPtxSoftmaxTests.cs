@@ -681,6 +681,126 @@ public class DirectPtxSoftmaxTests
         }
     }
 
+    [SkippableFact]
+    public void Backend_DirectPtxSoftmaxFamily_BackwardAndMaskingRoutesDispatch()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previous = DirectPtxFeatureGate.TestOverride;
+        bool previousExperiment = DirectPtxFeatureGate.SoftmaxExperimentOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        DirectPtxFeatureGate.SoftmaxExperimentOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxSoftmaxEnabled, "Requires a validated Ampere CUDA backend.");
+            const int m = 64, n = 256, size = m * n;
+            var random = RandomHelper.CreateSeededRandom(20265700);
+
+            // ---- SoftmaxBackward: dX = S*(dY - sum(dY*S)) ----
+            float[] sHost = new float[size];
+            float[] dyHost = Values(random, size, 0.5f);
+            for (int row = 0; row < m; row++)
+            {
+                var logits = Values(random, n, 2.0f);
+                double mx = double.NegativeInfinity;
+                for (int c = 0; c < n; c++) mx = Math.Max(mx, logits[c]);
+                double sm = 0;
+                for (int c = 0; c < n; c++) sm += Math.Exp(logits[c] - mx);
+                for (int c = 0; c < n; c++) sHost[row * n + c] = (float)(Math.Exp(logits[c] - mx) / sm);
+            }
+            var sbExpected = new float[size];
+            for (int row = 0; row < m; row++)
+            {
+                double dot = 0;
+                for (int c = 0; c < n; c++) dot += (double)dyHost[row * n + c] * sHost[row * n + c];
+                for (int c = 0; c < n; c++) sbExpected[row * n + c] = (float)(sHost[row * n + c] * (dyHost[row * n + c] - dot));
+            }
+            using (var sBuf = backend.AllocateBuffer(sHost))
+            using (var dyBuf = backend.AllocateBuffer(dyHost))
+            using (var dxBuf = backend.AllocateBuffer(size))
+            {
+                long before = backend.DirectPtxSoftmaxBackwardDispatchCount;
+                backend.SoftmaxBackward(dyBuf, sBuf, dxBuf, m, n);
+                backend.Synchronize();
+                Assert.True(backend.DirectPtxSoftmaxBackwardDispatchCount > before, backend.DirectPtxLastError);
+                AssertVectorClose(backend.DownloadBuffer(dxBuf), sbExpected, 2e-3f, "backend softmax-backward route");
+            }
+
+            // ---- LogSumExpAxis: [M,N] -> [M] ----
+            float[] xHost = Values(random, size, 3.0f);
+            var lseExpected = new float[m];
+            for (int row = 0; row < m; row++)
+            {
+                double mx = double.NegativeInfinity;
+                for (int c = 0; c < n; c++) mx = Math.Max(mx, xHost[row * n + c]);
+                double sm = 0;
+                for (int c = 0; c < n; c++) sm += Math.Exp(xHost[row * n + c] - mx);
+                lseExpected[row] = (float)(mx + Math.Log(sm));
+            }
+            using (var xBuf = backend.AllocateBuffer(xHost))
+            using (var lseBuf = backend.AllocateBuffer(m))
+            {
+                long before = backend.DirectPtxLogSumExpDispatchCount;
+                backend.LogSumExpAxis(xBuf, lseBuf, m, n);
+                backend.Synchronize();
+                Assert.True(backend.DirectPtxLogSumExpDispatchCount > before, backend.DirectPtxLastError);
+                AssertVectorClose(backend.DownloadBuffer(lseBuf), lseExpected, 3e-3f, "backend logsumexp route");
+
+                // ---- LogSumExpBackward: dX = softmax(x) * dY[m] ----
+                float[] dLseHost = Values(random, m, 1.0f);
+                var lseBwdExpected = new float[size];
+                for (int row = 0; row < m; row++)
+                {
+                    double mx = double.NegativeInfinity;
+                    for (int c = 0; c < n; c++) mx = Math.Max(mx, xHost[row * n + c]);
+                    double sm = 0;
+                    for (int c = 0; c < n; c++) sm += Math.Exp(xHost[row * n + c] - mx);
+                    for (int c = 0; c < n; c++)
+                        lseBwdExpected[row * n + c] = (float)(Math.Exp(xHost[row * n + c] - mx) / sm * dLseHost[row]);
+                }
+                using var dLseBuf = backend.AllocateBuffer(dLseHost);
+                using var dxBuf = backend.AllocateBuffer(size);
+                long beforeB = backend.DirectPtxLogSumExpBackwardDispatchCount;
+                backend.LogSumExpBackward(dLseBuf, xBuf, lseBuf, dxBuf, m, n);
+                backend.Synchronize();
+                Assert.True(backend.DirectPtxLogSumExpBackwardDispatchCount > beforeB, backend.DirectPtxLastError);
+                AssertVectorClose(backend.DownloadBuffer(dxBuf), lseBwdExpected, 2e-3f, "backend logsumexp-backward route");
+            }
+
+            // ---- MaskedFill / MaskedFillBackward (flat size) ----
+            float[] inFlat = Values(random, size, 2.0f);
+            float[] maskFlat = new float[size];
+            for (int i = 0; i < size; i++) maskFlat[i] = random.NextDouble() < 0.3 ? 1f : 0f;
+            const float fill = -1e9f;
+            using (var inBuf = backend.AllocateBuffer(inFlat))
+            using (var maskBuf = backend.AllocateBuffer(maskFlat))
+            using (var outFill = backend.AllocateBuffer(size))
+            using (var outBwd = backend.AllocateBuffer(size))
+            {
+                long beforeF = backend.DirectPtxMaskedFillDispatchCount;
+                backend.MaskedFillKernel(inBuf, maskBuf, outFill, fill, size);
+                long beforeBwd = backend.DirectPtxMaskedFillBackwardDispatchCount;
+                backend.MaskedFillBackward(inBuf, maskBuf, outBwd, size);
+                backend.Synchronize();
+                Assert.True(backend.DirectPtxMaskedFillDispatchCount > beforeF, backend.DirectPtxLastError);
+                Assert.True(backend.DirectPtxMaskedFillBackwardDispatchCount > beforeBwd, backend.DirectPtxLastError);
+                var gotFill = backend.DownloadBuffer(outFill);
+                var gotBwd = backend.DownloadBuffer(outBwd);
+                for (int i = 0; i < size; i++)
+                {
+                    bool masked = maskFlat[i] != 0f;
+                    Assert.Equal(masked ? fill : inFlat[i], gotFill[i]);
+                    Assert.Equal(masked ? 0f : inFlat[i], gotBwd[i]);
+                }
+            }
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previous;
+            DirectPtxFeatureGate.SoftmaxExperimentOverride = previousExperiment;
+        }
+    }
+
     private static float[] Values(Random random, int count, float magnitude)
     {
         var data = new float[count];
