@@ -118,8 +118,9 @@ public class DirectPtxSoftmaxTests
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
         using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(runtime.ArchitectureFamily == DirectPtxArchitectureFamily.Ampere,
-            "The checked-in softmax specialization is validated on Ampere.");
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedRowSoftmax(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in softmax specialization is measured on GA10x/SM86.");
         const int rows = 256, columns = 128;
         using var kernel = new PtxFusedSoftmaxF32Kernel(
             runtime, rows, columns, blockThreads);
@@ -186,6 +187,159 @@ public class DirectPtxSoftmaxTests
         var actual = new float[elements];
         output.Download<float>(actual);
         AssertVectorClose(actual, expected, 5e-5f, $"softmax-{blockThreads}");
+    }
+
+    [Theory]
+    [InlineData(8, 6, true)]
+    [InlineData(8, 0, false)]
+    [InlineData(8, 7, false)]
+    [InlineData(8, 9, false)]
+    [InlineData(9, 0, false)]
+    [InlineData(10, 0, false)]
+    public void SoftmaxArchitectureMatrix_FailsClosedOutsideSm86(
+        int major,
+        int minor,
+        bool expected)
+    {
+        Assert.Equal(expected,
+            DirectPtxArchitecture.HasValidatedRowSoftmax(major, minor));
+    }
+
+    [SkippableFact]
+    public void BackendSoftmax_PromotedGeometryDispatchesZeroAllocAndMatchesOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previousEnabled = DirectPtxFeatureGate.TestOverride;
+        bool previousExperiment = DirectPtxFeatureGate.SoftmaxExperimentOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        DirectPtxFeatureGate.SoftmaxExperimentOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxSoftmaxEnabled, "Requires a GA10x/SM86 CUDA backend.");
+            const int rows = 2048, columns = 128;
+            float[] valuesHost = MakeRowValues(rows, columns, seed: 3);
+            float[] expected = CpuRowSoftmax(valuesHost, rows, columns);
+            using var input = backend.AllocateBuffer(valuesHost);
+            using var output = backend.AllocateBuffer(rows * columns);
+
+            Assert.True(backend.PrewarmDirectPtxSoftmax(rows, columns), backend.DirectPtxLastError);
+            long before = backend.DirectPtxSoftmaxDispatchCount;
+            Assert.True(backend.TryDirectPtxSoftmax(input, output, rows, columns),
+                backend.DirectPtxLastError);
+            backend.Synchronize();
+            Assert.Equal(before + 1, backend.DirectPtxSoftmaxDispatchCount);
+            AssertVectorClose(backend.DownloadBuffer(output), expected, 5e-5f, "direct-ptx softmax");
+
+            // The resident dispatch path must not allocate managed memory.
+            long allocBefore = GC.GetAllocatedBytesForCurrentThread();
+            bool all = true;
+            for (int i = 0; i < 32; i++)
+                all &= backend.TryDirectPtxSoftmax(input, output, rows, columns);
+            long allocated = GC.GetAllocatedBytesForCurrentThread() - allocBefore;
+            backend.Synchronize();
+            Assert.True(all, backend.DirectPtxLastError);
+            Assert.Equal(0, allocated);
+
+            // The public route selects the direct-PTX kernel and increments the counter.
+            long publicBefore = backend.DirectPtxSoftmaxDispatchCount;
+            backend.Softmax(input, output, rows, columns);
+            backend.Synchronize();
+            Assert.Equal(publicBefore + 1, backend.DirectPtxSoftmaxDispatchCount);
+            AssertVectorClose(backend.DownloadBuffer(output), expected, 5e-5f, "public softmax");
+
+            Assert.True(backend.TryGetDirectPtxSoftmaxAudit(
+                rows, columns, out DirectPtxKernelAudit audit));
+            Assert.Equal(0, audit.Function.LocalBytesPerThread);
+            Assert.Equal(64, audit.PtxSha256.Length);
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previousEnabled;
+            DirectPtxFeatureGate.SoftmaxExperimentOverride = previousExperiment;
+        }
+    }
+
+    [SkippableFact]
+    public void BackendSoftmax_UnsupportedShapeAndDisabledGateFallBackToExistingKernel()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previousEnabled = DirectPtxFeatureGate.TestOverride;
+        bool previousExperiment = DirectPtxFeatureGate.SoftmaxExperimentOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        DirectPtxFeatureGate.SoftmaxExperimentOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxSoftmaxEnabled, "Requires a GA10x/SM86 CUDA backend.");
+
+            // An unsupported shape declines the direct-PTX route with an exact
+            // reason, leaves the dispatch counter untouched, and the public
+            // Softmax still returns a correct result through the existing kernel.
+            const int rows = 96, columns = 96; // 96 % 32 == 0 but not a promoted bucket
+            float[] valuesHost = MakeRowValues(rows, columns, seed: 7);
+            float[] expected = CpuRowSoftmax(valuesHost, rows, columns);
+            using var input = backend.AllocateBuffer(valuesHost);
+            using var output = backend.AllocateBuffer(rows * columns);
+            long before = backend.DirectPtxSoftmaxDispatchCount;
+            Assert.False(backend.TryDirectPtxSoftmax(input, output, rows, columns));
+            Assert.Equal("softmax-shape-not-implemented", backend.DirectPtxLastError);
+            backend.Softmax(input, output, rows, columns);
+            backend.Synchronize();
+            Assert.Equal(before, backend.DirectPtxSoftmaxDispatchCount);
+            AssertVectorClose(backend.DownloadBuffer(output), expected, 5e-5f,
+                "unsupported-shape fallback");
+
+            // A promoted shape with the feature disabled also falls back without
+            // touching the direct-PTX dispatch counter.
+            const int sr = 256, sc = 128;
+            float[] sValues = MakeRowValues(sr, sc, seed: 11);
+            float[] sExpected = CpuRowSoftmax(sValues, sr, sc);
+            using var sInput = backend.AllocateBuffer(sValues);
+            using var sOutput = backend.AllocateBuffer(sr * sc);
+            DirectPtxFeatureGate.TestOverride = false;
+            long disabledBefore = backend.DirectPtxSoftmaxDispatchCount;
+            Assert.False(backend.TryDirectPtxSoftmax(sInput, sOutput, sr, sc));
+            Assert.Equal("softmax-feature-disabled", backend.DirectPtxLastError);
+            backend.Softmax(sInput, sOutput, sr, sc);
+            backend.Synchronize();
+            Assert.Equal(disabledBefore, backend.DirectPtxSoftmaxDispatchCount);
+            AssertVectorClose(backend.DownloadBuffer(sOutput), sExpected, 5e-5f,
+                "disabled-gate fallback");
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previousEnabled;
+            DirectPtxFeatureGate.SoftmaxExperimentOverride = previousExperiment;
+        }
+    }
+
+    private static float[] MakeRowValues(int rows, int columns, int seed)
+    {
+        var random = new Random(seed);
+        var values = new float[rows * columns];
+        for (int i = 0; i < values.Length; i++)
+            values[i] = (random.NextSingle() * 2f - 1f) * 4f;
+        return values;
+    }
+
+    private static float[] CpuRowSoftmax(float[] values, int rows, int columns)
+    {
+        var expected = new float[values.Length];
+        for (int row = 0; row < rows; row++)
+        {
+            int rowBase = row * columns;
+            double maximum = double.NegativeInfinity;
+            for (int column = 0; column < columns; column++)
+                maximum = Math.Max(maximum, values[rowBase + column]);
+            double sum = 0;
+            for (int column = 0; column < columns; column++)
+                sum += Math.Exp(values[rowBase + column] - maximum);
+            for (int column = 0; column < columns; column++)
+                expected[rowBase + column] =
+                    (float)(Math.Exp(values[rowBase + column] - maximum) / sum);
+        }
+        return expected;
     }
 
     private static int Count(string text, string value)

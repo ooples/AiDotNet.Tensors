@@ -34,9 +34,10 @@ internal sealed class PtxFusedSoftmaxF32Kernel : IDisposable
         int blockThreads = DefaultBlockThreads)
     {
         ArgumentNullException.ThrowIfNull(runtime);
-        if (runtime.ArchitectureFamily != DirectPtxArchitectureFamily.Ampere)
+        if (!DirectPtxArchitecture.HasValidatedRowSoftmax(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
-                "The checked-in FP32 softmax specialization is validated only on Ampere.");
+                "The checked-in FP32 softmax specialization is measured only on GA10x/SM86.");
         Validate(rows, columns);
         ValidateBlockThreads(rows, blockThreads);
         Rows = rows;
@@ -115,7 +116,7 @@ internal sealed class PtxFusedSoftmaxF32Kernel : IDisposable
         ptx.AppendLine(")");
         ptx.AppendLine($".maxntid {blockThreads}, 1, 1");
         ptx.AppendLine("{");
-        ptx.AppendLine("    .reg .b32 %r<5>;");
+        ptx.AppendLine("    .reg .b32 %r<8>;");
         ptx.AppendLine("    .reg .b64 %rd<8>;");
         ptx.AppendLine("    .reg .f32 %f<20>;");
         ptx.AppendLine("    ld.param.u64 %rd0, [input_ptr];");
@@ -240,6 +241,12 @@ internal sealed class PtxFusedSoftmaxF32Kernel : IDisposable
         return ptx.ToString();
     }
 
+    // shfl.sync.bfly.b32 is a bit-manipulation instruction: its operands are
+    // .b32 registers, not .f32. Reinterpret the float accumulator through a
+    // .b32 register for the shuffle, then reinterpret the shuffled bits back to
+    // .f32 before the arithmetic reduction step. This is the ISA-correct idiom
+    // (matching the fused QKV/RoPE warp reduction) rather than relying on the
+    // assembler tolerating an .f32 register on a .b32 shuffle.
     private static void EmitShuffleReduction(
         StringBuilder ptx,
         string operation,
@@ -247,8 +254,10 @@ internal sealed class PtxFusedSoftmaxF32Kernel : IDisposable
     {
         foreach (int delta in new[] { 16, 8, 4, 2, 1 })
         {
+            ptx.AppendLine($"    mov.b32 %r6, {accumulator};");
             ptx.AppendLine(
-                $"    shfl.sync.bfly.b32 %f11, {accumulator}, {delta}, 31, 0xffffffff;");
+                $"    shfl.sync.bfly.b32 %r7, %r6, {delta}, 31, 0xffffffff;");
+            ptx.AppendLine($"    mov.b32 %f11, %r7;");
             ptx.AppendLine($"    {operation} {accumulator}, {accumulator}, %f11;");
         }
     }

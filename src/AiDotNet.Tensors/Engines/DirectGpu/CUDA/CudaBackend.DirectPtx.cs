@@ -99,7 +99,7 @@ public sealed partial class CudaBackend
         System.Threading.Interlocked.Read(ref _directPtxFlashAttentionBackwardDispatchCount);
     internal bool IsDirectPtxSoftmaxEnabled =>
         DirectPtxFeatureGate.IsSoftmaxEnabled && IsAvailable &&
-        DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) == DirectPtxArchitectureFamily.Ampere;
+        DirectPtxArchitecture.HasValidatedRowSoftmax(_ccMajor, _ccMinor);
 
     internal long DirectPtxSoftmaxDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxSoftmaxDispatchCount);
@@ -1889,8 +1889,7 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "softmax-cuda-unavailable";
             return false;
         }
-        if (DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) !=
-            DirectPtxArchitectureFamily.Ampere)
+        if (!DirectPtxArchitecture.HasValidatedRowSoftmax(_ccMajor, _ccMinor))
         {
             DirectPtxLastError = "softmax-architecture-not-validated";
             return false;
