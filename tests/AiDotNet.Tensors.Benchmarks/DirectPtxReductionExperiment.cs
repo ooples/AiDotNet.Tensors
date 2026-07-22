@@ -67,9 +67,15 @@ internal static class DirectPtxReductionExperiment
         Console.WriteLine(
             "Diagnostic gate: each in-process repetition counts as one diagnostic only; " +
             "production still requires three clean, separately launched captures.");
+        // Row-sum output is O(columns * magnitude), so absolute error scales
+        // with the operand; the meaningful accuracy signal is relative. Enforce
+        // the relative-error metric rather than the softmax-calibrated absolute
+        // bound, which would reject a numerically-correct reduction.
         DirectPtxReleaseGatePolicy policy = DirectPtxReleaseGatePolicy.ProductionDefault with
         {
-            RequiredIndependentRuns = 1
+            RequiredIndependentRuns = 1,
+            ErrorMetric = DirectPtxErrorMetric.Relative,
+            MaximumRelativeError = 5e-5
         };
         foreach ((int rows, int columns) in Shapes)
         {
@@ -80,12 +86,18 @@ internal static class DirectPtxReductionExperiment
             Result best = competitors.OrderBy(r => r.Time.Median).First();
             var directEvidence = new DirectPtxPerformanceEvidence(
                 direct.Time.Median * 1000, direct.Time.P95 * 1000,
-                direct.Allocation, direct.TemporaryBytes, direct.MaxError,
-                direct.LocalBytes, IndependentRuns: 1);
+                direct.Allocation, direct.TemporaryBytes, MaxAbsoluteError: 0.0,
+                direct.LocalBytes, IndependentRuns: 1)
+            {
+                MaxRelativeError = direct.MaxError
+            };
             var competitorEvidence = new DirectPtxPerformanceEvidence(
                 best.Time.Median * 1000, best.Time.P95 * 1000,
-                best.Allocation, best.TemporaryBytes, best.MaxError,
-                best.LocalBytes, IndependentRuns: 1);
+                best.Allocation, best.TemporaryBytes, MaxAbsoluteError: 0.0,
+                best.LocalBytes, IndependentRuns: 1)
+            {
+                MaxRelativeError = best.MaxError
+            };
             DirectPtxReleaseDecision decision = policy.Evaluate(directEvidence, competitorEvidence);
             Console.WriteLine(
                 $"[{rows},{columns}]: {(decision.Passed ? "PASS" : "HOLD"),-4} {decision.MedianSpeedup:F2}x vs {best.Method}; " +
@@ -97,7 +109,8 @@ internal static class DirectPtxReductionExperiment
     private static void RunDirect(List<Result> results)
     {
         using var runtime = new DirectPtxRuntime();
-        if (runtime.ArchitectureFamily != DirectPtxArchitectureFamily.Ampere) return;
+        if (!DirectPtxArchitecture.HasValidatedRowReduction(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor)) return;
         using (runtime.Enter())
         foreach ((int rows, int columns) in Shapes)
         {
@@ -217,8 +230,9 @@ internal static class DirectPtxReductionExperiment
 
     // Reports the maximum RELATIVE error against an FP64 oracle. Row-sum outputs
     // are O(columns * magnitude), so absolute error naturally exceeds the release
-    // gate's 5e-5 absolute bound while relative error stays ~1e-6; the reduction
-    // family therefore needs a relative-error gate before any promotion claim.
+    // gate's 5e-5 absolute bound while relative error stays ~1e-6. The gate is
+    // therefore run in DirectPtxErrorMetric.Relative mode for this family, which
+    // consumes this value via DirectPtxPerformanceEvidence.MaxRelativeError.
     private static float Validate(float[] actual, float[] input, int rows, int columns)
     {
         float maximum = 0;

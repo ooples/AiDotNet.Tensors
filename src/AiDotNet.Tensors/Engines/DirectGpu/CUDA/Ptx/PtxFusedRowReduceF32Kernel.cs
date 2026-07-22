@@ -38,9 +38,10 @@ internal sealed class PtxFusedRowReduceF32Kernel : IDisposable
         int blockThreads = DefaultBlockThreads)
     {
         ArgumentNullException.ThrowIfNull(runtime);
-        if (runtime.ArchitectureFamily != DirectPtxArchitectureFamily.Ampere)
+        if (!DirectPtxArchitecture.HasValidatedRowReduction(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
-                "The checked-in FP32 row-sum specialization is validated only on Ampere.");
+                "The checked-in FP32 row-sum specialization is measured only on GA10x/SM86.");
         Validate(rows, columns);
         ValidateBlockThreads(rows, blockThreads);
         Rows = rows;
@@ -115,7 +116,7 @@ internal sealed class PtxFusedRowReduceF32Kernel : IDisposable
         ptx.AppendLine($".maxntid {blockThreads}, 1, 1");
         ptx.AppendLine("{");
         ptx.AppendLine("    .reg .pred %p<2>;");
-        ptx.AppendLine("    .reg .b32 %r<6>;");
+        ptx.AppendLine("    .reg .b32 %r<7>;");
         ptx.AppendLine("    .reg .b64 %rd<9>;");
         ptx.AppendLine($"    .reg .f32 %f<{valuesPerLane + 3}>;");
         ptx.AppendLine("    ld.param.u64 %rd0, [input_ptr];");
@@ -144,6 +145,12 @@ internal sealed class PtxFusedRowReduceF32Kernel : IDisposable
         return ptx.ToString();
     }
 
+    // shfl.sync.bfly.b32 is a bit-manipulation instruction whose operands are
+    // .b32 registers, not .f32. Reinterpret the float accumulator through a
+    // .b32 register for the shuffle, then reinterpret the shuffled bits back to
+    // .f32 before the arithmetic add. This is the ISA-correct idiom (matching
+    // the fused QKV/RoPE warp reduction) rather than relying on the assembler
+    // tolerating an .f32 register on a .b32 shuffle.
     private static void EmitShuffleAddReduction(
         StringBuilder ptx,
         string accumulator,
@@ -151,8 +158,10 @@ internal sealed class PtxFusedRowReduceF32Kernel : IDisposable
     {
         foreach (int delta in new[] { 16, 8, 4, 2, 1 })
         {
+            ptx.AppendLine($"    mov.b32 %r5, {accumulator};");
             ptx.AppendLine(
-                $"    shfl.sync.bfly.b32 %f{scratchIndex}, {accumulator}, {delta}, 31, 0xffffffff;");
+                $"    shfl.sync.bfly.b32 %r6, %r5, {delta}, 31, 0xffffffff;");
+            ptx.AppendLine($"    mov.b32 %f{scratchIndex}, %r6;");
             ptx.AppendLine($"    add.rn.f32 {accumulator}, {accumulator}, %f{scratchIndex};");
         }
     }

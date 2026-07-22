@@ -99,7 +99,7 @@ public sealed partial class CudaBackend
         System.Threading.Interlocked.Read(ref _directPtxFlashAttentionBackwardDispatchCount);
     internal bool IsDirectPtxReductionEnabled =>
         DirectPtxFeatureGate.IsReductionEnabled && IsAvailable &&
-        DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) == DirectPtxArchitectureFamily.Ampere;
+        DirectPtxArchitecture.HasValidatedRowReduction(_ccMajor, _ccMinor);
 
     internal long DirectPtxRowReduceDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxRowReduceDispatchCount);
@@ -1805,8 +1805,7 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "reduction-cuda-unavailable";
             return false;
         }
-        if (DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) !=
-            DirectPtxArchitectureFamily.Ampere)
+        if (!DirectPtxArchitecture.HasValidatedRowReduction(_ccMajor, _ccMinor))
         {
             DirectPtxLastError = "reduction-architecture-not-validated";
             return false;
@@ -1885,8 +1884,7 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "reduction-cuda-unavailable";
             return false;
         }
-        if (DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) !=
-            DirectPtxArchitectureFamily.Ampere)
+        if (!DirectPtxArchitecture.HasValidatedRowReduction(_ccMajor, _ccMinor))
         {
             DirectPtxLastError = "reduction-architecture-not-validated";
             return false;

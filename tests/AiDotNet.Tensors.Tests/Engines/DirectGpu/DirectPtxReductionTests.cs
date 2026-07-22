@@ -65,8 +65,9 @@ public class DirectPtxReductionTests
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
         using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(runtime.ArchitectureFamily == DirectPtxArchitectureFamily.Ampere,
-            "The checked-in row-sum specialization is validated on Ampere.");
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedRowReduction(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in row-sum specialization is measured on GA10x/SM86.");
         using var kernel = new PtxFusedRowReduceF32Kernel(runtime, rows, columns);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
         Assert.Equal(0, kernel.Audit.Function.StaticSharedBytes);
@@ -155,6 +156,163 @@ public class DirectPtxReductionTests
                 DirectPtxReductionCoverageStatus.PromotedDirectPtx, cell.Status));
         Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() =>
             DirectPtxReductionCoverageManifest.Get("UnassignedReductionApi"));
+    }
+
+    [Theory]
+    [InlineData(8, 6, true)]
+    [InlineData(8, 0, false)]
+    [InlineData(8, 7, false)]
+    [InlineData(8, 9, false)]
+    [InlineData(9, 0, false)]
+    [InlineData(10, 0, false)]
+    public void ReductionArchitectureMatrix_FailsClosedOutsideSm86(
+        int major,
+        int minor,
+        bool expected)
+    {
+        Assert.Equal(expected,
+            DirectPtxArchitecture.HasValidatedRowReduction(major, minor));
+    }
+
+    [SkippableFact]
+    public void BackendRowSum_PromotedGeometryDispatchesZeroAllocAndMatchesOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previousEnabled = DirectPtxFeatureGate.TestOverride;
+        bool previousExperiment = DirectPtxFeatureGate.ReductionExperimentOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        DirectPtxFeatureGate.ReductionExperimentOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxReductionEnabled, "Requires a GA10x/SM86 CUDA backend.");
+            const int rows = 2048, columns = 128;
+            float[] valuesHost = MakeRowValues(rows, columns, seed: 5);
+            float[] expected = CpuRowSum(valuesHost, rows, columns);
+            using var input = backend.AllocateBuffer(valuesHost);
+            using var output = backend.AllocateBuffer(rows);
+
+            Assert.True(backend.PrewarmDirectPtxRowSum(rows, columns), backend.DirectPtxLastError);
+            long before = backend.DirectPtxRowReduceDispatchCount;
+            Assert.True(backend.TryDirectPtxRowSum(input, output, rows, columns),
+                backend.DirectPtxLastError);
+            backend.Synchronize();
+            Assert.Equal(before + 1, backend.DirectPtxRowReduceDispatchCount);
+            AssertRowSumsClose(backend.DownloadBuffer(output), expected, "direct-ptx row-sum");
+
+            // The resident dispatch path must not allocate managed memory.
+            long allocBefore = GC.GetAllocatedBytesForCurrentThread();
+            bool all = true;
+            for (int i = 0; i < 32; i++)
+                all &= backend.TryDirectPtxRowSum(input, output, rows, columns);
+            long allocated = GC.GetAllocatedBytesForCurrentThread() - allocBefore;
+            backend.Synchronize();
+            Assert.True(all, backend.DirectPtxLastError);
+            Assert.Equal(0, allocated);
+
+            // The public route selects the direct-PTX kernel and increments the counter.
+            long publicBefore = backend.DirectPtxRowReduceDispatchCount;
+            backend.SumAxis(input, output, rows, columns);
+            backend.Synchronize();
+            Assert.Equal(publicBefore + 1, backend.DirectPtxRowReduceDispatchCount);
+            AssertRowSumsClose(backend.DownloadBuffer(output), expected, "public sum-axis");
+
+            Assert.True(backend.TryGetDirectPtxRowReduceAudit(
+                rows, columns, out DirectPtxKernelAudit audit));
+            Assert.Equal(0, audit.Function.LocalBytesPerThread);
+            Assert.Equal(0, audit.Function.StaticSharedBytes);
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previousEnabled;
+            DirectPtxFeatureGate.ReductionExperimentOverride = previousExperiment;
+        }
+    }
+
+    [SkippableFact]
+    public void BackendRowSum_UnsupportedShapeAndDisabledGateFallBackToExistingKernel()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previousEnabled = DirectPtxFeatureGate.TestOverride;
+        bool previousExperiment = DirectPtxFeatureGate.ReductionExperimentOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        DirectPtxFeatureGate.ReductionExperimentOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxReductionEnabled, "Requires a GA10x/SM86 CUDA backend.");
+
+            // An unsupported shape declines the direct-PTX route with an exact
+            // reason, leaves the dispatch counter untouched, and the public
+            // SumAxis still returns a correct result through the existing kernel.
+            const int rows = 100, columns = 96; // 96 % 32 == 0 but not a promoted bucket
+            float[] valuesHost = MakeRowValues(rows, columns, seed: 9);
+            float[] expected = CpuRowSum(valuesHost, rows, columns);
+            using var input = backend.AllocateBuffer(valuesHost);
+            using var output = backend.AllocateBuffer(rows);
+            long before = backend.DirectPtxRowReduceDispatchCount;
+            Assert.False(backend.TryDirectPtxRowSum(input, output, rows, columns));
+            Assert.Equal("reduction-shape-not-implemented", backend.DirectPtxLastError);
+            backend.SumAxis(input, output, rows, columns);
+            backend.Synchronize();
+            Assert.Equal(before, backend.DirectPtxRowReduceDispatchCount);
+            AssertRowSumsClose(backend.DownloadBuffer(output), expected, "unsupported-shape fallback");
+
+            // A promoted shape with the feature disabled also falls back without
+            // touching the direct-PTX dispatch counter.
+            const int sr = 256, sc = 128;
+            float[] sValues = MakeRowValues(sr, sc, seed: 13);
+            float[] sExpected = CpuRowSum(sValues, sr, sc);
+            using var sInput = backend.AllocateBuffer(sValues);
+            using var sOutput = backend.AllocateBuffer(sr);
+            DirectPtxFeatureGate.TestOverride = false;
+            long disabledBefore = backend.DirectPtxRowReduceDispatchCount;
+            Assert.False(backend.TryDirectPtxRowSum(sInput, sOutput, sr, sc));
+            Assert.Equal("reduction-feature-disabled", backend.DirectPtxLastError);
+            backend.SumAxis(sInput, sOutput, sr, sc);
+            backend.Synchronize();
+            Assert.Equal(disabledBefore, backend.DirectPtxRowReduceDispatchCount);
+            AssertRowSumsClose(backend.DownloadBuffer(sOutput), sExpected, "disabled-gate fallback");
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previousEnabled;
+            DirectPtxFeatureGate.ReductionExperimentOverride = previousExperiment;
+        }
+    }
+
+    private static float[] MakeRowValues(int rows, int columns, int seed)
+    {
+        var random = new Random(seed);
+        var values = new float[rows * columns];
+        for (int i = 0; i < values.Length; i++)
+            values[i] = (random.NextSingle() * 2f - 1f) * 4f;
+        return values;
+    }
+
+    private static float[] CpuRowSum(float[] values, int rows, int columns)
+    {
+        var expected = new float[rows];
+        for (int row = 0; row < rows; row++)
+        {
+            double sum = 0;
+            for (int column = 0; column < columns; column++)
+                sum += values[row * columns + column];
+            expected[row] = (float)sum;
+        }
+        return expected;
+    }
+
+    private static void AssertRowSumsClose(float[] actual, float[] expected, string name)
+    {
+        Assert.Equal(expected.Length, actual.Length);
+        for (int row = 0; row < expected.Length; row++)
+        {
+            // Row-sum output is O(columns*magnitude); enforce relative closeness.
+            float tolerance = 2e-4f * (MathF.Abs(expected[row]) + 1f);
+            Assert.True(MathF.Abs(actual[row] - expected[row]) <= tolerance,
+                $"{name} row {row}: actual {actual[row]:G9}, expected {expected[row]:G9}, tol {tolerance:G9}.");
+        }
     }
 
     private static int Count(string text, string value)
