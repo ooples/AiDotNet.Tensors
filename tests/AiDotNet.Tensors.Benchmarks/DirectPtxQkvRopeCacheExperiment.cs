@@ -113,14 +113,14 @@ internal static class DirectPtxQkvRopeCacheExperiment
         using var projected = backend.AllocateBuffer(projection);
         using var biased = backend.AllocateBuffer(projection);
         using var rotatedQueryKey = backend.AllocateBuffer(2 * model);
+        long directDispatchBefore = backend.DirectPtxQkvRopeCacheDispatchCount;
 
         void DirectLaunch()
         {
-            if (!backend.TryDirectPtxQkvRopeCacheD64(
+            backend.QkvProjectionRoPECacheD64(
                 input, weights, bias, cosine, sine,
                 directQuery, directKeyCache, directValueCache,
-                shape.Heads, shape.Capacity, shape.Position))
-                throw new InvalidOperationException(backend.DirectPtxLastError);
+                shape.Heads, shape.Capacity, shape.Position);
         }
 
         void CurrentLaunch()
@@ -151,6 +151,17 @@ internal static class DirectPtxQkvRopeCacheExperiment
         Distribution currentEndToEnd = MeasureEndToEnd(backend, CurrentLaunch);
         long directBytes = MeasureAllocation(backend, DirectLaunch);
         long currentBytes = MeasureAllocation(backend, CurrentLaunch);
+        const long expectedDirectDispatches =
+            1L + Warmups + Samples * LaunchesPerDeviceSample +
+            Warmups + Samples + 8L + Samples;
+        long actualDirectDispatches =
+            backend.DirectPtxQkvRopeCacheDispatchCount - directDispatchBefore;
+        if (actualDirectDispatches != expectedDirectDispatches ||
+            backend.DirectPtxLastError is not null)
+            throw new InvalidOperationException(
+                $"Direct PTX routing was not exclusive for {shape.Name}: " +
+                $"expected {expectedDirectDispatches} dispatches, observed " +
+                $"{actualDirectDispatches}; last error={backend.DirectPtxLastError ?? "none"}.");
         if (!backend.TryGetDirectPtxQkvRopeCacheAudit(
             shape.Heads, shape.Capacity, shape.Position, out DirectPtxKernelAudit audit))
             throw new InvalidOperationException("No audit for measured QKV/RoPE/cache module.");
