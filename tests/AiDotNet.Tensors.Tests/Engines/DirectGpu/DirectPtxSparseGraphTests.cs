@@ -16,7 +16,7 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
             DirectPtxSparseGraphCompletionLedger.All
                 .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(5, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+        Assert.Equal(6, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
             entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
         Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
         Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
@@ -142,6 +142,35 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal("bias-then-stored-row-order", blueprint.Semantics["reduction-order"]);
         Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
         Assert.Equal("0", blueprint.Semantics["intermediate-global-bytes"]);
+    }
+
+    [Fact]
+    public void CsrSpmmF64Emitter_UsesTwoWideFp64RegisterReduction()
+    {
+        string ptx = PtxFusedCsrSpmmVec2F64Kernel.EmitPtx(8, 6);
+
+        Assert.Contains(PtxFusedCsrSpmmVec2F64Kernel.EntryPoint, ptx);
+        Assert.Contains("ld.global.v2.f64", ptx);
+        Assert.Equal(2, Count(ptx, "fma.rn.f64"));
+        Assert.Contains("st.global.v2.f64", ptx);
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.Equal(5, Count(ptx, ".param .u64"));
+    }
+
+    [Fact]
+    public void CsrSpmmF64Blueprint_UsesEightBytePhysicalContract()
+    {
+        DirectPtxKernelBlueprint blueprint =
+            PtxFusedCsrSpmmVec2F64Kernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere);
+
+        Assert.Equal(DirectPtxPhysicalType.Float64, blueprint.Tensors[0].PhysicalType);
+        Assert.Equal(8, blueprint.Tensors[0].ElementBytes);
+        Assert.Equal((nuint)(PtxFusedCsrSpmmVec2F64Kernel.NonZeros * sizeof(double)),
+            blueprint.Tensors[0].RequiredBytes);
+        Assert.Equal("fp64-fma", blueprint.Semantics["accumulator"]);
+        Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
     }
 
     [Theory]

@@ -3890,6 +3890,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (!IsAvailable)
             throw new InvalidOperationException("CUDA backend is not available.");
 
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxCsrSpmmVec2F64(
+            csrValues, csrColIndices, csrRowPointers, denseB, output,
+            M, K, N, nnz))
+            return;
+#endif
+
         if (!_kernelCache.TryGetValue("csr_spmm_double", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: csr_spmm_double");
 

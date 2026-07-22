@@ -102,6 +102,7 @@ internal enum DirectPtxPhysicalType
     Float16,
     BFloat16,
     Float32,
+    Float64,
     Int32
 }
 
@@ -226,7 +227,12 @@ internal readonly struct DirectPtxTensorView
             throw new ArgumentException(
                 $"The GPU pointer is not {requiredAlignment}-byte aligned.", nameof(buffer));
 
-        long elementBytes = physicalType is DirectPtxPhysicalType.Float16 or DirectPtxPhysicalType.BFloat16 ? 2L : 4L;
+        long elementBytes = physicalType switch
+        {
+            DirectPtxPhysicalType.Float16 or DirectPtxPhysicalType.BFloat16 => 2L,
+            DirectPtxPhysicalType.Float64 => 8L,
+            _ => 4L
+        };
         if (buffer.SizeInBytes % elementBytes != 0)
             throw new ArgumentException("The buffer byte extent is incompatible with its physical dtype.", nameof(buffer));
 
@@ -247,7 +253,12 @@ internal readonly struct DirectPtxTensorView
             throw new ArgumentException("The direct PTX buffer is smaller than the canonical BHSD view.", nameof(buffer));
         if (((nuint)buffer.Pointer & 15u) != 0)
             throw new ArgumentException("The direct PTX buffer is not 16-byte aligned.", nameof(buffer));
-        int elementBytes = physicalType is DirectPtxPhysicalType.Float16 or DirectPtxPhysicalType.BFloat16 ? 2 : 4;
+        int elementBytes = physicalType switch
+        {
+            DirectPtxPhysicalType.Float16 or DirectPtxPhysicalType.BFloat16 => 2,
+            DirectPtxPhysicalType.Float64 => 8,
+            _ => 4
+        };
         int elements = checked((int)(requiredBytes / (nuint)elementBytes));
         return new DirectPtxTensorView(
             buffer.Pointer, requiredBytes, buffer.ByteLength, physicalType,
