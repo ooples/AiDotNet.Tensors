@@ -65,6 +65,8 @@ public sealed partial class CudaBackend
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<SciCapsuleRoutingKey, PtxCapsuleAgreementKernel> _sciCapsuleAgreement =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<SciMatVecKey, PtxCosineSimilarityKernel> _sciCosineSimilarity =
+        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
 
     private long _sciDispatchCount;
     internal long DirectPtxScientificDispatchCount => System.Threading.Interlocked.Read(ref _sciDispatchCount);
@@ -374,6 +376,20 @@ public sealed partial class CudaBackend
                 new SciCapsuleRoutingKey(batchSize, inputCapsules, outputCapsules, capsuleDim),
                 () => new PtxCapsuleAgreementKernel(_directPtxRuntime!, batchSize, inputCapsules, outputCapsules, capsuleDim));
             Launch3(k.Blueprint, predictions, output, agreement, (vp, vo, va) => k.Launch(vp, vo, va));
+        });
+    }
+
+    internal bool TryDirectPtxCosineSimilarity(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int batchSize, int dim)
+    {
+        if (!ScientificGateOpen || !PtxCosineSimilarityKernel.IsSupportedShape(batchSize, dim)) return Fail("cosine-similarity");
+        long vecBytes = checked((long)batchSize * dim * sizeof(float));
+        long outBytes = checked((long)batchSize * sizeof(float));
+        if (a.SizeInBytes != vecBytes || b.SizeInBytes != vecBytes || output.SizeInBytes != outBytes) return Fail("cosine-similarity-extent");
+        return SciDispatch(() =>
+        {
+            var k = _sciCosineSimilarity.GetOrAdd(new SciMatVecKey(batchSize, dim),
+                () => new PtxCosineSimilarityKernel(_directPtxRuntime!, batchSize, dim));
+            Launch3(k.Blueprint, a, b, output, (va, vb, vo) => k.Launch(va, vb, vo));
         });
     }
 

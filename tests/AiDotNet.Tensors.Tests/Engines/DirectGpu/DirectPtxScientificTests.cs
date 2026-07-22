@@ -14,8 +14,9 @@ public class DirectPtxScientificTests
     [Fact]
     public void ScientificCoverageManifest_AssignsEveryScopedApiExactlyOnce()
     {
-        Assert.Equal(21, DirectPtxScientificCoverageManifest.All.Count);
+        Assert.Equal(22, DirectPtxScientificCoverageManifest.All.Count);
         string[] names = DirectPtxScientificCoverageManifest.All.Select(c => c.Api).ToArray();
+        Assert.Contains("CudaBackend.CosineSimilarity", names);
         Assert.Contains("CudaBackend.RbfForward", names);
         Assert.Contains("CudaBackend.PairwiseDistance", names);
         Assert.Contains("CudaBackend.PairwiseDistanceSquared", names);
@@ -750,6 +751,67 @@ public class DirectPtxScientificTests
         var actual = new float[expected.Length];
         outBuf.Download<float>(actual);
         AssertVectorClose(actual, expected, 3e-3f, $"capsule {op}");
+    }
+
+    [Fact]
+    public void CosineSimilarityEmitter_IsThreadPerBatchSerialDim()
+    {
+        string ptx = PtxCosineSimilarityKernel.EmitPtx(8, 6, 256, 64);
+        Assert.Contains(PtxCosineSimilarityKernel.EntryPoint, ptx);
+        Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));    // ai + bi in the loop
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.Equal(3, Count(ptx, "fma.rn.f32"));           // dot + norm_a + norm_b
+        Assert.Equal(2, Count(ptx, "sqrt.rn.f32"));          // ||a||, ||b||
+        Assert.Equal(1, Count(ptx, "div.rn.f32"));           // dot / denom
+        Assert.Contains("$COS_DIM_LOOP:", ptx);
+        Assert.Equal(0, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxCosineSimilarityKernel.IsSupportedShape(256, 64));
+        Assert.False(PtxCosineSimilarityKernel.IsSupportedShape(255, 64));   // batch not a multiple of 256
+        Assert.False(PtxCosineSimilarityKernel.IsPromotedShape(256, 64));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyCosineSimilarity_MatchesOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in cosine-similarity specialization is measured on GA10x/SM86.");
+        const int batchSize = 256, dim = 48;
+        using var kernel = new PtxCosineSimilarityKernel(runtime, batchSize, dim);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20267900);
+        float[] aHost = Values(random, batchSize * dim, 1.0f);
+        float[] bHost = Values(random, batchSize * dim, 1.0f);
+        var expected = new float[batchSize];
+        for (int bt = 0; bt < batchSize; bt++)
+        {
+            double dot = 0, na = 0, nb = 0;
+            for (int i = 0; i < dim; i++)
+            {
+                double ai = aHost[bt * dim + i], bi = bHost[bt * dim + i];
+                dot += ai * bi; na += ai * ai; nb += bi * bi;
+            }
+            expected[bt] = (float)(dot / (Math.Sqrt(na) * Math.Sqrt(nb) + 1e-8));
+        }
+
+        using var a = runtime.AllocateBytes((nuint)(aHost.Length * sizeof(float)));
+        using var b = runtime.AllocateBytes((nuint)(bHost.Length * sizeof(float)));
+        using var output = runtime.AllocateBytes((nuint)(expected.Length * sizeof(float)));
+        a.Upload<float>(aHost);
+        b.Upload<float>(bHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(a, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(b, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[expected.Length];
+        output.Download<float>(actual);
+        AssertVectorClose(actual, expected, 2e-3f, "cosine similarity");
     }
 
     [Fact]
@@ -1528,6 +1590,19 @@ public class DirectPtxScientificTests
                     }
             using (var pred = backend.AllocateBuffer(rPred)) using (var outb = backend.AllocateBuffer(wsExp)) using (var ag = backend.AllocateBuffer(rB * rI * rC))
             { backend.CapsuleAgreement(pred, outb, ag, rB, rI, rC, rD); n = AssertDispatched(n, "capsule-agreement"); AssertVectorClose(backend.DownloadBuffer(ag), agExp, 3e-3f, "capsule-agreement route"); }
+
+            // Cosine similarity: thread-per-batch. batch=256 (multiple of 256).
+            const int cosBatch = 256, cosDim = 48;
+            float[] cosA = Values(random, cosBatch * cosDim, 1.0f), cosB = Values(random, cosBatch * cosDim, 1.0f);
+            var cosExp = new float[cosBatch];
+            for (int bt = 0; bt < cosBatch; bt++)
+            {
+                double dot = 0, na = 0, nb = 0;
+                for (int i = 0; i < cosDim; i++) { double ai = cosA[bt * cosDim + i], bi = cosB[bt * cosDim + i]; dot += ai * bi; na += ai * ai; nb += bi * bi; }
+                cosExp[bt] = (float)(dot / (Math.Sqrt(na) * Math.Sqrt(nb) + 1e-8));
+            }
+            using (var ab = backend.AllocateBuffer(cosA)) using (var bb = backend.AllocateBuffer(cosB)) using (var o = backend.AllocateBuffer(cosBatch))
+            { backend.CosineSimilarity(ab, bb, o, cosBatch, cosDim); n = AssertDispatched(n, "cosine-similarity"); AssertVectorClose(backend.DownloadBuffer(o), cosExp, 2e-3f, "cosine-similarity route"); }
         }
         finally
         {

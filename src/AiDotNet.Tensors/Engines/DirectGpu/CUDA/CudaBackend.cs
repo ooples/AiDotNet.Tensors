@@ -16991,6 +16991,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void CosineSimilarity(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int batchSize, int dim)
     {
+        if (TryDirectPtxCosineSimilarity(a, b, output, batchSize, dim)) return;
+
         if (!_kernelCache.TryGetValue("cosine_similarity", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: cosine_similarity");
         using var _ = PushContext();
