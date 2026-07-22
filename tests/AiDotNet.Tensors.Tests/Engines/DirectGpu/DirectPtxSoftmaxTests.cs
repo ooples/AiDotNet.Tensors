@@ -314,6 +314,55 @@ public class DirectPtxSoftmaxTests
         }
     }
 
+    [SkippableFact]
+    public void BackendSoftmax_ThreeWay_CudaAndPtxBothMatchCpuOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previousEnabled = DirectPtxFeatureGate.TestOverride;
+        bool previousExperiment = DirectPtxFeatureGate.SoftmaxExperimentOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        DirectPtxFeatureGate.SoftmaxExperimentOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxSoftmaxEnabled, "Requires a GA10x/SM86 CUDA backend.");
+            const int rows = 2048, columns = 128;
+            float[] valuesHost = MakeRowValues(rows, columns, seed: 21);
+            float[] oracle = CpuRowSoftmax(valuesHost, rows, columns); // CPU fp64-accumulated reference
+            using var input = backend.AllocateBuffer(valuesHost);
+            using var cudaOut = backend.AllocateBuffer(rows * columns);
+            using var ptxOut = backend.AllocateBuffer(rows * columns);
+
+            // Leg 1 - the existing CUDA kernel (direct-PTX disabled). It must match
+            // the CPU oracle and must NOT touch the direct-PTX dispatch counter.
+            DirectPtxFeatureGate.TestOverride = false;
+            long ptxBefore = backend.DirectPtxSoftmaxDispatchCount;
+            backend.Softmax(input, cudaOut, rows, columns);
+            backend.Synchronize();
+            Assert.Equal(ptxBefore, backend.DirectPtxSoftmaxDispatchCount);
+            float[] cuda = backend.DownloadBuffer(cudaOut);
+            AssertVectorClose(cuda, oracle, 5e-5f, "CUDA vs CPU oracle");
+
+            // Leg 2 - the direct-PTX kernel (gate on). It must match the CPU oracle
+            // and the dispatch counter must advance (proving the PTX path fired).
+            DirectPtxFeatureGate.TestOverride = true;
+            Assert.True(backend.TryDirectPtxSoftmax(input, ptxOut, rows, columns),
+                backend.DirectPtxLastError);
+            backend.Synchronize();
+            Assert.Equal(ptxBefore + 1, backend.DirectPtxSoftmaxDispatchCount);
+            float[] ptx = backend.DownloadBuffer(ptxOut);
+            AssertVectorClose(ptx, oracle, 5e-5f, "direct-PTX vs CPU oracle");
+
+            // Leg 3 - the two GPU paths agree with each other (sum of both legs' tol).
+            AssertVectorClose(ptx, cuda, 1e-4f, "direct-PTX vs CUDA");
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previousEnabled;
+            DirectPtxFeatureGate.SoftmaxExperimentOverride = previousExperiment;
+        }
+    }
+
     private static float[] MakeRowValues(int rows, int columns, int seed)
     {
         var random = new Random(seed);
