@@ -16,7 +16,18 @@ internal sealed class DirectPtxKernelCache<TKey, TKernel> : IDisposable
     private readonly Dictionary<TKey, LinkedListNode<Entry>> _entries = new();
     private readonly LinkedList<Entry> _lru = new();
 
-    private sealed record Entry(TKey Key, TKernel Kernel);
+    private sealed class Entry
+    {
+        internal Entry(TKey key, TKernel kernel)
+        {
+            Key = key;
+            Kernel = kernel;
+        }
+
+        internal TKey Key { get; }
+        internal TKernel Kernel { get; }
+        internal bool IsPinned { get; set; }
+    }
 
     internal DirectPtxKernelCache(int capacity)
     {
@@ -26,6 +37,16 @@ internal sealed class DirectPtxKernelCache<TKey, TKernel> : IDisposable
 
     internal int Count => _entries.Count;
     internal int Capacity => _capacity;
+    internal int PinnedCount
+    {
+        get
+        {
+            int count = 0;
+            foreach (Entry entry in _lru)
+                if (entry.IsPinned) count++;
+            return count;
+        }
+    }
 
     internal bool TryGetValue(TKey key, out TKernel kernel)
     {
@@ -40,10 +61,27 @@ internal sealed class DirectPtxKernelCache<TKey, TKernel> : IDisposable
         return false;
     }
 
+    /// <summary>
+    /// Prevents eviction of a loaded module whose function is retained by a
+    /// CUDA graph. Pins are intentionally released only when the owning cache
+    /// is disposed: graph handles can outlive the call site that captured them,
+    /// and unloading their module would invalidate the retained function.
+    /// </summary>
+    internal bool Pin(TKey key)
+    {
+        if (!_entries.TryGetValue(key, out LinkedListNode<Entry>? node))
+            return false;
+        node.Value.IsPinned = true;
+        return true;
+    }
+
     internal TKernel GetOrAdd(TKey key, Func<TKernel> factory)
     {
         ArgumentNullException.ThrowIfNull(factory);
         if (TryGetValue(key, out TKernel existing)) return existing;
+        if (!HasRoomOrEvictableEntry())
+            throw new InvalidOperationException(
+                "The direct-PTX module cache is full of CUDA-graph-pinned kernels.");
 
         return AddOrGetExisting(key, factory());
     }
@@ -61,22 +99,33 @@ internal sealed class DirectPtxKernelCache<TKey, TKernel> : IDisposable
             created.Dispose();
             return existing;
         }
-        var node = new LinkedListNode<Entry>(new Entry(key, created));
-        _entries.Add(key, node);
-        _lru.AddFirst(node);
-        Trim();
-        return created;
-    }
-
-    private void Trim()
-    {
-        while (_entries.Count > _capacity)
+        if (_entries.Count >= _capacity)
         {
-            LinkedListNode<Entry> victim = _lru.Last!;
-            _lru.RemoveLast();
+            LinkedListNode<Entry>? victim = _lru.Last;
+            while (victim is not null && victim.Value.IsPinned)
+                victim = victim.Previous;
+            if (victim is null)
+            {
+                created.Dispose();
+                throw new InvalidOperationException(
+                    "The direct-PTX module cache is full of CUDA-graph-pinned kernels.");
+            }
+            _lru.Remove(victim);
             _entries.Remove(victim.Value.Key);
             victim.Value.Kernel.Dispose();
         }
+        var node = new LinkedListNode<Entry>(new Entry(key, created));
+        _entries.Add(key, node);
+        _lru.AddFirst(node);
+        return created;
+    }
+
+    private bool HasRoomOrEvictableEntry()
+    {
+        if (_entries.Count < _capacity) return true;
+        for (LinkedListNode<Entry>? node = _lru.Last; node is not null; node = node.Previous)
+            if (!node.Value.IsPinned) return true;
+        return false;
     }
 
     public void Dispose()

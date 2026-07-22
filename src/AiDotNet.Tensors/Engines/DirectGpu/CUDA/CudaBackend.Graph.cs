@@ -110,6 +110,20 @@ public sealed partial class CudaBackend
     }
 
     /// <summary>
+    /// Enqueues a previously <see cref="CaptureGraph"/>'d sequence on this
+    /// backend's stream without synchronizing the host. The caller must preserve
+    /// every captured buffer until the stream completes and must explicitly
+    /// synchronize before reading results on the host.
+    /// </summary>
+    public void EnqueueCapturedGraph(IntPtr graphExec)
+    {
+        if (graphExec == IntPtr.Zero) return;
+        using var _ = PushContext();
+        CuBlasNative.CheckCudaResult(
+            CudaNativeBindings.cuGraphLaunch(graphExec, _stream), "cuGraphLaunch");
+    }
+
+    /// <summary>
     /// Replays a previously <see cref="CaptureGraph"/>'d sequence with a single
     /// <c>cuGraphLaunch</c> on this backend's stream. Refresh any input-buffer
     /// CONTENTS (same pointers) before calling to feed new per-step data.

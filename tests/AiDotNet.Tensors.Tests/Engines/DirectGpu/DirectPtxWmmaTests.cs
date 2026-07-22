@@ -664,6 +664,36 @@ public class DirectPtxWmmaTests
     }
 
     [Fact]
+    public void KernelCache_GraphPinnedEntriesAreNeverEvicted()
+    {
+        using var cache = new DirectPtxKernelCache<int, TrackingDisposable>(2);
+        TrackingDisposable one = cache.GetOrAdd(1, () => new TrackingDisposable());
+        TrackingDisposable two = cache.GetOrAdd(2, () => new TrackingDisposable());
+        Assert.True(cache.Pin(1));
+        TrackingDisposable three = cache.GetOrAdd(3, () => new TrackingDisposable());
+
+        Assert.False(one.IsDisposed);
+        Assert.True(two.IsDisposed);
+        Assert.False(three.IsDisposed);
+        Assert.Equal(1, cache.PinnedCount);
+        Assert.True(cache.Pin(3));
+
+        var rejected = new TrackingDisposable();
+        Assert.Throws<InvalidOperationException>(() => cache.AddOrGetExisting(4, rejected));
+        Assert.True(rejected.IsDisposed);
+        Assert.Equal(2, cache.Count);
+        Assert.Equal(2, cache.PinnedCount);
+
+        bool factoryCalled = false;
+        Assert.Throws<InvalidOperationException>(() => cache.GetOrAdd(5, () =>
+        {
+            factoryCalled = true;
+            return new TrackingDisposable();
+        }));
+        Assert.False(factoryCalled);
+    }
+
+    [Fact]
     public void AttentionAutotuner_ExposesArchitectureIndependentShapeCandidates()
     {
         Assert.Equal(new[] { 1 }, DirectPtxAttentionAutotuner.Candidates(16));
@@ -1779,6 +1809,390 @@ public class DirectPtxWmmaTests
         }
     }
 
+    [Fact]
+    public void QkvRopeCacheEmitter_BakesCanonicalAbiAndEliminatesIntermediates()
+    {
+        string ptx = PtxFusedQkvRopeCacheD64Kernel.EmitPtx(
+            8, 6, heads: 8, cacheCapacity: 64, position: 17);
+
+        Assert.Contains(PtxFusedQkvRopeCacheD64Kernel.EntryPoint, ptx);
+        Assert.Contains(".target sm_86", ptx);
+        Assert.Contains("st.global.v2.f32 [%rd20]", ptx);
+        Assert.Contains("st.global.v2.f32 [%rd22]", ptx);
+        Assert.Contains("st.global.v2.f32 [%rd23]", ptx);
+        Assert.Contains("shfl.sync.bfly.b32", ptx);
+        Assert.Contains("@%p1 bra QKV_RETURN;", ptx);
+        Assert.DoesNotContain("@%p1 bra.uni", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("shape", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("q_projection_ptr", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("k_projection_ptr", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("v_projection_ptr", ptx, StringComparison.Ordinal);
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxFusedQkvRopeCacheD64Kernel.EmitPtx(8, 6, 6, 64, 17));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxFusedQkvRopeCacheD64Kernel.EmitPtx(8, 6, 8, 24, 17));
+    }
+
+    [Theory]
+    [InlineData(8, 6, true)]
+    [InlineData(8, 0, false)]
+    [InlineData(8, 7, false)]
+    [InlineData(8, 9, false)]
+    [InlineData(9, 0, false)]
+    [InlineData(10, 0, false)]
+    public void QkvRopeCacheArchitectureMatrix_FailsClosedOutsideSm86(
+        int major,
+        int minor,
+        bool expected)
+    {
+        Assert.Equal(expected,
+            DirectPtxArchitecture.HasValidatedQkvRopeCache(major, minor));
+    }
+
+    [Fact]
+    public void QkvRopeCacheCoverageManifest_AssignsEveryScopedApiExactlyOnce()
+    {
+        string[] expected =
+        [
+            "CudaBackend.QkvProjectionRoPECacheD64",
+            "IDirectGpuBackend.MatMulTransposed",
+            "DirectGpuTensorEngine.ApplyRoPEInterleavedGpu",
+            "IEngine.ApplyRoPEInterleaved",
+            "KVCache<T>.Append",
+            "DevicePagedKVCache.Append",
+            "Tensor reshape/transpose/slice QKV handoff",
+            "RecordingGpuBackend.RopeInterleaved",
+            "Attention ABI handoff"
+        ];
+        string[] actual = DirectPtxQkvRopeCacheCoverageManifest.All
+            .Select(cell => cell.Api).OrderBy(name => name, StringComparer.Ordinal).ToArray();
+        Assert.Equal(expected.OrderBy(name => name, StringComparer.Ordinal).ToArray(), actual);
+        Assert.Equal(actual.Length, actual.Distinct(StringComparer.Ordinal).Count());
+        Assert.All(DirectPtxQkvRopeCacheCoverageManifest.All, cell =>
+        {
+            Assert.False(string.IsNullOrWhiteSpace(cell.ExistingImplementation));
+            Assert.False(string.IsNullOrWhiteSpace(cell.DirectPtxAssignment));
+        });
+        Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() =>
+            DirectPtxQkvRopeCacheCoverageManifest.Get("UnassignedQkvApi"));
+    }
+
+    [SkippableTheory]
+    [InlineData(4, 16, 0)]
+    [InlineData(8, 64, 17)]
+    [InlineData(16, 128, 127)]
+    public void DriverOnlyQkvRopeCacheD64_MatchesOracleAndHasZeroSpills(
+        int heads,
+        int cacheCapacity,
+        int position)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedQkvRopeCache(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in QKV/RoPE/cache specialization is validated on SM86.");
+        using var kernel = new PtxFusedQkvRopeCacheD64Kernel(
+            runtime, heads, cacheCapacity, position);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+        Assert.Equal(0, kernel.Audit.Function.StaticSharedBytes);
+        Assert.True(kernel.Audit.ActiveBlocksPerMultiprocessor >= 8);
+
+        int modelDimension = heads * PtxFusedQkvRopeCacheD64Kernel.HeadDimension;
+        int projectionElements = 3 * modelDimension;
+        int cacheElements = cacheCapacity * modelDimension;
+        var random = new Random(20260830 + heads * 100 + cacheCapacity + position);
+        float[] inputHost = Values(random, modelDimension, 0.125f);
+        float[] weightsHost = Values(random, projectionElements * modelDimension, 0.0625f);
+        float[] biasHost = Values(random, projectionElements, 0.0625f);
+        (float[] cosineHost, float[] sineHost) = RopeTables(cacheCapacity);
+        float[] keyCacheHost = Values(random, cacheElements, 0.125f);
+        float[] valueCacheHost = Values(random, cacheElements, 0.125f);
+        (float[] expectedQ, float[] expectedK, float[] expectedV) = QkvRopeCacheOracle(
+            inputHost, weightsHost, biasHost, cosineHost, sineHost,
+            keyCacheHost, valueCacheHost, heads, cacheCapacity, position);
+
+        using var input = runtime.AllocateBytes((nuint)(inputHost.Length * sizeof(float)));
+        using var weights = runtime.AllocateBytes((nuint)(weightsHost.Length * sizeof(float)));
+        using var bias = runtime.AllocateBytes((nuint)(biasHost.Length * sizeof(float)));
+        using var cosine = runtime.AllocateBytes((nuint)(cosineHost.Length * sizeof(float)));
+        using var sine = runtime.AllocateBytes((nuint)(sineHost.Length * sizeof(float)));
+        using var query = runtime.AllocateBytes((nuint)(modelDimension * sizeof(float)));
+        using var keyCache = runtime.AllocateBytes((nuint)(cacheElements * sizeof(float)));
+        using var valueCache = runtime.AllocateBytes((nuint)(cacheElements * sizeof(float)));
+        input.Upload<float>(inputHost);
+        weights.Upload<float>(weightsHost);
+        bias.Upload<float>(biasHost);
+        cosine.Upload<float>(cosineHost);
+        sine.Upload<float>(sineHost);
+        keyCache.Upload<float>(keyCacheHost);
+        valueCache.Upload<float>(valueCacheHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(weights, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(cosine, kernel.Blueprint.Tensors[3]),
+            DirectPtxTensorView.CreateOwned(sine, kernel.Blueprint.Tensors[4]),
+            DirectPtxTensorView.CreateOwned(query, kernel.Blueprint.Tensors[5]),
+            DirectPtxTensorView.CreateOwned(keyCache, kernel.Blueprint.Tensors[6]),
+            DirectPtxTensorView.CreateOwned(valueCache, kernel.Blueprint.Tensors[7]));
+        runtime.Synchronize();
+        var actualQ = new float[modelDimension];
+        var actualK = new float[cacheElements];
+        var actualV = new float[cacheElements];
+        query.Download<float>(actualQ);
+        keyCache.Download<float>(actualK);
+        valueCache.Download<float>(actualV);
+        AssertVectorClose(actualQ, expectedQ, 2e-5f, "fused Q");
+        AssertVectorClose(actualK, expectedK, 2e-5f, "fused K cache");
+        AssertVectorClose(actualV, expectedV, 2e-5f, "fused V cache");
+    }
+
+    [SkippableFact]
+    public void BackendQkvRopeCacheD64_IsExactZeroAllocationAndCapturable()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previous = DirectPtxFeatureGate.TestOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxQkvRopeCacheEnabled,
+                "Requires an Ampere CUDA backend.");
+            const int heads = 4, cacheCapacity = 32, position = 11;
+            int modelDimension = heads * PtxFusedQkvRopeCacheD64Kernel.HeadDimension;
+            int projectionElements = 3 * modelDimension;
+            int cacheElements = cacheCapacity * modelDimension;
+            var random = new Random(20260831);
+            float[] inputHost = Values(random, modelDimension, 0.125f);
+            float[] weightsHost = Values(random, projectionElements * modelDimension, 0.0625f);
+            float[] biasHost = Values(random, projectionElements, 0.0625f);
+            (float[] cosineHost, float[] sineHost) = RopeTables(cacheCapacity);
+            float[] keyCacheHost = Values(random, cacheElements, 0.125f);
+            float[] valueCacheHost = Values(random, cacheElements, 0.125f);
+            (float[] expectedQ, float[] expectedK, float[] expectedV) = QkvRopeCacheOracle(
+                inputHost, weightsHost, biasHost, cosineHost, sineHost,
+                keyCacheHost, valueCacheHost, heads, cacheCapacity, position);
+            using var input = backend.AllocateBuffer(inputHost);
+            using var weights = backend.AllocateBuffer(weightsHost);
+            using var bias = backend.AllocateBuffer(biasHost);
+            using var cosine = backend.AllocateBuffer(cosineHost);
+            using var sine = backend.AllocateBuffer(sineHost);
+            using var query = backend.AllocateBuffer(modelDimension);
+            using var keyCache = backend.AllocateBuffer(keyCacheHost);
+            using var valueCache = backend.AllocateBuffer(valueCacheHost);
+            using var wrongQuery = backend.AllocateBuffer(modelDimension + 1);
+
+            DirectPtxFeatureGate.TestOverride = false;
+            Assert.False(backend.TryDirectPtxQkvRopeCacheD64(
+                input, weights, bias, cosine, sine, query, keyCache, valueCache,
+                heads, cacheCapacity, position));
+            Assert.Equal("qkv-rope-cache-feature-disabled", backend.DirectPtxLastError);
+            Assert.False(backend.PrewarmDirectPtxQkvRopeCacheD64(
+                heads, cacheCapacity, position));
+            Assert.Equal("qkv-rope-cache-feature-disabled", backend.DirectPtxLastError);
+            long disabledDispatch = backend.DirectPtxQkvRopeCacheDispatchCount;
+            backend.QkvProjectionRoPECacheD64(
+                input, weights, bias, cosine, sine, query, keyCache, valueCache,
+                heads, cacheCapacity, position);
+            backend.Synchronize();
+            Assert.Equal(disabledDispatch, backend.DirectPtxQkvRopeCacheDispatchCount);
+            Assert.Equal("qkv-rope-cache-feature-disabled", backend.DirectPtxLastError);
+            AssertVectorClose(backend.DownloadBuffer(query), expectedQ, 2e-5f, "disabled fallback Q");
+            DirectPtxFeatureGate.TestOverride = true;
+
+            Assert.Throws<ArgumentNullException>(() => backend.QkvProjectionRoPECacheD64(
+                null!, weights, bias, cosine, sine, query, keyCache, valueCache,
+                heads, cacheCapacity, position));
+
+            Assert.False(backend.TryDirectPtxQkvRopeCacheD64(
+                input, weights, bias, cosine, sine, query, keyCache, valueCache,
+                6, cacheCapacity, position));
+            Assert.Equal("qkv-rope-cache-head-count-not-implemented", backend.DirectPtxLastError);
+            Assert.False(backend.PrewarmDirectPtxQkvRopeCacheD64(
+                6, cacheCapacity, position));
+            Assert.Equal("qkv-rope-cache-head-count-not-implemented", backend.DirectPtxLastError);
+            Assert.False(backend.TryDirectPtxQkvRopeCacheD64(
+                input, weights, bias, cosine, sine, query, keyCache, valueCache,
+                heads, 24, position));
+            Assert.Equal("qkv-rope-cache-capacity-not-implemented", backend.DirectPtxLastError);
+            Assert.False(backend.TryDirectPtxQkvRopeCacheD64(
+                input, weights, bias, cosine, sine, query, keyCache, valueCache,
+                heads, cacheCapacity, -1));
+            Assert.Equal("qkv-rope-cache-position-out-of-range", backend.DirectPtxLastError);
+            Assert.False(backend.TryDirectPtxQkvRopeCacheD64(
+                input, weights, bias, cosine, sine, query, keyCache, valueCache,
+                heads, cacheCapacity, cacheCapacity));
+            Assert.Equal("qkv-rope-cache-position-out-of-range", backend.DirectPtxLastError);
+            Assert.False(backend.TryDirectPtxQkvRopeCacheD64(
+                null!, weights, bias, cosine, sine, query, keyCache, valueCache,
+                heads, cacheCapacity, position));
+            Assert.Equal("qkv-rope-cache-null-buffer", backend.DirectPtxLastError);
+
+            Assert.False(backend.TryDirectPtxQkvRopeCacheD64(
+                input, weights, bias, cosine, sine, wrongQuery, keyCache, valueCache,
+                heads, cacheCapacity, position));
+            Assert.Equal("qkv-rope-cache-physical-extent-mismatch", backend.DirectPtxLastError);
+            using var zeroPointer = new SyntheticGpuBuffer(
+                IntPtr.Zero, input.SizeInBytes);
+            Assert.False(backend.TryDirectPtxQkvRopeCacheD64(
+                zeroPointer, weights, bias, cosine, sine, query, keyCache, valueCache,
+                heads, cacheCapacity, position));
+            Assert.Equal("qkv-rope-cache-invalid-device-pointer", backend.DirectPtxLastError);
+            using var misaligned = new SyntheticGpuBuffer(
+                new IntPtr(input.Handle.ToInt64() + 4), input.SizeInBytes);
+            Assert.False(backend.TryDirectPtxQkvRopeCacheD64(
+                misaligned, weights, bias, cosine, sine, query, keyCache, valueCache,
+                heads, cacheCapacity, position));
+            Assert.Equal("qkv-rope-cache-alignment-mismatch", backend.DirectPtxLastError);
+            Assert.False(backend.TryDirectPtxQkvRopeCacheD64(
+                input, weights, bias, cosine, sine, input, keyCache, valueCache,
+                heads, cacheCapacity, position));
+            Assert.Equal("qkv-rope-cache-alias-not-supported", backend.DirectPtxLastError);
+            Assert.True(backend.PrewarmDirectPtxQkvRopeCacheD64(
+                heads, cacheCapacity, position), backend.DirectPtxLastError);
+            for (int i = 0; i < 8; i++)
+                Assert.True(backend.TryDirectPtxQkvRopeCacheD64(
+                    input, weights, bias, cosine, sine, query, keyCache, valueCache,
+                    heads, cacheCapacity, position), backend.DirectPtxLastError);
+
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            bool allLaunched = true;
+            for (int i = 0; i < 32; i++)
+                allLaunched &= backend.TryDirectPtxQkvRopeCacheD64(
+                    input, weights, bias, cosine, sine, query, keyCache, valueCache,
+                    heads, cacheCapacity, position);
+            long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+            backend.Synchronize();
+            Assert.True(allLaunched, backend.DirectPtxLastError);
+            Assert.Equal(0, allocated);
+
+            long publicBefore = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < 32; i++)
+                backend.QkvProjectionRoPECacheD64(
+                    input, weights, bias, cosine, sine, query, keyCache, valueCache,
+                    heads, cacheCapacity, position);
+            long publicAllocated = GC.GetAllocatedBytesForCurrentThread() - publicBefore;
+            backend.Synchronize();
+            Assert.Equal(0, publicAllocated);
+            AssertVectorClose(backend.DownloadBuffer(query), expectedQ, 2e-5f, "backend Q");
+            AssertVectorClose(backend.DownloadBuffer(keyCache), expectedK, 2e-5f, "backend K cache");
+            AssertVectorClose(backend.DownloadBuffer(valueCache), expectedV, 2e-5f, "backend V cache");
+
+            bool captureLaunch = true;
+            IntPtr graph = backend.CaptureGraph(() =>
+                captureLaunch &= backend.TryDirectPtxQkvRopeCacheD64(
+                    input, weights, bias, cosine, sine, query, keyCache, valueCache,
+                    heads, cacheCapacity, position));
+            Assert.True(captureLaunch, backend.DirectPtxLastError);
+            Assert.NotEqual(IntPtr.Zero, graph);
+            Assert.Equal(1, backend.DirectPtxQkvRopeCachePinnedKernelCount);
+            try
+            {
+                int warmed = 0;
+                foreach (int otherHeads in new[] { 4, 8, 16 })
+                foreach (int otherCapacity in new[] { 16, 32, 64, 128 })
+                for (int otherPosition = 0; otherPosition < otherCapacity; otherPosition++)
+                {
+                    if (otherHeads == heads && otherCapacity == cacheCapacity &&
+                        otherPosition == position)
+                        continue;
+                    Assert.True(backend.PrewarmDirectPtxQkvRopeCacheD64(
+                        otherHeads, otherCapacity, otherPosition), backend.DirectPtxLastError);
+                    if (++warmed >= backend.DirectPtxQkvRopeCacheKernelCapacity)
+                        goto CacheFilled;
+                }
+
+            CacheFilled:
+                Assert.True(backend.TryGetDirectPtxQkvRopeCacheAudit(
+                    heads, cacheCapacity, position, out _));
+                for (int i = 0; i < 8; i++)
+                    backend.EnqueueCapturedGraph(graph);
+                backend.Synchronize();
+                long graphBefore = GC.GetAllocatedBytesForCurrentThread();
+                for (int i = 0; i < 32; i++)
+                    backend.EnqueueCapturedGraph(graph);
+                long graphAllocated =
+                    GC.GetAllocatedBytesForCurrentThread() - graphBefore;
+                backend.Synchronize();
+                Assert.Equal(0, graphAllocated);
+            }
+            finally { backend.DestroyCapturedGraph(graph); }
+
+            Assert.True(backend.TryGetDirectPtxQkvRopeCacheAudit(
+                heads, cacheCapacity, position, out DirectPtxKernelAudit audit));
+            Assert.Equal(0, audit.Function.LocalBytesPerThread);
+            Assert.Equal(0, audit.Function.StaticSharedBytes);
+            Assert.True(audit.ActiveBlocksPerMultiprocessor >= 8);
+            Assert.True(backend.DirectPtxQkvRopeCacheDispatchCount >= 41);
+            long dispatchBefore = backend.DirectPtxQkvRopeCacheDispatchCount;
+            backend.QkvProjectionRoPECacheD64(
+                input, weights, bias, cosine, sine, query, keyCache, valueCache,
+                heads, cacheCapacity, position);
+            backend.Synchronize();
+            Assert.Equal(dispatchBefore + 1, backend.DirectPtxQkvRopeCacheDispatchCount);
+            AssertVectorClose(backend.DownloadBuffer(query), expectedQ, 2e-5f, "public Q");
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previous;
+        }
+    }
+
+    [SkippableFact]
+    public void BackendQkvRopeCacheD64_UnsupportedBucketsUseExistingGpuFallback()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previous = DirectPtxFeatureGate.TestOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxQkvRopeCacheEnabled,
+                "Requires an Ampere CUDA backend.");
+            const int heads = 6, cacheCapacity = 24, position = 23;
+            int modelDimension = heads * PtxFusedQkvRopeCacheD64Kernel.HeadDimension;
+            int projectionElements = 3 * modelDimension;
+            int cacheElements = cacheCapacity * modelDimension;
+            var random = new Random(20260901);
+            float[] inputHost = Values(random, modelDimension, 0.125f);
+            float[] weightsHost = Values(random, projectionElements * modelDimension, 0.0625f);
+            float[] biasHost = Values(random, projectionElements, 0.0625f);
+            (float[] cosineHost, float[] sineHost) = RopeTables(cacheCapacity);
+            float[] keyCacheHost = Values(random, cacheElements, 0.125f);
+            float[] valueCacheHost = Values(random, cacheElements, 0.125f);
+            (float[] expectedQ, float[] expectedK, float[] expectedV) = QkvRopeCacheOracle(
+                inputHost, weightsHost, biasHost, cosineHost, sineHost,
+                keyCacheHost, valueCacheHost, heads, cacheCapacity, position);
+            using var input = backend.AllocateBuffer(inputHost);
+            using var weights = backend.AllocateBuffer(weightsHost);
+            using var bias = backend.AllocateBuffer(biasHost);
+            using var cosine = backend.AllocateBuffer(cosineHost);
+            using var sine = backend.AllocateBuffer(sineHost);
+            using var query = backend.AllocateBuffer(modelDimension);
+            using var keyCache = backend.AllocateBuffer(keyCacheHost);
+            using var valueCache = backend.AllocateBuffer(valueCacheHost);
+
+            long dispatchBefore = backend.DirectPtxQkvRopeCacheDispatchCount;
+            backend.QkvProjectionRoPECacheD64(
+                input, weights, bias, cosine, sine, query, keyCache, valueCache,
+                heads, cacheCapacity, position);
+            backend.Synchronize();
+
+            Assert.Equal(dispatchBefore, backend.DirectPtxQkvRopeCacheDispatchCount);
+            Assert.Equal("qkv-rope-cache-head-count-not-implemented", backend.DirectPtxLastError);
+            AssertVectorClose(backend.DownloadBuffer(query), expectedQ, 2e-5f, "fallback Q");
+            AssertVectorClose(backend.DownloadBuffer(keyCache), expectedK, 2e-5f, "fallback K cache");
+            AssertVectorClose(backend.DownloadBuffer(valueCache), expectedV, 2e-5f, "fallback V cache");
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previous;
+        }
+    }
+
     [SkippableFact]
     public void DriverOnlyResidualRmsNorm_MatchesReferenceAndHasZeroLocalBytes()
     {
@@ -2275,6 +2689,11 @@ public class DirectPtxWmmaTests
             .Select(_ => (random.NextSingle() - 0.5f) * 0.5f)
             .ToArray();
 
+    private static float[] Values(Random random, int count, float magnitude) =>
+        Enumerable.Range(0, count)
+            .Select(_ => (random.NextSingle() * 2f - 1f) * magnitude)
+            .ToArray();
+
     private static void AssertAttentionGradientClose(float[] actual, float[] expected, string name)
     {
         Assert.Equal(expected.Length, actual.Length);
@@ -2530,6 +2949,90 @@ public class DirectPtxWmmaTests
     }
 
     private static float Half(ushort bits) => (float)BitConverter.UInt16BitsToHalf(bits);
+
+    private static (float[] Cosine, float[] Sine) RopeTables(int capacity)
+    {
+        const int pairs = PtxFusedQkvRopeCacheD64Kernel.HeadDimension / 2;
+        var cosine = new float[capacity * pairs];
+        var sine = new float[capacity * pairs];
+        for (int position = 0; position < capacity; position++)
+        for (int pair = 0; pair < pairs; pair++)
+        {
+            float angle = position * MathF.Pow(10_000f, -2f * pair /
+                PtxFusedQkvRopeCacheD64Kernel.HeadDimension);
+            cosine[position * pairs + pair] = MathF.Cos(angle);
+            sine[position * pairs + pair] = MathF.Sin(angle);
+        }
+        return (cosine, sine);
+    }
+
+    private static (float[] Query, float[] KeyCache, float[] ValueCache) QkvRopeCacheOracle(
+        float[] input,
+        float[] weights,
+        float[] bias,
+        float[] cosine,
+        float[] sine,
+        float[] initialKeyCache,
+        float[] initialValueCache,
+        int heads,
+        int cacheCapacity,
+        int position)
+    {
+        const int dimension = PtxFusedQkvRopeCacheD64Kernel.HeadDimension;
+        int modelDimension = heads * dimension;
+        var projection = new float[3 * modelDimension];
+        for (int output = 0; output < projection.Length; output++)
+        {
+            float sum = bias[output];
+            int weightBase = output * modelDimension;
+            for (int inner = 0; inner < modelDimension; inner++)
+                sum += input[inner] * weights[weightBase + inner];
+            projection[output] = sum;
+        }
+
+        var query = new float[modelDimension];
+        var keyCache = (float[])initialKeyCache.Clone();
+        var valueCache = (float[])initialValueCache.Clone();
+        int cacheBase = position * modelDimension;
+        int ropeBase = position * (dimension / 2);
+        for (int head = 0; head < heads; head++)
+        for (int pair = 0; pair < dimension / 2; pair++)
+        {
+            int feature = pair * 2;
+            int outputIndex = head * dimension + feature;
+            float c = cosine[ropeBase + pair];
+            float s = sine[ropeBase + pair];
+            float qe = projection[outputIndex];
+            float qo = projection[outputIndex + 1];
+            float ke = projection[modelDimension + outputIndex];
+            float ko = projection[modelDimension + outputIndex + 1];
+            query[outputIndex] = qe * c - qo * s;
+            query[outputIndex + 1] = qe * s + qo * c;
+            keyCache[cacheBase + outputIndex] = ke * c - ko * s;
+            keyCache[cacheBase + outputIndex + 1] = ke * s + ko * c;
+            valueCache[cacheBase + outputIndex] = projection[2 * modelDimension + outputIndex];
+            valueCache[cacheBase + outputIndex + 1] = projection[2 * modelDimension + outputIndex + 1];
+        }
+        return (query, keyCache, valueCache);
+    }
+
+    private static void AssertVectorClose(
+        float[] actual,
+        float[] expected,
+        float tolerance,
+        string name)
+    {
+        Assert.Equal(expected.Length, actual.Length);
+        float maximum = 0;
+        int maximumIndex = -1;
+        for (int i = 0; i < actual.Length; i++)
+        {
+            float error = MathF.Abs(actual[i] - expected[i]);
+            if (error > maximum) { maximum = error; maximumIndex = i; }
+        }
+        Assert.True(maximum <= tolerance,
+            $"{name} max absolute error {maximum:G9} at {maximumIndex}; tolerance {tolerance:G9}.");
+    }
 
     private static ushort[] RandomHalf(Random random, int length)
     {

@@ -6,6 +6,7 @@ param(
     [switch]$SkipBuild,
     [switch]$SkipExternal,
     [switch]$Issue834Only,
+    [switch]$Issue835Only,
     [ValidateRange(0, 10)]
     [int]$ContaminationRetries = 4,
     [switch]$AllowDirty
@@ -32,6 +33,138 @@ function Format-Command([string]$Command, [string[]]$Arguments) {
         if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
     })
     return (@($Command) + $quoted) -join ' '
+}
+
+function Read-QkvDotnetRows([string]$Path) {
+    $prefix = 'qkv_evidence_json='
+    return @(Get-Content -LiteralPath $Path | Where-Object {
+        $_.StartsWith($prefix, [StringComparison]::Ordinal)
+    } | ForEach-Object {
+        $_.Substring($prefix.Length) | ConvertFrom-Json
+    })
+}
+
+function Read-QkvPythonRows([string]$Path) {
+    return @(Get-Content -LiteralPath $Path | Where-Object {
+        $_.TrimStart().StartsWith('{', [StringComparison]::Ordinal)
+    } | ForEach-Object { $_ | ConvertFrom-Json })
+}
+
+function Assert-QkvDecodeThroughput([object[]]$Rows, [string]$Source) {
+    foreach ($row in $Rows) {
+        $deviceMedian = [double]$row.device_median_us
+        $endToEndMedian = [double]$row.e2e_median_us
+        $deviceTokens = [double]$row.device_tokens_per_second
+        $endToEndTokens = [double]$row.e2e_tokens_per_second
+        if ($deviceMedian -le 0 -or $endToEndMedian -le 0 -or
+            $deviceTokens -le 0 -or $endToEndTokens -le 0) {
+            throw "QKV release gate found missing or non-positive decode throughput in $Source for '$($row.shape)' '$($row.method)'."
+        }
+        $expectedDeviceTokens = 1e6 / $deviceMedian
+        $expectedEndToEndTokens = 1e6 / $endToEndMedian
+        if ([Math]::Abs($deviceTokens - $expectedDeviceTokens) -gt [Math]::Max(1e-6, $expectedDeviceTokens * 1e-9) -or
+            [Math]::Abs($endToEndTokens - $expectedEndToEndTokens) -gt [Math]::Max(1e-6, $expectedEndToEndTokens * 1e-9)) {
+            throw "QKV release gate found inconsistent decode throughput in $Source for '$($row.shape)' '$($row.method)'."
+        }
+    }
+}
+
+function Assert-QkvReleaseGate([string]$Root, [int]$RunCount, [bool]$IncludeExternal) {
+    $shapes = @('decode-h4', 'decode-h8', 'decode-h16')
+    $verdicts = [System.Collections.Generic.List[object]]::new()
+    for ($run = 1; $run -le $RunCount; $run++) {
+        $prefix = 'run-{0:D2}' -f $run
+        $dotnetPath = Join-Path $Root ($prefix + '-qkv-rope-cache.log')
+        $dotnetRows = @(Read-QkvDotnetRows $dotnetPath)
+        if ($dotnetRows.Count -ne 9) {
+            throw "QKV release gate expected 9 .NET rows in '$dotnetPath'; found $($dotnetRows.Count)."
+        }
+        Assert-QkvDecodeThroughput $dotnetRows $dotnetPath
+        $pythonRows = @()
+        if ($IncludeExternal) {
+            $pythonPath = Join-Path $Root ($prefix + '-qkv-rope-cache-pytorch.log')
+            $pythonRows = @(Read-QkvPythonRows $pythonPath | Where-Object { $_.status -eq 'ok' })
+            if ($pythonRows.Count -ne 9) {
+                throw "QKV release gate expected 9 PyTorch rows in '$pythonPath'; found $($pythonRows.Count)."
+            }
+            Assert-QkvDecodeThroughput $pythonRows $pythonPath
+        }
+
+        foreach ($shape in $shapes) {
+            $direct = @($dotnetRows | Where-Object {
+                $_.shape -eq $shape -and $_.method -eq 'Direct PTX CUDA graph'
+            })
+            $directEager = @($dotnetRows | Where-Object {
+                $_.shape -eq $shape -and $_.method -eq 'Direct PTX fused'
+            })
+            $current = @($dotnetRows | Where-Object {
+                $_.shape -eq $shape -and $_.method -eq 'AiDotNet cuBLAS+NVRTC'
+            })
+            if ($direct.Count -ne 1 -or $directEager.Count -ne 1 -or $current.Count -ne 1) {
+                throw "QKV release gate has an incomplete or duplicate .NET method set for run $run '$shape'."
+            }
+            $candidate = $direct[0]
+            $candidateRows = @($candidate, $directEager[0])
+            if (@($candidateRows | Where-Object {
+                [double]$_.max_error -gt 2e-5 -or
+                [long]$_.managed_bytes -ne 0 -or
+                [long]$_.temporary_device_bytes -ne 0 -or
+                [int]$_.registers_per_thread -gt 48 -or
+                [int]$_.static_shared_bytes -ne 0 -or
+                [int]$_.local_bytes_per_thread -ne 0 -or
+                [int]$_.active_blocks_per_sm -lt 8
+            }).Count -ne 0) {
+                throw "QKV release resource/correctness gate failed for run $run '$shape'."
+            }
+
+            $peers = @($current[0])
+            if ($IncludeExternal) {
+                $shapePeers = @($pythonRows | Where-Object { $_.shape -eq $shape })
+                $expectedPeerMethods = @(
+                    'PyTorch CUDA eager',
+                    'PyTorch CUDA graph',
+                    'PyTorch compile max-autotune'
+                )
+                if ($shapePeers.Count -ne $expectedPeerMethods.Count -or
+                    @($expectedPeerMethods | Where-Object {
+                        $method = $_
+                        @($shapePeers | Where-Object { $_.method -eq $method }).Count -ne 1
+                    }).Count -ne 0) {
+                    throw "QKV release gate has an incomplete or duplicate PyTorch method set for run $run '$shape'."
+                }
+                $peers += $shapePeers
+            }
+            foreach ($peer in $peers) {
+                if ([double]$peer.max_error -gt 2e-5) {
+                    throw "QKV peer '$($peer.method)' exceeded the correctness tolerance for run $run '$shape'."
+                }
+                $deviceSpeedup = [double]$peer.device_median_us / [double]$candidate.device_median_us
+                $endToEndSpeedup = [double]$peer.e2e_median_us / [double]$candidate.e2e_median_us
+                $p95Ratio = [double]$candidate.device_p95_us / [double]$peer.device_p95_us
+                if ($deviceSpeedup -lt 1.10 -or $endToEndSpeedup -lt 1.10 -or $p95Ratio -gt 1.10) {
+                    throw "QKV championship gate failed for run $run '$shape' versus '$($peer.method)': device=$deviceSpeedup, E2E=$endToEndSpeedup, P95 ratio=$p95Ratio."
+                }
+                $verdicts.Add([ordered]@{
+                    run = $run
+                    shape = $shape
+                    competitor = $peer.method
+                    device_median_speedup = $deviceSpeedup
+                    e2e_median_speedup = $endToEndSpeedup
+                    device_p95_ratio = $p95Ratio
+                })
+            }
+        }
+    }
+    $gatePath = Join-Path $Root 'qkv-release-gate.json'
+    [ordered]@{
+        status = 'pass'
+        required_device_and_e2e_median_speedup = 1.10
+        maximum_device_p95_ratio = 1.10
+        maximum_error = 2e-5
+        runs = $RunCount
+        external_competitors_included = $IncludeExternal
+        verdicts = @($verdicts)
+    } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $gatePath -Encoding utf8
 }
 
 function Get-GpuSnapshot {
@@ -94,6 +227,9 @@ function Assert-GpuReady([string]$Label, [switch]$AfterSuite) {
 
 Push-Location $repoRoot
 try {
+    if ($Issue834Only -and $Issue835Only) {
+        throw '-Issue834Only and -Issue835Only are mutually exclusive.'
+    }
     $gitCommit = (& git rev-parse HEAD).Trim()
     if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the Git commit for the evidence manifest.' }
     $dirtyLines = @(& git status --porcelain)
@@ -116,7 +252,7 @@ try {
     }
 
     $suites = [System.Collections.Generic.List[object]]::new()
-    if (-not $Issue834Only) {
+    if (-not $Issue834Only -and -not $Issue835Only) {
         $suites.Add((New-EvidenceSuite 'online-attention' 'dotnet' @($targetDll, '--direct-ptx-online-attention')))
         $suites.Add((New-EvidenceSuite 'gpu-matrix' 'dotnet' @($targetDll, '--direct-ptx-gpu-matrix')))
         $suites.Add((New-EvidenceSuite 'residual-rmsnorm' 'dotnet' @($targetDll, '--direct-ptx-residual-rmsnorm')))
@@ -125,19 +261,31 @@ try {
         }
     }
 
-    $suites.Add((New-EvidenceSuite 'attention-family' 'dotnet' @($targetDll, '--direct-ptx-attention-family', '1')))
-    $suites.Add((New-EvidenceSuite 'decode' 'dotnet' @($targetDll, '--direct-ptx-decode', '1')))
-    $suites.Add((New-EvidenceSuite 'paged-prefill' 'dotnet' @($targetDll, '--direct-ptx-paged-prefill', '1')))
-    $suites.Add((New-EvidenceSuite 'attention-backward' 'dotnet' @($targetDll, '--direct-ptx-attention-backward', '1')))
-    $suites.Add((New-EvidenceSuite 'flash-attention-backward' 'dotnet' @($targetDll, '--direct-ptx-flash-attention-backward', '1')))
+    if (-not $Issue835Only) {
+        $suites.Add((New-EvidenceSuite 'attention-family' 'dotnet' @($targetDll, '--direct-ptx-attention-family', '1')))
+        $suites.Add((New-EvidenceSuite 'decode' 'dotnet' @($targetDll, '--direct-ptx-decode', '1')))
+        $suites.Add((New-EvidenceSuite 'paged-prefill' 'dotnet' @($targetDll, '--direct-ptx-paged-prefill', '1')))
+        $suites.Add((New-EvidenceSuite 'attention-backward' 'dotnet' @($targetDll, '--direct-ptx-attention-backward', '1')))
+        $suites.Add((New-EvidenceSuite 'flash-attention-backward' 'dotnet' @($targetDll, '--direct-ptx-flash-attention-backward', '1')))
+    }
+    if (-not $Issue834Only) {
+        $suites.Add((New-EvidenceSuite 'qkv-rope-cache' 'dotnet' @(
+            $targetDll, '--direct-ptx-qkv-rope-cache', '1', '--no-external')))
+    }
 
     if (-not $SkipExternal) {
         $python = (Get-Command python -ErrorAction Stop).Source
-        $suites.Add((New-EvidenceSuite 'attention-family-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_attention_family_competitors.py'), '--runs', '1')))
-        $suites.Add((New-EvidenceSuite 'decode-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_decode_competitors.py'), '--runs', '1')))
-        $suites.Add((New-EvidenceSuite 'paged-prefill-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_paged_prefill_competitors.py'), '--runs', '1')))
-        $suites.Add((New-EvidenceSuite 'attention-backward-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_attention_backward_competitors.py'), '--runs', '1')))
-        $suites.Add((New-EvidenceSuite 'flash-attention-backward-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_flash_attention_backward_competitors.py'), '--runs', '1')))
+        if (-not $Issue835Only) {
+            $suites.Add((New-EvidenceSuite 'attention-family-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_attention_family_competitors.py'), '--runs', '1')))
+            $suites.Add((New-EvidenceSuite 'decode-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_decode_competitors.py'), '--runs', '1')))
+            $suites.Add((New-EvidenceSuite 'paged-prefill-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_paged_prefill_competitors.py'), '--runs', '1')))
+            $suites.Add((New-EvidenceSuite 'attention-backward-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_attention_backward_competitors.py'), '--runs', '1')))
+            $suites.Add((New-EvidenceSuite 'flash-attention-backward-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_flash_attention_backward_competitors.py'), '--runs', '1')))
+        }
+        if (-not $Issue834Only) {
+            $suites.Add((New-EvidenceSuite 'qkv-rope-cache-pytorch' $python @(
+                (Join-Path $pythonRoot 'run_direct_ptx_qkv_rope_cache_competitors.py'), '--runs', '1', '--json-lines')))
+        }
     }
 
     $previousDirectPtx = $env:AIDOTNET_DIRECT_PTX
@@ -231,7 +379,13 @@ try {
         $env:AIDOTNET_DIRECT_PTX_AUTOTUNE = $previousAutotune
     }
 
-    $files = Get-ChildItem -LiteralPath $evidenceRoot -Filter '*.log' | Sort-Object Name | ForEach-Object {
+    if (-not $Issue834Only) {
+        Assert-QkvReleaseGate $evidenceRoot $Runs (-not [bool]$SkipExternal)
+    }
+
+    $files = Get-ChildItem -LiteralPath $evidenceRoot -File | Where-Object {
+        $_.Extension -eq '.log' -or $_.Name -eq 'qkv-release-gate.json'
+    } | Sort-Object Name | ForEach-Object {
         $hash = Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256
         [ordered]@{ file = $_.Name; sha256 = $hash.Hash.ToLowerInvariant() }
     }
@@ -246,6 +400,7 @@ try {
         requested_independent_runs = $Runs
         contamination_retries_per_suite = $ContaminationRetries
         issue_834_only = [bool]$Issue834Only
+        issue_835_only = [bool]$Issue835Only
         external_gpu_baselines_included = -not [bool]$SkipExternal
         feature_gates = [ordered]@{
             AIDOTNET_DIRECT_PTX = '1'
