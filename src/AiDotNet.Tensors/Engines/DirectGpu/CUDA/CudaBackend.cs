@@ -8406,6 +8406,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void EmbeddingBackward(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradEmbedding, int numIndices, int embeddingDim, int vocabSize)
     {
+#if NET5_0_OR_GREATER
+        if (GpuDeterminism.IsActive && embeddingDim == 1 &&
+            TryDirectPtxScatterAddScalar(
+                gradOutput, indices, gradEmbedding, numIndices, vocabSize,
+                DirectPtxScalarScatterAddMode.DeterministicOverwrite))
+            return;
+#endif
+
         using var _ = PushContext();
         IntPtr gradOutPtr = gradOutput.Handle;
         IntPtr idxPtr = indices.Handle;
