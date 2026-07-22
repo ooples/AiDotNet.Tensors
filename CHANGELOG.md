@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.120.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.119.0...v0.120.0) (2026-07-22)
+
+
+### Features
+
+* add direct PTX fused-kernel blueprint ([#832](https://github.com/ooples/AiDotNet.Tensors/issues/832)) ([2832eb2](https://github.com/ooples/AiDotNet.Tensors/commit/2832eb21d7dd749a139e245a95ba0285d83490c4))
+* **ptx:** compile and dispatch direct-PTX on net471 (all TFMs) ([#881](https://github.com/ooples/AiDotNet.Tensors/issues/881)) ([cc14666](https://github.com/ooples/AiDotNet.Tensors/commit/cc1466621664b53107033d8ce59742307aa55393))
+* **ptx:** fuse decode QKV, RoPE, and KV-cache update ([#858](https://github.com/ooples/AiDotNet.Tensors/issues/858)) ([51dace6](https://github.com/ooples/AiDotNet.Tensors/commit/51dace68e3e7d309ec2115555aa1a547648c08d1))
+* **ptx:** implement fused attention kernel family ([#857](https://github.com/ooples/AiDotNet.Tensors/issues/857)) ([8fb5e91](https://github.com/ooples/AiDotNet.Tensors/commit/8fb5e91ea0ae2b8841e749b74f44cc26be258144))
+
+
+### Bug Fixes
+
+* **gpu:** gate sparsemax on where-select availability ([#866](https://github.com/ooples/AiDotNet.Tensors/issues/866)) ([9b1a88a](https://github.com/ooples/AiDotNet.Tensors/commit/9b1a88a11c451f81a494ead92a5ba0607542222a))
+
 ## [0.119.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.118.0...v0.119.0) (2026-07-21)
 
 
