@@ -2317,6 +2317,68 @@ public class DirectPtxWmmaTests
         }
     }
 
+    [SkippableFact]
+    public void Backend_DirectPtxFusedLoRA_DispatchesAndAuditsAcrossRanks()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previous = DirectPtxFeatureGate.TestOverride;
+        bool previousExperiment = DirectPtxFeatureGate.FusedLinearExperimentOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        DirectPtxFeatureGate.FusedLinearExperimentOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxFusedLinearEnabled, "Requires a validated Ampere CUDA backend.");
+            const int m = 64, k = 256, n = 256;
+            const float scale = 0.5f;
+            long before = backend.DirectPtxLoRADispatchCount;
+
+            foreach (int r in PtxFusedLoRAForwardStandardKernel.SupportedRanks)
+            {
+                var random = RandomHelper.CreateSeededRandom(20264500 + r);
+                float[] xHost = Values(random, m * k, 0.125f);
+                float[] aHost = Values(random, k * r, 0.0625f);   // loraA[K,R]
+                float[] bHost = Values(random, r * n, 0.0625f);   // loraB[R,N]
+                float[] baseHost = Values(random, m * n, 0.25f);
+                var z = new double[m * r];
+                for (int row = 0; row < m; row++)
+                for (int t = 0; t < r; t++)
+                {
+                    double acc = 0;
+                    for (int kk = 0; kk < k; kk++) acc += xHost[row * k + kk] * (double)aHost[kk * r + t];
+                    z[row * r + t] = acc;
+                }
+                var expected = new float[m * n];
+                for (int row = 0; row < m; row++)
+                for (int col = 0; col < n; col++)
+                {
+                    double acc = 0;
+                    for (int t = 0; t < r; t++) acc += z[row * r + t] * bHost[t * n + col];
+                    expected[row * n + col] = (float)(baseHost[row * n + col] + scale * acc);
+                }
+
+                using var x = backend.AllocateBuffer(xHost);
+                using var aBuf = backend.AllocateBuffer(aHost);
+                using var bBuf = backend.AllocateBuffer(bHost);
+                using var baseBuf = backend.AllocateBuffer(baseHost);
+                using var output = backend.AllocateBuffer(m * n);
+                Assert.True(
+                    backend.TryDirectPtxFusedLoRAForward(x, aBuf, bBuf, baseBuf, output, m, k, n, r, scale),
+                    backend.DirectPtxLastError);
+                backend.Synchronize();
+                Assert.True(backend.TryGetDirectPtxLoRAAudit(m, k, n, r, scale, out DirectPtxKernelAudit audit));
+                Assert.Equal(0, audit.Function.LocalBytesPerThread);
+                AssertVectorClose(backend.DownloadBuffer(output), expected, 2e-3f, $"backend fused-lora r{r}");
+            }
+            Assert.True(backend.DirectPtxLoRADispatchCount >= before + PtxFusedLoRAForwardStandardKernel.SupportedRanks.Length);
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previous;
+            DirectPtxFeatureGate.FusedLinearExperimentOverride = previousExperiment;
+        }
+    }
+
     [Fact]
     public void FusedLinearTiledEmitter_IsRegisterResidentTiledGemm()
     {
