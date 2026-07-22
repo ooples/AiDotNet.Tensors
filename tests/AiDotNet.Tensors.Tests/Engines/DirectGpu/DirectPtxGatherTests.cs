@@ -89,8 +89,13 @@ public class DirectPtxGatherTests
             DirectPtxGatherCoverageManifest.All
                 .Where(cell => cell.ExistingImplementation.StartsWith("none", StringComparison.Ordinal)),
             cell => Assert.StartsWith("blocked:", cell.DirectPtxAssignment, StringComparison.Ordinal));
-        Assert.Equal(11, DirectPtxGatherCoverageManifest.All
+        Assert.Equal(10, DirectPtxGatherCoverageManifest.All
             .Count(cell => cell.ExistingImplementation.StartsWith("none", StringComparison.Ordinal)));
+        // ScatterAddRows DOES exist - in CudaBackend.InstantNgp, not the main
+        // partial - so it is portable, not blocked.
+        Assert.DoesNotContain("none",
+            DirectPtxGatherCoverageManifest.Get("CudaBackend.ScatterAddRows").ExistingImplementation,
+            StringComparison.Ordinal);
         Assert.All(DirectPtxGatherCoverageManifest.All,
             cell => Assert.NotEqual(
                 DirectPtxGatherCoverageStatus.PromotedDirectPtx, cell.Status));
