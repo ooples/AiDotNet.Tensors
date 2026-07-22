@@ -73,8 +73,26 @@ public class DirectPtxSgdMomentumTests
         Assert.Equal(
             DirectPtxOptimizerCoverageStatus.ExperimentalDirectPtx,
             DirectPtxOptimizerCoverageManifest.Get("CudaBackend.SgdMomentumUpdate").Status);
-        Assert.Single(DirectPtxOptimizerCoverageManifest.All,
-            cell => cell.Status == DirectPtxOptimizerCoverageStatus.ExperimentalDirectPtx);
+        Assert.Equal(
+            DirectPtxOptimizerCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxOptimizerCoverageManifest.Get("CudaBackend.AdamUpdate").Status);
+        // Name the live cells rather than counting them: this pins WHICH cells
+        // are experimental, so a new cell cannot quietly take a live slot.
+        Assert.Equal(
+            new[] { "CudaBackend.AdamUpdate", "CudaBackend.SgdMomentumUpdate" },
+            DirectPtxOptimizerCoverageManifest.All
+                .Where(cell => cell.Status == DirectPtxOptimizerCoverageStatus.ExperimentalDirectPtx)
+                .Select(cell => cell.Api)
+                .OrderBy(api => api, StringComparer.Ordinal)
+                .ToArray());
+        // Eight cells named NVRTC kernels and backend ops that do not exist.
+        // Each must now declare itself blocked so it cannot read as a port.
+        Assert.All(
+            DirectPtxOptimizerCoverageManifest.All
+                .Where(cell => cell.ExistingImplementation.StartsWith("none", StringComparison.Ordinal)),
+            cell => Assert.StartsWith("blocked:", cell.DirectPtxAssignment, StringComparison.Ordinal));
+        Assert.Equal(8, DirectPtxOptimizerCoverageManifest.All
+            .Count(cell => cell.ExistingImplementation.StartsWith("none", StringComparison.Ordinal)));
         Assert.All(DirectPtxOptimizerCoverageManifest.All,
             cell => Assert.NotEqual(
                 DirectPtxOptimizerCoverageStatus.PromotedDirectPtx, cell.Status));

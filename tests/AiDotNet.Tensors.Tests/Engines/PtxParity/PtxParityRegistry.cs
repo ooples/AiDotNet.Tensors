@@ -47,6 +47,16 @@ public static class PtxParityRegistry
 {
     public static IReadOnlyList<PtxParitySpec> Specs { get; } = new[]
     {
+        new PtxParitySpec("PtxFusedAdamUpdateF32Kernel", PtxParityStatus.Deferred,
+            "Adam parameter update, fp32 (#848) - CudaBackend.AdamUpdate",
+            "updates param, m, and v in place, so a gate-off/gate-on spec must snapshot and restore all " +
+            "three between legs and drive both legs with identical baked hyperparameter bits. Unlike " +
+            "the loss gradients this one canNOT be bit-exact: the two bias corrections are precomputed " +
+            "on the host to remove powf from the kernel, and nvcc may contract some of the reference " +
+            "kernel's multiply-adds into FMAs, so the spec needs a small tolerance. That is a property " +
+            "of the design, not a gap - it is recorded here so nobody later mistakes the tolerance for " +
+            "sloppiness."),
+
         new PtxParitySpec("PtxFusedSgdMomentumF32Kernel", PtxParityStatus.Deferred,
             "fused SGD-momentum update, fp32 (#848) — CudaBackend.SgdMomentumUpdate",
             "has a public route, but the op mutates param and velocity in place, so a gate-off/gate-on " +
