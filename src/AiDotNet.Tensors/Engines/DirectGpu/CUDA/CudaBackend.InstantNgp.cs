@@ -203,9 +203,16 @@ public sealed partial class CudaBackend : IInstantNgpBackend, IUniqueConsecutive
     }
 
     public void ScatterAddRows(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output,
-        int sourceRows, int innerSize, int outputRows) =>
+        int sourceRows, int innerSize, int outputRows)
+    {
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxScatterAddRows(
+            source, indices, output, sourceRows, outputRows, innerSize, deterministic: true))
+            return;
+#endif
         LaunchResidentRows3("resident_scatter_add_rows", source, indices, output,
             checked(outputRows * innerSize), sourceRows, innerSize, outputRows);
+    }
 
     public void ScatterMeanRowsWithCounts(
         IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, IGpuBuffer counts,
