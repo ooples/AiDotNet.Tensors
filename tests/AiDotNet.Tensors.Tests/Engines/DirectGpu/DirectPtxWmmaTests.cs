@@ -2579,6 +2579,118 @@ public class DirectPtxWmmaTests
         return output;
     }
 
+    [Theory]
+    [InlineData(0)]  // None
+    [InlineData(1)]  // Relu
+    [InlineData(2)]  // GeluTanh
+    [InlineData(3)]  // Sigmoid
+    [InlineData(4)]  // Tanh
+    [InlineData(5)]  // Swish
+    [InlineData(6)]  // LeakyRelu
+    public void ActivationBackwardEmitter_IsElementwiseDerivativeWithNoScratchMemory(int activationValue)
+    {
+        var activation = (DirectPtxLinearActivation)activationValue;
+        string ptx = PtxLinearActivationBackwardKernel.EmitPtx(8, 6, 64, 256, activation);
+        Assert.Contains(PtxLinearActivationBackwardKernel.EntryPoint, ptx);
+        Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));   // preact z + upstream dy
+        Assert.Equal(1, Count(ptx, "st.global.f32"));       // dz
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        // Only the smooth activations invoke the transcendental approximation.
+        bool smooth = activation is DirectPtxLinearActivation.Tanh
+            or DirectPtxLinearActivation.Sigmoid or DirectPtxLinearActivation.Swish
+            or DirectPtxLinearActivation.GeluTanh;
+        Assert.Equal(smooth, ptx.Contains("tanh.approx.f32"));
+        // ReLU-family gate on the sign of the preactivation.
+        bool gated = activation is DirectPtxLinearActivation.Relu or DirectPtxLinearActivation.LeakyRelu;
+        Assert.Equal(gated, ptx.Contains("selp.f32"));
+        if (activation == DirectPtxLinearActivation.GeluTanh)
+        {
+            Assert.Contains("0f3F4C422A", ptx);   // sqrt(2/pi)
+            Assert.Contains("0f40400000", ptx);   // the 3.0 in u' = c0(1 + 3 c1 z^2)
+        }
+        Assert.True(PtxLinearActivationBackwardKernel.IsSupportedShape(128, 2048));
+        Assert.False(PtxLinearActivationBackwardKernel.IsPromotedShape(128, 2048));
+    }
+
+    [SkippableTheory]
+    [InlineData(64, 256, 1)]   // Relu
+    [InlineData(128, 512, 4)]  // Tanh
+    [InlineData(64, 256, 3)]   // Sigmoid
+    [InlineData(128, 256, 2)]  // GeluTanh
+    [InlineData(64, 512, 5)]   // Swish
+    public void DriverOnlyActivationBackward_MatchesDerivativeOracle(int m, int n, int activationValue)
+    {
+        var activation = (DirectPtxLinearActivation)activationValue;
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedFusedLinear(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in activation-backward specialization is measured on GA10x/SM86.");
+        using var kernel = new PtxLinearActivationBackwardKernel(runtime, m, n, activation);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20263400 + m + n + (int)activation);
+        float[] preact = Values(random, m * n, 1.5f);   // spread across the nonlinear region
+        float[] dy = Values(random, m * n, 0.5f);
+        var expected = new float[m * n];
+        for (int i = 0; i < expected.Length; i++)
+            expected[i] = (float)(dy[i] * ActivationDerivative(preact[i], activation));
+
+        using var pre = runtime.AllocateBytes((nuint)(preact.Length * sizeof(float)));
+        using var dyBuf = runtime.AllocateBytes((nuint)(dy.Length * sizeof(float)));
+        using var dz = runtime.AllocateBytes((nuint)(m * n * sizeof(float)));
+        pre.Upload<float>(preact);
+        dyBuf.Upload<float>(dy);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(pre, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(dyBuf, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(dz, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[m * n];
+        dz.Download<float>(actual);
+        AssertVectorClose(actual, expected, 2e-3f, $"activation backward {activation} {m}x{n}");
+    }
+
+    private static double ActivationDerivative(double z, DirectPtxLinearActivation activation)
+    {
+        switch (activation)
+        {
+            case DirectPtxLinearActivation.None:
+                return 1.0;
+            case DirectPtxLinearActivation.Relu:
+                return z > 0 ? 1.0 : 0.0;
+            case DirectPtxLinearActivation.LeakyRelu:
+                return z >= 0 ? 1.0 : 0.01;
+            case DirectPtxLinearActivation.Tanh:
+            {
+                double t = Math.Tanh(z);
+                return 1.0 - t * t;
+            }
+            case DirectPtxLinearActivation.Sigmoid:
+            {
+                double s = 1.0 / (1.0 + Math.Exp(-z));
+                return s * (1.0 - s);
+            }
+            case DirectPtxLinearActivation.Swish:
+            {
+                double s = 1.0 / (1.0 + Math.Exp(-z));
+                return s + z * s * (1.0 - s);
+            }
+            case DirectPtxLinearActivation.GeluTanh:
+            {
+                const double c0 = 0.7978845608028654; // sqrt(2/pi)
+                const double c1 = 0.044715;
+                double u = c0 * (z + c1 * z * z * z);
+                double t = Math.Tanh(u);
+                double up = c0 * (1.0 + 3.0 * c1 * z * z);
+                return 0.5 * (1.0 + t) + 0.5 * z * (1.0 - t * t) * up;
+            }
+            default:
+                throw new ArgumentOutOfRangeException(nameof(activation));
+        }
+    }
+
     [Fact]
     public void GemmEmitter_IsRegisterResidentTiledGemm()
     {
