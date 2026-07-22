@@ -16,7 +16,7 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
             DirectPtxSparseGraphCompletionLedger.All
                 .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(51, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+        Assert.Equal(53, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
             entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
         Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
         Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
@@ -578,6 +578,32 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal("single-overwrite", blueprint.Semantics["output-write"]);
         Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
         Assert.Equal("0", blueprint.Semantics["intermediate-global-bytes"]);
+    }
+
+    [Theory]
+    [InlineData((int)DirectPtxResidentScatterSoftmaxOperation.Forward, 3, true)]
+    [InlineData((int)DirectPtxResidentScatterSoftmaxOperation.Backward, 4, false)]
+    public void ResidentScatterSoftmaxEmitter_UsesOneGroupOwnedFusedLaunch(
+        int operationValue,
+        int pointerCount,
+        bool hasExponent)
+    {
+        var operation = (DirectPtxResidentScatterSoftmaxOperation)operationValue;
+        string ptx = PtxResidentScatterSoftmaxF32Kernel.EmitPtx(8, 6, operation);
+        DirectPtxKernelBlueprint blueprint = PtxResidentScatterSoftmaxF32Kernel.CreateBlueprint(
+            DirectPtxArchitectureFamily.Ampere, operation);
+
+        Assert.Equal(pointerCount, Count(ptx, ".param .u64"));
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("atom.", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(hasExponent, ptx.Contains("ex2.approx.f32", StringComparison.Ordinal));
+        Assert.Contains("one-thread-per-group-feature-plus-invalid-row-zeroing",
+            blueprint.Semantics["ownership"], StringComparison.Ordinal);
+        Assert.Equal("1", blueprint.Semantics["kernel-launches"]);
+        Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
+        Assert.Equal("0", blueprint.Semantics["intermediate-global-bytes"]);
+        Assert.All(blueprint.Tensors, tensor => Assert.Equal(DirectPtxExtentMode.Exact, tensor.ExtentMode));
     }
 
     [Theory]

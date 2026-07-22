@@ -232,9 +232,16 @@ public sealed partial class CudaBackend : IInstantNgpBackend, IUniqueConsecutive
     }
 
     public void ScatterSoftmaxRows(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output,
-        int sourceRows, int innerSize, int numGroups) =>
+        int sourceRows, int innerSize, int numGroups)
+    {
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxResidentScatterSoftmaxRows(
+            source, indices, output, sourceRows, innerSize, numGroups))
+            return;
+#endif
         LaunchResidentRows3("resident_scatter_softmax_rows", source, indices, output,
             checked(sourceRows * innerSize), sourceRows, innerSize, numGroups);
+    }
 
     public void ScatterAddBackwardRows(
         IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradSource,
@@ -279,9 +286,16 @@ public sealed partial class CudaBackend : IInstantNgpBackend, IUniqueConsecutive
 
     public void ScatterSoftmaxBackwardRows(
         IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer indices, IGpuBuffer gradSource,
-        int sourceRows, int innerSize, int numGroups) =>
+        int sourceRows, int innerSize, int numGroups)
+    {
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxResidentScatterSoftmaxBackwardRows(
+            gradOutput, output, indices, gradSource, sourceRows, innerSize, numGroups))
+            return;
+#endif
         LaunchResidentRows4("resident_scatter_softmax_backward_rows", gradOutput, output, indices, gradSource,
             checked(sourceRows * innerSize), sourceRows, innerSize, numGroups);
+    }
 
     public unsafe void CtcLoss(
         IGpuBuffer logProbs, IGpuBuffer targets, IGpuBuffer inputLengths,
