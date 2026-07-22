@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 
@@ -258,8 +257,7 @@ internal sealed record DirectPtxKernelAudit(
         int activeBlocksPerMultiprocessor,
         string jitInfoLog)
     {
-        using SHA256 sha = SHA256.Create();
-        string hash = PtxCompat.ToHexString(sha.ComputeHash(Encoding.UTF8.GetBytes(ptx))).ToLowerInvariant();
+        string hash = DirectPtxCubinArtifactCache.ComputePtxSha256(ptx);
         return new DirectPtxKernelAudit(
             blueprint.Id, deviceFingerprint, hash, function, blockThreads,
             activeBlocksPerMultiprocessor, jitInfoLog, DateTime.UtcNow);
@@ -275,8 +273,7 @@ internal sealed record DirectPtxKernelAudit(
         DirectPtxModule module)
     {
         PtxCompat.ThrowIfNull(module, nameof(module));
-        using SHA256 sha = SHA256.Create();
-        string hash = PtxCompat.ToHexString(sha.ComputeHash(Encoding.UTF8.GetBytes(ptx))).ToLowerInvariant();
+        string hash = DirectPtxCubinArtifactCache.ComputePtxSha256(ptx);
         return new DirectPtxKernelAudit(
             blueprint.Id, deviceFingerprint, hash, function, blockThreads,
             activeBlocksPerMultiprocessor, module.JitInfoLog, DateTime.UtcNow,

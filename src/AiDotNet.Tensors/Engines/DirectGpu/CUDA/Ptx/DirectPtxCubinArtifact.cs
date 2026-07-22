@@ -56,7 +56,7 @@ internal sealed class DirectPtxCubinArtifact
 /// </summary>
 internal static class DirectPtxCubinArtifactCache
 {
-    private const int PipelineVersion = 1;
+    private const int PipelineVersion = 2;
     private const int PtxInputType = 1; // CU_JIT_INPUT_PTX
     private const int LogBytes = 16 * 1024;
     private const string CacheEnvironmentVariable = "AIDOTNET_DIRECT_PTX_CACHE_PATH";
@@ -68,6 +68,7 @@ internal static class DirectPtxCubinArtifactCache
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         PtxCompat.ThrowIfNullOrWhiteSpace(ptx, nameof(ptx));
+        ptx = CanonicalizePtx(ptx);
         string sourceKey = ComputeSourceKey(
             ptx, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
 
@@ -90,11 +91,23 @@ internal static class DirectPtxCubinArtifactCache
 
     internal static string ComputeSourceKey(string ptx, int major, int minor)
     {
+        ptx = CanonicalizePtx(ptx);
         string identity = "direct-ptx-cubin-v" +
             PipelineVersion.ToString(CultureInfo.InvariantCulture) + "|sm" +
             major.ToString(CultureInfo.InvariantCulture) +
             minor.ToString(CultureInfo.InvariantCulture) + "|" + ptx;
         return Sha256(Encoding.UTF8.GetBytes(identity));
+    }
+
+    internal static string ComputePtxSha256(string ptx) =>
+        Sha256(Encoding.UTF8.GetBytes(CanonicalizePtx(ptx)));
+
+    internal static string CanonicalizePtx(string ptx)
+    {
+        PtxCompat.ThrowIfNullOrWhiteSpace(ptx, nameof(ptx));
+        if (ptx.IndexOf('\r') < 0)
+            return ptx;
+        return ptx.Replace("\r\n", "\n").Replace('\r', '\n');
     }
 
     private static DirectPtxCubinArtifact? TryReadEmbedded(

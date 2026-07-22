@@ -25,6 +25,23 @@ public sealed class DirectPtxNormalizationCorrectnessTests
     private const float Epsilon = 1e-5f;
 
     [Fact]
+    public void CubinIdentity_IsInvariantAcrossPlatformLineEndings()
+    {
+        const string lf = ".version 7.1\n.target sm_86\n.address_size 64\n";
+        string crlf = lf.Replace("\n", "\r\n");
+        string cr = lf.Replace('\n', '\r');
+
+        Assert.Equal(lf, DirectPtxCubinArtifactCache.CanonicalizePtx(crlf));
+        Assert.Equal(lf, DirectPtxCubinArtifactCache.CanonicalizePtx(cr));
+        Assert.Equal(
+            DirectPtxCubinArtifactCache.ComputePtxSha256(lf),
+            DirectPtxCubinArtifactCache.ComputePtxSha256(crlf));
+        Assert.Equal(
+            DirectPtxCubinArtifactCache.ComputeSourceKey(lf, 8, 6),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(crlf, 8, 6));
+    }
+
+    [Fact]
     public void FastModeRouting_UsesOnlyMeasuredAtomicWinner()
     {
         Assert.Equal(DirectPtxRowNormalizationOperation.LayerNormGradParameters,

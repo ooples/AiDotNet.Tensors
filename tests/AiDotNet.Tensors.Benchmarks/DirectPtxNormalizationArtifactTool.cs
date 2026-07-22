@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Security.Cryptography;
-using System.Text;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
 namespace AiDotNet.Tensors.Benchmarks;
@@ -188,7 +187,7 @@ internal static class DirectPtxNormalizationArtifactTool
     {
         string sourceKey = DirectPtxCubinArtifactCache.ComputeSourceKey(ptx, 8, 6);
         expected.Add(new ExpectedArtifact(
-            blueprintId, Sha256(Encoding.UTF8.GetBytes(ptx)), sourceKey));
+            blueprintId, DirectPtxCubinArtifactCache.ComputePtxSha256(ptx), sourceKey));
     }
 
     private static string Sha256(byte[] bytes)
