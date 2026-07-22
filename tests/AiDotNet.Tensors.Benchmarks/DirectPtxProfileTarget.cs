@@ -223,6 +223,7 @@ internal static class DirectPtxProfileTarget
 
     internal static void RunQkvRopeCache()
     {
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-qkv-rope-cache-start");
         using var runtime = new DirectPtxRuntime();
         const int heads = 16, capacity = 128, position = 127;
         using var kernel = new PtxFusedQkvRopeCacheD64Kernel(
@@ -250,9 +251,12 @@ internal static class DirectPtxProfileTarget
             DirectPtxTensorView.CreateOwned(query, kernel.Blueprint.Tensors[5]),
             DirectPtxTensorView.CreateOwned(keyCache, kernel.Blueprint.Tensors[6]),
             DirectPtxTensorView.CreateOwned(valueCache, kernel.Blueprint.Tensors[7]));
-        for (int i = 0; i < 10; i++) launch();
+        // Exactly one deterministic launch keeps the Nsight completeness gate
+        // one-to-one with this promoted specialization.
+        launch();
         runtime.Synchronize();
         Console.WriteLine(kernel.Audit.ToJson());
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-qkv-rope-cache-end");
     }
 
     internal static void VerifyNcuCsv(string path)

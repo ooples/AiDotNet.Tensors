@@ -69,7 +69,8 @@ class Program
         if (args.Length > 0 && args[0] == "--direct-ptx-qkv-rope-cache")
         {
             int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
-            DirectPtxQkvRopeCacheExperiment.Run(runs);
+            bool includeExternal = !args.Contains("--no-external", StringComparer.Ordinal);
+            DirectPtxQkvRopeCacheExperiment.Run(runs, includeExternal);
             return;
         }
         if (args.Length > 0 && args[0] == "--direct-ptx-residual-rmsnorm")

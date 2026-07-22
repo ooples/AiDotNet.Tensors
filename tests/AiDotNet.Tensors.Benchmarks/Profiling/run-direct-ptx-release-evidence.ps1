@@ -6,6 +6,7 @@ param(
     [switch]$SkipBuild,
     [switch]$SkipExternal,
     [switch]$Issue834Only,
+    [switch]$Issue835Only,
     [ValidateRange(0, 10)]
     [int]$ContaminationRetries = 4,
     [switch]$AllowDirty
@@ -94,6 +95,9 @@ function Assert-GpuReady([string]$Label, [switch]$AfterSuite) {
 
 Push-Location $repoRoot
 try {
+    if ($Issue834Only -and $Issue835Only) {
+        throw '-Issue834Only and -Issue835Only are mutually exclusive.'
+    }
     $gitCommit = (& git rev-parse HEAD).Trim()
     if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the Git commit for the evidence manifest.' }
     $dirtyLines = @(& git status --porcelain)
@@ -116,7 +120,7 @@ try {
     }
 
     $suites = [System.Collections.Generic.List[object]]::new()
-    if (-not $Issue834Only) {
+    if (-not $Issue834Only -and -not $Issue835Only) {
         $suites.Add((New-EvidenceSuite 'online-attention' 'dotnet' @($targetDll, '--direct-ptx-online-attention')))
         $suites.Add((New-EvidenceSuite 'gpu-matrix' 'dotnet' @($targetDll, '--direct-ptx-gpu-matrix')))
         $suites.Add((New-EvidenceSuite 'residual-rmsnorm' 'dotnet' @($targetDll, '--direct-ptx-residual-rmsnorm')))
@@ -125,19 +129,31 @@ try {
         }
     }
 
-    $suites.Add((New-EvidenceSuite 'attention-family' 'dotnet' @($targetDll, '--direct-ptx-attention-family', '1')))
-    $suites.Add((New-EvidenceSuite 'decode' 'dotnet' @($targetDll, '--direct-ptx-decode', '1')))
-    $suites.Add((New-EvidenceSuite 'paged-prefill' 'dotnet' @($targetDll, '--direct-ptx-paged-prefill', '1')))
-    $suites.Add((New-EvidenceSuite 'attention-backward' 'dotnet' @($targetDll, '--direct-ptx-attention-backward', '1')))
-    $suites.Add((New-EvidenceSuite 'flash-attention-backward' 'dotnet' @($targetDll, '--direct-ptx-flash-attention-backward', '1')))
+    if (-not $Issue835Only) {
+        $suites.Add((New-EvidenceSuite 'attention-family' 'dotnet' @($targetDll, '--direct-ptx-attention-family', '1')))
+        $suites.Add((New-EvidenceSuite 'decode' 'dotnet' @($targetDll, '--direct-ptx-decode', '1')))
+        $suites.Add((New-EvidenceSuite 'paged-prefill' 'dotnet' @($targetDll, '--direct-ptx-paged-prefill', '1')))
+        $suites.Add((New-EvidenceSuite 'attention-backward' 'dotnet' @($targetDll, '--direct-ptx-attention-backward', '1')))
+        $suites.Add((New-EvidenceSuite 'flash-attention-backward' 'dotnet' @($targetDll, '--direct-ptx-flash-attention-backward', '1')))
+    }
+    if (-not $Issue834Only) {
+        $suites.Add((New-EvidenceSuite 'qkv-rope-cache' 'dotnet' @(
+            $targetDll, '--direct-ptx-qkv-rope-cache', '1', '--no-external')))
+    }
 
     if (-not $SkipExternal) {
         $python = (Get-Command python -ErrorAction Stop).Source
-        $suites.Add((New-EvidenceSuite 'attention-family-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_attention_family_competitors.py'), '--runs', '1')))
-        $suites.Add((New-EvidenceSuite 'decode-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_decode_competitors.py'), '--runs', '1')))
-        $suites.Add((New-EvidenceSuite 'paged-prefill-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_paged_prefill_competitors.py'), '--runs', '1')))
-        $suites.Add((New-EvidenceSuite 'attention-backward-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_attention_backward_competitors.py'), '--runs', '1')))
-        $suites.Add((New-EvidenceSuite 'flash-attention-backward-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_flash_attention_backward_competitors.py'), '--runs', '1')))
+        if (-not $Issue835Only) {
+            $suites.Add((New-EvidenceSuite 'attention-family-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_attention_family_competitors.py'), '--runs', '1')))
+            $suites.Add((New-EvidenceSuite 'decode-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_decode_competitors.py'), '--runs', '1')))
+            $suites.Add((New-EvidenceSuite 'paged-prefill-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_paged_prefill_competitors.py'), '--runs', '1')))
+            $suites.Add((New-EvidenceSuite 'attention-backward-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_attention_backward_competitors.py'), '--runs', '1')))
+            $suites.Add((New-EvidenceSuite 'flash-attention-backward-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_flash_attention_backward_competitors.py'), '--runs', '1')))
+        }
+        if (-not $Issue834Only) {
+            $suites.Add((New-EvidenceSuite 'qkv-rope-cache-pytorch' $python @(
+                (Join-Path $pythonRoot 'run_direct_ptx_qkv_rope_cache_competitors.py'), '--runs', '1', '--json-lines')))
+        }
     }
 
     $previousDirectPtx = $env:AIDOTNET_DIRECT_PTX
@@ -246,6 +262,7 @@ try {
         requested_independent_runs = $Runs
         contamination_retries_per_suite = $ContaminationRetries
         issue_834_only = [bool]$Issue834Only
+        issue_835_only = [bool]$Issue835Only
         external_gpu_baselines_included = -not [bool]$SkipExternal
         feature_gates = [ordered]@{
             AIDOTNET_DIRECT_PTX = '1'

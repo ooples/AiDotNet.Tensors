@@ -53,7 +53,7 @@ internal static class DirectPtxQkvRopeCacheExperiment
         new("decode-h16", 16, 128, 127)
     ];
 
-    internal static void Run(int independentRuns = 3)
+    internal static void Run(int independentRuns = 3, bool includeExternal = true)
     {
         if (independentRuns <= 0) throw new ArgumentOutOfRangeException(nameof(independentRuns));
         Console.WriteLine(
@@ -75,10 +75,12 @@ internal static class DirectPtxQkvRopeCacheExperiment
             foreach (Shape shape in Shapes) evidence.Add(RunCell(backend, run, shape));
         }
 
-        IReadOnlyList<PythonRecord> python = RunPython(independentRuns);
+        IReadOnlyList<PythonRecord> python = includeExternal
+            ? RunPython(independentRuns)
+            : Array.Empty<PythonRecord>();
         foreach (PythonRecord record in python.Where(record => record.Status == "ok"))
             PrintPython(record);
-        PrintReleaseGate(evidence, python, independentRuns);
+        PrintReleaseGate(evidence, python, independentRuns, includeExternal);
     }
 
     private static CellEvidence RunCell(CudaBackend backend, int run, Shape shape)
@@ -279,11 +281,12 @@ internal static class DirectPtxQkvRopeCacheExperiment
     private static void PrintHeader()
     {
         Console.WriteLine(
-            $"{"Run",3} {"Shape",-11} {"Method",-23} {"dev med",9} {"dev p95",9} " +
-            $"{"dev p99",9} {"E2E med",9} {"E2E p95",9} {"E2E p99",9} " +
-            $"{"TFLOPS",8} {"B/call",9} {"tmp MiB",8} {"max err",10} " +
+            $"{"Run",3} {"Shape",-11} {"Method",-23} {"dev mean",9} {"dev med",9} " +
+            $"{"dev p95",9} {"dev p99",9} {"E2E mean",9} {"E2E med",9} " +
+            $"{"E2E p95",9} {"E2E p99",9} {"TFLOPS",8} {"managed B",9} " +
+            $"{"temp/peak B",11} {"max err",10} " +
             $"{"regs",5} {"shared",7} {"local",5} {"occ",4}");
-        Console.WriteLine(new string('-', 171));
+        Console.WriteLine(new string('-', 203));
     }
 
     private static void Print(
@@ -303,11 +306,13 @@ internal static class DirectPtxQkvRopeCacheExperiment
     {
         Console.WriteLine(
             $"{run,3} {shape.Name,-11} {method,-23} " +
-            $"{device.Median,9:F2} {device.P95,9:F2} {device.P99,9:F2} " +
-            $"{endToEnd.Median,9:F2} {endToEnd.P95,9:F2} {endToEnd.P99,9:F2} " +
-            $"{tflops,8:F3} {bytes,9} {temporaryBytes / 1048576.0,8:F3} " +
+            $"{device.Mean,9:F2} {device.Median,9:F2} {device.P95,9:F2} {device.P99,9:F2} " +
+            $"{endToEnd.Mean,9:F2} {endToEnd.Median,9:F2} {endToEnd.P95,9:F2} {endToEnd.P99,9:F2} " +
+            $"{tflops,8:F3} {ManagedBytes(bytes),9} {temporaryBytes,11} " +
             $"{error,10:G4} {Dash(registers),5} {Dash(shared),7} {Dash(local),5} {Dash(occupancy),4}");
     }
+
+    private static string ManagedBytes(long value) => value < 0 ? "n/a" : value.ToString();
 
     private static void PrintPython(PythonRecord record)
     {
@@ -326,10 +331,12 @@ internal static class DirectPtxQkvRopeCacheExperiment
     private static void PrintReleaseGate(
         IReadOnlyList<CellEvidence> evidence,
         IReadOnlyList<PythonRecord> python,
-        int expectedRuns)
+        int expectedRuns,
+        bool includeExternal)
     {
         bool complete = evidence.Count == expectedRuns * Shapes.Length &&
-            python.Count(record => record.Status == "ok") == expectedRuns * Shapes.Length * 2;
+            (!includeExternal ||
+                python.Count(record => record.Status == "ok") == expectedRuns * Shapes.Length * 2);
         bool correct = evidence.All(cell =>
             cell.DirectError <= 2e-5f && cell.CurrentError <= 2e-5f) &&
             python.Where(record => record.Status == "ok").All(record => record.MaxError <= 2e-5);
@@ -343,7 +350,7 @@ internal static class DirectPtxQkvRopeCacheExperiment
             cell.CurrentDevice.Median / cell.DirectDevice.Median >= 1.10 &&
             cell.DirectDevice.P95 <= cell.CurrentDevice.P95 * 1.10 &&
             cell.CurrentEndToEnd.Median / cell.DirectEndToEnd.Median >= 1.10);
-        bool pythonChampion = python.Where(record => record.Status == "ok").All(peer =>
+        bool pythonChampion = !includeExternal || python.Where(record => record.Status == "ok").All(peer =>
         {
             CellEvidence cell = evidence.Single(candidate =>
                 candidate.Run == peer.Run && candidate.Shape.Name == peer.Shape);
@@ -351,7 +358,7 @@ internal static class DirectPtxQkvRopeCacheExperiment
                 cell.DirectDevice.P95 <= peer.DeviceP95Us * 1.10 &&
                 peer.EndToEndMedianUs / cell.DirectEndToEnd.Median >= 1.10;
         });
-        Console.WriteLine(new string('-', 171));
+        Console.WriteLine(new string('-', 203));
         foreach (CellEvidence cell in evidence)
         {
             PythonRecord[] peers = python.Where(record =>
@@ -373,7 +380,9 @@ internal static class DirectPtxQkvRopeCacheExperiment
         bool pass = complete && correct && resources && allocation &&
             currentChampion && pythonChampion;
         Console.WriteLine(pass
-            ? "PASS: complete requested-run matrix, <=2e-5 error, bounded device P95, zero JIT local/shared/temp/managed allocation, and >=1.10x over every NVIDIA competitor."
+            ? includeExternal
+                ? "PASS: complete requested-run matrix, <=2e-5 error, bounded device P95, zero JIT local/shared/temp/managed allocation, and >=1.10x over every NVIDIA competitor."
+                : "PASS: complete AiDotNet matrix, <=2e-5 error, bounded device P95, zero JIT local/shared/temp/managed allocation, and >=1.10x over the current AiDotNet CUDA path."
             : $"FAIL: complete={complete}, correct={correct}, resources={resources}, " +
               $"allocation={allocation}, AiDotNetChampion={currentChampion}, PyTorchChampion={pythonChampion}.");
         if (!pass) Environment.ExitCode = 2;
