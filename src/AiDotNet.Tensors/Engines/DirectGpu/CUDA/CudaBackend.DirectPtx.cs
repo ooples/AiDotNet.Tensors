@@ -103,10 +103,14 @@ public sealed partial class CudaBackend
 
     internal bool IsDirectPtxGlobalAvgPoolEnabled =>
         DirectPtxFeatureGate.IsGlobalAvgPoolEnabled && IsAvailable &&
-        DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) == DirectPtxArchitectureFamily.Ampere;
+        DirectPtxArchitecture.HasValidatedGlobalAvgPool(_ccMajor, _ccMinor);
 
     internal long DirectPtxGlobalAvgPoolDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxGlobalAvgPoolDispatchCount);
+    internal int DirectPtxGlobalAvgPoolPinnedKernelCount
+    {
+        get { lock (_directPtxLock) return _directPtxGlobalAvgPoolKernels.PinnedCount; }
+    }
     internal int DirectPtxQkvRopeCacheKernelCapacity => _directPtxQkvRopeCacheKernels.Capacity;
     internal int DirectPtxQkvRopeCachePinnedKernelCount
     {
@@ -1809,10 +1813,14 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "global-avgpool-cuda-unavailable";
             return false;
         }
-        if (DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) !=
-            DirectPtxArchitectureFamily.Ampere)
+        if (!DirectPtxArchitecture.HasValidatedGlobalAvgPool(_ccMajor, _ccMinor))
         {
             DirectPtxLastError = "global-avgpool-architecture-not-validated";
+            return false;
+        }
+        if (input is null || output is null)
+        {
+            DirectPtxLastError = "global-avgpool-null-buffer";
             return false;
         }
         if (batch <= 0 || channels <= 0 || height <= 0 || width <= 0)
@@ -1847,9 +1855,25 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "global-avgpool-physical-extent-mismatch";
             return false;
         }
+        if (input.Handle == IntPtr.Zero || output.Handle == IntPtr.Zero)
+        {
+            DirectPtxLastError = "global-avgpool-invalid-device-pointer";
+            return false;
+        }
+        if ((((nuint)input.Handle | (nuint)output.Handle) & 15u) != 0)
+        {
+            DirectPtxLastError = "global-avgpool-alignment-mismatch";
+            return false;
+        }
+        if (DirectPtxGlobalAvgPoolBuffersOverlap(input, output))
+        {
+            DirectPtxLastError = "global-avgpool-alias-not-supported";
+            return false;
+        }
 
         try
         {
+            bool capturing = IsStreamCapturing();
             EnsureContextCurrent();
             var key = new DirectPtxGlobalAvgPoolKey(rows, spatial);
             lock (_directPtxLock)
@@ -1857,7 +1881,7 @@ public sealed partial class CudaBackend
                 if (!_directPtxGlobalAvgPoolKernels.TryGetValue(
                     key, out PtxFusedGlobalAvgPoolF32Kernel? kernel))
                 {
-                    if (IsStreamCapturing())
+                    if (capturing)
                     {
                         DirectPtxLastError =
                             "Direct PTX global average pool must be prewarmed before CUDA graph capture.";
@@ -1866,6 +1890,11 @@ public sealed partial class CudaBackend
                     _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                     kernel = CreateAndCacheGlobalAvgPoolKernelSlow(key);
                 }
+                // CUDA graph executables retain the CUfunction after capture.
+                // Pin the loaded module so LRU churn cannot unload that handle.
+                if (capturing && !_directPtxGlobalAvgPoolKernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX global-average-pool module for CUDA graph capture.");
                 lock (GpuDispatchLock)
                     kernel.Launch(
                         DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]),
@@ -1888,6 +1917,70 @@ public sealed partial class CudaBackend
         DirectPtxGlobalAvgPoolKey key) =>
         _directPtxGlobalAvgPoolKernels.GetOrAdd(key, () =>
             new PtxFusedGlobalAvgPoolF32Kernel(_directPtxRuntime!, key.Rows, key.Spatial));
+
+    internal bool PrewarmDirectPtxGlobalAvgPool(int rows, int spatial)
+    {
+        if (!DirectPtxFeatureGate.IsGlobalAvgPoolEnabled)
+        {
+            DirectPtxLastError = "global-avgpool-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "global-avgpool-cuda-unavailable";
+            return false;
+        }
+        if (!DirectPtxArchitecture.HasValidatedGlobalAvgPool(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = "global-avgpool-architecture-not-validated";
+            return false;
+        }
+        if (!PtxFusedGlobalAvgPoolF32Kernel.IsSupportedShape(rows, spatial))
+        {
+            DirectPtxLastError = "global-avgpool-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedGlobalAvgPoolF32Kernel.IsPromotedShape(rows, spatial) &&
+            !DirectPtxFeatureGate.GlobalAvgPoolExperimentOverride)
+        {
+            DirectPtxLastError = "global-avgpool-performance-gate-not-met";
+            return false;
+        }
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX global-average-pool prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                var key = new DirectPtxGlobalAvgPoolKey(rows, spatial);
+                if (!_directPtxGlobalAvgPoolKernels.TryGetValue(key, out _))
+                    _ = CreateAndCacheGlobalAvgPoolKernelSlow(key);
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    private static bool DirectPtxGlobalAvgPoolBuffersOverlap(
+        IGpuBuffer input,
+        IGpuBuffer output)
+    {
+        nuint inputStart = (nuint)input.Handle;
+        nuint outputStart = (nuint)output.Handle;
+        nuint inputEnd = checked(inputStart + (nuint)input.SizeInBytes);
+        nuint outputEnd = checked(outputStart + (nuint)output.SizeInBytes);
+        return inputStart < outputEnd && outputStart < inputEnd;
+    }
 
     internal bool TryGetDirectPtxGlobalAvgPoolAudit(int rows, int spatial, out DirectPtxKernelAudit audit)
     {

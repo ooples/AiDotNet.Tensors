@@ -28,6 +28,9 @@ public class DirectPtxGlobalAvgPoolTests
         Assert.Equal(1, Count(ptx, "ld.global.ca.v4.f32"));
         Assert.Equal(1, Count(ptx, "st.global.f32"));
         Assert.Equal(5, Count(ptx, "shfl.sync.bfly.b32"));
+        Assert.Equal(5, Count(ptx, "shfl.sync.bfly.b32 %b1, %b0"));
+        Assert.DoesNotContain("shfl.sync.bfly.b32 %f", ptx, StringComparison.Ordinal);
+        Assert.Equal(10, Count(ptx, "mov.b32"));
         Assert.Equal(1, Count(ptx, "mul.rn.f32"));
         // 1/128 = 0x3C000000
         Assert.Contains("0f3C000000", ptx);
@@ -49,6 +52,9 @@ public class DirectPtxGlobalAvgPoolTests
         Assert.False(PtxFusedGlobalAvgPoolF32Kernel.IsSupportedShape(256, 64));
         Assert.False(PtxFusedGlobalAvgPoolF32Kernel.IsSupportedShape(2048, 96));
         Assert.False(PtxFusedGlobalAvgPoolF32Kernel.IsPromotedShape(2048, 128));
+        Assert.True(DirectPtxArchitecture.HasValidatedGlobalAvgPool(8, 6));
+        Assert.False(DirectPtxArchitecture.HasValidatedGlobalAvgPool(8, 0));
+        Assert.False(DirectPtxArchitecture.HasValidatedGlobalAvgPool(8, 9));
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             PtxFusedGlobalAvgPoolF32Kernel.EmitPtx(8, 6, 17, 128));
     }
@@ -80,6 +86,28 @@ public class DirectPtxGlobalAvgPoolTests
             DirectPtxPoolingCoverageManifest.Get("UnassignedPoolingApi"));
     }
 
+    [Fact]
+    public void GlobalAvgPoolExperimentOverride_IsThreadLocal()
+    {
+        bool original = DirectPtxFeatureGate.GlobalAvgPoolExperimentOverride;
+        try
+        {
+            DirectPtxFeatureGate.GlobalAvgPoolExperimentOverride = true;
+            bool workerValue = true;
+            var worker = new System.Threading.Thread(() =>
+                workerValue = DirectPtxFeatureGate.GlobalAvgPoolExperimentOverride);
+            worker.Start();
+            worker.Join();
+
+            Assert.True(DirectPtxFeatureGate.GlobalAvgPoolExperimentOverride);
+            Assert.False(workerValue);
+        }
+        finally
+        {
+            DirectPtxFeatureGate.GlobalAvgPoolExperimentOverride = original;
+        }
+    }
+
     [SkippableTheory]
     [InlineData(256, 128)]
     [InlineData(2048, 64)]
@@ -89,8 +117,9 @@ public class DirectPtxGlobalAvgPoolTests
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
         using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(runtime.ArchitectureFamily == DirectPtxArchitectureFamily.Ampere,
-            "The checked-in global-average-pool specialization is validated on Ampere.");
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedGlobalAvgPool(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in global-average-pool specialization is admitted only on SM86.");
         using var kernel = new PtxFusedGlobalAvgPoolF32Kernel(runtime, rows, spatial);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
         Assert.Equal(0, kernel.Audit.Function.StaticSharedBytes);

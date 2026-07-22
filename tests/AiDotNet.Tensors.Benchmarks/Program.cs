@@ -124,6 +124,11 @@ class Program
             DirectPtxProfileTarget.RunQkvRopeCache();
             return;
         }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-global-avgpool")
+        {
+            DirectPtxProfileTarget.RunGlobalAvgPool();
+            return;
+        }
         if (args.Length > 1 && args[0] == "--direct-ptx-verify-ncu")
         {
             DirectPtxProfileTarget.VerifyNcuCsv(args[1]);

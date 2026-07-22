@@ -45,6 +45,14 @@ internal static class DirectPtxArchitecture
     /// </summary>
     internal static bool HasValidatedQkvRopeCache(int major, int minor) =>
         (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The first global-average-pool candidate is emitted only for the exact
+    /// GA102/SM86 validation domain. Other Ampere devices are separate tuning
+    /// and admission domains and must not inherit this specialization.
+    /// </summary>
+    internal static bool HasValidatedGlobalAvgPool(int major, int minor) =>
+        (major, minor) == (8, 6);
 }
 
 internal enum DirectPtxExtentMode

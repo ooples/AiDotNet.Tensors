@@ -41,15 +41,16 @@ internal static class DirectPtxGlobalAvgPoolExperiment
         RunPyTorch(results);
 
         Console.WriteLine($"NVIDIA GPU-only FP32 global average pool (resident tensors), diagnostic repetition {repetition}/{repetitions}");
-        Console.WriteLine($"{"Rows",7} {"HW",6} {"Method",-27} {"median us",10} {"p95 us",10} {"mean us",10} {"GB/s",9} {"B/call",9} {"max rel",10} {"regs",6} {"local B",8}");
-        Console.WriteLine(new string('-', 128));
+        Console.WriteLine($"{"Rows",7} {"HW",6} {"Method",-27} {"E2E med us",10} {"P95 us",10} {"P99 us",10} {"mean us",10} {"GB/s",9} {"B/call",9} {"temp B",9} {"max rel",10} {"regs",6} {"local B",8}");
+        Console.WriteLine(new string('-', 154));
         foreach (Result r in results.OrderBy(r => r.Rows).ThenBy(r => r.Spatial).ThenBy(r => r.Time.Median))
         {
             string registers = r.Registers < 0 ? "n/a" : r.Registers.ToString();
             string local = r.LocalBytes < 0 ? "n/a" : r.LocalBytes.ToString();
             Console.WriteLine(
                 $"{r.Rows,7} {r.Spatial,6} {r.Method,-27} {r.Time.Median * 1000,10:F2} {r.Time.P95 * 1000,10:F2} " +
-                $"{r.Time.Mean * 1000,10:F2} {r.GigabytesPerSecond,9:F2} {r.Allocation,9} {r.MaxError,10:G4} {registers,6} {local,8}");
+                $"{r.Time.P99 * 1000,10:F2} {r.Time.Mean * 1000,10:F2} {r.GigabytesPerSecond,9:F2} " +
+                $"{r.Allocation,9} {r.TemporaryBytes,9} {r.MaxError,10:G4} {registers,6} {local,8}");
         }
 
         Console.WriteLine();
@@ -80,7 +81,8 @@ internal static class DirectPtxGlobalAvgPoolExperiment
     private static void RunDirect(List<Result> results)
     {
         using var runtime = new DirectPtxRuntime();
-        if (runtime.ArchitectureFamily != DirectPtxArchitectureFamily.Ampere) return;
+        if (!DirectPtxArchitecture.HasValidatedGlobalAvgPool(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor)) return;
         using (runtime.Enter())
         foreach ((int batch, int channels, int spatial) in Shapes)
         {
@@ -118,8 +120,13 @@ internal static class DirectPtxGlobalAvgPoolExperiment
             Action launch = () => backend.GlobalAvgPool2D(inputBuffer, outputBuffer, batch, channels, spatial, 1);
             Distribution distribution = Measure(backend.Synchronize, launch);
             long allocation = Allocation(backend.Synchronize, launch);
+            launch();
+            backend.Synchronize();
+            var actual = new float[rows];
+            backend.DownloadBuffer(outputBuffer, actual);
+            float error = Validate(actual, input, rows, spatial);
             results.Add(new Result(rows, spatial, "AiDotNet global_avgpool2d", distribution,
-                Bandwidth(rows, spatial, distribution.Median), allocation, 0, 0f, -1, -1));
+                Bandwidth(rows, spatial, distribution.Median), allocation, 0, error, -1, -1));
         }
     }
 
@@ -137,8 +144,11 @@ internal static class DirectPtxGlobalAvgPoolExperiment
             }
             Distribution distribution = Measure(() => torch.cuda.synchronize(), Launch);
             long allocation = Allocation(() => torch.cuda.synchronize(), Launch);
+            using TorchTensor check = x.mean([1L]);
+            using TorchTensor checkCpu = check.cpu();
+            float error = Validate(checkCpu.data<float>().ToArray(), input, rows, spatial);
             results.Add(new Result(rows, spatial, "PyTorch mean(dim=-1)", distribution,
-                Bandwidth(rows, spatial, distribution.Median), allocation, -1, 0f, -1, -1));
+                Bandwidth(rows, spatial, distribution.Median), allocation, -1, error, -1, -1));
         }
     }
 

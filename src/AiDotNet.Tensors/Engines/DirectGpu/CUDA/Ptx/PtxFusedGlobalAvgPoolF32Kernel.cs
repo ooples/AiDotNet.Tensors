@@ -41,9 +41,10 @@ internal sealed class PtxFusedGlobalAvgPoolF32Kernel : IDisposable
         int blockThreads = DefaultBlockThreads)
     {
         ArgumentNullException.ThrowIfNull(runtime);
-        if (runtime.ArchitectureFamily != DirectPtxArchitectureFamily.Ampere)
+        if (!DirectPtxArchitecture.HasValidatedGlobalAvgPool(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
-                "The checked-in FP32 global-average-pool specialization is validated only on Ampere.");
+                "The checked-in FP32 global-average-pool specialization is admitted only on SM86.");
         Validate(rows, spatial);
         ValidateBlockThreads(rows, blockThreads);
         Rows = rows;
@@ -117,6 +118,7 @@ internal sealed class PtxFusedGlobalAvgPoolF32Kernel : IDisposable
         ptx.AppendLine("{");
         ptx.AppendLine("    .reg .pred %p<2>;");
         ptx.AppendLine("    .reg .b32 %r<5>;");
+        ptx.AppendLine("    .reg .b32 %b<2>;");
         ptx.AppendLine("    .reg .b64 %rd<8>;");
         ptx.AppendLine($"    .reg .f32 %f<{valuesPerLane + 2}>;");
         ptx.AppendLine("    ld.param.u64 %rd0, [input_ptr];");
@@ -136,8 +138,10 @@ internal sealed class PtxFusedGlobalAvgPoolF32Kernel : IDisposable
             ptx.AppendLine($"    add.rn.f32 %f{accReg}, %f{accReg}, %f{i};");
         foreach (int delta in new[] { 16, 8, 4, 2, 1 })
         {
+            ptx.AppendLine($"    mov.b32 %b0, %f{accReg};");
             ptx.AppendLine(
-                $"    shfl.sync.bfly.b32 %f{shuffleReg}, %f{accReg}, {delta}, 31, 0xffffffff;");
+                $"    shfl.sync.bfly.b32 %b1, %b0, {delta}, 31, 0xffffffff;");
+            ptx.AppendLine($"    mov.b32 %f{shuffleReg}, %b1;");
             ptx.AppendLine($"    add.rn.f32 %f{accReg}, %f{accReg}, %f{shuffleReg};");
         }
         ptx.AppendLine($"    mul.rn.f32 %f{accReg}, %f{accReg}, {invSpatial};");

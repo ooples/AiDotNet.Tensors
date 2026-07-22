@@ -43,8 +43,19 @@ internal static class DirectPtxFeatureGate
 
     /// <summary>Test-only override. Null restores environment-based behavior.</summary>
     internal static bool? TestOverride { get; set; }
-    /// <summary>Benchmark-only access to global-average-pool cells that have not passed promotion.</summary>
-    internal static bool GlobalAvgPoolExperimentOverride { get; set; }
+    [ThreadStatic]
+    private static bool s_globalAvgPoolExperimentOverride;
+
+    /// <summary>
+    /// Benchmark-only access to global-average-pool cells that have not passed
+    /// promotion. Thread-local state prevents parallel tests or benchmarks from
+    /// enabling an experimental route in an unrelated dispatcher.
+    /// </summary>
+    internal static bool GlobalAvgPoolExperimentOverride
+    {
+        get => s_globalAvgPoolExperimentOverride;
+        set => s_globalAvgPoolExperimentOverride = value;
+    }
 
     internal static bool IsEnabled => IsAttentionEnabled;
 
