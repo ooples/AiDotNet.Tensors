@@ -14,7 +14,7 @@ public class DirectPtxScientificTests
     [Fact]
     public void ScientificCoverageManifest_AssignsEveryScopedApiExactlyOnce()
     {
-        Assert.Equal(19, DirectPtxScientificCoverageManifest.All.Count);
+        Assert.Equal(21, DirectPtxScientificCoverageManifest.All.Count);
         string[] names = DirectPtxScientificCoverageManifest.All.Select(c => c.Api).ToArray();
         Assert.Contains("CudaBackend.RbfForward", names);
         Assert.Contains("CudaBackend.PairwiseDistance", names);
@@ -25,6 +25,8 @@ public class DirectPtxScientificTests
         Assert.Contains("CudaBackend.SphericalHarmonicsBackward", names);
         Assert.Contains("CudaBackend.CapsulePredictions", names);
         Assert.Contains("CudaBackend.CapsuleTransform", names);
+        Assert.Contains("CudaBackend.CapsuleWeightedSum", names);
+        Assert.Contains("CudaBackend.CapsuleAgreement", names);
         Assert.Equal(names.Length, names.Distinct(StringComparer.Ordinal).Count());
         Assert.All(DirectPtxScientificCoverageManifest.All, cell =>
         {
@@ -750,6 +752,121 @@ public class DirectPtxScientificTests
         AssertVectorClose(actual, expected, 3e-3f, $"capsule {op}");
     }
 
+    [Fact]
+    public void CapsuleWeightedSumEmitter_IsThreadPerOutputSerialIReduction()
+    {
+        // B=4, I=8, C=8, D=8 -> outputs = 4*8*8 = 256.
+        string ptx = PtxCapsuleWeightedSumKernel.EmitPtx(8, 6, 4, 8, 8, 8);
+        Assert.Contains(PtxCapsuleWeightedSumKernel.EntryPoint, ptx);
+        Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.Equal(1, Count(ptx, "fma.rn.f32"));
+        Assert.Contains("$CWS_I_LOOP:", ptx);
+        Assert.Contains("rem.u32 %r3, %r2, 8", ptx);         // d = idx % capsuleDim
+        Assert.Contains("add.u64 %rd6, %rd6, 32", ptx);      // coupling i stride = C*4 = 32
+        Assert.Contains("add.u64 %rd7, %rd7, 256", ptx);     // pred i stride = C*D*4 = 256
+        Assert.Equal(0, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxCapsuleWeightedSumKernel.IsSupportedShape(4, 8, 8, 8));
+        Assert.False(PtxCapsuleWeightedSumKernel.IsSupportedShape(4, 8, 3, 5));   // 4*3*5=60 not mult of 256
+        Assert.False(PtxCapsuleWeightedSumKernel.IsPromotedShape(4, 8, 8, 8));
+    }
+
+    [Fact]
+    public void CapsuleAgreementEmitter_IsThreadPerOutputSerialDReduction()
+    {
+        // B=4, I=8, C=8 -> outputs = 256.
+        string ptx = PtxCapsuleAgreementKernel.EmitPtx(8, 6, 4, 8, 8, 12);
+        Assert.Contains(PtxCapsuleAgreementKernel.EntryPoint, ptx);
+        Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.Equal(1, Count(ptx, "fma.rn.f32"));
+        Assert.Contains("$CAG_D_LOOP:", ptx);
+        Assert.Contains("rem.u32 %r3, %r2, 8", ptx);         // c = idx % outputCapsules
+        Assert.Equal(2, Count(ptx, "add.u64 %rd6, %rd6, 4") + Count(ptx, "add.u64 %rd7, %rd7, 4")); // both stride 1
+        Assert.Equal(0, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxCapsuleAgreementKernel.IsSupportedShape(4, 8, 8, 12));
+        Assert.False(PtxCapsuleAgreementKernel.IsSupportedShape(4, 3, 5, 12));    // 4*3*5=60 not mult of 256
+        Assert.False(PtxCapsuleAgreementKernel.IsPromotedShape(4, 8, 8, 12));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyCapsuleRouting_MatchesOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in capsule-routing specialization is measured on GA10x/SM86.");
+        const int b = 8, inCaps = 8, outCaps = 8, capDim = 8;   // WS outputs = 8*8*8 = 512; AG outputs = 8*8*8 = 512
+        var random = RandomHelper.CreateSeededRandom(20267800);
+        float[] coupling = Values(random, b * inCaps * outCaps, 1.0f);
+        float[] preds = Values(random, b * inCaps * outCaps * capDim, 1.0f);
+
+        // Weighted sum: output[b,c,d] = sum_i coupling[b,i,c] * predictions[b,i,c,d]
+        var wsExp = new float[b * outCaps * capDim];
+        for (int bi = 0; bi < b; bi++)
+            for (int c = 0; c < outCaps; c++)
+                for (int d = 0; d < capDim; d++)
+                {
+                    double sum = 0;
+                    for (int i = 0; i < inCaps; i++)
+                        sum += coupling[bi * inCaps * outCaps + i * outCaps + c] *
+                               preds[bi * inCaps * outCaps * capDim + i * outCaps * capDim + c * capDim + d];
+                    wsExp[bi * outCaps * capDim + c * capDim + d] = (float)sum;
+                }
+        using (var couplingBuf = runtime.AllocateBytes((nuint)(coupling.Length * sizeof(float))))
+        using (var predBuf = runtime.AllocateBytes((nuint)(preds.Length * sizeof(float))))
+        using (var outBuf = runtime.AllocateBytes((nuint)(wsExp.Length * sizeof(float))))
+        using (var ws = new PtxCapsuleWeightedSumKernel(runtime, b, inCaps, outCaps, capDim))
+        {
+            Assert.Equal(0, ws.Audit.Function.LocalBytesPerThread);
+            couplingBuf.Upload<float>(coupling);
+            predBuf.Upload<float>(preds);
+            ws.Launch(
+                DirectPtxTensorView.CreateOwned(couplingBuf, ws.Blueprint.Tensors[0]),
+                DirectPtxTensorView.CreateOwned(predBuf, ws.Blueprint.Tensors[1]),
+                DirectPtxTensorView.CreateOwned(outBuf, ws.Blueprint.Tensors[2]));
+            runtime.Synchronize();
+            var actual = new float[wsExp.Length];
+            outBuf.Download<float>(actual);
+            AssertVectorClose(actual, wsExp, 3e-3f, "capsule weighted sum");
+        }
+
+        // Agreement: agreement[b,i,c] = sum_d predictions[b,i,c,d] * output[b,c,d]  (reuse wsExp as output)
+        var agExp = new float[b * inCaps * outCaps];
+        for (int bi = 0; bi < b; bi++)
+            for (int i = 0; i < inCaps; i++)
+                for (int c = 0; c < outCaps; c++)
+                {
+                    double sum = 0;
+                    for (int d = 0; d < capDim; d++)
+                        sum += preds[bi * inCaps * outCaps * capDim + i * outCaps * capDim + c * capDim + d] *
+                               wsExp[bi * outCaps * capDim + c * capDim + d];
+                    agExp[bi * inCaps * outCaps + i * outCaps + c] = (float)sum;
+                }
+        using (var predBuf = runtime.AllocateBytes((nuint)(preds.Length * sizeof(float))))
+        using (var outBuf = runtime.AllocateBytes((nuint)(wsExp.Length * sizeof(float))))
+        using (var agreeBuf = runtime.AllocateBytes((nuint)(agExp.Length * sizeof(float))))
+        using (var ag = new PtxCapsuleAgreementKernel(runtime, b, inCaps, outCaps, capDim))
+        {
+            Assert.Equal(0, ag.Audit.Function.LocalBytesPerThread);
+            predBuf.Upload<float>(preds);
+            outBuf.Upload<float>(wsExp);
+            ag.Launch(
+                DirectPtxTensorView.CreateOwned(predBuf, ag.Blueprint.Tensors[0]),
+                DirectPtxTensorView.CreateOwned(outBuf, ag.Blueprint.Tensors[1]),
+                DirectPtxTensorView.CreateOwned(agreeBuf, ag.Blueprint.Tensors[2]));
+            runtime.Synchronize();
+            var actual = new float[agExp.Length];
+            agreeBuf.Download<float>(actual);
+            AssertVectorClose(actual, agExp, 3e-3f, "capsule agreement");
+        }
+    }
+
     // CPU mirror of the NVRTC spherical_harmonics basis table.
     private static float[] ShBasisOracle(float dx, float dy, float dz, int degree)
     {
@@ -1381,6 +1498,36 @@ public class DirectPtxScientificTests
             { backend.CapsulePredictions(ib, wb, o, capB, capI, capK, capC, capD); n = AssertDispatched(n, "capsule-predictions"); AssertVectorClose(backend.DownloadBuffer(o), capPredExp, 3e-3f, "capsule-predictions route"); }
             using (var ib = backend.AllocateBuffer(capIn)) using (var wb = backend.AllocateBuffer(capW)) using (var o = backend.AllocateBuffer(capB * capI * capC * capD))
             { backend.CapsuleTransform(ib, wb, o, capB, capI, capK, capC, capD); n = AssertDispatched(n, "capsule-transform"); AssertVectorClose(backend.DownloadBuffer(o), capTransExp, 3e-3f, "capsule-transform route"); }
+
+            // Capsule routing: weighted sum (out B*C*D) then agreement (out B*I*C).
+            const int rB = 8, rI = 8, rC = 8, rD = 8;
+            float[] rCoup = Values(random, rB * rI * rC, 1.0f);
+            float[] rPred = Values(random, rB * rI * rC * rD, 1.0f);
+            var wsExp = new float[rB * rC * rD];
+            for (int bi = 0; bi < rB; bi++)
+                for (int cc = 0; cc < rC; cc++)
+                    for (int d = 0; d < rD; d++)
+                    {
+                        double sum = 0;
+                        for (int i = 0; i < rI; i++)
+                            sum += rCoup[bi * rI * rC + i * rC + cc] * rPred[bi * rI * rC * rD + i * rC * rD + cc * rD + d];
+                        wsExp[bi * rC * rD + cc * rD + d] = (float)sum;
+                    }
+            using (var coup = backend.AllocateBuffer(rCoup)) using (var pred = backend.AllocateBuffer(rPred)) using (var o = backend.AllocateBuffer(rB * rC * rD))
+            { backend.CapsuleWeightedSum(coup, pred, o, rB, rI, rC, rD); n = AssertDispatched(n, "capsule-weighted-sum"); AssertVectorClose(backend.DownloadBuffer(o), wsExp, 3e-3f, "capsule-weighted-sum route"); }
+
+            var agExp = new float[rB * rI * rC];
+            for (int bi = 0; bi < rB; bi++)
+                for (int i = 0; i < rI; i++)
+                    for (int cc = 0; cc < rC; cc++)
+                    {
+                        double sum = 0;
+                        for (int d = 0; d < rD; d++)
+                            sum += rPred[bi * rI * rC * rD + i * rC * rD + cc * rD + d] * wsExp[bi * rC * rD + cc * rD + d];
+                        agExp[bi * rI * rC + i * rC + cc] = (float)sum;
+                    }
+            using (var pred = backend.AllocateBuffer(rPred)) using (var outb = backend.AllocateBuffer(wsExp)) using (var ag = backend.AllocateBuffer(rB * rI * rC))
+            { backend.CapsuleAgreement(pred, outb, ag, rB, rI, rC, rD); n = AssertDispatched(n, "capsule-agreement"); AssertVectorClose(backend.DownloadBuffer(ag), agExp, 3e-3f, "capsule-agreement route"); }
         }
         finally
         {

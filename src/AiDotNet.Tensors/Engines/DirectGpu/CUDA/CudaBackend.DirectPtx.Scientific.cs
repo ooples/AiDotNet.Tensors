@@ -25,6 +25,7 @@ public sealed partial class CudaBackend
     private readonly record struct SciMatVecKey(int Batch, int Dim);
     private readonly record struct SciShKey(int NumPoints, int BasisCount, int NumChannels, int Degree, bool BroadcastDir);
     private readonly record struct SciCapsuleKey(DirectPtxCapsuleOp Op, int Batch, int InputCapsules, int InputDim, int OutputCount, int OutputDim);
+    private readonly record struct SciCapsuleRoutingKey(int Batch, int InputCapsules, int OutputCapsules, int CapsuleDim);
 
     private readonly DirectPtxKernelCache<SciCountKey, PtxComplexMultiplyKernel> _sciComplexMul =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
@@ -59,6 +60,10 @@ public sealed partial class CudaBackend
     private readonly DirectPtxKernelCache<SciShKey, PtxSphericalHarmonicsBackwardKernel> _sciSphericalHarmonicsBwd =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<SciCapsuleKey, PtxCapsuleContractionKernel> _sciCapsuleContraction =
+        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<SciCapsuleRoutingKey, PtxCapsuleWeightedSumKernel> _sciCapsuleWeightedSum =
+        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<SciCapsuleRoutingKey, PtxCapsuleAgreementKernel> _sciCapsuleAgreement =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
 
     private long _sciDispatchCount;
@@ -331,6 +336,46 @@ public sealed partial class CudaBackend
         int batchSize, int inputCapsules, int inputDim, int numCapsules, int capsuleDim) =>
         TryDirectPtxCapsuleContraction(DirectPtxCapsuleOp.Transform, input, weights, output,
             batchSize, inputCapsules, inputDim, numCapsules, capsuleDim);
+
+    internal bool TryDirectPtxCapsuleWeightedSum(
+        IGpuBuffer coupling, IGpuBuffer predictions, IGpuBuffer output,
+        int batchSize, int inputCapsules, int outputCapsules, int capsuleDim)
+    {
+        if (!ScientificGateOpen ||
+            !PtxCapsuleWeightedSumKernel.IsSupportedShape(batchSize, inputCapsules, outputCapsules, capsuleDim)) return Fail("capsule-weighted-sum");
+        long couplingBytes = checked((long)batchSize * inputCapsules * outputCapsules * sizeof(float));
+        long predBytes = checked((long)batchSize * inputCapsules * outputCapsules * capsuleDim * sizeof(float));
+        long outBytes = checked((long)batchSize * outputCapsules * capsuleDim * sizeof(float));
+        if (coupling.SizeInBytes != couplingBytes || predictions.SizeInBytes != predBytes ||
+            output.SizeInBytes != outBytes) return Fail("capsule-weighted-sum-extent");
+        return SciDispatch(() =>
+        {
+            var k = _sciCapsuleWeightedSum.GetOrAdd(
+                new SciCapsuleRoutingKey(batchSize, inputCapsules, outputCapsules, capsuleDim),
+                () => new PtxCapsuleWeightedSumKernel(_directPtxRuntime!, batchSize, inputCapsules, outputCapsules, capsuleDim));
+            Launch3(k.Blueprint, coupling, predictions, output, (vc, vp, vo) => k.Launch(vc, vp, vo));
+        });
+    }
+
+    internal bool TryDirectPtxCapsuleAgreement(
+        IGpuBuffer predictions, IGpuBuffer output, IGpuBuffer agreement,
+        int batchSize, int inputCapsules, int outputCapsules, int capsuleDim)
+    {
+        if (!ScientificGateOpen ||
+            !PtxCapsuleAgreementKernel.IsSupportedShape(batchSize, inputCapsules, outputCapsules, capsuleDim)) return Fail("capsule-agreement");
+        long predBytes = checked((long)batchSize * inputCapsules * outputCapsules * capsuleDim * sizeof(float));
+        long outBytes = checked((long)batchSize * outputCapsules * capsuleDim * sizeof(float));
+        long agreeBytes = checked((long)batchSize * inputCapsules * outputCapsules * sizeof(float));
+        if (predictions.SizeInBytes != predBytes || output.SizeInBytes != outBytes ||
+            agreement.SizeInBytes != agreeBytes) return Fail("capsule-agreement-extent");
+        return SciDispatch(() =>
+        {
+            var k = _sciCapsuleAgreement.GetOrAdd(
+                new SciCapsuleRoutingKey(batchSize, inputCapsules, outputCapsules, capsuleDim),
+                () => new PtxCapsuleAgreementKernel(_directPtxRuntime!, batchSize, inputCapsules, outputCapsules, capsuleDim));
+            Launch3(k.Blueprint, predictions, output, agreement, (vp, vo, va) => k.Launch(vp, vo, va));
+        });
+    }
 
     private bool Fail(string reason)
     {
