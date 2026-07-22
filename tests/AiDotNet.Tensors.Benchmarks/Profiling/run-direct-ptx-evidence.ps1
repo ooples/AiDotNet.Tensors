@@ -33,7 +33,9 @@ param(
     [ValidateSet('max_error', 'max_rel_error')][string]$ErrorField = 'max_error',
     [ValidateRange(3, 20)][int]$Runs = 3,
     [string]$OutputDirectory = (Join-Path ([System.IO.Path]::GetTempPath()) ("aidotnet-ptx-evidence-" + (Get-Date -Format 'yyyyMMdd-HHmmss'))),
-    [double]$ErrorTolerance = 5e-5,
+    # 0 = use each experiment's emitted per-precision "tolerance" field (fp32
+    # 2e-4, fp16 2e-3, w8a8 5e-4); pass a value to override.
+    [double]$ErrorTolerance = 0,
     [string]$DirectMethodPrefix = 'Direct PTX',
     [switch]$SkipBuild
 )
@@ -92,6 +94,7 @@ foreach ($shapeGroup in $byShape) {
             MaxTemp     = [long](@($m.Group | ForEach-Object { [long]$_.temp_bytes } | Measure-Object -Maximum).Maximum)
             MaxLocal    = [long](@($m.Group | ForEach-Object { [long]$_.local_bytes } | Measure-Object -Maximum).Maximum)
             MaxError    = [double](@($m.Group | ForEach-Object { [double]$_.$ErrorField } | Measure-Object -Maximum).Maximum)
+            EmittedTol  = [double](@($m.Group | ForEach-Object { if ($_.PSObject.Properties.Name -contains 'tolerance') { [double]$_.tolerance } else { 0 } } | Measure-Object -Maximum).Maximum)
             Runs        = @($m.Group | Select-Object -ExpandProperty Process -Unique).Count
         }
     }
@@ -107,7 +110,8 @@ foreach ($shapeGroup in $byShape) {
     if ($direct.MaxManaged -gt 0) { $fail.Add("managed-bytes=$($direct.MaxManaged)>0") }
     if ($direct.MaxTemp -gt 0)    { $fail.Add("temp-bytes=$($direct.MaxTemp)>0") }
     if ($direct.MaxLocal -gt 0)   { $fail.Add("local-bytes=$($direct.MaxLocal)>0") }
-    if ($direct.MaxError -gt $ErrorTolerance) { $fail.Add(("$ErrorField={0:E1}>{1:E1}" -f $direct.MaxError, $ErrorTolerance)) }
+    $effTol = if ($ErrorTolerance -gt 0) { $ErrorTolerance } elseif ($direct.EmittedTol -gt 0) { $direct.EmittedTol } else { 5e-5 }
+    if ($direct.MaxError -gt $effTol) { $fail.Add(("$ErrorField={0:E1}>{1:E1}" -f $direct.MaxError, $effTol)) }
     if ($direct.Runs -lt 3) { $fail.Add("independent-runs=$($direct.Runs)<3") }
 
     $passed = ($fail.Count -eq 0); if (-not $passed) { $anyHold = $true }
