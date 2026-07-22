@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -44,8 +43,13 @@ public sealed class DirectPtxRecurrentTests
         Assert.Equal("rglru-alias-not-supported",
             DirectPtxRecurrentEligibility.EvaluateBuffers(request with { OutputPointer = request.ValuePointer }).Reason);
         Assert.Equal("rglru-address-range-overflow",
-            DirectPtxRecurrentEligibility.EvaluateBuffers(request with { ValuePointer = nuint.MaxValue - 127 }).Reason);
+            DirectPtxRecurrentEligibility.EvaluateBuffers(request with { ValuePointer = MaxNuint - 127 }).Reason);
     }
+
+    // nuint.MaxValue is net7+ generic math. Truncating ulong.MaxValue to nuint
+    // yields all-ones at the native pointer width on both 32- and 64-bit, which
+    // is exactly the value the address-range-overflow guard is probed with.
+    private static readonly nuint MaxNuint = unchecked((nuint)ulong.MaxValue);
 
     [Fact]
     public void RgLruBlueprint_DeclaresExactNoWorkspaceAbi()
@@ -179,4 +183,3 @@ public sealed class DirectPtxRecurrentTests
         public void Dispose() => Disposed = true;
     }
 }
-#endif

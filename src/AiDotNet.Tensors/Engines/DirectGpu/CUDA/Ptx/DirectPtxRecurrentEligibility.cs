@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
 internal readonly record struct DirectPtxRgLruRequest(
@@ -95,4 +94,3 @@ internal static class DirectPtxRecurrentEligibility
         internal bool Overlaps(Range other) => Start < other.End && other.Start < End;
     }
 }
-#endif

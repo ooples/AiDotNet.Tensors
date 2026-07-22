@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 
@@ -84,7 +83,7 @@ internal static class DirectPtxRecurrentCoverageManifest
 
     internal static DirectPtxRecurrentCoverageCell Get(string api)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(api);
+        PtxCompat.ThrowIfNullOrWhiteSpace(api, nameof(api));
         foreach (DirectPtxRecurrentCoverageCell cell in All)
             if (string.Equals(cell.Api, api, StringComparison.Ordinal)) return cell;
         throw new KeyNotFoundException(
@@ -101,4 +100,3 @@ internal static class DirectPtxRecurrentCoverageManifest
         new(api, existing, semantics, layout, dtypes,
             DirectPtxRecurrentCoverageStatus.PlannedDirectPtx, assignment);
 }
-#endif

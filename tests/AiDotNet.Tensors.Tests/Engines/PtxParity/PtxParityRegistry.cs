@@ -82,9 +82,12 @@ public static class PtxParityRegistry
             "fused QKV + RoPE + KV-cache write (#858)",
             "multi-output (Q + K/V cache) with baked RoPE tables; needs a dedicated QKV/RoPE/cache oracle."),
         new PtxParitySpec("PtxFusedRgLruScan128x256Kernel", PtxParityStatus.Deferred,
-            "RG-LRU scan forward [1,128,256] (#846)",
+            "RG-LRU scan forward [1,128,256] (#846) — CudaBackend.RgLruScanForward",
             "the exact SM86 route and high-precision resident championship harness are checked in, " +
-            "but a three-way test requires an admitted SM86 GPU; keep deferred until that CI lane exists."),
+            "but a three-way test requires an admitted SM86 GPU; keep deferred until that CI lane exists. " +
+            "Two constraints for whoever writes it: the op is a sequential scan, so the oracle must run " +
+            "the full recurrence in fp64 rather than a single fused step, and error accumulates along " +
+            "the sequence, so the tolerance has to scale with seqLen."),
     };
 
     private static readonly Dictionary<string, PtxParitySpec> ByKernel =

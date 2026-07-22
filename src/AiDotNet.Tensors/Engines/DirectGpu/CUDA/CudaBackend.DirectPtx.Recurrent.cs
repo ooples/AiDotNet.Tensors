@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
@@ -52,11 +51,11 @@ public sealed partial class CudaBackend
         DirectPtxEligibilityResult bufferResult =
             DirectPtxRecurrentEligibility.EvaluateBuffers(
                 new DirectPtxRgLruBufferRequest(
-                    (nuint)value.Handle, value.SizeInBytes,
-                    (nuint)recurrenceGate.Handle, recurrenceGate.SizeInBytes,
-                    (nuint)inputGate.Handle, inputGate.SizeInBytes,
-                    (nuint)decay.Handle, decay.SizeInBytes,
-                    (nuint)output.Handle, output.SizeInBytes));
+                    PtxCompat.ToNuint(value.Handle), value.SizeInBytes,
+                    PtxCompat.ToNuint(recurrenceGate.Handle), recurrenceGate.SizeInBytes,
+                    PtxCompat.ToNuint(inputGate.Handle), inputGate.SizeInBytes,
+                    PtxCompat.ToNuint(decay.Handle), decay.SizeInBytes,
+                    PtxCompat.ToNuint(output.Handle), output.SizeInBytes));
         if (!bufferResult.IsEligible)
         {
             DirectPtxLastError = bufferResult.Reason;
@@ -199,4 +198,3 @@ public sealed partial class CudaBackend
         int SequenceLength,
         int RecurrentDimension);
 }
-#endif

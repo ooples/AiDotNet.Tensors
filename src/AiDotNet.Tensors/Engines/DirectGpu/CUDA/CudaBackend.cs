@@ -15503,11 +15503,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (batch <= 0 || seqLen <= 0 || recDim <= 0)
             throw new ArgumentOutOfRangeException(nameof(batch), "RG-LRU dimensions must be positive.");
-#if NET5_0_OR_GREATER
         if (TryDirectPtxRgLruScanForward(
             value, recGate, inpGate, decay, output, batch, seqLen, recDim))
             return;
-#endif
         LaunchLegacyRgLruScanForward(value, recGate, inpGate, decay, output, batch, seqLen, recDim);
     }
 
