@@ -54,14 +54,19 @@ public class DirectPtxReductionTests
             PtxFusedRowReduceF32Kernel.EmitPtx(8, 6, 17, 128));
     }
 
-    [SkippableFact]
-    public void DriverOnlyFusedRowSum_MatchesReferenceAndHasZeroLocalBytes()
+    [SkippableTheory]
+    [InlineData(256, 128)]
+    [InlineData(2048, 64)]
+    [InlineData(2048, 128)]
+    [InlineData(8192, 128)]
+    public void DriverOnlyFusedRowSum_MatchesReferenceAndHasZeroLocalBytes(
+        int rows,
+        int columns)
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
         using var runtime = new DirectPtxRuntime();
         Skip.IfNot(runtime.ArchitectureFamily == DirectPtxArchitectureFamily.Ampere,
             "The checked-in row-sum specialization is validated on Ampere.");
-        const int rows = 2048, columns = 128;
         using var kernel = new PtxFusedRowReduceF32Kernel(runtime, rows, columns);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
         Assert.Equal(0, kernel.Audit.Function.StaticSharedBytes);
@@ -76,6 +81,13 @@ public class DirectPtxReductionTests
         var random = new Random(20260722);
         float[] values = Enumerable.Range(0, elements)
             .Select(_ => (random.NextSingle() * 2f - 1f) * 4f).ToArray();
+        Array.Clear(values, 0, columns);
+        for (int column = 0; column < columns; column++)
+            values[columns + column] = (column & 1) == 0 ? 4f : -4f;
+        values[2 * columns + 7] = float.PositiveInfinity;
+        values[3 * columns + 11] = float.NaN;
+        values[4 * columns + 13] = float.PositiveInfinity;
+        values[4 * columns + 17] = float.NegativeInfinity;
         var expected = new float[rows];
         for (int row = 0; row < rows; row++)
         {
@@ -93,10 +105,29 @@ public class DirectPtxReductionTests
         output.Download<float>(actual);
         for (int row = 0; row < rows; row++)
         {
+            if (float.IsNaN(expected[row]))
+            {
+                Assert.True(float.IsNaN(actual[row]),
+                    $"row {row}: expected NaN, actual {actual[row]:G9}.");
+                continue;
+            }
+            if (float.IsInfinity(expected[row]))
+            {
+                Assert.Equal(expected[row], actual[row]);
+                continue;
+            }
             float tolerance = 1e-4f * (MathF.Abs(expected[row]) + 1f);
             Assert.True(MathF.Abs(actual[row] - expected[row]) <= tolerance,
                 $"row {row}: actual {actual[row]:G9}, expected {expected[row]:G9}, tol {tolerance:G9}.");
         }
+
+        using var suffixAllocation = runtime.AllocateBytes(
+            kernel.Blueprint.Tensors[0].RequiredBytes + (nuint)16);
+        DirectPtxTensorView suffix = DirectPtxTensorView.CreateOwned(
+            suffixAllocation, kernel.Blueprint.Tensors[0], 16);
+        Assert.Throws<ArgumentException>(() => kernel.Launch(
+            suffix,
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[1])));
     }
 
     [Fact]

@@ -10,8 +10,9 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// Issue-#843 NVIDIA-only fused FP32 row-sum reduction benchmark. Compares the
 /// hand-emitted direct-PTX kernel against the current AiDotNet CUDA sum_axis
 /// kernel and the strongest resident PyTorch path on identical device tensors.
-/// CPU MKL/OpenBLAS are intentionally ineligible. The single capture below is
-/// one independent run; production promotion consumes three clean runs.
+/// CPU MKL/OpenBLAS are intentionally ineligible. Repetitions in one process
+/// are diagnostic only; production promotion consumes three separately
+/// launched, clean captures.
 /// </summary>
 internal static class DirectPtxReductionExperiment
 {
@@ -21,31 +22,51 @@ internal static class DirectPtxReductionExperiment
     private readonly record struct Distribution(double Mean, double Median, double P95, double P99);
     private readonly record struct Result(
         int Rows, int Columns, string Method, Distribution Time, double GigabytesPerSecond,
-        long Allocation, long TemporaryBytes, float MaxError, int Registers, int LocalBytes);
+        long Allocation, long TemporaryBytes, float MaxError, int Registers,
+        int StaticSharedBytes, int LocalBytes, int ActiveBlocksPerMultiprocessor);
 
-    internal static void Run(int independentRuns = 1)
+    internal static void Run(int repetitions = 1)
     {
-        GpuBenchmarkEnvironment.PrintSnapshot("start");
+        if (repetitions <= 0)
+            throw new ArgumentOutOfRangeException(nameof(repetitions));
+
+        for (int repetition = 1; repetition <= repetitions; repetition++)
+            RunRepetition(repetition, repetitions);
+    }
+
+    private static void RunRepetition(int repetition, int repetitions)
+    {
+        GpuBenchmarkEnvironment.PrintSnapshot($"start-{repetition}");
         var results = new List<Result>();
         RunDirect(results);
         RunAiDotNet(results);
         RunPyTorch(results);
 
-        Console.WriteLine("NVIDIA GPU-only fused FP32 row-sum reduction (resident tensors)");
-        Console.WriteLine($"{"Rows",7} {"Cols",6} {"Method",-27} {"median us",10} {"p95 us",10} {"mean us",10} {"GB/s",9} {"B/call",9} {"max err",10} {"regs",6} {"local B",8}");
-        Console.WriteLine(new string('-', 128));
+        Console.WriteLine(
+            $"NVIDIA GPU-only fused FP32 row-sum reduction (resident tensors), " +
+            $"diagnostic repetition {repetition}/{repetitions}");
+        Console.WriteLine($"{"Rows",7} {"Cols",6} {"Method",-27} {"median us",10} {"p95 us",10} {"p99 us",10} {"mean us",10} {"GB/s",9} {"B/call",9} {"temp B",9} {"max rel",10} {"regs",6} {"shared B",9} {"local B",8} {"blocks/SM",9}");
+        Console.WriteLine(new string('-', 172));
         foreach (Result r in results.OrderBy(r => r.Rows).ThenBy(r => r.Columns).ThenBy(r => r.Time.Median))
         {
             string registers = r.Registers < 0 ? "n/a" : r.Registers.ToString();
+            string shared = r.StaticSharedBytes < 0 ? "n/a" : r.StaticSharedBytes.ToString();
             string local = r.LocalBytes < 0 ? "n/a" : r.LocalBytes.ToString();
+            string activeBlocks = r.ActiveBlocksPerMultiprocessor < 0
+                ? "n/a"
+                : r.ActiveBlocksPerMultiprocessor.ToString();
+            string temporary = r.TemporaryBytes < 0 ? "n/a" : r.TemporaryBytes.ToString();
             Console.WriteLine(
                 $"{r.Rows,7} {r.Columns,6} {r.Method,-27} {r.Time.Median * 1000,10:F2} " +
-                $"{r.Time.P95 * 1000,10:F2} {r.Time.Mean * 1000,10:F2} {r.GigabytesPerSecond,9:F2} " +
-                $"{r.Allocation,9} {r.MaxError,10:G4} {registers,6} {local,8}");
+                $"{r.Time.P95 * 1000,10:F2} {r.Time.P99 * 1000,10:F2} {r.Time.Mean * 1000,10:F2} " +
+                $"{r.GigabytesPerSecond,9:F2} {r.Allocation,9} {temporary,9} " +
+                $"{r.MaxError,10:G4} {registers,6} {shared,9} {local,8} {activeBlocks,9}");
         }
 
         Console.WriteLine();
-        Console.WriteLine("Diagnostic gate: production policy except this single capture counts as one independent run (production requires three).");
+        Console.WriteLine(
+            "Diagnostic gate: each in-process repetition counts as one diagnostic only; " +
+            "production still requires three clean, separately launched captures.");
         DirectPtxReleaseGatePolicy policy = DirectPtxReleaseGatePolicy.ProductionDefault with
         {
             RequiredIndependentRuns = 1
@@ -70,7 +91,7 @@ internal static class DirectPtxReductionExperiment
                 $"[{rows},{columns}]: {(decision.Passed ? "PASS" : "HOLD"),-4} {decision.MedianSpeedup:F2}x vs {best.Method}; " +
                 (decision.Passed ? "all gates passed" : string.Join("; ", decision.Failures)));
         }
-        GpuBenchmarkEnvironment.PrintSnapshot("end");
+        GpuBenchmarkEnvironment.PrintSnapshot($"end-{repetition}");
     }
 
     private static void RunDirect(List<Result> results)
@@ -96,7 +117,10 @@ internal static class DirectPtxReductionExperiment
             float error = Validate(actual, x, rows, columns);
             results.Add(new Result(rows, columns, "Direct PTX row-sum", distribution,
                 Bandwidth(rows, columns, distribution.Median), allocation, 0, error,
-                kernel.Audit.Function.RegistersPerThread, kernel.Audit.Function.LocalBytesPerThread));
+                kernel.Audit.Function.RegistersPerThread,
+                kernel.Audit.Function.StaticSharedBytes,
+                kernel.Audit.Function.LocalBytesPerThread,
+                kernel.Audit.ActiveBlocksPerMultiprocessor));
         }
     }
 
@@ -115,7 +139,8 @@ internal static class DirectPtxReductionExperiment
             launch(); backend.Synchronize();
             float error = Validate(backend.DownloadBuffer(output), x, rows, columns);
             results.Add(new Result(rows, columns, "AiDotNet sum_axis", distribution,
-                Bandwidth(rows, columns, distribution.Median), allocation, 0, error, -1, -1));
+                Bandwidth(rows, columns, distribution.Median), allocation, 0, error,
+                -1, -1, -1, -1));
         }
     }
 
@@ -132,8 +157,13 @@ internal static class DirectPtxReductionExperiment
             }
             Distribution distribution = Measure(() => torch.cuda.synchronize(), Launch);
             long allocation = Allocation(() => torch.cuda.synchronize(), Launch);
+            using TorchTensor validation = input.sum([1L]);
+            using TorchTensor validationCpu = validation.cpu();
+            float error = Validate(
+                validationCpu.data<float>().ToArray(), xHost, rows, columns);
             results.Add(new Result(rows, columns, "PyTorch sum(dim=-1)", distribution,
-                Bandwidth(rows, columns, distribution.Median), allocation, -1, 0, -1, -1));
+                Bandwidth(rows, columns, distribution.Median), allocation, -1, error,
+                -1, -1, -1, -1));
         }
     }
 
