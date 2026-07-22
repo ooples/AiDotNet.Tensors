@@ -5,6 +5,7 @@ using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -2240,6 +2241,115 @@ public class DirectPtxWmmaTests
         Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() =>
             DirectPtxDenseLinearCoverageManifest.Get("UnassignedDenseLinearApi"));
     }
+
+    [Fact]
+    public void FusedLinearTiledEmitter_IsRegisterResidentTiledGemm()
+    {
+        string ptx = PtxFusedLinearTiledKernel.EmitPtx(
+            8, 6, 64, 256, 256, DirectPtxLinearActivation.GeluTanh);
+        Assert.Contains(PtxFusedLinearTiledKernel.EntryPoint, ptx);
+        Assert.Contains(".shared .align 16 .b8 a_tile[2048]", ptx);
+        Assert.Contains(".shared .align 16 .b8 w_tile[2048]", ptx);
+        Assert.Equal(4, Count(ptx, "ld.param.u64"));
+        // 128 register-block FMAs (16 per k x 8 BK) + 16 GELU-epilogue FMAs.
+        Assert.Equal(144, Count(ptx, "fma.rn.f32"));
+        Assert.Equal(64, Count(ptx, "ld.shared.f32"));
+        Assert.Equal(2, Count(ptx, "bar.sync 0"));
+        Assert.Equal(16, Count(ptx, "st.global.f32"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+
+        // Only the epilogue changes across activations.
+        string relu = PtxFusedLinearTiledKernel.EmitPtx(
+            8, 6, 64, 256, 256, DirectPtxLinearActivation.Relu);
+        Assert.DoesNotContain("tanh.approx", relu, StringComparison.Ordinal);
+        Assert.Contains("max.f32", relu, StringComparison.Ordinal);
+        string none = PtxFusedLinearTiledKernel.EmitPtx(
+            8, 6, 64, 256, 256, DirectPtxLinearActivation.None);
+        Assert.Equal(128, Count(none, "fma.rn.f32")); // no epilogue FMAs
+
+        // Shape domain fails closed off the tile multiples.
+        Assert.False(PtxFusedLinearTiledKernel.IsSupportedShape(63, 256, 256));
+        Assert.False(PtxFusedLinearTiledKernel.IsSupportedShape(64, 255, 256));
+        Assert.False(PtxFusedLinearTiledKernel.IsSupportedShape(64, 256, 96));
+        Assert.True(PtxFusedLinearTiledKernel.IsSupportedShape(128, 512, 2048));
+        Assert.False(PtxFusedLinearTiledKernel.IsPromotedShape(128, 512, 2048));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxFusedLinearTiledKernel.EmitPtx(8, 6, 63, 256, 256, DirectPtxLinearActivation.None));
+    }
+
+    [SkippableTheory]
+    [InlineData(64, 256, 256, 2)]  // GeluTanh
+    [InlineData(128, 512, 512, 1)] // Relu
+    [InlineData(64, 256, 512, 0)]  // None
+    public void DriverOnlyFusedLinearTiled_MatchesOracleAndHasZeroLocalBytes(
+        int m, int k, int n, int activationValue)
+    {
+        var activation = (DirectPtxLinearActivation)activationValue;
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedFusedLinear(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in tiled fused-linear specialization is measured on GA10x/SM86.");
+        using var kernel = new PtxFusedLinearTiledKernel(runtime, m, k, n, activation);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+        Assert.Equal(4, kernel.Blueprint.Tensors.Count);
+
+        var random = RandomHelper.CreateSeededRandom(20262300 + m + k + n + (int)activation);
+        float[] aHost = Values(random, m * k, 0.125f);
+        float[] wHost = Values(random, n * k, 0.0625f);   // output-major [N,K]
+        float[] biasHost = Values(random, n, 0.0625f);
+        float[] expected = TiledLinearOracle(aHost, wHost, biasHost, m, k, n, activation);
+
+        using var a = runtime.AllocateBytes((nuint)(aHost.Length * sizeof(float)));
+        using var w = runtime.AllocateBytes((nuint)(wHost.Length * sizeof(float)));
+        using var bias = runtime.AllocateBytes((nuint)(biasHost.Length * sizeof(float)));
+        using var output = runtime.AllocateBytes((nuint)(m * n * sizeof(float)));
+        a.Upload<float>(aHost);
+        w.Upload<float>(wHost);
+        bias.Upload<float>(biasHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(a, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(w, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[3]));
+        runtime.Synchronize();
+        var actual = new float[m * n];
+        output.Download<float>(actual);
+        // tanh.approx + fp32 K-accumulation; generous ceiling well above measured.
+        AssertVectorClose(actual, expected, 2e-3f, $"tiled fused linear {activation} {m}x{k}x{n}");
+    }
+
+    private static float[] TiledLinearOracle(
+        float[] a, float[] w, float[] bias, int m, int k, int n,
+        DirectPtxLinearActivation activation)
+    {
+        var output = new float[m * n];
+        for (int row = 0; row < m; row++)
+        for (int col = 0; col < n; col++)
+        {
+            double acc = 0;
+            for (int kk = 0; kk < k; kk++)
+                acc += a[row * k + kk] * (double)w[col * k + kk]; // W is [N,K] output-major
+            acc += bias[col];
+            output[row * n + col] = (float)ApplyTiledActivation(acc, activation);
+        }
+        return output;
+    }
+
+    private static double ApplyTiledActivation(double x, DirectPtxLinearActivation activation) => activation switch
+    {
+        DirectPtxLinearActivation.None => x,
+        DirectPtxLinearActivation.Relu => Math.Max(x, 0.0),
+        DirectPtxLinearActivation.LeakyRelu => x >= 0 ? x : 0.01 * x,
+        DirectPtxLinearActivation.Tanh => Math.Tanh(x),
+        DirectPtxLinearActivation.Sigmoid => 1.0 / (1.0 + Math.Exp(-x)),
+        DirectPtxLinearActivation.Swish => x / (1.0 + Math.Exp(-x)),
+        DirectPtxLinearActivation.GeluTanh =>
+            0.5 * x * (1.0 + Math.Tanh(0.7978845608 * (x + 0.044715 * x * x * x))),
+        _ => x
+    };
 
     [Theory]
     [InlineData(8, 6, true)]
