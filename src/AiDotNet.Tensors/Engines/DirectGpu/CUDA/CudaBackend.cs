@@ -8267,106 +8267,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             attentionBias, biasBatchStride))
             return;
 #endif
-        int causalFlag = isCausal ? 1 : 0;
-        int hasBias = attentionBias is not null ? 1 : 0;
-        IntPtr biasPtr = attentionBias is not null ? attentionBias.Handle : IntPtr.Zero;
-
-        IntPtr goPtr = gradOutput.Handle;
-        IntPtr qPtr = query.Handle;
-        IntPtr kPtr = key.Handle;
-        IntPtr vPtr = value.Handle;
-        IntPtr oPtr = output.Handle;
-        IntPtr sPtr = softmaxStats.Handle;
-        IntPtr gqPtr = gradQuery.Handle;
-        IntPtr gkPtr = gradKey.Handle;
-        IntPtr gvPtr = gradValue.Handle;
-
-        if (GpuDeterminism.IsActive)
-        {
-            // Issue #382: tiled flash_attention_backward uses atomicAdd for
-            // gradKey/gradValue — non-deterministic across runs. Split into two
-            // atomic-free kernels:
-            //   gradq: per (bh, qi) writes gradQuery only
-            //   gradkv: per (bh, ki, d) accumulates gradKey/gradValue with fixed qi order
-            var kernelQ = _kernelCache["flash_attention_backward_gradq_deterministic"];
-            void** argsQ = stackalloc void*[17];
-            argsQ[0] = &goPtr;
-            argsQ[1] = &qPtr;
-            argsQ[2] = &kPtr;
-            argsQ[3] = &vPtr;
-            argsQ[4] = &oPtr;
-            argsQ[5] = &sPtr;
-            argsQ[6] = &gqPtr;
-            argsQ[7] = &batch;
-            argsQ[8] = &numHeads;
-            argsQ[9] = &seqQ;
-            argsQ[10] = &seqK;
-            argsQ[11] = &headDim;
-            argsQ[12] = &scale;
-            argsQ[13] = &causalFlag;
-            argsQ[14] = &biasPtr;
-            argsQ[15] = &hasBias;
-            argsQ[16] = &biasBatchStride;
-
-            uint gridQX = (uint)((seqQ + 63) / 64);
-            uint gridQY = (uint)(batch * numHeads);
-            LaunchKernel2D(kernelQ, gridQX, gridQY, 64, 1, argsQ);
-
-            var kernelKV = _kernelCache["flash_attention_backward_gradkv_deterministic"];
-            void** argsKV = stackalloc void*[18];
-            argsKV[0] = &goPtr;
-            argsKV[1] = &qPtr;
-            argsKV[2] = &kPtr;
-            argsKV[3] = &vPtr;
-            argsKV[4] = &oPtr;
-            argsKV[5] = &sPtr;
-            argsKV[6] = &gkPtr;
-            argsKV[7] = &gvPtr;
-            argsKV[8] = &batch;
-            argsKV[9] = &numHeads;
-            argsKV[10] = &seqQ;
-            argsKV[11] = &seqK;
-            argsKV[12] = &headDim;
-            argsKV[13] = &scale;
-            argsKV[14] = &causalFlag;
-            argsKV[15] = &biasPtr;
-            argsKV[16] = &hasBias;
-            argsKV[17] = &biasBatchStride;
-
-            uint gridKVX = (uint)((headDim + 15) / 16);
-            uint gridKVY = (uint)((seqK + 3) / 4);
-            uint gridKVZ = (uint)(batch * numHeads);
-            LaunchKernel3D(kernelKV, gridKVX, gridKVY, gridKVZ, 16, 4, 1, argsKV);
-            return;
-        }
-
-        var kernel = _kernelCache["flash_attention_backward"];
-        uint gridX = (uint)((seqQ + 31) / 32);
-        uint gridY = (uint)(batch * numHeads);
-
-        void** args = stackalloc void*[19];
-        args[0] = &goPtr;
-        args[1] = &qPtr;
-        args[2] = &kPtr;
-        args[3] = &vPtr;
-        args[4] = &oPtr;
-        args[5] = &sPtr;
-        args[6] = &gqPtr;
-        args[7] = &gkPtr;
-        args[8] = &gvPtr;
-        args[9] = &batch;
-        args[10] = &numHeads;
-        args[11] = &seqQ;
-        args[12] = &seqK;
-        args[13] = &headDim;
-        args[14] = &scale;
-        args[15] = &causalFlag;
-        args[16] = &biasPtr;
-        args[17] = &hasBias;
-        args[18] = &biasBatchStride;
-
-        uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
-        LaunchKernel2DWithSharedMem(kernel, gridX, gridY, 32, 1, sharedBytes, args);
+            FlashAttentionBackwardLaunch(
+                gradOutput, query, key, value,
+                output, softmaxStats, gradQuery, gradKey,
+                gradValue, batch, numHeads, seqQ,
+                seqK, headDim, scale, isCausal,
+                attentionBias, biasBatchStride);
     }
 
     /// <summary>
@@ -8374,14 +8280,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     /// backward. It bypasses direct-PTX routing while retaining the same stream,
     /// deterministic selection, launch geometry, and public tensor ABI.
     /// </summary>
-    internal unsafe void FlashAttentionBackwardCurrentInto(
+    private unsafe void FlashAttentionBackwardLaunch(
         IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer softmaxStats,
         IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
         int batch, int numHeads, int seqQ, int seqK, int headDim, float scale,
         bool isCausal, IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
+    
     {
-        using var _ = PushContext();
         int causalFlag = isCausal ? 1 : 0;
         int hasBias = attentionBias is not null ? 1 : 0;
         IntPtr biasPtr = attentionBias is not null ? attentionBias.Handle : IntPtr.Zero;
@@ -8472,6 +8378,21 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[18] = &biasBatchStride;
         uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
         LaunchKernel2DWithSharedMem(kernel, gridX, gridY, 32, 1, sharedBytes, args);
+    }
+
+    internal unsafe void FlashAttentionBackwardCurrentInto(
+        IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
+        IGpuBuffer output, IGpuBuffer softmaxStats,
+        IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale,
+        bool isCausal, IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
+    {
+            FlashAttentionBackwardLaunch(
+                gradOutput, query, key, value,
+                output, softmaxStats, gradQuery, gradKey,
+                gradValue, batch, numHeads, seqQ,
+                seqK, headDim, scale, isCausal,
+                attentionBias, biasBatchStride);
     }
 
     public unsafe void GroupedQueryAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
@@ -8533,88 +8454,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 batch, numQHeads, numKVHeads, seqQ, seqK, headDim, scale))
             return;
 #endif
-
-        IntPtr goPtr = gradOutput.Handle;
-        IntPtr qPtr = query.Handle;
-        IntPtr kPtr = key.Handle;
-        IntPtr vPtr = value.Handle;
-        IntPtr wPtr = attentionWeights.Handle;
-        IntPtr gqPtr = gradQuery.Handle;
-        IntPtr gkPtr = gradKey.Handle;
-        IntPtr gvPtr = gradValue.Handle;
-
-        if (GpuDeterminism.IsActive)
-        {
-            // Issue #382: split tiled GQA backward into gradq (per bqh, qi) and
-            // gradkv (per b, kvh, ki, d). No atomicAdd in either kernel.
-            var kqGqa = _kernelCache["grouped_query_attention_backward_gradq_deterministic"];
-            void** argsQg = stackalloc void*[14];
-            argsQg[0] = &goPtr;
-            argsQg[1] = &qPtr;
-            argsQg[2] = &kPtr;
-            argsQg[3] = &vPtr;
-            argsQg[4] = &wPtr;
-            argsQg[5] = &gqPtr;
-            argsQg[6] = &batch;
-            argsQg[7] = &numQHeads;
-            argsQg[8] = &numKVHeads;
-            argsQg[9] = &queriesPerKV;
-            argsQg[10] = &seqQ;
-            argsQg[11] = &seqK;
-            argsQg[12] = &headDim;
-            argsQg[13] = &scale;
-            uint gqX = (uint)((seqQ + 63) / 64);
-            uint gqY = (uint)(batch * numQHeads);
-            LaunchKernel2D(kqGqa, gqX, gqY, 64, 1, argsQg);
-
-            var kkvGqa = _kernelCache["grouped_query_attention_backward_gradkv_deterministic"];
-            void** argsKVg = stackalloc void*[15];
-            argsKVg[0] = &goPtr;
-            argsKVg[1] = &qPtr;
-            argsKVg[2] = &kPtr;
-            argsKVg[3] = &vPtr;
-            argsKVg[4] = &wPtr;
-            argsKVg[5] = &gkPtr;
-            argsKVg[6] = &gvPtr;
-            argsKVg[7] = &batch;
-            argsKVg[8] = &numQHeads;
-            argsKVg[9] = &numKVHeads;
-            argsKVg[10] = &queriesPerKV;
-            argsKVg[11] = &seqQ;
-            argsKVg[12] = &seqK;
-            argsKVg[13] = &headDim;
-            argsKVg[14] = &scale;
-            uint gkvX = (uint)((headDim + 15) / 16);
-            uint gkvY = (uint)((seqK + 3) / 4);
-            uint gkvZ = (uint)(batch * numKVHeads);
-            LaunchKernel3D(kkvGqa, gkvX, gkvY, gkvZ, 16, 4, 1, argsKVg);
-            return;
-        }
-
-        var kernel = _kernelCache["grouped_query_attention_backward"];
-        uint gridX = (uint)((seqQ + 31) / 32);
-        uint gridY = (uint)(batch * numQHeads);
-
-        void** args = stackalloc void*[16];
-        args[0] = &goPtr;
-        args[1] = &qPtr;
-        args[2] = &kPtr;
-        args[3] = &vPtr;
-        args[4] = &wPtr;
-        args[5] = &gqPtr;
-        args[6] = &gkPtr;
-        args[7] = &gvPtr;
-        args[8] = &batch;
-        args[9] = &numQHeads;
-        args[10] = &numKVHeads;
-        args[11] = &queriesPerKV;
-        args[12] = &seqQ;
-        args[13] = &seqK;
-        args[14] = &headDim;
-        args[15] = &scale;
-
-        uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
-        LaunchKernel2DWithSharedMem(kernel, gridX, gridY, 32, 1, sharedBytes, args);
+            GroupedQueryAttentionBackwardLaunch(
+                gradOutput, query, key, value,
+                attentionWeights, gradQuery, gradKey, gradValue,
+                batch, numQHeads, numKVHeads, seqQ,
+                seqK, headDim, scale, numQueriesPerKV);
     }
 
     /// <summary>
@@ -8622,14 +8466,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     /// It deliberately bypasses direct-PTX routing while preserving the exact
     /// public ABI, stream, determinism selection, and launch implementation.
     /// </summary>
-    internal unsafe void GroupedQueryAttentionBackwardCurrentInto(
+    private unsafe void GroupedQueryAttentionBackwardLaunch(
         IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer attentionWeights,
         IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
         int batch, int numQHeads, int numKVHeads, int seqQ, int seqK,
         int headDim, float scale, int numQueriesPerKV)
+    
     {
-        using var _ = PushContext();
         int queriesPerKV = numQueriesPerKV;
         IntPtr goPtr = gradOutput.Handle;
         IntPtr qPtr = query.Handle;
@@ -8708,6 +8552,20 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[15] = &scale;
         uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
         LaunchKernel2DWithSharedMem(kernel, gridX, gridY, 32, 1, sharedBytes, args);
+    }
+
+    internal unsafe void GroupedQueryAttentionBackwardCurrentInto(
+        IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
+        IGpuBuffer attentionWeights,
+        IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
+        int batch, int numQHeads, int numKVHeads, int seqQ, int seqK,
+        int headDim, float scale, int numQueriesPerKV)
+    {
+            GroupedQueryAttentionBackwardLaunch(
+                gradOutput, query, key, value,
+                attentionWeights, gradQuery, gradKey, gradValue,
+                batch, numQHeads, numKVHeads, seqQ,
+                seqK, headDim, scale, numQueriesPerKV);
     }
 
     #endregion
