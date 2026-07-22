@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -30,7 +29,7 @@ internal sealed class PtxFusedSwiGluF32Kernel : IDisposable
         int outerSize,
         int halfDimension)
     {
-        ArgumentNullException.ThrowIfNull(runtime);
+        PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         if (!DirectPtxArchitecture.HasValidatedGatedGlu(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
@@ -212,14 +211,13 @@ internal sealed class PtxFusedSwiGluF32Kernel : IDisposable
 
     private static bool Overlaps(DirectPtxTensorView left, DirectPtxTensorView right)
     {
-        nuint leftStart = (nuint)left.Pointer;
-        nuint rightStart = (nuint)right.Pointer;
+        nuint leftStart = PtxCompat.ToNuint(left.Pointer);
+        nuint rightStart = PtxCompat.ToNuint(right.Pointer);
         nuint leftEnd = checked(leftStart + left.ByteLength);
         nuint rightEnd = checked(rightStart + right.ByteLength);
         return leftStart < rightEnd && rightStart < leftEnd;
     }
 
     private static string FloatLiteral(float value) =>
-        "0f" + BitConverter.SingleToInt32Bits(value).ToString("X8", CultureInfo.InvariantCulture);
+        "0f" + PtxCompat.SingleToInt32Bits(value).ToString("X8", CultureInfo.InvariantCulture);
 }
-#endif

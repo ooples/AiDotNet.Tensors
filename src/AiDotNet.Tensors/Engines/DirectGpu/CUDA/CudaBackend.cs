@@ -2662,13 +2662,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             biasFloat.SizeInBytes < outputBytes || outputFloat.SizeInBytes < outputBytes)
             throw new ArgumentException(
                 "W8A8 fused-linear buffers are smaller than the requested canonical extents.");
-#if NET5_0_OR_GREATER
         if (TryDirectPtxFusedLinearGeluW8A8M1(
             inputInt8, outputMajorWeightsInt8, activationScaleFloat,
             weightScalesFloat, biasFloat, outputFloat,
             inputFeatures, outputFeatures))
             return;
-#endif
 
         if (!_kernelCache.TryGetValue("fused_linear_gelu_w8a8_m1", out var kernel))
             throw new InvalidOperationException(
@@ -3205,11 +3203,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             preNormBias.Size < 64 || gamma.Size < 64 || beta.Size < 64)
             throw new ArgumentException(
                 "Residual LayerNorm+GELU buffers are smaller than the requested canonical extents.");
-#if NET5_0_OR_GREATER
         if (TryDirectPtxFusedResidualBiasLayerNormGeluD64(
             input, residual, preNormBias, gamma, beta, output, rows, epsilon))
             return;
-#endif
 
         Add(input, residual, output, elements);
         BiasAdd(output, preNormBias, output, rows, 64);
@@ -9997,11 +9993,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             outputMajorWeight.Size < checked(inFeatures * outFeatures) ||
             bias.Size < outFeatures || output.Size < outFeatures)
             throw new ArgumentException("Fused-linear buffers are smaller than the requested canonical extents.");
-#if NET5_0_OR_GREATER
         if (TryDirectPtxFusedLinearGeluM1(
             input, outputMajorWeight, bias, output, inFeatures, outFeatures))
             return;
-#endif
         MatMulTransposed(input, outputMajorWeight, output, 1, outFeatures, inFeatures);
         BiasAdd(output, bias, output, 1, outFeatures);
         Gelu(output, output, outFeatures);
@@ -16775,18 +16769,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     }
     public void GeGluForward(IGpuBuffer input, IGpuBuffer output, int outerSize, int halfDim)
     {
-#if NET5_0_OR_GREATER
         if (TryDirectPtxGeGluForward(input, output, outerSize, halfDim))
             return;
-#endif
         LaunchGatedForward("geglu_forward", input, output, outerSize, halfDim);
     }
     public unsafe void GeGluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int outerSize, int halfDim)
     {
-#if NET5_0_OR_GREATER
         if (TryDirectPtxGeGluBackward(gradOutput, input, gradInput, outerSize, halfDim))
             return;
-#endif
         LaunchGatedBackward("geglu_backward", gradOutput, input, gradInput, outerSize, halfDim);
     }
     public void ReGluForward(IGpuBuffer input, IGpuBuffer output, int outerSize, int halfDim) =>
@@ -16794,10 +16784,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void ReGluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int outerSize, int halfDim) { LaunchGatedBackward("reglu_backward", gradOutput, input, gradInput, outerSize, halfDim); }
     public void SwiGluForward(IGpuBuffer input, IGpuBuffer output, int outerSize, int halfDim)
     {
-#if NET5_0_OR_GREATER
         if (TryDirectPtxSwiGluForward(input, output, outerSize, halfDim))
             return;
-#endif
         LaunchGatedForward("swiglu_forward", input, output, outerSize, halfDim);
     }
     public unsafe void SwiGluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int outerSize, int halfDim) { LaunchGatedBackward("swiglu_backward", gradOutput, input, gradInput, outerSize, halfDim); }

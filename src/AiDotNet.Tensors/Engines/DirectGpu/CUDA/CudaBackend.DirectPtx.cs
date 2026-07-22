@@ -123,7 +123,7 @@ public sealed partial class CudaBackend
 
     internal bool IsDirectPtxQuantizedLinearEnabled =>
         DirectPtxFeatureGate.IsQuantizedLinearEnabled && IsAvailable &&
-        DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) == DirectPtxArchitectureFamily.Ampere;
+        DirectPtxArchitecture.HasValidatedQuantizedLinear(_ccMajor, _ccMinor);
 
     internal long DirectPtxResidualRmsNormDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxResidualRmsNormDispatchCount);
@@ -2417,7 +2417,7 @@ public sealed partial class CudaBackend
         {
             bool capturing = IsStreamCapturing();
             EnsureContextCurrent();
-            var key = new DirectPtxResidualRmsNormKey(rows, BitConverter.SingleToInt32Bits(epsilon));
+            var key = new DirectPtxResidualRmsNormKey(rows, PtxCompat.SingleToInt32Bits(epsilon));
             lock (_directPtxLock)
             {
                 if (!_directPtxResidualLayerNormGeluKernels.TryGetValue(
@@ -2461,7 +2461,7 @@ public sealed partial class CudaBackend
         CreateAndCacheResidualLayerNormGeluKernelSlow(DirectPtxResidualRmsNormKey key) =>
         _directPtxResidualLayerNormGeluKernels.GetOrAdd(key, () =>
             new PtxFusedResidualBiasLayerNormGeluD64Kernel(
-                _directPtxRuntime!, key.Rows, BitConverter.Int32BitsToSingle(key.EpsilonBits)));
+                _directPtxRuntime!, key.Rows, PtxCompat.Int32BitsToSingle(key.EpsilonBits)));
 
     internal bool PrewarmDirectPtxFusedResidualBiasLayerNormGeluD64(
         int rows,
@@ -2506,7 +2506,7 @@ public sealed partial class CudaBackend
             {
                 _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                 var key = new DirectPtxResidualRmsNormKey(
-                    rows, BitConverter.SingleToInt32Bits(epsilon));
+                    rows, PtxCompat.SingleToInt32Bits(epsilon));
                 if (!_directPtxResidualLayerNormGeluKernels.TryGetValue(key, out _))
                     _ = CreateAndCacheResidualLayerNormGeluKernelSlow(key);
             }
@@ -2527,7 +2527,7 @@ public sealed partial class CudaBackend
     {
         lock (_directPtxLock)
         {
-            var key = new DirectPtxResidualRmsNormKey(rows, BitConverter.SingleToInt32Bits(epsilon));
+            var key = new DirectPtxResidualRmsNormKey(rows, PtxCompat.SingleToInt32Bits(epsilon));
             if (_directPtxResidualLayerNormGeluKernels.TryGetValue(key, out var kernel))
             {
                 audit = kernel.Audit;
