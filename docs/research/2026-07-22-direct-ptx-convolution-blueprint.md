@@ -184,3 +184,78 @@ Tensor-Core redesign. Evidence—not the existence of PTX—chooses the next ste
    cells.
 6. Apply the same contract/cache/evidence template independently to depthwise,
    transposed, deformable, locally connected, and 3D families.
+
+## ResNet-class evidence campaign (issue #841 promotion track)
+
+The golden-slice cells in `DirectPtxConvolutionCoverageManifest` establish the
+ABI, contracts, correctness, and fallback for every scoped family. They are
+GPU-correctness verified against a high-precision CPU oracle
+(`DirectPtxConvolutionTests` `DriverOnly*` facts) but **none is promoted**: they
+are registered `Deferred` in `PtxParityRegistry` pending competitive evidence.
+Promotion is decided only by the resident, apples-to-apples gate below.
+
+### Target regime and matrix
+
+"Bigger realistic shapes where cuDNN is strongest" (not dynamic-shape PTX —
+#841 forbids runtime shape branches — but realistic-size *exact* SM86
+specializations). The evidence matrix is the ResNet workhorse:
+
+| scope | N | C | H | W | K | kernel | stride | pad |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| resnet_3x3_c64_56 | 32 | 64 | 56 | 56 | 64 | 3 | 1 | 1 |
+| resnet_3x3_c128_28 | 16 | 128 | 28 | 28 | 128 | 3 | 1 | 1 |
+| resnet_3x3_c256_14 | 8 | 256 | 14 | 14 | 256 | 3 | 1 | 1 |
+| resnet_1x1_c64_56 | 32 | 64 | 56 | 56 | 64 | 1 | 1 | 0 |
+| resnet_1x1_c128_28 | 16 | 128 | 28 | 28 | 128 | 1 | 1 | 0 |
+| resnet_1x1_c256_14 | 8 | 256 | 14 | 14 | 256 | 1 | 1 | 0 |
+
+### Competitor bar (cuDNN at its best)
+
+`BaselineRunners/py/run_direct_ptx_convolution_resnet_competitors.py` measures
+the strongest compiled PyTorch/cuDNN lane per shape: per-shape algorithm
+autotuning (`cudnn.benchmark=True`), the autotuned kernel captured in a CUDA
+graph (strongest latency-bound lane), and a `torch.compile` lane. FP32/NCHW,
+TF32 off, for an apples-to-apples fp32-accumulation comparison. It emits per-shape
+JSON with the full environment fingerprint.
+
+### Harness and gate
+
+`--direct-ptx-convolution-resnet` (`DirectPtxConvolutionResnetExperiment`)
+benchmarks the established AiDotNet CUDA/cuDNN path and each verified direct-PTX
+specialization (median/p95/p99/mean, GFLOPS, managed bytes, max abs error vs the
+fp64 oracle), parses the competitor JSON, and prints a per-shape verdict:
+
+- **PASS** = candidate median <= strongest-competitor median / 1.10 **and**
+  candidate p95 <= competitor p95 * 1.10;
+- **HOLD** otherwise. A HOLD cell is never promoted; it stays experimental with
+  the measured numbers recorded, exactly as PR #863 handles losing cells.
+
+### Optimization strategy per op
+
+- **1x1 projection** = a `K x C` by `C x (N*H*W)` GEMM. v1 is a thread-per-output
+  channel dot; the promotion attempt stages the `K x C` weight block in shared
+  memory, tiles the `M = N*H*W` columns, uses `v4.f32` coalesced loads, and keeps
+  the tile accumulators in registers. It competes against cuBLASLt/implicit-GEMM.
+- **3x3 s1 p1** — cuDNN uses Winograd F(2x2,3x3)/F(4x4,3x3) or implicit-precomp
+  GEMM on Tensor Cores. The promotion attempt is shared-memory input-halo tiling
+  with register accumulation over the 9 taps and `C` channels, then a Winograd
+  F(2,3) transform stage if the direct tile does not clear the gate.
+
+### Honest expectation
+
+At these compute-bound shapes cuDNN's Winograd + Tensor-Core lanes are extremely
+strong; several cells are expected to HOLD, precisely as #863's normalization
+backward/reduction cells did. Wins are most likely in the resident, fused,
+latency-bound sub-regime where cuDNN's fixed launch/workspace overhead dominates.
+The deliverable is the strong-attempt kernels **plus the honest measured table**,
+never an overclaim; rejected optimization attempts are retained as evidence.
+
+### Reproduction (idle GPU required)
+
+```text
+# competitor bar
+python tests/AiDotNet.Tensors.Benchmarks/BaselineRunners/py/run_direct_ptx_convolution_resnet_competitors.py
+
+# candidate + gate (screening; promotion needs 3 clean processes)
+dotnet run -c Release --project tests/AiDotNet.Tensors.Benchmarks -- --direct-ptx-convolution-resnet
+```
