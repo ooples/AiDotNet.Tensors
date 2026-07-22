@@ -2038,6 +2038,15 @@ public class DirectPtxWmmaTests
             backend.Synchronize();
             Assert.True(allLaunched, backend.DirectPtxLastError);
             Assert.Equal(0, allocated);
+
+            long publicBefore = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < 32; i++)
+                backend.QkvProjectionRoPECacheD64(
+                    input, weights, bias, cosine, sine, query, keyCache, valueCache,
+                    heads, cacheCapacity, position);
+            long publicAllocated = GC.GetAllocatedBytesForCurrentThread() - publicBefore;
+            backend.Synchronize();
+            Assert.Equal(0, publicAllocated);
             AssertVectorClose(backend.DownloadBuffer(query), expectedQ, 2e-5f, "backend Q");
             AssertVectorClose(backend.DownloadBuffer(keyCache), expectedK, 2e-5f, "backend K cache");
             AssertVectorClose(backend.DownloadBuffer(valueCache), expectedV, 2e-5f, "backend V cache");
