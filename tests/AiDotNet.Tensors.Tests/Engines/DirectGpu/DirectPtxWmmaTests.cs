@@ -2248,6 +2248,10 @@ public class DirectPtxWmmaTests
         })
             Assert.Equal(DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx,
                 DirectPtxDenseLinearCoverageManifest.Get(api).Status);
+        // The public FusedLinear route is wired through the tiled kernel via a
+        // fail-closed backend guard.
+        Assert.Equal(DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxDenseLinearCoverageManifest.Get("DirectGpuTensorEngine.FusedLinear").Status);
         Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() =>
             DirectPtxDenseLinearCoverageManifest.Get("UnassignedDenseLinearApi"));
     }

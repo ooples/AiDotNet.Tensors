@@ -9735,6 +9735,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int batchSize, int inFeatures, int outFeatures)
     {
         if (batchSize <= 0 || inFeatures <= 0 || outFeatures <= 0) return;
+        // Fail-closed direct-PTX fast path (issue #836); returns false until GPU-promoted.
+        if (TryDirectPtxFusedLinearTiled(input, weight, bias, output,
+            batchSize, inFeatures, outFeatures, Ptx.DirectPtxLinearActivation.Relu)) return;
         if (!_kernelCache.TryGetValue("fused_linear_relu", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: fused_linear_relu");
         using var _ = PushContext();
@@ -9751,6 +9754,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int batchSize, int inFeatures, int outFeatures)
     {
         if (batchSize <= 0 || inFeatures <= 0 || outFeatures <= 0) return;
+        // Fail-closed direct-PTX fast path (issue #836); returns false until GPU-promoted.
+        if (TryDirectPtxFusedLinearTiled(input, weight, bias, output,
+            batchSize, inFeatures, outFeatures, Ptx.DirectPtxLinearActivation.Sigmoid)) return;
         if (!_kernelCache.TryGetValue("fused_linear_sigmoid", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: fused_linear_sigmoid");
         using var _ = PushContext();
@@ -9767,6 +9773,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int batchSize, int inFeatures, int outFeatures)
     {
         if (batchSize <= 0 || inFeatures <= 0 || outFeatures <= 0) return;
+        // Fail-closed direct-PTX fast path (issue #836); returns false until GPU-promoted.
+        if (TryDirectPtxFusedLinearTiled(input, weight, bias, output,
+            batchSize, inFeatures, outFeatures, Ptx.DirectPtxLinearActivation.Tanh)) return;
         if (!_kernelCache.TryGetValue("fused_linear_tanh", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: fused_linear_tanh");
         using var _ = PushContext();
@@ -9783,6 +9792,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int batchSize, int inFeatures, int outFeatures)
     {
         if (batchSize <= 0 || inFeatures <= 0 || outFeatures <= 0) return;
+        // Fail-closed direct-PTX fast path (issue #836); returns false until GPU-promoted.
+        if (TryDirectPtxFusedLinearTiled(input, weight, bias, output,
+            batchSize, inFeatures, outFeatures, Ptx.DirectPtxLinearActivation.GeluTanh)) return;
         if (!_kernelCache.TryGetValue("fused_linear_gelu", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: fused_linear_gelu");
         using var _ = PushContext();
