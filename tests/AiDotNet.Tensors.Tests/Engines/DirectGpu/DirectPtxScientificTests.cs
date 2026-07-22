@@ -24,11 +24,61 @@ public class DirectPtxScientificTests
             Assert.False(string.IsNullOrWhiteSpace(cell.DTypes));
             Assert.False(string.IsNullOrWhiteSpace(cell.DirectPtxAssignment));
         });
-        foreach (string api in new[] { "CudaBackend.ComplexMultiply", "CudaBackend.ComplexConjugate", "CudaBackend.ComplexMagnitude", "CudaBackend.OctonionAdd", "CudaBackend.OctonionMultiply", "CudaBackend.MobiusAdd", "CudaBackend.PoincareDistance", "CudaBackend.PoincareProject", "CudaBackend.PoincareExpMap" })
-            Assert.Equal(DirectPtxScientificCoverageStatus.ExperimentalDirectPtx,
-                DirectPtxScientificCoverageManifest.Get(api).Status);
+        // Every scoped op now has a direct-PTX owner.
+        Assert.DoesNotContain(DirectPtxScientificCoverageManifest.All,
+            c => c.Status == DirectPtxScientificCoverageStatus.PlannedDirectPtx);
         Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() =>
             DirectPtxScientificCoverageManifest.Get("UnassignedScientificApi"));
+    }
+
+    [Fact]
+    public void ComplexPhaseEmitter_IsMinimaxAtan2()
+    {
+        string ptx = PtxComplexPhaseKernel.EmitPtx(8, 6, 16384);
+        Assert.Contains(PtxComplexPhaseKernel.EntryPoint, ptx);
+        Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));   // re + im
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.Equal(2, Count(ptx, "abs.f32"));             // |re|, |im|
+        Assert.Contains("max.f32 %f4", ptx);
+        Assert.Contains("min.f32 %f5", ptx);
+        Assert.Equal(4, Count(ptx, "selp.f32"));            // quadrant + degenerate folding
+        Assert.Equal(0, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxComplexPhaseKernel.IsSupportedCount(16384));
+        Assert.False(PtxComplexPhaseKernel.IsPromotedCount(16384));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyComplexPhase_MatchesAtan2Oracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in complex-phase specialization is measured on GA10x/SM86.");
+        const int count = 16384;
+        using var kernel = new PtxComplexPhaseKernel(runtime, count);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20266700);
+        float[] re = Values(random, count, 2.0f);   // all four quadrants
+        float[] im = Values(random, count, 2.0f);
+        var expected = new float[count];
+        for (int i = 0; i < count; i++) expected[i] = (float)Math.Atan2(im[i], re[i]);
+
+        using var reBuf = runtime.AllocateBytes((nuint)(re.Length * sizeof(float)));
+        using var imBuf = runtime.AllocateBytes((nuint)(im.Length * sizeof(float)));
+        using var phaseBuf = runtime.AllocateBytes((nuint)(count * sizeof(float)));
+        reBuf.Upload<float>(re);
+        imBuf.Upload<float>(im);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(reBuf, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(imBuf, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(phaseBuf, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[count];
+        phaseBuf.Download<float>(actual);
+        AssertVectorClose(actual, expected, 2e-3f, "complex phase (atan2)");
     }
 
     [Fact]
