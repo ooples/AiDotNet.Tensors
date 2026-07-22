@@ -44,6 +44,8 @@ public sealed partial class CudaBackend
         _directPtxGraphGatherKernels = new(4);
     private readonly DirectPtxKernelCache<DirectPtxGraphScatterKey, PtxGraphScatterAddDeterministicVec4F32Kernel>
         _directPtxGraphScatterKernels = new(4);
+    private readonly DirectPtxKernelCache<DirectPtxGraphScatterKey, PtxGraphScatterAddAtomicF32Kernel>
+        _directPtxGraphScatterAtomicKernels = new(4);
     private readonly DirectPtxKernelCache<DirectPtxSegmentReduction, PtxSegmentReduceDeterministicVec4F32Kernel>
         _directPtxSegmentReduceKernels = new(4);
     private readonly DirectPtxKernelCache<DirectPtxCsrSegmentKey, PtxCsrSegmentReduceVec4F32Kernel>
@@ -872,6 +874,136 @@ public sealed partial class CudaBackend
                 var key = new DirectPtxGraphScatterKey(weighted);
                 _ = _directPtxGraphScatterKernels.GetOrAdd(
                     key, () => new PtxGraphScatterAddDeterministicVec4F32Kernel(
+                        _directPtxRuntime!, weighted));
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryDirectPtxGraphScatterAddAtomicF32(
+        IGpuBuffer input,
+        IGpuBuffer sourceIndices,
+        IGpuBuffer targetIndices,
+        IGpuBuffer? edgeWeights,
+        IGpuBuffer output,
+        int nodes,
+        int edges,
+        int features)
+    {
+        if (!IsDirectPtxSparseGraphEnabled ||
+            !PtxGraphScatterAddAtomicF32Kernel.SupportsShape(nodes, edges, features))
+        {
+            DirectPtxLastError = "graph-scatter-atomic-specialization-not-admitted";
+            return false;
+        }
+        if (input is null || sourceIndices is null || targetIndices is null || output is null)
+        {
+            DirectPtxLastError = "graph-scatter-atomic-null-buffer";
+            return false;
+        }
+        bool weighted = edgeWeights is not null;
+        if (input.SizeInBytes != (long)nodes * features * sizeof(float) ||
+            sourceIndices.SizeInBytes != (long)edges * sizeof(int) ||
+            targetIndices.SizeInBytes != (long)edges * sizeof(int) ||
+            (weighted && edgeWeights!.SizeInBytes != (long)edges * sizeof(float)) ||
+            output.SizeInBytes != (long)nodes * features * sizeof(float))
+        {
+            DirectPtxLastError = "graph-scatter-atomic-physical-extent-mismatch";
+            return false;
+        }
+        if (input.Handle == IntPtr.Zero || sourceIndices.Handle == IntPtr.Zero ||
+            targetIndices.Handle == IntPtr.Zero || output.Handle == IntPtr.Zero ||
+            (weighted && edgeWeights!.Handle == IntPtr.Zero))
+        {
+            DirectPtxLastError = "graph-scatter-atomic-invalid-device-pointer";
+            return false;
+        }
+        nuint pointers = (nuint)input.Handle | (nuint)sourceIndices.Handle |
+            (nuint)targetIndices.Handle | (nuint)output.Handle;
+        if (weighted) pointers |= (nuint)edgeWeights!.Handle;
+        if ((pointers & 15u) != 0)
+        {
+            DirectPtxLastError = "graph-scatter-atomic-alignment-mismatch";
+            return false;
+        }
+        if (DirectPtxBuffersOverlap(output, input) ||
+            DirectPtxBuffersOverlap(output, sourceIndices) ||
+            DirectPtxBuffersOverlap(output, targetIndices) ||
+            (weighted && DirectPtxBuffersOverlap(output, edgeWeights!)))
+        {
+            DirectPtxLastError = "graph-scatter-atomic-alias-not-supported";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var key = new DirectPtxGraphScatterKey(weighted);
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxGraphScatterAtomicKernels.TryGetValue(key, out _))
+                {
+                    DirectPtxLastError =
+                        "Direct PTX atomic graph scatter-add must be prewarmed before CUDA graph capture.";
+                    return false;
+                }
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxGraphScatterAddAtomicF32Kernel kernel =
+                    _directPtxGraphScatterAtomicKernels.GetOrAdd(
+                        key, () => new PtxGraphScatterAddAtomicF32Kernel(
+                            _directPtxRuntime!, weighted));
+                if (capturing && !_directPtxGraphScatterAtomicKernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX atomic graph scatter-add module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                {
+                    DirectPtxTensorView inputView =
+                        DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]);
+                    DirectPtxTensorView sourceView =
+                        DirectPtxTensorView.Create(sourceIndices, kernel.Blueprint.Tensors[1]);
+                    DirectPtxTensorView targetView =
+                        DirectPtxTensorView.Create(targetIndices, kernel.Blueprint.Tensors[2]);
+                    if (weighted)
+                        kernel.LaunchWeighted(
+                            inputView, sourceView, targetView,
+                            DirectPtxTensorView.Create(edgeWeights!, kernel.Blueprint.Tensors[3]),
+                            DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[4]));
+                    else
+                        kernel.Launch(
+                            inputView, sourceView, targetView,
+                            DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[3]));
+                }
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxGraphScatterDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool PrewarmDirectPtxGraphScatterAddAtomic(bool weighted)
+    {
+        if (!IsDirectPtxSparseGraphEnabled || IsStreamCapturing()) return false;
+        try
+        {
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                var key = new DirectPtxGraphScatterKey(weighted);
+                _ = _directPtxGraphScatterAtomicKernels.GetOrAdd(
+                    key, () => new PtxGraphScatterAddAtomicF32Kernel(
                         _directPtxRuntime!, weighted));
             }
             DirectPtxLastError = null;
@@ -3176,6 +3308,7 @@ public sealed partial class CudaBackend
             _directPtxCsrSpmmF64Kernels.Dispose();
             _directPtxGraphGatherKernels.Dispose();
             _directPtxGraphScatterKernels.Dispose();
+            _directPtxGraphScatterAtomicKernels.Dispose();
             _directPtxSegmentReduceKernels.Dispose();
             _directPtxCsrSegmentKernels.Dispose();
             _directPtxCsrBackwardKernels.Dispose();

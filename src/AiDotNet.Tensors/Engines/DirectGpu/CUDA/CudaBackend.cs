@@ -4112,6 +4112,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // First zero the output buffer
         ZeroBuffer(output, numNodes * features);
 
+#if NET5_0_OR_GREATER
+        if (!GpuDeterminism.IsActive &&
+            TryDirectPtxGraphScatterAddAtomicF32(
+                input, sourceIndices, targetIndices, edgeValues, output,
+                numNodes, numEdges, features))
+            return;
+#endif
+
         IntPtr inputPtr = input.Handle;
         IntPtr sourcePtr = sourceIndices.Handle;
         IntPtr targetPtr = targetIndices.Handle;

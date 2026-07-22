@@ -16,7 +16,7 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
             DirectPtxSparseGraphCompletionLedger.All
                 .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(25, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+        Assert.Equal(26, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
             entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
         Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
         Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
@@ -232,6 +232,27 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal("ascending-edge-index", blueprint.Semantics["reduction-order"]);
         Assert.Equal("fused-zero-register-initialization", blueprint.Semantics["output-initialization"]);
         Assert.Equal("single-overwrite", blueprint.Semantics["output-write"]);
+        Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void AtomicGraphScatterEmitter_BakesPointerOnlyAtomicAbi(bool weighted)
+    {
+        string ptx = PtxGraphScatterAddAtomicF32Kernel.EmitPtx(8, 6, weighted);
+        DirectPtxKernelBlueprint blueprint = PtxGraphScatterAddAtomicF32Kernel.CreateBlueprint(
+            DirectPtxArchitectureFamily.Ampere, weighted);
+
+        Assert.Contains(weighted
+            ? PtxGraphScatterAddAtomicF32Kernel.WeightedEntryPoint
+            : PtxGraphScatterAddAtomicF32Kernel.EntryPoint, ptx);
+        Assert.Equal(1, Count(ptx, "atom.global.add.f32"));
+        Assert.DoesNotContain("st.global", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.Equal(weighted ? 5 : 4, Count(ptx, ".param .u64"));
+        Assert.Equal("unordered-global-fp32-atomic", blueprint.Semantics["reduction-order"]);
+        Assert.Equal("zero-initialized-by-direct-ptx-fill", blueprint.Semantics["output-precondition"]);
         Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
     }
 
