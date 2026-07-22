@@ -167,6 +167,12 @@ internal enum DirectPtxPhysicalLayout
     CapsuleVectors,
     /// <summary>Contiguous capsule gradients [capsule,dimension].</summary>
     CapsuleGradients,
+    /// <summary>Sparse optimizer indices using the legacy bit-cast-or-integral-FP32 encoding.</summary>
+    SparseOptimizerFloatIndices,
+    /// <summary>Contiguous non-zero sparse optimizer gradients.</summary>
+    SparseOptimizerValues,
+    /// <summary>Contiguous mutable optimizer parameters or state.</summary>
+    SparseOptimizerState,
     /// <summary>Triangle vertex indices [face,three].</summary>
     TriangleFaces,
     /// <summary>Dense additive attention bias, [H,Sq,Skv] or [B,H,Sq,Skv].</summary>

@@ -79,7 +79,7 @@ internal static class DirectPtxSparseGraphCompletionLedger
             "mesh_pool_softmax_final_sum", "mesh_pool_softmax_normalize", "mesh_pool_softmax_scores",
             "mesh_pool_weighted_gather", "mesh_pool_weighted_backward",
             "mesh_pool_weighted_backward_deterministic", "mesh_pool_scores_backward");
-        Add("CudaOptimizerKernels", DirectPtxSparseGraphCompletionStatus.MissingDirectPtx,
+        Add("CudaOptimizerKernels", DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx,
             "sparse_sgd_update", "sparse_sgd_momentum_update", "sparse_adam_update",
             "sparse_adamw_update", "sparse_rmsprop_update", "sparse_adagrad_update", "sparse_nag_update",
             "sparse_adadelta_update", "sparse_amsgrad_update", "sparse_adamax_update",

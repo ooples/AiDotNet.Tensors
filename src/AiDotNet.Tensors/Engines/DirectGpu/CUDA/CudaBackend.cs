@@ -13313,6 +13313,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
         if (nnz == 0) return;
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxSparseOptimizer(param, sparseIndices, sparseValues, null, null, null, nnz,
+            DirectPtxSparseOptimizerKey.Create(
+                DirectPtxSparseOptimizerOperation.Sgd, learningRate, weightDecay)))
+            return;
+#endif
         if (!_kernelCache.TryGetValue("sparse_sgd_update", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: sparse_sgd_update");
         using var _ = PushContext();
@@ -13333,6 +13339,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
         if (velocity is null) throw new ArgumentNullException(nameof(velocity));
         if (nnz == 0) return;
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxSparseOptimizer(param, sparseIndices, sparseValues, velocity, null, null, nnz,
+            DirectPtxSparseOptimizerKey.Create(
+                DirectPtxSparseOptimizerOperation.SgdMomentum,
+                learningRate, momentum, weightDecay)))
+            return;
+#endif
         if (!_kernelCache.TryGetValue("sparse_sgd_momentum_update", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: sparse_sgd_momentum_update");
         using var _ = PushContext();
@@ -13356,6 +13369,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (step < 1) throw new ArgumentOutOfRangeException(nameof(step));
         if (epsilon <= 0) throw new ArgumentOutOfRangeException(nameof(epsilon));
         if (nnz == 0) return;
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxSparseOptimizer(param, sparseIndices, sparseValues, m, v, null, nnz,
+            DirectPtxSparseOptimizerKey.Create(
+                DirectPtxSparseOptimizerOperation.Adam,
+                learningRate, beta1, beta2, epsilon, weightDecay, step)))
+            return;
+#endif
         if (!_kernelCache.TryGetValue("sparse_adam_update", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: sparse_adam_update");
         using var _ = PushContext();
@@ -13381,6 +13401,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (v is null) throw new ArgumentNullException(nameof(v));
         if (step < 1) throw new ArgumentOutOfRangeException(nameof(step));
         if (nnz == 0) return;
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxSparseOptimizer(param, sparseIndices, sparseValues, m, v, null, nnz,
+            DirectPtxSparseOptimizerKey.Create(
+                DirectPtxSparseOptimizerOperation.AdamW,
+                learningRate, beta1, beta2, epsilon, weightDecay, step)))
+            return;
+#endif
         if (!_kernelCache.TryGetValue("sparse_adamw_update", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: sparse_adamw_update");
         using var _ = PushContext();
@@ -13404,6 +13431,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
         if (squaredAvg is null) throw new ArgumentNullException(nameof(squaredAvg));
         if (nnz == 0) return;
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxSparseOptimizer(param, sparseIndices, sparseValues, squaredAvg, null, null, nnz,
+            DirectPtxSparseOptimizerKey.Create(
+                DirectPtxSparseOptimizerOperation.Rmsprop,
+                learningRate, rho, epsilon, weightDecay)))
+            return;
+#endif
         if (!_kernelCache.TryGetValue("sparse_rmsprop_update", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: sparse_rmsprop_update");
         using var _ = PushContext();
@@ -13424,6 +13458,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
         if (accumulatedGrad is null) throw new ArgumentNullException(nameof(accumulatedGrad));
         if (nnz == 0) return;
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxSparseOptimizer(param, sparseIndices, sparseValues, accumulatedGrad, null, null, nnz,
+            DirectPtxSparseOptimizerKey.Create(
+                DirectPtxSparseOptimizerOperation.Adagrad,
+                learningRate, epsilon, weightDecay)))
+            return;
+#endif
         if (!_kernelCache.TryGetValue("sparse_adagrad_update", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: sparse_adagrad_update");
         using var _ = PushContext();
@@ -13444,6 +13485,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
         if (velocity is null) throw new ArgumentNullException(nameof(velocity));
         if (nnz == 0) return;
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxSparseOptimizer(param, sparseIndices, sparseValues, velocity, null, null, nnz,
+            DirectPtxSparseOptimizerKey.Create(
+                DirectPtxSparseOptimizerOperation.Nag,
+                learningRate, momentum, weightDecay)))
+            return;
+#endif
         if (!_kernelCache.TryGetValue("sparse_nag_update", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: sparse_nag_update");
         using var _ = PushContext();
@@ -13465,6 +13513,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (accumGrad is null) throw new ArgumentNullException(nameof(accumGrad));
         if (accumUpdate is null) throw new ArgumentNullException(nameof(accumUpdate));
         if (nnz == 0) return;
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxSparseOptimizer(param, sparseIndices, sparseValues,
+            accumGrad, accumUpdate, null, nnz,
+            DirectPtxSparseOptimizerKey.Create(
+                DirectPtxSparseOptimizerOperation.Adadelta,
+                rho, epsilon, weightDecay)))
+            return;
+#endif
         if (!_kernelCache.TryGetValue("sparse_adadelta_update", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: sparse_adadelta_update");
         using var _ = PushContext();
@@ -13489,6 +13545,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (vMax is null) throw new ArgumentNullException(nameof(vMax));
         if (step < 1) throw new ArgumentOutOfRangeException(nameof(step));
         if (nnz == 0) return;
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxSparseOptimizer(param, sparseIndices, sparseValues, m, v, vMax, nnz,
+            DirectPtxSparseOptimizerKey.Create(
+                DirectPtxSparseOptimizerOperation.Amsgrad,
+                learningRate, beta1, beta2, epsilon, weightDecay, step)))
+            return;
+#endif
         if (!_kernelCache.TryGetValue("sparse_amsgrad_update", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: sparse_amsgrad_update");
         using var _ = PushContext();
@@ -13514,6 +13577,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (u is null) throw new ArgumentNullException(nameof(u));
         if (step < 1) throw new ArgumentOutOfRangeException(nameof(step));
         if (nnz == 0) return;
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxSparseOptimizer(param, sparseIndices, sparseValues, m, u, null, nnz,
+            DirectPtxSparseOptimizerKey.Create(
+                DirectPtxSparseOptimizerOperation.Adamax,
+                learningRate, beta1, beta2, epsilon, weightDecay, step)))
+            return;
+#endif
         if (!_kernelCache.TryGetValue("sparse_adamax_update", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: sparse_adamax_update");
         using var _ = PushContext();
@@ -13537,6 +13607,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
         if (m is null) throw new ArgumentNullException(nameof(m));
         if (nnz == 0) return;
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxSparseOptimizer(param, sparseIndices, sparseValues, m, null, null, nnz,
+            DirectPtxSparseOptimizerKey.Create(
+                DirectPtxSparseOptimizerOperation.Lion,
+                learningRate, beta1, beta2, weightDecay)))
+            return;
+#endif
         if (!_kernelCache.TryGetValue("sparse_lion_update", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: sparse_lion_update");
         using var _ = PushContext();
@@ -13559,6 +13636,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (v is null) throw new ArgumentNullException(nameof(v));
         if (step < 1) throw new ArgumentOutOfRangeException(nameof(step));
         if (nnz == 0) return;
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxSparseOptimizer(param, sparseIndices, sparseValues, m, v, null, nnz,
+            DirectPtxSparseOptimizerKey.Create(
+                DirectPtxSparseOptimizerOperation.Nadam,
+                learningRate, beta1, beta2, epsilon, weightDecay, step)))
+            return;
+#endif
         if (!_kernelCache.TryGetValue("sparse_nadam_update", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: sparse_nadam_update");
         using var _ = PushContext();
@@ -13583,6 +13667,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (z is null) throw new ArgumentNullException(nameof(z));
         if (n is null) throw new ArgumentNullException(nameof(n));
         if (nnz == 0) return;
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxSparseOptimizer(param, sparseIndices, sparseValues, z, n, null, nnz,
+            DirectPtxSparseOptimizerKey.Create(
+                DirectPtxSparseOptimizerOperation.Ftrl,
+                learningRate, l1Reg, l2Reg, beta)))
+            return;
+#endif
         if (!_kernelCache.TryGetValue("sparse_ftrl_update", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: sparse_ftrl_update");
         using var _ = PushContext();
@@ -13604,6 +13695,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
         if (nnz == 0) return;
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxSparseOptimizer(param, sparseIndices, sparseValues, null, null, null, nnz,
+            DirectPtxSparseOptimizerKey.Create(
+                DirectPtxSparseOptimizerOperation.ProximalL1,
+                learningRate, l1Strength)))
+            return;
+#endif
         if (!_kernelCache.TryGetValue("sparse_proximal_l1_update", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: sparse_proximal_l1_update");
         using var _ = PushContext();

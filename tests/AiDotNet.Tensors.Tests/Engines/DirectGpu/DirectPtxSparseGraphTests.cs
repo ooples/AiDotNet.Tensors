@@ -16,7 +16,7 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
             DirectPtxSparseGraphCompletionLedger.All
                 .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(54, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+        Assert.Equal(68, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
             entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
         Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
         Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
@@ -631,6 +631,76 @@ public sealed class DirectPtxSparseGraphTests
     }
 
     [Theory]
+    [InlineData((int)DirectPtxSparseOptimizerOperation.Sgd, 3, 0)]
+    [InlineData((int)DirectPtxSparseOptimizerOperation.SgdMomentum, 4, 1)]
+    [InlineData((int)DirectPtxSparseOptimizerOperation.Adam, 5, 2)]
+    [InlineData((int)DirectPtxSparseOptimizerOperation.AdamW, 5, 2)]
+    [InlineData((int)DirectPtxSparseOptimizerOperation.Rmsprop, 4, 1)]
+    [InlineData((int)DirectPtxSparseOptimizerOperation.Adagrad, 4, 1)]
+    [InlineData((int)DirectPtxSparseOptimizerOperation.Nag, 4, 1)]
+    [InlineData((int)DirectPtxSparseOptimizerOperation.Adadelta, 5, 2)]
+    [InlineData((int)DirectPtxSparseOptimizerOperation.Amsgrad, 6, 3)]
+    [InlineData((int)DirectPtxSparseOptimizerOperation.Adamax, 5, 2)]
+    [InlineData((int)DirectPtxSparseOptimizerOperation.Lion, 4, 1)]
+    [InlineData((int)DirectPtxSparseOptimizerOperation.Nadam, 5, 2)]
+    [InlineData((int)DirectPtxSparseOptimizerOperation.Ftrl, 5, 2)]
+    [InlineData((int)DirectPtxSparseOptimizerOperation.ProximalL1, 3, 0)]
+    public void SparseOptimizerEmitter_BakesPointerOnlyExactAbi(
+        int operationValue,
+        int pointerCount,
+        int stateCount)
+    {
+        var operation = (DirectPtxSparseOptimizerOperation)operationValue;
+        DirectPtxSparseOptimizerKey key = CreateSparseOptimizerKey(operation);
+        string ptx = PtxSparseOptimizerF32Kernel.EmitPtx(8, 6, key);
+        DirectPtxKernelBlueprint blueprint = PtxSparseOptimizerF32Kernel.CreateBlueprint(
+            DirectPtxArchitectureFamily.Ampere, key);
+
+        Assert.Equal(pointerCount, Count(ptx, ".param .u64"));
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("ld.global.b32", ptx, StringComparison.Ordinal);
+        Assert.Contains("and.b32 %r5, %r3, 2139095040", ptx, StringComparison.Ordinal);
+        Assert.Contains("cvt.rzi.s32.f32", ptx, StringComparison.Ordinal);
+        Assert.Equal(3 + stateCount, blueprint.Tensors.Count);
+        Assert.Equal(1 + stateCount, Count(ptx, "st.global.f32"));
+        Assert.All(blueprint.Tensors, tensor =>
+        {
+            Assert.Equal(DirectPtxExtentMode.Exact, tensor.ExtentMode);
+            Assert.Equal(16, tensor.AlignmentBytes);
+        });
+        Assert.Equal(PtxSparseOptimizerF32Kernel.ParameterElements,
+            blueprint.Tensors[0].PhysicalExtent.ElementCount);
+        Assert.Equal(PtxSparseOptimizerF32Kernel.NonZeros,
+            blueprint.Tensors[1].PhysicalExtent.ElementCount);
+        Assert.Equal(DirectPtxPhysicalLayout.SparseOptimizerFloatIndices,
+            blueprint.Tensors[1].Layout);
+        Assert.Equal("pointers-only", blueprint.Semantics["kernel-parameters"]);
+        Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
+        Assert.Equal("0", blueprint.Semantics["intermediate-global-bytes"]);
+    }
+
+    [Fact]
+    public void SparseOptimizerAdmission_IsExactAndRejectsUnsafeScalarSpecializations()
+    {
+        Assert.True(PtxSparseOptimizerF32Kernel.SupportsShape(1_048_576, 16_384));
+        Assert.False(PtxSparseOptimizerF32Kernel.SupportsShape(1_048_575, 16_384));
+        Assert.False(PtxSparseOptimizerF32Kernel.SupportsShape(1_048_576, 8_192));
+        Assert.True(PtxSparseOptimizerF32Kernel.SupportsConfiguration(
+            CreateSparseOptimizerKey(DirectPtxSparseOptimizerOperation.Adam)));
+        Assert.False(PtxSparseOptimizerF32Kernel.SupportsConfiguration(
+            DirectPtxSparseOptimizerKey.Create(
+                DirectPtxSparseOptimizerOperation.Adam,
+                1e-3f, 1f, 0.999f, 1e-8f, 0, 1)));
+        Assert.False(PtxSparseOptimizerF32Kernel.SupportsConfiguration(
+            DirectPtxSparseOptimizerKey.Create(
+                DirectPtxSparseOptimizerOperation.Ftrl,
+                0, 0.1f, 0.1f, 1f)));
+    }
+
+    [Theory]
     [InlineData(8, 6, true)]
     [InlineData(8, 0, false)]
     [InlineData(8, 7, false)]
@@ -786,6 +856,33 @@ public sealed class DirectPtxSparseGraphTests
         }
         return output;
     }
+
+    private static DirectPtxSparseOptimizerKey CreateSparseOptimizerKey(
+        DirectPtxSparseOptimizerOperation operation) => operation switch
+    {
+        DirectPtxSparseOptimizerOperation.Sgd =>
+            DirectPtxSparseOptimizerKey.Create(operation, 1e-3f, 1e-4f),
+        DirectPtxSparseOptimizerOperation.SgdMomentum or DirectPtxSparseOptimizerOperation.Nag =>
+            DirectPtxSparseOptimizerKey.Create(operation, 1e-3f, 0.9f, 1e-4f),
+        DirectPtxSparseOptimizerOperation.Adam or DirectPtxSparseOptimizerOperation.AdamW or
+        DirectPtxSparseOptimizerOperation.Amsgrad or DirectPtxSparseOptimizerOperation.Adamax or
+        DirectPtxSparseOptimizerOperation.Nadam =>
+            DirectPtxSparseOptimizerKey.Create(
+                operation, 1e-3f, 0.9f, 0.999f, 1e-8f, 1e-4f, 7),
+        DirectPtxSparseOptimizerOperation.Rmsprop =>
+            DirectPtxSparseOptimizerKey.Create(operation, 1e-3f, 0.9f, 1e-8f, 1e-4f),
+        DirectPtxSparseOptimizerOperation.Adagrad =>
+            DirectPtxSparseOptimizerKey.Create(operation, 1e-3f, 1e-8f, 1e-4f),
+        DirectPtxSparseOptimizerOperation.Adadelta =>
+            DirectPtxSparseOptimizerKey.Create(operation, 0.9f, 1e-8f, 1e-4f),
+        DirectPtxSparseOptimizerOperation.Lion =>
+            DirectPtxSparseOptimizerKey.Create(operation, 1e-3f, 0.9f, 0.99f, 1e-4f),
+        DirectPtxSparseOptimizerOperation.Ftrl =>
+            DirectPtxSparseOptimizerKey.Create(operation, 1e-2f, 0.1f, 0.1f, 1f),
+        DirectPtxSparseOptimizerOperation.ProximalL1 =>
+            DirectPtxSparseOptimizerKey.Create(operation, 1e-3f, 0.1f),
+        _ => throw new ArgumentOutOfRangeException(nameof(operation))
+    };
 
     private static int Count(string source, string value) =>
         source.Split(value, StringSplitOptions.None).Length - 1;
