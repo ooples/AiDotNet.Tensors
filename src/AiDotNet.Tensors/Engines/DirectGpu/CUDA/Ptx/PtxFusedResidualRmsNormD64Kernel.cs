@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -39,9 +38,9 @@ internal sealed class PtxFusedResidualRmsNormD64Kernel : IDisposable
         float epsilon = 1e-5f,
         int warpsPerBlock = 4)
     {
-        ArgumentNullException.ThrowIfNull(runtime);
+        PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         if (rows <= 0 || rows > 65535) throw new ArgumentOutOfRangeException(nameof(rows));
-        if (!float.IsFinite(epsilon) || epsilon <= 0) throw new ArgumentOutOfRangeException(nameof(epsilon));
+        if (!PtxCompat.IsFinite(epsilon) || epsilon <= 0) throw new ArgumentOutOfRangeException(nameof(epsilon));
         if (warpsPerBlock is not (1 or 2 or 4 or 8))
             throw new ArgumentOutOfRangeException(nameof(warpsPerBlock));
         if (!DirectPtxArchitecture.HasValidatedOnlineAttention(
@@ -159,7 +158,7 @@ internal sealed class PtxFusedResidualRmsNormD64Kernel : IDisposable
         int rows = 1,
         int warpsPerBlock = 1)
     {
-        if (!float.IsFinite(epsilon) || epsilon <= 0) throw new ArgumentOutOfRangeException(nameof(epsilon));
+        if (!PtxCompat.IsFinite(epsilon) || epsilon <= 0) throw new ArgumentOutOfRangeException(nameof(epsilon));
         if (rows <= 0) throw new ArgumentOutOfRangeException(nameof(rows));
         if (warpsPerBlock is not (1 or 2 or 4 or 8))
             throw new ArgumentOutOfRangeException(nameof(warpsPerBlock));
@@ -240,6 +239,5 @@ internal sealed class PtxFusedResidualRmsNormD64Kernel : IDisposable
     }
 
     private static string FloatLiteral(float value) =>
-        "0f" + BitConverter.SingleToInt32Bits(value).ToString("X8", CultureInfo.InvariantCulture);
+        "0f" + PtxCompat.SingleToInt32Bits(value).ToString("X8", CultureInfo.InvariantCulture);
 }
-#endif

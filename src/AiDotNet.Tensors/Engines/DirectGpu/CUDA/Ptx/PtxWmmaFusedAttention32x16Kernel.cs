@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Globalization;
 using System.Text;
@@ -38,7 +37,7 @@ internal sealed class PtxWmmaFusedAttention32x16Kernel : IDisposable
     {
         _runtime = runtime ?? throw new ArgumentNullException(nameof(runtime));
         if (batchHeads <= 0 || batchHeads > 65535) throw new ArgumentOutOfRangeException(nameof(batchHeads));
-        if (!float.IsFinite(scale)) throw new ArgumentOutOfRangeException(nameof(scale));
+        if (!PtxCompat.IsFinite(scale)) throw new ArgumentOutOfRangeException(nameof(scale));
         if (runtime.ComputeCapabilityMajor < 7)
             throw new NotSupportedException("WMMA Tensor Core PTX requires compute capability 7.0 or newer.");
 
@@ -53,10 +52,10 @@ internal sealed class PtxWmmaFusedAttention32x16Kernel : IDisposable
     internal unsafe void Launch(
         DirectPtxBuffer query, DirectPtxBuffer key, DirectPtxBuffer value, DirectPtxBuffer output)
     {
-        ArgumentNullException.ThrowIfNull(query);
-        ArgumentNullException.ThrowIfNull(key);
-        ArgumentNullException.ThrowIfNull(value);
-        ArgumentNullException.ThrowIfNull(output);
+        PtxCompat.ThrowIfNull(query, nameof(query));
+        PtxCompat.ThrowIfNull(key, nameof(key));
+        PtxCompat.ThrowIfNull(value, nameof(value));
+        PtxCompat.ThrowIfNull(output, nameof(output));
         if (query.ByteLength < QBytes || key.ByteLength < KBytes ||
             value.ByteLength < VBytes || output.ByteLength < OutputBytes)
             throw new ArgumentException("A fused-attention buffer is smaller than the specialized shape.");
@@ -314,6 +313,5 @@ internal sealed class PtxWmmaFusedAttention32x16Kernel : IDisposable
     }
 
     private static string FloatLiteral(float value) =>
-        "0f" + BitConverter.SingleToInt32Bits(value).ToString("X8", CultureInfo.InvariantCulture);
+        "0f" + PtxCompat.SingleToInt32Bits(value).ToString("X8", CultureInfo.InvariantCulture);
 }
-#endif

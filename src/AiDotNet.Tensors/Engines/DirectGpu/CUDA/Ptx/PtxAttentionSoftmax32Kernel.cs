@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Text;
 
@@ -47,8 +46,8 @@ internal sealed class PtxAttentionSoftmax32Kernel : IDisposable
 
     internal unsafe void Launch(DirectPtxBuffer scores, DirectPtxBuffer probabilities)
     {
-        ArgumentNullException.ThrowIfNull(scores);
-        ArgumentNullException.ThrowIfNull(probabilities);
+        PtxCompat.ThrowIfNull(scores, nameof(scores));
+        PtxCompat.ThrowIfNull(probabilities, nameof(probabilities));
         if (scores.ByteLength < ScoreBytes || probabilities.ByteLength < ProbabilityBytes)
             throw new ArgumentException("A softmax buffer is smaller than the specialized shape.");
 
@@ -155,4 +154,3 @@ internal sealed class PtxAttentionSoftmax32Kernel : IDisposable
         }
     }
 }
-#endif

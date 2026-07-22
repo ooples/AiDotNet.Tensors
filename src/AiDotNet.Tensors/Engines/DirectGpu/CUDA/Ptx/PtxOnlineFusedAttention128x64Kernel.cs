@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Globalization;
 using System.Text;
@@ -95,7 +94,7 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
         int? warpsPerBlock = null,
         int causalQueryOffset = 0)
     {
-        ArgumentNullException.ThrowIfNull(runtime);
+        PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         if (batch <= 0) throw new ArgumentOutOfRangeException(nameof(batch));
         if (queryHeads <= 0) throw new ArgumentOutOfRangeException(nameof(queryHeads));
         if (keyValueHeads <= 0 || queryHeads % keyValueHeads != 0)
@@ -103,8 +102,8 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
                 nameof(keyValueHeads), "Query heads must be evenly divisible by positive KV heads.");
         if (checked((long)batch * queryHeads) > 65535)
             throw new ArgumentOutOfRangeException(nameof(queryHeads), "The flattened query-head grid exceeds CUDA grid-y.");
-        if (!float.IsFinite(scale)) throw new ArgumentOutOfRangeException(nameof(scale));
-        if (!float.IsFinite(epsilon) || epsilon <= 0) throw new ArgumentOutOfRangeException(nameof(epsilon));
+        if (!PtxCompat.IsFinite(scale)) throw new ArgumentOutOfRangeException(nameof(scale));
+        if (!PtxCompat.IsFinite(epsilon) || epsilon <= 0) throw new ArgumentOutOfRangeException(nameof(epsilon));
         if (causalQueryOffset < -querySequence)
             throw new ArgumentOutOfRangeException(
                 nameof(causalQueryOffset), "The causal offset cannot fully mask every query row.");
@@ -937,6 +936,5 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
     }
 
     private static string FloatLiteral(float value) =>
-        "0f" + BitConverter.SingleToInt32Bits(value).ToString("X8", CultureInfo.InvariantCulture);
+        "0f" + PtxCompat.SingleToInt32Bits(value).ToString("X8", CultureInfo.InvariantCulture);
 }
-#endif
