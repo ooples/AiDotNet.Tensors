@@ -4,6 +4,7 @@ using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 using AiDotNet.Tensors.Engines.Gpu;
+using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
@@ -73,7 +74,7 @@ internal static class DirectPtxFusedLinearExperiment
 
     private static void RunCell(CudaBackend backend, CuBlasLtMatmul cublasLt, int run, Shape shape)
     {
-        var random = new Random(20261400 + run * 10_000 + shape.K + shape.N);
+        var random = RandomHelper.CreateSeededRandom(20261400 + run * 10_000 + shape.K + shape.N);
         float[] inputHost = Values(random, shape.K, 0.125f);
         float[] inputMajorWeightHost = Values(random, shape.K * shape.N, 0.0625f);
         float[] outputMajorWeightHost = TransposeWeights(
@@ -343,7 +344,7 @@ internal static class DirectPtxFusedLinearExperiment
             $"\"median_us\":{device.Median.ToString("R", c)}," +
             $"\"p95_us\":{device.P95.ToString("R", c)}," +
             $"\"managed_bytes\":{allocation},\"temp_bytes\":{temporaryBytes}," +
-            $"\"max_error\":{error.ToString("R", c)},\"local_bytes\":{local}" +
+            $"\"max_error\":{error.ToString("R", c)},\"tolerance\":2e-4,\"local_bytes\":{local}" +
             "}");
     }
 
