@@ -1816,6 +1816,89 @@ public sealed class DirectPtxConvolutionTests
         Assert.Equal(0f, maxAbsoluteError);
     }
 
+    [Fact]
+    public void DepthwiseConv1DBackwardInputEmitter_IsPerChannelHaloPredicatedSm86Ptx()
+    {
+        string ptx = PtxDepthwiseConv1DNcl3BackwardInputF32Kernel.EmitPtx(8, 6);
+
+        Assert.Contains(".target sm_86", ptx, StringComparison.Ordinal);
+        Assert.Contains(PtxDepthwiseConv1DNcl3BackwardInputF32Kernel.EntryPoint, ptx, StringComparison.Ordinal);
+        Assert.Equal(3, Count(ptx, ".param .u64"));
+        Assert.Equal(3, Count(ptx, "fma.rn.f32"));
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.DoesNotContain("bra", ptx, StringComparison.Ordinal);
+        // Negated read offset: k=0 reads dOut[l+1] guarded by p1, k=2 reads dOut[l-1] by p0.
+        Assert.Equal(1, Count(ptx, "@%p1 ld.global.nc.f32"));
+        Assert.Equal(1, Count(ptx, "@%p0 ld.global.nc.f32"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.Throws<NotSupportedException>(() =>
+            PtxDepthwiseConv1DNcl3BackwardInputF32Kernel.EmitPtx(8, 9));
+    }
+
+    [Fact]
+    public void DepthwiseConv1DBackwardInputManifestCell_IsExperimentalWithDedicatedRoute()
+    {
+        Assert.Equal(DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxConvolutionCoverageManifest.Get("IEngine.DepthwiseConv1DBackwardInput").Status);
+        Assert.Equal(DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxConvolutionCoverageManifest
+                .Get("CudaBackend.TryDirectPtxDepthwiseConv1DBackwardInput").Status);
+    }
+
+    [SkippableFact]
+    public void DriverOnlyDepthwiseConv1DBackwardInput_MatchesCpuReference()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "Requires the experimental SM86 convolution specialization.");
+
+        const int channels = PtxDepthwiseConv1DNcl3BackwardInputF32Kernel.Channels;
+        const int length = PtxDepthwiseConv1DNcl3BackwardInputF32Kernel.Length;
+        const int kernelSize = PtxDepthwiseConv1DNcl3BackwardInputF32Kernel.KernelSize;
+
+        using var kernel = new PtxDepthwiseConv1DNcl3BackwardInputF32Kernel(runtime);
+        using var gradOutDevice = runtime.AllocateBytes((nuint)PtxDepthwiseConv1DNcl3BackwardInputF32Kernel.GradOutputBytes);
+        using var weightDevice = runtime.AllocateBytes((nuint)PtxDepthwiseConv1DNcl3BackwardInputF32Kernel.WeightBytes);
+        using var gradInDevice = runtime.AllocateBytes((nuint)PtxDepthwiseConv1DNcl3BackwardInputF32Kernel.GradInputBytes);
+
+        Random random = AiDotNet.Tensors.Helpers.RandomHelper.CreateSecureRandom();
+        var gradOut = new float[channels * length];
+        for (int i = 0; i < gradOut.Length; i++) gradOut[i] = (float)(random.NextDouble() * 2 - 1);
+        var weights = new float[channels * kernelSize];
+        for (int i = 0; i < weights.Length; i++) weights[i] = (float)(random.NextDouble() * 2 - 1);
+        gradOutDevice.Upload<float>(gradOut);
+        weightDevice.Upload<float>(weights);
+
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(gradOutDevice, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(weightDevice, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(gradInDevice, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[channels * length];
+        gradInDevice.Download<float>(actual);
+
+        float maxAbsoluteError = 0;
+        for (int c = 0; c < channels; c++)
+        for (int l = 0; l < length; l++)
+        {
+            float expected = 0;
+            for (int k = 0; k < kernelSize; k++)
+            {
+                int ol = l + 1 - k;
+                if (ol < 0 || ol >= length) continue;
+                expected += weights[c * kernelSize + k] * gradOut[c * length + ol];
+            }
+            float got = actual[c * length + l];
+            maxAbsoluteError = MathF.Max(maxAbsoluteError, MathF.Abs(got - expected));
+        }
+
+        Assert.True(maxAbsoluteError <= 5e-5f,
+            $"DepthwiseConv1D backward-input max absolute error {maxAbsoluteError:G9}.");
+    }
+
     private static string? Validate(
         bool enabled, bool available, int major, int minor,
         DirectPtxConvolutionShape shape, IGpuBuffer? input, IGpuBuffer? weights,
