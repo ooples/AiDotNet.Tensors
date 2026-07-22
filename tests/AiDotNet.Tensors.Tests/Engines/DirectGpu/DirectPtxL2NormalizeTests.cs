@@ -1,9 +1,9 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Linq;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+using AiDotNet.Tensors.Tests.TestHelpers;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -33,7 +33,7 @@ public class DirectPtxL2NormalizeTests
         Assert.Equal(5, Count(ptx, "shfl.sync.bfly.b32"));
         Assert.Equal(1, Count(ptx, "rsqrt.approx.f32"));
         // eps = 1e-12 baked as an IEEE-754 single-precision literal.
-        string eps = "0f" + BitConverter.SingleToUInt32Bits(PtxFusedRowL2NormalizeF32Kernel.Epsilon)
+        string eps = "0f" + MathCompat.SingleToUInt32Bits(PtxFusedRowL2NormalizeF32Kernel.Epsilon)
             .ToString("X8", System.Globalization.CultureInfo.InvariantCulture);
         Assert.Contains(eps, ptx);
         Assert.Contains("ld.global.ca.v2.f32",
@@ -79,7 +79,7 @@ public class DirectPtxL2NormalizeTests
 
         int elements = rows * columns;
         var random = new Random(20260722);
-        float[] input = Enumerable.Range(0, elements).Select(_ => (random.NextSingle() * 2f - 1f) * 4f).ToArray();
+        float[] input = Enumerable.Range(0, elements).Select(_ => (float)((random.NextDouble() * 2.0 - 1.0) * 4.0)).ToArray();
         var expected = new float[elements];
         for (int row = 0; row < rows; row++)
         {
@@ -123,4 +123,3 @@ public class DirectPtxL2NormalizeTests
         return count;
     }
 }
-#endif

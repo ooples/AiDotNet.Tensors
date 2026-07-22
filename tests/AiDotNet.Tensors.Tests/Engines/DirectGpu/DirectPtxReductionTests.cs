@@ -1,10 +1,10 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Linq;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 using AiDotNet.Tensors.Helpers;
+using AiDotNet.Tensors.Tests.TestHelpers;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -82,7 +82,7 @@ public class DirectPtxReductionTests
         using var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
         var random = RandomHelper.CreateSeededRandom(20260722);
         float[] values = Enumerable.Range(0, elements)
-            .Select(_ => (random.NextSingle() * 2f - 1f) * 4f).ToArray();
+            .Select(_ => (float)((random.NextDouble() * 2.0 - 1.0) * 4.0)).ToArray();
         Array.Clear(values, 0, columns);
         for (int column = 0; column < columns; column++)
             values[columns + column] = (column & 1) == 0 ? 4f : -4f;
@@ -205,14 +205,22 @@ public class DirectPtxReductionTests
             AssertRowSumsClose(backend.DownloadBuffer(output), expected, "direct-ptx row-sum");
 
             // The resident dispatch path must not allocate managed memory.
+            // GC.GetAllocatedBytesForCurrentThread is net5+. On net471 the 32 dispatches
+            // still run and are asserted; only the allocation probe is unavailable.
+#if NET5_0_OR_GREATER
             long allocBefore = GC.GetAllocatedBytesForCurrentThread();
+#endif
             bool all = true;
             for (int i = 0; i < 32; i++)
                 all &= backend.TryDirectPtxRowSum(input, output, rows, columns);
+#if NET5_0_OR_GREATER
             long allocated = GC.GetAllocatedBytesForCurrentThread() - allocBefore;
+#endif
             backend.Synchronize();
             Assert.True(all, backend.DirectPtxLastError);
+#if NET5_0_OR_GREATER
             Assert.Equal(0, allocated);
+#endif
 
             // The public route selects the direct-PTX kernel and increments the counter.
             long publicBefore = backend.DirectPtxRowReduceDispatchCount;
@@ -339,7 +347,7 @@ public class DirectPtxReductionTests
         var random = RandomHelper.CreateSeededRandom(seed);
         var values = new float[rows * columns];
         for (int i = 0; i < values.Length; i++)
-            values[i] = (random.NextSingle() * 2f - 1f) * 4f;
+            values[i] = (float)((random.NextDouble() * 2.0 - 1.0) * 4.0);
         return values;
     }
 
@@ -379,4 +387,3 @@ public class DirectPtxReductionTests
         return count;
     }
 }
-#endif

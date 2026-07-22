@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 using System.Text;
@@ -42,7 +41,7 @@ internal sealed class PtxFusedRowL2NormalizeF32Kernel : IDisposable
         int columns,
         int blockThreads = DefaultBlockThreads)
     {
-        ArgumentNullException.ThrowIfNull(runtime);
+        PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         if (!DirectPtxArchitecture.HasValidatedRowReduction(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
@@ -99,7 +98,7 @@ internal sealed class PtxFusedRowL2NormalizeF32Kernel : IDisposable
         ValidateBlockThreads(rows, blockThreads);
         int warpsPerBlock = blockThreads / 32;
         int valuesPerLane = columns / 32;
-        string epsilonLiteral = "0f" + BitConverter.SingleToUInt32Bits(Epsilon).ToString("X8",
+        string epsilonLiteral = "0f" + PtxCompat.SingleToUInt32Bits(Epsilon).ToString("X8",
             System.Globalization.CultureInfo.InvariantCulture);
         var valueRegisterNames = new string[valuesPerLane];
         for (int i = 0; i < valuesPerLane; i++)
@@ -121,7 +120,8 @@ internal sealed class PtxFusedRowL2NormalizeF32Kernel : IDisposable
         ptx.AppendLine(")");
         ptx.AppendLine($".maxntid {blockThreads}, 1, 1");
         ptx.AppendLine("{");
-        ptx.AppendLine("    .reg .b32 %r<5>;");
+        // %r5/%r6 are the .b32 scratch pair the warp shuffle reinterprets through.
+        ptx.AppendLine("    .reg .b32 %r<7>;");
         ptx.AppendLine("    .reg .b64 %rd<8>;");
         ptx.AppendLine($"    .reg .f32 %f<{valuesPerLane + 3}>;");
         ptx.AppendLine("    ld.param.u64 %rd0, [input_ptr];");
@@ -141,10 +141,17 @@ internal sealed class PtxFusedRowL2NormalizeF32Kernel : IDisposable
         ptx.AppendLine($"    mov.f32 %f{accReg}, 0f00000000;");
         for (int i = 0; i < valuesPerLane; i++)
             ptx.AppendLine($"    fma.rn.f32 %f{accReg}, %f{i}, %f{i}, %f{accReg};");
+        // shfl.sync.bfly.b32 is a bit-manipulation instruction whose operands are
+        // .b32 registers, not .f32. Reinterpret the float accumulator through a
+        // .b32 register for the shuffle, then reinterpret the shuffled bits back
+        // to .f32 before the arithmetic add — the same ISA-correct idiom the
+        // row-reduce kernel uses, rather than relying on the assembler.
         foreach (int delta in new[] { 16, 8, 4, 2, 1 })
         {
+            ptx.AppendLine($"    mov.b32 %r5, %f{accReg};");
             ptx.AppendLine(
-                $"    shfl.sync.bfly.b32 %f{shuffleReg}, %f{accReg}, {delta}, 31, 0xffffffff;");
+                $"    shfl.sync.bfly.b32 %r6, %r5, {delta}, 31, 0xffffffff;");
+            ptx.AppendLine($"    mov.b32 %f{shuffleReg}, %r6;");
             ptx.AppendLine($"    add.rn.f32 %f{accReg}, %f{accReg}, %f{shuffleReg};");
         }
         ptx.AppendLine($"    add.rn.f32 %f{accReg}, %f{accReg}, {epsilonLiteral};");
@@ -242,11 +249,10 @@ internal sealed class PtxFusedRowL2NormalizeF32Kernel : IDisposable
 
     private static bool Overlaps(DirectPtxTensorView left, DirectPtxTensorView right)
     {
-        nuint leftStart = (nuint)left.Pointer;
-        nuint rightStart = (nuint)right.Pointer;
+        nuint leftStart = PtxCompat.ToNuint(left.Pointer);
+        nuint rightStart = PtxCompat.ToNuint(right.Pointer);
         nuint leftEnd = checked(leftStart + left.ByteLength);
         nuint rightEnd = checked(rightStart + right.ByteLength);
         return leftStart < rightEnd && rightStart < leftEnd;
     }
 }
-#endif

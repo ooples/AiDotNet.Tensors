@@ -75,7 +75,7 @@ internal readonly record struct DirectPtxReleaseGatePolicy(
             failures.Add($"temporary-device-bytes={candidate.TemporaryDeviceBytes}>{MaximumTemporaryDeviceBytes}");
         if (ErrorMetric == DirectPtxErrorMetric.Relative)
         {
-            if (!double.IsFinite(candidate.MaxRelativeError) ||
+            if (!PtxCompat.IsFinite(candidate.MaxRelativeError) ||
                 candidate.MaxRelativeError > MaximumRelativeError)
                 failures.Add(
                     $"max-rel-error={candidate.MaxRelativeError:G6}>{MaximumRelativeError:G6}");

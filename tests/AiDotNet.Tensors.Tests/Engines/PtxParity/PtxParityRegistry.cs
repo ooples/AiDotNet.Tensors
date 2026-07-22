@@ -47,6 +47,22 @@ public static class PtxParityRegistry
 {
     public static IReadOnlyList<PtxParitySpec> Specs { get; } = new[]
     {
+        new PtxParitySpec("PtxFusedRowReduceF32Kernel", PtxParityStatus.ThreeWayParity,
+            "row sum, fp32 (#843) — CudaBackend.SumAxis",
+            "runnable spec: DirectPtxReductionTests.BackendRowSum_ThreeWay_CudaAndPtxBothMatchCpuOracle. " +
+            "Leg 1 runs the op with the direct-PTX gate off and asserts the existing CUDA kernel matches " +
+            "the fp64-accumulated CPU oracle while the PTX dispatch counter stays put; leg 2 runs it with " +
+            "the gate on and asserts direct-PTX matches the same oracle while the counter advances, " +
+            "proving the PTX path actually fired; leg 3 cross-checks the two GPU paths. Driver-gated, so " +
+            "it skips off an SM86 CUDA machine."),
+
+        new PtxParitySpec("PtxFusedRowL2NormalizeF32Kernel", PtxParityStatus.Deferred,
+            "row L2 normalize, fp32 (#843) — CudaBackend.NormalizeL2",
+            "shares the reduction gate and has a public route, but unlike the row-sum kernel it has no " +
+            "gate-off/gate-on spec yet: its tests cover PTX-vs-CPU only, so the CUDA==CPU leg is unproven. " +
+            "Converts to ThreeWayParity by mirroring BackendRowSum_ThreeWay_CudaAndPtxBothMatchCpuOracle " +
+            "over NormalizeL2 with an rsqrt-aware tolerance."),
+
         new PtxParitySpec("PtxFusedResidualRmsNormD64Kernel", PtxParityStatus.Deferred,
             "fused residual + RMSNorm (D=64)",
             "backend method has no public op route on main (only the CUDA RmsNorm path is wired), " +
