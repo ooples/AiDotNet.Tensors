@@ -62,6 +62,8 @@ public sealed partial class CudaBackend
         _directPtxScatterRowsKernels = new(8);
     private readonly DirectPtxKernelCache<int, PtxScatterMaxRowsF32Kernel>
         _directPtxScatterMaxRowsKernels = new(1);
+    private readonly DirectPtxKernelCache<int, PtxNeuralScatterMaxF32Kernel>
+        _directPtxNeuralScatterMaxKernels = new(1);
     private readonly DirectPtxKernelCache<DirectPtxScatterBackwardRowsOperation, PtxScatterBackwardRowsF32Kernel>
         _directPtxScatterBackwardRowsKernels = new(4);
     private readonly DirectPtxKernelCache<DirectPtxCapsuleRoutingOperation, PtxCapsuleRoutingF32Kernel>
@@ -114,6 +116,7 @@ public sealed partial class CudaBackend
     private long _directPtxScalarScatterAddDispatchCount;
     private long _directPtxScatterRowsDispatchCount;
     private long _directPtxScatterMaxRowsDispatchCount;
+    private long _directPtxNeuralScatterMaxDispatchCount;
     private long _directPtxScatterBackwardRowsDispatchCount;
     private long _directPtxCapsuleRoutingDispatchCount;
     private long _directPtxCapsuleProjectionDispatchCount;
@@ -229,6 +232,8 @@ public sealed partial class CudaBackend
         System.Threading.Interlocked.Read(ref _directPtxScatterRowsDispatchCount);
     internal long DirectPtxScatterMaxRowsDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxScatterMaxRowsDispatchCount);
+    internal long DirectPtxNeuralScatterMaxDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxNeuralScatterMaxDispatchCount);
     internal long DirectPtxScatterBackwardRowsDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxScatterBackwardRowsDispatchCount);
     internal long DirectPtxCapsuleRoutingDispatchCount =>
@@ -2050,6 +2055,86 @@ public sealed partial class CudaBackend
                 _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                 _ = _directPtxScatterMaxRowsKernels.GetOrAdd(
                     0, () => new PtxScatterMaxRowsF32Kernel(_directPtxRuntime!));
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryDirectPtxNeuralScatterMax(
+        IGpuBuffer source,
+        IGpuBuffer indices,
+        IGpuBuffer output,
+        IGpuBuffer argmax,
+        int sourceRows,
+        int features,
+        int destinationRows)
+    {
+        if (!IsDirectPtxSparseGraphEnabled ||
+            !PtxNeuralScatterMaxF32Kernel.SupportsShape(
+                sourceRows, features, destinationRows) ||
+            !HasExactBytes(source, (long)sourceRows * features * sizeof(float)) ||
+            !HasExactBytes(indices, (long)sourceRows * sizeof(int)) ||
+            !HasExactBytes(output, (long)destinationRows * features * sizeof(float)) ||
+            !HasExactBytes(argmax, (long)destinationRows * features * sizeof(int)))
+            return false;
+        nuint pointers = (nuint)source.Handle | (nuint)indices.Handle |
+            (nuint)output.Handle | (nuint)argmax.Handle;
+        if (source.Handle == IntPtr.Zero || indices.Handle == IntPtr.Zero ||
+            output.Handle == IntPtr.Zero || argmax.Handle == IntPtr.Zero ||
+            (pointers & 15u) != 0 || DirectPtxBuffersOverlap(source, indices) ||
+            DirectPtxBuffersOverlap(output, source) || DirectPtxBuffersOverlap(output, indices) ||
+            DirectPtxBuffersOverlap(output, argmax) || DirectPtxBuffersOverlap(argmax, source) ||
+            DirectPtxBuffersOverlap(argmax, indices))
+            return false;
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            const int key = 0;
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxNeuralScatterMaxKernels.TryGetValue(key, out _))
+                    return false;
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxNeuralScatterMaxF32Kernel kernel =
+                    _directPtxNeuralScatterMaxKernels.GetOrAdd(
+                        key, () => new PtxNeuralScatterMaxF32Kernel(_directPtxRuntime!));
+                if (capturing && !_directPtxNeuralScatterMaxKernels.Pin(key)) return false;
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(source, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(indices, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[2]),
+                        DirectPtxTensorView.Create(argmax, kernel.Blueprint.Tensors[3]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxNeuralScatterMaxDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool PrewarmDirectPtxNeuralScatterMax()
+    {
+        if (!IsDirectPtxSparseGraphEnabled || IsStreamCapturing()) return false;
+        try
+        {
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _ = _directPtxNeuralScatterMaxKernels.GetOrAdd(
+                    0, () => new PtxNeuralScatterMaxF32Kernel(_directPtxRuntime!));
             }
             DirectPtxLastError = null;
             return true;
@@ -5193,6 +5278,7 @@ public sealed partial class CudaBackend
             _directPtxScalarScatterAddKernels.Dispose();
             _directPtxScatterRowsKernels.Dispose();
             _directPtxScatterMaxRowsKernels.Dispose();
+            _directPtxNeuralScatterMaxKernels.Dispose();
             _directPtxScatterBackwardRowsKernels.Dispose();
             _directPtxCapsuleRoutingKernels.Dispose();
             _directPtxCapsuleProjectionKernels.Dispose();

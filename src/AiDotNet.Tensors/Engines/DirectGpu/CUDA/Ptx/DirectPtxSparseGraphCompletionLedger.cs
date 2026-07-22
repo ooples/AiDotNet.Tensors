@@ -70,7 +70,7 @@ internal static class DirectPtxSparseGraphCompletionLedger
             "csr_segmented_max", "csr_segmented_min", "csr_segmented_stddev");
         Add("CudaSnnKernels", DirectPtxSparseGraphCompletionStatus.MissingDirectPtx,
             "sparse_2_4_matmul_mma_sp");
-        Add("CudaNeuralNetKernels", DirectPtxSparseGraphCompletionStatus.MissingDirectPtx,
+        Add("CudaNeuralNetKernels", DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx,
             "scatter_max");
         Add("CudaMeshPoolKernels", DirectPtxSparseGraphCompletionStatus.MissingDirectPtx,
             "mesh_pool_compute_scores", "mesh_pool_gather", "mesh_pool_backward",

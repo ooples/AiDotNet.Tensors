@@ -7753,8 +7753,16 @@ public partial class DirectGpuTensorEngine
             using var idxBuf = GetOrAllocateInt32IndexBuffer(backend, indices);
             using var outBuf = AllocateOutputBuffer(backend, outLen);
             using var argmaxBuf = AllocateOutputBuffer(backend, outLen);
-            indexBackend.ScatterMaxWithArgmaxRows(srcBuf.Buffer, idxBuf.Buffer,
-                outBuf.Buffer, argmaxBuf.Buffer, srcDimSize, innerSize, outDimSize);
+            bool directPtxHandled = false;
+#if NET5_0_OR_GREATER
+            directPtxHandled = backend is DirectGpu.CUDA.CudaBackend cudaBackend &&
+                cudaBackend.TryDirectPtxNeuralScatterMax(
+                    srcBuf.Buffer, idxBuf.Buffer, outBuf.Buffer, argmaxBuf.Buffer,
+                    srcDimSize, innerSize, outDimSize);
+#endif
+            if (!directPtxHandled)
+                indexBackend.ScatterMaxWithArgmaxRows(srcBuf.Buffer, idxBuf.Buffer,
+                    outBuf.Buffer, argmaxBuf.Buffer, srcDimSize, innerSize, outDimSize);
             var result = DeferTensorResult<T>(backend, outBuf.Buffer, outLen, outShape);
             outBuf.RelinquishOwnership();
             argmax = DeferTensorResult<int>(backend, argmaxBuf.Buffer, outLen, outShape);

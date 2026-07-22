@@ -16,7 +16,7 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
             DirectPtxSparseGraphCompletionLedger.All
                 .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(73, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+        Assert.Equal(74, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
             entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
         Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
         Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
@@ -878,6 +878,38 @@ public sealed class DirectPtxSparseGraphTests
         Assert.False(PtxTensorScatterHighLevelF32Kernel.SupportsShape(8_192, 64, 1_024));
         Assert.False(PtxTensorScatterHighLevelF32Kernel.SupportsShape(16_384, 32, 1_024));
         Assert.False(PtxTensorScatterHighLevelF32Kernel.SupportsShape(16_384, 64, 512));
+    }
+
+    [Fact]
+    public void NeuralScatterMaxEmitter_IsDeterministicAndWritesInt32Argmax()
+    {
+        string ptx = PtxNeuralScatterMaxF32Kernel.EmitPtx(8, 6);
+        DirectPtxKernelBlueprint blueprint =
+            PtxNeuralScatterMaxF32Kernel.CreateBlueprint(
+                DirectPtxArchitectureFamily.Ampere);
+
+        Assert.Contains(PtxNeuralScatterMaxF32Kernel.EntryPoint, ptx);
+        Assert.Equal(4, Count(ptx, ".param .u64"));
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("atom.", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.Contains("st.global.s32", ptx, StringComparison.Ordinal);
+        Assert.Equal(DirectPtxPhysicalType.Int32, blueprint.Tensors[3].PhysicalType);
+        Assert.Equal("lowest-source-row", blueprint.Semantics["tie-break"]);
+        Assert.Equal("single-overwrite", blueprint.Semantics["output-write"]);
+        Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
+        Assert.All(blueprint.Tensors, tensor =>
+            Assert.Equal(DirectPtxExtentMode.Exact, tensor.ExtentMode));
+    }
+
+    [Fact]
+    public void NeuralScatterMaxAdmission_IsExact()
+    {
+        Assert.True(PtxNeuralScatterMaxF32Kernel.SupportsShape(16_384, 64, 1_024));
+        Assert.False(PtxNeuralScatterMaxF32Kernel.SupportsShape(8_192, 64, 1_024));
+        Assert.False(PtxNeuralScatterMaxF32Kernel.SupportsShape(16_384, 32, 1_024));
+        Assert.False(PtxNeuralScatterMaxF32Kernel.SupportsShape(16_384, 64, 512));
     }
 
     [Theory]
