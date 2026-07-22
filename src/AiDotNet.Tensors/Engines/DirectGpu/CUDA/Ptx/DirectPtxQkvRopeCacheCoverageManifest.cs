@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 
@@ -95,11 +94,10 @@ internal static class DirectPtxQkvRopeCacheCoverageManifest
 
     internal static DirectPtxQkvRopeCacheCoverageCell Get(string api)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(api);
+        PtxCompat.ThrowIfNullOrWhiteSpace(api, nameof(api));
         foreach (DirectPtxQkvRopeCacheCoverageCell cell in All)
             if (string.Equals(cell.Api, api, StringComparison.Ordinal)) return cell;
         throw new KeyNotFoundException(
             $"QKV/RoPE/cache API '{api}' is not assigned in the #835 coverage manifest.");
     }
 }
-#endif
