@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Globalization;
 using System.Text;
@@ -38,7 +37,7 @@ internal sealed class PtxWmmaBatchedQkKernel : IDisposable
         if (n <= 0 || (n & 31) != 0) throw new ArgumentOutOfRangeException(nameof(n), "N must be a positive multiple of 32.");
         if (k <= 0 || (k & 15) != 0) throw new ArgumentOutOfRangeException(nameof(k), "K must be a positive multiple of 16.");
         if (batchCount <= 0 || batchCount > 65535) throw new ArgumentOutOfRangeException(nameof(batchCount));
-        if (!float.IsFinite(scale)) throw new ArgumentOutOfRangeException(nameof(scale));
+        if (!PtxCompat.IsFinite(scale)) throw new ArgumentOutOfRangeException(nameof(scale));
         if (runtime.ComputeCapabilityMajor < 7)
             throw new NotSupportedException("WMMA Tensor Core PTX requires compute capability 7.0 or newer.");
 
@@ -59,9 +58,9 @@ internal sealed class PtxWmmaBatchedQkKernel : IDisposable
 
     internal unsafe void Launch(DirectPtxBuffer a, DirectPtxBuffer b, DirectPtxBuffer c)
     {
-        ArgumentNullException.ThrowIfNull(a);
-        ArgumentNullException.ThrowIfNull(b);
-        ArgumentNullException.ThrowIfNull(c);
+        PtxCompat.ThrowIfNull(a, nameof(a));
+        PtxCompat.ThrowIfNull(b, nameof(b));
+        PtxCompat.ThrowIfNull(c, nameof(c));
         if (a.ByteLength < ABytes || b.ByteLength < BBytes || c.ByteLength < CBytes)
             throw new ArgumentException("A PTX kernel buffer is smaller than its specialized tensor shape.");
 
@@ -98,7 +97,7 @@ internal sealed class PtxWmmaBatchedQkKernel : IDisposable
         // Target the actual device family so the Driver
         // JIT produces architecture-specific SASS for this context.
         string target = $"sm_{ccMajor}{ccMinor}";
-        string scaleHex = "0f" + BitConverter.SingleToInt32Bits(scale).ToString("X8", CultureInfo.InvariantCulture);
+        string scaleHex = "0f" + PtxCompat.SingleToInt32Bits(scale).ToString("X8", CultureInfo.InvariantCulture);
         int aBatchBytes = checked(m * k * sizeof(ushort));
         int bBatchBytes = checked(n * k * sizeof(ushort));
         int cBatchBytes = checked(m * n * sizeof(float));
@@ -236,4 +235,3 @@ internal sealed class PtxWmmaBatchedQkKernel : IDisposable
         return ptx.ToString();
     }
 }
-#endif
