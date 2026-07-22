@@ -35,6 +35,98 @@ function Format-Command([string]$Command, [string[]]$Arguments) {
     return (@($Command) + $quoted) -join ' '
 }
 
+function Read-QkvDotnetRows([string]$Path) {
+    $prefix = 'qkv_evidence_json='
+    return @(Get-Content -LiteralPath $Path | Where-Object {
+        $_.StartsWith($prefix, [StringComparison]::Ordinal)
+    } | ForEach-Object {
+        $_.Substring($prefix.Length) | ConvertFrom-Json
+    })
+}
+
+function Read-QkvPythonRows([string]$Path) {
+    return @(Get-Content -LiteralPath $Path | Where-Object {
+        $_.TrimStart().StartsWith('{', [StringComparison]::Ordinal)
+    } | ForEach-Object { $_ | ConvertFrom-Json })
+}
+
+function Assert-QkvReleaseGate([string]$Root, [int]$RunCount, [bool]$IncludeExternal) {
+    $shapes = @('decode-h4', 'decode-h8', 'decode-h16')
+    $verdicts = [System.Collections.Generic.List[object]]::new()
+    for ($run = 1; $run -le $RunCount; $run++) {
+        $prefix = 'run-{0:D2}' -f $run
+        $dotnetPath = Join-Path $Root ($prefix + '-qkv-rope-cache.log')
+        $dotnetRows = @(Read-QkvDotnetRows $dotnetPath)
+        if ($dotnetRows.Count -ne 6) {
+            throw "QKV release gate expected 6 .NET rows in '$dotnetPath'; found $($dotnetRows.Count)."
+        }
+        $pythonRows = @()
+        if ($IncludeExternal) {
+            $pythonPath = Join-Path $Root ($prefix + '-qkv-rope-cache-pytorch.log')
+            $pythonRows = @(Read-QkvPythonRows $pythonPath | Where-Object { $_.status -eq 'ok' })
+            if ($pythonRows.Count -ne 6) {
+                throw "QKV release gate expected 6 PyTorch rows in '$pythonPath'; found $($pythonRows.Count)."
+            }
+        }
+
+        foreach ($shape in $shapes) {
+            $direct = @($dotnetRows | Where-Object {
+                $_.shape -eq $shape -and $_.method -eq 'Direct PTX fused'
+            })
+            $current = @($dotnetRows | Where-Object {
+                $_.shape -eq $shape -and $_.method -eq 'AiDotNet cuBLAS+NVRTC'
+            })
+            if ($direct.Count -ne 1 -or $current.Count -ne 1) {
+                throw "QKV release gate has an incomplete or duplicate .NET method set for run $run '$shape'."
+            }
+            $candidate = $direct[0]
+            if ([double]$candidate.max_error -gt 2e-5 -or
+                [long]$candidate.managed_bytes -ne 0 -or
+                [long]$candidate.temporary_device_bytes -ne 0 -or
+                [int]$candidate.registers_per_thread -gt 48 -or
+                [int]$candidate.static_shared_bytes -ne 0 -or
+                [int]$candidate.local_bytes_per_thread -ne 0 -or
+                [int]$candidate.active_blocks_per_sm -lt 8) {
+                throw "QKV release resource/correctness gate failed for run $run '$shape'."
+            }
+
+            $peers = @($current[0])
+            if ($IncludeExternal) {
+                $peers += @($pythonRows | Where-Object { $_.shape -eq $shape })
+            }
+            foreach ($peer in $peers) {
+                if ([double]$peer.max_error -gt 2e-5) {
+                    throw "QKV peer '$($peer.method)' exceeded the correctness tolerance for run $run '$shape'."
+                }
+                $deviceSpeedup = [double]$peer.device_median_us / [double]$candidate.device_median_us
+                $endToEndSpeedup = [double]$peer.e2e_median_us / [double]$candidate.e2e_median_us
+                $p95Ratio = [double]$candidate.device_p95_us / [double]$peer.device_p95_us
+                if ($deviceSpeedup -lt 1.10 -or $endToEndSpeedup -lt 1.10 -or $p95Ratio -gt 1.10) {
+                    throw "QKV championship gate failed for run $run '$shape' versus '$($peer.method)': device=$deviceSpeedup, E2E=$endToEndSpeedup, P95 ratio=$p95Ratio."
+                }
+                $verdicts.Add([ordered]@{
+                    run = $run
+                    shape = $shape
+                    competitor = $peer.method
+                    device_median_speedup = $deviceSpeedup
+                    e2e_median_speedup = $endToEndSpeedup
+                    device_p95_ratio = $p95Ratio
+                })
+            }
+        }
+    }
+    $gatePath = Join-Path $Root 'qkv-release-gate.json'
+    [ordered]@{
+        status = 'pass'
+        required_device_and_e2e_median_speedup = 1.10
+        maximum_device_p95_ratio = 1.10
+        maximum_error = 2e-5
+        runs = $RunCount
+        external_competitors_included = $IncludeExternal
+        verdicts = @($verdicts)
+    } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $gatePath -Encoding utf8
+}
+
 function Get-GpuSnapshot {
     $output = & nvidia-smi `
         '--query-gpu=name,uuid,driver_version,pstate,clocks.sm,clocks.mem,temperature.gpu,power.draw,power.limit,utilization.gpu,memory.used' `
@@ -247,7 +339,13 @@ try {
         $env:AIDOTNET_DIRECT_PTX_AUTOTUNE = $previousAutotune
     }
 
-    $files = Get-ChildItem -LiteralPath $evidenceRoot -Filter '*.log' | Sort-Object Name | ForEach-Object {
+    if (-not $Issue834Only) {
+        Assert-QkvReleaseGate $evidenceRoot $Runs (-not [bool]$SkipExternal)
+    }
+
+    $files = Get-ChildItem -LiteralPath $evidenceRoot -File | Where-Object {
+        $_.Extension -eq '.log' -or $_.Name -eq 'qkv-release-gate.json'
+    } | Sort-Object Name | ForEach-Object {
         $hash = Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256
         [ordered]@{ file = $_.Name; sha256 = $hash.Hash.ToLowerInvariant() }
     }

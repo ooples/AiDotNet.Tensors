@@ -310,6 +310,29 @@ internal static class DirectPtxQkvRopeCacheExperiment
             $"{endToEnd.Mean,9:F2} {endToEnd.Median,9:F2} {endToEnd.P95,9:F2} {endToEnd.P99,9:F2} " +
             $"{tflops,8:F3} {ManagedBytes(bytes),9} {temporaryBytes,11} " +
             $"{error,10:G4} {Dash(registers),5} {Dash(shared),7} {Dash(local),5} {Dash(occupancy),4}");
+        Console.WriteLine("qkv_evidence_json=" + JsonSerializer.Serialize(new
+        {
+            status = "ok",
+            run,
+            shape = shape.Name,
+            method,
+            device_mean_us = device.Mean,
+            device_median_us = device.Median,
+            device_p95_us = device.P95,
+            device_p99_us = device.P99,
+            e2e_mean_us = endToEnd.Mean,
+            e2e_median_us = endToEnd.Median,
+            e2e_p95_us = endToEnd.P95,
+            e2e_p99_us = endToEnd.P99,
+            tflops,
+            managed_bytes = bytes,
+            temporary_device_bytes = temporaryBytes,
+            max_error = error,
+            registers_per_thread = registers,
+            static_shared_bytes = shared,
+            local_bytes_per_thread = local,
+            active_blocks_per_sm = occupancy
+        }));
     }
 
     private static string ManagedBytes(long value) => value < 0 ? "n/a" : value.ToString();
