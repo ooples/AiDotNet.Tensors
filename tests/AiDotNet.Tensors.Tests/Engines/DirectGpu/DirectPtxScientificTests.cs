@@ -14,13 +14,14 @@ public class DirectPtxScientificTests
     [Fact]
     public void ScientificCoverageManifest_AssignsEveryScopedApiExactlyOnce()
     {
-        Assert.Equal(15, DirectPtxScientificCoverageManifest.All.Count);
+        Assert.Equal(16, DirectPtxScientificCoverageManifest.All.Count);
         string[] names = DirectPtxScientificCoverageManifest.All.Select(c => c.Api).ToArray();
         Assert.Contains("CudaBackend.RbfForward", names);
         Assert.Contains("CudaBackend.PairwiseDistance", names);
         Assert.Contains("CudaBackend.PairwiseDistanceSquared", names);
         Assert.Contains("CudaBackend.QuantumMeasurement", names);
         Assert.Contains("CudaBackend.ComplexMatVec", names);
+        Assert.Contains("CudaBackend.SphericalHarmonics", names);
         Assert.Equal(names.Length, names.Distinct(StringComparer.Ordinal).Count());
         Assert.All(DirectPtxScientificCoverageManifest.All, cell =>
         {
@@ -528,6 +529,101 @@ public class DirectPtxScientificTests
         outImag.Download<float>(actualImag);
         AssertVectorClose(actualReal, expReal, 3e-3f, "complex matvec real");
         AssertVectorClose(actualImag, expImag, 3e-3f, "complex matvec imag");
+    }
+
+    [Fact]
+    public void SphericalHarmonicsEmitter_IsRegisterResidentBasisDotProduct()
+    {
+        string ptx = PtxSphericalHarmonicsKernel.EmitPtx(8, 6, 256, 16, 3, 3, broadcastDir: false);
+        Assert.Contains(PtxSphericalHarmonicsKernel.EntryPoint, ptx);
+        Assert.Equal(3 + 16, Count(ptx, "ld.global.nc.f32"));   // 3 dir + 16 coeff loads
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.Equal(1, Count(ptx, "max.f32"));                 // clamp low
+        Assert.Equal(1, Count(ptx, "min.f32"));                 // clamp high
+        Assert.Contains("div.u32 %r3, %r2, 3", ptx);            // i = idx / numChannels
+        Assert.Contains("rem.u32 %r4, %r2, 3", ptx);            // ch = idx % numChannels
+        Assert.Contains("sqrt.rn.f32", ptx);                    // direction normalization
+        Assert.Equal(0, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxSphericalHarmonicsKernel.IsSupportedShape(256, 16, 3, 3));
+        Assert.False(PtxSphericalHarmonicsKernel.IsSupportedShape(256, 16, 3, 2));   // basisCount>(deg+1)^2
+        Assert.False(PtxSphericalHarmonicsKernel.IsSupportedShape(255, 16, 3, 3));   // count not multiple of 256
+        Assert.False(PtxSphericalHarmonicsKernel.IsPromotedShape(256, 16, 3, 3));
+    }
+
+    [SkippableTheory]
+    [InlineData(3, 16, false)]
+    [InlineData(2, 9, true)]
+    public void DriverOnlySphericalHarmonics_MatchesOracle(int degree, int basisCount, bool broadcast)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in spherical-harmonics specialization is measured on GA10x/SM86.");
+        const int numPoints = 256, numChannels = 4;   // count = 1024 (multiple of 256)
+        using var kernel = new PtxSphericalHarmonicsKernel(runtime, numPoints, basisCount, numChannels, degree, broadcast);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20267500);
+        int dirCount = broadcast ? 1 : numPoints;
+        float[] coeff = Values(random, numPoints * basisCount * numChannels, 0.5f);
+        float[] dirs = Values(random, dirCount * 3, 1.0f);
+        var expected = new float[numPoints * numChannels];
+        for (int i = 0; i < numPoints; i++)
+        {
+            int dirIdx = broadcast ? 0 : i;
+            float[] basis = ShBasisOracle(dirs[dirIdx * 3], dirs[dirIdx * 3 + 1], dirs[dirIdx * 3 + 2], degree);
+            for (int ch = 0; ch < numChannels; ch++)
+            {
+                double color = 0;
+                for (int b = 0; b < basisCount; b++)
+                    color += coeff[i * basisCount * numChannels + b * numChannels + ch] * basis[b];
+                expected[i * numChannels + ch] = (float)Math.Min(Math.Max(color, 0.0), 1.0);
+            }
+        }
+
+        using var coeffBuf = runtime.AllocateBytes((nuint)(coeff.Length * sizeof(float)));
+        using var dirBuf = runtime.AllocateBytes((nuint)(dirs.Length * sizeof(float)));
+        using var outBuf = runtime.AllocateBytes((nuint)(expected.Length * sizeof(float)));
+        coeffBuf.Upload<float>(coeff);
+        dirBuf.Upload<float>(dirs);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(coeffBuf, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(dirBuf, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(outBuf, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[expected.Length];
+        outBuf.Download<float>(actual);
+        AssertVectorClose(actual, expected, 3e-3f, "spherical harmonics");
+    }
+
+    // CPU mirror of the NVRTC spherical_harmonics basis table.
+    private static float[] ShBasisOracle(float dx, float dy, float dz, int degree)
+    {
+        float norm = (float)Math.Sqrt(dx * dx + dy * dy + dz * dz);
+        if (norm > 0.0f) { float inv = 1.0f / norm; dx *= inv; dy *= inv; dz *= inv; }
+        var b = new float[16];
+        b[0] = 0.282095f;
+        if (degree >= 1) { b[1] = 0.488603f * dy; b[2] = 0.488603f * dz; b[3] = 0.488603f * dx; }
+        if (degree >= 2)
+        {
+            b[4] = 1.092548f * dx * dy; b[5] = 1.092548f * dy * dz;
+            b[6] = 0.315392f * (3.0f * dz * dz - 1.0f);
+            b[7] = 1.092548f * dx * dz; b[8] = 0.546274f * (dx * dx - dy * dy);
+        }
+        if (degree >= 3)
+        {
+            b[9] = 0.590044f * dy * (3.0f * dx * dx - dy * dy);
+            b[10] = 2.890611f * dx * dy * dz;
+            b[11] = 0.457046f * dy * (5.0f * dz * dz - 1.0f);
+            b[12] = 0.373176f * dz * (5.0f * dz * dz - 3.0f);
+            b[13] = 0.457046f * dx * (5.0f * dz * dz - 1.0f);
+            b[14] = 1.445306f * dz * (dx * dx - dy * dy);
+            b[15] = 0.590044f * dx * (dx * dx - 3.0f * dy * dy);
+        }
+        return b;
     }
 
     [Fact]
@@ -1066,6 +1162,24 @@ public class DirectPtxScientificTests
                 AssertVectorClose(backend.DownloadBuffer(orb), cmvExpRe, 3e-3f, "complex-matvec real route");
                 AssertVectorClose(backend.DownloadBuffer(oib), cmvExpIm, 3e-3f, "complex-matvec imag route");
             }
+
+            // Spherical harmonics: degree 3, RGB channels. count = points*channels = 1024.
+            const int shPoints = 256, shBasis = 16, shChannels = 4, shDegree = 3;
+            float[] shCoeff = Values(random, shPoints * shBasis * shChannels, 0.5f);
+            float[] shDirs = Values(random, shPoints * 3, 1.0f);
+            var shExp = new float[shPoints * shChannels];
+            for (int i = 0; i < shPoints; i++)
+            {
+                float[] basis = ShBasisOracle(shDirs[i * 3], shDirs[i * 3 + 1], shDirs[i * 3 + 2], shDegree);
+                for (int ch = 0; ch < shChannels; ch++)
+                {
+                    double color = 0;
+                    for (int b = 0; b < shBasis; b++) color += shCoeff[i * shBasis * shChannels + b * shChannels + ch] * basis[b];
+                    shExp[i * shChannels + ch] = (float)Math.Min(Math.Max(color, 0.0), 1.0);
+                }
+            }
+            using (var cb = backend.AllocateBuffer(shCoeff)) using (var db = backend.AllocateBuffer(shDirs)) using (var o = backend.AllocateBuffer(shPoints * shChannels))
+            { backend.SphericalHarmonics(cb, db, o, shPoints, shBasis, shChannels, shDegree, 0); n = AssertDispatched(n, "spherical-harmonics"); AssertVectorClose(backend.DownloadBuffer(o), shExp, 3e-3f, "spherical-harmonics route"); }
         }
         finally
         {

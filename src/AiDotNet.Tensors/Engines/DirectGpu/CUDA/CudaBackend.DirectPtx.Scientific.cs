@@ -23,6 +23,7 @@ public sealed partial class CudaBackend
     private readonly record struct SciRbfKey(int Batch, int NumCenters, int InputDim);
     private readonly record struct SciPairwiseKey(int M, int N, int Dim, bool Squared);
     private readonly record struct SciMatVecKey(int Batch, int Dim);
+    private readonly record struct SciShKey(int NumPoints, int BasisCount, int NumChannels, int Degree, bool BroadcastDir);
 
     private readonly DirectPtxKernelCache<SciCountKey, PtxComplexMultiplyKernel> _sciComplexMul =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
@@ -51,6 +52,8 @@ public sealed partial class CudaBackend
     private readonly DirectPtxKernelCache<SciCountKey, PtxQuantumMeasurementKernel> _sciQuantumMeasure =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<SciMatVecKey, PtxComplexMatVecKernel> _sciComplexMatVec =
+        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<SciShKey, PtxSphericalHarmonicsKernel> _sciSphericalHarmonics =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
 
     private long _sciDispatchCount;
@@ -245,6 +248,27 @@ public sealed partial class CudaBackend
                 () => new PtxComplexMatVecKernel(_directPtxRuntime!, batchSize, dim));
             Launch6(k.Blueprint, matReal, matImag, vecReal, vecImag, outReal, outImag,
                 (mr, mi, vr, vi, or, oi) => k.Launch(mr, mi, vr, vi, or, oi));
+        });
+    }
+
+    internal bool TryDirectPtxSphericalHarmonics(
+        IGpuBuffer shCoefficients, IGpuBuffer viewDirections, IGpuBuffer output,
+        int numPoints, int basisCount, int numChannels, int degree, int broadcastDir)
+    {
+        bool broadcast = broadcastDir != 0;
+        if (!ScientificGateOpen ||
+            !PtxSphericalHarmonicsKernel.IsSupportedShape(numPoints, basisCount, numChannels, degree)) return Fail("spherical-harmonics");
+        long coeffBytes = checked((long)numPoints * basisCount * numChannels * sizeof(float));
+        long dirBytes = checked((long)(broadcast ? 1 : numPoints) * 3 * sizeof(float));
+        long outBytes = checked((long)numPoints * numChannels * sizeof(float));
+        if (shCoefficients.SizeInBytes != coeffBytes || viewDirections.SizeInBytes != dirBytes ||
+            output.SizeInBytes != outBytes) return Fail("spherical-harmonics-extent");
+        return SciDispatch(() =>
+        {
+            var k = _sciSphericalHarmonics.GetOrAdd(
+                new SciShKey(numPoints, basisCount, numChannels, degree, broadcast),
+                () => new PtxSphericalHarmonicsKernel(_directPtxRuntime!, numPoints, basisCount, numChannels, degree, broadcast));
+            Launch3(k.Blueprint, shCoefficients, viewDirections, output, (vc, vd, vo) => k.Launch(vc, vd, vo));
         });
     }
 
