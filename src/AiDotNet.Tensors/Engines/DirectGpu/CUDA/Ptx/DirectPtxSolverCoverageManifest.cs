@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 
@@ -132,10 +131,9 @@ internal static class DirectPtxSolverCoverageManifest
 
     internal static DirectPtxSolverCoverageCell Get(string api)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(api);
+        PtxCompat.ThrowIfNullOrWhiteSpace(api, nameof(api));
         foreach (DirectPtxSolverCoverageCell cell in All)
             if (string.Equals(cell.Api, api, StringComparison.Ordinal)) return cell;
         throw new KeyNotFoundException($"Solver API '{api}' is not assigned in the #853 coverage manifest.");
     }
 }
-#endif

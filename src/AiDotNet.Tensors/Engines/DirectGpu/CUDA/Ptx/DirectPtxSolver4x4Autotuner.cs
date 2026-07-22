@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
@@ -11,7 +10,7 @@ internal static class DirectPtxSolver4x4Autotuner
 
     internal static int Select(Func<int, float[]> measure)
     {
-        ArgumentNullException.ThrowIfNull(measure);
+        PtxCompat.ThrowIfNull(measure, nameof(measure));
         int best = DefaultBlockThreads;
         float bestMedian = float.PositiveInfinity;
         foreach (int candidate in Candidates)
@@ -32,4 +31,3 @@ internal static class DirectPtxSolver4x4Autotuner
                 "Solver autotune candidates are exactly 64, 128, and 256 threads.");
     }
 }
-#endif

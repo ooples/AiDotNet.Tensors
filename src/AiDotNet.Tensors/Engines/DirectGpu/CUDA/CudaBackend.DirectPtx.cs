@@ -182,8 +182,8 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "cholesky-4x4-invalid-device-pointer";
             return false;
         }
-        if ((((nuint)input.Handle | (nuint)output.Handle) & 15u) != 0 ||
-            ((nuint)info.Handle & 3u) != 0)
+        if (((PtxCompat.ToNuint(input.Handle) | PtxCompat.ToNuint(output.Handle)) & 15u) != 0 ||
+            (PtxCompat.ToNuint(info.Handle) & 3u) != 0)
         {
             DirectPtxLastError = "cholesky-4x4-alignment-mismatch";
             return false;
@@ -335,8 +335,8 @@ public sealed partial class CudaBackend
 
     private static bool DirectPtxRangesOverlap(IGpuBuffer left, IGpuBuffer right)
     {
-        nuint leftStart = (nuint)left.Handle;
-        nuint rightStart = (nuint)right.Handle;
+        nuint leftStart = PtxCompat.ToNuint(left.Handle);
+        nuint rightStart = PtxCompat.ToNuint(right.Handle);
         nuint leftEnd = checked(leftStart + (nuint)left.SizeInBytes);
         nuint rightEnd = checked(rightStart + (nuint)right.SizeInBytes);
         return leftStart < rightEnd && rightStart < leftEnd;

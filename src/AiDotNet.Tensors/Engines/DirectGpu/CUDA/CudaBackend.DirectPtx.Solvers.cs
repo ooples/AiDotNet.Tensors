@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
@@ -702,7 +701,8 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
     }
 
     private static bool ValidPointer(IGpuBuffer buffer, int alignment) =>
-        buffer.Handle != IntPtr.Zero && ((nuint)buffer.Handle & (nuint)(alignment - 1)) == 0;
+        buffer.Handle != IntPtr.Zero &&
+        (PtxCompat.ToNuint(buffer.Handle) & (nuint)(alignment - 1)) == 0;
 
     private static long MatrixBytes(int batchCount) => checked((long)batchCount * 16 * sizeof(float));
     private static long VectorBytes(int batchCount) => checked((long)batchCount * 4 * sizeof(float));
@@ -767,4 +767,3 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
         int BatchCount,
         int BlockThreads);
 }
-#endif
