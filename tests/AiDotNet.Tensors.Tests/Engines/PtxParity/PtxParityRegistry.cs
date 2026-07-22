@@ -47,9 +47,12 @@ public static class PtxParityRegistry
 {
     public static IReadOnlyList<PtxParitySpec> Specs { get; } = new[]
     {
-        new PtxParitySpec("PtxFusedResidualRmsNormD64Kernel", PtxParityStatus.ThreeWayParity,
-            "IEngine residual-RMSNorm (D=64)",
-            "First worked three-way spec: single tensor in/out, direct CPU fp64 oracle."),
+        new PtxParitySpec("PtxFusedResidualRmsNormD64Kernel", PtxParityStatus.Deferred,
+            "fused residual + RMSNorm (D=64)",
+            "backend method has no public op route on main (only the CUDA RmsNorm path is wired), " +
+            "and its opt-in is captured at backend construction with no call-time experiment override, " +
+            "so a toggle-based three-way spec is not yet possible. Wire a public route + experiment " +
+            "override first (mirroring softmax/reduction) to convert to ThreeWayParity."),
 
         new PtxParitySpec("PtxOnlineFusedAttention128x64Kernel", PtxParityStatus.Deferred,
             "online fused attention",
