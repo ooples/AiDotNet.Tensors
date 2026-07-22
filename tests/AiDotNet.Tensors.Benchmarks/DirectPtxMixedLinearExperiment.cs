@@ -358,6 +358,18 @@ internal static class DirectPtxMixedLinearExperiment
             $"{endToEnd.Mean,6:F2}/{endToEnd.Median,6:F2}/{endToEnd.P95,6:F2}/{endToEnd.P99,6:F2}   " +
             $"{tflops,6:F3} {tflops * 1_000.0,7:F1} {allocation,7} {temporaryBytes,4} {error,8:E1} " +
             $"{registers,2}/{shared,1}/{local,1}/{blocks,2}");
+        // Evidence key is (M, N): the shape set reuses K/N across M=1 and M=16,
+        // so (M, N) is the unique cell identity for run-direct-ptx-evidence.ps1.
+        var c = System.Globalization.CultureInfo.InvariantCulture;
+        Console.WriteLine(
+            "mixed_linear_evidence_json={" +
+            $"\"rows\":{shape.M},\"columns\":{shape.N}," +
+            $"\"method\":\"{method}\"," +
+            $"\"median_us\":{device.Median.ToString("R", c)}," +
+            $"\"p95_us\":{device.P95.ToString("R", c)}," +
+            $"\"managed_bytes\":{allocation},\"temp_bytes\":{temporaryBytes}," +
+            $"\"max_error\":{error.ToString("R", c)},\"local_bytes\":{local}" +
+            "}");
     }
 
     private static float[] Values(Random random, int count, float scale) =>
