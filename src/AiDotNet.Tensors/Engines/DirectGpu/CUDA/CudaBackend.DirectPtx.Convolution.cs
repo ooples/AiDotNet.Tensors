@@ -4553,4 +4553,151 @@ public sealed partial class CudaBackend
         return _directPtxLocallyConnectedConv2DBwdWeightKernels.GetOrAdd(
             1, () => new PtxLocallyConnectedConv2DNchw3x3BackwardWeightF32Kernel(runtime));
     }
+
+    private readonly DirectPtxKernelCache<int, PtxLocallyConnectedConv2DNchwBackwardBiasF32Kernel>
+        _directPtxLocallyConnectedConv2DBwdBiasKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private long _directPtxLocallyConnectedConv2DBwdBiasDispatchCount;
+
+    internal long DirectPtxLocallyConnectedConv2DBwdBiasDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxLocallyConnectedConv2DBwdBiasDispatchCount);
+
+    /// <summary>
+    /// Attempts the exact FP32 NCHW locally-connected backward-bias experiment (batch
+    /// reduction of the unshared per-position bias). Validated by byte extent. Fails
+    /// closed on any unsupported contract so the caller runs the established composition.
+    /// </summary>
+    internal bool TryDirectPtxLocallyConnectedConv2DBackwardBias(
+        IGpuBuffer gradOutput,
+        IGpuBuffer gradBias)
+    {
+        if (!_directPtxConvolutionOptedIn)
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.FeatureDisabled;
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.BackendUnavailable;
+            return false;
+        }
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.ArchitectureNotImplemented;
+            return false;
+        }
+        if (gradOutput is null || gradBias is null)
+        {
+            DirectPtxLastError = "localconn2d-bwd-bias-null-buffer";
+            return false;
+        }
+        if (gradOutput.SizeInBytes != PtxLocallyConnectedConv2DNchwBackwardBiasF32Kernel.GradOutputBytes ||
+            gradBias.SizeInBytes != PtxLocallyConnectedConv2DNchwBackwardBiasF32Kernel.GradBiasBytes)
+        {
+            DirectPtxLastError = "localconn2d-bwd-bias-exact-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            const int key = 1;
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxLocallyConnectedConv2DBwdBiasKernels.TryGetValue(key, out _))
+                {
+                    DirectPtxLastError =
+                        "Direct PTX locally-connected Conv2D backward-bias must be prewarmed before CUDA graph capture.";
+                    return false;
+                }
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxLocallyConnectedConv2DNchwBackwardBiasF32Kernel kernel =
+                    GetOrCreateDirectPtxLocallyConnectedConv2DBwdBiasKernel();
+                if (capturing && !_directPtxLocallyConnectedConv2DBwdBiasKernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX locally-connected Conv2D backward-bias module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(gradOutput, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(gradBias, kernel.Blueprint.Tensors[1]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxLocallyConnectedConv2DBwdBiasDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool PrewarmDirectPtxLocallyConnectedConv2DBackwardBias()
+    {
+        if (!_directPtxConvolutionOptedIn)
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.FeatureDisabled;
+            return false;
+        }
+        if (!IsAvailable || !DirectPtxArchitecture.HasExperimentalConvolution(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.ArchitectureNotImplemented;
+            return false;
+        }
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX locally-connected Conv2D backward-bias prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _ = GetOrCreateDirectPtxLocallyConnectedConv2DBwdBiasKernel();
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxLocallyConnectedConv2DBwdBiasAudit(out DirectPtxKernelAudit? audit)
+    {
+        lock (_directPtxLock)
+        {
+            if (_directPtxLocallyConnectedConv2DBwdBiasKernels.TryGetValue(1, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null;
+        return false;
+    }
+
+    private PtxLocallyConnectedConv2DNchwBackwardBiasF32Kernel
+        GetOrCreateDirectPtxLocallyConnectedConv2DBwdBiasKernel()
+    {
+        if (_directPtxLocallyConnectedConv2DBwdBiasKernels.TryGetValue(
+                1, out PtxLocallyConnectedConv2DNchwBackwardBiasF32Kernel? existing))
+            return existing;
+        return CreateAndCacheDirectPtxLocallyConnectedConv2DBwdBiasKernelSlow();
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxLocallyConnectedConv2DNchwBackwardBiasF32Kernel
+        CreateAndCacheDirectPtxLocallyConnectedConv2DBwdBiasKernelSlow()
+    {
+        DirectPtxRuntime runtime = _directPtxRuntime ??
+            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+        return _directPtxLocallyConnectedConv2DBwdBiasKernels.GetOrAdd(
+            1, () => new PtxLocallyConnectedConv2DNchwBackwardBiasF32Kernel(runtime));
+    }
 }

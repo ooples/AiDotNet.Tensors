@@ -2929,6 +2929,76 @@ public sealed class DirectPtxConvolutionTests
             $"Locally-connected Conv2D 3x3 backward-weight max absolute error {maxAbsoluteError:G9}.");
     }
 
+    [Fact]
+    public void LocallyConnectedConv2DBackwardBiasEmitter_IsBatchReductionSm86Ptx()
+    {
+        string ptx = PtxLocallyConnectedConv2DNchwBackwardBiasF32Kernel.EmitPtx(8, 6);
+
+        Assert.Contains(".target sm_86", ptx, StringComparison.Ordinal);
+        Assert.Contains(PtxLocallyConnectedConv2DNchwBackwardBiasF32Kernel.EntryPoint, ptx, StringComparison.Ordinal);
+        Assert.Equal(2, Count(ptx, ".param .u64"));
+        // N=4 batch: 4 lane loads, 3 accumulation adds, single store, no atomics.
+        Assert.Equal(4, Count(ptx, "ld.global.nc.f32"));
+        Assert.Equal(3, Count(ptx, "add.rn.f32"));
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.DoesNotContain("bra ", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("red.global", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("atom", ptx, StringComparison.Ordinal);
+        Assert.Throws<NotSupportedException>(() =>
+            PtxLocallyConnectedConv2DNchwBackwardBiasF32Kernel.EmitPtx(8, 9));
+    }
+
+    [Fact]
+    public void LocallyConnectedConv2DBackwardBiasManifestCell_IsExperimentalWithDedicatedRoute()
+    {
+        Assert.Equal(DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxConvolutionCoverageManifest.Get("IEngine.LocallyConnectedConv2DBackwardBias").Status);
+        Assert.Equal(DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxConvolutionCoverageManifest
+                .Get("CudaBackend.TryDirectPtxLocallyConnectedConv2DBackwardBias").Status);
+    }
+
+    [SkippableFact]
+    public void DriverOnlyLocallyConnectedConv2DBackwardBias_MatchesCpuReference()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "Requires the experimental SM86 convolution specialization.");
+
+        const int batch = PtxLocallyConnectedConv2DNchwBackwardBiasF32Kernel.Batch;
+        const int biasElements = PtxLocallyConnectedConv2DNchwBackwardBiasF32Kernel.BiasElements;
+
+        using var kernel = new PtxLocallyConnectedConv2DNchwBackwardBiasF32Kernel(runtime);
+        using var gradOutDevice = runtime.AllocateBytes((nuint)PtxLocallyConnectedConv2DNchwBackwardBiasF32Kernel.GradOutputBytes);
+        using var gradBiasDevice = runtime.AllocateBytes((nuint)PtxLocallyConnectedConv2DNchwBackwardBiasF32Kernel.GradBiasBytes);
+
+        Random random = AiDotNet.Tensors.Helpers.RandomHelper.CreateSecureRandom();
+        var gradOut = new float[batch * biasElements];
+        for (int i = 0; i < gradOut.Length; i++) gradOut[i] = (float)(random.NextDouble() * 2 - 1);
+        gradOutDevice.Upload<float>(gradOut);
+
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(gradOutDevice, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(gradBiasDevice, kernel.Blueprint.Tensors[1]));
+        runtime.Synchronize();
+        var actual = new float[biasElements];
+        gradBiasDevice.Download<float>(actual);
+
+        float maxAbsoluteError = 0;
+        for (int id = 0; id < biasElements; id++)
+        {
+            float expected = 0;
+            for (int n = 0; n < batch; n++) expected += gradOut[n * biasElements + id];
+            maxAbsoluteError = MathF.Max(maxAbsoluteError, MathF.Abs(actual[id] - expected));
+        }
+
+        Assert.True(maxAbsoluteError <= 5e-5f,
+            $"Locally-connected Conv2D backward-bias max absolute error {maxAbsoluteError:G9}.");
+    }
+
     private static string? Validate(
         bool enabled, bool available, int major, int minor,
         DirectPtxConvolutionShape shape, IGpuBuffer? input, IGpuBuffer? weights,
