@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
 internal enum DirectPtxAttentionMaskKind
@@ -84,4 +83,3 @@ internal static class DirectPtxAttentionEligibility
         return DirectPtxEligibilityResult.Eligible;
     }
 }
-#endif

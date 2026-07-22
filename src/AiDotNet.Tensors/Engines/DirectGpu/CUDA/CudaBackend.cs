@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // Direct CUDA backend for NVIDIA GPUs (Driver API + NVRTC + cuBLAS fallback).
 using System;
 using System.Collections.Concurrent;
@@ -10,9 +10,7 @@ using System.Threading;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
-#if NET5_0_OR_GREATER
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
-#endif
 using AiDotNet.Tensors.Engines.Gpu;
 using AiDotNet.Tensors.Helpers;
 
@@ -2666,13 +2664,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecode));
         GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, heads, headDim, blockSize, seqLen, 1, nameof(PagedAttentionDecode));
         var output = AllocateBuffer(heads * headDim);
-#if NET5_0_OR_GREATER
         if (headDim == PtxFusedDecodeAttentionD64Kernel.HeadDimension &&
             TryDirectPtxPagedDecodeD64(
                 q, kcache, vcache, blockTable, output,
                 heads, heads, blockSize, seqLen, scale))
             return output;
-#endif
         if (!_kernelCache.TryGetValue("paged_attention_decode", out var kernel))
         {
             output.Dispose();
@@ -2699,13 +2695,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
         GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, heads, headDim, blockSize, checked(startPos + numQueries), numQueries, nameof(PagedAttentionPrefill));
         var output = AllocateBuffer(numQueries * heads * headDim);
-#if NET5_0_OR_GREATER
         if (headDim == PtxFusedPagedPrefillAttentionD64Kernel.HeadDimension &&
             TryDirectPtxPagedPrefillD64(
                 q, kcache, vcache, blockTable, output,
                 heads, heads, numQueries, startPos, blockSize, scale))
             return output;
-#endif
         if (!_kernelCache.TryGetValue("paged_attention_prefill", out var kernel))
         {
             output.Dispose();
@@ -2732,13 +2726,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionDecodeGqa));
         GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, kvHeads, headDim, blockSize, seqLen, 1, nameof(PagedAttentionDecodeGqa));
         var output = AllocateBuffer(heads * headDim);
-#if NET5_0_OR_GREATER
         if (headDim == PtxFusedDecodeAttentionD64Kernel.HeadDimension &&
             TryDirectPtxPagedDecodeD64(
                 q, kcache, vcache, blockTable, output,
                 heads, kvHeads, blockSize, seqLen, scale))
             return output;
-#endif
         if (!_kernelCache.TryGetValue("paged_attention_decode_gqa", out var kernel))
         {
             output.Dispose();
@@ -2764,13 +2756,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
         GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, kvHeads, headDim, blockSize, checked(startPos + numQueries), numQueries, nameof(PagedAttentionPrefillGqa));
         var output = AllocateBuffer(numQueries * heads * headDim);
-#if NET5_0_OR_GREATER
         if (headDim == PtxFusedPagedPrefillAttentionD64Kernel.HeadDimension &&
             TryDirectPtxPagedPrefillD64(
                 q, kcache, vcache, blockTable, output,
                 heads, kvHeads, numQueries, startPos, blockSize, scale))
             return output;
-#endif
         if (!_kernelCache.TryGetValue("paged_attention_prefill_gqa", out var kernel))
         {
             output.Dispose();
@@ -2800,11 +2790,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         GpuKernelGuards.Capacity(v, (long)seqLen * kvHeads * headDim, nameof(v), nameof(FlashDecode));
         if (seqLen <= 0) throw new ArgumentOutOfRangeException(nameof(seqLen));
         var output = AllocateBuffer(heads * headDim);
-#if NET5_0_OR_GREATER
         if (splits <= 0 && headDim == PtxFusedDecodeAttentionD64Kernel.HeadDimension &&
             TryDirectPtxFlashDecodeD64(q, k, v, output, heads, kvHeads, seqLen, scale))
             return output;
-#endif
         if (!_kernelCache.TryGetValue("flash_decode_partial", out var partKernel))
         {
             output.Dispose();
@@ -8154,12 +8142,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             bias.Size < projection || cosine.Size < ropeElements || sine.Size < ropeElements ||
             query.Size < model || keyCache.Size < cacheElements || valueCache.Size < cacheElements)
             throw new ArgumentException("QKV/RoPE/cache buffers are smaller than the requested canonical extents.");
-#if NET5_0_OR_GREATER
         if (TryDirectPtxQkvRopeCacheD64(
             input, packedWeights, bias, cosine, sine, query, keyCache, valueCache,
             heads, cacheCapacity, position))
             return;
-#endif
         using var projected = AllocateBuffer(projection);
         using var biased = AllocateBuffer(projection);
         using var rotatedQueryKey = AllocateBuffer(checked(2 * model));
@@ -8211,13 +8197,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
     {
         using var _ = PushContext();
-#if NET5_0_OR_GREATER
         if (TryDirectPtxAttentionBackwardD64(
             gradOutput, query, key, value, attentionWeights,
             gradQuery, gradKey, gradValue,
             batch, numHeads, numHeads, seqQ, seqK, headDim, scale))
             return;
-#endif
         int batchHeads = checked(batch * numHeads);
         int qkSize = checked(seqQ * seqK);
 
@@ -8321,14 +8305,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
     {
         using var _ = PushContext();
-#if NET5_0_OR_GREATER
         if (TryDirectPtxFlashAttentionBackwardD64(
             gradOutput, query, key, value, output, softmaxStats,
             gradQuery, gradKey, gradValue,
             batch, numHeads, seqQ, seqK, headDim, scale, isCausal,
             attentionBias, biasBatchStride))
             return;
-#endif
             FlashAttentionBackwardLaunch(
                 gradOutput, query, key, value,
                 output, softmaxStats, gradQuery, gradKey,
@@ -8508,14 +8490,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // #628: honor the explicit numQueriesPerKV (matches the CPU's kvh = qh / numQueriesPerKV)
         // rather than recomputing numQHeads/numKVHeads, which diverges for inconsistent GQA configs.
         int queriesPerKV = numQueriesPerKV;
-#if NET5_0_OR_GREATER
         if (numKVHeads > 0 && queriesPerKV == numQHeads / numKVHeads &&
             TryDirectPtxAttentionBackwardD64(
                 gradOutput, query, key, value, attentionWeights,
                 gradQuery, gradKey, gradValue,
                 batch, numQHeads, numKVHeads, seqQ, seqK, headDim, scale))
             return;
-#endif
             GroupedQueryAttentionBackwardLaunch(
                 gradOutput, query, key, value,
                 attentionWeights, gradQuery, gradKey, gradValue,
@@ -16041,9 +16021,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         // Direct-PTX modules borrow this backend's context and stream. Unload
         // them while both handles are still alive, before pool/stream teardown.
-#if NET5_0_OR_GREATER
         DisposeDirectPtxRuntime();
-#endif
 
         _pinnedPool.Dispose();
         _bufferPool.Dispose();
