@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -47,7 +46,7 @@ internal sealed class PtxFusedDecodeAttentionD64Kernel : IDisposable
         int poolBlocks,
         float scale)
     {
-        ArgumentNullException.ThrowIfNull(runtime);
+        PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         if (runtime.ArchitectureFamily != DirectPtxArchitectureFamily.Ampere)
             throw new PlatformNotSupportedException("The checked-in decode specialization is validated only on Ampere.");
         ValidateShape(isPaged, queryHeads, keyValueHeads, sequenceLength, blockSize, poolBlocks, scale);
@@ -217,7 +216,7 @@ internal sealed class PtxFusedDecodeAttentionD64Kernel : IDisposable
         if (queryHeadsPerKeyValueHead == 1)
             ptx.AppendLine("    mov.u32 %r5, %r4;");
         else if ((queryHeadsPerKeyValueHead & (queryHeadsPerKeyValueHead - 1)) == 0)
-            ptx.AppendLine($"    shr.u32 %r5, %r4, {System.Numerics.BitOperations.TrailingZeroCount((uint)queryHeadsPerKeyValueHead)};");
+            ptx.AppendLine($"    shr.u32 %r5, %r4, {PtxCompat.TrailingZeroCount((uint)queryHeadsPerKeyValueHead)};");
         else
             ptx.AppendLine($"    div.u32 %r5, %r4, {queryHeadsPerKeyValueHead};");
         ptx.AppendLine("    shl.b32 %r8, %r2, 1;");
@@ -390,7 +389,7 @@ internal sealed class PtxFusedDecodeAttentionD64Kernel : IDisposable
             throw new ArgumentOutOfRangeException(nameof(keyValueHeads));
         if (sequenceLength is not (16 or 32 or 64 or 128))
             throw new ArgumentOutOfRangeException(nameof(sequenceLength));
-        if (!float.IsFinite(scale)) throw new ArgumentOutOfRangeException(nameof(scale));
+        if (!PtxCompat.IsFinite(scale)) throw new ArgumentOutOfRangeException(nameof(scale));
         if (isPaged)
         {
             if (blockSize is not (16 or 32)) throw new ArgumentOutOfRangeException(nameof(blockSize));
@@ -404,6 +403,5 @@ internal sealed class PtxFusedDecodeAttentionD64Kernel : IDisposable
     }
 
     private static string FloatLiteral(float value) =>
-        "0f" + BitConverter.SingleToInt32Bits(value).ToString("X8", CultureInfo.InvariantCulture);
+        "0f" + PtxCompat.SingleToInt32Bits(value).ToString("X8", CultureInfo.InvariantCulture);
 }
-#endif
