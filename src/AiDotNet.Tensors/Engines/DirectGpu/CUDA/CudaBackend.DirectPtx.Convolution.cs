@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
@@ -308,4 +307,3 @@ public sealed partial class CudaBackend
             1, () => new PtxFusedDepthwiseConv2D3x3F32Kernel(runtime));
     }
 }
-#endif

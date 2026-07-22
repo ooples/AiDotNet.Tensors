@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 
@@ -99,11 +98,10 @@ internal static class DirectPtxConvolutionCoverageManifest
 
     internal static DirectPtxConvolutionCoverageCell Get(string api)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(api);
+        PtxCompat.ThrowIfNullOrWhiteSpace(api, nameof(api));
         foreach (DirectPtxConvolutionCoverageCell cell in All)
             if (string.Equals(cell.Api, api, StringComparison.Ordinal)) return cell;
         throw new KeyNotFoundException(
             $"Convolution API '{api}' is not assigned in the #841 coverage manifest.");
     }
 }
-#endif

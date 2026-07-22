@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 using System.Text;
@@ -40,7 +39,7 @@ internal sealed class PtxFusedConv2DNchwK1Kernel : IDisposable
 
     internal PtxFusedConv2DNchwK1Kernel(DirectPtxRuntime runtime)
     {
-        ArgumentNullException.ThrowIfNull(runtime);
+        PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         if (!DirectPtxArchitecture.HasExperimentalConvolution(
                 runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new NotSupportedException(
@@ -198,4 +197,3 @@ internal sealed class PtxFusedConv2DNchwK1Kernel : IDisposable
 
     public void Dispose() => _module.Dispose();
 }
-#endif
