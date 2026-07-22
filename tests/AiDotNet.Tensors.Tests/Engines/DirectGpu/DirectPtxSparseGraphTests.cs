@@ -16,7 +16,7 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
             DirectPtxSparseGraphCompletionLedger.All
                 .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(71, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+        Assert.Equal(73, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
             entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
         Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
         Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
@@ -812,6 +812,72 @@ public sealed class DirectPtxSparseGraphTests
         Assert.True(PtxTensorScatterReduceF32Kernel.SupportsShape(32, 512, 1024, 64));
         Assert.False(PtxTensorScatterReduceF32Kernel.SupportsShape(16, 512, 1024, 64));
         Assert.False(PtxTensorScatterReduceF32Kernel.SupportsShape(32, 512, 512, 64));
+    }
+
+    [Theory]
+    [InlineData((int)DirectPtxTensorScatterHighLevelOperation.Mean, 4)]
+    [InlineData((int)DirectPtxTensorScatterHighLevelOperation.AddBackward, 3)]
+    public void TensorScatterHighLevelEmitter_HasDistinctPointerOnlyAbi(
+        int operationValue,
+        int pointerCount)
+    {
+        var operation = (DirectPtxTensorScatterHighLevelOperation)operationValue;
+        string ptx = PtxTensorScatterHighLevelF32Kernel.EmitPtx(8, 6, operation);
+        DirectPtxKernelBlueprint blueprint =
+            PtxTensorScatterHighLevelF32Kernel.CreateBlueprint(
+                DirectPtxArchitectureFamily.Ampere, operation);
+
+        Assert.Equal(pointerCount, Count(ptx, ".param .u64"));
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal("single-overwrite", blueprint.Semantics["output-write"]);
+        Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
+        Assert.Equal("0", blueprint.Semantics["intermediate-global-bytes"]);
+        Assert.All(blueprint.Tensors, tensor =>
+            Assert.Equal(DirectPtxExtentMode.Exact, tensor.ExtentMode));
+    }
+
+    [Fact]
+    public void TensorScatterMeanEmitter_WritesPublicInt32Counts()
+    {
+        string ptx = PtxTensorScatterHighLevelF32Kernel.EmitPtx(
+            8, 6, DirectPtxTensorScatterHighLevelOperation.Mean);
+        DirectPtxKernelBlueprint blueprint =
+            PtxTensorScatterHighLevelF32Kernel.CreateBlueprint(
+                DirectPtxArchitectureFamily.Ampere,
+                DirectPtxTensorScatterHighLevelOperation.Mean);
+
+        Assert.Contains("aidotnet_tensor_scatter_mean_f32", ptx, StringComparison.Ordinal);
+        Assert.Contains("st.global.u32", ptx, StringComparison.Ordinal);
+        Assert.Equal(DirectPtxPhysicalType.Int32, blueprint.Tensors[3].PhysicalType);
+        Assert.Equal("int32", blueprint.Semantics["counts-type"]);
+    }
+
+    [Fact]
+    public void TensorScatterAddBackwardEmitter_GathersOnceAndStoresOnce()
+    {
+        string ptx = PtxTensorScatterHighLevelF32Kernel.EmitPtx(
+            8, 6, DirectPtxTensorScatterHighLevelOperation.AddBackward);
+        DirectPtxKernelBlueprint blueprint =
+            PtxTensorScatterHighLevelF32Kernel.CreateBlueprint(
+                DirectPtxArchitectureFamily.Ampere,
+                DirectPtxTensorScatterHighLevelOperation.AddBackward);
+
+        Assert.Contains("aidotnet_tensor_scatter_add_backward_f32", ptx, StringComparison.Ordinal);
+        Assert.Equal(1, Count(ptx, "ld.global.f32"));
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.Equal("zero", blueprint.Semantics["invalid-index"]);
+    }
+
+    [Fact]
+    public void TensorScatterHighLevelAdmission_IsExact()
+    {
+        Assert.True(PtxTensorScatterHighLevelF32Kernel.SupportsShape(16_384, 64, 1_024));
+        Assert.False(PtxTensorScatterHighLevelF32Kernel.SupportsShape(8_192, 64, 1_024));
+        Assert.False(PtxTensorScatterHighLevelF32Kernel.SupportsShape(16_384, 32, 1_024));
+        Assert.False(PtxTensorScatterHighLevelF32Kernel.SupportsShape(16_384, 64, 512));
     }
 
     [Theory]

@@ -20289,9 +20289,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var idxBuf = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices);
             using var outputBuffer = AllocateOutputBuffer(backend, outLen);
             using var countBuffer = AllocateOutputBuffer(backend, outDimSize);
-            indexBackend.ScatterMeanRowsWithCounts(
-                srcBuf.Buffer, idxBuf.Buffer, outputBuffer.Buffer, countBuffer.Buffer,
-                srcDimSize, innerSize, outDimSize);
+            bool directPtxHandled = false;
+#if NET5_0_OR_GREATER
+            directPtxHandled = backend is Engines.DirectGpu.CUDA.CudaBackend cudaBackend &&
+                cudaBackend.TryDirectPtxTensorScatterMean(
+                    srcBuf.Buffer, idxBuf.Buffer, outputBuffer.Buffer, countBuffer.Buffer,
+                    srcDimSize, innerSize, outDimSize);
+#endif
+            // The exact tensor-level PTX ABI emits Int32 counts, matching the
+            // public Tensor<int> result without a format conversion.
+            if (!directPtxHandled)
+            {
+                indexBackend.ScatterMeanRowsWithCounts(
+                    srcBuf.Buffer, idxBuf.Buffer, outputBuffer.Buffer, countBuffer.Buffer,
+                    srcDimSize, innerSize, outDimSize);
+            }
             var result = DeferTensorResult<T>(backend, outputBuffer.Buffer, outLen, outShape);
             counts = DeferTensorResult<int>(
                 backend, countBuffer.Buffer, outDimSize, new[] { outDimSize });

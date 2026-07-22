@@ -7815,8 +7815,17 @@ public partial class DirectGpuTensorEngine
             using var goBuf = GetOrAllocateBuffer(backend, gradOutput);
             using var idxBuf = GetOrAllocateInt32IndexBuffer(backend, indices);
             return DispatchDeferredGpuOp<T>(backend, srcLen, (int[])sourceShape.Clone(), output =>
+            {
+#if NET5_0_OR_GREATER
+                if (backend is DirectGpu.CUDA.CudaBackend cudaBackend &&
+                    cudaBackend.TryDirectPtxTensorScatterAddBackward(
+                        goBuf.Buffer, idxBuf.Buffer, output,
+                        srcDimSize, innerSize, outDimSize))
+                    return;
+#endif
                 indexBackend.ScatterAddBackwardRows(
-                    goBuf.Buffer, idxBuf.Buffer, output, srcDimSize, innerSize, outDimSize));
+                    goBuf.Buffer, idxBuf.Buffer, output, srcDimSize, innerSize, outDimSize);
+            });
         }
         catch
         {
