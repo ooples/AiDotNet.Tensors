@@ -1,7 +1,7 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Linq;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+using AiDotNet.Tensors.Helpers;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -126,11 +126,13 @@ public class DirectPtxComplexMultiplyTests
 
         var left = new float[numPairs * 2];
         var right = new float[numPairs * 2];
-        var random = new Random(20260722 + numPairs);
+        // Seeded so an oracle mismatch on the admitted SM86 machine reproduces exactly.
+        // NextDouble (not NextSingle) keeps the harness compiling on net471.
+        var random = RandomHelper.CreateSeededRandom(20260722 + numPairs);
         for (int i = 0; i < left.Length; i++)
         {
-            left[i] = random.NextSingle() * 2f - 1f;
-            right[i] = random.NextSingle() * 2f - 1f;
+            left[i] = (float)(random.NextDouble() * 2.0 - 1.0);
+            right[i] = (float)(random.NextDouble() * 2.0 - 1.0);
         }
         using var leftBuffer = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
         using var rightBuffer = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
@@ -167,4 +169,3 @@ public class DirectPtxComplexMultiplyTests
         return count;
     }
 }
-#endif

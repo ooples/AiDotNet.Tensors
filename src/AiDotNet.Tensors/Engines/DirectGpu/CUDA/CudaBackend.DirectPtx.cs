@@ -1847,7 +1847,8 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "complex-multiply-invalid-device-pointer";
             return false;
         }
-        if ((((nuint)left.Handle | (nuint)right.Handle | (nuint)output.Handle) & 15u) != 0)
+        if (((PtxCompat.ToNuint(left.Handle) | PtxCompat.ToNuint(right.Handle) |
+              PtxCompat.ToNuint(output.Handle)) & 15u) != 0)
         {
             DirectPtxLastError = "complex-multiply-alignment-mismatch";
             return false;
@@ -1962,8 +1963,8 @@ public sealed partial class CudaBackend
         IGpuBuffer left,
         IGpuBuffer right)
     {
-        nuint leftStart = (nuint)left.Handle;
-        nuint rightStart = (nuint)right.Handle;
+        nuint leftStart = PtxCompat.ToNuint(left.Handle);
+        nuint rightStart = PtxCompat.ToNuint(right.Handle);
         nuint leftEnd = checked(leftStart + (nuint)left.SizeInBytes);
         nuint rightEnd = checked(rightStart + (nuint)right.SizeInBytes);
         return leftStart < rightEnd && rightStart < leftEnd;

@@ -81,6 +81,15 @@ public static class PtxParityRegistry
         new PtxParitySpec("PtxFusedQkvRopeCacheD64Kernel", PtxParityStatus.Deferred,
             "fused QKV + RoPE + KV-cache write (#858)",
             "multi-output (Q + K/V cache) with baked RoPE tables; needs a dedicated QKV/RoPE/cache oracle."),
+
+        new PtxParitySpec("PtxFusedComplexMultiplyF32Kernel", PtxParityStatus.Deferred,
+            "interleaved-complex multiply, fp32 (#850)",
+            "structurally ready for a three-way spec — it is the first direct-PTX kernel with both a " +
+            "public op route (CudaBackend.ComplexMultiply) and a call-time experiment override — but " +
+            "the kernel is admitted only on exact SM86, and its issue (#850) explicitly holds GPU " +
+            "correctness back to the admitted release machine. Converts to ThreeWayParity when the " +
+            "fp64-oracle run over the four exact pair counts lands; until then the route stays disabled " +
+            "and every shape unpromoted."),
     };
 
     private static readonly Dictionary<string, PtxParitySpec> ByKernel =
