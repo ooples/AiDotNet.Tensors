@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -122,4 +121,3 @@ internal static class DirectPtxSoftmaxCoverageManifest
         new(api, implementation, semantics, layout, dtypes, assignment,
             DirectPtxSoftmaxCoverageStatus.ExperimentalDirectPtx);
 }
-#endif

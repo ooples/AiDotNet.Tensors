@@ -47,6 +47,15 @@ public static class PtxParityRegistry
 {
     public static IReadOnlyList<PtxParitySpec> Specs { get; } = new[]
     {
+        new PtxParitySpec("PtxFusedSoftmaxF32Kernel", PtxParityStatus.ThreeWayParity,
+            "row softmax, fp32 (#840) — CudaBackend.Softmax",
+            "runnable spec: DirectPtxSoftmaxTests.BackendSoftmax_ThreeWay_CudaAndPtxBothMatchCpuOracle. " +
+            "Leg 1 runs the op with the direct-PTX gate off and asserts the existing CUDA kernel matches " +
+            "the fp64-accumulated CPU oracle while the PTX dispatch counter stays put; leg 2 runs it with " +
+            "the gate on and asserts direct-PTX matches the same oracle while the counter advances, " +
+            "proving the PTX path actually fired; leg 3 cross-checks the two GPU paths. Driver-gated, so " +
+            "it skips off an SM86 CUDA machine."),
+
         new PtxParitySpec("PtxFusedResidualRmsNormD64Kernel", PtxParityStatus.Deferred,
             "fused residual + RMSNorm (D=64)",
             "backend method has no public op route on main (only the CUDA RmsNorm path is wired), " +

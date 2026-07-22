@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Linq;
 using AiDotNet.Tensors.Engines;
@@ -6,6 +5,7 @@ using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 using AiDotNet.Tensors.Helpers;
+using AiDotNet.Tensors.Tests.TestHelpers;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -143,7 +143,7 @@ public class DirectPtxSoftmaxTests
         using var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
         var random = RandomHelper.CreateSeededRandom(20260721);
         float[] values = Enumerable.Range(0, elements)
-            .Select(_ => (random.NextSingle() * 2f - 1f) * 4f).ToArray();
+            .Select(_ => (float)((random.NextDouble() * 2.0 - 1.0) * 4.0)).ToArray();
         for (int column = 0; column < columns; column++)
         {
             values[column] = 0f;
@@ -233,14 +233,22 @@ public class DirectPtxSoftmaxTests
             AssertVectorClose(backend.DownloadBuffer(output), expected, 5e-5f, "direct-ptx softmax");
 
             // The resident dispatch path must not allocate managed memory.
+            // GC.GetAllocatedBytesForCurrentThread is net5+. On net471 the 32 dispatches
+            // still run and are asserted; only the allocation probe is unavailable.
+#if NET5_0_OR_GREATER
             long allocBefore = GC.GetAllocatedBytesForCurrentThread();
+#endif
             bool all = true;
             for (int i = 0; i < 32; i++)
                 all &= backend.TryDirectPtxSoftmax(input, output, rows, columns);
+#if NET5_0_OR_GREATER
             long allocated = GC.GetAllocatedBytesForCurrentThread() - allocBefore;
+#endif
             backend.Synchronize();
             Assert.True(all, backend.DirectPtxLastError);
+#if NET5_0_OR_GREATER
             Assert.Equal(0, allocated);
+#endif
 
             // The public route selects the direct-PTX kernel and increments the counter.
             long publicBefore = backend.DirectPtxSoftmaxDispatchCount;
@@ -369,7 +377,7 @@ public class DirectPtxSoftmaxTests
         var random = RandomHelper.CreateSeededRandom(seed);
         var values = new float[rows * columns];
         for (int i = 0; i < values.Length; i++)
-            values[i] = (random.NextSingle() * 2f - 1f) * 4f;
+            values[i] = (float)((random.NextDouble() * 2.0 - 1.0) * 4.0);
         return values;
     }
 
@@ -420,7 +428,7 @@ public class DirectPtxSoftmaxTests
                     $"{name} expected NaN at {i}, actual {actual[i]:G9}.");
                 continue;
             }
-            Assert.True(float.IsFinite(actual[i]) == float.IsFinite(expected[i]),
+            Assert.True(MathCompat.IsFinite(actual[i]) == MathCompat.IsFinite(expected[i]),
                 $"{name} finite/nonfinite mismatch at {i}: actual {actual[i]:G9}, " +
                 $"expected {expected[i]:G9}.");
             float error = MathF.Abs(actual[i] - expected[i]);
@@ -430,4 +438,3 @@ public class DirectPtxSoftmaxTests
             $"{name} max absolute error {maximum:G9} at {maximumIndex}; tolerance {tolerance:G9}.");
     }
 }
-#endif
