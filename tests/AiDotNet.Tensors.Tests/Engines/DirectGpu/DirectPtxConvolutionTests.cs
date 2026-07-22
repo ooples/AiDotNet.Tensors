@@ -1358,6 +1358,101 @@ public sealed class DirectPtxConvolutionTests
             $"Conv2D 3x3 backward-weight max absolute error {maxAbsoluteError:G9}.");
     }
 
+    [Fact]
+    public void FusedConv2D3x3Emitter_HasBiasAddAndReluEpilogue()
+    {
+        string ptx = PtxFusedConv2DNchw3x3BiasReluF32Kernel.EmitPtx(8, 6);
+
+        Assert.Contains(".target sm_86", ptx, StringComparison.Ordinal);
+        Assert.Contains(PtxFusedConv2DNchw3x3BiasReluF32Kernel.EntryPoint, ptx, StringComparison.Ordinal);
+        Assert.Equal(4, Count(ptx, ".param .u64"));
+        Assert.Contains("CONV2D_FUSED_CHANNELS:", ptx, StringComparison.Ordinal);
+        Assert.Equal(9, Count(ptx, "fma.rn.f32"));
+        // Fused epilogue: one bias add + one ReLU max, single store, no intermediate.
+        Assert.Equal(1, Count(ptx, "add.rn.f32"));
+        Assert.Equal(1, Count(ptx, "max.f32"));
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.Equal(4, Count(ptx, "and.pred %p4"));
+        Assert.Contains("@%p5 bra CONV2D_FUSED_CHANNELS", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.Throws<NotSupportedException>(() =>
+            PtxFusedConv2DNchw3x3BiasReluF32Kernel.EmitPtx(8, 9));
+    }
+
+    [Fact]
+    public void FusedConv2D3x3ManifestCell_IsExperimentalWithDedicatedRoute()
+    {
+        Assert.Equal(DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxConvolutionCoverageManifest
+                .Get("CudaBackend.TryDirectPtxFusedConv2D3x3BiasRelu").Status);
+    }
+
+    [SkippableFact]
+    public void DriverOnlyFusedConv2D3x3BiasRelu_MatchesCpuReference()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "Requires the experimental SM86 convolution specialization.");
+
+        const int inChannels = PtxFusedConv2DNchw3x3BiasReluF32Kernel.InputChannels;
+        const int outChannels = PtxFusedConv2DNchw3x3BiasReluF32Kernel.OutputChannels;
+        const int height = PtxFusedConv2DNchw3x3BiasReluF32Kernel.Height;
+        const int width = PtxFusedConv2DNchw3x3BiasReluF32Kernel.Width;
+        const int kernelSize = PtxFusedConv2DNchw3x3BiasReluF32Kernel.KernelSize;
+
+        using var kernel = new PtxFusedConv2DNchw3x3BiasReluF32Kernel(runtime);
+        using var inputDevice = runtime.AllocateBytes((nuint)PtxFusedConv2DNchw3x3BiasReluF32Kernel.InputBytes);
+        using var weightDevice = runtime.AllocateBytes((nuint)PtxFusedConv2DNchw3x3BiasReluF32Kernel.WeightBytes);
+        using var biasDevice = runtime.AllocateBytes((nuint)PtxFusedConv2DNchw3x3BiasReluF32Kernel.BiasBytes);
+        using var outputDevice = runtime.AllocateBytes((nuint)PtxFusedConv2DNchw3x3BiasReluF32Kernel.OutputBytes);
+
+        Random random = AiDotNet.Tensors.Helpers.RandomHelper.CreateSecureRandom();
+        var input = new float[inChannels * height * width];
+        for (int i = 0; i < input.Length; i++) input[i] = (float)(random.NextDouble() * 2 - 1);
+        var weights = new float[outChannels * inChannels * kernelSize * kernelSize];
+        for (int i = 0; i < weights.Length; i++) weights[i] = (float)(random.NextDouble() * 2 - 1);
+        var bias = new float[outChannels];
+        for (int i = 0; i < bias.Length; i++) bias[i] = (float)(random.NextDouble() * 2 - 1);
+        inputDevice.Upload<float>(input);
+        weightDevice.Upload<float>(weights);
+        biasDevice.Upload<float>(bias);
+
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(inputDevice, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(weightDevice, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(biasDevice, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(outputDevice, kernel.Blueprint.Tensors[3]));
+        runtime.Synchronize();
+        var actual = new float[outChannels * height * width];
+        outputDevice.Download<float>(actual);
+
+        float maxAbsoluteError = 0;
+        for (int co = 0; co < outChannels; co++)
+        for (int y = 0; y < height; y++)
+        for (int x = 0; x < width; x++)
+        {
+            float acc = bias[co];
+            for (int ci = 0; ci < inChannels; ci++)
+            for (int ky = 0; ky < kernelSize; ky++)
+            for (int kx = 0; kx < kernelSize; kx++)
+            {
+                int iy = y + ky - 1;
+                int ix = x + kx - 1;
+                if (iy < 0 || iy >= height || ix < 0 || ix >= width) continue;
+                acc += weights[((co * inChannels + ci) * kernelSize + ky) * kernelSize + kx] *
+                    input[(ci * height + iy) * width + ix];
+            }
+            float expected = MathF.Max(acc, 0f);
+            float got = actual[(co * height + y) * width + x];
+            maxAbsoluteError = MathF.Max(maxAbsoluteError, MathF.Abs(got - expected));
+        }
+
+        Assert.True(maxAbsoluteError <= 3e-4f,
+            $"Fused Conv2D 3x3 bias+ReLU max absolute error {maxAbsoluteError:G9}.");
+    }
+
     private static string? Validate(
         bool enabled, bool available, int major, int minor,
         DirectPtxConvolutionShape shape, IGpuBuffer? input, IGpuBuffer? weights,
