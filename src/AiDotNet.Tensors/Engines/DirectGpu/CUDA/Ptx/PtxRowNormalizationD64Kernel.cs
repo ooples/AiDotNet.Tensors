@@ -28,7 +28,9 @@ internal enum DirectPtxRowNormalizationOperation
     ReduceNormL2,
     LayerNormGradParametersAtomic,
     RmsNormGradGammaAtomic,
-    ReduceNormL2Atomic
+    ReduceNormL2Atomic,
+    LayerNormBackwardFusedAtomic,
+    RmsNormBackwardFusedAtomic
 }
 
 internal sealed class PtxRowNormalizationD64Kernel : IDisposable
@@ -41,7 +43,24 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
     internal const int ParameterCohorts = ParameterBlockThreads / ParameterFeaturesPerBlock;
     internal const int ParameterPartialCohorts = ParameterCohorts / 2;
     internal const int ParameterRowsPerTile = 256;
-    internal const int ReductionMaxBlocks = 128;
+    internal const int ReductionBlockThreads = 512;
+    internal const int ReductionWarpsPerBlock = ReductionBlockThreads / 32;
+    internal const int ReductionSharedBytes = ReductionWarpsPerBlock * sizeof(float);
+    internal const int ReductionMaxBlocks = 512;
+    internal const int FusedLayerNormBackwardWarpsPerBlock = 32;
+    internal const int FusedRmsNormBackwardWarpsPerBlock = 20;
+    internal const int FusedLayerNormBackwardBlockThreads =
+        FusedLayerNormBackwardWarpsPerBlock * 32;
+    internal const int FusedRmsNormBackwardBlockThreads =
+        FusedRmsNormBackwardWarpsPerBlock * 32;
+    internal const int FusedLayerNormBackwardMaxBlocks = 128;
+    internal const int FusedRmsNormBackwardMaxBlocks = 136;
+    internal const int FusedLayerNormBackwardPlaneSharedBytes =
+        FusedLayerNormBackwardWarpsPerBlock * Dimension * sizeof(float);
+    internal const int FusedBackwardRmsSharedBytes =
+        FusedRmsNormBackwardWarpsPerBlock * Dimension * sizeof(float);
+    internal const int FusedBackwardLayerSharedBytes =
+        2 * FusedLayerNormBackwardPlaneSharedBytes;
     internal const int ParameterSharedBytes =
         2 * ParameterFeaturesPerBlock * ParameterPartialCohorts * sizeof(float);
 
@@ -85,9 +104,11 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         _module = runtime.LoadModule(
             Ptx, allowExperimentalJitFallback: DirectPtxFeatureGate.NormalizationExperimentOverride);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
-        int blockThreads = IsParameterGradient(operation)
-            ? ParameterBlockThreads
-            : RowBlockThreads;
+        int blockThreads = IsFusedBackward(operation)
+            ? GetFusedBackwardBlockThreads(operation)
+            : IsParameterGradient(operation)
+                ? ParameterBlockThreads
+                : IsReduction(operation) ? ReductionBlockThreads : RowBlockThreads;
         int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, blockThreads);
         Blueprint.ResourceBudget.Validate(
             EntryPoint, info, blockThreads, activeBlocks);
@@ -110,24 +131,36 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         IntPtr pointer3 = tensors.Length > 3 ? tensors[3].Pointer : IntPtr.Zero;
         IntPtr pointer4 = tensors.Length > 4 ? tensors[4].Pointer : IntPtr.Zero;
         IntPtr pointer5 = tensors.Length > 5 ? tensors[5].Pointer : IntPtr.Zero;
-        void** arguments = stackalloc void*[6];
+        IntPtr pointer6 = tensors.Length > 6 ? tensors[6].Pointer : IntPtr.Zero;
+        IntPtr pointer7 = tensors.Length > 7 ? tensors[7].Pointer : IntPtr.Zero;
+        void** arguments = stackalloc void*[8];
         arguments[0] = &pointer0;
         arguments[1] = &pointer1;
         arguments[2] = &pointer2;
         arguments[3] = &pointer3;
         arguments[4] = &pointer4;
         arguments[5] = &pointer5;
+        arguments[6] = &pointer6;
+        arguments[7] = &pointer7;
 
-        uint blockThreads = IsParameterGradient(Operation)
-            ? (uint)ParameterBlockThreads
-            : (uint)RowBlockThreads;
-        uint grid = Operation == DirectPtxRowNormalizationOperation.ReduceNormL2Atomic
+        uint blockThreads = IsFusedBackward(Operation)
+            ? (uint)GetFusedBackwardBlockThreads(Operation)
+            : IsParameterGradient(Operation)
+                ? (uint)ParameterBlockThreads
+                : IsReduction(Operation) ? (uint)ReductionBlockThreads : (uint)RowBlockThreads;
+        uint grid = IsFusedBackward(Operation)
             ? checked((uint)Math.Min(
-                (Rows * (Dimension / 4) + RowBlockThreads - 1) / RowBlockThreads,
+                (Rows + GetFusedBackwardWarpsPerBlock(Operation) - 1) /
+                    GetFusedBackwardWarpsPerBlock(Operation),
+                GetFusedBackwardMaxBlocks(Operation)))
+            : Operation == DirectPtxRowNormalizationOperation.ReduceNormL2Atomic
+            ? checked((uint)Math.Min(
+                (Rows * (Dimension / 4) + ReductionBlockThreads - 1) /
+                    ReductionBlockThreads,
                 ReductionMaxBlocks))
             : IsAtomicParameterGradient(Operation)
             ? checked((uint)(Dimension / ParameterFeaturesPerBlock *
-                (Rows / ParameterRowsPerTile)))
+                (Rows / Math.Min(ParameterRowsPerTile, Rows))))
             : IsParameterGradient(Operation)
                 ? Dimension / ParameterFeaturesPerBlock
             : Operation == DirectPtxRowNormalizationOperation.ReduceNormL2
@@ -187,6 +220,10 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
                 EmitParameterGradient(ccMajor, ccMinor, rows, rms: true, atomic: true),
             DirectPtxRowNormalizationOperation.ReduceNormL2Atomic =>
                 EmitReduceNormL2(ccMajor, ccMinor, rows, atomic: true),
+            DirectPtxRowNormalizationOperation.LayerNormBackwardFusedAtomic =>
+                EmitFusedBackward(ccMajor, ccMinor, rows, rms: false),
+            DirectPtxRowNormalizationOperation.RmsNormBackwardFusedAtomic =>
+                EmitFusedBackward(ccMajor, ccMinor, rows, rms: true),
             _ => throw new ArgumentOutOfRangeException(nameof(operation))
         };
     }
@@ -527,6 +564,173 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         return End(ptx, "RMS_BWD_DONE");
     }
 
+    private static string EmitFusedBackward(
+        int ccMajor, int ccMinor, int rows, bool rms)
+    {
+        DirectPtxRowNormalizationOperation operation = rms
+            ? DirectPtxRowNormalizationOperation.RmsNormBackwardFusedAtomic
+            : DirectPtxRowNormalizationOperation.LayerNormBackwardFusedAtomic;
+        var ptx = rms
+            ? Begin(ccMajor, ccMinor, GetEntryPoint(operation),
+                "grad_output_ptr", "input_ptr", "gamma_ptr", "rms_ptr",
+                "grad_input_ptr", "grad_gamma_ptr")
+            : Begin(ccMajor, ccMinor, GetEntryPoint(operation),
+                "grad_output_ptr", "input_ptr", "gamma_ptr", "mean_ptr",
+                "inv_var_ptr", "grad_input_ptr", "grad_gamma_ptr", "grad_beta_ptr");
+        int warpsPerBlock = GetFusedBackwardWarpsPerBlock(operation);
+        int blockThreads = GetFusedBackwardBlockThreads(operation);
+        int planeSharedBytes = rms
+            ? FusedBackwardRmsSharedBytes
+            : FusedLayerNormBackwardPlaneSharedBytes;
+        EmitRegisters(ptx, predicates: 6, b32: 16, b64: 24, f32: 36,
+            blockThreads: blockThreads);
+        ptx.AppendLine($"    .shared .align 16 .b8 fused_scratch[{(rms ? FusedBackwardRmsSharedBytes : FusedBackwardLayerSharedBytes)}];");
+        EmitPointerLoads(ptx, rms ? 6 : 8);
+
+        // A bounded grid lets every warp process a grid-stride row
+        // cohort. Input, gradient, gamma, and row statistics stay in registers
+        // until grad-input and the block's parameter partials are complete.
+        ptx.AppendLine("    mov.u32 %r0, %tid.x;");
+        ptx.AppendLine("    and.b32 %r1, %r0, 31;");
+        ptx.AppendLine("    shr.u32 %r2, %r0, 5;");
+        ptx.AppendLine("    mov.u32 %r3, %ctaid.x;");
+        ptx.AppendLine($"    mad.lo.u32 %r4, %r3, {warpsPerBlock}, %r2;");
+        ptx.AppendLine("    mov.u32 %r5, %nctaid.x;");
+        ptx.AppendLine($"    mul.lo.u32 %r5, %r5, {warpsPerBlock};");
+        ptx.AppendLine("    mul.wide.u32 %rd8, %r1, 8;");
+        ptx.AppendLine("    add.u64 %rd9, %rd2, %rd8;");
+        ptx.AppendLine("    ld.global.v2.f32 {%f4, %f5}, [%rd9];");
+        ptx.AppendLine("    mov.f32 %f20, 0f00000000;");
+        ptx.AppendLine("    mov.f32 %f21, 0f00000000;");
+        if (!rms)
+        {
+            ptx.AppendLine("    mov.f32 %f22, 0f00000000;");
+            ptx.AppendLine("    mov.f32 %f23, 0f00000000;");
+        }
+        ptx.AppendLine("FUSED_BWD_ROW_LOOP:");
+        ptx.AppendLine($"    setp.ge.u32 %p0, %r4, {rows};");
+        ptx.AppendLine("    @%p0 bra FUSED_BWD_PARTIALS;");
+        ptx.AppendLine("    mul.wide.u32 %rd10, %r4, 256;");
+        ptx.AppendLine("    add.u64 %rd11, %rd0, %rd10;");
+        ptx.AppendLine("    add.u64 %rd11, %rd11, %rd8;");
+        ptx.AppendLine("    add.u64 %rd12, %rd1, %rd10;");
+        ptx.AppendLine("    add.u64 %rd12, %rd12, %rd8;");
+        ptx.AppendLine($"    add.u64 %rd13, %rd{(rms ? 4 : 5)}, %rd10;");
+        ptx.AppendLine("    add.u64 %rd13, %rd13, %rd8;");
+        ptx.AppendLine("    ld.global.v2.f32 {%f0, %f1}, [%rd11];");
+        ptx.AppendLine("    ld.global.v2.f32 {%f2, %f3}, [%rd12];");
+        ptx.AppendLine("    mul.wide.u32 %rd14, %r4, 4;");
+        ptx.AppendLine("    add.u64 %rd15, %rd3, %rd14;");
+        ptx.AppendLine("    ld.global.f32 %f6, [%rd15];");
+        if (rms)
+        {
+            ptx.AppendLine("    rcp.approx.f32 %f7, %f6;");
+            ptx.AppendLine("    mul.rn.f32 %f8, %f7, %f7;");
+            ptx.AppendLine("    mul.rn.f32 %f8, %f8, %f7;");
+            ptx.AppendLine("    mul.rn.f32 %f9, %f0, %f4;");
+            ptx.AppendLine("    mul.rn.f32 %f10, %f1, %f5;");
+            ptx.AppendLine("    mul.rn.f32 %f11, %f9, %f2;");
+            ptx.AppendLine("    fma.rn.f32 %f11, %f10, %f3, %f11;");
+            EmitWarpSum(ptx, "%f11", "%f12");
+            ptx.AppendLine("    mul.rn.f32 %f14, %f11, %f8;");
+            ptx.AppendLine("    mul.rn.f32 %f14, %f14, 0fBC800000;");
+            ptx.AppendLine("    mul.rn.f32 %f13, %f9, %f7;");
+            ptx.AppendLine("    fma.rn.f32 %f15, %f2, %f14, %f13;");
+            ptx.AppendLine("    mul.rn.f32 %f16, %f10, %f7;");
+            ptx.AppendLine("    fma.rn.f32 %f18, %f3, %f14, %f16;");
+            ptx.AppendLine("    mul.rn.f32 %f19, %f0, %f2;");
+            ptx.AppendLine("    fma.rn.f32 %f20, %f19, %f7, %f20;");
+            ptx.AppendLine("    mul.rn.f32 %f19, %f1, %f3;");
+            ptx.AppendLine("    fma.rn.f32 %f21, %f19, %f7, %f21;");
+            ptx.AppendLine("    st.global.v2.f32 [%rd13], {%f15, %f18};");
+        }
+        else
+        {
+            ptx.AppendLine("    add.u64 %rd16, %rd4, %rd14;");
+            ptx.AppendLine("    ld.global.f32 %f7, [%rd16];");
+            ptx.AppendLine("    sub.rn.f32 %f8, %f2, %f6;");
+            ptx.AppendLine("    sub.rn.f32 %f9, %f3, %f6;");
+            ptx.AppendLine("    mul.rn.f32 %f10, %f0, %f4;");
+            ptx.AppendLine("    mul.rn.f32 %f11, %f1, %f5;");
+            ptx.AppendLine("    add.rn.f32 %f12, %f10, %f11;");
+            ptx.AppendLine("    mul.rn.f32 %f13, %f10, %f8;");
+            ptx.AppendLine("    fma.rn.f32 %f13, %f11, %f9, %f13;");
+            EmitWarpSum(ptx, "%f12", "%f14");
+            EmitWarpSum(ptx, "%f13", "%f14");
+            ptx.AppendLine("    mul.rn.f32 %f15, %f7, %f7;");
+            ptx.AppendLine("    mul.rn.f32 %f16, %f8, %f15;");
+            ptx.AppendLine("    mul.rn.f32 %f16, %f16, %f13;");
+            ptx.AppendLine("    add.rn.f32 %f16, %f16, %f12;");
+            ptx.AppendLine("    mul.rn.f32 %f16, %f16, 0f3C800000;");
+            ptx.AppendLine("    sub.rn.f32 %f17, %f10, %f16;");
+            ptx.AppendLine("    mul.rn.f32 %f17, %f17, %f7;");
+            ptx.AppendLine("    mul.rn.f32 %f18, %f9, %f15;");
+            ptx.AppendLine("    mul.rn.f32 %f18, %f18, %f13;");
+            ptx.AppendLine("    add.rn.f32 %f18, %f18, %f12;");
+            ptx.AppendLine("    mul.rn.f32 %f18, %f18, 0f3C800000;");
+            ptx.AppendLine("    sub.rn.f32 %f19, %f11, %f18;");
+            ptx.AppendLine("    mul.rn.f32 %f19, %f19, %f7;");
+            ptx.AppendLine("    mul.rn.f32 %f24, %f8, %f7;");
+            ptx.AppendLine("    fma.rn.f32 %f20, %f0, %f24, %f20;");
+            ptx.AppendLine("    mul.rn.f32 %f24, %f9, %f7;");
+            ptx.AppendLine("    fma.rn.f32 %f21, %f1, %f24, %f21;");
+            ptx.AppendLine("    add.rn.f32 %f22, %f22, %f0;");
+            ptx.AppendLine("    add.rn.f32 %f23, %f23, %f1;");
+            ptx.AppendLine("    st.global.v2.f32 [%rd13], {%f17, %f19};");
+        }
+        ptx.AppendLine("    add.u32 %r4, %r4, %r5;");
+        ptx.AppendLine("    bra FUSED_BWD_ROW_LOOP;");
+
+        // Every warp publishes its 64 feature partials once. Sixty-four
+        // threads then fold the warp cohorts and issue one final atomic
+        // per block/output, avoiding a second full global-memory input pass.
+        ptx.AppendLine("FUSED_BWD_PARTIALS:");
+        ptx.AppendLine($"    mad.lo.u32 %r6, %r2, {Dimension / 2}, %r1;");
+        ptx.AppendLine("    mul.lo.u32 %r6, %r6, 2;");
+        ptx.AppendLine("    mul.wide.u32 %rd17, %r6, 4;");
+        ptx.AppendLine("    mov.u64 %rd18, fused_scratch;");
+        ptx.AppendLine("    add.u64 %rd19, %rd18, %rd17;");
+        ptx.AppendLine("    st.shared.f32 [%rd19], %f20;");
+        ptx.AppendLine("    st.shared.f32 [%rd19+4], %f21;");
+        if (!rms)
+        {
+            ptx.AppendLine($"    st.shared.f32 [%rd19+{planeSharedBytes}], %f22;");
+            ptx.AppendLine($"    st.shared.f32 [%rd19+{planeSharedBytes + 4}], %f23;");
+        }
+        ptx.AppendLine("    bar.sync 0;");
+        ptx.AppendLine($"    setp.ge.u32 %p2, %r0, {Dimension};");
+        ptx.AppendLine("    @%p2 bra FUSED_BWD_RETURN;");
+        ptx.AppendLine("    mov.u32 %r6, 0;");
+        ptx.AppendLine("    mov.f32 %f24, 0f00000000;");
+        if (!rms)
+            ptx.AppendLine("    mov.f32 %f25, 0f00000000;");
+        ptx.AppendLine("FUSED_BWD_BLOCK_REDUCE:");
+        ptx.AppendLine($"    setp.ge.u32 %p3, %r6, {warpsPerBlock};");
+        ptx.AppendLine("    @%p3 bra FUSED_BWD_ATOMIC;");
+        ptx.AppendLine($"    mad.lo.u32 %r7, %r6, {Dimension}, %r0;");
+        ptx.AppendLine("    mul.wide.u32 %rd17, %r7, 4;");
+        ptx.AppendLine("    add.u64 %rd19, %rd18, %rd17;");
+        ptx.AppendLine("    ld.shared.f32 %f26, [%rd19];");
+        ptx.AppendLine("    add.rn.f32 %f24, %f24, %f26;");
+        if (!rms)
+        {
+            ptx.AppendLine($"    ld.shared.f32 %f27, [%rd19+{planeSharedBytes}];");
+            ptx.AppendLine("    add.rn.f32 %f25, %f25, %f27;");
+        }
+        ptx.AppendLine("    add.u32 %r6, %r6, 1;");
+        ptx.AppendLine("    bra FUSED_BWD_BLOCK_REDUCE;");
+        ptx.AppendLine("FUSED_BWD_ATOMIC:");
+        ptx.AppendLine("    mul.wide.u32 %rd20, %r0, 4;");
+        ptx.AppendLine($"    add.u64 %rd21, %rd{(rms ? 5 : 6)}, %rd20;");
+        ptx.AppendLine("    atom.global.add.f32 %f26, [%rd21], %f24;");
+        if (!rms)
+        {
+            ptx.AppendLine("    add.u64 %rd22, %rd7, %rd20;");
+            ptx.AppendLine("    atom.global.add.f32 %f27, [%rd22], %f25;");
+        }
+        return End(ptx, "FUSED_BWD_RETURN");
+    }
+
     private static string EmitLayerNormGradParameters(
         int ccMajor, int ccMinor, int rows) =>
         EmitParameterGradient(ccMajor, ccMinor, rows, rms: false, atomic: false);
@@ -538,6 +742,7 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
     private static string EmitParameterGradient(
         int ccMajor, int ccMinor, int rows, bool rms, bool atomic)
     {
+        int rowsPerTile = Math.Min(ParameterRowsPerTile, rows);
         DirectPtxRowNormalizationOperation operation = atomic
             ? rms
                 ? DirectPtxRowNormalizationOperation.RmsNormGradGammaAtomic
@@ -567,9 +772,9 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         {
             ptx.AppendLine("    mov.u32 %r7, %ctaid.x;");
             ptx.AppendLine("    shr.u32 %r7, %r7, 2;");
-            ptx.AppendLine($"    mad.lo.u32 %r4, %r7, {ParameterRowsPerTile}, %r2;");
+            ptx.AppendLine($"    mad.lo.u32 %r4, %r7, {rowsPerTile}, %r2;");
             ptx.AppendLine("    add.u32 %r7, %r7, 1;");
-            ptx.AppendLine($"    mul.lo.u32 %r7, %r7, {ParameterRowsPerTile};");
+            ptx.AppendLine($"    mul.lo.u32 %r7, %r7, {rowsPerTile};");
         }
         else
         {
@@ -766,16 +971,17 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         var ptx = Begin(ccMajor, ccMinor,
             GetEntryPoint(operation),
             "input_ptr", "output_ptr");
-        EmitRegisters(ptx, predicates: 4, b32: 16, b64: 8, f32: 8);
-        ptx.AppendLine("    .shared .align 4 .b8 reduce_scratch[32];");
+        EmitRegisters(ptx, predicates: 4, b32: 16, b64: 8, f32: 8,
+            blockThreads: ReductionBlockThreads);
+        ptx.AppendLine($"    .shared .align 4 .b8 reduce_scratch[{ReductionSharedBytes}];");
         EmitPointerLoads(ptx, 2);
         ptx.AppendLine("    mov.u32 %r0, %tid.x;");
         if (atomic)
         {
             ptx.AppendLine("    mov.u32 %r4, %ctaid.x;");
-            ptx.AppendLine($"    mad.lo.u32 %r1, %r4, {RowBlockThreads}, %r0;");
+            ptx.AppendLine($"    mad.lo.u32 %r1, %r4, {ReductionBlockThreads}, %r0;");
             ptx.AppendLine("    mov.u32 %r4, %nctaid.x;");
-            ptx.AppendLine($"    mul.lo.u32 %r4, %r4, {RowBlockThreads};");
+            ptx.AppendLine($"    mul.lo.u32 %r4, %r4, {ReductionBlockThreads};");
         }
         else
         {
@@ -806,7 +1012,7 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         }
         ptx.AppendLine(atomic
             ? "    add.u32 %r1, %r1, %r4;"
-            : $"    add.u32 %r1, %r1, {RowBlockThreads};");
+            : $"    add.u32 %r1, %r1, {ReductionBlockThreads};");
         ptx.AppendLine("    bra REDUCE_NORM_LOOP;");
         ptx.AppendLine("REDUCE_NORM_WARP:");
         EmitWarpSum(ptx, "%f0", "%f2");
@@ -822,7 +1028,7 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         ptx.AppendLine("    bar.sync 0;");
         ptx.AppendLine("    setp.ne.u32 %p2, %r3, 0;");
         ptx.AppendLine("    @%p2 bra REDUCE_NORM_DONE;");
-        ptx.AppendLine("    setp.lt.u32 %p3, %r2, 8;");
+        ptx.AppendLine($"    setp.lt.u32 %p3, %r2, {ReductionWarpsPerBlock};");
         ptx.AppendLine("    mov.f32 %f3, 0f00000000;");
         ptx.AppendLine("    @!%p3 bra REDUCE_NORM_FINAL;");
         ptx.AppendLine("    mul.wide.u32 %rd6, %r2, 4;");
@@ -1121,6 +1327,26 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
                 Stats("rms", DirectPtxTensorAccess.Read),
                 Matrix("grad_input", DirectPtxTensorAccess.Write)
             ],
+            DirectPtxRowNormalizationOperation.LayerNormBackwardFusedAtomic =>
+            [
+                Matrix("grad_output", DirectPtxTensorAccess.Read),
+                Matrix("input", DirectPtxTensorAccess.Read),
+                Vector("gamma", DirectPtxTensorAccess.Read),
+                Stats("mean", DirectPtxTensorAccess.Read),
+                Stats("inv_var", DirectPtxTensorAccess.Read),
+                Matrix("grad_input", DirectPtxTensorAccess.Write),
+                Vector("grad_gamma", DirectPtxTensorAccess.Write),
+                Vector("grad_beta", DirectPtxTensorAccess.Write)
+            ],
+            DirectPtxRowNormalizationOperation.RmsNormBackwardFusedAtomic =>
+            [
+                Matrix("grad_output", DirectPtxTensorAccess.Read),
+                Matrix("input", DirectPtxTensorAccess.Read),
+                Vector("gamma", DirectPtxTensorAccess.Read),
+                Stats("rms", DirectPtxTensorAccess.Read),
+                Matrix("grad_input", DirectPtxTensorAccess.Write),
+                Vector("grad_gamma", DirectPtxTensorAccess.Write)
+            ],
             DirectPtxRowNormalizationOperation.RmsNormGradGamma or
                 DirectPtxRowNormalizationOperation.RmsNormGradGammaAtomic =>
             [
@@ -1149,30 +1375,44 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         bool parameterGradient = IsParameterGradient(operation);
         bool atomicParameterGradient = IsAtomicParameterGradient(operation);
         bool atomicReduction = operation == DirectPtxRowNormalizationOperation.ReduceNormL2Atomic;
+        bool deterministicReduction = operation == DirectPtxRowNormalizationOperation.ReduceNormL2;
+        bool fusedBackward = IsFusedBackward(operation);
         return new DirectPtxKernelBlueprint(
             Operation: OperationName(operation),
             Version: 1,
             Architecture: architecture,
-            Variant: atomicReduction
-                ? $"bounded-atomic-reduction-b{ReductionMaxBlocks}-r{rows}"
+            Variant: fusedBackward
+                ? $"single-pass-grid-stride-d64-w{GetFusedBackwardWarpsPerBlock(operation)}" +
+                    $"-b{GetFusedBackwardMaxBlocks(operation)}-r{rows}"
+                : atomicReduction
+                ? $"bounded-atomic-reduction-t{ReductionBlockThreads}" +
+                    $"-b{ReductionMaxBlocks}-r{rows}"
+                : deterministicReduction
+                ? $"single-block-reduction-t{ReductionBlockThreads}-r{rows}"
                 : atomicParameterGradient
                 ? $"feature-tile-atomic-d64-f{ParameterFeaturesPerBlock}-c{ParameterCohorts}" +
-                    $"-rt{ParameterRowsPerTile}-r{rows}"
+                    $"-rt{Math.Min(ParameterRowsPerTile, rows)}-r{rows}"
                 : parameterGradient
                 ? $"feature-tile-d64-f{ParameterFeaturesPerBlock}-c{ParameterCohorts}-r{rows}"
                 : $"warp-row-d64-w{WarpsPerBlock}-r{rows}",
             Tensors: tensors,
             ResourceBudget: new DirectPtxResourceBudget(
-                // Parameter reductions use four independent feature tiles and
-                // a fixed shuffle/shared fold. The row-major loads stay
-                // coalesced while the work spans multiple SMs without atomics
-                // or output-sized temporary storage.
-                MaxRegistersPerThread: parameterGradient ? 80 : 48,
-                MaxStaticSharedBytes: parameterGradient ? ParameterSharedBytes :
-                    operation is DirectPtxRowNormalizationOperation.ReduceNormL2 or
-                        DirectPtxRowNormalizationOperation.ReduceNormL2Atomic ? 32 : 0,
+                // Reductions use fixed shuffle/shared folds. Parameter lanes
+                // use four independent feature tiles so row-major loads stay
+                // coalesced without output-sized temporary storage.
+                MaxRegistersPerThread: parameterGradient || fusedBackward ? 80 : 48,
+                MaxStaticSharedBytes: fusedBackward
+                    ? operation == DirectPtxRowNormalizationOperation.LayerNormBackwardFusedAtomic
+                        ? FusedBackwardLayerSharedBytes
+                        : FusedBackwardRmsSharedBytes
+                    : parameterGradient ? ParameterSharedBytes :
+                    IsReduction(operation) ? ReductionSharedBytes : 0,
                 MaxLocalBytesPerThread: 0,
-                MinBlocksPerMultiprocessor: parameterGradient ? 3 : 4),
+                MinBlocksPerMultiprocessor: fusedBackward
+                    ? operation == DirectPtxRowNormalizationOperation.RmsNormBackwardFusedAtomic
+                        ? 2
+                        : 1
+                    : parameterGradient || IsReduction(operation) ? 3 : 4),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["formula"] = OperationName(operation),
@@ -1181,9 +1421,14 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
                 ["global-intermediates"] = "none",
                 ["temporary-device-allocation"] = "none",
                 ["shape-stride-parameters"] = "none",
-                ["deterministic"] = atomicParameterGradient || atomicReduction ? "false" : "true",
-                ["dataflow"] = atomicReduction
+                ["deterministic"] = atomicParameterGradient || atomicReduction || fusedBackward
+                    ? "false" : "true",
+                ["dataflow"] = fusedBackward
+                    ? "one grid-stride pass retains row values in registers for grad-input and parameter partials; shared memory folds warp cohorts before one atomic per block/output"
+                    : atomicReduction
                     ? "coalesced 16-byte loads feed four register FMAs; bounded grid-stride accumulation, warp/shared block fold, then one global atomic per block"
+                    : deterministicReduction
+                    ? "one 512-thread block uses coalesced scalar loads, register FMAs, and a fixed warp/shared fold before the single scalar store"
                     : atomicParameterGradient
                     ? "256-row tiles accumulate coalesced 16-feature loads in registers, then shuffle/shared fold and one global atomic per output"
                     : parameterGradient
@@ -1273,12 +1518,53 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         operation is DirectPtxRowNormalizationOperation.LayerNormGradParametersAtomic or
             DirectPtxRowNormalizationOperation.RmsNormGradGammaAtomic;
 
+    internal static bool IsFusedBackward(
+        DirectPtxRowNormalizationOperation operation) =>
+        operation is DirectPtxRowNormalizationOperation.LayerNormBackwardFusedAtomic or
+            DirectPtxRowNormalizationOperation.RmsNormBackwardFusedAtomic;
+
+    private static bool IsReduction(
+        DirectPtxRowNormalizationOperation operation) =>
+        operation is DirectPtxRowNormalizationOperation.ReduceNormL2 or
+            DirectPtxRowNormalizationOperation.ReduceNormL2Atomic;
+
+    private static int GetFusedBackwardMaxBlocks(
+        DirectPtxRowNormalizationOperation operation) => operation switch
+        {
+            DirectPtxRowNormalizationOperation.LayerNormBackwardFusedAtomic =>
+                FusedLayerNormBackwardMaxBlocks,
+            DirectPtxRowNormalizationOperation.RmsNormBackwardFusedAtomic =>
+                FusedRmsNormBackwardMaxBlocks,
+            _ => throw new ArgumentOutOfRangeException(nameof(operation))
+        };
+
+    private static int GetFusedBackwardWarpsPerBlock(
+        DirectPtxRowNormalizationOperation operation) => operation switch
+        {
+            DirectPtxRowNormalizationOperation.LayerNormBackwardFusedAtomic =>
+                FusedLayerNormBackwardWarpsPerBlock,
+            DirectPtxRowNormalizationOperation.RmsNormBackwardFusedAtomic =>
+                FusedRmsNormBackwardWarpsPerBlock,
+            _ => throw new ArgumentOutOfRangeException(nameof(operation))
+        };
+
+    private static int GetFusedBackwardBlockThreads(
+        DirectPtxRowNormalizationOperation operation) => operation switch
+        {
+            DirectPtxRowNormalizationOperation.LayerNormBackwardFusedAtomic =>
+                FusedLayerNormBackwardBlockThreads,
+            DirectPtxRowNormalizationOperation.RmsNormBackwardFusedAtomic =>
+                FusedRmsNormBackwardBlockThreads,
+            _ => throw new ArgumentOutOfRangeException(nameof(operation))
+        };
+
     internal static DirectPtxRowNormalizationOperation SelectFastOperation(
         DirectPtxRowNormalizationOperation operation, bool deterministic, int rows) =>
         deterministic ? operation : operation switch
         {
-            // The bounded atomic parameter lane won only for the largest RMS
-            // shape. Fixed-order variants remain faster for the other cells.
+            // The separate bounded atomic parameter lane won only for the
+            // largest RMS shape. Deterministic execution always remains on
+            // the fixed-order reduction.
             DirectPtxRowNormalizationOperation.RmsNormGradGamma when rows == 8_192 =>
                 DirectPtxRowNormalizationOperation.RmsNormGradGammaAtomic,
             _ => operation
@@ -1335,6 +1621,10 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
             "rmsnorm-grad-gamma-atomic-d64",
         DirectPtxRowNormalizationOperation.ReduceNormL2Atomic =>
             "reduce-norm-l2-atomic-d64",
+        DirectPtxRowNormalizationOperation.LayerNormBackwardFusedAtomic =>
+            "layernorm-backward-fused-atomic-d64",
+        DirectPtxRowNormalizationOperation.RmsNormBackwardFusedAtomic =>
+            "rmsnorm-backward-fused-atomic-d64",
         _ => throw new ArgumentOutOfRangeException(nameof(operation))
     };
 

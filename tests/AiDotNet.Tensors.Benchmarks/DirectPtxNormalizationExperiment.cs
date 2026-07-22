@@ -27,8 +27,10 @@ internal static class DirectPtxNormalizationExperiment
     internal static void Run(int independentRuns = 3, string scope = "all")
     {
         if (independentRuns <= 0) throw new ArgumentOutOfRangeException(nameof(independentRuns));
-        if (scope != "all" && scope != "row" && scope != "channel")
-            throw new ArgumentOutOfRangeException(nameof(scope), scope, "Use all, row, or channel.");
+        if (scope != "all" && scope != "row" && scope != "row256" &&
+            scope != "row2048" && scope != "row8192" && scope != "channel")
+            throw new ArgumentOutOfRangeException(
+                nameof(scope), scope, "Use all, row, row256, row2048, row8192, or channel.");
         bool? previousGate = DirectPtxFeatureGate.TestOverride;
         bool previousExperiment = DirectPtxFeatureGate.NormalizationExperimentOverride;
         TensorCodecOptions previousOptions = TensorCodecOptions.Current;
@@ -60,8 +62,14 @@ internal static class DirectPtxNormalizationExperiment
                 using var backend = new CudaBackend();
                 if (run == 1) Console.WriteLine($"GPU: {backend.DeviceName}");
                 if (scope != "channel")
-                    foreach (int rows in RowBuckets) RunRowRoutes(run, rows, backend);
-                if (scope != "row") RunChannelRoutes(run, backend);
+                {
+                    foreach (int rows in RowBuckets)
+                    {
+                        if (scope == "all" || scope == "row" || scope == "row" + rows)
+                            RunRowRoutes(run, rows, backend);
+                    }
+                }
+                if (scope is "all" or "channel") RunChannelRoutes(run, backend);
             }
         }
         finally
@@ -136,9 +144,13 @@ internal static class DirectPtxNormalizationExperiment
                     (baselineGradInput, directGradInput),
                     (baselineGradGamma, directGradGamma),
                     (baselineGradBeta, directGradBeta)),
-                DirectPtxRowNormalizationOperation.LayerNormBackwardInput,
-                secondaryAuditOperation: DirectPtxRowNormalizationOperation.LayerNormGradParameters,
-                dispatchesPerAction: 2);
+                rows == 8_192
+                    ? DirectPtxRowNormalizationOperation.LayerNormBackwardFusedAtomic
+                    : DirectPtxRowNormalizationOperation.LayerNormBackwardInput,
+                secondaryAuditOperation: rows == 8_192
+                    ? null
+                    : DirectPtxRowNormalizationOperation.LayerNormGradParameters,
+                dispatchesPerAction: rows == 8_192 ? 1 : 2);
         }
 
         using (var baselineOutput = backend.AllocateBuffer(elements))
@@ -170,9 +182,13 @@ internal static class DirectPtxNormalizationExperiment
                 () => MaxError(backend,
                     (baselineGradInput, directGradInput),
                     (baselineGradGamma, directGradGamma)),
-                DirectPtxRowNormalizationOperation.RmsNormBackwardInput,
-                secondaryAuditOperation: DirectPtxRowNormalizationOperation.RmsNormGradGamma,
-                dispatchesPerAction: 2);
+                rows == 8_192
+                    ? DirectPtxRowNormalizationOperation.RmsNormBackwardFusedAtomic
+                    : DirectPtxRowNormalizationOperation.RmsNormBackwardInput,
+                secondaryAuditOperation: rows == 8_192
+                    ? null
+                    : DirectPtxRowNormalizationOperation.RmsNormGradGamma,
+                dispatchesPerAction: rows == 8_192 ? 1 : 2);
         }
 
         using (var baselineOutput = backend.AllocateBuffer(rows))

@@ -174,6 +174,7 @@ def row_cells(run, include_compile):
         mean = x.mean(dim=1)
         variance = x.var(dim=1, correction=0)
         rstd = torch.rsqrt(variance + EPSILON)
+        saved_rms = torch.sqrt((x * x).mean(dim=1, keepdim=True) + EPSILON)
         norms = torch.linalg.vector_norm(x, dim=1)
         scalar_gradient = torch.rand((rows,), device="cuda", generator=generator) * 0.5 - 0.25
         floats = rows * D * 4
@@ -189,7 +190,9 @@ def row_cells(run, include_compile):
                   lambda: F.rms_norm(x, [D], gamma, EPSILON), floats, include_compile)
 
         def rms_backward():
-            inverse_rms = torch.rsqrt((x * x).mean(dim=1, keepdim=True) + EPSILON)
+            # AiDotNet's backward API consumes the RMS saved by forward; do
+            # not charge either competitor for recomputing that statistic.
+            inverse_rms = torch.reciprocal(saved_rms)
             scaled = dy * gamma
             projection = (scaled * x).mean(dim=1, keepdim=True)
             grad_input = scaled * inverse_rms - x * projection * inverse_rms.pow(3)
@@ -207,7 +210,10 @@ def row_cells(run, include_compile):
         benchmark(run, rows, "NormalizeRowsFused",
                   lambda: F.normalize(x, p=2.0, dim=1), floats, include_compile)
         benchmark(run, rows, "ReduceNormL2",
-                  lambda: torch.linalg.vector_norm(x), 4, include_compile)
+                  # AiDotNet's fused reduction API returns the accumulated
+                  # sum of squares; callers apply sqrt when they need a norm.
+                  # Keep the competitor's arithmetic/output contract exact.
+                  lambda: torch.sum(torch.square(x)), 4, include_compile)
 
         xh = x.half()
         dyh = dy.half()
@@ -230,7 +236,7 @@ def row_cells(run, include_compile):
                       dyh, xh, [D], half_mean[:, None], half_rstd[:, None], gammah,
                       betah, [False, True, True]), D * 4, include_compile)
 
-        del (x, dy, gamma, beta, mean, variance, rstd, norms, scalar_gradient,
+        del (x, dy, gamma, beta, mean, variance, rstd, saved_rms, norms, scalar_gradient,
              xh, dyh, gammah, betah, half_mean, half_variance, half_rstd)
         torch.cuda.empty_cache()
 

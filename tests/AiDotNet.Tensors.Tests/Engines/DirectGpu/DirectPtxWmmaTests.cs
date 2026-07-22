@@ -998,7 +998,9 @@ public class DirectPtxWmmaTests
                 DirectPtxRowNormalizationOperation.ReduceNormL2 or
                 DirectPtxRowNormalizationOperation.LayerNormGradParametersAtomic or
                 DirectPtxRowNormalizationOperation.RmsNormGradGammaAtomic or
-                DirectPtxRowNormalizationOperation.ReduceNormL2Atomic;
+                DirectPtxRowNormalizationOperation.ReduceNormL2Atomic or
+                DirectPtxRowNormalizationOperation.LayerNormBackwardFusedAtomic or
+                DirectPtxRowNormalizationOperation.RmsNormBackwardFusedAtomic;
             Assert.Equal(usesSharedReduction,
                 ptx.Contains(".shared", StringComparison.Ordinal));
             Assert.Same(

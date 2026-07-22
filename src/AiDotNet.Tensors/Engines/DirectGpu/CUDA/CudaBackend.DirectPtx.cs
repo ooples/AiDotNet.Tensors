@@ -3051,13 +3051,23 @@ public sealed partial class CudaBackend
         IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
         IGpuBuffer saveMean, IGpuBuffer saveInvVar,
         IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
-        int rows, float epsilon) =>
-        TryDirectPtxRowNormalizationPair(
+        int rows, float epsilon)
+    {
+        if (!GpuDeterminism.IsActive && rows == 8_192)
+        {
+            return TryDirectPtxRowNormalization(
+                DirectPtxRowNormalizationOperation.LayerNormBackwardFusedAtomic,
+                rows, epsilon,
+                gradOutput, input, gamma, saveMean, saveInvVar, gradInput,
+                gradGamma, gradBeta);
+        }
+        return TryDirectPtxRowNormalizationPair(
             DirectPtxRowNormalizationOperation.LayerNormBackwardInput,
             DirectPtxRowNormalizationOperation.LayerNormGradParameters,
             rows, epsilon,
             gradOutput, input, gamma, saveMean, saveInvVar, gradInput,
             gradOutput, input, saveMean, saveInvVar, gradGamma, gradBeta);
+    }
 
     internal bool TryDirectPtxFp16LayerNormD64(
         IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer beta, IGpuBuffer output,
@@ -3091,12 +3101,21 @@ public sealed partial class CudaBackend
     internal bool TryDirectPtxRmsNormBackwardD64(
         IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer saveRms,
         IGpuBuffer gradInput, IGpuBuffer gradGamma, int rows, float epsilon)
-        => TryDirectPtxRowNormalizationPair(
+    {
+        if (!GpuDeterminism.IsActive && rows == 8_192)
+        {
+            return TryDirectPtxRowNormalization(
+                DirectPtxRowNormalizationOperation.RmsNormBackwardFusedAtomic,
+                rows, epsilon,
+                gradOutput, input, gamma, saveRms, gradInput, gradGamma);
+        }
+        return TryDirectPtxRowNormalizationPair(
             DirectPtxRowNormalizationOperation.RmsNormBackwardInput,
             DirectPtxRowNormalizationOperation.RmsNormGradGamma,
             rows, epsilon,
             gradOutput, input, gamma, saveRms, gradInput, null,
             gradOutput, input, saveRms, gradGamma, null, null);
+    }
 
     internal bool TryDirectPtxNormAxisD64(
         IGpuBuffer input, IGpuBuffer output, int rows) =>
@@ -3233,17 +3252,19 @@ public sealed partial class CudaBackend
         IGpuBuffer? tensor2 = null,
         IGpuBuffer? tensor3 = null,
         IGpuBuffer? tensor4 = null,
-        IGpuBuffer? tensor5 = null)
+        IGpuBuffer? tensor5 = null,
+        IGpuBuffer? tensor6 = null,
+        IGpuBuffer? tensor7 = null)
     {
         if (!IsDirectPtxRowNormalizationAdmitted(operation, rows))
             return false;
 
         try
         {
-            Span<DirectPtxTensorView> views = stackalloc DirectPtxTensorView[6];
+            Span<DirectPtxTensorView> views = stackalloc DirectPtxTensorView[8];
             int count = PrepareDirectPtxRowViews(
                 operation, rows, views, tensor0, tensor1,
-                tensor2, tensor3, tensor4, tensor5);
+                tensor2, tensor3, tensor4, tensor5, tensor6, tensor7);
             Span<DirectPtxTensorView> admitted = views.Slice(0, count);
 
             bool capturing = IsStreamCapturing();
@@ -3270,6 +3291,12 @@ public sealed partial class CudaBackend
                 {
                     if (operation == DirectPtxRowNormalizationOperation.ReduceNormL2Atomic)
                         ClearDirectPtxWriteOutputs(admitted);
+                    else if (operation ==
+                             DirectPtxRowNormalizationOperation.LayerNormBackwardFusedAtomic)
+                        ClearDirectPtxWriteOutputs(admitted.Slice(6, 2));
+                    else if (operation ==
+                             DirectPtxRowNormalizationOperation.RmsNormBackwardFusedAtomic)
+                        ClearDirectPtxWriteOutputs(admitted.Slice(5, 1));
                     kernel.LaunchPrevalidated(admitted);
                 }
             }
@@ -3326,7 +3353,9 @@ public sealed partial class CudaBackend
         IGpuBuffer? tensor2,
         IGpuBuffer? tensor3,
         IGpuBuffer? tensor4,
-        IGpuBuffer? tensor5)
+        IGpuBuffer? tensor5,
+        IGpuBuffer? tensor6 = null,
+        IGpuBuffer? tensor7 = null)
     {
         DirectPtxKernelBlueprint blueprint =
             PtxRowNormalizationD64Kernel.CreateBlueprint(
@@ -3346,6 +3375,12 @@ public sealed partial class CudaBackend
         if (count > 5)
             views[5] = DirectPtxTensorView.Create(
                 tensor5 ?? throw new ArgumentNullException(nameof(tensor5)), blueprint.Tensors[5]);
+        if (count > 6)
+            views[6] = DirectPtxTensorView.Create(
+                tensor6 ?? throw new ArgumentNullException(nameof(tensor6)), blueprint.Tensors[6]);
+        if (count > 7)
+            views[7] = DirectPtxTensorView.Create(
+                tensor7 ?? throw new ArgumentNullException(nameof(tensor7)), blueprint.Tensors[7]);
         PtxRowNormalizationD64Kernel.ValidateTensors(
             blueprint, views.Slice(0, count),
             PtxRowNormalizationD64Kernel.GetEntryPoint(operation));

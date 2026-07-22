@@ -9,10 +9,12 @@ Parent blueprint: `2026-07-20-fused-attention-championship-blueprint.md`
 ## Current verdict
 
 The implementation inventory is complete for the exact SM86 shapes in this
-pull request: 65 row/channel specialization cells map to 61 distinct,
+pull request: 71 row/channel specialization cells map to 67 distinct,
 content-addressed cubins. The difference is intentional: the two atomic
 parameter kernels have identical PTX for their three runtime grid sizes and
-therefore share a compiled artifact.
+therefore share a compiled artifact. The inventory now includes row-specific
+single-pass fused LayerNorm and RMSNorm backward experiments for all three
+row buckets.
 
 This is a compiled-cubin pipeline, not a raw-PTX production loader. Every
 normal production module load receives an ELF cubin. PTX text is accepted by
@@ -21,12 +23,12 @@ is the object preserved, hashed, cached, loaded, disassembled, and profiled.
 Passing PTX directly to `cuModuleLoadDataEx` is restricted to an explicit
 normalization experiment when the linker entry points are unavailable.
 
-No normalization cell is promoted by this pull request yet. Correctness,
+No new normalization cell is promoted by this pull request. Correctness,
 allocation, graph capture, artifact identity, runtime resource, and SASS
-safety gates pass. Several cells beat current AiDotNet, but the required
-three-run comparison against the strongest PyTorch lane is incomplete and
-some backward/reduction cells still lose its best compiled result. The
-production admission table therefore remains fail-closed.
+safety gates pass. The new backward and whole-tensor reduction experiments
+beat current AiDotNet but fail the required median and tail comparison against
+compiled PyTorch. The production admission table therefore remains
+fail-closed.
 
 ## Ten-stage production binary pipeline
 
@@ -47,6 +49,26 @@ The no-GPU CI verifier regenerates every current PTX string and blueprint ID,
 recomputes source keys, validates every manifest row, checks every cubin hash,
 and rejects extra artifacts. Reusing one source key across byte-identical
 specializations is allowed only when the cubin filename and hash also match.
+
+## Ten optimization readiness gates
+
+| # | Production requirement | Current implementation and verdict |
+|---:|---|---|
+| 1 | Exact contiguous layout | Admission requires contiguous, aligned physical views with frozen D=64 shape/stride semantics; unsupported views fall back. **Pass.** |
+| 2 | Coalesced vector memory access | Row kernels use adjacent `v2.f32` accesses and whole-tensor L2 uses aligned `v4.f32`; final values are written once. **Pass.** |
+| 3 | Shared memory only for reuse | Backward parameter partials are folded in 16 KiB (LayerNorm) or 5 KiB (RMSNorm); L2 uses a 64-byte warp fold. Single-use row inputs are not pointlessly staged. **Pass.** |
+| 4 | Register-resident math | Loaded row values, statistics, affine terms, reductions, and grad-input epilogues remain in registers until final stores. Final SASS has zero local loads/stores. **Pass.** |
+| 5 | Combined/fused kernels | The large-shape experimental backward paths compute grad-input plus parameter partials in one input pass and one dispatch. Existing residual+BatchNorm+ReLU is also truly fused. **Mechanically pass; performance HOLD.** |
+| 6 | Bounded global reductions | Parameter folds issue one atomic per block/output; the L2 experiment uses a 512-thread, at-most-512-block grid. No output-sized scratch is allocated. **Correctness pass; performance HOLD.** |
+| 7 | Asynchronous stream ordering | Launches and output clears use the backend stream with no host synchronization; `cuMemsetD8Async` is graph ordered. `cp.async` is required only for reusable tiles and is inapplicable to these single-use D=64 loads. **Pass.** |
+| 8 | CUDA Graph/lifetime safety | Plans are prewarmed and modules pinned for capture lifetime; compilation, tuning, file I/O, and cache misses are rejected during capture. **Pass.** |
+| 9 | Ahead-of-load binary control | PTX is linked to cubin, hashed, embedded, loaded, disassembled to SASS, resource-audited, and content-addressed cached. Raw PTX load is experiment-only. **Pass.** |
+| 10 | Promotion evidence | Three independent corrected PyTorch comparisons, correctness/determinism, zero hot allocation/temp, resource, and tail gates must all pass. **HOLD:** backward/L2 medians or p95s still lose. |
+
+Tensor Core MMA is not a normalization requirement: no matrix multiply exists
+in these formulas. The same policy requires MMA for applicable GEMM/attention
+PRs and rejects cargo-cult instructions that add conversions or shared-memory
+traffic without useful tensor operations.
 
 ## Kernel and memory contract
 
@@ -70,9 +92,18 @@ measured 8,192-row RMSNorm fast-mode cell; deterministic mode always retains
 the fixed-order kernel. Output zeroing is `cuMemsetD8Async` on the same stream,
 so it is ordered, graph-capturable, and has no host synchronization.
 
+The new experimental large-shape backward lane is a single dispatch and a
+single global input pass. A 32-warp LayerNorm block retains two adjacent
+features per lane in registers, writes 16 KiB of block parameter partials to
+shared memory once, and finishes with one atomic per block/output. RMSNorm's
+measured winner uses 20 warps, 5 KiB shared memory, and two resident blocks per
+SM. Neither route is admitted without the explicit experiment override.
+
 The experimental whole-tensor L2 lane uses aligned 16-byte loads, four
-register FMAs, a bounded grid, warp/shared block folds, and one atomic per
-block. It remains unselected because it still loses the existing CUDA kernel.
+register FMAs, 512-thread blocks, a bounded grid, a 64-byte warp/shared fold,
+and one atomic per block. It remains unselected because it still loses
+compiled PyTorch. The deterministic one-block variant also adopts the wider
+block fold but remains a fallback-only experiment.
 
 `cp.async` and Tensor Core instructions are requirements only where their
 operands are reusable and their arithmetic applies. These D=64 normalization
@@ -119,25 +150,31 @@ not eager PyTorch when compiled PyTorch is faster.
 
 ## Evidence collected on RTX 3080 / SM86
 
-- All 11 focused net10 correctness/routing/capture/allocation tests pass.
-- All current-source identities and compiled cubins pass the static verifier.
-- Final SASS passes for the complete compiled inventory with zero `LDL` and
-  zero `STL`; current maximum register use is 40/thread.
-- The atomic parameter entries contain the intended final
+- All 13 focused correctness/routing/capture/allocation tests pass on net10
+  and net471.
+- All 71 current-source identities and 67 compiled cubins pass the static
+  verifier.
+- Final SASS passes for all 67 cubins with zero `LDL` and zero `STL`; current
+  maximum register use is 48/thread.
+- Fused backward and atomic reduction entries contain the intended final
   `ATOMG.E.ADD.F32` instructions and no local memory.
-- Exact-cubin runtime profiling launches the complete embedded inventory.
+- Exact-cubin runtime profiling launches all 71 embedded specializations and
+  reports `PROFILED_NORMALIZATION_CUBINS=71`.
 - Nsight Compute 2025.4.1 attaches to the exact target, but hardware-counter
   collection is blocked locally by `ERR_NVGPUCTRPERM`. No counter-derived
   bandwidth/occupancy claim is made until an elevated runner or NVIDIA
   non-admin counter access is available.
 
-Preliminary strongest-PyTorch medians show why promotion remains off. At
-8,192 rows, compiled PyTorch measured approximately 20.75 us for LayerNorm
-backward, 19.37 us for RMSNorm backward, and 14.13 us for whole-tensor L2
-reduction. Current direct medians are approximately 44.8 us, 24.2 us, and the
-unselected atomic L2 experiment 26.9 us respectively. Several forward/L2-axis
-cells beat both competitors, but they still require the complete three-run
-tail matrix before independent promotion.
+The corrected three-run PyTorch 2.12.1/CUDA 13 contract uses saved RMS input
+for RMS backward and sum-of-squares output for `ReduceNormL2`. At 8,192 rows,
+compiled PyTorch medians were 20.46/20.40/20.50 us for LayerNorm backward,
+14.38/14.30/14.46 us for RMSNorm backward, and 12.66/12.90/13.15 us for L2.
+The exact embedded fused cubins measured 28.84/27.40/19.50 us for LayerNorm
+and 19.48/16.51/19.11 us for RMSNorm. Their p95s were 39.67/34.86/36.43 us
+and 42.33/22.88/26.34 us respectively, far outside the +10% tail gate. The
+unselected 512-thread atomic L2 experiment measured about 17.20 us median and
+22.18 us p95 in its clean routed screen; the deterministic embedded variant
+measured 42.64--43.77 us. All three cells remain HOLD.
 
 ## Rejected experiments retained as evidence
 
@@ -149,15 +186,25 @@ tail matrix before independent promotion.
   is shape/operation specific.
 - Scalar and `float4` bounded atomic whole-tensor L2 variants both remained
   slower than current CUDA. They stay experimental and unpromoted.
+- Backward sweeps rejected 256-thread blocks, 64/96/128-block common grids,
+  `v4` half-warp mapping, `.cg` loads, reciprocal broadcast, duplicate-stat
+  shuffles, and 512-row parameter tiles. The retained RMS 20-warp geometry
+  improved median occupancy, but not enough to pass PyTorch or tail gates.
+- A 24-warp RMS block was rejected by the runtime resource budget: register
+  allocation granularity permitted only one block/SM, so the benchmark failed
+  closed instead of timing a fallback.
 
 ## Follow-up required before production promotion
 
-1. Fuse or otherwise eliminate the second full input read in LayerNorm and
-   RMSNorm backward while keeping parameter reduction traffic bounded.
-2. Replace whole-tensor L2 with a measured hierarchy that beats compiled
-   PyTorch without output-sized scratch or hidden synchronization.
-3. Complete three clean independent runs for every candidate forward cell and
-   rerun the corrected residual BatchNorm semantics.
+1. Replace the final atomic parameter fold with a measured cross-block
+   completion topology that preserves the single input pass and removes the
+   separate output clear; a reusable bounded workspace is acceptable only if
+   it remains zero-allocation in the hot path and wins end-to-end.
+2. Replace whole-tensor L2 with a measured hierarchical or cooperative
+   reduction that beats compiled PyTorch without output-sized scratch or
+   hidden synchronization.
+3. Complete three clean independent runs for every remaining forward/channel
+   candidate and rerun the corrected residual BatchNorm semantics.
 4. Enable NVIDIA performance counters and archive exact-cubin NCU metrics for
    DRAM bytes, shared transactions/conflicts, occupancy, and local/spill
    counters.

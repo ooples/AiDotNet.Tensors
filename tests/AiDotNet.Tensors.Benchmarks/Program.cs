@@ -1165,7 +1165,7 @@ class Program
         Console.WriteLine("  --direct-ptx-flash-attention-backward [runs]: D64 Flash recomputation-backward release matrix");
         Console.WriteLine("  --direct-ptx-residual-rmsnorm: second-blueprint fused residual + RMSNorm D64");
         Console.WriteLine("  --direct-ptx-residual-layernorm-gelu [runs]: fused D64 normalization championship matrix");
-        Console.WriteLine("  --direct-ptx-normalization [runs] [all|row|channel]: issue #838 resident production-route screen");
+        Console.WriteLine("  --direct-ptx-normalization [runs] [all|row|row256|row2048|row8192|channel]: issue #838 resident production-route screen");
         Console.WriteLine("  --export-direct-ptx-normalization-cubins [directory]: compile and preserve release SM86 cubins");
         Console.WriteLine("  --audit-direct-ptx-normalization-sass <nvdisasm> [cubins] [evidence]: fail closed on final-SASS local memory");
         Console.WriteLine("  --direct-ptx-external-gpu-baselines: forced cuDNN/Flash/Math/compiled Python GPU matrix");

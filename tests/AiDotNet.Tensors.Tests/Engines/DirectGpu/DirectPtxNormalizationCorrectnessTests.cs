@@ -113,8 +113,8 @@ public sealed class DirectPtxNormalizationCorrectnessTests
                     expected[columns[2]] = columns[3];
             }
         }
-        Assert.Equal(65, manifestRows);
-        Assert.Equal(61, expected.Count);
+        Assert.Equal(71, manifestRows);
+        Assert.Equal(67, expected.Count);
 
         string[] cubins = resources.Where(name =>
             name.IndexOf(".Artifacts.sm86.", StringComparison.Ordinal) >= 0 &&
@@ -675,6 +675,19 @@ public sealed class DirectPtxNormalizationCorrectnessTests
                 "atomic LayerNorm grad beta");
         }
         using (var kernel = new PtxRowNormalizationD64Kernel(
+                   runtime, DirectPtxRowNormalizationOperation.LayerNormBackwardFusedAtomic, Rows))
+        {
+            object[] result = Run(runtime, kernel.Blueprint, views => kernel.Launch(views),
+                gradOutput, input, gamma, mean, invStd, null,
+                new float[Width], new float[Width]);
+            AssertClose((float[])result[5], layerGradInput, 8e-4f,
+                "fused LayerNorm grad input");
+            AssertClose((float[])result[6], layerGradGamma, 4e-3f,
+                "fused LayerNorm grad gamma");
+            AssertClose((float[])result[7], layerGradBeta, 4e-3f,
+                "fused LayerNorm grad beta");
+        }
+        using (var kernel = new PtxRowNormalizationD64Kernel(
                    runtime, DirectPtxRowNormalizationOperation.RmsNormBackwardInput, Rows))
         {
             object[] result = Run(runtime, kernel.Blueprint, views => kernel.Launch(views),
@@ -695,6 +708,16 @@ public sealed class DirectPtxNormalizationCorrectnessTests
                 gradOutput, input, rms, new float[Width]);
             AssertClose((float[])result[3], rmsGradGamma, 4e-3f,
                 "atomic RMSNorm grad gamma");
+        }
+        using (var kernel = new PtxRowNormalizationD64Kernel(
+                   runtime, DirectPtxRowNormalizationOperation.RmsNormBackwardFusedAtomic, Rows))
+        {
+            object[] result = Run(runtime, kernel.Blueprint, views => kernel.Launch(views),
+                gradOutput, input, gamma, rms, null, new float[Width]);
+            AssertClose((float[])result[4], rmsGradInput, 8e-4f,
+                "fused RMSNorm grad input");
+            AssertClose((float[])result[5], rmsGradGamma, 4e-3f,
+                "fused RMSNorm grad gamma");
         }
     }
 
