@@ -8407,6 +8407,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void EmbeddingBackward(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradEmbedding, int numIndices, int embeddingDim, int vocabSize)
     {
 #if NET5_0_OR_GREATER
+        if (embeddingDim == PtxScatterRowsF32Kernel.Features &&
+            TryDirectPtxScatterAddRows(
+                gradOutput, indices, gradEmbedding, numIndices, vocabSize, embeddingDim,
+                GpuDeterminism.IsActive))
+            return;
         if (GpuDeterminism.IsActive && embeddingDim == 1 &&
             TryDirectPtxScatterAddScalar(
                 gradOutput, indices, gradEmbedding, numIndices, vocabSize,
@@ -10057,6 +10062,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // Initialize output and counts to zero before accumulation
         Fill(output, 0f, outputSize * featureSize);
         Fill(counts, 0f, outputSize);
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxScatterMeanRows(
+            source, indices, output, counts, sourceSize, outputSize, featureSize,
+            GpuDeterminism.IsActive))
+            return;
+#endif
         IntPtr sPtr = source.Handle, idxPtr = indices.Handle, oPtr = output.Handle, cPtr = counts.Handle;
 
         if (GpuDeterminism.IsActive)

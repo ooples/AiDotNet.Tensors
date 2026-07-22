@@ -16,7 +16,7 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
             DirectPtxSparseGraphCompletionLedger.All
                 .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(34, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+        Assert.Equal(39, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
             entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
         Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
         Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
@@ -382,6 +382,29 @@ public sealed class DirectPtxSparseGraphTests
         Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
         Assert.Equal(atomic, ptx.Contains("atom.global.add.f32", StringComparison.Ordinal));
         Assert.Equal(seed, blueprint.Semantics["destination-seed"]);
+        Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
+        Assert.All(blueprint.Tensors, tensor => Assert.Equal(DirectPtxExtentMode.Exact, tensor.ExtentMode));
+    }
+
+    [Theory]
+    [InlineData((int)DirectPtxScatterRowsOperation.AddAtomic, 3, true)]
+    [InlineData((int)DirectPtxScatterRowsOperation.AddDeterministic, 3, false)]
+    [InlineData((int)DirectPtxScatterRowsOperation.MeanAccumulateAtomic, 4, true)]
+    [InlineData((int)DirectPtxScatterRowsOperation.MeanAccumulateDeterministic, 4, false)]
+    [InlineData((int)DirectPtxScatterRowsOperation.MeanNormalize, 2, false)]
+    public void ScatterRowsEmitter_BakesExactOperationAbi(
+        int operationValue,
+        int pointerCount,
+        bool atomic)
+    {
+        var operation = (DirectPtxScatterRowsOperation)operationValue;
+        string ptx = PtxScatterRowsF32Kernel.EmitPtx(8, 6, operation);
+        DirectPtxKernelBlueprint blueprint = PtxScatterRowsF32Kernel.CreateBlueprint(
+            DirectPtxArchitectureFamily.Ampere, operation);
+
+        Assert.Equal(pointerCount, Count(ptx, ".param .u64"));
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.Equal(atomic, ptx.Contains("atom.global", StringComparison.Ordinal));
         Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
         Assert.All(blueprint.Tensors, tensor => Assert.Equal(DirectPtxExtentMode.Exact, tensor.ExtentMode));
     }

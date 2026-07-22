@@ -58,6 +58,8 @@ public sealed partial class CudaBackend
         _directPtxStructuredSparse2x4Kernels = new(16);
     private readonly DirectPtxKernelCache<DirectPtxScalarScatterAddMode, PtxScatterAddScalarF32Kernel>
         _directPtxScalarScatterAddKernels = new(4);
+    private readonly DirectPtxKernelCache<DirectPtxScatterRowsOperation, PtxScatterRowsF32Kernel>
+        _directPtxScatterRowsKernels = new(8);
     private DirectPtxRuntime? _directPtxRuntime;
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
@@ -84,6 +86,7 @@ public sealed partial class CudaBackend
     private long _directPtxSparseUtilityDispatchCount;
     private long _directPtxStructuredSparse2x4DispatchCount;
     private long _directPtxScalarScatterAddDispatchCount;
+    private long _directPtxScatterRowsDispatchCount;
     internal int DirectPtxCachedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxAttentionKernels.Count; }
@@ -183,6 +186,8 @@ public sealed partial class CudaBackend
         System.Threading.Interlocked.Read(ref _directPtxStructuredSparse2x4DispatchCount);
     internal long DirectPtxScalarScatterAddDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxScalarScatterAddDispatchCount);
+    internal long DirectPtxScatterRowsDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxScatterRowsDispatchCount);
 
     /// <summary>
     /// Attempts the exact FP32 CSR SpMM golden specialization. The admitted ABI
@@ -1752,6 +1757,166 @@ public sealed partial class CudaBackend
             DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
             return false;
         }
+    }
+
+    internal bool TryDirectPtxScatterAddRows(
+        IGpuBuffer source,
+        IGpuBuffer indices,
+        IGpuBuffer destination,
+        int sourceRows,
+        int destinationRows,
+        int features,
+        bool deterministic)
+    {
+        int sourceElements = checked(sourceRows * features);
+        if (!ValidateDirectPtxScatterRows(
+            source, indices, destination, null,
+            sourceElements, destinationRows, features))
+            return false;
+        DirectPtxScatterRowsOperation operation = deterministic
+            ? DirectPtxScatterRowsOperation.AddDeterministic
+            : DirectPtxScatterRowsOperation.AddAtomic;
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxScatterRowsKernels.TryGetValue(operation, out _))
+                    return false;
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxScatterRowsF32Kernel kernel = _directPtxScatterRowsKernels.GetOrAdd(
+                    operation, () => new PtxScatterRowsF32Kernel(_directPtxRuntime!, operation));
+                if (capturing && !_directPtxScatterRowsKernels.Pin(operation)) return false;
+                lock (GpuDispatchLock)
+                    kernel.LaunchThree(
+                        DirectPtxTensorView.Create(source, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(indices, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(destination, kernel.Blueprint.Tensors[2]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxScatterRowsDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryDirectPtxScatterMeanRows(
+        IGpuBuffer source,
+        IGpuBuffer indices,
+        IGpuBuffer destination,
+        IGpuBuffer counts,
+        int sourceElements,
+        int destinationRows,
+        int features,
+        bool deterministic)
+    {
+        if (!ValidateDirectPtxScatterRows(
+            source, indices, destination, counts,
+            sourceElements, destinationRows, features))
+            return false;
+        DirectPtxScatterRowsOperation accumulate = deterministic
+            ? DirectPtxScatterRowsOperation.MeanAccumulateDeterministic
+            : DirectPtxScatterRowsOperation.MeanAccumulateAtomic;
+        const DirectPtxScatterRowsOperation normalize = DirectPtxScatterRowsOperation.MeanNormalize;
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                if (capturing &&
+                    (!_directPtxScatterRowsKernels.TryGetValue(accumulate, out _) ||
+                     !_directPtxScatterRowsKernels.TryGetValue(normalize, out _)))
+                    return false;
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxScatterRowsF32Kernel accumulateKernel = _directPtxScatterRowsKernels.GetOrAdd(
+                    accumulate, () => new PtxScatterRowsF32Kernel(_directPtxRuntime!, accumulate));
+                PtxScatterRowsF32Kernel normalizeKernel = _directPtxScatterRowsKernels.GetOrAdd(
+                    normalize, () => new PtxScatterRowsF32Kernel(_directPtxRuntime!, normalize));
+                if (capturing &&
+                    (!_directPtxScatterRowsKernels.Pin(accumulate) ||
+                     !_directPtxScatterRowsKernels.Pin(normalize)))
+                    return false;
+                lock (GpuDispatchLock)
+                {
+                    accumulateKernel.LaunchFour(
+                        DirectPtxTensorView.Create(source, accumulateKernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(indices, accumulateKernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(destination, accumulateKernel.Blueprint.Tensors[2]),
+                        DirectPtxTensorView.Create(counts, accumulateKernel.Blueprint.Tensors[3]));
+                    normalizeKernel.LaunchNormalize(
+                        DirectPtxTensorView.Create(destination, normalizeKernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(counts, normalizeKernel.Blueprint.Tensors[1]));
+                }
+            }
+            System.Threading.Interlocked.Add(ref _directPtxScatterRowsDispatchCount, 2);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool PrewarmDirectPtxScatterRows(DirectPtxScatterRowsOperation operation)
+    {
+        if (!IsDirectPtxSparseGraphEnabled || IsStreamCapturing()) return false;
+        try
+        {
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _ = _directPtxScatterRowsKernels.GetOrAdd(
+                    operation, () => new PtxScatterRowsF32Kernel(_directPtxRuntime!, operation));
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    private static bool ValidateDirectPtxScatterRows(
+        IGpuBuffer source,
+        IGpuBuffer indices,
+        IGpuBuffer destination,
+        IGpuBuffer? counts,
+        int sourceElements,
+        int destinationRows,
+        int features)
+    {
+        if (!PtxScatterRowsF32Kernel.SupportsShape(sourceElements, destinationRows, features))
+            return false;
+        int sourceRows = sourceElements / features;
+        if (!HasExactBytes(source, (long)sourceElements * sizeof(float)) ||
+            !HasExactBytes(indices, (long)sourceRows * sizeof(int)) ||
+            !HasExactBytes(destination, (long)destinationRows * features * sizeof(float)) ||
+            (counts is not null && !HasExactBytes(counts, (long)destinationRows * sizeof(int))))
+            return false;
+        nuint pointers = (nuint)source.Handle | (nuint)indices.Handle | (nuint)destination.Handle;
+        if (counts is not null) pointers |= (nuint)counts.Handle;
+        if (source.Handle == IntPtr.Zero || indices.Handle == IntPtr.Zero ||
+            destination.Handle == IntPtr.Zero || (counts is not null && counts.Handle == IntPtr.Zero) ||
+            (pointers & 15u) != 0)
+            return false;
+        if (DirectPtxBuffersOverlap(destination, source) ||
+            DirectPtxBuffersOverlap(destination, indices) ||
+            (counts is not null && (DirectPtxBuffersOverlap(counts, source) ||
+                DirectPtxBuffersOverlap(counts, indices) ||
+                DirectPtxBuffersOverlap(counts, destination))))
+            return false;
+        return true;
     }
 
     private static bool DirectPtxBuffersOverlap(IGpuBuffer left, IGpuBuffer right)
@@ -3607,6 +3772,7 @@ public sealed partial class CudaBackend
             _directPtxSparseUtilityKernels.Dispose();
             _directPtxStructuredSparse2x4Kernels.Dispose();
             _directPtxScalarScatterAddKernels.Dispose();
+            _directPtxScatterRowsKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }
