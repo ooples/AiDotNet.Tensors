@@ -3,6 +3,7 @@ using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 using AiDotNet.Tensors.Engines.Gpu;
+using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
@@ -77,6 +78,97 @@ internal static class DirectPtxGeGluExperiment
         }
     }
 
+    internal static void RunSwiGluForward(int independentRuns = 3)
+    {
+        if (independentRuns <= 0) throw new ArgumentOutOfRangeException(nameof(independentRuns));
+        bool? previousGate = DirectPtxFeatureGate.TestOverride;
+        bool previousExperiment = DirectPtxFeatureGate.SwiGluExperimentOverride;
+        DirectPtxFeatureGate.SwiGluExperimentOverride = true;
+        _flopsPerOutput = 10.0;
+        _bytesPerOutput = 12.0;
+        try
+        {
+            Console.WriteLine(
+                $"Direct-PTX FP32 SwiGLU: {independentRuns} run(s), " +
+                $"{Warmups} warmups + {Samples} samples/cell");
+            PrintHeader();
+            for (int run = 1; run <= independentRuns; run++)
+            foreach ((int outer, int halfDimension) in Shapes)
+                RunSwiGluCell(run, outer, halfDimension);
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previousGate;
+            DirectPtxFeatureGate.SwiGluExperimentOverride = previousExperiment;
+        }
+    }
+
+    private static void RunSwiGluCell(int run, int outerSize, int halfDimension)
+    {
+        using var backend = new CudaBackend();
+        if (run == 1 && outerSize == Shapes[0].Outer && halfDimension == Shapes[0].HalfDimension)
+            Console.WriteLine($"GPU: {backend.DeviceName}");
+        int outputElements = checked(outerSize * halfDimension);
+        int inputElements = checked(2 * outputElements);
+        var random = RandomHelper.CreateSeededRandom(20262100 + run * 100 + outerSize + halfDimension);
+        float[] inputHost = Enumerable.Range(0, inputElements)
+            .Select(_ => (random.NextSingle() * 2f - 1f) * 2f).ToArray();
+        float[] expected = SwiGluOracle(inputHost, outerSize, halfDimension);
+        using var input = backend.AllocateBuffer(inputHost);
+        using var baselineOutput = backend.AllocateBuffer(outputElements);
+        using var directOutput = backend.AllocateBuffer(outputElements);
+
+        void BaselineLaunch() => backend.SwiGluForward(
+            input, baselineOutput, outerSize, halfDimension);
+        void DirectLaunch()
+        {
+            if (!backend.TryDirectPtxSwiGluForward(
+                input, directOutput, outerSize, halfDimension))
+                throw new InvalidOperationException(backend.DirectPtxLastError);
+        }
+
+        DirectPtxFeatureGate.TestOverride = false;
+        BaselineLaunch();
+        backend.Synchronize();
+        float baselineError = MaximumError(backend.DownloadBuffer(baselineOutput), expected);
+        MeasureAndPrint(run, outerSize, halfDimension, "AiDotNet CUDA eager", backend,
+            BaselineLaunch, baselineError, temporaryBytes: 0);
+        MeasureGraphAndPrint(run, outerSize, halfDimension, "AiDotNet CUDA graph", backend,
+            BaselineLaunch, baselineError, temporaryBytes: 0);
+
+        DirectPtxFeatureGate.TestOverride = true;
+        if (!backend.PrewarmDirectPtxSwiGluForward(outerSize, halfDimension))
+            throw new InvalidOperationException(backend.DirectPtxLastError);
+        DirectLaunch();
+        backend.Synchronize();
+        float directError = MaximumError(backend.DownloadBuffer(directOutput), expected);
+        if (!backend.TryGetDirectPtxSwiGluAudit(
+            outerSize, halfDimension, out DirectPtxKernelAudit audit))
+            throw new InvalidOperationException("No audit for measured SwiGLU PTX module.");
+        MeasureAndPrint(run, outerSize, halfDimension, "Direct PTX eager", backend,
+            DirectLaunch, directError, temporaryBytes: 0, audit);
+        MeasureGraphAndPrint(run, outerSize, halfDimension, "Direct PTX graph", backend,
+            DirectLaunch, directError, temporaryBytes: 0, audit);
+    }
+
+    // Reference SwiGLU: output = value * SiLU(gate), gate = input second half.
+    private static float[] SwiGluOracle(float[] input, int outerSize, int halfDimension)
+    {
+        var output = new float[outerSize * halfDimension];
+        for (int row = 0; row < outerSize; row++)
+        {
+            int inputBase = row * halfDimension * 2;
+            int outputBase = row * halfDimension;
+            for (int feature = 0; feature < halfDimension; feature++)
+            {
+                double gate = input[inputBase + halfDimension + feature];
+                double silu = gate / (1.0 + Math.Exp(-gate));
+                output[outputBase + feature] = (float)(input[inputBase + feature] * silu);
+            }
+        }
+        return output;
+    }
+
     private static void RunCell(int run, int outerSize, int halfDimension)
     {
         using var backend = new CudaBackend();
@@ -84,7 +176,7 @@ internal static class DirectPtxGeGluExperiment
             Console.WriteLine($"GPU: {backend.DeviceName}");
         int outputElements = checked(outerSize * halfDimension);
         int inputElements = checked(2 * outputElements);
-        var random = new Random(20261900 + run * 100 + outerSize + halfDimension);
+        var random = RandomHelper.CreateSeededRandom(20261900 + run * 100 + outerSize + halfDimension);
         float[] inputHost = Enumerable.Range(0, inputElements)
             .Select(_ => (random.NextSingle() * 2f - 1f) * 2f).ToArray();
         float[] expected = Oracle(inputHost, outerSize, halfDimension);
@@ -134,7 +226,7 @@ internal static class DirectPtxGeGluExperiment
             Console.WriteLine($"GPU: {backend.DeviceName}");
         int outputElements = checked(outerSize * halfDimension);
         int inputElements = checked(2 * outputElements);
-        var random = new Random(20262000 + run * 100 + outerSize + halfDimension);
+        var random = RandomHelper.CreateSeededRandom(20262000 + run * 100 + outerSize + halfDimension);
         float[] inputHost = Enumerable.Range(0, inputElements)
             .Select(_ => (random.NextSingle() * 2f - 1f) * 2f).ToArray();
         float[] gradOutputHost = Enumerable.Range(0, outputElements)
@@ -315,7 +407,7 @@ internal static class DirectPtxGeGluExperiment
             $"\"median_us\":{device.Median.ToString("R", c)}," +
             $"\"p95_us\":{device.P95.ToString("R", c)}," +
             $"\"managed_bytes\":{allocation},\"temp_bytes\":{temporaryBytes}," +
-            $"\"max_error\":{error.ToString("R", c)},\"local_bytes\":{localBytes}" +
+            $"\"max_error\":{error.ToString("R", c)},\"tolerance\":2e-4,\"local_bytes\":{localBytes}" +
             "}");
     }
 

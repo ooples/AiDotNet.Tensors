@@ -120,6 +120,12 @@ class Program
             DirectPtxGeGluExperiment.RunBackward(runs);
             return;
         }
+        if (args.Length > 0 && args[0] == "--direct-ptx-swiglu")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxGeGluExperiment.RunSwiGluForward(runs);
+            return;
+        }
         if (args.Length > 0 && args[0] == "--direct-ptx-external-gpu-baselines")
         {
             DirectPtxExternalBaselines.Run();
@@ -1148,6 +1154,7 @@ class Program
         Console.WriteLine("  --direct-ptx-residual-layernorm-gelu [runs]: fused D64 normalization championship matrix");
         Console.WriteLine("  --direct-ptx-geglu [runs]: exact FP32 split-row tanh-GeGLU championship matrix");
         Console.WriteLine("  --direct-ptx-geglu-backward [runs]: exact fused FP32 GeGLU derivative championship");
+        Console.WriteLine("  --direct-ptx-swiglu [runs]: exact FP32 split-row SwiGLU forward championship");
         Console.WriteLine("  --direct-ptx-external-gpu-baselines: forced cuDNN/Flash/Math/compiled Python GPU matrix");
         Console.WriteLine("  --direct-ptx-profile-attention: deterministic Nsight Compute attention target");
         Console.WriteLine("  --direct-ptx-profile-residual-rmsnorm: deterministic Nsight Compute fusion target");
