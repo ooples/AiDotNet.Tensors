@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -39,7 +38,7 @@ internal static class DirectPtxAttentionAutotuner
                 batch, queryHeads, keyValueHeads, querySequence, keyValueSequence,
                 isCausal, causalQueryOffset, fused, emitStats, scale, epsilon));
         if (choice?.Variant?.StartsWith(VariantPrefix, StringComparison.Ordinal) == true &&
-            int.TryParse(choice.Variant.AsSpan(VariantPrefix.Length), NumberStyles.None,
+            int.TryParse(choice.Variant.Substring(VariantPrefix.Length), NumberStyles.None,
                 CultureInfo.InvariantCulture, out int parsed) &&
             Array.IndexOf(Candidates(querySequence), parsed) >= 0)
         {
@@ -114,6 +113,5 @@ internal static class DirectPtxAttentionAutotuner
             PtxOnlineFusedAttention128x64Kernel.HeadDimension,
             isCausal ? 1 : 0, causalQueryOffset,
             fused ? 1 : 0, emitStats ? 1 : 0,
-            BitConverter.SingleToInt32Bits(scale), BitConverter.SingleToInt32Bits(epsilon));
+            PtxCompat.SingleToInt32Bits(scale), PtxCompat.SingleToInt32Bits(epsilon));
 }
-#endif

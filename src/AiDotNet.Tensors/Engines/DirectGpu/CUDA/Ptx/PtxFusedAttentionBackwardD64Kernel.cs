@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -51,7 +50,7 @@ internal sealed class PtxFusedAttentionBackwardD64Kernel : IDisposable
         int keyValueSequence,
         float scale)
     {
-        ArgumentNullException.ThrowIfNull(runtime);
+        PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         if (runtime.ArchitectureFamily != DirectPtxArchitectureFamily.Ampere)
             throw new PlatformNotSupportedException(
                 "The checked-in attention-backward specialization is validated only on Ampere.");
@@ -573,10 +572,9 @@ internal sealed class PtxFusedAttentionBackwardD64Kernel : IDisposable
             throw new ArgumentOutOfRangeException(nameof(keyValueSequence));
         if (checked((queryHeads / keyValueHeads) * querySequence) > 2048)
             throw new ArgumentOutOfRangeException(nameof(queryHeads));
-        if (!float.IsFinite(scale)) throw new ArgumentOutOfRangeException(nameof(scale));
+        if (!PtxCompat.IsFinite(scale)) throw new ArgumentOutOfRangeException(nameof(scale));
     }
 
     private static string FloatLiteral(float value) =>
-        "0f" + BitConverter.SingleToInt32Bits(value).ToString("X8", CultureInfo.InvariantCulture);
+        "0f" + PtxCompat.SingleToInt32Bits(value).ToString("X8", CultureInfo.InvariantCulture);
 }
-#endif
