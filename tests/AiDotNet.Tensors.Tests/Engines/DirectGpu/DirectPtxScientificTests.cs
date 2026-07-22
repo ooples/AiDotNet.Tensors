@@ -24,7 +24,7 @@ public class DirectPtxScientificTests
             Assert.False(string.IsNullOrWhiteSpace(cell.DTypes));
             Assert.False(string.IsNullOrWhiteSpace(cell.DirectPtxAssignment));
         });
-        foreach (string api in new[] { "CudaBackend.ComplexMultiply", "CudaBackend.ComplexConjugate", "CudaBackend.ComplexMagnitude", "CudaBackend.OctonionAdd" })
+        foreach (string api in new[] { "CudaBackend.ComplexMultiply", "CudaBackend.ComplexConjugate", "CudaBackend.ComplexMagnitude", "CudaBackend.OctonionAdd", "CudaBackend.OctonionMultiply" })
             Assert.Equal(DirectPtxScientificCoverageStatus.ExperimentalDirectPtx,
                 DirectPtxScientificCoverageManifest.Get(api).Status);
         Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() =>
@@ -214,6 +214,69 @@ public class DirectPtxScientificTests
         var actual = new float[count * 8];
         output.Download<float>(actual);
         AssertVectorClose(actual, expected, 0f, "octonion add");
+    }
+
+    [Fact]
+    public void OctonionMultiplyEmitter_IsRegisterResidentCayleyDickson()
+    {
+        string ptx = PtxOctonionMultiplyKernel.EmitPtx(8, 6, 16384);
+        Assert.Contains(PtxOctonionMultiplyKernel.EntryPoint, ptx);
+        Assert.Equal(16, Count(ptx, "ld.global.nc.f32"));   // 8 a + 8 b into registers
+        Assert.Equal(8, Count(ptx, "st.global.f32"));        // 8 output components
+        Assert.Equal(8, Count(ptx, "mul.rn.f32 %f16"));      // one leading product per component
+        Assert.Equal(0, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxOctonionMultiplyKernel.IsSupportedCount(16384));
+        Assert.False(PtxOctonionMultiplyKernel.IsPromotedCount(16384));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyOctonionMultiply_MatchesCayleyDicksonOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in octonion-multiply specialization is measured on GA10x/SM86.");
+        const int count = 16384;
+        using var kernel = new PtxOctonionMultiplyKernel(runtime, count);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20266200);
+        float[] aHost = Values(random, count * 8, 1.5f);
+        float[] bHost = Values(random, count * 8, 1.5f);
+        var expected = new float[count * 8];
+        for (int o = 0; o < count; o++)
+        {
+            int p = o * 8;
+            double a0 = aHost[p], a1 = aHost[p + 1], a2 = aHost[p + 2], a3 = aHost[p + 3];
+            double a4 = aHost[p + 4], a5 = aHost[p + 5], a6 = aHost[p + 6], a7 = aHost[p + 7];
+            double b0 = bHost[p], b1 = bHost[p + 1], b2 = bHost[p + 2], b3 = bHost[p + 3];
+            double b4 = bHost[p + 4], b5 = bHost[p + 5], b6 = bHost[p + 6], b7 = bHost[p + 7];
+            expected[p]     = (float)(a0*b0 - a1*b1 - a2*b2 - a3*b3 - a4*b4 - a5*b5 - a6*b6 - a7*b7);
+            expected[p + 1] = (float)(a0*b1 + a1*b0 + a2*b3 - a3*b2 + a4*b5 - a5*b4 - a6*b7 + a7*b6);
+            expected[p + 2] = (float)(a0*b2 - a1*b3 + a2*b0 + a3*b1 + a4*b6 + a5*b7 - a6*b4 - a7*b5);
+            expected[p + 3] = (float)(a0*b3 + a1*b2 - a2*b1 + a3*b0 + a4*b7 - a5*b6 + a6*b5 - a7*b4);
+            expected[p + 4] = (float)(a0*b4 - a1*b5 - a2*b6 - a3*b7 + a4*b0 + a5*b1 + a6*b2 + a7*b3);
+            expected[p + 5] = (float)(a0*b5 + a1*b4 - a2*b7 + a3*b6 - a4*b1 + a5*b0 - a6*b3 + a7*b2);
+            expected[p + 6] = (float)(a0*b6 + a1*b7 + a2*b4 - a3*b5 - a4*b2 + a5*b3 + a6*b0 - a7*b1);
+            expected[p + 7] = (float)(a0*b7 - a1*b6 + a2*b5 + a3*b4 - a4*b3 - a5*b2 + a6*b1 + a7*b0);
+        }
+
+        using var a = runtime.AllocateBytes((nuint)(aHost.Length * sizeof(float)));
+        using var b = runtime.AllocateBytes((nuint)(bHost.Length * sizeof(float)));
+        using var output = runtime.AllocateBytes((nuint)(count * 8 * sizeof(float)));
+        a.Upload<float>(aHost);
+        b.Upload<float>(bHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(a, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(b, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[count * 8];
+        output.Download<float>(actual);
+        AssertVectorClose(actual, expected, 3e-3f, "octonion multiply");
     }
 
     private static float[] Values(Random random, int count, float magnitude)
