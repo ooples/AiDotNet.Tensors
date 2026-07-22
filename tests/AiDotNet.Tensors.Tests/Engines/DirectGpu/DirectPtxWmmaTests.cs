@@ -2361,6 +2361,84 @@ public class DirectPtxWmmaTests
         _ => x
     };
 
+    [Fact]
+    public void FusedGemmBiasEmitter_IsRegisterResidentTiledGemm()
+    {
+        string ptx = PtxFusedGemmBiasKernel.EmitPtx(
+            8, 6, 64, 256, 256, DirectPtxLinearActivation.GeluTanh);
+        Assert.Contains(PtxFusedGemmBiasKernel.EntryPoint, ptx);
+        Assert.Contains(".shared .align 16 .b8 a_tile[2048]", ptx);
+        Assert.Contains(".shared .align 16 .b8 b_tile[2048]", ptx);
+        Assert.Equal(144, Count(ptx, "fma.rn.f32"));   // 128 inner + 16 gelu
+        Assert.Equal(64, Count(ptx, "ld.shared.f32"));
+        Assert.Equal(2, Count(ptx, "bar.sync 0"));
+        Assert.Equal(16, Count(ptx, "st.global.f32"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(128, Count(PtxFusedGemmBiasKernel.EmitPtx(
+            8, 6, 64, 256, 256, DirectPtxLinearActivation.None), "fma.rn.f32"));
+        Assert.False(PtxFusedGemmBiasKernel.IsSupportedShape(63, 256, 256));
+        Assert.True(PtxFusedGemmBiasKernel.IsSupportedShape(128, 512, 2048));
+        Assert.False(PtxFusedGemmBiasKernel.IsPromotedShape(128, 512, 2048));
+    }
+
+    [SkippableTheory]
+    [InlineData(64, 256, 256, 2)]  // GeluTanh
+    [InlineData(128, 512, 512, 1)] // Relu
+    [InlineData(64, 256, 512, 0)]  // None
+    public void DriverOnlyFusedGemmBias_MatchesOracleAndHasZeroLocalBytes(
+        int m, int k, int n, int activationValue)
+    {
+        var activation = (DirectPtxLinearActivation)activationValue;
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedFusedLinear(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in GemmBias specialization is measured on GA10x/SM86.");
+        using var kernel = new PtxFusedGemmBiasKernel(runtime, m, k, n, activation);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20262400 + m + k + n + activationValue);
+        float[] aHost = Values(random, m * k, 0.125f);
+        float[] bHost = Values(random, k * n, 0.0625f);   // standard row-major [K,N]
+        float[] biasHost = Values(random, n, 0.0625f);
+        float[] expected = GemmBiasOracle(aHost, bHost, biasHost, m, k, n, activation);
+
+        using var a = runtime.AllocateBytes((nuint)(aHost.Length * sizeof(float)));
+        using var b = runtime.AllocateBytes((nuint)(bHost.Length * sizeof(float)));
+        using var bias = runtime.AllocateBytes((nuint)(biasHost.Length * sizeof(float)));
+        using var output = runtime.AllocateBytes((nuint)(m * n * sizeof(float)));
+        a.Upload<float>(aHost);
+        b.Upload<float>(bHost);
+        bias.Upload<float>(biasHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(a, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(b, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[3]));
+        runtime.Synchronize();
+        var actual = new float[m * n];
+        output.Download<float>(actual);
+        AssertVectorClose(actual, expected, 2e-3f, $"tiled gemm-bias {activation} {m}x{k}x{n}");
+    }
+
+    private static float[] GemmBiasOracle(
+        float[] a, float[] b, float[] bias, int m, int k, int n,
+        DirectPtxLinearActivation activation)
+    {
+        var output = new float[m * n];
+        for (int row = 0; row < m; row++)
+        for (int col = 0; col < n; col++)
+        {
+            double acc = 0;
+            for (int kk = 0; kk < k; kk++)
+                acc += a[row * k + kk] * (double)b[kk * n + col]; // B is standard [K,N]
+            acc += bias[col];
+            output[row * n + col] = (float)ApplyTiledActivation(acc, activation);
+        }
+        return output;
+    }
+
     [Theory]
     [InlineData(8, 6, true)]
     [InlineData(8, 0, false)]
