@@ -30,6 +30,8 @@ public sealed partial class CudaBackend
         _directPtxFlashAttentionBackwardKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<DirectPtxQkvRopeCacheKey, PtxFusedQkvRopeCacheD64Kernel>
         _directPtxQkvRopeCacheKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<DirectPtxMseLossKey, PtxFusedMseLossF32Kernel>
+        _directPtxMseLossKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private DirectPtxRuntime? _directPtxRuntime;
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
@@ -43,6 +45,7 @@ public sealed partial class CudaBackend
     private long _directPtxAttentionBackwardDispatchCount;
     private long _directPtxFlashAttentionBackwardDispatchCount;
     private long _directPtxQkvRopeCacheDispatchCount;
+    private long _directPtxMseLossDispatchCount;
     internal int DirectPtxCachedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxAttentionKernels.Count; }
@@ -97,6 +100,13 @@ public sealed partial class CudaBackend
 
     internal long DirectPtxQkvRopeCacheDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxQkvRopeCacheDispatchCount);
+
+    internal bool IsDirectPtxMseLossEnabled =>
+        DirectPtxFeatureGate.IsMseLossEnabled && IsAvailable &&
+        DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) == DirectPtxArchitectureFamily.Ampere;
+
+    internal long DirectPtxMseLossDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxMseLossDispatchCount);
     internal int DirectPtxQkvRopeCacheKernelCapacity => _directPtxQkvRopeCacheKernels.Capacity;
     internal int DirectPtxQkvRopeCachePinnedKernelCount
     {
@@ -1775,6 +1785,165 @@ public sealed partial class CudaBackend
         return false;
     }
 
+    /// <summary>
+    /// Attempts exact contiguous FP32 per-sample MSE loss of [rows,columns]
+    /// prediction/target matrices to a [rows] loss vector. Shape validation
+    /// happens before dispatch; the PTX ABI receives only pred/target/loss pointers.
+    /// </summary>
+    internal bool TryDirectPtxMseLoss(
+        IGpuBuffer predictions,
+        IGpuBuffer targets,
+        IGpuBuffer loss,
+        int rows,
+        int columns)
+    {
+        if (!DirectPtxFeatureGate.IsMseLossEnabled)
+        {
+            DirectPtxLastError = "mse-loss-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "mse-loss-cuda-unavailable";
+            return false;
+        }
+        if (DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) !=
+            DirectPtxArchitectureFamily.Ampere)
+        {
+            DirectPtxLastError = "mse-loss-architecture-not-validated";
+            return false;
+        }
+        if (!PtxFusedMseLossF32Kernel.IsSupportedShape(rows, columns))
+        {
+            DirectPtxLastError = "mse-loss-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedMseLossF32Kernel.IsPromotedShape(rows, columns) &&
+            !DirectPtxFeatureGate.MseLossExperimentOverride)
+        {
+            DirectPtxLastError = "mse-loss-performance-gate-not-met";
+            return false;
+        }
+
+        long matrixBytes = checked((long)rows * columns * sizeof(float));
+        if (predictions.SizeInBytes != matrixBytes || targets.SizeInBytes != matrixBytes ||
+            loss.SizeInBytes != checked((long)rows * sizeof(float)))
+        {
+            DirectPtxLastError = "mse-loss-physical-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            EnsureContextCurrent();
+            var key = new DirectPtxMseLossKey(rows, columns);
+            lock (_directPtxLock)
+            {
+                if (!_directPtxMseLossKernels.TryGetValue(
+                    key, out PtxFusedMseLossF32Kernel? kernel))
+                {
+                    if (IsStreamCapturing())
+                    {
+                        DirectPtxLastError =
+                            "Direct PTX MSE loss must be prewarmed before CUDA graph capture.";
+                        return false;
+                    }
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    kernel = CreateAndCacheMseLossKernelSlow(key);
+                }
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(predictions, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(targets, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(loss, kernel.Blueprint.Tensors[2]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxMseLossDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxFusedMseLossF32Kernel CreateAndCacheMseLossKernelSlow(
+        DirectPtxMseLossKey key) =>
+        _directPtxMseLossKernels.GetOrAdd(key, () =>
+            new PtxFusedMseLossF32Kernel(_directPtxRuntime!, key.Rows, key.Columns));
+
+    internal bool PrewarmDirectPtxMseLoss(int rows, int columns)
+    {
+        if (!DirectPtxFeatureGate.IsMseLossEnabled)
+        {
+            DirectPtxLastError = "mse-loss-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "mse-loss-cuda-unavailable";
+            return false;
+        }
+        if (DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) !=
+            DirectPtxArchitectureFamily.Ampere)
+        {
+            DirectPtxLastError = "mse-loss-architecture-not-validated";
+            return false;
+        }
+        if (!PtxFusedMseLossF32Kernel.IsSupportedShape(rows, columns))
+        {
+            DirectPtxLastError = "mse-loss-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedMseLossF32Kernel.IsPromotedShape(rows, columns) &&
+            !DirectPtxFeatureGate.MseLossExperimentOverride)
+        {
+            DirectPtxLastError = "mse-loss-performance-gate-not-met";
+            return false;
+        }
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX MSE loss prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                var key = new DirectPtxMseLossKey(rows, columns);
+                if (!_directPtxMseLossKernels.TryGetValue(key, out _))
+                    _ = CreateAndCacheMseLossKernelSlow(key);
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxMseLossAudit(int rows, int columns, out DirectPtxKernelAudit audit)
+    {
+        lock (_directPtxLock)
+        {
+            var key = new DirectPtxMseLossKey(rows, columns);
+            if (_directPtxMseLossKernels.TryGetValue(key, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null!;
+        return false;
+    }
+
     private void DisposeDirectPtxRuntime()
     {
         lock (_directPtxLock)
@@ -1787,6 +1956,7 @@ public sealed partial class CudaBackend
             _directPtxAttentionBackwardKernels.Dispose();
             _directPtxFlashAttentionBackwardKernels.Dispose();
             _directPtxQkvRopeCacheKernels.Dispose();
+            _directPtxMseLossKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }
@@ -1853,6 +2023,7 @@ public sealed partial class CudaBackend
         int Heads,
         int CacheCapacity,
         int Position);
+    private readonly record struct DirectPtxMseLossKey(int Rows, int Columns);
 
 }
 #endif
