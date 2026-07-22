@@ -44,6 +44,14 @@ internal static class DirectPtxArchitecture
     /// </summary>
     internal static bool HasValidatedQkvRopeCache(int major, int minor) =>
         (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The checked-in pointwise/activation/GLU specializations (issue #839) are measured
+    /// and promoted only on GA10x/SM86. Other architectures fail closed to the established
+    /// backend rather than inheriting Ampere's tuning.
+    /// </summary>
+    internal static bool HasValidatedPointwise(int major, int minor) =>
+        (major, minor) == (8, 6);
 }
 
 internal enum DirectPtxExtentMode
