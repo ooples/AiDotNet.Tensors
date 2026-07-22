@@ -55,6 +55,7 @@ public enum CudaResult
     NotMapped = 211,
     NotMappedAsArray = 212,
     NotMappedAsPointer = 213,
+    InvalidPtx = 218,
     LaunchFailed = 719,
     NotReady = 600,
     Unknown = 999
@@ -592,6 +593,26 @@ public static class CuBlasNative
         int computeType,
         int algo);
 
+    /// <summary>
+    /// Mixed-precision strided-batched GEMM. This is the closest cuBLAS
+    /// comparison for a packed batch of attention heads because it performs
+    /// the entire Q*K^T fanout with one host launch.
+    /// </summary>
+    [DllImport(CublasLibrary, EntryPoint = "cublasGemmStridedBatchedEx")]
+    public static extern CublasStatus cublasGemmStridedBatchedEx(
+        IntPtr handle,
+        CublasOperation transa,
+        CublasOperation transb,
+        int m, int n, int k,
+        IntPtr alpha,
+        IntPtr A, int Atype, int lda, long strideA,
+        IntPtr B, int Btype, int ldb, long strideB,
+        IntPtr beta,
+        IntPtr C, int Ctype, int ldc, long strideC,
+        int batchCount,
+        int computeType,
+        int algo);
+
     // CUDA data types for cublasGemmEx
     public const int CUDA_R_16F = 2;   // __half
     public const int CUDA_R_32F = 0;   // float
@@ -648,6 +669,7 @@ public static class CuBlasNative
             CudaResult.NoDevice => "No CUDA device available",
             CudaResult.InvalidDevice => "Invalid device",
             CudaResult.InvalidContext => "Invalid context",
+            CudaResult.InvalidPtx => "Invalid PTX (JIT compilation failed)",
             CudaResult.LaunchFailed => "Kernel launch failed",
             CudaResult.NotReady => "Operation not ready (async operation still in progress)",
             _ => $"Unknown CUDA error ({(int)result})"

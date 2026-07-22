@@ -7,6 +7,9 @@ using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.Gpu;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
+#if NET5_0_OR_GREATER
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+#endif
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -4001,8 +4004,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return destinationArray is not null;
     }
 
+    private static bool IsCanonicalDenseAllocation<T>(Tensor<T> tensor)
+        => tensor.IsContiguous && !tensor.IsSparse
+            && tensor._storageOffset == 0 && tensor._storage.Length == tensor.Length;
+
     private OwnedBuffer GetOrAllocateContiguousInputBuffer<T>(IDirectGpuBackend backend, Tensor<T> tensor)
     {
+        // Validate the logical-to-physical contract before accepting ANY
+        // resident/cached fast path. A contiguous view with a storage offset,
+        // or a view into a larger backing allocation, is not a canonical base
+        // pointer and cannot be passed to a stride-free device kernel.
+        if (!IsCanonicalDenseAllocation(tensor))
+            throw new InvalidOperationException(
+                "GPU destination-aware tensor ops require a contiguous, dense, zero-offset canonical allocation.");
+
         // #3 FP16-act CONVERT-AT-GAP: an FP16-tagged input → stable up-converted FP32 (see GetResidentOrPersistentInputBuffer).
         var tHalfC = TryFp16ResidentInput(tensor, out var tCountC);
         if (tHalfC is not null)
@@ -4012,11 +4027,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         if (tensor._gpuBuffer is not null && ReferenceEquals(tensor._gpuBackend, backend))
             return new OwnedBuffer(tensor._gpuBuffer, ownsBuffer: false);
-
-        if (!tensor.IsContiguous || tensor.IsSparse)
-            throw new InvalidOperationException("GPU destination-aware tensor ops require contiguous dense inputs.");
-        if (tensor._storageOffset != 0 || tensor._storage.Length != tensor.Length)
-            throw new InvalidOperationException("GPU destination-aware tensor ops require simple CPU-backed inputs.");
 
         return GetOrAllocateBuffer(backend, tensor);
     }
@@ -10116,6 +10126,81 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         // Compute scale if not provided
         float scaleFloat = (float)(scale ?? (1.0 / Math.Sqrt(headDim)));
+
+#if NET5_0_OR_GREATER
+        // Opt-in direct-PTX specialization. This is the only dynamic boundary:
+        // prove a zero-offset dense [B,H,S,D] allocation here, resolve it once
+        // to the kernel's physical FP16 dtype, then launch PTX containing no
+        // shape/stride/layout checks. Unsupported shapes or any JIT failure
+        // fall through to the existing NVRTC FlashAttention implementation.
+        if (typeof(T) == typeof(float) && attentionBias is null
+            && backend is Engines.DirectGpu.CUDA.CudaBackend directCuda
+            && directCuda.IsDirectPtxAttentionEnabled
+            // Module JIT and the eager scratch allocations below are not
+            // stream-capture safe. Captured graphs keep the established
+            // resident NVRTC path until a PTX prewarm/capture API is added.
+            && !directCuda.IsStreamCapturing()
+            && seqQ == seqK
+            && PtxOnlineFusedAttention128x64Kernel.IsSupportedSequenceLength(seqQ)
+            && headDim == PtxOnlineFusedAttention128x64Kernel.HeadDimension
+            && key.Shape._dims[0] == batch && value.Shape._dims[0] == batch
+            && key.Shape._dims[1] == heads && value.Shape._dims[1] == heads
+            && key.Shape._dims[3] == headDim && value.Shape._dims[2] == seqK
+            && value.Shape._dims[3] == headDim
+            && IsCanonicalDenseAllocation(query)
+            && IsCanonicalDenseAllocation(key)
+            && IsCanonicalDenseAllocation(value))
+        {
+            IGpuBuffer? queryHalfOwned = null;
+            IGpuBuffer? keyHalfOwned = null;
+            IGpuBuffer? valueHalfOwned = null;
+            var directOutput = AllocateOutputBuffer(backend, batch * heads * seqQ * headDim);
+            var directStats = AllocateOutputBuffer(backend, batch * heads * seqQ);
+            bool directHanded = false;
+            try
+            {
+                int inputElements = batch * heads * seqQ * headDim;
+                IGpuBuffer queryHalf = ResolveToFp16(
+                    query, inputElements, directCuda, backend, out queryHalfOwned);
+                IGpuBuffer keyHalf = ResolveToFp16(
+                    key, inputElements, directCuda, backend, out keyHalfOwned);
+                IGpuBuffer valueHalf = ResolveToFp16(
+                    value, inputElements, directCuda, backend, out valueHalfOwned);
+                if (directCuda.TryDirectPtxOnlineAttention(
+                    queryHalf, keyHalf, valueHalf,
+                    directOutput.Buffer, directStats.Buffer,
+                    batch * heads, scaleFloat, isCausal, seqQ))
+                {
+                    var directResult = DeferTensorResult<T>(
+                        backend, directOutput.Buffer,
+                        batch * heads * seqQ * headDim,
+                        new[] { batch, heads, seqQ, headDim });
+                    softmaxStats = DeferTensorResult<T>(
+                        backend, directStats.Buffer,
+                        batch * heads * seqQ,
+                        new[] { batch, heads, seqQ });
+                    directHanded = true;
+                    return directResult;
+                }
+                AliasDiag($"FlashAttention direct-PTX FELLBACK: {directCuda.DirectPtxLastError ?? "specialization unavailable"}");
+            }
+            catch (Exception ptxEx)
+            {
+                AliasDiag($"FlashAttention direct-PTX FELLBACK: {ptxEx.GetType().Name}: {ptxEx.Message}");
+            }
+            finally
+            {
+                queryHalfOwned?.Dispose();
+                keyHalfOwned?.Dispose();
+                valueHalfOwned?.Dispose();
+                if (!directHanded)
+                {
+                    directOutput.Dispose();
+                    directStats.Dispose();
+                }
+            }
+        }
+#endif
 
         // #638/#1650 GPU-RESIDENT capture path: run FlashAttentionV2 into resident output + softmax-stats
         // buffers and BIND them (no DownloadBuffer), so the diffusion attention block stays fully on-device
