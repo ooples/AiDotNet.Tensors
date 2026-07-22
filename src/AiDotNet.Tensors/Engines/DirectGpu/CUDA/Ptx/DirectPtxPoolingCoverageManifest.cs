@@ -46,7 +46,7 @@ internal static class DirectPtxPoolingCoverageManifest
         Planned("CudaBackend.UpsampleBilinear2D", "none - no backend op exists", "bilinear spatial upsample", Windowed, "FP32", "blocked: needs a public backend op first, then baked-scale-bilinear-families"),
         Planned("CudaBackend.Interpolate", "none - no backend op exists", "generic spatial interpolation", Windowed, "FP32", "blocked: needs a public backend op first, then baked-mode-scale-families"),
         Planned("CudaBackend.Pad2D", "NVRTC pad2d", "constant/reflect/replicate spatial padding", Windowed, "FP32", "baked-pad-mode-extent-families"),
-        Planned("CudaBackend.GridSample2D", "none - no backend op exists", "bilinear sampling at normalized grid coords", "canonical contiguous NCHW input + [N,Ho,Wo,2] grid", "FP32", "blocked: needs a public backend op first, then bilinear-grid-sample-families"),
+        Planned("CudaBackend.GridSample2D", "NVRTC grid sampler in CudaBackend.Geometry", "bilinear sampling at normalized grid coords", "canonical contiguous NCHW input + [N,Ho,Wo,2] grid", "FP32", "bilinear-grid-sample-families"),
         Planned("CudaBackend.RoiAlign", "none - no backend op exists", "region-of-interest aligned pooling", "canonical contiguous NCHW + [K,5] rois", "FP32", "blocked: needs a public backend op first, then baked-output-bins-roi-families"),
         Planned("CudaBackend.SpatialTransform", "none - no backend op exists", "affine-grid spatial warp", "canonical contiguous NCHW + [N,2,3] theta", "FP32", "blocked: needs a public backend op first, then affine-grid-sample-families"),
         Planned("CudaBackend.PixelShuffle", "NVRTC pixel_shuffle", "sub-pixel channel-to-space rearrange", Windowed, "FP32", "baked-upscale-factor-families"),

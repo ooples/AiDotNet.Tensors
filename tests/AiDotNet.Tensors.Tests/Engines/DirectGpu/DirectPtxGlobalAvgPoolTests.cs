@@ -100,8 +100,13 @@ public class DirectPtxGlobalAvgPoolTests
             DirectPtxPoolingCoverageManifest.All
                 .Where(cell => cell.ExistingImplementation.StartsWith("none", StringComparison.Ordinal)),
             cell => Assert.StartsWith("blocked:", cell.DirectPtxAssignment, StringComparison.Ordinal));
-        Assert.Equal(6, DirectPtxPoolingCoverageManifest.All
+        Assert.Equal(5, DirectPtxPoolingCoverageManifest.All
             .Count(cell => cell.ExistingImplementation.StartsWith("none", StringComparison.Ordinal)));
+        // GridSample2D DOES exist - in CudaBackend.Geometry, not the main
+        // partial - so it is portable, not blocked.
+        Assert.DoesNotContain("none",
+            DirectPtxPoolingCoverageManifest.Get("CudaBackend.GridSample2D").ExistingImplementation,
+            StringComparison.Ordinal);
         Assert.All(DirectPtxPoolingCoverageManifest.All,
             cell => Assert.NotEqual(
                 DirectPtxPoolingCoverageStatus.PromotedDirectPtx, cell.Status));
