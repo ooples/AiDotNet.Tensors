@@ -1,0 +1,163 @@
+#if !NETFRAMEWORK
+using System;
+using System.Linq;
+using System.Threading;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+using Xunit;
+
+namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
+
+public sealed class DirectPtxSparseGraphTests
+{
+    [Fact]
+    public void CsrSpmmEmitter_BakesExactShapeAndUsesRegisterResidentVec4Reduction()
+    {
+        string ptx = PtxFusedCsrSpmmVec4F32Kernel.EmitPtx(8, 6);
+
+        Assert.Contains(PtxFusedCsrSpmmVec4F32Kernel.EntryPoint, ptx);
+        Assert.Contains(".target sm_86", ptx);
+        Assert.Contains("ld.global.v4.f32", ptx);
+        Assert.Contains("st.global.v4.f32", ptx);
+        Assert.Equal(4, Count(ptx, "fma.rn.f32"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("shape", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.Equal(5, Count(ptx, ".param .u64"));
+    }
+
+    [Fact]
+    public void CsrSpmmBlueprint_DeclaresExactCsr32AndDensePhysicalAbi()
+    {
+        DirectPtxKernelBlueprint blueprint =
+            PtxFusedCsrSpmmVec4F32Kernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere);
+
+        Assert.Equal("csr-spmm-vec4-f32-v1-Ampere-m1024-k1024-n64-nnz16384-row-major", blueprint.Id);
+        Assert.Equal(5, blueprint.Tensors.Count);
+        Assert.All(blueprint.Tensors, tensor =>
+        {
+            Assert.Equal(DirectPtxExtentMode.Exact, tensor.ExtentMode);
+            Assert.Equal(16, tensor.AlignmentBytes);
+        });
+        Assert.Equal(DirectPtxPhysicalLayout.CsrValues, blueprint.Tensors[0].Layout);
+        Assert.Equal(DirectPtxPhysicalLayout.CsrColumnIndices, blueprint.Tensors[1].Layout);
+        Assert.Equal(DirectPtxPhysicalLayout.CsrRowPointers, blueprint.Tensors[2].Layout);
+        Assert.Equal(DirectPtxPhysicalType.Int32, blueprint.Tensors[1].PhysicalType);
+        Assert.Equal(PtxFusedCsrSpmmVec4F32Kernel.NonZeros, blueprint.Tensors[0].LogicalExtent.ElementCount);
+        Assert.Equal(PtxFusedCsrSpmmVec4F32Kernel.Rows + 1, blueprint.Tensors[2].LogicalExtent.ElementCount);
+        Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
+        Assert.Equal("0", blueprint.Semantics["intermediate-global-bytes"]);
+    }
+
+    [Theory]
+    [InlineData(8, 6, true)]
+    [InlineData(8, 0, false)]
+    [InlineData(8, 7, false)]
+    [InlineData(8, 9, false)]
+    [InlineData(9, 0, false)]
+    [InlineData(10, 0, false)]
+    public void SparseGraphArchitectureMatrix_FailsClosedOutsideExactSm86(
+        int major,
+        int minor,
+        bool expected) =>
+        Assert.Equal(expected, DirectPtxArchitecture.HasValidatedSparseGraph(major, minor));
+
+    [Fact]
+    public void CsrSpmmShapeMatrix_IsExactAndNeverPromotedWithoutHardwareEvidence()
+    {
+        Assert.True(PtxFusedCsrSpmmVec4F32Kernel.SupportsShape(1024, 1024, 64, 16384));
+        Assert.False(PtxFusedCsrSpmmVec4F32Kernel.SupportsShape(1024, 1024, 32, 16384));
+        Assert.False(PtxFusedCsrSpmmVec4F32Kernel.SupportsShape(1024, 1024, 64, 8192));
+        Assert.False(PtxFusedCsrSpmmVec4F32Kernel.IsPromotedShape(1024, 1024, 64, 16384));
+    }
+
+    [Fact]
+    public void SparseGraphExperimentOverride_IsThreadIsolated()
+    {
+        bool? previous = DirectPtxFeatureGate.SparseGraphExperimentOverride;
+        try
+        {
+            DirectPtxFeatureGate.SparseGraphExperimentOverride = null;
+            bool environmentValue = DirectPtxFeatureGate.IsSparseGraphEnabled;
+            DirectPtxFeatureGate.SparseGraphExperimentOverride = true;
+            bool childValue = true;
+            var thread = new Thread(() => childValue = DirectPtxFeatureGate.IsSparseGraphEnabled);
+            thread.Start();
+            thread.Join();
+            Assert.True(DirectPtxFeatureGate.IsSparseGraphEnabled);
+            Assert.Equal(environmentValue, childValue);
+        }
+        finally
+        {
+            DirectPtxFeatureGate.SparseGraphExperimentOverride = previous;
+        }
+    }
+
+    [SkippableFact]
+    public void DriverOnlyCsrSpmm_MatchesFp64OracleAndReportsNoDriverLocalMemory()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedSparseGraph(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in sparse/graph specialization admits only SM86.");
+        using var kernel = new PtxFusedCsrSpmmVec4F32Kernel(runtime);
+
+        int[] rowPointers = Enumerable.Range(0, PtxFusedCsrSpmmVec4F32Kernel.Rows + 1)
+            .Select(row => row * 16).ToArray();
+        int[] columns = new int[PtxFusedCsrSpmmVec4F32Kernel.NonZeros];
+        float[] values = new float[columns.Length];
+        for (int row = 0; row < PtxFusedCsrSpmmVec4F32Kernel.Rows; row++)
+        for (int item = 0; item < 16; item++)
+        {
+            int index = row * 16 + item;
+            columns[index] = (row * 17 + item * 13) & 1023;
+            values[index] = (item - 7.5f) / 32f;
+        }
+        float[] dense = Enumerable.Range(0,
+                PtxFusedCsrSpmmVec4F32Kernel.Inner * PtxFusedCsrSpmmVec4F32Kernel.Columns)
+            .Select(index => ((index * 19) % 101 - 50) / 128f).ToArray();
+        double[] expected = Oracle(rowPointers, columns, values, dense);
+
+        using var valuesBuffer = runtime.AllocateBytes((nuint)(values.Length * sizeof(float)));
+        using var columnsBuffer = runtime.AllocateBytes((nuint)(columns.Length * sizeof(int)));
+        using var rowPointersBuffer = runtime.AllocateBytes((nuint)(rowPointers.Length * sizeof(int)));
+        using var denseBuffer = runtime.AllocateBytes((nuint)(dense.Length * sizeof(float)));
+        using var outputBuffer = runtime.AllocateBytes((nuint)(expected.Length * sizeof(float)));
+        valuesBuffer.Upload<float>(values);
+        columnsBuffer.Upload<int>(columns);
+        rowPointersBuffer.Upload<int>(rowPointers);
+        denseBuffer.Upload<float>(dense);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(valuesBuffer, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(columnsBuffer, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(rowPointersBuffer, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(denseBuffer, kernel.Blueprint.Tensors[3]),
+            DirectPtxTensorView.CreateOwned(outputBuffer, kernel.Blueprint.Tensors[4]));
+        runtime.Synchronize();
+        var actual = new float[expected.Length];
+        outputBuffer.Download<float>(actual);
+        double maxError = actual.Select((value, index) => Math.Abs(value - expected[index])).Max();
+        Assert.True(maxError <= 2e-5, $"maximum error {maxError:R}");
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+    }
+
+    private static double[] Oracle(int[] rowPointers, int[] columns, float[] values, float[] dense)
+    {
+        var output = new double[PtxFusedCsrSpmmVec4F32Kernel.Rows * PtxFusedCsrSpmmVec4F32Kernel.Columns];
+        for (int row = 0; row < PtxFusedCsrSpmmVec4F32Kernel.Rows; row++)
+        for (int col = 0; col < PtxFusedCsrSpmmVec4F32Kernel.Columns; col++)
+        {
+            double sum = 0;
+            for (int p = rowPointers[row]; p < rowPointers[row + 1]; p++)
+                sum += (double)values[p] * dense[columns[p] * PtxFusedCsrSpmmVec4F32Kernel.Columns + col];
+            output[row * PtxFusedCsrSpmmVec4F32Kernel.Columns + col] = sum;
+        }
+        return output;
+    }
+
+    private static int Count(string source, string value) =>
+        source.Split(value, StringSplitOptions.None).Length - 1;
+}
+#endif

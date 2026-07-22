@@ -63,6 +63,10 @@ public static class CudaToPtxTransferLedger
             "same softmax family (#840); shares the row-softmax PTX kernel."),
         new CudaToPtxEntry("rmsnorm_forward", "PtxFusedResidualRmsNormD64Kernel", PtxTransferStatus.PtxInProgress,
             "fused residual RMSNorm; PTX kernel exists but has no public route wired yet (see parity registry)."),
+        new CudaToPtxEntry("csr_spmm", "PtxFusedCsrSpmmVec4F32Kernel", PtxTransferStatus.PtxInProgress,
+            "exact CSR32 M1024/K1024/N64/nnz16384 direct-PTX route (#852); disabled and unpromoted pending GPU evidence."),
+        new CudaToPtxEntry("csr_spmm_vec4", "PtxFusedCsrSpmmVec4F32Kernel", PtxTransferStatus.PtxInProgress,
+            "same exact vector-output CSR SpMM specialization (#852); established NVRTC remains fallback."),
 
         // --- Triaged anomalies: the 4 census kernels that mapped to no epic
         // #833 child during the full 888-kernel cross-reference. Recorded so the

@@ -3737,6 +3737,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (!IsAvailable)
             throw new InvalidOperationException("CUDA backend is not available.");
 
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxCsrSpmmVec4F32(
+            csrValues, csrColIndices, csrRowPointers, denseB, output,
+            M, K, N, nnz))
+            return;
+#endif
+
         if (!_kernelCache.TryGetValue("csr_spmm", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: csr_spmm");
 
@@ -3914,6 +3921,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (!IsAvailable)
             throw new InvalidOperationException("CUDA backend is not available.");
+
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxCsrSpmmVec4F32(
+            csrValues, csrColIndices, csrRowPointers, denseB, output,
+            M, K, N, nnz))
+            return;
+#endif
 
         // Fail fast on misaligned N: each thread computes 4 adjacent output
         // columns via float4 loads, so a non-multiple-of-4 N would silently

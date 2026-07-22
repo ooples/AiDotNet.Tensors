@@ -45,6 +45,13 @@ internal static class DirectPtxArchitecture
     /// </summary>
     internal static bool HasValidatedQkvRopeCache(int major, int minor) =>
         (major, minor) == (8, 6);
+
+    /// <summary>The sparse/graph experiment has a distinct GA102/SM86 tuning domain.</summary>
+    internal static bool HasValidatedSparseGraph(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    internal static bool HasValidatedCsrSpmm(int major, int minor) =>
+        HasValidatedSparseGraph(major, minor);
 }
 
 internal enum DirectPtxExtentMode

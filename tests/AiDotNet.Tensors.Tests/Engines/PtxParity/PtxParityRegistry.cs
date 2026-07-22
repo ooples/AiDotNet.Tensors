@@ -81,6 +81,10 @@ public static class PtxParityRegistry
         new PtxParitySpec("PtxFusedQkvRopeCacheD64Kernel", PtxParityStatus.Deferred,
             "fused QKV + RoPE + KV-cache write (#858)",
             "multi-output (Q + K/V cache) with baked RoPE tables; needs a dedicated QKV/RoPE/cache oracle."),
+        new PtxParitySpec("PtxFusedCsrSpmmVec4F32Kernel", PtxParityStatus.Deferred,
+            "DirectGpuTensorEngine.SparseDenseMatMulGpu / CudaBackend.CsrSpMM",
+            "driver-only coverage compares direct PTX to an FP64 oracle, and the benchmark harness measures " +
+            "the existing NVRTC route independently; the full three-way GPU parity run is pending hardware."),
     };
 
     private static readonly Dictionary<string, PtxParitySpec> ByKernel =

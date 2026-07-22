@@ -20,6 +20,7 @@ internal static class DirectPtxFeatureGate
     internal const string AttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_ATTENTION_BACKWARD";
     internal const string FlashAttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FLASH_ATTENTION_BACKWARD";
     internal const string QkvRopeCacheEnvironmentVariable = "AIDOTNET_DIRECT_PTX_QKV_ROPE_CACHE";
+    internal const string SparseGraphEnvironmentVariable = "AIDOTNET_DIRECT_PTX_SPARSE_GRAPH";
     internal const string AutotuneEnvironmentVariable = "AIDOTNET_DIRECT_PTX_AUTOTUNE";
     internal const string CacheCapacityEnvironmentVariable = "AIDOTNET_DIRECT_PTX_CACHE_CAPACITY";
 
@@ -35,12 +36,23 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentAttentionBackwardEnabled = ReadEnabled(AttentionBackwardEnvironmentVariable);
     private static readonly bool EnvironmentFlashAttentionBackwardEnabled = ReadEnabled(FlashAttentionBackwardEnvironmentVariable);
     private static readonly bool EnvironmentQkvRopeCacheEnabled = ReadEnabled(QkvRopeCacheEnvironmentVariable);
+    private static readonly bool EnvironmentSparseGraphEnabled = ReadEnabled(SparseGraphEnvironmentVariable);
     private static readonly bool EnvironmentAutotuneEnabled =
         !string.Equals(Environment.GetEnvironmentVariable(AutotuneEnvironmentVariable), "0", StringComparison.Ordinal);
     private static readonly int EnvironmentCacheCapacity = ReadCacheCapacity();
 
     /// <summary>Test-only override. Null restores environment-based behavior.</summary>
     internal static bool? TestOverride { get; set; }
+
+    [ThreadStatic]
+    private static bool? s_sparseGraphExperimentOverride;
+
+    /// <summary>Thread-isolated sparse/graph experiment override.</summary>
+    internal static bool? SparseGraphExperimentOverride
+    {
+        get => s_sparseGraphExperimentOverride;
+        set => s_sparseGraphExperimentOverride = value;
+    }
 
     internal static bool IsEnabled => IsAttentionEnabled;
 
@@ -67,6 +79,9 @@ internal static class DirectPtxFeatureGate
 
     internal static bool IsQkvRopeCacheEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentQkvRopeCacheEnabled);
+
+    internal static bool IsSparseGraphEnabled => SparseGraphExperimentOverride ?? TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentSparseGraphEnabled);
 
     internal static bool IsAutotuneEnabled => EnvironmentAutotuneEnabled;
 
@@ -104,6 +119,12 @@ internal enum DirectPtxPhysicalLayout
     PackedQkvWeights,
     /// <summary>Packed Q/K/V projection bias, [qkv,head,feature].</summary>
     PackedQkvBias,
+    /// <summary>Zero-based CSR non-zero values in stored row order.</summary>
+    CsrValues,
+    /// <summary>Zero-based Int32 CSR column indices, one per non-zero.</summary>
+    CsrColumnIndices,
+    /// <summary>Monotone Int32 CSR row offsets with terminal offset equal to nnz.</summary>
+    CsrRowPointers,
     /// <summary>Dense additive attention bias, [H,Sq,Skv] or [B,H,Sq,Skv].</summary>
     AttentionBias,
     /// <summary>One-dimensional canonical vector.</summary>

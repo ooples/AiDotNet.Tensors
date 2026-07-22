@@ -30,6 +30,8 @@ public sealed partial class CudaBackend
         _directPtxFlashAttentionBackwardKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<DirectPtxQkvRopeCacheKey, PtxFusedQkvRopeCacheD64Kernel>
         _directPtxQkvRopeCacheKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<DirectPtxCsrSpmmKey, PtxFusedCsrSpmmVec4F32Kernel>
+        _directPtxCsrSpmmKernels = new(4);
     private DirectPtxRuntime? _directPtxRuntime;
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
@@ -43,6 +45,7 @@ public sealed partial class CudaBackend
     private long _directPtxAttentionBackwardDispatchCount;
     private long _directPtxFlashAttentionBackwardDispatchCount;
     private long _directPtxQkvRopeCacheDispatchCount;
+    private long _directPtxCsrSpmmDispatchCount;
     internal int DirectPtxCachedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxAttentionKernels.Count; }
@@ -101,6 +104,210 @@ public sealed partial class CudaBackend
     internal int DirectPtxQkvRopeCachePinnedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxQkvRopeCacheKernels.PinnedCount; }
+    }
+
+    internal bool IsDirectPtxSparseGraphEnabled =>
+        DirectPtxFeatureGate.IsSparseGraphEnabled && IsAvailable &&
+        DirectPtxArchitecture.HasValidatedSparseGraph(_ccMajor, _ccMinor);
+    internal long DirectPtxCsrSpmmDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxCsrSpmmDispatchCount);
+    internal int DirectPtxCsrSpmmKernelCapacity => _directPtxCsrSpmmKernels.Capacity;
+    internal int DirectPtxCsrSpmmPinnedKernelCount
+    {
+        get { lock (_directPtxLock) return _directPtxCsrSpmmKernels.PinnedCount; }
+    }
+
+    /// <summary>
+    /// Attempts the exact FP32 CSR SpMM golden specialization. The admitted ABI
+    /// is CSR32 [1024,1024] with 16384 stored entries and contiguous B/C matrices
+    /// with 64 columns. No shape or stride values cross the kernel boundary.
+    /// </summary>
+    internal bool TryDirectPtxCsrSpmmVec4F32(
+        IGpuBuffer values,
+        IGpuBuffer columnIndices,
+        IGpuBuffer rowPointers,
+        IGpuBuffer dense,
+        IGpuBuffer output,
+        int rows,
+        int inner,
+        int columns,
+        int nonZeros)
+    {
+        if (!DirectPtxFeatureGate.IsSparseGraphEnabled)
+        {
+            DirectPtxLastError = "sparse-graph-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "sparse-graph-backend-unavailable";
+            return false;
+        }
+        if (!DirectPtxArchitecture.HasValidatedSparseGraph(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = "sparse-graph-architecture-not-implemented";
+            return false;
+        }
+        if (!PtxFusedCsrSpmmVec4F32Kernel.SupportsShape(rows, inner, columns, nonZeros))
+        {
+            DirectPtxLastError = "csr-spmm-shape-not-implemented";
+            return false;
+        }
+        if (values is null || columnIndices is null || rowPointers is null ||
+            dense is null || output is null)
+        {
+            DirectPtxLastError = "csr-spmm-null-buffer";
+            return false;
+        }
+        if (values.SizeInBytes != (long)nonZeros * sizeof(float) ||
+            columnIndices.SizeInBytes != (long)nonZeros * sizeof(int) ||
+            rowPointers.SizeInBytes != (long)(rows + 1) * sizeof(int) ||
+            dense.SizeInBytes != (long)inner * columns * sizeof(float) ||
+            output.SizeInBytes != (long)rows * columns * sizeof(float))
+        {
+            DirectPtxLastError = "csr-spmm-physical-extent-mismatch";
+            return false;
+        }
+        if (values.Handle == IntPtr.Zero || columnIndices.Handle == IntPtr.Zero ||
+            rowPointers.Handle == IntPtr.Zero || dense.Handle == IntPtr.Zero ||
+            output.Handle == IntPtr.Zero)
+        {
+            DirectPtxLastError = "csr-spmm-invalid-device-pointer";
+            return false;
+        }
+        if ((((nuint)values.Handle | (nuint)columnIndices.Handle | (nuint)rowPointers.Handle |
+              (nuint)dense.Handle | (nuint)output.Handle) & 15u) != 0)
+        {
+            DirectPtxLastError = "csr-spmm-alignment-mismatch";
+            return false;
+        }
+        if (DirectPtxBuffersOverlap(output, values) ||
+            DirectPtxBuffersOverlap(output, columnIndices) ||
+            DirectPtxBuffersOverlap(output, rowPointers) ||
+            DirectPtxBuffersOverlap(output, dense))
+        {
+            DirectPtxLastError = "csr-spmm-alias-not-supported";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var key = new DirectPtxCsrSpmmKey(rows, inner, columns, nonZeros);
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxCsrSpmmKernels.TryGetValue(key, out _))
+                {
+                    DirectPtxLastError =
+                        "Direct PTX CSR SpMM must be prewarmed before CUDA graph capture.";
+                    return false;
+                }
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxFusedCsrSpmmVec4F32Kernel kernel = GetOrCreateCsrSpmmKernel(key);
+                if (capturing && !_directPtxCsrSpmmKernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX CSR SpMM module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(values, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(columnIndices, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(rowPointers, kernel.Blueprint.Tensors[2]),
+                        DirectPtxTensorView.Create(dense, kernel.Blueprint.Tensors[3]),
+                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[4]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxCsrSpmmDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool PrewarmDirectPtxCsrSpmmVec4F32(
+        int rows,
+        int inner,
+        int columns,
+        int nonZeros)
+    {
+        if (!DirectPtxFeatureGate.IsSparseGraphEnabled)
+        {
+            DirectPtxLastError = "sparse-graph-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable || !DirectPtxArchitecture.HasValidatedSparseGraph(_ccMajor, _ccMinor) ||
+            !PtxFusedCsrSpmmVec4F32Kernel.SupportsShape(rows, inner, columns, nonZeros))
+        {
+            DirectPtxLastError = "csr-spmm-specialization-not-admitted";
+            return false;
+        }
+        if (IsStreamCapturing())
+        {
+            DirectPtxLastError = "Direct PTX CSR SpMM prewarm is not capture-safe.";
+            return false;
+        }
+        try
+        {
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _ = GetOrCreateCsrSpmmKernel(
+                    new DirectPtxCsrSpmmKey(rows, inner, columns, nonZeros));
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    private PtxFusedCsrSpmmVec4F32Kernel GetOrCreateCsrSpmmKernel(DirectPtxCsrSpmmKey key)
+    {
+        if (_directPtxCsrSpmmKernels.TryGetValue(key, out var existing)) return existing;
+        return CreateAndCacheCsrSpmmKernelSlow(key);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxFusedCsrSpmmVec4F32Kernel CreateAndCacheCsrSpmmKernelSlow(
+        DirectPtxCsrSpmmKey key) =>
+        _directPtxCsrSpmmKernels.GetOrAdd(
+            key, () => new PtxFusedCsrSpmmVec4F32Kernel(_directPtxRuntime!));
+
+    internal bool TryGetDirectPtxCsrSpmmAudit(
+        int rows,
+        int inner,
+        int columns,
+        int nonZeros,
+        out DirectPtxKernelAudit audit)
+    {
+        lock (_directPtxLock)
+        {
+            if (_directPtxCsrSpmmKernels.TryGetValue(
+                new DirectPtxCsrSpmmKey(rows, inner, columns, nonZeros), out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null!;
+        return false;
+    }
+
+    private static bool DirectPtxBuffersOverlap(IGpuBuffer left, IGpuBuffer right)
+    {
+        nuint leftStart = (nuint)left.Handle;
+        nuint rightStart = (nuint)right.Handle;
+        nuint leftEnd = checked(leftStart + (nuint)left.SizeInBytes);
+        nuint rightEnd = checked(rightStart + (nuint)right.SizeInBytes);
+        return leftStart < rightEnd && rightStart < leftEnd;
     }
 
     /// <summary>
@@ -1787,6 +1994,7 @@ public sealed partial class CudaBackend
             _directPtxAttentionBackwardKernels.Dispose();
             _directPtxFlashAttentionBackwardKernels.Dispose();
             _directPtxQkvRopeCacheKernels.Dispose();
+            _directPtxCsrSpmmKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }
@@ -1853,6 +2061,11 @@ public sealed partial class CudaBackend
         int Heads,
         int CacheCapacity,
         int Position);
+    private readonly record struct DirectPtxCsrSpmmKey(
+        int Rows,
+        int Inner,
+        int Columns,
+        int NonZeros);
 
 }
 #endif

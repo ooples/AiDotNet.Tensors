@@ -5,6 +5,32 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// <summary>Small deterministic targets for Nsight Compute release evidence.</summary>
 internal static class DirectPtxProfileTarget
 {
+    internal static void RunCsrSpmm()
+    {
+        GpuBenchmarkEnvironment.RequireIdleGpu("ncu-csr-spmm-start");
+        using var runtime = new DirectPtxRuntime();
+        using var kernel = new PtxFusedCsrSpmmVec4F32Kernel(runtime);
+        var inputs = DirectPtxCsrSpmmExperiment.Inputs();
+        using var values = runtime.AllocateBytes((nuint)(inputs.Values.Length * sizeof(float)));
+        using var columns = runtime.AllocateBytes((nuint)(inputs.Columns.Length * sizeof(int)));
+        using var rows = runtime.AllocateBytes((nuint)(inputs.RowPointers.Length * sizeof(int)));
+        using var dense = runtime.AllocateBytes((nuint)(inputs.Dense.Length * sizeof(float)));
+        using var output = runtime.AllocateBytes((nuint)(1024 * 64 * sizeof(float)));
+        values.Upload<float>(inputs.Values);
+        columns.Upload<int>(inputs.Columns);
+        rows.Upload<int>(inputs.RowPointers);
+        dense.Upload<float>(inputs.Dense);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(values, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(columns, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(rows, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(dense, kernel.Blueprint.Tensors[3]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[4]));
+        runtime.Synchronize();
+        Console.WriteLine(kernel.Audit.ToJson());
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-csr-spmm-end");
+    }
+
     internal static void RunAttention()
     {
         GpuBenchmarkEnvironment.RequireIdleGpu("ncu-attention-start");
