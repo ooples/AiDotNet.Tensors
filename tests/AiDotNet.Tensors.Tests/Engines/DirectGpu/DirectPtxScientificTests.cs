@@ -24,7 +24,7 @@ public class DirectPtxScientificTests
             Assert.False(string.IsNullOrWhiteSpace(cell.DTypes));
             Assert.False(string.IsNullOrWhiteSpace(cell.DirectPtxAssignment));
         });
-        foreach (string api in new[] { "CudaBackend.ComplexMultiply", "CudaBackend.ComplexConjugate", "CudaBackend.ComplexMagnitude", "CudaBackend.OctonionAdd", "CudaBackend.OctonionMultiply", "CudaBackend.MobiusAdd", "CudaBackend.PoincareDistance", "CudaBackend.PoincareProject" })
+        foreach (string api in new[] { "CudaBackend.ComplexMultiply", "CudaBackend.ComplexConjugate", "CudaBackend.ComplexMagnitude", "CudaBackend.OctonionAdd", "CudaBackend.OctonionMultiply", "CudaBackend.MobiusAdd", "CudaBackend.PoincareDistance", "CudaBackend.PoincareProject", "CudaBackend.PoincareExpMap" })
             Assert.Equal(DirectPtxScientificCoverageStatus.ExperimentalDirectPtx,
                 DirectPtxScientificCoverageManifest.Get(api).Status);
         Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() =>
@@ -480,6 +480,80 @@ public class DirectPtxScientificTests
         var actual = new float[batch * dim];
         output.Download<float>(actual);
         AssertVectorClose(actual, expected, 3e-3f, $"poincare project {batch}x{dim}");
+    }
+
+    [Fact]
+    public void PoincareExpMapEmitter_IsThreadPerVectorTanhScaledMobius()
+    {
+        string ptx = PtxPoincareExpMapKernel.EmitPtx(8, 6, 64);
+        Assert.Contains(PtxPoincareExpMapKernel.EntryPoint, ptx);
+        Assert.Contains("ld.param.f32 %f0, [curvature];", ptx);
+        Assert.Contains("NORM_LOOP:", ptx);
+        Assert.Contains("WRITE_LOOP:", ptx);
+        Assert.Contains("COPY_LOOP:", ptx);            // zero-tangent branch
+        Assert.Contains("tanh.approx.f32", ptx);
+        Assert.Equal(2, Count(ptx, "sqrt.rn.f32"));    // vNorm + sqrtC
+        Assert.Equal(0, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxPoincareExpMapKernel.IsSupportedShape(256, 64));
+        Assert.False(PtxPoincareExpMapKernel.IsPromotedShape(256, 64));
+    }
+
+    [SkippableTheory]
+    [InlineData(256, 32)]
+    [InlineData(256, 128)]
+    public void DriverOnlyPoincareExpMap_MatchesOracle(int batch, int dim)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in poincare-exp-map specialization is measured on GA10x/SM86.");
+        const float c = 0.5f;
+        using var kernel = new PtxPoincareExpMapKernel(runtime, batch, dim, c);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20266600 + batch + dim);
+        float[] xHost = Values(random, batch * dim, 0.1f);   // base points inside the ball
+        float[] vHost = Values(random, batch * dim, 0.15f);  // tangent vectors
+        var expected = new float[batch * dim];
+        for (int row = 0; row < batch; row++)
+        {
+            double xn = 0, vn = 0, xv = 0;
+            for (int i = 0; i < dim; i++)
+            {
+                double xi = xHost[row * dim + i], vi = vHost[row * dim + i];
+                xn += xi * xi; vn += vi * vi; xv += xi * vi;
+            }
+            double vNorm = Math.Sqrt(vn);
+            double sqrtC = Math.Sqrt(c);
+            double cf = 1.0 - c * xn;
+            double arg = sqrtC * vNorm * (cf / 2.0);
+            double scale = Math.Tanh(arg) / (sqrtC * vNorm);
+            double svNormSq = scale * scale * vn;
+            double xsvDot = scale * xv;
+            double numX = 1.0 + 2.0 * c * xsvDot + c * svNormSq;
+            double numSv = 1.0 - c * xn;
+            double denom = 1.0 + 2.0 * c * xsvDot + (double)c * c * xn * svNormSq;
+            if (Math.Abs(denom) < 1e-10) denom = 1e-10;
+            for (int i = 0; i < dim; i++)
+                expected[row * dim + i] = (float)((numX * xHost[row * dim + i] + numSv * (scale * vHost[row * dim + i])) / denom);
+        }
+
+        using var x = runtime.AllocateBytes((nuint)(xHost.Length * sizeof(float)));
+        using var v = runtime.AllocateBytes((nuint)(vHost.Length * sizeof(float)));
+        using var output = runtime.AllocateBytes((nuint)(batch * dim * sizeof(float)));
+        x.Upload<float>(xHost);
+        v.Upload<float>(vHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(x, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(v, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[batch * dim];
+        output.Download<float>(actual);
+        AssertVectorClose(actual, expected, 4e-3f, $"poincare exp-map {batch}x{dim}");
     }
 
     private static float[] Values(Random random, int count, float magnitude)
