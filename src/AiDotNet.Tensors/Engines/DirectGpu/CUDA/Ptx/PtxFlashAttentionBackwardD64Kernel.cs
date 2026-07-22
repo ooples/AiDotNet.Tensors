@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -46,7 +45,7 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
         bool isCausal,
         int biasBatchStride = -1)
     {
-        ArgumentNullException.ThrowIfNull(runtime);
+        PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         if (runtime.ArchitectureFamily != DirectPtxArchitectureFamily.Ampere)
             throw new PlatformNotSupportedException(
                 "The checked-in FlashAttention-backward specialization is validated only on Ampere.");
@@ -629,7 +628,7 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
             throw new ArgumentOutOfRangeException(nameof(querySequence));
         if (keyValueSequence is not (16 or 32 or 64 or 128))
             throw new ArgumentOutOfRangeException(nameof(keyValueSequence));
-        if (!float.IsFinite(scale)) throw new ArgumentOutOfRangeException(nameof(scale));
+        if (!PtxCompat.IsFinite(scale)) throw new ArgumentOutOfRangeException(nameof(scale));
         int fullBiasBatchStride = checked(heads * querySequence * keyValueSequence);
         if (biasBatchStride is not (-1 or 0) && biasBatchStride != fullBiasBatchStride)
             throw new ArgumentOutOfRangeException(
@@ -638,6 +637,5 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
     }
 
     private static string FloatLiteral(float value) =>
-        "0f" + BitConverter.SingleToInt32Bits(value).ToString("X8", CultureInfo.InvariantCulture);
+        "0f" + PtxCompat.SingleToInt32Bits(value).ToString("X8", CultureInfo.InvariantCulture);
 }
-#endif
