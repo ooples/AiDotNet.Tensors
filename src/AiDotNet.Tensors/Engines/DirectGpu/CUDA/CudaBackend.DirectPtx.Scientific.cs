@@ -22,6 +22,7 @@ public sealed partial class CudaBackend
     private readonly record struct SciVectorKey(int Batch, int Dim, int ExtraBits);
     private readonly record struct SciRbfKey(int Batch, int NumCenters, int InputDim);
     private readonly record struct SciPairwiseKey(int M, int N, int Dim, bool Squared);
+    private readonly record struct SciMatVecKey(int Batch, int Dim);
 
     private readonly DirectPtxKernelCache<SciCountKey, PtxComplexMultiplyKernel> _sciComplexMul =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
@@ -48,6 +49,8 @@ public sealed partial class CudaBackend
     private readonly DirectPtxKernelCache<SciPairwiseKey, PtxPairwiseDistanceKernel> _sciPairwise =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<SciCountKey, PtxQuantumMeasurementKernel> _sciQuantumMeasure =
+        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<SciMatVecKey, PtxComplexMatVecKernel> _sciComplexMatVec =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
 
     private long _sciDispatchCount;
@@ -226,6 +229,25 @@ public sealed partial class CudaBackend
         });
     }
 
+    internal bool TryDirectPtxComplexMatVec(
+        IGpuBuffer matReal, IGpuBuffer matImag, IGpuBuffer vecReal, IGpuBuffer vecImag,
+        IGpuBuffer outReal, IGpuBuffer outImag, int batchSize, int dim)
+    {
+        if (!ScientificGateOpen || !PtxComplexMatVecKernel.IsSupportedShape(batchSize, dim)) return Fail("complex-matvec");
+        long matBytes = checked((long)dim * dim * sizeof(float));
+        long vecBytes = checked((long)batchSize * dim * sizeof(float));
+        if (matReal.SizeInBytes != matBytes || matImag.SizeInBytes != matBytes ||
+            vecReal.SizeInBytes != vecBytes || vecImag.SizeInBytes != vecBytes ||
+            outReal.SizeInBytes != vecBytes || outImag.SizeInBytes != vecBytes) return Fail("complex-matvec-extent");
+        return SciDispatch(() =>
+        {
+            var k = _sciComplexMatVec.GetOrAdd(new SciMatVecKey(batchSize, dim),
+                () => new PtxComplexMatVecKernel(_directPtxRuntime!, batchSize, dim));
+            Launch6(k.Blueprint, matReal, matImag, vecReal, vecImag, outReal, outImag,
+                (mr, mi, vr, vi, or, oi) => k.Launch(mr, mi, vr, vi, or, oi));
+        });
+    }
+
     private bool Fail(string reason)
     {
         DirectPtxLastError = $"scientific-{reason}-not-eligible";
@@ -254,6 +276,20 @@ public sealed partial class CudaBackend
                 DirectPtxTensorView.Create(b, bp.Tensors[1]),
                 DirectPtxTensorView.Create(c, bp.Tensors[2]),
                 DirectPtxTensorView.Create(d, bp.Tensors[3]));
+    }
+
+    private void Launch6(
+        DirectPtxKernelBlueprint bp, IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, IGpuBuffer d, IGpuBuffer e, IGpuBuffer f,
+        Action<DirectPtxTensorView, DirectPtxTensorView, DirectPtxTensorView, DirectPtxTensorView, DirectPtxTensorView, DirectPtxTensorView> launch)
+    {
+        lock (GpuDispatchLock)
+            launch(
+                DirectPtxTensorView.Create(a, bp.Tensors[0]),
+                DirectPtxTensorView.Create(b, bp.Tensors[1]),
+                DirectPtxTensorView.Create(c, bp.Tensors[2]),
+                DirectPtxTensorView.Create(d, bp.Tensors[3]),
+                DirectPtxTensorView.Create(e, bp.Tensors[4]),
+                DirectPtxTensorView.Create(f, bp.Tensors[5]));
     }
 
     private bool SciDispatch(Action launch)

@@ -15305,6 +15305,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void ComplexMatVec(IGpuBuffer matReal, IGpuBuffer matImag, IGpuBuffer vecReal, IGpuBuffer vecImag,
         IGpuBuffer outReal, IGpuBuffer outImag, int batchSize, int dim)
     {
+        if (TryDirectPtxComplexMatVec(matReal, matImag, vecReal, vecImag, outReal, outImag, batchSize, dim)) return;
+
         if (!_kernelCache.TryGetValue("complex_matvec", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: complex_matvec");
 

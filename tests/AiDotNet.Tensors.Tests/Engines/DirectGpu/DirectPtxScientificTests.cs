@@ -14,12 +14,13 @@ public class DirectPtxScientificTests
     [Fact]
     public void ScientificCoverageManifest_AssignsEveryScopedApiExactlyOnce()
     {
-        Assert.Equal(14, DirectPtxScientificCoverageManifest.All.Count);
+        Assert.Equal(15, DirectPtxScientificCoverageManifest.All.Count);
         string[] names = DirectPtxScientificCoverageManifest.All.Select(c => c.Api).ToArray();
         Assert.Contains("CudaBackend.RbfForward", names);
         Assert.Contains("CudaBackend.PairwiseDistance", names);
         Assert.Contains("CudaBackend.PairwiseDistanceSquared", names);
         Assert.Contains("CudaBackend.QuantumMeasurement", names);
+        Assert.Contains("CudaBackend.ComplexMatVec", names);
         Assert.Equal(names.Length, names.Distinct(StringComparer.Ordinal).Count());
         Assert.All(DirectPtxScientificCoverageManifest.All, cell =>
         {
@@ -452,6 +453,81 @@ public class DirectPtxScientificTests
         var actual = new float[count];
         prob.Download<float>(actual);
         AssertVectorClose(actual, expected, 2e-3f, "quantum measurement");
+    }
+
+    [Fact]
+    public void ComplexMatVecEmitter_IsThreadPerRowSerialColumn()
+    {
+        string ptx = PtxComplexMatVecKernel.EmitPtx(8, 6, 4, 64);
+        Assert.Contains(PtxComplexMatVecKernel.EntryPoint, ptx);
+        Assert.Equal(4, Count(ptx, "ld.global.nc.f32"));    // mr, mi, xr, xi in the loop
+        Assert.Equal(2, Count(ptx, "st.global.f32"));        // outReal + outImag
+        Assert.Equal(4, Count(ptx, "fma.rn.f32"));           // complex MAC: 2 for real, 2 for imag
+        Assert.Contains("$CMV_COL_LOOP:", ptx);
+        Assert.Contains("div.u32 %r3, %r2, 64", ptx);        // b = idx / dim
+        Assert.Contains("rem.u32 %r4, %r2, 64", ptx);        // row = idx % dim
+        Assert.Equal(0, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxComplexMatVecKernel.IsSupportedShape(4, 64));
+        Assert.False(PtxComplexMatVecKernel.IsSupportedShape(3, 5));   // 15 not a multiple of 256
+        Assert.False(PtxComplexMatVecKernel.IsPromotedShape(4, 64));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyComplexMatVec_MatchesOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in complex-matvec specialization is measured on GA10x/SM86.");
+        const int batchSize = 16, dim = 64;   // rows = 1024 (multiple of 256)
+        using var kernel = new PtxComplexMatVecKernel(runtime, batchSize, dim);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20267400);
+        float[] mr = Values(random, dim * dim, 1.0f), mi = Values(random, dim * dim, 1.0f);
+        float[] xr = Values(random, batchSize * dim, 1.0f), xi = Values(random, batchSize * dim, 1.0f);
+        var expReal = new float[batchSize * dim];
+        var expImag = new float[batchSize * dim];
+        for (int b = 0; b < batchSize; b++)
+            for (int row = 0; row < dim; row++)
+            {
+                double sr = 0, si = 0;
+                for (int col = 0; col < dim; col++)
+                {
+                    double a = mr[row * dim + col], bb = mi[row * dim + col];
+                    double cr = xr[b * dim + col], ci = xi[b * dim + col];
+                    sr += a * cr - bb * ci;
+                    si += a * ci + bb * cr;
+                }
+                expReal[b * dim + row] = (float)sr;
+                expImag[b * dim + row] = (float)si;
+            }
+
+        using var matReal = runtime.AllocateBytes((nuint)(mr.Length * sizeof(float)));
+        using var matImag = runtime.AllocateBytes((nuint)(mi.Length * sizeof(float)));
+        using var vecReal = runtime.AllocateBytes((nuint)(xr.Length * sizeof(float)));
+        using var vecImag = runtime.AllocateBytes((nuint)(xi.Length * sizeof(float)));
+        using var outReal = runtime.AllocateBytes((nuint)(expReal.Length * sizeof(float)));
+        using var outImag = runtime.AllocateBytes((nuint)(expImag.Length * sizeof(float)));
+        matReal.Upload<float>(mr); matImag.Upload<float>(mi);
+        vecReal.Upload<float>(xr); vecImag.Upload<float>(xi);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(matReal, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(matImag, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(vecReal, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(vecImag, kernel.Blueprint.Tensors[3]),
+            DirectPtxTensorView.CreateOwned(outReal, kernel.Blueprint.Tensors[4]),
+            DirectPtxTensorView.CreateOwned(outImag, kernel.Blueprint.Tensors[5]));
+        runtime.Synchronize();
+        var actualReal = new float[expReal.Length];
+        var actualImag = new float[expImag.Length];
+        outReal.Download<float>(actualReal);
+        outImag.Download<float>(actualImag);
+        AssertVectorClose(actualReal, expReal, 3e-3f, "complex matvec real");
+        AssertVectorClose(actualImag, expImag, 3e-3f, "complex matvec imag");
     }
 
     [Fact]
@@ -962,6 +1038,34 @@ public class DirectPtxScientificTests
             for (int i = 0; i < qmExp.Length; i++) qmExp[i] = qmRe[i] * qmRe[i] + qmIm[i] * qmIm[i];
             using (var rb = backend.AllocateBuffer(qmRe)) using (var ib = backend.AllocateBuffer(qmIm)) using (var o = backend.AllocateBuffer(qmBatch * qmState))
             { backend.QuantumMeasurement(rb, ib, o, qmBatch, qmState); n = AssertDispatched(n, "quantum-measurement"); AssertVectorClose(backend.DownloadBuffer(o), qmExp, 2e-3f, "quantum-measurement route"); }
+
+            // Complex mat-vec: shared [dim,dim] matrix, per-batch vectors. rows = batch*dim = 1024.
+            const int cmvBatch = 16, cmvDim = 64;
+            float[] cmvMr = Values(random, cmvDim * cmvDim, 1.0f), cmvMi = Values(random, cmvDim * cmvDim, 1.0f);
+            float[] cmvXr = Values(random, cmvBatch * cmvDim, 1.0f), cmvXi = Values(random, cmvBatch * cmvDim, 1.0f);
+            var cmvExpRe = new float[cmvBatch * cmvDim];
+            var cmvExpIm = new float[cmvBatch * cmvDim];
+            for (int b = 0; b < cmvBatch; b++)
+                for (int row = 0; row < cmvDim; row++)
+                {
+                    double sr = 0, si = 0;
+                    for (int col = 0; col < cmvDim; col++)
+                    {
+                        double mRe = cmvMr[row * cmvDim + col], mIm = cmvMi[row * cmvDim + col];
+                        double xRe = cmvXr[b * cmvDim + col], xIm = cmvXi[b * cmvDim + col];
+                        sr += mRe * xRe - mIm * xIm; si += mRe * xIm + mIm * xRe;
+                    }
+                    cmvExpRe[b * cmvDim + row] = (float)sr; cmvExpIm[b * cmvDim + row] = (float)si;
+                }
+            using (var mrb = backend.AllocateBuffer(cmvMr)) using (var mib = backend.AllocateBuffer(cmvMi))
+            using (var xrb = backend.AllocateBuffer(cmvXr)) using (var xib = backend.AllocateBuffer(cmvXi))
+            using (var orb = backend.AllocateBuffer(cmvBatch * cmvDim)) using (var oib = backend.AllocateBuffer(cmvBatch * cmvDim))
+            {
+                backend.ComplexMatVec(mrb, mib, xrb, xib, orb, oib, cmvBatch, cmvDim);
+                n = AssertDispatched(n, "complex-matvec");
+                AssertVectorClose(backend.DownloadBuffer(orb), cmvExpRe, 3e-3f, "complex-matvec real route");
+                AssertVectorClose(backend.DownloadBuffer(oib), cmvExpIm, 3e-3f, "complex-matvec imag route");
+            }
         }
         finally
         {
