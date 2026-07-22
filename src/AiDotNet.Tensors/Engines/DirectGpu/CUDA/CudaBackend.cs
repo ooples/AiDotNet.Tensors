@@ -9015,6 +9015,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void SoftmaxBackward(IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer gradInput, int batchSize, int features)
     {
+        // Fail-closed direct-PTX fast path (issue #840): dX = S*(dY - sum(dY*S)); S=output, dY=gradOutput.
+        if (TryDirectPtxSoftmaxBackward(output, gradOutput, gradInput, batchSize, features)) return;
         if (!_kernelCache.TryGetValue("softmax_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: softmax_backward");
 
@@ -9516,6 +9518,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void LogSumExpBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer lse, IGpuBuffer gradInput, int outerSize, int reduceSize)
     {
+        // Fail-closed direct-PTX fast path (issue #840): dX = softmax(input) * gradOutput[m].
+        if (TryDirectPtxLogSumExpBackward(input, gradOutput, gradInput, outerSize, reduceSize)) return;
         if (!_kernelCache.TryGetValue("logsumexp_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: logsumexp_backward");
         using var _ = PushContext();
@@ -16443,7 +16447,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public void StdAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int reduceSize) => LaunchFusedAxis("std_axis", input, output, outerSize, reduceSize);
     public void ProductAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int reduceSize) => LaunchFusedAxis("product_axis", input, output, outerSize, reduceSize);
     public void NormAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int reduceSize) => LaunchFusedAxis("norm_axis", input, output, outerSize, reduceSize);
-    public void LogSumExpAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int reduceSize) => LaunchFusedAxis("logsumexp_axis", input, output, outerSize, reduceSize);
+    public void LogSumExpAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int reduceSize)
+    {
+        // Fail-closed direct-PTX fast path (issue #840); returns false until GPU-promoted.
+        if (TryDirectPtxLogSumExp(input, output, outerSize, reduceSize)) return;
+        LaunchFusedAxis("logsumexp_axis", input, output, outerSize, reduceSize);
+    }
     public void CumSumAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize) => LaunchFusedAxis("cumsum_axis", input, output, outerSize, innerSize);
     public void ScalarMinusTensor(IGpuBuffer input, IGpuBuffer output, float scalar, int size) => LaunchFusedScalar("scalar_minus_tensor", input, output, scalar, size);
     public void NormalizeL2(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize) => LaunchFusedAxis("normalize_l2", input, output, outerSize, innerSize);
@@ -16925,8 +16934,19 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel(kernel, (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
     }
 
-    public void Sparsemax(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize) => LaunchFusedAxis("sparsemax", input, output, outerSize, innerSize);
-    public void TaylorSoftmax(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize) => LaunchFusedAxis("taylor_softmax", input, output, outerSize, innerSize);
+    public void Sparsemax(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize)
+    {
+        // Fail-closed direct-PTX fast path (issue #840); returns false until GPU-promoted.
+        if (TryDirectPtxSparsemax(input, output, outerSize, innerSize)) return;
+        LaunchFusedAxis("sparsemax", input, output, outerSize, innerSize);
+    }
+
+    public void TaylorSoftmax(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize)
+    {
+        // Fail-closed direct-PTX fast path (issue #840); returns false until GPU-promoted.
+        if (TryDirectPtxTaylorSoftmax(input, output, outerSize, innerSize)) return;
+        LaunchFusedAxis("taylor_softmax", input, output, outerSize, innerSize);
+    }
     public void SphericalSoftmax(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize) => LaunchFusedAxis("spherical_softmax", input, output, outerSize, innerSize);
 
     public unsafe void BatchDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int batchSize, int dim)
