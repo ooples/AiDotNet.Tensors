@@ -20,6 +20,7 @@ internal static class DirectPtxFeatureGate
     internal const string AttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_ATTENTION_BACKWARD";
     internal const string FlashAttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FLASH_ATTENTION_BACKWARD";
     internal const string QkvRopeCacheEnvironmentVariable = "AIDOTNET_DIRECT_PTX_QKV_ROPE_CACHE";
+    internal const string SoftmaxEnvironmentVariable = "AIDOTNET_DIRECT_PTX_SOFTMAX";
     internal const string AutotuneEnvironmentVariable = "AIDOTNET_DIRECT_PTX_AUTOTUNE";
     internal const string CacheCapacityEnvironmentVariable = "AIDOTNET_DIRECT_PTX_CACHE_CAPACITY";
 
@@ -41,6 +42,10 @@ internal static class DirectPtxFeatureGate
 
     /// <summary>Test-only override. Null restores environment-based behavior.</summary>
     internal static bool? TestOverride { get; set; }
+    /// <summary>Benchmark-only access to softmax cells that have not passed promotion.</summary>
+    internal static bool SoftmaxExperimentOverride { get; set; }
+    /// <summary>Benchmark-only launch-geometry override; zero selects the production geometry.</summary>
+    internal static int SoftmaxBlockThreadsExperimentOverride { get; set; }
 
     internal static bool IsEnabled => IsAttentionEnabled;
 
@@ -52,6 +57,10 @@ internal static class DirectPtxFeatureGate
 
     internal static bool IsFlashDecodeEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentFlashDecodeEnabled);
+
+    internal static bool IsSoftmaxEnabled => TestOverride ??
+        (string.Equals(Environment.GetEnvironmentVariable(MasterEnvironmentVariable), "1", StringComparison.Ordinal) ||
+         string.Equals(Environment.GetEnvironmentVariable(SoftmaxEnvironmentVariable), "1", StringComparison.Ordinal));
 
     internal static bool IsPagedDecodeEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentPagedDecodeEnabled);

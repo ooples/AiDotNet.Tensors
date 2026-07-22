@@ -30,6 +30,8 @@ public sealed partial class CudaBackend
         _directPtxFlashAttentionBackwardKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<DirectPtxQkvRopeCacheKey, PtxFusedQkvRopeCacheD64Kernel>
         _directPtxQkvRopeCacheKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<DirectPtxSoftmaxKey, PtxFusedSoftmaxF32Kernel>
+        _directPtxSoftmaxKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private DirectPtxRuntime? _directPtxRuntime;
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
@@ -43,6 +45,7 @@ public sealed partial class CudaBackend
     private long _directPtxAttentionBackwardDispatchCount;
     private long _directPtxFlashAttentionBackwardDispatchCount;
     private long _directPtxQkvRopeCacheDispatchCount;
+    private long _directPtxSoftmaxDispatchCount;
     internal int DirectPtxCachedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxAttentionKernels.Count; }
@@ -94,6 +97,12 @@ public sealed partial class CudaBackend
 
     internal long DirectPtxFlashAttentionBackwardDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxFlashAttentionBackwardDispatchCount);
+    internal bool IsDirectPtxSoftmaxEnabled =>
+        DirectPtxFeatureGate.IsSoftmaxEnabled && IsAvailable &&
+        DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) == DirectPtxArchitectureFamily.Ampere;
+
+    internal long DirectPtxSoftmaxDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxSoftmaxDispatchCount);
 
     internal long DirectPtxQkvRopeCacheDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxQkvRopeCacheDispatchCount);
@@ -1775,6 +1784,183 @@ public sealed partial class CudaBackend
         return false;
     }
 
+    /// <summary>
+    /// Attempts exact contiguous FP32 row softmax. Shape validation happens
+    /// before dispatch; the PTX ABI receives only input/output pointers.
+    /// </summary>
+    internal bool TryDirectPtxSoftmax(
+        IGpuBuffer input,
+        IGpuBuffer output,
+        int rows,
+        int columns)
+    {
+        if (!DirectPtxFeatureGate.IsSoftmaxEnabled)
+        {
+            DirectPtxLastError = "softmax-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "softmax-cuda-unavailable";
+            return false;
+        }
+        if (DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) !=
+            DirectPtxArchitectureFamily.Ampere)
+        {
+            DirectPtxLastError = "softmax-architecture-not-validated";
+            return false;
+        }
+        if (!PtxFusedSoftmaxF32Kernel.IsSupportedShape(rows, columns))
+        {
+            DirectPtxLastError = "softmax-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedSoftmaxF32Kernel.IsPromotedShape(rows, columns) &&
+            !DirectPtxFeatureGate.SoftmaxExperimentOverride)
+        {
+            DirectPtxLastError = "softmax-performance-gate-not-met";
+            return false;
+        }
+
+        long bytes = checked((long)rows * columns * sizeof(float));
+        if (input.SizeInBytes != bytes || output.SizeInBytes != bytes)
+        {
+            DirectPtxLastError = "softmax-physical-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            EnsureContextCurrent();
+            var key = new DirectPtxSoftmaxKey(
+                rows, columns, SelectedSoftmaxBlockThreads(rows, columns));
+            lock (_directPtxLock)
+            {
+                if (!_directPtxSoftmaxKernels.TryGetValue(
+                    key, out PtxFusedSoftmaxF32Kernel? kernel))
+                {
+                    if (IsStreamCapturing())
+                    {
+                        DirectPtxLastError =
+                            "Direct PTX softmax must be prewarmed before CUDA graph capture.";
+                        return false;
+                    }
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    kernel = CreateAndCacheSoftmaxKernelSlow(key);
+                }
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[1]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxSoftmaxDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxFusedSoftmaxF32Kernel CreateAndCacheSoftmaxKernelSlow(
+        DirectPtxSoftmaxKey key) =>
+        _directPtxSoftmaxKernels.GetOrAdd(key, () =>
+            new PtxFusedSoftmaxF32Kernel(
+                _directPtxRuntime!, key.Rows, key.Columns, key.BlockThreads));
+
+    internal bool PrewarmDirectPtxSoftmax(int rows, int columns)
+    {
+        if (!DirectPtxFeatureGate.IsSoftmaxEnabled)
+        {
+            DirectPtxLastError = "softmax-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "softmax-cuda-unavailable";
+            return false;
+        }
+        if (DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) !=
+            DirectPtxArchitectureFamily.Ampere)
+        {
+            DirectPtxLastError = "softmax-architecture-not-validated";
+            return false;
+        }
+        if (!PtxFusedSoftmaxF32Kernel.IsSupportedShape(rows, columns))
+        {
+            DirectPtxLastError = "softmax-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedSoftmaxF32Kernel.IsPromotedShape(rows, columns) &&
+            !DirectPtxFeatureGate.SoftmaxExperimentOverride)
+        {
+            DirectPtxLastError = "softmax-performance-gate-not-met";
+            return false;
+        }
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX softmax prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                var key = new DirectPtxSoftmaxKey(
+                    rows, columns, SelectedSoftmaxBlockThreads(rows, columns));
+                if (!_directPtxSoftmaxKernels.TryGetValue(key, out _))
+                    _ = CreateAndCacheSoftmaxKernelSlow(key);
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxSoftmaxAudit(
+        int rows,
+        int columns,
+        out DirectPtxKernelAudit audit)
+    {
+        lock (_directPtxLock)
+        {
+            var key = new DirectPtxSoftmaxKey(
+                rows, columns, SelectedSoftmaxBlockThreads(rows, columns));
+            if (_directPtxSoftmaxKernels.TryGetValue(key, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null!;
+        return false;
+    }
+
+    private static int SelectedSoftmaxBlockThreads(int rows, int columns)
+    {
+        if (DirectPtxFeatureGate.SoftmaxBlockThreadsExperimentOverride is
+            128 or 256 or 512)
+            return DirectPtxFeatureGate.SoftmaxBlockThreadsExperimentOverride;
+        return (rows, columns) switch
+        {
+            (256, 128) => 128,
+            (2048, 64) => 512,
+            (2048, 128) => 128,
+            (8192, 128) => 256,
+            _ => PtxFusedSoftmaxF32Kernel.DefaultBlockThreads
+        };
+    }
+
     private void DisposeDirectPtxRuntime()
     {
         lock (_directPtxLock)
@@ -1787,6 +1973,7 @@ public sealed partial class CudaBackend
             _directPtxAttentionBackwardKernels.Dispose();
             _directPtxFlashAttentionBackwardKernels.Dispose();
             _directPtxQkvRopeCacheKernels.Dispose();
+            _directPtxSoftmaxKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }
@@ -1854,5 +2041,7 @@ public sealed partial class CudaBackend
         int CacheCapacity,
         int Position);
 
+    private readonly record struct DirectPtxSoftmaxKey(
+        int Rows, int Columns, int BlockThreads);
 }
 #endif
