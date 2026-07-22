@@ -16,7 +16,7 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
             DirectPtxSparseGraphCompletionLedger.All
                 .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(74, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+        Assert.Equal(75, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
             entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
         Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
         Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
@@ -910,6 +910,40 @@ public sealed class DirectPtxSparseGraphTests
         Assert.False(PtxNeuralScatterMaxF32Kernel.SupportsShape(8_192, 64, 1_024));
         Assert.False(PtxNeuralScatterMaxF32Kernel.SupportsShape(16_384, 32, 1_024));
         Assert.False(PtxNeuralScatterMaxF32Kernel.SupportsShape(16_384, 64, 512));
+    }
+
+    [Fact]
+    public void StructuredSparseMmaSpEmitter_UsesEightRealTensorCoreInstructions()
+    {
+        string ptx = PtxStructuredSparse2x4MmaSpF32Kernel.EmitPtx(8, 6);
+        DirectPtxKernelBlueprint blueprint =
+            PtxStructuredSparse2x4MmaSpF32Kernel.CreateBlueprint(
+                DirectPtxArchitectureFamily.Ampere);
+
+        Assert.Contains(PtxStructuredSparse2x4MmaSpF32Kernel.EntryPoint, ptx);
+        Assert.Contains(".target sm_86", ptx, StringComparison.Ordinal);
+        Assert.Equal(8, Count(ptx,
+            "mma.sp.sync.aligned.m16n8k32.row.col.f32.f16.f16.f32"));
+        Assert.Equal(4, Count(ptx, ".param .u64"));
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(" bra ", ptx, StringComparison.Ordinal);
+        Assert.Equal("8", blueprint.Semantics["tensor-core-operations-per-warp"]);
+        Assert.Equal("fp32-registers", blueprint.Semantics["accumulator"]);
+        Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
+        Assert.Equal("0", blueprint.Semantics["intermediate-global-bytes"]);
+        Assert.All(blueprint.Tensors, tensor =>
+            Assert.Equal(DirectPtxExtentMode.Exact, tensor.ExtentMode));
+    }
+
+    [Fact]
+    public void StructuredSparseMmaSpAdmission_IsExact()
+    {
+        Assert.True(PtxStructuredSparse2x4MmaSpF32Kernel.SupportsShape(256, 64, 256));
+        Assert.False(PtxStructuredSparse2x4MmaSpF32Kernel.SupportsShape(128, 64, 256));
+        Assert.False(PtxStructuredSparse2x4MmaSpF32Kernel.SupportsShape(256, 32, 256));
+        Assert.False(PtxStructuredSparse2x4MmaSpF32Kernel.SupportsShape(256, 64, 128));
     }
 
     [Theory]

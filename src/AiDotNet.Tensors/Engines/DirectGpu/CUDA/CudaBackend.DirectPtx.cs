@@ -56,6 +56,8 @@ public sealed partial class CudaBackend
         _directPtxSparseUtilityKernels = new(8);
     private readonly DirectPtxKernelCache<DirectPtxStructuredSparse2x4Key, PtxStructuredSparse2x4F32Kernel>
         _directPtxStructuredSparse2x4Kernels = new(16);
+    private readonly DirectPtxKernelCache<int, PtxStructuredSparse2x4MmaSpF32Kernel>
+        _directPtxStructuredSparse2x4MmaSpKernels = new(1);
     private readonly DirectPtxKernelCache<DirectPtxScalarScatterAddMode, PtxScatterAddScalarF32Kernel>
         _directPtxScalarScatterAddKernels = new(4);
     private readonly DirectPtxKernelCache<DirectPtxScatterRowsOperation, PtxScatterRowsF32Kernel>
@@ -113,6 +115,7 @@ public sealed partial class CudaBackend
     private long _directPtxCsrBackwardDispatchCount;
     private long _directPtxSparseUtilityDispatchCount;
     private long _directPtxStructuredSparse2x4DispatchCount;
+    private long _directPtxStructuredSparse2x4MmaSpDispatchCount;
     private long _directPtxScalarScatterAddDispatchCount;
     private long _directPtxScatterRowsDispatchCount;
     private long _directPtxScatterMaxRowsDispatchCount;
@@ -226,6 +229,8 @@ public sealed partial class CudaBackend
         System.Threading.Interlocked.Read(ref _directPtxSparseUtilityDispatchCount);
     internal long DirectPtxStructuredSparse2x4DispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxStructuredSparse2x4DispatchCount);
+    internal long DirectPtxStructuredSparse2x4MmaSpDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxStructuredSparse2x4MmaSpDispatchCount);
     internal long DirectPtxScalarScatterAddDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxScalarScatterAddDispatchCount);
     internal long DirectPtxScatterRowsDispatchCount =>
@@ -1644,6 +1649,89 @@ public sealed partial class CudaBackend
         return TryDirectPtxStructuredSparse2x4Core(
             DirectPtxStructuredSparse2x4Operation.MatMulBaseline,
             sparseValues, sparseMetadata, denseB, output, null, 1.0f, 0.0f);
+    }
+
+    internal bool TryDirectPtxSparse2x4MatMulMmaSp(
+        IGpuBuffer sparseValues,
+        IGpuBuffer sparseMetadata,
+        IGpuBuffer denseB,
+        IGpuBuffer output,
+        int rows,
+        int inner,
+        int columns)
+    {
+        if (!IsDirectPtxSparseGraphEnabled ||
+            !PtxStructuredSparse2x4MmaSpF32Kernel.SupportsShape(rows, columns, inner) ||
+            !HasExactBytes(sparseValues, (long)rows * (inner / 2) * sizeof(float)) ||
+            !HasExactBytes(sparseMetadata, (long)rows * (inner / 4)) ||
+            !HasExactBytes(denseB, (long)inner * columns * sizeof(float)) ||
+            !HasExactBytes(output, (long)rows * columns * sizeof(float)))
+            return false;
+        nuint pointers = (nuint)sparseValues.Handle | (nuint)sparseMetadata.Handle |
+            (nuint)denseB.Handle | (nuint)output.Handle;
+        if (sparseValues.Handle == IntPtr.Zero || sparseMetadata.Handle == IntPtr.Zero ||
+            denseB.Handle == IntPtr.Zero || output.Handle == IntPtr.Zero ||
+            (pointers & 15u) != 0 || DirectPtxBuffersOverlap(sparseValues, sparseMetadata) ||
+            DirectPtxBuffersOverlap(sparseValues, denseB) ||
+            DirectPtxBuffersOverlap(sparseMetadata, denseB) ||
+            DirectPtxBuffersOverlap(output, sparseValues) ||
+            DirectPtxBuffersOverlap(output, sparseMetadata) ||
+            DirectPtxBuffersOverlap(output, denseB))
+            return false;
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            const int key = 0;
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxStructuredSparse2x4MmaSpKernels.TryGetValue(key, out _))
+                    return false;
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxStructuredSparse2x4MmaSpF32Kernel kernel =
+                    _directPtxStructuredSparse2x4MmaSpKernels.GetOrAdd(
+                        key, () => new PtxStructuredSparse2x4MmaSpF32Kernel(_directPtxRuntime!));
+                if (capturing && !_directPtxStructuredSparse2x4MmaSpKernels.Pin(key))
+                    return false;
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(sparseValues, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(sparseMetadata, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(denseB, kernel.Blueprint.Tensors[2]),
+                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[3]));
+            }
+            System.Threading.Interlocked.Increment(
+                ref _directPtxStructuredSparse2x4MmaSpDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool PrewarmDirectPtxSparse2x4MatMulMmaSp()
+    {
+        if (!IsDirectPtxSparseGraphEnabled || IsStreamCapturing()) return false;
+        try
+        {
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _ = _directPtxStructuredSparse2x4MmaSpKernels.GetOrAdd(
+                    0, () => new PtxStructuredSparse2x4MmaSpF32Kernel(_directPtxRuntime!));
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
     }
 
     internal bool PrewarmDirectPtxStructuredSparse2x4(
@@ -5275,6 +5363,7 @@ public sealed partial class CudaBackend
             _directPtxCsrBackwardKernels.Dispose();
             _directPtxSparseUtilityKernels.Dispose();
             _directPtxStructuredSparse2x4Kernels.Dispose();
+            _directPtxStructuredSparse2x4MmaSpKernels.Dispose();
             _directPtxScalarScatterAddKernels.Dispose();
             _directPtxScatterRowsKernels.Dispose();
             _directPtxScatterMaxRowsKernels.Dispose();

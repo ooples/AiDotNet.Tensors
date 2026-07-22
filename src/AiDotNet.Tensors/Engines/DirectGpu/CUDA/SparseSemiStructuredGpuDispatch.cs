@@ -60,10 +60,16 @@ internal static class SparseSemiStructuredGpuDispatch
             UploadBytes(metaBuf.Handle, metadata);
 
 #if NET5_0_OR_GREATER
-            // Exact GA102 admission bypasses NVRTC. The direct-PTX baseline
-            // has a pointer-only M=256,K=256,N=64 ABI on the backend's
-            // borrowed Driver-API context and stream. Every other case keeps
-            // the established baseline/mma.sp selection below.
+            // Exact GA102 admission bypasses NVRTC. Prefer the warp-level
+            // Tensor Core module containing genuine mma.sp instructions; if
+            // module admission/JIT fails, retain the separately audited
+            // direct-PTX scalar baseline before falling through to NVRTC.
+            if (backend.TryDirectPtxSparse2x4MatMulMmaSp(
+                packedBuf, metaBuf, bBuf, outBuf, rows, cols, n))
+            {
+                backend.DownloadBuffer(outBuf, output);
+                return output;
+            }
             if (backend.TryDirectPtxSparse2x4MatMulBaseline(
                 packedBuf, metaBuf, bBuf, outBuf, rows, cols, n))
             {
