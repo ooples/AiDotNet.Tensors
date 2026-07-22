@@ -78,6 +78,12 @@ class Program
             DirectPtxResidualRmsNormExperiment.Run();
             return;
         }
+        if (args.Length > 0 && args[0] == "--direct-ptx-softmax")
+        {
+            DirectPtxSoftmaxExperiment.Run(
+                args.Length > 1 && int.TryParse(args[1], out int softmaxRuns) ? softmaxRuns : 1);
+            return;
+        }
         if (args.Length > 0 && args[0] == "--direct-ptx-external-gpu-baselines")
         {
             DirectPtxExternalBaselines.Run();
@@ -1065,6 +1071,7 @@ class Program
         Console.WriteLine("  --direct-ptx-attention-backward [runs]: deterministic D64 backward release matrix");
         Console.WriteLine("  --direct-ptx-flash-attention-backward [runs]: D64 Flash recomputation-backward release matrix");
         Console.WriteLine("  --direct-ptx-residual-rmsnorm: second-blueprint fused residual + RMSNorm D64");
+        Console.WriteLine("  --direct-ptx-softmax [runs]: exact-shape FP32 row-softmax championship matrix");
         Console.WriteLine("  --direct-ptx-external-gpu-baselines: forced cuDNN/Flash/Math/compiled Python GPU matrix");
         Console.WriteLine("  --direct-ptx-profile-attention: deterministic Nsight Compute attention target");
         Console.WriteLine("  --direct-ptx-profile-residual-rmsnorm: deterministic Nsight Compute fusion target");
