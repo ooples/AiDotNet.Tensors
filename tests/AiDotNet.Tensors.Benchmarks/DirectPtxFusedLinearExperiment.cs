@@ -335,6 +335,16 @@ internal static class DirectPtxFusedLinearExperiment
             $"{endToEnd.Mean,6:F2}/{endToEnd.Median,6:F2}/{endToEnd.P95,6:F2}/{endToEnd.P99,6:F2}   " +
             $"{tflops,6:F3} {gflops,7:F1} {allocation,7} {temporaryBytes,4} {error,8:E1} " +
             $"{registers,2}/{shared,1}/{local,1}/{blocks,2}");
+        var c = System.Globalization.CultureInfo.InvariantCulture;
+        Console.WriteLine(
+            "linear_evidence_json={" +
+            $"\"rows\":{shape.K},\"columns\":{shape.N}," +
+            $"\"method\":\"{method}\"," +
+            $"\"median_us\":{device.Median.ToString("R", c)}," +
+            $"\"p95_us\":{device.P95.ToString("R", c)}," +
+            $"\"managed_bytes\":{allocation},\"temp_bytes\":{temporaryBytes}," +
+            $"\"max_error\":{error.ToString("R", c)},\"local_bytes\":{local}" +
+            "}");
     }
 
     private static float[] Values(Random random, int count, float scale) =>
