@@ -16,7 +16,7 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
             DirectPtxSparseGraphCompletionLedger.All
                 .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(69, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+        Assert.Equal(71, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
             entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
         Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
         Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
@@ -749,6 +749,69 @@ public sealed class DirectPtxSparseGraphTests
         Assert.False(PtxFusedSparseLinearF32Kernel.SupportsShape(32, 1024, 1024, 8_192));
         Assert.True(PtxFusedSparseLinearF32Kernel.SupportsActivation(6));
         Assert.False(PtxFusedSparseLinearF32Kernel.SupportsActivation(7));
+    }
+
+    [Fact]
+    public void TensorGatherEmitter_UsesExactCoalescedPointerOnlyAbi()
+    {
+        string ptx = PtxTensorGatherRowsF32Kernel.EmitPtx(8, 6);
+        DirectPtxKernelBlueprint blueprint = PtxTensorGatherRowsF32Kernel.CreateBlueprint(
+            DirectPtxArchitectureFamily.Ampere);
+
+        Assert.Equal(3, Count(ptx, ".param .u64"));
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(1, Count(ptx, "ld.global.v4.f32"));
+        Assert.Equal(1, Count(ptx, "st.global.v4.f32"));
+        Assert.Equal(DirectPtxPhysicalLayout.RowGatherIndices, blueprint.Tensors[1].Layout);
+        Assert.Equal(PtxTensorGatherRowsF32Kernel.Indices,
+            blueprint.Tensors[1].PhysicalExtent.ElementCount);
+        Assert.Equal("one-coalesced-float4-per-thread", blueprint.Semantics["transfer"]);
+        Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
+        Assert.All(blueprint.Tensors, tensor =>
+            Assert.Equal(DirectPtxExtentMode.Exact, tensor.ExtentMode));
+    }
+
+    [Theory]
+    [InlineData((int)DirectPtxTensorScatterReduceMode.Sum, "add.rn.f32")]
+    [InlineData((int)DirectPtxTensorScatterReduceMode.Product, "mul.rn.f32")]
+    [InlineData((int)DirectPtxTensorScatterReduceMode.Maximum, "max.f32")]
+    [InlineData((int)DirectPtxTensorScatterReduceMode.Minimum, "min.f32")]
+    public void TensorScatterReduceEmitter_BakesCasReduction(
+        int modeValue,
+        string reductionInstruction)
+    {
+        var mode = (DirectPtxTensorScatterReduceMode)modeValue;
+        string ptx = PtxTensorScatterReduceF32Kernel.EmitPtx(8, 6, mode);
+        DirectPtxKernelBlueprint blueprint = PtxTensorScatterReduceF32Kernel.CreateBlueprint(
+            DirectPtxArchitectureFamily.Ampere, mode);
+
+        Assert.Equal(3, Count(ptx, ".param .u64"));
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("atom.global.cas.b32", ptx, StringComparison.Ordinal);
+        Assert.Contains(reductionInstruction, ptx, StringComparison.Ordinal);
+        Assert.Equal(DirectPtxPhysicalLayout.OuterDimensionInner, blueprint.Tensors[0].Layout);
+        Assert.Equal(DirectPtxPhysicalLayout.ElementScatterIndices, blueprint.Tensors[2].Layout);
+        Assert.Equal("preserved-include-self", blueprint.Semantics["output-seed"]);
+        Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
+        Assert.All(blueprint.Tensors, tensor =>
+            Assert.Equal(DirectPtxExtentMode.Exact, tensor.ExtentMode));
+    }
+
+    [Fact]
+    public void TensorIndexingAdmission_IsExact()
+    {
+        Assert.True(PtxTensorGatherRowsF32Kernel.SupportsShape(16_384, 64));
+        Assert.False(PtxTensorGatherRowsF32Kernel.SupportsShape(8_192, 64));
+        Assert.False(PtxTensorGatherRowsF32Kernel.SupportsShape(16_384, 32));
+        Assert.True(PtxTensorScatterReduceF32Kernel.SupportsShape(32, 512, 1024, 64));
+        Assert.False(PtxTensorScatterReduceF32Kernel.SupportsShape(16, 512, 1024, 64));
+        Assert.False(PtxTensorScatterReduceF32Kernel.SupportsShape(32, 512, 512, 64));
     }
 
     [Theory]

@@ -175,6 +175,12 @@ internal enum DirectPtxPhysicalLayout
     SparseOptimizerState,
     /// <summary>CSR row pointers followed immediately by CSR column indices.</summary>
     PackedCsrRowsAndColumns,
+    /// <summary>Zero-based Int32 row indices for a dense row gather.</summary>
+    RowGatherIndices,
+    /// <summary>One zero-based Int32 destination index per dense source element.</summary>
+    ElementScatterIndices,
+    /// <summary>Dense contiguous [outer,dimension,inner] storage.</summary>
+    OuterDimensionInner,
     /// <summary>Triangle vertex indices [face,three].</summary>
     TriangleFaces,
     /// <summary>Dense additive attention bias, [H,Sq,Skv] or [B,H,Sq,Skv].</summary>

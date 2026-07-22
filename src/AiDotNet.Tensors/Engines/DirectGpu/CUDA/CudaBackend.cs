@@ -11780,6 +11780,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void Gather(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, int numIndices, int featureSize)
     {
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxTensorGatherRows(source, indices, output, numIndices, featureSize))
+            return;
+#endif
         if (!_kernelCache.TryGetValue("embedding_forward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: embedding_forward");
 
@@ -12217,6 +12221,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     }
     public unsafe void ScatterReduce(IGpuBuffer output, IGpuBuffer source, IGpuBuffer index, int outerSize, int srcDim, int dstDim, int innerSize, int mode)
     {
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxTensorScatterReduce(
+            output, source, index, outerSize, srcDim, dstDim, innerSize, mode))
+            return;
+#endif
         var kernel = ResolveParity210Kernel("parity210_scatter_reduce");
         using var _ = PushContext();
         int __total = outerSize*srcDim*innerSize; if (__total <= 0) return;

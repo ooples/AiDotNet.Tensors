@@ -91,9 +91,9 @@ internal static class DirectPtxSparseGraphCompletionLedger
             "SparseSampledAddMM", "SparseSpGeMM", "SparseSum", "SparseMean", "SparseSoftmax",
             "SparseLogSoftmax");
         Add("DirectGpuTensorEngine", DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx,
-            "FusedSparseLinear");
+            "FusedSparseLinear", "Gather", "ScatterReduce");
         Add("DirectGpuTensorEngine", DirectPtxSparseGraphCompletionStatus.MissingDirectPtx,
-            "ScatterMean", "ScatterAddBackward", "Gather", "ScatterReduce");
+            "ScatterMean", "ScatterAddBackward");
         return entries;
     }
 }
