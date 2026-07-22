@@ -61,6 +61,7 @@ internal static class DirectPtxReductionExperiment
                 $"{r.Time.P95 * 1000,10:F2} {r.Time.P99 * 1000,10:F2} {r.Time.Mean * 1000,10:F2} " +
                 $"{r.GigabytesPerSecond,9:F2} {r.Allocation,9} {temporary,9} " +
                 $"{r.MaxError,10:G4} {registers,6} {shared,9} {local,8} {activeBlocks,9}");
+            EmitEvidence(r);
         }
 
         Console.WriteLine();
@@ -226,6 +227,24 @@ internal static class DirectPtxReductionExperiment
         var random = new Random(seed);
         return Enumerable.Range(0, length)
             .Select(_ => (random.NextSingle() - 0.5f) * 2f * magnitude).ToArray();
+    }
+
+    // Machine-readable evidence line consumed by
+    // Profiling/run-direct-ptx-reduction-evidence.ps1, which aggregates across
+    // independent clean processes and evaluates the release gate in
+    // relative-error mode. Time is stored in ms; emit microseconds.
+    private static void EmitEvidence(Result r)
+    {
+        var c = System.Globalization.CultureInfo.InvariantCulture;
+        Console.WriteLine(
+            "reduction_evidence_json={" +
+            $"\"rows\":{r.Rows},\"columns\":{r.Columns}," +
+            $"\"method\":\"{r.Method}\"," +
+            $"\"median_us\":{(r.Time.Median * 1000).ToString("R", c)}," +
+            $"\"p95_us\":{(r.Time.P95 * 1000).ToString("R", c)}," +
+            $"\"managed_bytes\":{r.Allocation},\"temp_bytes\":{r.TemporaryBytes}," +
+            $"\"max_rel_error\":{r.MaxError.ToString("R", c)},\"local_bytes\":{r.LocalBytes}" +
+            "}");
     }
 
     // Reports the maximum RELATIVE error against an FP64 oracle. Row-sum outputs
