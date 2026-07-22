@@ -33,9 +33,10 @@ internal sealed class PtxFusedResidualBiasLayerNormGeluD64Kernel : IDisposable
         float epsilon = 1e-5f)
     {
         ArgumentNullException.ThrowIfNull(runtime);
-        if (runtime.ArchitectureFamily != DirectPtxArchitectureFamily.Ampere)
+        if (!DirectPtxArchitecture.HasValidatedResidualLayerNormGelu(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
-                "The checked-in residual+bias+LayerNorm+GELU specialization is validated only on Ampere.");
+                "The checked-in residual+bias+LayerNorm+GELU specialization is measured only on GA10x/SM86.");
         Validate(rows, epsilon);
         Rows = rows;
         Epsilon = epsilon;

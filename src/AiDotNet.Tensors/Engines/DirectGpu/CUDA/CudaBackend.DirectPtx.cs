@@ -72,7 +72,7 @@ public sealed partial class CudaBackend
 
     internal bool IsDirectPtxResidualLayerNormGeluEnabled =>
         DirectPtxFeatureGate.IsResidualLayerNormGeluEnabled && IsAvailable &&
-        DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) == DirectPtxArchitectureFamily.Ampere;
+        DirectPtxArchitecture.HasValidatedResidualLayerNormGelu(_ccMajor, _ccMinor);
 
     internal bool IsDirectPtxFlashDecodeEnabled =>
         DirectPtxFeatureGate.IsFlashDecodeEnabled && IsAvailable &&

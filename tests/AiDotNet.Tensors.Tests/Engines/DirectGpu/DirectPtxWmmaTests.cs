@@ -889,6 +889,22 @@ public class DirectPtxWmmaTests
         Assert.False(PtxFusedResidualBiasLayerNormGeluD64Kernel.IsPromotedRows(256));
     }
 
+    [Theory]
+    [InlineData(8, 6, true)]
+    [InlineData(8, 0, false)]
+    [InlineData(8, 7, false)]
+    [InlineData(8, 9, false)]
+    [InlineData(9, 0, false)]
+    [InlineData(10, 0, false)]
+    public void ResidualLayerNormGeluArchitectureMatrix_FailsClosedOutsideSm86(
+        int major,
+        int minor,
+        bool expected)
+    {
+        Assert.Equal(expected,
+            DirectPtxArchitecture.HasValidatedResidualLayerNormGelu(major, minor));
+    }
+
     [Fact]
     public void ResidualBiasLayerNormGeluEmitter_IsRegisterResidentAndStrideFree()
     {
@@ -3086,8 +3102,9 @@ public class DirectPtxWmmaTests
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
         using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(runtime.ArchitectureFamily == DirectPtxArchitectureFamily.Ampere,
-            "The checked-in residual LayerNorm+GELU specialization is validated on Ampere.");
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedResidualLayerNormGelu(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in residual LayerNorm+GELU specialization is measured on GA10x/SM86.");
         const int rows = 256, dimension = 64;
         using var kernel = new PtxFusedResidualBiasLayerNormGeluD64Kernel(runtime, rows);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
