@@ -17,18 +17,16 @@ implementations require the internal experiment scope and fail closed in normal
 dispatch. Release promotion is stricter than preview admission and additionally
 requires executed-spill evidence from the committed head.
 
-The only performance-qualified preview cell is the Ampere FP32 decode
-specialization:
+The original screening candidate was the Ampere FP32 decode specialization:
 
 ```text
 input [1,512] + output-major weights [2048,512] + bias [2048]
     -> gelu_tanh(input @ transpose(weights) + bias) [1,2048]
 ```
 
-It passed the recorded three-run timing gate against current AiDotNet,
-cuBLASLt, and PyTorch CUDA Graphs. It is not claimed as release-promoted while
-executed-spill counters remain unavailable. All general-M, FP16/BF16,
-backward, LoRA, CE, dot, outer, and batched cells remain experimental until a
+The final clean release matrix did not reproduce a gate-qualified win for this
+cell or any other issue cell. All general-M, decode, FP16/BF16, backward, LoRA,
+CE, dot, outer, and batched cells therefore remain experimental until a later
 clean three-run matrix proves at least a 1.10x conservative median win,
 acceptable P95, zero hot managed bytes, zero avoidable temporary VRAM,
 numerical tolerance, and zero spill evidence.
@@ -236,28 +234,33 @@ Python runner. CUDA Graph rows use preallocated resident outputs and report
 zero replay-time device allocation. The strongest eligible competitor for a
 cell determines its gate.
 
-The GPU was concurrently occupied during the latest implementation screening,
-producing large P95/P99 excursions. Those screens are useful for rejecting
-obvious losers but are not accepted as final championship evidence. The PR
-description must use a fresh quiet-GPU three-run matrix from the committed head.
+## Current release evidence
 
-## Historical performance-qualified decode screen
+The final issue matrix ran from clean implementation commit
+`814d5460d672ecb55a8c04afa3c66e883bc79843` on 2026-07-22. The environment was
+Windows 10.0.26200, .NET 10.0.10 / SDK 10.0.302, NVIDIA GeForce RTX 3080,
+SM86, driver 610.47, and PyTorch 2.12.1+cu130. Three independent .NET and
+Python process pairs produced 144 AiDotNet/NVIDIA rows and 72 PyTorch rows.
+Every accepted process used the benchmark contract above; the evidence
+orchestrator rejected no attempt.
 
-Environment: Windows 10.0.26200, .NET 10.0.10 / SDK 10.0.302, NVIDIA GeForce
-RTX 3080 12 GiB, SM86, driver 610.47, PyTorch 2.12.1+cu130. Values are ranges
-across three runs; each run used the benchmark contract above.
+The result is an honest `timing-fail`, so all 44 issue cells remain
+experimental and fail closed. No operation cleared the full conservative gate
+in all three runs. Direct PTX had the best average device median for dot,
+outer, and strided dot, but those cells still missed either the 1.10x
+cross-run median requirement or the E2E requirement. The other nine groups
+were won by an established AiDotNet, NVIDIA, or PyTorch route. This evidence
+does not support release promotion.
 
-| Shape | Method | device median us | P95 us | GFLOPS | managed B/call | temp device B | max error |
-|---|---|---:|---:|---:|---:|---:|---:|
-| 512x2048 | **Direct PTX** | **9.63-11.67** | **13.62-18.22** | **179.6-217.9** | **0** | **0** | <=1.3e-7 |
-| 512x2048 | PyTorch CUDA Graph | 13.21-15.24 | 16.90-34.41 | 137.7-159.0 | n/a | 0 | <=2.4e-8 |
-| 512x2048 | AiDotNet NVRTC | 23.35-23.86 | 24.88-26.42 | 87.9-89.8 | 0 | 0 | <=6.7e-8 |
-| 512x2048 | NVIDIA cuBLASLt | 30.60-33.16 | 35.01-65.95 | 63.2-68.5 | 248 | 0 | <=1.3e-7 |
-
-The conservative cross-run comparison is `13.21 / 11.67 = 1.13x`; every
-paired direct P95 is below PyTorch Graph P95. The JIT audit recorded 24
-registers/thread, 0 shared bytes, 0 local bytes/thread, and 12 active
-128-thread blocks/SM.
+All 72 Direct PTX rows reported zero managed bytes/call, zero temporary device
+bytes, zero JIT local bytes/thread, and error within the declared tolerance.
+The complete per-operation tables group every competitor with mean, median,
+P95, P99, TFLOPS/GFLOPS, allocation, temporary memory, error, and resource
+metrics in the [checked-in evidence report](2026-07-22-direct-ptx-dense-linear-results.md).
+Its source report SHA-256 is
+`644de70469a7c04e79b0889468f1380c6e9869670d3dcde247491383d35d3fe4`;
+the machine-readable release-gate SHA-256 is
+`a229d8abaf100ccd47ae594c8625755fc79426bdc15112f59fd9410edae16590`.
 
 Nsight Compute CLI 2025.4.1 was extracted from the official package and
 attached to the committed kernel target on 2026-07-22. Counter collection still

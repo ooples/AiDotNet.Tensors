@@ -2216,7 +2216,7 @@ public partial class DirectPtxWmmaTests
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             PtxFusedLinearGeluM1Kernel.EmitPtx(8, 6, 512, 768));
         Assert.False(PtxFusedLinearGeluM1Kernel.IsPromotedShape(256, 256));
-        Assert.True(PtxFusedLinearGeluM1Kernel.IsPromotedShape(512, 2048));
+        Assert.False(PtxFusedLinearGeluM1Kernel.IsPromotedShape(512, 2048));
         Assert.False(PtxFusedLinearGeluM1Kernel.IsPromotedShape(1024, 4096));
     }
 
@@ -3684,10 +3684,11 @@ public partial class DirectPtxWmmaTests
     }
 
     [SkippableFact]
-    public void BackendFusedLinearGeluM1_IsExactZeroAllocationCapturableAndPublic()
+    public void BackendFusedLinearGeluM1_IsExactZeroAllocationCapturableAndExperimentOnly()
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
         bool? previous = DirectPtxFeatureGate.TestOverride;
+        bool previousExperiment = DirectPtxFeatureGate.FusedLinearExperimentOverride;
         DirectPtxFeatureGate.TestOverride = true;
         try
         {
@@ -3707,10 +3708,14 @@ public partial class DirectPtxWmmaTests
             using var output = backend.AllocateBuffer(outputFeatures);
             using var wrongOutput = backend.AllocateBuffer(outputFeatures + 1);
 
-            Assert.False(PtxFusedLinearGeluM1Kernel.IsPromotedShape(1024, 4096));
+            Assert.False(PtxFusedLinearGeluM1Kernel.IsPromotedShape(
+                inputFeatures, outputFeatures));
             Assert.False(backend.TryDirectPtxFusedLinearGeluM1(
-                input, weights, bias, output, 1024, 4096));
+                input, weights, bias, output, inputFeatures, outputFeatures));
             Assert.Equal("fused-linear-performance-gate-not-met", backend.DirectPtxLastError);
+            DirectPtxFeatureGate.FusedLinearExperimentOverride = true;
+
+            Assert.False(PtxFusedLinearGeluM1Kernel.IsPromotedShape(1024, 4096));
             Assert.False(backend.TryDirectPtxFusedLinearGeluM1(
                 input, weights, bias, wrongOutput, inputFeatures, outputFeatures));
             Assert.Equal("fused-linear-physical-extent-mismatch", backend.DirectPtxLastError);
@@ -3756,10 +3761,11 @@ public partial class DirectPtxWmmaTests
             backend.Synchronize();
             Assert.Equal(dispatchBefore + 1, backend.DirectPtxFusedLinearDispatchCount);
             AssertVectorClose(backend.DownloadBuffer(output), expected, 2e-4f,
-                "public fused linear GELU");
+                "experiment fused linear GELU");
         }
         finally
         {
+            DirectPtxFeatureGate.FusedLinearExperimentOverride = previousExperiment;
             DirectPtxFeatureGate.TestOverride = previous;
         }
     }

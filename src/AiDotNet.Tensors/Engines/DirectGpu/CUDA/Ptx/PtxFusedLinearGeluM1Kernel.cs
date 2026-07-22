@@ -251,8 +251,9 @@ internal sealed class PtxFusedLinearGeluM1Kernel : IDisposable
         inputFeatures is 256 or 512 or 1024 or 2048 or 4096 &&
         outputFeatures is 256 or 512 or 1024 or 2048 or 4096;
 
-    internal static bool IsPromotedShape(int inputFeatures, int outputFeatures) =>
-        (inputFeatures, outputFeatures) is (512, 2048);
+    // The final clean three-run issue matrix did not reproduce a release-gate
+    // win for any supported shape. Keep every specialization experiment-only.
+    internal static bool IsPromotedShape(int inputFeatures, int outputFeatures) => false;
 
     private static int OutputsPerWarp(int outputFeatures) => 2;
 
