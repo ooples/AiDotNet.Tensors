@@ -9860,6 +9860,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias,
         int batchSize, int inFeatures, int outFeatures)
     {
+        // Fail-closed direct-PTX composite backward (issue #836); returns false until GPU-promoted.
+        if (TryDirectPtxFusedLinearBackward(gradOutput, input, weight, preActivation,
+            gradInput, gradWeight, gradBias, batchSize, inFeatures, outFeatures,
+            Ptx.DirectPtxLinearActivation.Relu)) return;
         // Grad input kernel
         if (!_kernelCache.TryGetValue("fused_linear_relu_backward_grad_input", out var giKernel))
             throw new InvalidOperationException("CUDA kernel not found: fused_linear_relu_backward_grad_input");
@@ -9971,6 +9975,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias,
         int batchSize, int inFeatures, int outFeatures)
     {
+        // Fail-closed direct-PTX composite backward (issue #836); returns false until GPU-promoted.
+        if (TryDirectPtxFusedLinearBackward(gradOutput, input, weight, preActivation,
+            gradInput, gradWeight, gradBias, batchSize, inFeatures, outFeatures,
+            Ptx.DirectPtxLinearActivation.GeluTanh)) return;
         if (!_kernelCache.TryGetValue("fused_linear_gelu_backward_grad_input", out var giKernel))
             throw new InvalidOperationException("CUDA kernel not found: fused_linear_gelu_backward_grad_input");
         using var _ = PushContext();
@@ -10007,6 +10015,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias,
         int batchSize, int inFeatures, int outFeatures)
     {
+        // Fail-closed direct-PTX composite backward (issue #836); returns false until GPU-promoted.
+        if (TryDirectPtxFusedLinearBackward(gradOutput, input, weight, preActivation,
+            gradInput, gradWeight, gradBias, batchSize, inFeatures, outFeatures,
+            Ptx.DirectPtxLinearActivation.Swish)) return;
         if (!_kernelCache.TryGetValue("fused_linear_swish_backward_grad_input", out var giKernel))
             throw new InvalidOperationException("CUDA kernel not found: fused_linear_swish_backward_grad_input");
         using var _ = PushContext();

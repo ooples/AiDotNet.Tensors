@@ -2254,6 +2254,8 @@ public class DirectPtxWmmaTests
             DirectPtxDenseLinearCoverageManifest.Get("DirectGpuTensorEngine.FusedLinear").Status);
         Assert.Equal(DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx,
             DirectPtxDenseLinearCoverageManifest.Get("DirectGpuTensorEngine.TensorMatMul").Status);
+        Assert.Equal(DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxDenseLinearCoverageManifest.Get("DirectGpuTensorEngine.FusedLinearBackward").Status);
         Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() =>
             DirectPtxDenseLinearCoverageManifest.Get("UnassignedDenseLinearApi"));
     }
