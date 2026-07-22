@@ -24,7 +24,7 @@ public class DirectPtxScientificTests
             Assert.False(string.IsNullOrWhiteSpace(cell.DTypes));
             Assert.False(string.IsNullOrWhiteSpace(cell.DirectPtxAssignment));
         });
-        foreach (string api in new[] { "CudaBackend.ComplexMultiply", "CudaBackend.ComplexConjugate", "CudaBackend.ComplexMagnitude", "CudaBackend.OctonionAdd", "CudaBackend.OctonionMultiply" })
+        foreach (string api in new[] { "CudaBackend.ComplexMultiply", "CudaBackend.ComplexConjugate", "CudaBackend.ComplexMagnitude", "CudaBackend.OctonionAdd", "CudaBackend.OctonionMultiply", "CudaBackend.MobiusAdd" })
             Assert.Equal(DirectPtxScientificCoverageStatus.ExperimentalDirectPtx,
                 DirectPtxScientificCoverageManifest.Get(api).Status);
         Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() =>
@@ -277,6 +277,75 @@ public class DirectPtxScientificTests
         var actual = new float[count * 8];
         output.Download<float>(actual);
         AssertVectorClose(actual, expected, 3e-3f, "octonion multiply");
+    }
+
+    [Fact]
+    public void MobiusAddEmitter_IsPerVectorTreeReducedFormula()
+    {
+        string ptx = PtxMobiusAddKernel.EmitPtx(8, 6, 64);
+        Assert.Contains(PtxMobiusAddKernel.EntryPoint, ptx);
+        Assert.Contains("ld.param.f32 %f5, [curvature];", ptx);
+        Assert.Contains(".shared .align 16 .b8 x_sh[256]", ptx);   // dim=64
+        Assert.Contains(".shared .align 16 .b8 red[512]", ptx);    // 128 lanes
+        Assert.Contains("abs.f32 %f6, %f6", ptx);                  // |denom|
+        Assert.Contains("rcp.approx.f32 %f9, %f6", ptx);           // 1/denom
+        // Three reductions, each: store-barrier + 7 tree-halvings + post-load barrier.
+        Assert.Equal(27, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxMobiusAddKernel.IsSupportedShape(64, 64));
+        Assert.False(PtxMobiusAddKernel.IsSupportedShape(64, 100));
+        Assert.False(PtxMobiusAddKernel.IsPromotedShape(64, 64));
+    }
+
+    [SkippableTheory]
+    [InlineData(64, 32)]
+    [InlineData(128, 64)]
+    [InlineData(64, 128)]
+    public void DriverOnlyMobiusAdd_MatchesOracle(int batch, int dim)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in mobius-add specialization is measured on GA10x/SM86.");
+        const float c = 0.5f;
+        using var kernel = new PtxMobiusAddKernel(runtime, batch, dim, c);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20266300 + batch + dim);
+        // Small magnitudes keep the vectors inside the Poincare ball.
+        float[] xHost = Values(random, batch * dim, 0.2f);
+        float[] yHost = Values(random, batch * dim, 0.2f);
+        var expected = new float[batch * dim];
+        for (int row = 0; row < batch; row++)
+        {
+            double xn = 0, yn = 0, dot = 0;
+            for (int i = 0; i < dim; i++)
+            {
+                double xi = xHost[row * dim + i], yi = yHost[row * dim + i];
+                xn += xi * xi; yn += yi * yi; dot += xi * yi;
+            }
+            double denom = 1.0 + 2.0 * c * dot + (double)c * c * xn * yn;
+            denom = Math.Max(Math.Abs(denom), 1e-15);
+            double coeff1 = 1.0 + 2.0 * c * dot + c * yn;
+            double coeff2 = 1.0 - c * xn;
+            for (int i = 0; i < dim; i++)
+                expected[row * dim + i] = (float)((coeff1 * xHost[row * dim + i] + coeff2 * yHost[row * dim + i]) / denom);
+        }
+
+        using var x = runtime.AllocateBytes((nuint)(xHost.Length * sizeof(float)));
+        using var y = runtime.AllocateBytes((nuint)(yHost.Length * sizeof(float)));
+        using var output = runtime.AllocateBytes((nuint)(batch * dim * sizeof(float)));
+        x.Upload<float>(xHost);
+        y.Upload<float>(yHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(x, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(y, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[batch * dim];
+        output.Download<float>(actual);
+        AssertVectorClose(actual, expected, 3e-3f, $"mobius add {batch}x{dim}");
     }
 
     private static float[] Values(Random random, int count, float magnitude)
