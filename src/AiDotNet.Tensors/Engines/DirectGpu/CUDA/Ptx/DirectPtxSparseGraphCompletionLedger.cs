@@ -84,7 +84,7 @@ internal static class DirectPtxSparseGraphCompletionLedger
             "sparse_adamw_update", "sparse_rmsprop_update", "sparse_adagrad_update", "sparse_nag_update",
             "sparse_adadelta_update", "sparse_amsgrad_update", "sparse_adamax_update",
             "sparse_lion_update", "sparse_nadam_update", "sparse_ftrl_update", "sparse_proximal_l1_update");
-        Add("ISparseEngine", DirectPtxSparseGraphCompletionStatus.MissingDirectPtx,
+        Add("ISparseEngine", DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx,
             "SpMV", "SpMVTranspose", "SpMM", "SpSpMM", "AddSparseDense", "MultiplySparseDense",
             "SparseGather", "SparseScatter", "SparseScatterAdd", "SparseToDense", "DenseToSparse",
             "Coalesce", "SparseTranspose", "SparseMatMul", "SparseMatMulPatternPreserving", "SparseAddMM",

@@ -92,6 +92,8 @@ public sealed partial class CudaBackend
         _directPtxTensorScatterHighLevelKernels = new(2);
     private readonly DirectPtxKernelCache<DirectPtxMeshPoolOperation, PtxMeshPoolF32Kernel>
         _directPtxMeshPoolKernels = new(16);
+    private readonly DirectPtxKernelCache<DirectPtxSparseEngineOperation, PtxSparseEngineF32Kernel>
+        _directPtxSparseEngineKernels = new(22);
     private DirectPtxRuntime? _directPtxRuntime;
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
@@ -135,6 +137,7 @@ public sealed partial class CudaBackend
     private long _directPtxTensorScatterReduceDispatchCount;
     private long _directPtxTensorScatterHighLevelDispatchCount;
     private long _directPtxMeshPoolDispatchCount;
+    private long _directPtxSparseEngineDispatchCount;
     internal int DirectPtxCachedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxAttentionKernels.Count; }
@@ -268,6 +271,8 @@ public sealed partial class CudaBackend
         System.Threading.Interlocked.Read(ref _directPtxTensorScatterHighLevelDispatchCount);
     internal long DirectPtxMeshPoolDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxMeshPoolDispatchCount);
+    internal long DirectPtxSparseEngineDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxSparseEngineDispatchCount);
 
     /// <summary>
     /// Attempts the exact FP32 CSR SpMM golden specialization. The admitted ABI
@@ -5428,6 +5433,85 @@ public sealed partial class CudaBackend
         }
     }
 
+    internal bool TryDirectPtxSparseEngine(
+        DirectPtxSparseEngineOperation operation,
+        IGpuBuffer p0,
+        IGpuBuffer? p1 = null,
+        IGpuBuffer? p2 = null,
+        IGpuBuffer? p3 = null,
+        IGpuBuffer? p4 = null,
+        IGpuBuffer? p5 = null,
+        IGpuBuffer? p6 = null)
+    {
+        if (!IsDirectPtxSparseGraphEnabled || p0 is null) return false;
+        DirectPtxKernelBlueprint admission = PtxSparseEngineF32Kernel.GetAdmissionBlueprint(operation);
+        int count = admission.Tensors.Count;
+        bool Valid(IGpuBuffer? buffer, int index) => buffer is not null &&
+            buffer.Handle != IntPtr.Zero && ((nuint)buffer.Handle & 15u) == 0 &&
+            HasExactBytes(buffer, checked((long)admission.Tensors[index].RequiredBytes));
+        if (!Valid(p0, 0) || (count > 1 && !Valid(p1, 1)) || (count > 2 && !Valid(p2, 2)) ||
+            (count > 3 && !Valid(p3, 3)) || (count > 4 && !Valid(p4, 4)) ||
+            (count > 5 && !Valid(p5, 5)) || (count > 6 && !Valid(p6, 6))) return false;
+        bool Pair(IGpuBuffer left, IGpuBuffer? right) => right is not null && DirectPtxBuffersOverlap(left, right);
+        if (Pair(p0, p1) || Pair(p0, p2) || Pair(p0, p3) || Pair(p0, p4) || Pair(p0, p5) || Pair(p0, p6) ||
+            (p1 is not null && (Pair(p1, p2) || Pair(p1, p3) || Pair(p1, p4) || Pair(p1, p5) || Pair(p1, p6))) ||
+            (p2 is not null && (Pair(p2, p3) || Pair(p2, p4) || Pair(p2, p5) || Pair(p2, p6))) ||
+            (p3 is not null && (Pair(p3, p4) || Pair(p3, p5) || Pair(p3, p6))) ||
+            (p4 is not null && (Pair(p4, p5) || Pair(p4, p6))) || (p5 is not null && Pair(p5, p6))) return false;
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxSparseEngineKernels.TryGetValue(operation, out _)) return false;
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxSparseEngineF32Kernel kernel = _directPtxSparseEngineKernels.GetOrAdd(
+                    operation, () => new PtxSparseEngineF32Kernel(_directPtxRuntime!, operation));
+                if (capturing && !_directPtxSparseEngineKernels.Pin(operation)) return false;
+                Span<DirectPtxTensorView> views = stackalloc DirectPtxTensorView[7];
+                views[0] = DirectPtxTensorView.Create(p0, kernel.Blueprint.Tensors[0]);
+                if (count > 1) views[1] = DirectPtxTensorView.Create(p1!, kernel.Blueprint.Tensors[1]);
+                if (count > 2) views[2] = DirectPtxTensorView.Create(p2!, kernel.Blueprint.Tensors[2]);
+                if (count > 3) views[3] = DirectPtxTensorView.Create(p3!, kernel.Blueprint.Tensors[3]);
+                if (count > 4) views[4] = DirectPtxTensorView.Create(p4!, kernel.Blueprint.Tensors[4]);
+                if (count > 5) views[5] = DirectPtxTensorView.Create(p5!, kernel.Blueprint.Tensors[5]);
+                if (count > 6) views[6] = DirectPtxTensorView.Create(p6!, kernel.Blueprint.Tensors[6]);
+                lock (GpuDispatchLock) kernel.Launch(views[..count]);
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxSparseEngineDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool PrewarmDirectPtxSparseEngine(DirectPtxSparseEngineOperation operation)
+    {
+        if (!IsDirectPtxSparseGraphEnabled || IsStreamCapturing()) return false;
+        try
+        {
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _ = _directPtxSparseEngineKernels.GetOrAdd(
+                    operation, () => new PtxSparseEngineF32Kernel(_directPtxRuntime!, operation));
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
     private void DisposeDirectPtxRuntime()
     {
         lock (_directPtxLock)
@@ -5471,6 +5555,7 @@ public sealed partial class CudaBackend
             _directPtxTensorScatterReduceKernels.Dispose();
             _directPtxTensorScatterHighLevelKernels.Dispose();
             _directPtxMeshPoolKernels.Dispose();
+            _directPtxSparseEngineKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }

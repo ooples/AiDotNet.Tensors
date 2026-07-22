@@ -2,6 +2,7 @@
 using System;
 using System.Linq;
 using System.Threading;
+using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
@@ -12,16 +13,88 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 public sealed class DirectPtxSparseGraphTests
 {
     [Fact]
-    public void CompletionLedger_IsUniqueExplicitAndBlocksPrematurePr()
+    public void CompletionLedger_IsUniqueExplicitAndComplete()
     {
         Assert.True(DirectPtxSparseGraphCompletionLedger.All.Count >= 100);
         Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
             DirectPtxSparseGraphCompletionLedger.All
                 .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(91, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+        Assert.Equal(113, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
             entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
-        Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
-        Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
+        Assert.True(DirectPtxSparseGraphCompletionLedger.IsComplete);
+        DirectPtxSparseGraphCompletionLedger.RequireComplete();
+    }
+
+    [Fact]
+    public void SparseEngineFamily_EmitsAllTwentyTwoDistinctExactModules()
+    {
+        DirectPtxSparseEngineOperation[] operations = Enum.GetValues<DirectPtxSparseEngineOperation>();
+        Assert.Equal(22, operations.Length);
+        Assert.Equal(22, operations.Select(PtxSparseEngineF32Kernel.GetEntryPoint)
+            .Distinct(StringComparer.Ordinal).Count());
+
+        foreach (DirectPtxSparseEngineOperation operation in operations)
+        {
+            string ptx = PtxSparseEngineF32Kernel.EmitPtx(8, 6, operation);
+            DirectPtxKernelBlueprint blueprint = PtxSparseEngineF32Kernel.CreateBlueprint(
+                DirectPtxArchitectureFamily.Ampere, operation);
+
+            Assert.Contains(PtxSparseEngineF32Kernel.GetEntryPoint(operation), ptx);
+            Assert.Equal(blueprint.Tensors.Count, Count(ptx, ".param .u64"));
+            Assert.Contains("st.global", ptx, StringComparison.Ordinal);
+            Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+            Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+            Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+            Assert.All(blueprint.Tensors, tensor =>
+            {
+                Assert.Equal(DirectPtxExtentMode.Exact, tensor.ExtentMode);
+                Assert.Equal(16, tensor.AlignmentBytes);
+            });
+            Assert.Equal("device-pointers-only", blueprint.Semantics["parameter-abi"]);
+            Assert.Equal("forbidden", blueprint.Semantics["dynamic-strides"]);
+            Assert.Equal("host-pre-dispatch", blueprint.Semantics["coordinate-validation"]);
+            Assert.Equal("experimental-hardware-evidence-pending", blueprint.Semantics["promotion"]);
+            Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
+            if (operation == DirectPtxSparseEngineOperation.SparseSampledAddMM)
+                Assert.Equal("coo-unique", blueprint.Semantics["pattern"]);
+            AssertPtxControlFlowClosed(ptx);
+        }
+    }
+
+    [Fact]
+    public void SparseEngineFamily_EmitsOperationSpecificMathAndReductionSemantics()
+    {
+        string spmv = PtxSparseEngineF32Kernel.EmitPtx(8, 6, DirectPtxSparseEngineOperation.SpMV);
+        string spmm = PtxSparseEngineF32Kernel.EmitPtx(8, 6, DirectPtxSparseEngineOperation.SpMM);
+        string coalesce = PtxSparseEngineF32Kernel.EmitPtx(8, 6, DirectPtxSparseEngineOperation.Coalesce);
+        string softmax = PtxSparseEngineF32Kernel.EmitPtx(8, 6, DirectPtxSparseEngineOperation.SparseSoftmax);
+        string logSoftmax = PtxSparseEngineF32Kernel.EmitPtx(8, 6, DirectPtxSparseEngineOperation.SparseLogSoftmax);
+
+        Assert.Contains("SPMV_LOOP", spmv);
+        Assert.Contains("fma.rn.f32", spmm);
+        Assert.Contains("COALESCE_PRIOR", coalesce);
+        Assert.Contains("COALESCE_SUM", coalesce);
+        Assert.Contains("ex2.approx.f32", softmax);
+        Assert.Contains("lg2.approx.f32", logSoftmax);
+    }
+
+    [Fact]
+    public void SparseEngineFamily_HasARealHostFacingISparseEngineImplementation()
+    {
+        Assert.Contains(typeof(ISparseEngine), typeof(CudaPtxSparseEngine).GetInterfaces());
+        string[] operations =
+        [
+            nameof(ISparseEngine.SpMV), nameof(ISparseEngine.SpMVTranspose), nameof(ISparseEngine.SpMM),
+            nameof(ISparseEngine.SpSpMM), nameof(ISparseEngine.AddSparseDense), nameof(ISparseEngine.MultiplySparseDense),
+            nameof(ISparseEngine.SparseGather), nameof(ISparseEngine.SparseScatter), nameof(ISparseEngine.SparseScatterAdd),
+            nameof(ISparseEngine.SparseToDense), nameof(ISparseEngine.DenseToSparse), nameof(ISparseEngine.Coalesce),
+            nameof(ISparseEngine.SparseTranspose), nameof(ISparseEngine.SparseMatMul),
+            nameof(ISparseEngine.SparseMatMulPatternPreserving), nameof(ISparseEngine.SparseAddMM),
+            nameof(ISparseEngine.SparseSampledAddMM), nameof(ISparseEngine.SparseSpGeMM),
+            nameof(ISparseEngine.SparseSum), nameof(ISparseEngine.SparseMean), nameof(ISparseEngine.SparseSoftmax),
+            nameof(ISparseEngine.SparseLogSoftmax)
+        ];
+        Assert.All(operations, operation => Assert.NotNull(typeof(CudaPtxSparseEngine).GetMethod(operation)));
     }
 
     [Fact]
@@ -1242,5 +1315,23 @@ public sealed class DirectPtxSparseGraphTests
 
     private static int Count(string source, string value) =>
         source.Split(value, StringSplitOptions.None).Length - 1;
+
+    private static void AssertPtxControlFlowClosed(string ptx)
+    {
+        Assert.Equal(Count(ptx, "{"), Count(ptx, "}"));
+        string[] lines = ptx.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+        var labels = lines.Select(line => line.Trim())
+            .Where(line => line.EndsWith(":", StringComparison.Ordinal))
+            .Select(line => line[..^1]).ToHashSet(StringComparer.Ordinal);
+        foreach (string line in lines)
+        {
+            int branch = line.IndexOf("bra ", StringComparison.Ordinal);
+            if (branch < 0) continue;
+            int start = branch + 4;
+            int end = line.IndexOf(';', start);
+            Assert.True(end > start, $"Malformed PTX branch: {line}");
+            Assert.Contains(line[start..end].Trim(), labels);
+        }
+    }
 }
 #endif
