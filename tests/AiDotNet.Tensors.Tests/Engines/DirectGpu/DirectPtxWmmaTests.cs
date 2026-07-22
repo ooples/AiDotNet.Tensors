@@ -2440,6 +2440,24 @@ public class DirectPtxWmmaTests
     }
 
     [Fact]
+    public void GemmEmitter_IsRegisterResidentTiledGemm()
+    {
+        string ptx = PtxGemmKernel.EmitPtx(8, 6, 64, 256, 256);
+        Assert.Contains(PtxGemmKernel.EntryPoint, ptx);
+        Assert.Contains(".shared .align 16 .b8 a_tile[2048]", ptx);
+        Assert.Contains(".shared .align 16 .b8 b_tile[2048]", ptx);
+        Assert.Equal(128, Count(ptx, "fma.rn.f32"));   // no bias/activation epilogue
+        Assert.Equal(64, Count(ptx, "ld.shared.f32"));
+        Assert.Equal(2, Count(ptx, "bar.sync 0"));
+        Assert.Equal(16, Count(ptx, "st.global.f32"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("%ctaid.z", ptx, StringComparison.Ordinal); // single, not batched
+        Assert.False(PtxGemmKernel.IsSupportedShape(63, 256, 256));
+        Assert.True(PtxGemmKernel.IsSupportedShape(128, 512, 2048));
+        Assert.False(PtxGemmKernel.IsPromotedShape(128, 512, 2048));
+    }
+
+    [Fact]
     public void BatchedGemmEmitter_IsRegisterResidentTiledGemm()
     {
         string ptx = PtxBatchedGemmKernel.EmitPtx(8, 6, 4, 64, 256, 256);
