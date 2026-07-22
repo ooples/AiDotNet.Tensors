@@ -136,6 +136,8 @@ internal enum DirectPtxPhysicalLayout
     GraphTargetIndices,
     /// <summary>Dense row-major [edge, feature].</summary>
     EdgeMajor2D,
+    /// <summary>Contiguous FP32 scalar weight, one per directed edge.</summary>
+    GraphEdgeWeights,
     /// <summary>Dense additive attention bias, [H,Sq,Skv] or [B,H,Sq,Skv].</summary>
     AttentionBias,
     /// <summary>One-dimensional canonical vector.</summary>

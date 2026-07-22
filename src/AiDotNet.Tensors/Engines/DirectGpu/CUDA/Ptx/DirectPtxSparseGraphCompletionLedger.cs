@@ -45,9 +45,9 @@ internal static class DirectPtxSparseGraphCompletionLedger
         Add("CudaSparseKernels", DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx,
             "csr_spmm", "csr_spmm_vec4", "sddmm", "csr_spmm_warp", "csr_spmm_bias",
             "csr_spmm_double", "csr_spmm_bias_relu", "gather_source_features",
-            "gather_target_features");
+            "gather_target_features", "scatter_add_edges_deterministic");
         Add("CudaSparseKernels", DirectPtxSparseGraphCompletionStatus.MissingDirectPtx,
-            "scatter_add_edges", "scatter_add_edges_deterministic", "segment_sum", "segment_sum_deterministic", "segment_mean",
+            "scatter_add_edges", "segment_sum", "segment_sum_deterministic", "segment_mean",
             "segment_mean_deterministic", "segment_max", "csr_spmm_backward_b",
             "csr_spmm_backward_b_deterministic", "csr_spmm_backward_values", "zero_buffer",
             "init_neg_inf", "degree_normalize", "symmetric_degree_normalize");

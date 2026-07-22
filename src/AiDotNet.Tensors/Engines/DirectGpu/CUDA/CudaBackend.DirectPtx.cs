@@ -42,6 +42,8 @@ public sealed partial class CudaBackend
         _directPtxCsrSpmmF64Kernels = new(4);
     private readonly DirectPtxKernelCache<DirectPtxGraphGatherKey, PtxGraphEdgeGatherVec4F32Kernel>
         _directPtxGraphGatherKernels = new(4);
+    private readonly DirectPtxKernelCache<DirectPtxGraphScatterKey, PtxGraphScatterAddDeterministicVec4F32Kernel>
+        _directPtxGraphScatterKernels = new(4);
     private DirectPtxRuntime? _directPtxRuntime;
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
@@ -61,6 +63,7 @@ public sealed partial class CudaBackend
     private long _directPtxCsrSpmmBiasReluDispatchCount;
     private long _directPtxCsrSpmmF64DispatchCount;
     private long _directPtxGraphGatherDispatchCount;
+    private long _directPtxGraphScatterDispatchCount;
     internal int DirectPtxCachedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxAttentionKernels.Count; }
@@ -146,6 +149,8 @@ public sealed partial class CudaBackend
         System.Threading.Interlocked.Read(ref _directPtxCsrSpmmF64DispatchCount);
     internal long DirectPtxGraphGatherDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxGraphGatherDispatchCount);
+    internal long DirectPtxGraphScatterDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxGraphScatterDispatchCount);
 
     /// <summary>
     /// Attempts the exact FP32 CSR SpMM golden specialization. The admitted ABI
@@ -718,6 +723,136 @@ public sealed partial class CudaBackend
                 var key = new DirectPtxGraphGatherKey(gatherSource);
                 _ = _directPtxGraphGatherKernels.GetOrAdd(
                     key, () => new PtxGraphEdgeGatherVec4F32Kernel(_directPtxRuntime!, gatherSource));
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryDirectPtxGraphScatterAddDeterministicVec4F32(
+        IGpuBuffer input,
+        IGpuBuffer sourceIndices,
+        IGpuBuffer targetIndices,
+        IGpuBuffer? edgeWeights,
+        IGpuBuffer output,
+        int nodes,
+        int edges,
+        int features)
+    {
+        if (!IsDirectPtxSparseGraphEnabled ||
+            !PtxGraphScatterAddDeterministicVec4F32Kernel.SupportsShape(nodes, edges, features))
+        {
+            DirectPtxLastError = "graph-scatter-deterministic-specialization-not-admitted";
+            return false;
+        }
+        if (input is null || sourceIndices is null || targetIndices is null || output is null)
+        {
+            DirectPtxLastError = "graph-scatter-deterministic-null-buffer";
+            return false;
+        }
+        bool weighted = edgeWeights is not null;
+        if (input.SizeInBytes != (long)nodes * features * sizeof(float) ||
+            sourceIndices.SizeInBytes != (long)edges * sizeof(int) ||
+            targetIndices.SizeInBytes != (long)edges * sizeof(int) ||
+            (weighted && edgeWeights!.SizeInBytes != (long)edges * sizeof(float)) ||
+            output.SizeInBytes != (long)nodes * features * sizeof(float))
+        {
+            DirectPtxLastError = "graph-scatter-deterministic-physical-extent-mismatch";
+            return false;
+        }
+        if (input.Handle == IntPtr.Zero || sourceIndices.Handle == IntPtr.Zero ||
+            targetIndices.Handle == IntPtr.Zero || output.Handle == IntPtr.Zero ||
+            (weighted && edgeWeights!.Handle == IntPtr.Zero))
+        {
+            DirectPtxLastError = "graph-scatter-deterministic-invalid-device-pointer";
+            return false;
+        }
+        nuint pointers = (nuint)input.Handle | (nuint)sourceIndices.Handle |
+            (nuint)targetIndices.Handle | (nuint)output.Handle;
+        if (weighted) pointers |= (nuint)edgeWeights!.Handle;
+        if ((pointers & 15u) != 0)
+        {
+            DirectPtxLastError = "graph-scatter-deterministic-alignment-mismatch";
+            return false;
+        }
+        if (DirectPtxBuffersOverlap(output, input) ||
+            DirectPtxBuffersOverlap(output, sourceIndices) ||
+            DirectPtxBuffersOverlap(output, targetIndices) ||
+            (weighted && DirectPtxBuffersOverlap(output, edgeWeights!)))
+        {
+            DirectPtxLastError = "graph-scatter-deterministic-alias-not-supported";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var key = new DirectPtxGraphScatterKey(weighted);
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxGraphScatterKernels.TryGetValue(key, out _))
+                {
+                    DirectPtxLastError =
+                        "Direct PTX graph scatter-add must be prewarmed before CUDA graph capture.";
+                    return false;
+                }
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxGraphScatterAddDeterministicVec4F32Kernel kernel =
+                    _directPtxGraphScatterKernels.GetOrAdd(
+                        key, () => new PtxGraphScatterAddDeterministicVec4F32Kernel(
+                            _directPtxRuntime!, weighted));
+                if (capturing && !_directPtxGraphScatterKernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX graph scatter-add module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                {
+                    DirectPtxTensorView inputView =
+                        DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]);
+                    DirectPtxTensorView sourceView =
+                        DirectPtxTensorView.Create(sourceIndices, kernel.Blueprint.Tensors[1]);
+                    DirectPtxTensorView targetView =
+                        DirectPtxTensorView.Create(targetIndices, kernel.Blueprint.Tensors[2]);
+                    if (weighted)
+                        kernel.LaunchWeighted(
+                            inputView, sourceView, targetView,
+                            DirectPtxTensorView.Create(edgeWeights!, kernel.Blueprint.Tensors[3]),
+                            DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[4]));
+                    else
+                        kernel.Launch(
+                            inputView, sourceView, targetView,
+                            DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[3]));
+                }
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxGraphScatterDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool PrewarmDirectPtxGraphScatterAddDeterministic(bool weighted)
+    {
+        if (!IsDirectPtxSparseGraphEnabled || IsStreamCapturing()) return false;
+        try
+        {
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                var key = new DirectPtxGraphScatterKey(weighted);
+                _ = _directPtxGraphScatterKernels.GetOrAdd(
+                    key, () => new PtxGraphScatterAddDeterministicVec4F32Kernel(
+                        _directPtxRuntime!, weighted));
             }
             DirectPtxLastError = null;
             return true;
@@ -2574,6 +2709,7 @@ public sealed partial class CudaBackend
             _directPtxCsrSpmmBiasReluKernels.Dispose();
             _directPtxCsrSpmmF64Kernels.Dispose();
             _directPtxGraphGatherKernels.Dispose();
+            _directPtxGraphScatterKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }
@@ -2647,6 +2783,7 @@ public sealed partial class CudaBackend
         int NonZeros);
     private readonly record struct DirectPtxSddmmKey(int NonZeros, int Inner);
     private readonly record struct DirectPtxGraphGatherKey(bool GatherSource);
+    private readonly record struct DirectPtxGraphScatterKey(bool Weighted);
 
 }
 #endif

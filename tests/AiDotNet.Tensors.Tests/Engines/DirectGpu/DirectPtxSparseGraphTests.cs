@@ -16,7 +16,7 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
             DirectPtxSparseGraphCompletionLedger.All
                 .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(9, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+        Assert.Equal(10, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
             entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
         Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
         Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
@@ -210,6 +210,29 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(gatherSource ? DirectPtxPhysicalLayout.GraphSourceIndices :
             DirectPtxPhysicalLayout.GraphTargetIndices, blueprint.Tensors[1].Layout);
         Assert.Equal(DirectPtxPhysicalLayout.EdgeMajor2D, blueprint.Tensors[2].Layout);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void DeterministicGraphScatterEmitter_FusesInitializationAndWritesOnce(bool weighted)
+    {
+        string ptx = PtxGraphScatterAddDeterministicVec4F32Kernel.EmitPtx(8, 6, weighted);
+        DirectPtxKernelBlueprint blueprint =
+            PtxGraphScatterAddDeterministicVec4F32Kernel.CreateBlueprint(
+                DirectPtxArchitectureFamily.Ampere, weighted);
+
+        Assert.Contains(weighted
+            ? PtxGraphScatterAddDeterministicVec4F32Kernel.WeightedEntryPoint
+            : PtxGraphScatterAddDeterministicVec4F32Kernel.EntryPoint, ptx);
+        Assert.Equal(1, Count(ptx, "st.global.v4.f32"));
+        Assert.DoesNotContain("atom.", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.Equal(weighted ? 5 : 4, Count(ptx, ".param .u64"));
+        Assert.Equal("ascending-edge-index", blueprint.Semantics["reduction-order"]);
+        Assert.Equal("fused-zero-register-initialization", blueprint.Semantics["output-initialization"]);
+        Assert.Equal("single-overwrite", blueprint.Semantics["output-write"]);
+        Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
     }
 
     [Theory]

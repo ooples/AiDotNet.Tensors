@@ -4101,6 +4101,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (!IsAvailable)
             throw new InvalidOperationException("CUDA backend is not available.");
 
+#if NET5_0_OR_GREATER
+        if (GpuDeterminism.IsActive &&
+            TryDirectPtxGraphScatterAddDeterministicVec4F32(
+                input, sourceIndices, targetIndices, edgeValues, output,
+                numNodes, numEdges, features))
+            return;
+#endif
+
         using var _ = PushContext();
 
         // First zero the output buffer
