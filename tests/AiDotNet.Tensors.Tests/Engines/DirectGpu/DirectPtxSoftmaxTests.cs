@@ -33,8 +33,77 @@ public class DirectPtxSoftmaxTests
             DirectPtxSoftmaxCoverageManifest.Get("CudaBackend.LogSoftmax").Status);
         Assert.Equal(DirectPtxSoftmaxCoverageStatus.ExperimentalDirectPtx,
             DirectPtxSoftmaxCoverageManifest.Get("CudaBackend.LogSumExpAxis").Status);
+        Assert.Equal(DirectPtxSoftmaxCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxSoftmaxCoverageManifest.Get("CudaBackend.SoftmaxBackward").Status);
         Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() =>
             DirectPtxSoftmaxCoverageManifest.Get("UnassignedSoftmaxApi"));
+    }
+
+    [Fact]
+    public void SoftmaxBackwardEmitter_IsExactJacobianVectorProduct()
+    {
+        string ptx = PtxSoftmaxBackwardKernel.EmitPtx(8, 6, 64, 512);
+        Assert.Contains(PtxSoftmaxBackwardKernel.EntryPoint, ptx);
+        Assert.Contains("LOAD_LOOP:", ptx);
+        Assert.Contains("OUT_LOOP:", ptx);
+        Assert.DoesNotContain("SUM_LOOP:", ptx);                       // dot folded into the load pass
+        Assert.Contains("fma.rn.f32 %f0, %f2, %f1, %f0", ptx);         // dot += dY*S
+        Assert.DoesNotContain("ex2.approx.f32", ptx);                  // exact identity, no transcendental
+        Assert.DoesNotContain("lg2.approx.f32", ptx);
+        Assert.Equal(10, Count(ptx, "bar.sync 0"));                    // one reduction
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxSoftmaxBackwardKernel.IsSupportedShape(128, 2048));
+        Assert.False(PtxSoftmaxBackwardKernel.IsPromotedShape(128, 2048));
+    }
+
+    [SkippableTheory]
+    [InlineData(64, 256)]
+    [InlineData(128, 512)]
+    public void DriverOnlySoftmaxBackward_MatchesOracle(int m, int n)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedSoftmax(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in softmax-backward specialization is measured on GA10x/SM86.");
+        using var kernel = new PtxSoftmaxBackwardKernel(runtime, m, n);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20265000 + m + n);
+        // S is a valid softmax distribution per row; dY is arbitrary upstream gradient.
+        float[] sHost = new float[m * n];
+        float[] dyHost = Values(random, m * n, 0.5f);
+        for (int row = 0; row < m; row++)
+        {
+            var logits = Values(random, n, 2.0f);
+            double max = double.NegativeInfinity;
+            for (int col = 0; col < n; col++) max = Math.Max(max, logits[col]);
+            double sum = 0;
+            for (int col = 0; col < n; col++) sum += Math.Exp(logits[col] - max);
+            for (int col = 0; col < n; col++) sHost[row * n + col] = (float)(Math.Exp(logits[col] - max) / sum);
+        }
+        var expected = new float[m * n];
+        for (int row = 0; row < m; row++)
+        {
+            double dot = 0;
+            for (int col = 0; col < n; col++) dot += (double)dyHost[row * n + col] * sHost[row * n + col];
+            for (int col = 0; col < n; col++)
+                expected[row * n + col] = (float)(sHost[row * n + col] * (dyHost[row * n + col] - dot));
+        }
+
+        using var s = runtime.AllocateBytes((nuint)(sHost.Length * sizeof(float)));
+        using var dy = runtime.AllocateBytes((nuint)(dyHost.Length * sizeof(float)));
+        using var output = runtime.AllocateBytes((nuint)(m * n * sizeof(float)));
+        s.Upload<float>(sHost);
+        dy.Upload<float>(dyHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(s, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(dy, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[m * n];
+        output.Download<float>(actual);
+        AssertVectorClose(actual, expected, 2e-3f, $"softmax-backward {m}x{n}");
     }
 
     [Fact]
