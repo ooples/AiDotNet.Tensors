@@ -2344,6 +2344,8 @@ public class DirectPtxWmmaTests
                 captureLaunch &= backend.TryDirectPtxFusedLinearGeluM1(
                     input, weights, bias, output, inputFeatures, outputFeatures));
             Assert.True(captureLaunch, backend.DirectPtxLastError);
+            Assert.NotEqual(IntPtr.Zero, graph);
+            Assert.Equal(1, backend.DirectPtxFusedLinearPinnedKernelCount);
             try { backend.LaunchCapturedGraph(graph); }
             finally { backend.DestroyCapturedGraph(graph); }
             backend.Synchronize();

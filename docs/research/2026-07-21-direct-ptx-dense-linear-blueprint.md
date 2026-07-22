@@ -101,7 +101,9 @@ The specialization key is `(K,N)`. Modules use the bounded direct-PTX cache,
 are disposed with `CudaBackend`, and carry the standard blueprint id, PTX hash,
 GPU UUID/SM/driver fingerprint, function resources, occupancy, and JIT log.
 Capture may only use a prewarmed module and performs no JIT, tuning,
-allocation, I/O, or cache eviction.
+allocation, I/O, or cache eviction. A captured specialization is pinned in the
+bounded cache so later specialization churn cannot unload its retained
+`CUfunction` while a graph executable still references it.
 
 ## NVIDIA benchmark evidence
 
