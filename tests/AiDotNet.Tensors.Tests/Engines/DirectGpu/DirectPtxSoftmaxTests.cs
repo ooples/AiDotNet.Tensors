@@ -31,8 +31,66 @@ public class DirectPtxSoftmaxTests
             DirectPtxSoftmaxCoverageManifest.Get("CudaBackend.SoftmaxRows").Status);
         Assert.Equal(DirectPtxSoftmaxCoverageStatus.ExperimentalDirectPtx,
             DirectPtxSoftmaxCoverageManifest.Get("CudaBackend.LogSoftmax").Status);
+        Assert.Equal(DirectPtxSoftmaxCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxSoftmaxCoverageManifest.Get("CudaBackend.LogSumExpAxis").Status);
         Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() =>
             DirectPtxSoftmaxCoverageManifest.Get("UnassignedSoftmaxApi"));
+    }
+
+    [Fact]
+    public void LogSumExpEmitter_ReducesRowToSingleLogPartition()
+    {
+        string ptx = PtxLogSumExpKernel.EmitPtx(8, 6, 64, 512);
+        Assert.Contains(PtxLogSumExpKernel.EntryPoint, ptx);
+        Assert.Contains("LOAD_LOOP:", ptx);
+        Assert.Contains("SUM_LOOP:", ptx);
+        Assert.DoesNotContain("OUT_LOOP:", ptx);                       // single write, not a full row
+        Assert.Contains("ex2.approx.f32", ptx);
+        Assert.Contains("lg2.approx.f32", ptx);
+        Assert.Contains("setp.ne.u32 %p2, %r0, 0", ptx);               // thread-0 guard
+        Assert.Equal(1, Count(ptx, "st.global.f32"));                  // one value per row
+        // Two reductions minus the final post-load barrier (no pass reads shared after sumExp).
+        Assert.Equal(19, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxLogSumExpKernel.IsSupportedShape(128, 2048));
+        Assert.False(PtxLogSumExpKernel.IsPromotedShape(128, 2048));
+    }
+
+    [SkippableTheory]
+    [InlineData(64, 256)]
+    [InlineData(128, 1024)]
+    public void DriverOnlyLogSumExp_MatchesOracle(int m, int n)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedSoftmax(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in log-sum-exp specialization is measured on GA10x/SM86.");
+        using var kernel = new PtxLogSumExpKernel(runtime, m, n);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20264900 + m + n);
+        float[] xHost = Values(random, m * n, 3.0f);
+        var expected = new float[m];
+        for (int row = 0; row < m; row++)
+        {
+            double max = double.NegativeInfinity;
+            for (int col = 0; col < n; col++) max = Math.Max(max, xHost[row * n + col]);
+            double sum = 0;
+            for (int col = 0; col < n; col++) sum += Math.Exp(xHost[row * n + col] - max);
+            expected[row] = (float)(max + Math.Log(sum));
+        }
+
+        using var x = runtime.AllocateBytes((nuint)(xHost.Length * sizeof(float)));
+        using var output = runtime.AllocateBytes((nuint)(m * sizeof(float)));
+        x.Upload<float>(xHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(x, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[1]));
+        runtime.Synchronize();
+        var actual = new float[m];
+        output.Download<float>(actual);
+        AssertVectorClose(actual, expected, 3e-3f, $"logsumexp {m}x{n}");
     }
 
     [Fact]
