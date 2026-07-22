@@ -37,6 +37,10 @@ internal static class DirectPtxDenseLinearCoverageManifest
     private const string TiledGemmBias =
         "standard-B register-blocked PTX tile (PtxFusedGemmBiasKernel) with a fused " +
         "bias+activation epilogue; fails closed until GPU-validated and promoted";
+    private const string TiledBackward =
+        "direct PTX backward set: activation-gradient dZ (PtxLinearActivationBackwardKernel) " +
+        "then dInput=dZ@W (plain GEMM tile), dWeight=transpose(dZ)@X (PtxGemmContractMKernel) " +
+        "and dBias=colsum(dZ) (PtxBiasGradientKernel); fails closed until GPU-validated and promoted";
 
     internal static IReadOnlyList<DirectPtxDenseLinearCoverageCell> All { get; } =
     [
@@ -65,11 +69,11 @@ internal static class DirectPtxDenseLinearCoverageManifest
         Cell("CudaBackend.FusedLinearTanh", "NVRTC fused linear kernel", "tanh(input@weight+bias)", Dense + ", bias[N]", "FP32", TiledLinear, DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx),
         Cell("CudaBackend.FusedLinearGELU", "NVRTC fused linear kernel", "gelu_tanh(input@weight+bias)", Dense + ", bias[N]", "FP32", "input-major general-M contract remains baseline; M=1 output-major route is separate", DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx),
         Cell("CudaBackend.FusedLinearSwish", "NVRTC fused linear kernel", "swish(input@weight+bias)", Dense + ", bias[N]", "FP32", TiledLinear, DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx),
-        Cell("CudaBackend.FusedLinearReLUBackward", "NVRTC backward kernels", "dInput/dWeight/dBias for ReLU linear", "contiguous forward tensors and gradients", "FP32", PlannedLinear),
-        Cell("CudaBackend.FusedLinearSigmoidBackward", "NVRTC backward kernels", "dInput/dWeight/dBias for sigmoid linear", "contiguous forward tensors and gradients", "FP32", PlannedLinear),
-        Cell("CudaBackend.FusedLinearTanhBackward", "NVRTC backward kernels", "dInput/dWeight/dBias for tanh linear", "contiguous forward tensors and gradients", "FP32", PlannedLinear),
-        Cell("CudaBackend.FusedLinearGELUBackward", "NVRTC backward kernels", "dInput/dWeight/dBias for GELU linear", "contiguous forward tensors and gradients", "FP32", PlannedLinear),
-        Cell("CudaBackend.FusedLinearSwishBackward", "NVRTC backward kernels", "dInput/dWeight/dBias for swish linear", "contiguous forward tensors and gradients", "FP32", PlannedLinear),
+        Cell("CudaBackend.FusedLinearReLUBackward", "NVRTC backward kernels", "dInput/dWeight/dBias for ReLU linear", "contiguous forward tensors and gradients", "FP32", TiledBackward, DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx),
+        Cell("CudaBackend.FusedLinearSigmoidBackward", "NVRTC backward kernels", "dInput/dWeight/dBias for sigmoid linear", "contiguous forward tensors and gradients", "FP32", TiledBackward, DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx),
+        Cell("CudaBackend.FusedLinearTanhBackward", "NVRTC backward kernels", "dInput/dWeight/dBias for tanh linear", "contiguous forward tensors and gradients", "FP32", TiledBackward, DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx),
+        Cell("CudaBackend.FusedLinearGELUBackward", "NVRTC backward kernels", "dInput/dWeight/dBias for GELU linear", "contiguous forward tensors and gradients", "FP32", TiledBackward, DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx),
+        Cell("CudaBackend.FusedLinearSwishBackward", "NVRTC backward kernels", "dInput/dWeight/dBias for swish linear", "contiguous forward tensors and gradients", "FP32", TiledBackward, DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx),
         Cell("CudaBackend.FusedLinearCrossEntropyIndex", "NVRTC fused projection/loss", "linear plus indexed cross entropy", "hidden[M,K], W[K,N], bias[N], targets[M]", "FP32", PlannedLinear),
         Cell("CudaBackend.FusedLinearCrossEntropyDense", "NVRTC fused projection/loss", "linear plus dense-target cross entropy", "hidden[M,K], W[K,N], bias[N], targets[M,N]", "FP32", PlannedLinear),
         Cell("CudaBackend.FusedLoRAForward", "NVRTC fused LoRA composition", "base+scale*(X@transpose(A))@transpose(B)", "X[M,K], output-major A[R,K], output-major B[N,R], base/output[M,N]", "FP32", "direct PTX single-launch two-stage tile with a shared-resident Z intermediate (PtxFusedLoRAForwardKernel), r=64; fail-closed pending GPU validation", DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx),

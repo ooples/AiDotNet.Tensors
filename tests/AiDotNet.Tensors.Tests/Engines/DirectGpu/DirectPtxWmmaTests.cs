@@ -2692,6 +2692,114 @@ public class DirectPtxWmmaTests
     }
 
     [Fact]
+    public void DWeightContractMEmitter_ContractsOverBatchDimension()
+    {
+        string ptx = PtxGemmContractMKernel.EmitPtx(8, 6, 128, 256, 256); // M=128 N=256 K=256
+        Assert.Contains(PtxGemmContractMKernel.EntryPoint, ptx);
+        Assert.Contains(".shared .align 16 .b8 a_tile[2048]", ptx);   // 8x64 dZ slice
+        Assert.Contains(".shared .align 16 .b8 b_tile[2048]", ptx);   // 8x64 X slice
+        Assert.Contains("M_TILE_LOOP:", ptx);                          // contracts over M
+        Assert.Equal(128, Count(ptx, "fma.rn.f32"));                   // 8 contract * 16
+        Assert.Equal(64, Count(ptx, "ld.shared.f32"));
+        Assert.Equal(2, Count(ptx, "bar.sync 0"));
+        Assert.Equal(16, Count(ptx, "st.global.f32"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxGemmContractMKernel.IsSupportedShape(128, 512, 2048));
+        Assert.False(PtxGemmContractMKernel.IsPromotedShape(128, 512, 2048));
+    }
+
+    [Fact]
+    public void DBiasEmitter_IsColumnReductionWithNoScratchMemory()
+    {
+        string ptx = PtxBiasGradientKernel.EmitPtx(8, 6, 128, 256);
+        Assert.Contains(PtxBiasGradientKernel.EntryPoint, ptx);
+        Assert.Contains("COLSUM_LOOP:", ptx);
+        Assert.Equal(1, Count(ptx, "ld.global.nc.f32"));   // one load per iteration
+        Assert.Equal(1, Count(ptx, "st.global.f32"));       // one column result
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxBiasGradientKernel.IsSupportedShape(128, 2048));
+        Assert.False(PtxBiasGradientKernel.IsPromotedShape(128, 2048));
+    }
+
+    [SkippableTheory]
+    [InlineData(128, 256, 256)]
+    [InlineData(64, 512, 256)]
+    public void DriverOnlyDWeightContractM_MatchesOracle(int m, int n, int k)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedFusedLinear(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in dWeight specialization is measured on GA10x/SM86.");
+        using var kernel = new PtxGemmContractMKernel(runtime, m, n, k);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20263500 + m + n + k);
+        float[] dzHost = Values(random, m * n, 0.125f);   // dZ[M,N]
+        float[] xHost = Values(random, m * k, 0.125f);    // X[M,K]
+        var expected = new float[n * k];
+        for (int nn = 0; nn < n; nn++)
+        for (int kk = 0; kk < k; kk++)
+        {
+            double acc = 0;
+            for (int mm = 0; mm < m; mm++)
+                acc += dzHost[mm * n + nn] * (double)xHost[mm * k + kk];
+            expected[nn * k + kk] = (float)acc;
+        }
+
+        using var dz = runtime.AllocateBytes((nuint)(dzHost.Length * sizeof(float)));
+        using var x = runtime.AllocateBytes((nuint)(xHost.Length * sizeof(float)));
+        using var dw = runtime.AllocateBytes((nuint)(n * k * sizeof(float)));
+        dz.Upload<float>(dzHost);
+        x.Upload<float>(xHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(dz, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(x, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(dw, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[n * k];
+        dw.Download<float>(actual);
+        AssertVectorClose(actual, expected, 2e-3f, $"dweight {m}x{n}x{k}");
+    }
+
+    [SkippableTheory]
+    [InlineData(128, 256)]
+    [InlineData(64, 512)]
+    public void DriverOnlyDBias_MatchesColumnSumOracle(int m, int n)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedFusedLinear(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in dBias specialization is measured on GA10x/SM86.");
+        using var kernel = new PtxBiasGradientKernel(runtime, m, n);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20263600 + m + n);
+        float[] dzHost = Values(random, m * n, 0.125f);
+        var expected = new float[n];
+        for (int nn = 0; nn < n; nn++)
+        {
+            double acc = 0;
+            for (int mm = 0; mm < m; mm++)
+                acc += dzHost[mm * n + nn];
+            expected[nn] = (float)acc;
+        }
+
+        using var dz = runtime.AllocateBytes((nuint)(dzHost.Length * sizeof(float)));
+        using var dbias = runtime.AllocateBytes((nuint)(n * sizeof(float)));
+        dz.Upload<float>(dzHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(dz, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(dbias, kernel.Blueprint.Tensors[1]));
+        runtime.Synchronize();
+        var actual = new float[n];
+        dbias.Download<float>(actual);
+        AssertVectorClose(actual, expected, 2e-3f, $"dbias {m}x{n}");
+    }
+
+    [Fact]
     public void GemmEmitter_IsRegisterResidentTiledGemm()
     {
         string ptx = PtxGemmKernel.EmitPtx(8, 6, 64, 256, 256);
