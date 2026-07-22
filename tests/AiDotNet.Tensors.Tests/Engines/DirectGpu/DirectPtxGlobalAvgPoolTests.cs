@@ -77,8 +77,31 @@ public class DirectPtxGlobalAvgPoolTests
         Assert.Equal(
             DirectPtxPoolingCoverageStatus.ExperimentalDirectPtx,
             DirectPtxPoolingCoverageManifest.Get("CudaBackend.GlobalAvgPool2D").Status);
-        Assert.Single(DirectPtxPoolingCoverageManifest.All,
-            cell => cell.Status == DirectPtxPoolingCoverageStatus.ExperimentalDirectPtx);
+        Assert.Equal(
+            DirectPtxPoolingCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxPoolingCoverageManifest.Get("CudaBackend.GlobalMaxPool2D").Status);
+        // Name the live cells rather than counting them: this pins WHICH cells
+        // are experimental, so a new cell cannot quietly take a live slot.
+        Assert.Equal(
+            new[] { "CudaBackend.GlobalAvgPool2D", "CudaBackend.GlobalMaxPool2D" },
+            DirectPtxPoolingCoverageManifest.All
+                .Where(cell => cell.Status == DirectPtxPoolingCoverageStatus.ExperimentalDirectPtx)
+                .Select(cell => cell.Api)
+                .OrderBy(api => api, StringComparer.Ordinal)
+                .ToArray());
+        // The arg-max path is a separate cell and must stay unported: the
+        // value-only lane would silently drop the indices output.
+        Assert.Equal(
+            DirectPtxPoolingCoverageStatus.PlannedDirectPtx,
+            DirectPtxPoolingCoverageManifest.Get("CudaBackend.GlobalMaxPool2D+indices").Status);
+        // Every cell whose existing implementation was verified absent must say
+        // so, so a blocked cell can never read as a straightforward port.
+        Assert.All(
+            DirectPtxPoolingCoverageManifest.All
+                .Where(cell => cell.ExistingImplementation.StartsWith("none", StringComparison.Ordinal)),
+            cell => Assert.StartsWith("blocked:", cell.DirectPtxAssignment, StringComparison.Ordinal));
+        Assert.Equal(6, DirectPtxPoolingCoverageManifest.All
+            .Count(cell => cell.ExistingImplementation.StartsWith("none", StringComparison.Ordinal)));
         Assert.All(DirectPtxPoolingCoverageManifest.All,
             cell => Assert.NotEqual(
                 DirectPtxPoolingCoverageStatus.PromotedDirectPtx, cell.Status));

@@ -47,6 +47,14 @@ public static class PtxParityRegistry
 {
     public static IReadOnlyList<PtxParitySpec> Specs { get; } = new[]
     {
+        new PtxParitySpec("PtxFusedGlobalMaxPoolF32Kernel", PtxParityStatus.Deferred,
+            "global max pool 2D, fp32 (#842) - CudaBackend.GlobalMaxPool2D (value path)",
+            "a max reduction only selects an element, so its three-way spec can assert bit-for-bit " +
+            "equality with no tolerance. Two things the spec must cover explicitly: an all-NaN plane, " +
+            "which must reduce to -inf in both legs, and the fact that only the VALUE path is ported - " +
+            "when saveIndices is set the established kernel must still run, so the spec has to prove " +
+            "the direct-PTX lane is not taken in that case."),
+
         new PtxParitySpec("PtxFusedGlobalAvgPoolF32Kernel", PtxParityStatus.Deferred,
             "global average pool 2D, fp32 (#842) — CudaBackend.GlobalAvgPool2D",
             "has a public route, but its tests compare the PTX result against a CPU reference only, so " +
