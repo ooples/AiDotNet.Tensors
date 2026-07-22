@@ -1936,14 +1936,72 @@ public class DirectPtxWmmaTests
             using var valueCache = backend.AllocateBuffer(valueCacheHost);
             using var wrongQuery = backend.AllocateBuffer(modelDimension + 1);
 
+            DirectPtxFeatureGate.TestOverride = false;
+            Assert.False(backend.TryDirectPtxQkvRopeCacheD64(
+                input, weights, bias, cosine, sine, query, keyCache, valueCache,
+                heads, cacheCapacity, position));
+            Assert.Equal("qkv-rope-cache-feature-disabled", backend.DirectPtxLastError);
+            Assert.False(backend.PrewarmDirectPtxQkvRopeCacheD64(
+                heads, cacheCapacity, position));
+            Assert.Equal("qkv-rope-cache-feature-disabled", backend.DirectPtxLastError);
+            long disabledDispatch = backend.DirectPtxQkvRopeCacheDispatchCount;
+            backend.QkvProjectionRoPECacheD64(
+                input, weights, bias, cosine, sine, query, keyCache, valueCache,
+                heads, cacheCapacity, position);
+            backend.Synchronize();
+            Assert.Equal(disabledDispatch, backend.DirectPtxQkvRopeCacheDispatchCount);
+            Assert.Equal("qkv-rope-cache-feature-disabled", backend.DirectPtxLastError);
+            AssertVectorClose(backend.DownloadBuffer(query), expectedQ, 2e-5f, "disabled fallback Q");
+            DirectPtxFeatureGate.TestOverride = true;
+
+            Assert.Throws<ArgumentNullException>(() => backend.QkvProjectionRoPECacheD64(
+                null!, weights, bias, cosine, sine, query, keyCache, valueCache,
+                heads, cacheCapacity, position));
+
+            Assert.False(backend.TryDirectPtxQkvRopeCacheD64(
+                input, weights, bias, cosine, sine, query, keyCache, valueCache,
+                6, cacheCapacity, position));
+            Assert.Equal("qkv-rope-cache-head-count-not-implemented", backend.DirectPtxLastError);
+            Assert.False(backend.PrewarmDirectPtxQkvRopeCacheD64(
+                6, cacheCapacity, position));
+            Assert.Equal("qkv-rope-cache-head-count-not-implemented", backend.DirectPtxLastError);
+            Assert.False(backend.TryDirectPtxQkvRopeCacheD64(
+                input, weights, bias, cosine, sine, query, keyCache, valueCache,
+                heads, 24, position));
+            Assert.Equal("qkv-rope-cache-capacity-not-implemented", backend.DirectPtxLastError);
+            Assert.False(backend.TryDirectPtxQkvRopeCacheD64(
+                input, weights, bias, cosine, sine, query, keyCache, valueCache,
+                heads, cacheCapacity, -1));
+            Assert.Equal("qkv-rope-cache-position-out-of-range", backend.DirectPtxLastError);
+            Assert.False(backend.TryDirectPtxQkvRopeCacheD64(
+                input, weights, bias, cosine, sine, query, keyCache, valueCache,
+                heads, cacheCapacity, cacheCapacity));
+            Assert.Equal("qkv-rope-cache-position-out-of-range", backend.DirectPtxLastError);
+            Assert.False(backend.TryDirectPtxQkvRopeCacheD64(
+                null!, weights, bias, cosine, sine, query, keyCache, valueCache,
+                heads, cacheCapacity, position));
+            Assert.Equal("qkv-rope-cache-null-buffer", backend.DirectPtxLastError);
+
             Assert.False(backend.TryDirectPtxQkvRopeCacheD64(
                 input, weights, bias, cosine, sine, wrongQuery, keyCache, valueCache,
                 heads, cacheCapacity, position));
             Assert.Equal("qkv-rope-cache-physical-extent-mismatch", backend.DirectPtxLastError);
+            using var zeroPointer = new SyntheticGpuBuffer(
+                IntPtr.Zero, input.SizeInBytes);
+            Assert.False(backend.TryDirectPtxQkvRopeCacheD64(
+                zeroPointer, weights, bias, cosine, sine, query, keyCache, valueCache,
+                heads, cacheCapacity, position));
+            Assert.Equal("qkv-rope-cache-invalid-device-pointer", backend.DirectPtxLastError);
+            using var misaligned = new SyntheticGpuBuffer(
+                new IntPtr(input.Handle.ToInt64() + 4), input.SizeInBytes);
+            Assert.False(backend.TryDirectPtxQkvRopeCacheD64(
+                misaligned, weights, bias, cosine, sine, query, keyCache, valueCache,
+                heads, cacheCapacity, position));
+            Assert.Equal("qkv-rope-cache-alignment-mismatch", backend.DirectPtxLastError);
             Assert.False(backend.TryDirectPtxQkvRopeCacheD64(
                 input, weights, bias, cosine, sine, input, keyCache, valueCache,
                 heads, cacheCapacity, position));
-            Assert.Contains("alias", backend.DirectPtxLastError, StringComparison.OrdinalIgnoreCase);
+            Assert.Equal("qkv-rope-cache-alias-not-supported", backend.DirectPtxLastError);
             Assert.True(backend.PrewarmDirectPtxQkvRopeCacheD64(
                 heads, cacheCapacity, position), backend.DirectPtxLastError);
             for (int i = 0; i < 8; i++)
@@ -1988,6 +2046,58 @@ public class DirectPtxWmmaTests
             backend.Synchronize();
             Assert.Equal(dispatchBefore + 1, backend.DirectPtxQkvRopeCacheDispatchCount);
             AssertVectorClose(backend.DownloadBuffer(query), expectedQ, 2e-5f, "public Q");
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previous;
+        }
+    }
+
+    [SkippableFact]
+    public void BackendQkvRopeCacheD64_UnsupportedBucketsUseExistingGpuFallback()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previous = DirectPtxFeatureGate.TestOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxQkvRopeCacheEnabled,
+                "Requires an Ampere CUDA backend.");
+            const int heads = 6, cacheCapacity = 24, position = 23;
+            int modelDimension = heads * PtxFusedQkvRopeCacheD64Kernel.HeadDimension;
+            int projectionElements = 3 * modelDimension;
+            int cacheElements = cacheCapacity * modelDimension;
+            var random = new Random(20260901);
+            float[] inputHost = Values(random, modelDimension, 0.125f);
+            float[] weightsHost = Values(random, projectionElements * modelDimension, 0.0625f);
+            float[] biasHost = Values(random, projectionElements, 0.0625f);
+            (float[] cosineHost, float[] sineHost) = RopeTables(cacheCapacity);
+            float[] keyCacheHost = Values(random, cacheElements, 0.125f);
+            float[] valueCacheHost = Values(random, cacheElements, 0.125f);
+            (float[] expectedQ, float[] expectedK, float[] expectedV) = QkvRopeCacheOracle(
+                inputHost, weightsHost, biasHost, cosineHost, sineHost,
+                keyCacheHost, valueCacheHost, heads, cacheCapacity, position);
+            using var input = backend.AllocateBuffer(inputHost);
+            using var weights = backend.AllocateBuffer(weightsHost);
+            using var bias = backend.AllocateBuffer(biasHost);
+            using var cosine = backend.AllocateBuffer(cosineHost);
+            using var sine = backend.AllocateBuffer(sineHost);
+            using var query = backend.AllocateBuffer(modelDimension);
+            using var keyCache = backend.AllocateBuffer(keyCacheHost);
+            using var valueCache = backend.AllocateBuffer(valueCacheHost);
+
+            long dispatchBefore = backend.DirectPtxQkvRopeCacheDispatchCount;
+            backend.QkvProjectionRoPECacheD64(
+                input, weights, bias, cosine, sine, query, keyCache, valueCache,
+                heads, cacheCapacity, position);
+            backend.Synchronize();
+
+            Assert.Equal(dispatchBefore, backend.DirectPtxQkvRopeCacheDispatchCount);
+            Assert.Equal("qkv-rope-cache-head-count-not-implemented", backend.DirectPtxLastError);
+            AssertVectorClose(backend.DownloadBuffer(query), expectedQ, 2e-5f, "fallback Q");
+            AssertVectorClose(backend.DownloadBuffer(keyCache), expectedK, 2e-5f, "fallback K cache");
+            AssertVectorClose(backend.DownloadBuffer(valueCache), expectedV, 2e-5f, "fallback V cache");
         }
         finally
         {

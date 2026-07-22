@@ -8132,6 +8132,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int cacheCapacity,
         int position)
     {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (packedWeights is null) throw new ArgumentNullException(nameof(packedWeights));
+        if (bias is null) throw new ArgumentNullException(nameof(bias));
+        if (cosine is null) throw new ArgumentNullException(nameof(cosine));
+        if (sine is null) throw new ArgumentNullException(nameof(sine));
+        if (query is null) throw new ArgumentNullException(nameof(query));
+        if (keyCache is null) throw new ArgumentNullException(nameof(keyCache));
+        if (valueCache is null) throw new ArgumentNullException(nameof(valueCache));
         using var _ = PushContext();
         if (heads <= 0) throw new ArgumentOutOfRangeException(nameof(heads));
         if (cacheCapacity <= 0) throw new ArgumentOutOfRangeException(nameof(cacheCapacity));

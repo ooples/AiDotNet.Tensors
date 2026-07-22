@@ -86,6 +86,28 @@ contains no stride, layout, offset, shape, optional-bias, or bounds mode. An
 unsupported contract falls back to the established cuBLAS/NVRTC composition
 with an exact diagnostic reason.
 
+The boundary is fail-closed and uses stable reason codes before any PTX module
+lookup or launch:
+
+| Rejected contract | Diagnostic reason |
+|---|---|
+| feature switch off | `qkv-rope-cache-feature-disabled` |
+| CUDA backend unavailable | `qkv-rope-cache-backend-unavailable` |
+| non-Ampere architecture | `qkv-rope-cache-architecture-not-implemented` |
+| H outside `{4,8,16}` | `qkv-rope-cache-head-count-not-implemented` |
+| capacity outside `{16,32,64,128}` | `qkv-rope-cache-capacity-not-implemented` |
+| position outside `[0,capacity)` | `qkv-rope-cache-position-out-of-range` |
+| null buffer | `qkv-rope-cache-null-buffer` |
+| non-exact physical extent | `qkv-rope-cache-physical-extent-mismatch` |
+| null device pointer | `qkv-rope-cache-invalid-device-pointer` |
+| non-16-byte-aligned pointer | `qkv-rope-cache-alignment-mismatch` |
+| overlapping input/output or output/output ranges | `qkv-rope-cache-alias-not-supported` |
+
+Prewarm and dispatch share the same shape/architecture validator. Tests also
+execute the established GPU composition with the feature disabled and with an
+unsupported H/capacity pair, proving that rejection is a correct fallback and
+not merely a skipped launch.
+
 The public CUDA backend entry point is
 `CudaBackend.QkvProjectionRoPECacheD64`. It first attempts the gated PTX path
 and otherwise performs packed cuBLAS projection, NVRTC bias and RoPE, then the

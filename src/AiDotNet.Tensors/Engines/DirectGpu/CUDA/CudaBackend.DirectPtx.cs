@@ -117,20 +117,12 @@ public sealed partial class CudaBackend
         int cacheCapacity,
         int position)
     {
-        if (!IsDirectPtxQkvRopeCacheEnabled) return false;
-        if (heads is not (4 or 8 or 16))
-        {
-            DirectPtxLastError = "qkv-rope-cache-head-count-not-implemented";
+        if (!ValidateDirectPtxQkvRopeCacheEligibility(heads, cacheCapacity, position))
             return false;
-        }
-        if (cacheCapacity is not (16 or 32 or 64 or 128))
+        if (input is null || packedWeights is null || bias is null || cosine is null ||
+            sine is null || query is null || keyCache is null || valueCache is null)
         {
-            DirectPtxLastError = "qkv-rope-cache-capacity-not-implemented";
-            return false;
-        }
-        if (position < 0 || position >= cacheCapacity)
-        {
-            DirectPtxLastError = "qkv-rope-cache-position-out-of-range";
+            DirectPtxLastError = "qkv-rope-cache-null-buffer";
             return false;
         }
 
@@ -149,6 +141,27 @@ public sealed partial class CudaBackend
             valueCache.SizeInBytes != cacheElements * sizeof(float))
         {
             DirectPtxLastError = "qkv-rope-cache-physical-extent-mismatch";
+            return false;
+        }
+        if (input.Handle == IntPtr.Zero || packedWeights.Handle == IntPtr.Zero ||
+            bias.Handle == IntPtr.Zero || cosine.Handle == IntPtr.Zero ||
+            sine.Handle == IntPtr.Zero || query.Handle == IntPtr.Zero ||
+            keyCache.Handle == IntPtr.Zero || valueCache.Handle == IntPtr.Zero)
+        {
+            DirectPtxLastError = "qkv-rope-cache-invalid-device-pointer";
+            return false;
+        }
+        if ((((nuint)input.Handle | (nuint)packedWeights.Handle | (nuint)bias.Handle |
+              (nuint)cosine.Handle | (nuint)sine.Handle | (nuint)query.Handle |
+              (nuint)keyCache.Handle | (nuint)valueCache.Handle) & 15u) != 0)
+        {
+            DirectPtxLastError = "qkv-rope-cache-alignment-mismatch";
+            return false;
+        }
+        if (DirectPtxQkvRopeCacheOutputsOverlap(
+            input, packedWeights, bias, cosine, sine, query, keyCache, valueCache))
+        {
+            DirectPtxLastError = "qkv-rope-cache-alias-not-supported";
             return false;
         }
 
@@ -211,7 +224,8 @@ public sealed partial class CudaBackend
         int cacheCapacity,
         int position)
     {
-        if (!IsDirectPtxQkvRopeCacheEnabled) return false;
+        if (!ValidateDirectPtxQkvRopeCacheEligibility(heads, cacheCapacity, position))
+            return false;
         try
         {
             if (IsStreamCapturing())
@@ -233,6 +247,73 @@ public sealed partial class CudaBackend
         {
             DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
             return false;
+        }
+    }
+
+    private bool ValidateDirectPtxQkvRopeCacheEligibility(
+        int heads,
+        int cacheCapacity,
+        int position)
+    {
+        if (!DirectPtxFeatureGate.IsQkvRopeCacheEnabled)
+        {
+            DirectPtxLastError = "qkv-rope-cache-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "qkv-rope-cache-backend-unavailable";
+            return false;
+        }
+        if (DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) !=
+            DirectPtxArchitectureFamily.Ampere)
+        {
+            DirectPtxLastError = "qkv-rope-cache-architecture-not-implemented";
+            return false;
+        }
+        if (heads is not (4 or 8 or 16))
+        {
+            DirectPtxLastError = "qkv-rope-cache-head-count-not-implemented";
+            return false;
+        }
+        if (cacheCapacity is not (16 or 32 or 64 or 128))
+        {
+            DirectPtxLastError = "qkv-rope-cache-capacity-not-implemented";
+            return false;
+        }
+        if (position < 0 || position >= cacheCapacity)
+        {
+            DirectPtxLastError = "qkv-rope-cache-position-out-of-range";
+            return false;
+        }
+        return true;
+    }
+
+    private static bool DirectPtxQkvRopeCacheOutputsOverlap(
+        IGpuBuffer input,
+        IGpuBuffer packedWeights,
+        IGpuBuffer bias,
+        IGpuBuffer cosine,
+        IGpuBuffer sine,
+        IGpuBuffer query,
+        IGpuBuffer keyCache,
+        IGpuBuffer valueCache)
+    {
+        return Overlaps(query, keyCache) || Overlaps(query, valueCache) ||
+            Overlaps(keyCache, valueCache) || IsInput(query) ||
+            IsInput(keyCache) || IsInput(valueCache);
+
+        bool IsInput(IGpuBuffer output) =>
+            Overlaps(output, input) || Overlaps(output, packedWeights) ||
+            Overlaps(output, bias) || Overlaps(output, cosine) || Overlaps(output, sine);
+
+        static bool Overlaps(IGpuBuffer left, IGpuBuffer right)
+        {
+            nuint leftStart = (nuint)left.Handle;
+            nuint rightStart = (nuint)right.Handle;
+            nuint leftEnd = checked(leftStart + (nuint)left.SizeInBytes);
+            nuint rightEnd = checked(rightStart + (nuint)right.SizeInBytes);
+            return leftStart < rightEnd && rightStart < leftEnd;
         }
     }
 
