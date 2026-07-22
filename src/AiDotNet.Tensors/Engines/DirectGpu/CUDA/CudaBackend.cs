@@ -15503,6 +15503,17 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (batch <= 0 || seqLen <= 0 || recDim <= 0)
             throw new ArgumentOutOfRangeException(nameof(batch), "RG-LRU dimensions must be positive.");
+        if (TryDirectPtxRgLruScanForward(
+            value, recGate, inpGate, decay, output, batch, seqLen, recDim))
+            return;
+        LaunchLegacyRgLruScanForward(value, recGate, inpGate, decay, output, batch, seqLen, recDim);
+    }
+
+    /// <summary>Resident current-CUDA comparison lane for the issue-#846 harness.</summary>
+    internal unsafe void LaunchLegacyRgLruScanForward(
+        IGpuBuffer value, IGpuBuffer recGate, IGpuBuffer inpGate, IGpuBuffer decay, IGpuBuffer output,
+        int batch, int seqLen, int recDim)
+    {
         if (!_kernelCache.TryGetValue("rglru_scan_forward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: rglru_scan_forward");
 

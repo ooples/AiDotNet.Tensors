@@ -264,6 +264,34 @@ internal static class DirectPtxProfileTarget
         GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-qkv-rope-cache-end");
     }
 
+    internal static void RunRgLru()
+    {
+        GpuBenchmarkEnvironment.RequireIdleGpu("ncu-rglru-start");
+        using var runtime = new DirectPtxRuntime();
+        using var kernel = new PtxFusedRgLruScan128x256Kernel(runtime);
+        using var value = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var recurrenceGate = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var inputGate = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        using var decay = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
+        using var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[4].RequiredBytes);
+        int elements = PtxFusedRgLruScan128x256Kernel.Batch *
+            PtxFusedRgLruScan128x256Kernel.SequenceLength *
+            PtxFusedRgLruScan128x256Kernel.RecurrentDimension;
+        value.Upload<float>(new float[elements]);
+        recurrenceGate.Upload<float>(Enumerable.Repeat(0.5f, elements).ToArray());
+        inputGate.Upload<float>(Enumerable.Repeat(0.5f, elements).ToArray());
+        decay.Upload<float>(new float[PtxFusedRgLruScan128x256Kernel.RecurrentDimension]);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(value, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(recurrenceGate, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(inputGate, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(decay, kernel.Blueprint.Tensors[3]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[4]));
+        runtime.Synchronize();
+        Console.WriteLine(kernel.Audit.ToJson());
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-rglru-end");
+    }
+
     internal static void VerifyNcuCsv(string path)
     {
         DirectPtxProfilerEvidence evidence = DirectPtxProfilerEvidence.FromNcuCsv(path);

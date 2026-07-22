@@ -63,6 +63,8 @@ public static class CudaToPtxTransferLedger
             "same softmax family (#840); shares the row-softmax PTX kernel."),
         new CudaToPtxEntry("rmsnorm_forward", "PtxFusedResidualRmsNormD64Kernel", PtxTransferStatus.PtxInProgress,
             "fused residual RMSNorm; PTX kernel exists but has no public route wired yet (see parity registry)."),
+        new CudaToPtxEntry("rglru_scan_forward", "PtxFusedRgLruScan128x256Kernel", PtxTransferStatus.PtxInProgress,
+            "exact RG-LRU [1,128,256]/SM86 forward (#846); fails closed until parity, 3 clean >=1.10x runs, and Nsight zero-spill evidence."),
 
         // --- Triaged anomalies: the 4 census kernels that mapped to no epic
         // #833 child during the full 888-kernel cross-reference. Recorded so the
