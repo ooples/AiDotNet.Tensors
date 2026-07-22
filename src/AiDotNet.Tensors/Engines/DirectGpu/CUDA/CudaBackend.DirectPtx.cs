@@ -1809,6 +1809,7 @@ public sealed partial class CudaBackend
             _directPtxConv2DFp16K1Kernels.Dispose();
             _directPtxConvTranspose2D3x3BwdInputKernels.Dispose();
             _directPtxConvTranspose2D3x3BwdWeightKernels.Dispose();
+            _directPtxFusedConvTranspose2D3x3Kernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }
