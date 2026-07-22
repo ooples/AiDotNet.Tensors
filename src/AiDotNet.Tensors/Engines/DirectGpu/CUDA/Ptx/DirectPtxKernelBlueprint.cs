@@ -44,6 +44,14 @@ internal static class DirectPtxArchitecture
     /// </summary>
     internal static bool HasValidatedQkvRopeCache(int major, int minor) =>
         (major, minor) == (8, 6);
+
+    /// <summary>
+    /// Issue #841's first convolution emitter deliberately targets one exact
+    /// GA102/SM86 tuning domain. It remains experimental until GPU evidence is
+    /// attached; other SMs must use the established backend.
+    /// </summary>
+    internal static bool HasExperimentalConvolution(int major, int minor) =>
+        (major, minor) == (8, 6);
 }
 
 internal enum DirectPtxExtentMode
