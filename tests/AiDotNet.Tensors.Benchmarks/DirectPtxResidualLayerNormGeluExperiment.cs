@@ -3,6 +3,7 @@ using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 using AiDotNet.Tensors.Engines.Gpu;
+using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
@@ -49,7 +50,7 @@ internal static class DirectPtxResidualLayerNormGeluExperiment
         using var backend = new CudaBackend();
         if (run == 1 && rows == RowBuckets[0]) Console.WriteLine($"GPU: {backend.DeviceName}");
         int elements = checked(rows * Dimension);
-        var random = new Random(20261800 + run * 100 + rows);
+        var random = RandomHelper.CreateSeededRandom(20261800 + run * 100 + rows);
         float[] inputHost = Values(random, elements, 1f);
         float[] residualHost = Values(random, elements, 0.25f);
         float[] biasHost = Values(random, Dimension, 0.05f);
@@ -252,7 +253,7 @@ internal static class DirectPtxResidualLayerNormGeluExperiment
             $"\"median_us\":{device.Median.ToString("R", c)}," +
             $"\"p95_us\":{device.P95.ToString("R", c)}," +
             $"\"managed_bytes\":{allocation},\"temp_bytes\":{temporaryBytes}," +
-            $"\"max_error\":{error.ToString("R", c)},\"local_bytes\":{localBytes}" +
+            $"\"max_error\":{error.ToString("R", c)},\"tolerance\":2e-4,\"local_bytes\":{localBytes}" +
             "}");
     }
 
