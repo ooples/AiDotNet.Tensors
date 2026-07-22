@@ -6847,4 +6847,161 @@ public sealed partial class CudaBackend
         return _directPtxDeformableConv2DGroupedBwdOffsetKernels.GetOrAdd(
             1, () => new PtxDeformableConv2DGroupedNchw3x3BackwardOffsetF32Kernel(runtime));
     }
+
+    private readonly DirectPtxKernelCache<int, PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel>
+        _directPtxDeformableConv2DGroupedBwdInputKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private long _directPtxDeformableConv2DGroupedBwdInputDispatchCount;
+
+    internal long DirectPtxDeformableConv2DGroupedBwdInputDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxDeformableConv2DGroupedBwdInputDispatchCount);
+
+    /// <summary>
+    /// Attempts the exact FP32 NCHW grouped deformable 3x3 backward-input experiment
+    /// (DCNv2 grouped, deterministic bilinear-transpose gather with per-group offset/mask).
+    /// Validated by byte extent. Fails closed on any unsupported contract so the caller
+    /// runs the established composition.
+    /// </summary>
+    internal bool TryDirectPtxDeformableConv2DGroupedBackwardInput(
+        IGpuBuffer gradOutput,
+        IGpuBuffer weights,
+        IGpuBuffer offsets,
+        IGpuBuffer mask,
+        IGpuBuffer gradInput)
+    {
+        if (!_directPtxConvolutionOptedIn)
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.FeatureDisabled;
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.BackendUnavailable;
+            return false;
+        }
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.ArchitectureNotImplemented;
+            return false;
+        }
+        if (gradOutput is null || weights is null || offsets is null || mask is null || gradInput is null)
+        {
+            DirectPtxLastError = "deformconv2d-grouped-bwd-input-null-buffer";
+            return false;
+        }
+        if (gradOutput.SizeInBytes != PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel.GradOutputBytes ||
+            weights.SizeInBytes != PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel.WeightBytes ||
+            offsets.SizeInBytes != PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel.OffsetBytes ||
+            mask.SizeInBytes != PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel.MaskBytes ||
+            gradInput.SizeInBytes != PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel.GradInputBytes)
+        {
+            DirectPtxLastError = "deformconv2d-grouped-bwd-input-exact-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            const int key = 1;
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxDeformableConv2DGroupedBwdInputKernels.TryGetValue(key, out _))
+                {
+                    DirectPtxLastError =
+                        "Direct PTX grouped deformable Conv2D backward-input must be prewarmed before CUDA graph capture.";
+                    return false;
+                }
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel kernel =
+                    GetOrCreateDirectPtxDeformableConv2DGroupedBwdInputKernel();
+                if (capturing && !_directPtxDeformableConv2DGroupedBwdInputKernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX grouped deformable Conv2D backward-input module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(gradOutput, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(weights, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(offsets, kernel.Blueprint.Tensors[2]),
+                        DirectPtxTensorView.Create(mask, kernel.Blueprint.Tensors[3]),
+                        DirectPtxTensorView.Create(gradInput, kernel.Blueprint.Tensors[4]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxDeformableConv2DGroupedBwdInputDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool PrewarmDirectPtxDeformableConv2DGroupedBackwardInput()
+    {
+        if (!_directPtxConvolutionOptedIn)
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.FeatureDisabled;
+            return false;
+        }
+        if (!IsAvailable || !DirectPtxArchitecture.HasExperimentalConvolution(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.ArchitectureNotImplemented;
+            return false;
+        }
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX grouped deformable Conv2D backward-input prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _ = GetOrCreateDirectPtxDeformableConv2DGroupedBwdInputKernel();
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxDeformableConv2DGroupedBwdInputAudit(out DirectPtxKernelAudit? audit)
+    {
+        lock (_directPtxLock)
+        {
+            if (_directPtxDeformableConv2DGroupedBwdInputKernels.TryGetValue(1, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null;
+        return false;
+    }
+
+    private PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel
+        GetOrCreateDirectPtxDeformableConv2DGroupedBwdInputKernel()
+    {
+        if (_directPtxDeformableConv2DGroupedBwdInputKernels.TryGetValue(
+                1, out PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel? existing))
+            return existing;
+        return CreateAndCacheDirectPtxDeformableConv2DGroupedBwdInputKernelSlow();
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel
+        CreateAndCacheDirectPtxDeformableConv2DGroupedBwdInputKernelSlow()
+    {
+        DirectPtxRuntime runtime = _directPtxRuntime ??
+            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+        return _directPtxDeformableConv2DGroupedBwdInputKernels.GetOrAdd(
+            1, () => new PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel(runtime));
+    }
 }

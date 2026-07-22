@@ -4582,6 +4582,123 @@ public sealed class DirectPtxConvolutionTests
             $"Grouped deformable Conv2D backward-offset max absolute error {maxAbsoluteError:G9}.");
     }
 
+    [Fact]
+    public void DeformableConv2DGroupedBackwardInputEmitter_IsPerGroupTransposeGatherSm86Ptx()
+    {
+        string ptx = PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel.EmitPtx(8, 6);
+
+        Assert.Contains(".target sm_86", ptx, StringComparison.Ordinal);
+        Assert.Contains(PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel.EntryPoint, ptx, StringComparison.Ordinal);
+        Assert.Equal(5, Count(ptx, ".param .u64"));
+        // g(d)=max(0,1-|d|): two abs + two max; triple loop t -> s -> co.
+        Assert.Equal(2, Count(ptx, "abs.f32"));
+        Assert.Equal(2, Count(ptx, "max.f32"));
+        Assert.Contains("DEFORM_GROUPED_BWD_INPUT_T:", ptx, StringComparison.Ordinal);
+        Assert.Contains("DEFORM_GROUPED_BWD_INPUT_S:", ptx, StringComparison.Ordinal);
+        Assert.Contains("DEFORM_GROUPED_BWD_INPUT_CO:", ptx, StringComparison.Ordinal);
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("atom", ptx, StringComparison.Ordinal);
+        Assert.Throws<NotSupportedException>(() =>
+            PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel.EmitPtx(8, 9));
+    }
+
+    [Fact]
+    public void DeformableConv2DGroupedBackwardInputManifestCell_IsExperimentalWithDedicatedRoute()
+    {
+        Assert.Equal(DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxConvolutionCoverageManifest.Get("IEngine.DeformableConv2DGroupedBackward").Status);
+        Assert.Equal(DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxConvolutionCoverageManifest
+                .Get("CudaBackend.TryDirectPtxDeformableConv2DGroupedBackwardInput").Status);
+    }
+
+    [SkippableFact]
+    public void DriverOnlyDeformableConv2DGroupedBackwardInput_MatchesCpuReference()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "Requires the experimental SM86 convolution specialization.");
+
+        const int inChannels = PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel.InputChannels;
+        const int outChannels = PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel.OutputChannels;
+        const int height = PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel.Height;
+        const int width = PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel.Width;
+        const int kernelSize = PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel.KernelSize;
+        const int taps = PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel.TapsPerChannel;
+        const int channelsPerGroup = PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel.ChannelsPerGroup;
+        const int offChannels = PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel.OffsetChannels;
+        const int maskChannels = PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel.MaskChannels;
+        int spatial = height * width;
+
+        using var kernel = new PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel(runtime);
+        using var gradOutDevice = runtime.AllocateBytes((nuint)PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel.GradOutputBytes);
+        using var weightDevice = runtime.AllocateBytes((nuint)PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel.WeightBytes);
+        using var offsetDevice = runtime.AllocateBytes((nuint)PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel.OffsetBytes);
+        using var maskDevice = runtime.AllocateBytes((nuint)PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel.MaskBytes);
+        using var gradInDevice = runtime.AllocateBytes((nuint)PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel.GradInputBytes);
+
+        Random random = AiDotNet.Tensors.Helpers.RandomHelper.CreateSecureRandom();
+        var gradOut = new float[outChannels * spatial];
+        for (int i = 0; i < gradOut.Length; i++) gradOut[i] = (float)(random.NextDouble() * 2 - 1);
+        var weights = new float[outChannels * inChannels * kernelSize * kernelSize];
+        for (int i = 0; i < weights.Length; i++) weights[i] = (float)(random.NextDouble() * 2 - 1);
+        var offsets = new float[offChannels * spatial];
+        for (int i = 0; i < offsets.Length; i++) offsets[i] = (float)(random.NextDouble() * 2 - 1);
+        var mask = new float[maskChannels * spatial];
+        for (int i = 0; i < mask.Length; i++) mask[i] = (float)random.NextDouble();
+        gradOutDevice.Upload<float>(gradOut);
+        weightDevice.Upload<float>(weights);
+        offsetDevice.Upload<float>(offsets);
+        maskDevice.Upload<float>(mask);
+
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(gradOutDevice, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(weightDevice, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(offsetDevice, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(maskDevice, kernel.Blueprint.Tensors[3]),
+            DirectPtxTensorView.CreateOwned(gradInDevice, kernel.Blueprint.Tensors[4]));
+        runtime.Synchronize();
+        var actual = new float[inChannels * spatial];
+        gradInDevice.Download<float>(actual);
+
+        static float G(float d) => MathF.Max(0f, 1f - MathF.Abs(d));
+
+        float maxAbsoluteError = 0;
+        for (int ci = 0; ci < inChannels; ci++)
+        for (int iy = 0; iy < height; iy++)
+        for (int ix = 0; ix < width; ix++)
+        {
+            int gg = ci / channelsPerGroup;
+            float acc = 0;
+            for (int t = 0; t < taps; t++)
+            {
+                int ky = t / kernelSize;
+                int kx = t % kernelSize;
+                for (int oy = 0; oy < height; oy++)
+                for (int ox = 0; ox < width; ox++)
+                {
+                    int s = oy * width + ox;
+                    float py = oy + ky - 1 + offsets[(gg * 2 * taps + 2 * t) * spatial + s];
+                    float px = ox + kx - 1 + offsets[(gg * 2 * taps + 2 * t + 1) * spatial + s];
+                    float coeff = G(iy - py) * G(ix - px);
+                    if (coeff == 0f) continue;
+                    float gsum = 0;
+                    for (int co = 0; co < outChannels; co++)
+                        gsum += gradOut[co * spatial + s] * weights[((co * inChannels + ci) * kernelSize + ky) * kernelSize + kx];
+                    acc += coeff * mask[(gg * taps + t) * spatial + s] * gsum;
+                }
+            }
+            float got = actual[ci * spatial + (iy * width + ix)];
+            maxAbsoluteError = MathF.Max(maxAbsoluteError, MathF.Abs(got - acc));
+        }
+
+        Assert.True(maxAbsoluteError <= 3e-4f,
+            $"Grouped deformable Conv2D backward-input max absolute error {maxAbsoluteError:G9}.");
+    }
+
     private static string? Validate(
         bool enabled, bool available, int major, int minor,
         DirectPtxConvolutionShape shape, IGpuBuffer? input, IGpuBuffer? weights,
