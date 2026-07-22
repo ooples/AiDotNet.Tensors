@@ -243,7 +243,16 @@ internal static class DirectPtxConvolutionCoverageManifest
             "same v1 unfold/im2col contract", "exact contiguous NCHW to row-major", "FP32",
             DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
             "hand-emitted sm_86 pointer-only gather specialization, disabled by default"),
-        Planned("CudaBackend.Conv2dDirectFp16Hw", "NVRTC half-weight direct convolution", "FP32 input rounded to FP16, FP32 accumulation/output", "NCHW/OIHW-half", "mixed FP16/FP32", "architecture-specific half/Tensor-Core family"),
+        new("CudaBackend.Conv2dDirectFp16Hw",
+            "NVRTC half-weight direct convolution with established fallback owned by caller",
+            "FP16 input+weights, FP32 accumulation/output", "NCHW/OIHW half input+weights, FP32 output", "mixed FP16/FP32",
+            DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            "v1 exact N1/C64/H16/W16/K64 1x1 FP16-in/FP32-out cvt.f32.f16 dot; all else falls back"),
+        new("CudaBackend.TryDirectPtxConv2DFp16K1",
+            "new direct Driver-API PTX route with established fallback owned by caller",
+            "same v1 FP16 1x1 mixed-precision contract", "exact contiguous NCHW/OIHW half in, FP32 out", "mixed FP16/FP32",
+            DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            "hand-emitted sm_86 pointer-only FP16-storage specialization, disabled by default"),
         Planned("CudaBackend.Im2colKNFp16", "NVRTC fused im2col+FP16 conversion", "FP16 Tensor-Core GEMM preparation", "NCHW to KxN half", "FP16/FP32", "fuse producer into PTX convolution tiles"),
         Planned("CudaBackend.UnfoldKNFp16FromFp16", "NVRTC FP16 im2col", "FP16 patch extraction", "NCHW-half to KxN-half", "FP16", "fuse producer into PTX convolution tiles")
     ];

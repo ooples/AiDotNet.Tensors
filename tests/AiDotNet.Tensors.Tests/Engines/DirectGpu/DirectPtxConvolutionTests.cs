@@ -1982,6 +1982,102 @@ public sealed class DirectPtxConvolutionTests
             $"DepthwiseConv1D backward-weight max absolute error {maxAbsoluteError:G9}.");
     }
 
+    [Fact]
+    public void Conv2DFp16K1Emitter_WidensHalvesAndAccumulatesInFp32()
+    {
+        string ptx = PtxConv2DFp16K1NchwF32Kernel.EmitPtx(8, 6);
+
+        Assert.Contains(".target sm_86", ptx, StringComparison.Ordinal);
+        Assert.Contains(PtxConv2DFp16K1NchwF32Kernel.EntryPoint, ptx, StringComparison.Ordinal);
+        Assert.Equal(3, Count(ptx, ".param .u64"));
+        // FP16 storage: half loads + widening converts; FP32 accumulate.
+        Assert.Equal(2 * PtxConv2DFp16K1NchwF32Kernel.InputChannels, Count(ptx, "ld.global.nc.b16"));
+        Assert.Equal(2 * PtxConv2DFp16K1NchwF32Kernel.InputChannels, Count(ptx, "cvt.f32.f16"));
+        Assert.Equal(PtxConv2DFp16K1NchwF32Kernel.InputChannels, Count(ptx, "fma.rn.f32"));
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.Throws<NotSupportedException>(() =>
+            PtxConv2DFp16K1NchwF32Kernel.EmitPtx(8, 9));
+    }
+
+    [Fact]
+    public void Conv2DFp16K1Blueprint_UsesFp16InputsAndFp32Output()
+    {
+        DirectPtxKernelBlueprint blueprint =
+            PtxConv2DFp16K1NchwF32Kernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere);
+
+        Assert.Equal(new[]
+            {
+                DirectPtxPhysicalType.Float16, DirectPtxPhysicalType.Float16,
+                DirectPtxPhysicalType.Float32
+            },
+            blueprint.Tensors.Select(t => t.PhysicalType));
+        Assert.Equal(DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxConvolutionCoverageManifest.Get("CudaBackend.Conv2dDirectFp16Hw").Status);
+        Assert.Equal(DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxConvolutionCoverageManifest.Get("CudaBackend.TryDirectPtxConv2DFp16K1").Status);
+    }
+
+    [SkippableFact]
+    public void DriverOnlyConv2DFp16K1_MatchesCpuReference()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "Requires the experimental SM86 convolution specialization.");
+
+        const int inChannels = PtxConv2DFp16K1NchwF32Kernel.InputChannels;
+        const int outChannels = PtxConv2DFp16K1NchwF32Kernel.OutputChannels;
+        const int spatial = PtxConv2DFp16K1NchwF32Kernel.SpatialElements;
+
+        using var kernel = new PtxConv2DFp16K1NchwF32Kernel(runtime);
+        using var inputDevice = runtime.AllocateBytes((nuint)PtxConv2DFp16K1NchwF32Kernel.InputBytes);
+        using var weightDevice = runtime.AllocateBytes((nuint)PtxConv2DFp16K1NchwF32Kernel.WeightBytes);
+        using var outputDevice = runtime.AllocateBytes((nuint)PtxConv2DFp16K1NchwF32Kernel.OutputBytes);
+
+        Random random = AiDotNet.Tensors.Helpers.RandomHelper.CreateSecureRandom();
+        ushort[] inputHalf = RandomHalfBits(random, inChannels * spatial);
+        ushort[] weightHalf = RandomHalfBits(random, outChannels * inChannels);
+        inputDevice.Upload<ushort>(inputHalf);
+        weightDevice.Upload<ushort>(weightHalf);
+
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(inputDevice, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(weightDevice, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(outputDevice, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[outChannels * spatial];
+        outputDevice.Download<float>(actual);
+
+        float maxAbsoluteError = 0;
+        for (int k = 0; k < outChannels; k++)
+        for (int s = 0; s < spatial; s++)
+        {
+            float expected = 0;
+            for (int c = 0; c < inChannels; c++)
+            {
+                float w = (float)BitConverter.UInt16BitsToHalf(weightHalf[k * inChannels + c]);
+                float x = (float)BitConverter.UInt16BitsToHalf(inputHalf[c * spatial + s]);
+                expected += w * x;
+            }
+            float got = actual[k * spatial + s];
+            maxAbsoluteError = MathF.Max(maxAbsoluteError, MathF.Abs(got - expected));
+        }
+
+        // Inputs are exact FP16 values on both sides; only fma-vs-mul+add differs.
+        Assert.True(maxAbsoluteError <= 5e-3f,
+            $"FP16 1x1 conv max absolute error {maxAbsoluteError:G9}.");
+    }
+
+    private static ushort[] RandomHalfBits(Random random, int count)
+    {
+        var bits = new ushort[count];
+        for (int i = 0; i < count; i++)
+            bits[i] = BitConverter.HalfToUInt16Bits((Half)(float)(random.NextDouble() * 2 - 1));
+        return bits;
+    }
+
     private static string? Validate(
         bool enabled, bool available, int major, int minor,
         DirectPtxConvolutionShape shape, IGpuBuffer? input, IGpuBuffer? weights,
