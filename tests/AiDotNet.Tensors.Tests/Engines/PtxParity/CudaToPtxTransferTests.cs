@@ -54,11 +54,13 @@ public sealed class CudaToPtxTransferTests
         int total = CudaKernelCensus.KernelNames.Count;
         int replaced = CudaToPtxTransferLedger.Replaced.Count();
         int inProgress = CudaToPtxTransferLedger.InProgress.Count();
-        int remaining = total - replaced;
+        int notPlanned = CudaToPtxTransferLedger.NotPlanned.Count();
+        int remaining = total - replaced - notPlanned;
 
         _out.WriteLine($"CUDA kernels total:            {total}");
         _out.WriteLine($"  replaced by promoted PTX:    {replaced}");
         _out.WriteLine($"  PTX in progress (not promoted): {inProgress}");
+        _out.WriteLine($"  not planned (infra/gap/reassigned): {notPlanned}");
         _out.WriteLine($"  remaining before full delete:  {remaining}");
         _out.WriteLine("");
         _out.WriteLine("In-progress ports:");
@@ -82,8 +84,13 @@ public sealed class CudaToPtxTransferTests
         var replaced = CudaToPtxTransferLedger.Replaced
             .Select(e => e.CudaKernel)
             .ToHashSet(StringComparer.Ordinal);
+        // Kernels deliberately excluded from the transfer (infra utilities,
+        // genuine gaps, or category-subsumed) do not block completion.
+        var excluded = CudaToPtxTransferLedger.NotPlanned
+            .Select(e => e.CudaKernel)
+            .ToHashSet(StringComparer.Ordinal);
         string[] remaining = CudaKernelCensus.KernelNames
-            .Where(k => !replaced.Contains(k))
+            .Where(k => !replaced.Contains(k) && !excluded.Contains(k))
             .OrderBy(k => k, StringComparer.Ordinal)
             .ToArray();
 
