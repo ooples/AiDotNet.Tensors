@@ -84,6 +84,12 @@ class Program
             DirectPtxConvolutionExperiment.Run(includeExternal);
             return;
         }
+        if (args.Length > 0 && args[0] == "--direct-ptx-convolution-resnet")
+        {
+            bool includeExternal = !args.Contains("--no-external", StringComparer.Ordinal);
+            DirectPtxConvolutionResnetExperiment.Run(includeExternal);
+            return;
+        }
         if (args.Length > 0 && args[0] == "--direct-ptx-external-gpu-baselines")
         {
             DirectPtxExternalBaselines.Run();
