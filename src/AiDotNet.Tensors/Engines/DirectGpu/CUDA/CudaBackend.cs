@@ -4318,6 +4318,84 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    /// <summary>CSR SpMM gradient for the dense right operand.</summary>
+    public unsafe void CsrSpMMBackwardB(
+        IGpuBuffer values, IGpuBuffer columnIndices, IGpuBuffer rowPointers,
+        IGpuBuffer gradOutput, IGpuBuffer gradB,
+        int M, int K, int N, int nnz)
+    {
+        if (!IsAvailable) throw new InvalidOperationException("CUDA backend is not available.");
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxCsrSpmmBackwardF32(
+            values, columnIndices, rowPointers, gradOutput, gradB,
+            M, K, N, nnz, DirectPtxCsrBackwardTarget.DenseB))
+            return;
+#endif
+        using var _ = PushContext();
+        ZeroBuffer(gradB, K * N);
+        bool deterministic = GpuDeterminism.IsActive;
+        string kernelName = deterministic
+            ? "csr_spmm_backward_b_deterministic" : "csr_spmm_backward_b";
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+        IntPtr valuesPtr = values.Handle;
+        IntPtr columnsPtr = columnIndices.Handle;
+        IntPtr rowsPtr = rowPointers.Handle;
+        IntPtr gradOutputPtr = gradOutput.Handle;
+        IntPtr gradBPtr = gradB.Handle;
+        void** args = stackalloc void*[9];
+        args[0] = &valuesPtr;
+        args[1] = &columnsPtr;
+        args[2] = &rowsPtr;
+        args[3] = &gradOutputPtr;
+        args[4] = &gradBPtr;
+        args[5] = &M;
+        args[6] = &K;
+        args[7] = &N;
+        args[8] = &nnz;
+        uint gridX = (uint)((N + DefaultBlockSize - 1) / DefaultBlockSize);
+        if (deterministic)
+            LaunchKernel2D(kernel, gridX, (uint)K, (uint)DefaultBlockSize, 1, args);
+        else
+            LaunchKernel(kernel, gridX, DefaultBlockSize, args);
+    }
+
+    /// <summary>CSR SpMM gradient for the stored sparse values.</summary>
+    public unsafe void CsrSpMMBackwardValues(
+        IGpuBuffer columnIndices, IGpuBuffer rowPointers, IGpuBuffer denseB,
+        IGpuBuffer gradOutput, IGpuBuffer gradValues,
+        int M, int K, int N, int nnz)
+    {
+        if (!IsAvailable) throw new InvalidOperationException("CUDA backend is not available.");
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxCsrSpmmBackwardF32(
+            columnIndices, rowPointers, denseB, gradOutput, gradValues,
+            M, K, N, nnz, DirectPtxCsrBackwardTarget.Values))
+            return;
+#endif
+        if (!_kernelCache.TryGetValue("csr_spmm_backward_values", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: csr_spmm_backward_values");
+        using var _ = PushContext();
+        IntPtr columnsPtr = columnIndices.Handle;
+        IntPtr rowsPtr = rowPointers.Handle;
+        IntPtr densePtr = denseB.Handle;
+        IntPtr gradOutputPtr = gradOutput.Handle;
+        IntPtr gradValuesPtr = gradValues.Handle;
+        void** args = stackalloc void*[10];
+        args[0] = &columnsPtr; // Legacy float-index parameter is unused by the kernel.
+        args[1] = &columnsPtr;
+        args[2] = &rowsPtr;
+        args[3] = &densePtr;
+        args[4] = &gradOutputPtr;
+        args[5] = &gradValuesPtr;
+        args[6] = &M;
+        args[7] = &K;
+        args[8] = &N;
+        args[9] = &nnz;
+        uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
     private unsafe void ZeroBuffer(IGpuBuffer buffer, int size)
     {
         if (!_kernelCache.TryGetValue("zero_buffer", out var kernel))

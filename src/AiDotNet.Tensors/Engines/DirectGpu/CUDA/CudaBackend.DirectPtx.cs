@@ -48,6 +48,8 @@ public sealed partial class CudaBackend
         _directPtxSegmentReduceKernels = new(4);
     private readonly DirectPtxKernelCache<DirectPtxCsrSegmentKey, PtxCsrSegmentReduceVec4F32Kernel>
         _directPtxCsrSegmentKernels = new(8);
+    private readonly DirectPtxKernelCache<DirectPtxCsrBackwardTarget, PtxCsrSpmmBackwardF32Kernel>
+        _directPtxCsrBackwardKernels = new(4);
     private DirectPtxRuntime? _directPtxRuntime;
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
@@ -70,6 +72,7 @@ public sealed partial class CudaBackend
     private long _directPtxGraphScatterDispatchCount;
     private long _directPtxSegmentReduceDispatchCount;
     private long _directPtxCsrSegmentDispatchCount;
+    private long _directPtxCsrBackwardDispatchCount;
     internal int DirectPtxCachedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxAttentionKernels.Count; }
@@ -161,6 +164,8 @@ public sealed partial class CudaBackend
         System.Threading.Interlocked.Read(ref _directPtxSegmentReduceDispatchCount);
     internal long DirectPtxCsrSegmentDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxCsrSegmentDispatchCount);
+    internal long DirectPtxCsrBackwardDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxCsrBackwardDispatchCount);
 
     /// <summary>
     /// Attempts the exact FP32 CSR SpMM golden specialization. The admitted ABI
@@ -1083,6 +1088,100 @@ public sealed partial class CudaBackend
                         DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[3]));
             }
             System.Threading.Interlocked.Increment(ref _directPtxCsrSegmentDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryDirectPtxCsrSpmmBackwardF32(
+        IGpuBuffer p0,
+        IGpuBuffer p1,
+        IGpuBuffer p2,
+        IGpuBuffer gradOutput,
+        IGpuBuffer output,
+        int rows,
+        int inner,
+        int columns,
+        int nonZeros,
+        DirectPtxCsrBackwardTarget target)
+    {
+        if (!IsDirectPtxSparseGraphEnabled ||
+            !PtxCsrSpmmBackwardF32Kernel.SupportsShape(rows, inner, columns, nonZeros))
+        {
+            DirectPtxLastError = "csr-backward-specialization-not-admitted";
+            return false;
+        }
+        if (p0 is null || p1 is null || p2 is null || gradOutput is null || output is null)
+        {
+            DirectPtxLastError = "csr-backward-null-buffer";
+            return false;
+        }
+        long p0Bytes = target == DirectPtxCsrBackwardTarget.DenseB
+            ? (long)nonZeros * sizeof(float) : (long)nonZeros * sizeof(int);
+        long p1Bytes = target == DirectPtxCsrBackwardTarget.DenseB
+            ? (long)nonZeros * sizeof(int) : (long)(rows + 1) * sizeof(int);
+        long p2Bytes = target == DirectPtxCsrBackwardTarget.DenseB
+            ? (long)(rows + 1) * sizeof(int) : (long)inner * columns * sizeof(float);
+        long outputBytes = target == DirectPtxCsrBackwardTarget.DenseB
+            ? (long)inner * columns * sizeof(float) : (long)nonZeros * sizeof(float);
+        if (p0.SizeInBytes != p0Bytes || p1.SizeInBytes != p1Bytes || p2.SizeInBytes != p2Bytes ||
+            gradOutput.SizeInBytes != (long)rows * columns * sizeof(float) ||
+            output.SizeInBytes != outputBytes)
+        {
+            DirectPtxLastError = "csr-backward-physical-extent-mismatch";
+            return false;
+        }
+        if (p0.Handle == IntPtr.Zero || p1.Handle == IntPtr.Zero || p2.Handle == IntPtr.Zero ||
+            gradOutput.Handle == IntPtr.Zero || output.Handle == IntPtr.Zero)
+        {
+            DirectPtxLastError = "csr-backward-invalid-device-pointer";
+            return false;
+        }
+        if ((((nuint)p0.Handle | (nuint)p1.Handle | (nuint)p2.Handle |
+              (nuint)gradOutput.Handle | (nuint)output.Handle) & 15u) != 0)
+        {
+            DirectPtxLastError = "csr-backward-alignment-mismatch";
+            return false;
+        }
+        if (DirectPtxBuffersOverlap(output, p0) || DirectPtxBuffersOverlap(output, p1) ||
+            DirectPtxBuffersOverlap(output, p2) || DirectPtxBuffersOverlap(output, gradOutput))
+        {
+            DirectPtxLastError = "csr-backward-alias-not-supported";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxCsrBackwardKernels.TryGetValue(target, out _))
+                {
+                    DirectPtxLastError =
+                        "Direct PTX CSR backward must be prewarmed before CUDA graph capture.";
+                    return false;
+                }
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxCsrSpmmBackwardF32Kernel kernel = _directPtxCsrBackwardKernels.GetOrAdd(
+                    target, () => new PtxCsrSpmmBackwardF32Kernel(_directPtxRuntime!, target));
+                if (capturing && !_directPtxCsrBackwardKernels.Pin(target))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX CSR backward module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(p0, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(p1, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(p2, kernel.Blueprint.Tensors[2]),
+                        DirectPtxTensorView.Create(gradOutput, kernel.Blueprint.Tensors[3]),
+                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[4]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxCsrBackwardDispatchCount);
             DirectPtxLastError = null;
             return true;
         }
@@ -2941,6 +3040,7 @@ public sealed partial class CudaBackend
             _directPtxGraphScatterKernels.Dispose();
             _directPtxSegmentReduceKernels.Dispose();
             _directPtxCsrSegmentKernels.Dispose();
+            _directPtxCsrBackwardKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }

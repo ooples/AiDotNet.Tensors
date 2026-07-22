@@ -16,7 +16,7 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
             DirectPtxSparseGraphCompletionLedger.All
                 .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(18, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+        Assert.Equal(21, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
             entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
         Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
         Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
@@ -277,6 +277,26 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(DirectPtxPhysicalLayout.CsrFloatRowPointers, blueprint.Tensors[1].Layout);
         Assert.Equal("zero", blueprint.Semantics["empty-row"]);
         Assert.Equal("single-overwrite", blueprint.Semantics["output-write"]);
+    }
+
+    [Theory]
+    [InlineData((int)DirectPtxCsrBackwardTarget.DenseB)]
+    [InlineData((int)DirectPtxCsrBackwardTarget.Values)]
+    public void CsrBackwardEmitter_UsesPointerOnlySingleWriteAbi(int targetValue)
+    {
+        var target = (DirectPtxCsrBackwardTarget)targetValue;
+        string ptx = PtxCsrSpmmBackwardF32Kernel.EmitPtx(8, 6, target);
+        DirectPtxKernelBlueprint blueprint = PtxCsrSpmmBackwardF32Kernel.CreateBlueprint(
+            DirectPtxArchitectureFamily.Ampere, target);
+
+        Assert.Equal(5, Count(ptx, ".param .u64"));
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("atom.", ptx, StringComparison.Ordinal);
+        Assert.Equal(1, target == DirectPtxCsrBackwardTarget.DenseB
+            ? Count(ptx, "st.global.v4.f32") : Count(ptx, "st.global.f32"));
+        Assert.Equal("fused-register-initialization", blueprint.Semantics["output-initialization"]);
+        Assert.Equal("single-overwrite", blueprint.Semantics["output-write"]);
+        Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
     }
 
     [Theory]

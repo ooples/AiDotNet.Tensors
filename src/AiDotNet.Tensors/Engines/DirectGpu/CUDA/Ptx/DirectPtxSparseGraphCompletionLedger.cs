@@ -46,10 +46,10 @@ internal static class DirectPtxSparseGraphCompletionLedger
             "csr_spmm", "csr_spmm_vec4", "sddmm", "csr_spmm_warp", "csr_spmm_bias",
             "csr_spmm_double", "csr_spmm_bias_relu", "gather_source_features",
             "gather_target_features", "scatter_add_edges_deterministic", "segment_sum",
-            "segment_sum_deterministic", "segment_mean", "segment_mean_deterministic", "segment_max");
+            "segment_sum_deterministic", "segment_mean", "segment_mean_deterministic", "segment_max",
+            "csr_spmm_backward_b", "csr_spmm_backward_b_deterministic", "csr_spmm_backward_values");
         Add("CudaSparseKernels", DirectPtxSparseGraphCompletionStatus.MissingDirectPtx,
-            "scatter_add_edges", "csr_spmm_backward_b",
-            "csr_spmm_backward_b_deterministic", "csr_spmm_backward_values", "zero_buffer",
+            "scatter_add_edges", "zero_buffer",
             "init_neg_inf", "degree_normalize", "symmetric_degree_normalize");
         Add("CudaBackend.CSR", DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx,
             "csr_segmented_max", "csr_segmented_min", "csr_segmented_stddev");
