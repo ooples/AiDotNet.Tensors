@@ -84,6 +84,12 @@ class Program
                 args.Length > 1 && int.TryParse(args[1], out int reductionRuns) ? reductionRuns : 1);
             return;
         }
+        if (args.Length > 0 && args[0] == "--direct-ptx-l2normalize")
+        {
+            DirectPtxL2NormalizeExperiment.Run(
+                args.Length > 1 && int.TryParse(args[1], out int l2Runs) ? l2Runs : 1);
+            return;
+        }
         if (args.Length > 0 && args[0] == "--direct-ptx-external-gpu-baselines")
         {
             DirectPtxExternalBaselines.Run();
