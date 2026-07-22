@@ -109,11 +109,11 @@ public sealed partial class CudaBackend
 
     internal bool IsDirectPtxSwiGluEnabled =>
         DirectPtxFeatureGate.IsSwiGluEnabled && IsAvailable &&
-        DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) == DirectPtxArchitectureFamily.Ampere;
+        DirectPtxArchitecture.HasValidatedGatedGlu(_ccMajor, _ccMinor);
 
     internal bool IsDirectPtxGeGluEnabled =>
         DirectPtxFeatureGate.IsGeGluEnabled && IsAvailable &&
-        DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) == DirectPtxArchitectureFamily.Ampere;
+        DirectPtxArchitecture.HasValidatedGatedGlu(_ccMajor, _ccMinor);
     internal bool IsDirectPtxFusedLinearEnabled =>
         DirectPtxFeatureGate.IsFusedLinearEnabled && IsAvailable &&
         DirectPtxArchitecture.HasValidatedFusedLinear(_ccMajor, _ccMinor);

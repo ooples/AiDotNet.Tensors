@@ -30,9 +30,10 @@ internal sealed class PtxFusedGeGluF32Kernel : IDisposable
         int halfDimension)
     {
         ArgumentNullException.ThrowIfNull(runtime);
-        if (runtime.ArchitectureFamily != DirectPtxArchitectureFamily.Ampere)
+        if (!DirectPtxArchitecture.HasValidatedGatedGlu(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
-                "The checked-in FP32 GeGLU specialization is validated only on Ampere.");
+                "The checked-in FP32 GeGLU specialization is measured only on GA10x/SM86.");
         Validate(outerSize, halfDimension);
         OuterSize = outerSize;
         HalfDimension = halfDimension;

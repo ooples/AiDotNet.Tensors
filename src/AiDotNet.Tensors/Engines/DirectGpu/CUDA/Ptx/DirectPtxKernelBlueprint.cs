@@ -72,6 +72,16 @@ internal static class DirectPtxArchitecture
     /// </summary>
     internal static bool HasValidatedResidualLayerNormGelu(int major, int minor) =>
         (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The fused gated-GLU (GeGLU / SwiGLU forward and backward) pointwise
+    /// specializations are measured and promoted only on GA10x/SM86. Other
+    /// Ampere variants (SM80, SM87) are independent tuning domains and must
+    /// supply and benchmark their own specialization rather than silently
+    /// inheriting SM86's launch geometry.
+    /// </summary>
+    internal static bool HasValidatedGatedGlu(int major, int minor) =>
+        (major, minor) == (8, 6);
 }
 
 internal enum DirectPtxExtentMode

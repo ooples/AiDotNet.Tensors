@@ -949,6 +949,22 @@ public class DirectPtxWmmaTests
         Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData(8, 6, true)]
+    [InlineData(8, 0, false)]
+    [InlineData(8, 7, false)]
+    [InlineData(8, 9, false)]
+    [InlineData(9, 0, false)]
+    [InlineData(10, 0, false)]
+    public void GatedGluArchitectureMatrix_FailsClosedOutsideSm86(
+        int major,
+        int minor,
+        bool expected)
+    {
+        Assert.Equal(expected,
+            DirectPtxArchitecture.HasValidatedGatedGlu(major, minor));
+    }
+
     [Fact]
     public void SwiGluEmitter_VectorizesTheSplitRowAndHasPointerOnlyAbi()
     {
@@ -3243,8 +3259,9 @@ public class DirectPtxWmmaTests
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
         using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(runtime.ArchitectureFamily == DirectPtxArchitectureFamily.Ampere,
-            "The checked-in SwiGLU specialization is validated on Ampere.");
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedGatedGlu(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in SwiGLU specialization is measured on GA10x/SM86.");
         const int outerSize = 1, halfDimension = 4096;
         using var kernel = new PtxFusedSwiGluF32Kernel(runtime, outerSize, halfDimension);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
@@ -3280,8 +3297,9 @@ public class DirectPtxWmmaTests
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
         using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(runtime.ArchitectureFamily == DirectPtxArchitectureFamily.Ampere,
-            "The checked-in GeGLU specialization is validated on Ampere.");
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedGatedGlu(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in GeGLU specialization is measured on GA10x/SM86.");
         const int outerSize = 1, halfDimension = 4096;
         using var kernel = new PtxFusedGeGluF32Kernel(runtime, outerSize, halfDimension);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
@@ -3318,8 +3336,9 @@ public class DirectPtxWmmaTests
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
         using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(runtime.ArchitectureFamily == DirectPtxArchitectureFamily.Ampere,
-            "The checked-in GeGLU-backward specialization is validated on Ampere.");
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedGatedGlu(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in GeGLU-backward specialization is measured on GA10x/SM86.");
         const int outerSize = 1, halfDimension = 4096;
         using var kernel = new PtxFusedGeGluBackwardF32Kernel(
             runtime, outerSize, halfDimension);
