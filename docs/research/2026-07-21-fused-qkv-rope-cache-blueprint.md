@@ -210,15 +210,29 @@ spilling requests.
 ## Reproduction
 
 ```powershell
-$env:AIDOTNET_DIRECT_PTX_QKV_ROPE_CACHE = '1'
-dotnet run --project tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.csproj `
-  -c Release -- --direct-ptx-qkv-rope-cache 3
+$evidence = Join-Path $env:TEMP 'aidotnet-qkv-release-evidence'
+powershell -ExecutionPolicy Bypass -File `
+  tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-release-evidence.ps1 `
+  -Runs 3 -Issue835Only -OutputDirectory $evidence
 ```
 
-For deterministic Nsight attachment, run the benchmark executable with
-`--direct-ptx-profile-qkv-rope-cache` and filter kernel name
-`aidotnet_qkv_rope_cache_d64`. The profile target prints the complete audit
-even when performance-counter permission is unavailable.
+The runner creates separate clean .NET and PyTorch processes for each run,
+hashes every raw log, and writes `qkv-release-gate.json` only after joining the
+rows and enforcing the error/resource/allocation/median/P95 gate against every
+competitor.
+
+For deterministic Nsight attachment after the Release build:
+
+```powershell
+$env:NSIGHT_COMPUTE_CLI = '<path-to-ncu.exe>'
+powershell -ExecutionPolicy Bypass -File `
+  tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-ncu.ps1 `
+  -Target qkv-rope-cache -OutputCsv (Join-Path $env:TEMP 'aidotnet-qkv-ncu.csv')
+```
+
+The profile target filters `aidotnet_qkv_rope_cache_d64`, emits one launch per
+head-codegen family, prints each complete JIT audit, and fails closed unless
+all required Nsight counter columns and all three launch rows are present.
 
 ## Next assembly-line increments
 
