@@ -2457,6 +2457,23 @@ public class DirectPtxWmmaTests
     }
 
     [Fact]
+    public void HgemmEmitter_NarrowsFp32AccumulatorsToFp16Output()
+    {
+        string ptx = PtxHgemmKernel.EmitPtx(8, 6, 64, 256, 256);
+        Assert.Contains(PtxHgemmKernel.EntryPoint, ptx);
+        Assert.Equal(4, Count(ptx, "ld.global.nc.u16"));   // 2 A + 2 B fp16 loads / thread
+        Assert.Equal(4, Count(ptx, "cvt.f32.f16"));        // fp16 operands -> fp32 tile
+        Assert.Equal(128, Count(ptx, "fma.rn.f32"));       // fp32 accumulate
+        Assert.Equal(16, Count(ptx, "cvt.rn.f16.f32"));    // narrow each accumulator
+        Assert.Equal(16, Count(ptx, "st.global.u16"));     // fp16 output store
+        Assert.Equal(0, Count(ptx, "st.global.f32"));      // no fp32 output
+        Assert.Equal(2, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxHgemmKernel.IsSupportedShape(128, 512, 2048));
+        Assert.False(PtxHgemmKernel.IsPromotedShape(128, 512, 2048));
+    }
+
+    [Fact]
     public void GemmEmitter_IsRegisterResidentTiledGemm()
     {
         string ptx = PtxGemmKernel.EmitPtx(8, 6, 64, 256, 256);
