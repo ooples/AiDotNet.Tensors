@@ -106,6 +106,10 @@ public sealed partial class CudaBackend
         System.Threading.Interlocked.Read(ref _directPtxQkvRopeCacheDispatchCount);
     internal long DirectPtxFusedLinearDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxFusedLinearDispatchCount);
+    internal int DirectPtxFusedLinearPinnedKernelCount
+    {
+        get { lock (_directPtxLock) return _directPtxFusedLinearKernels.PinnedCount; }
+    }
     internal int DirectPtxQkvRopeCacheKernelCapacity => _directPtxQkvRopeCacheKernels.Capacity;
     internal int DirectPtxQkvRopeCachePinnedKernelCount
     {
@@ -391,6 +395,7 @@ public sealed partial class CudaBackend
 
         try
         {
+            bool capturing = IsStreamCapturing();
             EnsureContextCurrent();
             var key = new DirectPtxFusedLinearKey(inputFeatures, outputFeatures);
             lock (_directPtxLock)
@@ -398,7 +403,7 @@ public sealed partial class CudaBackend
                 if (!_directPtxFusedLinearKernels.TryGetValue(
                     key, out PtxFusedLinearGeluM1Kernel? kernel))
                 {
-                    if (IsStreamCapturing())
+                    if (capturing)
                     {
                         DirectPtxLastError =
                             "Direct PTX fused linear must be prewarmed before CUDA graph capture.";
@@ -407,6 +412,11 @@ public sealed partial class CudaBackend
                     _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                     kernel = CreateAndCacheFusedLinearKernelSlow(key);
                 }
+                // CUDA graph executables retain the CUfunction after capture.
+                // Pin its module so later specialization churn cannot unload it.
+                if (capturing && !_directPtxFusedLinearKernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX fused-linear module for CUDA graph capture.");
                 lock (GpuDispatchLock)
                     kernel.Launch(
                         DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]),
