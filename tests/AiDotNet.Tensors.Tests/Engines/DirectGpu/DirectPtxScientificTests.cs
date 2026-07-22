@@ -1,6 +1,7 @@
 using System;
 using System.Linq;
 using AiDotNet.Tensors.Engines.DirectGpu;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 using AiDotNet.Tensors.Helpers;
 using Xunit;
@@ -604,6 +605,74 @@ public class DirectPtxScientificTests
         var actual = new float[batch * dim];
         output.Download<float>(actual);
         AssertVectorClose(actual, expected, 4e-3f, $"poincare exp-map {batch}x{dim}");
+    }
+
+    [SkippableFact]
+    public void Backend_DirectPtxScientific_RoutesDispatchThroughPublicMethods()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previous = DirectPtxFeatureGate.TestOverride;
+        bool previousExperiment = DirectPtxFeatureGate.ScientificExperimentOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        DirectPtxFeatureGate.ScientificExperimentOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxScientificEnabled, "Requires a validated Ampere CUDA backend.");
+            var random = RandomHelper.CreateSeededRandom(20266800);
+
+            // ComplexMultiply through the public backend method.
+            const int pairs = 16384;
+            float[] aHost = Values(random, pairs * 2, 1.0f);
+            float[] bHost = Values(random, pairs * 2, 1.0f);
+            var cmExpected = new float[pairs * 2];
+            for (int i = 0; i < pairs; i++)
+            {
+                float ar = aHost[2 * i], ai = aHost[2 * i + 1], br = bHost[2 * i], bi = bHost[2 * i + 1];
+                cmExpected[2 * i] = ar * br - ai * bi;
+                cmExpected[2 * i + 1] = ar * bi + ai * br;
+            }
+            using (var a = backend.AllocateBuffer(aHost))
+            using (var b = backend.AllocateBuffer(bHost))
+            using (var outc = backend.AllocateBuffer(pairs * 2))
+            {
+                long before = backend.DirectPtxScientificDispatchCount;
+                backend.ComplexMultiply(a, b, outc, pairs);
+                backend.Synchronize();
+                Assert.True(backend.DirectPtxScientificDispatchCount > before, backend.DirectPtxLastError);
+                AssertVectorClose(backend.DownloadBuffer(outc), cmExpected, 2e-3f, "backend complex-multiply route");
+            }
+
+            // MobiusAdd through the public backend method.
+            const int batch = 128, dim = 64;
+            const float c = 0.5f;
+            float[] xHost = Values(random, batch * dim, 0.2f);
+            float[] yHost = Values(random, batch * dim, 0.2f);
+            var maExpected = new float[batch * dim];
+            for (int row = 0; row < batch; row++)
+            {
+                double xn = 0, yn = 0, dot = 0;
+                for (int i = 0; i < dim; i++) { double xi = xHost[row * dim + i], yi = yHost[row * dim + i]; xn += xi * xi; yn += yi * yi; dot += xi * yi; }
+                double denom = Math.Max(Math.Abs(1.0 + 2.0 * c * dot + (double)c * c * xn * yn), 1e-15);
+                double coeff1 = 1.0 + 2.0 * c * dot + c * yn, coeff2 = 1.0 - c * xn;
+                for (int i = 0; i < dim; i++) maExpected[row * dim + i] = (float)((coeff1 * xHost[row * dim + i] + coeff2 * yHost[row * dim + i]) / denom);
+            }
+            using (var x = backend.AllocateBuffer(xHost))
+            using (var y = backend.AllocateBuffer(yHost))
+            using (var outm = backend.AllocateBuffer(batch * dim))
+            {
+                long before = backend.DirectPtxScientificDispatchCount;
+                backend.MobiusAdd(x, y, outm, batch, dim, c);
+                backend.Synchronize();
+                Assert.True(backend.DirectPtxScientificDispatchCount > before, backend.DirectPtxLastError);
+                AssertVectorClose(backend.DownloadBuffer(outm), maExpected, 3e-3f, "backend mobius-add route");
+            }
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previous;
+            DirectPtxFeatureGate.ScientificExperimentOverride = previousExperiment;
+        }
     }
 
     private static float[] Values(Random random, int count, float magnitude)

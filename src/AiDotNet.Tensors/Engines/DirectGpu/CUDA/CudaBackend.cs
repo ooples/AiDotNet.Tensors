@@ -13877,6 +13877,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (!IsAvailable) throw new InvalidOperationException("CUDA backend not available");
 
+        // Fail-closed direct-PTX fast path (issue #854); returns false until GPU-promoted.
+        if (TryDirectPtxComplexMagnitude(real, imag, magnitude, n)) return;
         if (!_kernelCache.TryGetValue("complex_magnitude", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: complex_magnitude");
 
@@ -13898,6 +13900,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (!IsAvailable) throw new InvalidOperationException("CUDA backend not available");
 
+        // Fail-closed direct-PTX fast path (issue #854); returns false until GPU-promoted.
+        if (TryDirectPtxComplexPhase(real, imag, phase, n)) return;
         if (!_kernelCache.TryGetValue("complex_phase", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: complex_phase");
 
@@ -14208,6 +14212,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void PoincareProject(IGpuBuffer input, IGpuBuffer output, int batchSize, int dim, float curvature, float epsilon = 1e-5f)
     {
+        // Fail-closed direct-PTX fast path (issue #854); returns false until GPU-promoted.
+        if (TryDirectPtxPoincareProject(input, output, batchSize, dim, curvature, epsilon)) return;
         if (!_kernelCache.TryGetValue("poincare_project", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: poincare_project");
 
@@ -14228,6 +14234,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void MobiusAdd(IGpuBuffer x, IGpuBuffer y, IGpuBuffer output, int batchSize, int dim, float curvature)
     {
+        // Fail-closed direct-PTX fast path (issue #854); returns false until GPU-promoted.
+        if (TryDirectPtxMobiusAdd(x, y, output, batchSize, dim, curvature)) return;
         if (!_kernelCache.TryGetValue("mobius_add", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: mobius_add");
 
@@ -14249,6 +14257,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void PoincareExpMap(IGpuBuffer basePoint, IGpuBuffer tangentVec, IGpuBuffer output, int batchSize, int dim, float curvature)
     {
+        // Fail-closed direct-PTX fast path (issue #854); returns false until GPU-promoted.
+        if (TryDirectPtxPoincareExpMap(basePoint, tangentVec, output, batchSize, dim, curvature)) return;
         if (!_kernelCache.TryGetValue("poincare_exp_map", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: poincare_exp_map");
 
@@ -14270,6 +14280,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void PoincareDistance(IGpuBuffer x, IGpuBuffer y, IGpuBuffer output, int batchSize, int dim, float curvature)
     {
+        // Fail-closed direct-PTX fast path (issue #854); returns false until GPU-promoted.
+        if (TryDirectPtxPoincareDistance(x, y, output, batchSize, dim, curvature)) return;
         if (!_kernelCache.TryGetValue("poincare_distance", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: poincare_distance");
 
@@ -14400,6 +14412,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void OctonionMultiply(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int count)
     {
+        // Fail-closed direct-PTX fast path (issue #854); returns false until GPU-promoted.
+        if (TryDirectPtxOctonionMultiply(a, b, output, count)) return;
         if (!_kernelCache.TryGetValue("octonion_multiply", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: octonion_multiply");
 
@@ -14419,6 +14433,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void OctonionAdd(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int count)
     {
+        // Fail-closed direct-PTX fast path (issue #854); returns false until GPU-promoted.
+        if (TryDirectPtxOctonionAdd(a, b, output, count)) return;
         if (!_kernelCache.TryGetValue("octonion_add", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: octonion_add");
 
@@ -14571,6 +14587,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (numPairs <= 0) return;
         if (numPairs * 2 > a.Size || numPairs * 2 > b.Size || numPairs * 2 > output.Size)
             throw new ArgumentException($"numPairs ({numPairs}) requires {numPairs * 2} elements but buffer sizes are a={a.Size}, b={b.Size}, out={output.Size}.");
+        // Fail-closed direct-PTX fast path (issue #854); returns false until GPU-promoted.
+        if (TryDirectPtxComplexMultiply(a, b, output, numPairs)) return;
         if (!_kernelCache.TryGetValue("complex_multiply", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: complex_multiply");
         using var _ = PushContext();
@@ -14586,6 +14604,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (numPairs <= 0) return;
         if (numPairs * 2 > input.Size || numPairs * 2 > output.Size)
             throw new ArgumentException($"numPairs ({numPairs}) requires {numPairs * 2} elements but buffer sizes are in={input.Size}, out={output.Size}.");
+        // Fail-closed direct-PTX fast path (issue #854); returns false until GPU-promoted.
+        if (TryDirectPtxComplexConjugate(input, output, numPairs)) return;
         if (!_kernelCache.TryGetValue("complex_conjugate", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: complex_conjugate");
         using var _ = PushContext();
