@@ -16,7 +16,7 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
             DirectPtxSparseGraphCompletionLedger.All
                 .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(49, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+        Assert.Equal(51, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
             entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
         Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
         Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
@@ -552,6 +552,32 @@ public sealed class DirectPtxSparseGraphTests
         Assert.False(PtxCapsuleSquashF32Kernel.SupportsShape(319, 16, 1e-8f));
         Assert.False(PtxCapsuleSquashF32Kernel.SupportsShape(320, 8, 1e-8f));
         Assert.False(PtxCapsuleSquashF32Kernel.SupportsShape(320, 16, 1e-6f));
+    }
+
+    [Theory]
+    [InlineData((int)DirectPtxResidentScatterAuxOperation.MeanRowsWithCounts, 4, 2, "ascending-source-row")]
+    [InlineData((int)DirectPtxResidentScatterAuxOperation.MaxBackwardRows, 3, 1, "ascending-source-row")]
+    public void ResidentScatterAuxEmitter_BakesExactDeterministicAbi(
+        int operationValue,
+        int pointerCount,
+        int storeCount,
+        string reductionOrder)
+    {
+        var operation = (DirectPtxResidentScatterAuxOperation)operationValue;
+        string ptx = PtxResidentScatterAuxF32Kernel.EmitPtx(8, 6, operation);
+        DirectPtxKernelBlueprint blueprint = PtxResidentScatterAuxF32Kernel.CreateBlueprint(
+            DirectPtxArchitectureFamily.Ampere, operation);
+
+        Assert.Equal(pointerCount, Count(ptx, ".param .u64"));
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("atom.", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(storeCount, Count(ptx, "st.global.f32"));
+        Assert.All(blueprint.Tensors, tensor => Assert.Equal(DirectPtxExtentMode.Exact, tensor.ExtentMode));
+        Assert.Equal(reductionOrder, blueprint.Semantics["reduction-order"]);
+        Assert.Equal("single-overwrite", blueprint.Semantics["output-write"]);
+        Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
+        Assert.Equal("0", blueprint.Semantics["intermediate-global-bytes"]);
     }
 
     [Theory]

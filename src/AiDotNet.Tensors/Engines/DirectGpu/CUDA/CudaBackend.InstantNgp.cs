@@ -220,9 +220,16 @@ public sealed partial class CudaBackend : IInstantNgpBackend, IUniqueConsecutive
 
     public void ScatterMeanRowsWithCounts(
         IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, IGpuBuffer counts,
-        int sourceRows, int innerSize, int outputRows) =>
+        int sourceRows, int innerSize, int outputRows)
+    {
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxResidentScatterMeanRowsWithCounts(
+            source, indices, output, counts, sourceRows, innerSize, outputRows))
+            return;
+#endif
         LaunchResidentRows4("resident_scatter_mean_rows_counts", source, indices, output, counts,
             Math.Max(checked(outputRows * innerSize), outputRows), sourceRows, innerSize, outputRows);
+    }
 
     public void ScatterSoftmaxRows(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output,
         int sourceRows, int innerSize, int numGroups) =>
@@ -259,9 +266,16 @@ public sealed partial class CudaBackend : IInstantNgpBackend, IUniqueConsecutive
 
     public void ScatterMaxBackwardRows(
         IGpuBuffer gradOutput, IGpuBuffer argmax, IGpuBuffer gradSource,
-        int sourceRows, int innerSize, int outputRows) =>
+        int sourceRows, int innerSize, int outputRows)
+    {
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxResidentScatterMaxBackwardRows(
+            gradOutput, argmax, gradSource, sourceRows, innerSize, outputRows))
+            return;
+#endif
         LaunchResidentRows3("resident_scatter_max_backward_rows", gradOutput, argmax, gradSource,
             checked(sourceRows * innerSize), sourceRows, innerSize, outputRows);
+    }
 
     public void ScatterSoftmaxBackwardRows(
         IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer indices, IGpuBuffer gradSource,
