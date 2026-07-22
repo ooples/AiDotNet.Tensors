@@ -16,7 +16,7 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
             DirectPtxSparseGraphCompletionLedger.All
                 .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(6, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+        Assert.Equal(7, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
             entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
         Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
         Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
@@ -142,6 +142,21 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal("bias-then-stored-row-order", blueprint.Semantics["reduction-order"]);
         Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
         Assert.Equal("0", blueprint.Semantics["intermediate-global-bytes"]);
+    }
+
+    [Fact]
+    public void CsrSpmmBiasReluEmitter_BakesBranchlessRegisterEpilogue()
+    {
+        string ptx = PtxFusedCsrSpmmBiasVec4F32Kernel.EmitPtx(8, 6, fuseRelu: true);
+        DirectPtxKernelBlueprint blueprint = PtxFusedCsrSpmmBiasVec4F32Kernel.CreateBlueprint(
+            DirectPtxArchitectureFamily.Ampere, fuseRelu: true);
+
+        Assert.Contains(PtxFusedCsrSpmmBiasVec4F32Kernel.ReluEntryPoint, ptx);
+        Assert.Equal(4, Count(ptx, "max.f32"));
+        Assert.DoesNotContain(PtxFusedCsrSpmmBiasVec4F32Kernel.EntryPoint + "(", ptx);
+        Assert.Equal("relu", blueprint.Semantics["epilogue"]);
+        Assert.Equal("C=relu(A(csr)*B+bias)", blueprint.Semantics["equation"]);
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
     }
 
     [Fact]

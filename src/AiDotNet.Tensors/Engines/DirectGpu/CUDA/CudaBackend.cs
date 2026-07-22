@@ -4039,6 +4039,56 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel2D(kernel, gridX, gridY, (uint)DefaultBlockSize, 1, args);
     }
 
+    /// <summary>
+    /// Fused CSR SpMM, column bias, and ReLU epilogue. The exact SM86
+    /// specialization keeps all four outputs in registers through the
+    /// epilogue; other shapes use the established resident CUDA kernel.
+    /// </summary>
+    public unsafe void CsrSpMMBiasRelu(
+        IGpuBuffer csrValues,
+        IGpuBuffer csrColIndices,
+        IGpuBuffer csrRowPointers,
+        IGpuBuffer denseB,
+        IGpuBuffer bias,
+        IGpuBuffer output,
+        int M, int K, int N, int nnz)
+    {
+        if (!IsAvailable)
+            throw new InvalidOperationException("CUDA backend is not available.");
+
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxCsrSpmmBiasVec4F32(
+            csrValues, csrColIndices, csrRowPointers, denseB, bias, output,
+            M, K, N, nnz, fuseRelu: true))
+            return;
+#endif
+
+        if (!_kernelCache.TryGetValue("csr_spmm_bias_relu", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: csr_spmm_bias_relu");
+
+        using var _ = PushContext();
+        uint gridX = (uint)M;
+        uint gridY = (uint)((N + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr valuesPtr = csrValues.Handle;
+        IntPtr colIndicesPtr = csrColIndices.Handle;
+        IntPtr rowPointersPtr = csrRowPointers.Handle;
+        IntPtr denseBPtr = denseB.Handle;
+        IntPtr biasPtr = bias.Handle;
+        IntPtr outputPtr = output.Handle;
+        void** args = stackalloc void*[10];
+        args[0] = &valuesPtr;
+        args[1] = &colIndicesPtr;
+        args[2] = &rowPointersPtr;
+        args[3] = &denseBPtr;
+        args[4] = &biasPtr;
+        args[5] = &outputPtr;
+        args[6] = &M;
+        args[7] = &K;
+        args[8] = &N;
+        args[9] = &nnz;
+        LaunchKernel2D(kernel, gridX, gridY, (uint)DefaultBlockSize, 1, args);
+    }
+
     /// <inheritdoc/>
     public unsafe void ScatterAddEdges(
         IGpuBuffer input,

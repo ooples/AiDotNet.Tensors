@@ -36,6 +36,8 @@ public sealed partial class CudaBackend
         _directPtxSddmmKernels = new(4);
     private readonly DirectPtxKernelCache<DirectPtxCsrSpmmKey, PtxFusedCsrSpmmBiasVec4F32Kernel>
         _directPtxCsrSpmmBiasKernels = new(4);
+    private readonly DirectPtxKernelCache<DirectPtxCsrSpmmKey, PtxFusedCsrSpmmBiasVec4F32Kernel>
+        _directPtxCsrSpmmBiasReluKernels = new(4);
     private readonly DirectPtxKernelCache<DirectPtxCsrSpmmKey, PtxFusedCsrSpmmVec2F64Kernel>
         _directPtxCsrSpmmF64Kernels = new(4);
     private DirectPtxRuntime? _directPtxRuntime;
@@ -54,6 +56,7 @@ public sealed partial class CudaBackend
     private long _directPtxCsrSpmmDispatchCount;
     private long _directPtxSddmmDispatchCount;
     private long _directPtxCsrSpmmBiasDispatchCount;
+    private long _directPtxCsrSpmmBiasReluDispatchCount;
     private long _directPtxCsrSpmmF64DispatchCount;
     internal int DirectPtxCachedKernelCount
     {
@@ -134,6 +137,8 @@ public sealed partial class CudaBackend
     }
     internal long DirectPtxCsrSpmmBiasDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxCsrSpmmBiasDispatchCount);
+    internal long DirectPtxCsrSpmmBiasReluDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxCsrSpmmBiasReluDispatchCount);
     internal long DirectPtxCsrSpmmF64DispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxCsrSpmmF64DispatchCount);
 
@@ -335,7 +340,8 @@ public sealed partial class CudaBackend
         int rows,
         int inner,
         int columns,
-        int nonZeros)
+        int nonZeros,
+        bool fuseRelu = false)
     {
         if (!IsDirectPtxSparseGraphEnabled)
         {
@@ -390,18 +396,20 @@ public sealed partial class CudaBackend
             bool capturing = IsStreamCapturing();
             EnsureContextCurrent();
             var key = new DirectPtxCsrSpmmKey(rows, inner, columns, nonZeros);
+            DirectPtxKernelCache<DirectPtxCsrSpmmKey, PtxFusedCsrSpmmBiasVec4F32Kernel> cache =
+                fuseRelu ? _directPtxCsrSpmmBiasReluKernels : _directPtxCsrSpmmBiasKernels;
             lock (_directPtxLock)
             {
-                if (capturing && !_directPtxCsrSpmmBiasKernels.TryGetValue(key, out _))
+                if (capturing && !cache.TryGetValue(key, out _))
                 {
                     DirectPtxLastError =
                         "Direct PTX CSR SpMM+bias must be prewarmed before CUDA graph capture.";
                     return false;
                 }
                 _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
-                PtxFusedCsrSpmmBiasVec4F32Kernel kernel = _directPtxCsrSpmmBiasKernels.GetOrAdd(
-                    key, () => new PtxFusedCsrSpmmBiasVec4F32Kernel(_directPtxRuntime!));
-                if (capturing && !_directPtxCsrSpmmBiasKernels.Pin(key))
+                PtxFusedCsrSpmmBiasVec4F32Kernel kernel = cache.GetOrAdd(
+                    key, () => new PtxFusedCsrSpmmBiasVec4F32Kernel(_directPtxRuntime!, fuseRelu));
+                if (capturing && !cache.Pin(key))
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX CSR SpMM+bias module for CUDA graph capture.");
                 lock (GpuDispatchLock)
@@ -413,7 +421,10 @@ public sealed partial class CudaBackend
                         DirectPtxTensorView.Create(bias, kernel.Blueprint.Tensors[4]),
                         DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[5]));
             }
-            System.Threading.Interlocked.Increment(ref _directPtxCsrSpmmBiasDispatchCount);
+            if (fuseRelu)
+                System.Threading.Interlocked.Increment(ref _directPtxCsrSpmmBiasReluDispatchCount);
+            else
+                System.Threading.Interlocked.Increment(ref _directPtxCsrSpmmBiasDispatchCount);
             DirectPtxLastError = null;
             return true;
         }
@@ -425,7 +436,7 @@ public sealed partial class CudaBackend
     }
 
     internal bool PrewarmDirectPtxCsrSpmmBiasVec4F32(
-        int rows, int inner, int columns, int nonZeros)
+        int rows, int inner, int columns, int nonZeros, bool fuseRelu = false)
     {
         if (!IsDirectPtxSparseGraphEnabled || IsStreamCapturing() ||
             !PtxFusedCsrSpmmBiasVec4F32Kernel.SupportsShape(rows, inner, columns, nonZeros))
@@ -437,8 +448,10 @@ public sealed partial class CudaBackend
             {
                 _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                 var key = new DirectPtxCsrSpmmKey(rows, inner, columns, nonZeros);
-                _ = _directPtxCsrSpmmBiasKernels.GetOrAdd(
-                    key, () => new PtxFusedCsrSpmmBiasVec4F32Kernel(_directPtxRuntime!));
+                DirectPtxKernelCache<DirectPtxCsrSpmmKey, PtxFusedCsrSpmmBiasVec4F32Kernel> cache =
+                    fuseRelu ? _directPtxCsrSpmmBiasReluKernels : _directPtxCsrSpmmBiasKernels;
+                _ = cache.GetOrAdd(
+                    key, () => new PtxFusedCsrSpmmBiasVec4F32Kernel(_directPtxRuntime!, fuseRelu));
             }
             DirectPtxLastError = null;
             return true;
@@ -451,11 +464,14 @@ public sealed partial class CudaBackend
     }
 
     internal bool TryGetDirectPtxCsrSpmmBiasAudit(
-        int rows, int inner, int columns, int nonZeros, out DirectPtxKernelAudit audit)
+        int rows, int inner, int columns, int nonZeros, out DirectPtxKernelAudit audit,
+        bool fuseRelu = false)
     {
         lock (_directPtxLock)
         {
-            if (_directPtxCsrSpmmBiasKernels.TryGetValue(
+            DirectPtxKernelCache<DirectPtxCsrSpmmKey, PtxFusedCsrSpmmBiasVec4F32Kernel> cache =
+                fuseRelu ? _directPtxCsrSpmmBiasReluKernels : _directPtxCsrSpmmBiasKernels;
+            if (cache.TryGetValue(
                 new DirectPtxCsrSpmmKey(rows, inner, columns, nonZeros), out var kernel))
             {
                 audit = kernel.Audit;
@@ -2445,6 +2461,7 @@ public sealed partial class CudaBackend
             _directPtxCsrSpmmKernels.Dispose();
             _directPtxSddmmKernels.Dispose();
             _directPtxCsrSpmmBiasKernels.Dispose();
+            _directPtxCsrSpmmBiasReluKernels.Dispose();
             _directPtxCsrSpmmF64Kernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;

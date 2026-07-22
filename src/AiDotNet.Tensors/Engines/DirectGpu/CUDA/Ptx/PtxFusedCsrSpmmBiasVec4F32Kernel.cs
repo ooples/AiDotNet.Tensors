@@ -13,6 +13,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 internal sealed class PtxFusedCsrSpmmBiasVec4F32Kernel : IDisposable
 {
     internal const string EntryPoint = "aidotnet_csr_spmm_bias_vec4_f32_m1024_k1024_n64_nnz16384";
+    internal const string ReluEntryPoint = "aidotnet_csr_spmm_bias_relu_vec4_f32_m1024_k1024_n64_nnz16384";
     internal const int Rows = PtxFusedCsrSpmmVec4F32Kernel.Rows;
     internal const int Inner = PtxFusedCsrSpmmVec4F32Kernel.Inner;
     internal const int Columns = PtxFusedCsrSpmmVec4F32Kernel.Columns;
@@ -30,8 +31,9 @@ internal sealed class PtxFusedCsrSpmmBiasVec4F32Kernel : IDisposable
     internal DirectPtxKernelBlueprint Blueprint { get; }
     internal DirectPtxKernelAudit Audit { get; }
     internal string JitInfoLog => _module.JitInfoLog;
+    internal bool FuseRelu { get; }
 
-    internal PtxFusedCsrSpmmBiasVec4F32Kernel(DirectPtxRuntime runtime)
+    internal PtxFusedCsrSpmmBiasVec4F32Kernel(DirectPtxRuntime runtime, bool fuseRelu = false)
     {
         ArgumentNullException.ThrowIfNull(runtime);
         if (!DirectPtxArchitecture.HasValidatedSparseGraph(
@@ -39,13 +41,15 @@ internal sealed class PtxFusedCsrSpmmBiasVec4F32Kernel : IDisposable
             throw new NotSupportedException(
                 $"CSR SpMM+bias has no SM {runtime.ComputeCapabilityMajor}.{runtime.ComputeCapabilityMinor} experimental specialization.");
 
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily);
-        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        FuseRelu = fuseRelu;
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, fuseRelu);
+        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, fuseRelu);
         _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
+        string entryPoint = fuseRelu ? ReluEntryPoint : EntryPoint;
+        _function = _module.GetFunction(entryPoint, out DirectPtxFunctionInfo functionInfo);
         FunctionInfo = functionInfo;
         int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, functionInfo, BlockThreads, activeBlocks);
+        Blueprint.ResourceBudget.Validate(entryPoint, functionInfo, BlockThreads, activeBlocks);
         Audit = DirectPtxKernelAudit.Create(
             Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo,
             BlockThreads, activeBlocks, _module.JitInfoLog);
@@ -90,7 +94,9 @@ internal sealed class PtxFusedCsrSpmmBiasVec4F32Kernel : IDisposable
         _module.Launch(_function, GridBlocks, 1, 1, BlockThreads, 1, 1, 0, arguments);
     }
 
-    internal static DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture)
+    internal static DirectPtxKernelBlueprint CreateBlueprint(
+        DirectPtxArchitectureFamily architecture,
+        bool fuseRelu = false)
     {
         var values = new DirectPtxExtent(NonZeros);
         var rowPointers = new DirectPtxExtent(Rows + 1);
@@ -98,7 +104,7 @@ internal sealed class PtxFusedCsrSpmmBiasVec4F32Kernel : IDisposable
         var bias = new DirectPtxExtent(Columns);
         var output = new DirectPtxExtent(Rows, Columns);
         return new DirectPtxKernelBlueprint(
-            Operation: "csr-spmm-bias-vec4-f32",
+            Operation: fuseRelu ? "csr-spmm-bias-relu-vec4-f32" : "csr-spmm-bias-vec4-f32",
             Version: 1,
             Architecture: architecture,
             Variant: "m1024-k1024-n64-nnz16384-row-major",
@@ -120,20 +126,21 @@ internal sealed class PtxFusedCsrSpmmBiasVec4F32Kernel : IDisposable
             ResourceBudget: new DirectPtxResourceBudget(48, 0, 0, 4),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
-                ["equation"] = "C=A(csr)*B+bias",
+                ["equation"] = fuseRelu ? "C=relu(A(csr)*B+bias)" : "C=A(csr)*B+bias",
                 ["csr-index-base"] = "zero",
                 ["csr-index-width"] = "int32",
                 ["reduction-order"] = "bias-then-stored-row-order",
                 ["accumulator"] = "fp32-fma",
                 ["dense-layout"] = "row-major-contiguous",
                 ["bias-layout"] = "contiguous-column-vector",
+                ["epilogue"] = fuseRelu ? "relu" : "identity",
                 ["output-columns-per-thread"] = ColumnsPerThread.ToString(),
                 ["intermediate-global-bytes"] = "0",
                 ["workspace-bytes"] = "0"
             });
     }
 
-    internal static string EmitPtx(int ccMajor, int ccMinor)
+    internal static string EmitPtx(int ccMajor, int ccMinor, bool fuseRelu = false)
     {
         if (ccMajor <= 0 || ccMinor < 0) throw new ArgumentOutOfRangeException(nameof(ccMajor));
         var ptx = new StringBuilder(4096);
@@ -141,7 +148,7 @@ internal sealed class PtxFusedCsrSpmmBiasVec4F32Kernel : IDisposable
         ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
-        ptx.AppendLine($".visible .entry {EntryPoint}(");
+        ptx.AppendLine($".visible .entry {(fuseRelu ? ReluEntryPoint : EntryPoint)}(");
         ptx.AppendLine("    .param .u64 values_ptr,");
         ptx.AppendLine("    .param .u64 column_indices_ptr,");
         ptx.AppendLine("    .param .u64 row_pointers_ptr,");
@@ -194,6 +201,13 @@ internal sealed class PtxFusedCsrSpmmBiasVec4F32Kernel : IDisposable
         ptx.AppendLine("    add.u32 %r8, %r8, 1;");
         ptx.AppendLine("    bra CSR_BIAS_LOOP;");
         ptx.AppendLine("CSR_BIAS_DONE:");
+        if (fuseRelu)
+        {
+            ptx.AppendLine("    max.f32 %f0, %f0, 0f00000000;");
+            ptx.AppendLine("    max.f32 %f1, %f1, 0f00000000;");
+            ptx.AppendLine("    max.f32 %f2, %f2, 0f00000000;");
+            ptx.AppendLine("    max.f32 %f3, %f3, 0f00000000;");
+        }
         ptx.AppendLine("    shl.b32 %r11, %r3, 6;");
         ptx.AppendLine("    add.u32 %r11, %r11, %r5;");
         ptx.AppendLine("    mul.wide.u32 %rd15, %r11, 4;");
