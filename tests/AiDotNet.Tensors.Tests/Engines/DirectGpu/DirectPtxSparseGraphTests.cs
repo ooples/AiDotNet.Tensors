@@ -16,7 +16,7 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
             DirectPtxSparseGraphCompletionLedger.All
                 .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(30, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+        Assert.Equal(31, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
             entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
         Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
         Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
@@ -344,6 +344,7 @@ public sealed class DirectPtxSparseGraphTests
     [InlineData((int)DirectPtxStructuredSparse2x4Operation.Decompress, 3)]
     [InlineData((int)DirectPtxStructuredSparse2x4Operation.Gemm, 4)]
     [InlineData((int)DirectPtxStructuredSparse2x4Operation.GemmBiasRelu, 5)]
+    [InlineData((int)DirectPtxStructuredSparse2x4Operation.MatMulBaseline, 4)]
     public void StructuredSparse2x4Emitter_BakesExactPointerOnlyAbi(
         int operationValue,
         int pointerCount)

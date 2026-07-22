@@ -10,7 +10,8 @@ internal enum DirectPtxStructuredSparse2x4Operation
     Enforce,
     Decompress,
     Gemm,
-    GemmBiasRelu
+    GemmBiasRelu,
+    MatMulBaseline
 }
 
 /// <summary>
@@ -106,7 +107,8 @@ internal sealed class PtxStructuredSparse2x4F32Kernel : IDisposable
         DirectPtxTensorView denseB,
         DirectPtxTensorView output)
     {
-        if (Operation != DirectPtxStructuredSparse2x4Operation.Gemm)
+        if (Operation is not (DirectPtxStructuredSparse2x4Operation.Gemm or
+            DirectPtxStructuredSparse2x4Operation.MatMulBaseline))
             throw new InvalidOperationException("This module does not expose the plain structured sparse GEMM ABI.");
         Require(values, Blueprint.Tensors[0], nameof(values));
         Require(metadata, Blueprint.Tensors[1], nameof(metadata));
@@ -187,7 +189,8 @@ internal sealed class PtxStructuredSparse2x4F32Kernel : IDisposable
                 Exact("dense-output", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.RowMajor2D,
                     denseA, DirectPtxTensorAccess.Write)
             ],
-            DirectPtxStructuredSparse2x4Operation.Gemm =>
+            DirectPtxStructuredSparse2x4Operation.Gemm or
+            DirectPtxStructuredSparse2x4Operation.MatMulBaseline =>
             [
                 Exact("packed-values", DirectPtxPhysicalType.Float32,
                     DirectPtxPhysicalLayout.StructuredSparse2x4Values, values, DirectPtxTensorAccess.Read),
@@ -217,7 +220,8 @@ internal sealed class PtxStructuredSparse2x4F32Kernel : IDisposable
             Operation: "structured-sparse-2x4-" + operation.ToString().ToLowerInvariant(),
             Version: 1,
             Architecture: architecture,
-            Variant: operation == DirectPtxStructuredSparse2x4Operation.Gemm
+            Variant: operation is DirectPtxStructuredSparse2x4Operation.Gemm or
+                DirectPtxStructuredSparse2x4Operation.MatMulBaseline
                 ? $"m256-n64-k256-a{BitConverter.SingleToInt32Bits(alpha):x8}-b{BitConverter.SingleToInt32Bits(beta):x8}"
                 : "m256-n64-k256",
             Tensors: tensors,
@@ -257,6 +261,9 @@ internal sealed class PtxStructuredSparse2x4F32Kernel : IDisposable
                 break;
             case DirectPtxStructuredSparse2x4Operation.Gemm:
                 EmitGemm(ptx, GetEntryPoint(operation, alpha, beta), alpha, beta, false);
+                break;
+            case DirectPtxStructuredSparse2x4Operation.MatMulBaseline:
+                EmitGemm(ptx, GetEntryPoint(operation, alpha, beta), 1.0f, 0.0f, false);
                 break;
             case DirectPtxStructuredSparse2x4Operation.GemmBiasRelu:
                 EmitGemm(ptx, GetEntryPoint(operation, alpha, beta), 1.0f, 0.0f, true);
@@ -489,6 +496,8 @@ internal sealed class PtxStructuredSparse2x4F32Kernel : IDisposable
                 $"aidotnet_sparse_gemm_2x4_f32_m256_n64_k256_a{BitConverter.SingleToInt32Bits(alpha):x8}_b{BitConverter.SingleToInt32Bits(beta):x8}",
             DirectPtxStructuredSparse2x4Operation.GemmBiasRelu =>
                 "aidotnet_sparse_gemm_2x4_bias_relu_f32_m256_n64_k256",
+            DirectPtxStructuredSparse2x4Operation.MatMulBaseline =>
+                "aidotnet_sparse_2_4_matmul_baseline_f32_m256_n64_k256",
             _ => throw new ArgumentOutOfRangeException(nameof(operation))
         };
 

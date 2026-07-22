@@ -1546,6 +1546,26 @@ public sealed partial class CudaBackend
             sparseValues, sparseMetadata, denseB, bias, output, 1.0f, 0.0f);
     }
 
+    internal bool TryDirectPtxSparse2x4MatMulBaseline(
+        IGpuBuffer sparseValues,
+        IGpuBuffer sparseMetadata,
+        IGpuBuffer denseB,
+        IGpuBuffer output,
+        int rows,
+        int inner,
+        int columns)
+    {
+        if (!PtxStructuredSparse2x4F32Kernel.SupportsGemmShape(rows, columns, inner) ||
+            !HasExactBytes(sparseValues, (long)rows * (inner / 2) * sizeof(float)) ||
+            !HasExactBytes(sparseMetadata, (long)rows * (inner / 4)) ||
+            !HasExactBytes(denseB, (long)inner * columns * sizeof(float)) ||
+            !HasExactBytes(output, (long)rows * columns * sizeof(float)))
+            return false;
+        return TryDirectPtxStructuredSparse2x4Core(
+            DirectPtxStructuredSparse2x4Operation.MatMulBaseline,
+            sparseValues, sparseMetadata, denseB, output, null, 1.0f, 0.0f);
+    }
+
     internal bool PrewarmDirectPtxStructuredSparse2x4(
         DirectPtxStructuredSparse2x4Operation operation,
         float alpha = 1.0f,
@@ -1629,7 +1649,8 @@ public sealed partial class CudaBackend
                             DirectPtxTensorView.Create(p0, kernel.Blueprint.Tensors[0]),
                             DirectPtxTensorView.Create(p1, kernel.Blueprint.Tensors[1]),
                             DirectPtxTensorView.Create(p2, kernel.Blueprint.Tensors[2]));
-                    else if (operation == DirectPtxStructuredSparse2x4Operation.Gemm)
+                    else if (operation is DirectPtxStructuredSparse2x4Operation.Gemm or
+                        DirectPtxStructuredSparse2x4Operation.MatMulBaseline)
                         kernel.LaunchGemm(
                             DirectPtxTensorView.Create(p0, kernel.Blueprint.Tensors[0]),
                             DirectPtxTensorView.Create(p1, kernel.Blueprint.Tensors[1]),

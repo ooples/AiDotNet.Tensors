@@ -52,11 +52,11 @@ internal static class DirectPtxSparseGraphCompletionLedger
             "scatter_add_edges");
         Add("CudaSnnKernels", DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx,
             "enforce_2x4_sparsity", "decompress_2x4_sparse", "sparse_gemm_2x4",
-            "sparse_gemm_bias_relu");
+            "sparse_gemm_bias_relu", "sparse_2_4_matmul_baseline");
         Add("CudaBackend.CSR", DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx,
             "csr_segmented_max", "csr_segmented_min", "csr_segmented_stddev");
         Add("CudaSnnKernels", DirectPtxSparseGraphCompletionStatus.MissingDirectPtx,
-            "sparse_2_4_matmul_baseline", "sparse_2_4_matmul_mma_sp");
+            "sparse_2_4_matmul_mma_sp");
         Add("CudaNeuralNetKernels", DirectPtxSparseGraphCompletionStatus.MissingDirectPtx,
             "scatter_add", "scatter_add_deterministic", "scatter_add_accumulate_deterministic",
             "scatter_add_batched", "scatter_add_batched_deterministic", "scatter_max",

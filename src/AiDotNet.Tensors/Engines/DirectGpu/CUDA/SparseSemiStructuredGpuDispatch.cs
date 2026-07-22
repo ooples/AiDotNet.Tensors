@@ -59,6 +59,19 @@ internal static class SparseSemiStructuredGpuDispatch
             metaBuf = backend.AllocateByteBuffer(metadata.Length);
             UploadBytes(metaBuf.Handle, metadata);
 
+#if NET5_0_OR_GREATER
+            // Exact GA102 admission bypasses NVRTC. The direct-PTX baseline
+            // has a pointer-only M=256,K=256,N=64 ABI on the backend's
+            // borrowed Driver-API context and stream. Every other case keeps
+            // the established baseline/mma.sp selection below.
+            if (backend.TryDirectPtxSparse2x4MatMulBaseline(
+                packedBuf, metaBuf, bBuf, outBuf, rows, cols, n))
+            {
+                backend.DownloadBuffer(outBuf, output);
+                return output;
+            }
+#endif
+
             // Block tile: 16 cols × 16 rows is friendly to memory coalescing
             // for the baseline kernel and to the warp-cooperative tile shape
             // for the Ampere kernel.
