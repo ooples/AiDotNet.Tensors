@@ -14,9 +14,11 @@ public class DirectPtxScientificTests
     [Fact]
     public void ScientificCoverageManifest_AssignsEveryScopedApiExactlyOnce()
     {
-        Assert.Equal(11, DirectPtxScientificCoverageManifest.All.Count);
+        Assert.Equal(13, DirectPtxScientificCoverageManifest.All.Count);
         string[] names = DirectPtxScientificCoverageManifest.All.Select(c => c.Api).ToArray();
         Assert.Contains("CudaBackend.RbfForward", names);
+        Assert.Contains("CudaBackend.PairwiseDistance", names);
+        Assert.Contains("CudaBackend.PairwiseDistanceSquared", names);
         Assert.Equal(names.Length, names.Distinct(StringComparer.Ordinal).Count());
         Assert.All(DirectPtxScientificCoverageManifest.All, cell =>
         {
@@ -333,6 +335,72 @@ public class DirectPtxScientificTests
         var actual = new float[expected.Length];
         output.Download<float>(actual);
         AssertVectorClose(actual, expected, 2e-3f, "rbf forward");
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void PairwiseDistanceEmitter_IsThreadPerPairSerialDim(bool squared)
+    {
+        string ptx = PtxPairwiseDistanceKernel.EmitPtx(8, 6, 32, 8, 4, squared);
+        Assert.Contains(PtxPairwiseDistanceKernel.EntryPointFor(squared), ptx);
+        Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));    // a + b in the loop
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.Equal(squared ? 0 : 1, Count(ptx, "sqrt.rn.f32"));   // L2 takes sqrt, squared does not
+        Assert.Contains("$PD_DIM_LOOP:", ptx);
+        Assert.Contains("div.u32 %r3, %r2, 8", ptx);         // i = idx / N
+        Assert.Contains("rem.u32 %r4, %r2, 8", ptx);         // j = idx % N
+        Assert.Equal(0, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxPairwiseDistanceKernel.IsSupportedShape(32, 8, 4));
+        Assert.False(PtxPairwiseDistanceKernel.IsSupportedShape(33, 8, 4));  // pairs not multiple of 256
+        Assert.False(PtxPairwiseDistanceKernel.IsPromotedShape(32, 8, 4));
+    }
+
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void DriverOnlyPairwiseDistance_MatchesOracle(bool squared)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in pairwise-distance specialization is measured on GA10x/SM86.");
+        const int m = 64, n = 16, dim = 10;   // pairs = 1024 (multiple of 256)
+        using var kernel = new PtxPairwiseDistanceKernel(runtime, m, n, dim, squared);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20267200);
+        float[] aHost = Values(random, m * dim, 1.0f);
+        float[] bHost = Values(random, n * dim, 1.0f);
+        var expected = new float[m * n];
+        for (int i = 0; i < m; i++)
+            for (int j = 0; j < n; j++)
+            {
+                double distSq = 0;
+                for (int d = 0; d < dim; d++)
+                {
+                    double diff = aHost[i * dim + d] - bHost[j * dim + d];
+                    distSq += diff * diff;
+                }
+                expected[i * n + j] = (float)(squared ? distSq : Math.Sqrt(distSq));
+            }
+
+        using var a = runtime.AllocateBytes((nuint)(aHost.Length * sizeof(float)));
+        using var b = runtime.AllocateBytes((nuint)(bHost.Length * sizeof(float)));
+        using var output = runtime.AllocateBytes((nuint)(expected.Length * sizeof(float)));
+        a.Upload<float>(aHost);
+        b.Upload<float>(bHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(a, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(b, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[expected.Length];
+        output.Download<float>(actual);
+        AssertVectorClose(actual, expected, 2e-3f, squared ? "pairwise distance squared" : "pairwise distance");
     }
 
     [Fact]
@@ -817,6 +885,24 @@ public class DirectPtxScientificTests
             using (var inb = backend.AllocateBuffer(rin)) using (var cenb = backend.AllocateBuffer(rcen))
             using (var epsb = backend.AllocateBuffer(reps)) using (var o = backend.AllocateBuffer(rbfBatch * rbfCenters))
             { backend.RbfForward(inb, cenb, epsb, o, rbfBatch, rbfCenters, rbfDim); n = AssertDispatched(n, "rbf-forward"); AssertVectorClose(backend.DownloadBuffer(o), rbfExp, 2e-3f, "rbf-forward route"); }
+
+            // Pairwise distance (L2) and squared: pairs = M*N must be a multiple of 256.
+            const int pdM = 64, pdN = 16, pdDim = 10;
+            float[] pdA = Values(random, pdM * pdDim, 1.0f), pdB = Values(random, pdN * pdDim, 1.0f);
+            var pdSqExp = new float[pdM * pdN];
+            var pdL2Exp = new float[pdM * pdN];
+            for (int i = 0; i < pdM; i++)
+                for (int j = 0; j < pdN; j++)
+                {
+                    double distSq = 0;
+                    for (int d = 0; d < pdDim; d++) { double diff = pdA[i * pdDim + d] - pdB[j * pdDim + d]; distSq += diff * diff; }
+                    pdSqExp[i * pdN + j] = (float)distSq;
+                    pdL2Exp[i * pdN + j] = (float)Math.Sqrt(distSq);
+                }
+            using (var ab = backend.AllocateBuffer(pdA)) using (var bb = backend.AllocateBuffer(pdB)) using (var o = backend.AllocateBuffer(pdM * pdN))
+            { backend.PairwiseDistance(ab, bb, o, pdM, pdN, pdDim); n = AssertDispatched(n, "pairwise-distance"); AssertVectorClose(backend.DownloadBuffer(o), pdL2Exp, 2e-3f, "pairwise-distance route"); }
+            using (var ab = backend.AllocateBuffer(pdA)) using (var bb = backend.AllocateBuffer(pdB)) using (var o = backend.AllocateBuffer(pdM * pdN))
+            { backend.PairwiseDistanceSquared(ab, bb, o, pdM, pdN, pdDim); n = AssertDispatched(n, "pairwise-distance-squared"); AssertVectorClose(backend.DownloadBuffer(o), pdSqExp, 2e-3f, "pairwise-distance-squared route"); }
         }
         finally
         {

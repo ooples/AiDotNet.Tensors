@@ -16990,6 +16990,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void PairwiseDistance(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int M, int N, int dim)
     {
+        if (TryDirectPtxPairwiseDistance(a, b, output, M, N, dim, squared: false)) return;
+
         if (!_kernelCache.TryGetValue("pairwise_distance", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: pairwise_distance");
         using var _ = PushContext();
@@ -17002,6 +17004,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void PairwiseDistanceSquared(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int M, int N, int dim)
     {
+        if (TryDirectPtxPairwiseDistance(a, b, output, M, N, dim, squared: true)) return;
+
         if (!_kernelCache.TryGetValue("pairwise_distance_squared", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: pairwise_distance_squared");
         using var _ = PushContext();

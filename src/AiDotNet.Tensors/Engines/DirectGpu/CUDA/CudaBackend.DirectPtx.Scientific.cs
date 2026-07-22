@@ -21,6 +21,7 @@ public sealed partial class CudaBackend
     private readonly record struct SciCountKey(int Count);
     private readonly record struct SciVectorKey(int Batch, int Dim, int ExtraBits);
     private readonly record struct SciRbfKey(int Batch, int NumCenters, int InputDim);
+    private readonly record struct SciPairwiseKey(int M, int N, int Dim, bool Squared);
 
     private readonly DirectPtxKernelCache<SciCountKey, PtxComplexMultiplyKernel> _sciComplexMul =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
@@ -43,6 +44,8 @@ public sealed partial class CudaBackend
     private readonly DirectPtxKernelCache<SciVectorKey, PtxPoincareExpMapKernel> _sciPoincareExp =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<SciRbfKey, PtxRbfForwardKernel> _sciRbf =
+        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<SciPairwiseKey, PtxPairwiseDistanceKernel> _sciPairwise =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
 
     private long _sciDispatchCount;
@@ -185,6 +188,22 @@ public sealed partial class CudaBackend
             var k = _sciRbf.GetOrAdd(new SciRbfKey(batchSize, numCenters, inputDim),
                 () => new PtxRbfForwardKernel(_directPtxRuntime!, batchSize, numCenters, inputDim));
             Launch4(k.Blueprint, input, centers, epsilons, output, (vi, vc, ve, vo) => k.Launch(vi, vc, ve, vo));
+        });
+    }
+
+    internal bool TryDirectPtxPairwiseDistance(
+        IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int m, int n, int dim, bool squared)
+    {
+        string tag = squared ? "pairwise-distance-squared" : "pairwise-distance";
+        if (!ScientificGateOpen || !PtxPairwiseDistanceKernel.IsSupportedShape(m, n, dim)) return Fail(tag);
+        if (a.SizeInBytes != checked((long)m * dim * sizeof(float)) ||
+            b.SizeInBytes != checked((long)n * dim * sizeof(float)) ||
+            output.SizeInBytes != checked((long)m * n * sizeof(float))) return Fail($"{tag}-extent");
+        return SciDispatch(() =>
+        {
+            var k = _sciPairwise.GetOrAdd(new SciPairwiseKey(m, n, dim, squared),
+                () => new PtxPairwiseDistanceKernel(_directPtxRuntime!, m, n, dim, squared));
+            Launch3(k.Blueprint, a, b, output, (va, vb, vo) => k.Launch(va, vb, vo));
         });
     }
 
