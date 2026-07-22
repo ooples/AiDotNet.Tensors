@@ -16,7 +16,7 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
             DirectPtxSparseGraphCompletionLedger.All
                 .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(31, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+        Assert.Equal(33, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
             entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
         Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
         Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
@@ -362,6 +362,28 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Contains(blueprint.Tensors, tensor =>
             tensor.Layout == DirectPtxPhysicalLayout.StructuredSparse2x4Metadata &&
             tensor.PhysicalType == DirectPtxPhysicalType.UInt8);
+    }
+
+    [Theory]
+    [InlineData((int)DirectPtxScalarScatterAddMode.Atomic, true, "preserved")]
+    [InlineData((int)DirectPtxScalarScatterAddMode.DeterministicOverwrite, false, "discarded")]
+    [InlineData((int)DirectPtxScalarScatterAddMode.DeterministicAccumulate, false, "preserved")]
+    public void ScalarScatterAddEmitter_BakesReductionAndSeedSemantics(
+        int modeValue,
+        bool atomic,
+        string seed)
+    {
+        var mode = (DirectPtxScalarScatterAddMode)modeValue;
+        string ptx = PtxScatterAddScalarF32Kernel.EmitPtx(8, 6, mode);
+        DirectPtxKernelBlueprint blueprint = PtxScatterAddScalarF32Kernel.CreateBlueprint(
+            DirectPtxArchitectureFamily.Ampere, mode);
+
+        Assert.Equal(3, Count(ptx, ".param .u64"));
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.Equal(atomic, ptx.Contains("atom.global.add.f32", StringComparison.Ordinal));
+        Assert.Equal(seed, blueprint.Semantics["destination-seed"]);
+        Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
+        Assert.All(blueprint.Tensors, tensor => Assert.Equal(DirectPtxExtentMode.Exact, tensor.ExtentMode));
     }
 
     [Theory]

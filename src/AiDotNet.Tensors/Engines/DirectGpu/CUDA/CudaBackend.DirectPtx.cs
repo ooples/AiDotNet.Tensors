@@ -56,6 +56,8 @@ public sealed partial class CudaBackend
         _directPtxSparseUtilityKernels = new(8);
     private readonly DirectPtxKernelCache<DirectPtxStructuredSparse2x4Key, PtxStructuredSparse2x4F32Kernel>
         _directPtxStructuredSparse2x4Kernels = new(16);
+    private readonly DirectPtxKernelCache<DirectPtxScalarScatterAddMode, PtxScatterAddScalarF32Kernel>
+        _directPtxScalarScatterAddKernels = new(4);
     private DirectPtxRuntime? _directPtxRuntime;
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
@@ -81,6 +83,7 @@ public sealed partial class CudaBackend
     private long _directPtxCsrBackwardDispatchCount;
     private long _directPtxSparseUtilityDispatchCount;
     private long _directPtxStructuredSparse2x4DispatchCount;
+    private long _directPtxScalarScatterAddDispatchCount;
     internal int DirectPtxCachedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxAttentionKernels.Count; }
@@ -178,6 +181,8 @@ public sealed partial class CudaBackend
         System.Threading.Interlocked.Read(ref _directPtxSparseUtilityDispatchCount);
     internal long DirectPtxStructuredSparse2x4DispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxStructuredSparse2x4DispatchCount);
+    internal long DirectPtxScalarScatterAddDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxScalarScatterAddDispatchCount);
 
     /// <summary>
     /// Attempts the exact FP32 CSR SpMM golden specialization. The admitted ABI
@@ -1678,6 +1683,76 @@ public sealed partial class CudaBackend
 
     private static bool HasExactBytes(IGpuBuffer buffer, long bytes) =>
         buffer is not null && buffer.SizeInBytes == bytes;
+
+    internal bool TryDirectPtxScatterAddScalar(
+        IGpuBuffer source,
+        IGpuBuffer indices,
+        IGpuBuffer destination,
+        int sourceElements,
+        int destinationElements,
+        DirectPtxScalarScatterAddMode mode)
+    {
+        if (!IsDirectPtxSparseGraphEnabled ||
+            !PtxScatterAddScalarF32Kernel.SupportsShape(sourceElements, destinationElements) ||
+            !HasExactBytes(source, (long)sourceElements * sizeof(float)) ||
+            !HasExactBytes(indices, (long)sourceElements * sizeof(int)) ||
+            !HasExactBytes(destination, (long)destinationElements * sizeof(float)) ||
+            source.Handle == IntPtr.Zero || indices.Handle == IntPtr.Zero ||
+            destination.Handle == IntPtr.Zero ||
+            ((((nuint)source.Handle | (nuint)indices.Handle | (nuint)destination.Handle) & 15u) != 0) ||
+            DirectPtxBuffersOverlap(destination, source) ||
+            DirectPtxBuffersOverlap(destination, indices))
+            return false;
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxScalarScatterAddKernels.TryGetValue(mode, out _))
+                    return false;
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxScatterAddScalarF32Kernel kernel = _directPtxScalarScatterAddKernels.GetOrAdd(
+                    mode, () => new PtxScatterAddScalarF32Kernel(_directPtxRuntime!, mode));
+                if (capturing && !_directPtxScalarScatterAddKernels.Pin(mode)) return false;
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(source, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(indices, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(destination, kernel.Blueprint.Tensors[2]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxScalarScatterAddDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool PrewarmDirectPtxScatterAddScalar(DirectPtxScalarScatterAddMode mode)
+    {
+        if (!IsDirectPtxSparseGraphEnabled || IsStreamCapturing()) return false;
+        try
+        {
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _ = _directPtxScalarScatterAddKernels.GetOrAdd(
+                    mode, () => new PtxScatterAddScalarF32Kernel(_directPtxRuntime!, mode));
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
 
     private static bool DirectPtxBuffersOverlap(IGpuBuffer left, IGpuBuffer right)
     {
@@ -3531,6 +3606,7 @@ public sealed partial class CudaBackend
             _directPtxCsrBackwardKernels.Dispose();
             _directPtxSparseUtilityKernels.Dispose();
             _directPtxStructuredSparse2x4Kernels.Dispose();
+            _directPtxScalarScatterAddKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }

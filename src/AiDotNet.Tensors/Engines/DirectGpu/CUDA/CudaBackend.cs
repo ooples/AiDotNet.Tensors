@@ -11659,6 +11659,15 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // atomicAdd path stays the DEFAULT (non-deterministic mode); the deterministic variant is
         // opt-in only. (Defense-in-depth atop AiDotNet#1819, which fixed the actual observed
         // repro — the minibatch-shuffle seed; #742 makes the guarantee hardware-independent.)
+#if NET5_0_OR_GREATER
+        DirectPtxScalarScatterAddMode directMode = GpuDeterminism.IsActive
+            ? DirectPtxScalarScatterAddMode.DeterministicAccumulate
+            : DirectPtxScalarScatterAddMode.Atomic;
+        if (TryDirectPtxScatterAddScalar(
+            source, indices, destination, sourceSize, destSize, directMode))
+            return;
+#endif
+
         using var _ = PushContext();
         IntPtr srcPtr = source.Handle;
         IntPtr idxPtr = indices.Handle;
