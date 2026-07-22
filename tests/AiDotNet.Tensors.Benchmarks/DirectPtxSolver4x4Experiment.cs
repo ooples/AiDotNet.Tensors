@@ -26,7 +26,10 @@ internal static class DirectPtxSolver4x4Experiment
         int Run, string Operation, int Batch, string Method,
         Distribution Device, Distribution EndToEnd, double Gflops, double GbPerSecond,
         long ManagedBytes, long TemporaryDeviceBytes, double MaximumError,
-        int Registers, int SharedBytes, int LocalBytes, int ActiveBlocksPerSm);
+        int Registers, int SharedBytes, int LocalBytes, int MaxThreadsPerBlock,
+        int ActiveBlocksPerSm, int PtxVersion, int BinaryVersion,
+        string DeviceFingerprint, string PtxSha256, string JitInfoLog,
+        string DotNetRuntime, string OperatingSystem);
 
     internal static void Run(int independentRuns = 3)
     {
@@ -133,11 +136,12 @@ internal static class DirectPtxSolver4x4Experiment
             Distribution graphDevice = MeasureDevice(backend, graphLaunch);
             Distribution graphE2e = MeasureEndToEnd(backend, graphLaunch);
             results.Add(Create(run, operation, batch, "Direct PTX CUDA graph", graphDevice,
-                graphE2e, MeasureAllocation(backend, graphLaunch), 0, error, audit));
+                graphE2e, MeasureAllocation(backend, graphLaunch), 0, error, audit,
+                audit.DeviceFingerprint));
         }
         finally { backend.DestroyCapturedGraph(graph); }
         results.Add(Create(run, operation, batch, "Direct PTX resident", directDevice,
-            directE2e, directBytes, 0, error, audit));
+            directE2e, directBytes, 0, error, audit, audit.DeviceFingerprint));
 
         if (current is not null)
         {
@@ -152,7 +156,7 @@ internal static class DirectPtxSolver4x4Experiment
             results.Add(Create(run, operation, batch, "AiDotNet CUDA established", currentDevice,
                 currentE2e, MeasureAllocation(backend, current), 0,
                 Error(backend, operation, batch, matrixHost, vectorHost,
-                    matrix1, matrix2, vector, pivots, info), null));
+                    matrix1, matrix2, vector, pivots, info), null, audit.DeviceFingerprint));
         }
         Enable(operation, null);
     }
@@ -165,7 +169,7 @@ internal static class DirectPtxSolver4x4Experiment
     private static Result Create(
         int run, string operation, int batch, string method,
         Distribution device, Distribution e2e, long managedBytes, long tempBytes,
-        double error, DirectPtxKernelAudit? audit)
+        double error, DirectPtxKernelAudit? audit, string deviceFingerprint)
     {
         double flops = EstimatedFlops(operation, batch);
         double seconds = device.Median * 1e-6;
@@ -176,7 +180,12 @@ internal static class DirectPtxSolver4x4Experiment
             audit?.Function.RegistersPerThread ?? -1,
             audit?.Function.StaticSharedBytes ?? -1,
             audit?.Function.LocalBytesPerThread ?? -1,
-            audit?.ActiveBlocksPerMultiprocessor ?? -1);
+            audit?.Function.MaxThreadsPerBlock ?? -1,
+            audit?.ActiveBlocksPerMultiprocessor ?? -1,
+            audit?.Function.PtxVersion ?? -1,
+            audit?.Function.BinaryVersion ?? -1,
+            deviceFingerprint, audit?.PtxSha256 ?? "-", audit?.JitInfoLog ?? "-",
+            Environment.Version.ToString(), Environment.OSVersion.ToString());
     }
 
     private static Distribution MeasureDevice(CudaBackend backend, Action action)
@@ -502,6 +511,8 @@ internal static class DirectPtxSolver4x4Experiment
 
     private static void Print(IReadOnlyList<Result> results)
     {
+        foreach (string fingerprint in results.Select(row => row.DeviceFingerprint).Distinct())
+            Console.WriteLine($"solver_environment={fingerprint}; dotnet={Environment.Version}; os={Environment.OSVersion}");
         Console.WriteLine(
             $"{"Run",3} {"Operation",11} {"Batch",7} {"Method",25} {"dev mean",9} {"dev med",9} " +
             $"{"dev P95",9} {"dev P99",9} {"E2E mean",9} {"E2E med",9} {"E2E P95",9} {"E2E P99",9} " +

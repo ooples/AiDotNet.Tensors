@@ -4,6 +4,7 @@
 import argparse
 import json
 import math
+import platform
 import statistics
 import time
 
@@ -18,6 +19,21 @@ OPERATIONS = (
     "cholesky", "lu-factor", "qr", "eigh", "eigh-lower", "svd", "lu-solve",
     "ldl-factor", "ldl-solve", "solve", "tri-lower", "tri-upper",
     "chol-backward", "solve-backward")
+
+
+def environment():
+    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    driver = torch.cuda.driver_version() if hasattr(torch.cuda, "driver_version") else None
+    return {
+        "gpu": properties.name,
+        "gpu_uuid": str(getattr(properties, "uuid", "unavailable")),
+        "compute_capability": f"{properties.major}.{properties.minor}",
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "driver": driver,
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+    }
 
 
 def percentile(values, fraction):
@@ -239,8 +255,7 @@ def emit(run, operation, batch, method, device, e2e, temporary, error):
         "gflops": flops(operation, batch) / (device["median_us"] * 1e-6) / 1e9,
         "gb_per_second": bytes_moved(operation, batch) / (device["median_us"] * 1e-6) / 1e9,
         "managed_bytes": 0, "temporary_device_bytes": temporary, "max_error": error,
-        "gpu": torch.cuda.get_device_name(), "torch": torch.__version__,
-        "cuda": torch.version.cuda, "driver": torch.cuda.driver_version() if hasattr(torch.cuda, "driver_version") else None,
+        **environment(),
     }
     print(json.dumps(record, separators=(",", ":")), flush=True)
 
@@ -249,8 +264,7 @@ def emit_unavailable(run, operation, batch, method, error):
     print(json.dumps({
         "status": "unavailable", "run": run, "operation": operation,
         "batch": batch, "method": method, "reason": str(error),
-        "gpu": torch.cuda.get_device_name(), "torch": torch.__version__,
-        "cuda": torch.version.cuda,
+        **environment(),
     }, separators=(",", ":")), flush=True)
 
 
