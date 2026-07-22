@@ -14,7 +14,7 @@ public class DirectPtxScientificTests
     [Fact]
     public void ScientificCoverageManifest_AssignsEveryScopedApiExactlyOnce()
     {
-        Assert.Equal(17, DirectPtxScientificCoverageManifest.All.Count);
+        Assert.Equal(19, DirectPtxScientificCoverageManifest.All.Count);
         string[] names = DirectPtxScientificCoverageManifest.All.Select(c => c.Api).ToArray();
         Assert.Contains("CudaBackend.RbfForward", names);
         Assert.Contains("CudaBackend.PairwiseDistance", names);
@@ -23,6 +23,8 @@ public class DirectPtxScientificTests
         Assert.Contains("CudaBackend.ComplexMatVec", names);
         Assert.Contains("CudaBackend.SphericalHarmonics", names);
         Assert.Contains("CudaBackend.SphericalHarmonicsBackward", names);
+        Assert.Contains("CudaBackend.CapsulePredictions", names);
+        Assert.Contains("CudaBackend.CapsuleTransform", names);
         Assert.Equal(names.Length, names.Distinct(StringComparer.Ordinal).Count());
         Assert.All(DirectPtxScientificCoverageManifest.All, cell =>
         {
@@ -673,6 +675,81 @@ public class DirectPtxScientificTests
         AssertVectorClose(actual, expected, 3e-3f, "spherical harmonics backward");
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void CapsuleContractionEmitter_IsThreadPerOutputSerialContraction(bool predictions)
+    {
+        DirectPtxCapsuleOp op = predictions ? DirectPtxCapsuleOp.Predictions : DirectPtxCapsuleOp.Transform;
+        // B=2, I=4, K=8, C=4, D=8 -> outputs = 2*4*4*8 = 512 (multiple of 256).
+        string ptx = PtxCapsuleContractionKernel.EmitPtx(8, 6, op, 2, 4, 8, 4, 8);
+        Assert.Contains(PtxCapsuleContractionKernel.EntryPointFor(op), ptx);
+        Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));    // input[b,i,k] + weights[...] in the loop
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.Equal(1, Count(ptx, "fma.rn.f32"));           // contraction MAC
+        Assert.Contains("$CAPS_K_LOOP:", ptx);
+        Assert.Contains("rem.u32 %r3, %r2, 8", ptx);         // d = idx % outputDim
+        Assert.Equal(0, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        // Predictions weight k-stride = D = 8 -> "add.u64 %rd7, %rd7, 32"; Transform k-stride = C*D = 32 -> "128".
+        Assert.Contains(op == DirectPtxCapsuleOp.Predictions ? "add.u64 %rd7, %rd7, 32" : "add.u64 %rd7, %rd7, 128", ptx);
+        Assert.True(PtxCapsuleContractionKernel.IsSupportedShape(2, 4, 8, 4, 8));
+        Assert.False(PtxCapsuleContractionKernel.IsSupportedShape(2, 3, 8, 4, 8));   // 2*3*4*8=192 not mult of 256
+        Assert.False(PtxCapsuleContractionKernel.IsPromotedShape(2, 4, 8, 4, 8));
+    }
+
+    [SkippableTheory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void DriverOnlyCapsuleContraction_MatchesOracle(bool predictions)
+    {
+        DirectPtxCapsuleOp op = predictions ? DirectPtxCapsuleOp.Predictions : DirectPtxCapsuleOp.Transform;
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in capsule-contraction specialization is measured on GA10x/SM86.");
+        const int b = 4, inCaps = 8, inDim = 12, outCount = 8, outDim = 8;   // outputs = 4*8*8*8 = 2048
+        using var kernel = new PtxCapsuleContractionKernel(runtime, op, b, inCaps, inDim, outCount, outDim);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20267700);
+        float[] input = Values(random, b * inCaps * inDim, 1.0f);
+        float[] weights = Values(random, inCaps * outCount * inDim * outDim, 1.0f);
+        var expected = new float[b * inCaps * outCount * outDim];
+        for (int bi = 0; bi < b; bi++)
+            for (int i = 0; i < inCaps; i++)
+                for (int cj = 0; cj < outCount; cj++)
+                    for (int d = 0; d < outDim; d++)
+                    {
+                        double sum = 0;
+                        for (int k = 0; k < inDim; k++)
+                        {
+                            int inputIdx = bi * inCaps * inDim + i * inDim + k;
+                            int weightIdx = op == DirectPtxCapsuleOp.Predictions
+                                ? i * outCount * inDim * outDim + cj * inDim * outDim + k * outDim + d
+                                : i * inDim * outCount * outDim + k * outCount * outDim + cj * outDim + d;
+                            sum += input[inputIdx] * weights[weightIdx];
+                        }
+                        expected[bi * inCaps * outCount * outDim + i * outCount * outDim + cj * outDim + d] = (float)sum;
+                    }
+
+        using var inBuf = runtime.AllocateBytes((nuint)(input.Length * sizeof(float)));
+        using var wBuf = runtime.AllocateBytes((nuint)(weights.Length * sizeof(float)));
+        using var outBuf = runtime.AllocateBytes((nuint)(expected.Length * sizeof(float)));
+        inBuf.Upload<float>(input);
+        wBuf.Upload<float>(weights);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(inBuf, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(wBuf, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(outBuf, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[expected.Length];
+        outBuf.Download<float>(actual);
+        AssertVectorClose(actual, expected, 3e-3f, $"capsule {op}");
+    }
+
     // CPU mirror of the NVRTC spherical_harmonics basis table.
     private static float[] ShBasisOracle(float dx, float dy, float dz, int degree)
     {
@@ -1273,6 +1350,37 @@ public class DirectPtxScientificTests
             using (var cb = backend.AllocateBuffer(shCoeff)) using (var db = backend.AllocateBuffer(shDirs))
             using (var gb = backend.AllocateBuffer(shOutGrad)) using (var sg = backend.AllocateBuffer(shPoints * shBasis * shChannels))
             { backend.SphericalHarmonicsBackward(cb, db, gb, sg, shPoints, shBasis, shChannels, shDegree, 0); n = AssertDispatched(n, "spherical-harmonics-backward"); AssertVectorClose(backend.DownloadBuffer(sg), shGradExp, 3e-3f, "spherical-harmonics-backward route"); }
+
+            // Capsule predictions + transform: outputs = B*I*C*D = 4*8*8*8 = 2048.
+            const int capB = 4, capI = 8, capK = 12, capC = 8, capD = 8;
+            float[] capIn = Values(random, capB * capI * capK, 1.0f);
+            float[] capW = Values(random, capI * capC * capK * capD, 1.0f);
+            float[] CapExpect(bool predictions)
+            {
+                var e = new float[capB * capI * capC * capD];
+                for (int bi = 0; bi < capB; bi++)
+                    for (int i = 0; i < capI; i++)
+                        for (int cj = 0; cj < capC; cj++)
+                            for (int d = 0; d < capD; d++)
+                            {
+                                double sum = 0;
+                                for (int k = 0; k < capK; k++)
+                                {
+                                    int inIdx = bi * capI * capK + i * capK + k;
+                                    int wIdx = predictions
+                                        ? i * capC * capK * capD + cj * capK * capD + k * capD + d
+                                        : i * capK * capC * capD + k * capC * capD + cj * capD + d;
+                                    sum += capIn[inIdx] * capW[wIdx];
+                                }
+                                e[bi * capI * capC * capD + i * capC * capD + cj * capD + d] = (float)sum;
+                            }
+                return e;
+            }
+            float[] capPredExp = CapExpect(true), capTransExp = CapExpect(false);
+            using (var ib = backend.AllocateBuffer(capIn)) using (var wb = backend.AllocateBuffer(capW)) using (var o = backend.AllocateBuffer(capB * capI * capC * capD))
+            { backend.CapsulePredictions(ib, wb, o, capB, capI, capK, capC, capD); n = AssertDispatched(n, "capsule-predictions"); AssertVectorClose(backend.DownloadBuffer(o), capPredExp, 3e-3f, "capsule-predictions route"); }
+            using (var ib = backend.AllocateBuffer(capIn)) using (var wb = backend.AllocateBuffer(capW)) using (var o = backend.AllocateBuffer(capB * capI * capC * capD))
+            { backend.CapsuleTransform(ib, wb, o, capB, capI, capK, capC, capD); n = AssertDispatched(n, "capsule-transform"); AssertVectorClose(backend.DownloadBuffer(o), capTransExp, 3e-3f, "capsule-transform route"); }
         }
         finally
         {

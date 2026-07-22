@@ -24,6 +24,7 @@ public sealed partial class CudaBackend
     private readonly record struct SciPairwiseKey(int M, int N, int Dim, bool Squared);
     private readonly record struct SciMatVecKey(int Batch, int Dim);
     private readonly record struct SciShKey(int NumPoints, int BasisCount, int NumChannels, int Degree, bool BroadcastDir);
+    private readonly record struct SciCapsuleKey(DirectPtxCapsuleOp Op, int Batch, int InputCapsules, int InputDim, int OutputCount, int OutputDim);
 
     private readonly DirectPtxKernelCache<SciCountKey, PtxComplexMultiplyKernel> _sciComplexMul =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
@@ -56,6 +57,8 @@ public sealed partial class CudaBackend
     private readonly DirectPtxKernelCache<SciShKey, PtxSphericalHarmonicsKernel> _sciSphericalHarmonics =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<SciShKey, PtxSphericalHarmonicsBackwardKernel> _sciSphericalHarmonicsBwd =
+        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<SciCapsuleKey, PtxCapsuleContractionKernel> _sciCapsuleContraction =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
 
     private long _sciDispatchCount;
@@ -295,6 +298,39 @@ public sealed partial class CudaBackend
                 (vc, vd, vg, vs) => k.Launch(vc, vd, vg, vs));
         });
     }
+
+    private bool TryDirectPtxCapsuleContraction(
+        DirectPtxCapsuleOp op, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer output,
+        int batchSize, int inputCapsules, int inputDim, int outputCount, int outputDim)
+    {
+        string tag = op == DirectPtxCapsuleOp.Predictions ? "capsule-predictions" : "capsule-transform";
+        if (!ScientificGateOpen ||
+            !PtxCapsuleContractionKernel.IsSupportedShape(batchSize, inputCapsules, inputDim, outputCount, outputDim)) return Fail(tag);
+        long inputBytes = checked((long)batchSize * inputCapsules * inputDim * sizeof(float));
+        long weightBytes = checked((long)inputCapsules * outputCount * inputDim * outputDim * sizeof(float));
+        long outputBytes = checked((long)batchSize * inputCapsules * outputCount * outputDim * sizeof(float));
+        if (input.SizeInBytes != inputBytes || weights.SizeInBytes != weightBytes ||
+            output.SizeInBytes != outputBytes) return Fail($"{tag}-extent");
+        return SciDispatch(() =>
+        {
+            var k = _sciCapsuleContraction.GetOrAdd(
+                new SciCapsuleKey(op, batchSize, inputCapsules, inputDim, outputCount, outputDim),
+                () => new PtxCapsuleContractionKernel(_directPtxRuntime!, op, batchSize, inputCapsules, inputDim, outputCount, outputDim));
+            Launch3(k.Blueprint, input, weights, output, (vi, vw, vo) => k.Launch(vi, vw, vo));
+        });
+    }
+
+    internal bool TryDirectPtxCapsulePredictions(
+        IGpuBuffer input, IGpuBuffer weights, IGpuBuffer output,
+        int batchSize, int inputCapsules, int inputDim, int outputCapsules, int outputDim) =>
+        TryDirectPtxCapsuleContraction(DirectPtxCapsuleOp.Predictions, input, weights, output,
+            batchSize, inputCapsules, inputDim, outputCapsules, outputDim);
+
+    internal bool TryDirectPtxCapsuleTransform(
+        IGpuBuffer input, IGpuBuffer weights, IGpuBuffer output,
+        int batchSize, int inputCapsules, int inputDim, int numCapsules, int capsuleDim) =>
+        TryDirectPtxCapsuleContraction(DirectPtxCapsuleOp.Transform, input, weights, output,
+            batchSize, inputCapsules, inputDim, numCapsules, capsuleDim);
 
     private bool Fail(string reason)
     {

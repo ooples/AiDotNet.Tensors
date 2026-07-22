@@ -3317,6 +3317,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void CapsulePredictions(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer output,
         int batchSize, int inputCapsules, int inputDim, int outputCapsules, int outputDim)
     {
+        if (TryDirectPtxCapsulePredictions(input, weights, output, batchSize, inputCapsules, inputDim, outputCapsules, outputDim)) return;
+
         if (!_kernelCache.TryGetValue("capsule_predictions", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: capsule_predictions");
 
@@ -3346,6 +3348,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void CapsuleTransform(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer output,
         int batchSize, int inputCapsules, int inputDim, int numCapsules, int capsuleDim)
     {
+        if (TryDirectPtxCapsuleTransform(input, weights, output, batchSize, inputCapsules, inputDim, numCapsules, capsuleDim)) return;
+
         if (!_kernelCache.TryGetValue("capsule_transform", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: capsule_transform");
 
