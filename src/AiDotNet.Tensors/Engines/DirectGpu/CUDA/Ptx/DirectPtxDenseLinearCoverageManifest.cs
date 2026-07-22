@@ -41,7 +41,7 @@ internal static class DirectPtxDenseLinearCoverageManifest
         Cell("CudaBackend.GemmAsync", "cuBLAS SGEMM on caller stream", "asynchronous C=alpha*A@B+beta*C", Dense, "FP32", PlannedGemm),
         Cell("CudaBackend.MatMul", "allocated output plus CudaBackend.Gemm", "C=A@B", Dense, "FP32", PlannedGemm),
         Cell("CudaBackend.MatMulTransposed", "cuBLAS SGEMM", "C=A@transpose(B)", "A[M,K], output-major B[N,K], C[M,N]", "FP32", PlannedGemm),
-        Cell("CudaBackend.BatchedGemm", "cuBLAS strided-batched SGEMM", "independent dense batches", "contiguous strided [batch,M,K]/[batch,K,N]", "FP32", PlannedGemm),
+        Cell("CudaBackend.BatchedGemm", "cuBLAS strided-batched SGEMM", "independent dense batches", "contiguous strided [batch,M,K]/[batch,K,N]", "FP32", "direct PTX strided-batched tile (PtxBatchedGemmKernel); fail-closed pending GPU validation", DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx),
         Cell("CudaBackend.BatchedGemmFanout", "cuBLAS batched pointer fanout", "one A with multiple B/C products", "contiguous A plus pointer-array B/C", "FP32", PlannedGemm),
         Cell("CudaBackend.BatchedGemmExFanout", "cuBLAS GemmEx pointer fanout", "mixed-precision fanout products", "contiguous A plus pointer-array B/C", "FP16/BF16/FP32", PlannedGemm),
         Cell("CudaBackend.GemmFp16", "cuBLAS GemmEx", "FP16 inputs with FP32 output contract", Dense, "FP16->FP32", PlannedGemm),
