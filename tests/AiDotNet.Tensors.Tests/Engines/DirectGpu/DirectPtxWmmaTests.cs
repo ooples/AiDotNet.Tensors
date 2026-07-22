@@ -2057,9 +2057,20 @@ public class DirectPtxWmmaTests
                     input, weights, bias, cosine, sine, query, keyCache, valueCache,
                     heads, cacheCapacity, position));
             Assert.True(captureLaunch, backend.DirectPtxLastError);
-            try { backend.LaunchCapturedGraph(graph); }
+            try
+            {
+                for (int i = 0; i < 8; i++)
+                    backend.EnqueueCapturedGraph(graph);
+                backend.Synchronize();
+                long graphBefore = GC.GetAllocatedBytesForCurrentThread();
+                for (int i = 0; i < 32; i++)
+                    backend.EnqueueCapturedGraph(graph);
+                long graphAllocated =
+                    GC.GetAllocatedBytesForCurrentThread() - graphBefore;
+                backend.Synchronize();
+                Assert.Equal(0, graphAllocated);
+            }
             finally { backend.DestroyCapturedGraph(graph); }
-            backend.Synchronize();
 
             Assert.True(backend.TryGetDirectPtxQkvRopeCacheAudit(
                 heads, cacheCapacity, position, out DirectPtxKernelAudit audit));

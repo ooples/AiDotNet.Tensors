@@ -20,10 +20,13 @@ internal static class DirectPtxQkvRopeCacheExperiment
     private readonly record struct CellEvidence(
         int Run,
         Shape Shape,
+        Distribution GraphDevice,
+        Distribution GraphEndToEnd,
         Distribution DirectDevice,
         Distribution CurrentDevice,
         Distribution DirectEndToEnd,
         Distribution CurrentEndToEnd,
+        long GraphBytes,
         long DirectBytes,
         long CurrentBytes,
         double DirectError,
@@ -143,30 +146,47 @@ internal static class DirectPtxQkvRopeCacheExperiment
         double currentError = MaximumError(
             backend, currentQuery, currentKeyCache, currentValueCache,
             expectedQ, expectedK, expectedV);
-        Distribution directDevice = MeasureDevice(backend, DirectLaunch);
-        Distribution currentDevice = MeasureDevice(backend, CurrentLaunch);
-        Distribution directEndToEnd = MeasureEndToEnd(backend, DirectLaunch);
-        Distribution currentEndToEnd = MeasureEndToEnd(backend, CurrentLaunch);
-        long directBytes = MeasureAllocation(backend, DirectLaunch);
-        long currentBytes = MeasureAllocation(backend, CurrentLaunch);
-        const long expectedDirectDispatches =
-            1L + Warmups + Samples * LaunchesPerDeviceSample +
-            Warmups + Samples + 8L + Samples;
-        long actualDirectDispatches =
-            backend.DirectPtxQkvRopeCacheDispatchCount - directDispatchBefore;
-        if (actualDirectDispatches != expectedDirectDispatches ||
-            backend.DirectPtxLastError is not null)
+        IntPtr graph = backend.CaptureGraph(DirectLaunch);
+        if (graph == IntPtr.Zero)
             throw new InvalidOperationException(
-                $"Direct PTX routing was not exclusive for {shape.Name}: " +
-                $"expected {expectedDirectDispatches} dispatches, observed " +
-                $"{actualDirectDispatches}; last error={backend.DirectPtxLastError ?? "none"}.");
-        if (!backend.TryGetDirectPtxQkvRopeCacheAudit(
-            shape.Heads, shape.Capacity, shape.Position, out DirectPtxKernelAudit audit))
-            throw new InvalidOperationException("No audit for measured QKV/RoPE/cache module.");
+                $"Could not capture the public direct-PTX route for {shape.Name}.");
+        try
+        {
+            void GraphLaunch() => backend.EnqueueCapturedGraph(graph);
 
-        return new CellEvidence(
-            run, shape, directDevice, currentDevice, directEndToEnd, currentEndToEnd,
-            directBytes, currentBytes, directError, currentError, audit);
+            Distribution graphDevice = MeasureDevice(backend, GraphLaunch);
+            Distribution directDevice = MeasureDevice(backend, DirectLaunch);
+            Distribution currentDevice = MeasureDevice(backend, CurrentLaunch);
+            Distribution graphEndToEnd = MeasureEndToEnd(backend, GraphLaunch);
+            Distribution directEndToEnd = MeasureEndToEnd(backend, DirectLaunch);
+            Distribution currentEndToEnd = MeasureEndToEnd(backend, CurrentLaunch);
+            long graphBytes = MeasureAllocation(backend, GraphLaunch);
+            long directBytes = MeasureAllocation(backend, DirectLaunch);
+            long currentBytes = MeasureAllocation(backend, CurrentLaunch);
+            const long expectedDirectDispatches =
+                2L + Warmups + Samples * LaunchesPerDeviceSample +
+                Warmups + Samples + 8L + Samples;
+            long actualDirectDispatches =
+                backend.DirectPtxQkvRopeCacheDispatchCount - directDispatchBefore;
+            if (actualDirectDispatches != expectedDirectDispatches ||
+                backend.DirectPtxLastError is not null)
+                throw new InvalidOperationException(
+                    $"Direct PTX routing was not exclusive for {shape.Name}: " +
+                    $"expected {expectedDirectDispatches} dispatches, observed " +
+                    $"{actualDirectDispatches}; last error={backend.DirectPtxLastError ?? "none"}.");
+            if (!backend.TryGetDirectPtxQkvRopeCacheAudit(
+                shape.Heads, shape.Capacity, shape.Position, out DirectPtxKernelAudit audit))
+                throw new InvalidOperationException("No audit for measured QKV/RoPE/cache module.");
+
+            return new CellEvidence(
+                run, shape, graphDevice, graphEndToEnd,
+                directDevice, currentDevice, directEndToEnd, currentEndToEnd,
+                graphBytes, directBytes, currentBytes, directError, currentError, audit);
+        }
+        finally
+        {
+            backend.DestroyCapturedGraph(graph);
+        }
     }
 
     private static void PrintGrouped(
@@ -180,6 +200,13 @@ internal static class DirectPtxQkvRopeCacheExperiment
         {
             CellEvidence cell = evidence.Single(candidate =>
                 candidate.Run == run && candidate.Shape == shape);
+            Print(run, shape, "Direct PTX CUDA graph", cell.GraphDevice,
+                cell.GraphEndToEnd, Tflops(shape, cell.GraphDevice.Median),
+                cell.GraphBytes, 0, cell.DirectError,
+                cell.Audit.Function.RegistersPerThread,
+                cell.Audit.Function.StaticSharedBytes,
+                cell.Audit.Function.LocalBytesPerThread,
+                cell.Audit.ActiveBlocksPerMultiprocessor);
             Print(run, shape, "Direct PTX fused", cell.DirectDevice, cell.DirectEndToEnd,
                 Tflops(shape, cell.DirectDevice.Median), cell.DirectBytes, 0,
                 cell.DirectError, cell.Audit.Function.RegistersPerThread,
@@ -397,18 +424,18 @@ internal static class DirectPtxQkvRopeCacheExperiment
             cell.Audit.Function.StaticSharedBytes == 0 &&
             cell.Audit.Function.LocalBytesPerThread == 0 &&
             cell.Audit.ActiveBlocksPerMultiprocessor >= 8);
-        bool allocation = evidence.All(cell => cell.DirectBytes == 0);
+        bool allocation = evidence.All(cell => cell.GraphBytes == 0 && cell.DirectBytes == 0);
         bool currentChampion = evidence.All(cell =>
-            cell.CurrentDevice.Median / cell.DirectDevice.Median >= 1.10 &&
-            cell.DirectDevice.P95 <= cell.CurrentDevice.P95 * 1.10 &&
-            cell.CurrentEndToEnd.Median / cell.DirectEndToEnd.Median >= 1.10);
+            cell.CurrentDevice.Median / cell.GraphDevice.Median >= 1.10 &&
+            cell.GraphDevice.P95 <= cell.CurrentDevice.P95 * 1.10 &&
+            cell.CurrentEndToEnd.Median / cell.GraphEndToEnd.Median >= 1.10);
         bool pythonChampion = !includeExternal || python.Where(record => record.Status == "ok").All(peer =>
         {
             CellEvidence cell = evidence.Single(candidate =>
                 candidate.Run == peer.Run && candidate.Shape.Name == peer.Shape);
-            return peer.DeviceMedianUs / cell.DirectDevice.Median >= 1.10 &&
-                cell.DirectDevice.P95 <= peer.DeviceP95Us * 1.10 &&
-                peer.EndToEndMedianUs / cell.DirectEndToEnd.Median >= 1.10;
+            return peer.DeviceMedianUs / cell.GraphDevice.Median >= 1.10 &&
+                cell.GraphDevice.P95 <= peer.DeviceP95Us * 1.10 &&
+                peer.EndToEndMedianUs / cell.GraphEndToEnd.Median >= 1.10;
         });
         Console.WriteLine(new string('-', 203));
         foreach (CellEvidence cell in evidence)
@@ -417,13 +444,13 @@ internal static class DirectPtxQkvRopeCacheExperiment
                 record.Status == "ok" && record.Run == cell.Run &&
                 record.Shape == cell.Shape.Name).ToArray();
             double pythonDevice = peers.Length == 0 ? 0 :
-                peers.Min(peer => peer.DeviceMedianUs / cell.DirectDevice.Median);
+                peers.Min(peer => peer.DeviceMedianUs / cell.GraphDevice.Median);
             double pythonEndToEnd = peers.Length == 0 ? 0 :
-                peers.Min(peer => peer.EndToEndMedianUs / cell.DirectEndToEnd.Median);
+                peers.Min(peer => peer.EndToEndMedianUs / cell.GraphEndToEnd.Median);
             Console.WriteLine(
                 $"gate run {cell.Run} {cell.Shape.Name}: " +
-                $"vs AiDotNet {cell.CurrentDevice.Median / cell.DirectDevice.Median:F2}x device, " +
-                $"{cell.CurrentEndToEnd.Median / cell.DirectEndToEnd.Median:F2}x E2E; " +
+                $"vs AiDotNet {cell.CurrentDevice.Median / cell.GraphDevice.Median:F2}x device, " +
+                $"{cell.CurrentEndToEnd.Median / cell.GraphEndToEnd.Median:F2}x E2E; " +
                 (peers.Length == 0
                     ? "PyTorch missing"
                     : $"vs strongest PyTorch {pythonDevice:F2}x device, " +

@@ -57,8 +57,8 @@ function Assert-QkvReleaseGate([string]$Root, [int]$RunCount, [bool]$IncludeExte
         $prefix = 'run-{0:D2}' -f $run
         $dotnetPath = Join-Path $Root ($prefix + '-qkv-rope-cache.log')
         $dotnetRows = @(Read-QkvDotnetRows $dotnetPath)
-        if ($dotnetRows.Count -ne 6) {
-            throw "QKV release gate expected 6 .NET rows in '$dotnetPath'; found $($dotnetRows.Count)."
+        if ($dotnetRows.Count -ne 9) {
+            throw "QKV release gate expected 9 .NET rows in '$dotnetPath'; found $($dotnetRows.Count)."
         }
         $pythonRows = @()
         if ($IncludeExternal) {
@@ -71,22 +71,28 @@ function Assert-QkvReleaseGate([string]$Root, [int]$RunCount, [bool]$IncludeExte
 
         foreach ($shape in $shapes) {
             $direct = @($dotnetRows | Where-Object {
+                $_.shape -eq $shape -and $_.method -eq 'Direct PTX CUDA graph'
+            })
+            $directEager = @($dotnetRows | Where-Object {
                 $_.shape -eq $shape -and $_.method -eq 'Direct PTX fused'
             })
             $current = @($dotnetRows | Where-Object {
                 $_.shape -eq $shape -and $_.method -eq 'AiDotNet cuBLAS+NVRTC'
             })
-            if ($direct.Count -ne 1 -or $current.Count -ne 1) {
+            if ($direct.Count -ne 1 -or $directEager.Count -ne 1 -or $current.Count -ne 1) {
                 throw "QKV release gate has an incomplete or duplicate .NET method set for run $run '$shape'."
             }
             $candidate = $direct[0]
-            if ([double]$candidate.max_error -gt 2e-5 -or
-                [long]$candidate.managed_bytes -ne 0 -or
-                [long]$candidate.temporary_device_bytes -ne 0 -or
-                [int]$candidate.registers_per_thread -gt 48 -or
-                [int]$candidate.static_shared_bytes -ne 0 -or
-                [int]$candidate.local_bytes_per_thread -ne 0 -or
-                [int]$candidate.active_blocks_per_sm -lt 8) {
+            $candidateRows = @($candidate, $directEager[0])
+            if (@($candidateRows | Where-Object {
+                [double]$_.max_error -gt 2e-5 -or
+                [long]$_.managed_bytes -ne 0 -or
+                [long]$_.temporary_device_bytes -ne 0 -or
+                [int]$_.registers_per_thread -gt 48 -or
+                [int]$_.static_shared_bytes -ne 0 -or
+                [int]$_.local_bytes_per_thread -ne 0 -or
+                [int]$_.active_blocks_per_sm -lt 8
+            }).Count -ne 0) {
                 throw "QKV release resource/correctness gate failed for run $run '$shape'."
             }
 
