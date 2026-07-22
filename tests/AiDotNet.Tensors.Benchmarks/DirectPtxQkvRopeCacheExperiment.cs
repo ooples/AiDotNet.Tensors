@@ -26,8 +26,8 @@ internal static class DirectPtxQkvRopeCacheExperiment
         Distribution CurrentEndToEnd,
         long DirectBytes,
         long CurrentBytes,
-        float DirectError,
-        float CurrentError,
+        double DirectError,
+        double CurrentError,
         DirectPtxKernelAudit Audit);
     private sealed record PythonRecord(
         string Status,
@@ -95,7 +95,7 @@ internal static class DirectPtxQkvRopeCacheExperiment
         (float[] cosineHost, float[] sineHost) = RopeTables(shape.Capacity);
         float[] initialKeyCache = Values(random, cacheElements, 0.125f);
         float[] initialValueCache = Values(random, cacheElements, 0.125f);
-        (float[] expectedQ, float[] expectedK, float[] expectedV) = Oracle(
+        (double[] expectedQ, double[] expectedK, double[] expectedV) = Oracle(
             inputHost, weightsHost, biasHost, cosineHost, sineHost,
             initialKeyCache, initialValueCache, shape);
 
@@ -139,10 +139,10 @@ internal static class DirectPtxQkvRopeCacheExperiment
         DirectLaunch();
         CurrentLaunch();
         backend.Synchronize();
-        float directError = MaximumError(
+        double directError = MaximumError(
             backend, directQuery, directKeyCache, directValueCache,
             expectedQ, expectedK, expectedV);
-        float currentError = MaximumError(
+        double currentError = MaximumError(
             backend, currentQuery, currentKeyCache, currentValueCache,
             expectedQ, expectedK, expectedV);
         Distribution directDevice = MeasureDevice(backend, DirectLaunch);
@@ -410,25 +410,25 @@ internal static class DirectPtxQkvRopeCacheExperiment
         return flops / (microseconds * 1e-6) / 1e12;
     }
 
-    private static float MaximumError(
+    private static double MaximumError(
         CudaBackend backend,
         IGpuBuffer query,
         IGpuBuffer keyCache,
         IGpuBuffer valueCache,
-        float[] expectedQuery,
-        float[] expectedKey,
-        float[] expectedValue)
+        double[] expectedQuery,
+        double[] expectedKey,
+        double[] expectedValue)
     {
-        float error = 0;
+        double error = 0;
         Update(backend.DownloadBuffer(query), expectedQuery);
         Update(backend.DownloadBuffer(keyCache), expectedKey);
         Update(backend.DownloadBuffer(valueCache), expectedValue);
         return error;
 
-        void Update(float[] actual, float[] expected)
+        void Update(float[] actual, double[] expected)
         {
             for (int i = 0; i < expected.Length; i++)
-                error = MathF.Max(error, MathF.Abs(actual[i] - expected[i]));
+                error = Math.Max(error, Math.Abs(actual[i] - expected[i]));
         }
     }
 
@@ -451,7 +451,7 @@ internal static class DirectPtxQkvRopeCacheExperiment
         return (cosine, sine);
     }
 
-    private static (float[] Query, float[] KeyCache, float[] ValueCache) Oracle(
+    private static (double[] Query, double[] KeyCache, double[] ValueCache) Oracle(
         float[] input,
         float[] weights,
         float[] bias,
@@ -462,18 +462,18 @@ internal static class DirectPtxQkvRopeCacheExperiment
         Shape shape)
     {
         int model = shape.Heads * Dimension;
-        var projection = new float[3 * model];
+        var projection = new double[3 * model];
         for (int output = 0; output < projection.Length; output++)
         {
-            float sum = bias[output];
+            double sum = bias[output];
             int weightBase = output * model;
             for (int inner = 0; inner < model; inner++)
-                sum += input[inner] * weights[weightBase + inner];
+                sum += (double)input[inner] * weights[weightBase + inner];
             projection[output] = sum;
         }
-        var query = new float[model];
-        var keyCache = (float[])initialKeyCache.Clone();
-        var valueCache = (float[])initialValueCache.Clone();
+        var query = new double[model];
+        var keyCache = Array.ConvertAll(initialKeyCache, value => (double)value);
+        var valueCache = Array.ConvertAll(initialValueCache, value => (double)value);
         int cacheBase = shape.Position * model;
         int ropeBase = shape.Position * (Dimension / 2);
         for (int head = 0; head < shape.Heads; head++)
@@ -481,10 +481,10 @@ internal static class DirectPtxQkvRopeCacheExperiment
         {
             int feature = pair * 2;
             int index = head * Dimension + feature;
-            float c = cosine[ropeBase + pair];
-            float s = sine[ropeBase + pair];
-            float qe = projection[index], qo = projection[index + 1];
-            float ke = projection[model + index], ko = projection[model + index + 1];
+            double c = cosine[ropeBase + pair];
+            double s = sine[ropeBase + pair];
+            double qe = projection[index], qo = projection[index + 1];
+            double ke = projection[model + index], ko = projection[model + index + 1];
             query[index] = qe * c - qo * s;
             query[index + 1] = qe * s + qo * c;
             keyCache[cacheBase + index] = ke * c - ko * s;

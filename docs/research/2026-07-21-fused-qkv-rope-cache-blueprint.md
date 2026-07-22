@@ -137,6 +137,8 @@ warmups and 101 samples. CUDA-event samples average ten resident invocations;
 E2E is one public launch plus synchronization. Allocation and all input/output
 copies are outside timing. `TFLOPS = 6*(H*64)^2/time`, counting three FP32
 projection dot products. Bias/RoPE FLOPs are not inflated into the rate.
+Maximum error is measured against FP64 projection accumulation and FP64
+RoPE/cache arithmetic over the exact FP32 inputs and lookup tables.
 
 The current AiDotNet peer is its actual resident NVIDIA sequence: one cuBLAS
 packed projection, NVRTC BiasAdd, NVRTC interleaved RoPE, and three D2D copies.
