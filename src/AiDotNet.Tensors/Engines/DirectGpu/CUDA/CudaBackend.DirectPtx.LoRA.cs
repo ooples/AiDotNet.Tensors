@@ -7,6 +7,10 @@ public sealed partial class CudaBackend
 {
     private readonly DirectPtxKernelCache<DirectPtxLoRAKey, PtxFusedLoRAKernel>
         _directPtxLoRAKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private long _directPtxLoRADispatchCount;
+
+    internal long DirectPtxLoRADispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxLoRADispatchCount);
 
     private readonly record struct DirectPtxLoRAKey(
         int Batch, int InputFeatures, int Rank, int OutputFeatures, int ScalingBits);
@@ -91,6 +95,7 @@ public sealed partial class CudaBackend
                         DirectPtxTensorView.Create(loraB, kernel.Blueprint.Tensors[3]),
                         DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[4]));
             }
+            System.Threading.Interlocked.Increment(ref _directPtxLoRADispatchCount);
             DirectPtxLastError = null;
             return true;
         }
@@ -163,6 +168,32 @@ public sealed partial class CudaBackend
         audit = null!;
         return false;
     }
+
+    // Compatibility surface for the independently-authored standard-layout
+    // #836 tests. Both names resolve to the same stricter validated backend.
+    internal bool TryDirectPtxFusedLoRAForward(
+        IGpuBuffer input,
+        IGpuBuffer loraA,
+        IGpuBuffer loraB,
+        IGpuBuffer baseOutput,
+        IGpuBuffer output,
+        int m,
+        int k,
+        int n,
+        int rank,
+        float scale) =>
+        TryDirectPtxFusedLoRA(
+            input, baseOutput, loraA, loraB, output,
+            m, k, rank, n, scale);
+
+    internal bool TryGetDirectPtxLoRAAudit(
+        int m,
+        int k,
+        int n,
+        int rank,
+        float scale,
+        out DirectPtxKernelAudit audit) =>
+        TryGetDirectPtxFusedLoRAAudit(m, k, rank, n, scale, out audit);
 
     [System.Runtime.CompilerServices.MethodImpl(
         System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]

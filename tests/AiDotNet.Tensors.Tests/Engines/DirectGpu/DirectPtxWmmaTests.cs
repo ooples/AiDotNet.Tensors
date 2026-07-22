@@ -11,7 +11,7 @@ using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
-public class DirectPtxWmmaTests
+public partial class DirectPtxWmmaTests
 {
     [SkippableTheory]
     [InlineData(16, false)]
@@ -2238,10 +2238,230 @@ public class DirectPtxWmmaTests
         Assert.Equal(DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx,
             DirectPtxDenseLinearCoverageManifest.Get(
                 "CudaBackend.FusedLinearGELUTransposedM1").Status);
+        // The general-M tiled kernel (PtxFusedLinearTiledKernel) now owns the
+        // FusedLinear* forward-activation family.
+        foreach (string api in new[]
+        {
+            "CudaBackend.FusedLinearReLU", "CudaBackend.FusedLinearSigmoid",
+            "CudaBackend.FusedLinearTanh", "CudaBackend.FusedLinearGELU",
+            "CudaBackend.FusedLinearSwish"
+        })
+            Assert.Equal(DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx,
+                DirectPtxDenseLinearCoverageManifest.Get(api).Status);
+        // The public FusedLinear / TensorMatMul routes are wired through the PTX tiles
+        // via fail-closed backend guards.
+        Assert.Equal(DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxDenseLinearCoverageManifest.Get("DirectGpuTensorEngine.FusedLinear").Status);
+        Assert.Equal(DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxDenseLinearCoverageManifest.Get("DirectGpuTensorEngine.TensorMatMul").Status);
+        Assert.Equal(DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxDenseLinearCoverageManifest.Get("DirectGpuTensorEngine.FusedLinearBackward").Status);
+        Assert.Equal(DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxDenseLinearCoverageManifest.Get("DirectGpuTensorEngine.FusedLoRAForward").Status);
+        // Every dense-linear cell now has a direct-PTX owner.
         Assert.DoesNotContain(DirectPtxDenseLinearCoverageManifest.All,
             cell => cell.Status == DirectPtxDenseLinearCoverageStatus.PlannedDirectPtx);
         Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() =>
             DirectPtxDenseLinearCoverageManifest.Get("UnassignedDenseLinearApi"));
+    }
+
+    [SkippableFact]
+    public void Backend_DirectPtxGemm_PrewarmsDispatchesAndAudits()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previous = DirectPtxFeatureGate.TestOverride;
+        bool previousExperiment = DirectPtxFeatureGate.FusedLinearExperimentOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        DirectPtxFeatureGate.FusedLinearExperimentOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxFusedLinearEnabled, "Requires a validated Ampere CUDA backend.");
+            const int m = 64, k = 256, n = 256;
+
+            // Prewarm compiles/caches the module; the audit proves the zero-scratch contract.
+            Assert.True(backend.PrewarmDirectPtxGemm(m, k, n), backend.DirectPtxLastError);
+            Assert.True(backend.TryGetDirectPtxGemmAudit(m, k, n, out DirectPtxKernelAudit audit));
+            Assert.Equal(0, audit.Function.LocalBytesPerThread);
+            Assert.Equal(64, audit.PtxSha256.Length);
+
+            var random = RandomHelper.CreateSeededRandom(20264400);
+            float[] aHost = Values(random, m * k, 0.125f);
+            float[] bHost = Values(random, k * n, 0.0625f);
+            var expected = new float[m * n];
+            for (int row = 0; row < m; row++)
+            for (int col = 0; col < n; col++)
+            {
+                double acc = 0;
+                for (int kk = 0; kk < k; kk++) acc += aHost[row * k + kk] * (double)bHost[kk * n + col];
+                expected[row * n + col] = (float)acc;
+            }
+
+            using var a = backend.AllocateBuffer(aHost);
+            using var b = backend.AllocateBuffer(bHost);
+            using var c = backend.AllocateBuffer(m * n);
+            long before = backend.DirectPtxGemmDispatchCount;
+            Assert.True(backend.TryDirectPtxGemm(a, b, c, m, k, n), backend.DirectPtxLastError);
+            backend.Synchronize();
+            Assert.True(backend.DirectPtxGemmDispatchCount > before);
+            AssertVectorClose(backend.DownloadBuffer(c), expected, 2e-3f, "backend direct-ptx gemm");
+
+            // The public MatMul path routes through the same fail-closed guard.
+            using var mm = backend.MatMul(a, b, m, n, k);
+            AssertVectorClose(backend.DownloadBuffer(mm), expected, 2e-3f, "backend MatMul via direct-ptx");
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previous;
+            DirectPtxFeatureGate.FusedLinearExperimentOverride = previousExperiment;
+        }
+    }
+
+    [SkippableFact]
+    public void Backend_DirectPtxFusedLoRA_DispatchesAndAuditsAcrossRanks()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previous = DirectPtxFeatureGate.TestOverride;
+        bool previousExperiment = DirectPtxFeatureGate.FusedLinearExperimentOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        DirectPtxFeatureGate.FusedLinearExperimentOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxFusedLinearEnabled, "Requires a validated Ampere CUDA backend.");
+            const int m = 64, k = 256, n = 256;
+            const float scale = 0.5f;
+            long before = backend.DirectPtxLoRADispatchCount;
+
+            foreach (int r in PtxFusedLoRAForwardStandardKernel.SupportedRanks)
+            {
+                var random = RandomHelper.CreateSeededRandom(20264500 + r);
+                float[] xHost = Values(random, m * k, 0.125f);
+                float[] aHost = Values(random, k * r, 0.0625f);   // loraA[K,R]
+                float[] bHost = Values(random, r * n, 0.0625f);   // loraB[R,N]
+                float[] baseHost = Values(random, m * n, 0.25f);
+                var z = new double[m * r];
+                for (int row = 0; row < m; row++)
+                for (int t = 0; t < r; t++)
+                {
+                    double acc = 0;
+                    for (int kk = 0; kk < k; kk++) acc += xHost[row * k + kk] * (double)aHost[kk * r + t];
+                    z[row * r + t] = acc;
+                }
+                var expected = new float[m * n];
+                for (int row = 0; row < m; row++)
+                for (int col = 0; col < n; col++)
+                {
+                    double acc = 0;
+                    for (int t = 0; t < r; t++) acc += z[row * r + t] * bHost[t * n + col];
+                    expected[row * n + col] = (float)(baseHost[row * n + col] + scale * acc);
+                }
+
+                using var x = backend.AllocateBuffer(xHost);
+                using var aBuf = backend.AllocateBuffer(aHost);
+                using var bBuf = backend.AllocateBuffer(bHost);
+                using var baseBuf = backend.AllocateBuffer(baseHost);
+                using var output = backend.AllocateBuffer(m * n);
+                Assert.True(
+                    backend.TryDirectPtxFusedLoRAForward(x, aBuf, bBuf, baseBuf, output, m, k, n, r, scale),
+                    backend.DirectPtxLastError);
+                backend.Synchronize();
+                Assert.True(backend.TryGetDirectPtxLoRAAudit(m, k, n, r, scale, out DirectPtxKernelAudit audit));
+                Assert.Equal(0, audit.Function.LocalBytesPerThread);
+                AssertVectorClose(backend.DownloadBuffer(output), expected, 2e-3f, $"backend fused-lora r{r}");
+            }
+            Assert.True(backend.DirectPtxLoRADispatchCount >= before + PtxFusedLoRAForwardStandardKernel.SupportedRanks.Length);
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previous;
+            DirectPtxFeatureGate.FusedLinearExperimentOverride = previousExperiment;
+        }
+    }
+
+    [SkippableTheory]
+    [InlineData(1, false)]  // ReLU, preactivation form
+    [InlineData(3, true)]   // Sigmoid, output form
+    public void Backend_DirectPtxFusedLinearBackward_MatchesAllGradientOracles(
+        int activationValue, bool fromOutput)
+    {
+        var activation = (DirectPtxLinearActivation)activationValue;
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previous = DirectPtxFeatureGate.TestOverride;
+        bool previousExperiment = DirectPtxFeatureGate.FusedLinearExperimentOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        DirectPtxFeatureGate.FusedLinearExperimentOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxFusedLinearEnabled, "Requires a validated Ampere CUDA backend.");
+            const int m = 64, k = 256, n = 256;
+
+            var random = RandomHelper.CreateSeededRandom(20264600 + (int)activation);
+            float[] xHost = Values(random, m * k, 0.125f);            // input[M,K]
+            float[] wHost = Values(random, k * n, 0.0625f);           // weight[K,N] input-major
+            float[] diffHost = Values(random, m * n, 1.0f);           // preact (Z) or output (Y)
+            float[] dyHost = Values(random, m * n, 0.5f);             // gradOutput[M,N]
+
+            // dZ = dY * activation'(diff).
+            var dz = new double[m * n];
+            for (int i = 0; i < dz.Length; i++)
+            {
+                double d = activation switch
+                {
+                    DirectPtxLinearActivation.Relu => diffHost[i] > 0 ? 1.0 : 0.0,
+                    DirectPtxLinearActivation.Sigmoid => diffHost[i] * (1.0 - diffHost[i]), // y(1-y), output form
+                    _ => throw new InvalidOperationException()
+                };
+                dz[i] = dyHost[i] * d;
+            }
+            var expGradInput = new float[m * k];   // dZ[M,N] @ transpose(W[K,N])
+            for (int row = 0; row < m; row++)
+            for (int col = 0; col < k; col++)
+            {
+                double acc = 0;
+                for (int nn = 0; nn < n; nn++) acc += dz[row * n + nn] * (double)wHost[col * n + nn];
+                expGradInput[row * k + col] = (float)acc;
+            }
+            var expGradWeight = new float[k * n];  // transpose(X[M,K]) @ dZ[M,N] -> [K,N]
+            for (int kk = 0; kk < k; kk++)
+            for (int nn = 0; nn < n; nn++)
+            {
+                double acc = 0;
+                for (int row = 0; row < m; row++) acc += xHost[row * k + kk] * dz[row * n + nn];
+                expGradWeight[kk * n + nn] = (float)acc;
+            }
+            var expGradBias = new float[n];        // colsum(dZ)
+            for (int nn = 0; nn < n; nn++)
+            {
+                double acc = 0;
+                for (int row = 0; row < m; row++) acc += dz[row * n + nn];
+                expGradBias[nn] = (float)acc;
+            }
+
+            using var gradOutput = backend.AllocateBuffer(dyHost);
+            using var input = backend.AllocateBuffer(xHost);
+            using var weight = backend.AllocateBuffer(wHost);
+            using var diff = backend.AllocateBuffer(diffHost);
+            using var gradInput = backend.AllocateBuffer(m * k);
+            using var gradWeight = backend.AllocateBuffer(k * n);
+            using var gradBias = backend.AllocateBuffer(n);
+            long before = backend.DirectPtxLinearBackwardDispatchCount;
+            Assert.True(
+                backend.TryDirectPtxFusedLinearBackward(gradOutput, input, weight, diff,
+                    gradInput, gradWeight, gradBias, m, k, n, activation, derivativeFromOutput: fromOutput),
+                backend.DirectPtxLastError);
+            backend.Synchronize();
+            Assert.True(backend.DirectPtxLinearBackwardDispatchCount > before);
+            AssertVectorClose(backend.DownloadBuffer(gradInput), expGradInput, 2e-3f, $"dInput {activation}");
+            AssertVectorClose(backend.DownloadBuffer(gradWeight), expGradWeight, 2e-3f, $"dWeight {activation}");
+            AssertVectorClose(backend.DownloadBuffer(gradBias), expGradBias, 2e-3f, $"dBias {activation}");
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previous;
+            DirectPtxFeatureGate.FusedLinearExperimentOverride = previousExperiment;
+        }
     }
 
     [Fact]
@@ -2288,728 +2508,12 @@ public class DirectPtxWmmaTests
         Assert.False(PtxFusedLinearTiledKernel.IsPromotedShape(128, 512, 2048));
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             PtxFusedLinearTiledKernel.EmitPtx(8, 6, 63, 256, 256, DirectPtxLinearActivation.None));
-
-        string inputMajor = PtxFusedLinearTiledKernel.EmitPtx(
-            8, 6, 64, 256, 256, DirectPtxLinearActivation.None,
-            DirectPtxLinearWeightLayout.InputMajor);
-        Assert.Contains("weights=InputMajor", inputMajor, StringComparison.Ordinal);
-        Assert.Contains("mul.wide.u32 %rd8, %r15, 1024", inputMajor, StringComparison.Ordinal);
-        Assert.DoesNotContain("stride", inputMajor, StringComparison.OrdinalIgnoreCase);
-
-        string batchedGemm = PtxFusedLinearTiledKernel.EmitPtx(
-            8, 6, 64, 256, 256, DirectPtxLinearActivation.None,
-            DirectPtxLinearWeightLayout.InputMajor, hasBias: false, batchCount: 4);
-        Assert.Equal(3, Count(batchedGemm, ".param .u64"));
-        Assert.DoesNotContain("bias_ptr", batchedGemm, StringComparison.Ordinal);
-        Assert.Contains("mov.u32 %r22, %ctaid.z", batchedGemm, StringComparison.Ordinal);
-        Assert.Contains("mul.wide.u32 %rd20, %r22, 65536", batchedGemm, StringComparison.Ordinal);
-        Assert.DoesNotContain("stride", batchedGemm, StringComparison.OrdinalIgnoreCase);
-    }
-
-    [SkippableFact]
-    public void DriverOnlyFusedLinearTiledInputMajor_MatchesOracleAndHasZeroLocalBytes()
-    {
-        const int m = 64, k = 256, n = 256;
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedFusedLinear(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
-            "The checked-in tiled fused-linear specialization is measured on GA10x/SM86.");
-        using var kernel = new PtxFusedLinearTiledKernel(
-            runtime, m, k, n, DirectPtxLinearActivation.GeluTanh,
-            DirectPtxLinearWeightLayout.InputMajor);
-        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
-        Assert.Equal(DirectPtxPhysicalLayout.LinearWeightInputMajor,
-            kernel.Blueprint.Tensors[1].Layout);
-
-        var random = RandomHelper.CreateSeededRandom(20262364);
-        float[] inputHost = Values(random, m * k, 0.125f);
-        float[] weightsHost = Values(random, k * n, 0.0625f);
-        float[] biasHost = Values(random, n, 0.0625f);
-        var expected = new float[m * n];
-        for (int row = 0; row < m; row++)
-        for (int col = 0; col < n; col++)
-        {
-            double acc = biasHost[col];
-            for (int kk = 0; kk < k; kk++)
-                acc += inputHost[row * k + kk] * (double)weightsHost[kk * n + col];
-            expected[row * n + col] = (float)ApplyTiledActivation(
-                acc, DirectPtxLinearActivation.GeluTanh);
-        }
-
-        using var input = runtime.AllocateBytes((nuint)(inputHost.Length * sizeof(float)));
-        using var weights = runtime.AllocateBytes((nuint)(weightsHost.Length * sizeof(float)));
-        using var bias = runtime.AllocateBytes((nuint)(biasHost.Length * sizeof(float)));
-        using var output = runtime.AllocateBytes((nuint)(expected.Length * sizeof(float)));
-        input.Upload<float>(inputHost);
-        weights.Upload<float>(weightsHost);
-        bias.Upload<float>(biasHost);
-        kernel.Launch(
-            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
-            DirectPtxTensorView.CreateOwned(weights, kernel.Blueprint.Tensors[1]),
-            DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[2]),
-            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[3]));
-        runtime.Synchronize();
-        var actual = new float[expected.Length];
-        output.Download<float>(actual);
-        AssertVectorClose(actual, expected, 2e-3f, "tiled fused linear input-major");
-    }
-
-    [SkippableFact]
-    public void BackendGemmTiledInputMajor_IsPublicAndMatchesOracle()
-    {
-        const int m = 64, k = 256, n = 256;
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        bool? previousGate = DirectPtxFeatureGate.TestOverride;
-        bool previousExperiment = DirectPtxFeatureGate.FusedLinearExperimentOverride;
-        DirectPtxFeatureGate.TestOverride = true;
-        DirectPtxFeatureGate.FusedLinearExperimentOverride = true;
-        try
-        {
-            using var backend = new CudaBackend();
-            Skip.IfNot(backend.IsDirectPtxFusedLinearEnabled,
-                "Requires the measured SM86 fused-linear architecture domain.");
-            var random = RandomHelper.CreateSeededRandom(20262365);
-            float[] aHost = Values(random, m * k, 0.125f);
-            float[] bHost = Values(random, k * n, 0.0625f);
-            var expected = new float[m * n];
-            for (int row = 0; row < m; row++)
-            for (int col = 0; col < n; col++)
-            {
-                double acc = 0;
-                for (int kk = 0; kk < k; kk++)
-                    acc += aHost[row * k + kk] * (double)bHost[kk * n + col];
-                expected[row * n + col] = (float)acc;
-            }
-
-            using var a = backend.AllocateBuffer(aHost);
-            using var b = backend.AllocateBuffer(bHost);
-            using var output = backend.AllocateBuffer(m * n);
-            long before = backend.DirectPtxFusedLinearTiledDispatchCount;
-            backend.Gemm(a, b, output, m, n, k);
-            backend.Synchronize();
-            Assert.Equal(before + 1, backend.DirectPtxFusedLinearTiledDispatchCount);
-            AssertVectorClose(backend.DownloadBuffer(output), expected, 2e-3f,
-                "public direct PTX GEMM input-major");
-        }
-        finally
-        {
-            DirectPtxFeatureGate.FusedLinearExperimentOverride = previousExperiment;
-            DirectPtxFeatureGate.TestOverride = previousGate;
-        }
-    }
-
-    [Fact]
-    public void DenseVectorEmitters_HavePointerOnlyExactAbis()
-    {
-        string dot = PtxDenseVectorKernel.EmitPtx(
-            8, 6, DirectPtxDenseVectorOperation.Dot, 4096);
-        Assert.Contains(PtxDenseVectorKernel.DotEntryPoint, dot, StringComparison.Ordinal);
-        Assert.Equal(3, Count(dot, ".param .u64"));
-        Assert.Contains(".shared .align 16 .b8 partial[32]", dot, StringComparison.Ordinal);
-        Assert.Equal(1, Count(dot, "bar.sync 0")); // publish eight warp partials
-        Assert.Equal(10, Count(dot, "shfl.sync.down.b32"));
-        Assert.DoesNotContain(".local", dot, StringComparison.Ordinal);
-        Assert.DoesNotContain("stride", dot, StringComparison.OrdinalIgnoreCase);
-
-        string outer = PtxDenseVectorKernel.EmitPtx(
-            8, 6, DirectPtxDenseVectorOperation.Outer, 64, 128);
-        Assert.Contains(PtxDenseVectorKernel.OuterEntryPoint, outer, StringComparison.Ordinal);
-        Assert.Equal(3, Count(outer, ".param .u64"));
-        Assert.Equal(1, Count(outer, "st.global.f32"));
-        Assert.DoesNotContain(".shared", outer, StringComparison.Ordinal);
-        Assert.DoesNotContain(".local", outer, StringComparison.Ordinal);
-        Assert.DoesNotContain("stride", outer, StringComparison.OrdinalIgnoreCase);
-    }
-
-    [SkippableFact]
-    public void DriverOnlyDenseVectorKernels_MatchOracleAndHaveZeroLocalBytes()
-    {
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedFusedLinear(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
-            "The checked-in dense-vector specializations are measured on GA10x/SM86.");
-        var random = RandomHelper.CreateSeededRandom(20262366);
-
-        const int length = 4096;
-        float[] leftHost = Values(random, length, 0.125f);
-        float[] rightHost = Values(random, length, 0.125f);
-        double expectedDot = 0;
-        for (int i = 0; i < length; i++) expectedDot += leftHost[i] * (double)rightHost[i];
-        using (var kernel = new PtxDenseVectorKernel(
-            runtime, DirectPtxDenseVectorOperation.Dot, length))
-        using (var left = runtime.AllocateBytes((nuint)(length * sizeof(float))))
-        using (var right = runtime.AllocateBytes((nuint)(length * sizeof(float))))
-        using (var output = runtime.AllocateBytes(sizeof(float)))
-        {
-            Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
-            left.Upload<float>(leftHost);
-            right.Upload<float>(rightHost);
-            kernel.Launch(
-                DirectPtxTensorView.CreateOwned(left, kernel.Blueprint.Tensors[0]),
-                DirectPtxTensorView.CreateOwned(right, kernel.Blueprint.Tensors[1]),
-                DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[2]));
-            runtime.Synchronize();
-            var actual = new float[1];
-            output.Download<float>(actual);
-            Assert.InRange(Math.Abs(actual[0] - expectedDot), 0, 2e-5);
-        }
-
-        const int m = 64, n = 128;
-        float[] outerLeft = Values(random, m, 0.125f);
-        float[] outerRight = Values(random, n, 0.125f);
-        using (var kernel = new PtxDenseVectorKernel(
-            runtime, DirectPtxDenseVectorOperation.Outer, m, n))
-        using (var left = runtime.AllocateBytes((nuint)(m * sizeof(float))))
-        using (var right = runtime.AllocateBytes((nuint)(n * sizeof(float))))
-        using (var output = runtime.AllocateBytes((nuint)(m * n * sizeof(float))))
-        {
-            Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
-            left.Upload<float>(outerLeft);
-            right.Upload<float>(outerRight);
-            kernel.Launch(
-                DirectPtxTensorView.CreateOwned(left, kernel.Blueprint.Tensors[0]),
-                DirectPtxTensorView.CreateOwned(right, kernel.Blueprint.Tensors[1]),
-                DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[2]));
-            runtime.Synchronize();
-            var actual = new float[m * n];
-            output.Download<float>(actual);
-            for (int row = 0; row < m; row++)
-            for (int col = 0; col < n; col++)
-                Assert.InRange(
-                    Math.Abs(actual[row * n + col] - outerLeft[row] * outerRight[col]),
-                    0, 1e-7);
-        }
-    }
-
-    [Fact]
-    public void BatchedVectorAndCrossEntropyEmitters_HavePointerOnlyExactAbis()
-    {
-        string batchDot = PtxBatchedVectorKernel.EmitPtx(
-            8, 6, DirectPtxBatchedVectorOperation.Dot, batch: 8, m: 512);
-        Assert.Contains(PtxBatchedVectorKernel.DotEntryPoint, batchDot, StringComparison.Ordinal);
-        Assert.Equal(3, Count(batchDot, ".param .u64"));
-        Assert.Contains(".shared .align 16 .b8 partial[32]", batchDot, StringComparison.Ordinal);
-        Assert.Equal(10, Count(batchDot, "shfl.sync.down.b32"));
-        Assert.DoesNotContain(".param .u32", batchDot, StringComparison.Ordinal);
-        Assert.DoesNotContain(".local", batchDot, StringComparison.Ordinal);
-        Assert.DoesNotContain("stride", batchDot, StringComparison.OrdinalIgnoreCase);
-
-        string batchOuter = PtxBatchedVectorKernel.EmitPtx(
-            8, 6, DirectPtxBatchedVectorOperation.Outer, batch: 4, m: 32, n: 64);
-        Assert.Contains(PtxBatchedVectorKernel.OuterEntryPoint, batchOuter, StringComparison.Ordinal);
-        Assert.Equal(3, Count(batchOuter, ".param .u64"));
-        Assert.Equal(1, Count(batchOuter, "st.global.f32"));
-        Assert.DoesNotContain(".local", batchOuter, StringComparison.Ordinal);
-        Assert.DoesNotContain("stride", batchOuter, StringComparison.OrdinalIgnoreCase);
-
-        string strided = PtxStridedDotKernel.EmitPtx(
-            8, 6, aSize: 512, bSize: 512, bOffset: 511, bStep: -1);
-        Assert.Contains(PtxStridedDotKernel.EntryPoint, strided, StringComparison.Ordinal);
-        Assert.Equal(3, Count(strided, ".param .u64"));
-        Assert.DoesNotContain(".param .u32", strided, StringComparison.Ordinal);
-        Assert.Contains("valid-i=[0,511]", strided, StringComparison.Ordinal);
-        Assert.DoesNotContain(".local", strided, StringComparison.Ordinal);
-        Assert.Equal((0, 511), PtxStridedDotKernel.ValidInterval(512, 512, 511, -1));
-        Assert.Equal((3, 10), PtxStridedDotKernel.ValidInterval(16, 8, -3, 1));
-
-        string index = PtxFusedLinearCrossEntropyKernel.EmitPtx(
-            8, 6, DirectPtxCrossEntropyTarget.Index, rows: 4,
-            hiddenDimension: 16, vocabulary: 32);
-        Assert.Contains(PtxFusedLinearCrossEntropyKernel.IndexEntryPoint, index, StringComparison.Ordinal);
-        Assert.Equal(5, Count(index, ".param .u64"));
-        Assert.Contains("atom.global.add.f32", index, StringComparison.Ordinal);
-        Assert.Contains(".maxntid 32, 1, 1", index, StringComparison.Ordinal);
-        Assert.Contains(".shared .align 16 .b8 scratch[256]", index, StringComparison.Ordinal);
-        Assert.DoesNotContain("st.global.f32", index, StringComparison.Ordinal);
-        Assert.DoesNotContain(".local", index, StringComparison.Ordinal);
-        Assert.DoesNotContain("stride", index, StringComparison.OrdinalIgnoreCase);
-
-        string dense = PtxFusedLinearCrossEntropyKernel.EmitPtx(
-            8, 6, DirectPtxCrossEntropyTarget.Dense, rows: 4,
-            hiddenDimension: 16, vocabulary: 32);
-        Assert.Contains(PtxFusedLinearCrossEntropyKernel.DenseEntryPoint, dense, StringComparison.Ordinal);
-        Assert.Equal(5, Count(dense, ".param .u64"));
-        Assert.DoesNotContain(".local", dense, StringComparison.Ordinal);
-        Assert.DoesNotContain("stride", dense, StringComparison.OrdinalIgnoreCase);
-    }
-
-    [SkippableFact]
-    public void DriverOnlyBatchedVectorKernels_MatchOracleAndHaveZeroLocalBytes()
-    {
-        const int batch = 4, dimension = 512, m = 16, n = 32;
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedFusedLinear(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
-            "The checked-in batched-vector specializations are measured on GA10x/SM86.");
-        var random = RandomHelper.CreateSeededRandom(20262369);
-
-        float[] dotLeft = Values(random, batch * dimension, 0.125f);
-        float[] dotRight = Values(random, batch * dimension, 0.125f);
-        var dotExpected = new float[batch];
-        for (int b = 0; b < batch; b++)
-        {
-            double sum = 0;
-            for (int i = 0; i < dimension; i++)
-                sum += dotLeft[b * dimension + i] * (double)dotRight[b * dimension + i];
-            dotExpected[b] = (float)sum;
-        }
-        using (var kernel = new PtxBatchedVectorKernel(
-            runtime, DirectPtxBatchedVectorOperation.Dot, batch, dimension))
-        using (var left = runtime.AllocateBytes((nuint)(dotLeft.Length * sizeof(float))))
-        using (var right = runtime.AllocateBytes((nuint)(dotRight.Length * sizeof(float))))
-        using (var output = runtime.AllocateBytes((nuint)(batch * sizeof(float))))
-        {
-            Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
-            left.Upload<float>(dotLeft);
-            right.Upload<float>(dotRight);
-            kernel.Launch(
-                DirectPtxTensorView.CreateOwned(left, kernel.Blueprint.Tensors[0]),
-                DirectPtxTensorView.CreateOwned(right, kernel.Blueprint.Tensors[1]),
-                DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[2]));
-            runtime.Synchronize();
-            var actual = new float[batch];
-            output.Download<float>(actual);
-            AssertVectorClose(actual, dotExpected, 2e-5f, "batched dot direct PTX");
-        }
-
-        float[] outerLeft = Values(random, batch * m, 0.125f);
-        float[] outerRight = Values(random, batch * n, 0.125f);
-        using (var kernel = new PtxBatchedVectorKernel(
-            runtime, DirectPtxBatchedVectorOperation.Outer, batch, m, n))
-        using (var left = runtime.AllocateBytes((nuint)(outerLeft.Length * sizeof(float))))
-        using (var right = runtime.AllocateBytes((nuint)(outerRight.Length * sizeof(float))))
-        using (var output = runtime.AllocateBytes((nuint)(batch * m * n * sizeof(float))))
-        {
-            Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
-            left.Upload<float>(outerLeft);
-            right.Upload<float>(outerRight);
-            kernel.Launch(
-                DirectPtxTensorView.CreateOwned(left, kernel.Blueprint.Tensors[0]),
-                DirectPtxTensorView.CreateOwned(right, kernel.Blueprint.Tensors[1]),
-                DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[2]));
-            runtime.Synchronize();
-            var actual = new float[batch * m * n];
-            output.Download<float>(actual);
-            for (int b = 0; b < batch; b++)
-            for (int row = 0; row < m; row++)
-            for (int col = 0; col < n; col++)
-                Assert.InRange(Math.Abs(
-                    actual[(b * m + row) * n + col] -
-                    outerLeft[b * m + row] * outerRight[b * n + col]), 0, 1e-7);
-        }
-
-        const int stridedSize = 512;
-        float[] stridedLeft = Values(random, stridedSize, 0.125f);
-        float[] stridedRight = Values(random, stridedSize, 0.125f);
-        double stridedExpected = 0;
-        for (int i = 0; i < stridedSize; i++)
-            stridedExpected += stridedLeft[i] * (double)stridedRight[stridedSize - 1 - i];
-        using (var kernel = new PtxStridedDotKernel(
-            runtime, stridedSize, stridedSize, stridedSize - 1, -1))
-        using (var left = runtime.AllocateBytes((nuint)(stridedSize * sizeof(float))))
-        using (var right = runtime.AllocateBytes((nuint)(stridedSize * sizeof(float))))
-        using (var output = runtime.AllocateBytes(sizeof(float)))
-        {
-            Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
-            left.Upload<float>(stridedLeft);
-            right.Upload<float>(stridedRight);
-            kernel.Launch(
-                DirectPtxTensorView.CreateOwned(left, kernel.Blueprint.Tensors[0]),
-                DirectPtxTensorView.CreateOwned(right, kernel.Blueprint.Tensors[1]),
-                DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[2]));
-            runtime.Synchronize();
-            var actual = new float[1];
-            output.Download<float>(actual);
-            Assert.InRange(Math.Abs(actual[0] - stridedExpected), 0, 2e-5);
-        }
-    }
-
-    [SkippableFact]
-    public void DriverOnlyFusedLinearCrossEntropy_MatchesStableOracleAndHasZeroLocalBytes()
-    {
-        const int rows = 4, hiddenDimension = 16, vocabulary = 32;
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedFusedLinear(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
-            "The checked-in fused CE specializations are measured on GA10x/SM86.");
-        var random = RandomHelper.CreateSeededRandom(20262370);
-        float[] hiddenHost = Values(random, rows * hiddenDimension, 0.125f);
-        float[] weightHost = Values(random, hiddenDimension * vocabulary, 0.0625f);
-        float[] biasHost = Values(random, vocabulary, 0.03125f);
-        float[] indexTarget = [1f, 7f, 15f, 31f];
-        var denseTarget = new float[rows * vocabulary];
-        for (int row = 0; row < rows; row++)
-            denseTarget[row * vocabulary + (int)indexTarget[row]] = 1f;
-
-        double expected = 0;
-        var logits = new double[vocabulary];
-        for (int row = 0; row < rows; row++)
-        {
-            double max = double.NegativeInfinity;
-            for (int col = 0; col < vocabulary; col++)
-            {
-                double value = biasHost[col];
-                for (int k = 0; k < hiddenDimension; k++)
-                    value += hiddenHost[row * hiddenDimension + k] *
-                        (double)weightHost[k * vocabulary + col];
-                logits[col] = value;
-                max = Math.Max(max, value);
-            }
-            double sum = 0;
-            for (int col = 0; col < vocabulary; col++) sum += Math.Exp(logits[col] - max);
-            expected += max + Math.Log(sum) - logits[(int)indexTarget[row]];
-        }
-        expected /= rows;
-
-        using var hidden = runtime.AllocateBytes((nuint)(hiddenHost.Length * sizeof(float)));
-        using var weight = runtime.AllocateBytes((nuint)(weightHost.Length * sizeof(float)));
-        using var bias = runtime.AllocateBytes((nuint)(biasHost.Length * sizeof(float)));
-        using var targetIndex = runtime.AllocateBytes((nuint)(indexTarget.Length * sizeof(float)));
-        using var targetDense = runtime.AllocateBytes((nuint)(denseTarget.Length * sizeof(float)));
-        using var loss = runtime.AllocateBytes(sizeof(float));
-        hidden.Upload<float>(hiddenHost);
-        weight.Upload<float>(weightHost);
-        bias.Upload<float>(biasHost);
-        targetIndex.Upload<float>(indexTarget);
-        targetDense.Upload<float>(denseTarget);
-
-        foreach (DirectPtxCrossEntropyTarget kind in new[]
-        {
-            DirectPtxCrossEntropyTarget.Index,
-            DirectPtxCrossEntropyTarget.Dense
-        })
-        {
-            using var kernel = new PtxFusedLinearCrossEntropyKernel(
-                runtime, kind, rows, hiddenDimension, vocabulary);
-            Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
-            Assert.Equal(kernel.StaticSharedBytes,
-                kernel.Audit.Function.StaticSharedBytes);
-            loss.Upload<float>(new float[1]);
-            kernel.Launch(
-                DirectPtxTensorView.CreateOwned(hidden, kernel.Blueprint.Tensors[0]),
-                DirectPtxTensorView.CreateOwned(weight, kernel.Blueprint.Tensors[1]),
-                DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[2]),
-                DirectPtxTensorView.CreateOwned(
-                    kind == DirectPtxCrossEntropyTarget.Index ? targetIndex : targetDense,
-                    kernel.Blueprint.Tensors[3]),
-                DirectPtxTensorView.CreateOwned(loss, kernel.Blueprint.Tensors[4]));
-            runtime.Synchronize();
-            var actual = new float[1];
-            loss.Download<float>(actual);
-            Assert.InRange(Math.Abs(actual[0] - expected), 0, 2e-4);
-        }
-    }
-
-    [Fact]
-    public void Fp16GemmEmitter_BakesDtypeTransposeBatchAndConversionIntoPointerOnlyAbi()
-    {
-        string fp16 = PtxFp16GemmKernel.EmitPtx(
-            8, 6, m: 16, n: 32, k: 64, batch: 4,
-            transposeA: true, transposeB: false,
-            outputType: DirectPtxGemmOutputType.Float16);
-        Assert.Contains(PtxFp16GemmKernel.EntryPoint, fp16, StringComparison.Ordinal);
-        Assert.Equal(3, Count(fp16, ".param .u64"));
-        Assert.DoesNotContain(".param .u32", fp16, StringComparison.Ordinal);
-        Assert.Contains("mov.u32 %r5, %ctaid.z", fp16, StringComparison.Ordinal);
-        Assert.Contains("cvt.f32.f16", fp16, StringComparison.Ordinal);
-        Assert.Contains("cvt.rn.f16.f32", fp16, StringComparison.Ordinal);
-        Assert.DoesNotContain(".local", fp16, StringComparison.Ordinal);
-        Assert.DoesNotContain("stride", fp16, StringComparison.OrdinalIgnoreCase);
-
-        string bf16 = PtxFp16GemmKernel.EmitPtx(
-            8, 6, m: 16, n: 32, k: 64,
-            inputType: DirectPtx16BitInputType.BFloat16);
-        Assert.Contains("shl.b32", bf16, StringComparison.Ordinal);
-        Assert.Contains("st.global.f32", bf16, StringComparison.Ordinal);
-        Assert.DoesNotContain("cvt.f32.f16", bf16, StringComparison.Ordinal);
-        Assert.DoesNotContain(".local", bf16, StringComparison.Ordinal);
-    }
-
-    [SkippableFact]
-    public void DriverOnlyFp16GemmVariants_MatchOracleAndHaveZeroLocalBytes()
-    {
-        const int m = 16, n = 16, k = 32;
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedFusedLinear(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
-            "The checked-in 16-bit GEMM specializations are measured on GA10x/SM86.");
-        var random = RandomHelper.CreateSeededRandom(20262371);
-        ushort[] leftHost = RandomHalfRange(random, m * k, 0.125f);
-        ushort[] rightHost = RandomHalfRange(random, k * n, 0.125f);
-        var expected = new float[m * n];
-        for (int row = 0; row < m; row++)
-        for (int col = 0; col < n; col++)
-        {
-            float sum = 0;
-            for (int inner = 0; inner < k; inner++)
-                sum += Half(leftHost[row * k + inner]) * Half(rightHost[inner * n + col]);
-            expected[row * n + col] = sum;
-        }
-
-        using var left = runtime.AllocateBytes((nuint)(leftHost.Length * sizeof(ushort)));
-        using var right = runtime.AllocateBytes((nuint)(rightHost.Length * sizeof(ushort)));
-        left.Upload<ushort>(leftHost);
-        right.Upload<ushort>(rightHost);
-
-        using (var kernel = new PtxFp16GemmKernel(runtime, m, n, k))
-        using (var output = runtime.AllocateBytes((nuint)(expected.Length * sizeof(float))))
-        {
-            Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
-            kernel.Launch(
-                DirectPtxTensorView.CreateOwned(left, kernel.Blueprint.Tensors[0]),
-                DirectPtxTensorView.CreateOwned(right, kernel.Blueprint.Tensors[1]),
-                DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[2]));
-            runtime.Synchronize();
-            var actual = new float[expected.Length];
-            output.Download<float>(actual);
-            AssertVectorClose(actual, expected, 2e-5f, "FP16-input FP32-output GEMM");
-        }
-
-        using (var kernel = new PtxFp16GemmKernel(
-            runtime, m, n, k,
-            outputType: DirectPtxGemmOutputType.Float16))
-        using (var output = runtime.AllocateBytes((nuint)(expected.Length * sizeof(ushort))))
-        {
-            Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
-            kernel.Launch(
-                DirectPtxTensorView.CreateOwned(left, kernel.Blueprint.Tensors[0]),
-                DirectPtxTensorView.CreateOwned(right, kernel.Blueprint.Tensors[1]),
-                DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[2]));
-            runtime.Synchronize();
-            var actualBits = new ushort[expected.Length];
-            output.Download<ushort>(actualBits);
-            for (int i = 0; i < expected.Length; i++)
-                Assert.InRange(Math.Abs(Half(actualBits[i]) - (float)(Half)expected[i]), 0, 1e-7);
-        }
-
-        ushort[] leftBf16 = BFloat16Values(random, m * k);
-        ushort[] rightBf16 = BFloat16Values(random, k * n);
-        var expectedBf16 = new float[m * n];
-        for (int row = 0; row < m; row++)
-        for (int col = 0; col < n; col++)
-            for (int inner = 0; inner < k; inner++)
-                expectedBf16[row * n + col] +=
-                    BFloat16(leftBf16[row * k + inner]) * BFloat16(rightBf16[inner * n + col]);
-        using var leftB = runtime.AllocateBytes((nuint)(leftBf16.Length * sizeof(ushort)));
-        using var rightB = runtime.AllocateBytes((nuint)(rightBf16.Length * sizeof(ushort)));
-        using var outputB = runtime.AllocateBytes((nuint)(expectedBf16.Length * sizeof(float)));
-        leftB.Upload<ushort>(leftBf16);
-        rightB.Upload<ushort>(rightBf16);
-        using (var kernel = new PtxFp16GemmKernel(
-            runtime, m, n, k, inputType: DirectPtx16BitInputType.BFloat16))
-        {
-            Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
-            kernel.Launch(
-                DirectPtxTensorView.CreateOwned(leftB, kernel.Blueprint.Tensors[0]),
-                DirectPtxTensorView.CreateOwned(rightB, kernel.Blueprint.Tensors[1]),
-                DirectPtxTensorView.CreateOwned(outputB, kernel.Blueprint.Tensors[2]));
-            runtime.Synchronize();
-            var actual = new float[expectedBf16.Length];
-            outputB.Download<float>(actual);
-            AssertVectorClose(actual, expectedBf16, 2e-5f, "BF16-input FP32-output GEMM");
-        }
-    }
-
-    [Fact]
-    public void FusedLoRAEmitter_HasPointerOnlyFusedDataflow()
-    {
-        string ptx = PtxFusedLoRAKernel.EmitPtx(
-            8, 6, batch: 8, inputFeatures: 256, rank: 8,
-            outputFeatures: 256, scaling: 0.125f);
-        Assert.Contains(PtxFusedLoRAKernel.EntryPoint, ptx, StringComparison.Ordinal);
-        Assert.Equal(5, Count(ptx, ".param .u64"));
-        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
-        Assert.DoesNotContain(".param .f32", ptx, StringComparison.Ordinal);
-        Assert.Contains(".shared .align 16 .b8 projection[32]", ptx, StringComparison.Ordinal);
-        Assert.Equal(1, Count(ptx, "st.global.f32"));
-        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
-        Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
-    }
-
-    [SkippableFact]
-    public void DriverOnlyFusedLoRA_MatchesOracleAndHasZeroLocalBytes()
-    {
-        const int batch = 8, inputFeatures = 256, rank = 8, outputFeatures = 256;
-        const float scaling = 0.125f;
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedFusedLinear(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
-            "The checked-in fused-LoRA specialization is measured on GA10x/SM86.");
-        using var kernel = new PtxFusedLoRAKernel(
-            runtime, batch, inputFeatures, rank, outputFeatures, scaling);
-        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
-        Assert.Equal(rank * sizeof(float), kernel.Audit.Function.StaticSharedBytes);
-
-        var random = RandomHelper.CreateSeededRandom(20262367);
-        float[] inputHost = Values(random, batch * inputFeatures, 0.125f);
-        float[] baseHost = Values(random, batch * outputFeatures, 0.125f);
-        float[] aHost = Values(random, inputFeatures * rank, 0.0625f);
-        float[] bHost = Values(random, rank * outputFeatures, 0.0625f);
-        var expected = new float[baseHost.Length];
-        var projection = new double[rank];
-        for (int row = 0; row < batch; row++)
-        {
-            Array.Clear(projection, 0, projection.Length);
-            for (int r = 0; r < rank; r++)
-                for (int i = 0; i < inputFeatures; i++)
-                    projection[r] += inputHost[row * inputFeatures + i] * (double)aHost[i * rank + r];
-            for (int col = 0; col < outputFeatures; col++)
-            {
-                double delta = 0;
-                for (int r = 0; r < rank; r++)
-                    delta += projection[r] * bHost[r * outputFeatures + col];
-                expected[row * outputFeatures + col] =
-                    baseHost[row * outputFeatures + col] + scaling * (float)delta;
-            }
-        }
-
-        using var input = runtime.AllocateBytes((nuint)(inputHost.Length * sizeof(float)));
-        using var baseOutput = runtime.AllocateBytes((nuint)(baseHost.Length * sizeof(float)));
-        using var loraA = runtime.AllocateBytes((nuint)(aHost.Length * sizeof(float)));
-        using var loraB = runtime.AllocateBytes((nuint)(bHost.Length * sizeof(float)));
-        using var output = runtime.AllocateBytes((nuint)(expected.Length * sizeof(float)));
-        input.Upload<float>(inputHost);
-        baseOutput.Upload<float>(baseHost);
-        loraA.Upload<float>(aHost);
-        loraB.Upload<float>(bHost);
-        kernel.Launch(
-            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
-            DirectPtxTensorView.CreateOwned(baseOutput, kernel.Blueprint.Tensors[1]),
-            DirectPtxTensorView.CreateOwned(loraA, kernel.Blueprint.Tensors[2]),
-            DirectPtxTensorView.CreateOwned(loraB, kernel.Blueprint.Tensors[3]),
-            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[4]));
-        runtime.Synchronize();
-        var actual = new float[expected.Length];
-        output.Download<float>(actual);
-        AssertVectorClose(actual, expected, 2e-4f, "fused LoRA direct PTX");
-    }
-
-    [Fact]
-    public void FusedLinearBackwardEmitter_HasThreePointerOnlyOutputKernels()
-    {
-        string ptx = PtxFusedLinearBackwardKernel.EmitPtx(
-            8, 6, 64, 256, 256, DirectPtxLinearActivation.GeluTanh);
-        Assert.Contains(PtxFusedLinearBackwardKernel.GradInputEntryPoint, ptx, StringComparison.Ordinal);
-        Assert.Contains(PtxFusedLinearBackwardKernel.GradWeightEntryPoint, ptx, StringComparison.Ordinal);
-        Assert.Contains(PtxFusedLinearBackwardKernel.GradBiasEntryPoint, ptx, StringComparison.Ordinal);
-        Assert.Equal(11, Count(ptx, ".param .u64"));
-        Assert.Equal(3, Count(ptx, "st.global.f32"));
-        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
-        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
-        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
-        Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
-    }
-
-    [SkippableTheory]
-    [InlineData(1)] // ReLU
-    [InlineData(3)] // Sigmoid
-    [InlineData(4)] // Tanh
-    [InlineData(2)] // GELU-tanh
-    [InlineData(5)] // Swish
-    public void DriverOnlyFusedLinearBackwardActivations_MatchOracleAndHaveZeroLocalBytes(
-        int activationValue)
-    {
-        const int m = 64, k = 256, n = 256;
-        var activation = (DirectPtxLinearActivation)activationValue;
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedFusedLinear(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
-            "The checked-in backward specialization is measured on GA10x/SM86.");
-        using var kernel = new PtxFusedLinearBackwardKernel(
-            runtime, m, k, n, activation);
-        Assert.All(kernel.Audits, audit => Assert.Equal(0, audit.Function.LocalBytesPerThread));
-
-        var random = RandomHelper.CreateSeededRandom(20262368);
-        float[] gradOutputHost = Values(random, m * n, 0.125f);
-        float[] inputHost = Values(random, m * k, 0.125f);
-        float[] weightsHost = Values(random, k * n, 0.0625f);
-        float[] preActivationHost = Values(random, m * n, 0.25f);
-        float[] savedHost = preActivationHost
-            .Select(value => activation switch
-            {
-                DirectPtxLinearActivation.Sigmoid =>
-                    (float)(1.0 / (1.0 + Math.Exp(-value))),
-                DirectPtxLinearActivation.Tanh => (float)Math.Tanh(value),
-                _ => value
-            })
-            .ToArray();
-        float[] masked = new float[m * n];
-        for (int i = 0; i < masked.Length; i++)
-        {
-            double x = preActivationHost[i];
-            double derivative = activation switch
-            {
-                DirectPtxLinearActivation.Relu => x > 0 ? 1.0 : 0.0,
-                DirectPtxLinearActivation.Sigmoid => savedHost[i] * (1.0 - savedHost[i]),
-                DirectPtxLinearActivation.Tanh => 1.0 - savedHost[i] * savedHost[i],
-                DirectPtxLinearActivation.GeluTanh => GeluTanhDerivative(x),
-                DirectPtxLinearActivation.Swish =>
-                    Sigmoid(x) + x * Sigmoid(x) * (1.0 - Sigmoid(x)),
-                _ => throw new ArgumentOutOfRangeException(nameof(activation))
-            };
-            masked[i] = (float)(gradOutputHost[i] * derivative);
-        }
-        var expectedInput = new float[m * k];
-        var expectedWeight = new float[k * n];
-        var expectedBias = new float[n];
-        for (int row = 0; row < m; row++)
-        for (int col = 0; col < n; col++)
-        {
-            float g = masked[row * n + col];
-            expectedBias[col] += g;
-            for (int kk = 0; kk < k; kk++)
-            {
-                expectedInput[row * k + kk] += g * weightsHost[kk * n + col];
-                expectedWeight[kk * n + col] += inputHost[row * k + kk] * g;
-            }
-        }
-
-        using var gradOutput = runtime.AllocateBytes((nuint)(gradOutputHost.Length * sizeof(float)));
-        using var input = runtime.AllocateBytes((nuint)(inputHost.Length * sizeof(float)));
-        using var weights = runtime.AllocateBytes((nuint)(weightsHost.Length * sizeof(float)));
-        using var saved = runtime.AllocateBytes((nuint)(savedHost.Length * sizeof(float)));
-        using var gradInput = runtime.AllocateBytes((nuint)(expectedInput.Length * sizeof(float)));
-        using var gradWeight = runtime.AllocateBytes((nuint)(expectedWeight.Length * sizeof(float)));
-        using var gradBias = runtime.AllocateBytes((nuint)(expectedBias.Length * sizeof(float)));
-        gradOutput.Upload<float>(gradOutputHost);
-        input.Upload<float>(inputHost);
-        weights.Upload<float>(weightsHost);
-        saved.Upload<float>(savedHost);
-        kernel.Launch(
-            DirectPtxTensorView.CreateOwned(gradOutput, kernel.Blueprint.Tensors[0]),
-            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[1]),
-            DirectPtxTensorView.CreateOwned(weights, kernel.Blueprint.Tensors[2]),
-            DirectPtxTensorView.CreateOwned(saved, kernel.Blueprint.Tensors[3]),
-            DirectPtxTensorView.CreateOwned(gradInput, kernel.Blueprint.Tensors[4]),
-            DirectPtxTensorView.CreateOwned(gradWeight, kernel.Blueprint.Tensors[5]),
-            DirectPtxTensorView.CreateOwned(gradBias, kernel.Blueprint.Tensors[6]));
-        runtime.Synchronize();
-        var actualInput = new float[expectedInput.Length];
-        var actualWeight = new float[expectedWeight.Length];
-        var actualBias = new float[expectedBias.Length];
-        gradInput.Download<float>(actualInput);
-        gradWeight.Download<float>(actualWeight);
-        gradBias.Download<float>(actualBias);
-        AssertVectorClose(actualInput, expectedInput, 3e-4f, $"fused {activation} backward dInput");
-        AssertVectorClose(actualWeight, expectedWeight, 3e-4f, $"fused {activation} backward dWeight");
-        AssertVectorClose(actualBias, expectedBias, 3e-4f, $"fused {activation} backward dBias");
     }
 
     [SkippableTheory]
     [InlineData(64, 256, 256, 2)]  // GeluTanh
     [InlineData(128, 512, 512, 1)] // Relu
     [InlineData(64, 256, 512, 0)]  // None
-    [InlineData(64, 256, 256, 3)]  // Sigmoid
-    [InlineData(64, 256, 256, 4)]  // Tanh
-    [InlineData(64, 256, 256, 5)]  // Swish
-    [InlineData(64, 256, 256, 6)]  // LeakyReLU
     public void DriverOnlyFusedLinearTiled_MatchesOracleAndHasZeroLocalBytes(
         int m, int k, int n, int activationValue)
     {
@@ -3078,17 +2582,1043 @@ public class DirectPtxWmmaTests
         _ => x
     };
 
-    private static double Sigmoid(double x) => 1.0 / (1.0 + Math.Exp(-x));
-
-    private static double GeluTanhDerivative(double x)
+    [Fact]
+    public void FusedGemmBiasEmitter_IsRegisterResidentTiledGemm()
     {
-        const double sqrtTwoOverPi = 0.7978845608;
-        const double coefficient = 0.044715;
-        double x2 = x * x;
-        double t = Math.Tanh(sqrtTwoOverPi * (x + coefficient * x * x2));
-        return 0.5 * (1.0 + t) +
-            0.5 * x * (1.0 - t * t) * sqrtTwoOverPi *
-            (1.0 + 3.0 * coefficient * x2);
+        string ptx = PtxFusedGemmBiasKernel.EmitPtx(
+            8, 6, 64, 256, 256, DirectPtxLinearActivation.GeluTanh);
+        Assert.Contains(PtxFusedGemmBiasKernel.EntryPoint, ptx);
+        Assert.Contains(".shared .align 16 .b8 a_tile[2048]", ptx);
+        Assert.Contains(".shared .align 16 .b8 b_tile[2048]", ptx);
+        Assert.Equal(144, Count(ptx, "fma.rn.f32"));   // 128 inner + 16 gelu
+        Assert.Equal(64, Count(ptx, "ld.shared.f32"));
+        Assert.Equal(2, Count(ptx, "bar.sync 0"));
+        Assert.Equal(16, Count(ptx, "st.global.f32"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(128, Count(PtxFusedGemmBiasKernel.EmitPtx(
+            8, 6, 64, 256, 256, DirectPtxLinearActivation.None), "fma.rn.f32"));
+        Assert.False(PtxFusedGemmBiasKernel.IsSupportedShape(63, 256, 256));
+        Assert.True(PtxFusedGemmBiasKernel.IsSupportedShape(128, 512, 2048));
+        Assert.False(PtxFusedGemmBiasKernel.IsPromotedShape(128, 512, 2048));
+    }
+
+    [SkippableTheory]
+    [InlineData(64, 256, 256, 2)]  // GeluTanh
+    [InlineData(128, 512, 512, 1)] // Relu
+    [InlineData(64, 256, 512, 0)]  // None
+    public void DriverOnlyFusedGemmBias_MatchesOracleAndHasZeroLocalBytes(
+        int m, int k, int n, int activationValue)
+    {
+        var activation = (DirectPtxLinearActivation)activationValue;
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedFusedLinear(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in GemmBias specialization is measured on GA10x/SM86.");
+        using var kernel = new PtxFusedGemmBiasKernel(runtime, m, k, n, activation);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20262400 + m + k + n + activationValue);
+        float[] aHost = Values(random, m * k, 0.125f);
+        float[] bHost = Values(random, k * n, 0.0625f);   // standard row-major [K,N]
+        float[] biasHost = Values(random, n, 0.0625f);
+        float[] expected = GemmBiasOracle(aHost, bHost, biasHost, m, k, n, activation);
+
+        using var a = runtime.AllocateBytes((nuint)(aHost.Length * sizeof(float)));
+        using var b = runtime.AllocateBytes((nuint)(bHost.Length * sizeof(float)));
+        using var bias = runtime.AllocateBytes((nuint)(biasHost.Length * sizeof(float)));
+        using var output = runtime.AllocateBytes((nuint)(m * n * sizeof(float)));
+        a.Upload<float>(aHost);
+        b.Upload<float>(bHost);
+        bias.Upload<float>(biasHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(a, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(b, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[3]));
+        runtime.Synchronize();
+        var actual = new float[m * n];
+        output.Download<float>(actual);
+        AssertVectorClose(actual, expected, 2e-3f, $"tiled gemm-bias {activation} {m}x{k}x{n}");
+    }
+
+    private static float[] GemmBiasOracle(
+        float[] a, float[] b, float[] bias, int m, int k, int n,
+        DirectPtxLinearActivation activation)
+    {
+        var output = new float[m * n];
+        for (int row = 0; row < m; row++)
+        for (int col = 0; col < n; col++)
+        {
+            double acc = 0;
+            for (int kk = 0; kk < k; kk++)
+                acc += a[row * k + kk] * (double)b[kk * n + col]; // B is standard [K,N]
+            acc += bias[col];
+            output[row * n + col] = (float)ApplyTiledActivation(acc, activation);
+        }
+        return output;
+    }
+
+    [Fact]
+    public void GemmFp16Emitter_ConvertsFp16OperandsToFp32Tile()
+    {
+        string ptx = PtxGemmFp16Kernel.EmitPtx(8, 6, 64, 256, 256);
+        Assert.Contains(PtxGemmFp16Kernel.EntryPoint, ptx);
+        Assert.Equal(4, Count(ptx, "ld.global.nc.u16"));   // 2 A + 2 B fp16 loads / thread
+        Assert.Equal(4, Count(ptx, "cvt.f32.f16"));
+        Assert.Equal(128, Count(ptx, "fma.rn.f32"));       // fp32 accumulate
+        Assert.Equal(64, Count(ptx, "ld.shared.f32"));
+        Assert.Equal(2, Count(ptx, "bar.sync 0"));
+        Assert.Equal(16, Count(ptx, "st.global.f32"));     // fp32 output
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.Contains(".reg .b16 %h", ptx, StringComparison.Ordinal);
+        Assert.True(PtxGemmFp16Kernel.IsSupportedShape(128, 512, 2048));
+        Assert.False(PtxGemmFp16Kernel.IsPromotedShape(128, 512, 2048));
+    }
+
+    [Fact]
+    public void HgemmEmitter_NarrowsFp32AccumulatorsToFp16Output()
+    {
+        string ptx = PtxHgemmKernel.EmitPtx(8, 6, 64, 256, 256);
+        Assert.Contains(PtxHgemmKernel.EntryPoint, ptx);
+        Assert.Equal(4, Count(ptx, "ld.global.nc.u16"));   // 2 A + 2 B fp16 loads / thread
+        Assert.Equal(4, Count(ptx, "cvt.f32.f16"));        // fp16 operands -> fp32 tile
+        Assert.Equal(128, Count(ptx, "fma.rn.f32"));       // fp32 accumulate
+        Assert.Equal(16, Count(ptx, "cvt.rn.f16.f32"));    // narrow each accumulator
+        Assert.Equal(16, Count(ptx, "st.global.u16"));     // fp16 output store
+        Assert.Equal(0, Count(ptx, "st.global.f32"));      // no fp32 output
+        Assert.Equal(2, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxHgemmKernel.IsSupportedShape(128, 512, 2048));
+        Assert.False(PtxHgemmKernel.IsPromotedShape(128, 512, 2048));
+    }
+
+    [Fact]
+    public void MatMulTransposedEmitter_IsBareTransposedBTile()
+    {
+        string ptx = PtxMatMulTransposedKernel.EmitPtx(8, 6, 64, 256, 256);
+        Assert.Contains(PtxMatMulTransposedKernel.EntryPoint, ptx);
+        Assert.Contains(".shared .align 16 .b8 a_tile[2048]", ptx);
+        Assert.Contains(".shared .align 16 .b8 b_tile[2048]", ptx);
+        Assert.Equal(128, Count(ptx, "fma.rn.f32"));
+        Assert.Equal(64, Count(ptx, "ld.shared.f32"));
+        Assert.Equal(2, Count(ptx, "bar.sync 0"));
+        Assert.Equal(16, Count(ptx, "st.global.f32"));
+        Assert.Equal(0, Count(ptx, "add.rn.f32"));         // no bias add
+        Assert.DoesNotContain("tanh.approx.f32", ptx);     // no activation epilogue
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxMatMulTransposedKernel.IsSupportedShape(128, 512, 2048));
+        Assert.False(PtxMatMulTransposedKernel.IsPromotedShape(128, 512, 2048));
+    }
+
+    [Fact]
+    public void FusedLoraForwardEmitter_IsSingleLaunchTwoStageWithSharedZ()
+    {
+        string ptx = PtxFusedLoRAForwardKernel.EmitPtx(8, 6, 64, 256, 256);
+        Assert.Contains(PtxFusedLoRAForwardKernel.EntryPoint, ptx);
+        Assert.Contains("ld.param.f32 %f26, [scale];", ptx);                 // scalar scale
+        Assert.Contains(".shared .align 16 .b8 z_tile[16384]", ptx);         // 64x64 resident Z
+        Assert.Contains("STAGE1_K_LOOP:", ptx);
+        Assert.Contains("COL_LOOP:", ptx);                                   // streams all N tiles
+        Assert.Contains("STAGE2_R_LOOP:", ptx);
+        // 128 (stage1 Z) + 128 (stage2 dY) + 16 (base+scale*dY residual) FMAs.
+        Assert.Equal(272, Count(ptx, "fma.rn.f32"));
+        Assert.Equal(16, Count(ptx, "st.global.f32"));
+        Assert.Equal(16, Count(ptx, "st.shared.f32 [%rd16]"));               // Z spill to shared
+        Assert.Equal(5, Count(ptx, "bar.sync 0"));                           // 2 stage1 + Z + 2 stage2
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxFusedLoRAForwardKernel.IsSupportedShape(128, 512, 2048));
+        Assert.False(PtxFusedLoRAForwardKernel.IsPromotedShape(128, 512, 2048));
+    }
+
+    [SkippableTheory]
+    [InlineData(64, 256, 256)]
+    [InlineData(128, 512, 512)]
+    public void DriverOnlyFusedLoraForward_MatchesOracleAndHasZeroLocalBytes(int m, int k, int n)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedFusedLinear(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in fused-LoRA specialization is measured on GA10x/SM86.");
+        const float scale = 0.5f;
+        int r = PtxFusedLoRAForwardKernel.Rank;
+        using var kernel = new PtxFusedLoRAForwardKernel(runtime, m, k, n, scale);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+        Assert.Equal(5, kernel.Blueprint.Tensors.Count);
+
+        var random = RandomHelper.CreateSeededRandom(20263100 + m + k + n);
+        float[] xHost = Values(random, m * k, 0.125f);
+        float[] aHost = Values(random, r * k, 0.0625f);       // output-major [r,K]
+        float[] bHost = Values(random, n * r, 0.0625f);       // output-major [N,r]
+        float[] baseHost = Values(random, m * n, 0.25f);
+        float[] expected = FusedLoraOracle(xHost, aHost, bHost, baseHost, scale, m, k, n, r);
+
+        using var x = runtime.AllocateBytes((nuint)(xHost.Length * sizeof(float)));
+        using var a = runtime.AllocateBytes((nuint)(aHost.Length * sizeof(float)));
+        using var b = runtime.AllocateBytes((nuint)(bHost.Length * sizeof(float)));
+        using var baseBuf = runtime.AllocateBytes((nuint)(baseHost.Length * sizeof(float)));
+        using var output = runtime.AllocateBytes((nuint)(m * n * sizeof(float)));
+        x.Upload<float>(xHost);
+        a.Upload<float>(aHost);
+        b.Upload<float>(bHost);
+        baseBuf.Upload<float>(baseHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(x, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(a, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(b, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(baseBuf, kernel.Blueprint.Tensors[3]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[4]));
+        runtime.Synchronize();
+        var actual = new float[m * n];
+        output.Download<float>(actual);
+        AssertVectorClose(actual, expected, 2e-3f, $"fused lora {m}x{k}x{n} r{r}");
+    }
+
+    private static float[] FusedLoraOracle(
+        float[] x, float[] a, float[] b, float[] baseOut, float scale, int m, int k, int n, int r)
+    {
+        var z = new double[m * r];
+        for (int row = 0; row < m; row++)
+        for (int t = 0; t < r; t++)
+        {
+            double acc = 0;
+            for (int kk = 0; kk < k; kk++)
+                acc += x[row * k + kk] * (double)a[t * k + kk]; // Z = X @ transpose(A[r,K])
+            z[row * r + t] = acc;
+        }
+        var output = new float[m * n];
+        for (int row = 0; row < m; row++)
+        for (int col = 0; col < n; col++)
+        {
+            double acc = 0;
+            for (int t = 0; t < r; t++)
+                acc += z[row * r + t] * b[col * r + t];         // dY = Z @ transpose(B[N,r])
+            output[row * n + col] = (float)(baseOut[row * n + col] + scale * acc);
+        }
+        return output;
+    }
+
+    [Theory]
+    [InlineData(0)]  // None
+    [InlineData(1)]  // Relu
+    [InlineData(2)]  // GeluTanh
+    [InlineData(3)]  // Sigmoid
+    [InlineData(4)]  // Tanh
+    [InlineData(5)]  // Swish
+    [InlineData(6)]  // LeakyRelu
+    public void ActivationBackwardEmitter_IsElementwiseDerivativeWithNoScratchMemory(int activationValue)
+    {
+        var activation = (DirectPtxLinearActivation)activationValue;
+        string ptx = PtxLinearActivationBackwardKernel.EmitPtx(8, 6, 64, 256, activation);
+        Assert.Contains(PtxLinearActivationBackwardKernel.EntryPoint, ptx);
+        Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));   // preact z + upstream dy
+        Assert.Equal(1, Count(ptx, "st.global.f32"));       // dz
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        // Only the smooth activations invoke the transcendental approximation.
+        bool smooth = activation is DirectPtxLinearActivation.Tanh
+            or DirectPtxLinearActivation.Sigmoid or DirectPtxLinearActivation.Swish
+            or DirectPtxLinearActivation.GeluTanh;
+        Assert.Equal(smooth, ptx.Contains("tanh.approx.f32"));
+        // ReLU-family gate on the sign of the preactivation.
+        bool gated = activation is DirectPtxLinearActivation.Relu or DirectPtxLinearActivation.LeakyRelu;
+        Assert.Equal(gated, ptx.Contains("selp.f32"));
+        if (activation == DirectPtxLinearActivation.GeluTanh)
+        {
+            Assert.Contains("0f3F4C422A", ptx);   // sqrt(2/pi)
+            Assert.Contains("0f40400000", ptx);   // the 3.0 in u' = c0(1 + 3 c1 z^2)
+        }
+        Assert.True(PtxLinearActivationBackwardKernel.IsSupportedShape(128, 2048));
+        Assert.False(PtxLinearActivationBackwardKernel.IsPromotedShape(128, 2048));
+    }
+
+    [Theory]
+    [InlineData(3)]  // Sigmoid -> y(1-y)
+    [InlineData(4)]  // Tanh    -> 1-y^2
+    public void ActivationBackwardEmitter_OutputForm_UsesSavedActivationDerivative(int activationValue)
+    {
+        var activation = (DirectPtxLinearActivation)activationValue;
+        string ptx = PtxLinearActivationBackwardKernel.EmitPtx(8, 6, 64, 256, activation, derivativeFromOutput: true);
+        Assert.Contains("form=output", ptx);
+        Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));   // y + dy
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        // Output-form derivatives are pure polynomials in y — no transcendental needed.
+        Assert.DoesNotContain("tanh.approx.f32", ptx);
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        if (activation == DirectPtxLinearActivation.Sigmoid)
+            Assert.Contains("sub.rn.f32 %f10, %f0, %f10", ptx);  // y - y^2
+    }
+
+    [Fact]
+    public void ActivationBackwardEmitter_OutputForm_RejectsNonSquashingActivations()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxLinearActivationBackwardKernel.EmitPtx(
+                8, 6, 64, 256, DirectPtxLinearActivation.Relu, derivativeFromOutput: true));
+    }
+
+    [SkippableTheory]
+    [InlineData(64, 256, 1)]   // Relu
+    [InlineData(128, 512, 4)]  // Tanh
+    [InlineData(64, 256, 3)]   // Sigmoid
+    [InlineData(128, 256, 2)]  // GeluTanh
+    [InlineData(64, 512, 5)]   // Swish
+    public void DriverOnlyActivationBackward_MatchesDerivativeOracle(int m, int n, int activationValue)
+    {
+        var activation = (DirectPtxLinearActivation)activationValue;
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedFusedLinear(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in activation-backward specialization is measured on GA10x/SM86.");
+        using var kernel = new PtxLinearActivationBackwardKernel(runtime, m, n, activation);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20263400 + m + n + (int)activation);
+        float[] preact = Values(random, m * n, 1.5f);   // spread across the nonlinear region
+        float[] dy = Values(random, m * n, 0.5f);
+        var expected = new float[m * n];
+        for (int i = 0; i < expected.Length; i++)
+            expected[i] = (float)(dy[i] * ActivationDerivative(preact[i], activation));
+
+        using var pre = runtime.AllocateBytes((nuint)(preact.Length * sizeof(float)));
+        using var dyBuf = runtime.AllocateBytes((nuint)(dy.Length * sizeof(float)));
+        using var dz = runtime.AllocateBytes((nuint)(m * n * sizeof(float)));
+        pre.Upload<float>(preact);
+        dyBuf.Upload<float>(dy);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(pre, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(dyBuf, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(dz, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[m * n];
+        dz.Download<float>(actual);
+        AssertVectorClose(actual, expected, 2e-3f, $"activation backward {activation} {m}x{n}");
+    }
+
+    private static double ActivationDerivative(double z, DirectPtxLinearActivation activation)
+    {
+        switch (activation)
+        {
+            case DirectPtxLinearActivation.None:
+                return 1.0;
+            case DirectPtxLinearActivation.Relu:
+                return z > 0 ? 1.0 : 0.0;
+            case DirectPtxLinearActivation.LeakyRelu:
+                return z >= 0 ? 1.0 : 0.01;
+            case DirectPtxLinearActivation.Tanh:
+            {
+                double t = Math.Tanh(z);
+                return 1.0 - t * t;
+            }
+            case DirectPtxLinearActivation.Sigmoid:
+            {
+                double s = 1.0 / (1.0 + Math.Exp(-z));
+                return s * (1.0 - s);
+            }
+            case DirectPtxLinearActivation.Swish:
+            {
+                double s = 1.0 / (1.0 + Math.Exp(-z));
+                return s + z * s * (1.0 - s);
+            }
+            case DirectPtxLinearActivation.GeluTanh:
+            {
+                const double c0 = 0.7978845608028654; // sqrt(2/pi)
+                const double c1 = 0.044715;
+                double u = c0 * (z + c1 * z * z * z);
+                double t = Math.Tanh(u);
+                double up = c0 * (1.0 + 3.0 * c1 * z * z);
+                return 0.5 * (1.0 + t) + 0.5 * z * (1.0 - t * t) * up;
+            }
+            default:
+                throw new ArgumentOutOfRangeException(nameof(activation));
+        }
+    }
+
+    [Fact]
+    public void DWeightContractMEmitter_ContractsOverBatchDimension()
+    {
+        string ptx = PtxGemmContractMKernel.EmitPtx(8, 6, 128, 256, 256); // M=128 N=256 K=256
+        Assert.Contains(PtxGemmContractMKernel.EntryPoint, ptx);
+        Assert.Contains(".shared .align 16 .b8 a_tile[2048]", ptx);   // 8x64 dZ slice
+        Assert.Contains(".shared .align 16 .b8 b_tile[2048]", ptx);   // 8x64 X slice
+        Assert.Contains("M_TILE_LOOP:", ptx);                          // contracts over M
+        Assert.Equal(128, Count(ptx, "fma.rn.f32"));                   // 8 contract * 16
+        Assert.Equal(64, Count(ptx, "ld.shared.f32"));
+        Assert.Equal(2, Count(ptx, "bar.sync 0"));
+        Assert.Equal(16, Count(ptx, "st.global.f32"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxGemmContractMKernel.IsSupportedShape(128, 512, 2048));
+        Assert.False(PtxGemmContractMKernel.IsPromotedShape(128, 512, 2048));
+    }
+
+    [Fact]
+    public void DBiasEmitter_IsColumnReductionWithNoScratchMemory()
+    {
+        string ptx = PtxBiasGradientKernel.EmitPtx(8, 6, 128, 256);
+        Assert.Contains(PtxBiasGradientKernel.EntryPoint, ptx);
+        Assert.Contains("COLSUM_LOOP:", ptx);
+        Assert.Equal(1, Count(ptx, "ld.global.nc.f32"));   // one load per iteration
+        Assert.Equal(1, Count(ptx, "st.global.f32"));       // one column result
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxBiasGradientKernel.IsSupportedShape(128, 2048));
+        Assert.False(PtxBiasGradientKernel.IsPromotedShape(128, 2048));
+    }
+
+    [SkippableTheory]
+    [InlineData(128, 256, 256)]
+    [InlineData(64, 512, 256)]
+    public void DriverOnlyDWeightContractM_MatchesOracle(int m, int n, int k)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedFusedLinear(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in dWeight specialization is measured on GA10x/SM86.");
+        using var kernel = new PtxGemmContractMKernel(runtime, m, n, k);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20263500 + m + n + k);
+        float[] dzHost = Values(random, m * n, 0.125f);   // dZ[M,N]
+        float[] xHost = Values(random, m * k, 0.125f);    // X[M,K]
+        var expected = new float[n * k];
+        for (int nn = 0; nn < n; nn++)
+        for (int kk = 0; kk < k; kk++)
+        {
+            double acc = 0;
+            for (int mm = 0; mm < m; mm++)
+                acc += dzHost[mm * n + nn] * (double)xHost[mm * k + kk];
+            expected[nn * k + kk] = (float)acc;
+        }
+
+        using var dz = runtime.AllocateBytes((nuint)(dzHost.Length * sizeof(float)));
+        using var x = runtime.AllocateBytes((nuint)(xHost.Length * sizeof(float)));
+        using var dw = runtime.AllocateBytes((nuint)(n * k * sizeof(float)));
+        dz.Upload<float>(dzHost);
+        x.Upload<float>(xHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(dz, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(x, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(dw, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[n * k];
+        dw.Download<float>(actual);
+        AssertVectorClose(actual, expected, 2e-3f, $"dweight {m}x{n}x{k}");
+    }
+
+    [SkippableTheory]
+    [InlineData(128, 256)]
+    [InlineData(64, 512)]
+    public void DriverOnlyDBias_MatchesColumnSumOracle(int m, int n)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedFusedLinear(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in dBias specialization is measured on GA10x/SM86.");
+        using var kernel = new PtxBiasGradientKernel(runtime, m, n);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20263600 + m + n);
+        float[] dzHost = Values(random, m * n, 0.125f);
+        var expected = new float[n];
+        for (int nn = 0; nn < n; nn++)
+        {
+            double acc = 0;
+            for (int mm = 0; mm < m; mm++)
+                acc += dzHost[mm * n + nn];
+            expected[nn] = (float)acc;
+        }
+
+        using var dz = runtime.AllocateBytes((nuint)(dzHost.Length * sizeof(float)));
+        using var dbias = runtime.AllocateBytes((nuint)(n * sizeof(float)));
+        dz.Upload<float>(dzHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(dz, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(dbias, kernel.Blueprint.Tensors[1]));
+        runtime.Synchronize();
+        var actual = new float[n];
+        dbias.Download<float>(actual);
+        AssertVectorClose(actual, expected, 2e-3f, $"dbias {m}x{n}");
+    }
+
+    [Fact]
+    public void SoftmaxCrossEntropyIndexEmitter_IsSinglePassStableReductionWithGradient()
+    {
+        string ptx = PtxSoftmaxCrossEntropyIndexKernel.EmitPtx(8, 6, 64, 512);
+        Assert.Contains(PtxSoftmaxCrossEntropyIndexKernel.EntryPoint, ptx);
+        Assert.Contains(".shared .align 16 .b8 row_sh[2048]", ptx);   // N=512 row cache
+        Assert.Contains(".shared .align 16 .b8 red[1024]", ptx);       // 256-thread reduction
+        Assert.Contains("LOAD_LOOP:", ptx);
+        Assert.Contains("SUM_LOOP:", ptx);
+        Assert.Contains("GRAD_LOOP:", ptx);
+        Assert.Contains("max.f32 %f10", ptx);                          // tree-reduced max
+        Assert.Contains("ex2.approx.f32", ptx);                        // exp
+        Assert.Contains("lg2.approx.f32", ptx);                        // log for logsumexp
+        Assert.Contains("rcp.approx.f32", ptx);                        // 1/sumExp
+        Assert.Contains("ld.global.nc.u32 %r4", ptx);                  // integer target
+        // Two reductions, each: store-barrier + 8 tree-halving barriers + post-load barrier.
+        Assert.Equal(20, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxSoftmaxCrossEntropyIndexKernel.IsSupportedShape(128, 2048));
+        Assert.False(PtxSoftmaxCrossEntropyIndexKernel.IsPromotedShape(128, 2048));
+    }
+
+    [SkippableTheory]
+    [InlineData(64, 256)]
+    [InlineData(128, 512)]
+    public void DriverOnlySoftmaxCrossEntropyIndex_MatchesOracle(int m, int n)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedFusedLinear(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in softmax-cross-entropy specialization is measured on GA10x/SM86.");
+        using var kernel = new PtxSoftmaxCrossEntropyIndexKernel(runtime, m, n);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20263700 + m + n);
+        float[] logits = Values(random, m * n, 3.0f);   // wide range exercises stability
+        var targets = new int[m];
+        for (int row = 0; row < m; row++)
+            targets[row] = (int)(random.NextDouble() * n) % n;
+
+        var expLoss = new float[m];
+        var expGrad = new float[m * n];
+        for (int row = 0; row < m; row++)
+        {
+            double max = double.NegativeInfinity;
+            for (int col = 0; col < n; col++) max = Math.Max(max, logits[row * n + col]);
+            double sum = 0;
+            for (int col = 0; col < n; col++) sum += Math.Exp(logits[row * n + col] - max);
+            double logZ = max + Math.Log(sum);
+            expLoss[row] = (float)(logZ - logits[row * n + targets[row]]);
+            for (int col = 0; col < n; col++)
+            {
+                double sm = Math.Exp(logits[row * n + col] - max) / sum;
+                expGrad[row * n + col] = (float)(sm - (col == targets[row] ? 1.0 : 0.0));
+            }
+        }
+
+        using var logitsBuf = runtime.AllocateBytes((nuint)(logits.Length * sizeof(float)));
+        using var targetsBuf = runtime.AllocateBytes((nuint)(targets.Length * sizeof(int)));
+        using var lossBuf = runtime.AllocateBytes((nuint)(m * sizeof(float)));
+        using var gradBuf = runtime.AllocateBytes((nuint)(m * n * sizeof(float)));
+        logitsBuf.Upload<float>(logits);
+        targetsBuf.Upload<int>(targets);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(logitsBuf, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(targetsBuf, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(lossBuf, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(gradBuf, kernel.Blueprint.Tensors[3]));
+        runtime.Synchronize();
+        var actualLoss = new float[m];
+        var actualGrad = new float[m * n];
+        lossBuf.Download<float>(actualLoss);
+        gradBuf.Download<float>(actualGrad);
+        AssertVectorClose(actualLoss, expLoss, 3e-3f, $"ce-index loss {m}x{n}");
+        AssertVectorClose(actualGrad, expGrad, 3e-3f, $"ce-index grad {m}x{n}");
+    }
+
+    [Fact]
+    public void SoftmaxCrossEntropyDenseEmitter_ReducesTargetMassAndDot()
+    {
+        string ptx = PtxSoftmaxCrossEntropyDenseKernel.EmitPtx(8, 6, 64, 512);
+        Assert.Contains(PtxSoftmaxCrossEntropyDenseKernel.EntryPoint, ptx);
+        Assert.Contains(".shared .align 16 .b8 row_sh[2048]", ptx);
+        Assert.Contains("fma.rn.f32 %f6, %f9, %f1, %f6", ptx);   // dot += target*logit
+        Assert.Contains("ex2.approx.f32", ptx);
+        Assert.Contains("lg2.approx.f32", ptx);
+        Assert.Contains("rcp.approx.f32", ptx);
+        // Four tree reductions (max, exp-sum, dot, sumT), each 1 store + 8 halving + 1 post-load.
+        Assert.Equal(40, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxSoftmaxCrossEntropyDenseKernel.IsSupportedShape(128, 2048));
+        Assert.False(PtxSoftmaxCrossEntropyDenseKernel.IsPromotedShape(128, 2048));
+    }
+
+    [SkippableTheory]
+    [InlineData(64, 256)]
+    [InlineData(128, 512)]
+    public void DriverOnlySoftmaxCrossEntropyDense_MatchesOracle(int m, int n)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedFusedLinear(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in dense softmax-cross-entropy specialization is measured on GA10x/SM86.");
+        using var kernel = new PtxSoftmaxCrossEntropyDenseKernel(runtime, m, n);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20263800 + m + n);
+        float[] logits = Values(random, m * n, 3.0f);
+        // Normalized soft target rows (each row sums to 1).
+        var targets = new float[m * n];
+        for (int row = 0; row < m; row++)
+        {
+            double s = 0;
+            for (int col = 0; col < n; col++) { double t = random.NextDouble(); targets[row * n + col] = (float)t; s += t; }
+            for (int col = 0; col < n; col++) targets[row * n + col] = (float)(targets[row * n + col] / s);
+        }
+
+        var expLoss = new float[m];
+        var expGrad = new float[m * n];
+        for (int row = 0; row < m; row++)
+        {
+            double max = double.NegativeInfinity;
+            for (int col = 0; col < n; col++) max = Math.Max(max, logits[row * n + col]);
+            double sum = 0;
+            for (int col = 0; col < n; col++) sum += Math.Exp(logits[row * n + col] - max);
+            double logZ = max + Math.Log(sum);
+            double sumT = 0, dot = 0;
+            for (int col = 0; col < n; col++) { sumT += targets[row * n + col]; dot += targets[row * n + col] * (double)logits[row * n + col]; }
+            expLoss[row] = (float)(logZ * sumT - dot);
+            for (int col = 0; col < n; col++)
+            {
+                double sm = Math.Exp(logits[row * n + col] - max) / sum;
+                expGrad[row * n + col] = (float)(sm * sumT - targets[row * n + col]);
+            }
+        }
+
+        using var logitsBuf = runtime.AllocateBytes((nuint)(logits.Length * sizeof(float)));
+        using var targetsBuf = runtime.AllocateBytes((nuint)(targets.Length * sizeof(float)));
+        using var lossBuf = runtime.AllocateBytes((nuint)(m * sizeof(float)));
+        using var gradBuf = runtime.AllocateBytes((nuint)(m * n * sizeof(float)));
+        logitsBuf.Upload<float>(logits);
+        targetsBuf.Upload<float>(targets);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(logitsBuf, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(targetsBuf, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(lossBuf, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(gradBuf, kernel.Blueprint.Tensors[3]));
+        runtime.Synchronize();
+        var actualLoss = new float[m];
+        var actualGrad = new float[m * n];
+        lossBuf.Download<float>(actualLoss);
+        gradBuf.Download<float>(actualGrad);
+        AssertVectorClose(actualLoss, expLoss, 3e-3f, $"ce-dense loss {m}x{n}");
+        AssertVectorClose(actualGrad, expGrad, 3e-3f, $"ce-dense grad {m}x{n}");
+    }
+
+    [Fact]
+    public void GemmFp16TransposedEmitter_ConvertsFp16InAndOutWithTransposedB()
+    {
+        string ptx = PtxGemmFp16TransposedKernel.EmitPtx(8, 6, 64, 256, 256);
+        Assert.Contains(PtxGemmFp16TransposedKernel.EntryPoint, ptx);
+        Assert.Equal(4, Count(ptx, "ld.global.nc.u16"));   // 2 A + 2 B fp16 loads / thread
+        Assert.Equal(4, Count(ptx, "cvt.f32.f16"));         // fp16 operands -> fp32 tile
+        Assert.Equal(128, Count(ptx, "fma.rn.f32"));        // fp32 accumulate
+        Assert.Equal(16, Count(ptx, "cvt.rn.f16.f32"));     // narrow accumulators
+        Assert.Equal(16, Count(ptx, "st.global.u16"));      // fp16 output
+        Assert.Equal(0, Count(ptx, "add.rn.f32"));          // no bias
+        Assert.Equal(2, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxGemmFp16TransposedKernel.IsSupportedShape(128, 512, 2048));
+        Assert.False(PtxGemmFp16TransposedKernel.IsPromotedShape(128, 512, 2048));
+    }
+
+    [SkippableTheory]
+    [InlineData(64, 256, 256)]
+    [InlineData(128, 512, 256)]
+    public void DriverOnlyGemmFp16Transposed_MatchesOracle(int m, int kc, int no)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedFusedLinear(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in FP16 transpose-B specialization is measured on GA10x/SM86.");
+        using var kernel = new PtxGemmFp16TransposedKernel(runtime, m, kc, no);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20263900 + m + kc + no);
+        ushort[] aHost = RandomHalfRange(random, m * kc, 0.25f);
+        ushort[] bHost = RandomHalfRange(random, no * kc, 0.25f);   // output-major [No,Kc]
+        var expected = new float[m * no];
+        for (int row = 0; row < m; row++)
+        for (int col = 0; col < no; col++)
+        {
+            float acc = 0;
+            for (int t = 0; t < kc; t++)
+                acc += (float)BitConverter.UInt16BitsToHalf(aHost[row * kc + t])
+                     * (float)BitConverter.UInt16BitsToHalf(bHost[col * kc + t]);
+            expected[row * no + col] = acc;
+        }
+
+        using var a = runtime.AllocateBytes((nuint)(aHost.Length * sizeof(ushort)));
+        using var b = runtime.AllocateBytes((nuint)(bHost.Length * sizeof(ushort)));
+        using var output = runtime.AllocateBytes((nuint)(m * no * sizeof(ushort)));
+        a.Upload<ushort>(aHost);
+        b.Upload<ushort>(bHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(a, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(b, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new ushort[m * no];
+        output.Download<ushort>(actual);
+        for (int i = 0; i < actual.Length; i++)
+            Assert.True(Math.Abs((float)BitConverter.UInt16BitsToHalf(actual[i]) - expected[i]) < 5e-2f,
+                $"fp16 transpose-B mismatch at {i}");
+    }
+
+    [Fact]
+    public void GemmFp16ContractMEmitter_ContractsOverMWithFp16Conversions()
+    {
+        string ptx = PtxGemmFp16ContractMKernel.EmitPtx(8, 6, 128, 256, 256);
+        Assert.Contains(PtxGemmFp16ContractMKernel.EntryPoint, ptx);
+        Assert.Contains(".shared .align 16 .b8 a_tile[2048]", ptx);
+        Assert.Contains(".shared .align 16 .b8 b_tile[2048]", ptx);
+        Assert.Contains("M_TILE_LOOP:", ptx);
+        Assert.Equal(4, Count(ptx, "ld.global.nc.u16"));
+        Assert.Equal(4, Count(ptx, "cvt.f32.f16"));
+        Assert.Equal(128, Count(ptx, "fma.rn.f32"));
+        Assert.Equal(16, Count(ptx, "cvt.rn.f16.f32"));
+        Assert.Equal(16, Count(ptx, "st.global.u16"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxGemmFp16ContractMKernel.IsSupportedShape(128, 512, 2048));
+        Assert.False(PtxGemmFp16ContractMKernel.IsPromotedShape(128, 512, 2048));
+    }
+
+    [SkippableTheory]
+    [InlineData(128, 256, 256)]
+    [InlineData(64, 512, 256)]
+    public void DriverOnlyGemmFp16ContractM_MatchesOracle(int m, int p, int q)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedFusedLinear(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in FP16 contract-M specialization is measured on GA10x/SM86.");
+        using var kernel = new PtxGemmFp16ContractMKernel(runtime, m, p, q);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20264000 + m + p + q);
+        ushort[] aHost = RandomHalfRange(random, m * p, 0.25f);   // A[M,P]
+        ushort[] bHost = RandomHalfRange(random, m * q, 0.25f);   // B[M,Q]
+        var expected = new float[p * q];
+        for (int pp = 0; pp < p; pp++)
+        for (int qq = 0; qq < q; qq++)
+        {
+            float acc = 0;
+            for (int mm = 0; mm < m; mm++)
+                acc += (float)BitConverter.UInt16BitsToHalf(aHost[mm * p + pp])
+                     * (float)BitConverter.UInt16BitsToHalf(bHost[mm * q + qq]);
+            expected[pp * q + qq] = acc;
+        }
+
+        using var a = runtime.AllocateBytes((nuint)(aHost.Length * sizeof(ushort)));
+        using var b = runtime.AllocateBytes((nuint)(bHost.Length * sizeof(ushort)));
+        using var output = runtime.AllocateBytes((nuint)(p * q * sizeof(ushort)));
+        a.Upload<ushort>(aHost);
+        b.Upload<ushort>(bHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(a, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(b, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new ushort[p * q];
+        output.Download<ushort>(actual);
+        for (int i = 0; i < actual.Length; i++)
+            Assert.True(Math.Abs((float)BitConverter.UInt16BitsToHalf(actual[i]) - expected[i]) < 8e-2f,
+                $"fp16 contract-M mismatch at {i}");
+    }
+
+    [Fact]
+    public void BatchedGemmFanoutEmitter_DereferencesPointerArraysPerBatch()
+    {
+        string ptx = PtxBatchedGemmFanoutKernel.EmitPtx(8, 6, 64, 256, 256);
+        Assert.Contains(PtxBatchedGemmFanoutKernel.EntryPoint, ptx);
+        Assert.Contains(".param .u64 b_ptr_array", ptx);
+        Assert.Contains(".param .u64 c_ptr_array", ptx);
+        Assert.Contains("%ctaid.z", ptx);                       // batch slice
+        Assert.Equal(2, Count(ptx, "ld.global.nc.u64"));        // B_z and C_z base derefs
+        Assert.Equal(128, Count(ptx, "fma.rn.f32"));
+        Assert.Equal(16, Count(ptx, "st.global.f32"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxBatchedGemmFanoutKernel.IsSupportedShape(128, 512, 2048, 8));
+        Assert.False(PtxBatchedGemmFanoutKernel.IsSupportedShape(128, 512, 2048, 0));
+        Assert.False(PtxBatchedGemmFanoutKernel.IsPromotedShape(128, 512, 2048, 8));
+    }
+
+    [SkippableTheory]
+    [InlineData(64, 256, 256, 3)]
+    [InlineData(128, 256, 512, 4)]
+    public void DriverOnlyBatchedGemmFanout_MatchesOracle(int m, int k, int n, int batch)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedFusedLinear(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in batched-fanout specialization is measured on GA10x/SM86.");
+        using var kernel = new PtxBatchedGemmFanoutKernel(runtime, m, k, n, batch);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20264100 + m + k + n + batch);
+        float[] aHost = Values(random, m * k, 0.125f);
+        float[] bAllHost = Values(random, batch * k * n, 0.0625f);
+        var expected = new float[batch * m * n];
+        for (int bi = 0; bi < batch; bi++)
+        for (int row = 0; row < m; row++)
+        for (int col = 0; col < n; col++)
+        {
+            double acc = 0;
+            for (int kk = 0; kk < k; kk++)
+                acc += aHost[row * k + kk] * (double)bAllHost[bi * k * n + kk * n + col];
+            expected[bi * m * n + row * n + col] = (float)acc;
+        }
+
+        using var aBuf = runtime.AllocateBytes((nuint)(aHost.Length * sizeof(float)));
+        using var bAll = runtime.AllocateBytes((nuint)(bAllHost.Length * sizeof(float)));
+        using var cAll = runtime.AllocateBytes((nuint)(batch * m * n * sizeof(float)));
+        aBuf.Upload<float>(aHost);
+        bAll.Upload<float>(bAllHost);
+        var bPtrs = new ulong[batch];
+        var cPtrs = new ulong[batch];
+        for (int bi = 0; bi < batch; bi++)
+        {
+            bPtrs[bi] = (ulong)(bAll.Pointer.ToInt64() + (long)bi * k * n * sizeof(float));
+            cPtrs[bi] = (ulong)(cAll.Pointer.ToInt64() + (long)bi * m * n * sizeof(float));
+        }
+        using var bArray = runtime.AllocateBytes((nuint)(batch * sizeof(ulong)));
+        using var cArray = runtime.AllocateBytes((nuint)(batch * sizeof(ulong)));
+        bArray.Upload<ulong>(bPtrs);
+        cArray.Upload<ulong>(cPtrs);
+
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(aBuf, kernel.Blueprint.Tensors[0]),
+            bArray.Pointer, cArray.Pointer);
+        runtime.Synchronize();
+        var actual = new float[batch * m * n];
+        cAll.Download<float>(actual);
+        AssertVectorClose(actual, expected, 2e-3f, $"batched fanout {m}x{k}x{n} b{batch}");
+    }
+
+    [Fact]
+    public void BatchedGemmExFanoutEmitter_IsFp16FanoutWithPointerArrays()
+    {
+        string ptx = PtxBatchedGemmExFanoutKernel.EmitPtx(8, 6, 64, 256, 256);
+        Assert.Contains(PtxBatchedGemmExFanoutKernel.EntryPoint, ptx);
+        Assert.Contains(".param .u64 b_ptr_array", ptx);
+        Assert.Contains("%ctaid.z", ptx);
+        Assert.Equal(2, Count(ptx, "ld.global.nc.u64"));        // pointer derefs
+        Assert.Equal(4, Count(ptx, "ld.global.nc.u16"));        // fp16 A + B loads
+        Assert.Equal(4, Count(ptx, "cvt.f32.f16"));
+        Assert.Equal(128, Count(ptx, "fma.rn.f32"));
+        Assert.Equal(16, Count(ptx, "cvt.rn.f16.f32"));
+        Assert.Equal(16, Count(ptx, "st.global.u16"));          // fp16 output
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxBatchedGemmExFanoutKernel.IsSupportedShape(128, 512, 2048, 4));
+        Assert.False(PtxBatchedGemmExFanoutKernel.IsPromotedShape(128, 512, 2048, 4));
+    }
+
+    [SkippableTheory]
+    [InlineData(64, 256, 256, 3)]
+    public void DriverOnlyBatchedGemmExFanout_MatchesOracle(int m, int k, int n, int batch)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedFusedLinear(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in mixed-precision batched-fanout specialization is measured on GA10x/SM86.");
+        using var kernel = new PtxBatchedGemmExFanoutKernel(runtime, m, k, n, batch);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20264200 + m + k + n + batch);
+        ushort[] aHost = RandomHalfRange(random, m * k, 0.25f);
+        ushort[] bAllHost = RandomHalfRange(random, batch * k * n, 0.25f);
+        var expected = new float[batch * m * n];
+        for (int bi = 0; bi < batch; bi++)
+        for (int row = 0; row < m; row++)
+        for (int col = 0; col < n; col++)
+        {
+            float acc = 0;
+            for (int kk = 0; kk < k; kk++)
+                acc += (float)BitConverter.UInt16BitsToHalf(aHost[row * k + kk])
+                     * (float)BitConverter.UInt16BitsToHalf(bAllHost[bi * k * n + kk * n + col]);
+            expected[bi * m * n + row * n + col] = acc;
+        }
+
+        using var aBuf = runtime.AllocateBytes((nuint)(aHost.Length * sizeof(ushort)));
+        using var bAll = runtime.AllocateBytes((nuint)(bAllHost.Length * sizeof(ushort)));
+        using var cAll = runtime.AllocateBytes((nuint)(batch * m * n * sizeof(ushort)));
+        aBuf.Upload<ushort>(aHost);
+        bAll.Upload<ushort>(bAllHost);
+        var bPtrs = new ulong[batch];
+        var cPtrs = new ulong[batch];
+        for (int bi = 0; bi < batch; bi++)
+        {
+            bPtrs[bi] = (ulong)(bAll.Pointer.ToInt64() + (long)bi * k * n * sizeof(ushort));
+            cPtrs[bi] = (ulong)(cAll.Pointer.ToInt64() + (long)bi * m * n * sizeof(ushort));
+        }
+        using var bArray = runtime.AllocateBytes((nuint)(batch * sizeof(ulong)));
+        using var cArray = runtime.AllocateBytes((nuint)(batch * sizeof(ulong)));
+        bArray.Upload<ulong>(bPtrs);
+        cArray.Upload<ulong>(cPtrs);
+
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(aBuf, kernel.Blueprint.Tensors[0]),
+            bArray.Pointer, cArray.Pointer);
+        runtime.Synchronize();
+        var actual = new ushort[batch * m * n];
+        cAll.Download<ushort>(actual);
+        for (int i = 0; i < actual.Length; i++)
+            Assert.True(Math.Abs((float)BitConverter.UInt16BitsToHalf(actual[i]) - expected[i]) < 6e-2f,
+                $"fp16 fanout mismatch at {i}");
+    }
+
+    [Theory]
+    [InlineData(16)]
+    [InlineData(32)]
+    [InlineData(64)]
+    public void FusedLoraForwardStandardEmitter_IsStandardBTwoStageWithSharedZ(int rank)
+    {
+        string ptx = PtxFusedLoRAForwardStandardKernel.EmitPtx(8, 6, 64, 256, 256, rank);
+        Assert.Contains(PtxFusedLoRAForwardStandardKernel.EntryPoint, ptx);
+        Assert.Contains("ld.param.f32 %f26, [scale];", ptx);
+        Assert.Contains(".shared .align 16 .b8 z_tile[16384]", ptx);   // always MaxRank-sized
+        Assert.Contains("STAGE1_K_LOOP:", ptx);
+        Assert.Contains("COL_LOOP:", ptx);
+        Assert.Contains("STAGE2_R_LOOP:", ptx);
+        Assert.Equal(272, Count(ptx, "fma.rn.f32"));       // 128 Z + 128 dY + 16 residual
+        Assert.Equal(16, Count(ptx, "st.global.f32"));
+        Assert.Equal(5, Count(ptx, "bar.sync 0"));
+        Assert.Contains($"setp.lt.u32 %p1, %r9, {rank};", ptx);        // R-loop bounded by rank
+        Assert.Contains($"setp.lt.u32 %p3, %r17, {rank};", ptx);        // loraA col bounds guard
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxFusedLoRAForwardStandardKernel.IsSupportedShape(128, 512, 2048, rank));
+        Assert.False(PtxFusedLoRAForwardStandardKernel.IsSupportedShape(128, 512, 2048, 48));
+        Assert.False(PtxFusedLoRAForwardStandardKernel.IsPromotedShape(128, 512, 2048, rank));
+    }
+
+    [SkippableTheory]
+    [InlineData(64, 256, 256, 64)]
+    [InlineData(128, 512, 512, 32)]
+    [InlineData(64, 256, 512, 16)]
+    public void DriverOnlyFusedLoraForwardStandard_MatchesOracle(int m, int k, int n, int r)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedFusedLinear(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in standard-layout fused-LoRA specialization is measured on GA10x/SM86.");
+        const float scale = 0.5f;
+        using var kernel = new PtxFusedLoRAForwardStandardKernel(runtime, m, k, n, r, scale);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+        Assert.Equal(5, kernel.Blueprint.Tensors.Count);
+
+        var random = RandomHelper.CreateSeededRandom(20264300 + m + k + n);
+        float[] xHost = Values(random, m * k, 0.125f);
+        float[] aHost = Values(random, k * r, 0.0625f);       // loraA[K,R] standard
+        float[] bHost = Values(random, r * n, 0.0625f);       // loraB[R,N] standard
+        float[] baseHost = Values(random, m * n, 0.25f);
+        var z = new double[m * r];
+        for (int row = 0; row < m; row++)
+        for (int t = 0; t < r; t++)
+        {
+            double acc = 0;
+            for (int kk = 0; kk < k; kk++) acc += xHost[row * k + kk] * (double)aHost[kk * r + t];
+            z[row * r + t] = acc;
+        }
+        var expected = new float[m * n];
+        for (int row = 0; row < m; row++)
+        for (int col = 0; col < n; col++)
+        {
+            double acc = 0;
+            for (int t = 0; t < r; t++) acc += z[row * r + t] * bHost[t * n + col];
+            expected[row * n + col] = (float)(baseHost[row * n + col] + scale * acc);
+        }
+
+        using var x = runtime.AllocateBytes((nuint)(xHost.Length * sizeof(float)));
+        using var a = runtime.AllocateBytes((nuint)(aHost.Length * sizeof(float)));
+        using var b = runtime.AllocateBytes((nuint)(bHost.Length * sizeof(float)));
+        using var baseBuf = runtime.AllocateBytes((nuint)(baseHost.Length * sizeof(float)));
+        using var output = runtime.AllocateBytes((nuint)(m * n * sizeof(float)));
+        x.Upload<float>(xHost);
+        a.Upload<float>(aHost);
+        b.Upload<float>(bHost);
+        baseBuf.Upload<float>(baseHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(x, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(a, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(b, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(baseBuf, kernel.Blueprint.Tensors[3]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[4]));
+        runtime.Synchronize();
+        var actual = new float[m * n];
+        output.Download<float>(actual);
+        AssertVectorClose(actual, expected, 2e-3f, $"fused lora standard {m}x{k}x{n} r{r}");
+    }
+
+    [Fact]
+    public void GemmEmitter_IsRegisterResidentTiledGemm()
+    {
+        string ptx = PtxGemmKernel.EmitPtx(8, 6, 64, 256, 256);
+        Assert.Contains(PtxGemmKernel.EntryPoint, ptx);
+        Assert.Contains(".shared .align 16 .b8 a_tile[2048]", ptx);
+        Assert.Contains(".shared .align 16 .b8 b_tile[2048]", ptx);
+        Assert.Equal(128, Count(ptx, "fma.rn.f32"));   // no bias/activation epilogue
+        Assert.Equal(64, Count(ptx, "ld.shared.f32"));
+        Assert.Equal(2, Count(ptx, "bar.sync 0"));
+        Assert.Equal(16, Count(ptx, "st.global.f32"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("%ctaid.z", ptx, StringComparison.Ordinal); // single, not batched
+        Assert.False(PtxGemmKernel.IsSupportedShape(63, 256, 256));
+        Assert.True(PtxGemmKernel.IsSupportedShape(128, 512, 2048));
+        Assert.False(PtxGemmKernel.IsPromotedShape(128, 512, 2048));
+    }
+
+    [Fact]
+    public void BatchedGemmEmitter_IsRegisterResidentTiledGemm()
+    {
+        string ptx = PtxBatchedGemmKernel.EmitPtx(8, 6, 4, 64, 256, 256);
+        Assert.Contains(PtxBatchedGemmKernel.EntryPoint, ptx);
+        Assert.Contains(".shared .align 16 .b8 a_tile[2048]", ptx);
+        Assert.Contains(".shared .align 16 .b8 b_tile[2048]", ptx);
+        Assert.Contains("%ctaid.z", ptx);                 // per-batch offset
+        Assert.Equal(128, Count(ptx, "fma.rn.f32"));      // no bias/activation epilogue
+        Assert.Equal(64, Count(ptx, "ld.shared.f32"));
+        Assert.Equal(2, Count(ptx, "bar.sync 0"));
+        Assert.Equal(16, Count(ptx, "st.global.f32"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.False(PtxBatchedGemmKernel.IsSupportedShape(3, 64, 256, 256));
+        Assert.True(PtxBatchedGemmKernel.IsSupportedShape(8, 128, 512, 512));
+        Assert.False(PtxBatchedGemmKernel.IsPromotedShape(8, 128, 512, 512));
+    }
+
+    [Fact]
+    public void OuterProductEmitter_IsRegisterResidentPointerOnly()
+    {
+        string ptx = PtxOuterProductKernel.EmitPtx(8, 6, 64, 256);
+        Assert.Contains(PtxOuterProductKernel.EntryPoint, ptx);
+        Assert.Equal(3, Count(ptx, "ld.param.u64"));
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.Equal(1, Count(ptx, "mul.rn.f32"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("bar.sync", ptx, StringComparison.Ordinal);
+        Assert.False(PtxOuterProductKernel.IsSupportedShape(64, 96));
+        Assert.True(PtxOuterProductKernel.IsSupportedShape(128, 2048));
+        Assert.False(PtxOuterProductKernel.IsPromotedShape(128, 2048));
+    }
+
+    [Fact]
+    public void DotProductEmitter_IsIsaCorrectWarpCtaReduction()
+    {
+        string ptx = PtxDotProductKernel.EmitPtx(8, 6, 1024);
+        Assert.Contains(PtxDotProductKernel.EntryPoint, ptx);
+        Assert.Equal(3, Count(ptx, "ld.param.u64"));
+        Assert.Equal(10, Count(ptx, "shfl.sync.bfly.b32"));  // 2 warp reductions x 5 deltas
+        Assert.Equal(1, Count(ptx, "bar.sync 0"));
+        Assert.Contains(".shared .align 4 .b8 partial[32]", ptx);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        // shuffles go through .b32 registers, never .f32.
+        Assert.DoesNotContain("shfl.sync.bfly.b32 %f", ptx, StringComparison.Ordinal);
+        Assert.False(PtxDotProductKernel.IsSupportedShape(300));
+        Assert.True(PtxDotProductKernel.IsSupportedShape(2048));
     }
 
     [Theory]
@@ -4010,20 +4540,6 @@ public class DirectPtxWmmaTests
     }
 
     private static float Half(ushort bits) => (float)BitConverter.UInt16BitsToHalf(bits);
-
-    private static ushort[] BFloat16Values(Random random, int length)
-    {
-        var result = new ushort[length];
-        for (int i = 0; i < result.Length; i++)
-        {
-            float value = random.Next(-16, 17) / 128f;
-            result[i] = (ushort)((uint)BitConverter.SingleToInt32Bits(value) >> 16);
-        }
-        return result;
-    }
-
-    private static float BFloat16(ushort bits) =>
-        BitConverter.Int32BitsToSingle(bits << 16);
 
     private static (float[] Cosine, float[] Sine) RopeTables(int capacity)
     {

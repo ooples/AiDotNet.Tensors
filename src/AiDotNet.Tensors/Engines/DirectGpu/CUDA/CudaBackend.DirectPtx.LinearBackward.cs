@@ -8,6 +8,10 @@ public sealed partial class CudaBackend
 {
     private readonly DirectPtxKernelCache<DirectPtxLinearBackwardKey, PtxFusedLinearBackwardKernel>
         _directPtxLinearBackwardKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private long _directPtxLinearBackwardDispatchCount;
+
+    internal long DirectPtxLinearBackwardDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxLinearBackwardDispatchCount);
 
     private readonly record struct DirectPtxLinearBackwardKey(
         int M, int K, int N, int Activation);
@@ -90,6 +94,7 @@ public sealed partial class CudaBackend
                         DirectPtxTensorView.Create(gradWeight, kernel.Blueprint.Tensors[5]),
                         DirectPtxTensorView.Create(gradBias, kernel.Blueprint.Tensors[6]));
             }
+            System.Threading.Interlocked.Increment(ref _directPtxLinearBackwardDispatchCount);
             DirectPtxLastError = null;
             return true;
         }
@@ -134,6 +139,32 @@ public sealed partial class CudaBackend
             DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
             return false;
         }
+    }
+
+    internal bool TryDirectPtxFusedLinearBackward(
+        IGpuBuffer gradOutput,
+        IGpuBuffer input,
+        IGpuBuffer weights,
+        IGpuBuffer saved,
+        IGpuBuffer gradInput,
+        IGpuBuffer gradWeight,
+        IGpuBuffer gradBias,
+        int m,
+        int k,
+        int n,
+        DirectPtxLinearActivation activation,
+        bool derivativeFromOutput)
+    {
+        bool requiresOutput = activation == DirectPtxLinearActivation.Sigmoid ||
+            activation == DirectPtxLinearActivation.Tanh;
+        if (derivativeFromOutput != requiresOutput)
+        {
+            DirectPtxLastError = "fused-linear-backward-saved-value-kind-mismatch";
+            return false;
+        }
+        return TryDirectPtxFusedLinearBackward(
+            gradOutput, input, weights, saved, gradInput, gradWeight, gradBias,
+            m, k, n, activation);
     }
 
     internal bool TryGetDirectPtxFusedLinearBackwardAudits(
