@@ -24,10 +24,93 @@ public class DirectPtxScientificTests
             Assert.False(string.IsNullOrWhiteSpace(cell.DTypes));
             Assert.False(string.IsNullOrWhiteSpace(cell.DirectPtxAssignment));
         });
-        Assert.Equal(DirectPtxScientificCoverageStatus.ExperimentalDirectPtx,
-            DirectPtxScientificCoverageManifest.Get("CudaBackend.ComplexMultiply").Status);
+        foreach (string api in new[] { "CudaBackend.ComplexMultiply", "CudaBackend.ComplexConjugate", "CudaBackend.ComplexMagnitude" })
+            Assert.Equal(DirectPtxScientificCoverageStatus.ExperimentalDirectPtx,
+                DirectPtxScientificCoverageManifest.Get(api).Status);
         Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() =>
             DirectPtxScientificCoverageManifest.Get("UnassignedScientificApi"));
+    }
+
+    [Fact]
+    public void ComplexConjugateEmitter_NegatesImaginaryPart()
+    {
+        string ptx = PtxComplexConjugateKernel.EmitPtx(8, 6, 16384);
+        Assert.Contains(PtxComplexConjugateKernel.EntryPoint, ptx);
+        Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));
+        Assert.Equal(2, Count(ptx, "st.global.f32"));
+        Assert.Contains("neg.f32 %f2, %f1", ptx);
+        Assert.Equal(0, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxComplexConjugateKernel.IsSupportedPairs(16384));
+        Assert.False(PtxComplexConjugateKernel.IsPromotedPairs(16384));
+    }
+
+    [Fact]
+    public void ComplexMagnitudeEmitter_UsesRoundToNearestSqrt()
+    {
+        string ptx = PtxComplexMagnitudeKernel.EmitPtx(8, 6, 16384);
+        Assert.Contains(PtxComplexMagnitudeKernel.EntryPoint, ptx);
+        Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.Contains("fma.rn.f32 %f2, %f1, %f1, %f2", ptx);   // re^2 + im^2
+        Assert.Contains("sqrt.rn.f32 %f3, %f2", ptx);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxComplexMagnitudeKernel.IsSupportedCount(16384));
+        Assert.False(PtxComplexMagnitudeKernel.IsPromotedCount(16384));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyComplexConjugateAndMagnitude_MatchOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in complex specializations are measured on GA10x/SM86.");
+        const int pairs = 16384;
+        var random = RandomHelper.CreateSeededRandom(20266000);
+
+        // Conjugate (interleaved).
+        float[] cIn = Values(random, pairs * 2, 2.0f);
+        var conjExpected = new float[pairs * 2];
+        for (int i = 0; i < pairs; i++) { conjExpected[2 * i] = cIn[2 * i]; conjExpected[2 * i + 1] = -cIn[2 * i + 1]; }
+        using (var conj = new PtxComplexConjugateKernel(runtime, pairs))
+        using (var inBuf = runtime.AllocateBytes((nuint)(cIn.Length * sizeof(float))))
+        using (var outBuf = runtime.AllocateBytes((nuint)(pairs * 2 * sizeof(float))))
+        {
+            Assert.Equal(0, conj.Audit.Function.LocalBytesPerThread);
+            inBuf.Upload<float>(cIn);
+            conj.Launch(
+                DirectPtxTensorView.CreateOwned(inBuf, conj.Blueprint.Tensors[0]),
+                DirectPtxTensorView.CreateOwned(outBuf, conj.Blueprint.Tensors[1]));
+            runtime.Synchronize();
+            var got = new float[pairs * 2];
+            outBuf.Download<float>(got);
+            AssertVectorClose(got, conjExpected, 0f, "complex conjugate");
+        }
+
+        // Magnitude (split).
+        float[] re = Values(random, pairs, 2.0f);
+        float[] im = Values(random, pairs, 2.0f);
+        var magExpected = new float[pairs];
+        for (int i = 0; i < pairs; i++) magExpected[i] = (float)Math.Sqrt((double)re[i] * re[i] + (double)im[i] * im[i]);
+        using (var mag = new PtxComplexMagnitudeKernel(runtime, pairs))
+        using (var reBuf = runtime.AllocateBytes((nuint)(re.Length * sizeof(float))))
+        using (var imBuf = runtime.AllocateBytes((nuint)(im.Length * sizeof(float))))
+        using (var magBuf = runtime.AllocateBytes((nuint)(pairs * sizeof(float))))
+        {
+            reBuf.Upload<float>(re);
+            imBuf.Upload<float>(im);
+            mag.Launch(
+                DirectPtxTensorView.CreateOwned(reBuf, mag.Blueprint.Tensors[0]),
+                DirectPtxTensorView.CreateOwned(imBuf, mag.Blueprint.Tensors[1]),
+                DirectPtxTensorView.CreateOwned(magBuf, mag.Blueprint.Tensors[2]));
+            runtime.Synchronize();
+            var got = new float[pairs];
+            magBuf.Download<float>(got);
+            AssertVectorClose(got, magExpected, 2e-3f, "complex magnitude");
+        }
     }
 
     [Fact]
