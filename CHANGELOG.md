@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.119.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.118.0...v0.119.0) (2026-07-21)
+
+
+### Features
+
+* **simd:** block-Q8_0 GEMM matching ggml_vec_dot_q8_0_q8_0 ([#830](https://github.com/ooples/AiDotNet.Tensors/issues/830)) ([3a4d27e](https://github.com/ooples/AiDotNet.Tensors/commit/3a4d27eaadb2382f71277b3487fe64fde9f1ed33))
+
+
+### Bug Fixes
+
+* **cuda:** power_scalar returned NaN for negative bases under --use_fast_math ([#827](https://github.com/ooples/AiDotNet.Tensors/issues/827)) ([4ae2377](https://github.com/ooples/AiDotNet.Tensors/commit/4ae237736a7196c717efbe486cbf2b1d9653a19a))
+* **gpu:** add tape-gradient parity and correct backward kernels ([#829](https://github.com/ooples/AiDotNet.Tensors/issues/829)) ([f1b6dff](https://github.com/ooples/AiDotNet.Tensors/commit/f1b6dff4df7f5aea7b675bb56201f82366d57ece))
+
+
+### Performance
+
+* **fft:** blittable buffer-reusing NativeComplexFFT — kill per-call Complex&lt;T&gt; allocation ([#855](https://github.com/ooples/AiDotNet.Tensors/issues/855)) ([b61cd73](https://github.com/ooples/AiDotNet.Tensors/commit/b61cd730c01e7596c522e7fdc630d789c268c9f7))
+* **fft:** wire NativeComplexFFT butterfly to SIMD radix-2 (test-gated) ([#831](https://github.com/ooples/AiDotNet.Tensors/issues/831)) ([7938eb2](https://github.com/ooples/AiDotNet.Tensors/commit/7938eb2f5ddb24914e7fe0cc348dc6e2c360ec46))
+
 ## [0.118.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.117.2...v0.118.0) (2026-07-20)
 
 
