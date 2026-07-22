@@ -148,6 +148,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private IntPtr _neuralNetModule;
     private IntPtr _fusedModule;
     private IntPtr _quantGemmModule; // P0: weight-only fused dequant-GEMM (int8/int4/fp8)
+    private string? _quantGemmInitializationError;
     private IntPtr _pagedAttnModule; // P1: paged-attention decode
     private IntPtr _flashDecodeModule; // P2: fused decode attention (FlashDecoding)
     private IntPtr _attentionModule;
@@ -861,12 +862,26 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         try
         {
             _quantGemmModule = CompileKernelModule(device, Kernels.CudaQuantGemmKernels.GetSource(), "quant_gemm_kernels", Kernels.CudaQuantGemmKernels.GetKernelNames());
+        }
+        catch (Exception exception)
+        {
+            _quantGemmInitializationError = exception.Message;
+        }
+        try
+        {
             _pagedAttnModule = CompileKernelModule(device, Kernels.CudaPagedAttentionKernels.GetSource(), "paged_attention_kernels", Kernels.CudaPagedAttentionKernels.GetKernelNames());
+        }
+        catch
+        {
+            // Optional P1 serving kernel; its public call degrades gracefully.
+        }
+        try
+        {
             _flashDecodeModule = CompileKernelModule(device, Kernels.CudaFlashDecodeKernels.GetSource(), "flash_decode_kernels", Kernels.CudaFlashDecodeKernels.GetKernelNames());
         }
         catch
         {
-            // P0/P1/P2 serving kernels are optional; leave their modules unset and degrade gracefully.
+            // Optional P2 serving kernel; its public call degrades gracefully.
         }
         _attentionModule = CompileKernelModule(device, CudaAttentionKernels.GetSource(), "attention_kernels", CudaAttentionKernels.GetKernelNames());
         _fftModule = CompileKernelModule(device, Kernels.CudaFFTKernels.GetSource(), "fft_kernels", Kernels.CudaFFTKernels.GetKernelNames());
@@ -2611,6 +2626,112 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         GpuKernelGuards.Capacity(weightsInt8, (long)K * N, nameof(weightsInt8), nameof(DequantGemmInt8));
         GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmInt8));
         return LaunchDequantGemm("dequant_gemm_int8", activations, weightsInt8, scales, M, K, N, groupSize, scaleCount);
+    }
+
+    /// <summary>
+    /// Symmetric W8A8 decode-token projection over canonical contiguous
+    /// output-major weights: <c>GELU(s32(input[K] @ transpose(weights[N,K])) *
+    /// activationScale * weightScales[N] + bias[N])</c>. Zero-points are
+    /// exactly zero. The admitted direct-PTX specialization fuses DP4A,
+    /// dequantization, bias, and GELU without a global intermediate; unsupported
+    /// cells fail closed to the resident NVRTC correctness kernel.
+    /// </summary>
+    public unsafe void FusedLinearGELUW8A8TransposedM1(
+        IGpuBuffer inputInt8,
+        IGpuBuffer outputMajorWeightsInt8,
+        IGpuBuffer activationScaleFloat,
+        IGpuBuffer weightScalesFloat,
+        IGpuBuffer biasFloat,
+        IGpuBuffer outputFloat,
+        int inputFeatures,
+        int outputFeatures)
+    {
+        if (inputInt8 is null) throw new ArgumentNullException(nameof(inputInt8));
+        if (outputMajorWeightsInt8 is null) throw new ArgumentNullException(nameof(outputMajorWeightsInt8));
+        if (activationScaleFloat is null) throw new ArgumentNullException(nameof(activationScaleFloat));
+        if (weightScalesFloat is null) throw new ArgumentNullException(nameof(weightScalesFloat));
+        if (biasFloat is null) throw new ArgumentNullException(nameof(biasFloat));
+        if (outputFloat is null) throw new ArgumentNullException(nameof(outputFloat));
+        if (inputFeatures <= 0) throw new ArgumentOutOfRangeException(nameof(inputFeatures));
+        if (outputFeatures <= 0) throw new ArgumentOutOfRangeException(nameof(outputFeatures));
+        long outputBytes = checked((long)outputFeatures * sizeof(float));
+        if (inputInt8.SizeInBytes < inputFeatures ||
+            outputMajorWeightsInt8.SizeInBytes < checked((long)inputFeatures * outputFeatures) ||
+            activationScaleFloat.SizeInBytes < sizeof(float) ||
+            weightScalesFloat.SizeInBytes < outputBytes ||
+            biasFloat.SizeInBytes < outputBytes || outputFloat.SizeInBytes < outputBytes)
+            throw new ArgumentException(
+                "W8A8 fused-linear buffers are smaller than the requested canonical extents.");
+        if (TryDirectPtxFusedLinearGeluW8A8M1(
+            inputInt8, outputMajorWeightsInt8, activationScaleFloat,
+            weightScalesFloat, biasFloat, outputFloat,
+            inputFeatures, outputFeatures))
+            return;
+
+        if (!_kernelCache.TryGetValue("fused_linear_gelu_w8a8_m1", out var kernel))
+            throw new InvalidOperationException(
+                $"CUDA kernel not found: fused_linear_gelu_w8a8_m1. {_quantGemmInitializationError}");
+        using var _ = PushContext();
+        IntPtr inputPointer = inputInt8.Handle;
+        IntPtr weightPointer = outputMajorWeightsInt8.Handle;
+        IntPtr activationScalePointer = activationScaleFloat.Handle;
+        IntPtr weightScalePointer = weightScalesFloat.Handle;
+        IntPtr biasPointer = biasFloat.Handle;
+        IntPtr outputPointer = outputFloat.Handle;
+        int k = inputFeatures, n = outputFeatures;
+        void** args = stackalloc void*[8];
+        args[0] = &inputPointer;
+        args[1] = &weightPointer;
+        args[2] = &activationScalePointer;
+        args[3] = &weightScalePointer;
+        args[4] = &biasPointer;
+        args[5] = &outputPointer;
+        args[6] = &k;
+        args[7] = &n;
+        uint grid = (uint)((outputFeatures + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <summary>Applies the W8A8 FP32 per-channel dequantization, bias, and tanh-GELU epilogue.</summary>
+    public unsafe void W8A8DequantBiasGelu(
+        IGpuBuffer accumulatorInt32,
+        IGpuBuffer activationScaleFloat,
+        IGpuBuffer weightScalesFloat,
+        IGpuBuffer biasFloat,
+        IGpuBuffer outputFloat,
+        int outputFeatures)
+    {
+        if (accumulatorInt32 is null) throw new ArgumentNullException(nameof(accumulatorInt32));
+        if (activationScaleFloat is null) throw new ArgumentNullException(nameof(activationScaleFloat));
+        if (weightScalesFloat is null) throw new ArgumentNullException(nameof(weightScalesFloat));
+        if (biasFloat is null) throw new ArgumentNullException(nameof(biasFloat));
+        if (outputFloat is null) throw new ArgumentNullException(nameof(outputFloat));
+        if (outputFeatures <= 0) throw new ArgumentOutOfRangeException(nameof(outputFeatures));
+        long outputBytes = checked((long)outputFeatures * sizeof(float));
+        if (accumulatorInt32.SizeInBytes < outputBytes ||
+            activationScaleFloat.SizeInBytes < sizeof(float) ||
+            weightScalesFloat.SizeInBytes < outputBytes ||
+            biasFloat.SizeInBytes < outputBytes || outputFloat.SizeInBytes < outputBytes)
+            throw new ArgumentException("W8A8 epilogue buffers are smaller than the requested extent.");
+        if (!_kernelCache.TryGetValue("w8a8_dequant_bias_gelu", out var kernel))
+            throw new InvalidOperationException(
+                $"CUDA kernel not found: w8a8_dequant_bias_gelu. {_quantGemmInitializationError}");
+        using var _ = PushContext();
+        IntPtr accumulatorPointer = accumulatorInt32.Handle;
+        IntPtr activationScalePointer = activationScaleFloat.Handle;
+        IntPtr weightScalePointer = weightScalesFloat.Handle;
+        IntPtr biasPointer = biasFloat.Handle;
+        IntPtr outputPointer = outputFloat.Handle;
+        int n = outputFeatures;
+        void** args = stackalloc void*[6];
+        args[0] = &accumulatorPointer;
+        args[1] = &activationScalePointer;
+        args[2] = &weightScalePointer;
+        args[3] = &biasPointer;
+        args[4] = &outputPointer;
+        args[5] = &n;
+        uint grid = (uint)((outputFeatures + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
     /// <summary>Weight-only fused dequant-GEMM (int4, 2 signed nibbles/byte, low nibble even). Weights
@@ -9793,6 +9914,34 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[0] = &iPtr; args[1] = &wPtr; args[2] = &bPtr; args[3] = &oPtr;
         args[4] = &batchSize; args[5] = &inFeatures; args[6] = &outFeatures;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <summary>
+    /// Applies a decode-token linear layer whose resident FP32 weights use the
+    /// canonical output-major <c>[outFeatures,inFeatures]</c> physical layout,
+    /// then adds bias and applies tanh-GELU. The admitted direct-PTX path keeps
+    /// both the accumulator and activation in registers and writes output once.
+    /// </summary>
+    public void FusedLinearGELUTransposedM1(
+        IGpuBuffer input,
+        IGpuBuffer outputMajorWeight,
+        IGpuBuffer bias,
+        IGpuBuffer output,
+        int inFeatures,
+        int outFeatures)
+    {
+        if (inFeatures <= 0) throw new ArgumentOutOfRangeException(nameof(inFeatures));
+        if (outFeatures <= 0) throw new ArgumentOutOfRangeException(nameof(outFeatures));
+        if (input.Size < inFeatures ||
+            outputMajorWeight.Size < checked(inFeatures * outFeatures) ||
+            bias.Size < outFeatures || output.Size < outFeatures)
+            throw new ArgumentException("Fused-linear buffers are smaller than the requested canonical extents.");
+        if (TryDirectPtxFusedLinearGeluM1(
+            input, outputMajorWeight, bias, output, inFeatures, outFeatures))
+            return;
+        MatMulTransposed(input, outputMajorWeight, output, 1, outFeatures, inFeatures);
+        BiasAdd(output, bias, output, 1, outFeatures);
+        Gelu(output, output, outFeatures);
     }
 
     public unsafe void FusedLinearSwish(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output,

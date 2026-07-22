@@ -85,6 +85,17 @@ internal static class GpuDriverCrossPlatformResolver
                 : ["libcudart.so.13", "libcudart.so.12", "libcudart.so"];
         }
 
+        // cuBLASLt must be matched before the libcublas prefix below. The public
+        // wrapper intentionally imports the version-neutral alias "cublasLt".
+        if (libraryName.Equals("cublasLt", StringComparison.Ordinal) ||
+            libraryName.StartsWith("cublasLt64_", StringComparison.Ordinal) ||
+            libraryName.StartsWith("libcublasLt", StringComparison.Ordinal))
+        {
+            return windows
+                ? ["cublasLt64_13", "cublasLt64_12", "cublasLt64_11"]
+                : ["libcublasLt.so.13", "libcublasLt.so.12", "libcublasLt.so.11", "libcublasLt.so"];
+        }
+
         // cuBLAS (CuBlasNative has its own version-fallback resolver; this covers the
         // cross-OS direction it cannot: a Linux-built assembly asking for libcublas on Windows)
         if (libraryName.StartsWith("cublas64_", StringComparison.Ordinal) ||
