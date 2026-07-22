@@ -466,7 +466,13 @@ public class NativeComplexOpsTests
         bool priorTracer = SetAutoTracer(false);
         try
         {
-            const int H = 128, W = 1024, iters = 1000;
+            // iters=100 (was 1000): allocation bytes/call is deterministic, so
+            // the (b1-b0)/iters average is already stable well under 100 iters.
+            // The assertions and ceilings are unchanged; only the iteration count
+            // is reduced. 1000 iterations ran ~2040 real 128x1024 FFTs purely for
+            // a stable allocation average, making this a 4-13 min CI time-bomb
+            // (pure CPU compute, highly runner-variance sensitive) for no signal.
+            const int H = 128, W = 1024, iters = 100;
 
             var input = new Tensor<double>(new[] { H, W });
             var rng = new Random(7);
