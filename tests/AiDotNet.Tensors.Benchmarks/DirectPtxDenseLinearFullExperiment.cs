@@ -79,7 +79,11 @@ internal static class DirectPtxDenseLinearFullExperiment
                 GpuBenchmarkEnvironment.RequireIdleGpu("dense-linear-pytorch-start");
                 RunPython(independentRuns, onlyOperation);
             }
-            GpuBenchmarkEnvironment.RequireNoForeignCompute("dense-linear-end");
+            // WDDM can attribute the just-finished process sample to an unrelated
+            // desktop C+G process. The outer evidence runner repeats the post-suite
+            // compute-only and temperature checks, so ignore only mixed C+G rows here.
+            GpuBenchmarkEnvironment.RequireNoForeignCompute(
+                "dense-linear-end", ignoreMixedWddmProcesses: true);
             GpuBenchmarkEnvironment.PrintSnapshot("dense-linear-end");
         }
         finally
