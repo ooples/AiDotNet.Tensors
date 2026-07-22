@@ -130,6 +130,12 @@ internal enum DirectPtxPhysicalLayout
     CooRowIndices,
     /// <summary>Zero-based Int32 COO column indices, one per sampled non-zero.</summary>
     CooColumnIndices,
+    /// <summary>Zero-based graph source-node indices, one per directed edge.</summary>
+    GraphSourceIndices,
+    /// <summary>Zero-based graph target-node indices, one per directed edge.</summary>
+    GraphTargetIndices,
+    /// <summary>Dense row-major [edge, feature].</summary>
+    EdgeMajor2D,
     /// <summary>Dense additive attention bias, [H,Sq,Skv] or [B,H,Sq,Skv].</summary>
     AttentionBias,
     /// <summary>One-dimensional canonical vector.</summary>

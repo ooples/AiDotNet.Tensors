@@ -16,7 +16,7 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
             DirectPtxSparseGraphCompletionLedger.All
                 .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(7, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+        Assert.Equal(9, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
             entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
         Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
         Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
@@ -186,6 +186,30 @@ public sealed class DirectPtxSparseGraphTests
             blueprint.Tensors[0].RequiredBytes);
         Assert.Equal("fp64-fma", blueprint.Semantics["accumulator"]);
         Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void GraphGatherEmitter_BakesDirectionAndUsesOneVec4Transfer(bool gatherSource)
+    {
+        string ptx = PtxGraphEdgeGatherVec4F32Kernel.EmitPtx(8, 6, gatherSource);
+        string entry = gatherSource
+            ? PtxGraphEdgeGatherVec4F32Kernel.SourceEntryPoint
+            : PtxGraphEdgeGatherVec4F32Kernel.TargetEntryPoint;
+        DirectPtxKernelBlueprint blueprint = PtxGraphEdgeGatherVec4F32Kernel.CreateBlueprint(
+            DirectPtxArchitectureFamily.Ampere, gatherSource);
+
+        Assert.Contains(entry, ptx);
+        Assert.Equal(1, Count(ptx, "ld.global.v4.f32"));
+        Assert.Equal(1, Count(ptx, "st.global.v4.f32"));
+        Assert.Equal(3, Count(ptx, ".param .u64"));
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("bra", ptx, StringComparison.Ordinal);
+        Assert.Equal(gatherSource ? DirectPtxPhysicalLayout.GraphSourceIndices :
+            DirectPtxPhysicalLayout.GraphTargetIndices, blueprint.Tensors[1].Layout);
+        Assert.Equal(DirectPtxPhysicalLayout.EdgeMajor2D, blueprint.Tensors[2].Layout);
     }
 
     [Theory]

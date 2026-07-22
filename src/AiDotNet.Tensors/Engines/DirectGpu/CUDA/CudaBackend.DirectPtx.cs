@@ -40,6 +40,8 @@ public sealed partial class CudaBackend
         _directPtxCsrSpmmBiasReluKernels = new(4);
     private readonly DirectPtxKernelCache<DirectPtxCsrSpmmKey, PtxFusedCsrSpmmVec2F64Kernel>
         _directPtxCsrSpmmF64Kernels = new(4);
+    private readonly DirectPtxKernelCache<DirectPtxGraphGatherKey, PtxGraphEdgeGatherVec4F32Kernel>
+        _directPtxGraphGatherKernels = new(4);
     private DirectPtxRuntime? _directPtxRuntime;
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
@@ -58,6 +60,7 @@ public sealed partial class CudaBackend
     private long _directPtxCsrSpmmBiasDispatchCount;
     private long _directPtxCsrSpmmBiasReluDispatchCount;
     private long _directPtxCsrSpmmF64DispatchCount;
+    private long _directPtxGraphGatherDispatchCount;
     internal int DirectPtxCachedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxAttentionKernels.Count; }
@@ -141,6 +144,8 @@ public sealed partial class CudaBackend
         System.Threading.Interlocked.Read(ref _directPtxCsrSpmmBiasReluDispatchCount);
     internal long DirectPtxCsrSpmmF64DispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxCsrSpmmF64DispatchCount);
+    internal long DirectPtxGraphGatherDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxGraphGatherDispatchCount);
 
     /// <summary>
     /// Attempts the exact FP32 CSR SpMM golden specialization. The admitted ABI
@@ -617,6 +622,111 @@ public sealed partial class CudaBackend
         }
         audit = null!;
         return false;
+    }
+
+    internal bool TryDirectPtxGraphEdgeGatherVec4F32(
+        IGpuBuffer nodeFeatures,
+        IGpuBuffer edgeNodeIndices,
+        IGpuBuffer edgeFeatures,
+        int nodes,
+        int edges,
+        int features,
+        bool gatherSource)
+    {
+        if (!IsDirectPtxSparseGraphEnabled ||
+            !PtxGraphEdgeGatherVec4F32Kernel.SupportsShape(nodes, edges, features))
+        {
+            DirectPtxLastError = "graph-gather-specialization-not-admitted";
+            return false;
+        }
+        if (nodeFeatures is null || edgeNodeIndices is null || edgeFeatures is null)
+        {
+            DirectPtxLastError = "graph-gather-null-buffer";
+            return false;
+        }
+        if (nodeFeatures.SizeInBytes != (long)nodes * features * sizeof(float) ||
+            edgeNodeIndices.SizeInBytes != (long)edges * sizeof(int) ||
+            edgeFeatures.SizeInBytes != (long)edges * features * sizeof(float))
+        {
+            DirectPtxLastError = "graph-gather-physical-extent-mismatch";
+            return false;
+        }
+        if (nodeFeatures.Handle == IntPtr.Zero || edgeNodeIndices.Handle == IntPtr.Zero ||
+            edgeFeatures.Handle == IntPtr.Zero)
+        {
+            DirectPtxLastError = "graph-gather-invalid-device-pointer";
+            return false;
+        }
+        if ((((nuint)nodeFeatures.Handle | (nuint)edgeNodeIndices.Handle |
+              (nuint)edgeFeatures.Handle) & 15u) != 0)
+        {
+            DirectPtxLastError = "graph-gather-alignment-mismatch";
+            return false;
+        }
+        if (DirectPtxBuffersOverlap(edgeFeatures, nodeFeatures) ||
+            DirectPtxBuffersOverlap(edgeFeatures, edgeNodeIndices))
+        {
+            DirectPtxLastError = "graph-gather-alias-not-supported";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var key = new DirectPtxGraphGatherKey(gatherSource);
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxGraphGatherKernels.TryGetValue(key, out _))
+                {
+                    DirectPtxLastError =
+                        "Direct PTX graph gather must be prewarmed before CUDA graph capture.";
+                    return false;
+                }
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxGraphEdgeGatherVec4F32Kernel kernel = _directPtxGraphGatherKernels.GetOrAdd(
+                    key, () => new PtxGraphEdgeGatherVec4F32Kernel(_directPtxRuntime!, gatherSource));
+                if (capturing && !_directPtxGraphGatherKernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX graph gather module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(nodeFeatures, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(edgeNodeIndices, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(edgeFeatures, kernel.Blueprint.Tensors[2]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxGraphGatherDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool PrewarmDirectPtxGraphEdgeGather(bool gatherSource)
+    {
+        if (!IsDirectPtxSparseGraphEnabled || IsStreamCapturing()) return false;
+        try
+        {
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                var key = new DirectPtxGraphGatherKey(gatherSource);
+                _ = _directPtxGraphGatherKernels.GetOrAdd(
+                    key, () => new PtxGraphEdgeGatherVec4F32Kernel(_directPtxRuntime!, gatherSource));
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
     }
 
     private static bool DirectPtxBuffersOverlap(IGpuBuffer left, IGpuBuffer right)
@@ -2463,6 +2573,7 @@ public sealed partial class CudaBackend
             _directPtxCsrSpmmBiasKernels.Dispose();
             _directPtxCsrSpmmBiasReluKernels.Dispose();
             _directPtxCsrSpmmF64Kernels.Dispose();
+            _directPtxGraphGatherKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }
@@ -2535,6 +2646,7 @@ public sealed partial class CudaBackend
         int Columns,
         int NonZeros);
     private readonly record struct DirectPtxSddmmKey(int NonZeros, int Inner);
+    private readonly record struct DirectPtxGraphGatherKey(bool GatherSource);
 
 }
 #endif

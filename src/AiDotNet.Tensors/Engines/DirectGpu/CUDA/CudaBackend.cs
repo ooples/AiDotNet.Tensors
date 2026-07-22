@@ -4143,6 +4143,62 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel2D(kernel, gridX, gridY, (uint)DefaultBlockSize, 1, args2);
     }
 
+    /// <summary>Gathers source-node features into a contiguous edge-major tensor.</summary>
+    public void GatherSourceFeatures(
+        IGpuBuffer input,
+        IGpuBuffer sourceIndices,
+        IGpuBuffer output,
+        int numNodes,
+        int numEdges,
+        int features) =>
+        GatherEdgeFeatures(input, sourceIndices, output, numNodes, numEdges, features, true);
+
+    /// <summary>Gathers target-node features into a contiguous edge-major tensor.</summary>
+    public void GatherTargetFeatures(
+        IGpuBuffer input,
+        IGpuBuffer targetIndices,
+        IGpuBuffer output,
+        int numNodes,
+        int numEdges,
+        int features) =>
+        GatherEdgeFeatures(input, targetIndices, output, numNodes, numEdges, features, false);
+
+    private unsafe void GatherEdgeFeatures(
+        IGpuBuffer input,
+        IGpuBuffer nodeIndices,
+        IGpuBuffer output,
+        int numNodes,
+        int numEdges,
+        int features,
+        bool gatherSource)
+    {
+        if (!IsAvailable)
+            throw new InvalidOperationException("CUDA backend is not available.");
+
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxGraphEdgeGatherVec4F32(
+            input, nodeIndices, output, numNodes, numEdges, features, gatherSource))
+            return;
+#endif
+
+        string kernelName = gatherSource ? "gather_source_features" : "gather_target_features";
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+        using var _ = PushContext();
+        uint gridX = (uint)numEdges;
+        uint gridY = (uint)((features + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr inputPtr = input.Handle;
+        IntPtr indexPtr = nodeIndices.Handle;
+        IntPtr outputPtr = output.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &inputPtr;
+        args[1] = &indexPtr;
+        args[2] = &outputPtr;
+        args[3] = &numEdges;
+        args[4] = &features;
+        LaunchKernel2D(kernel, gridX, gridY, (uint)DefaultBlockSize, 1, args);
+    }
+
     private unsafe void ZeroBuffer(IGpuBuffer buffer, int size)
     {
         if (!_kernelCache.TryGetValue("zero_buffer", out var kernel))
