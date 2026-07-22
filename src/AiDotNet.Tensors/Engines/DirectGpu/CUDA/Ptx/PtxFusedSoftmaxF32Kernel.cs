@@ -193,7 +193,7 @@ internal sealed class PtxFusedSoftmaxF32Kernel : IDisposable
         ptx.AppendLine("    add.u64 %rd5, %rd1, %rd2;");
         ptx.AppendLine("    add.u64 %rd6, %rd4, %rd3;");
         ptx.AppendLine("    add.u64 %rd7, %rd5, %rd3;");
-        ptx.AppendLine("    cvta.to.shared.u64 %rd8, scratch;");
+        ptx.AppendLine("    mov.u64 %rd8, scratch;");
         ptx.AppendLine("    ld.global.ca.f32 %f0, [%rd6];");
         ptx.AppendLine("    mov.f32 %f8, %f0;");
         EmitShuffleReduction(ptx, "max.ftz.f32", "%f8");

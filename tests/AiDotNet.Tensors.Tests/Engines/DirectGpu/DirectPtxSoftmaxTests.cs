@@ -42,6 +42,8 @@ public class DirectPtxSoftmaxTests
 
         string cta = PtxFusedSoftmaxF32Kernel.EmitPtx(8, 6, 256, 128, 128);
         Assert.Contains(".shared .align 16 .b8 scratch[16]", cta);
+        Assert.Contains("mov.u64 %rd8, scratch;", cta);
+        Assert.DoesNotContain("cvta.to.shared", cta, StringComparison.Ordinal);
         Assert.Equal(4, Count(cta, "bar.sync 0"));
         Assert.Equal(1, Count(cta, "ld.global.ca.f32"));
         Assert.Equal(1, Count(cta, "st.global.f32"));
