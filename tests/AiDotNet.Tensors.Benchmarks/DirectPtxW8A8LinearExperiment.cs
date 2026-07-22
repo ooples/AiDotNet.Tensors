@@ -5,6 +5,7 @@ using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 using AiDotNet.Tensors.Engines.Gpu;
+using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
@@ -62,7 +63,7 @@ internal static class DirectPtxW8A8LinearExperiment
         using var backend = new CudaBackend();
         using var cublasLt = new CuBlasLtMatmul();
         if (run == 1) Console.WriteLine($"GPU: {backend.DeviceName}");
-        var random = new Random(20261700 + run);
+        var random = RandomHelper.CreateSeededRandom(20261700 + run);
         sbyte[] inputHost = QuantizedValues(random, K);
         sbyte[] weightsHost = QuantizedValues(random, K * N);
         sbyte[] inputMajorWeightsHost = TransposeOutputMajor(weightsHost, K, N);
@@ -258,6 +259,17 @@ internal static class DirectPtxW8A8LinearExperiment
             $"{e2e.Mean,6:F2}/{e2e.Median,6:F2}/{e2e.P95,6:F2}/{e2e.P99,6:F2}   " +
             $"{tops,6:F3} {tops * 1_000.0,7:F1} {allocation,7} {temporaryBytes,5} " +
             $"{error,8:E1} {resources}");
+        var c = System.Globalization.CultureInfo.InvariantCulture;
+        int localBytes = audit?.Function.LocalBytesPerThread ?? -1;
+        Console.WriteLine(
+            "w8a8_evidence_json={" +
+            $"\"rows\":{K},\"columns\":{N}," +
+            $"\"method\":\"{method}\"," +
+            $"\"median_us\":{device.Median.ToString("R", c)}," +
+            $"\"p95_us\":{device.P95.ToString("R", c)}," +
+            $"\"managed_bytes\":{allocation},\"temp_bytes\":{temporaryBytes}," +
+            $"\"max_error\":{error.ToString("R", c)},\"tolerance\":5e-4,\"local_bytes\":{localBytes}" +
+            "}");
     }
 
     private static void PrintPyTorchEligibility()

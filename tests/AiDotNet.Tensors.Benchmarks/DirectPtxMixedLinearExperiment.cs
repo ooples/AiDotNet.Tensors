@@ -4,6 +4,7 @@ using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 using AiDotNet.Tensors.Engines.Gpu;
+using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
@@ -83,7 +84,7 @@ internal static class DirectPtxMixedLinearExperiment
         Shape shape,
         bool tensorCore)
     {
-        var random = new Random(20261500 + run * 10_000 + shape.K + shape.N);
+        var random = RandomHelper.CreateSeededRandom(20261500 + run * 10_000 + shape.K + shape.N);
         float[] inputHost = HalfRoundedValues(random, shape.M * shape.K, 0.125f);
         float[] weightsHost = HalfRoundedValues(random, shape.K * shape.N, 0.0625f);
         float[] inputMajorWeightsHost = TransposeOutputMajor(weightsHost, shape.K, shape.N);
@@ -368,7 +369,7 @@ internal static class DirectPtxMixedLinearExperiment
             $"\"median_us\":{device.Median.ToString("R", c)}," +
             $"\"p95_us\":{device.P95.ToString("R", c)}," +
             $"\"managed_bytes\":{allocation},\"temp_bytes\":{temporaryBytes}," +
-            $"\"max_error\":{error.ToString("R", c)},\"local_bytes\":{local}" +
+            $"\"max_error\":{error.ToString("R", c)},\"tolerance\":2e-3,\"local_bytes\":{local}" +
             "}");
     }
 
