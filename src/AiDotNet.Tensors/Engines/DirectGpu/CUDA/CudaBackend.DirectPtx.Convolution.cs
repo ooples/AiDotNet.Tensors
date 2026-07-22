@@ -3952,4 +3952,155 @@ public sealed partial class CudaBackend
         return _directPtxConv3D3x3x3BwdWeightKernels.GetOrAdd(
             1, () => new PtxConv3DNcdhw3x3x3BackwardWeightF32Kernel(runtime));
     }
+
+    private readonly DirectPtxKernelCache<int, PtxFusedConv3DNcdhw3x3x3BiasReluF32Kernel>
+        _directPtxFusedConv3D3x3x3Kernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private long _directPtxFusedConv3D3x3x3DispatchCount;
+
+    internal long DirectPtxFusedConv3D3x3x3DispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxFusedConv3D3x3x3DispatchCount);
+
+    /// <summary>
+    /// Attempts the exact FP32 NCDHW 3x3x3 3D convolution + bias + ReLU fused
+    /// experiment (stride 1, pad 1). The 3D contract is validated by byte extent
+    /// (NCDHW/OIDHW are rank-5 and do not fit the 2D shape record). Fails closed on
+    /// any unsupported contract so the caller runs the established composition.
+    /// </summary>
+    internal bool TryDirectPtxFusedConv3D3x3x3BiasRelu(
+        IGpuBuffer input,
+        IGpuBuffer weights,
+        IGpuBuffer bias,
+        IGpuBuffer output)
+    {
+        if (!_directPtxConvolutionOptedIn)
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.FeatureDisabled;
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.BackendUnavailable;
+            return false;
+        }
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.ArchitectureNotImplemented;
+            return false;
+        }
+        if (input is null || weights is null || bias is null || output is null)
+        {
+            DirectPtxLastError = "fused-conv3d-3x3x3-null-buffer";
+            return false;
+        }
+        if (input.SizeInBytes != PtxFusedConv3DNcdhw3x3x3BiasReluF32Kernel.InputBytes ||
+            weights.SizeInBytes != PtxFusedConv3DNcdhw3x3x3BiasReluF32Kernel.WeightBytes ||
+            bias.SizeInBytes != PtxFusedConv3DNcdhw3x3x3BiasReluF32Kernel.BiasBytes ||
+            output.SizeInBytes != PtxFusedConv3DNcdhw3x3x3BiasReluF32Kernel.OutputBytes)
+        {
+            DirectPtxLastError = "fused-conv3d-3x3x3-exact-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            const int key = 1;
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxFusedConv3D3x3x3Kernels.TryGetValue(key, out _))
+                {
+                    DirectPtxLastError =
+                        "Direct PTX fused Conv3D 3x3x3 must be prewarmed before CUDA graph capture.";
+                    return false;
+                }
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxFusedConv3DNcdhw3x3x3BiasReluF32Kernel kernel = GetOrCreateDirectPtxFusedConv3D3x3x3Kernel();
+                if (capturing && !_directPtxFusedConv3D3x3x3Kernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX fused Conv3D 3x3x3 module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(weights, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(bias, kernel.Blueprint.Tensors[2]),
+                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[3]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxFusedConv3D3x3x3DispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool PrewarmDirectPtxFusedConv3D3x3x3BiasRelu()
+    {
+        if (!_directPtxConvolutionOptedIn)
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.FeatureDisabled;
+            return false;
+        }
+        if (!IsAvailable || !DirectPtxArchitecture.HasExperimentalConvolution(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.ArchitectureNotImplemented;
+            return false;
+        }
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX fused Conv3D 3x3x3 prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _ = GetOrCreateDirectPtxFusedConv3D3x3x3Kernel();
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxFusedConv3D3x3x3Audit(out DirectPtxKernelAudit? audit)
+    {
+        lock (_directPtxLock)
+        {
+            if (_directPtxFusedConv3D3x3x3Kernels.TryGetValue(1, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null;
+        return false;
+    }
+
+    private PtxFusedConv3DNcdhw3x3x3BiasReluF32Kernel GetOrCreateDirectPtxFusedConv3D3x3x3Kernel()
+    {
+        if (_directPtxFusedConv3D3x3x3Kernels.TryGetValue(
+                1, out PtxFusedConv3DNcdhw3x3x3BiasReluF32Kernel? existing))
+            return existing;
+        return CreateAndCacheDirectPtxFusedConv3D3x3x3KernelSlow();
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxFusedConv3DNcdhw3x3x3BiasReluF32Kernel CreateAndCacheDirectPtxFusedConv3D3x3x3KernelSlow()
+    {
+        DirectPtxRuntime runtime = _directPtxRuntime ??
+            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+        return _directPtxFusedConv3D3x3x3Kernels.GetOrAdd(
+            1, () => new PtxFusedConv3DNcdhw3x3x3BiasReluF32Kernel(runtime));
+    }
 }

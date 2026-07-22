@@ -2537,6 +2537,109 @@ public sealed class DirectPtxConvolutionTests
             $"Conv3D 3x3x3 backward-weight max absolute error {maxAbsoluteError:G9}.");
     }
 
+    [Fact]
+    public void FusedConv3D3x3x3Emitter_HasBiasAddAndReluEpilogue()
+    {
+        string ptx = PtxFusedConv3DNcdhw3x3x3BiasReluF32Kernel.EmitPtx(8, 6);
+
+        Assert.Contains(".target sm_86", ptx, StringComparison.Ordinal);
+        Assert.Contains(PtxFusedConv3DNcdhw3x3x3BiasReluF32Kernel.EntryPoint, ptx, StringComparison.Ordinal);
+        Assert.Equal(4, Count(ptx, ".param .u64"));
+        Assert.Contains("CONV3D_FUSED_CHANNELS:", ptx, StringComparison.Ordinal);
+        // 27 taps per input channel, unrolled inside the channel loop.
+        Assert.Equal(27, Count(ptx, "fma.rn.f32"));
+        // Fused epilogue: one bias add + one ReLU max, single store, no intermediate.
+        Assert.Equal(1, Count(ptx, "add.rn.f32"));
+        Assert.Equal(1, Count(ptx, "max.f32"));
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.Contains("@%p7 bra CONV3D_FUSED_CHANNELS", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.Throws<NotSupportedException>(() =>
+            PtxFusedConv3DNcdhw3x3x3BiasReluF32Kernel.EmitPtx(8, 9));
+    }
+
+    [Fact]
+    public void FusedConv3D3x3x3ManifestCell_IsExperimentalWithDedicatedRoute()
+    {
+        Assert.Equal(DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxConvolutionCoverageManifest.Get("IEngine.FusedConv3D").Status);
+        Assert.Equal(DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxConvolutionCoverageManifest
+                .Get("CudaBackend.TryDirectPtxFusedConv3D3x3x3BiasRelu").Status);
+    }
+
+    [SkippableFact]
+    public void DriverOnlyFusedConv3D3x3x3BiasRelu_MatchesCpuReference()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "Requires the experimental SM86 convolution specialization.");
+
+        const int inChannels = PtxFusedConv3DNcdhw3x3x3BiasReluF32Kernel.InputChannels;
+        const int outChannels = PtxFusedConv3DNcdhw3x3x3BiasReluF32Kernel.OutputChannels;
+        const int depth = PtxFusedConv3DNcdhw3x3x3BiasReluF32Kernel.Depth;
+        const int hgt = PtxFusedConv3DNcdhw3x3x3BiasReluF32Kernel.Height;
+        const int wid = PtxFusedConv3DNcdhw3x3x3BiasReluF32Kernel.Width;
+        const int kernelSize = PtxFusedConv3DNcdhw3x3x3BiasReluF32Kernel.KernelSize;
+        int spatial = depth * hgt * wid;
+        int hw = hgt * wid;
+
+        using var kernel = new PtxFusedConv3DNcdhw3x3x3BiasReluF32Kernel(runtime);
+        using var inputDevice = runtime.AllocateBytes((nuint)PtxFusedConv3DNcdhw3x3x3BiasReluF32Kernel.InputBytes);
+        using var weightDevice = runtime.AllocateBytes((nuint)PtxFusedConv3DNcdhw3x3x3BiasReluF32Kernel.WeightBytes);
+        using var biasDevice = runtime.AllocateBytes((nuint)PtxFusedConv3DNcdhw3x3x3BiasReluF32Kernel.BiasBytes);
+        using var outputDevice = runtime.AllocateBytes((nuint)PtxFusedConv3DNcdhw3x3x3BiasReluF32Kernel.OutputBytes);
+
+        Random random = AiDotNet.Tensors.Helpers.RandomHelper.CreateSecureRandom();
+        var input = new float[inChannels * spatial];
+        for (int i = 0; i < input.Length; i++) input[i] = (float)(random.NextDouble() * 2 - 1);
+        var weights = new float[outChannels * inChannels * kernelSize * kernelSize * kernelSize];
+        for (int i = 0; i < weights.Length; i++) weights[i] = (float)(random.NextDouble() * 2 - 1);
+        var bias = new float[outChannels];
+        for (int i = 0; i < bias.Length; i++) bias[i] = (float)(random.NextDouble() * 2 - 1);
+        inputDevice.Upload<float>(input);
+        weightDevice.Upload<float>(weights);
+        biasDevice.Upload<float>(bias);
+
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(inputDevice, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(weightDevice, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(biasDevice, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(outputDevice, kernel.Blueprint.Tensors[3]));
+        runtime.Synchronize();
+        var actual = new float[outChannels * spatial];
+        outputDevice.Download<float>(actual);
+
+        float maxAbsoluteError = 0;
+        for (int co = 0; co < outChannels; co++)
+        for (int d = 0; d < depth; d++)
+        for (int h = 0; h < hgt; h++)
+        for (int w = 0; w < wid; w++)
+        {
+            float acc = bias[co];
+            for (int ci = 0; ci < inChannels; ci++)
+            for (int kd = 0; kd < kernelSize; kd++)
+            for (int kh = 0; kh < kernelSize; kh++)
+            for (int kw = 0; kw < kernelSize; kw++)
+            {
+                int id = d + kd - 1, ih = h + kh - 1, iw = w + kw - 1;
+                if (id < 0 || id >= depth || ih < 0 || ih >= hgt || iw < 0 || iw >= wid) continue;
+                acc += weights[(((co * inChannels + ci) * kernelSize + kd) * kernelSize + kh) * kernelSize + kw] *
+                    input[ci * spatial + (id * hw + ih * wid + iw)];
+            }
+            float expected = MathF.Max(acc, 0f);
+            float got = actual[co * spatial + (d * hw + h * wid + w)];
+            maxAbsoluteError = MathF.Max(maxAbsoluteError, MathF.Abs(got - expected));
+        }
+
+        Assert.True(maxAbsoluteError <= 2e-4f,
+            $"Fused Conv3D 3x3x3 bias+ReLU max absolute error {maxAbsoluteError:G9}.");
+    }
+
     private static string? Validate(
         bool enabled, bool available, int major, int minor,
         DirectPtxConvolutionShape shape, IGpuBuffer? input, IGpuBuffer? weights,
