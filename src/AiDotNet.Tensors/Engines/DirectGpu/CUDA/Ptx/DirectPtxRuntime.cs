@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Runtime.InteropServices;
 using System.Globalization;
@@ -120,9 +119,9 @@ internal sealed class DirectPtxRuntime : IDisposable
         {
             if (CudaNativeBindings.cuDeviceGetUuidV2(out CudaDeviceUuid uuid, device) != CudaResult.Success)
                 return $"ordinal-{device}";
-            Span<byte> bytes = stackalloc byte[16];
+            byte[] bytes = new byte[16];
             for (int i = 0; i < bytes.Length; i++) bytes[i] = uuid.Bytes[i];
-            return Convert.ToHexString(bytes).ToLowerInvariant();
+            return PtxCompat.ToHexString(bytes).ToLowerInvariant();
         }
         catch (EntryPointNotFoundException)
         {
@@ -135,7 +134,7 @@ internal sealed class DirectPtxRuntime : IDisposable
 
     internal ContextScope Enter()
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        PtxCompat.ThrowIfDisposed(_disposed, this);
         return new ContextScope(_context);
     }
 
@@ -199,7 +198,7 @@ internal sealed class DirectPtxRuntime : IDisposable
 
     internal float MeasureKernelMilliseconds(Action launch, int warmup, int iterations)
     {
-        ArgumentNullException.ThrowIfNull(launch);
+        PtxCompat.ThrowIfNull(launch, nameof(launch));
         if (warmup < 0) throw new ArgumentOutOfRangeException(nameof(warmup));
         if (iterations <= 0) throw new ArgumentOutOfRangeException(nameof(iterations));
 
@@ -234,7 +233,7 @@ internal sealed class DirectPtxRuntime : IDisposable
     internal float[] MeasureKernelSamples(
         Action launch, int warmup, int samples, int launchesPerSample)
     {
-        ArgumentNullException.ThrowIfNull(launch);
+        PtxCompat.ThrowIfNull(launch, nameof(launch));
         if (warmup < 0) throw new ArgumentOutOfRangeException(nameof(warmup));
         if (samples <= 0) throw new ArgumentOutOfRangeException(nameof(samples));
         if (launchesPerSample <= 0) throw new ArgumentOutOfRangeException(nameof(launchesPerSample));
@@ -497,4 +496,3 @@ internal readonly record struct DirectPtxFunctionInfo(
             Get(function, CudaFunctionAttribute.BinaryVersion));
     }
 }
-#endif
