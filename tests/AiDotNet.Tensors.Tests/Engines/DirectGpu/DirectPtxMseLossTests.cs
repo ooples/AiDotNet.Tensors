@@ -73,8 +73,24 @@ public class DirectPtxMseLossTests
         Assert.Equal(
             DirectPtxLossCoverageStatus.ExperimentalDirectPtx,
             DirectPtxLossCoverageManifest.Get("CudaBackend.MseLoss").Status);
-        Assert.Single(DirectPtxLossCoverageManifest.All,
-            cell => cell.Status == DirectPtxLossCoverageStatus.ExperimentalDirectPtx);
+        // Name the live cells rather than counting them: this pins WHICH cells
+        // are experimental, so a new cell cannot quietly take a live slot.
+        Assert.Equal(
+            new[]
+            {
+                "CudaBackend.MaeBackward",
+                "CudaBackend.MseLoss",
+                "CudaBackend.MseLossBackward",
+            },
+            DirectPtxLossCoverageManifest.All
+                .Where(cell => cell.Status == DirectPtxLossCoverageStatus.ExperimentalDirectPtx)
+                .Select(cell => cell.Api)
+                .OrderBy(api => api, StringComparer.Ordinal)
+                .ToArray());
+        // CosineEmbeddingLoss has no backend op at all, so it must stay blocked.
+        Assert.StartsWith("blocked:",
+            DirectPtxLossCoverageManifest.Get("CudaBackend.CosineEmbeddingLoss").DirectPtxAssignment,
+            StringComparison.Ordinal);
         Assert.All(DirectPtxLossCoverageManifest.All,
             cell => Assert.NotEqual(
                 DirectPtxLossCoverageStatus.PromotedDirectPtx, cell.Status));
