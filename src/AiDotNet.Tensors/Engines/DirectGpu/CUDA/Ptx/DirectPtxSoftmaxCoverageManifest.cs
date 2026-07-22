@@ -59,7 +59,8 @@ internal static class DirectPtxSoftmaxCoverageManifest
             RowMajor + ", plus mask", "FP32", DirectPtxSoftmaxCoverageStatus.ExperimentalDirectPtx,
             "elementwise gradient-gating PTX kernel (PtxMaskedFillBackwardKernel); fails closed until GPU-validated and promoted"),
         new("CudaBackend.Sparsemax", "NVRTC sparsemax", "Euclidean projection of logits onto the simplex",
-            RowMajor, "FP32", DirectPtxSoftmaxCoverageStatus.PlannedDirectPtx, Planned),
+            RowMajor, "FP32", DirectPtxSoftmaxCoverageStatus.ExperimentalDirectPtx,
+            "one-block-per-row shared-resident PTX kernel (PtxSparsemaxKernel) finding tau by 30-step bisection of the tree-reduced clipped sum; fails closed until GPU-validated and promoted"),
         new("CudaBackend.TaylorSoftmax", "NVRTC Taylor softmax", "second-order Taylor approximation of softmax",
             RowMajor, "FP32", DirectPtxSoftmaxCoverageStatus.ExperimentalDirectPtx,
             "one-block-per-row shared-resident PTX kernel (PtxTaylorSoftmaxKernel) normalizing the positive polynomial 1+x+x^2/2 with a single tree-reduced sum; fails closed until GPU-validated and promoted")

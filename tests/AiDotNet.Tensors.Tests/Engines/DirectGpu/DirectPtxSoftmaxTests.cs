@@ -43,8 +43,77 @@ public class DirectPtxSoftmaxTests
             DirectPtxSoftmaxCoverageManifest.Get("CudaBackend.MaskedFillBackward").Status);
         Assert.Equal(DirectPtxSoftmaxCoverageStatus.ExperimentalDirectPtx,
             DirectPtxSoftmaxCoverageManifest.Get("CudaBackend.TaylorSoftmax").Status);
+        Assert.Equal(DirectPtxSoftmaxCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxSoftmaxCoverageManifest.Get("CudaBackend.Sparsemax").Status);
+        // The whole softmax family now has a direct-PTX owner.
+        Assert.DoesNotContain(DirectPtxSoftmaxCoverageManifest.All,
+            c => c.Status == DirectPtxSoftmaxCoverageStatus.PlannedDirectPtx);
         Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() =>
             DirectPtxSoftmaxCoverageManifest.Get("UnassignedSoftmaxApi"));
+    }
+
+    [Fact]
+    public void SparsemaxEmitter_FindsThresholdByBisection()
+    {
+        string ptx = PtxSparsemaxKernel.EmitPtx(8, 6, 64, 512);
+        Assert.Contains(PtxSparsemaxKernel.EntryPoint, ptx);
+        Assert.Contains("LOAD_LOOP:", ptx);
+        Assert.Contains("BISECT_LOOP:", ptx);
+        Assert.Contains("SUM_LOOP:", ptx);
+        Assert.Contains("OUT_LOOP:", ptx);
+        Assert.Contains("setp.gt.f32 %p1, %f3, 0f3F800000", ptx);       // S(mid) > 1
+        Assert.Contains("@!%p1 mov.f32 %f6, %f7", ptx);                 // negated-predicate bracket update
+        Assert.DoesNotContain("ex2.approx.f32", ptx);                   // no transcendental
+        Assert.Equal(20, Count(ptx, "bar.sync 0"));                     // max reduction + bisection-body reduction
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxSparsemaxKernel.IsSupportedShape(128, 2048));
+        Assert.False(PtxSparsemaxKernel.IsPromotedShape(128, 2048));
+    }
+
+    [SkippableTheory]
+    [InlineData(64, 256)]
+    [InlineData(128, 512)]
+    public void DriverOnlySparsemax_MatchesSortedOracle(int m, int n)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedSoftmax(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in sparsemax specialization is measured on GA10x/SM86.");
+        using var kernel = new PtxSparsemaxKernel(runtime, m, n);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20265400 + m + n);
+        float[] zHost = Values(random, m * n, 3.0f);
+        var expected = new float[m * n];
+        for (int row = 0; row < m; row++)
+        {
+            // Reference sorted closed form: tau = (sum_{i<=k} z_(i) - 1) / k.
+            var sorted = new double[n];
+            for (int col = 0; col < n; col++) sorted[col] = zHost[row * n + col];
+            Array.Sort(sorted);
+            Array.Reverse(sorted);
+            double cum = 0, tau = 0;
+            int k = 0;
+            for (int j = 0; j < n; j++)
+            {
+                cum += sorted[j];
+                if (1.0 + (j + 1) * sorted[j] > cum) { k = j + 1; tau = (cum - 1.0) / (j + 1); }
+            }
+            for (int col = 0; col < n; col++)
+                expected[row * n + col] = (float)Math.Max(zHost[row * n + col] - tau, 0.0);
+        }
+
+        using var z = runtime.AllocateBytes((nuint)(zHost.Length * sizeof(float)));
+        using var output = runtime.AllocateBytes((nuint)(m * n * sizeof(float)));
+        z.Upload<float>(zHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(z, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[1]));
+        runtime.Synchronize();
+        var actual = new float[m * n];
+        output.Download<float>(actual);
+        AssertVectorClose(actual, expected, 2e-3f, $"sparsemax {m}x{n}");
     }
 
     [Fact]
