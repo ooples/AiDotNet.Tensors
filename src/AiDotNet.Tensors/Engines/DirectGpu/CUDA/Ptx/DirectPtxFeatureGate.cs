@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using AiDotNet.Tensors.Engines.DirectGpu;
 
@@ -180,7 +179,7 @@ internal readonly struct DirectPtxTensorView
         DirectPtxTensorContract contract,
         nuint byteOffset = 0)
     {
-        ArgumentNullException.ThrowIfNull(buffer);
+        PtxCompat.ThrowIfNull(buffer, nameof(buffer));
         if (buffer.Handle == IntPtr.Zero)
             throw new ArgumentException("The GPU buffer has no device pointer.", nameof(buffer));
         nuint allocationBytes = checked((nuint)buffer.SizeInBytes);
@@ -190,7 +189,7 @@ internal readonly struct DirectPtxTensorView
             throw new ArgumentException(
                 $"Tensor '{contract.Name}' requires {contract.RequiredBytes} bytes at offset {byteOffset}; allocation has {allocationBytes}.",
                 nameof(buffer));
-        nuint pointerValue = checked((nuint)buffer.Handle + byteOffset);
+        nuint pointerValue = checked(PtxCompat.ToNuint(buffer.Handle) + byteOffset);
         if ((pointerValue & (nuint)(contract.AlignmentBytes - 1)) != 0)
             throw new ArgumentException(
                 $"Tensor '{contract.Name}' is not {contract.AlignmentBytes}-byte aligned.", nameof(buffer));
@@ -199,7 +198,7 @@ internal readonly struct DirectPtxTensorView
                 $"Tensor '{contract.Name}' extent/offset is incompatible with {contract.PhysicalType}.", nameof(buffer));
 
         return new DirectPtxTensorView(
-            (IntPtr)pointerValue,
+            PtxCompat.ToIntPtr(pointerValue),
             contract.RequiredBytes,
             allocationBytes,
             contract.PhysicalType,
@@ -215,7 +214,7 @@ internal readonly struct DirectPtxTensorView
         nuint requiredBytes,
         int requiredAlignment = 16)
     {
-        ArgumentNullException.ThrowIfNull(buffer);
+        PtxCompat.ThrowIfNull(buffer, nameof(buffer));
         if (buffer.Handle == IntPtr.Zero)
             throw new ArgumentException("The GPU buffer has no device pointer.", nameof(buffer));
         if (requiredBytes == 0 || checked((nuint)buffer.SizeInBytes) < requiredBytes)
@@ -224,7 +223,7 @@ internal readonly struct DirectPtxTensorView
                 nameof(buffer));
         if (requiredAlignment <= 0 || (requiredAlignment & (requiredAlignment - 1)) != 0)
             throw new ArgumentOutOfRangeException(nameof(requiredAlignment), "Alignment must be a power of two.");
-        if (((nuint)buffer.Handle & (nuint)(requiredAlignment - 1)) != 0)
+        if ((PtxCompat.ToNuint(buffer.Handle) & (nuint)(requiredAlignment - 1)) != 0)
             throw new ArgumentException(
                 $"The GPU pointer is not {requiredAlignment}-byte aligned.", nameof(buffer));
 
@@ -244,10 +243,10 @@ internal readonly struct DirectPtxTensorView
         DirectPtxPhysicalType physicalType,
         nuint requiredBytes)
     {
-        ArgumentNullException.ThrowIfNull(buffer);
+        PtxCompat.ThrowIfNull(buffer, nameof(buffer));
         if (buffer.Pointer == IntPtr.Zero || buffer.ByteLength < requiredBytes)
             throw new ArgumentException("The direct PTX buffer is smaller than the canonical BHSD view.", nameof(buffer));
-        if (((nuint)buffer.Pointer & 15u) != 0)
+        if ((PtxCompat.ToNuint(buffer.Pointer) & 15u) != 0)
             throw new ArgumentException("The direct PTX buffer is not 16-byte aligned.", nameof(buffer));
         int elementBytes = physicalType is DirectPtxPhysicalType.Float16 or DirectPtxPhysicalType.BFloat16 ? 2 : 4;
         int elements = checked((int)(requiredBytes / (nuint)elementBytes));
@@ -262,20 +261,19 @@ internal readonly struct DirectPtxTensorView
         DirectPtxTensorContract contract,
         nuint byteOffset = 0)
     {
-        ArgumentNullException.ThrowIfNull(buffer);
+        PtxCompat.ThrowIfNull(buffer, nameof(buffer));
         nuint end = checked(byteOffset + contract.RequiredBytes);
         if (buffer.Pointer == IntPtr.Zero || end > buffer.ByteLength ||
             (contract.ExtentMode == DirectPtxExtentMode.Exact && end != buffer.ByteLength))
             throw new ArgumentException(
                 $"The direct PTX buffer does not satisfy tensor ABI '{contract.Name}'.", nameof(buffer));
-        nuint pointer = checked((nuint)buffer.Pointer + byteOffset);
+        nuint pointer = checked(PtxCompat.ToNuint(buffer.Pointer) + byteOffset);
         if ((pointer & (nuint)(contract.AlignmentBytes - 1)) != 0)
             throw new ArgumentException(
                 $"Tensor '{contract.Name}' is not {contract.AlignmentBytes}-byte aligned.", nameof(buffer));
         return new DirectPtxTensorView(
-            (IntPtr)pointer, contract.RequiredBytes, buffer.ByteLength,
+            PtxCompat.ToIntPtr(pointer), contract.RequiredBytes, buffer.ByteLength,
             contract.PhysicalType, contract.Layout, contract.LogicalExtent,
             contract.PhysicalExtent, contract.Access);
     }
 }
-#endif
