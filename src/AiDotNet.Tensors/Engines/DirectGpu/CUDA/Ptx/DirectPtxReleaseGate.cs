@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 
@@ -35,7 +34,7 @@ internal readonly record struct DirectPtxReleaseGatePolicy(
     {
         var failures = new List<string>();
         double speedup = bestCompetitor.MedianMicroseconds / candidate.MedianMicroseconds;
-        if (!double.IsFinite(speedup) || speedup < MinimumMedianSpeedup)
+        if (!PtxCompat.IsFinite(speedup) || speedup < MinimumMedianSpeedup)
             failures.Add($"median-speedup={speedup:F3}x<{MinimumMedianSpeedup:F3}x");
         double p95Limit = bestCompetitor.P95Microseconds * (1.0 + MaximumP95RegressionFraction);
         if (candidate.P95Microseconds > p95Limit)
@@ -58,4 +57,3 @@ internal sealed record DirectPtxReleaseDecision(
     bool Passed,
     double MedianSpeedup,
     IReadOnlyList<string> Failures);
-#endif

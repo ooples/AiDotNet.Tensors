@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
@@ -234,9 +233,9 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "qkv-rope-cache-invalid-device-pointer";
             return false;
         }
-        if ((((nuint)input.Handle | (nuint)packedWeights.Handle | (nuint)bias.Handle |
-              (nuint)cosine.Handle | (nuint)sine.Handle | (nuint)query.Handle |
-              (nuint)keyCache.Handle | (nuint)valueCache.Handle) & 15u) != 0)
+        if (((PtxCompat.ToNuint(input.Handle) | PtxCompat.ToNuint(packedWeights.Handle) | PtxCompat.ToNuint(bias.Handle) |
+              PtxCompat.ToNuint(cosine.Handle) | PtxCompat.ToNuint(sine.Handle) | PtxCompat.ToNuint(query.Handle) |
+              PtxCompat.ToNuint(keyCache.Handle) | PtxCompat.ToNuint(valueCache.Handle)) & 15u) != 0)
         {
             DirectPtxLastError = "qkv-rope-cache-alignment-mismatch";
             return false;
@@ -397,8 +396,8 @@ public sealed partial class CudaBackend
 
         static bool Overlaps(IGpuBuffer left, IGpuBuffer right)
         {
-            nuint leftStart = (nuint)left.Handle;
-            nuint rightStart = (nuint)right.Handle;
+            nuint leftStart = PtxCompat.ToNuint(left.Handle);
+            nuint rightStart = PtxCompat.ToNuint(right.Handle);
             nuint leftEnd = checked(leftStart + (nuint)left.SizeInBytes);
             nuint rightEnd = checked(rightStart + (nuint)right.SizeInBytes);
             return leftStart < rightEnd && rightStart < leftEnd;
@@ -1192,8 +1191,8 @@ public sealed partial class CudaBackend
                     batch, queryHeads, keyValueHeads, querySequence, keyValueSequence,
                     isCausal, causalQueryOffset, fuseLayerNormGelu,
                     emitSoftmaxStats,
-                    BitConverter.SingleToInt32Bits(scale),
-                    BitConverter.SingleToInt32Bits(epsilon));
+                    PtxCompat.SingleToInt32Bits(scale),
+                    PtxCompat.SingleToInt32Bits(epsilon));
 
                 // Capture may launch only an already-loaded in-memory plan. No
                 // disk lookup, module JIT, event allocation, or autotune occurs
@@ -1412,7 +1411,7 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "decode-sequence-bucket-not-implemented";
             return false;
         }
-        if (!float.IsFinite(scale))
+        if (!PtxCompat.IsFinite(scale))
         {
             DirectPtxLastError = "decode-scale-not-finite";
             return false;
@@ -1449,7 +1448,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             var keyShape = new DirectPtxDecodeKey(
                 isPaged, queryHeads, keyValueHeads, sequenceLength,
-                blockSize, poolBlocks, BitConverter.SingleToInt32Bits(scale));
+                blockSize, poolBlocks, PtxCompat.SingleToInt32Bits(scale));
             lock (_directPtxLock)
             {
                 if (capturing && !_directPtxDecodeKernels.TryGetValue(keyShape, out _))
@@ -1534,7 +1533,7 @@ public sealed partial class CudaBackend
                 _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                 var key = new DirectPtxDecodeKey(
                     isPaged, queryHeads, keyValueHeads, sequenceLength,
-                    blockSize, poolBlocks, BitConverter.SingleToInt32Bits(scale));
+                    blockSize, poolBlocks, PtxCompat.SingleToInt32Bits(scale));
                 _ = GetOrCreateDecodeKernel(key, scale);
             }
             DirectPtxLastError = null;
@@ -1561,7 +1560,7 @@ public sealed partial class CudaBackend
         {
             var key = new DirectPtxDecodeKey(
                 isPaged, queryHeads, keyValueHeads, sequenceLength,
-                blockSize, poolBlocks, BitConverter.SingleToInt32Bits(scale));
+                blockSize, poolBlocks, PtxCompat.SingleToInt32Bits(scale));
             if (_directPtxDecodeKernels.TryGetValue(key, out var kernel))
             {
                 audit = kernel.Audit;
@@ -1606,7 +1605,7 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "paged-prefill-block-size-not-implemented";
             return false;
         }
-        if (!float.IsFinite(scale))
+        if (!PtxCompat.IsFinite(scale))
         {
             DirectPtxLastError = "paged-prefill-scale-not-finite";
             return false;
@@ -1635,7 +1634,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             var key = new DirectPtxPagedPrefillKey(
                 queryHeads, keyValueHeads, queryCount, startPosition,
-                blockSize, poolBlocks, BitConverter.SingleToInt32Bits(scale));
+                blockSize, poolBlocks, PtxCompat.SingleToInt32Bits(scale));
             lock (_directPtxLock)
             {
                 if (capturing && !_directPtxPagedPrefillKernels.TryGetValue(key, out _))
@@ -1708,7 +1707,7 @@ public sealed partial class CudaBackend
                 _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                 var key = new DirectPtxPagedPrefillKey(
                     queryHeads, keyValueHeads, queryCount, startPosition,
-                    blockSize, poolBlocks, BitConverter.SingleToInt32Bits(scale));
+                    blockSize, poolBlocks, PtxCompat.SingleToInt32Bits(scale));
                 _ = GetOrCreatePagedPrefillKernel(key, scale);
             }
             DirectPtxLastError = null;
@@ -1735,7 +1734,7 @@ public sealed partial class CudaBackend
         {
             var key = new DirectPtxPagedPrefillKey(
                 queryHeads, keyValueHeads, queryCount, startPosition,
-                blockSize, poolBlocks, BitConverter.SingleToInt32Bits(scale));
+                blockSize, poolBlocks, PtxCompat.SingleToInt32Bits(scale));
             if (_directPtxPagedPrefillKernels.TryGetValue(key, out var kernel))
             {
                 audit = kernel.Audit;
@@ -1793,7 +1792,7 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "flash-attention-backward-sequence-bucket-not-implemented";
             return false;
         }
-        if (!float.IsFinite(scale))
+        if (!PtxCompat.IsFinite(scale))
         {
             DirectPtxLastError = "flash-attention-backward-scale-not-finite";
             return false;
@@ -1841,7 +1840,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             var keyShape = new DirectPtxFlashAttentionBackwardKey(
                 batch, heads, querySequence, keyValueSequence, isCausal,
-                BitConverter.SingleToInt32Bits(scale), bakedBiasBatchStride);
+                PtxCompat.SingleToInt32Bits(scale), bakedBiasBatchStride);
             lock (_directPtxLock)
             {
                 if (capturing && !_directPtxFlashAttentionBackwardKernels.TryGetValue(keyShape, out _))
@@ -1923,7 +1922,7 @@ public sealed partial class CudaBackend
                 _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                 var key = new DirectPtxFlashAttentionBackwardKey(
                     batch, heads, querySequence, keyValueSequence, isCausal,
-                    BitConverter.SingleToInt32Bits(scale), biasBatchStride);
+                    PtxCompat.SingleToInt32Bits(scale), biasBatchStride);
                 _ = GetOrCreateFlashAttentionBackwardKernel(key, scale);
             }
             DirectPtxLastError = null;
@@ -1951,7 +1950,7 @@ public sealed partial class CudaBackend
         {
             var key = new DirectPtxFlashAttentionBackwardKey(
                 batch, heads, querySequence, keyValueSequence, isCausal,
-                BitConverter.SingleToInt32Bits(scale), biasBatchStride);
+                PtxCompat.SingleToInt32Bits(scale), biasBatchStride);
             if (_directPtxFlashAttentionBackwardKernels.TryGetValue(key, out var kernel))
             {
                 gradQueryAudit = kernel.GradQueryAudit;
@@ -2009,7 +2008,7 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "attention-backward-sequence-bucket-not-implemented";
             return false;
         }
-        if (!float.IsFinite(scale))
+        if (!PtxCompat.IsFinite(scale))
         {
             DirectPtxLastError = "attention-backward-scale-not-finite";
             return false;
@@ -2040,7 +2039,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             var keyShape = new DirectPtxAttentionBackwardKey(
                 batch, queryHeads, keyValueHeads, querySequence, keyValueSequence,
-                BitConverter.SingleToInt32Bits(scale));
+                PtxCompat.SingleToInt32Bits(scale));
             lock (_directPtxLock)
             {
                 if (capturing && !_directPtxAttentionBackwardKernels.TryGetValue(keyShape, out _))
@@ -2116,7 +2115,7 @@ public sealed partial class CudaBackend
                 _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                 var key = new DirectPtxAttentionBackwardKey(
                     batch, queryHeads, keyValueHeads, querySequence, keyValueSequence,
-                    BitConverter.SingleToInt32Bits(scale));
+                    PtxCompat.SingleToInt32Bits(scale));
                 _ = GetOrCreateAttentionBackwardKernel(key, scale);
             }
             DirectPtxLastError = null;
@@ -2144,7 +2143,7 @@ public sealed partial class CudaBackend
         {
             var key = new DirectPtxAttentionBackwardKey(
                 batch, queryHeads, keyValueHeads, querySequence, keyValueSequence,
-                BitConverter.SingleToInt32Bits(scale));
+                PtxCompat.SingleToInt32Bits(scale));
             if (_directPtxAttentionBackwardKernels.TryGetValue(key, out var kernel))
             {
                 rowDeltaAudit = kernel.RowDeltaAudit;
@@ -2236,7 +2235,7 @@ public sealed partial class CudaBackend
                 var plan = new DirectPtxAttentionPlanKey(
                     batch, queryHeads, keyValueHeads, querySequence, keyValueSequence,
                     isCausal, causalQueryOffset, fuseLayerNormGelu, emitSoftmaxStats,
-                    BitConverter.SingleToInt32Bits(scale), BitConverter.SingleToInt32Bits(epsilon));
+                    PtxCompat.SingleToInt32Bits(scale), PtxCompat.SingleToInt32Bits(epsilon));
                 if (!_directPtxAttentionPlans.TryGetValue(plan, out int warps))
                 {
                     if (!DirectPtxAttentionAutotuner.TryLoad(
@@ -2279,7 +2278,7 @@ public sealed partial class CudaBackend
             lock (_directPtxLock)
             {
                 var key = new DirectPtxResidualRmsNormKey(
-                    rows, BitConverter.SingleToInt32Bits(epsilon));
+                    rows, PtxCompat.SingleToInt32Bits(epsilon));
                 if (capturing && !_directPtxResidualRmsNormKernels.TryGetValue(key, out _))
                 {
                     DirectPtxLastError = "Direct PTX residual RMSNorm must be prewarmed before CUDA graph capture.";
@@ -2320,7 +2319,7 @@ public sealed partial class CudaBackend
             lock (_directPtxLock)
             {
                 _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
-                var key = new DirectPtxResidualRmsNormKey(rows, BitConverter.SingleToInt32Bits(epsilon));
+                var key = new DirectPtxResidualRmsNormKey(rows, PtxCompat.SingleToInt32Bits(epsilon));
                 if (!_directPtxResidualRmsNormKernels.TryGetValue(key, out _))
                     _ = CreateAndCacheResidualRmsNormKernel(key, rows, epsilon);
                 return true;
@@ -2349,7 +2348,7 @@ public sealed partial class CudaBackend
     {
         lock (_directPtxLock)
         {
-            var key = new DirectPtxResidualRmsNormKey(rows, BitConverter.SingleToInt32Bits(epsilon));
+            var key = new DirectPtxResidualRmsNormKey(rows, PtxCompat.SingleToInt32Bits(epsilon));
             if (_directPtxResidualRmsNormKernels.TryGetValue(key, out var kernel))
             {
                 audit = kernel.Audit;
@@ -3049,8 +3048,8 @@ public sealed partial class CudaBackend
                 1, batchHeads, batchHeads, sequenceLength, sequenceLength,
                 isCausal, 0, fuseLayerNormGelu,
                 true,
-                BitConverter.SingleToInt32Bits(scale),
-                BitConverter.SingleToInt32Bits(epsilon));
+                PtxCompat.SingleToInt32Bits(scale),
+                PtxCompat.SingleToInt32Bits(epsilon));
             if (_directPtxAttentionPlans.TryGetValue(plan, out int warps) &&
                 _directPtxAttentionKernels.TryGetValue(
                     DirectPtxAttentionKey.FromPlan(plan, warps), out var kernel))
@@ -3079,7 +3078,7 @@ public sealed partial class CudaBackend
             var plan = new DirectPtxAttentionPlanKey(
                 1, batchHeads, batchHeads, sequenceLength, sequenceLength,
                 isCausal, 0, fuseLayerNormGelu, true,
-                BitConverter.SingleToInt32Bits(scale), BitConverter.SingleToInt32Bits(epsilon));
+                PtxCompat.SingleToInt32Bits(scale), PtxCompat.SingleToInt32Bits(epsilon));
             if (_directPtxAttentionPlans.TryGetValue(plan, out int warps) &&
                 _directPtxAttentionKernels.TryGetValue(
                     DirectPtxAttentionKey.FromPlan(plan, warps), out var kernel))
@@ -3111,7 +3110,7 @@ public sealed partial class CudaBackend
             var plan = new DirectPtxAttentionPlanKey(
                 batch, queryHeads, keyValueHeads, querySequence, keyValueSequence,
                 isCausal, causalQueryOffset, fuseLayerNormGelu, emitSoftmaxStats,
-                BitConverter.SingleToInt32Bits(scale), BitConverter.SingleToInt32Bits(epsilon));
+                PtxCompat.SingleToInt32Bits(scale), PtxCompat.SingleToInt32Bits(epsilon));
             if (_directPtxAttentionPlans.TryGetValue(plan, out int warps) &&
                 _directPtxAttentionKernels.TryGetValue(
                     DirectPtxAttentionKey.FromPlan(plan, warps), out var kernel))
@@ -3216,4 +3215,3 @@ public sealed partial class CudaBackend
         int Position);
 
 }
-#endif
