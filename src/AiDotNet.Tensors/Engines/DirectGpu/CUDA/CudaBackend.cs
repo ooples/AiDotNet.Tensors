@@ -14818,6 +14818,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void SoftmaxRows(IGpuBuffer input, IGpuBuffer output, int rows, int cols)
     {
         if (rows <= 0 || cols <= 0) return;
+        // Fail-closed direct-PTX fast path (issue #840); returns false until GPU-promoted.
+        if (TryDirectPtxSoftmax(input, output, rows, cols)) return;
         if (!_kernelCache.TryGetValue("softmax_rows", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: softmax_rows");
         using var _ = PushContext();
@@ -16905,7 +16907,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     }
 
     // --- Softmax Variants + Distance ---
-    public void LogSoftmax(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize) => LaunchFusedAxis("log_softmax", input, output, outerSize, innerSize);
+    public void LogSoftmax(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize)
+    {
+        // Fail-closed direct-PTX fast path (issue #840); returns false until GPU-promoted.
+        if (TryDirectPtxLogSoftmax(input, output, outerSize, innerSize)) return;
+        LaunchFusedAxis("log_softmax", input, output, outerSize, innerSize);
+    }
 
     public unsafe void GumbelSoftmax(IGpuBuffer logits, IGpuBuffer output, int outerSize, int innerSize, float temperature, ulong seed)
     {
