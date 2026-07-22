@@ -261,7 +261,7 @@ try {
     $manifestPath = Join-Path $evidenceRoot 'manifest.json'
     [System.IO.File]::WriteAllText($manifestPath, $manifest + [Environment]::NewLine)
     Write-Host "Evidence capture completed: $evidenceRoot"
-    Write-Host 'Run both Nsight targets separately; performance-counter access is a mandatory release gate.'
+    Write-Host 'Run each required Nsight target separately; performance-counter access is a mandatory release gate.'
 }
 finally {
     Pop-Location
