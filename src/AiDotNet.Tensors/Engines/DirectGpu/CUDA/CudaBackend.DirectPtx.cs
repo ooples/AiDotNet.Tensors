@@ -206,6 +206,19 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "causal-query-offset-without-causal-mask";
             return false;
         }
+        // Precise fallback reason instead of an opaque swallowed NullReferenceException: LaunchAttentionKernel
+        // dereferences softmaxStatsFloat! when emitSoftmaxStats is set, and gammaFloat!/betaFloat! when
+        // fuseLayerNormGelu is set. Reject a null buffer here so DirectPtxLastError names the missing input.
+        if (emitSoftmaxStats && softmaxStatsFloat is null)
+        {
+            DirectPtxLastError = "softmax-stats-buffer-null";
+            return false;
+        }
+        if (fuseLayerNormGelu && (gammaFloat is null || betaFloat is null))
+        {
+            DirectPtxLastError = "layernorm-gamma-or-beta-null";
+            return false;
+        }
 
         DirectPtxEligibilityResult eligibility = DirectPtxAttentionEligibility.Evaluate(
             new DirectPtxAttentionRequest(
@@ -1251,6 +1264,15 @@ public sealed partial class CudaBackend
         if (causalQueryOffset < -querySequence)
         {
             DirectPtxLastError = "causal-query-offset-outside-query-domain";
+            return false;
+        }
+        // Mirror the dispatch reject in TryDirectPtxOnlineAttentionCore: a non-zero causalQueryOffset
+        // under a non-causal mask is never requested by dispatch (the mask derivation below collapses to
+        // None when !isCausal), so without this a prewarmed plan keyed on (isCausal:false, offset!=0)
+        // would be dead weight the dispatch path can never hit.
+        if (!isCausal && causalQueryOffset != 0)
+        {
+            DirectPtxLastError = "causal-query-offset-without-causal-mask";
             return false;
         }
         DirectPtxEligibilityResult eligibility = DirectPtxAttentionEligibility.Evaluate(

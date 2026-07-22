@@ -775,14 +775,14 @@ $env:AIDOTNET_DIRECT_PTX_ATTENTION_BACKWARD='1'
 dotnet run --project tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.csproj `
   -c Release --no-build -- --direct-ptx-attention-backward 3
 
-C:\Users\cheat\.cache\aidotnet-direct-ptx-py312\Scripts\python.exe `
+$env:DIRECT_PTX_PY\Scripts\python.exe `
   tests/AiDotNet.Tensors.Benchmarks/BaselineRunners/py/run_direct_ptx_attention_backward_competitors.py --runs 3
 
 $env:AIDOTNET_DIRECT_PTX_FLASH_ATTENTION_BACKWARD='1'
 dotnet run --project tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.csproj `
   -c Release --no-build -- --direct-ptx-flash-attention-backward 3
 
-C:\Users\cheat\.cache\aidotnet-direct-ptx-py312\Scripts\python.exe `
+$env:DIRECT_PTX_PY\Scripts\python.exe `
   tests/AiDotNet.Tensors.Benchmarks/BaselineRunners/py/run_direct_ptx_flash_attention_backward_competitors.py --runs 3
 
 # Mandatory release capture: three separate processes per suite, guarded

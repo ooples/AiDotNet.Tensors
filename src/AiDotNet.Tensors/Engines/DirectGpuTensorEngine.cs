@@ -10597,14 +10597,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (typeof(T) == typeof(float) && softcap == 0
             && backend is Engines.DirectGpu.CUDA.CudaBackend directCuda
             && directCuda.IsDirectPtxAttentionEnabled && !directCuda.IsStreamCapturing()
-            && seqQ is 16 or 32 or 64 or 128
-            && seqK is 16 or 32 or 64 or 128 && headDim == 64
-            && query.IsContiguous && key.IsContiguous && value.IsContiguous
-            && !query.IsSparse && !key.IsSparse && !value.IsSparse
-            && query._storageOffset == 0 && key._storageOffset == 0 && value._storageOffset == 0
-            && query._storage.Length == query.Length
-            && key._storage.Length == key.Length
-            && value._storage.Length == value.Length)
+            // Track the kernel's supported shape set and the extracted canonical-dense contract instead
+            // of re-inlining them, so this gate cannot silently diverge from what the PTX actually accepts
+            // when the kernel's supported lengths/head-dim change.
+            && PtxOnlineFusedAttention128x64Kernel.IsSupportedSequenceLength(seqQ)
+            && PtxOnlineFusedAttention128x64Kernel.IsSupportedSequenceLength(seqK)
+            && headDim == PtxOnlineFusedAttention128x64Kernel.HeadDimension
+            && IsCanonicalDenseAllocation(query)
+            && IsCanonicalDenseAllocation(key)
+            && IsCanonicalDenseAllocation(value))
         {
             IGpuBuffer? queryHalfOwned = null;
             IGpuBuffer? keyHalfOwned = null;
