@@ -1,3 +1,7 @@
+#if NET5_0_OR_GREATER
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+#endif
+
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 public sealed partial class CudaBackend : IInstantNgpBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
@@ -227,15 +231,31 @@ public sealed partial class CudaBackend : IInstantNgpBackend, IUniqueConsecutive
 
     public void ScatterAddBackwardRows(
         IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradSource,
-        int sourceRows, int innerSize, int outputRows) =>
+        int sourceRows, int innerSize, int outputRows)
+    {
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxScatterBackwardRows(
+            gradOutput, indices, null, gradSource, sourceRows, innerSize, outputRows,
+            DirectPtxScatterBackwardRowsOperation.Add))
+            return;
+#endif
         LaunchResidentRows3("resident_scatter_add_backward_rows", gradOutput, indices, gradSource,
             checked(sourceRows * innerSize), sourceRows, innerSize, outputRows);
+    }
 
     public void ScatterMeanBackwardRows(
         IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer counts, IGpuBuffer gradSource,
-        int sourceRows, int innerSize, int outputRows) =>
+        int sourceRows, int innerSize, int outputRows)
+    {
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxScatterBackwardRows(
+            gradOutput, indices, counts, gradSource, sourceRows, innerSize, outputRows,
+            DirectPtxScatterBackwardRowsOperation.Mean))
+            return;
+#endif
         LaunchResidentRows4("resident_scatter_mean_backward_rows", gradOutput, indices, counts, gradSource,
             checked(sourceRows * innerSize), sourceRows, innerSize, outputRows);
+    }
 
     public void ScatterMaxBackwardRows(
         IGpuBuffer gradOutput, IGpuBuffer argmax, IGpuBuffer gradSource,

@@ -58,7 +58,8 @@ internal static class DirectPtxSparseGraphCompletionLedger
             "scatter_add_batched", "scatter_add_batched_deterministic",
             "scatter_mean_accumulate", "scatter_mean_accumulate_deterministic", "scatter_mean_normalize");
         Add("CudaInstantNgpKernels", DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx,
-            "resident_scatter_max_argmax_rows", "resident_scatter_add_rows");
+            "resident_scatter_max_argmax_rows", "resident_scatter_add_rows",
+            "resident_scatter_add_backward_rows", "resident_scatter_mean_backward_rows");
         Add("CudaBackend.CSR", DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx,
             "csr_segmented_max", "csr_segmented_min", "csr_segmented_stddev");
         Add("CudaSnnKernels", DirectPtxSparseGraphCompletionStatus.MissingDirectPtx,
@@ -68,8 +69,7 @@ internal static class DirectPtxSparseGraphCompletionLedger
         Add("CudaInstantNgpKernels", DirectPtxSparseGraphCompletionStatus.MissingDirectPtx,
             "resident_uniform_mesh_laplacian",
             "resident_scatter_mean_rows_counts",
-            "resident_scatter_softmax_rows", "resident_scatter_add_backward_rows",
-            "resident_scatter_mean_backward_rows", "resident_scatter_max_backward_rows",
+            "resident_scatter_softmax_rows", "resident_scatter_max_backward_rows",
             "resident_scatter_softmax_backward_rows");
         Add("CudaCapsuleKernels", DirectPtxSparseGraphCompletionStatus.MissingDirectPtx,
             "squash", "squash_backward", "capsule_predictions", "capsule_transform",

@@ -16,7 +16,7 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
             DirectPtxSparseGraphCompletionLedger.All
                 .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(41, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+        Assert.Equal(43, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
             entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
         Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
         Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
@@ -423,6 +423,24 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal("negative-infinity", blueprint.Semantics["empty-output"]);
         Assert.Equal("float-encoded-minus-one", blueprint.Semantics["empty-argmax"]);
         Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
+    }
+
+    [Theory]
+    [InlineData((int)DirectPtxScatterBackwardRowsOperation.Add, 3)]
+    [InlineData((int)DirectPtxScatterBackwardRowsOperation.Mean, 4)]
+    public void ScatterBackwardRowsEmitter_BakesExactGatherAbi(int operationValue, int pointerCount)
+    {
+        var operation = (DirectPtxScatterBackwardRowsOperation)operationValue;
+        string ptx = PtxScatterBackwardRowsF32Kernel.EmitPtx(8, 6, operation);
+        DirectPtxKernelBlueprint blueprint = PtxScatterBackwardRowsF32Kernel.CreateBlueprint(
+            DirectPtxArchitectureFamily.Ampere, operation);
+
+        Assert.Equal(pointerCount, Count(ptx, ".param .u64"));
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("atom.", ptx, StringComparison.Ordinal);
+        Assert.Equal("zero", blueprint.Semantics["invalid-index"]);
+        Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
+        Assert.All(blueprint.Tensors, tensor => Assert.Equal(DirectPtxExtentMode.Exact, tensor.ExtentMode));
     }
 
     [Theory]
