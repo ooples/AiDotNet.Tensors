@@ -2474,6 +2474,24 @@ public class DirectPtxWmmaTests
     }
 
     [Fact]
+    public void MatMulTransposedEmitter_IsBareTransposedBTile()
+    {
+        string ptx = PtxMatMulTransposedKernel.EmitPtx(8, 6, 64, 256, 256);
+        Assert.Contains(PtxMatMulTransposedKernel.EntryPoint, ptx);
+        Assert.Contains(".shared .align 16 .b8 a_tile[2048]", ptx);
+        Assert.Contains(".shared .align 16 .b8 b_tile[2048]", ptx);
+        Assert.Equal(128, Count(ptx, "fma.rn.f32"));
+        Assert.Equal(64, Count(ptx, "ld.shared.f32"));
+        Assert.Equal(2, Count(ptx, "bar.sync 0"));
+        Assert.Equal(16, Count(ptx, "st.global.f32"));
+        Assert.Equal(0, Count(ptx, "add.rn.f32"));         // no bias add
+        Assert.DoesNotContain("tanh.approx.f32", ptx);     // no activation epilogue
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxMatMulTransposedKernel.IsSupportedShape(128, 512, 2048));
+        Assert.False(PtxMatMulTransposedKernel.IsPromotedShape(128, 512, 2048));
+    }
+
+    [Fact]
     public void GemmEmitter_IsRegisterResidentTiledGemm()
     {
         string ptx = PtxGemmKernel.EmitPtx(8, 6, 64, 256, 256);
