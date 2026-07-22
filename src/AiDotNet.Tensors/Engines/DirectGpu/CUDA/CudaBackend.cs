@@ -4308,6 +4308,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     private unsafe void InitializeNegativeInfinity(IGpuBuffer output, int size)
     {
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxSparseFill(output, size, negativeInfinity: true)) return;
+#endif
         if (!_kernelCache.TryGetValue("init_neg_inf", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: init_neg_inf");
         IntPtr outputPtr = output.Handle;
@@ -4398,6 +4401,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     private unsafe void ZeroBuffer(IGpuBuffer buffer, int size)
     {
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxSparseFill(buffer, size, negativeInfinity: false)) return;
+#endif
         if (!_kernelCache.TryGetValue("zero_buffer", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: zero_buffer");
 
@@ -4408,6 +4414,58 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[0] = &bufferPtr;
         args[1] = &size;
 
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <summary>GCN degree normalization with epsilon baked by the admitted PTX module.</summary>
+    public unsafe void DegreeNormalize(
+        IGpuBuffer input, IGpuBuffer degrees, IGpuBuffer output,
+        int numNodes, int features, float epsilon = 1e-8f)
+    {
+        if (!IsAvailable) throw new InvalidOperationException("CUDA backend is not available.");
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxDegreeNormalize(input, degrees, output, numNodes, features, epsilon)) return;
+#endif
+        if (!_kernelCache.TryGetValue("degree_normalize", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: degree_normalize");
+        using var _ = PushContext();
+        IntPtr inputPtr = input.Handle;
+        IntPtr degreesPtr = degrees.Handle;
+        IntPtr outputPtr = output.Handle;
+        void** args = stackalloc void*[6];
+        args[0] = &inputPtr; args[1] = &degreesPtr; args[2] = &outputPtr;
+        args[3] = &numNodes; args[4] = &features; args[5] = &epsilon;
+        LaunchKernel2D(kernel, (uint)numNodes,
+            (uint)((features + DefaultBlockSize - 1) / DefaultBlockSize),
+            (uint)DefaultBlockSize, 1, args);
+    }
+
+    /// <summary>Per-edge symmetric degree normalization.</summary>
+    public unsafe void SymmetricDegreeNormalize(
+        IGpuBuffer edgeValues, IGpuBuffer sourceIndices, IGpuBuffer targetIndices,
+        IGpuBuffer sourceDegrees, IGpuBuffer targetDegrees, IGpuBuffer output,
+        int numNodes, int numEdges, float epsilon = 1e-8f)
+    {
+        if (!IsAvailable) throw new InvalidOperationException("CUDA backend is not available.");
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxSymmetricDegreeNormalize(
+            edgeValues, sourceIndices, targetIndices, sourceDegrees, targetDegrees, output,
+            numNodes, numEdges, epsilon)) return;
+#endif
+        if (!_kernelCache.TryGetValue("symmetric_degree_normalize", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: symmetric_degree_normalize");
+        using var _ = PushContext();
+        IntPtr edgeValuesPtr = edgeValues.Handle;
+        IntPtr sourcePtr = sourceIndices.Handle;
+        IntPtr targetPtr = targetIndices.Handle;
+        IntPtr sourceDegreesPtr = sourceDegrees.Handle;
+        IntPtr targetDegreesPtr = targetDegrees.Handle;
+        IntPtr outputPtr = output.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &edgeValuesPtr; args[1] = &sourcePtr; args[2] = &targetPtr;
+        args[3] = &sourceDegreesPtr; args[4] = &targetDegreesPtr; args[5] = &outputPtr;
+        args[6] = &numEdges; args[7] = &epsilon;
+        uint grid = (uint)((numEdges + DefaultBlockSize - 1) / DefaultBlockSize);
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 

@@ -50,6 +50,8 @@ public sealed partial class CudaBackend
         _directPtxCsrSegmentKernels = new(8);
     private readonly DirectPtxKernelCache<DirectPtxCsrBackwardTarget, PtxCsrSpmmBackwardF32Kernel>
         _directPtxCsrBackwardKernels = new(4);
+    private readonly DirectPtxKernelCache<DirectPtxSparseUtilityKey, PtxSparseUtilityF32Kernel>
+        _directPtxSparseUtilityKernels = new(8);
     private DirectPtxRuntime? _directPtxRuntime;
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
@@ -73,6 +75,7 @@ public sealed partial class CudaBackend
     private long _directPtxSegmentReduceDispatchCount;
     private long _directPtxCsrSegmentDispatchCount;
     private long _directPtxCsrBackwardDispatchCount;
+    private long _directPtxSparseUtilityDispatchCount;
     internal int DirectPtxCachedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxAttentionKernels.Count; }
@@ -166,6 +169,8 @@ public sealed partial class CudaBackend
         System.Threading.Interlocked.Read(ref _directPtxCsrSegmentDispatchCount);
     internal long DirectPtxCsrBackwardDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxCsrBackwardDispatchCount);
+    internal long DirectPtxSparseUtilityDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxSparseUtilityDispatchCount);
 
     /// <summary>
     /// Attempts the exact FP32 CSR SpMM golden specialization. The admitted ABI
@@ -1182,6 +1187,139 @@ public sealed partial class CudaBackend
                         DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[4]));
             }
             System.Threading.Interlocked.Increment(ref _directPtxCsrBackwardDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryDirectPtxSparseFill(IGpuBuffer output, int elements, bool negativeInfinity)
+    {
+        if (!IsDirectPtxSparseGraphEnabled || elements != PtxSparseUtilityF32Kernel.Elements ||
+            output is null || output.SizeInBytes != (long)elements * sizeof(float) ||
+            output.Handle == IntPtr.Zero || ((nuint)output.Handle & 15u) != 0)
+            return false;
+        DirectPtxSparseUtility utility = negativeInfinity
+            ? DirectPtxSparseUtility.FillNegativeInfinity : DirectPtxSparseUtility.FillZero;
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var key = new DirectPtxSparseUtilityKey(utility, 0);
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxSparseUtilityKernels.TryGetValue(key, out _)) return false;
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxSparseUtilityF32Kernel kernel = _directPtxSparseUtilityKernels.GetOrAdd(
+                    key, () => new PtxSparseUtilityF32Kernel(_directPtxRuntime!, utility));
+                if (capturing && !_directPtxSparseUtilityKernels.Pin(key)) return false;
+                lock (GpuDispatchLock)
+                    kernel.LaunchFill(DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[0]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxSparseUtilityDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryDirectPtxDegreeNormalize(
+        IGpuBuffer input, IGpuBuffer degrees, IGpuBuffer output,
+        int nodes, int features, float epsilon)
+    {
+        if (!IsDirectPtxSparseGraphEnabled || nodes != PtxSparseUtilityF32Kernel.Nodes ||
+            features != PtxSparseUtilityF32Kernel.Features || input is null || degrees is null ||
+            output is null || input.SizeInBytes != (long)nodes * features * sizeof(float) ||
+            degrees.SizeInBytes != (long)nodes * sizeof(float) ||
+            output.SizeInBytes != (long)nodes * features * sizeof(float))
+            return false;
+        return TryDirectPtxSparseUtilityCore(
+            DirectPtxSparseUtility.DegreeNormalize, epsilon,
+            input, degrees, null, null, null, output);
+    }
+
+    internal bool TryDirectPtxSymmetricDegreeNormalize(
+        IGpuBuffer edgeValues, IGpuBuffer sourceIndices, IGpuBuffer targetIndices,
+        IGpuBuffer sourceDegrees, IGpuBuffer targetDegrees, IGpuBuffer output,
+        int nodes, int edges, float epsilon)
+    {
+        if (!IsDirectPtxSparseGraphEnabled || nodes != PtxSparseUtilityF32Kernel.Nodes ||
+            edges != PtxSparseUtilityF32Kernel.Edges || edgeValues is null || sourceIndices is null ||
+            targetIndices is null || sourceDegrees is null || targetDegrees is null || output is null ||
+            edgeValues.SizeInBytes != (long)edges * sizeof(float) ||
+            sourceIndices.SizeInBytes != (long)edges * sizeof(int) ||
+            targetIndices.SizeInBytes != (long)edges * sizeof(int) ||
+            sourceDegrees.SizeInBytes != (long)nodes * sizeof(float) ||
+            targetDegrees.SizeInBytes != (long)nodes * sizeof(float) ||
+            output.SizeInBytes != (long)edges * sizeof(float))
+            return false;
+        return TryDirectPtxSparseUtilityCore(
+            DirectPtxSparseUtility.SymmetricDegreeNormalize, epsilon,
+            edgeValues, sourceIndices, targetIndices, sourceDegrees, targetDegrees, output);
+    }
+
+    private bool TryDirectPtxSparseUtilityCore(
+        DirectPtxSparseUtility utility,
+        float epsilon,
+        IGpuBuffer p0,
+        IGpuBuffer p1,
+        IGpuBuffer? p2,
+        IGpuBuffer? p3,
+        IGpuBuffer? p4,
+        IGpuBuffer output)
+    {
+        if (!(epsilon >= 0f) || float.IsInfinity(epsilon)) return false;
+        nuint pointers = (nuint)p0.Handle | (nuint)p1.Handle | (nuint)output.Handle;
+        if (p2 is not null) pointers |= (nuint)p2.Handle;
+        if (p3 is not null) pointers |= (nuint)p3.Handle;
+        if (p4 is not null) pointers |= (nuint)p4.Handle;
+        if (p0.Handle == IntPtr.Zero || p1.Handle == IntPtr.Zero || output.Handle == IntPtr.Zero ||
+            (p2 is not null && p2.Handle == IntPtr.Zero) || (p3 is not null && p3.Handle == IntPtr.Zero) ||
+            (p4 is not null && p4.Handle == IntPtr.Zero) || (pointers & 15u) != 0)
+            return false;
+        if (DirectPtxBuffersOverlap(output, p0) || DirectPtxBuffersOverlap(output, p1) ||
+            (p2 is not null && DirectPtxBuffersOverlap(output, p2)) ||
+            (p3 is not null && DirectPtxBuffersOverlap(output, p3)) ||
+            (p4 is not null && DirectPtxBuffersOverlap(output, p4)))
+            return false;
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var key = new DirectPtxSparseUtilityKey(utility, BitConverter.SingleToInt32Bits(epsilon));
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxSparseUtilityKernels.TryGetValue(key, out _)) return false;
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxSparseUtilityF32Kernel kernel = _directPtxSparseUtilityKernels.GetOrAdd(
+                    key, () => new PtxSparseUtilityF32Kernel(_directPtxRuntime!, utility, epsilon));
+                if (capturing && !_directPtxSparseUtilityKernels.Pin(key)) return false;
+                lock (GpuDispatchLock)
+                {
+                    if (utility == DirectPtxSparseUtility.DegreeNormalize)
+                        kernel.LaunchDegree(
+                            DirectPtxTensorView.Create(p0, kernel.Blueprint.Tensors[0]),
+                            DirectPtxTensorView.Create(p1, kernel.Blueprint.Tensors[1]),
+                            DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[2]));
+                    else
+                        kernel.LaunchSymmetric(
+                            DirectPtxTensorView.Create(p0, kernel.Blueprint.Tensors[0]),
+                            DirectPtxTensorView.Create(p1, kernel.Blueprint.Tensors[1]),
+                            DirectPtxTensorView.Create(p2!, kernel.Blueprint.Tensors[2]),
+                            DirectPtxTensorView.Create(p3!, kernel.Blueprint.Tensors[3]),
+                            DirectPtxTensorView.Create(p4!, kernel.Blueprint.Tensors[4]),
+                            DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[5]));
+                }
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxSparseUtilityDispatchCount);
             DirectPtxLastError = null;
             return true;
         }
@@ -3041,6 +3179,7 @@ public sealed partial class CudaBackend
             _directPtxSegmentReduceKernels.Dispose();
             _directPtxCsrSegmentKernels.Dispose();
             _directPtxCsrBackwardKernels.Dispose();
+            _directPtxSparseUtilityKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }
@@ -3117,6 +3256,9 @@ public sealed partial class CudaBackend
     private readonly record struct DirectPtxGraphScatterKey(bool Weighted);
     private readonly record struct DirectPtxCsrSegmentKey(
         DirectPtxCsrSegmentReduction Reduction,
+        int EpsilonBits);
+    private readonly record struct DirectPtxSparseUtilityKey(
+        DirectPtxSparseUtility Utility,
         int EpsilonBits);
 
 }

@@ -16,7 +16,7 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
             DirectPtxSparseGraphCompletionLedger.All
                 .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(21, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+        Assert.Equal(25, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
             entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
         Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
         Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
@@ -297,6 +297,25 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal("fused-register-initialization", blueprint.Semantics["output-initialization"]);
         Assert.Equal("single-overwrite", blueprint.Semantics["output-write"]);
         Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
+    }
+
+    [Theory]
+    [InlineData((int)DirectPtxSparseUtility.FillZero, 1)]
+    [InlineData((int)DirectPtxSparseUtility.FillNegativeInfinity, 1)]
+    [InlineData((int)DirectPtxSparseUtility.DegreeNormalize, 3)]
+    [InlineData((int)DirectPtxSparseUtility.SymmetricDegreeNormalize, 6)]
+    public void SparseUtilityEmitter_BakesExactPointerOnlyAbi(int utilityValue, int pointerCount)
+    {
+        var utility = (DirectPtxSparseUtility)utilityValue;
+        string ptx = PtxSparseUtilityF32Kernel.EmitPtx(8, 6, utility, 1e-8f);
+        DirectPtxKernelBlueprint blueprint = PtxSparseUtilityF32Kernel.CreateBlueprint(
+            DirectPtxArchitectureFamily.Ampere, utility, 1e-8f);
+
+        Assert.Equal(pointerCount, Count(ptx, ".param .u64"));
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
+        Assert.All(blueprint.Tensors, tensor => Assert.Equal(DirectPtxExtentMode.Exact, tensor.ExtentMode));
     }
 
     [Theory]
