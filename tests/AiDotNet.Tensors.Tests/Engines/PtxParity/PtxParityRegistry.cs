@@ -47,6 +47,13 @@ public static class PtxParityRegistry
 {
     public static IReadOnlyList<PtxParitySpec> Specs { get; } = new[]
     {
+        new PtxParitySpec("PtxFusedGatherF32Kernel", PtxParityStatus.Deferred,
+            "embedding gather, fp32 (#844) — CudaBackend.Gather",
+            "has a public route, but its tests cover the emitter and the PTX-vs-CPU result only, so the " +
+            "gate-off CUDA==CPU leg is unproven. Converts to ThreeWayParity by mirroring " +
+            "BackendRowSum_ThreeWay_CudaAndPtxBothMatchCpuOracle over Gather — gather is exact " +
+            "(a pure permuted copy, no accumulation), so the oracle comparison can be bit-exact."),
+
         new PtxParitySpec("PtxFusedResidualRmsNormD64Kernel", PtxParityStatus.Deferred,
             "fused residual + RMSNorm (D=64)",
             "backend method has no public op route on main (only the CUDA RmsNorm path is wired), " +

@@ -350,7 +350,7 @@ public sealed partial class CudaBackend
 
     internal bool IsDirectPtxGatherEnabled =>
         DirectPtxFeatureGate.IsGatherEnabled && IsAvailable &&
-        DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) == DirectPtxArchitectureFamily.Ampere;
+        DirectPtxArchitecture.HasValidatedGather(_ccMajor, _ccMinor);
 
     internal long DirectPtxGatherDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxGatherDispatchCount);
@@ -1816,8 +1816,7 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "gather-cuda-unavailable";
             return false;
         }
-        if (DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) !=
-            DirectPtxArchitectureFamily.Ampere)
+        if (!DirectPtxArchitecture.HasValidatedGather(_ccMajor, _ccMinor))
         {
             DirectPtxLastError = "gather-architecture-not-validated";
             return false;
@@ -1848,8 +1847,8 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "gather-invalid-device-pointer";
             return false;
         }
-        if ((((nuint)source.Handle | (nuint)output.Handle) & 15u) != 0 ||
-            ((nuint)indices.Handle & 3u) != 0)
+        if (((PtxCompat.ToNuint(source.Handle) | PtxCompat.ToNuint(output.Handle)) & 15u) != 0 ||
+            (PtxCompat.ToNuint(indices.Handle) & 3u) != 0)
         {
             DirectPtxLastError = "gather-alignment-mismatch";
             return false;
@@ -1907,8 +1906,8 @@ public sealed partial class CudaBackend
 
     private static bool Overlaps(IGpuBuffer left, IGpuBuffer right)
     {
-        nuint leftStart = (nuint)left.Handle;
-        nuint rightStart = (nuint)right.Handle;
+        nuint leftStart = PtxCompat.ToNuint(left.Handle);
+        nuint rightStart = PtxCompat.ToNuint(right.Handle);
         nuint leftEnd = checked(leftStart + (nuint)left.SizeInBytes);
         nuint rightEnd = checked(rightStart + (nuint)right.SizeInBytes);
         return leftStart < rightEnd && rightStart < leftEnd;
@@ -1934,8 +1933,7 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "gather-cuda-unavailable";
             return false;
         }
-        if (DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) !=
-            DirectPtxArchitectureFamily.Ampere)
+        if (!DirectPtxArchitecture.HasValidatedGather(_ccMajor, _ccMinor))
         {
             DirectPtxLastError = "gather-architecture-not-validated";
             return false;

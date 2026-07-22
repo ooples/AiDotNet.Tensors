@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -75,4 +74,3 @@ internal static class DirectPtxGatherCoverageManifest
         string api, string existing, string semantics, string layout, string dtypes, string assignment) =>
         new(api, existing, semantics, layout, dtypes, assignment, DirectPtxGatherCoverageStatus.PlannedDirectPtx);
 }
-#endif

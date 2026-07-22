@@ -1,9 +1,9 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Linq;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+using AiDotNet.Tensors.Helpers;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -140,9 +140,9 @@ public class DirectPtxGatherTests
         Assert.Equal(3, kernel.Blueprint.Tensors.Count);
 
         const int tableRows = 1024;
-        var random = new Random(20260722);
+        var random = RandomHelper.CreateSeededRandom(20260722);
         float[] table = Enumerable.Range(0, tableRows * featureSize)
-            .Select(_ => (random.NextSingle() * 2f - 1f) * 8f).ToArray();
+            .Select(_ => (float)((random.NextDouble() * 2.0 - 1.0) * 8.0)).ToArray();
         int[] indices = Enumerable.Range(0, numIndices)
             .Select(_ => random.Next(tableRows)).ToArray();
 
@@ -179,4 +179,3 @@ public class DirectPtxGatherTests
         return count;
     }
 }
-#endif

@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 using System.Text;
@@ -39,10 +38,11 @@ internal sealed class PtxFusedGatherF32Kernel : IDisposable
         int featureSize,
         int blockThreads = DefaultBlockThreads)
     {
-        ArgumentNullException.ThrowIfNull(runtime);
-        if (runtime.ArchitectureFamily != DirectPtxArchitectureFamily.Ampere)
+        PtxCompat.ThrowIfNull(runtime, nameof(runtime));
+        if (!DirectPtxArchitecture.HasValidatedGather(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
-                "The checked-in FP32 gather specialization is validated only on Ampere.");
+                "The checked-in FP32 gather specialization is admitted only on SM86.");
         Validate(numIndices, featureSize);
         ValidateBlockThreads(numIndices, blockThreads);
         NumIndices = numIndices;
@@ -243,4 +243,3 @@ internal sealed class PtxFusedGatherF32Kernel : IDisposable
                 $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
     }
 }
-#endif
