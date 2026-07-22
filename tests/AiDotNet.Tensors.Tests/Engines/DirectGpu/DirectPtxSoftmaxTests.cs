@@ -37,8 +37,93 @@ public class DirectPtxSoftmaxTests
             DirectPtxSoftmaxCoverageManifest.Get("CudaBackend.SoftmaxBackward").Status);
         Assert.Equal(DirectPtxSoftmaxCoverageStatus.ExperimentalDirectPtx,
             DirectPtxSoftmaxCoverageManifest.Get("CudaBackend.LogSumExpBackward").Status);
+        Assert.Equal(DirectPtxSoftmaxCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxSoftmaxCoverageManifest.Get("CudaBackend.MaskedFillKernel").Status);
+        Assert.Equal(DirectPtxSoftmaxCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxSoftmaxCoverageManifest.Get("CudaBackend.MaskedFillBackward").Status);
         Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() =>
             DirectPtxSoftmaxCoverageManifest.Get("UnassignedSoftmaxApi"));
+    }
+
+    [Fact]
+    public void MaskedFillEmitter_IsElementwiseSelect()
+    {
+        string ptx = PtxMaskedFillKernel.EmitPtx(8, 6, 64, 256);
+        Assert.Contains(PtxMaskedFillKernel.EntryPoint, ptx);
+        Assert.Contains("ld.param.f32 %f2, [fill];", ptx);
+        Assert.Contains("setp.neu.f32 %p0, %f1, 0f00000000", ptx);      // mask != 0
+        Assert.Contains("selp.f32 %f3, %f2, %f0, %p0", ptx);            // fill : input
+        Assert.Equal(0, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxMaskedFillKernel.IsSupportedShape(128, 2048));
+        Assert.False(PtxMaskedFillKernel.IsPromotedShape(128, 2048));
+    }
+
+    [Fact]
+    public void MaskedFillBackwardEmitter_GatesGradientAtMaskedPositions()
+    {
+        string ptx = PtxMaskedFillBackwardKernel.EmitPtx(8, 6, 64, 256);
+        Assert.Contains(PtxMaskedFillBackwardKernel.EntryPoint, ptx);
+        Assert.Contains("setp.neu.f32 %p0, %f1, 0f00000000", ptx);
+        Assert.Contains("selp.f32 %f3, 0f00000000, %f0, %p0", ptx);     // 0 : gradOutput
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxMaskedFillBackwardKernel.IsSupportedShape(128, 2048));
+        Assert.False(PtxMaskedFillBackwardKernel.IsPromotedShape(128, 2048));
+    }
+
+    [SkippableTheory]
+    [InlineData(64, 256)]
+    [InlineData(128, 512)]
+    public void DriverOnlyMaskedFillAndBackward_MatchOracle(int m, int n)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedSoftmax(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in masked-fill specialization is measured on GA10x/SM86.");
+        const float fill = -1e9f;
+        var random = RandomHelper.CreateSeededRandom(20265200 + m + n);
+        float[] inHost = Values(random, m * n, 2.0f);
+        float[] maskHost = new float[m * n];
+        for (int i = 0; i < maskHost.Length; i++) maskHost[i] = random.NextDouble() < 0.3 ? 1f : 0f;
+
+        var expFill = new float[m * n];
+        var expBwd = new float[m * n];
+        for (int i = 0; i < inHost.Length; i++)
+        {
+            bool masked = maskHost[i] != 0f;
+            expFill[i] = masked ? fill : inHost[i];
+            expBwd[i] = masked ? 0f : inHost[i];   // treat inHost as gradOutput for the backward
+        }
+
+        using var fwd = new PtxMaskedFillKernel(runtime, m, n, fill);
+        using var bwd = new PtxMaskedFillBackwardKernel(runtime, m, n);
+        Assert.Equal(0, fwd.Audit.Function.LocalBytesPerThread);
+        Assert.Equal(0, bwd.Audit.Function.LocalBytesPerThread);
+
+        using var inBuf = runtime.AllocateBytes((nuint)(inHost.Length * sizeof(float)));
+        using var maskBuf = runtime.AllocateBytes((nuint)(maskHost.Length * sizeof(float)));
+        using var outFill = runtime.AllocateBytes((nuint)(m * n * sizeof(float)));
+        using var outBwd = runtime.AllocateBytes((nuint)(m * n * sizeof(float)));
+        inBuf.Upload<float>(inHost);
+        maskBuf.Upload<float>(maskHost);
+        fwd.Launch(
+            DirectPtxTensorView.CreateOwned(inBuf, fwd.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(maskBuf, fwd.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(outFill, fwd.Blueprint.Tensors[2]));
+        bwd.Launch(
+            DirectPtxTensorView.CreateOwned(inBuf, bwd.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(maskBuf, bwd.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(outBwd, bwd.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actualFill = new float[m * n];
+        var actualBwd = new float[m * n];
+        outFill.Download<float>(actualFill);
+        outBwd.Download<float>(actualBwd);
+        AssertVectorClose(actualFill, expFill, 0f, $"masked-fill {m}x{n}");
+        AssertVectorClose(actualBwd, expBwd, 0f, $"masked-fill-backward {m}x{n}");
     }
 
     [Fact]
