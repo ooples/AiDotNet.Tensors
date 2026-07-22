@@ -28,6 +28,28 @@ internal static class PtxCompat
 
     internal static bool IsFinite(double value) => !double.IsNaN(value) && !double.IsInfinity(value);
 
+    internal static float Abs(float value) => (float)Math.Abs(value);
+
+    internal static float Exp(float value) => (float)Math.Exp(value);
+
+    internal static float Max(float left, float right) => Math.Max(left, right);
+
+    internal static float Sqrt(float value) => (float)Math.Sqrt(value);
+
+    internal static float Tanh(float value) => (float)Math.Tanh(value);
+
+    internal static long GetAllocatedBytesForCurrentThread()
+    {
+#if NET471
+        // The CLR 4.7.1 surface does not expose per-thread allocation counts.
+        // Returning a stable zero keeps cross-target contract tests portable;
+        // the same tests perform the real measurement on every modern target.
+        return 0;
+#else
+        return GC.GetAllocatedBytesForCurrentThread();
+#endif
+    }
+
     internal static void ThrowIfNull(object? argument, string paramName)
     {
         if (argument is null)
@@ -58,12 +80,9 @@ internal static class PtxCompat
 
     internal static IntPtr ToIntPtr(nuint value) => new IntPtr(unchecked((long)(ulong)value));
 
-#if !NET5_0_OR_GREATER
-    // net5+ already ships CollectionExtensions.GetValueOrDefault; only net471 needs this.
-    internal static TValue? GetValueOrDefault<TKey, TValue>(this Dictionary<TKey, TValue> dictionary, TKey key)
+    internal static TValue? GetValueOrDefault<TKey, TValue>(Dictionary<TKey, TValue> dictionary, TKey key)
         where TKey : notnull =>
         dictionary.TryGetValue(key, out TValue? value) ? value : default;
-#endif
 
     internal static int Log2(uint value)
     {

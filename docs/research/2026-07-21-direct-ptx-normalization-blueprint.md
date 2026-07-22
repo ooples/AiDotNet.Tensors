@@ -1,220 +1,184 @@
-# Direct-PTX normalization and fused epilogue blueprint
+# Compiled CUDA normalization blueprint
 
-Date: 2026-07-21
+Date: 2026-07-22
 
 Tracking issue: #838
 
 Parent blueprint: `2026-07-20-fused-attention-championship-blueprint.md`
 
-## Verdict
+## Current verdict
 
-The first issue-#838 golden slice is a six-input FP32 inference kernel:
+The implementation inventory is complete for the exact SM86 shapes in this
+pull request: 65 row/channel specialization cells map to 61 distinct,
+content-addressed cubins. The difference is intentional: the two atomic
+parameter kernels have identical PTX for their three runtime grid sizes and
+therefore share a compiled artifact.
 
-```text
-gelu_tanh(layernorm(input + residual + bias, gamma, beta))
-```
+This is a compiled-cubin pipeline, not a raw-PTX production loader. Every
+normal production module load receives an ELF cubin. PTX text is accepted by
+the CUDA driver linker only to create a missing artifact; the returned cubin
+is the object preserved, hashed, cached, loaded, disassembled, and profiled.
+Passing PTX directly to `cuModuleLoadDataEx` is restricted to an explicit
+normalization experiment when the linker entry points are unavailable.
 
-It specializes exact row-major `[rows,64]` tensors for Ampere. The 2,048-row
-and 8,192-row cells beat current AiDotNet and the strongest measured PyTorch
-CUDA/Triton-compiled path by conservative median factors of 1.35x and 1.79x.
-They pass the production median, P95, numerical, allocation, temporary-VRAM,
-and driver-JIT local-memory gates. The 256-row cell remains experiment-only:
-PyTorch compile reached 1.99 us while the worst direct measurement was 2.17 us.
+No normalization cell is promoted by this pull request yet. Correctness,
+allocation, graph capture, artifact identity, runtime resource, and SASS
+safety gates pass. Several cells beat current AiDotNet, but the required
+three-run comparison against the strongest PyTorch lane is incomplete and
+some backward/reduction cells still lose its best compiled result. The
+production admission table therefore remains fail-closed.
 
-The route is disabled by default behind
-`AIDOTNET_DIRECT_PTX_RESIDUAL_LAYERNORM_GELU=1` or the master direct-PTX gate.
-Unsupported layouts, extents, shapes, architectures, and aliases fail closed
-to the established CUDA composition. This increment does not close #838. An
-executable 41-cell normalization manifest assigns every remaining forward,
-backward, FP16, L2, fused activation, and convolution-normalization operation.
+## Ten-stage production binary pipeline
 
-## Assembly-line contract
-
-Every later normalization kernel follows the same sequence:
-
-1. Freeze one semantic cell, dtype, architecture, shape bucket, physical
-   layout, alignment, alias policy, accuracy mode, and fallback.
-2. Establish exact physical extents at the boundary. The kernel never receives
-   or dynamically checks strides, dimensions, epsilon, or mode flags.
-3. Emit a pointer-only PTX ABI with geometry and constants baked into the
-   module identity.
-4. Fuse residual, bias, reductions, affine normalization, and activation while
-   values are register resident; write only the final tensor to global memory.
-5. Prewarm and audit the driver-JIT result before graph capture. Reject local
-   memory, excess registers/shared memory, or insufficient occupancy.
-6. Benchmark resident operands against current AiDotNet and the strongest
-   NVIDIA GPU competitors with identical arithmetic, warmups, sample counts,
-   accuracy checks, and device/E2E timing definitions.
-7. Promote only a measured cell that clears all release gates in three
-   independent runs. Architecture and shape families never inherit promotion.
-
-Contiguity is therefore a boundary invariant, not a hot-loop branch. General
-tensor views remain valid elsewhere in AiDotNet, but they must be materialized
-or routed to fallback before entering this specialized ABI. A later tensor
-layout registry can make those proofs reusable across adjacent fused kernels;
-it must not add per-element stride checks.
-
-## Register-resident dataflow
-
-One 256-thread block owns eight rows and one warp owns each row. Every lane
-loads two features from each row tensor. Those two values remain lane-owned
-through both warp reductions, normalization, affine transform, and tanh-GELU.
-
-```text
-coalesced global loads
-  input + residual + broadcast bias
-        -> two lane registers
-        -> warp sum -> mean
-        -> warp squared-deviation sum -> inverse standard deviation
-        -> broadcast gamma/beta -> tanh-GELU
-        -> one final coalesced output store
-```
-
-| Allocation | Per output element | Global writes | Lifetime |
-|---|---:|---:|---|
-| input | one load | 0 | lane registers |
-| residual | one load | 0 | lane registers |
-| bias | one load | 0 | lane registers |
-| gamma | one load | 0 | affine epilogue |
-| beta | one load | 0 | affine epilogue |
-| output | 0 loads | one store | final commit only |
-
-There is no residual intermediate, bias intermediate, normalization output,
-activation output, scratch allocation, shared memory, or temporary VRAM. PTX
-emitter tests require exactly ten `ld.global.nc.f32`, two final stores, ten
-warp shuffles, six pointer parameters, and no `.shared`, `.local`, scalar
-shape parameter, or stride token. Because shared memory is absent, bank
-conflicts and `cp.async` staging are inapplicable to this D=64 warp-row cell.
-Async shared-memory tiling remains a blueprint option for wider rows and
-multi-row Tensor Core cells where a staged panel is actually reused.
-
-## Formal ABI and admission
-
-The launch contains six 64-bit pointers and no scalar parameters:
-
-| Tensor | Layout | Exact extent | Access | Alignment |
-|---|---|---|---|---:|
-| input | row-major | `[rows,64]` FP32 | read | 16 B |
-| residual | row-major | `[rows,64]` FP32 | read | 16 B |
-| bias | vector | `[64]` FP32 | read | 16 B |
-| gamma | vector | `[64]` FP32 | read | 16 B |
-| beta | vector | `[64]` FP32 | read | 16 B |
-| output | row-major | `[rows,64]` FP32 | write | 16 B |
-
-Admission checks the feature gate, CUDA availability, exact Ampere
-architecture, promoted row bucket, exact byte extents, 16-byte alignment, and
-non-aliasing once. Stable fallback reasons distinguish feature-disabled,
-CUDA-unavailable, architecture-not-validated, shape-not-implemented,
-performance-gate-not-met, and physical-extent-mismatch cases. Capture requires
-a prewarmed cache entry and cannot JIT, tune, allocate, perform I/O, or evict.
-The captured module is pinned so later specialization churn cannot unload a
-`CUfunction` retained by the graph.
-
-## GPU championship evidence
-
-Environment: Windows 10.0.26200, .NET 10.0.10 / SDK 10.0.302, NVIDIA GeForce
-RTX 3080, SM86, driver fingerprint
-`gpu-79d5ac8ef419a3bce86d78a8222664cd-sm86-drv13030`, PyTorch
-2.12.1+cu130, CUDA 13.0, and `triton-windows` 3.7.1.post27. Each cell uses 30
-warmups and 101 samples in each of three independent runs. Raw-device samples
-average a captured batch of 50 resident launches; E2E samples include one
-launch plus synchronization. Uploads, downloads, compilation, allocation, and
-graph construction are outside timing.
-
-Useful work is `(19*64+3)*rows`; sqrt, reciprocal, and tanh each count as one
-operation. Thus the table reports useful algorithmic GFLOPS rather than an
-inflated hardware-instruction estimate. Values are min-max ranges over the
-three-run capture. Device columns are `mean/median/P95/P99` microseconds; E2E
-columns are `median/P95/P99` microseconds.
-
-### Promoted rows
-
-| Rows | Method | Device us mean/med/P95/P99 | E2E us med/P95/P99 | GFLOPS | managed B/call | temp VRAM B | max error |
-|---:|---|---|---|---:|---:|---:|---:|
-| 2,048 | AiDotNet CUDA eager | 20.20-22.33 / 20.07-22.30 / 20.52-22.73 / 21.40-29.06 | 42.60-48.80 / 61.80-88.50 / 65.60-255.40 | 111.9-124.4 | 56 | 0 | 5.6e-6 |
-| 2,048 | AiDotNet CUDA graph | 20.59-21.80 / 20.36-21.40 / 21.65-22.77 / 25.50-30.90 | 37.00-42.20 / 45.60-59.90 / 54.80-77.00 | 116.7-122.6 | 0 | 0 | 5.6e-6 |
-| 2,048 | Direct PTX eager | 2.76-2.84 / 2.58-2.79 / 3.13-3.28 / 3.44-7.00 | 19.30-23.60 / 33.10-42.50 / 40.20-44.60 | 896.3-967.5 | 0 | 0 | 5.6e-6 |
-| 2,048 | Direct PTX graph | 2.67-2.78 / 2.58-2.64 / 3.11-3.19 / 3.28-6.45 | 18.40-19.30 / 38.90-40.50 / 40.80-46.10 | 945.0-967.5 | 0 | 0 | 5.6e-6 |
-| 2,048 | PyTorch CUDA eager | 12.51-13.62 / 12.43-13.60 / 13.33-14.56 / 13.37-19.37 | 108.00-150.90 / 125.60-195.40 / 138.80-305.10 | 183.6-200.8 | n/a | 540,672 | 6.0e-7 |
-| 2,048 | PyTorch CUDA graph | same eager device kernel | 32.30-32.40 / 35.50-41.80 / 42.40-60.80 | 183.6-200.8 | n/a | 1,024 | 6.0e-7 |
-| 2,048 | PyTorch compile | 3.74-4.13 / 3.77-4.08 / 3.79-4.42 / 3.95-4.73 | 125.10-177.80 / 140.50-210.40 / 155.40-286.80 | 612.6-662.5 | n/a | 0 | 7.2e-7 |
-| 2,048 | PyTorch compile graph | same compiled device kernel | 26.10-31.20 / 42.10-45.70 / 48.90-50.20 | 612.6-662.5 | n/a | 1,024 | 7.2e-7 |
-| 8,192 | AiDotNet CUDA eager | 76.43-77.61 / 75.76-76.82 / 83.05-83.89 / 84.34-90.69 | 96.40-97.60 / 99.40-101.50 / 116.90-138.10 | 130.0-131.8 | 56 | 0 | 5.6e-6 |
-| 8,192 | AiDotNet CUDA graph | 77.68-78.30 / 76.84-76.94 / 83.78-85.44 / 86.75-93.02 | 93.30-99.00 / 95.10-102.20 / 97.40-109.30 | 129.8-130.0 | 0 | 0 | 5.6e-6 |
-| 8,192 | Direct PTX eager | 5.83-5.88 / 5.53-5.80 / 6.10-6.39 / 9.18-10.01 | 22.80-24.20 / 44.80-45.70 / 48.80-50.10 | 1,723.0-1,805.9 | 0 | 0 | 5.5e-6 |
-| 8,192 | Direct PTX graph | 5.78-6.17 / 5.59-5.96 / 6.00-7.29 / 9.30-10.22 | 15.90-27.50 / 43.70-46.60 / 44.90-52.30 | 1,675.6-1,786.1 | 0 | 0 | 5.5e-6 |
-| 8,192 | PyTorch CUDA eager | 40.52-40.70 / 40.26-40.43 / 40.65-45.61 / 46.32-47.47 | 96.10-96.60 / 118.50-128.30 / 135.80-226.90 | 247.0-248.0 | n/a | 2,162,688 | 7.2e-7 |
-| 8,192 | PyTorch CUDA graph | same eager device kernel | 60.00-64.40 / 65.90-77.80 / 87.20-189.30 | 247.0-248.0 | n/a | 1,024 | 7.2e-7 |
-| 8,192 | PyTorch compile | 10.85-10.97 / 10.65-10.90 / 11.30-11.49 / 11.61-16.98 | 125.20-126.70 / 142.50-154.40 / 172.20-316.90 | 916.5-937.7 | n/a | 0 | 7.2e-7 |
-| 8,192 | PyTorch compile graph | same compiled device kernel | 30.40-30.50 / 31.40-34.10 / 35.40-39.90 | 916.5-937.7 | n/a | 1,024 | 7.2e-7 |
-
-The executable TUI reports TFLOPS implicitly through GFLOPS: the 8,192-row
-direct kernel sustains 1.68-1.81 useful TFLOPS. It also prints mean, median,
-P95, P99, useful GB/s, managed allocation, temporary device bytes, numerical
-error, and registers/shared/local/blocks for every competitor and run.
-
-### Rejected 256-row cell
-
-| Method | Device median us | P95 us | GFLOPS | managed B/call | temp VRAM B |
-|---|---:|---:|---:|---:|---:|
-| AiDotNet CUDA graph | 5.92-6.73 | 6.41-7.27 | 46.3-52.7 | 0 | 0 |
-| Direct PTX | 1.99-2.17 | 2.46-3.03 | 143.8-157.1 | 0 | 0 |
-| PyTorch compile | 1.99-2.54 | 2.48-2.56 | 123.0-157.1 | n/a | 0 |
-| PyTorch compile graph | 1.99-2.54 | 2.48-2.56 | 123.0-157.1 | n/a | 0-1,024 |
-
-The conservative gate compares the worst candidate evidence with the best
-competitor evidence. At 2,048 rows it is `3.77/2.79 = 1.35x`; at 8,192 it is
-`10.65/5.96 = 1.79x`. At 256 rows it is only `1.99/2.17 = 0.92x`, so that cell
-correctly returns `performance-gate-not-met` in production.
-
-## Resource and spill evidence
-
-All three modules report the same driver-JIT resources:
-
-```text
-registers/thread: 18
-static shared bytes: 0
-local bytes/thread: 0
-active 256-thread blocks/SM: 6
-PTX/binary version: 86/86
-```
-
-| Rows | Blueprint suffix | PTX SHA-256 |
+| # | Required stage | Implementation and release gate |
 |---:|---|---|
-| 256 | `w8-r256` | `04382119ccf04f836805f0839a3d48c6886b613d8ecc95949805f7b127cf0a3f` |
-| 2,048 | `w8-r2048` | `030060fca5a18a70f81f52ec922756564deee659b88b0524a5ad833fa69270db` |
-| 8,192 | `w8-r8192` | `e250a9dc0990d50e1c1527b69f8415cc7f367b3de4c7f7db863d0698f1fb4adf` |
+| 1 | Generate PTX | Shape, dtype, epsilon/momentum, architecture, physical layout, alias policy, and operation are frozen in the blueprint; hot ABIs contain pointers only. |
+| 2 | Compile explicitly | `cuLinkCreate` + `cuLinkAddData(CU_JIT_INPUT_PTX)` + `cuLinkComplete` produces the executable before module load. Linker failures include both info and error logs. |
+| 3 | Preserve cubin | The returned ELF bytes are SHA-256 hashed and exported under their source key. Invalid/non-ELF output fails closed. |
+| 4 | Disassemble SASS | Pinned `nvdisasm` 13.3.73 disassembles the exact preserved cubin and records entry point, registers, instructions, global/shared/local traffic, async copies, and Tensor Core instructions. |
+| 5 | Fail unsafe machine code | CI rejects a missing/extra/stale/hash-mismatched artifact, multiple direct entries, absent resource metadata, or any final-SASS `LDL`/`STL`. Runtime blueprint budgets independently reject local bytes, excess registers/shared memory, and insufficient occupancy. |
+| 6 | Profile exact cubin | `--direct-ptx-profile-normalization` executes every embedded cubin and asserts `EmbeddedCubin` before launch. Nsight Compute is invoked against that target, never against a separately compiled sample. |
+| 7 | Embed in NuGet | `Artifacts/sm86/*.cubin` and `normalization-cubins.tsv` are embedded resources in `AiDotNet.Tensors`; the package contains the audited bytes and their release hashes. |
+| 8 | Load cubin in production | Resolution order is embedded cubin, verified disk cubin, then driver-linked cubin. `cuModuleLoadData` receives the compiled image. |
+| 9 | Restrict PTX JIT | Direct PTX JIT is available only behind the explicit experiment fallback and only when CUDA linker entry points are unavailable. It is not a promotion path. |
+| 10 | Cache complete identity | The source key hashes pipeline version + target SM + PTX content. Disk identity also includes CUDA driver/linker version; sidecars preserve source key, cubin hash, target, and driver. |
 
-The loader rejects more than 40 registers/thread, any shared or local bytes,
-or fewer than six active blocks/SM before caching. Nsight Compute 2025.4.1 was
-installed and attached to the exact 8,192-row kernel, but this host returned
-`ERR_NVGPUCTRPERM` before metric collection. Consequently this increment does
-not claim executed SASS zero-spill proof. It proves compile-time no-local
-allocation through the driver audit, and the CSV verifier is ready to require
-zero executed register spills, local loads, local stores, and derived local
-spill requests once an administrator enables NVIDIA performance counters.
+The no-GPU CI verifier regenerates every current PTX string and blueprint ID,
+recomputes source keys, validates every manifest row, checks every cubin hash,
+and rejects extra artifacts. Reusing one source key across byte-identical
+specializations is allowed only when the cubin filename and hash also match.
+
+## Kernel and memory contract
+
+All admitted tensors are exact, contiguous, aligned physical views. Strides,
+shapes, epsilon, momentum, dtype, and mode flags are removed before the hot
+launch. Unsupported layouts or aliases return to the established CUDA path.
+There are no output-sized temporary device allocations.
+
+Row forward/input-gradient kernels assign one warp to one 64-value row. Each
+lane loads two adjacent half-row values, retains them in registers through
+warp reductions and the affine/activation epilogue, then commits the final
+values once. Channel kernels use the same register-resident rule and shared
+memory only for values reused across threads. Parameter gradients use
+coalesced 16-feature tiles: row cohorts accumulate in registers, shuffle
+within a warp, fold fixed partials through 1 KiB shared memory, and write the
+64 final parameters once.
+
+The experimental fast parameter lane divides rows into 256-row tiles and
+uses one final FP32 atomic per tile/output. It is selected only for the
+measured 8,192-row RMSNorm fast-mode cell; deterministic mode always retains
+the fixed-order kernel. Output zeroing is `cuMemsetD8Async` on the same stream,
+so it is ordered, graph-capturable, and has no host synchronization.
+
+The experimental whole-tensor L2 lane uses aligned 16-byte loads, four
+register FMAs, a bounded grid, warp/shared block folds, and one atomic per
+block. It remains unselected because it still loses the existing CUDA kernel.
+
+`cp.async` and Tensor Core instructions are requirements only where their
+operands are reusable and their arithmetic applies. These D=64 normalization
+kernels consume each row value once and perform reductions/elementwise math;
+SASS correctly reports zero async copies and zero MMA instructions. Forcing a
+global-to-shared copy before a single use would increase traffic. Wider tiled
+or GEMM-containing fused cells must revisit both gates with profiler evidence.
+
+## Streaming, graphs, and lifetime
+
+All launches, accumulation clears, and fallbacks use the backend compute
+stream. There is no hidden device synchronization, host copy, host reduction,
+or hot-path allocation. Modules and plans are prewarmed before CUDA Graph
+capture and pinned for the graph lifetime so cache eviction cannot invalidate
+a retained `CUfunction`. Compilation, file I/O, tuning, and cache misses are
+forbidden during capture.
+
+Fused residual + BatchNorm + ReLU is connected through the production fusion
+manager. The kernel computes the normalization affine result, adds the
+residual while values are resident, applies ReLU, and performs one output
+write. Other compositions are not described as fused until their public route
+actually dispatches a combined cubin.
+
+## Release gates
+
+A shape/operation/architecture cell may be promoted only when all conditions
+hold in three independent runs:
+
+1. Median device time is at least 1.10x faster than the strongest of current
+   AiDotNet and PyTorch, including `torch.compile` max-autotune and CUDA Graph.
+2. Candidate P95 is no more than 10% worse than that strongest competitor.
+3. Identical resident inputs, semantics, numerical mode, warmups, samples,
+   launch batch, stream, and graph treatment are used.
+4. Correctness and deterministic-mode bit stability pass at declared
+   tolerances; fast atomics are explicitly labeled nondeterministic.
+5. Managed hot allocation and temporary VRAM are both zero.
+6. Runtime local bytes and final-SASS `LDL`/`STL` are zero; registers, shared
+   memory, and active blocks meet the blueprint budget.
+7. The exact cubin is embedded, hash verified, disassembled, and profiled.
+
+The executable screen uses 30 warmups, 101 samples, and 50 resident launches
+per device sample. Promotion uses the competitor's strongest measured lane,
+not eager PyTorch when compiled PyTorch is faster.
+
+## Evidence collected on RTX 3080 / SM86
+
+- All 11 focused net10 correctness/routing/capture/allocation tests pass.
+- All current-source identities and compiled cubins pass the static verifier.
+- Final SASS passes for the complete compiled inventory with zero `LDL` and
+  zero `STL`; current maximum register use is 40/thread.
+- The atomic parameter entries contain the intended final
+  `ATOMG.E.ADD.F32` instructions and no local memory.
+- Exact-cubin runtime profiling launches the complete embedded inventory.
+- Nsight Compute 2025.4.1 attaches to the exact target, but hardware-counter
+  collection is blocked locally by `ERR_NVGPUCTRPERM`. No counter-derived
+  bandwidth/occupancy claim is made until an elevated runner or NVIDIA
+  non-admin counter access is available.
+
+Preliminary strongest-PyTorch medians show why promotion remains off. At
+8,192 rows, compiled PyTorch measured approximately 20.75 us for LayerNorm
+backward, 19.37 us for RMSNorm backward, and 14.13 us for whole-tensor L2
+reduction. Current direct medians are approximately 44.8 us, 24.2 us, and the
+unselected atomic L2 experiment 26.9 us respectively. Several forward/L2-axis
+cells beat both competitors, but they still require the complete three-run
+tail matrix before independent promotion.
+
+## Rejected experiments retained as evidence
+
+- Four outputs per BatchNorm thread increased register pressure and reduced
+  useful parallelism. The source was restored exactly and the artifact
+  identity verifier confirmed the restoration.
+- Atomic parameter gradients regressed 256/2,048-row cells and LayerNorm at
+  8,192 rows. Only 8,192-row RMSNorm showed a useful improvement, so routing
+  is shape/operation specific.
+- Scalar and `float4` bounded atomic whole-tensor L2 variants both remained
+  slower than current CUDA. They stay experimental and unpromoted.
+
+## Follow-up required before production promotion
+
+1. Fuse or otherwise eliminate the second full input read in LayerNorm and
+   RMSNorm backward while keeping parameter reduction traffic bounded.
+2. Replace whole-tensor L2 with a measured hierarchy that beats compiled
+   PyTorch without output-sized scratch or hidden synchronization.
+3. Complete three clean independent runs for every candidate forward cell and
+   rerun the corrected residual BatchNorm semantics.
+4. Enable NVIDIA performance counters and archive exact-cubin NCU metrics for
+   DRAM bytes, shared transactions/conflicts, occupancy, and local/spill
+   counters.
+5. Promote only the individual cells that pass; keep all other shapes behind
+   `normalization-performance-gate-not-met`.
 
 ## Reproduction
 
 ```powershell
-$env:AIDOTNET_DIRECT_PTX_RESIDUAL_LAYERNORM_GELU = '1'
-dotnet run --project tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.csproj `
-  -c Release -- --direct-ptx-residual-layernorm-gelu 3
+dotnet tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Benchmarks.dll `
+  --verify-direct-ptx-normalization-cubins
 
-powershell -ExecutionPolicy Bypass -File `
-  tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-ncu.ps1 `
-  -Target residual-layernorm-gelu -NcuPath <path-to-ncu.exe>
+dotnet tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Benchmarks.dll `
+  --audit-direct-ptx-normalization-sass <nvdisasm.exe> `
+  src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/sm86 `
+  artifacts/direct-ptx/normalization/sass
+
+dotnet tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Benchmarks.dll `
+  --direct-ptx-normalization 3 all
+
+<ncu.exe> --target-processes all --profile-from-start off `
+  dotnet tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Benchmarks.dll `
+  --direct-ptx-profile-normalization
 ```
-
-## Next normalization increments
-
-1. FP32/FP16 LayerNorm and RMSNorm forward families, including residual and
-   bias epilogues, using the exact same layout/admission/audit contract.
-2. Normalization backward pairs with fused parameter-gradient reductions and
-   no global forward-intermediate materialization beyond declared saved state.
-3. Wider hidden dimensions using measured warp/block reduction catalogs and,
-   only where panels are reused, async shared-memory pipelines.
-4. BatchNorm, GroupNorm, InstanceNorm, and LocalResponseNorm families with
-   training/inference semantics split into explicit blueprint cells.
-5. Fused convolution-normalization-activation cells and FP16 architecture
-   families, each independently benchmarked and promoted.

@@ -137,12 +137,10 @@ public sealed partial class CudaBackend
             biasFloat.SizeInBytes < checked((long)outFeatures * sizeof(float)) ||
             outputFloat.SizeInBytes < checked((long)outFeatures * sizeof(float)))
             throw new ArgumentException("Mixed fused-linear buffers are smaller than the requested canonical extents.");
-#if NET5_0_OR_GREATER
         if (TryDirectPtxFusedLinearGeluFp16M1(
             inputHalf, outputMajorWeightHalf, biasFloat, outputFloat,
             inFeatures, outFeatures))
             return;
-#endif
 
         using var _ = PushContext();
         float alpha = 1f, beta = 0f;
@@ -194,12 +192,10 @@ public sealed partial class CudaBackend
             biasFloat.SizeInBytes < checked((long)outFeatures * sizeof(float)) ||
             outputFloat.SizeInBytes < checked((long)rows * outFeatures * sizeof(float)))
             throw new ArgumentException("M=16 mixed fused-linear buffers are smaller than the requested canonical extents.");
-#if NET5_0_OR_GREATER
         if (TryDirectPtxFusedLinearGeluFp16M16(
             inputHalf, outputMajorWeightHalf, biasFloat, outputFloat,
             inFeatures, outFeatures))
             return;
-#endif
 
         using var _ = PushContext();
         float alpha = 1f, beta = 0f;

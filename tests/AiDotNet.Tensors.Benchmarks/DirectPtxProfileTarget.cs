@@ -5,6 +5,77 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// <summary>Small deterministic targets for Nsight Compute release evidence.</summary>
 internal static class DirectPtxProfileTarget
 {
+    internal static void RunNormalization()
+    {
+        GpuBenchmarkEnvironment.RequireIdleGpu("ncu-normalization-start");
+        bool previousExperiment = DirectPtxFeatureGate.NormalizationExperimentOverride;
+        DirectPtxFeatureGate.NormalizationExperimentOverride = true;
+        try
+        {
+            using var runtime = new DirectPtxRuntime();
+            int launches = 0;
+            foreach (int rows in new[] { 256, 2_048, 8_192 })
+            foreach (DirectPtxRowNormalizationOperation operation in
+                Enum.GetValues<DirectPtxRowNormalizationOperation>())
+            {
+                using var kernel = new PtxRowNormalizationD64Kernel(
+                    runtime, operation, rows, 1e-5f);
+                LaunchNormalizationKernel(runtime, kernel.Blueprint, kernel.Audit, kernel.Launch);
+                launches++;
+            }
+
+            foreach (DirectPtxChannelNormalizationOperation operation in
+                Enum.GetValues<DirectPtxChannelNormalizationOperation>())
+            {
+                using var kernel = new PtxChannelNormalizationD64Kernel(
+                    runtime, operation, 1e-5f, 0.1f);
+                LaunchNormalizationKernel(runtime, kernel.Blueprint, kernel.Audit, kernel.Launch);
+                launches++;
+            }
+
+            runtime.Synchronize();
+            Console.WriteLine($"PROFILED_NORMALIZATION_CUBINS={launches}");
+        }
+        finally
+        {
+            DirectPtxFeatureGate.NormalizationExperimentOverride = previousExperiment;
+        }
+        // Do not re-run the idle-GPU gate here: writing 56 audit records can make
+        // a hardware-accelerated terminal briefly appear as a compute+graphics
+        // process. The pre-launch gate protects the actual profiled interval.
+    }
+
+    private static void LaunchNormalizationKernel(
+        DirectPtxRuntime runtime,
+        DirectPtxKernelBlueprint blueprint,
+        DirectPtxKernelAudit audit,
+        Action<ReadOnlySpan<DirectPtxTensorView>> launch)
+    {
+        if (audit.ImageKind != DirectPtxModuleImageKind.EmbeddedCubin)
+            throw new InvalidOperationException(
+                $"Nsight target requires an embedded cubin, but {blueprint.Id} loaded {audit.ImageKind}.");
+
+        var buffers = new DirectPtxBuffer[blueprint.Tensors.Count];
+        var views = new DirectPtxTensorView[blueprint.Tensors.Count];
+        try
+        {
+            for (int i = 0; i < blueprint.Tensors.Count; i++)
+            {
+                DirectPtxTensorContract contract = blueprint.Tensors[i];
+                buffers[i] = runtime.AllocateBytes(contract.RequiredBytes);
+                buffers[i].Upload<byte>(new byte[checked((int)contract.RequiredBytes)]);
+                views[i] = DirectPtxTensorView.CreateOwned(buffers[i], contract);
+            }
+            launch(views);
+            Console.WriteLine(audit.ToJson());
+        }
+        finally
+        {
+            for (int i = buffers.Length - 1; i >= 0; i--)
+                buffers[i]?.Dispose();
+        }
+    }
+
     internal static void RunAttention()
     {
         GpuBenchmarkEnvironment.RequireIdleGpu("ncu-attention-start");

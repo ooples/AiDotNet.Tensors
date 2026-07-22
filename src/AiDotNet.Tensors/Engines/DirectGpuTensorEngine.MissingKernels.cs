@@ -2309,6 +2309,33 @@ public partial class DirectGpuTensorEngine
             using var gammaBuffer = GetOrAllocateBuffer(backend, gamma);
             using var meanBuffer = GetOrAllocateBuffer(backend, mean);
             using var varianceBuffer = GetOrAllocateBuffer(backend, variance);
+            if (backend is Engines.DirectGpu.CUDA.CudaBackend cudaBackend &&
+                batch == Engines.DirectGpu.CUDA.Ptx.PtxChannelNormalizationD64Kernel.GroupNormBatch &&
+                numGroups == Engines.DirectGpu.CUDA.Ptx.PtxChannelNormalizationD64Kernel.GroupNormGroups &&
+                channels == Engines.DirectGpu.CUDA.Ptx.PtxChannelNormalizationD64Kernel.GroupNormChannels &&
+                spatial == Engines.DirectGpu.CUDA.Ptx.PtxChannelNormalizationD64Kernel.GroupNormSpatial)
+            {
+                using var directGradInput = AllocateOutputBuffer(backend, input.Length);
+                using var directGradGamma = AllocateOutputBuffer(backend, channels);
+                using var directGradBeta = AllocateOutputBuffer(backend, channels);
+                if (cudaBackend.TryDirectPtxGroupNormBackwardUnit64(
+                        gradient.Buffer, inputBuffer.Buffer, gammaBuffer.Buffer,
+                        meanBuffer.Buffer, varianceBuffer.Buffer,
+                        directGradInput.Buffer, directGradGamma.Buffer, directGradBeta.Buffer,
+                        batch, numGroups, channels, spatial, (float)epsilon))
+                {
+                    gradGamma = DeferTensorResult<T>(
+                        backend, directGradGamma.Buffer, channels, gamma.Shape.ToArray());
+                    directGradGamma.RelinquishOwnership();
+                    gradBeta = DeferTensorResult<T>(
+                        backend, directGradBeta.Buffer, channels, gamma.Shape.ToArray());
+                    directGradBeta.RelinquishOwnership();
+                    var directInput = DeferTensorResult<T>(
+                        backend, directGradInput.Buffer, input.Length, input.Shape.ToArray());
+                    directGradInput.RelinquishOwnership();
+                    return directInput;
+                }
+            }
             using var onesGroup = backend.AllocateBuffer(groupSize);
             using var onesSpatial = backend.AllocateBuffer(spatial);
             using var onesBatch = backend.AllocateBuffer(batch);

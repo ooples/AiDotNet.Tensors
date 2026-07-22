@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -32,7 +31,7 @@ internal sealed class PtxFusedResidualBiasLayerNormGeluD64Kernel : IDisposable
         int rows,
         float epsilon = 1e-5f)
     {
-        ArgumentNullException.ThrowIfNull(runtime);
+        PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         if (!DirectPtxArchitecture.HasValidatedResidualLayerNormGelu(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
@@ -252,14 +251,16 @@ internal sealed class PtxFusedResidualBiasLayerNormGeluD64Kernel : IDisposable
 
     internal static bool IsSupportedRows(int rows) => rows is 256 or 2048 or 8192;
 
-    internal static bool IsPromotedRows(int rows) => rows is 2048 or 8192;
+    // Historical screening is promising, but promotion requires current-head
+    // three-run and executed-SASS spill evidence for the complete issue scope.
+    internal static bool IsPromotedRows(int rows) => false;
 
     private static void Validate(int rows, float epsilon)
     {
         if (!IsSupportedRows(rows))
             throw new ArgumentOutOfRangeException(nameof(rows),
                 "The first residual LayerNorm+GELU family supports exact row buckets 256, 2048, and 8192.");
-        if (!float.IsFinite(epsilon) || epsilon <= 0)
+        if (!PtxCompat.IsFinite(epsilon) || epsilon <= 0)
             throw new ArgumentOutOfRangeException(nameof(epsilon));
     }
 
@@ -277,14 +278,13 @@ internal sealed class PtxFusedResidualBiasLayerNormGeluD64Kernel : IDisposable
 
     private static bool Overlaps(DirectPtxTensorView left, DirectPtxTensorView right)
     {
-        nuint leftStart = (nuint)left.Pointer;
-        nuint rightStart = (nuint)right.Pointer;
+        nuint leftStart = PtxCompat.ToNuint(left.Pointer);
+        nuint rightStart = PtxCompat.ToNuint(right.Pointer);
         nuint leftEnd = checked(leftStart + left.ByteLength);
         nuint rightEnd = checked(rightStart + right.ByteLength);
         return leftStart < rightEnd && rightStart < leftEnd;
     }
 
     private static string FloatLiteral(float value) =>
-        "0f" + BitConverter.SingleToInt32Bits(value).ToString("X8", CultureInfo.InvariantCulture);
+        "0f" + PtxCompat.SingleToInt32Bits(value).ToString("X8", CultureInfo.InvariantCulture);
 }
-#endif

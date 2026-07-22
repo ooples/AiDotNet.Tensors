@@ -4388,6 +4388,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 BindResidentBufferFp16(output, outBuf, backend, input.Length);
                 return true;
             }
+            if (ihGn is null && backend is Engines.DirectGpu.CUDA.CudaBackend cbDirectGn &&
+                cbDirectGn.TryDirectPtxGroupNormSwishUnit64(
+                    bufIn.Buffer, outBuf, bufGamma.Buffer, bufBeta.Buffer,
+                    batch, numGroups, channels, spatial, (float)epsilon))
+            {
+                ResidentSyncCheck("GroupNormSwish.DirectPtx");
+                BindResidentBuffer(output, outBuf, backend);
+                return true;
+            }
             // Key AND validate by required capacity: the cache is keyed on the output backing array, but the
             // same array can recur with different group metadata (batch*numGroups) or a larger input, and a
             // reused undersized norm/mean/var buffer would feed GroupNorm out-of-bounds scratch. (Re)allocate
@@ -5971,10 +5980,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var gpuIn = gpuBackend.AllocateBuffer(floatInput.GetDataArray());
                 using var gpuGamma = gpuBackend.AllocateBuffer(floatGamma.GetDataArray());
                 using var gpuBeta = gpuBackend.AllocateBuffer(floatBeta.GetDataArray());
+                using var gpuOut = gpuBackend.AllocateBuffer(input.Length);
+                if (gpuBackend is Engines.DirectGpu.CUDA.CudaBackend cudaBackend &&
+                    cudaBackend.TryDirectPtxGroupNormSwishUnit64(
+                        gpuIn, gpuOut, gpuGamma, gpuBeta,
+                        batch, numGroups, channels, spatial, (float)epsilon))
+                {
+                    DownloadIntoTensor(gpuBackend, gpuOut, floatOutput);
+                    return;
+                }
                 using var gpuNorm = gpuBackend.AllocateBuffer(input.Length);
                 using var gpuMean = gpuBackend.AllocateBuffer(batch * numGroups);
                 using var gpuVar = gpuBackend.AllocateBuffer(batch * numGroups);
-                using var gpuOut = gpuBackend.AllocateBuffer(input.Length);
 
                 // GroupNorm then Swish (sigmoid * x). Interface order is
                 // (batch, numGroups, channels, spatialSize) — see the value-returning GroupNorm fix.
@@ -6009,17 +6026,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
                 using var gpuA = gpuBackend.AllocateBuffer(floatA.GetDataArray());
                 using var gpuB = gpuBackend.AllocateBuffer(floatB.GetDataArray());
-                using var gpuSum = gpuBackend.AllocateBuffer(a.Length);
                 using var gpuGamma = gpuBackend.AllocateBuffer(floatGamma.GetDataArray());
                 using var gpuBeta = gpuBackend.AllocateBuffer(floatBeta.GetDataArray());
                 using var gpuOut = gpuBackend.AllocateBuffer(a.Length);
+                if (gpuBackend is Engines.DirectGpu.CUDA.CudaBackend cudaBackend &&
+                    cudaBackend.TryDirectPtxAddGroupNormUnit64(
+                        gpuA, gpuB, gpuOut, gpuGamma, gpuBeta,
+                        batch, numGroups, channels, spatial, (float)epsilon))
+                {
+                    DownloadIntoTensor(gpuBackend, gpuOut, floatOutput);
+                    return;
+                }
+                using var gpuSum = gpuBackend.AllocateBuffer(a.Length);
                 using var gpuMean = gpuBackend.AllocateBuffer(batch * numGroups);
                 using var gpuVar = gpuBackend.AllocateBuffer(batch * numGroups);
 
                 // Add then GroupNorm
                 gpuBackend.Add(gpuA, gpuB, gpuSum, a.Length);
                 gpuBackend.GroupNorm(gpuSum, gpuOut, gpuGamma, gpuBeta, gpuMean, gpuVar,
-                    batch, channels, spatial, numGroups, (float)epsilon);
+                    batch, numGroups, channels, spatial, (float)epsilon);
                 DownloadIntoTensor(gpuBackend, gpuOut, floatOutput);
                 return;
             }
@@ -19035,9 +19060,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     hpL.Fp16LayerNorm(hIn, hG, hB, hOut, mBuf.Buffer, vBuf.Buffer, outerSize, normSize, (float)epsilon);
                     var resultH = FinishGpuOpHalfStore(backend, hOut, input.Length, input.Shape._dims);
                     hOut = null;
-                    backend.Multiply(vBuf.Buffer, vBuf.Buffer, vBuf.Buffer, outerSize);
-                    backend.Reciprocal(vBuf.Buffer, vBuf.Buffer, outerSize);
-                    backend.SubScalar(vBuf.Buffer, vBuf.Buffer, (float)epsilon, outerSize);
                     mean = (Tensor<T>)(object)new Tensor<Half>(FinishGpuOp<Half>(backend, mBuf, outerSize), batchShape);
                     variance = (Tensor<T>)(object)new Tensor<Half>(FinishGpuOp<Half>(backend, vBuf, outerSize), batchShape);
                     meanVarTransferred = true;

@@ -84,6 +84,42 @@ class Program
             DirectPtxResidualLayerNormGeluExperiment.Run(runs);
             return;
         }
+        if (args.Length > 0 && args[0] == "--direct-ptx-normalization")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            string scope = args.Length > 2 ? args[2] : "all";
+            DirectPtxNormalizationExperiment.Run(runs, scope);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--export-direct-ptx-normalization-cubins")
+        {
+            string outputDirectory = args.Length > 1
+                ? args[1]
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86");
+            DirectPtxNormalizationArtifactTool.Run(outputDirectory);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-normalization-cubins")
+        {
+            string artifactDirectory = args.Length > 1
+                ? args[1]
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86");
+            DirectPtxNormalizationArtifactTool.Verify(artifactDirectory);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-normalization-sass")
+        {
+            if (args.Length < 2)
+                throw new ArgumentException("Pass the absolute nvdisasm executable path.");
+            string artifactDirectory = args.Length > 2
+                ? args[2]
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86");
+            string evidenceDirectory = args.Length > 3
+                ? args[3]
+                : Path.Combine("artifacts", "direct-ptx", "normalization", "sass");
+            DirectPtxSassAuditTool.Run(args[1], artifactDirectory, evidenceDirectory);
+            return;
+        }
         if (args.Length > 0 && args[0] == "--direct-ptx-fused-linear")
         {
             int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
@@ -126,6 +162,11 @@ class Program
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-residual-layernorm-gelu")
         {
             DirectPtxProfileTarget.RunResidualLayerNormGelu();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-normalization")
+        {
+            DirectPtxProfileTarget.RunNormalization();
             return;
         }
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-fused-linear")
@@ -1124,6 +1165,9 @@ class Program
         Console.WriteLine("  --direct-ptx-flash-attention-backward [runs]: D64 Flash recomputation-backward release matrix");
         Console.WriteLine("  --direct-ptx-residual-rmsnorm: second-blueprint fused residual + RMSNorm D64");
         Console.WriteLine("  --direct-ptx-residual-layernorm-gelu [runs]: fused D64 normalization championship matrix");
+        Console.WriteLine("  --direct-ptx-normalization [runs] [all|row|channel]: issue #838 resident production-route screen");
+        Console.WriteLine("  --export-direct-ptx-normalization-cubins [directory]: compile and preserve release SM86 cubins");
+        Console.WriteLine("  --audit-direct-ptx-normalization-sass <nvdisasm> [cubins] [evidence]: fail closed on final-SASS local memory");
         Console.WriteLine("  --direct-ptx-external-gpu-baselines: forced cuDNN/Flash/Math/compiled Python GPU matrix");
         Console.WriteLine("  --direct-ptx-profile-attention: deterministic Nsight Compute attention target");
         Console.WriteLine("  --direct-ptx-profile-residual-rmsnorm: deterministic Nsight Compute fusion target");

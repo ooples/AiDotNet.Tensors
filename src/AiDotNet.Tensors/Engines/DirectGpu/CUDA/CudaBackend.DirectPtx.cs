@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
@@ -21,6 +22,10 @@ public sealed partial class CudaBackend
         _directPtxResidualRmsNormKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<DirectPtxResidualRmsNormKey, PtxFusedResidualBiasLayerNormGeluD64Kernel>
         _directPtxResidualLayerNormGeluKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<DirectPtxRowNormalizationKey, PtxRowNormalizationD64Kernel>
+        _directPtxRowNormalizationKernels = new(DirectPtxFeatureGate.CacheCapacity);
+    private readonly DirectPtxKernelCache<DirectPtxChannelNormalizationKey, PtxChannelNormalizationD64Kernel>
+        _directPtxChannelNormalizationKernels = new(DirectPtxFeatureGate.CacheCapacity);
     private readonly DirectPtxKernelCache<DirectPtxDecodeKey, PtxFusedDecodeAttentionD64Kernel>
         _directPtxDecodeKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<DirectPtxPagedPrefillKey, PtxFusedPagedPrefillAttentionD64Kernel>
@@ -40,6 +45,77 @@ public sealed partial class CudaBackend
     private readonly DirectPtxKernelCache<DirectPtxFusedLinearKey, PtxFusedLinearGeluW8A8M1Kernel>
         _directPtxQuantizedLinearKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private DirectPtxRuntime? _directPtxRuntime;
+    // A captured CUDA graph retains CUfunction handles. Track every cache pin
+    // acquired while recording so destroying/updating the graph can release the
+    // corresponding module references instead of exhausting the bounded LRUs.
+    private List<Action>? _directPtxPendingGraphUnpins;
+    private readonly Dictionary<IntPtr, List<Action>> _directPtxGraphUnpins = new();
+
+    private void BeginDirectPtxGraphCapture()
+    {
+        lock (_directPtxLock)
+        {
+            if (_directPtxPendingGraphUnpins is not null)
+                throw new InvalidOperationException("A direct-PTX graph capture is already active.");
+            _directPtxPendingGraphUnpins = new List<Action>();
+        }
+    }
+
+    private bool PinDirectPtxKernel<TKey, TKernel>(
+        DirectPtxKernelCache<TKey, TKernel> cache,
+        TKey key)
+        where TKey : notnull
+        where TKernel : class, IDisposable
+    {
+        lock (_directPtxLock)
+        {
+            if (_directPtxPendingGraphUnpins is null || !cache.Pin(key))
+                return false;
+            _directPtxPendingGraphUnpins.Add(() => cache.Unpin(key));
+            return true;
+        }
+    }
+
+    private void AbortDirectPtxGraphCapture()
+    {
+        lock (_directPtxLock)
+        {
+            if (_directPtxPendingGraphUnpins is null) return;
+            ReleaseDirectPtxPinActions(_directPtxPendingGraphUnpins);
+            _directPtxPendingGraphUnpins = null;
+        }
+    }
+
+    private void CommitDirectPtxGraphCapture(IntPtr graphExec, bool replaceExisting)
+    {
+        lock (_directPtxLock)
+        {
+            List<Action> pins = _directPtxPendingGraphUnpins ?? new List<Action>();
+            _directPtxPendingGraphUnpins = null;
+            if (replaceExisting && _directPtxGraphUnpins.TryGetValue(graphExec, out List<Action>? oldPins))
+                ReleaseDirectPtxPinActions(oldPins);
+            if (pins.Count != 0)
+                _directPtxGraphUnpins[graphExec] = pins;
+            else if (replaceExisting)
+                _directPtxGraphUnpins.Remove(graphExec);
+        }
+    }
+
+    private void ReleaseDirectPtxGraphPins(IntPtr graphExec)
+    {
+        lock (_directPtxLock)
+        {
+            if (!_directPtxGraphUnpins.TryGetValue(graphExec, out List<Action>? pins)) return;
+            _directPtxGraphUnpins.Remove(graphExec);
+            ReleaseDirectPtxPinActions(pins);
+        }
+    }
+
+    private static void ReleaseDirectPtxPinActions(List<Action> pins)
+    {
+        for (int i = pins.Count - 1; i >= 0; i--)
+            pins[i]();
+    }
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
     internal string? DirectPtxLastError { get; private set; }
@@ -48,6 +124,8 @@ public sealed partial class CudaBackend
     private long _directPtxAttentionDispatchCount;
     private long _directPtxResidualRmsNormDispatchCount;
     private long _directPtxResidualLayerNormGeluDispatchCount;
+    private long _directPtxRowNormalizationDispatchCount;
+    private long _directPtxChannelNormalizationDispatchCount;
     private long _directPtxDecodeDispatchCount;
     private long _directPtxPagedPrefillDispatchCount;
     private long _directPtxAttentionBackwardDispatchCount;
@@ -71,6 +149,10 @@ public sealed partial class CudaBackend
 
     internal bool IsDirectPtxResidualLayerNormGeluEnabled =>
         DirectPtxFeatureGate.IsResidualLayerNormGeluEnabled && IsAvailable &&
+        DirectPtxArchitecture.HasValidatedResidualLayerNormGelu(_ccMajor, _ccMinor);
+
+    internal bool IsDirectPtxNormalizationEnabled =>
+        DirectPtxFeatureGate.IsNormalizationEnabled && IsAvailable &&
         DirectPtxArchitecture.HasValidatedResidualLayerNormGelu(_ccMajor, _ccMinor);
 
     internal bool IsDirectPtxFlashDecodeEnabled =>
@@ -113,6 +195,18 @@ public sealed partial class CudaBackend
         System.Threading.Interlocked.Read(ref _directPtxResidualRmsNormDispatchCount);
     internal long DirectPtxResidualLayerNormGeluDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxResidualLayerNormGeluDispatchCount);
+    internal long DirectPtxRowNormalizationDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxRowNormalizationDispatchCount);
+    internal long DirectPtxChannelNormalizationDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxChannelNormalizationDispatchCount);
+    internal int DirectPtxRowNormalizationPinnedKernelCount
+    {
+        get { lock (_directPtxLock) return _directPtxRowNormalizationKernels.PinnedCount; }
+    }
+    internal int DirectPtxChannelNormalizationPinnedKernelCount
+    {
+        get { lock (_directPtxLock) return _directPtxChannelNormalizationKernels.PinnedCount; }
+    }
     internal int DirectPtxResidualLayerNormGeluPinnedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxResidualLayerNormGeluKernels.PinnedCount; }
@@ -229,7 +323,7 @@ public sealed partial class CudaBackend
                 // A graph executable retains this CUfunction after capture.
                 // cuModuleUnload invalidates function handles, so a captured
                 // specialization must never be selected as an LRU victim.
-                if (capturing && !_directPtxQkvRopeCacheKernels.Pin(key))
+                if (capturing && !PinDirectPtxKernel(_directPtxQkvRopeCacheKernels, key))
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX QKV/RoPE/cache module for CUDA graph capture.");
                 lock (GpuDispatchLock)
@@ -459,7 +553,7 @@ public sealed partial class CudaBackend
                     _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                     kernel = CreateAndCacheMixedLinearKernelSlow(key);
                 }
-                if (capturing && !_directPtxMixedLinearKernels.Pin(key))
+                if (capturing && !PinDirectPtxKernel(_directPtxMixedLinearKernels, key))
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX mixed-linear module for CUDA graph capture.");
                 lock (GpuDispatchLock)
@@ -601,7 +695,7 @@ public sealed partial class CudaBackend
                     _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                     kernel = CreateAndCacheQuantizedLinearKernelSlow(key);
                 }
-                if (capturing && !_directPtxQuantizedLinearKernels.Pin(key))
+                if (capturing && !PinDirectPtxKernel(_directPtxQuantizedLinearKernels, key))
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX W8A8-linear module for CUDA graph capture.");
                 lock (GpuDispatchLock)
@@ -746,7 +840,7 @@ public sealed partial class CudaBackend
                     _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                     kernel = CreateAndCacheMixedLinearM16KernelSlow(key);
                 }
-                if (capturing && !_directPtxMixedLinearM16Kernels.Pin(key))
+                if (capturing && !PinDirectPtxKernel(_directPtxMixedLinearM16Kernels, key))
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX M=16 mixed-linear module for CUDA graph capture.");
                 lock (GpuDispatchLock)
@@ -887,7 +981,7 @@ public sealed partial class CudaBackend
                 }
                 // CUDA graph executables retain the CUfunction after capture.
                 // Pin its module so later specialization churn cannot unload it.
-                if (capturing && !_directPtxFusedLinearKernels.Pin(key))
+                if (capturing && !PinDirectPtxKernel(_directPtxFusedLinearKernels, key))
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX fused-linear module for CUDA graph capture.");
                 lock (GpuDispatchLock)
@@ -2380,7 +2474,7 @@ public sealed partial class CudaBackend
         {
             bool capturing = IsStreamCapturing();
             EnsureContextCurrent();
-            var key = new DirectPtxResidualRmsNormKey(rows, BitConverter.SingleToInt32Bits(epsilon));
+            var key = new DirectPtxResidualRmsNormKey(rows, PtxCompat.SingleToInt32Bits(epsilon));
             lock (_directPtxLock)
             {
                 if (!_directPtxResidualLayerNormGeluKernels.TryGetValue(
@@ -2395,7 +2489,7 @@ public sealed partial class CudaBackend
                     _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                     kernel = CreateAndCacheResidualLayerNormGeluKernelSlow(key);
                 }
-                if (capturing && !_directPtxResidualLayerNormGeluKernels.Pin(key))
+                if (capturing && !PinDirectPtxKernel(_directPtxResidualLayerNormGeluKernels, key))
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX residual LayerNorm+GELU module for CUDA graph capture.");
                 lock (GpuDispatchLock)
@@ -2424,7 +2518,7 @@ public sealed partial class CudaBackend
         CreateAndCacheResidualLayerNormGeluKernelSlow(DirectPtxResidualRmsNormKey key) =>
         _directPtxResidualLayerNormGeluKernels.GetOrAdd(key, () =>
             new PtxFusedResidualBiasLayerNormGeluD64Kernel(
-                _directPtxRuntime!, key.Rows, BitConverter.Int32BitsToSingle(key.EpsilonBits)));
+                _directPtxRuntime!, key.Rows, PtxCompat.Int32BitsToSingle(key.EpsilonBits)));
 
     internal bool PrewarmDirectPtxFusedResidualBiasLayerNormGeluD64(
         int rows,
@@ -2469,7 +2563,7 @@ public sealed partial class CudaBackend
             {
                 _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                 var key = new DirectPtxResidualRmsNormKey(
-                    rows, BitConverter.SingleToInt32Bits(epsilon));
+                    rows, PtxCompat.SingleToInt32Bits(epsilon));
                 if (!_directPtxResidualLayerNormGeluKernels.TryGetValue(key, out _))
                     _ = CreateAndCacheResidualLayerNormGeluKernelSlow(key);
             }
@@ -2490,8 +2584,828 @@ public sealed partial class CudaBackend
     {
         lock (_directPtxLock)
         {
-            var key = new DirectPtxResidualRmsNormKey(rows, BitConverter.SingleToInt32Bits(epsilon));
+            var key = new DirectPtxResidualRmsNormKey(rows, PtxCompat.SingleToInt32Bits(epsilon));
             if (_directPtxResidualLayerNormGeluKernels.TryGetValue(key, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null!;
+        return false;
+    }
+
+    internal bool TryDirectPtxBatchNormUnit64(
+        IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
+        IGpuBuffer runningMean, IGpuBuffer runningVar,
+        IGpuBuffer saveMean, IGpuBuffer saveInvVar,
+        int batch, int channels, int spatialSize,
+        float epsilon, float momentum, bool training)
+    {
+        if (batch != PtxChannelNormalizationD64Kernel.BatchNormBatch ||
+            channels != PtxChannelNormalizationD64Kernel.BatchNormChannels ||
+            spatialSize != PtxChannelNormalizationD64Kernel.BatchNormSpatial)
+            return RejectDirectPtxNormalizationShape();
+
+        return training
+            ? TryDirectPtxChannelNormalization(
+                DirectPtxChannelNormalizationOperation.BatchNormTraining,
+                epsilon, momentum, input, gamma, beta, runningMean, runningVar,
+                output, saveMean, saveInvVar)
+            : TryDirectPtxChannelNormalization(
+                DirectPtxChannelNormalizationOperation.BatchNormInference,
+                epsilon, momentum, input, gamma, beta, runningMean, runningVar, output);
+    }
+
+    internal bool TryDirectPtxFusedBatchNormActivationUnit64(
+        IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
+        IGpuBuffer runningMean, IGpuBuffer runningVar,
+        int batch, int channels, int spatialSize, float epsilon,
+        FusedActivationType activation)
+    {
+        if (batch != PtxChannelNormalizationD64Kernel.BatchNormBatch ||
+            channels != PtxChannelNormalizationD64Kernel.BatchNormChannels ||
+            spatialSize != PtxChannelNormalizationD64Kernel.BatchNormSpatial)
+            return RejectDirectPtxNormalizationShape();
+
+        DirectPtxChannelNormalizationOperation? operation = activation switch
+        {
+            FusedActivationType.ReLU => DirectPtxChannelNormalizationOperation.BatchNormRelu,
+            FusedActivationType.GELU => DirectPtxChannelNormalizationOperation.BatchNormGelu,
+            FusedActivationType.Sigmoid => DirectPtxChannelNormalizationOperation.BatchNormSigmoid,
+            FusedActivationType.Tanh => DirectPtxChannelNormalizationOperation.BatchNormTanh,
+            _ => null
+        };
+        if (!operation.HasValue)
+        {
+            DirectPtxLastError = "normalization-activation-not-implemented";
+            return false;
+        }
+        return TryDirectPtxChannelNormalization(
+            operation.Value, epsilon, 0f, input, gamma, beta, runningMean, runningVar, output);
+    }
+
+    internal bool TryDirectPtxBatchNormBackwardUnit64(
+        IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
+        IGpuBuffer saveMean, IGpuBuffer saveInvVar,
+        IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
+        int batch, int channels, int spatialSize, float epsilon)
+    {
+        if (batch != PtxChannelNormalizationD64Kernel.BatchNormBatch ||
+            channels != PtxChannelNormalizationD64Kernel.BatchNormChannels ||
+            spatialSize != PtxChannelNormalizationD64Kernel.BatchNormSpatial)
+            return RejectDirectPtxNormalizationShape();
+        return TryDirectPtxChannelNormalization(
+            DirectPtxChannelNormalizationOperation.BatchNormBackward,
+            epsilon, 0f, gradOutput, input, gamma, saveMean, saveInvVar,
+            gradInput, gradGamma, gradBeta);
+    }
+
+    internal bool TryDirectPtxResidualBatchNormReluUnit64(
+        IGpuBuffer input, IGpuBuffer residual, IGpuBuffer output,
+        IGpuBuffer gamma, IGpuBuffer beta,
+        IGpuBuffer runningMean, IGpuBuffer runningVar,
+        int batch, int channels, int spatialSize, float epsilon)
+    {
+        if (batch != PtxChannelNormalizationD64Kernel.BatchNormBatch ||
+            channels != PtxChannelNormalizationD64Kernel.BatchNormChannels ||
+            spatialSize != PtxChannelNormalizationD64Kernel.BatchNormSpatial)
+            return RejectDirectPtxNormalizationShape();
+        return TryDirectPtxChannelNormalization(
+            DirectPtxChannelNormalizationOperation.ResidualBatchNormRelu,
+            epsilon, 0f, input, residual, gamma, beta, runningMean, runningVar, output);
+    }
+
+    internal bool TryDirectPtxGroupNormUnit64(
+        IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
+        IGpuBuffer saveMean, IGpuBuffer saveVariance,
+        int batch, int groups, int channels, int spatialSize, float epsilon)
+    {
+        if (batch != PtxChannelNormalizationD64Kernel.GroupNormBatch ||
+            groups != PtxChannelNormalizationD64Kernel.GroupNormGroups ||
+            channels != PtxChannelNormalizationD64Kernel.GroupNormChannels ||
+            spatialSize != PtxChannelNormalizationD64Kernel.GroupNormSpatial)
+            return RejectDirectPtxNormalizationShape();
+        return TryDirectPtxChannelNormalization(
+            DirectPtxChannelNormalizationOperation.GroupNormForward,
+            epsilon, 0f, input, gamma, beta, output, saveMean, saveVariance);
+    }
+
+    internal bool TryDirectPtxGroupNormSwishUnit64(
+        IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
+        int batch, int groups, int channels, int spatialSize, float epsilon)
+    {
+        if (batch != PtxChannelNormalizationD64Kernel.GroupNormBatch ||
+            groups != PtxChannelNormalizationD64Kernel.GroupNormGroups ||
+            channels != PtxChannelNormalizationD64Kernel.GroupNormChannels ||
+            spatialSize != PtxChannelNormalizationD64Kernel.GroupNormSpatial)
+            return RejectDirectPtxNormalizationShape();
+        return TryDirectPtxChannelNormalization(
+            DirectPtxChannelNormalizationOperation.GroupNormSwish,
+            epsilon, 0f, input, gamma, beta, output);
+    }
+
+    internal bool TryDirectPtxAddGroupNormUnit64(
+        IGpuBuffer left, IGpuBuffer right, IGpuBuffer output,
+        IGpuBuffer gamma, IGpuBuffer beta,
+        int batch, int groups, int channels, int spatialSize, float epsilon)
+    {
+        if (batch != PtxChannelNormalizationD64Kernel.GroupNormBatch ||
+            groups != PtxChannelNormalizationD64Kernel.GroupNormGroups ||
+            channels != PtxChannelNormalizationD64Kernel.GroupNormChannels ||
+            spatialSize != PtxChannelNormalizationD64Kernel.GroupNormSpatial)
+            return RejectDirectPtxNormalizationShape();
+        return TryDirectPtxChannelNormalization(
+            DirectPtxChannelNormalizationOperation.AddGroupNorm,
+            epsilon, 0f, left, right, gamma, beta, output);
+    }
+
+    internal bool TryDirectPtxInstanceNormUnit64(
+        IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
+        IGpuBuffer saveMean, IGpuBuffer saveInvVar,
+        int batch, int channels, int spatialSize, float epsilon)
+    {
+        if (batch != PtxChannelNormalizationD64Kernel.InstanceNormBatch ||
+            channels != PtxChannelNormalizationD64Kernel.InstanceNormChannels ||
+            spatialSize != PtxChannelNormalizationD64Kernel.InstanceNormSpatial)
+            return RejectDirectPtxNormalizationShape();
+        return TryDirectPtxChannelNormalization(
+            DirectPtxChannelNormalizationOperation.InstanceNormForward,
+            epsilon, 0f, input, gamma, beta, output, saveMean, saveInvVar);
+    }
+
+    internal bool TryDirectPtxInstanceNormBackwardUnit64(
+        IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
+        IGpuBuffer saveMean, IGpuBuffer saveInvVar,
+        IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
+        int batch, int channels, int spatialSize, float epsilon)
+    {
+        if (batch != PtxChannelNormalizationD64Kernel.InstanceNormBatch ||
+            channels != PtxChannelNormalizationD64Kernel.InstanceNormChannels ||
+            spatialSize != PtxChannelNormalizationD64Kernel.InstanceNormSpatial)
+            return RejectDirectPtxNormalizationShape();
+        return TryDirectPtxChannelNormalizationPair(
+            DirectPtxChannelNormalizationOperation.InstanceNormBackwardInput,
+            DirectPtxChannelNormalizationOperation.InstanceNormGradParameters,
+            epsilon,
+            gradOutput, input, gamma, saveMean, saveInvVar, gradInput,
+            gradOutput, input, saveMean, saveInvVar, gradGamma, gradBeta);
+    }
+
+    internal bool TryDirectPtxGroupNormBackwardUnit64(
+        IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
+        IGpuBuffer mean, IGpuBuffer variance,
+        IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
+        int batch, int groups, int channels, int spatialSize, float epsilon)
+    {
+        if (batch != PtxChannelNormalizationD64Kernel.GroupNormBatch ||
+            groups != PtxChannelNormalizationD64Kernel.GroupNormGroups ||
+            channels != PtxChannelNormalizationD64Kernel.GroupNormChannels ||
+            spatialSize != PtxChannelNormalizationD64Kernel.GroupNormSpatial)
+            return RejectDirectPtxNormalizationShape();
+        return TryDirectPtxChannelNormalizationPair(
+            DirectPtxChannelNormalizationOperation.GroupNormBackwardInput,
+            DirectPtxChannelNormalizationOperation.GroupNormGradParameters,
+            epsilon,
+            gradOutput, input, gamma, mean, variance, gradInput,
+            gradOutput, input, mean, variance, gradGamma, gradBeta);
+    }
+
+    private bool TryDirectPtxChannelNormalizationPair(
+        DirectPtxChannelNormalizationOperation inputOperation,
+        DirectPtxChannelNormalizationOperation parameterOperation,
+        float epsilon,
+        IGpuBuffer inputTensor0, IGpuBuffer inputTensor1, IGpuBuffer inputTensor2,
+        IGpuBuffer inputTensor3, IGpuBuffer inputTensor4, IGpuBuffer inputTensor5,
+        IGpuBuffer parameterTensor0, IGpuBuffer parameterTensor1, IGpuBuffer parameterTensor2,
+        IGpuBuffer parameterTensor3, IGpuBuffer parameterTensor4, IGpuBuffer parameterTensor5)
+    {
+        if (!IsDirectPtxChannelNormalizationAdmitted(inputOperation) ||
+            !IsDirectPtxChannelNormalizationAdmitted(parameterOperation))
+            return false;
+        try
+        {
+            Span<DirectPtxTensorView> inputViews = stackalloc DirectPtxTensorView[6];
+            Span<DirectPtxTensorView> parameterViews = stackalloc DirectPtxTensorView[6];
+            int inputCount = PrepareDirectPtxChannelViews(
+                inputOperation, inputViews, out _,
+                inputTensor0, inputTensor1, inputTensor2, inputTensor3, inputTensor4, inputTensor5);
+            int parameterCount = PrepareDirectPtxChannelViews(
+                parameterOperation, parameterViews, out _,
+                parameterTensor0, parameterTensor1, parameterTensor2,
+                parameterTensor3, parameterTensor4, parameterTensor5);
+
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var inputKey = DirectPtxChannelNormalizationKey.Create(inputOperation, epsilon, 0f);
+            var parameterKey = DirectPtxChannelNormalizationKey.Create(parameterOperation, epsilon, 0f);
+            lock (_directPtxLock)
+            {
+                if (capturing &&
+                    (!_directPtxChannelNormalizationKernels.TryGetValue(inputKey, out _) ||
+                     !_directPtxChannelNormalizationKernels.TryGetValue(parameterKey, out _)))
+                {
+                    DirectPtxLastError =
+                        "Direct PTX channel normalization must be prewarmed before CUDA graph capture.";
+                    return false;
+                }
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                if (!_directPtxChannelNormalizationKernels.TryGetValue(inputKey, out var inputKernel))
+                    inputKernel = CreateAndCacheChannelNormalizationKernelSlow(inputKey);
+                if (!_directPtxChannelNormalizationKernels.TryGetValue(parameterKey, out var parameterKernel))
+                    parameterKernel = CreateAndCacheChannelNormalizationKernelSlow(parameterKey);
+                if (capturing &&
+                    (!PinDirectPtxKernel(_directPtxChannelNormalizationKernels, inputKey) ||
+                     !PinDirectPtxKernel(_directPtxChannelNormalizationKernels, parameterKey)))
+                    throw new InvalidOperationException(
+                        "Could not pin both direct-PTX normalization-backward modules for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                {
+                    inputKernel.LaunchPrevalidated(inputViews.Slice(0, inputCount));
+                    parameterKernel.LaunchPrevalidated(parameterViews.Slice(0, parameterCount));
+                }
+            }
+            System.Threading.Interlocked.Add(ref _directPtxChannelNormalizationDispatchCount, 2);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"channel-normalization-{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryDirectPtxFp16GroupNormSwishUnit64(
+        IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer beta, IGpuBuffer output,
+        int batch, int groups, int channels, int spatialSize, float epsilon)
+    {
+        if (batch != PtxChannelNormalizationD64Kernel.GroupNormBatch ||
+            groups != PtxChannelNormalizationD64Kernel.GroupNormGroups ||
+            channels != PtxChannelNormalizationD64Kernel.GroupNormChannels ||
+            spatialSize != PtxChannelNormalizationD64Kernel.GroupNormSpatial)
+            return RejectDirectPtxNormalizationShape();
+        return TryDirectPtxChannelNormalization(
+            DirectPtxChannelNormalizationOperation.Fp16GroupNormSwish,
+            epsilon, 0f, input, gamma, beta, output);
+    }
+
+    private bool RejectDirectPtxNormalizationShape()
+    {
+        DirectPtxLastError = "normalization-shape-not-implemented";
+        return false;
+    }
+
+    private bool TryDirectPtxChannelNormalization(
+        DirectPtxChannelNormalizationOperation operation,
+        float epsilon,
+        float momentum,
+        IGpuBuffer tensor0,
+        IGpuBuffer tensor1,
+        IGpuBuffer? tensor2 = null,
+        IGpuBuffer? tensor3 = null,
+        IGpuBuffer? tensor4 = null,
+        IGpuBuffer? tensor5 = null,
+        IGpuBuffer? tensor6 = null,
+        IGpuBuffer? tensor7 = null)
+    {
+        if (!IsDirectPtxChannelNormalizationAdmitted(operation))
+            return false;
+
+        try
+        {
+            Span<DirectPtxTensorView> views = stackalloc DirectPtxTensorView[8];
+            int count = PrepareDirectPtxChannelViews(
+                operation, views, out _,
+                tensor0, tensor1, tensor2, tensor3, tensor4, tensor5, tensor6, tensor7);
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            DirectPtxChannelNormalizationKey key =
+                DirectPtxChannelNormalizationKey.Create(operation, epsilon, momentum);
+            lock (_directPtxLock)
+            {
+                if (!_directPtxChannelNormalizationKernels.TryGetValue(key, out var kernel))
+                {
+                    if (capturing)
+                    {
+                        DirectPtxLastError =
+                            "Direct PTX channel normalization must be prewarmed before CUDA graph capture.";
+                        return false;
+                    }
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    kernel = CreateAndCacheChannelNormalizationKernelSlow(key);
+                }
+                if (capturing && !PinDirectPtxKernel(_directPtxChannelNormalizationKernels, key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX channel-normalization module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                    kernel.LaunchPrevalidated(views.Slice(0, count));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxChannelNormalizationDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"channel-normalization-{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    private bool IsDirectPtxChannelNormalizationAdmitted(
+        DirectPtxChannelNormalizationOperation operation)
+    {
+        if (!DirectPtxFeatureGate.IsNormalizationEnabled)
+        {
+            DirectPtxLastError = "normalization-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "normalization-cuda-unavailable";
+            return false;
+        }
+        if (!DirectPtxArchitecture.HasValidatedResidualLayerNormGelu(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = "normalization-architecture-not-validated";
+            return false;
+        }
+        if (!PtxChannelNormalizationD64Kernel.IsPromoted(operation) &&
+            !DirectPtxFeatureGate.NormalizationExperimentOverride)
+        {
+            DirectPtxLastError = "normalization-performance-gate-not-met";
+            return false;
+        }
+        return true;
+    }
+
+    private static int PrepareDirectPtxChannelViews(
+        DirectPtxChannelNormalizationOperation operation,
+        Span<DirectPtxTensorView> views,
+        out DirectPtxKernelBlueprint blueprint,
+        IGpuBuffer tensor0,
+        IGpuBuffer tensor1,
+        IGpuBuffer? tensor2 = null,
+        IGpuBuffer? tensor3 = null,
+        IGpuBuffer? tensor4 = null,
+        IGpuBuffer? tensor5 = null,
+        IGpuBuffer? tensor6 = null,
+        IGpuBuffer? tensor7 = null)
+    {
+        blueprint = PtxChannelNormalizationD64Kernel.CreateBlueprint(
+            DirectPtxArchitectureFamily.Ampere, operation);
+        int count = blueprint.Tensors.Count;
+        if (views.Length < count)
+            throw new ArgumentException("The channel-normalization view span is too small.", nameof(views));
+        views[0] = DirectPtxTensorView.Create(tensor0, blueprint.Tensors[0]);
+        views[1] = DirectPtxTensorView.Create(tensor1, blueprint.Tensors[1]);
+        if (count > 2) views[2] = DirectPtxTensorView.Create(
+            tensor2 ?? throw new ArgumentNullException(nameof(tensor2)), blueprint.Tensors[2]);
+        if (count > 3) views[3] = DirectPtxTensorView.Create(
+            tensor3 ?? throw new ArgumentNullException(nameof(tensor3)), blueprint.Tensors[3]);
+        if (count > 4) views[4] = DirectPtxTensorView.Create(
+            tensor4 ?? throw new ArgumentNullException(nameof(tensor4)), blueprint.Tensors[4]);
+        if (count > 5) views[5] = DirectPtxTensorView.Create(
+            tensor5 ?? throw new ArgumentNullException(nameof(tensor5)), blueprint.Tensors[5]);
+        if (count > 6) views[6] = DirectPtxTensorView.Create(
+            tensor6 ?? throw new ArgumentNullException(nameof(tensor6)), blueprint.Tensors[6]);
+        if (count > 7) views[7] = DirectPtxTensorView.Create(
+            tensor7 ?? throw new ArgumentNullException(nameof(tensor7)), blueprint.Tensors[7]);
+        PtxChannelNormalizationD64Kernel.ValidateTensors(
+            blueprint, views.Slice(0, count),
+            PtxChannelNormalizationD64Kernel.GetEntryPoint(operation));
+        return count;
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxChannelNormalizationD64Kernel CreateAndCacheChannelNormalizationKernelSlow(
+        DirectPtxChannelNormalizationKey key) =>
+        _directPtxChannelNormalizationKernels.GetOrAdd(key, () =>
+            new PtxChannelNormalizationD64Kernel(
+                _directPtxRuntime!, key.Operation,
+                PtxCompat.Int32BitsToSingle(key.EpsilonBits),
+                PtxCompat.Int32BitsToSingle(key.MomentumBits)));
+
+    internal bool PrewarmDirectPtxChannelNormalization(
+        DirectPtxChannelNormalizationOperation operation,
+        float epsilon = 1e-5f,
+        float momentum = 0.1f)
+    {
+        if (!IsDirectPtxChannelNormalizationAdmitted(operation))
+            return false;
+        if (IsStreamCapturing())
+        {
+            DirectPtxLastError = "channel-normalization-prewarm-during-capture";
+            return false;
+        }
+        try
+        {
+            EnsureContextCurrent();
+            DirectPtxChannelNormalizationKey key =
+                DirectPtxChannelNormalizationKey.Create(operation, epsilon, momentum);
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                if (!_directPtxChannelNormalizationKernels.TryGetValue(key, out _))
+                    _ = CreateAndCacheChannelNormalizationKernelSlow(key);
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"channel-normalization-{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxChannelNormalizationAudit(
+        DirectPtxChannelNormalizationOperation operation,
+        float epsilon,
+        float momentum,
+        out DirectPtxKernelAudit audit)
+    {
+        lock (_directPtxLock)
+        {
+            DirectPtxChannelNormalizationKey key =
+                DirectPtxChannelNormalizationKey.Create(operation, epsilon, momentum);
+            if (_directPtxChannelNormalizationKernels.TryGetValue(key, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null!;
+        return false;
+    }
+
+    internal bool TryDirectPtxLayerNormD64(
+        IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
+        IGpuBuffer saveMean, IGpuBuffer saveInvVar, int rows, float epsilon) =>
+        TryDirectPtxRowNormalization(
+            DirectPtxRowNormalizationOperation.LayerNormForward, rows, epsilon,
+            input, gamma, beta, output, saveMean, saveInvVar);
+
+    internal bool TryDirectPtxLayerNormBackwardD64(
+        IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
+        IGpuBuffer saveMean, IGpuBuffer saveInvVar,
+        IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
+        int rows, float epsilon) =>
+        TryDirectPtxRowNormalizationPair(
+            DirectPtxRowNormalizationOperation.LayerNormBackwardInput,
+            DirectPtxRowNormalizationOperation.LayerNormGradParameters,
+            rows, epsilon,
+            gradOutput, input, gamma, saveMean, saveInvVar, gradInput,
+            gradOutput, input, saveMean, saveInvVar, gradGamma, gradBeta);
+
+    internal bool TryDirectPtxFp16LayerNormD64(
+        IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer beta, IGpuBuffer output,
+        IGpuBuffer mean, IGpuBuffer variance, int rows, float epsilon) =>
+        TryDirectPtxRowNormalization(
+            DirectPtxRowNormalizationOperation.Fp16LayerNormForward,
+            rows, epsilon, input, gamma, beta, output, mean, variance);
+
+    internal bool TryDirectPtxFp16LayerNormBackwardD64(
+        IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
+        IGpuBuffer mean, IGpuBuffer invVar, IGpuBuffer gradInput, int rows) =>
+        TryDirectPtxRowNormalization(
+            DirectPtxRowNormalizationOperation.Fp16LayerNormBackwardInput,
+            rows, 1e-5f, gradOutput, input, gamma, mean, invVar, gradInput);
+
+    internal bool TryDirectPtxFp16LayerNormGradParametersD64(
+        IGpuBuffer gradOutput, IGpuBuffer input,
+        IGpuBuffer mean, IGpuBuffer invVar,
+        IGpuBuffer gradGamma, IGpuBuffer gradBeta, int rows) =>
+        TryDirectPtxRowNormalization(
+            DirectPtxRowNormalizationOperation.Fp16LayerNormGradParameters,
+            rows, 1e-5f, gradOutput, input, mean, invVar, gradGamma, gradBeta);
+
+    internal bool TryDirectPtxRmsNormD64(
+        IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer saveRms,
+        int rows, float epsilon) =>
+        TryDirectPtxRowNormalization(
+            DirectPtxRowNormalizationOperation.RmsNormForward, rows, epsilon,
+            input, gamma, output, saveRms);
+
+    internal bool TryDirectPtxRmsNormBackwardD64(
+        IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer saveRms,
+        IGpuBuffer gradInput, IGpuBuffer gradGamma, int rows, float epsilon)
+        => TryDirectPtxRowNormalizationPair(
+            DirectPtxRowNormalizationOperation.RmsNormBackwardInput,
+            DirectPtxRowNormalizationOperation.RmsNormGradGamma,
+            rows, epsilon,
+            gradOutput, input, gamma, saveRms, gradInput, null,
+            gradOutput, input, saveRms, gradGamma, null, null);
+
+    internal bool TryDirectPtxNormAxisD64(
+        IGpuBuffer input, IGpuBuffer output, int rows) =>
+        TryDirectPtxRowNormalization(
+            DirectPtxRowNormalizationOperation.NormAxis, rows, 1e-5f,
+            input, output);
+
+    internal bool TryDirectPtxNormalizeL2D64(
+        IGpuBuffer input, IGpuBuffer output, int rows) =>
+        TryDirectPtxRowNormalization(
+            DirectPtxRowNormalizationOperation.NormalizeL2, rows, 1e-5f,
+            input, output);
+
+    private bool TryDirectPtxRowNormalizationPair(
+        DirectPtxRowNormalizationOperation inputOperation,
+        DirectPtxRowNormalizationOperation parameterOperation,
+        int rows,
+        float epsilon,
+        IGpuBuffer inputTensor0,
+        IGpuBuffer inputTensor1,
+        IGpuBuffer? inputTensor2,
+        IGpuBuffer? inputTensor3,
+        IGpuBuffer? inputTensor4,
+        IGpuBuffer? inputTensor5,
+        IGpuBuffer parameterTensor0,
+        IGpuBuffer parameterTensor1,
+        IGpuBuffer? parameterTensor2,
+        IGpuBuffer? parameterTensor3,
+        IGpuBuffer? parameterTensor4,
+        IGpuBuffer? parameterTensor5)
+    {
+        parameterOperation = PtxRowNormalizationD64Kernel.SelectFastOperation(
+            parameterOperation, GpuDeterminism.IsActive, rows);
+        if (!IsDirectPtxRowNormalizationAdmitted(inputOperation, rows) ||
+            !IsDirectPtxRowNormalizationAdmitted(parameterOperation, rows))
+            return false;
+        try
+        {
+            Span<DirectPtxTensorView> inputViews = stackalloc DirectPtxTensorView[6];
+            Span<DirectPtxTensorView> parameterViews = stackalloc DirectPtxTensorView[6];
+            int inputCount = PrepareDirectPtxRowViews(
+                inputOperation, rows, inputViews,
+                inputTensor0, inputTensor1, inputTensor2, inputTensor3, inputTensor4, inputTensor5);
+            int parameterCount = PrepareDirectPtxRowViews(
+                parameterOperation, rows, parameterViews,
+                parameterTensor0, parameterTensor1, parameterTensor2,
+                parameterTensor3, parameterTensor4, parameterTensor5);
+
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var inputKey = new DirectPtxRowNormalizationKey(
+                inputOperation, rows, PtxCompat.SingleToInt32Bits(epsilon));
+            var parameterKey = new DirectPtxRowNormalizationKey(
+                parameterOperation, rows, PtxCompat.SingleToInt32Bits(epsilon));
+            lock (_directPtxLock)
+            {
+                bool hasInput = _directPtxRowNormalizationKernels.TryGetValue(inputKey, out _);
+                bool hasParameters = _directPtxRowNormalizationKernels.TryGetValue(parameterKey, out _);
+                if (capturing && (!hasInput || !hasParameters))
+                {
+                    DirectPtxLastError =
+                        "Direct PTX normalization backward pair must be prewarmed before CUDA graph capture.";
+                    return false;
+                }
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                if (!hasInput)
+                    _ = CreateAndCacheRowNormalizationKernelSlow(inputKey);
+                if (!hasParameters)
+                    _ = CreateAndCacheRowNormalizationKernelSlow(parameterKey);
+                _directPtxRowNormalizationKernels.TryGetValue(inputKey, out var inputKernel);
+                _directPtxRowNormalizationKernels.TryGetValue(parameterKey, out var parameterKernel);
+                if (capturing &&
+                    (!PinDirectPtxKernel(_directPtxRowNormalizationKernels, inputKey) ||
+                     !PinDirectPtxKernel(_directPtxRowNormalizationKernels, parameterKey)))
+                    throw new InvalidOperationException(
+                        "Could not pin both direct-PTX normalization-backward modules for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                {
+                    inputKernel!.LaunchPrevalidated(inputViews.Slice(0, inputCount));
+                    if (PtxRowNormalizationD64Kernel.IsAtomicParameterGradient(
+                            parameterOperation))
+                        ClearDirectPtxWriteOutputs(parameterViews.Slice(0, parameterCount));
+                    parameterKernel!.LaunchPrevalidated(parameterViews.Slice(0, parameterCount));
+                }
+            }
+            System.Threading.Interlocked.Add(ref _directPtxRowNormalizationDispatchCount, 2);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"normalization-{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    private void ClearDirectPtxWriteOutputs(ReadOnlySpan<DirectPtxTensorView> views)
+    {
+        for (int i = 0; i < views.Length; i++)
+        {
+            DirectPtxTensorView view = views[i];
+            if ((view.Access & DirectPtxTensorAccess.Write) == 0)
+                continue;
+            DirectPtxRuntime.Check(
+                CudaNativeBindings.cuMemsetD8Async(
+                    view.Pointer, 0, checked((ulong)view.ByteLength), _stream),
+                "cuMemsetD8Async(direct PTX normalization accumulation output)");
+        }
+    }
+
+    internal bool TryDirectPtxNormBackwardD64(
+        IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer norm,
+        IGpuBuffer gradInput, int rows) =>
+        TryDirectPtxRowNormalization(
+            DirectPtxRowNormalizationOperation.NormBackward, rows, 1e-5f,
+            gradOutput, input, norm, gradInput);
+
+    internal bool TryDirectPtxReduceNormL2D64(
+        IGpuBuffer input, IGpuBuffer output, int rows)
+    {
+        DirectPtxRowNormalizationOperation operation =
+            PtxRowNormalizationD64Kernel.SelectFastOperation(
+                DirectPtxRowNormalizationOperation.ReduceNormL2,
+                GpuDeterminism.IsActive, rows);
+        return TryDirectPtxRowNormalization(operation, rows, 1e-5f, input, output);
+    }
+
+    private bool TryDirectPtxRowNormalization(
+        DirectPtxRowNormalizationOperation operation,
+        int rows,
+        float epsilon,
+        IGpuBuffer tensor0,
+        IGpuBuffer tensor1,
+        IGpuBuffer? tensor2 = null,
+        IGpuBuffer? tensor3 = null,
+        IGpuBuffer? tensor4 = null,
+        IGpuBuffer? tensor5 = null)
+    {
+        if (!IsDirectPtxRowNormalizationAdmitted(operation, rows))
+            return false;
+
+        try
+        {
+            Span<DirectPtxTensorView> views = stackalloc DirectPtxTensorView[6];
+            int count = PrepareDirectPtxRowViews(
+                operation, rows, views, tensor0, tensor1,
+                tensor2, tensor3, tensor4, tensor5);
+            Span<DirectPtxTensorView> admitted = views.Slice(0, count);
+
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var key = new DirectPtxRowNormalizationKey(
+                operation, rows, PtxCompat.SingleToInt32Bits(epsilon));
+            lock (_directPtxLock)
+            {
+                if (!_directPtxRowNormalizationKernels.TryGetValue(key, out var kernel))
+                {
+                    if (capturing)
+                    {
+                        DirectPtxLastError =
+                            "Direct PTX normalization must be prewarmed before CUDA graph capture.";
+                        return false;
+                    }
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    kernel = CreateAndCacheRowNormalizationKernelSlow(key);
+                }
+                if (capturing && !PinDirectPtxKernel(_directPtxRowNormalizationKernels, key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX normalization module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                {
+                    if (operation == DirectPtxRowNormalizationOperation.ReduceNormL2Atomic)
+                        ClearDirectPtxWriteOutputs(admitted);
+                    kernel.LaunchPrevalidated(admitted);
+                }
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxRowNormalizationDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"normalization-{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    private bool IsDirectPtxRowNormalizationAdmitted(
+        DirectPtxRowNormalizationOperation operation,
+        int rows)
+    {
+        if (!DirectPtxFeatureGate.IsNormalizationEnabled)
+        {
+            DirectPtxLastError = "normalization-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "normalization-cuda-unavailable";
+            return false;
+        }
+        if (!DirectPtxArchitecture.HasValidatedResidualLayerNormGelu(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = "normalization-architecture-not-validated";
+            return false;
+        }
+        if (!PtxRowNormalizationD64Kernel.IsSupportedRows(rows))
+        {
+            DirectPtxLastError = "normalization-shape-not-implemented";
+            return false;
+        }
+        if (!PtxRowNormalizationD64Kernel.IsPromoted(operation, rows) &&
+            !DirectPtxFeatureGate.NormalizationExperimentOverride)
+        {
+            DirectPtxLastError = "normalization-performance-gate-not-met";
+            return false;
+        }
+        return true;
+    }
+
+    private static int PrepareDirectPtxRowViews(
+        DirectPtxRowNormalizationOperation operation,
+        int rows,
+        Span<DirectPtxTensorView> views,
+        IGpuBuffer tensor0,
+        IGpuBuffer tensor1,
+        IGpuBuffer? tensor2,
+        IGpuBuffer? tensor3,
+        IGpuBuffer? tensor4,
+        IGpuBuffer? tensor5)
+    {
+        DirectPtxKernelBlueprint blueprint =
+            PtxRowNormalizationD64Kernel.CreateBlueprint(
+                DirectPtxArchitectureFamily.Ampere, operation, rows);
+        int count = blueprint.Tensors.Count;
+        views[0] = DirectPtxTensorView.Create(tensor0, blueprint.Tensors[0]);
+        views[1] = DirectPtxTensorView.Create(tensor1, blueprint.Tensors[1]);
+        if (count > 2)
+            views[2] = DirectPtxTensorView.Create(
+                tensor2 ?? throw new ArgumentNullException(nameof(tensor2)), blueprint.Tensors[2]);
+        if (count > 3)
+            views[3] = DirectPtxTensorView.Create(
+                tensor3 ?? throw new ArgumentNullException(nameof(tensor3)), blueprint.Tensors[3]);
+        if (count > 4)
+            views[4] = DirectPtxTensorView.Create(
+                tensor4 ?? throw new ArgumentNullException(nameof(tensor4)), blueprint.Tensors[4]);
+        if (count > 5)
+            views[5] = DirectPtxTensorView.Create(
+                tensor5 ?? throw new ArgumentNullException(nameof(tensor5)), blueprint.Tensors[5]);
+        PtxRowNormalizationD64Kernel.ValidateTensors(
+            blueprint, views.Slice(0, count),
+            PtxRowNormalizationD64Kernel.GetEntryPoint(operation));
+        return count;
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxRowNormalizationD64Kernel CreateAndCacheRowNormalizationKernelSlow(
+        DirectPtxRowNormalizationKey key) =>
+        _directPtxRowNormalizationKernels.GetOrAdd(key, () =>
+            new PtxRowNormalizationD64Kernel(
+                _directPtxRuntime!, key.Operation, key.Rows,
+                PtxCompat.Int32BitsToSingle(key.EpsilonBits)));
+
+    internal bool PrewarmDirectPtxRowNormalization(
+        DirectPtxRowNormalizationOperation operation,
+        int rows,
+        float epsilon = 1e-5f)
+    {
+        if (!IsDirectPtxRowNormalizationAdmitted(operation, rows))
+            return false;
+        if (IsStreamCapturing())
+        {
+            DirectPtxLastError = "normalization-prewarm-during-capture";
+            return false;
+        }
+
+        try
+        {
+            EnsureContextCurrent();
+            var key = new DirectPtxRowNormalizationKey(
+                operation, rows, PtxCompat.SingleToInt32Bits(epsilon));
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                if (!_directPtxRowNormalizationKernels.TryGetValue(key, out _))
+                    _ = CreateAndCacheRowNormalizationKernelSlow(key);
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"normalization-{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxRowNormalizationAudit(
+        DirectPtxRowNormalizationOperation operation,
+        int rows,
+        float epsilon,
+        out DirectPtxKernelAudit audit)
+    {
+        lock (_directPtxLock)
+        {
+            var key = new DirectPtxRowNormalizationKey(
+                operation, rows, PtxCompat.SingleToInt32Bits(epsilon));
+            if (_directPtxRowNormalizationKernels.TryGetValue(key, out var kernel))
             {
                 audit = kernel.Audit;
                 return true;
@@ -2596,10 +3510,14 @@ public sealed partial class CudaBackend
     {
         lock (_directPtxLock)
         {
+            _directPtxPendingGraphUnpins = null;
+            _directPtxGraphUnpins.Clear();
             _directPtxAttentionKernels.Dispose();
             _directPtxAttentionPlans.Clear();
             _directPtxResidualRmsNormKernels.Dispose();
             _directPtxResidualLayerNormGeluKernels.Dispose();
+            _directPtxRowNormalizationKernels.Dispose();
+            _directPtxChannelNormalizationKernels.Dispose();
             _directPtxDecodeKernels.Dispose();
             _directPtxPagedPrefillKernels.Dispose();
             _directPtxAttentionBackwardKernels.Dispose();
@@ -2640,6 +3558,23 @@ public sealed partial class CudaBackend
     }
 
     private readonly record struct DirectPtxResidualRmsNormKey(int Rows, int EpsilonBits);
+    private readonly record struct DirectPtxRowNormalizationKey(
+        DirectPtxRowNormalizationOperation Operation,
+        int Rows,
+        int EpsilonBits);
+    private readonly record struct DirectPtxChannelNormalizationKey(
+        DirectPtxChannelNormalizationOperation Operation,
+        int EpsilonBits,
+        int MomentumBits)
+    {
+        internal static DirectPtxChannelNormalizationKey Create(
+            DirectPtxChannelNormalizationOperation operation,
+            float epsilon,
+            float momentum) => new(
+                operation,
+                PtxCompat.SingleToInt32Bits(epsilon),
+                PtxCompat.SingleToInt32Bits(momentum));
+    }
     private readonly record struct DirectPtxFusedLinearKey(
         int InputFeatures,
         int OutputFeatures);

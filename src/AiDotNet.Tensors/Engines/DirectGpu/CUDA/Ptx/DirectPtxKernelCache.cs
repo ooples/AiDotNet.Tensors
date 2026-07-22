@@ -25,7 +25,8 @@ internal sealed class DirectPtxKernelCache<TKey, TKernel> : IDisposable
 
         internal TKey Key { get; }
         internal TKernel Kernel { get; }
-        internal bool IsPinned { get; set; }
+        internal int PinCount { get; set; }
+        internal bool IsPinned => PinCount != 0;
     }
 
     internal DirectPtxKernelCache(int capacity)
@@ -62,15 +63,24 @@ internal sealed class DirectPtxKernelCache<TKey, TKernel> : IDisposable
 
     /// <summary>
     /// Prevents eviction of a loaded module whose function is retained by a
-    /// CUDA graph. Pins are intentionally released only when the owning cache
-    /// is disposed: graph handles can outlive the call site that captured them,
-    /// and unloading their module would invalidate the retained function.
+    /// CUDA graph. Each live graph owns one reference and must balance it with
+    /// <see cref="Unpin"/> after its graph-exec handle is destroyed.
     /// </summary>
     internal bool Pin(TKey key)
     {
         if (!_entries.TryGetValue(key, out LinkedListNode<Entry>? node))
             return false;
-        node.Value.IsPinned = true;
+        checked { node.Value.PinCount++; }
+        return true;
+    }
+
+    /// <summary>Releases one CUDA-graph reference acquired by <see cref="Pin"/>.</summary>
+    internal bool Unpin(TKey key)
+    {
+        if (!_entries.TryGetValue(key, out LinkedListNode<Entry>? node) ||
+            node.Value.PinCount == 0)
+            return false;
+        node.Value.PinCount--;
         return true;
     }
 

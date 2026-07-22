@@ -10,6 +10,7 @@ using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
+[Collection(DirectPtxFeatureGateCollection.Name)]
 public class DirectPtxWmmaTests
 {
     [SkippableTheory]
@@ -694,6 +695,28 @@ public class DirectPtxWmmaTests
     }
 
     [Fact]
+    public void KernelCache_GraphPinsAreReferenceCountedAndBecomeEvictableAfterRelease()
+    {
+        using var cache = new DirectPtxKernelCache<int, TrackingDisposable>(2);
+        TrackingDisposable one = cache.GetOrAdd(1, () => new TrackingDisposable());
+        _ = cache.GetOrAdd(2, () => new TrackingDisposable());
+        Assert.True(cache.Pin(1));
+        Assert.True(cache.Pin(1));
+        Assert.Equal(1, cache.PinnedCount);
+
+        Assert.True(cache.Unpin(1));
+        _ = cache.GetOrAdd(3, () => new TrackingDisposable());
+        Assert.False(one.IsDisposed);
+        Assert.Equal(1, cache.PinnedCount);
+
+        Assert.True(cache.Unpin(1));
+        Assert.False(cache.Unpin(1));
+        _ = cache.GetOrAdd(4, () => new TrackingDisposable());
+        Assert.True(one.IsDisposed);
+        Assert.Equal(0, cache.PinnedCount);
+    }
+
+    [Fact]
     public void AttentionAutotuner_ExposesArchitectureIndependentShapeCandidates()
     {
         Assert.Equal(new[] { 1 }, DirectPtxAttentionAutotuner.Candidates(16));
@@ -865,7 +888,7 @@ public class DirectPtxWmmaTests
     }
 
     [Fact]
-    public void ResidualBiasLayerNormGelu_OnlyPromotesCellsThatClearThreeRunReleaseGate()
+    public void ResidualBiasLayerNormGelu_HistoricalScreeningDoesNotBypassCurrentHeadGate()
     {
         DirectPtxReleaseGatePolicy policy = DirectPtxReleaseGatePolicy.ProductionDefault;
         var rows2048 = new DirectPtxPerformanceEvidence(
@@ -884,8 +907,8 @@ public class DirectPtxWmmaTests
         Assert.True(policy.Evaluate(rows2048, rows2048Competitor).Passed);
         Assert.True(policy.Evaluate(rows8192, rows8192Competitor).Passed);
         Assert.False(policy.Evaluate(rows256, rows256Competitor).Passed);
-        Assert.True(PtxFusedResidualBiasLayerNormGeluD64Kernel.IsPromotedRows(2048));
-        Assert.True(PtxFusedResidualBiasLayerNormGeluD64Kernel.IsPromotedRows(8192));
+        Assert.False(PtxFusedResidualBiasLayerNormGeluD64Kernel.IsPromotedRows(2048));
+        Assert.False(PtxFusedResidualBiasLayerNormGeluD64Kernel.IsPromotedRows(8192));
         Assert.False(PtxFusedResidualBiasLayerNormGeluD64Kernel.IsPromotedRows(256));
     }
 
@@ -935,7 +958,7 @@ public class DirectPtxWmmaTests
     [Fact]
     public void NormalizationCoverageManifest_AssignsEveryScopedApiExactlyOnce()
     {
-        Assert.Equal(41, DirectPtxNormalizationCoverageManifest.All.Count);
+        Assert.Equal(50, DirectPtxNormalizationCoverageManifest.All.Count);
         string[] names = DirectPtxNormalizationCoverageManifest.All
             .Select(cell => cell.Api).ToArray();
         Assert.Equal(names.Length, names.Distinct(StringComparer.Ordinal).Count());
@@ -947,12 +970,49 @@ public class DirectPtxWmmaTests
             Assert.False(string.IsNullOrWhiteSpace(cell.DTypes));
             Assert.False(string.IsNullOrWhiteSpace(cell.DirectPtxAssignment));
         });
+        Assert.DoesNotContain(DirectPtxNormalizationCoverageManifest.All,
+            cell => cell.Status == DirectPtxNormalizationCoverageStatus.PlannedDirectPtx);
+        Assert.DoesNotContain(DirectPtxNormalizationCoverageManifest.All,
+            cell => cell.Status == DirectPtxNormalizationCoverageStatus.PromotedDirectPtx);
         Assert.Equal(
-            DirectPtxNormalizationCoverageStatus.PromotedDirectPtx,
+            DirectPtxNormalizationCoverageStatus.ExperimentalDirectPtx,
             DirectPtxNormalizationCoverageManifest.Get(
                 "CudaBackend.FusedResidualBiasLayerNormGeluD64").Status);
         Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() =>
             DirectPtxNormalizationCoverageManifest.Get("UnassignedNormalizationApi"));
+    }
+
+    [Fact]
+    public void NormalizationEmitters_ArePointerOnlyAndBlueprintsAreHotPathCached()
+    {
+        foreach (DirectPtxRowNormalizationOperation operation in
+                 Enum.GetValues<DirectPtxRowNormalizationOperation>())
+        {
+            string ptx = PtxRowNormalizationD64Kernel.EmitPtx(8, 6, operation, 256);
+            Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+            Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+            if (operation != DirectPtxRowNormalizationOperation.ReduceNormL2)
+                Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+            Assert.Same(
+                PtxRowNormalizationD64Kernel.CreateBlueprint(
+                    DirectPtxArchitectureFamily.Ampere, operation, 256),
+                PtxRowNormalizationD64Kernel.CreateBlueprint(
+                    DirectPtxArchitectureFamily.Ampere, operation, 256));
+        }
+
+        foreach (DirectPtxChannelNormalizationOperation operation in
+                 Enum.GetValues<DirectPtxChannelNormalizationOperation>())
+        {
+            string ptx = PtxChannelNormalizationD64Kernel.EmitPtx(8, 6, operation);
+            Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+            Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+            Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+            Assert.Same(
+                PtxChannelNormalizationD64Kernel.CreateBlueprint(
+                    DirectPtxArchitectureFamily.Ampere, operation),
+                PtxChannelNormalizationD64Kernel.CreateBlueprint(
+                    DirectPtxArchitectureFamily.Ampere, operation));
+        }
     }
 
     [Fact]
@@ -3153,6 +3213,38 @@ public class DirectPtxWmmaTests
         var actual = new float[expected.Length];
         output.Download<float>(actual);
         AssertVectorClose(actual, expected, 2e-4f, "residual LayerNorm+GELU");
+    }
+
+    [SkippableFact]
+    public void DriverOnlyNormalizationInventory_AllModulesJitWithoutLocalMemory()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedResidualLayerNormGelu(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in normalization family is validated on GA10x/SM86.");
+
+        foreach (DirectPtxRowNormalizationOperation operation in
+                 Enum.GetValues<DirectPtxRowNormalizationOperation>())
+        {
+            using var kernel = new PtxRowNormalizationD64Kernel(runtime, operation, 256);
+            Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+            Assert.Equal(
+                operation == DirectPtxRowNormalizationOperation.ReduceNormL2 ? 32 : 0,
+                kernel.Audit.Function.StaticSharedBytes);
+            Assert.True(kernel.Audit.ActiveBlocksPerMultiprocessor >= 4);
+            Assert.Equal(64, kernel.Audit.PtxSha256.Length);
+        }
+
+        foreach (DirectPtxChannelNormalizationOperation operation in
+                 Enum.GetValues<DirectPtxChannelNormalizationOperation>())
+        {
+            using var kernel = new PtxChannelNormalizationD64Kernel(runtime, operation);
+            Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+            Assert.Equal(0, kernel.Audit.Function.StaticSharedBytes);
+            Assert.True(kernel.Audit.ActiveBlocksPerMultiprocessor >= 3);
+            Assert.Equal(64, kernel.Audit.PtxSha256.Length);
+        }
     }
 
     [SkippableFact]
