@@ -4103,4 +4103,152 @@ public sealed partial class CudaBackend
         return _directPtxFusedConv3D3x3x3Kernels.GetOrAdd(
             1, () => new PtxFusedConv3DNcdhw3x3x3BiasReluF32Kernel(runtime));
     }
+
+    private readonly DirectPtxKernelCache<int, PtxLocallyConnectedConv2DNchw3x3F32Kernel>
+        _directPtxLocallyConnectedConv2DKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private long _directPtxLocallyConnectedConv2DDispatchCount;
+
+    internal long DirectPtxLocallyConnectedConv2DDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxLocallyConnectedConv2DDispatchCount);
+
+    /// <summary>
+    /// Attempts the exact FP32 NCHW locally-connected 3x3 convolution experiment
+    /// (unshared per-position weights, stride 1, pad 1). The per-position weight
+    /// tensor is rank-6, so the contract is validated by byte extent. Fails closed on
+    /// any unsupported contract so the caller runs the established composition.
+    /// </summary>
+    internal bool TryDirectPtxLocallyConnectedConv2D(
+        IGpuBuffer input,
+        IGpuBuffer weights,
+        IGpuBuffer output)
+    {
+        if (!_directPtxConvolutionOptedIn)
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.FeatureDisabled;
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.BackendUnavailable;
+            return false;
+        }
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.ArchitectureNotImplemented;
+            return false;
+        }
+        if (input is null || weights is null || output is null)
+        {
+            DirectPtxLastError = "localconn2d-null-buffer";
+            return false;
+        }
+        if (input.SizeInBytes != PtxLocallyConnectedConv2DNchw3x3F32Kernel.InputBytes ||
+            weights.SizeInBytes != PtxLocallyConnectedConv2DNchw3x3F32Kernel.WeightBytes ||
+            output.SizeInBytes != PtxLocallyConnectedConv2DNchw3x3F32Kernel.OutputBytes)
+        {
+            DirectPtxLastError = "localconn2d-exact-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            const int key = 1;
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxLocallyConnectedConv2DKernels.TryGetValue(key, out _))
+                {
+                    DirectPtxLastError =
+                        "Direct PTX locally-connected Conv2D must be prewarmed before CUDA graph capture.";
+                    return false;
+                }
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxLocallyConnectedConv2DNchw3x3F32Kernel kernel = GetOrCreateDirectPtxLocallyConnectedConv2DKernel();
+                if (capturing && !_directPtxLocallyConnectedConv2DKernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX locally-connected Conv2D module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(weights, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[2]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxLocallyConnectedConv2DDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool PrewarmDirectPtxLocallyConnectedConv2D()
+    {
+        if (!_directPtxConvolutionOptedIn)
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.FeatureDisabled;
+            return false;
+        }
+        if (!IsAvailable || !DirectPtxArchitecture.HasExperimentalConvolution(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.ArchitectureNotImplemented;
+            return false;
+        }
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX locally-connected Conv2D prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _ = GetOrCreateDirectPtxLocallyConnectedConv2DKernel();
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxLocallyConnectedConv2DAudit(out DirectPtxKernelAudit? audit)
+    {
+        lock (_directPtxLock)
+        {
+            if (_directPtxLocallyConnectedConv2DKernels.TryGetValue(1, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null;
+        return false;
+    }
+
+    private PtxLocallyConnectedConv2DNchw3x3F32Kernel GetOrCreateDirectPtxLocallyConnectedConv2DKernel()
+    {
+        if (_directPtxLocallyConnectedConv2DKernels.TryGetValue(
+                1, out PtxLocallyConnectedConv2DNchw3x3F32Kernel? existing))
+            return existing;
+        return CreateAndCacheDirectPtxLocallyConnectedConv2DKernelSlow();
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxLocallyConnectedConv2DNchw3x3F32Kernel CreateAndCacheDirectPtxLocallyConnectedConv2DKernelSlow()
+    {
+        DirectPtxRuntime runtime = _directPtxRuntime ??
+            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+        return _directPtxLocallyConnectedConv2DKernels.GetOrAdd(
+            1, () => new PtxLocallyConnectedConv2DNchw3x3F32Kernel(runtime));
+    }
 }
