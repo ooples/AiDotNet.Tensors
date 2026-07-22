@@ -47,6 +47,21 @@ public static class PtxParityRegistry
 {
     public static IReadOnlyList<PtxParitySpec> Specs { get; } = new[]
     {
+        new PtxParitySpec("PtxRowNormalizationD64Kernel", PtxParityStatus.Deferred,
+            "row normalization family (D=64, #838)",
+            "the 16-operation family has direct GPU-vs-CPU correctness coverage, including forward, " +
+            "backward, parameter-gradient, fp16, L2, and atomic experimental variants, but the parity " +
+            "scaffold does not yet provide an equivalent gate-off CUDA leg for every specialization. " +
+            "Keep the family deferred and unpromoted until that three-way matrix and the competitive " +
+            "performance gates are complete."),
+
+        new PtxParitySpec("PtxChannelNormalizationD64Kernel", PtxParityStatus.Deferred,
+            "channel normalization family (64-value units, #838)",
+            "the 17-operation BatchNorm, GroupNorm, InstanceNorm, activation, residual, backward, and " +
+            "parameter-gradient family has direct GPU-vs-CPU correctness coverage, but no single " +
+            "gate-off CUDA route exercises identical baked shapes and multi-output semantics for every " +
+            "specialization. Keep it deferred and unpromoted until the full three-way matrix exists."),
+
         new PtxParitySpec("PtxFusedResidualBiasLayerNormGeluD64Kernel", PtxParityStatus.Deferred,
             "fused residual + bias + LayerNorm + GELU (D=64, #838)",
             "reachable only through the internal TryDirectPtx* entry point; like the RMSNorm sibling it " +

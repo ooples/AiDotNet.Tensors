@@ -991,8 +991,16 @@ public class DirectPtxWmmaTests
             string ptx = PtxRowNormalizationD64Kernel.EmitPtx(8, 6, operation, 256);
             Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
             Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
-            if (operation != DirectPtxRowNormalizationOperation.ReduceNormL2)
-                Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+            bool usesSharedReduction = operation is
+                DirectPtxRowNormalizationOperation.LayerNormGradParameters or
+                DirectPtxRowNormalizationOperation.Fp16LayerNormGradParameters or
+                DirectPtxRowNormalizationOperation.RmsNormGradGamma or
+                DirectPtxRowNormalizationOperation.ReduceNormL2 or
+                DirectPtxRowNormalizationOperation.LayerNormGradParametersAtomic or
+                DirectPtxRowNormalizationOperation.RmsNormGradGammaAtomic or
+                DirectPtxRowNormalizationOperation.ReduceNormL2Atomic;
+            Assert.Equal(usesSharedReduction,
+                ptx.Contains(".shared", StringComparison.Ordinal));
             Assert.Same(
                 PtxRowNormalizationD64Kernel.CreateBlueprint(
                     DirectPtxArchitectureFamily.Ampere, operation, 256),
@@ -1006,7 +1014,11 @@ public class DirectPtxWmmaTests
             string ptx = PtxChannelNormalizationD64Kernel.EmitPtx(8, 6, operation);
             Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
             Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
-            Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+            bool usesSharedReduction = operation is
+                DirectPtxChannelNormalizationOperation.GroupNormGradParameters or
+                DirectPtxChannelNormalizationOperation.InstanceNormGradParameters;
+            Assert.Equal(usesSharedReduction,
+                ptx.Contains(".shared", StringComparison.Ordinal));
             Assert.Same(
                 PtxChannelNormalizationD64Kernel.CreateBlueprint(
                     DirectPtxArchitectureFamily.Ampere, operation),
