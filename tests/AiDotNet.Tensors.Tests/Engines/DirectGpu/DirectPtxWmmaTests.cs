@@ -683,6 +683,14 @@ public class DirectPtxWmmaTests
         Assert.True(rejected.IsDisposed);
         Assert.Equal(2, cache.Count);
         Assert.Equal(2, cache.PinnedCount);
+
+        bool factoryCalled = false;
+        Assert.Throws<InvalidOperationException>(() => cache.GetOrAdd(5, () =>
+        {
+            factoryCalled = true;
+            return new TrackingDisposable();
+        }));
+        Assert.False(factoryCalled);
     }
 
     [Fact]

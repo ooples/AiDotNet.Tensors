@@ -98,7 +98,10 @@ public sealed partial class CudaBackend
     internal long DirectPtxQkvRopeCacheDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxQkvRopeCacheDispatchCount);
     internal int DirectPtxQkvRopeCacheKernelCapacity => _directPtxQkvRopeCacheKernels.Capacity;
-    internal int DirectPtxQkvRopeCachePinnedKernelCount => _directPtxQkvRopeCacheKernels.PinnedCount;
+    internal int DirectPtxQkvRopeCachePinnedKernelCount
+    {
+        get { lock (_directPtxLock) return _directPtxQkvRopeCacheKernels.PinnedCount; }
+    }
 
     /// <summary>
     /// Attempts the baked FP32 decode-token D64 specialization that projects

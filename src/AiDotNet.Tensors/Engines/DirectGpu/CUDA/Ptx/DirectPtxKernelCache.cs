@@ -79,6 +79,9 @@ internal sealed class DirectPtxKernelCache<TKey, TKernel> : IDisposable
     {
         ArgumentNullException.ThrowIfNull(factory);
         if (TryGetValue(key, out TKernel existing)) return existing;
+        if (!HasRoomOrEvictableEntry())
+            throw new InvalidOperationException(
+                "The direct-PTX module cache is full of CUDA-graph-pinned kernels.");
 
         return AddOrGetExisting(key, factory());
     }
@@ -115,6 +118,14 @@ internal sealed class DirectPtxKernelCache<TKey, TKernel> : IDisposable
         _entries.Add(key, node);
         _lru.AddFirst(node);
         return created;
+    }
+
+    private bool HasRoomOrEvictableEntry()
+    {
+        if (_entries.Count < _capacity) return true;
+        for (LinkedListNode<Entry>? node = _lru.Last; node is not null; node = node.Previous)
+            if (!node.Value.IsPinned) return true;
+        return false;
     }
 
     public void Dispose()
