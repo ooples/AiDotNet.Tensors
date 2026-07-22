@@ -16,7 +16,7 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
             DirectPtxSparseGraphCompletionLedger.All
                 .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(47, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+        Assert.Equal(49, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
             entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
         Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
         Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
@@ -509,6 +509,49 @@ public sealed class DirectPtxSparseGraphTests
         Assert.All(blueprint.Tensors, tensor => Assert.Equal(DirectPtxExtentMode.Exact, tensor.ExtentMode));
         Assert.Equal("fully-unrolled-ascending-input-dimension", blueprint.Semantics["reduction-order"]);
         Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
+    }
+
+    [Theory]
+    [InlineData((int)DirectPtxCapsuleSquashOperation.Forward, 2, 16, 16)]
+    [InlineData((int)DirectPtxCapsuleSquashOperation.Backward, 3, 32, 16)]
+    public void CapsuleSquashEmitter_RetainsCanonicalVectorAcrossFp64Reduction(
+        int operationValue,
+        int pointerCount,
+        int loadCount,
+        int storeCount)
+    {
+        var operation = (DirectPtxCapsuleSquashOperation)operationValue;
+        string ptx = PtxCapsuleSquashF32Kernel.EmitPtx(8, 6, operation);
+        DirectPtxKernelBlueprint blueprint = PtxCapsuleSquashF32Kernel.CreateBlueprint(
+            DirectPtxArchitectureFamily.Ampere, operation);
+
+        Assert.Equal(pointerCount, Count(ptx, ".param .u64"));
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("epsilon_ptr", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(loadCount, Count(ptx, "ld.global.f32"));
+        Assert.Equal(storeCount, Count(ptx, "st.global.f32"));
+        Assert.Contains("sqrt.rn.f64", ptx, StringComparison.Ordinal);
+        Assert.Contains("cvt.f64.f32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.All(blueprint.Tensors, tensor =>
+        {
+            Assert.Equal(PtxCapsuleSquashF32Kernel.Elements, tensor.PhysicalExtent.ElementCount);
+            Assert.Equal(DirectPtxExtentMode.Exact, tensor.ExtentMode);
+        });
+        Assert.Equal("fp64", blueprint.Semantics["reduction-precision"]);
+        Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
+        Assert.Equal("0", blueprint.Semantics["intermediate-global-bytes"]);
+    }
+
+    [Fact]
+    public void CapsuleSquashShapeAndEpsilonAdmission_IsExact()
+    {
+        Assert.True(PtxCapsuleSquashF32Kernel.SupportsShape(320, 16, 1e-8f));
+        Assert.False(PtxCapsuleSquashF32Kernel.SupportsShape(319, 16, 1e-8f));
+        Assert.False(PtxCapsuleSquashF32Kernel.SupportsShape(320, 8, 1e-8f));
+        Assert.False(PtxCapsuleSquashF32Kernel.SupportsShape(320, 16, 1e-6f));
     }
 
     [Theory]

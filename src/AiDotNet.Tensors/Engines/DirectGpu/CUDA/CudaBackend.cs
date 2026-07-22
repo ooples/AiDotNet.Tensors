@@ -3282,6 +3282,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void Squash(IGpuBuffer input, IGpuBuffer output, int numCapsules, int capsuleDim, float epsilon)
     {
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxCapsuleSquash(input, output, numCapsules, capsuleDim, epsilon))
+            return;
+#endif
         if (!_kernelCache.TryGetValue("squash", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: squash");
 
@@ -3303,6 +3307,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void SquashBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int numCapsules, int capsuleDim, float epsilon)
     {
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxCapsuleSquashBackward(
+            gradOutput, input, gradInput, numCapsules, capsuleDim, epsilon))
+            return;
+#endif
         if (!_kernelCache.TryGetValue("squash_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: squash_backward");
 

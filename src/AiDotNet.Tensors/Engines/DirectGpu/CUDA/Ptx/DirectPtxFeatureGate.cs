@@ -163,6 +163,10 @@ internal enum DirectPtxPhysicalLayout
     CapsulePredictionWeights,
     /// <summary>Transform weights [input-capsule,input-dimension,output-capsule,output-dimension].</summary>
     CapsuleTransformWeights,
+    /// <summary>Contiguous capsule vectors [capsule,dimension].</summary>
+    CapsuleVectors,
+    /// <summary>Contiguous capsule gradients [capsule,dimension].</summary>
+    CapsuleGradients,
     /// <summary>Dense additive attention bias, [H,Sq,Skv] or [B,H,Sq,Skv].</summary>
     AttentionBias,
     /// <summary>One-dimensional canonical vector.</summary>

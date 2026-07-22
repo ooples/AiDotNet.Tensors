@@ -68,6 +68,8 @@ public sealed partial class CudaBackend
         _directPtxCapsuleRoutingKernels = new(4);
     private readonly DirectPtxKernelCache<DirectPtxCapsuleProjectionOperation, PtxCapsuleProjectionF32Kernel>
         _directPtxCapsuleProjectionKernels = new(4);
+    private readonly DirectPtxKernelCache<DirectPtxCapsuleSquashOperation, PtxCapsuleSquashF32Kernel>
+        _directPtxCapsuleSquashKernels = new(4);
     private DirectPtxRuntime? _directPtxRuntime;
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
@@ -99,6 +101,7 @@ public sealed partial class CudaBackend
     private long _directPtxScatterBackwardRowsDispatchCount;
     private long _directPtxCapsuleRoutingDispatchCount;
     private long _directPtxCapsuleProjectionDispatchCount;
+    private long _directPtxCapsuleSquashDispatchCount;
     internal int DirectPtxCachedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxAttentionKernels.Count; }
@@ -208,6 +211,8 @@ public sealed partial class CudaBackend
         System.Threading.Interlocked.Read(ref _directPtxCapsuleRoutingDispatchCount);
     internal long DirectPtxCapsuleProjectionDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxCapsuleProjectionDispatchCount);
+    internal long DirectPtxCapsuleSquashDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxCapsuleSquashDispatchCount);
 
     /// <summary>
     /// Attempts the exact FP32 CSR SpMM golden specialization. The admitted ABI
@@ -2274,6 +2279,130 @@ public sealed partial class CudaBackend
         }
     }
 
+    internal bool TryDirectPtxCapsuleSquash(
+        IGpuBuffer input,
+        IGpuBuffer output,
+        int capsules,
+        int dimension,
+        float epsilon)
+    {
+        const DirectPtxCapsuleSquashOperation operation = DirectPtxCapsuleSquashOperation.Forward;
+        if (!ValidateDirectPtxCapsuleSquashBuffers(
+                input, null, output, capsules, dimension, epsilon))
+            return false;
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxCapsuleSquashKernels.TryGetValue(operation, out _))
+                    return false;
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxCapsuleSquashF32Kernel kernel = _directPtxCapsuleSquashKernels.GetOrAdd(
+                    operation, () => new PtxCapsuleSquashF32Kernel(_directPtxRuntime!, operation));
+                if (capturing && !_directPtxCapsuleSquashKernels.Pin(operation)) return false;
+                lock (GpuDispatchLock)
+                    kernel.LaunchForward(
+                        DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[1]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxCapsuleSquashDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryDirectPtxCapsuleSquashBackward(
+        IGpuBuffer gradOutput,
+        IGpuBuffer input,
+        IGpuBuffer gradInput,
+        int capsules,
+        int dimension,
+        float epsilon)
+    {
+        const DirectPtxCapsuleSquashOperation operation = DirectPtxCapsuleSquashOperation.Backward;
+        if (!ValidateDirectPtxCapsuleSquashBuffers(
+                gradOutput, input, gradInput, capsules, dimension, epsilon))
+            return false;
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxCapsuleSquashKernels.TryGetValue(operation, out _))
+                    return false;
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxCapsuleSquashF32Kernel kernel = _directPtxCapsuleSquashKernels.GetOrAdd(
+                    operation, () => new PtxCapsuleSquashF32Kernel(_directPtxRuntime!, operation));
+                if (capturing && !_directPtxCapsuleSquashKernels.Pin(operation)) return false;
+                lock (GpuDispatchLock)
+                    kernel.LaunchBackward(
+                        DirectPtxTensorView.Create(gradOutput, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(gradInput, kernel.Blueprint.Tensors[2]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxCapsuleSquashDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    private bool ValidateDirectPtxCapsuleSquashBuffers(
+        IGpuBuffer first,
+        IGpuBuffer? second,
+        IGpuBuffer output,
+        int capsules,
+        int dimension,
+        float epsilon)
+    {
+        if (!IsDirectPtxSparseGraphEnabled ||
+            !PtxCapsuleSquashF32Kernel.SupportsShape(capsules, dimension, epsilon))
+            return false;
+        long bytes = (long)capsules * dimension * sizeof(float);
+        if (!HasExactBytes(first, bytes) || (second is not null && !HasExactBytes(second, bytes)) ||
+            !HasExactBytes(output, bytes) || first.Handle == IntPtr.Zero ||
+            (second is not null && second.Handle == IntPtr.Zero) || output.Handle == IntPtr.Zero)
+            return false;
+        nuint pointers = (nuint)first.Handle | (nuint)output.Handle;
+        if (second is not null) pointers |= (nuint)second.Handle;
+        return (pointers & 15u) == 0 && !DirectPtxBuffersOverlap(output, first) &&
+            (second is null || !DirectPtxBuffersOverlap(output, second));
+    }
+
+    internal bool PrewarmDirectPtxCapsuleSquash(DirectPtxCapsuleSquashOperation operation)
+    {
+        if (!IsDirectPtxSparseGraphEnabled || IsStreamCapturing()) return false;
+        try
+        {
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _ = _directPtxCapsuleSquashKernels.GetOrAdd(
+                    operation, () => new PtxCapsuleSquashF32Kernel(_directPtxRuntime!, operation));
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
     private static bool DirectPtxBuffersOverlap(IGpuBuffer left, IGpuBuffer right)
     {
         nuint leftStart = (nuint)left.Handle;
@@ -4132,6 +4261,7 @@ public sealed partial class CudaBackend
             _directPtxScatterBackwardRowsKernels.Dispose();
             _directPtxCapsuleRoutingKernels.Dispose();
             _directPtxCapsuleProjectionKernels.Dispose();
+            _directPtxCapsuleSquashKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }
