@@ -69,6 +69,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     // FP16 (Half) element width in bytes — used to validate half-buffer sizes before launching FP16-native kernels.
     private const int Fp16ByteWidth = 2;
     private readonly ConcurrentDictionary<string, IntPtr> _kernelCache;
+    internal bool HasWhereSelectKernel => _kernelCache.ContainsKey("where_select");
     private IntPtr _cudaContext;
     private IntPtr _stream;
 
