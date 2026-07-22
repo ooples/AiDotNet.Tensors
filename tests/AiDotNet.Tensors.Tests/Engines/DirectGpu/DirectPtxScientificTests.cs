@@ -24,7 +24,7 @@ public class DirectPtxScientificTests
             Assert.False(string.IsNullOrWhiteSpace(cell.DTypes));
             Assert.False(string.IsNullOrWhiteSpace(cell.DirectPtxAssignment));
         });
-        foreach (string api in new[] { "CudaBackend.ComplexMultiply", "CudaBackend.ComplexConjugate", "CudaBackend.ComplexMagnitude", "CudaBackend.OctonionAdd", "CudaBackend.OctonionMultiply", "CudaBackend.MobiusAdd", "CudaBackend.PoincareDistance" })
+        foreach (string api in new[] { "CudaBackend.ComplexMultiply", "CudaBackend.ComplexConjugate", "CudaBackend.ComplexMagnitude", "CudaBackend.OctonionAdd", "CudaBackend.OctonionMultiply", "CudaBackend.MobiusAdd", "CudaBackend.PoincareDistance", "CudaBackend.PoincareProject" })
             Assert.Equal(DirectPtxScientificCoverageStatus.ExperimentalDirectPtx,
                 DirectPtxScientificCoverageManifest.Get(api).Status);
         Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() =>
@@ -417,6 +417,69 @@ public class DirectPtxScientificTests
         var actual = new float[batch];
         output.Download<float>(actual);
         AssertVectorClose(actual, expected, 5e-3f, $"poincare distance {batch}x{dim}");
+    }
+
+    [Fact]
+    public void PoincareProjectEmitter_IsThreadPerVectorConditionalRescale()
+    {
+        string ptx = PtxPoincareProjectKernel.EmitPtx(8, 6, 64);
+        Assert.Contains(PtxPoincareProjectKernel.EntryPoint, ptx);
+        Assert.Contains("ld.param.f32 %f1, [epsilon];", ptx);
+        Assert.Contains("NORM_LOOP:", ptx);
+        Assert.Contains("WRITE_LOOP:", ptx);
+        Assert.Contains("setp.ge.f32 %p1, %f2, %f5", ptx);   // ||x||^2 >= maxNorm^2
+        Assert.Contains("selp.f32 %f8, %f7, 0f3F800000, %p1", ptx); // scale or 1
+        Assert.Equal(2, Count(ptx, "sqrt.rn.f32"));           // sqrt(c) + sqrt(sqNorm)
+        Assert.Equal(0, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxPoincareProjectKernel.IsSupportedShape(256, 64));
+        Assert.False(PtxPoincareProjectKernel.IsPromotedShape(256, 64));
+    }
+
+    [SkippableTheory]
+    [InlineData(256, 32)]
+    [InlineData(256, 128)]
+    public void DriverOnlyPoincareProject_MatchesOracle(int batch, int dim)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in poincare-project specialization is measured on GA10x/SM86.");
+        const float c = 0.5f, eps = 1e-5f;
+        using var kernel = new PtxPoincareProjectKernel(runtime, batch, dim, c, eps);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20266500 + batch + dim);
+        // Alternate small (inside ball, copied) and large (outside, projected) rows.
+        float[] xHost = new float[batch * dim];
+        for (int row = 0; row < batch; row++)
+        {
+            float mag = (row % 2 == 0) ? 0.05f : 0.4f;
+            for (int i = 0; i < dim; i++) xHost[row * dim + i] = (float)((random.NextDouble() * 2 - 1) * mag);
+        }
+        double maxNorm = 1.0 / Math.Sqrt(c) - eps;
+        double maxNormSq = maxNorm * maxNorm;
+        var expected = new float[batch * dim];
+        for (int row = 0; row < batch; row++)
+        {
+            double sq = 0;
+            for (int i = 0; i < dim; i++) { double v = xHost[row * dim + i]; sq += v * v; }
+            double scale = sq >= maxNormSq ? maxNorm / Math.Sqrt(sq) : 1.0;
+            for (int i = 0; i < dim; i++) expected[row * dim + i] = (float)(xHost[row * dim + i] * scale);
+        }
+
+        using var x = runtime.AllocateBytes((nuint)(xHost.Length * sizeof(float)));
+        using var output = runtime.AllocateBytes((nuint)(batch * dim * sizeof(float)));
+        x.Upload<float>(xHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(x, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[1]));
+        runtime.Synchronize();
+        var actual = new float[batch * dim];
+        output.Download<float>(actual);
+        AssertVectorClose(actual, expected, 3e-3f, $"poincare project {batch}x{dim}");
     }
 
     private static float[] Values(Random random, int count, float magnitude)
