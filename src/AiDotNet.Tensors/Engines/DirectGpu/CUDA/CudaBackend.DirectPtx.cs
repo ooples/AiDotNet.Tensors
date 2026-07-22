@@ -32,6 +32,8 @@ public sealed partial class CudaBackend
         _directPtxQkvRopeCacheKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<DirectPtxRowReduceKey, PtxFusedRowReduceF32Kernel>
         _directPtxRowReduceKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<DirectPtxRowReduceKey, PtxFusedRowL2NormalizeF32Kernel>
+        _directPtxRowL2NormalizeKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private DirectPtxRuntime? _directPtxRuntime;
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
@@ -46,6 +48,7 @@ public sealed partial class CudaBackend
     private long _directPtxFlashAttentionBackwardDispatchCount;
     private long _directPtxQkvRopeCacheDispatchCount;
     private long _directPtxRowReduceDispatchCount;
+    private long _directPtxRowL2NormalizeDispatchCount;
     internal int DirectPtxCachedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxAttentionKernels.Count; }
@@ -103,6 +106,9 @@ public sealed partial class CudaBackend
 
     internal long DirectPtxRowReduceDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxRowReduceDispatchCount);
+
+    internal long DirectPtxRowL2NormalizeDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxRowL2NormalizeDispatchCount);
 
     internal long DirectPtxQkvRopeCacheDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxQkvRopeCacheDispatchCount);
@@ -1943,6 +1949,107 @@ public sealed partial class CudaBackend
         return false;
     }
 
+    /// <summary>
+    /// Attempts exact contiguous FP32 fused row L2-normalization of a
+    /// [rows,columns] matrix into a same-shape output. The per-row norm is never
+    /// materialized; the PTX ABI receives only input/output pointers.
+    /// </summary>
+    internal bool TryDirectPtxRowL2Normalize(
+        IGpuBuffer input,
+        IGpuBuffer output,
+        int rows,
+        int columns)
+    {
+        if (!DirectPtxFeatureGate.IsReductionEnabled)
+        {
+            DirectPtxLastError = "l2normalize-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "l2normalize-cuda-unavailable";
+            return false;
+        }
+        if (!DirectPtxArchitecture.HasValidatedRowReduction(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = "l2normalize-architecture-not-validated";
+            return false;
+        }
+        if (!PtxFusedRowL2NormalizeF32Kernel.IsSupportedShape(rows, columns))
+        {
+            DirectPtxLastError = "l2normalize-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedRowL2NormalizeF32Kernel.IsPromotedShape(rows, columns) &&
+            !DirectPtxFeatureGate.ReductionExperimentOverride)
+        {
+            DirectPtxLastError = "l2normalize-performance-gate-not-met";
+            return false;
+        }
+
+        long bytes = checked((long)rows * columns * sizeof(float));
+        if (input.SizeInBytes != bytes || output.SizeInBytes != bytes)
+        {
+            DirectPtxLastError = "l2normalize-physical-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            EnsureContextCurrent();
+            var key = new DirectPtxRowReduceKey(rows, columns);
+            lock (_directPtxLock)
+            {
+                if (!_directPtxRowL2NormalizeKernels.TryGetValue(
+                    key, out PtxFusedRowL2NormalizeF32Kernel? kernel))
+                {
+                    if (IsStreamCapturing())
+                    {
+                        DirectPtxLastError =
+                            "Direct PTX L2-normalize must be prewarmed before CUDA graph capture.";
+                        return false;
+                    }
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    kernel = CreateAndCacheRowL2NormalizeKernelSlow(key);
+                }
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[1]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxRowL2NormalizeDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxFusedRowL2NormalizeF32Kernel CreateAndCacheRowL2NormalizeKernelSlow(
+        DirectPtxRowReduceKey key) =>
+        _directPtxRowL2NormalizeKernels.GetOrAdd(key, () =>
+            new PtxFusedRowL2NormalizeF32Kernel(_directPtxRuntime!, key.Rows, key.Columns));
+
+    internal bool TryGetDirectPtxRowL2NormalizeAudit(int rows, int columns, out DirectPtxKernelAudit audit)
+    {
+        lock (_directPtxLock)
+        {
+            var key = new DirectPtxRowReduceKey(rows, columns);
+            if (_directPtxRowL2NormalizeKernels.TryGetValue(key, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null!;
+        return false;
+    }
+
     private void DisposeDirectPtxRuntime()
     {
         lock (_directPtxLock)
@@ -1956,6 +2063,7 @@ public sealed partial class CudaBackend
             _directPtxFlashAttentionBackwardKernels.Dispose();
             _directPtxQkvRopeCacheKernels.Dispose();
             _directPtxRowReduceKernels.Dispose();
+            _directPtxRowL2NormalizeKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }

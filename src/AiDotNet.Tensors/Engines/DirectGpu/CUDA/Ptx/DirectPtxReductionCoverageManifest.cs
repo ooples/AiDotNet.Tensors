@@ -44,7 +44,7 @@ internal static class DirectPtxReductionCoverageManifest
         Planned("CudaBackend.StdAxis", "NVRTC std_axis", "standard deviation over last axis", Rows, "FP32", "warp-row-std-families"),
         Planned("CudaBackend.NormAxis", "NVRTC norm_axis", "L2 norm over last axis", Rows, "FP32", "warp-row-norm-families"),
         Planned("CudaBackend.CumSumAxis", "NVRTC cumsum_axis", "inclusive prefix sum along inner axis", Rows, "FP32", "warp-scan-inclusive-families"),
-        Planned("CudaBackend.NormalizeL2", "NVRTC normalize_l2", "row L2 normalization", Rows, "FP32", "warp-row-normalize-l2-families"),
+        Experimental("CudaBackend.NormalizeL2", "NVRTC normalize_l2", "row L2 normalization (fused reduce+rescale, eps=1e-12)", Rows, "FP32", "v1 Ampere warp-row C64/C128 exact-shape cells (fused, no materialized norm)"),
         Planned("CudaBackend.ReduceSumOfSquares", "NVRTC reduce_sum_of_squares", "scalar sum of squares", Vector, "FP32", "single-vector-sum-of-squares-size-families"),
         Planned("CudaBackend.ReduceMaxMagnitude", "NVRTC reduce_max_magnitude", "scalar max |x|", Vector, "FP32", "single-vector-max-magnitude-families"),
         Planned("CudaBackend.Sum", "NVRTC segmented reduce_sum", "scalar full-tensor sum", Vector, "FP32", "two-stage-grid-reduce-families"),

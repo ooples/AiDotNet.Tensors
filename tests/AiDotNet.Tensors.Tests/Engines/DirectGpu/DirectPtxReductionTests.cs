@@ -149,8 +149,11 @@ public class DirectPtxReductionTests
         Assert.Equal(
             DirectPtxReductionCoverageStatus.ExperimentalDirectPtx,
             DirectPtxReductionCoverageManifest.Get("CudaBackend.SumAxis").Status);
-        Assert.Single(DirectPtxReductionCoverageManifest.All,
-            cell => cell.Status == DirectPtxReductionCoverageStatus.ExperimentalDirectPtx);
+        Assert.Equal(
+            DirectPtxReductionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxReductionCoverageManifest.Get("CudaBackend.NormalizeL2").Status);
+        Assert.Equal(2, DirectPtxReductionCoverageManifest.All
+            .Count(cell => cell.Status == DirectPtxReductionCoverageStatus.ExperimentalDirectPtx));
         Assert.All(DirectPtxReductionCoverageManifest.All,
             cell => Assert.NotEqual(
                 DirectPtxReductionCoverageStatus.PromotedDirectPtx, cell.Status));
