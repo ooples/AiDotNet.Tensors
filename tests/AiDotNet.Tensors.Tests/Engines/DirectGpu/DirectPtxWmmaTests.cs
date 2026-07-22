@@ -3019,6 +3019,68 @@ public class DirectPtxWmmaTests
     }
 
     [Fact]
+    public void GemmFp16ContractMEmitter_ContractsOverMWithFp16Conversions()
+    {
+        string ptx = PtxGemmFp16ContractMKernel.EmitPtx(8, 6, 128, 256, 256);
+        Assert.Contains(PtxGemmFp16ContractMKernel.EntryPoint, ptx);
+        Assert.Contains(".shared .align 16 .b8 a_tile[2048]", ptx);
+        Assert.Contains(".shared .align 16 .b8 b_tile[2048]", ptx);
+        Assert.Contains("M_TILE_LOOP:", ptx);
+        Assert.Equal(4, Count(ptx, "ld.global.nc.u16"));
+        Assert.Equal(4, Count(ptx, "cvt.f32.f16"));
+        Assert.Equal(128, Count(ptx, "fma.rn.f32"));
+        Assert.Equal(16, Count(ptx, "cvt.rn.f16.f32"));
+        Assert.Equal(16, Count(ptx, "st.global.u16"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxGemmFp16ContractMKernel.IsSupportedShape(128, 512, 2048));
+        Assert.False(PtxGemmFp16ContractMKernel.IsPromotedShape(128, 512, 2048));
+    }
+
+    [SkippableTheory]
+    [InlineData(128, 256, 256)]
+    [InlineData(64, 512, 256)]
+    public void DriverOnlyGemmFp16ContractM_MatchesOracle(int m, int p, int q)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedFusedLinear(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in FP16 contract-M specialization is measured on GA10x/SM86.");
+        using var kernel = new PtxGemmFp16ContractMKernel(runtime, m, p, q);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20264000 + m + p + q);
+        ushort[] aHost = RandomHalfRange(random, m * p, 0.25f);   // A[M,P]
+        ushort[] bHost = RandomHalfRange(random, m * q, 0.25f);   // B[M,Q]
+        var expected = new float[p * q];
+        for (int pp = 0; pp < p; pp++)
+        for (int qq = 0; qq < q; qq++)
+        {
+            float acc = 0;
+            for (int mm = 0; mm < m; mm++)
+                acc += (float)BitConverter.UInt16BitsToHalf(aHost[mm * p + pp])
+                     * (float)BitConverter.UInt16BitsToHalf(bHost[mm * q + qq]);
+            expected[pp * q + qq] = acc;
+        }
+
+        using var a = runtime.AllocateBytes((nuint)(aHost.Length * sizeof(ushort)));
+        using var b = runtime.AllocateBytes((nuint)(bHost.Length * sizeof(ushort)));
+        using var output = runtime.AllocateBytes((nuint)(p * q * sizeof(ushort)));
+        a.Upload<ushort>(aHost);
+        b.Upload<ushort>(bHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(a, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(b, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new ushort[p * q];
+        output.Download<ushort>(actual);
+        for (int i = 0; i < actual.Length; i++)
+            Assert.True(Math.Abs((float)BitConverter.UInt16BitsToHalf(actual[i]) - expected[i]) < 8e-2f,
+                $"fp16 contract-M mismatch at {i}");
+    }
+
+    [Fact]
     public void GemmEmitter_IsRegisterResidentTiledGemm()
     {
         string ptx = PtxGemmKernel.EmitPtx(8, 6, 64, 256, 256);
