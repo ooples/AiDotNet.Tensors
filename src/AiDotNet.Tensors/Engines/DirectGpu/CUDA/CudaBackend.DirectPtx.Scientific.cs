@@ -20,6 +20,7 @@ public sealed partial class CudaBackend
 
     private readonly record struct SciCountKey(int Count);
     private readonly record struct SciVectorKey(int Batch, int Dim, int ExtraBits);
+    private readonly record struct SciRbfKey(int Batch, int NumCenters, int InputDim);
 
     private readonly DirectPtxKernelCache<SciCountKey, PtxComplexMultiplyKernel> _sciComplexMul =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
@@ -40,6 +41,8 @@ public sealed partial class CudaBackend
     private readonly DirectPtxKernelCache<SciVectorKey, PtxPoincareProjectKernel> _sciPoincareProj =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<SciVectorKey, PtxPoincareExpMapKernel> _sciPoincareExp =
+        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<SciRbfKey, PtxRbfForwardKernel> _sciRbf =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
 
     private long _sciDispatchCount;
@@ -168,6 +171,23 @@ public sealed partial class CudaBackend
         });
     }
 
+    internal bool TryDirectPtxRbfForward(
+        IGpuBuffer input, IGpuBuffer centers, IGpuBuffer epsilons, IGpuBuffer output,
+        int batchSize, int numCenters, int inputDim)
+    {
+        if (!ScientificGateOpen || !PtxRbfForwardKernel.IsSupportedShape(batchSize, numCenters, inputDim)) return Fail("rbf-forward");
+        if (input.SizeInBytes != checked((long)batchSize * inputDim * sizeof(float)) ||
+            centers.SizeInBytes != checked((long)numCenters * inputDim * sizeof(float)) ||
+            epsilons.SizeInBytes != checked((long)numCenters * sizeof(float)) ||
+            output.SizeInBytes != checked((long)batchSize * numCenters * sizeof(float))) return Fail("rbf-forward-extent");
+        return SciDispatch(() =>
+        {
+            var k = _sciRbf.GetOrAdd(new SciRbfKey(batchSize, numCenters, inputDim),
+                () => new PtxRbfForwardKernel(_directPtxRuntime!, batchSize, numCenters, inputDim));
+            Launch4(k.Blueprint, input, centers, epsilons, output, (vi, vc, ve, vo) => k.Launch(vi, vc, ve, vo));
+        });
+    }
+
     private bool Fail(string reason)
     {
         DirectPtxLastError = $"scientific-{reason}-not-eligible";
@@ -184,6 +204,18 @@ public sealed partial class CudaBackend
     {
         lock (GpuDispatchLock)
             launch(DirectPtxTensorView.Create(a, bp.Tensors[0]), DirectPtxTensorView.Create(b, bp.Tensors[1]), DirectPtxTensorView.Create(c, bp.Tensors[2]));
+    }
+
+    private void Launch4(
+        DirectPtxKernelBlueprint bp, IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, IGpuBuffer d,
+        Action<DirectPtxTensorView, DirectPtxTensorView, DirectPtxTensorView, DirectPtxTensorView> launch)
+    {
+        lock (GpuDispatchLock)
+            launch(
+                DirectPtxTensorView.Create(a, bp.Tensors[0]),
+                DirectPtxTensorView.Create(b, bp.Tensors[1]),
+                DirectPtxTensorView.Create(c, bp.Tensors[2]),
+                DirectPtxTensorView.Create(d, bp.Tensors[3]));
     }
 
     private bool SciDispatch(Action launch)

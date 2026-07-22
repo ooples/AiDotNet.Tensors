@@ -14129,6 +14129,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void RbfForward(IGpuBuffer input, IGpuBuffer centers, IGpuBuffer epsilons, IGpuBuffer output, int batchSize, int numCenters, int inputDim)
     {
+        if (TryDirectPtxRbfForward(input, centers, epsilons, output, batchSize, numCenters, inputDim)) return;
+
         if (!_kernelCache.TryGetValue("rbf_forward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: rbf_forward");
 

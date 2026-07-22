@@ -14,8 +14,9 @@ public class DirectPtxScientificTests
     [Fact]
     public void ScientificCoverageManifest_AssignsEveryScopedApiExactlyOnce()
     {
-        Assert.Equal(10, DirectPtxScientificCoverageManifest.All.Count);
+        Assert.Equal(11, DirectPtxScientificCoverageManifest.All.Count);
         string[] names = DirectPtxScientificCoverageManifest.All.Select(c => c.Api).ToArray();
+        Assert.Contains("CudaBackend.RbfForward", names);
         Assert.Equal(names.Length, names.Distinct(StringComparer.Ordinal).Count());
         Assert.All(DirectPtxScientificCoverageManifest.All, cell =>
         {
@@ -265,6 +266,73 @@ public class DirectPtxScientificTests
         var actual = new float[count * 8];
         output.Download<float>(actual);
         AssertVectorClose(actual, expected, 0f, "octonion add");
+    }
+
+    [Fact]
+    public void RbfForwardEmitter_IsThreadPerPairSerialDim()
+    {
+        string ptx = PtxRbfForwardKernel.EmitPtx(8, 6, 256, 4, 8);
+        Assert.Contains(PtxRbfForwardKernel.EntryPoint, ptx);
+        Assert.Equal(3, Count(ptx, "ld.global.nc.f32"));    // input + centers in the loop, epsilon after
+        Assert.Equal(1, Count(ptx, "st.global.f32"));        // one output per (batch,center) pair
+        Assert.Equal(1, Count(ptx, "ex2.approx.f32"));       // expf via exp2
+        Assert.Contains("$RBF_DIM_LOOP:", ptx);
+        Assert.Contains("div.u32 %r3, %r2, 4", ptx);         // b = idx / numCenters
+        Assert.Contains("rem.u32 %r4, %r2, 4", ptx);         // c = idx % numCenters
+        Assert.Equal(0, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxRbfForwardKernel.IsSupportedShape(256, 4, 8));
+        Assert.False(PtxRbfForwardKernel.IsSupportedShape(255, 4, 8));   // pairs not a multiple of 256
+        Assert.False(PtxRbfForwardKernel.IsPromotedShape(256, 4, 8));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyRbfForward_MatchesOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in RBF-forward specialization is measured on GA10x/SM86.");
+        const int batchSize = 128, numCenters = 8, inputDim = 12;   // pairs = 1024 (multiple of 256)
+        using var kernel = new PtxRbfForwardKernel(runtime, batchSize, numCenters, inputDim);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20267100);
+        float[] inputHost = Values(random, batchSize * inputDim, 1.0f);
+        float[] centersHost = Values(random, numCenters * inputDim, 1.0f);
+        float[] epsHost = new float[numCenters];
+        for (int i = 0; i < numCenters; i++) epsHost[i] = (float)(0.2 + random.NextDouble());
+        var expected = new float[batchSize * numCenters];
+        for (int b = 0; b < batchSize; b++)
+            for (int cc = 0; cc < numCenters; cc++)
+            {
+                double distSq = 0;
+                for (int d = 0; d < inputDim; d++)
+                {
+                    double diff = inputHost[b * inputDim + d] - centersHost[cc * inputDim + d];
+                    distSq += diff * diff;
+                }
+                expected[b * numCenters + cc] = (float)Math.Exp(-epsHost[cc] * distSq);
+            }
+
+        using var input = runtime.AllocateBytes((nuint)(inputHost.Length * sizeof(float)));
+        using var centers = runtime.AllocateBytes((nuint)(centersHost.Length * sizeof(float)));
+        using var epsilons = runtime.AllocateBytes((nuint)(epsHost.Length * sizeof(float)));
+        using var output = runtime.AllocateBytes((nuint)(expected.Length * sizeof(float)));
+        input.Upload<float>(inputHost);
+        centers.Upload<float>(centersHost);
+        epsilons.Upload<float>(epsHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(centers, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(epsilons, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[3]));
+        runtime.Synchronize();
+        var actual = new float[expected.Length];
+        output.Download<float>(actual);
+        AssertVectorClose(actual, expected, 2e-3f, "rbf forward");
     }
 
     [Fact]
@@ -732,6 +800,23 @@ public class DirectPtxScientificTests
             { backend.PoincareProject(x, o, batch, dim, c, eps); n = AssertDispatched(n, "poincare-project"); }
             using (var x = backend.AllocateBuffer(px)) using (var v = backend.AllocateBuffer(py)) using (var o = backend.AllocateBuffer(batch * dim))
             { backend.PoincareExpMap(x, v, o, batch, dim, c); n = AssertDispatched(n, "poincare-exp-map"); }
+
+            // RBF forward: pairs = batch*numCenters must be a multiple of 256.
+            const int rbfBatch = 256, rbfCenters = 8, rbfDim = 12;
+            float[] rin = Values(random, rbfBatch * rbfDim, 1.0f), rcen = Values(random, rbfCenters * rbfDim, 1.0f);
+            float[] reps = new float[rbfCenters];
+            for (int i = 0; i < rbfCenters; i++) reps[i] = 0.3f + 0.5f * i / rbfCenters;
+            var rbfExp = new float[rbfBatch * rbfCenters];
+            for (int b = 0; b < rbfBatch; b++)
+                for (int cc = 0; cc < rbfCenters; cc++)
+                {
+                    double distSq = 0;
+                    for (int d = 0; d < rbfDim; d++) { double diff = rin[b * rbfDim + d] - rcen[cc * rbfDim + d]; distSq += diff * diff; }
+                    rbfExp[b * rbfCenters + cc] = (float)Math.Exp(-reps[cc] * distSq);
+                }
+            using (var inb = backend.AllocateBuffer(rin)) using (var cenb = backend.AllocateBuffer(rcen))
+            using (var epsb = backend.AllocateBuffer(reps)) using (var o = backend.AllocateBuffer(rbfBatch * rbfCenters))
+            { backend.RbfForward(inb, cenb, epsb, o, rbfBatch, rbfCenters, rbfDim); n = AssertDispatched(n, "rbf-forward"); AssertVectorClose(backend.DownloadBuffer(o), rbfExp, 2e-3f, "rbf-forward route"); }
         }
         finally
         {
