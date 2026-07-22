@@ -24,7 +24,7 @@ public class DirectPtxScientificTests
             Assert.False(string.IsNullOrWhiteSpace(cell.DTypes));
             Assert.False(string.IsNullOrWhiteSpace(cell.DirectPtxAssignment));
         });
-        foreach (string api in new[] { "CudaBackend.ComplexMultiply", "CudaBackend.ComplexConjugate", "CudaBackend.ComplexMagnitude" })
+        foreach (string api in new[] { "CudaBackend.ComplexMultiply", "CudaBackend.ComplexConjugate", "CudaBackend.ComplexMagnitude", "CudaBackend.OctonionAdd" })
             Assert.Equal(DirectPtxScientificCoverageStatus.ExperimentalDirectPtx,
                 DirectPtxScientificCoverageManifest.Get(api).Status);
         Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() =>
@@ -166,6 +166,54 @@ public class DirectPtxScientificTests
         var actual = new float[pairs * 2];
         output.Download<float>(actual);
         AssertVectorClose(actual, expected, 2e-3f, "complex multiply");
+    }
+
+    [Fact]
+    public void OctonionAddEmitter_AddsEightLanesPerThread()
+    {
+        string ptx = PtxOctonionAddKernel.EmitPtx(8, 6, 16384);
+        Assert.Contains(PtxOctonionAddKernel.EntryPoint, ptx);
+        Assert.Equal(16, Count(ptx, "ld.global.nc.f32"));   // 8 a + 8 b
+        Assert.Equal(8, Count(ptx, "add.rn.f32"));
+        Assert.Equal(8, Count(ptx, "st.global.f32"));
+        Assert.Equal(0, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxOctonionAddKernel.IsSupportedCount(16384));
+        Assert.False(PtxOctonionAddKernel.IsPromotedCount(16384));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyOctonionAdd_MatchesOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in octonion-add specialization is measured on GA10x/SM86.");
+        const int count = 16384;
+        using var kernel = new PtxOctonionAddKernel(runtime, count);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20266100);
+        float[] aHost = Values(random, count * 8, 2.0f);
+        float[] bHost = Values(random, count * 8, 2.0f);
+        var expected = new float[count * 8];
+        for (int i = 0; i < expected.Length; i++) expected[i] = aHost[i] + bHost[i];
+
+        using var a = runtime.AllocateBytes((nuint)(aHost.Length * sizeof(float)));
+        using var b = runtime.AllocateBytes((nuint)(bHost.Length * sizeof(float)));
+        using var output = runtime.AllocateBytes((nuint)(count * 8 * sizeof(float)));
+        a.Upload<float>(aHost);
+        b.Upload<float>(bHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(a, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(b, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[count * 8];
+        output.Download<float>(actual);
+        AssertVectorClose(actual, expected, 0f, "octonion add");
     }
 
     private static float[] Values(Random random, int count, float magnitude)

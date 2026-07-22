@@ -45,7 +45,7 @@ internal static class DirectPtxScientificCoverageManifest
         new("CudaBackend.PoincareExpMap", "NVRTC poincare exp-map", "tangent-space exponential map", "Poincare vectors", "FP32", DirectPtxScientificCoverageStatus.PlannedDirectPtx, Planned),
         new("CudaBackend.PoincareDistance", "NVRTC poincare distance", "hyperbolic geodesic distance", "Poincare vectors", "FP32", DirectPtxScientificCoverageStatus.PlannedDirectPtx, Planned),
         new("CudaBackend.OctonionMultiply", "NVRTC octonion multiply", "8-component hypercomplex product", "octonion 8-tuples", "FP32", DirectPtxScientificCoverageStatus.PlannedDirectPtx, Planned),
-        new("CudaBackend.OctonionAdd", "NVRTC octonion add", "componentwise octonion sum", "octonion 8-tuples", "FP32", DirectPtxScientificCoverageStatus.PlannedDirectPtx, Planned)
+        new("CudaBackend.OctonionAdd", "NVRTC octonion add", "componentwise octonion sum", "octonion 8-tuples", "FP32", DirectPtxScientificCoverageStatus.ExperimentalDirectPtx, "one-thread-per-octonion 8-lane add PTX kernel (PtxOctonionAddKernel); fails closed until GPU-validated and promoted")
     ];
 
     internal static DirectPtxScientificCoverageCell Get(string api)
