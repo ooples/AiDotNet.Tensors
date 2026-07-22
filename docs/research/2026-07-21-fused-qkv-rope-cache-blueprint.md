@@ -182,7 +182,10 @@ bytes, zero local bytes/thread, and 12 active 128-thread blocks per SM. The
 resource budget rejects more than 48 registers, any shared/local allocation,
 or fewer than eight active blocks/SM before a module can enter the cache.
 
-The H16 profile target recorded:
+The profile target emits exactly one deterministic launch for each distinct
+unrolled head body: H4/cap16/pos0, H8/cap64/pos17, and H16/cap128/pos127.
+Capacity and position only change baked address immediates; they do not change
+the instruction types or register liveness. The H16 audit recorded:
 
 ```text
 BlueprintId: qkv-projection-rope-cache-d64-v1-Ampere-decode-fp32-h16-capacity128-position127

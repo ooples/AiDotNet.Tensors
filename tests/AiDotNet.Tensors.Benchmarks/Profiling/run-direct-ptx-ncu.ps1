@@ -44,7 +44,7 @@ $expectedLaunches = switch ($Target) {
     'paged-prefill' { 1 }
     'attention-backward' { 3 }
     'flash-attention-backward' { 2 }
-    'qkv-rope-cache' { 1 }
+    'qkv-rope-cache' { 3 }
 }
 $metricNames = @(
     'smsp__sass_inst_executed_op_local.sum',

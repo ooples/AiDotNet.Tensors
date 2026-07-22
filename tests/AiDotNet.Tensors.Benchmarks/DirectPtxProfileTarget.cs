@@ -225,37 +225,42 @@ internal static class DirectPtxProfileTarget
     {
         GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-qkv-rope-cache-start");
         using var runtime = new DirectPtxRuntime();
-        const int heads = 16, capacity = 128, position = 127;
-        using var kernel = new PtxFusedQkvRopeCacheD64Kernel(
-            runtime, heads, capacity, position);
-        int model = heads * PtxFusedQkvRopeCacheD64Kernel.HeadDimension;
-        using var input = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
-        using var weights = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
-        using var bias = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
-        using var cosine = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
-        using var sine = runtime.AllocateBytes(kernel.Blueprint.Tensors[4].RequiredBytes);
-        using var query = runtime.AllocateBytes(kernel.Blueprint.Tensors[5].RequiredBytes);
-        using var keyCache = runtime.AllocateBytes(kernel.Blueprint.Tensors[6].RequiredBytes);
-        using var valueCache = runtime.AllocateBytes(kernel.Blueprint.Tensors[7].RequiredBytes);
-        input.Upload<float>(new float[model]);
-        weights.Upload<float>(new float[3 * model * model]);
-        bias.Upload<float>(new float[3 * model]);
-        cosine.Upload<float>(Enumerable.Repeat(1f, capacity * 32).ToArray());
-        sine.Upload<float>(new float[capacity * 32]);
-        Action launch = () => kernel.Launch(
-            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
-            DirectPtxTensorView.CreateOwned(weights, kernel.Blueprint.Tensors[1]),
-            DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[2]),
-            DirectPtxTensorView.CreateOwned(cosine, kernel.Blueprint.Tensors[3]),
-            DirectPtxTensorView.CreateOwned(sine, kernel.Blueprint.Tensors[4]),
-            DirectPtxTensorView.CreateOwned(query, kernel.Blueprint.Tensors[5]),
-            DirectPtxTensorView.CreateOwned(keyCache, kernel.Blueprint.Tensors[6]),
-            DirectPtxTensorView.CreateOwned(valueCache, kernel.Blueprint.Tensors[7]));
-        // Exactly one deterministic launch keeps the Nsight completeness gate
-        // one-to-one with this promoted specialization.
-        launch();
-        runtime.Synchronize();
-        Console.WriteLine(kernel.Audit.ToJson());
+        (int Heads, int Capacity, int Position)[] shapes =
+        [
+            (4, 16, 0),
+            (8, 64, 17),
+            (16, 128, 127)
+        ];
+        foreach ((int heads, int capacity, int position) in shapes)
+        {
+            using var kernel = new PtxFusedQkvRopeCacheD64Kernel(
+                runtime, heads, capacity, position);
+            int model = heads * PtxFusedQkvRopeCacheD64Kernel.HeadDimension;
+            using var input = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+            using var weights = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+            using var bias = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+            using var cosine = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
+            using var sine = runtime.AllocateBytes(kernel.Blueprint.Tensors[4].RequiredBytes);
+            using var query = runtime.AllocateBytes(kernel.Blueprint.Tensors[5].RequiredBytes);
+            using var keyCache = runtime.AllocateBytes(kernel.Blueprint.Tensors[6].RequiredBytes);
+            using var valueCache = runtime.AllocateBytes(kernel.Blueprint.Tensors[7].RequiredBytes);
+            input.Upload<float>(new float[model]);
+            weights.Upload<float>(new float[3 * model * model]);
+            bias.Upload<float>(new float[3 * model]);
+            cosine.Upload<float>(Enumerable.Repeat(1f, capacity * 32).ToArray());
+            sine.Upload<float>(new float[capacity * 32]);
+            kernel.Launch(
+                DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+                DirectPtxTensorView.CreateOwned(weights, kernel.Blueprint.Tensors[1]),
+                DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[2]),
+                DirectPtxTensorView.CreateOwned(cosine, kernel.Blueprint.Tensors[3]),
+                DirectPtxTensorView.CreateOwned(sine, kernel.Blueprint.Tensors[4]),
+                DirectPtxTensorView.CreateOwned(query, kernel.Blueprint.Tensors[5]),
+                DirectPtxTensorView.CreateOwned(keyCache, kernel.Blueprint.Tensors[6]),
+                DirectPtxTensorView.CreateOwned(valueCache, kernel.Blueprint.Tensors[7]));
+            runtime.Synchronize();
+            Console.WriteLine(kernel.Audit.ToJson());
+        }
         GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-qkv-rope-cache-end");
     }
 
