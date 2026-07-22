@@ -179,6 +179,145 @@ public sealed class DirectPtxConvolutionTests
             StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void DepthwiseEmitter_IsPointerOnlyHaloPredicatedSm86Ptx()
+    {
+        string ptx = PtxFusedDepthwiseConv2D3x3F32Kernel.EmitPtx(8, 6);
+
+        Assert.Contains(".target sm_86", ptx, StringComparison.Ordinal);
+        Assert.Contains(PtxFusedDepthwiseConv2D3x3F32Kernel.EntryPoint, ptx, StringComparison.Ordinal);
+        Assert.Equal(3, Count(ptx, ".param .u64"));
+        Assert.Equal(9, Count(ptx, "fma.rn.f32"));
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        // Nine weights + one center tap + eight halo-predicated boundary taps.
+        Assert.Equal(18, Count(ptx, "ld.global.nc.f32"));
+        // Only the eight boundary taps are predicated; the center tap never is.
+        Assert.Contains("setp.", ptx, StringComparison.Ordinal);
+        Assert.Equal(4, Count(ptx, "and.pred"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.Throws<NotSupportedException>(() =>
+            PtxFusedDepthwiseConv2D3x3F32Kernel.EmitPtx(8, 9));
+    }
+
+    [Fact]
+    public void DepthwiseBlueprint_DeclaresExactContiguousAbiAndNoIntermediate()
+    {
+        DirectPtxKernelBlueprint blueprint =
+            PtxFusedDepthwiseConv2D3x3F32Kernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere);
+
+        Assert.Equal("depthwise-conv2d-v1-Ampere-n1-c64-h16-w16-r3-s1-p1-fp32", blueprint.Id);
+        Assert.Equal(
+            new[] { DirectPtxPhysicalLayout.Nchw, DirectPtxPhysicalLayout.Oihw,
+                DirectPtxPhysicalLayout.Nchw },
+            blueprint.Tensors.Select(t => t.Layout));
+        Assert.All(blueprint.Tensors, tensor =>
+        {
+            Assert.Equal(DirectPtxExtentMode.Exact, tensor.ExtentMode);
+            Assert.Equal(16, tensor.AlignmentBytes);
+            Assert.Equal(DirectPtxPhysicalType.Float32, tensor.PhysicalType);
+        });
+        Assert.Equal("0", blueprint.Semantics["intermediate-global-bytes"]);
+        Assert.Equal("experimental-pending-gpu-evidence", blueprint.Semantics["promotion"]);
+        Assert.Equal(0, blueprint.ResourceBudget.MaxLocalBytesPerThread);
+    }
+
+    [Fact]
+    public void DepthwiseManifestCell_IsExperimentalWithDedicatedRoute()
+    {
+        Assert.Equal(DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxConvolutionCoverageManifest.Get("IEngine.DepthwiseConv2D").Status);
+        Assert.Equal(DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxConvolutionCoverageManifest
+                .Get("CudaBackend.TryDirectPtxDepthwiseConv2D3x3").Status);
+    }
+
+    [Fact]
+    public void RegisterCeiling_ScalesWithDeviceRegisterFileNotHardcodedLiteral()
+    {
+        // 65536 regs/SM, 4 target blocks x 128 threads => 65536/512 = 128/thread,
+        // and 65536 regs/block / 128 = 512, so the SM bound (128) wins.
+        DirectPtxFunctionInfo ampere = Info(regsPerSm: 65536, regsPerBlock: 65536);
+        Assert.Equal(128, DirectPtxResourceBudget.DeriveRegisterCeiling(ampere, 128, 4));
+
+        // Half the register file => half the ceiling. Nothing is hardcoded.
+        DirectPtxFunctionInfo smaller = Info(regsPerSm: 32768, regsPerBlock: 65536);
+        Assert.Equal(64, DirectPtxResourceBudget.DeriveRegisterCeiling(smaller, 128, 4));
+
+        // The per-block cap can be the binding constraint at large block sizes.
+        DirectPtxFunctionInfo blockBound = Info(regsPerSm: 131072, regsPerBlock: 32768);
+        Assert.Equal(128, DirectPtxResourceBudget.DeriveRegisterCeiling(blockBound, 256, 2));
+
+        // Older drivers that cannot report capacity => no standalone bound; the
+        // driver occupancy calculator and zero-local-bytes invariant still apply.
+        DirectPtxFunctionInfo unknown = Info(regsPerSm: 0, regsPerBlock: 0);
+        Assert.Equal(int.MaxValue, DirectPtxResourceBudget.DeriveRegisterCeiling(unknown, 128, 4));
+    }
+
+    private static DirectPtxFunctionInfo Info(int regsPerSm, int regsPerBlock) =>
+        new(MaxThreadsPerBlock: 1024, StaticSharedBytes: 0, ConstBytes: 0,
+            LocalBytesPerThread: 0, RegistersPerThread: 40, PtxVersion: 0, BinaryVersion: 0,
+            MaxRegistersPerMultiprocessor: regsPerSm, MaxRegistersPerBlock: regsPerBlock);
+
+    [SkippableFact]
+    public void DriverOnlyDepthwiseConv2D3x3_MatchesCpuReference()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "Requires the experimental SM86 depthwise specialization.");
+
+        const int channels = PtxFusedDepthwiseConv2D3x3F32Kernel.Channels;
+        const int height = PtxFusedDepthwiseConv2D3x3F32Kernel.Height;
+        const int width = PtxFusedDepthwiseConv2D3x3F32Kernel.Width;
+        const int kernelSize = PtxFusedDepthwiseConv2D3x3F32Kernel.KernelSize;
+
+        using var kernel = new PtxFusedDepthwiseConv2D3x3F32Kernel(runtime);
+        using var inputDevice = runtime.AllocateBytes((nuint)PtxFusedDepthwiseConv2D3x3F32Kernel.InputBytes);
+        using var weightDevice = runtime.AllocateBytes((nuint)PtxFusedDepthwiseConv2D3x3F32Kernel.WeightBytes);
+        using var outputDevice = runtime.AllocateBytes((nuint)PtxFusedDepthwiseConv2D3x3F32Kernel.OutputBytes);
+
+        Random random = AiDotNet.Tensors.Helpers.RandomHelper.CreateSecureRandom();
+        var input = new float[channels * height * width];
+        for (int i = 0; i < input.Length; i++) input[i] = (float)(random.NextDouble() * 2 - 1);
+        var weights = new float[channels * kernelSize * kernelSize];
+        for (int i = 0; i < weights.Length; i++) weights[i] = (float)(random.NextDouble() * 2 - 1);
+        inputDevice.Upload<float>(input);
+        weightDevice.Upload<float>(weights);
+
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(inputDevice, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(weightDevice, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(outputDevice, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[channels * height * width];
+        outputDevice.Download<float>(actual);
+
+        float maxAbsoluteError = 0;
+        for (int c = 0; c < channels; c++)
+        for (int y = 0; y < height; y++)
+        for (int x = 0; x < width; x++)
+        {
+            float expected = 0;
+            for (int ky = 0; ky < kernelSize; ky++)
+            for (int kx = 0; kx < kernelSize; kx++)
+            {
+                int iy = y + ky - 1;
+                int ix = x + kx - 1;
+                if (iy < 0 || iy >= height || ix < 0 || ix >= width) continue;
+                expected += weights[(c * kernelSize + ky) * kernelSize + kx] *
+                    input[(c * height + iy) * width + ix];
+            }
+            float got = actual[(c * height + y) * width + x];
+            maxAbsoluteError = MathF.Max(maxAbsoluteError, MathF.Abs(got - expected));
+        }
+
+        Assert.True(maxAbsoluteError <= 5e-5f,
+            $"Depthwise 3x3 max absolute error {maxAbsoluteError:G9}.");
+    }
+
     private static string? Validate(
         bool enabled, bool available, int major, int minor,
         DirectPtxConvolutionShape shape, IGpuBuffer? input, IGpuBuffer? weights,

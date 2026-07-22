@@ -17,6 +17,8 @@ public enum CudaDeviceAttribute
     ClockRate = 13,
     MultiprocessorCount = 16,
     MaxThreadsPerMultiprocessor = 39,
+    MaxRegistersPerBlock = 12,
+    MaxRegistersPerMultiprocessor = 82,
     ComputeCapabilityMajor = 75,
     ComputeCapabilityMinor = 76,
     CooperativeLaunch = 95
