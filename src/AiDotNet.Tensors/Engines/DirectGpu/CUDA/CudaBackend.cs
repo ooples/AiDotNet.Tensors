@@ -3267,6 +3267,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public void Softmax(IGpuBuffer A, IGpuBuffer B, int batchSize, int features)
     {
+        // Fail-closed direct-PTX fast path (issue #840); returns false until GPU-promoted.
+        if (TryDirectPtxSoftmax(A, B, batchSize, features)) return;
         LaunchSoftmaxKernel(A, B, batchSize, features);
     }
 

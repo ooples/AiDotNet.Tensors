@@ -1,6 +1,7 @@
 using System;
 using System.Linq;
 using AiDotNet.Tensors.Engines.DirectGpu;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 using AiDotNet.Tensors.Helpers;
 using Xunit;
@@ -555,6 +556,53 @@ public class DirectPtxSoftmaxTests
         var actual = new float[m * n];
         output.Download<float>(actual);
         AssertVectorClose(actual, expected, 2e-3f, $"softmax {m}x{n}");
+    }
+
+    [SkippableFact]
+    public void Backend_DirectPtxSoftmax_PrewarmsDispatchesAndAudits()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previous = DirectPtxFeatureGate.TestOverride;
+        bool previousExperiment = DirectPtxFeatureGate.SoftmaxExperimentOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        DirectPtxFeatureGate.SoftmaxExperimentOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxSoftmaxEnabled, "Requires a validated Ampere CUDA backend.");
+            const int m = 64, n = 256;
+
+            Assert.True(backend.PrewarmDirectPtxSoftmax(m, n), backend.DirectPtxLastError);
+            Assert.True(backend.TryGetDirectPtxSoftmaxAudit(m, n, out DirectPtxKernelAudit audit));
+            Assert.Equal(0, audit.Function.LocalBytesPerThread);
+            Assert.Equal(64, audit.PtxSha256.Length);
+
+            var random = RandomHelper.CreateSeededRandom(20265500);
+            float[] xHost = Values(random, m * n, 3.0f);
+            var expected = new float[m * n];
+            for (int row = 0; row < m; row++)
+            {
+                double max = double.NegativeInfinity;
+                for (int col = 0; col < n; col++) max = Math.Max(max, xHost[row * n + col]);
+                double sum = 0;
+                for (int col = 0; col < n; col++) sum += Math.Exp(xHost[row * n + col] - max);
+                for (int col = 0; col < n; col++)
+                    expected[row * n + col] = (float)(Math.Exp(xHost[row * n + col] - max) / sum);
+            }
+
+            using var inBuf = backend.AllocateBuffer(xHost);
+            using var outBuf = backend.AllocateBuffer(m * n);
+            long before = backend.DirectPtxSoftmaxDispatchCount;
+            backend.Softmax(inBuf, outBuf, m, n);   // public route flows through the fail-closed guard
+            backend.Synchronize();
+            Assert.True(backend.DirectPtxSoftmaxDispatchCount > before, backend.DirectPtxLastError);
+            AssertVectorClose(backend.DownloadBuffer(outBuf), expected, 2e-3f, "backend softmax via direct-ptx");
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previous;
+            DirectPtxFeatureGate.SoftmaxExperimentOverride = previousExperiment;
+        }
     }
 
     private static float[] Values(Random random, int count, float magnitude)
