@@ -81,6 +81,14 @@ public static class PtxParityRegistry
         new PtxParitySpec("PtxFusedQkvRopeCacheD64Kernel", PtxParityStatus.Deferred,
             "fused QKV + RoPE + KV-cache write (#858)",
             "multi-output (Q + K/V cache) with baked RoPE tables; needs a dedicated QKV/RoPE/cache oracle."),
+        new PtxParitySpec("PtxRegisterCholesky4x4F32Kernel", PtxParityStatus.Deferred,
+            "Linalg.CholeskyEx lower FP32 batched 4x4 (#853)",
+            "a dedicated opt-in DriverOnly structural/parity matrix is checked in; promotion to three-way " +
+            "coverage waits for execution on the admitted SM86 device and attached failure-info evidence."),
+        new PtxParitySpec("PtxRegisterSolver4x4F32Kernel", PtxParityStatus.Deferred,
+            "dense decomposition/solve forward and backward FP32 batched 4x4 family (#853)",
+            "the operation-parameterized DriverOnly matrix and public routing are checked in; three-way " +
+            "classification waits for SM86 execution, operation-specific oracle evidence, and the release gate."),
     };
 
     private static readonly Dictionary<string, PtxParitySpec> ByKernel =

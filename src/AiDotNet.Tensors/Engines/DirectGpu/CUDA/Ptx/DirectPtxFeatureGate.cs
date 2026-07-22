@@ -19,6 +19,17 @@ internal static class DirectPtxFeatureGate
     internal const string AttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_ATTENTION_BACKWARD";
     internal const string FlashAttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FLASH_ATTENTION_BACKWARD";
     internal const string QkvRopeCacheEnvironmentVariable = "AIDOTNET_DIRECT_PTX_QKV_ROPE_CACHE";
+    internal const string Cholesky4x4EnvironmentVariable = "AIDOTNET_DIRECT_PTX_CHOLESKY_4X4";
+    internal const string LuFactor4x4EnvironmentVariable = "AIDOTNET_DIRECT_PTX_LU_FACTOR_4X4";
+    internal const string Qr4x4EnvironmentVariable = "AIDOTNET_DIRECT_PTX_QR_4X4";
+    internal const string Eigh4x4EnvironmentVariable = "AIDOTNET_DIRECT_PTX_EIGH_4X4";
+    internal const string Svd4x4EnvironmentVariable = "AIDOTNET_DIRECT_PTX_SVD_4X4";
+    internal const string LuSolve4x4EnvironmentVariable = "AIDOTNET_DIRECT_PTX_LU_SOLVE_4X4";
+    internal const string LdlFactor4x4EnvironmentVariable = "AIDOTNET_DIRECT_PTX_LDL_FACTOR_4X4";
+    internal const string LdlSolve4x4EnvironmentVariable = "AIDOTNET_DIRECT_PTX_LDL_SOLVE_4X4";
+    internal const string Solve4x4EnvironmentVariable = "AIDOTNET_DIRECT_PTX_SOLVE_4X4";
+    internal const string TriangularSolve4x4EnvironmentVariable = "AIDOTNET_DIRECT_PTX_TRIANGULAR_SOLVE_4X4";
+    internal const string SolverBackward4x4EnvironmentVariable = "AIDOTNET_DIRECT_PTX_SOLVER_BACKWARD_4X4";
     internal const string AutotuneEnvironmentVariable = "AIDOTNET_DIRECT_PTX_AUTOTUNE";
     internal const string CacheCapacityEnvironmentVariable = "AIDOTNET_DIRECT_PTX_CACHE_CAPACITY";
 
@@ -34,12 +45,40 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentAttentionBackwardEnabled = ReadEnabled(AttentionBackwardEnvironmentVariable);
     private static readonly bool EnvironmentFlashAttentionBackwardEnabled = ReadEnabled(FlashAttentionBackwardEnvironmentVariable);
     private static readonly bool EnvironmentQkvRopeCacheEnabled = ReadEnabled(QkvRopeCacheEnvironmentVariable);
+    private static readonly bool EnvironmentCholesky4x4Enabled = ReadEnabled(Cholesky4x4EnvironmentVariable);
+    private static readonly bool EnvironmentLuFactor4x4Enabled = ReadEnabled(LuFactor4x4EnvironmentVariable);
+    private static readonly bool EnvironmentQr4x4Enabled = ReadEnabled(Qr4x4EnvironmentVariable);
+    private static readonly bool EnvironmentEigh4x4Enabled = ReadEnabled(Eigh4x4EnvironmentVariable);
+    private static readonly bool EnvironmentSvd4x4Enabled = ReadEnabled(Svd4x4EnvironmentVariable);
+    private static readonly bool EnvironmentLuSolve4x4Enabled = ReadEnabled(LuSolve4x4EnvironmentVariable);
+    private static readonly bool EnvironmentLdlFactor4x4Enabled = ReadEnabled(LdlFactor4x4EnvironmentVariable);
+    private static readonly bool EnvironmentLdlSolve4x4Enabled = ReadEnabled(LdlSolve4x4EnvironmentVariable);
+    private static readonly bool EnvironmentSolve4x4Enabled = ReadEnabled(Solve4x4EnvironmentVariable);
+    private static readonly bool EnvironmentTriangularSolve4x4Enabled = ReadEnabled(TriangularSolve4x4EnvironmentVariable);
+    private static readonly bool EnvironmentSolverBackward4x4Enabled = ReadEnabled(SolverBackward4x4EnvironmentVariable);
     private static readonly bool EnvironmentAutotuneEnabled =
         !string.Equals(Environment.GetEnvironmentVariable(AutotuneEnvironmentVariable), "0", StringComparison.Ordinal);
     private static readonly int EnvironmentCacheCapacity = ReadCacheCapacity();
 
     /// <summary>Test-only override. Null restores environment-based behavior.</summary>
     internal static bool? TestOverride { get; set; }
+
+    [ThreadStatic] private static bool? s_cholesky4x4ExperimentOverride;
+    [ThreadStatic] private static bool? s_solver4x4ExperimentOverride;
+
+    /// <summary>Thread-local benchmark/test override; null restores the process-start gate.</summary>
+    internal static bool? Cholesky4x4ExperimentOverride
+    {
+        get => s_cholesky4x4ExperimentOverride;
+        set => s_cholesky4x4ExperimentOverride = value;
+    }
+
+    /// <summary>Thread-local override for the non-Cholesky solver experiment family.</summary>
+    internal static bool? Solver4x4ExperimentOverride
+    {
+        get => s_solver4x4ExperimentOverride;
+        set => s_solver4x4ExperimentOverride = value;
+    }
 
     internal static bool IsEnabled => IsAttentionEnabled;
 
@@ -66,6 +105,39 @@ internal static class DirectPtxFeatureGate
 
     internal static bool IsQkvRopeCacheEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentQkvRopeCacheEnabled);
+
+    internal static bool IsCholesky4x4Enabled => Cholesky4x4ExperimentOverride ?? TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentCholesky4x4Enabled);
+
+    internal static bool IsLuFactor4x4Enabled => Solver4x4ExperimentOverride ?? TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentLuFactor4x4Enabled);
+
+    internal static bool IsQr4x4Enabled => Solver4x4ExperimentOverride ?? TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentQr4x4Enabled);
+
+    internal static bool IsEigh4x4Enabled => Solver4x4ExperimentOverride ?? TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentEigh4x4Enabled);
+
+    internal static bool IsSvd4x4Enabled => Solver4x4ExperimentOverride ?? TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentSvd4x4Enabled);
+
+    internal static bool IsLuSolve4x4Enabled => Solver4x4ExperimentOverride ?? TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentLuSolve4x4Enabled);
+
+    internal static bool IsLdlFactor4x4Enabled => Solver4x4ExperimentOverride ?? TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentLdlFactor4x4Enabled);
+
+    internal static bool IsLdlSolve4x4Enabled => Solver4x4ExperimentOverride ?? TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentLdlSolve4x4Enabled);
+
+    internal static bool IsSolve4x4Enabled => Solver4x4ExperimentOverride ?? TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentSolve4x4Enabled);
+
+    internal static bool IsTriangularSolve4x4Enabled => Solver4x4ExperimentOverride ?? TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentTriangularSolve4x4Enabled);
+
+    internal static bool IsSolverBackward4x4Enabled => Solver4x4ExperimentOverride ?? TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentSolverBackward4x4Enabled);
 
     internal static bool IsAutotuneEnabled => EnvironmentAutotuneEnabled;
 
@@ -95,6 +167,8 @@ internal enum DirectPtxPhysicalLayout
     Bhsd,
     /// <summary>Dense row-major [row, feature].</summary>
     RowMajor2D,
+    /// <summary>Dense row-major [batch, row, column] matrices.</summary>
+    BatchedRowMajorMatrix,
     /// <summary>Dense row-major [sequence, head, dimension].</summary>
     SequenceHeadDim,
     /// <summary>Dense [row, qkv, head, feature] projection output.</summary>

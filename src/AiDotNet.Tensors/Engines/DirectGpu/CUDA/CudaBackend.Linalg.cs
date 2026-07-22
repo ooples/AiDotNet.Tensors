@@ -35,6 +35,7 @@ public sealed partial class CudaBackend : ILinalgBackend
         int batchCount, int n, bool upper)
     {
         if (batchCount <= 0 || n <= 0) return;
+        if (TryDirectPtxCholesky4x4(input, output, info, batchCount, n, upper)) return;
         var kernel = ResolveLinalgKernel("parity211_cholesky");
         using var _ = PushContext();
         IntPtr inPtr = input.Handle; IntPtr outPtr = output.Handle; IntPtr infoPtr = info.Handle;
@@ -50,6 +51,7 @@ public sealed partial class CudaBackend : ILinalgBackend
         int batchCount, int m, int n)
     {
         if (batchCount <= 0 || m <= 0 || n <= 0) return;
+        if (TryDirectPtxLuFactor4x4(input, output, pivots, batchCount, m, n)) return;
         var kernel = ResolveLinalgKernel("parity211_lu_factor");
         using var _ = PushContext();
         IntPtr inPtr = input.Handle; IntPtr outPtr = output.Handle; IntPtr pivPtr = pivots.Handle;
@@ -65,6 +67,7 @@ public sealed partial class CudaBackend : ILinalgBackend
         int batchCount, int m, int n)
     {
         if (batchCount <= 0 || m <= 0 || n <= 0) return;
+        if (TryDirectPtxQrReduced4x4(input, q, r, batchCount, m, n)) return;
         var kernel = ResolveLinalgKernel("parity211_qr_reduced");
         using var _ = PushContext();
         IntPtr inPtr = input.Handle; IntPtr qPtr = q.Handle; IntPtr rPtr = r.Handle;
@@ -80,6 +83,7 @@ public sealed partial class CudaBackend : ILinalgBackend
         int batchCount, int n)
     {
         if (batchCount <= 0 || n <= 0) return;
+        if (TryDirectPtxEighUpper4x4(input, eigenvalues, eigenvectors, batchCount, n)) return;
         // The kernel allocates 2·n·n floats of dynamic shared memory (Ash +
         // Vsh scratch). CUDA caps dynamic shared memory per block at 48 KB
         // by default, which bounds n at ⌊√(48 KB / 2 / 4 B)⌋ ≈ 77. We clamp

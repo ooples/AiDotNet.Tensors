@@ -49,14 +49,12 @@ public static class Linalg
     public static (Tensor<T> Eigenvalues, Tensor<T> Eigenvectors) Eigh<T>(Tensor<T> input, bool upper = false)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
-        // GPU fast-path (fp32, n ≤ 64 — shared-memory bound). The current GPU
-        // kernels symmetrize from the upper triangle, so they match `upper=true`
-        // semantics; `upper=false` falls through to the CPU path that reads
-        // from the lower triangle. Widen this to all UPLO modes when the GPU
-        // kernel grows an explicit `upper` uniform.
-        if (typeof(T) == typeof(float) && upper && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
+        // GPU fast-path. Established backends cover the upper-triangle mode;
+        // the exact direct-PTX 4x4 specialization also has a distinct
+        // lower-authoritative entry point. Unsupported contracts fall back.
+        if (typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
         {
-            var (gW, gV) = gpu.TryGpuEigh((Tensor<float>)(object)input);
+            var (gW, gV) = gpu.TryGpuEigh((Tensor<float>)(object)input, upper);
             if (gW is not null && gV is not null)
                 return ((Tensor<T>)(object)gW, (Tensor<T>)(object)gV);
         }
@@ -66,7 +64,7 @@ public static class Linalg
     /// <summary>Eigenvalues only of a symmetric/Hermitian matrix.</summary>
     public static Tensor<T> Eigvalsh<T>(Tensor<T> input, bool upper = false)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => EighDecomposition.Compute(input, upper).Eigenvalues;
+        => Eigh(input, upper).Eigenvalues;
 
     /// <summary>
     /// General (non-symmetric) eigendecomposition. Returns complex eigenvalues
@@ -86,14 +84,20 @@ public static class Linalg
     public static (Tensor<T> Q, Tensor<T> R) QR<T>(Tensor<T> input, string mode = "reduced")
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
-        // GPU fast-path is reduced-mode only (the kernel doesn't implement
-        // "complete" padding or "r"-only suppression). Complete/r fall through
-        // to the managed implementation.
-        if (mode == "reduced" && typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
+        // For the admitted square 4x4 specialization complete and reduced QR
+        // have identical physical extents. R-only reuses the direct factor and
+        // suppresses Q at the public boundary.
+        if ((mode == "reduced" || mode == "complete" || mode == "r") &&
+            typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
         {
             var (gQ, gR) = gpu.TryGpuQrReduced((Tensor<float>)(object)input);
             if (gQ is not null && gR is not null)
-                return ((Tensor<T>)(object)gQ, (Tensor<T>)(object)gR);
+            {
+                Tensor<T> q = mode == "r"
+                    ? new Tensor<T>(new int[input.Rank])
+                    : (Tensor<T>)(object)gQ;
+                return (q, (Tensor<T>)(object)gR);
+            }
         }
         return QrDecomposition.Compute(input, mode);
     }
@@ -163,27 +167,65 @@ public static class Linalg
     /// <summary>Solve <c>AX = B</c> given a precomputed LU factorization.</summary>
     public static Tensor<T> LuSolve<T>(Tensor<T> lu, Tensor<int> pivots, Tensor<T> b)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => LuDecomposition.Solve(lu, pivots, b);
+    {
+        if (typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
+        {
+            Tensor<float>? result = gpu.TryGpuLuSolve(
+                (Tensor<float>)(object)lu, pivots, (Tensor<float>)(object)b);
+            if (result is not null) return (Tensor<T>)(object)result;
+        }
+        return LuDecomposition.Solve(lu, pivots, b);
+    }
 
     /// <summary>LDL factorization for symmetric-indefinite systems.</summary>
     public static (Tensor<T> LD, Tensor<int> Pivots) LdlFactor<T>(Tensor<T> input, bool upper = false)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => LdlDecomposition.Factor(input, upper);
+    {
+        if (typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
+        {
+            var (ld, pivots) = gpu.TryGpuLdlFactor((Tensor<float>)(object)input, upper);
+            if (ld is not null && pivots is not null) return ((Tensor<T>)(object)ld, pivots);
+        }
+        return LdlDecomposition.Factor(input, upper);
+    }
 
     /// <summary>LDL solve.</summary>
     public static Tensor<T> LdlSolve<T>(Tensor<T> ld, Tensor<int> pivots, Tensor<T> b, bool upper = false)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => LdlDecomposition.Solve(ld, pivots, b, upper);
+    {
+        if (typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
+        {
+            Tensor<float>? result = gpu.TryGpuLdlSolve(
+                (Tensor<float>)(object)ld, pivots, (Tensor<float>)(object)b, upper);
+            if (result is not null) return (Tensor<T>)(object)result;
+        }
+        return LdlDecomposition.Solve(ld, pivots, b, upper);
+    }
 
     /// <summary>Singular Value Decomposition — upgraded wrapper around <see cref="SvdDecomposition"/>.</summary>
     public static (Tensor<T> U, Tensor<T> S, Tensor<T> Vh) Svd<T>(Tensor<T> input, bool fullMatrices = true)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => SvdWrapper.Full(input, fullMatrices);
+    {
+        if (typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
+        {
+            var (u, s, vh) = gpu.TryGpuSvdReduced((Tensor<float>)(object)input, fullMatrices);
+            if (u is not null && s is not null && vh is not null)
+                return ((Tensor<T>)(object)u, (Tensor<T>)(object)s, (Tensor<T>)(object)vh);
+        }
+        return SvdWrapper.Full(input, fullMatrices);
+    }
 
     /// <summary>Singular values only.</summary>
     public static Tensor<T> SvdVals<T>(Tensor<T> input)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => SvdWrapper.ValuesOnly(input);
+    {
+        if (typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
+        {
+            var (_, singularValues, _) = gpu.TryGpuSvdReduced((Tensor<float>)(object)input, fullMatrices: false);
+            if (singularValues is not null) return (Tensor<T>)(object)singularValues;
+        }
+        return SvdWrapper.ValuesOnly(input);
+    }
 
     /// <summary>
     /// Randomized low-rank SVD via <paramref name="q"/> subspace iterations. Cheap
@@ -192,7 +234,54 @@ public static class Linalg
     public static (Tensor<T> U, Tensor<T> S, Tensor<T> Vh) SvdLowRank<T>(
         Tensor<T> input, int rank, int q = 2)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => SvdWrapper.LowRank(input, rank, q);
+    {
+        if (rank < 1) throw new ArgumentException("rank must be positive.", nameof(rank));
+        _ = q; // The established implementation also reserves q for future randomized iteration.
+        if (typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
+        {
+            var (fullU, fullS, fullVh) = gpu.TryGpuSvdReduced(
+                (Tensor<float>)(object)input, fullMatrices: false);
+            if (fullU is not null && fullS is not null && fullVh is not null)
+            {
+                var truncated = TruncateSvd4x4(fullU, fullS, fullVh, Math.Min(rank, 4));
+                return ((Tensor<T>)(object)truncated.U, (Tensor<T>)(object)truncated.S,
+                    (Tensor<T>)(object)truncated.Vh);
+            }
+        }
+        return SvdWrapper.LowRank(input, rank, q);
+    }
+
+    private static (Tensor<float> U, Tensor<float> S, Tensor<float> Vh) TruncateSvd4x4(
+        Tensor<float> fullU, Tensor<float> fullS, Tensor<float> fullVh, int k)
+    {
+        int rank = fullU.Rank;
+        int batch = 1;
+        for (int i = 0; i < rank - 2; i++) batch = checked(batch * fullU._shape[i]);
+        int[] uShape = (int[])fullU._shape.Clone();
+        int[] sShape = (int[])fullS._shape.Clone();
+        int[] vhShape = (int[])fullVh._shape.Clone();
+        uShape[rank - 1] = k;
+        sShape[sShape.Length - 1] = k;
+        vhShape[rank - 2] = k;
+        var u = new Tensor<float>(uShape);
+        var s = new Tensor<float>(sShape);
+        var vh = new Tensor<float>(vhShape);
+        float[] sourceU = fullU.GetDataArray(), sourceS = fullS.GetDataArray(),
+            sourceVh = fullVh.GetDataArray();
+        float[] targetU = u.GetDataArray(), targetS = s.GetDataArray(),
+            targetVh = vh.GetDataArray();
+        for (int b = 0; b < batch; b++)
+        {
+            for (int row = 0; row < 4; row++)
+            for (int col = 0; col < k; col++)
+                targetU[b * 4 * k + row * k + col] = sourceU[b * 16 + row * 4 + col];
+            for (int col = 0; col < k; col++) targetS[b * k + col] = sourceS[b * 4 + col];
+            for (int row = 0; row < k; row++)
+            for (int col = 0; col < 4; col++)
+                targetVh[b * k * 4 + row * 4 + col] = sourceVh[b * 16 + row * 4 + col];
+        }
+        return (u, s, vh);
+    }
 
     // ═══════════════════════════════════════════════════════════════════════
     // SOLVERS
@@ -202,7 +291,14 @@ public static class Linalg
     public static Tensor<T> Solve<T>(Tensor<T> a, Tensor<T> b)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
-        var result = LinearSolvers.Solve(a, b);
+        Tensor<T> result;
+        if (typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
+        {
+            var (direct, _) = gpu.TryGpuSolveVector(
+                (Tensor<float>)(object)a, (Tensor<float>)(object)b);
+            result = direct is null ? LinearSolvers.Solve(a, b) : (Tensor<T>)(object)direct;
+        }
+        else result = LinearSolvers.Solve(a, b);
         DifferentiableOps.RecordBinary("Linalg.Solve", result, a, b, LinalgBackward.SolveBackward<T>());
         return result;
     }
@@ -210,18 +306,59 @@ public static class Linalg
     /// <summary>Solve, returning the solution and an <c>info</c> flag per batch element.</summary>
     public static (Tensor<T> Solution, Tensor<int> Info) SolveEx<T>(Tensor<T> a, Tensor<T> b)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => LinearSolvers.SolveEx(a, b);
+    {
+        if (typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
+        {
+            var (solution, info) = gpu.TryGpuSolveVector(
+                (Tensor<float>)(object)a, (Tensor<float>)(object)b);
+            if (solution is not null && info is not null) return ((Tensor<T>)(object)solution, info);
+        }
+        return LinearSolvers.SolveEx(a, b);
+    }
 
     /// <summary>Solve a triangular system. <paramref name="upper"/> selects U or L.</summary>
     public static Tensor<T> SolveTriangular<T>(Tensor<T> a, Tensor<T> b, bool upper, bool unitDiagonal = false)
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => LinearSolvers.SolveTriangular(a, b, upper, unitDiagonal);
+    {
+        if (typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
+        {
+            Tensor<float>? solution = gpu.TryGpuTriangularSolveVector(
+                (Tensor<float>)(object)a, (Tensor<float>)(object)b, upper, unitDiagonal);
+            if (solution is not null) return (Tensor<T>)(object)solution;
+        }
+        return LinearSolvers.SolveTriangular(a, b, upper, unitDiagonal);
+    }
 
     /// <summary>Least-squares solve. <paramref name="driver"/> ∈ {"gels","gelsy","gelsd","gelss"}.</summary>
     public static (Tensor<T> Solution, Tensor<T> Residuals, Tensor<int> Rank, Tensor<T> SingularValues)
         Lstsq<T>(Tensor<T> a, Tensor<T> b, double? rcond = null, string driver = "gelsd")
         where T : unmanaged, IEquatable<T>, IComparable<T>
-        => LinearSolvers.Lstsq(a, b, rcond, driver);
+    {
+        if (driver != "gels" && driver != "gelsy" && driver != "gelsd" && driver != "gelss")
+            throw new ArgumentException($"Unknown Lstsq driver '{driver}'.", nameof(driver));
+        if (typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
+        {
+            var (solution, info) = gpu.TryGpuSolveVector(
+                (Tensor<float>)(object)a, (Tensor<float>)(object)b);
+            if (solution is not null && info is not null &&
+                Array.TrueForAll(info.GetDataArray(), value => value == 0))
+            {
+                var (_, r) = gpu.TryGpuQrReduced((Tensor<float>)(object)a, directOnly: true);
+                if (r is not null)
+                {
+                    var residuals = new Tensor<float>(new[] { 1 });
+                    var rankResult = new Tensor<int>(new[] { 1 });
+                    rankResult.GetDataArray()[0] = 4;
+                    var singularValues = new Tensor<float>(new[] { 4 });
+                    float[] rData = r.GetDataArray(), sData = singularValues.GetDataArray();
+                    for (int i = 0; i < 4; i++) sData[i] = Math.Abs(rData[i * 5]);
+                    return ((Tensor<T>)(object)solution, (Tensor<T>)(object)residuals,
+                        rankResult, (Tensor<T>)(object)singularValues);
+                }
+            }
+        }
+        return LinearSolvers.Lstsq(a, b, rcond, driver);
+    }
 
     // ═══════════════════════════════════════════════════════════════════════
     // INVERSES

@@ -93,6 +93,20 @@ internal static class LinalgBackward
             var B = inputs[1];
             var X = output;
 
+            if (typeof(T) == typeof(float) && B.Rank == A.Rank - 1 &&
+                AiDotNetEngine.Current is DirectGpuTensorEngine directGpu)
+            {
+                var (directGradA, directGradB) = directGpu.TryGpuSolveBackwardVector(
+                    (Tensor<float>)(object)A, (Tensor<float>)(object)X,
+                    (Tensor<float>)(object)gradOutput);
+                if (directGradA is not null && directGradB is not null)
+                {
+                    Accumulate(grads, A, (Tensor<T>)(object)directGradA);
+                    Accumulate(grads, B, (Tensor<T>)(object)directGradB);
+                    return;
+                }
+            }
+
             // Solve Aᵀ · gradB = gradX  (i.e. gradB = A⁻ᵀ · gradX).
             var AT = Transpose(A);
             var gradB = Linalg.Solve(AT, gradOutput);
@@ -143,6 +157,18 @@ internal static class LinalgBackward
             var A = inputs[0];
             var L = upper ? Transpose(output) : output;
             var gradL = upper ? Transpose(gradOutput) : gradOutput;
+
+            if (!upper && typeof(T) == typeof(float) &&
+                AiDotNetEngine.Current is DirectGpuTensorEngine directGpu)
+            {
+                Tensor<float>? direct = directGpu.TryGpuCholeskyBackwardLower(
+                    (Tensor<float>)(object)L, (Tensor<float>)(object)gradL);
+                if (direct is not null)
+                {
+                    Accumulate(grads, A, (Tensor<T>)(object)direct);
+                    return;
+                }
+            }
 
             // tmp = Lᵀ · gradL
             var LT = Transpose(L);

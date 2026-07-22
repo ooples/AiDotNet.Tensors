@@ -34,7 +34,9 @@ internal static class LuDecomposition
         int n = input.Shape[rank - 1];
         int k = Math.Min(m, n);
 
-        var (luPacked, pivots) = Factor(input);
+        // Route through the public packed-factor primitive so an eligible
+        // direct-PTX specialization is preserved when callers request P/L/U.
+        var (luPacked, pivots) = Linalg.LuFactor(input);
         int batch = BatchSize(input._shape, rank);
 
         var lShape = (int[])input._shape.Clone();
