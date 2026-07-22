@@ -34,6 +34,9 @@ internal static class DirectPtxDenseLinearCoverageManifest
     private const string TiledLinear =
         "general-M output-major register-blocked PTX tile (PtxFusedLinearTiledKernel) " +
         "with a fused activation epilogue; fails closed until GPU-validated and promoted";
+    private const string TiledGemmBias =
+        "standard-B register-blocked PTX tile (PtxFusedGemmBiasKernel) with a fused " +
+        "bias+activation epilogue; fails closed until GPU-validated and promoted";
 
     internal static IReadOnlyList<DirectPtxDenseLinearCoverageCell> All { get; } =
     [
@@ -44,18 +47,18 @@ internal static class DirectPtxDenseLinearCoverageManifest
         Cell("CudaBackend.BatchedGemm", "cuBLAS strided-batched SGEMM", "independent dense batches", "contiguous strided [batch,M,K]/[batch,K,N]", "FP32", "direct PTX strided-batched tile (PtxBatchedGemmKernel); fail-closed pending GPU validation", DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx),
         Cell("CudaBackend.BatchedGemmFanout", "cuBLAS batched pointer fanout", "one A with multiple B/C products", "contiguous A plus pointer-array B/C", "FP32", PlannedGemm),
         Cell("CudaBackend.BatchedGemmExFanout", "cuBLAS GemmEx pointer fanout", "mixed-precision fanout products", "contiguous A plus pointer-array B/C", "FP16/BF16/FP32", PlannedGemm),
-        Cell("CudaBackend.GemmFp16", "cuBLAS GemmEx", "FP16 inputs with FP32 output contract", Dense, "FP16->FP32", PlannedGemm),
+        Cell("CudaBackend.GemmFp16", "cuBLAS GemmEx", "FP16 inputs with FP32 output contract", Dense, "FP16->FP32", "direct PTX FP16-input FP32-accumulate tile (PtxGemmFp16Kernel); fail-closed pending GPU validation", DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx),
         Cell("CudaBackend.Hgemm", "cuBLAS Hgemm", "FP16 inputs and output", Dense, "FP16", PlannedGemm),
-        Cell("CudaBackend.GemmFp16In32fOut", "cuBLAS GemmEx", "FP16 multiply, FP32 accumulation/output", Dense, "FP16->FP32", PlannedGemm),
+        Cell("CudaBackend.GemmFp16In32fOut", "cuBLAS GemmEx", "FP16 multiply, FP32 accumulation/output", Dense, "FP16->FP32", "direct PTX FP16-input FP32-accumulate tile (PtxGemmFp16Kernel); fail-closed pending GPU validation", DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx),
         Cell("CudaBackend.GemmFp16HalfOut", "cuBLAS GemmEx", "FP16 multiply/accumulate mode and half output", Dense, "FP16", PlannedGemm),
         Cell("CudaBackend.MatMulBackwardFp16Fused", "two cuBLAS GemmEx operations", "dA=dC@B^T and dB=A^T@dC", "contiguous forward tensors and two gradients", "FP16/FP32 gradients", PlannedGemm),
-        Cell("CudaBackend.GemmBias", "cuBLAS SGEMM plus NVRTC bias", "A@B+bias", Dense + ", bias[N]", "FP32", PlannedLinear),
-        Cell("CudaBackend.GemmBiasRelu", "cuBLAS/NVRTC or cuBLASLt", "relu(A@B+bias)", Dense + ", bias[N]", "FP32", PlannedLinear),
-        Cell("CudaBackend.GemmBiasGelu", "cuBLAS/NVRTC or cuBLASLt", "gelu_tanh(A@B+bias)", Dense + ", bias[N]", "FP32", PlannedLinear),
-        Cell("CudaBackend.GemmBiasSigmoid", "cuBLAS plus NVRTC sigmoid", "sigmoid(A@B+bias)", Dense + ", bias[N]", "FP32", PlannedLinear),
-        Cell("CudaBackend.GemmBiasTanh", "cuBLAS plus NVRTC tanh", "tanh(A@B+bias)", Dense + ", bias[N]", "FP32", PlannedLinear),
-        Cell("CudaBackend.GemmBiasSwish", "cuBLAS plus NVRTC swish", "swish(A@B+bias)", Dense + ", bias[N]", "FP32", PlannedLinear),
-        Cell("CudaBackend.GemmBiasLeakyRelu", "cuBLAS plus NVRTC leaky-ReLU", "leaky_relu(A@B+bias)", Dense + ", bias[N]", "FP32", PlannedLinear),
+        Cell("CudaBackend.GemmBias", "cuBLAS SGEMM plus NVRTC bias", "A@B+bias", Dense + ", bias[N]", "FP32", TiledGemmBias, DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx),
+        Cell("CudaBackend.GemmBiasRelu", "cuBLAS/NVRTC or cuBLASLt", "relu(A@B+bias)", Dense + ", bias[N]", "FP32", TiledGemmBias, DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx),
+        Cell("CudaBackend.GemmBiasGelu", "cuBLAS/NVRTC or cuBLASLt", "gelu_tanh(A@B+bias)", Dense + ", bias[N]", "FP32", TiledGemmBias, DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx),
+        Cell("CudaBackend.GemmBiasSigmoid", "cuBLAS plus NVRTC sigmoid", "sigmoid(A@B+bias)", Dense + ", bias[N]", "FP32", TiledGemmBias, DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx),
+        Cell("CudaBackend.GemmBiasTanh", "cuBLAS plus NVRTC tanh", "tanh(A@B+bias)", Dense + ", bias[N]", "FP32", TiledGemmBias, DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx),
+        Cell("CudaBackend.GemmBiasSwish", "cuBLAS plus NVRTC swish", "swish(A@B+bias)", Dense + ", bias[N]", "FP32", TiledGemmBias, DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx),
+        Cell("CudaBackend.GemmBiasLeakyRelu", "cuBLAS plus NVRTC leaky-ReLU", "leaky_relu(A@B+bias)", Dense + ", bias[N]", "FP32", TiledGemmBias, DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx),
         Cell("CudaBackend.FusedLinearGELUTransposedM1", "direct PTX or MatMulTransposed+BiasAdd+Gelu", "gelu_tanh(x@transpose(W)+bias)", "x[K], W[N,K], bias/output[N]", "FP32", "v1 Ampere M=1 K/N=512/2048 is performance-qualified; 256/256 and 1024/4096 remain measured candidates", DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx),
         Cell("CudaBackend.FusedLinearReLU", "NVRTC fused linear kernel", "relu(input@weight+bias)", Dense + ", bias[N]", "FP32", TiledLinear, DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx),
         Cell("CudaBackend.FusedLinearSigmoid", "NVRTC fused linear kernel", "sigmoid(input@weight+bias)", Dense + ", bias[N]", "FP32", TiledLinear, DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx),
