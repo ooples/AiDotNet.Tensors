@@ -38,6 +38,13 @@ internal static class DirectPtxArchitecture
     /// </summary>
     internal static bool HasValidatedOnlineAttention(int major, int minor) =>
         (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The first QKV/RoPE/cache specialization is measured and promoted only
+    /// on GA102/SM86. Other Ampere variants remain independent tuning domains.
+    /// </summary>
+    internal static bool HasValidatedQkvRopeCache(int major, int minor) =>
+        (major, minor) == (8, 6);
 }
 
 internal enum DirectPtxExtentMode

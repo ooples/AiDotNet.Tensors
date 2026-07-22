@@ -22,7 +22,7 @@ one resident FP32 decode token [H*64]
 
 The declared buckets are `H in {4,8,16}`, cache capacity in
 `{16,32,64,128}`, D=64, and a baked position inside the selected capacity.
-The kernel is Ampere-only and disabled by default behind
+The kernel is GA102/SM86-only and disabled by default behind
 `AIDOTNET_DIRECT_PTX_QKV_ROPE_CACHE=1` (or the master direct-PTX gate).
 
 This increment is the reference assembly-line example, not closure of all of
@@ -93,7 +93,7 @@ lookup or launch:
 |---|---|
 | feature switch off | `qkv-rope-cache-feature-disabled` |
 | CUDA backend unavailable | `qkv-rope-cache-backend-unavailable` |
-| non-Ampere architecture | `qkv-rope-cache-architecture-not-implemented` |
+| architecture other than measured SM86 | `qkv-rope-cache-architecture-not-implemented` |
 | H outside `{4,8,16}` | `qkv-rope-cache-head-count-not-implemented` |
 | capacity outside `{16,32,64,128}` | `qkv-rope-cache-capacity-not-implemented` |
 | position outside `[0,capacity)` | `qkv-rope-cache-position-out-of-range` |

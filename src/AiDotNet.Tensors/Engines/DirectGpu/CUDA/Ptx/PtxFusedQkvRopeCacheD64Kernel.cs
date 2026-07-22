@@ -34,9 +34,10 @@ internal sealed class PtxFusedQkvRopeCacheD64Kernel : IDisposable
         int position)
     {
         ArgumentNullException.ThrowIfNull(runtime);
-        if (runtime.ArchitectureFamily != DirectPtxArchitectureFamily.Ampere)
+        if (!DirectPtxArchitecture.HasValidatedQkvRopeCache(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
-                "The checked-in fused QKV/RoPE/cache specialization is validated only on Ampere.");
+                "The checked-in fused QKV/RoPE/cache specialization is validated only on SM86.");
         ValidateShape(heads, cacheCapacity, position);
 
         Heads = heads;

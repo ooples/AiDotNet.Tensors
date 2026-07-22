@@ -1804,6 +1804,22 @@ public class DirectPtxWmmaTests
             PtxFusedQkvRopeCacheD64Kernel.EmitPtx(8, 6, 8, 24, 17));
     }
 
+    [Theory]
+    [InlineData(8, 6, true)]
+    [InlineData(8, 0, false)]
+    [InlineData(8, 7, false)]
+    [InlineData(8, 9, false)]
+    [InlineData(9, 0, false)]
+    [InlineData(10, 0, false)]
+    public void QkvRopeCacheArchitectureMatrix_FailsClosedOutsideSm86(
+        int major,
+        int minor,
+        bool expected)
+    {
+        Assert.Equal(expected,
+            DirectPtxArchitecture.HasValidatedQkvRopeCache(major, minor));
+    }
+
     [Fact]
     public void QkvRopeCacheCoverageManifest_AssignsEveryScopedApiExactlyOnce()
     {
@@ -1843,8 +1859,9 @@ public class DirectPtxWmmaTests
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
         using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(runtime.ArchitectureFamily == DirectPtxArchitectureFamily.Ampere,
-            "The checked-in QKV/RoPE/cache specialization is validated on Ampere.");
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedQkvRopeCache(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in QKV/RoPE/cache specialization is validated on SM86.");
         using var kernel = new PtxFusedQkvRopeCacheD64Kernel(
             runtime, heads, cacheCapacity, position);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);

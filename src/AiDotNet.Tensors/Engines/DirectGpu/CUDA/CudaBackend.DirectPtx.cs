@@ -78,7 +78,7 @@ public sealed partial class CudaBackend
 
     internal bool IsDirectPtxQkvRopeCacheEnabled =>
         DirectPtxFeatureGate.IsQkvRopeCacheEnabled && IsAvailable &&
-        DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) == DirectPtxArchitectureFamily.Ampere;
+        DirectPtxArchitecture.HasValidatedQkvRopeCache(_ccMajor, _ccMinor);
 
     internal long DirectPtxResidualRmsNormDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxResidualRmsNormDispatchCount);
@@ -265,8 +265,7 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "qkv-rope-cache-backend-unavailable";
             return false;
         }
-        if (DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) !=
-            DirectPtxArchitectureFamily.Ampere)
+        if (!DirectPtxArchitecture.HasValidatedQkvRopeCache(_ccMajor, _ccMinor))
         {
             DirectPtxLastError = "qkv-rope-cache-architecture-not-implemented";
             return false;
