@@ -16,7 +16,7 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
             DirectPtxSparseGraphCompletionLedger.All
                 .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(45, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+        Assert.Equal(47, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
             entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
         Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
         Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
@@ -475,6 +475,40 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal("single-overwrite", blueprint.Semantics["output-write"]);
         Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
         Assert.Equal("0", blueprint.Semantics["intermediate-global-bytes"]);
+    }
+
+    [Theory]
+    [InlineData((int)DirectPtxCapsuleProjectionOperation.Predictions,
+        (int)DirectPtxPhysicalLayout.CapsulePredictionWeights, 64)]
+    [InlineData((int)DirectPtxCapsuleProjectionOperation.Transform,
+        (int)DirectPtxPhysicalLayout.CapsuleTransformWeights, 640)]
+    public void CapsuleProjectionEmitter_UnrollsExactLayoutSpecificReduction(
+        int operationValue,
+        int weightLayoutValue,
+        int weightByteStride)
+    {
+        var operation = (DirectPtxCapsuleProjectionOperation)operationValue;
+        string ptx = PtxCapsuleProjectionF32Kernel.EmitPtx(8, 6, operation);
+        DirectPtxKernelBlueprint blueprint = PtxCapsuleProjectionF32Kernel.CreateBlueprint(
+            DirectPtxArchitectureFamily.Ampere, operation);
+
+        Assert.Equal(3, Count(ptx, ".param .u64"));
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(PtxCapsuleProjectionF32Kernel.InputDimension, Count(ptx, "fma.rn.f32"));
+        Assert.Equal(PtxCapsuleProjectionF32Kernel.InputDimension * 2, Count(ptx, "ld.global.f32"));
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.Contains($"[%rd6+{weightByteStride * 7}]", ptx, StringComparison.Ordinal);
+        Assert.Equal((DirectPtxPhysicalLayout)weightLayoutValue, blueprint.Tensors[1].Layout);
+        Assert.Equal(PtxCapsuleProjectionF32Kernel.InputElements,
+            blueprint.Tensors[0].PhysicalExtent.ElementCount);
+        Assert.Equal(PtxCapsuleProjectionF32Kernel.WeightElements,
+            blueprint.Tensors[1].PhysicalExtent.ElementCount);
+        Assert.Equal(PtxCapsuleProjectionF32Kernel.OutputElements,
+            blueprint.Tensors[2].PhysicalExtent.ElementCount);
+        Assert.All(blueprint.Tensors, tensor => Assert.Equal(DirectPtxExtentMode.Exact, tensor.ExtentMode));
+        Assert.Equal("fully-unrolled-ascending-input-dimension", blueprint.Semantics["reduction-order"]);
+        Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
     }
 
     [Theory]

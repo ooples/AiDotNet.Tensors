@@ -157,6 +157,12 @@ internal enum DirectPtxPhysicalLayout
     CapsulePredictions,
     /// <summary>Routed capsule vectors [batch,output-capsule,dimension].</summary>
     CapsuleOutput,
+    /// <summary>Capsule inputs [batch,input-capsule,input-dimension].</summary>
+    CapsuleInput,
+    /// <summary>Prediction weights [input-capsule,output-capsule,input-dimension,output-dimension].</summary>
+    CapsulePredictionWeights,
+    /// <summary>Transform weights [input-capsule,input-dimension,output-capsule,output-dimension].</summary>
+    CapsuleTransformWeights,
     /// <summary>Dense additive attention bias, [H,Sq,Skv] or [B,H,Sq,Skv].</summary>
     AttentionBias,
     /// <summary>One-dimensional canonical vector.</summary>
