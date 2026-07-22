@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 
@@ -77,7 +76,7 @@ internal sealed class DirectPtxKernelCache<TKey, TKernel> : IDisposable
 
     internal TKernel GetOrAdd(TKey key, Func<TKernel> factory)
     {
-        ArgumentNullException.ThrowIfNull(factory);
+        PtxCompat.ThrowIfNull(factory, nameof(factory));
         if (TryGetValue(key, out TKernel existing)) return existing;
         if (!HasRoomOrEvictableEntry())
             throw new InvalidOperationException(
@@ -93,7 +92,7 @@ internal sealed class DirectPtxKernelCache<TKey, TKernel> : IDisposable
     /// </summary>
     internal TKernel AddOrGetExisting(TKey key, TKernel created)
     {
-        ArgumentNullException.ThrowIfNull(created);
+        PtxCompat.ThrowIfNull(created, nameof(created));
         if (TryGetValue(key, out TKernel existing))
         {
             created.Dispose();
@@ -186,4 +185,3 @@ internal sealed class DirectPtxPlanCache<TKey, TValue> where TKey : notnull
         _lru.Clear();
     }
 }
-#endif

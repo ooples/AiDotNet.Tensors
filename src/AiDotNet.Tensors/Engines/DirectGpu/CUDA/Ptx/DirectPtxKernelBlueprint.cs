@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -248,7 +247,7 @@ internal sealed record DirectPtxKernelAudit(
         string jitInfoLog)
     {
         using SHA256 sha = SHA256.Create();
-        string hash = Convert.ToHexString(sha.ComputeHash(Encoding.UTF8.GetBytes(ptx))).ToLowerInvariant();
+        string hash = PtxCompat.ToHexString(sha.ComputeHash(Encoding.UTF8.GetBytes(ptx))).ToLowerInvariant();
         return new DirectPtxKernelAudit(
             blueprint.Id, deviceFingerprint, hash, function, blockThreads,
             activeBlocksPerMultiprocessor, jitInfoLog, DateTime.UtcNow);
@@ -276,7 +275,7 @@ internal sealed record DirectPtxProfilerEvidence(
 
     internal static DirectPtxProfilerEvidence FromNcuCsv(string path)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+        PtxCompat.ThrowIfNullOrWhiteSpace(path, nameof(path));
         var values = new Dictionary<string, long>(StringComparer.Ordinal);
         string[][] rows = File.ReadLines(path).Select(ParseCsvLine).ToArray();
 
@@ -366,7 +365,7 @@ internal sealed record DirectPtxProfilerEvidence(
 
     private static bool TryParseCounter(string value, out long result)
     {
-        string normalized = value.Trim().Replace(",", string.Empty, StringComparison.Ordinal);
+        string normalized = value.Trim().Replace(",", string.Empty);
         return long.TryParse(normalized, NumberStyles.Integer, CultureInfo.InvariantCulture, out result);
     }
 
@@ -385,4 +384,3 @@ internal sealed record DirectPtxProfilerEvidence(
         return result.ToArray();
     }
 }
-#endif
