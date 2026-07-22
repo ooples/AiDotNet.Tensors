@@ -47,6 +47,8 @@ public sealed partial class CudaBackend
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<SciPairwiseKey, PtxPairwiseDistanceKernel> _sciPairwise =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<SciCountKey, PtxQuantumMeasurementKernel> _sciQuantumMeasure =
+        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
 
     private long _sciDispatchCount;
     internal long DirectPtxScientificDispatchCount => System.Threading.Interlocked.Read(ref _sciDispatchCount);
@@ -204,6 +206,23 @@ public sealed partial class CudaBackend
             var k = _sciPairwise.GetOrAdd(new SciPairwiseKey(m, n, dim, squared),
                 () => new PtxPairwiseDistanceKernel(_directPtxRuntime!, m, n, dim, squared));
             Launch3(k.Blueprint, a, b, output, (va, vb, vo) => k.Launch(va, vb, vo));
+        });
+    }
+
+    internal bool TryDirectPtxQuantumMeasurement(
+        IGpuBuffer realPart, IGpuBuffer imagPart, IGpuBuffer probabilities, int batchSize, int stateSize)
+    {
+        long count = (long)batchSize * stateSize;
+        if (!ScientificGateOpen || count > int.MaxValue ||
+            !PtxQuantumMeasurementKernel.IsSupportedCount((int)count)) return Fail("quantum-measurement");
+        long bytes = checked(count * sizeof(float));
+        if (realPart.SizeInBytes != bytes || imagPart.SizeInBytes != bytes ||
+            probabilities.SizeInBytes != bytes) return Fail("quantum-measurement-extent");
+        return SciDispatch(() =>
+        {
+            var k = _sciQuantumMeasure.GetOrAdd(new SciCountKey((int)count),
+                () => new PtxQuantumMeasurementKernel(_directPtxRuntime!, (int)count));
+            Launch3(k.Blueprint, realPart, imagPart, probabilities, (vr, vi, vp) => k.Launch(vr, vi, vp));
         });
     }
 

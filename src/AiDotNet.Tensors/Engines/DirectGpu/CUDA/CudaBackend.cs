@@ -15259,6 +15259,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void QuantumMeasurement(IGpuBuffer realPart, IGpuBuffer imagPart, IGpuBuffer probabilities, int batchSize, int stateSize)
     {
+        if (TryDirectPtxQuantumMeasurement(realPart, imagPart, probabilities, batchSize, stateSize)) return;
+
         if (!_kernelCache.TryGetValue("quantum_measurement", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: quantum_measurement");
 

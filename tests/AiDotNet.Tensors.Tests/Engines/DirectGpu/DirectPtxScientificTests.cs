@@ -14,11 +14,12 @@ public class DirectPtxScientificTests
     [Fact]
     public void ScientificCoverageManifest_AssignsEveryScopedApiExactlyOnce()
     {
-        Assert.Equal(13, DirectPtxScientificCoverageManifest.All.Count);
+        Assert.Equal(14, DirectPtxScientificCoverageManifest.All.Count);
         string[] names = DirectPtxScientificCoverageManifest.All.Select(c => c.Api).ToArray();
         Assert.Contains("CudaBackend.RbfForward", names);
         Assert.Contains("CudaBackend.PairwiseDistance", names);
         Assert.Contains("CudaBackend.PairwiseDistanceSquared", names);
+        Assert.Contains("CudaBackend.QuantumMeasurement", names);
         Assert.Equal(names.Length, names.Distinct(StringComparer.Ordinal).Count());
         Assert.All(DirectPtxScientificCoverageManifest.All, cell =>
         {
@@ -401,6 +402,56 @@ public class DirectPtxScientificTests
         var actual = new float[expected.Length];
         output.Download<float>(actual);
         AssertVectorClose(actual, expected, 2e-3f, squared ? "pairwise distance squared" : "pairwise distance");
+    }
+
+    [Fact]
+    public void QuantumMeasurementEmitter_IsMagnitudeSquared()
+    {
+        string ptx = PtxQuantumMeasurementKernel.EmitPtx(8, 6, 16384);
+        Assert.Contains(PtxQuantumMeasurementKernel.EntryPoint, ptx);
+        Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));    // re + im
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.Equal(1, Count(ptx, "mul.rn.f32"));           // re*re
+        Assert.Equal(1, Count(ptx, "fma.rn.f32"));           // + im*im
+        Assert.Equal(0, Count(ptx, "sqrt.rn.f32"));          // squared magnitude, no sqrt
+        Assert.Equal(0, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxQuantumMeasurementKernel.IsSupportedCount(16384));
+        Assert.False(PtxQuantumMeasurementKernel.IsPromotedCount(16384));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyQuantumMeasurement_MatchesOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in quantum-measurement specialization is measured on GA10x/SM86.");
+        const int count = 16384;   // batchSize*stateSize
+        using var kernel = new PtxQuantumMeasurementKernel(runtime, count);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20267300);
+        float[] reHost = Values(random, count, 2.0f);
+        float[] imHost = Values(random, count, 2.0f);
+        var expected = new float[count];
+        for (int i = 0; i < count; i++) expected[i] = reHost[i] * reHost[i] + imHost[i] * imHost[i];
+
+        using var re = runtime.AllocateBytes((nuint)(count * sizeof(float)));
+        using var im = runtime.AllocateBytes((nuint)(count * sizeof(float)));
+        using var prob = runtime.AllocateBytes((nuint)(count * sizeof(float)));
+        re.Upload<float>(reHost);
+        im.Upload<float>(imHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(re, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(im, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(prob, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[count];
+        prob.Download<float>(actual);
+        AssertVectorClose(actual, expected, 2e-3f, "quantum measurement");
     }
 
     [Fact]
@@ -903,6 +954,14 @@ public class DirectPtxScientificTests
             { backend.PairwiseDistance(ab, bb, o, pdM, pdN, pdDim); n = AssertDispatched(n, "pairwise-distance"); AssertVectorClose(backend.DownloadBuffer(o), pdL2Exp, 2e-3f, "pairwise-distance route"); }
             using (var ab = backend.AllocateBuffer(pdA)) using (var bb = backend.AllocateBuffer(pdB)) using (var o = backend.AllocateBuffer(pdM * pdN))
             { backend.PairwiseDistanceSquared(ab, bb, o, pdM, pdN, pdDim); n = AssertDispatched(n, "pairwise-distance-squared"); AssertVectorClose(backend.DownloadBuffer(o), pdSqExp, 2e-3f, "pairwise-distance-squared route"); }
+
+            // Quantum measurement: |amplitude|^2 (unnormalized). count = batch*state = 16384.
+            const int qmBatch = 128, qmState = 128;
+            float[] qmRe = Values(random, qmBatch * qmState, 2.0f), qmIm = Values(random, qmBatch * qmState, 2.0f);
+            var qmExp = new float[qmBatch * qmState];
+            for (int i = 0; i < qmExp.Length; i++) qmExp[i] = qmRe[i] * qmRe[i] + qmIm[i] * qmIm[i];
+            using (var rb = backend.AllocateBuffer(qmRe)) using (var ib = backend.AllocateBuffer(qmIm)) using (var o = backend.AllocateBuffer(qmBatch * qmState))
+            { backend.QuantumMeasurement(rb, ib, o, qmBatch, qmState); n = AssertDispatched(n, "quantum-measurement"); AssertVectorClose(backend.DownloadBuffer(o), qmExp, 2e-3f, "quantum-measurement route"); }
         }
         finally
         {
