@@ -918,4 +918,157 @@ public sealed partial class CudaBackend
         return _directPtxConvBwdInputKernels.GetOrAdd(
             1, () => new PtxConv2DNchwK1BackwardInputF32Kernel(runtime));
     }
+
+    private readonly DirectPtxKernelCache<int, PtxConv2DNchwK1BackwardWeightF32Kernel>
+        _directPtxConvBwdWeightKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private long _directPtxConvBwdWeightDispatchCount;
+
+    internal long DirectPtxConvBwdWeightDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxConvBwdWeightDispatchCount);
+
+    /// <summary>
+    /// Attempts the exact FP32 NCHW 1x1 convolution backward-weight gradient
+    /// experiment (dW[k,c] = sum_{y,x} dOut[k,y,x] * in[c,y,x]). Fails closed on any
+    /// unsupported contract so the caller runs the established composition.
+    /// </summary>
+    internal bool TryDirectPtxConv2DBackwardWeight(
+        IGpuBuffer gradOutput,
+        IGpuBuffer input,
+        IGpuBuffer gradWeight,
+        DirectPtxConvolutionShape shape)
+    {
+        if (!_directPtxConvolutionOptedIn)
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.FeatureDisabled;
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.BackendUnavailable;
+            return false;
+        }
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.ArchitectureNotImplemented;
+            return false;
+        }
+        if (shape != PtxConv2DNchwK1BackwardWeightF32Kernel.Shape)
+        {
+            DirectPtxLastError = "conv-bwd-weight-shape-not-implemented";
+            return false;
+        }
+        if (gradOutput is null || input is null || gradWeight is null)
+        {
+            DirectPtxLastError = "conv-bwd-weight-null-buffer";
+            return false;
+        }
+        if (gradOutput.SizeInBytes != PtxConv2DNchwK1BackwardWeightF32Kernel.GradOutputBytes ||
+            input.SizeInBytes != PtxConv2DNchwK1BackwardWeightF32Kernel.InputBytes ||
+            gradWeight.SizeInBytes != PtxConv2DNchwK1BackwardWeightF32Kernel.GradWeightBytes)
+        {
+            DirectPtxLastError = "conv-bwd-weight-exact-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            const int key = 1;
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxConvBwdWeightKernels.TryGetValue(key, out _))
+                {
+                    DirectPtxLastError =
+                        "Direct PTX conv backward-weight must be prewarmed before CUDA graph capture.";
+                    return false;
+                }
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxConv2DNchwK1BackwardWeightF32Kernel kernel = GetOrCreateDirectPtxConvBwdWeightKernel();
+                if (capturing && !_directPtxConvBwdWeightKernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX conv backward-weight module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(gradOutput, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(gradWeight, kernel.Blueprint.Tensors[2]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxConvBwdWeightDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool PrewarmDirectPtxConv2DBackwardWeight()
+    {
+        if (!_directPtxConvolutionOptedIn)
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.FeatureDisabled;
+            return false;
+        }
+        if (!IsAvailable || !DirectPtxArchitecture.HasExperimentalConvolution(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.ArchitectureNotImplemented;
+            return false;
+        }
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX conv backward-weight prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _ = GetOrCreateDirectPtxConvBwdWeightKernel();
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxConvBwdWeightAudit(out DirectPtxKernelAudit? audit)
+    {
+        lock (_directPtxLock)
+        {
+            if (_directPtxConvBwdWeightKernels.TryGetValue(1, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null;
+        return false;
+    }
+
+    private PtxConv2DNchwK1BackwardWeightF32Kernel GetOrCreateDirectPtxConvBwdWeightKernel()
+    {
+        if (_directPtxConvBwdWeightKernels.TryGetValue(
+                1, out PtxConv2DNchwK1BackwardWeightF32Kernel? existing))
+            return existing;
+        return CreateAndCacheDirectPtxConvBwdWeightKernelSlow();
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxConv2DNchwK1BackwardWeightF32Kernel CreateAndCacheDirectPtxConvBwdWeightKernelSlow()
+    {
+        DirectPtxRuntime runtime = _directPtxRuntime ??
+            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+        return _directPtxConvBwdWeightKernels.GetOrAdd(
+            1, () => new PtxConv2DNchwK1BackwardWeightF32Kernel(runtime));
+    }
 }
