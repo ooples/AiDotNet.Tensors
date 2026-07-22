@@ -149,7 +149,8 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "vision-box-iou-invalid-device-pointer";
             return false;
         }
-        if ((((nuint)boxesA.Handle | (nuint)boxesB.Handle | (nuint)output.Handle) & 15u) != 0)
+        if (((PtxCompat.ToNuint(boxesA.Handle) | PtxCompat.ToNuint(boxesB.Handle) |
+              PtxCompat.ToNuint(output.Handle)) & 15u) != 0)
         {
             DirectPtxLastError = "vision-box-iou-alignment-mismatch";
             return false;
@@ -267,8 +268,8 @@ public sealed partial class CudaBackend
 
     private static bool Overlaps(IGpuBuffer left, IGpuBuffer right)
     {
-        nuint leftStart = (nuint)left.Handle;
-        nuint rightStart = (nuint)right.Handle;
+        nuint leftStart = PtxCompat.ToNuint(left.Handle);
+        nuint rightStart = PtxCompat.ToNuint(right.Handle);
         nuint leftEnd = checked(leftStart + (nuint)left.SizeInBytes);
         nuint rightEnd = checked(rightStart + (nuint)right.SizeInBytes);
         return leftStart < rightEnd && rightStart < leftEnd;

@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
@@ -287,7 +286,9 @@ public sealed partial class CudaBackend : IDirectPtxVisionBackend
         if (!DirectPtxFeatureGate.IsVisionOperationEnabled(specA.Operation) ||
             !DirectPtxFeatureGate.IsVisionOperationEnabled(specB.Operation))
         {
-            DirectPtxLastError = DirectPtxVisionDisabledReasons[(int)specA.Operation];
+            DirectPtxLastError = !DirectPtxFeatureGate.IsVisionOperationEnabled(specA.Operation)
+                ? DirectPtxVisionDisabledReasons[(int)specA.Operation]
+                : DirectPtxVisionDisabledReasons[(int)specB.Operation];
             return false;
         }
         if (!IsAvailable ||
@@ -355,19 +356,44 @@ public sealed partial class CudaBackend : IDirectPtxVisionBackend
 
     bool IDirectPtxVisionBackend.CanDirectPtxMeshgrid2D(int n0, int n1, bool xy)
     {
-        if (!IsAvailable ||
-            !DirectPtxArchitecture.HasValidatedVisionBoxIou(_ccMajor, _ccMinor) ||
-            !DirectPtxFeatureGate.IsVisionOperationEnabled(
-                DirectPtxVisionOperation.Meshgrid2D) ||
-            !DirectPtxVisionSpecializations.TryMeshgrid2D(
+        const DirectPtxVisionOperation operation = DirectPtxVisionOperation.Meshgrid2D;
+        if (!DirectPtxFeatureGate.IsVisionOperationEnabled(operation))
+        {
+            DirectPtxLastError = DirectPtxVisionDisabledReasons[(int)operation];
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = DirectPtxVisionUnavailableReasons[(int)operation];
+            return false;
+        }
+        if (!DirectPtxArchitecture.HasValidatedVisionBoxIou(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = DirectPtxVisionArchitectureReasons[(int)operation];
+            return false;
+        }
+        if (!DirectPtxVisionSpecializations.TryMeshgrid2D(
                 n0, n1, 0, xy, out DirectPtxVisionSpec spec0) ||
             !DirectPtxVisionSpecializations.TryMeshgrid2D(
                 n0, n1, 1, xy, out DirectPtxVisionSpec spec1))
+        {
+            DirectPtxLastError = DirectPtxVisionNotAdmittedReasons[(int)operation];
             return false;
-        if (!IsStreamCapturing()) return true;
+        }
+        if (!IsStreamCapturing())
+        {
+            DirectPtxLastError = null;
+            return true;
+        }
         lock (_directPtxLock)
-            return _directPtxVisionKernels.TryGetValue(spec0, out _) &&
+        {
+            bool prewarmed = _directPtxVisionKernels.TryGetValue(spec0, out _) &&
                 _directPtxVisionKernels.TryGetValue(spec1, out _);
+            DirectPtxLastError = prewarmed
+                ? null
+                : "vision-Meshgrid2D-capture-requires-prewarm";
+            return prewarmed;
+        }
     }
 
     bool IDirectPtxVisionBackend.TryDirectPtxMeshgrid2DPair(
@@ -462,9 +488,21 @@ public sealed partial class CudaBackend : IDirectPtxVisionBackend
                 DirectPtxVisionNotAdmittedReasons, spec.Operation);
             return false;
         }
-        if (!DirectPtxFeatureGate.IsVisionOperationEnabled(spec.Operation) || !IsAvailable ||
-            !DirectPtxArchitecture.HasValidatedVisionBoxIou(_ccMajor, _ccMinor))
+        if (!DirectPtxFeatureGate.IsVisionOperationEnabled(spec.Operation))
+        {
+            DirectPtxLastError = DirectPtxVisionDisabledReasons[(int)spec.Operation];
             return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = DirectPtxVisionUnavailableReasons[(int)spec.Operation];
+            return false;
+        }
+        if (!DirectPtxArchitecture.HasValidatedVisionBoxIou(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = DirectPtxVisionArchitectureReasons[(int)spec.Operation];
+            return false;
+        }
         try
         {
             if (IsStreamCapturing())
@@ -533,4 +571,3 @@ public sealed partial class CudaBackend : IDirectPtxVisionBackend
             : "vision-unknown-specialization-not-admitted";
     }
 }
-#endif

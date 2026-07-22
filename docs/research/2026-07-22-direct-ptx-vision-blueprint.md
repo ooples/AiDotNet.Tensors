@@ -29,6 +29,11 @@ No winner or zero-spill result is claimed before those artifacts exist.
 `DirectPtxVisionCoverageManifest` contains only implemented and routed #851
 cells. It contains no planned or fallback-only row.
 
+The production emitters, feature gates, cache, and routes compile on every
+repository target, including `net471`, through the shared `PtxCompat` layer.
+The resident evidence runners remain `net10.0` tools so their environment and
+measurement APIs are identical across clean runs.
+
 ## Architecture and specialization matrix
 
 Only GA102/SM86 is admitted. SM80, Ada, Hopper, Blackwell, unknown devices,
@@ -70,6 +75,17 @@ never performs a dynamic stride/layout check.
 Output storage may not overlap any input. Read-only box inputs may alias, which
 is required by standalone self-pairwise IoU. NMS `suppressed` is the sole
 read/write contract and must be zeroed by the caller before a fresh operation.
+No contract admits physical padding: logical extent equals physical extent and
+the allocation must end exactly at `byteOffset + RequiredBytes`.
+
+All base pointers and vector rows are 16-byte aligned. Pairwise/area/conversion
+threads load one adjacent `v4.f32` box row; consecutive lanes write consecutive
+output cells, so output stores coalesce. Cross and meshgrid likewise map lanes
+to consecutive scalar outputs. Masks walk each dense row in ascending address
+order. ROI feature reads and the single-controller NMS selection are inherently
+data-dependent and are not falsely labeled coalesced; their output stores are
+contiguous. Version 1 declares no shared storage, so shared-bank conflicts and
+semantic bank padding are not applicable rather than assumed away.
 
 ## Fused dataflow and global traffic
 
@@ -120,6 +136,10 @@ Backend disposal unloads both vision caches and the shared runtime. Normal
 disabled fallback uses precomputed reason strings and adds no per-call managed
 allocation.
 
+The repository-wide `PtxParityRegistry` classifies both vision module types,
+and `CudaToPtxTransferLedger` records each replaced CUDA/NVRTC kernel as
+in-progress. None is marked promoted while the hardware evidence is pending.
+
 Version 1 has one block geometry per exact specialization, so it has no honest
 runtime tuning choice and performs no timing-based autotuning. The closed
 admission table is the deterministic plan set; competing geometries must be
@@ -134,9 +154,13 @@ the Nsight workflow below can supply that proof.
 
 All methods use precreated tensors on one NVIDIA GPU and exclude host/device
 transfer. The C# family runner compares direct PTX, direct graph replay,
-current AiDotNet NVRTC, and current AiDotNet graph replay. The separate Python
-runner covers eligible torchvision/PyTorch implementations without mixing
-framework contexts. CPU, MKL, and OpenBLAS are excluded.
+current AiDotNet NVRTC, and current AiDotNet graph replay. Before timing, it
+also compares both NVIDIA outputs to the FP64 `CpuEngine` oracle for every
+publicly expressible operation. The backend-only aligned-loss backwards report
+the established analytical CUDA route as their independent reference. The
+separate Python runner covers eligible torchvision/PyTorch implementations and
+checks each result against an untimed FP64 CPU oracle without mixing framework
+contexts. CPU, MKL, and OpenBLAS performance results are excluded.
 
 Each cell uses 30 warmups, 101 samples, 25 launches per CUDA-event sample, and
 three independent runs. JSON records device and E2E mean/median/P95/P99,

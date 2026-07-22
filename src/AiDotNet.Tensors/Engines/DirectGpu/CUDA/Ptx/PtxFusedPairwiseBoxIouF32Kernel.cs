@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 using System.Text;
@@ -33,7 +32,7 @@ internal sealed class PtxFusedPairwiseBoxIouF32Kernel : IDisposable
 
     internal PtxFusedPairwiseBoxIouF32Kernel(DirectPtxRuntime runtime, int n, int m)
     {
-        ArgumentNullException.ThrowIfNull(runtime);
+        PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         if (!IsSupportedShape(n, m))
             throw new NotSupportedException($"Pairwise BoxIoU shape [{n},{m}] is not emitted.");
         if (!DirectPtxArchitecture.HasValidatedVisionBoxIou(
@@ -135,8 +134,8 @@ internal sealed class PtxFusedPairwiseBoxIouF32Kernel : IDisposable
 
     private static bool RangesOverlap(DirectPtxTensorView left, DirectPtxTensorView right)
     {
-        nuint leftStart = (nuint)left.Pointer;
-        nuint rightStart = (nuint)right.Pointer;
+        nuint leftStart = PtxCompat.ToNuint(left.Pointer);
+        nuint rightStart = PtxCompat.ToNuint(right.Pointer);
         nuint leftEnd = checked(leftStart + left.ByteLength);
         nuint rightEnd = checked(rightStart + right.ByteLength);
         return leftStart < rightEnd && rightStart < leftEnd;
@@ -215,4 +214,3 @@ internal sealed class PtxFusedPairwiseBoxIouF32Kernel : IDisposable
         return ptx.ToString();
     }
 }
-#endif

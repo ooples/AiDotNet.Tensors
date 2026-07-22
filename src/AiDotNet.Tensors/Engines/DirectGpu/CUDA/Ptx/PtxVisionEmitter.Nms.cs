@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
@@ -12,8 +11,8 @@ internal static partial class PtxVisionEmitter
         int length = spec.D0;
         RequireOneOf(length, nameof(length), 256, 1024);
         bool batched = (spec.Flags & 1) != 0;
-        float threshold = BitConverter.Int32BitsToSingle(spec.ScalarBits);
-        if (!float.IsFinite(threshold) || threshold < 0 || threshold > 1)
+        float threshold = PtxCompat.Int32BitsToSingle(spec.ScalarBits);
+        if (!PtxCompat.IsFinite(threshold) || threshold < 0 || threshold > 1)
             throw new ArgumentOutOfRangeException(nameof(spec), "NMS threshold must be in [0,1].");
         var ptx = Begin(spec, ccMajor, ccMinor,
             "boxes", "scores", "class_ids", "suppressed", "output", "output_count");
@@ -28,7 +27,7 @@ internal static partial class PtxVisionEmitter
         ptx.AppendLine($"    setp.ge.u32 %p2, %r6, {length}; @%p2 bra NMS_FOUND;");
         ptx.AppendLine("    mul.wide.u32 %rd6, %r6, 4; add.u64 %rd7, %rd3, %rd6; ld.global.f32 %f1, [%rd7]; setp.ne.f32 %p3, %f1, 0f00000000; @%p3 bra NMS_FIND_NEXT;");
         ptx.AppendLine("    add.u64 %rd8, %rd1, %rd6; ld.global.f32 %f2, [%rd8]; setp.lt.s32 %p4, %r5, 0; @%p4 bra NMS_SELECT;");
-        ptx.AppendLine("    testp.nan.f32 %p5, %f2; @%p5 bra NMS_FIND_NEXT; testp.nan.f32 %p6, %f0; @%p6 bra NMS_SELECT;");
+        ptx.AppendLine("    testp.notanumber.f32 %p5, %f2; @%p5 bra NMS_FIND_NEXT; testp.notanumber.f32 %p6, %f0; @%p6 bra NMS_SELECT;");
         ptx.AppendLine("    setp.gt.f32 %p7, %f2, %f0; @%p7 bra NMS_SELECT; setp.ne.f32 %p8, %f2, %f0; @%p8 bra NMS_FIND_NEXT; setp.lt.u32 %p9, %r6, %r5; @!%p9 bra NMS_FIND_NEXT;");
         ptx.AppendLine("NMS_SELECT: mov.u32 %r5, %r6; mov.f32 %f0, %f2;");
         ptx.AppendLine("NMS_FIND_NEXT: add.u32 %r6, %r6, 1; bra NMS_FIND;");
@@ -72,4 +71,3 @@ internal static partial class PtxVisionEmitter
             code, 1, maxRegisters: 48, minBlocksPerSm: 1);
     }
 }
-#endif

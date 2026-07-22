@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
@@ -51,4 +50,3 @@ internal static partial class PtxVisionEmitter
             Finish(ptx), total, maxRegisters: 12, minBlocksPerSm: 4);
     }
 }
-#endif

@@ -81,6 +81,17 @@ public static class PtxParityRegistry
         new PtxParitySpec("PtxFusedQkvRopeCacheD64Kernel", PtxParityStatus.Deferred,
             "fused QKV + RoPE + KV-cache write (#858)",
             "multi-output (Q + K/V cache) with baked RoPE tables; needs a dedicated QKV/RoPE/cache oracle."),
+
+        new PtxParitySpec("PtxFusedPairwiseBoxIouF32Kernel", PtxParityStatus.Deferred,
+            "pairwise BoxIoU (#851)",
+            "the dedicated SM86 test and benchmark harness compare direct PTX and the established CUDA route " +
+            "against an fp64 oracle, but the driver-only matrix cannot run on CPU-only CI; retain the explicit " +
+            "deferral until resident-GPU evidence is attached."),
+        new PtxParitySpec("PtxVisionKernel", PtxParityStatus.Deferred,
+            "vision/detection/ROI/geometry specialization family (#851)",
+            "all 120 closed specializations pass static ABI/emitter validation and have driver-only direct-PTX " +
+            "versus established-CUDA checks; the operation-specific fp64 resident-GPU oracle matrix remains " +
+            "deferred until the required SM86 hardware run."),
     };
 
     private static readonly Dictionary<string, PtxParitySpec> ByKernel =

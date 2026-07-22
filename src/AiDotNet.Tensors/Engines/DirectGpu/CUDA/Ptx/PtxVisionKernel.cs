@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
@@ -73,7 +72,7 @@ internal sealed class PtxVisionKernel : IDisposable
 
     internal PtxVisionKernel(DirectPtxRuntime runtime, DirectPtxVisionSpec spec)
     {
-        ArgumentNullException.ThrowIfNull(runtime);
+        PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         if (!DirectPtxArchitecture.HasValidatedVisionBoxIou(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new NotSupportedException(
@@ -147,7 +146,7 @@ internal sealed class PtxVisionKernel : IDisposable
         DirectPtxKernelBlueprint blueprint,
         ReadOnlySpan<DirectPtxTensorView> views)
     {
-        ArgumentNullException.ThrowIfNull(blueprint);
+        PtxCompat.ThrowIfNull(blueprint, nameof(blueprint));
         if (views.Length != blueprint.Tensors.Count)
             throw new ArgumentException(
                 $"Vision PTX ABI expects {blueprint.Tensors.Count} tensors; got {views.Length}.",
@@ -180,8 +179,8 @@ internal sealed class PtxVisionKernel : IDisposable
             if ((blueprint.Tensors[i].Access & DirectPtxTensorAccess.Write) == 0 &&
                 (blueprint.Tensors[j].Access & DirectPtxTensorAccess.Write) == 0)
                 continue;
-            nuint left = (nuint)views[i].Pointer;
-            nuint right = (nuint)views[j].Pointer;
+            nuint left = PtxCompat.ToNuint(views[i].Pointer);
+            nuint right = PtxCompat.ToNuint(views[j].Pointer);
             if (left < checked(right + views[j].ByteLength) &&
                 right < checked(left + views[i].ByteLength))
                 throw new ArgumentException(
@@ -191,4 +190,3 @@ internal sealed class PtxVisionKernel : IDisposable
 
     public void Dispose() => _module.Dispose();
 }
-#endif

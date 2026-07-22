@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Text;
 
@@ -14,7 +13,7 @@ internal static partial class PtxVisionEmitter
         int k = spec.D4, outH = spec.D5, outW = spec.D6, outputChannels = spec.D7;
         int sampling = spec.Flags & 0xff;
         bool aligned = (spec.Flags & 0x100) != 0;
-        float spatialScale = BitConverter.Int32BitsToSingle(spec.ScalarBits);
+        float spatialScale = PtxCompat.Int32BitsToSingle(spec.ScalarBits);
         bool positionSensitive = spec.Operation is DirectPtxVisionOperation.PsRoiAlign or
             DirectPtxVisionOperation.PsRoiPool;
         bool align = spec.Operation is DirectPtxVisionOperation.RoiAlign or
@@ -26,7 +25,7 @@ internal static partial class PtxVisionEmitter
             throw new NotSupportedException("Position-sensitive RoI specialization is not emitted.");
         if (align && sampling != 2)
             throw new NotSupportedException("The first RoIAlign specialization bakes samplingRatio=2.");
-        if (!float.IsFinite(spatialScale) || spatialScale <= 0)
+        if (!PtxCompat.IsFinite(spatialScale) || spatialScale <= 0)
             throw new ArgumentOutOfRangeException(nameof(spec), "Spatial scale must be finite and positive.");
 
         int outputC = positionSensitive ? outputChannels : c;
@@ -160,4 +159,3 @@ internal static partial class PtxVisionEmitter
         ptx.AppendLine(done + ":");
     }
 }
-#endif

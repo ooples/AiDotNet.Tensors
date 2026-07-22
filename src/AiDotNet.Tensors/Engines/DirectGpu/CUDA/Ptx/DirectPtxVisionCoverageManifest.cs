@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 
@@ -127,11 +126,10 @@ internal static class DirectPtxVisionCoverageManifest
 
     internal static DirectPtxVisionCoverageCell Get(string api)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(api);
+        PtxCompat.ThrowIfNullOrWhiteSpace(api, nameof(api));
         foreach (DirectPtxVisionCoverageCell cell in All)
             if (string.Equals(cell.Api, api, StringComparison.Ordinal)) return cell;
         throw new KeyNotFoundException(
             $"Vision API '{api}' is not assigned in the #851 coverage manifest.");
     }
 }
-#endif

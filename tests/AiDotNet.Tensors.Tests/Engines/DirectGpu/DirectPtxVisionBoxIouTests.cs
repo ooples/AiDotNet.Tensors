@@ -138,6 +138,7 @@ public sealed class DirectPtxVisionBoxIouTests
         Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("nvrtc", ptx, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("setp.ge.u32", ptx, StringComparison.Ordinal);
+        AssertPtxRegisterAndLabelClosure(ptx);
     }
 
     [Fact]
@@ -235,6 +236,13 @@ public sealed class DirectPtxVisionBoxIouTests
                 ScalarBits: BitConverter.SingleToInt32Bits(0.5f)),
             DirectPtxArchitectureFamily.Ampere, 8, 6);
         Assert.Equal(new DirectPtxExtent(1), plainNms.Blueprint.Tensors[2].LogicalExtent);
+        Assert.Contains("testp.notanumber.f32", plainNms.Ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("testp.nan.f32", plainNms.Ptx, StringComparison.Ordinal);
+
+        DirectPtxVisionDefinition masksToBoxes = PtxVisionEmitter.Emit(
+            new(DirectPtxVisionOperation.MasksToBoxes, 256, 28, 28),
+            DirectPtxArchitectureFamily.Ampere, 8, 6);
+        Assert.Equal(40, masksToBoxes.Blueprint.ResourceBudget.MaxRegistersPerThread);
 
         DirectPtxVisionDefinition roiPool = PtxVisionEmitter.Emit(
             new(DirectPtxVisionOperation.RoiPool,
@@ -373,7 +381,7 @@ public sealed class DirectPtxVisionBoxIouTests
     [Fact]
     public void CoverageManifest_AssignsOnlyImplementedDirectPtxCells()
     {
-        Assert.True(DirectPtxVisionCoverageManifest.All.Count >= 25);
+        Assert.Equal(29, DirectPtxVisionCoverageManifest.All.Count);
         Assert.Equal(
             DirectPtxVisionCoverageManifest.All.Count,
             DirectPtxVisionCoverageManifest.All.Select(cell => cell.Api).Distinct(StringComparer.Ordinal).Count());

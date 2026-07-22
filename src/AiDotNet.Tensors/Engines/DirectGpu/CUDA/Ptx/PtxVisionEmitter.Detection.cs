@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Text;
 
@@ -369,4 +368,3 @@ internal static partial class PtxVisionEmitter
         if (negative) ptx.AppendLine($"    neg.f32 {result}, {result};");
     }
 }
-#endif

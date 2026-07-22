@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
@@ -74,7 +73,6 @@ internal static partial class PtxVisionEmitter
                 Tensor("masks", DirectPtxPhysicalLayout.RowMajor3D, new(n, h, w), DirectPtxTensorAccess.Read),
                 Tensor("boxes", DirectPtxPhysicalLayout.BoxXyxy, new(n, 4), DirectPtxTensorAccess.Write)
             ], Semantics(("empty-mask", "zero box"), ("predicate", "nonzero")),
-            Finish(ptx), n, maxRegisters: 32, minBlocksPerSm: 2);
+            Finish(ptx), n, maxRegisters: 40, minBlocksPerSm: 2);
     }
 }
-#endif

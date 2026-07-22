@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
@@ -37,7 +36,7 @@ internal static class DirectPtxVisionSpecializations
                 requested.Operation == DirectPtxVisionOperation.IouFamilyBackwardA,
                 requested.D0, requested.D1, requested.D2, out canonical),
             DirectPtxVisionOperation.Nms => TryNms(
-                requested.D0, BitConverter.Int32BitsToSingle(requested.ScalarBits),
+                requested.D0, PtxCompat.Int32BitsToSingle(requested.ScalarBits),
                 (requested.Flags & 1) != 0, out canonical),
             DirectPtxVisionOperation.MasksToBoxes => TryMasksToBoxes(
                 requested.D0, requested.D1, requested.D2, out canonical),
@@ -47,7 +46,7 @@ internal static class DirectPtxVisionSpecializations
             DirectPtxVisionOperation.PsRoiPool => TryRoi(
                 requested.Operation, requested.D0, requested.D1, requested.D2,
                 requested.D3, requested.D4, requested.D5, requested.D6,
-                requested.D7, BitConverter.Int32BitsToSingle(requested.ScalarBits),
+                requested.D7, PtxCompat.Int32BitsToSingle(requested.ScalarBits),
                 requested.Flags & 0xff, (requested.Flags & 0x100) != 0,
                 out canonical),
             DirectPtxVisionOperation.Cross3 => TryCross3(
@@ -116,11 +115,11 @@ internal static class DirectPtxVisionSpecializations
         int length, float threshold, bool batched, out DirectPtxVisionSpec spec)
     {
         bool admitted = (length is 256 or 1024) &&
-            BitConverter.SingleToInt32Bits(threshold) ==
-            BitConverter.SingleToInt32Bits(0.5f);
+            PtxCompat.SingleToInt32Bits(threshold) ==
+            PtxCompat.SingleToInt32Bits(0.5f);
         spec = admitted
             ? new(DirectPtxVisionOperation.Nms, length, Flags: batched ? 1 : 0,
-                ScalarBits: BitConverter.SingleToInt32Bits(threshold))
+                ScalarBits: PtxCompat.SingleToInt32Bits(threshold))
             : default;
         return admitted;
     }
@@ -163,13 +162,13 @@ internal static class DirectPtxVisionSpecializations
             _ => false
         };
         bool admitted = roiOperation && shape && semantics &&
-            BitConverter.SingleToInt32Bits(spatialScale) ==
-            BitConverter.SingleToInt32Bits(0.25f);
+            PtxCompat.SingleToInt32Bits(spatialScale) ==
+            PtxCompat.SingleToInt32Bits(0.25f);
         int flags = samplingRatio & 0xff;
         if (aligned) flags |= 0x100;
         spec = admitted
             ? new(operation, n, c, h, w, k, outH, outW, outputChannels,
-                flags, BitConverter.SingleToInt32Bits(spatialScale))
+                flags, PtxCompat.SingleToInt32Bits(spatialScale))
             : default;
         return admitted;
     }
@@ -196,4 +195,3 @@ internal static class DirectPtxVisionSpecializations
         return admitted;
     }
 }
-#endif

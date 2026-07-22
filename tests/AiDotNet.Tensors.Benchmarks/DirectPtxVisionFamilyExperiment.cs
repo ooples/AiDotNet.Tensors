@@ -1,9 +1,12 @@
 using System.Diagnostics;
 using System.Text.Json;
+using AiDotNet.Tensors;
+using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 using AiDotNet.Tensors.Engines.Gpu;
+using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
@@ -78,7 +81,10 @@ internal static class DirectPtxVisionFamilyExperiment
         cell.LaunchDirect();
         cell.LaunchCurrent();
         backend.Synchronize();
-        double error = cell.MaximumWriteError();
+        double establishedRouteError = cell.MaximumWriteError();
+        (double? directOracleError, double? currentOracleError) =
+            cell.MaximumCpuOracleErrors();
+        double error = Math.Max(establishedRouteError, directOracleError ?? 0);
         double tolerance = CorrectnessTolerance(spec);
         if (!double.IsFinite(error) || error > tolerance)
             throw new InvalidOperationException(
@@ -103,13 +109,16 @@ internal static class DirectPtxVisionFamilyExperiment
         try
         {
             MeasureAndPrint(backend, run, spec, "Direct PTX", cell.LaunchDirect,
-                error, model, audit, pairedAudit);
+                error, establishedRouteError, directOracleError,
+                model, audit, pairedAudit);
             MeasureAndPrint(backend, run, spec, "Direct PTX CUDA graph",
-                () => backend.EnqueueCapturedGraph(directGraph), error, model, audit, pairedAudit);
+                () => backend.EnqueueCapturedGraph(directGraph), error,
+                establishedRouteError, directOracleError, model, audit, pairedAudit);
             MeasureAndPrint(backend, run, spec, "AiDotNet NVRTC", cell.LaunchCurrent,
-                0, model, null);
+                currentOracleError ?? 0, 0, currentOracleError, model, null);
             MeasureAndPrint(backend, run, spec, "AiDotNet NVRTC CUDA graph",
-                () => backend.EnqueueCapturedGraph(currentGraph), 0, model, null);
+                () => backend.EnqueueCapturedGraph(currentGraph), currentOracleError ?? 0,
+                0, currentOracleError, model, null);
         }
         finally
         {
@@ -125,6 +134,8 @@ internal static class DirectPtxVisionFamilyExperiment
         string method,
         Action launch,
         double error,
+        double establishedRouteError,
+        double? highPrecisionOracleError,
         WorkModel model,
         DirectPtxKernelAudit? audit,
         DirectPtxKernelAudit? pairedAudit = null)
@@ -157,6 +168,8 @@ internal static class DirectPtxVisionFamilyExperiment
             managed_bytes_per_call = managed,
             temporary_device_bytes = model.TemporaryDeviceBytes,
             maximum_error = error,
+            established_route_error = establishedRouteError,
+            high_precision_oracle_error = highPrecisionOracleError,
             registers_per_thread = audit is null ? (int?)null : Math.Max(
                 audit.Function.RegistersPerThread,
                 pairedAudit?.Function.RegistersPerThread ?? 0),
@@ -633,6 +646,220 @@ internal static class DirectPtxVisionFamilyExperiment
                     maximum = Math.Max(maximum, Math.Abs(left[i] - right[i]));
             }
             return maximum;
+        }
+
+        internal (double? Direct, double? Current) MaximumCpuOracleErrors()
+        {
+            double[][]? oracle = BuildCpuOracle();
+            if (oracle is null) return (null, null);
+            float[][] direct = SemanticOutputs(_direct, _extraOutputDirect);
+            float[][] current = SemanticOutputs(_current, _extraOutputCurrent);
+            if (direct.Length != oracle.Length || current.Length != oracle.Length)
+                throw new InvalidOperationException(
+                    $"Oracle output count mismatch for {_spec.Operation}.");
+            return (MaximumError(direct, oracle), MaximumError(current, oracle));
+        }
+
+        private float[][] SemanticOutputs(IGpuBuffer[] buffers, IGpuBuffer? extra)
+        {
+            if (_spec.Operation == DirectPtxVisionOperation.Nms)
+                return [_backend.DownloadBuffer(buffers[4]), _backend.DownloadBuffer(buffers[5])];
+            if (_spec.Operation is DirectPtxVisionOperation.IouFamilyBackwardA or
+                DirectPtxVisionOperation.Meshgrid2D)
+                return [_backend.DownloadBuffer(buffers[^1]), _backend.DownloadBuffer(extra!)];
+            return _definition.Blueprint.Tensors
+                .Select((contract, index) => (contract, index))
+                .Where(item => (item.contract.Access & DirectPtxTensorAccess.Write) != 0)
+                .Select(item => _backend.DownloadBuffer(buffers[item.index]))
+                .ToArray();
+        }
+
+        private static double MaximumError(float[][] actual, double[][] expected)
+        {
+            double maximum = 0;
+            for (int output = 0; output < expected.Length; output++)
+            {
+                if (actual[output].Length != expected[output].Length)
+                    return double.PositiveInfinity;
+                for (int i = 0; i < expected[output].Length; i++)
+                    maximum = Math.Max(maximum,
+                        Math.Abs(actual[output][i] - expected[output][i]));
+            }
+            return maximum;
+        }
+
+        private double[][]? BuildCpuOracle()
+        {
+            var cpu = new CpuEngine();
+            switch (_spec.Operation)
+            {
+                case DirectPtxVisionOperation.GeneralizedBoxIou:
+                case DirectPtxVisionOperation.DistanceBoxIou:
+                case DirectPtxVisionOperation.CompleteBoxIou:
+                {
+                    using Tensor<double> a = Host(_direct[0], _spec.D0, 4);
+                    using Tensor<double> b = Host(_direct[1], _spec.D1, 4);
+                    using Tensor<double> output = _spec.Operation switch
+                    {
+                        DirectPtxVisionOperation.GeneralizedBoxIou => cpu.GeneralizedBoxIou(a, b),
+                        DirectPtxVisionOperation.DistanceBoxIou => cpu.DistanceBoxIou(a, b),
+                        _ => cpu.CompleteBoxIou(a, b)
+                    };
+                    return [Copy(output)];
+                }
+                case DirectPtxVisionOperation.BoxArea:
+                {
+                    using Tensor<double> boxes = Host(_direct[0], _spec.D0, 4);
+                    using Tensor<double> output = cpu.BoxArea(boxes);
+                    return [Copy(output)];
+                }
+                case DirectPtxVisionOperation.BoxConvert:
+                {
+                    using Tensor<double> boxes = Host(_direct[0], _spec.D0, 4);
+                    using Tensor<double> output = cpu.BoxConvert(
+                        boxes, (BoxFormat)_spec.D1, (BoxFormat)_spec.D2);
+                    return [Copy(output)];
+                }
+                case DirectPtxVisionOperation.IoULoss:
+                case DirectPtxVisionOperation.GIoULoss:
+                case DirectPtxVisionOperation.DIoULoss:
+                case DirectPtxVisionOperation.CIoULoss:
+                {
+                    using Tensor<double> predicted = Host(_direct[0], _spec.D0, 4);
+                    using Tensor<double> target = Host(_direct[1], _spec.D0, 4);
+                    using Tensor<double> output = _spec.Operation switch
+                    {
+                        DirectPtxVisionOperation.IoULoss => cpu.TensorIoULoss(predicted, target),
+                        DirectPtxVisionOperation.GIoULoss => cpu.TensorGIoULoss(predicted, target),
+                        DirectPtxVisionOperation.DIoULoss => cpu.TensorDIoULoss(predicted, target),
+                        _ => cpu.TensorCIoULoss(predicted, target)
+                    };
+                    return [Copy(output)];
+                }
+                case DirectPtxVisionOperation.IoULossBackward:
+                case DirectPtxVisionOperation.GIoULossBackward:
+                case DirectPtxVisionOperation.DIoULossBackward:
+                case DirectPtxVisionOperation.CIoULossBackward:
+                    // The aligned backward methods are backend-only. Their
+                    // established analytical CUDA implementation is the
+                    // independent reference reported by established_route_error.
+                    return null;
+                case DirectPtxVisionOperation.IouFamilyBackwardA:
+                {
+                    using Tensor<double> grad = Host(_direct[0], _spec.D0, _spec.D1);
+                    using Tensor<double> boxesA = Host(_direct[1], _spec.D0, 4);
+                    using Tensor<double> boxesB = Host(_direct[2], _spec.D1, 4);
+                    (Tensor<double> gradA, Tensor<double> gradB) pair = _spec.D2 switch
+                    {
+                        0 => cpu.BoxIouBackward(grad, boxesA, boxesB),
+                        1 => cpu.GeneralizedBoxIouBackward(grad, boxesA, boxesB),
+                        2 => cpu.DistanceBoxIouBackward(grad, boxesA, boxesB),
+                        _ => cpu.CompleteBoxIouBackward(grad, boxesA, boxesB)
+                    };
+                    using (pair.gradA)
+                    using (pair.gradB)
+                        return [Copy(pair.gradA), Copy(pair.gradB)];
+                }
+                case DirectPtxVisionOperation.Nms:
+                {
+                    using Tensor<double> boxes = Host(_direct[0], _spec.D0, 4);
+                    using Tensor<double> scores = Host(_direct[1], _spec.D0);
+                    Tensor<int>? classes = null;
+                    try
+                    {
+                        if ((_spec.Flags & 1) != 0)
+                            classes = HostInt(_direct[2], _spec.D0);
+                        using Tensor<int> indices = classes is null
+                            ? cpu.Nms(boxes, scores, 0.5)
+                            : cpu.BatchedNms(boxes, scores, classes, 0.5);
+                        var output = new double[_spec.D0];
+                        ReadOnlySpan<int> kept = indices.AsSpan();
+                        for (int i = 0; i < kept.Length; i++) output[i] = kept[i];
+                        return [output, [kept.Length]];
+                    }
+                    finally { classes?.Dispose(); }
+                }
+                case DirectPtxVisionOperation.MasksToBoxes:
+                {
+                    using Tensor<double> masks = Host(
+                        _direct[0], _spec.D0, _spec.D1, _spec.D2);
+                    using Tensor<int> output = cpu.MasksToBoxes(masks);
+                    return [Copy(output)];
+                }
+                case DirectPtxVisionOperation.RoiAlign:
+                case DirectPtxVisionOperation.RoiPool:
+                case DirectPtxVisionOperation.PsRoiAlign:
+                case DirectPtxVisionOperation.PsRoiPool:
+                {
+                    using Tensor<double> input = Host(
+                        _direct[0], _spec.D0, _spec.D1, _spec.D2, _spec.D3);
+                    using Tensor<double> boxes = Host(_direct[1], _spec.D4, 5);
+                    float scale = BitConverter.Int32BitsToSingle(_spec.ScalarBits);
+                    using Tensor<double> output = _spec.Operation switch
+                    {
+                        DirectPtxVisionOperation.RoiAlign => cpu.RoIAlign(
+                            input, boxes, _spec.D5, _spec.D6, scale,
+                            _spec.Flags & 0xff, (_spec.Flags & 0x100) != 0),
+                        DirectPtxVisionOperation.RoiPool => cpu.RoIPool(
+                            input, boxes, _spec.D5, _spec.D6, scale),
+                        DirectPtxVisionOperation.PsRoiAlign => cpu.PsRoIAlign(
+                            input, boxes, _spec.D5, _spec.D6, _spec.D7,
+                            scale, _spec.Flags & 0xff),
+                        _ => cpu.PsRoIPool(
+                            input, boxes, _spec.D5, _spec.D6, _spec.D7, scale)
+                    };
+                    return [Copy(output)];
+                }
+                case DirectPtxVisionOperation.Cross3:
+                {
+                    using Tensor<double> a = Host(_direct[0], _spec.D0, 3, _spec.D1);
+                    using Tensor<double> b = Host(_direct[1], _spec.D0, 3, _spec.D1);
+                    using Tensor<double> output = cpu.TensorCross(a, b, 1);
+                    return [Copy(output)];
+                }
+                case DirectPtxVisionOperation.Meshgrid2D:
+                {
+                    using Tensor<double> x = Host(_direct[0], _spec.D0);
+                    using Tensor<double> y = Host(_extraInputDirect!, _spec.D1);
+                    Tensor<double>[] grids = cpu.TensorMeshgrid(
+                        [x, y], (_spec.Flags & 2) != 0 ? "xy" : "ij");
+                    try { return [Copy(grids[0]), Copy(grids[1])]; }
+                    finally
+                    {
+                        grids[0].Dispose();
+                        grids[1].Dispose();
+                    }
+                }
+                default:
+                    throw new NotSupportedException(
+                        $"No CPU oracle is assigned for {_spec.Operation}.");
+            }
+        }
+
+        private Tensor<double> Host(IGpuBuffer buffer, params int[] shape)
+        {
+            float[] values = _backend.DownloadBuffer(buffer);
+            var converted = new double[values.Length];
+            for (int i = 0; i < values.Length; i++) converted[i] = values[i];
+            return new Tensor<double>(converted, shape);
+        }
+
+        private Tensor<int> HostInt(IGpuBuffer buffer, params int[] shape)
+        {
+            float[] values = _backend.DownloadBuffer(buffer);
+            var converted = new int[values.Length];
+            for (int i = 0; i < values.Length; i++) converted[i] = (int)values[i];
+            return new Tensor<int>(converted, shape);
+        }
+
+        private static double[] Copy(Tensor<double> tensor) => tensor.AsSpan().ToArray();
+
+        private static double[] Copy(Tensor<int> tensor)
+        {
+            ReadOnlySpan<int> values = tensor.AsSpan();
+            var result = new double[values.Length];
+            for (int i = 0; i < result.Length; i++) result[i] = values[i];
+            return result;
         }
 
         private static IGpuBuffer? At(IGpuBuffer[] buffers, int index) =>
