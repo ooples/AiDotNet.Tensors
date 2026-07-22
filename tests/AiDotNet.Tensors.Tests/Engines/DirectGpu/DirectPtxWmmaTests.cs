@@ -3151,6 +3151,79 @@ public class DirectPtxWmmaTests
     }
 
     [Fact]
+    public void BatchedGemmExFanoutEmitter_IsFp16FanoutWithPointerArrays()
+    {
+        string ptx = PtxBatchedGemmExFanoutKernel.EmitPtx(8, 6, 64, 256, 256);
+        Assert.Contains(PtxBatchedGemmExFanoutKernel.EntryPoint, ptx);
+        Assert.Contains(".param .u64 b_ptr_array", ptx);
+        Assert.Contains("%ctaid.z", ptx);
+        Assert.Equal(2, Count(ptx, "ld.global.nc.u64"));        // pointer derefs
+        Assert.Equal(4, Count(ptx, "ld.global.nc.u16"));        // fp16 A + B loads
+        Assert.Equal(4, Count(ptx, "cvt.f32.f16"));
+        Assert.Equal(128, Count(ptx, "fma.rn.f32"));
+        Assert.Equal(16, Count(ptx, "cvt.rn.f16.f32"));
+        Assert.Equal(16, Count(ptx, "st.global.u16"));          // fp16 output
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxBatchedGemmExFanoutKernel.IsSupportedShape(128, 512, 2048, 4));
+        Assert.False(PtxBatchedGemmExFanoutKernel.IsPromotedShape(128, 512, 2048, 4));
+    }
+
+    [SkippableTheory]
+    [InlineData(64, 256, 256, 3)]
+    public void DriverOnlyBatchedGemmExFanout_MatchesOracle(int m, int k, int n, int batch)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedFusedLinear(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in mixed-precision batched-fanout specialization is measured on GA10x/SM86.");
+        using var kernel = new PtxBatchedGemmExFanoutKernel(runtime, m, k, n, batch);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20264200 + m + k + n + batch);
+        ushort[] aHost = RandomHalfRange(random, m * k, 0.25f);
+        ushort[] bAllHost = RandomHalfRange(random, batch * k * n, 0.25f);
+        var expected = new float[batch * m * n];
+        for (int bi = 0; bi < batch; bi++)
+        for (int row = 0; row < m; row++)
+        for (int col = 0; col < n; col++)
+        {
+            float acc = 0;
+            for (int kk = 0; kk < k; kk++)
+                acc += (float)BitConverter.UInt16BitsToHalf(aHost[row * k + kk])
+                     * (float)BitConverter.UInt16BitsToHalf(bAllHost[bi * k * n + kk * n + col]);
+            expected[bi * m * n + row * n + col] = acc;
+        }
+
+        using var aBuf = runtime.AllocateBytes((nuint)(aHost.Length * sizeof(ushort)));
+        using var bAll = runtime.AllocateBytes((nuint)(bAllHost.Length * sizeof(ushort)));
+        using var cAll = runtime.AllocateBytes((nuint)(batch * m * n * sizeof(ushort)));
+        aBuf.Upload<ushort>(aHost);
+        bAll.Upload<ushort>(bAllHost);
+        var bPtrs = new ulong[batch];
+        var cPtrs = new ulong[batch];
+        for (int bi = 0; bi < batch; bi++)
+        {
+            bPtrs[bi] = (ulong)(bAll.Pointer.ToInt64() + (long)bi * k * n * sizeof(ushort));
+            cPtrs[bi] = (ulong)(cAll.Pointer.ToInt64() + (long)bi * m * n * sizeof(ushort));
+        }
+        using var bArray = runtime.AllocateBytes((nuint)(batch * sizeof(ulong)));
+        using var cArray = runtime.AllocateBytes((nuint)(batch * sizeof(ulong)));
+        bArray.Upload<ulong>(bPtrs);
+        cArray.Upload<ulong>(cPtrs);
+
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(aBuf, kernel.Blueprint.Tensors[0]),
+            bArray.Pointer, cArray.Pointer);
+        runtime.Synchronize();
+        var actual = new ushort[batch * m * n];
+        cAll.Download<ushort>(actual);
+        for (int i = 0; i < actual.Length; i++)
+            Assert.True(Math.Abs((float)BitConverter.UInt16BitsToHalf(actual[i]) - expected[i]) < 6e-2f,
+                $"fp16 fanout mismatch at {i}");
+    }
+
+    [Fact]
     public void GemmEmitter_IsRegisterResidentTiledGemm()
     {
         string ptx = PtxGemmKernel.EmitPtx(8, 6, 64, 256, 256);
