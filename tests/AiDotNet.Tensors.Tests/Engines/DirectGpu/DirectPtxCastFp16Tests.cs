@@ -1,9 +1,9 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Linq;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+using AiDotNet.Tensors.Helpers;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -65,11 +65,23 @@ public class DirectPtxCastFp16Tests
             Assert.False(string.IsNullOrWhiteSpace(cell.DTypes));
             Assert.False(string.IsNullOrWhiteSpace(cell.DirectPtxAssignment));
         });
+        // The narrowing and widening halves of the conversion pair are both
+        // implemented and both still experimental. Naming them individually is
+        // stricter than a bare count: it pins WHICH cells are live, so a future
+        // cell cannot silently take a promoted slot.
         Assert.Equal(
             DirectPtxLayoutCoverageStatus.ExperimentalDirectPtx,
             DirectPtxLayoutCoverageManifest.Get("CudaBackend.ConvertToFp16").Status);
-        Assert.Single(DirectPtxLayoutCoverageManifest.All,
-            cell => cell.Status == DirectPtxLayoutCoverageStatus.ExperimentalDirectPtx);
+        Assert.Equal(
+            DirectPtxLayoutCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxLayoutCoverageManifest.Get("CudaBackend.ConvertToFp32").Status);
+        Assert.Equal(
+            new[] { "CudaBackend.ConvertToFp16", "CudaBackend.ConvertToFp32" },
+            DirectPtxLayoutCoverageManifest.All
+                .Where(cell => cell.Status == DirectPtxLayoutCoverageStatus.ExperimentalDirectPtx)
+                .Select(cell => cell.Api)
+                .OrderBy(api => api, StringComparer.Ordinal)
+                .ToArray());
         Assert.All(DirectPtxLayoutCoverageManifest.All,
             cell => Assert.NotEqual(
                 DirectPtxLayoutCoverageStatus.PromotedDirectPtx, cell.Status));
@@ -111,6 +123,10 @@ public class DirectPtxCastFp16Tests
         }
     }
 
+    // System.Half and BitConverter.HalfToUInt16Bits are net5+, so the fp16
+    // oracle cannot be expressed on net471. The test is driver-gated anyway;
+    // every non-driver contract above still runs on net471.
+#if NET5_0_OR_GREATER
     [SkippableTheory]
     [InlineData(65_536)]
     [InlineData(262_144)]
@@ -128,9 +144,9 @@ public class DirectPtxCastFp16Tests
         Assert.Equal("cast-f32-to-f16", kernel.Blueprint.Operation);
         Assert.Equal(2, kernel.Blueprint.Tensors.Count);
 
-        var random = new Random(20260722);
+        var random = RandomHelper.CreateSeededRandom(20260722);
         float[] input = Enumerable.Range(0, size)
-            .Select(_ => (random.NextSingle() * 2f - 1f) * 65_504f).ToArray();
+            .Select(_ => (float)((random.NextDouble() * 2.0 - 1.0) * 65_504.0)).ToArray();
         input[0] = 0f;
         input[1] = float.PositiveInfinity;
         input[2] = float.NegativeInfinity;
@@ -152,6 +168,7 @@ public class DirectPtxCastFp16Tests
             Assert.Equal(expected, actual[i]);
         }
     }
+#endif
 
     private static int Count(string text, string value)
     {
@@ -164,4 +181,3 @@ public class DirectPtxCastFp16Tests
         return count;
     }
 }
-#endif

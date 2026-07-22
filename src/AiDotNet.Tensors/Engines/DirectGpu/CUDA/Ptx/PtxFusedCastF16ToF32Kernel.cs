@@ -5,18 +5,23 @@ using System.Text;
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
 /// <summary>
-/// Exact contiguous FP32-to-FP16 dtype conversion (issue #845). Each thread
-/// loads one FP32x4 vector, applies four round-to-nearest-even
-/// <c>cvt.rn.f16.f32</c> conversions, and commits one packed FP16x4 vector.
-/// There are no shared-memory, local-memory, global-intermediate,
-/// temporary-allocation, division, remainder, stride, or scalar shape
-/// parameters — only two tensor pointers reach the launch ABI. The
-/// specialization stays disabled by default and fails closed until three clean
-/// promotion runs clear the release gate.
+/// Exact contiguous FP16-to-FP32 dtype conversion (issue #845). This is the
+/// widening mirror of <see cref="PtxFusedCastF32ToF16Kernel"/>: each thread
+/// loads one packed FP16x4 vector, applies four <c>cvt.f32.f16</c> widenings,
+/// and commits one FP32x4 vector. There are no shared-memory, local-memory,
+/// global-intermediate, temporary-allocation, division, remainder, stride, or
+/// scalar shape parameters — only two tensor pointers reach the launch ABI.
+///
+/// Widening FP16 to FP32 is exact: every FP16 value (including subnormals,
+/// infinities, and NaN payloads) is representable in FP32, so no rounding mode
+/// applies and the conversion is bit-exact against a double-precision oracle.
+///
+/// The specialization stays disabled by default and fails closed until three
+/// clean promotion runs clear the release gate.
 /// </summary>
-internal sealed class PtxFusedCastF32ToF16Kernel : IDisposable
+internal sealed class PtxFusedCastF16ToF32Kernel : IDisposable
 {
-    internal const string EntryPoint = "aidotnet_fused_cast_f32_to_f16";
+    internal const string EntryPoint = "aidotnet_fused_cast_f16_to_f32";
     internal const int DefaultBlockThreads = 256;
     internal const int ElementsPerThread = 4;
 
@@ -30,16 +35,16 @@ internal sealed class PtxFusedCastF32ToF16Kernel : IDisposable
     internal DirectPtxKernelBlueprint Blueprint { get; }
     internal DirectPtxKernelAudit Audit { get; }
 
-    internal PtxFusedCastF32ToF16Kernel(
+    internal PtxFusedCastF16ToF32Kernel(
         DirectPtxRuntime runtime,
         int size,
         int blockThreads = DefaultBlockThreads)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
-        if (!DirectPtxArchitecture.HasValidatedCastFp16(
+        if (!DirectPtxArchitecture.HasValidatedCastFp32(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
-                "The checked-in FP32->FP16 cast specialization is admitted only on SM86.");
+                "The checked-in FP16->FP32 cast specialization is admitted only on SM86.");
         Validate(size);
         ValidateBlockThreads(size, blockThreads);
         Size = size;
@@ -93,7 +98,7 @@ internal sealed class PtxFusedCastF32ToF16Kernel : IDisposable
         ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine(
-            $"// exact-shape size={size} block={blockThreads} elems-per-thread={ElementsPerThread} strategy=linear-vec4 op=cast-f32-f16");
+            $"// exact-shape size={size} block={blockThreads} elems-per-thread={ElementsPerThread} strategy=linear-vec4 op=cast-f16-f32");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");
         ptx.AppendLine("    .param .u64 input_ptr,");
@@ -110,16 +115,19 @@ internal sealed class PtxFusedCastF32ToF16Kernel : IDisposable
         ptx.AppendLine("    mov.u32 %r0, %ctaid.x;");
         ptx.AppendLine("    mov.u32 %r1, %tid.x;");
         ptx.AppendLine($"    mad.lo.u32 %r2, %r0, {blockThreads}, %r1;");
-        ptx.AppendLine($"    mul.wide.u32 %rd2, %r2, {ElementsPerThread * sizeof(float)};");
-        ptx.AppendLine($"    mul.wide.u32 %rd3, %r2, {ElementsPerThread * 2};");
+        // Input is 2 bytes/element, output is 4 — the byte strides are the exact
+        // mirror of the narrowing kernel's.
+        ptx.AppendLine($"    mul.wide.u32 %rd2, %r2, {ElementsPerThread * 2};");
+        ptx.AppendLine($"    mul.wide.u32 %rd3, %r2, {ElementsPerThread * sizeof(float)};");
         ptx.AppendLine("    add.u64 %rd4, %rd0, %rd2;");
         ptx.AppendLine("    add.u64 %rd5, %rd1, %rd3;");
-        ptx.AppendLine("    ld.global.ca.v4.f32 {%f0, %f1, %f2, %f3}, [%rd4];");
-        ptx.AppendLine("    cvt.rn.f16.f32 %rs0, %f0;");
-        ptx.AppendLine("    cvt.rn.f16.f32 %rs1, %f1;");
-        ptx.AppendLine("    cvt.rn.f16.f32 %rs2, %f2;");
-        ptx.AppendLine("    cvt.rn.f16.f32 %rs3, %f3;");
-        ptx.AppendLine("    st.global.v4.u16 [%rd5], {%rs0, %rs1, %rs2, %rs3};");
+        ptx.AppendLine("    ld.global.ca.v4.u16 {%rs0, %rs1, %rs2, %rs3}, [%rd4];");
+        // FP16 -> FP32 is exact for every input, so no rounding modifier applies.
+        ptx.AppendLine("    cvt.f32.f16 %f0, %rs0;");
+        ptx.AppendLine("    cvt.f32.f16 %f1, %rs1;");
+        ptx.AppendLine("    cvt.f32.f16 %f2, %rs2;");
+        ptx.AppendLine("    cvt.f32.f16 %f3, %rs3;");
+        ptx.AppendLine("    st.global.v4.f32 [%rd5], {%f0, %f1, %f2, %f3};");
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");
         return ptx.ToString();
@@ -132,15 +140,15 @@ internal sealed class PtxFusedCastF32ToF16Kernel : IDisposable
     {
         var extent = new DirectPtxExtent(size);
         return new DirectPtxKernelBlueprint(
-            Operation: "cast-f32-to-f16",
+            Operation: "cast-f16-to-f32",
             Version: 1,
             Architecture: architecture,
             Variant: $"linear-vec4-b{blockThreads}-n{size}",
             Tensors:
             [
-                new("input", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
+                new("input", DirectPtxPhysicalType.Float16, DirectPtxPhysicalLayout.Vector,
                     extent, extent, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact),
-                new("output", DirectPtxPhysicalType.Float16, DirectPtxPhysicalLayout.Vector,
+                new("output", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
                     extent, extent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: new DirectPtxResourceBudget(
@@ -150,24 +158,25 @@ internal sealed class PtxFusedCastF32ToF16Kernel : IDisposable
                 MinBlocksPerMultiprocessor: 1536 / blockThreads),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
-                ["formula"] = "output[i] = (fp16)round_nearest_even(input[i])",
-                ["mode"] = "inference-forward-cvt-rn-f16",
-                ["input"] = "fp32",
-                ["output"] = "fp16",
+                ["formula"] = "output[i] = (fp32)input[i]",
+                ["mode"] = "inference-forward-cvt-f32-f16",
+                ["input"] = "fp16",
+                ["output"] = "fp32",
                 ["elements-per-thread"] = ElementsPerThread.ToString(),
                 ["global-input-reads"] = "one-vector-per-thread",
                 ["global-output-writes"] = "one-vector-per-thread",
-                ["lane-vector-transaction"] = "aligned-fp32x4-in-fp16x4-out",
+                ["lane-vector-transaction"] = "aligned-fp16x4-in-fp32x4-out",
                 ["shared-intermediate"] = "none",
                 ["global-intermediates"] = "none",
                 ["temporary-device-allocation"] = "none",
                 ["stride-parameters"] = "none",
-                ["rounding"] = "round-to-nearest-even",
+                ["rounding"] = "exact-widening-no-rounding",
                 ["byte-offset"] = "zero-entire-allocation-view",
                 ["padding"] = "none-logical-equals-physical"
             });
     }
 
+    /// <summary>The widening family mirrors the narrowing family's exact shapes.</summary>
     internal static bool IsSupportedShape(int size) =>
         size is 65_536 or 262_144 or 1_048_576 or 4_194_304;
 
@@ -177,7 +186,7 @@ internal sealed class PtxFusedCastF32ToF16Kernel : IDisposable
     {
         if (!IsSupportedShape(size))
             throw new ArgumentOutOfRangeException(nameof(size),
-                "The first FP32->FP16 cast family supports exact sizes " +
+                "The first FP16->FP32 cast family supports exact sizes " +
                 "65536, 262144, 1048576, and 4194304.");
     }
 

@@ -31,6 +31,9 @@ public sealed partial class CudaBackend
         _directPtxQkvRopeCacheKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<DirectPtxCastFp16Key, PtxFusedCastF32ToF16Kernel>
         _directPtxCastFp16Kernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+
+    private readonly DirectPtxKernelCache<DirectPtxCastFp32Key, PtxFusedCastF16ToF32Kernel>
+        _directPtxCastFp32Kernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private DirectPtxRuntime? _directPtxRuntime;
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
@@ -45,6 +48,7 @@ public sealed partial class CudaBackend
     private long _directPtxFlashAttentionBackwardDispatchCount;
     private long _directPtxQkvRopeCacheDispatchCount;
     private long _directPtxCastFp16DispatchCount;
+    private long _directPtxCastFp32DispatchCount;
     internal int DirectPtxCachedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxAttentionKernels.Count; }
@@ -102,7 +106,7 @@ public sealed partial class CudaBackend
 
     internal bool IsDirectPtxCastFp16Enabled =>
         DirectPtxFeatureGate.IsCastFp16Enabled && IsAvailable &&
-        DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) == DirectPtxArchitectureFamily.Ampere;
+        DirectPtxArchitecture.HasValidatedCastFp16(_ccMajor, _ccMinor);
 
     internal long DirectPtxCastFp16DispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxCastFp16DispatchCount);
@@ -110,6 +114,18 @@ public sealed partial class CudaBackend
     {
         get { lock (_directPtxLock) return _directPtxCastFp16Kernels.PinnedCount; }
     }
+
+    internal bool IsDirectPtxCastFp32Enabled =>
+        DirectPtxFeatureGate.IsCastFp32Enabled && IsAvailable &&
+        DirectPtxArchitecture.HasValidatedCastFp32(_ccMajor, _ccMinor);
+
+    internal long DirectPtxCastFp32DispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxCastFp32DispatchCount);
+    internal int DirectPtxCastFp32PinnedKernelCount
+    {
+        get { lock (_directPtxLock) return _directPtxCastFp32Kernels.PinnedCount; }
+    }
+
     internal int DirectPtxQkvRopeCacheKernelCapacity => _directPtxQkvRopeCacheKernels.Capacity;
     internal int DirectPtxQkvRopeCachePinnedKernelCount
     {
@@ -1813,8 +1829,7 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "cast-fp16-cuda-unavailable";
             return false;
         }
-        if (DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) !=
-            DirectPtxArchitectureFamily.Ampere)
+        if (!DirectPtxArchitecture.HasValidatedCastFp16(_ccMajor, _ccMinor))
         {
             DirectPtxLastError = "cast-fp16-architecture-not-validated";
             return false;
@@ -1842,7 +1857,7 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "cast-fp16-invalid-device-pointer";
             return false;
         }
-        if ((((nuint)input.Handle | (nuint)output.Handle) & 15u) != 0)
+        if (((PtxCompat.ToNuint(input.Handle) | PtxCompat.ToNuint(output.Handle)) & 15u) != 0)
         {
             DirectPtxLastError = "cast-fp16-alignment-mismatch";
             return false;
@@ -1893,8 +1908,8 @@ public sealed partial class CudaBackend
 
     private static bool DirectPtxCastBuffersOverlap(IGpuBuffer input, IGpuBuffer output)
     {
-        nuint inputStart = (nuint)input.Handle;
-        nuint outputStart = (nuint)output.Handle;
+        nuint inputStart = PtxCompat.ToNuint(input.Handle);
+        nuint outputStart = PtxCompat.ToNuint(output.Handle);
         nuint inputEnd = checked(inputStart + (nuint)input.SizeInBytes);
         nuint outputEnd = checked(outputStart + (nuint)output.SizeInBytes);
         return inputStart < outputEnd && outputStart < inputEnd;
@@ -1919,8 +1934,7 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "cast-fp16-cuda-unavailable";
             return false;
         }
-        if (DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) !=
-            DirectPtxArchitectureFamily.Ampere)
+        if (!DirectPtxArchitecture.HasValidatedCastFp16(_ccMajor, _ccMinor))
         {
             DirectPtxLastError = "cast-fp16-architecture-not-validated";
             return false;
@@ -1961,6 +1975,187 @@ public sealed partial class CudaBackend
         }
     }
 
+    /// <summary>
+    /// Widening FP16-to-FP32 cast (issue #845). Mirrors the narrowing FP32-to-FP16
+    /// route: same closed shape family, same alignment and aliasing rules, same
+    /// fail-closed reason strings, with the input/output byte extents swapped.
+    /// </summary>
+    internal bool TryDirectPtxCastFp32(
+        IGpuBuffer input,
+        IGpuBuffer output,
+        int size)
+    {
+        if (input is null || output is null)
+        {
+            DirectPtxLastError = "cast-fp32-null-buffer";
+            return false;
+        }
+        if (!DirectPtxFeatureGate.IsCastFp32Enabled)
+        {
+            DirectPtxLastError = "cast-fp32-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "cast-fp32-cuda-unavailable";
+            return false;
+        }
+        if (!DirectPtxArchitecture.HasValidatedCastFp32(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = "cast-fp32-architecture-not-validated";
+            return false;
+        }
+        if (!PtxFusedCastF16ToF32Kernel.IsSupportedShape(size))
+        {
+            DirectPtxLastError = "cast-fp32-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedCastF16ToF32Kernel.IsPromotedShape(size) &&
+            !DirectPtxFeatureGate.CastFp32ExperimentOverride)
+        {
+            DirectPtxLastError = "cast-fp32-performance-gate-not-met";
+            return false;
+        }
+
+        // Widening: 2 bytes in per element, 4 bytes out.
+        if (input.SizeInBytes != checked((long)size * 2) ||
+            output.SizeInBytes != checked((long)size * sizeof(float)))
+        {
+            DirectPtxLastError = "cast-fp32-physical-extent-mismatch";
+            return false;
+        }
+        if (input.Handle == IntPtr.Zero || output.Handle == IntPtr.Zero)
+        {
+            DirectPtxLastError = "cast-fp32-invalid-device-pointer";
+            return false;
+        }
+        if (((PtxCompat.ToNuint(input.Handle) | PtxCompat.ToNuint(output.Handle)) & 15u) != 0)
+        {
+            DirectPtxLastError = "cast-fp32-alignment-mismatch";
+            return false;
+        }
+        if (DirectPtxCastBuffersOverlap(input, output))
+        {
+            DirectPtxLastError = "cast-fp32-alias-not-supported";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var key = new DirectPtxCastFp32Key(size);
+            lock (_directPtxLock)
+            {
+                if (!_directPtxCastFp32Kernels.TryGetValue(
+                    key, out PtxFusedCastF16ToF32Kernel? kernel))
+                {
+                    if (capturing)
+                    {
+                        DirectPtxLastError =
+                            "Direct PTX widening cast must be prewarmed before CUDA graph capture.";
+                        return false;
+                    }
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    kernel = CreateAndCacheCastFp32KernelSlow(key);
+                }
+                if (capturing && !_directPtxCastFp32Kernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX widening cast module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[1]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxCastFp32DispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    private PtxFusedCastF16ToF32Kernel CreateAndCacheCastFp32KernelSlow(
+        DirectPtxCastFp32Key key)
+    {
+        DirectPtxRuntime runtime = _directPtxRuntime ??
+            throw new InvalidOperationException(
+                "The direct-PTX runtime must be initialized before creating a widening cast kernel.");
+        return _directPtxCastFp32Kernels.GetOrAdd(key, () =>
+            new PtxFusedCastF16ToF32Kernel(runtime, key.Size));
+    }
+
+    internal bool PrewarmDirectPtxCastFp32(int size)
+    {
+        if (!DirectPtxFeatureGate.IsCastFp32Enabled)
+        {
+            DirectPtxLastError = "cast-fp32-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "cast-fp32-cuda-unavailable";
+            return false;
+        }
+        if (!DirectPtxArchitecture.HasValidatedCastFp32(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = "cast-fp32-architecture-not-validated";
+            return false;
+        }
+        if (!PtxFusedCastF16ToF32Kernel.IsSupportedShape(size))
+        {
+            DirectPtxLastError = "cast-fp32-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedCastF16ToF32Kernel.IsPromotedShape(size) &&
+            !DirectPtxFeatureGate.CastFp32ExperimentOverride)
+        {
+            DirectPtxLastError = "cast-fp32-performance-gate-not-met";
+            return false;
+        }
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX widening cast prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                var key = new DirectPtxCastFp32Key(size);
+                if (!_directPtxCastFp32Kernels.TryGetValue(key, out _))
+                    _ = CreateAndCacheCastFp32KernelSlow(key);
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxCastFp32Audit(int size, out DirectPtxKernelAudit? audit)
+    {
+        lock (_directPtxLock)
+        {
+            var key = new DirectPtxCastFp32Key(size);
+            if (_directPtxCastFp32Kernels.TryGetValue(key, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null;
+        return false;
+    }
+
     internal bool TryGetDirectPtxCastFp16Audit(int size, out DirectPtxKernelAudit audit)
     {
         lock (_directPtxLock)
@@ -1989,6 +2184,7 @@ public sealed partial class CudaBackend
             _directPtxFlashAttentionBackwardKernels.Dispose();
             _directPtxQkvRopeCacheKernels.Dispose();
             _directPtxCastFp16Kernels.Dispose();
+            _directPtxCastFp32Kernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }
@@ -2056,5 +2252,7 @@ public sealed partial class CudaBackend
         int CacheCapacity,
         int Position);
     private readonly record struct DirectPtxCastFp16Key(int Size);
+
+    private readonly record struct DirectPtxCastFp32Key(int Size);
 
 }

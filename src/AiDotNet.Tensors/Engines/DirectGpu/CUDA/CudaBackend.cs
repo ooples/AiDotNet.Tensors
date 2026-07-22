@@ -13083,10 +13083,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     /// <inheritdoc/>
     public unsafe void ConvertToFp16(IGpuBuffer input, IGpuBuffer output, int size)
     {
-#if NET5_0_OR_GREATER
         if (TryDirectPtxCastFp16(input, output, size))
             return;
-#endif
         // The toolkit (cuda_fp16.h-based) kernel is the faster __half2 packed
         // path, but it only compiles on machines with the CUDA Toolkit
         // header. On driver-only hosts CompileKernelModule(... CudaFp16Kernels)
@@ -13482,6 +13480,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     /// <inheritdoc/>
     public unsafe void ConvertToFp32(IGpuBuffer input, IGpuBuffer output, int size)
     {
+        if (TryDirectPtxCastFp32(input, output, size))
+            return;
         // Mirror ConvertToFp16: the toolkit (cuda_fp16.h) "convert_fp16_to_fp32" kernel only registers on
         // CUDA-Toolkit hosts; on driver-only hosts (e.g. GTX 1660 Ti, no toolkit) it never compiles, so a
         // hard throw here broke every FP16→FP32 up-cast on those machines — including the FP16 resident

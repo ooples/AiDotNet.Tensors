@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -36,9 +35,9 @@ internal static class DirectPtxLayoutCoverageManifest
     internal static IReadOnlyList<DirectPtxLayoutCoverageCell> All { get; } =
     [
         Experimental("CudaBackend.ConvertToFp16", "NVRTC convert_fp32_to_fp16 / _native", "round-to-nearest-even FP32 to FP16", Vector, "FP32 in; FP16 out", "v1 Ampere linear-vec4 exact-size cells"),
-        Planned("CudaBackend.ConvertToFp32", "NVRTC convert_fp16_to_fp32", "widen FP16 to FP32", Vector, "FP16 in; FP32 out", "linear-vec4-widen-families"),
-        Planned("CudaBackend.ConvertToBf16", "NVRTC convert_fp32_to_bf16", "round FP32 to BF16", Vector, "FP32 in; BF16 out", "linear-vec4-bf16-families"),
-        Planned("CudaBackend.ConvertBf16ToFp32", "NVRTC convert_bf16_to_fp32", "widen BF16 to FP32", Vector, "BF16 in; FP32 out", "linear-vec4-widen-families"),
+        Experimental("CudaBackend.ConvertToFp32", "NVRTC convert_fp16_to_fp32", "widen FP16 to FP32", Vector, "FP16 in; FP32 out", "v1 Ampere linear-vec4 exact-size cells"),
+        Planned("CudaBackend.ConvertToBf16", "none - no backend op exists yet", "round FP32 to BF16", Vector, "FP32 in; BF16 out", "needs a public backend op first, then linear-vec4-bf16-families"),
+        Planned("CudaBackend.ConvertBf16ToFp32", "none - no backend op exists yet", "widen BF16 to FP32", Vector, "BF16 in; FP32 out", "needs a public backend op first, then linear-vec4-widen-families"),
         Planned("CudaBackend.Copy", "NVRTC memcpy_device / cudaMemcpyAsync", "contiguous device copy", Vector, "FP32/FP16", "linear-vec4-copy-families"),
         Planned("CudaBackend.Transpose", "NVRTC transpose", "2D transpose [rows,cols] to [cols,rows]", Rows, "FP32", "shared-tile-32x32-transpose-families"),
         Planned("CudaBackend.TransposeBatched", "NVRTC transpose_batched", "batched 2D transpose", "canonical contiguous [batch,rows,cols]", "FP32", "shared-tile-batched-transpose-families"),
@@ -73,4 +72,3 @@ internal static class DirectPtxLayoutCoverageManifest
         string api, string existing, string semantics, string layout, string dtypes, string assignment) =>
         new(api, existing, semantics, layout, dtypes, assignment, DirectPtxLayoutCoverageStatus.PlannedDirectPtx);
 }
-#endif
