@@ -41,8 +41,70 @@ public class DirectPtxSoftmaxTests
             DirectPtxSoftmaxCoverageManifest.Get("CudaBackend.MaskedFillKernel").Status);
         Assert.Equal(DirectPtxSoftmaxCoverageStatus.ExperimentalDirectPtx,
             DirectPtxSoftmaxCoverageManifest.Get("CudaBackend.MaskedFillBackward").Status);
+        Assert.Equal(DirectPtxSoftmaxCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxSoftmaxCoverageManifest.Get("CudaBackend.TaylorSoftmax").Status);
         Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() =>
             DirectPtxSoftmaxCoverageManifest.Get("UnassignedSoftmaxApi"));
+    }
+
+    [Fact]
+    public void TaylorSoftmaxEmitter_NormalizesPositivePolynomial()
+    {
+        string ptx = PtxTaylorSoftmaxKernel.EmitPtx(8, 6, 64, 512);
+        Assert.Contains(PtxTaylorSoftmaxKernel.EntryPoint, ptx);
+        Assert.Contains("LOAD_LOOP:", ptx);
+        Assert.Contains("OUT_LOOP:", ptx);
+        Assert.Contains("fma.rn.f32 %f5, %f5, 0f3F000000, %f1", ptx);   // 0.5 x^2 + x
+        Assert.Contains("rcp.approx.f32", ptx);
+        Assert.DoesNotContain("ex2.approx.f32", ptx);                   // polynomial, no exp
+        Assert.DoesNotContain("max.f32", ptx);                          // strictly positive -> no max shift
+        Assert.Equal(10, Count(ptx, "bar.sync 0"));                     // single sum reduction
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxTaylorSoftmaxKernel.IsSupportedShape(128, 2048));
+        Assert.False(PtxTaylorSoftmaxKernel.IsPromotedShape(128, 2048));
+    }
+
+    [SkippableTheory]
+    [InlineData(64, 256)]
+    [InlineData(128, 512)]
+    public void DriverOnlyTaylorSoftmax_MatchesOracle(int m, int n)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedSoftmax(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in Taylor-softmax specialization is measured on GA10x/SM86.");
+        using var kernel = new PtxTaylorSoftmaxKernel(runtime, m, n);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20265300 + m + n);
+        float[] xHost = Values(random, m * n, 2.0f);
+        var expected = new float[m * n];
+        for (int row = 0; row < m; row++)
+        {
+            double sum = 0;
+            for (int col = 0; col < n; col++)
+            {
+                double x = xHost[row * n + col];
+                sum += 1.0 + x + 0.5 * x * x;
+            }
+            for (int col = 0; col < n; col++)
+            {
+                double x = xHost[row * n + col];
+                expected[row * n + col] = (float)((1.0 + x + 0.5 * x * x) / sum);
+            }
+        }
+
+        using var x = runtime.AllocateBytes((nuint)(xHost.Length * sizeof(float)));
+        using var output = runtime.AllocateBytes((nuint)(m * n * sizeof(float)));
+        x.Upload<float>(xHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(x, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[1]));
+        runtime.Synchronize();
+        var actual = new float[m * n];
+        output.Download<float>(actual);
+        AssertVectorClose(actual, expected, 2e-3f, $"taylor-softmax {m}x{n}");
     }
 
     [Fact]

@@ -61,7 +61,8 @@ internal static class DirectPtxSoftmaxCoverageManifest
         new("CudaBackend.Sparsemax", "NVRTC sparsemax", "Euclidean projection of logits onto the simplex",
             RowMajor, "FP32", DirectPtxSoftmaxCoverageStatus.PlannedDirectPtx, Planned),
         new("CudaBackend.TaylorSoftmax", "NVRTC Taylor softmax", "second-order Taylor approximation of softmax",
-            RowMajor, "FP32", DirectPtxSoftmaxCoverageStatus.PlannedDirectPtx, Planned)
+            RowMajor, "FP32", DirectPtxSoftmaxCoverageStatus.ExperimentalDirectPtx,
+            "one-block-per-row shared-resident PTX kernel (PtxTaylorSoftmaxKernel) normalizing the positive polynomial 1+x+x^2/2 with a single tree-reduced sum; fails closed until GPU-validated and promoted")
     ];
 
     internal static DirectPtxSoftmaxCoverageCell Get(string api)
