@@ -1828,6 +1828,7 @@ public sealed partial class CudaBackend
             _directPtxIm2colKNFp16Kernels.Dispose();
             _directPtxUnfoldKNFp16FromFp16Kernels.Dispose();
             _directPtxDeformableConv2DGroupedKernels.Dispose();
+            _directPtxDeformableConv2DGroupedBwdWeightKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }
