@@ -99,6 +99,10 @@ weights `[4096,1024]`, FP32 activation scale `[1]`, FP32 per-output scales
 symmetric and both zero-points are exactly zero. Packing and quantization are
 model-load responsibilities and are never timed or repeated on the hot path.
 
+All three specialization caches require prewarming before CUDA graph capture.
+Once captured, the referenced module is pinned in its bounded cache so later
+specialization churn cannot unload a `CUfunction` retained by the graph.
+
 ## GPU-only championship evidence
 
 Environment: Windows 10.0.26200, .NET 10.0.10 / SDK 10.0.302, NVIDIA GeForce

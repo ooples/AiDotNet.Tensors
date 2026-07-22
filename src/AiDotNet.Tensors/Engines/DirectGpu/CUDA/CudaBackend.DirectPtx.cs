@@ -380,6 +380,18 @@ public sealed partial class CudaBackend
 
     internal long DirectPtxQuantizedLinearDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxQuantizedLinearDispatchCount);
+    internal int DirectPtxMixedLinearPinnedKernelCount
+    {
+        get { lock (_directPtxLock) return _directPtxMixedLinearKernels.PinnedCount; }
+    }
+    internal int DirectPtxMixedLinearM16PinnedKernelCount
+    {
+        get { lock (_directPtxLock) return _directPtxMixedLinearM16Kernels.PinnedCount; }
+    }
+    internal int DirectPtxQuantizedLinearPinnedKernelCount
+    {
+        get { lock (_directPtxLock) return _directPtxQuantizedLinearKernels.PinnedCount; }
+    }
 
     /// <summary>
     /// Attempts the exact contiguous FP16-input/weight, FP32-accumulate M=1
@@ -418,6 +430,7 @@ public sealed partial class CudaBackend
 
         try
         {
+            bool capturing = IsStreamCapturing();
             EnsureContextCurrent();
             var key = new DirectPtxFusedLinearKey(inputFeatures, outputFeatures);
             lock (_directPtxLock)
@@ -425,7 +438,7 @@ public sealed partial class CudaBackend
                 if (!_directPtxMixedLinearKernels.TryGetValue(
                     key, out PtxFusedLinearGeluFp16M1Kernel? kernel))
                 {
-                    if (IsStreamCapturing())
+                    if (capturing)
                     {
                         DirectPtxLastError =
                             "Direct PTX mixed linear must be prewarmed before CUDA graph capture.";
@@ -434,6 +447,9 @@ public sealed partial class CudaBackend
                     _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                     kernel = CreateAndCacheMixedLinearKernelSlow(key);
                 }
+                if (capturing && !_directPtxMixedLinearKernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX mixed-linear module for CUDA graph capture.");
                 lock (GpuDispatchLock)
                     kernel.Launch(
                         DirectPtxTensorView.Create(inputHalf, kernel.Blueprint.Tensors[0]),
@@ -556,6 +572,7 @@ public sealed partial class CudaBackend
 
         try
         {
+            bool capturing = IsStreamCapturing();
             EnsureContextCurrent();
             var key = new DirectPtxFusedLinearKey(inputFeatures, outputFeatures);
             lock (_directPtxLock)
@@ -563,7 +580,7 @@ public sealed partial class CudaBackend
                 if (!_directPtxQuantizedLinearKernels.TryGetValue(
                     key, out PtxFusedLinearGeluW8A8M1Kernel? kernel))
                 {
-                    if (IsStreamCapturing())
+                    if (capturing)
                     {
                         DirectPtxLastError =
                             "Direct PTX W8A8 linear must be prewarmed before CUDA graph capture.";
@@ -572,6 +589,9 @@ public sealed partial class CudaBackend
                     _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                     kernel = CreateAndCacheQuantizedLinearKernelSlow(key);
                 }
+                if (capturing && !_directPtxQuantizedLinearKernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX W8A8-linear module for CUDA graph capture.");
                 lock (GpuDispatchLock)
                     kernel.Launch(
                         DirectPtxTensorView.Create(inputInt8, kernel.Blueprint.Tensors[0]),
@@ -697,6 +717,7 @@ public sealed partial class CudaBackend
 
         try
         {
+            bool capturing = IsStreamCapturing();
             EnsureContextCurrent();
             var key = new DirectPtxFusedLinearKey(inputFeatures, outputFeatures);
             lock (_directPtxLock)
@@ -704,7 +725,7 @@ public sealed partial class CudaBackend
                 if (!_directPtxMixedLinearM16Kernels.TryGetValue(
                     key, out PtxFusedLinearGeluFp16M16Kernel? kernel))
                 {
-                    if (IsStreamCapturing())
+                    if (capturing)
                     {
                         DirectPtxLastError =
                             "Direct PTX M=16 mixed linear must be prewarmed before CUDA graph capture.";
@@ -713,6 +734,9 @@ public sealed partial class CudaBackend
                     _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                     kernel = CreateAndCacheMixedLinearM16KernelSlow(key);
                 }
+                if (capturing && !_directPtxMixedLinearM16Kernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX M=16 mixed-linear module for CUDA graph capture.");
                 lock (GpuDispatchLock)
                     kernel.Launch(
                         DirectPtxTensorView.Create(inputHalf, kernel.Blueprint.Tensors[0]),

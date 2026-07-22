@@ -2404,6 +2404,8 @@ public class DirectPtxWmmaTests
                 captured &= backend.TryDirectPtxFusedLinearGeluFp16M16(
                     inputHalf, weightHalf, bias, output, inputFeatures, outputFeatures));
             Assert.True(captured, backend.DirectPtxLastError);
+            Assert.NotEqual(IntPtr.Zero, graph);
+            Assert.Equal(1, backend.DirectPtxMixedLinearM16PinnedKernelCount);
             try { backend.LaunchCapturedGraph(graph); }
             finally { backend.DestroyCapturedGraph(graph); }
             backend.Synchronize();
@@ -2544,6 +2546,8 @@ public class DirectPtxWmmaTests
                 captured &= backend.TryDirectPtxFusedLinearGeluFp16M1(
                     inputHalf, weightHalf, bias, output, inputFeatures, outputFeatures));
             Assert.True(captured, backend.DirectPtxLastError);
+            Assert.NotEqual(IntPtr.Zero, graph);
+            Assert.Equal(1, backend.DirectPtxMixedLinearPinnedKernelCount);
             try { backend.LaunchCapturedGraph(graph); }
             finally { backend.DestroyCapturedGraph(graph); }
             backend.Synchronize();
@@ -2712,6 +2716,8 @@ public class DirectPtxWmmaTests
                     input, weights, activationScale, weightScales, bias, output,
                     inputFeatures, outputFeatures));
             Assert.True(captured, backend.DirectPtxLastError);
+            Assert.NotEqual(IntPtr.Zero, graph);
+            Assert.Equal(1, backend.DirectPtxQuantizedLinearPinnedKernelCount);
             try { backend.LaunchCapturedGraph(graph); }
             finally { backend.DestroyCapturedGraph(graph); }
             backend.Synchronize();
