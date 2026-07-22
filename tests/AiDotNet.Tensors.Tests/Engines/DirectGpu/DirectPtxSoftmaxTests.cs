@@ -85,13 +85,13 @@ public class DirectPtxSoftmaxTests
             double sum = 0;
             for (int col = 0; col < n; col++)
             {
-                double x = xHost[row * n + col];
-                sum += 1.0 + x + 0.5 * x * x;
+                double xv = xHost[row * n + col];
+                sum += 1.0 + xv + 0.5 * xv * xv;
             }
             for (int col = 0; col < n; col++)
             {
-                double x = xHost[row * n + col];
-                expected[row * n + col] = (float)((1.0 + x + 0.5 * x * x) / sum);
+                double xv = xHost[row * n + col];
+                expected[row * n + col] = (float)((1.0 + xv + 0.5 * xv * xv) / sum);
             }
         }
 
