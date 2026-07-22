@@ -123,7 +123,7 @@ def main():
                 (key_cache[position].double() - expected_key).abs().max().item(),
                 (value_cache[position].double() - projected_reference[2]).abs().max().item(),
             )
-            del probe, projected_reference, expected_query, expected_key
+            del probe
 
             capture_stream = torch.cuda.Stream()
             capture_stream.wait_stream(torch.cuda.current_stream())
@@ -139,10 +139,27 @@ def main():
                 graph.replay()
                 return graph_query
 
+            # Compile and validate outside every timing distribution. This lane
+            # is mandatory on the release machine: silently omitting an
+            # available Inductor/Triton fusion would not establish the strongest
+            # relevant PyTorch competitor.
+            compiled_operation = torch.compile(
+                operation, mode="max-autotune", fullgraph=True)
+            for _ in range(3):
+                compiled_query = compiled_operation()
+            torch.cuda.synchronize()
+            compiled_error = max(
+                (compiled_query.double() - expected_query).abs().max().item(),
+                (key_cache[position].double() - expected_key).abs().max().item(),
+                (value_cache[position].double() - projected_reference[2]).abs().max().item(),
+            )
+            del compiled_query, projected_reference, expected_query, expected_key
+
             useful_flops = 6.0 * model * model
-            for method, measured_operation in (
-                ("PyTorch CUDA eager", operation),
-                ("PyTorch CUDA graph", graph_operation),
+            for method, measured_operation, method_error in (
+                ("PyTorch CUDA eager", operation, max_error),
+                ("PyTorch CUDA graph", graph_operation, max_error),
+                ("PyTorch compile max-autotune", compiled_operation, compiled_error),
             ):
                 device_values = measure_device(measured_operation)
                 e2e_values = measure_e2e(measured_operation)
@@ -169,10 +186,10 @@ def main():
                     "e2e_tokens_per_second": 1e6 / e2e_values[1],
                     "tflops": useful_flops / (device_values[1] * 1e-6) / 1e12,
                     "peak_device_bytes": peak_bytes,
-                    "max_error": max_error,
+                    "max_error": method_error,
                 }
                 print(json.dumps(record, separators=(",", ":")))
-            del x, weights, bias, cosine, sine, key_cache, value_cache
+            del compiled_operation, x, weights, bias, cosine, sine, key_cache, value_cache
     return 0
 
 

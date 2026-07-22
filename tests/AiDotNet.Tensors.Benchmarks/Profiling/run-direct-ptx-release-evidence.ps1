@@ -84,8 +84,8 @@ function Assert-QkvReleaseGate([string]$Root, [int]$RunCount, [bool]$IncludeExte
         if ($IncludeExternal) {
             $pythonPath = Join-Path $Root ($prefix + '-qkv-rope-cache-pytorch.log')
             $pythonRows = @(Read-QkvPythonRows $pythonPath | Where-Object { $_.status -eq 'ok' })
-            if ($pythonRows.Count -ne 6) {
-                throw "QKV release gate expected 6 PyTorch rows in '$pythonPath'; found $($pythonRows.Count)."
+            if ($pythonRows.Count -ne 9) {
+                throw "QKV release gate expected 9 PyTorch rows in '$pythonPath'; found $($pythonRows.Count)."
             }
             Assert-QkvDecodeThroughput $pythonRows $pythonPath
         }
@@ -119,7 +119,20 @@ function Assert-QkvReleaseGate([string]$Root, [int]$RunCount, [bool]$IncludeExte
 
             $peers = @($current[0])
             if ($IncludeExternal) {
-                $peers += @($pythonRows | Where-Object { $_.shape -eq $shape })
+                $shapePeers = @($pythonRows | Where-Object { $_.shape -eq $shape })
+                $expectedPeerMethods = @(
+                    'PyTorch CUDA eager',
+                    'PyTorch CUDA graph',
+                    'PyTorch compile max-autotune'
+                )
+                if ($shapePeers.Count -ne $expectedPeerMethods.Count -or
+                    @($expectedPeerMethods | Where-Object {
+                        $method = $_
+                        @($shapePeers | Where-Object { $_.method -eq $method }).Count -ne 1
+                    }).Count -ne 0) {
+                    throw "QKV release gate has an incomplete or duplicate PyTorch method set for run $run '$shape'."
+                }
+                $peers += $shapePeers
             }
             foreach ($peer in $peers) {
                 if ([double]$peer.max_error -gt 2e-5) {

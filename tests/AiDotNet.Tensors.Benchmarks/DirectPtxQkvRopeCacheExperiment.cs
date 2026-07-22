@@ -420,9 +420,20 @@ internal static class DirectPtxQkvRopeCacheExperiment
         int expectedRuns,
         bool includeExternal)
     {
+        string[] expectedPythonMethods =
+        [
+            "PyTorch CUDA eager",
+            "PyTorch CUDA graph",
+            "PyTorch compile max-autotune"
+        ];
         bool complete = evidence.Count == expectedRuns * Shapes.Length &&
             (!includeExternal ||
-                python.Count(record => record.Status == "ok") == expectedRuns * Shapes.Length * 2);
+                python.Count(record => record.Status == "ok") ==
+                    expectedRuns * Shapes.Length * expectedPythonMethods.Length) &&
+            (!includeExternal || Enumerable.Range(1, expectedRuns).All(run =>
+                Shapes.All(shape => expectedPythonMethods.All(method =>
+                    python.Count(record => record.Status == "ok" && record.Run == run &&
+                        record.Shape == shape.Name && record.Method == method) == 1))));
         bool correct = evidence.All(cell =>
             cell.DirectError <= 2e-5f && cell.CurrentError <= 2e-5f) &&
             python.Where(record => record.Status == "ok").All(record => record.MaxError <= 2e-5);
