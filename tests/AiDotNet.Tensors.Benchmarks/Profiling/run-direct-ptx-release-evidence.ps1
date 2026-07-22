@@ -50,6 +50,25 @@ function Read-QkvPythonRows([string]$Path) {
     } | ForEach-Object { $_ | ConvertFrom-Json })
 }
 
+function Assert-QkvDecodeThroughput([object[]]$Rows, [string]$Source) {
+    foreach ($row in $Rows) {
+        $deviceMedian = [double]$row.device_median_us
+        $endToEndMedian = [double]$row.e2e_median_us
+        $deviceTokens = [double]$row.device_tokens_per_second
+        $endToEndTokens = [double]$row.e2e_tokens_per_second
+        if ($deviceMedian -le 0 -or $endToEndMedian -le 0 -or
+            $deviceTokens -le 0 -or $endToEndTokens -le 0) {
+            throw "QKV release gate found missing or non-positive decode throughput in $Source for '$($row.shape)' '$($row.method)'."
+        }
+        $expectedDeviceTokens = 1e6 / $deviceMedian
+        $expectedEndToEndTokens = 1e6 / $endToEndMedian
+        if ([Math]::Abs($deviceTokens - $expectedDeviceTokens) -gt [Math]::Max(1e-6, $expectedDeviceTokens * 1e-9) -or
+            [Math]::Abs($endToEndTokens - $expectedEndToEndTokens) -gt [Math]::Max(1e-6, $expectedEndToEndTokens * 1e-9)) {
+            throw "QKV release gate found inconsistent decode throughput in $Source for '$($row.shape)' '$($row.method)'."
+        }
+    }
+}
+
 function Assert-QkvReleaseGate([string]$Root, [int]$RunCount, [bool]$IncludeExternal) {
     $shapes = @('decode-h4', 'decode-h8', 'decode-h16')
     $verdicts = [System.Collections.Generic.List[object]]::new()
@@ -60,6 +79,7 @@ function Assert-QkvReleaseGate([string]$Root, [int]$RunCount, [bool]$IncludeExte
         if ($dotnetRows.Count -ne 9) {
             throw "QKV release gate expected 9 .NET rows in '$dotnetPath'; found $($dotnetRows.Count)."
         }
+        Assert-QkvDecodeThroughput $dotnetRows $dotnetPath
         $pythonRows = @()
         if ($IncludeExternal) {
             $pythonPath = Join-Path $Root ($prefix + '-qkv-rope-cache-pytorch.log')
@@ -67,6 +87,7 @@ function Assert-QkvReleaseGate([string]$Root, [int]$RunCount, [bool]$IncludeExte
             if ($pythonRows.Count -ne 6) {
                 throw "QKV release gate expected 6 PyTorch rows in '$pythonPath'; found $($pythonRows.Count)."
             }
+            Assert-QkvDecodeThroughput $pythonRows $pythonPath
         }
 
         foreach ($shape in $shapes) {

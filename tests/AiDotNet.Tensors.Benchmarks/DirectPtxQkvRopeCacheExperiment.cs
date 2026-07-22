@@ -338,11 +338,11 @@ internal static class DirectPtxQkvRopeCacheExperiment
     {
         Console.WriteLine(
             $"{"Run",3} {"Shape",-11} {"Method",-23} {"dev mean",9} {"dev med",9} " +
-            $"{"dev p95",9} {"dev p99",9} {"E2E mean",9} {"E2E med",9} " +
-            $"{"E2E p95",9} {"E2E p99",9} {"TFLOPS",8} {"managed B",9} " +
+            $"{"dev p95",9} {"dev p99",9} {"dev tok/s",11} {"E2E mean",9} {"E2E med",9} " +
+            $"{"E2E p95",9} {"E2E p99",9} {"E2E tok/s",11} {"TFLOPS",8} {"managed B",9} " +
             $"{"temp/peak B",11} {"max err",10} " +
             $"{"regs",5} {"shared",7} {"local",5} {"occ",4}");
-        Console.WriteLine(new string('-', 203));
+        Console.WriteLine(new string('-', 227));
     }
 
     private static void Print(
@@ -363,7 +363,9 @@ internal static class DirectPtxQkvRopeCacheExperiment
         Console.WriteLine(
             $"{run,3} {shape.Name,-11} {method,-23} " +
             $"{device.Mean,9:F2} {device.Median,9:F2} {device.P95,9:F2} {device.P99,9:F2} " +
+            $"{DecodeTokensPerSecond(device.Median),11:F0} " +
             $"{endToEnd.Mean,9:F2} {endToEnd.Median,9:F2} {endToEnd.P95,9:F2} {endToEnd.P99,9:F2} " +
+            $"{DecodeTokensPerSecond(endToEnd.Median),11:F0} " +
             $"{tflops,8:F3} {ManagedBytes(bytes),9} {temporaryBytes,11} " +
             $"{error,10:G4} {Dash(registers),5} {Dash(shared),7} {Dash(local),5} {Dash(occupancy),4}");
         Console.WriteLine("qkv_evidence_json=" + JsonSerializer.Serialize(new
@@ -376,10 +378,12 @@ internal static class DirectPtxQkvRopeCacheExperiment
             device_median_us = device.Median,
             device_p95_us = device.P95,
             device_p99_us = device.P99,
+            device_tokens_per_second = DecodeTokensPerSecond(device.Median),
             e2e_mean_us = endToEnd.Mean,
             e2e_median_us = endToEnd.Median,
             e2e_p95_us = endToEnd.P95,
             e2e_p99_us = endToEnd.P99,
+            e2e_tokens_per_second = DecodeTokensPerSecond(endToEnd.Median),
             tflops,
             managed_bytes = bytes,
             temporary_device_bytes = temporaryBytes,
@@ -392,6 +396,9 @@ internal static class DirectPtxQkvRopeCacheExperiment
     }
 
     private static string ManagedBytes(long value) => value < 0 ? "n/a" : value.ToString();
+
+    private static double DecodeTokensPerSecond(double medianMicroseconds) =>
+        1_000_000.0 / medianMicroseconds;
 
     private static void PrintPython(PythonRecord record)
     {
