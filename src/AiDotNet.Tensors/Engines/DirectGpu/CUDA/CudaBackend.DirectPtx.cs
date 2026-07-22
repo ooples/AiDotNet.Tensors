@@ -97,6 +97,8 @@ public sealed partial class CudaBackend
 
     internal long DirectPtxQkvRopeCacheDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxQkvRopeCacheDispatchCount);
+    internal int DirectPtxQkvRopeCacheKernelCapacity => _directPtxQkvRopeCacheKernels.Capacity;
+    internal int DirectPtxQkvRopeCachePinnedKernelCount => _directPtxQkvRopeCacheKernels.PinnedCount;
 
     /// <summary>
     /// Attempts the baked FP32 decode-token D64 specialization that projects
@@ -180,6 +182,12 @@ public sealed partial class CudaBackend
                 }
                 _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                 PtxFusedQkvRopeCacheD64Kernel kernel = GetOrCreateQkvRopeCacheKernel(key);
+                // A graph executable retains this CUfunction after capture.
+                // cuModuleUnload invalidates function handles, so a captured
+                // specialization must never be selected as an LRU victim.
+                if (capturing && !_directPtxQkvRopeCacheKernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX QKV/RoPE/cache module for CUDA graph capture.");
                 lock (GpuDispatchLock)
                     kernel.Launch(
                         DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]),

@@ -664,6 +664,28 @@ public class DirectPtxWmmaTests
     }
 
     [Fact]
+    public void KernelCache_GraphPinnedEntriesAreNeverEvicted()
+    {
+        using var cache = new DirectPtxKernelCache<int, TrackingDisposable>(2);
+        TrackingDisposable one = cache.GetOrAdd(1, () => new TrackingDisposable());
+        TrackingDisposable two = cache.GetOrAdd(2, () => new TrackingDisposable());
+        Assert.True(cache.Pin(1));
+        TrackingDisposable three = cache.GetOrAdd(3, () => new TrackingDisposable());
+
+        Assert.False(one.IsDisposed);
+        Assert.True(two.IsDisposed);
+        Assert.False(three.IsDisposed);
+        Assert.Equal(1, cache.PinnedCount);
+        Assert.True(cache.Pin(3));
+
+        var rejected = new TrackingDisposable();
+        Assert.Throws<InvalidOperationException>(() => cache.AddOrGetExisting(4, rejected));
+        Assert.True(rejected.IsDisposed);
+        Assert.Equal(2, cache.Count);
+        Assert.Equal(2, cache.PinnedCount);
+    }
+
+    [Fact]
     public void AttentionAutotuner_ExposesArchitectureIndependentShapeCandidates()
     {
         Assert.Equal(new[] { 1 }, DirectPtxAttentionAutotuner.Candidates(16));
@@ -2057,8 +2079,27 @@ public class DirectPtxWmmaTests
                     input, weights, bias, cosine, sine, query, keyCache, valueCache,
                     heads, cacheCapacity, position));
             Assert.True(captureLaunch, backend.DirectPtxLastError);
+            Assert.NotEqual(IntPtr.Zero, graph);
+            Assert.Equal(1, backend.DirectPtxQkvRopeCachePinnedKernelCount);
             try
             {
+                int warmed = 0;
+                foreach (int otherHeads in new[] { 4, 8, 16 })
+                foreach (int otherCapacity in new[] { 16, 32, 64, 128 })
+                for (int otherPosition = 0; otherPosition < otherCapacity; otherPosition++)
+                {
+                    if (otherHeads == heads && otherCapacity == cacheCapacity &&
+                        otherPosition == position)
+                        continue;
+                    Assert.True(backend.PrewarmDirectPtxQkvRopeCacheD64(
+                        otherHeads, otherCapacity, otherPosition), backend.DirectPtxLastError);
+                    if (++warmed >= backend.DirectPtxQkvRopeCacheKernelCapacity)
+                        goto CacheFilled;
+                }
+
+            CacheFilled:
+                Assert.True(backend.TryGetDirectPtxQkvRopeCacheAudit(
+                    heads, cacheCapacity, position, out _));
                 for (int i = 0; i < 8; i++)
                     backend.EnqueueCapturedGraph(graph);
                 backend.Synchronize();

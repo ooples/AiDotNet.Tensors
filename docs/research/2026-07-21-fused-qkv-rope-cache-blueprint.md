@@ -122,12 +122,18 @@ bounded direct-PTX LRU cache, are disposed with the CUDA backend, and carry a
 `DirectPtxKernelAudit` containing the blueprint id, PTX SHA-256, GPU/SM/driver
 fingerprint, JIT resource attributes, launch geometry, active blocks/SM, and
 JIT log. Prewarm is mandatory before CUDA graph capture; capture never emits
-PTX, loads a module, allocates, tunes, performs I/O, or evicts a live module.
+PTX, loads a module, allocates, tunes, or performs I/O. A specialization used
+during capture is pinned without allocation and retained until backend
+disposal, because `cuModuleUnload` invalidates the `CUfunction` retained by the
+graph executable. Eviction skips pinned entries, and a cache whose every slot
+is graph-pinned rejects a new specialization instead of invalidating a live
+graph or exceeding its configured bound.
 
 Tests cover first/middle/last position, H=4/8/16, exact-extent rejection,
 unsupported buckets, public routing, 0 B/call after prewarm, graph
-capture/replay, numerical agreement, cache-row preservation, audit lookup, and
-module disposal through the established cache owner.
+capture/replay after enough specialization churn to force LRU eviction,
+numerical agreement, cache-row preservation, audit lookup, and module disposal
+through the established cache owner.
 
 `CudaBackend.EnqueueCapturedGraph` replays an instantiated graph without a host
 barrier. The caller owns completion and buffer lifetime. This lets the public
