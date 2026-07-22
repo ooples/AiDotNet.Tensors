@@ -2256,6 +2256,11 @@ public class DirectPtxWmmaTests
             DirectPtxDenseLinearCoverageManifest.Get("DirectGpuTensorEngine.TensorMatMul").Status);
         Assert.Equal(DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx,
             DirectPtxDenseLinearCoverageManifest.Get("DirectGpuTensorEngine.FusedLinearBackward").Status);
+        Assert.Equal(DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxDenseLinearCoverageManifest.Get("DirectGpuTensorEngine.FusedLoRAForward").Status);
+        // Every dense-linear cell now has a direct-PTX owner.
+        Assert.DoesNotContain(DirectPtxDenseLinearCoverageManifest.All,
+            cell => cell.Status == DirectPtxDenseLinearCoverageStatus.PlannedDirectPtx);
         Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() =>
             DirectPtxDenseLinearCoverageManifest.Get("UnassignedDenseLinearApi"));
     }
@@ -3229,6 +3234,83 @@ public class DirectPtxWmmaTests
         for (int i = 0; i < actual.Length; i++)
             Assert.True(Math.Abs((float)BitConverter.UInt16BitsToHalf(actual[i]) - expected[i]) < 6e-2f,
                 $"fp16 fanout mismatch at {i}");
+    }
+
+    [Fact]
+    public void FusedLoraForwardStandardEmitter_IsStandardBTwoStageWithSharedZ()
+    {
+        string ptx = PtxFusedLoRAForwardStandardKernel.EmitPtx(8, 6, 64, 256, 256);
+        Assert.Contains(PtxFusedLoRAForwardStandardKernel.EntryPoint, ptx);
+        Assert.Contains("ld.param.f32 %f26, [scale];", ptx);
+        Assert.Contains(".shared .align 16 .b8 z_tile[16384]", ptx);
+        Assert.Contains("STAGE1_K_LOOP:", ptx);
+        Assert.Contains("COL_LOOP:", ptx);
+        Assert.Contains("STAGE2_R_LOOP:", ptx);
+        Assert.Equal(272, Count(ptx, "fma.rn.f32"));       // 128 Z + 128 dY + 16 residual
+        Assert.Equal(16, Count(ptx, "st.global.f32"));
+        Assert.Equal(5, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxFusedLoRAForwardStandardKernel.IsSupportedShape(128, 512, 2048));
+        Assert.False(PtxFusedLoRAForwardStandardKernel.IsPromotedShape(128, 512, 2048));
+    }
+
+    [SkippableTheory]
+    [InlineData(64, 256, 256)]
+    [InlineData(128, 512, 512)]
+    public void DriverOnlyFusedLoraForwardStandard_MatchesOracle(int m, int k, int n)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedFusedLinear(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in standard-layout fused-LoRA specialization is measured on GA10x/SM86.");
+        const float scale = 0.5f;
+        int r = PtxFusedLoRAForwardStandardKernel.Rank;
+        using var kernel = new PtxFusedLoRAForwardStandardKernel(runtime, m, k, n, scale);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+        Assert.Equal(5, kernel.Blueprint.Tensors.Count);
+
+        var random = RandomHelper.CreateSeededRandom(20264300 + m + k + n);
+        float[] xHost = Values(random, m * k, 0.125f);
+        float[] aHost = Values(random, k * r, 0.0625f);       // loraA[K,R] standard
+        float[] bHost = Values(random, r * n, 0.0625f);       // loraB[R,N] standard
+        float[] baseHost = Values(random, m * n, 0.25f);
+        var z = new double[m * r];
+        for (int row = 0; row < m; row++)
+        for (int t = 0; t < r; t++)
+        {
+            double acc = 0;
+            for (int kk = 0; kk < k; kk++) acc += xHost[row * k + kk] * (double)aHost[kk * r + t];
+            z[row * r + t] = acc;
+        }
+        var expected = new float[m * n];
+        for (int row = 0; row < m; row++)
+        for (int col = 0; col < n; col++)
+        {
+            double acc = 0;
+            for (int t = 0; t < r; t++) acc += z[row * r + t] * bHost[t * n + col];
+            expected[row * n + col] = (float)(baseHost[row * n + col] + scale * acc);
+        }
+
+        using var x = runtime.AllocateBytes((nuint)(xHost.Length * sizeof(float)));
+        using var a = runtime.AllocateBytes((nuint)(aHost.Length * sizeof(float)));
+        using var b = runtime.AllocateBytes((nuint)(bHost.Length * sizeof(float)));
+        using var baseBuf = runtime.AllocateBytes((nuint)(baseHost.Length * sizeof(float)));
+        using var output = runtime.AllocateBytes((nuint)(m * n * sizeof(float)));
+        x.Upload<float>(xHost);
+        a.Upload<float>(aHost);
+        b.Upload<float>(bHost);
+        baseBuf.Upload<float>(baseHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(x, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(a, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(b, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(baseBuf, kernel.Blueprint.Tensors[3]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[4]));
+        runtime.Synchronize();
+        var actual = new float[m * n];
+        output.Download<float>(actual);
+        AssertVectorClose(actual, expected, 2e-3f, $"fused lora standard {m}x{k}x{n} r{r}");
     }
 
     [Fact]
