@@ -2238,6 +2238,16 @@ public class DirectPtxWmmaTests
         Assert.Equal(DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx,
             DirectPtxDenseLinearCoverageManifest.Get(
                 "CudaBackend.FusedLinearGELUTransposedM1").Status);
+        // The general-M tiled kernel (PtxFusedLinearTiledKernel) now owns the
+        // FusedLinear* forward-activation family.
+        foreach (string api in new[]
+        {
+            "CudaBackend.FusedLinearReLU", "CudaBackend.FusedLinearSigmoid",
+            "CudaBackend.FusedLinearTanh", "CudaBackend.FusedLinearGELU",
+            "CudaBackend.FusedLinearSwish"
+        })
+            Assert.Equal(DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx,
+                DirectPtxDenseLinearCoverageManifest.Get(api).Status);
         Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() =>
             DirectPtxDenseLinearCoverageManifest.Get("UnassignedDenseLinearApi"));
     }

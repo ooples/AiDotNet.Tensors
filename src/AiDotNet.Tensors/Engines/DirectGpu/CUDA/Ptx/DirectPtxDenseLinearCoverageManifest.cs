@@ -31,6 +31,9 @@ internal static class DirectPtxDenseLinearCoverageManifest
         "shape/dtype-specific PTX GEMM tile; no generic runtime-stride kernel";
     private const string PlannedLinear =
         "shape/dtype/activation-specific PTX fusion with a prepacked weight contract";
+    private const string TiledLinear =
+        "general-M output-major register-blocked PTX tile (PtxFusedLinearTiledKernel) " +
+        "with a fused activation epilogue; fails closed until GPU-validated and promoted";
 
     internal static IReadOnlyList<DirectPtxDenseLinearCoverageCell> All { get; } =
     [
@@ -54,11 +57,11 @@ internal static class DirectPtxDenseLinearCoverageManifest
         Cell("CudaBackend.GemmBiasSwish", "cuBLAS plus NVRTC swish", "swish(A@B+bias)", Dense + ", bias[N]", "FP32", PlannedLinear),
         Cell("CudaBackend.GemmBiasLeakyRelu", "cuBLAS plus NVRTC leaky-ReLU", "leaky_relu(A@B+bias)", Dense + ", bias[N]", "FP32", PlannedLinear),
         Cell("CudaBackend.FusedLinearGELUTransposedM1", "direct PTX or MatMulTransposed+BiasAdd+Gelu", "gelu_tanh(x@transpose(W)+bias)", "x[K], W[N,K], bias/output[N]", "FP32", "v1 Ampere M=1 K/N=512/2048 is performance-qualified; 256/256 and 1024/4096 remain measured candidates", DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx),
-        Cell("CudaBackend.FusedLinearReLU", "NVRTC fused linear kernel", "relu(input@weight+bias)", Dense + ", bias[N]", "FP32", PlannedLinear),
-        Cell("CudaBackend.FusedLinearSigmoid", "NVRTC fused linear kernel", "sigmoid(input@weight+bias)", Dense + ", bias[N]", "FP32", PlannedLinear),
-        Cell("CudaBackend.FusedLinearTanh", "NVRTC fused linear kernel", "tanh(input@weight+bias)", Dense + ", bias[N]", "FP32", PlannedLinear),
+        Cell("CudaBackend.FusedLinearReLU", "NVRTC fused linear kernel", "relu(input@weight+bias)", Dense + ", bias[N]", "FP32", TiledLinear, DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx),
+        Cell("CudaBackend.FusedLinearSigmoid", "NVRTC fused linear kernel", "sigmoid(input@weight+bias)", Dense + ", bias[N]", "FP32", TiledLinear, DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx),
+        Cell("CudaBackend.FusedLinearTanh", "NVRTC fused linear kernel", "tanh(input@weight+bias)", Dense + ", bias[N]", "FP32", TiledLinear, DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx),
         Cell("CudaBackend.FusedLinearGELU", "NVRTC fused linear kernel", "gelu_tanh(input@weight+bias)", Dense + ", bias[N]", "FP32", "input-major general-M contract remains baseline; M=1 output-major route is separate", DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx),
-        Cell("CudaBackend.FusedLinearSwish", "NVRTC fused linear kernel", "swish(input@weight+bias)", Dense + ", bias[N]", "FP32", PlannedLinear),
+        Cell("CudaBackend.FusedLinearSwish", "NVRTC fused linear kernel", "swish(input@weight+bias)", Dense + ", bias[N]", "FP32", TiledLinear, DirectPtxDenseLinearCoverageStatus.ExperimentalDirectPtx),
         Cell("CudaBackend.FusedLinearReLUBackward", "NVRTC backward kernels", "dInput/dWeight/dBias for ReLU linear", "contiguous forward tensors and gradients", "FP32", PlannedLinear),
         Cell("CudaBackend.FusedLinearSigmoidBackward", "NVRTC backward kernels", "dInput/dWeight/dBias for sigmoid linear", "contiguous forward tensors and gradients", "FP32", PlannedLinear),
         Cell("CudaBackend.FusedLinearTanhBackward", "NVRTC backward kernels", "dInput/dWeight/dBias for tanh linear", "contiguous forward tensors and gradients", "FP32", PlannedLinear),
