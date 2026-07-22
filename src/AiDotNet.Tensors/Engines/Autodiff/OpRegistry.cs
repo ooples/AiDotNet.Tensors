@@ -244,6 +244,12 @@ internal static class OpRegistry
 
         // Stochastic (Gumbel uses STE)
         "GumbelSoftmax",
+        // Categorical sampling returns discrete class indices drawn from the
+        // probabilities, so no gradient flows back to them: the sample is a
+        // step function of the input. Unlike GumbelSoftmax it records no tape
+        // node and applies no straight-through estimator. Callers who need a
+        // differentiable relaxation should use GumbelSoftmax instead.
+        "TensorCategoricalSample",
 
         // Arbitrary user function (cannot auto-diff)
         "TensorMap",

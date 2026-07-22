@@ -44,6 +44,15 @@ internal static class DirectPtxArchitecture
     /// </summary>
     internal static bool HasValidatedQkvRopeCache(int major, int minor) =>
         (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The first stochastic specialization is deliberately limited to the
+    /// exact SM for which its launch/resource contract was authored. It stays
+    /// behind an experimental gate until correctness, performance, and Nsight
+    /// evidence promote it.
+    /// </summary>
+    internal static bool HasExperimentalRngDropout(int major, int minor) =>
+        (major, minor) == (8, 6);
 }
 
 internal enum DirectPtxExtentMode

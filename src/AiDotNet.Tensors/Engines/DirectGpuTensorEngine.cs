@@ -14241,29 +14241,32 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
             else
             {
-                float scale = 1.0f / (1.0f - (float)dropoutRate);
                 ulong seed = NextStochasticSeed();
-                using var temporary = backend.AllocateBuffer(input.Length);
-                backend.Dropout(inputBuffer.Buffer, temporary, maskBuffer, input.Length,
-                    (float)dropoutRate, seed, true);
-
-                bool fused = backend.TryFusedBiasDropout(
-                    inputBuffer.Buffer, outputBuffer, biasBuffer.Buffer, maskBuffer,
-                    rows, cols, (float)dropoutRate, scale);
-
-                if (!fused)
+                bool philoxFused = backend is IPhiloxBiasDropoutBackend philoxBackend &&
+                    philoxBackend.TryFusedBiasPhiloxDropout(
+                        inputBuffer.Buffer, outputBuffer, biasBuffer.Buffer, maskBuffer,
+                        rows, cols, (float)dropoutRate, seed);
+                if (!philoxFused)
                 {
-                    backend.BiasAdd(inputBuffer.Buffer, biasBuffer.Buffer, outputBuffer, rows, cols);
-                }
+                    float scale = 1.0f / (1.0f - (float)dropoutRate);
+                    using var temporary = backend.AllocateBuffer(input.Length);
+                    backend.Dropout(inputBuffer.Buffer, temporary, maskBuffer, input.Length,
+                        (float)dropoutRate, seed, true);
 
-                // The dropout kernels historically recomputed 1/(1-p) on-device. OpenCL's
-                // reciprocal can differ from the CPU/API value by one ULP, and the fused kernel
-                // only needs a zero/non-zero mask. Canonicalize the public mask to the host scale
-                // on every backend, then use that exact mask for the unfused result as well.
-                backend.NotEqualScalar(maskBuffer, maskBuffer, 0f, input.Length);
-                backend.Scale(maskBuffer, maskBuffer, scale, input.Length);
-                if (!fused)
-                    backend.Multiply(outputBuffer, maskBuffer, outputBuffer, input.Length);
+                    bool fused = backend.TryFusedBiasDropout(
+                        inputBuffer.Buffer, outputBuffer, biasBuffer.Buffer, maskBuffer,
+                        rows, cols, (float)dropoutRate, scale);
+
+                    if (!fused)
+                        backend.BiasAdd(inputBuffer.Buffer, biasBuffer.Buffer, outputBuffer, rows, cols);
+
+                    // The established kernels need a canonical public FP32 mask. The direct-PTX
+                    // fused path writes that exact mask itself and therefore skips these launches.
+                    backend.NotEqualScalar(maskBuffer, maskBuffer, 0f, input.Length);
+                    backend.Scale(maskBuffer, maskBuffer, scale, input.Length);
+                    if (!fused)
+                        backend.Multiply(outputBuffer, maskBuffer, outputBuffer, input.Length);
+                }
             }
 
             int[] shape = input.Shape.ToArray();
@@ -20829,21 +20832,31 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var bufOut = AllocateOutputBuffer(backend, tensor.Length);
             try
             {
+                bool fusedTraining = false;
                 if (training)
                 {
-                    // Seeded training uses the same counter-based stateless generator as the CPU path so
-                    // the per-element slopes match bit-for-bit; unseeded uses a monotonic process seed.
+                    // Seeded training is reproducible within the selected RNG ABI. The experimental
+                    // admitted path owns a versioned Philox stream; the established fallback retains
+                    // its existing generator. Unseeded calls use a monotonic engine-owned seed.
                     ulong gpuSeed = seed.HasValue
                         ? (ulong)(uint)seed.GetValueOrDefault()
                         : (ulong)System.Threading.Interlocked.Increment(ref _gpuRngSeed);
-                    backend.GenerateRandomUniform(bufNoise.Buffer, tensor.Length, lowerF, upperF, gpuSeed);
+                    fusedTraining = tensor.IsContiguous &&
+                        backend is IPhiloxRReluBackend philoxRrelu &&
+                        philoxRrelu.TryFusedPhiloxRRelu(
+                            bufIn.Buffer, bufNoise.Buffer, bufOut.Buffer,
+                            tensor.Length, lowerF, upperF, gpuSeed);
+                    if (!fusedTraining)
+                        backend.GenerateRandomUniform(
+                            bufNoise.Buffer, tensor.Length, lowerF, upperF, gpuSeed);
                 }
                 else
                 {
                     float mid = (float)((lower + upper) / 2.0);
                     backend.Fill(bufNoise.Buffer, mid, tensor.Length);
                 }
-                backend.RRelu(bufIn.Buffer, bufNoise.Buffer, bufOut.Buffer, tensor.Length);
+                if (!fusedTraining)
+                    backend.RRelu(bufIn.Buffer, bufNoise.Buffer, bufOut.Buffer, tensor.Length);
                 var output = DeferTensorResult<T>(backend, bufOut.Buffer, tensor.Length, tensor.Shape.ToArray());
                 bufOut.RelinquishOwnership();
                 var noise = DeferTensorResult<T>(backend, bufNoise.Buffer, tensor.Length, tensor.Shape.ToArray());
@@ -22450,13 +22463,43 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return base.TensorRepeatElements(tensor, repeats, axis);
     }
 
-    // GenerateDropoutMask and GenerateGaussianNoise return Vector<T> and need CPU-side
-    // post-processing (scale multiplication), so they must download immediately.
+    // These public operations return host vectors, so a successful GPU route must
+    // download the final result immediately. Resident callers should use the tensor APIs.
     Vector<T> IEngine.GenerateDropoutMask<T>(int length, T dropoutRate, T scale, int? seed)
     {
-        if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb))
-        { try { float keepProb = 1f - Convert.ToSingle(dropoutRate); ulong s = seed.HasValue ? (ulong)seed.Value : (ulong)Environment.TickCount; using var go=bb.AllocateBuffer(length); bb.DropoutMask(go,length,keepProb,s); float[] result=bb.DownloadBuffer(go); float sc=Convert.ToSingle(scale); for(int i=0;i<length;i++) result[i]*=sc; return new Vector<T>((T[])(object)result); } catch{} }
-        return base.GenerateDropoutMask(length,dropoutRate,scale,seed);
+        if (typeof(T) == typeof(float) && TryGetBackend(out var backend))
+        {
+            try
+            {
+                float dropProbability = Convert.ToSingle(dropoutRate);
+                float outputScale = Convert.ToSingle(scale);
+                bool finiteDropProbability =
+                    !float.IsNaN(dropProbability) && !float.IsInfinity(dropProbability);
+                bool finiteOutputScale =
+                    !float.IsNaN(outputScale) && !float.IsInfinity(outputScale);
+                if (finiteDropProbability && dropProbability > 0f &&
+                    dropProbability < 1f && finiteOutputScale)
+                {
+                    ulong threshold64 = (ulong)Math.Floor(
+                        dropProbability * 4_294_967_296.0);
+                    if (threshold64 is > 0 and <= uint.MaxValue)
+                    {
+                        uint rngSeed = seed.HasValue
+                            ? unchecked((uint)seed.GetValueOrDefault())
+                            : unchecked((uint)System.Threading.Interlocked.Increment(ref _gpuRngSeed));
+                        using var output = backend.AllocateBuffer(length);
+                        backend.GenerateStatelessDropoutMask(
+                            output, length, (uint)threshold64, outputScale, rngSeed);
+                        return new Vector<T>((T[])(object)backend.DownloadBuffer(output));
+                    }
+                }
+            }
+            catch
+            {
+                // Preserve the established generic/edge-contract fallback below.
+            }
+        }
+        return base.GenerateDropoutMask(length, dropoutRate, scale, seed);
     }
 
     Vector<T> IEngine.GenerateGaussianNoise<T>(int length, T mean, T standardDeviation, int? seed)
@@ -23128,26 +23171,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     return DispatchDeferredGpuOp<T>(backend, total, shape,
                         output => backend.Fill(output, 0f, total));
 
-                if (seed.HasValue)
-                {
-                    uint thresholdBits = checked((uint)StatelessRandom.ProbabilityThreshold(dropProbability));
-                    uint randomSeed = unchecked((uint)seed.Value);
-                    return DispatchDeferredGpuOp<T>(backend, total, shape,
-                        output => backend.GenerateStatelessDropoutMask(
-                            output, total, thresholdBits, outputScale, randomSeed));
-                }
-
-                using var random = AllocateOutputBuffer(backend, total);
-                using var threshold = AllocateOutputBuffer(backend, total);
-                return DispatchDeferredGpuOp<T>(backend, total, shape, output =>
-                {
-                    backend.GenerateRandomUniform(
-                        random.Buffer, total, 0f, 1f, unchecked((ulong)Environment.TickCount));
-                    backend.Fill(threshold.Buffer, dropProbability, total);
-                    backend.LessThan(random.Buffer, threshold.Buffer, output, total);
-                    backend.Scale(output, output, -outputScale, total);
-                    backend.AddScalar(output, output, outputScale, total);
-                });
+                uint thresholdBits = checked((uint)
+                    StatelessRandom.ProbabilityThreshold(dropProbability));
+                uint randomSeed = seed.HasValue
+                    ? unchecked((uint)seed.Value)
+                    : unchecked((uint)System.Threading.Interlocked.Increment(ref _gpuRngSeed));
+                return DispatchDeferredGpuOp<T>(backend, total, shape,
+                    output => backend.GenerateStatelessDropoutMask(
+                        output, total, thresholdBits, outputScale, randomSeed));
             }
             catch { }
         }
