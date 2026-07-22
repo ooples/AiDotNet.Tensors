@@ -4375,6 +4375,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (!IsAvailable)
             throw new InvalidOperationException("CUDA backend is not available.");
 
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxCsrSegmentReduceVec4F32(
+            csrColIndices, csrRowPointers, input, output, M, K, N,
+            DirectPtxCsrSegmentReduction.Max))
+            return;
+#endif
+
         if (!_kernelCache.TryGetValue("csr_segmented_max", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: csr_segmented_max");
 
@@ -4411,6 +4418,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (!IsAvailable)
             throw new InvalidOperationException("CUDA backend is not available.");
+
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxCsrSegmentReduceVec4F32(
+            csrColIndices, csrRowPointers, input, output, M, K, N,
+            DirectPtxCsrSegmentReduction.Min))
+            return;
+#endif
 
         if (!_kernelCache.TryGetValue("csr_segmented_min", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: csr_segmented_min");
@@ -4449,6 +4463,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (!IsAvailable)
             throw new InvalidOperationException("CUDA backend is not available.");
+
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxCsrSegmentReduceVec4F32(
+            csrColIndices, csrRowPointers, input, output, M, K, N,
+            DirectPtxCsrSegmentReduction.StdDev, epsilon))
+            return;
+#endif
 
         if (!_kernelCache.TryGetValue("csr_segmented_stddev", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: csr_segmented_stddev");

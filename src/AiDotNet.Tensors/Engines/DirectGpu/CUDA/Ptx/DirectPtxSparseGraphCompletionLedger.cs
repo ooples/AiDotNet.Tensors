@@ -51,7 +51,7 @@ internal static class DirectPtxSparseGraphCompletionLedger
             "scatter_add_edges", "csr_spmm_backward_b",
             "csr_spmm_backward_b_deterministic", "csr_spmm_backward_values", "zero_buffer",
             "init_neg_inf", "degree_normalize", "symmetric_degree_normalize");
-        Add("CudaBackend.CSR", DirectPtxSparseGraphCompletionStatus.MissingDirectPtx,
+        Add("CudaBackend.CSR", DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx,
             "csr_segmented_max", "csr_segmented_min", "csr_segmented_stddev");
         Add("CudaSnnKernels", DirectPtxSparseGraphCompletionStatus.MissingDirectPtx,
             "enforce_2x4_sparsity", "decompress_2x4_sparse", "sparse_gemm_2x4", "sparse_gemm_bias_relu",

@@ -16,7 +16,7 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
             DirectPtxSparseGraphCompletionLedger.All
                 .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(15, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+        Assert.Equal(18, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
             entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
         Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
         Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
@@ -256,6 +256,27 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal("ascending-item-index", blueprint.Semantics["reduction-order"]);
         Assert.Equal("single-overwrite", blueprint.Semantics["output-write"]);
         Assert.Equal("0", blueprint.Semantics["intermediate-global-bytes"]);
+    }
+
+    [Theory]
+    [InlineData((int)DirectPtxCsrSegmentReduction.Max)]
+    [InlineData((int)DirectPtxCsrSegmentReduction.Min)]
+    [InlineData((int)DirectPtxCsrSegmentReduction.StdDev)]
+    public void CsrSegmentReduceEmitter_UsesExactPointerOnlyLegacyCsrAbi(int reductionValue)
+    {
+        var reduction = (DirectPtxCsrSegmentReduction)reductionValue;
+        string ptx = PtxCsrSegmentReduceVec4F32Kernel.EmitPtx(8, 6, reduction, 1e-8f);
+        DirectPtxKernelBlueprint blueprint = PtxCsrSegmentReduceVec4F32Kernel.CreateBlueprint(
+            DirectPtxArchitectureFamily.Ampere, reduction, 1e-8f);
+
+        Assert.Equal(4, Count(ptx, ".param .u64"));
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.Equal(1, Count(ptx, "st.global.v4.f32"));
+        Assert.Equal(DirectPtxPhysicalType.Float32, blueprint.Tensors[0].PhysicalType);
+        Assert.Equal(DirectPtxPhysicalLayout.CsrFloatColumnIndices, blueprint.Tensors[0].Layout);
+        Assert.Equal(DirectPtxPhysicalLayout.CsrFloatRowPointers, blueprint.Tensors[1].Layout);
+        Assert.Equal("zero", blueprint.Semantics["empty-row"]);
+        Assert.Equal("single-overwrite", blueprint.Semantics["output-write"]);
     }
 
     [Theory]

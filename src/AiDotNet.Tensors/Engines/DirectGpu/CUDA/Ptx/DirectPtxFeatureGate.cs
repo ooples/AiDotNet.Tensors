@@ -142,6 +142,10 @@ internal enum DirectPtxPhysicalLayout
     SegmentIds,
     /// <summary>Contiguous Int32 item count, one per segment.</summary>
     SegmentSizes,
+    /// <summary>Zero-based CSR column indices encoded as exactly integral FP32 values.</summary>
+    CsrFloatColumnIndices,
+    /// <summary>Monotone CSR row offsets encoded as exactly integral FP32 values.</summary>
+    CsrFloatRowPointers,
     /// <summary>Dense additive attention bias, [H,Sq,Skv] or [B,H,Sq,Skv].</summary>
     AttentionBias,
     /// <summary>One-dimensional canonical vector.</summary>
