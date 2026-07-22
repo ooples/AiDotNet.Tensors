@@ -19,6 +19,8 @@ public sealed partial class CudaBackend
         _directPtxAttentionPlans = new(DirectPtxFeatureGate.CacheCapacity);
     private readonly DirectPtxKernelCache<DirectPtxResidualRmsNormKey, PtxFusedResidualRmsNormD64Kernel>
         _directPtxResidualRmsNormKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<DirectPtxResidualRmsNormKey, PtxFusedResidualBiasLayerNormGeluD64Kernel>
+        _directPtxResidualLayerNormGeluKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<DirectPtxDecodeKey, PtxFusedDecodeAttentionD64Kernel>
         _directPtxDecodeKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<DirectPtxPagedPrefillKey, PtxFusedPagedPrefillAttentionD64Kernel>
@@ -29,6 +31,20 @@ public sealed partial class CudaBackend
         _directPtxFlashAttentionBackwardKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<DirectPtxQkvRopeCacheKey, PtxFusedQkvRopeCacheD64Kernel>
         _directPtxQkvRopeCacheKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<DirectPtxSwiGluKey, PtxFusedSwiGluF32Kernel>
+        _directPtxSwiGluKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<DirectPtxSwiGluKey, PtxFusedGeGluF32Kernel>
+        _directPtxGeGluKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<DirectPtxSwiGluKey, PtxFusedGeGluBackwardF32Kernel>
+        _directPtxGeGluBackwardKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<DirectPtxFusedLinearKey, PtxFusedLinearGeluM1Kernel>
+        _directPtxFusedLinearKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<DirectPtxFusedLinearKey, PtxFusedLinearGeluFp16M1Kernel>
+        _directPtxMixedLinearKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<DirectPtxFusedLinearKey, PtxFusedLinearGeluFp16M16Kernel>
+        _directPtxMixedLinearM16Kernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<DirectPtxFusedLinearKey, PtxFusedLinearGeluW8A8M1Kernel>
+        _directPtxQuantizedLinearKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private DirectPtxRuntime? _directPtxRuntime;
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
@@ -37,11 +53,18 @@ public sealed partial class CudaBackend
         System.Threading.Interlocked.Read(ref _directPtxAttentionDispatchCount);
     private long _directPtxAttentionDispatchCount;
     private long _directPtxResidualRmsNormDispatchCount;
+    private long _directPtxResidualLayerNormGeluDispatchCount;
     private long _directPtxDecodeDispatchCount;
     private long _directPtxPagedPrefillDispatchCount;
     private long _directPtxAttentionBackwardDispatchCount;
     private long _directPtxFlashAttentionBackwardDispatchCount;
     private long _directPtxQkvRopeCacheDispatchCount;
+    private long _directPtxSwiGluDispatchCount;
+    private long _directPtxGeGluDispatchCount;
+    private long _directPtxGeGluBackwardDispatchCount;
+    private long _directPtxFusedLinearDispatchCount;
+    private long _directPtxMixedLinearDispatchCount;
+    private long _directPtxQuantizedLinearDispatchCount;
     internal int DirectPtxCachedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxAttentionKernels.Count; }
@@ -54,6 +77,10 @@ public sealed partial class CudaBackend
     internal bool IsDirectPtxResidualRmsNormEnabled =>
         _directPtxResidualRmsNormOptedIn && IsAvailable &&
         DirectPtxArchitecture.HasValidatedOnlineAttention(_ccMajor, _ccMinor);
+
+    internal bool IsDirectPtxResidualLayerNormGeluEnabled =>
+        DirectPtxFeatureGate.IsResidualLayerNormGeluEnabled && IsAvailable &&
+        DirectPtxArchitecture.HasValidatedResidualLayerNormGelu(_ccMajor, _ccMinor);
 
     internal bool IsDirectPtxFlashDecodeEnabled =>
         DirectPtxFeatureGate.IsFlashDecodeEnabled && IsAvailable &&
@@ -79,8 +106,33 @@ public sealed partial class CudaBackend
         DirectPtxFeatureGate.IsQkvRopeCacheEnabled && IsAvailable &&
         DirectPtxArchitecture.HasValidatedQkvRopeCache(_ccMajor, _ccMinor);
 
+    internal bool IsDirectPtxSwiGluEnabled =>
+        DirectPtxFeatureGate.IsSwiGluEnabled && IsAvailable &&
+        DirectPtxArchitecture.HasValidatedGatedGlu(_ccMajor, _ccMinor);
+
+    internal bool IsDirectPtxGeGluEnabled =>
+        DirectPtxFeatureGate.IsGeGluEnabled && IsAvailable &&
+        DirectPtxArchitecture.HasValidatedGatedGlu(_ccMajor, _ccMinor);
+    internal bool IsDirectPtxFusedLinearEnabled =>
+        DirectPtxFeatureGate.IsFusedLinearEnabled && IsAvailable &&
+        DirectPtxArchitecture.HasValidatedFusedLinear(_ccMajor, _ccMinor);
+
+    internal bool IsDirectPtxMixedLinearEnabled =>
+        DirectPtxFeatureGate.IsMixedPrecisionLinearEnabled && IsAvailable &&
+        DirectPtxArchitecture.HasValidatedMixedLinear(_ccMajor, _ccMinor);
+
+    internal bool IsDirectPtxQuantizedLinearEnabled =>
+        DirectPtxFeatureGate.IsQuantizedLinearEnabled && IsAvailable &&
+        DirectPtxArchitecture.HasValidatedQuantizedLinear(_ccMajor, _ccMinor);
+
     internal long DirectPtxResidualRmsNormDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxResidualRmsNormDispatchCount);
+    internal long DirectPtxResidualLayerNormGeluDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxResidualLayerNormGeluDispatchCount);
+    internal int DirectPtxResidualLayerNormGeluPinnedKernelCount
+    {
+        get { lock (_directPtxLock) return _directPtxResidualLayerNormGeluKernels.PinnedCount; }
+    }
 
     internal long DirectPtxDecodeDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxDecodeDispatchCount);
@@ -96,6 +148,32 @@ public sealed partial class CudaBackend
 
     internal long DirectPtxQkvRopeCacheDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxQkvRopeCacheDispatchCount);
+    internal long DirectPtxSwiGluDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxSwiGluDispatchCount);
+
+    internal long DirectPtxGeGluDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxGeGluDispatchCount);
+
+    internal long DirectPtxGeGluBackwardDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxGeGluBackwardDispatchCount);
+    internal int DirectPtxSwiGluPinnedKernelCount
+    {
+        get { lock (_directPtxLock) return _directPtxSwiGluKernels.PinnedCount; }
+    }
+    internal int DirectPtxGeGluPinnedKernelCount
+    {
+        get { lock (_directPtxLock) return _directPtxGeGluKernels.PinnedCount; }
+    }
+    internal int DirectPtxGeGluBackwardPinnedKernelCount
+    {
+        get { lock (_directPtxLock) return _directPtxGeGluBackwardKernels.PinnedCount; }
+    }
+    internal long DirectPtxFusedLinearDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxFusedLinearDispatchCount);
+    internal int DirectPtxFusedLinearPinnedKernelCount
+    {
+        get { lock (_directPtxLock) return _directPtxFusedLinearKernels.PinnedCount; }
+    }
     internal int DirectPtxQkvRopeCacheKernelCapacity => _directPtxQkvRopeCacheKernels.Capacity;
     internal int DirectPtxQkvRopeCachePinnedKernelCount
     {
@@ -336,6 +414,603 @@ public sealed partial class CudaBackend
         {
             var key = new DirectPtxQkvRopeCacheKey(heads, cacheCapacity, position);
             if (_directPtxQkvRopeCacheKernels.TryGetValue(key, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null!;
+        return false;
+    }
+
+    internal long DirectPtxMixedLinearDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxMixedLinearDispatchCount);
+
+    internal long DirectPtxQuantizedLinearDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxQuantizedLinearDispatchCount);
+    internal int DirectPtxMixedLinearPinnedKernelCount
+    {
+        get { lock (_directPtxLock) return _directPtxMixedLinearKernels.PinnedCount; }
+    }
+    internal int DirectPtxMixedLinearM16PinnedKernelCount
+    {
+        get { lock (_directPtxLock) return _directPtxMixedLinearM16Kernels.PinnedCount; }
+    }
+    internal int DirectPtxQuantizedLinearPinnedKernelCount
+    {
+        get { lock (_directPtxLock) return _directPtxQuantizedLinearKernels.PinnedCount; }
+    }
+
+    /// <summary>
+    /// Attempts the exact contiguous FP16-input/weight, FP32-accumulate M=1
+    /// linear + FP32 bias + tanh-GELU specialization.
+    /// </summary>
+    internal bool TryDirectPtxFusedLinearGeluFp16M1(
+        IGpuBuffer inputHalf,
+        IGpuBuffer outputMajorWeightsHalf,
+        IGpuBuffer biasFloat,
+        IGpuBuffer outputFloat,
+        int inputFeatures,
+        int outputFeatures)
+    {
+        if (!IsDirectPtxMixedLinearEnabled) return false;
+        if (!PtxFusedLinearGeluFp16M1Kernel.IsSupportedShape(inputFeatures, outputFeatures))
+        {
+            DirectPtxLastError = "mixed-linear-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedLinearGeluFp16M1Kernel.IsPromotedShape(inputFeatures, outputFeatures) &&
+            !DirectPtxFeatureGate.MixedPrecisionLinearExperimentOverride)
+        {
+            DirectPtxLastError = "mixed-linear-performance-gate-not-met";
+            return false;
+        }
+        long inputBytes = checked((long)inputFeatures * sizeof(ushort));
+        long weightBytes = checked((long)inputFeatures * outputFeatures * sizeof(ushort));
+        long outputBytes = checked((long)outputFeatures * sizeof(float));
+        if (inputHalf.SizeInBytes != inputBytes ||
+            outputMajorWeightsHalf.SizeInBytes != weightBytes ||
+            biasFloat.SizeInBytes != outputBytes || outputFloat.SizeInBytes != outputBytes)
+        {
+            DirectPtxLastError = "mixed-linear-physical-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var key = new DirectPtxFusedLinearKey(inputFeatures, outputFeatures);
+            lock (_directPtxLock)
+            {
+                if (!_directPtxMixedLinearKernels.TryGetValue(
+                    key, out PtxFusedLinearGeluFp16M1Kernel? kernel))
+                {
+                    if (capturing)
+                    {
+                        DirectPtxLastError =
+                            "Direct PTX mixed linear must be prewarmed before CUDA graph capture.";
+                        return false;
+                    }
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    kernel = CreateAndCacheMixedLinearKernelSlow(key);
+                }
+                if (capturing && !_directPtxMixedLinearKernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX mixed-linear module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(inputHalf, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(outputMajorWeightsHalf, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(biasFloat, kernel.Blueprint.Tensors[2]),
+                        DirectPtxTensorView.Create(outputFloat, kernel.Blueprint.Tensors[3]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxMixedLinearDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    private PtxFusedLinearGeluFp16M1Kernel CreateAndCacheMixedLinearKernelSlow(
+        DirectPtxFusedLinearKey key) =>
+        _directPtxMixedLinearKernels.GetOrAdd(key, () =>
+            new PtxFusedLinearGeluFp16M1Kernel(
+                _directPtxRuntime!, key.InputFeatures, key.OutputFeatures));
+
+    internal bool PrewarmDirectPtxFusedLinearGeluFp16M1(
+        int inputFeatures,
+        int outputFeatures)
+    {
+        if (!IsDirectPtxMixedLinearEnabled) return false;
+        if (!PtxFusedLinearGeluFp16M1Kernel.IsSupportedShape(inputFeatures, outputFeatures))
+        {
+            DirectPtxLastError = "mixed-linear-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedLinearGeluFp16M1Kernel.IsPromotedShape(inputFeatures, outputFeatures) &&
+            !DirectPtxFeatureGate.MixedPrecisionLinearExperimentOverride)
+        {
+            DirectPtxLastError = "mixed-linear-performance-gate-not-met";
+            return false;
+        }
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX mixed linear prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                var key = new DirectPtxFusedLinearKey(inputFeatures, outputFeatures);
+                if (!_directPtxMixedLinearKernels.TryGetValue(key, out _))
+                    _ = CreateAndCacheMixedLinearKernelSlow(key);
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxMixedLinearAudit(
+        int inputFeatures,
+        int outputFeatures,
+        out DirectPtxKernelAudit audit)
+    {
+        lock (_directPtxLock)
+        {
+            var key = new DirectPtxFusedLinearKey(inputFeatures, outputFeatures);
+            if (_directPtxMixedLinearKernels.TryGetValue(key, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null!;
+        return false;
+    }
+
+    /// <summary>
+    /// Attempts the exact contiguous symmetric W8A8 M=1 projection with S32
+    /// DP4A accumulation and a fused FP32 dequant/bias/tanh-GELU epilogue.
+    /// </summary>
+    internal bool TryDirectPtxFusedLinearGeluW8A8M1(
+        IGpuBuffer inputInt8,
+        IGpuBuffer outputMajorWeightsInt8,
+        IGpuBuffer activationScaleFloat,
+        IGpuBuffer weightScalesFloat,
+        IGpuBuffer biasFloat,
+        IGpuBuffer outputFloat,
+        int inputFeatures,
+        int outputFeatures)
+    {
+        if (!IsDirectPtxQuantizedLinearEnabled) return false;
+        if (!PtxFusedLinearGeluW8A8M1Kernel.IsSupportedShape(inputFeatures, outputFeatures))
+        {
+            DirectPtxLastError = "quantized-linear-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedLinearGeluW8A8M1Kernel.IsPromotedShape(inputFeatures, outputFeatures) &&
+            !DirectPtxFeatureGate.QuantizedLinearExperimentOverride)
+        {
+            DirectPtxLastError = "quantized-linear-performance-gate-not-met";
+            return false;
+        }
+        long outputBytes = checked((long)outputFeatures * sizeof(float));
+        if (inputInt8.SizeInBytes != inputFeatures ||
+            outputMajorWeightsInt8.SizeInBytes != checked((long)inputFeatures * outputFeatures) ||
+            activationScaleFloat.SizeInBytes != sizeof(float) ||
+            weightScalesFloat.SizeInBytes != outputBytes ||
+            biasFloat.SizeInBytes != outputBytes || outputFloat.SizeInBytes != outputBytes)
+        {
+            DirectPtxLastError = "quantized-linear-physical-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var key = new DirectPtxFusedLinearKey(inputFeatures, outputFeatures);
+            lock (_directPtxLock)
+            {
+                if (!_directPtxQuantizedLinearKernels.TryGetValue(
+                    key, out PtxFusedLinearGeluW8A8M1Kernel? kernel))
+                {
+                    if (capturing)
+                    {
+                        DirectPtxLastError =
+                            "Direct PTX W8A8 linear must be prewarmed before CUDA graph capture.";
+                        return false;
+                    }
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    kernel = CreateAndCacheQuantizedLinearKernelSlow(key);
+                }
+                if (capturing && !_directPtxQuantizedLinearKernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX W8A8-linear module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(inputInt8, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(outputMajorWeightsInt8, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(activationScaleFloat, kernel.Blueprint.Tensors[2]),
+                        DirectPtxTensorView.Create(weightScalesFloat, kernel.Blueprint.Tensors[3]),
+                        DirectPtxTensorView.Create(biasFloat, kernel.Blueprint.Tensors[4]),
+                        DirectPtxTensorView.Create(outputFloat, kernel.Blueprint.Tensors[5]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxQuantizedLinearDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    private PtxFusedLinearGeluW8A8M1Kernel CreateAndCacheQuantizedLinearKernelSlow(
+        DirectPtxFusedLinearKey key) =>
+        _directPtxQuantizedLinearKernels.GetOrAdd(key, () =>
+            new PtxFusedLinearGeluW8A8M1Kernel(
+                _directPtxRuntime!, key.InputFeatures, key.OutputFeatures));
+
+    internal bool PrewarmDirectPtxFusedLinearGeluW8A8M1(
+        int inputFeatures,
+        int outputFeatures)
+    {
+        if (!IsDirectPtxQuantizedLinearEnabled) return false;
+        if (!PtxFusedLinearGeluW8A8M1Kernel.IsSupportedShape(inputFeatures, outputFeatures))
+        {
+            DirectPtxLastError = "quantized-linear-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedLinearGeluW8A8M1Kernel.IsPromotedShape(inputFeatures, outputFeatures) &&
+            !DirectPtxFeatureGate.QuantizedLinearExperimentOverride)
+        {
+            DirectPtxLastError = "quantized-linear-performance-gate-not-met";
+            return false;
+        }
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX W8A8 linear prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                var key = new DirectPtxFusedLinearKey(inputFeatures, outputFeatures);
+                if (!_directPtxQuantizedLinearKernels.TryGetValue(key, out _))
+                    _ = CreateAndCacheQuantizedLinearKernelSlow(key);
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxQuantizedLinearAudit(
+        int inputFeatures,
+        int outputFeatures,
+        out DirectPtxKernelAudit audit)
+    {
+        lock (_directPtxLock)
+        {
+            var key = new DirectPtxFusedLinearKey(inputFeatures, outputFeatures);
+            if (_directPtxQuantizedLinearKernels.TryGetValue(key, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null!;
+        return false;
+    }
+
+    /// <summary>
+    /// Attempts the exact contiguous M=16 FP16-input/weight, FP32-accumulate
+    /// Tensor Core linear + FP32 bias + tanh-GELU specialization.
+    /// </summary>
+    internal bool TryDirectPtxFusedLinearGeluFp16M16(
+        IGpuBuffer inputHalf,
+        IGpuBuffer outputMajorWeightsHalf,
+        IGpuBuffer biasFloat,
+        IGpuBuffer outputFloat,
+        int inputFeatures,
+        int outputFeatures)
+    {
+        if (!IsDirectPtxMixedLinearEnabled) return false;
+        if (!PtxFusedLinearGeluFp16M16Kernel.IsSupportedShape(inputFeatures, outputFeatures))
+        {
+            DirectPtxLastError = "mixed-linear-m16-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedLinearGeluFp16M16Kernel.IsPromotedShape(inputFeatures, outputFeatures) &&
+            !DirectPtxFeatureGate.MixedPrecisionLinearExperimentOverride)
+        {
+            DirectPtxLastError = "mixed-linear-m16-performance-gate-not-met";
+            return false;
+        }
+        long inputBytes = checked((long)PtxFusedLinearGeluFp16M16Kernel.Rows *
+            inputFeatures * sizeof(ushort));
+        long weightBytes = checked((long)inputFeatures * outputFeatures * sizeof(ushort));
+        long biasBytes = checked((long)outputFeatures * sizeof(float));
+        long outputBytes = checked((long)PtxFusedLinearGeluFp16M16Kernel.Rows *
+            outputFeatures * sizeof(float));
+        if (inputHalf.SizeInBytes != inputBytes ||
+            outputMajorWeightsHalf.SizeInBytes != weightBytes ||
+            biasFloat.SizeInBytes != biasBytes || outputFloat.SizeInBytes != outputBytes)
+        {
+            DirectPtxLastError = "mixed-linear-m16-physical-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var key = new DirectPtxFusedLinearKey(inputFeatures, outputFeatures);
+            lock (_directPtxLock)
+            {
+                if (!_directPtxMixedLinearM16Kernels.TryGetValue(
+                    key, out PtxFusedLinearGeluFp16M16Kernel? kernel))
+                {
+                    if (capturing)
+                    {
+                        DirectPtxLastError =
+                            "Direct PTX M=16 mixed linear must be prewarmed before CUDA graph capture.";
+                        return false;
+                    }
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    kernel = CreateAndCacheMixedLinearM16KernelSlow(key);
+                }
+                if (capturing && !_directPtxMixedLinearM16Kernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX M=16 mixed-linear module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(inputHalf, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(outputMajorWeightsHalf, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(biasFloat, kernel.Blueprint.Tensors[2]),
+                        DirectPtxTensorView.Create(outputFloat, kernel.Blueprint.Tensors[3]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxMixedLinearDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    private PtxFusedLinearGeluFp16M16Kernel CreateAndCacheMixedLinearM16KernelSlow(
+        DirectPtxFusedLinearKey key) =>
+        _directPtxMixedLinearM16Kernels.GetOrAdd(key, () =>
+            new PtxFusedLinearGeluFp16M16Kernel(
+                _directPtxRuntime!, key.InputFeatures, key.OutputFeatures));
+
+    internal bool PrewarmDirectPtxFusedLinearGeluFp16M16(
+        int inputFeatures,
+        int outputFeatures)
+    {
+        if (!IsDirectPtxMixedLinearEnabled) return false;
+        if (!PtxFusedLinearGeluFp16M16Kernel.IsSupportedShape(inputFeatures, outputFeatures))
+        {
+            DirectPtxLastError = "mixed-linear-m16-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedLinearGeluFp16M16Kernel.IsPromotedShape(inputFeatures, outputFeatures) &&
+            !DirectPtxFeatureGate.MixedPrecisionLinearExperimentOverride)
+        {
+            DirectPtxLastError = "mixed-linear-m16-performance-gate-not-met";
+            return false;
+        }
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX M=16 mixed linear prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                var key = new DirectPtxFusedLinearKey(inputFeatures, outputFeatures);
+                if (!_directPtxMixedLinearM16Kernels.TryGetValue(key, out _))
+                    _ = CreateAndCacheMixedLinearM16KernelSlow(key);
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxMixedLinearM16Audit(
+        int inputFeatures,
+        int outputFeatures,
+        out DirectPtxKernelAudit audit)
+    {
+        lock (_directPtxLock)
+        {
+            var key = new DirectPtxFusedLinearKey(inputFeatures, outputFeatures);
+            if (_directPtxMixedLinearM16Kernels.TryGetValue(key, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null!;
+        return false;
+    }
+
+    /// <summary>
+    /// Attempts the exact contiguous FP32 M=1 linear + bias + tanh-GELU
+    /// specialization. K and N live in the loaded module, not in the launch ABI.
+    /// </summary>
+    internal bool TryDirectPtxFusedLinearGeluM1(
+        IGpuBuffer input,
+        IGpuBuffer weights,
+        IGpuBuffer bias,
+        IGpuBuffer output,
+        int inputFeatures,
+        int outputFeatures)
+    {
+        if (!IsDirectPtxFusedLinearEnabled) return false;
+        if (!PtxFusedLinearGeluM1Kernel.IsSupportedShape(inputFeatures, outputFeatures))
+        {
+            DirectPtxLastError = "fused-linear-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedLinearGeluM1Kernel.IsPromotedShape(inputFeatures, outputFeatures) &&
+            !DirectPtxFeatureGate.FusedLinearExperimentOverride)
+        {
+            DirectPtxLastError = "fused-linear-performance-gate-not-met";
+            return false;
+        }
+        long inputBytes = checked((long)inputFeatures * sizeof(float));
+        long outputBytes = checked((long)outputFeatures * sizeof(float));
+        long weightBytes = checked((long)inputFeatures * outputFeatures * sizeof(float));
+        if (input.SizeInBytes != inputBytes || weights.SizeInBytes != weightBytes ||
+            bias.SizeInBytes != outputBytes || output.SizeInBytes != outputBytes)
+        {
+            DirectPtxLastError = "fused-linear-physical-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var key = new DirectPtxFusedLinearKey(inputFeatures, outputFeatures);
+            lock (_directPtxLock)
+            {
+                if (!_directPtxFusedLinearKernels.TryGetValue(
+                    key, out PtxFusedLinearGeluM1Kernel? kernel))
+                {
+                    if (capturing)
+                    {
+                        DirectPtxLastError =
+                            "Direct PTX fused linear must be prewarmed before CUDA graph capture.";
+                        return false;
+                    }
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    kernel = CreateAndCacheFusedLinearKernelSlow(key);
+                }
+                // CUDA graph executables retain the CUfunction after capture.
+                // Pin its module so later specialization churn cannot unload it.
+                if (capturing && !_directPtxFusedLinearKernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX fused-linear module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(weights, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(bias, kernel.Blueprint.Tensors[2]),
+                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[3]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxFusedLinearDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    private PtxFusedLinearGeluM1Kernel GetOrCreateFusedLinearKernel(
+        DirectPtxFusedLinearKey key)
+    {
+        if (_directPtxFusedLinearKernels.TryGetValue(
+            key, out PtxFusedLinearGeluM1Kernel? existing))
+            return existing;
+        return CreateAndCacheFusedLinearKernelSlow(key);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxFusedLinearGeluM1Kernel CreateAndCacheFusedLinearKernelSlow(
+        DirectPtxFusedLinearKey key) =>
+        _directPtxFusedLinearKernels.GetOrAdd(key, () =>
+            new PtxFusedLinearGeluM1Kernel(
+                _directPtxRuntime!, key.InputFeatures, key.OutputFeatures));
+
+    internal bool PrewarmDirectPtxFusedLinearGeluM1(
+        int inputFeatures,
+        int outputFeatures)
+    {
+        if (!IsDirectPtxFusedLinearEnabled)
+            return false;
+        if (!PtxFusedLinearGeluM1Kernel.IsSupportedShape(inputFeatures, outputFeatures))
+        {
+            DirectPtxLastError = "fused-linear-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedLinearGeluM1Kernel.IsPromotedShape(inputFeatures, outputFeatures) &&
+            !DirectPtxFeatureGate.FusedLinearExperimentOverride)
+        {
+            DirectPtxLastError = "fused-linear-performance-gate-not-met";
+            return false;
+        }
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX fused linear prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _ = GetOrCreateFusedLinearKernel(
+                    new DirectPtxFusedLinearKey(inputFeatures, outputFeatures));
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxFusedLinearAudit(
+        int inputFeatures,
+        int outputFeatures,
+        out DirectPtxKernelAudit audit)
+    {
+        lock (_directPtxLock)
+        {
+            var key = new DirectPtxFusedLinearKey(inputFeatures, outputFeatures);
+            if (_directPtxFusedLinearKernels.TryGetValue(key, out var kernel))
             {
                 audit = kernel.Audit;
                 return true;
@@ -1552,6 +2227,7 @@ public sealed partial class CudaBackend
         }
         try
         {
+            bool capturing = IsStreamCapturing();
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
@@ -1683,6 +2359,679 @@ public sealed partial class CudaBackend
         return false;
     }
 
+    /// <summary>
+    /// Attempts the exact contiguous FP32 D=64 transformer boundary
+    /// GELU(LayerNorm(input + residual + bias)). The direct kernel reads each
+    /// activation once, retains both values owned by a lane in registers, and
+    /// performs no intermediate global-memory stores.
+    /// </summary>
+    internal bool TryDirectPtxFusedResidualBiasLayerNormGeluD64(
+        IGpuBuffer input,
+        IGpuBuffer residual,
+        IGpuBuffer preNormBias,
+        IGpuBuffer gamma,
+        IGpuBuffer beta,
+        IGpuBuffer output,
+        int rows,
+        float epsilon = 1e-5f)
+    {
+        if (!DirectPtxFeatureGate.IsResidualLayerNormGeluEnabled)
+        {
+            DirectPtxLastError = "residual-layernorm-gelu-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "residual-layernorm-gelu-cuda-unavailable";
+            return false;
+        }
+        if (DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) !=
+            DirectPtxArchitectureFamily.Ampere)
+        {
+            DirectPtxLastError = "residual-layernorm-gelu-architecture-not-validated";
+            return false;
+        }
+        if (!PtxFusedResidualBiasLayerNormGeluD64Kernel.IsSupportedRows(rows))
+        {
+            DirectPtxLastError = "residual-layernorm-gelu-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedResidualBiasLayerNormGeluD64Kernel.IsPromotedRows(rows) &&
+            !DirectPtxFeatureGate.NormalizationExperimentOverride)
+        {
+            DirectPtxLastError = "residual-layernorm-gelu-performance-gate-not-met";
+            return false;
+        }
+
+        long matrixBytes = checked((long)rows * PtxFusedResidualBiasLayerNormGeluD64Kernel.Dimension * sizeof(float));
+        long vectorBytes = PtxFusedResidualBiasLayerNormGeluD64Kernel.Dimension * sizeof(float);
+        if (input.SizeInBytes != matrixBytes || residual.SizeInBytes != matrixBytes ||
+            preNormBias.SizeInBytes != vectorBytes || gamma.SizeInBytes != vectorBytes ||
+            beta.SizeInBytes != vectorBytes || output.SizeInBytes != matrixBytes)
+        {
+            DirectPtxLastError = "residual-layernorm-gelu-physical-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var key = new DirectPtxResidualRmsNormKey(rows, PtxCompat.SingleToInt32Bits(epsilon));
+            lock (_directPtxLock)
+            {
+                if (!_directPtxResidualLayerNormGeluKernels.TryGetValue(
+                    key, out PtxFusedResidualBiasLayerNormGeluD64Kernel? kernel))
+                {
+                    if (capturing)
+                    {
+                        DirectPtxLastError =
+                            "Direct PTX residual LayerNorm+GELU must be prewarmed before CUDA graph capture.";
+                        return false;
+                    }
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    kernel = CreateAndCacheResidualLayerNormGeluKernelSlow(key);
+                }
+                if (capturing && !_directPtxResidualLayerNormGeluKernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX residual LayerNorm+GELU module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(residual, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(preNormBias, kernel.Blueprint.Tensors[2]),
+                        DirectPtxTensorView.Create(gamma, kernel.Blueprint.Tensors[3]),
+                        DirectPtxTensorView.Create(beta, kernel.Blueprint.Tensors[4]),
+                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[5]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxResidualLayerNormGeluDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxFusedResidualBiasLayerNormGeluD64Kernel
+        CreateAndCacheResidualLayerNormGeluKernelSlow(DirectPtxResidualRmsNormKey key) =>
+        _directPtxResidualLayerNormGeluKernels.GetOrAdd(key, () =>
+            new PtxFusedResidualBiasLayerNormGeluD64Kernel(
+                _directPtxRuntime!, key.Rows, PtxCompat.Int32BitsToSingle(key.EpsilonBits)));
+
+    internal bool PrewarmDirectPtxFusedResidualBiasLayerNormGeluD64(
+        int rows,
+        float epsilon = 1e-5f)
+    {
+        if (!DirectPtxFeatureGate.IsResidualLayerNormGeluEnabled)
+        {
+            DirectPtxLastError = "residual-layernorm-gelu-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "residual-layernorm-gelu-cuda-unavailable";
+            return false;
+        }
+        if (DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) !=
+            DirectPtxArchitectureFamily.Ampere)
+        {
+            DirectPtxLastError = "residual-layernorm-gelu-architecture-not-validated";
+            return false;
+        }
+        if (!PtxFusedResidualBiasLayerNormGeluD64Kernel.IsSupportedRows(rows))
+        {
+            DirectPtxLastError = "residual-layernorm-gelu-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedResidualBiasLayerNormGeluD64Kernel.IsPromotedRows(rows) &&
+            !DirectPtxFeatureGate.NormalizationExperimentOverride)
+        {
+            DirectPtxLastError = "residual-layernorm-gelu-performance-gate-not-met";
+            return false;
+        }
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX residual LayerNorm+GELU prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                var key = new DirectPtxResidualRmsNormKey(
+                    rows, PtxCompat.SingleToInt32Bits(epsilon));
+                if (!_directPtxResidualLayerNormGeluKernels.TryGetValue(key, out _))
+                    _ = CreateAndCacheResidualLayerNormGeluKernelSlow(key);
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxResidualLayerNormGeluAudit(
+        int rows,
+        float epsilon,
+        out DirectPtxKernelAudit audit)
+    {
+        lock (_directPtxLock)
+        {
+            var key = new DirectPtxResidualRmsNormKey(rows, PtxCompat.SingleToInt32Bits(epsilon));
+            if (_directPtxResidualLayerNormGeluKernels.TryGetValue(key, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null!;
+        return false;
+    }
+
+    /// <summary>
+    /// Attempts exact contiguous FP32 SwiGLU over rows laid out as
+    /// [value | gate]. Shape and extent validation happens once here; the PTX
+    /// launch ABI contains only input and output pointers.
+    /// </summary>
+    internal bool TryDirectPtxSwiGluForward(
+        IGpuBuffer input,
+        IGpuBuffer output,
+        int outerSize,
+        int halfDimension)
+    {
+        if (!DirectPtxFeatureGate.IsSwiGluEnabled)
+        {
+            DirectPtxLastError = "swiglu-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "swiglu-cuda-unavailable";
+            return false;
+        }
+        if (DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) !=
+            DirectPtxArchitectureFamily.Ampere)
+        {
+            DirectPtxLastError = "swiglu-architecture-not-validated";
+            return false;
+        }
+        if (!PtxFusedSwiGluF32Kernel.IsSupportedShape(outerSize, halfDimension))
+        {
+            DirectPtxLastError = "swiglu-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedSwiGluF32Kernel.IsPromotedShape(outerSize, halfDimension) &&
+            !DirectPtxFeatureGate.SwiGluExperimentOverride)
+        {
+            DirectPtxLastError = "swiglu-performance-gate-not-met";
+            return false;
+        }
+
+        long outputBytes = checked((long)outerSize * halfDimension * sizeof(float));
+        if (input.SizeInBytes != checked(2 * outputBytes) ||
+            output.SizeInBytes != outputBytes)
+        {
+            DirectPtxLastError = "swiglu-physical-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var key = new DirectPtxSwiGluKey(outerSize, halfDimension);
+            lock (_directPtxLock)
+            {
+                if (!_directPtxSwiGluKernels.TryGetValue(
+                    key, out PtxFusedSwiGluF32Kernel? kernel))
+                {
+                    if (capturing)
+                    {
+                        DirectPtxLastError =
+                            "Direct PTX SwiGLU must be prewarmed before CUDA graph capture.";
+                        return false;
+                    }
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    kernel = CreateAndCacheSwiGluKernelSlow(key);
+                }
+                if (capturing && !_directPtxSwiGluKernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX SwiGLU module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[1]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxSwiGluDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxFusedSwiGluF32Kernel CreateAndCacheSwiGluKernelSlow(
+        DirectPtxSwiGluKey key) =>
+        _directPtxSwiGluKernels.GetOrAdd(key, () =>
+            new PtxFusedSwiGluF32Kernel(
+                _directPtxRuntime!, key.OuterSize, key.HalfDimension));
+
+    internal bool PrewarmDirectPtxSwiGluForward(
+        int outerSize,
+        int halfDimension)
+    {
+        if (!DirectPtxFeatureGate.IsSwiGluEnabled)
+        {
+            DirectPtxLastError = "swiglu-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "swiglu-cuda-unavailable";
+            return false;
+        }
+        if (DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) !=
+            DirectPtxArchitectureFamily.Ampere)
+        {
+            DirectPtxLastError = "swiglu-architecture-not-validated";
+            return false;
+        }
+        if (!PtxFusedSwiGluF32Kernel.IsSupportedShape(outerSize, halfDimension))
+        {
+            DirectPtxLastError = "swiglu-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedSwiGluF32Kernel.IsPromotedShape(outerSize, halfDimension) &&
+            !DirectPtxFeatureGate.SwiGluExperimentOverride)
+        {
+            DirectPtxLastError = "swiglu-performance-gate-not-met";
+            return false;
+        }
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX SwiGLU prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                var key = new DirectPtxSwiGluKey(outerSize, halfDimension);
+                if (!_directPtxSwiGluKernels.TryGetValue(key, out _))
+                    _ = CreateAndCacheSwiGluKernelSlow(key);
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxSwiGluAudit(
+        int outerSize,
+        int halfDimension,
+        out DirectPtxKernelAudit audit)
+    {
+        lock (_directPtxLock)
+        {
+            var key = new DirectPtxSwiGluKey(outerSize, halfDimension);
+            if (_directPtxSwiGluKernels.TryGetValue(key, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null!;
+        return false;
+    }
+
+    internal bool TryDirectPtxGeGluForward(
+        IGpuBuffer input,
+        IGpuBuffer output,
+        int outerSize,
+        int halfDimension)
+    {
+        if (!DirectPtxFeatureGate.IsGeGluEnabled)
+        {
+            DirectPtxLastError = "geglu-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "geglu-cuda-unavailable";
+            return false;
+        }
+        if (DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) !=
+            DirectPtxArchitectureFamily.Ampere)
+        {
+            DirectPtxLastError = "geglu-architecture-not-validated";
+            return false;
+        }
+        if (!PtxFusedGeGluF32Kernel.IsSupportedShape(outerSize, halfDimension))
+        {
+            DirectPtxLastError = "geglu-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedGeGluF32Kernel.IsPromotedShape(outerSize, halfDimension) &&
+            !DirectPtxFeatureGate.GeGluExperimentOverride)
+        {
+            DirectPtxLastError = "geglu-performance-gate-not-met";
+            return false;
+        }
+
+        long outputBytes = checked((long)outerSize * halfDimension * sizeof(float));
+        if (input.SizeInBytes != checked(2 * outputBytes) ||
+            output.SizeInBytes != outputBytes)
+        {
+            DirectPtxLastError = "geglu-physical-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var key = new DirectPtxSwiGluKey(outerSize, halfDimension);
+            lock (_directPtxLock)
+            {
+                if (!_directPtxGeGluKernels.TryGetValue(
+                    key, out PtxFusedGeGluF32Kernel? kernel))
+                {
+                    if (capturing)
+                    {
+                        DirectPtxLastError =
+                            "Direct PTX GeGLU must be prewarmed before CUDA graph capture.";
+                        return false;
+                    }
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    kernel = CreateAndCacheGeGluKernelSlow(key);
+                }
+                if (capturing && !_directPtxGeGluKernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX GeGLU module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[1]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxGeGluDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxFusedGeGluF32Kernel CreateAndCacheGeGluKernelSlow(
+        DirectPtxSwiGluKey key) =>
+        _directPtxGeGluKernels.GetOrAdd(key, () =>
+            new PtxFusedGeGluF32Kernel(
+                _directPtxRuntime!, key.OuterSize, key.HalfDimension));
+
+    internal bool PrewarmDirectPtxGeGluForward(
+        int outerSize,
+        int halfDimension)
+    {
+        if (!DirectPtxFeatureGate.IsGeGluEnabled)
+        {
+            DirectPtxLastError = "geglu-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "geglu-cuda-unavailable";
+            return false;
+        }
+        if (DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) !=
+            DirectPtxArchitectureFamily.Ampere)
+        {
+            DirectPtxLastError = "geglu-architecture-not-validated";
+            return false;
+        }
+        if (!PtxFusedGeGluF32Kernel.IsSupportedShape(outerSize, halfDimension))
+        {
+            DirectPtxLastError = "geglu-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedGeGluF32Kernel.IsPromotedShape(outerSize, halfDimension) &&
+            !DirectPtxFeatureGate.GeGluExperimentOverride)
+        {
+            DirectPtxLastError = "geglu-performance-gate-not-met";
+            return false;
+        }
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX GeGLU prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                var key = new DirectPtxSwiGluKey(outerSize, halfDimension);
+                if (!_directPtxGeGluKernels.TryGetValue(key, out _))
+                    _ = CreateAndCacheGeGluKernelSlow(key);
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxGeGluAudit(
+        int outerSize,
+        int halfDimension,
+        out DirectPtxKernelAudit audit)
+    {
+        lock (_directPtxLock)
+        {
+            var key = new DirectPtxSwiGluKey(outerSize, halfDimension);
+            if (_directPtxGeGluKernels.TryGetValue(key, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null!;
+        return false;
+    }
+
+    internal bool TryDirectPtxGeGluBackward(
+        IGpuBuffer gradOutput,
+        IGpuBuffer input,
+        IGpuBuffer gradInput,
+        int outerSize,
+        int halfDimension)
+    {
+        if (!DirectPtxFeatureGate.IsGeGluEnabled)
+        {
+            DirectPtxLastError = "geglu-backward-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "geglu-backward-cuda-unavailable";
+            return false;
+        }
+        if (DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) !=
+            DirectPtxArchitectureFamily.Ampere)
+        {
+            DirectPtxLastError = "geglu-backward-architecture-not-validated";
+            return false;
+        }
+        if (!PtxFusedGeGluBackwardF32Kernel.IsSupportedShape(outerSize, halfDimension))
+        {
+            DirectPtxLastError = "geglu-backward-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedGeGluBackwardF32Kernel.IsPromotedShape(outerSize, halfDimension) &&
+            !DirectPtxFeatureGate.GeGluExperimentOverride)
+        {
+            DirectPtxLastError = "geglu-backward-performance-gate-not-met";
+            return false;
+        }
+
+        long halfBytes = checked((long)outerSize * halfDimension * sizeof(float));
+        long splitBytes = checked(2 * halfBytes);
+        if (gradOutput.SizeInBytes != halfBytes || input.SizeInBytes != splitBytes ||
+            gradInput.SizeInBytes != splitBytes)
+        {
+            DirectPtxLastError = "geglu-backward-physical-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var key = new DirectPtxSwiGluKey(outerSize, halfDimension);
+            lock (_directPtxLock)
+            {
+                if (!_directPtxGeGluBackwardKernels.TryGetValue(
+                    key, out PtxFusedGeGluBackwardF32Kernel? kernel))
+                {
+                    if (capturing)
+                    {
+                        DirectPtxLastError =
+                            "Direct PTX GeGLU backward must be prewarmed before CUDA graph capture.";
+                        return false;
+                    }
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    kernel = CreateAndCacheGeGluBackwardKernelSlow(key);
+                }
+                if (capturing && !_directPtxGeGluBackwardKernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX GeGLU-backward module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(gradOutput, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(gradInput, kernel.Blueprint.Tensors[2]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxGeGluBackwardDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxFusedGeGluBackwardF32Kernel CreateAndCacheGeGluBackwardKernelSlow(
+        DirectPtxSwiGluKey key) =>
+        _directPtxGeGluBackwardKernels.GetOrAdd(key, () =>
+            new PtxFusedGeGluBackwardF32Kernel(
+                _directPtxRuntime!, key.OuterSize, key.HalfDimension));
+
+    internal bool PrewarmDirectPtxGeGluBackward(
+        int outerSize,
+        int halfDimension)
+    {
+        if (!DirectPtxFeatureGate.IsGeGluEnabled)
+        {
+            DirectPtxLastError = "geglu-backward-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "geglu-backward-cuda-unavailable";
+            return false;
+        }
+        if (DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) !=
+            DirectPtxArchitectureFamily.Ampere)
+        {
+            DirectPtxLastError = "geglu-backward-architecture-not-validated";
+            return false;
+        }
+        if (!PtxFusedGeGluBackwardF32Kernel.IsSupportedShape(outerSize, halfDimension))
+        {
+            DirectPtxLastError = "geglu-backward-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedGeGluBackwardF32Kernel.IsPromotedShape(outerSize, halfDimension) &&
+            !DirectPtxFeatureGate.GeGluExperimentOverride)
+        {
+            DirectPtxLastError = "geglu-backward-performance-gate-not-met";
+            return false;
+        }
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX GeGLU-backward prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                var key = new DirectPtxSwiGluKey(outerSize, halfDimension);
+                if (!_directPtxGeGluBackwardKernels.TryGetValue(key, out _))
+                    _ = CreateAndCacheGeGluBackwardKernelSlow(key);
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxGeGluBackwardAudit(
+        int outerSize,
+        int halfDimension,
+        out DirectPtxKernelAudit audit)
+    {
+        lock (_directPtxLock)
+        {
+            var key = new DirectPtxSwiGluKey(outerSize, halfDimension);
+            if (_directPtxGeGluBackwardKernels.TryGetValue(key, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null!;
+        return false;
+    }
+
     internal bool TryGetDirectPtxAttentionAudit(
         int batchHeads,
         float scale,
@@ -1781,11 +3130,19 @@ public sealed partial class CudaBackend
             _directPtxAttentionKernels.Dispose();
             _directPtxAttentionPlans.Clear();
             _directPtxResidualRmsNormKernels.Dispose();
+            _directPtxResidualLayerNormGeluKernels.Dispose();
             _directPtxDecodeKernels.Dispose();
             _directPtxPagedPrefillKernels.Dispose();
             _directPtxAttentionBackwardKernels.Dispose();
             _directPtxFlashAttentionBackwardKernels.Dispose();
             _directPtxQkvRopeCacheKernels.Dispose();
+            _directPtxSwiGluKernels.Dispose();
+            _directPtxGeGluKernels.Dispose();
+            _directPtxGeGluBackwardKernels.Dispose();
+            _directPtxFusedLinearKernels.Dispose();
+            _directPtxMixedLinearKernels.Dispose();
+            _directPtxMixedLinearM16Kernels.Dispose();
+            _directPtxQuantizedLinearKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }
@@ -1817,6 +3174,10 @@ public sealed partial class CudaBackend
     }
 
     private readonly record struct DirectPtxResidualRmsNormKey(int Rows, int EpsilonBits);
+    private readonly record struct DirectPtxSwiGluKey(int OuterSize, int HalfDimension);
+    private readonly record struct DirectPtxFusedLinearKey(
+        int InputFeatures,
+        int OutputFeatures);
     private readonly record struct DirectPtxDecodeKey(
         bool IsPaged,
         int QueryHeads,

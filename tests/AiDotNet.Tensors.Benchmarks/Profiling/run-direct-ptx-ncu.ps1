@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache')]
+    [ValidateSet('attention', 'residual-rmsnorm', 'residual-layernorm-gelu', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'geglu', 'geglu-backward', 'fused-linear', 'mixed-linear', 'mixed-linear-m16', 'w8a8-linear')]
     [string]$Target = 'attention',
     [string]$OutputCsv = (Join-Path ([System.IO.Path]::GetTempPath()) ("aidotnet-direct-ptx-ncu-" + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.csv')),
     [string]$NcuPath = $env:NSIGHT_COMPUTE_CLI
@@ -22,29 +22,50 @@ $targetDll = (Resolve-Path -LiteralPath $targetDll).Path
 $switch = switch ($Target) {
     'attention' { '--direct-ptx-profile-attention' }
     'residual-rmsnorm' { '--direct-ptx-profile-residual-rmsnorm' }
+    'residual-layernorm-gelu' { '--direct-ptx-profile-residual-layernorm-gelu' }
     'decode' { '--direct-ptx-profile-decode' }
     'paged-prefill' { '--direct-ptx-profile-paged-prefill' }
     'attention-backward' { '--direct-ptx-profile-attention-backward' }
     'flash-attention-backward' { '--direct-ptx-profile-flash-attention-backward' }
     'qkv-rope-cache' { '--direct-ptx-profile-qkv-rope-cache' }
+    'geglu' { '--direct-ptx-profile-geglu' }
+    'geglu-backward' { '--direct-ptx-profile-geglu-backward' }
+    'fused-linear' { '--direct-ptx-profile-fused-linear' }
+    'mixed-linear' { '--direct-ptx-profile-mixed-linear' }
+    'mixed-linear-m16' { '--direct-ptx-profile-mixed-linear-m16' }
+    'w8a8-linear' { '--direct-ptx-profile-w8a8-linear' }
 }
 $kernel = switch ($Target) {
     'attention' { 'regex:aidotnet_online_attention_128x64' }
     'residual-rmsnorm' { 'regex:aidotnet_fused_residual_rmsnorm_d64' }
+    'residual-layernorm-gelu' { 'regex:aidotnet_fused_residual_bias_layernorm_gelu_d64' }
     'decode' { 'regex:aidotnet_(flash|paged)_decode_d64' }
     'paged-prefill' { 'regex:aidotnet_paged_prefill_d64' }
     'attention-backward' { 'regex:aidotnet_attention_backward_(delta|dq|dkv)_d64' }
     'flash-attention-backward' { 'regex:aidotnet_flash_attention_backward_(dq|dkv)_d64' }
     'qkv-rope-cache' { 'regex:aidotnet_qkv_rope_cache_d64' }
+    'geglu' { 'regex:aidotnet_fused_geglu_f32x4' }
+    'geglu-backward' { 'regex:aidotnet_fused_geglu_backward_f32x4' }
+    'fused-linear' { 'regex:aidotnet_fused_linear_gelu_m1' }
+    'mixed-linear' { 'regex:aidotnet_fused_linear_gelu_fp16_m1' }
+    'mixed-linear-m16' { 'regex:aidotnet_fused_linear_gelu_fp16_m16' }
+    'w8a8-linear' { 'regex:aidotnet_fused_linear_gelu_w8a8_m1' }
 }
 $expectedLaunches = switch ($Target) {
     'attention' { 16 }
     'residual-rmsnorm' { 4 }
+    'residual-layernorm-gelu' { 10 }
     'decode' { 2 }
     'paged-prefill' { 1 }
     'attention-backward' { 3 }
     'flash-attention-backward' { 2 }
     'qkv-rope-cache' { 3 }
+    'geglu' { 10 }
+    'geglu-backward' { 10 }
+    'fused-linear' { 10 }
+    'mixed-linear' { 10 }
+    'mixed-linear-m16' { 10 }
+    'w8a8-linear' { 10 }
 }
 $metricNames = @(
     'smsp__sass_inst_executed_op_local.sum',
