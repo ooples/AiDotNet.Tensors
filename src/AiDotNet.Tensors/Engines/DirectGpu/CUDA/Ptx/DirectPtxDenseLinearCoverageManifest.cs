@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 
@@ -83,11 +82,10 @@ internal static class DirectPtxDenseLinearCoverageManifest
 
     internal static DirectPtxDenseLinearCoverageCell Get(string api)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(api);
+        PtxCompat.ThrowIfNullOrWhiteSpace(api, nameof(api));
         foreach (DirectPtxDenseLinearCoverageCell cell in All)
             if (string.Equals(cell.Api, api, StringComparison.Ordinal)) return cell;
         throw new KeyNotFoundException(
             $"Dense-linear API '{api}' is not assigned in the #836 coverage manifest.");
     }
 }
-#endif

@@ -189,7 +189,7 @@ public sealed partial class CudaBackend
 
     internal bool IsDirectPtxQuantizedLinearEnabled =>
         DirectPtxFeatureGate.IsQuantizedLinearEnabled && IsAvailable &&
-        DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) == DirectPtxArchitectureFamily.Ampere;
+        DirectPtxArchitecture.HasValidatedQuantizedLinear(_ccMajor, _ccMinor);
 
     internal long DirectPtxResidualRmsNormDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxResidualRmsNormDispatchCount);
