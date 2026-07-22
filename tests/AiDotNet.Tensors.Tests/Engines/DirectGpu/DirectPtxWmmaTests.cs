@@ -2800,6 +2800,84 @@ public class DirectPtxWmmaTests
     }
 
     [Fact]
+    public void SoftmaxCrossEntropyIndexEmitter_IsSinglePassStableReductionWithGradient()
+    {
+        string ptx = PtxSoftmaxCrossEntropyIndexKernel.EmitPtx(8, 6, 64, 512);
+        Assert.Contains(PtxSoftmaxCrossEntropyIndexKernel.EntryPoint, ptx);
+        Assert.Contains(".shared .align 16 .b8 row_sh[2048]", ptx);   // N=512 row cache
+        Assert.Contains(".shared .align 16 .b8 red[1024]", ptx);       // 256-thread reduction
+        Assert.Contains("LOAD_LOOP:", ptx);
+        Assert.Contains("SUM_LOOP:", ptx);
+        Assert.Contains("GRAD_LOOP:", ptx);
+        Assert.Contains("max.f32 %f10", ptx);                          // tree-reduced max
+        Assert.Contains("ex2.approx.f32", ptx);                        // exp
+        Assert.Contains("lg2.approx.f32", ptx);                        // log for logsumexp
+        Assert.Contains("rcp.approx.f32", ptx);                        // 1/sumExp
+        Assert.Contains("ld.global.nc.u32 %r4", ptx);                  // integer target
+        // Two reductions, each: store-barrier + 8 tree-halving barriers + post-load barrier.
+        Assert.Equal(20, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxSoftmaxCrossEntropyIndexKernel.IsSupportedShape(128, 2048));
+        Assert.False(PtxSoftmaxCrossEntropyIndexKernel.IsPromotedShape(128, 2048));
+    }
+
+    [SkippableTheory]
+    [InlineData(64, 256)]
+    [InlineData(128, 512)]
+    public void DriverOnlySoftmaxCrossEntropyIndex_MatchesOracle(int m, int n)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedFusedLinear(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in softmax-cross-entropy specialization is measured on GA10x/SM86.");
+        using var kernel = new PtxSoftmaxCrossEntropyIndexKernel(runtime, m, n);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20263700 + m + n);
+        float[] logits = Values(random, m * n, 3.0f);   // wide range exercises stability
+        var targets = new int[m];
+        for (int row = 0; row < m; row++)
+            targets[row] = (int)(random.NextDouble() * n) % n;
+
+        var expLoss = new float[m];
+        var expGrad = new float[m * n];
+        for (int row = 0; row < m; row++)
+        {
+            double max = double.NegativeInfinity;
+            for (int col = 0; col < n; col++) max = Math.Max(max, logits[row * n + col]);
+            double sum = 0;
+            for (int col = 0; col < n; col++) sum += Math.Exp(logits[row * n + col] - max);
+            double logZ = max + Math.Log(sum);
+            expLoss[row] = (float)(logZ - logits[row * n + targets[row]]);
+            for (int col = 0; col < n; col++)
+            {
+                double sm = Math.Exp(logits[row * n + col] - max) / sum;
+                expGrad[row * n + col] = (float)(sm - (col == targets[row] ? 1.0 : 0.0));
+            }
+        }
+
+        using var logitsBuf = runtime.AllocateBytes((nuint)(logits.Length * sizeof(float)));
+        using var targetsBuf = runtime.AllocateBytes((nuint)(targets.Length * sizeof(int)));
+        using var lossBuf = runtime.AllocateBytes((nuint)(m * sizeof(float)));
+        using var gradBuf = runtime.AllocateBytes((nuint)(m * n * sizeof(float)));
+        logitsBuf.Upload<float>(logits);
+        targetsBuf.Upload<int>(targets);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(logitsBuf, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(targetsBuf, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(lossBuf, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(gradBuf, kernel.Blueprint.Tensors[3]));
+        runtime.Synchronize();
+        var actualLoss = new float[m];
+        var actualGrad = new float[m * n];
+        lossBuf.Download<float>(actualLoss);
+        gradBuf.Download<float>(actualGrad);
+        AssertVectorClose(actualLoss, expLoss, 3e-3f, $"ce-index loss {m}x{n}");
+        AssertVectorClose(actualGrad, expGrad, 3e-3f, $"ce-index grad {m}x{n}");
+    }
+
+    [Fact]
     public void GemmEmitter_IsRegisterResidentTiledGemm()
     {
         string ptx = PtxGemmKernel.EmitPtx(8, 6, 64, 256, 256);
