@@ -45,6 +45,13 @@ internal static class DirectPtxArchitecture
     /// </summary>
     internal static bool HasValidatedQkvRopeCache(int major, int minor) =>
         (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The first interleaved complex-multiply candidate is admitted only for
+    /// the exact GA102/SM86 validation domain.
+    /// </summary>
+    internal static bool HasValidatedComplexMultiply(int major, int minor) =>
+        (major, minor) == (8, 6);
 }
 
 internal enum DirectPtxExtentMode
