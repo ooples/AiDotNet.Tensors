@@ -2999,6 +2999,132 @@ public sealed class DirectPtxConvolutionTests
             $"Locally-connected Conv2D backward-bias max absolute error {maxAbsoluteError:G9}.");
     }
 
+    [Fact]
+    public void DeformableConv2DEmitter_IsBilinearSamplingSm86Ptx()
+    {
+        string ptx = PtxDeformableConv2DNchw3x3F32Kernel.EmitPtx(8, 6);
+
+        Assert.Contains(".target sm_86", ptx, StringComparison.Ordinal);
+        Assert.Contains(PtxDeformableConv2DNchw3x3F32Kernel.EntryPoint, ptx, StringComparison.Ordinal);
+        Assert.Equal(5, Count(ptx, ".param .u64"));
+        // Bilinear: floor via round-to-minus-infinity, two per tap (y, x) over 9 taps.
+        Assert.Equal(18, Count(ptx, "cvt.rmi.s32.f32"));
+        // Nine per-tap channel loops, each guarded by a validity branch.
+        Assert.Equal(9, Count(ptx, "bra DEFORM_TAP"));
+        Assert.Contains("DEFORM_TAP0_CI:", ptx, StringComparison.Ordinal);
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("atom", ptx, StringComparison.Ordinal);
+        Assert.Throws<NotSupportedException>(() =>
+            PtxDeformableConv2DNchw3x3F32Kernel.EmitPtx(8, 9));
+    }
+
+    [Fact]
+    public void DeformableConv2DManifestCell_IsExperimentalWithDedicatedRoute()
+    {
+        Assert.Equal(DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxConvolutionCoverageManifest.Get("IEngine.DeformableConv2D").Status);
+        Assert.Equal(DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxConvolutionCoverageManifest
+                .Get("CudaBackend.TryDirectPtxDeformableConv2D").Status);
+    }
+
+    [SkippableFact]
+    public void DriverOnlyDeformableConv2D_MatchesCpuReference()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "Requires the experimental SM86 convolution specialization.");
+
+        const int inChannels = PtxDeformableConv2DNchw3x3F32Kernel.InputChannels;
+        const int outChannels = PtxDeformableConv2DNchw3x3F32Kernel.OutputChannels;
+        const int height = PtxDeformableConv2DNchw3x3F32Kernel.Height;
+        const int width = PtxDeformableConv2DNchw3x3F32Kernel.Width;
+        const int kernelSize = PtxDeformableConv2DNchw3x3F32Kernel.KernelSize;
+        const int taps = PtxDeformableConv2DNchw3x3F32Kernel.TapsPerChannel;
+        int spatial = height * width;
+
+        using var kernel = new PtxDeformableConv2DNchw3x3F32Kernel(runtime);
+        using var inputDevice = runtime.AllocateBytes((nuint)PtxDeformableConv2DNchw3x3F32Kernel.InputBytes);
+        using var weightDevice = runtime.AllocateBytes((nuint)PtxDeformableConv2DNchw3x3F32Kernel.WeightBytes);
+        using var offsetDevice = runtime.AllocateBytes((nuint)PtxDeformableConv2DNchw3x3F32Kernel.OffsetBytes);
+        using var maskDevice = runtime.AllocateBytes((nuint)PtxDeformableConv2DNchw3x3F32Kernel.MaskBytes);
+        using var outputDevice = runtime.AllocateBytes((nuint)PtxDeformableConv2DNchw3x3F32Kernel.OutputBytes);
+
+        Random random = AiDotNet.Tensors.Helpers.RandomHelper.CreateSecureRandom();
+        var input = new float[inChannels * spatial];
+        for (int i = 0; i < input.Length; i++) input[i] = (float)(random.NextDouble() * 2 - 1);
+        var weights = new float[outChannels * inChannels * kernelSize * kernelSize];
+        for (int i = 0; i < weights.Length; i++) weights[i] = (float)(random.NextDouble() * 2 - 1);
+        var offsets = new float[2 * taps * spatial];
+        for (int i = 0; i < offsets.Length; i++) offsets[i] = (float)(random.NextDouble() * 2 - 1);
+        var mask = new float[taps * spatial];
+        for (int i = 0; i < mask.Length; i++) mask[i] = (float)random.NextDouble();
+        inputDevice.Upload<float>(input);
+        weightDevice.Upload<float>(weights);
+        offsetDevice.Upload<float>(offsets);
+        maskDevice.Upload<float>(mask);
+
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(inputDevice, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(weightDevice, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(offsetDevice, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(maskDevice, kernel.Blueprint.Tensors[3]),
+            DirectPtxTensorView.CreateOwned(outputDevice, kernel.Blueprint.Tensors[4]));
+        runtime.Synchronize();
+        var actual = new float[outChannels * spatial];
+        outputDevice.Download<float>(actual);
+
+        // Same bilinear as the kernel: floor + 4 corner, zero-pad outside the frame.
+        static float Bilinear(float[] x, int ci, int spatialSize, int h, int w, float py, float px)
+        {
+            int y0 = (int)MathF.Floor(py);
+            int x0 = (int)MathF.Floor(px);
+            int y1 = y0 + 1;
+            int x1 = x0 + 1;
+            float wy1 = py - y0;
+            float wy0 = 1f - wy1;
+            float wx1 = px - x0;
+            float wx0 = 1f - wx1;
+            float Sample(int yy, int xx) =>
+                (yy < 0 || yy >= h || xx < 0 || xx >= w) ? 0f : x[ci * spatialSize + (yy * w + xx)];
+            return wy0 * wx0 * Sample(y0, x0) + wy0 * wx1 * Sample(y0, x1)
+                 + wy1 * wx0 * Sample(y1, x0) + wy1 * wx1 * Sample(y1, x1);
+        }
+
+        float maxAbsoluteError = 0;
+        for (int co = 0; co < outChannels; co++)
+        for (int oy = 0; oy < height; oy++)
+        for (int ox = 0; ox < width; ox++)
+        {
+            int s = oy * width + ox;
+            float acc = 0;
+            for (int ky = 0; ky < kernelSize; ky++)
+            for (int kx = 0; kx < kernelSize; kx++)
+            {
+                int t = ky * kernelSize + kx;
+                float offY = offsets[(2 * t) * spatial + s];
+                float offX = offsets[(2 * t + 1) * spatial + s];
+                float py = oy + ky - 1 + offY;
+                float px = ox + kx - 1 + offX;
+                float m = mask[t * spatial + s];
+                for (int ci = 0; ci < inChannels; ci++)
+                {
+                    float sample = Bilinear(input, ci, spatial, height, width, py, px);
+                    acc += weights[((co * inChannels + ci) * kernelSize + ky) * kernelSize + kx] * m * sample;
+                }
+            }
+            float got = actual[co * spatial + s];
+            maxAbsoluteError = MathF.Max(maxAbsoluteError, MathF.Abs(got - acc));
+        }
+
+        Assert.True(maxAbsoluteError <= 2e-4f,
+            $"Deformable Conv2D forward max absolute error {maxAbsoluteError:G9}.");
+    }
+
     private static string? Validate(
         bool enabled, bool available, int major, int minor,
         DirectPtxConvolutionShape shape, IGpuBuffer? input, IGpuBuffer? weights,
