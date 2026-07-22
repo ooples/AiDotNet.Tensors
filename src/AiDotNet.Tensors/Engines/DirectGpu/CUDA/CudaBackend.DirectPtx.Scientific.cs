@@ -67,6 +67,8 @@ public sealed partial class CudaBackend
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<SciMatVecKey, PtxCosineSimilarityKernel> _sciCosineSimilarity =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<SciMatVecKey, PtxSphericalSoftmaxKernel> _sciSphericalSoftmax =
+        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
 
     private long _sciDispatchCount;
     internal long DirectPtxScientificDispatchCount => System.Threading.Interlocked.Read(ref _sciDispatchCount);
@@ -390,6 +392,19 @@ public sealed partial class CudaBackend
             var k = _sciCosineSimilarity.GetOrAdd(new SciMatVecKey(batchSize, dim),
                 () => new PtxCosineSimilarityKernel(_directPtxRuntime!, batchSize, dim));
             Launch3(k.Blueprint, a, b, output, (va, vb, vo) => k.Launch(va, vb, vo));
+        });
+    }
+
+    internal bool TryDirectPtxSphericalSoftmax(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize)
+    {
+        if (!ScientificGateOpen || !PtxSphericalSoftmaxKernel.IsSupportedShape(outerSize, innerSize)) return Fail("spherical-softmax");
+        long bytes = checked((long)outerSize * innerSize * sizeof(float));
+        if (input.SizeInBytes != bytes || output.SizeInBytes != bytes) return Fail("spherical-softmax-extent");
+        return SciDispatch(() =>
+        {
+            var k = _sciSphericalSoftmax.GetOrAdd(new SciMatVecKey(outerSize, innerSize),
+                () => new PtxSphericalSoftmaxKernel(_directPtxRuntime!, outerSize, innerSize));
+            Launch2(k.Blueprint, input, output, (vi, vo) => k.Launch(vi, vo));
         });
     }
 

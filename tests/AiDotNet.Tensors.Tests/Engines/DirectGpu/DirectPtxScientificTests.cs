@@ -14,9 +14,10 @@ public class DirectPtxScientificTests
     [Fact]
     public void ScientificCoverageManifest_AssignsEveryScopedApiExactlyOnce()
     {
-        Assert.Equal(22, DirectPtxScientificCoverageManifest.All.Count);
+        Assert.Equal(23, DirectPtxScientificCoverageManifest.All.Count);
         string[] names = DirectPtxScientificCoverageManifest.All.Select(c => c.Api).ToArray();
         Assert.Contains("CudaBackend.CosineSimilarity", names);
+        Assert.Contains("CudaBackend.SphericalSoftmax", names);
         Assert.Contains("CudaBackend.RbfForward", names);
         Assert.Contains("CudaBackend.PairwiseDistance", names);
         Assert.Contains("CudaBackend.PairwiseDistanceSquared", names);
@@ -751,6 +752,68 @@ public class DirectPtxScientificTests
         var actual = new float[expected.Length];
         outBuf.Download<float>(actual);
         AssertVectorClose(actual, expected, 3e-3f, $"capsule {op}");
+    }
+
+    [Fact]
+    public void SphericalSoftmaxEmitter_IsFourPassThreadPerRow()
+    {
+        string ptx = PtxSphericalSoftmaxKernel.EmitPtx(8, 6, 256, 32);
+        Assert.Contains(PtxSphericalSoftmaxKernel.EntryPoint, ptx);
+        Assert.Contains("$SS_P1:", ptx);   // norm
+        Assert.Contains("$SS_P2:", ptx);   // normalize + max
+        Assert.Contains("$SS_P3:", ptx);   // exp + sum
+        Assert.Contains("$SS_P4:", ptx);   // scale
+        Assert.Equal(1, Count(ptx, "ex2.approx.f32"));       // stable exp
+        Assert.Equal(1, Count(ptx, "max.f32"));              // running max
+        Assert.Equal(2, Count(ptx, "div.rn.f32"));           // invNorm + inv_sum
+        Assert.Contains("mov.f32 %f2, 0fFF800000", ptx);     // max init -inf
+        Assert.Equal(0, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxSphericalSoftmaxKernel.IsSupportedShape(256, 32));
+        Assert.False(PtxSphericalSoftmaxKernel.IsSupportedShape(255, 32));   // outer not multiple of 256
+        Assert.False(PtxSphericalSoftmaxKernel.IsPromotedShape(256, 32));
+    }
+
+    [SkippableFact]
+    public void DriverOnlySphericalSoftmax_MatchesOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in spherical-softmax specialization is measured on GA10x/SM86.");
+        const int outerSize = 256, innerSize = 40;
+        using var kernel = new PtxSphericalSoftmaxKernel(runtime, outerSize, innerSize);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20268000);
+        float[] inHost = Values(random, outerSize * innerSize, 2.0f);
+        var expected = new float[outerSize * innerSize];
+        for (int r = 0; r < outerSize; r++)
+        {
+            double normSq = 0;
+            for (int j = 0; j < innerSize; j++) { double v = inHost[r * innerSize + j]; normSq += v * v; }
+            double norm = Math.Sqrt(normSq + 1e-12);
+            double maxVal = double.NegativeInfinity;
+            var norm01 = new double[innerSize];
+            for (int j = 0; j < innerSize; j++) { norm01[j] = inHost[r * innerSize + j] / norm; if (norm01[j] > maxVal) maxVal = norm01[j]; }
+            double sumExp = 0;
+            for (int j = 0; j < innerSize; j++) { norm01[j] = Math.Exp(norm01[j] - maxVal); sumExp += norm01[j]; }
+            double invSum = 1.0 / (sumExp + 1e-10);
+            for (int j = 0; j < innerSize; j++) expected[r * innerSize + j] = (float)(norm01[j] * invSum);
+        }
+
+        using var input = runtime.AllocateBytes((nuint)(inHost.Length * sizeof(float)));
+        using var output = runtime.AllocateBytes((nuint)(expected.Length * sizeof(float)));
+        input.Upload<float>(inHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[1]));
+        runtime.Synchronize();
+        var actual = new float[expected.Length];
+        output.Download<float>(actual);
+        AssertVectorClose(actual, expected, 2e-3f, "spherical softmax");
     }
 
     [Fact]
@@ -1603,6 +1666,26 @@ public class DirectPtxScientificTests
             }
             using (var ab = backend.AllocateBuffer(cosA)) using (var bb = backend.AllocateBuffer(cosB)) using (var o = backend.AllocateBuffer(cosBatch))
             { backend.CosineSimilarity(ab, bb, o, cosBatch, cosDim); n = AssertDispatched(n, "cosine-similarity"); AssertVectorClose(backend.DownloadBuffer(o), cosExp, 2e-3f, "cosine-similarity route"); }
+
+            // Spherical softmax: thread-per-row. outer=256 (multiple of 256).
+            const int ssOuter = 256, ssInner = 40;
+            float[] ssIn = Values(random, ssOuter * ssInner, 2.0f);
+            var ssExp = new float[ssOuter * ssInner];
+            for (int r = 0; r < ssOuter; r++)
+            {
+                double normSq = 0;
+                for (int j = 0; j < ssInner; j++) { double v = ssIn[r * ssInner + j]; normSq += v * v; }
+                double norm = Math.Sqrt(normSq + 1e-12);
+                double maxVal = double.NegativeInfinity;
+                var t = new double[ssInner];
+                for (int j = 0; j < ssInner; j++) { t[j] = ssIn[r * ssInner + j] / norm; if (t[j] > maxVal) maxVal = t[j]; }
+                double sumExp = 0;
+                for (int j = 0; j < ssInner; j++) { t[j] = Math.Exp(t[j] - maxVal); sumExp += t[j]; }
+                double invSum = 1.0 / (sumExp + 1e-10);
+                for (int j = 0; j < ssInner; j++) ssExp[r * ssInner + j] = (float)(t[j] * invSum);
+            }
+            using (var ib = backend.AllocateBuffer(ssIn)) using (var o = backend.AllocateBuffer(ssOuter * ssInner))
+            { backend.SphericalSoftmax(ib, o, ssOuter, ssInner); n = AssertDispatched(n, "spherical-softmax"); AssertVectorClose(backend.DownloadBuffer(o), ssExp, 2e-3f, "spherical-softmax route"); }
         }
         finally
         {
