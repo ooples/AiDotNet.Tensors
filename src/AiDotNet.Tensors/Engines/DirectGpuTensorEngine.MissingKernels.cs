@@ -3547,16 +3547,16 @@ public partial class DirectGpuTensorEngine
                 {
                     output0 = backend.AllocateBuffer(outputLength);
                     output1 = backend.AllocateBuffer(outputLength);
-                    if (!directPtx.TryDirectPtxMeshgrid2DPair(
+                    if (directPtx.TryDirectPtxMeshgrid2DPair(
                             source0.Buffer, source1.Buffer, output0, output1,
                             n0, n1, xy))
-                        throw new InvalidOperationException(
-                            "Direct PTX meshgrid pair dispatch failed eligibility validation.");
-                    direct0 = DeferTensorResult<T>(backend, output0, outputLength, outShape);
-                    output0 = null;
-                    direct1 = DeferTensorResult<T>(backend, output1, outputLength, outShape);
-                    output1 = null;
-                    return [direct0, direct1];
+                    {
+                        direct0 = DeferTensorResult<T>(backend, output0, outputLength, outShape);
+                        output0 = null;
+                        direct1 = DeferTensorResult<T>(backend, output1, outputLength, outShape);
+                        output1 = null;
+                        return [direct0, direct1];
+                    }
                 }
                 catch
                 {
