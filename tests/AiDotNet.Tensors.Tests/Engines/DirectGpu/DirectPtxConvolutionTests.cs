@@ -1733,6 +1733,89 @@ public sealed class DirectPtxConvolutionTests
             $"DepthwiseConv1D max absolute error {maxAbsoluteError:G9}.");
     }
 
+    [Fact]
+    public void UnfoldEmitter_IsHaloMaskedGatherSm86Ptx()
+    {
+        string ptx = PtxUnfoldIm2ColNchw3x3F32Kernel.EmitPtx(8, 6);
+
+        Assert.Contains(".target sm_86", ptx, StringComparison.Ordinal);
+        Assert.Contains(PtxUnfoldIm2ColNchw3x3F32Kernel.EntryPoint, ptx, StringComparison.Ordinal);
+        Assert.Equal(2, Count(ptx, ".param .u64"));
+        // Pure gather: no FMA, exactly one guarded load and one store.
+        Assert.Equal(0, Count(ptx, "fma"));
+        Assert.Equal(1, Count(ptx, "@%p4 ld.global.nc.f32"));
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        // Two integer divides decompose the row into channel and kernel indices.
+        Assert.Equal(2, Count(ptx, "div.u32"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.Throws<NotSupportedException>(() =>
+            PtxUnfoldIm2ColNchw3x3F32Kernel.EmitPtx(8, 9));
+    }
+
+    [Fact]
+    public void UnfoldManifestCell_IsExperimentalWithDedicatedRoute()
+    {
+        Assert.Equal(DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxConvolutionCoverageManifest.Get("IEngine.Unfold").Status);
+        Assert.Equal(DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxConvolutionCoverageManifest
+                .Get("CudaBackend.TryDirectPtxUnfold").Status);
+    }
+
+    [SkippableFact]
+    public void DriverOnlyUnfold_MatchesCpuReference()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "Requires the experimental SM86 convolution specialization.");
+
+        const int channels = PtxUnfoldIm2ColNchw3x3F32Kernel.Channels;
+        const int height = PtxUnfoldIm2ColNchw3x3F32Kernel.Height;
+        const int width = PtxUnfoldIm2ColNchw3x3F32Kernel.Width;
+        const int kernelSize = PtxUnfoldIm2ColNchw3x3F32Kernel.KernelSize;
+        const int rows = PtxUnfoldIm2ColNchw3x3F32Kernel.UnfoldRows;
+        const int cols = PtxUnfoldIm2ColNchw3x3F32Kernel.SpatialElements;
+
+        using var kernel = new PtxUnfoldIm2ColNchw3x3F32Kernel(runtime);
+        using var inputDevice = runtime.AllocateBytes((nuint)PtxUnfoldIm2ColNchw3x3F32Kernel.InputBytes);
+        using var unfoldDevice = runtime.AllocateBytes((nuint)PtxUnfoldIm2ColNchw3x3F32Kernel.UnfoldBytes);
+
+        Random random = AiDotNet.Tensors.Helpers.RandomHelper.CreateSecureRandom();
+        var input = new float[channels * height * width];
+        for (int i = 0; i < input.Length; i++) input[i] = (float)(random.NextDouble() * 2 - 1);
+        inputDevice.Upload<float>(input);
+
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(inputDevice, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(unfoldDevice, kernel.Blueprint.Tensors[1]));
+        runtime.Synchronize();
+        var actual = new float[rows * cols];
+        unfoldDevice.Download<float>(actual);
+
+        float maxAbsoluteError = 0;
+        for (int c = 0; c < channels; c++)
+        for (int ky = 0; ky < kernelSize; ky++)
+        for (int kx = 0; kx < kernelSize; kx++)
+        for (int oy = 0; oy < height; oy++)
+        for (int ox = 0; ox < width; ox++)
+        {
+            int iy = oy + ky - 1, ix = ox + kx - 1;
+            float expected = 0;
+            if (iy >= 0 && iy < height && ix >= 0 && ix < width)
+                expected = input[(c * height + iy) * width + ix];
+            int row = (c * kernelSize + ky) * kernelSize + kx;
+            int col = oy * width + ox;
+            float got = actual[row * cols + col];
+            maxAbsoluteError = MathF.Max(maxAbsoluteError, MathF.Abs(got - expected));
+        }
+
+        // Pure gather is bit-exact.
+        Assert.Equal(0f, maxAbsoluteError);
+    }
+
     private static string? Validate(
         bool enabled, bool available, int major, int minor,
         DirectPtxConvolutionShape shape, IGpuBuffer? input, IGpuBuffer? weights,

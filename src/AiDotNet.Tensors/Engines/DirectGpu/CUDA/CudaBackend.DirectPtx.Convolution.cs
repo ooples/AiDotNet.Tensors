@@ -2599,4 +2599,148 @@ public sealed partial class CudaBackend
         return _directPtxDepthwiseConv1DKernels.GetOrAdd(
             1, () => new PtxDepthwiseConv1DNcl3ForwardF32Kernel(runtime));
     }
+
+    private readonly DirectPtxKernelCache<int, PtxUnfoldIm2ColNchw3x3F32Kernel>
+        _directPtxUnfoldKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private long _directPtxUnfoldDispatchCount;
+
+    internal long DirectPtxUnfoldDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxUnfoldDispatchCount);
+
+    /// <summary>
+    /// Attempts the exact FP32 NCHW unfold/im2col patch-extraction experiment
+    /// (kernel 3, stride 1, pad 1). Validated by byte extent. Fails closed so the
+    /// caller runs the established materialization.
+    /// </summary>
+    internal bool TryDirectPtxUnfold(
+        IGpuBuffer input,
+        IGpuBuffer unfold)
+    {
+        if (!_directPtxConvolutionOptedIn)
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.FeatureDisabled;
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.BackendUnavailable;
+            return false;
+        }
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.ArchitectureNotImplemented;
+            return false;
+        }
+        if (input is null || unfold is null)
+        {
+            DirectPtxLastError = "unfold-null-buffer";
+            return false;
+        }
+        if (input.SizeInBytes != PtxUnfoldIm2ColNchw3x3F32Kernel.InputBytes ||
+            unfold.SizeInBytes != PtxUnfoldIm2ColNchw3x3F32Kernel.UnfoldBytes)
+        {
+            DirectPtxLastError = "unfold-exact-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            const int key = 1;
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxUnfoldKernels.TryGetValue(key, out _))
+                {
+                    DirectPtxLastError =
+                        "Direct PTX unfold must be prewarmed before CUDA graph capture.";
+                    return false;
+                }
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxUnfoldIm2ColNchw3x3F32Kernel kernel = GetOrCreateDirectPtxUnfoldKernel();
+                if (capturing && !_directPtxUnfoldKernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX unfold module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(unfold, kernel.Blueprint.Tensors[1]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxUnfoldDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool PrewarmDirectPtxUnfold()
+    {
+        if (!_directPtxConvolutionOptedIn)
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.FeatureDisabled;
+            return false;
+        }
+        if (!IsAvailable || !DirectPtxArchitecture.HasExperimentalConvolution(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.ArchitectureNotImplemented;
+            return false;
+        }
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX unfold prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _ = GetOrCreateDirectPtxUnfoldKernel();
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxUnfoldAudit(out DirectPtxKernelAudit? audit)
+    {
+        lock (_directPtxLock)
+        {
+            if (_directPtxUnfoldKernels.TryGetValue(1, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null;
+        return false;
+    }
+
+    private PtxUnfoldIm2ColNchw3x3F32Kernel GetOrCreateDirectPtxUnfoldKernel()
+    {
+        if (_directPtxUnfoldKernels.TryGetValue(
+                1, out PtxUnfoldIm2ColNchw3x3F32Kernel? existing))
+            return existing;
+        return CreateAndCacheDirectPtxUnfoldKernelSlow();
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxUnfoldIm2ColNchw3x3F32Kernel CreateAndCacheDirectPtxUnfoldKernelSlow()
+    {
+        DirectPtxRuntime runtime = _directPtxRuntime ??
+            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+        return _directPtxUnfoldKernels.GetOrAdd(
+            1, () => new PtxUnfoldIm2ColNchw3x3F32Kernel(runtime));
+    }
 }
