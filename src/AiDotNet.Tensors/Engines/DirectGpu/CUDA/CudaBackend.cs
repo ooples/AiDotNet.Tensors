@@ -9903,6 +9903,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer output, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias,
         int batchSize, int inFeatures, int outFeatures)
     {
+        // Fail-closed direct-PTX composite backward (issue #836), output-form derivative;
+        // returns false until GPU-promoted.
+        if (TryDirectPtxFusedLinearBackward(gradOutput, input, weight, output,
+            gradInput, gradWeight, gradBias, batchSize, inFeatures, outFeatures,
+            Ptx.DirectPtxLinearActivation.Sigmoid, derivativeFromOutput: true)) return;
         if (!_kernelCache.TryGetValue("fused_linear_sigmoid_backward_grad_input", out var giKernel))
             throw new InvalidOperationException("CUDA kernel not found: fused_linear_sigmoid_backward_grad_input");
         using var _ = PushContext();
@@ -9939,6 +9944,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer output, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias,
         int batchSize, int inFeatures, int outFeatures)
     {
+        // Fail-closed direct-PTX composite backward (issue #836), output-form derivative;
+        // returns false until GPU-promoted.
+        if (TryDirectPtxFusedLinearBackward(gradOutput, input, weight, output,
+            gradInput, gradWeight, gradBias, batchSize, inFeatures, outFeatures,
+            Ptx.DirectPtxLinearActivation.Tanh, derivativeFromOutput: true)) return;
         if (!_kernelCache.TryGetValue("fused_linear_tanh_backward_grad_input", out var giKernel))
             throw new InvalidOperationException("CUDA kernel not found: fused_linear_tanh_backward_grad_input");
         using var _ = PushContext();

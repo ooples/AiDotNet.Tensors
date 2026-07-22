@@ -91,6 +91,38 @@ internal static class PtxLinearActivationBackwardEmit
         }
     }
 
+    /// <summary>
+    /// Emits <c>out = dy * activation'(y)</c> where the derivative is expressed in terms of
+    /// the post-activation output <paramref name="y"/> (what the backend saves for the
+    /// smooth squashing activations): sigmoid' = y(1-y), tanh' = 1 - y^2. Only Sigmoid and
+    /// Tanh have an exact output-form derivative; other activations must use <see cref="Emit"/>
+    /// with the preactivation.
+    /// </summary>
+    internal static void EmitFromOutput(
+        StringBuilder ptx, DirectPtxLinearActivation activation, string y, string dy, string outReg)
+    {
+        switch (activation)
+        {
+            case DirectPtxLinearActivation.Sigmoid:
+                // y * (1 - y) = y - y^2
+                ptx.AppendLine($"    mul.rn.f32 %f10, {y}, {y};");       // y^2
+                ptx.AppendLine($"    sub.rn.f32 %f10, {y}, %f10;");       // y - y^2
+                ptx.AppendLine($"    mul.rn.f32 {outReg}, {dy}, %f10;");
+                break;
+            case DirectPtxLinearActivation.Tanh:
+                // 1 - y^2
+                ptx.AppendLine($"    mul.rn.f32 %f10, {y}, {y};");       // y^2
+                ptx.AppendLine($"    mul.rn.f32 %f10, %f10, {NegOne};");
+                ptx.AppendLine($"    add.rn.f32 %f10, %f10, {One};");     // 1 - y^2
+                ptx.AppendLine($"    mul.rn.f32 {outReg}, {dy}, %f10;");
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(
+                    nameof(activation), activation,
+                    "Only Sigmoid and Tanh have an exact post-activation-form derivative.");
+        }
+    }
+
     private static void EmitSigmoid(StringBuilder ptx, string z, string sReg)
     {
         ptx.AppendLine($"    mul.rn.f32 {sReg}, {z}, {Half};");

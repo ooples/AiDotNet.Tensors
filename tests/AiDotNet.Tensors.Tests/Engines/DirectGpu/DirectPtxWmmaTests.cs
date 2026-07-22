@@ -2626,6 +2626,32 @@ public class DirectPtxWmmaTests
         Assert.False(PtxLinearActivationBackwardKernel.IsPromotedShape(128, 2048));
     }
 
+    [Theory]
+    [InlineData(3)]  // Sigmoid -> y(1-y)
+    [InlineData(4)]  // Tanh    -> 1-y^2
+    public void ActivationBackwardEmitter_OutputForm_UsesSavedActivationDerivative(int activationValue)
+    {
+        var activation = (DirectPtxLinearActivation)activationValue;
+        string ptx = PtxLinearActivationBackwardKernel.EmitPtx(8, 6, 64, 256, activation, derivativeFromOutput: true);
+        Assert.Contains("form=output", ptx);
+        Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));   // y + dy
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        // Output-form derivatives are pure polynomials in y — no transcendental needed.
+        Assert.DoesNotContain("tanh.approx.f32", ptx);
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        if (activation == DirectPtxLinearActivation.Sigmoid)
+            Assert.Contains("sub.rn.f32 %f10, %f0, %f10", ptx);  // y - y^2
+    }
+
+    [Fact]
+    public void ActivationBackwardEmitter_OutputForm_RejectsNonSquashingActivations()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxLinearActivationBackwardKernel.EmitPtx(
+                8, 6, 64, 256, DirectPtxLinearActivation.Relu, derivativeFromOutput: true));
+    }
+
     [SkippableTheory]
     [InlineData(64, 256, 1)]   // Relu
     [InlineData(128, 512, 4)]  // Tanh

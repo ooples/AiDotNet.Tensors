@@ -28,12 +28,14 @@ internal sealed class PtxLinearActivationBackwardKernel : IDisposable
     internal int M { get; }
     internal int N { get; }
     internal DirectPtxLinearActivation Activation { get; }
+    internal bool DerivativeFromOutput { get; }
     internal string Ptx { get; }
     internal DirectPtxKernelBlueprint Blueprint { get; }
     internal DirectPtxKernelAudit Audit { get; }
 
     internal PtxLinearActivationBackwardKernel(
-        DirectPtxRuntime runtime, int m, int n, DirectPtxLinearActivation activation)
+        DirectPtxRuntime runtime, int m, int n, DirectPtxLinearActivation activation,
+        bool derivativeFromOutput = false)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         if (!DirectPtxArchitecture.HasValidatedFusedLinear(
@@ -44,8 +46,9 @@ internal sealed class PtxLinearActivationBackwardKernel : IDisposable
         M = m;
         N = n;
         Activation = activation;
+        DerivativeFromOutput = derivativeFromOutput;
         Blueprint = CreateBlueprint(runtime.ArchitectureFamily, m, n, activation);
-        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, m, n, activation);
+        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, m, n, activation, derivativeFromOutput);
         _module = runtime.LoadModule(Ptx);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
         int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
@@ -74,14 +77,17 @@ internal sealed class PtxLinearActivationBackwardKernel : IDisposable
     public void Dispose() => _module.Dispose();
 
     internal static string EmitPtx(
-        int ccMajor, int ccMinor, int m, int n, DirectPtxLinearActivation activation)
+        int ccMajor, int ccMinor, int m, int n, DirectPtxLinearActivation activation,
+        bool derivativeFromOutput = false)
     {
         ValidateShape(m, n);
         var ptx = new StringBuilder(8_000);
         ptx.AppendLine(".version 7.1");
         ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
         ptx.AppendLine(".address_size 64");
-        ptx.AppendLine($"// linear-activation-backward M={m} N={n} act={activation}");
+        ptx.AppendLine(
+            $"// linear-activation-backward M={m} N={n} act={activation} " +
+            $"form={(derivativeFromOutput ? "output" : "preact")}");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");
         ptx.AppendLine("    .param .u64 preact_ptr,");
@@ -104,9 +110,12 @@ internal sealed class PtxLinearActivationBackwardKernel : IDisposable
         ptx.AppendLine("    add.u64 %rd4, %rd0, %rd3;");
         ptx.AppendLine("    add.u64 %rd5, %rd1, %rd3;");
         ptx.AppendLine("    add.u64 %rd6, %rd2, %rd3;");
-        ptx.AppendLine("    ld.global.nc.f32 %f0, [%rd4];");                 // z (preact)
+        ptx.AppendLine("    ld.global.nc.f32 %f0, [%rd4];");                 // z (preact) or y (output)
         ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd5];");                 // dy
-        PtxLinearActivationBackwardEmit.Emit(ptx, activation, "%f0", "%f1", "%f2");
+        if (derivativeFromOutput)
+            PtxLinearActivationBackwardEmit.EmitFromOutput(ptx, activation, "%f0", "%f1", "%f2");
+        else
+            PtxLinearActivationBackwardEmit.Emit(ptx, activation, "%f0", "%f1", "%f2");
         ptx.AppendLine("    st.global.f32 [%rd6], %f2;");                    // dz
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");

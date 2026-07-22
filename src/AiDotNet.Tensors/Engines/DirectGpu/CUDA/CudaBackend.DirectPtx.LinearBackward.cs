@@ -31,7 +31,7 @@ public sealed partial class CudaBackend
     internal long DirectPtxLinearBackwardDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxLinearBackwardDispatchCount);
 
-    private readonly record struct DirectPtxActBackwardKey(int M, int N, int Activation);
+    private readonly record struct DirectPtxActBackwardKey(int M, int N, int Activation, bool FromOutput);
     private readonly record struct DirectPtxDWeightKey(int M, int P, int Q);
     private readonly record struct DirectPtxDBiasKey(int M, int N);
 
@@ -53,7 +53,8 @@ public sealed partial class CudaBackend
         int m,
         int k,
         int n,
-        DirectPtxLinearActivation activation)
+        DirectPtxLinearActivation activation,
+        bool derivativeFromOutput = false)
     {
         if (!IsDirectPtxFusedLinearEnabled) return false;
         // Composite: every stage must support the shape.
@@ -98,7 +99,7 @@ public sealed partial class CudaBackend
             lock (_directPtxLock)
             {
                 _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
-                var actKey = new DirectPtxActBackwardKey(m, n, (int)activation);
+                var actKey = new DirectPtxActBackwardKey(m, n, (int)activation, derivativeFromOutput);
                 var giKey = new DirectPtxGemmKey(m, n, k);       // PtxGemmKernel(M, K=N, N=K)
                 var gwKey = new DirectPtxDWeightKey(m, k, n);    // PtxGemmContractMKernel(M, P=K, Q=N)
                 var gbKey = new DirectPtxDBiasKey(m, n);
@@ -148,7 +149,7 @@ public sealed partial class CudaBackend
     private PtxLinearActivationBackwardKernel GetOrAddActBackward(DirectPtxActBackwardKey key) =>
         _directPtxActBackwardKernels.GetOrAdd(key, () =>
             new PtxLinearActivationBackwardKernel(
-                _directPtxRuntime!, key.M, key.N, (DirectPtxLinearActivation)key.Activation));
+                _directPtxRuntime!, key.M, key.N, (DirectPtxLinearActivation)key.Activation, key.FromOutput));
 
     [System.Runtime.CompilerServices.MethodImpl(
         System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
