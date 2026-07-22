@@ -14,10 +14,11 @@ public class DirectPtxScientificTests
     [Fact]
     public void ScientificCoverageManifest_AssignsEveryScopedApiExactlyOnce()
     {
-        Assert.Equal(23, DirectPtxScientificCoverageManifest.All.Count);
+        Assert.Equal(24, DirectPtxScientificCoverageManifest.All.Count);
         string[] names = DirectPtxScientificCoverageManifest.All.Select(c => c.Api).ToArray();
         Assert.Contains("CudaBackend.CosineSimilarity", names);
         Assert.Contains("CudaBackend.SphericalSoftmax", names);
+        Assert.Contains("CudaBackend.NormalizeProbabilities", names);
         Assert.Contains("CudaBackend.RbfForward", names);
         Assert.Contains("CudaBackend.PairwiseDistance", names);
         Assert.Contains("CudaBackend.PairwiseDistanceSquared", names);
@@ -752,6 +753,56 @@ public class DirectPtxScientificTests
         var actual = new float[expected.Length];
         outBuf.Download<float>(actual);
         AssertVectorClose(actual, expected, 3e-3f, $"capsule {op}");
+    }
+
+    [Fact]
+    public void NormalizeProbabilitiesEmitter_IsBlockPerRowTreeReduction()
+    {
+        string ptx = PtxNormalizeProbabilitiesKernel.EmitPtx(8, 6, 64, 512);
+        Assert.Contains(PtxNormalizeProbabilitiesKernel.EntryPoint, ptx);
+        Assert.Contains(".shared .align 16 .b8 red[1024]", ptx);   // 256-lane reduction scratch
+        Assert.Contains("$NP_SUM:", ptx);                          // strided partial-sum loop
+        Assert.Contains("$NP_DIV:", ptx);                          // strided divide loop
+        Assert.Equal(9, Count(ptx, "bar.sync 0"));                 // 1 after load + 8 tree-reduce strides
+        Assert.Equal(1, Count(ptx, "max.f32"));                    // clamp totalSum >= 1e-10
+        Assert.Equal(1, Count(ptx, "div.rn.f32"));                 // per-element divide
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxNormalizeProbabilitiesKernel.IsSupportedShape(64, 512));
+        Assert.False(PtxNormalizeProbabilitiesKernel.IsSupportedShape(0, 512));
+        Assert.False(PtxNormalizeProbabilitiesKernel.IsPromotedShape(64, 512));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyNormalizeProbabilities_MatchesOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in normalize-probabilities specialization is measured on GA10x/SM86.");
+        const int batchSize = 64, stateSize = 512;   // state > blockDim exercises the strided loop
+        using var kernel = new PtxNormalizeProbabilitiesKernel(runtime, batchSize, stateSize);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20268100);
+        float[] host = new float[batchSize * stateSize];
+        for (int i = 0; i < host.Length; i++) host[i] = (float)(random.NextDouble() + 0.01);   // positive probs
+        var expected = new float[host.Length];
+        for (int b = 0; b < batchSize; b++)
+        {
+            double sum = 0;
+            for (int i = 0; i < stateSize; i++) sum += host[b * stateSize + i];
+            if (sum < 1e-10) sum = 1e-10;
+            for (int i = 0; i < stateSize; i++) expected[b * stateSize + i] = (float)(host[b * stateSize + i] / sum);
+        }
+
+        using var probs = runtime.AllocateBytes((nuint)(host.Length * sizeof(float)));
+        probs.Upload<float>(host);
+        kernel.Launch(DirectPtxTensorView.CreateOwned(probs, kernel.Blueprint.Tensors[0]));
+        runtime.Synchronize();
+        var actual = new float[host.Length];
+        probs.Download<float>(actual);
+        AssertVectorClose(actual, expected, 2e-3f, "normalize probabilities");
     }
 
     [Fact]
@@ -1686,6 +1737,21 @@ public class DirectPtxScientificTests
             }
             using (var ib = backend.AllocateBuffer(ssIn)) using (var o = backend.AllocateBuffer(ssOuter * ssInner))
             { backend.SphericalSoftmax(ib, o, ssOuter, ssInner); n = AssertDispatched(n, "spherical-softmax"); AssertVectorClose(backend.DownloadBuffer(o), ssExp, 2e-3f, "spherical-softmax route"); }
+
+            // Normalize probabilities: in-place, one block per row. stateSize power-of-two (512) for the NVRTC contract.
+            const int npBatch = 64, npState = 512;
+            float[] npHost = new float[npBatch * npState];
+            for (int i = 0; i < npHost.Length; i++) npHost[i] = (float)(random.NextDouble() + 0.01);
+            var npExp = new float[npHost.Length];
+            for (int bt = 0; bt < npBatch; bt++)
+            {
+                double sum = 0;
+                for (int i = 0; i < npState; i++) sum += npHost[bt * npState + i];
+                if (sum < 1e-10) sum = 1e-10;
+                for (int i = 0; i < npState; i++) npExp[bt * npState + i] = (float)(npHost[bt * npState + i] / sum);
+            }
+            using (var pb = backend.AllocateBuffer(npHost))
+            { backend.NormalizeProbabilities(pb, npBatch, npState); n = AssertDispatched(n, "normalize-probabilities"); AssertVectorClose(backend.DownloadBuffer(pb), npExp, 2e-3f, "normalize-probabilities route"); }
         }
         finally
         {

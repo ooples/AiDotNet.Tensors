@@ -69,6 +69,8 @@ public sealed partial class CudaBackend
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<SciMatVecKey, PtxSphericalSoftmaxKernel> _sciSphericalSoftmax =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<SciMatVecKey, PtxNormalizeProbabilitiesKernel> _sciNormalizeProbabilities =
+        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
 
     private long _sciDispatchCount;
     internal long DirectPtxScientificDispatchCount => System.Threading.Interlocked.Read(ref _sciDispatchCount);
@@ -408,10 +410,29 @@ public sealed partial class CudaBackend
         });
     }
 
+    internal bool TryDirectPtxNormalizeProbabilities(IGpuBuffer probabilities, int batchSize, int stateSize)
+    {
+        if (!ScientificGateOpen || !PtxNormalizeProbabilitiesKernel.IsSupportedShape(batchSize, stateSize)) return Fail("normalize-probabilities");
+        long bytes = checked((long)batchSize * stateSize * sizeof(float));
+        if (probabilities.SizeInBytes != bytes) return Fail("normalize-probabilities-extent");
+        return SciDispatch(() =>
+        {
+            var k = _sciNormalizeProbabilities.GetOrAdd(new SciMatVecKey(batchSize, stateSize),
+                () => new PtxNormalizeProbabilitiesKernel(_directPtxRuntime!, batchSize, stateSize));
+            Launch1(k.Blueprint, probabilities, vp => k.Launch(vp));
+        });
+    }
+
     private bool Fail(string reason)
     {
         DirectPtxLastError = $"scientific-{reason}-not-eligible";
         return false;
+    }
+
+    private void Launch1(DirectPtxKernelBlueprint bp, IGpuBuffer a, Action<DirectPtxTensorView> launch)
+    {
+        lock (GpuDispatchLock)
+            launch(DirectPtxTensorView.Create(a, bp.Tensors[0]));
     }
 
     private void Launch2(DirectPtxKernelBlueprint bp, IGpuBuffer a, IGpuBuffer b, Action<DirectPtxTensorView, DirectPtxTensorView> launch)
