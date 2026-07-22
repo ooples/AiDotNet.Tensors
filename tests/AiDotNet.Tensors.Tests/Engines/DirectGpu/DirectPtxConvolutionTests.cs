@@ -2835,6 +2835,100 @@ public sealed class DirectPtxConvolutionTests
             $"Locally-connected Conv2D 3x3 backward-input max absolute error {maxAbsoluteError:G9}.");
     }
 
+    [Fact]
+    public void LocallyConnectedConv2DBackwardWeightEmitter_IsSingleProductSm86Ptx()
+    {
+        string ptx = PtxLocallyConnectedConv2DNchw3x3BackwardWeightF32Kernel.EmitPtx(8, 6);
+
+        Assert.Contains(".target sm_86", ptx, StringComparison.Ordinal);
+        Assert.Contains(PtxLocallyConnectedConv2DNchw3x3BackwardWeightF32Kernel.EntryPoint, ptx, StringComparison.Ordinal);
+        Assert.Equal(3, Count(ptx, ".param .u64"));
+        // Two integer divides decompose the flat weight id (id/9 and tap_kk/3).
+        Assert.Equal(2, Count(ptx, "div.u32"));
+        // Unshared weight = single output usage: exactly one multiply, no fma reduction, single store.
+        Assert.Equal(1, Count(ptx, "mul.f32"));
+        Assert.Equal(0, Count(ptx, "fma.rn.f32"));
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        // No loop: straight-line thread-per-weight (no backward branch).
+        Assert.DoesNotContain("bra ", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("atom", ptx, StringComparison.Ordinal);
+        Assert.Throws<NotSupportedException>(() =>
+            PtxLocallyConnectedConv2DNchw3x3BackwardWeightF32Kernel.EmitPtx(8, 9));
+    }
+
+    [Fact]
+    public void LocallyConnectedConv2DBackwardWeightManifestCell_IsExperimentalWithDedicatedRoute()
+    {
+        Assert.Equal(DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxConvolutionCoverageManifest.Get("IEngine.LocallyConnectedConv2DBackwardWeights").Status);
+        Assert.Equal(DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxConvolutionCoverageManifest
+                .Get("CudaBackend.TryDirectPtxLocallyConnectedConv2DBackwardWeights").Status);
+    }
+
+    [SkippableFact]
+    public void DriverOnlyLocallyConnectedConv2DBackwardWeight_MatchesCpuReference()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "Requires the experimental SM86 convolution specialization.");
+
+        const int inChannels = PtxLocallyConnectedConv2DNchw3x3BackwardWeightF32Kernel.InputChannels;
+        const int outChannels = PtxLocallyConnectedConv2DNchw3x3BackwardWeightF32Kernel.OutputChannels;
+        const int height = PtxLocallyConnectedConv2DNchw3x3BackwardWeightF32Kernel.Height;
+        const int width = PtxLocallyConnectedConv2DNchw3x3BackwardWeightF32Kernel.Width;
+        const int kernelSize = PtxLocallyConnectedConv2DNchw3x3BackwardWeightF32Kernel.KernelSize;
+        int spatial = height * width;
+
+        using var kernel = new PtxLocallyConnectedConv2DNchw3x3BackwardWeightF32Kernel(runtime);
+        using var gradOutDevice = runtime.AllocateBytes((nuint)PtxLocallyConnectedConv2DNchw3x3BackwardWeightF32Kernel.GradOutputBytes);
+        using var inputDevice = runtime.AllocateBytes((nuint)PtxLocallyConnectedConv2DNchw3x3BackwardWeightF32Kernel.InputBytes);
+        using var gradWeightDevice = runtime.AllocateBytes((nuint)PtxLocallyConnectedConv2DNchw3x3BackwardWeightF32Kernel.GradWeightBytes);
+
+        Random random = AiDotNet.Tensors.Helpers.RandomHelper.CreateSecureRandom();
+        var gradOut = new float[outChannels * spatial];
+        for (int i = 0; i < gradOut.Length; i++) gradOut[i] = (float)(random.NextDouble() * 2 - 1);
+        var input = new float[inChannels * spatial];
+        for (int i = 0; i < input.Length; i++) input[i] = (float)(random.NextDouble() * 2 - 1);
+        gradOutDevice.Upload<float>(gradOut);
+        inputDevice.Upload<float>(input);
+
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(gradOutDevice, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(inputDevice, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(gradWeightDevice, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[PtxLocallyConnectedConv2DNchw3x3BackwardWeightF32Kernel.WeightElements];
+        gradWeightDevice.Download<float>(actual);
+
+        float maxAbsoluteError = 0;
+        for (int oy = 0; oy < height; oy++)
+        for (int ox = 0; ox < width; ox++)
+        for (int co = 0; co < outChannels; co++)
+        for (int ci = 0; ci < inChannels; ci++)
+        for (int ky = 0; ky < kernelSize; ky++)
+        for (int kx = 0; kx < kernelSize; kx++)
+        {
+            int pos = oy * width + ox;
+            int iy = oy + ky - 1;
+            int ix = ox + kx - 1;
+            float inVal = (iy < 0 || iy >= height || ix < 0 || ix >= width)
+                ? 0f
+                : input[ci * spatial + (iy * width + ix)];
+            float expected = gradOut[co * spatial + pos] * inVal;
+            int wIdx = (((pos * outChannels + co) * inChannels + ci) * kernelSize * kernelSize)
+                + ky * kernelSize + kx;
+            maxAbsoluteError = MathF.Max(maxAbsoluteError, MathF.Abs(actual[wIdx] - expected));
+        }
+
+        Assert.True(maxAbsoluteError <= 5e-5f,
+            $"Locally-connected Conv2D 3x3 backward-weight max absolute error {maxAbsoluteError:G9}.");
+    }
+
     private static string? Validate(
         bool enabled, bool available, int major, int minor,
         DirectPtxConvolutionShape shape, IGpuBuffer? input, IGpuBuffer? weights,
