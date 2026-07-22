@@ -102,7 +102,7 @@ public sealed partial class CudaBackend
 
     internal bool IsDirectPtxMseLossEnabled =>
         DirectPtxFeatureGate.IsMseLossEnabled && IsAvailable &&
-        DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) == DirectPtxArchitectureFamily.Ampere;
+        DirectPtxArchitecture.HasValidatedMseLoss(_ccMajor, _ccMinor);
 
     internal long DirectPtxMseLossDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxMseLossDispatchCount);
@@ -1806,8 +1806,7 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "mse-loss-cuda-unavailable";
             return false;
         }
-        if (DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) !=
-            DirectPtxArchitectureFamily.Ampere)
+        if (!DirectPtxArchitecture.HasValidatedMseLoss(_ccMajor, _ccMinor))
         {
             DirectPtxLastError = "mse-loss-architecture-not-validated";
             return false;
@@ -1886,8 +1885,7 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "mse-loss-cuda-unavailable";
             return false;
         }
-        if (DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) !=
-            DirectPtxArchitectureFamily.Ampere)
+        if (!DirectPtxArchitecture.HasValidatedMseLoss(_ccMajor, _ccMinor))
         {
             DirectPtxLastError = "mse-loss-architecture-not-validated";
             return false;

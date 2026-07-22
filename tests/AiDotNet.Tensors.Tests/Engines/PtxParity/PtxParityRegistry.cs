@@ -47,6 +47,14 @@ public static class PtxParityRegistry
 {
     public static IReadOnlyList<PtxParitySpec> Specs { get; } = new[]
     {
+        new PtxParitySpec("PtxFusedMseLossF32Kernel", PtxParityStatus.Deferred,
+            "per-sample MSE loss, fp32 (#847) — CudaBackend.MseLoss",
+            "has a public route, but its tests compare the PTX result against a CPU reference only, so " +
+            "the gate-off CUDA==CPU leg is unproven. Converts to ThreeWayParity by mirroring " +
+            "BackendRowSum_ThreeWay_CudaAndPtxBothMatchCpuOracle over MseLoss; the per-row warp " +
+            "reduction accumulates, so that spec needs a summation-order-aware tolerance rather than " +
+            "bit-exact equality."),
+
         new PtxParitySpec("PtxFusedResidualRmsNormD64Kernel", PtxParityStatus.Deferred,
             "fused residual + RMSNorm (D=64)",
             "backend method has no public op route on main (only the CUDA RmsNorm path is wired), " +

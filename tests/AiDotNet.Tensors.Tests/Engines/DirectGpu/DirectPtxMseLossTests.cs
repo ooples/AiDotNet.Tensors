@@ -1,9 +1,9 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Linq;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+using AiDotNet.Tensors.Helpers;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -101,9 +101,9 @@ public class DirectPtxMseLossTests
         Assert.Equal(3, kernel.Blueprint.Tensors.Count);
 
         int elements = rows * columns;
-        var random = new Random(20260722);
-        float[] pred = Enumerable.Range(0, elements).Select(_ => (random.NextSingle() * 2f - 1f) * 4f).ToArray();
-        float[] target = Enumerable.Range(0, elements).Select(_ => (random.NextSingle() * 2f - 1f) * 4f).ToArray();
+        var random = RandomHelper.CreateSeededRandom(20260722);
+        float[] pred = Enumerable.Range(0, elements).Select(_ => (float)((random.NextDouble() * 2.0 - 1.0) * 4.0)).ToArray();
+        float[] target = Enumerable.Range(0, elements).Select(_ => (float)((random.NextDouble() * 2.0 - 1.0) * 4.0)).ToArray();
         var expected = new float[rows];
         for (int row = 0; row < rows; row++)
         {
@@ -148,4 +148,3 @@ public class DirectPtxMseLossTests
         return count;
     }
 }
-#endif

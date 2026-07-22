@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -39,10 +38,11 @@ internal sealed class PtxFusedMseLossF32Kernel : IDisposable
         int columns,
         int blockThreads = DefaultBlockThreads)
     {
-        ArgumentNullException.ThrowIfNull(runtime);
-        if (runtime.ArchitectureFamily != DirectPtxArchitectureFamily.Ampere)
+        PtxCompat.ThrowIfNull(runtime, nameof(runtime));
+        if (!DirectPtxArchitecture.HasValidatedMseLoss(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
-                "The checked-in FP32 MSE-loss specialization is validated only on Ampere.");
+                "The checked-in FP32 MSE-loss specialization is admitted only on SM86.");
         Validate(rows, columns);
         ValidateBlockThreads(rows, blockThreads);
         Rows = rows;
@@ -100,7 +100,7 @@ internal sealed class PtxFusedMseLossF32Kernel : IDisposable
         int warpsPerBlock = blockThreads / 32;
         int valuesPerLane = columns / 32;
         // 1/columns as an IEEE-754 single-precision hex literal.
-        uint invColumnsBits = BitConverter.SingleToUInt32Bits(1.0f / columns);
+        uint invColumnsBits = PtxCompat.SingleToUInt32Bits(1.0f / columns);
         string invColumns = "0f" + invColumnsBits.ToString("X8", CultureInfo.InvariantCulture);
         var ptx = new StringBuilder(4_096);
         ptx.AppendLine(".version 7.1");
@@ -117,7 +117,8 @@ internal sealed class PtxFusedMseLossF32Kernel : IDisposable
         ptx.AppendLine($".maxntid {blockThreads}, 1, 1");
         ptx.AppendLine("{");
         ptx.AppendLine("    .reg .pred %p<2>;");
-        ptx.AppendLine("    .reg .b32 %r<6>;");
+        // %r5/%r6 are the .b32 scratch pair the warp shuffle reinterprets through.
+        ptx.AppendLine("    .reg .b32 %r<7>;");
         ptx.AppendLine("    .reg .b64 %rd<13>;");
         ptx.AppendLine($"    .reg .f32 %f<{2 * valuesPerLane + 3}>;");
         ptx.AppendLine("    ld.param.u64 %rd0, [pred_ptr];");
@@ -148,10 +149,16 @@ internal sealed class PtxFusedMseLossF32Kernel : IDisposable
             ptx.AppendLine($"    sub.rn.f32 %f{predBase + i}, %f{predBase + i}, %f{targetBase + i};");
             ptx.AppendLine($"    fma.rn.f32 %f{accReg}, %f{predBase + i}, %f{predBase + i}, %f{accReg};");
         }
+        // shfl.sync.bfly.b32 is a bit-manipulation instruction whose operands are
+        // .b32 registers, not .f32. Reinterpret the float accumulator through a
+        // .b32 register for the shuffle, then reinterpret the shuffled bits back
+        // to .f32 before the arithmetic add.
         foreach (int delta in new[] { 16, 8, 4, 2, 1 })
         {
+            ptx.AppendLine($"    mov.b32 %r5, %f{accReg};");
             ptx.AppendLine(
-                $"    shfl.sync.bfly.b32 %f{shuffleReg}, %f{accReg}, {delta}, 31, 0xffffffff;");
+                $"    shfl.sync.bfly.b32 %r6, %r5, {delta}, 31, 0xffffffff;");
+            ptx.AppendLine($"    mov.b32 %f{shuffleReg}, %r6;");
             ptx.AppendLine($"    add.rn.f32 %f{accReg}, %f{accReg}, %f{shuffleReg};");
         }
         ptx.AppendLine($"    mul.rn.f32 %f{accReg}, %f{accReg}, {invColumns};");
@@ -254,4 +261,3 @@ internal sealed class PtxFusedMseLossF32Kernel : IDisposable
                 $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
     }
 }
-#endif
