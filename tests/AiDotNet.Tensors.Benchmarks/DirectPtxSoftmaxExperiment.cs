@@ -275,6 +275,29 @@ internal static class DirectPtxSoftmaxExperiment
             $"{e2e.Mean,6:F2}/{e2e.Median,6:F2}/{e2e.P95,6:F2}/{e2e.P99,6:F2}   " +
             $"{gflops,7:F1} {tflops,6:F3} {bandwidth,5:F1} {allocation,6} {temporaryBytes,4} " +
             $"{error,8:E1} {resources}");
+        EmitEvidence(run, rows, columns, method, device, allocation, temporaryBytes, error, audit);
+    }
+
+    // Machine-readable evidence line consumed by
+    // Profiling/run-direct-ptx-softmax-evidence.ps1, which aggregates across
+    // independent clean processes and evaluates DirectPtxReleaseGate. Device
+    // median/P95 (microseconds) are the timed quantities the gate compares.
+    private static void EmitEvidence(
+        int run, int rows, int columns, string method,
+        Distribution device, long allocation, long temporaryBytes,
+        float error, DirectPtxKernelAudit? audit)
+    {
+        var c = System.Globalization.CultureInfo.InvariantCulture;
+        int localBytes = audit?.Function.LocalBytesPerThread ?? 0;
+        Console.WriteLine(
+            "softmax_evidence_json={" +
+            $"\"run\":{run},\"rows\":{rows},\"columns\":{columns}," +
+            $"\"method\":\"{method}\"," +
+            $"\"median_us\":{device.Median.ToString("R", c)}," +
+            $"\"p95_us\":{device.P95.ToString("R", c)}," +
+            $"\"managed_bytes\":{allocation},\"temp_bytes\":{temporaryBytes}," +
+            $"\"max_error\":{error.ToString("R", c)},\"local_bytes\":{localBytes}" +
+            "}");
     }
 
     private static float[] Oracle(float[] input, int rows, int columns)
