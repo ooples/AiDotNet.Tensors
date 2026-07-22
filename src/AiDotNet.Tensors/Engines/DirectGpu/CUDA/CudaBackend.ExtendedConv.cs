@@ -47,6 +47,8 @@ public sealed partial class CudaBackend : ITrilinearInterpolationKernels, IConvT
     {
         int total = checked(numPoints * basisCount * numChannels);
         if (total <= 0) return;
+        if (TryDirectPtxSphericalHarmonicsBackward(shCoefficients, viewDirections, outputGradient, shGrad, numPoints, basisCount, numChannels, degree, broadcastDir)) return;
+
         if (!_kernelCache.TryGetValue("spherical_harmonics_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: spherical_harmonics_backward");
         using var _ = PushContext();

@@ -14,7 +14,7 @@ public class DirectPtxScientificTests
     [Fact]
     public void ScientificCoverageManifest_AssignsEveryScopedApiExactlyOnce()
     {
-        Assert.Equal(16, DirectPtxScientificCoverageManifest.All.Count);
+        Assert.Equal(17, DirectPtxScientificCoverageManifest.All.Count);
         string[] names = DirectPtxScientificCoverageManifest.All.Select(c => c.Api).ToArray();
         Assert.Contains("CudaBackend.RbfForward", names);
         Assert.Contains("CudaBackend.PairwiseDistance", names);
@@ -22,6 +22,7 @@ public class DirectPtxScientificTests
         Assert.Contains("CudaBackend.QuantumMeasurement", names);
         Assert.Contains("CudaBackend.ComplexMatVec", names);
         Assert.Contains("CudaBackend.SphericalHarmonics", names);
+        Assert.Contains("CudaBackend.SphericalHarmonicsBackward", names);
         Assert.Equal(names.Length, names.Distinct(StringComparer.Ordinal).Count());
         Assert.All(DirectPtxScientificCoverageManifest.All, cell =>
         {
@@ -597,6 +598,79 @@ public class DirectPtxScientificTests
         var actual = new float[expected.Length];
         outBuf.Download<float>(actual);
         AssertVectorClose(actual, expected, 3e-3f, "spherical harmonics");
+    }
+
+    [Fact]
+    public void SphericalHarmonicsBackwardEmitter_MasksAndSelectsBasis()
+    {
+        string ptx = PtxSphericalHarmonicsBackwardKernel.EmitPtx(8, 6, 128, 16, 4, 3, broadcastDir: false);
+        Assert.Contains(PtxSphericalHarmonicsBackwardKernel.EntryPoint, ptx);
+        Assert.Equal(3 + 16 + 1, Count(ptx, "ld.global.nc.f32"));   // 3 dir + 16 coeff (preclamp) + 1 outGrad
+        Assert.Equal(1, Count(ptx, "st.global.f32"));                // shGrad[idx]
+        Assert.Contains("or.pred %p3, %p1, %p2", ptx);               // out-of-range clamp mask
+        Assert.Equal(15, Count(ptx, "setp.eq.u32"));                 // basisCount-1 selp-chain comparisons
+        Assert.Contains($"rem.u32 %r6, %r5, 16", ptx);               // b = q % basisCount
+        Assert.Contains("div.u32 %r3, %r5, 16", ptx);                // i = q / basisCount
+        Assert.Equal(0, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxSphericalHarmonicsBackwardKernel.IsSupportedShape(128, 16, 4, 3));
+        Assert.False(PtxSphericalHarmonicsBackwardKernel.IsSupportedShape(128, 16, 4, 2));   // basis>(deg+1)^2
+        Assert.False(PtxSphericalHarmonicsBackwardKernel.IsPromotedShape(128, 16, 4, 3));
+    }
+
+    [SkippableTheory]
+    [InlineData(3, 16, false)]
+    [InlineData(2, 9, true)]
+    public void DriverOnlySphericalHarmonicsBackward_MatchesOracle(int degree, int basisCount, bool broadcast)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in spherical-harmonics-backward specialization is measured on GA10x/SM86.");
+        const int numPoints = 64, numChannels = 4;   // count = points*basis*channels multiple of 256
+        using var kernel = new PtxSphericalHarmonicsBackwardKernel(runtime, numPoints, basisCount, numChannels, degree, broadcast);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20267600);
+        int dirCount = broadcast ? 1 : numPoints;
+        float[] coeff = Values(random, numPoints * basisCount * numChannels, 0.5f);
+        float[] dirs = Values(random, dirCount * 3, 1.0f);
+        float[] outGrad = Values(random, numPoints * numChannels, 1.0f);
+        var expected = new float[numPoints * basisCount * numChannels];
+        for (int i = 0; i < numPoints; i++)
+        {
+            int dirIdx = broadcast ? 0 : i;
+            float[] basis = ShBasisOracle(dirs[dirIdx * 3], dirs[dirIdx * 3 + 1], dirs[dirIdx * 3 + 2], degree);
+            for (int ch = 0; ch < numChannels; ch++)
+            {
+                double preclamp = 0;
+                for (int bb = 0; bb < basisCount; bb++)
+                    preclamp += coeff[i * basisCount * numChannels + bb * numChannels + ch] * basis[bb];
+                float colorGrad = outGrad[i * numChannels + ch];
+                if (preclamp < 0.0 || preclamp > 1.0) colorGrad = 0.0f;
+                for (int b = 0; b < basisCount; b++)
+                    expected[i * basisCount * numChannels + b * numChannels + ch] = colorGrad * basis[b];
+            }
+        }
+
+        using var coeffBuf = runtime.AllocateBytes((nuint)(coeff.Length * sizeof(float)));
+        using var dirBuf = runtime.AllocateBytes((nuint)(dirs.Length * sizeof(float)));
+        using var gradBuf = runtime.AllocateBytes((nuint)(outGrad.Length * sizeof(float)));
+        using var shGradBuf = runtime.AllocateBytes((nuint)(expected.Length * sizeof(float)));
+        coeffBuf.Upload<float>(coeff);
+        dirBuf.Upload<float>(dirs);
+        gradBuf.Upload<float>(outGrad);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(coeffBuf, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(dirBuf, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(gradBuf, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(shGradBuf, kernel.Blueprint.Tensors[3]));
+        runtime.Synchronize();
+        var actual = new float[expected.Length];
+        shGradBuf.Download<float>(actual);
+        AssertVectorClose(actual, expected, 3e-3f, "spherical harmonics backward");
     }
 
     // CPU mirror of the NVRTC spherical_harmonics basis table.
@@ -1180,6 +1254,25 @@ public class DirectPtxScientificTests
             }
             using (var cb = backend.AllocateBuffer(shCoeff)) using (var db = backend.AllocateBuffer(shDirs)) using (var o = backend.AllocateBuffer(shPoints * shChannels))
             { backend.SphericalHarmonics(cb, db, o, shPoints, shBasis, shChannels, shDegree, 0); n = AssertDispatched(n, "spherical-harmonics"); AssertVectorClose(backend.DownloadBuffer(o), shExp, 3e-3f, "spherical-harmonics route"); }
+
+            // Spherical harmonics backward: count = points*basis*channels = 256*16*4.
+            float[] shOutGrad = Values(random, shPoints * shChannels, 1.0f);
+            var shGradExp = new float[shPoints * shBasis * shChannels];
+            for (int i = 0; i < shPoints; i++)
+            {
+                float[] basis = ShBasisOracle(shDirs[i * 3], shDirs[i * 3 + 1], shDirs[i * 3 + 2], shDegree);
+                for (int ch = 0; ch < shChannels; ch++)
+                {
+                    double preclamp = 0;
+                    for (int bb = 0; bb < shBasis; bb++) preclamp += shCoeff[i * shBasis * shChannels + bb * shChannels + ch] * basis[bb];
+                    float cg = shOutGrad[i * shChannels + ch];
+                    if (preclamp < 0.0 || preclamp > 1.0) cg = 0.0f;
+                    for (int b = 0; b < shBasis; b++) shGradExp[i * shBasis * shChannels + b * shChannels + ch] = cg * basis[b];
+                }
+            }
+            using (var cb = backend.AllocateBuffer(shCoeff)) using (var db = backend.AllocateBuffer(shDirs))
+            using (var gb = backend.AllocateBuffer(shOutGrad)) using (var sg = backend.AllocateBuffer(shPoints * shBasis * shChannels))
+            { backend.SphericalHarmonicsBackward(cb, db, gb, sg, shPoints, shBasis, shChannels, shDegree, 0); n = AssertDispatched(n, "spherical-harmonics-backward"); AssertVectorClose(backend.DownloadBuffer(sg), shGradExp, 3e-3f, "spherical-harmonics-backward route"); }
         }
         finally
         {

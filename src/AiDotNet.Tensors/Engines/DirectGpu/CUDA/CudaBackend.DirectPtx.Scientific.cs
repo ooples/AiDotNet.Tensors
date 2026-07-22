@@ -55,6 +55,8 @@ public sealed partial class CudaBackend
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<SciShKey, PtxSphericalHarmonicsKernel> _sciSphericalHarmonics =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<SciShKey, PtxSphericalHarmonicsBackwardKernel> _sciSphericalHarmonicsBwd =
+        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
 
     private long _sciDispatchCount;
     internal long DirectPtxScientificDispatchCount => System.Threading.Interlocked.Read(ref _sciDispatchCount);
@@ -269,6 +271,28 @@ public sealed partial class CudaBackend
                 new SciShKey(numPoints, basisCount, numChannels, degree, broadcast),
                 () => new PtxSphericalHarmonicsKernel(_directPtxRuntime!, numPoints, basisCount, numChannels, degree, broadcast));
             Launch3(k.Blueprint, shCoefficients, viewDirections, output, (vc, vd, vo) => k.Launch(vc, vd, vo));
+        });
+    }
+
+    internal bool TryDirectPtxSphericalHarmonicsBackward(
+        IGpuBuffer shCoefficients, IGpuBuffer viewDirections, IGpuBuffer outputGradient, IGpuBuffer shGrad,
+        int numPoints, int basisCount, int numChannels, int degree, int broadcastDir)
+    {
+        bool broadcast = broadcastDir != 0;
+        if (!ScientificGateOpen ||
+            !PtxSphericalHarmonicsBackwardKernel.IsSupportedShape(numPoints, basisCount, numChannels, degree)) return Fail("spherical-harmonics-backward");
+        long coeffBytes = checked((long)numPoints * basisCount * numChannels * sizeof(float));
+        long dirBytes = checked((long)(broadcast ? 1 : numPoints) * 3 * sizeof(float));
+        long gradBytes = checked((long)numPoints * numChannels * sizeof(float));
+        if (shCoefficients.SizeInBytes != coeffBytes || viewDirections.SizeInBytes != dirBytes ||
+            outputGradient.SizeInBytes != gradBytes || shGrad.SizeInBytes != coeffBytes) return Fail("spherical-harmonics-backward-extent");
+        return SciDispatch(() =>
+        {
+            var k = _sciSphericalHarmonicsBwd.GetOrAdd(
+                new SciShKey(numPoints, basisCount, numChannels, degree, broadcast),
+                () => new PtxSphericalHarmonicsBackwardKernel(_directPtxRuntime!, numPoints, basisCount, numChannels, degree, broadcast));
+            Launch4(k.Blueprint, shCoefficients, viewDirections, outputGradient, shGrad,
+                (vc, vd, vg, vs) => k.Launch(vc, vd, vg, vs));
         });
     }
 
