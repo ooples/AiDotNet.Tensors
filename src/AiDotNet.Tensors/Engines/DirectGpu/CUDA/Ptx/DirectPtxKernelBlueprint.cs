@@ -45,6 +45,15 @@ internal static class DirectPtxArchitecture
     /// </summary>
     internal static bool HasValidatedQkvRopeCache(int major, int minor) =>
         (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The issue-#846 recurrent prototype is deliberately an exact GA102/SM86
+    /// specialization. It is not promoted: correctness, performance, and
+    /// resource evidence must still be collected before the feature gate can
+    /// be enabled by default.
+    /// </summary>
+    internal static bool HasExperimentalRgLruScan(int major, int minor) =>
+        (major, minor) == (8, 6);
 }
 
 internal enum DirectPtxExtentMode

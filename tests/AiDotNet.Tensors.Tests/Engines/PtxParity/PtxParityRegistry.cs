@@ -81,6 +81,10 @@ public static class PtxParityRegistry
         new PtxParitySpec("PtxFusedQkvRopeCacheD64Kernel", PtxParityStatus.Deferred,
             "fused QKV + RoPE + KV-cache write (#858)",
             "multi-output (Q + K/V cache) with baked RoPE tables; needs a dedicated QKV/RoPE/cache oracle."),
+        new PtxParitySpec("PtxFusedRgLruScan128x256Kernel", PtxParityStatus.Deferred,
+            "RG-LRU scan forward [1,128,256] (#846)",
+            "the exact SM86 route and high-precision resident championship harness are checked in, " +
+            "but a three-way test requires an admitted SM86 GPU; keep deferred until that CI lane exists."),
     };
 
     private static readonly Dictionary<string, PtxParitySpec> ByKernel =
