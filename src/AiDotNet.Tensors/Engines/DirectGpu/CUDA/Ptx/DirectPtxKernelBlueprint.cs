@@ -44,6 +44,10 @@ internal static class DirectPtxArchitecture
     /// </summary>
     internal static bool HasValidatedQkvRopeCache(int major, int minor) =>
         (major, minor) == (8, 6);
+
+    /// <summary>The first vision specialization is emitted only for GA102/SM86.</summary>
+    internal static bool HasValidatedVisionBoxIou(int major, int minor) =>
+        (major, minor) == (8, 6);
 }
 
 internal enum DirectPtxExtentMode
@@ -117,6 +121,7 @@ internal readonly record struct DirectPtxTensorContract
     internal DirectPtxExtent LogicalExtent { get; }
     internal DirectPtxExtent PhysicalExtent { get; }
     internal int AlignmentBytes { get; }
+    internal nuint ByteOffset { get; }
     internal DirectPtxTensorAccess Access { get; }
     internal DirectPtxExtentMode ExtentMode { get; }
 
@@ -128,7 +133,8 @@ internal readonly record struct DirectPtxTensorContract
         DirectPtxExtent physicalExtent,
         int alignmentBytes,
         DirectPtxTensorAccess access,
-        DirectPtxExtentMode extentMode = DirectPtxExtentMode.AtLeast)
+        DirectPtxExtentMode extentMode = DirectPtxExtentMode.AtLeast,
+        nuint byteOffset = 0)
     {
         if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("A tensor ABI name is required.", nameof(name));
         if (alignmentBytes <= 0 || (alignmentBytes & (alignmentBytes - 1)) != 0)
@@ -141,6 +147,7 @@ internal readonly record struct DirectPtxTensorContract
         LogicalExtent = logicalExtent;
         PhysicalExtent = physicalExtent;
         AlignmentBytes = alignmentBytes;
+        ByteOffset = byteOffset;
         Access = access;
         ExtentMode = extentMode;
     }

@@ -1,5 +1,6 @@
 // Copyright (c) AiDotNet. All rights reserved.
 // CUDA launcher shims for the RoI family (Issue #217 tail).
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 public sealed partial class CudaBackend : IRoiBackend
@@ -19,6 +20,10 @@ public sealed partial class CudaBackend : IRoiBackend
     {
         int total = K * C * outH * outW;
         if (total <= 0) return;
+        if (TryDirectPtxVisionRoi(
+                DirectPtxVisionOperation.RoiAlign, input, boxes, output,
+                N, C, H, W, K, outH, outW, C, spatialScale,
+                samplingRatio, aligned)) return;
         var kernel = ResolveRoiKernel("roi_align");
         using var _ = PushContext();
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -39,6 +44,10 @@ public sealed partial class CudaBackend : IRoiBackend
     {
         int total = K * C * outH * outW;
         if (total <= 0) return;
+        if (TryDirectPtxVisionRoi(
+                DirectPtxVisionOperation.RoiPool, input, boxes, output,
+                N, C, H, W, K, outH, outW, C, spatialScale,
+                0, false)) return;
         var kernel = ResolveRoiKernel("roi_pool");
         using var _ = PushContext();
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -58,6 +67,10 @@ public sealed partial class CudaBackend : IRoiBackend
     {
         int total = K * outputChannels * outH * outW;
         if (total <= 0) return;
+        if (TryDirectPtxVisionRoi(
+                DirectPtxVisionOperation.PsRoiAlign, input, boxes, output,
+                N, C, H, W, K, outH, outW, outputChannels, spatialScale,
+                samplingRatio, false)) return;
         var kernel = ResolveRoiKernel("ps_roi_align");
         using var _ = PushContext();
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -79,6 +92,10 @@ public sealed partial class CudaBackend : IRoiBackend
     {
         int total = K * outputChannels * outH * outW;
         if (total <= 0) return;
+        if (TryDirectPtxVisionRoi(
+                DirectPtxVisionOperation.PsRoiPool, input, boxes, output,
+                N, C, H, W, K, outH, outW, outputChannels, spatialScale,
+                0, false)) return;
         var kernel = ResolveRoiKernel("ps_roi_pool");
         using var _ = PushContext();
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);

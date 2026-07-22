@@ -19,6 +19,8 @@ internal static class DirectPtxFeatureGate
     internal const string AttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_ATTENTION_BACKWARD";
     internal const string FlashAttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FLASH_ATTENTION_BACKWARD";
     internal const string QkvRopeCacheEnvironmentVariable = "AIDOTNET_DIRECT_PTX_QKV_ROPE_CACHE";
+    internal const string VisionBoxIouEnvironmentVariable = "AIDOTNET_DIRECT_PTX_VISION_BOX_IOU";
+    internal const string VisionEnvironmentVariable = "AIDOTNET_DIRECT_PTX_VISION";
     internal const string AutotuneEnvironmentVariable = "AIDOTNET_DIRECT_PTX_AUTOTUNE";
     internal const string CacheCapacityEnvironmentVariable = "AIDOTNET_DIRECT_PTX_CACHE_CAPACITY";
 
@@ -34,12 +36,35 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentAttentionBackwardEnabled = ReadEnabled(AttentionBackwardEnvironmentVariable);
     private static readonly bool EnvironmentFlashAttentionBackwardEnabled = ReadEnabled(FlashAttentionBackwardEnvironmentVariable);
     private static readonly bool EnvironmentQkvRopeCacheEnabled = ReadEnabled(QkvRopeCacheEnvironmentVariable);
+    private static readonly bool EnvironmentVisionBoxIouEnabled = ReadEnabled(VisionBoxIouEnvironmentVariable);
+    private static readonly bool EnvironmentVisionEnabled = ReadEnabled(VisionEnvironmentVariable);
+    private static readonly bool[] EnvironmentVisionOperationEnabled = ReadVisionOperationGates();
     private static readonly bool EnvironmentAutotuneEnabled =
         !string.Equals(Environment.GetEnvironmentVariable(AutotuneEnvironmentVariable), "0", StringComparison.Ordinal);
     private static readonly int EnvironmentCacheCapacity = ReadCacheCapacity();
 
     /// <summary>Test-only override. Null restores environment-based behavior.</summary>
     internal static bool? TestOverride { get; set; }
+
+    [ThreadStatic]
+    private static bool? _visionBoxIouExperimentOverride;
+
+    [ThreadStatic]
+    private static bool? _visionBoxIouGateOverride;
+
+    /// <summary>Thread-isolated static/driver-test opt-in for the unpromoted specialization.</summary>
+    internal static bool? VisionBoxIouExperimentOverride
+    {
+        get => _visionBoxIouExperimentOverride;
+        set => _visionBoxIouExperimentOverride = value;
+    }
+
+    /// <summary>Benchmark-only route selector; false forces the established backend.</summary>
+    internal static bool? VisionBoxIouGateOverride
+    {
+        get => _visionBoxIouGateOverride;
+        set => _visionBoxIouGateOverride = value;
+    }
 
     internal static bool IsEnabled => IsAttentionEnabled;
 
@@ -67,12 +92,61 @@ internal static class DirectPtxFeatureGate
     internal static bool IsQkvRopeCacheEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentQkvRopeCacheEnabled);
 
+    internal static bool IsVisionBoxIouEnabled => VisionBoxIouGateOverride ??
+        VisionBoxIouExperimentOverride ?? TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentVisionEnabled || EnvironmentVisionBoxIouEnabled);
+
+    internal static bool IsVisionOperationEnabled(DirectPtxVisionOperation operation) =>
+        VisionBoxIouExperimentOverride ?? TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentVisionEnabled ||
+         EnvironmentVisionOperationEnabled[(int)operation]);
+
     internal static bool IsAutotuneEnabled => EnvironmentAutotuneEnabled;
 
     internal static int CacheCapacity => EnvironmentCacheCapacity;
 
     private static bool ReadEnabled(string variable) =>
         string.Equals(Environment.GetEnvironmentVariable(variable), "1", StringComparison.Ordinal);
+
+    private static bool[] ReadVisionOperationGates()
+    {
+        Array values = Enum.GetValues(typeof(DirectPtxVisionOperation));
+        var enabled = new bool[values.Length];
+        foreach (DirectPtxVisionOperation operation in values)
+        {
+            string suffix = VisionGateSuffix(operation);
+            enabled[(int)operation] = ReadEnabled("AIDOTNET_DIRECT_PTX_VISION_" + suffix);
+        }
+        return enabled;
+    }
+
+    private static string VisionGateSuffix(DirectPtxVisionOperation operation) => operation switch
+    {
+        DirectPtxVisionOperation.GeneralizedBoxIou => "GENERALIZED_BOX_IOU",
+        DirectPtxVisionOperation.DistanceBoxIou => "DISTANCE_BOX_IOU",
+        DirectPtxVisionOperation.CompleteBoxIou => "COMPLETE_BOX_IOU",
+        DirectPtxVisionOperation.BoxArea => "BOX_AREA",
+        DirectPtxVisionOperation.BoxConvert => "BOX_CONVERT",
+        DirectPtxVisionOperation.IoULoss => "IOU_LOSS",
+        DirectPtxVisionOperation.GIoULoss => "GIOU_LOSS",
+        DirectPtxVisionOperation.DIoULoss => "DIOU_LOSS",
+        DirectPtxVisionOperation.CIoULoss => "CIOU_LOSS",
+        DirectPtxVisionOperation.IoULossBackward => "IOU_LOSS_BACKWARD",
+        DirectPtxVisionOperation.GIoULossBackward => "GIOU_LOSS_BACKWARD",
+        DirectPtxVisionOperation.DIoULossBackward => "DIOU_LOSS_BACKWARD",
+        DirectPtxVisionOperation.CIoULossBackward => "CIOU_LOSS_BACKWARD",
+        DirectPtxVisionOperation.IouFamilyBackwardA => "IOU_FAMILY_BACKWARD_A",
+        DirectPtxVisionOperation.IouFamilyBackwardB => "IOU_FAMILY_BACKWARD_B",
+        DirectPtxVisionOperation.Nms => "NMS",
+        DirectPtxVisionOperation.MasksToBoxes => "MASKS_TO_BOXES",
+        DirectPtxVisionOperation.RoiAlign => "ROI_ALIGN",
+        DirectPtxVisionOperation.RoiPool => "ROI_POOL",
+        DirectPtxVisionOperation.PsRoiAlign => "PS_ROI_ALIGN",
+        DirectPtxVisionOperation.PsRoiPool => "PS_ROI_POOL",
+        DirectPtxVisionOperation.Cross3 => "CROSS3",
+        DirectPtxVisionOperation.Meshgrid2D => "MESHGRID_2D",
+        _ => throw new ArgumentOutOfRangeException(nameof(operation))
+    };
 
     private static int ReadCacheCapacity()
     {
@@ -95,6 +169,8 @@ internal enum DirectPtxPhysicalLayout
     Bhsd,
     /// <summary>Dense row-major [row, feature].</summary>
     RowMajor2D,
+    /// <summary>Dense row-major [dim0, dim1, dim2].</summary>
+    RowMajor3D,
     /// <summary>Dense row-major [sequence, head, dimension].</summary>
     SequenceHeadDim,
     /// <summary>Dense [row, qkv, head, feature] projection output.</summary>
@@ -107,6 +183,16 @@ internal enum DirectPtxPhysicalLayout
     AttentionBias,
     /// <summary>One-dimensional canonical vector.</summary>
     Vector,
+    /// <summary>Dense row-major bounding boxes in canonical XYXY order.</summary>
+    BoxXyxy,
+    /// <summary>Dense images with batch/channel/height/width order.</summary>
+    Nchw,
+    /// <summary>Dense images with batch/height/width/channel order.</summary>
+    Nhwc,
+    /// <summary>Dense normalized sampling coordinates ending in 2 or 3.</summary>
+    SamplingGrid,
+    /// <summary>ROI rows [batchIndex,x1,y1,x2,y2].</summary>
+    RoiBoxes,
     /// <summary>Block table plus packed pages for decode attention.</summary>
     PagedKv
 }
@@ -153,6 +239,10 @@ internal readonly struct DirectPtxTensorView
         nuint byteOffset = 0)
     {
         PtxCompat.ThrowIfNull(buffer, nameof(buffer));
+        if (byteOffset != contract.ByteOffset)
+            throw new ArgumentException(
+                $"Tensor '{contract.Name}' requires byte offset {contract.ByteOffset}; received {byteOffset}.",
+                nameof(byteOffset));
         if (buffer.Handle == IntPtr.Zero)
             throw new ArgumentException("The GPU buffer has no device pointer.", nameof(buffer));
         nuint allocationBytes = checked((nuint)buffer.SizeInBytes);
@@ -235,6 +325,10 @@ internal readonly struct DirectPtxTensorView
         nuint byteOffset = 0)
     {
         PtxCompat.ThrowIfNull(buffer, nameof(buffer));
+        if (byteOffset != contract.ByteOffset)
+            throw new ArgumentException(
+                $"Tensor '{contract.Name}' requires byte offset {contract.ByteOffset}; received {byteOffset}.",
+                nameof(byteOffset));
         nuint end = checked(byteOffset + contract.RequiredBytes);
         if (buffer.Pointer == IntPtr.Zero || end > buffer.ByteLength ||
             (contract.ExtentMode == DirectPtxExtentMode.Exact && end != buffer.ByteLength))

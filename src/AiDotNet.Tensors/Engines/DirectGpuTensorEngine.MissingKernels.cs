@@ -3497,6 +3497,18 @@ public partial class DirectGpuTensorEngine
         => TensorSearchSorted(boundaries, input, right);
 
     /// <inheritdoc/>
+    public new (Tensor<T> X, Tensor<T> Y) TensorMeshgrid<T>(Tensor<T> x, Tensor<T> y)
+    {
+        if (x is null) throw new ArgumentNullException(nameof(x));
+        if (y is null) throw new ArgumentNullException(nameof(y));
+        Tensor<T>[] grids = TensorMeshgrid([x, y], "xy");
+        return (grids[0], grids[1]);
+    }
+
+    (Tensor<T> X, Tensor<T> Y) IEngine.TensorMeshgrid<T>(Tensor<T> x, Tensor<T> y) =>
+        TensorMeshgrid(x, y);
+
+    /// <inheritdoc/>
     public override Tensor<T>[] TensorMeshgrid<T>(Tensor<T>[] tensors, string indexing = "ij")
     {
         if (tensors is null) throw new ArgumentNullException(nameof(tensors));
@@ -3508,7 +3520,7 @@ public partial class DirectGpuTensorEngine
         }
         if (indexing != "ij" && indexing != "xy")
             throw new ArgumentException("indexing must be 'ij' or 'xy'");
-        if (typeof(T) != typeof(float) || !TryGetBackend(out _))
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
             return base.TensorMeshgrid(tensors, indexing);
 
         // Each output grid k = input k reshaped onto its output axis (size n_k, 1s elsewhere) then
@@ -3520,6 +3532,44 @@ public partial class DirectGpuTensorEngine
             for (int i = 0; i < d; i++) outShape[i] = tensors[i]._shape[0];
             bool xy = indexing == "xy" && d >= 2;
             if (xy) { int tmp = outShape[0]; outShape[0] = outShape[1]; outShape[1] = tmp; }
+
+            if (d == 2 && backend is IDirectPtxVisionBackend directPtx &&
+                directPtx.CanDirectPtxMeshgrid2D(
+                    tensors[0]._shape[0], tensors[1]._shape[0], xy))
+            {
+                int n0 = tensors[0]._shape[0], n1 = tensors[1]._shape[0];
+                int outputLength = checked(n0 * n1);
+                using var source0 = GetOrAllocateBuffer(backend, tensors[0]);
+                using var source1 = GetOrAllocateBuffer(backend, tensors[1]);
+                IGpuBuffer? output0 = null, output1 = null;
+                Tensor<T>? direct0 = null, direct1 = null;
+                try
+                {
+                    output0 = backend.AllocateBuffer(outputLength);
+                    output1 = backend.AllocateBuffer(outputLength);
+                    if (directPtx.TryDirectPtxMeshgrid2DPair(
+                            source0.Buffer, source1.Buffer, output0, output1,
+                            n0, n1, xy))
+                    {
+                        direct0 = DeferTensorResult<T>(backend, output0, outputLength, outShape);
+                        output0 = null;
+                        direct1 = DeferTensorResult<T>(backend, output1, outputLength, outShape);
+                        output1 = null;
+                        return [direct0, direct1];
+                    }
+                }
+                catch
+                {
+                    direct0?.Dispose();
+                    direct1?.Dispose();
+                    throw;
+                }
+                finally
+                {
+                    output0?.Dispose();
+                    output1?.Dispose();
+                }
+            }
 
             var result = new Tensor<T>[d];
             for (int k = 0; k < d; k++)

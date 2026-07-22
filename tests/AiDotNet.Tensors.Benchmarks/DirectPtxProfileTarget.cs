@@ -264,6 +264,102 @@ internal static class DirectPtxProfileTarget
         GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-qkv-rope-cache-end");
     }
 
+    internal static void RunVisionBoxIou()
+    {
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-vision-box-iou-start");
+        using var runtime = new DirectPtxRuntime();
+        (int N, int M)[] shapes = [(256, 256), (1024, 256), (1024, 1024), (4096, 256)];
+        foreach ((int n, int m) in shapes)
+        {
+            using var kernel = new PtxFusedPairwiseBoxIouF32Kernel(runtime, n, m);
+            using var boxesA = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+            using var boxesB = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+            using var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+            boxesA.Upload<float>(new float[n * 4]);
+            boxesB.Upload<float>(new float[m * 4]);
+            kernel.Launch(
+                DirectPtxTensorView.CreateOwned(boxesA, kernel.Blueprint.Tensors[0]),
+                DirectPtxTensorView.CreateOwned(boxesB, kernel.Blueprint.Tensors[1]),
+                DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[2]));
+            runtime.Synchronize();
+            Console.WriteLine(kernel.Audit.ToJson());
+        }
+        foreach (DirectPtxVisionSpec spec in VisionProfileSpecs())
+        {
+            using var kernel = new PtxVisionKernel(runtime, spec);
+            var buffers = new DirectPtxBuffer[kernel.Blueprint.Tensors.Count];
+            try
+            {
+                var views = new DirectPtxTensorView[buffers.Length];
+                for (int i = 0; i < buffers.Length; i++)
+                {
+                    DirectPtxTensorContract contract = kernel.Blueprint.Tensors[i];
+                    buffers[i] = runtime.AllocateBytes(contract.RequiredBytes);
+                    if (contract.PhysicalType == DirectPtxPhysicalType.Int32)
+                        buffers[i].Upload<int>(new int[checked((int)(contract.RequiredBytes / 4))]);
+                    else
+                        buffers[i].Upload<float>(new float[checked((int)(contract.RequiredBytes / 4))]);
+                    views[i] = DirectPtxTensorView.CreateOwned(buffers[i], contract);
+                }
+                kernel.Launch(
+                    views[0],
+                    views.Length > 1 ? views[1] : default,
+                    views.Length > 2 ? views[2] : default,
+                    views.Length > 3 ? views[3] : default,
+                    views.Length > 4 ? views[4] : default,
+                    views.Length > 5 ? views[5] : default);
+                runtime.Synchronize();
+                Console.WriteLine(kernel.Audit.ToJson());
+            }
+            finally
+            {
+                foreach (DirectPtxBuffer? buffer in buffers) buffer?.Dispose();
+            }
+        }
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-vision-box-iou-end");
+    }
+
+    private static IEnumerable<DirectPtxVisionSpec> VisionProfileSpecs()
+    {
+        yield return new(DirectPtxVisionOperation.GeneralizedBoxIou, 256, 256);
+        yield return new(DirectPtxVisionOperation.DistanceBoxIou, 256, 256);
+        yield return new(DirectPtxVisionOperation.CompleteBoxIou, 256, 256);
+        yield return new(DirectPtxVisionOperation.BoxArea, 256);
+        yield return new(DirectPtxVisionOperation.BoxConvert, 256, 0, 2);
+        yield return new(DirectPtxVisionOperation.IoULoss, 256);
+        yield return new(DirectPtxVisionOperation.GIoULoss, 256);
+        yield return new(DirectPtxVisionOperation.DIoULoss, 256);
+        yield return new(DirectPtxVisionOperation.CIoULoss, 256);
+        yield return new(DirectPtxVisionOperation.IoULossBackward, 256);
+        yield return new(DirectPtxVisionOperation.GIoULossBackward, 256);
+        yield return new(DirectPtxVisionOperation.DIoULossBackward, 256);
+        yield return new(DirectPtxVisionOperation.CIoULossBackward, 256);
+        yield return new(DirectPtxVisionOperation.IouFamilyBackwardA, 256, 256, 0);
+        yield return new(DirectPtxVisionOperation.IouFamilyBackwardB, 256, 256, 0);
+        yield return new(DirectPtxVisionOperation.Nms, 256,
+            Flags: 0, ScalarBits: BitConverter.SingleToInt32Bits(0.5f));
+        yield return new(DirectPtxVisionOperation.Nms, 256,
+            Flags: 1, ScalarBits: BitConverter.SingleToInt32Bits(0.5f));
+        yield return new(DirectPtxVisionOperation.MasksToBoxes, 256, 28, 28);
+        yield return new(DirectPtxVisionOperation.RoiAlign,
+            1, 256, 56, 56, 256, 7, 7, 256, 2 | 0x100,
+            BitConverter.SingleToInt32Bits(0.25f));
+        yield return new(DirectPtxVisionOperation.RoiPool,
+            1, 256, 56, 56, 256, 7, 7, 256, 0,
+            BitConverter.SingleToInt32Bits(0.25f));
+        yield return new(DirectPtxVisionOperation.PsRoiAlign,
+            1, 196, 56, 56, 256, 7, 7, 4, 2,
+            BitConverter.SingleToInt32Bits(0.25f));
+        yield return new(DirectPtxVisionOperation.PsRoiPool,
+            1, 196, 56, 56, 256, 7, 7, 4, 0,
+            BitConverter.SingleToInt32Bits(0.25f));
+        yield return new(DirectPtxVisionOperation.Cross3, 256, 1);
+        yield return new(DirectPtxVisionOperation.Meshgrid2D, 256, 256, Flags: 0);
+        yield return new(DirectPtxVisionOperation.Meshgrid2D, 256, 256, Flags: 1);
+        yield return new(DirectPtxVisionOperation.Meshgrid2D, 256, 256, Flags: 2);
+        yield return new(DirectPtxVisionOperation.Meshgrid2D, 256, 256, Flags: 3);
+    }
+
     internal static void VerifyNcuCsv(string path)
     {
         DirectPtxProfilerEvidence evidence = DirectPtxProfilerEvidence.FromNcuCsv(path);
