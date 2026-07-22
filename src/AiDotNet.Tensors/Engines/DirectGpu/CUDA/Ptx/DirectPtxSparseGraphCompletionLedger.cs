@@ -72,7 +72,7 @@ internal static class DirectPtxSparseGraphCompletionLedger
             "sparse_2_4_matmul_mma_sp");
         Add("CudaNeuralNetKernels", DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx,
             "scatter_max");
-        Add("CudaMeshPoolKernels", DirectPtxSparseGraphCompletionStatus.MissingDirectPtx,
+        Add("CudaMeshPoolKernels", DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx,
             "mesh_pool_compute_scores", "mesh_pool_gather", "mesh_pool_backward",
             "mesh_pool_backward_deterministic", "mesh_pool_importance_backward", "mesh_pool_zero_grad",
             "mesh_pool_softmax_find_max", "mesh_pool_softmax_final_max", "mesh_pool_softmax_exp_sum",

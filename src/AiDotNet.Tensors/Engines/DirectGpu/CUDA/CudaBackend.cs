@@ -155,6 +155,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private IntPtr _spectralPerfModule;
     private IntPtr _spatialTransformerModule;
     private IntPtr _sparseModule;
+    private IntPtr _meshPoolModule;
     private IntPtr _locallyConnectedModule;
     private IntPtr _deformableConvModule;
     private IntPtr _capsuleModule;
@@ -872,6 +873,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         _fftModule = CompileKernelModule(device, Kernels.CudaFFTKernels.GetSource(), "fft_kernels", Kernels.CudaFFTKernels.GetKernelNames());
         _spectralPerfModule = CompileKernelModule(device, Kernels.CudaSpectralPerfKernels.GetSource(), "spectral_perf_kernels", Kernels.CudaSpectralPerfKernels.GetKernelNames());
         _sparseModule = CompileKernelModule(device, CudaSparseKernels.GetSource(), "sparse_kernels", CudaSparseKernels.GetKernelNames());
+        _meshPoolModule = CompileKernelModule(device, CudaMeshPoolKernels.GetSource(), "mesh_pool_kernels", CudaMeshPoolKernels.GetKernelNames());
         _spatialTransformerModule = CompileKernelModule(device, CudaSpatialTransformerKernels.GetSource(), "spatial_transformer_kernels", CudaSpatialTransformerKernels.GetKernelNames());
 
         // Compile Locally Connected kernels (unique weights per spatial position)
@@ -16919,6 +16921,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         {
             CudaNativeBindings.cuModuleUnload(_sparseModule);
             _sparseModule = IntPtr.Zero;
+        }
+        if (_meshPoolModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_meshPoolModule);
+            _meshPoolModule = IntPtr.Zero;
         }
 
         if (_linalgModule != IntPtr.Zero)

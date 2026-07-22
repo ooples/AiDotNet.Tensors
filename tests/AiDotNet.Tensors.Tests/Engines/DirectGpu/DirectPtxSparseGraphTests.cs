@@ -2,6 +2,8 @@
 using System;
 using System.Linq;
 using System.Threading;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 using Xunit;
 
@@ -16,10 +18,118 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
             DirectPtxSparseGraphCompletionLedger.All
                 .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(75, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+        Assert.Equal(91, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
             entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
         Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
         Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
+    }
+
+    [Fact]
+    public void MeshPoolFamily_EmitsAllSixteenDistinctPointerOnlyModules()
+    {
+        DirectPtxMeshPoolOperation[] operations = Enum.GetValues<DirectPtxMeshPoolOperation>();
+        Assert.Equal(16, operations.Length);
+        Assert.Equal(16, operations.Select(PtxMeshPoolF32Kernel.GetEntryPoint)
+            .Distinct(StringComparer.Ordinal).Count());
+        Assert.Equal(operations.Select(PtxMeshPoolF32Kernel.GetKernelName).OrderBy(name => name),
+            CudaMeshPoolKernels.GetKernelNames().OrderBy(name => name));
+
+        foreach (DirectPtxMeshPoolOperation operation in operations)
+        {
+            string ptx = PtxMeshPoolF32Kernel.EmitPtx(8, 6, operation);
+            DirectPtxKernelBlueprint blueprint = PtxMeshPoolF32Kernel.CreateBlueprint(
+                DirectPtxArchitectureFamily.Ampere, operation);
+
+            Assert.Contains(PtxMeshPoolF32Kernel.GetEntryPoint(operation), ptx);
+            Assert.Equal(PtxMeshPoolF32Kernel.GetTensorCount(operation), blueprint.Tensors.Count);
+            Assert.Equal(blueprint.Tensors.Count, Count(ptx, ".param .u64"));
+            Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+            if (operation == DirectPtxMeshPoolOperation.SoftmaxScores)
+                Assert.Contains(".shared .align 16 .b8 softmax_scratch[1024]", ptx);
+            else
+                Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+            Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+            Assert.All(blueprint.Tensors, tensor =>
+            {
+                Assert.Equal(DirectPtxExtentMode.Exact, tensor.ExtentMode);
+                Assert.Equal(16, tensor.AlignmentBytes);
+            });
+            for (int i = 0; i < blueprint.Tensors.Count; i++)
+                Assert.Equal((long)blueprint.Tensors[i].RequiredBytes,
+                    PtxMeshPoolF32Kernel.GetRequiredBytes(operation, i));
+            Assert.Equal("device-pointers-only", blueprint.Semantics["parameter-abi"]);
+            Assert.Equal("experimental-hardware-evidence-pending", blueprint.Semantics["promotion"]);
+            Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
+        }
+    }
+
+    [Fact]
+    public void MeshPoolFamily_HasPublicCudaProductionSurfaces()
+    {
+        string[] methods =
+        [
+            nameof(CudaBackend.MeshPoolComputeScores), nameof(CudaBackend.MeshPoolGather),
+            nameof(CudaBackend.MeshPoolBackward), nameof(CudaBackend.MeshPoolImportanceBackward),
+            nameof(CudaBackend.MeshPoolZeroGrad), nameof(CudaBackend.MeshPoolSoftmaxFindMax),
+            nameof(CudaBackend.MeshPoolSoftmaxFinalMax), nameof(CudaBackend.MeshPoolSoftmaxExpSum),
+            nameof(CudaBackend.MeshPoolSoftmaxFinalSum), nameof(CudaBackend.MeshPoolSoftmaxNormalize),
+            nameof(CudaBackend.MeshPoolSoftmaxScores), nameof(CudaBackend.MeshPoolWeightedGather),
+            nameof(CudaBackend.MeshPoolWeightedBackward), nameof(CudaBackend.MeshPoolScoresBackward)
+        ];
+
+        Assert.All(methods, method => Assert.NotNull(typeof(CudaBackend).GetMethod(method)));
+    }
+
+    [Fact]
+    public void MeshPoolFamily_PreservesAtomicAndDeterministicReductionChoices()
+    {
+        string atomic = PtxMeshPoolF32Kernel.EmitPtx(
+            8, 6, DirectPtxMeshPoolOperation.WeightedBackwardAtomic);
+        string deterministic = PtxMeshPoolF32Kernel.EmitPtx(
+            8, 6, DirectPtxMeshPoolOperation.WeightedBackwardDeterministic);
+
+        Assert.Contains("atom.global.add.f32", atomic);
+        Assert.DoesNotContain("atom.global", deterministic, StringComparison.Ordinal);
+        Assert.Contains("BACKWARD_SCAN", deterministic);
+        Assert.Contains("ld.global.f32", deterministic);
+        Assert.Contains("st.global.f32", deterministic);
+    }
+
+    [Fact]
+    public void MeshPoolSoftmax_BakesTemperatureAndUsesRegisterResidentOnlineStorage()
+    {
+        string fused = PtxMeshPoolF32Kernel.EmitPtx(
+            8, 6, DirectPtxMeshPoolOperation.SoftmaxScores);
+        string staged = PtxMeshPoolF32Kernel.EmitPtx(
+            8, 6, DirectPtxMeshPoolOperation.SoftmaxExpSum);
+
+        Assert.Contains("ex2.approx.f32", fused);
+        Assert.Contains("ex2.approx.f32", staged);
+        Assert.Contains("0f3fb8aa3b", fused);
+        Assert.DoesNotContain("temperature", fused, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("stride", fused, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal("1.0f-baked", PtxMeshPoolF32Kernel.CreateBlueprint(
+            DirectPtxArchitectureFamily.Ampere,
+            DirectPtxMeshPoolOperation.SoftmaxScores).Semantics["temperature"]);
+    }
+
+    [Fact]
+    public void MeshPoolShapeMatrix_IsExactAndRejectsDynamicTemperature()
+    {
+        Assert.True(PtxMeshPoolF32Kernel.SupportsShape(
+            DirectPtxMeshPoolOperation.ComputeScores, 16384, 4096, 64));
+        Assert.True(PtxMeshPoolF32Kernel.SupportsShape(
+            DirectPtxMeshPoolOperation.SoftmaxScores, 256, 4096, 64));
+        Assert.False(PtxMeshPoolF32Kernel.SupportsShape(
+            DirectPtxMeshPoolOperation.ComputeScores, 8192, 4096, 64));
+        Assert.False(PtxMeshPoolF32Kernel.SupportsShape(
+            DirectPtxMeshPoolOperation.ComputeScores, 16384, 2048, 64));
+        Assert.False(PtxMeshPoolF32Kernel.SupportsShape(
+            DirectPtxMeshPoolOperation.ComputeScores, 16384, 4096, 32));
+        Assert.False(PtxMeshPoolF32Kernel.SupportsShape(
+            DirectPtxMeshPoolOperation.ComputeScores, 16384, 4096, 64, 0.5f));
+        Assert.False(PtxMeshPoolF32Kernel.SupportsShape(
+            DirectPtxMeshPoolOperation.SoftmaxScores, 16384, 4096, 64));
     }
 
     [Fact]
