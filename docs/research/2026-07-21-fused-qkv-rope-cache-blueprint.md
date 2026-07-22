@@ -150,6 +150,12 @@ Bias/RoPE FLOPs are not inflated into the rate. Maximum error is measured
 against FP64 projection accumulation and FP64 RoPE/cache arithmetic over the
 exact FP32 inputs and lookup tables.
 
+This is a batch-1, one-token decode-front-end operation, so
+`decode-op tokens/s = 1,000,000 / median_us`. Device tokens/s uses CUDA-event
+latency; E2E tokens/s includes one enqueue/launch and synchronization. These
+rates measure this fused QKV+RoPE+cache update, not a complete decoder model's
+generation throughput.
+
 The current AiDotNet peer is its actual resident NVIDIA sequence: one cuBLAS
 packed projection, NVRTC BiasAdd, NVRTC interleaved RoPE, and three D2D copies.
 Its preallocated intermediates total `8*H*64*sizeof(float)`. PyTorch is measured
@@ -159,20 +165,20 @@ backend entry point. The graph rows are the promotion comparison; both graph
 replays have zero temporary allocation.
 
 Aggregation retains all three medians in run order. P95/P99 are the worst run,
-mean is the mean of run means, TFLOPS is the middle of the three measured rates,
-and allocation/temporary/error/resource values are maxima. Within each shape,
-the best timing/rate/error cell is bolded independently rather than assuming
-that one method won every statistic.
+mean is the mean of run means, TFLOPS and decode-op tokens/s are the middle of
+the three measured rates, and allocation/temporary/error/resource values are
+maxima. Within each shape, the best timing/rate/error cell is bolded
+independently rather than assuming that one method won every statistic.
 
 ### H4 / capacity 16 / position 0
 
-| Method | device median R1/R2/R3 us | dev P95 | dev P99 | dev mean | E2E median R1/R2/R3 us | E2E P95 | E2E P99 | E2E mean | TFLOPS | managed B | temp/peak B | max error | resources |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| **Direct PTX CUDA Graph — WINNER** | **10.65/11.67/10.14** | 35.74 | 82.33 | **13.22** | **21.70/11.00/18.00** | 76.30 | 274.30 | **24.29** | **0.037** | **0** | **0** | 2.178e-8 | 40r/0s/0l/12occ |
-| PyTorch CUDA Graph *(strongest external)* | 28.16/29.18/29.08 | 55.50 | 103.01 | 32.23 | 40.30/39.40/88.80 | 102.50 | **227.50** | 53.03 | 0.014 | n/a | **0** | **1.735e-8** | n/a |
-| Direct PTX fused, public eager | 15.85/16.18/15.56 | **32.46** | **44.54** | 16.86 | 22.60/24.90/21.50 | **49.90** | 282.00 | 32.37 | 0.025 | **0** | **0** | 2.178e-8 | 40r/0s/0l/12occ |
-| AiDotNet cuBLAS+NVRTC | 79.56/73.42/72.60 | 137.42 | 172.13 | 81.30 | 75.80/81.90/80.90 | 122.20 | 264.80 | 82.61 | 0.005 | 0 | 8192 | 2.275e-8 | n/a |
-| PyTorch CUDA eager | 540.05/692.12/608.87 | 894.46 | 1048.58 | 640.09 | 501.10/598.60/686.00 | 1345.70 | 1597.30 | 640.15 | 0.001 | n/a | 6144 | **1.735e-8** | n/a |
+| Method | device median R1/R2/R3 us | dev P95 | dev P99 | dev mean | dev decode-op tok/s | E2E median R1/R2/R3 us | E2E P95 | E2E P99 | E2E mean | E2E decode-op tok/s | TFLOPS | managed B | temp/peak B | max error | resources |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| **Direct PTX CUDA Graph — WINNER** | **10.65/11.67/10.14** | 35.74 | 82.33 | **13.22** | **93,900** | **21.70/11.00/18.00** | 76.30 | 274.30 | **24.29** | **55,556** | **0.037** | **0** | **0** | 2.178e-8 | 40r/0s/0l/12occ |
+| PyTorch CUDA Graph *(strongest external)* | 28.16/29.18/29.08 | 55.50 | 103.01 | 32.23 | 34,386 | 40.30/39.40/88.80 | 102.50 | **227.50** | 53.03 | 24,814 | 0.014 | n/a | **0** | **1.735e-8** | n/a |
+| Direct PTX fused, public eager | 15.85/16.18/15.56 | **32.46** | **44.54** | 16.86 | 63,080 | 22.60/24.90/21.50 | **49.90** | 282.00 | 32.37 | 44,248 | 0.025 | **0** | **0** | 2.178e-8 | 40r/0s/0l/12occ |
+| AiDotNet cuBLAS+NVRTC | 79.56/73.42/72.60 | 137.42 | 172.13 | 81.30 | 13,620 | 75.80/81.90/80.90 | 122.20 | 264.80 | 82.61 | 12,361 | 0.005 | 0 | 8192 | 2.275e-8 | n/a |
+| PyTorch CUDA eager | 540.05/692.12/608.87 | 894.46 | 1048.58 | 640.09 | 1,642 | 501.10/598.60/686.00 | 1345.70 | 1597.30 | 640.15 | 1,671 | 0.001 | n/a | 6144 | **1.735e-8** | n/a |
 
 Conservative per-run gate minimum: **6.29x device / 3.49x E2E over current
 AiDotNet**, and **2.50x device / 1.86x E2E over PyTorch CUDA Graph**. Maximum
@@ -180,13 +186,13 @@ paired device-P95 ratio: **0.772**.
 
 ### H8 / capacity 64 / position 17
 
-| Method | device median R1/R2/R3 us | dev P95 | dev P99 | dev mean | E2E median R1/R2/R3 us | E2E P95 | E2E P99 | E2E mean | TFLOPS | managed B | temp/peak B | max error | resources |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| **Direct PTX CUDA Graph — WINNER** | **10.96/10.44/10.44** | **30.72** | **37.68** | **12.27** | **22.20/18.80/18.40** | **45.10** | 245.70 | **23.39** | **0.151** | **0** | **0** | **2.561e-8** | 40r/0s/0l/12occ |
-| PyTorch CUDA Graph *(strongest external)* | 30.01/28.26/33.38 | 53.66 | 97.08 | 33.34 | 43.70/47.90/49.40 | 71.90 | 240.40 | 50.59 | 0.052 | n/a | **0** | 3.953e-8 | n/a |
-| Direct PTX fused, public eager | 16.28/14.94/14.95 | 31.13 | 43.32 | 16.72 | 26.60/26.10/27.10 | 47.90 | **211.40** | 32.83 | 0.105 | **0** | **0** | **2.561e-8** | 40r/0s/0l/12occ |
-| AiDotNet cuBLAS+NVRTC | 78.54/74.24/75.17 | 111.00 | 133.43 | 80.29 | 91.70/85.10/79.40 | 247.00 | 320.60 | 97.85 | 0.021 | 0 | 16384 | 4.428e-8 | n/a |
-| PyTorch CUDA eager | 574.87/646.25/553.78 | 950.99 | 1147.60 | 623.82 | 519.40/631.70/513.10 | 1130.80 | 2480.60 | 610.82 | 0.003 | n/a | 12288 | 3.953e-8 | n/a |
+| Method | device median R1/R2/R3 us | dev P95 | dev P99 | dev mean | dev decode-op tok/s | E2E median R1/R2/R3 us | E2E P95 | E2E P99 | E2E mean | E2E decode-op tok/s | TFLOPS | managed B | temp/peak B | max error | resources |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| **Direct PTX CUDA Graph — WINNER** | **10.96/10.44/10.44** | **30.72** | **37.68** | **12.27** | **95,741** | **22.20/18.80/18.40** | **45.10** | 245.70 | **23.39** | **53,191** | **0.151** | **0** | **0** | **2.561e-8** | 40r/0s/0l/12occ |
+| PyTorch CUDA Graph *(strongest external)* | 30.01/28.26/33.38 | 53.66 | 97.08 | 33.34 | 33,323 | 43.70/47.90/49.40 | 71.90 | 240.40 | 50.59 | 20,877 | 0.052 | n/a | **0** | 3.953e-8 | n/a |
+| Direct PTX fused, public eager | 16.28/14.94/14.95 | 31.13 | 43.32 | 16.72 | 66,888 | 26.60/26.10/27.10 | 47.90 | **211.40** | 32.83 | 37,594 | 0.105 | **0** | **0** | **2.561e-8** | 40r/0s/0l/12occ |
+| AiDotNet cuBLAS+NVRTC | 78.54/74.24/75.17 | 111.00 | 133.43 | 80.29 | 13,303 | 91.70/85.10/79.40 | 247.00 | 320.60 | 97.85 | 11,751 | 0.021 | 0 | 16384 | 4.428e-8 | n/a |
+| PyTorch CUDA eager | 574.87/646.25/553.78 | 950.99 | 1147.60 | 623.82 | 1,740 | 519.40/631.70/513.10 | 1130.80 | 2480.60 | 610.82 | 1,925 | 0.003 | n/a | 12288 | 3.953e-8 | n/a |
 
 Conservative per-run gate minimum: **7.11x device / 4.13x E2E over current
 AiDotNet**, and **2.71x device / 1.97x E2E over PyTorch CUDA Graph**. Maximum
@@ -194,13 +200,13 @@ paired device-P95 ratio: **0.669**.
 
 ### H16 / capacity 128 / position 127
 
-| Method | device median R1/R2/R3 us | dev P95 | dev P99 | dev mean | E2E median R1/R2/R3 us | E2E P95 | E2E P99 | E2E mean | TFLOPS | managed B | temp/peak B | max error | resources |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| **Direct PTX CUDA Graph — WINNER** | **18.64/17.92/17.82** | **29.39** | 60.93 | **19.34** | **38.60/33.40/32.30** | 108.80 | 267.00 | 44.65 | **0.351** | **0** | **0** | **4.458e-8** | 40r/0s/0l/12occ |
-| PyTorch CUDA Graph *(strongest external)* | 39.94/40.96/40.55 | 63.08 | 132.92 | 43.33 | 56.80/66.00/56.50 | 93.10 | 319.10 | 65.32 | 0.155 | n/a | **0** | 8.104e-8 | n/a |
-| Direct PTX fused, public eager | 26.83/18.94/18.84 | 47.21 | **59.08** | 23.21 | 50.30/37.20/33.80 | **69.50** | **254.60** | **44.08** | 0.332 | **0** | **0** | **4.458e-8** | 40r/0s/0l/12occ |
-| AiDotNet cuBLAS+NVRTC | 113.77/73.42/67.89 | 163.33 | 205.62 | 89.78 | 126.60/69.60/71.50 | 413.60 | 471.10 | 108.39 | 0.086 | 0 | 32768 | 7.281e-8 | n/a |
-| PyTorch CUDA eager | 528.59/675.53/631.81 | 1092.51 | 1215.80 | 644.42 | 507.40/729.30/717.20 | 1112.50 | 2127.20 | 694.28 | 0.010 | n/a | 24576 | 8.104e-8 | n/a |
+| Method | device median R1/R2/R3 us | dev P95 | dev P99 | dev mean | dev decode-op tok/s | E2E median R1/R2/R3 us | E2E P95 | E2E P99 | E2E mean | E2E decode-op tok/s | TFLOPS | managed B | temp/peak B | max error | resources |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| **Direct PTX CUDA Graph — WINNER** | **18.64/17.92/17.82** | **29.39** | 60.93 | **19.34** | **55,804** | **38.60/33.40/32.30** | 108.80 | 267.00 | 44.65 | **29,940** | **0.351** | **0** | **0** | **4.458e-8** | 40r/0s/0l/12occ |
+| PyTorch CUDA Graph *(strongest external)* | 39.94/40.96/40.55 | 63.08 | 132.92 | 43.33 | 24,661 | 56.80/66.00/56.50 | 93.10 | 319.10 | 65.32 | 17,606 | 0.155 | n/a | **0** | 8.104e-8 | n/a |
+| Direct PTX fused, public eager | 26.83/18.94/18.84 | 47.21 | **59.08** | 23.21 | 52,787 | 50.30/37.20/33.80 | **69.50** | **254.60** | **44.08** | 26,882 | 0.332 | **0** | **0** | **4.458e-8** | 40r/0s/0l/12occ |
+| AiDotNet cuBLAS+NVRTC | 113.77/73.42/67.89 | 163.33 | 205.62 | 89.78 | 13,620 | 126.60/69.60/71.50 | 413.60 | 471.10 | 108.39 | 13,986 | 0.086 | 0 | 32768 | 7.281e-8 | n/a |
+| PyTorch CUDA eager | 528.59/675.53/631.81 | 1092.51 | 1215.80 | 644.42 | 1,583 | 507.40/729.30/717.20 | 1112.50 | 2127.20 | 694.28 | 1,394 | 0.010 | n/a | 24576 | 8.104e-8 | n/a |
 
 Conservative per-run gate minimum: **3.81x device / 2.08x E2E over current
 AiDotNet**, and **2.14x device / 1.47x E2E over PyTorch CUDA Graph**. Maximum
@@ -255,7 +261,8 @@ powershell -ExecutionPolicy Bypass -File `
 
 The runner creates separate clean .NET and PyTorch processes for each run,
 hashes every raw log, and writes `qkv-release-gate.json` only after joining the
-rows and enforcing the error/resource/allocation/median/P95 gate against every
+rows, validating both decode-op tokens/s fields against their medians, and
+enforcing the error/resource/allocation/median/P95 gate against every
 competitor.
 
 For deterministic Nsight attachment after the Release build:
