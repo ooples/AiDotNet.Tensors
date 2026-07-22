@@ -52,6 +52,14 @@ internal static class DirectPtxArchitecture
     /// </summary>
     internal static bool HasValidatedGather(int major, int minor) =>
         (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The index-select specialization is measured only on GA102/SM86. It is a
+    /// separate predicate from the gather one because the two ops have
+    /// different index dtypes and are promoted independently.
+    /// </summary>
+    internal static bool HasValidatedIndexSelect(int major, int minor) =>
+        (major, minor) == (8, 6);
 }
 
 internal enum DirectPtxExtentMode
