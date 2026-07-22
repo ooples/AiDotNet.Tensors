@@ -5,6 +5,7 @@ using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+using AiDotNet.Tensors.Helpers;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -140,7 +141,7 @@ public class DirectPtxSoftmaxTests
         int elements = rows * columns;
         using var input = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
         using var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
-        var random = new Random(20260721);
+        var random = RandomHelper.CreateSeededRandom(20260721);
         float[] values = Enumerable.Range(0, elements)
             .Select(_ => (random.NextSingle() * 2f - 1f) * 4f).ToArray();
         for (int column = 0; column < columns; column++)
@@ -365,7 +366,7 @@ public class DirectPtxSoftmaxTests
 
     private static float[] MakeRowValues(int rows, int columns, int seed)
     {
-        var random = new Random(seed);
+        var random = RandomHelper.CreateSeededRandom(seed);
         var values = new float[rows * columns];
         for (int i = 0; i < values.Length; i++)
             values[i] = (random.NextSingle() * 2f - 1f) * 4f;
