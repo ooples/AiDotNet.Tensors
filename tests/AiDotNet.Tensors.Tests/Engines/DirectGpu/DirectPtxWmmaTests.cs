@@ -2379,6 +2379,91 @@ public class DirectPtxWmmaTests
         }
     }
 
+    [SkippableTheory]
+    [InlineData(1, false)]  // ReLU, preactivation form
+    [InlineData(3, true)]   // Sigmoid, output form
+    public void Backend_DirectPtxFusedLinearBackward_MatchesAllGradientOracles(
+        int activationValue, bool fromOutput)
+    {
+        var activation = (DirectPtxLinearActivation)activationValue;
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previous = DirectPtxFeatureGate.TestOverride;
+        bool previousExperiment = DirectPtxFeatureGate.FusedLinearExperimentOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        DirectPtxFeatureGate.FusedLinearExperimentOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxFusedLinearEnabled, "Requires a validated Ampere CUDA backend.");
+            const int m = 64, k = 256, n = 256;
+
+            var random = RandomHelper.CreateSeededRandom(20264600 + (int)activation);
+            float[] xHost = Values(random, m * k, 0.125f);            // input[M,K]
+            float[] wHost = Values(random, n * k, 0.0625f);           // weight[N,K] output-major
+            float[] diffHost = Values(random, m * n, 1.0f);           // preact (Z) or output (Y)
+            float[] dyHost = Values(random, m * n, 0.5f);             // gradOutput[M,N]
+
+            // dZ = dY * activation'(diff).
+            var dz = new double[m * n];
+            for (int i = 0; i < dz.Length; i++)
+            {
+                double d = activation switch
+                {
+                    DirectPtxLinearActivation.Relu => diffHost[i] > 0 ? 1.0 : 0.0,
+                    DirectPtxLinearActivation.Sigmoid => diffHost[i] * (1.0 - diffHost[i]), // y(1-y), output form
+                    _ => throw new InvalidOperationException()
+                };
+                dz[i] = dyHost[i] * d;
+            }
+            var expGradInput = new float[m * k];   // dZ[M,N] @ W[N,K]
+            for (int row = 0; row < m; row++)
+            for (int col = 0; col < k; col++)
+            {
+                double acc = 0;
+                for (int nn = 0; nn < n; nn++) acc += dz[row * n + nn] * (double)wHost[nn * k + col];
+                expGradInput[row * k + col] = (float)acc;
+            }
+            var expGradWeight = new float[k * n];  // transpose(X[M,K]) @ dZ[M,N] -> [K,N]
+            for (int kk = 0; kk < k; kk++)
+            for (int nn = 0; nn < n; nn++)
+            {
+                double acc = 0;
+                for (int row = 0; row < m; row++) acc += xHost[row * k + kk] * dz[row * n + nn];
+                expGradWeight[kk * n + nn] = (float)acc;
+            }
+            var expGradBias = new float[n];        // colsum(dZ)
+            for (int nn = 0; nn < n; nn++)
+            {
+                double acc = 0;
+                for (int row = 0; row < m; row++) acc += dz[row * n + nn];
+                expGradBias[nn] = (float)acc;
+            }
+
+            using var gradOutput = backend.AllocateBuffer(dyHost);
+            using var input = backend.AllocateBuffer(xHost);
+            using var weight = backend.AllocateBuffer(wHost);
+            using var diff = backend.AllocateBuffer(diffHost);
+            using var gradInput = backend.AllocateBuffer(m * k);
+            using var gradWeight = backend.AllocateBuffer(k * n);
+            using var gradBias = backend.AllocateBuffer(n);
+            long before = backend.DirectPtxLinearBackwardDispatchCount;
+            Assert.True(
+                backend.TryDirectPtxFusedLinearBackward(gradOutput, input, weight, diff,
+                    gradInput, gradWeight, gradBias, m, k, n, activation, derivativeFromOutput: fromOutput),
+                backend.DirectPtxLastError);
+            backend.Synchronize();
+            Assert.True(backend.DirectPtxLinearBackwardDispatchCount > before);
+            AssertVectorClose(backend.DownloadBuffer(gradInput), expGradInput, 2e-3f, $"dInput {activation}");
+            AssertVectorClose(backend.DownloadBuffer(gradWeight), expGradWeight, 2e-3f, $"dWeight {activation}");
+            AssertVectorClose(backend.DownloadBuffer(gradBias), expGradBias, 2e-3f, $"dBias {activation}");
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previous;
+            DirectPtxFeatureGate.FusedLinearExperimentOverride = previousExperiment;
+        }
+    }
+
     [Fact]
     public void FusedLinearTiledEmitter_IsRegisterResidentTiledGemm()
     {
