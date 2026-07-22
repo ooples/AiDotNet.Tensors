@@ -107,17 +107,22 @@ public class DirectPtxSoftmaxTests
                 $"Public/backend softmax-scope operation '{operation}' is unassigned."));
     }
 
-    [SkippableFact]
-    public void DriverOnlyFusedSoftmax_MatchesReferenceAndHasZeroLocalBytes()
+    [SkippableTheory]
+    [InlineData(PtxFusedSoftmaxF32Kernel.DefaultBlockThreads, 0)]
+    [InlineData(128, 16)]
+    public void DriverOnlyFusedSoftmax_MatchesReferenceAndHasZeroLocalBytes(
+        int blockThreads,
+        int expectedStaticSharedBytes)
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
         using var runtime = new DirectPtxRuntime();
         Skip.IfNot(runtime.ArchitectureFamily == DirectPtxArchitectureFamily.Ampere,
             "The checked-in softmax specialization is validated on Ampere.");
         const int rows = 256, columns = 128;
-        using var kernel = new PtxFusedSoftmaxF32Kernel(runtime, rows, columns);
+        using var kernel = new PtxFusedSoftmaxF32Kernel(
+            runtime, rows, columns, blockThreads);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
-        Assert.Equal(0, kernel.Audit.Function.StaticSharedBytes);
+        Assert.Equal(expectedStaticSharedBytes, kernel.Audit.Function.StaticSharedBytes);
         Assert.True(kernel.Audit.ActiveBlocksPerMultiprocessor >= 3);
         Assert.Equal(64, kernel.Audit.PtxSha256.Length);
         Assert.Equal("softmax-forward-f32", kernel.Blueprint.Operation);
@@ -178,7 +183,7 @@ public class DirectPtxSoftmaxTests
         runtime.Synchronize();
         var actual = new float[elements];
         output.Download<float>(actual);
-        AssertVectorClose(actual, expected, 5e-5f, "softmax");
+        AssertVectorClose(actual, expected, 5e-5f, $"softmax-{blockThreads}");
     }
 
     private static int Count(string text, string value)

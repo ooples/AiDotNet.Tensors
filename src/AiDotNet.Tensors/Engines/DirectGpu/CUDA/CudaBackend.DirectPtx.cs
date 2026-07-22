@@ -1794,33 +1794,8 @@ public sealed partial class CudaBackend
         int rows,
         int columns)
     {
-        if (!DirectPtxFeatureGate.IsSoftmaxEnabled)
-        {
-            DirectPtxLastError = "softmax-feature-disabled";
+        if (!IsDirectPtxSoftmaxEligible(rows, columns))
             return false;
-        }
-        if (!IsAvailable)
-        {
-            DirectPtxLastError = "softmax-cuda-unavailable";
-            return false;
-        }
-        if (DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) !=
-            DirectPtxArchitectureFamily.Ampere)
-        {
-            DirectPtxLastError = "softmax-architecture-not-validated";
-            return false;
-        }
-        if (!PtxFusedSoftmaxF32Kernel.IsSupportedShape(rows, columns))
-        {
-            DirectPtxLastError = "softmax-shape-not-implemented";
-            return false;
-        }
-        if (!PtxFusedSoftmaxF32Kernel.IsPromotedShape(rows, columns) &&
-            !DirectPtxFeatureGate.SoftmaxExperimentOverride)
-        {
-            DirectPtxLastError = "softmax-performance-gate-not-met";
-            return false;
-        }
 
         long bytes = checked((long)rows * columns * sizeof(float));
         if (input.SizeInBytes != bytes || output.SizeInBytes != bytes)
@@ -1874,6 +1849,36 @@ public sealed partial class CudaBackend
 
     internal bool PrewarmDirectPtxSoftmax(int rows, int columns)
     {
+        if (!IsDirectPtxSoftmaxEligible(rows, columns))
+            return false;
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX softmax prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                var key = new DirectPtxSoftmaxKey(
+                    rows, columns, SelectedSoftmaxBlockThreads(rows, columns));
+                if (!_directPtxSoftmaxKernels.TryGetValue(key, out _))
+                    _ = CreateAndCacheSoftmaxKernelSlow(key);
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    private bool IsDirectPtxSoftmaxEligible(int rows, int columns)
+    {
         if (!DirectPtxFeatureGate.IsSoftmaxEnabled)
         {
             DirectPtxLastError = "softmax-feature-disabled";
@@ -1901,30 +1906,7 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "softmax-performance-gate-not-met";
             return false;
         }
-        try
-        {
-            if (IsStreamCapturing())
-            {
-                DirectPtxLastError = "Direct PTX softmax prewarm is not capture-safe.";
-                return false;
-            }
-            EnsureContextCurrent();
-            lock (_directPtxLock)
-            {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
-                var key = new DirectPtxSoftmaxKey(
-                    rows, columns, SelectedSoftmaxBlockThreads(rows, columns));
-                if (!_directPtxSoftmaxKernels.TryGetValue(key, out _))
-                    _ = CreateAndCacheSoftmaxKernelSlow(key);
-            }
-            DirectPtxLastError = null;
-            return true;
-        }
-        catch (Exception ex)
-        {
-            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
-            return false;
-        }
+        return true;
     }
 
     internal bool TryGetDirectPtxSoftmaxAudit(
