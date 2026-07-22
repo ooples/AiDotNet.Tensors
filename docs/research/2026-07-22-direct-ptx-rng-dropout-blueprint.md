@@ -1,31 +1,48 @@
 # Direct PTX stochastic-kernel blueprint: issue #849
 
-Status: experimental implementation; disabled by default; no GPU promotion evidence attached.
+Status: full experimental implementation, disabled by default. Static proof is
+checked in; GPU correctness, benchmark, and Nsight promotion evidence remains
+pending and no performance win is claimed.
 
-This document defines the reusable assembly-line contract for RNG, dropout,
-sampling, and stochastic-noise kernels. The first executable slice is FP32
-inverted-dropout forward because it exercises the critical concerns together:
-counter ownership, exact layout admission, random generation fused into a
-consumer, a backward-visible saved mask, CUDA graph lifetime, and an honest
-strongest-peer benchmark.
+This document is the reusable assembly-line contract for RNG, dropout,
+sampling, stochastic activations, and stochastic-noise kernels. The executable
+inventory is `DirectPtxRngCoverageManifest`; a public or CUDA entry point is not
+considered assigned unless that manifest names its direct specialization or an
+explicit fail-closed reason.
 
-## Scope and coverage
+## Implemented operation inventory
 
-`DirectPtxRngCoverageManifest` is the executable inventory. It assigns:
+| Operation family | Direct PTX implementation | Exact FP32 shapes | Fused boundary and required global traffic |
+|---|---|---|---|
+| Uniform and random initialization | `PtxPhiloxFillF32Kernel.Uniform` | N=4,096 / 65,536 / 1,048,576 | no reads; one float4 output write |
+| Normal and Gaussian noise | `PtxPhiloxFillF32Kernel.Normal` | same N | Philox plus two Box-Muller pairs in registers; one float4 write |
+| Bernoulli/dropout masks | `PtxPhiloxFillF32Kernel.BernoulliMask` and `DropThresholdMask` | same N | predicate and scale remain in registers; one required public-mask write |
+| Dropout forward | `PtxFusedPhiloxDropoutF32Kernel` | same N | input read plus required output and saved-mask writes; no random-mask intermediate or second launch |
+| Dropout backward | `PtxDropoutBackwardF32Kernel` | same N | gradient and saved-mask reads plus gradient write |
+| Bias + dropout | `PtxFusedBiasPhiloxDropout256F32Kernel` | [16/256/4,096, 256] | bias read, input read, required output and saved-mask writes; no biased-tensor temporary |
+| Gumbel softmax | `PtxFusedGumbelSoftmax32F32Kernel` | [128/2,048/32,768, 32] | Philox Gumbel perturbation and warp max/sum remain in registers; only logits read and probabilities written |
+| Gumbel backward | `PtxGumbelSoftmaxBackward32F32Kernel` | same rows x 32 | softmax Jacobian reduction and temperature scale remain in one warp; no reduction temporary |
+| Categorical sampling | `PtxPhiloxCategorical32F32Kernel` | same rows x 32 | warp CDF scan, draw, and one-hot selection remain in registers; no CDF or index intermediate |
+| NeRF importance sampling | `PtxFusedImportanceSampling64F32Kernel` | 64/1,024/16,384 rays x 64 coarse x 64 fine | each coarse t/weight read once into two bank-aligned shared arrays; unrolled CDF traversal writes only final samples |
+| Training RReLU | `PtxFusedPhiloxRreluF32Kernel` | same vector N | slope generation and negative-side multiply are fused; input read plus required output and backward-visible saved-noise writes |
+| Saved-noise RReLU forward/backward | `PtxRreluF32Kernel` | same vector N | exact float4 ports of both existing NVRTC kernels; no intermediate |
+| Advertised DDIM step | `PtxFusedDdimStepF32Kernel` | same vector N | two float4 reads and one output write after host-side FP64 coefficient collapse |
 
-- backend uniform, normal, secure-uniform, Gaussian-noise, dropout-mask,
-  dropout forward/backward, bias-dropout, Gumbel-softmax, and NeRF importance
-  sampling, plus the stochastic DDIM scheduler step;
-- tensor random-uniform/range/normal/dropout-mask initialization entry points;
-- `IDeviceRng` uniform, normal, and Bernoulli providers;
-- categorical, multinomial, relaxed/quantized categorical, continuous,
-  discrete, multivariate, composite, transform, and rejection-sampling
-  distribution families;
-- cryptographic randomness, which is explicitly excluded. Deterministic
-  Philox must never be substituted for a secure-random guarantee.
+The tensor random-uniform/range/normal construction and in-place entry points,
+`Tensor.CreateRandom`, `RandomUniformGpu`, and `RandomNormalGpu` route through the
+same admitted fill specializations. `TensorDropoutMask` routes directly through
+the appropriate mask specialization for both explicit and engine-owned seeds.
+The host-result `GenerateDropoutMask` and `GenerateGaussianNoise` operations use
+the same PTX generation only at admitted FP32 lengths, followed by the public
+contract's unavoidable device-to-host result transfer; resident callers should
+use the tensor/GPU APIs.
 
-The manifest distinguishes the implemented experimental slice from planned
-and baseline-only assignments. Coverage does not imply promotion.
+`CuRand.Uniform`, `CuRand.Normal`, and `CuRand.Bernoulli` return host tensors.
+They deliberately retain their host/provider implementation because wrapping
+PTX would add a private device allocation, synchronization, and D2H copy.
+Cryptographic and secure-random APIs are also explicitly excluded: deterministic
+Philox cannot preserve unpredictability. `GenerateSecureRandomUniform` bypasses
+the direct route even when the feature gate is enabled.
 
 ## Versioned RNG ABI
 
@@ -33,172 +50,181 @@ The first ABI is `philox4x32-10-v1`:
 
 | Field | Mapping |
 |---|---|
-| 64-bit seed | Philox key words `(seed.low32, seed.high32)` |
-| 64-bit counter offset | Low 64 bits of the 128-bit Philox counter |
-| 64-bit subsequence | High 64 bits of the 128-bit Philox counter |
-| float4 group `g` | Counter `(counterOffset + g, subsequence)` with modulo-2^64 low-counter addition |
-| element `i` | Word `i mod 4` from group `floor(i / 4)` |
-| dropout keep decision | Unsigned word `< floor(keepProbability * 2^32)` |
+| 64-bit seed | key `(seed.low32, seed.high32)` |
+| 64-bit counter offset | low 64 bits of the 128-bit counter |
+| 64-bit subsequence | high 64 bits of the 128-bit counter |
+| float4 group `g` | counter `(counterOffset + g, subsequence)` |
+| vector element `i` | word `i mod 4` of group `floor(i / 4)` |
+| keep mask | unsigned word `< floor(keepProbability * 2^32)` |
+| drop-threshold mask | unsigned word `< threshold` means dropped |
 
-The public CUDA `Dropout` route maps its existing explicit seed to the Philox
-key and uses subsequence/counter offset zero. Repeating the same exact call is
-therefore bit-reproducible. Internal launch and oracle APIs expose all three
-fields so future schedulers can reserve non-overlapping counter intervals.
+Counter ownership is scheduling-independent:
 
-Counter consumption is shape-derived and independent of block scheduling:
-`ceil(N/4)` counters. Promoted normal, categorical, and rejection algorithms
-must document their word consumption before implementation. Variable-length
-rejection loops may not silently consume a shared implicit stream.
+- vector fills, dropout, bias-dropout, and RReLU consume one counter per four
+  adjacent outputs;
+- Gumbel softmax consumes one counter per element and uses word zero;
+- categorical consumes one counter per row and uses word zero;
+- importance sampling consumes one counter per final sample and uses word zero.
 
-## Executable v1 physical ABI
+The benchmark CPU oracle uses the same ten-round reference and explicit mapping.
+Seed, subsequence, and counter-offset tests include the published all-zero
+Philox4x32-10 vector. No variable-length rejection loop owns an implicit stream.
 
-The v1 kernel admits only:
+## Physical ABI and fail-closed admission
 
-- SM86 exactly; Ada, other Ampere SMs, Hopper, and Blackwell fail closed until
-  each has independent correctness/resource/performance evidence;
-- FP32 exact element counts 4,096, 65,536, or 1,048,576;
-- three distinct, exact-size, 16-byte-aligned allocations for input, output,
-  and the public saved mask;
-- dense vector layout with zero byte offset and no overlap;
-- finite dropout rate strictly between zero and one, with a representable
-  integer keep threshold and finite inverse-keep scale;
-- training forward only. Evaluation, zero-rate, backward, other dtypes,
-  views, and all other shapes use the established backend.
+Every specialization is SM86-only and FP32-only. Ada, other Ampere SMs,
+Hopper, and Blackwell remain separate, unmeasured architecture families and
+fall back with an exact reason. Every tensor contract fixes:
 
-Admission occurs once in `DirectPtxRngDropoutAdmission`. Successful admission
-creates exact `DirectPtxTensorView` capability tokens. The emitted PTX accepts
-no element count, stride, layout, dtype, alignment, alias, or tail parameter.
-It contains no tail branch.
+- logical and physical extents;
+- dense vector or row-major layout identity;
+- exact allocation byte length and zero view offset;
+- 4- or 16-byte alignment according to transaction width;
+- read/write access and non-alias rules;
+- block geometry, resource budget, and minimum active blocks/SM.
+
+Admission validates those facts once on the host and creates
+`DirectPtxTensorView` capability tokens. The admitted PTX accepts pointers,
+mathematical scalars, and explicit RNG state only. It has no element-count,
+stride, layout, dtype, alignment, padding, or tail argument and no generic
+dynamic-shape branch. Non-contiguous public tensors are not silently assigned a
+different physical meaning.
 
 ## Fused memory dataflow
 
-One 128-thread block processes 512 adjacent FP32 values. Each thread:
+Random state, thresholds, slopes, masks that are not public outputs, Gumbel
+perturbations, warp reductions, CDF state, and interpolation state remain in
+registers. Dropout and RReLU write masks/slopes only because their public
+backward contract requires them. Bias-dropout eliminates the previous biased
+activation temporary. Categorical eliminates both CDF and sampled-index
+buffers. Importance sampling is the only family that benefits from shared
+memory: each warp owns one ray, lane `i` owns elements `i` and `i+32`, so the
+two 64-float arrays are aligned and bank conflict free for each cooperative
+load/traversal step.
 
-1. computes one Philox4x32-10 counter entirely in scalar registers;
-2. converts its four random words to four mask decisions using unsigned
-   threshold predicates;
-3. performs one aligned `ld.global.v4.f32` from input;
-4. multiplies in registers by zero or `1 / keepProbability`;
-5. performs one aligned float4 output store and one aligned float4 mask store.
+`cp.async` and Tensor Cores are intentionally absent. These kernels either have
+no reusable global tile or perform scalar probability arithmetic; adding an
+asynchronous copy pipeline or MMA instruction would not match their dataflow.
+Architecture-specific instructions are required only when measurement shows a
+benefit, not as a checklist decoration.
 
-There is no random-mask generation launch, no private VRAM intermediate, no
-re-read of input, no shared-memory staging, and no temporary device allocation.
-Shared memory, `cp.async`, and Tensor Cores are not useful for this streaming,
-low-arithmetic-intensity transform. The saved mask is not avoidable under the
-current public/backward contract; future fused backward consumers can keep or
-regenerate it according to an explicit counter ABI.
+## Runtime, cache, and capture contract
 
-The useful-traffic convention is 12 bytes/element: one FP32 input read, one
-FP32 output write, and one required FP32 saved-mask write. PyTorch's native
-boolean mask is a strong lower-traffic competitor and remains in the matrix.
+`AIDOTNET_DIRECT_PTX_RNG_DROPOUT=1` is snapshotted when `CudaBackend` is
+constructed and is off by default. Each kernel family has a bounded exact-shape
+module cache. Cache keys include operation semantics and shape; audit identity
+also includes PTX SHA-256 and the GPU/SM/driver fingerprint. Disposal unloads
+all RNG modules before the CUDA context and stream are released.
 
-## Runtime and graph-capture contract
+Warm dispatches use direct cache probes; factory delegates exist only in
+no-inline cold creation helpers. Saved-noise RReLU likewise uses explicit
+forward/backward calls instead of a capturing launch delegate. This makes the
+steady-state managed-allocation requirement structural as well as measurable.
 
-`CudaBackend` owns a bounded shape-keyed LRU of modules. The environment gate
-`AIDOTNET_DIRECT_PTX_RNG_DROPOUT=1` is snapshotted at backend construction and
-is off by default. Cache misses JIT outside capture. `PrewarmDirectPtxRngDropoutF32`
-provides explicit preparation. A cold capture rejects without loading a module;
-a warm capture pins the module so LRU eviction cannot invalidate a graph-held
-`CUfunction`. Backend disposal unloads every RNG module before its borrowed
-CUDA context and stream are destroyed.
+Every family exposes prewarm and audit entry points. A cold CUDA graph capture
+rejects rather than JIT-compiling. A warm capture pins its module so LRU
+eviction cannot invalidate a captured `CUfunction`. Capture performs no tuning,
+allocation, file I/O, or cache eviction. These exact domains have one legal
+plan per key, so there is no artificial autotuning search; future operations
+with multiple legal plans must use a bounded device/driver/shape/semantics-keyed
+plan cache.
 
 Any gate, SM, shape, extent, pointer, alignment, alias, numerical, resource,
-JIT, cache, or capture failure returns to the existing two-kernel NVRTC path
-with an exact diagnostic in `DirectPtxLastError`. The fallback remains the
-source of truth until promotion.
+JIT, cache, or capture rejection uses the established CUDA/CPU path. The new
+categorical API has a seeded, resident GPU fallback based on the Gumbel-max
+identity, so disabling direct PTX does not silently move valid FP32 last-axis
+sampling to the CPU. Secure semantics and host-only provider contracts bypass
+direct PTX explicitly.
 
-## Resource rejection and evidence
+## Resource and deterministic static proof
 
-Every loaded specialization produces a `DirectPtxKernelAudit` containing the
-blueprint identity, PTX SHA-256, GPU/SM/driver fingerprint, function resource
-attributes, block size, active blocks per SM, and JIT log. Runtime rejects:
+Module loading records function registers, static shared memory, local bytes,
+max threads, PTX/binary versions, active blocks/SM, PTX hash, complete JIT log,
+and device fingerprint. A specialization is rejected for any nonzero local
+bytes or for violating its per-kernel register/shared/occupancy budget.
 
-- any nonzero local bytes per thread;
-- more than 56 registers per thread;
-- any static shared memory;
-- fewer than eight active blocks per SM;
-- a JIT max-thread limit below 128.
+Focused non-GPU tests prove:
 
-Driver attributes are necessary but not sufficient. Promotion also requires
-the checked-in Nsight target and verifier to show zero executed register-spill,
-local-load, and local-store counters for every exact shape. No such result has
-been collected in this change.
+- ten Philox rounds, counter-domain reproducibility, and the published vector;
+- fixed instruction/dataflow structure for every emitter;
+- exact supported shape buckets and unmeasured-SM rejection;
+- no runtime stride/shape/tail ABI or emitted local-memory declaration;
+- mask polarity, Box-Muller pairs, warp reductions, shared layout, and fused
+  consumer boundaries;
+- unique operation-manifest assignment, explicit secure/host exclusions,
+  transfer-ledger validity, module pinning, and deterministic cleanup.
 
-There is no autotuning search in v1: it has one vector width, block geometry,
-and exact specialization per admitted shape. This is a deterministic one-plan
-domain, so a tuning cache would add state without alternatives. Operations
-with multiple tiles, vector widths, or fusion plans must use the existing
-bounded, device/driver/SM/shape/semantics-keyed plan-cache pattern.
+Static emitter tests do not prove that the NVIDIA driver accepts the PTX or that
+it executes correctly. Those claims remain pending until the device run.
 
-## Deterministic non-GPU proof
+## Resident benchmark
 
-The focused tests establish without launching a GPU that:
-
-- the CPU Philox reference matches the published all-zero Philox4x32-10 vector;
-- seed, subsequence, and counter select deterministic independent domains;
-- the PTX emits ten rounds, baked launch geometry, aligned float4 traffic, and
-  no shape/stride/tail branch;
-- exact SM, shape, extent, pointer, alignment, alias, and rate admission fails
-  closed with stable reasons;
-- graph-pinned modules cannot be evicted and are disposed with their owner;
-- every coverage-manifest family is uniquely assigned and secure randomness is
-  excluded.
-
-These tests prove emitter and contract structure, not device correctness.
-
-## Resident benchmark and Nsight commands
-
-After obtaining exclusive use of the admitted GPU:
+With exclusive access to the admitted GPU and CUDA-enabled Python PyTorch:
 
 ```powershell
 $env:AIDOTNET_DIRECT_PTX_RNG_DROPOUT='1'
-dotnet run -c Release -f net10.0 --project tests/AiDotNet.Tensors.Benchmarks -- --direct-ptx-rng-dropout 3
-tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-ncu.ps1 -Target rng-dropout
+dotnet run -c Release -f net10.0 --project tests/AiDotNet.Tensors.Benchmarks -- --direct-ptx-rng-stochastic 3
 ```
 
-The harness preallocates all tensors/workspaces, prewarms before timing,
-requires 30 warmups plus 101 samples for each of three independent runs, and
-groups these resident NVIDIA methods per shape:
+Use `--no-external` only for harness diagnostics; it is not promotion evidence.
+The full run covers every table row and every exact shape with:
 
-- Direct PTX fused launch;
-- Direct PTX CUDA-graph replay;
-- current AiDotNet NVRTC mask generation plus multiply;
-- PyTorch `native_dropout` eager;
-- PyTorch CUDA graph;
-- PyTorch `torch.compile(mode="max-autotune", fullgraph=True)`.
+- direct PTX launch and direct PTX CUDA-graph replay;
+- an isolated AiDotNet backend with the direct gate disabled, preventing the
+  established row from silently dispatching the candidate;
+- PyTorch eager, CUDA graph, and `torch.compile(mode="max-autotune",
+  fullgraph=True)` where supported; unsupported peers are printed as skipped,
+  not silently omitted.
 
-It reports device and synchronized end-to-end mean/median/P95/P99, effective
-GB/s, managed bytes/call, temporary/peak device bytes, maximum semantic error,
-registers, shared/local bytes, and active blocks/SM. The environment fingerprint
-and exact audit JSON must be retained with the run artifacts.
+Every cell uses 30 warmups, 101 samples, ten resident launches per device-time
+sample, and three independent runs. Output is grouped by operation and shape and
+reports device and synchronized end-to-end mean/median/P95/P99, effective GB/s,
+managed bytes/call, temporary or peak device bytes, maximum oracle/semantic
+error, registers, shared/local bytes, blocks/SM, and complete .NET/PyTorch/CUDA/
+GPU/driver/audit fingerprints. GFLOPS is intentionally not fabricated for RNG
+and probability kernels; GB/s is the meaningful throughput measure.
 
-## Promotion table (intentionally pending)
+## Nsight zero-spill proof
 
-| Shape | Method | Device median | P95 | P99 | GB/s | Managed B/call | Temporary/peak device B | Max error | Regs | Shared B | Local B | Blocks/SM | Spill/local counters |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| N=4,096 | Direct PTX / graph / current AiDotNet / PyTorch eager/graph/compile | pending | pending | pending | pending | pending | pending | pending | pending | pending | pending | pending | pending |
-| N=65,536 | Direct PTX / graph / current AiDotNet / PyTorch eager/graph/compile | pending | pending | pending | pending | pending | pending | pending | pending | pending | pending | pending | pending |
-| N=1,048,576 | Direct PTX / graph / current AiDotNet / PyTorch eager/graph/compile | pending | pending | pending | pending | pending | pending | pending | pending | pending | pending | pending | pending |
+```powershell
+tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-ncu.ps1 -Target rng-stochastic
+```
 
-No cell may be filled from a different machine, CPU competitor, partial run, or
-screening result. Promotion requires the issue gate: at least 1.10x candidate
-median speedup over the strongest eligible peer, candidate P95 within 10% of
-that peer, zero hot managed allocation, zero avoidable temporary VRAM,
-operation-specific correctness, zero local bytes, and zero executed spill/local
-evidence.
+The deterministic target emits exactly 45 launches: one launch for every
+kernel family and exact shape. The verifier requires all launches plus the
+requested metric groups and rejects any executed register-spill instruction,
+local load, local store, or local spilling request. Driver-reported local bytes
+alone are not sufficient. No Nsight result has been collected in this change.
 
-## Assembly-line extensions
+## Promotion evidence (intentionally pending)
 
-Each next stochastic PR follows the same order:
+| Operation group | Shapes | Direct PTX | Direct graph | AiDotNet established | PyTorch eager/graph/compile | Oracle | Resources | Spill/local counters | Promotion |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| uniform / normal / Gaussian / masks | three vector N | pending | pending | pending | pending | pending | pending | pending | pending |
+| dropout forward / backward | three vector N | pending | pending | pending | pending | pending | pending | pending | pending |
+| RReLU fused / saved forward / backward | three vector N | pending | pending | pending | pending | pending | pending | pending | pending |
+| DDIM | three vector N | pending | pending | pending | pending | pending | pending | pending | pending |
+| Gumbel forward / backward / categorical | three row counts x 32 | pending | pending | pending | pending | pending | pending | pending | pending |
+| importance sampling | three ray counts x 64 x 64 | pending | pending | pending | pending | pending | pending | pending | pending |
+| bias-dropout | three row counts x 256 | pending | pending | pending | pending | pending | pending | pending | pending |
 
-1. add every entry point to the manifest before implementation;
-2. freeze the mathematical and counter-consumption semantics;
-3. choose exact logical/physical layouts and fusion boundaries;
-4. add fail-closed admission and a disabled per-kernel gate;
-5. emit architecture- and exact-shape-specific PTX with no dynamic layout path;
-6. attach a bounded module/plan cache, prewarm, pinning, disposal, and audit;
-7. add CPU emitter/admission/determinism tests and high-precision GPU oracles;
-8. add resident strongest-peer and deterministic Nsight harnesses;
-9. run three clean benchmark suites and populate the grouped evidence table;
-10. promote only the winning, zero-spill cells; leave every other contract on
-    the established backend with its exact rejection reason.
+No cell may be filled from another machine, a CPU competitor, a partial run, or
+a screening result. Promotion requires at least 1.10x candidate median speedup
+over the strongest eligible peer, candidate P95 no worse than peer P95 +10%,
+zero hot managed allocation, zero avoidable temporary VRAM, operation-specific
+correctness, zero local bytes, and zero executed spill/local evidence. A losing
+or unproven specialization remains disabled and on the established fallback.
+
+## Assembly-line extension order
+
+1. Inventory every public and CUDA entry point before coding.
+2. Freeze mathematical, backward, deterministic, and counter-consumption semantics.
+3. Freeze logical/physical layouts and the true fusion boundary.
+4. Add exact fail-closed admission and a disabled per-family gate.
+5. Emit architecture- and exact-shape PTX without dynamic layout paths.
+6. Add bounded cache, prewarm, capture pinning, cleanup, and audit.
+7. Add high-precision/current-backend oracles and every rejection test.
+8. Add full-operation resident competitors and deterministic Nsight coverage.
+9. Run three clean suites and populate the grouped evidence table.
+10. Promote only cells that pass every correctness, tail-latency, allocation,
+    temporary-memory, speed, and zero-spill gate.

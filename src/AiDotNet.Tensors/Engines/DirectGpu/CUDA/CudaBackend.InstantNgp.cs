@@ -260,6 +260,12 @@ public sealed partial class CudaBackend : IInstantNgpBackend, IUniqueConsecutive
         IGpuBuffer tValuesCoarse, IGpuBuffer weightsCoarse, IGpuBuffer fineTValues,
         int numRays, int numCoarseSamples, int numFineSamples, uint seed)
     {
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxImportanceSamplingF32(
+                tValuesCoarse, weightsCoarse, fineTValues,
+                numRays, numCoarseSamples, numFineSamples, seed))
+            return;
+#endif
         int total = checked(numRays * numFineSamples);
         if (total <= 0) return;
         var kernel = ResolveInstantNgpKernel("importance_sampling");

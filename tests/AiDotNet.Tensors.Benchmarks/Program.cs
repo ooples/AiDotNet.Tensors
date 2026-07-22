@@ -80,6 +80,13 @@ class Program
             DirectPtxRngDropoutExperiment.Run(runs, includeExternal);
             return;
         }
+        if (args.Length > 0 && args[0] == "--direct-ptx-rng-stochastic")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            bool includeExternal = !args.Contains("--no-external", StringComparer.Ordinal);
+            DirectPtxRngStochasticExperiment.Run(runs, includeExternal);
+            return;
+        }
         if (args.Length > 0 && args[0] == "--direct-ptx-residual-rmsnorm")
         {
             DirectPtxResidualRmsNormExperiment.Run();
@@ -128,6 +135,11 @@ class Program
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-rng-dropout")
         {
             DirectPtxProfileTarget.RunRngDropout();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-rng-stochastic")
+        {
+            DirectPtxProfileTarget.RunRngStochastic();
             return;
         }
         if (args.Length > 1 && args[0] == "--direct-ptx-verify-ncu")

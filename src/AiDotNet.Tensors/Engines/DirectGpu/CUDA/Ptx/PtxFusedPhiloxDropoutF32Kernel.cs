@@ -18,10 +18,10 @@ internal sealed class PtxFusedPhiloxDropoutF32Kernel : IDisposable
     internal const int ValuesPerThread = 4;
     internal const string EntryPoint = "aidotnet_philox_dropout_f32";
 
-    private const uint PhiloxM0 = 0xD2511F53u;
-    private const uint PhiloxM1 = 0xCD9E8D57u;
-    private const uint PhiloxW0 = 0x9E3779B9u;
-    private const uint PhiloxW1 = 0xBB67AE85u;
+    internal const uint PhiloxM0 = 0xD2511F53u;
+    internal const uint PhiloxM1 = 0xCD9E8D57u;
+    internal const uint PhiloxW0 = 0x9E3779B9u;
+    internal const uint PhiloxW1 = 0xBB67AE85u;
 
     private readonly DirectPtxModule _module;
     private readonly IntPtr _function;
@@ -143,29 +143,7 @@ internal sealed class PtxFusedPhiloxDropoutF32Kernel : IDisposable
         ptx.AppendLine("    addc.u32 %r11, %r9, 0;");
         ptx.AppendLine("    mov.u32 %r12, %r6;");
         ptx.AppendLine("    mov.u32 %r13, %r7;");
-        for (int round = 0; round < 10; round++)
-        {
-            ptx.AppendLine($"    // Philox4x32-10 round {round}");
-            ptx.AppendLine($"    mul.hi.u32 %r14, %r10, 0x{PhiloxM0:X8};");
-            ptx.AppendLine($"    mul.lo.u32 %r15, %r10, 0x{PhiloxM0:X8};");
-            ptx.AppendLine($"    mul.hi.u32 %r16, %r12, 0x{PhiloxM1:X8};");
-            ptx.AppendLine($"    mul.lo.u32 %r17, %r12, 0x{PhiloxM1:X8};");
-            ptx.AppendLine("    xor.b32 %r18, %r16, %r11;");
-            ptx.AppendLine("    xor.b32 %r18, %r18, %r4;");
-            ptx.AppendLine("    mov.u32 %r19, %r17;");
-            ptx.AppendLine("    xor.b32 %r20, %r14, %r13;");
-            ptx.AppendLine("    xor.b32 %r20, %r20, %r5;");
-            ptx.AppendLine("    mov.u32 %r21, %r15;");
-            ptx.AppendLine("    mov.u32 %r10, %r18;");
-            ptx.AppendLine("    mov.u32 %r11, %r19;");
-            ptx.AppendLine("    mov.u32 %r12, %r20;");
-            ptx.AppendLine("    mov.u32 %r13, %r21;");
-            if (round != 9)
-            {
-                ptx.AppendLine($"    add.u32 %r4, %r4, 0x{PhiloxW0:X8};");
-                ptx.AppendLine($"    add.u32 %r5, %r5, 0x{PhiloxW1:X8};");
-            }
-        }
+        AppendPhiloxRounds(ptx);
         ptx.AppendLine("    setp.lt.u32 %p0, %r10, %r22;");
         ptx.AppendLine("    setp.lt.u32 %p1, %r11, %r22;");
         ptx.AppendLine("    setp.lt.u32 %p2, %r12, %r22;");
@@ -215,6 +193,38 @@ internal sealed class PtxFusedPhiloxDropoutF32Kernel : IDisposable
             }
         }
         return (c0, c1, c2, c3);
+    }
+
+    /// <summary>
+    /// Emits the shared Philox4x32-10 core. Callers initialize counter words
+    /// r10-r13 and key words r4-r5; the generated words replace r10-r13.
+    /// Scratch registers r14-r21 are clobbered.
+    /// </summary>
+    internal static void AppendPhiloxRounds(StringBuilder ptx)
+    {
+        for (int round = 0; round < 10; round++)
+        {
+            ptx.AppendLine($"    // Philox4x32-10 round {round}");
+            ptx.AppendLine($"    mul.hi.u32 %r14, %r10, 0x{PhiloxM0:X8};");
+            ptx.AppendLine($"    mul.lo.u32 %r15, %r10, 0x{PhiloxM0:X8};");
+            ptx.AppendLine($"    mul.hi.u32 %r16, %r12, 0x{PhiloxM1:X8};");
+            ptx.AppendLine($"    mul.lo.u32 %r17, %r12, 0x{PhiloxM1:X8};");
+            ptx.AppendLine("    xor.b32 %r18, %r16, %r11;");
+            ptx.AppendLine("    xor.b32 %r18, %r18, %r4;");
+            ptx.AppendLine("    mov.u32 %r19, %r17;");
+            ptx.AppendLine("    xor.b32 %r20, %r14, %r13;");
+            ptx.AppendLine("    xor.b32 %r20, %r20, %r5;");
+            ptx.AppendLine("    mov.u32 %r21, %r15;");
+            ptx.AppendLine("    mov.u32 %r10, %r18;");
+            ptx.AppendLine("    mov.u32 %r11, %r19;");
+            ptx.AppendLine("    mov.u32 %r12, %r20;");
+            ptx.AppendLine("    mov.u32 %r13, %r21;");
+            if (round != 9)
+            {
+                ptx.AppendLine($"    add.u32 %r4, %r4, 0x{PhiloxW0:X8};");
+                ptx.AppendLine($"    add.u32 %r5, %r5, 0x{PhiloxW1:X8};");
+            }
+        }
     }
 
     private static DirectPtxKernelBlueprint CreateBlueprint(

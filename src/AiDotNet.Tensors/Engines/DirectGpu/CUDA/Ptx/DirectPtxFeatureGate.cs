@@ -186,6 +186,32 @@ internal readonly struct DirectPtxTensorView
             contract.Access);
     }
 
+    internal static DirectPtxTensorView Create(
+        DirectPtxBuffer buffer,
+        DirectPtxTensorContract contract)
+    {
+        ArgumentNullException.ThrowIfNull(buffer);
+        if (buffer.Pointer == IntPtr.Zero)
+            throw new ArgumentException("The direct PTX buffer has no device pointer.", nameof(buffer));
+        if (buffer.ByteLength != contract.RequiredBytes)
+            throw new ArgumentException(
+                $"Tensor '{contract.Name}' requires exactly {contract.RequiredBytes} bytes; allocation has {buffer.ByteLength}.",
+                nameof(buffer));
+        nuint pointerValue = checked((nuint)buffer.Pointer);
+        if ((pointerValue & (nuint)(contract.AlignmentBytes - 1)) != 0)
+            throw new ArgumentException(
+                $"Tensor '{contract.Name}' is not {contract.AlignmentBytes}-byte aligned.", nameof(buffer));
+        return new DirectPtxTensorView(
+            buffer.Pointer,
+            contract.RequiredBytes,
+            buffer.ByteLength,
+            contract.PhysicalType,
+            contract.Layout,
+            contract.LogicalExtent,
+            contract.PhysicalExtent,
+            contract.Access);
+    }
+
     internal static DirectPtxTensorView CreateBhsd(
         IGpuBuffer buffer,
         DirectPtxPhysicalType physicalType,

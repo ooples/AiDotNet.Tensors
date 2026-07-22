@@ -22072,6 +22072,68 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    public Tensor<T> TensorCategoricalSample<T>(
+        Tensor<T> probabilities,
+        int axis = -1,
+        int? seed = null)
+    {
+        if (probabilities is null) throw new ArgumentNullException(nameof(probabilities));
+        int rank = probabilities.Rank;
+        int normalizedAxis = axis < 0 ? rank + axis : axis;
+        if (normalizedAxis < 0 || normalizedAxis >= rank)
+            throw new ArgumentOutOfRangeException(nameof(axis));
+        int classes = probabilities.Shape[normalizedAxis];
+        if (classes <= 0)
+            throw new ArgumentException("Categorical sampling requires a non-empty category axis.", nameof(probabilities));
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        T[] source = probabilities.GetFlattenedData();
+        var destination = new T[source.Length];
+        int outerSize = 1;
+        int innerSize = 1;
+        for (int i = 0; i < normalizedAxis; i++) outerSize = checked(outerSize * probabilities.Shape[i]);
+        for (int i = normalizedAxis + 1; i < rank; i++) innerSize = checked(innerSize * probabilities.Shape[i]);
+        Random random = seed.HasValue ? new Random(seed.Value) : RandomHelper.ThreadSafeRandom;
+
+        for (int outer = 0; outer < outerSize; outer++)
+        {
+            for (int inner = 0; inner < innerSize; inner++)
+            {
+                double sum = 0d;
+                for (int category = 0; category < classes; category++)
+                {
+                    int index = (outer * classes + category) * innerSize + inner;
+                    double probability = numOps.ToDouble(source[index]);
+                    if (double.IsNaN(probability) || double.IsInfinity(probability) || probability < 0d)
+                        throw new ArgumentException(
+                            "Categorical probabilities must be finite and non-negative.", nameof(probabilities));
+                    sum += probability;
+                }
+                if (!(sum > 0d) || double.IsNaN(sum) || double.IsInfinity(sum))
+                    throw new ArgumentException(
+                        "Every categorical slice must have a finite positive sum.", nameof(probabilities));
+                double target = random.NextDouble() * sum;
+                double cumulative = 0d;
+                int selected = classes - 1;
+                for (int category = 0; category < classes; category++)
+                {
+                    int index = (outer * classes + category) * innerSize + inner;
+                    cumulative += numOps.ToDouble(source[index]);
+                    if (target < cumulative)
+                    {
+                        selected = category;
+                        break;
+                    }
+                }
+                int selectedIndex = (outer * classes + selected) * innerSize + inner;
+                destination[selectedIndex] = numOps.One;
+            }
+        }
+
+        return TensorAllocator.Rent<T>(probabilities._shape, destination);
+    }
+
+    /// <inheritdoc/>
     public Tensor<T> GumbelSoftmaxBackward<T>(Tensor<T> gradOutput, Tensor<T> output, double temperature, int axis = -1)
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));

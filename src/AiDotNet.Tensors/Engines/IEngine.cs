@@ -4056,6 +4056,18 @@ public interface IEngine
     Tensor<T> GumbelSoftmax<T>(Tensor<T> input, double temperature = 1.0, bool hard = false, int axis = -1);
 
     /// <summary>
+    /// Draws one categorical sample per slice and returns a one-hot tensor with
+    /// the same shape as <paramref name="probabilities"/>.
+    /// </summary>
+    /// <param name="probabilities">Finite, non-negative categorical weights.</param>
+    /// <param name="axis">Category axis; defaults to the last axis.</param>
+    /// <param name="seed">Optional deterministic seed.</param>
+    Tensor<T> TensorCategoricalSample<T>(
+        Tensor<T> probabilities,
+        int axis = -1,
+        int? seed = null);
+
+    /// <summary>
     /// Computes the backward pass for Gumbel-Softmax.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>

@@ -57,6 +57,11 @@ public sealed partial class CudaBackend
         float alphaBarT,
         float alphaBarTMinus1)
     {
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxFusedDdimStepF32(
+                xT, epsilonTheta, output, size, alphaBarT, alphaBarTMinus1))
+            return;
+#endif
         EnsureFusedAdvancedKernelsAvailable(nameof(FusedDDIMStep));
         if (!_kernelCache.TryGetValue("fused_ddim_step", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: fused_ddim_step.");

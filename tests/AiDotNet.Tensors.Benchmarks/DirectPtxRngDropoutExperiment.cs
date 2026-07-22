@@ -64,12 +64,32 @@ internal static class DirectPtxRngDropoutExperiment
         var cells = new List<Cell>();
         for (int run = 1; run <= independentRuns; run++)
         {
-            using var backend = new CudaBackend();
-            if (!backend.IsDirectPtxRngDropoutEnabled)
-                throw new InvalidOperationException(
-                    "Set AIDOTNET_DIRECT_PTX_RNG_DROPOUT=1 and use the exact admitted SM.");
-            if (run == 1) Console.WriteLine($"GPU: {backend.DeviceName}");
-            foreach (Shape shape in Shapes) cells.AddRange(RunShape(backend, run, shape));
+            CudaBackend directBackend;
+            CudaBackend establishedBackend;
+            try
+            {
+                DirectPtxFeatureGate.TestOverride = true;
+                directBackend = new CudaBackend();
+                DirectPtxFeatureGate.TestOverride = false;
+                establishedBackend = new CudaBackend();
+            }
+            finally
+            {
+                DirectPtxFeatureGate.TestOverride = null;
+            }
+            using (directBackend)
+            using (establishedBackend)
+            {
+                if (!directBackend.IsDirectPtxRngDropoutEnabled)
+                    throw new InvalidOperationException(
+                        "The exact admitted SM is required for the direct-PTX contender.");
+                if (establishedBackend.IsDirectPtxRngDropoutEnabled)
+                    throw new InvalidOperationException(
+                        "The AiDotNet baseline backend unexpectedly admitted direct PTX.");
+                if (run == 1) Console.WriteLine($"GPU: {directBackend.DeviceName}");
+                foreach (Shape shape in Shapes)
+                    cells.AddRange(RunShape(directBackend, establishedBackend, run, shape));
+            }
         }
 
         IReadOnlyList<PythonCell> python = includeExternal
@@ -79,16 +99,21 @@ internal static class DirectPtxRngDropoutExperiment
         GpuBenchmarkEnvironment.RequireNoForeignCompute("direct-ptx-rng-dropout-end");
     }
 
-    private static IEnumerable<Cell> RunShape(CudaBackend backend, int run, Shape shape)
+    private static IEnumerable<Cell> RunShape(
+        CudaBackend backend,
+        CudaBackend establishedBackend,
+        int run,
+        Shape shape)
     {
         var random = new Random(849_000 + run * 10_000 + shape.Elements);
         float[] inputHost = Enumerable.Range(0, shape.Elements)
             .Select(_ => (float)(random.NextDouble() * 2.0 - 1.0)).ToArray();
         using var input = backend.AllocateBuffer(inputHost);
+        using var establishedInput = establishedBackend.AllocateBuffer(inputHost);
         using var directOutput = backend.AllocateBuffer(shape.Elements);
         using var directMask = backend.AllocateBuffer(shape.Elements);
-        using var currentOutput = backend.AllocateBuffer(shape.Elements);
-        using var currentMask = backend.AllocateBuffer(shape.Elements);
+        using var currentOutput = establishedBackend.AllocateBuffer(shape.Elements);
+        using var currentMask = establishedBackend.AllocateBuffer(shape.Elements);
         if (!backend.PrewarmDirectPtxRngDropoutF32(shape.Elements))
             throw new InvalidOperationException(backend.DirectPtxLastError ?? "PTX prewarm failed.");
 
@@ -96,14 +121,17 @@ internal static class DirectPtxRngDropoutExperiment
             input, directOutput, directMask, shape.Elements, DropoutRate, Seed, training: true);
         void CurrentLaunch()
         {
-            backend.DropoutMask(currentMask, shape.Elements, 1.0f - DropoutRate, Seed);
-            backend.Multiply(input, currentMask, currentOutput, shape.Elements);
+            establishedBackend.DropoutMask(
+                currentMask, shape.Elements, 1.0f - DropoutRate, Seed);
+            establishedBackend.Multiply(
+                establishedInput, currentMask, currentOutput, shape.Elements);
         }
 
         long publicDispatchBefore = backend.DirectPtxRngDropoutDispatchCount;
         DirectLaunch();
         CurrentLaunch();
         backend.Synchronize();
+        establishedBackend.Synchronize();
         if (backend.DirectPtxRngDropoutDispatchCount != publicDispatchBefore + 1 ||
             backend.DirectPtxLastError is not null)
             throw new InvalidOperationException(
@@ -113,7 +141,7 @@ internal static class DirectPtxRngDropoutExperiment
         double directError = DirectOracleError(
             backend, inputHost, directOutput, directMask, shape.Elements);
         double currentError = MaskApplicationError(
-            backend, inputHost, currentOutput, currentMask);
+            establishedBackend, inputHost, currentOutput, currentMask);
         if (!backend.TryGetDirectPtxRngDropoutAudit(shape.Elements, out DirectPtxKernelAudit audit))
             throw new InvalidOperationException("The prewarmed PTX module has no audit record.");
         Console.WriteLine($"audit run={run} shape={shape.Name}: {audit.ToJson()}");
@@ -140,7 +168,7 @@ internal static class DirectPtxRngDropoutExperiment
                     $"{expectedMeasuredDispatches}, observed {actualMeasuredDispatches}; " +
                     $"error={backend.DirectPtxLastError ?? "none"}.");
             yield return direct;
-            yield return Measure(backend, run, shape, "AiDotNet current NVRTC x2", CurrentLaunch,
+            yield return Measure(establishedBackend, run, shape, "AiDotNet current NVRTC x2", CurrentLaunch,
                 currentError, null, temporaryDeviceBytes: 0);
         }
         finally

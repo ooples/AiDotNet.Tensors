@@ -1787,6 +1787,16 @@ public sealed partial class CudaBackend
             _directPtxFlashAttentionBackwardKernels.Dispose();
             _directPtxQkvRopeCacheKernels.Dispose();
             _directPtxRngDropoutKernels.Dispose();
+            _directPtxRngFillKernels.Dispose();
+            _directPtxDropoutBackwardKernels.Dispose();
+            _directPtxGumbelSoftmaxKernels.Dispose();
+            _directPtxImportanceSamplingKernels.Dispose();
+            _directPtxBiasDropoutKernels.Dispose();
+            _directPtxDdimKernels.Dispose();
+            _directPtxCategoricalKernels.Dispose();
+            _directPtxGumbelBackwardKernels.Dispose();
+            _directPtxFusedRreluKernels.Dispose();
+            _directPtxRreluKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }
