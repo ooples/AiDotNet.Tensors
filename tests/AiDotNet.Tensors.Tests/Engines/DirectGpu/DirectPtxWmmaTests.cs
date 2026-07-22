@@ -3262,28 +3262,35 @@ public class DirectPtxWmmaTests
                 $"fp16 fanout mismatch at {i}");
     }
 
-    [Fact]
-    public void FusedLoraForwardStandardEmitter_IsStandardBTwoStageWithSharedZ()
+    [Theory]
+    [InlineData(16)]
+    [InlineData(32)]
+    [InlineData(64)]
+    public void FusedLoraForwardStandardEmitter_IsStandardBTwoStageWithSharedZ(int rank)
     {
-        string ptx = PtxFusedLoRAForwardStandardKernel.EmitPtx(8, 6, 64, 256, 256);
+        string ptx = PtxFusedLoRAForwardStandardKernel.EmitPtx(8, 6, 64, 256, 256, rank);
         Assert.Contains(PtxFusedLoRAForwardStandardKernel.EntryPoint, ptx);
         Assert.Contains("ld.param.f32 %f26, [scale];", ptx);
-        Assert.Contains(".shared .align 16 .b8 z_tile[16384]", ptx);
+        Assert.Contains(".shared .align 16 .b8 z_tile[16384]", ptx);   // always MaxRank-sized
         Assert.Contains("STAGE1_K_LOOP:", ptx);
         Assert.Contains("COL_LOOP:", ptx);
         Assert.Contains("STAGE2_R_LOOP:", ptx);
         Assert.Equal(272, Count(ptx, "fma.rn.f32"));       // 128 Z + 128 dY + 16 residual
         Assert.Equal(16, Count(ptx, "st.global.f32"));
         Assert.Equal(5, Count(ptx, "bar.sync 0"));
+        Assert.Contains($"setp.lt.u32 %p1, %r9, {rank};", ptx);        // R-loop bounded by rank
+        Assert.Contains($"setp.lt.u32 %p3, %r17, {rank};", ptx);        // loraA col bounds guard
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
-        Assert.True(PtxFusedLoRAForwardStandardKernel.IsSupportedShape(128, 512, 2048));
-        Assert.False(PtxFusedLoRAForwardStandardKernel.IsPromotedShape(128, 512, 2048));
+        Assert.True(PtxFusedLoRAForwardStandardKernel.IsSupportedShape(128, 512, 2048, rank));
+        Assert.False(PtxFusedLoRAForwardStandardKernel.IsSupportedShape(128, 512, 2048, 48));
+        Assert.False(PtxFusedLoRAForwardStandardKernel.IsPromotedShape(128, 512, 2048, rank));
     }
 
     [SkippableTheory]
-    [InlineData(64, 256, 256)]
-    [InlineData(128, 512, 512)]
-    public void DriverOnlyFusedLoraForwardStandard_MatchesOracle(int m, int k, int n)
+    [InlineData(64, 256, 256, 64)]
+    [InlineData(128, 512, 512, 32)]
+    [InlineData(64, 256, 512, 16)]
+    public void DriverOnlyFusedLoraForwardStandard_MatchesOracle(int m, int k, int n, int r)
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
         using var runtime = new DirectPtxRuntime();
@@ -3291,8 +3298,7 @@ public class DirectPtxWmmaTests
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
             "The checked-in standard-layout fused-LoRA specialization is measured on GA10x/SM86.");
         const float scale = 0.5f;
-        int r = PtxFusedLoRAForwardStandardKernel.Rank;
-        using var kernel = new PtxFusedLoRAForwardStandardKernel(runtime, m, k, n, scale);
+        using var kernel = new PtxFusedLoRAForwardStandardKernel(runtime, m, k, n, r, scale);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
         Assert.Equal(5, kernel.Blueprint.Tensors.Count);
 

@@ -28,11 +28,11 @@ public sealed partial class CudaBackend
         float scaling)
     {
         EnsureFusedAdvancedKernelsAvailable(nameof(FusedLoRAForward));
-        // Fail-closed direct-PTX fast path (issue #836) for the r=64 standard-layout case;
-        // returns false until GPU-promoted, then falls through to the NVRTC kernel.
-        if (rank == Ptx.PtxFusedLoRAForwardStandardKernel.Rank &&
+        // Fail-closed direct-PTX fast path (issue #836) for the supported standard-layout
+        // ranks; returns false until GPU-promoted, then falls through to the NVRTC kernel.
+        if (Ptx.PtxFusedLoRAForwardStandardKernel.IsSupportedRank(rank) &&
             TryDirectPtxFusedLoRAForward(input, loraA, loraB, baseOutput, output,
-                batchSize, inputFeatures, outputFeatures, scaling)) return;
+                batchSize, inputFeatures, outputFeatures, rank, scaling)) return;
         if (!_kernelCache.TryGetValue("fused_lora_forward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: fused_lora_forward.");
         using var _ = PushContext();

@@ -15,9 +15,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// intermediate, no per-column Z recompute. This is the standard-layout sibling of the
 /// output-major <see cref="PtxFusedLoRAForwardKernel"/>.
 ///
-/// Rank fixed r = <see cref="Rank"/> (64). Tile BM=BN=64, BK=8, TM=TN=4 → 256 threads,
-/// 16 FP32 accumulators/thread. Shared: 2 KiB X + 2 KiB loraA + 16 KiB Z + 2 KiB loraB.
-/// Grid = (M/BM).
+/// The rank R is a runtime specialization in <see cref="SupportedRanks"/> (16/32/64). The
+/// resident Z tile is always sized for <see cref="MaxRank"/> (stride 64) so unused columns
+/// never collide with neighbouring rows; the loraA load is bounds-guarded on <c>col &lt; R</c>
+/// so no out-of-range factor element is read. Tile BM=BN=64, BK=8, TM=TN=4 → 256 threads,
+/// 16 FP32 accumulators/thread. Grid = (M/BM).
 /// </summary>
 internal sealed class PtxFusedLoRAForwardStandardKernel : IDisposable
 {
@@ -26,8 +28,10 @@ internal sealed class PtxFusedLoRAForwardStandardKernel : IDisposable
     internal const int BlockK = 8;
     internal const int ThreadM = 4;
     internal const int ThreadN = 4;
-    internal const int Rank = 64;
+    internal const int MaxRank = 64; // Z-tile column stride; the largest supported rank.
     internal const int BlockThreads = (BlockM / ThreadM) * (BlockN / ThreadN); // 256
+
+    internal static readonly int[] SupportedRanks = { 16, 32, 64 };
     internal const string EntryPoint = "aidotnet_fused_lora_forward_standard";
 
     private readonly DirectPtxModule _module;
@@ -36,25 +40,27 @@ internal sealed class PtxFusedLoRAForwardStandardKernel : IDisposable
     internal int M { get; }
     internal int K { get; }
     internal int N { get; }
+    internal int Rank { get; }
     internal float Scale { get; }
     internal string Ptx { get; }
     internal DirectPtxKernelBlueprint Blueprint { get; }
     internal DirectPtxKernelAudit Audit { get; }
 
-    internal PtxFusedLoRAForwardStandardKernel(DirectPtxRuntime runtime, int m, int k, int n, float scale)
+    internal PtxFusedLoRAForwardStandardKernel(DirectPtxRuntime runtime, int m, int k, int n, int rank, float scale)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         if (!DirectPtxArchitecture.HasValidatedFusedLinear(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
                 "The checked-in standard-layout fused-LoRA specialization is measured only on GA10x/SM86.");
-        ValidateShape(m, k, n);
+        ValidateShape(m, k, n, rank);
         M = m;
         K = k;
         N = n;
+        Rank = rank;
         Scale = scale;
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, m, k, n);
-        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, m, k, n);
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, m, k, n, rank);
+        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, m, k, n, rank);
         _module = runtime.LoadModule(Ptx);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
         int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
@@ -96,18 +102,18 @@ internal sealed class PtxFusedLoRAForwardStandardKernel : IDisposable
 
     public void Dispose() => _module.Dispose();
 
-    internal static string EmitPtx(int ccMajor, int ccMinor, int m, int k, int n)
+    internal static string EmitPtx(int ccMajor, int ccMinor, int m, int k, int n, int rank)
     {
-        ValidateShape(m, k, n);
-        int kBytes = checked(k * sizeof(float));   // X row stride
-        int rBytes = checked(Rank * sizeof(float)); // loraA row stride (over R)
-        int nBytes = checked(n * sizeof(float));   // loraB row stride, base/output row stride
+        ValidateShape(m, k, n, rank);
+        int kBytes = checked(k * sizeof(float));    // X row stride
+        int rBytes = checked(rank * sizeof(float)); // loraA row stride (over R)
+        int nBytes = checked(n * sizeof(float));    // loraB row stride, base/output row stride
 
         var ptx = new StringBuilder(32_000);
         ptx.AppendLine(".version 7.1");
         ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
         ptx.AppendLine(".address_size 64");
-        ptx.AppendLine($"// fused-lora-standard M={m} K={k} N={n} r={Rank} tile={BlockM}x{BlockN}x{BlockK}");
+        ptx.AppendLine($"// fused-lora-standard M={m} K={k} N={n} r={rank} tile={BlockM}x{BlockN}x{BlockK}");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");
         ptx.AppendLine("    .param .u64 x_ptr,");
@@ -125,7 +131,7 @@ internal sealed class PtxFusedLoRAForwardStandardKernel : IDisposable
         ptx.AppendLine("    .reg .f32 %f<48>;");
         ptx.AppendLine($"    .shared .align 16 .b8 x_tile[{BlockM * BlockK * sizeof(float)}];");
         ptx.AppendLine($"    .shared .align 16 .b8 a_tile[{BlockK * BlockN * sizeof(float)}];");
-        ptx.AppendLine($"    .shared .align 16 .b8 z_tile[{BlockM * Rank * sizeof(float)}];");
+        ptx.AppendLine($"    .shared .align 16 .b8 z_tile[{BlockM * MaxRank * sizeof(float)}];");
         ptx.AppendLine($"    .shared .align 16 .b8 b_tile[{BlockK * BlockN * sizeof(float)}];");
         ptx.AppendLine("    ld.param.u64 %rd0, [x_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd1, [a_ptr];");
@@ -138,32 +144,32 @@ internal sealed class PtxFusedLoRAForwardStandardKernel : IDisposable
         ptx.AppendLine("    mov.u64 %rd7, z_tile;");
         ptx.AppendLine("    mov.u64 %rd20, b_tile;");
         ptx.AppendLine("    mov.u32 %r0, %tid.x;");
-        ptx.AppendLine("    mov.u32 %r1, %ctaid.x;");                 // row block
-        ptx.AppendLine("    shr.u32 %r3, %r0, 4;");                   // threadRow
-        ptx.AppendLine("    and.b32 %r4, %r0, 15;");                  // threadCol
-        ptx.AppendLine($"    mul.lo.u32 %r5, %r1, {BlockM};");        // rowBase
+        ptx.AppendLine("    mov.u32 %r1, %ctaid.x;");
+        ptx.AppendLine("    shr.u32 %r3, %r0, 4;");
+        ptx.AppendLine("    and.b32 %r4, %r0, 15;");
+        ptx.AppendLine($"    mul.lo.u32 %r5, %r1, {BlockM};");
         ptx.AppendLine($"    mul.lo.u32 %r7, %r3, {ThreadM};");
         ptx.AppendLine($"    mul.lo.u32 %r8, %r4, {ThreadN};");
 
-        // ---- Stage 1: Z[BM,R] = X[BM,K] @ loraA[K,R] (standard-B) ----
+        // ---- Stage 1: Z[BM,R] = X[BM,K] @ loraA[K,R] (standard-B, loraA col-guarded) ----
         for (int i = 0; i < ThreadM * ThreadN; i++)
             ptx.AppendLine($"    mov.f32 %f{i}, 0f00000000;");
         ptx.AppendLine("    mov.u32 %r9, 0;");
         ptx.AppendLine("STAGE1_K_LOOP:");
-        EmitStage1Load(ptx, kBytes, rBytes);
+        EmitStage1Load(ptx, kBytes, rBytes, rank);
         ptx.AppendLine("    bar.sync 0;");
         EmitStandardInner(ptx, "%rd13", "%rd14");
         ptx.AppendLine("    bar.sync 0;");
         ptx.AppendLine($"    add.u32 %r9, %r9, {BlockK};");
         ptx.AppendLine($"    setp.lt.u32 %p0, %r9, {k};");
         ptx.AppendLine("    @%p0 bra.uni STAGE1_K_LOOP;");
-        // Store Z accumulators into z_tile[(threadRow*TM+i)*R + (threadCol*TN+j)].
+        // Store Z accumulators into z_tile[(threadRow*TM+i)*MaxRank + (threadCol*TN+j)].
         for (int i = 0; i < ThreadM; i++)
             for (int j = 0; j < ThreadN; j++)
             {
                 ptx.AppendLine($"    add.u32 %r22, %r7, {i};");
                 ptx.AppendLine($"    add.u32 %r23, %r8, {j};");
-                ptx.AppendLine($"    mul.lo.u32 %r24, %r22, {Rank};");
+                ptx.AppendLine($"    mul.lo.u32 %r24, %r22, {MaxRank};");
                 ptx.AppendLine("    add.u32 %r24, %r24, %r23;");
                 ptx.AppendLine("    mul.wide.u32 %rd15, %r24, 4;");
                 ptx.AppendLine("    add.u64 %rd16, %rd7, %rd15;");
@@ -183,7 +189,7 @@ internal sealed class PtxFusedLoRAForwardStandardKernel : IDisposable
         EmitStage2Inner(ptx);
         ptx.AppendLine("    bar.sync 0;");
         ptx.AppendLine($"    add.u32 %r9, %r9, {BlockK};");
-        ptx.AppendLine($"    setp.lt.u32 %p1, %r9, {Rank};");
+        ptx.AppendLine($"    setp.lt.u32 %p1, %r9, {rank};");
         ptx.AppendLine("    @%p1 bra.uni STAGE2_R_LOOP;");
         EmitStage2Epilogue(ptx, nBytes);
         ptx.AppendLine($"    add.u32 %r30, %r30, {BlockN};");
@@ -195,9 +201,10 @@ internal sealed class PtxFusedLoRAForwardStandardKernel : IDisposable
         return ptx.ToString();
     }
 
-    // Stage 1: X tile [BM][BK] (rows over M, cols over K) and loraA tile [BK][BN] (rows
-    // over K, cols over R). Both standard row-major. Leaves fragment bases in %rd13/%rd14.
-    private static void EmitStage1Load(StringBuilder ptx, int kBytes, int rBytes)
+    // Stage 1: X tile [BM][BK] (rows over M, cols over K) and loraA tile [BK][BN] (rows over
+    // K, cols over R). loraA columns >= rank load 0 (bounds guard), so their Z columns are 0
+    // and are never read in stage 2. Leaves fragment bases in %rd13/%rd14.
+    private static void EmitStage1Load(StringBuilder ptx, int kBytes, int rBytes, int rank)
     {
         for (int slot = 0; slot < 2; slot++)
         {
@@ -224,7 +231,9 @@ internal sealed class PtxFusedLoRAForwardStandardKernel : IDisposable
             ptx.AppendLine("    mul.wide.u32 %rd9, %r17, 4;");
             ptx.AppendLine("    add.u64 %rd10, %rd1, %rd8;");
             ptx.AppendLine("    add.u64 %rd10, %rd10, %rd9;");
-            ptx.AppendLine("    ld.global.nc.f32 %f16, [%rd10];");
+            ptx.AppendLine("    mov.f32 %f16, 0f00000000;");                // default 0 for col >= rank
+            ptx.AppendLine($"    setp.lt.u32 %p3, %r17, {rank};");
+            ptx.AppendLine("    @%p3 ld.global.nc.f32 %f16, [%rd10];");
             ptx.AppendLine("    add.u64 %rd12, %rd5, %rd11;");
             ptx.AppendLine("    st.shared.f32 [%rd12], %f16;");
         }
@@ -276,7 +285,7 @@ internal sealed class PtxFusedLoRAForwardStandardKernel : IDisposable
         }
     }
 
-    // out[myRow,myCol] += sum_kk Z[myRow, r0+kk] * loraB_tile[kk, myCol].
+    // out[myRow,myCol] += sum_kk Z[myRow, r0+kk] * loraB_tile[kk, myCol]. Z stride = MaxRank.
     private static void EmitStage2Inner(StringBuilder ptx)
     {
         // loraB fragment base: &b_tile[threadCol*TN] (row-major [BK][BN], stride BN).
@@ -284,11 +293,11 @@ internal sealed class PtxFusedLoRAForwardStandardKernel : IDisposable
         ptx.AppendLine("    add.u64 %rd14, %rd20, %rd14;");
         for (int k = 0; k < BlockK; k++)
         {
-            // Z fragment: z_tile[(threadRow*TM+i)*R + (r0+k)].
+            // Z fragment: z_tile[(threadRow*TM+i)*MaxRank + (r0+k)].
             for (int i = 0; i < ThreadM; i++)
             {
                 ptx.AppendLine($"    add.u32 %r22, %r7, {i};");
-                ptx.AppendLine($"    mul.lo.u32 %r22, %r22, {Rank};");
+                ptx.AppendLine($"    mul.lo.u32 %r22, %r22, {MaxRank};");
                 ptx.AppendLine("    add.u32 %r22, %r22, %r9;");            // + r0
                 ptx.AppendLine($"    add.u32 %r22, %r22, {k};");          // + kk
                 ptx.AppendLine("    mul.wide.u32 %rd15, %r22, 4;");
@@ -330,18 +339,18 @@ internal sealed class PtxFusedLoRAForwardStandardKernel : IDisposable
     }
 
     private static DirectPtxKernelBlueprint CreateBlueprint(
-        DirectPtxArchitectureFamily architecture, int m, int k, int n)
+        DirectPtxArchitectureFamily architecture, int m, int k, int n, int rank)
     {
         var x = new DirectPtxExtent(m, k);
-        var a = new DirectPtxExtent(k, Rank);
-        var b = new DirectPtxExtent(Rank, n);
+        var a = new DirectPtxExtent(k, rank);
+        var b = new DirectPtxExtent(rank, n);
         var baseOut = new DirectPtxExtent(m, n);
         var output = new DirectPtxExtent(m, n);
         return new DirectPtxKernelBlueprint(
             Operation: "fused-lora-forward-standard",
             Version: 1,
             Architecture: architecture,
-            Variant: $"fp32-m{m}-k{k}-n{n}-r{Rank}",
+            Variant: $"fp32-m{m}-k{k}-n{n}-r{rank}",
             Tensors:
             [
                 new("x", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.RowMajor2D,
@@ -357,15 +366,16 @@ internal sealed class PtxFusedLoRAForwardStandardKernel : IDisposable
             ],
             ResourceBudget: new DirectPtxResourceBudget(
                 MaxRegistersPerThread: 120,
-                MaxStaticSharedBytes: (BlockM * BlockK + BlockK * BlockN + BlockM * Rank + BlockK * BlockN) * sizeof(float),
+                MaxStaticSharedBytes: (BlockM * BlockK + BlockK * BlockN + BlockM * MaxRank + BlockK * BlockN) * sizeof(float),
                 MaxLocalBytesPerThread: 0,
                 MinBlocksPerMultiprocessor: 1),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["formula"] = "output = base + scale * (X @ loraA[K,R]) @ loraB[R,N]",
-                ["rank"] = Rank.ToString(),
+                ["rank"] = rank.ToString(),
                 ["factors"] = "standard-row-major-fp32-down[K,R]-up[R,N]",
                 ["fusion"] = "single-launch-shared-resident-intermediate-Z",
+                ["z-stride"] = MaxRank.ToString(),
                 ["tile"] = $"{BlockM}x{BlockN}x{BlockK}-register-{ThreadM}x{ThreadN}",
                 ["global-intermediates"] = "none",
                 ["temporary-device-allocation"] = "none",
@@ -373,7 +383,10 @@ internal sealed class PtxFusedLoRAForwardStandardKernel : IDisposable
             });
     }
 
-    internal static bool IsSupportedShape(int m, int k, int n) =>
+    internal static bool IsSupportedRank(int rank) => Array.IndexOf(SupportedRanks, rank) >= 0;
+
+    internal static bool IsSupportedShape(int m, int k, int n, int rank) =>
+        IsSupportedRank(rank) &&
         m > 0 && m % BlockM == 0 &&
         n > 0 && n % BlockN == 0 &&
         k > 0 && k % BlockK == 0 &&
@@ -381,14 +394,14 @@ internal sealed class PtxFusedLoRAForwardStandardKernel : IDisposable
         k is 256 or 512 or 1024 or 2048 or 4096 &&
         n is 256 or 512 or 1024 or 2048 or 4096;
 
-    internal static bool IsPromotedShape(int m, int k, int n) => false;
+    internal static bool IsPromotedShape(int m, int k, int n, int rank) => false;
 
-    private static void ValidateShape(int m, int k, int n)
+    private static void ValidateShape(int m, int k, int n, int rank)
     {
-        if (!IsSupportedShape(m, k, n))
+        if (!IsSupportedShape(m, k, n, rank))
             throw new ArgumentOutOfRangeException(
                 nameof(m),
-                "Standard fused-LoRA supports M in {64,128,256,512,1024,2048}, K/N in {256,512,1024,2048,4096}, r=64.");
+                "Standard fused-LoRA supports M in {64,128,256,512,1024,2048}, K/N in {256,512,1024,2048,4096}, r in {16,32,64}.");
     }
 
     private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)

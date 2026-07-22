@@ -19,12 +19,12 @@ public sealed partial class CudaBackend
     internal long DirectPtxLoRADispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxLoRADispatchCount);
 
-    private readonly record struct DirectPtxLoRAKey(int M, int K, int N, int ScaleBits);
+    private readonly record struct DirectPtxLoRAKey(int M, int K, int N, int Rank, int ScaleBits);
 
     /// <summary>
     /// Attempts the standard-layout fused LoRA forward. Returns false (leaving the caller
-    /// on the NVRTC path) for rank != 64, unsupported shapes, an extent mismatch, during
-    /// graph capture, or unless the experiment override is set.
+    /// on the NVRTC path) for an unsupported rank/shape, an extent mismatch, during graph
+    /// capture, or unless the experiment override is set.
     /// </summary>
     internal bool TryDirectPtxFusedLoRAForward(
         IGpuBuffer input,
@@ -35,24 +35,24 @@ public sealed partial class CudaBackend
         int m,
         int k,
         int n,
+        int rank,
         float scale)
     {
         if (!IsDirectPtxFusedLinearEnabled) return false;
-        if (!PtxFusedLoRAForwardStandardKernel.IsSupportedShape(m, k, n))
+        if (!PtxFusedLoRAForwardStandardKernel.IsSupportedShape(m, k, n, rank))
         {
             DirectPtxLastError = "fused-lora-shape-not-implemented";
             return false;
         }
-        if (!PtxFusedLoRAForwardStandardKernel.IsPromotedShape(m, k, n) &&
+        if (!PtxFusedLoRAForwardStandardKernel.IsPromotedShape(m, k, n, rank) &&
             !DirectPtxFeatureGate.FusedLinearExperimentOverride)
         {
             DirectPtxLastError = "fused-lora-performance-gate-not-met";
             return false;
         }
-        int r = PtxFusedLoRAForwardStandardKernel.Rank;
         long xBytes = checked((long)m * k * sizeof(float));
-        long aBytes = checked((long)k * r * sizeof(float));
-        long bBytes = checked((long)r * n * sizeof(float));
+        long aBytes = checked((long)k * rank * sizeof(float));
+        long bBytes = checked((long)rank * n * sizeof(float));
         long mnBytes = checked((long)m * n * sizeof(float));
         if (input.SizeInBytes != xBytes || loraA.SizeInBytes != aBytes ||
             loraB.SizeInBytes != bBytes || baseOutput.SizeInBytes != mnBytes ||
@@ -70,7 +70,7 @@ public sealed partial class CudaBackend
                 return false;
             }
             EnsureContextCurrent();
-            var key = new DirectPtxLoRAKey(m, k, n, BitConverter.ToInt32(BitConverter.GetBytes(scale), 0));
+            var key = new DirectPtxLoRAKey(m, k, n, rank, BitConverter.ToInt32(BitConverter.GetBytes(scale), 0));
             lock (_directPtxLock)
             {
                 if (!_directPtxLoRAKernels.TryGetValue(key, out PtxFusedLoRAForwardStandardKernel? kernel))
@@ -102,13 +102,13 @@ public sealed partial class CudaBackend
     private PtxFusedLoRAForwardStandardKernel CreateAndCacheLoRAKernelSlow(
         DirectPtxLoRAKey key, float scale) =>
         _directPtxLoRAKernels.GetOrAdd(key, () =>
-            new PtxFusedLoRAForwardStandardKernel(_directPtxRuntime!, key.M, key.K, key.N, scale));
+            new PtxFusedLoRAForwardStandardKernel(_directPtxRuntime!, key.M, key.K, key.N, key.Rank, scale));
 
-    internal bool TryGetDirectPtxLoRAAudit(int m, int k, int n, float scale, out DirectPtxKernelAudit audit)
+    internal bool TryGetDirectPtxLoRAAudit(int m, int k, int n, int rank, float scale, out DirectPtxKernelAudit audit)
     {
         lock (_directPtxLock)
         {
-            var key = new DirectPtxLoRAKey(m, k, n, BitConverter.ToInt32(BitConverter.GetBytes(scale), 0));
+            var key = new DirectPtxLoRAKey(m, k, n, rank, BitConverter.ToInt32(BitConverter.GetBytes(scale), 0));
             if (_directPtxLoRAKernels.TryGetValue(key, out var kernel))
             {
                 audit = kernel.Audit;
