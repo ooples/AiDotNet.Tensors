@@ -2281,8 +2281,9 @@ public class DirectPtxWmmaTests
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
         using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(runtime.ArchitectureFamily == DirectPtxArchitectureFamily.Ampere,
-            "The checked-in FP16 Tensor Core fused-linear specialization is validated on Ampere.");
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedMixedLinear(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in FP16 Tensor Core fused-linear specialization is measured on GA10x/SM86.");
         const int rows = PtxFusedLinearGeluFp16M16Kernel.Rows;
         const int inputFeatures = 512, outputFeatures = 2048;
         using var kernel = new PtxFusedLinearGeluFp16M16Kernel(
@@ -2431,8 +2432,9 @@ public class DirectPtxWmmaTests
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
         using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(runtime.ArchitectureFamily == DirectPtxArchitectureFamily.Ampere,
-            "The checked-in FP16 fused-linear specialization is validated on Ampere.");
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedMixedLinear(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in FP16 fused-linear specialization is measured on GA10x/SM86.");
         const int inputFeatures = 512, outputFeatures = 2048;
         using var kernel = new PtxFusedLinearGeluFp16M1Kernel(
             runtime, inputFeatures, outputFeatures);
@@ -2588,8 +2590,9 @@ public class DirectPtxWmmaTests
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
         using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(runtime.ArchitectureFamily == DirectPtxArchitectureFamily.Ampere,
-            "The checked-in W8A8 fused-linear specialization is validated on Ampere.");
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedMixedLinear(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in W8A8 fused-linear specialization is measured on GA10x/SM86.");
         const int inputFeatures = 1024, outputFeatures = 4096;
         using var kernel = new PtxFusedLinearGeluW8A8M1Kernel(
             runtime, inputFeatures, outputFeatures);
@@ -2796,6 +2799,22 @@ public class DirectPtxWmmaTests
                 "CudaBackend.FusedLinearGELUW8A8TransposedM1").Status);
         Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() =>
             DirectPtxQuantizedMixedSparseCoverageManifest.Get("UnassignedMixedApi"));
+    }
+
+    [Theory]
+    [InlineData(8, 6, true)]
+    [InlineData(8, 0, false)]
+    [InlineData(8, 7, false)]
+    [InlineData(8, 9, false)]
+    [InlineData(9, 0, false)]
+    [InlineData(10, 0, false)]
+    public void MixedLinearArchitectureMatrix_FailsClosedOutsideSm86(
+        int major,
+        int minor,
+        bool expected)
+    {
+        Assert.Equal(expected,
+            DirectPtxArchitecture.HasValidatedMixedLinear(major, minor));
     }
 
     [SkippableTheory]

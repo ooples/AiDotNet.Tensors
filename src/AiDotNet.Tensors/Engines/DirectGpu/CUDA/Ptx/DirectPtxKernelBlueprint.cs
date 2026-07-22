@@ -54,6 +54,15 @@ internal static class DirectPtxArchitecture
     /// </summary>
     internal static bool HasValidatedFusedLinear(int major, int minor) =>
         (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The mixed-precision (FP16 / W8A8) fused-linear decode specializations are
+    /// measured and promoted only on GA10x/SM86. Other Ampere variants (SM80,
+    /// SM87) are independent tuning domains and must supply and benchmark their
+    /// own specialization rather than silently inheriting SM86's launch geometry.
+    /// </summary>
+    internal static bool HasValidatedMixedLinear(int major, int minor) =>
+        (major, minor) == (8, 6);
 }
 
 internal enum DirectPtxExtentMode

@@ -31,9 +31,10 @@ internal sealed class PtxFusedLinearGeluW8A8M1Kernel : IDisposable
         int outputFeatures)
     {
         ArgumentNullException.ThrowIfNull(runtime);
-        if (runtime.ArchitectureFamily != DirectPtxArchitectureFamily.Ampere)
+        if (!DirectPtxArchitecture.HasValidatedMixedLinear(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
-                "The checked-in W8A8 fused-linear specialization is validated only on Ampere.");
+                "The checked-in W8A8 fused-linear specialization is measured only on GA10x/SM86.");
         ValidateShape(inputFeatures, outputFeatures);
 
         InputFeatures = inputFeatures;

@@ -34,9 +34,10 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
         int outputFeatures)
     {
         ArgumentNullException.ThrowIfNull(runtime);
-        if (runtime.ArchitectureFamily != DirectPtxArchitectureFamily.Ampere)
+        if (!DirectPtxArchitecture.HasValidatedMixedLinear(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
-                "The checked-in FP16 Tensor Core fused-linear specialization is validated only on Ampere.");
+                "The checked-in FP16 Tensor Core fused-linear specialization is measured only on GA10x/SM86.");
         ValidateShape(inputFeatures, outputFeatures);
 
         InputFeatures = inputFeatures;

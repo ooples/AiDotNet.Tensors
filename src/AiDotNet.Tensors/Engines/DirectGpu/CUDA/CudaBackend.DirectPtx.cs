@@ -97,7 +97,7 @@ public sealed partial class CudaBackend
 
     internal bool IsDirectPtxMixedLinearEnabled =>
         DirectPtxFeatureGate.IsMixedPrecisionLinearEnabled && IsAvailable &&
-        DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) == DirectPtxArchitectureFamily.Ampere;
+        DirectPtxArchitecture.HasValidatedMixedLinear(_ccMajor, _ccMinor);
 
     internal bool IsDirectPtxQuantizedLinearEnabled =>
         DirectPtxFeatureGate.IsQuantizedLinearEnabled && IsAvailable &&
