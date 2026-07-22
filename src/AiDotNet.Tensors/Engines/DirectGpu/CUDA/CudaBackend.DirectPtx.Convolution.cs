@@ -5010,4 +5010,160 @@ public sealed partial class CudaBackend
         return _directPtxDeformableConv2DBwdWeightKernels.GetOrAdd(
             1, () => new PtxDeformableConv2DNchw3x3BackwardWeightF32Kernel(runtime));
     }
+
+    private readonly DirectPtxKernelCache<int, PtxDeformableConv2DNchw3x3BackwardMaskF32Kernel>
+        _directPtxDeformableConv2DBwdMaskKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private long _directPtxDeformableConv2DBwdMaskDispatchCount;
+
+    internal long DirectPtxDeformableConv2DBwdMaskDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxDeformableConv2DBwdMaskDispatchCount);
+
+    /// <summary>
+    /// Attempts the exact FP32 NCHW deformable 3x3 backward-mask experiment (DCNv2,
+    /// modulation-mask gradient). Validated by byte extent. Fails closed on any
+    /// unsupported contract so the caller runs the established composition.
+    /// </summary>
+    internal bool TryDirectPtxDeformableConv2DBackwardMask(
+        IGpuBuffer gradOutput,
+        IGpuBuffer input,
+        IGpuBuffer weights,
+        IGpuBuffer offsets,
+        IGpuBuffer gradMask)
+    {
+        if (!_directPtxConvolutionOptedIn)
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.FeatureDisabled;
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.BackendUnavailable;
+            return false;
+        }
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.ArchitectureNotImplemented;
+            return false;
+        }
+        if (gradOutput is null || input is null || weights is null || offsets is null || gradMask is null)
+        {
+            DirectPtxLastError = "deformconv2d-bwd-mask-null-buffer";
+            return false;
+        }
+        if (gradOutput.SizeInBytes != PtxDeformableConv2DNchw3x3BackwardMaskF32Kernel.GradOutputBytes ||
+            input.SizeInBytes != PtxDeformableConv2DNchw3x3BackwardMaskF32Kernel.InputBytes ||
+            weights.SizeInBytes != PtxDeformableConv2DNchw3x3BackwardMaskF32Kernel.WeightBytes ||
+            offsets.SizeInBytes != PtxDeformableConv2DNchw3x3BackwardMaskF32Kernel.OffsetBytes ||
+            gradMask.SizeInBytes != PtxDeformableConv2DNchw3x3BackwardMaskF32Kernel.GradMaskBytes)
+        {
+            DirectPtxLastError = "deformconv2d-bwd-mask-exact-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            const int key = 1;
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxDeformableConv2DBwdMaskKernels.TryGetValue(key, out _))
+                {
+                    DirectPtxLastError =
+                        "Direct PTX deformable Conv2D backward-mask must be prewarmed before CUDA graph capture.";
+                    return false;
+                }
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxDeformableConv2DNchw3x3BackwardMaskF32Kernel kernel =
+                    GetOrCreateDirectPtxDeformableConv2DBwdMaskKernel();
+                if (capturing && !_directPtxDeformableConv2DBwdMaskKernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX deformable Conv2D backward-mask module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(gradOutput, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(weights, kernel.Blueprint.Tensors[2]),
+                        DirectPtxTensorView.Create(offsets, kernel.Blueprint.Tensors[3]),
+                        DirectPtxTensorView.Create(gradMask, kernel.Blueprint.Tensors[4]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxDeformableConv2DBwdMaskDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool PrewarmDirectPtxDeformableConv2DBackwardMask()
+    {
+        if (!_directPtxConvolutionOptedIn)
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.FeatureDisabled;
+            return false;
+        }
+        if (!IsAvailable || !DirectPtxArchitecture.HasExperimentalConvolution(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.ArchitectureNotImplemented;
+            return false;
+        }
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX deformable Conv2D backward-mask prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _ = GetOrCreateDirectPtxDeformableConv2DBwdMaskKernel();
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxDeformableConv2DBwdMaskAudit(out DirectPtxKernelAudit? audit)
+    {
+        lock (_directPtxLock)
+        {
+            if (_directPtxDeformableConv2DBwdMaskKernels.TryGetValue(1, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null;
+        return false;
+    }
+
+    private PtxDeformableConv2DNchw3x3BackwardMaskF32Kernel
+        GetOrCreateDirectPtxDeformableConv2DBwdMaskKernel()
+    {
+        if (_directPtxDeformableConv2DBwdMaskKernels.TryGetValue(
+                1, out PtxDeformableConv2DNchw3x3BackwardMaskF32Kernel? existing))
+            return existing;
+        return CreateAndCacheDirectPtxDeformableConv2DBwdMaskKernelSlow();
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxDeformableConv2DNchw3x3BackwardMaskF32Kernel
+        CreateAndCacheDirectPtxDeformableConv2DBwdMaskKernelSlow()
+    {
+        DirectPtxRuntime runtime = _directPtxRuntime ??
+            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+        return _directPtxDeformableConv2DBwdMaskKernels.GetOrAdd(
+            1, () => new PtxDeformableConv2DNchw3x3BackwardMaskF32Kernel(runtime));
+    }
 }
