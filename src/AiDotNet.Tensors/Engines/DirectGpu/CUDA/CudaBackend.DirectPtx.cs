@@ -102,7 +102,7 @@ public sealed partial class CudaBackend
 
     internal bool IsDirectPtxSgdMomentumEnabled =>
         DirectPtxFeatureGate.IsSgdMomentumEnabled && IsAvailable &&
-        DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) == DirectPtxArchitectureFamily.Ampere;
+        DirectPtxArchitecture.HasValidatedSgdMomentum(_ccMajor, _ccMinor);
 
     internal long DirectPtxSgdMomentumDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxSgdMomentumDispatchCount);
@@ -1809,8 +1809,7 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "sgd-momentum-cuda-unavailable";
             return false;
         }
-        if (DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) !=
-            DirectPtxArchitectureFamily.Ampere)
+        if (!DirectPtxArchitecture.HasValidatedSgdMomentum(_ccMajor, _ccMinor))
         {
             DirectPtxLastError = "sgd-momentum-architecture-not-validated";
             return false;
@@ -1820,7 +1819,8 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "sgd-momentum-shape-not-implemented";
             return false;
         }
-        if (!float.IsFinite(learningRate) || !float.IsFinite(momentum) || !float.IsFinite(weightDecay))
+        if (!PtxCompat.IsFinite(learningRate) || !PtxCompat.IsFinite(momentum) ||
+            !PtxCompat.IsFinite(weightDecay))
         {
             DirectPtxLastError = "sgd-momentum-nonfinite-hyperparameter";
             return false;
@@ -1844,9 +1844,9 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             var key = new DirectPtxSgdMomentumKey(
                 size,
-                BitConverter.SingleToInt32Bits(learningRate),
-                BitConverter.SingleToInt32Bits(momentum),
-                BitConverter.SingleToInt32Bits(weightDecay));
+                PtxCompat.SingleToInt32Bits(learningRate),
+                PtxCompat.SingleToInt32Bits(momentum),
+                PtxCompat.SingleToInt32Bits(weightDecay));
             lock (_directPtxLock)
             {
                 if (!_directPtxSgdMomentumKernels.TryGetValue(
@@ -1885,9 +1885,9 @@ public sealed partial class CudaBackend
         _directPtxSgdMomentumKernels.GetOrAdd(key, () =>
             new PtxFusedSgdMomentumF32Kernel(
                 _directPtxRuntime!, key.Size,
-                BitConverter.Int32BitsToSingle(key.LearningRateBits),
-                BitConverter.Int32BitsToSingle(key.MomentumBits),
-                BitConverter.Int32BitsToSingle(key.WeightDecayBits)));
+                PtxCompat.Int32BitsToSingle(key.LearningRateBits),
+                PtxCompat.Int32BitsToSingle(key.MomentumBits),
+                PtxCompat.Int32BitsToSingle(key.WeightDecayBits)));
 
     private void DisposeDirectPtxRuntime()
     {

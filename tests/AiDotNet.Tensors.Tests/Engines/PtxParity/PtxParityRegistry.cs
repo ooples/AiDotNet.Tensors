@@ -47,6 +47,14 @@ public static class PtxParityRegistry
 {
     public static IReadOnlyList<PtxParitySpec> Specs { get; } = new[]
     {
+        new PtxParitySpec("PtxFusedSgdMomentumF32Kernel", PtxParityStatus.Deferred,
+            "fused SGD-momentum update, fp32 (#848) — CudaBackend.SgdMomentumUpdate",
+            "has a public route, but the op mutates param and velocity in place, so a gate-off/gate-on " +
+            "spec must snapshot and restore both buffers between legs rather than just comparing one " +
+            "output. Its tests currently cover PTX-vs-CPU only. Converts to ThreeWayParity once that " +
+            "in-place-safe harness exists; the hyperparameters are baked into the module, so each leg " +
+            "must also use identical learning-rate/momentum/weight-decay bit patterns."),
+
         new PtxParitySpec("PtxFusedResidualRmsNormD64Kernel", PtxParityStatus.Deferred,
             "fused residual + RMSNorm (D=64)",
             "backend method has no public op route on main (only the CUDA RmsNorm path is wired), " +

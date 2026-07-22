@@ -1,9 +1,9 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Linq;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+using AiDotNet.Tensors.Helpers;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -100,10 +100,10 @@ public class DirectPtxSgdMomentumTests
         Assert.Equal("sgd-momentum-f32", kernel.Blueprint.Operation);
         Assert.Equal(3, kernel.Blueprint.Tensors.Count);
 
-        var random = new Random(20260722);
-        float[] param = Enumerable.Range(0, size).Select(_ => (random.NextSingle() * 2f - 1f)).ToArray();
-        float[] grad = Enumerable.Range(0, size).Select(_ => (random.NextSingle() * 2f - 1f) * 0.5f).ToArray();
-        float[] velocity = Enumerable.Range(0, size).Select(_ => (random.NextSingle() * 2f - 1f) * 0.25f).ToArray();
+        var random = RandomHelper.CreateSeededRandom(20260722);
+        float[] param = Enumerable.Range(0, size).Select(_ => (float)(random.NextDouble() * 2.0 - 1.0)).ToArray();
+        float[] grad = Enumerable.Range(0, size).Select(_ => (float)(random.NextDouble() * 2.0 - 1.0) * 0.5f).ToArray();
+        float[] velocity = Enumerable.Range(0, size).Select(_ => (float)(random.NextDouble() * 2.0 - 1.0) * 0.25f).ToArray();
 
         var expectedParam = new float[size];
         var expectedVelocity = new float[size];
@@ -151,4 +151,3 @@ public class DirectPtxSgdMomentumTests
         return count;
     }
 }
-#endif

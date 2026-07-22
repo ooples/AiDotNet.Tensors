@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -52,10 +51,11 @@ internal sealed class PtxFusedSgdMomentumF32Kernel : IDisposable
         float weightDecay,
         int blockThreads = DefaultBlockThreads)
     {
-        ArgumentNullException.ThrowIfNull(runtime);
-        if (runtime.ArchitectureFamily != DirectPtxArchitectureFamily.Ampere)
+        PtxCompat.ThrowIfNull(runtime, nameof(runtime));
+        if (!DirectPtxArchitecture.HasValidatedSgdMomentum(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
-                "The checked-in FP32 SGD-momentum specialization is validated only on Ampere.");
+                "The checked-in FP32 SGD-momentum specialization is admitted only on SM86.");
         Validate(size);
         ValidateBlockThreads(size, blockThreads);
         ValidateHyperparameters(learningRate, momentum, weightDecay);
@@ -106,7 +106,7 @@ internal sealed class PtxFusedSgdMomentumF32Kernel : IDisposable
     public void Dispose() => _module.Dispose();
 
     private static string HexFloat(float value) =>
-        "0f" + BitConverter.SingleToUInt32Bits(value).ToString("X8", CultureInfo.InvariantCulture);
+        "0f" + PtxCompat.SingleToUInt32Bits(value).ToString("X8", CultureInfo.InvariantCulture);
 
     internal static string EmitPtx(
         int ccMajor,
@@ -183,7 +183,7 @@ internal sealed class PtxFusedSgdMomentumF32Kernel : IDisposable
             Operation: "sgd-momentum-f32",
             Version: 1,
             Architecture: architecture,
-            Variant: $"linear-vec4-b{blockThreads}-n{size}-lr{BitConverter.SingleToUInt32Bits(learningRate):X8}-m{BitConverter.SingleToUInt32Bits(momentum):X8}-wd{BitConverter.SingleToUInt32Bits(weightDecay):X8}",
+            Variant: $"linear-vec4-b{blockThreads}-n{size}-lr{PtxCompat.SingleToUInt32Bits(learningRate):X8}-m{PtxCompat.SingleToUInt32Bits(momentum):X8}-wd{PtxCompat.SingleToUInt32Bits(weightDecay):X8}",
             Tensors:
             [
                 new("param", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
@@ -243,7 +243,8 @@ internal sealed class PtxFusedSgdMomentumF32Kernel : IDisposable
 
     private static void ValidateHyperparameters(float learningRate, float momentum, float weightDecay)
     {
-        if (!float.IsFinite(learningRate) || !float.IsFinite(momentum) || !float.IsFinite(weightDecay))
+        if (!PtxCompat.IsFinite(learningRate) || !PtxCompat.IsFinite(momentum) ||
+            !PtxCompat.IsFinite(weightDecay))
             throw new ArgumentOutOfRangeException(nameof(learningRate),
                 "SGD-momentum hyperparameters must be finite.");
     }
@@ -264,11 +265,10 @@ internal sealed class PtxFusedSgdMomentumF32Kernel : IDisposable
 
     private static bool Overlaps(DirectPtxTensorView left, DirectPtxTensorView right)
     {
-        nuint leftStart = (nuint)left.Pointer;
-        nuint rightStart = (nuint)right.Pointer;
+        nuint leftStart = PtxCompat.ToNuint(left.Pointer);
+        nuint rightStart = PtxCompat.ToNuint(right.Pointer);
         nuint leftEnd = checked(leftStart + left.ByteLength);
         nuint rightEnd = checked(rightStart + right.ByteLength);
         return leftStart < rightEnd && rightStart < leftEnd;
     }
 }
-#endif
