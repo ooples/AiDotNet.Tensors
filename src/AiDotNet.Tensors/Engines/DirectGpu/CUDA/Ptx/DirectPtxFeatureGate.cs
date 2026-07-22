@@ -43,6 +43,8 @@ internal static class DirectPtxFeatureGate
     internal static bool? TestOverride { get; set; }
     /// <summary>Benchmark-only access to reduction cells that have not passed promotion.</summary>
     internal static bool ReductionExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to mean/max/min/sum-of-squares row cells that have not passed promotion.</summary>
+    internal static bool RowReduceOpExperimentOverride { get; set; }
 
     internal static bool IsEnabled => IsAttentionEnabled;
 

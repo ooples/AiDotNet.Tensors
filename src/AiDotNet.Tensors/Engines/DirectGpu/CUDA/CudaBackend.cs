@@ -11769,6 +11769,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void MeanAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
     {
+        if (TryDirectPtxRowReduceOp(DirectPtxRowReduceOp.Mean, A, B, outerSize, reduceSize))
+            return;
         if (!_kernelCache.TryGetValue("mean_axis", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: mean_axis");
 
@@ -11839,6 +11841,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void MaxAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
     {
+        if (TryDirectPtxRowReduceOp(DirectPtxRowReduceOp.Max, A, B, outerSize, reduceSize))
+            return;
         if (!_kernelCache.TryGetValue("max_axis", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: max_axis");
 

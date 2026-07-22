@@ -153,8 +153,35 @@ public class DirectPtxReductionTests
         Assert.Equal(
             DirectPtxReductionCoverageStatus.ExperimentalDirectPtx,
             DirectPtxReductionCoverageManifest.Get("CudaBackend.NormalizeL2").Status);
-        Assert.Equal(2, DirectPtxReductionCoverageManifest.All
-            .Count(cell => cell.Status == DirectPtxReductionCoverageStatus.ExperimentalDirectPtx));
+        Assert.Equal(
+            DirectPtxReductionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxReductionCoverageManifest.Get("CudaBackend.MeanAxis").Status);
+        Assert.Equal(
+            DirectPtxReductionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxReductionCoverageManifest.Get("CudaBackend.MaxAxis").Status);
+        // Name the live cells rather than counting them: this pins WHICH cells
+        // are experimental, so a new cell cannot quietly take a live slot.
+        Assert.Equal(
+            new[]
+            {
+                "CudaBackend.MaxAxis",
+                "CudaBackend.MeanAxis",
+                "CudaBackend.NormalizeL2",
+                "CudaBackend.SumAxis",
+            },
+            DirectPtxReductionCoverageManifest.All
+                .Where(cell => cell.Status == DirectPtxReductionCoverageStatus.ExperimentalDirectPtx)
+                .Select(cell => cell.Api)
+                .OrderBy(api => api, StringComparer.Ordinal)
+                .ToArray());
+        // MinAxis is implemented in PTX but has no backend op to route through,
+        // so it must stay Planned and say why.
+        Assert.Equal(
+            DirectPtxReductionCoverageStatus.PlannedDirectPtx,
+            DirectPtxReductionCoverageManifest.Get("CudaBackend.MinAxis").Status);
+        Assert.StartsWith("blocked:",
+            DirectPtxReductionCoverageManifest.Get("CudaBackend.MinAxis").DirectPtxAssignment,
+            StringComparison.Ordinal);
         Assert.All(DirectPtxReductionCoverageManifest.All,
             cell => Assert.NotEqual(
                 DirectPtxReductionCoverageStatus.PromotedDirectPtx, cell.Status));
