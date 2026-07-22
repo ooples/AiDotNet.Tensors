@@ -1758,6 +1758,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         ValidateGemmArgs(A, B, C, M, N, K);
 
         using var _ = PushContext();
+        // Fail-closed direct-PTX fast path (issue #836) for the standard alpha=1/beta=0
+        // C=A@B case; returns false until a shape is GPU-promoted, then falls to cuBLAS.
+        if (alpha == 1.0f && beta == 0.0f && TryDirectPtxGemm(A, B, C, M, K, N)) return;
         ApplyDeterministicGemmMathMode();
         float alphaVal = alpha;
         float betaVal = beta;
