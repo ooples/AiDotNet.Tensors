@@ -16,7 +16,7 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
             DirectPtxSparseGraphCompletionLedger.All
                 .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(3, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+        Assert.Equal(5, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
             entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
         Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
         Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
@@ -111,6 +111,37 @@ public sealed class DirectPtxSparseGraphTests
         Assert.False(PtxFusedSddmmF32Kernel.SupportsShape(1024, 1024, 32, 16384));
         Assert.False(PtxFusedSddmmF32Kernel.SupportsShape(1024, 1024, 64, 8192));
         Assert.False(PtxFusedSddmmF32Kernel.IsPromotedShape(1024, 1024, 64, 16384));
+    }
+
+    [Fact]
+    public void CsrSpmmBiasEmitter_FusesBiasIntoRegisterResidentVec4Reduction()
+    {
+        string ptx = PtxFusedCsrSpmmBiasVec4F32Kernel.EmitPtx(8, 6);
+
+        Assert.Contains(PtxFusedCsrSpmmBiasVec4F32Kernel.EntryPoint, ptx);
+        Assert.Equal(2, Count(ptx, "ld.global.v4.f32"));
+        Assert.Equal(4, Count(ptx, "fma.rn.f32"));
+        Assert.Equal(1, Count(ptx, "st.global.v4.f32"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.Equal(6, Count(ptx, ".param .u64"));
+    }
+
+    [Fact]
+    public void CsrSpmmBiasBlueprint_DeclaresExactBiasAndZeroWorkspace()
+    {
+        DirectPtxKernelBlueprint blueprint =
+            PtxFusedCsrSpmmBiasVec4F32Kernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere);
+
+        Assert.Equal(6, blueprint.Tensors.Count);
+        Assert.Equal(DirectPtxPhysicalLayout.Vector, blueprint.Tensors[4].Layout);
+        Assert.Equal(PtxFusedCsrSpmmBiasVec4F32Kernel.Columns,
+            blueprint.Tensors[4].PhysicalExtent.ElementCount);
+        Assert.All(blueprint.Tensors, tensor => Assert.Equal(DirectPtxExtentMode.Exact, tensor.ExtentMode));
+        Assert.Equal("bias-then-stored-row-order", blueprint.Semantics["reduction-order"]);
+        Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
+        Assert.Equal("0", blueprint.Semantics["intermediate-global-bytes"]);
     }
 
     [Theory]

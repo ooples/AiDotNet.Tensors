@@ -3838,6 +3838,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (!IsAvailable)
             throw new InvalidOperationException("CUDA backend is not available.");
 
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxCsrSpmmVec4F32(
+            csrValues, csrColIndices, csrRowPointers, denseB, output,
+            M, K, N, nnz))
+            return;
+#endif
+
         if (!_kernelCache.TryGetValue("csr_spmm_warp", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: csr_spmm_warp");
 
@@ -3987,6 +3994,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (!IsAvailable)
             throw new InvalidOperationException("CUDA backend is not available.");
+
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxCsrSpmmBiasVec4F32(
+            csrValues, csrColIndices, csrRowPointers, denseB, bias, output,
+            M, K, N, nnz))
+            return;
+#endif
 
         if (!_kernelCache.TryGetValue("csr_spmm_bias", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: csr_spmm_bias");

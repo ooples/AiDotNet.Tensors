@@ -34,6 +34,8 @@ public sealed partial class CudaBackend
         _directPtxCsrSpmmKernels = new(4);
     private readonly DirectPtxKernelCache<DirectPtxSddmmKey, PtxFusedSddmmF32Kernel>
         _directPtxSddmmKernels = new(4);
+    private readonly DirectPtxKernelCache<DirectPtxCsrSpmmKey, PtxFusedCsrSpmmBiasVec4F32Kernel>
+        _directPtxCsrSpmmBiasKernels = new(4);
     private DirectPtxRuntime? _directPtxRuntime;
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
@@ -49,6 +51,7 @@ public sealed partial class CudaBackend
     private long _directPtxQkvRopeCacheDispatchCount;
     private long _directPtxCsrSpmmDispatchCount;
     private long _directPtxSddmmDispatchCount;
+    private long _directPtxCsrSpmmBiasDispatchCount;
     internal int DirectPtxCachedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxAttentionKernels.Count; }
@@ -126,6 +129,8 @@ public sealed partial class CudaBackend
     {
         get { lock (_directPtxLock) return _directPtxSddmmKernels.PinnedCount; }
     }
+    internal long DirectPtxCsrSpmmBiasDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxCsrSpmmBiasDispatchCount);
 
     /// <summary>
     /// Attempts the exact FP32 CSR SpMM golden specialization. The admitted ABI
@@ -301,6 +306,151 @@ public sealed partial class CudaBackend
         lock (_directPtxLock)
         {
             if (_directPtxCsrSpmmKernels.TryGetValue(
+                new DirectPtxCsrSpmmKey(rows, inner, columns, nonZeros), out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null!;
+        return false;
+    }
+
+    /// <summary>
+    /// Attempts the exact fused FP32 CSR SpMM+bias specialization. Bias is
+    /// consumed before the sparse reduction and output is written once.
+    /// </summary>
+    internal bool TryDirectPtxCsrSpmmBiasVec4F32(
+        IGpuBuffer values,
+        IGpuBuffer columnIndices,
+        IGpuBuffer rowPointers,
+        IGpuBuffer dense,
+        IGpuBuffer bias,
+        IGpuBuffer output,
+        int rows,
+        int inner,
+        int columns,
+        int nonZeros)
+    {
+        if (!IsDirectPtxSparseGraphEnabled)
+        {
+            DirectPtxLastError = "csr-spmm-bias-specialization-not-enabled";
+            return false;
+        }
+        if (!PtxFusedCsrSpmmBiasVec4F32Kernel.SupportsShape(rows, inner, columns, nonZeros))
+        {
+            DirectPtxLastError = "csr-spmm-bias-shape-not-implemented";
+            return false;
+        }
+        if (values is null || columnIndices is null || rowPointers is null || dense is null ||
+            bias is null || output is null)
+        {
+            DirectPtxLastError = "csr-spmm-bias-null-buffer";
+            return false;
+        }
+        if (values.SizeInBytes != (long)nonZeros * sizeof(float) ||
+            columnIndices.SizeInBytes != (long)nonZeros * sizeof(int) ||
+            rowPointers.SizeInBytes != (long)(rows + 1) * sizeof(int) ||
+            dense.SizeInBytes != (long)inner * columns * sizeof(float) ||
+            bias.SizeInBytes != (long)columns * sizeof(float) ||
+            output.SizeInBytes != (long)rows * columns * sizeof(float))
+        {
+            DirectPtxLastError = "csr-spmm-bias-physical-extent-mismatch";
+            return false;
+        }
+        if (values.Handle == IntPtr.Zero || columnIndices.Handle == IntPtr.Zero ||
+            rowPointers.Handle == IntPtr.Zero || dense.Handle == IntPtr.Zero ||
+            bias.Handle == IntPtr.Zero || output.Handle == IntPtr.Zero)
+        {
+            DirectPtxLastError = "csr-spmm-bias-invalid-device-pointer";
+            return false;
+        }
+        if ((((nuint)values.Handle | (nuint)columnIndices.Handle | (nuint)rowPointers.Handle |
+              (nuint)dense.Handle | (nuint)bias.Handle | (nuint)output.Handle) & 15u) != 0)
+        {
+            DirectPtxLastError = "csr-spmm-bias-alignment-mismatch";
+            return false;
+        }
+        if (DirectPtxBuffersOverlap(output, values) ||
+            DirectPtxBuffersOverlap(output, columnIndices) ||
+            DirectPtxBuffersOverlap(output, rowPointers) ||
+            DirectPtxBuffersOverlap(output, dense) || DirectPtxBuffersOverlap(output, bias))
+        {
+            DirectPtxLastError = "csr-spmm-bias-alias-not-supported";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var key = new DirectPtxCsrSpmmKey(rows, inner, columns, nonZeros);
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxCsrSpmmBiasKernels.TryGetValue(key, out _))
+                {
+                    DirectPtxLastError =
+                        "Direct PTX CSR SpMM+bias must be prewarmed before CUDA graph capture.";
+                    return false;
+                }
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxFusedCsrSpmmBiasVec4F32Kernel kernel = _directPtxCsrSpmmBiasKernels.GetOrAdd(
+                    key, () => new PtxFusedCsrSpmmBiasVec4F32Kernel(_directPtxRuntime!));
+                if (capturing && !_directPtxCsrSpmmBiasKernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX CSR SpMM+bias module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(values, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(columnIndices, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(rowPointers, kernel.Blueprint.Tensors[2]),
+                        DirectPtxTensorView.Create(dense, kernel.Blueprint.Tensors[3]),
+                        DirectPtxTensorView.Create(bias, kernel.Blueprint.Tensors[4]),
+                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[5]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxCsrSpmmBiasDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool PrewarmDirectPtxCsrSpmmBiasVec4F32(
+        int rows, int inner, int columns, int nonZeros)
+    {
+        if (!IsDirectPtxSparseGraphEnabled || IsStreamCapturing() ||
+            !PtxFusedCsrSpmmBiasVec4F32Kernel.SupportsShape(rows, inner, columns, nonZeros))
+            return false;
+        try
+        {
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                var key = new DirectPtxCsrSpmmKey(rows, inner, columns, nonZeros);
+                _ = _directPtxCsrSpmmBiasKernels.GetOrAdd(
+                    key, () => new PtxFusedCsrSpmmBiasVec4F32Kernel(_directPtxRuntime!));
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxCsrSpmmBiasAudit(
+        int rows, int inner, int columns, int nonZeros, out DirectPtxKernelAudit audit)
+    {
+        lock (_directPtxLock)
+        {
+            if (_directPtxCsrSpmmBiasKernels.TryGetValue(
                 new DirectPtxCsrSpmmKey(rows, inner, columns, nonZeros), out var kernel))
             {
                 audit = kernel.Audit;
@@ -2152,6 +2302,7 @@ public sealed partial class CudaBackend
             _directPtxQkvRopeCacheKernels.Dispose();
             _directPtxCsrSpmmKernels.Dispose();
             _directPtxSddmmKernels.Dispose();
+            _directPtxCsrSpmmBiasKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }
