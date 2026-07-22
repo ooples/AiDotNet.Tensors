@@ -306,6 +306,17 @@ internal static class DirectPtxGeGluExperiment
             $"{e2e.Mean,6:F2}/{e2e.Median,6:F2}/{e2e.P95,6:F2}/{e2e.P99,6:F2}   " +
             $"{gflops,7:F1} {bandwidth,5:F1} {allocation,6} {temporaryBytes,4} " +
             $"{error,8:E1} {resources}");
+        var c = System.Globalization.CultureInfo.InvariantCulture;
+        int localBytes = audit?.Function.LocalBytesPerThread ?? -1;
+        Console.WriteLine(
+            "glu_evidence_json={" +
+            $"\"rows\":{outerSize},\"columns\":{halfDimension}," +
+            $"\"method\":\"{method}\"," +
+            $"\"median_us\":{device.Median.ToString("R", c)}," +
+            $"\"p95_us\":{device.P95.ToString("R", c)}," +
+            $"\"managed_bytes\":{allocation},\"temp_bytes\":{temporaryBytes}," +
+            $"\"max_error\":{error.ToString("R", c)},\"local_bytes\":{localBytes}" +
+            "}");
     }
 
     private static float[] Oracle(float[] input, int outerSize, int halfDimension)
