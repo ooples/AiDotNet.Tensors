@@ -29,6 +29,8 @@ public sealed partial class CudaBackend
         _directPtxFlashAttentionBackwardKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<DirectPtxQkvRopeCacheKey, PtxFusedQkvRopeCacheD64Kernel>
         _directPtxQkvRopeCacheKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<DirectPtxVisionBoxIouKey, PtxFusedPairwiseBoxIouF32Kernel>
+        _directPtxVisionBoxIouKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private DirectPtxRuntime? _directPtxRuntime;
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
@@ -42,6 +44,7 @@ public sealed partial class CudaBackend
     private long _directPtxAttentionBackwardDispatchCount;
     private long _directPtxFlashAttentionBackwardDispatchCount;
     private long _directPtxQkvRopeCacheDispatchCount;
+    private long _directPtxVisionBoxIouDispatchCount;
     internal int DirectPtxCachedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxAttentionKernels.Count; }
@@ -100,6 +103,191 @@ public sealed partial class CudaBackend
     internal int DirectPtxQkvRopeCachePinnedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxQkvRopeCacheKernels.PinnedCount; }
+    }
+
+    internal bool IsDirectPtxVisionBoxIouEnabled =>
+        DirectPtxFeatureGate.IsVisionBoxIouEnabled && IsAvailable &&
+        DirectPtxArchitecture.HasValidatedVisionBoxIou(_ccMajor, _ccMinor);
+    internal long DirectPtxVisionBoxIouDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxVisionBoxIouDispatchCount);
+    internal int DirectPtxVisionBoxIouKernelCapacity => _directPtxVisionBoxIouKernels.Capacity;
+    internal int DirectPtxVisionBoxIouPinnedKernelCount
+    {
+        get { lock (_directPtxLock) return _directPtxVisionBoxIouKernels.PinnedCount; }
+    }
+
+    /// <summary>
+    /// Attempts an exact contiguous FP32 pairwise-XYXY-IoU specialization.
+    /// Its pointer-only ABI contains no runtime shape, layout, or stride data.
+    /// </summary>
+    internal bool TryDirectPtxVisionBoxIou(
+        IGpuBuffer boxesA,
+        IGpuBuffer boxesB,
+        IGpuBuffer output,
+        int n,
+        int m)
+    {
+        if (!ValidateDirectPtxVisionBoxIouEligibility(n, m)) return false;
+        if (boxesA is null || boxesB is null || output is null)
+        {
+            DirectPtxLastError = "vision-box-iou-null-buffer";
+            return false;
+        }
+
+        long boxesABytes = checked((long)n * 4 * sizeof(float));
+        long boxesBBytes = checked((long)m * 4 * sizeof(float));
+        long outputBytes = checked((long)n * m * sizeof(float));
+        if (boxesA.SizeInBytes != boxesABytes || boxesB.SizeInBytes != boxesBBytes ||
+            output.SizeInBytes != outputBytes)
+        {
+            DirectPtxLastError = "vision-box-iou-physical-extent-mismatch";
+            return false;
+        }
+        if (boxesA.Handle == IntPtr.Zero || boxesB.Handle == IntPtr.Zero ||
+            output.Handle == IntPtr.Zero)
+        {
+            DirectPtxLastError = "vision-box-iou-invalid-device-pointer";
+            return false;
+        }
+        if ((((nuint)boxesA.Handle | (nuint)boxesB.Handle | (nuint)output.Handle) & 15u) != 0)
+        {
+            DirectPtxLastError = "vision-box-iou-alignment-mismatch";
+            return false;
+        }
+        if (DirectPtxVisionBoxIouOutputOverlaps(boxesA, boxesB, output))
+        {
+            DirectPtxLastError = "vision-box-iou-alias-not-supported";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var key = new DirectPtxVisionBoxIouKey(n, m);
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxVisionBoxIouKernels.TryGetValue(key, out _))
+                {
+                    DirectPtxLastError =
+                        "Direct PTX pairwise BoxIoU must be prewarmed before CUDA graph capture.";
+                    return false;
+                }
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxFusedPairwiseBoxIouF32Kernel kernel = GetOrCreateVisionBoxIouKernel(key);
+                if (capturing && !_directPtxVisionBoxIouKernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX pairwise BoxIoU module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(boxesA, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(boxesB, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[2]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxVisionBoxIouDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    private PtxFusedPairwiseBoxIouF32Kernel GetOrCreateVisionBoxIouKernel(
+        DirectPtxVisionBoxIouKey key)
+    {
+        if (_directPtxVisionBoxIouKernels.TryGetValue(key, out var existing))
+            return existing;
+        return CreateAndCacheVisionBoxIouKernelSlow(key);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxFusedPairwiseBoxIouF32Kernel CreateAndCacheVisionBoxIouKernelSlow(
+        DirectPtxVisionBoxIouKey key) =>
+        _directPtxVisionBoxIouKernels.GetOrAdd(key, () =>
+            new PtxFusedPairwiseBoxIouF32Kernel(_directPtxRuntime!, key.N, key.M));
+
+    internal bool PrewarmDirectPtxVisionBoxIou(int n, int m)
+    {
+        if (!ValidateDirectPtxVisionBoxIouEligibility(n, m)) return false;
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX pairwise BoxIoU prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _ = GetOrCreateVisionBoxIouKernel(new DirectPtxVisionBoxIouKey(n, m));
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    private bool ValidateDirectPtxVisionBoxIouEligibility(int n, int m)
+    {
+        if (!DirectPtxFeatureGate.IsVisionBoxIouEnabled)
+        {
+            DirectPtxLastError = "vision-box-iou-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "vision-box-iou-backend-unavailable";
+            return false;
+        }
+        if (!DirectPtxArchitecture.HasValidatedVisionBoxIou(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = "vision-box-iou-architecture-not-implemented";
+            return false;
+        }
+        if (!PtxFusedPairwiseBoxIouF32Kernel.IsSupportedShape(n, m))
+        {
+            DirectPtxLastError = "vision-box-iou-shape-not-implemented";
+            return false;
+        }
+        return true;
+    }
+
+    private static bool DirectPtxVisionBoxIouOutputOverlaps(
+        IGpuBuffer boxesA, IGpuBuffer boxesB, IGpuBuffer output) =>
+        Overlaps(output, boxesA) || Overlaps(output, boxesB);
+
+    private static bool Overlaps(IGpuBuffer left, IGpuBuffer right)
+    {
+        nuint leftStart = (nuint)left.Handle;
+        nuint rightStart = (nuint)right.Handle;
+        nuint leftEnd = checked(leftStart + (nuint)left.SizeInBytes);
+        nuint rightEnd = checked(rightStart + (nuint)right.SizeInBytes);
+        return leftStart < rightEnd && rightStart < leftEnd;
+    }
+
+    internal bool TryGetDirectPtxVisionBoxIouAudit(
+        int n, int m, out DirectPtxKernelAudit audit)
+    {
+        lock (_directPtxLock)
+        {
+            if (_directPtxVisionBoxIouKernels.TryGetValue(
+                new DirectPtxVisionBoxIouKey(n, m), out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null!;
+        return false;
     }
 
     /// <summary>
@@ -1786,6 +1974,8 @@ public sealed partial class CudaBackend
             _directPtxAttentionBackwardKernels.Dispose();
             _directPtxFlashAttentionBackwardKernels.Dispose();
             _directPtxQkvRopeCacheKernels.Dispose();
+            _directPtxVisionBoxIouKernels.Dispose();
+            _directPtxVisionKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }
@@ -1852,5 +2042,6 @@ public sealed partial class CudaBackend
         int Heads,
         int CacheCapacity,
         int Position);
+    private readonly record struct DirectPtxVisionBoxIouKey(int N, int M);
 
 }

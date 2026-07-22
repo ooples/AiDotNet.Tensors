@@ -4,6 +4,9 @@
 // _kernelCache, dispatched via 256-thread block / grid-ceil.
 
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
+#if NET5_0_OR_GREATER
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+#endif
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
@@ -39,20 +42,50 @@ public sealed partial class CudaBackend : IDetectionBackend
     }
 
     public unsafe void BoxIou(IGpuBuffer boxesA, IGpuBuffer boxesB, IGpuBuffer output, int n, int m)
-        => DispatchPairwiseIou("detection_box_iou", boxesA, boxesB, output, n, m);
+    {
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxVisionBoxIou(boxesA, boxesB, output, n, m)) return;
+#endif
+        DispatchPairwiseIou("detection_box_iou", boxesA, boxesB, output, n, m);
+    }
 
     public unsafe void GeneralizedBoxIou(IGpuBuffer boxesA, IGpuBuffer boxesB, IGpuBuffer output, int n, int m)
-        => DispatchPairwiseIou("detection_generalized_box_iou", boxesA, boxesB, output, n, m);
+    {
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxVisionPairwise(
+                DirectPtxVisionOperation.GeneralizedBoxIou,
+                boxesA, boxesB, output, n, m)) return;
+#endif
+        DispatchPairwiseIou("detection_generalized_box_iou", boxesA, boxesB, output, n, m);
+    }
 
     public unsafe void DistanceBoxIou(IGpuBuffer boxesA, IGpuBuffer boxesB, IGpuBuffer output, int n, int m)
-        => DispatchPairwiseIou("detection_distance_box_iou", boxesA, boxesB, output, n, m);
+    {
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxVisionPairwise(
+                DirectPtxVisionOperation.DistanceBoxIou,
+                boxesA, boxesB, output, n, m)) return;
+#endif
+        DispatchPairwiseIou("detection_distance_box_iou", boxesA, boxesB, output, n, m);
+    }
 
     public unsafe void CompleteBoxIou(IGpuBuffer boxesA, IGpuBuffer boxesB, IGpuBuffer output, int n, int m)
-        => DispatchPairwiseIou("detection_complete_box_iou", boxesA, boxesB, output, n, m);
+    {
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxVisionPairwise(
+                DirectPtxVisionOperation.CompleteBoxIou,
+                boxesA, boxesB, output, n, m)) return;
+#endif
+        DispatchPairwiseIou("detection_complete_box_iou", boxesA, boxesB, output, n, m);
+    }
 
     public unsafe void BoxArea(IGpuBuffer boxes, IGpuBuffer output, int n)
     {
         if (n <= 0) return;
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxVisionVector(
+                DirectPtxVisionOperation.BoxArea, boxes, output, null, n)) return;
+#endif
         var kernel = ResolveDetectionKernel("detection_box_area");
         using var _ = PushContext();
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -72,6 +105,10 @@ public sealed partial class CudaBackend : IDetectionBackend
         if ((uint)fromFormat > 2 || (uint)toFormat > 2)
             throw new ArgumentException(
                 $"fromFormat/toFormat must be 0 (XYXY), 1 (XYWH), or 2 (CXCYWH); got {fromFormat}, {toFormat}.");
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxVisionBoxConvert(
+                boxes, output, n, fromFormat, toFormat)) return;
+#endif
         var kernel = ResolveDetectionKernel("detection_box_convert");
         using var _ = PushContext();
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -92,6 +129,11 @@ public sealed partial class CudaBackend : IDetectionBackend
         // zero, which is the correct gradient. Skipping would leak stale
         // pooled-buffer values into autodiff.
         if (n <= 0 && m <= 0) return;
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxVisionIouFamilyBackward(
+                gradOutput, boxesA, boxesB, gradA, gradB, n, m, variant))
+            return;
+#endif
         var kernelA = ResolveDetectionKernel("detection_iou_backward_a");
         var kernelB = ResolveDetectionKernel("detection_iou_backward_b");
         using var _ = PushContext();

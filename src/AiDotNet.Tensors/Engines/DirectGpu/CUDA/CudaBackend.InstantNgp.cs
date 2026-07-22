@@ -1,3 +1,7 @@
+#if NET5_0_OR_GREATER
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+#endif
+
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 public sealed partial class CudaBackend : IInstantNgpBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
@@ -280,6 +284,11 @@ public sealed partial class CudaBackend : IInstantNgpBackend, IUniqueConsecutive
         int batched)
     {
         if (length <= 0) return;
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxVisionNms(
+                boxes, scores, classIds, suppressed, outputCapacity, outputCount,
+                length, iouThreshold, batched != 0)) return;
+#endif
         var kernel = ResolveInstantNgpKernel("resident_nms");
         using var _ = PushContext();
         IntPtr b = boxes.Handle, s = scores.Handle, c = classIds.Handle;
