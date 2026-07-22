@@ -5930,4 +5930,148 @@ public sealed partial class CudaBackend
         return _directPtxConvTranspose3D3x3x3BwdWeightKernels.GetOrAdd(
             1, () => new PtxConvTranspose3DNcdhw3x3x3BackwardWeightF32Kernel(runtime));
     }
+
+    private readonly DirectPtxKernelCache<int, PtxIm2colKNFp16Nchw3x3Kernel>
+        _directPtxIm2colKNFp16Kernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private long _directPtxIm2colKNFp16DispatchCount;
+
+    internal long DirectPtxIm2colKNFp16DispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxIm2colKNFp16DispatchCount);
+
+    /// <summary>
+    /// Attempts the exact FP32-to-FP16 im2col experiment producing a row-major [K, N]
+    /// FP16 patch matrix for Tensor-Core GEMM preparation. Validated by byte extent. Fails
+    /// closed on any unsupported contract so the caller runs the established composition.
+    /// </summary>
+    internal bool TryDirectPtxIm2colKNFp16(
+        IGpuBuffer input,
+        IGpuBuffer output)
+    {
+        if (!_directPtxConvolutionOptedIn)
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.FeatureDisabled;
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.BackendUnavailable;
+            return false;
+        }
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.ArchitectureNotImplemented;
+            return false;
+        }
+        if (input is null || output is null)
+        {
+            DirectPtxLastError = "im2col-kn-fp16-null-buffer";
+            return false;
+        }
+        if (input.SizeInBytes != PtxIm2colKNFp16Nchw3x3Kernel.InputBytes ||
+            output.SizeInBytes != PtxIm2colKNFp16Nchw3x3Kernel.OutputBytes)
+        {
+            DirectPtxLastError = "im2col-kn-fp16-exact-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            const int key = 1;
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxIm2colKNFp16Kernels.TryGetValue(key, out _))
+                {
+                    DirectPtxLastError =
+                        "Direct PTX Im2col-KN-FP16 must be prewarmed before CUDA graph capture.";
+                    return false;
+                }
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxIm2colKNFp16Nchw3x3Kernel kernel = GetOrCreateDirectPtxIm2colKNFp16Kernel();
+                if (capturing && !_directPtxIm2colKNFp16Kernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX Im2col-KN-FP16 module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[1]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxIm2colKNFp16DispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool PrewarmDirectPtxIm2colKNFp16()
+    {
+        if (!_directPtxConvolutionOptedIn)
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.FeatureDisabled;
+            return false;
+        }
+        if (!IsAvailable || !DirectPtxArchitecture.HasExperimentalConvolution(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.ArchitectureNotImplemented;
+            return false;
+        }
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX Im2col-KN-FP16 prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _ = GetOrCreateDirectPtxIm2colKNFp16Kernel();
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxIm2colKNFp16Audit(out DirectPtxKernelAudit? audit)
+    {
+        lock (_directPtxLock)
+        {
+            if (_directPtxIm2colKNFp16Kernels.TryGetValue(1, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null;
+        return false;
+    }
+
+    private PtxIm2colKNFp16Nchw3x3Kernel GetOrCreateDirectPtxIm2colKNFp16Kernel()
+    {
+        if (_directPtxIm2colKNFp16Kernels.TryGetValue(
+                1, out PtxIm2colKNFp16Nchw3x3Kernel? existing))
+            return existing;
+        return CreateAndCacheDirectPtxIm2colKNFp16KernelSlow();
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxIm2colKNFp16Nchw3x3Kernel CreateAndCacheDirectPtxIm2colKNFp16KernelSlow()
+    {
+        DirectPtxRuntime runtime = _directPtxRuntime ??
+            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+        return _directPtxIm2colKNFp16Kernels.GetOrAdd(
+            1, () => new PtxIm2colKNFp16Nchw3x3Kernel(runtime));
+    }
 }

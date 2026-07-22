@@ -3895,6 +3895,92 @@ public sealed class DirectPtxConvolutionTests
             $"ConvTranspose3D 3x3x3 backward-weight max absolute error {maxAbsoluteError:G9}.");
     }
 
+    [Fact]
+    public void Im2colKNFp16Emitter_IsFp16ProducingGatherSm86Ptx()
+    {
+        string ptx = PtxIm2colKNFp16Nchw3x3Kernel.EmitPtx(8, 6);
+
+        Assert.Contains(".target sm_86", ptx, StringComparison.Ordinal);
+        Assert.Contains(PtxIm2colKNFp16Nchw3x3Kernel.EntryPoint, ptx, StringComparison.Ordinal);
+        Assert.Equal(2, Count(ptx, ".param .u64"));
+        // Two divides decompose k (k/9, tap/3); one FP16 conversion + one 2-byte store.
+        Assert.Equal(2, Count(ptx, "div.u32"));
+        Assert.Equal(1, Count(ptx, "cvt.rn.f16.f32"));
+        Assert.Equal(1, Count(ptx, "st.global.b16"));
+        Assert.Equal(0, Count(ptx, "fma.rn.f32"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("atom", ptx, StringComparison.Ordinal);
+        Assert.Throws<NotSupportedException>(() =>
+            PtxIm2colKNFp16Nchw3x3Kernel.EmitPtx(8, 9));
+    }
+
+    [Fact]
+    public void Im2colKNFp16ManifestCell_IsExperimentalWithDedicatedRoute()
+    {
+        Assert.Equal(DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxConvolutionCoverageManifest.Get("CudaBackend.Im2colKNFp16").Status);
+        Assert.Equal(DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxConvolutionCoverageManifest
+                .Get("CudaBackend.TryDirectPtxIm2colKNFp16").Status);
+    }
+
+    [SkippableFact]
+    public void DriverOnlyIm2colKNFp16_MatchesCpuReference()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "Requires the experimental SM86 convolution specialization.");
+
+        const int inChannels = PtxIm2colKNFp16Nchw3x3Kernel.InputChannels;
+        const int height = PtxIm2colKNFp16Nchw3x3Kernel.Height;
+        const int width = PtxIm2colKNFp16Nchw3x3Kernel.Width;
+        const int kernelSize = PtxIm2colKNFp16Nchw3x3Kernel.KernelSize;
+        const int patchDim = PtxIm2colKNFp16Nchw3x3Kernel.PatchDim;   // K
+        const int n = PtxIm2colKNFp16Nchw3x3Kernel.SpatialElements;   // N
+        int spatial = height * width;
+
+        using var kernel = new PtxIm2colKNFp16Nchw3x3Kernel(runtime);
+        using var inputDevice = runtime.AllocateBytes((nuint)PtxIm2colKNFp16Nchw3x3Kernel.InputBytes);
+        using var outputDevice = runtime.AllocateBytes((nuint)PtxIm2colKNFp16Nchw3x3Kernel.OutputBytes);
+
+        Random random = AiDotNet.Tensors.Helpers.RandomHelper.CreateSecureRandom();
+        var input = new float[inChannels * spatial];
+        for (int i = 0; i < input.Length; i++) input[i] = (float)(random.NextDouble() * 2 - 1);
+        inputDevice.Upload<float>(input);
+
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(inputDevice, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(outputDevice, kernel.Blueprint.Tensors[1]));
+        runtime.Synchronize();
+        var actual = new ushort[patchDim * n];
+        outputDevice.Download<ushort>(actual);
+
+        int mismatches = 0;
+        for (int k = 0; k < patchDim; k++)
+        {
+            int ci = k / (kernelSize * kernelSize);
+            int tap = k % (kernelSize * kernelSize);
+            int ky = tap / kernelSize;
+            int kx = tap % kernelSize;
+            for (int col = 0; col < n; col++)
+            {
+                int oy = col / width;
+                int ox = col % width;
+                int iy = oy + ky - 1;
+                int ix = ox + kx - 1;
+                float val = (iy < 0 || iy >= height || ix < 0 || ix >= width)
+                    ? 0f
+                    : input[ci * spatial + (iy * width + ix)];
+                ushort expected = BitConverter.HalfToUInt16Bits((Half)val);
+                if (actual[k * n + col] != expected) mismatches++;
+            }
+        }
+
+        Assert.Equal(0, mismatches);
+    }
+
     private static string? Validate(
         bool enabled, bool available, int major, int minor,
         DirectPtxConvolutionShape shape, IGpuBuffer? input, IGpuBuffer? weights,
