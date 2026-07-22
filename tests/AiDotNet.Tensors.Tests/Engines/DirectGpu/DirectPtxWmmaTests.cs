@@ -2265,6 +2265,58 @@ public class DirectPtxWmmaTests
             DirectPtxDenseLinearCoverageManifest.Get("UnassignedDenseLinearApi"));
     }
 
+    [SkippableFact]
+    public void Backend_DirectPtxGemm_PrewarmsDispatchesAndAudits()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previous = DirectPtxFeatureGate.TestOverride;
+        bool previousExperiment = DirectPtxFeatureGate.FusedLinearExperimentOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        DirectPtxFeatureGate.FusedLinearExperimentOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxFusedLinearEnabled, "Requires a validated Ampere CUDA backend.");
+            const int m = 64, k = 256, n = 256;
+
+            // Prewarm compiles/caches the module; the audit proves the zero-scratch contract.
+            Assert.True(backend.PrewarmDirectPtxGemm(m, k, n), backend.DirectPtxLastError);
+            Assert.True(backend.TryGetDirectPtxGemmAudit(m, k, n, out DirectPtxKernelAudit audit));
+            Assert.Equal(0, audit.Function.LocalBytesPerThread);
+            Assert.Equal(64, audit.PtxSha256.Length);
+
+            var random = RandomHelper.CreateSeededRandom(20264400);
+            float[] aHost = Values(random, m * k, 0.125f);
+            float[] bHost = Values(random, k * n, 0.0625f);
+            var expected = new float[m * n];
+            for (int row = 0; row < m; row++)
+            for (int col = 0; col < n; col++)
+            {
+                double acc = 0;
+                for (int kk = 0; kk < k; kk++) acc += aHost[row * k + kk] * (double)bHost[kk * n + col];
+                expected[row * n + col] = (float)acc;
+            }
+
+            using var a = backend.AllocateBuffer(aHost);
+            using var b = backend.AllocateBuffer(bHost);
+            using var c = backend.AllocateBuffer(m * n);
+            long before = backend.DirectPtxGemmDispatchCount;
+            Assert.True(backend.TryDirectPtxGemm(a, b, c, m, k, n), backend.DirectPtxLastError);
+            backend.Synchronize();
+            Assert.True(backend.DirectPtxGemmDispatchCount > before);
+            AssertVectorClose(backend.DownloadBuffer(c), expected, 2e-3f, "backend direct-ptx gemm");
+
+            // The public MatMul path routes through the same fail-closed guard.
+            using var mm = backend.MatMul(a, b, m, n, k);
+            AssertVectorClose(backend.DownloadBuffer(mm), expected, 2e-3f, "backend MatMul via direct-ptx");
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previous;
+            DirectPtxFeatureGate.FusedLinearExperimentOverride = previousExperiment;
+        }
+    }
+
     [Fact]
     public void FusedLinearTiledEmitter_IsRegisterResidentTiledGemm()
     {
