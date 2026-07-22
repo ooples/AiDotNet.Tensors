@@ -260,7 +260,7 @@ internal sealed record DirectPtxProfilerEvidence(
         var values = new Dictionary<string, long>(StringComparer.Ordinal);
         string[][] rows = File.ReadLines(path).Select(ParseCsvLine).ToArray();
 
-        // Nsight Compute 2026.2 raw CSV is column-oriented: metric names are
+        // Current Nsight Compute raw CSV is column-oriented: metric names are
         // headers and every following data row is a kernel launch. Preserve
         // support for the older row-oriented export below as well.
         for (int rowIndex = 0; rowIndex < rows.Length; rowIndex++)

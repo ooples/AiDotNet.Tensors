@@ -81,6 +81,44 @@ public static class PtxParityRegistry
         new PtxParitySpec("PtxFusedQkvRopeCacheD64Kernel", PtxParityStatus.Deferred,
             "fused QKV + RoPE + KV-cache write (#858)",
             "multi-output (Q + K/V cache) with baked RoPE tables; needs a dedicated QKV/RoPE/cache oracle."),
+        new PtxParitySpec("PtxFusedLinearGeluM1Kernel", PtxParityStatus.Deferred,
+            "FusedLinearGELUTransposedM1 (#836)",
+            "driver-only PTX-vs-fp64-oracle and public-route tests exist, but the output-major weight " +
+            "contract has no equivalent existing-CUDA public route in the parity harness yet; add that " +
+            "layout-explicit baseline before classifying this as three-way parity."),
+        new PtxParitySpec("PtxFusedLinearTiledKernel", PtxParityStatus.Deferred,
+            "general-M fused linear + bias + activation (#836)",
+            "driver-only PTX-vs-fp64-oracle coverage exists for None, ReLU, and GELU. The tiled route is " +
+            "not production-promoted until its resident three-way championship matrix passes, so the " +
+            "current-CUDA arm remains intentionally outside the parity runner."),
+        new PtxParitySpec("PtxDenseVectorKernel", PtxParityStatus.Deferred,
+            "dot and outer products (#836)",
+            "direct PTX driver/public-route oracle coverage exists; the current-CUDA comparison and " +
+            "resident release-evidence matrix must pass before promotion to three-way parity."),
+        new PtxParitySpec("PtxFusedLoRAKernel", PtxParityStatus.Deferred,
+            "FusedLoRAForward (#836)",
+            "direct PTX oracle and public-route coverage exists; the current NVRTC and PyTorch GPU " +
+            "championship arms remain required before production promotion."),
+        new PtxParitySpec("PtxFusedLinearBackwardKernel", PtxParityStatus.Deferred,
+            "fused linear activation backward family (#836)",
+            "direct PTX covers dInput, dWeight, and dBias without a global masked-gradient tensor; " +
+            "the five-activation current-CUDA championship matrix is still required for promotion."),
+        new PtxParitySpec("PtxBatchedVectorKernel", PtxParityStatus.Deferred,
+            "batched dot and batched outer products (#836)",
+            "direct PTX oracle/public-route coverage exists; the current-CUDA three-way evidence " +
+            "matrix remains required before production promotion."),
+        new PtxParitySpec("PtxStridedDotKernel", PtxParityStatus.Deferred,
+            "explicitly strided dot product (#836)",
+            "direct PTX bakes offset/step and the valid interval; current-CUDA three-way evidence " +
+            "remains required before production promotion."),
+        new PtxParitySpec("PtxFusedLinearCrossEntropyKernel", PtxParityStatus.Deferred,
+            "fused linear cross entropy, index and dense targets (#836)",
+            "direct PTX keeps logits register-only; current-CUDA and PyTorch championship evidence " +
+            "remains required before production promotion."),
+        new PtxParitySpec("PtxFp16GemmKernel", PtxParityStatus.Deferred,
+            "FP16/BF16 GEMM, fanout, conversion, and transpose-free backward (#836)",
+            "direct PTX exact-shape correctness baseline exists; Tensor-Core championship " +
+            "specializations and three-way evidence remain required before production promotion."),
     };
 
     private static readonly Dictionary<string, PtxParitySpec> ByKernel =

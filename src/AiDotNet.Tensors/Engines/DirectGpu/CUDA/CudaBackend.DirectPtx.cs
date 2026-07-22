@@ -382,6 +382,12 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "fused-linear-performance-gate-not-met";
             return false;
         }
+        if (DirectPtxBufferIsInvalid(input) || DirectPtxBufferIsInvalid(weights) ||
+            DirectPtxBufferIsInvalid(bias) || DirectPtxBufferIsInvalid(output))
+        {
+            DirectPtxLastError = "fused-linear-null-or-invalid-buffer";
+            return false;
+        }
         long inputBytes = checked((long)inputFeatures * sizeof(float));
         long outputBytes = checked((long)outputFeatures * sizeof(float));
         long weightBytes = checked((long)inputFeatures * outputFeatures * sizeof(float));
@@ -389,6 +395,13 @@ public sealed partial class CudaBackend
             bias.SizeInBytes != outputBytes || output.SizeInBytes != outputBytes)
         {
             DirectPtxLastError = "fused-linear-physical-extent-mismatch";
+            return false;
+        }
+        if (DirectPtxBuffersOverlap(output, input) ||
+            DirectPtxBuffersOverlap(output, weights) ||
+            DirectPtxBuffersOverlap(output, bias))
+        {
+            DirectPtxLastError = "fused-linear-output-alias-not-supported";
             return false;
         }
 
@@ -1953,6 +1966,13 @@ public sealed partial class CudaBackend
             _directPtxQkvRopeCacheKernels.Dispose();
             _directPtxFusedLinearKernels.Dispose();
             _directPtxFusedLinearTiledKernels.Dispose();
+            _directPtxDenseVectorKernels.Dispose();
+            _directPtxBatchedVectorKernels.Dispose();
+            _directPtxStridedDotKernels.Dispose();
+            _directPtxCrossEntropyKernels.Dispose();
+            _directPtxFp16GemmKernels.Dispose();
+            _directPtxLoRAKernels.Dispose();
+            _directPtxLinearBackwardKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }

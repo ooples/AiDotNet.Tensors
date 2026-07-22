@@ -7,6 +7,7 @@ param(
     [switch]$SkipExternal,
     [switch]$Issue834Only,
     [switch]$Issue835Only,
+    [switch]$Issue836Only,
     [ValidateRange(0, 10)]
     [int]$ContaminationRetries = 4,
     [switch]$AllowDirty
@@ -167,6 +168,210 @@ function Assert-QkvReleaseGate([string]$Root, [int]$RunCount, [bool]$IncludeExte
     } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $gatePath -Encoding utf8
 }
 
+function Read-DenseLinearDotnetRows([string]$Path) {
+    $prefix = 'dense_linear_evidence_json='
+    return @(Get-Content -LiteralPath $Path | Where-Object {
+        $_.StartsWith($prefix, [StringComparison]::Ordinal)
+    } | ForEach-Object {
+        $_.Substring($prefix.Length) | ConvertFrom-Json
+    })
+}
+
+function Write-DenseLinearMarkdown(
+    [string]$Root,
+    [object[]]$Rows,
+    [object[]]$Verdicts,
+    [int]$RunCount,
+    [bool]$IncludeExternal) {
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add('# Issue #836 direct-PTX dense/linear evidence')
+    $lines.Add('')
+    $lines.Add("Generated from $RunCount independent clean process runs; each cell uses 30 warmups, 101 samples, and 10 launches per CUDA-event sample.")
+    $lines.Add('Latency columns are device-event measurements unless prefixed E2E. Rate is shown as TFLOPS / GFLOPS. R/S/L/B means registers/thread, static shared bytes, local bytes/thread, and active blocks/SM.')
+    $lines.Add('')
+    $lines.Add('## Promotion gate')
+    $lines.Add('')
+    $lines.Add('| Operation | Strongest eligible competitor(s) | min device speedup | min E2E speedup | max P95 ratio | timing verdict |')
+    $lines.Add('|---|---|---:|---:|---:|---|')
+    foreach ($operation in @($Rows.operation | Sort-Object -Unique)) {
+        $operationVerdicts = @($Verdicts | Where-Object { $_.operation -eq $operation })
+        $strongest = @($operationVerdicts.strongest_competitor | Sort-Object -Unique) -join ' / '
+        $minDevice = ($operationVerdicts.device_median_speedup | Measure-Object -Minimum).Minimum
+        $minE2e = ($operationVerdicts.e2e_median_speedup | Measure-Object -Minimum).Minimum
+        $maxP95 = ($operationVerdicts.device_p95_ratio | Measure-Object -Maximum).Maximum
+        $passed = @($operationVerdicts | Where-Object { -not $_.timing_gate_passed }).Count -eq 0
+        $verdict = if ($passed) { '**TIMING PASS**' } else { 'FAIL - remains experimental' }
+        $lines.Add("| $operation | $strongest | $('{0:F2}x' -f $minDevice) | $('{0:F2}x' -f $minE2e) | $('{0:F2}x' -f $maxP95) | $verdict |")
+    }
+
+    $lines.Add('')
+    $lines.Add('## Full grouped results')
+    foreach ($operation in @($Rows.operation | Sort-Object -Unique)) {
+        $operationRows = @($Rows | Where-Object { $_.operation -eq $operation })
+        $shape = $operationRows[0].shape
+        $methodGroups = @($operationRows | Group-Object method)
+        $winner = $methodGroups | Sort-Object {
+            (@($_.Group.device_median_us) | Measure-Object -Average).Average
+        } | Select-Object -First 1
+        $lines.Add('')
+        $lines.Add("### $operation - $shape")
+        $lines.Add('')
+        $lines.Add('| Method | med R1/R2/R3 us | worst P95 | worst P99 | avg mean | E2E med R1/R2/R3 | E2E worst P95 | E2E worst P99 | E2E avg mean | TFLOPS / GFLOPS | managed B | temp B | max error | R/S/L/B | verdict |')
+        $lines.Add('|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|')
+        foreach ($methodGroup in $methodGroups) {
+            $group = @($methodGroup.Group | Sort-Object evidence_run)
+            $method = $methodGroup.Name
+            if ($methodGroup.Name -eq $winner.Name) { $method = "**$method - WINNER**" }
+            $deviceMedians = @($group | ForEach-Object { '{0:F2}' -f [double]$_.device_median_us }) -join '/'
+            $e2eMedians = @($group | ForEach-Object { '{0:F2}' -f [double]$_.e2e_median_us }) -join '/'
+            $worstP95 = ($group.device_p95_us | Measure-Object -Maximum).Maximum
+            $worstP99 = ($group.device_p99_us | Measure-Object -Maximum).Maximum
+            $mean = ($group.device_mean_us | Measure-Object -Average).Average
+            $worstE2eP95 = ($group.e2e_p95_us | Measure-Object -Maximum).Maximum
+            $worstE2eP99 = ($group.e2e_p99_us | Measure-Object -Maximum).Maximum
+            $e2eMean = ($group.e2e_mean_us | Measure-Object -Average).Average
+            $rates = @($group.gflops | Sort-Object)
+            $gflops = [double]$rates[[Math]::Floor($rates.Count / 2)]
+            $managedValues = @($group | Where-Object { $null -ne $_.managed_bytes } |
+                ForEach-Object { [long]$_.managed_bytes })
+            $managed = if ($managedValues.Count -eq 0) { 'n/a' } else {
+                [string](($managedValues | Measure-Object -Maximum).Maximum)
+            }
+            $tempValues = @($group | Where-Object { $null -ne $_.temporary_device_bytes } |
+                ForEach-Object { [long]$_.temporary_device_bytes })
+            $temp = if ($tempValues.Count -eq 0) { 'n/a' } else {
+                [string](($tempValues | Measure-Object -Maximum).Maximum)
+            }
+            $maxError = ($group.max_error | Measure-Object -Maximum).Maximum
+            $resource = @($group | Where-Object { $null -ne $_.registers -and [int]$_.registers -ge 0 } |
+                Select-Object -First 1)
+            $resources = if ($resource.Count -eq 0) { 'n/a' } else {
+                "$($resource[0].registers)/$($resource[0].static_shared_bytes)/$($resource[0].local_bytes_per_thread)/$($resource[0].active_blocks_per_sm)"
+            }
+            $verdict = '-'
+            if ($methodGroup.Name -eq 'Direct PTX graph') {
+                $operationVerdicts = @($Verdicts | Where-Object { $_.operation -eq $operation })
+                $passed = @($operationVerdicts | Where-Object { -not $_.timing_gate_passed }).Count -eq 0
+                $minDevice = ($operationVerdicts.device_median_speedup | Measure-Object -Minimum).Minimum
+                $minE2e = ($operationVerdicts.e2e_median_speedup | Measure-Object -Minimum).Minimum
+                $maxRatio = ($operationVerdicts.device_p95_ratio | Measure-Object -Maximum).Maximum
+                $verdict = if ($passed) {
+                    "**TIMING PASS - $('{0:F2}x' -f $minDevice) device / $('{0:F2}x' -f $minE2e) E2E; $('{0:F2}x' -f $maxRatio) P95**"
+                } else {
+                    "FAIL - $('{0:F2}x' -f $minDevice) device / $('{0:F2}x' -f $minE2e) E2E; $('{0:F2}x' -f $maxRatio) P95"
+                }
+            }
+            $lines.Add("| $method | $deviceMedians | $('{0:F2}' -f $worstP95) | $('{0:F2}' -f $worstP99) | $('{0:F2}' -f $mean) | $e2eMedians | $('{0:F2}' -f $worstE2eP95) | $('{0:F2}' -f $worstE2eP99) | $('{0:F2}' -f $e2eMean) | $('{0:F3} / {1:F2}' -f ($gflops / 1000.0), $gflops) | $managed | $temp | $('{0:E2}' -f $maxError) | $resources | $verdict |")
+        }
+    }
+    $lines.Add('')
+    $lines.Add('Timing qualification is not release promotion. Executed Nsight spill/local-memory counters are still mandatory for every promoted specialization.')
+    [IO.File]::WriteAllLines((Join-Path $Root 'dense-linear-results.md'), $lines)
+}
+
+function Assert-DenseLinearEvidence([string]$Root, [int]$RunCount, [bool]$IncludeExternal) {
+    $operations = @(
+        'decode-gelu', 'gemm-fp32', 'fused-gelu', 'batched-gemm',
+        'gemm-fp16', 'lora', 'linear-ce-index', 'linear-backward-relu',
+        'dot', 'outer', 'batched-dot', 'strided-dot'
+    )
+    $verdicts = [System.Collections.Generic.List[object]]::new()
+    $allRows = [System.Collections.Generic.List[object]]::new()
+    $allPassed = $true
+    for ($run = 1; $run -le $RunCount; $run++) {
+        $prefix = 'run-{0:D2}' -f $run
+        $dotnetPath = Join-Path $Root ($prefix + '-dense-linear.log')
+        $dotnetRows = @(Read-DenseLinearDotnetRows $dotnetPath)
+        if ($dotnetRows.Count -ne 48) {
+            throw "Dense-linear evidence expected 48 .NET rows in '$dotnetPath'; found $($dotnetRows.Count)."
+        }
+        foreach ($row in $dotnetRows) {
+            $row | Add-Member -NotePropertyName evidence_run -NotePropertyValue $run -Force
+            $allRows.Add($row)
+        }
+        $pythonRows = @()
+        if ($IncludeExternal) {
+            $pythonPath = Join-Path $Root ($prefix + '-dense-linear-pytorch.log')
+            $pythonRows = @(Read-QkvPythonRows $pythonPath | Where-Object { $_.status -eq 'ok' })
+            if ($pythonRows.Count -ne 24) {
+                throw "Dense-linear evidence expected 24 PyTorch rows in '$pythonPath'; found $($pythonRows.Count)."
+            }
+            foreach ($row in $pythonRows) {
+                $row | Add-Member -NotePropertyName evidence_run -NotePropertyValue $run -Force
+                $allRows.Add($row)
+            }
+        }
+
+        foreach ($operation in $operations) {
+            $directRows = @($dotnetRows | Where-Object {
+                $_.operation -eq $operation -and $_.method -like 'Direct PTX*'
+            })
+            $candidate = @($directRows | Where-Object { $_.method -eq 'Direct PTX graph' })
+            if ($candidate.Count -ne 1 -or $directRows.Count -ne 2) {
+                throw "Dense-linear evidence has an incomplete Direct PTX method set for run $run '$operation'."
+            }
+            if (@($directRows | Where-Object {
+                [double]$_.max_error -gt [double]$_.tolerance -or
+                [long]$_.managed_bytes -ne 0 -or
+                [long]$_.temporary_device_bytes -ne 0 -or
+                [int]$_.local_bytes_per_thread -ne 0
+            }).Count -ne 0) {
+                throw "Dense-linear resource/correctness gate failed for run $run '$operation'."
+            }
+
+            $peers = @($dotnetRows | Where-Object {
+                $_.operation -eq $operation -and $_.method -notlike 'Direct PTX*'
+            })
+            if ($IncludeExternal) {
+                $shapePeers = @($pythonRows | Where-Object { $_.operation -eq $operation })
+                if ($shapePeers.Count -ne 2) {
+                    throw "Dense-linear evidence has an incomplete PyTorch method set for run $run '$operation'."
+                }
+                $peers += $shapePeers
+            }
+            if ($peers.Count -eq 0) {
+                throw "Dense-linear evidence has no eligible competitor for run $run '$operation'."
+            }
+            foreach ($peer in $peers) {
+                $peerTolerance = if ($null -ne $peer.tolerance) { [double]$peer.tolerance } else { 2e-4 }
+                if ([double]$peer.max_error -gt $peerTolerance) {
+                    throw "Dense-linear peer '$($peer.method)' exceeded tolerance for run $run '$operation'."
+                }
+            }
+            $strongest = $peers | Sort-Object { [double]$_.device_median_us } | Select-Object -First 1
+            $deviceSpeedup = [double]$strongest.device_median_us / [double]$candidate[0].device_median_us
+            $endToEndSpeedup = [double]$strongest.e2e_median_us / [double]$candidate[0].e2e_median_us
+            $p95Ratio = [double]$candidate[0].device_p95_us / [double]$strongest.device_p95_us
+            $timingPassed = $deviceSpeedup -ge 1.10 -and
+                $endToEndSpeedup -ge 1.10 -and $p95Ratio -le 1.10
+            if (-not $timingPassed) { $allPassed = $false }
+            $verdicts.Add([ordered]@{
+                run = $run
+                operation = $operation
+                candidate = $candidate[0].method
+                strongest_competitor = $strongest.method
+                device_median_speedup = $deviceSpeedup
+                e2e_median_speedup = $endToEndSpeedup
+                device_p95_ratio = $p95Ratio
+                timing_gate_passed = $timingPassed
+            })
+        }
+    }
+    $gatePath = Join-Path $Root 'dense-linear-release-gate.json'
+    [ordered]@{
+        status = if ($allPassed) { 'timing-pass' } else { 'timing-fail' }
+        release_promoted = $false
+        release_blocker = 'Executed Nsight spill/local-memory counters are not available for every timing-qualified specialization.'
+        required_device_and_e2e_median_speedup = 1.10
+        maximum_device_p95_ratio = 1.10
+        maximum_error = 2e-4
+        runs = $RunCount
+        external_competitors_included = $IncludeExternal
+        verdicts = @($verdicts)
+    } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $gatePath -Encoding utf8
+    Write-DenseLinearMarkdown $Root @($allRows) @($verdicts) $RunCount $IncludeExternal
+}
+
 function Get-GpuSnapshot {
     $output = & nvidia-smi `
         '--query-gpu=name,uuid,driver_version,pstate,clocks.sm,clocks.mem,temperature.gpu,power.draw,power.limit,utilization.gpu,memory.used' `
@@ -227,8 +432,10 @@ function Assert-GpuReady([string]$Label, [switch]$AfterSuite) {
 
 Push-Location $repoRoot
 try {
-    if ($Issue834Only -and $Issue835Only) {
-        throw '-Issue834Only and -Issue835Only are mutually exclusive.'
+    $issueOnlyCount = @(@($Issue834Only, $Issue835Only, $Issue836Only) |
+        Where-Object { $_ }).Count
+    if ($issueOnlyCount -gt 1) {
+        throw '-Issue834Only, -Issue835Only, and -Issue836Only are mutually exclusive.'
     }
     $gitCommit = (& git rev-parse HEAD).Trim()
     if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the Git commit for the evidence manifest.' }
@@ -252,7 +459,17 @@ try {
     }
 
     $suites = [System.Collections.Generic.List[object]]::new()
-    if (-not $Issue834Only -and -not $Issue835Only) {
+    if ($Issue836Only) {
+        $suites.Add((New-EvidenceSuite 'dense-linear' 'dotnet' @(
+            $targetDll, '--direct-ptx-dense-linear-full', '1', '--no-python')))
+        if (-not $SkipExternal) {
+            $python = (Get-Command python -ErrorAction Stop).Source
+            $suites.Add((New-EvidenceSuite 'dense-linear-pytorch' $python @(
+                (Join-Path $pythonRoot 'run_direct_ptx_dense_linear_full_competitors.py'),
+                '--runs', '1', '--json-lines')))
+        }
+    }
+    elseif (-not $Issue834Only -and -not $Issue835Only) {
         $suites.Add((New-EvidenceSuite 'online-attention' 'dotnet' @($targetDll, '--direct-ptx-online-attention')))
         $suites.Add((New-EvidenceSuite 'gpu-matrix' 'dotnet' @($targetDll, '--direct-ptx-gpu-matrix')))
         $suites.Add((New-EvidenceSuite 'residual-rmsnorm' 'dotnet' @($targetDll, '--direct-ptx-residual-rmsnorm')))
@@ -261,19 +478,19 @@ try {
         }
     }
 
-    if (-not $Issue835Only) {
+    if (-not $Issue836Only -and -not $Issue835Only) {
         $suites.Add((New-EvidenceSuite 'attention-family' 'dotnet' @($targetDll, '--direct-ptx-attention-family', '1')))
         $suites.Add((New-EvidenceSuite 'decode' 'dotnet' @($targetDll, '--direct-ptx-decode', '1')))
         $suites.Add((New-EvidenceSuite 'paged-prefill' 'dotnet' @($targetDll, '--direct-ptx-paged-prefill', '1')))
         $suites.Add((New-EvidenceSuite 'attention-backward' 'dotnet' @($targetDll, '--direct-ptx-attention-backward', '1')))
         $suites.Add((New-EvidenceSuite 'flash-attention-backward' 'dotnet' @($targetDll, '--direct-ptx-flash-attention-backward', '1')))
     }
-    if (-not $Issue834Only) {
+    if (-not $Issue836Only -and -not $Issue834Only) {
         $suites.Add((New-EvidenceSuite 'qkv-rope-cache' 'dotnet' @(
             $targetDll, '--direct-ptx-qkv-rope-cache', '1', '--no-external')))
     }
 
-    if (-not $SkipExternal) {
+    if (-not $Issue836Only -and -not $SkipExternal) {
         $python = (Get-Command python -ErrorAction Stop).Source
         if (-not $Issue835Only) {
             $suites.Add((New-EvidenceSuite 'attention-family-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_attention_family_competitors.py'), '--runs', '1')))
@@ -290,8 +507,13 @@ try {
 
     $previousDirectPtx = $env:AIDOTNET_DIRECT_PTX
     $previousAutotune = $env:AIDOTNET_DIRECT_PTX_AUTOTUNE
+    $previousPath = $env:PATH
     $env:AIDOTNET_DIRECT_PTX = '1'
     $env:AIDOTNET_DIRECT_PTX_AUTOTUNE = '0'
+    $nativeRuntime = Join-Path (Split-Path $targetDll -Parent) 'runtimes\win-x64\native'
+    if (Test-Path -LiteralPath $nativeRuntime -PathType Container) {
+        $env:PATH = $nativeRuntime + [IO.Path]::PathSeparator + $env:PATH
+    }
     try {
         for ($run = 1; $run -le $Runs; $run++) {
             foreach ($suite in $suites) {
@@ -377,14 +599,19 @@ try {
     finally {
         $env:AIDOTNET_DIRECT_PTX = $previousDirectPtx
         $env:AIDOTNET_DIRECT_PTX_AUTOTUNE = $previousAutotune
+        $env:PATH = $previousPath
     }
 
-    if (-not $Issue834Only) {
+    if (-not $Issue834Only -and -not $Issue836Only) {
         Assert-QkvReleaseGate $evidenceRoot $Runs (-not [bool]$SkipExternal)
+    }
+    if ($Issue836Only) {
+        Assert-DenseLinearEvidence $evidenceRoot $Runs (-not [bool]$SkipExternal)
     }
 
     $files = Get-ChildItem -LiteralPath $evidenceRoot -File | Where-Object {
-        $_.Extension -eq '.log' -or $_.Name -eq 'qkv-release-gate.json'
+        $_.Extension -eq '.log' -or $_.Extension -eq '.md' -or
+            $_.Name.EndsWith('-release-gate.json', [StringComparison]::Ordinal)
     } | Sort-Object Name | ForEach-Object {
         $hash = Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256
         [ordered]@{ file = $_.Name; sha256 = $hash.Hash.ToLowerInvariant() }
@@ -401,6 +628,7 @@ try {
         contamination_retries_per_suite = $ContaminationRetries
         issue_834_only = [bool]$Issue834Only
         issue_835_only = [bool]$Issue835Only
+        issue_836_only = [bool]$Issue836Only
         external_gpu_baselines_included = -not [bool]$SkipExternal
         feature_gates = [ordered]@{
             AIDOTNET_DIRECT_PTX = '1'

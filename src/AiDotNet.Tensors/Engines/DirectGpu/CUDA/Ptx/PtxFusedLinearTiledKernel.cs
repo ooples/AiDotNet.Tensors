@@ -23,28 +23,41 @@ internal enum DirectPtxLinearActivation
 }
 
 /// <summary>
+/// Physical weight contract baked into a fused-linear specialization. The
+/// kernel never receives a stride or layout flag at launch time.
+/// </summary>
+internal enum DirectPtxLinearWeightLayout
+{
+    /// <summary>Canonical AiDotNet linear/GEMM weights, row-major [K,N].</summary>
+    InputMajor,
+    /// <summary>Prepacked decode weights, row-major [N,K].</summary>
+    OutputMajor
+}
+
+/// <summary>
 /// General-M FP32 fused linear + bias + activation, computed as a real
 /// register-blocked, shared-memory-staged tiled GEMM rather than the warp-reduction
 /// dot product of the M=1 decode kernel. Computes
-/// <c>C[M,N] = activation(A[M,K] @ transpose(W[N,K]) + bias[N])</c> where A is
-/// row-major input tokens and W is canonical output-major weights (row n contiguous
-/// over K, identical to the M=1 contract), so a block loads one BM×BK tile of A and
-/// one BN×BK tile of W into shared memory each K-step and every thread accumulates a
-/// TM×TN micro-tile entirely in registers.
+/// <c>C[M,N] = activation(A[M,K] @ B[K,N] + bias[N])</c> for canonical
+/// input-major weights, or the equivalent product with prepacked output-major
+/// <c>W[N,K]</c>. A block loads one BM-by-BK tile of A and one BN-by-BK tile of
+/// weights into shared memory on each K-step; every thread accumulates a
+/// TM-by-TN micro-tile entirely in registers. The selected weight layout is
+/// baked into PTX, so admitted launches contain no runtime layout branch.
 ///
-/// Tile: BM=BN=64, BK=8, TM=TN=4 → 256 threads, 16 FP32 accumulators/thread, 4 KiB
-/// shared (2 KiB A + 2 KiB W). Grid = (N/BN, M/BM). This is the correct fused
-/// foundation; cp.async double-buffering and FP16 Tensor-Core tiles are the tracked
-/// performance follow-ups.
+/// Tile: BM=BN=16, BK=32, TM=TN=2: 64 threads, four FP32 accumulators/thread,
+/// and 4 KiB shared. The smaller output tile supplies enough independent blocks
+/// for transformer matrices whose row count is only 64 while retaining coalesced
+/// cooperative loads and a register-only epilogue.
 /// </summary>
 internal sealed class PtxFusedLinearTiledKernel : IDisposable
 {
-    internal const int BlockM = 64;
-    internal const int BlockN = 64;
-    internal const int BlockK = 8;
-    internal const int ThreadM = 4;
-    internal const int ThreadN = 4;
-    internal const int BlockThreads = (BlockM / ThreadM) * (BlockN / ThreadN); // 256
+    internal const int BlockM = 16;
+    internal const int BlockN = 16;
+    internal const int BlockK = 32;
+    internal const int ThreadM = 2;
+    internal const int ThreadN = 2;
+    internal const int BlockThreads = (BlockM / ThreadM) * (BlockN / ThreadN); // 64
     internal const string EntryPoint = "aidotnet_fused_linear_tiled";
 
     private readonly DirectPtxModule _module;
@@ -53,7 +66,10 @@ internal sealed class PtxFusedLinearTiledKernel : IDisposable
     internal int M { get; }
     internal int K { get; }
     internal int N { get; }
+    internal int BatchCount { get; }
+    internal bool HasBias { get; }
     internal DirectPtxLinearActivation Activation { get; }
+    internal DirectPtxLinearWeightLayout WeightLayout { get; }
     internal string Ptx { get; }
     internal DirectPtxKernelBlueprint Blueprint { get; }
     internal DirectPtxKernelAudit Audit { get; }
@@ -63,7 +79,10 @@ internal sealed class PtxFusedLinearTiledKernel : IDisposable
         int m,
         int k,
         int n,
-        DirectPtxLinearActivation activation)
+        DirectPtxLinearActivation activation,
+        DirectPtxLinearWeightLayout weightLayout = DirectPtxLinearWeightLayout.OutputMajor,
+        bool hasBias = true,
+        int batchCount = 1)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         if (!DirectPtxArchitecture.HasValidatedFusedLinear(
@@ -75,9 +94,19 @@ internal sealed class PtxFusedLinearTiledKernel : IDisposable
         M = m;
         K = k;
         N = n;
+        if (batchCount <= 0 || batchCount > 64)
+            throw new ArgumentOutOfRangeException(nameof(batchCount));
+        if (!hasBias && activation != DirectPtxLinearActivation.None)
+            throw new ArgumentException("A no-bias GEMM specialization cannot apply a fused activation.", nameof(activation));
+        BatchCount = batchCount;
+        HasBias = hasBias;
         Activation = activation;
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, m, k, n, activation);
-        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, m, k, n, activation);
+        WeightLayout = weightLayout;
+        Blueprint = CreateBlueprint(
+            runtime.ArchitectureFamily, m, k, n, activation, weightLayout, hasBias, batchCount);
+        Ptx = EmitPtx(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
+            m, k, n, activation, weightLayout, hasBias, batchCount);
         _module = runtime.LoadModule(Ptx);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
         int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
@@ -93,6 +122,7 @@ internal sealed class PtxFusedLinearTiledKernel : IDisposable
         DirectPtxTensorView bias,
         DirectPtxTensorView output)
     {
+        if (!HasBias) throw new InvalidOperationException("This specialization has no bias parameter.");
         Require(input, Blueprint.Tensors[0], nameof(input));
         Require(weights, Blueprint.Tensors[1], nameof(weights));
         Require(bias, Blueprint.Tensors[2], nameof(bias));
@@ -111,7 +141,32 @@ internal sealed class PtxFusedLinearTiledKernel : IDisposable
         arguments[3] = &outputPointer;
         _module.Launch(
             _function,
-            (uint)(N / BlockN), (uint)(M / BlockM), 1,
+            (uint)(N / BlockN), (uint)(M / BlockM), (uint)BatchCount,
+            BlockThreads, 1, 1, 0, arguments);
+    }
+
+    internal unsafe void LaunchGemm(
+        DirectPtxTensorView input,
+        DirectPtxTensorView weights,
+        DirectPtxTensorView output)
+    {
+        if (HasBias) throw new InvalidOperationException("This specialization requires a bias parameter.");
+        Require(input, Blueprint.Tensors[0], nameof(input));
+        Require(weights, Blueprint.Tensors[1], nameof(weights));
+        Require(output, Blueprint.Tensors[2], nameof(output));
+        if (Overlaps(output, input) || Overlaps(output, weights))
+            throw new ArgumentException("GEMM output may not alias either input.");
+
+        IntPtr inputPointer = input.Pointer;
+        IntPtr weightPointer = weights.Pointer;
+        IntPtr outputPointer = output.Pointer;
+        void** arguments = stackalloc void*[3];
+        arguments[0] = &inputPointer;
+        arguments[1] = &weightPointer;
+        arguments[2] = &outputPointer;
+        _module.Launch(
+            _function,
+            (uint)(N / BlockN), (uint)(M / BlockM), (uint)BatchCount,
             BlockThreads, 1, 1, 0, arguments);
     }
 
@@ -123,24 +178,35 @@ internal sealed class PtxFusedLinearTiledKernel : IDisposable
         int m,
         int k,
         int n,
-        DirectPtxLinearActivation activation)
+        DirectPtxLinearActivation activation,
+        DirectPtxLinearWeightLayout weightLayout = DirectPtxLinearWeightLayout.OutputMajor,
+        bool hasBias = true,
+        int batchCount = 1)
     {
         ValidateShape(m, k, n);
+        if (batchCount <= 0 || batchCount > 64)
+            throw new ArgumentOutOfRangeException(nameof(batchCount));
+        if (!hasBias && activation != DirectPtxLinearActivation.None)
+            throw new ArgumentException("A no-bias GEMM specialization cannot apply a fused activation.", nameof(activation));
         int kBytes = checked(k * sizeof(float));
         int nBytes = checked(n * sizeof(float));
+        int inputBatchBytes = checked(m * k * sizeof(float));
+        int weightBatchBytes = checked(k * n * sizeof(float));
+        int outputBatchBytes = checked(m * n * sizeof(float));
 
         var ptx = new StringBuilder(24_000);
         ptx.AppendLine(".version 7.1");
         ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine(
-            $"// tiled fused-linear M={m} K={k} N={n} act={activation} " +
+            $"// tiled {(hasBias ? "fused-linear" : "gemm")} M={m} K={k} N={n} " +
+            $"batch={batchCount} act={activation} weights={weightLayout} " +
             $"tile={BlockM}x{BlockN}x{BlockK} thread={ThreadM}x{ThreadN}");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");
         ptx.AppendLine("    .param .u64 input_ptr,");
         ptx.AppendLine("    .param .u64 weights_ptr,");
-        ptx.AppendLine("    .param .u64 bias_ptr,");
+        if (hasBias) ptx.AppendLine("    .param .u64 bias_ptr,");
         ptx.AppendLine("    .param .u64 output_ptr");
         ptx.AppendLine(")");
         ptx.AppendLine($".maxntid {BlockThreads}, 1, 1");
@@ -154,23 +220,34 @@ internal sealed class PtxFusedLinearTiledKernel : IDisposable
         ptx.AppendLine($"    .shared .align 16 .b8 w_tile[{BlockN * BlockK * sizeof(float)}];");
         ptx.AppendLine("    ld.param.u64 %rd0, [input_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd1, [weights_ptr];");
-        ptx.AppendLine("    ld.param.u64 %rd2, [bias_ptr];");
+        if (hasBias) ptx.AppendLine("    ld.param.u64 %rd2, [bias_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd3, [output_ptr];");
         ptx.AppendLine("    mov.u64 %rd4, a_tile;");
         ptx.AppendLine("    mov.u64 %rd5, w_tile;");
 
         // Thread / block coordinates.
-        ptx.AppendLine("    mov.u32 %r0, %tid.x;");                         // tid 0..255
+        ptx.AppendLine("    mov.u32 %r0, %tid.x;");                         // tid 0..63
         ptx.AppendLine("    mov.u32 %r1, %ctaid.x;");                        // block col
         ptx.AppendLine("    mov.u32 %r2, %ctaid.y;");                        // block row
-        ptx.AppendLine($"    shr.u32 %r3, %r0, 4;");                         // threadRow = tid / (BN/TN=16)
-        ptx.AppendLine($"    and.b32 %r4, %r0, 15;");                        // threadCol = tid % 16
+        ptx.AppendLine("    shr.u32 %r3, %r0, 3;");                          // threadRow = tid / (BN/TN=8)
+        ptx.AppendLine("    and.b32 %r4, %r0, 7;");                          // threadCol = tid % 8
         ptx.AppendLine($"    mul.lo.u32 %r5, %r2, {BlockM};");               // blockRow*BM (base A row)
         ptx.AppendLine($"    mul.lo.u32 %r6, %r1, {BlockN};");               // blockCol*BN (base W row / N col)
         ptx.AppendLine($"    mul.lo.u32 %r7, %r3, {ThreadM};");             // threadRow*TM (A sub-row)
         ptx.AppendLine($"    mul.lo.u32 %r8, %r4, {ThreadN};");             // threadCol*TN (W sub-row)
 
-        // Zero the 16 accumulators %f0..%f15.
+        if (batchCount > 1)
+        {
+            ptx.AppendLine("    mov.u32 %r22, %ctaid.z;");
+            ptx.AppendLine($"    mul.wide.u32 %rd20, %r22, {inputBatchBytes};");
+            ptx.AppendLine("    add.u64 %rd0, %rd0, %rd20;");
+            ptx.AppendLine($"    mul.wide.u32 %rd20, %r22, {weightBatchBytes};");
+            ptx.AppendLine("    add.u64 %rd1, %rd1, %rd20;");
+            ptx.AppendLine($"    mul.wide.u32 %rd20, %r22, {outputBatchBytes};");
+            ptx.AppendLine("    add.u64 %rd3, %rd3, %rd20;");
+        }
+
+        // Zero the TM*TN accumulator registers (%f0..%f3 for the 2x2 tile).
         for (int i = 0; i < ThreadM * ThreadN; i++)
             ptx.AppendLine($"    mov.f32 %f{i}, 0f00000000;");
 
@@ -179,9 +256,9 @@ internal sealed class PtxFusedLinearTiledKernel : IDisposable
         ptx.AppendLine("K_TILE_LOOP:");
 
         // ---- Cooperative global -> shared load ----
-        // 512 A elements + 512 W elements over 256 threads => 2 each. Element index
-        // e in {tid, tid+256}; row = e>>3 (e / BK), kk = e & 7 (e % BK).
-        EmitCooperativeLoad(ptx, kBytes);
+        // Each 2 KiB tile contributes 512 FP32 elements, so every thread owns
+        // eight A and eight W scalar copies into the selected shared layout.
+        EmitCooperativeLoad(ptx, kBytes, nBytes, weightLayout);
         ptx.AppendLine("    bar.sync 0;");
 
         // ---- Register-blocked inner product over BK ----
@@ -193,46 +270,58 @@ internal sealed class PtxFusedLinearTiledKernel : IDisposable
         ptx.AppendLine("    @%p0 bra.uni K_TILE_LOOP;");
 
         // ---- Epilogue: + bias[n], activation, store C[m,n] ----
-        EmitEpilogue(ptx, activation, nBytes);
+        EmitEpilogue(ptx, activation, nBytes, hasBias);
 
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");
         return ptx.ToString();
     }
 
-    // Each thread loads 2 A elements and 2 W elements into shared memory.
-    private static void EmitCooperativeLoad(StringBuilder ptx, int kBytes)
+    // Each thread loads eight A elements and eight W elements into shared memory.
+    private static void EmitCooperativeLoad(
+        StringBuilder ptx,
+        int kBytes,
+        int nBytes,
+        DirectPtxLinearWeightLayout weightLayout)
     {
         // %r9 holds k0 (element units into K).
-        for (int slot = 0; slot < 2; slot++)
+        for (int slot = 0; slot < 8; slot++)
         {
             string e = slot == 0 ? "%r10" : "%r11";
-            ptx.AppendLine($"    add.u32 {e}, %r0, {slot * BlockThreads};");   // e = tid + slot*256
-            // A: row = e>>3, kk = e&7. globalRow = blockRow*BM + row = %r5 + row.
-            ptx.AppendLine($"    shr.u32 %r12, {e}, 3;");                       // row
-            ptx.AppendLine($"    and.b32 %r13, {e}, 7;");                       // kk
+            ptx.AppendLine($"    add.u32 {e}, %r0, {slot * BlockThreads};");
+            ptx.AppendLine($"    shr.u32 %r12, {e}, 5;");                       // row=e/32
+            ptx.AppendLine($"    and.b32 %r13, {e}, 31;");                      // kk=e%32
             ptx.AppendLine("    add.u32 %r14, %r5, %r12;");                     // global A row
-            ptx.AppendLine("    add.u32 %r15, %r9, %r13;");                     // global K col = k0 + kk
+            ptx.AppendLine("    add.u32 %r15, %r9, %r13;");                     // global K col
             ptx.AppendLine($"    mul.wide.u32 %rd8, %r14, {kBytes};");          // row * K * 4
             ptx.AppendLine("    mul.wide.u32 %rd9, %r15, 4;");                  // col * 4
             ptx.AppendLine("    add.u64 %rd10, %rd0, %rd8;");
             ptx.AppendLine("    add.u64 %rd10, %rd10, %rd9;");
             ptx.AppendLine("    ld.global.nc.f32 %f16, [%rd10];");
-            ptx.AppendLine($"    mul.wide.u32 %rd11, {e}, 4;");                 // shared byte offset = e*4
+            ptx.AppendLine($"    mul.wide.u32 %rd11, {e}, 4;");
             ptx.AppendLine("    add.u64 %rd12, %rd4, %rd11;");
             ptx.AppendLine("    st.shared.f32 [%rd12], %f16;");
-            // W: same layout, row over N; globalRow = blockCol*BN + row = %r6 + row.
-            ptx.AppendLine("    add.u32 %r14, %r6, %r12;");                     // global W row (N index)
-            ptx.AppendLine($"    mul.wide.u32 %rd8, %r14, {kBytes};");
-            ptx.AppendLine("    add.u64 %rd10, %rd1, %rd8;");
-            ptx.AppendLine("    add.u64 %rd10, %rd10, %rd9;");
+            ptx.AppendLine("    add.u32 %r14, %r6, %r12;");                     // global N / W row
+            if (weightLayout == DirectPtxLinearWeightLayout.OutputMajor)
+            {
+                ptx.AppendLine($"    mul.wide.u32 %rd8, %r14, {kBytes};");
+                ptx.AppendLine("    add.u64 %rd10, %rd1, %rd8;");
+                ptx.AppendLine("    add.u64 %rd10, %rd10, %rd9;");
+            }
+            else
+            {
+                ptx.AppendLine($"    mul.wide.u32 %rd8, %r15, {nBytes};");
+                ptx.AppendLine("    mul.wide.u32 %rd9, %r14, 4;");
+                ptx.AppendLine("    add.u64 %rd10, %rd1, %rd8;");
+                ptx.AppendLine("    add.u64 %rd10, %rd10, %rd9;");
+            }
             ptx.AppendLine("    ld.global.nc.f32 %f16, [%rd10];");
             ptx.AppendLine("    add.u64 %rd12, %rd5, %rd11;");
             ptx.AppendLine("    st.shared.f32 [%rd12], %f16;");
         }
     }
 
-    // For each k in 0..BK-1: load TM A-fragment + TN W-fragment from shared, 16 FMAs.
+    // For each k in 0..BK-1, load the register fragments and issue TM*TN FMAs.
     private static void EmitInnerAccumulate(StringBuilder ptx)
     {
         // A_sh row for micro-row i = (threadRow*TM + i); linear index = row*BK + k.
@@ -246,7 +335,6 @@ internal sealed class PtxFusedLinearTiledKernel : IDisposable
         ptx.AppendLine("    add.u64 %rd14, %rd5, %rd14;");                      // &W_sh[(threadCol*TN)*BK]
         for (int k = 0; k < BlockK; k++)
         {
-            int kByte = k * sizeof(float);
             // a[i] at &A_sh + (i*BK + k)*4 ; w[j] at &W_sh + (j*BK + k)*4.
             for (int i = 0; i < ThreadM; i++)
             {
@@ -262,11 +350,14 @@ internal sealed class PtxFusedLinearTiledKernel : IDisposable
                 for (int j = 0; j < ThreadN; j++)
                     ptx.AppendLine(
                         $"    fma.rn.f32 %f{i * ThreadN + j}, %f{16 + i}, %f{20 + j}, %f{i * ThreadN + j};");
-            _ = kByte;
         }
     }
 
-    private static void EmitEpilogue(StringBuilder ptx, DirectPtxLinearActivation activation, int nBytes)
+    private static void EmitEpilogue(
+        StringBuilder ptx,
+        DirectPtxLinearActivation activation,
+        int nBytes,
+        bool hasBias)
     {
         // Global output row base m0 = blockRow*BM + threadRow*TM = %r5 + %r7.
         // Global output col base n0 = blockCol*BN + threadCol*TN = %r6 + %r8.
@@ -282,9 +373,12 @@ internal sealed class PtxFusedLinearTiledKernel : IDisposable
                 int acc = i * ThreadN + j;
                 ptx.AppendLine($"    add.u32 %r21, %r19, {j};");               // n = n0 + j
                 ptx.AppendLine("    mul.wide.u32 %rd17, %r21, 4;");            // n * 4
-                ptx.AppendLine("    add.u64 %rd18, %rd2, %rd17;");             // &bias[n]
-                ptx.AppendLine("    ld.global.nc.f32 %f24, [%rd18];");
-                ptx.AppendLine($"    add.rn.f32 %f{acc}, %f{acc}, %f24;");      // + bias
+                if (hasBias)
+                {
+                    ptx.AppendLine("    add.u64 %rd18, %rd2, %rd17;");         // &bias[n]
+                    ptx.AppendLine("    ld.global.nc.f32 %f24, [%rd18];");
+                    ptx.AppendLine($"    add.rn.f32 %f{acc}, %f{acc}, %f24;");  // + bias
+                }
                 EmitActivation(ptx, activation, $"%f{acc}");
                 ptx.AppendLine("    add.u64 %rd19, %rd16, %rd17;");            // &C[m,n]
                 ptx.AppendLine($"    st.global.f32 [%rd19], %f{acc};");
@@ -346,29 +440,49 @@ internal sealed class PtxFusedLinearTiledKernel : IDisposable
         int m,
         int k,
         int n,
-        DirectPtxLinearActivation activation)
+        DirectPtxLinearActivation activation,
+        DirectPtxLinearWeightLayout weightLayout,
+        bool hasBias,
+        int batchCount)
     {
-        var input = new DirectPtxExtent(m, k);
-        var weights = new DirectPtxExtent(n, k);
+        var input = batchCount == 1
+            ? new DirectPtxExtent(m, k)
+            : new DirectPtxExtent(batchCount, m, k);
+        var weights = weightLayout == DirectPtxLinearWeightLayout.OutputMajor
+            ? (batchCount == 1
+                ? new DirectPtxExtent(n, k)
+                : new DirectPtxExtent(batchCount, n, k))
+            : (batchCount == 1
+                ? new DirectPtxExtent(k, n)
+                : new DirectPtxExtent(batchCount, k, n));
         var bias = new DirectPtxExtent(n);
-        var output = new DirectPtxExtent(m, n);
+        var output = batchCount == 1
+            ? new DirectPtxExtent(m, n)
+            : new DirectPtxExtent(batchCount, m, n);
+        var tensors = new List<DirectPtxTensorContract>
+        {
+            new("input", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.RowMajor2D,
+                input, input, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact),
+            new("weights", DirectPtxPhysicalType.Float32,
+                weightLayout == DirectPtxLinearWeightLayout.OutputMajor
+                    ? DirectPtxPhysicalLayout.LinearWeightOutputMajor
+                    : DirectPtxPhysicalLayout.LinearWeightInputMajor,
+                weights, weights, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact)
+        };
+        if (hasBias)
+            tensors.Add(new DirectPtxTensorContract(
+                "bias", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
+                bias, bias, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact));
+        tensors.Add(new DirectPtxTensorContract(
+            "output", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.RowMajor2D,
+            output, output, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact));
+
         return new DirectPtxKernelBlueprint(
-            Operation: "fused-linear-tiled",
+            Operation: hasBias ? "fused-linear-tiled" : "gemm-tiled",
             Version: 1,
             Architecture: architecture,
-            Variant: $"gemm-fp32-m{m}-k{k}-n{n}-{activation}".ToLowerInvariant(),
-            Tensors:
-            [
-                new("input", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.RowMajor2D,
-                    input, input, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact),
-                new("weights", DirectPtxPhysicalType.Float32,
-                    DirectPtxPhysicalLayout.LinearWeightOutputMajor,
-                    weights, weights, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact),
-                new("bias", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
-                    bias, bias, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact),
-                new("output", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.RowMajor2D,
-                    output, output, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
-            ],
+            Variant: $"gemm-fp32-b{batchCount}-m{m}-k{k}-n{n}-{activation}-{weightLayout}".ToLowerInvariant(),
+            Tensors: tensors,
             ResourceBudget: new DirectPtxResourceBudget(
                 MaxRegistersPerThread: 96,
                 MaxStaticSharedBytes: (BlockM + BlockN) * BlockK * sizeof(float),
@@ -376,16 +490,34 @@ internal sealed class PtxFusedLinearTiledKernel : IDisposable
                 MinBlocksPerMultiprocessor: 1),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
-                ["formula"] = "activation(A[M,K] @ transpose(W[N,K]) + bias[N])",
+                ["formula"] = Formula(weightLayout, hasBias, batchCount),
                 ["activation"] = activation.ToString(),
-                ["weights"] = "output-major-row-major-fp32",
+                ["weights"] = weightLayout == DirectPtxLinearWeightLayout.OutputMajor
+                    ? "output-major-row-major-fp32"
+                    : "input-major-row-major-fp32",
                 ["tile"] = $"{BlockM}x{BlockN}x{BlockK}-register-{ThreadM}x{ThreadN}",
                 ["accumulator"] = "thread-private-fp32-registers",
                 ["staging"] = "shared-memory-double-tile-a-and-w",
                 ["global-intermediates"] = "none",
                 ["temporary-device-allocation"] = "none",
+                ["batch-count"] = batchCount.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                ["bias"] = hasBias ? "fused-register-epilogue" : "none",
                 ["stride-parameters"] = "none"
             });
+    }
+
+    private static string Formula(
+        DirectPtxLinearWeightLayout weightLayout,
+        bool hasBias,
+        int batchCount)
+    {
+        string batch = batchCount == 1 ? string.Empty : "batched ";
+        string product = weightLayout == DirectPtxLinearWeightLayout.OutputMajor
+            ? "A[M,K] @ transpose(W[N,K])"
+            : "A[M,K] @ W[K,N]";
+        return hasBias
+            ? $"{batch}activation({product} + bias[N])"
+            : $"{batch}{product}";
     }
 
     internal static bool IsSupportedShape(int m, int k, int n) =>

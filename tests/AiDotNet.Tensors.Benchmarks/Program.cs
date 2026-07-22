@@ -84,6 +84,15 @@ class Program
             DirectPtxFusedLinearExperiment.Run(runs);
             return;
         }
+        if (args.Length > 0 && args[0] == "--direct-ptx-dense-linear-full")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            bool includePython = !args.Contains("--no-python", StringComparer.Ordinal);
+            string? onlyOperation = args.FirstOrDefault(
+                argument => argument.StartsWith("--only=", StringComparison.Ordinal))?[7..];
+            DirectPtxDenseLinearFullExperiment.Run(runs, includePython, onlyOperation);
+            return;
+        }
         if (args.Length > 0 && args[0] == "--direct-ptx-external-gpu-baselines")
         {
             DirectPtxExternalBaselines.Run();
@@ -1071,6 +1080,7 @@ class Program
         Console.WriteLine("  --direct-ptx-online-attention: Async online S128/D64 GPU championship table");
         Console.WriteLine("  --direct-ptx-gpu-matrix: NVIDIA-only S16/S32/S64/S128 attention matrix");
         Console.WriteLine("  --direct-ptx-fused-linear [runs]: FP32 M=1 linear+bias+GELU championship matrix");
+        Console.WriteLine("  --direct-ptx-dense-linear-full [runs] [--no-python] [--only=operation]: complete #836 resident NVIDIA matrix");
         Console.WriteLine("  --direct-ptx-attention-family [runs]: rectangular MHA/GQA/MQA resident release matrix");
         Console.WriteLine("  --direct-ptx-decode [runs]: dense and paged D64 decode resident release matrix");
         Console.WriteLine("  --direct-ptx-paged-prefill [runs]: causal D64 paged-prefill release matrix");

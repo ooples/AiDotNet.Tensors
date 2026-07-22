@@ -27,6 +27,16 @@ public sealed partial class CudaBackend
         int outputFeatures,
         float scaling)
     {
+        if (TryDirectPtxFusedLoRA(
+            input, baseOutput, loraA, loraB, output,
+            batchSize, inputFeatures, rank, outputFeatures, scaling))
+        {
+            // Preserve this public API's established completion semantics. The
+            // internal Try* entry point remains asynchronous for graph capture
+            // and resident benchmark use.
+            Synchronize();
+            return;
+        }
         EnsureFusedAdvancedKernelsAvailable(nameof(FusedLoRAForward));
         if (!_kernelCache.TryGetValue("fused_lora_forward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: fused_lora_forward.");
