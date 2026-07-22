@@ -62,7 +62,6 @@ internal static class DirectPtxQkvRopeCacheExperiment
         Console.WriteLine(
             $"Device samples average {LaunchesPerDeviceSample} resident launches. " +
             "All tensors and competitor workspaces are allocated before timing.");
-        PrintHeader();
         var evidence = new List<CellEvidence>(independentRuns * Shapes.Length);
         for (int run = 1; run <= independentRuns; run++)
         {
@@ -78,8 +77,7 @@ internal static class DirectPtxQkvRopeCacheExperiment
         IReadOnlyList<PythonRecord> python = includeExternal
             ? RunPython(independentRuns)
             : Array.Empty<PythonRecord>();
-        foreach (PythonRecord record in python.Where(record => record.Status == "ok"))
-            PrintPython(record);
+        PrintGrouped(evidence, python, independentRuns);
         PrintReleaseGate(evidence, python, independentRuns, includeExternal);
     }
 
@@ -166,19 +164,39 @@ internal static class DirectPtxQkvRopeCacheExperiment
             shape.Heads, shape.Capacity, shape.Position, out DirectPtxKernelAudit audit))
             throw new InvalidOperationException("No audit for measured QKV/RoPE/cache module.");
 
-        Print(run, shape, "Direct PTX fused", directDevice, directEndToEnd,
-            Tflops(shape, directDevice.Median), directBytes, 0, directError,
-            audit.Function.RegistersPerThread,
-            audit.Function.StaticSharedBytes,
-            audit.Function.LocalBytesPerThread,
-            audit.ActiveBlocksPerMultiprocessor);
-        long currentTemporaryBytes = 8L * model * sizeof(float);
-        Print(run, shape, "AiDotNet cuBLAS+NVRTC", currentDevice, currentEndToEnd,
-            Tflops(shape, currentDevice.Median), currentBytes,
-            currentTemporaryBytes, currentError, -1, -1, -1, -1);
         return new CellEvidence(
             run, shape, directDevice, currentDevice, directEndToEnd, currentEndToEnd,
             directBytes, currentBytes, directError, currentError, audit);
+    }
+
+    private static void PrintGrouped(
+        IReadOnlyList<CellEvidence> evidence,
+        IReadOnlyList<PythonRecord> python,
+        int independentRuns)
+    {
+        PrintHeader();
+        for (int run = 1; run <= independentRuns; run++)
+        foreach (Shape shape in Shapes)
+        {
+            CellEvidence cell = evidence.Single(candidate =>
+                candidate.Run == run && candidate.Shape == shape);
+            Print(run, shape, "Direct PTX fused", cell.DirectDevice, cell.DirectEndToEnd,
+                Tflops(shape, cell.DirectDevice.Median), cell.DirectBytes, 0,
+                cell.DirectError, cell.Audit.Function.RegistersPerThread,
+                cell.Audit.Function.StaticSharedBytes,
+                cell.Audit.Function.LocalBytesPerThread,
+                cell.Audit.ActiveBlocksPerMultiprocessor);
+            long currentTemporaryBytes =
+                8L * shape.Heads * Dimension * sizeof(float);
+            Print(run, shape, "AiDotNet cuBLAS+NVRTC", cell.CurrentDevice,
+                cell.CurrentEndToEnd, Tflops(shape, cell.CurrentDevice.Median),
+                cell.CurrentBytes, currentTemporaryBytes, cell.CurrentError,
+                -1, -1, -1, -1);
+            foreach (PythonRecord record in python.Where(record =>
+                record.Status == "ok" && record.Run == run &&
+                record.Shape == shape.Name).OrderBy(record => record.DeviceMedianUs))
+                PrintPython(record);
+        }
     }
 
     private static Distribution MeasureDevice(CudaBackend backend, Action action)
