@@ -1090,6 +1090,98 @@ public sealed class DirectPtxConvolutionTests
             $"Conv1D backward-weight max absolute error {maxAbsoluteError:G9}.");
     }
 
+    [Fact]
+    public void Conv2D3x3ForwardEmitter_IsHaloPredicatedChannelLoopSm86Ptx()
+    {
+        string ptx = PtxConv2DNchw3x3ForwardF32Kernel.EmitPtx(8, 6);
+
+        Assert.Contains(".target sm_86", ptx, StringComparison.Ordinal);
+        Assert.Contains(PtxConv2DNchw3x3ForwardF32Kernel.EntryPoint, ptx, StringComparison.Ordinal);
+        Assert.Equal(3, Count(ptx, ".param .u64"));
+        Assert.Contains("CONV2D_CHANNELS:", ptx, StringComparison.Ordinal);
+        // Nine taps unrolled in the channel-loop body.
+        Assert.Equal(9, Count(ptx, "fma.rn.f32"));
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        // Four corner taps combine two boundary predicates.
+        Assert.Equal(4, Count(ptx, "and.pred %p4"));
+        // Loop uses %p5, keeping the boundary predicates (%p0-%p3) intact.
+        Assert.Contains("@%p5 bra CONV2D_CHANNELS", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.Throws<NotSupportedException>(() =>
+            PtxConv2DNchw3x3ForwardF32Kernel.EmitPtx(8, 9));
+    }
+
+    [Fact]
+    public void Conv2D3x3ForwardManifestCell_IsExperimentalWithDedicatedRoute()
+    {
+        Assert.Equal(DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxConvolutionCoverageManifest.Get("IEngine.Conv2D").Status);
+        Assert.Equal(DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxConvolutionCoverageManifest
+                .Get("CudaBackend.TryDirectPtxConv2D3x3").Status);
+    }
+
+    [SkippableFact]
+    public void DriverOnlyConv2D3x3Forward_MatchesCpuReference()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "Requires the experimental SM86 convolution specialization.");
+
+        const int inChannels = PtxConv2DNchw3x3ForwardF32Kernel.InputChannels;
+        const int outChannels = PtxConv2DNchw3x3ForwardF32Kernel.OutputChannels;
+        const int height = PtxConv2DNchw3x3ForwardF32Kernel.Height;
+        const int width = PtxConv2DNchw3x3ForwardF32Kernel.Width;
+        const int kernelSize = PtxConv2DNchw3x3ForwardF32Kernel.KernelSize;
+
+        using var kernel = new PtxConv2DNchw3x3ForwardF32Kernel(runtime);
+        using var inputDevice = runtime.AllocateBytes((nuint)PtxConv2DNchw3x3ForwardF32Kernel.InputBytes);
+        using var weightDevice = runtime.AllocateBytes((nuint)PtxConv2DNchw3x3ForwardF32Kernel.WeightBytes);
+        using var outputDevice = runtime.AllocateBytes((nuint)PtxConv2DNchw3x3ForwardF32Kernel.OutputBytes);
+
+        Random random = AiDotNet.Tensors.Helpers.RandomHelper.CreateSecureRandom();
+        var input = new float[inChannels * height * width];
+        for (int i = 0; i < input.Length; i++) input[i] = (float)(random.NextDouble() * 2 - 1);
+        var weights = new float[outChannels * inChannels * kernelSize * kernelSize];
+        for (int i = 0; i < weights.Length; i++) weights[i] = (float)(random.NextDouble() * 2 - 1);
+        inputDevice.Upload<float>(input);
+        weightDevice.Upload<float>(weights);
+
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(inputDevice, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(weightDevice, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(outputDevice, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[outChannels * height * width];
+        outputDevice.Download<float>(actual);
+
+        float maxAbsoluteError = 0;
+        for (int co = 0; co < outChannels; co++)
+        for (int y = 0; y < height; y++)
+        for (int x = 0; x < width; x++)
+        {
+            float expected = 0;
+            for (int ci = 0; ci < inChannels; ci++)
+            for (int ky = 0; ky < kernelSize; ky++)
+            for (int kx = 0; kx < kernelSize; kx++)
+            {
+                int iy = y + ky - 1;
+                int ix = x + kx - 1;
+                if (iy < 0 || iy >= height || ix < 0 || ix >= width) continue;
+                expected += weights[((co * inChannels + ci) * kernelSize + ky) * kernelSize + kx] *
+                    input[(ci * height + iy) * width + ix];
+            }
+            float got = actual[(co * height + y) * width + x];
+            maxAbsoluteError = MathF.Max(maxAbsoluteError, MathF.Abs(got - expected));
+        }
+
+        Assert.True(maxAbsoluteError <= 3e-4f,
+            $"Conv2D 3x3 forward max absolute error {maxAbsoluteError:G9}.");
+    }
+
     private static string? Validate(
         bool enabled, bool available, int major, int minor,
         DirectPtxConvolutionShape shape, IGpuBuffer? input, IGpuBuffer? weights,
