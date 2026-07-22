@@ -264,6 +264,148 @@ internal static class DirectPtxProfileTarget
         GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-qkv-rope-cache-end");
     }
 
+    internal static void RunSolvers4x4()
+    {
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-solvers-4x4-start");
+        using var runtime = new DirectPtxRuntime();
+        foreach (int batch in new[] { 1024, 4096, 16384, 65536 })
+        {
+            using (var cholesky = new PtxRegisterCholesky4x4F32Kernel(runtime, batch))
+            using (var input = runtime.AllocateBytes(cholesky.Blueprint.Tensors[0].RequiredBytes))
+            using (var output = runtime.AllocateBytes(cholesky.Blueprint.Tensors[1].RequiredBytes))
+            using (var info = runtime.AllocateBytes(cholesky.Blueprint.Tensors[2].RequiredBytes))
+            {
+                input.Upload<float>(RepeatSolverMatrix(batch,
+                [
+                    9f, 1f, 2f, .5f,
+                    1f, 8f, .25f, 1f,
+                    2f, .25f, 7f, .75f,
+                    .5f, 1f, .75f, 6f
+                ]));
+                cholesky.Launch(
+                    DirectPtxTensorView.CreateOwned(input, cholesky.Blueprint.Tensors[0]),
+                    DirectPtxTensorView.CreateOwned(output, cholesky.Blueprint.Tensors[1]),
+                    DirectPtxTensorView.CreateOwned(info, cholesky.Blueprint.Tensors[2]));
+                runtime.Synchronize();
+                Console.WriteLine(cholesky.Audit.ToJson());
+            }
+
+            foreach (DirectPtxSolver4x4Operation operation in Enum.GetValues<DirectPtxSolver4x4Operation>())
+            {
+                using var kernel = new PtxRegisterSolver4x4F32Kernel(runtime, operation, batch);
+                using var first = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+                using var second = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+                using var third = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+                UploadSolverProfileInputs(operation, batch, first, second, third);
+                if (kernel.Blueprint.Tensors.Count == 3)
+                {
+                    kernel.Launch3(
+                        DirectPtxTensorView.CreateOwned(first, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.CreateOwned(second, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.CreateOwned(third, kernel.Blueprint.Tensors[2]));
+                }
+                else if (kernel.Blueprint.Tensors.Count == 4)
+                {
+                    using var fourth = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
+                    kernel.Launch4(
+                        DirectPtxTensorView.CreateOwned(first, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.CreateOwned(second, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.CreateOwned(third, kernel.Blueprint.Tensors[2]),
+                        DirectPtxTensorView.CreateOwned(fourth, kernel.Blueprint.Tensors[3]));
+                }
+                else
+                {
+                    using var fourth = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
+                    using var fifth = runtime.AllocateBytes(kernel.Blueprint.Tensors[4].RequiredBytes);
+                    kernel.Launch5(
+                        DirectPtxTensorView.CreateOwned(first, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.CreateOwned(second, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.CreateOwned(third, kernel.Blueprint.Tensors[2]),
+                        DirectPtxTensorView.CreateOwned(fourth, kernel.Blueprint.Tensors[3]),
+                        DirectPtxTensorView.CreateOwned(fifth, kernel.Blueprint.Tensors[4]));
+                }
+                runtime.Synchronize();
+                Console.WriteLine(kernel.Audit.ToJson());
+            }
+        }
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-solvers-4x4-end");
+    }
+
+    private static void UploadSolverProfileInputs(
+        DirectPtxSolver4x4Operation operation,
+        int batch,
+        DirectPtxBuffer first,
+        DirectPtxBuffer second,
+        DirectPtxBuffer third)
+    {
+        float[] spd =
+        [
+            9f, 1f, 2f, .5f,
+            1f, 8f, .25f, 1f,
+            2f, .25f, 7f, .75f,
+            .5f, 1f, .75f, 6f
+        ];
+        float[] identity =
+            [1f, 0f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 0f, 1f];
+        float[] lower =
+            [3f, 0f, 0f, 0f, 1f, 4f, 0f, 0f, .5f, 1f, 5f, 0f, .25f, .5f, 1f, 6f];
+        float[] upper =
+            [3f, 1f, .5f, .25f, 0f, 4f, 1f, .5f, 0f, 0f, 5f, 1f, 0f, 0f, 0f, 6f];
+        float[] factor =
+            [3f, 0f, 0f, 0f, 0f, 2.5f, 0f, 0f, 0f, 0f, 2f, 0f, 0f, 0f, 0f, 1.5f];
+        float[] firstMatrix = operation switch
+        {
+            DirectPtxSolver4x4Operation.LuSolveVector or
+            DirectPtxSolver4x4Operation.LdlSolveVectorLower or
+            DirectPtxSolver4x4Operation.SolveBackwardVector => identity,
+            DirectPtxSolver4x4Operation.TriangularSolveVectorLower => lower,
+            DirectPtxSolver4x4Operation.TriangularSolveVectorUpper => upper,
+            DirectPtxSolver4x4Operation.CholeskyBackwardLower => factor,
+            _ => spd
+        };
+        first.Upload<float>(RepeatSolverMatrix(batch, firstMatrix));
+
+        float[] rhs = RepeatSolverVector(batch, [1f, 2f, 3f, 4f]);
+        if (operation is DirectPtxSolver4x4Operation.LuSolveVector or
+            DirectPtxSolver4x4Operation.LdlSolveVectorLower)
+        {
+            int[] pivots = new int[batch * 4];
+            for (int b = 0; b < batch; b++)
+                for (int i = 0; i < 4; i++) pivots[b * 4 + i] = i;
+            second.Upload<int>(pivots);
+            third.Upload<float>(rhs);
+        }
+        else if (operation is DirectPtxSolver4x4Operation.GeneralSolveVector or
+            DirectPtxSolver4x4Operation.TriangularSolveVectorLower or
+            DirectPtxSolver4x4Operation.TriangularSolveVectorUpper)
+        {
+            second.Upload<float>(rhs);
+        }
+        else if (operation == DirectPtxSolver4x4Operation.CholeskyBackwardLower)
+        {
+            second.Upload<float>(RepeatSolverMatrix(batch, identity));
+        }
+        else if (operation == DirectPtxSolver4x4Operation.SolveBackwardVector)
+        {
+            second.Upload<float>(rhs);
+            third.Upload<float>(RepeatSolverVector(batch, [.5f, 1f, 1.5f, 2f]));
+        }
+    }
+
+    private static float[] RepeatSolverMatrix(int batch, float[] matrix)
+    {
+        var result = new float[checked(batch * 16)];
+        for (int b = 0; b < batch; b++) Array.Copy(matrix, 0, result, b * 16, 16);
+        return result;
+    }
+
+    private static float[] RepeatSolverVector(int batch, float[] vector)
+    {
+        var result = new float[checked(batch * 4)];
+        for (int b = 0; b < batch; b++) Array.Copy(vector, 0, result, b * 4, 4);
+        return result;
+    }
+
     internal static void VerifyNcuCsv(string path)
     {
         DirectPtxProfilerEvidence evidence = DirectPtxProfilerEvidence.FromNcuCsv(path);

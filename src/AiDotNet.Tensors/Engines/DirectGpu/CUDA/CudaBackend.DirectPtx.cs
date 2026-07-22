@@ -29,6 +29,10 @@ public sealed partial class CudaBackend
         _directPtxFlashAttentionBackwardKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<DirectPtxQkvRopeCacheKey, PtxFusedQkvRopeCacheD64Kernel>
         _directPtxQkvRopeCacheKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<DirectPtxCholesky4x4Key, PtxRegisterCholesky4x4F32Kernel>
+        _directPtxCholesky4x4Kernels = new(12);
+    private readonly DirectPtxPlanCache<DirectPtxCholesky4x4PlanKey, int>
+        _directPtxCholesky4x4Plans = new(4);
     private DirectPtxRuntime? _directPtxRuntime;
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
@@ -42,6 +46,7 @@ public sealed partial class CudaBackend
     private long _directPtxAttentionBackwardDispatchCount;
     private long _directPtxFlashAttentionBackwardDispatchCount;
     private long _directPtxQkvRopeCacheDispatchCount;
+    private long _directPtxCholesky4x4DispatchCount;
     internal int DirectPtxCachedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxAttentionKernels.Count; }
@@ -79,6 +84,10 @@ public sealed partial class CudaBackend
         DirectPtxFeatureGate.IsQkvRopeCacheEnabled && IsAvailable &&
         DirectPtxArchitecture.HasValidatedQkvRopeCache(_ccMajor, _ccMinor);
 
+    internal bool IsDirectPtxCholesky4x4Enabled =>
+        DirectPtxFeatureGate.IsCholesky4x4Enabled && IsAvailable &&
+        DirectPtxArchitecture.IsCholesky4x4ExperimentArchitecture(_ccMajor, _ccMinor);
+
     internal long DirectPtxResidualRmsNormDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxResidualRmsNormDispatchCount);
 
@@ -100,6 +109,237 @@ public sealed partial class CudaBackend
     internal int DirectPtxQkvRopeCachePinnedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxQkvRopeCacheKernels.PinnedCount; }
+    }
+
+    internal long DirectPtxCholesky4x4DispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxCholesky4x4DispatchCount);
+    internal int DirectPtxCholesky4x4KernelCapacity => _directPtxCholesky4x4Kernels.Capacity;
+    internal int DirectPtxCholesky4x4PinnedKernelCount
+    {
+        get { lock (_directPtxLock) return _directPtxCholesky4x4Kernels.PinnedCount; }
+    }
+
+    /// <summary>
+    /// Attempts the exact contiguous FP32 batch-of-4x4 lower-Cholesky
+    /// experiment. Its PTX ABI contains pointers only; every physical and
+    /// semantic contract is rejected here before launch.
+    /// </summary>
+    internal bool TryDirectPtxCholesky4x4(
+        IGpuBuffer input,
+        IGpuBuffer output,
+        IGpuBuffer info,
+        int batchCount,
+        int n,
+        bool upper)
+    {
+        if (!DirectPtxFeatureGate.IsCholesky4x4Enabled)
+        {
+            DirectPtxLastError = "cholesky-4x4-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "cholesky-4x4-backend-unavailable";
+            return false;
+        }
+        if (!DirectPtxArchitecture.IsCholesky4x4ExperimentArchitecture(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = "cholesky-4x4-architecture-not-implemented";
+            return false;
+        }
+        if (upper)
+        {
+            DirectPtxLastError = "cholesky-4x4-upper-not-implemented";
+            return false;
+        }
+        if (n != PtxRegisterCholesky4x4F32Kernel.MatrixOrder)
+        {
+            DirectPtxLastError = "cholesky-order-not-implemented";
+            return false;
+        }
+        if (!PtxRegisterCholesky4x4F32Kernel.IsSupportedBatchCount(batchCount))
+        {
+            DirectPtxLastError = "cholesky-4x4-batch-not-implemented";
+            return false;
+        }
+        if (input is null || output is null || info is null)
+        {
+            DirectPtxLastError = "cholesky-4x4-null-buffer";
+            return false;
+        }
+
+        long matrixBytes = checked((long)batchCount *
+            PtxRegisterCholesky4x4F32Kernel.MatrixElements * sizeof(float));
+        long infoBytes = checked((long)batchCount * sizeof(int));
+        if (input.SizeInBytes != matrixBytes || output.SizeInBytes != matrixBytes ||
+            info.SizeInBytes != infoBytes)
+        {
+            DirectPtxLastError = "cholesky-4x4-physical-extent-mismatch";
+            return false;
+        }
+        if (input.Handle == IntPtr.Zero || output.Handle == IntPtr.Zero || info.Handle == IntPtr.Zero)
+        {
+            DirectPtxLastError = "cholesky-4x4-invalid-device-pointer";
+            return false;
+        }
+        if ((((nuint)input.Handle | (nuint)output.Handle) & 15u) != 0 ||
+            ((nuint)info.Handle & 3u) != 0)
+        {
+            DirectPtxLastError = "cholesky-4x4-alignment-mismatch";
+            return false;
+        }
+        if (DirectPtxRangesOverlap(input, output) || DirectPtxRangesOverlap(input, info) ||
+            DirectPtxRangesOverlap(output, info))
+        {
+            DirectPtxLastError = "cholesky-4x4-alias-not-supported";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var planKey = new DirectPtxCholesky4x4PlanKey(batchCount);
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxCholesky4x4Plans.TryGetValue(planKey, out _))
+                {
+                    DirectPtxLastError =
+                        "Direct PTX Cholesky 4x4 must be prewarmed before CUDA graph capture.";
+                    return false;
+                }
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                int blockThreads;
+                if (!_directPtxCholesky4x4Plans.TryGetValue(planKey, out blockThreads))
+                {
+                    blockThreads = DirectPtxFeatureGate.IsAutotuneEnabled
+                        ? DirectPtxSolver4x4Autotuner.Select(candidate =>
+                        {
+                            var candidateKey = new DirectPtxCholesky4x4Key(batchCount, candidate);
+                            PtxRegisterCholesky4x4F32Kernel candidateKernel =
+                                GetOrCreateCholesky4x4Kernel(candidateKey);
+                            var inputView = DirectPtxTensorView.Create(input, candidateKernel.Blueprint.Tensors[0]);
+                            var outputView = DirectPtxTensorView.Create(output, candidateKernel.Blueprint.Tensors[1]);
+                            var infoView = DirectPtxTensorView.Create(info, candidateKernel.Blueprint.Tensors[2]);
+                            return _directPtxRuntime.MeasureKernelSamples(
+                                () => { lock (GpuDispatchLock) candidateKernel.Launch(inputView, outputView, infoView); },
+                                warmup: 2, samples: 5, launchesPerSample: 1);
+                        })
+                        : DirectPtxSolver4x4Autotuner.DefaultBlockThreads;
+                    _directPtxCholesky4x4Plans.Set(planKey, blockThreads);
+                }
+                var key = new DirectPtxCholesky4x4Key(batchCount, blockThreads);
+                if (capturing && !_directPtxCholesky4x4Kernels.TryGetValue(key, out _))
+                {
+                    DirectPtxLastError =
+                        "Direct PTX Cholesky 4x4 selected module is not resident for capture.";
+                    return false;
+                }
+                PtxRegisterCholesky4x4F32Kernel kernel =
+                    GetOrCreateCholesky4x4Kernel(key);
+                if (capturing && !_directPtxCholesky4x4Kernels.Pin(key))
+                {
+                    DirectPtxLastError = "cholesky-4x4-capture-pin-failed";
+                    return false;
+                }
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(info, kernel.Blueprint.Tensors[2]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxCholesky4x4DispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool PrewarmDirectPtxCholesky4x4(int batchCount)
+    {
+        if (!IsDirectPtxCholesky4x4Enabled) return false;
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX Cholesky 4x4 prewarm is not capture-safe.";
+                return false;
+            }
+            if (!PtxRegisterCholesky4x4F32Kernel.IsSupportedBatchCount(batchCount))
+            {
+                DirectPtxLastError = "cholesky-4x4-batch-not-implemented";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                var planKey = new DirectPtxCholesky4x4PlanKey(batchCount);
+                if (!_directPtxCholesky4x4Plans.TryGetValue(planKey, out int blockThreads))
+                {
+                    blockThreads = DirectPtxSolver4x4Autotuner.DefaultBlockThreads;
+                    _directPtxCholesky4x4Plans.Set(planKey, blockThreads);
+                }
+                _ = GetOrCreateCholesky4x4Kernel(
+                    new DirectPtxCholesky4x4Key(batchCount, blockThreads));
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    private PtxRegisterCholesky4x4F32Kernel GetOrCreateCholesky4x4Kernel(
+        DirectPtxCholesky4x4Key key)
+    {
+        if (_directPtxCholesky4x4Kernels.TryGetValue(key, out var existing)) return existing;
+        return CreateAndCacheCholesky4x4KernelSlow(key);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxRegisterCholesky4x4F32Kernel CreateAndCacheCholesky4x4KernelSlow(
+        DirectPtxCholesky4x4Key key)
+    {
+        var created = new PtxRegisterCholesky4x4F32Kernel(
+            _directPtxRuntime!, key.BatchCount, key.BlockThreads);
+        return _directPtxCholesky4x4Kernels.AddOrGetExisting(key, created);
+    }
+
+    internal bool TryGetDirectPtxCholesky4x4Audit(
+        int batchCount,
+        out DirectPtxKernelAudit audit)
+    {
+        lock (_directPtxLock)
+        {
+            if (_directPtxCholesky4x4Plans.TryGetValue(
+                new DirectPtxCholesky4x4PlanKey(batchCount), out int blockThreads) &&
+                _directPtxCholesky4x4Kernels.TryGetValue(
+                    new DirectPtxCholesky4x4Key(batchCount, blockThreads), out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null!;
+        return false;
+    }
+
+    private static bool DirectPtxRangesOverlap(IGpuBuffer left, IGpuBuffer right)
+    {
+        nuint leftStart = (nuint)left.Handle;
+        nuint rightStart = (nuint)right.Handle;
+        nuint leftEnd = checked(leftStart + (nuint)left.SizeInBytes);
+        nuint rightEnd = checked(rightStart + (nuint)right.SizeInBytes);
+        return leftStart < rightEnd && rightStart < leftEnd;
     }
 
     /// <summary>
@@ -1786,6 +2026,9 @@ public sealed partial class CudaBackend
             _directPtxAttentionBackwardKernels.Dispose();
             _directPtxFlashAttentionBackwardKernels.Dispose();
             _directPtxQkvRopeCacheKernels.Dispose();
+            _directPtxCholesky4x4Kernels.Dispose();
+            _directPtxCholesky4x4Plans.Clear();
+            DisposeDirectPtxSolver4x4Kernels();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }
@@ -1852,5 +2095,7 @@ public sealed partial class CudaBackend
         int Heads,
         int CacheCapacity,
         int Position);
+    private readonly record struct DirectPtxCholesky4x4PlanKey(int BatchCount);
+    private readonly record struct DirectPtxCholesky4x4Key(int BatchCount, int BlockThreads);
 
 }

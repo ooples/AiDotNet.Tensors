@@ -63,6 +63,14 @@ public static class CudaToPtxTransferLedger
             "same softmax family (#840); shares the row-softmax PTX kernel."),
         new CudaToPtxEntry("rmsnorm_forward", "PtxFusedResidualRmsNormD64Kernel", PtxTransferStatus.PtxInProgress,
             "fused residual RMSNorm; PTX kernel exists but has no public route wired yet (see parity registry)."),
+        new CudaToPtxEntry("parity211_cholesky", "PtxRegisterCholesky4x4F32Kernel", PtxTransferStatus.PtxInProgress,
+            "issue #853 exact lower FP32 4x4 batch family; NVRTC stays until correctness/performance/spill promotion."),
+        new CudaToPtxEntry("parity211_lu_factor", "PtxRegisterSolver4x4F32Kernel", PtxTransferStatus.PtxInProgress,
+            "issue #853 exact pivoted FP32 4x4 batch family; NVRTC remains the established fallback."),
+        new CudaToPtxEntry("parity211_qr_reduced", "PtxRegisterSolver4x4F32Kernel", PtxTransferStatus.PtxInProgress,
+            "issue #853 exact reduced FP32 4x4 batch family; NVRTC remains the established fallback."),
+        new CudaToPtxEntry("parity211_eigh", "PtxRegisterSolver4x4F32Kernel", PtxTransferStatus.PtxInProgress,
+            "issue #853 exact upper-triangle FP32 4x4 batch family; NVRTC remains the established fallback."),
 
         // --- Triaged anomalies: the 4 census kernels that mapped to no epic
         // #833 child during the full 888-kernel cross-reference. Recorded so the

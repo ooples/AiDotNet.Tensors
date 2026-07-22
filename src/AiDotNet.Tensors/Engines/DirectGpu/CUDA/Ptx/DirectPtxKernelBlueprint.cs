@@ -44,6 +44,18 @@ internal static class DirectPtxArchitecture
     /// </summary>
     internal static bool HasValidatedQkvRopeCache(int major, int minor) =>
         (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The register-resident 4x4 Cholesky experiment is deliberately isolated
+    /// to GA102/SM86 while correctness, resource, and timing evidence is
+    /// collected independently for every architecture family. Admission here
+    /// is not a promotion or performance-validation claim.
+    /// </summary>
+    internal static bool IsCholesky4x4ExperimentArchitecture(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    internal static bool IsSolver4x4ExperimentArchitecture(int major, int minor) =>
+        (major, minor) == (8, 6);
 }
 
 internal enum DirectPtxExtentMode
