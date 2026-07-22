@@ -2298,4 +2298,152 @@ public sealed partial class CudaBackend
         return _directPtxConvTranspose2D3x3Kernels.GetOrAdd(
             1, () => new PtxConvTranspose2DNchw3x3ForwardF32Kernel(runtime));
     }
+
+    private readonly DirectPtxKernelCache<int, PtxConv3DNcdhw3x3x3ForwardF32Kernel>
+        _directPtxConv3D3x3x3Kernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private long _directPtxConv3D3x3x3DispatchCount;
+
+    internal long DirectPtxConv3D3x3x3DispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxConv3D3x3x3DispatchCount);
+
+    /// <summary>
+    /// Attempts the exact FP32 NCDHW 3x3x3 3D convolution experiment (stride 1,
+    /// pad 1). The 3D contract is validated by byte extent (NCDHW/OIDHW are rank-5
+    /// and do not fit the 2D shape record). Fails closed so the caller runs the
+    /// established composition.
+    /// </summary>
+    internal bool TryDirectPtxConv3D3x3x3(
+        IGpuBuffer input,
+        IGpuBuffer weights,
+        IGpuBuffer output)
+    {
+        if (!_directPtxConvolutionOptedIn)
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.FeatureDisabled;
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.BackendUnavailable;
+            return false;
+        }
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.ArchitectureNotImplemented;
+            return false;
+        }
+        if (input is null || weights is null || output is null)
+        {
+            DirectPtxLastError = "conv3d-3x3x3-null-buffer";
+            return false;
+        }
+        if (input.SizeInBytes != PtxConv3DNcdhw3x3x3ForwardF32Kernel.InputBytes ||
+            weights.SizeInBytes != PtxConv3DNcdhw3x3x3ForwardF32Kernel.WeightBytes ||
+            output.SizeInBytes != PtxConv3DNcdhw3x3x3ForwardF32Kernel.OutputBytes)
+        {
+            DirectPtxLastError = "conv3d-3x3x3-exact-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            const int key = 1;
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxConv3D3x3x3Kernels.TryGetValue(key, out _))
+                {
+                    DirectPtxLastError =
+                        "Direct PTX Conv3D 3x3x3 must be prewarmed before CUDA graph capture.";
+                    return false;
+                }
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxConv3DNcdhw3x3x3ForwardF32Kernel kernel = GetOrCreateDirectPtxConv3D3x3x3Kernel();
+                if (capturing && !_directPtxConv3D3x3x3Kernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX Conv3D 3x3x3 module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(weights, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[2]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxConv3D3x3x3DispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool PrewarmDirectPtxConv3D3x3x3()
+    {
+        if (!_directPtxConvolutionOptedIn)
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.FeatureDisabled;
+            return false;
+        }
+        if (!IsAvailable || !DirectPtxArchitecture.HasExperimentalConvolution(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.ArchitectureNotImplemented;
+            return false;
+        }
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX Conv3D 3x3x3 prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _ = GetOrCreateDirectPtxConv3D3x3x3Kernel();
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxConv3D3x3x3Audit(out DirectPtxKernelAudit? audit)
+    {
+        lock (_directPtxLock)
+        {
+            if (_directPtxConv3D3x3x3Kernels.TryGetValue(1, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null;
+        return false;
+    }
+
+    private PtxConv3DNcdhw3x3x3ForwardF32Kernel GetOrCreateDirectPtxConv3D3x3x3Kernel()
+    {
+        if (_directPtxConv3D3x3x3Kernels.TryGetValue(
+                1, out PtxConv3DNcdhw3x3x3ForwardF32Kernel? existing))
+            return existing;
+        return CreateAndCacheDirectPtxConv3D3x3x3KernelSlow();
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxConv3DNcdhw3x3x3ForwardF32Kernel CreateAndCacheDirectPtxConv3D3x3x3KernelSlow()
+    {
+        DirectPtxRuntime runtime = _directPtxRuntime ??
+            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+        return _directPtxConv3D3x3x3Kernels.GetOrAdd(
+            1, () => new PtxConv3DNcdhw3x3x3ForwardF32Kernel(runtime));
+    }
 }
