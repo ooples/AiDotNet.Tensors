@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 
@@ -298,11 +297,10 @@ internal static class DirectPtxRngCoverageManifest
 
     internal static DirectPtxRngCoverageCell Get(string api)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(api);
+        PtxCompat.ThrowIfNullOrWhiteSpace(api, nameof(api));
         foreach (DirectPtxRngCoverageCell cell in All)
             if (string.Equals(cell.Api, api, StringComparison.Ordinal)) return cell;
         throw new KeyNotFoundException(
             $"Stochastic API '{api}' is not assigned in the #849 coverage manifest.");
     }
 }
-#endif

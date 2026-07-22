@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 using System.Text;
@@ -26,7 +25,7 @@ internal sealed class PtxDropoutBackwardF32Kernel : IDisposable
 
     internal PtxDropoutBackwardF32Kernel(DirectPtxRuntime runtime, int elementCount)
     {
-        ArgumentNullException.ThrowIfNull(runtime);
+        PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         if (!DirectPtxArchitecture.HasExperimentalRngDropout(
                 runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
@@ -178,4 +177,3 @@ internal sealed class PtxDropoutBackwardF32Kernel : IDisposable
                 $"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
     }
 }
-#endif

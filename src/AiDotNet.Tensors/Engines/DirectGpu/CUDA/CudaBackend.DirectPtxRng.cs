@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
@@ -78,7 +77,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
             DirectPtxLastError = rejection;
             return false;
         }
-        if (!float.IsFinite(lower) || !float.IsFinite(upper) || lower > upper)
+        if (!PtxCompat.IsFinite(lower) || !PtxCompat.IsFinite(upper) || lower > upper)
         {
             DirectPtxLastError = "rng-rrelu-bounds-not-supported";
             return false;
@@ -433,7 +432,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
             DirectPtxLastError = "rng-gumbel-exact-shape-not-supported";
             return false;
         }
-        if (!float.IsFinite(temperature) || temperature <= 0f)
+        if (!PtxCompat.IsFinite(temperature) || temperature <= 0f)
         {
             DirectPtxLastError = "rng-gumbel-temperature-not-supported";
             return false;
@@ -686,7 +685,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
             DirectPtxLastError = "rng-bias-dropout-exact-shape-not-supported";
             return false;
         }
-        if (!float.IsFinite(dropoutRate) || dropoutRate <= 0f || dropoutRate >= 1f)
+        if (!PtxCompat.IsFinite(dropoutRate) || dropoutRate <= 0f || dropoutRate >= 1f)
         {
             DirectPtxLastError = "rng-bias-dropout-rate-not-supported";
             return false;
@@ -1056,7 +1055,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
             DirectPtxLastError = "rng-gumbel-backward-specialization-not-supported";
             return false;
         }
-        if (!float.IsFinite(temperature) || temperature <= 0f)
+        if (!PtxCompat.IsFinite(temperature) || temperature <= 0f)
         {
             DirectPtxLastError = "rng-gumbel-backward-temperature-not-supported";
             return false;
@@ -1188,7 +1187,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
             return false;
         }
         if (kind == DirectPtxPhiloxFillKind.BernoulliMask ||
-            !float.IsFinite(first) || !float.IsFinite(second) ||
+            !PtxCompat.IsFinite(first) || !PtxCompat.IsFinite(second) ||
             (kind == DirectPtxPhiloxFillKind.Uniform && second <= first) ||
             (kind == DirectPtxPhiloxFillKind.Normal && second < 0f))
         {
@@ -1264,7 +1263,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
             DirectPtxLastError = rejection;
             return false;
         }
-        if (threshold == 0 || !float.IsFinite(scale) || scale < 0f)
+        if (threshold == 0 || !PtxCompat.IsFinite(scale) || scale < 0f)
         {
             DirectPtxLastError = "rng-mask-numerical-contract-not-supported";
             return false;
@@ -1535,7 +1534,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
             rejection = "rng-fill-physical-extent-mismatch";
             return false;
         }
-        if (((nuint)output.Handle & 15u) != 0)
+        if ((PtxCompat.ToNuint(output.Handle) & 15u) != 0)
         {
             rejection = "rng-fill-alignment-mismatch";
             return false;
@@ -1576,7 +1575,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
             rejection = $"rng-dropout-backward-{role}-extent-mismatch";
             return false;
         }
-        if (((nuint)buffer.Handle & 15u) != 0)
+        if ((PtxCompat.ToNuint(buffer.Handle) & 15u) != 0)
         {
             rejection = $"rng-dropout-backward-{role}-alignment-mismatch";
             return false;
@@ -1602,7 +1601,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
             rejection = $"rng-gumbel-{role}-extent-mismatch";
             return false;
         }
-        if (((nuint)buffer.Handle & 3u) != 0)
+        if ((PtxCompat.ToNuint(buffer.Handle) & 3u) != 0)
         {
             rejection = $"rng-gumbel-{role}-alignment-mismatch";
             return false;
@@ -1628,7 +1627,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
             rejection = $"rng-importance-{role}-extent-mismatch";
             return false;
         }
-        if (((nuint)buffer.Handle & 3u) != 0)
+        if ((PtxCompat.ToNuint(buffer.Handle) & 3u) != 0)
         {
             rejection = $"rng-importance-{role}-alignment-mismatch";
             return false;
@@ -1654,7 +1653,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
             rejection = $"rng-bias-dropout-{role}-extent-mismatch";
             return false;
         }
-        if (((nuint)buffer.Handle & 15u) != 0)
+        if ((PtxCompat.ToNuint(buffer.Handle) & 15u) != 0)
         {
             rejection = $"rng-bias-dropout-{role}-alignment-mismatch";
             return false;
@@ -1680,7 +1679,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
             rejection = $"rng-ddim-{role}-extent-mismatch";
             return false;
         }
-        if (((nuint)buffer.Handle & 15u) != 0)
+        if ((PtxCompat.ToNuint(buffer.Handle) & 15u) != 0)
         {
             rejection = $"rng-ddim-{role}-alignment-mismatch";
             return false;
@@ -1706,7 +1705,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
             rejection = $"rng-categorical-{role}-extent-mismatch";
             return false;
         }
-        if (((nuint)buffer.Handle & 3u) != 0)
+        if ((PtxCompat.ToNuint(buffer.Handle) & 3u) != 0)
         {
             rejection = $"rng-categorical-{role}-alignment-mismatch";
             return false;
@@ -1732,7 +1731,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
             rejection = $"rng-gumbel-backward-{role}-extent-mismatch";
             return false;
         }
-        if (((nuint)buffer.Handle & 3u) != 0)
+        if ((PtxCompat.ToNuint(buffer.Handle) & 3u) != 0)
         {
             rejection = $"rng-gumbel-backward-{role}-alignment-mismatch";
             return false;
@@ -1773,7 +1772,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
             rejection = $"rng-rrelu-{role}-extent-mismatch";
             return false;
         }
-        if (((nuint)buffer.Handle & 15u) != 0)
+        if ((PtxCompat.ToNuint(buffer.Handle) & 15u) != 0)
         {
             rejection = $"rng-rrelu-{role}-alignment-mismatch";
             return false;
@@ -1937,4 +1936,3 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
         DirectPtxRreluKind Kind,
         int ElementCount);
 }
-#endif

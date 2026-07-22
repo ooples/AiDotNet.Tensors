@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
@@ -33,7 +32,7 @@ internal static class DirectPtxRngDropoutAdmission
             return Reject("rng-dropout-exact-sm-not-supported", out rejection);
         if (!PtxFusedPhiloxDropoutF32Kernel.IsSupportedElementCount(elementCount))
             return Reject("rng-dropout-exact-shape-not-supported", out rejection);
-        if (!float.IsFinite(dropoutRate) || dropoutRate <= 0.0f || dropoutRate >= 1.0f)
+        if (!PtxCompat.IsFinite(dropoutRate) || dropoutRate <= 0.0f || dropoutRate >= 1.0f)
             return Reject("rng-dropout-rate-not-supported", out rejection);
         if (input == IntPtr.Zero || output == IntPtr.Zero || mask == IntPtr.Zero)
             return Reject("rng-dropout-invalid-device-pointer", out rejection);
@@ -46,7 +45,7 @@ internal static class DirectPtxRngDropoutAdmission
         }
         if (inputBytes != requiredBytes || outputBytes != requiredBytes || maskBytes != requiredBytes)
             return Reject("rng-dropout-physical-extent-mismatch", out rejection);
-        if ((((nuint)input | (nuint)output | (nuint)mask) & 15u) != 0)
+        if (((PtxCompat.ToNuint(input) | PtxCompat.ToNuint(output) | PtxCompat.ToNuint(mask)) & 15u) != 0)
             return Reject("rng-dropout-alignment-mismatch", out rejection);
         try
         {
@@ -65,7 +64,7 @@ internal static class DirectPtxRngDropoutAdmission
         if (threshold64 is 0 or > uint.MaxValue)
             return Reject("rng-dropout-keep-threshold-not-representable", out rejection);
         float inverseKeep = 1.0f / keepProbability;
-        if (!float.IsFinite(inverseKeep) || inverseKeep <= 1.0f)
+        if (!PtxCompat.IsFinite(inverseKeep) || inverseKeep <= 1.0f)
             return Reject("rng-dropout-inverse-keep-not-representable", out rejection);
 
         parameters = new DirectPtxRngDropoutParameters((uint)threshold64, inverseKeep);
@@ -75,8 +74,8 @@ internal static class DirectPtxRngDropoutAdmission
 
     private static bool Overlaps(IntPtr left, long leftBytes, IntPtr right, long rightBytes)
     {
-        nuint leftStart = (nuint)left;
-        nuint rightStart = (nuint)right;
+        nuint leftStart = PtxCompat.ToNuint(left);
+        nuint rightStart = PtxCompat.ToNuint(right);
         nuint leftEnd = checked(leftStart + (nuint)leftBytes);
         nuint rightEnd = checked(rightStart + (nuint)rightBytes);
         return leftStart < rightEnd && rightStart < leftEnd;
@@ -88,4 +87,3 @@ internal static class DirectPtxRngDropoutAdmission
         return false;
     }
 }
-#endif

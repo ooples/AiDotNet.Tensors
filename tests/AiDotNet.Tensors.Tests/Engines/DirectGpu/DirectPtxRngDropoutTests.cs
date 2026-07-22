@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Linq;
 using AiDotNet.Tensors.Engines;
@@ -641,4 +640,3 @@ public sealed class DirectPtxRngDropoutTests
         public void Dispose() => IsDisposed = true;
     }
 }
-#endif

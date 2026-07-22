@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 using System.Text;
@@ -26,7 +25,7 @@ internal sealed class PtxFusedPhiloxRreluF32Kernel : IDisposable
 
     internal PtxFusedPhiloxRreluF32Kernel(DirectPtxRuntime runtime, int elementCount)
     {
-        ArgumentNullException.ThrowIfNull(runtime);
+        PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         if (!DirectPtxArchitecture.HasExperimentalRngDropout(
                 runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
@@ -57,7 +56,7 @@ internal sealed class PtxFusedPhiloxRreluF32Kernel : IDisposable
         Require(input, Blueprint.Tensors[0], nameof(input));
         Require(noise, Blueprint.Tensors[1], nameof(noise));
         Require(output, Blueprint.Tensors[2], nameof(output));
-        if (!float.IsFinite(lower) || !float.IsFinite(upper) || lower > upper)
+        if (!PtxCompat.IsFinite(lower) || !PtxCompat.IsFinite(upper) || lower > upper)
             throw new ArgumentOutOfRangeException(nameof(lower));
         if (PtxFusedPhiloxDropoutF32Kernel.RangesOverlap(input, noise) ||
             PtxFusedPhiloxDropoutF32Kernel.RangesOverlap(input, output) ||
@@ -220,4 +219,3 @@ internal sealed class PtxFusedPhiloxRreluF32Kernel : IDisposable
                 $"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
     }
 }
-#endif

@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 using System.Text;
@@ -33,7 +32,7 @@ internal sealed class PtxFusedPhiloxDropoutF32Kernel : IDisposable
 
     internal PtxFusedPhiloxDropoutF32Kernel(DirectPtxRuntime runtime, int elementCount)
     {
-        ArgumentNullException.ThrowIfNull(runtime);
+        PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         if (!DirectPtxArchitecture.HasExperimentalRngDropout(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
@@ -65,7 +64,7 @@ internal sealed class PtxFusedPhiloxDropoutF32Kernel : IDisposable
         Require(input, Blueprint.Tensors[0], nameof(input));
         Require(output, Blueprint.Tensors[1], nameof(output));
         Require(mask, Blueprint.Tensors[2], nameof(mask));
-        if (keepThreshold == 0 || !float.IsFinite(inverseKeep) || inverseKeep <= 1.0f)
+        if (keepThreshold == 0 || !PtxCompat.IsFinite(inverseKeep) || inverseKeep <= 1.0f)
             throw new ArgumentOutOfRangeException(
                 nameof(keepThreshold), "Dropout requires a non-empty keep interval and finite inverse keep scale > 1.");
         if (RangesOverlap(input, output) || RangesOverlap(input, mask) || RangesOverlap(output, mask))
@@ -291,11 +290,10 @@ internal sealed class PtxFusedPhiloxDropoutF32Kernel : IDisposable
 
     internal static bool RangesOverlap(DirectPtxTensorView left, DirectPtxTensorView right)
     {
-        nuint leftStart = (nuint)left.Pointer;
-        nuint rightStart = (nuint)right.Pointer;
+        nuint leftStart = PtxCompat.ToNuint(left.Pointer);
+        nuint rightStart = PtxCompat.ToNuint(right.Pointer);
         nuint leftEnd = checked(leftStart + left.ByteLength);
         nuint rightEnd = checked(rightStart + right.ByteLength);
         return leftStart < rightEnd && rightStart < leftEnd;
     }
 }
-#endif

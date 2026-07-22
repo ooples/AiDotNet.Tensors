@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 using System.Text;
@@ -26,7 +25,7 @@ internal sealed class PtxGumbelSoftmaxBackward32F32Kernel : IDisposable
 
     internal PtxGumbelSoftmaxBackward32F32Kernel(DirectPtxRuntime runtime, int rows)
     {
-        ArgumentNullException.ThrowIfNull(runtime);
+        PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         if (!DirectPtxArchitecture.HasExperimentalRngDropout(
                 runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
@@ -53,7 +52,7 @@ internal sealed class PtxGumbelSoftmaxBackward32F32Kernel : IDisposable
         Require(gradOutput, Blueprint.Tensors[0], nameof(gradOutput));
         Require(softOutput, Blueprint.Tensors[1], nameof(softOutput));
         Require(gradInput, Blueprint.Tensors[2], nameof(gradInput));
-        if (!float.IsFinite(temperature) || temperature <= 0f)
+        if (!PtxCompat.IsFinite(temperature) || temperature <= 0f)
             throw new ArgumentOutOfRangeException(nameof(temperature));
         if (PtxFusedPhiloxDropoutF32Kernel.RangesOverlap(gradOutput, gradInput) ||
             PtxFusedPhiloxDropoutF32Kernel.RangesOverlap(softOutput, gradInput))
@@ -190,4 +189,3 @@ internal sealed class PtxGumbelSoftmaxBackward32F32Kernel : IDisposable
                 $"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
     }
 }
-#endif

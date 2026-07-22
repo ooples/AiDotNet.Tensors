@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 using System.Text;
@@ -28,7 +27,7 @@ internal sealed class PtxFusedBiasPhiloxDropout256F32Kernel : IDisposable
 
     internal PtxFusedBiasPhiloxDropout256F32Kernel(DirectPtxRuntime runtime, int rows)
     {
-        ArgumentNullException.ThrowIfNull(runtime);
+        PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         if (!DirectPtxArchitecture.HasExperimentalRngDropout(
                 runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
@@ -61,7 +60,7 @@ internal sealed class PtxFusedBiasPhiloxDropout256F32Kernel : IDisposable
         Require(bias, Blueprint.Tensors[1], nameof(bias));
         Require(output, Blueprint.Tensors[2], nameof(output));
         Require(mask, Blueprint.Tensors[3], nameof(mask));
-        if (keepThreshold == 0 || !float.IsFinite(inverseKeep) || inverseKeep <= 1f)
+        if (keepThreshold == 0 || !PtxCompat.IsFinite(inverseKeep) || inverseKeep <= 1f)
             throw new ArgumentOutOfRangeException(nameof(keepThreshold));
         if (PtxFusedPhiloxDropoutF32Kernel.RangesOverlap(input, output) ||
             PtxFusedPhiloxDropoutF32Kernel.RangesOverlap(input, mask) ||
@@ -237,4 +236,3 @@ internal sealed class PtxFusedBiasPhiloxDropout256F32Kernel : IDisposable
                 $"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
     }
 }
-#endif

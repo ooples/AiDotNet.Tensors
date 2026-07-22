@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 using System.Text;
@@ -30,7 +29,7 @@ internal sealed class PtxRreluF32Kernel : IDisposable
         DirectPtxRreluKind kind,
         int elementCount)
     {
-        ArgumentNullException.ThrowIfNull(runtime);
+        PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         if (!DirectPtxArchitecture.HasExperimentalRngDropout(
                 runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
@@ -262,4 +261,3 @@ internal sealed class PtxRreluF32Kernel : IDisposable
             throw new ArgumentException("RReLU forward tensors may not alias.");
     }
 }
-#endif

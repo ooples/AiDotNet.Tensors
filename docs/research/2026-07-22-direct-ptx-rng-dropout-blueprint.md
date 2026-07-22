@@ -116,6 +116,11 @@ module cache. Cache keys include operation semantics and shape; audit identity
 also includes PTX SHA-256 and the GPU/SM/driver fingerprint. Disposal unloads
 all RNG modules before the CUDA context and stream are released.
 
+The runtime, emitters, admission checks, and CUDA dispatch hooks compile on both
+net471 and modern .NET targets. They use the shared `PtxCompat` layer for BCL
+features and pointer conversions missing from .NET Framework; no target-specific
+guard is allowed to compile the PTX route out of one supported framework.
+
 Warm dispatches use direct cache probes; factory delegates exist only in
 no-inline cold creation helpers. Saved-noise RReLU likewise uses explicit
 forward/backward calls instead of a capturing launch delegate. This makes the

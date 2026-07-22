@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 using System.Text;
@@ -38,7 +37,7 @@ internal sealed class PtxPhiloxFillF32Kernel : IDisposable
         DirectPtxPhiloxFillKind kind,
         int elementCount)
     {
-        ArgumentNullException.ThrowIfNull(runtime);
+        PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         if (!DirectPtxArchitecture.HasExperimentalRngDropout(
                 runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
@@ -70,7 +69,7 @@ internal sealed class PtxPhiloxFillF32Kernel : IDisposable
             DirectPtxPhiloxFillKind.DropThresholdMask)
             throw new InvalidOperationException("Use LaunchMask for a Bernoulli fill.");
         Require(output);
-        if (!float.IsFinite(first) || !float.IsFinite(second) ||
+        if (!PtxCompat.IsFinite(first) || !PtxCompat.IsFinite(second) ||
             (Kind == DirectPtxPhiloxFillKind.Uniform && second <= first) ||
             (Kind == DirectPtxPhiloxFillKind.Normal && second < 0f))
             throw new ArgumentOutOfRangeException(nameof(first),
@@ -98,7 +97,7 @@ internal sealed class PtxPhiloxFillF32Kernel : IDisposable
                          DirectPtxPhiloxFillKind.DropThresholdMask))
             throw new InvalidOperationException("LaunchMask requires a Bernoulli fill module.");
         Require(output);
-        if (threshold == 0 || !float.IsFinite(scale) || scale < 0f)
+        if (threshold == 0 || !PtxCompat.IsFinite(scale) || scale < 0f)
             throw new ArgumentOutOfRangeException(nameof(threshold));
         IntPtr outputPointer = output.Pointer;
         void** arguments = stackalloc void*[6];
@@ -340,4 +339,3 @@ internal sealed class PtxPhiloxFillF32Kernel : IDisposable
                 "Supported exact element buckets are 4096, 65536, and 1048576.");
     }
 }
-#endif

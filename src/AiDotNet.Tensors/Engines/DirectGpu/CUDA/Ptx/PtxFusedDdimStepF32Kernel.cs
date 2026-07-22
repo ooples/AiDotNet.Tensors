@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 using System.Text;
@@ -26,7 +25,7 @@ internal sealed class PtxFusedDdimStepF32Kernel : IDisposable
 
     internal PtxFusedDdimStepF32Kernel(DirectPtxRuntime runtime, int elementCount)
     {
-        ArgumentNullException.ThrowIfNull(runtime);
+        PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         if (!DirectPtxArchitecture.HasExperimentalRngDropout(
                 runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
@@ -54,7 +53,7 @@ internal sealed class PtxFusedDdimStepF32Kernel : IDisposable
         Require(xT, Blueprint.Tensors[0], nameof(xT));
         Require(epsilon, Blueprint.Tensors[1], nameof(epsilon));
         Require(output, Blueprint.Tensors[2], nameof(output));
-        if (!float.IsFinite(xCoefficient) || !float.IsFinite(epsilonCoefficient))
+        if (!PtxCompat.IsFinite(xCoefficient) || !PtxCompat.IsFinite(epsilonCoefficient))
             throw new ArgumentOutOfRangeException(nameof(xCoefficient));
         if (PtxFusedPhiloxDropoutF32Kernel.RangesOverlap(xT, output) ||
             PtxFusedPhiloxDropoutF32Kernel.RangesOverlap(epsilon, output))
@@ -189,4 +188,3 @@ internal sealed class PtxFusedDdimStepF32Kernel : IDisposable
                 $"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
     }
 }
-#endif

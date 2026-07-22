@@ -190,14 +190,14 @@ internal readonly struct DirectPtxTensorView
         DirectPtxBuffer buffer,
         DirectPtxTensorContract contract)
     {
-        ArgumentNullException.ThrowIfNull(buffer);
+        PtxCompat.ThrowIfNull(buffer, nameof(buffer));
         if (buffer.Pointer == IntPtr.Zero)
             throw new ArgumentException("The direct PTX buffer has no device pointer.", nameof(buffer));
         if (buffer.ByteLength != contract.RequiredBytes)
             throw new ArgumentException(
                 $"Tensor '{contract.Name}' requires exactly {contract.RequiredBytes} bytes; allocation has {buffer.ByteLength}.",
                 nameof(buffer));
-        nuint pointerValue = checked((nuint)buffer.Pointer);
+        nuint pointerValue = PtxCompat.ToNuint(buffer.Pointer);
         if ((pointerValue & (nuint)(contract.AlignmentBytes - 1)) != 0)
             throw new ArgumentException(
                 $"Tensor '{contract.Name}' is not {contract.AlignmentBytes}-byte aligned.", nameof(buffer));
