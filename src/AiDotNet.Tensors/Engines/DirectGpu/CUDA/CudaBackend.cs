@@ -2662,13 +2662,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             biasFloat.SizeInBytes < outputBytes || outputFloat.SizeInBytes < outputBytes)
             throw new ArgumentException(
                 "W8A8 fused-linear buffers are smaller than the requested canonical extents.");
-#if NET5_0_OR_GREATER
         if (TryDirectPtxFusedLinearGeluW8A8M1(
             inputInt8, outputMajorWeightsInt8, activationScaleFloat,
             weightScalesFloat, biasFloat, outputFloat,
             inputFeatures, outputFeatures))
             return;
-#endif
 
         if (!_kernelCache.TryGetValue("fused_linear_gelu_w8a8_m1", out var kernel))
             throw new InvalidOperationException(
@@ -9938,11 +9936,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             outputMajorWeight.Size < checked(inFeatures * outFeatures) ||
             bias.Size < outFeatures || output.Size < outFeatures)
             throw new ArgumentException("Fused-linear buffers are smaller than the requested canonical extents.");
-#if NET5_0_OR_GREATER
         if (TryDirectPtxFusedLinearGeluM1(
             input, outputMajorWeight, bias, output, inFeatures, outFeatures))
             return;
-#endif
         MatMulTransposed(input, outputMajorWeight, output, 1, outFeatures, inFeatures);
         BiasAdd(output, bias, output, 1, outFeatures);
         Gelu(output, output, outFeatures);
