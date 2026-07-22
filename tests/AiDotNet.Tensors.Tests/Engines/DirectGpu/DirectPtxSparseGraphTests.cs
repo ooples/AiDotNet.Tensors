@@ -10,6 +10,19 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 public sealed class DirectPtxSparseGraphTests
 {
     [Fact]
+    public void CompletionLedger_IsUniqueExplicitAndBlocksPrematurePr()
+    {
+        Assert.True(DirectPtxSparseGraphCompletionLedger.All.Count >= 100);
+        Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
+            DirectPtxSparseGraphCompletionLedger.All
+                .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
+        Assert.Equal(2, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+            entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
+        Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
+        Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
+    }
+
+    [Fact]
     public void CsrSpmmEmitter_BakesExactShapeAndUsesRegisterResidentVec4Reduction()
     {
         string ptx = PtxFusedCsrSpmmVec4F32Kernel.EmitPtx(8, 6);
