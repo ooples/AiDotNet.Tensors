@@ -125,6 +125,10 @@ internal enum DirectPtxPhysicalLayout
     CsrColumnIndices,
     /// <summary>Monotone Int32 CSR row offsets with terminal offset equal to nnz.</summary>
     CsrRowPointers,
+    /// <summary>Zero-based Int32 COO row indices, one per sampled non-zero.</summary>
+    CooRowIndices,
+    /// <summary>Zero-based Int32 COO column indices, one per sampled non-zero.</summary>
+    CooColumnIndices,
     /// <summary>Dense additive attention bias, [H,Sq,Skv] or [B,H,Sq,Skv].</summary>
     AttentionBias,
     /// <summary>One-dimensional canonical vector.</summary>

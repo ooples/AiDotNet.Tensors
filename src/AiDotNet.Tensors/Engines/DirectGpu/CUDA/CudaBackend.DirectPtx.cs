@@ -32,6 +32,8 @@ public sealed partial class CudaBackend
         _directPtxQkvRopeCacheKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<DirectPtxCsrSpmmKey, PtxFusedCsrSpmmVec4F32Kernel>
         _directPtxCsrSpmmKernels = new(4);
+    private readonly DirectPtxKernelCache<DirectPtxSddmmKey, PtxFusedSddmmF32Kernel>
+        _directPtxSddmmKernels = new(4);
     private DirectPtxRuntime? _directPtxRuntime;
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
@@ -46,6 +48,7 @@ public sealed partial class CudaBackend
     private long _directPtxFlashAttentionBackwardDispatchCount;
     private long _directPtxQkvRopeCacheDispatchCount;
     private long _directPtxCsrSpmmDispatchCount;
+    private long _directPtxSddmmDispatchCount;
     internal int DirectPtxCachedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxAttentionKernels.Count; }
@@ -115,6 +118,13 @@ public sealed partial class CudaBackend
     internal int DirectPtxCsrSpmmPinnedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxCsrSpmmKernels.PinnedCount; }
+    }
+    internal long DirectPtxSddmmDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxSddmmDispatchCount);
+    internal int DirectPtxSddmmKernelCapacity => _directPtxSddmmKernels.Capacity;
+    internal int DirectPtxSddmmPinnedKernelCount
+    {
+        get { lock (_directPtxLock) return _directPtxSddmmKernels.PinnedCount; }
     }
 
     /// <summary>
@@ -308,6 +318,152 @@ public sealed partial class CudaBackend
         nuint leftEnd = checked(leftStart + (nuint)left.SizeInBytes);
         nuint rightEnd = checked(rightStart + (nuint)right.SizeInBytes);
         return leftStart < rightEnd && rightStart < leftEnd;
+    }
+
+    /// <summary>
+    /// Attempts the exact FP32 SDDMM specialization for a 1024x1024 sampled
+    /// product, K=64, and 16384 COO entries. The public CUDA SDDMM surface does
+    /// not carry dense row counts, so exact allocation extents prove both row
+    /// domains before the five-pointer kernel ABI is admitted.
+    /// </summary>
+    internal bool TryDirectPtxSddmmF32(
+        IGpuBuffer rowIndices,
+        IGpuBuffer columnIndices,
+        IGpuBuffer x,
+        IGpuBuffer y,
+        IGpuBuffer output,
+        int nonZeros,
+        int inner)
+    {
+        if (!DirectPtxFeatureGate.IsSparseGraphEnabled)
+        {
+            DirectPtxLastError = "sddmm-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable || !DirectPtxArchitecture.HasValidatedSparseGraph(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = "sddmm-architecture-not-implemented";
+            return false;
+        }
+        if (!PtxFusedSddmmF32Kernel.SupportsShape(
+            PtxFusedSddmmF32Kernel.Rows, PtxFusedSddmmF32Kernel.Columns, inner, nonZeros))
+        {
+            DirectPtxLastError = "sddmm-shape-not-implemented";
+            return false;
+        }
+        if (rowIndices is null || columnIndices is null || x is null || y is null || output is null)
+        {
+            DirectPtxLastError = "sddmm-null-buffer";
+            return false;
+        }
+
+        long patternBytes = (long)nonZeros * sizeof(int);
+        long xBytes = (long)PtxFusedSddmmF32Kernel.Rows * inner * sizeof(float);
+        long yBytes = (long)PtxFusedSddmmF32Kernel.Columns * inner * sizeof(float);
+        long outputBytes = (long)nonZeros * sizeof(float);
+        if (rowIndices.SizeInBytes != patternBytes || columnIndices.SizeInBytes != patternBytes ||
+            x.SizeInBytes != xBytes || y.SizeInBytes != yBytes || output.SizeInBytes != outputBytes)
+        {
+            DirectPtxLastError = "sddmm-physical-extent-mismatch";
+            return false;
+        }
+        if (rowIndices.Handle == IntPtr.Zero || columnIndices.Handle == IntPtr.Zero ||
+            x.Handle == IntPtr.Zero || y.Handle == IntPtr.Zero || output.Handle == IntPtr.Zero)
+        {
+            DirectPtxLastError = "sddmm-invalid-device-pointer";
+            return false;
+        }
+        if ((((nuint)rowIndices.Handle | (nuint)columnIndices.Handle | (nuint)x.Handle |
+              (nuint)y.Handle | (nuint)output.Handle) & 15u) != 0)
+        {
+            DirectPtxLastError = "sddmm-alignment-mismatch";
+            return false;
+        }
+        if (DirectPtxBuffersOverlap(output, rowIndices) ||
+            DirectPtxBuffersOverlap(output, columnIndices) ||
+            DirectPtxBuffersOverlap(output, x) || DirectPtxBuffersOverlap(output, y))
+        {
+            DirectPtxLastError = "sddmm-alias-not-supported";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var key = new DirectPtxSddmmKey(nonZeros, inner);
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxSddmmKernels.TryGetValue(key, out _))
+                {
+                    DirectPtxLastError = "Direct PTX SDDMM must be prewarmed before CUDA graph capture.";
+                    return false;
+                }
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxFusedSddmmF32Kernel kernel = _directPtxSddmmKernels.GetOrAdd(
+                    key, () => new PtxFusedSddmmF32Kernel(_directPtxRuntime));
+                if (capturing && !_directPtxSddmmKernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX SDDMM module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(rowIndices, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(columnIndices, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(x, kernel.Blueprint.Tensors[2]),
+                        DirectPtxTensorView.Create(y, kernel.Blueprint.Tensors[3]),
+                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[4]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxSddmmDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool PrewarmDirectPtxSddmmF32(int nonZeros, int inner)
+    {
+        if (!IsDirectPtxSparseGraphEnabled || IsStreamCapturing() ||
+            !PtxFusedSddmmF32Kernel.SupportsShape(
+                PtxFusedSddmmF32Kernel.Rows, PtxFusedSddmmF32Kernel.Columns, inner, nonZeros))
+            return false;
+        try
+        {
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                var key = new DirectPtxSddmmKey(nonZeros, inner);
+                _ = _directPtxSddmmKernels.GetOrAdd(
+                    key, () => new PtxFusedSddmmF32Kernel(_directPtxRuntime));
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxSddmmAudit(
+        int nonZeros, int inner, out DirectPtxKernelAudit audit)
+    {
+        lock (_directPtxLock)
+        {
+            if (_directPtxSddmmKernels.TryGetValue(
+                new DirectPtxSddmmKey(nonZeros, inner), out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null!;
+        return false;
     }
 
     /// <summary>
@@ -1995,6 +2151,7 @@ public sealed partial class CudaBackend
             _directPtxFlashAttentionBackwardKernels.Dispose();
             _directPtxQkvRopeCacheKernels.Dispose();
             _directPtxCsrSpmmKernels.Dispose();
+            _directPtxSddmmKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }
@@ -2066,6 +2223,7 @@ public sealed partial class CudaBackend
         int Inner,
         int Columns,
         int NonZeros);
+    private readonly record struct DirectPtxSddmmKey(int NonZeros, int Inner);
 
 }
 #endif

@@ -110,7 +110,7 @@ internal sealed class PtxFusedCsrSpmmVec4F32Kernel : IDisposable
                 new("output", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.RowMajor2D,
                     output, output, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
-            ResourceBudget: new DirectPtxResourceBudget(32, 0, 0, 4),
+            ResourceBudget: new DirectPtxResourceBudget(48, 0, 0, 4),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["equation"] = "C=A(csr)*B",

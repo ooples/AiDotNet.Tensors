@@ -3789,6 +3789,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new InvalidOperationException("CUDA backend is not available.");
         if (nnz == 0) return;
 
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxSddmmF32(
+            rowIndices, colIndices, x, y, output, nnz, innerK))
+            return;
+#endif
+
         if (!_kernelCache.TryGetValue("sddmm", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: sddmm");
 

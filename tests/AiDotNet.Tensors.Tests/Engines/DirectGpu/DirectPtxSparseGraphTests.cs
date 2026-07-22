@@ -16,7 +16,7 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
             DirectPtxSparseGraphCompletionLedger.All
                 .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(2, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+        Assert.Equal(3, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
             entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
         Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
         Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
@@ -61,6 +61,56 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(PtxFusedCsrSpmmVec4F32Kernel.Rows + 1, blueprint.Tensors[2].LogicalExtent.ElementCount);
         Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
         Assert.Equal("0", blueprint.Semantics["intermediate-global-bytes"]);
+    }
+
+    [Fact]
+    public void SddmmEmitter_BakesExactShapeAndUsesRegisterResidentUnrolledReduction()
+    {
+        string ptx = PtxFusedSddmmF32Kernel.EmitPtx(8, 6);
+
+        Assert.Contains(PtxFusedSddmmF32Kernel.EntryPoint, ptx);
+        Assert.Contains(".target sm_86", ptx);
+        Assert.Equal(32, Count(ptx, "ld.global.v4.f32"));
+        Assert.Equal(PtxFusedSddmmF32Kernel.Inner, Count(ptx, "fma.rn.f32"));
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("bra", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("shape", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.Equal(5, Count(ptx, ".param .u64"));
+    }
+
+    [Fact]
+    public void SddmmBlueprint_DeclaresExactCoo32AndDensePhysicalAbi()
+    {
+        DirectPtxKernelBlueprint blueprint =
+            PtxFusedSddmmF32Kernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere);
+
+        Assert.Equal("sddmm-f32-v1-Ampere-m1024-n1024-k64-nnz16384-row-major", blueprint.Id);
+        Assert.Equal(5, blueprint.Tensors.Count);
+        Assert.All(blueprint.Tensors, tensor =>
+        {
+            Assert.Equal(DirectPtxExtentMode.Exact, tensor.ExtentMode);
+            Assert.Equal(16, tensor.AlignmentBytes);
+        });
+        Assert.Equal(DirectPtxPhysicalLayout.CooRowIndices, blueprint.Tensors[0].Layout);
+        Assert.Equal(DirectPtxPhysicalLayout.CooColumnIndices, blueprint.Tensors[1].Layout);
+        Assert.Equal(DirectPtxPhysicalLayout.RowMajor2D, blueprint.Tensors[2].Layout);
+        Assert.Equal(DirectPtxPhysicalLayout.Vector, blueprint.Tensors[4].Layout);
+        Assert.Equal("ascending-inner-index", blueprint.Semantics["reduction-order"]);
+        Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
+    }
+
+    [Fact]
+    public void SddmmShapeMatrix_IsExactAndNeverPromotedWithoutHardwareEvidence()
+    {
+        Assert.True(PtxFusedSddmmF32Kernel.SupportsShape(1024, 1024, 64, 16384));
+        Assert.False(PtxFusedSddmmF32Kernel.SupportsShape(512, 1024, 64, 16384));
+        Assert.False(PtxFusedSddmmF32Kernel.SupportsShape(1024, 1024, 32, 16384));
+        Assert.False(PtxFusedSddmmF32Kernel.SupportsShape(1024, 1024, 64, 8192));
+        Assert.False(PtxFusedSddmmF32Kernel.IsPromotedShape(1024, 1024, 64, 16384));
     }
 
     [Theory]
@@ -147,6 +197,56 @@ public sealed class DirectPtxSparseGraphTests
             DirectPtxTensorView.CreateOwned(columnsBuffer, kernel.Blueprint.Tensors[1]),
             DirectPtxTensorView.CreateOwned(rowPointersBuffer, kernel.Blueprint.Tensors[2]),
             DirectPtxTensorView.CreateOwned(denseBuffer, kernel.Blueprint.Tensors[3]),
+            DirectPtxTensorView.CreateOwned(outputBuffer, kernel.Blueprint.Tensors[4]));
+        runtime.Synchronize();
+        var actual = new float[expected.Length];
+        outputBuffer.Download<float>(actual);
+        double maxError = actual.Select((value, index) => Math.Abs(value - expected[index])).Max();
+        Assert.True(maxError <= 2e-5, $"maximum error {maxError:R}");
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+    }
+
+    [SkippableFact]
+    public void DriverOnlySddmm_MatchesFp64OracleAndReportsNoDriverLocalMemory()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedSparseGraph(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in sparse/graph specialization admits only SM86.");
+        using var kernel = new PtxFusedSddmmF32Kernel(runtime);
+
+        int[] rows = new int[PtxFusedSddmmF32Kernel.NonZeros];
+        int[] columns = new int[rows.Length];
+        for (int p = 0; p < rows.Length; p++)
+        {
+            rows[p] = (p * 17) & 1023;
+            columns[p] = (p * 29 + 7) & 1023;
+        }
+        float[] x = Enumerable.Range(0, PtxFusedSddmmF32Kernel.Rows * PtxFusedSddmmF32Kernel.Inner)
+            .Select(index => ((index * 19) % 101 - 50) / 128f).ToArray();
+        float[] y = Enumerable.Range(0, PtxFusedSddmmF32Kernel.Columns * PtxFusedSddmmF32Kernel.Inner)
+            .Select(index => ((index * 23) % 97 - 48) / 128f).ToArray();
+        double[] expected = new double[rows.Length];
+        for (int p = 0; p < rows.Length; p++)
+        for (int k = 0; k < PtxFusedSddmmF32Kernel.Inner; k++)
+            expected[p] += (double)x[rows[p] * PtxFusedSddmmF32Kernel.Inner + k] *
+                y[columns[p] * PtxFusedSddmmF32Kernel.Inner + k];
+
+        using var rowBuffer = runtime.AllocateBytes((nuint)(rows.Length * sizeof(int)));
+        using var columnBuffer = runtime.AllocateBytes((nuint)(columns.Length * sizeof(int)));
+        using var xBuffer = runtime.AllocateBytes((nuint)(x.Length * sizeof(float)));
+        using var yBuffer = runtime.AllocateBytes((nuint)(y.Length * sizeof(float)));
+        using var outputBuffer = runtime.AllocateBytes((nuint)(expected.Length * sizeof(float)));
+        rowBuffer.Upload<int>(rows);
+        columnBuffer.Upload<int>(columns);
+        xBuffer.Upload<float>(x);
+        yBuffer.Upload<float>(y);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(rowBuffer, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(columnBuffer, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(xBuffer, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(yBuffer, kernel.Blueprint.Tensors[3]),
             DirectPtxTensorView.CreateOwned(outputBuffer, kernel.Blueprint.Tensors[4]));
         runtime.Synchronize();
         var actual = new float[expected.Length];
