@@ -15353,6 +15353,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new ArgumentOutOfRangeException(nameof(numQubits), numQubits,
                 "Number of qubits must be between 1 and 30 to avoid integer overflow.");
 
+        if (TryDirectPtxQuantumRotation(stateReal, stateImag, outReal, outImag, angles, numQubits, batchSize)) return;
+
         using var _ = PushContext();
         int dim = 1 << numQubits;
         // dim is guaranteed to be power of two since it's 2^numQubits

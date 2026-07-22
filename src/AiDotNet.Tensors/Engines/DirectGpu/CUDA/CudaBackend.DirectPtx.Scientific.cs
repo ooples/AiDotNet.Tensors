@@ -26,6 +26,7 @@ public sealed partial class CudaBackend
     private readonly record struct SciShKey(int NumPoints, int BasisCount, int NumChannels, int Degree, bool BroadcastDir);
     private readonly record struct SciCapsuleKey(DirectPtxCapsuleOp Op, int Batch, int InputCapsules, int InputDim, int OutputCount, int OutputDim);
     private readonly record struct SciCapsuleRoutingKey(int Batch, int InputCapsules, int OutputCapsules, int CapsuleDim);
+    private readonly record struct SciQuantumRotationKey(int NumQubits, int Batch);
 
     private readonly DirectPtxKernelCache<SciCountKey, PtxComplexMultiplyKernel> _sciComplexMul =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
@@ -72,6 +73,8 @@ public sealed partial class CudaBackend
     private readonly DirectPtxKernelCache<SciMatVecKey, PtxNormalizeProbabilitiesKernel> _sciNormalizeProbabilities =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<SciMatVecKey, PtxMeasurementForwardKernel> _sciMeasurementForward =
+        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<SciQuantumRotationKey, PtxQuantumRotationKernel> _sciQuantumRotation =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
 
     private long _sciDispatchCount;
@@ -439,6 +442,25 @@ public sealed partial class CudaBackend
         });
     }
 
+    internal bool TryDirectPtxQuantumRotation(
+        IGpuBuffer stateReal, IGpuBuffer stateImag, IGpuBuffer outReal, IGpuBuffer outImag, IGpuBuffer angles,
+        int numQubits, int batchSize)
+    {
+        if (!ScientificGateOpen || !PtxQuantumRotationKernel.IsSupportedShape(numQubits, batchSize)) return Fail("quantum-rotation");
+        long stateBytes = checked((long)batchSize * (1L << numQubits) * sizeof(float));
+        long angleBytes = checked((long)numQubits * sizeof(float));
+        if (stateReal.SizeInBytes != stateBytes || stateImag.SizeInBytes != stateBytes ||
+            outReal.SizeInBytes != stateBytes || outImag.SizeInBytes != stateBytes ||
+            angles.SizeInBytes != angleBytes) return Fail("quantum-rotation-extent");
+        return SciDispatch(() =>
+        {
+            var k = _sciQuantumRotation.GetOrAdd(new SciQuantumRotationKey(numQubits, batchSize),
+                () => new PtxQuantumRotationKernel(_directPtxRuntime!, numQubits, batchSize));
+            Launch5(k.Blueprint, stateReal, stateImag, outReal, outImag, angles,
+                (vsr, vsi, vor, voi, va) => k.Launch(vsr, vsi, vor, voi, va));
+        });
+    }
+
     private bool Fail(string reason)
     {
         DirectPtxLastError = $"scientific-{reason}-not-eligible";
@@ -473,6 +495,19 @@ public sealed partial class CudaBackend
                 DirectPtxTensorView.Create(b, bp.Tensors[1]),
                 DirectPtxTensorView.Create(c, bp.Tensors[2]),
                 DirectPtxTensorView.Create(d, bp.Tensors[3]));
+    }
+
+    private void Launch5(
+        DirectPtxKernelBlueprint bp, IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, IGpuBuffer d, IGpuBuffer e,
+        Action<DirectPtxTensorView, DirectPtxTensorView, DirectPtxTensorView, DirectPtxTensorView, DirectPtxTensorView> launch)
+    {
+        lock (GpuDispatchLock)
+            launch(
+                DirectPtxTensorView.Create(a, bp.Tensors[0]),
+                DirectPtxTensorView.Create(b, bp.Tensors[1]),
+                DirectPtxTensorView.Create(c, bp.Tensors[2]),
+                DirectPtxTensorView.Create(d, bp.Tensors[3]),
+                DirectPtxTensorView.Create(e, bp.Tensors[4]));
     }
 
     private void Launch6(

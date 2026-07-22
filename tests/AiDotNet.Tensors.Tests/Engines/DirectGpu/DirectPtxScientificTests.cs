@@ -14,12 +14,13 @@ public class DirectPtxScientificTests
     [Fact]
     public void ScientificCoverageManifest_AssignsEveryScopedApiExactlyOnce()
     {
-        Assert.Equal(25, DirectPtxScientificCoverageManifest.All.Count);
+        Assert.Equal(26, DirectPtxScientificCoverageManifest.All.Count);
         string[] names = DirectPtxScientificCoverageManifest.All.Select(c => c.Api).ToArray();
         Assert.Contains("CudaBackend.CosineSimilarity", names);
         Assert.Contains("CudaBackend.SphericalSoftmax", names);
         Assert.Contains("CudaBackend.NormalizeProbabilities", names);
         Assert.Contains("CudaBackend.MeasurementForward", names);
+        Assert.Contains("CudaBackend.QuantumRotation", names);
         Assert.Contains("CudaBackend.RbfForward", names);
         Assert.Contains("CudaBackend.PairwiseDistance", names);
         Assert.Contains("CudaBackend.PairwiseDistanceSquared", names);
@@ -754,6 +755,89 @@ public class DirectPtxScientificTests
         var actual = new float[expected.Length];
         outBuf.Download<float>(actual);
         AssertVectorClose(actual, expected, 3e-3f, $"capsule {op}");
+    }
+
+    [Fact]
+    public void QuantumRotationEmitter_UnrollsQubitsWithBarriers()
+    {
+        const int numQubits = 4;
+        string ptx = PtxQuantumRotationKernel.EmitPtx(8, 6, numQubits, 16);
+        Assert.Contains(PtxQuantumRotationKernel.EntryPoint, ptx);
+        Assert.Contains("$QR_INIT:", ptx);
+        Assert.Equal(numQubits, Count(ptx, "cos.approx.f32"));   // one per qubit
+        Assert.Equal(numQubits, Count(ptx, "sin.approx.f32"));
+        Assert.Equal(numQubits + 1, Count(ptx, "bar.sync 0"));   // init + one per qubit step
+        for (int q = 0; q < numQubits; q++) Assert.Contains($"$QR_STEP{q}:", ptx);
+        Assert.DoesNotContain("shfl.sync.bfly", ptx, StringComparison.Ordinal);   // discipline rule 1
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxQuantumRotationKernel.IsSupportedShape(numQubits, 16));
+        Assert.False(PtxQuantumRotationKernel.IsSupportedShape(0, 16));
+        Assert.False(PtxQuantumRotationKernel.IsSupportedShape(PtxQuantumRotationKernel.MaxQubits + 1, 16));
+        Assert.False(PtxQuantumRotationKernel.IsPromotedShape(numQubits, 16));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyQuantumRotation_MatchesOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in quantum-rotation specialization is measured on GA10x/SM86.");
+        const int numQubits = 6, batchSize = 16;
+        int dim = 1 << numQubits;
+        using var kernel = new PtxQuantumRotationKernel(runtime, numQubits, batchSize);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20268300);
+        float[] sr = Values(random, batchSize * dim, 1.0f);
+        float[] si = Values(random, batchSize * dim, 1.0f);
+        float[] angles = new float[numQubits];
+        for (int q = 0; q < numQubits; q++) angles[q] = (float)((random.NextDouble() * 2.0 - 1.0) * 1.2);   // modest range for approx sin/cos
+
+        // CPU oracle mirroring the NVRTC butterfly.
+        var expR = (float[])sr.Clone();
+        var expI = (float[])si.Clone();
+        for (int b = 0; b < batchSize; b++)
+        {
+            int off = b * dim;
+            for (int q = 0; q < numQubits; q++)
+            {
+                float c = (float)Math.Cos(angles[q] / 2.0f), s = (float)Math.Sin(angles[q] / 2.0f);
+                int stride = 1 << q;
+                for (int i = 0; i < dim / 2; i++)
+                {
+                    int block = i / stride, within = i % stride;
+                    int idx0 = block * 2 * stride + within, idx1 = idx0 + stride;
+                    float r0 = expR[off + idx0], i0 = expI[off + idx0], r1 = expR[off + idx1], i1 = expI[off + idx1];
+                    expR[off + idx0] = c * r0 - s * r1;
+                    expI[off + idx0] = c * i0 - s * i1;
+                    expR[off + idx1] = s * r0 + c * r1;
+                    expI[off + idx1] = s * i0 + c * i1;
+                }
+            }
+        }
+
+        using var srBuf = runtime.AllocateBytes((nuint)(sr.Length * sizeof(float)));
+        using var siBuf = runtime.AllocateBytes((nuint)(si.Length * sizeof(float)));
+        using var orBuf = runtime.AllocateBytes((nuint)(sr.Length * sizeof(float)));
+        using var oiBuf = runtime.AllocateBytes((nuint)(si.Length * sizeof(float)));
+        using var angBuf = runtime.AllocateBytes((nuint)(angles.Length * sizeof(float)));
+        srBuf.Upload<float>(sr); siBuf.Upload<float>(si); angBuf.Upload<float>(angles);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(srBuf, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(siBuf, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(orBuf, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(oiBuf, kernel.Blueprint.Tensors[3]),
+            DirectPtxTensorView.CreateOwned(angBuf, kernel.Blueprint.Tensors[4]));
+        runtime.Synchronize();
+        var actualR = new float[sr.Length];
+        var actualI = new float[si.Length];
+        orBuf.Download<float>(actualR);
+        oiBuf.Download<float>(actualI);
+        AssertVectorClose(actualR, expR, 3e-3f, "quantum rotation real");
+        AssertVectorClose(actualI, expI, 3e-3f, "quantum rotation imag");
     }
 
     [Fact]
@@ -1830,6 +1914,40 @@ public class DirectPtxScientificTests
             }
             using (var ib = backend.AllocateBuffer(mfIn)) using (var o = backend.AllocateBuffer(mfBatch * mfState))
             { backend.MeasurementForward(ib, o, mfBatch, mfState); n = AssertDispatched(n, "measurement-forward"); AssertVectorClose(backend.DownloadBuffer(o), mfExp, 2e-3f, "measurement-forward route"); }
+
+            // Quantum rotation: Ry per qubit. numQubits=6 -> dim=64.
+            const int qrQubits = 6, qrBatch = 16, qrDim = 1 << qrQubits;
+            float[] qrSr = Values(random, qrBatch * qrDim, 1.0f), qrSi = Values(random, qrBatch * qrDim, 1.0f);
+            float[] qrAng = new float[qrQubits];
+            for (int q = 0; q < qrQubits; q++) qrAng[q] = 0.3f + 0.1f * q;
+            var qrExpR = (float[])qrSr.Clone();
+            var qrExpI = (float[])qrSi.Clone();
+            for (int bt = 0; bt < qrBatch; bt++)
+            {
+                int off = bt * qrDim;
+                for (int q = 0; q < qrQubits; q++)
+                {
+                    float cc = (float)Math.Cos(qrAng[q] / 2.0f), ss = (float)Math.Sin(qrAng[q] / 2.0f);
+                    int stride = 1 << q;
+                    for (int i = 0; i < qrDim / 2; i++)
+                    {
+                        int block = i / stride, within = i % stride;
+                        int idx0 = block * 2 * stride + within, idx1 = idx0 + stride;
+                        float r0 = qrExpR[off + idx0], i0 = qrExpI[off + idx0], r1 = qrExpR[off + idx1], i1 = qrExpI[off + idx1];
+                        qrExpR[off + idx0] = cc * r0 - ss * r1; qrExpI[off + idx0] = cc * i0 - ss * i1;
+                        qrExpR[off + idx1] = ss * r0 + cc * r1; qrExpI[off + idx1] = ss * i0 + cc * i1;
+                    }
+                }
+            }
+            using (var srb = backend.AllocateBuffer(qrSr)) using (var sib = backend.AllocateBuffer(qrSi))
+            using (var orb = backend.AllocateBuffer(qrBatch * qrDim)) using (var oib = backend.AllocateBuffer(qrBatch * qrDim))
+            using (var angb = backend.AllocateBuffer(qrAng))
+            {
+                backend.QuantumRotation(srb, sib, orb, oib, angb, qrQubits, qrBatch);
+                n = AssertDispatched(n, "quantum-rotation");
+                AssertVectorClose(backend.DownloadBuffer(orb), qrExpR, 3e-3f, "quantum-rotation real route");
+                AssertVectorClose(backend.DownloadBuffer(oib), qrExpI, 3e-3f, "quantum-rotation imag route");
+            }
         }
         finally
         {
