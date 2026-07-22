@@ -16,7 +16,7 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
             DirectPtxSparseGraphCompletionLedger.All
                 .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(39, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+        Assert.Equal(40, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
             entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
         Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
         Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
@@ -407,6 +407,22 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(atomic, ptx.Contains("atom.global", StringComparison.Ordinal));
         Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
         Assert.All(blueprint.Tensors, tensor => Assert.Equal(DirectPtxExtentMode.Exact, tensor.ExtentMode));
+    }
+
+    [Fact]
+    public void ScatterMaxRowsEmitter_BakesFirstTieAndEmptyGroupSemantics()
+    {
+        string ptx = PtxScatterMaxRowsF32Kernel.EmitPtx(8, 6);
+        DirectPtxKernelBlueprint blueprint = PtxScatterMaxRowsF32Kernel.CreateBlueprint(
+            DirectPtxArchitectureFamily.Ampere);
+
+        Assert.Equal(4, Count(ptx, ".param .u64"));
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("atom.", ptx, StringComparison.Ordinal);
+        Assert.Equal("lowest-source-row", blueprint.Semantics["tie-break"]);
+        Assert.Equal("negative-infinity", blueprint.Semantics["empty-output"]);
+        Assert.Equal("float-encoded-minus-one", blueprint.Semantics["empty-argmax"]);
+        Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
     }
 
     [Theory]

@@ -141,6 +141,11 @@ public sealed partial class CudaBackend : IInstantNgpBackend, IUniqueConsecutive
     {
         int total = checked(outputRows * innerSize);
         if (total <= 0) return;
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxScatterMaxRows(
+            source, indices, output, argmax, sourceRows, innerSize, outputRows))
+            return;
+#endif
         var kernel = ResolveInstantNgpKernel("resident_scatter_max_argmax_rows");
         using var _ = PushContext();
         IntPtr s = source.Handle, i = indices.Handle, o = output.Handle, a = argmax.Handle;
