@@ -13103,6 +13103,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     /// <inheritdoc/>
     public unsafe void ConvertToFp16(IGpuBuffer input, IGpuBuffer output, int size)
     {
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxCastFp16(input, output, size))
+            return;
+#endif
         // The toolkit (cuda_fp16.h-based) kernel is the faster __half2 packed
         // path, but it only compiles on machines with the CUDA Toolkit
         // header. On driver-only hosts CompileKernelModule(... CudaFp16Kernels)
