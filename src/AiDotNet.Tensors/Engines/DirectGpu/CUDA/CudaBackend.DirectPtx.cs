@@ -85,7 +85,7 @@ public sealed partial class CudaBackend
 
     internal bool IsDirectPtxFusedLinearEnabled =>
         DirectPtxFeatureGate.IsFusedLinearEnabled && IsAvailable &&
-        DirectPtxArchitecture.Classify(_ccMajor, _ccMinor) == DirectPtxArchitectureFamily.Ampere;
+        DirectPtxArchitecture.HasValidatedFusedLinear(_ccMajor, _ccMinor);
 
     internal long DirectPtxResidualRmsNormDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxResidualRmsNormDispatchCount);

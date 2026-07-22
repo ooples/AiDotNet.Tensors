@@ -30,9 +30,10 @@ internal sealed class PtxFusedLinearGeluM1Kernel : IDisposable
         int outputFeatures)
     {
         ArgumentNullException.ThrowIfNull(runtime);
-        if (runtime.ArchitectureFamily != DirectPtxArchitectureFamily.Ampere)
+        if (!DirectPtxArchitecture.HasValidatedFusedLinear(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
-                "The checked-in fused-linear GELU specialization is validated only on Ampere.");
+                "The checked-in fused-linear GELU specialization is measured only on GA10x/SM86.");
         ValidateShape(inputFeatures, outputFeatures);
 
         InputFeatures = inputFeatures;
