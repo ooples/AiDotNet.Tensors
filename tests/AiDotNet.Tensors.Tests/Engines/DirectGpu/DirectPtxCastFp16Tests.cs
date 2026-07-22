@@ -77,6 +77,40 @@ public class DirectPtxCastFp16Tests
             DirectPtxLayoutCoverageManifest.Get("UnassignedLayoutApi"));
     }
 
+    [SkippableFact]
+    public void BackendCast_PrewarmCaptureAndModuleLifetimeContractsHold()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previousGate = DirectPtxFeatureGate.TestOverride;
+        bool previousExperiment = DirectPtxFeatureGate.CastFp16ExperimentOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        DirectPtxFeatureGate.CastFp16ExperimentOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxCastFp16Enabled, "Requires an Ampere CUDA backend.");
+            const int size = 65_536;
+            using var input = backend.AllocateBuffer(new float[size]);
+            using var output = backend.AllocateBuffer(size / 2);
+
+            Assert.True(backend.PrewarmDirectPtxCastFp16(size), backend.DirectPtxLastError);
+            bool captured = true;
+            IntPtr graph = backend.CaptureGraph(() =>
+                captured &= backend.TryDirectPtxCastFp16(input, output, size));
+            Assert.True(captured, backend.DirectPtxLastError);
+            Assert.NotEqual(IntPtr.Zero, graph);
+            Assert.Equal(1, backend.DirectPtxCastFp16PinnedKernelCount);
+            try { backend.LaunchCapturedGraph(graph); }
+            finally { backend.DestroyCapturedGraph(graph); }
+            backend.Synchronize();
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previousGate;
+            DirectPtxFeatureGate.CastFp16ExperimentOverride = previousExperiment;
+        }
+    }
+
     [SkippableTheory]
     [InlineData(65_536)]
     [InlineData(262_144)]

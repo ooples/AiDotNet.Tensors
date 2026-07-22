@@ -107,6 +107,10 @@ public sealed partial class CudaBackend
 
     internal long DirectPtxCastFp16DispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxCastFp16DispatchCount);
+    internal int DirectPtxCastFp16PinnedKernelCount
+    {
+        get { lock (_directPtxLock) return _directPtxCastFp16Kernels.PinnedCount; }
+    }
     internal int DirectPtxQkvRopeCacheKernelCapacity => _directPtxQkvRopeCacheKernels.Capacity;
     internal int DirectPtxQkvRopeCachePinnedKernelCount
     {
@@ -1795,6 +1799,11 @@ public sealed partial class CudaBackend
         IGpuBuffer output,
         int size)
     {
+        if (input is null || output is null)
+        {
+            DirectPtxLastError = "cast-fp16-null-buffer";
+            return false;
+        }
         if (!DirectPtxFeatureGate.IsCastFp16Enabled)
         {
             DirectPtxLastError = "cast-fp16-feature-disabled";
@@ -1829,9 +1838,25 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "cast-fp16-physical-extent-mismatch";
             return false;
         }
+        if (input.Handle == IntPtr.Zero || output.Handle == IntPtr.Zero)
+        {
+            DirectPtxLastError = "cast-fp16-invalid-device-pointer";
+            return false;
+        }
+        if ((((nuint)input.Handle | (nuint)output.Handle) & 15u) != 0)
+        {
+            DirectPtxLastError = "cast-fp16-alignment-mismatch";
+            return false;
+        }
+        if (DirectPtxCastBuffersOverlap(input, output))
+        {
+            DirectPtxLastError = "cast-fp16-alias-not-supported";
+            return false;
+        }
 
         try
         {
+            bool capturing = IsStreamCapturing();
             EnsureContextCurrent();
             var key = new DirectPtxCastFp16Key(size);
             lock (_directPtxLock)
@@ -1839,7 +1864,7 @@ public sealed partial class CudaBackend
                 if (!_directPtxCastFp16Kernels.TryGetValue(
                     key, out PtxFusedCastF32ToF16Kernel? kernel))
                 {
-                    if (IsStreamCapturing())
+                    if (capturing)
                     {
                         DirectPtxLastError =
                             "Direct PTX cast must be prewarmed before CUDA graph capture.";
@@ -1848,6 +1873,9 @@ public sealed partial class CudaBackend
                     _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                     kernel = CreateAndCacheCastFp16KernelSlow(key);
                 }
+                if (capturing && !_directPtxCastFp16Kernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX cast module for CUDA graph capture.");
                 lock (GpuDispatchLock)
                     kernel.Launch(
                         DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]),
@@ -1862,6 +1890,15 @@ public sealed partial class CudaBackend
             DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
             return false;
         }
+    }
+
+    private static bool DirectPtxCastBuffersOverlap(IGpuBuffer input, IGpuBuffer output)
+    {
+        nuint inputStart = (nuint)input.Handle;
+        nuint outputStart = (nuint)output.Handle;
+        nuint inputEnd = checked(inputStart + (nuint)input.SizeInBytes);
+        nuint outputEnd = checked(outputStart + (nuint)output.SizeInBytes);
+        return inputStart < outputEnd && outputStart < inputEnd;
     }
 
     [System.Runtime.CompilerServices.MethodImpl(

@@ -18,7 +18,9 @@ verified on the local RTX 3080 (SM86) as **bit-identical** to the CPU
 `(Half)float` round-to-nearest-even reference across all admitted sizes,
 including zero, subnormal, and non-finite inputs.
 
-Production fails closed with `cast-fp16-performance-gate-not-met`
+The backend requires prewarm before CUDA graph capture and pins every captured
+module until backend disposal so bounded-cache eviction cannot invalidate a
+graph executable. Production fails closed with `cast-fp16-performance-gate-not-met`
 (`IsPromotedShape => false`). This draft does not close #845. Its 20-cell
 manifest assigns the remaining widen, BF16, copy, transpose, permute, reshape,
 interleave, block-quantize/dequantize, pad, slice, concat, and public-routing
