@@ -16,7 +16,7 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
             DirectPtxSparseGraphCompletionLedger.All
                 .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(53, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+        Assert.Equal(54, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
             entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
         Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
         Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
@@ -603,6 +603,30 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal("1", blueprint.Semantics["kernel-launches"]);
         Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
         Assert.Equal("0", blueprint.Semantics["intermediate-global-bytes"]);
+        Assert.All(blueprint.Tensors, tensor => Assert.Equal(DirectPtxExtentMode.Exact, tensor.ExtentMode));
+    }
+
+    [Fact]
+    public void UniformMeshLaplacianEmitter_BakesTriangleTopologyAndSingleWrite()
+    {
+        string ptx = PtxUniformMeshLaplacianF32Kernel.EmitPtx(8, 6);
+        DirectPtxKernelBlueprint blueprint = PtxUniformMeshLaplacianF32Kernel.CreateBlueprint(
+            DirectPtxArchitectureFamily.Ampere);
+
+        Assert.Equal(2, Count(ptx, ".param .u64"));
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("atom.", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(3, Count(ptx, "ld.global.u32"));
+        Assert.Equal(12, Count(ptx, "and.pred"));
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.Equal(PtxUniformMeshLaplacianF32Kernel.FaceIndices,
+            blueprint.Tensors[0].PhysicalExtent.ElementCount);
+        Assert.Equal(PtxUniformMeshLaplacianF32Kernel.OutputElements,
+            blueprint.Tensors[1].PhysicalExtent.ElementCount);
+        Assert.Equal("ascending-face", blueprint.Semantics["reduction-order"]);
+        Assert.Equal("single-overwrite", blueprint.Semantics["output-write"]);
+        Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
         Assert.All(blueprint.Tensors, tensor => Assert.Equal(DirectPtxExtentMode.Exact, tensor.ExtentMode));
     }
 

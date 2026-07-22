@@ -167,6 +167,8 @@ internal enum DirectPtxPhysicalLayout
     CapsuleVectors,
     /// <summary>Contiguous capsule gradients [capsule,dimension].</summary>
     CapsuleGradients,
+    /// <summary>Triangle vertex indices [face,three].</summary>
+    TriangleFaces,
     /// <summary>Dense additive attention bias, [H,Sq,Skv] or [B,H,Sq,Skv].</summary>
     AttentionBias,
     /// <summary>One-dimensional canonical vector.</summary>

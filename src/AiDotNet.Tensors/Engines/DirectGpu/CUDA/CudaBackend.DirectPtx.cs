@@ -74,6 +74,8 @@ public sealed partial class CudaBackend
         _directPtxResidentScatterAuxKernels = new(4);
     private readonly DirectPtxKernelCache<DirectPtxResidentScatterSoftmaxOperation, PtxResidentScatterSoftmaxF32Kernel>
         _directPtxResidentScatterSoftmaxKernels = new(4);
+    private readonly DirectPtxKernelCache<int, PtxUniformMeshLaplacianF32Kernel>
+        _directPtxUniformMeshLaplacianKernels = new(1);
     private DirectPtxRuntime? _directPtxRuntime;
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
@@ -108,6 +110,7 @@ public sealed partial class CudaBackend
     private long _directPtxCapsuleSquashDispatchCount;
     private long _directPtxResidentScatterAuxDispatchCount;
     private long _directPtxResidentScatterSoftmaxDispatchCount;
+    private long _directPtxUniformMeshLaplacianDispatchCount;
     internal int DirectPtxCachedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxAttentionKernels.Count; }
@@ -223,6 +226,8 @@ public sealed partial class CudaBackend
         System.Threading.Interlocked.Read(ref _directPtxResidentScatterAuxDispatchCount);
     internal long DirectPtxResidentScatterSoftmaxDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxResidentScatterSoftmaxDispatchCount);
+    internal long DirectPtxUniformMeshLaplacianDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxUniformMeshLaplacianDispatchCount);
 
     /// <summary>
     /// Attempts the exact FP32 CSR SpMM golden specialization. The admitted ABI
@@ -2699,6 +2704,72 @@ public sealed partial class CudaBackend
         }
     }
 
+    internal bool TryDirectPtxUniformMeshLaplacian(
+        IGpuBuffer faces,
+        IGpuBuffer output,
+        int faceCount,
+        int vertexCount)
+    {
+        const int key = 0;
+        if (!IsDirectPtxSparseGraphEnabled ||
+            !PtxUniformMeshLaplacianF32Kernel.SupportsShape(faceCount, vertexCount) ||
+            !HasExactBytes(faces, (long)faceCount * 3 * sizeof(int)) ||
+            !HasExactBytes(output, (long)vertexCount * vertexCount * sizeof(float)) ||
+            faces.Handle == IntPtr.Zero || output.Handle == IntPtr.Zero ||
+            ((((nuint)faces.Handle | (nuint)output.Handle) & 15u) != 0) ||
+            DirectPtxBuffersOverlap(output, faces))
+            return false;
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxUniformMeshLaplacianKernels.TryGetValue(key, out _))
+                    return false;
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxUniformMeshLaplacianF32Kernel kernel =
+                    _directPtxUniformMeshLaplacianKernels.GetOrAdd(
+                        key, () => new PtxUniformMeshLaplacianF32Kernel(_directPtxRuntime!));
+                if (capturing && !_directPtxUniformMeshLaplacianKernels.Pin(key)) return false;
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(faces, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[1]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxUniformMeshLaplacianDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool PrewarmDirectPtxUniformMeshLaplacian()
+    {
+        if (!IsDirectPtxSparseGraphEnabled || IsStreamCapturing()) return false;
+        try
+        {
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _ = _directPtxUniformMeshLaplacianKernels.GetOrAdd(
+                    0, () => new PtxUniformMeshLaplacianF32Kernel(_directPtxRuntime!));
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
     private static bool DirectPtxBuffersOverlap(IGpuBuffer left, IGpuBuffer right)
     {
         nuint leftStart = (nuint)left.Handle;
@@ -4560,6 +4631,7 @@ public sealed partial class CudaBackend
             _directPtxCapsuleSquashKernels.Dispose();
             _directPtxResidentScatterAuxKernels.Dispose();
             _directPtxResidentScatterSoftmaxKernels.Dispose();
+            _directPtxUniformMeshLaplacianKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }

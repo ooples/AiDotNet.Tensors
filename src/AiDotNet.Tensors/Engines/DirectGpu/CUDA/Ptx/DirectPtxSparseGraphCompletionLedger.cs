@@ -61,7 +61,8 @@ internal static class DirectPtxSparseGraphCompletionLedger
             "resident_scatter_max_argmax_rows", "resident_scatter_add_rows",
             "resident_scatter_add_backward_rows", "resident_scatter_mean_backward_rows",
             "resident_scatter_mean_rows_counts", "resident_scatter_max_backward_rows",
-            "resident_scatter_softmax_rows", "resident_scatter_softmax_backward_rows");
+            "resident_scatter_softmax_rows", "resident_scatter_softmax_backward_rows",
+            "resident_uniform_mesh_laplacian");
         Add("CudaCapsuleKernels", DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx,
             "capsule_weighted_sum", "capsule_agreement", "capsule_predictions", "capsule_transform",
             "squash", "squash_backward");
@@ -71,8 +72,6 @@ internal static class DirectPtxSparseGraphCompletionLedger
             "sparse_2_4_matmul_mma_sp");
         Add("CudaNeuralNetKernels", DirectPtxSparseGraphCompletionStatus.MissingDirectPtx,
             "scatter_max");
-        Add("CudaInstantNgpKernels", DirectPtxSparseGraphCompletionStatus.MissingDirectPtx,
-            "resident_uniform_mesh_laplacian");
         Add("CudaMeshPoolKernels", DirectPtxSparseGraphCompletionStatus.MissingDirectPtx,
             "mesh_pool_compute_scores", "mesh_pool_gather", "mesh_pool_backward",
             "mesh_pool_backward_deterministic", "mesh_pool_importance_backward", "mesh_pool_zero_grad",
