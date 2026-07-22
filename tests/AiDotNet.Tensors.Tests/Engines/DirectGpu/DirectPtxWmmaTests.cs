@@ -2439,6 +2439,38 @@ public class DirectPtxWmmaTests
         return output;
     }
 
+    [Fact]
+    public void OuterProductEmitter_IsRegisterResidentPointerOnly()
+    {
+        string ptx = PtxOuterProductKernel.EmitPtx(8, 6, 64, 256);
+        Assert.Contains(PtxOuterProductKernel.EntryPoint, ptx);
+        Assert.Equal(3, Count(ptx, "ld.param.u64"));
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.Equal(1, Count(ptx, "mul.rn.f32"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("bar.sync", ptx, StringComparison.Ordinal);
+        Assert.False(PtxOuterProductKernel.IsSupportedShape(64, 96));
+        Assert.True(PtxOuterProductKernel.IsSupportedShape(128, 2048));
+        Assert.False(PtxOuterProductKernel.IsPromotedShape(128, 2048));
+    }
+
+    [Fact]
+    public void DotProductEmitter_IsIsaCorrectWarpCtaReduction()
+    {
+        string ptx = PtxDotProductKernel.EmitPtx(8, 6, 1024);
+        Assert.Contains(PtxDotProductKernel.EntryPoint, ptx);
+        Assert.Equal(3, Count(ptx, "ld.param.u64"));
+        Assert.Equal(10, Count(ptx, "shfl.sync.bfly.b32"));  // 2 warp reductions x 5 deltas
+        Assert.Equal(1, Count(ptx, "bar.sync 0"));
+        Assert.Contains(".shared .align 4 .b8 partial[32]", ptx);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        // shuffles go through .b32 registers, never .f32.
+        Assert.DoesNotContain("shfl.sync.bfly.b32 %f", ptx, StringComparison.Ordinal);
+        Assert.False(PtxDotProductKernel.IsSupportedShape(300));
+        Assert.True(PtxDotProductKernel.IsSupportedShape(2048));
+    }
+
     [Theory]
     [InlineData(8, 6, true)]
     [InlineData(8, 0, false)]
