@@ -534,6 +534,94 @@ public sealed class DirectPtxConvolutionTests
             $"Depthwise 3x3 backward-weight max absolute error {maxAbsoluteError:G9}.");
     }
 
+    [Fact]
+    public void ConvBackwardBiasEmitter_IsWarpReductionStrideFreeSm86Ptx()
+    {
+        string ptx = PtxConv2DBackwardBiasF32Kernel.EmitPtx(8, 6);
+
+        Assert.Contains(".target sm_86", ptx, StringComparison.Ordinal);
+        Assert.Contains(PtxConv2DBackwardBiasF32Kernel.EntryPoint, ptx, StringComparison.Ordinal);
+        Assert.Equal(2, Count(ptx, ".param .u64"));
+        Assert.Equal(5, Count(ptx, "shfl.sync.bfly.b32"));
+        // One partial-sum add per spatial step plus the five reduction adds.
+        Assert.Equal(PtxConv2DBackwardBiasF32Kernel.SpatialStepsPerLane + 5, Count(ptx, "add.rn.f32"));
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("red.global", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.Throws<NotSupportedException>(() =>
+            PtxConv2DBackwardBiasF32Kernel.EmitPtx(8, 9));
+    }
+
+    [Fact]
+    public void ConvBackwardBiasBlueprint_IsNchwToVectorReduction()
+    {
+        DirectPtxKernelBlueprint blueprint =
+            PtxConv2DBackwardBiasF32Kernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere);
+
+        Assert.Equal("conv2d-bwd-bias-v1-Ampere-n1-k64-h16-w16-fp32", blueprint.Id);
+        Assert.Equal(
+            new[] { DirectPtxPhysicalLayout.Nchw, DirectPtxPhysicalLayout.Vector },
+            blueprint.Tensors.Select(t => t.Layout));
+        Assert.Equal("grad_bias", blueprint.Tensors[1].Name);
+        Assert.Equal("warp-shuffle-butterfly-deterministic", blueprint.Semantics["reduction"]);
+        Assert.Equal("0", blueprint.Semantics["intermediate-global-bytes"]);
+        Assert.Equal(0, blueprint.ResourceBudget.MaxStaticSharedBytes);
+    }
+
+    [Fact]
+    public void ConvBackwardBiasManifestCell_IsExperimentalWithDedicatedRoute()
+    {
+        Assert.Equal(DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxConvolutionCoverageManifest.Get("DirectGpuTensorEngine.Conv2DBackwardBiasGpu").Status);
+        Assert.Equal(DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxConvolutionCoverageManifest
+                .Get("CudaBackend.TryDirectPtxConv2DBackwardBias").Status);
+    }
+
+    [SkippableFact]
+    public void DriverOnlyConv2DBackwardBias_MatchesCpuReference()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "Requires the experimental SM86 convolution specialization.");
+
+        const int channels = PtxConv2DBackwardBiasF32Kernel.OutputChannels;
+        const int height = PtxConv2DBackwardBiasF32Kernel.Height;
+        const int width = PtxConv2DBackwardBiasF32Kernel.Width;
+
+        using var kernel = new PtxConv2DBackwardBiasF32Kernel(runtime);
+        using var gradOutDevice = runtime.AllocateBytes((nuint)PtxConv2DBackwardBiasF32Kernel.GradOutputBytes);
+        using var gradBiasDevice = runtime.AllocateBytes((nuint)PtxConv2DBackwardBiasF32Kernel.GradBiasBytes);
+
+        Random random = AiDotNet.Tensors.Helpers.RandomHelper.CreateSecureRandom();
+        var gradOut = new float[channels * height * width];
+        for (int i = 0; i < gradOut.Length; i++) gradOut[i] = (float)(random.NextDouble() * 2 - 1);
+        gradOutDevice.Upload<float>(gradOut);
+
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(gradOutDevice, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(gradBiasDevice, kernel.Blueprint.Tensors[1]));
+        runtime.Synchronize();
+        var actual = new float[channels];
+        gradBiasDevice.Download<float>(actual);
+
+        float maxAbsoluteError = 0;
+        for (int k = 0; k < channels; k++)
+        {
+            float expected = 0;
+            for (int s = 0; s < height * width; s++)
+                expected += gradOut[k * height * width + s];
+            maxAbsoluteError = MathF.Max(maxAbsoluteError, MathF.Abs(actual[k] - expected));
+        }
+
+        Assert.True(maxAbsoluteError <= 2e-4f,
+            $"Conv2D backward-bias max absolute error {maxAbsoluteError:G9}.");
+    }
+
     private static string? Validate(
         bool enabled, bool available, int major, int minor,
         DirectPtxConvolutionShape shape, IGpuBuffer? input, IGpuBuffer? weights,
