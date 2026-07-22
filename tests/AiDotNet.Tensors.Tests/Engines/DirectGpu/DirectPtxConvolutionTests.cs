@@ -1453,6 +1453,109 @@ public sealed class DirectPtxConvolutionTests
             $"Fused Conv2D 3x3 bias+ReLU max absolute error {maxAbsoluteError:G9}.");
     }
 
+    [Fact]
+    public void ConvTranspose2D3x3Emitter_IsHaloPredicatedChannelLoopSm86Ptx()
+    {
+        string ptx = PtxConvTranspose2DNchw3x3ForwardF32Kernel.EmitPtx(8, 6);
+
+        Assert.Contains(".target sm_86", ptx, StringComparison.Ordinal);
+        Assert.Contains(PtxConvTranspose2DNchw3x3ForwardF32Kernel.EntryPoint, ptx, StringComparison.Ordinal);
+        Assert.Equal(3, Count(ptx, ".param .u64"));
+        Assert.Contains("CONV_TRANSPOSE2D_CHANNELS:", ptx, StringComparison.Ordinal);
+        Assert.Equal(9, Count(ptx, "fma.rn.f32"));
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.Equal(4, Count(ptx, "and.pred %p4"));
+        Assert.Contains("@%p5 bra CONV_TRANSPOSE2D_CHANNELS", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.Throws<NotSupportedException>(() =>
+            PtxConvTranspose2DNchw3x3ForwardF32Kernel.EmitPtx(8, 9));
+    }
+
+    [Fact]
+    public void ConvTranspose2D3x3Blueprint_UsesIohwWeights()
+    {
+        DirectPtxKernelBlueprint blueprint =
+            PtxConvTranspose2DNchw3x3ForwardF32Kernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere);
+
+        Assert.Equal("conv-transpose2d-v1-Ampere-n1-cin64-h16-w16-cout64-r3-s1-p1-fp32", blueprint.Id);
+        Assert.Equal(
+            new[] { DirectPtxPhysicalLayout.Nchw, DirectPtxPhysicalLayout.Iohw,
+                DirectPtxPhysicalLayout.Nchw },
+            blueprint.Tensors.Select(t => t.Layout));
+    }
+
+    [Fact]
+    public void ConvTranspose2D3x3ManifestCell_IsExperimentalWithDedicatedRoute()
+    {
+        Assert.Equal(DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxConvolutionCoverageManifest.Get("IEngine.ConvTranspose2D").Status);
+        Assert.Equal(DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxConvolutionCoverageManifest
+                .Get("CudaBackend.TryDirectPtxConvTranspose2D3x3").Status);
+    }
+
+    [SkippableFact]
+    public void DriverOnlyConvTranspose2D3x3_MatchesCpuReference()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "Requires the experimental SM86 convolution specialization.");
+
+        const int inChannels = PtxConvTranspose2DNchw3x3ForwardF32Kernel.InputChannels;
+        const int outChannels = PtxConvTranspose2DNchw3x3ForwardF32Kernel.OutputChannels;
+        const int height = PtxConvTranspose2DNchw3x3ForwardF32Kernel.Height;
+        const int width = PtxConvTranspose2DNchw3x3ForwardF32Kernel.Width;
+        const int kernelSize = PtxConvTranspose2DNchw3x3ForwardF32Kernel.KernelSize;
+
+        using var kernel = new PtxConvTranspose2DNchw3x3ForwardF32Kernel(runtime);
+        using var inputDevice = runtime.AllocateBytes((nuint)PtxConvTranspose2DNchw3x3ForwardF32Kernel.InputBytes);
+        using var weightDevice = runtime.AllocateBytes((nuint)PtxConvTranspose2DNchw3x3ForwardF32Kernel.WeightBytes);
+        using var outputDevice = runtime.AllocateBytes((nuint)PtxConvTranspose2DNchw3x3ForwardF32Kernel.OutputBytes);
+
+        Random random = AiDotNet.Tensors.Helpers.RandomHelper.CreateSecureRandom();
+        var input = new float[inChannels * height * width];
+        for (int i = 0; i < input.Length; i++) input[i] = (float)(random.NextDouble() * 2 - 1);
+        // IOHW weights: [Cin, Cout, kH, kW].
+        var weights = new float[inChannels * outChannels * kernelSize * kernelSize];
+        for (int i = 0; i < weights.Length; i++) weights[i] = (float)(random.NextDouble() * 2 - 1);
+        inputDevice.Upload<float>(input);
+        weightDevice.Upload<float>(weights);
+
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(inputDevice, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(weightDevice, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(outputDevice, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[outChannels * height * width];
+        outputDevice.Download<float>(actual);
+
+        float maxAbsoluteError = 0;
+        for (int co = 0; co < outChannels; co++)
+        for (int y = 0; y < height; y++)
+        for (int x = 0; x < width; x++)
+        {
+            float expected = 0;
+            for (int ci = 0; ci < inChannels; ci++)
+            for (int ky = 0; ky < kernelSize; ky++)
+            for (int kx = 0; kx < kernelSize; kx++)
+            {
+                int iy = y + 1 - ky;
+                int ix = x + 1 - kx;
+                if (iy < 0 || iy >= height || ix < 0 || ix >= width) continue;
+                expected += weights[((ci * outChannels + co) * kernelSize + ky) * kernelSize + kx] *
+                    input[(ci * height + iy) * width + ix];
+            }
+            float got = actual[(co * height + y) * width + x];
+            maxAbsoluteError = MathF.Max(maxAbsoluteError, MathF.Abs(got - expected));
+        }
+
+        Assert.True(maxAbsoluteError <= 3e-4f,
+            $"ConvTranspose2D 3x3 max absolute error {maxAbsoluteError:G9}.");
+    }
+
     private static string? Validate(
         bool enabled, bool available, int major, int minor,
         DirectPtxConvolutionShape shape, IGpuBuffer? input, IGpuBuffer? weights,

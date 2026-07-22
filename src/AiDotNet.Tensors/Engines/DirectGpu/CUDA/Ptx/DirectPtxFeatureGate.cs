@@ -117,7 +117,9 @@ internal enum DirectPtxPhysicalLayout
     /// <summary>Dense row-major [batch, channel, height, width].</summary>
     Nchw,
     /// <summary>Dense output/input/spatial convolution weights [output, input, height, width].</summary>
-    Oihw
+    Oihw,
+    /// <summary>Dense input/output/spatial transposed-convolution weights [input, output, height, width].</summary>
+    Iohw
 }
 
 /// <summary>
