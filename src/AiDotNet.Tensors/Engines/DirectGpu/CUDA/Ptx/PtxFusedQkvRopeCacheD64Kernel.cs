@@ -220,7 +220,10 @@ internal sealed class PtxFusedQkvRopeCacheD64Kernel : IDisposable
 
         for (int f = 0; f < 6; f++) EmitWarpSum(ptx, $"%f{f}", "%f8", "%r20", "%r21");
         ptx.AppendLine("    setp.ne.u32 %p1, %r1, 0;");
-        ptx.AppendLine("    @%p1 bra.uni QKV_RETURN;");
+        // Only lane zero owns the bias/RoPE/final-store epilogue. This branch
+        // is deliberately divergent and therefore must not carry PTX's .uni
+        // promise (the earlier output-pair bounds branch is warp-uniform).
+        ptx.AppendLine("    @%p1 bra QKV_RETURN;");
         EmitBiasPair(ptx, "%r8", "%f0", "%f1");
         EmitBiasPair(ptx, "%r9", "%f2", "%f3");
         EmitBiasPair(ptx, "%r10", "%f4", "%f5");

@@ -1791,6 +1791,8 @@ public class DirectPtxWmmaTests
         Assert.Contains("st.global.v2.f32 [%rd22]", ptx);
         Assert.Contains("st.global.v2.f32 [%rd23]", ptx);
         Assert.Contains("shfl.sync.bfly.b32", ptx);
+        Assert.Contains("@%p1 bra QKV_RETURN;", ptx);
+        Assert.DoesNotContain("@%p1 bra.uni", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
