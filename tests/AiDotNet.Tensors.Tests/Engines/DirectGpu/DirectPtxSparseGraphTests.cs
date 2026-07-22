@@ -16,7 +16,7 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
             DirectPtxSparseGraphCompletionLedger.All
                 .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(68, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+        Assert.Equal(69, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
             entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
         Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
         Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
@@ -698,6 +698,57 @@ public sealed class DirectPtxSparseGraphTests
             DirectPtxSparseOptimizerKey.Create(
                 DirectPtxSparseOptimizerOperation.Ftrl,
                 0, 0.1f, 0.1f, 1f)));
+    }
+
+    [Theory]
+    [InlineData(0, "FSL_ACTIVATE")]
+    [InlineData(1, "max.f32")]
+    [InlineData(2, "0f3d372713")]
+    [InlineData(3, "rcp.approx.f32")]
+    [InlineData(4, "0fbf800000")]
+    [InlineData(5, "selp.f32")]
+    [InlineData(6, "rcp.approx.f32")]
+    public void FusedSparseLinearEmitter_FusesEveryProductionActivation(
+        int activation,
+        string activationToken)
+    {
+        foreach (bool hasBias in new[] { false, true })
+        {
+            var key = new DirectPtxFusedSparseLinearKey(hasBias, activation);
+            string ptx = PtxFusedSparseLinearF32Kernel.EmitPtx(8, 6, key);
+            DirectPtxKernelBlueprint blueprint = PtxFusedSparseLinearF32Kernel.CreateBlueprint(
+                DirectPtxArchitectureFamily.Ampere, key);
+
+            Assert.Equal(hasBias ? 5 : 4, Count(ptx, ".param .u64"));
+            Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+            Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+            Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+            Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains(activationToken, ptx, StringComparison.Ordinal);
+            Assert.Contains("fma.rn.f32", ptx, StringComparison.Ordinal);
+            Assert.Equal(1, Count(ptx, "st.global.f32"));
+            Assert.Equal(DirectPtxPhysicalLayout.PackedCsrRowsAndColumns,
+                blueprint.Tensors[1].Layout);
+            Assert.Equal(PtxFusedSparseLinearF32Kernel.PackedCsrElements,
+                blueprint.Tensors[1].PhysicalExtent.ElementCount);
+            Assert.Equal("csr-dot-plus-optional-bias-plus-activation",
+                blueprint.Semantics["fusion"]);
+            Assert.Equal("single-overwrite", blueprint.Semantics["output-write"]);
+            Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
+            Assert.All(blueprint.Tensors, tensor =>
+                Assert.Equal(DirectPtxExtentMode.Exact, tensor.ExtentMode));
+        }
+    }
+
+    [Fact]
+    public void FusedSparseLinearAdmission_IsExact()
+    {
+        Assert.True(PtxFusedSparseLinearF32Kernel.SupportsShape(32, 1024, 1024, 16_384));
+        Assert.False(PtxFusedSparseLinearF32Kernel.SupportsShape(16, 1024, 1024, 16_384));
+        Assert.False(PtxFusedSparseLinearF32Kernel.SupportsShape(32, 512, 1024, 16_384));
+        Assert.False(PtxFusedSparseLinearF32Kernel.SupportsShape(32, 1024, 1024, 8_192));
+        Assert.True(PtxFusedSparseLinearF32Kernel.SupportsActivation(6));
+        Assert.False(PtxFusedSparseLinearF32Kernel.SupportsActivation(7));
     }
 
     [Theory]

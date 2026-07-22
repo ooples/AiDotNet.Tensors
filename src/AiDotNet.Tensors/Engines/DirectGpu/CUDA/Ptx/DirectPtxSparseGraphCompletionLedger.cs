@@ -90,8 +90,10 @@ internal static class DirectPtxSparseGraphCompletionLedger
             "Coalesce", "SparseTranspose", "SparseMatMul", "SparseMatMulPatternPreserving", "SparseAddMM",
             "SparseSampledAddMM", "SparseSpGeMM", "SparseSum", "SparseMean", "SparseSoftmax",
             "SparseLogSoftmax");
+        Add("DirectGpuTensorEngine", DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx,
+            "FusedSparseLinear");
         Add("DirectGpuTensorEngine", DirectPtxSparseGraphCompletionStatus.MissingDirectPtx,
-            "FusedSparseLinear", "ScatterMean", "ScatterAddBackward", "Gather", "ScatterReduce");
+            "ScatterMean", "ScatterAddBackward", "Gather", "ScatterReduce");
         return entries;
     }
 }

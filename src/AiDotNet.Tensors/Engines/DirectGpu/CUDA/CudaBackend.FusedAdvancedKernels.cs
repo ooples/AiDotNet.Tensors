@@ -93,10 +93,6 @@ public sealed partial class CudaBackend
         int hasBias,
         int activation)
     {
-        EnsureFusedAdvancedKernelsAvailable(nameof(FusedSparseLinear));
-        if (!_kernelCache.TryGetValue("fused_sparse_linear", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: fused_sparse_linear.");
-
         // batchSize * outputFeatures wraps silently to a corrupt grid count
         // when the int product exceeds int.MaxValue. Promote to long, validate.
         if (batchSize <= 0 || outputFeatures <= 0) return;
@@ -106,6 +102,17 @@ public sealed partial class CudaBackend
                 $"batchSize ({batchSize}) * outputFeatures ({outputFeatures}) = {totalLong} " +
                 "exceeds int.MaxValue; split the dispatch into chunks.");
         int total = (int)totalLong;
+
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxFusedSparseLinear(
+            input, packedCsr, sparseValues, bias, output,
+            batchSize, inputFeatures, outputFeatures, nnz, hasBias, activation))
+            return;
+#endif
+
+        EnsureFusedAdvancedKernelsAvailable(nameof(FusedSparseLinear));
+        if (!_kernelCache.TryGetValue("fused_sparse_linear", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: fused_sparse_linear.");
 
         using var _ = PushContext();
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);

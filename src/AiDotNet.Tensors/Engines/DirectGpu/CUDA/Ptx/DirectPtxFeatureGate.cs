@@ -173,6 +173,8 @@ internal enum DirectPtxPhysicalLayout
     SparseOptimizerValues,
     /// <summary>Contiguous mutable optimizer parameters or state.</summary>
     SparseOptimizerState,
+    /// <summary>CSR row pointers followed immediately by CSR column indices.</summary>
+    PackedCsrRowsAndColumns,
     /// <summary>Triangle vertex indices [face,three].</summary>
     TriangleFaces,
     /// <summary>Dense additive attention bias, [H,Sq,Skv] or [B,H,Sq,Skv].</summary>
