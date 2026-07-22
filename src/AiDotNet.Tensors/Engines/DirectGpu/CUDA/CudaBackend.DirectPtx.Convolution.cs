@@ -6074,4 +6074,148 @@ public sealed partial class CudaBackend
         return _directPtxIm2colKNFp16Kernels.GetOrAdd(
             1, () => new PtxIm2colKNFp16Nchw3x3Kernel(runtime));
     }
+
+    private readonly DirectPtxKernelCache<int, PtxUnfoldKNFp16FromFp16Nchw3x3Kernel>
+        _directPtxUnfoldKNFp16FromFp16Kernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private long _directPtxUnfoldKNFp16FromFp16DispatchCount;
+
+    internal long DirectPtxUnfoldKNFp16FromFp16DispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxUnfoldKNFp16FromFp16DispatchCount);
+
+    /// <summary>
+    /// Attempts the exact FP16-in/FP16-out im2col experiment producing a row-major [K, N]
+    /// FP16 patch matrix (verbatim two-byte gather). Validated by byte extent. Fails
+    /// closed on any unsupported contract so the caller runs the established composition.
+    /// </summary>
+    internal bool TryDirectPtxUnfoldKNFp16FromFp16(
+        IGpuBuffer input,
+        IGpuBuffer output)
+    {
+        if (!_directPtxConvolutionOptedIn)
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.FeatureDisabled;
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.BackendUnavailable;
+            return false;
+        }
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.ArchitectureNotImplemented;
+            return false;
+        }
+        if (input is null || output is null)
+        {
+            DirectPtxLastError = "unfold-kn-fp16-from-fp16-null-buffer";
+            return false;
+        }
+        if (input.SizeInBytes != PtxUnfoldKNFp16FromFp16Nchw3x3Kernel.InputBytes ||
+            output.SizeInBytes != PtxUnfoldKNFp16FromFp16Nchw3x3Kernel.OutputBytes)
+        {
+            DirectPtxLastError = "unfold-kn-fp16-from-fp16-exact-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            const int key = 1;
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxUnfoldKNFp16FromFp16Kernels.TryGetValue(key, out _))
+                {
+                    DirectPtxLastError =
+                        "Direct PTX Unfold-KN-FP16-from-FP16 must be prewarmed before CUDA graph capture.";
+                    return false;
+                }
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxUnfoldKNFp16FromFp16Nchw3x3Kernel kernel = GetOrCreateDirectPtxUnfoldKNFp16FromFp16Kernel();
+                if (capturing && !_directPtxUnfoldKNFp16FromFp16Kernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX Unfold-KN-FP16-from-FP16 module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[1]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxUnfoldKNFp16FromFp16DispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool PrewarmDirectPtxUnfoldKNFp16FromFp16()
+    {
+        if (!_directPtxConvolutionOptedIn)
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.FeatureDisabled;
+            return false;
+        }
+        if (!IsAvailable || !DirectPtxArchitecture.HasExperimentalConvolution(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = DirectPtxConvolutionEligibility.ArchitectureNotImplemented;
+            return false;
+        }
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX Unfold-KN-FP16-from-FP16 prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _ = GetOrCreateDirectPtxUnfoldKNFp16FromFp16Kernel();
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxUnfoldKNFp16FromFp16Audit(out DirectPtxKernelAudit? audit)
+    {
+        lock (_directPtxLock)
+        {
+            if (_directPtxUnfoldKNFp16FromFp16Kernels.TryGetValue(1, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null;
+        return false;
+    }
+
+    private PtxUnfoldKNFp16FromFp16Nchw3x3Kernel GetOrCreateDirectPtxUnfoldKNFp16FromFp16Kernel()
+    {
+        if (_directPtxUnfoldKNFp16FromFp16Kernels.TryGetValue(
+                1, out PtxUnfoldKNFp16FromFp16Nchw3x3Kernel? existing))
+            return existing;
+        return CreateAndCacheDirectPtxUnfoldKNFp16FromFp16KernelSlow();
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxUnfoldKNFp16FromFp16Nchw3x3Kernel CreateAndCacheDirectPtxUnfoldKNFp16FromFp16KernelSlow()
+    {
+        DirectPtxRuntime runtime = _directPtxRuntime ??
+            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+        return _directPtxUnfoldKNFp16FromFp16Kernels.GetOrAdd(
+            1, () => new PtxUnfoldKNFp16FromFp16Nchw3x3Kernel(runtime));
+    }
 }

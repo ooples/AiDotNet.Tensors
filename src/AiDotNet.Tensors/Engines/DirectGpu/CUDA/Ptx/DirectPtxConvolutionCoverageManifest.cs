@@ -425,7 +425,16 @@ internal static class DirectPtxConvolutionCoverageManifest
             "same v1 im2col-KN-FP16 contract", "exact contiguous NCHW FP32 to row-major FP16 (byte-extent validated)", "FP32 in / FP16 out",
             DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
             "hand-emitted sm_86 pointer-only FP16-producing im2col specialization, disabled by default"),
-        Planned("CudaBackend.UnfoldKNFp16FromFp16", "NVRTC FP16 im2col", "FP16 patch extraction", "NCHW-half to KxN-half", "FP16", "fuse producer into PTX convolution tiles")
+        new("CudaBackend.UnfoldKNFp16FromFp16",
+            "CUDA direct FP16 im2col with established fallback owned by caller",
+            "FP16 patch extraction", "NCHW FP16 to row-major [K,N] FP16", "generic public; CUDA FP16",
+            DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            "v1 exact N1/Cin4/H8/W8 3x3 s1 p1 FP16 verbatim two-byte halo-masked gather (bit-exact); all else falls back"),
+        new("CudaBackend.TryDirectPtxUnfoldKNFp16FromFp16",
+            "new direct Driver-API PTX route with established fallback owned by caller",
+            "same v1 unfold-KN-FP16-from-FP16 contract", "exact contiguous NCHW FP16 to row-major FP16 (byte-extent validated)", "FP16",
+            DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            "hand-emitted sm_86 pointer-only FP16 verbatim-gather specialization, disabled by default")
     ];
 
     internal static DirectPtxConvolutionCoverageCell Get(string api)
