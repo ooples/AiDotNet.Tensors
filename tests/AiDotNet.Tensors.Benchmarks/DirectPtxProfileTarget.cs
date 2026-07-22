@@ -264,6 +264,35 @@ internal static class DirectPtxProfileTarget
         GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-qkv-rope-cache-end");
     }
 
+    internal static void RunRngDropout()
+    {
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-rng-dropout-start");
+        using var runtime = new DirectPtxRuntime();
+        foreach (int elements in new[] { 4_096, 65_536, 1_048_576 })
+        {
+            using var kernel = new PtxFusedPhiloxDropoutF32Kernel(runtime, elements);
+            using var input = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+            using var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+            using var mask = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+            input.Upload<float>(new float[elements]);
+            const float dropoutRate = 0.1f;
+            float keep = 1.0f - dropoutRate;
+            uint threshold = (uint)Math.Floor((double)keep * 4_294_967_296.0);
+            kernel.Launch(
+                DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+                DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[1]),
+                DirectPtxTensorView.CreateOwned(mask, kernel.Blueprint.Tensors[2]),
+                seed: 0x8490_1234_5678_9ABCul,
+                subsequence: 0,
+                counterOffset: 0,
+                keepThreshold: threshold,
+                inverseKeep: 1.0f / keep);
+            runtime.Synchronize();
+            Console.WriteLine(kernel.Audit.ToJson());
+        }
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-rng-dropout-end");
+    }
+
     internal static void VerifyNcuCsv(string path)
     {
         DirectPtxProfilerEvidence evidence = DirectPtxProfilerEvidence.FromNcuCsv(path);

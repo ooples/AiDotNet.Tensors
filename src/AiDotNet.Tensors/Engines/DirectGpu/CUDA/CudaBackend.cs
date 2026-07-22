@@ -7826,6 +7826,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void Dropout(IGpuBuffer input, IGpuBuffer output, IGpuBuffer mask, int size, float dropoutRate, ulong seed, bool training)
     {
+#if NET5_0_OR_GREATER
+        if (training && TryDirectPtxRngDropoutF32(
+            input, output, mask, size, dropoutRate, seed))
+            return;
+#endif
         if (!_kernelCache.TryGetValue("dropout_forward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: dropout_forward");
 

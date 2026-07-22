@@ -81,6 +81,11 @@ public static class PtxParityRegistry
         new PtxParitySpec("PtxFusedQkvRopeCacheD64Kernel", PtxParityStatus.Deferred,
             "fused QKV + RoPE + KV-cache write (#858)",
             "multi-output (Q + K/V cache) with baked RoPE tables; needs a dedicated QKV/RoPE/cache oracle."),
+        new PtxParitySpec("PtxFusedPhiloxDropoutF32Kernel", PtxParityStatus.Deferred,
+            "fused Philox inverted-dropout forward + saved mask (#849)",
+            "the public route, CPU Philox oracle, established CUDA peer, and exact-shape harness are wired, " +
+            "but three-way device parity is intentionally deferred until exclusive access to the admitted SM86 GPU; " +
+            "non-GPU tests cover the emitter, published Philox vector, admission, and fallback contracts."),
     };
 
     private static readonly Dictionary<string, PtxParitySpec> ByKernel =

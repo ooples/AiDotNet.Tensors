@@ -63,6 +63,10 @@ public static class CudaToPtxTransferLedger
             "same softmax family (#840); shares the row-softmax PTX kernel."),
         new CudaToPtxEntry("rmsnorm_forward", "PtxFusedResidualRmsNormD64Kernel", PtxTransferStatus.PtxInProgress,
             "fused residual RMSNorm; PTX kernel exists but has no public route wired yet (see parity registry)."),
+        new CudaToPtxEntry("dropout_mask", "PtxFusedPhiloxDropoutF32Kernel", PtxTransferStatus.PtxInProgress,
+            "issue #849 fuses versioned Philox mask production into dropout forward; disabled until three clean benchmark/Nsight runs."),
+        new CudaToPtxEntry("dropout_forward", "PtxFusedPhiloxDropoutF32Kernel", PtxTransferStatus.PtxInProgress,
+            "issue #849 exact-shape FP32 fused dropout forward; established CUDA kernels remain the fail-closed fallback."),
 
         // --- Triaged anomalies: the 4 census kernels that mapped to no epic
         // #833 child during the full 888-kernel cross-reference. Recorded so the
@@ -70,7 +74,7 @@ public static class CudaToPtxTransferLedger
         new CudaToPtxEntry("resident_mode", "(none)", PtxTransferStatus.NotPlanned,
             "GPU-residency infra/utility kernel, not a compute op; excluded from the PTX transfer."),
         new CudaToPtxEntry("fused_ddim_step", "(none)", PtxTransferStatus.NotPlanned,
-            "DDIM diffusion sampler step; not covered by any epic #833 child (genuine gap). Flagged on #833 — needs a new child issue or fold into #849 before it can be ported."),
+            "DDIM diffusion sampler step is now assigned to the #849 stochastic manifest; no direct specialization has started yet."),
         new CudaToPtxEntry("squash", "(none)", PtxTransferStatus.NotPlanned,
             "capsule-network squash activation; reassigned to #839 (pointwise/activation) scope — no standalone transfer entry."),
         new CudaToPtxEntry("squash_backward", "(none)", PtxTransferStatus.NotPlanned,
