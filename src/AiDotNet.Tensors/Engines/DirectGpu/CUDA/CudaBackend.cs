@@ -3385,6 +3385,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void CapsuleWeightedSum(IGpuBuffer coupling, IGpuBuffer predictions, IGpuBuffer output,
         int batchSize, int inputCapsules, int outputCapsules, int capsuleDim)
     {
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxCapsuleRouting(
+            coupling, predictions, output, batchSize, inputCapsules, outputCapsules, capsuleDim,
+            DirectPtxCapsuleRoutingOperation.WeightedSum))
+            return;
+#endif
         if (!_kernelCache.TryGetValue("capsule_weighted_sum", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: capsule_weighted_sum");
 
@@ -3412,6 +3418,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void CapsuleAgreement(IGpuBuffer predictions, IGpuBuffer output, IGpuBuffer agreement,
         int batchSize, int inputCapsules, int outputCapsules, int capsuleDim)
     {
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxCapsuleRouting(
+            predictions, output, agreement, batchSize, inputCapsules, outputCapsules, capsuleDim,
+            DirectPtxCapsuleRoutingOperation.Agreement))
+            return;
+#endif
         if (!_kernelCache.TryGetValue("capsule_agreement", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: capsule_agreement");
 

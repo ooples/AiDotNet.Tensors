@@ -64,6 +64,8 @@ public sealed partial class CudaBackend
         _directPtxScatterMaxRowsKernels = new(1);
     private readonly DirectPtxKernelCache<DirectPtxScatterBackwardRowsOperation, PtxScatterBackwardRowsF32Kernel>
         _directPtxScatterBackwardRowsKernels = new(4);
+    private readonly DirectPtxKernelCache<DirectPtxCapsuleRoutingOperation, PtxCapsuleRoutingF32Kernel>
+        _directPtxCapsuleRoutingKernels = new(4);
     private DirectPtxRuntime? _directPtxRuntime;
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
@@ -93,6 +95,7 @@ public sealed partial class CudaBackend
     private long _directPtxScatterRowsDispatchCount;
     private long _directPtxScatterMaxRowsDispatchCount;
     private long _directPtxScatterBackwardRowsDispatchCount;
+    private long _directPtxCapsuleRoutingDispatchCount;
     internal int DirectPtxCachedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxAttentionKernels.Count; }
@@ -198,6 +201,8 @@ public sealed partial class CudaBackend
         System.Threading.Interlocked.Read(ref _directPtxScatterMaxRowsDispatchCount);
     internal long DirectPtxScatterBackwardRowsDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxScatterBackwardRowsDispatchCount);
+    internal long DirectPtxCapsuleRoutingDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxCapsuleRoutingDispatchCount);
 
     /// <summary>
     /// Attempts the exact FP32 CSR SpMM golden specialization. The admitted ABI
@@ -2096,6 +2101,93 @@ public sealed partial class CudaBackend
         }
     }
 
+    /// <summary>
+    /// Attempts the exact pointer-only capsule routing reductions. The admitted
+    /// ABI is B=32, input capsules=32, output capsules=10, dimension=16 with
+    /// tightly packed row-major allocations and no runtime shape parameters.
+    /// </summary>
+    internal bool TryDirectPtxCapsuleRouting(
+        IGpuBuffer first,
+        IGpuBuffer second,
+        IGpuBuffer output,
+        int batch,
+        int inputCapsules,
+        int outputCapsules,
+        int dimension,
+        DirectPtxCapsuleRoutingOperation operation)
+    {
+        if (!IsDirectPtxSparseGraphEnabled ||
+            !PtxCapsuleRoutingF32Kernel.SupportsShape(
+                batch, inputCapsules, outputCapsules, dimension))
+            return false;
+
+        long couplingBytes = (long)batch * inputCapsules * outputCapsules * sizeof(float);
+        long predictionBytes = couplingBytes * dimension;
+        long routedBytes = (long)batch * outputCapsules * dimension * sizeof(float);
+        long firstBytes = operation == DirectPtxCapsuleRoutingOperation.WeightedSum
+            ? couplingBytes : predictionBytes;
+        long secondBytes = operation == DirectPtxCapsuleRoutingOperation.WeightedSum
+            ? predictionBytes : routedBytes;
+        long outputBytes = operation == DirectPtxCapsuleRoutingOperation.WeightedSum
+            ? routedBytes : couplingBytes;
+        if (!HasExactBytes(first, firstBytes) || !HasExactBytes(second, secondBytes) ||
+            !HasExactBytes(output, outputBytes) || first.Handle == IntPtr.Zero ||
+            second.Handle == IntPtr.Zero || output.Handle == IntPtr.Zero ||
+            ((((nuint)first.Handle | (nuint)second.Handle | (nuint)output.Handle) & 15u) != 0) ||
+            DirectPtxBuffersOverlap(output, first) || DirectPtxBuffersOverlap(output, second))
+            return false;
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxCapsuleRoutingKernels.TryGetValue(operation, out _))
+                    return false;
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxCapsuleRoutingF32Kernel kernel = _directPtxCapsuleRoutingKernels.GetOrAdd(
+                    operation, () => new PtxCapsuleRoutingF32Kernel(_directPtxRuntime!, operation));
+                if (capturing && !_directPtxCapsuleRoutingKernels.Pin(operation)) return false;
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(first, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(second, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[2]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxCapsuleRoutingDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool PrewarmDirectPtxCapsuleRouting(DirectPtxCapsuleRoutingOperation operation)
+    {
+        if (!IsDirectPtxSparseGraphEnabled || IsStreamCapturing()) return false;
+        try
+        {
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _ = _directPtxCapsuleRoutingKernels.GetOrAdd(
+                    operation, () => new PtxCapsuleRoutingF32Kernel(_directPtxRuntime!, operation));
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
     private static bool DirectPtxBuffersOverlap(IGpuBuffer left, IGpuBuffer right)
     {
         nuint leftStart = (nuint)left.Handle;
@@ -3952,6 +4044,7 @@ public sealed partial class CudaBackend
             _directPtxScatterRowsKernels.Dispose();
             _directPtxScatterMaxRowsKernels.Dispose();
             _directPtxScatterBackwardRowsKernels.Dispose();
+            _directPtxCapsuleRoutingKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }

@@ -16,7 +16,7 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
             DirectPtxSparseGraphCompletionLedger.All
                 .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(43, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+        Assert.Equal(45, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
             entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
         Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
         Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
@@ -441,6 +441,40 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal("zero", blueprint.Semantics["invalid-index"]);
         Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
         Assert.All(blueprint.Tensors, tensor => Assert.Equal(DirectPtxExtentMode.Exact, tensor.ExtentMode));
+    }
+
+    [Theory]
+    [InlineData((int)DirectPtxCapsuleRoutingOperation.WeightedSum, "ascending-input-capsule", 10240, 163840, 5120)]
+    [InlineData((int)DirectPtxCapsuleRoutingOperation.Agreement, "ascending-dimension", 163840, 5120, 10240)]
+    public void CapsuleRoutingEmitter_BakesExactPointerOnlyReductionAbi(
+        int operationValue,
+        string reductionOrder,
+        int firstElements,
+        int secondElements,
+        int outputElements)
+    {
+        var operation = (DirectPtxCapsuleRoutingOperation)operationValue;
+        string ptx = PtxCapsuleRoutingF32Kernel.EmitPtx(8, 6, operation);
+        DirectPtxKernelBlueprint blueprint = PtxCapsuleRoutingF32Kernel.CreateBlueprint(
+            DirectPtxArchitectureFamily.Ampere, operation);
+
+        Assert.Equal(3, Count(ptx, ".param .u64"));
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.Equal(3, blueprint.Tensors.Count);
+        Assert.All(blueprint.Tensors, tensor =>
+        {
+            Assert.Equal(DirectPtxExtentMode.Exact, tensor.ExtentMode);
+            Assert.Equal(16, tensor.AlignmentBytes);
+        });
+        Assert.Equal(firstElements, blueprint.Tensors[0].PhysicalExtent.ElementCount);
+        Assert.Equal(secondElements, blueprint.Tensors[1].PhysicalExtent.ElementCount);
+        Assert.Equal(outputElements, blueprint.Tensors[2].PhysicalExtent.ElementCount);
+        Assert.Equal(reductionOrder, blueprint.Semantics["reduction-order"]);
+        Assert.Equal("single-overwrite", blueprint.Semantics["output-write"]);
+        Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
+        Assert.Equal("0", blueprint.Semantics["intermediate-global-bytes"]);
     }
 
     [Theory]

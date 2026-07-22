@@ -151,6 +151,12 @@ internal enum DirectPtxPhysicalLayout
     StructuredSparse2x4Values,
     /// <summary>One packed byte per logical group of four containing two 2-bit positions.</summary>
     StructuredSparse2x4Metadata,
+    /// <summary>Capsule routing coefficients [batch,input-capsule,output-capsule].</summary>
+    CapsuleCoupling,
+    /// <summary>Capsule predictions [batch,input-capsule,output-capsule,dimension].</summary>
+    CapsulePredictions,
+    /// <summary>Routed capsule vectors [batch,output-capsule,dimension].</summary>
+    CapsuleOutput,
     /// <summary>Dense additive attention bias, [H,Sq,Skv] or [B,H,Sq,Skv].</summary>
     AttentionBias,
     /// <summary>One-dimensional canonical vector.</summary>
