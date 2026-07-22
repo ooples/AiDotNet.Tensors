@@ -6,40 +6,39 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
 /// <summary>
 /// Elementwise masked fill <c>output[i] = mask[i] != 0 ? fillValue : input[i]</c> (issue
-/// #840), the pre-softmax masking stage (e.g. causal/padding masks setting positions to a
-/// large negative value). One thread owns one element — no shared memory, no reduction, no
-/// global intermediate. The result is exact.
+/// #840), the pre-softmax masking stage (e.g. causal/padding masks). Purely elementwise over
+/// a flat element count, matching the backend's flat-<c>size</c> ABI — one thread owns one
+/// element, no shared memory, no reduction, no global intermediate. The result is exact.
 ///
-/// 256 threads/block, grid = (M*N)/256; supported shapes keep M*N a multiple of 256.
+/// 256 threads/block, grid = count/256; supported counts are positive multiples of 256.
 /// </summary>
 internal sealed class PtxMaskedFillKernel : IDisposable
 {
     internal const int BlockThreads = 256;
+    internal const int MaxCount = 2048 * 4096;
     internal const string EntryPoint = "aidotnet_masked_fill";
 
     private readonly DirectPtxModule _module;
     private readonly IntPtr _function;
 
-    internal int M { get; }
-    internal int N { get; }
+    internal int Count { get; }
     internal float FillValue { get; }
     internal string Ptx { get; }
     internal DirectPtxKernelBlueprint Blueprint { get; }
     internal DirectPtxKernelAudit Audit { get; }
 
-    internal PtxMaskedFillKernel(DirectPtxRuntime runtime, int m, int n, float fillValue)
+    internal PtxMaskedFillKernel(DirectPtxRuntime runtime, int count, float fillValue)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         if (!DirectPtxArchitecture.HasValidatedSoftmax(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
                 "The checked-in masked-fill specialization is measured only on GA10x/SM86.");
-        ValidateShape(m, n);
-        M = m;
-        N = n;
+        ValidateShape(count);
+        Count = count;
         FillValue = fillValue;
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, m, n);
-        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, m, n);
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, count);
+        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, count);
         _module = runtime.LoadModule(Ptx);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
         int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
@@ -64,19 +63,19 @@ internal sealed class PtxMaskedFillKernel : IDisposable
         arguments[1] = &maskPointer;
         arguments[2] = &outputPointer;
         arguments[3] = &fill;
-        _module.Launch(_function, (uint)(M * N / BlockThreads), 1, 1, BlockThreads, 1, 1, 0, arguments);
+        _module.Launch(_function, (uint)(Count / BlockThreads), 1, 1, BlockThreads, 1, 1, 0, arguments);
     }
 
     public void Dispose() => _module.Dispose();
 
-    internal static string EmitPtx(int ccMajor, int ccMinor, int m, int n)
+    internal static string EmitPtx(int ccMajor, int ccMinor, int count)
     {
-        ValidateShape(m, n);
+        ValidateShape(count);
         var ptx = new StringBuilder(4_000);
         ptx.AppendLine(".version 7.1");
         ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
         ptx.AppendLine(".address_size 64");
-        ptx.AppendLine($"// masked-fill M={m} N={n}");
+        ptx.AppendLine($"// masked-fill count={count}");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");
         ptx.AppendLine("    .param .u64 input_ptr,");
@@ -111,22 +110,21 @@ internal sealed class PtxMaskedFillKernel : IDisposable
         return ptx.ToString();
     }
 
-    private static DirectPtxKernelBlueprint CreateBlueprint(
-        DirectPtxArchitectureFamily architecture, int m, int n)
+    private static DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture, int count)
     {
-        var extent = new DirectPtxExtent(m, n);
+        var extent = new DirectPtxExtent(count);
         return new DirectPtxKernelBlueprint(
             Operation: "masked-fill",
             Version: 1,
             Architecture: architecture,
-            Variant: $"fp32-m{m}-n{n}",
+            Variant: $"fp32-count{count}",
             Tensors:
             [
-                new("input", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.RowMajor2D,
+                new("input", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
                     extent, extent, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact),
-                new("mask", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.RowMajor2D,
+                new("mask", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
                     extent, extent, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact),
-                new("output", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.RowMajor2D,
+                new("output", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
                     extent, extent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: new DirectPtxResourceBudget(
@@ -144,20 +142,17 @@ internal sealed class PtxMaskedFillKernel : IDisposable
             });
     }
 
-    internal static bool IsSupportedShape(int m, int n) =>
-        m > 0 && m % 64 == 0 &&
-        n > 0 && n % BlockThreads == 0 &&
-        m is 64 or 128 or 256 or 512 or 1024 or 2048 &&
-        n is 256 or 512 or 1024 or 2048 or 4096;
+    internal static bool IsSupportedCount(int count) =>
+        count > 0 && count % BlockThreads == 0 && count <= MaxCount;
 
-    internal static bool IsPromotedShape(int m, int n) => false;
+    internal static bool IsPromotedCount(int count) => false;
 
-    private static void ValidateShape(int m, int n)
+    private static void ValidateShape(int count)
     {
-        if (!IsSupportedShape(m, n))
+        if (!IsSupportedCount(count))
             throw new ArgumentOutOfRangeException(
-                nameof(m),
-                "Masked fill supports M in {64,128,256,512,1024,2048}, N in {256,512,1024,2048,4096}.");
+                nameof(count),
+                $"Masked fill supports a positive element count that is a multiple of {BlockThreads} up to {MaxCount}.");
     }
 
     private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)

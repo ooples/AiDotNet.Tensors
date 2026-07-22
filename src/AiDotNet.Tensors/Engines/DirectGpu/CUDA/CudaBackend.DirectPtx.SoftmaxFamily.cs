@@ -17,7 +17,7 @@ public sealed partial class CudaBackend
         _directPtxLogSumExpBackwardKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<DirectPtxSoftmaxKey, PtxSoftmaxBackwardKernel>
         _directPtxSoftmaxBackwardKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
-    private readonly DirectPtxKernelCache<DirectPtxSoftmaxKey, PtxMaskedFillBackwardKernel>
+    private readonly DirectPtxKernelCache<DirectPtxMaskedFillBackwardKey, PtxMaskedFillBackwardKernel>
         _directPtxMaskedFillBackwardKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<DirectPtxSoftmaxKey, PtxTaylorSoftmaxKernel>
         _directPtxTaylorSoftmaxKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
@@ -26,7 +26,8 @@ public sealed partial class CudaBackend
     private readonly DirectPtxKernelCache<DirectPtxMaskedFillKey, PtxMaskedFillKernel>
         _directPtxMaskedFillKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
 
-    private readonly record struct DirectPtxMaskedFillKey(int M, int N, int FillBits);
+    private readonly record struct DirectPtxMaskedFillKey(int Count, int FillBits);
+    private readonly record struct DirectPtxMaskedFillBackwardKey(int Count);
 
     private bool SoftmaxFamilyGateOpen =>
         IsDirectPtxSoftmaxEnabled && DirectPtxFeatureGate.SoftmaxExperimentOverride;
@@ -134,18 +135,18 @@ public sealed partial class CudaBackend
     }
     private long _directPtxSparsemaxDispatchCount;
 
-    // ---- Masked fill: input[M,N], mask[M,N], fill -> output[M,N] ----
-    internal bool TryDirectPtxMaskedFill(IGpuBuffer input, IGpuBuffer mask, IGpuBuffer output, int m, int n, float fill)
+    // ---- Masked fill: input[count], mask[count], fill -> output[count] (flat elementwise) ----
+    internal bool TryDirectPtxMaskedFill(IGpuBuffer input, IGpuBuffer mask, IGpuBuffer output, int count, float fill)
     {
-        if (!SoftmaxFamilyGateOpen || !PtxMaskedFillKernel.IsSupportedShape(m, n))
+        if (!SoftmaxFamilyGateOpen || !PtxMaskedFillKernel.IsSupportedCount(count))
         { DirectPtxLastError = "masked-fill-not-eligible"; return false; }
-        long bytes = checked((long)m * n * sizeof(float));
+        long bytes = checked((long)count * sizeof(float));
         if (input.SizeInBytes != bytes || mask.SizeInBytes != bytes || output.SizeInBytes != bytes)
         { DirectPtxLastError = "masked-fill-physical-extent-mismatch"; return false; }
         return Dispatch2(() =>
         {
-            var key = new DirectPtxMaskedFillKey(m, n, BitConverter.ToInt32(BitConverter.GetBytes(fill), 0));
-            var kernel = _directPtxMaskedFillKernels.GetOrAdd(key, () => new PtxMaskedFillKernel(_directPtxRuntime!, m, n, fill));
+            var key = new DirectPtxMaskedFillKey(count, BitConverter.ToInt32(BitConverter.GetBytes(fill), 0));
+            var kernel = _directPtxMaskedFillKernels.GetOrAdd(key, () => new PtxMaskedFillKernel(_directPtxRuntime!, count, fill));
             lock (GpuDispatchLock)
                 kernel.Launch(
                     DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]),
@@ -155,18 +156,18 @@ public sealed partial class CudaBackend
     }
     private long _directPtxMaskedFillDispatchCount;
 
-    // ---- Masked fill backward: grad[M,N], mask[M,N] -> output[M,N] ----
-    internal bool TryDirectPtxMaskedFillBackward(IGpuBuffer grad, IGpuBuffer mask, IGpuBuffer output, int m, int n)
+    // ---- Masked fill backward: grad[count], mask[count] -> output[count] (flat elementwise) ----
+    internal bool TryDirectPtxMaskedFillBackward(IGpuBuffer grad, IGpuBuffer mask, IGpuBuffer output, int count)
     {
-        if (!SoftmaxFamilyGateOpen || !PtxMaskedFillBackwardKernel.IsSupportedShape(m, n))
+        if (!SoftmaxFamilyGateOpen || !PtxMaskedFillBackwardKernel.IsSupportedCount(count))
         { DirectPtxLastError = "masked-fill-backward-not-eligible"; return false; }
-        long bytes = checked((long)m * n * sizeof(float));
+        long bytes = checked((long)count * sizeof(float));
         if (grad.SizeInBytes != bytes || mask.SizeInBytes != bytes || output.SizeInBytes != bytes)
         { DirectPtxLastError = "masked-fill-backward-physical-extent-mismatch"; return false; }
         return Dispatch2(() =>
         {
-            var key = new DirectPtxSoftmaxKey(m, n);
-            var kernel = _directPtxMaskedFillBackwardKernels.GetOrAdd(key, () => new PtxMaskedFillBackwardKernel(_directPtxRuntime!, m, n));
+            var key = new DirectPtxMaskedFillBackwardKey(count);
+            var kernel = _directPtxMaskedFillBackwardKernels.GetOrAdd(key, () => new PtxMaskedFillBackwardKernel(_directPtxRuntime!, count));
             lock (GpuDispatchLock)
                 kernel.Launch(
                     DirectPtxTensorView.Create(grad, kernel.Blueprint.Tensors[0]),

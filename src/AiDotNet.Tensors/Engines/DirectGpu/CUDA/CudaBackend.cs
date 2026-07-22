@@ -9478,6 +9478,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void MaskedFillBackward(IGpuBuffer gradOutput, IGpuBuffer mask, IGpuBuffer gradInput, int size)
     {
+        // Fail-closed direct-PTX fast path (issue #840); returns false until GPU-promoted.
+        if (TryDirectPtxMaskedFillBackward(gradOutput, mask, gradInput, size)) return;
         if (!_kernelCache.TryGetValue("masked_fill_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: masked_fill_backward");
         using var _ = PushContext();
@@ -16855,6 +16857,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void MaskedFillKernel(IGpuBuffer input, IGpuBuffer mask, IGpuBuffer output, float fillValue, int size)
     {
+        // Fail-closed direct-PTX fast path (issue #840); returns false until GPU-promoted.
+        if (TryDirectPtxMaskedFill(input, mask, output, size, fillValue)) return;
         if (!_kernelCache.TryGetValue("masked_fill_kernel", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: masked_fill_kernel");
         using var _ = PushContext();

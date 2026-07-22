@@ -180,7 +180,7 @@ public class DirectPtxSoftmaxTests
     [Fact]
     public void MaskedFillEmitter_IsElementwiseSelect()
     {
-        string ptx = PtxMaskedFillKernel.EmitPtx(8, 6, 64, 256);
+        string ptx = PtxMaskedFillKernel.EmitPtx(8, 6, 16384);
         Assert.Contains(PtxMaskedFillKernel.EntryPoint, ptx);
         Assert.Contains("ld.param.f32 %f2, [fill];", ptx);
         Assert.Contains("setp.neu.f32 %p0, %f1, 0f00000000", ptx);      // mask != 0
@@ -188,21 +188,22 @@ public class DirectPtxSoftmaxTests
         Assert.Equal(0, Count(ptx, "bar.sync 0"));
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
-        Assert.True(PtxMaskedFillKernel.IsSupportedShape(128, 2048));
-        Assert.False(PtxMaskedFillKernel.IsPromotedShape(128, 2048));
+        Assert.True(PtxMaskedFillKernel.IsSupportedCount(16384));
+        Assert.False(PtxMaskedFillKernel.IsSupportedCount(100));        // not a multiple of 256
+        Assert.False(PtxMaskedFillKernel.IsPromotedCount(16384));
     }
 
     [Fact]
     public void MaskedFillBackwardEmitter_GatesGradientAtMaskedPositions()
     {
-        string ptx = PtxMaskedFillBackwardKernel.EmitPtx(8, 6, 64, 256);
+        string ptx = PtxMaskedFillBackwardKernel.EmitPtx(8, 6, 16384);
         Assert.Contains(PtxMaskedFillBackwardKernel.EntryPoint, ptx);
         Assert.Contains("setp.neu.f32 %p0, %f1, 0f00000000", ptx);
         Assert.Contains("selp.f32 %f3, 0f00000000, %f0, %p0", ptx);     // 0 : gradOutput
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
-        Assert.True(PtxMaskedFillBackwardKernel.IsSupportedShape(128, 2048));
-        Assert.False(PtxMaskedFillBackwardKernel.IsPromotedShape(128, 2048));
+        Assert.True(PtxMaskedFillBackwardKernel.IsSupportedCount(16384));
+        Assert.False(PtxMaskedFillBackwardKernel.IsPromotedCount(16384));
     }
 
     [SkippableTheory]
@@ -230,8 +231,8 @@ public class DirectPtxSoftmaxTests
             expBwd[i] = masked ? 0f : inHost[i];   // treat inHost as gradOutput for the backward
         }
 
-        using var fwd = new PtxMaskedFillKernel(runtime, m, n, fill);
-        using var bwd = new PtxMaskedFillBackwardKernel(runtime, m, n);
+        using var fwd = new PtxMaskedFillKernel(runtime, m * n, fill);
+        using var bwd = new PtxMaskedFillBackwardKernel(runtime, m * n);
         Assert.Equal(0, fwd.Audit.Function.LocalBytesPerThread);
         Assert.Equal(0, bwd.Audit.Function.LocalBytesPerThread);
 
