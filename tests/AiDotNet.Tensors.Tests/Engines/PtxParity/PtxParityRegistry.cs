@@ -47,6 +47,15 @@ public static class PtxParityRegistry
 {
     public static IReadOnlyList<PtxParitySpec> Specs { get; } = new[]
     {
+        new PtxParitySpec("PtxFusedTranspose2DF32Kernel", PtxParityStatus.Deferred,
+            "2D transpose, fp32 (#845) - CudaBackend.Transpose",
+            "has a public route and a call-time experiment override. A transpose only moves elements, " +
+            "so its three-way spec can assert bit-for-bit equality on all three legs with no tolerance " +
+            "at all - the cleanest parity target in the family. Deferred only because the gate-off leg " +
+            "needs an admitted SM86 machine to run; the kernel is shared-memory staged, so that leg " +
+            "must also assert the Nsight bank-conflict count is zero, which the naive kernel it " +
+            "replaces would fail."),
+
         new PtxParitySpec("PtxFusedCastF32ToF16Kernel", PtxParityStatus.Deferred,
             "narrowing FP32->FP16 cast (#845) — CudaBackend.ConvertToFp16",
             "has a public route and a call-time experiment override, but its driver test compares the " +

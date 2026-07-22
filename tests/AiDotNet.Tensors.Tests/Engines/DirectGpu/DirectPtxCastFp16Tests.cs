@@ -76,12 +76,27 @@ public class DirectPtxCastFp16Tests
             DirectPtxLayoutCoverageStatus.ExperimentalDirectPtx,
             DirectPtxLayoutCoverageManifest.Get("CudaBackend.ConvertToFp32").Status);
         Assert.Equal(
-            new[] { "CudaBackend.ConvertToFp16", "CudaBackend.ConvertToFp32" },
+            DirectPtxLayoutCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxLayoutCoverageManifest.Get("CudaBackend.Transpose").Status);
+        Assert.Equal(
+            new[] { "CudaBackend.ConvertToFp16", "CudaBackend.ConvertToFp32", "CudaBackend.Transpose" },
             DirectPtxLayoutCoverageManifest.All
                 .Where(cell => cell.Status == DirectPtxLayoutCoverageStatus.ExperimentalDirectPtx)
                 .Select(cell => cell.Api)
                 .OrderBy(api => api, StringComparer.Ordinal)
                 .ToArray());
+        // Copy is deliberately left on the driver DMA copy engine, so it is the
+        // one cell that must be ExistingBackend rather than Planned: "no PTX
+        // lane" is a decision here, not an unfinished item.
+        Assert.Equal(
+            DirectPtxLayoutCoverageStatus.ExistingBackend,
+            DirectPtxLayoutCoverageManifest.Get("CudaBackend.Copy").Status);
+        // Every cell whose existing implementation was verified absent must say
+        // so, so a blocked cell can never read as a straightforward port.
+        Assert.All(
+            DirectPtxLayoutCoverageManifest.All
+                .Where(cell => cell.ExistingImplementation.StartsWith("none", StringComparison.Ordinal)),
+            cell => Assert.StartsWith("blocked:", cell.DirectPtxAssignment, StringComparison.Ordinal));
         Assert.All(DirectPtxLayoutCoverageManifest.All,
             cell => Assert.NotEqual(
                 DirectPtxLayoutCoverageStatus.PromotedDirectPtx, cell.Status));

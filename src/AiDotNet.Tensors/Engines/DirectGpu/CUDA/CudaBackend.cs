@@ -8617,6 +8617,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void Transpose(IGpuBuffer A, IGpuBuffer B, int rows, int cols)
     {
+        if (TryDirectPtxTranspose2D(A, B, rows, cols))
+            return;
         if (!_kernelCache.TryGetValue("transpose_2d", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: transpose_2d");
 

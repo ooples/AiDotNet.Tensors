@@ -20,6 +20,7 @@ internal static class DirectPtxFeatureGate
     internal const string FlashAttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FLASH_ATTENTION_BACKWARD";
     internal const string CastFp16EnvironmentVariable = "AIDOTNET_DIRECT_PTX_CAST_FP16";
     internal const string CastFp32EnvironmentVariable = "AIDOTNET_DIRECT_PTX_CAST_FP32";
+    internal const string Transpose2DEnvironmentVariable = "AIDOTNET_DIRECT_PTX_TRANSPOSE2D";
     internal const string QkvRopeCacheEnvironmentVariable = "AIDOTNET_DIRECT_PTX_QKV_ROPE_CACHE";
     internal const string AutotuneEnvironmentVariable = "AIDOTNET_DIRECT_PTX_AUTOTUNE";
     internal const string CacheCapacityEnvironmentVariable = "AIDOTNET_DIRECT_PTX_CACHE_CAPACITY";
@@ -37,6 +38,7 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentFlashAttentionBackwardEnabled = ReadEnabled(FlashAttentionBackwardEnvironmentVariable);
     private static readonly bool EnvironmentCastFp16Enabled = ReadEnabled(CastFp16EnvironmentVariable);
     private static readonly bool EnvironmentCastFp32Enabled = ReadEnabled(CastFp32EnvironmentVariable);
+    private static readonly bool EnvironmentTranspose2DEnabled = ReadEnabled(Transpose2DEnvironmentVariable);
     private static readonly bool EnvironmentQkvRopeCacheEnabled = ReadEnabled(QkvRopeCacheEnvironmentVariable);
     private static readonly bool EnvironmentAutotuneEnabled =
         !string.Equals(Environment.GetEnvironmentVariable(AutotuneEnvironmentVariable), "0", StringComparison.Ordinal);
@@ -48,6 +50,8 @@ internal static class DirectPtxFeatureGate
     internal static bool CastFp16ExperimentOverride { get; set; }
     /// <summary>Benchmark-only access to widening-cast cells that have not passed promotion.</summary>
     internal static bool CastFp32ExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to transpose cells that have not passed promotion.</summary>
+    internal static bool Transpose2DExperimentOverride { get; set; }
 
     internal static bool IsEnabled => IsAttentionEnabled;
 
@@ -77,6 +81,9 @@ internal static class DirectPtxFeatureGate
 
     internal static bool IsCastFp32Enabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentCastFp32Enabled);
+
+    internal static bool IsTranspose2DEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentTranspose2DEnabled);
 
     internal static bool IsQkvRopeCacheEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentQkvRopeCacheEnabled);

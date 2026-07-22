@@ -59,6 +59,15 @@ internal static class DirectPtxArchitecture
     /// </summary>
     internal static bool HasValidatedCastFp32(int major, int minor) =>
         (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The shared-tile 2D transpose specialization is measured only on
+    /// GA102/SM86. Shared-memory bank behaviour and the occupancy the tile
+    /// budget assumes are per-SM properties, so other Ampere variants stay
+    /// independent tuning domains.
+    /// </summary>
+    internal static bool HasValidatedTranspose2D(int major, int minor) =>
+        (major, minor) == (8, 6);
 }
 
 internal enum DirectPtxExtentMode
