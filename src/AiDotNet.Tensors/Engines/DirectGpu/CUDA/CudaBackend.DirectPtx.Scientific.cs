@@ -71,6 +71,8 @@ public sealed partial class CudaBackend
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<SciMatVecKey, PtxNormalizeProbabilitiesKernel> _sciNormalizeProbabilities =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<SciMatVecKey, PtxMeasurementForwardKernel> _sciMeasurementForward =
+        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
 
     private long _sciDispatchCount;
     internal long DirectPtxScientificDispatchCount => System.Threading.Interlocked.Read(ref _sciDispatchCount);
@@ -420,6 +422,20 @@ public sealed partial class CudaBackend
             var k = _sciNormalizeProbabilities.GetOrAdd(new SciMatVecKey(batchSize, stateSize),
                 () => new PtxNormalizeProbabilitiesKernel(_directPtxRuntime!, batchSize, stateSize));
             Launch1(k.Blueprint, probabilities, vp => k.Launch(vp));
+        });
+    }
+
+    internal bool TryDirectPtxMeasurementForward(IGpuBuffer input, IGpuBuffer output, int batchSize, int stateSize)
+    {
+        if (!ScientificGateOpen || !PtxMeasurementForwardKernel.IsSupportedShape(batchSize, stateSize)) return Fail("measurement-forward");
+        long inBytes = checked((long)batchSize * stateSize * 2 * sizeof(float));
+        long outBytes = checked((long)batchSize * stateSize * sizeof(float));
+        if (input.SizeInBytes != inBytes || output.SizeInBytes != outBytes) return Fail("measurement-forward-extent");
+        return SciDispatch(() =>
+        {
+            var k = _sciMeasurementForward.GetOrAdd(new SciMatVecKey(batchSize, stateSize),
+                () => new PtxMeasurementForwardKernel(_directPtxRuntime!, batchSize, stateSize));
+            Launch2(k.Blueprint, input, output, (vi, vo) => k.Launch(vi, vo));
         });
     }
 

@@ -15382,6 +15382,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // Validate state size is power of two for shared-memory reduction
         ValidateQuantumStateSize(stateSize, nameof(stateSize));
 
+        if (TryDirectPtxMeasurementForward(input, output, batchSize, stateSize)) return;
+
         using var _ = PushContext();
         // One block per batch element, uses shared memory for reduction
         uint grid = (uint)batchSize;

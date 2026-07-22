@@ -14,11 +14,12 @@ public class DirectPtxScientificTests
     [Fact]
     public void ScientificCoverageManifest_AssignsEveryScopedApiExactlyOnce()
     {
-        Assert.Equal(24, DirectPtxScientificCoverageManifest.All.Count);
+        Assert.Equal(25, DirectPtxScientificCoverageManifest.All.Count);
         string[] names = DirectPtxScientificCoverageManifest.All.Select(c => c.Api).ToArray();
         Assert.Contains("CudaBackend.CosineSimilarity", names);
         Assert.Contains("CudaBackend.SphericalSoftmax", names);
         Assert.Contains("CudaBackend.NormalizeProbabilities", names);
+        Assert.Contains("CudaBackend.MeasurementForward", names);
         Assert.Contains("CudaBackend.RbfForward", names);
         Assert.Contains("CudaBackend.PairwiseDistance", names);
         Assert.Contains("CudaBackend.PairwiseDistanceSquared", names);
@@ -753,6 +754,65 @@ public class DirectPtxScientificTests
         var actual = new float[expected.Length];
         outBuf.Download<float>(actual);
         AssertVectorClose(actual, expected, 3e-3f, $"capsule {op}");
+    }
+
+    [Fact]
+    public void MeasurementForwardEmitter_FusesMagnitudeAndNormalize()
+    {
+        string ptx = PtxMeasurementForwardKernel.EmitPtx(8, 6, 32, 256);
+        Assert.Contains(PtxMeasurementForwardKernel.EntryPoint, ptx);
+        Assert.Contains(".shared .align 16 .b8 red[1024]", ptx);
+        Assert.Contains("$MF_SUM:", ptx);                          // |z|^2 + partial sum
+        Assert.Contains("$MF_DIV:", ptx);                          // normalize
+        Assert.Equal(1, Count(ptx, "fma.rn.f32"));                 // re^2 + im^2
+        Assert.Equal(9, Count(ptx, "bar.sync 0"));                 // 1 after load + 8 tree strides
+        Assert.Equal(1, Count(ptx, "max.f32"));                    // clamp
+        Assert.Equal(1, Count(ptx, "div.rn.f32"));                 // normalize
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxMeasurementForwardKernel.IsSupportedShape(32, 256));
+        Assert.False(PtxMeasurementForwardKernel.IsSupportedShape(32, 0));
+        Assert.False(PtxMeasurementForwardKernel.IsPromotedShape(32, 256));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyMeasurementForward_MatchesOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in measurement-forward specialization is measured on GA10x/SM86.");
+        const int batchSize = 32, stateSize = 256;   // state > blockDim exercises the strided loop
+        using var kernel = new PtxMeasurementForwardKernel(runtime, batchSize, stateSize);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20268200);
+        float[] inHost = Values(random, batchSize * stateSize * 2, 1.0f);
+        var expected = new float[batchSize * stateSize];
+        for (int b = 0; b < batchSize; b++)
+        {
+            double sum = 0;
+            for (int i = 0; i < stateSize; i++)
+            {
+                double re = inHost[(b * stateSize + i) * 2], im = inHost[(b * stateSize + i) * 2 + 1];
+                double mag = re * re + im * im;
+                expected[b * stateSize + i] = (float)mag;
+                sum += mag;
+            }
+            if (sum < 1e-10) sum = 1e-10;
+            for (int i = 0; i < stateSize; i++) expected[b * stateSize + i] = (float)(expected[b * stateSize + i] / sum);
+        }
+
+        using var input = runtime.AllocateBytes((nuint)(inHost.Length * sizeof(float)));
+        using var output = runtime.AllocateBytes((nuint)(expected.Length * sizeof(float)));
+        input.Upload<float>(inHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[1]));
+        runtime.Synchronize();
+        var actual = new float[expected.Length];
+        output.Download<float>(actual);
+        AssertVectorClose(actual, expected, 2e-3f, "measurement forward");
     }
 
     [Fact]
@@ -1752,6 +1812,24 @@ public class DirectPtxScientificTests
             }
             using (var pb = backend.AllocateBuffer(npHost))
             { backend.NormalizeProbabilities(pb, npBatch, npState); n = AssertDispatched(n, "normalize-probabilities"); AssertVectorClose(backend.DownloadBuffer(pb), npExp, 2e-3f, "normalize-probabilities route"); }
+
+            // Measurement forward: |z|^2 + normalize. state power-of-two (256) for the NVRTC contract.
+            const int mfBatch = 32, mfState = 256;
+            float[] mfIn = Values(random, mfBatch * mfState * 2, 1.0f);
+            var mfExp = new float[mfBatch * mfState];
+            for (int bt = 0; bt < mfBatch; bt++)
+            {
+                double sum = 0;
+                for (int i = 0; i < mfState; i++)
+                {
+                    double zr = mfIn[(bt * mfState + i) * 2], zi = mfIn[(bt * mfState + i) * 2 + 1];
+                    double mag = zr * zr + zi * zi; mfExp[bt * mfState + i] = (float)mag; sum += mag;
+                }
+                if (sum < 1e-10) sum = 1e-10;
+                for (int i = 0; i < mfState; i++) mfExp[bt * mfState + i] = (float)(mfExp[bt * mfState + i] / sum);
+            }
+            using (var ib = backend.AllocateBuffer(mfIn)) using (var o = backend.AllocateBuffer(mfBatch * mfState))
+            { backend.MeasurementForward(ib, o, mfBatch, mfState); n = AssertDispatched(n, "measurement-forward"); AssertVectorClose(backend.DownloadBuffer(o), mfExp, 2e-3f, "measurement-forward route"); }
         }
         finally
         {
