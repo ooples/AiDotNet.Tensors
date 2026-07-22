@@ -4451,6 +4451,137 @@ public sealed class DirectPtxConvolutionTests
             $"Grouped deformable Conv2D backward-mask max absolute error {maxAbsoluteError:G9}.");
     }
 
+    [Fact]
+    public void DeformableConv2DGroupedBackwardOffsetEmitter_IsPerGroupSpatialDerivativeSm86Ptx()
+    {
+        string ptx = PtxDeformableConv2DGroupedNchw3x3BackwardOffsetF32Kernel.EmitPtx(8, 6);
+
+        Assert.Contains(".target sm_86", ptx, StringComparison.Ordinal);
+        Assert.Contains(PtxDeformableConv2DGroupedNchw3x3BackwardOffsetF32Kernel.EntryPoint, ptx, StringComparison.Ordinal);
+        Assert.Equal(6, Count(ptx, ".param .u64"));
+        Assert.Equal(2, Count(ptx, "div.u32"));
+        Assert.Equal(2, Count(ptx, "cvt.rmi.s32.f32"));
+        Assert.Contains("DEFORM_GROUPED_BWD_OFFSET_J:", ptx, StringComparison.Ordinal);
+        Assert.Contains("DEFORM_GROUPED_BWD_OFFSET_CO:", ptx, StringComparison.Ordinal);
+        // Dual outputs dOffY and dOffX.
+        Assert.Equal(2, Count(ptx, "st.global.f32"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("atom", ptx, StringComparison.Ordinal);
+        Assert.Throws<NotSupportedException>(() =>
+            PtxDeformableConv2DGroupedNchw3x3BackwardOffsetF32Kernel.EmitPtx(8, 9));
+    }
+
+    [Fact]
+    public void DeformableConv2DGroupedBackwardOffsetManifestCell_IsExperimentalWithDedicatedRoute()
+    {
+        Assert.Equal(DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxConvolutionCoverageManifest.Get("IEngine.DeformableConv2DGroupedBackward").Status);
+        Assert.Equal(DirectPtxConvolutionCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxConvolutionCoverageManifest
+                .Get("CudaBackend.TryDirectPtxDeformableConv2DGroupedBackwardOffset").Status);
+    }
+
+    [SkippableFact]
+    public void DriverOnlyDeformableConv2DGroupedBackwardOffset_MatchesCpuReference()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "Requires the experimental SM86 convolution specialization.");
+
+        const int inChannels = PtxDeformableConv2DGroupedNchw3x3BackwardOffsetF32Kernel.InputChannels;
+        const int outChannels = PtxDeformableConv2DGroupedNchw3x3BackwardOffsetF32Kernel.OutputChannels;
+        const int height = PtxDeformableConv2DGroupedNchw3x3BackwardOffsetF32Kernel.Height;
+        const int width = PtxDeformableConv2DGroupedNchw3x3BackwardOffsetF32Kernel.Width;
+        const int kernelSize = PtxDeformableConv2DGroupedNchw3x3BackwardOffsetF32Kernel.KernelSize;
+        const int taps = PtxDeformableConv2DGroupedNchw3x3BackwardOffsetF32Kernel.TapsPerChannel;
+        const int channelsPerGroup = PtxDeformableConv2DGroupedNchw3x3BackwardOffsetF32Kernel.ChannelsPerGroup;
+        const int offChannels = PtxDeformableConv2DGroupedNchw3x3BackwardOffsetF32Kernel.OffsetChannels;
+        const int maskChannels = PtxDeformableConv2DGroupedNchw3x3BackwardOffsetF32Kernel.MaskChannels;
+        int spatial = height * width;
+
+        using var kernel = new PtxDeformableConv2DGroupedNchw3x3BackwardOffsetF32Kernel(runtime);
+        using var gradOutDevice = runtime.AllocateBytes((nuint)PtxDeformableConv2DGroupedNchw3x3BackwardOffsetF32Kernel.GradOutputBytes);
+        using var inputDevice = runtime.AllocateBytes((nuint)PtxDeformableConv2DGroupedNchw3x3BackwardOffsetF32Kernel.InputBytes);
+        using var weightDevice = runtime.AllocateBytes((nuint)PtxDeformableConv2DGroupedNchw3x3BackwardOffsetF32Kernel.WeightBytes);
+        using var offsetDevice = runtime.AllocateBytes((nuint)PtxDeformableConv2DGroupedNchw3x3BackwardOffsetF32Kernel.OffsetBytes);
+        using var maskDevice = runtime.AllocateBytes((nuint)PtxDeformableConv2DGroupedNchw3x3BackwardOffsetF32Kernel.MaskBytes);
+        using var gradOffsetDevice = runtime.AllocateBytes((nuint)PtxDeformableConv2DGroupedNchw3x3BackwardOffsetF32Kernel.GradOffsetBytes);
+
+        Random random = AiDotNet.Tensors.Helpers.RandomHelper.CreateSecureRandom();
+        var gradOut = new float[outChannels * spatial];
+        for (int i = 0; i < gradOut.Length; i++) gradOut[i] = (float)(random.NextDouble() * 2 - 1);
+        var input = new float[inChannels * spatial];
+        for (int i = 0; i < input.Length; i++) input[i] = (float)(random.NextDouble() * 2 - 1);
+        var weights = new float[outChannels * inChannels * kernelSize * kernelSize];
+        for (int i = 0; i < weights.Length; i++) weights[i] = (float)(random.NextDouble() * 2 - 1);
+        var offsets = new float[offChannels * spatial];
+        for (int i = 0; i < offsets.Length; i++) offsets[i] = (float)(random.NextDouble() * 2 - 1);
+        var mask = new float[maskChannels * spatial];
+        for (int i = 0; i < mask.Length; i++) mask[i] = (float)random.NextDouble();
+        gradOutDevice.Upload<float>(gradOut);
+        inputDevice.Upload<float>(input);
+        weightDevice.Upload<float>(weights);
+        offsetDevice.Upload<float>(offsets);
+        maskDevice.Upload<float>(mask);
+
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(gradOutDevice, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(inputDevice, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(weightDevice, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(offsetDevice, kernel.Blueprint.Tensors[3]),
+            DirectPtxTensorView.CreateOwned(maskDevice, kernel.Blueprint.Tensors[4]),
+            DirectPtxTensorView.CreateOwned(gradOffsetDevice, kernel.Blueprint.Tensors[5]));
+        runtime.Synchronize();
+        var actual = new float[offChannels * spatial];
+        gradOffsetDevice.Download<float>(actual);
+
+        float maxAbsoluteError = 0;
+        for (int g = 0; g < maskChannels / taps; g++)
+        for (int t = 0; t < taps; t++)
+        {
+            int ky = t / kernelSize;
+            int kx = t % kernelSize;
+            for (int oy = 0; oy < height; oy++)
+            for (int ox = 0; ox < width; ox++)
+            {
+                int s = oy * width + ox;
+                float offY = offsets[(g * 2 * taps + 2 * t) * spatial + s];
+                float offX = offsets[(g * 2 * taps + 2 * t + 1) * spatial + s];
+                float py = oy + ky - 1 + offY;
+                float px = ox + kx - 1 + offX;
+                int y0 = (int)MathF.Floor(py);
+                int x0 = (int)MathF.Floor(px);
+                int y1 = y0 + 1, x1 = x0 + 1;
+                float fy = py - y0, fx = px - x0;
+                float wy0 = 1f - fy, wx0 = 1f - fx;
+                float accY = 0, accX = 0;
+                for (int j = 0; j < channelsPerGroup; j++)
+                {
+                    int ci = g * channelsPerGroup + j;
+                    float V00 = (y0 < 0 || y0 >= height || x0 < 0 || x0 >= width) ? 0f : input[ci * spatial + (y0 * width + x0)];
+                    float V01 = (y0 < 0 || y0 >= height || x1 < 0 || x1 >= width) ? 0f : input[ci * spatial + (y0 * width + x1)];
+                    float V10 = (y1 < 0 || y1 >= height || x0 < 0 || x0 >= width) ? 0f : input[ci * spatial + (y1 * width + x0)];
+                    float V11 = (y1 < 0 || y1 >= height || x1 < 0 || x1 >= width) ? 0f : input[ci * spatial + (y1 * width + x1)];
+                    float dpy = wx0 * (V10 - V00) + fx * (V11 - V01);
+                    float dpx = wy0 * (V01 - V00) + fy * (V11 - V10);
+                    float gsum = 0;
+                    for (int co = 0; co < outChannels; co++)
+                        gsum += gradOut[co * spatial + s] * weights[((co * inChannels + ci) * kernelSize + ky) * kernelSize + kx];
+                    accY += gsum * dpy;
+                    accX += gsum * dpx;
+                }
+                float m = mask[(g * taps + t) * spatial + s];
+                maxAbsoluteError = MathF.Max(maxAbsoluteError, MathF.Abs(actual[(g * 2 * taps + 2 * t) * spatial + s] - m * accY));
+                maxAbsoluteError = MathF.Max(maxAbsoluteError, MathF.Abs(actual[(g * 2 * taps + 2 * t + 1) * spatial + s] - m * accX));
+            }
+        }
+
+        Assert.True(maxAbsoluteError <= 3e-4f,
+            $"Grouped deformable Conv2D backward-offset max absolute error {maxAbsoluteError:G9}.");
+    }
+
     private static string? Validate(
         bool enabled, bool available, int major, int minor,
         DirectPtxConvolutionShape shape, IGpuBuffer? input, IGpuBuffer? weights,
