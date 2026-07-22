@@ -103,7 +103,8 @@ internal enum DirectPtxPhysicalType
     BFloat16,
     Float32,
     Float64,
-    Int32
+    Int32,
+    UInt8
 }
 
 internal enum DirectPtxPhysicalLayout
@@ -146,6 +147,10 @@ internal enum DirectPtxPhysicalLayout
     CsrFloatColumnIndices,
     /// <summary>Monotone CSR row offsets encoded as exactly integral FP32 values.</summary>
     CsrFloatRowPointers,
+    /// <summary>Row-major two retained FP32 values per logical group of four.</summary>
+    StructuredSparse2x4Values,
+    /// <summary>One packed byte per logical group of four containing two 2-bit positions.</summary>
+    StructuredSparse2x4Metadata,
     /// <summary>Dense additive attention bias, [H,Sq,Skv] or [B,H,Sq,Skv].</summary>
     AttentionBias,
     /// <summary>One-dimensional canonical vector.</summary>

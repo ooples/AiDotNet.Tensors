@@ -16,7 +16,7 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
             DirectPtxSparseGraphCompletionLedger.All
                 .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(26, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+        Assert.Equal(30, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
             entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
         Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
         Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
@@ -337,6 +337,30 @@ public sealed class DirectPtxSparseGraphTests
         Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
         Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
         Assert.All(blueprint.Tensors, tensor => Assert.Equal(DirectPtxExtentMode.Exact, tensor.ExtentMode));
+    }
+
+    [Theory]
+    [InlineData((int)DirectPtxStructuredSparse2x4Operation.Enforce, 3)]
+    [InlineData((int)DirectPtxStructuredSparse2x4Operation.Decompress, 3)]
+    [InlineData((int)DirectPtxStructuredSparse2x4Operation.Gemm, 4)]
+    [InlineData((int)DirectPtxStructuredSparse2x4Operation.GemmBiasRelu, 5)]
+    public void StructuredSparse2x4Emitter_BakesExactPointerOnlyAbi(
+        int operationValue,
+        int pointerCount)
+    {
+        var operation = (DirectPtxStructuredSparse2x4Operation)operationValue;
+        string ptx = PtxStructuredSparse2x4F32Kernel.EmitPtx(8, 6, operation, 0.75f, 0.25f);
+        DirectPtxKernelBlueprint blueprint = PtxStructuredSparse2x4F32Kernel.CreateBlueprint(
+            DirectPtxArchitectureFamily.Ampere, operation, 0.75f, 0.25f);
+
+        Assert.Equal(pointerCount, Count(ptx, ".param .u64"));
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
+        Assert.All(blueprint.Tensors, tensor => Assert.Equal(DirectPtxExtentMode.Exact, tensor.ExtentMode));
+        Assert.Contains(blueprint.Tensors, tensor =>
+            tensor.Layout == DirectPtxPhysicalLayout.StructuredSparse2x4Metadata &&
+            tensor.PhysicalType == DirectPtxPhysicalType.UInt8);
     }
 
     [Theory]

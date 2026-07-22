@@ -160,6 +160,7 @@ internal readonly record struct DirectPtxTensorContract
         DirectPtxPhysicalType.Float32 => 4,
         DirectPtxPhysicalType.Float64 => 8,
         DirectPtxPhysicalType.Int32 => 4,
+        DirectPtxPhysicalType.UInt8 => 1,
         _ => throw new ArgumentOutOfRangeException(nameof(PhysicalType))
     };
 }

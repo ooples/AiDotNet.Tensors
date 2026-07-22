@@ -54,6 +54,8 @@ public sealed partial class CudaBackend
         _directPtxCsrBackwardKernels = new(4);
     private readonly DirectPtxKernelCache<DirectPtxSparseUtilityKey, PtxSparseUtilityF32Kernel>
         _directPtxSparseUtilityKernels = new(8);
+    private readonly DirectPtxKernelCache<DirectPtxStructuredSparse2x4Key, PtxStructuredSparse2x4F32Kernel>
+        _directPtxStructuredSparse2x4Kernels = new(16);
     private DirectPtxRuntime? _directPtxRuntime;
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
@@ -78,6 +80,7 @@ public sealed partial class CudaBackend
     private long _directPtxCsrSegmentDispatchCount;
     private long _directPtxCsrBackwardDispatchCount;
     private long _directPtxSparseUtilityDispatchCount;
+    private long _directPtxStructuredSparse2x4DispatchCount;
     internal int DirectPtxCachedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxAttentionKernels.Count; }
@@ -173,6 +176,8 @@ public sealed partial class CudaBackend
         System.Threading.Interlocked.Read(ref _directPtxCsrBackwardDispatchCount);
     internal long DirectPtxSparseUtilityDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxSparseUtilityDispatchCount);
+    internal long DirectPtxStructuredSparse2x4DispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxStructuredSparse2x4DispatchCount);
 
     /// <summary>
     /// Attempts the exact FP32 CSR SpMM golden specialization. The admitted ABI
@@ -1461,6 +1466,197 @@ public sealed partial class CudaBackend
             return false;
         }
     }
+
+    internal bool TryDirectPtxEnforce2x4(
+        IGpuBuffer denseInput,
+        IGpuBuffer sparseValues,
+        IGpuBuffer sparseMetadata,
+        int rows,
+        int inner)
+    {
+        if (!PtxStructuredSparse2x4F32Kernel.SupportsMatrixShape(rows, inner) ||
+            !HasExactBytes(denseInput, (long)rows * inner * sizeof(float)) ||
+            !HasExactBytes(sparseValues, (long)rows * (inner / 2) * sizeof(float)) ||
+            !HasExactBytes(sparseMetadata, (long)rows * (inner / 4)))
+            return false;
+        return TryDirectPtxStructuredSparse2x4Core(
+            DirectPtxStructuredSparse2x4Operation.Enforce,
+            denseInput, sparseValues, sparseMetadata, null, null, 1.0f, 0.0f);
+    }
+
+    internal bool TryDirectPtxDecompress2x4(
+        IGpuBuffer sparseValues,
+        IGpuBuffer sparseMetadata,
+        IGpuBuffer denseOutput,
+        int rows,
+        int inner)
+    {
+        if (!PtxStructuredSparse2x4F32Kernel.SupportsMatrixShape(rows, inner) ||
+            !HasExactBytes(sparseValues, (long)rows * (inner / 2) * sizeof(float)) ||
+            !HasExactBytes(sparseMetadata, (long)rows * (inner / 4)) ||
+            !HasExactBytes(denseOutput, (long)rows * inner * sizeof(float)))
+            return false;
+        return TryDirectPtxStructuredSparse2x4Core(
+            DirectPtxStructuredSparse2x4Operation.Decompress,
+            sparseValues, sparseMetadata, denseOutput, null, null, 1.0f, 0.0f);
+    }
+
+    internal bool TryDirectPtxSparseGemm2x4(
+        IGpuBuffer sparseValues,
+        IGpuBuffer sparseMetadata,
+        IGpuBuffer denseB,
+        IGpuBuffer output,
+        int rows,
+        int columns,
+        int inner,
+        float alpha,
+        float beta)
+    {
+        if (!PtxStructuredSparse2x4F32Kernel.SupportsGemmShape(rows, columns, inner) ||
+            !float.IsFinite(alpha) || !float.IsFinite(beta) ||
+            !HasExactBytes(sparseValues, (long)rows * (inner / 2) * sizeof(float)) ||
+            !HasExactBytes(sparseMetadata, (long)rows * (inner / 4)) ||
+            !HasExactBytes(denseB, (long)inner * columns * sizeof(float)) ||
+            !HasExactBytes(output, (long)rows * columns * sizeof(float)))
+            return false;
+        return TryDirectPtxStructuredSparse2x4Core(
+            DirectPtxStructuredSparse2x4Operation.Gemm,
+            sparseValues, sparseMetadata, denseB, output, null, alpha, beta);
+    }
+
+    internal bool TryDirectPtxSparseGemmBiasRelu2x4(
+        IGpuBuffer sparseValues,
+        IGpuBuffer sparseMetadata,
+        IGpuBuffer denseB,
+        IGpuBuffer bias,
+        IGpuBuffer output,
+        int rows,
+        int columns,
+        int inner)
+    {
+        if (!PtxStructuredSparse2x4F32Kernel.SupportsGemmShape(rows, columns, inner) ||
+            !HasExactBytes(sparseValues, (long)rows * (inner / 2) * sizeof(float)) ||
+            !HasExactBytes(sparseMetadata, (long)rows * (inner / 4)) ||
+            !HasExactBytes(denseB, (long)inner * columns * sizeof(float)) ||
+            !HasExactBytes(bias, (long)columns * sizeof(float)) ||
+            !HasExactBytes(output, (long)rows * columns * sizeof(float)))
+            return false;
+        return TryDirectPtxStructuredSparse2x4Core(
+            DirectPtxStructuredSparse2x4Operation.GemmBiasRelu,
+            sparseValues, sparseMetadata, denseB, bias, output, 1.0f, 0.0f);
+    }
+
+    internal bool PrewarmDirectPtxStructuredSparse2x4(
+        DirectPtxStructuredSparse2x4Operation operation,
+        float alpha = 1.0f,
+        float beta = 0.0f)
+    {
+        if (!IsDirectPtxSparseGraphEnabled || IsStreamCapturing() ||
+            !float.IsFinite(alpha) || !float.IsFinite(beta))
+            return false;
+        try
+        {
+            EnsureContextCurrent();
+            var key = new DirectPtxStructuredSparse2x4Key(
+                operation, BitConverter.SingleToInt32Bits(alpha), BitConverter.SingleToInt32Bits(beta));
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _ = _directPtxStructuredSparse2x4Kernels.GetOrAdd(
+                    key, () => new PtxStructuredSparse2x4F32Kernel(
+                        _directPtxRuntime!, operation, alpha, beta));
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    private bool TryDirectPtxStructuredSparse2x4Core(
+        DirectPtxStructuredSparse2x4Operation operation,
+        IGpuBuffer p0,
+        IGpuBuffer p1,
+        IGpuBuffer p2,
+        IGpuBuffer? p3,
+        IGpuBuffer? p4,
+        float alpha,
+        float beta)
+    {
+        if (!IsDirectPtxSparseGraphEnabled) return false;
+        if (p0 is null || p1 is null || p2 is null ||
+            p0.Handle == IntPtr.Zero || p1.Handle == IntPtr.Zero || p2.Handle == IntPtr.Zero ||
+            (p3 is not null && p3.Handle == IntPtr.Zero) ||
+            (p4 is not null && p4.Handle == IntPtr.Zero))
+            return false;
+        nuint pointers = (nuint)p0.Handle | (nuint)p1.Handle | (nuint)p2.Handle;
+        if (p3 is not null) pointers |= (nuint)p3.Handle;
+        if (p4 is not null) pointers |= (nuint)p4.Handle;
+        if ((pointers & 15u) != 0) return false;
+        if (DirectPtxBuffersOverlap(p0, p1) || DirectPtxBuffersOverlap(p0, p2) ||
+            DirectPtxBuffersOverlap(p1, p2) ||
+            (p3 is not null && (DirectPtxBuffersOverlap(p0, p3) ||
+                DirectPtxBuffersOverlap(p1, p3) || DirectPtxBuffersOverlap(p2, p3))) ||
+            (p4 is not null && (DirectPtxBuffersOverlap(p0, p4) ||
+                DirectPtxBuffersOverlap(p1, p4) || DirectPtxBuffersOverlap(p2, p4) ||
+                (p3 is not null && DirectPtxBuffersOverlap(p3, p4)))))
+            return false;
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var key = new DirectPtxStructuredSparse2x4Key(
+                operation, BitConverter.SingleToInt32Bits(alpha), BitConverter.SingleToInt32Bits(beta));
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxStructuredSparse2x4Kernels.TryGetValue(key, out _))
+                    return false;
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxStructuredSparse2x4F32Kernel kernel =
+                    _directPtxStructuredSparse2x4Kernels.GetOrAdd(
+                        key, () => new PtxStructuredSparse2x4F32Kernel(
+                            _directPtxRuntime!, operation, alpha, beta));
+                if (capturing && !_directPtxStructuredSparse2x4Kernels.Pin(key)) return false;
+                lock (GpuDispatchLock)
+                {
+                    if (operation is DirectPtxStructuredSparse2x4Operation.Enforce or
+                        DirectPtxStructuredSparse2x4Operation.Decompress)
+                        kernel.Launch(
+                            DirectPtxTensorView.Create(p0, kernel.Blueprint.Tensors[0]),
+                            DirectPtxTensorView.Create(p1, kernel.Blueprint.Tensors[1]),
+                            DirectPtxTensorView.Create(p2, kernel.Blueprint.Tensors[2]));
+                    else if (operation == DirectPtxStructuredSparse2x4Operation.Gemm)
+                        kernel.LaunchGemm(
+                            DirectPtxTensorView.Create(p0, kernel.Blueprint.Tensors[0]),
+                            DirectPtxTensorView.Create(p1, kernel.Blueprint.Tensors[1]),
+                            DirectPtxTensorView.Create(p2, kernel.Blueprint.Tensors[2]),
+                            DirectPtxTensorView.Create(p3!, kernel.Blueprint.Tensors[3]));
+                    else
+                        kernel.LaunchBiasRelu(
+                            DirectPtxTensorView.Create(p0, kernel.Blueprint.Tensors[0]),
+                            DirectPtxTensorView.Create(p1, kernel.Blueprint.Tensors[1]),
+                            DirectPtxTensorView.Create(p2, kernel.Blueprint.Tensors[2]),
+                            DirectPtxTensorView.Create(p3!, kernel.Blueprint.Tensors[3]),
+                            DirectPtxTensorView.Create(p4!, kernel.Blueprint.Tensors[4]));
+                }
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxStructuredSparse2x4DispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    private static bool HasExactBytes(IGpuBuffer buffer, long bytes) =>
+        buffer is not null && buffer.SizeInBytes == bytes;
 
     private static bool DirectPtxBuffersOverlap(IGpuBuffer left, IGpuBuffer right)
     {
@@ -3313,6 +3509,7 @@ public sealed partial class CudaBackend
             _directPtxCsrSegmentKernels.Dispose();
             _directPtxCsrBackwardKernels.Dispose();
             _directPtxSparseUtilityKernels.Dispose();
+            _directPtxStructuredSparse2x4Kernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }
@@ -3393,6 +3590,10 @@ public sealed partial class CudaBackend
     private readonly record struct DirectPtxSparseUtilityKey(
         DirectPtxSparseUtility Utility,
         int EpsilonBits);
+    private readonly record struct DirectPtxStructuredSparse2x4Key(
+        DirectPtxStructuredSparse2x4Operation Operation,
+        int AlphaBits,
+        int BetaBits);
 
 }
 #endif

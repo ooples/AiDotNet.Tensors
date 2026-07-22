@@ -3609,6 +3609,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (requiredIndexBytes > sparseIndices.SizeInBytes)
             throw new ArgumentOutOfRangeException(nameof(M), $"Packed 2:4 metadata requires {requiredIndexBytes} bytes but sparseIndices has {sparseIndices.SizeInBytes}.");
 
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxEnforce2x4(denseInput, sparseValues, sparseIndices, M, K))
+            return;
+#endif
+
         if (!_kernelCache.TryGetValue("enforce_2x4_sparsity", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: enforce_2x4_sparsity");
 
@@ -3639,6 +3644,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if ((long)M * (K / 2) > sparseValues.Size || totalGroupsLong > sparseIndices.SizeInBytes || (long)M * K > denseOutput.Size)
             throw new ArgumentException("One or more buffers are too small for the requested 2:4 decompression.");
 
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxDecompress2x4(sparseValues, sparseIndices, denseOutput, M, K))
+            return;
+#endif
+
         if (!_kernelCache.TryGetValue("decompress_2x4_sparse", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: decompress_2x4_sparse");
 
@@ -3662,6 +3672,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (K % 4 != 0)
             throw new ArgumentException("K must be a multiple of 4 for 2:4 sparse GEMM.");
+
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxSparseGemm2x4(
+            sparseAValues, sparseAIndices, B, C, M, N, K, alpha, beta))
+            return;
+#endif
 
         if (!_kernelCache.TryGetValue("sparse_gemm_2x4", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: sparse_gemm_2x4");
@@ -3694,10 +3710,18 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (K % 4 != 0)
             throw new ArgumentException("K must be a multiple of 4 for 2:4 sparse GEMM.");
 
-        if (!_kernelCache.TryGetValue("sparse_gemm_bias_relu", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: sparse_gemm_bias_relu");
-
         var output = AllocateBuffer(M * N);
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxSparseGemmBiasRelu2x4(
+            sparseAValues, sparseAIndices, B, bias, output, M, N, K))
+            return output;
+#endif
+
+        if (!_kernelCache.TryGetValue("sparse_gemm_bias_relu", out var kernel))
+        {
+            output.Dispose();
+            throw new InvalidOperationException("CUDA kernel not found: sparse_gemm_bias_relu");
+        }
         using var _ = PushContext();
         IntPtr valsPtr = sparseAValues.Handle;
         IntPtr idxPtr = sparseAIndices.Handle;
