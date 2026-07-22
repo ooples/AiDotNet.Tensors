@@ -16,7 +16,7 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal(DirectPtxSparseGraphCompletionLedger.All.Count,
             DirectPtxSparseGraphCompletionLedger.All
                 .Select(entry => entry.Operation).Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(10, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
+        Assert.Equal(15, DirectPtxSparseGraphCompletionLedger.All.Count(entry =>
             entry.Status == DirectPtxSparseGraphCompletionStatus.ImplementedDirectPtx));
         Assert.False(DirectPtxSparseGraphCompletionLedger.IsComplete);
         Assert.Throws<InvalidOperationException>(DirectPtxSparseGraphCompletionLedger.RequireComplete);
@@ -233,6 +233,29 @@ public sealed class DirectPtxSparseGraphTests
         Assert.Equal("fused-zero-register-initialization", blueprint.Semantics["output-initialization"]);
         Assert.Equal("single-overwrite", blueprint.Semantics["output-write"]);
         Assert.Equal("0", blueprint.Semantics["workspace-bytes"]);
+    }
+
+    [Theory]
+    [InlineData((int)DirectPtxSegmentReduction.Sum, 3)]
+    [InlineData((int)DirectPtxSegmentReduction.Mean, 4)]
+    [InlineData((int)DirectPtxSegmentReduction.Max, 3)]
+    public void SegmentReduceEmitter_BakesReductionAndSingleStore(
+        int reductionValue,
+        int pointerParameters)
+    {
+        var reduction = (DirectPtxSegmentReduction)reductionValue;
+        string ptx = PtxSegmentReduceDeterministicVec4F32Kernel.EmitPtx(8, 6, reduction);
+        DirectPtxKernelBlueprint blueprint =
+            PtxSegmentReduceDeterministicVec4F32Kernel.CreateBlueprint(
+                DirectPtxArchitectureFamily.Ampere, reduction);
+
+        Assert.Equal(pointerParameters, Count(ptx, ".param .u64"));
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("atom.", ptx, StringComparison.Ordinal);
+        Assert.Equal(1, Count(ptx, "st.global.v4.f32"));
+        Assert.Equal("ascending-item-index", blueprint.Semantics["reduction-order"]);
+        Assert.Equal("single-overwrite", blueprint.Semantics["output-write"]);
+        Assert.Equal("0", blueprint.Semantics["intermediate-global-bytes"]);
     }
 
     [Theory]

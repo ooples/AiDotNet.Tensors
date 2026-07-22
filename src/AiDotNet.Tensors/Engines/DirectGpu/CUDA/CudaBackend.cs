@@ -10,9 +10,7 @@ using System.Threading;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
-#if NET5_0_OR_GREATER
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
-#endif
 using AiDotNet.Tensors.Engines.Gpu;
 using AiDotNet.Tensors.Helpers;
 
@@ -4205,6 +4203,119 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[3] = &numEdges;
         args[4] = &features;
         LaunchKernel2D(kernel, gridX, gridY, (uint)DefaultBlockSize, 1, args);
+    }
+
+    /// <summary>Segmented sum from contiguous item-major features.</summary>
+    public void SegmentSum(
+        IGpuBuffer input, IGpuBuffer segmentIds, IGpuBuffer output,
+        int numItems, int numSegments, int features) =>
+        SegmentReduce(input, segmentIds, null, output, numItems, numSegments, features,
+            DirectPtxSegmentReduction.Sum);
+
+    /// <summary>Segmented mean from contiguous item-major features.</summary>
+    public void SegmentMean(
+        IGpuBuffer input, IGpuBuffer segmentIds, IGpuBuffer segmentSizes, IGpuBuffer output,
+        int numItems, int numSegments, int features) =>
+        SegmentReduce(input, segmentIds, segmentSizes, output, numItems, numSegments, features,
+            DirectPtxSegmentReduction.Mean);
+
+    /// <summary>Segmented maximum from contiguous item-major features.</summary>
+    public void SegmentMax(
+        IGpuBuffer input, IGpuBuffer segmentIds, IGpuBuffer output,
+        int numItems, int numSegments, int features) =>
+        SegmentReduce(input, segmentIds, null, output, numItems, numSegments, features,
+            DirectPtxSegmentReduction.Max);
+
+    private unsafe void SegmentReduce(
+        IGpuBuffer input,
+        IGpuBuffer segmentIds,
+        IGpuBuffer? segmentSizes,
+        IGpuBuffer output,
+        int numItems,
+        int numSegments,
+        int features,
+        DirectPtxSegmentReduction reduction)
+    {
+        if (!IsAvailable)
+            throw new InvalidOperationException("CUDA backend is not available.");
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxSegmentReduceDeterministicVec4F32(
+            input, segmentIds, segmentSizes, output,
+            numItems, numSegments, features, reduction))
+            return;
+#endif
+        using var _ = PushContext();
+        if (reduction == DirectPtxSegmentReduction.Max)
+            InitializeNegativeInfinity(output, numSegments * features);
+        else
+            ZeroBuffer(output, numSegments * features);
+
+        bool deterministic = GpuDeterminism.IsActive;
+        string kernelName = reduction switch
+        {
+            DirectPtxSegmentReduction.Sum => deterministic ? "segment_sum_deterministic" : "segment_sum",
+            DirectPtxSegmentReduction.Mean => deterministic ? "segment_mean_deterministic" : "segment_mean",
+            DirectPtxSegmentReduction.Max => "segment_max",
+            _ => throw new ArgumentOutOfRangeException(nameof(reduction))
+        };
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+        IntPtr inputPtr = input.Handle;
+        IntPtr idsPtr = segmentIds.Handle;
+        IntPtr sizesPtr = segmentSizes?.Handle ?? IntPtr.Zero;
+        IntPtr outputPtr = output.Handle;
+        uint gridX = (uint)(deterministic && reduction != DirectPtxSegmentReduction.Max
+            ? numSegments : numItems);
+        uint gridY = (uint)((features + DefaultBlockSize - 1) / DefaultBlockSize);
+        if (reduction == DirectPtxSegmentReduction.Mean)
+        {
+            void** args = stackalloc void*[deterministic ? 7 : 6];
+            args[0] = &inputPtr;
+            args[1] = &idsPtr;
+            args[2] = &sizesPtr;
+            args[3] = &outputPtr;
+            args[4] = &numItems;
+            if (deterministic)
+            {
+                args[5] = &numSegments;
+                args[6] = &features;
+            }
+            else
+            {
+                args[5] = &features;
+            }
+            LaunchKernel2D(kernel, gridX, gridY, (uint)DefaultBlockSize, 1, args);
+        }
+        else
+        {
+            void** args = stackalloc void*[deterministic && reduction == DirectPtxSegmentReduction.Sum ? 6 : 5];
+            args[0] = &inputPtr;
+            args[1] = &idsPtr;
+            args[2] = &outputPtr;
+            args[3] = &numItems;
+            if (deterministic && reduction == DirectPtxSegmentReduction.Sum)
+            {
+                args[4] = &numSegments;
+                args[5] = &features;
+            }
+            else
+            {
+                args[4] = &features;
+            }
+            LaunchKernel2D(kernel, gridX, gridY, (uint)DefaultBlockSize, 1, args);
+        }
+    }
+
+    private unsafe void InitializeNegativeInfinity(IGpuBuffer output, int size)
+    {
+        if (!_kernelCache.TryGetValue("init_neg_inf", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: init_neg_inf");
+        IntPtr outputPtr = output.Handle;
+        void** args = stackalloc void*[2];
+        args[0] = &outputPtr;
+        args[1] = &size;
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
     private unsafe void ZeroBuffer(IGpuBuffer buffer, int size)

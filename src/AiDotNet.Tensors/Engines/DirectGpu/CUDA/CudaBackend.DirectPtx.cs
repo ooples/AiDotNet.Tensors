@@ -44,6 +44,8 @@ public sealed partial class CudaBackend
         _directPtxGraphGatherKernels = new(4);
     private readonly DirectPtxKernelCache<DirectPtxGraphScatterKey, PtxGraphScatterAddDeterministicVec4F32Kernel>
         _directPtxGraphScatterKernels = new(4);
+    private readonly DirectPtxKernelCache<DirectPtxSegmentReduction, PtxSegmentReduceDeterministicVec4F32Kernel>
+        _directPtxSegmentReduceKernels = new(4);
     private DirectPtxRuntime? _directPtxRuntime;
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
@@ -64,6 +66,7 @@ public sealed partial class CudaBackend
     private long _directPtxCsrSpmmF64DispatchCount;
     private long _directPtxGraphGatherDispatchCount;
     private long _directPtxGraphScatterDispatchCount;
+    private long _directPtxSegmentReduceDispatchCount;
     internal int DirectPtxCachedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxAttentionKernels.Count; }
@@ -151,6 +154,8 @@ public sealed partial class CudaBackend
         System.Threading.Interlocked.Read(ref _directPtxGraphGatherDispatchCount);
     internal long DirectPtxGraphScatterDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxGraphScatterDispatchCount);
+    internal long DirectPtxSegmentReduceDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxSegmentReduceDispatchCount);
 
     /// <summary>
     /// Attempts the exact FP32 CSR SpMM golden specialization. The admitted ABI
@@ -853,6 +858,127 @@ public sealed partial class CudaBackend
                 _ = _directPtxGraphScatterKernels.GetOrAdd(
                     key, () => new PtxGraphScatterAddDeterministicVec4F32Kernel(
                         _directPtxRuntime!, weighted));
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryDirectPtxSegmentReduceDeterministicVec4F32(
+        IGpuBuffer input,
+        IGpuBuffer segmentIds,
+        IGpuBuffer? segmentSizes,
+        IGpuBuffer output,
+        int items,
+        int segments,
+        int features,
+        DirectPtxSegmentReduction reduction)
+    {
+        if (!IsDirectPtxSparseGraphEnabled ||
+            !PtxSegmentReduceDeterministicVec4F32Kernel.SupportsShape(items, segments, features))
+        {
+            DirectPtxLastError = "segment-reduce-specialization-not-admitted";
+            return false;
+        }
+        bool mean = reduction == DirectPtxSegmentReduction.Mean;
+        if (input is null || segmentIds is null || output is null || (mean && segmentSizes is null))
+        {
+            DirectPtxLastError = "segment-reduce-null-buffer";
+            return false;
+        }
+        if (input.SizeInBytes != (long)items * features * sizeof(float) ||
+            segmentIds.SizeInBytes != (long)items * sizeof(int) ||
+            (mean && segmentSizes!.SizeInBytes != (long)segments * sizeof(int)) ||
+            output.SizeInBytes != (long)segments * features * sizeof(float))
+        {
+            DirectPtxLastError = "segment-reduce-physical-extent-mismatch";
+            return false;
+        }
+        if (input.Handle == IntPtr.Zero || segmentIds.Handle == IntPtr.Zero ||
+            output.Handle == IntPtr.Zero || (mean && segmentSizes!.Handle == IntPtr.Zero))
+        {
+            DirectPtxLastError = "segment-reduce-invalid-device-pointer";
+            return false;
+        }
+        nuint pointers = (nuint)input.Handle | (nuint)segmentIds.Handle | (nuint)output.Handle;
+        if (mean) pointers |= (nuint)segmentSizes!.Handle;
+        if ((pointers & 15u) != 0)
+        {
+            DirectPtxLastError = "segment-reduce-alignment-mismatch";
+            return false;
+        }
+        if (DirectPtxBuffersOverlap(output, input) || DirectPtxBuffersOverlap(output, segmentIds) ||
+            (mean && DirectPtxBuffersOverlap(output, segmentSizes!)))
+        {
+            DirectPtxLastError = "segment-reduce-alias-not-supported";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                if (capturing && !_directPtxSegmentReduceKernels.TryGetValue(reduction, out _))
+                {
+                    DirectPtxLastError =
+                        "Direct PTX segmented reduction must be prewarmed before CUDA graph capture.";
+                    return false;
+                }
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                PtxSegmentReduceDeterministicVec4F32Kernel kernel =
+                    _directPtxSegmentReduceKernels.GetOrAdd(
+                        reduction, () => new PtxSegmentReduceDeterministicVec4F32Kernel(
+                            _directPtxRuntime!, reduction));
+                if (capturing && !_directPtxSegmentReduceKernels.Pin(reduction))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX segmented reduction module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                {
+                    DirectPtxTensorView inputView =
+                        DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]);
+                    DirectPtxTensorView idsView =
+                        DirectPtxTensorView.Create(segmentIds, kernel.Blueprint.Tensors[1]);
+                    if (mean)
+                        kernel.LaunchMean(
+                            inputView, idsView,
+                            DirectPtxTensorView.Create(segmentSizes!, kernel.Blueprint.Tensors[2]),
+                            DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[3]));
+                    else
+                        kernel.Launch(
+                            inputView, idsView,
+                            DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[2]));
+                }
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxSegmentReduceDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool PrewarmDirectPtxSegmentReduce(DirectPtxSegmentReduction reduction)
+    {
+        if (!IsDirectPtxSparseGraphEnabled || IsStreamCapturing()) return false;
+        try
+        {
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _ = _directPtxSegmentReduceKernels.GetOrAdd(
+                    reduction, () => new PtxSegmentReduceDeterministicVec4F32Kernel(
+                        _directPtxRuntime!, reduction));
             }
             DirectPtxLastError = null;
             return true;
@@ -2710,6 +2836,7 @@ public sealed partial class CudaBackend
             _directPtxCsrSpmmF64Kernels.Dispose();
             _directPtxGraphGatherKernels.Dispose();
             _directPtxGraphScatterKernels.Dispose();
+            _directPtxSegmentReduceKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }

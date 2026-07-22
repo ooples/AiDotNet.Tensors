@@ -138,6 +138,10 @@ internal enum DirectPtxPhysicalLayout
     EdgeMajor2D,
     /// <summary>Contiguous FP32 scalar weight, one per directed edge.</summary>
     GraphEdgeWeights,
+    /// <summary>Zero-based Int32 segment id, one per edge/item.</summary>
+    SegmentIds,
+    /// <summary>Contiguous Int32 item count, one per segment.</summary>
+    SegmentSizes,
     /// <summary>Dense additive attention bias, [H,Sq,Skv] or [B,H,Sq,Skv].</summary>
     AttentionBias,
     /// <summary>One-dimensional canonical vector.</summary>
