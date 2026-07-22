@@ -606,6 +606,81 @@ public class DirectPtxSoftmaxTests
         }
     }
 
+    [SkippableFact]
+    public void Backend_DirectPtxSoftmaxFamily_RoutesDispatchThroughPublicMethods()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previous = DirectPtxFeatureGate.TestOverride;
+        bool previousExperiment = DirectPtxFeatureGate.SoftmaxExperimentOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        DirectPtxFeatureGate.SoftmaxExperimentOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxSoftmaxEnabled, "Requires a validated Ampere CUDA backend.");
+            const int m = 64, n = 256;
+            var random = RandomHelper.CreateSeededRandom(20265600);
+            float[] xHost = Values(random, m * n, 2.0f);
+            using var inBuf = backend.AllocateBuffer(xHost);
+            using var outBuf = backend.AllocateBuffer(m * n);
+
+            // Log-softmax: x - logsumexp.
+            long beforeLog = backend.DirectPtxLogSoftmaxDispatchCount;
+            backend.LogSoftmax(inBuf, outBuf, m, n);
+            backend.Synchronize();
+            Assert.True(backend.DirectPtxLogSoftmaxDispatchCount > beforeLog, backend.DirectPtxLastError);
+            Assert.True(backend.TryGetDirectPtxLogSoftmaxAudit(m, n, out DirectPtxKernelAudit logAudit));
+            Assert.Equal(0, logAudit.Function.LocalBytesPerThread);
+            var logExpected = new float[m * n];
+            for (int row = 0; row < m; row++)
+            {
+                double max = double.NegativeInfinity;
+                for (int col = 0; col < n; col++) max = Math.Max(max, xHost[row * n + col]);
+                double sum = 0;
+                for (int col = 0; col < n; col++) sum += Math.Exp(xHost[row * n + col] - max);
+                double logZ = max + Math.Log(sum);
+                for (int col = 0; col < n; col++) logExpected[row * n + col] = (float)(xHost[row * n + col] - logZ);
+            }
+            AssertVectorClose(backend.DownloadBuffer(outBuf), logExpected, 3e-3f, "backend log-softmax route");
+
+            // Taylor softmax: (1+x+x^2/2) normalized.
+            long beforeTaylor = backend.DirectPtxTaylorSoftmaxDispatchCount;
+            backend.TaylorSoftmax(inBuf, outBuf, m, n);
+            backend.Synchronize();
+            Assert.True(backend.DirectPtxTaylorSoftmaxDispatchCount > beforeTaylor, backend.DirectPtxLastError);
+            var taylorExpected = new float[m * n];
+            for (int row = 0; row < m; row++)
+            {
+                double sum = 0;
+                for (int col = 0; col < n; col++) { double v = xHost[row * n + col]; sum += 1.0 + v + 0.5 * v * v; }
+                for (int col = 0; col < n; col++) { double v = xHost[row * n + col]; taylorExpected[row * n + col] = (float)((1.0 + v + 0.5 * v * v) / sum); }
+            }
+            AssertVectorClose(backend.DownloadBuffer(outBuf), taylorExpected, 2e-3f, "backend taylor-softmax route");
+
+            // Sparsemax dispatches and projects onto the simplex (rows sum to 1).
+            long beforeSparse = backend.DirectPtxSparsemaxDispatchCount;
+            backend.Sparsemax(inBuf, outBuf, m, n);
+            backend.Synchronize();
+            Assert.True(backend.DirectPtxSparsemaxDispatchCount > beforeSparse, backend.DirectPtxLastError);
+            var sparse = backend.DownloadBuffer(outBuf);
+            for (int row = 0; row < m; row++)
+            {
+                double rowSum = 0;
+                for (int col = 0; col < n; col++)
+                {
+                    Assert.True(sparse[row * n + col] >= -1e-4f, "sparsemax output must be non-negative");
+                    rowSum += sparse[row * n + col];
+                }
+                Assert.True(Math.Abs(rowSum - 1.0) < 3e-3, $"sparsemax row {row} sums to {rowSum}, expected 1");
+            }
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previous;
+            DirectPtxFeatureGate.SoftmaxExperimentOverride = previousExperiment;
+        }
+    }
+
     private static float[] Values(Random random, int count, float magnitude)
     {
         var data = new float[count];

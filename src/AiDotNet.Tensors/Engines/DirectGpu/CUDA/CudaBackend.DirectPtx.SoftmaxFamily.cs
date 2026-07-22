@@ -29,6 +29,14 @@ public sealed partial class CudaBackend
     private readonly record struct DirectPtxMaskedFillKey(int Count, int FillBits);
     private readonly record struct DirectPtxMaskedFillBackwardKey(int Count);
 
+    internal long DirectPtxLogSumExpDispatchCount => System.Threading.Interlocked.Read(ref _directPtxLogSumExpDispatchCount);
+    internal long DirectPtxLogSumExpBackwardDispatchCount => System.Threading.Interlocked.Read(ref _directPtxLogSumExpBackwardDispatchCount);
+    internal long DirectPtxSoftmaxBackwardDispatchCount => System.Threading.Interlocked.Read(ref _directPtxSoftmaxBackwardDispatchCount);
+    internal long DirectPtxTaylorSoftmaxDispatchCount => System.Threading.Interlocked.Read(ref _directPtxTaylorSoftmaxDispatchCount);
+    internal long DirectPtxSparsemaxDispatchCount => System.Threading.Interlocked.Read(ref _directPtxSparsemaxDispatchCount);
+    internal long DirectPtxMaskedFillDispatchCount => System.Threading.Interlocked.Read(ref _directPtxMaskedFillDispatchCount);
+    internal long DirectPtxMaskedFillBackwardDispatchCount => System.Threading.Interlocked.Read(ref _directPtxMaskedFillBackwardDispatchCount);
+
     private bool SoftmaxFamilyGateOpen =>
         IsDirectPtxSoftmaxEnabled && DirectPtxFeatureGate.SoftmaxExperimentOverride;
 
