@@ -2958,6 +2958,67 @@ public class DirectPtxWmmaTests
     }
 
     [Fact]
+    public void GemmFp16TransposedEmitter_ConvertsFp16InAndOutWithTransposedB()
+    {
+        string ptx = PtxGemmFp16TransposedKernel.EmitPtx(8, 6, 64, 256, 256);
+        Assert.Contains(PtxGemmFp16TransposedKernel.EntryPoint, ptx);
+        Assert.Equal(4, Count(ptx, "ld.global.nc.u16"));   // 2 A + 2 B fp16 loads / thread
+        Assert.Equal(4, Count(ptx, "cvt.f32.f16"));         // fp16 operands -> fp32 tile
+        Assert.Equal(128, Count(ptx, "fma.rn.f32"));        // fp32 accumulate
+        Assert.Equal(16, Count(ptx, "cvt.rn.f16.f32"));     // narrow accumulators
+        Assert.Equal(16, Count(ptx, "st.global.u16"));      // fp16 output
+        Assert.Equal(0, Count(ptx, "add.rn.f32"));          // no bias
+        Assert.Equal(2, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxGemmFp16TransposedKernel.IsSupportedShape(128, 512, 2048));
+        Assert.False(PtxGemmFp16TransposedKernel.IsPromotedShape(128, 512, 2048));
+    }
+
+    [SkippableTheory]
+    [InlineData(64, 256, 256)]
+    [InlineData(128, 512, 256)]
+    public void DriverOnlyGemmFp16Transposed_MatchesOracle(int m, int kc, int no)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedFusedLinear(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in FP16 transpose-B specialization is measured on GA10x/SM86.");
+        using var kernel = new PtxGemmFp16TransposedKernel(runtime, m, kc, no);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20263900 + m + kc + no);
+        ushort[] aHost = RandomHalfRange(random, m * kc, 0.25f);
+        ushort[] bHost = RandomHalfRange(random, no * kc, 0.25f);   // output-major [No,Kc]
+        var expected = new float[m * no];
+        for (int row = 0; row < m; row++)
+        for (int col = 0; col < no; col++)
+        {
+            float acc = 0;
+            for (int t = 0; t < kc; t++)
+                acc += (float)BitConverter.UInt16BitsToHalf(aHost[row * kc + t])
+                     * (float)BitConverter.UInt16BitsToHalf(bHost[col * kc + t]);
+            expected[row * no + col] = acc;
+        }
+
+        using var a = runtime.AllocateBytes((nuint)(aHost.Length * sizeof(ushort)));
+        using var b = runtime.AllocateBytes((nuint)(bHost.Length * sizeof(ushort)));
+        using var output = runtime.AllocateBytes((nuint)(m * no * sizeof(ushort)));
+        a.Upload<ushort>(aHost);
+        b.Upload<ushort>(bHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(a, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(b, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new ushort[m * no];
+        output.Download<ushort>(actual);
+        for (int i = 0; i < actual.Length; i++)
+            Assert.True(Math.Abs((float)BitConverter.UInt16BitsToHalf(actual[i]) - expected[i]) < 5e-2f,
+                $"fp16 transpose-B mismatch at {i}");
+    }
+
+    [Fact]
     public void GemmEmitter_IsRegisterResidentTiledGemm()
     {
         string ptx = PtxGemmKernel.EmitPtx(8, 6, 64, 256, 256);
