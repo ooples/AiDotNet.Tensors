@@ -284,6 +284,18 @@ public static class PtxParityRegistry
             "one module per element count; output=log1p(input)=ln(1+input) via lg2.approx(1+x) scaled by " +
             "ln(2). Its spec is TOLERANCE-based, not bit-exact. Converts to ThreeWayParity (with tolerance) " +
             "when the SM86 run lands; until then unpromoted and fail-closed."),
+        new PtxParitySpec("PtxBispectrumGatherF32Kernel", PtxParityStatus.Deferred,
+            "third-order spectral cumulant (bispectrum), fp32 (#850) - CudaBackend.BispectrumGather",
+            "one module per (maxF1,maxF2,specLength); each thread forms B(f1,f2)=X(f1)*X(f2)*conj(X(f1+f2)) " +
+            "as a triple complex product with the multiply-then-fma contraction (nvcc's default fused form), " +
+            "so its spec is TOLERANCE-based against the fp64 oracle. Converts to ThreeWayParity (with tolerance) " +
+            "when the SM86 run lands; until then unpromoted and fail-closed."),
+        new PtxParitySpec("PtxTrispectrumGatherF32Kernel", PtxParityStatus.Deferred,
+            "fourth-order spectral cumulant (trispectrum), fp32 (#850) - CudaBackend.TrispectrumGather",
+            "one module per (maxF1,maxF2,maxF3,specLength); each thread forms " +
+            "T(f1,f2,f3)=X(f1)*X(f2)*X(f3)*conj(X(f1+f2+f3)) as a quadruple complex product with the " +
+            "multiply-then-fma contraction, so its spec is TOLERANCE-based against the fp64 oracle. Converts to " +
+            "ThreeWayParity (with tolerance) when the SM86 run lands; until then unpromoted and fail-closed."),
         new PtxParitySpec("PtxAnalyticSignalMaskF32Kernel", PtxParityStatus.Deferred,
             "analytic-signal (Hilbert) frequency mask, fp32 (#850) - CudaBackend.AnalyticSignalMask",
             "one module per (batch,fftSize,binLow,binHigh); the frequency-domain Hilbert step, multiplying the " +

@@ -68,6 +68,7 @@ public class DirectPtxComplexMultiplyTests
                 "CudaBackend.ApplyWindow",
                 "CudaBackend.BatchedFFT",
                 "CudaBackend.BatchedFFT2D",
+                "CudaBackend.BispectrumGather",
                 "CudaBackend.BuildSpectrum",
                 "CudaBackend.ComplexConjugate",
                 "CudaBackend.ComplexMagnitude",
@@ -97,6 +98,7 @@ public class DirectPtxComplexMultiplyTests
                 "CudaBackend.SplitComplexPhase",
                 "CudaBackend.SplitComplexScale",
                 "CudaBackend.StftMagPhase",
+                "CudaBackend.TrispectrumGather",
                 "Fft.FftFreq",
                 "Fft.FftShift",
                 "Fft.IFftShift",
@@ -2193,6 +2195,81 @@ public class DirectPtxComplexMultiplyTests
         oB.Download<float>(actual);
         for (int i = 0; i < actual.Length; i++)
             Assert.True(Math.Abs(actual[i] - expected[i]) <= 5e-3 * (1 + Math.Abs(expected[i])) + 5e-4);
+    }
+
+    [Fact]
+    public void BispectrumGatherEmitter_IsTripleComplexProduct()
+    {
+        string ptx = PtxBispectrumGatherF32Kernel.EmitPtx(8, 6, 64, 64);
+        Assert.Contains("op=bispectrum-gather", ptx);
+        Assert.Contains("div.u32 %r3, %r2, 64", ptx);          // f1
+        Assert.Contains("rem.u32 %r4, %r2, 64", ptx);          // f2
+        Assert.Contains("add.u32 %r5, %r3, %r4", ptx);         // sumIdx
+        Assert.Equal(4, Count(ptx, "fma.rn.f32"));             // two complex products
+        Assert.Equal(3, Count(ptx, "neg.f32"));                // conj + two subtractions
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxBispectrumGatherF32Kernel.IsSupportedShape(64, 64, 200));   // 200 >= 64+64-1
+        Assert.False(PtxBispectrumGatherF32Kernel.IsSupportedShape(64, 64, 100));  // spec too short
+        Assert.False(PtxBispectrumGatherF32Kernel.IsPromotedShape(64, 64, 200));
+    }
+
+    [Fact]
+    public void TrispectrumGatherEmitter_IsQuadrupleComplexProduct()
+    {
+        string ptx = PtxTrispectrumGatherF32Kernel.EmitPtx(8, 6, 16, 16, 16);
+        Assert.Contains("op=trispectrum-gather", ptx);
+        Assert.Contains("div.u32 %r3, %r2, 256", ptx);         // f1 = idx / (maxF2*maxF3)
+        Assert.Contains("div.u32 %r5, %r4, 16", ptx);          // f2
+        Assert.Contains("rem.u32 %r6, %r4, 16", ptx);          // f3
+        Assert.Equal(6, Count(ptx, "fma.rn.f32"));             // three complex products
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxTrispectrumGatherF32Kernel.IsSupportedShape(16, 16, 16, 60));   // 60 >= 48-2
+        Assert.False(PtxTrispectrumGatherF32Kernel.IsSupportedShape(16, 16, 16, 40));
+        Assert.False(PtxTrispectrumGatherF32Kernel.IsPromotedShape(16, 16, 16, 60));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyBispectrumGather_MatchesDoubleOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedComplexMultiply(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The candidate is admitted only on SM86.");
+        const int maxF1 = 64, maxF2 = 64, specLen = maxF1 + maxF2;   // >= maxF1+maxF2-1
+        using var kernel = new PtxBispectrumGatherF32Kernel(runtime, maxF1, maxF2, specLen);
+        var sr = new float[specLen];
+        var si = new float[specLen];
+        var random = RandomHelper.CreateSeededRandom(20270801);
+        for (int i = 0; i < specLen; i++) { sr[i] = (float)(random.NextDouble() * 2 - 1); si[i] = (float)(random.NextDouble() * 2 - 1); }
+        var expRe = new float[maxF1 * maxF2];
+        var expIm = new float[maxF1 * maxF2];
+        for (int idx = 0; idx < maxF1 * maxF2; idx++)
+        {
+            int f1 = idx / maxF2, f2 = idx % maxF2, s = f1 + f2;
+            double ar = sr[f1], ai = si[f1], br = sr[f2], bi = si[f2], cr = sr[s], ci = -si[s];
+            double abr = ar * br - ai * bi, abi = ar * bi + ai * br;
+            expRe[idx] = (float)(abr * cr - abi * ci); expIm[idx] = (float)(abr * ci + abi * cr);
+        }
+        using var srB = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var siB = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var orB = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        using var oiB = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
+        srB.Upload<float>(sr); siB.Upload<float>(si);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(srB, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(siB, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(orB, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(oiB, kernel.Blueprint.Tensors[3]));
+        runtime.Synchronize();
+        var actRe = new float[maxF1 * maxF2];
+        var actIm = new float[maxF1 * maxF2];
+        orB.Download<float>(actRe); oiB.Download<float>(actIm);
+        for (int i = 0; i < actRe.Length; i++)
+        {
+            Assert.True(Math.Abs(actRe[i] - expRe[i]) <= 1e-4 * (1 + Math.Abs(expRe[i])));
+            Assert.True(Math.Abs(actIm[i] - expIm[i]) <= 1e-4 * (1 + Math.Abs(expIm[i])));
+        }
     }
 
     private static int Count(string text, string value)
