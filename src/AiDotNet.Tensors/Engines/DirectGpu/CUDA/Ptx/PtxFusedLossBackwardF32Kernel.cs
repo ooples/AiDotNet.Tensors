@@ -325,10 +325,12 @@ internal sealed class PtxFusedLossBackwardF32Kernel : IDisposable
             Variant: $"linear-vec4-b{blockThreads}-n{size}",
             Tensors: tensors,
             ResourceBudget: new DirectPtxResourceBudget(
-                // Measured by the offline gate at sm86: 18 registers at four
-                // elements per thread. Eight elements hold twice the inputs and
-                // twice the diffs live, so the budget is widened ahead of the
-                // next measurement rather than left to fail at construction.
+                // Measured by the offline gate at sm86 at eight elements per
+                // thread: 30 registers for the MSE gradient and 28 for the MAE
+                // sign gradient, up from 18 at four elements. The budget was
+                // widened to 40 ahead of that measurement rather than after it,
+                // which is what kept this change from repeating the cast
+                // kernels' silent breach.
                 MaxRegistersPerThread: 40,
                 MaxStaticSharedBytes: 0,
                 MaxLocalBytesPerThread: 0,
