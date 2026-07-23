@@ -7,18 +7,21 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
 /// <summary>
 /// Exact-shape fused-linear backward family. One launch assigns disjoint CTA
-/// ranges to dInput and dWeight. The k=0 dWeight lanes accumulate dBias from
-/// the same grad-output/saved-value reads, so no masked-gradient tensor or
-/// separate bias-reduction launch is materialized.
+/// ranges to dInput and dWeight. The championship ReLU cell uses 32x32 output
+/// tiles with 4x4 register microtiles; other supported shapes use the generic
+/// scalar topology. The k=0 dWeight lanes also accumulate dBias, so neither a
+/// masked-gradient tensor nor a separate bias-reduction launch is materialized.
 /// </summary>
 internal sealed class PtxFusedLinearBackwardKernel : IDisposable
 {
     internal const int BlockThreads = 256;
+    internal const int ExactBlockThreads = 64;
     internal const int Tile = 16;
     internal const string EntryPoint = "aidotnet_fused_linear_backward";
 
     private readonly DirectPtxModule _module;
     private readonly IntPtr _function;
+    private readonly int _blockThreads;
 
     internal int M { get; }
     internal int K { get; }
@@ -50,13 +53,15 @@ internal sealed class PtxFusedLinearBackwardKernel : IDisposable
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, m, k, n, activation);
         _module = runtime.LoadModule(Ptx);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
+        _blockThreads = IsExactChampionshipCell(m, k, n, activation)
+            ? ExactBlockThreads : BlockThreads;
         int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(
-            _function, BlockThreads);
+            _function, _blockThreads);
         Blueprint.ResourceBudget.Validate(
-            EntryPoint, info, BlockThreads, activeBlocks);
+            EntryPoint, info, _blockThreads, activeBlocks);
         DirectPtxKernelAudit audit = DirectPtxKernelAudit.Create(
             Blueprint, runtime.DeviceFingerprint, Ptx, info,
-            BlockThreads, activeBlocks, _module);
+            _blockThreads, activeBlocks, _module);
         Audits = [audit];
     }
 
@@ -104,10 +109,12 @@ internal sealed class PtxFusedLinearBackwardKernel : IDisposable
         arguments[4] = &gi;
         arguments[5] = &gw;
         arguments[6] = &gb;
-        uint grid = checked(Grid(checked(M * K)) + Grid(checked(K * N)));
+        uint grid = IsExactChampionshipCell(M, K, N, Activation)
+            ? 80u
+            : checked(Grid(checked(M * K)) + Grid(checked(K * N)));
         _module.Launch(
             _function, grid, 1, 1,
-            BlockThreads, 1, 1, 0, arguments);
+            checked((uint)_blockThreads), 1, 1, 0, arguments);
     }
 
     private static uint Grid(int elements) =>
@@ -129,8 +136,226 @@ internal sealed class PtxFusedLinearBackwardKernel : IDisposable
         ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// fused-linear backward M={m} K={k} N={n} act={activation}; single exact pointer-only ABI");
-        EmitCombined(ptx, m, k, n, activation);
+        if (IsExactChampionshipCell(m, k, n, activation))
+            EmitExactReluChampionship(ptx);
+        else
+            EmitCombined(ptx, m, k, n, activation);
         return ptx.ToString();
+    }
+
+    private static void EmitExactReluChampionship(StringBuilder ptx)
+    {
+        ptx.AppendLine("// championship M64 K256 N256 ReLU backward; 32x32 register tiles; 80 CTAs; no global intermediates");
+        ptx.AppendLine($".visible .entry {EntryPoint}(");
+        string[] parameters =
+        [
+            "grad_output_ptr", "input_ptr", "weights_ptr", "saved_ptr",
+            "grad_input_ptr", "grad_weight_ptr", "grad_bias_ptr"
+        ];
+        for (int i = 0; i < parameters.Length; i++)
+            ptx.AppendLine($"    .param .u64 {parameters[i]}{(i + 1 == parameters.Length ? string.Empty : ",")}");
+        ptx.AppendLine(")");
+        ptx.AppendLine($".maxntid {ExactBlockThreads}, 1, 1");
+        ptx.AppendLine("{");
+        ptx.AppendLine("    .reg .pred %p<12>;");
+        ptx.AppendLine("    .reg .b32 %r<40>;");
+        ptx.AppendLine("    .reg .b64 %rd<64>;");
+        ptx.AppendLine("    .reg .f32 %f<40>;");
+        ptx.AppendLine("    .shared .align 16 .b8 tile_a[4096];");
+        ptx.AppendLine("    .shared .align 16 .b8 tile_b[4096];");
+        EmitPointers(
+            ptx, "grad_output_ptr", "input_ptr", "weights_ptr", "saved_ptr",
+            "grad_input_ptr", "grad_weight_ptr", "grad_bias_ptr");
+        ptx.AppendLine("    mov.u64 %rd7, tile_a;");
+        ptx.AppendLine("    mov.u64 %rd8, tile_b;");
+        ptx.AppendLine("    mov.u32 %r0, %tid.x;");
+        ptx.AppendLine("    mov.u32 %r1, %ctaid.x;");
+        ptx.AppendLine("    shr.u32 %r2, %r0, 3;");
+        ptx.AppendLine("    and.b32 %r3, %r0, 7;");
+        ptx.AppendLine("    shl.b32 %r4, %r2, 2;");
+        ptx.AppendLine("    shl.b32 %r5, %r3, 2;");
+        for (int accumulator = 0; accumulator < 16; accumulator++)
+            ptx.AppendLine($"    mov.f32 %f{accumulator}, 0f00000000;");
+        for (int bias = 32; bias < 36; bias++)
+            ptx.AppendLine($"    mov.f32 %f{bias}, 0f00000000;");
+        EmitExactComputePointers(ptx);
+        ptx.AppendLine("    setp.lt.u32 %p0, %r1, 16;");
+        ptx.AppendLine("    @%p0 bra.uni EXACT_GRAD_INPUT;");
+
+        // dWeight = X^T @ maskedGrad. Sixty-four 32x32 CTAs replace the
+        // previous 256 scalar 16x16 CTAs; block-row zero also owns dBias.
+        ptx.AppendLine("    sub.u32 %r1, %r1, 16;");
+        ptx.AppendLine("    shr.u32 %r7, %r1, 3;");
+        ptx.AppendLine("    and.b32 %r8, %r1, 7;");
+        ptx.AppendLine("    shl.b32 %r7, %r7, 5;");
+        ptx.AppendLine("    shl.b32 %r8, %r8, 5;");
+        ptx.AppendLine("    setp.eq.u32 %p6, %r7, 0;");
+        ptx.AppendLine("    setp.eq.u32 %p7, %r2, 0;");
+        ptx.AppendLine("    and.pred %p6, %p6, %p7;");
+        ptx.AppendLine("    mov.u32 %r6, 0;");
+        ptx.AppendLine("EXACT_GW_PANEL:");
+        ptx.AppendLine("    setp.ge.u32 %p1, %r6, 64;");
+        ptx.AppendLine("    @%p1 bra.uni EXACT_GW_STORE;");
+        for (int load = 0; load < 4; load++)
+            EmitExactGradWeightPanelLoad(ptx, load * ExactBlockThreads);
+        ptx.AppendLine("    bar.sync 0;");
+        EmitExactPanelCompute(ptx, accumulateBias: true);
+        ptx.AppendLine("    bar.sync 0;");
+        ptx.AppendLine("    add.u32 %r6, %r6, 32;");
+        ptx.AppendLine("    bra.uni EXACT_GW_PANEL;");
+        ptx.AppendLine("EXACT_GW_STORE:");
+        EmitExactOutputTileStore(ptx, "%rd5");
+        ptx.AppendLine("    @!%p6 bra.uni EXACT_DONE;");
+        ptx.AppendLine("    add.u32 %r12, %r8, %r5;");
+        ptx.AppendLine("    mul.wide.u32 %rd28, %r12, 4;");
+        ptx.AppendLine("    add.u64 %rd28, %rd6, %rd28;");
+        ptx.AppendLine("    st.global.v4.f32 [%rd28], {%f32,%f33,%f34,%f35};");
+        ptx.AppendLine("    bra.uni EXACT_DONE;");
+
+        // dInput = maskedGrad @ W^T. Sixteen CTAs cover [64,256].
+        ptx.AppendLine("EXACT_GRAD_INPUT:");
+        ptx.AppendLine("    shr.u32 %r7, %r1, 3;");
+        ptx.AppendLine("    and.b32 %r8, %r1, 7;");
+        ptx.AppendLine("    shl.b32 %r7, %r7, 5;");
+        ptx.AppendLine("    shl.b32 %r8, %r8, 5;");
+        ptx.AppendLine("    mov.u32 %r6, 0;");
+        ptx.AppendLine("EXACT_GI_PANEL:");
+        ptx.AppendLine("    setp.ge.u32 %p1, %r6, 256;");
+        ptx.AppendLine("    @%p1 bra.uni EXACT_GI_STORE;");
+        for (int load = 0; load < 4; load++)
+            EmitExactGradInputPanelLoad(ptx, load * ExactBlockThreads);
+        ptx.AppendLine("    bar.sync 0;");
+        EmitExactPanelCompute(ptx, accumulateBias: false);
+        ptx.AppendLine("    bar.sync 0;");
+        ptx.AppendLine("    add.u32 %r6, %r6, 32;");
+        ptx.AppendLine("    bra.uni EXACT_GI_PANEL;");
+        ptx.AppendLine("EXACT_GI_STORE:");
+        EmitExactOutputTileStore(ptx, "%rd4");
+        ptx.AppendLine("EXACT_DONE:");
+        ptx.AppendLine("    ret;");
+        ptx.AppendLine("}");
+    }
+
+    private static void EmitExactComputePointers(StringBuilder ptx)
+    {
+        ptx.AppendLine("    mul.wide.u32 %rd20, %r4, 128;");
+        ptx.AppendLine("    add.u64 %rd20, %rd7, %rd20;");
+        ptx.AppendLine("    add.u64 %rd21, %rd20, 128;");
+        ptx.AppendLine("    add.u64 %rd22, %rd20, 256;");
+        ptx.AppendLine("    add.u64 %rd23, %rd20, 384;");
+        ptx.AppendLine("    mul.wide.u32 %rd24, %r5, 4;");
+        ptx.AppendLine("    add.u64 %rd24, %rd8, %rd24;");
+        ptx.AppendLine("    add.u64 %rd25, %rd24, 4;");
+        ptx.AppendLine("    add.u64 %rd26, %rd24, 8;");
+        ptx.AppendLine("    add.u64 %rd27, %rd24, 12;");
+    }
+
+    private static void EmitExactGradInputPanelLoad(StringBuilder ptx, int threadOffset)
+    {
+        ptx.AppendLine($"    add.u32 %r9, %r0, {threadOffset};");
+        ptx.AppendLine("    shr.u32 %r10, %r9, 3;");
+        ptx.AppendLine("    and.b32 %r11, %r9, 7;");
+        ptx.AppendLine("    shl.b32 %r11, %r11, 2;");
+        ptx.AppendLine("    add.u32 %r12, %r7, %r10;");
+        ptx.AppendLine("    add.u32 %r13, %r6, %r11;");
+        ptx.AppendLine("    mad.lo.u32 %r14, %r12, 256, %r13;");
+        ptx.AppendLine("    mul.wide.u32 %rd9, %r14, 4;");
+        ptx.AppendLine("    add.u64 %rd10, %rd0, %rd9;");
+        ptx.AppendLine("    add.u64 %rd11, %rd3, %rd9;");
+        ptx.AppendLine("    ld.global.v4.f32 {%f20,%f21,%f22,%f23}, [%rd10];");
+        ptx.AppendLine("    ld.global.v4.f32 {%f24,%f25,%f26,%f27}, [%rd11];");
+        EmitExactReluMask(ptx);
+        ptx.AppendLine("    mad.lo.u32 %r15, %r10, 32, %r11;");
+        ptx.AppendLine("    mul.wide.u32 %rd12, %r15, 4;");
+        ptx.AppendLine("    add.u64 %rd12, %rd7, %rd12;");
+        ptx.AppendLine("    st.shared.v4.f32 [%rd12], {%f28,%f29,%f30,%f31};");
+        ptx.AppendLine("    add.u32 %r12, %r8, %r10;");
+        ptx.AppendLine("    mad.lo.u32 %r14, %r12, 256, %r13;");
+        ptx.AppendLine("    mul.wide.u32 %rd9, %r14, 4;");
+        ptx.AppendLine("    add.u64 %rd10, %rd2, %rd9;");
+        ptx.AppendLine("    ld.global.v4.f32 {%f16,%f17,%f18,%f19}, [%rd10];");
+        ptx.AppendLine("    mad.lo.u32 %r15, %r11, 32, %r10;");
+        ptx.AppendLine("    mul.wide.u32 %rd12, %r15, 4;");
+        ptx.AppendLine("    add.u64 %rd12, %rd8, %rd12;");
+        ptx.AppendLine("    st.shared.f32 [%rd12], %f16;");
+        ptx.AppendLine("    st.shared.f32 [%rd12+128], %f17;");
+        ptx.AppendLine("    st.shared.f32 [%rd12+256], %f18;");
+        ptx.AppendLine("    st.shared.f32 [%rd12+384], %f19;");
+    }
+
+    private static void EmitExactGradWeightPanelLoad(StringBuilder ptx, int threadOffset)
+    {
+        ptx.AppendLine($"    add.u32 %r9, %r0, {threadOffset};");
+        ptx.AppendLine("    shr.u32 %r10, %r9, 3;");
+        ptx.AppendLine("    and.b32 %r11, %r9, 7;");
+        ptx.AppendLine("    shl.b32 %r11, %r11, 2;");
+        ptx.AppendLine("    add.u32 %r12, %r6, %r10;");
+        ptx.AppendLine("    add.u32 %r13, %r7, %r11;");
+        ptx.AppendLine("    mad.lo.u32 %r14, %r12, 256, %r13;");
+        ptx.AppendLine("    mul.wide.u32 %rd9, %r14, 4;");
+        ptx.AppendLine("    add.u64 %rd10, %rd1, %rd9;");
+        ptx.AppendLine("    ld.global.v4.f32 {%f16,%f17,%f18,%f19}, [%rd10];");
+        ptx.AppendLine("    mad.lo.u32 %r15, %r11, 32, %r10;");
+        ptx.AppendLine("    mul.wide.u32 %rd12, %r15, 4;");
+        ptx.AppendLine("    add.u64 %rd12, %rd7, %rd12;");
+        ptx.AppendLine("    st.shared.f32 [%rd12], %f16;");
+        ptx.AppendLine("    st.shared.f32 [%rd12+128], %f17;");
+        ptx.AppendLine("    st.shared.f32 [%rd12+256], %f18;");
+        ptx.AppendLine("    st.shared.f32 [%rd12+384], %f19;");
+        ptx.AppendLine("    add.u32 %r13, %r8, %r11;");
+        ptx.AppendLine("    mad.lo.u32 %r14, %r12, 256, %r13;");
+        ptx.AppendLine("    mul.wide.u32 %rd9, %r14, 4;");
+        ptx.AppendLine("    add.u64 %rd10, %rd0, %rd9;");
+        ptx.AppendLine("    add.u64 %rd11, %rd3, %rd9;");
+        ptx.AppendLine("    ld.global.v4.f32 {%f20,%f21,%f22,%f23}, [%rd10];");
+        ptx.AppendLine("    ld.global.v4.f32 {%f24,%f25,%f26,%f27}, [%rd11];");
+        EmitExactReluMask(ptx);
+        ptx.AppendLine("    mad.lo.u32 %r15, %r10, 32, %r11;");
+        ptx.AppendLine("    mul.wide.u32 %rd12, %r15, 4;");
+        ptx.AppendLine("    add.u64 %rd12, %rd8, %rd12;");
+        ptx.AppendLine("    st.shared.v4.f32 [%rd12], {%f28,%f29,%f30,%f31};");
+    }
+
+    private static void EmitExactReluMask(StringBuilder ptx)
+    {
+        for (int lane = 0; lane < 4; lane++)
+        {
+            ptx.AppendLine($"    setp.gt.f32 %p{lane + 2}, %f{lane + 24}, 0f00000000;");
+            ptx.AppendLine($"    selp.f32 %f{lane + 28}, %f{lane + 20}, 0f00000000, %p{lane + 2};");
+        }
+    }
+
+    private static void EmitExactPanelCompute(StringBuilder ptx, bool accumulateBias)
+    {
+        for (int inner = 0; inner < 32; inner++)
+        {
+            string aOffset = inner == 0 ? string.Empty : $"+{inner * sizeof(float)}";
+            string bOffset = inner == 0 ? string.Empty : $"+{inner * 32 * sizeof(float)}";
+            for (int row = 0; row < 4; row++)
+                ptx.AppendLine($"    ld.shared.f32 %f{16 + row}, [%rd{20 + row}{aOffset}];");
+            for (int col = 0; col < 4; col++)
+                ptx.AppendLine($"    ld.shared.f32 %f{20 + col}, [%rd{24 + col}{bOffset}];");
+            for (int row = 0; row < 4; row++)
+            for (int col = 0; col < 4; col++)
+                ptx.AppendLine($"    fma.rn.f32 %f{row * 4 + col}, %f{16 + row}, %f{20 + col}, %f{row * 4 + col};");
+            if (accumulateBias)
+                for (int col = 0; col < 4; col++)
+                    ptx.AppendLine($"    @%p6 add.rn.f32 %f{32 + col}, %f{32 + col}, %f{20 + col};");
+        }
+    }
+
+    private static void EmitExactOutputTileStore(StringBuilder ptx, string outputPointer)
+    {
+        for (int row = 0; row < 4; row++)
+        {
+            ptx.AppendLine($"    add.u32 %r12, %r7, %r4;");
+            if (row != 0) ptx.AppendLine($"    add.u32 %r12, %r12, {row};");
+            ptx.AppendLine("    add.u32 %r13, %r8, %r5;");
+            ptx.AppendLine("    mad.lo.u32 %r14, %r12, 256, %r13;");
+            ptx.AppendLine("    mul.wide.u32 %rd28, %r14, 4;");
+            ptx.AppendLine($"    add.u64 %rd28, {outputPointer}, %rd28;");
+            ptx.AppendLine($"    st.global.v4.f32 [%rd28], {{%f{row * 4},%f{row * 4 + 1},%f{row * 4 + 2},%f{row * 4 + 3}}};");
+        }
     }
 
     private static void EmitCombined(
@@ -382,6 +607,14 @@ internal sealed class PtxFusedLinearBackwardKernel : IDisposable
         k is 256 or 512 or 1024 or 2048 or 4096 &&
         n is 256 or 512 or 1024 or 2048 or 4096;
 
+    internal static bool IsExactChampionshipCell(
+        int m,
+        int k,
+        int n,
+        DirectPtxLinearActivation activation) =>
+        m == 64 && k == 256 && n == 256 &&
+        activation == DirectPtxLinearActivation.Relu;
+
     private static void Validate(
         int m, int k, int n, DirectPtxLinearActivation activation)
     {
@@ -405,9 +638,9 @@ internal sealed class PtxFusedLinearBackwardKernel : IDisposable
         var weights = new DirectPtxExtent(k, n);
         return new DirectPtxKernelBlueprint(
             Operation: "fused-linear-backward",
-            Version: 2,
+            Version: IsExactChampionshipCell(m, k, n, activation) ? 3 : 2,
             Architecture: architecture,
-            Variant: $"fp32-m{m}-k{k}-n{n}-{activation}".ToLowerInvariant(),
+            Variant: $"{(IsExactChampionshipCell(m, k, n, activation) ? "register32x32-thread4x4" : "fp32")}-m{m}-k{k}-n{n}-{activation}".ToLowerInvariant(),
             Tensors:
             [
                 new("gradOutput", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.RowMajor2D,
@@ -427,16 +660,22 @@ internal sealed class PtxFusedLinearBackwardKernel : IDisposable
                     DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 48,
-                MaxStaticSharedBytes: 2 * Tile * Tile * sizeof(float),
+                MaxRegistersPerThread:
+                    IsExactChampionshipCell(m, k, n, activation) ? 96 : 48,
+                MaxStaticSharedBytes: IsExactChampionshipCell(m, k, n, activation)
+                    ? 8_192 : 2 * Tile * Tile * sizeof(float),
                 MaxLocalBytesPerThread: 0,
                 MinBlocksPerMultiprocessor: 4),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["formula"] = "dX,dW,db for activation(X@W+bias)",
                 ["activation"] = activation.ToString(),
-                ["launch-topology"] = "single-grid-disjoint-dinput-dweight-cta-ranges",
-                ["tiling"] = "16x16-shared-panels-coalesced-global-loads",
+                ["launch-topology"] = IsExactChampionshipCell(m, k, n, activation)
+                    ? "single-grid-16-dinput-plus-64-dweight-cta-ranges"
+                    : "single-grid-disjoint-dinput-dweight-cta-ranges",
+                ["tiling"] = IsExactChampionshipCell(m, k, n, activation)
+                    ? "32x32 output tile; 32-wide shared panels; 4x4 register microtile"
+                    : "16x16-shared-panels-coalesced-global-loads",
                 ["masked-gradient"] = "recomputed-in-registers-once-per-shared-panel-load",
                 ["bias-gradient"] = "accumulated-by-k0-dweight-tile-from-resident-masked-gradient-panel",
                 ["global-intermediates"] = "none",

@@ -15,6 +15,19 @@ internal static class DirectPtxDenseLinearAutotuner
     private const string VariantPrefix = "nblock-";
     internal const double NearTieTolerance = 0.03;
 
+    /// <summary>
+    /// Reproducible GA10x championship defaults measured with a cold tuning
+    /// cache. K=512 favors four warps/N32; K=1024 favors eight warps/N64.
+    /// Autotuning may still replace either choice for another fingerprint.
+    /// </summary>
+    internal static int DefaultCandidate(int inputFeatures, int outputFeatures)
+    {
+        if (!PtxFusedLinearGeluFp16M16Kernel.IsSupportedShape(
+                inputFeatures, outputFeatures))
+            throw new ArgumentOutOfRangeException(nameof(inputFeatures));
+        return inputFeatures == 512 ? 32 : 64;
+    }
+
     internal static int[] Candidates(int inputFeatures, int outputFeatures)
     {
         if (!PtxFusedLinearGeluFp16M16Kernel.IsSupportedShape(

@@ -13,11 +13,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 internal sealed class PtxStridedDotKernel : IDisposable
 {
     internal const int BlockThreads = 256;
+    internal const int ReverseBlockThreads = 32;
     internal const int WarpCount = BlockThreads / 32;
     internal const string EntryPoint = "aidotnet_strided_dot";
 
     private readonly DirectPtxModule _module;
     private readonly IntPtr _function;
+    private readonly int _blockThreads;
 
     internal string Ptx { get; }
     internal DirectPtxKernelBlueprint Blueprint { get; }
@@ -43,11 +45,12 @@ internal sealed class PtxStridedDotKernel : IDisposable
             aSize, bSize, bOffset, bStep);
         _module = runtime.LoadModule(Ptx);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
+        _blockThreads = GetBlockThreads(aSize, bSize, bOffset, bStep);
+        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, _blockThreads);
+        Blueprint.ResourceBudget.Validate(EntryPoint, info, _blockThreads, activeBlocks);
         Audit = DirectPtxKernelAudit.Create(
             Blueprint, runtime.DeviceFingerprint, Ptx, info,
-            BlockThreads, activeBlocks, _module);
+            _blockThreads, activeBlocks, _module);
     }
 
     internal unsafe void Launch(
@@ -68,7 +71,7 @@ internal sealed class PtxStridedDotKernel : IDisposable
         arguments[1] = &rightPointer;
         arguments[2] = &outputPointer;
         _module.Launch(
-            _function, 1, 1, 1, BlockThreads, 1, 1, 0, arguments);
+            _function, 1, 1, 1, checked((uint)_blockThreads), 1, 1, 0, arguments);
     }
 
     public void Dispose() => _module.Dispose();
@@ -83,6 +86,8 @@ internal sealed class PtxStridedDotKernel : IDisposable
     {
         Validate(aSize, bSize);
         (int first, int last) = ValidInterval(aSize, bSize, bOffset, bStep);
+        if (IsExactReverseCell(aSize, bSize, bOffset, bStep))
+            return EmitExactReversePtx(ccMajor, ccMinor);
         var ptx = new StringBuilder(8_192);
         ptx.AppendLine(".version 7.1");
         ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
@@ -144,6 +149,59 @@ internal sealed class PtxStridedDotKernel : IDisposable
         ptx.AppendLine("    @%p2 bra.uni STRIDED_DONE;");
         ptx.AppendLine("    st.global.f32 [%rd2], %f0;");
         ptx.AppendLine("STRIDED_DONE:");
+        ptx.AppendLine("    ret;");
+        ptx.AppendLine("}");
+        return ptx.ToString();
+    }
+
+    private static string EmitExactReversePtx(int ccMajor, int ccMinor)
+    {
+        var ptx = new StringBuilder(8_192);
+        ptx.AppendLine(".version 7.1");
+        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        ptx.AppendLine(".address_size 64");
+        ptx.AppendLine();
+        ptx.AppendLine("// exact strided dot a=512 b=512 offset=511 step=-1; valid-i=[0,511]; aligned float4 reverse pairs");
+        ptx.AppendLine($".visible .entry {EntryPoint}(");
+        ptx.AppendLine("    .param .u64 left_ptr,");
+        ptx.AppendLine("    .param .u64 right_ptr,");
+        ptx.AppendLine("    .param .u64 output_ptr");
+        ptx.AppendLine(")");
+        ptx.AppendLine($".maxntid {ReverseBlockThreads}, 1, 1");
+        ptx.AppendLine("{");
+        ptx.AppendLine("    .reg .pred %p<2>;");
+        ptx.AppendLine("    .reg .b32 %r<8>;");
+        ptx.AppendLine("    .reg .b64 %rd<8>;");
+        ptx.AppendLine("    .reg .f32 %f<10>;");
+        ptx.AppendLine("    ld.param.u64 %rd0, [left_ptr];");
+        ptx.AppendLine("    ld.param.u64 %rd1, [right_ptr];");
+        ptx.AppendLine("    ld.param.u64 %rd2, [output_ptr];");
+        ptx.AppendLine("    mov.u32 %r0, %tid.x;");
+        ptx.AppendLine("    mul.wide.u32 %rd3, %r0, 16;");
+        ptx.AppendLine("    add.u64 %rd4, %rd0, %rd3;");
+        ptx.AppendLine("    sub.u32 %r2, 127, %r0;");
+        ptx.AppendLine("    mul.wide.u32 %rd5, %r2, 16;");
+        ptx.AppendLine("    add.u64 %rd6, %rd1, %rd5;");
+        ptx.AppendLine("    mov.f32 %f8, 0f00000000;");
+        for (int group = 0; group < 4; group++)
+        {
+            ptx.AppendLine("    ld.global.nc.v4.f32 {%f0,%f1,%f2,%f3}, [%rd4];");
+            ptx.AppendLine("    ld.global.nc.v4.f32 {%f4,%f5,%f6,%f7}, [%rd6];");
+            ptx.AppendLine("    fma.rn.f32 %f8, %f0, %f7, %f8;");
+            ptx.AppendLine("    fma.rn.f32 %f8, %f1, %f6, %f8;");
+            ptx.AppendLine("    fma.rn.f32 %f8, %f2, %f5, %f8;");
+            ptx.AppendLine("    fma.rn.f32 %f8, %f3, %f4, %f8;");
+            if (group != 3)
+            {
+                ptx.AppendLine("    add.u64 %rd4, %rd4, 512;");
+                ptx.AppendLine("    sub.u64 %rd6, %rd6, 512;");
+            }
+        }
+        EmitWarpReduction(ptx, "%f8", "%f9", "%r3", "%r4");
+        ptx.AppendLine("    setp.ne.u32 %p0, %r0, 0;");
+        ptx.AppendLine("    @%p0 bra.uni REVERSE_DONE;");
+        ptx.AppendLine("    st.global.f32 [%rd2], %f8;");
+        ptx.AppendLine("REVERSE_DONE:");
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");
         return ptx.ToString();
@@ -223,9 +281,9 @@ internal sealed class PtxStridedDotKernel : IDisposable
         (int first, int last) = ValidInterval(aSize, bSize, bOffset, bStep);
         return new DirectPtxKernelBlueprint(
             Operation: "strided-dot",
-            Version: 2,
+            Version: IsExactReverseCell(aSize, bSize, bOffset, bStep) ? 3 : 2,
             Architecture: architecture,
-            Variant: $"warp-reduce-fp32-a{aSize}-b{bSize}-o{bOffset}-s{bStep}",
+            Variant: $"{(IsExactReverseCell(aSize, bSize, bOffset, bStep) ? "fp32x4-reverse" : "warp-reduce-fp32")}-a{aSize}-b{bSize}-o{bOffset}-s{bStep}",
             Tensors:
             [
                 new("left", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
@@ -236,8 +294,10 @@ internal sealed class PtxStridedDotKernel : IDisposable
                     output, output, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 32,
-                MaxStaticSharedBytes: WarpCount * sizeof(float),
+                MaxRegistersPerThread: IsExactReverseCell(aSize, bSize, bOffset, bStep)
+                    ? 48 : 32,
+                MaxStaticSharedBytes: IsExactReverseCell(aSize, bSize, bOffset, bStep)
+                    ? 0 : GetWarpCount(aSize, bSize, bOffset, bStep) * sizeof(float),
                 MaxLocalBytesPerThread: 0,
                 MinBlocksPerMultiprocessor: 1),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
@@ -249,9 +309,20 @@ internal sealed class PtxStridedDotKernel : IDisposable
                 ["runtime-scalar-parameters"] = "none",
                 ["runtime-bounds-checks"] = "none",
                 ["temporary-device-allocation"] = "none",
-                ["reduction-pipeline"] = "register shuffles; eight shared warp totals; one block barrier; one output store"
+                ["reduction-pipeline"] = IsExactReverseCell(aSize, bSize, bOffset, bStep)
+                    ? "four aligned float4 reverse-pair loads per lane; register-only warp reduction; one output store"
+                    : "register shuffles; eight shared warp totals; one block barrier; one output store"
             });
     }
+
+    private static bool IsExactReverseCell(int aSize, int bSize, int bOffset, int bStep) =>
+        aSize == 512 && bSize == 512 && bOffset == 511 && bStep == -1;
+
+    private static int GetBlockThreads(int aSize, int bSize, int bOffset, int bStep) =>
+        IsExactReverseCell(aSize, bSize, bOffset, bStep) ? ReverseBlockThreads : BlockThreads;
+
+    private static int GetWarpCount(int aSize, int bSize, int bOffset, int bStep) =>
+        GetBlockThreads(aSize, bSize, bOffset, bStep) / 32;
 
     private static void Validate(int aSize, int bSize)
     {

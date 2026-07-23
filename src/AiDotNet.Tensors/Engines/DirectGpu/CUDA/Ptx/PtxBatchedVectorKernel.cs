@@ -19,7 +19,7 @@ internal sealed class PtxBatchedVectorKernel : IDisposable
 {
     internal const int BaselineBlockThreads = 256;
     internal const int WarpBlockThreads = 32;
-    internal const int VectorBlockThreads = 128;
+    internal const int VectorBlockThreads = 32;
     internal const int WarpCount = BaselineBlockThreads / 32;
     internal const string DotEntryPoint = "aidotnet_batched_dot";
     internal const string OuterEntryPoint = "aidotnet_batched_outer";
@@ -234,54 +234,44 @@ internal sealed class PtxBatchedVectorKernel : IDisposable
         int blockThreads)
     {
         int batchBytes = checked(dimension * sizeof(float));
-        ptx.AppendLine($"// exact batched dot B={batch} D={dimension}; one vectorized four-warp CTA per batch");
+        ptx.AppendLine($"// exact batched dot B={batch} D={dimension}; one unrolled register-only warp per batch");
         EmitHeader(ptx, DotEntryPoint, blockThreads);
-        ptx.AppendLine("    .reg .pred %p<4>;");
-        ptx.AppendLine("    .reg .b32 %r<12>;");
-        ptx.AppendLine("    .reg .b64 %rd<16>;");
+        ptx.AppendLine("    .reg .pred %p<2>;");
+        ptx.AppendLine("    .reg .b32 %r<8>;");
+        ptx.AppendLine("    .reg .b64 %rd<12>;");
         ptx.AppendLine("    .reg .f32 %f<14>;");
-        ptx.AppendLine("    .shared .align 16 .b8 partial[16];");
         EmitPointers(ptx);
         ptx.AppendLine("    mov.u32 %r0, %tid.x;");
         ptx.AppendLine("    mov.u32 %r1, %ctaid.x;");
         ptx.AppendLine($"    mul.wide.u32 %rd3, %r1, {batchBytes};");
         ptx.AppendLine("    add.u64 %rd4, %rd0, %rd3;");
         ptx.AppendLine("    add.u64 %rd5, %rd1, %rd3;");
-        ptx.AppendLine("    shl.b32 %r1, %r0, 2;");
-        ptx.AppendLine("    mul.wide.u32 %rd6, %r1, 4;");
+        ptx.AppendLine("    mul.wide.u32 %rd6, %r0, 16;");
         ptx.AppendLine("    add.u64 %rd7, %rd4, %rd6;");
         ptx.AppendLine("    add.u64 %rd8, %rd5, %rd6;");
-        ptx.AppendLine("    ld.global.nc.v4.f32 {%f0,%f1,%f2,%f3}, [%rd7];");
-        ptx.AppendLine("    ld.global.nc.v4.f32 {%f4,%f5,%f6,%f7}, [%rd8];");
-        ptx.AppendLine("    mul.rn.f32 %f8, %f0, %f4;");
-        ptx.AppendLine("    fma.rn.f32 %f8, %f1, %f5, %f8;");
-        ptx.AppendLine("    fma.rn.f32 %f8, %f2, %f6, %f8;");
-        ptx.AppendLine("    fma.rn.f32 %f8, %f3, %f7, %f8;");
-        ptx.AppendLine("    and.b32 %r2, %r0, 31;");
-        ptx.AppendLine("    shr.u32 %r3, %r0, 5;");
-        EmitWarpReduction(ptx, "%f8", "%f9", "%r4", "%r5");
-        ptx.AppendLine("    mov.u64 %rd9, partial;");
-        ptx.AppendLine("    setp.ne.u32 %p0, %r2, 0;");
-        ptx.AppendLine("    @%p0 bra.uni BATCH_DOT_VECTOR_PUBLISHED;");
-        ptx.AppendLine("    mul.wide.u32 %rd10, %r3, 4;");
-        ptx.AppendLine("    add.u64 %rd11, %rd9, %rd10;");
-        ptx.AppendLine("    st.shared.f32 [%rd11], %f8;");
-        ptx.AppendLine("BATCH_DOT_VECTOR_PUBLISHED:");
-        ptx.AppendLine("    bar.sync 0;");
-        ptx.AppendLine("    setp.ne.u32 %p1, %r3, 0;");
-        ptx.AppendLine("    @%p1 bra.uni BATCH_DOT_VECTOR_DONE;");
-        ptx.AppendLine("    setp.lt.u32 %p2, %r2, 4;");
         ptx.AppendLine("    mov.f32 %f8, 0f00000000;");
-        ptx.AppendLine("    mul.wide.u32 %rd12, %r2, 4;");
-        ptx.AppendLine("    add.u64 %rd13, %rd9, %rd12;");
-        ptx.AppendLine("    @%p2 ld.shared.f32 %f8, [%rd13];");
-        EmitWarpReduction(ptx, "%f8", "%f9", "%r4", "%r5");
-        ptx.AppendLine("    setp.ne.u32 %p3, %r2, 0;");
-        ptx.AppendLine("    @%p3 bra.uni BATCH_DOT_VECTOR_DONE;");
-        ptx.AppendLine("    mov.u32 %r6, %ctaid.x;");
-        ptx.AppendLine("    mul.wide.u32 %rd14, %r6, 4;");
-        ptx.AppendLine("    add.u64 %rd15, %rd2, %rd14;");
-        ptx.AppendLine("    st.global.f32 [%rd15], %f8;");
+        ptx.AppendLine("    mov.f32 %f10, 0f00000000;");
+        ptx.AppendLine("    mov.f32 %f11, 0f00000000;");
+        ptx.AppendLine("    mov.f32 %f12, 0f00000000;");
+        foreach (int offset in new[] { 0, 512, 1_024, 1_536 })
+        {
+            string suffix = offset == 0 ? string.Empty : $"+{offset}";
+            ptx.AppendLine($"    ld.global.v4.f32 {{%f0,%f1,%f2,%f3}}, [%rd7{suffix}];");
+            ptx.AppendLine($"    ld.global.v4.f32 {{%f4,%f5,%f6,%f7}}, [%rd8{suffix}];");
+            ptx.AppendLine("    fma.rn.f32 %f8, %f0, %f4, %f8;");
+            ptx.AppendLine("    fma.rn.f32 %f10, %f1, %f5, %f10;");
+            ptx.AppendLine("    fma.rn.f32 %f11, %f2, %f6, %f11;");
+            ptx.AppendLine("    fma.rn.f32 %f12, %f3, %f7, %f12;");
+        }
+        ptx.AppendLine("    add.rn.f32 %f8, %f8, %f10;");
+        ptx.AppendLine("    add.rn.f32 %f11, %f11, %f12;");
+        ptx.AppendLine("    add.rn.f32 %f8, %f8, %f11;");
+        EmitWarpReduction(ptx, "%f8", "%f13", "%r2", "%r3");
+        ptx.AppendLine("    setp.ne.u32 %p0, %r0, 0;");
+        ptx.AppendLine("    @%p0 bra.uni BATCH_DOT_VECTOR_DONE;");
+        ptx.AppendLine("    mul.wide.u32 %rd9, %r1, 4;");
+        ptx.AppendLine("    add.u64 %rd10, %rd2, %rd9;");
+        ptx.AppendLine("    st.global.f32 [%rd10], %f8;");
         ptx.AppendLine("BATCH_DOT_VECTOR_DONE:");
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");
@@ -394,10 +384,10 @@ internal sealed class PtxBatchedVectorKernel : IDisposable
         var output = dot ? new DirectPtxExtent(batch) : new DirectPtxExtent(batch, m, n);
         return new DirectPtxKernelBlueprint(
             Operation: dot ? "batched-dense-dot" : "batched-dense-outer",
-            Version: fusedBatch ? 5 : warpPerBatch ? 4 : 1,
+            Version: fusedBatch ? 6 : warpPerBatch ? 4 : 1,
             Architecture: architecture,
             Variant: dot
-                ? $"{(fusedBatch ? "vector-cta-per-batch-fp32x4" : warpPerBatch ? "warp-block-per-batch-fp32x4" : "fp32")}-b{batch}-d{m}"
+                ? $"{(fusedBatch ? "unrolled-warp-per-batch-fp32x4" : warpPerBatch ? "warp-block-per-batch-fp32x4" : "fp32")}-b{batch}-d{m}"
                 : $"fp32-b{batch}-m{m}-n{n}",
             Tensors:
             [
@@ -410,8 +400,8 @@ internal sealed class PtxBatchedVectorKernel : IDisposable
                     output, output, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 32,
-                MaxStaticSharedBytes: fusedBatch ? 4 * sizeof(float) : dot && !warpPerBatch ? WarpCount * sizeof(float) : 0,
+                MaxRegistersPerThread: fusedBatch ? 48 : 32,
+                MaxStaticSharedBytes: dot && !warpPerBatch ? WarpCount * sizeof(float) : 0,
                 MaxLocalBytesPerThread: 0,
                 MinBlocksPerMultiprocessor: fusedBatch ? 10 : warpPerBatch ? 12 : dot ? 1 : 4),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
@@ -426,7 +416,7 @@ internal sealed class PtxBatchedVectorKernel : IDisposable
                 ["global-intermediates"] = "none",
                 ["reduction-pipeline"] = warpPerBatch
                     ? fusedBatch
-                        ? "aligned float4 loads; one four-warp CTA per batch; register/shared warp reduction; one output store"
+                        ? "four aligned float4 pairs per lane; one warp per batch; register-only reduction; one output store"
                         : "aligned float4 loads; one 32-thread CTA per batch; register-only shuffles; one output store"
                     : dot ? "block reduction through shared warp partials" : "none"
             });

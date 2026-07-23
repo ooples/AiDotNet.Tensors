@@ -256,7 +256,7 @@ public sealed class DirectPtxDenseLinearBackendTests
     }
 
     [SkippableFact]
-    public void FusedLinearCrossEntropy_AtomicReductionFailsClosedInDeterministicMode()
+    public void FusedLinearCrossEntropy_ExactNonAtomicCellSupportsDeterministicMode()
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
         bool? previousGate = DirectPtxFeatureGate.TestOverride;
@@ -276,11 +276,11 @@ public sealed class DirectPtxDenseLinearBackendTests
             using var targets = backend.AllocateBuffer(4);
             using var loss = backend.AllocateBuffer(1);
 
-            Assert.False(backend.TryDirectPtxFusedLinearCrossEntropy(
+            Assert.True(backend.TryDirectPtxFusedLinearCrossEntropy(
                 DirectPtxCrossEntropyTarget.Index,
-                hidden, weights, bias, targets, loss, 4, 16, 32));
-            Assert.Contains("disabled in deterministic mode", backend.DirectPtxLastError,
-                StringComparison.Ordinal);
+                hidden, weights, bias, targets, loss, 4, 16, 32),
+                backend.DirectPtxLastError);
+            backend.Synchronize();
         }
         finally
         {

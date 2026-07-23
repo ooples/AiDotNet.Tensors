@@ -35,7 +35,9 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "fused-linear-ce-null-or-invalid-buffer";
             return false;
         }
-        if (GpuDeterminism.IsActive)
+        bool exactIndex = PtxFusedLinearCrossEntropyKernel.IsExactIndexCell(
+            targetKind, rows, hiddenDimension, vocabulary);
+        if (GpuDeterminism.IsActive && !exactIndex)
         {
             DirectPtxLastError =
                 "Direct PTX fused linear/CE uses an atomic row reduction and is disabled in deterministic mode.";
@@ -87,10 +89,11 @@ public sealed partial class CudaBackend
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX fused linear/CE module for CUDA graph capture.");
 
-                // The fused row kernels atomically accumulate into one scalar.
-                // Clear it on the same stream so the operation remains capture-safe
-                // and avoids Fill's BitConverter allocation on every hot dispatch.
-                MemsetBuffer(meanLoss, 0, sizeof(float));
+                // Generic row kernels atomically accumulate into one scalar.
+                // The exact B4/K16/V32 index cell performs one deterministic
+                // final store and therefore needs neither an atomic nor pre-clear.
+                if (!exactIndex)
+                    MemsetBuffer(meanLoss, 0, sizeof(float));
                 lock (GpuDispatchLock)
                     kernel.Launch(
                         DirectPtxTensorView.Create(hidden, kernel.Blueprint.Tensors[0]),

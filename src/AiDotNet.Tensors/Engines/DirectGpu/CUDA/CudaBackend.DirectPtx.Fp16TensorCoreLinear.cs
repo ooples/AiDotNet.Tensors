@@ -175,7 +175,8 @@ public sealed partial class CudaBackend
             lock (_directPtxLock)
             {
                 _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
-                int outputsPerBlock = PtxFusedLinearGeluFp16M16Kernel.DefaultOutputsPerBlock;
+                int outputsPerBlock = DirectPtxDenseLinearAutotuner.DefaultCandidate(
+                    inputFeatures, outputFeatures);
                 if (DirectPtxFeatureGate.IsAutotuneEnabled &&
                     DirectPtxDenseLinearAutotuner.TryLoad(
                         _directPtxRuntime, inputFeatures, outputFeatures,
@@ -217,7 +218,8 @@ public sealed partial class CudaBackend
         IGpuBuffer biasFloat,
         IGpuBuffer outputFloat)
     {
-        int selected = PtxFusedLinearGeluFp16M16Kernel.DefaultOutputsPerBlock;
+        int selected = DirectPtxDenseLinearAutotuner.DefaultCandidate(
+            plan.InputFeatures, plan.OutputFeatures);
         bool persisted = DirectPtxFeatureGate.IsAutotuneEnabled &&
             DirectPtxDenseLinearAutotuner.TryLoad(
                 _directPtxRuntime!, plan.InputFeatures, plan.OutputFeatures,
@@ -278,8 +280,8 @@ public sealed partial class CudaBackend
         {
             var plan = new DirectPtxFp16TensorCoreLinearPlanKey(
                 inputFeatures, outputFeatures);
-            int outputsPerBlock =
-                PtxFusedLinearGeluFp16M16Kernel.DefaultOutputsPerBlock;
+            int outputsPerBlock = DirectPtxDenseLinearAutotuner.DefaultCandidate(
+                inputFeatures, outputFeatures);
             if (_directPtxFp16TensorCoreLinearPlans.TryGetValue(
                     plan, out int selectedOutputsPerBlock))
                 outputsPerBlock = selectedOutputsPerBlock;

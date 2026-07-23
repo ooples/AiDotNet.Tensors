@@ -12,10 +12,11 @@ internal enum DirectPtxCrossEntropyTarget
 }
 
 /// <summary>
-/// Exact-shape fused FP32 projection and cross entropy. A block owns one row,
-/// projects vocab columns cooperatively, reduces log-sum-exp in shared memory,
-/// and atomically contributes directly to the resident mean-loss scalar. The
-/// logits never leave registers and are never materialized in global memory.
+/// Exact-shape fused FP32 projection and cross entropy. The championship cell
+/// assigns one warp to each row in a single CTA, retains projected logits in
+/// registers, and writes the mean loss once without atomics. Other supported
+/// shapes use one block per row and atomic accumulation. Neither path
+/// materializes logits in global memory.
 /// </summary>
 internal sealed class PtxFusedLinearCrossEntropyKernel : IDisposable
 {
@@ -30,7 +31,8 @@ internal sealed class PtxFusedLinearCrossEntropyKernel : IDisposable
     internal int HiddenDimension { get; }
     internal int Vocabulary { get; }
     internal int BlockThreads { get; }
-    internal int StaticSharedBytes => 2 * BlockThreads * sizeof(float);
+    internal int StaticSharedBytes => GetStaticSharedBytes(
+        TargetKind, Rows, HiddenDimension, Vocabulary, BlockThreads);
     internal string Ptx { get; }
     internal DirectPtxKernelBlueprint Blueprint { get; }
     internal DirectPtxKernelAudit Audit { get; }
@@ -53,7 +55,7 @@ internal sealed class PtxFusedLinearCrossEntropyKernel : IDisposable
         Rows = rows;
         HiddenDimension = hiddenDimension;
         Vocabulary = vocabulary;
-        BlockThreads = ThreadsForVocabulary(vocabulary);
+        BlockThreads = GetBlockThreads(targetKind, rows, hiddenDimension, vocabulary);
         Blueprint = CreateBlueprint(
             runtime.ArchitectureFamily, targetKind, rows, hiddenDimension,
             vocabulary, BlockThreads);
@@ -98,8 +100,10 @@ internal sealed class PtxFusedLinearCrossEntropyKernel : IDisposable
         arguments[2] = &biasPointer;
         arguments[3] = &targetPointer;
         arguments[4] = &lossPointer;
+        uint grid = IsExactIndexCell(TargetKind, Rows, HiddenDimension, Vocabulary)
+            ? 1u : checked((uint)Rows);
         _module.Launch(
-            _function, checked((uint)Rows), 1, 1,
+            _function, grid, 1, 1,
             checked((uint)BlockThreads), 1, 1, 0, arguments);
     }
 
@@ -114,6 +118,8 @@ internal sealed class PtxFusedLinearCrossEntropyKernel : IDisposable
         int vocabulary)
     {
         Validate(targetKind, rows, hiddenDimension, vocabulary);
+        if (IsExactIndexCell(targetKind, rows, hiddenDimension, vocabulary))
+            return EmitExactIndexPtx(ccMajor, ccMinor);
         bool index = targetKind == DirectPtxCrossEntropyTarget.Index;
         int blockThreads = ThreadsForVocabulary(vocabulary);
         int staticSharedBytes = 2 * blockThreads * sizeof(float);
@@ -255,6 +261,124 @@ internal sealed class PtxFusedLinearCrossEntropyKernel : IDisposable
         return ptx.ToString();
     }
 
+    private static string EmitExactIndexPtx(int ccMajor, int ccMinor)
+    {
+        const int blockThreads = 128;
+        var ptx = new StringBuilder(16_384);
+        ptx.AppendLine(".version 7.1");
+        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        ptx.AppendLine(".address_size 64");
+        ptx.AppendLine();
+        ptx.AppendLine("// exact fused projection/index-CE B4 K16 V32; one warp per row; logits retained in registers");
+        ptx.AppendLine($".visible .entry {IndexEntryPoint}(");
+        ptx.AppendLine("    .param .u64 hidden_ptr,");
+        ptx.AppendLine("    .param .u64 weight_ptr,");
+        ptx.AppendLine("    .param .u64 bias_ptr,");
+        ptx.AppendLine("    .param .u64 target_ptr,");
+        ptx.AppendLine("    .param .u64 loss_ptr");
+        ptx.AppendLine(")");
+        ptx.AppendLine($".maxntid {blockThreads}, 1, 1");
+        ptx.AppendLine("{");
+        ptx.AppendLine("    .reg .pred %p<8>;");
+        ptx.AppendLine("    .reg .b32 %r<20>;");
+        ptx.AppendLine("    .reg .b64 %rd<16>;");
+        ptx.AppendLine("    .reg .f32 %f<16>;");
+        ptx.AppendLine("    .shared .align 16 .b8 row_loss[16];");
+        ptx.AppendLine("    ld.param.u64 %rd0, [hidden_ptr];");
+        ptx.AppendLine("    ld.param.u64 %rd1, [weight_ptr];");
+        ptx.AppendLine("    ld.param.u64 %rd2, [bias_ptr];");
+        ptx.AppendLine("    ld.param.u64 %rd3, [target_ptr];");
+        ptx.AppendLine("    ld.param.u64 %rd4, [loss_ptr];");
+        ptx.AppendLine("    mov.u32 %r0, %tid.x;");
+        ptx.AppendLine("    and.b32 %r1, %r0, 31;");
+        ptx.AppendLine("    shr.u32 %r2, %r0, 5;");
+        ptx.AppendLine("    mul.wide.u32 %rd5, %r2, 64;");
+        ptx.AppendLine("    add.u64 %rd6, %rd0, %rd5;");
+        ptx.AppendLine("    mul.wide.u32 %rd7, %r1, 4;");
+        ptx.AppendLine("    add.u64 %rd8, %rd6, %rd7;");
+        ptx.AppendLine("    setp.lt.u32 %p0, %r1, 16;");
+        ptx.AppendLine("    mov.f32 %f1, 0f00000000;");
+        ptx.AppendLine("    @%p0 ld.global.f32 %f1, [%rd8];");
+        ptx.AppendLine("    mov.b32 %r7, %f1;");
+        ptx.AppendLine("    add.u64 %rd9, %rd2, %rd7;");
+        ptx.AppendLine("    ld.global.f32 %f0, [%rd9];");
+        ptx.AppendLine("    add.u64 %rd10, %rd1, %rd7;");
+        for (int k = 0; k < 16; k++)
+        {
+            ptx.AppendLine($"    shfl.sync.idx.b32 %r8, %r7, {k}, 31, 0xffffffff;");
+            ptx.AppendLine("    mov.b32 %f2, %r8;");
+            string suffix = k == 0 ? string.Empty : $"+{k * 128}";
+            ptx.AppendLine($"    ld.global.f32 %f3, [%rd10{suffix}];");
+            ptx.AppendLine("    fma.rn.f32 %f0, %f2, %f3, %f0;");
+        }
+        ptx.AppendLine("    setp.eq.u32 %p1, %r1, 0;");
+        ptx.AppendLine("    mov.f32 %f6, 0f00000000;");
+        ptx.AppendLine("    mul.wide.u32 %rd11, %r2, 4;");
+        ptx.AppendLine("    add.u64 %rd12, %rd3, %rd11;");
+        ptx.AppendLine("    @%p1 ld.global.f32 %f6, [%rd12];");
+        ptx.AppendLine("    mov.u32 %r5, 0;");
+        ptx.AppendLine("    @%p1 cvt.rni.s32.f32 %r5, %f6;");
+        ptx.AppendLine("    shfl.sync.idx.b32 %r6, %r5, 0, 31, 0xffffffff;");
+
+        ptx.AppendLine("    mov.f32 %f4, %f0;");
+        EmitWarpFloatReduction(ptx, "%f4", "%f7", "%r8", "%r9", maximum: true);
+        ptx.AppendLine("    mov.b32 %r8, %f4;");
+        ptx.AppendLine("    shfl.sync.idx.b32 %r9, %r8, 0, 31, 0xffffffff;");
+        ptx.AppendLine("    mov.b32 %f4, %r9;");
+        ptx.AppendLine("    sub.rn.f32 %f5, %f0, %f4;");
+        ptx.AppendLine("    mul.rn.f32 %f5, %f5, 0f3FB8AA3B;");
+        ptx.AppendLine("    ex2.approx.f32 %f5, %f5;");
+        EmitWarpFloatReduction(ptx, "%f5", "%f7", "%r8", "%r9", maximum: false);
+        ptx.AppendLine("    setp.eq.u32 %p2, %r1, %r6;");
+        ptx.AppendLine("    mov.f32 %f8, 0f00000000;");
+        ptx.AppendLine("    @%p2 mov.f32 %f8, %f0;");
+        EmitWarpFloatReduction(ptx, "%f8", "%f7", "%r8", "%r9", maximum: false);
+
+        ptx.AppendLine("    setp.lt.s32 %p3, %r6, 0;");
+        ptx.AppendLine("    setp.ge.s32 %p4, %r6, 32;");
+        ptx.AppendLine("    or.pred %p5, %p3, %p4;");
+        ptx.AppendLine("    @%p1 lg2.approx.f32 %f9, %f5;");
+        ptx.AppendLine("    @%p1 fma.rn.f32 %f9, %f9, 0f3F317218, %f4;");
+        ptx.AppendLine("    @%p1 sub.rn.f32 %f9, %f9, %f8;");
+        ptx.AppendLine("    @%p1 mul.rn.f32 %f9, %f9, 0f3E800000;");
+        ptx.AppendLine("    @%p5 mov.f32 %f9, 0f7F800000;");
+        ptx.AppendLine("    mov.u64 %rd13, row_loss;");
+        ptx.AppendLine("    add.u64 %rd14, %rd13, %rd11;");
+        ptx.AppendLine("    @%p1 st.shared.f32 [%rd14], %f9;");
+        ptx.AppendLine("    bar.sync 0;");
+        ptx.AppendLine("    setp.ne.u32 %p6, %r2, 0;");
+        ptx.AppendLine("    @%p6 bra.uni CE_EXACT_DONE;");
+        ptx.AppendLine("    setp.lt.u32 %p7, %r1, 4;");
+        ptx.AppendLine("    mov.f32 %f10, 0f00000000;");
+        ptx.AppendLine("    add.u64 %rd15, %rd13, %rd7;");
+        ptx.AppendLine("    @%p7 ld.shared.f32 %f10, [%rd15];");
+        EmitWarpFloatReduction(ptx, "%f10", "%f11", "%r8", "%r9", maximum: false);
+        ptx.AppendLine("    @%p1 st.global.f32 [%rd4], %f10;");
+        ptx.AppendLine("CE_EXACT_DONE:");
+        ptx.AppendLine("    ret;");
+        ptx.AppendLine("}");
+        return ptx.ToString();
+    }
+
+    private static void EmitWarpFloatReduction(
+        StringBuilder ptx,
+        string value,
+        string shuffled,
+        string valueBits,
+        string shuffledBits,
+        bool maximum)
+    {
+        foreach (int offset in new[] { 16, 8, 4, 2, 1 })
+        {
+            ptx.AppendLine($"    mov.b32 {valueBits}, {value};");
+            ptx.AppendLine($"    shfl.sync.down.b32 {shuffledBits}, {valueBits}, {offset}, 31, 0xffffffff;");
+            ptx.AppendLine($"    mov.b32 {shuffled}, {shuffledBits};");
+            ptx.AppendLine(maximum
+                ? $"    max.f32 {value}, {value}, {shuffled};"
+                : $"    add.rn.f32 {value}, {value}, {shuffled};");
+        }
+    }
+
     private static void EmitProjectionPassStart(
         StringBuilder ptx,
         string loop,
@@ -366,9 +490,9 @@ internal sealed class PtxFusedLinearCrossEntropyKernel : IDisposable
             Operation: index
                 ? "fused-linear-cross-entropy-index"
                 : "fused-linear-cross-entropy-dense",
-            Version: 1,
+            Version: IsExactIndexCell(targetKind, rows, hiddenDimension, vocabulary) ? 2 : 1,
             Architecture: architecture,
-            Variant: $"fp32-b{rows}-k{hiddenDimension}-v{vocabulary}",
+            Variant: $"{(IsExactIndexCell(targetKind, rows, hiddenDimension, vocabulary) ? "one-cta-warp-row-register-logits-fp32" : "fp32")}-b{rows}-k{hiddenDimension}-v{vocabulary}",
             Tensors:
             [
                 new("hidden", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.RowMajor2D,
@@ -381,23 +505,34 @@ internal sealed class PtxFusedLinearCrossEntropyKernel : IDisposable
                     index ? DirectPtxPhysicalLayout.Vector : DirectPtxPhysicalLayout.RowMajor2D,
                     target, target, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact),
                 new("meanLoss", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
-                    loss, loss, 16, DirectPtxTensorAccess.ReadWrite, DirectPtxExtentMode.Exact)
+                    loss, loss, 16,
+                    IsExactIndexCell(targetKind, rows, hiddenDimension, vocabulary)
+                        ? DirectPtxTensorAccess.Write : DirectPtxTensorAccess.ReadWrite,
+                    DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 48,
-                MaxStaticSharedBytes: 2 * blockThreads * sizeof(float),
+                MaxRegistersPerThread: IsExactIndexCell(targetKind, rows, hiddenDimension, vocabulary) ? 64 : 48,
+                MaxStaticSharedBytes: GetStaticSharedBytes(
+                    targetKind, rows, hiddenDimension, vocabulary, blockThreads),
                 MaxLocalBytesPerThread: 0,
-                MinBlocksPerMultiprocessor: 2),
+                MinBlocksPerMultiprocessor:
+                    IsExactIndexCell(targetKind, rows, hiddenDimension, vocabulary) ? 8 : 2),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["formula"] = index
                     ? "mean(logsumexp(hidden@weight+bias)-selected_logit)"
                     : "mean(-sum(target*(hidden@weight+bias-logsumexp)))",
                 ["projection-layout"] = "canonical-contiguous-input-major-weight",
-                ["logits"] = "register-only-recomputed-never-materialized",
-                ["row-reductions"] = "shared-max-and-sum",
+                ["logits"] = IsExactIndexCell(targetKind, rows, hiddenDimension, vocabulary)
+                    ? "register-only-single-projection-pass-never-materialized"
+                    : "register-only-recomputed-never-materialized",
+                ["row-reductions"] = IsExactIndexCell(targetKind, rows, hiddenDimension, vocabulary)
+                    ? "warp-shuffle max/sum/selected; four shared row losses; one barrier"
+                    : "shared-max-and-sum",
                 ["block-threads"] = blockThreads.ToString(CultureInfo.InvariantCulture),
-                ["output"] = "one resident scalar; caller clears before launch",
+                ["output"] = IsExactIndexCell(targetKind, rows, hiddenDimension, vocabulary)
+                    ? "one directly stored resident scalar; no atomic and no pre-clear"
+                    : "one resident scalar; caller clears before launch",
                 ["shape-parameters"] = "none",
                 ["stride-parameters"] = "none",
                 ["temporary-device-allocation"] = "none"
@@ -411,6 +546,31 @@ internal sealed class PtxFusedLinearCrossEntropyKernel : IDisposable
         <= 128 => 128,
         _ => 256
     };
+
+    internal static bool IsExactIndexCell(
+        DirectPtxCrossEntropyTarget targetKind,
+        int rows,
+        int hiddenDimension,
+        int vocabulary) =>
+        targetKind == DirectPtxCrossEntropyTarget.Index &&
+        rows == 4 && hiddenDimension == 16 && vocabulary == 32;
+
+    private static int GetBlockThreads(
+        DirectPtxCrossEntropyTarget targetKind,
+        int rows,
+        int hiddenDimension,
+        int vocabulary) =>
+        IsExactIndexCell(targetKind, rows, hiddenDimension, vocabulary)
+            ? 128 : ThreadsForVocabulary(vocabulary);
+
+    private static int GetStaticSharedBytes(
+        DirectPtxCrossEntropyTarget targetKind,
+        int rows,
+        int hiddenDimension,
+        int vocabulary,
+        int blockThreads) =>
+        IsExactIndexCell(targetKind, rows, hiddenDimension, vocabulary)
+            ? 4 * sizeof(float) : 2 * blockThreads * sizeof(float);
 
     private static string FloatLiteral(float value) =>
         "0f" + PtxCompat.SingleToInt32Bits(value).ToString("X8", CultureInfo.InvariantCulture);

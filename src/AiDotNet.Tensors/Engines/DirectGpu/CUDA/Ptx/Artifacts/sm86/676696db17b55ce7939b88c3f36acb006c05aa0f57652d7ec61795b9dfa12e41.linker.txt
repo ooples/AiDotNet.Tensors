@@ -4,4 +4,4 @@ driver-version=13030
 cuda-driver-linker-info-log:
 info    : 0 bytes gmem
 info    : Function properties for 'aidotnet_fused_linear_ce_index':
-info    : used 20 registers, used 1 barriers, 0 stack, 256 bytes smem, 392 bytes cmem[0], 0 bytes lmem
+info    : used 35 registers, used 1 barriers, 0 stack, 16 bytes smem, 392 bytes cmem[0], 0 bytes lmem

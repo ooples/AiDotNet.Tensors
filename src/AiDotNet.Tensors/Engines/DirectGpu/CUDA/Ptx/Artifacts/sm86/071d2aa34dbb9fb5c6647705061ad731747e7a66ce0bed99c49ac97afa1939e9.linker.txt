@@ -4,4 +4,4 @@ driver-version=13030
 cuda-driver-linker-info-log:
 info    : 0 bytes gmem
 info    : Function properties for 'aidotnet_fused_linear_backward':
-info    : used 38 registers, used 1 barriers, 0 stack, 2048 bytes smem, 408 bytes cmem[0], 0 bytes lmem
+info    : used 87 registers, used 1 barriers, 0 stack, 8192 bytes smem, 408 bytes cmem[0], 0 bytes lmem

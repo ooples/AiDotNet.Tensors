@@ -16,6 +16,13 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 public partial class DirectPtxWmmaTests
 {
     [Fact]
+    public void Fp16TensorCoreDefaultsPreserveMeasuredShapeWinners()
+    {
+        Assert.Equal(32, DirectPtxDenseLinearAutotuner.DefaultCandidate(512, 2_048));
+        Assert.Equal(64, DirectPtxDenseLinearAutotuner.DefaultCandidate(1_024, 4_096));
+    }
+
+    [Fact]
     public void LinkerLogNormalization_IsDeterministicAndPreservesValidBarrierCounts()
     {
         const string input =
@@ -179,14 +186,13 @@ public partial class DirectPtxWmmaTests
             8, 6, DirectPtxBatchedVectorOperation.Dot, batch: 4, m: 512);
         Assert.Contains(PtxBatchedVectorKernel.DotEntryPoint, batchDot, StringComparison.Ordinal);
         Assert.Equal(3, Count(batchDot, ".param .u64"));
-        Assert.Contains(".maxntid 128, 1, 1", batchDot, StringComparison.Ordinal);
+        Assert.Contains(".maxntid 32, 1, 1", batchDot, StringComparison.Ordinal);
         Assert.Contains("mov.u32 %r1, %ctaid.x", batchDot, StringComparison.Ordinal);
-        Assert.Contains(".shared .align 16 .b8 partial[16]", batchDot, StringComparison.Ordinal);
-        Assert.Equal(1, Count(batchDot, "bar.sync 0"));
-        Assert.Equal(2, Count(batchDot, "ld.global.nc.v4.f32"));
-        Assert.Equal(1, Count(batchDot, "mul.rn.f32"));
-        Assert.Equal(3, Count(batchDot, "fma.rn.f32"));
-        Assert.Equal(10, Count(batchDot, "shfl.sync.down.b32"));
+        Assert.DoesNotContain(".shared", batchDot, StringComparison.Ordinal);
+        Assert.DoesNotContain("bar.sync", batchDot, StringComparison.Ordinal);
+        Assert.Equal(8, Count(batchDot, "ld.global.v4.f32"));
+        Assert.Equal(16, Count(batchDot, "fma.rn.f32"));
+        Assert.Equal(5, Count(batchDot, "shfl.sync.down.b32"));
         Assert.DoesNotContain(".param .u32", batchDot, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", batchDot, StringComparison.Ordinal);
         Assert.DoesNotContain("stride", batchDot, StringComparison.OrdinalIgnoreCase);
@@ -205,9 +211,12 @@ public partial class DirectPtxWmmaTests
         Assert.Equal(3, Count(strided, ".param .u64"));
         Assert.DoesNotContain(".param .u32", strided, StringComparison.Ordinal);
         Assert.Contains("valid-i=[0,511]", strided, StringComparison.Ordinal);
-        Assert.Contains(".shared .align 16 .b8 partial[32]", strided, StringComparison.Ordinal);
-        Assert.Equal(1, Count(strided, "bar.sync 0"));
-        Assert.Equal(10, Count(strided, "shfl.sync.down.b32"));
+        Assert.Contains(".maxntid 32, 1, 1", strided, StringComparison.Ordinal);
+        Assert.DoesNotContain(".shared", strided, StringComparison.Ordinal);
+        Assert.Equal(8, Count(strided, "ld.global.nc.v4.f32"));
+        Assert.Equal(16, Count(strided, "fma.rn.f32"));
+        Assert.DoesNotContain("bar.sync", strided, StringComparison.Ordinal);
+        Assert.Equal(5, Count(strided, "shfl.sync.down.b32"));
         Assert.DoesNotContain(".local", strided, StringComparison.Ordinal);
         Assert.Equal((0, 511), PtxStridedDotKernel.ValidInterval(512, 512, 511, -1));
         Assert.Equal((3, 10), PtxStridedDotKernel.ValidInterval(16, 8, -3, 1));
@@ -217,10 +226,11 @@ public partial class DirectPtxWmmaTests
             hiddenDimension: 16, vocabulary: 32);
         Assert.Contains(PtxFusedLinearCrossEntropyKernel.IndexEntryPoint, index, StringComparison.Ordinal);
         Assert.Equal(5, Count(index, ".param .u64"));
-        Assert.Contains("atom.global.add.f32", index, StringComparison.Ordinal);
-        Assert.Contains(".maxntid 32, 1, 1", index, StringComparison.Ordinal);
-        Assert.Contains(".shared .align 16 .b8 scratch[256]", index, StringComparison.Ordinal);
-        Assert.DoesNotContain("st.global.f32", index, StringComparison.Ordinal);
+        Assert.DoesNotContain("atom.global", index, StringComparison.Ordinal);
+        Assert.Contains(".maxntid 128, 1, 1", index, StringComparison.Ordinal);
+        Assert.Contains(".shared .align 16 .b8 row_loss[16]", index, StringComparison.Ordinal);
+        Assert.Equal(1, Count(index, "st.global.f32"));
+        Assert.Equal(1, Count(index, "bar.sync 0"));
         Assert.DoesNotContain(".local", index, StringComparison.Ordinal);
         Assert.DoesNotContain("stride", index, StringComparison.OrdinalIgnoreCase);
 
@@ -240,10 +250,11 @@ public partial class DirectPtxWmmaTests
             8, 6, DirectPtxDenseVectorOperation.Dot, 4096);
         Assert.Contains(PtxDenseVectorKernel.DotEntryPoint, dot, StringComparison.Ordinal);
         Assert.Equal(3, Count(dot, ".param .u64"));
-        Assert.Contains(".shared .align 16 .b8 partial[32]", dot, StringComparison.Ordinal);
-        Assert.Equal(2, Count(dot, "ld.global.nc.v4.f32"));
-        Assert.Equal(4, Count(dot, "fma.rn.f32"));
-        Assert.Equal(1, Count(dot, "bar.sync 0")); // publish eight warp partials
+        Assert.Contains(".maxntid 512, 1, 1", dot, StringComparison.Ordinal);
+        Assert.Contains(".shared .align 16 .b8 partial[64]", dot, StringComparison.Ordinal);
+        Assert.Equal(4, Count(dot, "ld.global.nc.v4.f32"));
+        Assert.Equal(8, Count(dot, "fma.rn.f32"));
+        Assert.Equal(1, Count(dot, "bar.sync 0"));
         Assert.Equal(10, Count(dot, "shfl.sync.down.b32"));
         Assert.DoesNotContain(".local", dot, StringComparison.Ordinal);
         Assert.DoesNotContain("stride", dot, StringComparison.OrdinalIgnoreCase);
@@ -252,7 +263,7 @@ public partial class DirectPtxWmmaTests
             8, 6, DirectPtxDenseVectorOperation.Outer, 64, 128);
         Assert.Contains(PtxDenseVectorKernel.OuterEntryPoint, outer, StringComparison.Ordinal);
         Assert.Equal(3, Count(outer, ".param .u64"));
-        Assert.Equal(1, Count(outer, "ld.global.nc.v4.f32"));
+        Assert.Equal(1, Count(outer, "ld.global.v4.f32"));
         Assert.Equal(1, Count(outer, "st.global.v4.f32"));
         Assert.Contains(".maxntid 128, 1, 1", outer, StringComparison.Ordinal);
         Assert.DoesNotContain("div.u32", outer, StringComparison.Ordinal);
@@ -1052,6 +1063,15 @@ public partial class DirectPtxWmmaTests
         Assert.DoesNotContain("@!%p5 bra.uni", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+
+        string exact = PtxFusedLinearBackwardKernel.EmitPtx(
+            8, 6, 64, 256, 256, DirectPtxLinearActivation.Relu);
+        Assert.Contains(".maxntid 64, 1, 1", exact, StringComparison.Ordinal);
+        Assert.Contains(".shared .align 16 .b8 tile_a[4096]", exact, StringComparison.Ordinal);
+        Assert.Contains(".shared .align 16 .b8 tile_b[4096]", exact, StringComparison.Ordinal);
+        Assert.Contains("EXACT_GRAD_INPUT:", exact, StringComparison.Ordinal);
+        Assert.Contains("st.global.v4.f32", exact, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", exact, StringComparison.Ordinal);
     }
 
     [Theory]
