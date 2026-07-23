@@ -92,6 +92,8 @@ public sealed partial class CudaBackend
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<SciNgpKey, PtxInstantNgpHashEncodeBackwardKernel> _sciNgpHashEncodeBwd =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<SciMatVecKey, PtxMeshLaplacianKernel> _sciMeshLaplacian =
+        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
 
     private long _sciDispatchCount;
     internal long DirectPtxScientificDispatchCount => System.Threading.Interlocked.Read(ref _sciDispatchCount);
@@ -574,6 +576,19 @@ public sealed partial class CudaBackend
                 new SciNgpKey(numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride),
                 () => new PtxInstantNgpHashEncodeBackwardKernel(_directPtxRuntime!, numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride));
             Launch3(k.Blueprint, positions, outputGradient, tableGradient, (vp, vg, vt) => k.Launch(vp, vg, vt));
+        });
+    }
+
+    internal bool TryDirectPtxUniformMeshLaplacian(IGpuBuffer faces, IGpuBuffer output, int numFaces, int numVertices)
+    {
+        if (!ScientificGateOpen || !PtxMeshLaplacianKernel.IsSupportedShape(numFaces, numVertices)) return Fail("mesh-laplacian");
+        if (faces.SizeInBytes != checked((long)numFaces * 3 * sizeof(int)) ||
+            output.SizeInBytes != checked((long)numVertices * numVertices * sizeof(float))) return Fail("mesh-laplacian-extent");
+        return SciDispatch(() =>
+        {
+            var k = _sciMeshLaplacian.GetOrAdd(new SciMatVecKey(numFaces, numVertices),
+                () => new PtxMeshLaplacianKernel(_directPtxRuntime!, numFaces, numVertices));
+            Launch2(k.Blueprint, faces, output, (vf, vo) => k.Launch(vf, vo));
         });
     }
 

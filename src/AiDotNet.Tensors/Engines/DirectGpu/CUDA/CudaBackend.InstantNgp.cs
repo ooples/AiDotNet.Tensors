@@ -159,6 +159,7 @@ public sealed partial class CudaBackend : IInstantNgpBackend, IUniqueConsecutive
     {
         int total = checked(numVertices * numVertices);
         if (total <= 0) return;
+        if (TryDirectPtxUniformMeshLaplacian(faces, output, numFaces, numVertices)) return;
         var kernel = ResolveInstantNgpKernel("resident_uniform_mesh_laplacian");
         using var _ = PushContext();
         IntPtr f = faces.Handle, o = output.Handle;

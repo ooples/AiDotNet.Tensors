@@ -14,10 +14,14 @@ public class DirectPtxScientificTests
     [Fact]
     public void ScientificCoverageManifest_AssignsEveryScopedApiExactlyOnce()
     {
-        Assert.Equal(32, DirectPtxScientificCoverageManifest.All.Count);
+        Assert.Equal(34, DirectPtxScientificCoverageManifest.All.Count);
         string[] names = DirectPtxScientificCoverageManifest.All.Select(c => c.Api).ToArray();
         Assert.Contains("CudaBackend.HashGridEncodeLevel", names);
         Assert.Contains("CudaBackend.HashGridEncodeLevelBackward", names);
+        Assert.Contains("CudaBackend.UniformMeshLaplacian", names);
+        // generate_spiral_indices is single-threaded control-flow; intentionally NVRTC-baseline, not direct-PTX.
+        Assert.Equal(DirectPtxScientificCoverageStatus.BaselineOnly,
+            DirectPtxScientificCoverageManifest.Get("CudaBackend.GenerateSpiralIndices").Status);
         Assert.Contains("CudaBackend.CosineSimilarity", names);
         Assert.Contains("CudaBackend.SphericalSoftmax", names);
         Assert.Contains("CudaBackend.NormalizeProbabilities", names);
@@ -761,6 +765,80 @@ public class DirectPtxScientificTests
         var actual = new float[expected.Length];
         outBuf.Download<float>(actual);
         AssertVectorClose(actual, expected, 3e-3f, $"capsule {op}");
+    }
+
+    [Fact]
+    public void MeshLaplacianEmitter_IsThreadPerCellFaceScan()
+    {
+        string ptx = PtxMeshLaplacianKernel.EmitPtx(8, 6, 32, 16);   // cells = 16*16 = 256
+        Assert.Contains(PtxMeshLaplacianKernel.EntryPoint, ptx);
+        Assert.Contains("$MESH_FACE_LOOP:", ptx);
+        Assert.Equal(3, Count(ptx, "ld.global.nc.s32"));    // v0, v1, v2 int32
+        Assert.Equal(6, Count(ptx, "setp.eq.s32"));          // 3 row + 3 col equality predicates
+        Assert.Equal(12, Count(ptx, "and.pred %p6"));        // 12 conditions matching NVRTC
+        Assert.Equal(12, Count(ptx, "@%p6 add.rn.f32"));     // predicated +/-1
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.Equal(0, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxMeshLaplacianKernel.IsSupportedShape(32, 16));
+        Assert.False(PtxMeshLaplacianKernel.IsSupportedShape(32, 15));   // 225 not a multiple of 256
+        Assert.False(PtxMeshLaplacianKernel.IsPromotedShape(32, 16));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyMeshLaplacian_MatchesOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in mesh-laplacian specialization is measured on GA10x/SM86.");
+        const int numFaces = 40, numVertices = 16;   // cells = 256
+        using var kernel = new PtxMeshLaplacianKernel(runtime, numFaces, numVertices);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20269000);
+        int[] faces = new int[numFaces * 3];
+        for (int i = 0; i < faces.Length; i++) faces[i] = random.Next(0, numVertices);
+        var expected = new float[numVertices * numVertices];
+        for (int gid = 0; gid < expected.Length; gid++)
+        {
+            int row = gid / numVertices, col = gid % numVertices;
+            expected[gid] = MeshLaplacianOracle(faces, numFaces, row, col);
+        }
+
+        using var facesBuf = runtime.AllocateBytes((nuint)(faces.Length * sizeof(int)));
+        using var outBuf = runtime.AllocateBytes((nuint)(expected.Length * sizeof(float)));
+        facesBuf.Upload<int>(faces);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(facesBuf, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(outBuf, kernel.Blueprint.Tensors[1]));
+        runtime.Synchronize();
+        var actual = new float[expected.Length];
+        outBuf.Download<float>(actual);
+        AssertVectorClose(actual, expected, 0f, "mesh laplacian");
+    }
+
+    private static float MeshLaplacianOracle(int[] faces, int numFaces, int row, int col)
+    {
+        float value = 0f;
+        for (int face = 0; face < numFaces; face++)
+        {
+            int v0 = faces[face * 3], v1 = faces[face * 3 + 1], v2 = faces[face * 3 + 2];
+            if (row == v0 && col == v1) value -= 1f;
+            if (row == v1 && col == v0) value -= 1f;
+            if (row == v0 && col == v0) value += 1f;
+            if (row == v1 && col == v1) value += 1f;
+            if (row == v1 && col == v2) value -= 1f;
+            if (row == v2 && col == v1) value -= 1f;
+            if (row == v1 && col == v1) value += 1f;
+            if (row == v2 && col == v2) value += 1f;
+            if (row == v2 && col == v0) value -= 1f;
+            if (row == v0 && col == v2) value -= 1f;
+            if (row == v2 && col == v2) value += 1f;
+            if (row == v0 && col == v0) value += 1f;
+        }
+        return value;
     }
 
     [Fact]
@@ -2438,6 +2516,15 @@ public class DirectPtxScientificTests
             }
             using (var pb = backend.AllocateBuffer(ngpbPos)) using (var gb = backend.AllocateBuffer(ngpbGrad)) using (var tg = backend.AllocateBuffer(ngpbTable * ngpFpl))
             { backend.HashGridEncodeLevelBackward(pb, gb, tg, ngpbPts, ngpRes, ngpbTable, ngpFpl, ngpLoff, ngpStride); n = AssertDispatched(n, "instant-ngp-hash-encode-backward"); AssertVectorClose(backend.DownloadBuffer(tg), ngpbTblGrad, 3e-3f, "instant-ngp-hash-encode-backward route"); }
+
+            // Uniform mesh Laplacian. cells = V*V = 16*16 = 256. Faces are int32.
+            const int mlFaces = 40, mlVerts = 16;
+            int[] mlFaceData = new int[mlFaces * 3];
+            for (int i = 0; i < mlFaceData.Length; i++) mlFaceData[i] = random.Next(0, mlVerts);
+            var mlExp = new float[mlVerts * mlVerts];
+            for (int gid = 0; gid < mlExp.Length; gid++) mlExp[gid] = MeshLaplacianOracle(mlFaceData, mlFaces, gid / mlVerts, gid % mlVerts);
+            using (var fb = backend.AllocateIntBuffer(mlFaceData)) using (var o = backend.AllocateBuffer(mlVerts * mlVerts))
+            { backend.UniformMeshLaplacian(fb, o, mlFaces, mlVerts); n = AssertDispatched(n, "mesh-laplacian"); AssertVectorClose(backend.DownloadBuffer(o), mlExp, 0f, "mesh-laplacian route"); }
         }
         finally
         {
