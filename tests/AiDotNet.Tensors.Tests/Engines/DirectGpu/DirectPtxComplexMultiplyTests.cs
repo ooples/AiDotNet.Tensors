@@ -93,6 +93,10 @@ public class DirectPtxComplexMultiplyTests
                 "CudaBackend.SplitComplexPhase",
                 "CudaBackend.SplitComplexScale",
                 "CudaBackend.StftMagPhase",
+                "Fft.FftFreq",
+                "Fft.FftShift",
+                "Fft.IFftShift",
+                "Fft.RFftFreq",
             },
             DirectPtxSpectralCoverageManifest.All
                 .Where(cell => cell.Status == DirectPtxSpectralCoverageStatus.ExperimentalDirectPtx)
@@ -1901,6 +1905,119 @@ public class DirectPtxComplexMultiplyTests
             double expected = Math.Max(20.0 * Math.Log10(v), topDbFloor);
             Assert.True(Math.Abs(actual[i] - expected) <= 1e-2 * (1 + Math.Abs(expected)));
         }
+    }
+
+    [Fact]
+    public void FftRollEmitter_IsWrappedGather()
+    {
+        // dim=1000, fftshift => shift = floor(1000/2) = 500, forward = dim - shift = 500
+        int shift = PtxFftRollF32Kernel.FftShiftAmount(1000);
+        Assert.Equal(500, shift);
+        Assert.Equal(500, PtxFftRollF32Kernel.IFftShiftAmount(1000));
+        string ptx = PtxFftRollF32Kernel.EmitPtx(8, 6, 1000, shift, 4);
+        Assert.Contains("op=fft-roll", ptx);
+        Assert.Contains("rem.u32 %r3, %r2, 1000", ptx);
+        Assert.Contains("add.u32 %r5, %r3, 500", ptx);       // i + (dim - shift)
+        Assert.Contains("@%p1 sub.u32 %r5, %r5, 1000", ptx);  // single wrap
+        Assert.DoesNotContain("fma", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxFftRollF32Kernel.IsSupportedShape(1000, shift, 4));
+        Assert.False(PtxFftRollF32Kernel.IsSupportedShape(1000, 1000, 4));   // shift must be < dim
+        Assert.False(PtxFftRollF32Kernel.IsPromotedShape(1000, shift, 4));
+    }
+
+    [Fact]
+    public void FftFreqEmitter_FullHasSignedBranch()
+    {
+        string full = PtxFftFreqF32Kernel.EmitPtx(8, 6, 1000, DirectPtxFftFreqOp.Full);
+        Assert.Contains("op=fft-freq-full", full);
+        Assert.Contains("sub.s32 %r3, %r2, 1000", full);          // i - n
+        Assert.Contains("setp.lt.u32 %p1, %r2, 500", full);       // split = (1000+1)/2 = 500
+        Assert.Contains("selp.b32", full);
+        Assert.Contains("ld.param.f32 %f0, [scale_val]", full);
+        string real = PtxFftFreqF32Kernel.EmitPtx(8, 6, 1000, DirectPtxFftFreqOp.Real);
+        Assert.Contains("op=fft-freq-real", real);
+        Assert.Contains("cvt.rn.f32.u32 %f1, %r2", real);
+        Assert.DoesNotContain("selp.b32", real);                  // no signed branch on the real layout
+        Assert.DoesNotContain(".local", full, StringComparison.Ordinal);
+    }
+
+    [SkippableFact]
+    public void DriverOnlyFftShiftAndInverse_RoundTripAndMatchOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedComplexMultiply(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The candidate is admitted only on SM86.");
+        const int dim = 999, batch = 5;   // odd dim exercises the floor/ceil asymmetry
+        int shift = PtxFftRollF32Kernel.FftShiftAmount(dim);
+        int inverseShift = PtxFftRollF32Kernel.IFftShiftAmount(dim);
+        using var fwd = new PtxFftRollF32Kernel(runtime, dim, shift, batch);
+        using var inv = new PtxFftRollF32Kernel(runtime, dim, inverseShift, batch);
+
+        var input = new float[batch * dim];
+        var random = RandomHelper.CreateSeededRandom(20270501);
+        for (int i = 0; i < input.Length; i++) input[i] = (float)(random.NextDouble() * 2 - 1);
+        var expected = new float[batch * dim];
+        for (int b = 0; b < batch; b++)
+            for (int i = 0; i < dim; i++)
+                expected[b * dim + i] = input[b * dim + ((i - shift) % dim + dim) % dim];   // np.roll
+
+        using var iB = runtime.AllocateBytes(fwd.Blueprint.Tensors[0].RequiredBytes);
+        using var sB = runtime.AllocateBytes(fwd.Blueprint.Tensors[1].RequiredBytes);
+        using var rB = runtime.AllocateBytes(inv.Blueprint.Tensors[1].RequiredBytes);
+        iB.Upload<float>(input);
+        fwd.Launch(
+            DirectPtxTensorView.CreateOwned(iB, fwd.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(sB, fwd.Blueprint.Tensors[1]));
+        inv.Launch(
+            DirectPtxTensorView.CreateOwned(sB, inv.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(rB, inv.Blueprint.Tensors[1]));
+        runtime.Synchronize();
+
+        var shifted = new float[batch * dim];
+        var roundTrip = new float[batch * dim];
+        sB.Download<float>(shifted); rB.Download<float>(roundTrip);
+        for (int i = 0; i < input.Length; i++)
+        {
+            Assert.Equal(expected[i], shifted[i]);   // bit-exact vs np.roll
+            Assert.Equal(input[i], roundTrip[i]);    // ifftshift(fftshift(x)) == x
+        }
+    }
+
+    [SkippableFact]
+    public void DriverOnlyFftFreq_MatchesReference()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedComplexUnary(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The candidate is admitted only on SM86.");
+        const int n = 1000;
+        const double d = 0.5;
+        float scale = (float)(1.0 / (d * n));
+        using var full = new PtxFftFreqF32Kernel(runtime, n, DirectPtxFftFreqOp.Full);
+        using var real = new PtxFftFreqF32Kernel(runtime, n, DirectPtxFftFreqOp.Real);
+
+        var expFull = new float[n];
+        int split = (n + 1) / 2;
+        for (int i = 0; i < split; i++) expFull[i] = (float)(i * scale);
+        for (int i = split; i < n; i++) expFull[i] = (float)((i - n) * scale);
+        var expReal = new float[n / 2 + 1];
+        for (int i = 0; i < expReal.Length; i++) expReal[i] = (float)(i * scale);
+
+        using var fB = runtime.AllocateBytes(full.Blueprint.Tensors[0].RequiredBytes);
+        using var rB = runtime.AllocateBytes(real.Blueprint.Tensors[0].RequiredBytes);
+        full.Launch(DirectPtxTensorView.CreateOwned(fB, full.Blueprint.Tensors[0]), scale);
+        real.Launch(DirectPtxTensorView.CreateOwned(rB, real.Blueprint.Tensors[0]), scale);
+        runtime.Synchronize();
+
+        var actFull = new float[n];
+        var actReal = new float[n / 2 + 1];
+        fB.Download<float>(actFull); rB.Download<float>(actReal);
+        for (int i = 0; i < n; i++) Assert.Equal(expFull[i], actFull[i]);
+        for (int i = 0; i < actReal.Length; i++) Assert.Equal(expReal[i], actReal[i]);
     }
 
     private static int Count(string text, string value)

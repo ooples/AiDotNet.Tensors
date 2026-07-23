@@ -74,7 +74,33 @@ internal static class DirectPtxSpectralCoverageManifest
         Planned("IEngine.GriffinLim", "iterative STFT/ISTFT composition", "phase reconstruction", Frames, "generic public; CUDA FP32", "griffin-lim-step-cells"),
         Planned("IEngine.Resample", "CUDA audio resample", "polyphase waveform resample", "canonical contiguous waveform", "generic public; CUDA FP32", "resample-ratio-cells"),
         Planned("IEngine.NativeComplexMultiply", "native/split complex dispatch", "public native complex product", Interleaved, "Complex<FP32/FP64>", "public-complex-product-routing"),
-        Planned("IEngine.NativeSpectralFilter", "FFT multiply IFFT composition", "public 2D spectral filter", Split, "generic public; CUDA FP32", "public-spectral-filter-routing")
+        Planned("IEngine.NativeSpectralFilter", "FFT multiply IFFT composition", "public 2D spectral filter", Split, "generic public; CUDA FP32", "public-spectral-filter-routing"),
+
+        // Public Fft-module variants. FftShift/IFftShift and FftFreq/RFftFreq have
+        // standalone direct-PTX kernels; the transform variants below compose the
+        // CudaBackend FFT/RFFT/IRFFT leaf kernels (all Experimental) plus packing,
+        // conjugation, and per-axis loops, so they are assigned as compositions.
+        Experimental("Fft.FftShift", "numpy-style fftshift roll", "shift zero-frequency to center", Interleaved, "FP32", "v1 Ampere batched contiguous roll by floor(dim/2) (PtxFftRollF32Kernel); pure bit-exact data movement"),
+        Experimental("Fft.IFftShift", "numpy-style ifftshift roll", "inverse of fftshift", Interleaved, "FP32", "v1 Ampere batched contiguous roll by ceil(dim/2) (PtxFftRollF32Kernel); pure bit-exact data movement"),
+        Experimental("Fft.FftFreq", "numpy-style fftfreq", "DFT sample frequencies", "canonical contiguous frequency vector", "FP32", "v1 Ampere index-to-frequency generation (PtxFftFreqF32Kernel Full); i or i-n scaled by 1/(d*n), bit-exact"),
+        Experimental("Fft.RFftFreq", "numpy-style rfftfreq", "real-FFT non-negative sample frequencies", "canonical contiguous frequency vector", "FP32", "v1 Ampere index-to-frequency generation (PtxFftFreqF32Kernel Real); i scaled by 1/(d*n), bit-exact"),
+        Planned("Fft.Fft1", "public 1D complex FFT", "torch.fft.fft", Interleaved, "generic public; CUDA FP32", "composition: interleave->CudaBackend.FFT->norm; routes to the FFT leaf kernels"),
+        Planned("Fft.IFft1", "public 1D complex IFFT", "torch.fft.ifft", Interleaved, "generic public; CUDA FP32", "composition: CudaBackend.FFT(inverse) with 1/n normalization"),
+        Planned("Fft.Fft2", "public 2D complex FFT", "torch.fft.fft2", Interleaved, "generic public; CUDA FP32", "composition: routes to CudaBackend.FFT2D"),
+        Planned("Fft.IFft2", "public 2D complex IFFT", "torch.fft.ifft2", Interleaved, "generic public; CUDA FP32", "composition: CudaBackend.FFT2D(inverse) with 1/(h*w) normalization"),
+        Planned("Fft.FftN", "public N-D complex FFT", "torch.fft.fftn", Interleaved, "generic public; CUDA FP32", "composition: separable CudaBackend.FFT per transformed axis"),
+        Planned("Fft.IFftN", "public N-D complex IFFT", "torch.fft.ifftn", Interleaved, "generic public; CUDA FP32", "composition: separable inverse CudaBackend.FFT per axis with product normalization"),
+        Planned("Fft.RFft2", "public 2D real FFT", "torch.fft.rfft2", Split, "generic public; CUDA FP32", "composition: CudaBackend.RFFT on the last axis then CudaBackend.FFT on the others"),
+        Planned("Fft.IRFft2", "public 2D real IFFT", "torch.fft.irfft2", Split, "generic public; CUDA FP32", "composition: inverse FFT on leading axes then CudaBackend.IRFFT on the last"),
+        Planned("Fft.RFftN", "public N-D real FFT", "torch.fft.rfftn", Split, "generic public; CUDA FP32", "composition: CudaBackend.RFFT on the last axis then FFT on the rest"),
+        Planned("Fft.IRFftN", "public N-D real IFFT", "torch.fft.irfftn", Split, "generic public; CUDA FP32", "composition: inverse FFT on leading axes then CudaBackend.IRFFT on the last"),
+        Planned("Fft.HFft", "public 1D Hermitian FFT", "torch.fft.hfft", Split, "generic public; CUDA FP32", "composition: SplitComplexConjugate then CudaBackend.IRFFT-style real output"),
+        Planned("Fft.IHFft", "public 1D inverse Hermitian FFT", "torch.fft.ihfft", Split, "generic public; CUDA FP32", "composition: CudaBackend.RFFT then SplitComplexConjugate with 1/n normalization"),
+        Planned("Fft.HFft2", "public 2D Hermitian FFT", "torch.fft.hfft2", Split, "generic public; CUDA FP32", "composition: Hermitian expand then 2D real inverse transform"),
+        Planned("Fft.IHFft2", "public 2D inverse Hermitian FFT", "torch.fft.ihfft2", Split, "generic public; CUDA FP32", "composition: 2D real forward transform then conjugation"),
+        Planned("Fft.HFftN", "public N-D Hermitian FFT", "torch.fft.hfftn", Split, "generic public; CUDA FP32", "composition: Hermitian expand then N-D real inverse transform"),
+        Planned("Fft.IHFftN", "public N-D inverse Hermitian FFT", "torch.fft.ihfftn", Split, "generic public; CUDA FP32", "composition: N-D real forward transform then conjugation"),
+        Planned("Fft.FftConv", "FFT convolution", "linear/circular convolution via FFT", Interleaved, "generic public; CUDA FP32", "composition: CudaBackend.FFT -> SplitComplexMultiply -> inverse CudaBackend.FFT")
     ];
 
     private static readonly IReadOnlyDictionary<string, DirectPtxSpectralCoverageCell> ByApi =

@@ -284,6 +284,18 @@ public static class PtxParityRegistry
             "one module per element count; output=log1p(input)=ln(1+input) via lg2.approx(1+x) scaled by " +
             "ln(2). Its spec is TOLERANCE-based, not bit-exact. Converts to ThreeWayParity (with tolerance) " +
             "when the SM86 run lands; until then unpromoted and fail-closed."),
+        new PtxParitySpec("PtxFftRollF32Kernel", PtxParityStatus.Deferred,
+            "batched contiguous fft roll, fp32 (#850) - Fft.FftShift / Fft.IFftShift",
+            "one module per (dim,shift,batch); output[b,i]=input[b,(i-shift) mod dim] along the last axis. " +
+            "fftshift bakes shift=floor(dim/2), ifftshift bakes ceil(dim/2); the same kernel serves both " +
+            "directions and both the real and complex-interleaved axes. It is pure data movement, so the spec " +
+            "is bit-exact including NaN payloads and signed zeros. Converts to ThreeWayParity when the SM86 run lands."),
+        new PtxParitySpec("PtxFftFreqF32Kernel", PtxParityStatus.Deferred,
+            "fft sample-frequency generation, fp32 (#850) - Fft.FftFreq / Fft.RFftFreq",
+            "one module per (n, op); Full writes the n signed DFT bins [0..split-1, split-n..-1]*scale and " +
+            "Real writes the n/2+1 non-negative bins [0..n/2]*scale, with scale=1/(d*n) a per-launch .param " +
+            ".f32. Each output is an integer index cast to fp32 and scaled, so the spec is bit-exact against " +
+            "the reference bins. Converts to ThreeWayParity when the SM86 run lands; until then unpromoted."),
         new PtxParitySpec("PtxMelFilterbankApplyF32Kernel", PtxParityStatus.Deferred,
             "segmented mel filterbank application, fp32 (#850) - CudaBackend.MelFilterbankApply",
             "one module per (totalSegBatch,specBins,melBins); each thread owns one (seg,mel) output and reduces " +
