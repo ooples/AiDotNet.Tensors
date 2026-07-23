@@ -79,7 +79,14 @@ public sealed class DirectPtxNormalizationCorrectnessTests
                 8_192);
 
         Assert.Contains("red.global.add.f32", ptx, StringComparison.Ordinal);
-        Assert.Contains("setp.lt.u32 %p5, %r2, 16", ptx, StringComparison.Ordinal);
+        Assert.Contains("setp.ge.u32 %p5, %r2, 16", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("REDUCE_NORM_LOOP", ptx, StringComparison.Ordinal);
+        Assert.Equal(2, ptx.Split(
+            new[] { "ld.global.nc.v4.f32" }, StringSplitOptions.None).Length - 1);
+        Assert.Contains("shfl.sync.bfly.b32 %r9, %r8, 8, 15, 0x0000ffff", ptx,
+            StringComparison.Ordinal);
+        Assert.Contains("ld.global.f32 %f0, [%rd4]", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("REDUCE_NORM_LAST_FINAL", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain("st.global.f32 [%rd4], %f3", ptx, StringComparison.Ordinal);
         Assert.Equal("16", blueprint.Semantics["accumulator-banks"]);
         Assert.Equal("false", blueprint.Semantics["deterministic"]);

@@ -9,7 +9,7 @@ Parent blueprint: `2026-07-20-fused-attention-championship-blueprint.md`
 ## Current verdict
 
 The implementation inventory is complete for the exact SM86 shapes in this
-pull request: 71 row/channel specialization cells map to 67 distinct,
+pull request: 71 row/channel specialization cells map to 66 distinct,
 content-addressed cubins. The difference is intentional: the two atomic
 parameter kernels have identical PTX for their three runtime grid sizes and
 therefore share a compiled artifact. The inventory now includes row-specific
@@ -59,7 +59,7 @@ specializations is allowed only when the cubin filename and hash also match.
 | 3 | Shared memory only for reuse | Backward parameter partials are folded in 16 KiB (LayerNorm) or 5 KiB (RMSNorm); L2 uses a 64-byte warp fold. Single-use row inputs are not pointlessly staged. **Pass.** |
 | 4 | Register-resident math | Loaded row values, statistics, affine terms, reductions, and grad-input epilogues remain in registers until final stores. Final SASS has zero local loads/stores. **Pass.** |
 | 5 | Combined/fused kernels | The large-shape experimental backward paths compute grad-input plus parameter partials in one input pass and one dispatch. Existing residual+BatchNorm+ReLU is also truly fused. **Mechanically pass; performance HOLD.** |
-| 6 | Bounded global reductions | Fused backward folds issue one `RED` per block/output into one of four banked accumulators, reducing per-address contention by 4x, plus one completion atomic per block. L2 uses a 512-thread, at-most-128-block grid feeding 16 reusable `RED` banks and a one-warp final fold. The complete persistent workspace is 2,052 bytes; no output-sized scratch exists. **Source/resource pass; current L2 GPU correctness and performance HOLD.** |
+| 6 | Bounded global reductions | Fused backward folds issue one `RED` per block/output into one of four banked accumulators, reducing per-address contention by 4x, plus one completion atomic per block. L2 uses a 512-thread, at-most-128-block grid feeding 16 reusable `RED` banks and a half-warp final fold. The complete persistent workspace is 2,052 bytes; no output-sized scratch exists. **Source/resource pass; current L2 GPU correctness and performance HOLD.** |
 | 7 | Asynchronous stream ordering | Launches use the backend stream with no host synchronization. Fused backward/L2 no longer clear outputs; their prewarmed workspace self-resets inside the kernel. `cp.async` is required only for reusable tiles and is inapplicable to these single-use D=64 loads. **Pass.** |
 | 8 | CUDA Graph/lifetime safety | Plans are prewarmed and modules pinned for capture lifetime; compilation, tuning, file I/O, and cache misses are rejected during capture. **Pass.** |
 | 9 | Ahead-of-load binary control | PTX is linked to cubin, hashed, embedded, loaded, disassembled to SASS, resource-audited, and content-addressed cached. Raw PTX load is experiment-only. **Pass.** |
@@ -110,9 +110,11 @@ The experimental whole-tensor L2 lane uses aligned 16-byte loads, four
 register FMAs, 512-thread blocks, a bounded 128-block grid, and a 64-byte
 warp/shared fold. Blocks publish through 16 reusable non-returning `RED` banks,
 limiting each address to at most eight publishers. The last block uses one warp
-to fold and clear those banks, writes the scalar directly, and resets the
+with a 16-lane member mask to fold and clear those banks, writes the scalar directly, and resets the
 workspace completion counter. This replaces the slower 128-slot second global
-fold. It remains unselected until current-source GPU correctness, graph replay,
+fold. Exact shape specializations emit one uniform `LDG.E.128` per thread at
+256/2,048 rows and exactly two at 8,192 rows, with no runtime input bounds loop.
+It remains unselected until current-source GPU correctness, graph replay,
 and clean performance runs all pass. The
 deterministic one-block variant also adopts the wider block fold but remains a
 fallback-only experiment.
@@ -185,13 +187,14 @@ process existed before it registered its CUDA context.
   a banked-L2 emitter/routing contract that passes on net10 and net471. Exact
   current-source L2 GPU correctness and graph replay, plus the four-bank net471
   GPU replay, wait for an uncontended device.
-- All 71 current-source identities and 67 compiled cubins pass the static
+- All 71 current-source identities and 66 compiled cubins pass the static
   verifier.
 - Final SASS passes for all 67 cubins with zero `LDL` and zero `STL`; current
   maximum register use is 48/thread.
 - Fused backward and the banked L2 entry contain the intended final
   `RED.E.ADD.F32` publishers; only the integer completion counters use `ATOMG`.
-  The banked L2 cubin uses 24 registers/thread and 64 bytes shared memory.
+  The banked L2 cubin uses 24 registers/thread and 64 bytes shared memory; its
+  hot reduction paths use inline full-warp/half-warp `SHFL` instructions.
 - Exact-cubin runtime profiling launches all 71 embedded specializations and
   reports `PROFILED_NORMALIZATION_CUBINS=71`.
 - Nsight Compute 2025.4.1 attaches to the exact target, but hardware-counter
@@ -209,7 +212,7 @@ and 42.33/22.88/26.34 us respectively, far outside the +10% tail gate. The
 superseded single-address/bounded-partial 512-thread L2 experiments measured
 about 17.20 us median and 22.18 us p95 in their clean routed screen; the
 deterministic embedded variant measured 42.64--43.77 us. The new 16-bank
-`RED`/one-warp-fold candidate has not been timed. All three operation families
+`RED`/half-warp-fold candidate has not been timed. All three operation families
 remain HOLD.
 
 The first workspace topology stored every block partial and folded it in the
