@@ -226,6 +226,26 @@ internal sealed class PtxWinogradWmmaFusedAllKKernel : IDisposable
         s.AppendLine($"    mul.wide.u32 %rd5, %r15, {I(hw)};");
         s.AppendLine("    shl.b64 %rd5, %rd5, 2;");
         s.AppendLine("    add.u64 %rd5, %rd1, %rd5;");
+        // Interior-tile fast path: when the whole 4x4 patch is in bounds
+        // (ih0 in [0, H-4], iw0 in [0, W-4]) skip all 16 per-element bounds checks
+        // and issue 16 plain loads. ~86% of tiles are interior at 56x56.
+        s.AppendLine("    setp.ge.s32 %pr1, %r13, 0;");
+        s.AppendLine($"    setp.le.s32 %pr2, %r13, {I(h - 4)};");
+        s.AppendLine("    setp.ge.s32 %pr3, %r14, 0;");
+        s.AppendLine($"    setp.le.s32 %pr4, %r14, {I(w - 4)};");
+        s.AppendLine("    and.pred %pr1, %pr1, %pr2;");
+        s.AppendLine("    and.pred %pr3, %pr3, %pr4;");
+        s.AppendLine("    and.pred %pr5, %pr1, %pr3;");
+        s.AppendLine("    @!%pr5 bra PATCH_SLOW;");
+        // fast path: patch base = channel base + (ih0*W + iw0)*4
+        s.AppendLine($"    mad.lo.s32 %r16, %r13, {I(w)}, %r14;");
+        s.AppendLine("    mul.wide.s32 %rd6, %r16, 4;");
+        s.AppendLine("    add.u64 %rd6, %rd5, %rd6;");
+        for (int di = 0; di < 4; di++)
+            for (int dj = 0; dj < 4; dj++)
+                s.AppendLine($"    ld.global.nc.f32 %d{di * 4 + dj}, [%rd6+{I((di * w + dj) * 4)}];");
+        s.AppendLine("    bra PATCH_DONE;");
+        s.AppendLine("PATCH_SLOW:");
         for (int di = 0; di < 4; di++)
             for (int dj = 0; dj < 4; dj++)
             {
@@ -246,6 +266,7 @@ internal sealed class PtxWinogradWmmaFusedAllKKernel : IDisposable
                 s.AppendLine("    add.u64 %rd6, %rd5, %rd6;");
                 s.AppendLine($"    @%pr1 ld.global.nc.f32 %d{reg}, [%rd6];");
             }
+        s.AppendLine("PATCH_DONE:");
         int D(int i, int j) => i * 4 + j;
         int T(int i, int j) => 16 + i * 4 + j;
         int Vv(int i, int j) => 32 + i * 4 + j;
