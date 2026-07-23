@@ -14,8 +14,9 @@ public class DirectPtxScientificTests
     [Fact]
     public void ScientificCoverageManifest_AssignsEveryScopedApiExactlyOnce()
     {
-        Assert.Equal(30, DirectPtxScientificCoverageManifest.All.Count);
+        Assert.Equal(31, DirectPtxScientificCoverageManifest.All.Count);
         string[] names = DirectPtxScientificCoverageManifest.All.Select(c => c.Api).ToArray();
+        Assert.Contains("CudaBackend.HashGridEncodeLevel", names);
         Assert.Contains("CudaBackend.CosineSimilarity", names);
         Assert.Contains("CudaBackend.SphericalSoftmax", names);
         Assert.Contains("CudaBackend.NormalizeProbabilities", names);
@@ -759,6 +760,84 @@ public class DirectPtxScientificTests
         var actual = new float[expected.Length];
         outBuf.Download<float>(actual);
         AssertVectorClose(actual, expected, 3e-3f, $"capsule {op}");
+    }
+
+    [Fact]
+    public void InstantNgpHashEncodeEmitter_IsTrilinearEightCornerHash()
+    {
+        string ptx = PtxInstantNgpHashEncodeKernel.EmitPtx(8, 6, 256, 16, 4096, 2, 0, 32);
+        Assert.Contains(PtxInstantNgpHashEncodeKernel.EntryPoint, ptx);
+        Assert.Equal(3, Count(ptx, "cvt.rmi.s32.f32"));      // floor on x/y/z
+        Assert.Equal(8, Count(ptx, "rem.u32 %r14"));         // 8 corner spatial hashes
+        Assert.Equal(3 + 8, Count(ptx, "ld.global.nc.f32")); // 3 position + 8 corner lookups
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.Equal(8, Count(ptx, "mul.lo.u32 %r11, "));    // one hash multiply per corner
+        Assert.Equal(0, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxInstantNgpHashEncodeKernel.IsSupportedShape(256, 16, 4096, 2, 0, 32));
+        Assert.False(PtxInstantNgpHashEncodeKernel.IsSupportedShape(255, 16, 4096, 2, 0, 32));   // not mult of 256
+        Assert.False(PtxInstantNgpHashEncodeKernel.IsSupportedShape(256, 16, 4096, 2, 31, 32));  // levelOffset+fpl (33) > stride (32)
+        Assert.False(PtxInstantNgpHashEncodeKernel.IsPromotedShape(256, 16, 4096, 2, 0, 32));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyInstantNgpHashEncode_MatchesOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in instant-ngp-hash-encode specialization is measured on GA10x/SM86.");
+        const int numPoints = 256, resolution = 16, tableSize = 4096, fpl = 2, levelOffset = 0, outputStride = 4;
+        using var kernel = new PtxInstantNgpHashEncodeKernel(runtime, numPoints, resolution, tableSize, fpl, levelOffset, outputStride);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20268800);
+        float[] positions = new float[numPoints * 3];
+        for (int i = 0; i < positions.Length; i++) positions[i] = (float)random.NextDouble();
+        float[] table = Values(random, tableSize * fpl, 1.0f);
+        var expected = new float[numPoints * outputStride];
+        for (int n = 0; n < numPoints; n++)
+            for (int f = 0; f < fpl; f++)
+                expected[n * outputStride + levelOffset + f] = NgpEncodeOracle(positions, table, n, f, resolution, tableSize, fpl);
+
+        using var pos = runtime.AllocateBytes((nuint)(positions.Length * sizeof(float)));
+        using var tbl = runtime.AllocateBytes((nuint)(table.Length * sizeof(float)));
+        using var outBuf = runtime.AllocateBytes((nuint)(expected.Length * sizeof(float)));
+        pos.Upload<float>(positions);
+        tbl.Upload<float>(table);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(pos, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(tbl, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(outBuf, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[expected.Length];
+        outBuf.Download<float>(actual);
+        AssertVectorClose(actual, expected, 3e-3f, "instant-ngp hash encode");
+    }
+
+    private static uint NgpHash(int x, int y, int z, int tableSize)
+    {
+        uint hx = (uint)x * 73856093u, hy = (uint)y * 19349663u, hz = (uint)z * 83492791u;
+        return (hx ^ hy ^ hz) % (uint)tableSize;
+    }
+
+    private static float NgpEncodeOracle(float[] positions, float[] table, int n, int f, int resolution, int tableSize, int fpl)
+    {
+        float Clamp(float v) => v <= 0f ? 0f : (v >= 0.999999f ? 0.999999f : v);
+        float gx = Clamp(positions[n * 3]) * resolution, gy = Clamp(positions[n * 3 + 1]) * resolution, gz = Clamp(positions[n * 3 + 2]) * resolution;
+        int x0 = (int)Math.Floor(gx), y0 = (int)Math.Floor(gy), z0 = (int)Math.Floor(gz);
+        int x1 = x0 + 1, y1 = y0 + 1, z1 = z0 + 1;
+        float fx = gx - x0, fy = gy - y0, fz = gz - z0, ix = 1f - fx, iy = 1f - fy, iz = 1f - fz;
+        return ix * iy * iz * table[NgpHash(x0, y0, z0, tableSize) * fpl + f]
+             + ix * iy * fz * table[NgpHash(x0, y0, z1, tableSize) * fpl + f]
+             + ix * fy * iz * table[NgpHash(x0, y1, z0, tableSize) * fpl + f]
+             + ix * fy * fz * table[NgpHash(x0, y1, z1, tableSize) * fpl + f]
+             + fx * iy * iz * table[NgpHash(x1, y0, z0, tableSize) * fpl + f]
+             + fx * iy * fz * table[NgpHash(x1, y0, z1, tableSize) * fpl + f]
+             + fx * fy * iz * table[NgpHash(x1, y1, z0, tableSize) * fpl + f]
+             + fx * fy * fz * table[NgpHash(x1, y1, z1, tableSize) * fpl + f];
     }
 
     [Fact]
@@ -2250,6 +2329,18 @@ public class DirectPtxScientificTests
             float[] ivfVec = Values(random, ivfV * ivfDim, 1.0f), ivfCen = Values(random, ivfC * ivfDim, 1.0f);
             using (var vb = backend.AllocateBuffer(ivfVec)) using (var cb = backend.AllocateBuffer(ivfCen)) using (var ab = backend.AllocateBuffer(ivfV))
             { backend.IvfAssign(vb, cb, ab, ivfV, ivfC, ivfDim, AnnMetric.L2); n = AssertDispatched(n, "ann-ivf-assign"); }
+
+            // Instant-NGP hash encode. cells = numPoints*fpl = 256*2 = 512.
+            const int ngpPts = 256, ngpRes = 16, ngpTable = 4096, ngpFpl = 2, ngpLoff = 0, ngpStride = 4;
+            float[] ngpPos = new float[ngpPts * 3];
+            for (int i = 0; i < ngpPos.Length; i++) ngpPos[i] = (float)random.NextDouble();
+            float[] ngpTbl = Values(random, ngpTable * ngpFpl, 1.0f);
+            var ngpExp = new float[ngpPts * ngpStride];
+            for (int np = 0; np < ngpPts; np++)
+                for (int f = 0; f < ngpFpl; f++)
+                    ngpExp[np * ngpStride + ngpLoff + f] = NgpEncodeOracle(ngpPos, ngpTbl, np, f, ngpRes, ngpTable, ngpFpl);
+            using (var pb = backend.AllocateBuffer(ngpPos)) using (var tb = backend.AllocateBuffer(ngpTbl)) using (var o = backend.AllocateBuffer(ngpPts * ngpStride))
+            { backend.HashGridEncodeLevel(pb, tb, o, ngpPts, ngpRes, ngpTable, ngpFpl, ngpLoff, ngpStride); n = AssertDispatched(n, "instant-ngp-hash-encode"); AssertVectorClose(backend.DownloadBuffer(o), ngpExp, 3e-3f, "instant-ngp-hash-encode route"); }
         }
         finally
         {

@@ -30,6 +30,7 @@ public sealed partial class CudaBackend
     private readonly record struct SciAnnCdKey(AnnMetric Metric, int NumQueries, int NumDatabase, int Dim);
     private readonly record struct SciAnnPqKey(AnnMetric Metric, int NumQueries, int M, int Ksub, int Dsub);
     private readonly record struct SciAnnAdcKey(int NumQueries, int NumCodes, int M, int Ksub);
+    private readonly record struct SciNgpKey(int NumPoints, int Resolution, int TableSize, int FeaturesPerLevel, int LevelOffset, int OutputStride);
 
     private readonly DirectPtxKernelCache<SciCountKey, PtxComplexMultiplyKernel> _sciComplexMul =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
@@ -86,6 +87,8 @@ public sealed partial class CudaBackend
     private readonly DirectPtxKernelCache<SciAnnCdKey, PtxAnnIvfAssignKernel> _sciAnnIvfAssign =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<SciAnnAdcKey, PtxAnnPqAdcScanKernel> _sciAnnPqAdcScan =
+        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<SciNgpKey, PtxInstantNgpHashEncodeKernel> _sciNgpHashEncode =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
 
     private long _sciDispatchCount;
@@ -533,6 +536,24 @@ public sealed partial class CudaBackend
             var k = _sciAnnPqAdcScan.GetOrAdd(new SciAnnAdcKey(numQueries, numCodes, m, ksub),
                 () => new PtxAnnPqAdcScanKernel(_directPtxRuntime!, numQueries, numCodes, m, ksub));
             Launch3(k.Blueprint, codes, tables, distances, (vc, vt, vd) => k.Launch(vc, vt, vd));
+        });
+    }
+
+    internal bool TryDirectPtxInstantNgpHashEncode(
+        IGpuBuffer positions, IGpuBuffer hashTable, IGpuBuffer output,
+        int numPoints, int resolution, int tableSize, int featuresPerLevel, int levelOffset, int outputStride)
+    {
+        if (!ScientificGateOpen ||
+            !PtxInstantNgpHashEncodeKernel.IsSupportedShape(numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride)) return Fail("instant-ngp-hash-encode");
+        if (positions.SizeInBytes != checked((long)numPoints * 3 * sizeof(float)) ||
+            hashTable.SizeInBytes != checked((long)tableSize * featuresPerLevel * sizeof(float)) ||
+            output.SizeInBytes != checked((long)numPoints * outputStride * sizeof(float))) return Fail("instant-ngp-hash-encode-extent");
+        return SciDispatch(() =>
+        {
+            var k = _sciNgpHashEncode.GetOrAdd(
+                new SciNgpKey(numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride),
+                () => new PtxInstantNgpHashEncodeKernel(_directPtxRuntime!, numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride));
+            Launch3(k.Blueprint, positions, hashTable, output, (vp, vt, vo) => k.Launch(vp, vt, vo));
         });
     }
 
