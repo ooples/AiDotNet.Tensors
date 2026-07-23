@@ -81,7 +81,50 @@ public static class PtxParityRegistry
         new PtxParitySpec("PtxFusedQkvRopeCacheD64Kernel", PtxParityStatus.Deferred,
             "fused QKV + RoPE + KV-cache write (#858)",
             "multi-output (Q + K/V cache) with baked RoPE tables; needs a dedicated QKV/RoPE/cache oracle."),
+
+        // Issue #854 specialized-scientific / ANN / hypercomplex / hyperbolic / quantum / Instant-NGP
+        // kernels. Each has a GPU-gated DriverOnly CPU-fp64-oracle parity test, an emitter structure
+        // test, and a backend dispatch test in DirectPtxScientificTests. The three-way gate-toggle
+        // parity spec in this harness is deferred pending the scientific parity harness (mirrors the
+        // attention entries above); every op fails closed and is unpromoted until GPU-validated.
+        new PtxParitySpec("PtxComplexMultiplyKernel", PtxParityStatus.Deferred, "complex multiply (#854)", ScientificNote),
+        new PtxParitySpec("PtxComplexConjugateKernel", PtxParityStatus.Deferred, "complex conjugate (#854)", ScientificNote),
+        new PtxParitySpec("PtxComplexMagnitudeKernel", PtxParityStatus.Deferred, "complex magnitude (#854)", ScientificNote),
+        new PtxParitySpec("PtxComplexPhaseKernel", PtxParityStatus.Deferred, "complex phase / atan2 (#854)", ScientificNote),
+        new PtxParitySpec("PtxComplexMatVecKernel", PtxParityStatus.Deferred, "complex mat-vec (#854)", ScientificNote),
+        new PtxParitySpec("PtxOctonionAddKernel", PtxParityStatus.Deferred, "octonion add (#854)", ScientificNote),
+        new PtxParitySpec("PtxOctonionMultiplyKernel", PtxParityStatus.Deferred, "octonion multiply (#854)", ScientificNote),
+        new PtxParitySpec("PtxMobiusAddKernel", PtxParityStatus.Deferred, "mobius add (#854)", ScientificNote),
+        new PtxParitySpec("PtxPoincareDistanceKernel", PtxParityStatus.Deferred, "poincare distance (#854)", ScientificNote),
+        new PtxParitySpec("PtxPoincareProjectKernel", PtxParityStatus.Deferred, "poincare project (#854)", ScientificNote),
+        new PtxParitySpec("PtxPoincareExpMapKernel", PtxParityStatus.Deferred, "poincare exp-map (#854)", ScientificNote),
+        new PtxParitySpec("PtxRbfForwardKernel", PtxParityStatus.Deferred, "rbf forward (#854)", ScientificNote),
+        new PtxParitySpec("PtxPairwiseDistanceKernel", PtxParityStatus.Deferred, "pairwise distance L2/squared (#854)", ScientificNote),
+        new PtxParitySpec("PtxCosineSimilarityKernel", PtxParityStatus.Deferred, "cosine similarity (#854)", ScientificNote),
+        new PtxParitySpec("PtxQuantumMeasurementKernel", PtxParityStatus.Deferred, "quantum measurement (#854)", ScientificNote),
+        new PtxParitySpec("PtxQuantumRotationKernel", PtxParityStatus.Deferred, "quantum rotation (#854)", ScientificNote),
+        new PtxParitySpec("PtxMeasurementForwardKernel", PtxParityStatus.Deferred, "measurement forward (#854)", ScientificNote),
+        new PtxParitySpec("PtxNormalizeProbabilitiesKernel", PtxParityStatus.Deferred, "normalize probabilities (#854)", ScientificNote),
+        new PtxParitySpec("PtxSphericalHarmonicsKernel", PtxParityStatus.Deferred, "spherical harmonics (#854)", ScientificNote),
+        new PtxParitySpec("PtxSphericalHarmonicsBackwardKernel", PtxParityStatus.Deferred, "spherical harmonics backward (#854)", ScientificNote),
+        new PtxParitySpec("PtxSphericalSoftmaxKernel", PtxParityStatus.Deferred, "spherical softmax (#854)", ScientificNote),
+        new PtxParitySpec("PtxCapsuleContractionKernel", PtxParityStatus.Deferred, "capsule predictions/transform (#854)", ScientificNote),
+        new PtxParitySpec("PtxCapsuleWeightedSumKernel", PtxParityStatus.Deferred, "capsule weighted sum (#854)", ScientificNote),
+        new PtxParitySpec("PtxCapsuleAgreementKernel", PtxParityStatus.Deferred, "capsule agreement (#854)", ScientificNote),
+        new PtxParitySpec("PtxAnnComputeDistancesKernel", PtxParityStatus.Deferred, "ann compute distances (#854)", ScientificNote),
+        new PtxParitySpec("PtxAnnPqDistanceTablesKernel", PtxParityStatus.Deferred, "ann pq distance tables (#854)", ScientificNote),
+        new PtxParitySpec("PtxAnnIvfAssignKernel", PtxParityStatus.Deferred, "ann ivf assign (#854)", ScientificNote),
+        new PtxParitySpec("PtxAnnPqAdcScanKernel", PtxParityStatus.Deferred, "ann pq adc scan (#854)", ScientificNote),
+        new PtxParitySpec("PtxInstantNgpHashEncodeKernel", PtxParityStatus.Deferred, "instant-ngp hash encode (#854)", ScientificNote),
+        new PtxParitySpec("PtxInstantNgpHashEncodeBackwardKernel", PtxParityStatus.Deferred, "instant-ngp hash encode backward (#854)", ScientificNote),
+        new PtxParitySpec("PtxMeshLaplacianKernel", PtxParityStatus.Deferred, "uniform mesh laplacian (#854)", ScientificNote),
     };
+
+    private const string ScientificNote =
+        "issue #854 direct-PTX kernel; a GPU-gated DriverOnly CPU-fp64-oracle parity test, an emitter " +
+        "structure test, and a backend dispatch test exist in DirectPtxScientificTests. The three-way " +
+        "gate-toggle parity spec in this harness is deferred pending the scientific parity harness; the " +
+        "op fails closed and stays unpromoted until GPU-validated.";
 
     private static readonly Dictionary<string, PtxParitySpec> ByKernel =
         Specs.ToDictionary(s => s.KernelTypeName, StringComparer.Ordinal);
