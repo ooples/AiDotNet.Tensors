@@ -40,7 +40,7 @@ internal static class DirectPtxProfileTarget
         {
             DirectPtxFeatureGate.NormalizationExperimentOverride = previousExperiment;
         }
-        // Do not re-run the idle-GPU gate here: writing 56 audit records can make
+        // Do not re-run the idle-GPU gate here: writing 71 audit records can make
         // a hardware-accelerated terminal briefly appear as a compute+graphics
         // process. The pre-launch gate protects the actual profiled interval.
     }

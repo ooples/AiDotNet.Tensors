@@ -68,6 +68,33 @@ public sealed class DirectPtxNormalizationCorrectnessTests
     }
 
     [Fact]
+    public void BankedL2Emitter_UsesReusableRedAccumulatorsAndRemainsUnpromoted()
+    {
+        string ptx = PtxRowNormalizationD64Kernel.EmitPtx(
+            8, 6, DirectPtxRowNormalizationOperation.ReduceNormL2Atomic, 8_192);
+        DirectPtxKernelBlueprint blueprint =
+            PtxRowNormalizationD64Kernel.CreateBlueprint(
+                DirectPtxArchitectureFamily.Ampere,
+                DirectPtxRowNormalizationOperation.ReduceNormL2Atomic,
+                8_192);
+
+        Assert.Contains("red.global.add.f32", ptx, StringComparison.Ordinal);
+        Assert.Contains("setp.ge.u32 %p5, %r2, 16", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("REDUCE_NORM_LOOP", ptx, StringComparison.Ordinal);
+        Assert.Equal(2, ptx.Split(
+            new[] { "ld.global.nc.v4.f32" }, StringSplitOptions.None).Length - 1);
+        Assert.Contains("shfl.sync.bfly.b32 %r9, %r8, 8, 15, 0x0000ffff", ptx,
+            StringComparison.Ordinal);
+        Assert.Contains("ld.global.f32 %f0, [%rd4]", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("REDUCE_NORM_LAST_FINAL", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("st.global.f32 [%rd4], %f3", ptx, StringComparison.Ordinal);
+        Assert.Equal("16", blueprint.Semantics["accumulator-banks"]);
+        Assert.Equal("false", blueprint.Semantics["deterministic"]);
+        Assert.False(PtxRowNormalizationD64Kernel.IsPromoted(
+            DirectPtxRowNormalizationOperation.ReduceNormL2Atomic, 8_192));
+    }
+
+    [Fact]
     public void HalfBits_UsesIeeeBinary16AcrossTargetFrameworks()
     {
         (float Value, ushort Bits)[] cases =
@@ -94,6 +121,7 @@ public sealed class DirectPtxNormalizationCorrectnessTests
         string manifestResource = Assert.Single(resources, name =>
             name.EndsWith(".Artifacts.sm86.normalization-cubins.tsv", StringComparison.Ordinal));
         var expected = new Dictionary<string, string>(StringComparer.Ordinal);
+        var blueprintIds = new HashSet<string>(StringComparer.Ordinal);
         int manifestRows = 0;
         using (Stream stream = Assert.IsAssignableFrom<Stream>(
                    assembly.GetManifestResourceStream(manifestResource)))
@@ -108,6 +136,7 @@ public sealed class DirectPtxNormalizationCorrectnessTests
                 string[] columns = line.Split('\t');
                 Assert.Equal(5, columns.Length);
                 manifestRows++;
+                Assert.True(blueprintIds.Add(columns[0]), $"Duplicate blueprint identity: {columns[0]}");
                 if (expected.TryGetValue(columns[2], out string? existingHash))
                     Assert.Equal(existingHash, columns[3]);
                 else
@@ -115,7 +144,8 @@ public sealed class DirectPtxNormalizationCorrectnessTests
             }
         }
         Assert.Equal(71, manifestRows);
-        Assert.Equal(67, expected.Count);
+        Assert.Equal(71, blueprintIds.Count);
+        Assert.Equal(66, expected.Count);
 
         string[] cubins = resources.Where(name =>
             name.IndexOf(".Artifacts.sm86.", StringComparison.Ordinal) >= 0 &&

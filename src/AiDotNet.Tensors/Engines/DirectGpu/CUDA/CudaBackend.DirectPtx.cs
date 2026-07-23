@@ -3246,6 +3246,19 @@ public sealed partial class CudaBackend
         return TryDirectPtxRowNormalization(operation, rows, 1e-5f, input, output);
     }
 
+    internal bool TryDirectPtxReduceNormL2BankedD64(
+        IGpuBuffer input, IGpuBuffer output, int rows)
+    {
+        if (GpuDeterminism.IsActive)
+        {
+            DirectPtxLastError = "normalization-banked-l2-requires-fast-mode";
+            return false;
+        }
+        return TryDirectPtxRowNormalization(
+            DirectPtxRowNormalizationOperation.ReduceNormL2Atomic,
+            rows, 1e-5f, input, output);
+    }
+
     private bool TryDirectPtxRowNormalization(
         DirectPtxRowNormalizationOperation operation,
         int rows,

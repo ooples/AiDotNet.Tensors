@@ -47,6 +47,7 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
     internal const int ReductionWarpsPerBlock = ReductionBlockThreads / 32;
     internal const int ReductionSharedBytes = ReductionWarpsPerBlock * sizeof(float);
     internal const int ReductionMaxBlocks = 128;
+    internal const int ReductionAccumulatorBanks = 16;
     internal const int FusedLayerNormBackwardWarpsPerBlock = 32;
     internal const int FusedRmsNormBackwardWarpsPerBlock = 20;
     internal const int FusedLayerNormBackwardBlockThreads =
@@ -176,10 +177,7 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
                     GetFusedBackwardWarpsPerBlock(Operation),
                 GetFusedBackwardMaxBlocks(Operation)))
             : Operation == DirectPtxRowNormalizationOperation.ReduceNormL2Atomic
-            ? checked((uint)Math.Min(
-                (Rows * (Dimension / 4) + ReductionBlockThreads - 1) /
-                    ReductionBlockThreads,
-                ReductionMaxBlocks))
+            ? checked((uint)GetReductionBlockCount(Rows))
             : IsAtomicParameterGradient(Operation)
             ? checked((uint)(Dimension / ParameterFeaturesPerBlock *
                 (Rows / Math.Min(ParameterRowsPerTile, Rows))))
@@ -1086,40 +1084,43 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         {
             ptx.AppendLine("    mov.u32 %r4, %ctaid.x;");
             ptx.AppendLine($"    mad.lo.u32 %r1, %r4, {ReductionBlockThreads}, %r0;");
-            ptx.AppendLine("    mov.u32 %r4, %nctaid.x;");
-            ptx.AppendLine($"    mul.lo.u32 %r4, %r4, {ReductionBlockThreads};");
         }
         else
         {
             ptx.AppendLine("    mov.u32 %r1, %r0;");
         }
         ptx.AppendLine("    mov.f32 %f0, 0f00000000;");
-        ptx.AppendLine("REDUCE_NORM_LOOP:");
-        ptx.AppendLine(atomic
-            ? $"    setp.ge.u32 %p0, %r1, {rows * (Dimension / 4)};"
-            : $"    setp.ge.u32 %p0, %r1, {rows * Dimension};");
-        ptx.AppendLine("    @%p0 bra REDUCE_NORM_WARP;");
-        ptx.AppendLine(atomic
-            ? "    mul.wide.u32 %rd6, %r1, 16;"
-            : "    mul.wide.u32 %rd6, %r1, 4;");
-        ptx.AppendLine("    add.u64 %rd3, %rd0, %rd6;");
         if (atomic)
         {
-            ptx.AppendLine("    ld.global.nc.v4.f32 {%f1, %f2, %f3, %f4}, [%rd3];");
-            ptx.AppendLine("    fma.rn.f32 %f0, %f1, %f1, %f0;");
-            ptx.AppendLine("    fma.rn.f32 %f0, %f2, %f2, %f0;");
-            ptx.AppendLine("    fma.rn.f32 %f0, %f3, %f3, %f0;");
-            ptx.AppendLine("    fma.rn.f32 %f0, %f4, %f4, %f0;");
+            int blockCount = GetReductionBlockCount(rows);
+            int threads = blockCount * ReductionBlockThreads;
+            int vectorsPerThread = GetReductionVectorsPerThread(rows);
+            int gridStrideBytes = checked(threads * 4 * sizeof(float));
+            ptx.AppendLine("    mul.wide.u32 %rd6, %r1, 16;");
+            ptx.AppendLine("    add.u64 %rd3, %rd0, %rd6;");
+            for (int vector = 0; vector < vectorsPerThread; vector++)
+            {
+                if (vector != 0)
+                    ptx.AppendLine($"    add.u64 %rd3, %rd3, {gridStrideBytes};");
+                ptx.AppendLine("    ld.global.nc.v4.f32 {%f1, %f2, %f3, %f4}, [%rd3];");
+                ptx.AppendLine("    fma.rn.f32 %f0, %f1, %f1, %f0;");
+                ptx.AppendLine("    fma.rn.f32 %f0, %f2, %f2, %f0;");
+                ptx.AppendLine("    fma.rn.f32 %f0, %f3, %f3, %f0;");
+                ptx.AppendLine("    fma.rn.f32 %f0, %f4, %f4, %f0;");
+            }
         }
         else
         {
+            ptx.AppendLine("REDUCE_NORM_LOOP:");
+            ptx.AppendLine($"    setp.ge.u32 %p0, %r1, {rows * Dimension};");
+            ptx.AppendLine("    @%p0 bra REDUCE_NORM_WARP;");
+            ptx.AppendLine("    mul.wide.u32 %rd6, %r1, 4;");
+            ptx.AppendLine("    add.u64 %rd3, %rd0, %rd6;");
             ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd3];");
             ptx.AppendLine("    fma.rn.f32 %f0, %f1, %f1, %f0;");
+            ptx.AppendLine($"    add.u32 %r1, %r1, {ReductionBlockThreads};");
+            ptx.AppendLine("    bra REDUCE_NORM_LOOP;");
         }
-        ptx.AppendLine(atomic
-            ? "    add.u32 %r1, %r1, %r4;"
-            : $"    add.u32 %r1, %r1, {ReductionBlockThreads};");
-        ptx.AppendLine("    bra REDUCE_NORM_LOOP;");
         ptx.AppendLine("REDUCE_NORM_WARP:");
         EmitWarpSum(ptx, "%f0", "%f2");
         ptx.AppendLine("    and.b32 %r2, %r0, 31;");
@@ -1136,15 +1137,15 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         ptx.AppendLine(atomic
             ? "    @%p2 bra REDUCE_NORM_PUBLISH_WAIT;"
             : "    @%p2 bra REDUCE_NORM_DONE;");
-        ptx.AppendLine($"    setp.lt.u32 %p3, %r2, {ReductionWarpsPerBlock};");
-        ptx.AppendLine("    mov.f32 %f3, 0f00000000;");
-        ptx.AppendLine("    @!%p3 bra REDUCE_NORM_FINAL;");
+        ptx.AppendLine($"    setp.ge.u32 %p3, %r2, {ReductionWarpsPerBlock};");
+        ptx.AppendLine(atomic
+            ? "    @%p3 bra REDUCE_NORM_PUBLISH_WAIT;"
+            : "    @%p3 bra REDUCE_NORM_DONE;");
         ptx.AppendLine("    mul.wide.u32 %rd6, %r2, 4;");
         ptx.AppendLine("    mov.u64 %rd7, reduce_scratch;");
         ptx.AppendLine("    add.u64 %rd7, %rd7, %rd6;");
         ptx.AppendLine("    ld.shared.f32 %f3, [%rd7];");
-        ptx.AppendLine("REDUCE_NORM_FINAL:");
-        EmitWarpSum(ptx, "%f3", "%f4");
+        EmitHalfWarpSum(ptx, "%f3", "%f4");
         ptx.AppendLine("    setp.ne.u32 %p1, %r0, 0;");
         ptx.AppendLine(atomic
             ? "    @%p1 bra REDUCE_NORM_PUBLISH_WAIT;"
@@ -1155,10 +1156,15 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
             return End(ptx, "REDUCE_NORM_DONE");
         }
 
+        // Publish into reusable banks rather than materializing one partial per
+        // block. Sixteen addresses limit each bank to at most eight publishers,
+        // and RED avoids the unused atomic return value. The completion counter
+        // orders the final half-warp fold without a second kernel or host clear.
         ptx.AppendLine("    mov.u32 %r5, %ctaid.x;");
-        ptx.AppendLine("    mul.wide.u32 %rd3, %r5, 4;");
+        ptx.AppendLine($"    and.b32 %r6, %r5, {ReductionAccumulatorBanks - 1};");
+        ptx.AppendLine("    mul.wide.u32 %rd3, %r6, 4;");
         ptx.AppendLine("    add.u64 %rd4, %rd2, %rd3;");
-        ptx.AppendLine("    st.global.f32 [%rd4], %f3;");
+        ptx.AppendLine("    red.global.add.f32 [%rd4], %f3;");
         ptx.AppendLine("    membar.gl;");
         ptx.AppendLine($"    add.u64 %rd5, %rd2, {NormalizationWorkspaceCounterByteOffset};");
         ptx.AppendLine("    atom.global.add.u32 %r5, [%rd5], 1;");
@@ -1174,44 +1180,25 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         ptx.AppendLine("    ld.shared.u32 %r5, [%rd6];");
         ptx.AppendLine("    setp.eq.u32 %p4, %r5, 0;");
         ptx.AppendLine("    @%p4 bra REDUCE_NORM_DONE;");
+        ptx.AppendLine("    membar.gl;");
 
-        // The last block performs the cross-block fold in fixed block-index
-        // order. At most 128 slots are live for the supported exact shapes.
-        ptx.AppendLine("    mov.u32 %r6, %nctaid.x;");
-        ptx.AppendLine("    setp.lt.u32 %p4, %r0, %r6;");
-        ptx.AppendLine("    mov.f32 %f0, 0f00000000;");
-        ptx.AppendLine("    @!%p4 bra REDUCE_NORM_LAST_WARP;");
-        ptx.AppendLine("    mul.wide.u32 %rd3, %r0, 4;");
+        // The low half of warp zero loads and clears the sixteen banks. Its
+        // shuffle mask names exactly those active lanes, avoiding the divergent
+        // full-warp helper path while reducing the fold to four inline SHFLs.
+        // Only thread zero commits the result and counter reset.
+        ptx.AppendLine("    setp.ne.u32 %p5, %r3, 0;");
+        ptx.AppendLine("    @%p5 bra REDUCE_NORM_DONE;");
+        ptx.AppendLine($"    setp.ge.u32 %p5, %r2, {ReductionAccumulatorBanks};");
+        ptx.AppendLine("    @%p5 bra REDUCE_NORM_DONE;");
+        ptx.AppendLine("    mul.wide.u32 %rd3, %r2, 4;");
         ptx.AppendLine("    add.u64 %rd4, %rd2, %rd3;");
         ptx.AppendLine("    ld.global.f32 %f0, [%rd4];");
         ptx.AppendLine("    mov.f32 %f1, 0f00000000;");
         ptx.AppendLine("    st.global.f32 [%rd4], %f1;");
-        ptx.AppendLine("REDUCE_NORM_LAST_WARP:");
-        EmitWarpSum(ptx, "%f0", "%f2");
-        ptx.AppendLine("    and.b32 %r2, %r0, 31;");
-        ptx.AppendLine("    shr.u32 %r3, %r0, 5;");
+        EmitHalfWarpSum(ptx, "%f0", "%f2");
         ptx.AppendLine("    setp.ne.u32 %p5, %r2, 0;");
-        ptx.AppendLine("    @%p5 bra REDUCE_NORM_LAST_BARRIER;");
-        ptx.AppendLine("    mul.wide.u32 %rd3, %r3, 4;");
-        ptx.AppendLine("    mov.u64 %rd4, reduce_scratch;");
-        ptx.AppendLine("    add.u64 %rd4, %rd4, %rd3;");
-        ptx.AppendLine("    st.shared.f32 [%rd4], %f0;");
-        ptx.AppendLine("REDUCE_NORM_LAST_BARRIER:");
-        ptx.AppendLine("    bar.sync 0;");
-        ptx.AppendLine("    setp.ne.u32 %p5, %r3, 0;");
         ptx.AppendLine("    @%p5 bra REDUCE_NORM_DONE;");
-        ptx.AppendLine($"    setp.lt.u32 %p5, %r2, {ReductionWarpsPerBlock};");
-        ptx.AppendLine("    mov.f32 %f3, 0f00000000;");
-        ptx.AppendLine("    @!%p5 bra REDUCE_NORM_LAST_FINAL;");
-        ptx.AppendLine("    mul.wide.u32 %rd3, %r2, 4;");
-        ptx.AppendLine("    mov.u64 %rd4, reduce_scratch;");
-        ptx.AppendLine("    add.u64 %rd4, %rd4, %rd3;");
-        ptx.AppendLine("    ld.shared.f32 %f3, [%rd4];");
-        ptx.AppendLine("REDUCE_NORM_LAST_FINAL:");
-        EmitWarpSum(ptx, "%f3", "%f4");
-        ptx.AppendLine("    setp.ne.u32 %p5, %r0, 0;");
-        ptx.AppendLine("    @%p5 bra REDUCE_NORM_DONE;");
-        ptx.AppendLine("    st.global.f32 [%rd1], %f3;");
+        ptx.AppendLine("    st.global.f32 [%rd1], %f0;");
         ptx.AppendLine("    mov.u32 %r5, 0;");
         ptx.AppendLine($"    add.u64 %rd5, %rd2, {NormalizationWorkspaceCounterByteOffset};");
         ptx.AppendLine("    st.global.u32 [%rd5], %r5;");
@@ -1337,6 +1324,17 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         {
             ptx.AppendLine($"    mov.b32 %r8, {value};");
             ptx.AppendLine($"    shfl.sync.bfly.b32 %r9, %r8, {delta}, 31, 0xffffffff;");
+            ptx.AppendLine($"    mov.b32 {temporary}, %r9;");
+            ptx.AppendLine($"    add.rn.f32 {value}, {value}, {temporary};");
+        }
+    }
+
+    private static void EmitHalfWarpSum(StringBuilder ptx, string value, string temporary)
+    {
+        foreach (int delta in new[] { 8, 4, 2, 1 })
+        {
+            ptx.AppendLine($"    mov.b32 %r8, {value};");
+            ptx.AppendLine($"    shfl.sync.bfly.b32 %r9, %r8, {delta}, 15, 0x0000ffff;");
             ptx.AppendLine($"    mov.b32 {temporary}, %r9;");
             ptx.AppendLine($"    add.rn.f32 {value}, {value}, {temporary};");
         }
@@ -1598,8 +1596,9 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
                 ? $"single-pass-grid-stride-d64-w{GetFusedBackwardWarpsPerBlock(operation)}" +
                     $"-b{GetFusedBackwardMaxBlocks(operation)}-r{rows}"
                 : atomicReduction
-                ? $"bounded-workspace-last-block-reduction-t{ReductionBlockThreads}" +
-                    $"-b{ReductionMaxBlocks}-r{rows}"
+                ? $"uniform-v4x{GetReductionVectorsPerThread(rows)}-banked-red-half-warp" +
+                    $"-t{ReductionBlockThreads}-b{ReductionMaxBlocks}" +
+                    $"-a{ReductionAccumulatorBanks}-r{rows}"
                 : deterministicReduction
                 ? $"single-block-reduction-t{ReductionBlockThreads}-r{rows}"
                 : atomicParameterGradient
@@ -1633,19 +1632,21 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
                 ["row-count"] = rows.ToString(CultureInfo.InvariantCulture),
                 ["global-intermediates"] = fusedBackward
                     ? "bounded-reusable-accumulators"
-                    : atomicReduction ? "bounded-block-partials" : "none",
+                    : atomicReduction ? "bounded-reusable-accumulators" : "none",
                 ["accumulator-banks"] = fusedBackward
                     ? FusedBackwardAccumulatorBanks.ToString(CultureInfo.InvariantCulture)
+                    : atomicReduction
+                    ? ReductionAccumulatorBanks.ToString(CultureInfo.InvariantCulture)
                     : "none",
                 ["temporary-device-allocation"] = RequiresPersistentWorkspace(operation)
                     ? "persistent-prewarm-workspace" : "none",
                 ["shape-stride-parameters"] = "none",
-                ["deterministic"] = atomicParameterGradient || fusedBackward
+                ["deterministic"] = atomicParameterGradient || fusedBackward || atomicReduction
                     ? "false" : "true",
                 ["dataflow"] = fusedBackward
                     ? "one grid-stride pass retains row values in registers for grad-input and parameter partials; shared memory folds warp cohorts before one atomic per block/output"
                     : atomicReduction
-                    ? "coalesced 16-byte loads feed four register FMAs; bounded grid-stride accumulation, warp/shared block fold, then one global atomic per block"
+                    ? "exact specializations issue one or two uniform coalesced 16-byte loads per thread with no input bounds loop; register FMAs and warp/shared folds publish through sixteen reusable RED banks; the last block performs a half-warp fold and self-reset"
                     : deterministicReduction
                     ? "one 512-thread block uses coalesced scalar loads, register FMAs, and a fixed warp/shared fold before the single scalar store"
                     : atomicParameterGradient
@@ -1761,6 +1762,21 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
                 FusedRmsNormBackwardMaxBlocks,
             _ => throw new ArgumentOutOfRangeException(nameof(operation))
         };
+
+    private static int GetReductionBlockCount(int rows) => Math.Min(
+        (rows * (Dimension / 4) + ReductionBlockThreads - 1) /
+            ReductionBlockThreads,
+        ReductionMaxBlocks);
+
+    private static int GetReductionVectorsPerThread(int rows)
+    {
+        int vectorCount = rows * (Dimension / 4);
+        int threads = GetReductionBlockCount(rows) * ReductionBlockThreads;
+        if (vectorCount % threads != 0)
+            throw new InvalidOperationException(
+                "Exact L2 specialization must assign a uniform vector count per thread.");
+        return vectorCount / threads;
+    }
 
     private static int GetFusedBackwardWarpsPerBlock(
         DirectPtxRowNormalizationOperation operation) => operation switch

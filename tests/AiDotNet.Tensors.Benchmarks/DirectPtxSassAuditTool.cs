@@ -30,7 +30,7 @@ internal static class DirectPtxSassAuditTool
         IReadOnlyDictionary<string, ManifestCell> manifest = ReadManifest(manifestPath);
         var report = new List<string>
         {
-            "source-key\tblueprint-id\tcubin-sha256\tentry\tregisters\tinstructions\tldg\tstg\tlds\tsts\tasync-copy\ttensor-core\tlocal-load\tlocal-store"
+            "source-key\tblueprint-id\tcubin-sha256\tentry\tregisters\tinstructions\tldg\tldg128\tstg\tlds\tsts\tred\tatomg\tshfl\tcall\tasync-copy\ttensor-core\tlocal-load\tlocal-store"
         };
         foreach (ManifestCell cell in manifest.Values.OrderBy(value => value.SourceKey, StringComparer.Ordinal))
         {
@@ -50,6 +50,7 @@ internal static class DirectPtxSassAuditTool
                     "Final SASS uses local memory for " + cell.BlueprintId +
                     ": LDL=" + metrics.LocalLoads.ToString(CultureInfo.InvariantCulture) +
                     ", STL=" + metrics.LocalStores.ToString(CultureInfo.InvariantCulture));
+            EnforceSpecializationSass(cell, metrics);
             report.Add(string.Join("\t",
                 cell.SourceKey,
                 cell.BlueprintId,
@@ -58,9 +59,14 @@ internal static class DirectPtxSassAuditTool
                 metrics.Registers.ToString(CultureInfo.InvariantCulture),
                 metrics.Instructions.ToString(CultureInfo.InvariantCulture),
                 metrics.GlobalLoads.ToString(CultureInfo.InvariantCulture),
+                metrics.Vector128GlobalLoads.ToString(CultureInfo.InvariantCulture),
                 metrics.GlobalStores.ToString(CultureInfo.InvariantCulture),
                 metrics.SharedLoads.ToString(CultureInfo.InvariantCulture),
                 metrics.SharedStores.ToString(CultureInfo.InvariantCulture),
+                metrics.GlobalReductions.ToString(CultureInfo.InvariantCulture),
+                metrics.GlobalAtomics.ToString(CultureInfo.InvariantCulture),
+                metrics.Shuffles.ToString(CultureInfo.InvariantCulture),
+                metrics.Calls.ToString(CultureInfo.InvariantCulture),
                 metrics.AsyncCopies.ToString(CultureInfo.InvariantCulture),
                 metrics.TensorCoreInstructions.ToString(CultureInfo.InvariantCulture),
                 metrics.LocalLoads.ToString(CultureInfo.InvariantCulture),
@@ -105,7 +111,9 @@ internal static class DirectPtxSassAuditTool
         string? entry = null;
         int registers = -1;
         int instructions = 0;
-        int ldg = 0, stg = 0, lds = 0, sts = 0, async = 0, tensor = 0, ldl = 0, stl = 0;
+        int ldg = 0, ldg128 = 0, stg = 0, lds = 0, sts = 0;
+        int red = 0, atomg = 0, shfl = 0, call = 0;
+        int async = 0, tensor = 0, ldl = 0, stl = 0;
         bool active = false;
         foreach (string rawLine in sass.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries))
         {
@@ -142,15 +150,47 @@ internal static class DirectPtxSassAuditTool
             if (HasMnemonic(line, "LDL")) ldl++;
             if (HasMnemonic(line, "STL")) stl++;
             if (HasMnemonic(line, "LDGSTS") || HasMnemonic(line, "CPASYNC")) async++;
-            if (HasMnemonic(line, "LDG")) ldg++;
+            if (HasMnemonic(line, "LDG"))
+            {
+                ldg++;
+                if (line.IndexOf(".128", StringComparison.Ordinal) >= 0) ldg128++;
+            }
             if (HasMnemonic(line, "STG")) stg++;
             if (HasMnemonic(line, "LDS")) lds++;
             if (HasMnemonic(line, "STS")) sts++;
+            if (HasMnemonic(line, "RED")) red++;
+            if (HasMnemonic(line, "ATOMG")) atomg++;
+            if (HasMnemonic(line, "SHFL")) shfl++;
+            if (HasMnemonic(line, "CALL")) call++;
             if (HasMnemonic(line, "HMMA") || HasMnemonic(line, "IMMA") || HasMnemonic(line, "MMA")) tensor++;
         }
         if (entry == null || registers < 0 || instructions == 0)
             throw new InvalidDataException("No auditable AiDotNet direct entry point was found in " + source);
-        return new SassMetrics(entry, registers, instructions, ldg, stg, lds, sts, async, tensor, ldl, stl);
+        return new SassMetrics(entry, registers, instructions, ldg, ldg128, stg, lds, sts,
+            red, atomg, shfl, call, async, tensor, ldl, stl);
+    }
+
+    private static void EnforceSpecializationSass(ManifestCell cell, SassMetrics metrics)
+    {
+        if (!string.Equals(metrics.EntryPoint, "aidotnet_reduce_norm_l2_atomic_d64",
+                StringComparison.Ordinal))
+            return;
+
+        int expectedVectorLoads = cell.BlueprintId.IndexOf("-r8192", StringComparison.Ordinal) >= 0
+            ? 2 : 1;
+        if (metrics.Registers > 24 ||
+            metrics.Vector128GlobalLoads != expectedVectorLoads ||
+            metrics.GlobalReductions != 1 ||
+            metrics.GlobalAtomics != 1 ||
+            metrics.Shuffles < 13)
+            throw new InvalidDataException(
+                "Banked L2 SASS contract failed for " + cell.BlueprintId +
+                ": registers=" + metrics.Registers.ToString(CultureInfo.InvariantCulture) +
+                ", LDG.128=" + metrics.Vector128GlobalLoads.ToString(CultureInfo.InvariantCulture) +
+                " (expected " + expectedVectorLoads.ToString(CultureInfo.InvariantCulture) + ")" +
+                ", RED=" + metrics.GlobalReductions.ToString(CultureInfo.InvariantCulture) +
+                ", ATOMG=" + metrics.GlobalAtomics.ToString(CultureInfo.InvariantCulture) +
+                ", SHFL=" + metrics.Shuffles.ToString(CultureInfo.InvariantCulture) + ".");
     }
 
     private static bool HasMnemonic(string instruction, string mnemonic)
@@ -211,9 +251,14 @@ internal static class DirectPtxSassAuditTool
         int Registers,
         int Instructions,
         int GlobalLoads,
+        int Vector128GlobalLoads,
         int GlobalStores,
         int SharedLoads,
         int SharedStores,
+        int GlobalReductions,
+        int GlobalAtomics,
+        int Shuffles,
+        int Calls,
         int AsyncCopies,
         int TensorCoreInstructions,
         int LocalLoads,
