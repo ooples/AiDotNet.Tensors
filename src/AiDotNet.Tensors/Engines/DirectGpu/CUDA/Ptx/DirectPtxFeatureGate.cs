@@ -42,6 +42,16 @@ internal static class DirectPtxFeatureGate
 
     /// <summary>Test-only override. Null restores environment-based behavior.</summary>
     internal static bool? TestOverride { get; set; }
+    /// <summary>Benchmark-only access to measured cells that have not passed promotion.</summary>
+    internal static bool FusedLinearExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to mixed-precision cells that have not passed promotion.</summary>
+    internal static bool MixedPrecisionLinearExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to quantized cells that have not passed promotion.</summary>
+    internal static bool QuantizedLinearExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to normalization cells that have not passed promotion.</summary>
+    internal static bool NormalizationExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to convolution cells that have not passed promotion.</summary>
+    internal static bool ConvolutionExperimentOverride { get; set; }
 
     internal static bool IsEnabled => IsAttentionEnabled;
 
