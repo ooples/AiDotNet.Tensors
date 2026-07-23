@@ -187,6 +187,18 @@ public static class PtxParityRegistry
             "memory pipeline (coalesced cp.async staging + ldmatrix + multi-warp cooperation) -- a multi-day " +
             "kernel. Deferred."),
 
+        new PtxParitySpec("PtxWinogradWmmaFullyFusedKernel", PtxParityStatus.Deferred,
+            "Winograd F(2,3) fully-fused FP16 TC conv: input transform + GEMM + output transform, 1 kernel (#841 3x3)",
+            "cuDNN-structure single kernel: phase 1 computes V = B^T d B straight into shared (no global V, no " +
+            "51MB round-trip), phase 2 runs the per-warp position mma reading B from shared V + A from precomputed " +
+            "fp16 U, phase 3 exchanges M in shared and applies A^T M A + bias + ReLU. Verified correct on-device " +
+            "(<= 5e-2). HONEST perf (idle 3080 @ 2040MHz, ResNet C64): ~1195us -- SLOWER than the separate-kernel " +
+            "STAGED pipeline (~554us) and coop (~613us). Root cause found by measurement: grid.y=K/16=4 makes each " +
+            "channel-block recompute V for the same 8 tiles -> 4x redundant input-transform work, which outweighs " +
+            "eliminating the V round-trip. The correct fusion must process ALL K channels per tile-block (V computed " +
+            "once); this kernel proves fusion alone is not the win. Best 3x3 to date = STAGED 554us, 1.8x off cuDNN " +
+            "fp16+ReLU (308us idle, same window) -- down from 11x. Deferred."),
+
         new PtxParitySpec("PtxWinogradWmmaCoopKernel", PtxParityStatus.Deferred,
             "Winograd F(2,3) cooperative FP16 TC conv: one position per warp, M via shared (#841 3x3)",
             "attacks the occupancy question head-on: 16 warps, one Winograd position each (4 accumulators/thread " +
