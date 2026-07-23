@@ -2,10 +2,13 @@
 """Exact-shape PyTorch CUDA competitors for issue #838 normalization kernels."""
 
 import argparse
+import csv
 import glob
 import importlib.util
+import io
 import os
 import statistics
+import subprocess
 import sys
 import time
 
@@ -75,6 +78,77 @@ def discard(value):
     del value
 
 
+def external_python_processes():
+    if os.name == "nt":
+        completed = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        for fields in csv.reader(io.StringIO(completed.stdout)):
+            if len(fields) < 2 or not fields[0].lower().startswith("python"):
+                continue
+            try:
+                yield int(fields[1])
+            except ValueError:
+                continue
+        return
+    completed = subprocess.run(
+        ["ps", "-eo", "pid=,comm="],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    for line in completed.stdout.splitlines():
+        fields = line.split(None, 1)
+        if len(fields) != 2 or not fields[1].lower().startswith("python"):
+            continue
+        try:
+            yield int(fields[0])
+        except ValueError:
+            continue
+
+
+def require_exclusive_cuda_benchmark_lane():
+    current_pid = os.getpid()
+    for process_id in external_python_processes():
+        if process_id != current_pid:
+            raise RuntimeError(
+                "External Python process detected before or during the CUDA "
+                f"benchmark lane: {process_id}"
+            )
+    completed = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-compute-apps=pid,process_name",
+            "--format=csv,noheader",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    for line in completed.stdout.splitlines():
+        fields = line.split(",", 1)
+        if len(fields) != 2 or "python" not in fields[1].lower():
+            continue
+        try:
+            process_id = int(fields[0].strip())
+        except ValueError:
+            continue
+        if process_id != current_pid:
+            raise RuntimeError(
+                "External Python CUDA workload detected; benchmark evidence is invalid: "
+                + line.strip()
+            )
+
+
 def measure_device(operation):
     for _ in range(WARMUPS):
         discard(operation())
@@ -141,6 +215,7 @@ def emit(run, extent, name, method, device, e2e, temporary_bytes):
 
 
 def benchmark(run, extent, name, operation, output_bytes, include_compile):
+    require_exclusive_cuda_benchmark_lane()
     try:
         emit(run, extent, name, "PyTorch eager",
              measure_device(operation), measure_e2e(operation),
@@ -148,6 +223,7 @@ def benchmark(run, extent, name, operation, output_bytes, include_compile):
     except Exception as exception:
         print(f"SKIP run={run} {name} eager: {type(exception).__name__}: {exception}")
         return
+    require_exclusive_cuda_benchmark_lane()
     if not include_compile:
         return
     try:
@@ -161,6 +237,7 @@ def benchmark(run, extent, name, operation, output_bytes, include_compile):
         del compiled
     except Exception as exception:
         print(f"SKIP run={run} {name} compile: {type(exception).__name__}: {exception}")
+    require_exclusive_cuda_benchmark_lane()
 
 
 def row_cells(run, include_compile, selected_rows=ROWS):
@@ -367,6 +444,7 @@ def main():
     if not torch.cuda.is_available():
         print("CUDA-enabled Python PyTorch is required.", file=sys.stderr)
         return 2
+    require_exclusive_cuda_benchmark_lane()
     torch.set_grad_enabled(False)
     print(
         f"GPU: {torch.cuda.get_device_name(0)}; torch={torch.__version__}; "

@@ -851,6 +851,7 @@ internal static class DirectPtxNormalizationExperiment
         bool baselineCaptureCompatible, bool directCaptureCompatible,
         int dispatchesPerAction)
     {
+        RequireExclusiveCudaBenchmarkLane();
         DirectPtxFeatureGate.TestOverride = false;
         baseline();
         backend.Synchronize();
@@ -882,6 +883,7 @@ internal static class DirectPtxNormalizationExperiment
             backend, direct, getDirectDispatchCount, name, dispatchesPerAction);
         long directAllocation = MeasureAllocation(
             backend, direct, getDirectDispatchCount, name, dispatchesPerAction);
+        RequireExclusiveCudaBenchmarkLane();
 
         double speedup = baselineDevice.Median / directDevice.Median;
         bool tail = directDevice.P95 <= baselineDevice.P95 * 1.10;
@@ -899,6 +901,63 @@ internal static class DirectPtxNormalizationExperiment
         Print(run, extent, name, "Direct PTX", directDevice, directE2e,
             directAllocation, directTemporaryBytes, directPersistentWorkspaceBytes,
             error, audit, secondaryAudit, speedup, advanceToCompetitor);
+    }
+
+    private static void RequireExclusiveCudaBenchmarkLane()
+    {
+        foreach (Process candidate in Process.GetProcesses())
+        {
+            using (candidate)
+            {
+                int candidateId;
+                string candidateName;
+                try
+                {
+                    candidateId = candidate.Id;
+                    candidateName = candidate.ProcessName;
+                }
+                catch
+                {
+                    // Protected/system processes are irrelevant when their
+                    // image name cannot be inspected. The CUDA process audit
+                    // below remains the authoritative device-side check.
+                    continue;
+                }
+                if (candidateId != Environment.ProcessId &&
+                    candidateName.StartsWith(
+                        "python", StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException(
+                        "External Python process detected before or during the CUDA " +
+                        $"benchmark lane: {candidateId}, {candidateName}");
+            }
+        }
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = "nvidia-smi",
+            Arguments = "--query-compute-apps=pid,process_name --format=csv,noheader",
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        using Process process = Process.Start(startInfo) ??
+            throw new InvalidOperationException(
+                "nvidia-smi is required to enforce an uncontended CUDA benchmark lane.");
+        string output = process.StandardOutput.ReadToEnd();
+        string error = process.StandardError.ReadToEnd();
+        process.WaitForExit();
+        if (process.ExitCode != 0)
+            throw new InvalidOperationException(
+                $"nvidia-smi CUDA process audit failed ({process.ExitCode}): {error.Trim()}");
+        string[] lines = output.Split(
+            new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+        foreach (string line in lines)
+        {
+            if (line.IndexOf("python", StringComparison.OrdinalIgnoreCase) >= 0)
+                throw new InvalidOperationException(
+                    "External Python CUDA workload detected; benchmark evidence is invalid: " +
+                    line.Trim());
+        }
     }
 
     private static Distribution MeasureDevice(

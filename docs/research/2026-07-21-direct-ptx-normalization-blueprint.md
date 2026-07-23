@@ -170,6 +170,11 @@ scopes (`row256`, `row2048`, and `row8192`) as the AiDotNet runner.
 screen; it is never a production-promotion result without the strongest clean
 PyTorch eager/compiled comparison.
 
+Both runners fail closed before and after every cell if any other OS-level
+Python process exists or any external Python PID appears in NVIDIA's compute
+process table. Checking both closes the observed startup race where a Python
+process existed before it registered its CUDA context.
+
 ## Evidence collected on RTX 3080 / SM86
 
 - All 14 focused correctness/routing/capture/allocation tests pass on net10
@@ -207,6 +212,14 @@ The earlier single-bank run cannot be used for promotion because two unrelated
 Python CUDA workloads held the GPU at 99% utilization. The four-bank candidate
 was not timed when a later `compress_medium.py` workload held utilization near
 28%; no contended absolute number is treated as release evidence.
+
+A later low-utilization-start attempt initially reported 7.95 us median /
+11.86 us p95 LayerNorm backward and 5.24 / 7.78 us RMSNorm backward. The
+`stage_a_uncompressed.py` process already existed at the OS level and registered
+CUDA during that run; unchanged forward controls and runs two/three slowed
+sharply. The entire attempt is rejected, including those promising first-run
+numbers. The new dual process guard reproduces this case and aborts before any
+cell can be reported.
 
 ## Rejected experiments retained as evidence
 
