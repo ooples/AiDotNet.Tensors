@@ -53,6 +53,9 @@ $expectedLaunches = switch ($Target) {
     'dense-linear' { 16 }
 }
 $metricNames = @(
+    'sass__inst_executed_register_spilling',
+    'sass__inst_executed_register_spilling_mem_local',
+    'sass__inst_executed_register_spilling_mem_shared',
     'smsp__sass_inst_executed_op_local.sum',
     'smsp__sass_inst_executed_op_local_ld.sum',
     'smsp__sass_inst_executed_op_local_st.sum',

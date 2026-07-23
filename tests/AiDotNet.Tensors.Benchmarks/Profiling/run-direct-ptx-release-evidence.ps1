@@ -224,6 +224,9 @@ function Read-DenseLinearNcuProof([string]$Path) {
     if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
     $resolved = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path
     $metricNames = @(
+        'sass__inst_executed_register_spilling',
+        'sass__inst_executed_register_spilling_mem_local',
+        'sass__inst_executed_register_spilling_mem_shared',
         'smsp__sass_inst_executed_op_local.sum',
         'smsp__sass_inst_executed_op_local_ld.sum',
         'smsp__sass_inst_executed_op_local_st.sum',
@@ -235,7 +238,7 @@ function Read-DenseLinearNcuProof([string]$Path) {
         'sm__maximum_warps_per_active_cycle_pct',
         'sm__warps_active.avg.pct_of_peak_sustained_active'
     )
-    $zeroMetricNames = @($metricNames[0..4])
+    $zeroMetricNames = @($metricNames[0..7])
     $csvLines = @(Get-Content -LiteralPath $resolved)
     $headerIndex = -1
     for ($index = 0; $index -lt $csvLines.Count; $index++) {

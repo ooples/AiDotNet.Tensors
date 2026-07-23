@@ -800,6 +800,8 @@ public partial class DirectPtxWmmaTests
         {
             System.IO.File.WriteAllText(path,
                 "\"sass__inst_executed_register_spilling.sum\",\"0\"\n" +
+                "\"sass__inst_executed_register_spilling_mem_local.sum\",\"0\"\n" +
+                "\"sass__inst_executed_register_spilling_mem_shared.sum\",\"0\"\n" +
                 "\"sass__inst_executed_local_loads\",\"0\"\n" +
                 "\"sass__inst_executed_local_stores.sum\",\"0\"\n" +
                 "\"l1tex__t_requests_pipe_lsu_mem_local_op_ld.sum\",\"0\"\n" +
@@ -815,6 +817,18 @@ public partial class DirectPtxWmmaTests
                 "\"l1tex__t_requests_pipe_lsu_mem_local_op_st\",\"0\"\n");
             DirectPtxProfilerEvidence spilling = DirectPtxProfilerEvidence.FromNcuCsv(path);
             Assert.False(spilling.ProvesZeroExecutedSpills);
+
+            System.IO.File.WriteAllText(path,
+                "\"sass__inst_executed_register_spilling.sum\",\"0\"\n" +
+                "\"sass__inst_executed_register_spilling_mem_local.sum\",\"0\"\n" +
+                "\"sass__inst_executed_register_spilling_mem_shared.sum\",\"2\"\n" +
+                "\"sass__inst_executed_local_loads\",\"0\"\n" +
+                "\"sass__inst_executed_local_stores.sum\",\"0\"\n" +
+                "\"l1tex__t_requests_pipe_lsu_mem_local_op_ld.sum\",\"0\"\n" +
+                "\"l1tex__t_requests_pipe_lsu_mem_local_op_st.sum\",\"0\"\n");
+            DirectPtxProfilerEvidence sharedSpilling = DirectPtxProfilerEvidence.FromNcuCsv(path);
+            Assert.False(sharedSpilling.ProvesZeroExecutedSpills);
+            Assert.Equal(2, sharedSpilling.RegisterSpillInstructions);
 
             System.IO.File.WriteAllText(path,
                 "\"sass__inst_executed_register_spilling\",\"0\"\n" +

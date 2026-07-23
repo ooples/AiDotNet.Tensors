@@ -337,6 +337,7 @@ internal sealed record DirectPtxProfilerEvidence(
         int observedGroups = 0;
         if (Contains("sass__inst_executed_register_spilling") ||
             Contains("sass__inst_executed_register_spilling_mem_local") ||
+            Contains("sass__inst_executed_register_spilling_mem_shared") ||
             Contains("smsp__sass_inst_executed_op_local")) observedGroups++;
         if (Contains("sass__inst_executed_local_loads") ||
             Contains("smsp__sass_inst_executed_op_local_ld")) observedGroups++;
@@ -346,6 +347,7 @@ internal sealed record DirectPtxProfilerEvidence(
         if (Contains("l1tex__t_requests_pipe_lsu_mem_local_op_st")) observedGroups++;
         return new DirectPtxProfilerEvidence(
             Get("sass__inst_executed_register_spilling", "sass__inst_executed_register_spilling_mem_local",
+                "sass__inst_executed_register_spilling_mem_shared",
                 "smsp__sass_inst_executed_op_local"),
             Get("sass__inst_executed_local_loads", "smsp__sass_inst_executed_op_local_ld"),
             Get("sass__inst_executed_local_stores", "smsp__sass_inst_executed_op_local_st"),
@@ -360,6 +362,8 @@ internal sealed record DirectPtxProfilerEvidence(
         value.StartsWith("sass__inst_executed_register_spilling.", StringComparison.Ordinal) ||
         value == "sass__inst_executed_register_spilling_mem_local" ||
         value.StartsWith("sass__inst_executed_register_spilling_mem_local.", StringComparison.Ordinal) ||
+        value == "sass__inst_executed_register_spilling_mem_shared" ||
+        value.StartsWith("sass__inst_executed_register_spilling_mem_shared.", StringComparison.Ordinal) ||
         value == "sass__inst_executed_local_loads" ||
         value.StartsWith("sass__inst_executed_local_loads.", StringComparison.Ordinal) ||
         value == "sass__inst_executed_local_stores" ||
