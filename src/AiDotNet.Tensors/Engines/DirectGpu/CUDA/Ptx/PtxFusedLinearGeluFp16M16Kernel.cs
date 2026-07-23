@@ -161,24 +161,23 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
         ptx.AppendLine("    mad.lo.u32 %r15, %r2, 8, %r4;");
         ptx.AppendLine("    shl.b32 %r17, %r6, 1;");
         ptx.AppendLine("    add.u32 %r15, %r15, %r17;");
-        // ldmatrix.x4 receives one naturally aligned row address for each of
-        // the four 8x8 quadrants from lane groups 0..3. The resulting four
-        // registers are already in the A-fragment order consumed by MMA.
-        ptx.AppendLine("    and.b32 %r20, %r1, 7;");
-        ptx.AppendLine("    shr.u32 %r21, %r1, 3;");
-        ptx.AppendLine("    and.b32 %r22, %r21, 1;");
-        ptx.AppendLine("    shl.b32 %r22, %r22, 8;");
-        ptx.AppendLine("    shr.u32 %r23, %r21, 1;");
+        // Supply the four A-matrix row sets required by ldmatrix.x4.
+        ptx.AppendLine("    and.b32 %r22, %r1, 7;");
+        ptx.AppendLine("    shr.u32 %r23, %r1, 3;");
+        ptx.AppendLine("    and.b32 %r19, %r23, 1;");
+        ptx.AppendLine("    shl.b32 %r19, %r19, 8;");
+        ptx.AppendLine("    shr.u32 %r23, %r23, 1;");
         ptx.AppendLine("    shl.b32 %r23, %r23, 4;");
-        ptx.AppendLine("    mad.lo.u32 %r20, %r20, 32, %r22;");
-        ptx.AppendLine("    add.u32 %r20, %r20, %r23;");
-        // The output-major weight panel is the physical transpose of the
-        // conceptual KxN B fragment. x2.trans loads both K halves directly
-        // into the column-major B-fragment order required by MMA.
+        ptx.AppendLine("    mad.lo.u32 %r22, %r22, 32, %r19;");
+        ptx.AppendLine("    add.u32 %r22, %r22, %r23;");
+        // The packed weights are already output-major: a normal x2 load maps
+        // its row fragments directly to the column-major MMA B registers.
+        // Duplicate the two sets of row addresses in the upper half-warp.
         ptx.AppendLine("    and.b32 %r21, %r1, 7;");
-        ptx.AppendLine("    shr.u32 %r22, %r1, 3;");
-        ptx.AppendLine("    shl.b32 %r22, %r22, 4;");
-        ptx.AppendLine("    mad.lo.u32 %r21, %r21, 32, %r22;");
+        ptx.AppendLine("    shr.u32 %r19, %r1, 3;");
+        ptx.AppendLine("    and.b32 %r19, %r19, 1;");
+        ptx.AppendLine("    shl.b32 %r19, %r19, 4;");
+        ptx.AppendLine("    mad.lo.u32 %r21, %r21, 32, %r19;");
         ptx.AppendLine("    setp.lt.u32 %p0, %r0, 128;");
         ptx.AppendLine("    mov.u64 %rd4, smem;");
         ptx.AppendLine("    cvt.u64.u32 %rd5, %r9;");
@@ -286,14 +285,14 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
         int weightsBase = bufferBase + aPanelBytes;
         int aSubpanel = subchunk * 512;
         int weightSubpanel = subchunk * outputsPerBlock * 16 * sizeof(ushort);
-        ptx.AppendLine("    cvt.u64.u32 %rd14, %r20;");
+        ptx.AppendLine("    cvt.u64.u32 %rd14, %r22;");
         ptx.AppendLine("    add.u64 %rd13, %rd4, %rd14;");
         ptx.AppendLine($"    ldmatrix.sync.aligned.m8n8.x4.shared.b16 " +
             $"{{%a0,%a1,%a2,%a3}}, [%rd13+{bufferBase + aSubpanel}];");
         ptx.AppendLine("    cvt.u64.u32 %rd14, %r21;");
         ptx.AppendLine("    add.u64 %rd13, %rd4, %rd14;");
         ptx.AppendLine("    add.u64 %rd13, %rd13, %rd9;");
-        ptx.AppendLine($"    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 " +
+        ptx.AppendLine($"    ldmatrix.sync.aligned.m8n8.x2.shared.b16 " +
             $"{{%b0,%b1}}, [%rd13+{weightsBase + weightSubpanel}];");
         ptx.AppendLine("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 " +
             "{%c0,%c1,%c2,%c3}, {%a0,%a1,%a2,%a3}, {%b0,%b1}, {%c0,%c1,%c2,%c3};");
@@ -323,7 +322,7 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
         var output = new DirectPtxExtent(Rows, outputFeatures);
         return new DirectPtxKernelBlueprint(
             Operation: "fused-linear-bias-gelu",
-            Version: 4,
+            Version: 5,
             Architecture: architecture,
             Variant: $"tensorcore-async-ldmatrix-fp16-fp32acc-m16-nblock{outputsPerBlock}-k{inputFeatures}-n{outputFeatures}",
             Tensors:
@@ -351,7 +350,7 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
                 ["accumulator"] = "mma-m16n8k16-fp32-register-fragment",
                 ["pipeline"] = "double-buffered-cp.async-16-byte-panels",
                 ["block-tile"] = $"M16-N{outputsPerBlock}",
-                ["shared-load"] = "warp-collective-ldmatrix-x4-A-and-x2-trans-B",
+                ["shared-load"] = "warp-collective-ldmatrix-x4-A-and-x2-B-from-output-major-panels",
                 ["shared-A"] = "packed-M16-panel-reused-by-four-warps",
                 ["epilogue"] = "bias-and-tanh-gelu-in-accumulator-registers",
                 ["output"] = "canonical-contiguous-row-major-fp32-single-store",

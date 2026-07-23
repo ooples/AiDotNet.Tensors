@@ -20,6 +20,7 @@ internal static class DirectPtxDenseLinearFullExperiment
     private const int Warmups = 30;
     private const int Samples = 101;
     private const int DeviceLaunches = 50;
+    private const int GraphOperationsPerReplay = 50;
     private const double Tolerance = 2e-4;
     private static string _deviceFingerprint = "n/a";
 
@@ -149,6 +150,7 @@ internal static class DirectPtxDenseLinearFullExperiment
             warmups = Warmups,
             samples = Samples,
             launches_per_device_sample = DeviceLaunches,
+            graph_operations_per_replay = GraphOperationsPerReplay,
             independent_runs = independentRuns
         }));
     }
@@ -792,7 +794,14 @@ internal static class DirectPtxDenseLinearFullExperiment
         double tolerance = Tolerance)
     {
         string environmentLabel = operation + "-" + method;
-        GpuBenchmarkEnvironment.RequireNoForeignCompute(environmentLabel + "-start");
+        // The process/suite admission checks reject active WDDM C+G work while
+        // the runner is idle. During the measured process, pmon can attribute
+        // this console's own output to WindowsTerminal as a stale C+G sample,
+        // even when whole-device utilization remains 0-1%. Route boundaries
+        // therefore continue to reject compute-only and Python processes but
+        // leave mixed-WDDM admission to the stable outer boundary.
+        GpuBenchmarkEnvironment.RequireNoForeignCompute(
+            environmentLabel + "-start", ignoreMixedWddmProcesses: true);
         try
         {
             launch();
@@ -810,7 +819,8 @@ internal static class DirectPtxDenseLinearFullExperiment
                 status = "unsupported",
                 reason = ex.Message
             }));
-            GpuBenchmarkEnvironment.RequireNoForeignCompute(environmentLabel + "-end");
+            GpuBenchmarkEnvironment.RequireNoForeignCompute(
+                environmentLabel + "-end", ignoreMixedWddmProcesses: true);
             return;
         }
         backend.Synchronize();
@@ -820,14 +830,20 @@ internal static class DirectPtxDenseLinearFullExperiment
         long allocation = MeasureAllocation(backend, launch);
         DeviceAllocation temporary = MeasureTemporaryDeviceAllocation(backend, launch);
         Print(run, operation, shape, method, work, device, endToEnd,
-            allocation, temporary, maxError, tolerance, resources);
+            allocation, temporary, maxError, tolerance, resources,
+            logicalOperationsPerCall: 1);
 
         if (!capture)
         {
-            GpuBenchmarkEnvironment.RequireNoForeignCompute(environmentLabel + "-end");
+            GpuBenchmarkEnvironment.RequireNoForeignCompute(
+                environmentLabel + "-end", ignoreMixedWddmProcesses: true);
             return;
         }
-        IntPtr graph = backend.CaptureGraph(launch);
+        void CaptureBatch()
+        {
+            for (int i = 0; i < GraphOperationsPerReplay; i++) launch();
+        }
+        IntPtr graph = backend.CaptureGraph(CaptureBatch);
         if (graph == IntPtr.Zero)
         {
             Console.WriteLine("dense_linear_graph_status_json=" + JsonSerializer.Serialize(new
@@ -839,7 +855,8 @@ internal static class DirectPtxDenseLinearFullExperiment
                 status = "unsupported",
                 reason = "CUDA graph capture returned a null executable graph"
             }));
-            GpuBenchmarkEnvironment.RequireNoForeignCompute(environmentLabel + "-end");
+            GpuBenchmarkEnvironment.RequireNoForeignCompute(
+                environmentLabel + "-end", ignoreMixedWddmProcesses: true);
             return;
         }
         try
@@ -851,25 +868,36 @@ internal static class DirectPtxDenseLinearFullExperiment
             GraphLaunch();
             backend.Synchronize();
             double graphError = error();
-            Distribution graphDevice = MeasureDevice(backend, GraphLaunch);
-            Distribution graphEndToEnd = MeasureEndToEnd(backend, GraphLaunch);
-            long graphAllocation = MeasureAllocation(backend, GraphLaunch);
+            Distribution graphDevice = MeasureDevice(
+                backend, GraphLaunch, GraphOperationsPerReplay);
+            Distribution graphEndToEnd = MeasureEndToEnd(
+                backend, GraphLaunch, GraphOperationsPerReplay);
+            long graphAllocation = MeasureAllocation(
+                backend, GraphLaunch, GraphOperationsPerReplay);
             DeviceAllocation graphTemporary =
                 MeasureTemporaryDeviceAllocation(backend, GraphLaunch);
             Print(run, operation, shape, method + " graph", work,
                 graphDevice, graphEndToEnd, graphAllocation,
-                graphTemporary, graphError, tolerance, resources);
+                graphTemporary, graphError, tolerance, resources,
+                GraphOperationsPerReplay);
         }
         finally
         {
             backend.DestroyCapturedGraph(graph);
         }
-        GpuBenchmarkEnvironment.RequireNoForeignCompute(environmentLabel + "-end");
+        GpuBenchmarkEnvironment.RequireNoForeignCompute(
+            environmentLabel + "-end", ignoreMixedWddmProcesses: true);
     }
 
-    private static Distribution MeasureDevice(CudaBackend backend, Action launch)
+    private static Distribution MeasureDevice(
+        CudaBackend backend,
+        Action launch,
+        int logicalOperationsPerCall = 1)
     {
-        for (int i = 0; i < Warmups; i++) launch();
+        int warmupCalls = DivideRoundUp(Warmups, logicalOperationsPerCall);
+        int callsPerSample = DivideRoundUp(DeviceLaunches, logicalOperationsPerCall);
+        int logicalOperationsPerSample = checked(callsPerSample * logicalOperationsPerCall);
+        for (int i = 0; i < warmupCalls; i++) launch();
         backend.Synchronize();
         var values = new double[Samples];
         using IGpuEvent start = backend.CreateEvent(enableTiming: true);
@@ -877,17 +905,22 @@ internal static class DirectPtxDenseLinearFullExperiment
         for (int sample = 0; sample < values.Length; sample++)
         {
             backend.RecordEvent(start, backend.DefaultStream);
-            for (int i = 0; i < DeviceLaunches; i++) launch();
+            for (int i = 0; i < callsPerSample; i++) launch();
             backend.RecordEvent(end, backend.DefaultStream);
             end.Synchronize();
-            values[sample] = backend.GetEventElapsedTime(start, end) * 1_000d / DeviceLaunches;
+            values[sample] = backend.GetEventElapsedTime(start, end) * 1_000d /
+                logicalOperationsPerSample;
         }
         return Summarize(values);
     }
 
-    private static Distribution MeasureEndToEnd(CudaBackend backend, Action launch)
+    private static Distribution MeasureEndToEnd(
+        CudaBackend backend,
+        Action launch,
+        int logicalOperationsPerCall = 1)
     {
-        for (int i = 0; i < Warmups; i++) launch();
+        int warmupCalls = DivideRoundUp(Warmups, logicalOperationsPerCall);
+        for (int i = 0; i < warmupCalls; i++) launch();
         backend.Synchronize();
         var values = new double[Samples];
         double scale = 1_000_000d / Stopwatch.Frequency;
@@ -896,23 +929,34 @@ internal static class DirectPtxDenseLinearFullExperiment
             long start = Stopwatch.GetTimestamp();
             launch();
             backend.Synchronize();
-            values[sample] = (Stopwatch.GetTimestamp() - start) * scale;
+            values[sample] = (Stopwatch.GetTimestamp() - start) * scale /
+                logicalOperationsPerCall;
         }
         return Summarize(values);
     }
 
-    private static long MeasureAllocation(CudaBackend backend, Action launch)
+    private static long MeasureAllocation(
+        CudaBackend backend,
+        Action launch,
+        int logicalOperationsPerCall = 1)
     {
         // Cross the tiered-JIT promotion threshold before opening the exact
         // per-thread allocation window. Otherwise a one-time delegate/code
         // promotion can be misreported as a few bytes per hot launch.
-        for (int i = 0; i < 64; i++) launch();
+        for (int i = 0; i < DivideRoundUp(64, logicalOperationsPerCall); i++) launch();
         backend.Synchronize();
         long before = GC.GetAllocatedBytesForCurrentThread();
         for (int i = 0; i < Samples; i++) launch();
-        long result = (GC.GetAllocatedBytesForCurrentThread() - before) / Samples;
+        long result = (GC.GetAllocatedBytesForCurrentThread() - before) /
+            checked(Samples * logicalOperationsPerCall);
         backend.Synchronize();
         return result;
+    }
+
+    private static int DivideRoundUp(int value, int divisor)
+    {
+        if (divisor <= 0) throw new ArgumentOutOfRangeException(nameof(divisor));
+        return checked((value + divisor - 1) / divisor);
     }
 
     private static DeviceAllocation MeasureTemporaryDeviceAllocation(
@@ -962,7 +1006,7 @@ internal static class DirectPtxDenseLinearFullExperiment
         int run, string operation, string shape, string method, double work,
         Distribution device, Distribution endToEnd,
         long allocation, DeviceAllocation temporary, double maxError,
-        double tolerance, Resources resources)
+        double tolerance, Resources resources, int logicalOperationsPerCall)
     {
         double gflops = work / (device.Median * 1e-6) / 1e9;
         Console.WriteLine(
@@ -980,6 +1024,7 @@ internal static class DirectPtxDenseLinearFullExperiment
             operation,
             shape,
             method,
+            logical_operations_per_call = logicalOperationsPerCall,
             work_flops = work,
             device_mean_us = device.Mean,
             device_median_us = device.Median,

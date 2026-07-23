@@ -224,7 +224,8 @@ public sealed partial class CudaBackend
                 out selected);
         if (!persisted && DirectPtxFeatureGate.IsAutotuneEnabled)
         {
-            double bestMilliseconds = double.PositiveInfinity;
+            double n64MedianMilliseconds = double.NaN;
+            double n32MedianMilliseconds = double.NaN;
             lock (GpuDispatchLock)
             {
                 foreach (int candidate in DirectPtxDenseLinearAutotuner.Candidates(
@@ -235,7 +236,7 @@ public sealed partial class CudaBackend
                     if (!_directPtxFp16TensorCoreLinearKernels.TryGetValue(
                             key, out PtxFusedLinearGeluFp16M16Kernel? kernel))
                         kernel = CreateAndCacheDirectPtxFp16TensorCoreLinearSlow(key);
-                    float milliseconds = _directPtxRuntime!.MeasureKernelMilliseconds(
+                    float[] samples = _directPtxRuntime!.MeasureKernelSamples(
                         () => kernel.Launch(
                             DirectPtxTensorView.Create(
                                 inputHalf, kernel.Blueprint.Tensors[0]),
@@ -245,19 +246,24 @@ public sealed partial class CudaBackend
                                 biasFloat, kernel.Blueprint.Tensors[2]),
                             DirectPtxTensorView.Create(
                                 outputFloat, kernel.Blueprint.Tensors[3])),
-                        warmup: 3, iterations: 12);
-                    if (milliseconds < bestMilliseconds)
-                    {
-                        bestMilliseconds = milliseconds;
-                        selected = candidate;
-                    }
+                        warmup: 10, samples: 11, launchesPerSample: 100);
+                    double medianMilliseconds =
+                        DirectPtxDenseLinearAutotuner.MedianMilliseconds(samples);
+                    if (candidate == 64) n64MedianMilliseconds = medianMilliseconds;
+                    else if (candidate == 32) n32MedianMilliseconds = medianMilliseconds;
                 }
             }
+            selected = DirectPtxDenseLinearAutotuner.SelectWinner(
+                n64MedianMilliseconds, n32MedianMilliseconds);
+            double bestMilliseconds = selected == 64
+                ? n64MedianMilliseconds
+                : n32MedianMilliseconds;
             double work = 2d * PtxFusedLinearGeluFp16M16Kernel.Rows *
                 plan.InputFeatures * plan.OutputFeatures;
             DirectPtxDenseLinearAutotuner.Store(
                 _directPtxRuntime!, plan.InputFeatures, plan.OutputFeatures,
-                selected, bestMilliseconds, work / (bestMilliseconds * 1_000_000d));
+                selected, bestMilliseconds, work / (bestMilliseconds * 1_000_000d),
+                n64MedianMilliseconds, n32MedianMilliseconds);
         }
         _directPtxFp16TensorCoreLinearPlans.Set(plan, selected);
         return selected;

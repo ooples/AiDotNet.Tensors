@@ -86,6 +86,11 @@ public static class PtxParityRegistry
             "driver-only PTX-vs-fp64-oracle and public-route tests exist, but the output-major weight " +
             "contract has no equivalent existing-CUDA public route in the parity harness yet; add that " +
             "layout-explicit baseline before classifying this as three-way parity."),
+        new PtxParitySpec("PtxFusedLinearGeluFp16M16Kernel", PtxParityStatus.Deferred,
+            "exact-shape FP16 Tensor Core fused linear + GELU (#836)",
+            "driver-only PTX-vs-fp64-oracle and exact-cubin tests cover the two admitted transformer " +
+            "shapes; the resident NVIDIA and compiled-PyTorch championship matrix must pass before " +
+            "classifying this experimental specialization as three-way parity."),
         new PtxParitySpec("PtxFusedLinearTiledKernel", PtxParityStatus.Deferred,
             "general-M fused linear + bias + activation (#836)",
             "driver-only PTX-vs-fp64-oracle coverage exists for None, ReLU, and GELU. The tiled route is " +

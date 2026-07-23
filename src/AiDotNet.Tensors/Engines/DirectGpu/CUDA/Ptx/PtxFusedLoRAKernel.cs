@@ -132,39 +132,94 @@ internal sealed class PtxFusedLoRAKernel : IDisposable
         ptx.AppendLine("    .reg .b64 %rd<24>;");
         ptx.AppendLine("    .reg .f32 %f<8>;");
         ptx.AppendLine($"    .shared .align 16 .b8 projection[{rank * sizeof(float)}];");
+        ptx.AppendLine("    .shared .align 16 .b8 projection_partials[256];");
         ptx.AppendLine("    ld.param.u64 %rd0, [input_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd1, [base_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd2, [lora_a_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd3, [lora_b_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd4, [output_ptr];");
         ptx.AppendLine("    mov.u64 %rd5, projection;");
+        ptx.AppendLine("    mov.u64 %rd14, projection_partials;");
         ptx.AppendLine("    mov.u32 %r0, %tid.x;");
         ptx.AppendLine("    mov.u32 %r1, %ctaid.x;");
         ptx.AppendLine($"    mul.wide.u32 %rd6, %r1, {inputRowBytes};");
         ptx.AppendLine("    add.u64 %rd7, %rd0, %rd6;");
 
-        // Only the first R threads compute projection[r]. All threads reach the barrier.
-        ptx.AppendLine($"    setp.ge.u32 %p0, %r0, {rank};");
-        ptx.AppendLine("    @%p0 bra.uni LORA_PROJECTION_DONE;");
+        // Lanes are arranged as four K contributors for each eight-rank group.
+        // All eight warps partition K in steps of 32, so loraA[K,R] is read in
+        // contiguous eight-float segments instead of one strided rank column.
+        // A 64-float shared fold joins the eight warp partials; lanes 0..7 of
+        // warp zero publish the final rank group.
+        ptx.AppendLine("    and.b32 %r5, %r0, 31;");
+        ptx.AppendLine("    shr.u32 %r6, %r0, 5;");
+        ptx.AppendLine("    and.b32 %r7, %r5, 7;");
+        ptx.AppendLine("    shr.u32 %r8, %r5, 3;");
+        ptx.AppendLine("    mov.u32 %r9, 0;");
+        ptx.AppendLine("LORA_PROJECTION_RANK_LOOP:");
+        ptx.AppendLine($"    setp.ge.u32 %p4, %r9, {rank};");
+        ptx.AppendLine("    @%p4 bra.uni LORA_PROJECTION_DONE;");
+        ptx.AppendLine("    add.u32 %r10, %r9, %r7;");
+        ptx.AppendLine($"    setp.ge.u32 %p0, %r10, {rank};");
         ptx.AppendLine("    mov.f32 %f0, 0f00000000;");
-        ptx.AppendLine("    mov.u32 %r2, 0;");
+        ptx.AppendLine("    @%p0 bra LORA_REDUCE_PROJECTION;");
+        ptx.AppendLine("    mad.lo.u32 %r2, %r6, 4, %r8;");
         ptx.AppendLine("LORA_INPUT_LOOP:");
         ptx.AppendLine($"    setp.ge.u32 %p1, %r2, {inputFeatures};");
-        ptx.AppendLine("    @%p1 bra.uni LORA_STORE_PROJECTION;");
+        ptx.AppendLine("    @%p1 bra.uni LORA_REDUCE_PROJECTION;");
         ptx.AppendLine("    mul.wide.u32 %rd8, %r2, 4;");
         ptx.AppendLine("    add.u64 %rd9, %rd7, %rd8;");
         ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd9];");
         ptx.AppendLine($"    mul.wide.u32 %rd10, %r2, {aRowBytes};");
-        ptx.AppendLine("    mul.wide.u32 %rd11, %r0, 4;");
+        ptx.AppendLine("    mul.wide.u32 %rd11, %r10, 4;");
         ptx.AppendLine("    add.u64 %rd12, %rd2, %rd10;");
         ptx.AppendLine("    add.u64 %rd12, %rd12, %rd11;");
         ptx.AppendLine("    ld.global.nc.f32 %f2, [%rd12];");
         ptx.AppendLine("    fma.rn.f32 %f0, %f1, %f2, %f0;");
-        ptx.AppendLine("    add.u32 %r2, %r2, 1;");
+        ptx.AppendLine("    add.u32 %r2, %r2, 32;");
         ptx.AppendLine("    bra.uni LORA_INPUT_LOOP;");
-        ptx.AppendLine("LORA_STORE_PROJECTION:");
+        ptx.AppendLine("LORA_REDUCE_PROJECTION:");
+        foreach (int offset in new[] { 8, 16 })
+        {
+            ptx.AppendLine("    mov.b32 %r12, %f0;");
+            ptx.AppendLine(
+                $"    shfl.sync.down.b32 %r13, %r12, {offset}, 31, 0xffffffff;");
+            ptx.AppendLine("    mov.b32 %f1, %r13;");
+            ptx.AppendLine("    add.rn.f32 %f0, %f0, %f1;");
+        }
+        ptx.AppendLine("    setp.ne.u32 %p2, %r8, 0;");
+        ptx.AppendLine("    @%p2 bra LORA_PARTIAL_STORED;");
+        ptx.AppendLine("    mad.lo.u32 %r11, %r7, 8, %r6;");
+        ptx.AppendLine("    mul.wide.u32 %rd8, %r11, 4;");
+        ptx.AppendLine("    add.u64 %rd9, %rd14, %rd8;");
+        ptx.AppendLine("    st.shared.f32 [%rd9], %f0;");
+        ptx.AppendLine("LORA_PARTIAL_STORED:");
+        ptx.AppendLine("    bar.sync 0;");
+        ptx.AppendLine("    setp.ne.u32 %p2, %r6, 0;");
+        ptx.AppendLine("    @%p2 bra.uni LORA_PROJECTION_GROUP_DONE;");
+        ptx.AppendLine("    mad.lo.u32 %r11, %r7, 8, %r8;");
+        ptx.AppendLine("    mul.wide.u32 %rd8, %r11, 4;");
+        ptx.AppendLine("    add.u64 %rd9, %rd14, %rd8;");
+        ptx.AppendLine("    ld.shared.f32 %f0, [%rd9];");
+        ptx.AppendLine("    ld.shared.f32 %f1, [%rd9+16];");
+        ptx.AppendLine("    add.rn.f32 %f0, %f0, %f1;");
+        foreach (int offset in new[] { 8, 16 })
+        {
+            ptx.AppendLine("    mov.b32 %r12, %f0;");
+            ptx.AppendLine(
+                $"    shfl.sync.down.b32 %r13, %r12, {offset}, 31, 0xffffffff;");
+            ptx.AppendLine("    mov.b32 %f1, %r13;");
+            ptx.AppendLine("    add.rn.f32 %f0, %f0, %f1;");
+        }
+        ptx.AppendLine("    setp.ne.u32 %p2, %r8, 0;");
+        ptx.AppendLine("    @%p2 bra LORA_PROJECTION_GROUP_DONE;");
+        ptx.AppendLine("    @%p0 bra LORA_PROJECTION_GROUP_DONE;");
+        ptx.AppendLine("    mul.wide.u32 %rd11, %r10, 4;");
         ptx.AppendLine("    add.u64 %rd13, %rd5, %rd11;");
         ptx.AppendLine("    st.shared.f32 [%rd13], %f0;");
+        ptx.AppendLine("LORA_PROJECTION_GROUP_DONE:");
+        ptx.AppendLine("    bar.sync 0;");
+        ptx.AppendLine("    add.u32 %r9, %r9, 8;");
+        ptx.AppendLine("    bra.uni LORA_PROJECTION_RANK_LOOP;");
         ptx.AppendLine("LORA_PROJECTION_DONE:");
         ptx.AppendLine("    bar.sync 0;");
 
@@ -244,7 +299,7 @@ internal sealed class PtxFusedLoRAKernel : IDisposable
         var b = new DirectPtxExtent(rank, outputFeatures);
         return new DirectPtxKernelBlueprint(
             Operation: "fused-lora-forward",
-            Version: 1,
+            Version: 2,
             Architecture: architecture,
             Variant: $"fp32-b{batch}-i{inputFeatures}-r{rank}-o{outputFeatures}-s{PtxCompat.SingleToInt32Bits(scaling):x8}",
             Tensors:
@@ -262,14 +317,15 @@ internal sealed class PtxFusedLoRAKernel : IDisposable
             ],
             ResourceBudget: new DirectPtxResourceBudget(
                 MaxRegistersPerThread: 40,
-                MaxStaticSharedBytes: rank * sizeof(float),
+                MaxStaticSharedBytes: rank * sizeof(float) + 256,
                 MaxLocalBytesPerThread: 0,
                 MinBlocksPerMultiprocessor: 2),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["formula"] = "baseOutput + scaling * ((input @ loraA) @ loraB)",
                 ["scaling-bits"] = PtxCompat.SingleToInt32Bits(scaling).ToString("x8", CultureInfo.InvariantCulture),
-                ["intermediate"] = "shared-projection-per-row",
+                ["intermediate"] = "warp-reduced-shared-projection-per-row",
+                ["projection"] = "eight-warp-coalesced-kxr-loads-two-stage-shuffle-reduction",
                 ["global-intermediates"] = "none",
                 ["temporary-device-allocation"] = "none",
                 ["shape-parameters"] = "none",

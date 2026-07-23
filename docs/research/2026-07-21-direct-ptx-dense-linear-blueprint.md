@@ -130,10 +130,14 @@ final store, and supports the two transpose-free backward products.
 Two M=16 championship cells (`K512/N2048` and `K1024/N4096`) use a separate
 SM86 kernel: eight warps double-buffer FP16 input/output-major weight panels with
 `cp.async`, consume the packed panels with warp-collective `ldmatrix.x4` and
-`ldmatrix.x2.trans`, issue `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32`, retain
+non-transposed `ldmatrix.x2`, issue `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32`, retain
 FP32 accumulators through bias and tanh-GELU, and perform the only FP32 output
 stores. Shape, layout, dtype, and panel geometry are baked; the launch ABI is
-four pointers. A bounded GPU/driver/shape-keyed tuner evaluates N32 and N64
+four pointers. The B load is deliberately non-transposed: the output-major
+shared panel already maps each row fragment to the column-major MMA B-register
+contract, and an additional `.trans` changes the mathematical product. A
+structured row/K/bias oracle locks this physical-layout invariant. A bounded
+GPU/driver/shape-keyed tuner evaluates N32 and N64
 tiles before persisting the winner. Its cache identity also includes both
 candidate PTX-to-cubin source identities, so an emitter edit cannot reuse a
 stale decision. The benchmark's explicit `--autotune-fp16-m16` screen skips
@@ -144,19 +148,24 @@ cells remain experiment-only until the full timing gate passes.
 
 ### Fused-linear backward
 
-Three pointer-only entry points write `dInput`, `dWeight`, and `dBias` directly.
-Each recomputes the activation derivative in registers, so no masked-gradient
-tensor is materialized. ReLU and tanh-GELU consume saved preactivation;
-sigmoid and tanh consume saved output, matching the established contracts.
-Gradient outputs must be disjoint from each other and from saved forward
-tensors.
+One pointer-only launch assigns disjoint CTA ranges to `dInput` and `dWeight`.
+The `k=0` `dWeight` lanes accumulate `dBias` from the same grad-output and saved
+value panels, eliminating a third CTA range and separate launch. Both matrix
+products use 16x16 coalesced shared-memory panels and fully unrolled 16-FMA
+inner products. Activation derivatives are computed in registers while each
+grad-output panel is loaded and are never materialized globally. ReLU and
+tanh-GELU consume saved preactivation; sigmoid and tanh consume saved output,
+matching the established contracts. Gradient outputs must be disjoint from
+each other and from saved forward tensors.
 
 ### LoRA
 
-One block owns one batch row. It computes `input @ A` into a rank-sized shared
-projection, reuses that projection for `@ B`, fuses scaling and the base
-residual in registers, and writes the final output once. Exact output aliasing
-with `baseOutput` is allowed; partial overlap is rejected.
+One block owns one batch row. Eight warps partition K while lanes traverse
+contiguous eight-rank groups in `A[K,R]`; register shuffles and a fixed
+64-float shared fold produce the rank-sized shared projection. The same launch
+reuses that projection for `@ B`, fuses scaling and the base residual in
+registers, and writes the final output once. Exact output aliasing with
+`baseOutput` is allowed; partial overlap is rejected.
 
 ### Linear cross entropy
 
@@ -184,7 +193,7 @@ element per thread and write it once.
 | tiled GEMM/linear | A and weight panels, optional bias | panels in shared; accumulator/epilogue in registers | final C once |
 | FP16/BF16 GEMM | 16-bit A/B | FP32 or FP16-rounded accumulator in registers | converted C once |
 | backward linear | grad output, input, weights, saved activation | derivative and reduction accumulators in registers | dInput/dWeight/dBias once |
-| LoRA | input, base, A, B | rank projection in shared; residual epilogue in registers | final output once |
+| LoRA | input, base, A, B | warp partials and rank projection in shared; residual epilogue in registers | final output once |
 | linear CE | hidden, weight, bias, target | logits in registers; reductions in shared | one atomic scalar contribution/row |
 | dot | two vectors | register partials, then 32-byte shared warp totals | one scalar/batch |
 | outer | two vectors | product in a register | each output element once |
@@ -282,9 +291,9 @@ meet the median and P95 thresholds.
 
 ## Current exact-machine-code audit
 
-The requalification candidate contains 16 content-addressed SM86 cubins and 18
-entry points (the backward cubin owns three and the Tensor-Core tuning domain
-owns N32/N64 images). The pinned final-SASS audit finds
+The requalification candidate contains 16 content-addressed SM86 cubins and 16
+entry points (the backward cubin is now single-entry and the Tensor-Core tuning
+domain owns N32/N64 images). The pinned final-SASS audit finds
 zero `LDL` and zero `STL` in every entry. Representative hardware rows are:
 
 | Candidate | registers/thread | static shared B | final-SASS `LDSM` | `cp.async` | Tensor Core | final-SASS local loads/stores |
@@ -296,7 +305,7 @@ zero `LDL` and zero `STL` in every entry. Representative hardware rows are:
 | FP16 fused GELU M16/K1024/N4096 N32 | 34 | 24576 | 128 | 48 | 64 | 0 / 0 |
 | FP16 fused GELU M16/K1024/N4096 N64 | 34 | 40960 | 128 | 48 | 64 | 0 / 0 |
 
-The deterministic Nsight target additionally launches all 18 exact embedded-
+The deterministic Nsight target additionally launches all 16 exact embedded-
 cubin entry points and rejects runtime-linked images. Executed counters remain
 a separate required gate: aggregate local/spill instructions, local-load and
 local-store instructions, and L1 local-load/local-store requests must all be
@@ -337,7 +346,7 @@ returned `ERR_NVGPUCTRPERM`; the resulting diagnostic CSV is not spill proof.
 Driver-JIT local size zero is enforced now, but no specialization is claimed as
 release-promoted until the checked-in CSV verifier observes zero executed local
 loads, local stores, aggregate local/spill instructions, and L1 local-load and
-local-store requests for all 18 exact launches. The timing orchestrator accepts
+local-store requests for all 16 exact launches. The timing orchestrator accepts
 that verified CSV explicitly and records its SHA-256 in the same release gate.
 
 ## Reproduction

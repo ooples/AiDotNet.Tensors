@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Resident PyTorch CUDA eager/graph peers for issue #836 operation families."""
+"""Resident PyTorch CUDA eager/graph peers for issue #836 operation families.
+
+Graph rows replay a captured sequence of 50 logical operations and normalize
+per operation, matching the .NET runner and avoiding one-node graph submission
+latency in the GPU execution comparison.
+"""
 
 import argparse
 import csv
@@ -21,6 +26,7 @@ import torch.nn.functional as functional
 WARMUPS = 30
 SAMPLES = 101
 DEVICE_LAUNCHES = 50
+GRAPH_OPERATIONS_PER_REPLAY = 50
 
 
 def foreign_python_processes():
@@ -156,8 +162,17 @@ def summarize(values):
     )
 
 
-def measure_device(operation):
-    for _ in range(WARMUPS):
+def divide_round_up(value, divisor):
+    if divisor <= 0:
+        raise ValueError("divisor must be positive")
+    return (value + divisor - 1) // divisor
+
+
+def measure_device(operation, logical_operations_per_call=1):
+    warmup_calls = divide_round_up(WARMUPS, logical_operations_per_call)
+    calls_per_sample = divide_round_up(DEVICE_LAUNCHES, logical_operations_per_call)
+    logical_operations_per_sample = calls_per_sample * logical_operations_per_call
+    for _ in range(warmup_calls):
         operation()
     torch.cuda.synchronize()
     timings = []
@@ -165,16 +180,17 @@ def measure_device(operation):
     end = torch.cuda.Event(enable_timing=True)
     for _ in range(SAMPLES):
         start.record()
-        for _ in range(DEVICE_LAUNCHES):
+        for _ in range(calls_per_sample):
             operation()
         end.record()
         end.synchronize()
-        timings.append(start.elapsed_time(end) * 1000.0 / DEVICE_LAUNCHES)
+        timings.append(start.elapsed_time(end) * 1000.0 / logical_operations_per_sample)
     return summarize(timings)
 
 
-def measure_e2e(operation):
-    for _ in range(WARMUPS):
+def measure_e2e(operation, logical_operations_per_call=1):
+    warmup_calls = divide_round_up(WARMUPS, logical_operations_per_call)
+    for _ in range(warmup_calls):
         operation()
     torch.cuda.synchronize()
     timings = []
@@ -182,7 +198,9 @@ def measure_e2e(operation):
         start = time.perf_counter_ns()
         operation()
         torch.cuda.synchronize()
-        timings.append((time.perf_counter_ns() - start) / 1000.0)
+        timings.append(
+            (time.perf_counter_ns() - start) /
+            (1000.0 * logical_operations_per_call))
     return summarize(timings)
 
 
@@ -212,7 +230,7 @@ def output_storage_bytes(value):
     return total
 
 
-def capture_graph(operation):
+def capture_graph(operation, logical_operations_per_replay=GRAPH_OPERATIONS_PER_REPLAY):
     capture_stream = torch.cuda.Stream()
     capture_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(capture_stream):
@@ -221,7 +239,8 @@ def capture_graph(operation):
     torch.cuda.current_stream().wait_stream(capture_stream)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        graph_output = operation()
+        for _ in range(logical_operations_per_replay):
+            graph_output = operation()
 
     def replay():
         graph.replay()
@@ -432,8 +451,8 @@ def main():
 
             graph_operation, eager_graph, eager_capture_stream = capture_graph(eager)
             competitors = [
-                ("PyTorch CUDA eager", eager),
-                ("PyTorch CUDA graph", graph_operation),
+                ("PyTorch CUDA eager", eager, 1),
+                ("PyTorch CUDA graph", graph_operation, GRAPH_OPERATIONS_PER_REPLAY),
             ]
             compiled = None
             compiled_graph = None
@@ -445,8 +464,9 @@ def main():
                 torch.cuda.synchronize()
                 compiled_graph_operation, compiled_graph, compiled_capture_stream = capture_graph(compiled)
                 competitors.extend((
-                    ("PyTorch compile max-autotune", compiled),
-                    ("PyTorch compile max-autotune graph", compiled_graph_operation),
+                    ("PyTorch compile max-autotune", compiled, 1),
+                    ("PyTorch compile max-autotune graph", compiled_graph_operation,
+                     GRAPH_OPERATIONS_PER_REPLAY),
                 ))
                 del compiled_probe
             except Exception as exception:
@@ -460,13 +480,13 @@ def main():
                     **software_fingerprint,
                 }, separators=(",", ":")))
 
-            for method, measured in competitors:
+            for method, measured, logical_operations_per_call in competitors:
                 require_no_foreign_compute(f"{operation}-{method}-start")
                 correctness_probe = measured()
                 torch.cuda.synchronize()
                 error = maximum_error(correctness_probe, expected)
-                device_values = measure_device(measured)
-                e2e_values = measure_e2e(measured)
+                device_values = measure_device(measured, logical_operations_per_call)
+                e2e_values = measure_e2e(measured, logical_operations_per_call)
                 torch.cuda.synchronize()
                 torch.cuda.reset_peak_memory_stats()
                 baseline = torch.cuda.memory_allocated()
@@ -483,6 +503,7 @@ def main():
                     "operation": operation,
                     "shape": shape,
                     "method": method,
+                    "logical_operations_per_call": logical_operations_per_call,
                     "work_flops": work,
                     "device_mean_us": device_values[0],
                     "device_median_us": device_values[1],

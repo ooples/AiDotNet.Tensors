@@ -7,8 +7,8 @@ namespace AiDotNet.Tensors.Benchmarks;
 
 /// <summary>
 /// Disassembles the exact manifest cubins and rejects local-memory machine
-/// instructions. Multi-entry modules (notably fused-linear backward) are
-/// audited entry-by-entry instead of hiding behind aggregate module metadata.
+/// instructions. Every module is audited entry-by-entry instead of hiding
+/// behind aggregate module metadata.
 /// </summary>
 internal static class DirectPtxDenseLinearSassAuditTool
 {
@@ -78,7 +78,7 @@ internal static class DirectPtxDenseLinearSassAuditTool
                     metrics.LocalStores.ToString(CultureInfo.InvariantCulture)));
             }
         }
-        const int expectedEntryPoints = 18;
+        const int expectedEntryPoints = 16;
         if (report.Count - 1 != expectedEntryPoints)
             throw new InvalidDataException(
                 $"Dense-linear SASS inventory expected {expectedEntryPoints} entry points; " +

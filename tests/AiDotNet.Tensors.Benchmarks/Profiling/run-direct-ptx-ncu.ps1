@@ -39,7 +39,7 @@ $kernel = switch ($Target) {
     'flash-attention-backward' { 'regex:aidotnet_flash_attention_backward_(dq|dkv)_d64' }
     'qkv-rope-cache' { 'regex:aidotnet_qkv_rope_cache_d64' }
     'fused-linear' { 'regex:aidotnet_fused_linear_gelu_m1' }
-    'dense-linear' { 'regex:aidotnet_(fused_linear_gelu_m1|fused_linear_tiled|fused_linear_gelu_fp16_m16|fp16_gemm|fused_lora_forward|fused_linear_ce_index|fused_linear_backward_(input|weight|bias)|dense_(dot|outer)|batched_dot|strided_dot)' }
+    'dense-linear' { 'regex:aidotnet_(fused_linear_gelu_m1|fused_linear_tiled|fused_linear_gelu_fp16_m16|fp16_gemm|fused_lora_forward|fused_linear_ce_index|fused_linear_backward|dense_(dot|outer)|batched_dot|strided_dot)' }
 }
 $expectedLaunches = switch ($Target) {
     'attention' { 16 }
@@ -50,7 +50,7 @@ $expectedLaunches = switch ($Target) {
     'flash-attention-backward' { 2 }
     'qkv-rope-cache' { 3 }
     'fused-linear' { 10 }
-    'dense-linear' { 18 }
+    'dense-linear' { 16 }
 }
 $metricNames = @(
     'smsp__sass_inst_executed_op_local.sum',

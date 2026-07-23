@@ -25,7 +25,8 @@ internal enum DirectPtxGemmOutputType
 /// </summary>
 internal sealed class PtxFp16GemmKernel : IDisposable
 {
-    internal const int BlockThreads = 256;
+    internal const int BaselineBlockThreads = 256;
+    internal const int TensorCoreBlockThreads = 64;
     internal const string EntryPoint = "aidotnet_fp16_gemm";
 
     private readonly DirectPtxModule _module;
@@ -40,6 +41,7 @@ internal sealed class PtxFp16GemmKernel : IDisposable
     internal DirectPtx16BitInputType InputType { get; }
     internal DirectPtxGemmOutputType OutputType { get; }
     internal bool HalfAccumulate { get; }
+    internal int BlockThreads { get; }
     internal string Ptx { get; }
     internal DirectPtxKernelBlueprint Blueprint { get; }
     internal DirectPtxKernelAudit Audit { get; }
@@ -72,6 +74,11 @@ internal sealed class PtxFp16GemmKernel : IDisposable
         InputType = inputType;
         OutputType = outputType;
         HalfAccumulate = halfAccumulate;
+        BlockThreads = IsTensorCoreShape(
+            m, n, k, batch, transposeA, transposeB,
+            inputType, outputType, halfAccumulate)
+            ? TensorCoreBlockThreads
+            : BaselineBlockThreads;
         Blueprint = CreateBlueprint(
             runtime.ArchitectureFamily, m, n, k, batch,
             transposeA, transposeB, inputType, outputType, halfAccumulate);
@@ -106,10 +113,14 @@ internal sealed class PtxFp16GemmKernel : IDisposable
         arguments[0] = &leftPointer;
         arguments[1] = &rightPointer;
         arguments[2] = &outputPointer;
-        uint grid = checked((uint)(((long)M * N + BlockThreads - 1) / BlockThreads));
+        uint grid = IsTensorCoreShape(
+                M, N, K, Batch, TransposeA, TransposeB,
+                InputType, OutputType, HalfAccumulate)
+            ? 1u
+            : checked((uint)(((long)M * N + BlockThreads - 1) / BlockThreads));
         _module.Launch(
             _function, grid, 1, checked((uint)Batch),
-            BlockThreads, 1, 1, 0, arguments);
+            checked((uint)BlockThreads), 1, 1, 0, arguments);
     }
 
     public void Dispose() => _module.Dispose();
@@ -128,6 +139,10 @@ internal sealed class PtxFp16GemmKernel : IDisposable
         bool halfAccumulate = false)
     {
         Validate(m, n, k, batch, inputType, outputType, halfAccumulate);
+        if (IsTensorCoreShape(
+                m, n, k, batch, transposeA, transposeB,
+                inputType, outputType, halfAccumulate))
+            return EmitTensorCoreM16N16K32(ccMajor, ccMinor);
         int matrixElements = checked(m * n);
         int aElements = checked(m * k);
         int bElements = checked(k * n);
@@ -143,7 +158,7 @@ internal sealed class PtxFp16GemmKernel : IDisposable
         ptx.AppendLine("    .param .u64 right_ptr,");
         ptx.AppendLine("    .param .u64 output_ptr");
         ptx.AppendLine(")");
-        ptx.AppendLine($".maxntid {BlockThreads}, 1, 1");
+        ptx.AppendLine($".maxntid {BaselineBlockThreads}, 1, 1");
         ptx.AppendLine("{");
         ptx.AppendLine("    .reg .pred %p<4>;");
         ptx.AppendLine("    .reg .b16 %h<4>;");
@@ -155,7 +170,7 @@ internal sealed class PtxFp16GemmKernel : IDisposable
         ptx.AppendLine("    ld.param.u64 %rd2, [output_ptr];");
         ptx.AppendLine("    mov.u32 %r0, %ctaid.x;");
         ptx.AppendLine("    mov.u32 %r1, %tid.x;");
-        ptx.AppendLine($"    mad.lo.u32 %r2, %r0, {BlockThreads}, %r1;");
+        ptx.AppendLine($"    mad.lo.u32 %r2, %r0, {BaselineBlockThreads}, %r1;");
         ptx.AppendLine($"    setp.ge.u32 %p0, %r2, {matrixElements};");
         ptx.AppendLine("    @%p0 bra.uni GEMM_DONE;");
         ptx.AppendLine($"    div.u32 %r3, %r2, {n};");
@@ -210,6 +225,109 @@ internal sealed class PtxFp16GemmKernel : IDisposable
         return ptx.ToString();
     }
 
+    private static string EmitTensorCoreM16N16K32(int ccMajor, int ccMinor)
+    {
+        var ptx = new StringBuilder(8_192);
+        ptx.AppendLine(".version 7.1");
+        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        ptx.AppendLine(".address_size 64");
+        ptx.AppendLine();
+        ptx.AppendLine("// exact FP16 M16 N16 K32: two-warp async Tensor-Core specialization");
+        ptx.AppendLine($".visible .entry {EntryPoint}(");
+        ptx.AppendLine("    .param .u64 left_ptr,");
+        ptx.AppendLine("    .param .u64 right_ptr,");
+        ptx.AppendLine("    .param .u64 output_ptr");
+        ptx.AppendLine(")");
+        ptx.AppendLine($".maxntid {TensorCoreBlockThreads}, 1, 1");
+        ptx.AppendLine("{");
+        ptx.AppendLine("    .reg .b32 %r<24>;");
+        ptx.AppendLine("    .reg .b32 %a<4>;");
+        ptx.AppendLine("    .reg .b32 %b<2>;");
+        ptx.AppendLine("    .reg .b64 %rd<14>;");
+        ptx.AppendLine("    .reg .f32 %c<4>;");
+        ptx.AppendLine("    .shared .align 16 .b8 smem[2048];");
+        ptx.AppendLine("    ld.param.u64 %rd0, [left_ptr];");
+        ptx.AppendLine("    ld.param.u64 %rd1, [right_ptr];");
+        ptx.AppendLine("    ld.param.u64 %rd2, [output_ptr];");
+        ptx.AppendLine("    mov.u32 %r0, %tid.x;");
+        ptx.AppendLine("    and.b32 %r1, %r0, 31;");
+        ptx.AppendLine("    shr.u32 %r2, %r0, 5;");
+        ptx.AppendLine("    shl.b32 %r3, %r0, 4;");
+        ptx.AppendLine("    cvt.u64.u32 %rd3, %r3;");
+        ptx.AppendLine("    add.u64 %rd4, %rd0, %rd3;");
+        ptx.AppendLine("    add.u64 %rd5, %rd1, %rd3;");
+        // A is repacked from row-major [16,32] into two adjacent M16xK16
+        // panels so one x4 ldmatrix supplies each MMA K fragment.
+        ptx.AppendLine("    shr.u32 %r4, %r0, 2;");
+        ptx.AppendLine("    and.b32 %r5, %r0, 3;");
+        ptx.AppendLine("    shr.u32 %r6, %r5, 1;");
+        ptx.AppendLine("    and.b32 %r7, %r5, 1;");
+        ptx.AppendLine("    shl.b32 %r6, %r6, 9;");
+        ptx.AppendLine("    shl.b32 %r7, %r7, 4;");
+        ptx.AppendLine("    mad.lo.u32 %r8, %r4, 32, %r6;");
+        ptx.AppendLine("    add.u32 %r8, %r8, %r7;");
+        ptx.AppendLine("    mov.u64 %rd6, smem;");
+        ptx.AppendLine("    cvt.u64.u32 %rd7, %r8;");
+        ptx.AppendLine("    add.u64 %rd8, %rd6, %rd7;");
+        ptx.AppendLine("    cp.async.ca.shared.global [%rd8], [%rd4], 16;");
+        // B remains row-major [32,16]. The transposed x2 ldmatrix below
+        // presents its KxN rows as the column-major MMA B fragment.
+        ptx.AppendLine("    add.u64 %rd9, %rd6, %rd3;");
+        ptx.AppendLine("    cp.async.ca.shared.global [%rd9+1024], [%rd5], 16;");
+        ptx.AppendLine("    cp.async.commit_group;");
+        ptx.AppendLine("    cp.async.wait_group 0;");
+        ptx.AppendLine("    bar.sync 0;");
+        ptx.AppendLine("    mov.f32 %c0, 0f00000000;");
+        ptx.AppendLine("    mov.f32 %c1, 0f00000000;");
+        ptx.AppendLine("    mov.f32 %c2, 0f00000000;");
+        ptx.AppendLine("    mov.f32 %c3, 0f00000000;");
+        // Warp-collective A addresses for an M16xK16 row-major fragment.
+        ptx.AppendLine("    and.b32 %r9, %r1, 7;");
+        ptx.AppendLine("    shr.u32 %r10, %r1, 3;");
+        ptx.AppendLine("    and.b32 %r11, %r10, 1;");
+        ptx.AppendLine("    shl.b32 %r11, %r11, 8;");
+        ptx.AppendLine("    shr.u32 %r10, %r10, 1;");
+        ptx.AppendLine("    shl.b32 %r10, %r10, 4;");
+        ptx.AppendLine("    mad.lo.u32 %r9, %r9, 32, %r11;");
+        ptx.AppendLine("    add.u32 %r9, %r9, %r10;");
+        // Warp 0 consumes N0..7; warp 1 consumes N8..15. The second x2
+        // matrix starts eight K rows later (8 * 32 bytes).
+        ptx.AppendLine("    and.b32 %r12, %r1, 7;");
+        ptx.AppendLine("    shr.u32 %r13, %r1, 3;");
+        ptx.AppendLine("    and.b32 %r13, %r13, 1;");
+        ptx.AppendLine("    shl.b32 %r13, %r13, 8;");
+        ptx.AppendLine("    mad.lo.u32 %r12, %r12, 32, %r13;");
+        ptx.AppendLine("    shl.b32 %r14, %r2, 4;");
+        ptx.AppendLine("    add.u32 %r12, %r12, %r14;");
+        ptx.AppendLine("    cvt.u64.u32 %rd10, %r9;");
+        ptx.AppendLine("    add.u64 %rd11, %rd6, %rd10;");
+        ptx.AppendLine("    cvt.u64.u32 %rd12, %r12;");
+        ptx.AppendLine("    add.u64 %rd13, %rd6, %rd12;");
+        for (int panel = 0; panel < 2; panel++)
+        {
+            int offset = panel * 512;
+            ptx.AppendLine($"    ldmatrix.sync.aligned.m8n8.x4.shared.b16 " +
+                $"{{%a0,%a1,%a2,%a3}}, [%rd11+{offset}];");
+            ptx.AppendLine($"    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 " +
+                $"{{%b0,%b1}}, [%rd13+{1024 + offset}];");
+            ptx.AppendLine("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 " +
+                "{%c0,%c1,%c2,%c3}, {%a0,%a1,%a2,%a3}, {%b0,%b1}, {%c0,%c1,%c2,%c3};");
+        }
+        ptx.AppendLine("    shr.u32 %r15, %r1, 2;");
+        ptx.AppendLine("    and.b32 %r16, %r1, 3;");
+        ptx.AppendLine("    shl.b32 %r16, %r16, 1;");
+        ptx.AppendLine("    mad.lo.u32 %r16, %r2, 8, %r16;");
+        ptx.AppendLine("    mad.lo.u32 %r17, %r15, 16, %r16;");
+        ptx.AppendLine("    shl.b32 %r17, %r17, 2;");
+        ptx.AppendLine("    cvt.u64.u32 %rd10, %r17;");
+        ptx.AppendLine("    add.u64 %rd11, %rd2, %rd10;");
+        ptx.AppendLine("    st.global.v2.f32 [%rd11], {%c0,%c1};");
+        ptx.AppendLine("    st.global.v2.f32 [%rd11+512], {%c2,%c3};");
+        ptx.AppendLine("    ret;");
+        ptx.AppendLine("}");
+        return ptx.ToString();
+    }
+
     private static void Emit16BitLoad(
         StringBuilder ptx,
         string address,
@@ -258,11 +376,14 @@ internal sealed class PtxFp16GemmKernel : IDisposable
             ? DirectPtxPhysicalType.Float32 : DirectPtxPhysicalType.Float16;
         DirectPtxPhysicalLayout layout = batch == 1
             ? DirectPtxPhysicalLayout.RowMajor2D : DirectPtxPhysicalLayout.RowMajor3D;
+        bool tensorCore = IsTensorCoreShape(
+            m, n, k, batch, transposeA, transposeB,
+            inputType, outputType, halfAccumulate);
         return new DirectPtxKernelBlueprint(
             Operation: "16-bit-gemm",
-            Version: 1,
+            Version: tensorCore ? 2 : 1,
             Architecture: architecture,
-            Variant: $"{inputType}-to-{outputType}-b{batch}-m{m}-n{n}-k{k}-ta{transposeA}-tb{transposeB}-ha{halfAccumulate}",
+            Variant: $"{(tensorCore ? "tensorcore-async-" : string.Empty)}{inputType}-to-{outputType}-b{batch}-m{m}-n{n}-k{k}-ta{transposeA}-tb{transposeB}-ha{halfAccumulate}",
             Tensors:
             [
                 new("left", physicalInput, layout, left, left, 16,
@@ -274,14 +395,16 @@ internal sealed class PtxFp16GemmKernel : IDisposable
             ],
             ResourceBudget: new DirectPtxResourceBudget(
                 MaxRegistersPerThread: 32,
-                MaxStaticSharedBytes: 0,
+                MaxStaticSharedBytes: tensorCore ? 2_048 : 0,
                 MaxLocalBytesPerThread: 0,
-                MinBlocksPerMultiprocessor: 4),
+                MinBlocksPerMultiprocessor: tensorCore ? 8 : 4),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["formula"] = "output=op(left)@op(right)",
                 ["input-dtype"] = inputType.ToString(),
-                ["accumulator"] = halfAccumulate ? "fp16-rounded-each-fma" : "fp32",
+                ["accumulator"] = tensorCore
+                    ? "mma-m16n8k16-fp32-register-fragment"
+                    : halfAccumulate ? "fp16-rounded-each-fma" : "fp32",
                 ["output-dtype"] = outputType.ToString(),
                 ["transpose-a"] = transposeA.ToString(),
                 ["transpose-b"] = transposeB.ToString(),
@@ -289,9 +412,29 @@ internal sealed class PtxFp16GemmKernel : IDisposable
                 ["shape-parameters"] = "none",
                 ["stride-parameters"] = "none",
                 ["temporary-device-allocation"] = "none",
-                ["promotion"] = "correctness-baseline-only; Tensor-Core replacement required"
+                ["pipeline"] = tensorCore
+                    ? "two-warp-cp.async-ldmatrix-mma; register-only-output"
+                    : "scalar-correctness-baseline",
+                ["promotion"] = tensorCore
+                    ? "exact M16 N16 K32 Tensor-Core experiment"
+                    : "correctness-baseline-only; Tensor-Core replacement required"
             });
     }
+
+    private static bool IsTensorCoreShape(
+        int m,
+        int n,
+        int k,
+        int batch,
+        bool transposeA,
+        bool transposeB,
+        DirectPtx16BitInputType inputType,
+        DirectPtxGemmOutputType outputType,
+        bool halfAccumulate) =>
+        m == 16 && n == 16 && k == 32 && batch == 1 &&
+        !transposeA && !transposeB &&
+        inputType == DirectPtx16BitInputType.Float16 &&
+        outputType == DirectPtxGemmOutputType.Float32 && !halfAccumulate;
 
     private static void Validate(
         int m,

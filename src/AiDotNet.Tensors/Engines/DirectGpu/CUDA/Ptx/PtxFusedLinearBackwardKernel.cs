@@ -6,21 +6,19 @@ using System.Text;
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
 /// <summary>
-/// Exact-shape fused-linear backward family. Activation derivatives are
-/// recomputed in registers independently in each of three output kernels, so
-/// no masked-gradient tensor is materialized in global memory.
+/// Exact-shape fused-linear backward family. One launch assigns disjoint CTA
+/// ranges to dInput and dWeight. The k=0 dWeight lanes accumulate dBias from
+/// the same grad-output/saved-value reads, so no masked-gradient tensor or
+/// separate bias-reduction launch is materialized.
 /// </summary>
 internal sealed class PtxFusedLinearBackwardKernel : IDisposable
 {
     internal const int BlockThreads = 256;
-    internal const string GradInputEntryPoint = "aidotnet_fused_linear_backward_input";
-    internal const string GradWeightEntryPoint = "aidotnet_fused_linear_backward_weight";
-    internal const string GradBiasEntryPoint = "aidotnet_fused_linear_backward_bias";
+    internal const int Tile = 16;
+    internal const string EntryPoint = "aidotnet_fused_linear_backward";
 
     private readonly DirectPtxModule _module;
-    private readonly IntPtr _gradInputFunction;
-    private readonly IntPtr _gradWeightFunction;
-    private readonly IntPtr _gradBiasFunction;
+    private readonly IntPtr _function;
 
     internal int M { get; }
     internal int K { get; }
@@ -51,27 +49,15 @@ internal sealed class PtxFusedLinearBackwardKernel : IDisposable
         Blueprint = CreateBlueprint(runtime.ArchitectureFamily, m, k, n, activation);
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, m, k, n, activation);
         _module = runtime.LoadModule(Ptx);
-        _gradInputFunction = LoadAndAudit(
-            runtime, GradInputEntryPoint, out DirectPtxKernelAudit gradInputAudit);
-        _gradWeightFunction = LoadAndAudit(
-            runtime, GradWeightEntryPoint, out DirectPtxKernelAudit gradWeightAudit);
-        _gradBiasFunction = LoadAndAudit(
-            runtime, GradBiasEntryPoint, out DirectPtxKernelAudit gradBiasAudit);
-        Audits = [gradInputAudit, gradWeightAudit, gradBiasAudit];
-    }
-
-    private IntPtr LoadAndAudit(
-        DirectPtxRuntime runtime,
-        string entryPoint,
-        out DirectPtxKernelAudit audit)
-    {
-        IntPtr function = _module.GetFunction(entryPoint, out DirectPtxFunctionInfo info);
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(function, BlockThreads);
-        Blueprint.ResourceBudget.Validate(entryPoint, info, BlockThreads, activeBlocks);
-        audit = DirectPtxKernelAudit.Create(
+        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
+        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(
+            _function, BlockThreads);
+        Blueprint.ResourceBudget.Validate(
+            EntryPoint, info, BlockThreads, activeBlocks);
+        DirectPtxKernelAudit audit = DirectPtxKernelAudit.Create(
             Blueprint, runtime.DeviceFingerprint, Ptx, info,
             BlockThreads, activeBlocks, _module);
-        return function;
+        Audits = [audit];
     }
 
     internal unsafe void Launch(
@@ -110,23 +96,18 @@ internal sealed class PtxFusedLinearBackwardKernel : IDisposable
         IntPtr gw = gradWeight.Pointer;
         IntPtr gb = gradBias.Pointer;
 
-        void** inputArgs = stackalloc void*[4];
-        inputArgs[0] = &go; inputArgs[1] = &w; inputArgs[2] = &s; inputArgs[3] = &gi;
+        void** arguments = stackalloc void*[7];
+        arguments[0] = &go;
+        arguments[1] = &x;
+        arguments[2] = &w;
+        arguments[3] = &s;
+        arguments[4] = &gi;
+        arguments[5] = &gw;
+        arguments[6] = &gb;
+        uint grid = checked(Grid(checked(M * K)) + Grid(checked(K * N)));
         _module.Launch(
-            _gradInputFunction, Grid(checked(M * K)), 1, 1,
-            BlockThreads, 1, 1, 0, inputArgs);
-
-        void** weightArgs = stackalloc void*[4];
-        weightArgs[0] = &go; weightArgs[1] = &x; weightArgs[2] = &s; weightArgs[3] = &gw;
-        _module.Launch(
-            _gradWeightFunction, Grid(checked(K * N)), 1, 1,
-            BlockThreads, 1, 1, 0, weightArgs);
-
-        void** biasArgs = stackalloc void*[3];
-        biasArgs[0] = &go; biasArgs[1] = &s; biasArgs[2] = &gb;
-        _module.Launch(
-            _gradBiasFunction, Grid(N), 1, 1,
-            BlockThreads, 1, 1, 0, biasArgs);
+            _function, grid, 1, 1,
+            BlockThreads, 1, 1, 0, arguments);
     }
 
     private static uint Grid(int elements) =>
@@ -143,108 +124,154 @@ internal sealed class PtxFusedLinearBackwardKernel : IDisposable
         DirectPtxLinearActivation activation)
     {
         Validate(m, k, n, activation);
-        var ptx = new StringBuilder(20_000);
+        var ptx = new StringBuilder(12_000);
         ptx.AppendLine(".version 7.1");
         ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
         ptx.AppendLine(".address_size 64");
-        ptx.AppendLine($"// fused-linear backward M={m} K={k} N={n} act={activation}; exact pointer-only ABIs");
-        EmitGradInput(ptx, m, k, n, activation);
-        EmitGradWeight(ptx, m, k, n, activation);
-        EmitGradBias(ptx, m, n, activation);
+        ptx.AppendLine($"// fused-linear backward M={m} K={k} N={n} act={activation}; single exact pointer-only ABI");
+        EmitCombined(ptx, m, k, n, activation);
         return ptx.ToString();
     }
 
-    private static void EmitGradInput(
+    private static void EmitCombined(
         StringBuilder ptx, int m, int k, int n, DirectPtxLinearActivation activation)
     {
-        EmitHeader(ptx, GradInputEntryPoint, "grad_output_ptr", "weights_ptr", "saved_ptr", "grad_input_ptr");
+        int mTiles = m / Tile;
+        int kTiles = k / Tile;
+        int nTiles = n / Tile;
+        int gradInputBlocks = checked(mTiles * kTiles);
+        EmitHeader(
+            ptx, EntryPoint,
+            "grad_output_ptr", "input_ptr", "weights_ptr", "saved_ptr",
+            "grad_input_ptr", "grad_weight_ptr", "grad_bias_ptr");
         EmitRegisters(ptx);
-        EmitPointers(ptx, "grad_output_ptr", "weights_ptr", "saved_ptr", "grad_input_ptr");
-        EmitIndex(ptx, checked(m * k), k);
-        ptx.AppendLine("    mov.f32 %f7, 0f00000000;");
-        ptx.AppendLine("    mov.u32 %r4, 0;");
-        ptx.AppendLine("GI_LOOP:");
-        ptx.AppendLine($"    setp.ge.u32 %p1, %r4, {n};");
-        ptx.AppendLine("    @%p1 bra.uni GI_STORE;");
-        EmitRowColumnOffset(ptx, "%r2", n, "%r4", "%rd4");
-        ptx.AppendLine("    add.u64 %rd5, %rd0, %rd4;");
-        ptx.AppendLine("    add.u64 %rd6, %rd2, %rd4;");
-        ptx.AppendLine("    ld.global.nc.f32 %f0, [%rd5];");
-        ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd6];");
-        EmitMaskedGradient(ptx, activation);
-        EmitRowColumnOffset(ptx, "%r3", n, "%r4", "%rd7");
-        ptx.AppendLine("    add.u64 %rd8, %rd1, %rd7;");
-        ptx.AppendLine("    ld.global.nc.f32 %f3, [%rd8];");
-        ptx.AppendLine("    fma.rn.f32 %f7, %f2, %f3, %f7;");
-        ptx.AppendLine("    add.u32 %r4, %r4, 1;");
-        ptx.AppendLine("    bra.uni GI_LOOP;");
-        ptx.AppendLine("GI_STORE:");
-        ptx.AppendLine("    mul.wide.u32 %rd9, %r1, 4;");
-        ptx.AppendLine("    add.u64 %rd10, %rd3, %rd9;");
-        ptx.AppendLine("    st.global.f32 [%rd10], %f7;");
-        EmitFooter(ptx);
-    }
+        ptx.AppendLine("    .shared .align 16 .b8 tile_a[1024];");
+        ptx.AppendLine("    .shared .align 16 .b8 tile_b[1024];");
+        EmitPointers(
+            ptx, "grad_output_ptr", "input_ptr", "weights_ptr", "saved_ptr",
+            "grad_input_ptr", "grad_weight_ptr", "grad_bias_ptr");
+        ptx.AppendLine("    mov.u64 %rd7, tile_a;");
+        ptx.AppendLine("    mov.u64 %rd8, tile_b;");
+        ptx.AppendLine("    mov.u32 %r0, %tid.x;");
+        ptx.AppendLine("    mov.u32 %r1, %ctaid.x;");
+        ptx.AppendLine($"    setp.lt.u32 %p0, %r1, {gradInputBlocks};");
+        ptx.AppendLine("    @%p0 bra.uni GRAD_INPUT_PATH;");
 
-    private static void EmitGradWeight(
-        StringBuilder ptx, int m, int k, int n, DirectPtxLinearActivation activation)
-    {
-        EmitHeader(ptx, GradWeightEntryPoint, "grad_output_ptr", "input_ptr", "saved_ptr", "grad_weight_ptr");
-        EmitRegisters(ptx);
-        EmitPointers(ptx, "grad_output_ptr", "input_ptr", "saved_ptr", "grad_weight_ptr");
-        EmitIndex(ptx, checked(k * n), n); // r2=k index, r3=n index
-        ptx.AppendLine("    mov.f32 %f7, 0f00000000;");
-        ptx.AppendLine("    mov.u32 %r4, 0;");
-        ptx.AppendLine("GW_LOOP:");
-        ptx.AppendLine($"    setp.ge.u32 %p1, %r4, {m};");
+        // dWeight = X^T @ maskedGrad. Threads load contiguous X[M,K] and
+        // maskedGrad[M,N] panels, then reuse both panels for 16 FMAs. The
+        // first K tile also folds each N column into dBias.
+        ptx.AppendLine($"    sub.u32 %r1, %r1, {gradInputBlocks};");
+        ptx.AppendLine($"    div.u32 %r2, %r1, {nTiles};");
+        ptx.AppendLine($"    rem.u32 %r3, %r1, {nTiles};");
+        EmitLocalCoordinates(ptx);
+        ptx.AppendLine($"    mad.lo.u32 %r6, %r2, {Tile}, %r4;");
+        ptx.AppendLine($"    mad.lo.u32 %r7, %r3, {Tile}, %r5;");
+        ptx.AppendLine("    setp.eq.u32 %p3, %r2, 0;");
+        ptx.AppendLine("    setp.eq.u32 %p4, %r4, 0;");
+        ptx.AppendLine("    and.pred %p5, %p3, %p4;");
+        ptx.AppendLine("    mov.f32 %f10, 0f00000000;");
+        ptx.AppendLine("    mov.f32 %f11, 0f00000000;");
+        ptx.AppendLine("    mov.u32 %r8, 0;");
+        ptx.AppendLine("GW_TILE_LOOP:");
+        ptx.AppendLine($"    setp.ge.u32 %p1, %r8, {m};");
         ptx.AppendLine("    @%p1 bra.uni GW_STORE;");
-        EmitRowColumnOffset(ptx, "%r4", n, "%r3", "%rd4");
-        ptx.AppendLine("    add.u64 %rd5, %rd0, %rd4;");
-        ptx.AppendLine("    add.u64 %rd6, %rd2, %rd4;");
-        ptx.AppendLine("    ld.global.nc.f32 %f0, [%rd5];");
-        ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd6];");
+        ptx.AppendLine("    add.u32 %r9, %r8, %r4;");
+        ptx.AppendLine($"    mad.lo.u32 %r10, %r2, {Tile}, %r5;");
+        ptx.AppendLine($"    mad.lo.u32 %r12, %r9, {k}, %r10;");
+        ptx.AppendLine("    mul.wide.u32 %rd9, %r12, 4;");
+        ptx.AppendLine("    add.u64 %rd10, %rd1, %rd9;");
+        ptx.AppendLine("    ld.global.nc.f32 %f3, [%rd10];");
+        ptx.AppendLine($"    mad.lo.u32 %r10, %r3, {Tile}, %r5;");
+        ptx.AppendLine($"    mad.lo.u32 %r12, %r9, {n}, %r10;");
+        ptx.AppendLine("    mul.wide.u32 %rd9, %r12, 4;");
+        ptx.AppendLine("    add.u64 %rd10, %rd0, %rd9;");
+        ptx.AppendLine("    add.u64 %rd11, %rd3, %rd9;");
+        ptx.AppendLine("    ld.global.nc.f32 %f0, [%rd10];");
+        ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd11];");
         EmitMaskedGradient(ptx, activation);
-        EmitRowColumnOffset(ptx, "%r4", k, "%r2", "%rd7");
-        ptx.AppendLine("    add.u64 %rd8, %rd1, %rd7;");
-        ptx.AppendLine("    ld.global.nc.f32 %f3, [%rd8];");
-        ptx.AppendLine("    fma.rn.f32 %f7, %f3, %f2, %f7;");
-        ptx.AppendLine("    add.u32 %r4, %r4, 1;");
-        ptx.AppendLine("    bra.uni GW_LOOP;");
+        EmitStorePanels(ptx, "%f3", "%f2");
+        ptx.AppendLine("    bar.sync 0;");
+        ptx.AppendLine("    mul.wide.u32 %rd12, %r4, 4;");
+        ptx.AppendLine("    add.u64 %rd12, %rd7, %rd12;");
+        ptx.AppendLine("    mul.wide.u32 %rd13, %r5, 4;");
+        ptx.AppendLine("    add.u64 %rd13, %rd8, %rd13;");
+        for (int inner = 0; inner < Tile; inner++)
+        {
+            string offset = inner == 0 ? string.Empty : $"+{inner * Tile * sizeof(float)}";
+            ptx.AppendLine($"    ld.shared.f32 %f0, [%rd12{offset}];");
+            ptx.AppendLine($"    ld.shared.f32 %f1, [%rd13{offset}];");
+            ptx.AppendLine("    fma.rn.f32 %f10, %f0, %f1, %f10;");
+            ptx.AppendLine("    @%p5 add.rn.f32 %f11, %f11, %f1;");
+        }
+        ptx.AppendLine("    bar.sync 0;");
+        ptx.AppendLine($"    add.u32 %r8, %r8, {Tile};");
+        ptx.AppendLine("    bra.uni GW_TILE_LOOP;");
         ptx.AppendLine("GW_STORE:");
-        ptx.AppendLine("    mul.wide.u32 %rd9, %r1, 4;");
-        ptx.AppendLine("    add.u64 %rd10, %rd3, %rd9;");
-        ptx.AppendLine("    st.global.f32 [%rd10], %f7;");
-        EmitFooter(ptx);
-    }
+        ptx.AppendLine($"    mad.lo.u32 %r12, %r6, {n}, %r7;");
+        ptx.AppendLine("    mul.wide.u32 %rd9, %r12, 4;");
+        ptx.AppendLine("    add.u64 %rd10, %rd5, %rd9;");
+        ptx.AppendLine("    st.global.f32 [%rd10], %f10;");
+        ptx.AppendLine("    @!%p5 bra KERNEL_DONE;");
+        ptx.AppendLine("    mul.wide.u32 %rd9, %r7, 4;");
+        ptx.AppendLine("    add.u64 %rd10, %rd6, %rd9;");
+        ptx.AppendLine("    st.global.f32 [%rd10], %f11;");
+        ptx.AppendLine("    bra.uni KERNEL_DONE;");
 
-    private static void EmitGradBias(
-        StringBuilder ptx, int m, int n, DirectPtxLinearActivation activation)
-    {
-        EmitHeader(ptx, GradBiasEntryPoint, "grad_output_ptr", "saved_ptr", "grad_bias_ptr");
-        EmitRegisters(ptx);
-        EmitPointers(ptx, "grad_output_ptr", "saved_ptr", "grad_bias_ptr");
-        ptx.AppendLine("    mov.u32 %r0, %ctaid.x;");
-        ptx.AppendLine("    mov.u32 %r1, %tid.x;");
-        ptx.AppendLine($"    mad.lo.u32 %r1, %r0, {BlockThreads}, %r1;");
-        ptx.AppendLine($"    setp.ge.u32 %p0, %r1, {n};");
-        ptx.AppendLine("    @%p0 bra.uni KERNEL_DONE;");
-        ptx.AppendLine("    mov.f32 %f7, 0f00000000;");
-        ptx.AppendLine("    mov.u32 %r4, 0;");
-        ptx.AppendLine("GB_LOOP:");
-        ptx.AppendLine($"    setp.ge.u32 %p1, %r4, {m};");
-        ptx.AppendLine("    @%p1 bra.uni GB_STORE;");
-        EmitRowColumnOffset(ptx, "%r4", n, "%r1", "%rd4");
-        ptx.AppendLine("    add.u64 %rd5, %rd0, %rd4;");
-        ptx.AppendLine("    add.u64 %rd6, %rd1, %rd4;");
-        ptx.AppendLine("    ld.global.nc.f32 %f0, [%rd5];");
-        ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd6];");
+        // dInput = maskedGrad @ W. The weight loader transposes a coalesced
+        // W[K,N] panel into shared memory so each output thread reads one
+        // contiguous shared column during the inner product.
+        ptx.AppendLine("GRAD_INPUT_PATH:");
+        ptx.AppendLine($"    div.u32 %r2, %r1, {kTiles};");
+        ptx.AppendLine($"    rem.u32 %r3, %r1, {kTiles};");
+        EmitLocalCoordinates(ptx);
+        ptx.AppendLine($"    mad.lo.u32 %r6, %r2, {Tile}, %r4;");
+        ptx.AppendLine($"    mad.lo.u32 %r7, %r3, {Tile}, %r5;");
+        ptx.AppendLine("    mov.f32 %f10, 0f00000000;");
+        ptx.AppendLine("    mov.u32 %r8, 0;");
+        ptx.AppendLine("GI_TILE_LOOP:");
+        ptx.AppendLine($"    setp.ge.u32 %p1, %r8, {n};");
+        ptx.AppendLine("    @%p1 bra.uni GI_STORE;");
+        ptx.AppendLine("    add.u32 %r9, %r8, %r5;");
+        ptx.AppendLine($"    mad.lo.u32 %r12, %r6, {n}, %r9;");
+        ptx.AppendLine("    mul.wide.u32 %rd9, %r12, 4;");
+        ptx.AppendLine("    add.u64 %rd10, %rd0, %rd9;");
+        ptx.AppendLine("    add.u64 %rd11, %rd3, %rd9;");
+        ptx.AppendLine("    ld.global.nc.f32 %f0, [%rd10];");
+        ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd11];");
         EmitMaskedGradient(ptx, activation);
-        ptx.AppendLine("    add.rn.f32 %f7, %f7, %f2;");
-        ptx.AppendLine("    add.u32 %r4, %r4, 1;");
-        ptx.AppendLine("    bra.uni GB_LOOP;");
-        ptx.AppendLine("GB_STORE:");
-        ptx.AppendLine("    mul.wide.u32 %rd7, %r1, 4;");
-        ptx.AppendLine("    add.u64 %rd8, %rd2, %rd7;");
-        ptx.AppendLine("    st.global.f32 [%rd8], %f7;");
+        ptx.AppendLine($"    mad.lo.u32 %r10, %r3, {Tile}, %r4;");
+        ptx.AppendLine($"    mad.lo.u32 %r12, %r10, {n}, %r9;");
+        ptx.AppendLine("    mul.wide.u32 %rd9, %r12, 4;");
+        ptx.AppendLine("    add.u64 %rd10, %rd2, %rd9;");
+        ptx.AppendLine("    ld.global.nc.f32 %f3, [%rd10];");
+        ptx.AppendLine("    mul.wide.u32 %rd9, %r0, 4;");
+        ptx.AppendLine("    add.u64 %rd10, %rd7, %rd9;");
+        ptx.AppendLine("    st.shared.f32 [%rd10], %f2;");
+        ptx.AppendLine($"    mad.lo.u32 %r12, %r5, {Tile}, %r4;");
+        ptx.AppendLine("    mul.wide.u32 %rd9, %r12, 4;");
+        ptx.AppendLine("    add.u64 %rd10, %rd8, %rd9;");
+        ptx.AppendLine("    st.shared.f32 [%rd10], %f3;");
+        ptx.AppendLine("    bar.sync 0;");
+        ptx.AppendLine($"    mul.wide.u32 %rd12, %r4, {Tile * sizeof(float)};");
+        ptx.AppendLine("    add.u64 %rd12, %rd7, %rd12;");
+        ptx.AppendLine("    mul.wide.u32 %rd13, %r5, 4;");
+        ptx.AppendLine("    add.u64 %rd13, %rd8, %rd13;");
+        for (int inner = 0; inner < Tile; inner++)
+        {
+            string aOffset = inner == 0 ? string.Empty : $"+{inner * sizeof(float)}";
+            string bOffset = inner == 0 ? string.Empty : $"+{inner * Tile * sizeof(float)}";
+            ptx.AppendLine($"    ld.shared.f32 %f0, [%rd12{aOffset}];");
+            ptx.AppendLine($"    ld.shared.f32 %f1, [%rd13{bOffset}];");
+            ptx.AppendLine("    fma.rn.f32 %f10, %f0, %f1, %f10;");
+        }
+        ptx.AppendLine("    bar.sync 0;");
+        ptx.AppendLine($"    add.u32 %r8, %r8, {Tile};");
+        ptx.AppendLine("    bra.uni GI_TILE_LOOP;");
+        ptx.AppendLine("GI_STORE:");
+        ptx.AppendLine($"    mad.lo.u32 %r12, %r6, {k}, %r7;");
+        ptx.AppendLine("    mul.wide.u32 %rd9, %r12, 4;");
+        ptx.AppendLine("    add.u64 %rd10, %rd4, %rd9;");
+        ptx.AppendLine("    st.global.f32 [%rd10], %f10;");
         EmitFooter(ptx);
     }
 
@@ -261,9 +288,9 @@ internal sealed class PtxFusedLinearBackwardKernel : IDisposable
 
     private static void EmitRegisters(StringBuilder ptx)
     {
-        ptx.AppendLine("    .reg .pred %p<6>;");
+        ptx.AppendLine("    .reg .pred %p<8>;");
         ptx.AppendLine("    .reg .b32 %r<16>;");
-        ptx.AppendLine("    .reg .b64 %rd<16>;");
+        ptx.AppendLine("    .reg .b64 %rd<20>;");
         ptx.AppendLine("    .reg .f32 %f<16>;");
     }
 
@@ -273,23 +300,20 @@ internal sealed class PtxFusedLinearBackwardKernel : IDisposable
             ptx.AppendLine($"    ld.param.u64 %rd{i}, [{names[i]}];");
     }
 
-    private static void EmitIndex(StringBuilder ptx, int total, int columns)
+    private static void EmitLocalCoordinates(StringBuilder ptx)
     {
-        ptx.AppendLine("    mov.u32 %r0, %ctaid.x;");
-        ptx.AppendLine("    mov.u32 %r1, %tid.x;");
-        ptx.AppendLine($"    mad.lo.u32 %r1, %r0, {BlockThreads}, %r1;");
-        ptx.AppendLine($"    setp.ge.u32 %p0, %r1, {total};");
-        ptx.AppendLine("    @%p0 bra.uni KERNEL_DONE;");
-        ptx.AppendLine($"    div.u32 %r2, %r1, {columns};");
-        ptx.AppendLine($"    rem.u32 %r3, %r1, {columns};");
+        ptx.AppendLine($"    div.u32 %r4, %r0, {Tile};");
+        ptx.AppendLine($"    rem.u32 %r5, %r0, {Tile};");
     }
 
-    private static void EmitRowColumnOffset(
-        StringBuilder ptx, string row, int columns, string column, string target)
+    private static void EmitStorePanels(
+        StringBuilder ptx, string tileAValue, string tileBValue)
     {
-        ptx.AppendLine($"    mul.lo.u32 %r10, {row}, {columns};");
-        ptx.AppendLine($"    add.u32 %r10, %r10, {column};");
-        ptx.AppendLine($"    mul.wide.u32 {target}, %r10, 4;");
+        ptx.AppendLine("    mul.wide.u32 %rd9, %r0, 4;");
+        ptx.AppendLine("    add.u64 %rd10, %rd7, %rd9;");
+        ptx.AppendLine($"    st.shared.f32 [%rd10], {tileAValue};");
+        ptx.AppendLine("    add.u64 %rd11, %rd8, %rd9;");
+        ptx.AppendLine($"    st.shared.f32 [%rd11], {tileBValue};");
     }
 
     private static void EmitMaskedGradient(
@@ -381,7 +405,7 @@ internal sealed class PtxFusedLinearBackwardKernel : IDisposable
         var weights = new DirectPtxExtent(k, n);
         return new DirectPtxKernelBlueprint(
             Operation: "fused-linear-backward",
-            Version: 1,
+            Version: 2,
             Architecture: architecture,
             Variant: $"fp32-m{m}-k{k}-n{n}-{activation}".ToLowerInvariant(),
             Tensors:
@@ -404,14 +428,17 @@ internal sealed class PtxFusedLinearBackwardKernel : IDisposable
             ],
             ResourceBudget: new DirectPtxResourceBudget(
                 MaxRegistersPerThread: 48,
-                MaxStaticSharedBytes: 0,
+                MaxStaticSharedBytes: 2 * Tile * Tile * sizeof(float),
                 MaxLocalBytesPerThread: 0,
                 MinBlocksPerMultiprocessor: 4),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["formula"] = "dX,dW,db for activation(X@W+bias)",
                 ["activation"] = activation.ToString(),
-                ["masked-gradient"] = "recomputed-in-registers-per-output-kernel",
+                ["launch-topology"] = "single-grid-disjoint-dinput-dweight-cta-ranges",
+                ["tiling"] = "16x16-shared-panels-coalesced-global-loads",
+                ["masked-gradient"] = "recomputed-in-registers-once-per-shared-panel-load",
+                ["bias-gradient"] = "accumulated-by-k0-dweight-tile-from-resident-masked-gradient-panel",
                 ["global-intermediates"] = "none",
                 ["temporary-device-allocation"] = "none",
                 ["shape-parameters"] = "none",

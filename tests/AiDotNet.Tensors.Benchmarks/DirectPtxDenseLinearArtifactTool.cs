@@ -255,33 +255,33 @@ internal static class DirectPtxDenseLinearArtifactTool
                 PtxFusedLinearTiledKernel.EmitPtx(
                 major, minor, 64, 256, 256, DirectPtxLinearActivation.None,
                 DirectPtxLinearWeightLayout.InputMajor, false, 4)),
-            Cell("16-bit-gemm-v1-Ampere-Float16-to-Float32-b1-m16-n16-k32-taFalse-tbFalse-haFalse",
+            Cell("16-bit-gemm-v2-Ampere-tensorcore-async-Float16-to-Float32-b1-m16-n16-k32-taFalse-tbFalse-haFalse",
                 PtxFp16GemmKernel.EmitPtx(major, minor, 16, 16, 32)),
-            Cell("fused-linear-bias-gelu-v4-Ampere-tensorcore-async-ldmatrix-fp16-fp32acc-m16-nblock64-k512-n2048",
+            Cell("fused-linear-bias-gelu-v5-Ampere-tensorcore-async-ldmatrix-fp16-fp32acc-m16-nblock64-k512-n2048",
                 PtxFusedLinearGeluFp16M16Kernel.EmitPtx(
                     major, minor, 512, 2_048)),
-            Cell("fused-linear-bias-gelu-v4-Ampere-tensorcore-async-ldmatrix-fp16-fp32acc-m16-nblock32-k512-n2048",
+            Cell("fused-linear-bias-gelu-v5-Ampere-tensorcore-async-ldmatrix-fp16-fp32acc-m16-nblock32-k512-n2048",
                 PtxFusedLinearGeluFp16M16Kernel.EmitPtx(
                     major, minor, 512, 2_048, outputsPerBlock: 32)),
-            Cell("fused-linear-bias-gelu-v4-Ampere-tensorcore-async-ldmatrix-fp16-fp32acc-m16-nblock64-k1024-n4096",
+            Cell("fused-linear-bias-gelu-v5-Ampere-tensorcore-async-ldmatrix-fp16-fp32acc-m16-nblock64-k1024-n4096",
                 PtxFusedLinearGeluFp16M16Kernel.EmitPtx(
                     major, minor, 1_024, 4_096)),
-            Cell("fused-linear-bias-gelu-v4-Ampere-tensorcore-async-ldmatrix-fp16-fp32acc-m16-nblock32-k1024-n4096",
+            Cell("fused-linear-bias-gelu-v5-Ampere-tensorcore-async-ldmatrix-fp16-fp32acc-m16-nblock32-k1024-n4096",
                 PtxFusedLinearGeluFp16M16Kernel.EmitPtx(
                     major, minor, 1_024, 4_096, outputsPerBlock: 32)),
-            Cell("fused-lora-forward-v1-Ampere-fp32-b8-i256-r8-o256-s3e000000",
+            Cell("fused-lora-forward-v2-Ampere-fp32-b8-i256-r8-o256-s3e000000",
                 PtxFusedLoRAKernel.EmitPtx(major, minor, 8, 256, 8, 256, 0.125f)),
             Cell("fused-linear-cross-entropy-index-v1-Ampere-fp32-b4-k16-v32",
                 PtxFusedLinearCrossEntropyKernel.EmitPtx(
                 major, minor, DirectPtxCrossEntropyTarget.Index, 4, 16, 32)),
-            Cell("fused-linear-backward-v1-Ampere-fp32-m64-k256-n256-relu",
+            Cell("fused-linear-backward-v2-Ampere-fp32-m64-k256-n256-relu",
                 PtxFusedLinearBackwardKernel.EmitPtx(
                 major, minor, 64, 256, 256, DirectPtxLinearActivation.Relu)),
             Cell("dense-dot-v1-Ampere-fp32-k4096", PtxDenseVectorKernel.EmitPtx(
                 major, minor, DirectPtxDenseVectorOperation.Dot, 4_096)),
-            Cell("dense-outer-v1-Ampere-fp32-m64-n128", PtxDenseVectorKernel.EmitPtx(
+            Cell("dense-outer-v2-Ampere-fp32x4-m64-n128", PtxDenseVectorKernel.EmitPtx(
                 major, minor, DirectPtxDenseVectorOperation.Outer, 64, 128)),
-            Cell("batched-dense-dot-v1-Ampere-fp32-b4-d512",
+            Cell("batched-dense-dot-v2-Ampere-warp-per-batch-fp32-b4-d512",
                 PtxBatchedVectorKernel.EmitPtx(
                 major, minor, DirectPtxBatchedVectorOperation.Dot, 4, 512)),
             Cell("strided-dot-v1-Ampere-fp32-a512-b512-o511-s-1",

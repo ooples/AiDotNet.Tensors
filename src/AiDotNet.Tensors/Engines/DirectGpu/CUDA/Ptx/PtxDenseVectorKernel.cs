@@ -79,9 +79,12 @@ internal sealed class PtxDenseVectorKernel : IDisposable
         arguments[0] = &leftPointer;
         arguments[1] = &rightPointer;
         arguments[2] = &outputPointer;
+        long workItems = Operation == DirectPtxDenseVectorOperation.Outer && (N & 3) == 0
+            ? (long)M * (N / 4)
+            : (long)M * N;
         uint grid = Operation == DirectPtxDenseVectorOperation.Dot
             ? 1u
-            : checked((uint)(((long)M * N + BlockThreads - 1) / BlockThreads));
+            : checked((uint)((workItems + BlockThreads - 1) / BlockThreads));
         _module.Launch(
             _function, grid, 1, 1, BlockThreads, 1, 1, 0, arguments);
     }
@@ -110,6 +113,12 @@ internal sealed class PtxDenseVectorKernel : IDisposable
 
     private static void EmitOuter(StringBuilder ptx, int m, int n)
     {
+        if ((n & 3) == 0)
+        {
+            EmitVectorizedOuter(ptx, m, n);
+            return;
+        }
+
         int total = checked(m * n);
         ptx.AppendLine($"// exact outer product M={m} N={n}; pointer-only ABI");
         EmitHeader(ptx, OuterEntryPoint);
@@ -135,6 +144,50 @@ internal sealed class PtxDenseVectorKernel : IDisposable
         ptx.AppendLine("    mul.wide.u32 %rd7, %r2, 4;");
         ptx.AppendLine("    add.u64 %rd8, %rd2, %rd7;");
         ptx.AppendLine("    st.global.f32 [%rd8], %f2;");
+        ptx.AppendLine("OUTER_DONE:");
+        ptx.AppendLine("    ret;");
+        ptx.AppendLine("}");
+    }
+
+    private static void EmitVectorizedOuter(StringBuilder ptx, int m, int n)
+    {
+        int vectorsPerRow = n / 4;
+        int totalVectors = checked(m * vectorsPerRow);
+        ptx.AppendLine($"// exact outer product M={m} N={n}; aligned float4 streaming specialization");
+        EmitHeader(ptx, OuterEntryPoint);
+        ptx.AppendLine("    .reg .pred %p<2>;");
+        ptx.AppendLine("    .reg .b32 %r<8>;");
+        ptx.AppendLine("    .reg .b64 %rd<12>;");
+        ptx.AppendLine("    .reg .f32 %f<10>;");
+        EmitPointers(ptx);
+        ptx.AppendLine("    mov.u32 %r0, %ctaid.x;");
+        ptx.AppendLine("    mov.u32 %r1, %tid.x;");
+        ptx.AppendLine($"    mad.lo.u32 %r2, %r0, {BlockThreads}, %r1;");
+        ptx.AppendLine($"    setp.ge.u32 %p0, %r2, {totalVectors};");
+        ptx.AppendLine("    @%p0 bra.uni OUTER_DONE;");
+        if (IsPowerOfTwo(vectorsPerRow))
+        {
+            ptx.AppendLine($"    shr.u32 %r3, %r2, {Log2(vectorsPerRow)};");
+            ptx.AppendLine($"    and.b32 %r4, %r2, {vectorsPerRow - 1};");
+        }
+        else
+        {
+            ptx.AppendLine($"    div.u32 %r3, %r2, {vectorsPerRow};");
+            ptx.AppendLine($"    rem.u32 %r4, %r2, {vectorsPerRow};");
+        }
+        ptx.AppendLine("    mul.wide.u32 %rd3, %r3, 4;");
+        ptx.AppendLine("    add.u64 %rd4, %rd0, %rd3;");
+        ptx.AppendLine("    ld.global.nc.f32 %f0, [%rd4];");
+        ptx.AppendLine("    mul.wide.u32 %rd5, %r4, 16;");
+        ptx.AppendLine("    add.u64 %rd6, %rd1, %rd5;");
+        ptx.AppendLine("    ld.global.nc.v4.f32 {%f1,%f2,%f3,%f4}, [%rd6];");
+        ptx.AppendLine("    mul.rn.f32 %f5, %f0, %f1;");
+        ptx.AppendLine("    mul.rn.f32 %f6, %f0, %f2;");
+        ptx.AppendLine("    mul.rn.f32 %f7, %f0, %f3;");
+        ptx.AppendLine("    mul.rn.f32 %f8, %f0, %f4;");
+        ptx.AppendLine("    mul.wide.u32 %rd7, %r2, 16;");
+        ptx.AppendLine("    add.u64 %rd8, %rd2, %rd7;");
+        ptx.AppendLine("    st.global.v4.f32 [%rd8], {%f5,%f6,%f7,%f8};");
         ptx.AppendLine("OUTER_DONE:");
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");
@@ -234,14 +287,16 @@ internal sealed class PtxDenseVectorKernel : IDisposable
         int n)
     {
         bool dot = operation == DirectPtxDenseVectorOperation.Dot;
+        bool vectorizedOuter = !dot && (n & 3) == 0;
         var left = new DirectPtxExtent(m);
         var right = new DirectPtxExtent(dot ? m : n);
         var output = dot ? new DirectPtxExtent(1) : new DirectPtxExtent(m, n);
         return new DirectPtxKernelBlueprint(
             Operation: dot ? "dense-dot" : "dense-outer",
-            Version: 1,
+            Version: vectorizedOuter ? 2 : 1,
             Architecture: architecture,
-            Variant: dot ? $"fp32-k{m}" : $"fp32-m{m}-n{n}",
+            Variant: dot ? $"fp32-k{m}" :
+                $"{(vectorizedOuter ? "fp32x4" : "fp32")}-m{m}-n{n}",
             Tensors:
             [
                 new("left", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
@@ -264,8 +319,20 @@ internal sealed class PtxDenseVectorKernel : IDisposable
                 ["shape-parameters"] = "none",
                 ["stride-parameters"] = "none",
                 ["temporary-device-allocation"] = "none",
-                ["global-intermediates"] = "none"
+                ["global-intermediates"] = "none",
+                ["memory-pipeline"] = vectorizedOuter
+                    ? "aligned float4 load/multiply/store; one output write"
+                    : "scalar register path; one output write"
             });
+    }
+
+    private static bool IsPowerOfTwo(int value) => value > 0 && (value & (value - 1)) == 0;
+
+    private static int Log2(int value)
+    {
+        int result = 0;
+        while ((value >>= 1) != 0) result++;
+        return result;
     }
 
     private static void Validate(DirectPtxDenseVectorOperation operation, int m, int n)

@@ -4,4 +4,4 @@ driver-version=13030
 cuda-driver-linker-info-log:
 info    : 0 bytes gmem
 info    : Function properties for 'aidotnet_fused_linear_gelu_m1':
-info    : used 24 registers, used -1365508094 barriers, 0 stack, 0 bytes smem, 384 bytes cmem[0], 0 bytes lmem
+info    : used 24 registers, used -1206059006 barriers, 0 stack, 0 bytes smem, 384 bytes cmem[0], 0 bytes lmem

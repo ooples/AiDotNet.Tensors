@@ -13,6 +13,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 internal static class DirectPtxDenseLinearAutotuner
 {
     private const string VariantPrefix = "nblock-";
+    internal const double NearTieTolerance = 0.03;
 
     internal static int[] Candidates(int inputFeatures, int outputFeatures)
     {
@@ -49,7 +50,9 @@ internal static class DirectPtxDenseLinearAutotuner
         int outputFeatures,
         int outputsPerBlock,
         double milliseconds,
-        double gflops)
+        double gflops,
+        double n64MedianMilliseconds,
+        double n32MedianMilliseconds)
     {
         if (Array.IndexOf(Candidates(inputFeatures, outputFeatures), outputsPerBlock) < 0)
             throw new ArgumentOutOfRangeException(nameof(outputsPerBlock));
@@ -78,7 +81,13 @@ internal static class DirectPtxDenseLinearAutotuner
                                     runtime.ComputeCapabilityMinor,
                                     inputFeatures, outputFeatures, outputsPerBlock),
                                 runtime.ComputeCapabilityMajor,
-                                runtime.ComputeCapabilityMinor)
+                                runtime.ComputeCapabilityMinor),
+                        ["N64MedianMicroseconds"] = (n64MedianMilliseconds * 1_000d)
+                            .ToString("R", CultureInfo.InvariantCulture),
+                        ["N32MedianMicroseconds"] = (n32MedianMilliseconds * 1_000d)
+                            .ToString("R", CultureInfo.InvariantCulture),
+                        ["NearTieTolerancePercent"] = (NearTieTolerance * 100d)
+                            .ToString("R", CultureInfo.InvariantCulture)
                     },
                     MeasuredTimeMs = milliseconds,
                     MeasuredGflops = gflops,
@@ -90,6 +99,43 @@ internal static class DirectPtxDenseLinearAutotuner
             // Persistence is advisory. The in-memory winner remains valid when
             // the cache root is read-only or temporarily unavailable.
         }
+    }
+
+    /// <summary>
+    /// Selects the measured winner while retaining N=64 when it is within the
+    /// bounded noise band of the absolute minimum. That deterministic tie
+    /// policy prevents identical hardware from oscillating between cache
+    /// entries when launch timings differ only by normal measurement noise.
+    /// </summary>
+    internal static int SelectWinner(
+        double n64MedianMilliseconds,
+        double n32MedianMilliseconds)
+    {
+        ValidateMeasurement(n64MedianMilliseconds, nameof(n64MedianMilliseconds));
+        ValidateMeasurement(n32MedianMilliseconds, nameof(n32MedianMilliseconds));
+        return n64MedianMilliseconds <= n32MedianMilliseconds * (1d + NearTieTolerance)
+            ? 64
+            : 32;
+    }
+
+    internal static double MedianMilliseconds(float[] samples)
+    {
+        PtxCompat.ThrowIfNull(samples, nameof(samples));
+        if (samples.Length == 0) throw new ArgumentException("At least one sample is required.", nameof(samples));
+        var ordered = (float[])samples.Clone();
+        Array.Sort(ordered);
+        int middle = ordered.Length / 2;
+        double median = (ordered.Length & 1) != 0
+            ? ordered[middle]
+            : ((double)ordered[middle - 1] + ordered[middle]) / 2d;
+        ValidateMeasurement(median, nameof(samples));
+        return median;
+    }
+
+    private static void ValidateMeasurement(double milliseconds, string parameterName)
+    {
+        if (double.IsNaN(milliseconds) || double.IsInfinity(milliseconds) || milliseconds <= 0d)
+            throw new ArgumentOutOfRangeException(parameterName);
     }
 
     private static KernelId KernelId(
@@ -111,7 +157,7 @@ internal static class DirectPtxDenseLinearAutotuner
             "n64=" + n64 + "\nn32=" + n32 + "\n");
         return new KernelId(
             "direct-ptx-dense-linear",
-            "fused-gelu-fp16-m16-v4-" + runtime.DeviceFingerprint +
+            "fused-gelu-fp16-m16-v5-tuner-v2-" + runtime.DeviceFingerprint +
             "-candidate-set-" + candidateSet);
     }
 

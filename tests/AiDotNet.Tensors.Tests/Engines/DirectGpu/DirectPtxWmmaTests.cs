@@ -4643,8 +4643,12 @@ public partial class DirectPtxWmmaTests
             float error = MathF.Abs(actual[i] - expected[i]);
             if (error > maximum) { maximum = error; maximumIndex = i; }
         }
+        string values = maximumIndex >= 0
+            ? $"actual {actual[maximumIndex]:G9}, expected {expected[maximumIndex]:G9}"
+            : "all values identical";
         Assert.True(maximum <= tolerance,
-            $"{name} max absolute error {maximum:G9} at {maximumIndex}; tolerance {tolerance:G9}.");
+            $"{name} max absolute error {maximum:G9} at {maximumIndex}; " +
+            $"{values}, tolerance {tolerance:G9}.");
     }
 
     private static ushort[] RandomHalf(Random random, int length)
