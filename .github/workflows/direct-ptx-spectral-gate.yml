@@ -16,6 +16,8 @@ on:
       - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxFusedComplexMultiplyF32Kernel.cs'
       - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxFusedComplexUnaryF32Kernel.cs'
       - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxSplitComplexUnaryF32Kernel.cs'
+      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxSplitComplexBinaryF32Kernel.cs'
+      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxSplitComplexConjugateF32Kernel.cs'
       - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/**'
       - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxSpectralCubinTool.cs'
       - 'tests/AiDotNet.Tensors.Benchmarks/Program.cs'

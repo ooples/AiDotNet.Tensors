@@ -60,6 +60,33 @@ internal static class DirectPtxSpectralCubinTool
                     PtxSplitComplexUnaryF32Kernel.EmitPtx(8, 6, op, count));
             }
         }
+
+        // The split-complex binary operators and the split conjugate landed
+        // after this gate was first written; enumerating them here keeps every
+        // kernel in the family covered by machine-code evidence.
+        foreach (int count in new[] { 65_536, 262_144, 1_048_576, 4_194_304 })
+        {
+            if (PtxSplitComplexBinaryF32Kernel.IsSupportedShape(count))
+            {
+                foreach (DirectPtxSplitComplexBinaryOp op in new[]
+                         {
+                             DirectPtxSplitComplexBinaryOp.Multiply,
+                             DirectPtxSplitComplexBinaryOp.Add,
+                         })
+                {
+                    yield return new DirectPtxModuleSource(
+                        $"split-complex-{op}-f32-v1-n{count}",
+                        PtxSplitComplexBinaryF32Kernel.EntryPointFor(op),
+                        PtxSplitComplexBinaryF32Kernel.EmitPtx(8, 6, op, count));
+                }
+            }
+
+            if (PtxSplitComplexConjugateF32Kernel.IsSupportedShape(count))
+                yield return new DirectPtxModuleSource(
+                    $"split-complex-conjugate-f32-v1-n{count}",
+                    PtxSplitComplexConjugateF32Kernel.EntryPoint,
+                    PtxSplitComplexConjugateF32Kernel.EmitPtx(8, 6, count));
+        }
     }
 
     internal static int Generate(string[] args) => args.Length < 3
