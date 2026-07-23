@@ -300,6 +300,10 @@
          by MKL.NET.win-x64 pre-removal. The telemetry path is only useful on net10.0
          runtimes (the GPU backends we wire it into), so excluding it on net471 is safe. -->
     <Compile Remove="Engines\DirectGpu\Telemetry\SupabaseTelemetryClient.cs" />
+    <!-- SupabaseGpuTuningExchange (Phase 2 community autotune) is net10-only for the
+         same reason: it depends on System.Net.Http + System.Text.Json. net471
+         participates in local autotune fully via the NullGpuTuningExchange. -->
+    <Compile Remove="Engines\DirectGpu\Telemetry\SupabaseGpuTuningExchange.cs" />
   </ItemGroup>
 
   <!--
@@ -309,8 +313,14 @@
     but the source code never contains credentials.
   -->
   <PropertyGroup>
-    <TelemetryUrl Condition="'$(TelemetryUrl)' == ''"></TelemetryUrl>
-    <TelemetryKey Condition="'$(TelemetryKey)' == ''"></TelemetryKey>
+    <!-- Embedded defaults point at the Ooples aidotnet-gpu-telemetry project.
+         The publishable key is public-by-design (RLS restricts anon to
+         insert/select on the telemetry tables); a runtime AIDOTNET_TELEMETRY_URL /
+         AIDOTNET_TELEMETRY_KEY env var overrides it, and telemetry stays OFF
+         unless AIDOTNET_TELEMETRY=true regardless. CI may still override with
+         -p:TelemetryUrl=... -p:TelemetryKey=... -->
+    <TelemetryUrl Condition="'$(TelemetryUrl)' == ''">https://yfkqwpgjahoamlgckjib.supabase.co</TelemetryUrl>
+    <TelemetryKey Condition="'$(TelemetryKey)' == ''">sb_publishable_ZMB8J8H82gdHAatyNOVDyA__hUWhREZ</TelemetryKey>
   </PropertyGroup>
 
   <ItemGroup>

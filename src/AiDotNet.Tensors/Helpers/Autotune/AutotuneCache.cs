@@ -475,6 +475,10 @@ public static class AutotuneCache
                     {
                         Variant = bestVariant,
                         MeasuredGflops = bestGflops,
+                        // Persist the winner's structured parameters when the entry
+                        // supplies them, so tile/block hyperparameters survive the
+                        // round-trip (previously only Variant + GFLOPS were stored).
+                        Parameters = CopyParameters(entry.ParametersFor?.Invoke(shape, bestVariant)),
                     };
                     TryStore(entry.Id, shape, choice);
                     best[ReportKey(entry.Id, shape)] = bestGflops;
@@ -490,6 +494,20 @@ public static class AutotuneCache
 
     private static string ReportKey(KernelId id, ShapeProfile shape)
         => $"{id.ToFileStem()}@{shape.ToFileStem()}";
+
+    // Copies an entry's parameter map into the KernelChoice's dictionary with the
+    // ordinal comparer used everywhere else. A null value would be rejected by the
+    // Lookup corruption gate, so null values are normalized to empty strings.
+    private static Dictionary<string, string> CopyParameters(
+        IReadOnlyDictionary<string, string>? parameters)
+    {
+        var copy = new Dictionary<string, string>(
+            parameters?.Count ?? 0, StringComparer.Ordinal);
+        if (parameters is not null)
+            foreach (var kv in parameters)
+                copy[kv.Key] = kv.Value ?? string.Empty;
+        return copy;
+    }
 
     private static int[][] DefaultRepresentativeShapes() => new[]
     {
