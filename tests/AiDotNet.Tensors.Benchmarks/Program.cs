@@ -13,6 +13,25 @@ class Program
 
     static void Main(string[] args)
     {
+        // GPU-free cubin generation and verification for the pooling family.
+        if (args.Length > 0 && args[0] == "--generate-direct-ptx-pooling-cubins")
+        {
+            Environment.ExitCode = DirectPtxPoolingCubinTool.Generate(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-pooling-cubins")
+        {
+            Environment.ExitCode = DirectPtxPoolingCubinTool.Verify(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-pooling-sass")
+        {
+            Environment.ExitCode = DirectPtxPoolingCubinTool.AuditSass(args);
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--direct-ptx-attention")
         {
             DirectPtxAttentionExperiment.Run();
