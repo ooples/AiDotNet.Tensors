@@ -149,6 +149,20 @@ public static class PtxParityRegistry
             "thread-per-(frame,mel) fma reduction over the frequency axis, matching the reference's " +
             "fused sum. The spec is a fp64-oracle comparison over exact (frames,freqs,mels) shapes on " +
             "SM86; converts to ThreeWayParity when that run lands. Until then unpromoted and fail-closed."),
+
+        new PtxParitySpec("PtxBitReversePermutationF32Kernel", PtxParityStatus.Deferred,
+            "FFT bit-reversal permutation, fp32 (#850) - CudaBackend.FFT (stage 1 of radix-2 DIT)",
+            "one module per power-of-two length; the log2(n)-bit-reversed index is a single brev.b32 " +
+            "shifted right by 32-log2(n), and the lower thread of each pair performs the in-place swap. " +
+            "It is pure data movement, so the spec is bit-exact including NaN payloads and signed zeros. " +
+            "Converts to ThreeWayParity when the SM86 fp64-oracle FFT run lands; until then unpromoted."),
+        new PtxParitySpec("PtxFftButterflyF32Kernel", PtxParityStatus.Deferred,
+            "FFT radix-2 butterfly stage, fp32 (#850) - CudaBackend.FFT (stage 2 of radix-2 DIT)",
+            "one module per (length, stage stride); each thread owns one butterfly wing and applies a " +
+            "cos.approx/sin.approx twiddle, so - unlike the pure-movement bit-reverse stage - its spec is " +
+            "TOLERANCE-based, not bit-exact. The full transform launches this stage log2(n) times with " +
+            "doubling strides after the bit-reverse pass. Converts to ThreeWayParity (with tolerance) when " +
+            "the SM86 fp64-oracle FFT run lands; until then unpromoted and fail-closed."),
     };
 
     private static readonly Dictionary<string, PtxParitySpec> ByKernel =

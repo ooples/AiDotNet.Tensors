@@ -48,7 +48,7 @@ internal static class DirectPtxSpectralCoverageManifest
         Experimental("CudaBackend.SplitComplexScale", "NVRTC split_complex_scale", "complex scalar scale", Split, "FP32", "v1 Ampere split exact-count cells (PtxSplitComplexScaleF32Kernel); one mul.rn per lane, bit-exact; scalar via .param .f32"),
         Experimental("CudaBackend.SplitComplexAdd", "NVRTC split_complex_add", "complex add", Split, "FP32", "v1 Ampere split exact-count cells (PtxSplitComplexBinaryF32Kernel); two add.rn lanes"),
         Experimental("CudaBackend.SplitComplexCrossSpectral", "NVRTC split_complex_cross_spectral", "cross spectral product", Split, "FP32", "v1 Ampere split exact-count cells (PtxSplitComplexBinaryF32Kernel CrossSpectral); a*conj(b) with the multiply-then-fma contraction matching the reference fused form"),
-        Planned("CudaBackend.FFT", "NVRTC radix-2 stages", "1D complex FFT/IFFT", Split, "FP32", "radix-size-direction-cells"),
+        Experimental("CudaBackend.FFT", "NVRTC radix-2 stages", "1D complex FFT/IFFT", Split, "FP32", "v1 Ampere radix-2 DIT: PtxBitReversePermutationF32Kernel (brev.b32 guarded swap, bit-exact) then log2(n) PtxFftButterflyF32Kernel stages (cos.approx/sin.approx twiddles, tolerance-based)"),
         Planned("CudaBackend.BatchedFFT", "NVRTC batched radix-2 stages", "batched 1D complex FFT/IFFT", Split, "FP32", "batched-radix-size-direction-cells"),
         Planned("CudaBackend.FFT2D", "NVRTC row/column radix-2 stages", "2D complex FFT/IFFT", Split, "FP32", "fft2d-shape-direction-cells"),
         Planned("CudaBackend.BatchedFFT2D", "NVRTC batched FFT2D", "batched 2D complex FFT/IFFT", Split, "FP32", "batched-fft2d-shape-cells"),
