@@ -140,6 +140,15 @@ public static class PtxParityRegistry
             "against the strongest eligible cuDNN/PyTorch competitor, plus Nsight zero-spill SASS evidence. " +
             "Keep deferred until that three-way matrix and the competitive gates exist."),
 
+        new PtxParitySpec("PtxConv2DNchw3x3WinogradF23Kernel", PtxParityStatus.Deferred,
+            "Winograd F(2,3) 3x3 stride-1 same-conv+bias+ReLU, ResNet shapes (#841)",
+            "the 3x3 forward cell computed via Winograd F(2,3) (2x2 output tile, 4x4 input tile; input " +
+            "B^T d B, filter G g G^T, elementwise, output A^T M A). The math is verified correct on-device " +
+            "(<= 2e-3 vs the fp64 direct-conv oracle) with zero SASS spills, but the correctness-first " +
+            "one-thread-per-tile layout (redundant per-tile filter transforms, no data reuse) is ~4.5x " +
+            "slower than cuDNN. Keep deferred/unpromoted until the optimized layout (precomputed filter " +
+            "transform + register-blocked batched 16-GEMM + input-transform reuse) clears the >=1.10x gate."),
+
         new PtxParitySpec("PtxConv2DNchwK1RegBlockedKernel", PtxParityStatus.Deferred,
             "register-blocked shared-memory 1x1 Conv2D+bias+ReLU GEMM, ResNet shapes (#841)",
             "the register-blocked (TM x TN micro-tile) tiled-GEMM specialization: each thread computes a " +

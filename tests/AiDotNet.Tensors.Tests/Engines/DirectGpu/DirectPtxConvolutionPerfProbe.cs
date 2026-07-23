@@ -40,6 +40,8 @@ public sealed class DirectPtxConvolutionPerfProbe
             // ResNet 1x1 bottleneck: N32, C64, H56, W56, K64 (HW=3136), tile 16.
             MeasureTiled(runtime, new Conv2DTiledShape(32, 64, 64, 3136, 16));
             MeasureRegBlocked(runtime, new Conv2DRegBlockShape(32, 64, 64, 3136, 64, 64, 16, 4, 4));
+            // ResNet c64 3x3 same-conv via Winograd F(2,3): N32/C64/56x56/K64.
+            MeasureWinograd(runtime, new Conv2DWinogradShape(32, 64, 56, 56, 64));
         }
         finally
         {
@@ -111,6 +113,29 @@ public sealed class DirectPtxConvolutionPerfProbe
         Report($"regblk N{shape.Batch}/C{shape.InputChannels}/HW{shape.Spatial}/K{shape.OutputChannels} 1x1 " +
             $"{shape.BlockM}x{shape.BlockN}x{shape.BlockK}/{shape.ThreadM}x{shape.ThreadN} regs={kernel.FunctionInfo.RegistersPerThread}",
             runtime, Launch, flops);
+    }
+
+    private void MeasureWinograd(DirectPtxRuntime runtime, Conv2DWinogradShape shape)
+    {
+        using var kernel = new PtxConv2DNchw3x3WinogradF23Kernel(runtime, shape);
+        using var input = runtime.AllocateBytes((nuint)shape.InputBytes);
+        using var weights = runtime.AllocateBytes((nuint)shape.WeightBytes);
+        using var bias = runtime.AllocateBytes((nuint)shape.BiasBytes);
+        using var output = runtime.AllocateBytes((nuint)shape.OutputBytes);
+        input.Upload<float>(new float[shape.InputBytes / sizeof(float)]);
+        weights.Upload<float>(new float[shape.WeightBytes / sizeof(float)]);
+        bias.Upload<float>(new float[shape.BiasBytes / sizeof(float)]);
+
+        void Launch() => kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(weights, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[3]));
+
+        // Report against nominal direct-conv FLOPs (2*N*K*H*W*C*9) — the standard.
+        long flops = 2L * shape.Batch * shape.OutputChannels * shape.Height * shape.Width * shape.InputChannels * 9;
+        Report($"winograd N{shape.Batch}/C{shape.InputChannels}/{shape.Height}x{shape.Width}/K{shape.OutputChannels} 3x3 " +
+            $"regs={kernel.FunctionInfo.RegistersPerThread}", runtime, Launch, flops);
     }
 
     private void Report(string label, DirectPtxRuntime runtime, Action launch, long flops)

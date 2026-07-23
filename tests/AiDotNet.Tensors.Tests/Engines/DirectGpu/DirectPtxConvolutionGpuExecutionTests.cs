@@ -218,6 +218,90 @@ public sealed class DirectPtxConvolutionGpuExecutionTests
         return actual;
     }
 
+    [Fact]
+    public void Winograd3x3_SmallShape_MatchesDirectConvReference()
+    {
+        if (!DirectPtxRuntime.IsAvailable) return;
+
+        // N2/C4/H8/W8/K4 -> 128 tiles (one block). 3x3 stride-1 same-padded.
+        const int n = 2, cch = 4, h = 8, w = 8, k = 4;
+        var shape = new Conv2DWinogradShape(n, cch, h, w, k);
+
+        var input = new float[n * cch * h * w];
+        var weights = new float[k * cch * 9];
+        var bias = new float[k];
+        for (int i = 0; i < input.Length; i++) input[i] = DeterministicInput(i);
+        for (int i = 0; i < weights.Length; i++) weights[i] = DeterministicWeight(i);
+        for (int i = 0; i < bias.Length; i++) bias[i] = DeterministicBias(i);
+
+        float[] expected = ReferenceConv3x3Same(input, weights, bias, n, cch, h, w, k);
+
+        using var runtime = new DirectPtxRuntime();
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
+            return;
+
+        bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
+        DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
+        try
+        {
+            float[] actual = LaunchWinograd(runtime, shape, input, weights, bias);
+            AssertClose(expected, actual, 2e-3f); // Winograd rounds differently than direct
+        }
+        finally
+        {
+            DirectPtxFeatureGate.ConvolutionExperimentOverride = prior;
+        }
+    }
+
+    private static float[] LaunchWinograd(
+        DirectPtxRuntime runtime, Conv2DWinogradShape shape,
+        float[] input, float[] weights, float[] bias)
+    {
+        using var kernel = new PtxConv2DNchw3x3WinogradF23Kernel(runtime, shape);
+        using var dInput = runtime.AllocateBytes((nuint)shape.InputBytes);
+        using var dWeights = runtime.AllocateBytes((nuint)shape.WeightBytes);
+        using var dBias = runtime.AllocateBytes((nuint)shape.BiasBytes);
+        using var dOutput = runtime.AllocateBytes((nuint)shape.OutputBytes);
+        dInput.Upload<float>(input);
+        dWeights.Upload<float>(weights);
+        dBias.Upload<float>(bias);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(dInput, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(dWeights, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(dBias, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(dOutput, kernel.Blueprint.Tensors[3]));
+        runtime.Synchronize();
+        var actual = new float[shape.Batch * shape.OutputChannels * shape.Height * shape.Width];
+        dOutput.Download<float>(actual);
+        return actual;
+    }
+
+    // Direct 3x3 stride-1 same-padded conv + bias + ReLU, fp64 accumulation.
+    private static float[] ReferenceConv3x3Same(
+        float[] input, float[] weights, float[] bias, int n, int c, int h, int w, int k)
+    {
+        var output = new float[n * k * h * w];
+        for (int b = 0; b < n; b++)
+            for (int oc = 0; oc < k; oc++)
+                for (int oh = 0; oh < h; oh++)
+                    for (int ow = 0; ow < w; ow++)
+                    {
+                        double acc = bias[oc];
+                        for (int ic = 0; ic < c; ic++)
+                            for (int gi = 0; gi < 3; gi++)
+                                for (int gj = 0; gj < 3; gj++)
+                                {
+                                    int ih = oh + gi - 1, iw = ow + gj - 1;
+                                    if (ih < 0 || ih >= h || iw < 0 || iw >= w) continue;
+                                    acc += (double)input[((b * c + ic) * h + ih) * w + iw] *
+                                           weights[((oc * c + ic) * 3 + gi) * 3 + gj];
+                                }
+                        output[((b * k + oc) * h + oh) * w + ow] = (float)Math.Max(acc, 0.0);
+                    }
+        return output;
+    }
+
     private static unsafe float[] LaunchV1(
         DirectPtxRuntime runtime, float[] input, float[] weights, float[] bias)
     {
@@ -280,7 +364,9 @@ public sealed class DirectPtxConvolutionGpuExecutionTests
         return output;
     }
 
-    private static void AssertClose(float[] expected, float[] actual)
+    private static void AssertClose(float[] expected, float[] actual) => AssertClose(expected, actual, Tolerance);
+
+    private static void AssertClose(float[] expected, float[] actual, float tol)
     {
         Assert.Equal(expected.Length, actual.Length);
         float maxErr = 0f;
@@ -290,8 +376,8 @@ public sealed class DirectPtxConvolutionGpuExecutionTests
             float e = Math.Abs(expected[i] - actual[i]);
             if (e > maxErr) { maxErr = e; worst = i; }
         }
-        Assert.True(maxErr <= Tolerance,
-            $"max abs error {maxErr:E3} > {Tolerance:E3} at index {worst} " +
+        Assert.True(maxErr <= tol,
+            $"max abs error {maxErr:E3} > {tol:E3} at index {worst} " +
             $"(expected {(worst >= 0 ? expected[worst] : 0)}, actual {(worst >= 0 ? actual[worst] : 0)})");
     }
 }
