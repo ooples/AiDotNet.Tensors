@@ -13,12 +13,17 @@ internal static class DirectPtxFeatureGate
     internal const string MasterEnvironmentVariable = "AIDOTNET_DIRECT_PTX";
     internal const string EnvironmentVariable = "AIDOTNET_DIRECT_PTX_ATTENTION";
     internal const string ResidualRmsNormEnvironmentVariable = "AIDOTNET_DIRECT_PTX_RESIDUAL_RMSNORM";
+    internal const string ResidualLayerNormGeluEnvironmentVariable = "AIDOTNET_DIRECT_PTX_RESIDUAL_LAYERNORM_GELU";
+    internal const string NormalizationEnvironmentVariable = "AIDOTNET_DIRECT_PTX_NORMALIZATION";
     internal const string FlashDecodeEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FLASH_DECODE";
     internal const string PagedDecodeEnvironmentVariable = "AIDOTNET_DIRECT_PTX_PAGED_DECODE";
     internal const string PagedPrefillEnvironmentVariable = "AIDOTNET_DIRECT_PTX_PAGED_PREFILL";
     internal const string AttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_ATTENTION_BACKWARD";
     internal const string FlashAttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FLASH_ATTENTION_BACKWARD";
     internal const string QkvRopeCacheEnvironmentVariable = "AIDOTNET_DIRECT_PTX_QKV_ROPE_CACHE";
+    internal const string FusedLinearEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FUSED_LINEAR";
+    internal const string MixedPrecisionLinearEnvironmentVariable = "AIDOTNET_DIRECT_PTX_MIXED_LINEAR";
+    internal const string QuantizedLinearEnvironmentVariable = "AIDOTNET_DIRECT_PTX_QUANTIZED_LINEAR";
     internal const string AutotuneEnvironmentVariable = "AIDOTNET_DIRECT_PTX_AUTOTUNE";
     internal const string CacheCapacityEnvironmentVariable = "AIDOTNET_DIRECT_PTX_CACHE_CAPACITY";
 
@@ -28,18 +33,31 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentMasterEnabled = ReadEnabled(MasterEnvironmentVariable);
     private static readonly bool EnvironmentAttentionEnabled = ReadEnabled(EnvironmentVariable);
     private static readonly bool EnvironmentResidualRmsNormEnabled = ReadEnabled(ResidualRmsNormEnvironmentVariable);
+    private static readonly bool EnvironmentResidualLayerNormGeluEnabled = ReadEnabled(ResidualLayerNormGeluEnvironmentVariable);
+    private static readonly bool EnvironmentNormalizationEnabled = ReadEnabled(NormalizationEnvironmentVariable);
     private static readonly bool EnvironmentFlashDecodeEnabled = ReadEnabled(FlashDecodeEnvironmentVariable);
     private static readonly bool EnvironmentPagedDecodeEnabled = ReadEnabled(PagedDecodeEnvironmentVariable);
     private static readonly bool EnvironmentPagedPrefillEnabled = ReadEnabled(PagedPrefillEnvironmentVariable);
     private static readonly bool EnvironmentAttentionBackwardEnabled = ReadEnabled(AttentionBackwardEnvironmentVariable);
     private static readonly bool EnvironmentFlashAttentionBackwardEnabled = ReadEnabled(FlashAttentionBackwardEnvironmentVariable);
     private static readonly bool EnvironmentQkvRopeCacheEnabled = ReadEnabled(QkvRopeCacheEnvironmentVariable);
+    private static readonly bool EnvironmentFusedLinearEnabled = ReadEnabled(FusedLinearEnvironmentVariable);
+    private static readonly bool EnvironmentMixedPrecisionLinearEnabled = ReadEnabled(MixedPrecisionLinearEnvironmentVariable);
+    private static readonly bool EnvironmentQuantizedLinearEnabled = ReadEnabled(QuantizedLinearEnvironmentVariable);
     private static readonly bool EnvironmentAutotuneEnabled =
         !string.Equals(Environment.GetEnvironmentVariable(AutotuneEnvironmentVariable), "0", StringComparison.Ordinal);
     private static readonly int EnvironmentCacheCapacity = ReadCacheCapacity();
 
     /// <summary>Test-only override. Null restores environment-based behavior.</summary>
     internal static bool? TestOverride { get; set; }
+    /// <summary>Benchmark-only access to measured cells that have not passed promotion.</summary>
+    internal static bool FusedLinearExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to mixed-precision cells that have not passed promotion.</summary>
+    internal static bool MixedPrecisionLinearExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to quantized cells that have not passed promotion.</summary>
+    internal static bool QuantizedLinearExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to normalization cells that have not passed promotion.</summary>
+    internal static bool NormalizationExperimentOverride { get; set; }
 
     internal static bool IsEnabled => IsAttentionEnabled;
 
@@ -48,6 +66,12 @@ internal static class DirectPtxFeatureGate
 
     internal static bool IsResidualRmsNormEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentResidualRmsNormEnabled);
+
+    internal static bool IsResidualLayerNormGeluEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentResidualLayerNormGeluEnabled);
+
+    internal static bool IsNormalizationEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentNormalizationEnabled);
 
     internal static bool IsFlashDecodeEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentFlashDecodeEnabled);
@@ -67,6 +91,15 @@ internal static class DirectPtxFeatureGate
     internal static bool IsQkvRopeCacheEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentQkvRopeCacheEnabled);
 
+    internal static bool IsFusedLinearEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentFusedLinearEnabled);
+
+    internal static bool IsMixedPrecisionLinearEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentMixedPrecisionLinearEnabled);
+
+    internal static bool IsQuantizedLinearEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentQuantizedLinearEnabled);
+
     internal static bool IsAutotuneEnabled => EnvironmentAutotuneEnabled;
 
     internal static int CacheCapacity => EnvironmentCacheCapacity;
@@ -83,6 +116,7 @@ internal static class DirectPtxFeatureGate
 
 internal enum DirectPtxPhysicalType
 {
+    Int8,
     Float16,
     BFloat16,
     Float32,
@@ -95,6 +129,8 @@ internal enum DirectPtxPhysicalLayout
     Bhsd,
     /// <summary>Dense row-major [row, feature].</summary>
     RowMajor2D,
+    /// <summary>Dense canonical [batch, channel, spatial] (NCHW-flattened).</summary>
+    Nchw,
     /// <summary>Dense row-major [sequence, head, dimension].</summary>
     SequenceHeadDim,
     /// <summary>Dense [row, qkv, head, feature] projection output.</summary>
@@ -103,6 +139,10 @@ internal enum DirectPtxPhysicalLayout
     PackedQkvWeights,
     /// <summary>Packed Q/K/V projection bias, [qkv,head,feature].</summary>
     PackedQkvBias,
+    /// <summary>Input-major row-major linear weights, [inputFeature,outputFeature].</summary>
+    LinearWeightInputMajor,
+    /// <summary>Output-major row-major linear weights, [outputFeature,inputFeature].</summary>
+    LinearWeightOutputMajor,
     /// <summary>Dense additive attention bias, [H,Sq,Skv] or [B,H,Sq,Skv].</summary>
     AttentionBias,
     /// <summary>One-dimensional canonical vector.</summary>
@@ -200,7 +240,12 @@ internal readonly struct DirectPtxTensorView
             throw new ArgumentException(
                 $"The GPU pointer is not {requiredAlignment}-byte aligned.", nameof(buffer));
 
-        long elementBytes = physicalType is DirectPtxPhysicalType.Float16 or DirectPtxPhysicalType.BFloat16 ? 2L : 4L;
+        long elementBytes = physicalType switch
+        {
+            DirectPtxPhysicalType.Int8 => 1L,
+            DirectPtxPhysicalType.Float16 or DirectPtxPhysicalType.BFloat16 => 2L,
+            _ => 4L
+        };
         if (buffer.SizeInBytes % elementBytes != 0)
             throw new ArgumentException("The buffer byte extent is incompatible with its physical dtype.", nameof(buffer));
 
@@ -221,7 +266,12 @@ internal readonly struct DirectPtxTensorView
             throw new ArgumentException("The direct PTX buffer is smaller than the canonical BHSD view.", nameof(buffer));
         if ((PtxCompat.ToNuint(buffer.Pointer) & 15u) != 0)
             throw new ArgumentException("The direct PTX buffer is not 16-byte aligned.", nameof(buffer));
-        int elementBytes = physicalType is DirectPtxPhysicalType.Float16 or DirectPtxPhysicalType.BFloat16 ? 2 : 4;
+        int elementBytes = physicalType switch
+        {
+            DirectPtxPhysicalType.Int8 => 1,
+            DirectPtxPhysicalType.Float16 or DirectPtxPhysicalType.BFloat16 => 2,
+            _ => 4
+        };
         int elements = checked((int)(requiredBytes / (nuint)elementBytes));
         return new DirectPtxTensorView(
             buffer.Pointer, requiredBytes, buffer.ByteLength, physicalType,

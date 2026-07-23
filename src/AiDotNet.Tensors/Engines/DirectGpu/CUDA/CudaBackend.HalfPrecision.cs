@@ -112,6 +112,115 @@ public sealed partial class CudaBackend
     }
 
     /// <summary>
+    /// Decode-token projection for canonical FP16 output-major weights:
+    /// <c>output[N] = GELU(inputHalf[K] * transpose(weightHalf[N,K]) + biasFloat[N])</c>.
+    /// The admitted direct-PTX path fuses the full operation; the fail-closed
+    /// fallback uses FP16 cuBLAS with FP32 accumulation followed by resident
+    /// bias and GELU kernels and does not transpose or allocate temporary storage.
+    /// </summary>
+    public unsafe void FusedLinearGELUFp16TransposedM1(
+        IGpuBuffer inputHalf,
+        IGpuBuffer outputMajorWeightHalf,
+        IGpuBuffer biasFloat,
+        IGpuBuffer outputFloat,
+        int inFeatures,
+        int outFeatures)
+    {
+        if (inputHalf is null) throw new ArgumentNullException(nameof(inputHalf));
+        if (outputMajorWeightHalf is null) throw new ArgumentNullException(nameof(outputMajorWeightHalf));
+        if (biasFloat is null) throw new ArgumentNullException(nameof(biasFloat));
+        if (outputFloat is null) throw new ArgumentNullException(nameof(outputFloat));
+        if (inFeatures <= 0) throw new ArgumentOutOfRangeException(nameof(inFeatures));
+        if (outFeatures <= 0) throw new ArgumentOutOfRangeException(nameof(outFeatures));
+        if (inputHalf.SizeInBytes < checked((long)inFeatures * sizeof(ushort)) ||
+            outputMajorWeightHalf.SizeInBytes < checked((long)inFeatures * outFeatures * sizeof(ushort)) ||
+            biasFloat.SizeInBytes < checked((long)outFeatures * sizeof(float)) ||
+            outputFloat.SizeInBytes < checked((long)outFeatures * sizeof(float)))
+            throw new ArgumentException("Mixed fused-linear buffers are smaller than the requested canonical extents.");
+        if (TryDirectPtxFusedLinearGeluFp16M1(
+            inputHalf, outputMajorWeightHalf, biasFloat, outputFloat,
+            inFeatures, outFeatures))
+            return;
+
+        using var _ = PushContext();
+        float alpha = 1f, beta = 0f;
+        IntPtr alphaPointer = (IntPtr)(&alpha);
+        IntPtr betaPointer = (IntPtr)(&beta);
+        var status = CuBlasNative.cublasGemmEx(
+            _cublasHandle,
+            CublasOperation.Transpose, CublasOperation.None,
+            outFeatures, 1, inFeatures,
+            alphaPointer,
+            outputMajorWeightHalf.Handle, CuBlasNative.CUDA_R_16F, inFeatures,
+            inputHalf.Handle, CuBlasNative.CUDA_R_16F, inFeatures,
+            betaPointer,
+            outputFloat.Handle, CuBlasNative.CUDA_R_32F, outFeatures,
+            CuBlasNative.CUBLAS_COMPUTE_32F,
+            0);
+        if (status == AiDotNet.Tensors.Engines.CublasStatus.NotSupported)
+            throw new NotSupportedException(
+                $"FP16 output-major decode projection is not supported on compute capability {_ccMajor}.{_ccMinor}.");
+        CuBlasNative.CheckCublasStatus(status, "cublasGemmEx(FP16 output-major M=1)");
+        BiasAdd(outputFloat, biasFloat, outputFloat, 1, outFeatures);
+        Gelu(outputFloat, outputFloat, outFeatures);
+    }
+
+    /// <summary>
+    /// Canonical contiguous M=16 projection for FP16 row-major input and FP16
+    /// output-major weights: <c>output[16,N] = GELU(input[16,K] *
+    /// transpose(weight[N,K]) + bias[N])</c>. The admitted direct-PTX path
+    /// fuses asynchronous Tensor Core GEMM, bias, and GELU; the fail-closed
+    /// fallback uses cuBLAS followed by resident bias and GELU kernels.
+    /// </summary>
+    public unsafe void FusedLinearGELUFp16TransposedM16(
+        IGpuBuffer inputHalf,
+        IGpuBuffer outputMajorWeightHalf,
+        IGpuBuffer biasFloat,
+        IGpuBuffer outputFloat,
+        int inFeatures,
+        int outFeatures)
+    {
+        const int rows = 16;
+        if (inputHalf is null) throw new ArgumentNullException(nameof(inputHalf));
+        if (outputMajorWeightHalf is null) throw new ArgumentNullException(nameof(outputMajorWeightHalf));
+        if (biasFloat is null) throw new ArgumentNullException(nameof(biasFloat));
+        if (outputFloat is null) throw new ArgumentNullException(nameof(outputFloat));
+        if (inFeatures <= 0) throw new ArgumentOutOfRangeException(nameof(inFeatures));
+        if (outFeatures <= 0) throw new ArgumentOutOfRangeException(nameof(outFeatures));
+        if (inputHalf.SizeInBytes < checked((long)rows * inFeatures * sizeof(ushort)) ||
+            outputMajorWeightHalf.SizeInBytes < checked((long)inFeatures * outFeatures * sizeof(ushort)) ||
+            biasFloat.SizeInBytes < checked((long)outFeatures * sizeof(float)) ||
+            outputFloat.SizeInBytes < checked((long)rows * outFeatures * sizeof(float)))
+            throw new ArgumentException("M=16 mixed fused-linear buffers are smaller than the requested canonical extents.");
+        if (TryDirectPtxFusedLinearGeluFp16M16(
+            inputHalf, outputMajorWeightHalf, biasFloat, outputFloat,
+            inFeatures, outFeatures))
+            return;
+
+        using var _ = PushContext();
+        float alpha = 1f, beta = 0f;
+        IntPtr alphaPointer = (IntPtr)(&alpha);
+        IntPtr betaPointer = (IntPtr)(&beta);
+        var status = CuBlasNative.cublasGemmEx(
+            _cublasHandle,
+            CublasOperation.Transpose, CublasOperation.None,
+            outFeatures, rows, inFeatures,
+            alphaPointer,
+            outputMajorWeightHalf.Handle, CuBlasNative.CUDA_R_16F, inFeatures,
+            inputHalf.Handle, CuBlasNative.CUDA_R_16F, inFeatures,
+            betaPointer,
+            outputFloat.Handle, CuBlasNative.CUDA_R_32F, outFeatures,
+            CuBlasNative.CUBLAS_COMPUTE_32F,
+            0);
+        if (status == AiDotNet.Tensors.Engines.CublasStatus.NotSupported)
+            throw new NotSupportedException(
+                $"FP16 output-major M=16 projection is not supported on compute capability {_ccMajor}.{_ccMinor}.");
+        CuBlasNative.CheckCublasStatus(status, "cublasGemmEx(FP16 output-major M=16)");
+        BiasAdd(outputFloat, biasFloat, outputFloat, rows, outFeatures);
+        Gelu(outputFloat, outputFloat, checked(rows * outFeatures));
+    }
+
+    /// <summary>
     /// FP16 Tensor-Core forward GEMM with a HALF output: row-major <c>C[M,N] = A[M,K] · B[K,N]</c>, FP16
     /// inputs, FP32 accumulate (<c>CUBLAS_COMPUTE_32F</c> — full-chain precision), FP16 STORED output. The
     /// half-output variant of <see cref="GemmFp16"/> (which stores FP32): it lets the forward keep the matmul

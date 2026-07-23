@@ -20,6 +20,9 @@ internal sealed class PtxFusedResidualRmsNormD64Kernel : IDisposable
 
     internal int Rows { get; }
     internal float Epsilon { get; }
+
+    /// <summary>The register the epsilon launch parameter is loaded into.</summary>
+    private const string EpsilonRegister = "%eps";
     internal int WarpsPerBlock { get; }
     internal string Ptx { get; }
     internal DirectPtxFunctionInfo FunctionInfo { get; }
@@ -126,12 +129,14 @@ internal sealed class PtxFusedResidualRmsNormD64Kernel : IDisposable
         IntPtr gammaPointer = gamma.Pointer;
         IntPtr outputPointer = output.Pointer;
         IntPtr rmsPointer = rms.Pointer;
-        void** arguments = stackalloc void*[5];
+        float epsilon = Epsilon;
+        void** arguments = stackalloc void*[6];
         arguments[0] = &inputPointer;
         arguments[1] = &residualPointer;
         arguments[2] = &gammaPointer;
         arguments[3] = &outputPointer;
         arguments[4] = &rmsPointer;
+        arguments[5] = &epsilon;
         _module.Launch(
             _function, (uint)((Rows + WarpsPerBlock - 1) / WarpsPerBlock), 1, 1,
             (uint)(WarpsPerBlock * 32), 1, 1, 0, arguments);
@@ -162,7 +167,6 @@ internal sealed class PtxFusedResidualRmsNormD64Kernel : IDisposable
         if (rows <= 0) throw new ArgumentOutOfRangeException(nameof(rows));
         if (warpsPerBlock is not (1 or 2 or 4 or 8))
             throw new ArgumentOutOfRangeException(nameof(warpsPerBlock));
-        string epsilonHex = FloatLiteral(epsilon);
         var ptx = new StringBuilder(8192);
         ptx.AppendLine(".version 7.1");
         ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
@@ -173,13 +177,20 @@ internal sealed class PtxFusedResidualRmsNormD64Kernel : IDisposable
         ptx.AppendLine("    .param .u64 residual_ptr,");
         ptx.AppendLine("    .param .u64 gamma_ptr,");
         ptx.AppendLine("    .param .u64 output_ptr,");
-        ptx.AppendLine("    .param .u64 rms_ptr");
+        ptx.AppendLine("    .param .u64 rms_ptr,");
+        // epsilon is a launch parameter rather than a baked literal. Baking it
+        // made the module key depend on a value the blueprint id does not carry,
+        // so a caller using a non-default epsilon emitted PTX that no checked-in
+        // cubin matched and silently fell back to driver JIT.
+        ptx.AppendLine("    .param .f32 epsilon");
         ptx.AppendLine(")");
         ptx.AppendLine("{");
         ptx.AppendLine("    .reg .pred %p<2>;");
         ptx.AppendLine("    .reg .b32 %r<16>;");
         ptx.AppendLine("    .reg .b64 %rd<20>;");
         ptx.AppendLine("    .reg .f32 %f<20>;");
+        ptx.AppendLine($"    .reg .f32 {EpsilonRegister};");
+        ptx.AppendLine($"    ld.param.f32 {EpsilonRegister}, [epsilon];");
         ptx.AppendLine("    ld.param.u64 %rd0, [input_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd1, [residual_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd2, [gamma_ptr];");
@@ -214,7 +225,7 @@ internal sealed class PtxFusedResidualRmsNormD64Kernel : IDisposable
             ptx.AppendLine("    add.rn.f32 %f6, %f6, %f7;");
         }
         ptx.AppendLine("    mul.rn.f32 %f8, %f6, 0f3C800000;"); // 1/64
-        ptx.AppendLine($"    add.rn.f32 %f8, %f8, {epsilonHex};");
+        ptx.AppendLine($"    add.rn.f32 %f8, %f8, {EpsilonRegister};");
         ptx.AppendLine("    sqrt.rn.f32 %f9, %f8;");
         ptx.AppendLine("    rcp.approx.f32 %f10, %f9;");
         ptx.AppendLine("    add.u64 %rd9, %rd2, %rd6;");

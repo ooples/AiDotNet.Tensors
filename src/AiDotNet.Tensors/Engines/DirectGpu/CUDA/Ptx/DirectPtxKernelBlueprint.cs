@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 
@@ -43,6 +42,41 @@ internal static class DirectPtxArchitecture
     /// on GA102/SM86. Other Ampere variants remain independent tuning domains.
     /// </summary>
     internal static bool HasValidatedQkvRopeCache(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The fused-linear + GELU decode specializations are measured and promoted
+    /// only on GA10x/SM86. Other Ampere variants (SM80, SM87) are independent
+    /// tuning domains and must supply and benchmark their own specialization
+    /// rather than silently inheriting SM86's launch geometry.
+    /// </summary>
+    internal static bool HasValidatedFusedLinear(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The mixed-precision (FP16 / W8A8) fused-linear decode specializations are
+    /// measured and promoted only on GA10x/SM86. Other Ampere variants (SM80,
+    /// SM87) are independent tuning domains and must supply and benchmark their
+    /// own specialization rather than silently inheriting SM86's launch geometry.
+    /// </summary>
+    internal static bool HasValidatedMixedLinear(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The fused residual + bias + LayerNorm + GELU decode specialization is
+    /// measured and promoted only on GA10x/SM86. Other Ampere variants (SM80,
+    /// SM87) are independent tuning domains and must supply and benchmark their
+    /// own specialization rather than silently inheriting SM86's launch geometry.
+    /// </summary>
+    internal static bool HasValidatedResidualLayerNormGelu(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The quantized (W8A8) decode-linear specialization is measured only on
+    /// GA102/SM86, matching the other fused-linear predicates. Admitting the
+    /// whole Ampere family would run PTX that was never validated on SM80/SM87.
+    /// </summary>
+    internal static bool HasValidatedQuantizedLinear(int major, int minor) =>
         (major, minor) == (8, 6);
 }
 
@@ -148,6 +182,7 @@ internal readonly record struct DirectPtxTensorContract
     internal nuint RequiredBytes => checked((nuint)PhysicalExtent.ElementCount * (nuint)ElementBytes);
     internal int ElementBytes => PhysicalType switch
     {
+        DirectPtxPhysicalType.Int8 => 1,
         DirectPtxPhysicalType.Float16 or DirectPtxPhysicalType.BFloat16 => 2,
         DirectPtxPhysicalType.Float32 => 4,
         DirectPtxPhysicalType.Int32 => 4,
@@ -207,7 +242,11 @@ internal sealed record DirectPtxKernelAudit(
     int BlockThreads,
     int ActiveBlocksPerMultiprocessor,
     string JitInfoLog,
-    DateTime RecordedAtUtc)
+    DateTime RecordedAtUtc,
+    DirectPtxModuleImageKind ImageKind = DirectPtxModuleImageKind.DriverLinkedCubin,
+    string CubinSha256 = "",
+    string CubinSourceKey = "",
+    string? CubinPath = null)
 {
     internal static DirectPtxKernelAudit Create(
         DirectPtxKernelBlueprint blueprint,
@@ -218,11 +257,28 @@ internal sealed record DirectPtxKernelAudit(
         int activeBlocksPerMultiprocessor,
         string jitInfoLog)
     {
-        using SHA256 sha = SHA256.Create();
-        string hash = PtxCompat.ToHexString(sha.ComputeHash(Encoding.UTF8.GetBytes(ptx))).ToLowerInvariant();
+        string hash = DirectPtxCubinArtifactCache.ComputePtxSha256(ptx);
         return new DirectPtxKernelAudit(
             blueprint.Id, deviceFingerprint, hash, function, blockThreads,
             activeBlocksPerMultiprocessor, jitInfoLog, DateTime.UtcNow);
+    }
+
+    internal static DirectPtxKernelAudit Create(
+        DirectPtxKernelBlueprint blueprint,
+        string deviceFingerprint,
+        string ptx,
+        DirectPtxFunctionInfo function,
+        int blockThreads,
+        int activeBlocksPerMultiprocessor,
+        DirectPtxModule module)
+    {
+        PtxCompat.ThrowIfNull(module, nameof(module));
+        string hash = DirectPtxCubinArtifactCache.ComputePtxSha256(ptx);
+        return new DirectPtxKernelAudit(
+            blueprint.Id, deviceFingerprint, hash, function, blockThreads,
+            activeBlocksPerMultiprocessor, module.JitInfoLog, DateTime.UtcNow,
+            module.ImageKind, module.CubinSha256, module.CubinSourceKey,
+            module.CubinPath);
     }
 
     internal string ToJson() => JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
@@ -271,7 +327,7 @@ internal sealed record DirectPtxProfilerEvidence(
                 {
                     if (column >= data.Length || !TryParseCounter(data[column], out long value)) continue;
                     string metric = header[column].Trim();
-                    values[metric] = checked(values.GetValueOrDefault(metric) + value);
+                    values[metric] = checked(PtxCompat.GetValueOrDefault(values, metric) + value);
                 }
                 nextHeader++;
             }
@@ -288,7 +344,7 @@ internal sealed record DirectPtxProfilerEvidence(
                 {
                     if (TryParseCounter(cells[valueIndex], out long value))
                     {
-                        values[metric] = checked(values.GetValueOrDefault(metric) + value);
+                        values[metric] = checked(PtxCompat.GetValueOrDefault(values, metric) + value);
                         break;
                     }
                 }

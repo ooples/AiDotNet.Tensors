@@ -148,6 +148,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private IntPtr _neuralNetModule;
     private IntPtr _fusedModule;
     private IntPtr _quantGemmModule; // P0: weight-only fused dequant-GEMM (int8/int4/fp8)
+    private string? _quantGemmInitializationError;
     private IntPtr _pagedAttnModule; // P1: paged-attention decode
     private IntPtr _flashDecodeModule; // P2: fused decode attention (FlashDecoding)
     private IntPtr _attentionModule;
@@ -861,12 +862,26 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         try
         {
             _quantGemmModule = CompileKernelModule(device, Kernels.CudaQuantGemmKernels.GetSource(), "quant_gemm_kernels", Kernels.CudaQuantGemmKernels.GetKernelNames());
+        }
+        catch (Exception exception)
+        {
+            _quantGemmInitializationError = exception.Message;
+        }
+        try
+        {
             _pagedAttnModule = CompileKernelModule(device, Kernels.CudaPagedAttentionKernels.GetSource(), "paged_attention_kernels", Kernels.CudaPagedAttentionKernels.GetKernelNames());
+        }
+        catch
+        {
+            // Optional P1 serving kernel; its public call degrades gracefully.
+        }
+        try
+        {
             _flashDecodeModule = CompileKernelModule(device, Kernels.CudaFlashDecodeKernels.GetSource(), "flash_decode_kernels", Kernels.CudaFlashDecodeKernels.GetKernelNames());
         }
         catch
         {
-            // P0/P1/P2 serving kernels are optional; leave their modules unset and degrade gracefully.
+            // Optional P2 serving kernel; its public call degrades gracefully.
         }
         _attentionModule = CompileKernelModule(device, CudaAttentionKernels.GetSource(), "attention_kernels", CudaAttentionKernels.GetKernelNames());
         _fftModule = CompileKernelModule(device, Kernels.CudaFFTKernels.GetSource(), "fft_kernels", Kernels.CudaFFTKernels.GetKernelNames());
@@ -2613,6 +2628,112 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         return LaunchDequantGemm("dequant_gemm_int8", activations, weightsInt8, scales, M, K, N, groupSize, scaleCount);
     }
 
+    /// <summary>
+    /// Symmetric W8A8 decode-token projection over canonical contiguous
+    /// output-major weights: <c>GELU(s32(input[K] @ transpose(weights[N,K])) *
+    /// activationScale * weightScales[N] + bias[N])</c>. Zero-points are
+    /// exactly zero. The admitted direct-PTX specialization fuses DP4A,
+    /// dequantization, bias, and GELU without a global intermediate; unsupported
+    /// cells fail closed to the resident NVRTC correctness kernel.
+    /// </summary>
+    public unsafe void FusedLinearGELUW8A8TransposedM1(
+        IGpuBuffer inputInt8,
+        IGpuBuffer outputMajorWeightsInt8,
+        IGpuBuffer activationScaleFloat,
+        IGpuBuffer weightScalesFloat,
+        IGpuBuffer biasFloat,
+        IGpuBuffer outputFloat,
+        int inputFeatures,
+        int outputFeatures)
+    {
+        if (inputInt8 is null) throw new ArgumentNullException(nameof(inputInt8));
+        if (outputMajorWeightsInt8 is null) throw new ArgumentNullException(nameof(outputMajorWeightsInt8));
+        if (activationScaleFloat is null) throw new ArgumentNullException(nameof(activationScaleFloat));
+        if (weightScalesFloat is null) throw new ArgumentNullException(nameof(weightScalesFloat));
+        if (biasFloat is null) throw new ArgumentNullException(nameof(biasFloat));
+        if (outputFloat is null) throw new ArgumentNullException(nameof(outputFloat));
+        if (inputFeatures <= 0) throw new ArgumentOutOfRangeException(nameof(inputFeatures));
+        if (outputFeatures <= 0) throw new ArgumentOutOfRangeException(nameof(outputFeatures));
+        long outputBytes = checked((long)outputFeatures * sizeof(float));
+        if (inputInt8.SizeInBytes < inputFeatures ||
+            outputMajorWeightsInt8.SizeInBytes < checked((long)inputFeatures * outputFeatures) ||
+            activationScaleFloat.SizeInBytes < sizeof(float) ||
+            weightScalesFloat.SizeInBytes < outputBytes ||
+            biasFloat.SizeInBytes < outputBytes || outputFloat.SizeInBytes < outputBytes)
+            throw new ArgumentException(
+                "W8A8 fused-linear buffers are smaller than the requested canonical extents.");
+        if (TryDirectPtxFusedLinearGeluW8A8M1(
+            inputInt8, outputMajorWeightsInt8, activationScaleFloat,
+            weightScalesFloat, biasFloat, outputFloat,
+            inputFeatures, outputFeatures))
+            return;
+
+        if (!_kernelCache.TryGetValue("fused_linear_gelu_w8a8_m1", out var kernel))
+            throw new InvalidOperationException(
+                $"CUDA kernel not found: fused_linear_gelu_w8a8_m1. {_quantGemmInitializationError}");
+        using var _ = PushContext();
+        IntPtr inputPointer = inputInt8.Handle;
+        IntPtr weightPointer = outputMajorWeightsInt8.Handle;
+        IntPtr activationScalePointer = activationScaleFloat.Handle;
+        IntPtr weightScalePointer = weightScalesFloat.Handle;
+        IntPtr biasPointer = biasFloat.Handle;
+        IntPtr outputPointer = outputFloat.Handle;
+        int k = inputFeatures, n = outputFeatures;
+        void** args = stackalloc void*[8];
+        args[0] = &inputPointer;
+        args[1] = &weightPointer;
+        args[2] = &activationScalePointer;
+        args[3] = &weightScalePointer;
+        args[4] = &biasPointer;
+        args[5] = &outputPointer;
+        args[6] = &k;
+        args[7] = &n;
+        uint grid = (uint)((outputFeatures + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <summary>Applies the W8A8 FP32 per-channel dequantization, bias, and tanh-GELU epilogue.</summary>
+    public unsafe void W8A8DequantBiasGelu(
+        IGpuBuffer accumulatorInt32,
+        IGpuBuffer activationScaleFloat,
+        IGpuBuffer weightScalesFloat,
+        IGpuBuffer biasFloat,
+        IGpuBuffer outputFloat,
+        int outputFeatures)
+    {
+        if (accumulatorInt32 is null) throw new ArgumentNullException(nameof(accumulatorInt32));
+        if (activationScaleFloat is null) throw new ArgumentNullException(nameof(activationScaleFloat));
+        if (weightScalesFloat is null) throw new ArgumentNullException(nameof(weightScalesFloat));
+        if (biasFloat is null) throw new ArgumentNullException(nameof(biasFloat));
+        if (outputFloat is null) throw new ArgumentNullException(nameof(outputFloat));
+        if (outputFeatures <= 0) throw new ArgumentOutOfRangeException(nameof(outputFeatures));
+        long outputBytes = checked((long)outputFeatures * sizeof(float));
+        if (accumulatorInt32.SizeInBytes < outputBytes ||
+            activationScaleFloat.SizeInBytes < sizeof(float) ||
+            weightScalesFloat.SizeInBytes < outputBytes ||
+            biasFloat.SizeInBytes < outputBytes || outputFloat.SizeInBytes < outputBytes)
+            throw new ArgumentException("W8A8 epilogue buffers are smaller than the requested extent.");
+        if (!_kernelCache.TryGetValue("w8a8_dequant_bias_gelu", out var kernel))
+            throw new InvalidOperationException(
+                $"CUDA kernel not found: w8a8_dequant_bias_gelu. {_quantGemmInitializationError}");
+        using var _ = PushContext();
+        IntPtr accumulatorPointer = accumulatorInt32.Handle;
+        IntPtr activationScalePointer = activationScaleFloat.Handle;
+        IntPtr weightScalePointer = weightScalesFloat.Handle;
+        IntPtr biasPointer = biasFloat.Handle;
+        IntPtr outputPointer = outputFloat.Handle;
+        int n = outputFeatures;
+        void** args = stackalloc void*[6];
+        args[0] = &accumulatorPointer;
+        args[1] = &activationScalePointer;
+        args[2] = &weightScalePointer;
+        args[3] = &biasPointer;
+        args[4] = &outputPointer;
+        args[5] = &n;
+        uint grid = (uint)((outputFeatures + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
     /// <summary>Weight-only fused dequant-GEMM (int4, 2 signed nibbles/byte, low nibble even). Weights
     /// are a byte buffer of length ceil(K*N/2); matches FusedDequantMatmulKernels.Q4MatMul.</summary>
     public IGpuBuffer DequantGemmInt4(IGpuBuffer activations, IGpuBuffer weightsInt4Packed, IGpuBuffer scales,
@@ -3050,6 +3171,63 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[3] = &rows;
         args[4] = &cols;
         LaunchKernel2D(kernel, gridX, gridY, DefaultBlockSize, 1, args);
+    }
+
+    /// <summary>
+    /// Applies a canonical contiguous D=64 transformer boundary:
+    /// <c>GELU(LayerNorm(input + residual + preNormBias, gamma, beta))</c>.
+    /// Exact admitted shapes use a single direct-PTX kernel; all other shapes
+    /// fail closed to resident CUDA kernels without a temporary allocation.
+    /// </summary>
+    public unsafe void FusedResidualBiasLayerNormGeluD64(
+        IGpuBuffer input,
+        IGpuBuffer residual,
+        IGpuBuffer preNormBias,
+        IGpuBuffer gamma,
+        IGpuBuffer beta,
+        IGpuBuffer output,
+        int rows,
+        float epsilon = 1e-5f)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (residual is null) throw new ArgumentNullException(nameof(residual));
+        if (preNormBias is null) throw new ArgumentNullException(nameof(preNormBias));
+        if (gamma is null) throw new ArgumentNullException(nameof(gamma));
+        if (beta is null) throw new ArgumentNullException(nameof(beta));
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (rows <= 0) throw new ArgumentOutOfRangeException(nameof(rows));
+        if (float.IsNaN(epsilon) || float.IsInfinity(epsilon) || epsilon <= 0)
+            throw new ArgumentOutOfRangeException(nameof(epsilon));
+        int elements = checked(rows * 64);
+        if (input.Size < elements || residual.Size < elements || output.Size < elements ||
+            preNormBias.Size < 64 || gamma.Size < 64 || beta.Size < 64)
+            throw new ArgumentException(
+                "Residual LayerNorm+GELU buffers are smaller than the requested canonical extents.");
+        if (TryDirectPtxFusedResidualBiasLayerNormGeluD64(
+            input, residual, preNormBias, gamma, beta, output, rows, epsilon))
+            return;
+
+        Add(input, residual, output, elements);
+        BiasAdd(output, preNormBias, output, rows, 64);
+        if (!_kernelCache.TryGetValue("layernorm_gelu", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: layernorm_gelu");
+        using var context = PushContext();
+        IntPtr inputPointer = output.Handle;
+        IntPtr outputPointer = output.Handle;
+        IntPtr gammaPointer = gamma.Handle;
+        IntPtr betaPointer = beta.Handle;
+        int normalizedSize = 64;
+        void** args = stackalloc void*[7];
+        args[0] = &inputPointer;
+        args[1] = &outputPointer;
+        args[2] = &gammaPointer;
+        args[3] = &betaPointer;
+        args[4] = &rows;
+        args[5] = &normalizedSize;
+        args[6] = &epsilon;
+        LaunchKernelWithSharedMem(
+            kernel, (uint)rows, DefaultBlockSize,
+            DefaultBlockSize * sizeof(float), args);
     }
 
     public unsafe void Conv2DBiasAdd(IGpuBuffer output, IGpuBuffer bias, int batch, int channels, int spatialSize)
@@ -7293,6 +7471,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer runningMean, IGpuBuffer runningVar, IGpuBuffer saveMean, IGpuBuffer saveInvVar,
         int batch, int channels, int spatialSize, float epsilon, float momentum, bool training)
     {
+        if (TryDirectPtxBatchNormUnit64(
+                input, output, gamma, beta, runningMean, runningVar,
+                saveMean, saveInvVar, batch, channels, spatialSize,
+                epsilon, momentum, training))
+            return;
+
         // cuDNN fast path (issue #1159). Gated on the UseCudnnForBatchNorm
         // policy. Dispatches the GPU-pointer variant directly — caller-owned
         // input / output / stat buffers, no host round-trip. The op's
@@ -7382,6 +7566,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (training || activation == FusedActivationType.None)
             return false;
 
+        if (TryDirectPtxFusedBatchNormActivationUnit64(
+                input, output, gamma, beta, runningMean, runningVar,
+                batch, channels, spatialSize, epsilon, activation))
+            return true;
+
         string kernelName = activation switch
         {
             FusedActivationType.ReLU => "batchnorm_relu",
@@ -7418,10 +7607,61 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         return true;
     }
 
+    /// <summary>
+    /// Executes inference BatchNorm, adds a residual tensor, and applies ReLU in one launch.
+    /// The exact Ampere unit-64 cell uses the direct Driver-API PTX specialization when its
+    /// experiment gate is enabled; all other CUDA shapes use the existing compiled kernel.
+    /// </summary>
+    public unsafe bool TryResidualBatchNormRelu(
+        IGpuBuffer input, IGpuBuffer residual, IGpuBuffer output,
+        IGpuBuffer gamma, IGpuBuffer beta,
+        IGpuBuffer runningMean, IGpuBuffer runningVar,
+        int batch, int channels, int spatialSize, float epsilon)
+    {
+        if (TryDirectPtxResidualBatchNormReluUnit64(
+                input, residual, output, gamma, beta, runningMean, runningVar,
+                batch, channels, spatialSize, epsilon))
+            return true;
+
+        if (!_kernelCache.TryGetValue("residual_batchnorm_relu", out var kernel))
+            return false;
+
+        using var _ = PushContext();
+        int totalSize = checked(batch * channels * spatialSize);
+        uint grid = (uint)((totalSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr inputPtr = input.Handle;
+        IntPtr residualPtr = residual.Handle;
+        IntPtr outputPtr = output.Handle;
+        IntPtr gammaPtr = gamma.Handle;
+        IntPtr betaPtr = beta.Handle;
+        IntPtr runMeanPtr = runningMean.Handle;
+        IntPtr runVarPtr = runningVar.Handle;
+        void** args = stackalloc void*[11];
+        args[0] = &inputPtr;
+        args[1] = &residualPtr;
+        args[2] = &outputPtr;
+        args[3] = &gammaPtr;
+        args[4] = &betaPtr;
+        args[5] = &runMeanPtr;
+        args[6] = &runVarPtr;
+        args[7] = &batch;
+        args[8] = &channels;
+        args[9] = &spatialSize;
+        args[10] = &epsilon;
+        LaunchKernel(kernel, grid, (uint)DefaultBlockSize, args);
+        return true;
+    }
+
     public unsafe void BatchNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
         int batch, int channels, int spatialSize, float epsilon)
     {
+        if (TryDirectPtxBatchNormBackwardUnit64(
+                gradOutput, input, gamma, saveMean, saveInvVar,
+                gradInput, gradGamma, gradBeta,
+                batch, channels, spatialSize, epsilon))
+            return;
+
         if (!_kernelCache.TryGetValue("batchnorm_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: batchnorm_backward");
 
@@ -7455,6 +7695,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void LayerNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, int batchSize, int normalizedSize, float epsilon)
     {
+        if (normalizedSize == PtxRowNormalizationD64Kernel.Dimension &&
+            TryDirectPtxLayerNormD64(
+                input, output, gamma, beta, saveMean, saveInvVar, batchSize, epsilon))
+            return;
+
         if (!_kernelCache.TryGetValue("layernorm_forward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: layernorm_forward");
 
@@ -7484,6 +7729,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
         int batchSize, int normalizedSize, float epsilon)
     {
+        if (normalizedSize == PtxRowNormalizationD64Kernel.Dimension &&
+            TryDirectPtxLayerNormBackwardD64(
+                gradOutput, input, gamma, saveMean, saveInvVar,
+                gradInput, gradGamma, gradBeta, batchSize, epsilon))
+            return;
+
         if (!_kernelCache.TryGetValue("layernorm_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: layernorm_backward");
 
@@ -7535,6 +7786,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void GroupNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, int batch, int numGroups, int channels, int spatialSize, float epsilon)
     {
+        if (TryDirectPtxGroupNormUnit64(
+                input, output, gamma, beta, saveMean, saveInvVar,
+                batch, numGroups, channels, spatialSize, epsilon))
+            return;
+
         if (!_kernelCache.TryGetValue("groupnorm_forward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: groupnorm_forward");
 
@@ -7565,6 +7821,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void InstanceNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, int batch, int channels, int spatialSize, float epsilon)
     {
+        if (TryDirectPtxInstanceNormUnit64(
+                input, output, gamma, beta, saveMean, saveInvVar,
+                batch, channels, spatialSize, epsilon))
+            return;
+
         if (!_kernelCache.TryGetValue("instancenorm_forward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: instancenorm_forward");
 
@@ -7624,6 +7885,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new ArgumentException($"gradGamma buffer too small: expected at least {channels} elements, got {gradGamma.Size}.", nameof(gradGamma));
         if (gradBeta.Size < channels)
             throw new ArgumentException($"gradBeta buffer too small: expected at least {channels} elements, got {gradBeta.Size}.", nameof(gradBeta));
+
+        if (TryDirectPtxInstanceNormBackwardUnit64(
+                gradOutput, input, gamma, saveMean, saveInvVar,
+                gradInput, gradGamma, gradBeta,
+                batch, channels, spatialSize, epsilon))
+            return;
 
         // TWO-STAGE LAUNCH. instancenorm_backward consumes PRECOMPUTED per-instance sums and writes ONLY
         // gradInput; instancenorm_backward_sums produces those sums along with gradGamma/gradBeta. The
@@ -7755,6 +8022,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void RmsNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer saveRms,
         int batchSize, int normalizedSize, float epsilon)
     {
+        if (normalizedSize == PtxRowNormalizationD64Kernel.Dimension &&
+            TryDirectPtxRmsNormD64(input, output, gamma, saveRms, batchSize, epsilon))
+            return;
+
         if (!_kernelCache.TryGetValue("rmsnorm_forward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: rmsnorm_forward");
 
@@ -7779,6 +8050,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void RmsNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer saveRms,
         IGpuBuffer gradInput, IGpuBuffer gradGamma, int batchSize, int normalizedSize, float epsilon)
     {
+        if (normalizedSize == PtxRowNormalizationD64Kernel.Dimension &&
+            TryDirectPtxRmsNormBackwardD64(
+                gradOutput, input, gamma, saveRms,
+                gradInput, gradGamma, batchSize, epsilon))
+            return;
+
         // Compute gradInput using rmsnorm_backward kernel
         if (!_kernelCache.TryGetValue("rmsnorm_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: rmsnorm_backward");
@@ -9500,6 +9777,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void NormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer norm, IGpuBuffer gradInput, int outerSize, int reduceSize)
     {
+        if (reduceSize == PtxRowNormalizationD64Kernel.Dimension &&
+            TryDirectPtxNormBackwardD64(gradOutput, input, norm, gradInput, outerSize))
+            return;
+
         if (!_kernelCache.TryGetValue("norm_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: norm_backward");
         using var _ = PushContext();
@@ -9793,6 +10074,34 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[0] = &iPtr; args[1] = &wPtr; args[2] = &bPtr; args[3] = &oPtr;
         args[4] = &batchSize; args[5] = &inFeatures; args[6] = &outFeatures;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <summary>
+    /// Applies a decode-token linear layer whose resident FP32 weights use the
+    /// canonical output-major <c>[outFeatures,inFeatures]</c> physical layout,
+    /// then adds bias and applies tanh-GELU. The admitted direct-PTX path keeps
+    /// both the accumulator and activation in registers and writes output once.
+    /// </summary>
+    public void FusedLinearGELUTransposedM1(
+        IGpuBuffer input,
+        IGpuBuffer outputMajorWeight,
+        IGpuBuffer bias,
+        IGpuBuffer output,
+        int inFeatures,
+        int outFeatures)
+    {
+        if (inFeatures <= 0) throw new ArgumentOutOfRangeException(nameof(inFeatures));
+        if (outFeatures <= 0) throw new ArgumentOutOfRangeException(nameof(outFeatures));
+        if (input.Size < inFeatures ||
+            outputMajorWeight.Size < checked(inFeatures * outFeatures) ||
+            bias.Size < outFeatures || output.Size < outFeatures)
+            throw new ArgumentException("Fused-linear buffers are smaller than the requested canonical extents.");
+        if (TryDirectPtxFusedLinearGeluM1(
+            input, outputMajorWeight, bias, output, inFeatures, outFeatures))
+            return;
+        MatMulTransposed(input, outputMajorWeight, output, 1, outFeatures, inFeatures);
+        BiasAdd(output, bias, output, 1, outFeatures);
+        Gelu(output, output, outFeatures);
     }
 
     public unsafe void FusedLinearSwish(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output,
@@ -13193,6 +13502,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (meanFp32 is not null && meanFp32.SizeInBytes < statsBytes) throw new ArgumentException($"mean FP32 buffer too small: {meanFp32.SizeInBytes} < {statsBytes}.");
         if (varFp32 is not null && varFp32.SizeInBytes < statsBytes) throw new ArgumentException($"variance FP32 buffer too small: {varFp32.SizeInBytes} < {statsBytes}.");
         if (eps <= 0f || float.IsNaN(eps) || float.IsInfinity(eps)) throw new ArgumentOutOfRangeException(nameof(eps), eps, "eps must be finite and positive.");
+        if (cols == PtxRowNormalizationD64Kernel.Dimension && meanFp32 is not null && varFp32 is not null &&
+            TryDirectPtxFp16LayerNormD64(
+                input, gamma, beta, output, meanFp32, varFp32, rows, eps))
+            return;
         if (!_kernelCache.TryGetValue("fp16_layernorm_native", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: fp16_layernorm_native");
         using var _ = PushContext();
@@ -13227,6 +13540,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (gammaFp32.SizeInBytes < chanFp32Bytes) throw new ArgumentException($"gamma FP32 buffer too small: {gammaFp32.SizeInBytes} < {chanFp32Bytes}.");
         if (betaFp32.SizeInBytes < chanFp32Bytes) throw new ArgumentException($"beta FP32 buffer too small: {betaFp32.SizeInBytes} < {chanFp32Bytes}.");
         if (eps <= 0f || float.IsNaN(eps) || float.IsInfinity(eps)) throw new ArgumentOutOfRangeException(nameof(eps), eps, "eps must be finite and positive.");
+        if (TryDirectPtxFp16GroupNormSwishUnit64(
+                inHalf, gammaFp32, betaFp32, outHalf,
+                batch, numGroups, channels, spatial, eps))
+            return;
         if (!_kernelCache.TryGetValue("fp16_groupnorm_swish", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: fp16_groupnorm_swish");
         using var _ = PushContext();
@@ -13351,6 +13668,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (gamma.SizeInBytes < (long)cols * 2) throw new ArgumentException($"gamma half buffer too small: {gamma.SizeInBytes} < {(long)cols * 2}.");
         if (saveMeanFp32.SizeInBytes < (long)rows * sizeof(float)) throw new ArgumentException($"saveMean FP32 buffer too small: {saveMeanFp32.SizeInBytes} < {(long)rows * sizeof(float)}.");
         if (saveInvVarFp32.SizeInBytes < (long)rows * sizeof(float)) throw new ArgumentException($"saveInvVar FP32 buffer too small: {saveInvVarFp32.SizeInBytes} < {(long)rows * sizeof(float)}.");
+        if (cols == PtxRowNormalizationD64Kernel.Dimension &&
+            TryDirectPtxFp16LayerNormBackwardD64(
+                gradOutput, input, gamma, saveMeanFp32, saveInvVarFp32, gradInput, rows))
+            return;
         if (!_kernelCache.TryGetValue("fp16_layernorm_backward_native", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: fp16_layernorm_backward_native");
         using var _ = PushContext();
@@ -13382,6 +13703,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (gradBeta.SizeInBytes < (long)cols * 2) throw new ArgumentException($"gradBeta half buffer too small: {gradBeta.SizeInBytes} < {(long)cols * 2}.");
         if (saveMeanFp32.SizeInBytes < (long)rows * sizeof(float)) throw new ArgumentException($"saveMean FP32 buffer too small: {saveMeanFp32.SizeInBytes} < {(long)rows * sizeof(float)}.");
         if (saveInvVarFp32.SizeInBytes < (long)rows * sizeof(float)) throw new ArgumentException($"saveInvVar FP32 buffer too small: {saveInvVarFp32.SizeInBytes} < {(long)rows * sizeof(float)}.");
+        if (cols == PtxRowNormalizationD64Kernel.Dimension &&
+            TryDirectPtxFp16LayerNormGradParametersD64(
+                gradOutput, input, saveMeanFp32, saveInvVarFp32,
+                gradGamma, gradBeta, rows))
+            return;
         if (!_kernelCache.TryGetValue("fp16_layernorm_grad_params_native", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: fp16_layernorm_grad_params_native");
         using var _ = PushContext();
@@ -15046,6 +15372,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void NormalizeRowsFused(IGpuBuffer input, IGpuBuffer output, int rows, int cols)
     {
         if (rows <= 0 || cols <= 0) return;
+        if (cols == PtxRowNormalizationD64Kernel.Dimension &&
+            TryDirectPtxNormalizeL2D64(input, output, rows))
+            return;
         if (!_kernelCache.TryGetValue("normalize_rows_fused", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: normalize_rows_fused");
         using var _ = PushContext();
@@ -16385,9 +16714,15 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             input, output, size, GpuDeterminism.IsActive);
     public void ReduceProduct(IGpuBuffer input, IGpuBuffer output, int size) => LaunchFusedUnary("reduce_product", input, output, size);
     public unsafe void ReduceNormL2(IGpuBuffer input, IGpuBuffer output, int size)
-        => LaunchFusedUnaryReduce(
+    {
+        if (size % PtxRowNormalizationD64Kernel.Dimension == 0 &&
+            TryDirectPtxReduceNormL2D64(
+                input, output, size / PtxRowNormalizationD64Kernel.Dimension))
+            return;
+        LaunchFusedUnaryReduce(
             GpuDeterminism.IsActive ? "reduce_norm_l2_deterministic" : "reduce_norm_l2",
             input, output, size, GpuDeterminism.IsActive);
+    }
     public unsafe void ReduceSumOfSquares(IGpuBuffer input, IGpuBuffer output, int size)
         => LaunchFusedUnaryReduce(
             GpuDeterminism.IsActive ? "reduce_sum_of_squares_deterministic" : "reduce_sum_of_squares",
@@ -16438,11 +16773,23 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public void VarianceAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int reduceSize) => LaunchFusedAxis("variance_axis", input, output, outerSize, reduceSize);
     public void StdAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int reduceSize) => LaunchFusedAxis("std_axis", input, output, outerSize, reduceSize);
     public void ProductAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int reduceSize) => LaunchFusedAxis("product_axis", input, output, outerSize, reduceSize);
-    public void NormAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int reduceSize) => LaunchFusedAxis("norm_axis", input, output, outerSize, reduceSize);
+    public void NormAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int reduceSize)
+    {
+        if (reduceSize == PtxRowNormalizationD64Kernel.Dimension &&
+            TryDirectPtxNormAxisD64(input, output, outerSize))
+            return;
+        LaunchFusedAxis("norm_axis", input, output, outerSize, reduceSize);
+    }
     public void LogSumExpAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int reduceSize) => LaunchFusedAxis("logsumexp_axis", input, output, outerSize, reduceSize);
     public void CumSumAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize) => LaunchFusedAxis("cumsum_axis", input, output, outerSize, innerSize);
     public void ScalarMinusTensor(IGpuBuffer input, IGpuBuffer output, float scalar, int size) => LaunchFusedScalar("scalar_minus_tensor", input, output, scalar, size);
-    public void NormalizeL2(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize) => LaunchFusedAxis("normalize_l2", input, output, outerSize, innerSize);
+    public void NormalizeL2(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize)
+    {
+        if (innerSize == PtxRowNormalizationD64Kernel.Dimension &&
+            TryDirectPtxNormalizeL2D64(input, output, outerSize))
+            return;
+        LaunchFusedAxis("normalize_l2", input, output, outerSize, innerSize);
+    }
     public void ReduceSumBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int outerSize, int reduceSize) => LaunchFusedAxis("reduce_sum_backward", gradOutput, gradInput, outerSize, reduceSize);
     public void ReduceMeanBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int outerSize, int reduceSize) => LaunchFusedAxis("reduce_mean_backward", gradOutput, gradInput, outerSize, reduceSize);
 

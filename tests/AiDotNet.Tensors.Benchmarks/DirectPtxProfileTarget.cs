@@ -5,6 +5,77 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// <summary>Small deterministic targets for Nsight Compute release evidence.</summary>
 internal static class DirectPtxProfileTarget
 {
+    internal static void RunNormalization()
+    {
+        GpuBenchmarkEnvironment.RequireIdleGpu("ncu-normalization-start");
+        bool previousExperiment = DirectPtxFeatureGate.NormalizationExperimentOverride;
+        DirectPtxFeatureGate.NormalizationExperimentOverride = true;
+        try
+        {
+            using var runtime = new DirectPtxRuntime();
+            int launches = 0;
+            foreach (int rows in new[] { 256, 2_048, 8_192 })
+            foreach (DirectPtxRowNormalizationOperation operation in
+                Enum.GetValues<DirectPtxRowNormalizationOperation>())
+            {
+                using var kernel = new PtxRowNormalizationD64Kernel(
+                    runtime, operation, rows, 1e-5f);
+                LaunchNormalizationKernel(runtime, kernel.Blueprint, kernel.Audit, kernel.Launch);
+                launches++;
+            }
+
+            foreach (DirectPtxChannelNormalizationOperation operation in
+                Enum.GetValues<DirectPtxChannelNormalizationOperation>())
+            {
+                using var kernel = new PtxChannelNormalizationD64Kernel(
+                    runtime, operation, 1e-5f, 0.1f);
+                LaunchNormalizationKernel(runtime, kernel.Blueprint, kernel.Audit, kernel.Launch);
+                launches++;
+            }
+
+            runtime.Synchronize();
+            Console.WriteLine($"PROFILED_NORMALIZATION_CUBINS={launches}");
+        }
+        finally
+        {
+            DirectPtxFeatureGate.NormalizationExperimentOverride = previousExperiment;
+        }
+        // Do not re-run the idle-GPU gate here: writing 71 audit records can make
+        // a hardware-accelerated terminal briefly appear as a compute+graphics
+        // process. The pre-launch gate protects the actual profiled interval.
+    }
+
+    private static void LaunchNormalizationKernel(
+        DirectPtxRuntime runtime,
+        DirectPtxKernelBlueprint blueprint,
+        DirectPtxKernelAudit audit,
+        Action<ReadOnlySpan<DirectPtxTensorView>> launch)
+    {
+        if (audit.ImageKind != DirectPtxModuleImageKind.EmbeddedCubin)
+            throw new InvalidOperationException(
+                $"Nsight target requires an embedded cubin, but {blueprint.Id} loaded {audit.ImageKind}.");
+
+        var buffers = new DirectPtxBuffer[blueprint.Tensors.Count];
+        var views = new DirectPtxTensorView[blueprint.Tensors.Count];
+        try
+        {
+            for (int i = 0; i < blueprint.Tensors.Count; i++)
+            {
+                DirectPtxTensorContract contract = blueprint.Tensors[i];
+                buffers[i] = runtime.AllocateBytes(contract.RequiredBytes);
+                buffers[i].Upload<byte>(new byte[checked((int)contract.RequiredBytes)]);
+                views[i] = DirectPtxTensorView.CreateOwned(buffers[i], contract);
+            }
+            launch(views);
+            Console.WriteLine(audit.ToJson());
+        }
+        finally
+        {
+            for (int i = buffers.Length - 1; i >= 0; i--)
+                buffers[i]?.Dispose();
+        }
+    }
+
     internal static void RunAttention()
     {
         GpuBenchmarkEnvironment.RequireIdleGpu("ncu-attention-start");
@@ -262,6 +333,133 @@ internal static class DirectPtxProfileTarget
             Console.WriteLine(kernel.Audit.ToJson());
         }
         GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-qkv-rope-cache-end");
+    }
+
+    internal static void RunResidualLayerNormGelu()
+    {
+        using var runtime = new DirectPtxRuntime();
+        const int rows = 8192;
+        using var kernel = new PtxFusedResidualBiasLayerNormGeluD64Kernel(runtime, rows);
+        using var input = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var residual = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var bias = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        using var gamma = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
+        using var beta = runtime.AllocateBytes(kernel.Blueprint.Tensors[4].RequiredBytes);
+        using var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[5].RequiredBytes);
+        input.Upload<float>(new float[rows * 64]);
+        residual.Upload<float>(new float[rows * 64]);
+        bias.Upload<float>(new float[64]);
+        gamma.Upload<float>(Enumerable.Repeat(1f, 64).ToArray());
+        beta.Upload<float>(new float[64]);
+        Action launch = () => kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(residual, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(gamma, kernel.Blueprint.Tensors[3]),
+            DirectPtxTensorView.CreateOwned(beta, kernel.Blueprint.Tensors[4]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[5]));
+        for (int i = 0; i < 10; i++) launch();
+        runtime.Synchronize();
+        Console.WriteLine(kernel.Audit.ToJson());
+    }
+
+    internal static void RunFusedLinear()
+    {
+        using var runtime = new DirectPtxRuntime();
+        const int inputFeatures = 512, outputFeatures = 2048;
+        using var kernel = new PtxFusedLinearGeluM1Kernel(
+            runtime, inputFeatures, outputFeatures);
+        using var input = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var weights = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var bias = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        using var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
+        input.Upload<float>(new float[inputFeatures]);
+        weights.Upload<float>(new float[inputFeatures * outputFeatures]);
+        bias.Upload<float>(new float[outputFeatures]);
+        Action launch = () => kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(weights, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[3]));
+        for (int i = 0; i < 10; i++) launch();
+        runtime.Synchronize();
+        Console.WriteLine(kernel.Audit.ToJson());
+    }
+
+    internal static void RunMixedLinear()
+    {
+        using var runtime = new DirectPtxRuntime();
+        const int inputFeatures = 512, outputFeatures = 2048;
+        using var kernel = new PtxFusedLinearGeluFp16M1Kernel(
+            runtime, inputFeatures, outputFeatures);
+        using var input = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var weights = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var bias = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        using var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
+        input.Upload<ushort>(new ushort[inputFeatures]);
+        weights.Upload<ushort>(new ushort[inputFeatures * outputFeatures]);
+        bias.Upload<float>(new float[outputFeatures]);
+        Action launch = () => kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(weights, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[3]));
+        for (int i = 0; i < 10; i++) launch();
+        runtime.Synchronize();
+        Console.WriteLine(kernel.Audit.ToJson());
+    }
+
+    internal static void RunMixedLinearM16()
+    {
+        using var runtime = new DirectPtxRuntime();
+        const int rows = PtxFusedLinearGeluFp16M16Kernel.Rows;
+        const int inputFeatures = 1024, outputFeatures = 4096;
+        using var kernel = new PtxFusedLinearGeluFp16M16Kernel(
+            runtime, inputFeatures, outputFeatures);
+        using var input = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var weights = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var bias = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        using var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
+        input.Upload<ushort>(new ushort[rows * inputFeatures]);
+        weights.Upload<ushort>(new ushort[inputFeatures * outputFeatures]);
+        bias.Upload<float>(new float[outputFeatures]);
+        Action launch = () => kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(weights, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[3]));
+        for (int i = 0; i < 10; i++) launch();
+        runtime.Synchronize();
+        Console.WriteLine(kernel.Audit.ToJson());
+    }
+
+    internal static void RunW8A8Linear()
+    {
+        using var runtime = new DirectPtxRuntime();
+        const int inputFeatures = 1024, outputFeatures = 4096;
+        using var kernel = new PtxFusedLinearGeluW8A8M1Kernel(
+            runtime, inputFeatures, outputFeatures);
+        using var input = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var weights = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var activationScale = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        using var weightScales = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
+        using var bias = runtime.AllocateBytes(kernel.Blueprint.Tensors[4].RequiredBytes);
+        using var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[5].RequiredBytes);
+        input.Upload<sbyte>(new sbyte[inputFeatures]);
+        weights.Upload<sbyte>(new sbyte[inputFeatures * outputFeatures]);
+        activationScale.Upload<float>([0.01f]);
+        weightScales.Upload<float>(Enumerable.Repeat(0.005f, outputFeatures).ToArray());
+        bias.Upload<float>(new float[outputFeatures]);
+        Action launch = () => kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(weights, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(activationScale, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(weightScales, kernel.Blueprint.Tensors[3]),
+            DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[4]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[5]));
+        for (int i = 0; i < 10; i++) launch();
+        runtime.Synchronize();
+        Console.WriteLine(kernel.Audit.ToJson());
     }
 
     internal static void VerifyNcuCsv(string path)

@@ -146,24 +146,43 @@ internal sealed class DirectPtxRuntime : IDisposable
         return new DirectPtxBuffer(this, pointer, bytes);
     }
 
-    internal DirectPtxModule LoadModule(string ptx)
+    internal DirectPtxModule LoadModule(string ptx, bool allowExperimentalJitFallback = false)
     {
         if (string.IsNullOrWhiteSpace(ptx)) throw new ArgumentException("PTX cannot be empty.", nameof(ptx));
         using var _ = Enter();
+        DirectPtxCubinArtifact artifact;
+        try
+        {
+            artifact = DirectPtxCubinArtifactCache.Resolve(this, ptx);
+        }
+        catch (EntryPointNotFoundException) when (allowExperimentalJitFallback)
+        {
+            return LoadJitModule(ptx);
+        }
+        IntPtr image = Marshal.AllocHGlobal(artifact.Image.Length);
+        try
+        {
+            Marshal.Copy(artifact.Image, 0, image, artifact.Image.Length);
+            Check(CudaNativeBindings.cuModuleLoadData(out IntPtr module, image),
+                "cuModuleLoadData(compiled direct-PTX cubin)");
+            return new DirectPtxModule(this, module, artifact);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(image);
+        }
+    }
+
+    private unsafe DirectPtxModule LoadJitModule(string ptx)
+    {
         IntPtr text = Marshal.StringToHGlobalAnsi(ptx);
         const int logBytes = 16 * 1024;
         IntPtr errorLog = Marshal.AllocHGlobal(logBytes);
         IntPtr infoLog = Marshal.AllocHGlobal(logBytes);
         try
         {
-            unsafe
-            {
-                new Span<byte>((void*)errorLog, logBytes).Clear();
-                new Span<byte>((void*)infoLog, logBytes).Clear();
-            }
-            // CUjit_option values: INFO_LOG_BUFFER=3, INFO_LOG_SIZE=4,
-            // ERROR_LOG_BUFFER=5, ERROR_LOG_SIZE=6. Size values are passed
-            // by value through the void* option slot per the Driver API ABI.
+            new Span<byte>((void*)errorLog, logBytes).Clear();
+            new Span<byte>((void*)infoLog, logBytes).Clear();
             int[] options = [3, 4, 5, 6];
             IntPtr[] values = [infoLog, (IntPtr)logBytes, errorLog, (IntPtr)logBytes];
             CudaResult result = CudaNativeBindings.cuModuleLoadDataEx(
@@ -173,11 +192,11 @@ internal sealed class DirectPtxRuntime : IDisposable
                 string error = Marshal.PtrToStringAnsi(errorLog) ?? string.Empty;
                 string info = Marshal.PtrToStringAnsi(infoLog) ?? string.Empty;
                 throw new InvalidOperationException(
-                    $"cuModuleLoadDataEx(PTX) failed with CUDA driver status {(int)result} ({result}).\n" +
-                    $"JIT error log:\n{error}\nJIT info log:\n{info}");
+                    $"Experimental cuModuleLoadDataEx(PTX) fallback failed with CUDA driver status " +
+                    $"{(int)result} ({result}).\nJIT error log:\n{error}\nJIT info log:\n{info}");
             }
-            string jitInfo = Marshal.PtrToStringAnsi(infoLog) ?? string.Empty;
-            return new DirectPtxModule(this, module, jitInfo);
+            return new DirectPtxModule(
+                this, module, Marshal.PtrToStringAnsi(infoLog) ?? string.Empty);
         }
         finally
         {
@@ -399,12 +418,33 @@ internal sealed class DirectPtxModule : IDisposable
     private readonly DirectPtxRuntime _runtime;
     private IntPtr _module;
     internal string JitInfoLog { get; }
+    internal DirectPtxModuleImageKind ImageKind { get; }
+    internal string CubinSha256 { get; }
+    internal string CubinSourceKey { get; }
+    internal string? CubinPath { get; }
 
-    internal DirectPtxModule(DirectPtxRuntime runtime, IntPtr module, string jitInfoLog)
+    internal DirectPtxModule(
+        DirectPtxRuntime runtime, IntPtr module, DirectPtxCubinArtifact artifact)
     {
         _runtime = runtime;
         _module = module;
-        JitInfoLog = jitInfoLog;
+        JitInfoLog = artifact.CompilerLog;
+        ImageKind = artifact.ImageKind;
+        CubinSha256 = artifact.CubinSha256;
+        CubinSourceKey = artifact.SourceKey;
+        CubinPath = artifact.Path;
+    }
+
+    internal DirectPtxModule(
+        DirectPtxRuntime runtime, IntPtr module, string experimentalJitInfoLog)
+    {
+        _runtime = runtime;
+        _module = module;
+        JitInfoLog = experimentalJitInfoLog;
+        ImageKind = DirectPtxModuleImageKind.DriverJitPtx;
+        CubinSha256 = string.Empty;
+        CubinSourceKey = string.Empty;
+        CubinPath = null;
     }
 
     internal IntPtr GetFunction(string name)
