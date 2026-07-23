@@ -272,6 +272,13 @@ public static class PtxParityRegistry
             "along time by a rate .param .f32, lerping the magnitude and accumulating the cvt.rni-wrapped phase " +
             "advance. Its spec is TOLERANCE-based, not bit-exact. Converts to ThreeWayParity (with tolerance) " +
             "when the SM86 run lands; until then unpromoted and fail-closed."),
+
+        new PtxParitySpec("PtxMelFilterbankApplyF32Kernel", PtxParityStatus.Deferred,
+            "segmented mel filterbank application, fp32 (#850) - CudaBackend.MelFilterbankApply",
+            "one module per (totalSegBatch,specBins,melBins); each thread owns one (seg,mel) output and reduces " +
+            "over the spectral bins with fma.rn, guarded past totalSegBatch*melBins. The fma matches the " +
+            "reference's fused sum, so its spec is TOLERANCE-based against the fp64 oracle. Converts to " +
+            "ThreeWayParity (with tolerance) when the SM86 run lands; until then unpromoted and fail-closed."),
     };
 
     private static readonly Dictionary<string, PtxParitySpec> ByKernel =

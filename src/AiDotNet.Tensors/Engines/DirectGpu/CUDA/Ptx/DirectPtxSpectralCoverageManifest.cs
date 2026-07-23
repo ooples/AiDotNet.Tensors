@@ -62,7 +62,7 @@ internal static class DirectPtxSpectralCoverageManifest
         Experimental("CudaBackend.ApplyWindow", "NVRTC apply_window", "windowed frame elementwise product", Frames, "FP32", "v1 Ampere exact-count cells (PtxApplyWindowF32Kernel); one mul.rn per element, bit-exact input*window"),
         Experimental("CudaBackend.PowerToDb", "NVRTC power_to_db", "power spectrum to decibels", Frames, "FP32", "v1 Ampere exact-count cells (PtxPowerToDbF32Kernel); lg2.approx scaled by 10*log10(2) with refValue/minDb .param .f32, tolerance-based"),
         Experimental("CudaBackend.DbToPower", "NVRTC db_to_power", "decibels to power spectrum", Frames, "FP32", "v1 Ampere exact-count cells (PtxDbToPowerF32Kernel); ex2.approx of db*log2(10)/10 with refValue .param .f32, tolerance-based"),
-        Planned("CudaBackend.MelFilterbankApply", "NVRTC spectral mel apply", "segmented power-to-mel", Frames, "FP32", "segmented-mel-cells"),
+        Experimental("CudaBackend.MelFilterbankApply", "NVRTC spectral mel apply", "segmented power-to-mel", Frames, "FP32", "v1 Ampere thread-per-(seg,mel) guarded fma reduction over specBins (PtxMelFilterbankApplyF32Kernel); matches the perf-path mel_filterbank_apply, tolerance-based"),
         Planned("CudaBackend.SpectralFilter", "FFT2D multiply IFFT2D pipeline", "real spatial spectral filtering", Split, "FP32", "fft-filter-ifft-fusion-cells"),
         Planned("DirectGpuTensorEngine.FFT", "resident CUDA FFT or CPU fallback", "public complex FFT", Split, "generic public; CUDA FP32", "public-fft-routing"),
         Planned("DirectGpuTensorEngine.IFFT", "resident CUDA IFFT or CPU fallback", "public complex IFFT", Split, "generic public; CUDA FP32", "public-ifft-routing"),

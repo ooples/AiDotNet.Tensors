@@ -77,6 +77,7 @@ public class DirectPtxComplexMultiplyTests
                 "CudaBackend.IRFFT",
                 "CudaBackend.InterleaveComplex",
                 "CudaBackend.IstftFromSpectrum",
+                "CudaBackend.MelFilterbankApply",
                 "CudaBackend.PhaseVocoder",
                 "CudaBackend.PowerToDb",
                 "CudaBackend.RFFT",
@@ -1756,6 +1757,60 @@ public class DirectPtxComplexMultiplyTests
             Assert.True(Math.Abs(actMag[i] - expMag[i]) <= 1e-3 * (1 + Math.Abs(expMag[i])));
             Assert.True(Math.Abs(actPhase[i] - expPhase[i]) <= 1e-2 * (1 + Math.Abs(expPhase[i])));
         }
+    }
+
+    [Fact]
+    public void MelFilterbankApplyEmitter_IsGuardedFmaReduction()
+    {
+        string ptx = PtxMelFilterbankApplyF32Kernel.EmitPtx(8, 6, 100, 257, 80);   // 100*80 = 8000, not mult of 256
+        Assert.Contains("exact-shape totalSegBatch=100 specBins=257 melBins=80 block=256 op=mel-filterbank-apply", ptx);
+        Assert.Contains("setp.ge.u32 %p0, %r2, 8000", ptx);     // total guard
+        Assert.Contains("div.u32 %r3, %r2, 80", ptx);           // seg = outIdx / melBins
+        Assert.Contains("rem.u32 %r4, %r2, 80", ptx);           // m = outIdx % melBins
+        Assert.Contains("$MFA_LOOP:", ptx);
+        Assert.Equal(1, Count(ptx, "fma.rn.f32"));
+        Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxMelFilterbankApplyF32Kernel.IsSupportedShape(100, 257, 80));
+        Assert.False(PtxMelFilterbankApplyF32Kernel.IsSupportedShape(0, 257, 80));   // seg >= 1
+        Assert.False(PtxMelFilterbankApplyF32Kernel.IsPromotedShape(100, 257, 80));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyMelFilterbankApply_MatchesDoubleOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedComplexUnary(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The candidate is admitted only on SM86.");
+        const int seg = 100, specBins = 257, melBins = 80;
+        using var kernel = new PtxMelFilterbankApplyF32Kernel(runtime, seg, specBins, melBins);
+        var power = new float[seg * specBins];
+        var filters = new float[melBins * specBins];
+        var random = RandomHelper.CreateSeededRandom(20270301);
+        for (int i = 0; i < power.Length; i++) power[i] = (float)random.NextDouble();
+        for (int i = 0; i < filters.Length; i++) filters[i] = (float)random.NextDouble();
+        var expected = new float[seg * melBins];
+        for (int s = 0; s < seg; s++)
+            for (int m = 0; m < melBins; m++)
+            {
+                double sum = 0;
+                for (int i = 0; i < specBins; i++) sum += (double)power[s * specBins + i] * filters[m * specBins + i];
+                expected[s * melBins + m] = (float)sum;
+            }
+        using var pB = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var fB = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var eB = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        pB.Upload<float>(power); fB.Upload<float>(filters);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(pB, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(fB, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(eB, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[seg * melBins];
+        eB.Download<float>(actual);
+        for (int i = 0; i < actual.Length; i++) Assert.True(MathF.Abs(actual[i] - expected[i]) <= 3e-4f);
     }
 
     private static int Count(string text, string value)
