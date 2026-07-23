@@ -177,8 +177,11 @@ process existed before it registered its CUDA context.
 
 ## Evidence collected on RTX 3080 / SM86
 
-- All 14 focused correctness/routing/capture/allocation tests pass on net10
-  and net471.
+- On the final four-bank head, all 14 focused
+  correctness/routing/capture/allocation tests plus both emitter/inventory
+  checks pass on net10. The exact source builds on net471; the immediately
+  preceding single-bank workspace passed 14/14 on net471, while the final
+  four-bank net471 GPU replay waits for an uncontended device.
 - All 71 current-source identities and 67 compiled cubins pass the static
   verifier.
 - Final SASS passes for all 67 cubins with zero `LDL` and zero `STL`; current
