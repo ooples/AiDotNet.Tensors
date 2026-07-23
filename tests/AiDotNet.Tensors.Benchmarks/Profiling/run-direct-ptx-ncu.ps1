@@ -80,7 +80,7 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 dotnet $targetDll --direct-ptx-verify-ncu $OutputCsv
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-# One deterministic launch is emitted for every promoted kernel entry point;
+# One deterministic launch is emitted for every audited exact kernel entry point;
 # attention and residual-RMSNorm additionally enumerate all promoted sequence/
 # row, causal, and fusion variants. Nsight Compute raw CSV has one wide
 # data row per launch. Require every requested column on every expected launch
