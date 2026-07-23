@@ -21,17 +21,20 @@ public class DirectPtxSgdMomentumTests
     [Fact]
     public void FusedSgdMomentumEmitter_IsRegisterResidentAndPointerOnly()
     {
-        string ptx = PtxFusedSgdMomentumF32Kernel.EmitPtx(8, 6, 1_048_576, 0.1f, 0.9f, 1e-4f);
+        string ptx = PtxFusedSgdMomentumF32Kernel.EmitPtx(8, 6, 1_048_576, hasWeightDecay: true);
         Assert.Contains(".maxntid 256, 1, 1", ptx);
         Assert.Contains("exact-shape size=1048576 block=256", ptx);
         Assert.Contains("op=sgd-momentum wd=1", ptx);
         Assert.Equal(3, Count(ptx, "ld.param.u64"));
-        Assert.Equal(3, Count(ptx, "ld.global.ca.v4.f32"));
+        // param and velocity are read-modify-write and stay cached; the
+        // gradient is read once, so it uses the read-only data cache.
+        Assert.Equal(2, Count(ptx, "ld.global.ca.v4.f32"));
+        Assert.Equal(1, Count(ptx, "ld.global.nc.v4.f32"));
         Assert.Equal(2, Count(ptx, "st.global.v4.f32"));
         // With weight decay: 3 fma per element * 4 elements = 12.
         Assert.Equal(12, Count(ptx, "fma.rn.f32"));
         // Without weight decay: 2 fma per element * 4 = 8, and wd=0 marker.
-        string noWd = PtxFusedSgdMomentumF32Kernel.EmitPtx(8, 6, 65_536, 0.1f, 0.9f, 0f);
+        string noWd = PtxFusedSgdMomentumF32Kernel.EmitPtx(8, 6, 65_536, hasWeightDecay: false);
         Assert.Contains("op=sgd-momentum wd=0", noWd);
         Assert.Equal(8, Count(noWd, "fma.rn.f32"));
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
@@ -39,6 +42,12 @@ public class DirectPtxSgdMomentumTests
         Assert.DoesNotContain("bar.sync", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        // Three scalars travel as launch parameters, so the module key is the
+        // shape plus the decay presence - one module for a whole run.
+        Assert.Equal(3, Count(ptx, ".param .f32"));
+        Assert.Equal(
+            PtxFusedSgdMomentumF32Kernel.EmitPtx(8, 6, 1_048_576, hasWeightDecay: true),
+            PtxFusedSgdMomentumF32Kernel.EmitPtx(8, 6, 1_048_576, hasWeightDecay: true));
     }
 
     [Fact]
@@ -51,8 +60,11 @@ public class DirectPtxSgdMomentumTests
         Assert.False(PtxFusedSgdMomentumF32Kernel.IsSupportedShape(65_535));
         Assert.False(PtxFusedSgdMomentumF32Kernel.IsSupportedShape(1_000_000));
         Assert.False(PtxFusedSgdMomentumF32Kernel.IsPromotedShape(1_048_576));
+        // The hyperparameters are launch parameters now, so they are validated
+        // when the kernel is constructed rather than when the module is emitted;
+        // the module itself no longer depends on their values.
         Assert.Throws<ArgumentOutOfRangeException>(() =>
-            PtxFusedSgdMomentumF32Kernel.EmitPtx(8, 6, 1_048_576, float.NaN, 0.9f, 0f));
+            PtxFusedSgdMomentumF32Kernel.EmitPtx(8, 6, 1_000_000, hasWeightDecay: false));
     }
 
     [Fact]

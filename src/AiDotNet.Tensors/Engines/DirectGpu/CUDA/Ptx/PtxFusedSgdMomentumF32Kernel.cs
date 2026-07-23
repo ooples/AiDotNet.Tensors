@@ -28,6 +28,9 @@ internal sealed class PtxFusedSgdMomentumF32Kernel : IDisposable
 {
     internal const string EntryPoint = "aidotnet_fused_sgd_momentum_f32";
     internal const int DefaultBlockThreads = 256;
+    /// <summary>Whether this module emits the weight-decay term.</summary>
+    internal bool HasWeightDecay { get; }
+
     internal const int ElementsPerThread = 4;
 
     private readonly DirectPtxModule _module;
@@ -65,8 +68,9 @@ internal sealed class PtxFusedSgdMomentumF32Kernel : IDisposable
         WeightDecay = weightDecay;
         BlockThreads = blockThreads;
         Blueprint = CreateBlueprint(runtime.ArchitectureFamily, size, learningRate, momentum, weightDecay, blockThreads);
+        HasWeightDecay = weightDecay != 0f;
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
-            size, learningRate, momentum, weightDecay, blockThreads);
+            size, HasWeightDecay, blockThreads);
         _module = runtime.LoadModule(Ptx);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
         int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
@@ -89,10 +93,18 @@ internal sealed class PtxFusedSgdMomentumF32Kernel : IDisposable
         IntPtr paramPointer = param.Pointer;
         IntPtr gradientPointer = gradient.Pointer;
         IntPtr velocityPointer = velocity.Pointer;
-        void** arguments = stackalloc void*[3];
+        // Negated once here so the parameter update stays a single fma per
+        // element rather than a multiply followed by a subtract.
+        float negLearningRate = -LearningRate;
+        float momentum = Momentum;
+        float weightDecay = WeightDecay;
+        void** arguments = stackalloc void*[6];
         arguments[0] = &paramPointer;
         arguments[1] = &gradientPointer;
         arguments[2] = &velocityPointer;
+        arguments[3] = &negLearningRate;
+        arguments[4] = &momentum;
+        arguments[5] = &weightDecay;
         _module.Launch(
             _function,
             checked((uint)(Size / ElementsPerBlock)),
@@ -108,22 +120,20 @@ internal sealed class PtxFusedSgdMomentumF32Kernel : IDisposable
     private static string HexFloat(float value) =>
         "0f" + PtxCompat.SingleToUInt32Bits(value).ToString("X8", CultureInfo.InvariantCulture);
 
+    /// <summary>
+    /// Emits the module. Only the SHAPE and the weight-decay presence are baked;
+    /// the learning rate, momentum, and decay arrive as launch parameters, so
+    /// one module serves an entire run and the key space stays finite.
+    /// </summary>
     internal static string EmitPtx(
         int ccMajor,
         int ccMinor,
         int size,
-        float learningRate,
-        float momentum,
-        float weightDecay,
+        bool hasWeightDecay,
         int blockThreads = DefaultBlockThreads)
     {
         Validate(size);
         ValidateBlockThreads(size, blockThreads);
-        ValidateHyperparameters(learningRate, momentum, weightDecay);
-        string lrNeg = HexFloat(-learningRate);
-        string mom = HexFloat(momentum);
-        string wd = HexFloat(weightDecay);
-        bool hasWeightDecay = weightDecay != 0f;
         var ptx = new StringBuilder(3_072);
         ptx.AppendLine(".version 7.1");
         ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
@@ -134,16 +144,25 @@ internal sealed class PtxFusedSgdMomentumF32Kernel : IDisposable
         ptx.AppendLine($".visible .entry {EntryPoint}(");
         ptx.AppendLine("    .param .u64 param_ptr,");
         ptx.AppendLine("    .param .u64 grad_ptr,");
-        ptx.AppendLine("    .param .u64 vel_ptr");
+        ptx.AppendLine("    .param .u64 vel_ptr,");
+        // The host negates the learning rate once so the update stays a single
+        // fma per element rather than a multiply and a subtract.
+        ptx.AppendLine("    .param .f32 neg_learning_rate,");
+        ptx.AppendLine("    .param .f32 momentum,");
+        ptx.AppendLine("    .param .f32 weight_decay");
         ptx.AppendLine(")");
         ptx.AppendLine($".maxntid {blockThreads}, 1, 1");
         ptx.AppendLine("{");
         ptx.AppendLine("    .reg .b32 %r<3>;");
         ptx.AppendLine("    .reg .b64 %rd<9>;");
-        ptx.AppendLine("    .reg .f32 %f<12>;");
+        ptx.AppendLine("    .reg .f32 %f<15>;");
         ptx.AppendLine("    ld.param.u64 %rd0, [param_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd1, [grad_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd2, [vel_ptr];");
+        ptx.AppendLine("    ld.param.f32 %f12, [neg_learning_rate];");
+        ptx.AppendLine("    ld.param.f32 %f13, [momentum];");
+        if (hasWeightDecay)
+            ptx.AppendLine("    ld.param.f32 %f14, [weight_decay];");
         ptx.AppendLine("    mov.u32 %r0, %ctaid.x;");
         ptx.AppendLine("    mov.u32 %r1, %tid.x;");
         ptx.AppendLine($"    mad.lo.u32 %r2, %r0, {blockThreads}, %r1;");
@@ -153,15 +172,15 @@ internal sealed class PtxFusedSgdMomentumF32Kernel : IDisposable
         ptx.AppendLine("    add.u64 %rd6, %rd2, %rd3;");
         // f0-3 = param, f4-7 = grad, f8-11 = velocity.
         ptx.AppendLine("    ld.global.ca.v4.f32 {%f0, %f1, %f2, %f3}, [%rd4];");
-        ptx.AppendLine("    ld.global.ca.v4.f32 {%f4, %f5, %f6, %f7}, [%rd5];");
+        ptx.AppendLine("    ld.global.nc.v4.f32 {%f4, %f5, %f6, %f7}, [%rd5];");
         ptx.AppendLine("    ld.global.ca.v4.f32 {%f8, %f9, %f10, %f11}, [%rd6];");
         for (int i = 0; i < ElementsPerThread; i++)
         {
             int p = i, g = 4 + i, v = 8 + i;
             if (hasWeightDecay)
-                ptx.AppendLine($"    fma.rn.f32 %f{g}, %f{p}, {wd}, %f{g};");   // g = wd*param + grad
-            ptx.AppendLine($"    fma.rn.f32 %f{v}, %f{v}, {mom}, %f{g};");       // v = momentum*v + g
-            ptx.AppendLine($"    fma.rn.f32 %f{p}, %f{v}, {lrNeg}, %f{p};");     // param = -lr*v + param
+                ptx.AppendLine($"    fma.rn.f32 %f{g}, %f{p}, %f14, %f{g};");   // g = wd*param + grad
+            ptx.AppendLine($"    fma.rn.f32 %f{v}, %f{v}, %f13, %f{g};");       // v = momentum*v + g
+            ptx.AppendLine($"    fma.rn.f32 %f{p}, %f{v}, %f12, %f{p};");       // param = -lr*v + param
         }
         ptx.AppendLine("    st.global.v4.f32 [%rd6], {%f8, %f9, %f10, %f11};");  // velocity out
         ptx.AppendLine("    st.global.v4.f32 [%rd4], {%f0, %f1, %f2, %f3};");    // param out
