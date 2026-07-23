@@ -27,7 +27,7 @@ public class DirectPtxL2NormalizeTests
         Assert.Contains("exact-shape rows=2048 columns=128 block=128", ptx);
         Assert.Contains("op=l2normalize", ptx);
         Assert.Equal(2, Count(ptx, "ld.param.u64"));
-        Assert.Equal(1, Count(ptx, "ld.global.ca.v4.f32"));
+        Assert.Equal(1, Count(ptx, "ld.global.nc.v4.f32"));
         Assert.Equal(1, Count(ptx, "st.global.v4.f32"));
         Assert.Equal(4, Count(ptx, "fma.rn.f32"));
         Assert.Equal(5, Count(ptx, "shfl.sync.bfly.b32"));
@@ -36,7 +36,7 @@ public class DirectPtxL2NormalizeTests
         string eps = "0f" + MathCompat.SingleToUInt32Bits(PtxFusedRowL2NormalizeF32Kernel.Epsilon)
             .ToString("X8", System.Globalization.CultureInfo.InvariantCulture);
         Assert.Contains(eps, ptx);
-        Assert.Contains("ld.global.ca.v2.f32",
+        Assert.Contains("ld.global.nc.v2.f32",
             PtxFusedRowL2NormalizeF32Kernel.EmitPtx(8, 6, 2048, 64));
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);

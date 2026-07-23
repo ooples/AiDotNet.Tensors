@@ -137,7 +137,9 @@ internal sealed class PtxFusedRowL2NormalizeF32Kernel : IDisposable
         ptx.AppendLine($"    mul.wide.u32 %rd5, %r3, {valuesPerLane * sizeof(float)};");
         ptx.AppendLine("    add.u64 %rd6, %rd3, %rd5;");
         ptx.AppendLine("    add.u64 %rd7, %rd4, %rd5;");
-        ptx.AppendLine($"    ld.global.ca.v{valuesPerLane}.f32 {{{valueRegisters}}}, [%rd6];");
+        // Streamed once and never revisited, so this goes through the
+        // read-only data cache instead of displacing L1.
+        ptx.AppendLine($"    ld.global.nc.v{valuesPerLane}.f32 {{{valueRegisters}}}, [%rd6];");
         ptx.AppendLine($"    mov.f32 %f{accReg}, 0f00000000;");
         for (int i = 0; i < valuesPerLane; i++)
             ptx.AppendLine($"    fma.rn.f32 %f{accReg}, %f{i}, %f{i}, %f{accReg};");

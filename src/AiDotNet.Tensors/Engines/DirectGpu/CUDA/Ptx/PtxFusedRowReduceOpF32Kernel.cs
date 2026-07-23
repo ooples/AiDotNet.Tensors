@@ -176,7 +176,7 @@ internal sealed class PtxFusedRowReduceOpF32Kernel : IDisposable
         ptx.AppendLine($"    mul.wide.u32 %rd5, %r3, {valuesPerLane * sizeof(float)};");
         ptx.AppendLine("    add.u64 %rd6, %rd3, %rd5;");
         ptx.AppendLine(
-            $"    ld.global.ca.v{valuesPerLane}.f32 {{{valueRegisters}}}, [%rd6];");
+            $"    ld.global.nc.v{valuesPerLane}.f32 {{{valueRegisters}}}, [%rd6];");
 
         // Identity, then the register-resident lane fold.
         ptx.AppendLine($"    mov.f32 %f{accReg}, {IdentityLiteral(op)};");

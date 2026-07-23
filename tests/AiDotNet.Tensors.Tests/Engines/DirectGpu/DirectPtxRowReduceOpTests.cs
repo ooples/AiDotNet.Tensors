@@ -34,7 +34,7 @@ public class DirectPtxRowReduceOpTests
         Assert.Contains(tag, ptx);
         Assert.Equal(2, Count(ptx, "ld.param.u64"));
         // 128 columns / 32 lanes = one v4 load per lane.
-        Assert.Equal(1, Count(ptx, "ld.global.ca.v4.f32"));
+        Assert.Equal(1, Count(ptx, "ld.global.nc.v4.f32"));
         Assert.Equal(1, Count(ptx, "st.global.f32"));
         Assert.Equal(5, Count(ptx, "shfl.sync.bfly.b32"));
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
