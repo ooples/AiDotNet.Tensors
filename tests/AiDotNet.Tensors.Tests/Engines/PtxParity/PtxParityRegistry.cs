@@ -149,6 +149,30 @@ public static class PtxParityRegistry
             "(low occupancy vs M-buffer traffic); FP32 hand-PTX tops out at ~0.73x cuDNN. Deferred; the " +
             "remaining win path is FP16 Tensor Cores (option C)."),
 
+        new PtxParitySpec("PtxWinogradF23FilterTransformFp16Kernel", PtxParityStatus.Deferred,
+            "Winograd F(2,3) fp16 filter transform U = G g G^T -> U[16,K,C] (#841 3x3 option C)",
+            "fp16 A-operand producer for the Tensor-Core Winograd GEMM: fp32 transform math, casts the 16 " +
+            "positions to fp16 in position-major U[16,K,C] (the WMMA A layout). Verified correct on-device as " +
+            "part of the fp16-TC pipeline (<= 5e-2, cuDNN fp16 regime). Deferred (transform stage; measured via " +
+            "the WMMA GEMM cell)."),
+
+        new PtxParitySpec("PtxWinogradF23InputTransformFp16Kernel", PtxParityStatus.Deferred,
+            "Winograd F(2,3) fp16 input transform V = B^T d B -> V[16,P,C] (#841 3x3 option C)",
+            "fp16 B-operand producer for the Tensor-Core Winograd GEMM: fp32 transform math, casts the 16 " +
+            "positions to fp16 in tile-major V[16,P,C] so the col-major WMMA load yields V^T and the mma " +
+            "computes U*V. Verified correct on-device (<= 5e-2). Deferred (transform stage)."),
+
+        new PtxParitySpec("PtxWinogradWmmaBatchedGemmKernel", PtxParityStatus.Deferred,
+            "Winograd F(2,3) fp16 Tensor-Core batched GEMM M[xi]=U[xi].V[xi] (#841 3x3 option C)",
+            "option C: the 16 position GEMMs on Ampere Tensor Cores via wmma.mma.sync m16n16k16 f16->f32, " +
+            "batched over grid.z=16, reusing the proven Q*K^T WMMA loop (A=U row, B=V col-load). Verified " +
+            "correct on-device (<= 5e-2). HONEST perf: at the ResNet C64 shape it measured ~6076us amortized -- " +
+            "SLOWER than the fp32 batched pipeline (~1670us) and far off cuDNN (~494us). Root cause: contraction " +
+            "C=64 is too small to amortize the TC shared-staging/sync (Tensor Cores idle at ~0.6 TFLOP/s) and the " +
+            "batched structure still pays the ~98MB M round-trip cuDNN avoids by fusing. Naively swapping the " +
+            "GEMM to Tensor Cores does NOT win; only a fully-fused TC-Winograd (M in fragments + epilogue " +
+            "transform) could. Deferred."),
+
         new PtxParitySpec("PtxWinogradBatchedGemmKernel", PtxParityStatus.Deferred,
             "Winograd F(2,3) batched register-blocked GEMM M[b]=U[b].V[b] (#841 3x3 pipeline)",
             "the 16 Winograd position GEMMs run as one batched register-blocked GEMM (grid.z=16), reusing " +
