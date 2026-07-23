@@ -22,6 +22,7 @@ internal static class DirectPtxReductionCubinTool
         var warpRowShapes = new[] { (256, 128), (2048, 64), (2048, 128), (8192, 128) };
         foreach ((int rows, int columns) in warpRowShapes)
         {
+            if (!PtxFusedRowReduceF32Kernel.IsSupportedShape(rows, columns)) continue;
             yield return new DirectPtxModuleSource(
                 $"row-sum-f32-v1-r{rows}-c{columns}",
                 PtxFusedRowReduceF32Kernel.EntryPoint,
@@ -39,10 +40,14 @@ internal static class DirectPtxReductionCubinTool
             DirectPtxRowReduceOp.Min,
             DirectPtxRowReduceOp.SumOfSquares,
         };
+        // Filter through the kernel's own admission check rather than repeating
+        // its shape list here: a drift between the two would either skip a
+        // shipped module or try to emit one the kernel rejects.
         foreach (int rows in new[] { 256, 512, 1024, 2048, 4096 })
-        foreach (int columns in new[] { 128, 256, 512, 1024 })
+        foreach (int columns in new[] { 64, 128, 256, 512, 1024 })
         foreach (DirectPtxRowReduceOp op in operators)
         {
+            if (!PtxFusedRowReduceOpF32Kernel.IsSupportedShape(rows, columns)) continue;
             yield return new DirectPtxModuleSource(
                 $"row-reduce-{op}-f32-v1-r{rows}-c{columns}",
                 PtxFusedRowReduceOpF32Kernel.EntryPointFor(op),

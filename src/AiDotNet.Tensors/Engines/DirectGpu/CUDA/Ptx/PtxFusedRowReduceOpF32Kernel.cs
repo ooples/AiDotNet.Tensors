@@ -330,9 +330,19 @@ internal sealed class PtxFusedRowReduceOpF32Kernel : IDisposable
     };
 
     /// <summary>The operator set mirrors the row-sum family's exact shape domain.</summary>
+    /// <summary>
+    /// One warp owns a row and each lane issues ONE vectorized load, so the
+    /// column count must divide into 32 lanes at a legal vector width: 64
+    /// columns is a v2 per lane and 128 is a v4. There is no v8, so wider rows
+    /// are not admissible without a second load per lane.
+    ///
+    /// This previously advertised 256, 512, and 1024 columns as well, which
+    /// Validate then rejected - callers that trusted the admission check got an
+    /// exception from the constructor instead of a clean fallback.
+    /// </summary>
     internal static bool IsSupportedShape(int rows, int columns) =>
         rows is 256 or 512 or 1024 or 2048 or 4096 &&
-        columns is 128 or 256 or 512 or 1024;
+        columns is 64 or 128;
 
     internal static bool IsPromotedShape(int rows, int columns) => false;
 

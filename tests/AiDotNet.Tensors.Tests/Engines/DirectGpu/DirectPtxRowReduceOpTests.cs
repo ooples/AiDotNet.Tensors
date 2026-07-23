@@ -109,9 +109,17 @@ public class DirectPtxRowReduceOpTests
     public void ShapeDomain_IsClosedAndUnpromotedWithoutEvidence()
     {
         Assert.True(PtxFusedRowReduceOpF32Kernel.IsSupportedShape(1024, 128));
-        Assert.True(PtxFusedRowReduceOpF32Kernel.IsSupportedShape(256, 1024));
+        Assert.True(PtxFusedRowReduceOpF32Kernel.IsSupportedShape(256, 64));
         Assert.False(PtxFusedRowReduceOpF32Kernel.IsSupportedShape(1000, 128));
         Assert.False(PtxFusedRowReduceOpF32Kernel.IsSupportedShape(1024, 96));
+        // The admission check must not advertise widths the constructor
+        // rejects: 256 columns would need a v8 load per lane, which does not
+        // exist. Anything IsSupportedShape accepts must actually emit.
+        Assert.False(PtxFusedRowReduceOpF32Kernel.IsSupportedShape(1024, 256));
+        Assert.False(PtxFusedRowReduceOpF32Kernel.IsSupportedShape(1024, 1024));
+        foreach (int columns in new[] { 64, 128 })
+            _ = PtxFusedRowReduceOpF32Kernel.EmitPtx(
+                8, 6, DirectPtxRowReduceOp.Mean, 1024, columns);
         Assert.False(PtxFusedRowReduceOpF32Kernel.IsPromotedShape(1024, 128));
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             PtxFusedRowReduceOpF32Kernel.EmitPtx(8, 6, DirectPtxRowReduceOp.Mean, 1000, 128));
