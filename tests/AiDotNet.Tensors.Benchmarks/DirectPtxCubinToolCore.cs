@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
@@ -72,7 +73,7 @@ internal static class DirectPtxCubinToolCore
             // -O3 and the exact arch are pinned so the output depends only on
             // the PTX and the toolkit version, never on the host.
             (int exitCode, string stdout, string stderr) = Run(
-                ptxas, $"-arch={TargetArch} -O3 --warn-on-spills -o \"{cubinPath}\" \"{ptxPath}\"");
+                ptxas, $"-arch={TargetArch} -O3 -v --warn-on-spills -o \"{cubinPath}\" \"{ptxPath}\"");
             if (exitCode != 0)
             {
                 Console.Error.WriteLine($"[FAIL] ptxas rejected {module.BlueprintId}");
@@ -93,9 +94,14 @@ internal static class DirectPtxCubinToolCore
             }
 
             byte[] cubin = File.ReadAllBytes(cubinPath);
+            ResourceUsage usage = ParseUsage(diagnostics);
             rows.Add(string.Join("\t",
                 module.BlueprintId, module.EntryPoint, ptxSha, Sha256(cubin),
-                cubin.Length.ToString(CultureInfo.InvariantCulture), ptxSha + ".cubin"));
+                cubin.Length.ToString(CultureInfo.InvariantCulture),
+                usage.Registers.ToString(CultureInfo.InvariantCulture),
+                usage.SharedBytes.ToString(CultureInfo.InvariantCulture),
+                MaxBlocksPerSm(usage).ToString(CultureInfo.InvariantCulture),
+                ptxSha + ".cubin"));
             File.Delete(ptxPath);
         }
 
@@ -105,7 +111,7 @@ internal static class DirectPtxCubinToolCore
         manifest.AppendLine($"# target={TargetArch}");
         manifest.AppendLine($"# family={family}");
         manifest.AppendLine("# Reproducible: identical PTX plus this ptxas version yields these exact cubins.");
-        manifest.AppendLine("blueprint-id\tentry-point\tptx-sha256\tcubin-sha256\tcubin-bytes\tfile");
+        manifest.AppendLine("blueprint-id\tentry-point\tptx-sha256\tcubin-sha256\tcubin-bytes\tregisters\tshared-bytes\tmax-blocks-per-sm\tfile");
         foreach (string row in rows.OrderBy(r => r, StringComparer.Ordinal))
             manifest.AppendLine(row);
         File.WriteAllText(Path.Combine(outputDirectory, ManifestName(family)), manifest.ToString());
@@ -219,6 +225,51 @@ internal static class DirectPtxCubinToolCore
             ? $"SASS contract holds for {cubins.Length} {family} cubin(s)."
             : $"{violations} SASS violation(s).");
         return violations == 0 ? 0 : 1;
+    }
+
+    /// <summary>What ptxas reported about one compiled entry point.</summary>
+    private readonly record struct ResourceUsage(int Registers, int SharedBytes);
+
+    /// <summary>
+    /// Reads the register and shared-memory figures out of a ptxas -v report.
+    /// These are the numbers the resource budget in each blueprint is supposed
+    /// to encode, so recording them turns those budgets from estimates written
+    /// before any machine code existed into something checkable.
+    /// </summary>
+    private static ResourceUsage ParseUsage(string diagnostics)
+    {
+        int registers = 0;
+        int shared = 0;
+        Match r = Regex.Match(diagnostics, @"Used (\d+) registers");
+        if (r.Success) registers = int.Parse(r.Groups[1].Value, CultureInfo.InvariantCulture);
+        Match sm = Regex.Match(diagnostics, @"(\d+) bytes smem");
+        if (sm.Success) shared = int.Parse(sm.Groups[1].Value, CultureInfo.InvariantCulture);
+        return new ResourceUsage(registers, shared);
+    }
+
+    /// <summary>
+    /// Blocks per SM this kernel can hold on SM86, from the two limits a
+    /// direct-PTX kernel can actually influence: the 65536-entry register file
+    /// and 100 KB of shared memory per SM. Registers are allocated per warp in
+    /// units of 256, which is why the per-warp figure is rounded up before the
+    /// division.
+    ///
+    /// This is the number MinBlocksPerMultiprocessor should be set from.
+    /// </summary>
+    private static int MaxBlocksPerSm(ResourceUsage usage, int blockThreads = 256)
+    {
+        const int RegistersPerSm = 65_536;
+        const int SharedBytesPerSm = 100 * 1024;
+        const int WarpAllocationGranularity = 256;
+
+        if (usage.Registers <= 0) return 0;
+        int warps = (blockThreads + 31) / 32;
+        int registersPerWarp =
+            ((usage.Registers * 32) + WarpAllocationGranularity - 1)
+            / WarpAllocationGranularity * WarpAllocationGranularity;
+        int byRegisters = RegistersPerSm / (registersPerWarp * warps);
+        int byShared = usage.SharedBytes > 0 ? SharedBytesPerSm / usage.SharedBytes : int.MaxValue;
+        return Math.Max(0, Math.Min(byRegisters, byShared));
     }
 
     internal static string ManifestName(string family) => family + "-cubins.tsv";
