@@ -203,6 +203,9 @@ public partial class DirectPtxWmmaTests
         Assert.Equal(3, Count(strided, ".param .u64"));
         Assert.DoesNotContain(".param .u32", strided, StringComparison.Ordinal);
         Assert.Contains("valid-i=[0,511]", strided, StringComparison.Ordinal);
+        Assert.Contains(".shared .align 16 .b8 partial[32]", strided, StringComparison.Ordinal);
+        Assert.Equal(1, Count(strided, "bar.sync 0"));
+        Assert.Equal(10, Count(strided, "shfl.sync.down.b32"));
         Assert.DoesNotContain(".local", strided, StringComparison.Ordinal);
         Assert.Equal((0, 511), PtxStridedDotKernel.ValidInterval(512, 512, 511, -1));
         Assert.Equal((3, 10), PtxStridedDotKernel.ValidInterval(16, 8, -3, 1));
@@ -236,6 +239,8 @@ public partial class DirectPtxWmmaTests
         Assert.Contains(PtxDenseVectorKernel.DotEntryPoint, dot, StringComparison.Ordinal);
         Assert.Equal(3, Count(dot, ".param .u64"));
         Assert.Contains(".shared .align 16 .b8 partial[32]", dot, StringComparison.Ordinal);
+        Assert.Equal(2, Count(dot, "ld.global.nc.v4.f32"));
+        Assert.Equal(4, Count(dot, "fma.rn.f32"));
         Assert.Equal(1, Count(dot, "bar.sync 0")); // publish eight warp partials
         Assert.Equal(10, Count(dot, "shfl.sync.down.b32"));
         Assert.DoesNotContain(".local", dot, StringComparison.Ordinal);

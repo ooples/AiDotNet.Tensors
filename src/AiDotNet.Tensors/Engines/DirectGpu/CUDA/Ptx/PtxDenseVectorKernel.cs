@@ -195,29 +195,57 @@ internal sealed class PtxDenseVectorKernel : IDisposable
 
     private static void EmitDot(StringBuilder ptx, int length)
     {
-        ptx.AppendLine($"// exact dot product K={length}; one register/shared reduction, one global store");
+        bool vectorized = (length & 3) == 0;
+        ptx.AppendLine($"// exact dot product K={length}; {(vectorized ? "aligned float4 streaming; " : string.Empty)}one register/shared reduction, one global store");
         EmitHeader(ptx, DotEntryPoint);
         ptx.AppendLine("    .reg .pred %p<4>;");
         ptx.AppendLine("    .reg .b32 %r<10>;");
         ptx.AppendLine("    .reg .b64 %rd<12>;");
-        ptx.AppendLine("    .reg .f32 %f<6>;");
+        ptx.AppendLine($"    .reg .f32 %f<{(vectorized ? 13 : 6)}>;");
         ptx.AppendLine($"    .shared .align 16 .b8 partial[{WarpCount * sizeof(float)}];");
         EmitPointers(ptx);
         ptx.AppendLine("    mov.u32 %r0, %tid.x;");
-        ptx.AppendLine("    mov.u32 %r1, %r0;");
+        ptx.AppendLine(vectorized
+            ? "    shl.b32 %r1, %r0, 2;"
+            : "    mov.u32 %r1, %r0;");
         ptx.AppendLine("    mov.f32 %f0, 0f00000000;");
+        if (vectorized)
+        {
+            ptx.AppendLine("    mov.f32 %f6, 0f00000000;");
+            ptx.AppendLine("    mov.f32 %f7, 0f00000000;");
+            ptx.AppendLine("    mov.f32 %f8, 0f00000000;");
+        }
         ptx.AppendLine("DOT_LOOP:");
         ptx.AppendLine($"    setp.ge.u32 %p0, %r1, {length};");
         ptx.AppendLine("    @%p0 bra.uni DOT_REDUCE;");
         ptx.AppendLine("    mul.wide.u32 %rd3, %r1, 4;");
         ptx.AppendLine("    add.u64 %rd4, %rd0, %rd3;");
         ptx.AppendLine("    add.u64 %rd5, %rd1, %rd3;");
-        ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd4];");
-        ptx.AppendLine("    ld.global.nc.f32 %f2, [%rd5];");
-        ptx.AppendLine("    fma.rn.f32 %f0, %f1, %f2, %f0;");
-        ptx.AppendLine($"    add.u32 %r1, %r1, {BlockThreads};");
+        if (vectorized)
+        {
+            ptx.AppendLine("    ld.global.nc.v4.f32 {%f1,%f2,%f3,%f4}, [%rd4];");
+            ptx.AppendLine("    ld.global.nc.v4.f32 {%f9,%f10,%f11,%f12}, [%rd5];");
+            ptx.AppendLine("    fma.rn.f32 %f0, %f1, %f9, %f0;");
+            ptx.AppendLine("    fma.rn.f32 %f6, %f2, %f10, %f6;");
+            ptx.AppendLine("    fma.rn.f32 %f7, %f3, %f11, %f7;");
+            ptx.AppendLine("    fma.rn.f32 %f8, %f4, %f12, %f8;");
+            ptx.AppendLine($"    add.u32 %r1, %r1, {BlockThreads * 4};");
+        }
+        else
+        {
+            ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd4];");
+            ptx.AppendLine("    ld.global.nc.f32 %f2, [%rd5];");
+            ptx.AppendLine("    fma.rn.f32 %f0, %f1, %f2, %f0;");
+            ptx.AppendLine($"    add.u32 %r1, %r1, {BlockThreads};");
+        }
         ptx.AppendLine("    bra.uni DOT_LOOP;");
         ptx.AppendLine("DOT_REDUCE:");
+        if (vectorized)
+        {
+            ptx.AppendLine("    add.rn.f32 %f0, %f0, %f6;");
+            ptx.AppendLine("    add.rn.f32 %f7, %f7, %f8;");
+            ptx.AppendLine("    add.rn.f32 %f0, %f0, %f7;");
+        }
         ptx.AppendLine("    mov.u64 %rd6, partial;");
         ptx.AppendLine("    and.b32 %r3, %r0, 31;");
         ptx.AppendLine("    shr.u32 %r4, %r0, 5;");
@@ -287,15 +315,16 @@ internal sealed class PtxDenseVectorKernel : IDisposable
         int n)
     {
         bool dot = operation == DirectPtxDenseVectorOperation.Dot;
+        bool vectorizedDot = dot && (m & 3) == 0;
         bool vectorizedOuter = !dot && (n & 3) == 0;
         var left = new DirectPtxExtent(m);
         var right = new DirectPtxExtent(dot ? m : n);
         var output = dot ? new DirectPtxExtent(1) : new DirectPtxExtent(m, n);
         return new DirectPtxKernelBlueprint(
             Operation: dot ? "dense-dot" : "dense-outer",
-            Version: vectorizedOuter ? 2 : 1,
+            Version: vectorizedDot || vectorizedOuter ? 2 : 1,
             Architecture: architecture,
-            Variant: dot ? $"fp32-k{m}" :
+            Variant: dot ? $"{(vectorizedDot ? "fp32x4" : "fp32")}-k{m}" :
                 $"{(vectorizedOuter ? "fp32x4" : "fp32")}-m{m}-n{n}",
             Tensors:
             [
@@ -322,7 +351,9 @@ internal sealed class PtxDenseVectorKernel : IDisposable
                 ["global-intermediates"] = "none",
                 ["memory-pipeline"] = vectorizedOuter
                     ? "aligned float4 load/multiply/store; one output write"
-                    : "scalar register path; one output write"
+                    : vectorizedDot
+                        ? "aligned float4 loads; register/shared reduction; one output write"
+                        : "scalar register path; one output write"
             });
     }
 

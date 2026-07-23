@@ -277,14 +277,14 @@ internal static class DirectPtxDenseLinearArtifactTool
             Cell("fused-linear-backward-v2-Ampere-fp32-m64-k256-n256-relu",
                 PtxFusedLinearBackwardKernel.EmitPtx(
                 major, minor, 64, 256, 256, DirectPtxLinearActivation.Relu)),
-            Cell("dense-dot-v1-Ampere-fp32-k4096", PtxDenseVectorKernel.EmitPtx(
+            Cell("dense-dot-v2-Ampere-fp32x4-k4096", PtxDenseVectorKernel.EmitPtx(
                 major, minor, DirectPtxDenseVectorOperation.Dot, 4_096)),
             Cell("dense-outer-v2-Ampere-fp32x4-m64-n128", PtxDenseVectorKernel.EmitPtx(
                 major, minor, DirectPtxDenseVectorOperation.Outer, 64, 128)),
             Cell("batched-dense-dot-v3-Ampere-warp-per-batch-fp32x4-b4-d512",
                 PtxBatchedVectorKernel.EmitPtx(
                 major, minor, DirectPtxBatchedVectorOperation.Dot, 4, 512)),
-            Cell("strided-dot-v1-Ampere-fp32-a512-b512-o511-s-1",
+            Cell("strided-dot-v2-Ampere-warp-reduce-fp32-a512-b512-o511-s-1",
                 PtxStridedDotKernel.EmitPtx(
                 major, minor, 512, 512, 511, -1))
         ];

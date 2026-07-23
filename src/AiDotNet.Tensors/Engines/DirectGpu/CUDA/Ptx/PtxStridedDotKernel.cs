@@ -13,6 +13,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 internal sealed class PtxStridedDotKernel : IDisposable
 {
     internal const int BlockThreads = 256;
+    internal const int WarpCount = BlockThreads / 32;
     internal const string EntryPoint = "aidotnet_strided_dot";
 
     private readonly DirectPtxModule _module;
@@ -99,7 +100,7 @@ internal sealed class PtxStridedDotKernel : IDisposable
         ptx.AppendLine("    .reg .b32 %r<12>;");
         ptx.AppendLine("    .reg .b64 %rd<16>;");
         ptx.AppendLine("    .reg .f32 %f<6>;");
-        ptx.AppendLine($"    .shared .align 16 .b8 partial[{BlockThreads * sizeof(float)}];");
+        ptx.AppendLine($"    .shared .align 16 .b8 partial[{WarpCount * sizeof(float)}];");
         ptx.AppendLine("    ld.param.u64 %rd0, [left_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd1, [right_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd2, [output_ptr];");
@@ -121,32 +122,48 @@ internal sealed class PtxStridedDotKernel : IDisposable
         ptx.AppendLine("    bra.uni STRIDED_LOOP;");
         ptx.AppendLine("STRIDED_REDUCE:");
         ptx.AppendLine("    mov.u64 %rd7, partial;");
-        ptx.AppendLine("    mul.wide.u32 %rd8, %r0, 4;");
+        ptx.AppendLine("    and.b32 %r3, %r0, 31;");
+        ptx.AppendLine("    shr.u32 %r4, %r0, 5;");
+        EmitWarpReduction(ptx, "%f0", "%f3", "%r5", "%r6");
+        ptx.AppendLine("    setp.ne.u32 %p1, %r3, 0;");
+        ptx.AppendLine("    @%p1 bra.uni STRIDED_WARP_PUBLISHED;");
+        ptx.AppendLine("    mul.wide.u32 %rd8, %r4, 4;");
         ptx.AppendLine("    add.u64 %rd9, %rd7, %rd8;");
         ptx.AppendLine("    st.shared.f32 [%rd9], %f0;");
+        ptx.AppendLine("STRIDED_WARP_PUBLISHED:");
         ptx.AppendLine("    bar.sync 0;");
-        foreach (int offset in new[] { 128, 64, 32, 16, 8, 4, 2, 1 })
-        {
-            ptx.AppendLine($"    setp.ge.u32 %p1, %r0, {offset};");
-            ptx.AppendLine($"    @%p1 bra.uni STRIDED_SKIP_{offset};");
-            ptx.AppendLine($"    add.u32 %r3, %r0, {offset};");
-            ptx.AppendLine("    mul.wide.u32 %rd10, %r3, 4;");
-            ptx.AppendLine("    add.u64 %rd11, %rd7, %rd10;");
-            ptx.AppendLine("    ld.shared.f32 %f3, [%rd9];");
-            ptx.AppendLine("    ld.shared.f32 %f4, [%rd11];");
-            ptx.AppendLine("    add.rn.f32 %f3, %f3, %f4;");
-            ptx.AppendLine("    st.shared.f32 [%rd9], %f3;");
-            ptx.AppendLine($"STRIDED_SKIP_{offset}:");
-            ptx.AppendLine("    bar.sync 0;");
-        }
-        ptx.AppendLine("    setp.ne.u32 %p2, %r0, 0;");
+        ptx.AppendLine("    setp.ne.u32 %p2, %r4, 0;");
         ptx.AppendLine("    @%p2 bra.uni STRIDED_DONE;");
-        ptx.AppendLine("    ld.shared.f32 %f5, [%rd7];");
-        ptx.AppendLine("    st.global.f32 [%rd2], %f5;");
+        ptx.AppendLine($"    setp.lt.u32 %p3, %r3, {WarpCount};");
+        ptx.AppendLine("    mov.f32 %f0, 0f00000000;");
+        ptx.AppendLine("    mul.wide.u32 %rd10, %r3, 4;");
+        ptx.AppendLine("    add.u64 %rd11, %rd7, %rd10;");
+        ptx.AppendLine("    @%p3 ld.shared.f32 %f0, [%rd11];");
+        EmitWarpReduction(ptx, "%f0", "%f3", "%r5", "%r6");
+        ptx.AppendLine("    setp.ne.u32 %p2, %r3, 0;");
+        ptx.AppendLine("    @%p2 bra.uni STRIDED_DONE;");
+        ptx.AppendLine("    st.global.f32 [%rd2], %f0;");
         ptx.AppendLine("STRIDED_DONE:");
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");
         return ptx.ToString();
+    }
+
+    private static void EmitWarpReduction(
+        StringBuilder ptx,
+        string value,
+        string shuffled,
+        string valueBits,
+        string shuffledBits)
+    {
+        foreach (int offset in new[] { 16, 8, 4, 2, 1 })
+        {
+            ptx.AppendLine($"    mov.b32 {valueBits}, {value};");
+            ptx.AppendLine(
+                $"    shfl.sync.down.b32 {shuffledBits}, {valueBits}, {offset}, 31, 0xffffffff;");
+            ptx.AppendLine($"    mov.b32 {shuffled}, {shuffledBits};");
+            ptx.AppendLine($"    add.rn.f32 {value}, {value}, {shuffled};");
+        }
     }
 
     internal static (int First, int Last) ValidInterval(
@@ -206,9 +223,9 @@ internal sealed class PtxStridedDotKernel : IDisposable
         (int first, int last) = ValidInterval(aSize, bSize, bOffset, bStep);
         return new DirectPtxKernelBlueprint(
             Operation: "strided-dot",
-            Version: 1,
+            Version: 2,
             Architecture: architecture,
-            Variant: $"fp32-a{aSize}-b{bSize}-o{bOffset}-s{bStep}",
+            Variant: $"warp-reduce-fp32-a{aSize}-b{bSize}-o{bOffset}-s{bStep}",
             Tensors:
             [
                 new("left", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
@@ -220,7 +237,7 @@ internal sealed class PtxStridedDotKernel : IDisposable
             ],
             ResourceBudget: new DirectPtxResourceBudget(
                 MaxRegistersPerThread: 32,
-                MaxStaticSharedBytes: BlockThreads * sizeof(float),
+                MaxStaticSharedBytes: WarpCount * sizeof(float),
                 MaxLocalBytesPerThread: 0,
                 MinBlocksPerMultiprocessor: 1),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
@@ -231,7 +248,8 @@ internal sealed class PtxStridedDotKernel : IDisposable
                 ["valid-i"] = $"[{first},{last}]",
                 ["runtime-scalar-parameters"] = "none",
                 ["runtime-bounds-checks"] = "none",
-                ["temporary-device-allocation"] = "none"
+                ["temporary-device-allocation"] = "none",
+                ["reduction-pipeline"] = "register shuffles; eight shared warp totals; one block barrier; one output store"
             });
     }
 

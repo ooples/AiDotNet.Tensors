@@ -4,4 +4,4 @@ driver-version=13030
 cuda-driver-linker-info-log:
 info    : 0 bytes gmem
 info    : Function properties for 'aidotnet_strided_dot':
-info    : used 12 registers, used 1 barriers, 0 stack, 1024 bytes smem, 376 bytes cmem[0], 0 bytes lmem
+info    : used 24 registers, used 1 barriers, 0 stack, 32 bytes smem, 376 bytes cmem[0], 0 bytes lmem
