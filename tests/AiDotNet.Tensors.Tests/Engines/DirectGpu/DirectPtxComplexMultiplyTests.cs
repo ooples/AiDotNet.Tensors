@@ -65,8 +65,11 @@ public class DirectPtxComplexMultiplyTests
                 "CudaBackend.ComplexConjugate",
                 "CudaBackend.ComplexMagnitude",
                 "CudaBackend.ComplexMultiply",
+                "CudaBackend.SplitComplexAdd",
+                "CudaBackend.SplitComplexConjugate",
                 "CudaBackend.SplitComplexMagnitude",
                 "CudaBackend.SplitComplexMagnitudeSquared",
+                "CudaBackend.SplitComplexMultiply",
             },
             DirectPtxSpectralCoverageManifest.All
                 .Where(cell => cell.Status == DirectPtxSpectralCoverageStatus.ExperimentalDirectPtx)
@@ -258,6 +261,139 @@ public class DirectPtxComplexMultiplyTests
             double r = re[i], m = im[i];
             float expected = magnitude ? (float)Math.Sqrt(r * r + m * m) : (float)(r * r + m * m);
             Assert.True(MathF.Abs(actual[i] - expected) <= 3e-6f);
+        }
+    }
+
+    [Fact]
+    public void SplitComplexMultiplyEmitter_MatchesInterleavedContraction()
+    {
+        string ptx = PtxSplitComplexBinaryF32Kernel.EmitPtx(8, 6, DirectPtxSplitComplexBinaryOp.Multiply, 262144);
+        Assert.Contains("exact-shape count=262144 block=256", ptx);
+        Assert.Equal(6, Count(ptx, "ld.param.u64"));
+        Assert.Equal(4, Count(ptx, "ld.global.nc.f32"));   // ar, ai, br, bi
+        Assert.Equal(2, Count(ptx, "st.global.f32"));       // outReal, outImag
+        Assert.Equal(2, Count(ptx, "mul.rn.f32"));
+        Assert.Equal(2, Count(ptx, "fma.rn.f32"));
+        Assert.Equal(1, Count(ptx, "neg.f32"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("bra", ptx, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void SplitComplexAddEmitter_IsTwoAddLanes()
+    {
+        string ptx = PtxSplitComplexBinaryF32Kernel.EmitPtx(8, 6, DirectPtxSplitComplexBinaryOp.Add, 65536);
+        Assert.Equal(2, Count(ptx, "add.rn.f32"));
+        Assert.Equal(0, Count(ptx, "mul.rn.f32"));
+        Assert.Equal(0, Count(ptx, "fma.rn.f32"));
+        Assert.Equal(2, Count(ptx, "st.global.f32"));
+        Assert.DoesNotContain("bra", ptx, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void SplitComplexConjugateEmitter_CopiesRealAndFlipsImag()
+    {
+        string ptx = PtxSplitComplexConjugateF32Kernel.EmitPtx(8, 6, 262144);
+        Assert.Equal(4, Count(ptx, "ld.param.u64"));
+        Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));   // re, im
+        Assert.Equal(1, Count(ptx, "neg.f32"));
+        Assert.Equal(2, Count(ptx, "st.global.f32"));       // outReal=re, outImag=-im
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("bra", ptx, StringComparison.Ordinal);
+        Assert.True(PtxSplitComplexConjugateF32Kernel.IsSupportedShape(65536));
+        Assert.False(PtxSplitComplexConjugateF32Kernel.IsSupportedShape(1024));
+        Assert.False(PtxSplitComplexConjugateF32Kernel.IsPromotedShape(262144));
+    }
+
+    [SkippableTheory]
+    [InlineData(true, 65536)]
+    [InlineData(false, 65536)]
+    [InlineData(true, 1048576)]
+    public void DriverOnlySplitComplexBinary_MatchesDoubleOracle(bool multiply, int count)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedComplexMultiply(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The candidate is admitted only on SM86.");
+        var op = multiply ? DirectPtxSplitComplexBinaryOp.Multiply : DirectPtxSplitComplexBinaryOp.Add;
+        using var kernel = new PtxSplitComplexBinaryF32Kernel(runtime, op, count);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var ar = new float[count]; var ai = new float[count];
+        var br = new float[count]; var bi = new float[count];
+        var random = RandomHelper.CreateSeededRandom(20260860 + count + (multiply ? 1 : 0));
+        for (int i = 0; i < count; i++)
+        {
+            ar[i] = (float)(random.NextDouble() * 2.0 - 1.0);
+            ai[i] = (float)(random.NextDouble() * 2.0 - 1.0);
+            br[i] = (float)(random.NextDouble() * 2.0 - 1.0);
+            bi[i] = (float)(random.NextDouble() * 2.0 - 1.0);
+        }
+        using var arB = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var aiB = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var brB = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        using var biB = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
+        using var orB = runtime.AllocateBytes(kernel.Blueprint.Tensors[4].RequiredBytes);
+        using var oiB = runtime.AllocateBytes(kernel.Blueprint.Tensors[5].RequiredBytes);
+        arB.Upload<float>(ar); aiB.Upload<float>(ai); brB.Upload<float>(br); biB.Upload<float>(bi);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(arB, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(aiB, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(brB, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(biB, kernel.Blueprint.Tensors[3]),
+            DirectPtxTensorView.CreateOwned(orB, kernel.Blueprint.Tensors[4]),
+            DirectPtxTensorView.CreateOwned(oiB, kernel.Blueprint.Tensors[5]));
+        runtime.Synchronize();
+        var outR = new float[count]; var outI = new float[count];
+        orB.Download<float>(outR); oiB.Download<float>(outI);
+        for (int i = 0; i < count; i++)
+        {
+            double a = ar[i], b = ai[i], c = br[i], d = bi[i];
+            float er = multiply ? (float)(a * c - b * d) : (float)(a + c);
+            float ei = multiply ? (float)(a * d + b * c) : (float)(b + d);
+            Assert.True(MathF.Abs(outR[i] - er) <= 3e-6f);
+            Assert.True(MathF.Abs(outI[i] - ei) <= 3e-6f);
+        }
+    }
+
+    [SkippableTheory]
+    [InlineData(65536)]
+    [InlineData(1048576)]
+    public void DriverOnlySplitComplexConjugate_MatchesOracle(int count)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedComplexUnary(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The candidate is admitted only on SM86.");
+        using var kernel = new PtxSplitComplexConjugateF32Kernel(runtime, count);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var re = new float[count]; var im = new float[count];
+        var random = RandomHelper.CreateSeededRandom(20260870 + count);
+        for (int i = 0; i < count; i++)
+        {
+            re[i] = (float)(random.NextDouble() * 2.0 - 1.0);
+            im[i] = (float)(random.NextDouble() * 2.0 - 1.0);
+        }
+        using var reB = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var imB = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var orB = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        using var oiB = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
+        reB.Upload<float>(re); imB.Upload<float>(im);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(reB, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(imB, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(orB, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(oiB, kernel.Blueprint.Tensors[3]));
+        runtime.Synchronize();
+        var outR = new float[count]; var outI = new float[count];
+        orB.Download<float>(outR); oiB.Download<float>(outI);
+        for (int i = 0; i < count; i++)
+        {
+            Assert.Equal(re[i], outR[i]);       // real lane copied bit-exact
+            Assert.Equal(-im[i], outI[i]);      // imag sign-flipped bit-exact
         }
     }
 
