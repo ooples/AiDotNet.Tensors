@@ -62,6 +62,7 @@ public class DirectPtxComplexMultiplyTests
         Assert.Equal(
             new[]
             {
+                "CudaBackend.AmplitudeToDb",
                 "CudaBackend.ApplyMelFilterbank",
                 "CudaBackend.ApplyWindow",
                 "CudaBackend.BatchedFFT",
@@ -78,6 +79,7 @@ public class DirectPtxComplexMultiplyTests
                 "CudaBackend.InterleaveComplex",
                 "CudaBackend.IstftFromSpectrum",
                 "CudaBackend.MelFilterbankApply",
+                "CudaBackend.MfccLog1p",
                 "CudaBackend.PhaseVocoder",
                 "CudaBackend.PowerToDb",
                 "CudaBackend.RFFT",
@@ -1811,6 +1813,94 @@ public class DirectPtxComplexMultiplyTests
         var actual = new float[seg * melBins];
         eB.Download<float>(actual);
         for (int i = 0; i < actual.Length; i++) Assert.True(MathF.Abs(actual[i] - expected[i]) <= 3e-4f);
+    }
+
+    [Fact]
+    public void MfccLog1pEmitter_IsLg2Based()
+    {
+        string ptx = PtxMfccLog1pF32Kernel.EmitPtx(8, 6, 65536);
+        Assert.Contains("op=mfcc-log1p", ptx);
+        Assert.Contains("add.rn.f32 %f0, %f0, 0f3F800000", ptx);   // 1 + x
+        Assert.Contains("lg2.approx.f32", ptx);
+        Assert.Contains("setp.ge.u32 %p0, %r2, 65536", ptx);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxMfccLog1pF32Kernel.IsSupportedShape(65536));
+        Assert.False(PtxMfccLog1pF32Kernel.IsPromotedShape(65536));
+    }
+
+    [Fact]
+    public void AmplitudeToDbEmitter_IsLg2WithOptionalFloor()
+    {
+        string clipped = PtxAmplitudeToDbF32Kernel.EmitPtx(8, 6, 4096, clipTopDb: true);
+        Assert.Contains("op=amplitude-to-db", clipped);
+        Assert.Contains("lg2.approx.f32", clipped);
+        Assert.Equal(2, Count(clipped, "max.f32"));            // max(input,minAmp) + floor
+        Assert.Contains("ld.param.f32 %f3, [top_db_floor]", clipped);
+        string unclipped = PtxAmplitudeToDbF32Kernel.EmitPtx(8, 6, 4096, clipTopDb: false);
+        Assert.Equal(1, Count(unclipped, "max.f32"));          // only max(input,minAmp)
+        Assert.DoesNotContain("top_db_floor]", unclipped.Replace(".param .f32 top_db_floor", ""));  // param declared but unused
+        Assert.True(PtxAmplitudeToDbF32Kernel.IsSupportedShape(4096));
+        Assert.False(PtxAmplitudeToDbF32Kernel.IsPromotedShape(4096));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyMfccLog1p_MatchesWithinTolerance()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedComplexUnary(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The candidate is admitted only on SM86.");
+        const int n = 4096;
+        using var kernel = new PtxMfccLog1pF32Kernel(runtime, n);
+        var input = new float[n];
+        var random = RandomHelper.CreateSeededRandom(20270401);
+        for (int i = 0; i < n; i++) input[i] = (float)(random.NextDouble() * 10);
+        using var iB = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var oB = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        iB.Upload<float>(input);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(iB, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(oB, kernel.Blueprint.Tensors[1]));
+        runtime.Synchronize();
+        var actual = new float[n];
+        oB.Download<float>(actual);
+        for (int i = 0; i < n; i++)
+        {
+            double expected = Math.Log(1.0 + input[i]);
+            Assert.True(Math.Abs(actual[i] - expected) <= 1e-3 * (1 + Math.Abs(expected)));
+        }
+    }
+
+    [SkippableFact]
+    public void DriverOnlyAmplitudeToDb_MatchesWithinTolerance()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedComplexUnary(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The candidate is admitted only on SM86.");
+        const int n = 4096;
+        const float minAmp = 1e-5f, topDbFloor = -60f;
+        using var kernel = new PtxAmplitudeToDbF32Kernel(runtime, n, clipTopDb: true);
+        var input = new float[n];
+        var random = RandomHelper.CreateSeededRandom(20270402);
+        for (int i = 0; i < n; i++) input[i] = (float)random.NextDouble();
+        using var iB = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var oB = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        iB.Upload<float>(input);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(iB, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(oB, kernel.Blueprint.Tensors[1]), minAmp, topDbFloor);
+        runtime.Synchronize();
+        var actual = new float[n];
+        oB.Download<float>(actual);
+        for (int i = 0; i < n; i++)
+        {
+            double v = Math.Max(input[i], minAmp);
+            double expected = Math.Max(20.0 * Math.Log10(v), topDbFloor);
+            Assert.True(Math.Abs(actual[i] - expected) <= 1e-2 * (1 + Math.Abs(expected)));
+        }
     }
 
     private static int Count(string text, string value)

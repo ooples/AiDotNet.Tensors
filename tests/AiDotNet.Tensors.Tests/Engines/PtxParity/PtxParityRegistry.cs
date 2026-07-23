@@ -273,6 +273,17 @@ public static class PtxParityRegistry
             "advance. Its spec is TOLERANCE-based, not bit-exact. Converts to ThreeWayParity (with tolerance) " +
             "when the SM86 run lands; until then unpromoted and fail-closed."),
 
+        new PtxParitySpec("PtxAmplitudeToDbF32Kernel", PtxParityStatus.Deferred,
+            "amplitude-to-decibel conversion, fp32 (#850) - CudaBackend.AmplitudeToDb",
+            "one module per (length, clipTopDb); the log step of a log-mel/log-magnitude spectrogram. PTX has " +
+            "no log10, so db is lg2.approx(max(input,minAmp)) scaled by 20*log10(2), optionally floored at " +
+            "topDbFloor. minAmp/topDbFloor are .param .f32 and clipTopDb is baked. Its spec is TOLERANCE-based, " +
+            "not bit-exact. Converts to ThreeWayParity (with tolerance) when the SM86 run lands."),
+        new PtxParitySpec("PtxMfccLog1pF32Kernel", PtxParityStatus.Deferred,
+            "MFCC log1p compression, fp32 (#850) - CudaBackend.MfccLog1p",
+            "one module per element count; output=log1p(input)=ln(1+input) via lg2.approx(1+x) scaled by " +
+            "ln(2). Its spec is TOLERANCE-based, not bit-exact. Converts to ThreeWayParity (with tolerance) " +
+            "when the SM86 run lands; until then unpromoted and fail-closed."),
         new PtxParitySpec("PtxMelFilterbankApplyF32Kernel", PtxParityStatus.Deferred,
             "segmented mel filterbank application, fp32 (#850) - CudaBackend.MelFilterbankApply",
             "one module per (totalSegBatch,specBins,melBins); each thread owns one (seg,mel) output and reduces " +
