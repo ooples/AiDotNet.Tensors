@@ -42,6 +42,24 @@ internal static class DirectPtxSpectralCubinTool
                     PtxFusedComplexUnaryF32Kernel.EmitPtx(8, 6, op, pairs));
             }
         }
+
+        // The split-complex operators land on separate real/imaginary arrays
+        // rather than the interleaved layout, so they are their own modules.
+        foreach (int count in new[] { 65_536, 262_144, 1_048_576, 4_194_304 })
+        {
+            if (!PtxSplitComplexUnaryF32Kernel.IsSupportedShape(count)) continue;
+            foreach (DirectPtxSplitComplexUnaryOp op in new[]
+                     {
+                         DirectPtxSplitComplexUnaryOp.Magnitude,
+                         DirectPtxSplitComplexUnaryOp.MagnitudeSquared,
+                     })
+            {
+                yield return new DirectPtxModuleSource(
+                    $"split-complex-{op}-f32-v1-n{count}",
+                    PtxSplitComplexUnaryF32Kernel.EntryPointFor(op),
+                    PtxSplitComplexUnaryF32Kernel.EmitPtx(8, 6, op, count));
+            }
+        }
     }
 
     internal static int Generate(string[] args) => args.Length < 3
