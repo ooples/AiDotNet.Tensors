@@ -67,6 +67,15 @@ internal static class DirectPtxFeatureGate
     internal static bool IsQkvRopeCacheEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentQkvRopeCacheEnabled);
 
+    /// <summary>Softmax-family (issue #840) rollout gate; disabled by default.</summary>
+    internal static bool IsSoftmaxEnabled => TestOverride ?? EnvironmentMasterEnabled;
+
+    /// <summary>
+    /// Opt-in switch that lets fail-closed softmax-family specializations dispatch for GPU
+    /// validation before a shape is performance-promoted. Off in production.
+    /// </summary>
+    internal static bool SoftmaxExperimentOverride { get; set; }
+
     internal static bool IsAutotuneEnabled => EnvironmentAutotuneEnabled;
 
     internal static int CacheCapacity => EnvironmentCacheCapacity;
