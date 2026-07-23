@@ -121,6 +121,7 @@ public sealed class DirectPtxNormalizationCorrectnessTests
         string manifestResource = Assert.Single(resources, name =>
             name.EndsWith(".Artifacts.sm86.normalization-cubins.tsv", StringComparison.Ordinal));
         var expected = new Dictionary<string, string>(StringComparer.Ordinal);
+        var blueprintIds = new HashSet<string>(StringComparer.Ordinal);
         int manifestRows = 0;
         using (Stream stream = Assert.IsAssignableFrom<Stream>(
                    assembly.GetManifestResourceStream(manifestResource)))
@@ -135,6 +136,7 @@ public sealed class DirectPtxNormalizationCorrectnessTests
                 string[] columns = line.Split('\t');
                 Assert.Equal(5, columns.Length);
                 manifestRows++;
+                Assert.True(blueprintIds.Add(columns[0]), $"Duplicate blueprint identity: {columns[0]}");
                 if (expected.TryGetValue(columns[2], out string? existingHash))
                     Assert.Equal(existingHash, columns[3]);
                 else
@@ -142,7 +144,8 @@ public sealed class DirectPtxNormalizationCorrectnessTests
             }
         }
         Assert.Equal(71, manifestRows);
-        Assert.Equal(67, expected.Count);
+        Assert.Equal(71, blueprintIds.Count);
+        Assert.Equal(66, expected.Count);
 
         string[] cubins = resources.Where(name =>
             name.IndexOf(".Artifacts.sm86.", StringComparison.Ordinal) >= 0 &&
