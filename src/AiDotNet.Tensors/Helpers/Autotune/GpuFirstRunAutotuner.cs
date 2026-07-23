@@ -100,6 +100,14 @@ public static class GpuFirstRunAutotuner
     }
 
     /// <summary>
+    /// Overload keying on a structured <see cref="GpuDeviceFingerprint"/>, using
+    /// its per-card <see cref="GpuDeviceFingerprint.LocalKey"/> so the tuned
+    /// winner is cached once per physical device.
+    /// </summary>
+    public static KernelId GpuKernelId(string category, string name, GpuDeviceFingerprint fingerprint)
+        => GpuKernelId(category, name, fingerprint.LocalKey);
+
+    /// <summary>
     /// Resolves the tuned launch config for <paramref name="kernelId"/> +
     /// <paramref name="shape"/> on the current device.
     ///

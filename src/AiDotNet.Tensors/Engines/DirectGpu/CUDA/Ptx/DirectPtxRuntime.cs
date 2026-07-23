@@ -27,6 +27,7 @@ internal sealed class DirectPtxRuntime : IDisposable
     internal string DeviceUuid { get; }
     internal int DriverVersion { get; }
     internal string DeviceFingerprint { get; }
+    internal Helpers.Autotune.GpuDeviceFingerprint Fingerprint { get; }
     internal IntPtr Stream => _stream;
 
     internal static bool IsAvailable => CudaNativeBindings.IsAvailable;
@@ -70,7 +71,11 @@ internal sealed class DirectPtxRuntime : IDisposable
         ArchitectureFamily = DirectPtxArchitecture.Classify(major, minor);
         DeviceUuid = QueryDeviceUuid(device);
         DriverVersion = CudaNativeBindings.DriverVersion;
-        DeviceFingerprint = BuildDeviceFingerprint(DeviceUuid, major, minor, DriverVersion);
+        Fingerprint = Helpers.Autotune.GpuDeviceFingerprint.FromCuda(
+            DeviceName, DeviceUuid, major, minor, DriverVersion);
+        // Byte-identical to the legacy fingerprint string, so existing on-disk
+        // autotune caches keyed by DeviceFingerprint remain valid.
+        DeviceFingerprint = Fingerprint.ToCacheToken();
     }
 
     /// <summary>
@@ -110,7 +115,11 @@ internal sealed class DirectPtxRuntime : IDisposable
         ArchitectureFamily = DirectPtxArchitecture.Classify(major, minor);
         DeviceUuid = QueryDeviceUuid(device);
         DriverVersion = CudaNativeBindings.DriverVersion;
-        DeviceFingerprint = BuildDeviceFingerprint(DeviceUuid, major, minor, DriverVersion);
+        Fingerprint = Helpers.Autotune.GpuDeviceFingerprint.FromCuda(
+            DeviceName, DeviceUuid, major, minor, DriverVersion);
+        // Byte-identical to the legacy fingerprint string, so existing on-disk
+        // autotune caches keyed by DeviceFingerprint remain valid.
+        DeviceFingerprint = Fingerprint.ToCacheToken();
     }
 
     private static unsafe string QueryDeviceUuid(int device)
@@ -129,8 +138,6 @@ internal sealed class DirectPtxRuntime : IDisposable
         }
     }
 
-    private static string BuildDeviceFingerprint(string uuid, int major, int minor, int driverVersion) =>
-        $"gpu-{uuid}-sm{major}{minor}-drv{driverVersion.ToString(CultureInfo.InvariantCulture)}";
 
     internal ContextScope Enter()
     {
