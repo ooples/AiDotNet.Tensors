@@ -16,6 +16,22 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 public partial class DirectPtxWmmaTests
 {
     [Fact]
+    public void LinkerLogNormalization_IsDeterministicAndPreservesValidBarrierCounts()
+    {
+        const string input =
+            "used -1206059006 barriers\n" +
+            "used 0 barriers\n" +
+            "used 16 barriers\n" +
+            "used 1452736514 barriers\n";
+        Assert.Equal(
+            "used unavailable barriers\n" +
+            "used 0 barriers\n" +
+            "used 16 barriers\n" +
+            "used unavailable barriers\n",
+            DirectPtxCubinArtifactCache.NormalizeLinkerInfoLog(input));
+    }
+
+    [Fact]
     public void DenseLinearAutotuner_UsesMedianAndDeterministicNearTiePolicy()
     {
         Assert.Equal(0.010, DirectPtxDenseLinearAutotuner.MedianMilliseconds(
@@ -166,6 +182,8 @@ public partial class DirectPtxWmmaTests
         Assert.Contains(".maxntid 256, 1, 1", batchDot, StringComparison.Ordinal);
         Assert.DoesNotContain(".shared", batchDot, StringComparison.Ordinal);
         Assert.DoesNotContain("bar.sync", batchDot, StringComparison.Ordinal);
+        Assert.Equal(2, Count(batchDot, "ld.global.nc.v4.f32"));
+        Assert.Equal(4, Count(batchDot, "fma.rn.f32"));
         Assert.Equal(5, Count(batchDot, "shfl.sync.down.b32"));
         Assert.DoesNotContain(".param .u32", batchDot, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", batchDot, StringComparison.Ordinal);

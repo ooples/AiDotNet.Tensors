@@ -281,7 +281,7 @@ internal static class DirectPtxDenseLinearArtifactTool
                 major, minor, DirectPtxDenseVectorOperation.Dot, 4_096)),
             Cell("dense-outer-v2-Ampere-fp32x4-m64-n128", PtxDenseVectorKernel.EmitPtx(
                 major, minor, DirectPtxDenseVectorOperation.Outer, 64, 128)),
-            Cell("batched-dense-dot-v2-Ampere-warp-per-batch-fp32-b4-d512",
+            Cell("batched-dense-dot-v3-Ampere-warp-per-batch-fp32x4-b4-d512",
                 PtxBatchedVectorKernel.EmitPtx(
                 major, minor, DirectPtxBatchedVectorOperation.Dot, 4, 512)),
             Cell("strided-dot-v1-Ampere-fp32-a512-b512-o511-s-1",

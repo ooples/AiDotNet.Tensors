@@ -6,6 +6,7 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
@@ -148,7 +149,27 @@ internal static class DirectPtxCubinArtifactCache
         "target=sm" + runtime.ComputeCapabilityMajor.ToString(CultureInfo.InvariantCulture) +
         runtime.ComputeCapabilityMinor.ToString(CultureInfo.InvariantCulture) + "\n" +
         "driver-version=" + runtime.DriverVersion.ToString(CultureInfo.InvariantCulture) + "\n" +
-        "cuda-driver-linker-info-log:\n" + (linkerInfoLog ?? string.Empty);
+        "cuda-driver-linker-info-log:\n" + NormalizeLinkerInfoLog(linkerInfoLog);
+
+    /// <summary>
+    /// CUDA 13.3 on Windows can print an uninitialized signed integer in the
+    /// informational "used N barriers" field for kernels that use no named
+    /// barriers. Preserve valid 0..16 values and make only impossible values
+    /// deterministic; resource enforcement continues to use driver function
+    /// attributes and final SASS rather than this advisory text.
+    /// </summary>
+    internal static string NormalizeLinkerInfoLog(string? linkerInfoLog) =>
+        Regex.Replace(
+            linkerInfoLog ?? string.Empty,
+            @"used (-?\d+) barriers",
+            match => int.TryParse(
+                    match.Groups[1].Value,
+                    NumberStyles.Integer,
+                    CultureInfo.InvariantCulture,
+                    out int barriers) && barriers >= 0 && barriers <= 16
+                ? match.Value
+                : "used unavailable barriers",
+            RegexOptions.CultureInvariant);
 
     internal static string CanonicalizePtx(string ptx)
     {

@@ -226,12 +226,12 @@ internal sealed class PtxBatchedVectorKernel : IDisposable
         int blockThreads)
     {
         int batchBytes = checked(dimension * sizeof(float));
-        ptx.AppendLine($"// exact batched dot B={batch} D={dimension}; one warp per batch, register-only reduction");
+        ptx.AppendLine($"// exact batched dot B={batch} D={dimension}; one warp per batch, aligned float4 streaming, register-only reduction");
         EmitHeader(ptx, DotEntryPoint, blockThreads);
         ptx.AppendLine("    .reg .pred %p<3>;");
         ptx.AppendLine("    .reg .b32 %r<10>;");
         ptx.AppendLine("    .reg .b64 %rd<12>;");
-        ptx.AppendLine("    .reg .f32 %f<6>;");
+        ptx.AppendLine("    .reg .f32 %f<15>;");
         EmitPointers(ptx);
         ptx.AppendLine("    mov.u32 %r0, %tid.x;");
         ptx.AppendLine("    and.b32 %r1, %r0, 31;");
@@ -239,26 +239,35 @@ internal sealed class PtxBatchedVectorKernel : IDisposable
         ptx.AppendLine($"    mul.wide.u32 %rd3, %r2, {batchBytes};");
         ptx.AppendLine("    add.u64 %rd4, %rd0, %rd3;");
         ptx.AppendLine("    add.u64 %rd5, %rd1, %rd3;");
-        ptx.AppendLine("    mov.u32 %r3, %r1;");
-        ptx.AppendLine("    mov.f32 %f0, 0f00000000;");
+        ptx.AppendLine("    shl.b32 %r3, %r1, 2;");
+        ptx.AppendLine("    mov.f32 %f9, 0f00000000;");
+        ptx.AppendLine("    mov.f32 %f10, 0f00000000;");
+        ptx.AppendLine("    mov.f32 %f11, 0f00000000;");
+        ptx.AppendLine("    mov.f32 %f12, 0f00000000;");
         ptx.AppendLine("BATCH_DOT_LOOP:");
         ptx.AppendLine($"    setp.ge.u32 %p0, %r3, {dimension};");
         ptx.AppendLine("    @%p0 bra.uni BATCH_DOT_REDUCE;");
         ptx.AppendLine("    mul.wide.u32 %rd6, %r3, 4;");
         ptx.AppendLine("    add.u64 %rd7, %rd4, %rd6;");
         ptx.AppendLine("    add.u64 %rd8, %rd5, %rd6;");
-        ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd7];");
-        ptx.AppendLine("    ld.global.nc.f32 %f2, [%rd8];");
-        ptx.AppendLine("    fma.rn.f32 %f0, %f1, %f2, %f0;");
-        ptx.AppendLine("    add.u32 %r3, %r3, 32;");
+        ptx.AppendLine("    ld.global.nc.v4.f32 {%f1,%f2,%f3,%f4}, [%rd7];");
+        ptx.AppendLine("    ld.global.nc.v4.f32 {%f5,%f6,%f7,%f8}, [%rd8];");
+        ptx.AppendLine("    fma.rn.f32 %f9, %f1, %f5, %f9;");
+        ptx.AppendLine("    fma.rn.f32 %f10, %f2, %f6, %f10;");
+        ptx.AppendLine("    fma.rn.f32 %f11, %f3, %f7, %f11;");
+        ptx.AppendLine("    fma.rn.f32 %f12, %f4, %f8, %f12;");
+        ptx.AppendLine("    add.u32 %r3, %r3, 128;");
         ptx.AppendLine("    bra.uni BATCH_DOT_LOOP;");
         ptx.AppendLine("BATCH_DOT_REDUCE:");
-        EmitWarpReduction(ptx, "%f0", "%f3", "%r4", "%r5");
+        ptx.AppendLine("    add.rn.f32 %f9, %f9, %f10;");
+        ptx.AppendLine("    add.rn.f32 %f11, %f11, %f12;");
+        ptx.AppendLine("    add.rn.f32 %f9, %f9, %f11;");
+        EmitWarpReduction(ptx, "%f9", "%f13", "%r4", "%r5");
         ptx.AppendLine("    setp.ne.u32 %p1, %r1, 0;");
         ptx.AppendLine("    @%p1 bra.uni BATCH_DOT_DONE;");
         ptx.AppendLine("    mul.wide.u32 %rd9, %r2, 4;");
         ptx.AppendLine("    add.u64 %rd10, %rd2, %rd9;");
-        ptx.AppendLine("    st.global.f32 [%rd10], %f0;");
+        ptx.AppendLine("    st.global.f32 [%rd10], %f9;");
         ptx.AppendLine("BATCH_DOT_DONE:");
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");
@@ -316,10 +325,10 @@ internal sealed class PtxBatchedVectorKernel : IDisposable
         var output = dot ? new DirectPtxExtent(batch) : new DirectPtxExtent(batch, m, n);
         return new DirectPtxKernelBlueprint(
             Operation: dot ? "batched-dense-dot" : "batched-dense-outer",
-            Version: warpPerBatch ? 2 : 1,
+            Version: warpPerBatch ? 3 : 1,
             Architecture: architecture,
             Variant: dot
-                ? $"{(warpPerBatch ? "warp-per-batch-fp32" : "fp32")}-b{batch}-d{m}"
+                ? $"{(warpPerBatch ? "warp-per-batch-fp32x4" : "fp32")}-b{batch}-d{m}"
                 : $"fp32-b{batch}-m{m}-n{n}",
             Tensors:
             [
@@ -347,7 +356,7 @@ internal sealed class PtxBatchedVectorKernel : IDisposable
                 ["temporary-device-allocation"] = "none",
                 ["global-intermediates"] = "none",
                 ["reduction-pipeline"] = warpPerBatch
-                    ? "one warp per batch; register-only shuffles; one output store"
+                    ? "aligned float4 loads; one warp per batch; register-only shuffles; one output store"
                     : dot ? "block reduction through shared warp partials" : "none"
             });
     }
