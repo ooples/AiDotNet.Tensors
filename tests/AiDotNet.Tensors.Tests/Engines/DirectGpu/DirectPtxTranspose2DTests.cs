@@ -29,7 +29,7 @@ public class DirectPtxTranspose2DTests
         // 32 rows / 8 thread-rows = 4 staged elements per thread, each way.
         // Staging uses cp.async, so global->shared happens in ONE instruction
         // per element with no register round-trip and no separate store.
-        Assert.Equal(4, Count(ptx, "cp.async.cg.shared.global"));
+        Assert.Equal(4, Count(ptx, "cp.async.ca.shared.global"));
         Assert.DoesNotContain("ld.global.ca.f32", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain("st.shared.f32", ptx, StringComparison.Ordinal);
         Assert.Equal(4, Count(ptx, "ld.shared.f32"));
