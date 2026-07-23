@@ -52,6 +52,7 @@ public sealed class DirectPtxConvolutionPerfProbe
             MeasureWinogradWmmaCoop(runtime, 32, 64, 56, 56, 64);
             MeasureWinogradWmmaCoopBlocked(runtime, 32, 64, 56, 56, 64);
             MeasureStagesInIsolation(runtime, 32, 64, 56, 56, 64);
+            MeasureWinogradWmmaFullyFused(runtime, 32, 64, 56, 56, 64);
         }
         finally
         {
@@ -519,6 +520,35 @@ public sealed class DirectPtxConvolutionPerfProbe
         }
         long flops = 2L * n * kk * h * w * cch * 9;
         Report($"winograd-WMMA-COOPBLK N{n}/C{cch}/{h}x{w}/K{kk} 3x3 fp16-TC-coop-wn4 (inT+blkMMA+outT, regs={coop.FunctionInfo.RegistersPerThread})",
+            runtime, Launch, flops);
+    }
+
+    private void MeasureWinogradWmmaFullyFused(DirectPtxRuntime runtime, int n, int cch, int h, int w, int kk)
+    {
+        if (runtime.ComputeCapabilityMajor < 7) { _out.WriteLine("winograd-WMMA-FULLFUSED: no Tensor Cores"); return; }
+        using var filter = new PtxWinogradF23FilterTransformFp16Kernel(runtime, kk, cch);
+        using var dWeights = runtime.AllocateBytes((nuint)filter.WeightBytes);
+        using var dU = runtime.AllocateBytes((nuint)filter.TransformedBytes);
+        dWeights.Upload<float>(new float[filter.WeightBytes / sizeof(float)]);
+        filter.Launch(DirectPtxTensorView.CreateOwned(dWeights, filter.Blueprint.Tensors[0]),
+                      DirectPtxTensorView.CreateOwned(dU, filter.Blueprint.Tensors[1]));
+        runtime.Synchronize();
+
+        using var fused = new PtxWinogradWmmaFullyFusedKernel(runtime, n, cch, h, w, kk);
+        using var dInput = runtime.AllocateBytes((nuint)fused.InputBytes);
+        using var dBias = runtime.AllocateBytes((nuint)fused.BiasBytes);
+        using var dOutput = runtime.AllocateBytes((nuint)fused.OutputBytes);
+        dInput.Upload<float>(new float[fused.InputBytes / sizeof(float)]);
+        dBias.Upload<float>(new float[fused.BiasBytes / sizeof(float)]);
+
+        // Per call = the single fused kernel (U precomputed once).
+        void Launch() => fused.Launch(
+            DirectPtxTensorView.CreateOwned(dU, fused.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(dInput, fused.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(dBias, fused.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(dOutput, fused.Blueprint.Tensors[3]));
+        long flops = 2L * n * kk * h * w * cch * 9;
+        Report($"winograd-WMMA-FULLFUSED N{n}/C{cch}/{h}x{w}/K{kk} 3x3 fp16-TC-1kernel (inT+GEMM+outT fused, regs={fused.FunctionInfo.RegistersPerThread})",
             runtime, Launch, flops);
     }
 
