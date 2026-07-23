@@ -69,6 +69,7 @@ public class DirectPtxComplexMultiplyTests
                 "CudaBackend.InterleaveComplex",
                 "CudaBackend.SplitComplexAdd",
                 "CudaBackend.SplitComplexConjugate",
+                "CudaBackend.SplitComplexCrossSpectral",
                 "CudaBackend.SplitComplexMagnitude",
                 "CudaBackend.SplitComplexMagnitudeSquared",
                 "CudaBackend.SplitComplexMultiply",
@@ -279,6 +280,68 @@ public class DirectPtxComplexMultiplyTests
         Assert.Equal(1, Count(ptx, "neg.f32"));
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain("bra", ptx, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void SplitComplexCrossSpectralEmitter_IsConjugateProduct()
+    {
+        string ptx = PtxSplitComplexBinaryF32Kernel.EmitPtx(8, 6, DirectPtxSplitComplexBinaryOp.CrossSpectral, 262144);
+        Assert.Equal(6, Count(ptx, "ld.param.u64"));
+        Assert.Equal(4, Count(ptx, "ld.global.nc.f32"));
+        Assert.Equal(2, Count(ptx, "mul.rn.f32"));
+        Assert.Equal(2, Count(ptx, "fma.rn.f32"));
+        Assert.Equal(1, Count(ptx, "neg.f32"));           // sign on the imaginary lane (a*conj(b))
+        Assert.Equal(2, Count(ptx, "st.global.f32"));
+        Assert.DoesNotContain("bra", ptx, StringComparison.Ordinal);
+    }
+
+    [SkippableTheory]
+    [InlineData(65536)]
+    [InlineData(1048576)]
+    public void DriverOnlySplitComplexCrossSpectral_MatchesDoubleOracle(int count)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedComplexMultiply(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The candidate is admitted only on SM86.");
+        using var kernel = new PtxSplitComplexBinaryF32Kernel(runtime, DirectPtxSplitComplexBinaryOp.CrossSpectral, count);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+        var xr = new float[count]; var xi = new float[count];
+        var yr = new float[count]; var yi = new float[count];
+        var random = RandomHelper.CreateSeededRandom(20260890 + count);
+        for (int i = 0; i < count; i++)
+        {
+            xr[i] = (float)(random.NextDouble() * 2.0 - 1.0);
+            xi[i] = (float)(random.NextDouble() * 2.0 - 1.0);
+            yr[i] = (float)(random.NextDouble() * 2.0 - 1.0);
+            yi[i] = (float)(random.NextDouble() * 2.0 - 1.0);
+        }
+        using var xrB = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var xiB = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var yrB = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        using var yiB = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
+        using var orB = runtime.AllocateBytes(kernel.Blueprint.Tensors[4].RequiredBytes);
+        using var oiB = runtime.AllocateBytes(kernel.Blueprint.Tensors[5].RequiredBytes);
+        xrB.Upload<float>(xr); xiB.Upload<float>(xi); yrB.Upload<float>(yr); yiB.Upload<float>(yi);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(xrB, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(xiB, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(yrB, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(yiB, kernel.Blueprint.Tensors[3]),
+            DirectPtxTensorView.CreateOwned(orB, kernel.Blueprint.Tensors[4]),
+            DirectPtxTensorView.CreateOwned(oiB, kernel.Blueprint.Tensors[5]));
+        runtime.Synchronize();
+        var outR = new float[count]; var outI = new float[count];
+        orB.Download<float>(outR); oiB.Download<float>(outI);
+        for (int i = 0; i < count; i++)
+        {
+            double a = xr[i], b = xi[i], c = yr[i], d = yi[i];
+            float er = (float)(a * c + b * d);
+            float ei = (float)(b * c - a * d);
+            Assert.True(MathF.Abs(outR[i] - er) <= 3e-6f);
+            Assert.True(MathF.Abs(outI[i] - ei) <= 3e-6f);
+        }
     }
 
     [Fact]

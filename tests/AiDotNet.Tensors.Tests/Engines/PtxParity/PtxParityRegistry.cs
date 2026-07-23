@@ -108,11 +108,12 @@ public static class PtxParityRegistry
             "lands; until then the shapes stay unpromoted and fail closed."),
 
         new PtxParitySpec("PtxSplitComplexBinaryF32Kernel", PtxParityStatus.Deferred,
-            "split-buffer complex multiply and add, fp32 (#850) - CudaBackend.SplitComplexMultiply, CudaBackend.SplitComplexAdd",
+            "split-buffer complex multiply, add, and cross-spectral, fp32 (#850) - CudaBackend.SplitComplexMultiply, CudaBackend.SplitComplexAdd, CudaBackend.SplitComplexCrossSpectral",
             "one module per operator over the four exact element counts. Multiply forms ar*br-ai*bi and " +
-            "ar*bi+ai*br with the same multiply-then-fma contraction the interleaved multiply kernel " +
-            "uses, matching the reference's default fused evaluation; add is two add.rn lanes. Converts " +
-            "to ThreeWayParity when the SM86 fp64-oracle run lands; until then unpromoted and fail-closed."),
+            "ar*bi+ai*br, and cross-spectral (a*conj(b)) forms xr*yr+xi*yi and xi*yr-xr*yi, both with the " +
+            "same multiply-then-fma contraction the interleaved multiply kernel uses (the reference's " +
+            "default fused evaluation); add is two add.rn lanes. Converts to ThreeWayParity when the " +
+            "SM86 fp64-oracle run lands; until then unpromoted and fail-closed."),
         new PtxParitySpec("PtxSplitComplexConjugateF32Kernel", PtxParityStatus.Deferred,
             "split-buffer complex conjugate, fp32 (#850) - CudaBackend.SplitComplexConjugate",
             "one module over the four exact element counts. The real lane is copied and the imaginary " +

@@ -15,7 +15,10 @@ internal enum DirectPtxSplitComplexBinaryOp
     Multiply,
 
     /// <summary>out = a + b: (ar+br, ai+bi).</summary>
-    Add
+    Add,
+
+    /// <summary>out = a * conj(b): (ar*br + ai*bi, ai*br - ar*bi) - the cross-spectral product.</summary>
+    CrossSpectral
 }
 
 /// <summary>
@@ -50,6 +53,7 @@ internal sealed class PtxSplitComplexBinaryF32Kernel : IDisposable
     {
         DirectPtxSplitComplexBinaryOp.Multiply => "aidotnet_split_complex_multiply_f32",
         DirectPtxSplitComplexBinaryOp.Add => "aidotnet_split_complex_add_f32",
+        DirectPtxSplitComplexBinaryOp.CrossSpectral => "aidotnet_split_complex_cross_spectral_f32",
         _ => throw new ArgumentOutOfRangeException(nameof(op))
     };
 
@@ -159,7 +163,7 @@ internal sealed class PtxSplitComplexBinaryF32Kernel : IDisposable
         ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd9];");     // ai
         ptx.AppendLine("    ld.global.nc.f32 %f2, [%rd10];");    // br
         ptx.AppendLine("    ld.global.nc.f32 %f3, [%rd11];");    // bi
-        if (isMultiply)
+        if (op == DirectPtxSplitComplexBinaryOp.Multiply)
         {
             // outReal = ar*br - ai*bi, outImag = ar*bi + ai*br, matching the interleaved
             // multiply's multiply-then-fma contraction (the reference's default fused form).
@@ -168,6 +172,16 @@ internal sealed class PtxSplitComplexBinaryF32Kernel : IDisposable
             ptx.AppendLine("    fma.rn.f32 %f4, %f0, %f2, %f4;"); // ar*br - ai*bi
             ptx.AppendLine("    mul.rn.f32 %f5, %f1, %f2;");     // ai*br
             ptx.AppendLine("    fma.rn.f32 %f5, %f0, %f3, %f5;"); // ar*bi + ai*br
+        }
+        else if (op == DirectPtxSplitComplexBinaryOp.CrossSpectral)
+        {
+            // x * conj(y): outReal = xr*yr + xi*yi, outImag = xi*yr - xr*yi, using the same
+            // multiply-then-fma contraction as the reference's default fused form (a=x, b=y).
+            ptx.AppendLine("    mul.rn.f32 %f4, %f1, %f3;");     // xi*yi
+            ptx.AppendLine("    fma.rn.f32 %f4, %f0, %f2, %f4;"); // xr*yr + xi*yi
+            ptx.AppendLine("    mul.rn.f32 %f5, %f0, %f3;");     // xr*yi
+            ptx.AppendLine("    neg.f32 %f5, %f5;");
+            ptx.AppendLine("    fma.rn.f32 %f5, %f1, %f2, %f5;"); // xi*yr - xr*yi
         }
         else
         {
@@ -187,6 +201,7 @@ internal sealed class PtxSplitComplexBinaryF32Kernel : IDisposable
     {
         DirectPtxSplitComplexBinaryOp.Multiply => "split-complex-multiply",
         DirectPtxSplitComplexBinaryOp.Add => "split-complex-add",
+        DirectPtxSplitComplexBinaryOp.CrossSpectral => "split-complex-cross-spectral",
         _ => throw new ArgumentOutOfRangeException(nameof(op))
     };
 
@@ -194,7 +209,6 @@ internal sealed class PtxSplitComplexBinaryF32Kernel : IDisposable
         DirectPtxArchitectureFamily architecture, DirectPtxSplitComplexBinaryOp op, int count, int blockThreads)
     {
         var extent = new DirectPtxExtent(count);
-        bool isMultiply = op == DirectPtxSplitComplexBinaryOp.Multiply;
         DirectPtxTensorContract In(string name) => new(name, DirectPtxPhysicalType.Float32,
             DirectPtxPhysicalLayout.Vector, extent, extent, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact);
         DirectPtxTensorContract Out(string name) => new(name, DirectPtxPhysicalType.Float32,
@@ -221,15 +235,18 @@ internal sealed class PtxSplitComplexBinaryF32Kernel : IDisposable
                 MinBlocksPerMultiprocessor: 1536 / blockThreads),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
-                ["formula"] = isMultiply
-                    ? "out = (ar*br - ai*bi, ar*bi + ai*br)"
-                    : "out = (ar + br, ai + bi)",
+                ["formula"] = op switch
+                {
+                    DirectPtxSplitComplexBinaryOp.Multiply => "out = (ar*br - ai*bi, ar*bi + ai*br)",
+                    DirectPtxSplitComplexBinaryOp.CrossSpectral => "out = a*conj(b) = (ar*br + ai*bi, ai*br - ar*bi)",
+                    _ => "out = (ar + br, ai + bi)"
+                },
                 ["mode"] = $"inference-forward-{OpTag(op)}",
                 ["input-layout"] = "canonical-split-real-imag-contiguous",
                 ["output-layout"] = "canonical-split-real-imag-contiguous",
-                ["arithmetic"] = isMultiply
-                    ? "multiply-then-fma contraction matching the interleaved multiply and the reference's fused form"
-                    : "two add.rn lanes",
+                ["arithmetic"] = op == DirectPtxSplitComplexBinaryOp.Add
+                    ? "two add.rn lanes"
+                    : "multiply-then-fma contraction matching the interleaved multiply and the reference's fused form",
                 ["global-input-reads"] = "four-fp32-per-element",
                 ["global-output-writes"] = "two-fp32-per-element",
                 ["bounds-check"] = "none - the launch covers exactly the element count",
@@ -248,13 +265,14 @@ internal sealed class PtxSplitComplexBinaryF32Kernel : IDisposable
     internal static bool IsPromotedShape(int count) => false;
 
     internal static bool IsSupportedOp(DirectPtxSplitComplexBinaryOp op) =>
-        op is DirectPtxSplitComplexBinaryOp.Multiply or DirectPtxSplitComplexBinaryOp.Add;
+        op is DirectPtxSplitComplexBinaryOp.Multiply or DirectPtxSplitComplexBinaryOp.Add
+            or DirectPtxSplitComplexBinaryOp.CrossSpectral;
 
     private static void ValidateOp(DirectPtxSplitComplexBinaryOp op)
     {
         if (!IsSupportedOp(op))
             throw new ArgumentOutOfRangeException(nameof(op),
-                "The split complex binary family covers Multiply and Add.");
+                "The split complex binary family covers Multiply, Add, and CrossSpectral.");
     }
 
     private static void Validate(int count)
