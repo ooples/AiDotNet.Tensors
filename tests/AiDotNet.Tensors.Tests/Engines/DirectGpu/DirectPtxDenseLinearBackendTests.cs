@@ -15,6 +15,34 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 [Collection("BlasManaged-Stats-Serial")]
 public sealed class DirectPtxDenseLinearBackendTests
 {
+    [Fact]
+    public void ExperimentalEligibilityOverride_IsThreadLocal()
+    {
+        bool previous = DirectPtxFeatureGate.FusedLinearExperimentOverride;
+        DirectPtxFeatureGate.FusedLinearExperimentOverride = true;
+        try
+        {
+            bool observedOnWorker = true;
+            using var completed = new System.Threading.ManualResetEventSlim();
+            var worker = new System.Threading.Thread(() =>
+            {
+                observedOnWorker =
+                    DirectPtxFeatureGate.FusedLinearExperimentOverride;
+                completed.Set();
+            });
+            worker.Start();
+            Assert.True(completed.Wait(TimeSpan.FromSeconds(10)));
+            worker.Join();
+
+            Assert.False(observedOnWorker);
+            Assert.True(DirectPtxFeatureGate.FusedLinearExperimentOverride);
+        }
+        finally
+        {
+            DirectPtxFeatureGate.FusedLinearExperimentOverride = previous;
+        }
+    }
+
     [SkippableFact]
     public void UnsupportedSemantics_FailClosedWithStableReasonsBeforeJit()
     {

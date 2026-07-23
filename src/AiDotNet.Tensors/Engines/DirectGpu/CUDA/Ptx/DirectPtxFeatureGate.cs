@@ -42,8 +42,19 @@ internal static class DirectPtxFeatureGate
 
     /// <summary>Test-only override. Null restores environment-based behavior.</summary>
     internal static bool? TestOverride { get; set; }
-    /// <summary>Benchmark-only access to measured cells that have not passed promotion.</summary>
-    internal static bool FusedLinearExperimentOverride { get; set; }
+    [ThreadStatic]
+    private static bool _fusedLinearExperimentOverride;
+
+    /// <summary>
+    /// Benchmark-only access to measured cells that have not passed promotion.
+    /// The override is thread-local so parallel test/benchmark activity cannot
+    /// transiently admit an experimental route in another caller.
+    /// </summary>
+    internal static bool FusedLinearExperimentOverride
+    {
+        get => _fusedLinearExperimentOverride;
+        set => _fusedLinearExperimentOverride = value;
+    }
 
     internal static bool IsEnabled => IsAttentionEnabled;
 
