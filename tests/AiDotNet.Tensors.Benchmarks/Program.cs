@@ -154,7 +154,7 @@ class Program
         {
             string outputDirectory = args.Length > 1
                 ? args[1]
-                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86");
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86", "convolution");
             DirectPtxConvolutionArtifactTool.Run(outputDirectory);
             return;
         }
@@ -162,7 +162,7 @@ class Program
         {
             string artifactDirectory = args.Length > 1
                 ? args[1]
-                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86");
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86", "convolution");
             DirectPtxConvolutionArtifactTool.Verify(artifactDirectory);
             return;
         }
@@ -172,7 +172,7 @@ class Program
                 throw new ArgumentException("Pass the absolute nvdisasm executable path.");
             string artifactDirectory = args.Length > 2
                 ? args[2]
-                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86");
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86", "convolution");
             string evidenceDirectory = args.Length > 3
                 ? args[3]
                 : Path.Combine("artifacts", "direct-ptx", "convolution", "sass");
