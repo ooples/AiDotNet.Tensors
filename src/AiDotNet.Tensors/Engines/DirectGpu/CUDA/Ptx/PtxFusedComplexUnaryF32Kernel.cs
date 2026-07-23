@@ -48,6 +48,12 @@ internal sealed class PtxFusedComplexUnaryF32Kernel : IDisposable
 {
     internal const int DefaultBlockThreads = 256;
 
+    /// <summary>
+    /// Complex pairs each thread moves. Two, so the load is a single 16-byte
+    /// vector rather than an 8-byte one.
+    /// </summary>
+    internal const int PairsPerThread = 2;
+
     private readonly DirectPtxModule _module;
     private readonly IntPtr _function;
 
@@ -106,7 +112,7 @@ internal sealed class PtxFusedComplexUnaryF32Kernel : IDisposable
         arguments[1] = &outputPointer;
         _module.Launch(
             _function,
-            checked((uint)(NumPairs / BlockThreads)), 1, 1,
+            checked((uint)(NumPairs / (BlockThreads * PairsPerThread))), 1, 1,
             checked((uint)BlockThreads), 1, 1,
             0,
             arguments);
@@ -132,7 +138,7 @@ internal sealed class PtxFusedComplexUnaryF32Kernel : IDisposable
         ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine(
-            $"// exact-shape pairs={numPairs} block={blockThreads} layout=interleaved-complex-fp32 op={OpTag(op)}");
+            $"// exact-shape pairs={numPairs} block={blockThreads} layout=interleaved-complex-fp32 pairs-per-thread={PairsPerThread} op={OpTag(op)}");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {entryPoint}(");
         ptx.AppendLine("    .param .u64 input_ptr,");
@@ -142,39 +148,48 @@ internal sealed class PtxFusedComplexUnaryF32Kernel : IDisposable
         ptx.AppendLine("{");
         ptx.AppendLine("    .reg .b32 %r<3>;");
         ptx.AppendLine("    .reg .b64 %rd<8>;");
-        ptx.AppendLine("    .reg .f32 %f<5>;");
+        ptx.AppendLine("    .reg .f32 %f<8>;");
         ptx.AppendLine("    ld.param.u64 %rd0, [input_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd1, [output_ptr];");
         ptx.AppendLine("    mov.u32 %r0, %tid.x;");
         ptx.AppendLine("    mov.u32 %r1, %ctaid.x;");
         ptx.AppendLine($"    mad.lo.u32 %r2, %r1, {blockThreads}, %r0;");
-        // Input strides 8 bytes per pair; the output stride depends on the op.
-        ptx.AppendLine("    mul.wide.u32 %rd2, %r2, 8;");
+        // Two pairs per thread. An interleaved complex pair is two floats, so
+        // two pairs are exactly one 16-byte vector - the widest single load the
+        // ISA offers - which doubles the bytes a thread keeps in flight over
+        // the one-pair-per-thread version without any extra addressing.
+        ptx.AppendLine($"    mul.wide.u32 %rd2, %r2, {PairsPerThread * 8};");
         ptx.AppendLine("    add.u64 %rd4, %rd0, %rd2;");
-                // Inputs are streamed once and never revisited, so they go through the
+        // Inputs are streamed once and never revisited, so they go through the
         // read-only data cache rather than displacing L1 lines the store path
         // can use.
-        ptx.AppendLine("    ld.global.nc.v2.f32 {%f0, %f1}, [%rd4];");
+        ptx.AppendLine("    ld.global.nc.v4.f32 {%f0, %f1, %f2, %f3}, [%rd4];");
         if (isConjugate)
         {
             // Sign-bit flip: NaN payloads and signed zeros pass through as the
             // reference's unary minus leaves them.
-            ptx.AppendLine("    neg.f32 %f2, %f1;");
+            ptx.AppendLine("    neg.f32 %f4, %f1;");
+            ptx.AppendLine("    neg.f32 %f5, %f3;");
             ptx.AppendLine("    add.u64 %rd6, %rd1, %rd2;");
-            ptx.AppendLine("    st.global.v2.f32 [%rd6], {%f0, %f2};");
+            ptx.AppendLine("    st.global.v4.f32 [%rd6], {%f0, %f4, %f2, %f5};");
         }
         else
         {
-            // sqrtf(re*re + im*im), unfused so the rounding matches the
-            // reference. An fma would be faster and more accurate, and would
-            // therefore disagree with the kernel this replaces.
-            ptx.AppendLine("    mul.rn.f32 %f2, %f0, %f0;");
-            ptx.AppendLine("    mul.rn.f32 %f3, %f1, %f1;");
-            ptx.AppendLine("    add.rn.f32 %f2, %f2, %f3;");
-            ptx.AppendLine("    sqrt.rn.f32 %f2, %f2;");
-            ptx.AppendLine("    mul.wide.u32 %rd5, %r2, 4;");
+            // sqrtf(re*re + im*im) per pair, unfused so the rounding matches
+            // the reference. An fma would be faster and more accurate, and
+            // would therefore disagree with the kernel this replaces.
+            ptx.AppendLine("    mul.rn.f32 %f4, %f0, %f0;");
+            ptx.AppendLine("    mul.rn.f32 %f5, %f1, %f1;");
+            ptx.AppendLine("    add.rn.f32 %f4, %f4, %f5;");
+            ptx.AppendLine("    sqrt.rn.f32 %f4, %f4;");
+            ptx.AppendLine("    mul.rn.f32 %f6, %f2, %f2;");
+            ptx.AppendLine("    mul.rn.f32 %f7, %f3, %f3;");
+            ptx.AppendLine("    add.rn.f32 %f6, %f6, %f7;");
+            ptx.AppendLine("    sqrt.rn.f32 %f6, %f6;");
+            // Two pairs in, two scalars out.
+            ptx.AppendLine($"    mul.wide.u32 %rd5, %r2, {PairsPerThread * 4};");
             ptx.AppendLine("    add.u64 %rd6, %rd1, %rd5;");
-            ptx.AppendLine("    st.global.f32 [%rd6], %f2;");
+            ptx.AppendLine("    st.global.v2.f32 [%rd6], {%f4, %f6};");
         }
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");
@@ -201,7 +216,7 @@ internal sealed class PtxFusedComplexUnaryF32Kernel : IDisposable
             Operation: $"{OpTag(op)}-f32",
             Version: 1,
             Architecture: architecture,
-            Variant: $"pairwise-v2-b{blockThreads}-n{numPairs}",
+            Variant: $"pairwise-v4x2-b{blockThreads}-n{numPairs}",
             Tensors:
             [
                 new("input", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.RowMajor2D,
@@ -233,8 +248,10 @@ internal sealed class PtxFusedComplexUnaryF32Kernel : IDisposable
                 ["fma-use"] = isConjugate
                     ? "n/a"
                     : "deliberately none - an fma would be more accurate and would disagree with the reference",
-                ["global-input-reads"] = "one-fp32x2-per-pair",
-                ["global-output-writes"] = isConjugate ? "one-fp32x2-per-pair" : "one-fp32-per-pair",
+                ["global-input-reads"] = "one-fp32x4-per-two-pairs",
+                ["global-output-writes"] = isConjugate
+                    ? "one-fp32x4-per-two-pairs"
+                    : "one-fp32x2-per-two-pairs",
                 ["bounds-check"] = "none - the launch covers exactly the pair count",
                 ["shared-intermediate"] = "none",
                 ["global-intermediates"] = "none",
@@ -271,9 +288,11 @@ internal sealed class PtxFusedComplexUnaryF32Kernel : IDisposable
 
     private static void ValidateBlockThreads(int numPairs, int blockThreads)
     {
-        if (blockThreads is not (128 or 256 or 512) || numPairs % blockThreads != 0)
+        if (blockThreads is not (128 or 256 or 512) ||
+            numPairs % (blockThreads * PairsPerThread) != 0)
             throw new ArgumentOutOfRangeException(nameof(blockThreads),
-                "Complex unary block threads must be 128, 256, or 512 and evenly tile the pair count.");
+                "Complex unary block threads must be 128, 256, or 512 and, at two pairs " +
+                "per thread, evenly tile the pair count.");
     }
 
     private static void Require(

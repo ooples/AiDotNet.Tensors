@@ -19,17 +19,21 @@ public class DirectPtxComplexUnaryTests
         Assert.Contains(".visible .entry aidotnet_fused_complex_conjugate_f32(", ptx);
         Assert.Contains("op=complex-conjugate", ptx);
         Assert.Equal(2, Count(ptx, "ld.param.u64"));
-        Assert.Equal(1, Count(ptx, "ld.global.nc.v2.f32"));
-        Assert.Equal(1, Count(ptx, "st.global.v2.f32"));
+        // Two pairs per thread: one 16-byte load rather than an 8-byte one.
+        Assert.Equal(1, Count(ptx, "ld.global.nc.v4.f32"));
+        Assert.DoesNotContain("ld.global.nc.v2.f32", ptx, StringComparison.Ordinal);
+        Assert.Equal(1, Count(ptx, "st.global.v4.f32"));
 
         // Exactly one negate, applied to the imaginary lane, and the real lane
         // is stored untouched. neg.f32 flips the sign bit, so NaN payloads and
         // signed zeros survive as the reference's unary minus leaves them.
-        Assert.Equal(1, Count(ptx, "neg.f32"));
-        Assert.Contains("neg.f32 %f2, %f1;", ptx);
-        Assert.Contains("st.global.v2.f32 [%rd6], {%f0, %f2};", ptx);
-        // Pair in, pair out: both sides use the 8-byte stride.
-        Assert.Contains("mul.wide.u32 %rd2, %r2, 8;", ptx);
+        // One negate per pair, applied to each imaginary lane.
+        Assert.Equal(2, Count(ptx, "neg.f32"));
+        Assert.Contains("neg.f32 %f4, %f1;", ptx);
+        Assert.Contains("neg.f32 %f5, %f3;", ptx);
+        Assert.Contains("st.global.v4.f32 [%rd6], {%f0, %f4, %f2, %f5};", ptx);
+        // Pairs in, pairs out: both sides use the 16-byte two-pair stride.
+        Assert.Contains("mul.wide.u32 %rd2, %r2, 16;", ptx);
         Assert.Contains("add.u64 %rd6, %rd1, %rd2;", ptx);
         Assert.DoesNotContain("sqrt", ptx, StringComparison.Ordinal);
     }
@@ -45,20 +49,25 @@ public class DirectPtxComplexUnaryTests
         // sqrtf(re*re + im*im) with the multiplies UNFUSED. An fma would be both
         // faster and more accurate, and would therefore disagree with the
         // kernel this replaces - so its absence is the assertion.
-        Assert.Contains("mul.rn.f32 %f2, %f0, %f0;", ptx);
-        Assert.Contains("mul.rn.f32 %f3, %f1, %f1;", ptx);
-        Assert.Contains("add.rn.f32 %f2, %f2, %f3;", ptx);
+        Assert.Contains("mul.rn.f32 %f4, %f0, %f0;", ptx);
+        Assert.Contains("mul.rn.f32 %f5, %f1, %f1;", ptx);
+        Assert.Contains("add.rn.f32 %f4, %f4, %f5;", ptx);
+        // ...and the same again for the second pair.
+        Assert.Contains("mul.rn.f32 %f6, %f2, %f2;", ptx);
+        Assert.Contains("mul.rn.f32 %f7, %f3, %f3;", ptx);
+        Assert.Contains("add.rn.f32 %f6, %f6, %f7;", ptx);
         Assert.DoesNotContain("fma.", ptx, StringComparison.Ordinal);
         // IEEE square root, not the fast approximation.
-        Assert.Contains("sqrt.rn.f32 %f2, %f2;", ptx);
+        Assert.Equal(2, Count(ptx, "sqrt.rn.f32"));
         Assert.DoesNotContain("sqrt.approx", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain("rsqrt", ptx, StringComparison.Ordinal);
 
         // Pair in (8-byte stride), scalar out (4-byte stride).
-        Assert.Contains("mul.wide.u32 %rd2, %r2, 8;", ptx);
-        Assert.Contains("mul.wide.u32 %rd5, %r2, 4;", ptx);
-        Assert.Equal(1, Count(ptx, "st.global.f32"));
-        Assert.DoesNotContain("st.global.v2.f32", ptx, StringComparison.Ordinal);
+        // Two pairs in (16 bytes), two scalars out (8 bytes).
+        Assert.Contains("mul.wide.u32 %rd2, %r2, 16;", ptx);
+        Assert.Contains("mul.wide.u32 %rd5, %r2, 8;", ptx);
+        Assert.Equal(1, Count(ptx, "st.global.v2.f32"));
+        Assert.DoesNotContain("st.global.v4.f32", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain("neg.f32", ptx, StringComparison.Ordinal);
     }
 
