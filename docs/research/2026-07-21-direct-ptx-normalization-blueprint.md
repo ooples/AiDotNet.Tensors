@@ -195,6 +195,10 @@ process existed before it registered its CUDA context.
   `RED.E.ADD.F32` publishers; only the integer completion counters use `ATOMG`.
   The banked L2 cubin uses 24 registers/thread and 64 bytes shared memory; its
   hot reduction paths use inline full-warp/half-warp `SHFL` instructions.
+- CI rejects the banked L2 cubins unless row256/2,048 contain exactly one
+  `LDG.E.128` input load, row8,192 contains exactly two, and every shape retains
+  the register ceiling, one `RED`, one integer `ATOMG`, at least 13 inline
+  `SHFL` instructions, and zero local loads/stores.
 - Exact-cubin runtime profiling launches all 71 embedded specializations and
   reports `PROFILED_NORMALIZATION_CUBINS=71`.
 - Nsight Compute 2025.4.1 attaches to the exact target, but hardware-counter
