@@ -98,6 +98,14 @@ public static class PtxParityRegistry
             "correctness back to the admitted release machine. Converts to ThreeWayParity when the " +
             "fp64-oracle run over the four exact pair counts lands; until then the route stays disabled " +
             "and every shape unpromoted."),
+
+        new PtxParitySpec("PtxSplitComplexUnaryF32Kernel", PtxParityStatus.Deferred,
+            "split-buffer complex magnitude and magnitude-squared, fp32 (#850) - CudaBackend.SplitComplexMagnitude, CudaBackend.SplitComplexMagnitudeSquared",
+            "one module per operator over the four exact element counts. Both can be bit-exact because " +
+            "the emitter leaves the multiply-add UNFUSED to match sqrtf(re*re + im*im) / the reference " +
+            "power sum; an fma would be more accurate and would disagree, so the spec must assert " +
+            "equality rather than a tolerance. Converts to ThreeWayParity when the SM86 fp64-oracle run " +
+            "lands; until then the shapes stay unpromoted and fail closed."),
     };
 
     private static readonly Dictionary<string, PtxParitySpec> ByKernel =
