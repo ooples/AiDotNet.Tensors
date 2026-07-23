@@ -7381,6 +7381,39 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
+            // Issue #841 golden slice: the direct PTX path owns the complete
+            // convolution+bias+ReLU dataflow for one exact resident FP32 ABI.
+            // Every other shape/semantic contract continues through the
+            // established convolution, bias, and activation kernels below.
+#if NET5_0_OR_GREATER
+            if (typeof(T) == typeof(float) && bias is { } directBias &&
+                activation == FusedActivationType.ReLU &&
+                backend is Engines.DirectGpu.CUDA.CudaBackend directCuda &&
+                directCuda.IsDirectPtxConvolutionEnabled)
+            {
+                using var directBiasBuffer = GetWeightBufferPreferResident(
+                    backend, directBias, PersistentTensorRole.Biases);
+                var directShape = new DirectGpu.CUDA.Ptx.DirectPtxConvolutionShape(
+                    batch, inChannels, inHeight, inWidth,
+                    outChannels, outHeight, outWidth,
+                    kernelH, kernelW, strideH, strideW,
+                    padH, padW, dilationH, dilationW);
+                if (directCuda.TryDirectPtxFusedConv2DBiasRelu(
+                    inputBuffer.Buffer, kernelBuffer.Buffer, directBiasBuffer.Buffer,
+                    outputBuffer.Buffer, directShape))
+                {
+                    var directResult = DeferTensorResult<T>(
+                        backend, outputBuffer.Buffer,
+                        batch * outChannels * outHeight * outWidth,
+                        new[] { batch, outChannels, outHeight, outWidth });
+                    outputHandedOff = true;
+                    if (ResidentStepActive && typeof(T) == typeof(float))
+                        BindResidentBuffer(directResult, outputBuffer.Buffer, backend);
+                    return directResult;
+                }
+            }
+#endif
+
             // Execute GPU convolution
             backend.Conv2D(inputBuffer.Buffer, kernelBuffer.Buffer, outputBuffer.Buffer,
                 batch, inChannels, inHeight, inWidth,
