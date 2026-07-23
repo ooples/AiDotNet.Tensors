@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text.Json;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
@@ -56,6 +57,8 @@ internal static class DirectPtxConvolutionResnetExperiment
             Console.WriteLine($"== {shape.Scope}: N{shape.N} C{shape.C} H{shape.H} W{shape.W} K{shape.K} " +
                 $"{shape.Kernel}x{shape.Kernel} s{shape.Stride} p{shape.Pad} ==");
             var rows = new List<Result> { RunEstablishedAiDotNet(shape) };
+            Result? directPtx = RunDirectPtxIfAvailable(shape);
+            if (directPtx is Result cell) rows.Add(cell);
 
             Console.WriteLine($"{"Method",-40} {"median us",11} {"p95 us",11} {"p99 us",11} {"mean us",11} {"GFLOPS",11} {"managed B",11} {"max abs",10}");
             Console.WriteLine(new string('-', 120));
@@ -122,6 +125,43 @@ internal static class DirectPtxConvolutionResnetExperiment
         return new Result("AiDotNet established CUDA/cuDNN", distribution,
             shape.Flops / distribution.Median / 1e3, allocation,
             MaximumError(backend.DownloadBuffer(output), expected));
+    }
+
+    /// <summary>
+    /// Benchmarks the verified direct-PTX specialization for a shape, if one exists.
+    /// New ResNet-class cells slot in here as they pass GPU correctness.
+    /// </summary>
+    private static Result? RunDirectPtxIfAvailable(Shape shape)
+    {
+        if (shape.Scope != "resnet_1x1_c64_56") return null;
+
+        float[] inputHost = Values((long)shape.N * shape.C * shape.H * shape.W, 841);
+        float[] weightHost = Values((long)shape.K * shape.C, 842);
+        float[] biasHost = Values(shape.K, 843);
+        float[] expected = Oracle(shape, inputHost, weightHost, biasHost);
+
+        using var runtime = new DirectPtxRuntime();
+        using var kernel = new PtxConv2DNchwK1ResnetC64H56ForwardF32Kernel(runtime);
+        using var input = runtime.AllocateBytes((nuint)PtxConv2DNchwK1ResnetC64H56ForwardF32Kernel.InputBytes);
+        using var weights = runtime.AllocateBytes((nuint)PtxConv2DNchwK1ResnetC64H56ForwardF32Kernel.WeightBytes);
+        using var bias = runtime.AllocateBytes((nuint)PtxConv2DNchwK1ResnetC64H56ForwardF32Kernel.BiasBytes);
+        using var output = runtime.AllocateBytes((nuint)PtxConv2DNchwK1ResnetC64H56ForwardF32Kernel.OutputBytes);
+        input.Upload<float>(inputHost);
+        weights.Upload<float>(weightHost);
+        bias.Upload<float>(biasHost);
+        var inputView = DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]);
+        var weightView = DirectPtxTensorView.CreateOwned(weights, kernel.Blueprint.Tensors[1]);
+        var biasView = DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[2]);
+        var outputView = DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[3]);
+        void Launch() => kernel.Launch(inputView, weightView, biasView, outputView);
+        Distribution distribution = Measure(runtime.Synchronize, Launch);
+        long allocation = Allocation(runtime.Synchronize, Launch);
+        Launch();
+        runtime.Synchronize();
+        var actual = new float[PtxConv2DNchwK1ResnetC64H56ForwardF32Kernel.OutputElements];
+        output.Download<float>(actual);
+        return new Result("Direct PTX v1 (experimental)", distribution,
+            shape.Flops / distribution.Median / 1e3, allocation, MaximumError(actual, expected));
     }
 
     private static float[] Oracle(Shape s, float[] input, float[] weights, float[] bias)

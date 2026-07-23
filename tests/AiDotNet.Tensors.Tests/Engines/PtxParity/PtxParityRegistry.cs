@@ -183,6 +183,11 @@ public static class PtxParityRegistry
             "im2col FP32->FP16 (KxN)", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
         new PtxParitySpec("PtxUnfoldKNFp16FromFp16Nchw3x3Kernel", PtxParityStatus.Deferred,
             "unfold FP16->FP16 (KxN)", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+
+        // ResNet-class promotion-track cells (realistic compute-bound shapes).
+        new PtxParitySpec("PtxConv2DNchwK1ResnetC64H56ForwardF32Kernel", PtxParityStatus.Deferred,
+            "conv2d 1x1 + bias + ReLU ResNet-class N32/C64/H56/W56/K64",
+            "v1 thread-per-output baseline; shared-mem tiled-GEMM optimization + strongest-cuDNN/cuBLASLt promotion benchmark pending idle-GPU window (see blueprint ResNet campaign)."),
     };
 
     private static readonly Dictionary<string, PtxParitySpec> ByKernel =
