@@ -302,6 +302,15 @@ public static class PtxParityRegistry
             "slower than cuDNN. Keep deferred/unpromoted until the optimized layout (precomputed filter " +
             "transform + register-blocked batched 16-GEMM + input-transform reuse) clears the >=1.10x gate."),
 
+        new PtxParitySpec("PtxConv2DBackwardBiasKernel", PtxParityStatus.Deferred,
+            "Conv2D backward-bias direct-PTX coalesced reduction (#841 backward family)",
+            "gradBias[k] = sum over batch+spatial of gradOutput[b,k,h,w]. One block per output channel " +
+            "reduces the B x H x W slice with consecutive threads reading consecutive spatial elements (the " +
+            "contiguous NCHW axis -> coalesced loads, the same thread-to-memory lesson from the 3x3 kernel) " +
+            "and a shared tree reduction. Replaces the CPU-download reduction in " +
+            "DirectGpuTensorEngine.Conv2DBackwardBiasGpu. Verified correct on-device (<= 2e-3 vs fp64 CPU " +
+            "reduction, non-power-of-2 spatial). Deferred (experimental-pending-gpu-evidence)."),
+
         new PtxParitySpec("PtxConv2DNchwK1RegBlockedKernel", PtxParityStatus.Deferred,
             "register-blocked shared-memory 1x1 Conv2D+bias+ReLU GEMM, ResNet shapes (#841)",
             "the register-blocked (TM x TN micro-tile) tiled-GEMM specialization: each thread computes a " +
