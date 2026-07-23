@@ -1,6 +1,6 @@
-name: Direct PTX Normalization2 Gate
+name: Direct PTX Normalization Offline Gate
 
-# Produces and audits the normalization2 family's machine code WITHOUT a GPU.
+# Produces and audits the normalization-offline family's machine code WITHOUT a GPU.
 #
 # ptxas and nvdisasm are both host tools, so an ordinary ubuntu runner can
 # compile the emitted PTX to sm86 cubins, prove those cubins match the
@@ -12,7 +12,7 @@ on:
   pull_request:
     branches: [master, main]
     paths:
-      - '.github/workflows/direct-ptx-normalization2-gate.yml'
+      - '.github/workflows/direct-ptx-normalization-offline-gate.yml'
       - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxRowNormalizationD64Kernel.cs'
       - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/**'
       - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxNormalizationOfflineCubinTool.cs'
@@ -20,7 +20,7 @@ on:
   push:
     branches: [master, main]
     paths:
-      - '.github/workflows/direct-ptx-normalization2-gate.yml'
+      - '.github/workflows/direct-ptx-normalization-offline-gate.yml'
       - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/**'
       - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxNormalizationOfflineCubinTool.cs'
   workflow_dispatch:
@@ -88,9 +88,9 @@ jobs:
       - name: Compile every admitted shape to sm86
         run: >-
           dotnet tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Benchmarks.dll
-          --generate-direct-ptx-normalization2-cubins
+          --generate-direct-ptx-normalization-offline-cubins
           "$RUNNER_TEMP/cuda-nvcc/bin/ptxas"
-          "$RUNNER_TEMP/direct-ptx-normalization2/sm86"
+          "$RUNNER_TEMP/direct-ptx-normalization-offline/sm86"
 
       # The checked-in cubins must be exactly what this ptxas produces from the
       # current PTX. A kernel edit without a regenerated artifact fails here
@@ -98,7 +98,7 @@ jobs:
       - name: Verify the checked-in cubins are current
         run: >-
           dotnet tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Benchmarks.dll
-          --verify-direct-ptx-normalization2-cubins
+          --verify-direct-ptx-normalization-offline-cubins
           "$RUNNER_TEMP/cuda-nvcc/bin/ptxas"
           "src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/sm86"
 
@@ -108,10 +108,10 @@ jobs:
       - name: Disassemble and enforce the SASS contract
         run: >-
           dotnet tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Benchmarks.dll
-          --audit-direct-ptx-normalization2-sass
+          --audit-direct-ptx-normalization-offline-sass
           "$RUNNER_TEMP/cuda-nvdisasm/bin/nvdisasm"
           "src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/sm86"
-          "artifacts/direct-ptx/normalization2/sass"
+          "artifacts/direct-ptx/normalization-offline/sass"
 
       # Always upload: when the verify or SASS step fails, the generated
       # artifacts are exactly the evidence needed to diagnose it, and on a fresh
@@ -120,9 +120,9 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: direct-ptx-normalization2-sm86
+          name: direct-ptx-normalization-offline-sm86
           path: |
-            ${{ runner.temp }}/direct-ptx-normalization2/sm86/
-            artifacts/direct-ptx/normalization2/sass/
+            ${{ runner.temp }}/direct-ptx-normalization-offline/sm86/
+            artifacts/direct-ptx/normalization-offline/sass/
           if-no-files-found: warn
           retention-days: 14

@@ -4,14 +4,14 @@ using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 namespace AiDotNet.Tensors.Benchmarks;
 
 /// <summary>
-/// The normalization2 family's contribution to the GPU-free cubin pipeline: which
+/// The normalization-offline family's contribution to the GPU-free cubin pipeline: which
 /// modules exist. Everything else lives in <see cref="DirectPtxCubinToolCore"/>,
 /// which is byte-identical on every branch that carries it so the shared half
 /// merges cleanly when the families land together.
 /// </summary>
 internal static class DirectPtxNormalizationOfflineCubinTool
 {
-    internal const string Family = "normalization2";
+    internal const string Family = "normalization-offline";
 
     /// <summary>
     /// Every module this family can admit. Each shape is filtered through the
@@ -50,15 +50,15 @@ internal static class DirectPtxNormalizationOfflineCubinTool
     }
 
     internal static int Generate(string[] args) => args.Length < 3
-        ? Usage("--generate-direct-ptx-normalization2-cubins <ptxas-path> <output-directory>")
+        ? Usage("--generate-direct-ptx-normalization-offline-cubins <ptxas-path> <output-directory>")
         : DirectPtxCubinToolCore.Generate(Family, EnumerateModules(), args[1], args[2]);
 
     internal static int Verify(string[] args) => args.Length < 3
-        ? Usage("--verify-direct-ptx-normalization2-cubins <ptxas-path> <artifact-directory>")
+        ? Usage("--verify-direct-ptx-normalization-offline-cubins <ptxas-path> <artifact-directory>")
         : DirectPtxCubinToolCore.Verify(Family, EnumerateModules(), args[1], args[2]);
 
     internal static int AuditSass(string[] args) => args.Length < 4
-        ? Usage("--audit-direct-ptx-normalization2-sass <nvdisasm-path> <artifact-directory> <output-directory>")
+        ? Usage("--audit-direct-ptx-normalization-offline-sass <nvdisasm-path> <artifact-directory> <output-directory>")
         : DirectPtxCubinToolCore.AuditSass(Family, args[1], args[2], args[3]);
 
     private static int Usage(string text)

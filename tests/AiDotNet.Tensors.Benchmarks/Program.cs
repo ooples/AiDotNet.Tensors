@@ -13,20 +13,20 @@ class Program
 
     static void Main(string[] args)
     {
-        // GPU-free cubin generation and verification for the normalization2 family.
-        if (args.Length > 0 && args[0] == "--generate-direct-ptx-normalization2-cubins")
+        // GPU-free cubin generation and verification for the normalization-offline family.
+        if (args.Length > 0 && args[0] == "--generate-direct-ptx-normalization-offline-cubins")
         {
             Environment.ExitCode = DirectPtxNormalizationOfflineCubinTool.Generate(args);
             return;
         }
 
-        if (args.Length > 0 && args[0] == "--verify-direct-ptx-normalization2-cubins")
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-normalization-offline-cubins")
         {
             Environment.ExitCode = DirectPtxNormalizationOfflineCubinTool.Verify(args);
             return;
         }
 
-        if (args.Length > 0 && args[0] == "--audit-direct-ptx-normalization2-sass")
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-normalization-offline-sass")
         {
             Environment.ExitCode = DirectPtxNormalizationOfflineCubinTool.AuditSass(args);
             return;
