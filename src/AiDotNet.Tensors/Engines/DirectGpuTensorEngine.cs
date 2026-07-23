@@ -7356,6 +7356,39 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
+            // Issue #841 golden slice: the direct PTX path owns the complete
+            // convolution+bias+ReLU dataflow for one exact resident FP32 ABI.
+            // Every other shape/semantic contract continues through the
+            // established convolution, bias, and activation kernels below.
+#if NET5_0_OR_GREATER
+            if (typeof(T) == typeof(float) && bias is { } directBias &&
+                activation == FusedActivationType.ReLU &&
+                backend is Engines.DirectGpu.CUDA.CudaBackend directCuda &&
+                directCuda.IsDirectPtxConvolutionEnabled)
+            {
+                using var directBiasBuffer = GetWeightBufferPreferResident(
+                    backend, directBias, PersistentTensorRole.Biases);
+                var directShape = new DirectGpu.CUDA.Ptx.DirectPtxConvolutionShape(
+                    batch, inChannels, inHeight, inWidth,
+                    outChannels, outHeight, outWidth,
+                    kernelH, kernelW, strideH, strideW,
+                    padH, padW, dilationH, dilationW);
+                if (directCuda.TryDirectPtxFusedConv2DBiasRelu(
+                    inputBuffer.Buffer, kernelBuffer.Buffer, directBiasBuffer.Buffer,
+                    outputBuffer.Buffer, directShape))
+                {
+                    var directResult = DeferTensorResult<T>(
+                        backend, outputBuffer.Buffer,
+                        batch * outChannels * outHeight * outWidth,
+                        new[] { batch, outChannels, outHeight, outWidth });
+                    outputHandedOff = true;
+                    if (ResidentStepActive && typeof(T) == typeof(float))
+                        BindResidentBuffer(directResult, outputBuffer.Buffer, backend);
+                    return directResult;
+                }
+            }
+#endif
+
             // Execute GPU convolution
             backend.Conv2D(inputBuffer.Buffer, kernelBuffer.Buffer, outputBuffer.Buffer,
                 batch, inChannels, inHeight, inWidth,
@@ -8368,6 +8401,36 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
+            // Issue #841: the direct PTX path owns the complete depthwise 3x3
+            // stride-1 pad-1 dataflow for one exact resident FP32 ABI. Every
+            // other shape/semantic contract continues through the established
+            // depthwise kernel below.
+#if NET5_0_OR_GREATER
+            if (typeof(T) == typeof(float) &&
+                backend is Engines.DirectGpu.CUDA.CudaBackend directCuda &&
+                directCuda.IsDirectPtxConvolutionEnabled)
+            {
+                var directShape = new DirectGpu.CUDA.Ptx.DirectPtxConvolutionShape(
+                    batch, channels, inHeight, inWidth,
+                    channels, outHeight, outWidth,
+                    kernelH, kernelW, strideH, strideW,
+                    padH, padW, 1, 1);
+                if (directCuda.TryDirectPtxDepthwiseConv2D3x3(
+                    inputBuffer.Buffer, kernelBuffer.Buffer,
+                    outputBuffer.Buffer, directShape))
+                {
+                    var directResult = DeferTensorResult<T>(
+                        backend, outputBuffer.Buffer,
+                        batch * channels * outHeight * outWidth,
+                        new[] { batch, channels, outHeight, outWidth });
+                    outputBuffer.RelinquishOwnership();
+                    if (ResidentStepActive && typeof(T) == typeof(float))
+                        BindResidentBuffer(directResult, outputBuffer.Buffer, backend);
+                    return directResult;
+                }
+            }
+#endif
+
             backend.DepthwiseConv2D(inputBuffer.Buffer, kernelBuffer.Buffer, outputBuffer.Buffer,
                 batch, channels, inHeight, inWidth,
                 outHeight, outWidth,

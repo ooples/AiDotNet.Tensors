@@ -44,6 +44,14 @@ internal static class DirectPtxArchitecture
     /// </summary>
     internal static bool HasValidatedQkvRopeCache(int major, int minor) =>
         (major, minor) == (8, 6);
+
+    /// <summary>
+    /// Issue #841's first convolution emitter deliberately targets one exact
+    /// GA102/SM86 tuning domain. It remains experimental until GPU evidence is
+    /// attached; other SMs must use the established backend.
+    /// </summary>
+    internal static bool HasExperimentalConvolution(int major, int minor) =>
+        (major, minor) == (8, 6);
 }
 
 internal enum DirectPtxExtentMode
@@ -155,12 +163,40 @@ internal readonly record struct DirectPtxTensorContract
     };
 }
 
+/// <param name="MaxRegistersPerThread">
+/// Optional explicit per-thread register cap. When positive it acts as an extra
+/// (tighter) design ceiling on top of the device-derived one; <c>0</c> means the
+/// ceiling is derived purely from the device register file, so the kernel is not
+/// pinned to a hardcoded literal and scales across GPU generations.
+/// </param>
 internal readonly record struct DirectPtxResourceBudget(
     int MaxRegistersPerThread,
     int MaxStaticSharedBytes,
     int MaxLocalBytesPerThread,
     int MinBlocksPerMultiprocessor)
 {
+    /// <summary>
+    /// Derives the per-thread register ceiling from THIS device's register file
+    /// so the kernel's occupancy intent (<see cref="MinBlocksPerMultiprocessor"/>
+    /// blocks of <paramref name="blockThreads"/> threads) is enforced against real
+    /// hardware rather than a literal. Returns <see cref="int.MaxValue"/> when the
+    /// driver reports no register capacity (older drivers), in which case the
+    /// standalone bound is skipped and the driver occupancy calculator plus the
+    /// zero-local-bytes invariant remain the device-aware guards.
+    /// </summary>
+    internal static int DeriveRegisterCeiling(
+        DirectPtxFunctionInfo info, int blockThreads, int minBlocksPerMultiprocessor)
+    {
+        int ceiling = int.MaxValue;
+        if (blockThreads > 0 && minBlocksPerMultiprocessor > 0 &&
+            info.MaxRegistersPerMultiprocessor > 0)
+            ceiling = Math.Min(ceiling,
+                info.MaxRegistersPerMultiprocessor / (minBlocksPerMultiprocessor * blockThreads));
+        if (blockThreads > 0 && info.MaxRegistersPerBlock > 0)
+            ceiling = Math.Min(ceiling, info.MaxRegistersPerBlock / blockThreads);
+        return ceiling;
+    }
+
     internal void Validate(
         string kernelName,
         DirectPtxFunctionInfo info,
@@ -170,9 +206,20 @@ internal readonly record struct DirectPtxResourceBudget(
         if (info.LocalBytesPerThread > MaxLocalBytesPerThread)
             throw new InvalidOperationException(
                 $"Direct PTX kernel '{kernelName}' has {info.LocalBytesPerThread} local bytes/thread; budget is {MaxLocalBytesPerThread}.");
-        if (info.RegistersPerThread > MaxRegistersPerThread)
+
+        // The register ceiling scales with the device register file. An explicit
+        // MaxRegistersPerThread (when > 0) tightens it further as a design guard.
+        int deviceCeiling = DeriveRegisterCeiling(info, blockThreads, MinBlocksPerMultiprocessor);
+        int explicitCeiling = MaxRegistersPerThread > 0 ? MaxRegistersPerThread : int.MaxValue;
+        int effectiveCeiling = Math.Min(deviceCeiling, explicitCeiling);
+        if (effectiveCeiling != int.MaxValue && info.RegistersPerThread > effectiveCeiling)
             throw new InvalidOperationException(
-                $"Direct PTX kernel '{kernelName}' uses {info.RegistersPerThread} registers/thread; budget is {MaxRegistersPerThread}.");
+                $"Direct PTX kernel '{kernelName}' uses {info.RegistersPerThread} registers/thread; " +
+                $"ceiling is {effectiveCeiling} (device {info.MaxRegistersPerMultiprocessor} regs/SM, " +
+                $"{info.MaxRegistersPerBlock} regs/block; target {MinBlocksPerMultiprocessor} blocks x " +
+                $"{blockThreads} threads" +
+                (MaxRegistersPerThread > 0 ? $"; design cap {MaxRegistersPerThread}" : "") + ").");
+
         if (info.StaticSharedBytes > MaxStaticSharedBytes)
             throw new InvalidOperationException(
                 $"Direct PTX kernel '{kernelName}' uses {info.StaticSharedBytes} static shared bytes; budget is {MaxStaticSharedBytes}.");
