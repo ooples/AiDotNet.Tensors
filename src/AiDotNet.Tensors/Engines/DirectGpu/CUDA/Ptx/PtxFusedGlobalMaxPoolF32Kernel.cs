@@ -142,7 +142,7 @@ internal sealed class PtxFusedGlobalMaxPoolF32Kernel : IDisposable
         ptx.AppendLine($"    mul.wide.u32 %rd5, %r3, {valuesPerLane * sizeof(float)};");
         ptx.AppendLine("    add.u64 %rd6, %rd3, %rd5;");
         ptx.AppendLine(
-            $"    ld.global.ca.v{valuesPerLane}.f32 {{{valueRegisters}}}, [%rd6];");
+            $"    ld.global.nc.v{valuesPerLane}.f32 {{{valueRegisters}}}, [%rd6];");
         // Seed -inf, matching the reference's maxVal = -INFINITY.
         ptx.AppendLine($"    mov.f32 %f{accReg}, 0fFF800000;");
         for (int i = 0; i < valuesPerLane; i++)

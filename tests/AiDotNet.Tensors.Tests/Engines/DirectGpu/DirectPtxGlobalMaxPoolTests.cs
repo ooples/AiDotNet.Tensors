@@ -22,7 +22,7 @@ public class DirectPtxGlobalMaxPoolTests
         Assert.Contains("exact-shape rows=2048 spatial=128", ptx);
         Assert.Equal(2, Count(ptx, "ld.param.u64"));
         // 128 spatial / 32 lanes = one v4 load per lane.
-        Assert.Equal(1, Count(ptx, "ld.global.ca.v4.f32"));
+        Assert.Equal(1, Count(ptx, "ld.global.nc.v4.f32"));
         // Lane zero writes the single value for its plane.
         Assert.Equal(1, Count(ptx, "st.global.f32"));
         Assert.Contains("setp.eq.u32 %p0, %r3, 0;", ptx);
