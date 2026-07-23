@@ -83,11 +83,19 @@ internal static class DirectPtxCubinToolCore
                 continue;
             }
 
+            // Parse the figures rather than searching for the word "spill":
+            // the -v report says "0 bytes spill stores" on a clean build, so a
+            // substring match would fail every kernel. A non-zero stack frame
+            // is equally disqualifying - it is local memory by another name.
             string diagnostics = (stdout + stderr).Trim();
-            if (diagnostics.Contains("spill", StringComparison.OrdinalIgnoreCase))
+            int spillStores = ParseBytes(diagnostics, @"(\d+) bytes spill stores");
+            int spillLoads = ParseBytes(diagnostics, @"(\d+) bytes spill loads");
+            int stackFrame = ParseBytes(diagnostics, @"(\d+) bytes stack frame");
+            if (spillStores > 0 || spillLoads > 0 || stackFrame > 0)
             {
-                Console.Error.WriteLine($"[FAIL] {module.BlueprintId} spills:");
-                Console.Error.WriteLine(diagnostics);
+                Console.Error.WriteLine(
+                    $"[FAIL] {module.BlueprintId}: {stackFrame} bytes stack frame, " +
+                    $"{spillStores} bytes spill stores, {spillLoads} bytes spill loads.");
                 failures++;
                 File.Delete(ptxPath);
                 continue;
@@ -225,6 +233,13 @@ internal static class DirectPtxCubinToolCore
             ? $"SASS contract holds for {cubins.Length} {family} cubin(s)."
             : $"{violations} SASS violation(s).");
         return violations == 0 ? 0 : 1;
+    }
+
+    /// <summary>First capture of <paramref name="pattern"/> as an int, or 0.</summary>
+    private static int ParseBytes(string text, string pattern)
+    {
+        Match m = Regex.Match(text, pattern);
+        return m.Success ? int.Parse(m.Groups[1].Value, CultureInfo.InvariantCulture) : 0;
     }
 
     /// <summary>What ptxas reported about one compiled entry point.</summary>
