@@ -179,11 +179,15 @@ mode.
 
 ### Dot and outer products
 
-Dense and batched dot use register partials, warp shuffles, eight shared warp
-partials (32 bytes), one block barrier, and one final global store per result.
-Strided dot bakes its valid interval, offset, and step into the module rather
-than loading dynamic stride arguments. Outer and batched outer map one output
-element per thread and write it once.
+Dense dot uses aligned `float4` streams, register partials, warp shuffles,
+eight shared warp totals (32 bytes), one block barrier, and one final global
+store. The B4/K512 batched-dot specialization assigns one warp to each batch,
+uses aligned `float4` streams and register-only shuffles, and requires no
+shared memory or barrier. Strided dot bakes its valid interval, offset, and
+step into the module; its two-stage shuffle reduction replaces the prior 1 KiB
+and eight-barrier shared tree with eight shared warp totals and one barrier.
+Outer uses aligned `float4` transactions for the measured M64/N128 cell;
+fallback specializations still write every independent output exactly once.
 
 ## Global-memory ledger
 
@@ -195,7 +199,8 @@ element per thread and write it once.
 | backward linear | grad output, input, weights, saved activation | derivative and reduction accumulators in registers | dInput/dWeight/dBias once |
 | LoRA | input, base, A, B | warp partials and rank projection in shared; residual epilogue in registers | final output once |
 | linear CE | hidden, weight, bias, target | logits in registers; reductions in shared | one atomic scalar contribution/row |
-| dot | two vectors | register partials, then 32-byte shared warp totals | one scalar/batch |
+| dense/strided dot | two vectors | register partials, then 32-byte shared warp totals | one scalar |
+| batched dot | two batched vectors | one register-only warp reduction per batch | one scalar/batch |
 | outer | two vectors | product in a register | each output element once |
 
 There are no shape-dependent temporary device allocations in admitted direct
@@ -300,17 +305,23 @@ zero `LDL` and zero `STL` in every entry. Representative hardware rows are:
 |---|---:|---:|---:|---:|---:|---:|
 | FP32 GEMM M64/K256/N256 | 60 | 8192 | 0 | 8 | 0 | 0 / 0 |
 | FP32 fused GELU M64/K256/N256 | 60 | 8192 | 0 | 8 | 0 | 0 / 0 |
+| FP16 GEMM M16/K32/N16 | 20 | 2048 | 2 | 4 | 2 | 0 / 0 |
 | FP16 fused GELU M16/K512/N2048 N32 | 39 | 12288 | 64 | 24 | 32 | 0 / 0 |
 | FP16 fused GELU M16/K512/N2048 N64 | 39 | 20480 | 64 | 24 | 32 | 0 / 0 |
 | FP16 fused GELU M16/K1024/N4096 N32 | 34 | 24576 | 128 | 48 | 64 | 0 / 0 |
 | FP16 fused GELU M16/K1024/N4096 N64 | 34 | 40960 | 128 | 48 | 64 | 0 / 0 |
+| dense dot K4096 float4 | 24 | 32 | 0 | 0 | 0 | 0 / 0 |
+| outer M64/N128 float4 | 14 | 0 | 0 | 0 | 0 | 0 / 0 |
+| batched dot B4/K512 float4 | 24 | 0 | 0 | 0 | 0 | 0 / 0 |
+| reverse strided dot K512 | 24 | 32 | 0 | 0 | 0 | 0 / 0 |
 
 The deterministic Nsight target additionally launches all 16 exact embedded-
 cubin entry points and rejects runtime-linked images. Executed counters remain
-a separate required gate: aggregate local/spill instructions, local-load and
-local-store instructions, and L1 local-load/local-store requests must all be
-present and zero for every launch. Static disassembly is not mislabeled as an
-executed counter capture.
+a separate required gate: dedicated aggregate/local/shared register-spill
+instructions, aggregate local instructions, local-load/local-store
+instructions, and L1 local-load/local-store requests must all be present and
+zero for every launch. Static disassembly is not mislabeled as an executed
+counter capture.
 
 ## Current release evidence
 
@@ -340,12 +351,13 @@ Its source report SHA-256 is
 the machine-readable release-gate SHA-256 is
 `a229d8abaf100ccd47ae594c8625755fc79426bdc15112f59fd9410edae16590`.
 
-Nsight Compute CLI 2025.4.1 was extracted from the official package and
-attached to the committed kernel target on 2026-07-22. Counter collection still
+Nsight Compute CLI 2026.2.1 was extracted from the official package and
+detects the local RTX 3080. Counter collection still
 returned `ERR_NVGPUCTRPERM`; the resulting diagnostic CSV is not spill proof.
 Driver-JIT local size zero is enforced now, but no specialization is claimed as
 release-promoted until the checked-in CSV verifier observes zero executed local
-loads, local stores, aggregate local/spill instructions, and L1 local-load and
+loads, local stores, dedicated register-spill instructions (including local and
+shared spill paths), aggregate local instructions, and L1 local-load and
 local-store requests for all 16 exact launches. The timing orchestrator accepts
 that verified CSV explicitly and records its SHA-256 in the same release gate.
 
