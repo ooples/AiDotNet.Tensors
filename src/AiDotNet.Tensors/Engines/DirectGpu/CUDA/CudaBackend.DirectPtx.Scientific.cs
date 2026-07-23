@@ -90,6 +90,8 @@ public sealed partial class CudaBackend
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<SciNgpKey, PtxInstantNgpHashEncodeKernel> _sciNgpHashEncode =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<SciNgpKey, PtxInstantNgpHashEncodeBackwardKernel> _sciNgpHashEncodeBwd =
+        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
 
     private long _sciDispatchCount;
     internal long DirectPtxScientificDispatchCount => System.Threading.Interlocked.Read(ref _sciDispatchCount);
@@ -554,6 +556,24 @@ public sealed partial class CudaBackend
                 new SciNgpKey(numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride),
                 () => new PtxInstantNgpHashEncodeKernel(_directPtxRuntime!, numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride));
             Launch3(k.Blueprint, positions, hashTable, output, (vp, vt, vo) => k.Launch(vp, vt, vo));
+        });
+    }
+
+    internal bool TryDirectPtxInstantNgpHashEncodeBackward(
+        IGpuBuffer positions, IGpuBuffer outputGradient, IGpuBuffer tableGradient,
+        int numPoints, int resolution, int tableSize, int featuresPerLevel, int levelOffset, int outputStride)
+    {
+        if (!ScientificGateOpen ||
+            !PtxInstantNgpHashEncodeBackwardKernel.IsSupportedShape(numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride)) return Fail("instant-ngp-hash-encode-backward");
+        if (positions.SizeInBytes != checked((long)numPoints * 3 * sizeof(float)) ||
+            outputGradient.SizeInBytes != checked((long)numPoints * outputStride * sizeof(float)) ||
+            tableGradient.SizeInBytes != checked((long)tableSize * featuresPerLevel * sizeof(float))) return Fail("instant-ngp-hash-encode-backward-extent");
+        return SciDispatch(() =>
+        {
+            var k = _sciNgpHashEncodeBwd.GetOrAdd(
+                new SciNgpKey(numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride),
+                () => new PtxInstantNgpHashEncodeBackwardKernel(_directPtxRuntime!, numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride));
+            Launch3(k.Blueprint, positions, outputGradient, tableGradient, (vp, vg, vt) => k.Launch(vp, vg, vt));
         });
     }
 

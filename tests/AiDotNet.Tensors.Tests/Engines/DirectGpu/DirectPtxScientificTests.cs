@@ -14,9 +14,10 @@ public class DirectPtxScientificTests
     [Fact]
     public void ScientificCoverageManifest_AssignsEveryScopedApiExactlyOnce()
     {
-        Assert.Equal(31, DirectPtxScientificCoverageManifest.All.Count);
+        Assert.Equal(32, DirectPtxScientificCoverageManifest.All.Count);
         string[] names = DirectPtxScientificCoverageManifest.All.Select(c => c.Api).ToArray();
         Assert.Contains("CudaBackend.HashGridEncodeLevel", names);
+        Assert.Contains("CudaBackend.HashGridEncodeLevelBackward", names);
         Assert.Contains("CudaBackend.CosineSimilarity", names);
         Assert.Contains("CudaBackend.SphericalSoftmax", names);
         Assert.Contains("CudaBackend.NormalizeProbabilities", names);
@@ -760,6 +761,88 @@ public class DirectPtxScientificTests
         var actual = new float[expected.Length];
         outBuf.Download<float>(actual);
         AssertVectorClose(actual, expected, 3e-3f, $"capsule {op}");
+    }
+
+    [Fact]
+    public void InstantNgpHashEncodeBackwardEmitter_AccumulatesUnderHashMatch()
+    {
+        string ptx = PtxInstantNgpHashEncodeBackwardKernel.EmitPtx(8, 6, 64, 16, 256, 2, 0, 4);
+        Assert.Contains(PtxInstantNgpHashEncodeBackwardKernel.EntryPoint, ptx);
+        Assert.Contains("$NGPB_N_LOOP:", ptx);       // scan over points
+        Assert.Contains("$NGPB_CONTINUE:", ptx);      // grad-skip target
+        Assert.Equal(8, Count(ptx, "setp.eq.u32 %p1, %r14, %r3"));   // 8 corner hash-vs-entry matches
+        Assert.Equal(8, Count(ptx, "@%p1 fma.rn.f32 %f16"));         // predicated accumulate per corner
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.Equal(3, Count(ptx, "cvt.rmi.s32.f32"));              // floor per axis
+        Assert.Equal(0, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxInstantNgpHashEncodeBackwardKernel.IsSupportedShape(64, 16, 256, 2, 0, 4));   // cells = 256*2 = 512
+        Assert.False(PtxInstantNgpHashEncodeBackwardKernel.IsSupportedShape(64, 16, 100, 2, 0, 4));  // 100*2=200 not mult of 256
+        Assert.False(PtxInstantNgpHashEncodeBackwardKernel.IsPromotedShape(64, 16, 256, 2, 0, 4));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyInstantNgpHashEncodeBackward_MatchesOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in instant-ngp-hash-encode-backward specialization is measured on GA10x/SM86.");
+        const int numPoints = 64, resolution = 16, tableSize = 256, fpl = 2, levelOffset = 0, outputStride = 4;
+        using var kernel = new PtxInstantNgpHashEncodeBackwardKernel(runtime, numPoints, resolution, tableSize, fpl, levelOffset, outputStride);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20268900);
+        float[] positions = new float[numPoints * 3];
+        for (int i = 0; i < positions.Length; i++) positions[i] = (float)random.NextDouble();
+        float[] outGrad = Values(random, numPoints * outputStride, 1.0f);
+        var expected = new float[tableSize * fpl];
+        for (int gid = 0; gid < expected.Length; gid++)
+        {
+            int entry = gid / fpl, f = gid % fpl;
+            expected[gid] = NgpBackwardOracle(positions, outGrad, entry, f, numPoints, resolution, tableSize, fpl, levelOffset, outputStride);
+        }
+
+        using var pos = runtime.AllocateBytes((nuint)(positions.Length * sizeof(float)));
+        using var grad = runtime.AllocateBytes((nuint)(outGrad.Length * sizeof(float)));
+        using var tgrad = runtime.AllocateBytes((nuint)(expected.Length * sizeof(float)));
+        pos.Upload<float>(positions);
+        grad.Upload<float>(outGrad);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(pos, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(grad, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(tgrad, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[expected.Length];
+        tgrad.Download<float>(actual);
+        AssertVectorClose(actual, expected, 3e-3f, "instant-ngp hash encode backward");
+    }
+
+    private static float NgpBackwardOracle(
+        float[] positions, float[] outGrad, int entry, int f, int numPoints, int resolution, int tableSize, int fpl, int levelOffset, int outputStride)
+    {
+        float Clamp(float v) => v <= 0f ? 0f : (v >= 0.999999f ? 0.999999f : v);
+        float acc = 0f;
+        for (int n = 0; n < numPoints; n++)
+        {
+            float gx = Clamp(positions[n * 3]) * resolution, gy = Clamp(positions[n * 3 + 1]) * resolution, gz = Clamp(positions[n * 3 + 2]) * resolution;
+            int x0 = (int)Math.Floor(gx), y0 = (int)Math.Floor(gy), z0 = (int)Math.Floor(gz);
+            int x1 = x0 + 1, y1 = y0 + 1, z1 = z0 + 1;
+            float fx = gx - x0, fy = gy - y0, fz = gz - z0, ix = 1f - fx, iy = 1f - fy, iz = 1f - fz;
+            float grad = outGrad[n * outputStride + levelOffset + f];
+            if (Math.Abs(grad) < 1e-10f) continue;
+            if (NgpHash(x0, y0, z0, tableSize) == entry) acc += grad * ix * iy * iz;
+            if (NgpHash(x0, y0, z1, tableSize) == entry) acc += grad * ix * iy * fz;
+            if (NgpHash(x0, y1, z0, tableSize) == entry) acc += grad * ix * fy * iz;
+            if (NgpHash(x0, y1, z1, tableSize) == entry) acc += grad * ix * fy * fz;
+            if (NgpHash(x1, y0, z0, tableSize) == entry) acc += grad * fx * iy * iz;
+            if (NgpHash(x1, y0, z1, tableSize) == entry) acc += grad * fx * iy * fz;
+            if (NgpHash(x1, y1, z0, tableSize) == entry) acc += grad * fx * fy * iz;
+            if (NgpHash(x1, y1, z1, tableSize) == entry) acc += grad * fx * fy * fz;
+        }
+        return acc;
     }
 
     [Fact]
@@ -2341,6 +2424,20 @@ public class DirectPtxScientificTests
                     ngpExp[np * ngpStride + ngpLoff + f] = NgpEncodeOracle(ngpPos, ngpTbl, np, f, ngpRes, ngpTable, ngpFpl);
             using (var pb = backend.AllocateBuffer(ngpPos)) using (var tb = backend.AllocateBuffer(ngpTbl)) using (var o = backend.AllocateBuffer(ngpPts * ngpStride))
             { backend.HashGridEncodeLevel(pb, tb, o, ngpPts, ngpRes, ngpTable, ngpFpl, ngpLoff, ngpStride); n = AssertDispatched(n, "instant-ngp-hash-encode"); AssertVectorClose(backend.DownloadBuffer(o), ngpExp, 3e-3f, "instant-ngp-hash-encode route"); }
+
+            // Instant-NGP hash encode backward. cells = tableSize*fpl. Smaller tableSize (256) so cells = 512.
+            const int ngpbPts = 64, ngpbTable = 256;
+            float[] ngpbGrad = Values(random, ngpbPts * ngpStride, 1.0f);
+            float[] ngpbTblGrad = new float[ngpbTable * ngpFpl];   // (reuse ngpPos/ngpRes)
+            float[] ngpbPos = new float[ngpbPts * 3];
+            for (int i = 0; i < ngpbPos.Length; i++) ngpbPos[i] = (float)random.NextDouble();
+            for (int gid = 0; gid < ngpbTblGrad.Length; gid++)
+            {
+                int entry = gid / ngpFpl, f = gid % ngpFpl;
+                ngpbTblGrad[gid] = NgpBackwardOracle(ngpbPos, ngpbGrad, entry, f, ngpbPts, ngpRes, ngpbTable, ngpFpl, ngpLoff, ngpStride);
+            }
+            using (var pb = backend.AllocateBuffer(ngpbPos)) using (var gb = backend.AllocateBuffer(ngpbGrad)) using (var tg = backend.AllocateBuffer(ngpbTable * ngpFpl))
+            { backend.HashGridEncodeLevelBackward(pb, gb, tg, ngpbPts, ngpRes, ngpbTable, ngpFpl, ngpLoff, ngpStride); n = AssertDispatched(n, "instant-ngp-hash-encode-backward"); AssertVectorClose(backend.DownloadBuffer(tg), ngpbTblGrad, 3e-3f, "instant-ngp-hash-encode-backward route"); }
         }
         finally
         {
