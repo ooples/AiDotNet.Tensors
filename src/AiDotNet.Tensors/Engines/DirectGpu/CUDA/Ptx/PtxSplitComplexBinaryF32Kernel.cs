@@ -209,7 +209,13 @@ internal sealed class PtxSplitComplexBinaryF32Kernel : IDisposable
                 In("aReal"), In("aImag"), In("bReal"), In("bImag"), Out("outReal"), Out("outImag")
             ],
             ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 16,
+                // Measured by the offline gate at sm86: 20 registers for Add and
+                // 22 for Multiply. The budget was 16, so ResourceBudget.Validate
+                // would have thrown at construction on a real device for BOTH
+                // operators - the kernel takes four input streams and holds two
+                // output components live, which costs more than the unary kernels
+                // this budget was copied from.
+                MaxRegistersPerThread: 32,
                 MaxStaticSharedBytes: 0,
                 MaxLocalBytesPerThread: 0,
                 MinBlocksPerMultiprocessor: 1536 / blockThreads),
