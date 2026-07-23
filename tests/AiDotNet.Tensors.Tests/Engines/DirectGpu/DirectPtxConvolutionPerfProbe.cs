@@ -44,6 +44,7 @@ public sealed class DirectPtxConvolutionPerfProbe
             MeasureWinograd(runtime, new Conv2DWinogradShape(32, 64, 56, 56, 64));
             MeasureWinogradPretransformed(runtime, 32, 64, 56, 56, 64);
             MeasureWinogradFused(runtime, 32, 64, 56, 56, 64);
+            MeasureWinogradBatched(runtime, 32, 64, 56, 56, 64);
         }
         finally
         {
@@ -210,6 +211,44 @@ public sealed class DirectPtxConvolutionPerfProbe
 
         long flops = 2L * n * kk * h * w * cch * 9;
         Report($"winograd-FUSED N{n}/C{cch}/{h}x{w}/K{kk} 3x3 (inputT+gemm, regs={fused.FunctionInfo.RegistersPerThread})",
+            runtime, Launch, flops);
+    }
+
+    private void MeasureWinogradBatched(DirectPtxRuntime runtime, int n, int cch, int h, int w, int kk)
+    {
+        int tiles = n * (h / 2) * (w / 2);
+        using var filter = new PtxWinogradF23FilterTransformKernel(runtime, kk, cch, positionMajor: true);
+        using var dWeights = runtime.AllocateBytes((nuint)filter.WeightBytes);
+        using var dU = runtime.AllocateBytes((nuint)filter.TransformedBytes);
+        dWeights.Upload<float>(new float[filter.WeightBytes / sizeof(float)]);
+        filter.Launch(DirectPtxTensorView.CreateOwned(dWeights, filter.Blueprint.Tensors[0]),
+                      DirectPtxTensorView.CreateOwned(dU, filter.Blueprint.Tensors[1]));
+        runtime.Synchronize();
+
+        using var inputT = new PtxWinogradF23InputTransformKernel(runtime, n, cch, h, w);
+        using var dInput = runtime.AllocateBytes((nuint)inputT.InputBytes);
+        using var dV = runtime.AllocateBytes((nuint)inputT.TransformedBytes);
+        dInput.Upload<float>(new float[inputT.InputBytes / sizeof(float)]);
+        using var gemm = new PtxWinogradBatchedGemmKernel(runtime, kk, cch, tiles, 64, 64, 8, 4, 4);
+        using var dM = runtime.AllocateBytes((nuint)gemm.MBytes);
+        using var outT = new PtxWinogradF23OutputTransformKernel(runtime, n, h, w, kk);
+        using var dBias = runtime.AllocateBytes((nuint)outT.BiasBytes);
+        using var dOutput = runtime.AllocateBytes((nuint)outT.OutputBytes);
+        dBias.Upload<float>(new float[outT.BiasBytes / sizeof(float)]);
+
+        void Launch()
+        {
+            inputT.Launch(DirectPtxTensorView.CreateOwned(dInput, inputT.Blueprint.Tensors[0]),
+                          DirectPtxTensorView.CreateOwned(dV, inputT.Blueprint.Tensors[1]));
+            gemm.Launch(DirectPtxTensorView.CreateOwned(dU, gemm.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.CreateOwned(dV, gemm.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.CreateOwned(dM, gemm.Blueprint.Tensors[2]));
+            outT.Launch(DirectPtxTensorView.CreateOwned(dM, outT.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.CreateOwned(dBias, outT.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.CreateOwned(dOutput, outT.Blueprint.Tensors[2]));
+        }
+        long flops = 2L * n * kk * h * w * cch * 9;
+        Report($"winograd-BATCHED N{n}/C{cch}/{h}x{w}/K{kk} 3x3 (inT+regGEMM+outT, gemmRegs={gemm.FunctionInfo.RegistersPerThread})",
             runtime, Launch, flops);
     }
 
