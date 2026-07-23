@@ -115,12 +115,16 @@ jobs:
           "src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/sm86"
           "artifacts/direct-ptx/layout/sass"
 
+      # Always upload: when verify or the SASS audit fails, the generated
+      # artifacts are exactly the evidence needed to diagnose it, and on a
+      # regenerated family they are what gets committed to reseed the manifest.
       - name: Upload cubins and SASS evidence
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: direct-ptx-layout-sm86
           path: |
             ${{ runner.temp }}/direct-ptx-layout/sm86/
             artifacts/direct-ptx/layout/sass/
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 14
