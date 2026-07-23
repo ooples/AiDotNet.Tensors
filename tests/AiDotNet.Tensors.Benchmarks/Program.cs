@@ -13,6 +13,25 @@ class Program
 
     static void Main(string[] args)
     {
+        // GPU-free cubin generation and verification for the gather family.
+        if (args.Length > 0 && args[0] == "--generate-direct-ptx-gather-cubins")
+        {
+            Environment.ExitCode = DirectPtxGatherCubinTool.Generate(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-gather-cubins")
+        {
+            Environment.ExitCode = DirectPtxGatherCubinTool.Verify(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-gather-sass")
+        {
+            Environment.ExitCode = DirectPtxGatherCubinTool.AuditSass(args);
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--direct-ptx-attention")
         {
             DirectPtxAttentionExperiment.Run();
