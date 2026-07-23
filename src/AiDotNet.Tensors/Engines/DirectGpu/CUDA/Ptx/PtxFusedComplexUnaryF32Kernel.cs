@@ -228,7 +228,11 @@ internal sealed class PtxFusedComplexUnaryF32Kernel : IDisposable
                         scalarExtent, scalarExtent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 16,
+                // Measured by the offline gate at sm86 after moving to two
+                // pairs per thread: 14 registers for conjugate and 15 for
+                // magnitude. The previous 16 budget left one register of
+                // margin, which is not enough to absorb codegen drift.
+                MaxRegistersPerThread: 24,
                 MaxStaticSharedBytes: 0,
                 MaxLocalBytesPerThread: 0,
                 MinBlocksPerMultiprocessor: 1536 / blockThreads),
