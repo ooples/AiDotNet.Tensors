@@ -43,6 +43,7 @@ public sealed partial class CudaBackend : IAnnBackend
         int numVectors, int numCentroids, int dim, AnnMetric metric)
     {
         if (numVectors <= 0 || numCentroids <= 0) return;
+        if (TryDirectPtxAnnIvfAssign(vectors, centroids, assignments, numVectors, numCentroids, dim, metric)) return;
         var kernel = ResolveAnnKernel("ann_ivf_assign");
         using var _ = PushContext();
         uint grid = (uint)((numVectors + DefaultBlockSize - 1) / DefaultBlockSize);

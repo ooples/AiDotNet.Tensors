@@ -82,6 +82,8 @@ public sealed partial class CudaBackend
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<SciAnnPqKey, PtxAnnPqDistanceTablesKernel> _sciAnnPqDistanceTables =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<SciAnnCdKey, PtxAnnIvfAssignKernel> _sciAnnIvfAssign =
+        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
 
     private long _sciDispatchCount;
     internal long DirectPtxScientificDispatchCount => System.Threading.Interlocked.Read(ref _sciDispatchCount);
@@ -496,6 +498,22 @@ public sealed partial class CudaBackend
             var k = _sciAnnPqDistanceTables.GetOrAdd(new SciAnnPqKey(metric, numQueries, m, ksub, dsub),
                 () => new PtxAnnPqDistanceTablesKernel(_directPtxRuntime!, metric, numQueries, m, ksub, dsub));
             Launch3(k.Blueprint, queries, codebooks, tables, (vq, vc, vt) => k.Launch(vq, vc, vt));
+        });
+    }
+
+    internal bool TryDirectPtxAnnIvfAssign(
+        IGpuBuffer vectors, IGpuBuffer centroids, IGpuBuffer assignments,
+        int numVectors, int numCentroids, int dim, AnnMetric metric)
+    {
+        if (!ScientificGateOpen || !PtxAnnIvfAssignKernel.IsSupportedShape(numVectors, numCentroids, dim)) return Fail("ann-ivf-assign");
+        if (vectors.SizeInBytes != checked((long)numVectors * dim * sizeof(float)) ||
+            centroids.SizeInBytes != checked((long)numCentroids * dim * sizeof(float)) ||
+            assignments.SizeInBytes != checked((long)numVectors * sizeof(int))) return Fail("ann-ivf-assign-extent");
+        return SciDispatch(() =>
+        {
+            var k = _sciAnnIvfAssign.GetOrAdd(new SciAnnCdKey(metric, numVectors, numCentroids, dim),
+                () => new PtxAnnIvfAssignKernel(_directPtxRuntime!, metric, numVectors, numCentroids, dim));
+            Launch3(k.Blueprint, vectors, centroids, assignments, (vv, vc, va) => k.Launch(vv, vc, va));
         });
     }
 

@@ -14,7 +14,7 @@ public class DirectPtxScientificTests
     [Fact]
     public void ScientificCoverageManifest_AssignsEveryScopedApiExactlyOnce()
     {
-        Assert.Equal(28, DirectPtxScientificCoverageManifest.All.Count);
+        Assert.Equal(29, DirectPtxScientificCoverageManifest.All.Count);
         string[] names = DirectPtxScientificCoverageManifest.All.Select(c => c.Api).ToArray();
         Assert.Contains("CudaBackend.CosineSimilarity", names);
         Assert.Contains("CudaBackend.SphericalSoftmax", names);
@@ -23,6 +23,7 @@ public class DirectPtxScientificTests
         Assert.Contains("CudaBackend.QuantumRotation", names);
         Assert.Contains("CudaBackend.AnnComputeDistances", names);
         Assert.Contains("CudaBackend.AnnPqDistanceTables", names);
+        Assert.Contains("CudaBackend.AnnIvfAssign", names);
         Assert.Contains("CudaBackend.RbfForward", names);
         Assert.Contains("CudaBackend.PairwiseDistance", names);
         Assert.Contains("CudaBackend.PairwiseDistanceSquared", names);
@@ -757,6 +758,77 @@ public class DirectPtxScientificTests
         var actual = new float[expected.Length];
         outBuf.Download<float>(actual);
         AssertVectorClose(actual, expected, 3e-3f, $"capsule {op}");
+    }
+
+    [Theory]
+    [InlineData(AnnMetric.L2)]
+    [InlineData(AnnMetric.InnerProduct)]
+    public void AnnIvfAssignEmitter_IsThreadPerVectorCentroidScan(AnnMetric metric)
+    {
+        string ptx = PtxAnnIvfAssignKernel.EmitPtx(8, 6, metric, 256, 8, 12);
+        Assert.Contains(PtxAnnIvfAssignKernel.EntryPoint, ptx);
+        Assert.Contains("$IVF_C_LOOP:", ptx);   // scan over centroids
+        Assert.Contains("$IVF_K_LOOP:", ptx);   // metric over dim
+        Assert.Equal(1, Count(ptx, "st.global.u32"));   // int32 assignment
+        Assert.Contains(metric == AnnMetric.InnerProduct ? "setp.gt.f32 %p1" : "setp.lt.f32 %p1", ptx);   // argmax vs argmin
+        Assert.Contains(metric == AnnMetric.InnerProduct ? "mov.f32 %f0, 0fFF800000" : "mov.f32 %f0, 0f7F800000", ptx);   // best init
+        Assert.Equal(0, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxAnnIvfAssignKernel.IsSupportedShape(256, 8, 12));
+        Assert.False(PtxAnnIvfAssignKernel.IsSupportedShape(255, 8, 12));   // not a multiple of 256
+        Assert.False(PtxAnnIvfAssignKernel.IsPromotedShape(256, 8, 12));
+    }
+
+    [SkippableTheory]
+    [InlineData(AnnMetric.L2)]
+    [InlineData(AnnMetric.InnerProduct)]
+    public void DriverOnlyAnnIvfAssign_MatchesOracle(AnnMetric metric)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in ann-ivf-assign specialization is measured on GA10x/SM86.");
+        const int numVectors = 256, numCentroids = 12, dim = 10;
+        using var kernel = new PtxAnnIvfAssignKernel(runtime, metric, numVectors, numCentroids, dim);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20268600);
+        float[] vec = Values(random, numVectors * dim, 1.0f);
+        float[] cen = Values(random, numCentroids * dim, 1.0f);
+        var expected = new int[numVectors];
+        for (int i = 0; i < numVectors; i++)
+        {
+            int best = 0;
+            double bestScore = metric == AnnMetric.InnerProduct ? double.NegativeInfinity : double.PositiveInfinity;
+            for (int c = 0; c < numCentroids; c++)
+            {
+                double score = 0;
+                for (int k = 0; k < dim; k++)
+                {
+                    double a = vec[i * dim + k], b = cen[c * dim + k];
+                    score += metric == AnnMetric.InnerProduct ? a * b : (a - b) * (a - b);
+                }
+                bool better = metric == AnnMetric.InnerProduct ? score > bestScore : score < bestScore;
+                if (better) { bestScore = score; best = c; }
+            }
+            expected[i] = best;
+        }
+
+        using var vb = runtime.AllocateBytes((nuint)(vec.Length * sizeof(float)));
+        using var cb = runtime.AllocateBytes((nuint)(cen.Length * sizeof(float)));
+        using var ab = runtime.AllocateBytes((nuint)(numVectors * sizeof(int)));
+        vb.Upload<float>(vec);
+        cb.Upload<float>(cen);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(vb, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(cb, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(ab, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new int[numVectors];
+        ab.Download<int>(actual);
+        for (int i = 0; i < numVectors; i++)
+            Assert.True(actual[i] == expected[i], $"ivf assign {metric}: vector {i} expected {expected[i]} got {actual[i]}");
     }
 
     [Theory]
@@ -2112,6 +2184,12 @@ public class DirectPtxScientificTests
                     }
             using (var qb = backend.AllocateBuffer(pqQry)) using (var cbb = backend.AllocateBuffer(pqCb)) using (var t = backend.AllocateBuffer(pqQ * pqM * pqK))
             { backend.PqComputeDistanceTables(qb, cbb, t, pqQ, pqM, pqK, pqD, AnnMetric.InnerProduct); n = AssertDispatched(n, "ann-pq-distance-tables"); AssertVectorClose(backend.DownloadBuffer(t), pqExp, 3e-3f, "ann-pq-distance-tables route"); }
+
+            // ANN IVF assign (L2, int32 output). numVectors=256; value correctness covered by DriverOnlyAnnIvfAssign.
+            const int ivfV = 256, ivfC = 12, ivfDim = 10;
+            float[] ivfVec = Values(random, ivfV * ivfDim, 1.0f), ivfCen = Values(random, ivfC * ivfDim, 1.0f);
+            using (var vb = backend.AllocateBuffer(ivfVec)) using (var cb = backend.AllocateBuffer(ivfCen)) using (var ab = backend.AllocateBuffer(ivfV))
+            { backend.IvfAssign(vb, cb, ab, ivfV, ivfC, ivfDim, AnnMetric.L2); n = AssertDispatched(n, "ann-ivf-assign"); }
         }
         finally
         {
