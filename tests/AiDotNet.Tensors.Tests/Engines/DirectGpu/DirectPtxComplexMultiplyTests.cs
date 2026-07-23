@@ -63,6 +63,7 @@ public class DirectPtxComplexMultiplyTests
             new[]
             {
                 "CudaBackend.ApplyMelFilterbank",
+                "CudaBackend.BatchedFFT",
                 "CudaBackend.ComplexConjugate",
                 "CudaBackend.ComplexMagnitude",
                 "CudaBackend.ComplexMultiply",
@@ -1000,6 +1001,100 @@ public class DirectPtxComplexMultiplyTests
         {
             Assert.True(Math.Abs(recoveredRe[t] - signal[t]) <= 1e-2 * (1 + Math.Abs(signal[t])));
             Assert.True(Math.Abs(recoveredIm[t]) <= 1e-2);
+        }
+    }
+
+    [Fact]
+    public void BatchedBitReverseEmitter_OffsetsByGridY()
+    {
+        string ptx = PtxBatchedBitReverseF32Kernel.EmitPtx(8, 6, 512);
+        Assert.Contains("exact-shape n=512 log2n=9 block=256 op=batched-fft-bit-reverse", ptx);
+        Assert.Contains("brev.b32 %r3, %r2", ptx);
+        Assert.Contains("shr.u32 %r3, %r3, 23", ptx);
+        Assert.Contains("mov.u32 %r4, %ctaid.y", ptx);          // batch index from gridY
+        Assert.Contains("mul.lo.u32 %r5, %r4, 512", ptx);       // baseOffset = b*n
+        Assert.Equal(4, Count(ptx, "ld.global.f32"));
+        Assert.Equal(4, Count(ptx, "st.global.f32"));
+        Assert.DoesNotContain("fma", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxBatchedBitReverseF32Kernel.IsSupportedShape(512, 4));
+        Assert.False(PtxBatchedBitReverseF32Kernel.IsSupportedShape(512, 0));   // batch must be >= 1
+        Assert.False(PtxBatchedBitReverseF32Kernel.IsPromotedShape(512, 4));
+    }
+
+    [Fact]
+    public void BatchedFftButterflyEmitter_OffsetsByGridY()
+    {
+        string ptx = PtxBatchedFftButterflyF32Kernel.EmitPtx(8, 6, 512);
+        Assert.Contains("exact-shape n=512 block=256 op=batched-fft-butterfly", ptx);
+        Assert.Equal(2, Count(ptx, "ld.param.u32"));            // stride and inverse
+        Assert.Contains("mov.u32 %r10, %ctaid.y", ptx);         // batch index from gridY
+        Assert.Contains("mul.lo.u32 %r11, %r10, 512", ptx);     // baseOffset = b*n
+        Assert.Contains("cos.approx.f32", ptx);
+        Assert.Contains("sin.approx.f32", ptx);
+        Assert.Equal(2, Count(ptx, "fma.rn.f32"));
+        Assert.Equal(4, Count(ptx, "ld.global.f32"));
+        Assert.Equal(4, Count(ptx, "st.global.f32"));
+        Assert.DoesNotContain("bra", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxBatchedFftButterflyF32Kernel.IsSupportedShape(512, 4));
+        Assert.False(PtxBatchedFftButterflyF32Kernel.IsSupportedShape(256, 4));   // (n/2) not multiple of 256
+        Assert.False(PtxBatchedFftButterflyF32Kernel.IsPromotedShape(512, 4));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyBatchedFft_MatchesPerRowDftOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedComplexMultiply(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The candidate is admitted only on SM86.");
+        const int n = 512, batch = 3;
+        using var reverse = new PtxBatchedBitReverseF32Kernel(runtime, n, batch);
+        using var butterfly = new PtxBatchedFftButterflyF32Kernel(runtime, n, batch);
+        Assert.Equal(0, reverse.Audit.Function.LocalBytesPerThread);
+        Assert.Equal(0, butterfly.Audit.Function.LocalBytesPerThread);
+
+        var real = new float[batch * n];
+        var imag = new float[batch * n];
+        var random = RandomHelper.CreateSeededRandom(20261210);
+        for (int i = 0; i < real.Length; i++) { real[i] = (float)(random.NextDouble() * 2 - 1); imag[i] = 0f; }
+
+        var expectedRe = new double[batch * n];
+        var expectedIm = new double[batch * n];
+        for (int b = 0; b < batch; b++)
+            for (int k = 0; k < n; k++)
+            {
+                double sr = 0, si = 0;
+                for (int t = 0; t < n; t++)
+                {
+                    double angle = -2.0 * Math.PI * k * t / n;
+                    sr += real[b * n + t] * Math.Cos(angle);
+                    si += real[b * n + t] * Math.Sin(angle);
+                }
+                expectedRe[b * n + k] = sr; expectedIm[b * n + k] = si;
+            }
+
+        using var reB = runtime.AllocateBytes(reverse.Blueprint.Tensors[0].RequiredBytes);
+        using var imB = runtime.AllocateBytes(reverse.Blueprint.Tensors[1].RequiredBytes);
+        reB.Upload<float>(real); imB.Upload<float>(imag);
+        reverse.Launch(
+            DirectPtxTensorView.CreateOwned(reB, reverse.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(imB, reverse.Blueprint.Tensors[1]));
+        for (int stride = 2; stride <= n; stride <<= 1)
+            butterfly.Launch(
+                DirectPtxTensorView.CreateOwned(reB, butterfly.Blueprint.Tensors[0]),
+                DirectPtxTensorView.CreateOwned(imB, butterfly.Blueprint.Tensors[1]), stride, 0);
+        runtime.Synchronize();
+
+        var actualRe = new float[batch * n];
+        var actualIm = new float[batch * n];
+        reB.Download<float>(actualRe); imB.Download<float>(actualIm);
+        for (int i = 0; i < actualRe.Length; i++)
+        {
+            Assert.True(Math.Abs(actualRe[i] - expectedRe[i]) <= 1e-2 * (1 + Math.Abs(expectedRe[i])));
+            Assert.True(Math.Abs(actualIm[i] - expectedIm[i]) <= 1e-2 * (1 + Math.Abs(expectedIm[i])));
         }
     }
 

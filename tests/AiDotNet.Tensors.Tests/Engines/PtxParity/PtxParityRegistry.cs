@@ -182,6 +182,19 @@ public static class PtxParityRegistry
             "reciprocal transform length (1/n). Each lane is a single mul.rn, so the spec is bit-exact " +
             "against x*scale. Also normalizes batched inverse transforms (batch*n elements scaled by 1/n). " +
             "Converts to ThreeWayParity when the SM86 run lands; until then unpromoted and fail-closed."),
+
+        new PtxParitySpec("PtxBatchedBitReverseF32Kernel", PtxParityStatus.Deferred,
+            "batched FFT bit-reversal permutation, fp32 (#850) - CudaBackend.BatchedFFT (stage 1)",
+            "one module per (length, batch); the batch index is gridDim.y and offsets into each row at b*n, " +
+            "then the same brev.b32 guarded swap the single-transform kernel uses. It is pure data movement, " +
+            "so the spec is bit-exact including NaN payloads and signed zeros. Converts to ThreeWayParity " +
+            "when the SM86 fp64-oracle batched-FFT run lands; until then unpromoted and fail-closed."),
+        new PtxParitySpec("PtxBatchedFftButterflyF32Kernel", PtxParityStatus.Deferred,
+            "batched FFT radix-2 butterfly stage, fp32 (#850) - CudaBackend.BatchedFFT (stage 2)",
+            "one module per (length, batch, stage stride); the batch index is gridDim.y (baseOffset=b*n) and " +
+            "each thread applies a cos.approx/sin.approx twiddle to one wing, so its spec is TOLERANCE-based, " +
+            "not bit-exact. A batched transform launches this stage log2(n) times with doubling strides after " +
+            "the batched bit-reverse pass. Converts to ThreeWayParity (with tolerance) when the SM86 run lands."),
     };
 
     private static readonly Dictionary<string, PtxParitySpec> ByKernel =
