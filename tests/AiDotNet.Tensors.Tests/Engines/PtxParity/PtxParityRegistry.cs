@@ -47,6 +47,29 @@ public static class PtxParityRegistry
 {
     public static IReadOnlyList<PtxParitySpec> Specs { get; } = new[]
     {
+        new PtxParitySpec("PtxFusedTranspose2DF32Kernel", PtxParityStatus.Deferred,
+            "2D transpose, fp32 (#845) - CudaBackend.Transpose",
+            "has a public route and a call-time experiment override. A transpose only moves elements, " +
+            "so its three-way spec can assert bit-for-bit equality on all three legs with no tolerance " +
+            "at all - the cleanest parity target in the family. Deferred only because the gate-off leg " +
+            "needs an admitted SM86 machine to run; the kernel is shared-memory staged, so that leg " +
+            "must also assert the Nsight bank-conflict count is zero, which the naive kernel it " +
+            "replaces would fail."),
+
+        new PtxParitySpec("PtxFusedCastF32ToF16Kernel", PtxParityStatus.Deferred,
+            "narrowing FP32->FP16 cast (#845) — CudaBackend.ConvertToFp16",
+            "has a public route and a call-time experiment override, but its driver test compares the " +
+            "PTX result against System.Half only, so the gate-off CUDA==oracle leg is unproven. " +
+            "Converts to ThreeWayParity by adding a gate-off leg over ConvertToFp16; narrowing rounds " +
+            "round-to-nearest-even, so that leg must compare bit patterns, not a tolerance."),
+
+        new PtxParitySpec("PtxFusedCastF16ToF32Kernel", PtxParityStatus.Deferred,
+            "widening FP16->FP32 cast (#845) — CudaBackend.ConvertToFp32",
+            "same shape as the narrowing cast: public route plus experiment override, but no gate-off " +
+            "leg yet. Widening is exact for every FP16 input (including subnormals, infinities, and " +
+            "signed zero), so its three-way spec can assert bit-for-bit equality on all three legs " +
+            "rather than a tolerance."),
+
         new PtxParitySpec("PtxFusedResidualRmsNormD64Kernel", PtxParityStatus.Deferred,
             "fused residual + RMSNorm (D=64)",
             "backend method has no public op route on main (only the CUDA RmsNorm path is wired), " +

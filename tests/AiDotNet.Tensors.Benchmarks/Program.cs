@@ -13,6 +13,25 @@ class Program
 
     static void Main(string[] args)
     {
+        // GPU-free cubin generation and verification for the layout family.
+        if (args.Length > 0 && args[0] == "--generate-direct-ptx-layout-cubins")
+        {
+            Environment.ExitCode = DirectPtxOfflineCubinTool.Generate(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-layout-cubins")
+        {
+            Environment.ExitCode = DirectPtxOfflineCubinTool.Verify(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-layout-sass")
+        {
+            Environment.ExitCode = DirectPtxOfflineCubinTool.AuditSass(args);
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--direct-ptx-attention")
         {
             DirectPtxAttentionExperiment.Run();
@@ -76,6 +95,12 @@ class Program
         if (args.Length > 0 && args[0] == "--direct-ptx-residual-rmsnorm")
         {
             DirectPtxResidualRmsNormExperiment.Run();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-cast-fp16")
+        {
+            DirectPtxCastFp16Experiment.Run(
+                args.Length > 1 && int.TryParse(args[1], out int castRuns) ? castRuns : 1);
             return;
         }
         if (args.Length > 0 && args[0] == "--direct-ptx-external-gpu-baselines")
