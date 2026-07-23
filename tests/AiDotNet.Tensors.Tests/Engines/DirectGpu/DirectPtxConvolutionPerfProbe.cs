@@ -39,6 +39,7 @@ public sealed class DirectPtxConvolutionPerfProbe
             MeasureV1(runtime);
             // ResNet 1x1 bottleneck: N32, C64, H56, W56, K64 (HW=3136), tile 16.
             MeasureTiled(runtime, new Conv2DTiledShape(32, 64, 64, 3136, 16));
+            MeasureRegBlocked(runtime, new Conv2DRegBlockShape(32, 64, 64, 3136, 64, 64, 16, 4, 4));
         }
         finally
         {
@@ -89,6 +90,29 @@ public sealed class DirectPtxConvolutionPerfProbe
             runtime, Launch, flops);
     }
 
+    private void MeasureRegBlocked(DirectPtxRuntime runtime, Conv2DRegBlockShape shape)
+    {
+        using var kernel = new PtxConv2DNchwK1RegBlockedKernel(runtime, shape);
+        using var input = runtime.AllocateBytes((nuint)shape.InputBytes);
+        using var weights = runtime.AllocateBytes((nuint)shape.WeightBytes);
+        using var bias = runtime.AllocateBytes((nuint)shape.BiasBytes);
+        using var output = runtime.AllocateBytes((nuint)shape.OutputBytes);
+        input.Upload<float>(new float[shape.InputBytes / sizeof(float)]);
+        weights.Upload<float>(new float[shape.WeightBytes / sizeof(float)]);
+        bias.Upload<float>(new float[shape.BiasBytes / sizeof(float)]);
+
+        void Launch() => kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(weights, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[3]));
+
+        long flops = 2L * shape.Batch * shape.OutputChannels * shape.Spatial * shape.InputChannels;
+        Report($"regblk N{shape.Batch}/C{shape.InputChannels}/HW{shape.Spatial}/K{shape.OutputChannels} 1x1 " +
+            $"{shape.BlockM}x{shape.BlockN}x{shape.BlockK}/{shape.ThreadM}x{shape.ThreadN} regs={kernel.FunctionInfo.RegistersPerThread}",
+            runtime, Launch, flops);
+    }
+
     private void Report(string label, DirectPtxRuntime runtime, Action launch, long flops)
     {
         for (int i = 0; i < Warmups; i++) launch();
@@ -108,7 +132,19 @@ public sealed class DirectPtxConvolutionPerfProbe
         double median = us[Samples / 2];
         double p95 = us[(int)(Samples * 0.95)];
         double gflops = flops / (median / 1e6) / 1e9;
-        _out.WriteLine($"{label}: median={median:F1}us p95={p95:F1}us  {gflops:F0} GFLOP/s ({flops / 1e6:F0} MFLOP/launch)");
+
+        // Amortized (kernel-only): 100 launches, one sync — removes per-launch
+        // overhead so it is apples-to-apples with cuDNN CUDA-graph replay.
+        const int batch = 100;
+        var swa = Stopwatch.StartNew();
+        for (int i = 0; i < batch; i++) launch();
+        runtime.Synchronize();
+        swa.Stop();
+        double amortUs = swa.Elapsed.TotalMilliseconds * 1000.0 / batch;
+        double amortGflops = flops / (amortUs / 1e6) / 1e9;
+
+        _out.WriteLine($"{label}: median={median:F1}us p95={p95:F1}us {gflops:F0} GFLOP/s | " +
+            $"amortized={amortUs:F1}us {amortGflops:F0} GFLOP/s ({flops / 1e6:F0} MFLOP)");
     }
 }
 #endif
