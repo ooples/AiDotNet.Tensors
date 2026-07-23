@@ -14,13 +14,15 @@ public class DirectPtxScientificTests
     [Fact]
     public void ScientificCoverageManifest_AssignsEveryScopedApiExactlyOnce()
     {
-        Assert.Equal(26, DirectPtxScientificCoverageManifest.All.Count);
+        Assert.Equal(28, DirectPtxScientificCoverageManifest.All.Count);
         string[] names = DirectPtxScientificCoverageManifest.All.Select(c => c.Api).ToArray();
         Assert.Contains("CudaBackend.CosineSimilarity", names);
         Assert.Contains("CudaBackend.SphericalSoftmax", names);
         Assert.Contains("CudaBackend.NormalizeProbabilities", names);
         Assert.Contains("CudaBackend.MeasurementForward", names);
         Assert.Contains("CudaBackend.QuantumRotation", names);
+        Assert.Contains("CudaBackend.AnnComputeDistances", names);
+        Assert.Contains("CudaBackend.AnnPqDistanceTables", names);
         Assert.Contains("CudaBackend.RbfForward", names);
         Assert.Contains("CudaBackend.PairwiseDistance", names);
         Assert.Contains("CudaBackend.PairwiseDistanceSquared", names);
@@ -755,6 +757,138 @@ public class DirectPtxScientificTests
         var actual = new float[expected.Length];
         outBuf.Download<float>(actual);
         AssertVectorClose(actual, expected, 3e-3f, $"capsule {op}");
+    }
+
+    [Theory]
+    [InlineData(AnnMetric.L2)]
+    [InlineData(AnnMetric.InnerProduct)]
+    public void AnnComputeDistancesEmitter_IsThreadPerCellSerialDim(AnnMetric metric)
+    {
+        string ptx = PtxAnnComputeDistancesKernel.EmitPtx(8, 6, metric, 16, 16, 8);   // cells = 256
+        Assert.Contains(PtxAnnComputeDistancesKernel.EntryPoint, ptx);
+        Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.Contains("$ANN_CD_LOOP:", ptx);
+        Assert.Equal(metric == AnnMetric.L2 ? 1 : 0, Count(ptx, "sub.rn.f32"));   // L2 uses a-b
+        Assert.Contains("div.u32 %r3, %r2, 16", ptx);        // q = gid / numDatabase
+        Assert.Contains("rem.u32 %r4, %r2, 16", ptx);        // j = gid % numDatabase
+        Assert.Equal(0, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxAnnComputeDistancesKernel.IsSupportedShape(16, 16, 8));
+        Assert.False(PtxAnnComputeDistancesKernel.IsSupportedShape(15, 16, 8));   // 240 not mult of 256
+        Assert.False(PtxAnnComputeDistancesKernel.IsPromotedShape(16, 16, 8));
+    }
+
+    [Theory]
+    [InlineData(AnnMetric.L2)]
+    [InlineData(AnnMetric.InnerProduct)]
+    public void AnnPqDistanceTablesEmitter_IsThreadPerCellSerialSubdim(AnnMetric metric)
+    {
+        string ptx = PtxAnnPqDistanceTablesKernel.EmitPtx(8, 6, metric, 8, 4, 8, 4);   // cells = 8*4*8 = 256
+        Assert.Contains(PtxAnnPqDistanceTablesKernel.EntryPoint, ptx);
+        Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.Contains("$ANN_PQ_LOOP:", ptx);
+        Assert.Equal(metric == AnnMetric.L2 ? 1 : 0, Count(ptx, "sub.rn.f32"));
+        Assert.Contains("rem.u32 %r3, %r2, 8", ptx);         // c = gid % ksub
+        Assert.Equal(0, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxAnnPqDistanceTablesKernel.IsSupportedShape(8, 4, 8, 4));
+        Assert.False(PtxAnnPqDistanceTablesKernel.IsSupportedShape(3, 4, 5, 4));   // 60 not mult of 256
+        Assert.False(PtxAnnPqDistanceTablesKernel.IsPromotedShape(8, 4, 8, 4));
+    }
+
+    [SkippableTheory]
+    [InlineData(AnnMetric.L2)]
+    [InlineData(AnnMetric.InnerProduct)]
+    public void DriverOnlyAnnComputeDistances_MatchesOracle(AnnMetric metric)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in ann-compute-distances specialization is measured on GA10x/SM86.");
+        const int numQueries = 32, numDatabase = 16, dim = 12;   // cells = 512
+        using var kernel = new PtxAnnComputeDistancesKernel(runtime, metric, numQueries, numDatabase, dim);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20268400);
+        float[] q = Values(random, numQueries * dim, 1.0f);
+        float[] db = Values(random, numDatabase * dim, 1.0f);
+        var expected = new float[numQueries * numDatabase];
+        for (int qi = 0; qi < numQueries; qi++)
+            for (int j = 0; j < numDatabase; j++)
+            {
+                double acc = 0;
+                for (int k = 0; k < dim; k++)
+                {
+                    double a = q[qi * dim + k], b = db[j * dim + k];
+                    acc += metric == AnnMetric.InnerProduct ? a * b : (a - b) * (a - b);
+                }
+                expected[qi * numDatabase + j] = (float)acc;
+            }
+
+        using var qb = runtime.AllocateBytes((nuint)(q.Length * sizeof(float)));
+        using var dbb = runtime.AllocateBytes((nuint)(db.Length * sizeof(float)));
+        using var ob = runtime.AllocateBytes((nuint)(expected.Length * sizeof(float)));
+        qb.Upload<float>(q);
+        dbb.Upload<float>(db);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(qb, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(dbb, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(ob, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[expected.Length];
+        ob.Download<float>(actual);
+        AssertVectorClose(actual, expected, 3e-3f, $"ann compute distances {metric}");
+    }
+
+    [SkippableTheory]
+    [InlineData(AnnMetric.L2)]
+    [InlineData(AnnMetric.InnerProduct)]
+    public void DriverOnlyAnnPqDistanceTables_MatchesOracle(AnnMetric metric)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in ann-pq-distance-tables specialization is measured on GA10x/SM86.");
+        const int numQueries = 16, m = 8, ksub = 8, dsub = 6;   // cells = 1024
+        using var kernel = new PtxAnnPqDistanceTablesKernel(runtime, metric, numQueries, m, ksub, dsub);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20268500);
+        float[] q = Values(random, numQueries * m * dsub, 1.0f);
+        float[] cb = Values(random, m * ksub * dsub, 1.0f);
+        var expected = new float[numQueries * m * ksub];
+        for (int qi = 0; qi < numQueries; qi++)
+            for (int s = 0; s < m; s++)
+                for (int c = 0; c < ksub; c++)
+                {
+                    int qOff = qi * (m * dsub) + s * dsub;
+                    int cbOff = s * (ksub * dsub) + c * dsub;
+                    double acc = 0;
+                    for (int k = 0; k < dsub; k++)
+                    {
+                        double a = q[qOff + k], b = cb[cbOff + k];
+                        acc += metric == AnnMetric.InnerProduct ? a * b : (a - b) * (a - b);
+                    }
+                    expected[qi * (m * ksub) + s * ksub + c] = (float)acc;
+                }
+
+        using var qb = runtime.AllocateBytes((nuint)(q.Length * sizeof(float)));
+        using var cbb = runtime.AllocateBytes((nuint)(cb.Length * sizeof(float)));
+        using var tb = runtime.AllocateBytes((nuint)(expected.Length * sizeof(float)));
+        qb.Upload<float>(q);
+        cbb.Upload<float>(cb);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(qb, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(cbb, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(tb, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[expected.Length];
+        tb.Download<float>(actual);
+        AssertVectorClose(actual, expected, 3e-3f, $"ann pq distance tables {metric}");
     }
 
     [Fact]
@@ -1948,6 +2082,36 @@ public class DirectPtxScientificTests
                 AssertVectorClose(backend.DownloadBuffer(orb), qrExpR, 3e-3f, "quantum-rotation real route");
                 AssertVectorClose(backend.DownloadBuffer(oib), qrExpI, 3e-3f, "quantum-rotation imag route");
             }
+
+            // ANN compute distances (L2). cells = Q*DB = 32*16 = 512.
+            const int annQ = 32, annDB = 16, annDim = 12;
+            float[] annQry = Values(random, annQ * annDim, 1.0f), annDb = Values(random, annDB * annDim, 1.0f);
+            var annExp = new float[annQ * annDB];
+            for (int qi = 0; qi < annQ; qi++)
+                for (int j = 0; j < annDB; j++)
+                {
+                    double acc = 0;
+                    for (int k = 0; k < annDim; k++) { double da = annQry[qi * annDim + k] - annDb[j * annDim + k]; acc += da * da; }
+                    annExp[qi * annDB + j] = (float)acc;
+                }
+            using (var qb = backend.AllocateBuffer(annQry)) using (var dbb = backend.AllocateBuffer(annDb)) using (var o = backend.AllocateBuffer(annQ * annDB))
+            { backend.ComputeDistances(qb, dbb, o, annQ, annDB, annDim, AnnMetric.L2); n = AssertDispatched(n, "ann-compute-distances"); AssertVectorClose(backend.DownloadBuffer(o), annExp, 3e-3f, "ann-compute-distances route"); }
+
+            // ANN PQ distance tables (inner product). cells = Q*m*ksub = 16*8*8 = 1024.
+            const int pqQ = 16, pqM = 8, pqK = 8, pqD = 6;
+            float[] pqQry = Values(random, pqQ * pqM * pqD, 1.0f), pqCb = Values(random, pqM * pqK * pqD, 1.0f);
+            var pqExp = new float[pqQ * pqM * pqK];
+            for (int qi = 0; qi < pqQ; qi++)
+                for (int s = 0; s < pqM; s++)
+                    for (int cx = 0; cx < pqK; cx++)
+                    {
+                        int qOff = qi * (pqM * pqD) + s * pqD, cbOff = s * (pqK * pqD) + cx * pqD;
+                        double acc = 0;
+                        for (int k = 0; k < pqD; k++) acc += (double)pqQry[qOff + k] * pqCb[cbOff + k];
+                        pqExp[qi * (pqM * pqK) + s * pqK + cx] = (float)acc;
+                    }
+            using (var qb = backend.AllocateBuffer(pqQry)) using (var cbb = backend.AllocateBuffer(pqCb)) using (var t = backend.AllocateBuffer(pqQ * pqM * pqK))
+            { backend.PqComputeDistanceTables(qb, cbb, t, pqQ, pqM, pqK, pqD, AnnMetric.InnerProduct); n = AssertDispatched(n, "ann-pq-distance-tables"); AssertVectorClose(backend.DownloadBuffer(t), pqExp, 3e-3f, "ann-pq-distance-tables route"); }
         }
         finally
         {

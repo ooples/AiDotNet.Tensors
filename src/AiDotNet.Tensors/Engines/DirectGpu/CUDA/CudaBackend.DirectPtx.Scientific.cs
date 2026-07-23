@@ -27,6 +27,8 @@ public sealed partial class CudaBackend
     private readonly record struct SciCapsuleKey(DirectPtxCapsuleOp Op, int Batch, int InputCapsules, int InputDim, int OutputCount, int OutputDim);
     private readonly record struct SciCapsuleRoutingKey(int Batch, int InputCapsules, int OutputCapsules, int CapsuleDim);
     private readonly record struct SciQuantumRotationKey(int NumQubits, int Batch);
+    private readonly record struct SciAnnCdKey(AnnMetric Metric, int NumQueries, int NumDatabase, int Dim);
+    private readonly record struct SciAnnPqKey(AnnMetric Metric, int NumQueries, int M, int Ksub, int Dsub);
 
     private readonly DirectPtxKernelCache<SciCountKey, PtxComplexMultiplyKernel> _sciComplexMul =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
@@ -75,6 +77,10 @@ public sealed partial class CudaBackend
     private readonly DirectPtxKernelCache<SciMatVecKey, PtxMeasurementForwardKernel> _sciMeasurementForward =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<SciQuantumRotationKey, PtxQuantumRotationKernel> _sciQuantumRotation =
+        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<SciAnnCdKey, PtxAnnComputeDistancesKernel> _sciAnnComputeDistances =
+        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<SciAnnPqKey, PtxAnnPqDistanceTablesKernel> _sciAnnPqDistanceTables =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
 
     private long _sciDispatchCount;
@@ -458,6 +464,38 @@ public sealed partial class CudaBackend
                 () => new PtxQuantumRotationKernel(_directPtxRuntime!, numQubits, batchSize));
             Launch5(k.Blueprint, stateReal, stateImag, outReal, outImag, angles,
                 (vsr, vsi, vor, voi, va) => k.Launch(vsr, vsi, vor, voi, va));
+        });
+    }
+
+    internal bool TryDirectPtxAnnComputeDistances(
+        IGpuBuffer queries, IGpuBuffer database, IGpuBuffer distances,
+        int numQueries, int numDatabase, int dim, AnnMetric metric)
+    {
+        if (!ScientificGateOpen || !PtxAnnComputeDistancesKernel.IsSupportedShape(numQueries, numDatabase, dim)) return Fail("ann-compute-distances");
+        if (queries.SizeInBytes != checked((long)numQueries * dim * sizeof(float)) ||
+            database.SizeInBytes != checked((long)numDatabase * dim * sizeof(float)) ||
+            distances.SizeInBytes != checked((long)numQueries * numDatabase * sizeof(float))) return Fail("ann-compute-distances-extent");
+        return SciDispatch(() =>
+        {
+            var k = _sciAnnComputeDistances.GetOrAdd(new SciAnnCdKey(metric, numQueries, numDatabase, dim),
+                () => new PtxAnnComputeDistancesKernel(_directPtxRuntime!, metric, numQueries, numDatabase, dim));
+            Launch3(k.Blueprint, queries, database, distances, (vq, vd, vo) => k.Launch(vq, vd, vo));
+        });
+    }
+
+    internal bool TryDirectPtxAnnPqDistanceTables(
+        IGpuBuffer queries, IGpuBuffer codebooks, IGpuBuffer tables,
+        int numQueries, int m, int ksub, int dsub, AnnMetric metric)
+    {
+        if (!ScientificGateOpen || !PtxAnnPqDistanceTablesKernel.IsSupportedShape(numQueries, m, ksub, dsub)) return Fail("ann-pq-distance-tables");
+        if (queries.SizeInBytes != checked((long)numQueries * m * dsub * sizeof(float)) ||
+            codebooks.SizeInBytes != checked((long)m * ksub * dsub * sizeof(float)) ||
+            tables.SizeInBytes != checked((long)numQueries * m * ksub * sizeof(float))) return Fail("ann-pq-distance-tables-extent");
+        return SciDispatch(() =>
+        {
+            var k = _sciAnnPqDistanceTables.GetOrAdd(new SciAnnPqKey(metric, numQueries, m, ksub, dsub),
+                () => new PtxAnnPqDistanceTablesKernel(_directPtxRuntime!, metric, numQueries, m, ksub, dsub));
+            Launch3(k.Blueprint, queries, codebooks, tables, (vq, vc, vt) => k.Launch(vq, vc, vt));
         });
     }
 

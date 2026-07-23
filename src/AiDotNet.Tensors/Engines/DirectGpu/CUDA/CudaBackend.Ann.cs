@@ -26,6 +26,7 @@ public sealed partial class CudaBackend : IAnnBackend
         long totalLong = (long)numQueries * numDatabase;
         if (totalLong > int.MaxValue)
             throw new OverflowException($"ANN distance matrix total {totalLong} exceeds Int32.MaxValue.");
+        if (TryDirectPtxAnnComputeDistances(queries, database, distances, numQueries, numDatabase, dim, metric)) return;
         var kernel = ResolveAnnKernel("ann_compute_distances");
         using var _ = PushContext();
         int total = (int)totalLong;
@@ -60,6 +61,7 @@ public sealed partial class CudaBackend : IAnnBackend
         long totalLong = (long)numQueries * m * ksub;
         if (totalLong > int.MaxValue)
             throw new OverflowException($"ANN PQ table total {totalLong} exceeds Int32.MaxValue.");
+        if (TryDirectPtxAnnPqDistanceTables(queries, codebooks, tables, numQueries, m, ksub, dsub, metric)) return;
         var kernel = ResolveAnnKernel("ann_pq_distance_tables");
         using var _ = PushContext();
         int total = (int)totalLong;
