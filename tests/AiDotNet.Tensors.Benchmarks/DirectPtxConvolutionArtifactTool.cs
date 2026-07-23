@@ -50,6 +50,10 @@ internal static class DirectPtxConvolutionArtifactTool
         using (var kernel = new PtxFusedConv2DNchwK1Kernel(runtime))
             Export(kernel.Audit, outputDirectory, exported, manifest);
 
+        // The promoted register-blocked ResNet c64 1x1 specialization (beats cuDNN 1.60x).
+        using (var reg = new PtxConv2DNchwK1RegBlockedKernel(runtime, RegBlockedC64))
+            Export(reg.Audit, outputDirectory, exported, manifest);
+
         foreach (string cubinPath in Directory.GetFiles(
                      outputDirectory, "*.cubin", SearchOption.TopDirectoryOnly))
         {
@@ -148,15 +152,25 @@ internal static class DirectPtxConvolutionArtifactTool
             " distinct content-addressed SM86 cubin(s).");
     }
 
+    // The exact promoted register-blocked specialization: ResNet c64 1x1
+    // (N32/C64/56x56/K64), BM64/BN64/BK16, TM4/TN4.
+    private static readonly Conv2DRegBlockShape RegBlockedC64 =
+        new(32, 64, 64, 3136, 64, 64, 16, 4, 4);
+
     private static IReadOnlyList<ExpectedArtifact> CreateExpectedArtifacts()
     {
         var expected = new List<ExpectedArtifact>();
         string ptx = PtxFusedConv2DNchwK1Kernel.EmitPtx(8, 6);
-        string sourceKey = DirectPtxCubinArtifactCache.ComputeSourceKey(ptx, 8, 6);
         expected.Add(new ExpectedArtifact(
             PtxFusedConv2DNchwK1Kernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere).Id,
             DirectPtxCubinArtifactCache.ComputePtxSha256(ptx),
-            sourceKey));
+            DirectPtxCubinArtifactCache.ComputeSourceKey(ptx, 8, 6)));
+
+        string regPtx = PtxConv2DNchwK1RegBlockedKernel.EmitPtx(8, 6, RegBlockedC64);
+        expected.Add(new ExpectedArtifact(
+            PtxConv2DNchwK1RegBlockedKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, RegBlockedC64).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(regPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(regPtx, 8, 6)));
         return expected;
     }
 
