@@ -13,6 +13,25 @@ class Program
 
     static void Main(string[] args)
     {
+        // GPU-free cubin generation and verification for the layout family.
+        if (args.Length > 0 && args[0] == "--generate-direct-ptx-layout-cubins")
+        {
+            Environment.ExitCode = DirectPtxOfflineCubinTool.Generate(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-layout-cubins")
+        {
+            Environment.ExitCode = DirectPtxOfflineCubinTool.Verify(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-layout-sass")
+        {
+            Environment.ExitCode = DirectPtxOfflineCubinTool.AuditSass(args);
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--direct-ptx-attention")
         {
             DirectPtxAttentionExperiment.Run();
