@@ -14569,6 +14569,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void ComplexMultiply(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int numPairs)
     {
         if (numPairs <= 0) return;
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxComplexMultiply(a, b, output, numPairs))
+            return;
+#endif
         if (numPairs * 2 > a.Size || numPairs * 2 > b.Size || numPairs * 2 > output.Size)
             throw new ArgumentException($"numPairs ({numPairs}) requires {numPairs * 2} elements but buffer sizes are a={a.Size}, b={b.Size}, out={output.Size}.");
         if (!_kernelCache.TryGetValue("complex_multiply", out var kernel))

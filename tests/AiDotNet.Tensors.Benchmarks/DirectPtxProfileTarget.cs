@@ -264,6 +264,28 @@ internal static class DirectPtxProfileTarget
         GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-qkv-rope-cache-end");
     }
 
+    internal static void RunComplexMultiply()
+    {
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-complex-multiply-start");
+        using var runtime = new DirectPtxRuntime();
+        foreach (int numPairs in new[] { 65536, 262144, 1048576, 4194304 })
+        {
+            using var kernel = new PtxFusedComplexMultiplyF32Kernel(runtime, numPairs);
+            using var left = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+            using var right = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+            using var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+            left.Upload<float>(new float[numPairs * 2]);
+            right.Upload<float>(new float[numPairs * 2]);
+            kernel.Launch(
+                DirectPtxTensorView.CreateOwned(left, kernel.Blueprint.Tensors[0]),
+                DirectPtxTensorView.CreateOwned(right, kernel.Blueprint.Tensors[1]),
+                DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[2]));
+            runtime.Synchronize();
+            Console.WriteLine(kernel.Audit.ToJson());
+        }
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-complex-multiply-end");
+    }
+
     internal static void VerifyNcuCsv(string path)
     {
         DirectPtxProfilerEvidence evidence = DirectPtxProfilerEvidence.FromNcuCsv(path);

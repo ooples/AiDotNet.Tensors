@@ -13,6 +13,25 @@ class Program
 
     static void Main(string[] args)
     {
+        // GPU-free cubin generation and verification for the spectral family.
+        if (args.Length > 0 && args[0] == "--generate-direct-ptx-spectral-cubins")
+        {
+            Environment.ExitCode = DirectPtxSpectralCubinTool.Generate(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-spectral-cubins")
+        {
+            Environment.ExitCode = DirectPtxSpectralCubinTool.Verify(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-spectral-sass")
+        {
+            Environment.ExitCode = DirectPtxSpectralCubinTool.AuditSass(args);
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--direct-ptx-attention")
         {
             DirectPtxAttentionExperiment.Run();
@@ -73,6 +92,12 @@ class Program
             DirectPtxQkvRopeCacheExperiment.Run(runs, includeExternal);
             return;
         }
+        if (args.Length > 0 && args[0] == "--direct-ptx-complex-multiply")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxComplexMultiplyExperiment.Run(runs);
+            return;
+        }
         if (args.Length > 0 && args[0] == "--direct-ptx-residual-rmsnorm")
         {
             DirectPtxResidualRmsNormExperiment.Run();
@@ -116,6 +141,11 @@ class Program
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-qkv-rope-cache")
         {
             DirectPtxProfileTarget.RunQkvRopeCache();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-complex-multiply")
+        {
+            DirectPtxProfileTarget.RunComplexMultiply();
             return;
         }
         if (args.Length > 1 && args[0] == "--direct-ptx-verify-ncu")

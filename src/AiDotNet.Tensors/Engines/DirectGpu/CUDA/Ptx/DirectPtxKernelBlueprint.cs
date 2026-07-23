@@ -44,6 +44,20 @@ internal static class DirectPtxArchitecture
     /// </summary>
     internal static bool HasValidatedQkvRopeCache(int major, int minor) =>
         (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The first interleaved complex-multiply candidate is admitted only for
+    /// the exact GA102/SM86 validation domain.
+    /// </summary>
+    internal static bool HasValidatedComplexMultiply(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The complex conjugate and magnitude specializations are measured only on
+    /// GA102/SM86, matching their complex-multiply sibling.
+    /// </summary>
+    internal static bool HasValidatedComplexUnary(int major, int minor) =>
+        (major, minor) == (8, 6);
 }
 
 internal enum DirectPtxExtentMode
