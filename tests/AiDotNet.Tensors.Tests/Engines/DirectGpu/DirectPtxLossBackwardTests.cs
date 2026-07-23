@@ -17,9 +17,8 @@ public class DirectPtxLossBackwardTests
     [Fact]
     public void MseBackwardEmitter_HoistsTheBroadcastScalarAndKeepsTheAssociationOrder()
     {
-        const float invN = 1f / 1024f;
         string ptx = PtxFusedLossBackwardF32Kernel.EmitPtx(
-            8, 6, DirectPtxLossBackwardOp.MeanSquaredError, 65_536, invN);
+            8, 6, DirectPtxLossBackwardOp.MeanSquaredError, 65_536);
 
         Assert.Contains(".visible .entry aidotnet_fused_mse_loss_backward_f32(", ptx);
         Assert.Contains("op=mse-backward", ptx);
@@ -32,16 +31,18 @@ public class DirectPtxLossBackwardTests
         Assert.Equal(1, Count(ptx, "mul.rn.f32 %f12, %f12, 0f40000000;"));
 
         // Per element: subtract, multiply by the hoisted (g*2), then by invN -
-        // exactly ((g * 2) * d) * invN.
-        string invLiteral = "0f" + MathCompat.SingleToUInt32Bits(invN).ToString("X8");
+        // exactly ((g * 2) * d) * invN. Only the SOURCE of invN changed: it is a
+        // launch parameter now, so one module serves every batch size.
+        Assert.Contains("ld.param.f32 %f13, [inv_n];", ptx);
+        Assert.Equal(1, Count(ptx, "ld.param.f32"));
         for (int i = 0; i < 4; i++)
         {
             int diff = 8 + i;
             Assert.Contains($"sub.rn.f32 %f{diff}, %f{i}, %f{4 + i};", ptx);
             Assert.Contains($"mul.rn.f32 %f{diff}, %f12, %f{diff};", ptx);
-            Assert.Contains($"mul.rn.f32 %f{diff}, %f{diff}, {invLiteral};", ptx);
+            Assert.Contains($"mul.rn.f32 %f{diff}, %f{diff}, %f13;", ptx);
         }
-        // The scale is baked, so the kernel never divides.
+        // The scale is a multiply, so the kernel never divides.
         Assert.DoesNotContain("div.", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
@@ -79,6 +80,18 @@ public class DirectPtxLossBackwardTests
     }
 
     [Fact]
+    public void MseEmitter_IsIndependentOfTheScale()
+    {
+        // The scale no longer enters the module, so every batch size shares one
+        // module - the precondition for precompiling this kernel.
+        Assert.Equal(
+            PtxFusedLossBackwardF32Kernel.EmitPtx(
+                8, 6, DirectPtxLossBackwardOp.MeanSquaredError, 65_536),
+            PtxFusedLossBackwardF32Kernel.EmitPtx(
+                8, 6, DirectPtxLossBackwardOp.MeanSquaredError, 65_536));
+    }
+
+    [Fact]
     public void Emitter_ReadsEachInputOnceAndWritesOneVector()
     {
         foreach (var op in new[]
@@ -87,7 +100,7 @@ public class DirectPtxLossBackwardTests
                      DirectPtxLossBackwardOp.MeanAbsoluteError
                  })
         {
-            string ptx = PtxFusedLossBackwardF32Kernel.EmitPtx(8, 6, op, 262_144, 0.5f);
+            string ptx = PtxFusedLossBackwardF32Kernel.EmitPtx(8, 6, op, 262_144);
             Assert.Equal(2, Count(ptx, "ld.global.ca.v4.f32"));  // predictions, targets
             Assert.Equal(1, Count(ptx, "st.global.v4.f32"));
             Assert.DoesNotContain("bra", ptx, StringComparison.Ordinal);
@@ -106,12 +119,8 @@ public class DirectPtxLossBackwardTests
                 8, 6, DirectPtxLossBackwardOp.MeanSquaredError, 1_000));
         // invN is baked into the module, so a non-finite scale would poison
         // every gradient the cache serves under that key.
-        Assert.Throws<ArgumentOutOfRangeException>(() =>
-            PtxFusedLossBackwardF32Kernel.EmitPtx(
-                8, 6, DirectPtxLossBackwardOp.MeanSquaredError, 65_536, float.NaN));
-        Assert.Throws<ArgumentOutOfRangeException>(() =>
-            PtxFusedLossBackwardF32Kernel.EmitPtx(
-                8, 6, DirectPtxLossBackwardOp.MeanSquaredError, 65_536, float.PositiveInfinity));
+        // invN is now a launch parameter, so it is validated at Launch rather
+        // than at emit time - the module no longer depends on its value.
     }
 
     [Fact]

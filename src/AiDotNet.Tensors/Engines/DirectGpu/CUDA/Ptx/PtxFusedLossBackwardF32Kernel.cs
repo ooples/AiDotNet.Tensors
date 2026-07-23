@@ -89,7 +89,7 @@ internal sealed class PtxFusedLossBackwardF32Kernel : IDisposable
         BlockThreads = blockThreads;
         Blueprint = CreateBlueprint(runtime.ArchitectureFamily, op, size, blockThreads);
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
-            op, size, invN, blockThreads);
+            op, size, blockThreads);
         _module = runtime.LoadModule(Ptx);
         _function = _module.GetFunction(EntryPointFor(op), out DirectPtxFunctionInfo info);
         int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
@@ -107,8 +107,10 @@ internal sealed class PtxFusedLossBackwardF32Kernel : IDisposable
         DirectPtxTensorView predictions,
         DirectPtxTensorView targets,
         DirectPtxTensorView gradInput,
-        DirectPtxTensorView? gradOutput = null)
+        DirectPtxTensorView? gradOutput = null,
+        float invN = 1f)
     {
+        ValidateInvN(Op, invN);
         bool needsGradOutput = Op == DirectPtxLossBackwardOp.MeanSquaredError;
         if (needsGradOutput && !gradOutput.HasValue)
             throw new ArgumentException(
@@ -135,13 +137,15 @@ internal sealed class PtxFusedLossBackwardF32Kernel : IDisposable
         IntPtr targetsPointer = targets.Pointer;
         IntPtr gradInputPointer = gradInput.Pointer;
 
-        void** arguments = stackalloc void*[4];
+        void** arguments = stackalloc void*[5];
         int argumentCount = 0;
         if (needsGradOutput)
             arguments[argumentCount++] = &gradOutputPointer;
         arguments[argumentCount++] = &predictionsPointer;
         arguments[argumentCount++] = &targetsPointer;
-        arguments[argumentCount] = &gradInputPointer;
+        arguments[argumentCount++] = &gradInputPointer;
+        if (needsGradOutput)
+            arguments[argumentCount] = &invN;
 
         _module.Launch(
             _function,
@@ -153,18 +157,21 @@ internal sealed class PtxFusedLossBackwardF32Kernel : IDisposable
 
     public void Dispose() => _module.Dispose();
 
+    /// <summary>
+    /// Emits the module. Only the operator and the SHAPE are baked; the MSE
+    /// scale arrives as a launch parameter, so one module serves every batch
+    /// size and the key space stays finite.
+    /// </summary>
     internal static string EmitPtx(
         int ccMajor,
         int ccMinor,
         DirectPtxLossBackwardOp op,
         int size,
-        float invN = 1f,
         int blockThreads = DefaultBlockThreads)
     {
         ValidateOp(op);
         Validate(size);
         ValidateBlockThreads(size, blockThreads);
-        ValidateInvN(op, invN);
         bool isMse = op == DirectPtxLossBackwardOp.MeanSquaredError;
         string entryPoint = EntryPointFor(op);
 
@@ -181,6 +188,11 @@ internal sealed class PtxFusedLossBackwardF32Kernel : IDisposable
         ptx.AppendLine("    .param .u64 predictions_ptr,");
         ptx.AppendLine("    .param .u64 targets_ptr,");
         ptx.AppendLine("    .param .u64 grad_input_ptr");
+        if (isMse)
+        {
+            ptx.AppendLine("    ,");
+            ptx.AppendLine("    .param .f32 inv_n");
+        }
         ptx.AppendLine(")");
         ptx.AppendLine($".maxntid {blockThreads}, 1, 1");
         ptx.AppendLine("{");
@@ -189,7 +201,7 @@ internal sealed class PtxFusedLossBackwardF32Kernel : IDisposable
         ptx.AppendLine("    .reg .b32 %r<3>;");
         ptx.AppendLine("    .reg .b64 %rd<10>;");
         // p0..p3, t0..t3, d0..d3, plus the hoisted scalar for MSE.
-        ptx.AppendLine("    .reg .f32 %f<14>;");
+        ptx.AppendLine("    .reg .f32 %f<15>;");
 
         int paramCursor = 0;
         if (isMse)
@@ -208,6 +220,7 @@ internal sealed class PtxFusedLossBackwardF32Kernel : IDisposable
             // ((g * 2) * d) * invN in the established kernel.
             ptx.AppendLine("    ld.global.ca.f32 %f12, [%rd0];");
             ptx.AppendLine("    mul.rn.f32 %f12, %f12, 0f40000000;");   // * 2.0
+            ptx.AppendLine("    ld.param.f32 %f13, [inv_n];");
         }
 
         ptx.AppendLine("    mov.u32 %r0, %ctaid.x;");
@@ -226,10 +239,10 @@ internal sealed class PtxFusedLossBackwardF32Kernel : IDisposable
             ptx.AppendLine($"    sub.rn.f32 %f{diff}, %f{i}, %f{4 + i};");
             if (isMse)
             {
-                string invLiteral = "0f" + PtxCompat.SingleToUInt32Bits(invN)
-                    .ToString("X8", System.Globalization.CultureInfo.InvariantCulture);
+                // ((g * 2) * d) * invN, association order unchanged - only the
+                // source of invN moved from a baked literal to a parameter.
                 ptx.AppendLine($"    mul.rn.f32 %f{diff}, %f12, %f{diff};");
-                ptx.AppendLine($"    mul.rn.f32 %f{diff}, %f{diff}, {invLiteral};");
+                ptx.AppendLine($"    mul.rn.f32 %f{diff}, %f{diff}, %f13;");
             }
             else
             {
