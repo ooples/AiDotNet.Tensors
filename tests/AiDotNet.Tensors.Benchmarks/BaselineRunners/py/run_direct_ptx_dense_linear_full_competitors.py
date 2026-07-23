@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Resident PyTorch CUDA eager/graph peers for issue #836 operation families.
 
-Graph rows replay a captured sequence of 1000 logical operations and normalize
-per operation, matching the .NET runner and avoiding one-node graph submission
-latency in the GPU execution comparison.
+Graph rows replay a captured sequence of 200 logical operations five times per
+sample and normalize the resulting 1000 operations, matching the .NET runner
+without creating unstable thousand-node PyTorch graphs.
 """
 
 import argparse
@@ -26,7 +26,11 @@ import torch.nn.functional as functional
 WARMUPS = 30
 SAMPLES = 101
 DEVICE_LAUNCHES = 50
-GRAPH_OPERATIONS_PER_REPLAY = 1000
+GRAPH_OPERATIONS_PER_REPLAY = 200
+GRAPH_REPLAYS_PER_SAMPLE = 5
+GRAPH_LOGICAL_OPERATIONS_PER_SAMPLE = (
+    GRAPH_OPERATIONS_PER_REPLAY * GRAPH_REPLAYS_PER_SAMPLE
+)
 
 
 def foreign_python_processes():
@@ -170,7 +174,12 @@ def divide_round_up(value, divisor):
 
 def measure_device(operation, logical_operations_per_call=1):
     warmup_calls = divide_round_up(WARMUPS, logical_operations_per_call)
-    calls_per_sample = divide_round_up(DEVICE_LAUNCHES, logical_operations_per_call)
+    minimum_operations = (
+        GRAPH_LOGICAL_OPERATIONS_PER_SAMPLE
+        if logical_operations_per_call > 1 else DEVICE_LAUNCHES
+    )
+    calls_per_sample = divide_round_up(
+        minimum_operations, logical_operations_per_call)
     logical_operations_per_sample = calls_per_sample * logical_operations_per_call
     for _ in range(warmup_calls):
         operation()
@@ -194,13 +203,23 @@ def measure_e2e(operation, logical_operations_per_call=1):
         operation()
     torch.cuda.synchronize()
     timings = []
+    minimum_operations = (
+        GRAPH_LOGICAL_OPERATIONS_PER_SAMPLE
+        if logical_operations_per_call > 1 else 1
+    )
+    calls_per_sample = divide_round_up(
+        minimum_operations, logical_operations_per_call)
+    logical_operations_per_sample = (
+        calls_per_sample * logical_operations_per_call
+    )
     for _ in range(SAMPLES):
         start = time.perf_counter_ns()
-        operation()
+        for _ in range(calls_per_sample):
+            operation()
         torch.cuda.synchronize()
         timings.append(
             (time.perf_counter_ns() - start) /
-            (1000.0 * logical_operations_per_call))
+            (1000.0 * logical_operations_per_sample))
     return summarize(timings)
 
 
@@ -442,6 +461,9 @@ def main():
         "device_name": properties.name,
         "compute_capability": f"{properties.major}.{properties.minor}",
         "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        "graph_operations_per_replay": GRAPH_OPERATIONS_PER_REPLAY,
+        "graph_replays_per_sample": GRAPH_REPLAYS_PER_SAMPLE,
+        "graph_logical_operations_per_sample": GRAPH_LOGICAL_OPERATIONS_PER_SAMPLE,
     }
     for run in range(1, args.runs + 1):
         operations = (args.only,) if args.only else CASES

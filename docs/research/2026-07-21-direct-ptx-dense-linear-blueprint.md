@@ -272,9 +272,10 @@ active blocks per SM, occupancy inputs, and the JIT log.
 ## Benchmark contract
 
 The per-process runner uses 30 warmups, 101 samples, 50 launches per eager CUDA-event
-sample, and 1000 logical operations per captured graph replay. The longer graph
-replay amortizes event and host-launch floors for sub-2-microsecond kernels without
-changing the per-operation normalization. A 64-launch tiered-JIT settling window precedes its exact allocation
+sample, and five replays of a captured 200-operation graph per sample. The 1000
+logical operations amortize event and host-launch floors for sub-2-microsecond
+kernels without relying on unstable thousand-node competitor graphs or changing
+the per-operation normalization. A 64-launch tiered-JIT settling window precedes its exact allocation
 measurement. It reports device and E2E
 mean/median/P95/P99, GFLOPS/TFLOPS, managed bytes/call, temporary device bytes,
 maximum error, registers, shared/local bytes, active blocks/SM, blueprint id,

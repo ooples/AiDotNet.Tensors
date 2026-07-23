@@ -20,7 +20,10 @@ internal static class DirectPtxDenseLinearFullExperiment
     private const int Warmups = 30;
     private const int Samples = 101;
     private const int DeviceLaunches = 50;
-    private const int GraphOperationsPerReplay = 1000;
+    private const int GraphOperationsPerReplay = 200;
+    private const int GraphReplaysPerSample = 5;
+    private const int GraphLogicalOperationsPerSample =
+        GraphOperationsPerReplay * GraphReplaysPerSample;
     private const double Tolerance = 2e-4;
     private static string _deviceFingerprint = "n/a";
 
@@ -151,6 +154,8 @@ internal static class DirectPtxDenseLinearFullExperiment
             samples = Samples,
             launches_per_device_sample = DeviceLaunches,
             graph_operations_per_replay = GraphOperationsPerReplay,
+            graph_replays_per_sample = GraphReplaysPerSample,
+            graph_logical_operations_per_sample = GraphLogicalOperationsPerSample,
             independent_runs = independentRuns
         }));
     }
@@ -869,9 +874,11 @@ internal static class DirectPtxDenseLinearFullExperiment
             backend.Synchronize();
             double graphError = error();
             Distribution graphDevice = MeasureDevice(
-                backend, GraphLaunch, GraphOperationsPerReplay);
+                backend, GraphLaunch, GraphOperationsPerReplay,
+                GraphLogicalOperationsPerSample);
             Distribution graphEndToEnd = MeasureEndToEnd(
-                backend, GraphLaunch, GraphOperationsPerReplay);
+                backend, GraphLaunch, GraphOperationsPerReplay,
+                GraphLogicalOperationsPerSample);
             long graphAllocation = MeasureAllocation(
                 backend, GraphLaunch, GraphOperationsPerReplay);
             DeviceAllocation graphTemporary =
@@ -892,10 +899,12 @@ internal static class DirectPtxDenseLinearFullExperiment
     private static Distribution MeasureDevice(
         CudaBackend backend,
         Action launch,
-        int logicalOperationsPerCall = 1)
+        int logicalOperationsPerCall = 1,
+        int minimumLogicalOperationsPerSample = DeviceLaunches)
     {
         int warmupCalls = DivideRoundUp(Warmups, logicalOperationsPerCall);
-        int callsPerSample = DivideRoundUp(DeviceLaunches, logicalOperationsPerCall);
+        int callsPerSample = DivideRoundUp(
+            minimumLogicalOperationsPerSample, logicalOperationsPerCall);
         int logicalOperationsPerSample = checked(callsPerSample * logicalOperationsPerCall);
         for (int i = 0; i < warmupCalls; i++) launch();
         backend.Synchronize();
@@ -917,20 +926,25 @@ internal static class DirectPtxDenseLinearFullExperiment
     private static Distribution MeasureEndToEnd(
         CudaBackend backend,
         Action launch,
-        int logicalOperationsPerCall = 1)
+        int logicalOperationsPerCall = 1,
+        int minimumLogicalOperationsPerSample = 1)
     {
         int warmupCalls = DivideRoundUp(Warmups, logicalOperationsPerCall);
         for (int i = 0; i < warmupCalls; i++) launch();
         backend.Synchronize();
         var values = new double[Samples];
+        int callsPerSample = DivideRoundUp(
+            minimumLogicalOperationsPerSample, logicalOperationsPerCall);
+        int logicalOperationsPerSample = checked(
+            callsPerSample * logicalOperationsPerCall);
         double scale = 1_000_000d / Stopwatch.Frequency;
         for (int sample = 0; sample < values.Length; sample++)
         {
             long start = Stopwatch.GetTimestamp();
-            launch();
+            for (int i = 0; i < callsPerSample; i++) launch();
             backend.Synchronize();
             values[sample] = (Stopwatch.GetTimestamp() - start) * scale /
-                logicalOperationsPerCall;
+                logicalOperationsPerSample;
         }
         return Summarize(values);
     }

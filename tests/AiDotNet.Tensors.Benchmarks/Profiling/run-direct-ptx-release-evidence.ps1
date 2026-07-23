@@ -214,7 +214,7 @@ function Assert-DenseLinearRow([object]$Row, [string]$Source) {
         [double]$Row.e2e_p99_us -lt [double]$Row.e2e_p95_us) {
         throw "Dense-linear evidence has non-monotonic percentiles for '$($Row.method)' in '$Source'."
     }
-    $expectedOperationsPerCall = if ([string]$Row.method -like '* graph') { 1000 } else { 1 }
+    $expectedOperationsPerCall = if ([string]$Row.method -like '* graph') { 200 } else { 1 }
     if ([int]$Row.logical_operations_per_call -ne $expectedOperationsPerCall) {
         throw "Dense-linear evidence expected logical_operations_per_call=$expectedOperationsPerCall for '$($Row.method)' in '$Source'; found '$($Row.logical_operations_per_call)'."
     }
@@ -311,7 +311,7 @@ function Write-DenseLinearMarkdown(
     $lines = [System.Collections.Generic.List[string]]::new()
     $lines.Add('# Issue #836 direct-PTX dense/linear evidence')
     $lines.Add('')
-    $lines.Add("Generated from $RunCount independent clean process runs; each cell uses at least 30 logical warmups and 101 samples. Eager samples contain 50 ordinary launches; graph samples replay one captured sequence of 1000 logical operations and normalize per operation.")
+    $lines.Add("Generated from $RunCount independent clean process runs; each cell uses at least 30 logical warmups and 101 samples. Eager samples contain 50 ordinary launches; graph samples replay one captured 200-operation sequence five times and normalize all 1000 logical operations per sample.")
     $lines.Add('This graph contract measures GPU execution inside a model-scale captured graph instead of repeatedly exposing one-node cuGraphLaunch host-submission latency. Latency columns are normalized per logical operation; rate is GEMM-equivalent TFLOPS / GFLOPS. R/S/D/L/B means registers/thread, static shared bytes, dynamic shared bytes, local bytes/thread, and active blocks/SM; T/max is launched/max threads, and PTX/SASS are driver-reported versions.')
     $lines.Add('Temporary device bytes exclude required result storage. .NET rows report logical device-allocation count/bytes, including pooled buffers; PyTorch reports raw peak growth and de-aliased result-storage bytes in the source JSONL.')
     $lines.Add('')
@@ -320,7 +320,7 @@ function Write-DenseLinearMarkdown(
     $lines.Add('| Run | OS / framework | process | GPU / UUID | SM / driver | SM limits | benchmark contract |')
     $lines.Add('|---:|---|---|---|---|---|---|')
     foreach ($environment in @($Environments | Sort-Object evidence_run)) {
-        $lines.Add("| $($environment.evidence_run) | $($environment.os) / $($environment.framework) | $($environment.process_architecture), $($environment.processor_count) logical CPUs, server GC=$($environment.server_gc) | $($environment.gpu) / $($environment.gpu_uuid) | $($environment.compute_capability) / $($environment.cuda_driver_version) | $($environment.max_threads_per_sm) threads/SM | $($environment.warmups) logical warmups, $($environment.samples) samples, eager=$($environment.launches_per_device_sample)/sample, graph=$($environment.graph_operations_per_replay)/replay |")
+        $lines.Add("| $($environment.evidence_run) | $($environment.os) / $($environment.framework) | $($environment.process_architecture), $($environment.processor_count) logical CPUs, server GC=$($environment.server_gc) | $($environment.gpu) / $($environment.gpu_uuid) | $($environment.compute_capability) / $($environment.cuda_driver_version) | $($environment.max_threads_per_sm) threads/SM | $($environment.warmups) logical warmups, $($environment.samples) samples, eager=$($environment.launches_per_device_sample)/sample, graph=$($environment.graph_operations_per_replay)x$($environment.graph_replays_per_sample)=$($environment.graph_logical_operations_per_sample)/sample |")
     }
     $pythonFingerprints = @($Rows | Where-Object {
         $null -ne $_.pytorch_version -and $null -ne $_.python_version
@@ -450,8 +450,10 @@ function Assert-DenseLinearEvidence(
             throw "Dense-linear evidence expected one environment row in '$dotnetPath'; found $($environmentRows.Count)."
         }
         $environmentRows[0] | Add-Member -NotePropertyName evidence_run -NotePropertyValue $run -Force
-        if ([int]$environmentRows[0].graph_operations_per_replay -ne 1000) {
-            throw "Dense-linear evidence expected a 1000-operation graph replay contract in '$dotnetPath'."
+        if ([int]$environmentRows[0].graph_operations_per_replay -ne 200 -or
+            [int]$environmentRows[0].graph_replays_per_sample -ne 5 -or
+            [int]$environmentRows[0].graph_logical_operations_per_sample -ne 1000) {
+            throw "Dense-linear evidence expected a 200-operation graph replay repeated five times per sample in '$dotnetPath'."
         }
         $environments.Add($environmentRows[0])
         $dotnetRows = @(Read-DenseLinearDotnetRows $dotnetPath)
@@ -565,7 +567,7 @@ function Assert-DenseLinearEvidence(
         }
         required_device_and_e2e_median_speedup = 1.10
         maximum_device_p95_ratio = 1.10
-        measurement_contract = 'Eager: 50 ordinary launches per device sample. Graph: one captured 1000-operation sequence per sample, normalized per logical operation.'
+        measurement_contract = 'Eager: 50 ordinary launches per device sample. Graph: one captured 200-operation sequence replayed five times per sample, normalized across 1000 logical operations.'
         error_tolerance_policy = 'Per-row operation-specific tolerance; 2e-3 for FP16 fused-linear Tensor-Core shapes and 2e-4 otherwise.'
         runs = $RunCount
         external_competitors_included = $IncludeExternal
