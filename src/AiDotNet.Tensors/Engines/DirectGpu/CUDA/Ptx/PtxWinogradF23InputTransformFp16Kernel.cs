@@ -151,9 +151,13 @@ internal sealed class PtxWinogradF23InputTransformFp16Kernel : IDisposable
         s.AppendLine("    ld.param.u64 %rd1, [transformed_ptr];");
         s.AppendLine("    mov.u32 %r0, %tid.x;");
         s.AppendLine("    mov.u32 %r1, %ctaid.x;");
-        s.AppendLine($"    mad.lo.u32 %r2, %r1, {I(BlockThreads)}, %r0;");   // id = c*P + pp
-        s.AppendLine($"    rem.u32 %r3, %r2, {I(p)};");                      // pp (tile index)
-        s.AppendLine($"    div.u32 %r4, %r2, {I(p)};");                      // c
+        s.AppendLine($"    mad.lo.u32 %r2, %r1, {I(BlockThreads)}, %r0;");   // id = pp*C + c
+        // Decode so consecutive threads walk consecutive channels c (the contiguous
+        // axis of the P-major V[16,P,C] store) -> coalesced fp16 stores. Threads
+        // owning consecutive tiles instead would stride the store by C*2 bytes
+        // (2-byte writes 128B apart) which made this transform ~12x slower.
+        s.AppendLine($"    rem.u32 %r4, %r2, {I(c)};");                      // c (fast index)
+        s.AppendLine($"    div.u32 %r3, %r2, {I(c)};");                      // pp (tile index)
         // decode pp -> n, ti, tj
         s.AppendLine($"    rem.u32 %r5, %r3, {I(tw)};");                     // tj
         s.AppendLine($"    div.u32 %r6, %r3, {I(tw)};");
