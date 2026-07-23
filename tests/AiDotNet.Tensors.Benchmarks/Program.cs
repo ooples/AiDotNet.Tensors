@@ -13,6 +13,25 @@ class Program
 
     static void Main(string[] args)
     {
+        // GPU-free cubin generation and verification for the loss family.
+        if (args.Length > 0 && args[0] == "--generate-direct-ptx-loss-cubins")
+        {
+            Environment.ExitCode = DirectPtxLossCubinTool.Generate(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-loss-cubins")
+        {
+            Environment.ExitCode = DirectPtxLossCubinTool.Verify(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-loss-sass")
+        {
+            Environment.ExitCode = DirectPtxLossCubinTool.AuditSass(args);
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--direct-ptx-attention")
         {
             DirectPtxAttentionExperiment.Run();
