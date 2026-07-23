@@ -154,8 +154,6 @@ internal enum DirectPtxPhysicalLayout
     Vector,
     /// <summary>Block table plus packed pages for decode attention.</summary>
     PagedKv,
-    /// <summary>Dense row-major [batch, channel, height, width].</summary>
-    Nchw,
     /// <summary>Dense output/input/spatial convolution weights [output, input, height, width].</summary>
     Oihw
 }

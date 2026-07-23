@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
@@ -150,4 +149,3 @@ public sealed partial class CudaBackend
         _directPtxConvolutionKernels.GetOrAdd(
             1, () => new PtxFusedConv2DNchwK1Kernel(_directPtxRuntime!));
 }
-#endif
