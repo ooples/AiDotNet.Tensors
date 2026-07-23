@@ -67,7 +67,7 @@ internal static class DirectPtxCubinToolCore
         {
             string ptxSha = Sha256(Encoding.UTF8.GetBytes(module.Ptx));
             string ptxPath = Path.Combine(outputDirectory, ptxSha + ".ptx");
-            string cubinPath = Path.Combine(outputDirectory, ptxSha + ".cubin");
+            string cubinPath = Path.Combine(outputDirectory, ptxSha + ".cubin.tmp");
             File.WriteAllText(ptxPath, module.Ptx);
 
             // -O3 and the exact arch are pinned so the output depends only on
@@ -103,13 +103,22 @@ internal static class DirectPtxCubinToolCore
 
             byte[] cubin = File.ReadAllBytes(cubinPath);
             ResourceUsage usage = ParseUsage(diagnostics);
+            // Name the artifact by its CONTENT, not by the PTX that produced
+            // it. Shapes that differ only in launch geometry - the cast kernels
+            // bake nothing shape-dependent into their instructions - compile to
+            // byte-identical machine code, so content naming stores one file
+            // instead of one per shape.
+            string cubinSha = Sha256(cubin);
+            string finalPath = Path.Combine(outputDirectory, cubinSha + ".cubin");
+            if (File.Exists(finalPath)) File.Delete(cubinPath);
+            else File.Move(cubinPath, finalPath);
             rows.Add(string.Join("\t",
-                module.BlueprintId, module.EntryPoint, ptxSha, Sha256(cubin),
+                module.BlueprintId, module.EntryPoint, ptxSha, cubinSha,
                 cubin.Length.ToString(CultureInfo.InvariantCulture),
                 usage.Registers.ToString(CultureInfo.InvariantCulture),
                 usage.SharedBytes.ToString(CultureInfo.InvariantCulture),
                 MaxBlocksPerSm(usage).ToString(CultureInfo.InvariantCulture),
-                ptxSha + ".cubin"));
+                cubinSha + ".cubin"));
             File.Delete(ptxPath);
         }
 
