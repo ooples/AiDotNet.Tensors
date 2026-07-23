@@ -68,7 +68,9 @@ public class DirectPtxComplexMultiplyTests
                 "CudaBackend.ComplexMultiply",
                 "CudaBackend.DeinterleaveComplex",
                 "CudaBackend.FFT",
+                "CudaBackend.IRFFT",
                 "CudaBackend.InterleaveComplex",
+                "CudaBackend.RFFT",
                 "CudaBackend.SplitComplexAdd",
                 "CudaBackend.SplitComplexConjugate",
                 "CudaBackend.SplitComplexCrossSpectral",
@@ -820,6 +822,184 @@ public class DirectPtxComplexMultiplyTests
         {
             Assert.True(Math.Abs(actualRe[k] - expectedRe[k]) <= 1e-2 * (1 + Math.Abs(expectedRe[k])));
             Assert.True(Math.Abs(actualIm[k] - expectedIm[k]) <= 1e-2 * (1 + Math.Abs(expectedIm[k])));
+        }
+    }
+
+    [Fact]
+    public void RfftPostprocessEmitter_IsGuardedCopy()
+    {
+        string ptx = PtxRfftPostprocessF32Kernel.EmitPtx(8, 6, 512);   // outLen = 257
+        Assert.Contains("exact-shape n=512 outlen=257 block=256 op=rfft-postprocess", ptx);
+        Assert.Equal(4, Count(ptx, "ld.param.u64"));
+        Assert.Contains("setp.ge.u32 %p0, %r2, 257", ptx);
+        Assert.Contains("@%p0 bra $RFFT_END", ptx);
+        Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));
+        Assert.Equal(2, Count(ptx, "st.global.f32"));
+        Assert.DoesNotContain("fma", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxRfftPostprocessF32Kernel.IsSupportedShape(512));
+        Assert.False(PtxRfftPostprocessF32Kernel.IsSupportedShape(768));   // not power of two
+        Assert.False(PtxRfftPostprocessF32Kernel.IsPromotedShape(512));
+    }
+
+    [Fact]
+    public void IrfftPreprocessEmitter_IsHermitianExpand()
+    {
+        string ptx = PtxIrfftPreprocessF32Kernel.EmitPtx(8, 6, 512);   // inLen = 257
+        Assert.Contains("exact-shape n=512 inlen=257 block=256 op=irfft-preprocess", ptx);
+        Assert.Contains("setp.ge.u32 %p0, %r2, 257", ptx);
+        Assert.Contains("@%p0 bra $IRFFT_MIRROR", ptx);
+        Assert.Contains("sub.u32 %r3, 512, %r2", ptx);      // mirrorIdx = n - idx
+        Assert.Equal(1, Count(ptx, "neg.f32"));             // conjugate the mirror lane only
+        Assert.Equal(4, Count(ptx, "ld.global.nc.f32"));    // copy path + mirror path
+        Assert.Equal(4, Count(ptx, "st.global.f32"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxIrfftPreprocessF32Kernel.IsSupportedShape(512));
+        Assert.False(PtxIrfftPreprocessF32Kernel.IsSupportedShape(384));
+        Assert.False(PtxIrfftPreprocessF32Kernel.IsPromotedShape(512));
+    }
+
+    [Fact]
+    public void ScaleInverseEmitter_IsTwoLaneMul()
+    {
+        string ptx = PtxScaleInverseF32Kernel.EmitPtx(8, 6, 512);
+        Assert.Contains("exact-shape count=512 block=256 op=scale-inverse", ptx);
+        Assert.Contains("ld.param.f32 %f0, [scale_val]", ptx);
+        Assert.Equal(2, Count(ptx, "mul.rn.f32"));
+        Assert.Equal(2, Count(ptx, "ld.global.f32"));
+        Assert.Equal(2, Count(ptx, "st.global.f32"));
+        Assert.DoesNotContain("bra", ptx, StringComparison.Ordinal);   // exact launch, no guard
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxScaleInverseF32Kernel.IsSupportedShape(512));
+        Assert.True(PtxScaleInverseF32Kernel.IsSupportedShape(1536));   // batch*n need not be a power of two
+        Assert.False(PtxScaleInverseF32Kernel.IsSupportedShape(500));   // not a multiple of 256
+        Assert.False(PtxScaleInverseF32Kernel.IsPromotedShape(512));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyRfft_MatchesRealDftOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedComplexMultiply(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The candidate is admitted only on SM86.");
+        const int n = 512, outLen = n / 2 + 1;
+        using var reverse = new PtxBitReversePermutationF32Kernel(runtime, n);
+        using var butterfly = new PtxFftButterflyF32Kernel(runtime, n);
+        using var postprocess = new PtxRfftPostprocessF32Kernel(runtime, n);
+
+        var real = new float[n];
+        var imag = new float[n];
+        var random = RandomHelper.CreateSeededRandom(20261201);
+        for (int i = 0; i < n; i++) { real[i] = (float)(random.NextDouble() * 2 - 1); imag[i] = 0f; }
+
+        var expectedRe = new double[outLen];
+        var expectedIm = new double[outLen];
+        for (int k = 0; k < outLen; k++)
+        {
+            double sr = 0, si = 0;
+            for (int t = 0; t < n; t++)
+            {
+                double angle = -2.0 * Math.PI * k * t / n;
+                sr += real[t] * Math.Cos(angle);
+                si += real[t] * Math.Sin(angle);
+            }
+            expectedRe[k] = sr; expectedIm[k] = si;
+        }
+
+        using var reB = runtime.AllocateBytes(reverse.Blueprint.Tensors[0].RequiredBytes);
+        using var imB = runtime.AllocateBytes(reverse.Blueprint.Tensors[1].RequiredBytes);
+        using var outReB = runtime.AllocateBytes(postprocess.Blueprint.Tensors[2].RequiredBytes);
+        using var outImB = runtime.AllocateBytes(postprocess.Blueprint.Tensors[3].RequiredBytes);
+        reB.Upload<float>(real); imB.Upload<float>(imag);
+
+        reverse.Launch(
+            DirectPtxTensorView.CreateOwned(reB, reverse.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(imB, reverse.Blueprint.Tensors[1]));
+        for (int stride = 2; stride <= n; stride <<= 1)
+            butterfly.Launch(
+                DirectPtxTensorView.CreateOwned(reB, butterfly.Blueprint.Tensors[0]),
+                DirectPtxTensorView.CreateOwned(imB, butterfly.Blueprint.Tensors[1]), stride, 0);
+        postprocess.Launch(
+            DirectPtxTensorView.CreateOwned(reB, postprocess.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(imB, postprocess.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(outReB, postprocess.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(outImB, postprocess.Blueprint.Tensors[3]));
+        runtime.Synchronize();
+
+        var actualRe = new float[outLen];
+        var actualIm = new float[outLen];
+        outReB.Download<float>(actualRe); outImB.Download<float>(actualIm);
+        for (int k = 0; k < outLen; k++)
+        {
+            Assert.True(Math.Abs(actualRe[k] - expectedRe[k]) <= 1e-2 * (1 + Math.Abs(expectedRe[k])));
+            Assert.True(Math.Abs(actualIm[k] - expectedIm[k]) <= 1e-2 * (1 + Math.Abs(expectedIm[k])));
+        }
+    }
+
+    [SkippableFact]
+    public void DriverOnlyIrfft_RecoversRealSignal()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedComplexMultiply(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The candidate is admitted only on SM86.");
+        const int n = 512, inLen = n / 2 + 1;
+        using var preprocess = new PtxIrfftPreprocessF32Kernel(runtime, n);
+        using var reverse = new PtxBitReversePermutationF32Kernel(runtime, n);
+        using var butterfly = new PtxFftButterflyF32Kernel(runtime, n);
+        using var scale = new PtxScaleInverseF32Kernel(runtime, n);
+
+        // Original real signal and its packed positive-frequency spectrum (double DFT).
+        var signal = new float[n];
+        var random = RandomHelper.CreateSeededRandom(20261202);
+        for (int t = 0; t < n; t++) signal[t] = (float)(random.NextDouble() * 2 - 1);
+        var packedRe = new float[inLen];
+        var packedIm = new float[inLen];
+        for (int k = 0; k < inLen; k++)
+        {
+            double sr = 0, si = 0;
+            for (int t = 0; t < n; t++)
+            {
+                double angle = -2.0 * Math.PI * k * t / n;
+                sr += signal[t] * Math.Cos(angle);
+                si += signal[t] * Math.Sin(angle);
+            }
+            packedRe[k] = (float)sr; packedIm[k] = (float)si;
+        }
+
+        using var inReB = runtime.AllocateBytes(preprocess.Blueprint.Tensors[0].RequiredBytes);
+        using var inImB = runtime.AllocateBytes(preprocess.Blueprint.Tensors[1].RequiredBytes);
+        using var fullReB = runtime.AllocateBytes(preprocess.Blueprint.Tensors[2].RequiredBytes);
+        using var fullImB = runtime.AllocateBytes(preprocess.Blueprint.Tensors[3].RequiredBytes);
+        inReB.Upload<float>(packedRe); inImB.Upload<float>(packedIm);
+
+        preprocess.Launch(
+            DirectPtxTensorView.CreateOwned(inReB, preprocess.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(inImB, preprocess.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(fullReB, preprocess.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(fullImB, preprocess.Blueprint.Tensors[3]));
+        reverse.Launch(
+            DirectPtxTensorView.CreateOwned(fullReB, reverse.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(fullImB, reverse.Blueprint.Tensors[1]));
+        for (int stride = 2; stride <= n; stride <<= 1)
+            butterfly.Launch(
+                DirectPtxTensorView.CreateOwned(fullReB, butterfly.Blueprint.Tensors[0]),
+                DirectPtxTensorView.CreateOwned(fullImB, butterfly.Blueprint.Tensors[1]), stride, 1);
+        scale.Launch(
+            DirectPtxTensorView.CreateOwned(fullReB, scale.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(fullImB, scale.Blueprint.Tensors[1]), 1f / n);
+        runtime.Synchronize();
+
+        var recoveredRe = new float[n];
+        var recoveredIm = new float[n];
+        fullReB.Download<float>(recoveredRe); fullImB.Download<float>(recoveredIm);
+        for (int t = 0; t < n; t++)
+        {
+            Assert.True(Math.Abs(recoveredRe[t] - signal[t]) <= 1e-2 * (1 + Math.Abs(signal[t])));
+            Assert.True(Math.Abs(recoveredIm[t]) <= 1e-2);
         }
     }
 

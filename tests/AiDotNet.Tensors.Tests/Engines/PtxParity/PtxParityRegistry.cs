@@ -163,6 +163,25 @@ public static class PtxParityRegistry
             "TOLERANCE-based, not bit-exact. The full transform launches this stage log2(n) times with " +
             "doubling strides after the bit-reverse pass. Converts to ThreeWayParity (with tolerance) when " +
             "the SM86 fp64-oracle FFT run lands; until then unpromoted and fail-closed."),
+
+        new PtxParitySpec("PtxRfftPostprocessF32Kernel", PtxParityStatus.Deferred,
+            "RFFT positive-frequency extraction, fp32 (#850) - CudaBackend.RFFT",
+            "one module per power-of-two length; copies the first n/2+1 bins of the full complex spectrum " +
+            "into the packed real-FFT output. It is pure data movement, so the spec is bit-exact including " +
+            "NaN payloads and signed zeros; a single guard drops lanes past the (non-power-of-two) output " +
+            "length. Converts to ThreeWayParity when the SM86 fp64-oracle RFFT run lands; until then unpromoted."),
+        new PtxParitySpec("PtxIrfftPreprocessF32Kernel", PtxParityStatus.Deferred,
+            "IRFFT Hermitian reconstruction, fp32 (#850) - CudaBackend.IRFFT (stage 1)",
+            "one module per power-of-two length; the lower half is copied and the upper half is filled by " +
+            "conjugate symmetry (fullReal[i]=inReal[n-i], fullImag[i]=-inImag[n-i]) via a neg.f32 sign-bit " +
+            "flip, so the spec is bit-exact including NaN payloads and signed zeros. Converts to " +
+            "ThreeWayParity when the SM86 fp64-oracle IRFFT run lands; until then unpromoted and fail-closed."),
+        new PtxParitySpec("PtxScaleInverseF32Kernel", PtxParityStatus.Deferred,
+            "inverse-FFT normalization, fp32 (#850) - CudaBackend.IRFFT (final scale)",
+            "one module per element count; multiplies both split lanes in place by a per-launch .param .f32 " +
+            "reciprocal transform length (1/n). Each lane is a single mul.rn, so the spec is bit-exact " +
+            "against x*scale. Also normalizes batched inverse transforms (batch*n elements scaled by 1/n). " +
+            "Converts to ThreeWayParity when the SM86 run lands; until then unpromoted and fail-closed."),
     };
 
     private static readonly Dictionary<string, PtxParitySpec> ByKernel =
