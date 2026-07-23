@@ -106,6 +106,18 @@ public static class PtxParityRegistry
             "power sum; an fma would be more accurate and would disagree, so the spec must assert " +
             "equality rather than a tolerance. Converts to ThreeWayParity when the SM86 fp64-oracle run " +
             "lands; until then the shapes stay unpromoted and fail closed."),
+
+        new PtxParitySpec("PtxSplitComplexBinaryF32Kernel", PtxParityStatus.Deferred,
+            "split-buffer complex multiply and add, fp32 (#850) - CudaBackend.SplitComplexMultiply, CudaBackend.SplitComplexAdd",
+            "one module per operator over the four exact element counts. Multiply forms ar*br-ai*bi and " +
+            "ar*bi+ai*br with the same multiply-then-fma contraction the interleaved multiply kernel " +
+            "uses, matching the reference's default fused evaluation; add is two add.rn lanes. Converts " +
+            "to ThreeWayParity when the SM86 fp64-oracle run lands; until then unpromoted and fail-closed."),
+        new PtxParitySpec("PtxSplitComplexConjugateF32Kernel", PtxParityStatus.Deferred,
+            "split-buffer complex conjugate, fp32 (#850) - CudaBackend.SplitComplexConjugate",
+            "one module over the four exact element counts. The real lane is copied and the imaginary " +
+            "lane is a neg.f32 sign-bit flip, so the spec is bit-exact and must include NaN payloads and " +
+            "both signed zeros. Converts to ThreeWayParity when the SM86 run lands; until then unpromoted."),
     };
 
     private static readonly Dictionary<string, PtxParitySpec> ByKernel =
