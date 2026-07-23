@@ -84,6 +84,7 @@ public class DirectPtxComplexMultiplyTests
                 "CudaBackend.IstftNormalize",
                 "CudaBackend.MelFilterbankApply",
                 "CudaBackend.MfccLog1p",
+                "CudaBackend.PacPhaseBinMi",
                 "CudaBackend.PhaseVocoder",
                 "CudaBackend.PolarToComplex",
                 "CudaBackend.PowerToDb",
@@ -2269,6 +2270,88 @@ public class DirectPtxComplexMultiplyTests
         {
             Assert.True(Math.Abs(actRe[i] - expRe[i]) <= 1e-4 * (1 + Math.Abs(expRe[i])));
             Assert.True(Math.Abs(actIm[i] - expIm[i]) <= 1e-4 * (1 + Math.Abs(expIm[i])));
+        }
+    }
+
+    [Fact]
+    public void PacPhaseBinMiEmitter_IsSharedHistogramReduction()
+    {
+        string ptx = PtxPacPhaseBinMiF32Kernel.EmitPtx(8, 6, 4, 1000, 5, 2);
+        Assert.Contains("op=pac-phase-bin-mi", ptx);
+        Assert.Contains(".shared .align 4 .b32 pacHist[36]", ptx);   // 18 sums + 18 counts
+        Assert.Contains("bar.sync 0", ptx);
+        Assert.Contains("cvt.rzi.s32.f32 %r6, %f4", ptx);            // bin = (int)fbin
+        Assert.Contains("min.s32 %r6, %r6, 17", ptx);                // clamp to NUM_PHASE_BINS-1
+        Assert.Contains("$PAC_HIST:", ptx);
+        Assert.Contains("$PAC_ENT:", ptx);
+        Assert.Contains("lg2.approx.f32", ptx);
+        Assert.Contains("mad.lo.u32 %r13, %r1, 5, 2", ptx);          // b*numGammaBands + gammaIdx
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxPacPhaseBinMiF32Kernel.IsSupportedShape(4, 1000, 5, 2));
+        Assert.False(PtxPacPhaseBinMiF32Kernel.IsSupportedShape(4, 1000, 5, 5));   // gammaIdx out of range
+        Assert.False(PtxPacPhaseBinMiF32Kernel.IsPromotedShape(4, 1000, 5, 2));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyPacPhaseBinMi_MatchesDoubleOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedComplexUnary(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The candidate is admitted only on SM86.");
+        const int batch = 4, numSamples = 2000, numGammaBands = 5, gammaIdx = 2, bins = 18;
+        using var kernel = new PtxPacPhaseBinMiF32Kernel(runtime, batch, numSamples, numGammaBands, gammaIdx);
+        var theta = new float[batch * numSamples];
+        var gamma = new float[numGammaBands * batch * numSamples];
+        var random = RandomHelper.CreateSeededRandom(20270901);
+        for (int i = 0; i < theta.Length; i++) theta[i] = (float)(random.NextDouble() * 2 * Math.PI - Math.PI);
+        for (int i = 0; i < gamma.Length; i++) gamma[i] = (float)random.NextDouble();
+
+        var expected = new float[batch * numGammaBands];
+        for (int b = 0; b < batch; b++)
+        {
+            var sum = new double[bins];
+            var cnt = new double[bins];
+            int sampleOff = b * numSamples, gammaOff = (gammaIdx * batch + b) * numSamples;
+            for (int i = 0; i < numSamples; i++)
+            {
+                double fbin = (theta[sampleOff + i] + Math.PI) / (2.0 * Math.PI) * bins;
+                int bin = (int)fbin; if (bin < 0) bin = 0; if (bin >= bins) bin = bins - 1;
+                sum[bin] += gamma[gammaOff + i]; cnt[bin] += 1;
+            }
+            double totalAmp = 0;
+            for (int k = 0; k < bins; k++) totalAmp += cnt[k] > 0 ? sum[k] / cnt[k] : 0;
+            double mi = 0;
+            if (totalAmp > 0)
+            {
+                double entropy = 0;
+                for (int k = 0; k < bins; k++)
+                {
+                    double avg = cnt[k] > 0 ? sum[k] / cnt[k] : 0;
+                    double p = avg / totalAmp;
+                    if (p > 1e-12) entropy -= p * Math.Log(p);
+                }
+                mi = (Math.Log(bins) - entropy) / Math.Log(bins);
+            }
+            expected[b * numGammaBands + gammaIdx] = (float)mi;
+        }
+
+        using var tB = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var gB = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var oB = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        tB.Upload<float>(theta); gB.Upload<float>(gamma);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(tB, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(gB, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(oB, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[batch * numGammaBands];
+        oB.Download<float>(actual);
+        for (int b = 0; b < batch; b++)
+        {
+            int idx = b * numGammaBands + gammaIdx;
+            Assert.True(Math.Abs(actual[idx] - expected[idx]) <= 5e-3 * (1 + Math.Abs(expected[idx])));
         }
     }
 

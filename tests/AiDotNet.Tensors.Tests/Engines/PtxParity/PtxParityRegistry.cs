@@ -284,6 +284,13 @@ public static class PtxParityRegistry
             "one module per element count; output=log1p(input)=ln(1+input) via lg2.approx(1+x) scaled by " +
             "ln(2). Its spec is TOLERANCE-based, not bit-exact. Converts to ThreeWayParity (with tolerance) " +
             "when the SM86 run lands; until then unpromoted and fail-closed."),
+        new PtxParitySpec("PtxPacPhaseBinMiF32Kernel", PtxParityStatus.Deferred,
+            "phase-amplitude coupling modulation index, fp32 (#850) - CudaBackend.PacPhaseBinMi",
+            "one module per (batch,numSamples,numGammaBands,gammaIdx); one 18-thread block per batch row bins " +
+            "gamma amplitude by theta phase (each thread owns one bin, order-fixed deterministic scan into " +
+            "static shared memory), then thread 0 reduces to the Tort modulation index (normalized KL-divergence " +
+            "from uniform) using lg2.approx for the natural log. Its spec is TOLERANCE-based against the fp64 " +
+            "oracle. Converts to ThreeWayParity (with tolerance) when the SM86 run lands; until then unpromoted."),
         new PtxParitySpec("PtxBispectrumGatherF32Kernel", PtxParityStatus.Deferred,
             "third-order spectral cumulant (bispectrum), fp32 (#850) - CudaBackend.BispectrumGather",
             "one module per (maxF1,maxF2,specLength); each thread forms B(f1,f2)=X(f1)*X(f2)*conj(X(f1+f2)) " +
