@@ -11955,6 +11955,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Size must be positive.");
 
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxSgdMomentum(param, gradient, velocity, learningRate, momentum, weightDecay, size))
+            return;
+#endif
+
         if (!_kernelCache.TryGetValue("sgd_momentum_update", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: sgd_momentum_update");
 

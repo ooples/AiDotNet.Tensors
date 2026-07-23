@@ -44,6 +44,22 @@ internal static class DirectPtxArchitecture
     /// </summary>
     internal static bool HasValidatedQkvRopeCache(int major, int minor) =>
         (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The fused SGD-momentum specialization is measured only on GA102/SM86.
+    /// Admitting the whole Ampere family would run PTX that was never validated
+    /// on SM80/SM87, so this pins the exact pair.
+    /// </summary>
+    internal static bool HasValidatedSgdMomentum(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The Adam update specialization is measured only on GA102/SM86. It mutates
+    /// parameters in place, so an unvalidated architecture would corrupt training
+    /// state rather than just returning a wrong value.
+    /// </summary>
+    internal static bool HasValidatedAdamUpdate(int major, int minor) =>
+        (major, minor) == (8, 6);
 }
 
 internal enum DirectPtxExtentMode

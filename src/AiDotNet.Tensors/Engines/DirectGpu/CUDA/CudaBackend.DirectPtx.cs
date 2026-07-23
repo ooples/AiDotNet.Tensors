@@ -29,6 +29,8 @@ public sealed partial class CudaBackend
         _directPtxFlashAttentionBackwardKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<DirectPtxQkvRopeCacheKey, PtxFusedQkvRopeCacheD64Kernel>
         _directPtxQkvRopeCacheKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<DirectPtxSgdMomentumKey, PtxFusedSgdMomentumF32Kernel>
+        _directPtxSgdMomentumKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private DirectPtxRuntime? _directPtxRuntime;
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
@@ -42,6 +44,7 @@ public sealed partial class CudaBackend
     private long _directPtxAttentionBackwardDispatchCount;
     private long _directPtxFlashAttentionBackwardDispatchCount;
     private long _directPtxQkvRopeCacheDispatchCount;
+    private long _directPtxSgdMomentumDispatchCount;
     internal int DirectPtxCachedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxAttentionKernels.Count; }
@@ -96,6 +99,13 @@ public sealed partial class CudaBackend
 
     internal long DirectPtxQkvRopeCacheDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxQkvRopeCacheDispatchCount);
+
+    internal bool IsDirectPtxSgdMomentumEnabled =>
+        DirectPtxFeatureGate.IsSgdMomentumEnabled && IsAvailable &&
+        DirectPtxArchitecture.HasValidatedSgdMomentum(_ccMajor, _ccMinor);
+
+    internal long DirectPtxSgdMomentumDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxSgdMomentumDispatchCount);
     internal int DirectPtxQkvRopeCacheKernelCapacity => _directPtxQkvRopeCacheKernels.Capacity;
     internal int DirectPtxQkvRopeCachePinnedKernelCount
     {
@@ -1774,6 +1784,111 @@ public sealed partial class CudaBackend
         return false;
     }
 
+    /// <summary>
+    /// Attempts an exact contiguous FP32 fused SGD-with-momentum update step.
+    /// The learning rate, momentum, and weight decay are baked into module
+    /// identity; the PTX ABI receives only param/grad/velocity pointers. Param
+    /// and velocity are updated in place.
+    /// </summary>
+    internal bool TryDirectPtxSgdMomentum(
+        IGpuBuffer param,
+        IGpuBuffer gradient,
+        IGpuBuffer velocity,
+        float learningRate,
+        float momentum,
+        float weightDecay,
+        int size)
+    {
+        if (!DirectPtxFeatureGate.IsSgdMomentumEnabled)
+        {
+            DirectPtxLastError = "sgd-momentum-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "sgd-momentum-cuda-unavailable";
+            return false;
+        }
+        if (!DirectPtxArchitecture.HasValidatedSgdMomentum(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = "sgd-momentum-architecture-not-validated";
+            return false;
+        }
+        if (!PtxFusedSgdMomentumF32Kernel.IsSupportedShape(size))
+        {
+            DirectPtxLastError = "sgd-momentum-shape-not-implemented";
+            return false;
+        }
+        if (!PtxCompat.IsFinite(learningRate) || !PtxCompat.IsFinite(momentum) ||
+            !PtxCompat.IsFinite(weightDecay))
+        {
+            DirectPtxLastError = "sgd-momentum-nonfinite-hyperparameter";
+            return false;
+        }
+        if (!PtxFusedSgdMomentumF32Kernel.IsPromotedShape(size) &&
+            !DirectPtxFeatureGate.SgdMomentumExperimentOverride)
+        {
+            DirectPtxLastError = "sgd-momentum-performance-gate-not-met";
+            return false;
+        }
+
+        long bytes = checked((long)size * sizeof(float));
+        if (param.SizeInBytes != bytes || gradient.SizeInBytes != bytes || velocity.SizeInBytes != bytes)
+        {
+            DirectPtxLastError = "sgd-momentum-physical-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            EnsureContextCurrent();
+            var key = new DirectPtxSgdMomentumKey(
+                size,
+                PtxCompat.SingleToInt32Bits(learningRate),
+                PtxCompat.SingleToInt32Bits(momentum),
+                PtxCompat.SingleToInt32Bits(weightDecay));
+            lock (_directPtxLock)
+            {
+                if (!_directPtxSgdMomentumKernels.TryGetValue(
+                    key, out PtxFusedSgdMomentumF32Kernel? kernel))
+                {
+                    if (IsStreamCapturing())
+                    {
+                        DirectPtxLastError =
+                            "Direct PTX SGD-momentum must be prewarmed before CUDA graph capture.";
+                        return false;
+                    }
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    kernel = CreateAndCacheSgdMomentumKernelSlow(key);
+                }
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(param, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(gradient, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(velocity, kernel.Blueprint.Tensors[2]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxSgdMomentumDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxFusedSgdMomentumF32Kernel CreateAndCacheSgdMomentumKernelSlow(
+        DirectPtxSgdMomentumKey key) =>
+        _directPtxSgdMomentumKernels.GetOrAdd(key, () =>
+            new PtxFusedSgdMomentumF32Kernel(
+                _directPtxRuntime!, key.Size,
+                PtxCompat.Int32BitsToSingle(key.LearningRateBits),
+                PtxCompat.Int32BitsToSingle(key.MomentumBits),
+                PtxCompat.Int32BitsToSingle(key.WeightDecayBits)));
+
     private void DisposeDirectPtxRuntime()
     {
         lock (_directPtxLock)
@@ -1786,6 +1901,7 @@ public sealed partial class CudaBackend
             _directPtxAttentionBackwardKernels.Dispose();
             _directPtxFlashAttentionBackwardKernels.Dispose();
             _directPtxQkvRopeCacheKernels.Dispose();
+            _directPtxSgdMomentumKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }
@@ -1852,5 +1968,10 @@ public sealed partial class CudaBackend
         int Heads,
         int CacheCapacity,
         int Position);
+    private readonly record struct DirectPtxSgdMomentumKey(
+        int Size,
+        int LearningRateBits,
+        int MomentumBits,
+        int WeightDecayBits);
 
 }
