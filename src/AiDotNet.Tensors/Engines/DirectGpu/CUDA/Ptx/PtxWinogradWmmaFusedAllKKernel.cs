@@ -211,8 +211,10 @@ internal sealed class PtxWinogradWmmaFusedAllKKernel : IDisposable
         s.AppendLine("P1_LOOP:");
         s.AppendLine($"    setp.ge.u32 %pr0, %r5, {I(items)};");
         s.AppendLine("    @%pr0 bra P1_DONE;");
-        s.AppendLine($"    div.u32 %r6, %r5, {I(c)};");             // tile
-        s.AppendLine($"    rem.u32 %r7, %r5, {I(c)};");             // c
+        // tile-fast decode: consecutive threads walk consecutive tiles so their
+        // input patch reads are ~2 elements apart (coalesced) instead of stride H*W.
+        s.AppendLine($"    rem.u32 %r6, %r5, {I(TileP)};");         // tile (fast)
+        s.AppendLine($"    div.u32 %r7, %r5, {I(TileP)};");         // c
         s.AppendLine($"    add.u32 %r8, %r3, %r6;");                // global tile p
         s.AppendLine($"    rem.u32 %r9, %r8, {I(tw)};");
         s.AppendLine($"    div.u32 %r10, %r8, {I(tw)};");
