@@ -209,6 +209,20 @@ public static class PtxParityRegistry
             "(width) with a cos.approx/sin.approx twiddle, so its spec is TOLERANCE-based, not bit-exact. A 2D " +
             "FFT launches this stage log2(height) times with doubling strides after the column bit-reverse " +
             "pass. Converts to ThreeWayParity (with tolerance) when the SM86 run lands; until then unpromoted."),
+
+        new PtxParitySpec("PtxBatchedFftColsBitReverseF32Kernel", PtxParityStatus.Deferred,
+            "batched column FFT bit-reversal, fp32 (#850) - CudaBackend.BatchedFFT2D (column pass, stage 1)",
+            "one module per (height,width,images); adds an image dimension (gridDim.y, imgOffset=img*height*width) " +
+            "to the strided column bit-reverse so columns never cross image boundaries. The batched 2D FFT's row " +
+            "pass is one contiguous batched FFT over all images*height rows; this is the per-image column pass. It " +
+            "is pure data movement, so the spec is bit-exact including NaN payloads and signed zeros. Converts to " +
+            "ThreeWayParity when the SM86 fp64-oracle batched-FFT2D run lands; until then unpromoted and fail-closed."),
+        new PtxParitySpec("PtxBatchedFftColsButterflyF32Kernel", PtxParityStatus.Deferred,
+            "batched column FFT radix-2 butterfly stage, fp32 (#850) - CudaBackend.BatchedFFT2D (column pass, stage 2)",
+            "one module per (height,width,images,stage stride); adds the image offset (gridDim.y) to the strided " +
+            "column butterfly. Each thread applies a cos.approx/sin.approx twiddle, so its spec is TOLERANCE-based, " +
+            "not bit-exact. A batched 2D FFT launches this stage log2(height) times with doubling strides after the " +
+            "batched column bit-reverse pass. Converts to ThreeWayParity (with tolerance) when the SM86 run lands."),
     };
 
     private static readonly Dictionary<string, PtxParitySpec> ByKernel =
