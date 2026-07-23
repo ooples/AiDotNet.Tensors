@@ -150,16 +150,20 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         IntPtr pointer6 = tensors.Length > 6 ? tensors[6].Pointer : IntPtr.Zero;
         IntPtr pointer7 = tensors.Length > 7 ? tensors[7].Pointer : IntPtr.Zero;
         IntPtr pointer8 = tensors.Length > 8 ? tensors[8].Pointer : IntPtr.Zero;
-        void** arguments = stackalloc void*[9];
-        arguments[0] = &pointer0;
-        arguments[1] = &pointer1;
-        arguments[2] = &pointer2;
-        arguments[3] = &pointer3;
-        arguments[4] = &pointer4;
-        arguments[5] = &pointer5;
-        arguments[6] = &pointer6;
-        arguments[7] = &pointer7;
-        arguments[8] = &pointer8;
+        // epsilon is declared first in every entry point, so it is always
+        // argument 0 and the pointers follow it.
+        float epsilon = Epsilon;
+        void** arguments = stackalloc void*[10];
+        arguments[0] = &epsilon;
+        arguments[1] = &pointer0;
+        arguments[2] = &pointer1;
+        arguments[3] = &pointer2;
+        arguments[4] = &pointer3;
+        arguments[5] = &pointer4;
+        arguments[6] = &pointer5;
+        arguments[7] = &pointer6;
+        arguments[8] = &pointer7;
+        arguments[9] = &pointer8;
 
         uint blockThreads = IsFusedBackward(Operation)
             ? (uint)GetFusedBackwardBlockThreads(Operation)
@@ -252,6 +256,7 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         var ptx = Begin(ccMajor, ccMinor, GetEntryPoint(DirectPtxRowNormalizationOperation.LayerNormForward),
             "input_ptr", "gamma_ptr", "beta_ptr", "output_ptr", "mean_ptr", "inv_var_ptr");
         EmitRegisters(ptx, predicates: 3, b32: 16, b64: 20, f32: 32);
+        EmitEpsilonLoad(ptx);
         EmitPointerLoads(ptx, 6);
         EmitRowAddressSetup(ptx, rows, "LN_FWD_DONE");
         ptx.AppendLine("    ld.global.nc.f32 %f0, [%rd8];");
@@ -265,7 +270,7 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         ptx.AppendLine("    fma.rn.f32 %f7, %f6, %f6, %f7;");
         EmitWarpSum(ptx, "%f7", "%f8");
         ptx.AppendLine("    mul.rn.f32 %f9, %f7, 0f3C800000;");
-        ptx.AppendLine($"    add.rn.f32 %f9, %f9, {FloatLiteral(epsilon)};");
+        ptx.AppendLine($"    add.rn.f32 %f9, %f9, {EpsilonRegister};");
         ptx.AppendLine("    sqrt.rn.f32 %f10, %f9;");
         ptx.AppendLine("    rcp.approx.f32 %f11, %f10;");
         ptx.AppendLine("    add.u64 %rd9, %rd1, %rd7;");
@@ -294,6 +299,7 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
             GetEntryPoint(DirectPtxRowNormalizationOperation.Fp16LayerNormForward),
             "input_ptr", "gamma_ptr", "beta_ptr", "output_ptr", "mean_ptr", "variance_ptr");
         EmitRegisters(ptx, predicates: 3, b32: 16, b64: 20, f32: 32, b16: 8);
+        EmitEpsilonLoad(ptx);
         EmitPointerLoads(ptx, 6);
         EmitFp16RowAddressSetup(ptx, rows, "FP16_LN_FWD_DONE");
         ptx.AppendLine("    ld.global.nc.u16 %rs0, [%rd8];");
@@ -310,7 +316,7 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         EmitWarpSum(ptx, "%f7", "%f8");
         ptx.AppendLine("    mul.rn.f32 %f9, %f7, 0f3C800000;");
         ptx.AppendLine("    mov.f32 %f18, %f9;");
-        ptx.AppendLine($"    add.rn.f32 %f9, %f9, {FloatLiteral(epsilon)};");
+        ptx.AppendLine($"    add.rn.f32 %f9, %f9, {EpsilonRegister};");
         ptx.AppendLine("    sqrt.rn.f32 %f10, %f9;");
         ptx.AppendLine("    rcp.approx.f32 %f11, %f10;");
         ptx.AppendLine("    add.u64 %rd9, %rd1, %rd7;");
@@ -345,6 +351,7 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
             GetEntryPoint(DirectPtxRowNormalizationOperation.Fp16LayerNormBackwardInput),
             "grad_output_ptr", "input_ptr", "gamma_ptr", "mean_ptr", "inv_var_ptr", "grad_input_ptr");
         EmitRegisters(ptx, predicates: 2, b32: 16, b64: 22, f32: 36, b16: 8);
+        EmitEpsilonLoad(ptx);
         EmitPointerLoads(ptx, 6);
         EmitFp16RowAddressSetup(ptx, rows, "FP16_LN_BWD_DONE");
         ptx.AppendLine("    add.u64 %rd9, %rd0, %rd6;");
@@ -459,6 +466,7 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         var ptx = Begin(ccMajor, ccMinor, GetEntryPoint(DirectPtxRowNormalizationOperation.RmsNormForward),
             "input_ptr", "gamma_ptr", "output_ptr", "rms_ptr");
         EmitRegisters(ptx, predicates: 3, b32: 16, b64: 18, f32: 24);
+        EmitEpsilonLoad(ptx);
         EmitPointerLoads(ptx, 4);
         EmitRowAddressSetup(ptx, rows, "RMS_FWD_DONE");
         ptx.AppendLine("    ld.global.nc.f32 %f0, [%rd8];");
@@ -467,7 +475,7 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         ptx.AppendLine("    fma.rn.f32 %f2, %f1, %f1, %f2;");
         EmitWarpSum(ptx, "%f2", "%f3");
         ptx.AppendLine("    mul.rn.f32 %f4, %f2, 0f3C800000;");
-        ptx.AppendLine($"    add.rn.f32 %f4, %f4, {FloatLiteral(epsilon)};");
+        ptx.AppendLine($"    add.rn.f32 %f4, %f4, {EpsilonRegister};");
         ptx.AppendLine("    sqrt.rn.f32 %f5, %f4;");
         ptx.AppendLine("    rcp.approx.f32 %f6, %f5;");
         ptx.AppendLine("    add.u64 %rd9, %rd1, %rd7;");
@@ -492,6 +500,7 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
             GetEntryPoint(DirectPtxRowNormalizationOperation.LayerNormBackwardInput),
             "grad_output_ptr", "input_ptr", "gamma_ptr", "mean_ptr", "inv_var_ptr", "grad_input_ptr");
         EmitRegisters(ptx, predicates: 2, b32: 16, b64: 22, f32: 36);
+        EmitEpsilonLoad(ptx);
         EmitPointerLoads(ptx, 6);
         EmitRowAddressSetup(ptx, rows, "LN_BWD_DONE");
         ptx.AppendLine("    add.u64 %rd9, %rd0, %rd6;");
@@ -543,6 +552,7 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
             GetEntryPoint(DirectPtxRowNormalizationOperation.RmsNormBackwardInput),
             "grad_output_ptr", "input_ptr", "gamma_ptr", "rms_ptr", "grad_input_ptr");
         EmitRegisters(ptx, predicates: 2, b32: 16, b64: 20, f32: 30);
+        EmitEpsilonLoad(ptx);
         EmitPointerLoads(ptx, 5);
         EmitRowAddressSetup(ptx, rows, "RMS_BWD_DONE");
         ptx.AppendLine("    add.u64 %rd9, %rd0, %rd6;");
@@ -1001,6 +1011,7 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         var ptx = Begin(ccMajor, ccMinor, GetEntryPoint(operation),
             "input_ptr", "output_ptr");
         EmitRegisters(ptx, predicates: 3, b32: 16, b64: 18, f32: 20);
+        EmitEpsilonLoad(ptx);
         EmitPointerLoads(ptx, 2);
         EmitRowAddressSetup(ptx, rows, "NORM_DONE");
         ptx.AppendLine("    ld.global.nc.f32 %f0, [%rd8];");
@@ -1034,6 +1045,7 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
             GetEntryPoint(DirectPtxRowNormalizationOperation.NormBackward),
             "grad_output_ptr", "input_ptr", "norm_ptr", "grad_input_ptr");
         EmitRegisters(ptx, predicates: 2, b32: 16, b64: 20, f32: 20);
+        EmitEpsilonLoad(ptx);
         EmitPointerLoads(ptx, 4);
         EmitRowAddressSetup(ptx, rows, "NORM_BWD_DONE");
         EmitRowStatLoads(ptx, meanPointerRegister: 0, secondPointerRegister: 2,
@@ -1206,6 +1218,13 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         return End(ptx, "REDUCE_NORM_DONE");
     }
 
+    /// <summary>
+    /// The register epsilon is loaded into. A NAMED register rather than an
+    /// index: the operation emitters declare f32 banks ranging from 8 to 36
+    /// registers, so any fixed index would overflow the smaller ones.
+    /// </summary>
+    private const string EpsilonRegister = "%eps";
+
     private static StringBuilder Begin(
         int ccMajor, int ccMinor, string entryPoint, params string[] parameters)
     {
@@ -1215,10 +1234,31 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// direct-ptx normalization d64 entry={entryPoint}");
         ptx.AppendLine($".visible .entry {entryPoint}(");
+        // epsilon is a launch parameter, not a baked literal. Baking it made the
+        // module key depend on a value the blueprint id does not carry, so a
+        // caller using a non-default epsilon emitted PTX that no checked-in
+        // cubin matched and silently fell back to driver JIT.
+        //
+        // It is declared FIRST so its argument index is 0 for every operation.
+        // The operations declare between two and nine pointers, so a trailing
+        // epsilon would sit at a different index in each one and the launch
+        // argument array - which is positional - would have to know the count
+        // per operation to place it correctly.
+        ptx.AppendLine("    .param .f32 epsilon,");
         for (int i = 0; i < parameters.Length; i++)
             ptx.AppendLine($"    .param .u64 {parameters[i]}{(i + 1 == parameters.Length ? string.Empty : ",")}");
         ptx.AppendLine(")");
         return ptx;
+    }
+
+    /// <summary>
+    /// Declares and loads the epsilon launch parameter. Call immediately after
+    /// EmitRegisters so the declaration sits with the other register banks.
+    /// </summary>
+    private static void EmitEpsilonLoad(StringBuilder ptx)
+    {
+        ptx.AppendLine($"    .reg .f32 {EpsilonRegister};");
+        ptx.AppendLine($"    ld.param.f32 {EpsilonRegister}, [epsilon];");
     }
 
     private static void EmitRegisters(

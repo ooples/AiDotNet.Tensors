@@ -13,6 +13,25 @@ class Program
 
     static void Main(string[] args)
     {
+        // GPU-free cubin generation and verification for the normalization2 family.
+        if (args.Length > 0 && args[0] == "--generate-direct-ptx-normalization2-cubins")
+        {
+            Environment.ExitCode = DirectPtxNormalizationOfflineCubinTool.Generate(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-normalization2-cubins")
+        {
+            Environment.ExitCode = DirectPtxNormalizationOfflineCubinTool.Verify(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-normalization2-sass")
+        {
+            Environment.ExitCode = DirectPtxNormalizationOfflineCubinTool.AuditSass(args);
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--direct-ptx-attention")
         {
             DirectPtxAttentionExperiment.Run();
