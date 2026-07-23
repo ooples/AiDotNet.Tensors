@@ -19,7 +19,7 @@ public class DirectPtxComplexUnaryTests
         Assert.Contains(".visible .entry aidotnet_fused_complex_conjugate_f32(", ptx);
         Assert.Contains("op=complex-conjugate", ptx);
         Assert.Equal(2, Count(ptx, "ld.param.u64"));
-        Assert.Equal(1, Count(ptx, "ld.global.ca.v2.f32"));
+        Assert.Equal(1, Count(ptx, "ld.global.nc.v2.f32"));
         Assert.Equal(1, Count(ptx, "st.global.v2.f32"));
 
         // Exactly one negate, applied to the imaginary lane, and the real lane

@@ -15,7 +15,7 @@ public class DirectPtxComplexMultiplyTests
         string ptx = PtxFusedComplexMultiplyF32Kernel.EmitPtx(8, 6, 262144);
         Assert.Contains("exact-shape pairs=262144 block=256", ptx);
         Assert.Equal(3, Count(ptx, "ld.param.u64"));
-        Assert.Equal(2, Count(ptx, "ld.global.ca.v2.f32"));
+        Assert.Equal(2, Count(ptx, "ld.global.nc.v2.f32"));
         Assert.Equal(1, Count(ptx, "st.global.v2.f32"));
         Assert.Equal(2, Count(ptx, "mul.rn.f32"));
         Assert.Equal(2, Count(ptx, "fma.rn.f32"));

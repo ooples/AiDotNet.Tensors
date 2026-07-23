@@ -151,7 +151,10 @@ internal sealed class PtxFusedComplexUnaryF32Kernel : IDisposable
         // Input strides 8 bytes per pair; the output stride depends on the op.
         ptx.AppendLine("    mul.wide.u32 %rd2, %r2, 8;");
         ptx.AppendLine("    add.u64 %rd4, %rd0, %rd2;");
-        ptx.AppendLine("    ld.global.ca.v2.f32 {%f0, %f1}, [%rd4];");
+                // Inputs are streamed once and never revisited, so they go through the
+        // read-only data cache rather than displacing L1 lines the store path
+        // can use.
+        ptx.AppendLine("    ld.global.nc.v2.f32 {%f0, %f1}, [%rd4];");
         if (isConjugate)
         {
             // Sign-bit flip: NaN payloads and signed zeros pass through as the

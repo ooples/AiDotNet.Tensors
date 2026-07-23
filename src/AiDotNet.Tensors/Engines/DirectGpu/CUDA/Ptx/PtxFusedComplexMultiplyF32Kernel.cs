@@ -102,8 +102,11 @@ internal sealed class PtxFusedComplexMultiplyF32Kernel : IDisposable
         ptx.AppendLine("    add.u64 %rd4, %rd0, %rd3;");
         ptx.AppendLine("    add.u64 %rd5, %rd1, %rd3;");
         ptx.AppendLine("    add.u64 %rd6, %rd2, %rd3;");
-        ptx.AppendLine("    ld.global.ca.v2.f32 {%f0,%f1}, [%rd4];");
-        ptx.AppendLine("    ld.global.ca.v2.f32 {%f2,%f3}, [%rd5];");
+                // Inputs are streamed once and never revisited, so they go through the
+        // read-only data cache rather than displacing L1 lines the store path
+        // can use.
+        ptx.AppendLine("    ld.global.nc.v2.f32 {%f0,%f1}, [%rd4];");
+                ptx.AppendLine("    ld.global.nc.v2.f32 {%f2,%f3}, [%rd5];");
         ptx.AppendLine("    mul.rn.f32 %f4, %f1, %f3;");
         ptx.AppendLine("    neg.f32 %f4, %f4;");
         ptx.AppendLine("    fma.rn.f32 %f4, %f0, %f2, %f4;");
