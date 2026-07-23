@@ -54,11 +54,16 @@ internal static class DirectPtxConvolutionArtifactTool
         using (var reg = new PtxConv2DNchwK1RegBlockedKernel(runtime, RegBlockedC64))
             Export(reg.Audit, outputDirectory, exported, manifest);
 
+        // Prune only STALE convolution cubins. This directory is SHARED with
+        // sibling operators (e.g. normalization), so never delete a cubin that is
+        // referenced by another operator's manifest — only our own stale ones.
+        var protectedFiles = CubinsReferencedByOtherManifests(outputDirectory);
         foreach (string cubinPath in Directory.GetFiles(
                      outputDirectory, "*.cubin", SearchOption.TopDirectoryOnly))
         {
             string sourceKey = Path.GetFileNameWithoutExtension(cubinPath);
-            if (!exported.Contains(sourceKey))
+            if (!exported.Contains(sourceKey) &&
+                !protectedFiles.Contains(Path.GetFileName(cubinPath)))
                 File.Delete(cubinPath);
         }
 
@@ -172,6 +177,28 @@ internal static class DirectPtxConvolutionArtifactTool
             DirectPtxCubinArtifactCache.ComputePtxSha256(regPtx),
             DirectPtxCubinArtifactCache.ComputeSourceKey(regPtx, 8, 6)));
         return expected;
+    }
+
+    // Cubin filenames owned by sibling operators (any *-cubins.tsv other than
+    // ours), so a conv export never prunes normalization/other cubins.
+    private static HashSet<string> CubinsReferencedByOtherManifests(string dir)
+    {
+        var referenced = new HashSet<string>(StringComparer.Ordinal);
+        foreach (string manifest in Directory.GetFiles(dir, "*-cubins.tsv", SearchOption.TopDirectoryOnly))
+        {
+            if (string.Equals(Path.GetFileName(manifest), ManifestFileName, StringComparison.Ordinal))
+                continue; // our own manifest — governed by `exported`
+            foreach (string line in File.ReadLines(manifest))
+            {
+                if (line.Length == 0 || line[0] == '#' ||
+                    line.StartsWith("blueprint-id", StringComparison.Ordinal))
+                    continue;
+                string[] cols = line.Split('\t');
+                string file = cols[cols.Length - 1].Trim();
+                if (file.EndsWith(".cubin", StringComparison.Ordinal)) referenced.Add(file);
+            }
+        }
+        return referenced;
     }
 
     private static string Sha256(byte[] bytes)

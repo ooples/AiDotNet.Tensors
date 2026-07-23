@@ -31,7 +31,7 @@ env:
   DOTNET_NOLOGO: true
   NVDISASM_VERSION: '13.3.73'
   NVDISASM_SHA256: '38b2eca90c0ffa2ce815bd392077f68b7fe94992ea0ec0f8e85df30ca01fc4e9'
-  CONV_CUBIN_DIR: 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/sm86'
+  CONV_CUBIN_DIR: 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/sm86/convolution'
 
 jobs:
   cubin-sass-audit:
@@ -95,7 +95,7 @@ jobs:
           dotnet tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Benchmarks.dll
           --audit-direct-ptx-convolution-sass
           "$RUNNER_TEMP/cuda-nvdisasm/bin/nvdisasm"
-          "src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/sm86"
+          "src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/sm86/convolution"
           "artifacts/direct-ptx/convolution/sass"
 
       - name: Upload exact-cubin SASS evidence
