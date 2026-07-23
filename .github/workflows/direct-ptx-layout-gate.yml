@@ -94,6 +94,16 @@ jobs:
           "$RUNNER_TEMP/cuda-nvcc/bin/ptxas"
           "$RUNNER_TEMP/direct-ptx-layout/sm86"
 
+      # The checked-in cubins must be exactly what this ptxas produces from the
+      # current PTX. A kernel edit without a regenerated artifact fails here
+      # rather than shipping a stale binary that no longer matches its source.
+      - name: Verify the checked-in cubins are current
+        run: >-
+          dotnet tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Benchmarks.dll
+          --verify-direct-ptx-layout-cubins
+          "$RUNNER_TEMP/cuda-nvcc/bin/ptxas"
+          "src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/sm86"
+
       # The disassembly is the machine-code evidence the promotion gate asks
       # for, and it needs no device: LDL/STL in the SASS means a spill reached
       # the executable.
@@ -102,7 +112,7 @@ jobs:
           dotnet tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Benchmarks.dll
           --audit-direct-ptx-layout-sass
           "$RUNNER_TEMP/cuda-nvdisasm/bin/nvdisasm"
-          "$RUNNER_TEMP/direct-ptx-layout/sm86"
+          "src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/sm86"
           "artifacts/direct-ptx/layout/sass"
 
       - name: Upload cubins and SASS evidence
