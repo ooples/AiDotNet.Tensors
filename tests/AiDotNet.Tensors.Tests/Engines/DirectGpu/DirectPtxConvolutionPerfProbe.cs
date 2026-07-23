@@ -49,6 +49,9 @@ public sealed class DirectPtxConvolutionPerfProbe
             MeasureWinogradWmma(runtime, 32, 64, 56, 56, 64);
             MeasureWinogradWmmaFused(runtime, 32, 64, 56, 56, 64);
             MeasureWinogradWmmaFusedStaged(runtime, 32, 64, 56, 56, 64);
+            MeasureWinogradWmmaCoop(runtime, 32, 64, 56, 56, 64);
+            MeasureWinogradWmmaCoopBlocked(runtime, 32, 64, 56, 56, 64);
+            MeasureStagesInIsolation(runtime, 32, 64, 56, 56, 64);
         }
         finally
         {
@@ -396,6 +399,126 @@ public sealed class DirectPtxConvolutionPerfProbe
         }
         long flops = 2L * n * kk * h * w * cch * 9;
         Report($"winograd-WMMA-STAGED N{n}/C{cch}/{h}x{w}/K{kk} 3x3 fp16-TC-cpasync-4warp (inT+stagedMMA+outT, regs={fused.FunctionInfo.RegistersPerThread})",
+            runtime, Launch, flops);
+    }
+
+    private void MeasureWinogradWmmaCoop(DirectPtxRuntime runtime, int n, int cch, int h, int w, int kk)
+    {
+        if (runtime.ComputeCapabilityMajor < 7) { _out.WriteLine("winograd-WMMA-COOP: no Tensor Cores"); return; }
+        using var filter = new PtxWinogradF23FilterTransformFp16Kernel(runtime, kk, cch);
+        using var dWeights = runtime.AllocateBytes((nuint)filter.WeightBytes);
+        using var dU = runtime.AllocateBytes((nuint)filter.TransformedBytes);
+        dWeights.Upload<float>(new float[filter.WeightBytes / sizeof(float)]);
+        filter.Launch(DirectPtxTensorView.CreateOwned(dWeights, filter.Blueprint.Tensors[0]),
+                      DirectPtxTensorView.CreateOwned(dU, filter.Blueprint.Tensors[1]));
+        runtime.Synchronize();
+
+        using var inputT = new PtxWinogradF23InputTransformFp16Kernel(runtime, n, cch, h, w);
+        using var dInput = runtime.AllocateBytes((nuint)inputT.InputBytes);
+        using var dV = runtime.AllocateBytes((nuint)inputT.TransformedBytes);
+        dInput.Upload<float>(new float[inputT.InputBytes / sizeof(float)]);
+        using var coop = new PtxWinogradWmmaCoopKernel(runtime, n, cch, h, w, kk);
+        using var dBias = runtime.AllocateBytes((nuint)coop.BiasBytes);
+        using var dOutput = runtime.AllocateBytes((nuint)coop.OutputBytes);
+        dBias.Upload<float>(new float[coop.BiasBytes / sizeof(float)]);
+
+        void Launch()
+        {
+            inputT.Launch(DirectPtxTensorView.CreateOwned(dInput, inputT.Blueprint.Tensors[0]),
+                          DirectPtxTensorView.CreateOwned(dV, inputT.Blueprint.Tensors[1]));
+            coop.Launch(DirectPtxTensorView.CreateOwned(dU, coop.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.CreateOwned(dV, coop.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.CreateOwned(dBias, coop.Blueprint.Tensors[2]),
+                        DirectPtxTensorView.CreateOwned(dOutput, coop.Blueprint.Tensors[3]));
+        }
+        long flops = 2L * n * kk * h * w * cch * 9;
+        Report($"winograd-WMMA-COOP N{n}/C{cch}/{h}x{w}/K{kk} 3x3 fp16-TC-coop16warp (inT+coopMMA+outT, regs={coop.FunctionInfo.RegistersPerThread})",
+            runtime, Launch, flops);
+    }
+
+    private void MeasureStagesInIsolation(DirectPtxRuntime runtime, int n, int cch, int h, int w, int kk)
+    {
+        int tiles = n * (h / 2) * (w / 2);
+        long flops = 2L * n * kk * h * w * cch * 9;
+
+        // fp16 input transform alone.
+        using (var it16 = new PtxWinogradF23InputTransformFp16Kernel(runtime, n, cch, h, w))
+        using (var di = runtime.AllocateBytes((nuint)it16.InputBytes))
+        using (var dv = runtime.AllocateBytes((nuint)it16.TransformedBytes))
+        {
+            di.Upload<float>(new float[it16.InputBytes / sizeof(float)]);
+            void L() => it16.Launch(DirectPtxTensorView.CreateOwned(di, it16.Blueprint.Tensors[0]),
+                                    DirectPtxTensorView.CreateOwned(dv, it16.Blueprint.Tensors[1]));
+            Report($"STAGE inputT-fp16 alone (V[16,P,C], regs={it16.FunctionInfo.RegistersPerThread})", runtime, L, flops);
+        }
+        // fp32 input transform alone.
+        using (var it32 = new PtxWinogradF23InputTransformKernel(runtime, n, cch, h, w))
+        using (var di = runtime.AllocateBytes((nuint)it32.InputBytes))
+        using (var dv = runtime.AllocateBytes((nuint)it32.TransformedBytes))
+        {
+            di.Upload<float>(new float[it32.InputBytes / sizeof(float)]);
+            void L() => it32.Launch(DirectPtxTensorView.CreateOwned(di, it32.Blueprint.Tensors[0]),
+                                    DirectPtxTensorView.CreateOwned(dv, it32.Blueprint.Tensors[1]));
+            Report($"STAGE inputT-fp32 alone (V[16,C,P], regs={it32.FunctionInfo.RegistersPerThread})", runtime, L, flops);
+        }
+        // coop GEMM alone (U,V pre-staged; not re-run each call).
+        using (var f16 = new PtxWinogradF23FilterTransformFp16Kernel(runtime, kk, cch))
+        using (var it16 = new PtxWinogradF23InputTransformFp16Kernel(runtime, n, cch, h, w))
+        using (var dw = runtime.AllocateBytes((nuint)f16.WeightBytes))
+        using (var du = runtime.AllocateBytes((nuint)f16.TransformedBytes))
+        using (var di = runtime.AllocateBytes((nuint)it16.InputBytes))
+        using (var dv = runtime.AllocateBytes((nuint)it16.TransformedBytes))
+        using (var coop = new PtxWinogradWmmaCoopKernel(runtime, n, cch, h, w, kk))
+        using (var db = runtime.AllocateBytes((nuint)coop.BiasBytes))
+        using (var doU = runtime.AllocateBytes((nuint)coop.OutputBytes))
+        {
+            dw.Upload<float>(new float[f16.WeightBytes / sizeof(float)]);
+            di.Upload<float>(new float[it16.InputBytes / sizeof(float)]);
+            db.Upload<float>(new float[coop.BiasBytes / sizeof(float)]);
+            f16.Launch(DirectPtxTensorView.CreateOwned(dw, f16.Blueprint.Tensors[0]),
+                       DirectPtxTensorView.CreateOwned(du, f16.Blueprint.Tensors[1]));
+            it16.Launch(DirectPtxTensorView.CreateOwned(di, it16.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.CreateOwned(dv, it16.Blueprint.Tensors[1]));
+            runtime.Synchronize();
+            void L() => coop.Launch(DirectPtxTensorView.CreateOwned(du, coop.Blueprint.Tensors[0]),
+                                    DirectPtxTensorView.CreateOwned(dv, coop.Blueprint.Tensors[1]),
+                                    DirectPtxTensorView.CreateOwned(db, coop.Blueprint.Tensors[2]),
+                                    DirectPtxTensorView.CreateOwned(doU, coop.Blueprint.Tensors[3]));
+            Report($"STAGE coopGEMM alone (regs={coop.FunctionInfo.RegistersPerThread})", runtime, L, flops);
+        }
+    }
+
+    private void MeasureWinogradWmmaCoopBlocked(DirectPtxRuntime runtime, int n, int cch, int h, int w, int kk)
+    {
+        if (runtime.ComputeCapabilityMajor < 7) { _out.WriteLine("winograd-WMMA-COOPBLK: no Tensor Cores"); return; }
+        using var filter = new PtxWinogradF23FilterTransformFp16Kernel(runtime, kk, cch);
+        using var dWeights = runtime.AllocateBytes((nuint)filter.WeightBytes);
+        using var dU = runtime.AllocateBytes((nuint)filter.TransformedBytes);
+        dWeights.Upload<float>(new float[filter.WeightBytes / sizeof(float)]);
+        filter.Launch(DirectPtxTensorView.CreateOwned(dWeights, filter.Blueprint.Tensors[0]),
+                      DirectPtxTensorView.CreateOwned(dU, filter.Blueprint.Tensors[1]));
+        runtime.Synchronize();
+
+        using var inputT = new PtxWinogradF23InputTransformFp16Kernel(runtime, n, cch, h, w);
+        using var dInput = runtime.AllocateBytes((nuint)inputT.InputBytes);
+        using var dV = runtime.AllocateBytes((nuint)inputT.TransformedBytes);
+        dInput.Upload<float>(new float[inputT.InputBytes / sizeof(float)]);
+        using var coop = new PtxWinogradWmmaCoopBlockedKernel(runtime, n, cch, h, w, kk);
+        using var dBias = runtime.AllocateBytes((nuint)coop.BiasBytes);
+        using var dOutput = runtime.AllocateBytes((nuint)coop.OutputBytes);
+        dBias.Upload<float>(new float[coop.BiasBytes / sizeof(float)]);
+
+        void Launch()
+        {
+            inputT.Launch(DirectPtxTensorView.CreateOwned(dInput, inputT.Blueprint.Tensors[0]),
+                          DirectPtxTensorView.CreateOwned(dV, inputT.Blueprint.Tensors[1]));
+            coop.Launch(DirectPtxTensorView.CreateOwned(dU, coop.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.CreateOwned(dV, coop.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.CreateOwned(dBias, coop.Blueprint.Tensors[2]),
+                        DirectPtxTensorView.CreateOwned(dOutput, coop.Blueprint.Tensors[3]));
+        }
+        long flops = 2L * n * kk * h * w * cch * 9;
+        Report($"winograd-WMMA-COOPBLK N{n}/C{cch}/{h}x{w}/K{kk} 3x3 fp16-TC-coop-wn4 (inT+blkMMA+outT, regs={coop.FunctionInfo.RegistersPerThread})",
             runtime, Launch, flops);
     }
 

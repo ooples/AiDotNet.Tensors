@@ -187,6 +187,25 @@ public static class PtxParityRegistry
             "memory pipeline (coalesced cp.async staging + ldmatrix + multi-warp cooperation) -- a multi-day " +
             "kernel. Deferred."),
 
+        new PtxParitySpec("PtxWinogradWmmaCoopKernel", PtxParityStatus.Deferred,
+            "Winograd F(2,3) cooperative FP16 TC conv: one position per warp, M via shared (#841 3x3)",
+            "attacks the occupancy question head-on: 16 warps, one Winograd position each (4 accumulators/thread " +
+            "-> full occupancy, 40 regs, 0 spills), 16 position results exchanged through shared (8KB, no global M " +
+            "round-trip), combined A^T M A epilogue. Verified correct on-device (<= 5e-2). KEY DIAGNOSTIC: this " +
+            "kernel proved occupancy was NOT the bottleneck -- fully occupied yet as slow as the low-occupancy " +
+            "fused kernels. Isolating the pipeline stages then revealed the real wall was the fp16 input transform " +
+            "(uncoalesced P-major stores, 5651us) not the GEMM (981us). After the transform coalescing fix the " +
+            "full coop pipeline dropped ~4.4x (6300us -> 1437us, contended) and beats the fp32 batched pipeline. " +
+            "Deferred pending an uncontended idle-vs-cuDNN measurement."),
+
+        new PtxParitySpec("PtxWinogradWmmaCoopBlockedKernel", PtxParityStatus.Deferred,
+            "Winograd F(2,3) cooperative FP16 TC conv with mma-level A-fragment reuse (#841 3x3)",
+            "coop kernel + register blocking: each warp computes 16ch x 32tiles reusing one loaded A=U fragment " +
+            "across 4 N-subtiles (SASS confirmed loads-per-mma dropped from 6:1 to 3:1). Verified correct " +
+            "on-device (<= 5e-2). Second key diagnostic: halving the load ratio did NOT speed the pipeline up, " +
+            "which (with the isolation data) pinned the bottleneck on the input transform rather than GEMM memory. " +
+            "Retained as the load-amortization lesson for the post-transform-fix GEMM tuning. Deferred."),
+
         new PtxParitySpec("PtxWinogradWmmaFusedStagedKernel", PtxParityStatus.Deferred,
             "Winograd F(2,3) cuDNN-class fused FP16 TC conv: coalesced cp.async staging + 4-warp (#841 3x3)",
             "the cuDNN-class escalation of the fused kernel: a 4-warp block stages U[16,16,16]+V[16,32,16] " +
