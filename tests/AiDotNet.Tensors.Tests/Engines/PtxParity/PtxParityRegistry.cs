@@ -140,6 +140,15 @@ public static class PtxParityRegistry
             "against the strongest eligible cuDNN/PyTorch competitor, plus Nsight zero-spill SASS evidence. " +
             "Keep deferred until that three-way matrix and the competitive gates exist."),
 
+        new PtxParitySpec("PtxWinogradF23FusedRegBlockedKernel", PtxParityStatus.Deferred,
+            "Winograd F(2,3) register-blocked fused GEMM + output transform (#841 3x3, option A)",
+            "option-A attempt at the 3x3 win: fuses the batched GEMM + output transform with a TM x TN " +
+            "micro-tile (no M workspace, shared-load reuse). Verified correct on-device (<= 2e-3). But the " +
+            "16 Winograd positions force 16*TM*TN accumulators -> 128 registers at TM=TN=2 -> ~33% occupancy, " +
+            "which makes it SLOWER than the batched pipeline. This is the fundamental FP32 Winograd wall " +
+            "(low occupancy vs M-buffer traffic); FP32 hand-PTX tops out at ~0.73x cuDNN. Deferred; the " +
+            "remaining win path is FP16 Tensor Cores (option C)."),
+
         new PtxParitySpec("PtxWinogradBatchedGemmKernel", PtxParityStatus.Deferred,
             "Winograd F(2,3) batched register-blocked GEMM M[b]=U[b].V[b] (#841 3x3 pipeline)",
             "the 16 Winograd position GEMMs run as one batched register-blocked GEMM (grid.z=16), reusing " +
