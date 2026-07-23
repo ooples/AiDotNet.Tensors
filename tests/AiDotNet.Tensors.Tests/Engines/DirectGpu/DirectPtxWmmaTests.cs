@@ -1003,11 +1003,23 @@ public class DirectPtxWmmaTests
                 DirectPtxRowNormalizationOperation.RmsNormBackwardFusedAtomic;
             Assert.Equal(usesSharedReduction,
                 ptx.Contains(".shared", StringComparison.Ordinal));
-            Assert.Same(
+            DirectPtxKernelBlueprint blueprint =
                 PtxRowNormalizationD64Kernel.CreateBlueprint(
-                    DirectPtxArchitectureFamily.Ampere, operation, 256),
+                    DirectPtxArchitectureFamily.Ampere, operation, 256);
+            Assert.Same(blueprint,
                 PtxRowNormalizationD64Kernel.CreateBlueprint(
                     DirectPtxArchitectureFamily.Ampere, operation, 256));
+            bool fusedBackward = operation is
+                DirectPtxRowNormalizationOperation.LayerNormBackwardFusedAtomic or
+                DirectPtxRowNormalizationOperation.RmsNormBackwardFusedAtomic;
+            if (fusedBackward)
+            {
+                Assert.Contains("red.global.add.f32", ptx, StringComparison.Ordinal);
+                Assert.DoesNotContain("atom.global.add.f32", ptx, StringComparison.Ordinal);
+                Assert.Equal(
+                    PtxRowNormalizationD64Kernel.FusedBackwardAccumulatorBanks.ToString(),
+                    blueprint.Semantics["accumulator-banks"]);
+            }
         }
 
         foreach (DirectPtxChannelNormalizationOperation operation in

@@ -163,8 +163,8 @@ def benchmark(run, extent, name, operation, output_bytes, include_compile):
         print(f"SKIP run={run} {name} compile: {type(exception).__name__}: {exception}")
 
 
-def row_cells(run, include_compile):
-    for rows in ROWS:
+def row_cells(run, include_compile, selected_rows=ROWS):
+    for rows in selected_rows:
         generator = torch.Generator(device="cuda")
         generator.manual_seed(20263800 + run * 100 + rows)
         x = torch.rand((rows, D), device="cuda", generator=generator) * 1.5 - 0.75
@@ -355,7 +355,11 @@ def channel_cells(run, include_compile):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--runs", type=int, default=3)
-    parser.add_argument("--scope", choices=("all", "row", "channel"), default="all")
+    parser.add_argument(
+        "--scope",
+        choices=("all", "row", "row256", "row2048", "row8192", "channel"),
+        default="all",
+    )
     parser.add_argument("--no-compile", action="store_true")
     args = parser.parse_args()
     if args.runs <= 0:
@@ -371,8 +375,13 @@ def main():
     print_header()
     for run in range(1, args.runs + 1):
         if args.scope != "channel":
-            row_cells(run, not args.no_compile)
-        if args.scope != "row":
+            selected_rows = (
+                (int(args.scope[3:]),)
+                if args.scope.startswith("row") and args.scope != "row"
+                else ROWS
+            )
+            row_cells(run, not args.no_compile, selected_rows)
+        if args.scope in ("all", "channel"):
             channel_cells(run, not args.no_compile)
     return 0
 

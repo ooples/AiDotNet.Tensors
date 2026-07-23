@@ -61,12 +61,14 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         FusedRmsNormBackwardWarpsPerBlock * Dimension * sizeof(float);
     internal const int FusedBackwardLayerSharedBytes =
         2 * FusedLayerNormBackwardPlaneSharedBytes;
+    internal const int FusedBackwardAccumulatorBanks = 4;
     // One fixed backend-owned workspace serves every row-normalization
-    // specialization. The largest live layout is either LayerNorm's two D64
-    // accumulators or the L2 reducer's 128 block partials; the final word is a
-    // reusable completion counter.
+    // specialization. The largest live layout is LayerNorm's four banks of
+    // two D64 accumulators; the final word is a reusable completion counter.
+    // Banking reduces cross-block atomic serialization while remaining fixed
+    // size and small enough to prewarm once per backend.
     internal const int NormalizationWorkspacePartialFloats =
-        2 * Dimension;
+        FusedBackwardAccumulatorBanks * 2 * Dimension;
     internal const int NormalizationWorkspaceCounterIndex =
         NormalizationWorkspacePartialFloats;
     internal const int NormalizationWorkspaceElements =
@@ -599,6 +601,7 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         int planeSharedBytes = rms
             ? FusedBackwardRmsSharedBytes
             : FusedLayerNormBackwardPlaneSharedBytes;
+        int accumulatorBankBytes = (rms ? Dimension : 2 * Dimension) * sizeof(float);
         EmitRegisters(ptx, predicates: 6, b32: 16, b64: 24, f32: 36,
             blockThreads: blockThreads);
         ptx.AppendLine($"    .shared .align 16 .b8 fused_scratch[{(rms ? FusedBackwardRmsSharedBytes : FusedBackwardLayerSharedBytes)}];");
@@ -740,14 +743,18 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         ptx.AppendLine("    add.u32 %r6, %r6, 1;");
         ptx.AppendLine("    bra FUSED_BWD_BLOCK_REDUCE;");
         ptx.AppendLine("FUSED_BWD_PUBLISH:");
+        ptx.AppendLine("    mov.u32 %r10, %ctaid.x;");
+        ptx.AppendLine($"    and.b32 %r10, %r10, {FusedBackwardAccumulatorBanks - 1};");
+        ptx.AppendLine($"    mul.wide.u32 %rd17, %r10, {accumulatorBankBytes};");
+        ptx.AppendLine("    add.u64 %rd17, %rd23, %rd17;");
         ptx.AppendLine("    mul.wide.u32 %rd20, %r0, 4;");
-        ptx.AppendLine("    add.u64 %rd21, %rd23, %rd20;");
-        ptx.AppendLine("    atom.global.add.f32 %f26, [%rd21], %f24;");
+        ptx.AppendLine("    add.u64 %rd21, %rd17, %rd20;");
+        ptx.AppendLine("    red.global.add.f32 [%rd21], %f24;");
         if (!rms)
         {
-            ptx.AppendLine($"    add.u64 %rd22, %rd23, {Dimension * sizeof(float)};");
+            ptx.AppendLine($"    add.u64 %rd22, %rd17, {Dimension * sizeof(float)};");
             ptx.AppendLine("    add.u64 %rd22, %rd22, %rd20;");
-            ptx.AppendLine("    atom.global.add.f32 %f27, [%rd22], %f25;");
+            ptx.AppendLine("    red.global.add.f32 [%rd22], %f25;");
         }
 
         // CUDA's last-block completion protocol: all producers make their
@@ -776,20 +783,37 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         ptx.AppendLine($"    setp.ge.u32 %p4, %r0, {Dimension};");
         ptx.AppendLine("    @%p4 bra FUSED_BWD_RETURN;");
         ptx.AppendLine("    mul.wide.u32 %rd20, %r0, 4;");
-        ptx.AppendLine("    add.u64 %rd21, %rd23, %rd20;");
-        ptx.AppendLine("    ld.global.f32 %f24, [%rd21];");
-        ptx.AppendLine($"    add.u64 %rd22, %rd{(rms ? 5 : 6)}, %rd20;");
-        ptx.AppendLine("    st.global.f32 [%rd22], %f24;");
+        ptx.AppendLine("    mov.u32 %r10, 0;");
+        ptx.AppendLine("    mov.f32 %f24, 0f00000000;");
+        if (!rms)
+            ptx.AppendLine("    mov.f32 %f25, 0f00000000;");
+        ptx.AppendLine("FUSED_BWD_BANK_REDUCE:");
+        ptx.AppendLine($"    setp.ge.u32 %p5, %r10, {FusedBackwardAccumulatorBanks};");
+        ptx.AppendLine("    @%p5 bra FUSED_BWD_BANK_WRITE;");
+        ptx.AppendLine($"    mul.wide.u32 %rd17, %r10, {accumulatorBankBytes};");
+        ptx.AppendLine("    add.u64 %rd17, %rd23, %rd17;");
+        ptx.AppendLine("    add.u64 %rd21, %rd17, %rd20;");
+        ptx.AppendLine("    ld.global.f32 %f26, [%rd21];");
+        ptx.AppendLine("    add.rn.f32 %f24, %f24, %f26;");
         ptx.AppendLine("    mov.f32 %f26, 0f00000000;");
         ptx.AppendLine("    st.global.f32 [%rd21], %f26;");
         if (!rms)
         {
-            ptx.AppendLine($"    add.u64 %rd21, %rd23, {Dimension * sizeof(float)};");
+            ptx.AppendLine($"    add.u64 %rd21, %rd17, {Dimension * sizeof(float)};");
             ptx.AppendLine("    add.u64 %rd21, %rd21, %rd20;");
-            ptx.AppendLine("    ld.global.f32 %f25, [%rd21];");
+            ptx.AppendLine("    ld.global.f32 %f27, [%rd21];");
+            ptx.AppendLine("    add.rn.f32 %f25, %f25, %f27;");
+            ptx.AppendLine("    st.global.f32 [%rd21], %f26;");
+        }
+        ptx.AppendLine("    add.u32 %r10, %r10, 1;");
+        ptx.AppendLine("    bra FUSED_BWD_BANK_REDUCE;");
+        ptx.AppendLine("FUSED_BWD_BANK_WRITE:");
+        ptx.AppendLine($"    add.u64 %rd22, %rd{(rms ? 5 : 6)}, %rd20;");
+        ptx.AppendLine("    st.global.f32 [%rd22], %f24;");
+        if (!rms)
+        {
             ptx.AppendLine("    add.u64 %rd22, %rd7, %rd20;");
             ptx.AppendLine("    st.global.f32 [%rd22], %f25;");
-            ptx.AppendLine("    st.global.f32 [%rd21], %f26;");
         }
         ptx.AppendLine("    setp.ne.u32 %p4, %r0, 0;");
         ptx.AppendLine("    @%p4 bra FUSED_BWD_RETURN;");
@@ -1570,6 +1594,9 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
                 ["global-intermediates"] = fusedBackward
                     ? "bounded-reusable-accumulators"
                     : atomicReduction ? "bounded-block-partials" : "none",
+                ["accumulator-banks"] = fusedBackward
+                    ? FusedBackwardAccumulatorBanks.ToString(CultureInfo.InvariantCulture)
+                    : "none",
                 ["temporary-device-allocation"] = RequiresPersistentWorkspace(operation)
                     ? "persistent-prewarm-workspace" : "none",
                 ["shape-stride-parameters"] = "none",

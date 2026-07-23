@@ -26,7 +26,7 @@ normalization experiment when the linker entry points are unavailable.
 No new normalization cell is promoted by this pull request. Correctness,
 allocation, repeated graph replay, artifact identity, runtime resource, and
 SASS safety gates pass. The latest backward kernels replace destination
-memsets with a backend-persistent 516-byte accumulator/counter workspace, but
+memsets with a backend-persistent 2,052-byte accumulator/counter workspace, but
 the required clean three-run comparison against compiled PyTorch is still
 pending. The production admission table therefore remains fail-closed.
 
@@ -59,7 +59,7 @@ specializations is allowed only when the cubin filename and hash also match.
 | 3 | Shared memory only for reuse | Backward parameter partials are folded in 16 KiB (LayerNorm) or 5 KiB (RMSNorm); L2 uses a 64-byte warp fold. Single-use row inputs are not pointlessly staged. **Pass.** |
 | 4 | Register-resident math | Loaded row values, statistics, affine terms, reductions, and grad-input epilogues remain in registers until final stores. Final SASS has zero local loads/stores. **Pass.** |
 | 5 | Combined/fused kernels | The large-shape experimental backward paths compute grad-input plus parameter partials in one input pass and one dispatch. Existing residual+BatchNorm+ReLU is also truly fused. **Mechanically pass; performance HOLD.** |
-| 6 | Bounded global reductions | Fused backward folds issue one atomic per block/output into a reusable 128-float accumulator, plus one completion atomic per block. L2 uses a 512-thread, at-most-128-block partial grid. The complete shared workspace is 516 bytes; no output-sized scratch exists. **Correctness pass; performance HOLD.** |
+| 6 | Bounded global reductions | Fused backward folds issue one atomic per block/output into one of four banked accumulators, reducing per-address contention by 4x, plus one completion atomic per block. L2 uses a 512-thread, at-most-128-block partial grid. The complete persistent workspace is 2,052 bytes; no output-sized scratch exists. **Correctness pass; performance HOLD.** |
 | 7 | Asynchronous stream ordering | Launches use the backend stream with no host synchronization. Fused backward/L2 no longer clear outputs; their prewarmed workspace self-resets inside the kernel. `cp.async` is required only for reusable tiles and is inapplicable to these single-use D=64 loads. **Pass.** |
 | 8 | CUDA Graph/lifetime safety | Plans are prewarmed and modules pinned for capture lifetime; compilation, tuning, file I/O, and cache misses are rejected during capture. **Pass.** |
 | 9 | Ahead-of-load binary control | PTX is linked to cubin, hashed, embedded, loaded, disassembled to SASS, resource-audited, and content-addressed cached. Raw PTX load is experiment-only. **Pass.** |
@@ -76,7 +76,7 @@ All admitted tensors are exact, contiguous, aligned physical views. Strides,
 shapes, epsilon, momentum, dtype, and mode flags are removed before the hot
 launch. Unsupported layouts or aliases return to the established CUDA path.
 There are no output-sized temporary device allocations. Workspace-requiring
-operations share one backend-owned 516-byte allocation created during prewarm;
+operations share one backend-owned 2,052-byte allocation created during prewarm;
 the hot path performs no allocation and its pointer remains stable for graph
 capture.
 
@@ -100,10 +100,11 @@ single global input pass. A 32-warp LayerNorm block retains two adjacent
 features per lane in registers and folds 16 KiB of block parameter partials
 through shared memory once. RMSNorm uses 20 warps, 5 KiB shared memory, and two
 resident blocks per SM. The 64 folding threads issue one atomic per
-block/output into the reusable accumulator, then a last-block completion
-protocol copies final parameters, clears the accumulator, and resets the
-counter. This removes both destination memsets and a second global partial
-read pass. Neither route is admitted without the explicit experiment override.
+block/output into one of four accumulator banks, then a last-block completion
+protocol folds those banks, copies final parameters, clears every accumulator,
+and resets the counter. This removes both destination memsets and a second
+global block-partial read pass while cutting atomic contention by 4x. Neither
+route is admitted without the explicit experiment override.
 
 The experimental whole-tensor L2 lane uses aligned 16-byte loads, four
 register FMAs, 512-thread blocks, a bounded 128-block grid, and a 64-byte
@@ -160,6 +161,15 @@ The executable screen uses 30 warmups, 101 samples, and 50 resident launches
 per device sample. Promotion uses the competitor's strongest measured lane,
 not eager PyTorch when compiled PyTorch is faster.
 
+The resident screen reports per-dispatch `tmpB` separately from prewarmed
+`persistB`. Advancement requires `tmpB == 0`; nonzero `persistB` is accepted
+only when the caller explicitly declares it bounded and reusable and the route
+is CUDA-Graph compatible. The Python competitor accepts the same exact row
+scopes (`row256`, `row2048`, and `row8192`) as the AiDotNet runner.
+`COMPARE` means only that a cell passed this first-stage AiDotNet resident
+screen; it is never a production-promotion result without the strongest clean
+PyTorch eager/compiled comparison.
+
 ## Evidence collected on RTX 3080 / SM86
 
 - All 14 focused correctness/routing/capture/allocation tests pass on net10
@@ -191,10 +201,12 @@ measured 42.64--43.77 us. All three cells remain HOLD.
 The first workspace topology stored every block partial and folded it in the
 last block. A serial 64-thread fold measured 39.44 us LayerNorm / 36.07 us
 RMSNorm; an eight-lane-per-feature fold improved that to 36.19 / 19.31 us but
-still lost compiled PyTorch. The retained accumulator topology removes that
-second partial read pass. Its latest run cannot be used for promotion because
-two unrelated Python CUDA workloads held the GPU at 99% utilization; no
-contended absolute number is treated as release evidence.
+still lost compiled PyTorch. The retained four-bank accumulator topology
+removes that second partial read pass and reduces atomic address contention.
+The earlier single-bank run cannot be used for promotion because two unrelated
+Python CUDA workloads held the GPU at 99% utilization. The four-bank candidate
+was not timed when a later `compress_medium.py` workload held utilization near
+28%; no contended absolute number is treated as release evidence.
 
 ## Rejected experiments retained as evidence
 
@@ -221,7 +233,7 @@ contended absolute number is treated as release evidence.
 
 ## Follow-up required before production promotion
 
-1. Run the retained persistent-accumulator topology on an otherwise idle GPU;
+1. Run the retained four-bank persistent-accumulator topology on an otherwise idle GPU;
    promote it only if all three median and p95 comparisons beat compiled
    PyTorch by the stated gates.
 2. Continue reducing RMS reciprocal/reduction and accumulator contention only

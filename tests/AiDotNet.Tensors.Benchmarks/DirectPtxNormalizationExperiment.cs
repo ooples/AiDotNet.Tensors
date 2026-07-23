@@ -54,6 +54,9 @@ internal static class DirectPtxNormalizationExperiment
                 "Baseline and candidate use identical resident inputs, extents, semantics, stream, " +
                 "and production entry point. Error is candidate vs current AiDotNet output.");
             Console.WriteLine(
+                "COMPARE is only the first-stage resident screen; production promotion still requires " +
+                "three clean wins against the fastest corrected PyTorch eager/compiled lane.");
+            Console.WriteLine(
                 "cuDNN BatchNorm is ineligible on this host (cudnn_graph64_9.dll unavailable); " +
                 "channel baselines use AiDotNet's resident CUDA kernels.");
             PrintHeader();
@@ -150,8 +153,9 @@ internal static class DirectPtxNormalizationExperiment
                 secondaryAuditOperation: rows == 8_192
                     ? null
                     : DirectPtxRowNormalizationOperation.LayerNormGradParameters,
-                directTemporaryBytes: rows == 8_192
+                directPersistentWorkspaceBytes: rows == 8_192
                     ? PtxRowNormalizationD64Kernel.NormalizationWorkspaceBytes : 0,
+                directPersistentWorkspaceBoundedAndReusable: rows == 8_192,
                 dispatchesPerAction: rows == 8_192 ? 1 : 2);
         }
 
@@ -190,8 +194,9 @@ internal static class DirectPtxNormalizationExperiment
                 secondaryAuditOperation: rows == 8_192
                     ? null
                     : DirectPtxRowNormalizationOperation.RmsNormGradGamma,
-                directTemporaryBytes: rows == 8_192
+                directPersistentWorkspaceBytes: rows == 8_192
                     ? PtxRowNormalizationD64Kernel.NormalizationWorkspaceBytes : 0,
+                directPersistentWorkspaceBoundedAndReusable: rows == 8_192,
                 dispatchesPerAction: rows == 8_192 ? 1 : 2);
         }
 
@@ -778,6 +783,8 @@ internal static class DirectPtxNormalizationExperiment
         DirectPtxRowNormalizationOperation auditOperation,
         DirectPtxRowNormalizationOperation? secondaryAuditOperation = null,
         long baselineTemporaryBytes = 0, long directTemporaryBytes = 0,
+        long directPersistentWorkspaceBytes = 0,
+        bool directPersistentWorkspaceBoundedAndReusable = false,
         bool baselineCaptureCompatible = true,
         bool directCaptureCompatible = true,
         int dispatchesPerAction = 1)
@@ -796,6 +803,8 @@ internal static class DirectPtxNormalizationExperiment
                 : null,
             () => backend.DirectPtxRowNormalizationDispatchCount,
             baselineTemporaryBytes, directTemporaryBytes,
+            directPersistentWorkspaceBytes,
+            directPersistentWorkspaceBoundedAndReusable,
             baselineCaptureCompatible, directCaptureCompatible,
             dispatchesPerAction);
     }
@@ -807,6 +816,8 @@ internal static class DirectPtxNormalizationExperiment
         DirectPtxChannelNormalizationOperation? secondaryAuditOperation = null,
         float momentum = 0f,
         long baselineTemporaryBytes = 0, long directTemporaryBytes = 0,
+        long directPersistentWorkspaceBytes = 0,
+        bool directPersistentWorkspaceBoundedAndReusable = false,
         bool baselineCaptureCompatible = true,
         bool directCaptureCompatible = true,
         int dispatchesPerAction = 1)
@@ -822,6 +833,8 @@ internal static class DirectPtxNormalizationExperiment
                 : null,
             () => backend.DirectPtxChannelNormalizationDispatchCount,
             baselineTemporaryBytes, directTemporaryBytes,
+            directPersistentWorkspaceBytes,
+            directPersistentWorkspaceBoundedAndReusable,
             baselineCaptureCompatible, directCaptureCompatible,
             dispatchesPerAction);
     }
@@ -833,6 +846,8 @@ internal static class DirectPtxNormalizationExperiment
         Func<DirectPtxKernelAudit?>? getSecondaryAudit,
         Func<long> getDirectDispatchCount,
         long baselineTemporaryBytes, long directTemporaryBytes,
+        long directPersistentWorkspaceBytes,
+        bool directPersistentWorkspaceBoundedAndReusable,
         bool baselineCaptureCompatible, bool directCaptureCompatible,
         int dispatchesPerAction)
     {
@@ -870,14 +885,20 @@ internal static class DirectPtxNormalizationExperiment
 
         double speedup = baselineDevice.Median / directDevice.Median;
         bool tail = directDevice.P95 <= baselineDevice.P95 * 1.10;
-        bool eligible = speedup >= 1.10 && tail && directAllocation == 0 &&
-            directTemporaryBytes == 0 && error <= 2e-3f &&
+        bool workspaceEligible = directPersistentWorkspaceBytes >= 0 &&
+            (directPersistentWorkspaceBytes == 0 ||
+             directPersistentWorkspaceBoundedAndReusable);
+        bool advanceToCompetitor = speedup >= 1.10 && tail && directAllocation == 0 &&
+            directTemporaryBytes == 0 && workspaceEligible &&
+            directCaptureCompatible && error <= 2e-3f &&
             audit.Function.LocalBytesPerThread == 0 &&
             (secondaryAudit is null || secondaryAudit.Function.LocalBytesPerThread == 0);
         Print(run, extent, name, "AiDotNet", baselineDevice, baselineE2e,
-            baselineAllocation, baselineTemporaryBytes, error, null, null, 1.0, false);
+            baselineAllocation, baselineTemporaryBytes, 0, error,
+            null, null, 1.0, false);
         Print(run, extent, name, "Direct PTX", directDevice, directE2e,
-            directAllocation, directTemporaryBytes, error, audit, secondaryAudit, speedup, eligible);
+            directAllocation, directTemporaryBytes, directPersistentWorkspaceBytes,
+            error, audit, secondaryAudit, speedup, advanceToCompetitor);
     }
 
     private static Distribution MeasureDevice(
@@ -1004,16 +1025,16 @@ internal static class DirectPtxNormalizationExperiment
     {
         Console.WriteLine(
             "run rows operation                 method      dev med/p95/p99 us  " +
-            "e2e med/p95/p99 us allocB tmpB error    speed  screen R/S/L/B");
-        Console.WriteLine(new string('-', 154));
+            "e2e med/p95/p99 us allocB tmpB persistB error    speed  screen R/S/L/B");
+        Console.WriteLine(new string('-', 163));
     }
 
     private static void Print(
         int run, int rows, string name, string method,
         Distribution device, Distribution e2e,
-        long allocation, long temporaryBytes, float error,
+        long allocation, long temporaryBytes, long persistentWorkspaceBytes, float error,
         DirectPtxKernelAudit? audit, DirectPtxKernelAudit? secondaryAudit,
-        double speedup, bool eligible)
+        double speedup, bool advanceToCompetitor)
     {
         string resources = audit is null ? "-/-/-/-" :
             secondaryAudit is null
@@ -1023,12 +1044,15 @@ internal static class DirectPtxNormalizationExperiment
                   $"{Math.Max(audit.Function.StaticSharedBytes, secondaryAudit.Function.StaticSharedBytes)}/" +
                   $"{Math.Max(audit.Function.LocalBytesPerThread, secondaryAudit.Function.LocalBytesPerThread)}/" +
                   $"{Math.Min(audit.ActiveBlocksPerMultiprocessor, secondaryAudit.ActiveBlocksPerMultiprocessor)}";
-        string screen = method == "Direct PTX" ? eligible ? "ADVANCE" : "HOLD" : "BASE";
+        string screen = method == "Direct PTX"
+            ? advanceToCompetitor ? "COMPARE" : "HOLD"
+            : "BASE";
         Console.WriteLine(
             $"{run,3} {rows,5} {name,-25} {method,-10} " +
             $"{device.Median,6:F2}/{device.P95,6:F2}/{device.P99,6:F2} " +
             $"{e2e.Median,6:F2}/{e2e.P95,6:F2}/{e2e.P99,6:F2} " +
-            $"{allocation,6} {temporaryBytes,4} {error,8:E1} {speedup,5:F2}x " +
+            $"{allocation,6} {temporaryBytes,4} {persistentWorkspaceBytes,8} " +
+            $"{error,8:E1} {speedup,5:F2}x " +
             $"{screen,7} {resources}");
     }
 
