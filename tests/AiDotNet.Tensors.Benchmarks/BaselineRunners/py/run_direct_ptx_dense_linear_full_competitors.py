@@ -8,6 +8,7 @@ without creating unstable thousand-node PyTorch graphs.
 
 import argparse
 import csv
+import gc
 import glob
 import importlib.util
 import json
@@ -479,6 +480,7 @@ def main():
             ]
             compiled = None
             compiled_graph = None
+            compiled_graph_operation = None
             compiled_capture_stream = None
             try:
                 compiled = torch.compile(
@@ -549,6 +551,14 @@ def main():
                 }
                 print(json.dumps(record, separators=(",", ":")))
                 del result, correctness_probe
+            # Replay closures retain their CUDAGraph and static output. Drop
+            # every closure/list owner before releasing graph-private pools;
+            # otherwise a following shape can reuse addresses still owned by
+            # the prior graph and fail asynchronously with an illegal access.
+            torch.cuda.synchronize()
+            del competitors, graph_operation
+            if compiled_graph_operation is not None:
+                del compiled_graph_operation
             del expected, eager_graph, eager_capture_stream
             if compiled_graph is not None:
                 del compiled_graph
@@ -556,6 +566,8 @@ def main():
                 del compiled_capture_stream
             if compiled is not None:
                 del compiled
+            gc.collect()
+            torch.cuda.empty_cache()
             require_no_foreign_compute(f"{operation}-end")
     return 0
 
