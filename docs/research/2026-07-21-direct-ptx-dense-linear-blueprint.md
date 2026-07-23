@@ -127,6 +127,12 @@ and FP16-versus-FP32 accumulation into separate modules. It reads 16-bit
 operands, accumulates without a global conversion buffer, converts only at the
 final store, and supports the two transpose-free backward products.
 
+The exact M16/N16/K32 GEMM cell uses one warp. Each lane issues two aligned
+`cp.async` copies per operand, `ldmatrix` supplies four `mma.sync` instructions,
+all 256 FP32 results remain in eight accumulator registers per lane, and four
+vector stores commit the output once. Removing the second warp eliminates its
+scheduler and tail-latency cost without introducing a spill or intermediate.
+
 Two M=16 championship cells (`K512/N2048` and `K1024/N4096`) use a separate
 SM86 kernel: eight warps double-buffer FP16 input/output-major weight panels with
 `cp.async`, consume the packed panels with warp-collective `ldmatrix.x4` and
@@ -186,12 +192,14 @@ mode.
 
 Dense dot uses aligned `float4` streams, register partials, warp shuffles,
 eight shared warp totals (32 bytes), one block barrier, and one final global
-store. The B4/K512 batched-dot specialization assigns one warp to each batch,
-uses aligned `float4` streams and register-only shuffles, and requires no
-shared memory or barrier. Strided dot bakes its valid interval, offset, and
+store. The B4/K512 batched-dot specialization assigns one vectorized four-warp
+CTA to each batch. Every lane consumes exactly one aligned `float4` pair; warp
+totals fold through a conflict-free 16-byte shared table and one barrier.
+Strided dot bakes its valid interval, offset, and
 step into the module; its two-stage shuffle reduction replaces the prior 1 KiB
 and eight-barrier shared tree with eight shared warp totals and one barrier.
-Outer uses aligned `float4` transactions for the measured M64/N128 cell;
+Outer uses aligned `float4` transactions and a baked 128-thread launch for the
+measured M64/N128 cell. Its exact work count removes the bounds predicate;
 fallback specializations still write every independent output exactly once.
 
 ## Global-memory ledger
@@ -205,7 +213,7 @@ fallback specializations still write every independent output exactly once.
 | LoRA | input, base, A, B | warp partials and rank projection in shared; residual epilogue in registers | final output once |
 | linear CE | hidden, weight, bias, target | logits in registers; reductions in shared | one atomic scalar contribution/row |
 | dense/strided dot | two vectors | register partials, then 32-byte shared warp totals | one scalar |
-| batched dot | two batched vectors | one register-only warp reduction per batch | one scalar/batch |
+| batched dot | two batched vectors | four register reductions plus a 16-byte shared fold per batch | one scalar/batch |
 | outer | two vectors | product in a register | each output element once |
 
 There are no shape-dependent temporary device allocations in admitted direct
@@ -263,8 +271,10 @@ active blocks per SM, occupancy inputs, and the JIT log.
 
 ## Benchmark contract
 
-The per-process runner uses 30 warmups, 101 samples, 50 launches per CUDA-event
-sample, and a 64-launch tiered-JIT settling window before its exact allocation
+The per-process runner uses 30 warmups, 101 samples, 50 launches per eager CUDA-event
+sample, and 1000 logical operations per captured graph replay. The longer graph
+replay amortizes event and host-launch floors for sub-2-microsecond kernels without
+changing the per-operation normalization. A 64-launch tiered-JIT settling window precedes its exact allocation
 measurement. It reports device and E2E
 mean/median/P95/P99, GFLOPS/TFLOPS, managed bytes/call, temporary device bytes,
 maximum error, registers, shared/local bytes, active blocks/SM, blueprint id,
@@ -310,14 +320,14 @@ zero `LDL` and zero `STL` in every entry. Representative hardware rows are:
 |---|---:|---:|---:|---:|---:|---:|
 | FP32 GEMM M64/K256/N256 | 60 | 8192 | 0 | 8 | 0 | 0 / 0 |
 | FP32 fused GELU M64/K256/N256 | 60 | 8192 | 0 | 8 | 0 | 0 / 0 |
-| FP16 GEMM M16/K32/N16 | 20 | 2048 | 2 | 4 | 2 | 0 / 0 |
+| FP16 GEMM M16/K32/N16 | 28 | 2048 | 6 | 4 | 4 | 0 / 0 |
 | FP16 fused GELU M16/K512/N2048 N32 | 39 | 12288 | 64 | 24 | 32 | 0 / 0 |
 | FP16 fused GELU M16/K512/N2048 N64 | 39 | 20480 | 64 | 24 | 32 | 0 / 0 |
 | FP16 fused GELU M16/K1024/N4096 N32 | 34 | 24576 | 128 | 48 | 64 | 0 / 0 |
 | FP16 fused GELU M16/K1024/N4096 N64 | 34 | 40960 | 128 | 48 | 64 | 0 / 0 |
 | dense dot K4096 float4 | 24 | 32 | 0 | 0 | 0 | 0 / 0 |
 | outer M64/N128 float4 | 14 | 0 | 0 | 0 | 0 | 0 / 0 |
-| batched dot B4/K512 float4 | 24 | 0 | 0 | 0 | 0 | 0 / 0 |
+| batched dot B4/K512 float4 | 24 | 16 | 0 | 0 | 0 | 0 / 0 |
 | reverse strided dot K512 | 24 | 32 | 0 | 0 | 0 | 0 / 0 |
 
 The deterministic Nsight target additionally launches all 16 exact embedded-

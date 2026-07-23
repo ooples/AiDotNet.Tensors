@@ -20,7 +20,7 @@ internal static class DirectPtxDenseLinearFullExperiment
     private const int Warmups = 30;
     private const int Samples = 101;
     private const int DeviceLaunches = 50;
-    private const int GraphOperationsPerReplay = 50;
+    private const int GraphOperationsPerReplay = 1000;
     private const double Tolerance = 2e-4;
     private static string _deviceFingerprint = "n/a";
 

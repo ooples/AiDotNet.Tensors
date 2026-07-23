@@ -26,7 +26,7 @@ internal enum DirectPtxGemmOutputType
 internal sealed class PtxFp16GemmKernel : IDisposable
 {
     internal const int BaselineBlockThreads = 256;
-    internal const int TensorCoreBlockThreads = 64;
+    internal const int TensorCoreBlockThreads = 32;
     internal const string EntryPoint = "aidotnet_fp16_gemm";
 
     private readonly DirectPtxModule _module;
@@ -232,7 +232,7 @@ internal sealed class PtxFp16GemmKernel : IDisposable
         ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
-        ptx.AppendLine("// exact FP16 M16 N16 K32: two-warp async Tensor-Core specialization");
+        ptx.AppendLine("// exact FP16 M16 N16 K32: one-warp async Tensor-Core specialization");
         ptx.AppendLine($".visible .entry {EntryPoint}(");
         ptx.AppendLine("    .param .u64 left_ptr,");
         ptx.AppendLine("    .param .u64 right_ptr,");
@@ -242,38 +242,40 @@ internal sealed class PtxFp16GemmKernel : IDisposable
         ptx.AppendLine("{");
         ptx.AppendLine("    .reg .b32 %r<24>;");
         ptx.AppendLine("    .reg .b32 %a<4>;");
-        ptx.AppendLine("    .reg .b32 %b<2>;");
+        ptx.AppendLine("    .reg .b32 %b<4>;");
         ptx.AppendLine("    .reg .b64 %rd<14>;");
-        ptx.AppendLine("    .reg .f32 %c<4>;");
+        ptx.AppendLine("    .reg .f32 %c<8>;");
         ptx.AppendLine("    .shared .align 16 .b8 smem[2048];");
         ptx.AppendLine("    ld.param.u64 %rd0, [left_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd1, [right_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd2, [output_ptr];");
         ptx.AppendLine("    mov.u32 %r0, %tid.x;");
-        ptx.AppendLine("    and.b32 %r1, %r0, 31;");
-        ptx.AppendLine("    shr.u32 %r2, %r0, 5;");
-        ptx.AppendLine("    shl.b32 %r3, %r0, 4;");
-        ptx.AppendLine("    cvt.u64.u32 %rd3, %r3;");
-        ptx.AppendLine("    add.u64 %rd4, %rd0, %rd3;");
-        ptx.AppendLine("    add.u64 %rd5, %rd1, %rd3;");
-        // A is repacked from row-major [16,32] into two adjacent M16xK16
-        // panels so one x4 ldmatrix supplies each MMA K fragment.
-        ptx.AppendLine("    shr.u32 %r4, %r0, 2;");
-        ptx.AppendLine("    and.b32 %r5, %r0, 3;");
-        ptx.AppendLine("    shr.u32 %r6, %r5, 1;");
-        ptx.AppendLine("    and.b32 %r7, %r5, 1;");
-        ptx.AppendLine("    shl.b32 %r6, %r6, 9;");
-        ptx.AppendLine("    shl.b32 %r7, %r7, 4;");
-        ptx.AppendLine("    mad.lo.u32 %r8, %r4, 32, %r6;");
-        ptx.AppendLine("    add.u32 %r8, %r8, %r7;");
         ptx.AppendLine("    mov.u64 %rd6, smem;");
-        ptx.AppendLine("    cvt.u64.u32 %rd7, %r8;");
-        ptx.AppendLine("    add.u64 %rd8, %rd6, %rd7;");
-        ptx.AppendLine("    cp.async.ca.shared.global [%rd8], [%rd4], 16;");
-        // B remains row-major [32,16]. The transposed x2 ldmatrix below
-        // presents its KxN rows as the column-major MMA B fragment.
-        ptx.AppendLine("    add.u64 %rd9, %rd6, %rd3;");
-        ptx.AppendLine("    cp.async.ca.shared.global [%rd9+1024], [%rd5], 16;");
+        ptx.AppendLine("    mov.u32 %r1, %r0;");
+        // One warp issues two 16-byte copies per operand. A is repacked from
+        // row-major [16,32] into adjacent M16xK16 panels; B remains row-major.
+        for (int copy = 0; copy < 2; copy++)
+        {
+            int threadOffset = copy * TensorCoreBlockThreads;
+            ptx.AppendLine($"    add.u32 %r2, %r0, {threadOffset};");
+            ptx.AppendLine("    shl.b32 %r3, %r2, 4;");
+            ptx.AppendLine("    cvt.u64.u32 %rd3, %r3;");
+            ptx.AppendLine("    add.u64 %rd4, %rd0, %rd3;");
+            ptx.AppendLine("    add.u64 %rd5, %rd1, %rd3;");
+            ptx.AppendLine("    shr.u32 %r4, %r2, 2;");
+            ptx.AppendLine("    and.b32 %r5, %r2, 3;");
+            ptx.AppendLine("    shr.u32 %r6, %r5, 1;");
+            ptx.AppendLine("    and.b32 %r7, %r5, 1;");
+            ptx.AppendLine("    shl.b32 %r6, %r6, 9;");
+            ptx.AppendLine("    shl.b32 %r7, %r7, 4;");
+            ptx.AppendLine("    mad.lo.u32 %r8, %r4, 32, %r6;");
+            ptx.AppendLine("    add.u32 %r8, %r8, %r7;");
+            ptx.AppendLine("    cvt.u64.u32 %rd7, %r8;");
+            ptx.AppendLine("    add.u64 %rd8, %rd6, %rd7;");
+            ptx.AppendLine("    cp.async.ca.shared.global [%rd8], [%rd4], 16;");
+            ptx.AppendLine("    add.u64 %rd9, %rd6, %rd3;");
+            ptx.AppendLine("    cp.async.ca.shared.global [%rd9+1024], [%rd5], 16;");
+        }
         ptx.AppendLine("    cp.async.commit_group;");
         ptx.AppendLine("    cp.async.wait_group 0;");
         ptx.AppendLine("    bar.sync 0;");
@@ -281,6 +283,10 @@ internal sealed class PtxFp16GemmKernel : IDisposable
         ptx.AppendLine("    mov.f32 %c1, 0f00000000;");
         ptx.AppendLine("    mov.f32 %c2, 0f00000000;");
         ptx.AppendLine("    mov.f32 %c3, 0f00000000;");
+        ptx.AppendLine("    mov.f32 %c4, 0f00000000;");
+        ptx.AppendLine("    mov.f32 %c5, 0f00000000;");
+        ptx.AppendLine("    mov.f32 %c6, 0f00000000;");
+        ptx.AppendLine("    mov.f32 %c7, 0f00000000;");
         // Warp-collective A addresses for an M16xK16 row-major fragment.
         ptx.AppendLine("    and.b32 %r9, %r1, 7;");
         ptx.AppendLine("    shr.u32 %r10, %r1, 3;");
@@ -290,15 +296,13 @@ internal sealed class PtxFp16GemmKernel : IDisposable
         ptx.AppendLine("    shl.b32 %r10, %r10, 4;");
         ptx.AppendLine("    mad.lo.u32 %r9, %r9, 32, %r11;");
         ptx.AppendLine("    add.u32 %r9, %r9, %r10;");
-        // Warp 0 consumes N0..7; warp 1 consumes N8..15. The second x2
-        // matrix starts eight K rows later (8 * 32 bytes).
+        // The first B fragment consumes N0..7; the second consumes N8..15.
+        // The second x2 matrix starts eight K rows later (8 * 32 bytes).
         ptx.AppendLine("    and.b32 %r12, %r1, 7;");
         ptx.AppendLine("    shr.u32 %r13, %r1, 3;");
         ptx.AppendLine("    and.b32 %r13, %r13, 1;");
         ptx.AppendLine("    shl.b32 %r13, %r13, 8;");
         ptx.AppendLine("    mad.lo.u32 %r12, %r12, 32, %r13;");
-        ptx.AppendLine("    shl.b32 %r14, %r2, 4;");
-        ptx.AppendLine("    add.u32 %r12, %r12, %r14;");
         ptx.AppendLine("    cvt.u64.u32 %rd10, %r9;");
         ptx.AppendLine("    add.u64 %rd11, %rd6, %rd10;");
         ptx.AppendLine("    cvt.u64.u32 %rd12, %r12;");
@@ -312,17 +316,22 @@ internal sealed class PtxFp16GemmKernel : IDisposable
                 $"{{%b0,%b1}}, [%rd13+{1024 + offset}];");
             ptx.AppendLine("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 " +
                 "{%c0,%c1,%c2,%c3}, {%a0,%a1,%a2,%a3}, {%b0,%b1}, {%c0,%c1,%c2,%c3};");
+            ptx.AppendLine($"    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 " +
+                $"{{%b2,%b3}}, [%rd13+{1024 + offset + 16}];");
+            ptx.AppendLine("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 " +
+                "{%c4,%c5,%c6,%c7}, {%a0,%a1,%a2,%a3}, {%b2,%b3}, {%c4,%c5,%c6,%c7};");
         }
         ptx.AppendLine("    shr.u32 %r15, %r1, 2;");
         ptx.AppendLine("    and.b32 %r16, %r1, 3;");
         ptx.AppendLine("    shl.b32 %r16, %r16, 1;");
-        ptx.AppendLine("    mad.lo.u32 %r16, %r2, 8, %r16;");
         ptx.AppendLine("    mad.lo.u32 %r17, %r15, 16, %r16;");
         ptx.AppendLine("    shl.b32 %r17, %r17, 2;");
         ptx.AppendLine("    cvt.u64.u32 %rd10, %r17;");
         ptx.AppendLine("    add.u64 %rd11, %rd2, %rd10;");
         ptx.AppendLine("    st.global.v2.f32 [%rd11], {%c0,%c1};");
         ptx.AppendLine("    st.global.v2.f32 [%rd11+512], {%c2,%c3};");
+        ptx.AppendLine("    st.global.v2.f32 [%rd11+32], {%c4,%c5};");
+        ptx.AppendLine("    st.global.v2.f32 [%rd11+544], {%c6,%c7};");
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");
         return ptx.ToString();
@@ -381,7 +390,7 @@ internal sealed class PtxFp16GemmKernel : IDisposable
             inputType, outputType, halfAccumulate);
         return new DirectPtxKernelBlueprint(
             Operation: "16-bit-gemm",
-            Version: tensorCore ? 2 : 1,
+            Version: tensorCore ? 3 : 1,
             Architecture: architecture,
             Variant: $"{(tensorCore ? "tensorcore-async-" : string.Empty)}{inputType}-to-{outputType}-b{batch}-m{m}-n{n}-k{k}-ta{transposeA}-tb{transposeB}-ha{halfAccumulate}",
             Tensors:
@@ -397,7 +406,7 @@ internal sealed class PtxFp16GemmKernel : IDisposable
                 MaxRegistersPerThread: 32,
                 MaxStaticSharedBytes: tensorCore ? 2_048 : 0,
                 MaxLocalBytesPerThread: 0,
-                MinBlocksPerMultiprocessor: tensorCore ? 8 : 4),
+                MinBlocksPerMultiprocessor: tensorCore ? 12 : 4),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["formula"] = "output=op(left)@op(right)",
@@ -413,7 +422,7 @@ internal sealed class PtxFp16GemmKernel : IDisposable
                 ["stride-parameters"] = "none",
                 ["temporary-device-allocation"] = "none",
                 ["pipeline"] = tensorCore
-                    ? "two-warp-cp.async-ldmatrix-mma; register-only-output"
+                    ? "one-warp-cp.async-ldmatrix-mma; register-only-output"
                     : "scalar-correctness-baseline",
                 ["promotion"] = tensorCore
                     ? "exact M16 N16 K32 Tensor-Core experiment"

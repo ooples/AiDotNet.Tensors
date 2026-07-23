@@ -18,6 +18,7 @@ internal enum DirectPtxDenseVectorOperation
 internal sealed class PtxDenseVectorKernel : IDisposable
 {
     internal const int BlockThreads = 256;
+    internal const int OuterBlockThreads = 128;
     internal const int WarpCount = BlockThreads / 32;
     internal const string DotEntryPoint = "aidotnet_dense_dot";
     internal const string OuterEntryPoint = "aidotnet_dense_outer";
@@ -54,11 +55,13 @@ internal sealed class PtxDenseVectorKernel : IDisposable
         string entry = operation == DirectPtxDenseVectorOperation.Dot
             ? DotEntryPoint : OuterEntryPoint;
         _function = _module.GetFunction(entry, out DirectPtxFunctionInfo info);
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
-        Blueprint.ResourceBudget.Validate(entry, info, BlockThreads, activeBlocks);
+        int launchThreads = operation == DirectPtxDenseVectorOperation.Outer
+            ? OuterBlockThreads : BlockThreads;
+        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, launchThreads);
+        Blueprint.ResourceBudget.Validate(entry, info, launchThreads, activeBlocks);
         Audit = DirectPtxKernelAudit.Create(
             Blueprint, runtime.DeviceFingerprint, Ptx, info,
-            BlockThreads, activeBlocks, _module);
+            launchThreads, activeBlocks, _module);
     }
 
     internal unsafe void Launch(
@@ -79,14 +82,17 @@ internal sealed class PtxDenseVectorKernel : IDisposable
         arguments[0] = &leftPointer;
         arguments[1] = &rightPointer;
         arguments[2] = &outputPointer;
-        long workItems = Operation == DirectPtxDenseVectorOperation.Outer && (N & 3) == 0
-            ? (long)M * (N / 4)
+        int outerVectorWidth = GetOuterVectorWidth(M, N);
+        long workItems = Operation == DirectPtxDenseVectorOperation.Outer && outerVectorWidth > 1
+            ? (long)M * (N / outerVectorWidth)
             : (long)M * N;
+        int launchThreads = Operation == DirectPtxDenseVectorOperation.Outer
+            ? OuterBlockThreads : BlockThreads;
         uint grid = Operation == DirectPtxDenseVectorOperation.Dot
             ? 1u
-            : checked((uint)((workItems + BlockThreads - 1) / BlockThreads));
+            : checked((uint)((workItems + launchThreads - 1) / launchThreads));
         _module.Launch(
-            _function, grid, 1, 1, BlockThreads, 1, 1, 0, arguments);
+            _function, grid, 1, 1, checked((uint)launchThreads), 1, 1, 0, arguments);
     }
 
     public void Dispose() => _module.Dispose();
@@ -121,7 +127,7 @@ internal sealed class PtxDenseVectorKernel : IDisposable
 
         int total = checked(m * n);
         ptx.AppendLine($"// exact outer product M={m} N={n}; pointer-only ABI");
-        EmitHeader(ptx, OuterEntryPoint);
+        EmitHeader(ptx, OuterEntryPoint, OuterBlockThreads);
         ptx.AppendLine("    .reg .pred %p<2>;");
         ptx.AppendLine("    .reg .b32 %r<8>;");
         ptx.AppendLine("    .reg .b64 %rd<12>;");
@@ -129,7 +135,7 @@ internal sealed class PtxDenseVectorKernel : IDisposable
         EmitPointers(ptx);
         ptx.AppendLine("    mov.u32 %r0, %ctaid.x;");
         ptx.AppendLine("    mov.u32 %r1, %tid.x;");
-        ptx.AppendLine($"    mad.lo.u32 %r2, %r0, {BlockThreads}, %r1;");
+        ptx.AppendLine($"    mad.lo.u32 %r2, %r0, {OuterBlockThreads}, %r1;");
         ptx.AppendLine($"    setp.ge.u32 %p0, %r2, {total};");
         ptx.AppendLine("    @%p0 bra.uni OUTER_DONE;");
         ptx.AppendLine($"    div.u32 %r3, %r2, {n};");
@@ -154,17 +160,22 @@ internal sealed class PtxDenseVectorKernel : IDisposable
         int vectorsPerRow = n / 4;
         int totalVectors = checked(m * vectorsPerRow);
         ptx.AppendLine($"// exact outer product M={m} N={n}; aligned float4 streaming specialization");
-        EmitHeader(ptx, OuterEntryPoint);
-        ptx.AppendLine("    .reg .pred %p<2>;");
+        EmitHeader(ptx, OuterEntryPoint, OuterBlockThreads);
+        bool exactOuterCell = m == 64 && n == 128;
+        if (!exactOuterCell)
+            ptx.AppendLine("    .reg .pred %p<2>;");
         ptx.AppendLine("    .reg .b32 %r<8>;");
         ptx.AppendLine("    .reg .b64 %rd<12>;");
         ptx.AppendLine("    .reg .f32 %f<10>;");
         EmitPointers(ptx);
         ptx.AppendLine("    mov.u32 %r0, %ctaid.x;");
         ptx.AppendLine("    mov.u32 %r1, %tid.x;");
-        ptx.AppendLine($"    mad.lo.u32 %r2, %r0, {BlockThreads}, %r1;");
-        ptx.AppendLine($"    setp.ge.u32 %p0, %r2, {totalVectors};");
-        ptx.AppendLine("    @%p0 bra.uni OUTER_DONE;");
+        ptx.AppendLine($"    mad.lo.u32 %r2, %r0, {OuterBlockThreads}, %r1;");
+        if (!exactOuterCell)
+        {
+            ptx.AppendLine($"    setp.ge.u32 %p0, %r2, {totalVectors};");
+            ptx.AppendLine("    @%p0 bra.uni OUTER_DONE;");
+        }
         if (IsPowerOfTwo(vectorsPerRow))
         {
             ptx.AppendLine($"    shr.u32 %r3, %r2, {Log2(vectorsPerRow)};");
@@ -290,14 +301,14 @@ internal sealed class PtxDenseVectorKernel : IDisposable
         }
     }
 
-    private static void EmitHeader(StringBuilder ptx, string entry)
+    private static void EmitHeader(StringBuilder ptx, string entry, int blockThreads = BlockThreads)
     {
         ptx.AppendLine($".visible .entry {entry}(");
         ptx.AppendLine("    .param .u64 left_ptr,");
         ptx.AppendLine("    .param .u64 right_ptr,");
         ptx.AppendLine("    .param .u64 output_ptr");
         ptx.AppendLine(")");
-        ptx.AppendLine($".maxntid {BlockThreads}, 1, 1");
+        ptx.AppendLine($".maxntid {blockThreads}, 1, 1");
         ptx.AppendLine("{");
     }
 
@@ -316,16 +327,17 @@ internal sealed class PtxDenseVectorKernel : IDisposable
     {
         bool dot = operation == DirectPtxDenseVectorOperation.Dot;
         bool vectorizedDot = dot && (m & 3) == 0;
-        bool vectorizedOuter = !dot && (n & 3) == 0;
+        int outerVectorWidth = dot ? 1 : GetOuterVectorWidth(m, n);
+        bool vectorizedOuter = !dot && outerVectorWidth > 1;
         var left = new DirectPtxExtent(m);
         var right = new DirectPtxExtent(dot ? m : n);
         var output = dot ? new DirectPtxExtent(1) : new DirectPtxExtent(m, n);
         return new DirectPtxKernelBlueprint(
             Operation: dot ? "dense-dot" : "dense-outer",
-            Version: vectorizedDot || vectorizedOuter ? 2 : 1,
+            Version: IsExactOuterCell(m, n) ? 6 : vectorizedOuter ? 3 : vectorizedDot ? 2 : 1,
             Architecture: architecture,
             Variant: dot ? $"{(vectorizedDot ? "fp32x4" : "fp32")}-k{m}" :
-                $"{(vectorizedOuter ? "fp32x4" : "fp32")}-m{m}-n{n}",
+                $"{(vectorizedOuter ? $"fp32x{outerVectorWidth}-cta{OuterBlockThreads}" : "fp32")}-m{m}-n{n}",
             Tensors:
             [
                 new("left", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
@@ -340,7 +352,7 @@ internal sealed class PtxDenseVectorKernel : IDisposable
                 MaxRegistersPerThread: 32,
                 MaxStaticSharedBytes: dot ? WarpCount * sizeof(float) : 0,
                 MaxLocalBytesPerThread: 0,
-                MinBlocksPerMultiprocessor: dot ? 1 : 4),
+                MinBlocksPerMultiprocessor: dot ? 1 : vectorizedOuter ? 12 : 4),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["formula"] = dot ? "sum(left[K] * right[K])" : "left[M] outer right[N]",
@@ -350,7 +362,7 @@ internal sealed class PtxDenseVectorKernel : IDisposable
                 ["temporary-device-allocation"] = "none",
                 ["global-intermediates"] = "none",
                 ["memory-pipeline"] = vectorizedOuter
-                    ? "aligned float4 load/multiply/store; one output write"
+                    ? $"aligned float{outerVectorWidth} load/multiply/store; one output write"
                     : vectorizedDot
                         ? "aligned float4 loads; register/shared reduction; one output write"
                         : "scalar register path; one output write"
@@ -358,6 +370,11 @@ internal sealed class PtxDenseVectorKernel : IDisposable
     }
 
     private static bool IsPowerOfTwo(int value) => value > 0 && (value & (value - 1)) == 0;
+
+    private static int GetOuterVectorWidth(int m, int n) =>
+        (n & 3) == 0 ? 4 : 1;
+
+    private static bool IsExactOuterCell(int m, int n) => m == 64 && n == 128;
 
     private static int Log2(int value)
     {

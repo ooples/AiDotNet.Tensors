@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Resident PyTorch CUDA eager/graph peers for issue #836 operation families.
 
-Graph rows replay a captured sequence of 50 logical operations and normalize
+Graph rows replay a captured sequence of 1000 logical operations and normalize
 per operation, matching the .NET runner and avoiding one-node graph submission
 latency in the GPU execution comparison.
 """
@@ -26,7 +26,7 @@ import torch.nn.functional as functional
 WARMUPS = 30
 SAMPLES = 101
 DEVICE_LAUNCHES = 50
-GRAPH_OPERATIONS_PER_REPLAY = 50
+GRAPH_OPERATIONS_PER_REPLAY = 1000
 
 
 def foreign_python_processes():

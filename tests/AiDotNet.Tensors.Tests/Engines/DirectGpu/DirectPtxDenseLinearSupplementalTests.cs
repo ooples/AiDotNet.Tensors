@@ -176,15 +176,17 @@ public partial class DirectPtxWmmaTests
     public void BatchedVectorAndCrossEntropyEmitters_HavePointerOnlyExactAbis()
     {
         string batchDot = PtxBatchedVectorKernel.EmitPtx(
-            8, 6, DirectPtxBatchedVectorOperation.Dot, batch: 8, m: 512);
+            8, 6, DirectPtxBatchedVectorOperation.Dot, batch: 4, m: 512);
         Assert.Contains(PtxBatchedVectorKernel.DotEntryPoint, batchDot, StringComparison.Ordinal);
         Assert.Equal(3, Count(batchDot, ".param .u64"));
-        Assert.Contains(".maxntid 256, 1, 1", batchDot, StringComparison.Ordinal);
-        Assert.DoesNotContain(".shared", batchDot, StringComparison.Ordinal);
-        Assert.DoesNotContain("bar.sync", batchDot, StringComparison.Ordinal);
+        Assert.Contains(".maxntid 128, 1, 1", batchDot, StringComparison.Ordinal);
+        Assert.Contains("mov.u32 %r1, %ctaid.x", batchDot, StringComparison.Ordinal);
+        Assert.Contains(".shared .align 16 .b8 partial[16]", batchDot, StringComparison.Ordinal);
+        Assert.Equal(1, Count(batchDot, "bar.sync 0"));
         Assert.Equal(2, Count(batchDot, "ld.global.nc.v4.f32"));
-        Assert.Equal(4, Count(batchDot, "fma.rn.f32"));
-        Assert.Equal(5, Count(batchDot, "shfl.sync.down.b32"));
+        Assert.Equal(1, Count(batchDot, "mul.rn.f32"));
+        Assert.Equal(3, Count(batchDot, "fma.rn.f32"));
+        Assert.Equal(10, Count(batchDot, "shfl.sync.down.b32"));
         Assert.DoesNotContain(".param .u32", batchDot, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", batchDot, StringComparison.Ordinal);
         Assert.DoesNotContain("stride", batchDot, StringComparison.OrdinalIgnoreCase);
@@ -250,9 +252,9 @@ public partial class DirectPtxWmmaTests
             8, 6, DirectPtxDenseVectorOperation.Outer, 64, 128);
         Assert.Contains(PtxDenseVectorKernel.OuterEntryPoint, outer, StringComparison.Ordinal);
         Assert.Equal(3, Count(outer, ".param .u64"));
+        Assert.Equal(1, Count(outer, "ld.global.nc.v4.f32"));
         Assert.Equal(1, Count(outer, "st.global.v4.f32"));
-        Assert.Contains("ld.global.nc.v4.f32", outer, StringComparison.Ordinal);
-        Assert.Contains("st.global.v4.f32", outer, StringComparison.Ordinal);
+        Assert.Contains(".maxntid 128, 1, 1", outer, StringComparison.Ordinal);
         Assert.DoesNotContain("div.u32", outer, StringComparison.Ordinal);
         Assert.DoesNotContain("rem.u32", outer, StringComparison.Ordinal);
         Assert.DoesNotContain(".shared", outer, StringComparison.Ordinal);
@@ -812,16 +814,16 @@ public partial class DirectPtxWmmaTests
     }
 
     [Fact]
-    public void ExactFp16GemmEmitter_UsesTwoWarpAsyncTensorCorePipeline()
+    public void ExactFp16GemmEmitter_UsesOneWarpAsyncTensorCorePipeline()
     {
         string ptx = PtxFp16GemmKernel.EmitPtx(8, 6, m: 16, n: 16, k: 32);
-        Assert.Contains(".maxntid 64, 1, 1", ptx, StringComparison.Ordinal);
-        Assert.Equal(2, Count(ptx, "cp.async.ca.shared.global"));
+        Assert.Contains(".maxntid 32, 1, 1", ptx, StringComparison.Ordinal);
+        Assert.Equal(4, Count(ptx, "cp.async.ca.shared.global"));
         Assert.Equal(2, Count(ptx, "ldmatrix.sync.aligned.m8n8.x4.shared.b16"));
-        Assert.Equal(2, Count(ptx, "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16"));
-        Assert.Equal(2, Count(
+        Assert.Equal(4, Count(ptx, "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16"));
+        Assert.Equal(4, Count(
             ptx, "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"));
-        Assert.Equal(2, Count(ptx, "st.global.v2.f32"));
+        Assert.Equal(4, Count(ptx, "st.global.v2.f32"));
         Assert.DoesNotContain("GEMM_K_LOOP", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);

@@ -18,6 +18,8 @@ internal enum DirectPtxBatchedVectorOperation
 internal sealed class PtxBatchedVectorKernel : IDisposable
 {
     internal const int BaselineBlockThreads = 256;
+    internal const int WarpBlockThreads = 32;
+    internal const int VectorBlockThreads = 128;
     internal const int WarpCount = BaselineBlockThreads / 32;
     internal const string DotEntryPoint = "aidotnet_batched_dot";
     internal const string OuterEntryPoint = "aidotnet_batched_outer";
@@ -87,7 +89,7 @@ internal sealed class PtxBatchedVectorKernel : IDisposable
         arguments[1] = &rightPointer;
         arguments[2] = &outputPointer;
         uint grid = Operation == DirectPtxBatchedVectorOperation.Dot
-            ? (IsWarpPerBatchDot(Operation, Batch, M) ? 1u : checked((uint)Batch))
+            ? checked((uint)Batch)
             : checked((uint)(((long)Batch * M * N + BaselineBlockThreads - 1) /
                 BaselineBlockThreads));
         _module.Launch(
@@ -156,6 +158,12 @@ internal sealed class PtxBatchedVectorKernel : IDisposable
 
     private static void EmitDot(StringBuilder ptx, int batch, int dimension, int blockThreads)
     {
+        if (IsFusedBatchDot(DirectPtxBatchedVectorOperation.Dot, batch, dimension))
+        {
+            EmitFusedBatchDot(ptx, batch, dimension, blockThreads);
+            return;
+        }
+
         if (IsWarpPerBatchDot(DirectPtxBatchedVectorOperation.Dot, batch, dimension))
         {
             EmitWarpPerBatchDot(ptx, batch, dimension, blockThreads);
@@ -219,6 +227,66 @@ internal sealed class PtxBatchedVectorKernel : IDisposable
         ptx.AppendLine("}");
     }
 
+    private static void EmitFusedBatchDot(
+        StringBuilder ptx,
+        int batch,
+        int dimension,
+        int blockThreads)
+    {
+        int batchBytes = checked(dimension * sizeof(float));
+        ptx.AppendLine($"// exact batched dot B={batch} D={dimension}; one vectorized four-warp CTA per batch");
+        EmitHeader(ptx, DotEntryPoint, blockThreads);
+        ptx.AppendLine("    .reg .pred %p<4>;");
+        ptx.AppendLine("    .reg .b32 %r<12>;");
+        ptx.AppendLine("    .reg .b64 %rd<16>;");
+        ptx.AppendLine("    .reg .f32 %f<14>;");
+        ptx.AppendLine("    .shared .align 16 .b8 partial[16];");
+        EmitPointers(ptx);
+        ptx.AppendLine("    mov.u32 %r0, %tid.x;");
+        ptx.AppendLine("    mov.u32 %r1, %ctaid.x;");
+        ptx.AppendLine($"    mul.wide.u32 %rd3, %r1, {batchBytes};");
+        ptx.AppendLine("    add.u64 %rd4, %rd0, %rd3;");
+        ptx.AppendLine("    add.u64 %rd5, %rd1, %rd3;");
+        ptx.AppendLine("    shl.b32 %r1, %r0, 2;");
+        ptx.AppendLine("    mul.wide.u32 %rd6, %r1, 4;");
+        ptx.AppendLine("    add.u64 %rd7, %rd4, %rd6;");
+        ptx.AppendLine("    add.u64 %rd8, %rd5, %rd6;");
+        ptx.AppendLine("    ld.global.nc.v4.f32 {%f0,%f1,%f2,%f3}, [%rd7];");
+        ptx.AppendLine("    ld.global.nc.v4.f32 {%f4,%f5,%f6,%f7}, [%rd8];");
+        ptx.AppendLine("    mul.rn.f32 %f8, %f0, %f4;");
+        ptx.AppendLine("    fma.rn.f32 %f8, %f1, %f5, %f8;");
+        ptx.AppendLine("    fma.rn.f32 %f8, %f2, %f6, %f8;");
+        ptx.AppendLine("    fma.rn.f32 %f8, %f3, %f7, %f8;");
+        ptx.AppendLine("    and.b32 %r2, %r0, 31;");
+        ptx.AppendLine("    shr.u32 %r3, %r0, 5;");
+        EmitWarpReduction(ptx, "%f8", "%f9", "%r4", "%r5");
+        ptx.AppendLine("    mov.u64 %rd9, partial;");
+        ptx.AppendLine("    setp.ne.u32 %p0, %r2, 0;");
+        ptx.AppendLine("    @%p0 bra.uni BATCH_DOT_VECTOR_PUBLISHED;");
+        ptx.AppendLine("    mul.wide.u32 %rd10, %r3, 4;");
+        ptx.AppendLine("    add.u64 %rd11, %rd9, %rd10;");
+        ptx.AppendLine("    st.shared.f32 [%rd11], %f8;");
+        ptx.AppendLine("BATCH_DOT_VECTOR_PUBLISHED:");
+        ptx.AppendLine("    bar.sync 0;");
+        ptx.AppendLine("    setp.ne.u32 %p1, %r3, 0;");
+        ptx.AppendLine("    @%p1 bra.uni BATCH_DOT_VECTOR_DONE;");
+        ptx.AppendLine("    setp.lt.u32 %p2, %r2, 4;");
+        ptx.AppendLine("    mov.f32 %f8, 0f00000000;");
+        ptx.AppendLine("    mul.wide.u32 %rd12, %r2, 4;");
+        ptx.AppendLine("    add.u64 %rd13, %rd9, %rd12;");
+        ptx.AppendLine("    @%p2 ld.shared.f32 %f8, [%rd13];");
+        EmitWarpReduction(ptx, "%f8", "%f9", "%r4", "%r5");
+        ptx.AppendLine("    setp.ne.u32 %p3, %r2, 0;");
+        ptx.AppendLine("    @%p3 bra.uni BATCH_DOT_VECTOR_DONE;");
+        ptx.AppendLine("    mov.u32 %r6, %ctaid.x;");
+        ptx.AppendLine("    mul.wide.u32 %rd14, %r6, 4;");
+        ptx.AppendLine("    add.u64 %rd15, %rd2, %rd14;");
+        ptx.AppendLine("    st.global.f32 [%rd15], %f8;");
+        ptx.AppendLine("BATCH_DOT_VECTOR_DONE:");
+        ptx.AppendLine("    ret;");
+        ptx.AppendLine("}");
+    }
+
     private static void EmitWarpPerBatchDot(
         StringBuilder ptx,
         int batch,
@@ -226,7 +294,7 @@ internal sealed class PtxBatchedVectorKernel : IDisposable
         int blockThreads)
     {
         int batchBytes = checked(dimension * sizeof(float));
-        ptx.AppendLine($"// exact batched dot B={batch} D={dimension}; one warp per batch, aligned float4 streaming, register-only reduction");
+        ptx.AppendLine($"// exact batched dot B={batch} D={dimension}; one warp block per batch, aligned float4 streaming, register-only reduction");
         EmitHeader(ptx, DotEntryPoint, blockThreads);
         ptx.AppendLine("    .reg .pred %p<3>;");
         ptx.AppendLine("    .reg .b32 %r<10>;");
@@ -234,8 +302,8 @@ internal sealed class PtxBatchedVectorKernel : IDisposable
         ptx.AppendLine("    .reg .f32 %f<15>;");
         EmitPointers(ptx);
         ptx.AppendLine("    mov.u32 %r0, %tid.x;");
-        ptx.AppendLine("    and.b32 %r1, %r0, 31;");
-        ptx.AppendLine("    shr.u32 %r2, %r0, 5;");
+        ptx.AppendLine("    mov.u32 %r1, %r0;");
+        ptx.AppendLine("    mov.u32 %r2, %ctaid.x;");
         ptx.AppendLine($"    mul.wide.u32 %rd3, %r2, {batchBytes};");
         ptx.AppendLine("    add.u64 %rd4, %rd0, %rd3;");
         ptx.AppendLine("    add.u64 %rd5, %rd1, %rd3;");
@@ -319,16 +387,17 @@ internal sealed class PtxBatchedVectorKernel : IDisposable
         int n)
     {
         bool dot = operation == DirectPtxBatchedVectorOperation.Dot;
+        bool fusedBatch = IsFusedBatchDot(operation, batch, m);
         bool warpPerBatch = IsWarpPerBatchDot(operation, batch, m);
         var left = dot ? new DirectPtxExtent(batch, m) : new DirectPtxExtent(batch, m);
         var right = dot ? new DirectPtxExtent(batch, m) : new DirectPtxExtent(batch, n);
         var output = dot ? new DirectPtxExtent(batch) : new DirectPtxExtent(batch, m, n);
         return new DirectPtxKernelBlueprint(
             Operation: dot ? "batched-dense-dot" : "batched-dense-outer",
-            Version: warpPerBatch ? 3 : 1,
+            Version: fusedBatch ? 5 : warpPerBatch ? 4 : 1,
             Architecture: architecture,
             Variant: dot
-                ? $"{(warpPerBatch ? "warp-per-batch-fp32x4" : "fp32")}-b{batch}-d{m}"
+                ? $"{(fusedBatch ? "vector-cta-per-batch-fp32x4" : warpPerBatch ? "warp-block-per-batch-fp32x4" : "fp32")}-b{batch}-d{m}"
                 : $"fp32-b{batch}-m{m}-n{n}",
             Tensors:
             [
@@ -342,9 +411,9 @@ internal sealed class PtxBatchedVectorKernel : IDisposable
             ],
             ResourceBudget: new DirectPtxResourceBudget(
                 MaxRegistersPerThread: 32,
-                MaxStaticSharedBytes: dot && !warpPerBatch ? WarpCount * sizeof(float) : 0,
+                MaxStaticSharedBytes: fusedBatch ? 4 * sizeof(float) : dot && !warpPerBatch ? WarpCount * sizeof(float) : 0,
                 MaxLocalBytesPerThread: 0,
-                MinBlocksPerMultiprocessor: dot ? 1 : 4),
+                MinBlocksPerMultiprocessor: fusedBatch ? 10 : warpPerBatch ? 12 : dot ? 1 : 4),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["formula"] = dot
@@ -356,7 +425,9 @@ internal sealed class PtxBatchedVectorKernel : IDisposable
                 ["temporary-device-allocation"] = "none",
                 ["global-intermediates"] = "none",
                 ["reduction-pipeline"] = warpPerBatch
-                    ? "aligned float4 loads; one warp per batch; register-only shuffles; one output store"
+                    ? fusedBatch
+                        ? "aligned float4 loads; one four-warp CTA per batch; register/shared warp reduction; one output store"
+                        : "aligned float4 loads; one 32-thread CTA per batch; register-only shuffles; one output store"
                     : dot ? "block reduction through shared warp partials" : "none"
             });
     }
@@ -366,13 +437,20 @@ internal sealed class PtxBatchedVectorKernel : IDisposable
         int batch,
         int dimension) =>
         operation == DirectPtxBatchedVectorOperation.Dot &&
-        batch <= WarpCount && (dimension & 31) == 0;
+        batch <= 65_535 && (dimension & 31) == 0;
+
+    private static bool IsFusedBatchDot(
+        DirectPtxBatchedVectorOperation operation,
+        int batch,
+        int dimension) =>
+        operation == DirectPtxBatchedVectorOperation.Dot && batch == 4 && dimension == 512;
 
     private static int GetBlockThreads(
         DirectPtxBatchedVectorOperation operation,
         int batch,
-        int dimension) => IsWarpPerBatchDot(operation, batch, dimension)
-            ? checked(batch * 32)
+        int dimension) => IsFusedBatchDot(operation, batch, dimension)
+            ? VectorBlockThreads
+            : IsWarpPerBatchDot(operation, batch, dimension) ? WarpBlockThreads
             : BaselineBlockThreads;
 
     private static void Validate(
