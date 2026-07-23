@@ -287,6 +287,143 @@ internal static class DirectPtxProfileTarget
         Console.WriteLine(kernel.Audit.ToJson());
     }
 
+    /// <summary>
+    /// Executes every exact issue-836 cubin entry point once. The target rejects
+    /// runtime-linked/JIT PTX so an Nsight capture cannot accidentally profile a
+    /// different image than the content-addressed cubin audited in CI.
+    /// </summary>
+    internal static void RunDenseLinear()
+    {
+        GpuBenchmarkEnvironment.RequireIdleGpu("ncu-dense-linear-start");
+        using var runtime = new DirectPtxRuntime();
+
+        using (var kernel = new PtxFusedLinearGeluM1Kernel(runtime, 512, 2_048))
+            Profile(runtime, kernel.Blueprint,
+                views => kernel.Launch(views[0], views[1], views[2], views[3]),
+                kernel.Audit);
+
+        using (var kernel = new PtxFusedLinearTiledKernel(
+            runtime, 64, 256, 256, DirectPtxLinearActivation.None,
+            DirectPtxLinearWeightLayout.InputMajor, hasBias: false))
+            Profile(runtime, kernel.Blueprint,
+                views => kernel.LaunchGemm(views[0], views[1], views[2]),
+                kernel.Audit);
+
+        using (var kernel = new PtxFusedLinearTiledKernel(
+            runtime, 64, 256, 256, DirectPtxLinearActivation.GeluTanh,
+            DirectPtxLinearWeightLayout.InputMajor))
+            Profile(runtime, kernel.Blueprint,
+                views => kernel.Launch(views[0], views[1], views[2], views[3]),
+                kernel.Audit);
+
+        using (var kernel = new PtxFusedLinearTiledKernel(
+            runtime, 64, 256, 256, DirectPtxLinearActivation.None,
+            DirectPtxLinearWeightLayout.InputMajor, hasBias: false, batchCount: 4))
+            Profile(runtime, kernel.Blueprint,
+                views => kernel.LaunchGemm(views[0], views[1], views[2]),
+                kernel.Audit);
+
+        using (var kernel = new PtxFp16GemmKernel(runtime, 16, 16, 32))
+            Profile(runtime, kernel.Blueprint,
+                views => kernel.Launch(views[0], views[1], views[2]),
+                kernel.Audit);
+
+        foreach ((int k, int n, int outputsPerBlock) in new[]
+        {
+            (512, 2_048, 32),
+            (512, 2_048, 64),
+            (1_024, 4_096, 32),
+            (1_024, 4_096, 64)
+        })
+        {
+            using var kernel = new PtxFusedLinearGeluFp16M16Kernel(
+                runtime, k, n, outputsPerBlock);
+            Profile(runtime, kernel.Blueprint,
+                views => kernel.Launch(views[0], views[1], views[2], views[3]),
+                kernel.Audit);
+        }
+
+        using (var kernel = new PtxFusedLoRAKernel(runtime, 8, 256, 8, 256, 0.125f))
+            Profile(runtime, kernel.Blueprint,
+                views => kernel.Launch(views[0], views[1], views[2], views[3], views[4]),
+                kernel.Audit);
+
+        using (var kernel = new PtxFusedLinearCrossEntropyKernel(
+            runtime, DirectPtxCrossEntropyTarget.Index, 4, 16, 32))
+            Profile(runtime, kernel.Blueprint,
+                views => kernel.Launch(views[0], views[1], views[2], views[3], views[4]),
+                kernel.Audit);
+
+        using (var kernel = new PtxFusedLinearBackwardKernel(
+            runtime, 64, 256, 256, DirectPtxLinearActivation.Relu))
+            Profile(runtime, kernel.Blueprint,
+                views => kernel.Launch(
+                    views[0], views[1], views[2], views[3],
+                    views[4], views[5], views[6]),
+                kernel.Audits.ToArray());
+
+        using (var kernel = new PtxDenseVectorKernel(
+            runtime, DirectPtxDenseVectorOperation.Dot, 4_096))
+            Profile(runtime, kernel.Blueprint,
+                views => kernel.Launch(views[0], views[1], views[2]),
+                kernel.Audit);
+
+        using (var kernel = new PtxDenseVectorKernel(
+            runtime, DirectPtxDenseVectorOperation.Outer, 64, 128))
+            Profile(runtime, kernel.Blueprint,
+                views => kernel.Launch(views[0], views[1], views[2]),
+                kernel.Audit);
+
+        using (var kernel = new PtxBatchedVectorKernel(
+            runtime, DirectPtxBatchedVectorOperation.Dot, 4, 512))
+            Profile(runtime, kernel.Blueprint,
+                views => kernel.Launch(views[0], views[1], views[2]),
+                kernel.Audit);
+
+        using (var kernel = new PtxStridedDotKernel(runtime, 512, 512, 511, -1))
+            Profile(runtime, kernel.Blueprint,
+                views => kernel.Launch(views[0], views[1], views[2]),
+                kernel.Audit);
+
+        runtime.Synchronize();
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-dense-linear-end");
+    }
+
+    private static void Profile(
+        DirectPtxRuntime runtime,
+        DirectPtxKernelBlueprint blueprint,
+        Action<DirectPtxTensorView[]> launch,
+        params DirectPtxKernelAudit[] audits)
+    {
+        var buffers = new DirectPtxBuffer[blueprint.Tensors.Count];
+        var views = new DirectPtxTensorView[buffers.Length];
+        try
+        {
+            for (int index = 0; index < buffers.Length; index++)
+            {
+                DirectPtxTensorContract tensor = blueprint.Tensors[index];
+                buffers[index] = runtime.AllocateBytes(tensor.RequiredBytes);
+                buffers[index].Upload<byte>(new byte[checked((int)tensor.RequiredBytes)]);
+                views[index] = DirectPtxTensorView.CreateOwned(buffers[index], tensor);
+            }
+            launch(views);
+            runtime.Synchronize();
+            foreach (DirectPtxKernelAudit audit in audits)
+            {
+                if (audit.ImageKind != DirectPtxModuleImageKind.EmbeddedCubin ||
+                    string.IsNullOrWhiteSpace(audit.CubinSha256))
+                    throw new InvalidOperationException(
+                        $"Nsight target '{audit.BlueprintId}' did not load its exact embedded cubin.");
+                Console.WriteLine(audit.ToJson());
+            }
+        }
+        finally
+        {
+            for (int index = buffers.Length - 1; index >= 0; index--)
+                buffers[index]?.Dispose();
+        }
+    }
+
     internal static void VerifyNcuCsv(string path)
     {
         DirectPtxProfilerEvidence evidence = DirectPtxProfilerEvidence.FromNcuCsv(path);
@@ -294,7 +431,9 @@ internal static class DirectPtxProfileTarget
         Console.WriteLine($"register-spill instructions: {evidence.RegisterSpillInstructions}");
         Console.WriteLine($"local-load instructions: {evidence.LocalLoadInstructions}");
         Console.WriteLine($"local-store instructions: {evidence.LocalStoreInstructions}");
-        Console.WriteLine($"required metric groups observed: {evidence.ObservedMetricGroups}/3");
+        Console.WriteLine($"local-load requests: {evidence.LocalLoadRequests}");
+        Console.WriteLine($"local-store requests: {evidence.LocalStoreRequests}");
+        Console.WriteLine($"required metric groups observed: {evidence.ObservedMetricGroups}/5");
         Console.WriteLine(evidence.ProvesZeroExecutedSpills ? "PASS: zero executed spills" : "FAIL: spill/local traffic detected");
         if (!evidence.ProvesZeroExecutedSpills) Environment.ExitCode = 2;
     }

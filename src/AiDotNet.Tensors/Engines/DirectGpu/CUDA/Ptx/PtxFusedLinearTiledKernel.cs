@@ -113,7 +113,7 @@ internal sealed class PtxFusedLinearTiledKernel : IDisposable
         Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
         Audit = DirectPtxKernelAudit.Create(
             Blueprint, runtime.DeviceFingerprint, Ptx, info,
-            BlockThreads, activeBlocks, _module.JitInfoLog);
+            BlockThreads, activeBlocks, _module);
     }
 
     internal unsafe void Launch(
@@ -215,9 +215,10 @@ internal sealed class PtxFusedLinearTiledKernel : IDisposable
         ptx.AppendLine("    .reg .b32 %r<40>;");
         ptx.AppendLine("    .reg .b64 %rd<48>;");
         ptx.AppendLine("    .reg .f32 %f<48>;");
-        // A tile [BM][BK] then W tile [BN][BK], both row-major over BK.
-        ptx.AppendLine($"    .shared .align 16 .b8 a_tile[{BlockM * BlockK * sizeof(float)}];");
-        ptx.AppendLine($"    .shared .align 16 .b8 w_tile[{BlockN * BlockK * sizeof(float)}];");
+        // Two A/W banks let cp.async fill tile N+1 while tile N feeds FMAs.
+        int tileBytes = BlockM * BlockK * sizeof(float);
+        ptx.AppendLine($"    .shared .align 16 .b8 a_tile[{2 * tileBytes}];");
+        ptx.AppendLine($"    .shared .align 16 .b8 w_tile[{2 * tileBytes}];");
         ptx.AppendLine("    ld.param.u64 %rd0, [input_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd1, [weights_ptr];");
         if (hasBias) ptx.AppendLine("    ld.param.u64 %rd2, [bias_ptr];");
@@ -251,23 +252,37 @@ internal sealed class PtxFusedLinearTiledKernel : IDisposable
         for (int i = 0; i < ThreadM * ThreadN; i++)
             ptx.AppendLine($"    mov.f32 %f{i}, 0f00000000;");
 
-        // k0 loop counter in %r9 (element units), and running global-K offsets.
+        // Preload K tile zero into bank zero. %r9 is current k0 and %r26 is
+        // the current shared-bank byte offset (0 or tileBytes).
         ptx.AppendLine("    mov.u32 %r9, 0;");
+        ptx.AppendLine("    mov.u32 %r26, 0;");
+        EmitAsyncCooperativeLoad(
+            ptx, kBytes, nBytes, weightLayout, "%r9", "%r26");
+        ptx.AppendLine("    cp.async.commit_group;");
+        ptx.AppendLine("    cp.async.wait_group 0;");
+        ptx.AppendLine("    bar.sync 0;");
         ptx.AppendLine("K_TILE_LOOP:");
 
-        // ---- Cooperative global -> shared load ----
-        // Each 2 KiB tile contributes 512 FP32 elements, so every thread owns
-        // eight A and eight W scalar copies into the selected shared layout.
-        EmitCooperativeLoad(ptx, kBytes, nBytes, weightLayout);
-        ptx.AppendLine("    bar.sync 0;");
+        // Start the next bank before consuming the current one. The next-tile
+        // predicate is CTA-uniform because K is baked into the specialization.
+        ptx.AppendLine($"    add.u32 %r27, %r9, {BlockK};");
+        ptx.AppendLine($"    setp.ge.u32 %p0, %r27, {k};");
+        ptx.AppendLine("    @%p0 bra.uni K_TILE_NO_PREFETCH;");
+        ptx.AppendLine($"    xor.b32 %r28, %r26, {tileBytes};");
+        EmitAsyncCooperativeLoad(
+            ptx, kBytes, nBytes, weightLayout, "%r27", "%r28");
+        ptx.AppendLine("    cp.async.commit_group;");
+        ptx.AppendLine("K_TILE_NO_PREFETCH:");
 
         // ---- Register-blocked inner product over BK ----
-        EmitInnerAccumulate(ptx);
+        EmitInnerAccumulate(ptx, weightLayout, "%r26");
+        ptx.AppendLine("    @%p0 bra.uni K_TILE_DONE;");
+        ptx.AppendLine("    cp.async.wait_group 0;");
         ptx.AppendLine("    bar.sync 0;");
-
-        ptx.AppendLine($"    add.u32 %r9, %r9, {BlockK};");
-        ptx.AppendLine($"    setp.lt.u32 %p0, %r9, {k};");
-        ptx.AppendLine("    @%p0 bra.uni K_TILE_LOOP;");
+        ptx.AppendLine("    mov.u32 %r9, %r27;");
+        ptx.AppendLine("    mov.u32 %r26, %r28;");
+        ptx.AppendLine("    bra.uni K_TILE_LOOP;");
+        ptx.AppendLine("K_TILE_DONE:");
 
         // ---- Epilogue: + bias[n], activation, store C[m,n] ----
         EmitEpilogue(ptx, activation, nBytes, hasBias);
@@ -277,62 +292,85 @@ internal sealed class PtxFusedLinearTiledKernel : IDisposable
         return ptx.ToString();
     }
 
-    // Each thread loads eight A elements and eight W elements into shared memory.
-    private static void EmitCooperativeLoad(
+    // Each thread asynchronously copies two aligned float4 segments from each
+    // operand. Input-major weights remain KxN in shared; output-major weights
+    // remain NxK. The MMA-free FP32 inner loop consumes the baked layout.
+    private static void EmitAsyncCooperativeLoad(
         StringBuilder ptx,
         int kBytes,
         int nBytes,
-        DirectPtxLinearWeightLayout weightLayout)
+        DirectPtxLinearWeightLayout weightLayout,
+        string kRegister,
+        string bankRegister)
     {
-        // %r9 holds k0 (element units into K).
-        for (int slot = 0; slot < 8; slot++)
+        // kRegister holds k0 (element units into K). Each 16-byte copy covers four
+        // scalar elements; 64 threads * 2 copies = one complete 512-float tile.
+        ptx.AppendLine($"    cvt.u64.u32 %rd21, {bankRegister};");
+        for (int slot = 0; slot < 2; slot++)
         {
-            string e = slot == 0 ? "%r10" : "%r11";
-            ptx.AppendLine($"    add.u32 {e}, %r0, {slot * BlockThreads};");
-            ptx.AppendLine($"    shr.u32 %r12, {e}, 5;");                       // row=e/32
-            ptx.AppendLine($"    and.b32 %r13, {e}, 31;");                      // kk=e%32
+            ptx.AppendLine($"    add.u32 %r10, %r0, {slot * BlockThreads};");
+            ptx.AppendLine("    shl.b32 %r11, %r10, 2;");                       // scalar element
+            ptx.AppendLine("    shr.u32 %r12, %r11, 5;");                       // A row=e/32
+            ptx.AppendLine("    and.b32 %r13, %r11, 31;");                      // A kk=e%32
             ptx.AppendLine("    add.u32 %r14, %r5, %r12;");                     // global A row
-            ptx.AppendLine("    add.u32 %r15, %r9, %r13;");                     // global K col
+            ptx.AppendLine($"    add.u32 %r15, {kRegister}, %r13;");            // global K col
             ptx.AppendLine($"    mul.wide.u32 %rd8, %r14, {kBytes};");          // row * K * 4
             ptx.AppendLine("    mul.wide.u32 %rd9, %r15, 4;");                  // col * 4
             ptx.AppendLine("    add.u64 %rd10, %rd0, %rd8;");
             ptx.AppendLine("    add.u64 %rd10, %rd10, %rd9;");
-            ptx.AppendLine("    ld.global.nc.f32 %f16, [%rd10];");
-            ptx.AppendLine($"    mul.wide.u32 %rd11, {e}, 4;");
+            ptx.AppendLine("    mul.wide.u32 %rd11, %r10, 16;");
             ptx.AppendLine("    add.u64 %rd12, %rd4, %rd11;");
-            ptx.AppendLine("    st.shared.f32 [%rd12], %f16;");
-            ptx.AppendLine("    add.u32 %r14, %r6, %r12;");                     // global N / W row
+            ptx.AppendLine("    add.u64 %rd12, %rd12, %rd21;");
+            ptx.AppendLine("    cp.async.ca.shared.global [%rd12], [%rd10], 16;");
             if (weightLayout == DirectPtxLinearWeightLayout.OutputMajor)
             {
+                ptx.AppendLine("    add.u32 %r14, %r6, %r12;");                  // global N row
                 ptx.AppendLine($"    mul.wide.u32 %rd8, %r14, {kBytes};");
                 ptx.AppendLine("    add.u64 %rd10, %rd1, %rd8;");
                 ptx.AppendLine("    add.u64 %rd10, %rd10, %rd9;");
             }
             else
             {
-                ptx.AppendLine($"    mul.wide.u32 %rd8, %r15, {nBytes};");
-                ptx.AppendLine("    mul.wide.u32 %rd9, %r14, 4;");
+                ptx.AppendLine("    shr.u32 %r22, %r11, 4;");                    // W K row=e/16
+                ptx.AppendLine("    and.b32 %r23, %r11, 15;");                   // W N col=e%16
+                ptx.AppendLine($"    add.u32 %r24, {kRegister}, %r22;");
+                ptx.AppendLine("    add.u32 %r25, %r6, %r23;");
+                ptx.AppendLine($"    mul.wide.u32 %rd8, %r24, {nBytes};");
+                ptx.AppendLine("    mul.wide.u32 %rd9, %r25, 4;");
                 ptx.AppendLine("    add.u64 %rd10, %rd1, %rd8;");
                 ptx.AppendLine("    add.u64 %rd10, %rd10, %rd9;");
             }
-            ptx.AppendLine("    ld.global.nc.f32 %f16, [%rd10];");
             ptx.AppendLine("    add.u64 %rd12, %rd5, %rd11;");
-            ptx.AppendLine("    st.shared.f32 [%rd12], %f16;");
+            ptx.AppendLine("    add.u64 %rd12, %rd12, %rd21;");
+            ptx.AppendLine("    cp.async.ca.shared.global [%rd12], [%rd10], 16;");
         }
     }
 
     // For each k in 0..BK-1, load the register fragments and issue TM*TN FMAs.
-    private static void EmitInnerAccumulate(StringBuilder ptx)
+    private static void EmitInnerAccumulate(
+        StringBuilder ptx,
+        DirectPtxLinearWeightLayout weightLayout,
+        string bankRegister)
     {
         // A_sh row for micro-row i = (threadRow*TM + i); linear index = row*BK + k.
         // W_sh row for micro-col j = (threadCol*TN + j); linear index = row*BK + k.
         // Base shared byte pointers for this thread's fragment start (row*BK*4).
         ptx.AppendLine($"    mul.lo.u32 %r16, %r7, {BlockK};");                 // (threadRow*TM)*BK
-        ptx.AppendLine($"    mul.lo.u32 %r17, %r8, {BlockK};");                 // (threadCol*TN)*BK
         ptx.AppendLine("    mul.wide.u32 %rd13, %r16, 4;");
         ptx.AppendLine("    add.u64 %rd13, %rd4, %rd13;");                      // &A_sh[(threadRow*TM)*BK]
-        ptx.AppendLine("    mul.wide.u32 %rd14, %r17, 4;");
+        ptx.AppendLine($"    cvt.u64.u32 %rd22, {bankRegister};");
+        ptx.AppendLine("    add.u64 %rd13, %rd13, %rd22;");
+        if (weightLayout == DirectPtxLinearWeightLayout.OutputMajor)
+        {
+            ptx.AppendLine($"    mul.lo.u32 %r17, %r8, {BlockK};");
+            ptx.AppendLine("    mul.wide.u32 %rd14, %r17, 4;");
+        }
+        else
+        {
+            ptx.AppendLine("    mul.wide.u32 %rd14, %r8, 4;");
+        }
         ptx.AppendLine("    add.u64 %rd14, %rd5, %rd14;");                      // &W_sh[(threadCol*TN)*BK]
+        ptx.AppendLine("    add.u64 %rd14, %rd14, %rd22;");
         for (int k = 0; k < BlockK; k++)
         {
             // a[i] at &A_sh + (i*BK + k)*4 ; w[j] at &W_sh + (j*BK + k)*4.
@@ -343,7 +381,9 @@ internal sealed class PtxFusedLinearTiledKernel : IDisposable
             }
             for (int j = 0; j < ThreadN; j++)
             {
-                int off = (j * BlockK + k) * sizeof(float);
+                int off = weightLayout == DirectPtxLinearWeightLayout.OutputMajor
+                    ? (j * BlockK + k) * sizeof(float)
+                    : (k * BlockN + j) * sizeof(float);
                 ptx.AppendLine($"    ld.shared.f32 %f{20 + j}, [%rd14+{off}];");
             }
             for (int i = 0; i < ThreadM; i++)
@@ -479,13 +519,13 @@ internal sealed class PtxFusedLinearTiledKernel : IDisposable
 
         return new DirectPtxKernelBlueprint(
             Operation: hasBias ? "fused-linear-tiled" : "gemm-tiled",
-            Version: 1,
+            Version: 3,
             Architecture: architecture,
             Variant: $"gemm-fp32-b{batchCount}-m{m}-k{k}-n{n}-{activation}-{weightLayout}".ToLowerInvariant(),
             Tensors: tensors,
             ResourceBudget: new DirectPtxResourceBudget(
                 MaxRegistersPerThread: 96,
-                MaxStaticSharedBytes: (BlockM + BlockN) * BlockK * sizeof(float),
+                MaxStaticSharedBytes: 2 * (BlockM + BlockN) * BlockK * sizeof(float),
                 MaxLocalBytesPerThread: 0,
                 MinBlocksPerMultiprocessor: 1),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
@@ -497,8 +537,9 @@ internal sealed class PtxFusedLinearTiledKernel : IDisposable
                     : "input-major-row-major-fp32",
                 ["tile"] = $"{BlockM}x{BlockN}x{BlockK}-register-{ThreadM}x{ThreadN}",
                 ["accumulator"] = "thread-private-fp32-registers",
-                ["staging"] = "shared-memory-double-tile-a-and-w",
+                ["staging"] = "double-buffered-shared-a-and-w",
                 ["global-intermediates"] = "none",
+                ["global-to-shared"] = "overlapped-aligned-cp.async-float4",
                 ["temporary-device-allocation"] = "none",
                 ["batch-count"] = batchCount.ToString(System.Globalization.CultureInfo.InvariantCulture),
                 ["bias"] = hasBias ? "fused-register-epilogue" : "none",

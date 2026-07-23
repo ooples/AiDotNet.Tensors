@@ -70,7 +70,7 @@ internal sealed class PtxFusedLinearBackwardKernel : IDisposable
         Blueprint.ResourceBudget.Validate(entryPoint, info, BlockThreads, activeBlocks);
         audit = DirectPtxKernelAudit.Create(
             Blueprint, runtime.DeviceFingerprint, Ptx, info,
-            BlockThreads, activeBlocks, _module.JitInfoLog);
+            BlockThreads, activeBlocks, _module);
         return function;
     }
 

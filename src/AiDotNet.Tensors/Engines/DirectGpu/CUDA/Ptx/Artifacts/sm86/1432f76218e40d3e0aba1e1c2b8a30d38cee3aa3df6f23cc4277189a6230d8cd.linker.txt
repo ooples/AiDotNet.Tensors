@@ -1,0 +1,7 @@
+pipeline-version=3
+target=sm86
+driver-version=13030
+cuda-driver-linker-info-log:
+info    : 0 bytes gmem
+info    : Function properties for 'aidotnet_dense_outer':
+info    : used 12 registers, used -1365508094 barriers, 0 stack, 0 bytes smem, 376 bytes cmem[0], 0 bytes lmem

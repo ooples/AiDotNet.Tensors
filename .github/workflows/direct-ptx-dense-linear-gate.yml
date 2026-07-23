@@ -1,0 +1,111 @@
+name: Direct PTX Dense Linear Gate
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/direct-ptx-dense-linear-gate.yml'
+      - 'src/AiDotNet.Tensors/AiDotNet.Tensors.csproj'
+      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/CudaNativeBindings.cs'
+      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/CudaBackend.cs'
+      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/CudaBackend.DirectPtx*.cs'
+      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/CuBlasLtMatmul.cs'
+      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/DirectPtx*.cs'
+      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Ptx*.cs'
+      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/**'
+      - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxDenseLinearArtifactTool.cs'
+      - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxDenseLinearSassAuditTool.cs'
+      - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxDenseLinearFullExperiment.cs'
+      - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxProfileTarget.cs'
+      - 'tests/AiDotNet.Tensors.Benchmarks/GpuBenchmarkEnvironment.cs'
+      - 'tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-ncu.ps1'
+      - 'tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-release-evidence.ps1'
+      - 'tests/AiDotNet.Tensors.Benchmarks/BaselineRunners/py/run_direct_ptx_dense_linear_full_competitors.py'
+      - 'tests/AiDotNet.Tensors.Benchmarks/Program.cs'
+      - 'tests/AiDotNet.Tensors.Tests/Engines/DirectGpu/DirectPtxDenseLinear*.cs'
+      - 'tests/AiDotNet.Tensors.Tests/Engines/DirectGpu/DirectPtxWmmaTests.cs'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/direct-ptx-dense-linear-gate.yml'
+      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/**'
+      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/CudaBackend.cs'
+      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/CudaBackend.DirectPtx*.cs'
+      - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxDenseLinearArtifactTool.cs'
+      - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxDenseLinearSassAuditTool.cs'
+      - 'tests/AiDotNet.Tensors.Benchmarks/GpuBenchmarkEnvironment.cs'
+      - 'tests/AiDotNet.Tensors.Tests/Engines/DirectGpu/DirectPtxDenseLinear*.cs'
+      - 'tests/AiDotNet.Tensors.Tests/Engines/DirectGpu/DirectPtxWmmaTests.cs'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_NOLOGO: true
+  NVDISASM_VERSION: '13.3.73'
+  NVDISASM_SHA256: '38b2eca90c0ffa2ce815bd392077f68b7fe94992ea0ec0f8e85df30ca01fc4e9'
+
+jobs:
+  cubin-sass-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+          dotnet-quality: 'preview'
+
+      - name: Restore audit target
+        run: |
+          dotnet restore tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.csproj
+          dotnet restore tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj
+
+      - name: Build audit target
+        run: >-
+          dotnet build tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.csproj
+          --configuration Release --framework net10.0 --no-restore
+
+      - name: Verify PTX-to-cubin content identities
+        run: >-
+          dotnet tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Benchmarks.dll
+          --verify-direct-ptx-dense-linear-cubins
+
+      - name: Verify blueprint and embedded-resource contracts
+        run: >-
+          dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj
+          --configuration Release --framework net10.0 --no-restore
+          --filter "FullyQualifiedName~CubinSourceIdentity_IsCanonicalAcrossNewlineStyles|FullyQualifiedName~EmbeddedDenseLinearArtifacts_IncludeHashedCubinsAndLinkerLogs|FullyQualifiedName~Fp16TensorCoreM16Emitter_UsesAsyncMmaAndRegisterOnlyEpilogue|FullyQualifiedName~NsightEvidence_RequiresEveryExecutedSpillCounterToBeZero|FullyQualifiedName~DenseLinearCoverageManifest_AssignsEveryScopedApiExactlyOnce"
+
+      - name: Install pinned NVIDIA nvdisasm component
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/cuda-nvdisasm.tar.xz"
+          url="https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvdisasm/linux-x86_64/cuda_nvdisasm-linux-x86_64-${NVDISASM_VERSION}-archive.tar.xz"
+          curl --fail --location --silent --show-error "$url" --output "$archive"
+          echo "${NVDISASM_SHA256}  ${archive}" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/cuda-nvdisasm"
+          tar -xJf "$archive" -C "$RUNNER_TEMP/cuda-nvdisasm" --strip-components=1
+          test -x "$RUNNER_TEMP/cuda-nvdisasm/bin/nvdisasm"
+
+      - name: Disassemble and enforce SASS safety contract
+        run: >-
+          dotnet tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Benchmarks.dll
+          --audit-direct-ptx-dense-linear-sass
+          "$RUNNER_TEMP/cuda-nvdisasm/bin/nvdisasm"
+          "src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/sm86"
+          "artifacts/direct-ptx/dense-linear/sass"
+
+      - name: Upload exact-cubin SASS evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: direct-ptx-dense-linear-sm86-sass
+          path: artifacts/direct-ptx/dense-linear/sass/
+          if-no-files-found: error
+          retention-days: 14

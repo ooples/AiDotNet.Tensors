@@ -85,7 +85,7 @@ internal sealed class PtxFp16GemmKernel : IDisposable
         Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
         Audit = DirectPtxKernelAudit.Create(
             Blueprint, runtime.DeviceFingerprint, Ptx, info,
-            BlockThreads, activeBlocks, _module.JitInfoLog);
+            BlockThreads, activeBlocks, _module);
     }
 
     internal unsafe void Launch(

@@ -61,8 +61,11 @@ Every future PTX operation should follow the same sequence:
 6. Stage reusable panels in shared memory, retain accumulators and epilogues in
    registers, and write each final output once. Use warp shuffles, vector loads,
    `cp.async`, or `mma.sync` only when the exact cell benefits measurably.
-7. JIT outside capture, reject nonzero local bytes before caching, and record
-   PTX hash, GPU UUID, SM, driver, resources, occupancy, and JIT log.
+7. Compile PTX to a content-addressed cubin outside capture, load that exact
+   machine-code image, reject nonzero local bytes before caching, and record
+   PTX/cubin hashes, image source, GPU UUID, SM, driver, resources, occupancy,
+   and compiler log. Raw PTX JIT is an explicit diagnostic fallback, never an
+   unreported release path.
 8. Prewarm and pin modules before graph capture. The captured path may not JIT,
    tune, allocate, perform file I/O, or evict a referenced module.
 9. Compare resident NVIDIA paths only: current AiDotNet, the strongest eligible
@@ -108,8 +111,10 @@ global intermediate.
 ### General FP32 GEMM and fused linear
 
 The current Ampere experiment tile is `BM=16, BN=16, BK=32, TM=2, TN=2`:
-64 threads cooperatively stage one A tile and one weight tile in 4 KiB of
-shared memory. Each thread holds a 2-by-2 FP32 accumulator tile. Input-major
+64 threads cooperatively stage A and weight panels through two alternating
+shared-memory banks (8 KiB total). Aligned `cp.async` copies fill panel N+1 while panel N feeds
+register FMAs, with a CTA barrier only at bank handoff. Each thread holds a
+2-by-2 FP32 accumulator tile. Input-major
 `[K,N]` and prepacked output-major `[N,K]` are separate PTX modules; the layout
 choice is absent from the launch ABI and the instruction path. Bias and the
 selected activation are applied to accumulator registers before the one final
@@ -117,12 +122,25 @@ store. Batched GEMM bakes contiguous batch strides into address arithmetic.
 
 ### FP16 and BF16
 
-The correctness baseline bakes input dtype, output dtype, transposition, batch,
+The broad correctness baseline bakes input dtype, output dtype, transposition, batch,
 and FP16-versus-FP32 accumulation into separate modules. It reads 16-bit
 operands, accumulates without a global conversion buffer, converts only at the
-final store, and supports the two transpose-free backward products. It is a
-scalar baseline and remains fail-closed pending an architecture-specific
-Tensor Core replacement.
+final store, and supports the two transpose-free backward products.
+
+Two M=16 championship cells (`K512/N2048` and `K1024/N4096`) use a separate
+SM86 kernel: eight warps double-buffer FP16 input/output-major weight panels with
+`cp.async`, consume the packed panels with warp-collective `ldmatrix.x4` and
+`ldmatrix.x2.trans`, issue `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32`, retain
+FP32 accumulators through bias and tanh-GELU, and perform the only FP32 output
+stores. Shape, layout, dtype, and panel geometry are baked; the launch ABI is
+four pointers. A bounded GPU/driver/shape-keyed tuner evaluates N32 and N64
+tiles before persisting the winner. Its cache identity also includes both
+candidate PTX-to-cubin source identities, so an emitter edit cannot reuse a
+stale decision. The benchmark's explicit `--autotune-fp16-m16` screen skips
+default-plan prewarm, lets the first resident launch evaluate both candidates,
+and records the selected blueprint/source key. Evidence capture disables
+tuning and uses only the resulting checked-in, reproducible tile choice. These
+cells remain experiment-only until the full timing gate passes.
 
 ### Fused-linear backward
 
@@ -201,10 +219,23 @@ GA10x/SM86. Ada, Hopper, and Blackwell do not inherit Ampere admission; each
 needs its own emitter/tile catalog, resource limits, and evidence. Unsupported
 architectures fail closed before module creation.
 
-Every module key includes all baked semantics. Caches are bounded, disposed
+Every module key includes canonical PTX, target SM, pipeline version 3, and all
+baked semantics. Release cells have a checked-in manifest mapping that source
+identity to exact cubin and linker-log SHA-256 values. Runtime lookup prefers
+the hash-verified embedded cubin plus its preserved verbose CUDA Driver linker
+log, then a disk cache whose binary, audit, and linker-log sidecars all match,
+and otherwise invokes the CUDA Driver linker and caches its ELF output. PTX
+source is not passed directly to `cuModuleLoadData` on the normal path. CI
+rebuilds the expected source identities, rejects stale/missing cubins or linker
+logs, disassembles the exact embedded images with pinned `nvdisasm`, and fails
+on any final-SASS `LDL` or `STL`.
+Each operation-family exporter owns only the files named by its manifest, so
+regeneration cannot delete another family's artifacts from the shared SM directory.
+
+Caches are bounded, disposed
 with `CudaBackend`, and pin graph-referenced modules. Fast cache hits avoid
 capturing delegates, preserving zero managed allocation. A capture miss returns
-an explicit prewarm-required reason rather than JITing inside capture.
+an explicit prewarm-required reason rather than compiling inside capture.
 
 The loader rejects any JIT result with nonzero local bytes or a blueprint
 resource-budget violation. Audit records include blueprint id, SHA-256, device
@@ -213,26 +244,64 @@ active blocks per SM, occupancy inputs, and the JIT log.
 
 ## Benchmark contract
 
-The per-process runner uses 30 warmups, 101 samples, ten launches per CUDA-event
+The per-process runner uses 30 warmups, 101 samples, 50 launches per CUDA-event
 sample, and a 64-launch tiered-JIT settling window before its exact allocation
 measurement. It reports device and E2E
 mean/median/P95/P99, GFLOPS/TFLOPS, managed bytes/call, temporary device bytes,
 maximum error, registers, shared/local bytes, active blocks/SM, blueprint id,
-fingerprint, and PTX hash. Missing established kernels are emitted as explicit
+launched/max threads, PTX/binary versions, fingerprint, PTX/cubin hashes,
+module source/path, and compiler/linker log. Missing established kernels are emitted as explicit
 `unsupported` JSON rows; they do not abort the matrix or masquerade as wins.
+The .NET temporary-memory measurement snapshots a backend logical-allocation
+counter around one settled hot launch, so it observes pooled and immediately
+freed device buffers that a free-memory before/after delta would miss.
 
 Final evidence uses `run-direct-ptx-release-evidence.ps1 -Issue836Only`. The
 orchestrator starts three separate .NET processes and three separate Python
 processes, requires three consecutive clean `nvidia-smi` samples before each
 suite, rejects foreign compute and unsafe temperature, records start/end GPU
 snapshots and exact commands, retries contaminated attempts, and hashes every
-accepted/rejected log in a manifest. Its machine-readable release-gate file
-retains every per-run verdict; a losing cell is never averaged into a win.
+accepted/rejected log in a manifest. The orchestrator, .NET runner, and
+PyTorch competitor runner reject other OS-level Python processes before CUDA
+registration; both in-process runners repeat the Python and `nvidia-smi pmon`
+checks around every measured method. This closes the race left by
+GPU-process tables or suite-boundary checks alone. Its machine-readable release-gate file also
+rejects nonfinite values and non-monotonic percentiles and retains every
+per-run verdict; a losing cell is never averaged into a win.
 
-PyTorch 2.12.1+cu130 eager and CUDA Graph routes are measured by the companion
-Python runner. CUDA Graph rows use preallocated resident outputs and report
-zero replay-time device allocation. The strongest eligible competitor for a
-cell determines its gate.
+PyTorch 2.12.1+cu130 eager, eager CUDA Graph,
+`torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")`, and compiled
+CUDA Graph routes are measured by the companion Python runner. CUDA Graph rows
+use preallocated resident outputs and report zero replay-time device
+allocation. Eager rows report required result storage separately from true
+temporary peak growth, and every eager, graph, compiled, and compiled-graph
+route receives its own correctness probe. A missing compiled row makes final
+evidence incomplete. Every eligible competitor is evaluated independently; a cell passes only when all
+AiDotNet, NVIDIA-library, PyTorch eager/Graph, and PyTorch compiled/Graph pairs
+meet the median and P95 thresholds.
+
+## Current exact-machine-code audit
+
+The requalification candidate contains 16 content-addressed SM86 cubins and 18
+entry points (the backward cubin owns three and the Tensor-Core tuning domain
+owns N32/N64 images). The pinned final-SASS audit finds
+zero `LDL` and zero `STL` in every entry. Representative hardware rows are:
+
+| Candidate | registers/thread | static shared B | final-SASS `LDSM` | `cp.async` | Tensor Core | final-SASS local loads/stores |
+|---|---:|---:|---:|---:|---:|---:|
+| FP32 GEMM M64/K256/N256 | 60 | 8192 | 0 | 8 | 0 | 0 / 0 |
+| FP32 fused GELU M64/K256/N256 | 60 | 8192 | 0 | 8 | 0 | 0 / 0 |
+| FP16 fused GELU M16/K512/N2048 N32 | 39 | 12288 | 64 | 24 | 32 | 0 / 0 |
+| FP16 fused GELU M16/K512/N2048 N64 | 39 | 20480 | 64 | 24 | 32 | 0 / 0 |
+| FP16 fused GELU M16/K1024/N4096 N32 | 34 | 24576 | 128 | 48 | 64 | 0 / 0 |
+| FP16 fused GELU M16/K1024/N4096 N64 | 34 | 40960 | 128 | 48 | 64 | 0 / 0 |
+
+The deterministic Nsight target additionally launches all 18 exact embedded-
+cubin entry points and rejects runtime-linked images. Executed counters remain
+a separate required gate: aggregate local/spill instructions, local-load and
+local-store instructions, and L1 local-load/local-store requests must all be
+present and zero for every launch. Static disassembly is not mislabeled as an
+executed counter capture.
 
 ## Current release evidence
 
@@ -267,7 +336,9 @@ attached to the committed kernel target on 2026-07-22. Counter collection still
 returned `ERR_NVGPUCTRPERM`; the resulting diagnostic CSV is not spill proof.
 Driver-JIT local size zero is enforced now, but no specialization is claimed as
 release-promoted until the checked-in CSV verifier observes zero executed local
-loads, local stores, and local/spill instructions.
+loads, local stores, aggregate local/spill instructions, and L1 local-load and
+local-store requests for all 18 exact launches. The timing orchestrator accepts
+that verified CSV explicitly and records its SHA-256 in the same release gate.
 
 ## Reproduction
 
@@ -278,14 +349,27 @@ dotnet build tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.cspro
 dotnet tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Benchmarks.dll `
   --direct-ptx-dense-linear-full 1
 
-powershell -ExecutionPolicy Bypass -File `
-  tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-release-evidence.ps1 `
-  -Issue836Only -Runs 3 -SkipBuild `
-  -OutputDirectory artifacts/perf/direct-ptx-dense-linear
+$env:AIDOTNET_DIRECT_PTX_AUTOTUNE = '1'
+$env:AIDOTNET_AUTOTUNE_CACHE_PATH = Join-Path $env:TEMP 'aidotnet-pr859-tuning'
+dotnet tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Benchmarks.dll `
+  --direct-ptx-dense-linear-full 1 --no-python `
+  --only=fused-gelu-fp16-m16-k512 --autotune-fp16-m16
 
+$ncuCsv = Join-Path $env:TEMP 'aidotnet-direct-ptx-dense-linear-ncu.csv'
 powershell -ExecutionPolicy Bypass -File `
   tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-ncu.ps1 `
-  -Target fused-linear
+  -Target dense-linear -OutputCsv $ncuCsv
+
+powershell -ExecutionPolicy Bypass -File `
+  tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-release-evidence.ps1 `
+  -Issue836Only -Runs 3 -SkipBuild -DenseLinearNcuCsv $ncuCsv `
+  -OutputDirectory artifacts/perf/direct-ptx-dense-linear
+
+dotnet tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Benchmarks.dll `
+  --verify-direct-ptx-dense-linear-cubins
+
+dotnet tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Benchmarks.dll `
+  --audit-direct-ptx-dense-linear-sass <path-to-nvdisasm>
 ```
 
 Use `--no-python` only for focused C# screening and `--only=<operation>` for a

@@ -801,14 +801,18 @@ public partial class DirectPtxWmmaTests
             System.IO.File.WriteAllText(path,
                 "\"sass__inst_executed_register_spilling.sum\",\"0\"\n" +
                 "\"sass__inst_executed_local_loads\",\"0\"\n" +
-                "\"sass__inst_executed_local_stores.sum\",\"0\"\n");
+                "\"sass__inst_executed_local_stores.sum\",\"0\"\n" +
+                "\"l1tex__t_requests_pipe_lsu_mem_local_op_ld.sum\",\"0\"\n" +
+                "\"l1tex__t_requests_pipe_lsu_mem_local_op_st.sum\",\"0\"\n");
             DirectPtxProfilerEvidence zero = DirectPtxProfilerEvidence.FromNcuCsv(path);
             Assert.True(zero.ProvesZeroExecutedSpills);
 
             System.IO.File.WriteAllText(path,
                 "\"sass__inst_executed_register_spilling\",\"4\"\n" +
                 "\"sass__inst_executed_local_loads\",\"0\"\n" +
-                "\"sass__inst_executed_local_stores\",\"0\"\n");
+                "\"sass__inst_executed_local_stores\",\"0\"\n" +
+                "\"l1tex__t_requests_pipe_lsu_mem_local_op_ld\",\"0\"\n" +
+                "\"l1tex__t_requests_pipe_lsu_mem_local_op_st\",\"0\"\n");
             DirectPtxProfilerEvidence spilling = DirectPtxProfilerEvidence.FromNcuCsv(path);
             Assert.False(spilling.ProvesZeroExecutedSpills);
 
@@ -820,19 +824,27 @@ public partial class DirectPtxWmmaTests
 
             System.IO.File.WriteAllText(path,
                 "==PROF== Connected\n" +
-                "\"ID\",\"Kernel Name\",\"smsp__sass_inst_executed_op_local.sum\",\"smsp__sass_inst_executed_op_local_ld.sum\",\"smsp__sass_inst_executed_op_local_st.sum\"\n" +
-                "\"\",\"\",\"inst\",\"inst\",\"inst\"\n" +
-                "\"0\",\"kernel_a\",\"0\",\"0\",\"0\"\n" +
-                "\"1\",\"kernel_b\",\"0\",\"0\",\"0\"\n");
+                "\"ID\",\"Kernel Name\",\"smsp__sass_inst_executed_op_local.sum\",\"smsp__sass_inst_executed_op_local_ld.sum\",\"smsp__sass_inst_executed_op_local_st.sum\",\"l1tex__t_requests_pipe_lsu_mem_local_op_ld.sum\",\"l1tex__t_requests_pipe_lsu_mem_local_op_st.sum\"\n" +
+                "\"\",\"\",\"inst\",\"inst\",\"inst\",\"request\",\"request\"\n" +
+                "\"0\",\"kernel_a\",\"0\",\"0\",\"0\",\"0\",\"0\"\n" +
+                "\"1\",\"kernel_b\",\"0\",\"0\",\"0\",\"0\",\"0\"\n");
             DirectPtxProfilerEvidence modern = DirectPtxProfilerEvidence.FromNcuCsv(path);
             Assert.True(modern.ProvesZeroExecutedSpills);
-            Assert.Equal(3, modern.ObservedMetricGroups);
+            Assert.Equal(5, modern.ObservedMetricGroups);
 
             System.IO.File.WriteAllText(path,
-                "\"ID\",\"Kernel Name\",\"smsp__sass_inst_executed_op_local.sum\",\"smsp__sass_inst_executed_op_local_ld.sum\",\"smsp__sass_inst_executed_op_local_st.sum\"\n" +
-                "\"0\",\"kernel_a\",\"8\",\"8\",\"0\"\n");
+                "\"ID\",\"Kernel Name\",\"smsp__sass_inst_executed_op_local.sum\",\"smsp__sass_inst_executed_op_local_ld.sum\",\"smsp__sass_inst_executed_op_local_st.sum\",\"l1tex__t_requests_pipe_lsu_mem_local_op_ld.sum\",\"l1tex__t_requests_pipe_lsu_mem_local_op_st.sum\"\n" +
+                "\"0\",\"kernel_a\",\"8\",\"8\",\"0\",\"1\",\"0\"\n");
             DirectPtxProfilerEvidence modernSpilling = DirectPtxProfilerEvidence.FromNcuCsv(path);
             Assert.False(modernSpilling.ProvesZeroExecutedSpills);
+
+            System.IO.File.WriteAllText(path,
+                "\"ID\",\"Kernel Name\",\"smsp__sass_inst_executed_op_local.sum\",\"smsp__sass_inst_executed_op_local_ld.sum\",\"smsp__sass_inst_executed_op_local_st.sum\",\"l1tex__t_requests_pipe_lsu_mem_local_op_ld.sum\",\"l1tex__t_requests_pipe_lsu_mem_local_op_st.sum\"\n" +
+                "\"0\",\"kernel_a\",\"0\",\"0\",\"0\",\"0\",\"2\"\n");
+            DirectPtxProfilerEvidence requestOnly =
+                DirectPtxProfilerEvidence.FromNcuCsv(path);
+            Assert.False(requestOnly.ProvesZeroExecutedSpills);
+            Assert.Equal(2, requestOnly.LocalStoreRequests);
         }
         finally
         {
@@ -2470,8 +2482,8 @@ public partial class DirectPtxWmmaTests
         string ptx = PtxFusedLinearTiledKernel.EmitPtx(
             8, 6, 64, 256, 256, DirectPtxLinearActivation.GeluTanh);
         Assert.Contains(PtxFusedLinearTiledKernel.EntryPoint, ptx);
-        Assert.Contains(".shared .align 16 .b8 a_tile[2048]", ptx);
-        Assert.Contains(".shared .align 16 .b8 w_tile[2048]", ptx);
+        Assert.Contains(".shared .align 16 .b8 a_tile[4096]", ptx);
+        Assert.Contains(".shared .align 16 .b8 w_tile[4096]", ptx);
         Assert.Equal(4, Count(ptx, "ld.param.u64"));
         Assert.Equal(
             PtxFusedLinearTiledKernel.BlockK *
@@ -2484,6 +2496,10 @@ public partial class DirectPtxWmmaTests
             (PtxFusedLinearTiledKernel.ThreadM + PtxFusedLinearTiledKernel.ThreadN),
             Count(ptx, "ld.shared.f32"));
         Assert.Equal(2, Count(ptx, "bar.sync 0"));
+        Assert.Equal(8, Count(ptx, "cp.async.ca.shared.global"));
+        Assert.Equal(2, Count(ptx, "cp.async.commit_group"));
+        Assert.Equal(2, Count(ptx, "cp.async.wait_group 0"));
+        Assert.Contains("xor.b32 %r28, %r26, 2048", ptx);
         Assert.Equal(
             PtxFusedLinearTiledKernel.ThreadM * PtxFusedLinearTiledKernel.ThreadN,
             Count(ptx, "st.global.f32"));

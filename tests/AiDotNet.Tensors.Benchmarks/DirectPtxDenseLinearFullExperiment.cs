@@ -19,26 +19,34 @@ internal static class DirectPtxDenseLinearFullExperiment
 {
     private const int Warmups = 30;
     private const int Samples = 101;
-    private const int DeviceLaunches = 10;
+    private const int DeviceLaunches = 50;
     private const double Tolerance = 2e-4;
     private static string _deviceFingerprint = "n/a";
 
     private readonly record struct Distribution(
         double Mean, double Median, double P95, double P99);
 
+    private readonly record struct DeviceAllocation(long Count, long Bytes);
+
     private readonly record struct Resources(
-        int Registers, int StaticShared, int Local, int ActiveBlocks,
-        string Blueprint, string DeviceFingerprint, string PtxSha256)
+        int Registers, int StaticShared, int DynamicShared, int ConstantBytes,
+        int Local, int MaxThreads, int PtxVersion, int BinaryVersion,
+        int BlockThreads, int ActiveBlocks,
+        string Blueprint, string DeviceFingerprint, string PtxSha256,
+        string ModuleImageKind, string CubinSha256, string CubinSourceKey,
+        string CubinPath, string CompilerLog)
     {
         internal static Resources None => new(
-            -1, -1, -1, -1, "n/a",
-            DirectPtxDenseLinearFullExperiment._deviceFingerprint, "n/a");
+            -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, "n/a",
+            DirectPtxDenseLinearFullExperiment._deviceFingerprint, "n/a",
+            "n/a", "n/a", "n/a", "n/a", "n/a");
     }
 
     internal static void Run(
         int independentRuns = 3,
         bool includePython = true,
-        string? onlyOperation = null)
+        string? onlyOperation = null,
+        bool tuneFp16TensorCore = false)
     {
         if (independentRuns <= 0) throw new ArgumentOutOfRangeException(nameof(independentRuns));
         AddPackagedNativeRuntimeToPath();
@@ -47,6 +55,7 @@ internal static class DirectPtxDenseLinearFullExperiment
         bool previousDeterminism = AiDotNetEngine.DeterministicMode;
         try
         {
+            AiDotNetEngine.SetDeterministicMode(false);
             GpuBenchmarkEnvironment.RequireIdleGpu("dense-linear-start");
             GpuBenchmarkEnvironment.PrintSnapshot("dense-linear-start");
             PrintEnvironmentFingerprint(independentRuns);
@@ -55,6 +64,8 @@ internal static class DirectPtxDenseLinearFullExperiment
                 $"{Warmups} warmups + {Samples} samples/cell, {DeviceLaunches} launches/device sample.");
             Console.WriteLine(
                 "Resident operands and caller-owned outputs; managed allocation is measured after prewarm.");
+            Console.WriteLine(
+                "TFLOPS/GFLOPS are GEMM-equivalent FMA throughput; fused epilogue operations are excluded consistently.");
             PrintHeader();
             for (int run = 1; run <= independentRuns; run++)
             {
@@ -68,6 +79,12 @@ internal static class DirectPtxDenseLinearFullExperiment
                 if (Includes(onlyOperation, "fused-gelu")) RunFusedGelu(backend, cublasLt, run);
                 if (Includes(onlyOperation, "batched-gemm")) RunBatchedGemm(backend, run);
                 if (Includes(onlyOperation, "gemm-fp16")) RunFp16Gemm(backend, run);
+                if (Includes(onlyOperation, "fused-gelu-fp16-m16-k512"))
+                    RunFp16TensorCoreLinear(
+                        backend, cublasLt, run, 512, 2_048, tuneFp16TensorCore);
+                if (Includes(onlyOperation, "fused-gelu-fp16-m16-k1024"))
+                    RunFp16TensorCoreLinear(
+                        backend, cublasLt, run, 1_024, 4_096, tuneFp16TensorCore);
                 if (Includes(onlyOperation, "lora")) RunLoRA(backend, run);
                 if (Includes(onlyOperation, "linear-ce-index")) RunCrossEntropy(backend, run);
                 if (Includes(onlyOperation, "linear-backward-relu")) RunLinearBackward(backend, run);
@@ -121,6 +138,7 @@ internal static class DirectPtxDenseLinearFullExperiment
             processor_count = Environment.ProcessorCount,
             processor_identifier = Environment.GetEnvironmentVariable("PROCESSOR_IDENTIFIER") ?? "n/a",
             server_gc = System.Runtime.GCSettings.IsServerGC,
+            deterministic_mode = AiDotNetEngine.DeterministicMode,
             gpu = runtime.DeviceName,
             gpu_ordinal = runtime.DeviceOrdinal,
             gpu_uuid = runtime.DeviceUuid,
@@ -345,6 +363,109 @@ internal static class DirectPtxDenseLinearFullExperiment
             "Direct PTX", 2d * m * k * n, Launch,
             () => MaximumError(backend.DownloadBuffer(direct), expected),
             Resource(audit), capture: true);
+    }
+
+    private static void RunFp16TensorCoreLinear(
+        CudaBackend backend,
+        CuBlasLtMatmul cublasLt,
+        int run,
+        int k,
+        int n,
+        bool tune)
+    {
+        const int m = PtxFusedLinearGeluFp16M16Kernel.Rows;
+        string operation = k == 512
+            ? "fused-gelu-fp16-m16-k512"
+            : "fused-gelu-fp16-m16-k1024";
+        string shape = $"M16 K{k} N{n}";
+        var random = new Random(20264050 + run + k);
+        ushort[] inputHost = HalfValues(random, m * k);
+        ushort[] outputMajorWeightHost = HalfValues(random, n * k, 0.0625f);
+        ushort[] inputMajorWeightHost = TransposeHalfOutputMajor(
+            outputMajorWeightHost, k, n);
+        float[] biasHost = Values(random, n, 0.0625f);
+        float[] expected = HalfFusedLinearOracle(
+            inputHost, outputMajorWeightHost, biasHost, m, k, n);
+        using var input = backend.AllocateByteBuffer(inputHost.Length * sizeof(ushort));
+        using var outputMajorWeight = backend.AllocateByteBuffer(
+            outputMajorWeightHost.Length * sizeof(ushort));
+        using var inputMajorWeight = backend.AllocateByteBuffer(
+            inputMajorWeightHost.Length * sizeof(ushort));
+        using var bias = backend.AllocateBuffer(biasHost);
+        using var established = backend.AllocateBuffer(m * n);
+        using var vendor = backend.AllocateBuffer(m * n);
+        using var direct = backend.AllocateBuffer(m * n);
+        backend.UploadBytes(input, Bytes(inputHost));
+        backend.UploadBytes(outputMajorWeight, Bytes(outputMajorWeightHost));
+        backend.UploadBytes(inputMajorWeight, Bytes(inputMajorWeightHost));
+
+        DirectPtxFeatureGate.TestOverride = false;
+        BenchmarkRoute(backend, run, operation, shape,
+            "AiDotNet GemmEx+bias+GELU", 2d * m * k * n,
+            () =>
+            {
+                backend.GemmFp16In32fOut(
+                    input, inputMajorWeight, established, m, n, k);
+                backend.BiasAdd(established, bias, established, m, n);
+                backend.Gelu(established, established, m * n);
+            },
+            () => MaximumError(backend.DownloadBuffer(established), expected),
+            Resources.None, capture: true, tolerance: 2e-3);
+
+        BenchmarkRoute(backend, run, operation, shape,
+            "NVIDIA cuBLASLt FP16", 2d * m * k * n,
+            () => cublasLt.MatmulFused(
+                aDev: inputMajorWeight.Handle, m: n, k: k, transA: false,
+                bDev: input.Handle, n: m, transB: false,
+                cDev: IntPtr.Zero, dDev: vendor.Handle,
+                biasDev: bias.Handle, epilogue: CublasLtEpilogue.GELUBias,
+                stream: backend.DefaultStream.Handle,
+                dtype: CublasDataType.Float16,
+                computeType: CublasComputeType.Float32,
+                outputDtype: CublasDataType.Float32),
+            () => MaximumError(backend.DownloadBuffer(vendor), expected),
+            Resources.None, capture: true, tolerance: 2e-3);
+
+        EnableDirectExperiment();
+        void Launch()
+        {
+            if (!backend.TryDirectPtxFusedLinearGeluFp16M16(
+                    input, outputMajorWeight, bias, direct, k, n))
+                throw new InvalidOperationException(backend.DirectPtxLastError);
+        }
+        if (tune)
+        {
+            if (!DirectPtxFeatureGate.IsAutotuneEnabled)
+                throw new InvalidOperationException(
+                    "--autotune-fp16-m16 requires AIDOTNET_DIRECT_PTX_AUTOTUNE=1.");
+            // Do not prewarm a default plan: the first real launch owns the
+            // bounded candidate screen, persists its source-keyed result, and
+            // leaves the selected module resident for the measurements below.
+            Launch();
+            backend.Synchronize();
+        }
+        else
+        {
+            Require(backend.PrewarmDirectPtxFusedLinearGeluFp16M16(k, n), backend);
+        }
+        Require(backend.TryGetDirectPtxFp16TensorCoreLinearAudit(
+            k, n, out DirectPtxKernelAudit audit));
+        if (tune)
+        {
+            Console.WriteLine("dense_linear_tuning_json=" + JsonSerializer.Serialize(new
+            {
+                run,
+                operation,
+                shape,
+                selected_blueprint = audit.BlueprintId,
+                cubin_source_key = audit.CubinSourceKey,
+                device_fingerprint = audit.DeviceFingerprint
+            }));
+        }
+        BenchmarkRoute(backend, run, operation, shape,
+            "Direct PTX cp.async MMA", 2d * m * k * n, Launch,
+            () => MaximumError(backend.DownloadBuffer(direct), expected),
+            Resource(audit), capture: true, tolerance: 2e-3);
     }
 
     private static void RunLoRA(CudaBackend backend, int run)
@@ -667,8 +788,11 @@ internal static class DirectPtxDenseLinearFullExperiment
         Func<double> error,
         Resources resources,
         bool capture,
-        bool allowMissingEstablishedKernel = false)
+        bool allowMissingEstablishedKernel = false,
+        double tolerance = Tolerance)
     {
+        string environmentLabel = operation + "-" + method;
+        GpuBenchmarkEnvironment.RequireNoForeignCompute(environmentLabel + "-start");
         try
         {
             launch();
@@ -686,6 +810,7 @@ internal static class DirectPtxDenseLinearFullExperiment
                 status = "unsupported",
                 reason = ex.Message
             }));
+            GpuBenchmarkEnvironment.RequireNoForeignCompute(environmentLabel + "-end");
             return;
         }
         backend.Synchronize();
@@ -693,10 +818,15 @@ internal static class DirectPtxDenseLinearFullExperiment
         Distribution device = MeasureDevice(backend, launch);
         Distribution endToEnd = MeasureEndToEnd(backend, launch);
         long allocation = MeasureAllocation(backend, launch);
+        DeviceAllocation temporary = MeasureTemporaryDeviceAllocation(backend, launch);
         Print(run, operation, shape, method, work, device, endToEnd,
-            allocation, temporaryBytes: 0, maxError, resources);
+            allocation, temporary, maxError, tolerance, resources);
 
-        if (!capture) return;
+        if (!capture)
+        {
+            GpuBenchmarkEnvironment.RequireNoForeignCompute(environmentLabel + "-end");
+            return;
+        }
         IntPtr graph = backend.CaptureGraph(launch);
         if (graph == IntPtr.Zero)
         {
@@ -709,6 +839,7 @@ internal static class DirectPtxDenseLinearFullExperiment
                 status = "unsupported",
                 reason = "CUDA graph capture returned a null executable graph"
             }));
+            GpuBenchmarkEnvironment.RequireNoForeignCompute(environmentLabel + "-end");
             return;
         }
         try
@@ -723,14 +854,17 @@ internal static class DirectPtxDenseLinearFullExperiment
             Distribution graphDevice = MeasureDevice(backend, GraphLaunch);
             Distribution graphEndToEnd = MeasureEndToEnd(backend, GraphLaunch);
             long graphAllocation = MeasureAllocation(backend, GraphLaunch);
+            DeviceAllocation graphTemporary =
+                MeasureTemporaryDeviceAllocation(backend, GraphLaunch);
             Print(run, operation, shape, method + " graph", work,
                 graphDevice, graphEndToEnd, graphAllocation,
-                temporaryBytes: 0, graphError, resources);
+                graphTemporary, graphError, tolerance, resources);
         }
         finally
         {
             backend.DestroyCapturedGraph(graph);
         }
+        GpuBenchmarkEnvironment.RequireNoForeignCompute(environmentLabel + "-end");
     }
 
     private static Distribution MeasureDevice(CudaBackend backend, Action launch)
@@ -781,6 +915,25 @@ internal static class DirectPtxDenseLinearFullExperiment
         return result;
     }
 
+    private static DeviceAllocation MeasureTemporaryDeviceAllocation(
+        CudaBackend backend,
+        Action launch)
+    {
+        backend.Synchronize();
+        (long beforeCount, long beforeBytes) =
+            backend.DirectPtxEvidenceDeviceAllocations;
+        launch();
+        backend.Synchronize();
+        (long afterCount, long afterBytes) =
+            backend.DirectPtxEvidenceDeviceAllocations;
+        long count = checked(afterCount - beforeCount);
+        long bytes = checked(afterBytes - beforeBytes);
+        if (count < 0 || bytes < 0)
+            throw new InvalidOperationException(
+                "Device-allocation evidence counters moved backwards.");
+        return new DeviceAllocation(count, bytes);
+    }
+
     private static Distribution Summarize(double[] values)
     {
         Array.Sort(values);
@@ -801,21 +954,23 @@ internal static class DirectPtxDenseLinearFullExperiment
         Console.WriteLine(
             "run operation            shape                  method                     " +
             "dev mean/med/p95/p99 us         e2e mean/med/p95/p99 us       " +
-            "TFLOPS GFLOPS allocB tmpB error     R/S/L/B");
+            "TFLOPS GFLOPS allocB tmp#/B error     R/S/L/B");
         Console.WriteLine(new string('-', 190));
     }
 
     private static void Print(
         int run, string operation, string shape, string method, double work,
         Distribution device, Distribution endToEnd,
-        long allocation, long temporaryBytes, double maxError, Resources resources)
+        long allocation, DeviceAllocation temporary, double maxError,
+        double tolerance, Resources resources)
     {
         double gflops = work / (device.Median * 1e-6) / 1e9;
         Console.WriteLine(
             $"{run,3} {operation,-20} {shape,-22} {method,-26} " +
             $"{device.Mean,6:F2}/{device.Median,6:F2}/{device.P95,6:F2}/{device.P99,6:F2}  " +
             $"{endToEnd.Mean,6:F2}/{endToEnd.Median,6:F2}/{endToEnd.P95,6:F2}/{endToEnd.P99,6:F2}  " +
-            $"{gflops / 1_000d,6:F3} {gflops,7:F2} {allocation,6} {temporaryBytes,4} " +
+            $"{gflops / 1_000d,6:F3} {gflops,7:F2} {allocation,6} " +
+            $"{temporary.Count,3}/{temporary.Bytes,-4} " +
             $"{maxError,8:E1} {resources.Registers,2}/{resources.StaticShared,4}/" +
             $"{resources.Local,2}/{resources.ActiveBlocks,2}");
 
@@ -837,27 +992,50 @@ internal static class DirectPtxDenseLinearFullExperiment
             tflops = gflops / 1_000d,
             gflops,
             managed_bytes = allocation,
-            temporary_device_bytes = temporaryBytes,
+            temporary_device_allocation_count = temporary.Count,
+            temporary_device_bytes = temporary.Bytes,
             max_error = maxError,
-            tolerance = Tolerance,
+            tolerance,
             registers = resources.Registers,
             static_shared_bytes = resources.StaticShared,
+            dynamic_shared_bytes = resources.DynamicShared,
+            constant_bytes = resources.ConstantBytes,
             local_bytes_per_thread = resources.Local,
+            max_threads_per_block = resources.MaxThreads,
+            ptx_version = resources.PtxVersion,
+            binary_version = resources.BinaryVersion,
+            block_threads = resources.BlockThreads,
             active_blocks_per_sm = resources.ActiveBlocks,
             blueprint = resources.Blueprint,
             device_fingerprint = resources.DeviceFingerprint,
-            ptx_sha256 = resources.PtxSha256
+            ptx_sha256 = resources.PtxSha256,
+            module_image_kind = resources.ModuleImageKind,
+            cubin_sha256 = resources.CubinSha256,
+            cubin_source_key = resources.CubinSourceKey,
+            cubin_path = resources.CubinPath,
+            compiler_log = resources.CompilerLog
         }));
     }
 
     private static Resources Resource(DirectPtxKernelAudit audit) => new(
         audit.Function.RegistersPerThread,
         audit.Function.StaticSharedBytes,
+        0,
+        audit.Function.ConstBytes,
         audit.Function.LocalBytesPerThread,
+        audit.Function.MaxThreadsPerBlock,
+        audit.Function.PtxVersion,
+        audit.Function.BinaryVersion,
+        audit.BlockThreads,
         audit.ActiveBlocksPerMultiprocessor,
         audit.BlueprintId,
         audit.DeviceFingerprint,
-        audit.PtxSha256);
+        audit.PtxSha256,
+        audit.ImageKind.ToString(),
+        audit.CubinSha256,
+        audit.CubinSourceKey,
+        audit.CubinPath ?? "n/a",
+        audit.JitInfoLog);
 
     private static Resources Resource(IReadOnlyList<DirectPtxKernelAudit> audits)
     {
@@ -865,11 +1043,22 @@ internal static class DirectPtxDenseLinearFullExperiment
         return new Resources(
             audits.Max(audit => audit.Function.RegistersPerThread),
             audits.Max(audit => audit.Function.StaticSharedBytes),
+            0,
+            audits.Max(audit => audit.Function.ConstBytes),
             audits.Max(audit => audit.Function.LocalBytesPerThread),
+            audits.Min(audit => audit.Function.MaxThreadsPerBlock),
+            audits.Max(audit => audit.Function.PtxVersion),
+            audits.Max(audit => audit.Function.BinaryVersion),
+            audits.Max(audit => audit.BlockThreads),
             audits.Min(audit => audit.ActiveBlocksPerMultiprocessor),
             string.Join("+", audits.Select(audit => audit.BlueprintId)),
             audits[0].DeviceFingerprint,
-            string.Join("+", audits.Select(audit => audit.PtxSha256)));
+            string.Join("+", audits.Select(audit => audit.PtxSha256).Distinct()),
+            string.Join("+", audits.Select(audit => audit.ImageKind.ToString()).Distinct()),
+            string.Join("+", audits.Select(audit => audit.CubinSha256).Distinct()),
+            string.Join("+", audits.Select(audit => audit.CubinSourceKey).Distinct()),
+            string.Join("+", audits.Select(audit => audit.CubinPath ?? "n/a").Distinct()),
+            string.Join("\n---\n", audits.Select(audit => audit.JitInfoLog).Distinct()));
     }
 
     private static void RunPython(int runs, string? onlyOperation)
@@ -994,6 +1183,27 @@ internal static class DirectPtxDenseLinearFullExperiment
         return output;
     }
 
+    private static float[] HalfFusedLinearOracle(
+        ushort[] input,
+        ushort[] outputMajorWeights,
+        float[] bias,
+        int m,
+        int k,
+        int n)
+    {
+        var output = new float[m * n];
+        for (int row = 0; row < m; row++)
+        for (int column = 0; column < n; column++)
+        {
+            float sum = bias[column];
+            for (int inner = 0; inner < k; inner++)
+                sum += Half(input[row * k + inner]) *
+                    Half(outputMajorWeights[column * k + inner]);
+            output[row * n + column] = Gelu(sum);
+        }
+        return output;
+    }
+
     private static float[] LoRAOracle(
         float[] input, float[] baseOutput, float[] a, float[] b,
         int batch, int inputFeatures, int rank, int outputFeatures, float scaling)
@@ -1104,6 +1314,18 @@ internal static class DirectPtxDenseLinearFullExperiment
         for (int output = 0; output < n; output++)
             outputMajor[output * k + inner] = inputMajor[inner * n + output];
         return outputMajor;
+    }
+
+    private static ushort[] TransposeHalfOutputMajor(
+        ushort[] outputMajor,
+        int k,
+        int n)
+    {
+        var inputMajor = new ushort[outputMajor.Length];
+        for (int inner = 0; inner < k; inner++)
+        for (int output = 0; output < n; output++)
+            inputMajor[inner * n + output] = outputMajor[output * k + inner];
+        return inputMajor;
     }
 
     private static double MaximumError(float[] actual, float[] expected)

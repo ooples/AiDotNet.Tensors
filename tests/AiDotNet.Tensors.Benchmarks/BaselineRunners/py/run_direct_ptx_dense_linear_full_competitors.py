@@ -2,10 +2,15 @@
 """Resident PyTorch CUDA eager/graph peers for issue #836 operation families."""
 
 import argparse
+import csv
+import glob
+import importlib.util
 import json
 import math
+import os
 import platform
 import statistics
+import subprocess
 import sys
 import time
 
@@ -15,7 +20,123 @@ import torch.nn.functional as functional
 
 WARMUPS = 30
 SAMPLES = 101
-DEVICE_LAUNCHES = 10
+DEVICE_LAUNCHES = 50
+
+
+def foreign_python_processes():
+    """Return other Python processes without requiring a third-party package."""
+    current_pid = os.getpid()
+    conflicts = []
+    if os.name == "nt":
+        result = subprocess.run(
+            ["tasklist", "/fo", "csv", "/nh"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        for row in csv.reader(result.stdout.splitlines()):
+            if len(row) < 2:
+                continue
+            name = row[0].lower()
+            try:
+                pid = int(row[1])
+            except ValueError:
+                continue
+            if pid != current_pid and name in ("python.exe", "python3.exe", "pythonw.exe"):
+                conflicts.append(f"pid={pid} {row[0]}")
+        return conflicts
+
+    proc_root = "/proc"
+    if not os.path.isdir(proc_root):
+        raise RuntimeError("Cannot enumerate OS processes for clean evidence.")
+    for entry in os.scandir(proc_root):
+        if not entry.name.isdigit() or int(entry.name) == current_pid:
+            continue
+        try:
+            with open(os.path.join(entry.path, "comm"), encoding="utf-8") as stream:
+                name = stream.read().strip()
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        if name.lower() in ("python", "python3", "pythonw"):
+            conflicts.append(f"pid={entry.name} {name}")
+    return conflicts
+
+
+def require_no_foreign_compute(label):
+    """Fail closed when another Python or CUDA compute process is present."""
+    python_conflicts = foreign_python_processes()
+    if python_conflicts:
+        raise RuntimeError(
+            f"[{label}] foreign Python workload detected: "
+            + "; ".join(python_conflicts)
+        )
+
+    result = subprocess.run(
+        ["nvidia-smi", "pmon", "-c", "1", "-s", "u"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    gpu_conflicts = []
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        fields = stripped.split()
+        if len(fields) < 9:
+            continue
+        try:
+            pid = int(fields[1])
+        except ValueError:
+            continue
+        if pid == os.getpid():
+            continue
+        process_type = fields[2]
+        try:
+            sm_percent = int(fields[3])
+        except ValueError:
+            sm_percent = 0
+        if process_type == "C" or ("C" in process_type and sm_percent > 5):
+            gpu_conflicts.append(
+                f"pid={pid} {fields[-1]} type={process_type} sm={fields[3]}%"
+            )
+    if gpu_conflicts:
+        raise RuntimeError(
+            f"[{label}] foreign GPU workload detected: "
+            + "; ".join(gpu_conflicts)
+        )
+
+
+def configure_windows_triton():
+    """Give torch.compile's Triton backend an explicit Windows toolchain."""
+    if os.name != "nt":
+        return
+    if "CC" not in os.environ:
+        candidates = glob.glob(
+            r"C:\Program Files (x86)\Microsoft Visual Studio\*\BuildTools\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe"
+        ) + glob.glob(
+            r"C:\Program Files\Microsoft Visual Studio\*\Community\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe"
+        )
+        if candidates:
+            os.environ["CC"] = sorted(candidates)[-1]
+    spec = importlib.util.find_spec("triton")
+    if spec is None or not spec.submodule_search_locations:
+        return
+    triton_root = os.path.join(
+        next(iter(spec.submodule_search_locations)), "backends", "nvidia"
+    )
+    cuda_import_library = os.path.join(triton_root, "lib", "x64", "cuda.lib")
+    if not os.path.isfile(cuda_import_library):
+        return
+    os.environ.setdefault("CUDA_PATH", triton_root)
+    os.environ.setdefault("CUDA_HOME", triton_root)
+    current_lib = os.environ.get("LIB", "")
+    os.environ["LIB"] = os.path.dirname(cuda_import_library) + (
+        os.pathsep + current_lib if current_lib else ""
+    )
+
+
+configure_windows_triton()
 
 
 def percentile(values, q):
@@ -74,6 +195,41 @@ def maximum_error(actual, expected):
     return (actual.double() - expected).abs().max().item()
 
 
+def output_storage_bytes(value):
+    """Count required result storage once, excluding aliases within tuples."""
+    tensors = value if isinstance(value, (tuple, list)) else (value,)
+    seen = set()
+    total = 0
+    for tensor in tensors:
+        if not torch.is_tensor(tensor):
+            continue
+        storage = tensor.untyped_storage()
+        identity = (tensor.device.type, tensor.device.index, storage.data_ptr())
+        if identity in seen:
+            continue
+        seen.add(identity)
+        total += storage.nbytes()
+    return total
+
+
+def capture_graph(operation):
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        for _ in range(3):
+            graph_output = operation()
+    torch.cuda.current_stream().wait_stream(capture_stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output = operation()
+
+    def replay():
+        graph.replay()
+        return graph_output
+
+    return replay, graph, capture_stream
+
+
 def make_case(name, run, device):
     generator = torch.Generator(device=device)
     generator.manual_seed(20263000 + run * 100 + sum(ord(c) for c in name))
@@ -127,6 +283,20 @@ def make_case(name, run, device):
             return (left @ right).float()
 
         return "M16 K32 N16", 2.0 * m * k * n, op, left.double() @ right.double()
+
+    if name in ("fused-gelu-fp16-m16-k512", "fused-gelu-fp16-m16-k1024"):
+        m = 16
+        k, n = ((512, 2048) if name.endswith("k512") else (1024, 4096))
+        x = values((m, k), dtype=torch.float16)
+        w = values((n, k), 0.0625, torch.float16)
+        bias = values((n,), 0.0625)
+
+        def op():
+            return functional.gelu(x @ w.t() + bias, approximate="tanh")
+
+        expected = functional.gelu(
+            x.double() @ w.double().t() + bias.double(), approximate="tanh")
+        return f"M16 K{k} N{n}", 2.0 * m * k * n, op, expected
 
     if name == "lora":
         batch, input_features, rank, output_features = 8, 256, 8, 256
@@ -215,6 +385,8 @@ CASES = (
     "fused-gelu",
     "batched-gemm",
     "gemm-fp16",
+    "fused-gelu-fp16-m16-k512",
+    "fused-gelu-fp16-m16-k1024",
     "lora",
     "linear-ce-index",
     "linear-backward-relu",
@@ -233,11 +405,15 @@ def main():
     args = parser.parse_args()
     if args.runs <= 0:
         parser.error("--runs must be positive")
+    require_no_foreign_compute("dense-linear-pytorch-start")
     if not torch.cuda.is_available():
         print("CUDA-enabled Python PyTorch is required.", file=sys.stderr)
         return 2
 
     torch.set_grad_enabled(False)
+    # Keep FP32 cells in the same numerical mode as the AiDotNet/cuBLAS and
+    # direct-PTX FP32-accumulate routes. FP16 cells still use FP16 Tensor Cores.
+    torch.set_float32_matmul_precision("highest")
     device = torch.device("cuda")
     properties = torch.cuda.get_device_properties(device)
     software_fingerprint = {
@@ -246,32 +422,49 @@ def main():
         "pytorch_cuda_version": torch.version.cuda,
         "device_name": properties.name,
         "compute_capability": f"{properties.major}.{properties.minor}",
+        "float32_matmul_precision": torch.get_float32_matmul_precision(),
     }
     for run in range(1, args.runs + 1):
         operations = (args.only,) if args.only else CASES
         for operation in operations:
+            require_no_foreign_compute(f"{operation}-start")
             shape, work, eager, expected = make_case(operation, run, device)
-            eager_probe = eager()
-            eager_error = maximum_error(eager_probe, expected)
 
-            capture_stream = torch.cuda.Stream()
-            capture_stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(capture_stream):
-                for _ in range(3):
-                    graph_output = eager()
-            torch.cuda.current_stream().wait_stream(capture_stream)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                graph_output = eager()
+            graph_operation, eager_graph, eager_capture_stream = capture_graph(eager)
+            competitors = [
+                ("PyTorch CUDA eager", eager),
+                ("PyTorch CUDA graph", graph_operation),
+            ]
+            compiled = None
+            compiled_graph = None
+            compiled_capture_stream = None
+            try:
+                compiled = torch.compile(
+                    eager, fullgraph=True, mode="max-autotune-no-cudagraphs")
+                compiled_probe = compiled()
+                torch.cuda.synchronize()
+                compiled_graph_operation, compiled_graph, compiled_capture_stream = capture_graph(compiled)
+                competitors.extend((
+                    ("PyTorch compile max-autotune", compiled),
+                    ("PyTorch compile max-autotune graph", compiled_graph_operation),
+                ))
+                del compiled_probe
+            except Exception as exception:
+                print(json.dumps({
+                    "status": "skip",
+                    "run": run,
+                    "operation": operation,
+                    "shape": shape,
+                    "method": "PyTorch compile max-autotune",
+                    "reason": f"{type(exception).__name__}: {exception}",
+                    **software_fingerprint,
+                }, separators=(",", ":")))
 
-            def graph_operation():
-                graph.replay()
-                return graph_output
-
-            for method, measured, error in (
-                ("PyTorch CUDA eager", eager, eager_error),
-                ("PyTorch CUDA graph", graph_operation, eager_error),
-            ):
+            for method, measured in competitors:
+                require_no_foreign_compute(f"{operation}-{method}-start")
+                correctness_probe = measured()
+                torch.cuda.synchronize()
+                error = maximum_error(correctness_probe, expected)
                 device_values = measure_device(measured)
                 e2e_values = measure_e2e(measured)
                 torch.cuda.synchronize()
@@ -280,6 +473,9 @@ def main():
                 result = measured()
                 torch.cuda.synchronize()
                 peak_bytes = max(0, torch.cuda.max_memory_allocated() - baseline)
+                output_bytes = output_storage_bytes(result)
+                temporary_bytes = max(0, peak_bytes - output_bytes)
+                require_no_foreign_compute(f"{operation}-{method}-end")
                 median_us = device_values[1]
                 record = {
                     "status": "ok",
@@ -299,14 +495,24 @@ def main():
                     "tflops": work / (median_us * 1_000_000.0),
                     "gflops": work / (median_us * 1_000.0),
                     "managed_bytes": None,
-                    "temporary_device_bytes": peak_bytes,
+                    "output_device_bytes": output_bytes,
+                    "temporary_device_allocation_count": None,
+                    "temporary_device_bytes": temporary_bytes,
                     "peak_device_bytes": peak_bytes,
                     "max_error": error,
+                    "tolerance": 2e-3 if operation.startswith("fused-gelu-fp16-m16-") else 2e-4,
                     **software_fingerprint,
                 }
                 print(json.dumps(record, separators=(",", ":")))
-                del result
-            del eager_probe, expected, graph_output, graph, capture_stream
+                del result, correctness_probe
+            del expected, eager_graph, eager_capture_stream
+            if compiled_graph is not None:
+                del compiled_graph
+            if compiled_capture_stream is not None:
+                del compiled_capture_stream
+            if compiled is not None:
+                del compiled
+            require_no_foreign_compute(f"{operation}-end")
     return 0
 
 

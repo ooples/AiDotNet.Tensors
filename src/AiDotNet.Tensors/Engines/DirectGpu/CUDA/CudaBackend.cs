@@ -1314,6 +1314,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         ulong byteSize = (ulong)size * sizeof(float);
         // Issue #285: per-allocation cap check before cuMemAlloc.
         GpuBufferSizeGuard.EnsureFits("CUDA", (long)byteSize, MaxBufferAllocBytes, DeviceName);
+        RecordDirectPtxEvidenceDeviceAllocation(checked((long)byteSize));
 
         // CUDA driver API calls are required for device memory operations.
         using var _ = PushContext();
@@ -1579,6 +1580,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new ArgumentOutOfRangeException(nameof(size), "Buffer size must be positive.");
         // Issue #285: per-allocation cap check before cuMemAlloc.
         GpuBufferSizeGuard.EnsureFits("CUDA", (long)size * sizeof(float), MaxBufferAllocBytes, DeviceName);
+        RecordDirectPtxEvidenceDeviceAllocation(checked((long)size * sizeof(float)));
 
         // CUDA driver API calls are required for device memory operations.
         using var _ = PushContext();
@@ -1619,6 +1621,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Buffer size must be positive.");
         GpuBufferSizeGuard.EnsureFits("CUDA", size, MaxBufferAllocBytes, DeviceName);
+        RecordDirectPtxEvidenceDeviceAllocation(size);
 
         using var _ = PushContext();
         if (_asyncAlloc)
@@ -8098,6 +8101,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new ArgumentOutOfRangeException(nameof(size), "Buffer size must be positive.");
         // Issue #285: per-allocation cap check before cuMemAlloc.
         GpuBufferSizeGuard.EnsureFits("CUDA", (long)size * sizeof(int), MaxBufferAllocBytes, DeviceName);
+        RecordDirectPtxEvidenceDeviceAllocation(checked((long)size * sizeof(int)));
 
         using var _ = PushContext();
         ulong byteSize = (ulong)size * sizeof(int);
@@ -8120,6 +8124,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         ulong byteSize = (ulong)size * sizeof(int);
         // Issue #285: per-allocation cap check before cuMemAlloc.
         GpuBufferSizeGuard.EnsureFits("CUDA", (long)byteSize, MaxBufferAllocBytes, DeviceName);
+        RecordDirectPtxEvidenceDeviceAllocation(checked((long)byteSize));
 
         CuBlasNative.CheckCudaResult(CuBlasNative.cuMemAlloc(out IntPtr devicePtr, byteSize), "cuMemAlloc(int)");
 

@@ -6,6 +6,23 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 public sealed partial class CudaBackend
 {
+    private long _directPtxEvidenceDeviceAllocationCount;
+    private long _directPtxEvidenceDeviceAllocationBytes;
+
+    internal (long Count, long Bytes) DirectPtxEvidenceDeviceAllocations =>
+        (System.Threading.Interlocked.Read(
+            ref _directPtxEvidenceDeviceAllocationCount),
+         System.Threading.Interlocked.Read(
+            ref _directPtxEvidenceDeviceAllocationBytes));
+
+    private void RecordDirectPtxEvidenceDeviceAllocation(long bytes)
+    {
+        System.Threading.Interlocked.Increment(
+            ref _directPtxEvidenceDeviceAllocationCount);
+        System.Threading.Interlocked.Add(
+            ref _directPtxEvidenceDeviceAllocationBytes, bytes);
+    }
+
     // Resolve process-level feature switches once when the backend is built.
     // Reading environment variables in every dispatch would violate the
     // zero-allocation hot-path contract even though the PTX launch is resident.
@@ -1965,6 +1982,8 @@ public sealed partial class CudaBackend
             _directPtxFlashAttentionBackwardKernels.Dispose();
             _directPtxQkvRopeCacheKernels.Dispose();
             _directPtxFusedLinearKernels.Dispose();
+            _directPtxFp16TensorCoreLinearKernels.Dispose();
+            _directPtxFp16TensorCoreLinearPlans.Clear();
             _directPtxFusedLinearTiledKernels.Dispose();
             _directPtxDenseVectorKernels.Dispose();
             _directPtxBatchedVectorKernels.Dispose();

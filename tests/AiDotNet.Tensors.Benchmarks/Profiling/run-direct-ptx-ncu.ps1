@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'fused-linear')]
+    [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'fused-linear', 'dense-linear')]
     [string]$Target = 'attention',
     [string]$OutputCsv = (Join-Path ([System.IO.Path]::GetTempPath()) ("aidotnet-direct-ptx-ncu-" + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.csv')),
     [string]$NcuPath = $env:NSIGHT_COMPUTE_CLI
@@ -28,6 +28,7 @@ $switch = switch ($Target) {
     'flash-attention-backward' { '--direct-ptx-profile-flash-attention-backward' }
     'qkv-rope-cache' { '--direct-ptx-profile-qkv-rope-cache' }
     'fused-linear' { '--direct-ptx-profile-fused-linear' }
+    'dense-linear' { '--direct-ptx-profile-dense-linear' }
 }
 $kernel = switch ($Target) {
     'attention' { 'regex:aidotnet_online_attention_128x64' }
@@ -38,6 +39,7 @@ $kernel = switch ($Target) {
     'flash-attention-backward' { 'regex:aidotnet_flash_attention_backward_(dq|dkv)_d64' }
     'qkv-rope-cache' { 'regex:aidotnet_qkv_rope_cache_d64' }
     'fused-linear' { 'regex:aidotnet_fused_linear_gelu_m1' }
+    'dense-linear' { 'regex:aidotnet_(fused_linear_gelu_m1|fused_linear_tiled|fused_linear_gelu_fp16_m16|fp16_gemm|fused_lora_forward|fused_linear_ce_index|fused_linear_backward_(input|weight|bias)|dense_(dot|outer)|batched_dot|strided_dot)' }
 }
 $expectedLaunches = switch ($Target) {
     'attention' { 16 }
@@ -48,11 +50,14 @@ $expectedLaunches = switch ($Target) {
     'flash-attention-backward' { 2 }
     'qkv-rope-cache' { 3 }
     'fused-linear' { 10 }
+    'dense-linear' { 18 }
 }
 $metricNames = @(
     'smsp__sass_inst_executed_op_local.sum',
     'smsp__sass_inst_executed_op_local_ld.sum',
     'smsp__sass_inst_executed_op_local_st.sum',
+    'l1tex__t_requests_pipe_lsu_mem_local_op_ld.sum',
+    'l1tex__t_requests_pipe_lsu_mem_local_op_st.sum',
     'launch__registers_per_thread',
     'launch__shared_mem_per_block_static',
     'launch__shared_mem_per_block_dynamic',

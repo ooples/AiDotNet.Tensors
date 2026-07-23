@@ -50,6 +50,9 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <EmbeddedResource Include="Engines\DirectGpu\CUDA\Ptx\Artifacts\**\*.cubin" />
+    <EmbeddedResource Include="Engines\DirectGpu\CUDA\Ptx\Artifacts\**\*.tsv" />
+    <EmbeddedResource Include="Engines\DirectGpu\CUDA\Ptx\Artifacts\**\*.linker.txt" />
     <InternalsVisibleTo Include="AiDotNet" />
     <InternalsVisibleTo Include="AiDotNetTests" />
     <InternalsVisibleTo Include="AiDotNet.Tensors.Tests" />

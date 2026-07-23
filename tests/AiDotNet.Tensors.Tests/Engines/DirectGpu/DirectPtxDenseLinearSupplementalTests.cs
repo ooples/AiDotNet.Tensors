@@ -15,6 +15,73 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 // dense-linear kernel families on the same PR branch.
 public partial class DirectPtxWmmaTests
 {
+    [Fact]
+    public void CubinSourceIdentity_IsCanonicalAcrossNewlineStyles()
+    {
+        Assert.Equal(3, DirectPtxCubinArtifactCache.PipelineVersion);
+        const string lf = ".version 7.1\n.target sm_86\n";
+        const string crlf = ".version 7.1\r\n.target sm_86\r\n";
+        const string cr = ".version 7.1\r.target sm_86\r";
+        Assert.Equal(lf, DirectPtxCubinArtifactCache.CanonicalizePtx(crlf));
+        Assert.Equal(lf, DirectPtxCubinArtifactCache.CanonicalizePtx(cr));
+        Assert.Equal(
+            DirectPtxCubinArtifactCache.ComputePtxSha256(lf),
+            DirectPtxCubinArtifactCache.ComputePtxSha256(crlf));
+        Assert.Equal(
+            DirectPtxCubinArtifactCache.ComputeSourceKey(lf, 8, 6),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(crlf, 8, 6));
+        Assert.Equal(
+            "cd5c1a81a390b30a00e2ebb41f3b4ab79950317c763550ec5553543ee08da009",
+            DirectPtxCubinArtifactCache.ComputeSourceKey(lf, 8, 6));
+    }
+
+    [Fact]
+    public void EmbeddedDenseLinearArtifacts_IncludeHashedCubinsAndLinkerLogs()
+    {
+        System.Reflection.Assembly assembly = typeof(DirectPtxRuntime).Assembly;
+        string[] resources = assembly.GetManifestResourceNames();
+        string manifestName = Assert.Single(resources.Where(name =>
+            name.EndsWith(
+                ".Artifacts.sm86.dense-linear-cubins.tsv",
+                StringComparison.Ordinal)));
+        using System.IO.Stream manifestStream =
+            assembly.GetManifestResourceStream(manifestName)!;
+        Assert.NotNull(manifestStream);
+        using var reader = new System.IO.StreamReader(manifestStream);
+        int rows = 0;
+        string? line;
+        while ((line = reader.ReadLine()) != null)
+        {
+            if (line.Length == 0 || line[0] == '#' ||
+                line.StartsWith("blueprint-id", StringComparison.Ordinal))
+                continue;
+            string[] columns = line.Split('\t');
+            Assert.Equal(6, columns.Length);
+            string cubinName = Assert.Single(resources.Where(name =>
+                name.EndsWith("." + columns[4], StringComparison.Ordinal)));
+            string linkerName = Assert.Single(resources.Where(name =>
+                name.EndsWith(
+                    "." + columns[2] + ".linker.txt",
+                    StringComparison.Ordinal)));
+            using System.IO.Stream cubin =
+                assembly.GetManifestResourceStream(cubinName)!;
+            using System.IO.Stream linker =
+                assembly.GetManifestResourceStream(linkerName)!;
+            Assert.Equal(columns[3], Hash(cubin));
+            Assert.Equal(columns[5], Hash(linker));
+            rows++;
+        }
+        Assert.Equal(16, rows);
+
+        static string Hash(System.IO.Stream stream)
+        {
+            using System.Security.Cryptography.SHA256 sha =
+                System.Security.Cryptography.SHA256.Create();
+            return PtxCompat.ToHexString(sha.ComputeHash(stream))
+                .ToLowerInvariant();
+        }
+    }
+
     [SkippableFact]
     public void BackendGemmTiledInputMajor_IsPublicAndMatchesOracle()
     {
@@ -318,6 +385,9 @@ public partial class DirectPtxWmmaTests
         using (var output = runtime.AllocateBytes((nuint)(expected.Length * sizeof(float))))
         {
             Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+            Assert.Equal(DirectPtxModuleImageKind.EmbeddedCubin, kernel.Audit.ImageKind);
+            Assert.NotEmpty(kernel.Audit.CubinSha256);
+            Assert.NotEmpty(kernel.Audit.CubinSourceKey);
             kernel.Launch(
                 DirectPtxTensorView.CreateOwned(left, kernel.Blueprint.Tensors[0]),
                 DirectPtxTensorView.CreateOwned(right, kernel.Blueprint.Tensors[1]),
@@ -677,6 +747,133 @@ public partial class DirectPtxWmmaTests
         Assert.Contains("st.global.f32", bf16, StringComparison.Ordinal);
         Assert.DoesNotContain("cvt.f32.f16", bf16, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", bf16, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Fp16TensorCoreM16Emitter_UsesAsyncMmaAndRegisterOnlyEpilogue()
+    {
+        string k512Ptx = PtxFusedLinearGeluFp16M16Kernel.EmitPtx(
+            8, 6, inputFeatures: 512, outputFeatures: 2_048);
+        Assert.Contains(
+            PtxFusedLinearGeluFp16M16Kernel.EntryPoint, k512Ptx,
+            StringComparison.Ordinal);
+        Assert.Equal(4, Count(k512Ptx, ".param .u64"));
+        Assert.Equal(24,
+            Count(k512Ptx, "cp.async.ca.shared.global") +
+            Count(k512Ptx, "cp.async.cg.shared.global"));
+        Assert.Equal(32, Count(
+            k512Ptx, "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"));
+        Assert.Equal(32, Count(
+            k512Ptx, "ldmatrix.sync.aligned.m8n8.x4.shared.b16"));
+        Assert.Equal(32, Count(
+            k512Ptx, "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16"));
+        Assert.Contains(
+            "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%b0,%b1}, [%rd13+6144]",
+            k512Ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%b0,%b1}, [%rd13+5120]",
+            k512Ptx, StringComparison.Ordinal);
+        Assert.Contains(
+            "cp.async.cg.shared.global [%rd13+3072]",
+            k512Ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "cp.async.cg.shared.global [%rd13+2560]",
+            k512Ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("ld.shared.b32", k512Ptx, StringComparison.Ordinal);
+        Assert.Equal(2, Count(k512Ptx, "st.global.v2.f32"));
+        Assert.DoesNotContain(".param .u32", k512Ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", k512Ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("stride", k512Ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(20_480,
+            PtxFusedLinearGeluFp16M16Kernel.GetStaticSharedBytes(512));
+        string nblock32Ptx = PtxFusedLinearGeluFp16M16Kernel.EmitPtx(
+            8, 6, inputFeatures: 512, outputFeatures: 2_048,
+            outputsPerBlock: 32);
+        Assert.Contains("mul.lo.u32 %r4, %r3, 32", nblock32Ptx,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "cp.async.cg.shared.global [%rd13+2560]",
+            nblock32Ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "cp.async.cg.shared.global [%rd13+2304]",
+            nblock32Ptx, StringComparison.Ordinal);
+        Assert.Equal(12_288,
+            PtxFusedLinearGeluFp16M16Kernel.GetStaticSharedBytes(512, 32));
+        Assert.Equal(new[] { 64, 32 },
+            DirectPtxDenseLinearAutotuner.Candidates(512, 2_048));
+
+        string k1024Ptx = PtxFusedLinearGeluFp16M16Kernel.EmitPtx(
+            8, 6, inputFeatures: 1_024, outputFeatures: 4_096);
+        Assert.Equal(48,
+            Count(k1024Ptx, "cp.async.ca.shared.global") +
+            Count(k1024Ptx, "cp.async.cg.shared.global"));
+        Assert.Equal(64, Count(
+            k1024Ptx, "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"));
+        Assert.Equal(64, Count(
+            k1024Ptx, "ldmatrix.sync.aligned.m8n8.x4.shared.b16"));
+        Assert.Equal(64, Count(
+            k1024Ptx, "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16"));
+        Assert.DoesNotContain("ld.shared.b32", k1024Ptx, StringComparison.Ordinal);
+        Assert.Equal(40_960,
+            PtxFusedLinearGeluFp16M16Kernel.GetStaticSharedBytes(1_024));
+        Assert.False(
+            PtxFusedLinearGeluFp16M16Kernel.IsPromotedShape(1_024, 4_096));
+    }
+
+    [SkippableTheory]
+    [InlineData(512, 2_048, 32)]
+    [InlineData(512, 2_048, 64)]
+    [InlineData(1_024, 4_096, 32)]
+    [InlineData(1_024, 4_096, 64)]
+    public void DriverOnlyFp16TensorCoreM16_MatchesOracleAndLoadsExactCubin(
+        int k,
+        int n,
+        int outputsPerBlock)
+    {
+        const int m = PtxFusedLinearGeluFp16M16Kernel.Rows;
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedFusedLinear(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in Tensor Core specialization is measured on GA10x/SM86.");
+        using var kernel = new PtxFusedLinearGeluFp16M16Kernel(
+            runtime, k, n, outputsPerBlock);
+        Assert.Equal(DirectPtxModuleImageKind.EmbeddedCubin, kernel.Audit.ImageKind);
+        Assert.False(string.IsNullOrWhiteSpace(kernel.Audit.CubinSha256));
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20267223);
+        ushort[] inputHost = RandomHalfRange(random, m * k, 0.125f);
+        ushort[] weightHost = RandomHalfRange(random, n * k, 0.0625f);
+        float[] biasHost = Values(random, n, 0.03125f);
+        var expected = new float[m * n];
+        for (int row = 0; row < m; row++)
+        for (int column = 0; column < n; column++)
+        {
+            float sum = biasHost[column];
+            for (int inner = 0; inner < k; inner++)
+                sum += Half(inputHost[row * k + inner]) *
+                    Half(weightHost[column * k + inner]);
+            expected[row * n + column] = (float)ApplyTiledActivation(
+                sum, DirectPtxLinearActivation.GeluTanh);
+        }
+
+        using var input = runtime.AllocateBytes((nuint)(inputHost.Length * sizeof(ushort)));
+        using var weights = runtime.AllocateBytes((nuint)(weightHost.Length * sizeof(ushort)));
+        using var bias = runtime.AllocateBytes((nuint)(biasHost.Length * sizeof(float)));
+        using var output = runtime.AllocateBytes((nuint)(expected.Length * sizeof(float)));
+        input.Upload<ushort>(inputHost);
+        weights.Upload<ushort>(weightHost);
+        bias.Upload<float>(biasHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(weights, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[3]));
+        runtime.Synchronize();
+        var actual = new float[expected.Length];
+        output.Download<float>(actual);
+        AssertVectorClose(actual, expected, 3e-3f, "FP16 Tensor Core fused linear");
     }
 
     [Fact]

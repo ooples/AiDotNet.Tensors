@@ -68,6 +68,9 @@ public sealed class DirectPtxDenseLinearBackendTests
             AssertRejected(
                 () => backend.PrewarmDirectPtxStridedDot(0, 512, 0, 1),
                 backend, "strided-dot-shape-not-implemented");
+            AssertRejected(
+                () => backend.PrewarmDirectPtxFusedLinearGeluFp16M16(256, 256),
+                backend, "fp16-tensorcore-linear-shape-not-implemented");
 
             DirectPtxFeatureGate.FusedLinearExperimentOverride = false;
             AssertRejected(
@@ -78,6 +81,9 @@ public sealed class DirectPtxDenseLinearBackendTests
                 () => backend.PrewarmDirectPtxGemmTiled(
                     64, 256, 256, DirectPtxLinearWeightLayout.InputMajor),
                 backend, "gemm-tiled-performance-gate-not-met");
+            AssertRejected(
+                () => backend.PrewarmDirectPtxFusedLinearGeluFp16M16(512, 2_048),
+                backend, "fp16-tensorcore-linear-performance-gate-not-met");
         }
         finally
         {
@@ -108,6 +114,28 @@ public sealed class DirectPtxDenseLinearBackendTests
             Assert.True(backend.PrewarmDirectPtxFp16Gemm(16, 16, 32), backend.DirectPtxLastError);
             AssertZeroAllocationAndCapture(backend, () => backend.TryDirectPtxFp16Gemm(
                 halfA, halfB, halfC, 16, 16, 32));
+
+            const int tensorCoreK = 512, tensorCoreN = 2_048;
+            using var tensorCoreInput = backend.AllocateByteBuffer(
+                PtxFusedLinearGeluFp16M16Kernel.Rows * tensorCoreK * sizeof(ushort));
+            using var tensorCoreWeights = backend.AllocateByteBuffer(
+                tensorCoreN * tensorCoreK * sizeof(ushort));
+            using var tensorCoreBias = backend.AllocateBuffer(tensorCoreN);
+            using var tensorCoreOutput = backend.AllocateBuffer(
+                PtxFusedLinearGeluFp16M16Kernel.Rows * tensorCoreN);
+            using var tensorCoreWrongOutput = backend.AllocateBuffer(
+                PtxFusedLinearGeluFp16M16Kernel.Rows * tensorCoreN + 1);
+            Assert.False(backend.TryDirectPtxFusedLinearGeluFp16M16(
+                tensorCoreInput, tensorCoreWeights, tensorCoreBias,
+                tensorCoreWrongOutput, tensorCoreK, tensorCoreN));
+            Assert.Equal("fp16-tensorcore-linear-physical-extent-mismatch",
+                backend.DirectPtxLastError);
+            Assert.True(backend.PrewarmDirectPtxFusedLinearGeluFp16M16(
+                tensorCoreK, tensorCoreN), backend.DirectPtxLastError);
+            AssertZeroAllocationAndCapture(backend, () =>
+                backend.TryDirectPtxFusedLinearGeluFp16M16(
+                    tensorCoreInput, tensorCoreWeights, tensorCoreBias,
+                    tensorCoreOutput, tensorCoreK, tensorCoreN));
 
             using var gradC16 = backend.AllocateByteBuffer(16 * 16 * sizeof(ushort));
             using var gradLeft = backend.AllocateBuffer(16 * 32);
@@ -242,14 +270,21 @@ public sealed class DirectPtxDenseLinearBackendTests
         backend.Synchronize();
 
         bool everyLaunchSucceeded = true;
+        (long deviceCountBefore, long deviceBytesBefore) =
+            backend.DirectPtxEvidenceDeviceAllocations;
         long before = GC.GetAllocatedBytesForCurrentThread();
         for (int i = 0; i < 32; i++) everyLaunchSucceeded &= launch();
         long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
         backend.Synchronize();
         Assert.True(everyLaunchSucceeded, backend.DirectPtxLastError);
         Assert.Equal(0, allocated);
+        Assert.Equal(
+            (deviceCountBefore, deviceBytesBefore),
+            backend.DirectPtxEvidenceDeviceAllocations);
 
         bool captureLaunchSucceeded = false;
+        (long captureCountBefore, long captureBytesBefore) =
+            backend.DirectPtxEvidenceDeviceAllocations;
         IntPtr graph = backend.CaptureGraph(() => captureLaunchSucceeded = launch());
         Assert.True(captureLaunchSucceeded, backend.DirectPtxLastError);
         Assert.NotEqual(IntPtr.Zero, graph);
@@ -261,6 +296,9 @@ public sealed class DirectPtxDenseLinearBackendTests
         {
             backend.DestroyCapturedGraph(graph);
         }
+        Assert.Equal(
+            (captureCountBefore, captureBytesBefore),
+            backend.DirectPtxEvidenceDeviceAllocations);
     }
 
     private static void AssertRejected(
