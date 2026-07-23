@@ -81,6 +81,26 @@ public static class PtxParityRegistry
         new PtxParitySpec("PtxFusedQkvRopeCacheD64Kernel", PtxParityStatus.Deferred,
             "fused QKV + RoPE + KV-cache write (#858)",
             "multi-output (Q + K/V cache) with baked RoPE tables; needs a dedicated QKV/RoPE/cache oracle."),
+
+        new PtxParitySpec("PtxFusedConv2DNchwK1Kernel", PtxParityStatus.Deferred,
+            "fused Conv2D + bias + ReLU, exact N1/C64/H16/W16/K64 1x1 fp32 (#841) — " +
+            "CudaBackend.TryDirectPtxFusedConv2DBiasRelu",
+            "the first #841 convolution specialization is reachable only through the internal " +
+            "TryDirectPtxFusedConv2DBiasRelu experiment gate (disabled by default), so a toggle-based " +
+            "gate-off CUDA==CPU leg has nothing to compare against for the identical baked contract yet. " +
+            "It also stays unpromoted until the #841 resource-and-performance proof is attached: a " +
+            "three-independent-run apples-to-apples benchmark clearing the >=1.10x median / P95<=+10% gate " +
+            "against the strongest eligible cuDNN/PyTorch competitor, plus Nsight zero-spill SASS evidence. " +
+            "Keep deferred until that three-way matrix and the competitive gates exist."),
+
+        new PtxParitySpec("PtxConv2DNchwK1TiledKernel", PtxParityStatus.Deferred,
+            "shared-memory tiled 1x1 Conv2D+bias+ReLU GEMM, realistic ResNet shapes (#841)",
+            "the tiled-GEMM specialization staged ahead of the #841 GPU measurement window: it kills the " +
+            "~100x redundant global traffic of the naive golden slice by reusing shared weight/input tiles, " +
+            "targeting the realistic ResNet-class 1x1 projections where cuDNN is strongest. Its device " +
+            "correctness (<= 2e-4 vs the fp64 oracle), register/occupancy budget, tile-size sweep, and the " +
+            ">=1.10x-vs-cuDNN performance gate are all pending GPU verification; the emitter is drafted, not " +
+            "yet measured. Keep deferred and unpromoted until the three-way matrix and competitive gates pass."),
     };
 
     private static readonly Dictionary<string, PtxParitySpec> ByKernel =
