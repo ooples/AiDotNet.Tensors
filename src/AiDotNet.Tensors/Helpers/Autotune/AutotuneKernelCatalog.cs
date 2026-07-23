@@ -77,10 +77,29 @@ internal sealed class AutotuneCatalogEntry
     /// that variant is skipped for this shape.</summary>
     public Func<ShapeProfile, string, CancellationToken, Task<double>> BenchmarkVariant { get; }
 
+    /// <summary>
+    /// Optional: the structured launch parameters (e.g. tile sizes, block dims)
+    /// for a winning variant at a shape, persisted alongside the cached winner so
+    /// dispatch never has to re-parse the variant string. When null, the variant
+    /// id alone carries the config (the shipped GEMM/sparse entries). Supplying
+    /// it keeps the catalog warmup consistent with <see cref="GpuFirstRunAutotuner"/>,
+    /// which always persists parameters.
+    /// </summary>
+    public Func<ShapeProfile, string, IReadOnlyDictionary<string, string>>? ParametersFor { get; }
+
     public AutotuneCatalogEntry(
         KernelId id,
         Func<ShapeProfile, IEnumerable<string>> variants,
         Func<ShapeProfile, string, CancellationToken, Task<double>> benchmarkVariant)
+        : this(id, variants, benchmarkVariant, parametersFor: null)
+    {
+    }
+
+    public AutotuneCatalogEntry(
+        KernelId id,
+        Func<ShapeProfile, IEnumerable<string>> variants,
+        Func<ShapeProfile, string, CancellationToken, Task<double>> benchmarkVariant,
+        Func<ShapeProfile, string, IReadOnlyDictionary<string, string>>? parametersFor)
     {
         // KernelId is a readonly record struct (value type) so it can never be
         // null — but its Category/Name strings can be. Catalog consumers build
@@ -94,6 +113,7 @@ internal sealed class AutotuneCatalogEntry
         Id = id;
         Variants = variants ?? throw new ArgumentNullException(nameof(variants));
         BenchmarkVariant = benchmarkVariant ?? throw new ArgumentNullException(nameof(benchmarkVariant));
+        ParametersFor = parametersFor;
     }
 }
 
