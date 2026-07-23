@@ -184,3 +184,55 @@ Tensor-Core redesign. Evidence—not the existence of PTX—chooses the next ste
    cells.
 6. Apply the same contract/cache/evidence template independently to depthwise,
    transposed, deformable, locally connected, and 3D families.
+
+## Shared-memory tiled 1x1 GEMM emitter (staged 2026-07-22, pending GPU verification)
+
+`PtxConv2DNchwK1TiledKernel` is the first step of increment 2 above, drafted
+ahead of the GPU measurement window so that window is verify+measure only.
+
+**Why v1 cannot win, and this can.** A 1x1 NCHW convolution is the batched GEMM
+`O[n,k,hw] = ReLU(bias[k] + sum_c W[k,c] * X[n,c,hw])`. The v1 golden slice is
+pure thread-per-output with zero reuse: every output thread re-fetches its C
+weights and C inputs from global memory, so for K*HW outputs it issues
+~K*HW*(2C) global loads against only K*C + C*HW unique elements — on the
+ResNet-class shapes that is a ~50-100x over-read, and the kernel is memory-bound
+long before it is compute-bound. Staging a TILE x TILE weight block and a
+TILE x TILE input block into shared memory per contraction step makes each
+element travel from global memory once per block instead of once per thread,
+which is the dominant lever on these shapes.
+
+**Design.** Each block computes a TILE x TILE output tile — rows over K,
+columns over the batched spatial axis N*HW. The contraction over C is walked in
+TILE-wide steps; at each step the block cooperatively loads `A = W[K-tile, C-tile]`
+and `B = X[C-tile, HW-tile]` into `conv_tile_a` / `conv_tile_b`, barriers, and
+each thread accumulates `sum_kk A[row][kk] * B[kk][col]` from shared. Bias add +
+ReLU + store form the epilogue. Because issue #841 forbids dynamic-shape PTX, the
+tile is baked to divide K, C, and HW exactly, which removes every boundary
+predicate: a column tile never straddles a batch since TILE | HW, so the batch
+index `n = (ctaid.x*TILE)/HW` is block-uniform.
+
+**Shapes and tiles (starting point of the GPU-window sweep, not a measured
+optimum):**
+
+| shape | N | K | C | HW | tile | contraction steps | blocks | status |
+|-------|---|---|---|----|------|-------------------|--------|--------|
+| resnet_1x1_c64  | 32 | 64  | 64  | 3136 (56x56) | 16 | 4 | 6272 x 4 | emitter drafted |
+| resnet_1x1_c128 | 16 | 128 | 128 | 784  (28x28) | 16 | 8 | 784 x 8  | emitter drafted |
+| resnet_1x1_c256 |  8 | 256 | 256 | 196  (14x14) |  — | — | — | DEFERRED |
+
+`resnet_1x1_c256` is intentionally not instantiated: HW = 196 = 14^2 is not
+divisible by 16 (or any convenient square tile), so a clean square-tile GEMM
+needs either a non-square tile (e.g. 14) or boundary handling. Which one wins is
+a measurement question, so it is a GPU-window sweep target rather than a blind
+guess. This is stated, not silently dropped.
+
+**Pending GPU verification (nothing below is claimed yet):** driver-JIT
+assembly (no host `ptxas` on the dev box; the driver linker compiles at kernel
+construction), device correctness `<= 2e-4` vs the fp64 oracle, register/occupancy
+`ResourceBudget.Validate` on SM86, the tile-size sweep (TILE in {8,16,32} and a
+register-blocked TM x TN variant for arithmetic intensity), and the
+`>=1.10x`-vs-cuDNN performance gate on the three shapes above. The emitter's PTX
+was generated and inspected on the host (16 FMAs per contraction step, two
+barriers, loop bound C/TILE, correct global/shared/output addressing), but
+inspection is not assembly or measurement — the kernel stays Deferred and
+unpromoted until the gates pass.
