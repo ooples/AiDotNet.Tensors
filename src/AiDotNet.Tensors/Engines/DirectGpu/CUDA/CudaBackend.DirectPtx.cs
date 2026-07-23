@@ -29,6 +29,10 @@ public sealed partial class CudaBackend
         _directPtxFlashAttentionBackwardKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<DirectPtxQkvRopeCacheKey, PtxFusedQkvRopeCacheD64Kernel>
         _directPtxQkvRopeCacheKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<DirectPtxRowReduceKey, PtxFusedRowReduceF32Kernel>
+        _directPtxRowReduceKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<DirectPtxRowReduceKey, PtxFusedRowL2NormalizeF32Kernel>
+        _directPtxRowL2NormalizeKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private DirectPtxRuntime? _directPtxRuntime;
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
@@ -42,6 +46,9 @@ public sealed partial class CudaBackend
     private long _directPtxAttentionBackwardDispatchCount;
     private long _directPtxFlashAttentionBackwardDispatchCount;
     private long _directPtxQkvRopeCacheDispatchCount;
+    private long _directPtxRowReduceDispatchCount;
+    private long _directPtxRowReduceOpDispatchCount;
+    private long _directPtxRowL2NormalizeDispatchCount;
     internal int DirectPtxCachedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxAttentionKernels.Count; }
@@ -93,6 +100,15 @@ public sealed partial class CudaBackend
 
     internal long DirectPtxFlashAttentionBackwardDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxFlashAttentionBackwardDispatchCount);
+    internal bool IsDirectPtxReductionEnabled =>
+        DirectPtxFeatureGate.IsReductionEnabled && IsAvailable &&
+        DirectPtxArchitecture.HasValidatedRowReduction(_ccMajor, _ccMinor);
+
+    internal long DirectPtxRowReduceDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxRowReduceDispatchCount);
+
+    internal long DirectPtxRowL2NormalizeDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxRowL2NormalizeDispatchCount);
 
     internal long DirectPtxQkvRopeCacheDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxQkvRopeCacheDispatchCount);
@@ -1774,6 +1790,461 @@ public sealed partial class CudaBackend
         return false;
     }
 
+    /// <summary>
+    /// Attempts exact contiguous FP32 row-sum reduction of a [rows, columns]
+    /// input to a [rows] output. Shape validation happens before dispatch; the
+    /// PTX ABI receives only input/output pointers.
+    /// </summary>
+    internal bool TryDirectPtxRowSum(
+        IGpuBuffer input,
+        IGpuBuffer output,
+        int rows,
+        int columns)
+    {
+        if (!DirectPtxFeatureGate.IsReductionEnabled)
+        {
+            DirectPtxLastError = "reduction-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "reduction-cuda-unavailable";
+            return false;
+        }
+        if (!DirectPtxArchitecture.HasValidatedRowReduction(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = "reduction-architecture-not-validated";
+            return false;
+        }
+        if (!PtxFusedRowReduceF32Kernel.IsSupportedShape(rows, columns))
+        {
+            DirectPtxLastError = "reduction-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedRowReduceF32Kernel.IsPromotedShape(rows, columns) &&
+            !DirectPtxFeatureGate.ReductionExperimentOverride)
+        {
+            DirectPtxLastError = "reduction-performance-gate-not-met";
+            return false;
+        }
+
+        long inputBytes = checked((long)rows * columns * sizeof(float));
+        long outputBytes = checked((long)rows * sizeof(float));
+        if (input.SizeInBytes != inputBytes || output.SizeInBytes != outputBytes)
+        {
+            DirectPtxLastError = "reduction-physical-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            EnsureContextCurrent();
+            var key = new DirectPtxRowReduceKey(rows, columns);
+            lock (_directPtxLock)
+            {
+                if (!_directPtxRowReduceKernels.TryGetValue(
+                    key, out PtxFusedRowReduceF32Kernel? kernel))
+                {
+                    if (IsStreamCapturing())
+                    {
+                        DirectPtxLastError =
+                            "Direct PTX row-sum must be prewarmed before CUDA graph capture.";
+                        return false;
+                    }
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    kernel = CreateAndCacheRowReduceKernelSlow(key);
+                }
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[1]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxRowReduceDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxFusedRowReduceF32Kernel CreateAndCacheRowReduceKernelSlow(
+        DirectPtxRowReduceKey key) =>
+        _directPtxRowReduceKernels.GetOrAdd(key, () =>
+            new PtxFusedRowReduceF32Kernel(
+                _directPtxRuntime!, key.Rows, key.Columns));
+
+    internal bool PrewarmDirectPtxRowSum(int rows, int columns)
+    {
+        if (!DirectPtxFeatureGate.IsReductionEnabled)
+        {
+            DirectPtxLastError = "reduction-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "reduction-cuda-unavailable";
+            return false;
+        }
+        if (!DirectPtxArchitecture.HasValidatedRowReduction(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = "reduction-architecture-not-validated";
+            return false;
+        }
+        if (!PtxFusedRowReduceF32Kernel.IsSupportedShape(rows, columns))
+        {
+            DirectPtxLastError = "reduction-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedRowReduceF32Kernel.IsPromotedShape(rows, columns) &&
+            !DirectPtxFeatureGate.ReductionExperimentOverride)
+        {
+            DirectPtxLastError = "reduction-performance-gate-not-met";
+            return false;
+        }
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX row-sum prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                var key = new DirectPtxRowReduceKey(rows, columns);
+                if (!_directPtxRowReduceKernels.TryGetValue(key, out _))
+                    _ = CreateAndCacheRowReduceKernelSlow(key);
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxRowReduceAudit(
+        int rows,
+        int columns,
+        out DirectPtxKernelAudit audit)
+    {
+        lock (_directPtxLock)
+        {
+            var key = new DirectPtxRowReduceKey(rows, columns);
+            if (_directPtxRowReduceKernels.TryGetValue(key, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null!;
+        return false;
+    }
+
+    /// <summary>
+    /// Attempts exact contiguous FP32 fused row L2-normalization of a
+    /// [rows,columns] matrix into a same-shape output. The per-row norm is never
+    /// materialized; the PTX ABI receives only input/output pointers.
+    /// </summary>
+    internal bool TryDirectPtxRowL2Normalize(
+        IGpuBuffer input,
+        IGpuBuffer output,
+        int rows,
+        int columns)
+    {
+        if (!DirectPtxFeatureGate.IsReductionEnabled)
+        {
+            DirectPtxLastError = "l2normalize-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "l2normalize-cuda-unavailable";
+            return false;
+        }
+        if (!DirectPtxArchitecture.HasValidatedRowReduction(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = "l2normalize-architecture-not-validated";
+            return false;
+        }
+        if (!PtxFusedRowL2NormalizeF32Kernel.IsSupportedShape(rows, columns))
+        {
+            DirectPtxLastError = "l2normalize-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedRowL2NormalizeF32Kernel.IsPromotedShape(rows, columns) &&
+            !DirectPtxFeatureGate.ReductionExperimentOverride)
+        {
+            DirectPtxLastError = "l2normalize-performance-gate-not-met";
+            return false;
+        }
+
+        long bytes = checked((long)rows * columns * sizeof(float));
+        if (input.SizeInBytes != bytes || output.SizeInBytes != bytes)
+        {
+            DirectPtxLastError = "l2normalize-physical-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            EnsureContextCurrent();
+            var key = new DirectPtxRowReduceKey(rows, columns);
+            lock (_directPtxLock)
+            {
+                if (!_directPtxRowL2NormalizeKernels.TryGetValue(
+                    key, out PtxFusedRowL2NormalizeF32Kernel? kernel))
+                {
+                    if (IsStreamCapturing())
+                    {
+                        DirectPtxLastError =
+                            "Direct PTX L2-normalize must be prewarmed before CUDA graph capture.";
+                        return false;
+                    }
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    kernel = CreateAndCacheRowL2NormalizeKernelSlow(key);
+                }
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[1]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxRowL2NormalizeDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxFusedRowL2NormalizeF32Kernel CreateAndCacheRowL2NormalizeKernelSlow(
+        DirectPtxRowReduceKey key) =>
+        _directPtxRowL2NormalizeKernels.GetOrAdd(key, () =>
+            new PtxFusedRowL2NormalizeF32Kernel(_directPtxRuntime!, key.Rows, key.Columns));
+
+    internal bool TryGetDirectPtxRowL2NormalizeAudit(int rows, int columns, out DirectPtxKernelAudit audit)
+    {
+        lock (_directPtxLock)
+        {
+            var key = new DirectPtxRowReduceKey(rows, columns);
+            if (_directPtxRowL2NormalizeKernels.TryGetValue(key, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null!;
+        return false;
+    }
+
+    private readonly DirectPtxKernelCache<DirectPtxRowReduceOpKey, PtxFusedRowReduceOpF32Kernel>
+        _directPtxRowReduceOpKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+
+    private readonly record struct DirectPtxRowReduceOpKey(
+        DirectPtxRowReduceOp Op, int Rows, int Columns);
+
+    internal bool IsDirectPtxRowReduceOpEnabled =>
+        DirectPtxFeatureGate.IsReductionEnabled && IsAvailable &&
+        DirectPtxArchitecture.HasValidatedRowReduction(_ccMajor, _ccMinor);
+
+    internal long DirectPtxRowReduceOpDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxRowReduceOpDispatchCount);
+    internal int DirectPtxRowReduceOpPinnedKernelCount
+    {
+        get { lock (_directPtxLock) return _directPtxRowReduceOpKernels.PinnedCount; }
+    }
+
+    /// <summary>
+    /// Operator-parameterized row reduction (issue #843): mean, max, min, and
+    /// sum-of-squares over a [rows, columns] input. Shares the reduction feature
+    /// gate with the row-sum lane, since they are the same memory schedule.
+    /// </summary>
+    internal bool TryDirectPtxRowReduceOp(
+        DirectPtxRowReduceOp op,
+        IGpuBuffer input,
+        IGpuBuffer output,
+        int rows,
+        int columns)
+    {
+        if (input is null || output is null)
+        {
+            DirectPtxLastError = "row-reduce-op-null-buffer";
+            return false;
+        }
+        if (!DirectPtxFeatureGate.IsReductionEnabled)
+        {
+            DirectPtxLastError = "row-reduce-op-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "row-reduce-op-cuda-unavailable";
+            return false;
+        }
+        if (!DirectPtxArchitecture.HasValidatedRowReduction(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = "row-reduce-op-architecture-not-validated";
+            return false;
+        }
+        if (!PtxFusedRowReduceOpF32Kernel.IsSupportedOp(op))
+        {
+            DirectPtxLastError = "row-reduce-op-operator-not-implemented";
+            return false;
+        }
+        if (!PtxFusedRowReduceOpF32Kernel.IsSupportedShape(rows, columns))
+        {
+            DirectPtxLastError = "row-reduce-op-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedRowReduceOpF32Kernel.IsPromotedShape(rows, columns) &&
+            !DirectPtxFeatureGate.RowReduceOpExperimentOverride)
+        {
+            DirectPtxLastError = "row-reduce-op-performance-gate-not-met";
+            return false;
+        }
+
+        if (input.SizeInBytes != checked((long)rows * columns * sizeof(float)) ||
+            output.SizeInBytes != checked((long)rows * sizeof(float)))
+        {
+            DirectPtxLastError = "row-reduce-op-physical-extent-mismatch";
+            return false;
+        }
+        if (input.Handle == IntPtr.Zero || output.Handle == IntPtr.Zero)
+        {
+            DirectPtxLastError = "row-reduce-op-invalid-device-pointer";
+            return false;
+        }
+        if (((PtxCompat.ToNuint(input.Handle) | PtxCompat.ToNuint(output.Handle)) & 15u) != 0)
+        {
+            DirectPtxLastError = "row-reduce-op-alignment-mismatch";
+            return false;
+        }
+        if (DirectPtxRowReduceOpBuffersOverlap(input, output))
+        {
+            DirectPtxLastError = "row-reduce-op-alias-not-supported";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var key = new DirectPtxRowReduceOpKey(op, rows, columns);
+            lock (_directPtxLock)
+            {
+                if (!_directPtxRowReduceOpKernels.TryGetValue(
+                    key, out PtxFusedRowReduceOpF32Kernel? kernel))
+                {
+                    if (capturing)
+                    {
+                        DirectPtxLastError =
+                            "Direct PTX row reduction must be prewarmed before CUDA graph capture.";
+                        return false;
+                    }
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    kernel = CreateAndCacheRowReduceOpKernelSlow(key);
+                }
+                if (capturing && !_directPtxRowReduceOpKernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX row reduction module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[1]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxRowReduceOpDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    // The reduction writes one element per row while still reading that row, so
+    // any overlap between the two allocations would race.
+    private static bool DirectPtxRowReduceOpBuffersOverlap(IGpuBuffer left, IGpuBuffer right)
+    {
+        nuint leftStart = PtxCompat.ToNuint(left.Handle);
+        nuint rightStart = PtxCompat.ToNuint(right.Handle);
+        nuint leftEnd = checked(leftStart + (nuint)left.SizeInBytes);
+        nuint rightEnd = checked(rightStart + (nuint)right.SizeInBytes);
+        return leftStart < rightEnd && rightStart < leftEnd;
+    }
+
+    private PtxFusedRowReduceOpF32Kernel CreateAndCacheRowReduceOpKernelSlow(
+        DirectPtxRowReduceOpKey key)
+    {
+        DirectPtxRuntime runtime = _directPtxRuntime ??
+            throw new InvalidOperationException(
+                "The direct-PTX runtime must be initialized before creating a row reduction kernel.");
+        return _directPtxRowReduceOpKernels.GetOrAdd(key, () =>
+            new PtxFusedRowReduceOpF32Kernel(runtime, key.Op, key.Rows, key.Columns));
+    }
+
+    internal bool PrewarmDirectPtxRowReduceOp(DirectPtxRowReduceOp op, int rows, int columns)
+    {
+        if (!DirectPtxFeatureGate.IsReductionEnabled)
+        {
+            DirectPtxLastError = "row-reduce-op-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "row-reduce-op-cuda-unavailable";
+            return false;
+        }
+        if (!DirectPtxArchitecture.HasValidatedRowReduction(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = "row-reduce-op-architecture-not-validated";
+            return false;
+        }
+        if (!PtxFusedRowReduceOpF32Kernel.IsSupportedOp(op) ||
+            !PtxFusedRowReduceOpF32Kernel.IsSupportedShape(rows, columns))
+        {
+            DirectPtxLastError = "row-reduce-op-shape-not-implemented";
+            return false;
+        }
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX row reduction prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                var key = new DirectPtxRowReduceOpKey(op, rows, columns);
+                if (!_directPtxRowReduceOpKernels.TryGetValue(key, out _))
+                    _ = CreateAndCacheRowReduceOpKernelSlow(key);
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
     private void DisposeDirectPtxRuntime()
     {
         lock (_directPtxLock)
@@ -1786,6 +2257,9 @@ public sealed partial class CudaBackend
             _directPtxAttentionBackwardKernels.Dispose();
             _directPtxFlashAttentionBackwardKernels.Dispose();
             _directPtxQkvRopeCacheKernels.Dispose();
+            _directPtxRowReduceKernels.Dispose();
+            _directPtxRowReduceOpKernels.Dispose();
+            _directPtxRowL2NormalizeKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }
@@ -1853,4 +2327,5 @@ public sealed partial class CudaBackend
         int CacheCapacity,
         int Position);
 
+    private readonly record struct DirectPtxRowReduceKey(int Rows, int Columns);
 }

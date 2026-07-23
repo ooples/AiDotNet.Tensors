@@ -61,6 +61,13 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Verified architecture-specific direct-PTX executables, compiled offline
+         by a pinned ptxas. -->
+    <EmbeddedResource Include="Engines\DirectGpu\CUDA\Ptx\Artifacts\**\*.cubin" />
+    <EmbeddedResource Include="Engines\DirectGpu\CUDA\Ptx\Artifacts\**\*.tsv" />
+  </ItemGroup>
+
+  <ItemGroup>
     <None Include="Images\Favicon.jpg">
       <Pack>True</Pack>
       <PackagePath>\</PackagePath>

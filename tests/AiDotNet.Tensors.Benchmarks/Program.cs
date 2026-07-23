@@ -13,6 +13,25 @@ class Program
 
     static void Main(string[] args)
     {
+        // GPU-free cubin generation and verification for the reduction family.
+        if (args.Length > 0 && args[0] == "--generate-direct-ptx-reduction-cubins")
+        {
+            Environment.ExitCode = DirectPtxReductionCubinTool.Generate(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-reduction-cubins")
+        {
+            Environment.ExitCode = DirectPtxReductionCubinTool.Verify(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-reduction-sass")
+        {
+            Environment.ExitCode = DirectPtxReductionCubinTool.AuditSass(args);
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--direct-ptx-attention")
         {
             DirectPtxAttentionExperiment.Run();
@@ -76,6 +95,18 @@ class Program
         if (args.Length > 0 && args[0] == "--direct-ptx-residual-rmsnorm")
         {
             DirectPtxResidualRmsNormExperiment.Run();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-reduction")
+        {
+            DirectPtxReductionExperiment.Run(
+                args.Length > 1 && int.TryParse(args[1], out int reductionRuns) ? reductionRuns : 1);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-l2normalize")
+        {
+            DirectPtxL2NormalizeExperiment.Run(
+                args.Length > 1 && int.TryParse(args[1], out int l2Runs) ? l2Runs : 1);
             return;
         }
         if (args.Length > 0 && args[0] == "--direct-ptx-external-gpu-baselines")
