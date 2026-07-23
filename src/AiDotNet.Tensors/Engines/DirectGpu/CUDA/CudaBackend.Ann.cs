@@ -82,6 +82,7 @@ public sealed partial class CudaBackend : IAnnBackend
         long totalLong = (long)numQueries * numCodes;
         if (totalLong > int.MaxValue)
             throw new OverflowException($"ANN PQ ADC total {totalLong} exceeds Int32.MaxValue.");
+        if (TryDirectPtxAnnPqAdcScan(codes, tables, distances, numQueries, numCodes, m, ksub)) return;
         var kernel = ResolveAnnKernel("ann_pq_adc_scan");
         using var _ = PushContext();
         int total = (int)totalLong;

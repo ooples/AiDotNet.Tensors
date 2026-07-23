@@ -156,6 +156,7 @@ internal readonly record struct DirectPtxTensorContract
     internal nuint RequiredBytes => checked((nuint)PhysicalExtent.ElementCount * (nuint)ElementBytes);
     internal int ElementBytes => PhysicalType switch
     {
+        DirectPtxPhysicalType.UInt8 => 1,
         DirectPtxPhysicalType.Float16 or DirectPtxPhysicalType.BFloat16 => 2,
         DirectPtxPhysicalType.Float32 => 4,
         DirectPtxPhysicalType.Int32 => 4,

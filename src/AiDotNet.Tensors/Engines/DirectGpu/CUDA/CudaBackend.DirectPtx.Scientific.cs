@@ -29,6 +29,7 @@ public sealed partial class CudaBackend
     private readonly record struct SciQuantumRotationKey(int NumQubits, int Batch);
     private readonly record struct SciAnnCdKey(AnnMetric Metric, int NumQueries, int NumDatabase, int Dim);
     private readonly record struct SciAnnPqKey(AnnMetric Metric, int NumQueries, int M, int Ksub, int Dsub);
+    private readonly record struct SciAnnAdcKey(int NumQueries, int NumCodes, int M, int Ksub);
 
     private readonly DirectPtxKernelCache<SciCountKey, PtxComplexMultiplyKernel> _sciComplexMul =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
@@ -83,6 +84,8 @@ public sealed partial class CudaBackend
     private readonly DirectPtxKernelCache<SciAnnPqKey, PtxAnnPqDistanceTablesKernel> _sciAnnPqDistanceTables =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<SciAnnCdKey, PtxAnnIvfAssignKernel> _sciAnnIvfAssign =
+        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<SciAnnAdcKey, PtxAnnPqAdcScanKernel> _sciAnnPqAdcScan =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
 
     private long _sciDispatchCount;
@@ -514,6 +517,22 @@ public sealed partial class CudaBackend
             var k = _sciAnnIvfAssign.GetOrAdd(new SciAnnCdKey(metric, numVectors, numCentroids, dim),
                 () => new PtxAnnIvfAssignKernel(_directPtxRuntime!, metric, numVectors, numCentroids, dim));
             Launch3(k.Blueprint, vectors, centroids, assignments, (vv, vc, va) => k.Launch(vv, vc, va));
+        });
+    }
+
+    internal bool TryDirectPtxAnnPqAdcScan(
+        IGpuBuffer codes, IGpuBuffer tables, IGpuBuffer distances,
+        int numQueries, int numCodes, int m, int ksub)
+    {
+        if (!ScientificGateOpen || !PtxAnnPqAdcScanKernel.IsSupportedShape(numQueries, numCodes, m, ksub)) return Fail("ann-pq-adc-scan");
+        if (codes.SizeInBytes != checked((long)numCodes * m) ||                       // uint8 codes
+            tables.SizeInBytes != checked((long)numQueries * m * ksub * sizeof(float)) ||
+            distances.SizeInBytes != checked((long)numQueries * numCodes * sizeof(float))) return Fail("ann-pq-adc-scan-extent");
+        return SciDispatch(() =>
+        {
+            var k = _sciAnnPqAdcScan.GetOrAdd(new SciAnnAdcKey(numQueries, numCodes, m, ksub),
+                () => new PtxAnnPqAdcScanKernel(_directPtxRuntime!, numQueries, numCodes, m, ksub));
+            Launch3(k.Blueprint, codes, tables, distances, (vc, vt, vd) => k.Launch(vc, vt, vd));
         });
     }
 

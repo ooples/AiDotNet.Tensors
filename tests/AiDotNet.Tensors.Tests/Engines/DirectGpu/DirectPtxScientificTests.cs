@@ -14,7 +14,7 @@ public class DirectPtxScientificTests
     [Fact]
     public void ScientificCoverageManifest_AssignsEveryScopedApiExactlyOnce()
     {
-        Assert.Equal(29, DirectPtxScientificCoverageManifest.All.Count);
+        Assert.Equal(30, DirectPtxScientificCoverageManifest.All.Count);
         string[] names = DirectPtxScientificCoverageManifest.All.Select(c => c.Api).ToArray();
         Assert.Contains("CudaBackend.CosineSimilarity", names);
         Assert.Contains("CudaBackend.SphericalSoftmax", names);
@@ -24,6 +24,7 @@ public class DirectPtxScientificTests
         Assert.Contains("CudaBackend.AnnComputeDistances", names);
         Assert.Contains("CudaBackend.AnnPqDistanceTables", names);
         Assert.Contains("CudaBackend.AnnIvfAssign", names);
+        Assert.Contains("CudaBackend.AnnPqAdcScan", names);
         Assert.Contains("CudaBackend.RbfForward", names);
         Assert.Contains("CudaBackend.PairwiseDistance", names);
         Assert.Contains("CudaBackend.PairwiseDistanceSquared", names);
@@ -758,6 +759,65 @@ public class DirectPtxScientificTests
         var actual = new float[expected.Length];
         outBuf.Download<float>(actual);
         AssertVectorClose(actual, expected, 3e-3f, $"capsule {op}");
+    }
+
+    [Fact]
+    public void AnnPqAdcScanEmitter_GathersViaUint8Codes()
+    {
+        string ptx = PtxAnnPqAdcScanKernel.EmitPtx(8, 6, 16, 16, 8, 16);   // cells = 256
+        Assert.Contains(PtxAnnPqAdcScanKernel.EntryPoint, ptx);
+        Assert.Contains("$ADC_S_LOOP:", ptx);
+        Assert.Equal(1, Count(ptx, "ld.global.nc.u8"));     // uint8 code load
+        Assert.Equal(1, Count(ptx, "ld.global.nc.f32"));    // gathered table value
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.Contains("div.u32 %r3, %r2, 16", ptx);        // q = gid / numCodes
+        Assert.Contains("add.u64 %rd6, %rd6, 64", ptx);      // next subspace block = ksub*4 = 16*4 = 64
+        Assert.Equal(0, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxAnnPqAdcScanKernel.IsSupportedShape(16, 16, 8, 16));
+        Assert.False(PtxAnnPqAdcScanKernel.IsSupportedShape(16, 16, 8, 512));   // ksub > 256 (uint8)
+        Assert.False(PtxAnnPqAdcScanKernel.IsPromotedShape(16, 16, 8, 16));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyAnnPqAdcScan_MatchesOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in ann-pq-adc-scan specialization is measured on GA10x/SM86.");
+        const int numQueries = 16, numCodes = 32, m = 8, ksub = 16;   // cells = 512
+        using var kernel = new PtxAnnPqAdcScanKernel(runtime, numQueries, numCodes, m, ksub);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20268700);
+        float[] tables = Values(random, numQueries * m * ksub, 1.0f);
+        byte[] codes = new byte[numCodes * m];
+        for (int idx = 0; idx < codes.Length; idx++) codes[idx] = (byte)(random.Next(0, ksub));
+        var expected = new float[numQueries * numCodes];
+        for (int q = 0; q < numQueries; q++)
+            for (int i = 0; i < numCodes; i++)
+            {
+                double sum = 0;
+                for (int s = 0; s < m; s++)
+                    sum += tables[q * (m * ksub) + s * ksub + codes[i * m + s]];
+                expected[q * numCodes + i] = (float)sum;
+            }
+
+        using var codesBuf = runtime.AllocateBytes((nuint)codes.Length);
+        using var tablesBuf = runtime.AllocateBytes((nuint)(tables.Length * sizeof(float)));
+        using var distBuf = runtime.AllocateBytes((nuint)(expected.Length * sizeof(float)));
+        codesBuf.Upload<byte>(codes);
+        tablesBuf.Upload<float>(tables);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(codesBuf, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(tablesBuf, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(distBuf, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[expected.Length];
+        distBuf.Download<float>(actual);
+        AssertVectorClose(actual, expected, 2e-3f, "ann pq adc scan");
     }
 
     [Theory]

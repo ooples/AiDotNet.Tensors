@@ -95,7 +95,8 @@ internal enum DirectPtxPhysicalType
     Float16,
     BFloat16,
     Float32,
-    Int32
+    Int32,
+    UInt8
 }
 
 internal enum DirectPtxPhysicalLayout
