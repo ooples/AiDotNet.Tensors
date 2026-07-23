@@ -403,6 +403,20 @@ internal sealed class PtxFusedLinearTiledKernel : IDisposable
         // Global output col base n0 = blockCol*BN + threadCol*TN = %r6 + %r8.
         ptx.AppendLine("    add.u32 %r18, %r5, %r7;");                          // m0
         ptx.AppendLine("    add.u32 %r19, %r6, %r8;");                          // n0
+        if (!hasBias && activation == DirectPtxLinearActivation.None)
+        {
+            ptx.AppendLine("    mul.wide.u32 %rd17, %r19, 4;");
+            for (int i = 0; i < ThreadM; i++)
+            {
+                ptx.AppendLine($"    add.u32 %r20, %r18, {i};");
+                ptx.AppendLine($"    mul.wide.u32 %rd15, %r20, {nBytes};");
+                ptx.AppendLine("    add.u64 %rd16, %rd3, %rd15;");
+                ptx.AppendLine("    add.u64 %rd19, %rd16, %rd17;");
+                int acc = i * ThreadN;
+                ptx.AppendLine($"    st.global.v2.f32 [%rd19], {{%f{acc},%f{acc + 1}}};");
+            }
+            return;
+        }
         for (int i = 0; i < ThreadM; i++)
         {
             ptx.AppendLine($"    add.u32 %r20, %r18, {i};");                    // m = m0 + i
@@ -519,7 +533,7 @@ internal sealed class PtxFusedLinearTiledKernel : IDisposable
 
         return new DirectPtxKernelBlueprint(
             Operation: hasBias ? "fused-linear-tiled" : "gemm-tiled",
-            Version: 3,
+            Version: 4,
             Architecture: architecture,
             Variant: $"gemm-fp32-b{batchCount}-m{m}-k{k}-n{n}-{activation}-{weightLayout}".ToLowerInvariant(),
             Tensors: tensors,
@@ -543,6 +557,9 @@ internal sealed class PtxFusedLinearTiledKernel : IDisposable
                 ["temporary-device-allocation"] = "none",
                 ["batch-count"] = batchCount.ToString(System.Globalization.CultureInfo.InvariantCulture),
                 ["bias"] = hasBias ? "fused-register-epilogue" : "none",
+                ["output-store"] = hasBias
+                    ? "scalar-register-epilogue"
+                    : "aligned-fp32x2-register-epilogue",
                 ["stride-parameters"] = "none"
             });
     }

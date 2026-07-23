@@ -118,7 +118,9 @@ register FMAs, with a CTA barrier only at bank handoff. Each thread holds a
 `[K,N]` and prepacked output-major `[N,K]` are separate PTX modules; the layout
 choice is absent from the launch ABI and the instruction path. Bias and the
 selected activation are applied to accumulator registers before the one final
-store. Batched GEMM bakes contiguous batch strides into address arithmetic.
+store. No-bias GEMM combines each thread's adjacent register pair into aligned
+`st.global.v2.f32` transactions, halving its epilogue store instruction count.
+Batched GEMM bakes contiguous batch strides into address arithmetic.
 
 ### FP16 and BF16
 
@@ -203,17 +205,21 @@ mode.
 
 ### Dot and outer products
 
-Dense dot uses aligned `float4` streams, register partials, warp shuffles,
-eight shared warp totals (32 bytes), one block barrier, and one final global
-store. The B4/K512 batched-dot specialization assigns one vectorized four-warp
-CTA to each batch. Every lane consumes exactly one aligned `float4` pair; warp
-totals fold through a conflict-free 16-byte shared table and one barrier.
-Strided dot bakes its valid interval, offset, and
-step into the module; its two-stage shuffle reduction replaces the prior 1 KiB
-and eight-barrier shared tree with eight shared warp totals and one barrier.
-Outer uses aligned `float4` transactions and a baked 256-thread launch for the
-measured M64/N128 cell. Its exact work count removes the bounds predicate;
-fallback specializations still write every independent output exactly once.
+The exact K4096 dense dot assigns one aligned `float4` pair to every lane in a
+1024-thread CTA, retains four component sums in registers, folds 32 warp totals
+through a 128-byte shared table and one block barrier, and performs one final
+global store. The B4/K512 batched-dot specialization instead launches one
+register-only warp CTA per batch; every lane consumes four aligned `float4`
+pairs, so it needs no shared memory or block barrier.
+
+Strided dot bakes its valid interval, offset, and step into the module. The
+exact reverse-K512 cell uses one warp, four independent component accumulators,
+precomputed reverse pointers, and five shuffle steps with no shared memory.
+The M64/N128 outer cell launches four 256-thread CTAs. Each lane loads one
+right-hand `float4` once and reuses it for two rows owned by its warp, reducing
+redundant input transactions while preserving one final vector store per four
+outputs. Fallback specializations still write every independent output exactly
+once.
 
 ## Global-memory ledger
 
@@ -225,9 +231,10 @@ fallback specializations still write every independent output exactly once.
 | backward linear | grad output, input, weights, saved activation | derivative in registers; exact ReLU operands in shared FP16 WMMA tiles; FP32 matrix/bias accumulators | dInput/dWeight/dBias once |
 | LoRA | input, base, A, B | warp partials and rank projection in shared; residual epilogue in registers | final output once |
 | linear CE | hidden, weight, bias, target | logits in registers; reductions in shared | one atomic scalar contribution/row |
-| dense/strided dot | two vectors | register partials, then 32-byte shared warp totals | one scalar |
-| batched dot | two batched vectors | four register reductions plus a 16-byte shared fold per batch | one scalar/batch |
-| outer | two vectors | product in a register | each output element once |
+| dense dot | two vectors | register partials, then 128-byte shared warp totals | one scalar |
+| strided dot | two vectors | four register accumulators and warp shuffles | one scalar |
+| batched dot | two batched vectors | four register accumulators and warp shuffles per batch | one scalar/batch |
+| outer | two vectors | right `float4` retained across two rows; products in registers | each output element once |
 
 There are no shape-dependent temporary device allocations in admitted direct
 paths. Caller-owned outputs and the backend stream are reused.
@@ -337,6 +344,7 @@ zero `LDL` and zero `STL` in every entry. Representative hardware rows are:
 | Candidate | registers/thread | static shared B | final-SASS `LDSM` | `cp.async` | Tensor Core | final-SASS local loads/stores |
 |---|---:|---:|---:|---:|---:|---:|
 | FP32 GEMM M64/K256/N256 | 60 | 8192 | 0 | 8 | 0 | 0 / 0 |
+| FP32 batched GEMM B4/M64/K256/N256 | 64 | 8192 | 0 | 8 | 0 | 0 / 0 |
 | FP32 fused GELU M64/K256/N256 | 60 | 8192 | 0 | 8 | 0 | 0 / 0 |
 | FP16 GEMM M16/K32/N16 | 28 | 2048 | 6 | 4 | 4 | 0 / 0 |
 | FP16 fused GELU M16/K512/N2048 N32 | 39 | 12288 | 64 | 24 | 32 | 0 / 0 |
@@ -344,10 +352,10 @@ zero `LDL` and zero `STL` in every entry. Representative hardware rows are:
 | FP16 fused GELU M16/K1024/N4096 N32 | 34 | 24576 | 128 | 48 | 64 | 0 / 0 |
 | FP16 fused GELU M16/K1024/N4096 N64 | 34 | 40960 | 128 | 48 | 64 | 0 / 0 |
 | fused ReLU backward M64/K256/N256 split-K | 56 | 8192 | 4 | 0 | 4 | 0 / 0 |
-| dense dot K4096 float4 | 24 | 32 | 0 | 0 | 0 | 0 / 0 |
-| outer M64/N128 float4 | 14 | 0 | 0 | 0 | 0 | 0 / 0 |
-| batched dot B4/K512 float4 | 24 | 16 | 0 | 0 | 0 | 0 / 0 |
-| reverse strided dot K512 | 24 | 32 | 0 | 0 | 0 | 0 / 0 |
+| dense dot K4096 float4 | 24 | 128 | 0 | 0 | 0 | 0 / 0 |
+| outer M64/N128 reused float4 | 22 | 0 | 0 | 0 | 0 | 0 / 0 |
+| batched dot B4/K512 float4 | 40 | 0 | 0 | 0 | 0 | 0 / 0 |
+| reverse strided dot K512 | 40 | 0 | 0 | 0 | 0 | 0 / 0 |
 
 The deterministic Nsight target additionally launches all 16 exact embedded-
 cubin entry points and rejects runtime-linked images. Executed counters remain

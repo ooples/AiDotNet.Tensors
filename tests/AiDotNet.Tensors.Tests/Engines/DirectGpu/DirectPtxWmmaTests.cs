@@ -2529,6 +2529,12 @@ public partial class DirectPtxWmmaTests
         string none = PtxFusedLinearTiledKernel.EmitPtx(
             8, 6, 64, 256, 256, DirectPtxLinearActivation.None);
         Assert.Equal(128, Count(none, "fma.rn.f32")); // no epilogue FMAs
+        string batchedGemm = PtxFusedLinearTiledKernel.EmitPtx(
+            8, 6, 64, 256, 256, DirectPtxLinearActivation.None,
+            DirectPtxLinearWeightLayout.InputMajor, hasBias: false, batchCount: 4);
+        Assert.Equal(3, Count(batchedGemm, "ld.param.u64"));
+        Assert.Equal(2, Count(batchedGemm, "st.global.v2.f32"));
+        Assert.DoesNotContain("st.global.f32", batchedGemm, StringComparison.Ordinal);
 
         // Shape domain fails closed off the tile multiples.
         Assert.False(PtxFusedLinearTiledKernel.IsSupportedShape(63, 256, 256));

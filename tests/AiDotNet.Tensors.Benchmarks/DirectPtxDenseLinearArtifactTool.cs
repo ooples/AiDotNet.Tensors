@@ -243,15 +243,15 @@ internal static class DirectPtxDenseLinearArtifactTool
         [
             Cell("fused-linear-bias-gelu-v1-Ampere-decode-fp32-m1-k512-n2048",
                 PtxFusedLinearGeluM1Kernel.EmitPtx(major, minor, 512, 2_048)),
-            Cell("gemm-tiled-v3-Ampere-gemm-fp32-b1-m64-k256-n256-none-inputmajor",
+            Cell("gemm-tiled-v4-Ampere-gemm-fp32-b1-m64-k256-n256-none-inputmajor",
                 PtxFusedLinearTiledKernel.EmitPtx(
                 major, minor, 64, 256, 256, DirectPtxLinearActivation.None,
                 DirectPtxLinearWeightLayout.InputMajor, false, 1)),
-            Cell("fused-linear-tiled-v3-Ampere-gemm-fp32-b1-m64-k256-n256-gelutanh-inputmajor",
+            Cell("fused-linear-tiled-v4-Ampere-gemm-fp32-b1-m64-k256-n256-gelutanh-inputmajor",
                 PtxFusedLinearTiledKernel.EmitPtx(
                 major, minor, 64, 256, 256, DirectPtxLinearActivation.GeluTanh,
                 DirectPtxLinearWeightLayout.InputMajor, true, 1)),
-            Cell("gemm-tiled-v3-Ampere-gemm-fp32-b4-m64-k256-n256-none-inputmajor",
+            Cell("gemm-tiled-v4-Ampere-gemm-fp32-b4-m64-k256-n256-none-inputmajor",
                 PtxFusedLinearTiledKernel.EmitPtx(
                 major, minor, 64, 256, 256, DirectPtxLinearActivation.None,
                 DirectPtxLinearWeightLayout.InputMajor, false, 4)),
@@ -277,14 +277,14 @@ internal static class DirectPtxDenseLinearArtifactTool
             Cell("fused-linear-backward-v8-Ampere-wmma32x32-splitk-two-groups-m64-k256-n256-relu",
                 PtxFusedLinearBackwardKernel.EmitPtx(
                 major, minor, 64, 256, 256, DirectPtxLinearActivation.Relu)),
-            Cell("dense-dot-v3-Ampere-fp32x4-unrolled-k4096", PtxDenseVectorKernel.EmitPtx(
+            Cell("dense-dot-v4-Ampere-fp32x4-single-wave-k4096", PtxDenseVectorKernel.EmitPtx(
                 major, minor, DirectPtxDenseVectorOperation.Dot, 4_096)),
-            Cell("dense-outer-v7-Ampere-fp32x4-cta256-m64-n128", PtxDenseVectorKernel.EmitPtx(
+            Cell("dense-outer-v9-Ampere-fp32x4-reuse-right-cta256-m64-n128", PtxDenseVectorKernel.EmitPtx(
                 major, minor, DirectPtxDenseVectorOperation.Outer, 64, 128)),
             Cell("batched-dense-dot-v6-Ampere-unrolled-warp-per-batch-fp32x4-b4-d512",
                 PtxBatchedVectorKernel.EmitPtx(
                 major, minor, DirectPtxBatchedVectorOperation.Dot, 4, 512)),
-            Cell("strided-dot-v3-Ampere-fp32x4-reverse-a512-b512-o511-s-1",
+            Cell("strided-dot-v5-Ampere-fp32x4-reverse-a512-b512-o511-s-1",
                 PtxStridedDotKernel.EmitPtx(
                 major, minor, 512, 512, 511, -1))
         ];

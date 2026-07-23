@@ -213,7 +213,7 @@ public partial class DirectPtxWmmaTests
         Assert.Contains("valid-i=[0,511]", strided, StringComparison.Ordinal);
         Assert.Contains(".maxntid 32, 1, 1", strided, StringComparison.Ordinal);
         Assert.DoesNotContain(".shared", strided, StringComparison.Ordinal);
-        Assert.Equal(8, Count(strided, "ld.global.nc.v4.f32"));
+        Assert.Equal(8, Count(strided, "ld.global.v4.f32"));
         Assert.Equal(16, Count(strided, "fma.rn.f32"));
         Assert.DoesNotContain("bar.sync", strided, StringComparison.Ordinal);
         Assert.Equal(5, Count(strided, "shfl.sync.down.b32"));
@@ -250,10 +250,10 @@ public partial class DirectPtxWmmaTests
             8, 6, DirectPtxDenseVectorOperation.Dot, 4096);
         Assert.Contains(PtxDenseVectorKernel.DotEntryPoint, dot, StringComparison.Ordinal);
         Assert.Equal(3, Count(dot, ".param .u64"));
-        Assert.Contains(".maxntid 512, 1, 1", dot, StringComparison.Ordinal);
-        Assert.Contains(".shared .align 16 .b8 partial[64]", dot, StringComparison.Ordinal);
-        Assert.Equal(4, Count(dot, "ld.global.nc.v4.f32"));
-        Assert.Equal(8, Count(dot, "fma.rn.f32"));
+        Assert.Contains(".maxntid 1024, 1, 1", dot, StringComparison.Ordinal);
+        Assert.Contains(".shared .align 16 .b8 partial[128]", dot, StringComparison.Ordinal);
+        Assert.Equal(2, Count(dot, "ld.global.v4.f32"));
+        Assert.Equal(4, Count(dot, "fma.rn.f32"));
         Assert.Equal(1, Count(dot, "bar.sync 0"));
         Assert.Equal(10, Count(dot, "shfl.sync.down.b32"));
         Assert.DoesNotContain(".local", dot, StringComparison.Ordinal);
@@ -264,7 +264,7 @@ public partial class DirectPtxWmmaTests
         Assert.Contains(PtxDenseVectorKernel.OuterEntryPoint, outer, StringComparison.Ordinal);
         Assert.Equal(3, Count(outer, ".param .u64"));
         Assert.Equal(1, Count(outer, "ld.global.v4.f32"));
-        Assert.Equal(1, Count(outer, "st.global.v4.f32"));
+        Assert.Equal(2, Count(outer, "st.global.v4.f32"));
         Assert.Contains(".maxntid 256, 1, 1", outer, StringComparison.Ordinal);
         Assert.DoesNotContain("div.u32", outer, StringComparison.Ordinal);
         Assert.DoesNotContain("rem.u32", outer, StringComparison.Ordinal);

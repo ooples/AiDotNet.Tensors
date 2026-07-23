@@ -18,8 +18,9 @@ internal enum DirectPtxDenseVectorOperation
 internal sealed class PtxDenseVectorKernel : IDisposable
 {
     internal const int BlockThreads = 256;
-    internal const int ExactDotBlockThreads = 512;
+    internal const int ExactDotBlockThreads = 1024;
     internal const int OuterBlockThreads = 256;
+    internal const int ExactOuterRowsPerBlock = 16;
     internal const int WarpCount = BlockThreads / 32;
     internal const string DotEntryPoint = "aidotnet_dense_dot";
     internal const string OuterEntryPoint = "aidotnet_dense_outer";
@@ -89,6 +90,8 @@ internal sealed class PtxDenseVectorKernel : IDisposable
             : (long)M * N;
         uint grid = Operation == DirectPtxDenseVectorOperation.Dot
             ? 1u
+            : IsExactOuterCell(M, N)
+                ? checked((uint)(M / ExactOuterRowsPerBlock))
             : checked((uint)((workItems + _launchThreads - 1) / _launchThreads));
         _module.Launch(
             _function, grid, 1, 1, checked((uint)_launchThreads), 1, 1, 0, arguments);
@@ -156,13 +159,17 @@ internal sealed class PtxDenseVectorKernel : IDisposable
 
     private static void EmitVectorizedOuter(StringBuilder ptx, int m, int n)
     {
+        if (IsExactOuterCell(m, n))
+        {
+            EmitExactOuter(ptx, m, n);
+            return;
+        }
+
         int vectorsPerRow = n / 4;
         int totalVectors = checked(m * vectorsPerRow);
         ptx.AppendLine($"// exact outer product M={m} N={n}; aligned float4 streaming specialization");
         EmitHeader(ptx, OuterEntryPoint, OuterBlockThreads);
-        bool exactOuterCell = m == 64 && n == 128;
-        if (!exactOuterCell)
-            ptx.AppendLine("    .reg .pred %p<2>;");
+        ptx.AppendLine("    .reg .pred %p<2>;");
         ptx.AppendLine("    .reg .b32 %r<8>;");
         ptx.AppendLine("    .reg .b64 %rd<12>;");
         ptx.AppendLine("    .reg .f32 %f<10>;");
@@ -170,11 +177,8 @@ internal sealed class PtxDenseVectorKernel : IDisposable
         ptx.AppendLine("    mov.u32 %r0, %ctaid.x;");
         ptx.AppendLine("    mov.u32 %r1, %tid.x;");
         ptx.AppendLine($"    mad.lo.u32 %r2, %r0, {OuterBlockThreads}, %r1;");
-        if (!exactOuterCell)
-        {
-            ptx.AppendLine($"    setp.ge.u32 %p0, %r2, {totalVectors};");
-            ptx.AppendLine("    @%p0 bra.uni OUTER_DONE;");
-        }
+        ptx.AppendLine($"    setp.ge.u32 %p0, %r2, {totalVectors};");
+        ptx.AppendLine("    @%p0 bra.uni OUTER_DONE;");
         if (IsPowerOfTwo(vectorsPerRow))
         {
             ptx.AppendLine($"    shr.u32 %r3, %r2, {Log2(vectorsPerRow)};");
@@ -187,14 +191,10 @@ internal sealed class PtxDenseVectorKernel : IDisposable
         }
         ptx.AppendLine("    mul.wide.u32 %rd3, %r3, 4;");
         ptx.AppendLine("    add.u64 %rd4, %rd0, %rd3;");
-        ptx.AppendLine(exactOuterCell
-            ? "    ld.global.f32 %f0, [%rd4];"
-            : "    ld.global.nc.f32 %f0, [%rd4];");
+        ptx.AppendLine("    ld.global.nc.f32 %f0, [%rd4];");
         ptx.AppendLine("    mul.wide.u32 %rd5, %r4, 16;");
         ptx.AppendLine("    add.u64 %rd6, %rd1, %rd5;");
-        ptx.AppendLine(exactOuterCell
-            ? "    ld.global.v4.f32 {%f1,%f2,%f3,%f4}, [%rd6];"
-            : "    ld.global.nc.v4.f32 {%f1,%f2,%f3,%f4}, [%rd6];");
+        ptx.AppendLine("    ld.global.nc.v4.f32 {%f1,%f2,%f3,%f4}, [%rd6];");
         ptx.AppendLine("    mul.rn.f32 %f5, %f0, %f1;");
         ptx.AppendLine("    mul.rn.f32 %f6, %f0, %f2;");
         ptx.AppendLine("    mul.rn.f32 %f7, %f0, %f3;");
@@ -203,6 +203,43 @@ internal sealed class PtxDenseVectorKernel : IDisposable
         ptx.AppendLine("    add.u64 %rd8, %rd2, %rd7;");
         ptx.AppendLine("    st.global.v4.f32 [%rd8], {%f5,%f6,%f7,%f8};");
         ptx.AppendLine("OUTER_DONE:");
+        ptx.AppendLine("    ret;");
+        ptx.AppendLine("}");
+    }
+
+    private static void EmitExactOuter(StringBuilder ptx, int m, int n)
+    {
+        ptx.AppendLine($"// exact outer product M={m} N={n}; four CTAs reuse one right float4 per lane across two rows per warp");
+        EmitHeader(ptx, OuterEntryPoint, OuterBlockThreads);
+        ptx.AppendLine("    .reg .b32 %r<8>;");
+        ptx.AppendLine("    .reg .b64 %rd<12>;");
+        ptx.AppendLine("    .reg .f32 %f<10>;");
+        EmitPointers(ptx);
+        ptx.AppendLine("    mov.u32 %r0, %tid.x;");
+        ptx.AppendLine("    mov.u32 %r1, %ctaid.x;");
+        ptx.AppendLine("    and.b32 %r2, %r0, 31;");
+        ptx.AppendLine("    shr.u32 %r3, %r0, 5;");
+        ptx.AppendLine($"    mul.lo.u32 %r4, %r1, {ExactOuterRowsPerBlock};");
+        ptx.AppendLine("    shl.b32 %r6, %r3, 1;");
+        ptx.AppendLine("    add.u32 %r4, %r4, %r6;");
+        ptx.AppendLine("    mul.wide.u32 %rd3, %r2, 16;");
+        ptx.AppendLine("    add.u64 %rd4, %rd1, %rd3;");
+        ptx.AppendLine("    ld.global.v4.f32 {%f0,%f1,%f2,%f3}, [%rd4];");
+        for (int row = 0; row < 2; row++)
+        {
+            ptx.AppendLine($"    add.u32 %r5, %r4, {row};");
+            ptx.AppendLine("    mul.wide.u32 %rd5, %r5, 4;");
+            ptx.AppendLine("    add.u64 %rd6, %rd0, %rd5;");
+            ptx.AppendLine("    ld.global.f32 %f4, [%rd6];");
+            ptx.AppendLine("    mul.rn.f32 %f5, %f4, %f0;");
+            ptx.AppendLine("    mul.rn.f32 %f6, %f4, %f1;");
+            ptx.AppendLine("    mul.rn.f32 %f7, %f4, %f2;");
+            ptx.AppendLine("    mul.rn.f32 %f8, %f4, %f3;");
+            ptx.AppendLine($"    mul.wide.u32 %rd7, %r5, {n * sizeof(float)};");
+            ptx.AppendLine("    add.u64 %rd8, %rd2, %rd7;");
+            ptx.AppendLine("    add.u64 %rd8, %rd8, %rd3;");
+            ptx.AppendLine("    st.global.v4.f32 [%rd8], {%f5,%f6,%f7,%f8};");
+        }
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");
     }
@@ -295,7 +332,7 @@ internal sealed class PtxDenseVectorKernel : IDisposable
     private static void EmitExactDot4096(StringBuilder ptx)
     {
         const int exactWarpCount = ExactDotBlockThreads / 32;
-        ptx.AppendLine("// exact dot product K=4096; two unrolled aligned float4 pairs per lane; one shared reduction/store");
+        ptx.AppendLine("// exact dot product K=4096; one aligned float4 pair per lane; one shared reduction/store");
         EmitHeader(ptx, DotEntryPoint, ExactDotBlockThreads);
         ptx.AppendLine("    .reg .pred %p<4>;");
         ptx.AppendLine("    .reg .b32 %r<10>;");
@@ -311,16 +348,12 @@ internal sealed class PtxDenseVectorKernel : IDisposable
         ptx.AppendLine("    mov.f32 %f6, 0f00000000;");
         ptx.AppendLine("    mov.f32 %f7, 0f00000000;");
         ptx.AppendLine("    mov.f32 %f8, 0f00000000;");
-        foreach (int offset in new[] { 0, 8_192 })
-        {
-            string suffix = offset == 0 ? string.Empty : $"+{offset}";
-            ptx.AppendLine($"    ld.global.nc.v4.f32 {{%f1,%f2,%f3,%f4}}, [%rd4{suffix}];");
-            ptx.AppendLine($"    ld.global.nc.v4.f32 {{%f9,%f10,%f11,%f12}}, [%rd5{suffix}];");
-            ptx.AppendLine("    fma.rn.f32 %f0, %f1, %f9, %f0;");
-            ptx.AppendLine("    fma.rn.f32 %f6, %f2, %f10, %f6;");
-            ptx.AppendLine("    fma.rn.f32 %f7, %f3, %f11, %f7;");
-            ptx.AppendLine("    fma.rn.f32 %f8, %f4, %f12, %f8;");
-        }
+        ptx.AppendLine("    ld.global.v4.f32 {%f1,%f2,%f3,%f4}, [%rd4];");
+        ptx.AppendLine("    ld.global.v4.f32 {%f9,%f10,%f11,%f12}, [%rd5];");
+        ptx.AppendLine("    fma.rn.f32 %f0, %f1, %f9, %f0;");
+        ptx.AppendLine("    fma.rn.f32 %f6, %f2, %f10, %f6;");
+        ptx.AppendLine("    fma.rn.f32 %f7, %f3, %f11, %f7;");
+        ptx.AppendLine("    fma.rn.f32 %f8, %f4, %f12, %f8;");
         ptx.AppendLine("    add.rn.f32 %f0, %f0, %f6;");
         ptx.AppendLine("    add.rn.f32 %f7, %f7, %f8;");
         ptx.AppendLine("    add.rn.f32 %f0, %f0, %f7;");
@@ -401,10 +434,10 @@ internal sealed class PtxDenseVectorKernel : IDisposable
         var output = dot ? new DirectPtxExtent(1) : new DirectPtxExtent(m, n);
         return new DirectPtxKernelBlueprint(
             Operation: dot ? "dense-dot" : "dense-outer",
-            Version: IsExactOuterCell(m, n) ? 7 : dot && m == 4_096 ? 3 : vectorizedOuter ? 3 : vectorizedDot ? 2 : 1,
+            Version: IsExactOuterCell(m, n) ? 9 : dot && m == 4_096 ? 4 : vectorizedOuter ? 3 : vectorizedDot ? 2 : 1,
             Architecture: architecture,
-            Variant: dot ? $"{(m == 4_096 ? "fp32x4-unrolled" : vectorizedDot ? "fp32x4" : "fp32")}-k{m}" :
-                $"{(vectorizedOuter ? $"fp32x{outerVectorWidth}-cta{OuterBlockThreads}" : "fp32")}-m{m}-n{n}",
+            Variant: dot ? $"{(m == 4_096 ? "fp32x4-single-wave" : vectorizedDot ? "fp32x4" : "fp32")}-k{m}" :
+                $"{(IsExactOuterCell(m, n) ? $"fp32x{outerVectorWidth}-reuse-right-cta{OuterBlockThreads}" : vectorizedOuter ? $"fp32x{outerVectorWidth}-cta{OuterBlockThreads}" : "fp32")}-m{m}-n{n}",
             Tensors:
             [
                 new("left", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,

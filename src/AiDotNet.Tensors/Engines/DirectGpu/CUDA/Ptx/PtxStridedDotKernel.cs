@@ -171,8 +171,8 @@ internal sealed class PtxStridedDotKernel : IDisposable
         ptx.AppendLine("{");
         ptx.AppendLine("    .reg .pred %p<2>;");
         ptx.AppendLine("    .reg .b32 %r<8>;");
-        ptx.AppendLine("    .reg .b64 %rd<8>;");
-        ptx.AppendLine("    .reg .f32 %f<10>;");
+        ptx.AppendLine("    .reg .b64 %rd<12>;");
+        ptx.AppendLine("    .reg .f32 %f<14>;");
         ptx.AppendLine("    ld.param.u64 %rd0, [left_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd1, [right_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd2, [output_ptr];");
@@ -182,22 +182,27 @@ internal sealed class PtxStridedDotKernel : IDisposable
         ptx.AppendLine("    sub.u32 %r2, 127, %r0;");
         ptx.AppendLine("    mul.wide.u32 %rd5, %r2, 16;");
         ptx.AppendLine("    add.u64 %rd6, %rd1, %rd5;");
+        ptx.AppendLine("    sub.u64 %rd7, %rd6, 512;");
+        ptx.AppendLine("    sub.u64 %rd8, %rd6, 1024;");
+        ptx.AppendLine("    sub.u64 %rd9, %rd6, 1536;");
         ptx.AppendLine("    mov.f32 %f8, 0f00000000;");
+        ptx.AppendLine("    mov.f32 %f10, 0f00000000;");
+        ptx.AppendLine("    mov.f32 %f11, 0f00000000;");
+        ptx.AppendLine("    mov.f32 %f12, 0f00000000;");
         for (int group = 0; group < 4; group++)
         {
-            ptx.AppendLine("    ld.global.nc.v4.f32 {%f0,%f1,%f2,%f3}, [%rd4];");
-            ptx.AppendLine("    ld.global.nc.v4.f32 {%f4,%f5,%f6,%f7}, [%rd6];");
+            string leftSuffix = group == 0 ? string.Empty : $"+{group * 512}";
+            ptx.AppendLine($"    ld.global.v4.f32 {{%f0,%f1,%f2,%f3}}, [%rd4{leftSuffix}];");
+            ptx.AppendLine($"    ld.global.v4.f32 {{%f4,%f5,%f6,%f7}}, [%rd{6 + group}];");
             ptx.AppendLine("    fma.rn.f32 %f8, %f0, %f7, %f8;");
-            ptx.AppendLine("    fma.rn.f32 %f8, %f1, %f6, %f8;");
-            ptx.AppendLine("    fma.rn.f32 %f8, %f2, %f5, %f8;");
-            ptx.AppendLine("    fma.rn.f32 %f8, %f3, %f4, %f8;");
-            if (group != 3)
-            {
-                ptx.AppendLine("    add.u64 %rd4, %rd4, 512;");
-                ptx.AppendLine("    sub.u64 %rd6, %rd6, 512;");
-            }
+            ptx.AppendLine("    fma.rn.f32 %f10, %f1, %f6, %f10;");
+            ptx.AppendLine("    fma.rn.f32 %f11, %f2, %f5, %f11;");
+            ptx.AppendLine("    fma.rn.f32 %f12, %f3, %f4, %f12;");
         }
-        EmitWarpReduction(ptx, "%f8", "%f9", "%r3", "%r4");
+        ptx.AppendLine("    add.rn.f32 %f8, %f8, %f10;");
+        ptx.AppendLine("    add.rn.f32 %f11, %f11, %f12;");
+        ptx.AppendLine("    add.rn.f32 %f8, %f8, %f11;");
+        EmitWarpReduction(ptx, "%f8", "%f13", "%r3", "%r4");
         ptx.AppendLine("    setp.ne.u32 %p0, %r0, 0;");
         ptx.AppendLine("    @%p0 bra.uni REVERSE_DONE;");
         ptx.AppendLine("    st.global.f32 [%rd2], %f8;");
@@ -281,7 +286,7 @@ internal sealed class PtxStridedDotKernel : IDisposable
         (int first, int last) = ValidInterval(aSize, bSize, bOffset, bStep);
         return new DirectPtxKernelBlueprint(
             Operation: "strided-dot",
-            Version: IsExactReverseCell(aSize, bSize, bOffset, bStep) ? 3 : 2,
+            Version: IsExactReverseCell(aSize, bSize, bOffset, bStep) ? 5 : 2,
             Architecture: architecture,
             Variant: $"{(IsExactReverseCell(aSize, bSize, bOffset, bStep) ? "fp32x4-reverse" : "warp-reduce-fp32")}-a{aSize}-b{bSize}-o{bOffset}-s{bStep}",
             Tensors:
