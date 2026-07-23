@@ -59,7 +59,7 @@ specializations is allowed only when the cubin filename and hash also match.
 | 3 | Shared memory only for reuse | Backward parameter partials are folded in 16 KiB (LayerNorm) or 5 KiB (RMSNorm); L2 uses a 64-byte warp fold. Single-use row inputs are not pointlessly staged. **Pass.** |
 | 4 | Register-resident math | Loaded row values, statistics, affine terms, reductions, and grad-input epilogues remain in registers until final stores. Final SASS has zero local loads/stores. **Pass.** |
 | 5 | Combined/fused kernels | The large-shape experimental backward paths compute grad-input plus parameter partials in one input pass and one dispatch. Existing residual+BatchNorm+ReLU is also truly fused. **Mechanically pass; performance HOLD.** |
-| 6 | Bounded global reductions | Fused backward folds issue one atomic per block/output into one of four banked accumulators, reducing per-address contention by 4x, plus one completion atomic per block. L2 uses a 512-thread, at-most-128-block partial grid. The complete persistent workspace is 2,052 bytes; no output-sized scratch exists. **Correctness pass; performance HOLD.** |
+| 6 | Bounded global reductions | Fused backward folds issue one `RED` per block/output into one of four banked accumulators, reducing per-address contention by 4x, plus one completion atomic per block. L2 uses a 512-thread, at-most-128-block grid feeding 16 reusable `RED` banks and a one-warp final fold. The complete persistent workspace is 2,052 bytes; no output-sized scratch exists. **Source/resource pass; current L2 GPU correctness and performance HOLD.** |
 | 7 | Asynchronous stream ordering | Launches use the backend stream with no host synchronization. Fused backward/L2 no longer clear outputs; their prewarmed workspace self-resets inside the kernel. `cp.async` is required only for reusable tiles and is inapplicable to these single-use D=64 loads. **Pass.** |
 | 8 | CUDA Graph/lifetime safety | Plans are prewarmed and modules pinned for capture lifetime; compilation, tuning, file I/O, and cache misses are rejected during capture. **Pass.** |
 | 9 | Ahead-of-load binary control | PTX is linked to cubin, hashed, embedded, loaded, disassembled to SASS, resource-audited, and content-addressed cached. Raw PTX load is experiment-only. **Pass.** |
@@ -108,9 +108,12 @@ route is admitted without the explicit experiment override.
 
 The experimental whole-tensor L2 lane uses aligned 16-byte loads, four
 register FMAs, 512-thread blocks, a bounded 128-block grid, and a 64-byte
-warp/shared fold. Blocks publish one partial each; the last block performs the
-final fold, writes the scalar directly, and resets the workspace completion
-counter. It remains unselected until a clean run beats compiled PyTorch. The
+warp/shared fold. Blocks publish through 16 reusable non-returning `RED` banks,
+limiting each address to at most eight publishers. The last block uses one warp
+to fold and clear those banks, writes the scalar directly, and resets the
+workspace completion counter. This replaces the slower 128-slot second global
+fold. It remains unselected until current-source GPU correctness, graph replay,
+and clean performance runs all pass. The
 deterministic one-block variant also adopts the wider block fold but remains a
 fallback-only experiment.
 
@@ -177,17 +180,18 @@ process existed before it registered its CUDA context.
 
 ## Evidence collected on RTX 3080 / SM86
 
-- On the final four-bank head, all 14 focused
-  correctness/routing/capture/allocation tests plus both emitter/inventory
-  checks pass on net10. The exact source builds on net471; the immediately
-  preceding single-bank workspace passed 14/14 on net471, while the final
-  four-bank net471 GPU replay waits for an uncontended device.
+- The four-bank backward head passed all 14 focused GPU
+  correctness/routing/capture/allocation tests on net10. The current source adds
+  a banked-L2 emitter/routing contract that passes on net10 and net471. Exact
+  current-source L2 GPU correctness and graph replay, plus the four-bank net471
+  GPU replay, wait for an uncontended device.
 - All 71 current-source identities and 67 compiled cubins pass the static
   verifier.
 - Final SASS passes for all 67 cubins with zero `LDL` and zero `STL`; current
   maximum register use is 48/thread.
-- Fused backward and atomic reduction entries contain the intended final
-  `ATOMG.E.ADD.F32` instructions and no local memory.
+- Fused backward and the banked L2 entry contain the intended final
+  `RED.E.ADD.F32` publishers; only the integer completion counters use `ATOMG`.
+  The banked L2 cubin uses 24 registers/thread and 64 bytes shared memory.
 - Exact-cubin runtime profiling launches all 71 embedded specializations and
   reports `PROFILED_NORMALIZATION_CUBINS=71`.
 - Nsight Compute 2025.4.1 attaches to the exact target, but hardware-counter
@@ -202,9 +206,11 @@ compiled PyTorch medians were 20.46/20.40/20.50 us for LayerNorm backward,
 The exact embedded fused cubins measured 28.84/27.40/19.50 us for LayerNorm
 and 19.48/16.51/19.11 us for RMSNorm. Their p95s were 39.67/34.86/36.43 us
 and 42.33/22.88/26.34 us respectively, far outside the +10% tail gate. The
-unselected 512-thread atomic L2 experiment measured about 17.20 us median and
-22.18 us p95 in its clean routed screen; the deterministic embedded variant
-measured 42.64--43.77 us. All three cells remain HOLD.
+superseded single-address/bounded-partial 512-thread L2 experiments measured
+about 17.20 us median and 22.18 us p95 in their clean routed screen; the
+deterministic embedded variant measured 42.64--43.77 us. The new 16-bank
+`RED`/one-warp-fold candidate has not been timed. All three operation families
+remain HOLD.
 
 The first workspace topology stored every block partial and folded it in the
 last block. A serial 64-thread fold measured 39.44 us LayerNorm / 36.07 us
@@ -232,8 +238,9 @@ cell can be reported.
 - Atomic parameter gradients regressed 256/2,048-row cells and LayerNorm at
   8,192 rows. Only 8,192-row RMSNorm showed a useful improvement, so routing
   is shape/operation specific.
-- Scalar and `float4` bounded atomic whole-tensor L2 variants both remained
-  slower than current CUDA. They stay experimental and unpromoted.
+- Scalar, single-address atomic, and 128-slot block-partial whole-tensor L2
+  variants remained slower than current CUDA. The replacement 16-bank `RED`
+  variant stays experimental and unpromoted until clean validation.
 - Backward sweeps rejected 256-thread blocks, 64/96/128-block common grids,
   `v4` half-warp mapping, `.cg` loads, reciprocal broadcast, duplicate-stat
   shuffles, and 512-row parameter tiles. The retained RMS 20-warp geometry
@@ -255,9 +262,9 @@ cell can be reported.
 2. Continue reducing RMS reciprocal/reduction and accumulator contention only
    with measured variants that preserve two blocks/SM and the single input
    pass.
-3. Replace whole-tensor L2 with a measured hierarchical or cooperative
-   reduction that beats compiled PyTorch without output-sized scratch or
-   hidden synchronization.
+3. Validate and measure the 16-bank L2 reduction on an idle device; if it misses
+   the gate, continue the hierarchical/cooperative search without output-sized
+   scratch or hidden synchronization.
 4. Complete three clean independent runs for every remaining forward/channel
    candidate and rerun the corrected residual BatchNorm semantics.
 5. Enable NVIDIA performance counters and archive exact-cubin NCU metrics for

@@ -68,6 +68,26 @@ public sealed class DirectPtxNormalizationCorrectnessTests
     }
 
     [Fact]
+    public void BankedL2Emitter_UsesReusableRedAccumulatorsAndRemainsUnpromoted()
+    {
+        string ptx = PtxRowNormalizationD64Kernel.EmitPtx(
+            8, 6, DirectPtxRowNormalizationOperation.ReduceNormL2Atomic, 8_192);
+        DirectPtxKernelBlueprint blueprint =
+            PtxRowNormalizationD64Kernel.CreateBlueprint(
+                DirectPtxArchitectureFamily.Ampere,
+                DirectPtxRowNormalizationOperation.ReduceNormL2Atomic,
+                8_192);
+
+        Assert.Contains("red.global.add.f32", ptx, StringComparison.Ordinal);
+        Assert.Contains("setp.lt.u32 %p5, %r2, 16", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("st.global.f32 [%rd4], %f3", ptx, StringComparison.Ordinal);
+        Assert.Equal("16", blueprint.Semantics["accumulator-banks"]);
+        Assert.Equal("false", blueprint.Semantics["deterministic"]);
+        Assert.False(PtxRowNormalizationD64Kernel.IsPromoted(
+            DirectPtxRowNormalizationOperation.ReduceNormL2Atomic, 8_192));
+    }
+
+    [Fact]
     public void HalfBits_UsesIeeeBinary16AcrossTargetFrameworks()
     {
         (float Value, ushort Bits)[] cases =

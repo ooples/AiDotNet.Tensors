@@ -47,6 +47,7 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
     internal const int ReductionWarpsPerBlock = ReductionBlockThreads / 32;
     internal const int ReductionSharedBytes = ReductionWarpsPerBlock * sizeof(float);
     internal const int ReductionMaxBlocks = 128;
+    internal const int ReductionAccumulatorBanks = 16;
     internal const int FusedLayerNormBackwardWarpsPerBlock = 32;
     internal const int FusedRmsNormBackwardWarpsPerBlock = 20;
     internal const int FusedLayerNormBackwardBlockThreads =
@@ -1143,10 +1144,15 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
             return End(ptx, "REDUCE_NORM_DONE");
         }
 
+        // Publish into reusable banks rather than materializing one partial per
+        // block. Sixteen addresses limit each bank to at most eight publishers,
+        // and RED avoids the unused atomic return value. The completion counter
+        // orders the final one-warp fold without a second kernel or host clear.
         ptx.AppendLine("    mov.u32 %r5, %ctaid.x;");
-        ptx.AppendLine("    mul.wide.u32 %rd3, %r5, 4;");
+        ptx.AppendLine($"    and.b32 %r6, %r5, {ReductionAccumulatorBanks - 1};");
+        ptx.AppendLine("    mul.wide.u32 %rd3, %r6, 4;");
         ptx.AppendLine("    add.u64 %rd4, %rd2, %rd3;");
-        ptx.AppendLine("    st.global.f32 [%rd4], %f3;");
+        ptx.AppendLine("    red.global.add.f32 [%rd4], %f3;");
         ptx.AppendLine("    membar.gl;");
         ptx.AppendLine($"    add.u64 %rd5, %rd2, {NormalizationWorkspaceCounterByteOffset};");
         ptx.AppendLine("    atom.global.add.u32 %r5, [%rd5], 1;");
@@ -1162,44 +1168,26 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         ptx.AppendLine("    ld.shared.u32 %r5, [%rd6];");
         ptx.AppendLine("    setp.eq.u32 %p4, %r5, 0;");
         ptx.AppendLine("    @%p4 bra REDUCE_NORM_DONE;");
+        ptx.AppendLine("    membar.gl;");
 
-        // The last block performs the cross-block fold in fixed block-index
-        // order. At most 128 slots are live for the supported exact shapes.
-        ptx.AppendLine("    mov.u32 %r6, %nctaid.x;");
-        ptx.AppendLine("    setp.lt.u32 %p4, %r0, %r6;");
+        // The first warp of the last block folds and clears the sixteen banks.
+        // Stream ordering prevents the next launch from observing a partially
+        // reset workspace, so no second block-wide barrier is necessary.
+        ptx.AppendLine("    setp.ne.u32 %p5, %r3, 0;");
+        ptx.AppendLine("    @%p5 bra REDUCE_NORM_DONE;");
+        ptx.AppendLine($"    setp.lt.u32 %p5, %r2, {ReductionAccumulatorBanks};");
         ptx.AppendLine("    mov.f32 %f0, 0f00000000;");
-        ptx.AppendLine("    @!%p4 bra REDUCE_NORM_LAST_WARP;");
-        ptx.AppendLine("    mul.wide.u32 %rd3, %r0, 4;");
+        ptx.AppendLine("    @!%p5 bra REDUCE_NORM_LAST_FINAL;");
+        ptx.AppendLine("    mul.wide.u32 %rd3, %r2, 4;");
         ptx.AppendLine("    add.u64 %rd4, %rd2, %rd3;");
         ptx.AppendLine("    ld.global.f32 %f0, [%rd4];");
         ptx.AppendLine("    mov.f32 %f1, 0f00000000;");
         ptx.AppendLine("    st.global.f32 [%rd4], %f1;");
-        ptx.AppendLine("REDUCE_NORM_LAST_WARP:");
-        EmitWarpSum(ptx, "%f0", "%f2");
-        ptx.AppendLine("    and.b32 %r2, %r0, 31;");
-        ptx.AppendLine("    shr.u32 %r3, %r0, 5;");
-        ptx.AppendLine("    setp.ne.u32 %p5, %r2, 0;");
-        ptx.AppendLine("    @%p5 bra REDUCE_NORM_LAST_BARRIER;");
-        ptx.AppendLine("    mul.wide.u32 %rd3, %r3, 4;");
-        ptx.AppendLine("    mov.u64 %rd4, reduce_scratch;");
-        ptx.AppendLine("    add.u64 %rd4, %rd4, %rd3;");
-        ptx.AppendLine("    st.shared.f32 [%rd4], %f0;");
-        ptx.AppendLine("REDUCE_NORM_LAST_BARRIER:");
-        ptx.AppendLine("    bar.sync 0;");
-        ptx.AppendLine("    setp.ne.u32 %p5, %r3, 0;");
-        ptx.AppendLine("    @%p5 bra REDUCE_NORM_DONE;");
-        ptx.AppendLine($"    setp.lt.u32 %p5, %r2, {ReductionWarpsPerBlock};");
-        ptx.AppendLine("    mov.f32 %f3, 0f00000000;");
-        ptx.AppendLine("    @!%p5 bra REDUCE_NORM_LAST_FINAL;");
-        ptx.AppendLine("    mul.wide.u32 %rd3, %r2, 4;");
-        ptx.AppendLine("    mov.u64 %rd4, reduce_scratch;");
-        ptx.AppendLine("    add.u64 %rd4, %rd4, %rd3;");
-        ptx.AppendLine("    ld.shared.f32 %f3, [%rd4];");
         ptx.AppendLine("REDUCE_NORM_LAST_FINAL:");
-        EmitWarpSum(ptx, "%f3", "%f4");
-        ptx.AppendLine("    setp.ne.u32 %p5, %r0, 0;");
+        EmitWarpSum(ptx, "%f0", "%f2");
+        ptx.AppendLine("    setp.ne.u32 %p5, %r2, 0;");
         ptx.AppendLine("    @%p5 bra REDUCE_NORM_DONE;");
-        ptx.AppendLine("    st.global.f32 [%rd1], %f3;");
+        ptx.AppendLine("    st.global.f32 [%rd1], %f0;");
         ptx.AppendLine("    mov.u32 %r5, 0;");
         ptx.AppendLine($"    add.u64 %rd5, %rd2, {NormalizationWorkspaceCounterByteOffset};");
         ptx.AppendLine("    st.global.u32 [%rd5], %r5;");
@@ -1558,8 +1546,8 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
                 ? $"single-pass-grid-stride-d64-w{GetFusedBackwardWarpsPerBlock(operation)}" +
                     $"-b{GetFusedBackwardMaxBlocks(operation)}-r{rows}"
                 : atomicReduction
-                ? $"bounded-workspace-last-block-reduction-t{ReductionBlockThreads}" +
-                    $"-b{ReductionMaxBlocks}-r{rows}"
+                ? $"banked-red-last-warp-reduction-t{ReductionBlockThreads}" +
+                    $"-b{ReductionMaxBlocks}-a{ReductionAccumulatorBanks}-r{rows}"
                 : deterministicReduction
                 ? $"single-block-reduction-t{ReductionBlockThreads}-r{rows}"
                 : atomicParameterGradient
@@ -1593,19 +1581,21 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
                 ["row-count"] = rows.ToString(CultureInfo.InvariantCulture),
                 ["global-intermediates"] = fusedBackward
                     ? "bounded-reusable-accumulators"
-                    : atomicReduction ? "bounded-block-partials" : "none",
+                    : atomicReduction ? "bounded-reusable-accumulators" : "none",
                 ["accumulator-banks"] = fusedBackward
                     ? FusedBackwardAccumulatorBanks.ToString(CultureInfo.InvariantCulture)
+                    : atomicReduction
+                    ? ReductionAccumulatorBanks.ToString(CultureInfo.InvariantCulture)
                     : "none",
                 ["temporary-device-allocation"] = RequiresPersistentWorkspace(operation)
                     ? "persistent-prewarm-workspace" : "none",
                 ["shape-stride-parameters"] = "none",
-                ["deterministic"] = atomicParameterGradient || fusedBackward
+                ["deterministic"] = atomicParameterGradient || fusedBackward || atomicReduction
                     ? "false" : "true",
                 ["dataflow"] = fusedBackward
                     ? "one grid-stride pass retains row values in registers for grad-input and parameter partials; shared memory folds warp cohorts before one atomic per block/output"
                     : atomicReduction
-                    ? "coalesced 16-byte loads feed four register FMAs; bounded grid-stride accumulation, warp/shared block fold, then one global atomic per block"
+                    ? "coalesced 16-byte loads feed four register FMAs; bounded grid-stride accumulation and warp/shared block fold publish through sixteen reusable RED banks; the last block performs one warp fold and self-reset"
                     : deterministicReduction
                     ? "one 512-thread block uses coalesced scalar loads, register FMAs, and a fixed warp/shared fold before the single scalar store"
                     : atomicParameterGradient

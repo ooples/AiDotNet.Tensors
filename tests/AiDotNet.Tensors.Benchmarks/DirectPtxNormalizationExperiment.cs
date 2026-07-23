@@ -246,10 +246,17 @@ internal static class DirectPtxNormalizationExperiment
         using (var directOutput = backend.AllocateBuffer(1))
         {
             Action baseline = () => backend.ReduceNormL2(input, baselineOutput, elements);
-            Action direct = () => backend.ReduceNormL2(input, directOutput, elements);
+            Action direct = () =>
+            {
+                if (!backend.TryDirectPtxReduceNormL2BankedD64(input, directOutput, rows))
+                    throw new InvalidOperationException(backend.DirectPtxLastError);
+            };
             RunCell(run, rows, "ReduceNormL2", backend, baseline, direct,
                 () => MaxError(backend, (baselineOutput, directOutput)),
-                DirectPtxRowNormalizationOperation.ReduceNormL2,
+                DirectPtxRowNormalizationOperation.ReduceNormL2Atomic,
+                directPersistentWorkspaceBytes:
+                    PtxRowNormalizationD64Kernel.NormalizationWorkspaceBytes,
+                directPersistentWorkspaceBoundedAndReusable: true,
                 baselineCaptureCompatible: false);
         }
 
