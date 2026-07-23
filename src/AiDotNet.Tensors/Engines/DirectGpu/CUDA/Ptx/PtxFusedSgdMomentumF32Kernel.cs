@@ -213,7 +213,11 @@ internal sealed class PtxFusedSgdMomentumF32Kernel : IDisposable
                     extent, extent, 16, DirectPtxTensorAccess.ReadWrite, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 24,
+                // Measured by the offline gate at sm86: 22 registers without
+                // weight decay and 24 with it, so the previous budget of 24
+                // sat exactly on the limit and any codegen drift would have
+                // tripped ResourceBudget.Validate on a real device.
+                MaxRegistersPerThread: 32,
                 MaxStaticSharedBytes: 0,
                 MaxLocalBytesPerThread: 0,
                 MinBlocksPerMultiprocessor: 1536 / blockThreads),

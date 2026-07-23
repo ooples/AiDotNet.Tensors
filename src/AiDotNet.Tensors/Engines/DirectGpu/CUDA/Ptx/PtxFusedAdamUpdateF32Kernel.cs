@@ -286,6 +286,9 @@ internal sealed class PtxFusedAdamUpdateF32Kernel : IDisposable
                     extent, extent, 16, DirectPtxTensorAccess.ReadWrite, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: new DirectPtxResourceBudget(
+                // Measured by the offline gate at sm86: 34 registers in both
+                // the decay-free and weight-decay builds, giving 10 blocks/SM.
+                // The 40 budget holds with headroom.
                 MaxRegistersPerThread: 40,
                 MaxStaticSharedBytes: 0,
                 MaxLocalBytesPerThread: 0,
