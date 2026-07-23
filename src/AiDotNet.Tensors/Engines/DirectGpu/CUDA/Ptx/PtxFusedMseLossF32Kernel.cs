@@ -141,8 +141,10 @@ internal sealed class PtxFusedMseLossF32Kernel : IDisposable
         int shuffleReg = 2 * valuesPerLane + 1;
         string predRegs = string.Join(", ", RegisterRange(predBase, valuesPerLane));
         string targetRegs = string.Join(", ", RegisterRange(targetBase, valuesPerLane));
-        ptx.AppendLine($"    ld.global.ca.v{valuesPerLane}.f32 {{{predRegs}}}, [%rd6];");
-        ptx.AppendLine($"    ld.global.ca.v{valuesPerLane}.f32 {{{targetRegs}}}, [%rd8];");
+        // Streamed once and never revisited, so this goes through the
+        // read-only data cache instead of displacing L1.
+        ptx.AppendLine($"    ld.global.nc.v{valuesPerLane}.f32 {{{predRegs}}}, [%rd6];");
+        ptx.AppendLine($"    ld.global.nc.v{valuesPerLane}.f32 {{{targetRegs}}}, [%rd8];");
         ptx.AppendLine($"    mov.f32 %f{accReg}, 0f00000000;");
         for (int i = 0; i < valuesPerLane; i++)
         {

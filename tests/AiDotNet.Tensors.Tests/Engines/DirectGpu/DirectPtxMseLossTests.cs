@@ -25,14 +25,14 @@ public class DirectPtxMseLossTests
         Assert.Contains("exact-shape rows=2048 columns=128 block=128", ptx);
         Assert.Contains("op=mse-loss", ptx);
         Assert.Equal(3, Count(ptx, "ld.param.u64"));
-        Assert.Equal(2, Count(ptx, "ld.global.ca.v4.f32"));
+        Assert.Equal(2, Count(ptx, "ld.global.nc.v4.f32"));
         Assert.Equal(4, Count(ptx, "sub.rn.f32"));
         Assert.Equal(4, Count(ptx, "fma.rn.f32"));
         Assert.Equal(5, Count(ptx, "shfl.sync.bfly.b32"));
         Assert.Equal(1, Count(ptx, "st.global.f32"));
         // 1/128 = 0x3C000000
         Assert.Contains("0f3C000000", ptx);
-        Assert.Contains("ld.global.ca.v2.f32",
+        Assert.Contains("ld.global.nc.v2.f32",
             PtxFusedMseLossF32Kernel.EmitPtx(8, 6, 2048, 64));
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);

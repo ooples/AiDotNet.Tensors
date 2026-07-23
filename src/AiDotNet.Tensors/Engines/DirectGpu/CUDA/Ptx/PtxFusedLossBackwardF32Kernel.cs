@@ -218,7 +218,9 @@ internal sealed class PtxFusedLossBackwardF32Kernel : IDisposable
             // gradOutput[0] is a broadcast scalar, so g * 2 is loop-invariant.
             // Hoisting it keeps the per-element association identical to
             // ((g * 2) * d) * invN in the established kernel.
-            ptx.AppendLine("    ld.global.ca.f32 %f12, [%rd0];");
+        // Streamed once and never revisited, so this goes through the
+        // read-only data cache instead of displacing L1.
+            ptx.AppendLine("    ld.global.nc.f32 %f12, [%rd0];");
             ptx.AppendLine("    mul.rn.f32 %f12, %f12, 0f40000000;");   // * 2.0
             ptx.AppendLine("    ld.param.f32 %f13, [inv_n];");
         }
@@ -230,8 +232,8 @@ internal sealed class PtxFusedLossBackwardF32Kernel : IDisposable
         ptx.AppendLine($"    add.u64 %rd7, %rd{predParam}, %rd6;");
         ptx.AppendLine($"    add.u64 %rd8, %rd{targetParam}, %rd6;");
         ptx.AppendLine($"    add.u64 %rd9, %rd{gradInParam}, %rd6;");
-        ptx.AppendLine("    ld.global.ca.v4.f32 {%f0, %f1, %f2, %f3}, [%rd7];");
-        ptx.AppendLine("    ld.global.ca.v4.f32 {%f4, %f5, %f6, %f7}, [%rd8];");
+        ptx.AppendLine("    ld.global.nc.v4.f32 {%f0, %f1, %f2, %f3}, [%rd7];");
+        ptx.AppendLine("    ld.global.nc.v4.f32 {%f4, %f5, %f6, %f7}, [%rd8];");
 
         for (int i = 0; i < ElementsPerThread; i++)
         {

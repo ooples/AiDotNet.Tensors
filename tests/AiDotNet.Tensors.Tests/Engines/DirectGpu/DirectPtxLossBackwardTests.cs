@@ -27,7 +27,7 @@ public class DirectPtxLossBackwardTests
 
         // gradOutput[0] is a broadcast scalar, so it is read ONCE and doubled
         // once, outside the per-element work.
-        Assert.Equal(1, Count(ptx, "ld.global.ca.f32 %f12, [%rd0];"));
+        Assert.Equal(1, Count(ptx, "ld.global.nc.f32 %f12, [%rd0];"));
         Assert.Equal(1, Count(ptx, "mul.rn.f32 %f12, %f12, 0f40000000;"));
 
         // Per element: subtract, multiply by the hoisted (g*2), then by invN -
@@ -101,7 +101,7 @@ public class DirectPtxLossBackwardTests
                  })
         {
             string ptx = PtxFusedLossBackwardF32Kernel.EmitPtx(8, 6, op, 262_144);
-            Assert.Equal(2, Count(ptx, "ld.global.ca.v4.f32"));  // predictions, targets
+            Assert.Equal(2, Count(ptx, "ld.global.nc.v4.f32"));  // predictions, targets
             Assert.Equal(1, Count(ptx, "st.global.v4.f32"));
             Assert.DoesNotContain("bra", ptx, StringComparison.Ordinal);
         }
