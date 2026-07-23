@@ -253,6 +253,25 @@ public static class PtxParityRegistry
             "one module per element count; PTX has no pow, so pow(10,db/10) is ex2.approx of db*log2(10)/10 with " +
             "refValue per-launch .param .f32. Its spec is TOLERANCE-based, not bit-exact. Converts to " +
             "ThreeWayParity (with tolerance) when the SM86 run lands; until then unpromoted and fail-closed."),
+
+        new PtxParitySpec("PtxStftMagPhaseF32Kernel", PtxParityStatus.Deferred,
+            "direct windowed STFT magnitude/phase, fp32 (#850) - CudaBackend.StftMagPhase",
+            "one module per (batch,Lp,nFft,hop,numFrames,numFreqs); each thread evaluates a windowed length-nFft " +
+            "DFT for one output bin with cos.approx/sin.approx twiddles and fma accumulation, then emits " +
+            "sqrt(re^2+im^2) and a minimax atan2 phase. Its spec is TOLERANCE-based, not bit-exact. Converts to " +
+            "ThreeWayParity (with tolerance) when the SM86 fp64-oracle run lands; until then unpromoted."),
+        new PtxParitySpec("PtxBuildSpectrumF32Kernel", PtxParityStatus.Deferred,
+            "magnitude/phase to Hermitian spectrum, fp32 (#850) - CudaBackend.BuildSpectrum",
+            "one module per (batch,numFreqs,numFrames,nFft); each thread zeroes the nFft bins, fills the first " +
+            "numFreqs from cos.approx/sin.approx polar reconstruction, then mirrors by conjugate symmetry. Its " +
+            "spec is TOLERANCE-based, not bit-exact. Converts to ThreeWayParity (with tolerance) when the SM86 " +
+            "run lands; until then unpromoted and fail-closed."),
+        new PtxParitySpec("PtxPhaseVocoderF32Kernel", PtxParityStatus.Deferred,
+            "phase-vocoder time scaling, fp32 (#850) - CudaBackend.PhaseVocoder",
+            "one module per (leading,nFramesV,nFreqV,outFrames); each thread resamples one frequency channel " +
+            "along time by a rate .param .f32, lerping the magnitude and accumulating the cvt.rni-wrapped phase " +
+            "advance. Its spec is TOLERANCE-based, not bit-exact. Converts to ThreeWayParity (with tolerance) " +
+            "when the SM86 run lands; until then unpromoted and fail-closed."),
     };
 
     private static readonly Dictionary<string, PtxParitySpec> ByKernel =

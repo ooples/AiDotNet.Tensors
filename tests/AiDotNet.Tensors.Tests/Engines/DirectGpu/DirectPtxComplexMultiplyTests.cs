@@ -66,6 +66,7 @@ public class DirectPtxComplexMultiplyTests
                 "CudaBackend.ApplyWindow",
                 "CudaBackend.BatchedFFT",
                 "CudaBackend.BatchedFFT2D",
+                "CudaBackend.BuildSpectrum",
                 "CudaBackend.ComplexConjugate",
                 "CudaBackend.ComplexMagnitude",
                 "CudaBackend.ComplexMultiply",
@@ -76,6 +77,7 @@ public class DirectPtxComplexMultiplyTests
                 "CudaBackend.IRFFT",
                 "CudaBackend.InterleaveComplex",
                 "CudaBackend.IstftFromSpectrum",
+                "CudaBackend.PhaseVocoder",
                 "CudaBackend.PowerToDb",
                 "CudaBackend.RFFT",
                 "CudaBackend.SplitComplexAdd",
@@ -87,6 +89,7 @@ public class DirectPtxComplexMultiplyTests
                 "CudaBackend.SplitComplexMultiply",
                 "CudaBackend.SplitComplexPhase",
                 "CudaBackend.SplitComplexScale",
+                "CudaBackend.StftMagPhase",
             },
             DirectPtxSpectralCoverageManifest.All
                 .Where(cell => cell.Status == DirectPtxSpectralCoverageStatus.ExperimentalDirectPtx)
@@ -1526,6 +1529,232 @@ public class DirectPtxComplexMultiplyTests
         {
             Assert.True(Math.Abs(actualDb[i] - expectedDb[i]) <= 1e-2 * (1 + Math.Abs(expectedDb[i])));
             Assert.True(Math.Abs(recovered[i] - power[i]) <= 1e-2 * (1 + power[i]));   // round trip
+        }
+    }
+
+    [Fact]
+    public void BuildSpectrumEmitter_IsThreeLoopHermitian()
+    {
+        string ptx = PtxBuildSpectrumF32Kernel.EmitPtx(8, 6, 4, 257, 8, 512);   // batch=4,numFreqs=257,numFrames=8,nFft=512
+        Assert.Contains("exact-shape batch=4 numFreqs=257 numFrames=8 nFft=512 block=256 op=build-spectrum", ptx);
+        Assert.Contains("$BS_ZERO:", ptx);
+        Assert.Contains("$BS_FILL_LOOP:", ptx);
+        Assert.Contains("$BS_MIRROR_LOOP:", ptx);
+        Assert.Contains("cos.approx.f32", ptx);
+        Assert.Contains("sin.approx.f32", ptx);
+        Assert.Equal(1, Count(ptx, "neg.f32"));   // conjugate mirror
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxBuildSpectrumF32Kernel.IsSupportedShape(4, 257, 8, 512));
+        Assert.False(PtxBuildSpectrumF32Kernel.IsSupportedShape(4, 400, 8, 512));   // numFreqs > nFft/2+1
+        Assert.False(PtxBuildSpectrumF32Kernel.IsPromotedShape(4, 257, 8, 512));
+    }
+
+    [Fact]
+    public void StftMagPhaseEmitter_IsWindowedDftWithAtan2()
+    {
+        string ptx = PtxStftMagPhaseF32Kernel.EmitPtx(8, 6, 4, 1408, 512, 128, 8, 257);
+        Assert.Contains("op=stft-mag-phase", ptx);
+        Assert.Contains("$STFT_LOOP:", ptx);
+        Assert.Contains("cos.approx.f32", ptx);
+        Assert.Contains("sin.approx.f32", ptx);
+        Assert.Contains("sqrt.rn.f32", ptx);
+        Assert.Contains("rcp.approx.f32", ptx);   // atan2 minimax
+        Assert.Equal(2, Count(ptx, "fma.rn.f32 %f0, %f5, %f8, %f0") + Count(ptx, "fma.rn.f32 %f1, %f5, %f9, %f1"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxStftMagPhaseF32Kernel.IsSupportedShape(4, 1408, 512, 128, 8, 257));
+        Assert.False(PtxStftMagPhaseF32Kernel.IsSupportedShape(4, 100, 512, 128, 8, 257));   // Lp too small
+        Assert.False(PtxStftMagPhaseF32Kernel.IsPromotedShape(4, 1408, 512, 128, 8, 257));
+    }
+
+    [Fact]
+    public void PhaseVocoderEmitter_IsLerpWithWrappedPhase()
+    {
+        string ptx = PtxPhaseVocoderF32Kernel.EmitPtx(8, 6, 4, 8, 257, 12);   // leading=4,nFramesV=8,nFreqV=257,outFrames=12
+        Assert.Contains("op=phase-vocoder", ptx);
+        Assert.Contains("$PV_LOOP:", ptx);
+        Assert.Contains("ld.param.f32 %f0, [rate_val]", ptx);
+        Assert.Contains("cvt.rmi.s32.f32", ptx);   // floor(t*rate)
+        Assert.Contains("cvt.rni.f32.f32", ptx);   // round(dp/2pi)
+        Assert.Contains("min.s32 %r9", ptx);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxPhaseVocoderF32Kernel.IsSupportedShape(4, 8, 257, 12));
+        Assert.False(PtxPhaseVocoderF32Kernel.IsSupportedShape(4, 1, 257, 12));   // nFramesV < 2
+        Assert.False(PtxPhaseVocoderF32Kernel.IsPromotedShape(4, 8, 257, 12));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyBuildSpectrum_MatchesDoubleOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedComplexUnary(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The candidate is admitted only on SM86.");
+        const int batch = 4, numFreqs = 257, numFrames = 8, nFft = 512;
+        using var kernel = new PtxBuildSpectrumF32Kernel(runtime, batch, numFreqs, numFrames, nFft);
+        var mag = new float[batch * numFreqs * numFrames];
+        var phase = new float[batch * numFreqs * numFrames];
+        var random = RandomHelper.CreateSeededRandom(20270201);
+        for (int i = 0; i < mag.Length; i++) { mag[i] = (float)random.NextDouble(); phase[i] = (float)(random.NextDouble() * 2 * Math.PI - Math.PI); }
+
+        var expRe = new double[batch * numFrames * nFft];
+        var expIm = new double[batch * numFrames * nFft];
+        for (int b = 0; b < batch; b++)
+            for (int frame = 0; frame < numFrames; frame++)
+            {
+                int specOff = (b * numFrames + frame) * nFft;
+                for (int k = 0; k < numFreqs; k++)
+                {
+                    double m = mag[b * numFreqs * numFrames + k * numFrames + frame];
+                    double p = phase[b * numFreqs * numFrames + k * numFrames + frame];
+                    expRe[specOff + k] = m * Math.Cos(p); expIm[specOff + k] = m * Math.Sin(p);
+                }
+                for (int k = 1; k < numFreqs - 1; k++)
+                {
+                    int dst = nFft - k;
+                    expRe[specOff + dst] = expRe[specOff + k]; expIm[specOff + dst] = -expIm[specOff + k];
+                }
+            }
+
+        using var magB = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var phB = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var reB = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        using var imB = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
+        magB.Upload<float>(mag); phB.Upload<float>(phase);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(magB, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(phB, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(reB, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(imB, kernel.Blueprint.Tensors[3]));
+        runtime.Synchronize();
+        var actRe = new float[batch * numFrames * nFft];
+        var actIm = new float[batch * numFrames * nFft];
+        reB.Download<float>(actRe); imB.Download<float>(actIm);
+        for (int i = 0; i < actRe.Length; i++)
+        {
+            Assert.True(Math.Abs(actRe[i] - expRe[i]) <= 2e-4 * (1 + Math.Abs(expRe[i])));
+            Assert.True(Math.Abs(actIm[i] - expIm[i]) <= 2e-4 * (1 + Math.Abs(expIm[i])));
+        }
+    }
+
+    [SkippableFact]
+    public void DriverOnlyStftMagPhase_MatchesDoubleOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedComplexUnary(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The candidate is admitted only on SM86.");
+        const int batch = 2, nFft = 256, hop = 128, numFrames = 6, numFreqs = 129;
+        int lp = (numFrames - 1) * hop + nFft;
+        using var kernel = new PtxStftMagPhaseF32Kernel(runtime, batch, lp, nFft, hop, numFrames, numFreqs);
+        var padded = new float[batch * lp];
+        var window = new float[nFft];
+        var random = RandomHelper.CreateSeededRandom(20270202);
+        for (int i = 0; i < padded.Length; i++) padded[i] = (float)(random.NextDouble() * 2 - 1);
+        for (int i = 0; i < nFft; i++) window[i] = (float)(0.5 - 0.5 * Math.Cos(2.0 * Math.PI * i / nFft));
+
+        var expMag = new double[batch * numFreqs * numFrames];
+        var expPhase = new double[batch * numFreqs * numFrames];
+        for (int b = 0; b < batch; b++)
+            for (int k = 0; k < numFreqs; k++)
+                for (int frame = 0; frame < numFrames; frame++)
+                {
+                    double re = 0, im = 0, bk = -2.0 * Math.PI * k / nFft;
+                    for (int i = 0; i < nFft; i++)
+                    {
+                        double x = padded[b * lp + frame * hop + i] * window[i];
+                        re += x * Math.Cos(bk * i); im += x * Math.Sin(bk * i);
+                    }
+                    int outOff = b * numFreqs * numFrames + k * numFrames + frame;
+                    expMag[outOff] = Math.Sqrt(re * re + im * im); expPhase[outOff] = Math.Atan2(im, re);
+                }
+
+        using var pB = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var wB = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var mB = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        using var phB = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
+        pB.Upload<float>(padded); wB.Upload<float>(window);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(pB, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(wB, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(mB, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(phB, kernel.Blueprint.Tensors[3]));
+        runtime.Synchronize();
+        var actMag = new float[batch * numFreqs * numFrames];
+        var actPhase = new float[batch * numFreqs * numFrames];
+        mB.Download<float>(actMag); phB.Download<float>(actPhase);
+        for (int i = 0; i < actMag.Length; i++)
+        {
+            Assert.True(Math.Abs(actMag[i] - expMag[i]) <= 1e-2 * (1 + Math.Abs(expMag[i])));
+            if (expMag[i] > 1e-3)   // phase is meaningless where magnitude vanishes
+            {
+                double d = Math.Abs(actPhase[i] - expPhase[i]);
+                d = Math.Min(d, Math.Abs(d - 2 * Math.PI));   // wrap-around
+                Assert.True(d <= 2e-3);
+            }
+        }
+    }
+
+    [SkippableFact]
+    public void DriverOnlyPhaseVocoder_MatchesDoubleOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedComplexUnary(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The candidate is admitted only on SM86.");
+        const int leading = 4, nFramesV = 8, nFreqV = 257, outFrames = 12;
+        const float rate = 0.6f;
+        using var kernel = new PtxPhaseVocoderF32Kernel(runtime, leading, nFramesV, nFreqV, outFrames);
+        var mag = new float[leading * nFramesV * nFreqV];
+        var phase = new float[leading * nFramesV * nFreqV];
+        var random = RandomHelper.CreateSeededRandom(20270203);
+        for (int i = 0; i < mag.Length; i++) { mag[i] = (float)random.NextDouble(); phase[i] = (float)(random.NextDouble() * 2 * Math.PI - Math.PI); }
+
+        var expMag = new double[leading * outFrames * nFreqV];
+        var expPhase = new double[leading * outFrames * nFreqV];
+        int stride = nFramesV * nFreqV, outStride = outFrames * nFreqV;
+        for (int b = 0; b < leading; b++)
+            for (int f = 0; f < nFreqV; f++)
+            {
+                double acc = 0;
+                for (int t = 0; t < outFrames; t++)
+                {
+                    double srcT = t * (double)rate;
+                    int t0 = (int)Math.Floor(srcT);
+                    int t1 = Math.Min(t0 + 1, nFramesV - 1);
+                    double frac = srcT - t0;
+                    double m0 = mag[b * stride + t0 * nFreqV + f], m1 = mag[b * stride + t1 * nFreqV + f];
+                    expMag[b * outStride + t * nFreqV + f] = (1 - frac) * m0 + frac * m1;
+                    double dp = 0;
+                    if (t0 + 1 < nFramesV)
+                    {
+                        dp = phase[b * stride + (t0 + 1) * nFreqV + f] - phase[b * stride + t0 * nFreqV + f];
+                        dp -= 2 * Math.PI * Math.Round(dp / (2 * Math.PI));
+                    }
+                    acc += dp; expPhase[b * outStride + t * nFreqV + f] = acc;
+                }
+            }
+
+        using var magB = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var phB = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var nmB = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        using var npB = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
+        magB.Upload<float>(mag); phB.Upload<float>(phase);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(magB, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(phB, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(nmB, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(npB, kernel.Blueprint.Tensors[3]), rate);
+        runtime.Synchronize();
+        var actMag = new float[leading * outFrames * nFreqV];
+        var actPhase = new float[leading * outFrames * nFreqV];
+        nmB.Download<float>(actMag); npB.Download<float>(actPhase);
+        for (int i = 0; i < actMag.Length; i++)
+        {
+            Assert.True(Math.Abs(actMag[i] - expMag[i]) <= 1e-3 * (1 + Math.Abs(expMag[i])));
+            Assert.True(Math.Abs(actPhase[i] - expPhase[i]) <= 1e-2 * (1 + Math.Abs(expPhase[i])));
         }
     }
 
