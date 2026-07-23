@@ -6,6 +6,7 @@ using System.Security.Cryptography;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+using AiDotNet.Tensors.Engines.Optimization;
 using AiDotNet.Tensors.NumericOperations;
 using Xunit;
 
@@ -404,6 +405,91 @@ public sealed class DirectPtxNormalizationCorrectnessTests
     }
 
     [SkippableFact]
+    public void FusedBackwardWorkspace_ReplaysWithoutAllocationOrStaleAccumulators()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previousGate = DirectPtxFeatureGate.TestOverride;
+        bool previousExperiment = DirectPtxFeatureGate.NormalizationExperimentOverride;
+        TensorCodecOptions previousOptions = TensorCodecOptions.Current;
+        DirectPtxFeatureGate.TestOverride = true;
+        DirectPtxFeatureGate.NormalizationExperimentOverride = true;
+        TensorCodecOptions.SetCurrent(new TensorCodecOptions { Deterministic = false });
+        try
+        {
+            const int rows = 8_192;
+            int elements = rows * Width;
+            float[] inputHost = Values(elements, 37, 0.03125f);
+            float[] gradHost = Values(elements, 41, 0.00390625f);
+            float[] gammaHost = Values(Width, 29, 0.015625f, 1f);
+            float[] meanHost = Values(rows, 43, 0.015625f);
+            float[] invStdHost = Enumerable.Repeat(1.125f, rows).ToArray();
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxNormalizationEnabled,
+                "Requires the validated SM86 normalization backend.");
+            using var input = backend.AllocateBuffer(inputHost);
+            using var gradOutput = backend.AllocateBuffer(gradHost);
+            using var gamma = backend.AllocateBuffer(gammaHost);
+            using var mean = backend.AllocateBuffer(meanHost);
+            using var invStd = backend.AllocateBuffer(invStdHost);
+            using var gradInput = backend.AllocateBuffer(elements);
+            using var gradGamma = backend.AllocateBuffer(Width);
+            using var gradBeta = backend.AllocateBuffer(Width);
+
+            Assert.True(backend.PrewarmDirectPtxRowNormalization(
+                DirectPtxRowNormalizationOperation.LayerNormBackwardFusedAtomic,
+                rows, Epsilon), backend.DirectPtxLastError);
+            Assert.True(backend.TryDirectPtxLayerNormBackwardD64(
+                gradOutput, input, gamma, mean, invStd,
+                gradInput, gradGamma, gradBeta, rows, Epsilon),
+                backend.DirectPtxLastError);
+            backend.Synchronize();
+            float[] expectedGamma = backend.DownloadBuffer(gradGamma);
+            float[] expectedBeta = backend.DownloadBuffer(gradBeta);
+
+            long allocationBefore = PtxCompat.GetAllocatedBytesForCurrentThread();
+            bool everyLaunchSucceeded = true;
+            for (int i = 0; i < 32; i++)
+                everyLaunchSucceeded &= backend.TryDirectPtxLayerNormBackwardD64(
+                    gradOutput, input, gamma, mean, invStd,
+                    gradInput, gradGamma, gradBeta, rows, Epsilon);
+            long allocated = PtxCompat.GetAllocatedBytesForCurrentThread() - allocationBefore;
+            backend.Synchronize();
+            Assert.True(everyLaunchSucceeded, backend.DirectPtxLastError);
+            Assert.Equal(0, allocated);
+            AssertClose(backend.DownloadBuffer(gradGamma), expectedGamma, 4e-3f,
+                "reused workspace grad gamma");
+            AssertClose(backend.DownloadBuffer(gradBeta), expectedBeta, 4e-3f,
+                "reused workspace grad beta");
+
+            IntPtr graph = backend.CaptureGraph(() =>
+                Assert.True(backend.TryDirectPtxLayerNormBackwardD64(
+                    gradOutput, input, gamma, mean, invStd,
+                    gradInput, gradGamma, gradBeta, rows, Epsilon),
+                    backend.DirectPtxLastError));
+            try
+            {
+                backend.LaunchCapturedGraph(graph);
+                backend.LaunchCapturedGraph(graph);
+                backend.Synchronize();
+                AssertClose(backend.DownloadBuffer(gradGamma), expectedGamma, 4e-3f,
+                    "graph workspace grad gamma");
+                AssertClose(backend.DownloadBuffer(gradBeta), expectedBeta, 4e-3f,
+                    "graph workspace grad beta");
+            }
+            finally
+            {
+                backend.DestroyCapturedGraph(graph);
+            }
+        }
+        finally
+        {
+            TensorCodecOptions.SetCurrent(previousOptions);
+            DirectPtxFeatureGate.TestOverride = previousGate;
+            DirectPtxFeatureGate.NormalizationExperimentOverride = previousExperiment;
+        }
+    }
+
+    [SkippableFact]
     public void ChannelBackend_AdmissionTransactionCacheCaptureAndAllocationContractsHold()
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
@@ -597,8 +683,10 @@ public sealed class DirectPtxNormalizationCorrectnessTests
         using (var kernel = new PtxRowNormalizationD64Kernel(
                    runtime, DirectPtxRowNormalizationOperation.ReduceNormL2Atomic, Rows))
         {
-            object[] result = Run(runtime, kernel.Blueprint, views => kernel.Launch(views),
-                input, new float[1]);
+            object[] result = Run(runtime, kernel.Blueprint, views =>
+                { kernel.Launch(views); kernel.Launch(views); },
+                input, new float[1],
+                new float[PtxRowNormalizationD64Kernel.NormalizationWorkspaceElements]);
             AssertClose((float[])result[1], [(float)totalSquares], 5e-2f,
                 "atomic whole-tensor sum of squares");
         }
@@ -677,9 +765,11 @@ public sealed class DirectPtxNormalizationCorrectnessTests
         using (var kernel = new PtxRowNormalizationD64Kernel(
                    runtime, DirectPtxRowNormalizationOperation.LayerNormBackwardFusedAtomic, Rows))
         {
-            object[] result = Run(runtime, kernel.Blueprint, views => kernel.Launch(views),
+            object[] result = Run(runtime, kernel.Blueprint, views =>
+                { kernel.Launch(views); kernel.Launch(views); },
                 gradOutput, input, gamma, mean, invStd, null,
-                new float[Width], new float[Width]);
+                new float[Width], new float[Width],
+                new float[PtxRowNormalizationD64Kernel.NormalizationWorkspaceElements]);
             AssertClose((float[])result[5], layerGradInput, 8e-4f,
                 "fused LayerNorm grad input");
             AssertClose((float[])result[6], layerGradGamma, 4e-3f,
@@ -712,8 +802,10 @@ public sealed class DirectPtxNormalizationCorrectnessTests
         using (var kernel = new PtxRowNormalizationD64Kernel(
                    runtime, DirectPtxRowNormalizationOperation.RmsNormBackwardFusedAtomic, Rows))
         {
-            object[] result = Run(runtime, kernel.Blueprint, views => kernel.Launch(views),
-                gradOutput, input, gamma, rms, null, new float[Width]);
+            object[] result = Run(runtime, kernel.Blueprint, views =>
+                { kernel.Launch(views); kernel.Launch(views); },
+                gradOutput, input, gamma, rms, null, new float[Width],
+                new float[PtxRowNormalizationD64Kernel.NormalizationWorkspaceElements]);
             AssertClose((float[])result[4], rmsGradInput, 8e-4f,
                 "fused RMSNorm grad input");
             AssertClose((float[])result[5], rmsGradGamma, 4e-3f,

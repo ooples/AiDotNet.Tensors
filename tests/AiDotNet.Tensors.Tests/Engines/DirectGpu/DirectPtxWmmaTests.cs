@@ -3243,10 +3243,38 @@ public class DirectPtxWmmaTests
         {
             using var kernel = new PtxRowNormalizationD64Kernel(runtime, operation, 256);
             Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
-            Assert.Equal(
-                operation == DirectPtxRowNormalizationOperation.ReduceNormL2 ? 32 : 0,
-                kernel.Audit.Function.StaticSharedBytes);
-            Assert.True(kernel.Audit.ActiveBlocksPerMultiprocessor >= 4);
+            int expectedSharedBytes = operation switch
+            {
+                DirectPtxRowNormalizationOperation.LayerNormBackwardFusedAtomic =>
+                    PtxRowNormalizationD64Kernel.FusedBackwardLayerSharedBytes,
+                DirectPtxRowNormalizationOperation.RmsNormBackwardFusedAtomic =>
+                    PtxRowNormalizationD64Kernel.FusedBackwardRmsSharedBytes,
+                DirectPtxRowNormalizationOperation.LayerNormGradParameters or
+                    DirectPtxRowNormalizationOperation.Fp16LayerNormGradParameters or
+                    DirectPtxRowNormalizationOperation.RmsNormGradGamma or
+                    DirectPtxRowNormalizationOperation.LayerNormGradParametersAtomic or
+                    DirectPtxRowNormalizationOperation.RmsNormGradGammaAtomic =>
+                    PtxRowNormalizationD64Kernel.ParameterSharedBytes,
+                DirectPtxRowNormalizationOperation.ReduceNormL2 or
+                    DirectPtxRowNormalizationOperation.ReduceNormL2Atomic =>
+                    PtxRowNormalizationD64Kernel.ReductionSharedBytes,
+                _ => 0
+            };
+            Assert.Equal(expectedSharedBytes, kernel.Audit.Function.StaticSharedBytes);
+            int expectedMinimumBlocks = operation switch
+            {
+                DirectPtxRowNormalizationOperation.LayerNormBackwardFusedAtomic => 1,
+                DirectPtxRowNormalizationOperation.RmsNormBackwardFusedAtomic => 2,
+                DirectPtxRowNormalizationOperation.LayerNormGradParameters or
+                    DirectPtxRowNormalizationOperation.Fp16LayerNormGradParameters or
+                    DirectPtxRowNormalizationOperation.RmsNormGradGamma or
+                    DirectPtxRowNormalizationOperation.LayerNormGradParametersAtomic or
+                    DirectPtxRowNormalizationOperation.RmsNormGradGammaAtomic or
+                    DirectPtxRowNormalizationOperation.ReduceNormL2 or
+                    DirectPtxRowNormalizationOperation.ReduceNormL2Atomic => 3,
+                _ => 4
+            };
+            Assert.True(kernel.Audit.ActiveBlocksPerMultiprocessor >= expectedMinimumBlocks);
             Assert.Equal(64, kernel.Audit.PtxSha256.Length);
         }
 
@@ -3255,7 +3283,11 @@ public class DirectPtxWmmaTests
         {
             using var kernel = new PtxChannelNormalizationD64Kernel(runtime, operation);
             Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
-            Assert.Equal(0, kernel.Audit.Function.StaticSharedBytes);
+            Assert.Equal(
+                operation is DirectPtxChannelNormalizationOperation.GroupNormGradParameters or
+                    DirectPtxChannelNormalizationOperation.InstanceNormGradParameters
+                    ? PtxChannelNormalizationD64Kernel.ParameterSharedBytes : 0,
+                kernel.Audit.Function.StaticSharedBytes);
             Assert.True(kernel.Audit.ActiveBlocksPerMultiprocessor >= 3);
             Assert.Equal(64, kernel.Audit.PtxSha256.Length);
         }

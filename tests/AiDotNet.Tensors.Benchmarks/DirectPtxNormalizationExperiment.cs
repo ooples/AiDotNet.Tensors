@@ -150,6 +150,8 @@ internal static class DirectPtxNormalizationExperiment
                 secondaryAuditOperation: rows == 8_192
                     ? null
                     : DirectPtxRowNormalizationOperation.LayerNormGradParameters,
+                directTemporaryBytes: rows == 8_192
+                    ? PtxRowNormalizationD64Kernel.NormalizationWorkspaceBytes : 0,
                 dispatchesPerAction: rows == 8_192 ? 1 : 2);
         }
 
@@ -188,6 +190,8 @@ internal static class DirectPtxNormalizationExperiment
                 secondaryAuditOperation: rows == 8_192
                     ? null
                     : DirectPtxRowNormalizationOperation.RmsNormGradGamma,
+                directTemporaryBytes: rows == 8_192
+                    ? PtxRowNormalizationD64Kernel.NormalizationWorkspaceBytes : 0,
                 dispatchesPerAction: rows == 8_192 ? 1 : 2);
         }
 

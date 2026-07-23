@@ -45,6 +45,9 @@ public sealed partial class CudaBackend
     private readonly DirectPtxKernelCache<DirectPtxFusedLinearKey, PtxFusedLinearGeluW8A8M1Kernel>
         _directPtxQuantizedLinearKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private DirectPtxRuntime? _directPtxRuntime;
+    // Allocated once during normalization prewarm and reused by stream-ordered
+    // fused reductions. Its address stays stable across CUDA graph replays.
+    private IGpuBuffer? _directPtxNormalizationWorkspace;
     // A captured CUDA graph retains CUfunction handles. Track every cache pin
     // acquired while recording so destroying/updating the graph can release the
     // corresponding module references instead of exhausting the bounded LRUs.
@@ -3261,18 +3264,29 @@ public sealed partial class CudaBackend
 
         try
         {
-            Span<DirectPtxTensorView> views = stackalloc DirectPtxTensorView[8];
-            int count = PrepareDirectPtxRowViews(
-                operation, rows, views, tensor0, tensor1,
-                tensor2, tensor3, tensor4, tensor5, tensor6, tensor7);
-            Span<DirectPtxTensorView> admitted = views.Slice(0, count);
-
             bool capturing = IsStreamCapturing();
             EnsureContextCurrent();
             var key = new DirectPtxRowNormalizationKey(
                 operation, rows, PtxCompat.SingleToInt32Bits(epsilon));
             lock (_directPtxLock)
             {
+                IGpuBuffer? workspace = null;
+                if (PtxRowNormalizationD64Kernel.RequiresPersistentWorkspace(operation))
+                {
+                    if (_directPtxNormalizationWorkspace == null && capturing)
+                    {
+                        DirectPtxLastError =
+                            "Direct PTX normalization workspace must be prewarmed before CUDA graph capture.";
+                        return false;
+                    }
+                    workspace = EnsureDirectPtxNormalizationWorkspaceSlow();
+                }
+                Span<DirectPtxTensorView> views = stackalloc DirectPtxTensorView[9];
+                int count = PrepareDirectPtxRowViews(
+                    operation, rows, views, tensor0, tensor1,
+                    tensor2, tensor3, tensor4, tensor5, tensor6, tensor7, workspace);
+                Span<DirectPtxTensorView> admitted = views.Slice(0, count);
+
                 if (!_directPtxRowNormalizationKernels.TryGetValue(key, out var kernel))
                 {
                     if (capturing)
@@ -3289,14 +3303,6 @@ public sealed partial class CudaBackend
                         "Could not pin the direct-PTX normalization module for CUDA graph capture.");
                 lock (GpuDispatchLock)
                 {
-                    if (operation == DirectPtxRowNormalizationOperation.ReduceNormL2Atomic)
-                        ClearDirectPtxWriteOutputs(admitted);
-                    else if (operation ==
-                             DirectPtxRowNormalizationOperation.LayerNormBackwardFusedAtomic)
-                        ClearDirectPtxWriteOutputs(admitted.Slice(6, 2));
-                    else if (operation ==
-                             DirectPtxRowNormalizationOperation.RmsNormBackwardFusedAtomic)
-                        ClearDirectPtxWriteOutputs(admitted.Slice(5, 1));
                     kernel.LaunchPrevalidated(admitted);
                 }
             }
@@ -3355,17 +3361,22 @@ public sealed partial class CudaBackend
         IGpuBuffer? tensor4,
         IGpuBuffer? tensor5,
         IGpuBuffer? tensor6 = null,
-        IGpuBuffer? tensor7 = null)
+        IGpuBuffer? tensor7 = null,
+        IGpuBuffer? tensor8 = null)
     {
         DirectPtxKernelBlueprint blueprint =
             PtxRowNormalizationD64Kernel.CreateBlueprint(
                 DirectPtxArchitectureFamily.Ampere, operation, rows);
         int count = blueprint.Tensors.Count;
+        bool hasWorkspace =
+            PtxRowNormalizationD64Kernel.RequiresPersistentWorkspace(operation);
         views[0] = DirectPtxTensorView.Create(tensor0, blueprint.Tensors[0]);
         views[1] = DirectPtxTensorView.Create(tensor1, blueprint.Tensors[1]);
         if (count > 2)
             views[2] = DirectPtxTensorView.Create(
-                tensor2 ?? throw new ArgumentNullException(nameof(tensor2)), blueprint.Tensors[2]);
+                (hasWorkspace && count == 3 ? tensor8 : tensor2) ??
+                    throw new ArgumentNullException(hasWorkspace && count == 3
+                        ? nameof(tensor8) : nameof(tensor2)), blueprint.Tensors[2]);
         if (count > 3)
             views[3] = DirectPtxTensorView.Create(
                 tensor3 ?? throw new ArgumentNullException(nameof(tensor3)), blueprint.Tensors[3]);
@@ -3377,10 +3388,15 @@ public sealed partial class CudaBackend
                 tensor5 ?? throw new ArgumentNullException(nameof(tensor5)), blueprint.Tensors[5]);
         if (count > 6)
             views[6] = DirectPtxTensorView.Create(
-                tensor6 ?? throw new ArgumentNullException(nameof(tensor6)), blueprint.Tensors[6]);
+                (hasWorkspace && count == 7 ? tensor8 : tensor6) ??
+                    throw new ArgumentNullException(hasWorkspace && count == 7
+                        ? nameof(tensor8) : nameof(tensor6)), blueprint.Tensors[6]);
         if (count > 7)
             views[7] = DirectPtxTensorView.Create(
                 tensor7 ?? throw new ArgumentNullException(nameof(tensor7)), blueprint.Tensors[7]);
+        if (count > 8)
+            views[8] = DirectPtxTensorView.Create(
+                tensor8 ?? throw new ArgumentNullException(nameof(tensor8)), blueprint.Tensors[8]);
         PtxRowNormalizationD64Kernel.ValidateTensors(
             blueprint, views.Slice(0, count),
             PtxRowNormalizationD64Kernel.GetEntryPoint(operation));
@@ -3419,6 +3435,8 @@ public sealed partial class CudaBackend
                 _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                 if (!_directPtxRowNormalizationKernels.TryGetValue(key, out _))
                     _ = CreateAndCacheRowNormalizationKernelSlow(key);
+                if (PtxRowNormalizationD64Kernel.RequiresPersistentWorkspace(operation))
+                    _ = EnsureDirectPtxNormalizationWorkspaceSlow();
             }
             DirectPtxLastError = null;
             return true;
@@ -3429,6 +3447,10 @@ public sealed partial class CudaBackend
             return false;
         }
     }
+
+    private IGpuBuffer EnsureDirectPtxNormalizationWorkspaceSlow() =>
+        _directPtxNormalizationWorkspace ??= AllocateBuffer(
+            PtxRowNormalizationD64Kernel.NormalizationWorkspaceElements);
 
     internal bool TryGetDirectPtxRowNormalizationAudit(
         DirectPtxRowNormalizationOperation operation,
@@ -3562,6 +3584,8 @@ public sealed partial class CudaBackend
             _directPtxMixedLinearKernels.Dispose();
             _directPtxMixedLinearM16Kernels.Dispose();
             _directPtxQuantizedLinearKernels.Dispose();
+            _directPtxNormalizationWorkspace?.Dispose();
+            _directPtxNormalizationWorkspace = null;
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }

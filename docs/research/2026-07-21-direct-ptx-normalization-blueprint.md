@@ -24,11 +24,11 @@ Passing PTX directly to `cuModuleLoadDataEx` is restricted to an explicit
 normalization experiment when the linker entry points are unavailable.
 
 No new normalization cell is promoted by this pull request. Correctness,
-allocation, graph capture, artifact identity, runtime resource, and SASS
-safety gates pass. The new backward and whole-tensor reduction experiments
-beat current AiDotNet but fail the required median and tail comparison against
-compiled PyTorch. The production admission table therefore remains
-fail-closed.
+allocation, repeated graph replay, artifact identity, runtime resource, and
+SASS safety gates pass. The latest backward kernels replace destination
+memsets with a backend-persistent 516-byte accumulator/counter workspace, but
+the required clean three-run comparison against compiled PyTorch is still
+pending. The production admission table therefore remains fail-closed.
 
 ## Ten-stage production binary pipeline
 
@@ -59,11 +59,11 @@ specializations is allowed only when the cubin filename and hash also match.
 | 3 | Shared memory only for reuse | Backward parameter partials are folded in 16 KiB (LayerNorm) or 5 KiB (RMSNorm); L2 uses a 64-byte warp fold. Single-use row inputs are not pointlessly staged. **Pass.** |
 | 4 | Register-resident math | Loaded row values, statistics, affine terms, reductions, and grad-input epilogues remain in registers until final stores. Final SASS has zero local loads/stores. **Pass.** |
 | 5 | Combined/fused kernels | The large-shape experimental backward paths compute grad-input plus parameter partials in one input pass and one dispatch. Existing residual+BatchNorm+ReLU is also truly fused. **Mechanically pass; performance HOLD.** |
-| 6 | Bounded global reductions | Parameter folds issue one atomic per block/output; the L2 experiment uses a 512-thread, at-most-512-block grid. No output-sized scratch is allocated. **Correctness pass; performance HOLD.** |
-| 7 | Asynchronous stream ordering | Launches and output clears use the backend stream with no host synchronization; `cuMemsetD8Async` is graph ordered. `cp.async` is required only for reusable tiles and is inapplicable to these single-use D=64 loads. **Pass.** |
+| 6 | Bounded global reductions | Fused backward folds issue one atomic per block/output into a reusable 128-float accumulator, plus one completion atomic per block. L2 uses a 512-thread, at-most-128-block partial grid. The complete shared workspace is 516 bytes; no output-sized scratch exists. **Correctness pass; performance HOLD.** |
+| 7 | Asynchronous stream ordering | Launches use the backend stream with no host synchronization. Fused backward/L2 no longer clear outputs; their prewarmed workspace self-resets inside the kernel. `cp.async` is required only for reusable tiles and is inapplicable to these single-use D=64 loads. **Pass.** |
 | 8 | CUDA Graph/lifetime safety | Plans are prewarmed and modules pinned for capture lifetime; compilation, tuning, file I/O, and cache misses are rejected during capture. **Pass.** |
 | 9 | Ahead-of-load binary control | PTX is linked to cubin, hashed, embedded, loaded, disassembled to SASS, resource-audited, and content-addressed cached. Raw PTX load is experiment-only. **Pass.** |
-| 10 | Promotion evidence | Three independent corrected PyTorch comparisons, correctness/determinism, zero hot allocation/temp, resource, and tail gates must all pass. **HOLD:** backward/L2 medians or p95s still lose. |
+| 10 | Promotion evidence | Three independent corrected PyTorch comparisons, correctness/determinism, zero hot allocation, bounded workspace, resource, and tail gates must all pass. **HOLD:** the newest topology lacks an uncontended three-run result and previous backward/L2 medians or p95s lost. |
 
 Tensor Core MMA is not a normalization requirement: no matrix multiply exists
 in these formulas. The same policy requires MMA for applicable GEMM/attention
@@ -75,7 +75,10 @@ traffic without useful tensor operations.
 All admitted tensors are exact, contiguous, aligned physical views. Strides,
 shapes, epsilon, momentum, dtype, and mode flags are removed before the hot
 launch. Unsupported layouts or aliases return to the established CUDA path.
-There are no output-sized temporary device allocations.
+There are no output-sized temporary device allocations. Workspace-requiring
+operations share one backend-owned 516-byte allocation created during prewarm;
+the hot path performs no allocation and its pointer remains stable for graph
+capture.
 
 Row forward/input-gradient kernels assign one warp to one 64-value row. Each
 lane loads two adjacent half-row values, retains them in registers through
@@ -94,16 +97,21 @@ so it is ordered, graph-capturable, and has no host synchronization.
 
 The new experimental large-shape backward lane is a single dispatch and a
 single global input pass. A 32-warp LayerNorm block retains two adjacent
-features per lane in registers, writes 16 KiB of block parameter partials to
-shared memory once, and finishes with one atomic per block/output. RMSNorm's
-measured winner uses 20 warps, 5 KiB shared memory, and two resident blocks per
-SM. Neither route is admitted without the explicit experiment override.
+features per lane in registers and folds 16 KiB of block parameter partials
+through shared memory once. RMSNorm uses 20 warps, 5 KiB shared memory, and two
+resident blocks per SM. The 64 folding threads issue one atomic per
+block/output into the reusable accumulator, then a last-block completion
+protocol copies final parameters, clears the accumulator, and resets the
+counter. This removes both destination memsets and a second global partial
+read pass. Neither route is admitted without the explicit experiment override.
 
 The experimental whole-tensor L2 lane uses aligned 16-byte loads, four
-register FMAs, 512-thread blocks, a bounded grid, a 64-byte warp/shared fold,
-and one atomic per block. It remains unselected because it still loses
-compiled PyTorch. The deterministic one-block variant also adopts the wider
-block fold but remains a fallback-only experiment.
+register FMAs, 512-thread blocks, a bounded 128-block grid, and a 64-byte
+warp/shared fold. Blocks publish one partial each; the last block performs the
+final fold, writes the scalar directly, and resets the workspace completion
+counter. It remains unselected until a clean run beats compiled PyTorch. The
+deterministic one-block variant also adopts the wider block fold but remains a
+fallback-only experiment.
 
 `cp.async` and Tensor Core instructions are requirements only where their
 operands are reusable and their arithmetic applies. These D=64 normalization
@@ -114,12 +122,14 @@ or GEMM-containing fused cells must revisit both gates with profiler evidence.
 
 ## Streaming, graphs, and lifetime
 
-All launches, accumulation clears, and fallbacks use the backend compute
-stream. There is no hidden device synchronization, host copy, host reduction,
-or hot-path allocation. Modules and plans are prewarmed before CUDA Graph
-capture and pinned for the graph lifetime so cache eviction cannot invalidate
-a retained `CUfunction`. Compilation, file I/O, tuning, and cache misses are
-forbidden during capture.
+All launches and fallbacks use the backend compute stream. There is no hidden
+device synchronization, host copy, host reduction, or hot-path allocation.
+The fixed workspace is allocated and zeroed during prewarm; its accumulator
+and counter are reset by the completing block before kernel exit. Repeated
+launch and CUDA Graph replay tests reject stale accumulation. Modules and plans
+are prewarmed before capture and pinned for the graph lifetime so cache
+eviction cannot invalidate a retained `CUfunction`. Compilation, file I/O,
+tuning, and cache misses are forbidden during capture.
 
 Fused residual + BatchNorm + ReLU is connected through the production fusion
 manager. The kernel computes the normalization affine result, adds the
@@ -139,7 +149,9 @@ hold in three independent runs:
    launch batch, stream, and graph treatment are used.
 4. Correctness and deterministic-mode bit stability pass at declared
    tolerances; fast atomics are explicitly labeled nondeterministic.
-5. Managed hot allocation and temporary VRAM are both zero.
+5. Managed hot allocation and per-dispatch VRAM allocation are both zero;
+   bounded persistent workspace must be declared, graph-stable, self-resetting,
+   and independent of tensor extent rather than output-sized.
 6. Runtime local bytes and final-SASS `LDL`/`STL` are zero; registers, shared
    memory, and active blocks meet the blueprint budget.
 7. The exact cubin is embedded, hash verified, disassembled, and profiled.
@@ -150,7 +162,7 @@ not eager PyTorch when compiled PyTorch is faster.
 
 ## Evidence collected on RTX 3080 / SM86
 
-- All 13 focused correctness/routing/capture/allocation tests pass on net10
+- All 14 focused correctness/routing/capture/allocation tests pass on net10
   and net471.
 - All 71 current-source identities and 67 compiled cubins pass the static
   verifier.
@@ -176,6 +188,14 @@ unselected 512-thread atomic L2 experiment measured about 17.20 us median and
 22.18 us p95 in its clean routed screen; the deterministic embedded variant
 measured 42.64--43.77 us. All three cells remain HOLD.
 
+The first workspace topology stored every block partial and folded it in the
+last block. A serial 64-thread fold measured 39.44 us LayerNorm / 36.07 us
+RMSNorm; an eight-lane-per-feature fold improved that to 36.19 / 19.31 us but
+still lost compiled PyTorch. The retained accumulator topology removes that
+second partial read pass. Its latest run cannot be used for promotion because
+two unrelated Python CUDA workloads held the GPU at 99% utilization; no
+contended absolute number is treated as release evidence.
+
 ## Rejected experiments retained as evidence
 
 - Four outputs per BatchNorm thread increased register pressure and reduced
@@ -193,22 +213,29 @@ measured 42.64--43.77 us. All three cells remain HOLD.
 - A 24-warp RMS block was rejected by the runtime resource budget: register
   allocation granularity permitted only one block/SM, so the benchmark failed
   closed instead of timing a fallback.
+- A 21-warp RMS block was also rejected by the same two-block/SM resource gate;
+  20 warps is the largest retained geometry with the required occupancy.
+- Last-block workspace folds using one serial feature thread and eight lanes
+  per feature were correct but slower than the retained reusable-accumulator
+  protocol.
 
 ## Follow-up required before production promotion
 
-1. Replace the final atomic parameter fold with a measured cross-block
-   completion topology that preserves the single input pass and removes the
-   separate output clear; a reusable bounded workspace is acceptable only if
-   it remains zero-allocation in the hot path and wins end-to-end.
-2. Replace whole-tensor L2 with a measured hierarchical or cooperative
+1. Run the retained persistent-accumulator topology on an otherwise idle GPU;
+   promote it only if all three median and p95 comparisons beat compiled
+   PyTorch by the stated gates.
+2. Continue reducing RMS reciprocal/reduction and accumulator contention only
+   with measured variants that preserve two blocks/SM and the single input
+   pass.
+3. Replace whole-tensor L2 with a measured hierarchical or cooperative
    reduction that beats compiled PyTorch without output-sized scratch or
    hidden synchronization.
-3. Complete three clean independent runs for every remaining forward/channel
+4. Complete three clean independent runs for every remaining forward/channel
    candidate and rerun the corrected residual BatchNorm semantics.
-4. Enable NVIDIA performance counters and archive exact-cubin NCU metrics for
+5. Enable NVIDIA performance counters and archive exact-cubin NCU metrics for
    DRAM bytes, shared transactions/conflicts, occupancy, and local/spill
    counters.
-5. Promote only the individual cells that pass; keep all other shapes behind
+6. Promote only the individual cells that pass; keep all other shapes behind
    `normalization-performance-gate-not-met`.
 
 ## Reproduction
