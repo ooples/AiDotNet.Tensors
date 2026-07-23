@@ -126,6 +126,23 @@ public static class PtxParityRegistry
             "movement (a v2 transaction on the interleaved side, two scalar transactions on the split " +
             "side), so the spec is bit-exact including NaN payloads and signed zeros. Converts to " +
             "ThreeWayParity when the SM86 run lands; until then the shapes stay unpromoted and fail closed."),
+
+        new PtxParitySpec("PtxSplitComplexScaleF32Kernel", PtxParityStatus.Deferred,
+            "split-buffer complex real-scalar scale, fp32 (#850) - CudaBackend.SplitComplexScale",
+            "one module over the four exact element counts; the scalar is a per-launch .param .f32. Each " +
+            "lane is a single mul.rn, so the spec is bit-exact with the reference x*scalar. Converts to " +
+            "ThreeWayParity when the SM86 run lands; until then unpromoted and fail-closed."),
+        new PtxParitySpec("PtxSplitComplexPhaseF32Kernel", PtxParityStatus.Deferred,
+            "split-buffer complex phase, fp32 (#850) - CudaBackend.SplitComplexPhase",
+            "one module over the four exact element counts. PTX has no atan2 primitive, so the angle is a " +
+            "minimax atan (~1e-4) plus quadrant folding; unlike the other split operators its spec is " +
+            "TOLERANCE-based, not bit-exact. Converts to ThreeWayParity (with tolerance) when the SM86 " +
+            "run lands; until then unpromoted and fail-closed."),
+        new PtxParitySpec("PtxSplitComplexFromPolarF32Kernel", PtxParityStatus.Deferred,
+            "split-buffer polar-to-Cartesian, fp32 (#850) - CudaBackend.SplitComplexFromPolar",
+            "one module over the four exact element counts using cos.approx/sin.approx, so its spec is " +
+            "TOLERANCE-based, not bit-exact. Converts to ThreeWayParity (with tolerance) when the SM86 " +
+            "run lands; until then unpromoted and fail-closed."),
     };
 
     private static readonly Dictionary<string, PtxParitySpec> ByKernel =

@@ -70,9 +70,12 @@ public class DirectPtxComplexMultiplyTests
                 "CudaBackend.SplitComplexAdd",
                 "CudaBackend.SplitComplexConjugate",
                 "CudaBackend.SplitComplexCrossSpectral",
+                "CudaBackend.SplitComplexFromPolar",
                 "CudaBackend.SplitComplexMagnitude",
                 "CudaBackend.SplitComplexMagnitudeSquared",
                 "CudaBackend.SplitComplexMultiply",
+                "CudaBackend.SplitComplexPhase",
+                "CudaBackend.SplitComplexScale",
             },
             DirectPtxSpectralCoverageManifest.All
                 .Where(cell => cell.Status == DirectPtxSpectralCoverageStatus.ExperimentalDirectPtx)
@@ -536,6 +539,135 @@ public class DirectPtxComplexMultiplyTests
             var real = new float[count]; var imag = new float[count];
             b1.Download<float>(real); b2.Download<float>(imag);
             for (int i = 0; i < count; i++) { Assert.Equal(inter[2 * i], real[i]); Assert.Equal(inter[2 * i + 1], imag[i]); }
+        }
+    }
+
+    [Fact]
+    public void SplitComplexScaleEmitter_HasScalarParamAndTwoMuls()
+    {
+        string ptx = PtxSplitComplexScaleF32Kernel.EmitPtx(8, 6, 262144);
+        Assert.Equal(4, Count(ptx, "ld.param.u64"));
+        Assert.Equal(1, Count(ptx, "ld.param.f32"));    // the scalar operand
+        Assert.Equal(2, Count(ptx, "mul.rn.f32"));       // re*scalar, im*scalar
+        Assert.Equal(2, Count(ptx, "st.global.f32"));
+        Assert.DoesNotContain("bra", ptx, StringComparison.Ordinal);
+        Assert.True(PtxSplitComplexScaleF32Kernel.IsSupportedShape(65536));
+        Assert.False(PtxSplitComplexScaleF32Kernel.IsPromotedShape(262144));
+    }
+
+    [SkippableTheory]
+    [InlineData(65536)]
+    [InlineData(1048576)]
+    public void DriverOnlySplitComplexScale_MatchesOracle(int count)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedComplexUnary(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The candidate is admitted only on SM86.");
+        using var kernel = new PtxSplitComplexScaleF32Kernel(runtime, count);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+        const float scalar = 1.7501f;
+        var re = new float[count]; var im = new float[count];
+        var random = RandomHelper.CreateSeededRandom(20260900 + count);
+        for (int i = 0; i < count; i++) { re[i] = (float)(random.NextDouble() * 2.0 - 1.0); im[i] = (float)(random.NextDouble() * 2.0 - 1.0); }
+        using var reB = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var imB = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var orB = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        using var oiB = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
+        reB.Upload<float>(re); imB.Upload<float>(im);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(reB, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(imB, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(orB, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(oiB, kernel.Blueprint.Tensors[3]), scalar);
+        runtime.Synchronize();
+        var outR = new float[count]; var outI = new float[count];
+        orB.Download<float>(outR); oiB.Download<float>(outI);
+        for (int i = 0; i < count; i++) { Assert.Equal(re[i] * scalar, outR[i]); Assert.Equal(im[i] * scalar, outI[i]); }
+    }
+
+    [Fact]
+    public void SplitComplexPhaseEmitter_IsMinimaxAtan2()
+    {
+        string ptx = PtxSplitComplexPhaseF32Kernel.EmitPtx(8, 6, 262144);
+        Assert.Equal(3, Count(ptx, "ld.param.u64"));
+        Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));   // re, im
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.Equal(2, Count(ptx, "abs.f32"));
+        Assert.Equal(4, Count(ptx, "selp.f32"));            // quadrant + degenerate folding
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+    }
+
+    [SkippableTheory]
+    [InlineData(65536)]
+    public void DriverOnlySplitComplexPhase_MatchesAtan2WithinTolerance(int count)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedComplexUnary(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The candidate is admitted only on SM86.");
+        using var kernel = new PtxSplitComplexPhaseF32Kernel(runtime, count);
+        var re = new float[count]; var im = new float[count];
+        var random = RandomHelper.CreateSeededRandom(20260910 + count);
+        for (int i = 0; i < count; i++) { re[i] = (float)(random.NextDouble() * 2.0 - 1.0); im[i] = (float)(random.NextDouble() * 2.0 - 1.0); }
+        using var reB = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var imB = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var oB = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        reB.Upload<float>(re); imB.Upload<float>(im);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(reB, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(imB, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(oB, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[count]; oB.Download<float>(actual);
+        for (int i = 0; i < count; i++) Assert.True(MathF.Abs(actual[i] - (float)Math.Atan2(im[i], re[i])) <= 2e-4f);
+    }
+
+    [Fact]
+    public void SplitComplexFromPolarEmitter_UsesCosSinApprox()
+    {
+        string ptx = PtxSplitComplexFromPolarF32Kernel.EmitPtx(8, 6, 262144);
+        Assert.Equal(4, Count(ptx, "ld.param.u64"));
+        Assert.Equal(1, Count(ptx, "cos.approx.f32"));
+        Assert.Equal(1, Count(ptx, "sin.approx.f32"));
+        Assert.Equal(2, Count(ptx, "mul.rn.f32"));           // m*cos, m*sin
+        Assert.Equal(2, Count(ptx, "st.global.f32"));
+        Assert.True(PtxSplitComplexFromPolarF32Kernel.IsSupportedShape(65536));
+        Assert.False(PtxSplitComplexFromPolarF32Kernel.IsPromotedShape(262144));
+    }
+
+    [SkippableTheory]
+    [InlineData(65536)]
+    public void DriverOnlySplitComplexFromPolar_MatchesWithinTolerance(int count)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedComplexUnary(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The candidate is admitted only on SM86.");
+        using var kernel = new PtxSplitComplexFromPolarF32Kernel(runtime, count);
+        var mag = new float[count]; var phase = new float[count];
+        var random = RandomHelper.CreateSeededRandom(20260920 + count);
+        for (int i = 0; i < count; i++) { mag[i] = (float)(random.NextDouble() * 2.0); phase[i] = (float)((random.NextDouble() * 2.0 - 1.0) * Math.PI); }
+        using var mB = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var pB = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var orB = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        using var oiB = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
+        mB.Upload<float>(mag); pB.Upload<float>(phase);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(mB, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(pB, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(orB, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(oiB, kernel.Blueprint.Tensors[3]));
+        runtime.Synchronize();
+        var outR = new float[count]; var outI = new float[count];
+        orB.Download<float>(outR); oiB.Download<float>(outI);
+        for (int i = 0; i < count; i++)
+        {
+            Assert.True(MathF.Abs(outR[i] - (float)(mag[i] * Math.Cos(phase[i]))) <= 2e-4f);
+            Assert.True(MathF.Abs(outI[i] - (float)(mag[i] * Math.Sin(phase[i]))) <= 2e-4f);
         }
     }
 
