@@ -73,6 +73,7 @@ public class DirectPtxComplexMultiplyTests
                 "CudaBackend.FFT2D",
                 "CudaBackend.IRFFT",
                 "CudaBackend.InterleaveComplex",
+                "CudaBackend.IstftFromSpectrum",
                 "CudaBackend.RFFT",
                 "CudaBackend.SplitComplexAdd",
                 "CudaBackend.SplitComplexConjugate",
@@ -1315,6 +1316,101 @@ public class DirectPtxComplexMultiplyTests
         {
             Assert.True(Math.Abs(actualRe[i] - expectedRe[i]) <= 2e-2 * (1 + Math.Abs(expectedRe[i])));
             Assert.True(Math.Abs(actualIm[i] - expectedIm[i]) <= 2e-2 * (1 + Math.Abs(expectedIm[i])));
+        }
+    }
+
+    [Fact]
+    public void OverlapAddEmitter_IsFrameLoopFma()
+    {
+        string ptx = PtxOverlapAddF32Kernel.EmitPtx(8, 6, 8, 512, 128, 1408);   // (8-1)*128 + 512 = 1408
+        Assert.Contains("exact-shape numFrames=8 nFft=512 hop=128 outLen=1408 block=256 op=overlap-add", ptx);
+        Assert.Equal(3, Count(ptx, "ld.param.u64"));
+        Assert.Contains("setp.ge.u32 %p0, %r2, 1408", ptx);        // output guard
+        Assert.Contains("$OLA_LOOP:", ptx);
+        Assert.Contains("setp.ge.u32 %p1, %r3, 8", ptx);           // frame loop bound
+        Assert.Contains("mul.lo.u32 %r4, %r3, 128", ptx);          // frameStart = frame*hop
+        Assert.Contains("setp.ge.s32 %p3, %r5, 512", ptx);         // localIdx < nFft
+        Assert.Equal(1, Count(ptx, "fma.rn.f32"));
+        Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxOverlapAddF32Kernel.IsSupportedShape(8, 512, 128, 1408));
+        Assert.False(PtxOverlapAddF32Kernel.IsSupportedShape(8, 512, 600, 1408));   // hop > nFft
+        Assert.False(PtxOverlapAddF32Kernel.IsPromotedShape(8, 512, 128, 1408));
+    }
+
+    [Fact]
+    public void WindowSumSquaresEmitter_IsFrameLoopSquare()
+    {
+        string ptx = PtxWindowSumSquaresF32Kernel.EmitPtx(8, 6, 512, 128, 1408);   // numFrames = (1408-512)/128+1 = 8
+        Assert.Contains("exact-shape nFft=512 hop=128 outLen=1408 numFrames=8 block=256 op=window-sum-squares", ptx);
+        Assert.Equal(2, Count(ptx, "ld.param.u64"));
+        Assert.Contains("setp.ge.u32 %p1, %r3, 8", ptx);           // derived numFrames
+        Assert.Contains("fma.rn.f32 %f0, %f1, %f1, %f0", ptx);     // sum += w*w
+        Assert.Equal(1, Count(ptx, "ld.global.nc.f32"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxWindowSumSquaresF32Kernel.IsSupportedShape(512, 128, 1408));
+        Assert.False(PtxWindowSumSquaresF32Kernel.IsSupportedShape(512, 128, 1400));   // (out-nFft) not divisible by hop
+        Assert.False(PtxWindowSumSquaresF32Kernel.IsPromotedShape(512, 128, 1408));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyOverlapAddAndWindowSumSquares_MatchDoubleOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedComplexUnary(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The candidate is admitted only on SM86.");
+        const int numFrames = 8, nFft = 512, hop = 128, outLen = (numFrames - 1) * hop + nFft;
+        using var overlap = new PtxOverlapAddF32Kernel(runtime, numFrames, nFft, hop, outLen);
+        using var winSq = new PtxWindowSumSquaresF32Kernel(runtime, nFft, hop, outLen);
+        Assert.Equal(numFrames, winSq.NumFrames);
+
+        var frames = new float[numFrames * nFft];
+        var window = new float[nFft];
+        var random = RandomHelper.CreateSeededRandom(20261230);
+        for (int i = 0; i < frames.Length; i++) frames[i] = (float)(random.NextDouble() * 2 - 1);
+        for (int i = 0; i < nFft; i++) window[i] = (float)(0.5 - 0.5 * Math.Cos(2.0 * Math.PI * i / nFft));   // Hann
+
+        var expectedOut = new double[outLen];
+        var expectedWss = new double[outLen];
+        for (int idx = 0; idx < outLen; idx++)
+        {
+            double s = 0, w2 = 0;
+            for (int frame = 0; frame < numFrames; frame++)
+            {
+                int local = idx - frame * hop;
+                if (local >= 0 && local < nFft)
+                {
+                    s += (double)frames[frame * nFft + local] * window[local];
+                    w2 += (double)window[local] * window[local];
+                }
+            }
+            expectedOut[idx] = s; expectedWss[idx] = w2;
+        }
+
+        using var framesB = runtime.AllocateBytes(overlap.Blueprint.Tensors[0].RequiredBytes);
+        using var windowB = runtime.AllocateBytes(overlap.Blueprint.Tensors[1].RequiredBytes);
+        using var outB = runtime.AllocateBytes(overlap.Blueprint.Tensors[2].RequiredBytes);
+        using var wssB = runtime.AllocateBytes(winSq.Blueprint.Tensors[0].RequiredBytes);
+        framesB.Upload<float>(frames); windowB.Upload<float>(window);
+
+        overlap.Launch(
+            DirectPtxTensorView.CreateOwned(framesB, overlap.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(windowB, overlap.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(outB, overlap.Blueprint.Tensors[2]));
+        winSq.Launch(
+            DirectPtxTensorView.CreateOwned(wssB, winSq.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(windowB, winSq.Blueprint.Tensors[1]));
+        runtime.Synchronize();
+
+        var actualOut = new float[outLen];
+        var actualWss = new float[outLen];
+        outB.Download<float>(actualOut); wssB.Download<float>(actualWss);
+        for (int idx = 0; idx < outLen; idx++)
+        {
+            Assert.True(Math.Abs(actualOut[idx] - expectedOut[idx]) <= 1e-3 * (1 + Math.Abs(expectedOut[idx])));
+            Assert.True(Math.Abs(actualWss[idx] - expectedWss[idx]) <= 1e-3 * (1 + Math.Abs(expectedWss[idx])));
         }
     }
 

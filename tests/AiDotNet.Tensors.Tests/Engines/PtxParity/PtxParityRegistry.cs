@@ -223,6 +223,20 @@ public static class PtxParityRegistry
             "column butterfly. Each thread applies a cos.approx/sin.approx twiddle, so its spec is TOLERANCE-based, " +
             "not bit-exact. A batched 2D FFT launches this stage log2(height) times with doubling strides after the " +
             "batched column bit-reverse pass. Converts to ThreeWayParity (with tolerance) when the SM86 run lands."),
+
+        new PtxParitySpec("PtxOverlapAddF32Kernel", PtxParityStatus.Deferred,
+            "ISTFT overlap-add, fp32 (#850) - CudaBackend.IstftFromSpectrum (reconstruction)",
+            "one module per (numFrames,nFft,hopLength,outputLength); each thread owns one output sample and " +
+            "loops over the frames, accumulating frames[frame*nFft+localIdx]*window[localIdx] with fma.rn for " +
+            "every frame whose support covers the sample. The fma matches the reference's fused sum, so its spec " +
+            "is TOLERANCE-based against the fp64 oracle. Converts to ThreeWayParity (with tolerance) when the " +
+            "SM86 run lands; until then unpromoted and fail-closed."),
+        new PtxParitySpec("PtxWindowSumSquaresF32Kernel", PtxParityStatus.Deferred,
+            "ISTFT window normalization, fp32 (#850) - CudaBackend.IstftFromSpectrum (normalizer)",
+            "one module per (nFft,hopLength,outputLength); each thread owns one output sample and loops over the " +
+            "derived numFrames=(outputLength-nFft)/hop+1 frames, accumulating window[localIdx]^2 with fma.rn for " +
+            "every covering frame. The fma matches the reference's fused sum, so its spec is TOLERANCE-based " +
+            "against the fp64 oracle. Converts to ThreeWayParity (with tolerance) when the SM86 run lands."),
     };
 
     private static readonly Dictionary<string, PtxParitySpec> ByKernel =

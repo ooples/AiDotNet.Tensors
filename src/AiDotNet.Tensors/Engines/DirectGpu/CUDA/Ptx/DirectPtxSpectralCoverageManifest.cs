@@ -56,7 +56,7 @@ internal static class DirectPtxSpectralCoverageManifest
         Experimental("CudaBackend.IRFFT", "NVRTC reconstruction plus IFFT", "positive-frequency-to-real IFFT", Split, "FP32", "v1 Ampere: PtxIrfftPreprocessF32Kernel expands Hermitian symmetry (neg.f32 conjugate, bit-exact) then radix-2 inverse FFT then PtxScaleInverseF32Kernel by 1/n (one mul.rn per lane, bit-exact)"),
         Planned("CudaBackend.StftMagPhase", "NVRTC direct STFT mag/phase", "windowed STFT magnitude and phase", Frames, "FP32", "window-stft-mag-phase-cells"),
         Planned("CudaBackend.BuildSpectrum", "NVRTC build_spectrum", "magnitude/phase to Hermitian spectrum", Frames, "FP32", "spectrum-build-cells"),
-        Planned("CudaBackend.IstftFromSpectrum", "NVRTC ISTFT overlap-add", "spectrum inverse transform and overlap-add", Frames, "FP32", "istft-overlap-add-cells"),
+        Experimental("CudaBackend.IstftFromSpectrum", "NVRTC ISTFT overlap-add", "spectrum inverse transform and overlap-add", Frames, "FP32", "v1 Ampere: PtxOverlapAddF32Kernel windows and overlap-adds the synthesis frames (fma accumulation matching the fused reference) normalized by PtxWindowSumSquaresF32Kernel; both tolerance-based, thread-per-output-sample frame loops"),
         Planned("CudaBackend.PhaseVocoder", "NVRTC phase_vocoder", "rate-adjusted magnitude/phase", Frames, "FP32", "phase-vocoder-cells"),
         Experimental("CudaBackend.ApplyMelFilterbank", "NVRTC mel filterbank", "power spectrum to mel bands", Frames, "FP32", "v1 Ampere exact-shape cells (PtxApplyMelFilterbankF32Kernel); thread-per-(frame,mel) fma reduction over freqs"),
         Planned("CudaBackend.MelFilterbankApply", "NVRTC spectral mel apply", "segmented power-to-mel", Frames, "FP32", "segmented-mel-cells"),
