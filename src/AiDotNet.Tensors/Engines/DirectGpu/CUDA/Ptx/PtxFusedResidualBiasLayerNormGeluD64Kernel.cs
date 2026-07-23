@@ -22,6 +22,9 @@ internal sealed class PtxFusedResidualBiasLayerNormGeluD64Kernel : IDisposable
 
     internal int Rows { get; }
     internal float Epsilon { get; }
+
+    /// <summary>The register the epsilon launch parameter is loaded into.</summary>
+    private const string EpsilonRegister = "%eps";
     internal string Ptx { get; }
     internal DirectPtxKernelBlueprint Blueprint { get; }
     internal DirectPtxKernelAudit Audit { get; }
@@ -74,13 +77,15 @@ internal sealed class PtxFusedResidualBiasLayerNormGeluD64Kernel : IDisposable
         IntPtr gammaPointer = gamma.Pointer;
         IntPtr betaPointer = beta.Pointer;
         IntPtr outputPointer = output.Pointer;
-        void** arguments = stackalloc void*[6];
+        float epsilon = Epsilon;
+        void** arguments = stackalloc void*[7];
         arguments[0] = &inputPointer;
         arguments[1] = &residualPointer;
         arguments[2] = &biasPointer;
         arguments[3] = &gammaPointer;
         arguments[4] = &betaPointer;
         arguments[5] = &outputPointer;
+        arguments[6] = &epsilon;
         _module.Launch(
             _function, (uint)((Rows + WarpsPerBlock - 1) / WarpsPerBlock), 1, 1,
             BlockThreads, 1, 1, 0, arguments);
@@ -95,7 +100,6 @@ internal sealed class PtxFusedResidualBiasLayerNormGeluD64Kernel : IDisposable
         float epsilon)
     {
         Validate(rows, epsilon);
-        string epsilonHex = FloatLiteral(epsilon);
         var ptx = new StringBuilder(10_240);
         ptx.AppendLine(".version 7.1");
         ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
@@ -107,13 +111,20 @@ internal sealed class PtxFusedResidualBiasLayerNormGeluD64Kernel : IDisposable
         ptx.AppendLine("    .param .u64 bias_ptr,");
         ptx.AppendLine("    .param .u64 gamma_ptr,");
         ptx.AppendLine("    .param .u64 beta_ptr,");
-        ptx.AppendLine("    .param .u64 output_ptr");
+        ptx.AppendLine("    .param .u64 output_ptr,");
+        // epsilon is a launch parameter rather than a baked literal. Baking it
+        // made the module key depend on a value the blueprint id does not carry,
+        // so a caller using a non-default epsilon emitted PTX that no checked-in
+        // cubin matched and silently fell back to driver JIT.
+        ptx.AppendLine("    .param .f32 epsilon");
         ptx.AppendLine(")");
         ptx.AppendLine("{");
         ptx.AppendLine("    .reg .pred %p<2>;");
         ptx.AppendLine("    .reg .b32 %r<16>;");
         ptx.AppendLine("    .reg .b64 %rd<20>;");
         ptx.AppendLine("    .reg .f32 %f<32>;");
+        ptx.AppendLine($"    .reg .f32 {EpsilonRegister};");
+        ptx.AppendLine($"    ld.param.f32 {EpsilonRegister}, [epsilon];");
         ptx.AppendLine("    ld.param.u64 %rd0, [input_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd1, [residual_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd2, [bias_ptr];");
@@ -153,7 +164,7 @@ internal sealed class PtxFusedResidualBiasLayerNormGeluD64Kernel : IDisposable
         ptx.AppendLine("    fma.rn.f32 %f13, %f12, %f12, %f13;");
         EmitWarpSum(ptx, "%f13", "%f14");
         ptx.AppendLine("    mul.rn.f32 %f15, %f13, 0f3C800000;");
-        ptx.AppendLine($"    add.rn.f32 %f15, %f15, {epsilonHex};");
+        ptx.AppendLine($"    add.rn.f32 %f15, %f15, {EpsilonRegister};");
         ptx.AppendLine("    sqrt.rn.f32 %f16, %f15;");
         ptx.AppendLine("    rcp.approx.f32 %f17, %f16;");
         ptx.AppendLine("    add.u64 %rd11, %rd3, %rd7;");

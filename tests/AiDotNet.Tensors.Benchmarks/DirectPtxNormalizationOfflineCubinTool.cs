@@ -47,7 +47,49 @@ internal static class DirectPtxNormalizationOfflineCubinTool
                 PtxRowNormalizationD64Kernel.GetEntryPoint(op),
                 ptx);
         }
+
+        // Channel normalization is a single module per operation. It has no row
+        // dimension in its PTX at all - the unit count reaches it through the
+        // launch geometry - so with epsilon and momentum de-baked there is now
+        // exactly one artifact per operation rather than one per (epsilon,
+        // momentum) pair a caller happened to choose.
+        foreach (DirectPtxChannelNormalizationOperation op in
+                 (DirectPtxChannelNormalizationOperation[])System.Enum.GetValues(
+                     typeof(DirectPtxChannelNormalizationOperation)))
+        {
+            yield return new DirectPtxModuleSource(
+                $"channel-normalization-{op}-v1",
+                PtxChannelNormalizationD64Kernel.GetEntryPoint(op),
+                PtxChannelNormalizationD64Kernel.EmitPtx(8, 6, op));
+        }
+
+        // The two fused residual epilogues. Row count still selects the module
+        // because it sets the loop trip counts these kernels unroll, but epsilon
+        // no longer does.
+        foreach (int rows in new[] { 256, 2_048, 8_192 })
+        {
+            if (PtxFusedResidualBiasLayerNormGeluD64Kernel.IsSupportedRows(rows))
+                yield return new DirectPtxModuleSource(
+                    $"fused-residual-bias-layernorm-gelu-v1-r{rows}",
+                    PtxFusedResidualBiasLayerNormGeluD64Kernel.EntryPoint,
+                    PtxFusedResidualBiasLayerNormGeluD64Kernel.EmitPtx(8, 6, rows, DefaultEpsilon));
+
+            foreach (int warpsPerBlock in new[] { 1, 2, 4, 8 })
+                yield return new DirectPtxModuleSource(
+                    $"fused-residual-rmsnorm-v1-r{rows}-w{warpsPerBlock}",
+                    PtxFusedResidualRmsNormD64Kernel.EntryPoint,
+                    PtxFusedResidualRmsNormD64Kernel.EmitPtx(
+                        8, 6, DefaultEpsilon, rows, warpsPerBlock));
+        }
     }
+
+    /// <summary>
+    /// The epsilon passed to the emitters that still take one. It no longer
+    /// reaches the PTX - it is a launch parameter now - so its value cannot
+    /// affect the generated artifact; it exists only to satisfy the argument
+    /// validation these emitters perform before emitting.
+    /// </summary>
+    private const float DefaultEpsilon = 1e-5f;
 
     internal static int Generate(string[] args) => args.Length < 3
         ? Usage("--generate-direct-ptx-normalization-offline-cubins <ptxas-path> <output-directory>")

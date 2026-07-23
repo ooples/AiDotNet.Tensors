@@ -115,15 +115,19 @@ internal sealed class PtxChannelNormalizationD64Kernel : IDisposable
         IntPtr pointer5 = tensors.Length > 5 ? tensors[5].Pointer : IntPtr.Zero;
         IntPtr pointer6 = tensors.Length > 6 ? tensors[6].Pointer : IntPtr.Zero;
         IntPtr pointer7 = tensors.Length > 7 ? tensors[7].Pointer : IntPtr.Zero;
-        void** arguments = stackalloc void*[8];
-        arguments[0] = &pointer0;
-        arguments[1] = &pointer1;
-        arguments[2] = &pointer2;
-        arguments[3] = &pointer3;
-        arguments[4] = &pointer4;
-        arguments[5] = &pointer5;
-        arguments[6] = &pointer6;
-        arguments[7] = &pointer7;
+        float epsilon = Epsilon;
+        float momentum = Momentum;
+        void** arguments = stackalloc void*[10];
+        arguments[0] = &epsilon;
+        arguments[1] = &momentum;
+        arguments[2] = &pointer0;
+        arguments[3] = &pointer1;
+        arguments[4] = &pointer2;
+        arguments[5] = &pointer3;
+        arguments[6] = &pointer4;
+        arguments[7] = &pointer5;
+        arguments[8] = &pointer6;
+        arguments[9] = &pointer7;
 
         uint block = IsParameterGradient(Operation)
             ? (uint)ParameterBlockThreads
@@ -199,6 +203,7 @@ internal sealed class PtxChannelNormalizationD64Kernel : IDisposable
             "input_ptr", "gamma_ptr", "beta_ptr", "running_mean_ptr", "running_var_ptr",
             "output_ptr", "save_mean_ptr", "save_inv_var_ptr");
         EmitRegisters(ptx, predicates: 3, b16: 0, b32: 24, b64: 44, f32: 40);
+        EmitMomentumLoad(ptx);
         EmitPointerLoads(ptx, 8);
         EmitUnitAddressSetup(ptx, UnitLayout.Batch, "BN_TRAIN_DONE");
         EmitInputLoads(ptx, inputRegister: 0, half: false, "%f0", "%f1");
@@ -213,11 +218,14 @@ internal sealed class PtxChannelNormalizationD64Kernel : IDisposable
         ptx.AppendLine("    add.u64 %rd19, %rd4, %rd32;");
         ptx.AppendLine("    ld.global.nc.f32 %f12, [%rd18];");
         ptx.AppendLine("    ld.global.nc.f32 %f13, [%rd19];");
-        ptx.AppendLine($"    mul.rn.f32 %f14, %f12, {FloatLiteral(1f - momentum)};");
-        ptx.AppendLine($"    fma.rn.f32 %f14, %f2, {FloatLiteral(momentum)}, %f14;");
+        ptx.AppendLine($"    mul.rn.f32 %f14, %f12, {OneMinusMomentumRegister};");
+        ptx.AppendLine($"    fma.rn.f32 %f14, %f2, {MomentumRegister}, %f14;");
+        // 64/63 stays a literal: it is Bessel's correction for the fixed
+        // sixty-four-value unit this family is specialised on, so it is part of
+        // the shape the blueprint id already carries, not a caller-supplied value.
         ptx.AppendLine($"    mul.rn.f32 %f15, %f3, {FloatLiteral(64f / 63f)};");
-        ptx.AppendLine($"    mul.rn.f32 %f16, %f13, {FloatLiteral(1f - momentum)};");
-        ptx.AppendLine($"    fma.rn.f32 %f16, %f15, {FloatLiteral(momentum)}, %f16;");
+        ptx.AppendLine($"    mul.rn.f32 %f16, %f13, {OneMinusMomentumRegister};");
+        ptx.AppendLine($"    fma.rn.f32 %f16, %f15, {MomentumRegister}, %f16;");
         ptx.AppendLine("    add.u64 %rd20, %rd6, %rd32;");
         ptx.AppendLine("    add.u64 %rd21, %rd7, %rd32;");
         ptx.AppendLine("    setp.eq.u32 %p1, %r1, 0;");
@@ -252,7 +260,7 @@ internal sealed class PtxChannelNormalizationD64Kernel : IDisposable
         ptx.AppendLine("    add.u64 %rd19, %rd4, %rd32;");
         ptx.AppendLine("    ld.global.nc.f32 %f2, [%rd18];");
         ptx.AppendLine("    ld.global.nc.f32 %f3, [%rd19];");
-        ptx.AppendLine($"    add.rn.f32 %f3, %f3, {FloatLiteral(epsilon)};");
+        ptx.AppendLine($"    add.rn.f32 %f3, %f3, {EpsilonRegister};");
         ptx.AppendLine("    sqrt.rn.f32 %f4, %f3;");
         ptx.AppendLine("    rcp.approx.f32 %f5, %f4;");
         EmitAffineLoads(ptx, 1, 2, "%f6", "%f7", "%f8", "%f9");
@@ -283,7 +291,7 @@ internal sealed class PtxChannelNormalizationD64Kernel : IDisposable
         ptx.AppendLine("    add.u64 %rd19, %rd5, %rd32;");
         ptx.AppendLine("    ld.global.nc.f32 %f4, [%rd18];");
         ptx.AppendLine("    ld.global.nc.f32 %f5, [%rd19];");
-        ptx.AppendLine($"    add.rn.f32 %f5, %f5, {FloatLiteral(epsilon)};");
+        ptx.AppendLine($"    add.rn.f32 %f5, %f5, {EpsilonRegister};");
         ptx.AppendLine("    sqrt.rn.f32 %f6, %f5;");
         ptx.AppendLine("    rcp.approx.f32 %f7, %f6;");
         EmitAffineLoads(ptx, 2, 3, "%f8", "%f9", "%f10", "%f11");
@@ -391,7 +399,7 @@ internal sealed class PtxChannelNormalizationD64Kernel : IDisposable
         ptx.AppendLine("    ld.global.nc.f32 %f7, [%rd21];");
         if (statisticsAreVariance)
         {
-            ptx.AppendLine($"    add.rn.f32 %f7, %f7, {FloatLiteral(epsilon)};");
+            ptx.AppendLine($"    add.rn.f32 %f7, %f7, {EpsilonRegister};");
             ptx.AppendLine("    sqrt.rn.f32 %f24, %f7;");
             ptx.AppendLine("    rcp.approx.f32 %f7, %f24;");
         }
@@ -469,7 +477,7 @@ internal sealed class PtxChannelNormalizationD64Kernel : IDisposable
         ptx.AppendLine("    ld.global.nc.f32 %f4, [%rd9];");
         ptx.AppendLine("    add.u64 %rd9, %rd3, %rd8;");
         ptx.AppendLine("    ld.global.nc.f32 %f5, [%rd9];");
-        ptx.AppendLine($"    add.rn.f32 %f5, %f5, {FloatLiteral(epsilon)};");
+        ptx.AppendLine($"    add.rn.f32 %f5, %f5, {EpsilonRegister};");
         ptx.AppendLine("    sqrt.rn.f32 %f5, %f5;");
         ptx.AppendLine("    rcp.approx.f32 %f5, %f5;");
         ptx.AppendLine("    sub.rn.f32 %f6, %f3, %f4;");
@@ -584,6 +592,16 @@ internal sealed class PtxChannelNormalizationD64Kernel : IDisposable
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// exact 64-value channel normalization op={OperationName(operation)}");
         ptx.AppendLine($".visible .entry {GetEntryPoint(operation)}(");
+        // epsilon and momentum are launch parameters rather than baked literals.
+        // Baking them made the module key depend on values the blueprint id does
+        // not carry, so a caller using anything but the defaults emitted PTX no
+        // checked-in cubin matched and silently fell back to driver JIT.
+        //
+        // They are declared FIRST because the operations take between two and
+        // eight pointers, and the launch argument array is positional: only a
+        // leading position is the same index for all of them.
+        ptx.AppendLine("    .param .f32 epsilon,");
+        ptx.AppendLine("    .param .f32 momentum,");
         for (int i = 0; i < parameters.Length; i++)
             ptx.AppendLine($"    .param .u64 {parameters[i]}{(i + 1 == parameters.Length ? string.Empty : ",")}");
         ptx.AppendLine(")");
@@ -606,6 +624,34 @@ internal sealed class PtxChannelNormalizationD64Kernel : IDisposable
         ptx.AppendLine($"    .reg .b32 %r<{b32}>;");
         ptx.AppendLine($"    .reg .b64 %rd<{b64}>;");
         ptx.AppendLine($"    .reg .f32 %f<{f32}>;");
+        // Named rather than numbered: the operations declare f32 banks from ten
+        // to forty-four registers, so any fixed index would overflow the small
+        // ones.
+        ptx.AppendLine($"    .reg .f32 {EpsilonRegister}, {MomentumRegister}, {OneMinusMomentumRegister};");
+        ptx.AppendLine($"    ld.param.f32 {EpsilonRegister}, [epsilon];");
+    }
+
+    /// <summary>Registers the de-baked launch scalars are loaded into.</summary>
+    private const string EpsilonRegister = "%eps";
+
+    private const string MomentumRegister = "%mom";
+
+    private const string OneMinusMomentumRegister = "%ommom";
+
+    /// <summary>
+    /// Loads momentum and derives its complement. Only the training update needs
+    /// these, so they are loaded there rather than in every operation.
+    ///
+    /// The complement is computed on the device instead of being passed in.
+    /// sub.rn.f32 is the same IEEE single subtraction, under the same
+    /// round-to-nearest-even, that the host would have used for 1f - momentum,
+    /// so the running statistics are bit-identical to the baked version.
+    /// </summary>
+    private static void EmitMomentumLoad(StringBuilder ptx)
+    {
+        ptx.AppendLine($"    ld.param.f32 {MomentumRegister}, [momentum];");
+        ptx.AppendLine(
+            $"    sub.rn.f32 {OneMinusMomentumRegister}, 0f3F800000, {MomentumRegister};");
     }
 
     private static void EmitPointerLoads(StringBuilder ptx, int count)
@@ -723,7 +769,7 @@ internal sealed class PtxChannelNormalizationD64Kernel : IDisposable
         ptx.AppendLine($"    fma.rn.f32 {variance}, %f31, %f31, {variance};");
         EmitWarpSum(ptx, variance, "%f30");
         ptx.AppendLine($"    mul.rn.f32 {variance}, {variance}, 0f3C800000;");
-        ptx.AppendLine($"    add.rn.f32 %f32, {variance}, {FloatLiteral(epsilon)};");
+        ptx.AppendLine($"    add.rn.f32 %f32, {variance}, {EpsilonRegister};");
         ptx.AppendLine("    sqrt.rn.f32 %f33, %f32;");
         ptx.AppendLine($"    rcp.approx.f32 {invStd}, %f33;");
     }
