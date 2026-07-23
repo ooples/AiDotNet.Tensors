@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('attention', 'residual-rmsnorm', 'residual-layernorm-gelu', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'fused-linear', 'mixed-linear', 'mixed-linear-m16', 'w8a8-linear')]
+    [ValidateSet('attention', 'normalization', 'residual-rmsnorm', 'residual-layernorm-gelu', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'fused-linear', 'mixed-linear', 'mixed-linear-m16', 'w8a8-linear')]
     [string]$Target = 'attention',
     [string]$OutputCsv = (Join-Path ([System.IO.Path]::GetTempPath()) ("aidotnet-direct-ptx-ncu-" + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.csv')),
     [string]$NcuPath = $env:NSIGHT_COMPUTE_CLI
@@ -21,6 +21,7 @@ if (-not (Test-Path -LiteralPath $targetDll -PathType Leaf)) {
 $targetDll = (Resolve-Path -LiteralPath $targetDll).Path
 $switch = switch ($Target) {
     'attention' { '--direct-ptx-profile-attention' }
+    'normalization' { '--direct-ptx-profile-normalization' }
     'residual-rmsnorm' { '--direct-ptx-profile-residual-rmsnorm' }
     'residual-layernorm-gelu' { '--direct-ptx-profile-residual-layernorm-gelu' }
     'decode' { '--direct-ptx-profile-decode' }
@@ -35,6 +36,7 @@ $switch = switch ($Target) {
 }
 $kernel = switch ($Target) {
     'attention' { 'regex:aidotnet_online_attention_128x64' }
+    'normalization' { 'regex:aidotnet_.*norm.*' }
     'residual-rmsnorm' { 'regex:aidotnet_fused_residual_rmsnorm_d64' }
     'residual-layernorm-gelu' { 'regex:aidotnet_fused_residual_bias_layernorm_gelu_d64' }
     'decode' { 'regex:aidotnet_(flash|paged)_decode_d64' }
@@ -49,6 +51,7 @@ $kernel = switch ($Target) {
 }
 $expectedLaunches = switch ($Target) {
     'attention' { 16 }
+    'normalization' { 71 }
     'residual-rmsnorm' { 4 }
     'residual-layernorm-gelu' { 10 }
     'decode' { 2 }
@@ -87,11 +90,12 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 dotnet $targetDll --direct-ptx-verify-ncu $OutputCsv
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-# One deterministic launch is emitted for every promoted kernel entry point;
-# attention and residual-RMSNorm additionally enumerate all promoted sequence/
-# row, causal, and fusion variants. Nsight Compute 2026.2 raw CSV has one wide
-# data row per launch. Require every requested column on every expected launch
-# so a partial capture cannot be mistaken for complete evidence.
+# One deterministic launch is emitted for every targeted kernel identity;
+# normalization includes all 71 logical identities (66 distinct cubins), while
+# attention and residual-RMSNorm enumerate their sequence/row, causal, and
+# fusion variants. Nsight Compute 2026.2 raw CSV has one wide data row per
+# launch. Require every requested column on every expected launch so a partial
+# capture cannot be mistaken for complete evidence.
 $csvLines = @(Get-Content -LiteralPath $OutputCsv)
 $headerIndex = -1
 for ($index = 0; $index -lt $csvLines.Count; $index++) {

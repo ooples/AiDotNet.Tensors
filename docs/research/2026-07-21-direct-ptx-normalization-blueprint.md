@@ -294,7 +294,8 @@ dotnet tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Be
 dotnet tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Benchmarks.dll `
   --direct-ptx-normalization 3 all
 
-<ncu.exe> --target-processes all --profile-from-start off `
-  dotnet tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Benchmarks.dll `
-  --direct-ptx-profile-normalization
+powershell -ExecutionPolicy Bypass `
+  -File tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-ncu.ps1 `
+  -Target normalization `
+  -NcuPath <ncu.exe>
 ```
