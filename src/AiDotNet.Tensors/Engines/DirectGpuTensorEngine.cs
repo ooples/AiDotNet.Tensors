@@ -7360,7 +7360,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // convolution+bias+ReLU dataflow for one exact resident FP32 ABI.
             // Every other shape/semantic contract continues through the
             // established convolution, bias, and activation kernels below.
-#if NET5_0_OR_GREATER
             if (typeof(T) == typeof(float) && bias is { } directBias &&
                 activation == FusedActivationType.ReLU &&
                 backend is Engines.DirectGpu.CUDA.CudaBackend directCuda &&
@@ -7387,7 +7386,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     return directResult;
                 }
             }
-#endif
 
             // Execute GPU convolution
             backend.Conv2D(inputBuffer.Buffer, kernelBuffer.Buffer, outputBuffer.Buffer,

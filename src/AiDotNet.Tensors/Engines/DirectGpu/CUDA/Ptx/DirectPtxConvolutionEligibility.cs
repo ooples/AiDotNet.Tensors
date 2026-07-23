@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using AiDotNet.Tensors.Engines.DirectGpu;
 
@@ -66,8 +65,8 @@ internal static class DirectPtxConvolutionEligibility
             bias.SizeInBytes != PtxFusedConv2DNchwK1Kernel.BiasBytes ||
             output.SizeInBytes != PtxFusedConv2DNchwK1Kernel.OutputBytes)
             return PhysicalExtentMismatch;
-        if ((((nuint)input.Handle | (nuint)weights.Handle | (nuint)bias.Handle |
-              (nuint)output.Handle) & 15u) != 0)
+        if (((PtxCompat.ToNuint(input.Handle) | PtxCompat.ToNuint(weights.Handle) |
+              PtxCompat.ToNuint(bias.Handle) | PtxCompat.ToNuint(output.Handle)) & 15u) != 0)
             return AlignmentMismatch;
         if (Overlaps(input, output) || Overlaps(weights, output) || Overlaps(bias, output))
             return AliasNotSupported;
@@ -76,18 +75,16 @@ internal static class DirectPtxConvolutionEligibility
 
     private static bool Overlaps(IGpuBuffer left, IGpuBuffer right)
     {
-        nuint leftStart = (nuint)left.Handle;
-        nuint rightStart = (nuint)right.Handle;
+        nuint leftStart = PtxCompat.ToNuint(left.Handle);
+        nuint rightStart = PtxCompat.ToNuint(right.Handle);
         nuint leftBytes = (nuint)left.SizeInBytes;
         nuint rightBytes = (nuint)right.SizeInBytes;
-        // Malformed pointer ranges must reject rather than escape the
-        // fail-closed admission boundary through checked overflow.
-        if (leftStart > nuint.MaxValue - leftBytes ||
-            rightStart > nuint.MaxValue - rightBytes)
-            return true;
         nuint leftEnd = leftStart + leftBytes;
         nuint rightEnd = rightStart + rightBytes;
+        // Malformed pointer ranges (unsigned wraparound, where end < start) must
+        // reject rather than escape the fail-closed admission boundary.
+        if (leftEnd < leftStart || rightEnd < rightStart)
+            return true;
         return leftStart < rightEnd && rightStart < leftEnd;
     }
 }
-#endif
