@@ -66,10 +66,12 @@ public class DirectPtxComplexMultiplyTests
                 "CudaBackend.AnalyticSignalMask",
                 "CudaBackend.ApplyMelFilterbank",
                 "CudaBackend.ApplyWindow",
+                "CudaBackend.Atan2Elementwise",
                 "CudaBackend.BatchedFFT",
                 "CudaBackend.BatchedFFT2D",
                 "CudaBackend.BispectrumGather",
                 "CudaBackend.BuildSpectrum",
+                "CudaBackend.CavityBounceInplace",
                 "CudaBackend.ComplexConjugate",
                 "CudaBackend.ComplexMagnitude",
                 "CudaBackend.ComplexMultiply",
@@ -100,6 +102,7 @@ public class DirectPtxComplexMultiplyTests
                 "CudaBackend.SplitComplexScale",
                 "CudaBackend.StftMagPhase",
                 "CudaBackend.TrispectrumGather",
+                "CudaBackend.WidebandLogBinPool",
                 "Fft.FftFreq",
                 "Fft.FftShift",
                 "Fft.IFftShift",
@@ -2353,6 +2356,78 @@ public class DirectPtxComplexMultiplyTests
             int idx = b * numGammaBands + gammaIdx;
             Assert.True(Math.Abs(actual[idx] - expected[idx]) <= 5e-3 * (1 + Math.Abs(expected[idx])));
         }
+    }
+
+    [Fact]
+    public void CavityBounceEmitter_IsClampedTanh()
+    {
+        string ptx = PtxCavityBounceInplaceF32Kernel.EmitPtx(8, 6, 8192);
+        Assert.Contains("op=cavity-bounce-inplace", ptx);
+        Assert.Contains("ld.param.f32 %f1, [inv_n]", ptx);
+        Assert.Contains("max.f32", ptx);
+        Assert.Contains("min.f32", ptx);
+        Assert.Contains("tanh.approx.f32", ptx);
+        Assert.Contains("st.global.f32 [%rd4], 0f00000000", ptx);   // imag = 0
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxCavityBounceInplaceF32Kernel.IsSupportedShape(8192));
+        Assert.False(PtxCavityBounceInplaceF32Kernel.IsPromotedShape(8192));
+    }
+
+    [Fact]
+    public void WidebandLogBinPoolEmitter_IsLogBinAverage()
+    {
+        string ptx = PtxWidebandLogBinPoolF32Kernel.EmitPtx(8, 6, 32, 512, 40, 256);
+        Assert.Contains("op=wideband-log-bin-pool", ptx);
+        Assert.Contains("div.u32 %r3, %r2, 40", ptx);         // seg
+        Assert.Contains("rem.u32 %r4, %r2, 40", ptx);         // k
+        Assert.Equal(2, Count(ptx, "cvt.rzi.s32.f32"));       // binStart and binEnd floors
+        Assert.Contains("min.s32 %r6, %r6, 256", ptx);        // clamp to usable
+        Assert.Contains("$WB_LOOP:", ptx);
+        Assert.Contains("lg2.approx.f32", ptx);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxWidebandLogBinPoolF32Kernel.IsSupportedShape(32, 512, 40, 256));
+        Assert.False(PtxWidebandLogBinPoolF32Kernel.IsSupportedShape(32, 512, 40, 600));   // usable > fftSize
+        Assert.False(PtxWidebandLogBinPoolF32Kernel.IsPromotedShape(32, 512, 40, 256));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyWidebandLogBinPool_MatchesDoubleOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedComplexUnary(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The candidate is admitted only on SM86.");
+        const int seg = 32, fftSize = 512, numBins = 40, usable = 256;
+        using var kernel = new PtxWidebandLogBinPoolF32Kernel(runtime, seg, fftSize, numBins, usable);
+        var mag = new float[seg * fftSize];
+        var random = RandomHelper.CreateSeededRandom(20271001);
+        for (int i = 0; i < mag.Length; i++) mag[i] = (float)random.NextDouble();
+        var expected = new float[seg * numBins];
+        for (int outIdx = 0; outIdx < seg * numBins; outIdx++)
+        {
+            int s = outIdx / numBins, k = outIdx % numBins;
+            float r0 = (float)k / numBins, r1 = (float)(k + 1) / numBins;
+            int binStart = 1 + (int)(r0 * r0 * (usable - 1));
+            int binEnd = 1 + (int)(r1 * r1 * (usable - 1));
+            if (binEnd <= binStart) binEnd = binStart + 1;
+            if (binEnd > usable) binEnd = usable;
+            double sum = 0; int cnt = 0;
+            for (int i = binStart; i < binEnd; i++) { sum += mag[s * fftSize + i]; cnt++; }
+            double avg = cnt > 0 ? sum / cnt : 0;
+            expected[outIdx] = (float)Math.Log(1.0 + avg);
+        }
+        using var mB = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var oB = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        mB.Upload<float>(mag);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(mB, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(oB, kernel.Blueprint.Tensors[1]));
+        runtime.Synchronize();
+        var actual = new float[seg * numBins];
+        oB.Download<float>(actual);
+        for (int i = 0; i < actual.Length; i++)
+            Assert.True(Math.Abs(actual[i] - expected[i]) <= 1e-3 * (1 + Math.Abs(expected[i])));
     }
 
     private static int Count(string text, string value)

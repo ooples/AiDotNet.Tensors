@@ -284,6 +284,17 @@ public static class PtxParityRegistry
             "one module per element count; output=log1p(input)=ln(1+input) via lg2.approx(1+x) scaled by " +
             "ln(2). Its spec is TOLERANCE-based, not bit-exact. Converts to ThreeWayParity (with tolerance) " +
             "when the SM86 run lands; until then unpromoted and fail-closed."),
+        new PtxParitySpec("PtxCavityBounceInplaceF32Kernel", PtxParityStatus.Deferred,
+            "cavity-bounce post-IFFT nonlinearity, fp32 (#850) - CudaBackend.CavityBounceInplace",
+            "one module per element count; the fused post-IFFT step workReal=tanh(clamp(real*invN,-20,20)), " +
+            "workImag=0, with invN a per-launch .param .f32. The tanh.approx makes its spec TOLERANCE-based. " +
+            "Converts to ThreeWayParity (with tolerance) when the SM86 run lands; until then unpromoted."),
+        new PtxParitySpec("PtxWidebandLogBinPoolF32Kernel", PtxParityStatus.Deferred,
+            "wideband logarithmic magnitude bin pooling, fp32 (#850) - CudaBackend.WidebandLogBinPool",
+            "one module per (totalSegBatch,fftSize,numBins,usable); each thread averages magBuf over a " +
+            "quadratic log-spaced bin range and writes log1p(avg). The integer floor bin edges and " +
+            "lg2.approx log make its spec TOLERANCE-based. Converts to ThreeWayParity (with tolerance) when " +
+            "the SM86 run lands; until then unpromoted and fail-closed."),
         new PtxParitySpec("PtxPacPhaseBinMiF32Kernel", PtxParityStatus.Deferred,
             "phase-amplitude coupling modulation index, fp32 (#850) - CudaBackend.PacPhaseBinMi",
             "one module per (batch,numSamples,numGammaBands,gammaIdx); one 18-thread block per batch row bins " +
