@@ -83,11 +83,10 @@ internal sealed class PtxComplexConjugateKernel : IDisposable
         ptx.AppendLine("    mul.wide.u32 %rd2, %r2, 8;");
         ptx.AppendLine("    add.u64 %rd3, %rd0, %rd2;");
         ptx.AppendLine("    add.u64 %rd4, %rd1, %rd2;");
-        ptx.AppendLine("    ld.global.nc.f32 %f0, [%rd3];");             // real
-        ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd3+4];");           // imag
+        // Coalesced 8-byte transactions on the 8-byte-aligned interleaved [re,im] pair.
+        ptx.AppendLine("    ld.global.nc.v2.f32 {%f0, %f1}, [%rd3];");   // real, imag
         ptx.AppendLine("    neg.f32 %f2, %f1;");                         // -imag
-        ptx.AppendLine("    st.global.f32 [%rd4], %f0;");
-        ptx.AppendLine("    st.global.f32 [%rd4+4], %f2;");
+        ptx.AppendLine("    st.global.v2.f32 [%rd4], {%f0, %f2};");      // real, -imag
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");
         return ptx.ToString();

@@ -91,13 +91,18 @@ internal sealed class PtxOctonionAddKernel : IDisposable
         ptx.AppendLine("    add.u64 %rd4, %rd0, %rd3;");
         ptx.AppendLine("    add.u64 %rd5, %rd1, %rd3;");
         ptx.AppendLine("    add.u64 %rd6, %rd2, %rd3;");
-        for (int k = 0; k < Components; k++)
+        // Each octonion is 32 bytes at a 16-byte-aligned base (16-byte-aligned buffer + count*32),
+        // so both 4-component halves are 16-byte aligned and a single v4.f32 moves four lanes.
+        for (int half = 0; half < 2; half++)
         {
-            int off = k * sizeof(float);
-            ptx.AppendLine($"    ld.global.nc.f32 %f0, [%rd4+{off}];");
-            ptx.AppendLine($"    ld.global.nc.f32 %f1, [%rd5+{off}];");
-            ptx.AppendLine("    add.rn.f32 %f2, %f0, %f1;");
-            ptx.AppendLine($"    st.global.f32 [%rd6+{off}], %f2;");
+            int off = half * 4 * sizeof(float);
+            ptx.AppendLine($"    ld.global.nc.v4.f32 {{%f0, %f1, %f2, %f3}}, [%rd4+{off}];");
+            ptx.AppendLine($"    ld.global.nc.v4.f32 {{%f4, %f5, %f6, %f7}}, [%rd5+{off}];");
+            ptx.AppendLine("    add.rn.f32 %f0, %f0, %f4;");
+            ptx.AppendLine("    add.rn.f32 %f1, %f1, %f5;");
+            ptx.AppendLine("    add.rn.f32 %f2, %f2, %f6;");
+            ptx.AppendLine("    add.rn.f32 %f3, %f3, %f7;");
+            ptx.AppendLine($"    st.global.v4.f32 [%rd6+{off}], {{%f0, %f1, %f2, %f3}};");
         }
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");

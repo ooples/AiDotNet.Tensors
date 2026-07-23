@@ -113,8 +113,9 @@ public class DirectPtxScientificTests
     {
         string ptx = PtxComplexConjugateKernel.EmitPtx(8, 6, 16384);
         Assert.Contains(PtxComplexConjugateKernel.EntryPoint, ptx);
-        Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));
-        Assert.Equal(2, Count(ptx, "st.global.f32"));
+        Assert.Equal(1, Count(ptx, "ld.global.nc.v2.f32"));   // vectorized {real,imag}
+        Assert.Equal(1, Count(ptx, "st.global.v2.f32"));       // vectorized {real,-imag}
+        Assert.Equal(0, Count(ptx, "ld.global.nc.f32"));
         Assert.Contains("neg.f32 %f2, %f1", ptx);
         Assert.Equal(0, Count(ptx, "bar.sync 0"));
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
@@ -195,8 +196,9 @@ public class DirectPtxScientificTests
     {
         string ptx = PtxComplexMultiplyKernel.EmitPtx(8, 6, 16384);
         Assert.Contains(PtxComplexMultiplyKernel.EntryPoint, ptx);
-        Assert.Equal(4, Count(ptx, "ld.global.nc.f32"));   // ar, ai, br, bi
-        Assert.Equal(2, Count(ptx, "st.global.f32"));       // real, imag
+        Assert.Equal(2, Count(ptx, "ld.global.nc.v2.f32"));  // vectorized: {ar,ai}, {br,bi}
+        Assert.Equal(0, Count(ptx, "ld.global.nc.f32"));      // no scalar complex loads
+        Assert.Equal(1, Count(ptx, "st.global.v2.f32"));      // vectorized: {real,imag}
         Assert.Contains("sub.rn.f32 %f6, %f4, %f5", ptx);   // ar*br - ai*bi
         Assert.Contains("fma.rn.f32 %f8, %f1, %f2, %f7", ptx); // ai*br + ar*bi
         Assert.Equal(0, Count(ptx, "bar.sync 0"));
@@ -250,9 +252,10 @@ public class DirectPtxScientificTests
     {
         string ptx = PtxOctonionAddKernel.EmitPtx(8, 6, 16384);
         Assert.Contains(PtxOctonionAddKernel.EntryPoint, ptx);
-        Assert.Equal(16, Count(ptx, "ld.global.nc.f32"));   // 8 a + 8 b
-        Assert.Equal(8, Count(ptx, "add.rn.f32"));
-        Assert.Equal(8, Count(ptx, "st.global.f32"));
+        Assert.Equal(4, Count(ptx, "ld.global.nc.v4.f32"));  // vectorized: 2 halves x (a + b)
+        Assert.Equal(0, Count(ptx, "ld.global.nc.f32"));      // no scalar loads
+        Assert.Equal(8, Count(ptx, "add.rn.f32"));            // still 8 componentwise adds
+        Assert.Equal(2, Count(ptx, "st.global.v4.f32"));      // vectorized: 2 halves
         Assert.Equal(0, Count(ptx, "bar.sync 0"));
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);

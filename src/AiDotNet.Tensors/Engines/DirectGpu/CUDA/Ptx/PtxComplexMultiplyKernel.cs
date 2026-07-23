@@ -94,18 +94,17 @@ internal sealed class PtxComplexMultiplyKernel : IDisposable
         ptx.AppendLine("    add.u64 %rd4, %rd0, %rd3;");
         ptx.AppendLine("    add.u64 %rd5, %rd1, %rd3;");
         ptx.AppendLine("    add.u64 %rd6, %rd2, %rd3;");
-        ptx.AppendLine("    ld.global.nc.f32 %f0, [%rd4];");                 // ar
-        ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd4+4];");               // ai
-        ptx.AppendLine("    ld.global.nc.f32 %f2, [%rd5];");                 // br
-        ptx.AppendLine("    ld.global.nc.f32 %f3, [%rd5+4];");               // bi
+        // Coalesced 8-byte transactions: each interleaved [re,im] pair is 8-byte aligned
+        // (16-byte-aligned base + pair*8), so a single v2.f32 loads/stores both components.
+        ptx.AppendLine("    ld.global.nc.v2.f32 {%f0, %f1}, [%rd4];");       // ar, ai
+        ptx.AppendLine("    ld.global.nc.v2.f32 {%f2, %f3}, [%rd5];");       // br, bi
         // real = ar*br - ai*bi ; imag = ar*bi + ai*br
         ptx.AppendLine("    mul.rn.f32 %f4, %f0, %f2;");                     // ar*br
         ptx.AppendLine("    mul.rn.f32 %f5, %f1, %f3;");                     // ai*bi
         ptx.AppendLine("    sub.rn.f32 %f6, %f4, %f5;");                     // real
         ptx.AppendLine("    mul.rn.f32 %f7, %f0, %f3;");                     // ar*bi
         ptx.AppendLine("    fma.rn.f32 %f8, %f1, %f2, %f7;");                // ai*br + ar*bi = imag
-        ptx.AppendLine("    st.global.f32 [%rd6], %f6;");
-        ptx.AppendLine("    st.global.f32 [%rd6+4], %f8;");
+        ptx.AppendLine("    st.global.v2.f32 [%rd6], {%f6, %f8};");          // real, imag
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");
         return ptx.ToString();
