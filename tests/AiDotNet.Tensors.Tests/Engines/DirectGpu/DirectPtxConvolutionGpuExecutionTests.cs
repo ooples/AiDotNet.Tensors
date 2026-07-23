@@ -166,6 +166,35 @@ public sealed class DirectPtxConvolutionGpuExecutionTests
         }
     }
 
+    [Fact]
+    public void RegBlocked_ProductionEmbeddedCubin_NoOverride_MatchesCpuReference()
+    {
+        if (!DirectPtxRuntime.IsAvailable) return;
+
+        // The promoted c64 config, loaded via the EMBEDDED committed cubin with
+        // the experiment JIT fallback OFF — i.e. the real production path.
+        const int n = 32, k = 64, cch = 64, hw = 3136;
+        var shape = new Conv2DRegBlockShape(n, k, cch, hw, 64, 64, 16, 4, 4);
+
+        var input = new float[n * cch * hw];
+        var weights = new float[k * cch];
+        var bias = new float[k];
+        for (int i = 0; i < input.Length; i++) input[i] = DeterministicInput(i);
+        for (int i = 0; i < weights.Length; i++) weights[i] = DeterministicWeight(i);
+        for (int i = 0; i < bias.Length; i++) bias[i] = DeterministicBias(i);
+        float[] expected = ReferenceConv1x1(input, weights, bias, n, k, cch, hw);
+
+        using var runtime = new DirectPtxRuntime();
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
+            return;
+
+        // Override OFF: construction must resolve the embedded cubin, not JIT.
+        Assert.False(DirectPtxFeatureGate.ConvolutionExperimentOverride);
+        float[] actual = LaunchRegBlocked(runtime, shape, input, weights, bias);
+        AssertClose(expected, actual);
+    }
+
     private static float[] LaunchRegBlocked(
         DirectPtxRuntime runtime, Conv2DRegBlockShape shape,
         float[] input, float[] weights, float[] bias)
