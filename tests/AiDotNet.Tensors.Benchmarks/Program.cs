@@ -13,6 +13,25 @@ class Program
 
     static void Main(string[] args)
     {
+        // GPU-free cubin generation and verification for the spectral family.
+        if (args.Length > 0 && args[0] == "--generate-direct-ptx-spectral-cubins")
+        {
+            Environment.ExitCode = DirectPtxSpectralCubinTool.Generate(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-spectral-cubins")
+        {
+            Environment.ExitCode = DirectPtxSpectralCubinTool.Verify(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-spectral-sass")
+        {
+            Environment.ExitCode = DirectPtxSpectralCubinTool.AuditSass(args);
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--direct-ptx-attention")
         {
             DirectPtxAttentionExperiment.Run();
