@@ -284,6 +284,17 @@ public static class PtxParityRegistry
             "one module per element count; output=log1p(input)=ln(1+input) via lg2.approx(1+x) scaled by " +
             "ln(2). Its spec is TOLERANCE-based, not bit-exact. Converts to ThreeWayParity (with tolerance) " +
             "when the SM86 run lands; until then unpromoted and fail-closed."),
+        new PtxParitySpec("PtxAnalyticSignalMaskF32Kernel", PtxParityStatus.Deferred,
+            "analytic-signal (Hilbert) frequency mask, fp32 (#850) - CudaBackend.AnalyticSignalMask",
+            "one module per (batch,fftSize,binLow,binHigh); the frequency-domain Hilbert step, multiplying the " +
+            "split spectrum by a per-bin gain (0 negative / 2 positive / 1 DC and Nyquist) zeroed outside the " +
+            "pass band. The gains are exact powers of two applied with one mul per lane, so the spec is " +
+            "bit-exact including NaN payloads and signed zeros. Converts to ThreeWayParity when the SM86 run lands."),
+        new PtxParitySpec("PtxIstftNormalizeF32Kernel", PtxParityStatus.Deferred,
+            "ISTFT window-sum normalization, fp32 (#850) - CudaBackend.IstftNormalize",
+            "one module per element count; the final ISTFT stage dividing result by windowSum in place, guarded " +
+            "against tiny denominators with a div.rn matching the reference and a predicated selp. Its spec is " +
+            "bit-exact. Converts to ThreeWayParity when the SM86 run lands; until then unpromoted and fail-closed."),
         new PtxParitySpec("PtxFftRollF32Kernel", PtxParityStatus.Deferred,
             "batched contiguous fft roll, fp32 (#850) - Fft.FftShift / Fft.IFftShift",
             "one module per (dim,shift,batch); output[b,i]=input[b,(i-shift) mod dim] along the last axis. " +

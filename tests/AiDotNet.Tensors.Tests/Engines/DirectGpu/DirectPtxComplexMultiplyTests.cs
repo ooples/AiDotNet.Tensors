@@ -63,6 +63,7 @@ public class DirectPtxComplexMultiplyTests
             new[]
             {
                 "CudaBackend.AmplitudeToDb",
+                "CudaBackend.AnalyticSignalMask",
                 "CudaBackend.ApplyMelFilterbank",
                 "CudaBackend.ApplyWindow",
                 "CudaBackend.BatchedFFT",
@@ -71,6 +72,7 @@ public class DirectPtxComplexMultiplyTests
                 "CudaBackend.ComplexConjugate",
                 "CudaBackend.ComplexMagnitude",
                 "CudaBackend.ComplexMultiply",
+                "CudaBackend.ComplexPhase",
                 "CudaBackend.DbToPower",
                 "CudaBackend.DeinterleaveComplex",
                 "CudaBackend.FFT",
@@ -78,9 +80,11 @@ public class DirectPtxComplexMultiplyTests
                 "CudaBackend.IRFFT",
                 "CudaBackend.InterleaveComplex",
                 "CudaBackend.IstftFromSpectrum",
+                "CudaBackend.IstftNormalize",
                 "CudaBackend.MelFilterbankApply",
                 "CudaBackend.MfccLog1p",
                 "CudaBackend.PhaseVocoder",
+                "CudaBackend.PolarToComplex",
                 "CudaBackend.PowerToDb",
                 "CudaBackend.RFFT",
                 "CudaBackend.SplitComplexAdd",
@@ -2018,6 +2022,109 @@ public class DirectPtxComplexMultiplyTests
         fB.Download<float>(actFull); rB.Download<float>(actReal);
         for (int i = 0; i < n; i++) Assert.Equal(expFull[i], actFull[i]);
         for (int i = 0; i < actReal.Length; i++) Assert.Equal(expReal[i], actReal[i]);
+    }
+
+    [Fact]
+    public void AnalyticSignalMaskEmitter_IsPredicatedGain()
+    {
+        string ptx = PtxAnalyticSignalMaskF32Kernel.EmitPtx(8, 6, 4, 512, 8, 200);   // halfN=256
+        Assert.Contains("op=analytic-signal-mask", ptx);
+        Assert.Contains("setp.lt.u32 %p1, %r3, 256", ptx);      // k < halfN
+        Assert.Contains("setp.eq.u32 %p3, %r3, 256", ptx);      // k == halfN
+        Assert.Equal(2, Count(ptx, "or.pred"));                 // isEdge and outOfBand
+        Assert.Equal(3, Count(ptx, "selp.f32"));                // base, edge, band
+        Assert.Equal(2, Count(ptx, "mul.rn.f32"));              // real and imag lanes
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxAnalyticSignalMaskF32Kernel.IsSupportedShape(4, 512, 8, 200));
+        Assert.False(PtxAnalyticSignalMaskF32Kernel.IsSupportedShape(4, 512, 8, 600));   // binHigh > fftSize
+        Assert.False(PtxAnalyticSignalMaskF32Kernel.IsPromotedShape(4, 512, 8, 200));
+    }
+
+    [Fact]
+    public void IstftNormalizeEmitter_IsGuardedDivide()
+    {
+        string ptx = PtxIstftNormalizeF32Kernel.EmitPtx(8, 6, 8000);
+        Assert.Contains("op=istft-normalize", ptx);
+        Assert.Contains("setp.ge.u32 %p0, %r2, 8000", ptx);
+        Assert.Contains("div.rn.f32 %f2, %f0, %f1", ptx);
+        Assert.Contains("selp.f32 %f0, %f2, %f0, %p1", ptx);    // ws>1e-8 ? divided : original
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxIstftNormalizeF32Kernel.IsSupportedShape(8000));
+        Assert.False(PtxIstftNormalizeF32Kernel.IsPromotedShape(8000));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyAnalyticSignalMask_MatchesOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedComplexMultiply(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The candidate is admitted only on SM86.");
+        const int batch = 4, fftSize = 512, binLow = 8, binHigh = 200, halfN = fftSize / 2;
+        using var kernel = new PtxAnalyticSignalMaskF32Kernel(runtime, batch, fftSize, binLow, binHigh);
+        var re = new float[batch * fftSize];
+        var im = new float[batch * fftSize];
+        var random = RandomHelper.CreateSeededRandom(20270601);
+        for (int i = 0; i < re.Length; i++) { re[i] = (float)(random.NextDouble() * 2 - 1); im[i] = (float)(random.NextDouble() * 2 - 1); }
+        var expRe = new float[batch * fftSize];
+        var expIm = new float[batch * fftSize];
+        for (int idx = 0; idx < batch * fftSize; idx++)
+        {
+            int k = idx % fftSize;
+            float gain;
+            if (k == 0 || k == halfN) gain = (k < binLow || k >= binHigh) ? 0f : 1f;
+            else if (k < halfN) gain = (k < binLow || k >= binHigh) ? 0f : 2f;
+            else gain = 0f;
+            expRe[idx] = re[idx] * gain; expIm[idx] = im[idx] * gain;
+        }
+        using var rB = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var iB = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var orB = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        using var oiB = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
+        rB.Upload<float>(re); iB.Upload<float>(im);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(rB, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(iB, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(orB, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(oiB, kernel.Blueprint.Tensors[3]));
+        runtime.Synchronize();
+        var actRe = new float[batch * fftSize];
+        var actIm = new float[batch * fftSize];
+        orB.Download<float>(actRe); oiB.Download<float>(actIm);
+        for (int i = 0; i < actRe.Length; i++) { Assert.Equal(expRe[i], actRe[i]); Assert.Equal(expIm[i], actIm[i]); }
+    }
+
+    [SkippableFact]
+    public void DriverOnlyIstftNormalize_MatchesOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedComplexUnary(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The candidate is admitted only on SM86.");
+        const int total = 8000;
+        using var kernel = new PtxIstftNormalizeF32Kernel(runtime, total);
+        var result = new float[total];
+        var windowSum = new float[total];
+        var random = RandomHelper.CreateSeededRandom(20270602);
+        for (int i = 0; i < total; i++)
+        {
+            result[i] = (float)(random.NextDouble() * 2 - 1);
+            windowSum[i] = (i % 17 == 0) ? 0f : (float)(random.NextDouble() + 0.1);   // some below the floor
+        }
+        var expected = new float[total];
+        for (int i = 0; i < total; i++) expected[i] = windowSum[i] > 1e-8f ? result[i] / windowSum[i] : result[i];
+        using var resB = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var wsB = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        resB.Upload<float>(result); wsB.Upload<float>(windowSum);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(resB, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(wsB, kernel.Blueprint.Tensors[1]));
+        runtime.Synchronize();
+        var actual = new float[total];
+        resB.Download<float>(actual);
+        for (int i = 0; i < total; i++) Assert.Equal(expected[i], actual[i]);   // bit-exact
     }
 
     private static int Count(string text, string value)
