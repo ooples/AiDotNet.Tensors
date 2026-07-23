@@ -47,6 +47,21 @@ public static class PtxParityRegistry
 {
     public static IReadOnlyList<PtxParitySpec> Specs { get; } = new[]
     {
+        new PtxParitySpec("PtxFusedIndexSelectF32Kernel", PtxParityStatus.Deferred,
+            "index select, fp32 (#844) - CudaBackend.IndexSelect",
+            "a permuted copy, so its three-way spec can be bit-exact with no tolerance. The spec must " +
+            "cover one thing the gather spec does not: this op's index buffer holds FLOAT values and " +
+            "the reference applies a truncating (int) cast, so the legs have to be driven with " +
+            "non-integral index values too (3.7 must select row 3) to prove the conversion is numeric " +
+            "and not a bit reinterpretation."),
+
+        new PtxParitySpec("PtxFusedGatherF32Kernel", PtxParityStatus.Deferred,
+            "embedding gather, fp32 (#844) — CudaBackend.Gather",
+            "has a public route, but its tests cover the emitter and the PTX-vs-CPU result only, so the " +
+            "gate-off CUDA==CPU leg is unproven. Converts to ThreeWayParity by mirroring " +
+            "BackendRowSum_ThreeWay_CudaAndPtxBothMatchCpuOracle over Gather — gather is exact " +
+            "(a pure permuted copy, no accumulation), so the oracle comparison can be bit-exact."),
+
         new PtxParitySpec("PtxFusedResidualRmsNormD64Kernel", PtxParityStatus.Deferred,
             "fused residual + RMSNorm (D=64)",
             "backend method has no public op route on main (only the CUDA RmsNorm path is wired), " +

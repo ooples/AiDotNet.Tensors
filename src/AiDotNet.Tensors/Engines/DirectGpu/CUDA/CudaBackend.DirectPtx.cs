@@ -29,6 +29,8 @@ public sealed partial class CudaBackend
         _directPtxFlashAttentionBackwardKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<DirectPtxQkvRopeCacheKey, PtxFusedQkvRopeCacheD64Kernel>
         _directPtxQkvRopeCacheKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<DirectPtxGatherKey, PtxFusedGatherF32Kernel>
+        _directPtxGatherKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private DirectPtxRuntime? _directPtxRuntime;
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
@@ -42,6 +44,7 @@ public sealed partial class CudaBackend
     private long _directPtxAttentionBackwardDispatchCount;
     private long _directPtxFlashAttentionBackwardDispatchCount;
     private long _directPtxQkvRopeCacheDispatchCount;
+    private long _directPtxGatherDispatchCount;
     internal int DirectPtxCachedKernelCount
     {
         get { lock (_directPtxLock) return _directPtxAttentionKernels.Count; }
@@ -343,6 +346,17 @@ public sealed partial class CudaBackend
         }
         audit = null!;
         return false;
+    }
+
+    internal bool IsDirectPtxGatherEnabled =>
+        DirectPtxFeatureGate.IsGatherEnabled && IsAvailable &&
+        DirectPtxArchitecture.HasValidatedGather(_ccMajor, _ccMinor);
+
+    internal long DirectPtxGatherDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxGatherDispatchCount);
+    internal int DirectPtxGatherPinnedKernelCount
+    {
+        get { lock (_directPtxLock) return _directPtxGatherKernels.PinnedCount; }
     }
 
     /// <summary>
@@ -1774,6 +1788,210 @@ public sealed partial class CudaBackend
         return false;
     }
 
+    /// <summary>
+    /// Attempts exact contiguous FP32 embedding gather:
+    /// output[i,:] = source[indices[i],:]. Shape validation happens before
+    /// dispatch; the PTX ABI receives only index/source/output pointers. Indices
+    /// are trusted in range, as the established embedding_forward kernel requires.
+    /// </summary>
+    internal bool TryDirectPtxGather(
+        IGpuBuffer source,
+        IGpuBuffer indices,
+        IGpuBuffer output,
+        int numIndices,
+        int featureSize)
+    {
+        if (source is null || indices is null || output is null)
+        {
+            DirectPtxLastError = "gather-null-buffer";
+            return false;
+        }
+        if (!DirectPtxFeatureGate.IsGatherEnabled)
+        {
+            DirectPtxLastError = "gather-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "gather-cuda-unavailable";
+            return false;
+        }
+        if (!DirectPtxArchitecture.HasValidatedGather(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = "gather-architecture-not-validated";
+            return false;
+        }
+        if (!PtxFusedGatherF32Kernel.IsSupportedShape(numIndices, featureSize))
+        {
+            DirectPtxLastError = "gather-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedGatherF32Kernel.IsPromotedShape(numIndices, featureSize) &&
+            !DirectPtxFeatureGate.GatherExperimentOverride)
+        {
+            DirectPtxLastError = "gather-performance-gate-not-met";
+            return false;
+        }
+
+        long rowBytes = checked((long)featureSize * sizeof(float));
+        if (indices.SizeInBytes != checked((long)numIndices * sizeof(int)) ||
+            output.SizeInBytes != checked((long)numIndices * rowBytes) ||
+            source.SizeInBytes < rowBytes || source.SizeInBytes % rowBytes != 0)
+        {
+            DirectPtxLastError = "gather-physical-extent-mismatch";
+            return false;
+        }
+        if (source.Handle == IntPtr.Zero || indices.Handle == IntPtr.Zero ||
+            output.Handle == IntPtr.Zero)
+        {
+            DirectPtxLastError = "gather-invalid-device-pointer";
+            return false;
+        }
+        if (((PtxCompat.ToNuint(source.Handle) | PtxCompat.ToNuint(output.Handle)) & 15u) != 0 ||
+            (PtxCompat.ToNuint(indices.Handle) & 3u) != 0)
+        {
+            DirectPtxLastError = "gather-alignment-mismatch";
+            return false;
+        }
+        if (DirectPtxGatherBuffersOverlap(source, indices, output))
+        {
+            DirectPtxLastError = "gather-alias-not-supported";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var key = new DirectPtxGatherKey(numIndices, featureSize);
+            lock (_directPtxLock)
+            {
+                if (!_directPtxGatherKernels.TryGetValue(
+                    key, out PtxFusedGatherF32Kernel? kernel))
+                {
+                    if (capturing)
+                    {
+                        DirectPtxLastError =
+                            "Direct PTX gather must be prewarmed before CUDA graph capture.";
+                        return false;
+                    }
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    kernel = CreateAndCacheGatherKernelSlow(key);
+                }
+                if (capturing && !_directPtxGatherKernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX gather module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(indices, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(source, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[2]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxGatherDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    private static bool DirectPtxGatherBuffersOverlap(
+        IGpuBuffer source,
+        IGpuBuffer indices,
+        IGpuBuffer output) =>
+        Overlaps(source, indices) || Overlaps(source, output) || Overlaps(indices, output);
+
+    private static bool Overlaps(IGpuBuffer left, IGpuBuffer right)
+    {
+        nuint leftStart = PtxCompat.ToNuint(left.Handle);
+        nuint rightStart = PtxCompat.ToNuint(right.Handle);
+        nuint leftEnd = checked(leftStart + (nuint)left.SizeInBytes);
+        nuint rightEnd = checked(rightStart + (nuint)right.SizeInBytes);
+        return leftStart < rightEnd && rightStart < leftEnd;
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxFusedGatherF32Kernel CreateAndCacheGatherKernelSlow(
+        DirectPtxGatherKey key) =>
+        _directPtxGatherKernels.GetOrAdd(key, () =>
+            new PtxFusedGatherF32Kernel(
+                _directPtxRuntime!, key.NumIndices, key.FeatureSize));
+
+    internal bool PrewarmDirectPtxGather(int numIndices, int featureSize)
+    {
+        if (!DirectPtxFeatureGate.IsGatherEnabled)
+        {
+            DirectPtxLastError = "gather-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "gather-cuda-unavailable";
+            return false;
+        }
+        if (!DirectPtxArchitecture.HasValidatedGather(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = "gather-architecture-not-validated";
+            return false;
+        }
+        if (!PtxFusedGatherF32Kernel.IsSupportedShape(numIndices, featureSize))
+        {
+            DirectPtxLastError = "gather-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedGatherF32Kernel.IsPromotedShape(numIndices, featureSize) &&
+            !DirectPtxFeatureGate.GatherExperimentOverride)
+        {
+            DirectPtxLastError = "gather-performance-gate-not-met";
+            return false;
+        }
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX gather prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                var key = new DirectPtxGatherKey(numIndices, featureSize);
+                if (!_directPtxGatherKernels.TryGetValue(key, out _))
+                    _ = CreateAndCacheGatherKernelSlow(key);
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxGatherAudit(
+        int numIndices,
+        int featureSize,
+        out DirectPtxKernelAudit audit)
+    {
+        lock (_directPtxLock)
+        {
+            var key = new DirectPtxGatherKey(numIndices, featureSize);
+            if (_directPtxGatherKernels.TryGetValue(key, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null!;
+        return false;
+    }
+
     private void DisposeDirectPtxRuntime()
     {
         lock (_directPtxLock)
@@ -1786,6 +2004,7 @@ public sealed partial class CudaBackend
             _directPtxAttentionBackwardKernels.Dispose();
             _directPtxFlashAttentionBackwardKernels.Dispose();
             _directPtxQkvRopeCacheKernels.Dispose();
+            _directPtxGatherKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }
@@ -1853,4 +2072,5 @@ public sealed partial class CudaBackend
         int CacheCapacity,
         int Position);
 
+    private readonly record struct DirectPtxGatherKey(int NumIndices, int FeatureSize);
 }

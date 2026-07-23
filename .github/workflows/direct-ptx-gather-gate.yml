@@ -1,0 +1,129 @@
+name: Direct PTX Gather Gate
+
+# Produces and audits the gather family's machine code WITHOUT a GPU.
+#
+# ptxas and nvdisasm are both host tools, so an ordinary ubuntu runner can
+# compile the emitted PTX to sm86 cubins, prove those cubins match the
+# checked-in manifest, disassemble them, and enforce the zero-local-memory
+# contract. That makes the promotion evidence reproducible on every pull request
+# instead of depending on one admitted device being available.
+
+on:
+  pull_request:
+    branches: [master, main]
+    paths:
+      - '.github/workflows/direct-ptx-gather-gate.yml'
+      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxFusedGatherF32Kernel.cs'
+      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxFusedIndexSelectF32Kernel.cs'
+      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/**'
+      - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxGatherCubinTool.cs'
+      - 'tests/AiDotNet.Tensors.Benchmarks/Program.cs'
+  push:
+    branches: [master, main]
+    paths:
+      - '.github/workflows/direct-ptx-gather-gate.yml'
+      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/**'
+      - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxGatherCubinTool.cs'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_NOLOGO: true
+  # Pinned so the cubins stay byte-reproducible: the compiler version is part of
+  # the artifact identity, exactly like the PTX text is.
+  NVCC_VERSION: '13.3.33'
+  NVCC_SHA256: '93b098bda4a562ebf3541523ce82adc43f106a81dcf28bcbf8f0d8e093d1c66f'
+  NVDISASM_VERSION: '13.3.29'
+  NVDISASM_SHA256: '95b7f617ea11bb983a7150827a14ff4488cba10f0171fa8ae2e845bd58823456'
+
+jobs:
+  offline-cubin-and-sass:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+          dotnet-quality: 'preview'
+
+      - name: Build the tool
+        run: >-
+          dotnet build tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.csproj
+          --configuration Release --framework net10.0
+
+      - name: Install pinned ptxas
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/cuda-nvcc.tar.xz"
+          url="https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/linux-x86_64/cuda_nvcc-linux-x86_64-${NVCC_VERSION}-archive.tar.xz"
+          curl --fail --location --silent --show-error "$url" --output "$archive"
+          echo "${NVCC_SHA256}  ${archive}" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/cuda-nvcc"
+          tar -xJf "$archive" -C "$RUNNER_TEMP/cuda-nvcc" --strip-components=1
+          test -x "$RUNNER_TEMP/cuda-nvcc/bin/ptxas"
+
+      - name: Install pinned nvdisasm
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/cuda-nvdisasm.tar.xz"
+          url="https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvdisasm/linux-x86_64/cuda_nvdisasm-linux-x86_64-${NVDISASM_VERSION}-archive.tar.xz"
+          curl --fail --location --silent --show-error "$url" --output "$archive"
+          echo "${NVDISASM_SHA256}  ${archive}" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/cuda-nvdisasm"
+          tar -xJf "$archive" -C "$RUNNER_TEMP/cuda-nvdisasm" --strip-components=1
+          test -x "$RUNNER_TEMP/cuda-nvdisasm/bin/nvdisasm"
+
+      # Every kernel must compile to sm86 with no register spills. ptxas is told
+      # to warn on spills and the tool treats any spill as a failure, so the
+      # zero-local-memory budget is enforced at compile time, before any
+      # disassembly.
+      - name: Compile every admitted shape to sm86
+        run: >-
+          dotnet tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Benchmarks.dll
+          --generate-direct-ptx-gather-cubins
+          "$RUNNER_TEMP/cuda-nvcc/bin/ptxas"
+          "$RUNNER_TEMP/direct-ptx-gather/sm86"
+
+      # The checked-in cubins must be exactly what this ptxas produces from the
+      # current PTX. A kernel edit without a regenerated artifact fails here
+      # rather than shipping a stale binary that no longer matches its source.
+      - name: Verify the checked-in cubins are current
+        run: >-
+          dotnet tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Benchmarks.dll
+          --verify-direct-ptx-gather-cubins
+          "$RUNNER_TEMP/cuda-nvcc/bin/ptxas"
+          "src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/sm86"
+
+      # The disassembly is the machine-code evidence the promotion gate asks
+      # for, and it needs no device: LDL/STL in the SASS means a spill reached
+      # the executable.
+      - name: Disassemble and enforce the SASS contract
+        run: >-
+          dotnet tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Benchmarks.dll
+          --audit-direct-ptx-gather-sass
+          "$RUNNER_TEMP/cuda-nvdisasm/bin/nvdisasm"
+          "src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/sm86"
+          "artifacts/direct-ptx/gather/sass"
+
+      # Always upload: when the verify or SASS step fails, the generated
+      # artifacts are exactly the evidence needed to diagnose it, and on a fresh
+      # family they are what gets committed to seed the manifest.
+      - name: Upload cubins and SASS evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: direct-ptx-gather-sm86
+          path: |
+            ${{ runner.temp }}/direct-ptx-gather/sm86/
+            artifacts/direct-ptx/gather/sass/
+          if-no-files-found: warn
+          retention-days: 14

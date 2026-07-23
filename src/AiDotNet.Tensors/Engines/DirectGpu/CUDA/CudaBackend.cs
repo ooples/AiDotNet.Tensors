@@ -11244,6 +11244,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void Gather(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, int numIndices, int featureSize)
     {
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxGather(source, indices, output, numIndices, featureSize))
+            return;
+#endif
         if (!_kernelCache.TryGetValue("embedding_forward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: embedding_forward");
 
