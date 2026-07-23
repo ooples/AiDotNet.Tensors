@@ -147,14 +147,16 @@ internal sealed class PtxFusedIndexSelectF32Kernel : IDisposable
         // toward zero, which is exactly cvt.rzi.s32.f32.
         ptx.AppendLine($"    mul.wide.u32 %rd3, %r3, {sizeof(float)};");
         ptx.AppendLine("    add.u64 %rd4, %rd1, %rd3;");
-        ptx.AppendLine("    ld.global.ca.f32 %f0, [%rd4];");
+        // Streamed once and never revisited, so this goes through the
+        // read-only data cache instead of displacing L1.
+        ptx.AppendLine("    ld.global.nc.f32 %f0, [%rd4];");
         ptx.AppendLine("    cvt.rzi.s32.f32 %r5, %f0;");
         // src = srcIdx * innerSize + j
         ptx.AppendLine($"    mul.lo.s32 %r6, %r5, {innerSize};");
         ptx.AppendLine("    add.s32 %r7, %r6, %r4;");
         ptx.AppendLine($"    mul.wide.s32 %rd5, %r7, {sizeof(float)};");
         ptx.AppendLine("    add.u64 %rd6, %rd0, %rd5;");
-        ptx.AppendLine("    ld.global.ca.f32 %f1, [%rd6];");
+        ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd6];");
         ptx.AppendLine($"    mul.wide.u32 %rd7, %r2, {sizeof(float)};");
         ptx.AppendLine("    add.u64 %rd8, %rd2, %rd7;");
         ptx.AppendLine("    st.global.f32 [%rd8], %f1;");

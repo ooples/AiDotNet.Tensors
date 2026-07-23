@@ -25,11 +25,11 @@ public class DirectPtxGatherTests
         Assert.Contains("exact-shape indices=2048 feature=128 block=128", ptx);
         Assert.Contains("op=gather", ptx);
         Assert.Equal(3, Count(ptx, "ld.param.u64"));
-        Assert.Equal(1, Count(ptx, "ld.global.ca.u32"));
+        Assert.Equal(1, Count(ptx, "ld.global.nc.u32"));
         Assert.Equal(1, Count(ptx, "mul.wide.s32"));
-        Assert.Equal(1, Count(ptx, "ld.global.ca.v4.f32"));
+        Assert.Equal(1, Count(ptx, "ld.global.nc.v4.f32"));
         Assert.Equal(1, Count(ptx, "st.global.v4.f32"));
-        Assert.Contains("ld.global.ca.v2.f32",
+        Assert.Contains("ld.global.nc.v2.f32",
             PtxFusedGatherF32Kernel.EmitPtx(8, 6, 2048, 64));
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);

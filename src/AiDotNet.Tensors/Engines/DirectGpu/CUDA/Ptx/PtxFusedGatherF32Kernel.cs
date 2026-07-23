@@ -134,7 +134,9 @@ internal sealed class PtxFusedGatherF32Kernel : IDisposable
         // Load this warp's index.
         ptx.AppendLine("    mul.wide.u32 %rd3, %r4, 4;");
         ptx.AppendLine("    add.u64 %rd4, %rd0, %rd3;");
-        ptx.AppendLine("    ld.global.ca.u32 %r5, [%rd4];");
+        // Streamed once and never revisited, so this goes through the
+        // read-only data cache instead of displacing L1.
+        ptx.AppendLine("    ld.global.nc.u32 %r5, [%rd4];");
         // Source row base = source + index * rowBytes (signed index).
         ptx.AppendLine($"    mul.wide.s32 %rd5, %r5, {rowBytes};");
         ptx.AppendLine("    add.u64 %rd6, %rd1, %rd5;");
@@ -146,7 +148,7 @@ internal sealed class PtxFusedGatherF32Kernel : IDisposable
         ptx.AppendLine("    add.u64 %rd10, %rd2, %rd9;");
         ptx.AppendLine("    add.u64 %rd11, %rd10, %rd7;");
         ptx.AppendLine(
-            $"    ld.global.ca.v{valuesPerLane}.f32 {{{valueRegisters}}}, [%rd8];");
+            $"    ld.global.nc.v{valuesPerLane}.f32 {{{valueRegisters}}}, [%rd8];");
         ptx.AppendLine(
             $"    st.global.v{valuesPerLane}.f32 [%rd11], {{{valueRegisters}}};");
         ptx.AppendLine("    ret;");

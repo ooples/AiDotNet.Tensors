@@ -25,13 +25,13 @@ public class DirectPtxIndexSelectTests
 
         // The index is LOADED as a float and converted with a numeric truncation
         // toward zero, matching the reference's (int) cast.
-        Assert.Contains("ld.global.ca.f32 %f0, [%rd4];", ptx);
+        Assert.Contains("ld.global.nc.f32 %f0, [%rd4];", ptx);
         Assert.Contains("cvt.rzi.s32.f32 %r5, %f0;", ptx);
         // A bit reinterpretation would use mov.b32 on the index - it must not.
         Assert.DoesNotContain("mov.b32 %r5, %f0;", ptx);
         // Nor may the index be read as an integer directly.
-        Assert.DoesNotContain("ld.global.ca.s32", ptx, StringComparison.Ordinal);
-        Assert.DoesNotContain("ld.global.ca.u32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("ld.global.nc.s32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("ld.global.nc.u32", ptx, StringComparison.Ordinal);
     }
 
     [Fact]
