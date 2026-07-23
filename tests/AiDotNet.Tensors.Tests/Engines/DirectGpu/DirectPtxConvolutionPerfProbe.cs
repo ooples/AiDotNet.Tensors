@@ -42,6 +42,7 @@ public sealed class DirectPtxConvolutionPerfProbe
             MeasureRegBlocked(runtime, new Conv2DRegBlockShape(32, 64, 64, 3136, 64, 64, 16, 4, 4));
             // ResNet c64 3x3 same-conv via Winograd F(2,3): N32/C64/56x56/K64.
             MeasureWinograd(runtime, new Conv2DWinogradShape(32, 64, 56, 56, 64));
+            MeasureWinogradPretransformed(runtime, 32, 64, 56, 56, 64);
         }
         finally
         {
@@ -136,6 +137,39 @@ public sealed class DirectPtxConvolutionPerfProbe
         long flops = 2L * shape.Batch * shape.OutputChannels * shape.Height * shape.Width * shape.InputChannels * 9;
         Report($"winograd N{shape.Batch}/C{shape.InputChannels}/{shape.Height}x{shape.Width}/K{shape.OutputChannels} 3x3 " +
             $"regs={kernel.FunctionInfo.RegistersPerThread}", runtime, Launch, flops);
+    }
+
+    private void MeasureWinogradPretransformed(
+        DirectPtxRuntime runtime, int n, int cch, int h, int w, int kk)
+    {
+        // Stage 1 (one-time): filter transform weights -> U.
+        using var filter = new PtxWinogradF23FilterTransformKernel(runtime, kk, cch);
+        using var dWeights = runtime.AllocateBytes((nuint)filter.WeightBytes);
+        using var dU = runtime.AllocateBytes((nuint)filter.TransformedBytes);
+        dWeights.Upload<float>(new float[filter.WeightBytes / sizeof(float)]);
+        filter.Launch(
+            DirectPtxTensorView.CreateOwned(dWeights, filter.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(dU, filter.Blueprint.Tensors[1]));
+        runtime.Synchronize();
+
+        // Stage 2 (per input): the main kernel reads the precomputed U.
+        var shape = new Conv2DWinogradShape(n, cch, h, w, kk, filterPretransformed: true);
+        using var kernel = new PtxConv2DNchw3x3WinogradF23Kernel(runtime, shape);
+        using var input = runtime.AllocateBytes((nuint)shape.InputBytes);
+        using var bias = runtime.AllocateBytes((nuint)shape.BiasBytes);
+        using var output = runtime.AllocateBytes((nuint)shape.OutputBytes);
+        input.Upload<float>(new float[shape.InputBytes / sizeof(float)]);
+        bias.Upload<float>(new float[shape.BiasBytes / sizeof(float)]);
+
+        void Launch() => kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(dU, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[3]));
+
+        long flops = 2L * n * kk * h * w * cch * 9;
+        Report($"winograd-pretf N{n}/C{cch}/{h}x{w}/K{kk} 3x3 (filter U precomputed) regs={kernel.FunctionInfo.RegistersPerThread}",
+            runtime, Launch, flops);
     }
 
     private void Report(string label, DirectPtxRuntime runtime, Action launch, long flops)

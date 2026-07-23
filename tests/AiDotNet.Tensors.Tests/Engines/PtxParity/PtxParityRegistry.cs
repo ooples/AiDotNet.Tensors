@@ -140,6 +140,13 @@ public static class PtxParityRegistry
             "against the strongest eligible cuDNN/PyTorch competitor, plus Nsight zero-spill SASS evidence. " +
             "Keep deferred until that three-way matrix and the competitive gates exist."),
 
+        new PtxParitySpec("PtxWinogradF23FilterTransformKernel", PtxParityStatus.Deferred,
+            "Winograd F(2,3) filter transform U = G g G^T (#841 3x3 pipeline)",
+            "the one-time filter-transform stage of the optimized Winograd 3x3 pipeline (weights[K,C,3,3] -> " +
+            "U[K,C,4,4]); the main kernel reads U instead of recomputing it per output tile. Covered on-device " +
+            "transitively by the pretransformed-Winograd correctness test. Deferred until the full pipeline " +
+            "clears the >=1.10x gate."),
+
         new PtxParitySpec("PtxConv2DNchw3x3WinogradF23Kernel", PtxParityStatus.Deferred,
             "Winograd F(2,3) 3x3 stride-1 same-conv+bias+ReLU, ResNet shapes (#841)",
             "the 3x3 forward cell computed via Winograd F(2,3) (2x2 output tile, 4x4 input tile; input " +
