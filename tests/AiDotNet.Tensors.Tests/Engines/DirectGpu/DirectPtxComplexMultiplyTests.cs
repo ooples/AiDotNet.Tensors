@@ -69,6 +69,7 @@ public class DirectPtxComplexMultiplyTests
                 "CudaBackend.ComplexMultiply",
                 "CudaBackend.DeinterleaveComplex",
                 "CudaBackend.FFT",
+                "CudaBackend.FFT2D",
                 "CudaBackend.IRFFT",
                 "CudaBackend.InterleaveComplex",
                 "CudaBackend.RFFT",
@@ -1095,6 +1096,115 @@ public class DirectPtxComplexMultiplyTests
         {
             Assert.True(Math.Abs(actualRe[i] - expectedRe[i]) <= 1e-2 * (1 + Math.Abs(expectedRe[i])));
             Assert.True(Math.Abs(actualIm[i] - expectedIm[i]) <= 1e-2 * (1 + Math.Abs(expectedIm[i])));
+        }
+    }
+
+    [Fact]
+    public void FftColsBitReverseEmitter_IsStridedGuardedSwap()
+    {
+        string ptx = PtxFftColsBitReverseF32Kernel.EmitPtx(8, 6, 4, 512);   // log2height=2, shift=30
+        Assert.Contains("exact-shape height=4 width=512 log2h=2 block=256 op=fft-cols-bit-reverse", ptx);
+        Assert.Contains("rem.u32 %r3, %r2, 512", ptx);         // col = gid % width
+        Assert.Contains("div.u32 %r4, %r2, 512", ptx);         // row = gid / width
+        Assert.Contains("brev.b32 %r5, %r4", ptx);
+        Assert.Contains("shr.u32 %r5, %r5, 30", ptx);          // 32 - log2(4)
+        Assert.Contains("mad.lo.u32 %r6, %r4, 512, %r3", ptx); // row*width + col
+        Assert.Equal(4, Count(ptx, "ld.global.f32"));
+        Assert.Equal(4, Count(ptx, "st.global.f32"));
+        Assert.DoesNotContain("fma", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxFftColsBitReverseF32Kernel.IsSupportedShape(4, 512));
+        Assert.False(PtxFftColsBitReverseF32Kernel.IsSupportedShape(3, 512));   // height not power of two
+        Assert.False(PtxFftColsBitReverseF32Kernel.IsPromotedShape(4, 512));
+    }
+
+    [Fact]
+    public void FftColsButterflyEmitter_IsStridedWingTwiddle()
+    {
+        string ptx = PtxFftColsButterflyF32Kernel.EmitPtx(8, 6, 4, 512);
+        Assert.Contains("exact-shape height=4 width=512 block=256 op=fft-cols-butterfly", ptx);
+        Assert.Equal(2, Count(ptx, "ld.param.u32"));
+        Assert.Contains("rem.u32 %r3, %r2, 512", ptx);            // col
+        Assert.Contains("mad.lo.u32 %r11, %r10, 512, %r3", ptx);  // topIdx = topRow*width + col
+        Assert.Contains("mad.lo.u32 %r13, %r5, 512, %r11", ptx);  // botIdx = topIdx + halfStride*width
+        Assert.Contains("cos.approx.f32", ptx);
+        Assert.Contains("sin.approx.f32", ptx);
+        Assert.Equal(2, Count(ptx, "fma.rn.f32"));
+        Assert.Equal(4, Count(ptx, "ld.global.f32"));
+        Assert.Equal(4, Count(ptx, "st.global.f32"));
+        Assert.DoesNotContain("bra", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxFftColsButterflyF32Kernel.IsSupportedShape(4, 512));
+        Assert.False(PtxFftColsButterflyF32Kernel.IsSupportedShape(4, 500));   // width not power of two
+        Assert.False(PtxFftColsButterflyF32Kernel.IsPromotedShape(4, 512));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyFft2D_MatchesDouble2DDftOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedComplexMultiply(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The candidate is admitted only on SM86.");
+        const int height = 4, width = 512, total = height * width;
+        using var rowReverse = new PtxBatchedBitReverseF32Kernel(runtime, width, height);
+        using var rowButterfly = new PtxBatchedFftButterflyF32Kernel(runtime, width, height);
+        using var colReverse = new PtxFftColsBitReverseF32Kernel(runtime, height, width);
+        using var colButterfly = new PtxFftColsButterflyF32Kernel(runtime, height, width);
+
+        var real = new float[total];
+        var imag = new float[total];
+        var random = RandomHelper.CreateSeededRandom(20261220);
+        for (int i = 0; i < total; i++) { real[i] = (float)(random.NextDouble() * 2 - 1); imag[i] = 0f; }
+
+        // Full 2D forward DFT oracle in double precision.
+        var expectedRe = new double[total];
+        var expectedIm = new double[total];
+        for (int r = 0; r < height; r++)
+            for (int c = 0; c < width; c++)
+            {
+                double sr = 0, si = 0;
+                for (int t = 0; t < height; t++)
+                    for (int s = 0; s < width; s++)
+                    {
+                        double angle = -2.0 * Math.PI * ((double)r * t / height + (double)c * s / width);
+                        double xr = real[t * width + s];
+                        sr += xr * Math.Cos(angle);
+                        si += xr * Math.Sin(angle);
+                    }
+                expectedRe[r * width + c] = sr; expectedIm[r * width + c] = si;
+            }
+
+        using var reB = runtime.AllocateBytes(rowReverse.Blueprint.Tensors[0].RequiredBytes);
+        using var imB = runtime.AllocateBytes(rowReverse.Blueprint.Tensors[1].RequiredBytes);
+        reB.Upload<float>(real); imB.Upload<float>(imag);
+
+        // Row pass: batched FFT over height rows of length width.
+        rowReverse.Launch(
+            DirectPtxTensorView.CreateOwned(reB, rowReverse.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(imB, rowReverse.Blueprint.Tensors[1]));
+        for (int stride = 2; stride <= width; stride <<= 1)
+            rowButterfly.Launch(
+                DirectPtxTensorView.CreateOwned(reB, rowButterfly.Blueprint.Tensors[0]),
+                DirectPtxTensorView.CreateOwned(imB, rowButterfly.Blueprint.Tensors[1]), stride, 0);
+        // Column pass: strided FFT over width columns of length height.
+        colReverse.Launch(
+            DirectPtxTensorView.CreateOwned(reB, colReverse.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(imB, colReverse.Blueprint.Tensors[1]));
+        for (int stride = 2; stride <= height; stride <<= 1)
+            colButterfly.Launch(
+                DirectPtxTensorView.CreateOwned(reB, colButterfly.Blueprint.Tensors[0]),
+                DirectPtxTensorView.CreateOwned(imB, colButterfly.Blueprint.Tensors[1]), stride, 0);
+        runtime.Synchronize();
+
+        var actualRe = new float[total];
+        var actualIm = new float[total];
+        reB.Download<float>(actualRe); imB.Download<float>(actualIm);
+        for (int i = 0; i < total; i++)
+        {
+            Assert.True(Math.Abs(actualRe[i] - expectedRe[i]) <= 2e-2 * (1 + Math.Abs(expectedRe[i])));
+            Assert.True(Math.Abs(actualIm[i] - expectedIm[i]) <= 2e-2 * (1 + Math.Abs(expectedIm[i])));
         }
     }
 
