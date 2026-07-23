@@ -58,7 +58,7 @@ internal static class DirectPtxSpectralCoverageManifest
         Planned("CudaBackend.BuildSpectrum", "NVRTC build_spectrum", "magnitude/phase to Hermitian spectrum", Frames, "FP32", "spectrum-build-cells"),
         Planned("CudaBackend.IstftFromSpectrum", "NVRTC ISTFT overlap-add", "spectrum inverse transform and overlap-add", Frames, "FP32", "istft-overlap-add-cells"),
         Planned("CudaBackend.PhaseVocoder", "NVRTC phase_vocoder", "rate-adjusted magnitude/phase", Frames, "FP32", "phase-vocoder-cells"),
-        Planned("CudaBackend.ApplyMelFilterbank", "NVRTC mel filterbank", "power spectrum to mel bands", Frames, "FP32", "mel-filterbank-cells"),
+        Experimental("CudaBackend.ApplyMelFilterbank", "NVRTC mel filterbank", "power spectrum to mel bands", Frames, "FP32", "v1 Ampere exact-shape cells (PtxApplyMelFilterbankF32Kernel); thread-per-(frame,mel) fma reduction over freqs"),
         Planned("CudaBackend.MelFilterbankApply", "NVRTC spectral mel apply", "segmented power-to-mel", Frames, "FP32", "segmented-mel-cells"),
         Planned("CudaBackend.SpectralFilter", "FFT2D multiply IFFT2D pipeline", "real spatial spectral filtering", Split, "FP32", "fft-filter-ifft-fusion-cells"),
         Planned("DirectGpuTensorEngine.FFT", "resident CUDA FFT or CPU fallback", "public complex FFT", Split, "generic public; CUDA FP32", "public-fft-routing"),

@@ -143,6 +143,12 @@ public static class PtxParityRegistry
             "one module over the four exact element counts using cos.approx/sin.approx, so its spec is " +
             "TOLERANCE-based, not bit-exact. Converts to ThreeWayParity (with tolerance) when the SM86 " +
             "run lands; until then unpromoted and fail-closed."),
+
+        new PtxParitySpec("PtxApplyMelFilterbankF32Kernel", PtxParityStatus.Deferred,
+            "mel filterbank application, fp32 (#850) - CudaBackend.ApplyMelFilterbank",
+            "thread-per-(frame,mel) fma reduction over the frequency axis, matching the reference's " +
+            "fused sum. The spec is a fp64-oracle comparison over exact (frames,freqs,mels) shapes on " +
+            "SM86; converts to ThreeWayParity when that run lands. Until then unpromoted and fail-closed."),
     };
 
     private static readonly Dictionary<string, PtxParitySpec> ByKernel =
