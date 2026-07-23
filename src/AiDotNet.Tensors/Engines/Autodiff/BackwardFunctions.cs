@@ -4803,8 +4803,14 @@ internal static class BackwardFunctions<T>
             // gradient tensors).
             var inputGrad = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
             var weightGrad = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
-            var gradInputArr = (float[])(object)inputGrad.GetDataArray();
-            var gradWeightArr = (float[])(object)weightGrad.GetDataArray();
+            var gradInputArr = (float[])(object)(
+                inputGrad.GetLiveBackingArrayAllowingPaddingOrNull()
+                ?? throw new InvalidOperationException(
+                    "FusedLinear float input-gradient buffer must be a contiguous CPU tensor."));
+            var gradWeightArr = (float[])(object)(
+                weightGrad.GetLiveBackingArrayAllowingPaddingOrNull()
+                ?? throw new InvalidOperationException(
+                    "FusedLinear float weight-gradient buffer must be a contiguous CPU tensor."));
 
             bool used = false;
 
@@ -4841,7 +4847,10 @@ internal static class BackwardFunctions<T>
             if (inputs.Length > 2)
             {
                 var biasGrad = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[2]._shape);
-                var biasArr = (float[])(object)biasGrad.GetDataArray();
+                var biasArr = (float[])(object)(
+                    biasGrad.GetLiveBackingArrayAllowingPaddingOrNull()
+                    ?? throw new InvalidOperationException(
+                        "FusedLinear float bias-gradient buffer must be a contiguous CPU tensor."));
                 Array.Clear(biasArr, 0, N);
                 fixed (float* pG = gArr, pB = biasArr)
                 {
@@ -4881,8 +4890,14 @@ internal static class BackwardFunctions<T>
 
             var inputGrad = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
             var weightGrad = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
-            var gradInputArr = (double[])(object)inputGrad.GetDataArray();
-            var gradWeightArr = (double[])(object)weightGrad.GetDataArray();
+            var gradInputArr = (double[])(object)(
+                inputGrad.GetLiveBackingArrayAllowingPaddingOrNull()
+                ?? throw new InvalidOperationException(
+                    "FusedLinear double input-gradient buffer must be a contiguous CPU tensor."));
+            var gradWeightArr = (double[])(object)(
+                weightGrad.GetLiveBackingArrayAllowingPaddingOrNull()
+                ?? throw new InvalidOperationException(
+                    "FusedLinear double weight-gradient buffer must be a contiguous CPU tensor."));
 
             // dInput[M,K] = dY[M,N] · Wᵀ[N,K]; W stored [K,N] (ldb=N), transB=true.
             bool okInput = BlasProvider.TryGemmEx(M, K, N, gArr, 0, N, false, wArr, 0, N, true, gradInputArr, 0, K);
@@ -4903,7 +4918,10 @@ internal static class BackwardFunctions<T>
             if (inputs.Length > 2)
             {
                 var biasGrad = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[2]._shape);
-                var biasArr = (double[])(object)biasGrad.GetDataArray();
+                var biasArr = (double[])(object)(
+                    biasGrad.GetLiveBackingArrayAllowingPaddingOrNull()
+                    ?? throw new InvalidOperationException(
+                        "FusedLinear double bias-gradient buffer must be a contiguous CPU tensor."));
                 Array.Clear(biasArr, 0, N);
                 for (int row = 0; row < M; row++)
                 {
