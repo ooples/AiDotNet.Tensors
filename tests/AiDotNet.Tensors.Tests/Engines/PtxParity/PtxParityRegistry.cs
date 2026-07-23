@@ -173,6 +173,20 @@ public static class PtxParityRegistry
             "GEMM to Tensor Cores does NOT win; only a fully-fused TC-Winograd (M in fragments + epilogue " +
             "transform) could. Deferred."),
 
+        new PtxParitySpec("PtxWinogradWmmaFusedKernel", PtxParityStatus.Deferred,
+            "Winograd F(2,3) fully-fused FP16 Tensor-Core conv, no M round-trip (#841 3x3 option C, fused)",
+            "the cuDNN-style fused attempt: one warp runs all 16 position GEMMs via raw mma.sync m16n8k16 " +
+            "f16->f32 and applies the A^T M A output transform + bias + ReLU thread-locally in the epilogue " +
+            "(the defined m16n8k16 D-fragment layout puts each thread's accumulators at known (k,tile) coords), " +
+            "so M[16,K,P] never touches global -- killing the ~98MB round-trip of the batched pipelines. " +
+            "Verified correct on-device (<= 5e-2). HONEST perf: ~5303us amortized at ResNet C64 -- still ~10x " +
+            "off cuDNN (~494us) and worse than fp32 batched (~1977us). Root cause is now the OPERAND LOADS: " +
+            "direct-from-global mma fragment loads are ~12.5% coalesced (each warp gathers 16B from 8 separate " +
+            "128B lines) and, at 1 warp/block, the 384 dependent 32-bit loads are latency-bound. Removing the " +
+            "round-trip was necessary but not sufficient. Reaching cuDNN throughput needs the full cuDNN-class " +
+            "memory pipeline (coalesced cp.async staging + ldmatrix + multi-warp cooperation) -- a multi-day " +
+            "kernel. Deferred."),
+
         new PtxParitySpec("PtxWinogradBatchedGemmKernel", PtxParityStatus.Deferred,
             "Winograd F(2,3) batched register-blocked GEMM M[b]=U[b].V[b] (#841 3x3 pipeline)",
             "the 16 Winograd position GEMMs run as one batched register-blocked GEMM (grid.z=16), reusing " +

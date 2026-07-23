@@ -553,6 +553,61 @@ public sealed class DirectPtxConvolutionGpuExecutionTests
         finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
     }
 
+    [Fact]
+    public void Winograd3x3_WmmaFused_MatchesDirectConvReference()
+    {
+        if (!DirectPtxRuntime.IsAvailable) return;
+
+        // Fused WMMA: K multiple of 16, C multiple of 16, P multiple of 8.
+        const int n = 2, cch = 16, h = 8, w = 8, k = 32;   // P = 32
+        var input = new float[n * cch * h * w];
+        var weights = new float[k * cch * 9];
+        var bias = new float[k];
+        for (int i = 0; i < input.Length; i++) input[i] = DeterministicInput(i);
+        for (int i = 0; i < weights.Length; i++) weights[i] = DeterministicWeight(i);
+        for (int i = 0; i < bias.Length; i++) bias[i] = DeterministicBias(i);
+        float[] expected = ReferenceConv3x3Same(input, weights, bias, n, cch, h, w, k);
+
+        using var runtime = new DirectPtxRuntime();
+        if (runtime.ComputeCapabilityMajor < 7 ||
+            !DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
+            return;
+
+        bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
+        DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
+        try
+        {
+            using var filter = new PtxWinogradF23FilterTransformFp16Kernel(runtime, k, cch);
+            using var dWeights = runtime.AllocateBytes((nuint)filter.WeightBytes);
+            using var dU = runtime.AllocateBytes((nuint)filter.TransformedBytes);
+            dWeights.Upload<float>(weights);
+            filter.Launch(DirectPtxTensorView.CreateOwned(dWeights, filter.Blueprint.Tensors[0]),
+                          DirectPtxTensorView.CreateOwned(dU, filter.Blueprint.Tensors[1]));
+
+            using var inputT = new PtxWinogradF23InputTransformFp16Kernel(runtime, n, cch, h, w);
+            using var dInput = runtime.AllocateBytes((nuint)inputT.InputBytes);
+            using var dV = runtime.AllocateBytes((nuint)inputT.TransformedBytes);
+            dInput.Upload<float>(input);
+            inputT.Launch(DirectPtxTensorView.CreateOwned(dInput, inputT.Blueprint.Tensors[0]),
+                          DirectPtxTensorView.CreateOwned(dV, inputT.Blueprint.Tensors[1]));
+
+            using var fused = new PtxWinogradWmmaFusedKernel(runtime, n, cch, h, w, k);
+            using var dBias = runtime.AllocateBytes((nuint)fused.BiasBytes);
+            using var dOutput = runtime.AllocateBytes((nuint)fused.OutputBytes);
+            dBias.Upload<float>(bias);
+            fused.Launch(DirectPtxTensorView.CreateOwned(dU, fused.Blueprint.Tensors[0]),
+                         DirectPtxTensorView.CreateOwned(dV, fused.Blueprint.Tensors[1]),
+                         DirectPtxTensorView.CreateOwned(dBias, fused.Blueprint.Tensors[2]),
+                         DirectPtxTensorView.CreateOwned(dOutput, fused.Blueprint.Tensors[3]));
+            runtime.Synchronize();
+            var actual = new float[n * k * h * w];
+            dOutput.Download<float>(actual);
+            AssertClose(expected, actual, 5e-2f);
+        }
+        finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
+    }
+
     private static float[] LaunchWinograd(
         DirectPtxRuntime runtime, Conv2DWinogradShape shape,
         float[] input, float[] weights, float[] bias)
