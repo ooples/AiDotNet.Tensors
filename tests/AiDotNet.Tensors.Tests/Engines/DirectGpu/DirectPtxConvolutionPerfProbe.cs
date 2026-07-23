@@ -54,6 +54,7 @@ public sealed class DirectPtxConvolutionPerfProbe
             MeasureStagesInIsolation(runtime, 32, 64, 56, 56, 64);
             MeasureWinogradWmmaFullyFused(runtime, 32, 64, 56, 56, 64);
             MeasureWinogradWmmaFusedAllK(runtime, 32, 64, 56, 56, 64);
+            MeasureWinogradWmmaPipelined(runtime, 32, 64, 56, 56, 64);
         }
         finally
         {
@@ -578,6 +579,34 @@ public sealed class DirectPtxConvolutionPerfProbe
             DirectPtxTensorView.CreateOwned(dOutput, fused.Blueprint.Tensors[3]));
         long flops = 2L * n * kk * h * w * cch * 9;
         Report($"winograd-WMMA-ALLK N{n}/C{cch}/{h}x{w}/K{kk} 3x3 fp16-TC-1kernel-allK (V-once, regs={fused.FunctionInfo.RegistersPerThread})",
+            runtime, Launch, flops);
+    }
+
+    private void MeasureWinogradWmmaPipelined(DirectPtxRuntime runtime, int n, int cch, int h, int w, int kk)
+    {
+        if (runtime.ComputeCapabilityMajor < 7 || kk > 64) { _out.WriteLine("winograd-WMMA-PIPE: n/a"); return; }
+        using var filter = new PtxWinogradF23FilterTransformFp16Kernel(runtime, kk, cch);
+        using var dWeights = runtime.AllocateBytes((nuint)filter.WeightBytes);
+        using var dU = runtime.AllocateBytes((nuint)filter.TransformedBytes);
+        dWeights.Upload<float>(new float[filter.WeightBytes / sizeof(float)]);
+        filter.Launch(DirectPtxTensorView.CreateOwned(dWeights, filter.Blueprint.Tensors[0]),
+                      DirectPtxTensorView.CreateOwned(dU, filter.Blueprint.Tensors[1]));
+        runtime.Synchronize();
+
+        using var pipe = new PtxWinogradWmmaPipelinedKernel(runtime, n, cch, h, w, kk);
+        using var dInput = runtime.AllocateBytes((nuint)pipe.InputBytes);
+        using var dBias = runtime.AllocateBytes((nuint)pipe.BiasBytes);
+        using var dOutput = runtime.AllocateBytes((nuint)pipe.OutputBytes);
+        dInput.Upload<float>(new float[pipe.InputBytes / sizeof(float)]);
+        dBias.Upload<float>(new float[pipe.BiasBytes / sizeof(float)]);
+
+        void Launch() => pipe.Launch(
+            DirectPtxTensorView.CreateOwned(dU, pipe.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(dInput, pipe.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(dBias, pipe.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(dOutput, pipe.Blueprint.Tensors[3]));
+        long flops = 2L * n * kk * h * w * cch * 9;
+        Report($"winograd-WMMA-PIPE N{n}/C{cch}/{h}x{w}/K{kk} 3x3 fp16-TC-pipelined (dbuf transform||gemm, regs={pipe.FunctionInfo.RegistersPerThread})",
             runtime, Launch, flops);
     }
 

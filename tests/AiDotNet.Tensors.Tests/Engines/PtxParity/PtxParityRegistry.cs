@@ -187,6 +187,17 @@ public static class PtxParityRegistry
             "memory pipeline (coalesced cp.async staging + ldmatrix + multi-warp cooperation) -- a multi-day " +
             "kernel. Deferred."),
 
+        new PtxParitySpec("PtxWinogradWmmaPipelinedKernel", PtxParityStatus.Deferred,
+            "Winograd F(2,3) software-pipelined fully-fused FP16 TC conv — 1.16x off cuDNN (#841 3x3, best)",
+            "the all-K fusion + cuDNN-style software pipelining: the contraction C is split into 16-channel " +
+            "chunks and the input transform is double-buffered against the GEMM (transform chunk N+1's V into one " +
+            "shared buffer while the Tensor Cores accumulate chunk N from the other), so the transform's high-" +
+            "latency ~14%-coalesced global loads overlap the mma instead of running as a serial phase. Verified " +
+            "correct on-device (<= 5e-2, 2-chunk and 4-chunk). HONEST perf (idle 3080 @ 2040MHz, ResNet C64, " +
+            "amortized, same window): 356us vs cuDNN fp16 3x3+ReLU 307us = 1.16x off -- the culmination of the " +
+            "3x3 arc 6300us (11x) -> 356us (1.16x). regs=57 (transform + GEMM phases coexist -> ~67% occupancy, " +
+            "which caps the pipeline gain at ~6%). Best 3x3 kernel; near cuDNN parity with hand-PTX. K<=64. Deferred."),
+
         new PtxParitySpec("PtxWinogradWmmaFusedAllKKernel", PtxParityStatus.Deferred,
             "Winograd F(2,3) fully-fused FP16 TC conv, V computed once per tile-block (#841 3x3, best fused)",
             "the correct cuDNN-style fusion: grid.y=1 so one 16-warp block owns 8 tiles across ALL K channels and " +
