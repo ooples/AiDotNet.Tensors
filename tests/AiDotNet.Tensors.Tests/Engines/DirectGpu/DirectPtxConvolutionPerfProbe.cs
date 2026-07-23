@@ -1,0 +1,114 @@
+#if NET5_0_OR_GREATER
+using System;
+using System.Diagnostics;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+using Xunit;
+using Xunit.Abstractions;
+
+namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
+
+/// <summary>
+/// On-device throughput probe for the direct-PTX convolution kernels. Reports
+/// median / P95 per-launch latency and GFLOP/s (30 warmups + 101 timed samples,
+/// each a launch followed by a device sync). Not a pass/fail gate — it prints
+/// honest measured numbers for the #841 evidence table. Skips without a GPU.
+/// </summary>
+public sealed class DirectPtxConvolutionPerfProbe
+{
+    private readonly ITestOutputHelper _out;
+    public DirectPtxConvolutionPerfProbe(ITestOutputHelper output) => _out = output;
+
+    private const int Warmups = 30;
+    private const int Samples = 101;
+
+    [Fact]
+    public void Measure_V1_And_Tiled_ResNetC64()
+    {
+        if (!DirectPtxRuntime.IsAvailable) { _out.WriteLine("no CUDA device"); return; }
+        using var runtime = new DirectPtxRuntime();
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
+        { _out.WriteLine("no SM86 specialization"); return; }
+
+        _out.WriteLine($"device={runtime.DeviceName} sm{runtime.ComputeCapabilityMajor}{runtime.ComputeCapabilityMinor} drv{runtime.DriverVersion}");
+
+        bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
+        DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
+        try
+        {
+            MeasureV1(runtime);
+            // ResNet 1x1 bottleneck: N32, C64, H56, W56, K64 (HW=3136), tile 16.
+            MeasureTiled(runtime, new Conv2DTiledShape(32, 64, 64, 3136, 16));
+        }
+        finally
+        {
+            DirectPtxFeatureGate.ConvolutionExperimentOverride = prior;
+        }
+    }
+
+    private void MeasureV1(DirectPtxRuntime runtime)
+    {
+        using var kernel = new PtxFusedConv2DNchwK1Kernel(runtime);
+        using var input = runtime.AllocateBytes((nuint)PtxFusedConv2DNchwK1Kernel.InputBytes);
+        using var weights = runtime.AllocateBytes((nuint)PtxFusedConv2DNchwK1Kernel.WeightBytes);
+        using var bias = runtime.AllocateBytes((nuint)PtxFusedConv2DNchwK1Kernel.BiasBytes);
+        using var output = runtime.AllocateBytes((nuint)PtxFusedConv2DNchwK1Kernel.OutputBytes);
+        input.Upload<float>(new float[PtxFusedConv2DNchwK1Kernel.InputBytes / sizeof(float)]);
+        weights.Upload<float>(new float[PtxFusedConv2DNchwK1Kernel.WeightBytes / sizeof(float)]);
+        bias.Upload<float>(new float[PtxFusedConv2DNchwK1Kernel.BiasBytes / sizeof(float)]);
+
+        void Launch() => kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(weights, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[3]));
+
+        long flops = 2L * PtxFusedConv2DNchwK1Kernel.OutputElements * PtxFusedConv2DNchwK1Kernel.InputChannels;
+        Report("v1  N1/C64/H16/W16/K64 1x1", runtime, Launch, flops);
+    }
+
+    private void MeasureTiled(DirectPtxRuntime runtime, Conv2DTiledShape shape)
+    {
+        using var kernel = new PtxConv2DNchwK1TiledKernel(runtime, shape);
+        using var input = runtime.AllocateBytes((nuint)shape.InputBytes);
+        using var weights = runtime.AllocateBytes((nuint)shape.WeightBytes);
+        using var bias = runtime.AllocateBytes((nuint)shape.BiasBytes);
+        using var output = runtime.AllocateBytes((nuint)shape.OutputBytes);
+        input.Upload<float>(new float[shape.InputBytes / sizeof(float)]);
+        weights.Upload<float>(new float[shape.WeightBytes / sizeof(float)]);
+        bias.Upload<float>(new float[shape.BiasBytes / sizeof(float)]);
+
+        void Launch() => kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(weights, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[3]));
+
+        long flops = 2L * shape.Batch * shape.OutputChannels * shape.Spatial * shape.InputChannels;
+        Report($"tiled N{shape.Batch}/C{shape.InputChannels}/HW{shape.Spatial}/K{shape.OutputChannels} 1x1 tile{shape.Tile}",
+            runtime, Launch, flops);
+    }
+
+    private void Report(string label, DirectPtxRuntime runtime, Action launch, long flops)
+    {
+        for (int i = 0; i < Warmups; i++) launch();
+        runtime.Synchronize();
+
+        var us = new double[Samples];
+        var sw = new Stopwatch();
+        for (int i = 0; i < Samples; i++)
+        {
+            sw.Restart();
+            launch();
+            runtime.Synchronize();
+            sw.Stop();
+            us[i] = sw.Elapsed.TotalMilliseconds * 1000.0;
+        }
+        Array.Sort(us);
+        double median = us[Samples / 2];
+        double p95 = us[(int)(Samples * 0.95)];
+        double gflops = flops / (median / 1e6) / 1e9;
+        _out.WriteLine($"{label}: median={median:F1}us p95={p95:F1}us  {gflops:F0} GFLOP/s ({flops / 1e6:F0} MFLOP/launch)");
+    }
+}
+#endif
