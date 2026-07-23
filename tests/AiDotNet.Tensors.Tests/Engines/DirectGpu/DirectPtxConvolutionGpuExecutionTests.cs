@@ -921,6 +921,48 @@ public sealed class DirectPtxConvolutionGpuExecutionTests
     }
 
     [Fact]
+    public void Conv2DBackwardBias_MatchesCpuReduction()
+    {
+        if (!DirectPtxRuntime.IsAvailable) return;
+
+        const int n = 3, k = 8, h = 7, w = 5;   // non-power-of-2 spatial exercises the loop tails
+        var grad = new float[n * k * h * w];
+        for (int i = 0; i < grad.Length; i++) grad[i] = DeterministicInput(i) - 0.5f;
+        // CPU oracle: sum over batch + spatial per channel.
+        var expected = new float[k];
+        int hw = h * w;
+        for (int b = 0; b < n; b++)
+            for (int c = 0; c < k; c++)
+            {
+                double acc = 0;
+                for (int s = 0; s < hw; s++) acc += grad[(b * k + c) * hw + s];
+                expected[c] += (float)acc;
+            }
+
+        using var runtime = new DirectPtxRuntime();
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
+            return;
+
+        bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
+        DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
+        try
+        {
+            using var kernel = new PtxConv2DBackwardBiasKernel(runtime, n, k, h, w);
+            using var dGrad = runtime.AllocateBytes((nuint)kernel.GradOutputBytes);
+            using var dBias = runtime.AllocateBytes((nuint)kernel.GradBiasBytes);
+            dGrad.Upload<float>(grad);
+            kernel.Launch(DirectPtxTensorView.CreateOwned(dGrad, kernel.Blueprint.Tensors[0]),
+                          DirectPtxTensorView.CreateOwned(dBias, kernel.Blueprint.Tensors[1]));
+            runtime.Synchronize();
+            var actual = new float[k];
+            dBias.Download<float>(actual);
+            AssertClose(expected, actual, 2e-3f);
+        }
+        finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
+    }
+
+    [Fact]
     public void DumpWinogradPtxForSassAnalysis()
     {
         string dir = Environment.GetEnvironmentVariable("PTX_DUMP_DIR");
