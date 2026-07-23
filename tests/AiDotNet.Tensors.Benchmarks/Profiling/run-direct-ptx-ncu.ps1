@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache')]
+    [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'fused-linear', 'dense-linear')]
     [string]$Target = 'attention',
     [string]$OutputCsv = (Join-Path ([System.IO.Path]::GetTempPath()) ("aidotnet-direct-ptx-ncu-" + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.csv')),
     [string]$NcuPath = $env:NSIGHT_COMPUTE_CLI
@@ -27,6 +27,8 @@ $switch = switch ($Target) {
     'attention-backward' { '--direct-ptx-profile-attention-backward' }
     'flash-attention-backward' { '--direct-ptx-profile-flash-attention-backward' }
     'qkv-rope-cache' { '--direct-ptx-profile-qkv-rope-cache' }
+    'fused-linear' { '--direct-ptx-profile-fused-linear' }
+    'dense-linear' { '--direct-ptx-profile-dense-linear' }
 }
 $kernel = switch ($Target) {
     'attention' { 'regex:aidotnet_online_attention_128x64' }
@@ -36,6 +38,8 @@ $kernel = switch ($Target) {
     'attention-backward' { 'regex:aidotnet_attention_backward_(delta|dq|dkv)_d64' }
     'flash-attention-backward' { 'regex:aidotnet_flash_attention_backward_(dq|dkv)_d64' }
     'qkv-rope-cache' { 'regex:aidotnet_qkv_rope_cache_d64' }
+    'fused-linear' { 'regex:aidotnet_fused_linear_gelu_m1' }
+    'dense-linear' { 'regex:aidotnet_(fused_linear_gelu_m1|fused_linear_tiled|fused_linear_gelu_fp16_m16|fp16_gemm|fused_lora_forward|fused_linear_ce_index|fused_linear_backward|dense_(dot|outer)|batched_dot|strided_dot)' }
 }
 $expectedLaunches = switch ($Target) {
     'attention' { 16 }
@@ -45,11 +49,20 @@ $expectedLaunches = switch ($Target) {
     'attention-backward' { 3 }
     'flash-attention-backward' { 2 }
     'qkv-rope-cache' { 3 }
+    'fused-linear' { 10 }
+    'dense-linear' { 16 }
 }
 $metricNames = @(
+    'sass__inst_executed_register_spilling',
+    'sass__inst_executed_register_spilling_mem_local',
+    'sass__inst_executed_register_spilling_mem_shared',
     'smsp__sass_inst_executed_op_local.sum',
     'smsp__sass_inst_executed_op_local_ld.sum',
     'smsp__sass_inst_executed_op_local_st.sum',
+    'l1tex__t_requests_pipe_lsu_mem_local_op_ld.sum',
+    'l1tex__t_requests_pipe_lsu_mem_local_op_st.sum',
+    'l1tex__data_bank_conflicts_pipe_lsu_cmd_read.sum',
+    'l1tex__data_bank_conflicts_pipe_lsu_cmd_write.sum',
     'launch__registers_per_thread',
     'launch__shared_mem_per_block_static',
     'launch__shared_mem_per_block_dynamic',
@@ -72,9 +85,9 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 dotnet $targetDll --direct-ptx-verify-ncu $OutputCsv
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-# One deterministic launch is emitted for every promoted kernel entry point;
+# One deterministic launch is emitted for every audited exact kernel entry point;
 # attention and residual-RMSNorm additionally enumerate all promoted sequence/
-# row, causal, and fusion variants. Nsight Compute 2026.2 raw CSV has one wide
+# row, causal, and fusion variants. Nsight Compute raw CSV has one wide
 # data row per launch. Require every requested column on every expected launch
 # so a partial capture cannot be mistaken for complete evidence.
 $csvLines = @(Get-Content -LiteralPath $OutputCsv)

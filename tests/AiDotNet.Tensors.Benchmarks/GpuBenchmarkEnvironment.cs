@@ -26,10 +26,14 @@ internal static class GpuBenchmarkEnvironment
         }
     }
 
-    internal static void RequireNoForeignCompute(string label)
+    internal static void RequireNoForeignCompute(
+        string label,
+        bool ignoreMixedWddmProcesses = false)
     {
+        RequireNoForeignPython(label);
         string processMonitor = RunNvidiaSmi("pmon", "-c", "1", "-s", "u");
-        string[] conflicts = FindComputeWorkloadConflicts(processMonitor, Environment.ProcessId);
+        string[] conflicts = FindComputeWorkloadConflicts(
+            processMonitor, Environment.ProcessId, ignoreMixedWddmProcesses);
         if (conflicts.Length != 0)
             throw new InvalidOperationException(
                 $"[{label}] Foreign GPU workload detected; clean benchmark refused: {string.Join("; ", conflicts)}");
@@ -41,7 +45,44 @@ internal static class GpuBenchmarkEnvironment
                 $"[{label}] GPU temperature {temperatureCelsius} C exceeds the 75 C evidence ceiling.");
     }
 
-    internal static string[] FindComputeWorkloadConflicts(string processMonitor, int currentProcessId)
+    private static void RequireNoForeignPython(string label)
+    {
+        var conflicts = new List<string>();
+        foreach (Process process in Process.GetProcesses())
+        {
+            using (process)
+            {
+                try
+                {
+                    if (process.Id == Environment.ProcessId)
+                        continue;
+                    string name = process.ProcessName;
+                    if (string.Equals(name, "python", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(name, "python3", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(name, "pythonw", StringComparison.OrdinalIgnoreCase))
+                        conflicts.Add($"pid={process.Id} {name}");
+                }
+                catch (InvalidOperationException)
+                {
+                    // The process exited between enumeration and inspection.
+                }
+                catch (System.ComponentModel.Win32Exception)
+                {
+                    // An inaccessible system process cannot be a normal Python
+                    // benchmark process; the NVIDIA process gate remains active.
+                }
+            }
+        }
+        if (conflicts.Count != 0)
+            throw new InvalidOperationException(
+                $"[{label}] OS-level Python workload detected before CUDA registration; " +
+                $"clean benchmark refused: {string.Join("; ", conflicts)}");
+    }
+
+    internal static string[] FindComputeWorkloadConflicts(
+        string processMonitor,
+        int currentProcessId,
+        bool ignoreMixedWddmProcesses = false)
     {
         var conflicts = new List<string>();
         foreach (string line in processMonitor.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
@@ -62,7 +103,7 @@ internal static class GpuBenchmarkEnvironment
             // with a 0-1% sample. Treat a mixed process as competing compute only
             // when its measured SM use is material; the separate whole-device
             // guard still rejects >20% utilization at every suite boundary.
-            bool isActiveMixedCompute = processType.Contains('C') &&
+            bool isActiveMixedCompute = !ignoreMixedWddmProcesses && processType.Contains('C') &&
                 int.TryParse(smUtilization, out int smPercent) &&
                 smPercent > MixedComputeConflictThresholdPercent;
             if (isComputeOnly || isActiveMixedCompute)

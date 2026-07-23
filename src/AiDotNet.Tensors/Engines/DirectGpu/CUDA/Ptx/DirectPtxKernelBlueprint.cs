@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 
@@ -43,6 +42,15 @@ internal static class DirectPtxArchitecture
     /// on GA102/SM86. Other Ampere variants remain independent tuning domains.
     /// </summary>
     internal static bool HasValidatedQkvRopeCache(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The fused-linear + GELU decode specializations are measured and promoted
+    /// only on GA10x/SM86. Other Ampere variants (SM80, SM87) are independent
+    /// tuning domains and must supply and benchmark their own specialization
+    /// rather than silently inheriting SM86's launch geometry.
+    /// </summary>
+    internal static bool HasValidatedFusedLinear(int major, int minor) =>
         (major, minor) == (8, 6);
 }
 
@@ -207,7 +215,11 @@ internal sealed record DirectPtxKernelAudit(
     int BlockThreads,
     int ActiveBlocksPerMultiprocessor,
     string JitInfoLog,
-    DateTime RecordedAtUtc)
+    DateTime RecordedAtUtc,
+    DirectPtxModuleImageKind ImageKind = DirectPtxModuleImageKind.DriverLinkedCubin,
+    string CubinSha256 = "",
+    string CubinSourceKey = "",
+    string? CubinPath = null)
 {
     internal static DirectPtxKernelAudit Create(
         DirectPtxKernelBlueprint blueprint,
@@ -218,11 +230,28 @@ internal sealed record DirectPtxKernelAudit(
         int activeBlocksPerMultiprocessor,
         string jitInfoLog)
     {
-        using SHA256 sha = SHA256.Create();
-        string hash = PtxCompat.ToHexString(sha.ComputeHash(Encoding.UTF8.GetBytes(ptx))).ToLowerInvariant();
+        string hash = DirectPtxCubinArtifactCache.ComputePtxSha256(ptx);
         return new DirectPtxKernelAudit(
             blueprint.Id, deviceFingerprint, hash, function, blockThreads,
             activeBlocksPerMultiprocessor, jitInfoLog, DateTime.UtcNow);
+    }
+
+    internal static DirectPtxKernelAudit Create(
+        DirectPtxKernelBlueprint blueprint,
+        string deviceFingerprint,
+        string ptx,
+        DirectPtxFunctionInfo function,
+        int blockThreads,
+        int activeBlocksPerMultiprocessor,
+        DirectPtxModule module)
+    {
+        PtxCompat.ThrowIfNull(module, nameof(module));
+        string hash = DirectPtxCubinArtifactCache.ComputePtxSha256(ptx);
+        return new DirectPtxKernelAudit(
+            blueprint.Id, deviceFingerprint, hash, function, blockThreads,
+            activeBlocksPerMultiprocessor, module.JitInfoLog, DateTime.UtcNow,
+            module.ImageKind, module.CubinSha256, module.CubinSourceKey,
+            module.CubinPath);
     }
 
     internal string ToJson() => JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
@@ -237,13 +266,16 @@ internal sealed record DirectPtxProfilerEvidence(
     long RegisterSpillInstructions,
     long LocalLoadInstructions,
     long LocalStoreInstructions,
+    long LocalLoadRequests,
+    long LocalStoreRequests,
     int ObservedMetricGroups,
     string Source)
 {
     internal bool ProvesZeroExecutedSpills =>
-        ObservedMetricGroups == 3 &&
+        ObservedMetricGroups == 5 &&
         RegisterSpillInstructions == 0 && LocalLoadInstructions == 0 &&
-        LocalStoreInstructions == 0;
+        LocalStoreInstructions == 0 && LocalLoadRequests == 0 &&
+        LocalStoreRequests == 0;
 
     internal static DirectPtxProfilerEvidence FromNcuCsv(string path)
     {
@@ -251,7 +283,7 @@ internal sealed record DirectPtxProfilerEvidence(
         var values = new Dictionary<string, long>(StringComparer.Ordinal);
         string[][] rows = File.ReadLines(path).Select(ParseCsvLine).ToArray();
 
-        // Nsight Compute 2026.2 raw CSV is column-oriented: metric names are
+        // Current Nsight Compute raw CSV is column-oriented: metric names are
         // headers and every following data row is a kernel launch. Preserve
         // support for the older row-oriented export below as well.
         for (int rowIndex = 0; rowIndex < rows.Length; rowIndex++)
@@ -305,16 +337,22 @@ internal sealed record DirectPtxProfilerEvidence(
         int observedGroups = 0;
         if (Contains("sass__inst_executed_register_spilling") ||
             Contains("sass__inst_executed_register_spilling_mem_local") ||
+            Contains("sass__inst_executed_register_spilling_mem_shared") ||
             Contains("smsp__sass_inst_executed_op_local")) observedGroups++;
         if (Contains("sass__inst_executed_local_loads") ||
             Contains("smsp__sass_inst_executed_op_local_ld")) observedGroups++;
         if (Contains("sass__inst_executed_local_stores") ||
             Contains("smsp__sass_inst_executed_op_local_st")) observedGroups++;
+        if (Contains("l1tex__t_requests_pipe_lsu_mem_local_op_ld")) observedGroups++;
+        if (Contains("l1tex__t_requests_pipe_lsu_mem_local_op_st")) observedGroups++;
         return new DirectPtxProfilerEvidence(
             Get("sass__inst_executed_register_spilling", "sass__inst_executed_register_spilling_mem_local",
+                "sass__inst_executed_register_spilling_mem_shared",
                 "smsp__sass_inst_executed_op_local"),
             Get("sass__inst_executed_local_loads", "smsp__sass_inst_executed_op_local_ld"),
             Get("sass__inst_executed_local_stores", "smsp__sass_inst_executed_op_local_st"),
+            Get("l1tex__t_requests_pipe_lsu_mem_local_op_ld"),
+            Get("l1tex__t_requests_pipe_lsu_mem_local_op_st"),
             observedGroups,
             Path.GetFullPath(path));
     }
@@ -324,6 +362,8 @@ internal sealed record DirectPtxProfilerEvidence(
         value.StartsWith("sass__inst_executed_register_spilling.", StringComparison.Ordinal) ||
         value == "sass__inst_executed_register_spilling_mem_local" ||
         value.StartsWith("sass__inst_executed_register_spilling_mem_local.", StringComparison.Ordinal) ||
+        value == "sass__inst_executed_register_spilling_mem_shared" ||
+        value.StartsWith("sass__inst_executed_register_spilling_mem_shared.", StringComparison.Ordinal) ||
         value == "sass__inst_executed_local_loads" ||
         value.StartsWith("sass__inst_executed_local_loads.", StringComparison.Ordinal) ||
         value == "sass__inst_executed_local_stores" ||
@@ -333,7 +373,11 @@ internal sealed record DirectPtxProfilerEvidence(
         value == "smsp__sass_inst_executed_op_local_ld" ||
         value.StartsWith("smsp__sass_inst_executed_op_local_ld.", StringComparison.Ordinal) ||
         value == "smsp__sass_inst_executed_op_local_st" ||
-        value.StartsWith("smsp__sass_inst_executed_op_local_st.", StringComparison.Ordinal);
+        value.StartsWith("smsp__sass_inst_executed_op_local_st.", StringComparison.Ordinal) ||
+        value == "l1tex__t_requests_pipe_lsu_mem_local_op_ld" ||
+        value.StartsWith("l1tex__t_requests_pipe_lsu_mem_local_op_ld.", StringComparison.Ordinal) ||
+        value == "l1tex__t_requests_pipe_lsu_mem_local_op_st" ||
+        value.StartsWith("l1tex__t_requests_pipe_lsu_mem_local_op_st.", StringComparison.Ordinal);
 
     private static bool TryParseCounter(string value, out long result)
     {

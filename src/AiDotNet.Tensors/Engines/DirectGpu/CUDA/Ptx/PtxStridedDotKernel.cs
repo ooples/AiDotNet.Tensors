@@ -1,0 +1,360 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+
+/// <summary>
+/// Exact semantic specialization for the explicitly strided dot-product API.
+/// The host reduces the baked offset/step bounds to one valid i interval, so
+/// PTX receives no scalar shape/stride values and performs no per-element
+/// bounds check. Input allocations themselves remain canonical vectors.
+/// </summary>
+internal sealed class PtxStridedDotKernel : IDisposable
+{
+    internal const int BlockThreads = 256;
+    internal const int ReverseBlockThreads = 32;
+    internal const int WarpCount = BlockThreads / 32;
+    internal const string EntryPoint = "aidotnet_strided_dot";
+
+    private readonly DirectPtxModule _module;
+    private readonly IntPtr _function;
+    private readonly int _blockThreads;
+
+    internal string Ptx { get; }
+    internal DirectPtxKernelBlueprint Blueprint { get; }
+    internal DirectPtxKernelAudit Audit { get; }
+
+    internal PtxStridedDotKernel(
+        DirectPtxRuntime runtime,
+        int aSize,
+        int bSize,
+        int bOffset,
+        int bStep)
+    {
+        PtxCompat.ThrowIfNull(runtime, nameof(runtime));
+        if (!DirectPtxArchitecture.HasValidatedFusedLinear(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
+            throw new PlatformNotSupportedException(
+                "The strided-dot PTX specialization is measured only on GA10x/SM86.");
+        Validate(aSize, bSize);
+        Blueprint = CreateBlueprint(
+            runtime.ArchitectureFamily, aSize, bSize, bOffset, bStep);
+        Ptx = EmitPtx(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
+            aSize, bSize, bOffset, bStep);
+        _module = runtime.LoadModule(Ptx);
+        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
+        _blockThreads = GetBlockThreads(aSize, bSize, bOffset, bStep);
+        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, _blockThreads);
+        Blueprint.ResourceBudget.Validate(EntryPoint, info, _blockThreads, activeBlocks);
+        Audit = DirectPtxKernelAudit.Create(
+            Blueprint, runtime.DeviceFingerprint, Ptx, info,
+            _blockThreads, activeBlocks, _module);
+    }
+
+    internal unsafe void Launch(
+        DirectPtxTensorView left,
+        DirectPtxTensorView right,
+        DirectPtxTensorView output)
+    {
+        Require(left, Blueprint.Tensors[0], nameof(left));
+        Require(right, Blueprint.Tensors[1], nameof(right));
+        Require(output, Blueprint.Tensors[2], nameof(output));
+        if (Overlaps(output, left) || Overlaps(output, right))
+            throw new ArgumentException("Strided-dot output may not alias an input.");
+        IntPtr leftPointer = left.Pointer;
+        IntPtr rightPointer = right.Pointer;
+        IntPtr outputPointer = output.Pointer;
+        void** arguments = stackalloc void*[3];
+        arguments[0] = &leftPointer;
+        arguments[1] = &rightPointer;
+        arguments[2] = &outputPointer;
+        _module.Launch(
+            _function, 1, 1, 1, checked((uint)_blockThreads), 1, 1, 0, arguments);
+    }
+
+    public void Dispose() => _module.Dispose();
+
+    internal static string EmitPtx(
+        int ccMajor,
+        int ccMinor,
+        int aSize,
+        int bSize,
+        int bOffset,
+        int bStep)
+    {
+        Validate(aSize, bSize);
+        (int first, int last) = ValidInterval(aSize, bSize, bOffset, bStep);
+        if (IsExactReverseCell(aSize, bSize, bOffset, bStep))
+            return EmitExactReversePtx(ccMajor, ccMinor);
+        var ptx = new StringBuilder(8_192);
+        ptx.AppendLine(".version 7.1");
+        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        ptx.AppendLine(".address_size 64");
+        ptx.AppendLine();
+        ptx.AppendLine($"// exact strided dot a={aSize} b={bSize} offset={bOffset} step={bStep}; valid-i=[{first},{last}]");
+        ptx.AppendLine($".visible .entry {EntryPoint}(");
+        ptx.AppendLine("    .param .u64 left_ptr,");
+        ptx.AppendLine("    .param .u64 right_ptr,");
+        ptx.AppendLine("    .param .u64 output_ptr");
+        ptx.AppendLine(")");
+        ptx.AppendLine($".maxntid {BlockThreads}, 1, 1");
+        ptx.AppendLine("{");
+        ptx.AppendLine("    .reg .pred %p<4>;");
+        ptx.AppendLine("    .reg .b32 %r<12>;");
+        ptx.AppendLine("    .reg .b64 %rd<16>;");
+        ptx.AppendLine("    .reg .f32 %f<6>;");
+        ptx.AppendLine($"    .shared .align 16 .b8 partial[{WarpCount * sizeof(float)}];");
+        ptx.AppendLine("    ld.param.u64 %rd0, [left_ptr];");
+        ptx.AppendLine("    ld.param.u64 %rd1, [right_ptr];");
+        ptx.AppendLine("    ld.param.u64 %rd2, [output_ptr];");
+        ptx.AppendLine("    mov.u32 %r0, %tid.x;");
+        ptx.AppendLine($"    add.u32 %r1, %r0, {first};");
+        ptx.AppendLine("    mov.f32 %f0, 0f00000000;");
+        ptx.AppendLine("STRIDED_LOOP:");
+        ptx.AppendLine($"    setp.gt.s32 %p0, %r1, {last};");
+        ptx.AppendLine("    @%p0 bra.uni STRIDED_REDUCE;");
+        ptx.AppendLine($"    mad.lo.s32 %r2, %r1, {bStep}, {bOffset};");
+        ptx.AppendLine("    mul.wide.u32 %rd3, %r1, 4;");
+        ptx.AppendLine("    add.u64 %rd4, %rd0, %rd3;");
+        ptx.AppendLine("    mul.wide.u32 %rd5, %r2, 4;");
+        ptx.AppendLine("    add.u64 %rd6, %rd1, %rd5;");
+        ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd4];");
+        ptx.AppendLine("    ld.global.nc.f32 %f2, [%rd6];");
+        ptx.AppendLine("    fma.rn.f32 %f0, %f1, %f2, %f0;");
+        ptx.AppendLine($"    add.u32 %r1, %r1, {BlockThreads};");
+        ptx.AppendLine("    bra.uni STRIDED_LOOP;");
+        ptx.AppendLine("STRIDED_REDUCE:");
+        ptx.AppendLine("    mov.u64 %rd7, partial;");
+        ptx.AppendLine("    and.b32 %r3, %r0, 31;");
+        ptx.AppendLine("    shr.u32 %r4, %r0, 5;");
+        EmitWarpReduction(ptx, "%f0", "%f3", "%r5", "%r6");
+        ptx.AppendLine("    setp.ne.u32 %p1, %r3, 0;");
+        ptx.AppendLine("    @%p1 bra.uni STRIDED_WARP_PUBLISHED;");
+        ptx.AppendLine("    mul.wide.u32 %rd8, %r4, 4;");
+        ptx.AppendLine("    add.u64 %rd9, %rd7, %rd8;");
+        ptx.AppendLine("    st.shared.f32 [%rd9], %f0;");
+        ptx.AppendLine("STRIDED_WARP_PUBLISHED:");
+        ptx.AppendLine("    bar.sync 0;");
+        ptx.AppendLine("    setp.ne.u32 %p2, %r4, 0;");
+        ptx.AppendLine("    @%p2 bra.uni STRIDED_DONE;");
+        ptx.AppendLine($"    setp.lt.u32 %p3, %r3, {WarpCount};");
+        ptx.AppendLine("    mov.f32 %f0, 0f00000000;");
+        ptx.AppendLine("    mul.wide.u32 %rd10, %r3, 4;");
+        ptx.AppendLine("    add.u64 %rd11, %rd7, %rd10;");
+        ptx.AppendLine("    @%p3 ld.shared.f32 %f0, [%rd11];");
+        EmitWarpReduction(ptx, "%f0", "%f3", "%r5", "%r6");
+        ptx.AppendLine("    setp.ne.u32 %p2, %r3, 0;");
+        ptx.AppendLine("    @%p2 bra.uni STRIDED_DONE;");
+        ptx.AppendLine("    st.global.f32 [%rd2], %f0;");
+        ptx.AppendLine("STRIDED_DONE:");
+        ptx.AppendLine("    ret;");
+        ptx.AppendLine("}");
+        return ptx.ToString();
+    }
+
+    private static string EmitExactReversePtx(int ccMajor, int ccMinor)
+    {
+        var ptx = new StringBuilder(8_192);
+        ptx.AppendLine(".version 7.1");
+        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        ptx.AppendLine(".address_size 64");
+        ptx.AppendLine();
+        ptx.AppendLine("// exact strided dot a=512 b=512 offset=511 step=-1; valid-i=[0,511]; aligned float4 reverse pairs");
+        ptx.AppendLine($".visible .entry {EntryPoint}(");
+        ptx.AppendLine("    .param .u64 left_ptr,");
+        ptx.AppendLine("    .param .u64 right_ptr,");
+        ptx.AppendLine("    .param .u64 output_ptr");
+        ptx.AppendLine(")");
+        ptx.AppendLine($".maxntid {ReverseBlockThreads}, 1, 1");
+        ptx.AppendLine("{");
+        ptx.AppendLine("    .reg .pred %p<2>;");
+        ptx.AppendLine("    .reg .b32 %r<8>;");
+        ptx.AppendLine("    .reg .b64 %rd<12>;");
+        ptx.AppendLine("    .reg .f32 %f<14>;");
+        ptx.AppendLine("    ld.param.u64 %rd0, [left_ptr];");
+        ptx.AppendLine("    ld.param.u64 %rd1, [right_ptr];");
+        ptx.AppendLine("    ld.param.u64 %rd2, [output_ptr];");
+        ptx.AppendLine("    mov.u32 %r0, %tid.x;");
+        ptx.AppendLine("    mul.wide.u32 %rd3, %r0, 16;");
+        ptx.AppendLine("    add.u64 %rd4, %rd0, %rd3;");
+        ptx.AppendLine("    sub.u32 %r2, 127, %r0;");
+        ptx.AppendLine("    mul.wide.u32 %rd5, %r2, 16;");
+        ptx.AppendLine("    add.u64 %rd6, %rd1, %rd5;");
+        ptx.AppendLine("    sub.u64 %rd7, %rd6, 512;");
+        ptx.AppendLine("    sub.u64 %rd8, %rd6, 1024;");
+        ptx.AppendLine("    sub.u64 %rd9, %rd6, 1536;");
+        ptx.AppendLine("    mov.f32 %f8, 0f00000000;");
+        ptx.AppendLine("    mov.f32 %f10, 0f00000000;");
+        ptx.AppendLine("    mov.f32 %f11, 0f00000000;");
+        ptx.AppendLine("    mov.f32 %f12, 0f00000000;");
+        for (int group = 0; group < 4; group++)
+        {
+            string leftSuffix = group == 0 ? string.Empty : $"+{group * 512}";
+            ptx.AppendLine($"    ld.global.v4.f32 {{%f0,%f1,%f2,%f3}}, [%rd4{leftSuffix}];");
+            ptx.AppendLine($"    ld.global.v4.f32 {{%f4,%f5,%f6,%f7}}, [%rd{6 + group}];");
+            ptx.AppendLine("    fma.rn.f32 %f8, %f0, %f7, %f8;");
+            ptx.AppendLine("    fma.rn.f32 %f10, %f1, %f6, %f10;");
+            ptx.AppendLine("    fma.rn.f32 %f11, %f2, %f5, %f11;");
+            ptx.AppendLine("    fma.rn.f32 %f12, %f3, %f4, %f12;");
+        }
+        ptx.AppendLine("    add.rn.f32 %f8, %f8, %f10;");
+        ptx.AppendLine("    add.rn.f32 %f11, %f11, %f12;");
+        ptx.AppendLine("    add.rn.f32 %f8, %f8, %f11;");
+        EmitWarpReduction(ptx, "%f8", "%f13", "%r3", "%r4");
+        ptx.AppendLine("    setp.ne.u32 %p0, %r0, 0;");
+        ptx.AppendLine("    @%p0 bra.uni REVERSE_DONE;");
+        ptx.AppendLine("    st.global.f32 [%rd2], %f8;");
+        ptx.AppendLine("REVERSE_DONE:");
+        ptx.AppendLine("    ret;");
+        ptx.AppendLine("}");
+        return ptx.ToString();
+    }
+
+    private static void EmitWarpReduction(
+        StringBuilder ptx,
+        string value,
+        string shuffled,
+        string valueBits,
+        string shuffledBits)
+    {
+        foreach (int offset in new[] { 16, 8, 4, 2, 1 })
+        {
+            ptx.AppendLine($"    mov.b32 {valueBits}, {value};");
+            ptx.AppendLine(
+                $"    shfl.sync.down.b32 {shuffledBits}, {valueBits}, {offset}, 31, 0xffffffff;");
+            ptx.AppendLine($"    mov.b32 {shuffled}, {shuffledBits};");
+            ptx.AppendLine($"    add.rn.f32 {value}, {value}, {shuffled};");
+        }
+    }
+
+    internal static (int First, int Last) ValidInterval(
+        int aSize,
+        int bSize,
+        int bOffset,
+        int bStep)
+    {
+        Validate(aSize, bSize);
+        long first;
+        long last;
+        if (bStep > 0)
+        {
+            first = Math.Max(0, CeilDiv(-(long)bOffset, bStep));
+            last = Math.Min(aSize - 1L, FloorDiv((long)bSize - 1 - bOffset, bStep));
+        }
+        else if (bStep < 0)
+        {
+            long step = -(long)bStep;
+            first = Math.Max(0, CeilDiv((long)bOffset - (bSize - 1L), step));
+            last = Math.Min(aSize - 1L, FloorDiv(bOffset, step));
+        }
+        else if (bOffset >= 0 && bOffset < bSize)
+        {
+            first = 0;
+            last = aSize - 1L;
+        }
+        else
+        {
+            first = 0;
+            last = -1;
+        }
+        if (first > last) return (0, -1);
+        return (checked((int)first), checked((int)last));
+    }
+
+    private static long FloorDiv(long value, long positiveDivisor)
+    {
+        long quotient = value / positiveDivisor;
+        long remainder = value % positiveDivisor;
+        return remainder < 0 ? quotient - 1 : quotient;
+    }
+
+    private static long CeilDiv(long value, long positiveDivisor) =>
+        -FloorDiv(-value, positiveDivisor);
+
+    private static DirectPtxKernelBlueprint CreateBlueprint(
+        DirectPtxArchitectureFamily architecture,
+        int aSize,
+        int bSize,
+        int bOffset,
+        int bStep)
+    {
+        var left = new DirectPtxExtent(aSize);
+        var right = new DirectPtxExtent(bSize);
+        var output = new DirectPtxExtent(1);
+        (int first, int last) = ValidInterval(aSize, bSize, bOffset, bStep);
+        return new DirectPtxKernelBlueprint(
+            Operation: "strided-dot",
+            Version: IsExactReverseCell(aSize, bSize, bOffset, bStep) ? 5 : 2,
+            Architecture: architecture,
+            Variant: $"{(IsExactReverseCell(aSize, bSize, bOffset, bStep) ? "fp32x4-reverse" : "warp-reduce-fp32")}-a{aSize}-b{bSize}-o{bOffset}-s{bStep}",
+            Tensors:
+            [
+                new("left", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
+                    left, left, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact),
+                new("right", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
+                    right, right, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact),
+                new("output", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
+                    output, output, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
+            ],
+            ResourceBudget: new DirectPtxResourceBudget(
+                MaxRegistersPerThread: IsExactReverseCell(aSize, bSize, bOffset, bStep)
+                    ? 48 : 32,
+                MaxStaticSharedBytes: IsExactReverseCell(aSize, bSize, bOffset, bStep)
+                    ? 0 : GetWarpCount(aSize, bSize, bOffset, bStep) * sizeof(float),
+                MaxLocalBytesPerThread: 0,
+                MinBlocksPerMultiprocessor: 1),
+            Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["formula"] = "sum(left[i]*right[bOffset+i*bStep]) for in-bounds right indices",
+                ["b-offset"] = bOffset.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                ["b-step"] = bStep.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                ["valid-i"] = $"[{first},{last}]",
+                ["runtime-scalar-parameters"] = "none",
+                ["runtime-bounds-checks"] = "none",
+                ["temporary-device-allocation"] = "none",
+                ["reduction-pipeline"] = IsExactReverseCell(aSize, bSize, bOffset, bStep)
+                    ? "four aligned float4 reverse-pair loads per lane; register-only warp reduction; one output store"
+                    : "register shuffles; eight shared warp totals; one block barrier; one output store"
+            });
+    }
+
+    private static bool IsExactReverseCell(int aSize, int bSize, int bOffset, int bStep) =>
+        aSize == 512 && bSize == 512 && bOffset == 511 && bStep == -1;
+
+    private static int GetBlockThreads(int aSize, int bSize, int bOffset, int bStep) =>
+        IsExactReverseCell(aSize, bSize, bOffset, bStep) ? ReverseBlockThreads : BlockThreads;
+
+    private static int GetWarpCount(int aSize, int bSize, int bOffset, int bStep) =>
+        GetBlockThreads(aSize, bSize, bOffset, bStep) / 32;
+
+    private static void Validate(int aSize, int bSize)
+    {
+        if (aSize <= 0 || aSize > 1_048_576)
+            throw new ArgumentOutOfRangeException(nameof(aSize));
+        if (bSize <= 0 || bSize > 1_048_576)
+            throw new ArgumentOutOfRangeException(nameof(bSize));
+    }
+
+    private static void Require(
+        DirectPtxTensorView view,
+        DirectPtxTensorContract contract,
+        string parameter)
+    {
+        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
+            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
+            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength != contract.RequiredBytes)
+            throw new ArgumentException(
+                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
+    }
+
+    private static bool Overlaps(DirectPtxTensorView left, DirectPtxTensorView right)
+    {
+        nuint leftStart = PtxCompat.ToNuint(left.Pointer);
+        nuint rightStart = PtxCompat.ToNuint(right.Pointer);
+        nuint leftEnd = checked(leftStart + left.ByteLength);
+        nuint rightEnd = checked(rightStart + right.ByteLength);
+        return leftStart < rightEnd && rightStart < leftEnd;
+    }
+}

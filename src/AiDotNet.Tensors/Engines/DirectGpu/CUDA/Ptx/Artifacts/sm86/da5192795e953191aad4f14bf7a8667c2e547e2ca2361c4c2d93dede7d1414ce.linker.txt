@@ -1,0 +1,7 @@
+pipeline-version=3
+target=sm86
+driver-version=13030
+cuda-driver-linker-info-log:
+info    : 0 bytes gmem
+info    : Function properties for 'aidotnet_fused_lora_forward':
+info    : used 24 registers, used 1 barriers, 0 stack, 288 bytes smem, 392 bytes cmem[0], 0 bytes lmem
