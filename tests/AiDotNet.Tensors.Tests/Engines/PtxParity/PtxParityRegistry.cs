@@ -140,6 +140,20 @@ public static class PtxParityRegistry
             "against the strongest eligible cuDNN/PyTorch competitor, plus Nsight zero-spill SASS evidence. " +
             "Keep deferred until that three-way matrix and the competitive gates exist."),
 
+        new PtxParitySpec("PtxWinogradF23InputTransformKernel", PtxParityStatus.Deferred,
+            "Winograd F(2,3) input transform V = B^T d B (#841 3x3 pipeline)",
+            "the input-transform stage of the optimized Winograd 3x3 pipeline (input[N,C,H,W] -> " +
+            "position-major V[16,C,P], same-padded); covered on-device by the fused-pipeline correctness " +
+            "test. Deferred until the pipeline clears the >=1.10x gate."),
+
+        new PtxParitySpec("PtxWinogradF23FusedGemmKernel", PtxParityStatus.Deferred,
+            "Winograd F(2,3) fused batched-GEMM + output transform (#841 3x3 pipeline)",
+            "consumes U[16,K,C] and V[16,C,P], register-accumulates all 16 Winograd positions per output " +
+            "over shared-staged tiles, and fuses A^T M A + bias + ReLU to output (no M workspace). The full " +
+            "3-stage pipeline is verified correct on-device (<= 2e-3 vs the fp64 direct-conv oracle) with 0 " +
+            "spills, but the TM=TN=1 layout is shared-bandwidth-bound and does not yet beat cuDNN; register- " +
+            "blocking is register-heavy due to the 16-position factor. Deferred until it clears the >=1.10x gate."),
+
         new PtxParitySpec("PtxWinogradF23FilterTransformKernel", PtxParityStatus.Deferred,
             "Winograd F(2,3) filter transform U = G g G^T (#841 3x3 pipeline)",
             "the one-time filter-transform stage of the optimized Winograd 3x3 pipeline (weights[K,C,3,3] -> " +

@@ -21,17 +21,18 @@ internal sealed class PtxWinogradF23FilterTransformKernel : IDisposable
 
     internal int OutputChannels { get; }
     internal int InputChannels { get; }
+    internal bool PositionMajor { get; }
     internal string Ptx { get; }
     internal DirectPtxFunctionInfo FunctionInfo { get; }
     internal DirectPtxKernelBlueprint Blueprint { get; }
     internal DirectPtxKernelAudit Audit { get; }
 
     internal string EntryPoint =>
-        FormattableString.Invariant($"aidotnet_winograd_f23_filter_transform_k{OutputChannels}_c{InputChannels}");
+        FormattableString.Invariant($"aidotnet_winograd_f23_filter_transform_k{OutputChannels}_c{InputChannels}{(PositionMajor ? "_pm" : "")}");
     internal long WeightBytes => (long)OutputChannels * InputChannels * 9 * sizeof(float);
     internal long TransformedBytes => (long)OutputChannels * InputChannels * 16 * sizeof(float);
 
-    internal PtxWinogradF23FilterTransformKernel(DirectPtxRuntime runtime, int outputChannels, int inputChannels)
+    internal PtxWinogradF23FilterTransformKernel(DirectPtxRuntime runtime, int outputChannels, int inputChannels, bool positionMajor = false)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         if (!DirectPtxArchitecture.HasExperimentalConvolution(
@@ -43,9 +44,10 @@ internal sealed class PtxWinogradF23FilterTransformKernel : IDisposable
             throw new ArgumentException($"K*C must be a multiple of {BlockThreads}.");
         OutputChannels = outputChannels;
         InputChannels = inputChannels;
+        PositionMajor = positionMajor;
 
         Blueprint = CreateBlueprint(runtime.ArchitectureFamily, outputChannels, inputChannels);
-        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, outputChannels, inputChannels);
+        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, outputChannels, inputChannels, positionMajor);
         _module = runtime.LoadModule(
             Ptx, allowExperimentalJitFallback: DirectPtxFeatureGate.ConvolutionExperimentOverride);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
@@ -106,12 +108,12 @@ internal sealed class PtxWinogradF23FilterTransformKernel : IDisposable
             throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
     }
 
-    internal static string EmitPtx(int major, int minor, int k, int c)
+    internal static string EmitPtx(int major, int minor, int k, int c, bool positionMajor = false)
     {
         if (!DirectPtxArchitecture.HasExperimentalConvolution(major, minor))
             throw new NotSupportedException("Only the experimental SM86 filter transform emitter exists.");
         string I(int v) => v.ToString(CultureInfo.InvariantCulture);
-        string entry = FormattableString.Invariant($"aidotnet_winograd_f23_filter_transform_k{k}_c{c}");
+        string entry = FormattableString.Invariant($"aidotnet_winograd_f23_filter_transform_k{k}_c{c}{(positionMajor ? "_pm" : "")}");
         int total = k * c;
 
         var p = new StringBuilder(8192);
@@ -137,7 +139,9 @@ internal sealed class PtxWinogradF23FilterTransformKernel : IDisposable
         p.AppendLine("    @%p0 bra DONE;");
         p.AppendLine("    mul.wide.u32 %rd2, %r2, 36;");                     // g base = weights + id*9*4
         p.AppendLine("    add.u64 %rd2, %rd0, %rd2;");
-        p.AppendLine("    mul.wide.u32 %rd3, %r2, 64;");                     // U base = U + id*16*4
+        // U base. kc-major: U + id*16*4 (16 contiguous per (k,c)).
+        // position-major: U + id*4 (the (k,c) slot in xi=0; xi stride = K*C*4).
+        p.AppendLine($"    mul.wide.u32 %rd3, %r2, {I(positionMajor ? 4 : 64)};");
         p.AppendLine("    add.u64 %rd3, %rd1, %rd3;");
         // load g[0..8] -> %f0..%f8
         for (int i = 0; i < 9; i++)
@@ -169,8 +173,9 @@ internal sealed class PtxWinogradF23FilterTransformKernel : IDisposable
             p.AppendLine($"    mul.rn.f32 %f{I(U(i, 2))}, %f38, 0f3F000000;");
             p.AppendLine($"    mov.f32 %f{I(U(i, 3))}, %f{I(U3(i, 2))};");
         }
+        int uStride = positionMajor ? total * 4 : 4;   // xi stride: K*C*4 (pm) or 4 (kc)
         for (int i = 0; i < 16; i++)
-            p.AppendLine($"    st.global.f32 [%rd3+{I(i * 4)}], %f{I(21 + i)};");
+            p.AppendLine($"    st.global.f32 [%rd3+{I(i * uStride)}], %f{I(21 + i)};");
         p.AppendLine("DONE:");
         p.AppendLine("    ret;");
         p.AppendLine("}");
