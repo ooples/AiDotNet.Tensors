@@ -204,6 +204,8 @@ internal sealed class PtxFusedTranspose2DF32Kernel : IDisposable
                     outputExtent, outputExtent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: new DirectPtxResourceBudget(
+                // Measured by the offline gate: 24 registers and exactly
+                // SharedBytes of smem at sm86, giving 10 blocks/SM.
                 MaxRegistersPerThread: 32,
                 MaxStaticSharedBytes: SharedBytes,
                 MaxLocalBytesPerThread: 0,

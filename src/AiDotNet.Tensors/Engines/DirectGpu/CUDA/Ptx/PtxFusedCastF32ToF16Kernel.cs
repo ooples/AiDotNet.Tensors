@@ -166,7 +166,11 @@ internal sealed class PtxFusedCastF32ToF16Kernel : IDisposable
                     extent, extent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 16,
+                // Measured by the offline gate: ptxas -O3 reports 18 registers
+                // for this kernel at sm86 and 10 blocks/SM. The budget was 16,
+                // which the two-vector staging pushed past - ResourceBudget
+                // .Validate would have thrown on a real device at construction.
+                MaxRegistersPerThread: 24,
                 MaxStaticSharedBytes: 0,
                 MaxLocalBytesPerThread: 0,
                 MinBlocksPerMultiprocessor: 1536 / blockThreads),
