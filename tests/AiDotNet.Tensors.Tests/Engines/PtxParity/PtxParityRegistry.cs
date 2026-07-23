@@ -187,6 +187,22 @@ public static class PtxParityRegistry
             "memory pipeline (coalesced cp.async staging + ldmatrix + multi-warp cooperation) -- a multi-day " +
             "kernel. Deferred."),
 
+        new PtxParitySpec("PtxWinogradWmmaFusedStagedKernel", PtxParityStatus.Deferred,
+            "Winograd F(2,3) cuDNN-class fused FP16 TC conv: coalesced cp.async staging + 4-warp (#841 3x3)",
+            "the cuDNN-class escalation of the fused kernel: a 4-warp block stages U[16,16,16]+V[16,32,16] " +
+            "into shared with coalesced 16-byte cp.async (fixing the ~12.5%-coalesced direct-global fragment " +
+            "loads), reads mma fragments via ld.shared, runs 16 mma.sync m16n8k16 per k-step, and keeps the " +
+            "A^T M A output transform thread-local (no M round-trip; U tile reused by all 4 warps). Verified " +
+            "correct on-device (<= 5e-2). HONEST perf (idle 3080 @ 2040MHz, ResNet C64, amortized): ~2597us -- " +
+            "only ~3% better than the register-only fused (~2679us) and still ~3x SLOWER than the plain fp32 " +
+            "batched GEMM (~866us) and ~5.3x off cuDNN (~494us). ROOT (now definitive across 10 correct 3x3 " +
+            "kernels): the 16 Winograd positions force 64-128 accumulator registers/thread -> low occupancy -> " +
+            "the Tensor Cores are starved (~1% util) no matter the memory strategy. This is the SAME occupancy " +
+            "wall as the fp32 fused-RB kernel; TC throughput cannot be used because occupancy, not the GEMM, is " +
+            "the bottleneck. Coalescing/staging/cp.async do not escape it. Escaping it needs cuDNN's proprietary " +
+            "warp-specialized deep-pipeline scheduling. Best simple approach remains fp32 batched (866us, 1.75x " +
+            "off cuDNN). Deferred."),
+
         new PtxParitySpec("PtxWinogradBatchedGemmKernel", PtxParityStatus.Deferred,
             "Winograd F(2,3) batched register-blocked GEMM M[b]=U[b].V[b] (#841 3x3 pipeline)",
             "the 16 Winograd position GEMMs run as one batched register-blocked GEMM (grid.z=16), reusing " +
