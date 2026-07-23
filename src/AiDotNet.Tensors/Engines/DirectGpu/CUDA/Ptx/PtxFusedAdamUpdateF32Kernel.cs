@@ -52,6 +52,9 @@ internal sealed class PtxFusedAdamUpdateF32Kernel : IDisposable
 
     internal int Size { get; }
     internal int BlockThreads { get; }
+    /// <summary>Whether this module emits the weight-decay term.</summary>
+    internal bool HasWeightDecay { get; }
+
     internal int ElementsPerBlock => BlockThreads * ElementsPerThread;
     internal string Ptx { get; }
     internal DirectPtxKernelBlueprint Blueprint { get; }
@@ -73,9 +76,10 @@ internal sealed class PtxFusedAdamUpdateF32Kernel : IDisposable
         hyperparameters.Validate();
         Size = size;
         BlockThreads = blockThreads;
+        HasWeightDecay = hyperparameters.WeightDecay > 0f;
         Blueprint = CreateBlueprint(runtime.ArchitectureFamily, size, blockThreads);
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
-            size, hyperparameters, blockThreads);
+            size, HasWeightDecay, blockThreads);
         _module = runtime.LoadModule(Ptx);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
         int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
@@ -84,26 +88,55 @@ internal sealed class PtxFusedAdamUpdateF32Kernel : IDisposable
             Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module.JitInfoLog);
     }
 
+    /// <summary>
+    /// Launches the update. The scalars travel as launch parameters, so the
+    /// same module serves every step of a run - the step counter never enters
+    /// the module key and no per-step recompilation happens.
+    /// </summary>
     internal unsafe void Launch(
         DirectPtxTensorView param,
         DirectPtxTensorView gradient,
         DirectPtxTensorView firstMoment,
-        DirectPtxTensorView secondMoment)
+        DirectPtxTensorView secondMoment,
+        in DirectPtxAdamHyperparameters hyperparameters)
     {
         Require(param, Blueprint.Tensors[0], nameof(param));
         Require(gradient, Blueprint.Tensors[1], nameof(gradient));
         Require(firstMoment, Blueprint.Tensors[2], nameof(firstMoment));
         Require(secondMoment, Blueprint.Tensors[3], nameof(secondMoment));
+        hyperparameters.Validate();
+        if (hyperparameters.WeightDecay > 0f != HasWeightDecay)
+            throw new ArgumentException(
+                "This module was emitted for a different weight-decay presence; " +
+                "the decay term is baked, so the two must agree.",
+                nameof(hyperparameters));
 
         IntPtr paramPointer = param.Pointer;
         IntPtr gradientPointer = gradient.Pointer;
         IntPtr firstPointer = firstMoment.Pointer;
         IntPtr secondPointer = secondMoment.Pointer;
-        void** arguments = stackalloc void*[4];
+        float lrOverBc1 = hyperparameters.LearningRateOverBiasCorrection1;
+        float beta1 = hyperparameters.Beta1;
+        float oneMinusBeta1 = 1f - hyperparameters.Beta1;
+        float beta2 = hyperparameters.Beta2;
+        float oneMinusBeta2 = 1f - hyperparameters.Beta2;
+        float rsqrtBc2 = hyperparameters.ReciprocalSqrtBiasCorrection2;
+        float epsilon = hyperparameters.Epsilon;
+        float weightDecay = hyperparameters.WeightDecay;
+
+        void** arguments = stackalloc void*[12];
         arguments[0] = &paramPointer;
         arguments[1] = &gradientPointer;
         arguments[2] = &firstPointer;
         arguments[3] = &secondPointer;
+        arguments[4] = &lrOverBc1;
+        arguments[5] = &beta1;
+        arguments[6] = &oneMinusBeta1;
+        arguments[7] = &beta2;
+        arguments[8] = &oneMinusBeta2;
+        arguments[9] = &rsqrtBc2;
+        arguments[10] = &epsilon;
+        arguments[11] = &weightDecay;
         _module.Launch(
             _function,
             checked((uint)(Size / ElementsPerBlock)), 1, 1,
@@ -114,27 +147,20 @@ internal sealed class PtxFusedAdamUpdateF32Kernel : IDisposable
 
     public void Dispose() => _module.Dispose();
 
+    /// <summary>
+    /// Emits the module. Only the SHAPE and the weight-decay presence are baked;
+    /// every scalar arrives as a launch parameter, so one module serves an
+    /// entire training run.
+    /// </summary>
     internal static string EmitPtx(
         int ccMajor,
         int ccMinor,
         int size,
-        in DirectPtxAdamHyperparameters hyperparameters,
+        bool hasWeightDecay,
         int blockThreads = DefaultBlockThreads)
     {
         Validate(size);
         ValidateBlockThreads(size, blockThreads);
-        hyperparameters.Validate();
-
-        string lr = Literal(hyperparameters.LearningRate);
-        string beta1 = Literal(hyperparameters.Beta1);
-        string beta2 = Literal(hyperparameters.Beta2);
-        string oneMinusBeta1 = Literal(1f - hyperparameters.Beta1);
-        string oneMinusBeta2 = Literal(1f - hyperparameters.Beta2);
-        string epsilon = Literal(hyperparameters.Epsilon);
-        string weightDecay = Literal(hyperparameters.WeightDecay);
-        string biasCorrection1 = Literal(hyperparameters.BiasCorrection1);
-        string biasCorrection2 = Literal(hyperparameters.BiasCorrection2);
-        bool hasWeightDecay = hyperparameters.WeightDecay > 0f;
 
         var ptx = new StringBuilder(8_192);
         ptx.AppendLine(".version 7.1");
@@ -143,23 +169,44 @@ internal sealed class PtxFusedAdamUpdateF32Kernel : IDisposable
         ptx.AppendLine(
             $"// exact-shape size={size} block={blockThreads} elems-per-thread={ElementsPerThread} strategy=linear-vec4 op=adam-update");
         ptx.AppendLine(
-            $"// baked step={hyperparameters.Step} bias-corrections precomputed on host; no powf in kernel");
+            $"// weight-decay={(hasWeightDecay ? "on" : "off")}; all scalars are launch parameters, so the module key is shape-only");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");
         ptx.AppendLine("    .param .u64 param_ptr,");
         ptx.AppendLine("    .param .u64 gradient_ptr,");
         ptx.AppendLine("    .param .u64 first_moment_ptr,");
-        ptx.AppendLine("    .param .u64 second_moment_ptr");
+        ptx.AppendLine("    .param .u64 second_moment_ptr,");
+        // lr/bc1 and rsqrt(bc2) are folded on the host so the kernel needs one
+        // divide per element instead of three.
+        ptx.AppendLine("    .param .f32 lr_over_bc1,");
+        ptx.AppendLine("    .param .f32 beta1,");
+        ptx.AppendLine("    .param .f32 one_minus_beta1,");
+        ptx.AppendLine("    .param .f32 beta2,");
+        ptx.AppendLine("    .param .f32 one_minus_beta2,");
+        ptx.AppendLine("    .param .f32 rsqrt_bc2,");
+        ptx.AppendLine("    .param .f32 epsilon,");
+        ptx.AppendLine("    .param .f32 weight_decay");
         ptx.AppendLine(")");
         ptx.AppendLine($".maxntid {blockThreads}, 1, 1");
         ptx.AppendLine("{");
         ptx.AppendLine("    .reg .b32 %r<3>;");
         ptx.AppendLine("    .reg .b64 %rd<10>;");
-        ptx.AppendLine("    .reg .f32 %f<20>;");
+        ptx.AppendLine("    .reg .f32 %f<28>;");
         ptx.AppendLine("    ld.param.u64 %rd0, [param_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd1, [gradient_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd2, [first_moment_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd3, [second_moment_ptr];");
+        // Parameter space is uniform and cached, so these loads are broadcast
+        // and effectively free next to the four global vectors below.
+        ptx.AppendLine("    ld.param.f32 %f20, [lr_over_bc1];");
+        ptx.AppendLine("    ld.param.f32 %f21, [beta1];");
+        ptx.AppendLine("    ld.param.f32 %f22, [one_minus_beta1];");
+        ptx.AppendLine("    ld.param.f32 %f23, [beta2];");
+        ptx.AppendLine("    ld.param.f32 %f24, [one_minus_beta2];");
+        ptx.AppendLine("    ld.param.f32 %f25, [rsqrt_bc2];");
+        ptx.AppendLine("    ld.param.f32 %f26, [epsilon];");
+        if (hasWeightDecay)
+            ptx.AppendLine("    ld.param.f32 %f27, [weight_decay];");
         ptx.AppendLine("    mov.u32 %r0, %ctaid.x;");
         ptx.AppendLine("    mov.u32 %r1, %tid.x;");
         ptx.AppendLine($"    mad.lo.u32 %r2, %r0, {blockThreads}, %r1;");
@@ -168,37 +215,39 @@ internal sealed class PtxFusedAdamUpdateF32Kernel : IDisposable
         ptx.AppendLine("    add.u64 %rd7, %rd1, %rd4;");
         ptx.AppendLine("    add.u64 %rd8, %rd2, %rd4;");
         ptx.AppendLine("    add.u64 %rd9, %rd3, %rd4;");
-        ptx.AppendLine("    ld.global.ca.v4.f32 {%f0, %f1, %f2, %f3}, [%rd6];");    // param
-        ptx.AppendLine("    ld.global.ca.v4.f32 {%f4, %f5, %f6, %f7}, [%rd7];");    // gradient
-        ptx.AppendLine("    ld.global.ca.v4.f32 {%f8, %f9, %f10, %f11}, [%rd8];");  // m
-        ptx.AppendLine("    ld.global.ca.v4.f32 {%f12, %f13, %f14, %f15}, [%rd9];");// v
+        // param, m and v are read-modify-write, so they stay on the default
+        // cached path. The gradient is read once and never revisited, so it uses
+        // the read-only data cache and leaves L1 for the three resident tensors.
+        ptx.AppendLine("    ld.global.ca.v4.f32 {%f0, %f1, %f2, %f3}, [%rd6];");
+        ptx.AppendLine("    ld.global.nc.v4.f32 {%f4, %f5, %f6, %f7}, [%rd7];");
+        ptx.AppendLine("    ld.global.ca.v4.f32 {%f8, %f9, %f10, %f11}, [%rd8];");
+        ptx.AppendLine("    ld.global.ca.v4.f32 {%f12, %f13, %f14, %f15}, [%rd9];");
 
         for (int i = 0; i < ElementsPerThread; i++)
         {
             int p = i, g = 4 + i, m = 8 + i, v = 12 + i;
-            // grad += weightDecay * param  (emitted only when the baked decay is
-            // positive, matching the established kernel's guard).
+            // grad += weightDecay * param, emitted only when decay is on so the
+            // decay-free module carries no extra instruction.
             if (hasWeightDecay)
             {
-                ptx.AppendLine($"    mul.rn.f32 %f16, {weightDecay}, %f{p};");
+                ptx.AppendLine($"    mul.rn.f32 %f16, %f27, %f{p};");
                 ptx.AppendLine($"    add.rn.f32 %f{g}, %f{g}, %f16;");
             }
             // m = beta1 * m + (1 - beta1) * grad
-            ptx.AppendLine($"    mul.rn.f32 %f16, {beta1}, %f{m};");
-            ptx.AppendLine($"    mul.rn.f32 %f17, {oneMinusBeta1}, %f{g};");
+            ptx.AppendLine($"    mul.rn.f32 %f16, %f21, %f{m};");
+            ptx.AppendLine($"    mul.rn.f32 %f17, %f22, %f{g};");
             ptx.AppendLine($"    add.rn.f32 %f{m}, %f16, %f17;");
             // v = beta2 * v + ((1 - beta2) * grad) * grad   [left-associated]
-            ptx.AppendLine($"    mul.rn.f32 %f16, {beta2}, %f{v};");
-            ptx.AppendLine($"    mul.rn.f32 %f17, {oneMinusBeta2}, %f{g};");
+            ptx.AppendLine($"    mul.rn.f32 %f16, %f23, %f{v};");
+            ptx.AppendLine($"    mul.rn.f32 %f17, %f24, %f{g};");
             ptx.AppendLine($"    mul.rn.f32 %f17, %f17, %f{g};");
             ptx.AppendLine($"    add.rn.f32 %f{v}, %f16, %f17;");
-            // mHat = m / bc1 ; vHat = v / bc2
-            ptx.AppendLine($"    div.rn.f32 %f16, %f{m}, {biasCorrection1};");
-            ptx.AppendLine($"    div.rn.f32 %f17, %f{v}, {biasCorrection2};");
-            // param -= (lr * mHat) / (sqrt(vHat) + eps)
-            ptx.AppendLine("    sqrt.rn.f32 %f17, %f17;");
-            ptx.AppendLine($"    add.rn.f32 %f17, %f17, {epsilon};");
-            ptx.AppendLine($"    mul.rn.f32 %f16, {lr}, %f16;");
+            // numerator = (lr / bc1) * m, folding what was lr * (m / bc1).
+            ptx.AppendLine($"    mul.rn.f32 %f16, %f20, %f{m};");
+            // denominator = sqrt(v) * rsqrt(bc2) + eps, folding what was
+            // sqrt(v / bc2) + eps. One fma replaces a divide and an add.
+            ptx.AppendLine($"    sqrt.rn.f32 %f17, %f{v};");
+            ptx.AppendLine("    fma.rn.f32 %f17, %f17, %f25, %f26;");
             ptx.AppendLine("    div.rn.f32 %f16, %f16, %f17;");
             ptx.AppendLine($"    sub.rn.f32 %f{p}, %f{p}, %f16;");
         }
@@ -321,6 +370,20 @@ internal readonly struct DirectPtxAdamHyperparameters : IEquatable<DirectPtxAdam
     /// <summary>1 - beta2^step, computed once in double and rounded once.</summary>
     internal float BiasCorrection2 { get; }
 
+    /// <summary>
+    /// learningRate / biasCorrection1, folded on the host so the kernel
+    /// multiplies instead of dividing. Replaces lr * (m / bc1) with
+    /// (lr / bc1) * m.
+    /// </summary>
+    internal float LearningRateOverBiasCorrection1 { get; }
+
+    /// <summary>
+    /// 1 / sqrt(biasCorrection2), folded on the host so the kernel computes
+    /// sqrt(v) * rsqrt(bc2) instead of sqrt(v / bc2) - turning a divide plus an
+    /// add into a single fma.
+    /// </summary>
+    internal float ReciprocalSqrtBiasCorrection2 { get; }
+
     internal DirectPtxAdamHyperparameters(
         float learningRate,
         float beta1,
@@ -337,8 +400,14 @@ internal readonly struct DirectPtxAdamHyperparameters : IEquatable<DirectPtxAdam
         Step = step;
         // Accumulate the power in double so a large step count does not lose
         // precision before the single rounding to float.
-        BiasCorrection1 = (float)(1.0 - Math.Pow(beta1, step));
-        BiasCorrection2 = (float)(1.0 - Math.Pow(beta2, step));
+        double bc1 = 1.0 - Math.Pow(beta1, step);
+        double bc2 = 1.0 - Math.Pow(beta2, step);
+        BiasCorrection1 = (float)bc1;
+        BiasCorrection2 = (float)bc2;
+        // Fold both loop-invariant divisions on the host, in double, so the
+        // kernel is left with exactly one divide per element.
+        LearningRateOverBiasCorrection1 = bc1 > 0.0 ? (float)(learningRate / bc1) : 0f;
+        ReciprocalSqrtBiasCorrection2 = bc2 > 0.0 ? (float)(1.0 / Math.Sqrt(bc2)) : 0f;
     }
 
     /// <summary>

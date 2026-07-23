@@ -19,17 +19,22 @@ public class DirectPtxAdamUpdateTests
             epsilon: 1e-8f, weightDecay: weightDecay, step: step);
 
     [Fact]
-    public void Emitter_BakesEveryScalarSoTheLaunchAbiIsFourPointers()
+    public void Emitter_TakesScalarsAsLaunchParamsSoTheModuleKeyIsShapeOnly()
     {
-        string ptx = PtxFusedAdamUpdateF32Kernel.EmitPtx(8, 6, 262_144, Defaults());
+        string ptx = PtxFusedAdamUpdateF32Kernel.EmitPtx(8, 6, 262_144, hasWeightDecay: false);
         Assert.Contains(".visible .entry aidotnet_fused_adam_update_f32(", ptx);
         Assert.Contains("op=adam-update", ptx);
-        // Four pointers and nothing else: no scalar reaches the launch ABI.
-        Assert.Equal(4, Count(ptx, "ld.param.u64"));
-        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
-        Assert.DoesNotContain(".param .f32", ptx, StringComparison.Ordinal);
+
+        // Four pointers plus eight scalars. The scalars used to be baked, which
+        // put the step counter in the module key and forced a fresh JIT on every
+        // training step; as launch parameters one module serves a whole run.
+        Assert.Equal(4, Count(ptx, ".param .u64"));
+        Assert.Equal(8, Count(ptx, ".param .f32"));
+        Assert.Contains("ld.param.f32 %f20, [lr_over_bc1];", ptx);
+        Assert.Contains("ld.param.f32 %f25, [rsqrt_bc2];", ptx);
+
         // Reads param, gradient, m, v; writes param, m, v.
-        Assert.Equal(4, Count(ptx, "ld.global.ca.v4.f32"));
+        Assert.Equal(4, Count(ptx, "ld.global."));
         Assert.Equal(3, Count(ptx, "st.global.v4.f32"));
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
@@ -37,58 +42,78 @@ public class DirectPtxAdamUpdateTests
     }
 
     [Fact]
-    public void Emitter_RemovesBothPowfCallsByBakingTheBiasCorrections()
+    public void Emitter_IsIdenticalAcrossStepsAndLearningRates()
     {
-        var hyper = Defaults(step: 50);
-        string ptx = PtxFusedAdamUpdateF32Kernel.EmitPtx(8, 6, 65_536, hyper);
+        // The whole point of moving the scalars out: nothing that changes during
+        // training can change the module. Same shape and decay presence => byte
+        // identical PTX, so the cache holds exactly one module per shape.
+        string a = PtxFusedAdamUpdateF32Kernel.EmitPtx(8, 6, 65_536, hasWeightDecay: false);
+        string b = PtxFusedAdamUpdateF32Kernel.EmitPtx(8, 6, 65_536, hasWeightDecay: false);
+        Assert.Equal(a, b);
+        // Only the shape and the decay presence may change it.
+        Assert.NotEqual(a, PtxFusedAdamUpdateF32Kernel.EmitPtx(8, 6, 65_536, hasWeightDecay: true));
+        Assert.NotEqual(a, PtxFusedAdamUpdateF32Kernel.EmitPtx(8, 6, 262_144, hasWeightDecay: false));
+    }
 
-        // 1 - beta^step is loop-invariant, so it is a literal, not a computation.
-        // Check instructions only: the header comment legitimately says "powf".
+    [Fact]
+    public void Emitter_LeavesExactlyOneDividePerElement()
+    {
+        string ptx = PtxFusedAdamUpdateF32Kernel.EmitPtx(8, 6, 65_536, hasWeightDecay: false);
+
+        // The reference divides three times per element: m/bc1, v/bc2, and the
+        // final step. Both bias-correction divides are loop-invariant, so they
+        // fold into host-precomputed multipliers - (lr/bc1)*m and
+        // sqrt(v)*rsqrt(bc2) - leaving one genuine divide.
+        Assert.Equal(4, Count(ptx, "div.rn.f32"));          // 4 elements, 1 each
+        Assert.Equal(4, Count(ptx, "mul.rn.f32 %f16, %f20,"));   // (lr/bc1) * m
+        // The denominator is a single fma: sqrt(v) * rsqrt(bc2) + eps.
+        Assert.Equal(4, Count(ptx, "fma.rn.f32 %f17, %f17, %f25, %f26;"));
+        Assert.Equal(4, Count(ptx, "sqrt.rn.f32"));
+        // No powf and no on-device exp/log substitute for it.
         string body = StripComments(ptx);
         Assert.DoesNotContain("pow", body, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("lg2", body, StringComparison.Ordinal);
         Assert.DoesNotContain("ex2", body, StringComparison.Ordinal);
-        Assert.Contains($"baked step=50", ptx);
+    }
 
-        // Computed in double, rounded once - so it matches the reference value.
-        float expected1 = (float)(1.0 - Math.Pow(0.9f, 50));
-        float expected2 = (float)(1.0 - Math.Pow(0.999f, 50));
-        Assert.Equal(expected1, hyper.BiasCorrection1);
-        Assert.Equal(expected2, hyper.BiasCorrection2);
-        Assert.Contains($"0f{MathCompat.SingleToUInt32Bits(expected1):X8}", ptx);
-        Assert.Contains($"0f{MathCompat.SingleToUInt32Bits(expected2):X8}", ptx);
-        // One divide per bias correction per element, plus the final step divide.
-        Assert.Equal(12, Count(ptx, "div.rn.f32"));
+    [Fact]
+    public void Emitter_ReadsTheGradientThroughTheReadOnlyCache()
+    {
+        string ptx = PtxFusedAdamUpdateF32Kernel.EmitPtx(8, 6, 65_536, hasWeightDecay: false);
+        // param, m and v are read-modify-write and stay on the cached path; the
+        // gradient is read once and never revisited, so it goes through the
+        // read-only data cache and leaves L1 for the three resident tensors.
+        Assert.Equal(1, Count(ptx, "ld.global.nc.v4.f32"));
+        Assert.Equal(3, Count(ptx, "ld.global.ca.v4.f32"));
+        Assert.Contains("ld.global.nc.v4.f32 {%f4, %f5, %f6, %f7}, [%rd7];", ptx);
     }
 
     [Fact]
     public void Emitter_KeepsTheLeftAssociationOfTheSecondMomentTerm()
     {
-        string ptx = PtxFusedAdamUpdateF32Kernel.EmitPtx(8, 6, 65_536, Defaults());
-        string oneMinusBeta2 = "0f" + MathCompat.SingleToUInt32Bits(1f - 0.999f).ToString("X8");
+        string ptx = PtxFusedAdamUpdateF32Kernel.EmitPtx(8, 6, 65_536, hasWeightDecay: false);
         for (int i = 0; i < 4; i++)
         {
             int g = 4 + i;
             // ((1 - beta2) * grad) * grad, not (1 - beta2) * (grad * grad).
-            Assert.Contains($"mul.rn.f32 %f17, {oneMinusBeta2}, %f{g};", ptx);
+            // %f24 carries the one-minus-beta2 launch parameter.
+            Assert.Contains($"mul.rn.f32 %f17, %f24, %f{g};", ptx);
             Assert.Contains($"mul.rn.f32 %f17, %f17, %f{g};", ptx);
         }
-        // sqrt then add epsilon, never the reverse.
-        Assert.Equal(4, Count(ptx, "sqrt.rn.f32 %f17, %f17;"));
     }
 
     [Fact]
-    public void Emitter_OnlyEmitsTheWeightDecayTermWhenItIsPositive()
+    public void Emitter_OnlyEmitsTheWeightDecayTermWhenItIsRequested()
     {
-        string without = PtxFusedAdamUpdateF32Kernel.EmitPtx(8, 6, 65_536, Defaults(weightDecay: 0f));
-        string with = PtxFusedAdamUpdateF32Kernel.EmitPtx(8, 6, 65_536, Defaults(weightDecay: 0.01f));
-        string decayLiteral = "0f" + MathCompat.SingleToUInt32Bits(0.01f).ToString("X8");
+        string without = PtxFusedAdamUpdateF32Kernel.EmitPtx(8, 6, 65_536, hasWeightDecay: false);
+        string with = PtxFusedAdamUpdateF32Kernel.EmitPtx(8, 6, 65_536, hasWeightDecay: true);
 
-        // The established kernel guards on weightDecay > 0. Because the value is
-        // baked, that guard resolves at emit time - so the term is simply absent,
-        // with no runtime branch in either build.
-        Assert.DoesNotContain(decayLiteral, without);
-        Assert.Equal(4, Count(with, $"mul.rn.f32 %f16, {decayLiteral}, %f"));
+        // Decay presence stays a MODULE property rather than a runtime branch,
+        // so the decay-free module carries no extra instruction and neither
+        // module branches. That keeps the key space finite - two modules per
+        // shape - which is what lets these be precompiled.
+        Assert.Equal(4, Count(with, "mul.rn.f32 %f16, %f27,"));
+        Assert.DoesNotContain("%f27", without);
         Assert.DoesNotContain("bra", with, StringComparison.Ordinal);
         Assert.True(with.Length > without.Length);
     }
@@ -141,7 +166,7 @@ public class DirectPtxAdamUpdateTests
         Assert.False(PtxFusedAdamUpdateF32Kernel.IsSupportedShape(65_535));
         Assert.False(PtxFusedAdamUpdateF32Kernel.IsPromotedShape(65_536));
         Assert.Throws<ArgumentOutOfRangeException>(() =>
-            PtxFusedAdamUpdateF32Kernel.EmitPtx(8, 6, 1_000, Defaults()));
+            PtxFusedAdamUpdateF32Kernel.EmitPtx(8, 6, 1_000, hasWeightDecay: false));
     }
 
     [Fact]
