@@ -106,7 +106,7 @@ internal sealed class PtxFusedTranspose2DF32Kernel : IDisposable
         ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine(
-            $"// exact-shape rows={rows} columns={columns} tile={TileDim}x{TileDim} block={TileDim}x{BlockRows} strategy=shared-tile op=transpose2d-f32");
+            $"// exact-shape rows={rows} columns={columns} tile={TileDim}x{TileDim} block={TileDim}x{BlockRows} strategy=shared-tile-cp-async op=transpose2d-f32");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");
         ptx.AppendLine("    .param .u64 input_ptr,");
@@ -129,21 +129,29 @@ internal sealed class PtxFusedTranspose2DF32Kernel : IDisposable
         ptx.AppendLine($"    mad.lo.u32 %r4, %r2, {TileDim}, %r0;");
         ptx.AppendLine($"    mad.lo.u32 %r5, %r3, {TileDim}, %r1;");
 
-        // Stage the tile. Consecutive threads read consecutive columns, so each
-        // warp read is one coalesced transaction.
+        // Stage the tile with cp.async (Ampere+), .cg so the streamed source
+        // bypasses L1: the copy goes global->shared
+        // directly, without routing every element through a register and
+        // without a separate store. Consecutive threads read consecutive
+        // columns, so each warp read is still one coalesced transaction; the
+        // difference is that the four copies are issued back to back and the
+        // hardware overlaps them instead of serializing load-then-store.
         for (int j = 0; j < TileDim; j += BlockRows)
         {
             ptx.AppendLine($"    add.u32 %r6, %r5, {j};");
             ptx.AppendLine($"    mad.lo.u32 %r7, %r6, {columns}, %r4;");
             ptx.AppendLine("    mul.wide.u32 %rd3, %r7, 4;");
             ptx.AppendLine("    add.u64 %rd4, %rd0, %rd3;");
-            ptx.AppendLine("    ld.global.ca.f32 %f0, [%rd4];");
             ptx.AppendLine($"    add.u32 %r8, %r1, {j};");
             ptx.AppendLine($"    mad.lo.u32 %r9, %r8, {TileStride}, %r0;");
             ptx.AppendLine("    mul.wide.u32 %rd5, %r9, 4;");
             ptx.AppendLine("    add.u64 %rd6, %rd2, %rd5;");
-            ptx.AppendLine("    st.shared.f32 [%rd6], %f0;");
+            ptx.AppendLine("    cp.async.cg.shared.global [%rd6], [%rd4], 4;");
         }
+        // Commit the four copies as one group and wait for it before the tile
+        // is read back transposed.
+        ptx.AppendLine("    cp.async.commit_group;");
+        ptx.AppendLine("    cp.async.wait_group 0;");
         ptx.AppendLine("    bar.sync 0;");
 
         // Write coordinates: the tile's block indices swap, so the output write

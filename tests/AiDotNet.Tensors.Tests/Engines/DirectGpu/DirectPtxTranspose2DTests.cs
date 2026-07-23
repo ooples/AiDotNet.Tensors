@@ -23,13 +23,20 @@ public class DirectPtxTranspose2DTests
         string ptx = PtxFusedTranspose2DF32Kernel.EmitPtx(8, 6, 1024, 1024);
         Assert.Contains(".maxntid 32, 8, 1", ptx);
         Assert.Contains("exact-shape rows=1024 columns=1024 tile=32x32", ptx);
+        Assert.Contains("strategy=shared-tile-cp-async", ptx);
         Assert.Contains("op=transpose2d-f32", ptx);
         Assert.Equal(2, Count(ptx, "ld.param.u64"));
         // 32 rows / 8 thread-rows = 4 staged elements per thread, each way.
-        Assert.Equal(4, Count(ptx, "ld.global.ca.f32"));
-        Assert.Equal(4, Count(ptx, "st.shared.f32"));
+        // Staging uses cp.async, so global->shared happens in ONE instruction
+        // per element with no register round-trip and no separate store.
+        Assert.Equal(4, Count(ptx, "cp.async.cg.shared.global"));
+        Assert.DoesNotContain("ld.global.ca.f32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("st.shared.f32", ptx, StringComparison.Ordinal);
         Assert.Equal(4, Count(ptx, "ld.shared.f32"));
         Assert.Equal(4, Count(ptx, "st.global.f32"));
+        // The four copies commit as one group and are awaited once.
+        Assert.Equal(1, Count(ptx, "cp.async.commit_group"));
+        Assert.Equal(1, Count(ptx, "cp.async.wait_group 0"));
         // Exactly one barrier: stage the whole tile, then drain it.
         Assert.Equal(1, Count(ptx, "bar.sync"));
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);

@@ -25,9 +25,10 @@ public class DirectPtxCastFp16Tests
         Assert.Contains("exact-shape size=1048576 block=256", ptx);
         Assert.Contains("op=cast-f32-f16", ptx);
         Assert.Equal(2, Count(ptx, "ld.param.u64"));
-        Assert.Equal(1, Count(ptx, "ld.global.ca.v4.f32"));
-        Assert.Equal(4, Count(ptx, "cvt.rn.f16.f32"));
-        Assert.Equal(1, Count(ptx, "st.global.v4.u16"));
+        // Two vectors per thread: both loads issue before either is consumed.
+        Assert.Equal(2, Count(ptx, "ld.global.nc.v4.f32"));
+        Assert.Equal(8, Count(ptx, "cvt.rn.f16.f32"));
+        Assert.Equal(2, Count(ptx, "st.global.v4.u16"));
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain("bar.sync", ptx, StringComparison.Ordinal);

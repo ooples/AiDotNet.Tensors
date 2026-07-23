@@ -27,9 +27,10 @@ public class DirectPtxCastFp32Tests
         Assert.Contains("op=cast-f16-f32", ptx);
         Assert.Equal(2, Count(ptx, "ld.param.u64"));
         // The load/store types are the exact inverse of the narrowing kernel's.
-        Assert.Equal(1, Count(ptx, "ld.global.ca.v4.u16"));
-        Assert.Equal(4, Count(ptx, "cvt.f32.f16"));
-        Assert.Equal(1, Count(ptx, "st.global.v4.f32"));
+        // Two vectors per thread: both loads issue before either is consumed.
+        Assert.Equal(2, Count(ptx, "ld.global.nc.v4.u16"));
+        Assert.Equal(8, Count(ptx, "cvt.f32.f16"));
+        Assert.Equal(2, Count(ptx, "st.global.v4.f32"));
         // Widening is exact, so no rounding-mode modifier may appear.
         Assert.DoesNotContain("cvt.rn.", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
@@ -44,12 +45,16 @@ public class DirectPtxCastFp32Tests
     public void WideningCastByteStrides_MirrorTheNarrowingKernel()
     {
         string ptx = PtxFusedCastF16ToF32Kernel.EmitPtx(8, 6, 65_536);
-        // 4 elements/thread: 8 input bytes (fp16) and 16 output bytes (fp32).
-        Assert.Contains("mul.wide.u32 %rd2, %r2, 8;", ptx);
-        Assert.Contains("mul.wide.u32 %rd3, %r2, 16;", ptx);
+        // 8 elements/thread (2 vectors): 16 input bytes (fp16), 32 output (fp32).
+        Assert.Contains("mul.wide.u32 %rd2, %r2, 16;", ptx);
+        Assert.Contains("mul.wide.u32 %rd3, %r2, 32;", ptx);
         string narrowing = PtxFusedCastF32ToF16Kernel.EmitPtx(8, 6, 65_536);
-        Assert.Contains("mul.wide.u32 %rd2, %r2, 16;", narrowing);
-        Assert.Contains("mul.wide.u32 %rd3, %r2, 8;", narrowing);
+        Assert.Contains("mul.wide.u32 %rd2, %r2, 32;", narrowing);
+        Assert.Contains("mul.wide.u32 %rd3, %r2, 16;", narrowing);
+        // The second vector is reached by an immediate offset, not a second
+        // address computation.
+        Assert.Contains("[%rd4+8];", ptx);
+        Assert.Contains("[%rd5+16], {%f4,", ptx);
     }
 
     [Fact]

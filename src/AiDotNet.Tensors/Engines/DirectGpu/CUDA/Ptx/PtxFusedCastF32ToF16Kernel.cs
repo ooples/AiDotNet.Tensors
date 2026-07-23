@@ -18,7 +18,15 @@ internal sealed class PtxFusedCastF32ToF16Kernel : IDisposable
 {
     internal const string EntryPoint = "aidotnet_fused_cast_f32_to_f16";
     internal const int DefaultBlockThreads = 256;
-    internal const int ElementsPerThread = 4;
+    /// <summary>
+    /// Independent vectors each thread moves. Two rather than one so both loads
+    /// are issued before either is consumed: a pure streaming cast is limited by
+    /// how many bytes a thread keeps in flight, not by arithmetic.
+    /// </summary>
+    internal const int VectorsPerThread = 2;
+
+    internal const int ElementsPerVector = 4;
+    internal const int ElementsPerThread = VectorsPerThread * ElementsPerVector;
 
     private readonly DirectPtxModule _module;
     private readonly IntPtr _function;
@@ -93,7 +101,7 @@ internal sealed class PtxFusedCastF32ToF16Kernel : IDisposable
         ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine(
-            $"// exact-shape size={size} block={blockThreads} elems-per-thread={ElementsPerThread} strategy=linear-vec4 op=cast-f32-f16");
+            $"// exact-shape size={size} block={blockThreads} elems-per-thread={ElementsPerThread} strategy=linear-vec4x2 op=cast-f32-f16");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");
         ptx.AppendLine("    .param .u64 input_ptr,");
@@ -101,10 +109,10 @@ internal sealed class PtxFusedCastF32ToF16Kernel : IDisposable
         ptx.AppendLine(")");
         ptx.AppendLine($".maxntid {blockThreads}, 1, 1");
         ptx.AppendLine("{");
-        ptx.AppendLine("    .reg .b16 %rs<4>;");
+        ptx.AppendLine($"    .reg .b16 %rs<{ElementsPerThread}>;");
         ptx.AppendLine("    .reg .b32 %r<3>;");
         ptx.AppendLine("    .reg .b64 %rd<6>;");
-        ptx.AppendLine("    .reg .f32 %f<4>;");
+        ptx.AppendLine($"    .reg .f32 %f<{ElementsPerThread}>;");
         ptx.AppendLine("    ld.param.u64 %rd0, [input_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd1, [output_ptr];");
         ptx.AppendLine("    mov.u32 %r0, %ctaid.x;");
@@ -114,12 +122,26 @@ internal sealed class PtxFusedCastF32ToF16Kernel : IDisposable
         ptx.AppendLine($"    mul.wide.u32 %rd3, %r2, {ElementsPerThread * 2};");
         ptx.AppendLine("    add.u64 %rd4, %rd0, %rd2;");
         ptx.AppendLine("    add.u64 %rd5, %rd1, %rd3;");
-        ptx.AppendLine("    ld.global.ca.v4.f32 {%f0, %f1, %f2, %f3}, [%rd4];");
-        ptx.AppendLine("    cvt.rn.f16.f32 %rs0, %f0;");
-        ptx.AppendLine("    cvt.rn.f16.f32 %rs1, %f1;");
-        ptx.AppendLine("    cvt.rn.f16.f32 %rs2, %f2;");
-        ptx.AppendLine("    cvt.rn.f16.f32 %rs3, %f3;");
-        ptx.AppendLine("    st.global.v4.u16 [%rd5], {%rs0, %rs1, %rs2, %rs3};");
+        // The input is streamed once and never revisited, so it goes through
+        // the read-only data cache rather than polluting L1.
+        // Issue every load before consuming any of them, so the two vectors are
+        // in flight together.
+        for (int v = 0; v < VectorsPerThread; v++)
+        {
+            int b = v * ElementsPerVector;
+            int offset = v * ElementsPerVector * sizeof(float);
+            ptx.AppendLine(
+                $"    ld.global.nc.v4.f32 {{%f{b}, %f{b + 1}, %f{b + 2}, %f{b + 3}}}, [%rd4+{offset}];");
+        }
+        for (int i = 0; i < ElementsPerThread; i++)
+            ptx.AppendLine($"    cvt.rn.f16.f32 %rs{i}, %f{i};");
+        for (int v = 0; v < VectorsPerThread; v++)
+        {
+            int b = v * ElementsPerVector;
+            int offset = v * ElementsPerVector * 2;
+            ptx.AppendLine(
+                $"    st.global.v4.u16 [%rd5+{offset}], {{%rs{b}, %rs{b + 1}, %rs{b + 2}, %rs{b + 3}}};");
+        }
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");
         return ptx.ToString();
