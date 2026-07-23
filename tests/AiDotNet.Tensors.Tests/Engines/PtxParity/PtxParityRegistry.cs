@@ -237,6 +237,22 @@ public static class PtxParityRegistry
             "derived numFrames=(outputLength-nFft)/hop+1 frames, accumulating window[localIdx]^2 with fma.rn for " +
             "every covering frame. The fma matches the reference's fused sum, so its spec is TOLERANCE-based " +
             "against the fp64 oracle. Converts to ThreeWayParity (with tolerance) when the SM86 run lands."),
+
+        new PtxParitySpec("PtxApplyWindowF32Kernel", PtxParityStatus.Deferred,
+            "window application, fp32 (#850) - CudaBackend.ApplyWindow",
+            "one module per element count; output[i]=input[i]*window[i] with a single mul.rn, so the spec is " +
+            "bit-exact against the reference. Converts to ThreeWayParity when the SM86 run lands; until then " +
+            "unpromoted and fail-closed."),
+        new PtxParitySpec("PtxPowerToDbF32Kernel", PtxParityStatus.Deferred,
+            "power-to-decibel conversion, fp32 (#850) - CudaBackend.PowerToDb",
+            "one module per element count; PTX has no log10, so the base-10 log is lg2.approx scaled by " +
+            "10*log10(2) with refValue/minDb per-launch .param .f32. Its spec is TOLERANCE-based, not bit-exact. " +
+            "Converts to ThreeWayParity (with tolerance) when the SM86 run lands; until then unpromoted."),
+        new PtxParitySpec("PtxDbToPowerF32Kernel", PtxParityStatus.Deferred,
+            "decibel-to-power conversion, fp32 (#850) - CudaBackend.DbToPower",
+            "one module per element count; PTX has no pow, so pow(10,db/10) is ex2.approx of db*log2(10)/10 with " +
+            "refValue per-launch .param .f32. Its spec is TOLERANCE-based, not bit-exact. Converts to " +
+            "ThreeWayParity (with tolerance) when the SM86 run lands; until then unpromoted and fail-closed."),
     };
 
     private static readonly Dictionary<string, PtxParitySpec> ByKernel =

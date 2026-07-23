@@ -63,17 +63,20 @@ public class DirectPtxComplexMultiplyTests
             new[]
             {
                 "CudaBackend.ApplyMelFilterbank",
+                "CudaBackend.ApplyWindow",
                 "CudaBackend.BatchedFFT",
                 "CudaBackend.BatchedFFT2D",
                 "CudaBackend.ComplexConjugate",
                 "CudaBackend.ComplexMagnitude",
                 "CudaBackend.ComplexMultiply",
+                "CudaBackend.DbToPower",
                 "CudaBackend.DeinterleaveComplex",
                 "CudaBackend.FFT",
                 "CudaBackend.FFT2D",
                 "CudaBackend.IRFFT",
                 "CudaBackend.InterleaveComplex",
                 "CudaBackend.IstftFromSpectrum",
+                "CudaBackend.PowerToDb",
                 "CudaBackend.RFFT",
                 "CudaBackend.SplitComplexAdd",
                 "CudaBackend.SplitComplexConjugate",
@@ -1411,6 +1414,118 @@ public class DirectPtxComplexMultiplyTests
         {
             Assert.True(Math.Abs(actualOut[idx] - expectedOut[idx]) <= 1e-3 * (1 + Math.Abs(expectedOut[idx])));
             Assert.True(Math.Abs(actualWss[idx] - expectedWss[idx]) <= 1e-3 * (1 + Math.Abs(expectedWss[idx])));
+        }
+    }
+
+    [Fact]
+    public void ApplyWindowEmitter_IsSingleMul()
+    {
+        string ptx = PtxApplyWindowF32Kernel.EmitPtx(8, 6, 65536);
+        Assert.Contains("exact-shape count=65536 block=256 op=apply-window", ptx);
+        Assert.Equal(3, Count(ptx, "ld.param.u64"));
+        Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));
+        Assert.Equal(1, Count(ptx, "mul.rn.f32"));
+        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.DoesNotContain("bra", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxApplyWindowF32Kernel.IsSupportedShape(65536));
+        Assert.False(PtxApplyWindowF32Kernel.IsSupportedShape(65500));   // not multiple of 256
+        Assert.False(PtxApplyWindowF32Kernel.IsPromotedShape(65536));
+    }
+
+    [Fact]
+    public void PowerToDbEmitter_IsLg2Approx()
+    {
+        string ptx = PtxPowerToDbF32Kernel.EmitPtx(8, 6, 65536);
+        Assert.Contains("exact-shape count=65536 block=256 op=power-to-db", ptx);
+        Assert.Contains("ld.param.f32 %f3, [ref_val]", ptx);
+        Assert.Contains("ld.param.f32 %f4, [min_db]", ptx);
+        Assert.Contains("lg2.approx.f32", ptx);
+        Assert.Equal(2, Count(ptx, "max.f32"));    // max(power,1e-10) and max(db,minDb)
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxPowerToDbF32Kernel.IsSupportedShape(65536));
+        Assert.False(PtxPowerToDbF32Kernel.IsPromotedShape(65536));
+    }
+
+    [Fact]
+    public void DbToPowerEmitter_IsEx2Approx()
+    {
+        string ptx = PtxDbToPowerF32Kernel.EmitPtx(8, 6, 65536);
+        Assert.Contains("exact-shape count=65536 block=256 op=db-to-power", ptx);
+        Assert.Contains("ld.param.f32 %f3, [ref_val]", ptx);
+        Assert.Contains("ex2.approx.f32", ptx);
+        Assert.Equal(3, Count(ptx, "mul.rn.f32"));   // db*const, refSq, *refSq
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxDbToPowerF32Kernel.IsSupportedShape(65536));
+        Assert.False(PtxDbToPowerF32Kernel.IsPromotedShape(65536));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyApplyWindow_MatchesOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedComplexUnary(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The candidate is admitted only on SM86.");
+        const int n = 65536;
+        using var kernel = new PtxApplyWindowF32Kernel(runtime, n);
+        var input = new float[n];
+        var window = new float[n];
+        var random = RandomHelper.CreateSeededRandom(20270101);
+        for (int i = 0; i < n; i++) { input[i] = (float)(random.NextDouble() * 2 - 1); window[i] = (float)random.NextDouble(); }
+        using var iB = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var wB = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var oB = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        iB.Upload<float>(input); wB.Upload<float>(window);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(iB, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(wB, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(oB, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[n];
+        oB.Download<float>(actual);
+        for (int i = 0; i < n; i++) Assert.Equal(input[i] * window[i], actual[i]);   // bit-exact
+    }
+
+    [SkippableFact]
+    public void DriverOnlyPowerDbRoundTrip_MatchesWithinTolerance()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedComplexUnary(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The candidate is admitted only on SM86.");
+        const int n = 65536;
+        const float refValue = 1.0f, minDb = -80.0f;
+        using var toDb = new PtxPowerToDbF32Kernel(runtime, n);
+        using var toPower = new PtxDbToPowerF32Kernel(runtime, n);
+        var power = new float[n];
+        var random = RandomHelper.CreateSeededRandom(20270102);
+        for (int i = 0; i < n; i++) power[i] = (float)(random.NextDouble() * 4 + 1e-3);   // above the floor
+        var expectedDb = new double[n];
+        for (int i = 0; i < n; i++)
+            expectedDb[i] = Math.Max(10.0 * Math.Log10(Math.Max(power[i], 1e-10) / (refValue * (double)refValue)), minDb);
+
+        using var pB = runtime.AllocateBytes(toDb.Blueprint.Tensors[0].RequiredBytes);
+        using var dB = runtime.AllocateBytes(toDb.Blueprint.Tensors[1].RequiredBytes);
+        using var p2B = runtime.AllocateBytes(toPower.Blueprint.Tensors[1].RequiredBytes);
+        pB.Upload<float>(power);
+        toDb.Launch(
+            DirectPtxTensorView.CreateOwned(pB, toDb.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(dB, toDb.Blueprint.Tensors[1]), refValue, minDb);
+        toPower.Launch(
+            DirectPtxTensorView.CreateOwned(dB, toPower.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(p2B, toPower.Blueprint.Tensors[1]), refValue);
+        runtime.Synchronize();
+
+        var actualDb = new float[n];
+        var recovered = new float[n];
+        dB.Download<float>(actualDb); p2B.Download<float>(recovered);
+        for (int i = 0; i < n; i++)
+        {
+            Assert.True(Math.Abs(actualDb[i] - expectedDb[i]) <= 1e-2 * (1 + Math.Abs(expectedDb[i])));
+            Assert.True(Math.Abs(recovered[i] - power[i]) <= 1e-2 * (1 + power[i]));   // round trip
         }
     }
 
