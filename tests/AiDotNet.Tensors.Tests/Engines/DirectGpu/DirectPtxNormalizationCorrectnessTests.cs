@@ -1,3 +1,4 @@
+using System.Globalization;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -118,8 +119,14 @@ public sealed class DirectPtxNormalizationCorrectnessTests
     {
         var assembly = typeof(PtxRowNormalizationD64Kernel).Assembly;
         string[] resources = assembly.GetManifestResourceNames();
+        // The driver-linked artifact set this test used to read was retired: every
+        // row in it recorded the hash of PTX that stopped existing when epsilon
+        // and momentum became launch parameters, and it could not be rebuilt
+        // without an admitted device. The offline set that replaced it covers the
+        // same operations and more - eighty-six modules against seventy-one - so
+        // retargeting here strengthens the check rather than relaxing it.
         string manifestResource = Assert.Single(resources, name =>
-            name.EndsWith(".Artifacts.sm86.normalization-cubins.tsv", StringComparison.Ordinal));
+            name.EndsWith(".Artifacts.sm86.normalization-offline-cubins.tsv", StringComparison.Ordinal));
         var expected = new Dictionary<string, string>(StringComparer.Ordinal);
         var blueprintIds = new HashSet<string>(StringComparer.Ordinal);
         int manifestRows = 0;
@@ -134,18 +141,33 @@ public sealed class DirectPtxNormalizationCorrectnessTests
                     line.StartsWith("blueprint-id", StringComparison.Ordinal))
                     continue;
                 string[] columns = line.Split('\t');
-                Assert.Equal(5, columns.Length);
+                Assert.Equal(9, columns.Length);
                 manifestRows++;
                 Assert.True(blueprintIds.Add(columns[0]), $"Duplicate blueprint identity: {columns[0]}");
-                if (expected.TryGetValue(columns[2], out string? existingHash))
-                    Assert.Equal(existingHash, columns[3]);
+
+                // The artifact is named by its own content, so the file name and
+                // the recorded cubin hash have to be the same string. Checking it
+                // here is what makes the lookup below meaningful.
+                string cubinHash = columns[3];
+                Assert.Equal(cubinHash + ".cubin", columns[8]);
+
+                // ptxas measured these. A zero register count would mean the
+                // manifest was written without the -v report it claims to carry,
+                // which would silently disarm the resource-budget evidence.
+                Assert.True(int.Parse(columns[5], CultureInfo.InvariantCulture) > 0,
+                    $"No register measurement for {columns[0]}.");
+                Assert.True(int.Parse(columns[7], CultureInfo.InvariantCulture) > 0,
+                    $"No occupancy figure for {columns[0]}.");
+
+                if (expected.TryGetValue(cubinHash, out string? existingHash))
+                    Assert.Equal(existingHash, cubinHash);
                 else
-                    expected[columns[2]] = columns[3];
+                    expected[cubinHash] = cubinHash;
             }
         }
-        Assert.Equal(71, manifestRows);
-        Assert.Equal(71, blueprintIds.Count);
-        Assert.Equal(66, expected.Count);
+        Assert.Equal(86, manifestRows);
+        Assert.Equal(86, blueprintIds.Count);
+        Assert.Equal(81, expected.Count);
 
         string[] cubins = resources.Where(name =>
             name.IndexOf(".Artifacts.sm86.", StringComparison.Ordinal) >= 0 &&
