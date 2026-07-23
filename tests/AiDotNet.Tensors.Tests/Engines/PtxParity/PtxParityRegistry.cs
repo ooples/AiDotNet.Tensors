@@ -295,6 +295,12 @@ public static class PtxParityRegistry
             "one module per element count; the final ISTFT stage dividing result by windowSum in place, guarded " +
             "against tiny denominators with a div.rn matching the reference and a predicated selp. Its spec is " +
             "bit-exact. Converts to ThreeWayParity when the SM86 run lands; until then unpromoted and fail-closed."),
+        new PtxParitySpec("PtxAudioResampleF32Kernel", PtxParityStatus.Deferred,
+            "polyphase Hann-windowed sinc resampling, fp32 (#850) - IEngine.Resample",
+            "one module per (leading,inLen,outLen,up,down,halfWidth); each thread resamples one output sample " +
+            "by accumulating sinc((idx-srcIdx)*cutoff)*hann(k)*input over the tap window and normalizing by the " +
+            "window sum. Each sin/cos is argument-reduced to [-pi,pi] before sin.approx/cos.approx, so its spec " +
+            "is TOLERANCE-based, not bit-exact. Converts to ThreeWayParity (with tolerance) when the SM86 run lands."),
         new PtxParitySpec("PtxFftRollF32Kernel", PtxParityStatus.Deferred,
             "batched contiguous fft roll, fp32 (#850) - Fft.FftShift / Fft.IFftShift",
             "one module per (dim,shift,batch); output[b,i]=input[b,(i-shift) mod dim] along the last axis. " +

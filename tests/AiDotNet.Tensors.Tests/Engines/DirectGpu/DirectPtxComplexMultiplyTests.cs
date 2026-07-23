@@ -101,6 +101,7 @@ public class DirectPtxComplexMultiplyTests
                 "Fft.FftShift",
                 "Fft.IFftShift",
                 "Fft.RFftFreq",
+                "IEngine.Resample",
             },
             DirectPtxSpectralCoverageManifest.All
                 .Where(cell => cell.Status == DirectPtxSpectralCoverageStatus.ExperimentalDirectPtx)
@@ -2125,6 +2126,73 @@ public class DirectPtxComplexMultiplyTests
         var actual = new float[total];
         resB.Download<float>(actual);
         for (int i = 0; i < total; i++) Assert.Equal(expected[i], actual[i]);   // bit-exact
+    }
+
+    [Fact]
+    public void AudioResampleEmitter_IsRangeReducedPolyphase()
+    {
+        string ptx = PtxAudioResampleF32Kernel.EmitPtx(8, 6, 2, 1000, 1500, 3, 2, 8);
+        Assert.Contains("op=audio-resample", ptx);
+        Assert.Contains("$RS_LOOP:", ptx);
+        Assert.Contains("rem.u32 %r3, %r2, 1500", ptx);         // ot = gid % outLen
+        Assert.Contains("cvt.rmi.s32.f32 %r5", ptx);            // centre = floor(srcIdx)
+        Assert.Equal(2, Count(ptx, "cvt.rni.f32.f32"));         // range reduction for sin and cos
+        Assert.Contains("sin.approx.f32", ptx);
+        Assert.Contains("cos.approx.f32", ptx);
+        Assert.Contains("setp.gt.u32 %p1, %r6, 16", ptx);       // 2*halfWidth
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxAudioResampleF32Kernel.IsSupportedShape(2, 1000, 1500, 3, 2, 8));
+        Assert.False(PtxAudioResampleF32Kernel.IsSupportedShape(2, 1000, 1500, 3, 2, 0));   // halfWidth >= 1
+        Assert.False(PtxAudioResampleF32Kernel.IsPromotedShape(2, 1000, 1500, 3, 2, 8));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyAudioResample_MatchesDoubleOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedComplexUnary(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The candidate is admitted only on SM86.");
+        const int leading = 2, inLen = 512, up = 3, down = 2, halfWidth = 16;
+        const int outLen = inLen * up / down;   // 768
+        using var kernel = new PtxAudioResampleF32Kernel(runtime, leading, inLen, outLen, up, down, halfWidth);
+        var input = new float[leading * inLen];
+        var random = RandomHelper.CreateSeededRandom(20270701);
+        for (int i = 0; i < input.Length; i++) input[i] = (float)(random.NextDouble() * 2 - 1);
+
+        double cutoff = 1.0 / Math.Max(up, down);
+        var expected = new float[leading * outLen];
+        for (int gid = 0; gid < leading * outLen; gid++)
+        {
+            int ot = gid % outLen, row = gid / outLen, sBase = row * inLen;
+            double srcIdx = (double)ot * down / up;
+            int centre = (int)Math.Floor(srcIdx);
+            double acc = 0, wSum = 0;
+            for (int k = -halfWidth; k <= halfWidth; k++)
+            {
+                int idx = centre + k;
+                if (idx < 0 || idx >= inLen) continue;
+                double t = (idx - srcIdx) * cutoff;
+                double sinc = Math.Abs(t) < 1e-12 ? 1.0 : Math.Sin(Math.PI * t) / (Math.PI * t);
+                double hann = 0.5 - 0.5 * Math.Cos(2.0 * Math.PI * (k + halfWidth) / (2.0 * halfWidth));
+                double w = sinc * hann;
+                acc += w * input[sBase + idx]; wSum += w;
+            }
+            expected[gid] = (float)(wSum > 0 ? acc / wSum : 0);
+        }
+
+        using var iB = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var oB = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        iB.Upload<float>(input);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(iB, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(oB, kernel.Blueprint.Tensors[1]));
+        runtime.Synchronize();
+        var actual = new float[leading * outLen];
+        oB.Download<float>(actual);
+        for (int i = 0; i < actual.Length; i++)
+            Assert.True(Math.Abs(actual[i] - expected[i]) <= 5e-3 * (1 + Math.Abs(expected[i])) + 5e-4);
     }
 
     private static int Count(string text, string value)

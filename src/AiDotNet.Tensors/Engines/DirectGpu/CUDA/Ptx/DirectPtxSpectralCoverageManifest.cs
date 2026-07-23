@@ -76,7 +76,7 @@ internal static class DirectPtxSpectralCoverageManifest
         Planned("IEngine.ISTFT", "CudaBackend ISTFT stages or CPU", "public inverse STFT", Frames, "generic public; CUDA FP32", "public-istft-routing"),
         Planned("IEngine.MelSpectrogram", "STFT plus mel/filter/log pipeline", "public mel spectrogram", Frames, "generic public; CUDA FP32", "stft-power-mel-log-fusion-cells"),
         Planned("IEngine.GriffinLim", "iterative STFT/ISTFT composition", "phase reconstruction", Frames, "generic public; CUDA FP32", "griffin-lim-step-cells"),
-        Planned("IEngine.Resample", "CUDA audio resample", "polyphase waveform resample", "canonical contiguous waveform", "generic public; CUDA FP32", "resample-ratio-cells"),
+        Experimental("IEngine.Resample", "NVRTC audio_resample", "polyphase waveform resample", "canonical contiguous waveform", "FP32", "v1 Ampere thread-per-output-sample polyphase Hann-windowed sinc (PtxAudioResampleF32Kernel); range-reduced sin.approx/cos.approx, fma tap accumulation with window normalization, tolerance-based"),
         Planned("IEngine.NativeComplexMultiply", "native/split complex dispatch", "public native complex product", Interleaved, "Complex<FP32/FP64>", "public-complex-product-routing"),
         Planned("IEngine.NativeSpectralFilter", "FFT multiply IFFT composition", "public 2D spectral filter", Split, "generic public; CUDA FP32", "public-spectral-filter-routing"),
 
