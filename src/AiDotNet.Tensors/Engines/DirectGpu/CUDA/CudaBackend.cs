@@ -16865,7 +16865,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     // --- Loss Forward ---
     public void CrossEntropyLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numClasses) { LaunchLoss("cross_entropy_loss", predictions, targets, loss, batchSize, numClasses); }
-    public void MseLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures) { LaunchLoss("mse_loss", predictions, targets, loss, batchSize, numFeatures); }
+    public void MseLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures)
+    {
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxMseLoss(predictions, targets, loss, batchSize, numFeatures))
+            return;
+#endif
+        LaunchLoss("mse_loss", predictions, targets, loss, batchSize, numFeatures);
+    }
 
     private unsafe void LaunchLoss(string kernelName, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int dim)
     {

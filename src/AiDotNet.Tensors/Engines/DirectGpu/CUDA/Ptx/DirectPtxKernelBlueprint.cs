@@ -44,6 +44,22 @@ internal static class DirectPtxArchitecture
     /// </summary>
     internal static bool HasValidatedQkvRopeCache(int major, int minor) =>
         (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The per-sample FP32 MSE-loss specialization is measured only on
+    /// GA102/SM86. Admitting the whole Ampere family would run PTX that was
+    /// never validated on SM80/SM87, so this pins the exact pair.
+    /// </summary>
+    internal static bool HasValidatedMseLoss(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The loss-gradient specializations are measured only on GA102/SM86.
+    /// Gradients feed training, so an unvalidated architecture silently
+    /// changing rounding is worse here than in a forward-only kernel.
+    /// </summary>
+    internal static bool HasValidatedLossBackward(int major, int minor) =>
+        (major, minor) == (8, 6);
 }
 
 internal enum DirectPtxExtentMode

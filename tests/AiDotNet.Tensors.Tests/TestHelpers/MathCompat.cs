@@ -194,6 +194,17 @@ namespace AiDotNet.Tensors.Tests.TestHelpers
 #endif
         }
 
+        /// <summary>Reinterprets a float's bits as a uint (BitConverter.SingleToUInt32Bits is net-core-only).</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static uint SingleToUInt32Bits(float value)
+        {
+#if NET5_0_OR_GREATER
+            return BitConverter.SingleToUInt32Bits(value);
+#else
+            return unchecked((uint)BitConverter.ToInt32(BitConverter.GetBytes(value), 0));
+#endif
+        }
+
         /// <summary>Reinterprets an int's bits as a float (BitConverter.Int32BitsToSingle is net-core-only).</summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static float Int32BitsToSingle(int value)
