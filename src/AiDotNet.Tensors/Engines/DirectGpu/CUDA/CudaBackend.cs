@@ -6833,6 +6833,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void GlobalAvgPool2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int height, int width)
     {
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxGlobalAvgPool(input, output, batch, channels, height, width))
+            return;
+#endif
         if (!_kernelCache.TryGetValue("global_avgpool2d", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: global_avgpool2d");
 

@@ -13,6 +13,25 @@ class Program
 
     static void Main(string[] args)
     {
+        // GPU-free cubin generation and verification for the pooling family.
+        if (args.Length > 0 && args[0] == "--generate-direct-ptx-pooling-cubins")
+        {
+            Environment.ExitCode = DirectPtxPoolingCubinTool.Generate(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-pooling-cubins")
+        {
+            Environment.ExitCode = DirectPtxPoolingCubinTool.Verify(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-pooling-sass")
+        {
+            Environment.ExitCode = DirectPtxPoolingCubinTool.AuditSass(args);
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--direct-ptx-attention")
         {
             DirectPtxAttentionExperiment.Run();
@@ -78,6 +97,12 @@ class Program
             DirectPtxResidualRmsNormExperiment.Run();
             return;
         }
+        if (args.Length > 0 && args[0] == "--direct-ptx-global-avgpool")
+        {
+            DirectPtxGlobalAvgPoolExperiment.Run(
+                args.Length > 1 && int.TryParse(args[1], out int gapRuns) ? gapRuns : 1);
+            return;
+        }
         if (args.Length > 0 && args[0] == "--direct-ptx-external-gpu-baselines")
         {
             DirectPtxExternalBaselines.Run();
@@ -116,6 +141,11 @@ class Program
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-qkv-rope-cache")
         {
             DirectPtxProfileTarget.RunQkvRopeCache();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-global-avgpool")
+        {
+            DirectPtxProfileTarget.RunGlobalAvgPool();
             return;
         }
         if (args.Length > 1 && args[0] == "--direct-ptx-verify-ncu")

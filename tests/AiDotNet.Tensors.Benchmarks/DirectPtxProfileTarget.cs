@@ -264,6 +264,32 @@ internal static class DirectPtxProfileTarget
         GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-qkv-rope-cache-end");
     }
 
+    internal static void RunGlobalAvgPool()
+    {
+        GpuBenchmarkEnvironment.RequireIdleGpu("ncu-global-avgpool-start");
+        using var runtime = new DirectPtxRuntime();
+        (int Rows, int Spatial)[] shapes =
+        [
+            (256, 128),
+            (2048, 64),
+            (2048, 128),
+            (8192, 128)
+        ];
+        foreach ((int rows, int spatial) in shapes)
+        {
+            using var kernel = new PtxFusedGlobalAvgPoolF32Kernel(runtime, rows, spatial);
+            using var input = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+            using var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+            input.Upload<float>(new float[rows * spatial]);
+            kernel.Launch(
+                DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+                DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[1]));
+            runtime.Synchronize();
+            Console.WriteLine(kernel.Audit.ToJson());
+        }
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-global-avgpool-end");
+    }
+
     internal static void VerifyNcuCsv(string path)
     {
         DirectPtxProfilerEvidence evidence = DirectPtxProfilerEvidence.FromNcuCsv(path);
