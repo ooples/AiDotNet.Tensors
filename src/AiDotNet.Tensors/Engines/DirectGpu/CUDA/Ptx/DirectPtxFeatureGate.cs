@@ -60,6 +60,8 @@ internal static class DirectPtxFeatureGate
     internal static bool QuantizedLinearExperimentOverride { get; set; }
     /// <summary>Benchmark-only access to normalization cells that have not passed promotion.</summary>
     internal static bool NormalizationExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to convolution cells that have not passed promotion.</summary>
+    internal static bool ConvolutionExperimentOverride { get; set; }
 
     internal static bool IsEnabled => IsAttentionEnabled;
 

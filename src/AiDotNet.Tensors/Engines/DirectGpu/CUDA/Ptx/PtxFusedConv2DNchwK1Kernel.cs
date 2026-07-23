@@ -47,14 +47,15 @@ internal sealed class PtxFusedConv2DNchwK1Kernel : IDisposable
 
         Blueprint = CreateBlueprint(runtime.ArchitectureFamily);
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
-        _module = runtime.LoadModule(Ptx);
+        _module = runtime.LoadModule(
+            Ptx, allowExperimentalJitFallback: DirectPtxFeatureGate.ConvolutionExperimentOverride);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
         FunctionInfo = functionInfo;
         int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
         Blueprint.ResourceBudget.Validate(EntryPoint, functionInfo, BlockThreads, activeBlocks);
         Audit = DirectPtxKernelAudit.Create(
             Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo,
-            BlockThreads, activeBlocks, _module.JitInfoLog);
+            BlockThreads, activeBlocks, _module);
     }
 
     internal static DirectPtxKernelBlueprint CreateBlueprint(

@@ -15,16 +15,19 @@ internal static class DirectPtxSassAuditTool
     internal static void Run(
         string nvdisasmPath,
         string artifactDirectory,
-        string evidenceDirectory)
+        string evidenceDirectory,
+        string manifestFileName = "normalization-cubins.tsv",
+        string reportFileName = "normalization-sass-audit.tsv",
+        string label = "normalization")
     {
         nvdisasmPath = Path.GetFullPath(nvdisasmPath);
         artifactDirectory = Path.GetFullPath(artifactDirectory);
         evidenceDirectory = Path.GetFullPath(evidenceDirectory);
         if (!File.Exists(nvdisasmPath))
             throw new FileNotFoundException("nvdisasm is required for the release SASS gate.", nvdisasmPath);
-        string manifestPath = Path.Combine(artifactDirectory, "normalization-cubins.tsv");
+        string manifestPath = Path.Combine(artifactDirectory, manifestFileName);
         if (!File.Exists(manifestPath))
-            throw new FileNotFoundException("Normalization cubin manifest is missing.", manifestPath);
+            throw new FileNotFoundException("The " + label + " cubin manifest is missing.", manifestPath);
         Directory.CreateDirectory(evidenceDirectory);
 
         IReadOnlyDictionary<string, ManifestCell> manifest = ReadManifest(manifestPath);
@@ -67,10 +70,10 @@ internal static class DirectPtxSassAuditTool
                 metrics.LocalStores.ToString(CultureInfo.InvariantCulture)));
         }
 
-        string reportPath = Path.Combine(evidenceDirectory, "normalization-sass-audit.tsv");
+        string reportPath = Path.Combine(evidenceDirectory, reportFileName);
         File.WriteAllLines(reportPath, report);
         Console.WriteLine("SASS gate passed for " + manifest.Count.ToString(CultureInfo.InvariantCulture) +
-            " compiled normalization cubins; no direct entry uses LDL/STL.");
+            " compiled " + label + " cubins; no direct entry uses LDL/STL.");
         Console.WriteLine("Evidence: " + reportPath);
     }
 
