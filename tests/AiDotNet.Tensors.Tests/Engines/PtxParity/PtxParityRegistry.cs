@@ -140,6 +140,20 @@ public static class PtxParityRegistry
             "against the strongest eligible cuDNN/PyTorch competitor, plus Nsight zero-spill SASS evidence. " +
             "Keep deferred until that three-way matrix and the competitive gates exist."),
 
+        new PtxParitySpec("PtxWinogradBatchedGemmKernel", PtxParityStatus.Deferred,
+            "Winograd F(2,3) batched register-blocked GEMM M[b]=U[b].V[b] (#841 3x3 pipeline)",
+            "the 16 Winograd position GEMMs run as one batched register-blocked GEMM (grid.z=16), reusing " +
+            "the exact TM x TN micro-tile structure that beats cuDNN on 1x1 -- one clean position per block, " +
+            "avoiding the 16-accumulator register explosion of the fused kernel. Verified correct on-device " +
+            "in the 4-stage pipeline; ~2.3x faster than the naive/fused Winograd and plausibly beats cuDNN on " +
+            "an idle GPU (definitive measurement pending an uncontended window). Deferred until the >=1.10x " +
+            "gate is confirmed."),
+
+        new PtxParitySpec("PtxWinogradF23OutputTransformKernel", PtxParityStatus.Deferred,
+            "Winograd F(2,3) output transform A^T M A + bias + ReLU (#841 3x3 pipeline)",
+            "the output-transform stage reading M[16,K,P] and scattering the 2x2 tiles to output[N,K,H,W]; " +
+            "covered on-device by the batched-GEMM pipeline correctness test. Deferred with the pipeline."),
+
         new PtxParitySpec("PtxWinogradF23InputTransformKernel", PtxParityStatus.Deferred,
             "Winograd F(2,3) input transform V = B^T d B (#841 3x3 pipeline)",
             "the input-transform stage of the optimized Winograd 3x3 pipeline (input[N,C,H,W] -> " +
