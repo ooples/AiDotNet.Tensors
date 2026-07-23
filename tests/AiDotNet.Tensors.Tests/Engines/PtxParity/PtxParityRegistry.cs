@@ -187,6 +187,19 @@ public static class PtxParityRegistry
             "memory pipeline (coalesced cp.async staging + ldmatrix + multi-warp cooperation) -- a multi-day " +
             "kernel. Deferred."),
 
+        new PtxParitySpec("PtxWinogradWmmaFusedAllKKernel", PtxParityStatus.Deferred,
+            "Winograd F(2,3) fully-fused FP16 TC conv, V computed once per tile-block (#841 3x3, best fused)",
+            "the correct cuDNN-style fusion: grid.y=1 so one 16-warp block owns 8 tiles across ALL K channels and " +
+            "computes V = B^T d B exactly once into shared (phase 1); each warp then runs K/16 mma m-subtiles " +
+            "reusing the shared B(V) fragment while streaming A(U) (phase 2); M is exchanged through shared -- " +
+            "overlapping the now-dead V region -- and the A^T M A + bias + ReLU output transform runs in the " +
+            "epilogue (phase 3). No global V, no round-trip, no redundant transform (unlike the grid.y=4 fully-" +
+            "fused kernel). Verified correct on-device (<= 5e-2). HONEST perf (idle 3080 @ 2040MHz, ResNet C64, " +
+            "amortized): ~527us -- best of all fused variants (2.3x faster than the redundant-V fusion's 1188us), " +
+            "edges the staged pipeline (543us), and is 1.67x off cuDNN fp16+ReLU (314us idle, same window; the " +
+            "campaign started at 11x / 6300us). Remaining gap is cuDNN's phase pipelining (overlap V-compute with " +
+            "GEMM) + interior-tile fast path. K<=64 (M-exchange fits shared). Deferred."),
+
         new PtxParitySpec("PtxWinogradWmmaFullyFusedKernel", PtxParityStatus.Deferred,
             "Winograd F(2,3) fully-fused FP16 TC conv: input transform + GEMM + output transform, 1 kernel (#841 3x3)",
             "cuDNN-structure single kernel: phase 1 computes V = B^T d B straight into shared (no global V, no " +
