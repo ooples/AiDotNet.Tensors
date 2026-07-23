@@ -155,14 +155,27 @@ cells remain experiment-only until the full timing gate passes.
 ### Fused-linear backward
 
 One pointer-only launch assigns disjoint CTA ranges to `dInput` and `dWeight`.
-The `k=0` `dWeight` lanes accumulate `dBias` from the same grad-output and saved
-value panels, eliminating a third CTA range and separate launch. Both matrix
-products use 16x16 coalesced shared-memory panels and fully unrolled 16-FMA
-inner products. Activation derivatives are computed in registers while each
-grad-output panel is loaded and are never materialized globally. ReLU and
-tanh-GELU consume saved preactivation; sigmoid and tanh consume saved output,
-matching the established contracts. Gradient outputs must be disjoint from
-each other and from saved forward tensors.
+The exact M64/K256/N256 ReLU cell launches 80 CTAs: 16 for dInput and 64 for
+dWeight. Every CTA owns one 32x32 result tile. Its two four-warp groups split
+the reduction dimension, stage independent panels, retain FP32 WMMA
+accumulators, and merge the two partial tiles in shared memory. This exposes
+enough independent CTAs to the 68-SM RTX 3080 instead of leaving most SMs idle.
+FP32 input, weight, grad-output, and saved-activation values are streamed in
+aligned vectors; the ReLU derivative is applied in
+registers, and the resulting operands are rounded to FP16 only while staging
+the two group-local shared partitions. Four quadrant warps per group issue
+WMMA, and the merged result is written once. The row-zero dWeight
+owners retain FP32 masked-gradient sums, reuse their group-local shared tile for
+a fixed-order 16-row fold, and write `dBias`, eliminating a third CTA range and
+separate launch. There is no materialized masked-gradient tensor, atomic, or
+global workspace. This mixed-input numerical mode is part of the exact
+blueprint and its oracle tolerance; it is never silently selected for another
+activation or shape.
+
+Other supported cells retain the generic 16x16 FP32 shared-panel topology.
+ReLU and tanh-GELU consume saved preactivation; sigmoid and tanh consume saved
+output, matching the established contracts. Gradient outputs must be disjoint
+from each other and from saved forward tensors.
 
 ### LoRA
 
@@ -198,7 +211,7 @@ totals fold through a conflict-free 16-byte shared table and one barrier.
 Strided dot bakes its valid interval, offset, and
 step into the module; its two-stage shuffle reduction replaces the prior 1 KiB
 and eight-barrier shared tree with eight shared warp totals and one barrier.
-Outer uses aligned `float4` transactions and a baked 128-thread launch for the
+Outer uses aligned `float4` transactions and a baked 256-thread launch for the
 measured M64/N128 cell. Its exact work count removes the bounds predicate;
 fallback specializations still write every independent output exactly once.
 
@@ -209,7 +222,7 @@ fallback specializations still write every independent output exactly once.
 | decode linear | input, output-major weights, bias | accumulators and GELU in registers | final output once |
 | tiled GEMM/linear | A and weight panels, optional bias | panels in shared; accumulator/epilogue in registers | final C once |
 | FP16/BF16 GEMM | 16-bit A/B | FP32 or FP16-rounded accumulator in registers | converted C once |
-| backward linear | grad output, input, weights, saved activation | derivative and reduction accumulators in registers | dInput/dWeight/dBias once |
+| backward linear | grad output, input, weights, saved activation | derivative in registers; exact ReLU operands in shared FP16 WMMA tiles; FP32 matrix/bias accumulators | dInput/dWeight/dBias once |
 | LoRA | input, base, A, B | warp partials and rank projection in shared; residual epilogue in registers | final output once |
 | linear CE | hidden, weight, bias, target | logits in registers; reductions in shared | one atomic scalar contribution/row |
 | dense/strided dot | two vectors | register partials, then 32-byte shared warp totals | one scalar |
@@ -309,6 +322,10 @@ route receives its own correctness probe. A missing compiled row makes final
 evidence incomplete. Every eligible competitor is evaluated independently; a cell passes only when all
 AiDotNet, NVIDIA-library, PyTorch eager/Graph, and PyTorch compiled/Graph pairs
 meet the median and P95 thresholds.
+The exact backward cell also measures four additional PyTorch routes with the
+same FP32 input/output ABI, in-graph FP16 operand conversion, and FP32 matrix
+accumulation. This prevents a mixed-input PTX specialization from claiming a
+win only against a different full-FP32 numerical mode.
 
 ## Current exact-machine-code audit
 
@@ -326,6 +343,7 @@ zero `LDL` and zero `STL` in every entry. Representative hardware rows are:
 | FP16 fused GELU M16/K512/N2048 N64 | 39 | 20480 | 64 | 24 | 32 | 0 / 0 |
 | FP16 fused GELU M16/K1024/N4096 N32 | 34 | 24576 | 128 | 48 | 64 | 0 / 0 |
 | FP16 fused GELU M16/K1024/N4096 N64 | 34 | 40960 | 128 | 48 | 64 | 0 / 0 |
+| fused ReLU backward M64/K256/N256 split-K | 56 | 8192 | 4 | 0 | 4 | 0 / 0 |
 | dense dot K4096 float4 | 24 | 32 | 0 | 0 | 0 | 0 / 0 |
 | outer M64/N128 float4 | 14 | 0 | 0 | 0 | 0 | 0 / 0 |
 | batched dot B4/K512 float4 | 24 | 16 | 0 | 0 | 0 | 0 / 0 |

@@ -19,7 +19,7 @@ internal sealed class PtxDenseVectorKernel : IDisposable
 {
     internal const int BlockThreads = 256;
     internal const int ExactDotBlockThreads = 512;
-    internal const int OuterBlockThreads = 128;
+    internal const int OuterBlockThreads = 256;
     internal const int WarpCount = BlockThreads / 32;
     internal const string DotEntryPoint = "aidotnet_dense_dot";
     internal const string OuterEntryPoint = "aidotnet_dense_outer";
@@ -401,7 +401,7 @@ internal sealed class PtxDenseVectorKernel : IDisposable
         var output = dot ? new DirectPtxExtent(1) : new DirectPtxExtent(m, n);
         return new DirectPtxKernelBlueprint(
             Operation: dot ? "dense-dot" : "dense-outer",
-            Version: IsExactOuterCell(m, n) ? 6 : dot && m == 4_096 ? 3 : vectorizedOuter ? 3 : vectorizedDot ? 2 : 1,
+            Version: IsExactOuterCell(m, n) ? 7 : dot && m == 4_096 ? 3 : vectorizedOuter ? 3 : vectorizedDot ? 2 : 1,
             Architecture: architecture,
             Variant: dot ? $"{(m == 4_096 ? "fp32x4-unrolled" : vectorizedDot ? "fp32x4" : "fp32")}-k{m}" :
                 $"{(vectorizedOuter ? $"fp32x{outerVectorWidth}-cta{OuterBlockThreads}" : "fp32")}-m{m}-n{n}",
@@ -421,7 +421,7 @@ internal sealed class PtxDenseVectorKernel : IDisposable
                     ? (m == 4_096 ? ExactDotBlockThreads / 32 : WarpCount) * sizeof(float)
                     : 0,
                 MaxLocalBytesPerThread: 0,
-                MinBlocksPerMultiprocessor: dot ? 1 : vectorizedOuter ? 12 : 4),
+                MinBlocksPerMultiprocessor: dot ? 1 : vectorizedOuter ? 6 : 4),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["formula"] = dot ? "sum(left[K] * right[K])" : "left[M] outer right[N]",

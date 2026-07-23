@@ -419,6 +419,35 @@ def make_case(name, run, device):
     raise ValueError(name)
 
 
+def make_mixed_backward_case(run, device):
+    """Match the exact PTX cell's FP32 ABI and internal FP16 MMA mode."""
+    name = "linear-backward-relu"
+    generator = torch.Generator(device=device)
+    generator.manual_seed(20263000 + run * 100 + sum(ord(c) for c in name))
+
+    def values(shape, scale=0.125):
+        return (
+            torch.rand(shape, generator=generator, device=device) * 2 - 1
+        ) * scale
+
+    m, k, n = 64, 256, 256
+    grad = values((m, n))
+    x = values((m, k))
+    w = values((k, n), 0.0625)
+    saved = values((m, n), 0.25)
+
+    def op():
+        masked = grad * (saved > 0)
+        masked_half = masked.half()
+        return (
+            (masked_half @ w.half().t()).float(),
+            (x.half().t() @ masked_half).float(),
+            masked.sum(dim=0),
+        )
+
+    return op
+
+
 CASES = (
     "decode-gelu",
     "gemm-fp32",
@@ -482,6 +511,14 @@ def main():
             compiled_graph = None
             compiled_graph_operation = None
             compiled_capture_stream = None
+            mixed_eager = None
+            mixed_graph = None
+            mixed_graph_operation = None
+            mixed_capture_stream = None
+            mixed_compiled = None
+            mixed_compiled_graph = None
+            mixed_compiled_graph_operation = None
+            mixed_compiled_capture_stream = None
             try:
                 compiled = torch.compile(
                     eager, fullgraph=True, mode="max-autotune-no-cudagraphs")
@@ -504,6 +541,45 @@ def main():
                     "reason": f"{type(exception).__name__}: {exception}",
                     **software_fingerprint,
                 }, separators=(",", ":")))
+
+            if operation == "linear-backward-relu":
+                mixed_eager = make_mixed_backward_case(run, device)
+                mixed_graph_operation, mixed_graph, mixed_capture_stream = (
+                    capture_graph(mixed_eager)
+                )
+                competitors.extend((
+                    ("PyTorch mixed-FP16 CUDA eager", mixed_eager, 1),
+                    ("PyTorch mixed-FP16 CUDA graph", mixed_graph_operation,
+                     GRAPH_OPERATIONS_PER_REPLAY),
+                ))
+                try:
+                    mixed_compiled = torch.compile(
+                        mixed_eager, fullgraph=True,
+                        mode="max-autotune-no-cudagraphs")
+                    mixed_compiled_probe = mixed_compiled()
+                    torch.cuda.synchronize()
+                    (mixed_compiled_graph_operation,
+                     mixed_compiled_graph,
+                     mixed_compiled_capture_stream) = capture_graph(
+                         mixed_compiled)
+                    competitors.extend((
+                        ("PyTorch mixed-FP16 compile max-autotune",
+                         mixed_compiled, 1),
+                        ("PyTorch mixed-FP16 compile max-autotune graph",
+                         mixed_compiled_graph_operation,
+                         GRAPH_OPERATIONS_PER_REPLAY),
+                    ))
+                    del mixed_compiled_probe
+                except Exception as exception:
+                    print(json.dumps({
+                        "status": "skip",
+                        "run": run,
+                        "operation": operation,
+                        "shape": shape,
+                        "method": "PyTorch mixed-FP16 compile max-autotune",
+                        "reason": f"{type(exception).__name__}: {exception}",
+                        **software_fingerprint,
+                    }, separators=(",", ":")))
 
             for method, measured, logical_operations_per_call in competitors:
                 require_no_foreign_compute(f"{operation}-{method}-start")
@@ -559,6 +635,10 @@ def main():
             del competitors, graph_operation
             if compiled_graph_operation is not None:
                 del compiled_graph_operation
+            if mixed_graph_operation is not None:
+                del mixed_graph_operation
+            if mixed_compiled_graph_operation is not None:
+                del mixed_compiled_graph_operation
             del expected, eager_graph, eager_capture_stream
             if compiled_graph is not None:
                 del compiled_graph
@@ -566,6 +646,18 @@ def main():
                 del compiled_capture_stream
             if compiled is not None:
                 del compiled
+            if mixed_graph is not None:
+                del mixed_graph
+            if mixed_capture_stream is not None:
+                del mixed_capture_stream
+            if mixed_compiled_graph is not None:
+                del mixed_compiled_graph
+            if mixed_compiled_capture_stream is not None:
+                del mixed_compiled_capture_stream
+            if mixed_compiled is not None:
+                del mixed_compiled
+            if mixed_eager is not None:
+                del mixed_eager
             gc.collect()
             torch.cuda.empty_cache()
             require_no_foreign_compute(f"{operation}-end")

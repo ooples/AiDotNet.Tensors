@@ -274,12 +274,12 @@ internal static class DirectPtxDenseLinearArtifactTool
             Cell("fused-linear-cross-entropy-index-v2-Ampere-one-cta-warp-row-register-logits-fp32-b4-k16-v32",
                 PtxFusedLinearCrossEntropyKernel.EmitPtx(
                 major, minor, DirectPtxCrossEntropyTarget.Index, 4, 16, 32)),
-            Cell("fused-linear-backward-v3-Ampere-register32x32-thread4x4-m64-k256-n256-relu",
+            Cell("fused-linear-backward-v8-Ampere-wmma32x32-splitk-two-groups-m64-k256-n256-relu",
                 PtxFusedLinearBackwardKernel.EmitPtx(
                 major, minor, 64, 256, 256, DirectPtxLinearActivation.Relu)),
             Cell("dense-dot-v3-Ampere-fp32x4-unrolled-k4096", PtxDenseVectorKernel.EmitPtx(
                 major, minor, DirectPtxDenseVectorOperation.Dot, 4_096)),
-            Cell("dense-outer-v6-Ampere-fp32x4-cta128-m64-n128", PtxDenseVectorKernel.EmitPtx(
+            Cell("dense-outer-v7-Ampere-fp32x4-cta256-m64-n128", PtxDenseVectorKernel.EmitPtx(
                 major, minor, DirectPtxDenseVectorOperation.Outer, 64, 128)),
             Cell("batched-dense-dot-v6-Ampere-unrolled-warp-per-batch-fp32x4-b4-d512",
                 PtxBatchedVectorKernel.EmitPtx(

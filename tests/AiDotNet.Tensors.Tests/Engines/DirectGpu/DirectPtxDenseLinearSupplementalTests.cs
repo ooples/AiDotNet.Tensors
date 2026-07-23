@@ -265,7 +265,7 @@ public partial class DirectPtxWmmaTests
         Assert.Equal(3, Count(outer, ".param .u64"));
         Assert.Equal(1, Count(outer, "ld.global.v4.f32"));
         Assert.Equal(1, Count(outer, "st.global.v4.f32"));
-        Assert.Contains(".maxntid 128, 1, 1", outer, StringComparison.Ordinal);
+        Assert.Contains(".maxntid 256, 1, 1", outer, StringComparison.Ordinal);
         Assert.DoesNotContain("div.u32", outer, StringComparison.Ordinal);
         Assert.DoesNotContain("rem.u32", outer, StringComparison.Ordinal);
         Assert.DoesNotContain(".shared", outer, StringComparison.Ordinal);
@@ -300,7 +300,7 @@ public partial class DirectPtxWmmaTests
         using (var right = runtime.AllocateBytes((nuint)(dotRight.Length * sizeof(float))))
         using (var output = runtime.AllocateBytes((nuint)(batch * sizeof(float))))
         {
-            Assert.Equal(128, kernel.BlockThreads);
+            Assert.Equal(PtxBatchedVectorKernel.VectorBlockThreads, kernel.BlockThreads);
             Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
             left.Upload<float>(dotLeft);
             right.Upload<float>(dotRight);
@@ -535,6 +535,17 @@ public partial class DirectPtxWmmaTests
         using var kernel = new PtxFusedLinearBackwardKernel(
             runtime, m, k, n, activation);
         Assert.All(kernel.Audits, audit => Assert.Equal(0, audit.Function.LocalBytesPerThread));
+        if (activation == DirectPtxLinearActivation.Relu)
+        {
+            DirectPtxKernelAudit audit = Assert.Single(kernel.Audits);
+            Assert.Equal(DirectPtxModuleImageKind.EmbeddedCubin, audit.ImageKind);
+            Assert.Equal(PtxFusedLinearBackwardKernel.ExactBlockThreads, audit.BlockThreads);
+            Assert.Equal(8_192, audit.Function.StaticSharedBytes);
+            Assert.InRange(audit.Function.RegistersPerThread, 1, 64);
+            Assert.True(audit.ActiveBlocksPerMultiprocessor >= 4);
+            Assert.NotEmpty(audit.CubinSha256);
+            Assert.NotEmpty(audit.CubinSourceKey);
+        }
 
         var random = RandomHelper.CreateSeededRandom(20262368);
         float[] gradOutputHost = Values(random, m * n, 0.125f);
@@ -1066,10 +1077,15 @@ public partial class DirectPtxWmmaTests
 
         string exact = PtxFusedLinearBackwardKernel.EmitPtx(
             8, 6, 64, 256, 256, DirectPtxLinearActivation.Relu);
-        Assert.Contains(".maxntid 64, 1, 1", exact, StringComparison.Ordinal);
-        Assert.Contains(".shared .align 16 .b8 tile_a[4096]", exact, StringComparison.Ordinal);
-        Assert.Contains(".shared .align 16 .b8 tile_b[4096]", exact, StringComparison.Ordinal);
-        Assert.Contains("EXACT_GRAD_INPUT:", exact, StringComparison.Ordinal);
+        Assert.Contains(".maxntid 256, 1, 1", exact, StringComparison.Ordinal);
+        Assert.Contains(".shared .align 16 .b8 wmma_tiles[8192]", exact, StringComparison.Ordinal);
+        Assert.Contains("EXACT_SPLIT_DINPUT_SETUP:", exact, StringComparison.Ordinal);
+        Assert.Contains("wmma.load.a.sync.aligned", exact, StringComparison.Ordinal);
+        Assert.Contains("wmma.load.b.sync.aligned", exact, StringComparison.Ordinal);
+        Assert.Contains("wmma.mma.sync.aligned", exact, StringComparison.Ordinal);
+        Assert.Contains("wmma.store.d.sync.aligned", exact, StringComparison.Ordinal);
+        Assert.Contains("bar.sync %r18, 128", exact, StringComparison.Ordinal);
+        Assert.Contains("st.shared.v4.f32", exact, StringComparison.Ordinal);
         Assert.Contains("st.global.v4.f32", exact, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", exact, StringComparison.Ordinal);
     }

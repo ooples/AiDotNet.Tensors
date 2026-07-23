@@ -469,8 +469,8 @@ function Assert-DenseLinearEvidence(
         if ($IncludeExternal) {
             $pythonPath = Join-Path $Root ($prefix + '-dense-linear-pytorch.log')
             $pythonRows = @(Read-QkvPythonRows $pythonPath | Where-Object { $_.status -eq 'ok' })
-            if ($pythonRows.Count -ne 56) {
-                throw "Dense-linear evidence expected 56 PyTorch rows (eager, graph, compile, and compile graph) in '$pythonPath'; found $($pythonRows.Count)."
+            if ($pythonRows.Count -ne 60) {
+                throw "Dense-linear evidence expected 60 PyTorch rows (four standard routes per operation plus four matched mixed-FP16 backward routes) in '$pythonPath'; found $($pythonRows.Count)."
             }
             foreach ($row in $pythonRows) {
                 Assert-DenseLinearRow $row $pythonPath
@@ -511,7 +511,8 @@ function Assert-DenseLinearEvidence(
             })
             if ($IncludeExternal) {
                 $shapePeers = @($pythonRows | Where-Object { $_.operation -eq $operation })
-                if ($shapePeers.Count -ne 4) {
+                $expectedShapePeers = if ($operation -eq 'linear-backward-relu') { 8 } else { 4 }
+                if ($shapePeers.Count -ne $expectedShapePeers) {
                     throw "Dense-linear evidence has an incomplete PyTorch method set for run $run '$operation'."
                 }
                 $peers += $shapePeers
